@@ -133,8 +133,19 @@ impl TransformedRuneView {
 		self.executions.into_iter()
 	}
 
+	#[cfg(test)]
 	pub(crate) fn presentation_order(&self) -> &[LocalViewIdentity] {
 		&self.presentation_order
+	}
+
+	pub(crate) fn presentation_views(&self) -> Vec<&SpannedRuneViewIntent> {
+		let mut views = self
+			.executions
+			.iter()
+			.flat_map(|execution| execution.views.iter())
+			.collect::<Vec<_>>();
+		views.sort_by_key(|view| view.output_order);
+		views
 	}
 }
 

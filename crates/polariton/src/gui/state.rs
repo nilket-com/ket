@@ -24,9 +24,8 @@ use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	PendingRuneView, RuneEnvelopeError, RuneViewForm, RuneViewIntent, RuneViewScheduler,
-	SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView,
-	transform as transform_rune_view,
+	PendingRuneView, RuneEnvelopeError, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
+	TransformedRuneRelation, TransformedRuneView, transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -58,8 +57,6 @@ struct AppState {
 	window_size: Size,
 	result_registry: ResultRegistry,
 	rune_plot_panes: HashMap<BufferId, PaneId>,
-	#[cfg(feature = "toron")]
-	rune_relation_plot_panes: HashMap<(BufferId, RuneViewForm), PaneId>,
 	rune_buffer_revisions: HashMap<BufferId, u64>,
 	#[cfg(feature = "toron")]
 	rune_view_scheduler: RuneViewScheduler,
@@ -298,8 +295,6 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		window_size,
 		result_registry: ResultRegistry::default(),
 		rune_plot_panes: HashMap::new(),
-		#[cfg(feature = "toron")]
-		rune_relation_plot_panes: HashMap::new(),
 		rune_buffer_revisions: HashMap::new(),
 		#[cfg(feature = "toron")]
 		rune_view_scheduler: RuneViewScheduler::default(),
@@ -534,10 +529,15 @@ fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String
 		) => {
 			let message = error.to_string();
 			app_state.status_error = format!("Error: {message}");
-			app_state.code_editor.set_query_error(message);
+			app_state
+				.code_editor
+				.mark_rune_view_producer_stale(source_buffer, message);
 			return Task::none();
 		}
 		Err(RuneEnvelopeError::RecognizedNoOutput) => {
+			app_state
+				.code_editor
+				.prepare_rune_view_panels(source_buffer, &[], 0);
 			app_state.status_msg = "Rune view set is bound; no output root emitted.".into();
 			app_state.status_error.clear();
 			return Task::none();
@@ -603,6 +603,15 @@ fn run_rune_relation_view(
 		revision,
 		view,
 	};
+	let presentation = work
+		.view
+		.presentation_views()
+		.into_iter()
+		.map(|view| (view.identity.clone(), view.intent.form()))
+		.collect::<Vec<_>>();
+	app_state
+		.code_editor
+		.prepare_rune_view_panels(source_buffer, &presentation, revision);
 	let Some(work) = app_state.rune_view_scheduler.submit(work) else {
 		app_state.status_msg = "Rune workspace queued newest view…".into();
 		return Task::none();
@@ -615,7 +624,9 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 	let Some(connection) = app_state.adapter_state.rune_connection().cloned() else {
 		let message = app_state.adapter_state.local_workspace_unavailable();
 		app_state.status_error = format!("Error: {message}");
-		app_state.code_editor.set_query_error(message);
+		app_state
+			.code_editor
+			.mark_rune_view_producer_stale(work.source_buffer, message);
 		app_state.rune_view_scheduler.cancel(work.source_buffer);
 		return Task::none();
 	};
@@ -632,15 +643,20 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
-	app_state.code_editor.begin_query();
 	Task::batch(view.into_relations().map(|view| {
 		let connection = connection.clone();
 		let origin = view.origin.clone();
+		let views = view
+			.views
+			.iter()
+			.map(|view| view.identity.clone())
+			.collect::<Vec<_>>();
 		Task::perform(dispatch_rune_relation(connection, view), move |result| {
 			Message::RunRuneViewSetResult {
 				source_buffer,
 				revision,
 				origin,
+				views,
 				result,
 			}
 		})
@@ -703,7 +719,6 @@ fn rune_view_outcome(
 			};
 			RuneRelationSinkOutcome {
 				identity: view.identity,
-				output_order: view.output_order,
 				form,
 				span: view.span,
 				source: std::sync::Arc::clone(&result),
@@ -1332,6 +1347,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			source_buffer,
 			revision,
 			origin,
+			views,
 			result,
 		} => {
 			if let Some(next) = app_state
@@ -1350,58 +1366,58 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					let sink_count = outcome.sinks.len();
 					let mut errors = Vec::new();
 					let mut plot_tasks = Vec::new();
-					let mut table_rendered = false;
 					for sink in outcome.sinks {
 						assert!(
 							std::sync::Arc::ptr_eq(&outcome.result, &sink.source),
 							"Rune view sinks must share one stamped result identity"
 						);
+						let panel_id = app_state
+							.code_editor
+							.rune_view_panel_id(source_buffer, &sink.identity)
+							.expect("a dispatched view has a prepared host panel");
 						match sink.output {
 							Ok(RuneRelationSinkOutput::Table) => {
 								let frame = sink.source.as_ref().clone();
 								let rows = frame.height();
 								let cols = frame.width();
-								app_state.code_editor.set_query_result(frame.clone());
+								app_state
+									.code_editor
+									.set_rune_view_table(panel_id, frame.clone());
 								app_state.data_frame = frame;
 								app_state.status_df_size = Some((rows, cols));
-								table_rendered = true;
 							}
 							Ok(RuneRelationSinkOutput::Plot(resolved)) => {
-								let form = sink.form;
 								plot_tasks.push(build_resolved_plot_task(
 									resolved,
 									1200,
 									move |resolved, kernel| Message::RuneRelationPlotReady {
 										source_buffer,
 										revision,
-										form,
+										panel_id,
 										resolved,
 										kernel,
 									},
 								));
 							}
-							Err(message) => errors.push(format!(
-								"{} at bytes {}..{}: {message}",
-								sink.form.label(),
-								sink.span.start,
-								sink.span.end
-							)),
+							Err(message) => {
+								let message = format!(
+									"{} at bytes {}..{}: {message}",
+									sink.form.label(),
+									sink.span.start,
+									sink.span.end
+								);
+								app_state
+									.code_editor
+									.fail_rune_view(panel_id, message.clone());
+								errors.push(message);
+							}
 						}
 					}
 					if errors.is_empty() {
 						app_state.status_error.clear();
-						if !table_rendered {
-							app_state.code_editor.set_query_message(format!(
-								"Rune workspace rendered {sink_count} shared-result view{}.",
-								if sink_count == 1 { "" } else { "s" }
-							));
-						}
 					} else {
 						let message = errors.join("\n");
 						app_state.status_error = format!("Error: {message}");
-						if !table_rendered {
-							app_state.code_editor.set_query_error(message);
-						}
 					}
 					app_state.status_msg = format!(
 						"Rune workspace rendered {sink_count} shared-result view{}.",
@@ -1410,9 +1426,18 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					return Task::batch(plot_tasks);
 				}
 				Err(message) => {
+					for identity in views {
+						if let Some(panel_id) = app_state
+							.code_editor
+							.rune_view_panel_id(source_buffer, &identity)
+						{
+							app_state
+								.code_editor
+								.fail_rune_view(panel_id, message.clone());
+						}
+					}
 					app_state.status_error = format!("Error: {message}");
 					app_state.status_msg.clear();
-					app_state.code_editor.set_query_error(message);
 				}
 			}
 		}
@@ -1439,21 +1464,17 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::RuneRelationPlotReady {
 			source_buffer,
 			revision,
-			form,
+			panel_id,
 			resolved,
 			kernel,
 		} => {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
-			app_state.code_editor.open_dashboard();
-			let key = (source_buffer, form);
-			let previous = app_state.rune_relation_plot_panes.get(&key).copied();
 			let composition = resolved.resolved_spec.composition.clone();
-			let pane = app_state
-				.dashboard
-				.apply_plot_replacing(previous, composition, kernel);
-			app_state.rune_relation_plot_panes.insert(key, pane);
+			app_state
+				.code_editor
+				.set_rune_view_plot(panel_id, composition, kernel);
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
 		}
 		Message::RunMarkdownCellResult {
@@ -1851,8 +1872,11 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
+	use crate::plot::factory::create_plot;
+	#[cfg(feature = "toron")]
 	use crate::rune_relation_envelope::{
-		LocalViewIdentity, PendingRuneView, RuneViewForm, transform as transform_rune_view,
+		LocalViewIdentity, PendingRuneView, RuneViewForm, TransformedRuneRelation,
+		transform as transform_rune_view,
 	};
 	#[cfg(feature = "toron")]
 	use nilket_local::{
@@ -1906,6 +1930,62 @@ mod tests {
 				});
 			}
 			Ok(polars::df!("x" => [1_i64], "y" => [2_i64]).expect("fixture frame"))
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	fn complete_relation_in_head(
+		state: &mut super::AppState,
+		source_buffer: libaryon::core::BufferId,
+		revision: u64,
+		relation: TransformedRuneRelation,
+		frame: polars::frame::DataFrame,
+	) {
+		let origin = relation.origin.clone();
+		let views = relation
+			.views
+			.iter()
+			.map(|view| view.identity.clone())
+			.collect::<Vec<_>>();
+		let outcome = rune_view_outcome(frame, relation.views);
+		let plots = outcome
+			.sinks
+			.iter()
+			.filter_map(|sink| {
+				let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved)) = &sink.output
+				else {
+					return None;
+				};
+				Some((sink.identity.clone(), resolved.clone()))
+			})
+			.collect::<Vec<_>>();
+
+		drop(update(
+			state,
+			Message::RunRuneViewSetResult {
+				source_buffer,
+				revision,
+				origin,
+				views,
+				result: Ok(outcome),
+			},
+		));
+		for (identity, resolved) in plots {
+			let panel_id = state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity)
+				.expect("prepared plot panel");
+			let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+			drop(update(
+				state,
+				Message::RuneRelationPlotReady {
+					source_buffer,
+					revision,
+					panel_id,
+					resolved,
+					kernel,
+				},
+			));
 		}
 	}
 
@@ -2395,6 +2475,11 @@ mod tests {
 		let source = "let r = workspace.table(\"t\"); table(r); plot.bar(r, \"missing\", \"y\")";
 		let transformed = transform_rune_view(source).expect("view envelope");
 		let origin = transformed.origin.clone();
+		let views = transformed
+			.views
+			.iter()
+			.map(|view| view.identity.clone())
+			.collect::<Vec<_>>();
 		let outcome = rune_view_outcome(
 			polars::df!("y" => [1_i64, 2]).expect("fixture frame"),
 			transformed.views.clone(),
@@ -2420,7 +2505,14 @@ mod tests {
 		drop(startup);
 		let source_buffer = libaryon::core::BufferId::new(73);
 		state.rune_buffer_revisions.insert(source_buffer, 1);
-		state.code_editor.begin_query();
+		let presentation = transformed
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.form()))
+			.collect::<Vec<_>>();
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, 1);
 		assert!(
 			state
 				.rune_view_scheduler
@@ -2437,14 +2529,496 @@ mod tests {
 				source_buffer,
 				revision: 1,
 				origin,
+				views: views.clone(),
 				result: Ok(outcome),
 			},
 		));
 		assert!(
-			state.code_editor.query_panel_is_table(),
+			state
+				.code_editor
+				.rune_view_panel_is_table(source_buffer, &views[0]),
 			"the plot failure must not replace the sibling table"
 		);
 		assert!(state.status_error.contains("plot.bar at bytes"));
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard() {
+		let source = r#"
+ket.table("test1")
+	.sort([col("x").asc()])
+	.views([
+		scatter("x", "y"),
+		table()])
+ket.table("test2")
+	.sort([col("cat").asc()])
+	.views([
+		bar("cat", "val"),
+		table()])
+"#;
+		let program = transform_rune_view(source).expect("dogfood view program");
+		let presentation = program
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.form()))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			presentation,
+			vec![
+				(LocalViewIdentity::Anonymous(0), RuneViewForm::Scatter),
+				(LocalViewIdentity::Anonymous(1), RuneViewForm::Table),
+				(LocalViewIdentity::Anonymous(2), RuneViewForm::Bar),
+				(LocalViewIdentity::Anonymous(3), RuneViewForm::Table),
+			]
+		);
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(80);
+		let revision = 1;
+		state.rune_buffer_revisions.insert(source_buffer, revision);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, revision);
+		let panel_ids = presentation
+			.iter()
+			.map(|(identity, _)| {
+				state
+					.code_editor
+					.rune_view_panel_id(source_buffer, identity)
+					.expect("view panel")
+			})
+			.collect::<Vec<_>>();
+		assert!(panel_ids.windows(2).all(|ids| ids[0] < ids[1]));
+		assert!(panel_ids[0].get() >= (1_u64 << 63));
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision,
+					view: program.clone(),
+				})
+				.is_some()
+		);
+
+		let mut relations = program.into_relations().collect::<Vec<_>>();
+		relations.reverse();
+		for relation in relations {
+			let frame = if relation.origin.contains("test1") {
+				polars::df!("x" => [1_i64, 2], "y" => [2_i64, 4]).expect("test1 frame")
+			} else {
+				polars::df!("cat" => ["a", "b"], "val" => [3_i64, 5]).expect("test2 frame")
+			};
+			complete_relation_in_head(&mut state, source_buffer, revision, relation, frame);
+		}
+
+		let first_table = state
+			.code_editor
+			.rune_view_panel_table(source_buffer, &LocalViewIdentity::Anonymous(1))
+			.expect("first table panel");
+		let second_table = state
+			.code_editor
+			.rune_view_panel_table(source_buffer, &LocalViewIdentity::Anonymous(3))
+			.expect("second table panel");
+		assert!(first_table.column("x").is_ok());
+		assert!(first_table.column("cat").is_err());
+		assert!(second_table.column("cat").is_ok());
+		assert!(second_table.column("x").is_err());
+		assert_ne!(panel_ids[1], panel_ids[3]);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_plot(source_buffer, &LocalViewIdentity::Anonymous(0))
+		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_plot(source_buffer, &LocalViewIdentity::Anonymous(2)),
+			"bar panel did not resolve: {}",
+			state.status_error
+		);
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn execution_grouping_cannot_reorder_interleaved_host_panels() {
+		let source = r#"
+let a = workspace.table("a");
+let b = workspace.table("b");
+table(a);
+plot.scatter(b, "x", "y");
+plot.bar(a, "x", "y");
+"#;
+		let program = transform_rune_view(source).expect("interleaved origins");
+		let presentation = program
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.form()))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			presentation
+				.iter()
+				.map(|(_, form)| *form)
+				.collect::<Vec<_>>(),
+			vec![
+				RuneViewForm::Table,
+				RuneViewForm::Scatter,
+				RuneViewForm::Bar
+			]
+		);
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(81);
+		state.rune_buffer_revisions.insert(source_buffer, 1);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, 1);
+		let ids = presentation
+			.iter()
+			.map(|(identity, _)| {
+				state
+					.code_editor
+					.rune_view_panel_id(source_buffer, identity)
+					.expect("interleaved panel")
+			})
+			.collect::<Vec<_>>();
+		assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision: 1,
+					view: program.clone(),
+				})
+				.is_some()
+		);
+
+		let mut relations = program.into_relations().collect::<Vec<_>>();
+		let b = relations
+			.iter()
+			.position(|relation| relation.origin.contains("table(\"b\")"))
+			.map(|index| relations.remove(index))
+			.expect("b relation");
+		complete_relation_in_head(
+			&mut state,
+			source_buffer,
+			1,
+			b,
+			polars::df!("x" => [1_i64, 2], "y" => [3_i64, 4]).expect("b frame"),
+		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_plot(source_buffer, &LocalViewIdentity::Anonymous(1))
+		);
+		complete_relation_in_head(
+			&mut state,
+			source_buffer,
+			1,
+			relations.pop().expect("a relation"),
+			polars::df!("x" => ["left", "right"], "y" => [7_i64, 8]).expect("a frame"),
+		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_table(source_buffer, &LocalViewIdentity::Anonymous(0))
+		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_plot(source_buffer, &LocalViewIdentity::Anonymous(2)),
+			"bar panel did not resolve: {}",
+			state.status_error
+		);
+		assert_eq!(
+			ids,
+			(0..3)
+				.map(|position| {
+					state
+						.code_editor
+						.rune_view_panel_id(source_buffer, &LocalViewIdentity::Anonymous(position))
+						.expect("stable presentation panel")
+				})
+				.collect::<Vec<_>>()
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn view_identity_reuses_retargets_or_orphans_one_panel_as_declared() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(82);
+		let stable = LocalViewIdentity::Named("stable".to_owned());
+		let anonymous = LocalViewIdentity::Anonymous(0);
+
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[(stable.clone(), RuneViewForm::Table)],
+			1,
+		);
+		let stable_panel = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &stable)
+			.expect("stable panel");
+		state.code_editor.set_rune_view_table(
+			stable_panel,
+			polars::df!("x" => [1_i64], "y" => [2_i64]).expect("initial table"),
+		);
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[(stable.clone(), RuneViewForm::Scatter)],
+			2,
+		);
+		assert_eq!(
+			state.code_editor.rune_view_panel_id(source_buffer, &stable),
+			Some(stable_panel),
+			"a named form change keeps the destination"
+		);
+		let changed = transform_rune_view(
+			"workspace.table(\"t\").views([view(\"stable\", scatter(\"x\", \"y\"))])",
+		)
+		.expect("named scatter")
+		.into_relations()
+		.next()
+		.expect("one relation");
+		let changed_outcome = rune_view_outcome(
+			polars::df!("x" => [1_i64, 2], "y" => [2_i64, 4]).expect("plot frame"),
+			changed.views,
+		);
+		let resolved = changed_outcome
+			.sinks
+			.into_iter()
+			.find_map(|sink| match sink.output {
+				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved)) => Some(resolved),
+				_ => None,
+			})
+			.expect("resolved scatter");
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+		state.code_editor.set_rune_view_plot(
+			stable_panel,
+			resolved.resolved_spec.composition,
+			kernel,
+		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_plot(source_buffer, &stable)
+		);
+
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[
+				(stable.clone(), RuneViewForm::Scatter),
+				(anonymous.clone(), RuneViewForm::Table),
+			],
+			3,
+		);
+		let anonymous_panel = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &anonymous)
+			.expect("anonymous panel");
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[
+				(stable.clone(), RuneViewForm::Scatter),
+				(anonymous.clone(), RuneViewForm::Bar),
+			],
+			4,
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &anonymous),
+			Some(anonymous_panel),
+			"anonymous identity is its presentation slot"
+		);
+
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[(anonymous.clone(), RuneViewForm::Bar)],
+			5,
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &stable),
+			Some("orphaned")
+		);
+		assert_eq!(
+			state.code_editor.rune_view_panel_id(source_buffer, &stable),
+			Some(stable_panel),
+			"orphaning retains the destination"
+		);
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[(stable.clone(), RuneViewForm::Table)],
+			6,
+		);
+		assert_eq!(
+			state.code_editor.rune_view_panel_id(source_buffer, &stable),
+			Some(stable_panel),
+		);
+		state.code_editor.set_rune_view_table(
+			stable_panel,
+			polars::df!("restored" => [true]).expect("restored table"),
+		);
+
+		let invalid =
+			"workspace.table(\"t\").views([view(\"same\", table()), view(\"same\", table())])";
+		assert_eq!(
+			super::run_rune_code(&mut state, source_buffer, invalid.to_owned()).units(),
+			0
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &stable),
+			Some("stale"),
+			"an envelope failure is not deletion"
+		);
+
+		let first_failure = LocalViewIdentity::Named("first-failure".to_owned());
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[(first_failure.clone(), RuneViewForm::Table)],
+			7,
+		);
+		let failed_panel = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &first_failure)
+			.expect("first-failure panel");
+		state
+			.code_editor
+			.fail_rune_view(failed_panel, "first run failed".to_owned());
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_failed(source_buffer, &first_failure)
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn failed_origin_keeps_prior_content_stale_while_its_sibling_refreshes() {
+		let source = r#"
+workspace.table("good").views([view("good", table())]);
+workspace.table("bad").views([view("bad", table())]);
+"#;
+		let program = transform_rune_view(source).expect("isolated named origins");
+		let presentation = program
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.form()))
+			.collect::<Vec<_>>();
+		let good = LocalViewIdentity::Named("good".to_owned());
+		let bad = LocalViewIdentity::Named("bad".to_owned());
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(83);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, 1);
+		for identity in [&good, &bad] {
+			let panel = state
+				.code_editor
+				.rune_view_panel_id(source_buffer, identity)
+				.expect("named panel");
+			state.code_editor.set_rune_view_table(
+				panel,
+				polars::df!("previous" => [1_i64]).expect("previous content"),
+			);
+		}
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, 2);
+		state.rune_buffer_revisions.insert(source_buffer, 2);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision: 2,
+					view: program.clone(),
+				})
+				.is_some()
+		);
+		let mut relations = program.into_relations().collect::<Vec<_>>();
+		let bad_relation = relations
+			.iter()
+			.position(|relation| relation.origin.contains("table(\"bad\")"))
+			.map(|index| relations.remove(index))
+			.expect("bad relation");
+		drop(update(
+			&mut state,
+			Message::RunRuneViewSetResult {
+				source_buffer,
+				revision: 2,
+				origin: bad_relation.origin,
+				views: bad_relation
+					.views
+					.into_iter()
+					.map(|view| view.identity)
+					.collect(),
+				result: Err("bad origin failed".to_owned()),
+			},
+		));
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &bad),
+			Some("stale")
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &good),
+			Some("running")
+		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_table(source_buffer, &bad),
+			"stale preserves the prior frame"
+		);
+
+		complete_relation_in_head(
+			&mut state,
+			source_buffer,
+			2,
+			relations.pop().expect("good relation"),
+			polars::df!("current" => [2_i64]).expect("fresh sibling content"),
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &good),
+			Some("fresh")
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &bad),
+			Some("stale")
+		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_table(source_buffer, &good)
+				.expect("fresh good table")
+				.column("current")
+				.is_ok()
+		);
+		state.code_editor.shutdown();
 	}
 
 	#[test]

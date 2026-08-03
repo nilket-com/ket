@@ -116,3 +116,58 @@ cargo test -p polariton --features toron \
 cargo check -p polariton --features toron
 passed (Stage 3 consumes identity/order fields carried in the outcome)
 ```
+
+### Stage 3 — ordinary host-panel realization
+
+- Gate 3: `execution_grouping_cannot_reorder_interleaved_host_panels` opens the
+  table-`a`, scatter-`b`, bar-`a` panels in global presentation order, completes
+  `b` before `a`, and observes the same identities and content order afterward.
+- Gates 6 and 7:
+  `view_identity_reuses_retargets_or_orphans_one_panel_as_declared` reruns a
+  named view, changes it from table to scatter, and observes the same
+  `HostPanelId` hosting the new plot content.
+- Gate 8: the same test changes the form occupying anonymous presentation slot
+  zero and observes reuse of that slot's session-local destination.
+- Gate 9:
+  `dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard`
+  reproduces `/home/me/work/uat/test5.rn` as written. Its two `table()` sinks
+  retain distinct ids and frames (`x`/`y` versus `cat`/`val`), alongside two
+  ordinary plot panels.
+- Gate 10:
+  `failed_origin_keeps_prior_content_stale_while_its_sibling_refreshes` fails
+  the `bad` origin first, preserves its prior table with a stale marker, then
+  refreshes the `good` origin without clearing the failed panel's state.
+- Gate 11: the identity lifecycle test removes `stable` from a valid revision,
+  observes its panel retained and marked orphaned, then restores the name onto
+  the same id.
+- Gate 12: the lifecycle test submits a duplicate-name envelope refusal after a
+  successful result and observes stale preserved content rather than orphaning.
+- Gate 13: the dogfood test completes both tables and both plot kernels while
+  `DashboardState.panes` remains `None` and `DashboardState.content` remains
+  empty. `product_0010_relation_views_complete_without_dashboard_routing` is the
+  secondary reintroduction guard over the completion handler.
+
+The head allocates all four dogfood destinations from the single upper-half
+counter before dispatch. `PanelContent::Plot` owns the existing `PlotPaneState`
+directly, and its host surface emits plot interaction without `DashboardMsg`.
+Stale and orphan markers live beside content, so neither state destroys the
+last successful frame or kernel. A first-run failure instead replaces the
+running placeholder with `Failed` content.
+
+Verification:
+
+```text
+cargo test -p polariton --features toron
+217 passed; 4 ignored (live-service tests), 16 architecture tests passed
+
+cargo check -p polariton --no-default-features
+passed
+
+cargo fmt --all -- --check
+passed
+```
+
+All thirteen acceptance gates are discharged. The Stage 0 session-identity
+fallback remains the accepted limit: named view ids survive reruns in this
+process, not application restarts. No libaryon, Toron, transport, dashboard, or
+layout-policy file changed, so PRODUCT-0010's halt rule was not triggered.

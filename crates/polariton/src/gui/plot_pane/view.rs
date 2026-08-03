@@ -123,6 +123,58 @@ pub fn view<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMs
 		.into()
 }
 
+/// Plot content hosted directly by a libaryon panel. Host-panel chrome owns
+/// closing and layout, so this surface emits only plot interaction and never a
+/// [`DashboardMsg`].
+#[cfg(feature = "toron")]
+pub fn host_view(state: &PlotPaneState) -> Element<'_, PlotMessage> {
+	let title = state.composition.title();
+	let data = canvas(PlotWidget {
+		kernel: state.kernel.as_ref(),
+		title: title.clone(),
+		padding: 20.0,
+		settings: state.plot_settings.clone(),
+		render_revision: state.render_revision,
+		resize_render_suspended: state.resize_render_suspended,
+		layer: PlotRenderLayer::Data,
+	})
+	.width(Fill)
+	.height(Fill);
+	let interaction = canvas(PlotWidget {
+		kernel: state.kernel.as_ref(),
+		title,
+		padding: 20.0,
+		settings: state.plot_settings.clone(),
+		render_revision: state.render_revision,
+		resize_render_suspended: state.resize_render_suspended,
+		layer: PlotRenderLayer::OverlayInteractive,
+	})
+	.width(Fill)
+	.height(Fill);
+	let mut layers = stack![data, interaction];
+	if let Some(info) = &state.hovered_info {
+		layers = layers.push(
+			container(text(info))
+				.padding(6)
+				.style(|_| container::Style {
+					background: Some(iced::Background::Color(iced::Color {
+						a: 0.85,
+						..state.plot_settings.background_color
+					})),
+					text_color: Some(state.plot_settings.decoration_color),
+					..Default::default()
+				}),
+		);
+	}
+	container(layers.width(Fill).height(Fill))
+		.style(|_| container::Style {
+			background: Some(Background::Color(state.plot_settings.background_color)),
+			text_color: Some(state.plot_settings.decoration_color),
+			..Default::default()
+		})
+		.into()
+}
+
 fn plot_settings_panel<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMsg> {
 	let plot_event = move |pm| DashboardMsg::Plot(id, pm);
 	container(

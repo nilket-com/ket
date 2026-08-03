@@ -5,12 +5,16 @@
 //! renders the focused pane's projection: syntax, gutter, cursor, selection,
 //! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
+#[cfg(feature = "toron")]
+use crate::gui::plot_pane::{self, PlotPaneMsg, PlotPaneState};
 use crate::gui::{
 	dashboard::{self, DashboardMsg, DashboardState},
 	table::{Table, TableScroll},
 };
 use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
+#[cfg(feature = "toron")]
+use crate::rune_relation_envelope::{LocalViewIdentity, RuneViewForm};
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
@@ -45,6 +49,8 @@ use std::time::Duration;
 /// so results replace in place instead of opening a pane per query.
 const RESULT_PANEL: HostPanelId = HostPanelId::new(1);
 const DASHBOARD_PANEL: HostPanelId = HostPanelId::new(2);
+#[cfg(feature = "toron")]
+const DYNAMIC_VIEW_PANEL_BASE: u64 = 1_u64 << 63;
 
 const INITIAL_COLUMNS: u16 = 120;
 const INITIAL_ROWS: u16 = 40;
@@ -124,6 +130,11 @@ pub enum EditorMsg {
 		action: PaneTabAction,
 	},
 	Dashboard(DashboardMsg),
+	#[cfg(feature = "toron")]
+	HostPlot {
+		panel_id: HostPanelId,
+		message: PlotPaneMsg,
+	},
 	Input(InputEvent),
 	Paste(String),
 	Scroll(i32),
@@ -329,6 +340,12 @@ pub struct CodeEditor {
 	/// a Baryon-managed HostPanel.
 	show_column_types: bool,
 	panels: PanelRegistry,
+	/// Session-local realization of semantic view identities. Dynamic ids live
+	/// in the upper half of the namespace; fixed application panels stay below.
+	#[cfg(feature = "toron")]
+	view_panel_ids: HashMap<(libaryon::core::BufferId, LocalViewIdentity), HostPanelId>,
+	#[cfg(feature = "toron")]
+	next_view_panel_id: u64,
 	/// Monotonic revision for the results panel, so each run supersedes the
 	/// last.
 	result_revision: u64,
@@ -525,6 +542,10 @@ impl CodeEditor {
 			quit_notified: false,
 			show_column_types: false,
 			panels: PanelRegistry::default(),
+			#[cfg(feature = "toron")]
+			view_panel_ids: HashMap::new(),
+			#[cfg(feature = "toron")]
+			next_view_panel_id: DYNAMIC_VIEW_PANEL_BASE,
 			result_revision: 0,
 			drag: None,
 			pane_drag: None,
@@ -772,6 +793,193 @@ impl CodeEditor {
 		self.panels.set_content(RESULT_PANEL, PanelContent::Running);
 	}
 
+	/// Resolve one buffer revision's semantic view identities and establish its
+	/// ordinary host panels in presentation order before any query completes.
+	#[cfg(feature = "toron")]
+	pub fn prepare_rune_view_panels(
+		&mut self,
+		producer: libaryon::core::BufferId,
+		views: &[(LocalViewIdentity, RuneViewForm)],
+		revision: u64,
+	) {
+		let active = views
+			.iter()
+			.map(|(identity, _)| identity.clone())
+			.collect::<std::collections::HashSet<_>>();
+		let orphaned = self
+			.view_panel_ids
+			.iter()
+			.filter_map(|((buffer, identity), panel_id)| {
+				(*buffer == producer && !active.contains(identity)).then_some(*panel_id)
+			})
+			.collect::<Vec<_>>();
+		for panel_id in orphaned {
+			self.panels.mark_orphaned(panel_id);
+		}
+
+		for (identity, form) in views {
+			let panel_id = self.resolve_rune_view_panel(producer, identity.clone());
+			let known = self.panels.panels.contains_key(&panel_id)
+				&& !self.panels.pending_disposal.contains(&panel_id);
+			if known {
+				self.send(EditorCommand::RefreshHostPanel {
+					panel_id,
+					revision: PanelRevision::new(revision),
+				});
+			} else {
+				let title = match identity {
+					LocalViewIdentity::Named(name) => name.clone(),
+					LocalViewIdentity::Anonymous(position) => {
+						format!("{} {}", form.label(), position + 1)
+					}
+				};
+				self.send(EditorCommand::OpenHostPanel {
+					panel_id,
+					kind: match form {
+						RuneViewForm::Table => "rune-view-table",
+						RuneViewForm::Bar | RuneViewForm::Scatter => "rune-view-plot",
+					}
+					.to_owned(),
+					title,
+					split_direction: SplitDirection::Horizontal,
+					focus: false,
+				});
+			}
+			self.panels.mark_running(panel_id);
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	fn resolve_rune_view_panel(
+		&mut self,
+		producer: libaryon::core::BufferId,
+		identity: LocalViewIdentity,
+	) -> HostPanelId {
+		let key = (producer, identity);
+		if let Some(panel_id) = self.view_panel_ids.get(&key) {
+			return *panel_id;
+		}
+		let value = self.next_view_panel_id;
+		self.next_view_panel_id = self
+			.next_view_panel_id
+			.checked_add(1)
+			.expect("dynamic HostPanelId namespace exhausted");
+		let panel_id = HostPanelId::new(value);
+		self.view_panel_ids.insert(key, panel_id);
+		panel_id
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn rune_view_panel_id(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<HostPanelId> {
+		self.view_panel_ids
+			.get(&(producer, identity.clone()))
+			.copied()
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn set_rune_view_table(&mut self, panel_id: HostPanelId, frame: DataFrame) {
+		self.panels
+			.set_content(panel_id, PanelContent::Table(Box::new(frame)));
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn set_rune_view_plot(
+		&mut self,
+		panel_id: HostPanelId,
+		composition: PlotComposition,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+	) {
+		self.panels.set_plot(panel_id, composition, kernel);
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn fail_rune_view(&mut self, panel_id: HostPanelId, message: String) {
+		self.panels.fail_or_stale(panel_id, message);
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn mark_rune_view_producer_stale(
+		&mut self,
+		producer: libaryon::core::BufferId,
+		message: String,
+	) {
+		let panels = self
+			.view_panel_ids
+			.iter()
+			.filter_map(|((buffer, _), panel_id)| (*buffer == producer).then_some(*panel_id))
+			.collect::<Vec<_>>();
+		for panel_id in panels {
+			self.panels.fail_or_stale(panel_id, message.clone());
+		}
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_is_table(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> bool {
+		self.rune_view_panel_id(producer, identity)
+			.and_then(|panel_id| self.panels.panels.get(&panel_id))
+			.is_some_and(|entry| matches!(entry.content, PanelContent::Table(_)))
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_is_plot(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> bool {
+		self.rune_view_panel_id(producer, identity)
+			.and_then(|panel_id| self.panels.panels.get(&panel_id))
+			.is_some_and(|entry| matches!(entry.content, PanelContent::Plot(_)))
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_is_failed(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> bool {
+		self.rune_view_panel_id(producer, identity)
+			.and_then(|panel_id| self.panels.panels.get(&panel_id))
+			.is_some_and(|entry| matches!(entry.content, PanelContent::Failed(_)))
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_status(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<&'static str> {
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let entry = self.panels.panels.get(&panel_id)?;
+		Some(match entry.status {
+			PanelStatus::Fresh => "fresh",
+			PanelStatus::Running => "running",
+			PanelStatus::Stale(_) => "stale",
+			PanelStatus::Orphaned => "orphaned",
+		})
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_table(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<&DataFrame> {
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let entry = self.panels.panels.get(&panel_id)?;
+		match &entry.content {
+			PanelContent::Table(frame) => Some(frame),
+			_ => None,
+		}
+	}
+
 	#[cfg(test)]
 	pub(crate) fn has_query_surface(&self) -> bool {
 		self.panels.panels.contains_key(&RESULT_PANEL)
@@ -822,14 +1030,6 @@ impl CodeEditor {
 	pub fn set_query_message(&mut self, message: String) {
 		self.panels
 			.set_content(RESULT_PANEL, PanelContent::Message(message));
-	}
-
-	#[cfg(all(test, feature = "toron"))]
-	pub(crate) fn query_panel_is_table(&self) -> bool {
-		self.panels
-			.panels
-			.get(&RESULT_PANEL)
-			.is_some_and(|entry| matches!(entry.content, PanelContent::Table(_)))
 	}
 
 	pub fn set_show_column_types(&mut self, show_column_types: bool) {
@@ -1102,6 +1302,10 @@ impl CodeEditor {
 				self.request_content();
 			}
 			EditorMsg::Dashboard(_) => {}
+			#[cfg(feature = "toron")]
+			EditorMsg::HostPlot { panel_id, message } => {
+				self.panels.update_plot(panel_id, message);
+			}
 			EditorMsg::NotebookPlot { identity, message } => {
 				if let Some(NotebookCellOutput::Plot { surface }) =
 					self.notebook_outputs.get_mut(&identity)
@@ -2022,6 +2226,7 @@ pub struct PanelRegistry {
 struct PanelEntry {
 	revision: PanelRevision,
 	content: PanelContent,
+	status: PanelStatus,
 	/// Latest keyboard-driven scroll, with a sequence the widget uses to apply
 	/// it exactly once rather than on every frame.
 	scroll: Option<(u64, TableScroll)>,
@@ -2035,8 +2240,22 @@ enum PanelContent {
 	Unresolved,
 	Running,
 	Table(Box<DataFrame>),
+	#[cfg(feature = "toron")]
+	Plot(Box<PlotPaneState>),
 	Message(String),
 	Failed(String),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+enum PanelStatus {
+	#[default]
+	Fresh,
+	#[cfg(feature = "toron")]
+	Running,
+	#[cfg(feature = "toron")]
+	Stale(String),
+	#[cfg(feature = "toron")]
+	Orphaned,
 }
 
 impl PanelRegistry {
@@ -2054,6 +2273,7 @@ impl PanelRegistry {
 						.or_insert(PanelEntry {
 							revision: *revision,
 							content: PanelContent::Unresolved,
+							status: PanelStatus::Fresh,
 							scroll: None,
 						})
 						.revision = *revision;
@@ -2070,6 +2290,7 @@ impl PanelRegistry {
 						PanelEntry {
 							revision: PanelRevision::new(0),
 							content: PanelContent::Unresolved,
+							status: PanelStatus::Fresh,
 							scroll: None,
 						},
 					);
@@ -2110,6 +2331,7 @@ impl PanelRegistry {
 				self.panels.entry(panel.panel_id).or_insert(PanelEntry {
 					revision: panel.revision,
 					content: PanelContent::Unresolved,
+					status: PanelStatus::Fresh,
 					scroll: None,
 				});
 			}
@@ -2152,9 +2374,93 @@ impl PanelRegistry {
 		let entry = self.panels.entry(panel_id).or_insert(PanelEntry {
 			revision: PanelRevision::new(0),
 			content: PanelContent::Unresolved,
+			status: PanelStatus::Fresh,
 			scroll: None,
 		});
 		entry.content = content;
+		entry.status = PanelStatus::Fresh;
+	}
+
+	#[cfg(feature = "toron")]
+	fn mark_running(&mut self, panel_id: HostPanelId) {
+		let entry = self.panels.entry(panel_id).or_insert(PanelEntry {
+			revision: PanelRevision::new(0),
+			content: PanelContent::Unresolved,
+			status: PanelStatus::Fresh,
+			scroll: None,
+		});
+		if matches!(
+			entry.content,
+			PanelContent::Unresolved | PanelContent::Running | PanelContent::Failed(_)
+		) {
+			entry.content = PanelContent::Running;
+		}
+		entry.status = PanelStatus::Running;
+	}
+
+	#[cfg(feature = "toron")]
+	fn fail_or_stale(&mut self, panel_id: HostPanelId, message: String) {
+		let entry = self.panels.entry(panel_id).or_insert(PanelEntry {
+			revision: PanelRevision::new(0),
+			content: PanelContent::Unresolved,
+			status: PanelStatus::Fresh,
+			scroll: None,
+		});
+		if matches!(
+			entry.content,
+			PanelContent::Table(_) | PanelContent::Plot(_) | PanelContent::Message(_)
+		) {
+			entry.status = PanelStatus::Stale(message);
+		} else {
+			entry.content = PanelContent::Failed(message);
+			entry.status = PanelStatus::Fresh;
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	fn mark_orphaned(&mut self, panel_id: HostPanelId) {
+		if let Some(entry) = self.panels.get_mut(&panel_id) {
+			entry.status = PanelStatus::Orphaned;
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	fn update_plot(&mut self, panel_id: HostPanelId, message: PlotPaneMsg) {
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			..
+		}) = self.panels.get_mut(&panel_id)
+		{
+			plot.update(message);
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	fn set_plot(
+		&mut self,
+		panel_id: HostPanelId,
+		composition: PlotComposition,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+	) {
+		if let Some(PanelEntry {
+			content: PanelContent::Plot(plot),
+			status,
+			..
+		}) = self.panels.get_mut(&panel_id)
+		{
+			plot.set_kernel(composition, kernel);
+			*status = PanelStatus::Fresh;
+			return;
+		}
+		self.set_content(
+			panel_id,
+			PanelContent::Plot(Box::new(PlotPaneState::with_kernel(
+				composition,
+				kernel,
+				1200,
+				720,
+			))),
+		);
 	}
 
 	/// Native surface for a host panel. Backing objects will replace the
@@ -2166,9 +2472,8 @@ impl PanelRegistry {
 		show_column_types: bool,
 		dashboard: &'a DashboardState,
 	) -> Element<'a, EditorMsg> {
-		let content = self
-			.panels
-			.get(&panel.panel_id)
+		let entry = self.panels.get(&panel.panel_id);
+		let content = entry
 			.map(|entry| &entry.content)
 			.unwrap_or(&PanelContent::Unresolved);
 
@@ -2184,6 +2489,13 @@ impl PanelRegistry {
 							.and_then(|entry| entry.scroll),
 					)
 					.into(),
+				#[cfg(feature = "toron")]
+				PanelContent::Plot(plot) => {
+					plot_pane::host_view(plot).map(move |message| EditorMsg::HostPlot {
+						panel_id: panel.panel_id,
+						message,
+					})
+				}
 				PanelContent::Running => {
 					panel_message("running…".to_owned(), color(palette.preview_text))
 				}
@@ -2202,6 +2514,33 @@ impl PanelRegistry {
 					color(palette.preview_text),
 				),
 			}
+		};
+		#[cfg(feature = "toron")]
+		let marker = entry.and_then(|entry| match &entry.status {
+			PanelStatus::Fresh => None,
+			#[cfg(feature = "toron")]
+			PanelStatus::Running => Some(("refreshing…".to_owned(), palette.preview_text)),
+			#[cfg(feature = "toron")]
+			PanelStatus::Stale(message) => Some((format!("stale · {message}"), palette.status_text)),
+			#[cfg(feature = "toron")]
+			PanelStatus::Orphaned => Some(("orphaned".to_owned(), palette.status_text)),
+		});
+		#[cfg(feature = "toron")]
+		let inner = if let Some((label, tint)) = marker {
+			stack![
+				inner,
+				container(
+					text(label)
+						.font(EDITOR_FONT)
+						.size(metrics::TEXT_SIZE - 2.0)
+						.color(color(tint)),
+				)
+				.padding(4)
+				.align_x(iced::alignment::Horizontal::Right)
+			]
+			.into()
+		} else {
+			inner
 		};
 		let surface = color(palette.preview_surface);
 		container(inner)

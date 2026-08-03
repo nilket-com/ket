@@ -464,3 +464,29 @@ fn product_0007_stage_three_stays_session_scoped_and_keeps_ui_out_of_data_color(
 		);
 	}
 }
+
+#[test]
+fn product_0010_relation_views_complete_without_dashboard_routing() {
+	let source =
+		std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui/state.rs"))
+			.expect("read Polariton GUI state");
+	let handler = source
+		.split("\n\t\tMessage::RuneRelationPlotReady {")
+		.nth(1)
+		.and_then(|tail| tail.split("Message::RunMarkdownCellResult {").next())
+		.expect("isolate Rune relation plot completion handler");
+	assert!(
+		handler.contains("set_rune_view_plot"),
+		"PRODUCT-0010 plots must resolve through their ordinary host panel"
+	);
+	for forbidden in ["open_dashboard", "app_state.dashboard"] {
+		assert!(
+			!handler.contains(forbidden),
+			"PRODUCT-0010 relation completion reacquired dashboard routing: {forbidden}"
+		);
+	}
+	assert!(
+		"open_dashboard(); app_state.dashboard.apply_plot()".contains("open_dashboard"),
+		"positive control: dashboard-routing assay must observe the old path"
+	);
+}

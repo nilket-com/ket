@@ -106,6 +106,7 @@ pub enum Message {
 		source_buffer: BufferId,
 		revision: u64,
 		origin: String,
+		views: Vec<LocalViewIdentity>,
 		result: std::result::Result<RuneRelationViewSetOutcome, String>,
 	},
 	RuneBufferPlotReady {
@@ -118,7 +119,7 @@ pub enum Message {
 	RuneRelationPlotReady {
 		source_buffer: BufferId,
 		revision: u64,
-		form: RuneViewForm,
+		panel_id: libaryon::engine::HostPanelId,
 		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},
@@ -158,7 +159,6 @@ pub struct RuneRelationViewSetOutcome {
 #[derive(Clone)]
 pub struct RuneRelationSinkOutcome {
 	pub identity: LocalViewIdentity,
-	pub output_order: usize,
 	pub form: RuneViewForm,
 	pub span: std::ops::Range<u32>,
 	/// Every sink holds the same `Arc` as its containing set. This is the
