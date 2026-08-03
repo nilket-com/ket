@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.9. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.10. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -225,6 +225,26 @@ result identity.
    degrades quietly into a second, undeclared execution engine inside the
    workbench.
 
+### Respelling stop condition
+
+> Accepting `.views([...])` may add only parsing, provenance analysis, and
+> lowering into the existing `ViewSet` normal form. If implementation requires
+> changing execution, channel resolution, durability, or rendering — or
+> invalidates existing executable evidence — the work stops: the proposal is not
+> a respelling and requires a broader record.
+
+This is a stop condition rather than an acceptance checklist, and the difference
+is where it acts. A checklist confirms completion at the end; this halts the work
+the moment a change of the forbidden kind is required, which is when the
+discovery is cheapest and before the record's stated scope has quietly become
+untrue.
+
+The corollary is that the accepting record's own evidence is small and
+predictable: direct-versus-factored equivalence, sink ordering, and contextual
+constructor recognition. Everything else it needs is already proved. Every
+`executable` row above must still cite exactly what it cites today, with the new
+record adding its own citations rather than replacing any.
+
 ### What this section does not decide
 
 `PlotSpec` fields, scales, guides, themes, interaction, named views, and durable
@@ -283,6 +303,11 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.10 (2026-08-03): added the respelling stop condition — the normative limit
+  on what an accepting record may implement, and the halt rule if it needs more.
+  Recorded because it is falsifiable mid-work rather than only at the end, and
+  because it fixes the accepting record's evidence to three items with every
+  existing `executable` citation left untouched.
 - v0.9 (2026-08-03): four rows become **executable** — the three view sinks and
   shared-execution fan-out. The live relation gate now runs green against an
   installed deployment and asserts axis identity (`kernel.x_label()` /
