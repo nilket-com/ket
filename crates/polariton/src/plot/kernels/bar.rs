@@ -5,11 +5,20 @@ use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::Text;
 use iced::{Color, Rectangle};
 use polars::prelude::*;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct BarPlotKernel {
 	pub prepared_data: Arc<BarPreparedData>,
 	pub orientation: Orientation,
+}
+
+fn category_label(value: AnyValue<'_>) -> String {
+	if let AnyValue::String(value) = value {
+		value.to_string()
+	} else {
+		value.to_string().replace('"', "")
+	}
 }
 
 impl PlotKernel for BarPlotKernel {
@@ -331,7 +340,7 @@ pub fn prepare_bar_data(
 			),
 		}
 	};
-	let (group_names, groups_series) = if group_col.is_empty() {
+	let (group_names, _groups_series) = if group_col.is_empty() {
 		(
 			vec!["Value".to_string()],
 			Series::new("dummy_group".into(), &["Value"]),
@@ -376,42 +385,46 @@ pub fn prepare_bar_data(
 	let y_min = 0.0f64;
 	let y_range = (y_min, y_max * 1.1);
 	let mut values = vec![vec![0.0f64; num_groups]; num_cats];
-	let partitions = if cat_col.is_empty() {
-		vec![df.clone()]
-	} else {
-		df.partition_by([cat_col], true)
-			.unwrap_or_else(|_| vec![df.clone()])
-	};
-	for (i, group_df) in partitions.into_iter().enumerate() {
-		if i >= num_cats {
-			break;
-		}
-		let group_partitions = if group_col.is_empty() {
-			vec![group_df]
+	let mut assigned = vec![vec![false; num_groups]; num_cats];
+	let category_indices: HashMap<&str, usize> = categories
+		.iter()
+		.enumerate()
+		.map(|(index, value)| (value.as_str(), index))
+		.collect();
+	let group_indices: HashMap<&str, usize> = group_names
+		.iter()
+		.enumerate()
+		.map(|(index, value)| (value.as_str(), index))
+		.collect();
+	let category_column = (!cat_col.is_empty())
+		.then(|| df.column(cat_col).ok())
+		.flatten();
+	let group_column = (!group_col.is_empty())
+		.then(|| df.column(group_col).ok())
+		.flatten();
+	for row in 0..df.height() {
+		let category_idx = if cat_col.is_empty() {
+			Some(0)
 		} else {
-			group_df
-				.partition_by([group_col], true)
-				.unwrap_or_else(|_| vec![group_df.clone()])
+			category_column
+				.and_then(|column| column.get(row).ok())
+				.map(category_label)
+				.and_then(|value| category_indices.get(value.as_str()).copied())
 		};
-		for sub_group_df in group_partitions {
-			let g_idx = if group_col.is_empty() {
-				0
-			} else {
-				let g_val = sub_group_df
-					.column(group_col)
-					.and_then(|c| c.get(0))
-					.unwrap_or(AnyValue::Null);
-				groups_series.iter().position(|v| v == g_val).unwrap_or(0)
-			};
-			if g_idx >= num_groups {
-				continue;
-			}
-			let val = sub_group_df
-				.column(val_col)
-				.and_then(|c| c.cast(&DataType::Float64))
-				.map(|c| c.f64().unwrap().get(0).unwrap_or(0.0))
-				.unwrap_or(0.0);
-			values[i][g_idx] = val;
+		let group_idx = if group_col.is_empty() {
+			Some(0)
+		} else {
+			group_column
+				.and_then(|column| column.get(row).ok())
+				.map(category_label)
+				.and_then(|value| group_indices.get(value.as_str()).copied())
+		};
+		let (Some(category_idx), Some(group_idx)) = (category_idx, group_idx) else {
+			continue;
+		};
+		if !assigned[category_idx][group_idx] {
+			values[category_idx][group_idx] = vals_f64.get(row).unwrap_or(0.0);
+			assigned[category_idx][group_idx] = true;
 		}
 	}
 	BarPreparedData {
@@ -421,5 +434,53 @@ pub fn prepare_bar_data(
 		y_range,
 		x_label: cat_col.to_string(),
 		y_label: val_col.to_string(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn values_follow_category_identity_after_labels_are_sorted() {
+		let frame = polars::df!(
+			"cat" => ["Cat1", "Cat2", "Cat3", "Cat4", "Cat5", "Cat6"],
+			"val" => [1.1_f64, 2.2, 3.3, 4.4, 5.5, 6.6],
+		)
+		.expect("bar fixture");
+
+		let prepared = prepare_bar_data(&frame, "cat", "", "val");
+
+		assert_eq!(
+			prepared.categories,
+			["Cat1", "Cat2", "Cat3", "Cat4", "Cat5", "Cat6"]
+		);
+		assert_eq!(
+			prepared.values,
+			vec![
+				vec![1.1],
+				vec![2.2],
+				vec![3.3],
+				vec![4.4],
+				vec![5.5],
+				vec![6.6]
+			]
+		);
+	}
+
+	#[test]
+	fn values_follow_both_category_and_group_identity() {
+		let frame = polars::df!(
+			"cat" => ["B", "A", "B", "A", "A"],
+			"group" => ["right", "left", "left", "right", "left"],
+			"val" => [21_i64, 10, 20, 11, 999],
+		)
+		.expect("grouped bar fixture");
+
+		let prepared = prepare_bar_data(&frame, "cat", "group", "val");
+
+		assert_eq!(prepared.categories, ["A", "B"]);
+		assert_eq!(prepared.group_names, ["left", "right"]);
+		assert_eq!(prepared.values, vec![vec![10.0, 11.0], vec![20.0, 21.0]]);
 	}
 }

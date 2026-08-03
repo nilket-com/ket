@@ -13,6 +13,14 @@ pub struct StackedBarPlotKernel {
 	pub orientation: Orientation,
 }
 
+fn category_label(value: AnyValue<'_>) -> String {
+	if let AnyValue::String(value) = value {
+		value.to_string()
+	} else {
+		value.to_string().replace('"', "")
+	}
+}
+
 impl PlotKernel for StackedBarPlotKernel {
 	fn layout(&self, settings: PlotSettings) -> PlotLayout {
 		match self.orientation {
@@ -341,7 +349,7 @@ pub fn prepare_stacked_bar_data(
 			),
 		}
 	};
-	let (group_names, groups_series) = if group_col.is_empty() {
+	let (group_names, _groups_series) = if group_col.is_empty() {
 		(
 			vec!["Value".to_string()],
 			Series::new("dummy_group".into(), &["Value"]),
@@ -373,64 +381,62 @@ pub fn prepare_stacked_bar_data(
 			),
 		}
 	};
-	// Polars values are immutable snapshots here; the map is local to this
-	// preparation pass and is never shared with a mutating categorical mapping.
-	#[allow(clippy::mutable_key_type)]
-	let group_idx_map: HashMap<AnyValue, usize> = groups_series
+	let category_idx_map: HashMap<&str, usize> = categories
 		.iter()
 		.enumerate()
-		.map(|(i, v): (usize, AnyValue)| (v.into_static(), i))
+		.map(|(index, value)| (value.as_str(), index))
+		.collect();
+	let group_idx_map: HashMap<&str, usize> = group_names
+		.iter()
+		.enumerate()
+		.map(|(index, value)| (value.as_str(), index))
 		.collect();
 	let num_cats = categories.len();
 	let num_groups = group_names.len();
 	let mut category_values = vec![vec![0.0f64; num_groups]; num_cats];
-	let mut max_sum = 0.0f64;
-	let partitions = if cat_col.is_empty() {
-		vec![df.clone()]
-	} else {
-		df.partition_by([cat_col], true)
-			.unwrap_or_else(|_| vec![df.clone()])
+	let mut assigned = vec![vec![false; num_groups]; num_cats];
+	let vals_col_series = match df.column(val_col) {
+		Ok(column) => column.cast(&DataType::Float64).unwrap_or_else(|_| {
+			Column::from(Series::new_empty(val_col.into(), &DataType::Float64))
+		}),
+		Err(_) => Column::from(Series::new_empty(val_col.into(), &DataType::Float64)),
 	};
-	for (i, group_df) in partitions.into_iter().enumerate() {
-		if i >= num_cats {
-			break;
-		}
-		let group_partitions = if group_col.is_empty() {
-			vec![group_df]
+	let vals_f64 = vals_col_series.f64().expect("value column was cast to f64");
+	let category_column = (!cat_col.is_empty())
+		.then(|| df.column(cat_col).ok())
+		.flatten();
+	let group_column = (!group_col.is_empty())
+		.then(|| df.column(group_col).ok())
+		.flatten();
+	for row in 0..df.height() {
+		let category_idx = if cat_col.is_empty() {
+			Some(0)
 		} else {
-			group_df
-				.partition_by([group_col], true)
-				.unwrap_or_else(|_| vec![group_df.clone()])
+			category_column
+				.and_then(|column| column.get(row).ok())
+				.map(category_label)
+				.and_then(|value| category_idx_map.get(value.as_str()).copied())
 		};
-		let mut current_cat_sum = 0.0f64;
-		for sub_group_df in group_partitions {
-			let group_idx = if group_col.is_empty() {
-				Some(0)
-			} else {
-				let group_val = sub_group_df
-					.column(group_col)
-					.and_then(|c| c.get(0))
-					.unwrap_or(AnyValue::Null);
-				group_idx_map.get(&group_val).copied()
-			};
-
-			if let Some(group_idx) = group_idx {
-				if group_idx >= num_groups {
-					continue;
-				}
-				let val = sub_group_df
-					.column(val_col)
-					.and_then(|c| c.cast(&DataType::Float64))
-					.map(|c| c.f64().unwrap().get(0).unwrap_or(0.0))
-					.unwrap_or(0.0);
-				category_values[i][group_idx] = val;
-				current_cat_sum += val;
-			}
-		}
-		if current_cat_sum > max_sum {
-			max_sum = current_cat_sum;
+		let group_idx = if group_col.is_empty() {
+			Some(0)
+		} else {
+			group_column
+				.and_then(|column| column.get(row).ok())
+				.map(category_label)
+				.and_then(|value| group_idx_map.get(value.as_str()).copied())
+		};
+		let (Some(category_idx), Some(group_idx)) = (category_idx, group_idx) else {
+			continue;
+		};
+		if !assigned[category_idx][group_idx] {
+			category_values[category_idx][group_idx] = vals_f64.get(row).unwrap_or(0.0);
+			assigned[category_idx][group_idx] = true;
 		}
 	}
+	let max_sum = category_values
+		.iter()
+		.map(|values| values.iter().sum::<f64>())
+		.fold(0.0, f64::max);
 	let y_min = 0.0f64;
 	let y_range = (y_min, max_sum * 1.1);
 	StackedBarPreparedData {
@@ -440,5 +446,30 @@ pub fn prepare_stacked_bar_data(
 		y_range,
 		x_label: cat_col.to_string(),
 		y_label: val_col.to_string(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn stacks_follow_category_and_group_identity() {
+		let frame = polars::df!(
+			"cat" => ["B", "A", "B", "A", "A"],
+			"group" => ["right", "left", "left", "right", "left"],
+			"val" => [21_i64, 10, 20, 11, 999],
+		)
+		.expect("stacked bar fixture");
+
+		let prepared = prepare_stacked_bar_data(&frame, "cat", "group", "val");
+
+		assert_eq!(prepared.categories, ["A", "B"]);
+		assert_eq!(prepared.group_names, ["left", "right"]);
+		assert_eq!(
+			prepared.category_values,
+			vec![vec![10.0, 11.0], vec![20.0, 21.0]]
+		);
+		assert_eq!(prepared.y_range, (0.0, 45.1));
 	}
 }
