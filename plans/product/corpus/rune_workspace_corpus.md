@@ -1,14 +1,15 @@
 # Rune workspace acceptance corpus
 
-Version 0.4. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.5. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
 evidence. "Pending" rows are the destination stated in advance, not omissions.
 
 Statuses: **executable** (landed with cited evidence) · **pending** (destination,
-not yet implemented) · **deferred-by-design** (excluded deliberately by a cited
-record).
+not yet implemented) · **proposed** (a spelling under consideration; no accepted
+record, and not a commitment) · **deferred-by-design** (excluded deliberately by
+a cited record).
 
 ## Relation construction and transformation
 
@@ -31,6 +32,98 @@ record).
 | shared-execution view fan-out (one execution, N sinks) | pending — fan-out pair target | expansion justified by measurement #2 dogfood evidence, 2026-08-01 |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
+
+## Proposed surface: encoded view fan-out
+
+Status: **proposed**. This section records a candidate spelling and the invariant
+that justifies it. No record accepts it, no implementation depends on it, and the
+executable and pending rows above continue to describe the surface that exists.
+If a later record accepts this surface, the view rows are respelled with that
+citation rather than silently migrated.
+
+### Load-bearing invariant
+
+> `RuneDataFrame` → `EncodedViewSet` is simultaneously the type-state boundary,
+> the fan-out boundary, and the Toron–Polariton process boundary.
+
+The three coincide, which is the argument for the surface rather than a
+consequence of it:
+
+- **Type-state.** `RuneDataFrame` has no sink methods; `EncodedViewSet` has no
+  relation methods. A chain that appears to make one view consume another is
+  unrepresentable rather than merely discouraged.
+- **Fan-out.** Sinks appended to an `EncodedViewSet` are siblings over one
+  relation. This is the same algebra as the shared-execution fan-out row above:
+  one execution, N sinks, one stamped result shared by identity.
+- **Process.** Everything at or below `RuneDataFrame` executes on Toron;
+  everything above `.encode(...)` stays in Polariton. PRODUCT-0002's
+  execution/presentation split stops being a rule a reviewer enforces and becomes
+  one the receiver type enforces.
+
+### Form hierarchy
+
+| form | role |
+|---|---|
+| `r.views([...])` | canonical algebra: a relation and an explicit list of sinks |
+| `r.encode(x, y).scatter().bar()` | shared-encoding sugar; sinks append as siblings |
+| `r.scatter(x, y)` | single-view sugar, defined as exactly `r.encode(x, y).scatter()` |
+| `r.table()` | displays the underlying relation; ignores any encoding |
+
+Rules the hierarchy must satisfy:
+
+- **Sugar is a strict projection.** Each sugared form is definable in terms of
+  the canonical form and may carry no semantics the canonical form cannot
+  express. A sugared form that grows a private option is a second language.
+- **Binding is lazy.** Constructing an `EncodedViewSet` executes nothing and
+  emits nothing. Only a top-level displayable expression emits output; a
+  bound-but-unused set renders nothing.
+- **`table` is not a mark.** Marks consume an encoding; a grid consumes a
+  relation. `r.table()` shows the full relation on either receiver, and the fact
+  that it ignores an encoding in scope is stated rather than inferred.
+
+Receiver typing also retires the earlier namespace question. `workspace.table(name)`
+selects a source and `EncodedViewSet.table()` appends a grid sink; the receiver
+disambiguates, so neither a `plot.` nor a `view.` prefix is required to keep them
+apart.
+
+### Equivalence acceptance cases
+
+The direct and factored forms are one acceptance obligation, not two:
+
+```rune
+r.encode("cat", "val").scatter().bar();
+```
+
+```rune
+let v = r.encode("cat", "val");
+v.scatter().bar();
+```
+
+They must be indistinguishable in executions issued, sinks produced, and stamped
+result identity.
+
+### Requirements this surface imposes
+
+1. **Typed output-root discovery is a prerequisite, not an optimization.** The
+   current envelope recognizes a contiguous trailing view block positionally. In
+   the factored form the boundary is a binding rather than a chain position, so
+   recognition must be driven by the receiver's type. Positional peeling cannot
+   express the second acceptance case above, and will pass a demo while failing
+   the first refactor a user performs.
+2. **Data-changing operations lower before the boundary.** Vega-style `bin`,
+   `aggregate`, and calculated fields must lower into `RuneDataFrame` operations
+   before an `EncodedViewSet` is constructed. After `.encode(...)`, an operation
+   may describe presentation but must never execute a data transformation
+   locally. An operation that cannot be expressed as a relation operation before
+   the boundary is a typed capability refusal, not a local fallback — otherwise
+   the invariant degrades quietly into a second, undeclared execution engine
+   inside the workbench.
+
+### What this section does not decide
+
+`PlotSpec` fields, scales, guides, themes, interaction, named views, durable plot
+binding, and the exact spelling of `encode` remain open. The plotting record
+decides them; this section constrains where they may live.
 
 ## Mutation and definition lifecycle
 
@@ -61,6 +154,13 @@ record).
 
 ## Change log
 
+- v0.5 (2026-08-02): added the proposed encoded-view-fan-out surface and the
+  `proposed` status. Expansion justified by dogfood evidence: the working
+  three-view snippet made the fan-out point visible as a binding, and the
+  terseness exercise found that `.encode(...)` is simultaneously the type-state,
+  fan-out, and process boundary. Records two prerequisites — typed output-root
+  discovery, and lowering data-changing operations before the boundary. No
+  existing row changed status.
 - v0.4 (2026-08-01): added the shared-execution view fan-out row (pending,
   fan-out pair target), expansion justified by measurement #2 dogfood
   evidence: one relation must feed a table and plot in one execution.
