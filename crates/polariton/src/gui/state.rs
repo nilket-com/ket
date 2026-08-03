@@ -1,3 +1,5 @@
+#[cfg(feature = "toron")]
+use crate::adapters::common::DatabaseAdapter;
 use crate::adapters::{
 	common::{AdapterStage, ExecutionResult},
 	driver::AdapterState,
@@ -23,7 +25,8 @@ use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
 	PendingRuneView, RuneEnvelopeError, RuneViewForm, RuneViewIntent, RuneViewScheduler,
-	SpannedRuneViewIntent, TransformedRuneView, transform as transform_rune_view,
+	SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView,
+	transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -621,46 +624,53 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 		revision,
 		view,
 	} = work;
-	// Stage 2 expands this dispatch over every normalized origin. Keeping the
-	// first execution here preserves the existing single-origin runtime while
-	// Stage 1 lands the language normal form independently.
-	let view = view
-		.into_relations()
-		.next()
-		.expect("a scheduled view program has an execution");
-	app_state.status_msg = "Rune workspace running…".into();
+	let relation_count = view.relation_count();
+	app_state.status_msg = format!(
+		"Rune workspace running {relation_count} independent quer{}…",
+		if relation_count == 1 { "y" } else { "ies" }
+	);
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
 	app_state.code_editor.begin_query();
-	Task::perform(
-		async move {
-			let result = connection.write().await.dispatch_rune(&view.source).await;
-			match result {
-				Ok(frame) => Ok(rune_view_outcome(frame, view.views)),
-				Err(failure) => {
-					let location = failure
-						.span
-						.and_then(|span| {
-							view.source_map.map_span(toron_client::RuneSourceSpan {
-								start: span.start,
-								end: span.end,
-							})
-						})
-						.unwrap_or_else(|| view.source_map.diagnostic_fallback());
-					Err(format!(
-						"Rune {:?} at bytes {}..{}: {}",
-						failure.kind, location.start, location.end, failure.message
-					))
-				}
+	Task::batch(view.into_relations().map(|view| {
+		let connection = connection.clone();
+		let origin = view.origin.clone();
+		Task::perform(dispatch_rune_relation(connection, view), move |result| {
+			Message::RunRuneViewSetResult {
+				source_buffer,
+				revision,
+				origin,
+				result,
 			}
-		},
-		move |result| Message::RunRuneViewSetResult {
-			source_buffer,
-			revision,
-			result,
-		},
-	)
+		})
+	}))
+}
+
+#[cfg(feature = "toron")]
+async fn dispatch_rune_relation(
+	connection: Arc<RwLock<dyn DatabaseAdapter>>,
+	view: TransformedRuneRelation,
+) -> std::result::Result<crate::gui::messages::RuneRelationViewSetOutcome, String> {
+	let result = connection.write().await.dispatch_rune(&view.source).await;
+	match result {
+		Ok(frame) => Ok(rune_view_outcome(frame, view.views)),
+		Err(failure) => {
+			let location = failure
+				.span
+				.and_then(|span| {
+					view.source_map.map_span(toron_client::RuneSourceSpan {
+						start: span.start,
+						end: span.end,
+					})
+				})
+				.unwrap_or_else(|| view.source_map.diagnostic_fallback());
+			Err(format!(
+				"Rune {:?} at bytes {}..{}: {}",
+				failure.kind, location.start, location.end, failure.message
+			))
+		}
+	}
 }
 
 #[cfg(feature = "toron")]
@@ -692,6 +702,8 @@ fn rune_view_outcome(
 				}
 			};
 			RuneRelationSinkOutcome {
+				identity: view.identity,
+				output_order: view.output_order,
 				form,
 				span: view.span,
 				source: std::sync::Arc::clone(&result),
@@ -1319,9 +1331,13 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::RunRuneViewSetResult {
 			source_buffer,
 			revision,
+			origin,
 			result,
 		} => {
-			if let Some(next) = app_state.rune_view_scheduler.complete(source_buffer) {
+			if let Some(next) = app_state
+				.rune_view_scheduler
+				.complete(source_buffer, &origin)
+			{
 				return start_rune_relation_task(app_state, next);
 			}
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
@@ -1818,29 +1834,35 @@ fn get_node_rects(
 #[cfg(test)]
 mod tests {
 	#[cfg(feature = "toron")]
-	use super::rune_view_outcome;
-	#[cfg(feature = "toron")]
 	use super::{AdapterState, view};
 	use super::{
 		clear_transient_sql_status_on_editor_activity, compact_sql_diagnostic, new, set_sql_error,
 		update,
 	};
 	#[cfg(feature = "toron")]
-	use crate::adapters::common::AdapterStage;
+	use super::{dispatch_rune_relation, rune_view_outcome};
 	use crate::adapters::common::ExecutionResult;
+	#[cfg(feature = "toron")]
+	use crate::adapters::common::{
+		AdapterStage, DatabaseAdapter, RuneDispatchFailure, RuneDispatchFailureKind,
+	};
 	use crate::configuration::StartupData;
 	use crate::gui::messages::Message;
 	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
 	use crate::rune_relation_envelope::{
-		PendingRuneView, RuneViewForm, transform as transform_rune_view,
+		LocalViewIdentity, PendingRuneView, RuneViewForm, transform as transform_rune_view,
 	};
 	#[cfg(feature = "toron")]
 	use nilket_local::{
 		Artifact, Evidence, LocalWorkspace, ObservationContext, ReadyWorkspace, StaleCause,
 		VersionedArtifact, WorkspaceIdentity,
 	};
+	#[cfg(feature = "toron")]
+	use std::sync::{Arc, Mutex};
+	#[cfg(feature = "toron")]
+	use tokio::sync::RwLock;
 	#[cfg(feature = "toron")]
 	fn local_identity() -> WorkspaceIdentity {
 		WorkspaceIdentity {
@@ -1849,6 +1871,41 @@ mod tests {
 			session_nonce: "00000000-0000-0000-0000-000000000002".parse().unwrap(),
 			owner_pid: 42,
 			started_unix_ms: 7,
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	struct RecordingRuneAdapter {
+		calls: Arc<Mutex<Vec<String>>>,
+		fail_table: Option<&'static str>,
+	}
+
+	#[cfg(feature = "toron")]
+	#[async_trait::async_trait]
+	impl DatabaseAdapter for RecordingRuneAdapter {
+		async fn dispatch(&mut self, _code: &str) -> ExecutionResult {
+			ExecutionResult::Err("SQL dispatch is unused".to_owned())
+		}
+
+		async fn dispatch_rune(
+			&mut self,
+			source: &str,
+		) -> crate::adapters::common::RuneDispatchResult {
+			self.calls
+				.lock()
+				.expect("recording lock")
+				.push(source.to_owned());
+			if self
+				.fail_table
+				.is_some_and(|table| source.contains(&format!("table(\"{table}\")")))
+			{
+				return Err(RuneDispatchFailure {
+					kind: RuneDispatchFailureKind::Execution,
+					message: "fixture origin failed".to_owned(),
+					span: None,
+				});
+			}
+			Ok(polars::df!("x" => [1_i64], "y" => [2_i64]).expect("fixture frame"))
 		}
 	}
 
@@ -2196,6 +2253,87 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity() {
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		let calls = Arc::new(Mutex::new(Vec::new()));
+		let connection: Arc<RwLock<dyn DatabaseAdapter>> =
+			Arc::new(RwLock::new(RecordingRuneAdapter {
+				calls: calls.clone(),
+				fail_table: None,
+			}));
+
+		let same_origin = transform_rune_view(
+			"let r = workspace.table(\"a\"); table(r); plot.bar(r, \"x\", \"y\")",
+		)
+		.expect("same-origin fan-out");
+		assert_eq!(same_origin.relation_count(), 1);
+		let same_outcome = runtime
+			.block_on(dispatch_rune_relation(
+				connection.clone(),
+				same_origin.into_relations().next().expect("one origin"),
+			))
+			.expect("same origin succeeds");
+		assert_eq!(same_outcome.sinks.len(), 2);
+		assert!(
+			same_outcome
+				.sinks
+				.iter()
+				.all(|sink| Arc::ptr_eq(&same_outcome.result, &sink.source))
+		);
+
+		let multi = transform_rune_view(
+			"workspace.table(\"a\").views([bar(\"x\", \"y\")]); workspace.table(\"b\").views([bar(\"x\", \"y\")])",
+		)
+		.expect("two anonymous bars over two origins");
+		assert_eq!(multi.relation_count(), 2);
+		let mut relations = multi.into_relations().collect::<Vec<_>>();
+		let second = relations.pop().expect("second origin");
+		let first = relations.pop().expect("first origin");
+		let second_outcome = runtime
+			.block_on(dispatch_rune_relation(connection.clone(), second))
+			.expect("second origin succeeds first");
+		let first_outcome = runtime
+			.block_on(dispatch_rune_relation(connection.clone(), first))
+			.expect("first origin succeeds second");
+		assert_eq!(
+			(
+				&second_outcome.sinks[0].identity,
+				&first_outcome.sinks[0].identity,
+			),
+			(
+				&LocalViewIdentity::Anonymous(1),
+				&LocalViewIdentity::Anonymous(0),
+			)
+		);
+		assert_eq!(calls.lock().expect("recording lock").len(), 3);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn one_origin_failure_does_not_cancel_its_sibling_dispatch() {
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		let calls = Arc::new(Mutex::new(Vec::new()));
+		let connection: Arc<RwLock<dyn DatabaseAdapter>> =
+			Arc::new(RwLock::new(RecordingRuneAdapter {
+				calls: calls.clone(),
+				fail_table: Some("bad"),
+			}));
+		let program = transform_rune_view(
+			"workspace.table(\"good\").views([table()]); workspace.table(\"bad\").views([table()])",
+		)
+		.expect("two table origins");
+		let mut results = program
+			.into_relations()
+			.map(|relation| runtime.block_on(dispatch_rune_relation(connection.clone(), relation)))
+			.collect::<Vec<_>>();
+
+		assert!(results.remove(0).is_ok());
+		assert!(results.remove(0).is_err());
+		assert_eq!(calls.lock().expect("recording lock").len(), 2);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn bound_view_set_stops_without_dispatch_while_view_free_rune_still_runs_locally() {
 		let (mut state, startup) = new(StartupData::default(), None);
 		drop(startup);
@@ -2256,6 +2394,7 @@ mod tests {
 	fn bad_plot_field_fails_only_its_spanned_sink_while_table_survives() {
 		let source = "let r = workspace.table(\"t\"); table(r); plot.bar(r, \"missing\", \"y\")";
 		let transformed = transform_rune_view(source).expect("view envelope");
+		let origin = transformed.origin.clone();
 		let outcome = rune_view_outcome(
 			polars::df!("y" => [1_i64, 2]).expect("fixture frame"),
 			transformed.views.clone(),
@@ -2297,6 +2436,7 @@ mod tests {
 			Message::RunRuneViewSetResult {
 				source_buffer,
 				revision: 1,
+				origin,
 				result: Ok(outcome),
 			},
 		));

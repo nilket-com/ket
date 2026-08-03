@@ -82,3 +82,37 @@ cargo test -p polariton --features toron \
 cargo check -p polariton --features toron
 passed (Stage 2 will consume the two currently test-only program accessors)
 ```
+
+### Stage 2 — independent dispatch
+
+- Gate 1: `multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity`
+  sends two roots over one canonical origin through one adapter dispatch and
+  asserts both sinks retain the result's exact `Arc`.
+- Gate 2: the same test dispatches two distinct origins in reverse presentation
+  order and observes two independent outcomes; scheduler coverage completes
+  origins independently and starts a pending revision only after the last one.
+- Gate 4: two anonymous `bar` sinks over two origins both reach dispatch and
+  retain distinct anonymous positions.
+- Gate 10 prerequisite:
+  `one_origin_failure_does_not_cancel_its_sibling_dispatch` observes one success,
+  one attributed failure, and two adapter calls. Stage 3 proves the corresponding
+  stale/refresh presentation behavior.
+
+Verification:
+
+```text
+cargo test -p polariton --features toron \
+  scheduler_executes_in_flight_then_only_the_newest_pending_view
+1 passed
+
+cargo test -p polariton --features toron \
+  multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity
+1 passed
+
+cargo test -p polariton --features toron \
+  one_origin_failure_does_not_cancel_its_sibling_dispatch
+1 passed
+
+cargo check -p polariton --features toron
+passed (Stage 3 consumes identity/order fields carried in the outcome)
+```

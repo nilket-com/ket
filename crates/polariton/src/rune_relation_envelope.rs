@@ -157,7 +157,7 @@ pub(crate) struct PendingRuneView {
 
 #[derive(Default)]
 pub(crate) struct RuneViewScheduler {
-	in_flight: HashSet<BufferId>,
+	in_flight: HashMap<BufferId, HashSet<String>>,
 	pending: HashMap<BufferId, PendingRuneView>,
 	pub(crate) submitted: u64,
 	pub(crate) executed: u64,
@@ -167,7 +167,8 @@ pub(crate) struct RuneViewScheduler {
 impl RuneViewScheduler {
 	pub(crate) fn submit(&mut self, work: PendingRuneView) -> Option<PendingRuneView> {
 		self.submitted = self.submitted.saturating_add(1);
-		if self.in_flight.insert(work.source_buffer) {
+		if !self.in_flight.contains_key(&work.source_buffer) {
+			self.start(&work);
 			self.executed = self.executed.saturating_add(1);
 			return Some(work);
 		}
@@ -177,13 +178,25 @@ impl RuneViewScheduler {
 		None
 	}
 
-	pub(crate) fn complete(&mut self, source_buffer: BufferId) -> Option<PendingRuneView> {
+	pub(crate) fn complete(
+		&mut self,
+		source_buffer: BufferId,
+		origin: &str,
+	) -> Option<PendingRuneView> {
+		let origins = self
+			.in_flight
+			.get_mut(&source_buffer)
+			.expect("Rune view completion requires an in-flight buffer");
 		assert!(
-			self.in_flight.remove(&source_buffer),
-			"Rune view completion requires an in-flight buffer"
+			origins.remove(origin),
+			"Rune view completion requires an in-flight origin"
 		);
+		if !origins.is_empty() {
+			return None;
+		}
+		self.in_flight.remove(&source_buffer);
 		let pending = self.pending.remove(&source_buffer)?;
-		self.in_flight.insert(source_buffer);
+		self.start(&pending);
 		self.executed = self.executed.saturating_add(1);
 		Some(pending)
 	}
@@ -193,9 +206,26 @@ impl RuneViewScheduler {
 		self.pending.remove(&source_buffer);
 	}
 
+	fn start(&mut self, work: &PendingRuneView) {
+		let origins = work
+			.view
+			.executions
+			.iter()
+			.map(|execution| execution.origin.clone())
+			.collect::<HashSet<_>>();
+		assert!(
+			!origins.is_empty(),
+			"a scheduled view program has an origin"
+		);
+		assert!(
+			self.in_flight.insert(work.source_buffer, origins).is_none(),
+			"a buffer cannot start while another program is in flight"
+		);
+	}
+
 	#[cfg(test)]
 	fn is_in_flight(&self, source_buffer: BufferId) -> bool {
-		self.in_flight.contains(&source_buffer)
+		self.in_flight.contains_key(&source_buffer)
 	}
 }
 
@@ -2003,24 +2033,36 @@ mod tests {
 				source_buffer: buffer,
 				revision,
 				view: transform(
-					"let r = workspace.table(\"test2\"); table(r); plot.bar(r, \"cat\", \"val\"); plot.scatter(r, \"cat\", \"val\")",
+					"workspace.table(\"a\").views([table()]); workspace.table(\"b\").views([bar(\"cat\", \"val\")])",
 				)
-				.expect("complete view set"),
+				.expect("two-origin view program"),
 			}
+		}
+		fn origins(work: &PendingRuneView) -> Vec<String> {
+			work.view
+				.executions
+				.iter()
+				.map(|execution| execution.origin.clone())
+				.collect()
 		}
 		let buffer = BufferId::new(7);
 		let mut scheduler = RuneViewScheduler::default();
-		assert_eq!(
-			scheduler.submit(work(buffer, 1)).map(|work| work.revision),
-			Some(1)
-		);
+		let first = work(buffer, 1);
+		let first_origins = origins(&first);
+		assert_eq!(scheduler.submit(first).map(|work| work.revision), Some(1));
 		assert!(scheduler.submit(work(buffer, 2)).is_none());
 		assert!(scheduler.submit(work(buffer, 3)).is_none());
+		assert!(scheduler.complete(buffer, &first_origins[1]).is_none());
 		assert_eq!(
-			scheduler.complete(buffer).map(|work| work.revision),
+			scheduler
+				.complete(buffer, &first_origins[0])
+				.map(|work| work.revision),
 			Some(3)
 		);
-		assert!(scheduler.complete(buffer).is_none());
+		let current = work(buffer, 3);
+		let current_origins = origins(&current);
+		assert!(scheduler.complete(buffer, &current_origins[0]).is_none());
+		assert!(scheduler.complete(buffer, &current_origins[1]).is_none());
 		assert_eq!(
 			(
 				scheduler.submitted,
@@ -2045,6 +2087,6 @@ mod tests {
 	#[should_panic(expected = "Rune view completion requires an in-flight buffer")]
 	fn scheduler_completion_without_in_flight_work_is_a_hard_invariant() {
 		let mut scheduler = RuneViewScheduler::default();
-		let _ = scheduler.complete(BufferId::new(99));
+		let _ = scheduler.complete(BufferId::new(99), "workspace.table(\"t\")");
 	}
 }
