@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.12. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.13. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -32,6 +32,7 @@ a cited record).
 | shared-execution view fan-out (`r.views([...])`, one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink holds the *same* `Arc`, not equivalent copies; live acceptance issues one `dispatch_rune` and consumes three ordered sinks (`71445df3`, `755e850a`); direct/factored/legacy equivalence plus accepted-surface live axis identity (`d4c2d8a8`) |
 | multi-origin view program (one execution per canonical relation origin) | executable | `multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity` proves canonical-origin deduplication and independent dispatch; `execution_grouping_cannot_reorder_interleaved_host_panels` completes origins out of order without changing presentation (`b99338f8`, `cad42680`) |
 | optional view identity (`view("name", sink)` or anonymous positional identity) | executable | session-scoped: duplicate names refuse with both spans; names retain one host-panel id across reruns and form changes; anonymous views reuse their presentation slot; durable restart identity remains deferred by PRODUCT-0010's recorded protocol halt (`284e88e0`, `cad42680`) |
+| view collection placement (first view splits, later views request ordered tabs) | executable | `host_panel_placement_requests_tab_fallback_and_reopen_without_moving` proves advisory placement and stable reopen behavior in libaryon; `rune_view_collection_opens_one_split_with_ordered_host_tabs` projects four descriptor-titled view tabs in one pane while retaining source focus (PRODUCT-0011, `8535d662`) |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -333,6 +334,15 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.13 (2026-08-03): PRODUCT-0011 makes multi-view collections usable at
+  larger cardinalities. `OpenHostPanel` now accepts advisory `Split` or
+  `TabWith` placement while libaryon retains layout authority. Polariton requests
+  one split followed by presentation-ordered tabs; four views now consume one
+  output pane rather than four. Existing panels never relocate on rerun, missing
+  tab anchors fall back without a frontend error, descriptor titles make host
+  tabs legible, and closing one tab disposes only its panel (`8535d662`). Query
+  results and the dashboard retain their prior split behavior. Layout
+  persistence and durable document identity remain explicitly undecided.
 - v0.12 (2026-08-03): PRODUCT-0010 makes multi-origin view programs and optional
   view identity executable. Canonically equal origins retain one dispatch and
   shared `Arc`; distinct origins dispatch and fail independently; global
