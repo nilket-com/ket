@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.5. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.6. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -59,6 +59,59 @@ consequence of it:
   everything above `.encode(...)` stays in Polariton. PRODUCT-0002's
   execution/presentation split stops being a rule a reviewer enforces and becomes
   one the receiver type enforces.
+
+### Recognition by receiver provenance
+
+The invariant is stated in terms of `RuneDataFrame`, which is Toron's type.
+Polariton has no access to it: rune 0.14 exposes no type model, so the envelope
+analysis cannot know what any expression returns. Recognition therefore runs on a
+locally tracked **kind**, deliberately named `RelationCandidate` rather than
+`Relation`, because it records *provenance* and claims nothing. Toron still
+validates whether the peeled remote expression actually returns a relation, and
+a candidate that does not is a server-side typed failure exactly as today.
+
+Kind is rooted at `workspace` — the injected entrypoint parameter — and
+propagates:
+
+```text
+workspace-rooted chain
+  unknown method                → RelationCandidate
+  .encode(...) / .views(...)    → EncodedViewSet
+  direct .scatter(x, y)         → sugar for .encode(x, y).scatter()
+  direct .bar(x, y)             → sugar for .encode(x, y).bar()
+  direct .table()               → EncodedViewSet with a relation-table sink
+
+EncodedViewSet
+  .scatter() / .bar() / .table() → EncodedViewSet plus one ordered sink
+```
+
+Bindings preserve the inferred kind and the accumulated specification. Binding
+alone emits nothing. Only a **top-level expression of `EncodedViewSet` kind**
+becomes an output root.
+
+Two properties of this table are load-bearing:
+
+- **Unknown methods are kind-preserving.** The analysis must never enumerate
+  which methods return relations, because `project`, `filter`, `aggregate`,
+  `sort`, `limit`, `join`, and `window` are precisely the names the PRODUCT-0003
+  containment assay forbids it from knowing
+  (`../impl/0003_typed_output_root_discovery.md`). Stating propagation
+  negatively keeps the analysis ignorant by construction rather than by
+  discipline: `workspace.table("t").sort([...])` stays a `RelationCandidate`
+  without the analysis holding any opinion about `sort`.
+- **Sink methods are kind-preserving too.** `.scatter()` returns an
+  `EncodedViewSet` with one sink appended, or `v.scatter().bar()` breaks after
+  the first sink. This is also what makes sink **order** fall out of chain order
+  rather than needing a separate rule, and what lets the direct sugar and the
+  chained form share exactly one algebra.
+
+Receiver provenance is a narrower recognition rule than the free-function name
+matching it replaces. `table(r)` and `plot.bar(...)` are global names a user may
+legitimately own, which is why step 1 needs whole-buffer shadow analysis; a sink
+method is recognized only on a receiver the analysis already traced to
+`workspace`, so a user-defined `.scatter()` on an unrelated value is never a
+root. The shadowing machinery is a compatibility concern for the current
+spelling, not a permanent cost of the proposed one.
 
 ### Form hierarchy
 
@@ -154,6 +207,12 @@ decides them; this section constrains where they may live.
 
 ## Change log
 
+- v0.6 (2026-08-02): recorded receiver-provenance recognition beside the
+  invariant — the `RelationCandidate` kind, its propagation table, and the two
+  properties that make it implementable without a type model (unknown methods
+  and sink methods both kind-preserving). Follows step 1 landing
+  (`impl: typed output root discovery`), which proved the binding analysis this
+  rule extends. No row changed status.
 - v0.5 (2026-08-02): added the proposed encoded-view-fan-out surface and the
   `proposed` status. Expansion justified by dogfood evidence: the working
   three-view snippet made the fan-out point visible as a binding, and the
