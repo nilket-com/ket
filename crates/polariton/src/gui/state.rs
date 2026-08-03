@@ -527,8 +527,7 @@ fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String
 		Err(
 			error @ (RuneEnvelopeError::Invalid(_)
 			| RuneEnvelopeError::InvalidView { .. }
-			| RuneEnvelopeError::MixedRelations { .. }
-			| RuneEnvelopeError::DuplicateForm { .. }),
+			| RuneEnvelopeError::DuplicateName { .. }),
 		) => {
 			let message = error.to_string();
 			app_state.status_error = format!("Error: {message}");
@@ -622,6 +621,13 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 		revision,
 		view,
 	} = work;
+	// Stage 2 expands this dispatch over every normalized origin. Keeping the
+	// first execution here preserves the existing single-origin runtime while
+	// Stage 1 lands the language normal form independently.
+	let view = view
+		.into_relations()
+		.next()
+		.expect("a scheduled view program has an execution");
 	app_state.status_msg = "Rune workspace running…".into();
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
@@ -2147,7 +2153,12 @@ mod tests {
 		)
 		.expect("fixture frame");
 		let source = "let r = workspace.table(\"t\"); table(r); let marker = 1; plot.bar(r, \"cat\", \"y\"); let tail = marker + 1; plot.scatter(r, \"x\", \"y\", \"cat\")";
-		let views = transform_rune_view(source).expect("view envelope").views;
+		let views = transform_rune_view(source)
+			.expect("view envelope")
+			.into_relations()
+			.next()
+			.expect("one relation")
+			.views;
 		let outcome = rune_view_outcome(frame, views);
 		assert_eq!(outcome.sinks.len(), 3);
 		for sink in &outcome.sinks {
@@ -2210,6 +2221,33 @@ mod tests {
 			"view-free Rune still reaches the local host"
 		);
 		assert_eq!(state.rune_buffer_revisions.get(&source_buffer), Some(&1));
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn duplicate_view_names_refuse_through_the_head_with_both_spans() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(75);
+		let source = "workspace.table(\"a\").views([view(\"same\", table())]); workspace.table(\"b\").views([view(\"same\", bar(\"x\", \"y\"))])";
+		let first = source.find("\"same\"").expect("first name");
+		let second = source.rfind("\"same\"").expect("second name");
+
+		let task = super::run_rune_code(&mut state, source_buffer, source.to_owned());
+
+		assert_eq!(task.units(), 0);
+		assert_eq!(state.rune_view_scheduler.submitted, 0);
+		assert!(
+			state
+				.status_error
+				.contains(&format!("{first}..{}", first + 6))
+		);
+		assert!(
+			state
+				.status_error
+				.contains(&format!("{second}..{}", second + 6))
+		);
 		state.code_editor.shutdown();
 	}
 

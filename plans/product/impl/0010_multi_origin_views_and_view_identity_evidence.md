@@ -55,4 +55,30 @@ so Stage 1 may begin.
 
 ## Gate ledger
 
-Stages append their behavioral evidence here as they land.
+### Stage 1 — envelope normalization
+
+- Gate 5: `duplicate_view_names_refuse_through_the_head_with_both_spans`
+  drives the duplicate through `run_rune_code`, observes no dispatch, and checks
+  both source ranges in the user-visible diagnostic.
+- Gate 3 analysis half:
+  `origin_resolved_identity_groups_multiple_origins_and_repeated_inline_text`
+  proves distinct origin grouping and preserves presentation order separately.
+- Gate 4 analysis half: the same fixture admits duplicate anonymous forms; the
+  removed `DuplicateForm` and `MixedRelations` variants have no remaining source
+  references.
+- Gate 1 analysis half: `repeated_inline` remains one execution for two
+  separately written, canonically identical origins.
+
+Verification:
+
+```text
+cargo test -p polariton --features toron rune_relation_envelope
+25 passed
+
+cargo test -p polariton --features toron \
+  duplicate_view_names_refuse_through_the_head_with_both_spans
+1 passed
+
+cargo check -p polariton --features toron
+passed (Stage 2 will consume the two currently test-only program accessors)
+```

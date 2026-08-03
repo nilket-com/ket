@@ -57,6 +57,14 @@ impl RuneViewIntent {
 pub(crate) struct SpannedRuneViewIntent {
 	pub(crate) intent: RuneViewIntent,
 	pub(crate) span: Range<u32>,
+	pub(crate) identity: LocalViewIdentity,
+	pub(crate) output_order: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum LocalViewIdentity {
+	Named(String),
+	Anonymous(usize),
 }
 
 /// First-contact presentation data only. This is not `PlotSpec` v0 and dies
@@ -104,9 +112,40 @@ impl RuneEnvelopeSourceMap {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TransformedRuneView {
+	executions: Vec<TransformedRuneRelation>,
+	presentation_order: Vec<LocalViewIdentity>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TransformedRuneRelation {
+	pub(crate) origin: String,
 	pub(crate) source: String,
 	pub(crate) views: Vec<SpannedRuneViewIntent>,
 	pub(crate) source_map: RuneEnvelopeSourceMap,
+}
+
+impl TransformedRuneView {
+	pub(crate) fn relation_count(&self) -> usize {
+		self.executions.len()
+	}
+
+	pub(crate) fn into_relations(self) -> impl Iterator<Item = TransformedRuneRelation> {
+		self.executions.into_iter()
+	}
+
+	pub(crate) fn presentation_order(&self) -> &[LocalViewIdentity] {
+		&self.presentation_order
+	}
+}
+
+impl std::ops::Deref for TransformedRuneView {
+	type Target = TransformedRuneRelation;
+
+	fn deref(&self) -> &Self::Target {
+		self.executions
+			.first()
+			.expect("a transformed view program has an execution")
+	}
 }
 
 #[derive(Clone, Debug)]
@@ -170,12 +209,8 @@ pub(crate) enum RuneEnvelopeError {
 		span: Range<u32>,
 		message: String,
 	},
-	MixedRelations {
-		first: Range<u32>,
-		differing: Range<u32>,
-	},
-	DuplicateForm {
-		form: RuneViewForm,
+	DuplicateName {
+		name: String,
 		first: Range<u32>,
 		duplicate: Range<u32>,
 	},
@@ -197,19 +232,14 @@ impl std::fmt::Display for RuneEnvelopeError {
 				"Rune view syntax at bytes {}..{}: {message}",
 				span.start, span.end
 			),
-			Self::MixedRelations { first, differing } => write!(
-				formatter,
-				"one view set must share one relation; first relation at bytes {}..{}, differing relation at bytes {}..{}",
-				first.start, first.end, differing.start, differing.end
-			),
-			Self::DuplicateForm {
-				form,
+			Self::DuplicateName {
+				name,
 				first,
 				duplicate,
 			} => write!(
 				formatter,
-				"{} appears twice at bytes {}..{} and {}..{}; multiple views of one form wait for named views",
-				form.label(), first.start, first.end, duplicate.start, duplicate.end
+				"view name {name:?} appears twice at bytes {}..{} and {}..{}; names are unique per buffer",
+				first.start, first.end, duplicate.start, duplicate.end
 			),
 		}
 	}
@@ -220,44 +250,66 @@ impl std::error::Error for RuneEnvelopeError {}
 pub(crate) fn transform(source: &str) -> Result<TransformedRuneView, RuneEnvelopeError> {
 	let analysis = analyze(source)?;
 	let recognized_presentation = analysis.recognized_presentation;
-	let envelope = analysis.into_envelope().ok_or(if recognized_presentation {
-		RuneEnvelopeError::RecognizedNoOutput
-	} else {
-		RuneEnvelopeError::NoTerminalView
-	})?;
-	render(source, &envelope)
+	let envelopes = analysis.into_envelopes();
+	if envelopes.is_empty() {
+		return Err(if recognized_presentation {
+			RuneEnvelopeError::RecognizedNoOutput
+		} else {
+			RuneEnvelopeError::NoTerminalView
+		});
+	}
+	let executions = envelopes
+		.iter()
+		.map(|envelope| render(source, envelope))
+		.collect::<Result<Vec<_>, _>>()?;
+	let mut ordered = executions
+		.iter()
+		.flat_map(|execution| execution.views.iter())
+		.collect::<Vec<_>>();
+	ordered.sort_by_key(|view| view.output_order);
+	Ok(TransformedRuneView {
+		presentation_order: ordered
+			.into_iter()
+			.map(|view| view.identity.clone())
+			.collect(),
+		executions,
+	})
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct OutputRootAnalysis {
-	retained: Vec<Range<usize>>,
-	relation_origin: Option<String>,
-	relation_root: Option<RelationRoot>,
-	relation: Option<Range<usize>>,
-	sinks: Vec<ParsedSink>,
+	envelopes: Vec<ExecutionEnvelope>,
 	recognized_presentation: bool,
-	terminate_retained_tail: bool,
 }
 
 impl OutputRootAnalysis {
+	#[cfg(test)]
 	fn into_envelope(self) -> Option<ExecutionEnvelope> {
-		let mut sinks = self.sinks.into_iter();
-		let first = sinks.next()?;
-		Some(ExecutionEnvelope {
-			retained: self.retained,
-			relation: self.relation.expect("a nonempty analysis has a relation"),
-			relation_root: self
-				.relation_root
-				.expect("a nonempty analysis has a relation root"),
-			relation_origin: self
-				.relation_origin
-				.expect("a nonempty analysis has a relation origin"),
-			sinks: NonEmptySinks {
-				first,
-				rest: sinks.collect(),
-			},
-			terminate_retained_tail: self.terminate_retained_tail,
-		})
+		let mut envelopes = self.envelopes;
+		(envelopes.len() == 1).then(|| envelopes.remove(0))
+	}
+
+	fn into_envelopes(self) -> Vec<ExecutionEnvelope> {
+		self.envelopes
+	}
+
+	#[cfg(test)]
+	fn semantics(&self) -> BufferViewSemantics {
+		let mut views = self
+			.envelopes
+			.iter()
+			.flat_map(|envelope| envelope.sinks.iter())
+			.collect::<Vec<_>>();
+		views.sort_by_key(|sink| sink.output_order);
+		BufferViewSemantics {
+			executions: self
+				.envelopes
+				.iter()
+				.map(|envelope| envelope.relation_origin.clone())
+				.collect(),
+			presentation_order: views.into_iter().map(|sink| sink.intent.clone()).collect(),
+			execution_count: self.envelopes.len(),
+		}
 	}
 }
 
@@ -288,7 +340,14 @@ impl NonEmptySinks {
 struct EnvelopeSemantics {
 	relation_origin: String,
 	sinks: Vec<RuneViewIntent>,
-	execution_count: u8,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BufferViewSemantics {
+	executions: Vec<String>,
+	presentation_order: Vec<RuneViewIntent>,
+	execution_count: usize,
 }
 
 impl ExecutionEnvelope {
@@ -297,7 +356,6 @@ impl ExecutionEnvelope {
 		EnvelopeSemantics {
 			relation_origin: self.relation_origin.clone(),
 			sinks: self.sinks.iter().map(|sink| sink.intent.clone()).collect(),
-			execution_count: 1,
 		}
 	}
 }
@@ -305,6 +363,14 @@ impl ExecutionEnvelope {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedSink {
 	intent: RuneViewIntent,
+	span: Range<usize>,
+	name: Option<ParsedViewName>,
+	output_order: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ParsedViewName {
+	value: String,
 	span: Range<usize>,
 }
 
@@ -396,6 +462,8 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 				sinks: vec![ParsedSink {
 					intent: root.intent,
 					span: root.statement,
+					name: None,
+					output_order: 0,
 				}],
 			});
 			continue;
@@ -452,51 +520,65 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 	roots.sort_by_key(|root| root.emission.start);
 	peeled.sort_by_key(|region| region.start);
 
-	let Some(first) = roots.first() else {
+	if roots.is_empty() {
 		return Ok(OutputRootAnalysis {
-			retained: retained_regions(source.len(), &peeled)?,
-			relation_origin: None,
-			relation_root: None,
-			relation: None,
-			sinks: Vec::new(),
+			envelopes: Vec::new(),
 			recognized_presentation,
-			terminate_retained_tail: last_retained_is_expression,
 		});
-	};
-	let relation_origin = first.relation_origin.clone();
-	let relation_root = first.relation_root;
-	let relation = first.relation.clone();
-	let first_relation = u32_range(&relation, "relation")?;
-	let mut forms = HashMap::<RuneViewForm, Range<u32>>::new();
-	for root in &roots {
-		if root.relation_origin != relation_origin || root.relation_root != relation_root {
-			return Err(RuneEnvelopeError::MixedRelations {
-				first: first_relation.clone(),
-				differing: u32_range(&root.relation, "relation")?,
-			});
-		}
-		for sink in &root.sinks {
-			let form = sink.intent.form();
-			let span = u32_range(&sink.span, "view")?;
-			if let Some(first) = forms.insert(form, span.clone()) {
-				return Err(RuneEnvelopeError::DuplicateForm {
-					form,
-					first,
-					duplicate: span,
-				});
+	}
+
+	let retained = retained_regions(source.len(), &peeled)?;
+	let mut names = HashMap::<String, Range<u32>>::new();
+	let mut next_output_order = 0;
+	for root in &mut roots {
+		for sink in &mut root.sinks {
+			sink.output_order = next_output_order;
+			next_output_order += 1;
+			if let Some(name) = &sink.name {
+				let span = u32_range(&name.span, "view name")?;
+				if let Some(first) = names.insert(name.value.clone(), span.clone()) {
+					return Err(RuneEnvelopeError::DuplicateName {
+						name: name.value.clone(),
+						first,
+						duplicate: span,
+					});
+				}
 			}
 		}
 	}
 
-	let retained = retained_regions(source.len(), &peeled)?;
+	let mut grouped = Vec::<ParsedOutputRoot>::new();
+	let mut group_by_origin = HashMap::<String, usize>::new();
+	for root in roots {
+		if let Some(index) = group_by_origin.get(&root.relation_origin).copied() {
+			grouped[index].sinks.extend(root.sinks);
+		} else {
+			group_by_origin.insert(root.relation_origin.clone(), grouped.len());
+			grouped.push(root);
+		}
+	}
+
+	let envelopes = grouped
+		.into_iter()
+		.map(|root| {
+			let mut sinks = root.sinks.into_iter();
+			let first = sinks.next().expect("an output root has at least one sink");
+			ExecutionEnvelope {
+				retained: retained.clone(),
+				relation: root.relation,
+				relation_root: root.relation_root,
+				relation_origin: root.relation_origin,
+				sinks: NonEmptySinks {
+					first,
+					rest: sinks.collect(),
+				},
+				terminate_retained_tail: last_retained_is_expression,
+			}
+		})
+		.collect();
 	Ok(OutputRootAnalysis {
-		retained,
-		relation_origin: Some(relation_origin),
-		relation_root: Some(relation_root),
-		relation: Some(relation),
-		sinks: roots.into_iter().flat_map(|root| root.sinks).collect(),
+		envelopes,
 		recognized_presentation,
-		terminate_retained_tail: last_retained_is_expression,
 	})
 }
 
@@ -638,6 +720,8 @@ fn provenance_method_on_relation(
 			sinks: vec![ParsedSink {
 				intent: RuneViewIntent::Table,
 				span: byte_range(call.span(), source.len())?,
+				name: None,
+				output_order: 0,
 			}],
 		})),
 		_ => {
@@ -713,6 +797,14 @@ fn parse_contextual_sink(
 	expression: &ast::Expr,
 	source: &str,
 ) -> Result<ParsedSink, RuneEnvelopeError> {
+	parse_contextual_sink_inner(expression, source, true)
+}
+
+fn parse_contextual_sink_inner(
+	expression: &ast::Expr,
+	source: &str,
+	allow_identity_wrapper: bool,
+) -> Result<ParsedSink, RuneEnvelopeError> {
 	let ast::Expr::Call(call) = expression else {
 		return invalid_view(
 			expression.span(),
@@ -722,6 +814,36 @@ fn parse_contextual_sink(
 	};
 	let callee = source_slice(source, call.expr.span())?.trim();
 	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+	if callee == "view" {
+		if !allow_identity_wrapper {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"view(...) wrappers cannot be nested",
+			);
+		}
+		let [name, sink] = args.as_slice() else {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"view(...) takes a name string and one sink",
+			);
+		};
+		let raw_name = source_slice(source, name.span())?;
+		let Some(value) = decode_string_literal(raw_name) else {
+			return invalid_view(
+				name.span(),
+				source.len(),
+				"view name must be a string literal",
+			);
+		};
+		let mut parsed = parse_contextual_sink_inner(sink, source, false)?;
+		parsed.name = Some(ParsedViewName {
+			value,
+			span: byte_range(name.span(), source.len())?,
+		});
+		return Ok(parsed);
+	}
 	let intent = match callee {
 		"table" if args.is_empty() => RuneViewIntent::Table,
 		"bar" if args.len() == 2 => {
@@ -776,6 +898,8 @@ fn parse_contextual_sink(
 	Ok(ParsedSink {
 		intent,
 		span: byte_range(expression.span(), source.len())?,
+		name: None,
+		output_order: 0,
 	})
 }
 
@@ -807,6 +931,8 @@ fn parse_sugar_sink(
 	Ok(ParsedSink {
 		intent: RuneViewIntent::Plot(sink),
 		span: byte_range(call.span(), source.len())?,
+		name: None,
+		output_order: 0,
 	})
 }
 
@@ -825,7 +951,7 @@ fn invalid_view<T>(
 fn render(
 	source: &str,
 	envelope: &ExecutionEnvelope,
-) -> Result<TransformedRuneView, RuneEnvelopeError> {
+) -> Result<TransformedRuneRelation, RuneEnvelopeError> {
 	let entrypoint_prefix = match envelope.relation_root {
 		RelationRoot::Workspace => WORKSPACE_ENTRYPOINT_PREFIX,
 		RelationRoot::Ket => KET_ENTRYPOINT_PREFIX,
@@ -873,7 +999,8 @@ fn render(
 			.map_err(|_| RuneEnvelopeError::Invalid("source exceeds u32".into()))?,
 	)?;
 
-	Ok(TransformedRuneView {
+	Ok(TransformedRuneRelation {
+		origin: envelope.relation_origin.clone(),
 		source: transformed,
 		views: envelope
 			.sinks
@@ -882,6 +1009,11 @@ fn render(
 				Ok(SpannedRuneViewIntent {
 					intent: sink.intent.clone(),
 					span: u32_range(&sink.span, "view")?,
+					identity: match &sink.name {
+						Some(name) => LocalViewIdentity::Named(name.value.clone()),
+						None => LocalViewIdentity::Anonymous(sink.output_order),
+					},
+					output_order: sink.output_order,
 				})
 			})
 			.collect::<Result<_, RuneEnvelopeError>>()?,
@@ -1408,28 +1540,78 @@ mod tests {
 	}
 
 	#[test]
-	fn origin_resolved_identity_keeps_mixed_duplicate_and_inline_behavior() {
+	fn origin_resolved_identity_groups_multiple_origins_and_repeated_inline_text() {
 		let mixed_source = "let a = workspace.table(\"a\"); let b = workspace.table(\"b\"); table(a); let marker = 1; plot.bar(b, \"x\", \"y\")";
-		let mixed = transform(mixed_source).expect_err("mixed relations");
-		let RuneEnvelopeError::MixedRelations { first, differing } = mixed else {
-			panic!("expected mixed-relation refusal: {mixed:?}");
-		};
-		assert_eq!(&mixed_source[first.start as usize..first.end as usize], "a");
+		let semantics = analyze(mixed_source)
+			.expect("analyze multiple origins")
+			.semantics();
+		assert_eq!(semantics.execution_count, 2);
 		assert_eq!(
-			&mixed_source[differing.start as usize..differing.end as usize],
-			"b"
+			semantics
+				.presentation_order
+				.iter()
+				.map(RuneViewIntent::form)
+				.collect::<Vec<_>>(),
+			[RuneViewForm::Table, RuneViewForm::Bar]
+		);
+		let mixed = transform(mixed_source).expect("multiple origins normalize");
+		assert_eq!(mixed.relation_count(), 2);
+		assert_eq!(
+			mixed.presentation_order(),
+			&[
+				LocalViewIdentity::Anonymous(0),
+				LocalViewIdentity::Anonymous(1)
+			]
 		);
 
 		let duplicate =
 			transform("let r = workspace.table(\"t\"); table(r); let marker = 1; table(r)")
-				.expect_err("duplicate table form");
-		assert!(duplicate.to_string().contains("named views"));
+				.expect("duplicate anonymous forms are legal");
+		assert_eq!(duplicate.relation_count(), 1);
+		assert_eq!(duplicate.views.len(), 2);
 
 		let repeated_inline = transform(
 			"table(workspace.table(\"t\")); plot.bar(workspace.table(\"t\"), \"x\", \"y\")",
 		)
 		.expect("identical inline origins at different spans");
+		assert_eq!(repeated_inline.relation_count(), 1);
 		assert_eq!(repeated_inline.views.len(), 2);
+	}
+
+	#[test]
+	fn named_views_are_optional_unique_and_do_not_change_sink_form() {
+		let source = "workspace.table(\"t\").views([view(\"points\", scatter(\"x\", \"y\")), table(), view(\"bars\", bar(\"x\", \"y\"))])";
+		let transformed = transform(source).expect("named and anonymous views normalize");
+		assert_eq!(
+			transformed.presentation_order(),
+			&[
+				LocalViewIdentity::Named("points".to_owned()),
+				LocalViewIdentity::Anonymous(1),
+				LocalViewIdentity::Named("bars".to_owned()),
+			]
+		);
+		assert_eq!(transformed.views[0].intent.form(), RuneViewForm::Scatter);
+		assert_eq!(transformed.views[2].intent.form(), RuneViewForm::Bar);
+
+		let duplicate = "workspace.table(\"t\").views([view(\"same\", table())]); workspace.table(\"u\").views([view(\"same\", bar(\"x\", \"y\"))])";
+		let error = transform(duplicate).expect_err("duplicate names refuse");
+		let RuneEnvelopeError::DuplicateName {
+			name,
+			first,
+			duplicate: second,
+		} = error
+		else {
+			panic!("expected duplicate name refusal");
+		};
+		assert_eq!(name, "same");
+		assert_eq!(
+			&duplicate[first.start as usize..first.end as usize],
+			"\"same\""
+		);
+		assert_eq!(
+			&duplicate[second.start as usize..second.end as usize],
+			"\"same\""
+		);
 	}
 
 	#[test]
@@ -1714,6 +1896,9 @@ mod tests {
 			"workspace.table(\"t\").views([unknown()])",
 			"let s = scatter(\"c\", \"v\"); workspace.table(\"t\").views([s])",
 			"let v = workspace.table(\"t\").views([table()]); consume(v)",
+			"workspace.table(\"t\").views([view(\"n\")])",
+			"workspace.table(\"t\").views([view(name, table())])",
+			"workspace.table(\"t\").views([view(\"outer\", view(\"inner\", table()))])",
 		] {
 			let error = transform(source).expect_err("proven view syntax must refuse atomically");
 			let RuneEnvelopeError::InvalidView { span, .. } = error else {

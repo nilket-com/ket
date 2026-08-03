@@ -203,6 +203,7 @@ mod tests {
 			.expect("connect to Toron");
 		let source = "let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); table(r); let marker = 1; plot.bar(r, \"cat\", \"val\"); let tail = marker + 1; plot.scatter(r, \"cat\", \"val\")";
 		let view = transform_rune_view(source).expect("fan-out view envelope");
+		let view = view.into_relations().next().expect("one relation");
 		let frame = adapter
 			.dispatch_rune(&view.source)
 			.await
@@ -259,6 +260,7 @@ mod tests {
 			.expect("connect to Toron");
 		let source = "ket.table(\"test2\").sort([col(\"cat\").asc()]).views([table(), bar(\"cat\", \"val\"), scatter(\"cat\", \"val\")])";
 		let view = transform_rune_view(source).expect("PRODUCT-0008 view envelope");
+		let view = view.into_relations().next().expect("one relation");
 		let frame = adapter
 			.dispatch_rune(&view.source)
 			.await
