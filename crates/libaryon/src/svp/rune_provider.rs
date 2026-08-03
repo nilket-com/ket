@@ -49,8 +49,8 @@ impl LanguageProvider for RuneProvider {
 		global_offset: DocByte,
 		_file_path: &str,
 	) -> SemanticOutput {
-		let highlights = match rune_ast::try_parse_rune_file(&full_source) {
-			Some(file) => rune_semantic::extract_semantic_highlights(&file, global_offset),
+		let highlights = match rune_ast::try_parse_rune_document(&full_source) {
+			Some(document) => rune_semantic::extract_semantic_highlights(&document, global_offset),
 			None => Vec::new(),
 		};
 		SemanticOutput {
@@ -100,6 +100,49 @@ mod tests {
 			highlights
 				.iter()
 				.any(|s| s.category == TokenCategory::Variable)
+		);
+	}
+
+	#[test]
+	fn semantic_reactor_highlights_item_files_and_workspace_statement_buffers() {
+		let provider = RuneProvider;
+		let workspace = r#"workspace
+	.table("test2")
+	.sort([col("cat").asc()])
+	.views([
+		scatter("cat", "val"),
+		bar("cat", "val"),
+		table(),
+	])"#;
+		for (source, expected_category, expected_text) in [
+			(
+				"pub fn main() { let x = make(); }",
+				TokenCategory::Function,
+				"main",
+			),
+			(workspace, TokenCategory::Method, "views"),
+		] {
+			let output =
+				provider.semantic_reactor(Arc::new(source.to_owned()), DocByte::ZERO, "test.rn");
+			assert!(output.highlights.iter().any(|span| {
+				let start = u64::from(span.start) as usize;
+				let end = u64::from(span.end) as usize;
+				span.category == expected_category && &source[start..end] == expected_text
+			}));
+		}
+	}
+
+	#[test]
+	fn malformed_statement_buffer_keeps_the_lexical_fallback() {
+		let provider = RuneProvider;
+		let source = "workspace.table(\"test2\"";
+		let semantic =
+			provider.semantic_reactor(Arc::new(source.to_owned()), DocByte::ZERO, "broken.rn");
+		assert!(semantic.highlights.is_empty());
+		assert!(
+			!provider
+				.lexical_baseline(source.as_bytes(), &[(0, DocByte::ZERO)])
+				.is_empty()
 		);
 	}
 }

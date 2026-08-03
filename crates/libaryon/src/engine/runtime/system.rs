@@ -6448,6 +6448,55 @@ mod tests {
 	}
 
 	#[test]
+	fn rune_workspace_statement_buffer_reaches_the_rendered_semantic_highlights() {
+		use std::time::Duration;
+
+		let source = r#"workspace
+	.table("test2")
+	.sort([col("cat").asc()])
+	.views([
+		scatter("cat", "val"),
+		bar("cat", "val"),
+		table(),
+	])"#;
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_python_and_rune();
+		let mut view = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::ReplaceDocument {
+				text: source.to_owned(),
+				language: Some("rune".to_owned()),
+				virtual_path: None,
+			},
+		);
+
+		let has_highlight = |category, expected: &str, view: &crate::uast::Viewport| {
+			view.highlights.iter().any(|span| {
+				let start = u64::from(span.start) as usize;
+				let end = u64::from(span.end) as usize;
+				span.category == category && &source[start..end] == expected
+			})
+		};
+		for _ in 0..100 {
+			if has_highlight(TokenCategory::Method, "views", &view)
+				&& has_highlight(TokenCategory::Function, "scatter", &view)
+			{
+				break;
+			}
+			std::thread::sleep(Duration::from_millis(30));
+			tx_cmd.refresh_for_test().expect("refresh");
+			view = rx_view
+				.recv_timeout(Duration::from_secs(2))
+				.expect("viewport after Rune semantic analysis");
+		}
+		assert!(has_highlight(TokenCategory::Method, "views", &view));
+		assert!(has_highlight(TokenCategory::Function, "scatter", &view));
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
 	fn local_theme_override_survives_global_theme_change_and_tab_switch() {
 		let settings_path = temp_test_path("language-theme-global-settings");
 		let first_path = temp_test_path("language-theme-first").with_extension("txt");

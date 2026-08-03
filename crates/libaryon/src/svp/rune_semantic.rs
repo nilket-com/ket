@@ -1,23 +1,36 @@
 //! Phase 9 — Rune Semantic Reactor (extractor half).
 //!
-//! Walks a parsed [`rune::ast::File`] and emits high-fidelity
-//! [`HighlightSpan`]s that upgrade lexical `Variable` tokens to their true
-//! semantic category: function names, type names, methods, macros, `self`.
+//! Walks either Rune document root and emits high-fidelity [`HighlightSpan`]s
+//! that upgrade lexical `Variable` tokens to their true semantic category:
+//! function names, type names, methods, macros, `self`.
 //!
 //! This module deliberately mirrors `python_semantic.rs`. It owns no state,
 //! only consumes the AST, so it is safe to call from the background reactor
 //! thread.
 
 use crate::core::DocByte;
+use crate::svp::rune_ast::RuneDocument;
 use crate::svp::rust_highlight::{HighlightSpan, TokenCategory};
 
 use rune::ast::{self, Spanned};
 
-/// Extract semantic highlight spans from a parsed Rune file.
-pub fn extract_semantic_highlights(file: &ast::File, global_offset: DocByte) -> Vec<HighlightSpan> {
+/// Extract semantic highlight spans from an item file or statement buffer.
+pub(crate) fn extract_semantic_highlights(
+	document: &RuneDocument,
+	global_offset: DocByte,
+) -> Vec<HighlightSpan> {
 	let mut spans = Vec::new();
-	for (item, _semi) in &file.items {
-		visit_item(item, global_offset, &mut spans);
+	match document {
+		RuneDocument::File(file) => {
+			for (item, _semi) in &file.items {
+				visit_item(item, global_offset, &mut spans);
+			}
+		}
+		RuneDocument::Statements(block) => {
+			for statement in &block.statements {
+				visit_stmt(statement, global_offset, &mut spans);
+			}
+		}
 	}
 	spans.sort_unstable_by_key(|s| s.start);
 	spans
@@ -347,11 +360,11 @@ fn emit_path_as_call(path: &ast::Path, offset: DocByte, spans: &mut Vec<Highligh
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::svp::rune_ast::try_parse_rune_file;
+	use crate::svp::rune_ast::try_parse_rune_document;
 
 	fn highlights_for(source: &str) -> Vec<(TokenCategory, String)> {
-		let file = try_parse_rune_file(source).expect("rune source must parse");
-		let spans = extract_semantic_highlights(&file, DocByte::ZERO);
+		let document = try_parse_rune_document(source).expect("rune source must parse");
+		let spans = extract_semantic_highlights(&document, DocByte::ZERO);
 		spans
 			.into_iter()
 			.map(|s| {
@@ -449,5 +462,33 @@ impl Counter {
 				.any(|(c, t)| *c == TokenCategory::Function && t == "make"),
 			"missing make as Function: {hls:?}"
 		);
+	}
+
+	#[test]
+	fn workspace_statement_methods_and_sink_constructors_are_semantic() {
+		let source = r#"workspace
+	.table("test2")
+	.sort([col("cat").asc()])
+	.views([
+		scatter("cat", "val"),
+		bar("cat", "val"),
+		table(),
+	])"#;
+		let hls = highlights_for(source);
+		for method in ["table", "sort", "asc", "views"] {
+			assert!(
+				hls.iter()
+					.any(|(category, text)| *category == TokenCategory::Method && text == method),
+				"missing {method} as Method: {hls:?}"
+			);
+		}
+		for function in ["col", "scatter", "bar", "table"] {
+			assert!(
+				hls.iter().any(|(category, text)| {
+					*category == TokenCategory::Function && text == function
+				}),
+				"missing {function} as Function: {hls:?}"
+			);
+		}
 	}
 }

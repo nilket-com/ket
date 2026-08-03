@@ -1,8 +1,9 @@
 //! Phase 8 — Rune Structural Graft.
 //!
-//! Parses Rune source with the official `rune` crate's `Parser` and maps
-//! the resulting AST into Baryon's `UastRegistry` via the same relational
-//! isomorphism used for Python (`python_ast.rs`):
+//! Parses item-based Rune files and braceless statement buffers with the
+//! official `rune` crate's `Parser`, then maps the resulting AST into Baryon's
+//! `UastRegistry` via the same relational isomorphism used for Python
+//! (`python_ast.rs`):
 //!
 //! * Scopes / blocks (File, ItemFn, ItemImpl, ItemMod, ItemStruct,
 //!   ItemEnum, Block) → `SemanticKind::RelationalTable`
@@ -126,12 +127,30 @@ impl GreenNode {
 // Step 1: Parse
 // ============================================================
 
-/// Parse the given UTF-8 source into a Rune [`ast::File`]. Returns `None`
-/// on any parser error (syntax mid-flight, unsupported constructs, etc.);
-/// callers should fall back to an all-trivia tree in that case.
-pub fn try_parse_rune_file(source: &str) -> Option<ast::File> {
+/// The two document roots accepted by the Rune language provider.
+///
+/// Item files remain the first choice so existing `init.rn` behavior is
+/// unchanged. Workspace programs are braceless statement lists and use
+/// `EmptyBlock`, the same root Polariton executes.
+pub(crate) enum RuneDocument {
+	File(ast::File),
+	Statements(ast::EmptyBlock),
+}
+
+/// Parse a complete editor document without assuming every `.rn` buffer is an
+/// item file. Returns `None` on syntax mid-flight or unsupported input so the
+/// lexical and all-trivia fallbacks remain available.
+pub(crate) fn try_parse_rune_document(source: &str) -> Option<RuneDocument> {
 	let mut parser = rune::parse::Parser::new(source, SourceId::EMPTY, true);
-	parser.parse_all::<ast::File>().ok()
+	if let Ok(file) = parser.parse_all::<ast::File>() {
+		return Some(RuneDocument::File(file));
+	}
+
+	let mut parser = rune::parse::Parser::new(source, SourceId::EMPTY, true);
+	parser
+		.parse_all::<ast::EmptyBlock>()
+		.ok()
+		.map(RuneDocument::Statements)
 }
 
 // ============================================================
@@ -147,8 +166,11 @@ fn span_range(spanned: &impl Spanned) -> (u32, u32) {
 /// Top-level green-tree builder. Always returns a node of kind `File`
 /// whose `text_len()` equals `source_len`.
 pub fn build_green_tree(source: &str, source_len: u32) -> GreenNode {
-	match try_parse_rune_file(source) {
-		Some(file) => build_from_file(&file, source_len),
+	match try_parse_rune_document(source) {
+		Some(RuneDocument::File(file)) => build_from_file(&file, source_len),
+		Some(RuneDocument::Statements(block)) => {
+			build_from_statements(&block.statements, source_len)
+		}
 		// Parser bailed — wrap the whole document in a single trivia leaf
 		// so byte length is preserved and the engine stays alive.
 		None => GreenNode::branch(
@@ -156,6 +178,29 @@ pub fn build_green_tree(source: &str, source_len: u32) -> GreenNode {
 			vec![GreenNode::leaf(RuneSyntaxKind::Trivia, source_len)],
 		),
 	}
+}
+
+fn build_from_statements(statements: &[ast::Stmt], source_len: u32) -> GreenNode {
+	let mut children = Vec::new();
+	let mut offset = 0;
+
+	for statement in statements {
+		let (statement_start, statement_end) = span_range(statement);
+		if statement_start > offset {
+			children.push(GreenNode::leaf(
+				RuneSyntaxKind::Trivia,
+				statement_start - offset,
+			));
+		}
+		children.push(build_stmt_node(statement, statement_start, statement_end));
+		offset = statement_end;
+	}
+
+	if offset < source_len {
+		children.push(GreenNode::leaf(RuneSyntaxKind::Trivia, source_len - offset));
+	}
+
+	GreenNode::branch(RuneSyntaxKind::File, children)
 }
 
 fn build_from_file(file: &ast::File, source_len: u32) -> GreenNode {
@@ -581,6 +626,28 @@ mod tests {
 		build_green_tree(source, source.len() as u32)
 	}
 
+	#[test]
+	fn document_parser_preserves_item_files_and_accepts_workspace_statements() {
+		assert!(matches!(
+			try_parse_rune_document("pub fn main() { let x = 1; }"),
+			Some(RuneDocument::File(_))
+		));
+		assert!(matches!(
+			try_parse_rune_document(
+				"workspace.table(\"test2\").views([scatter(\"cat\", \"val\"), table()])"
+			),
+			Some(RuneDocument::Statements(_))
+		));
+		assert!(try_parse_rune_document("fn broken( { let x =").is_none());
+	}
+
+	#[test]
+	fn empty_block_itself_accepts_top_level_items() {
+		let mut parser =
+			rune::parse::Parser::new("pub fn main() { let x = 1; }", SourceId::EMPTY, true);
+		assert!(parser.parse_all::<ast::EmptyBlock>().is_ok());
+	}
+
 	// ---- byte-length invariants ----
 
 	#[test]
@@ -617,6 +684,24 @@ mod tests {
 	fn length_matches_module() {
 		let src = "mod nested {\n    fn inside() {}\n}\n";
 		assert_eq!(build(src).text_len(), src.len() as u32);
+	}
+
+	#[test]
+	fn workspace_statement_topology_contains_rows_instead_of_only_trivia() {
+		let src =
+			"let r = workspace.table(\"test2\"); r.views([scatter(\"cat\", \"val\"), table()])";
+		let tree = build(src);
+		assert_eq!(tree.text_len(), src.len() as u32);
+		assert!(
+			tree.children
+				.iter()
+				.any(|child| child.kind == RuneSyntaxKind::Local)
+		);
+		assert!(
+			tree.children
+				.iter()
+				.any(|child| child.kind == RuneSyntaxKind::Expr)
+		);
 	}
 
 	#[test]
