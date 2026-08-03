@@ -25,6 +25,8 @@ PATH="$mock_path" "${installer[@]}" --enable-linger
 unit="$fixture/units/nilket-local.service"
 grep -Fqx "ExecStart=\"$fixture/bin/nilket\" local --data-dir \"$fixture/profile with spaces and %%percent\"" "$unit"
 for directive in \
+	"StartLimitIntervalSec=60s" \
+	"StartLimitBurst=5" \
 	"Type=exec" \
 	"Restart=on-failure" \
 	"KillSignal=SIGINT" \

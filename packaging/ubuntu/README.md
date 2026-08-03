@@ -31,6 +31,10 @@ machine boot before login, explicitly request lingering:
 packaging/ubuntu/install-nilket-local-user-service.sh --enable-linger
 ```
 
+Lingering runs the local workspace unattended from boot while it still uses the
+`dev-insecure` development custody path. This remains a development-only
+deployment and is not a production custody boundary.
+
 The installer never invokes `sudo`. If policy does not authorize `loginctl`, run
 this separately:
 
@@ -45,6 +49,15 @@ systemctl --user status nilket-local.service
 systemctl --user restart nilket-local.service
 systemctl --user stop nilket-local.service
 journalctl --user -u nilket-local.service -f
+```
+
+Persistent startup failures are bounded to five attempts in one minute, after
+which the unit stays visibly failed. After correcting the cause, clear that
+state and start it again:
+
+```bash
+systemctl --user reset-failed nilket-local.service
+systemctl --user start nilket-local.service
 ```
 
 Polariton discovers and attaches to a running service without acquiring stop
@@ -63,7 +76,9 @@ authorized with `--force`.
 `KillSignal=SIGINT` enters Nilket's ordered drain, while `KillMode=mixed` keeps
 systemd from broadcasting that first signal to both roles. The 90-second stop
 deadline sits above Nilket's two 35-second role deadlines and leaves systemd as
-the final orphan backstop.
+the final orphan backstop. `StartLimitIntervalSec=60s` and
+`StartLimitBurst=5` turn recurring startup failures into a terminal, inspectable
+state instead of indefinite restart flapping.
 
 No Debian package is required for this user-local path. A future machine-owned
 package may install a system unit and binary under `/usr`; that is a distinct
