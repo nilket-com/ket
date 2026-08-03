@@ -123,6 +123,7 @@ refuses.
 
 Refusable inside a proven list:
 
+- an **empty list**, refused at its own span, per PRODUCT-0008 §3;
 - a constructor with wrong arity or non-literal field arguments;
 - an unknown callee;
 - a bound sink specification, such as `let s = scatter("c","v"); r.views([s])`,
@@ -168,9 +169,23 @@ The proof burden is three items; everything else is regression.
    overlaps another and that no `.views` or constructor text survives into the
    remote program.
 
-2. **Sink ordering.** List order then chain order is sink order; reordering the
-   list or the chain yields unequal semantics, while reordering unrelated
-   statements yields equal semantics. Both directions asserted.
+2. **Sink ordering, at both levels.** Within one emitted `ViewSet`, list order
+   then chain order is sink order: reordering the list or the chain yields
+   unequal semantics, while reordering unrelated statements yields equal
+   semantics. Across roots, order is **emission position, not definition
+   position**:
+
+   ```rune
+   let v = r.views([scatter("c","v")]);
+   table(r);
+   v
+   ```
+
+   yields `table`, then `scatter`. The reversal — `v` before `table(r)` — yields
+   `scatter`, then `table`. A third fixture defines two bound sets and emits them
+   in reverse definition order, asserting emission order wins. Without these an
+   implementation could order by constructor span, pass every other test, and
+   silently contradict binding laziness.
 
 3. **Contextual constructor recognition.** `scatter("c","v")` as a bare
    statement, in a binding, and inside a non-`views` call is ordinary Rune,
@@ -179,10 +194,11 @@ The proof burden is three items; everything else is regression.
    from `workspace` is never a root. Positive controls prove each form is
    recognized in the sanctioned position.
 
-**Atomicity controls.** Malformed arity, non-literal fields, unknown callee, a
-bound sink spec, and a misused `ViewSet` binding each refuse with a span; a
-counter proves no partial peel and no dispatch occurred. A shadowed `workspace`
-retains instead of refusing, proving the two paths are distinct.
+**Atomicity controls.** An empty list, malformed arity, non-literal fields, an
+unknown callee, a bound sink spec, and a misused `ViewSet` binding each refuse
+with a span; a counter proves no partial peel and no dispatch occurred. Both
+`.views([])` positions are covered — terminal and intermediate. A shadowed
+`workspace` retains instead of refusing, proving the two paths are distinct.
 
 **Laziness through the real caller.** A recognized envelope with no emitted root
 schedules nothing, emits nothing, and does not reach the local Rune host; a
@@ -227,8 +243,10 @@ identity. It seeds nothing; `test2` already exists.
       assay passes unchanged.
 - [ ] The four-program equivalence passes, including equality with the existing
       free-function spelling.
-- [ ] Sink ordering proved in both directions; contextual recognition proved with
-      positive controls.
+- [ ] Sink ordering proved at both levels: within a `ViewSet` by list then chain,
+      across roots by emission position rather than definition position.
+- [ ] `.views([])` refuses in terminal and intermediate positions.
+- [ ] Contextual recognition proved with positive controls.
 - [ ] Every existing envelope test passes unmodified; no `executable` row's cited
       test changed.
 - [ ] Live gate for the accepted spelling green against the running deployment.

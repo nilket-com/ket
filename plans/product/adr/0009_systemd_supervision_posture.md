@@ -100,8 +100,9 @@ deployment owns it, and the other attaches.
 Some startup failures recur on every attempt. A required endpoint occupied by a
 foreign process, a generated artifact that no longer validates, a profile whose
 format version the installed binary does not support, or development PKI that
-cannot be read will each fail preflight identically on the next start, and the
-one after that.
+cannot be read will each fail startup identically on the next start, and the one
+after that. They fail at different points — only the occupied endpoint is caught
+by preflight — but all of them recur.
 
 (Contention with a previous instance is *not* such a case, and must not be cited
 as one: systemd waits for the process to exit — up to `TimeoutStopSec` — before

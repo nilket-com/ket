@@ -96,6 +96,12 @@ is an attributed local refusal naming its span. Partial lowering is prohibited:
 no program may reach Toron with some elements peeled and others left in place,
 and no presentation syntax may reach the executor.
 
+An **empty list refuses** at its own span. A terminal `.views([])` would create an
+output root carrying no sinks and make the normal form's execution count
+ambiguous — one execution producing nothing is not distinguishable from no
+execution — and an intermediate `.views([])` adds no expressive power that
+appending does not already provide.
+
 This is deliberately stricter than PRODUCT-0003's free-function recognition,
 which retains everything it does not recognize. The difference is evidence, not
 appetite. There, a bare `table(1)` is genuinely ambiguous between a view and a
@@ -144,6 +150,23 @@ ViewSet { relation_origin, sinks: flat ordered list }
 
 Every surface operation appends. Nesting never enters the representation, so list
 order followed by chain order is execution order by construction.
+
+Ordering has two levels, and factoring makes the distinction observable. **Output
+roots order globally by source position**, and **list order then chain order
+applies within each emitted `ViewSet`**. Constructor spans carry diagnostic
+attribution only and never contribute to ordering. So in
+
+```rune
+let v = r.views([scatter("c", "v")]);
+table(r);
+v
+```
+
+the sink order is `table`, then `scatter`. The binding emits nothing, so `v`'s
+sinks take the position of the expression that emits them rather than the
+position of their constructors. Ordering by constructor span would reverse this
+and would silently contradict the laziness rule that says a binding emits
+nothing — the two rules are the same rule seen from two sides.
 
 This is the shape `EnvelopeSemantics` already compares. The accepted surface is
 therefore judged by lowering alone: its proof obligation is that the new spelling
