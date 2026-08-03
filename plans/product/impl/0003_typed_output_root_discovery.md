@@ -7,8 +7,12 @@ three-step sequence recorded in `../corpus/rune_workspace_corpus.md` v0.5: it
 establishes the semantic boundary so that `.views(...)` and `.encode(...)` can
 later be lowering rules over a sound analysis rather than parser tricks.
 
-The step changes **where the envelope looks** and **nothing any program means**.
-It introduces no new surface syntax, no new surface semantics, and no new
+No new spelling is introduced. Existing **unshadowed** top-level view forms
+become position-independent; every non-view statement retains its existing
+meaning. Position-independence is the feature, so some programs do change — a
+non-trailing `table(r)` reaches the executor today and becomes a local sink
+after this step. What must not change is the meaning of anything the envelope
+does not recognize. The step introduces no new surface syntax and no new
 refusal. No wire change, no Toron change. Deliverable is one `impl:` commit.
 
 ## What "typed" means here, and what it must not become
@@ -58,34 +62,77 @@ A genuine `plot.bar` root does not license the analysis to reinterpret
 `table(1)`. Having one real root limits such a collision; it does not make raw
 name matching safe.
 
+Retaining non-expression positions is not sufficient either, because a direct
+call in expression position collides just as readily:
+
+```rune
+fn table(x) { x }
+
+table(1);
+let answer = 42;
+answer
+```
+
+Today the reverse walk sees the trailing `answer`, returns `NoTerminalView`, and
+the local Rune host runs this program correctly. A forward scan sees a top-level
+one-argument `table(1)` — a complete name-and-shape match — and would claim it as
+an output root, converting a working local program into a broken remote one.
+`NoTerminalView` is currently what protects this buffer, and position-independence
+removes that protection.
+
 The rule is therefore as narrow as it can be:
 
 > A **top-level expression statement** whose callee text and call shape both
-> match a known view form is an output root. **Everything else is retained** and
-> shipped to Toron unchanged.
+> match an **unshadowed** known view form is an output root. **Everything else is
+> retained** and passed through unchanged.
 
 "Everything else" includes view-named calls in binding position, inside
 functions, inside blocks, and inside control flow — and view-named calls at top
 level whose shape does not match, such as wrong arity or non-literal field
-arguments. Retained statements fail downstream exactly as they do today, in Toron
-or in the local host, and legitimate same-named user functions keep working.
+arguments. Retained statements behave exactly as they do today: the buffer either
+has another valid root, in which case they reach Toron, or it has none, in which
+case it falls through to the local Rune host. Legitimate same-named user
+functions keep working in both cases.
+
+### Shadowing
+
+Recognition consults the binding analysis before claiming any root:
+
+- a visible user binding or item named `table` prevents `table(...)` recognition;
+- a visible binding or item named `plot` prevents `plot.bar(...)` and
+  `plot.scatter(...)` recognition;
+- only unshadowed exact forms are presentation roots.
+
+This is still binding analysis — which names are bound — and not Rune relation
+typing. It asks nothing about what any call computes.
+
+Visibility is evaluated conservatively for this step: a top-level item or binding
+of a shadowing name anywhere in the buffer disables that form for the **whole**
+buffer, rather than from its definition onward. Rune items are file-scoped
+regardless of position, and for `let` bindings the conservative rule errs toward
+retention, which is the safe direction under a total recognizer. A precise
+lexical rule can tighten this later without changing any program that works under
+the conservative one.
 
 This makes recognition **total and monotone**: recognized becomes a root,
-unrecognized is left alone, and no third outcome exists. It is the only rule
-under which position-independent recognition changes no program's meaning.
+unrecognized is left alone, and no third outcome exists.
 
 ### The diagnostic this costs
 
 Today a top-level trailing `plot.bar(r, "x")` refuses with "received 2
 arguments" (`:318-332`, asserted by
-`no_view_stays_outside_the_envelope_and_invalid_view_refuses` at `:581`). Under a
-total recognizer, wrong arity means "not a view," so that call is retained and
-the user sees a Toron unknown-callee error instead of a precise local one.
+`no_view_stays_outside_the_envelope_and_invalid_view_refuses` at `:581`).
+
+Under a total recognizer, wrong arity means "not a view," so that call is
+retained and the user sees a **downstream-executor** error instead of a precise
+local one — from the local Rune host when the buffer has no other root, or from
+Toron when another valid root establishes an envelope. A standalone malformed
+call never reaches Toron at all; it yields `NoTerminalView` and falls through.
 
 That is a real regression on a likely typo, and it is accepted deliberately
 rather than overlooked. Keeping the refusal would require treating a name match
 with a shape mismatch as evidence of intent, which is exactly the inference the
-collision above forbids. The precise diagnostic can return once the view names
+collisions above forbid. The precise diagnostic can return once the view names
 are formally reserved — the same condition already deferring a nested-call
 diagnostic. The arity half of `:581` is rewritten accordingly, with a citation.
 
@@ -208,39 +255,50 @@ that no longer exists.
 
 **Meaning is preserved for everything unrecognized.**
 
-5. **The collision program above is untouched**: `fn table(x) { x }` and
+5. **The binding-position collision is untouched**: `fn table(x) { x }` and
    `let n = table(1);` are retained verbatim in the remote program while
    `plot.bar` is recognized as the sole root.
-6. **View-named calls in binding position, in functions, in blocks, and in
+6. **The direct-call collision is untouched**: the `fn table(x) { x }` /
+   `table(1);` / trailing `answer` program still yields `NoTerminalView` and
+   reaches the local Rune host. This is the case position-independence would
+   otherwise break, so it is the load-bearing shadowing proof.
+7. **Shadowing disables each form independently:** a `let plot = ...;` binding
+   suppresses `plot.bar` and `plot.scatter` recognition while an unshadowed
+   `table(r)` in the same buffer is still a root, and the mirror case with
+   `table` shadowed. Positive controls without the shadowing binding prove both
+   forms are otherwise recognized.
+8. **View-named calls in binding position, in functions, in blocks, and in
    control flow** are retained and neither refused nor removed.
-7. **A top-level view-named call with wrong arity is retained**, replacing the
-   arity-refusal half of `:581` with a citation. The name-only half —
-   `NoTerminalView` for a buffer with no view at all — is unchanged.
+9. **A top-level view-named call with wrong arity or non-literal fields is
+   retained**, replacing the arity-refusal half of `:581` with a citation. The
+   name-only half — `NoTerminalView` for a buffer with no view at all — is
+   unchanged.
 
 **Internal.**
 
-8. **Semantic equality respects root order:** reordering ordinary statements
-   yields equal `EnvelopeSemantics`; reordering roots yields **unequal**
-   semantics. Both directions are asserted, since order is meaning.
-9. **Zero roots produce no envelope:** an `OutputRootAnalysis` over a
-   view-free buffer yields `None` from `into_envelope`, the caller reports
-   `NoTerminalView`, and no execution is scheduled. A one-root positive control
-   yields an envelope and one execution, so the test cannot pass by finding
-   nothing anywhere.
-10. **One remote execution feeds ordered local sinks:** an envelope with three
+10. **Semantic equality respects root order:** reordering ordinary statements
+    yields equal `EnvelopeSemantics`; reordering roots yields **unequal**
+    semantics. Both directions are asserted, since order is meaning.
+11. **Zero roots produce no envelope:** an `OutputRootAnalysis` over a
+    view-free buffer yields `None` from `into_envelope`, the caller reports
+    `NoTerminalView`, and no execution is scheduled. A one-root positive control
+    yields an envelope and one execution, so the test cannot pass by finding
+    nothing anywhere.
+12. **One remote execution feeds ordered local sinks:** an envelope with three
     roots submits exactly one scheduler execution and yields three sinks in
     source order sharing one result identity, re-asserting the existing `Arc`
     invariant (`gui/state.rs:2103`) against position-independent roots.
 
 **Preserved behavior and containment.**
 
-11. `MixedRelations` and `DuplicateForm` (`:546`) keep their behavior under
+13. `MixedRelations` and `DuplicateForm` (`:546`) keep their behavior under
     origin-resolved identity, including two identical inline expressions at
     different spans comparing as the same relation.
-12. `diagnostic_fallback()` returns the relation span; an unmappable server error
+14. `diagnostic_fallback()` returns the relation span; an unmappable server error
     is reported against the relation, not against a view.
-13. The relation-verb assay, with its positive control.
-14. `tests/architecture_test.rs:45` passes unchanged.
+15. The relation-verb assay, with its positive control. Shadow-awareness must not
+    trip it: the analysis consults bound names, never relation verbs.
+16. `tests/architecture_test.rs:45` passes unchanged.
 
 ## Non-goals
 
@@ -259,9 +317,12 @@ that no longer exists.
 
 - [ ] The analysis answers only output-root and binding questions; the
       relation-verb assay passes with its positive control.
-- [ ] Recognition is total: matched top-level expression statements become roots,
-      everything else is retained, and no third outcome exists.
-- [ ] The collision program is proven untouched.
+- [ ] Recognition is total: unshadowed matched top-level expression statements
+      become roots, everything else is retained, and no third outcome exists.
+- [ ] Recognition is shadow-aware per form, conservatively over the whole buffer,
+      with positive controls proving each form is otherwise recognized.
+- [ ] Both collision programs are proven untouched, including the direct-call one
+      that `NoTerminalView` protects today.
 - [ ] No new refusal is introduced; the arity refusal is withdrawn with a
       citation rather than widened to new positions.
 - [ ] `ExecutionEnvelope` is nonempty by construction; the empty case runs
