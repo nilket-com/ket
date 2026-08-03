@@ -1,9 +1,10 @@
 //! PRODUCT-0003's deliberately tiny terminal-view envelope.
 //!
 //! This module recognizes presentation calls and rewrites their relation
-//! argument into Toron's `main(workspace)` entrypoint. It owns no relation
-//! verbs, typing, planning, or lowering; those belong exclusively to Toron's
-//! native Rune frontend.
+//! argument into Toron's entrypoint, naming its single capability parameter
+//! `workspace` or the trial alias `ket` to match the proven relation root. It
+//! owns no relation verbs, typing, planning, or lowering; those belong
+//! exclusively to Toron's native Rune frontend.
 
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
@@ -12,7 +13,8 @@ use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 
-const ENTRYPOINT_PREFIX: &str = "pub fn main(workspace) {\n";
+const WORKSPACE_ENTRYPOINT_PREFIX: &str = "pub fn main(workspace) {\n";
+const KET_ENTRYPOINT_PREFIX: &str = "pub fn main(ket) {\n";
 const ENTRYPOINT_SUFFIX: &str = "\n}\n";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -230,6 +232,7 @@ pub(crate) fn transform(source: &str) -> Result<TransformedRuneView, RuneEnvelop
 struct OutputRootAnalysis {
 	retained: Vec<Range<usize>>,
 	relation_origin: Option<String>,
+	relation_root: Option<RelationRoot>,
 	relation: Option<Range<usize>>,
 	sinks: Vec<ParsedSink>,
 	recognized_presentation: bool,
@@ -243,6 +246,9 @@ impl OutputRootAnalysis {
 		Some(ExecutionEnvelope {
 			retained: self.retained,
 			relation: self.relation.expect("a nonempty analysis has a relation"),
+			relation_root: self
+				.relation_root
+				.expect("a nonempty analysis has a relation root"),
 			relation_origin: self
 				.relation_origin
 				.expect("a nonempty analysis has a relation origin"),
@@ -259,6 +265,7 @@ impl OutputRootAnalysis {
 struct ExecutionEnvelope {
 	retained: Vec<Range<usize>>,
 	relation: Range<usize>,
+	relation_root: RelationRoot,
 	relation_origin: String,
 	sinks: NonEmptySinks,
 	terminate_retained_tail: bool,
@@ -305,6 +312,7 @@ struct ParsedSink {
 struct ParsedOutputRoot {
 	emission: Range<usize>,
 	relation: Range<usize>,
+	relation_root: RelationRoot,
 	relation_origin: String,
 	sinks: Vec<ParsedSink>,
 }
@@ -322,6 +330,7 @@ struct ViewShadows {
 	table: bool,
 	plot: bool,
 	workspace: bool,
+	ket: bool,
 }
 
 impl ViewShadows {
@@ -330,6 +339,7 @@ impl ViewShadows {
 			"table" => self.table = true,
 			"plot" => self.plot = true,
 			"workspace" => self.workspace = true,
+			"ket" => self.ket = true,
 			_ => {}
 		}
 	}
@@ -339,13 +349,21 @@ impl ViewShadows {
 enum ExpressionProvenance {
 	RelationCandidate {
 		span: Range<usize>,
+		root: RelationRoot,
 		origin: String,
 	},
 	ViewSet {
 		relation: Range<usize>,
+		root: RelationRoot,
 		origin: String,
 		sinks: Vec<ParsedSink>,
 	},
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelationRoot {
+	Workspace,
+	Ket,
 }
 
 fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
@@ -367,11 +385,13 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 	let mut last_retained_is_expression = false;
 	for statement in &block.statements {
 		if let Some(root) = recognize_view_root(statement, source, shadows)? {
-			let relation_origin = resolve_relation_origin(source, &root, &bindings)?;
+			let (relation_origin, relation_root) =
+				resolve_relation_origin(source, &root, &bindings, shadows)?;
 			peeled.push(root.statement.clone());
 			roots.push(ParsedOutputRoot {
 				emission: root.statement.clone(),
 				relation: root.relation,
+				relation_root,
 				relation_origin,
 				sinks: vec![ParsedSink {
 					intent: root.intent,
@@ -383,7 +403,7 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 
 		if let ast::Stmt::Local(local) = statement {
 			let statement_span = byte_range(statement.span(), source.len())?;
-			let provenance = expression_provenance(&local.expr, source, &kinds, shadows.workspace)?;
+			let provenance = expression_provenance(&local.expr, source, &kinds, shadows)?;
 			if let Some(binding) = bindings
 				.iter()
 				.find(|binding| binding.statement == statement_span)
@@ -409,9 +429,10 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 		if let Some(expression) = expression
 			&& let Some(ExpressionProvenance::ViewSet {
 				relation,
+				root,
 				origin,
 				sinks,
-			}) = expression_provenance(expression, source, &kinds, shadows.workspace)?
+			}) = expression_provenance(expression, source, &kinds, shadows)?
 		{
 			let emission = byte_range(statement.span(), source.len())?;
 			recognized_presentation = true;
@@ -419,6 +440,7 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 			roots.push(ParsedOutputRoot {
 				emission,
 				relation,
+				relation_root: root,
 				relation_origin: origin,
 				sinks,
 			});
@@ -434,6 +456,7 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 		return Ok(OutputRootAnalysis {
 			retained: retained_regions(source.len(), &peeled)?,
 			relation_origin: None,
+			relation_root: None,
 			relation: None,
 			sinks: Vec::new(),
 			recognized_presentation,
@@ -441,11 +464,12 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 		});
 	};
 	let relation_origin = first.relation_origin.clone();
+	let relation_root = first.relation_root;
 	let relation = first.relation.clone();
 	let first_relation = u32_range(&relation, "relation")?;
 	let mut forms = HashMap::<RuneViewForm, Range<u32>>::new();
 	for root in &roots {
-		if root.relation_origin != relation_origin {
+		if root.relation_origin != relation_origin || root.relation_root != relation_root {
 			return Err(RuneEnvelopeError::MixedRelations {
 				first: first_relation.clone(),
 				differing: u32_range(&root.relation, "relation")?,
@@ -468,6 +492,7 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 	Ok(OutputRootAnalysis {
 		retained,
 		relation_origin: Some(relation_origin),
+		relation_root: Some(relation_root),
 		relation: Some(relation),
 		sinks: roots.into_iter().flat_map(|root| root.sinks).collect(),
 		recognized_presentation,
@@ -479,35 +504,41 @@ fn expression_provenance(
 	expression: &ast::Expr,
 	source: &str,
 	bindings: &HashMap<String, ExpressionProvenance>,
-	workspace_shadowed: bool,
+	shadows: ViewShadows,
 ) -> Result<Option<ExpressionProvenance>, RuneEnvelopeError> {
 	match expression {
 		ast::Expr::Path(path) => {
 			let raw = source_slice(source, path.span())?.trim();
-			if raw == "workspace" && !workspace_shadowed {
+			let root = match raw {
+				"workspace" if !shadows.workspace => Some(RelationRoot::Workspace),
+				"ket" if !shadows.ket => Some(RelationRoot::Ket),
+				_ => None,
+			};
+			if let Some(root) = root {
 				return Ok(Some(ExpressionProvenance::RelationCandidate {
 					span: byte_range(path.span(), source.len())?,
-					origin: raw.to_owned(),
+					root,
+					// Both spellings name one capability, so semantic identity is
+					// canonical even though synthesis preserves the authored root.
+					origin: "workspace".to_owned(),
 				}));
 			}
 			Ok(bindings.get(raw).cloned())
 		}
-		ast::Expr::Group(group) => {
-			expression_provenance(&group.expr, source, bindings, workspace_shadowed)
-		}
+		ast::Expr::Group(group) => expression_provenance(&group.expr, source, bindings, shadows),
 		ast::Expr::Call(call) => {
 			let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
 			if let ast::Expr::FieldAccess(field) = call.expr.as_ref() {
 				let method = source_slice(source, field.expr_field.span())?.trim();
-				let receiver =
-					expression_provenance(&field.expr, source, bindings, workspace_shadowed)?;
+				let receiver = expression_provenance(&field.expr, source, bindings, shadows)?;
 				return match receiver {
-					Some(ExpressionProvenance::RelationCandidate { span, origin }) => {
+					Some(ExpressionProvenance::RelationCandidate { span, root, origin }) => {
 						provenance_method_on_relation(
 							call,
 							method,
 							&field.expr,
 							span,
+							root,
 							origin,
 							&args,
 							source,
@@ -515,17 +546,18 @@ fn expression_provenance(
 					}
 					Some(ExpressionProvenance::ViewSet {
 						relation,
+						root,
 						origin,
 						sinks,
 					}) => provenance_method_on_view_set(
-						call, method, relation, origin, sinks, &args, source,
+						call, method, relation, root, origin, sinks, &args, source,
 					),
 					None => Ok(None),
 				};
 			}
 
 			if matches!(
-				expression_provenance(&call.expr, source, bindings, workspace_shadowed)?,
+				expression_provenance(&call.expr, source, bindings, shadows)?,
 				Some(ExpressionProvenance::ViewSet { .. })
 			) {
 				return invalid_view(
@@ -536,7 +568,7 @@ fn expression_provenance(
 			}
 			for arg in &args {
 				if matches!(
-					expression_provenance(arg, source, bindings, workspace_shadowed)?,
+					expression_provenance(arg, source, bindings, shadows)?,
 					Some(ExpressionProvenance::ViewSet { .. })
 				) {
 					return invalid_view(
@@ -551,7 +583,7 @@ fn expression_provenance(
 		ast::Expr::Vec(vector) => {
 			for (item, _) in vector.items.iter() {
 				if matches!(
-					expression_provenance(item, source, bindings, workspace_shadowed)?,
+					expression_provenance(item, source, bindings, shadows)?,
 					Some(ExpressionProvenance::ViewSet { .. })
 				) {
 					return invalid_view(
@@ -572,6 +604,7 @@ fn provenance_method_on_relation(
 	method: &str,
 	receiver: &ast::Expr,
 	relation: Range<usize>,
+	root: RelationRoot,
 	mut origin: String,
 	args: &[&ast::Expr],
 	source: &str,
@@ -581,22 +614,26 @@ fn provenance_method_on_relation(
 			let sinks = parse_view_list(call, args, source)?;
 			Ok(Some(ExpressionProvenance::ViewSet {
 				relation,
+				root,
 				origin,
 				sinks,
 			}))
 		}
 		"scatter" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
+			root,
 			origin,
 			sinks: vec![parse_sugar_sink(PlotType::Scatter, call, args, source)?],
 		})),
 		"bar" if args.len() == 2 => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
+			root,
 			origin,
 			sinks: vec![parse_sugar_sink(PlotType::Bar, call, args, source)?],
 		})),
 		"table" if args.is_empty() => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
+			root,
 			origin,
 			sinks: vec![ParsedSink {
 				intent: RuneViewIntent::Table,
@@ -611,6 +648,7 @@ fn provenance_method_on_relation(
 			})?);
 			Ok(Some(ExpressionProvenance::RelationCandidate {
 				span: call_span,
+				root,
 				origin,
 			}))
 		}
@@ -621,6 +659,7 @@ fn provenance_method_on_view_set(
 	call: &ast::ExprCall,
 	method: &str,
 	relation: Range<usize>,
+	root: RelationRoot,
 	origin: String,
 	mut sinks: Vec<ParsedSink>,
 	args: &[&ast::Expr],
@@ -636,6 +675,7 @@ fn provenance_method_on_view_set(
 	sinks.extend(parse_view_list(call, args, source)?);
 	Ok(Some(ExpressionProvenance::ViewSet {
 		relation,
+		root,
 		origin,
 		sinks,
 	}))
@@ -786,15 +826,19 @@ fn render(
 	source: &str,
 	envelope: &ExecutionEnvelope,
 ) -> Result<TransformedRuneView, RuneEnvelopeError> {
+	let entrypoint_prefix = match envelope.relation_root {
+		RelationRoot::Workspace => WORKSPACE_ENTRYPOINT_PREFIX,
+		RelationRoot::Ket => KET_ENTRYPOINT_PREFIX,
+	};
 	let retained_len = envelope.retained.iter().map(Range::len).sum::<usize>();
 	let mut transformed = String::with_capacity(
-		ENTRYPOINT_PREFIX.len()
+		entrypoint_prefix.len()
 			+ retained_len
 			+ envelope.relation.len()
 			+ ENTRYPOINT_SUFFIX.len()
 			+ 3,
 	);
-	transformed.push_str(ENTRYPOINT_PREFIX);
+	transformed.push_str(entrypoint_prefix);
 	let mut segments = Vec::new();
 	for retained in &envelope.retained {
 		let transformed_start = transformed.len();
@@ -1043,7 +1087,8 @@ fn resolve_relation_origin(
 	source: &str,
 	root: &ParsedView,
 	bindings: &[LocalBinding],
-) -> Result<String, RuneEnvelopeError> {
+	shadows: ViewShadows,
+) -> Result<(String, RelationRoot), RuneEnvelopeError> {
 	let relation = source
 		.get(root.relation.clone())
 		.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?
@@ -1052,12 +1097,22 @@ fn resolve_relation_origin(
 		&& let Some(binding) = bindings.iter().rev().find(|binding| {
 			binding.name == relation && binding.statement_start < root.statement.start
 		}) {
-		return Ok(source
+		let origin = source
 			.get(binding.initializer.clone())
 			.ok_or_else(|| RuneEnvelopeError::Invalid("binding initializer is not UTF-8".into()))?
-			.to_owned());
+			.to_owned();
+		return Ok(canonical_relation_origin(origin, shadows));
 	}
-	Ok(relation.to_owned())
+	Ok(canonical_relation_origin(relation.to_owned(), shadows))
+}
+
+fn canonical_relation_origin(origin: String, shadows: ViewShadows) -> (String, RelationRoot) {
+	if !shadows.ket
+		&& let Some(rest) = origin.strip_prefix("ket.")
+	{
+		return (format!("workspace.{rest}"), RelationRoot::Ket);
+	}
+	(origin, RelationRoot::Workspace)
 }
 
 fn is_simple_name(raw: &str) -> bool {
@@ -1191,7 +1246,7 @@ mod tests {
 		let transformed = transform(source).expect("table envelope");
 		assert_eq!(transformed.views.len(), 1);
 		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
-		assert!(transformed.source.starts_with(ENTRYPOINT_PREFIX));
+		assert!(transformed.source.starts_with(WORKSPACE_ENTRYPOINT_PREFIX));
 		assert!(transformed.source.ends_with(ENTRYPOINT_SUFFIX));
 		assert!(transformed.source.contains("let r = workspace.table"));
 		assert!(transformed.source.contains("\nr\n}"));
@@ -1526,6 +1581,40 @@ mod tests {
 			],
 			&["scatter(\"c\",\"v\")", "bar(\"c\",\"v\")"],
 			"each sink keeps its constructor span even when its binding is peeled"
+		);
+	}
+
+	#[test]
+	fn ket_is_an_exact_workspace_alias_for_relation_provenance() {
+		let workspace = envelope(
+			"let r = workspace.table(\"t\").sort([asc(col(\"c\"))]); r.views([scatter(\"c\",\"v\"), bar(\"c\",\"v\")])",
+		);
+		let ket = envelope(
+			"let r = ket.table(\"t\").sort([asc(col(\"c\"))]); r.views([scatter(\"c\",\"v\"), bar(\"c\",\"v\")])",
+		);
+		let legacy = envelope(
+			"let r = ket.table(\"t\").sort([asc(col(\"c\"))]); plot.scatter(r, \"c\", \"v\"); plot.bar(r, \"c\", \"v\")",
+		);
+
+		assert_eq!(ket.semantics(), workspace.semantics());
+		assert_eq!(legacy.semantics(), workspace.semantics());
+		let rendered =
+			transform("ket.table(\"t\").views([scatter(\"c\", \"v\"), bar(\"c\", \"v\")])")
+				.expect("ket relation root lowers");
+		assert!(rendered.source.starts_with(KET_ENTRYPOINT_PREFIX));
+		assert!(rendered.source.contains("\nket.table(\"t\")\n}"));
+	}
+
+	#[test]
+	fn a_shadowed_ket_is_ordinary_rune_without_shadowing_workspace() {
+		let shadowed = "let ket = local; ket.table(\"t\").views([table()])";
+		assert_eq!(transform(shadowed), Err(RuneEnvelopeError::NoTerminalView));
+
+		let workspace_remains =
+			envelope("let ket = local; workspace.table(\"t\").views([table()])");
+		assert_eq!(
+			workspace_remains.semantics().sinks,
+			vec![RuneViewIntent::Table]
 		);
 	}
 

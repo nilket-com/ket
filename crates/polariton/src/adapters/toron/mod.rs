@@ -257,7 +257,7 @@ mod tests {
 		let mut adapter = ToronAdapter::connect(&live_endpoint())
 			.await
 			.expect("connect to Toron");
-		let source = "workspace.table(\"test2\").sort([col(\"cat\").asc()]).views([table(), bar(\"cat\", \"val\"), scatter(\"cat\", \"val\")])";
+		let source = "ket.table(\"test2\").sort([col(\"cat\").asc()]).views([table(), bar(\"cat\", \"val\"), scatter(\"cat\", \"val\")])";
 		let view = transform_rune_view(source).expect("PRODUCT-0008 view envelope");
 		let frame = adapter
 			.dispatch_rune(&view.source)
