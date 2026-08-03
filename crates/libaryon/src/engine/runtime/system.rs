@@ -8713,6 +8713,49 @@ pub struct Foo {
 	}
 
 	#[test]
+	fn load_file_from_focused_browser_targets_the_editor_pane() {
+		let root = temp_test_path("file-browser-edit-command");
+		std::fs::create_dir_all(&root).expect("create root dir");
+		let first_path = root.join("first.rn");
+		let second_path = root.join("second.rn");
+		std::fs::write(&first_path, "first\n").expect("write first file");
+		std::fs::write(&second_path, "second\n").expect("write second file");
+		let root_name = root.to_string_lossy().into_owned();
+		let first_name = first_path.to_string_lossy().into_owned();
+		let second_name = second_path.to_string_lossy().into_owned();
+		let (tx_cmd, rx_view, handle) = spawn_test_engine(false, false, None);
+
+		let loaded = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::LoadFile(first_name));
+		let editor_pane_id = loaded.focused_pane_id;
+		let opened = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::OpenFileBrowserAt(root_name),
+		);
+		let browser_pane_id = opened.focused_pane_id;
+		assert!(opened.is_file_browser);
+
+		let edited = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::LoadFile(second_name.clone()),
+		);
+
+		assert_eq!(edited.focused_pane_id, editor_pane_id);
+		assert_eq!(edited.file_name.as_deref(), Some(second_name.as_str()));
+		assert!(
+			edited
+				.pane(browser_pane_id)
+				.is_some_and(|pane| pane.is_file_browser),
+			"editing from the tree must not retarget the browser view"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
 	fn browser_file_activation_returns_to_the_most_recently_focused_editor_pane() {
 		let root = temp_test_path("file-browser-recent-pane");
 		std::fs::create_dir_all(&root).expect("create root dir");

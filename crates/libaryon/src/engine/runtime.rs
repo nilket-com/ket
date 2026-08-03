@@ -4696,7 +4696,24 @@ fn dispatch_command(
 			needs_render |= effect.needs_render;
 		}
 		EditorCommand::LoadFile(path) => {
-			let pane_id = session.focused_pane_id;
+			let pane_id = if session
+				.layout
+				.find_pane(session.focused_pane_id)
+				.is_some_and(|pane| pane.active_tab().is_file_browser())
+			{
+				let browser_pane_id = session.focused_pane_id;
+				let Some(target_pane_id) =
+					ensure_browser_target_pane(runtime.registry, session, browser_pane_id)
+				else {
+					session.ui.status_message =
+						Some("Unable to find a target pane for file open".to_string());
+					needs_render = true;
+					return DispatchOutcome::continue_with(needs_render);
+				};
+				target_pane_id
+			} else {
+				session.focused_pane_id
+			};
 			needs_render |= load_file_into_pane(runtime, session, pane_id, path)
 				.effect
 				.needs_render;
