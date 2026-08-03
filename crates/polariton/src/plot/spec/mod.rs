@@ -230,6 +230,7 @@ pub struct BoundChannel {
 pub struct ChannelBinding {
 	composition: PlotComposition,
 	channels: Vec<BoundChannel>,
+	kernel_fields: Box<ResolvedKernelFields>,
 	color_job: Option<ColorJob>,
 	categorical_limit: usize,
 }
@@ -280,6 +281,7 @@ pub struct PlotProvenance {
 pub struct ResolvedPlotSpec {
 	pub composition: PlotComposition,
 	pub channels: Vec<ResolvedChannel>,
+	pub kernel_fields: Box<ResolvedKernelFields>,
 	pub color_job: Option<ColorJob>,
 	pub provenance: PlotProvenance,
 }
@@ -292,12 +294,133 @@ impl ResolvedPlotSpec {
 	}
 }
 
+/// Exact field roles consumed by the existing plot kernels. Automatic field
+/// choice is resolved into this product-side artifact; the factory only
+/// projects these names into kernel preparation calls.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedKernelFields {
+	Violin {
+		category: Option<String>,
+		value: String,
+	},
+	Hexbin {
+		x: String,
+		y: String,
+	},
+	Line {
+		series: Option<String>,
+		x: String,
+		y: String,
+	},
+	Bar {
+		category: String,
+		group: Option<String>,
+		value: String,
+	},
+	Scatter {
+		color: Option<String>,
+		x: String,
+		y: String,
+	},
+	StackedBar {
+		category: String,
+		group: Option<String>,
+		value: String,
+	},
+	Pie {
+		category: Option<String>,
+		value: String,
+	},
+	BoxPlot {
+		category: Option<String>,
+		value: String,
+	},
+	Histogram {
+		value: String,
+	},
+	Bubble {
+		x: String,
+		y: String,
+		size: String,
+		color: String,
+		label: Option<String>,
+	},
+	Heatmap {
+		x: String,
+		y: String,
+		value: String,
+	},
+	Parallel {
+		dimensions: Vec<String>,
+		category: Option<String>,
+	},
+	Radar {
+		dimensions: Vec<String>,
+		category: Option<String>,
+	},
+	RadialDial {
+		label: Option<String>,
+		value: String,
+		maximum: String,
+	},
+	Candlestick {
+		x: String,
+		open: String,
+		high: String,
+		low: String,
+		close: String,
+	},
+	Funnel {
+		stage: Option<String>,
+		value: String,
+	},
+	StackedArea {
+		series: Option<String>,
+		x: String,
+		y: String,
+	},
+	FillBetween {
+		x: String,
+		middle: String,
+		lower: String,
+		upper: String,
+	},
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedLayout {
 	pub viewport_width: u32,
 	pub viewport_height: u32,
-	pub x_range: (f32, f32),
-	pub y_range: (f32, f32),
+	pub x_range: (f64, f64),
+	pub y_range: (f64, f64),
+}
+
+impl ResolvedLayout {
+	pub fn from_spec(spec: &ResolvedPlotSpec, viewport_width: u32, viewport_height: u32) -> Self {
+		let range = |channel: Channel| {
+			spec.channel(channel)
+				.map(|channel| match &channel.domain {
+					ScaleDomain::Categorical(categories) => {
+						(0.0, categories.len().saturating_sub(1) as f64)
+					}
+					ScaleDomain::Quantitative { min, max } => padded_range(*min, *max),
+					ScaleDomain::Temporal { min, max } => padded_range(*min as f64, *max as f64),
+					ScaleDomain::Empty => (0.0, 1.0),
+				})
+				.unwrap_or((0.0, 1.0))
+		};
+		Self {
+			viewport_width,
+			viewport_height,
+			x_range: range(Channel::X),
+			y_range: range(Channel::Y),
+		}
+	}
+}
+
+fn padded_range(min: f64, max: f64) -> (f64, f64) {
+	let padding = (max - min).max(0.001) * 0.1;
+	(min - padding, max + padding)
 }
 
 #[derive(Clone, Debug)]
@@ -373,10 +496,22 @@ pub fn resolve_channels(
 ) -> Result<ChannelBinding, ChannelError> {
 	let plot_type = spec.composition.primary_plot_type();
 	if !matches!(plot_type, PlotType::Scatter | PlotType::Bar) {
-		return Err(ChannelError {
-			channel: Channel::X,
-			field: "<auto>".to_owned(),
-			reason: format!("{plot_type} has no PRODUCT-0007 channel contract yet"),
+		if !matches!(spec.x.field, AuthoredChannel::Auto)
+			|| !matches!(spec.y.field, AuthoredChannel::Auto)
+			|| !matches!(spec.color.field, OptionalAuthoredChannel::Auto)
+		{
+			return Err(ChannelError {
+				channel: Channel::X,
+				field: "<authored>".to_owned(),
+				reason: format!("{plot_type} does not yet expose authored channel roles"),
+			});
+		}
+		return Ok(ChannelBinding {
+			composition: spec.composition.clone(),
+			channels: Vec::new(),
+			kernel_fields: Box::new(resolve_automatic_kernel_fields(plot_type, schema)?),
+			color_job: None,
+			categorical_limit: 0,
 		});
 	}
 
@@ -448,9 +583,11 @@ pub fn resolve_channels(
 	}
 	let mut channels = vec![x, y];
 	channels.extend(color);
+	let kernel_fields = Box::new(kernel_fields_from_channels(plot_type, &channels)?);
 	Ok(ChannelBinding {
 		composition: spec.composition.clone(),
 		channels,
+		kernel_fields,
 		color_job,
 		categorical_limit: categorical_limit(plot_type),
 	})
@@ -502,11 +639,185 @@ pub fn resolve_domains(
 		ResolvedPlotSpec {
 			composition: binding.composition,
 			channels,
+			kernel_fields: binding.kernel_fields,
 			color_job,
 			provenance: result.provenance.clone(),
 		},
 		next_identity,
 	))
+}
+
+fn kernel_fields_from_channels(
+	plot_type: PlotType,
+	channels: &[BoundChannel],
+) -> Result<ResolvedKernelFields, ChannelError> {
+	let field = |channel| {
+		channels
+			.iter()
+			.find(|binding| binding.channel == channel)
+			.map(|binding| binding.field.clone())
+	};
+	let required = |channel| {
+		field(channel).ok_or_else(|| ChannelError {
+			channel,
+			field: "<resolved>".to_owned(),
+			reason: "required channel was not carried into the kernel contract".to_owned(),
+		})
+	};
+	match plot_type {
+		PlotType::Scatter => Ok(ResolvedKernelFields::Scatter {
+			color: field(Channel::Color),
+			x: required(Channel::X)?,
+			y: required(Channel::Y)?,
+		}),
+		PlotType::Bar => Ok(ResolvedKernelFields::Bar {
+			category: required(Channel::X)?,
+			group: field(Channel::Color),
+			value: required(Channel::Y)?,
+		}),
+		_ => unreachable!("only authored Scatter and Bar channels reach this projection"),
+	}
+}
+
+fn resolve_automatic_kernel_fields(
+	plot_type: PlotType,
+	schema: &Schema,
+) -> Result<ResolvedKernelFields, ChannelError> {
+	let nominal = schema
+		.iter()
+		.filter(|(_, dtype)| {
+			matches!(
+				semantic_type(dtype),
+				Some(SemanticType::Nominal | SemanticType::Ordinal)
+			)
+		})
+		.map(|(name, _)| name.as_str().to_owned())
+		.collect::<Vec<_>>();
+	let numeric = schema
+		.iter()
+		.filter(|(_, dtype)| {
+			dtype.is_numeric() || matches!(semantic_type(dtype), Some(SemanticType::Temporal))
+		})
+		.map(|(name, _)| name.as_str().to_owned())
+		.collect::<Vec<_>>();
+	let number = |index: usize, role: &str| {
+		numeric.get(index).cloned().ok_or_else(|| ChannelError {
+			channel: Channel::Y,
+			field: format!("<{role}>"),
+			reason: format!(
+				"{plot_type} requires numeric field {} for {role}",
+				index + 1
+			),
+		})
+	};
+	let category = |index: usize, role: &str| {
+		nominal.get(index).cloned().ok_or_else(|| ChannelError {
+			channel: Channel::X,
+			field: format!("<{role}>"),
+			reason: format!(
+				"{plot_type} requires categorical field {} for {role}",
+				index + 1
+			),
+		})
+	};
+	let optional_category = |index: usize| nominal.get(index).cloned();
+
+	Ok(match plot_type {
+		PlotType::Violin => ResolvedKernelFields::Violin {
+			category: optional_category(0),
+			value: number(0, "value")?,
+		},
+		PlotType::Hexbin => ResolvedKernelFields::Hexbin {
+			x: number(0, "x")?,
+			y: number(1, "y")?,
+		},
+		PlotType::Line => ResolvedKernelFields::Line {
+			series: optional_category(0),
+			x: number(0, "x")?,
+			y: number(1, "y")?,
+		},
+		PlotType::HorizontalBar | PlotType::Bar => ResolvedKernelFields::Bar {
+			category: category(0, "category")?,
+			group: optional_category(1),
+			value: number(0, "value")?,
+		},
+		PlotType::Scatter => unreachable!("Scatter uses the authored channel resolver"),
+		PlotType::StackedBar | PlotType::HorizontalStackedBar => ResolvedKernelFields::StackedBar {
+			category: category(0, "category")?,
+			group: optional_category(1),
+			value: number(0, "value")?,
+		},
+		PlotType::Pie => ResolvedKernelFields::Pie {
+			category: optional_category(0),
+			value: number(0, "value")?,
+		},
+		PlotType::BoxPlot => ResolvedKernelFields::BoxPlot {
+			category: optional_category(0),
+			value: number(0, "value")?,
+		},
+		PlotType::Histogram => ResolvedKernelFields::Histogram {
+			value: number(0, "value")?,
+		},
+		PlotType::Bubble => ResolvedKernelFields::Bubble {
+			x: number(0, "x")?,
+			y: number(1, "y")?,
+			size: number(2, "size")?,
+			color: number(3, "color")?,
+			label: optional_category(0),
+		},
+		PlotType::Heatmap => ResolvedKernelFields::Heatmap {
+			x: category(0, "x")?,
+			y: category(1, "y")?,
+			value: number(0, "value")?,
+		},
+		PlotType::Parallel => ResolvedKernelFields::Parallel {
+			dimensions: (!numeric.is_empty())
+				.then(|| numeric.clone())
+				.ok_or_else(|| ChannelError {
+					channel: Channel::Y,
+					field: "<dimensions>".to_owned(),
+					reason: "Parallel requires at least one numeric dimension".to_owned(),
+				})?,
+			category: optional_category(0),
+		},
+		PlotType::Radar => ResolvedKernelFields::Radar {
+			dimensions: (!numeric.is_empty())
+				.then(|| numeric.clone())
+				.ok_or_else(|| ChannelError {
+					channel: Channel::Y,
+					field: "<dimensions>".to_owned(),
+					reason: "Radar requires at least one numeric dimension".to_owned(),
+				})?,
+			category: optional_category(0),
+		},
+		PlotType::RadialDial => ResolvedKernelFields::RadialDial {
+			label: optional_category(0),
+			value: number(0, "value")?,
+			maximum: number(1, "maximum")?,
+		},
+		PlotType::Candlestick => ResolvedKernelFields::Candlestick {
+			x: category(0, "x")?,
+			open: number(0, "open")?,
+			high: number(1, "high")?,
+			low: number(2, "low")?,
+			close: number(3, "close")?,
+		},
+		PlotType::Funnel => ResolvedKernelFields::Funnel {
+			stage: optional_category(0),
+			value: number(0, "value")?,
+		},
+		PlotType::StackedArea => ResolvedKernelFields::StackedArea {
+			series: optional_category(0),
+			x: number(0, "x")?,
+			y: number(1, "y")?,
+		},
+		PlotType::FillBetween => ResolvedKernelFields::FillBetween {
+			x: number(0, "x")?,
+			middle: number(1, "middle")?,
+			lower: number(2, "lower")?,
+			upper: number(3, "upper")?,
+		},
+	})
 }
 
 fn resolve_required(

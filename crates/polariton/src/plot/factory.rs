@@ -1,5 +1,4 @@
 use crate::plot::common::{Orientation, PlotKernel};
-use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::kernels::bar::{self, BarPlotKernel};
 use crate::plot::kernels::boxplot::{self, BoxPlotKernel};
@@ -21,258 +20,240 @@ use crate::plot::kernels::scatter_line::ScatterLinePlotKernel;
 use crate::plot::kernels::stacked_area::{self, StackedAreaPlotKernel};
 use crate::plot::kernels::stacked_bar::{self, StackedBarPlotKernel};
 use crate::plot::kernels::violin::{self, ViolinPlotKernel};
+use crate::plot::spec::{ResolvedKernelFields, ResolvedPlotSpec};
 use polars::frame::DataFrame;
-use polars::prelude::{Column, DataType};
 use std::sync::Arc;
 
+/// Project a resolved product specification into an existing plot kernel.
+/// Field choice belongs to `plot::spec`; this module performs no schema or
+/// dtype inference and never substitutes one resolved role for another.
 pub fn create_plot(
-	composition: &PlotComposition,
+	spec: &ResolvedPlotSpec,
 	df: &DataFrame,
-	_width: u32,
-	_height: u32,
+	width: u32,
+	height: u32,
 ) -> Arc<dyn PlotKernel + Send + Sync> {
-	if composition.is_fill_between_with_line_overlay() {
-		return create_fill_between_line_plot(df);
-	}
-	if composition.is_scatter_with_line_overlay() {
-		return create_scatter_line_plot(df);
-	}
-
-	create_single_plot(composition.primary_plot_type(), df)
-}
-
-fn create_single_plot(plot_type: PlotType, df: &DataFrame) -> Arc<dyn PlotKernel + Send + Sync> {
-	let string_cols: Vec<&str> = df
-		.columns()
-		.iter()
-		.filter(|c: &&Column| matches!(c.dtype(), DataType::String | DataType::Categorical(_, _)))
-		.map(|c: &Column| c.name().as_str())
-		.collect();
-	let numeric_cols: Vec<&str> = df
-		.columns()
-		.iter()
-		.filter(|c: &&Column| c.dtype().is_numeric())
-		.map(|c: &Column| c.name().as_str())
-		.collect();
-
-	match plot_type {
-		PlotType::Violin => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let val = numeric_cols.first().copied().unwrap_or("");
-			let prepared = violin::prepare_violin_data(df, cat, val, None);
+	let plot_type = spec.composition.primary_plot_type();
+	match spec.kernel_fields.as_ref() {
+		ResolvedKernelFields::Violin { category, value } => {
+			let prepared =
+				violin::prepare_violin_data(df, category.as_deref().unwrap_or(""), value, None);
 			Arc::new(ViolinPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Hexbin => {
-			let prepared = hexbin::prepare_hexbin_data(df, 0.02);
+		ResolvedKernelFields::Hexbin { x, y } => {
+			let prepared = hexbin::prepare_hexbin_data(df, x, y, 0.02);
 			Arc::new(HexbinPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Line => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let x = numeric_cols.first().copied().unwrap_or("");
-			let y = numeric_cols.get(1).copied().unwrap_or(x);
-			let prepared = line::prepare_line_data(df, cat, x, y);
+		ResolvedKernelFields::Line { series, x, y } => {
+			let prepared = line::prepare_line_data(df, series.as_deref().unwrap_or(""), x, y);
 			Arc::new(LinePlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Bar => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let group = string_cols.get(1).copied().unwrap_or("");
-			let val = numeric_cols.first().copied().unwrap_or("");
-			let prepared = bar::prepare_bar_data(df, cat, group, val);
+		ResolvedKernelFields::Bar {
+			category,
+			group,
+			value,
+		} => {
+			let prepared =
+				bar::prepare_bar_data(df, category, group.as_deref().unwrap_or(""), value);
 			Arc::new(BarPlotKernel {
 				prepared_data: Arc::new(prepared),
-				orientation: Orientation::Vertical,
+				orientation: if plot_type == PlotType::HorizontalBar {
+					Orientation::Horizontal
+				} else {
+					Orientation::Vertical
+				},
 			})
 		}
-		PlotType::HorizontalBar => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let group = string_cols.get(1).copied().unwrap_or("");
-			let val = numeric_cols.first().copied().unwrap_or("");
-			let prepared = bar::prepare_bar_data(df, cat, group, val);
-			Arc::new(BarPlotKernel {
-				prepared_data: Arc::new(prepared),
-				orientation: Orientation::Horizontal,
-			})
+		ResolvedKernelFields::Scatter { color, x, y } => {
+			let scatter_data = Arc::new(scatter::prepare_scatter_data_resolved(
+				df, spec, width, height, 3.0,
+			));
+			if spec.composition.is_scatter_with_line_overlay() {
+				let line_data = Arc::new(line::prepare_line_data(
+					df,
+					color.as_deref().unwrap_or(""),
+					x,
+					y,
+				));
+				Arc::new(ScatterLinePlotKernel::new(scatter_data, line_data))
+			} else {
+				Arc::new(ScatterPlotKernel::new(scatter_data))
+			}
 		}
-		PlotType::Scatter => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let x = numeric_cols.first().copied().unwrap_or("");
-			let y = numeric_cols.get(1).copied().unwrap_or(x);
-			let prepared = scatter::prepare_scatter_data(df, cat, x, y, 3.0);
-			Arc::new(ScatterPlotKernel::new(Arc::new(prepared)))
-		}
-		PlotType::StackedBar => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let group = string_cols.get(1).copied().unwrap_or("");
-			let val = numeric_cols.first().copied().unwrap_or("");
-			let prepared = stacked_bar::prepare_stacked_bar_data(df, cat, group, val);
+		ResolvedKernelFields::StackedBar {
+			category,
+			group,
+			value,
+		} => {
+			let prepared = stacked_bar::prepare_stacked_bar_data(
+				df,
+				category,
+				group.as_deref().unwrap_or(""),
+				value,
+			);
 			Arc::new(StackedBarPlotKernel {
 				prepared_data: Arc::new(prepared),
-				orientation: Orientation::Vertical,
+				orientation: if plot_type == PlotType::HorizontalStackedBar {
+					Orientation::Horizontal
+				} else {
+					Orientation::Vertical
+				},
 			})
 		}
-		PlotType::HorizontalStackedBar => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let group = string_cols.get(1).copied().unwrap_or("");
-			let val = numeric_cols.first().copied().unwrap_or("");
-			let prepared = stacked_bar::prepare_stacked_bar_data(df, cat, group, val);
-			Arc::new(StackedBarPlotKernel {
-				prepared_data: Arc::new(prepared),
-				orientation: Orientation::Horizontal,
-			})
-		}
-		PlotType::Pie => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let val = numeric_cols.first().copied().unwrap_or("");
-			let prepared = pie::prepare_pie_data(df, cat, val);
+		ResolvedKernelFields::Pie { category, value } => {
+			let prepared = pie::prepare_pie_data(df, category.as_deref().unwrap_or(""), value);
 			Arc::new(PiePlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::BoxPlot => {
-			let cat = string_cols.first().copied().unwrap_or("");
-			let val = numeric_cols.first().copied().unwrap_or("");
-			let prepared = boxplot::prepare_box_plot_data(df, cat, val);
+		ResolvedKernelFields::BoxPlot { category, value } => {
+			let prepared =
+				boxplot::prepare_box_plot_data(df, category.as_deref().unwrap_or(""), value);
 			Arc::new(BoxPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Histogram => {
-			let val = numeric_cols.first().copied().unwrap_or("");
-			let prepared = histogram::prepare_histogram_data(df, val, 16);
+		ResolvedKernelFields::Histogram { value } => {
+			let prepared = histogram::prepare_histogram_data(df, value, 16);
 			Arc::new(HistogramPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Bubble => {
-			let x = numeric_cols.first().copied().unwrap_or("");
-			let y = numeric_cols.get(1).copied().unwrap_or(x);
-			let size = numeric_cols.get(2).copied().unwrap_or(y);
-			let color = numeric_cols.get(3).copied().unwrap_or(size);
-			let label = string_cols.first().copied();
-			let prepared = bubble::prepare_bubble_data(df, x, y, size, color, label);
+		ResolvedKernelFields::Bubble {
+			x,
+			y,
+			size,
+			color,
+			label,
+		} => {
+			let prepared = bubble::prepare_bubble_data(df, x, y, size, color, label.as_deref());
 			Arc::new(BubblePlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Heatmap => {
-			let x = string_cols.first().copied().unwrap_or("");
-			let y = string_cols.get(1).copied().unwrap_or("");
-			let z = numeric_cols.first().copied().unwrap_or("");
-			let prepared = heatmap::prepare_heatmap_data(df, x, y, z);
+		ResolvedKernelFields::Heatmap { x, y, value } => {
+			let prepared = heatmap::prepare_heatmap_data(df, x, y, value);
 			Arc::new(HeatmapPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Parallel => {
-			let dims: Vec<String> = numeric_cols.iter().map(|col| (*col).to_string()).collect();
-			let prepared = parallel::prepare_parallel_data(
-				df,
-				&dims,
-				string_cols.first().copied().unwrap_or(""),
-			);
+		ResolvedKernelFields::Parallel {
+			dimensions,
+			category,
+		} => {
+			let prepared =
+				parallel::prepare_parallel_data(df, dimensions, category.as_deref().unwrap_or(""));
 			Arc::new(ParallelPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Radar => {
-			let dims: Vec<String> = numeric_cols.iter().map(|col| (*col).to_string()).collect();
+		ResolvedKernelFields::Radar {
+			dimensions,
+			category,
+		} => {
 			let prepared =
-				radar::prepare_radar_data(df, &dims, string_cols.first().copied().unwrap_or(""));
+				radar::prepare_radar_data(df, dimensions, category.as_deref().unwrap_or(""));
 			Arc::new(RadarPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::RadialDial => {
-			let label = string_cols.first().copied().unwrap_or("");
-			let value = numeric_cols.first().copied().unwrap_or("");
-			let max_value = numeric_cols.get(1).copied().unwrap_or(value);
-			let prepared = radial_dial::prepare_radial_dial_data(df, label, value, max_value);
+		ResolvedKernelFields::RadialDial {
+			label,
+			value,
+			maximum,
+		} => {
+			let prepared = radial_dial::prepare_radial_dial_data(
+				df,
+				label.as_deref().unwrap_or(""),
+				value,
+				maximum,
+			);
 			Arc::new(RadialDialPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Candlestick => {
-			let x = string_cols.first().copied().unwrap_or("");
-			let open = numeric_cols.first().copied().unwrap_or("");
-			let high = numeric_cols.get(1).copied().unwrap_or(open);
-			let low = numeric_cols.get(2).copied().unwrap_or(high);
-			let close = numeric_cols.get(3).copied().unwrap_or(low);
+		ResolvedKernelFields::Candlestick {
+			x,
+			open,
+			high,
+			low,
+			close,
+		} => {
 			let prepared = candlestick::prepare_candlestick_data(df, x, open, high, low, close);
 			Arc::new(CandlestickPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::Funnel => {
-			let stage = string_cols.first().copied().unwrap_or("");
-			let value = numeric_cols.first().copied().unwrap_or("");
-			let prepared = funnel::prepare_funnel_data(df, stage, value);
+		ResolvedKernelFields::Funnel { stage, value } => {
+			let prepared = funnel::prepare_funnel_data(df, stage.as_deref().unwrap_or(""), value);
 			Arc::new(FunnelPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::StackedArea => {
-			let x = string_cols.first().copied().unwrap_or("");
-			let group = string_cols.get(1).copied().unwrap_or("");
-			let y = numeric_cols.first().copied().unwrap_or("");
-			let prepared = stacked_area::prepare_stacked_area_data(df, x, group, y);
+		ResolvedKernelFields::StackedArea { series, x, y } => {
+			let prepared =
+				stacked_area::prepare_stacked_area_data(df, series.as_deref().unwrap_or(""), x, y);
 			Arc::new(StackedAreaPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
-		PlotType::FillBetween => {
-			let x = numeric_cols.first().copied().unwrap_or("");
-			let y_mid = numeric_cols.get(1).copied().unwrap_or(x);
-			let y_lower = numeric_cols.get(2).copied().unwrap_or(y_mid);
-			let y_upper = numeric_cols.get(3).copied().unwrap_or(y_lower);
-			let prepared = fill_between::prepare_fill_between_data(df, x, y_mid, y_lower, y_upper);
-			Arc::new(FillBetweenPlotKernel {
-				prepared_data: Arc::new(prepared),
-			})
+		ResolvedKernelFields::FillBetween {
+			x,
+			middle,
+			lower,
+			upper,
+		} => {
+			let fill_between_data = Arc::new(fill_between::prepare_fill_between_data(
+				df, x, middle, lower, upper,
+			));
+			if spec.composition.is_fill_between_with_line_overlay() {
+				let line_data = Arc::new(line::prepare_line_data(df, "", x, middle));
+				Arc::new(FillBetweenLinePlotKernel::new(fill_between_data, line_data))
+			} else {
+				Arc::new(FillBetweenPlotKernel {
+					prepared_data: fill_between_data,
+				})
+			}
 		}
 	}
 }
 
-fn create_scatter_line_plot(df: &DataFrame) -> Arc<dyn PlotKernel + Send + Sync> {
-	let string_cols: Vec<&str> = df
-		.columns()
-		.iter()
-		.filter(|c: &&Column| matches!(c.dtype(), DataType::String | DataType::Categorical(_, _)))
-		.map(|c: &Column| c.name().as_str())
-		.collect();
-	let numeric_cols: Vec<&str> = df
-		.columns()
-		.iter()
-		.filter(|c: &&Column| c.dtype().is_numeric())
-		.map(|c: &Column| c.name().as_str())
-		.collect();
-	let cat = string_cols.first().copied().unwrap_or("");
-	let x = numeric_cols.first().copied().unwrap_or("");
-	let y = numeric_cols.get(1).copied().unwrap_or(x);
-	let scatter_data = Arc::new(scatter::prepare_scatter_data(df, cat, x, y, 3.0));
-	let line_data = Arc::new(line::prepare_line_data(df, cat, x, y));
-	Arc::new(ScatterLinePlotKernel::new(scatter_data, line_data))
+#[cfg(test)]
+pub fn create_automatic_plot(
+	composition: crate::plot::composition::PlotComposition,
+	df: &DataFrame,
+	width: u32,
+	height: u32,
+) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
+	use crate::plot::spec::AuthoredPlotSpec;
+	create_authored_plot(AuthoredPlotSpec::automatic(composition), df, width, height)
 }
 
-fn create_fill_between_line_plot(df: &DataFrame) -> Arc<dyn PlotKernel + Send + Sync> {
-	let numeric_cols: Vec<&str> = df
-		.columns()
-		.iter()
-		.filter(|c: &&Column| c.dtype().is_numeric())
-		.map(|c: &Column| c.name().as_str())
-		.collect();
-	let x = numeric_cols.first().copied().unwrap_or("");
-	let y_mid = numeric_cols.get(1).copied().unwrap_or(x);
-	let y_lower = numeric_cols.get(2).copied().unwrap_or(y_mid);
-	let y_upper = numeric_cols.get(3).copied().unwrap_or(y_lower);
-	let fill_between_data = Arc::new(fill_between::prepare_fill_between_data(
-		df, x, y_mid, y_lower, y_upper,
-	));
-	let line_data = Arc::new(line::prepare_line_data(df, "", x, y_mid));
-	Arc::new(FillBetweenLinePlotKernel::new(fill_between_data, line_data))
+#[cfg(test)]
+pub fn create_authored_plot(
+	authored_spec: crate::plot::spec::AuthoredPlotSpec,
+	df: &DataFrame,
+	width: u32,
+	height: u32,
+) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
+	use crate::plot::request::{PlotRequest, PlotSource, plan};
+	let resolved = plan(PlotRequest {
+		source: PlotSource::Materialized {
+			name: "factory test".to_owned(),
+			data: Arc::new(df.clone()),
+		},
+		authored_spec,
+	})?;
+	Ok(create_plot(
+		&resolved.resolved_spec,
+		&resolved.data,
+		width,
+		height,
+	))
 }

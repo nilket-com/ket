@@ -255,6 +255,25 @@ fn product_0007_local_transform_leaks(source: &str) -> Vec<&'static str> {
 	findings
 }
 
+fn product_0007_render_inference_leaks(source: &str) -> Vec<&'static str> {
+	let mut findings = Vec::new();
+	for (needle, label) in [
+		("numeric_cols", "numeric dtype partition"),
+		("string_cols", "string dtype partition"),
+		("df.columns()", "positional frame-column scan"),
+		("unwrap_or(x)", "x substituted for another channel"),
+		("unwrap_or(y)", "y substituted for another channel"),
+		("unwrap_or(open)", "open substituted for another channel"),
+		("unwrap_or(high)", "high substituted for another channel"),
+		("unwrap_or(low)", "low substituted for another channel"),
+	] {
+		if source.contains(needle) {
+			findings.push(label);
+		}
+	}
+	findings
+}
+
 #[test]
 fn product_0007_plot_spec_stays_product_side_and_cannot_execute_relations() {
 	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -307,5 +326,40 @@ fn product_0007_plot_spec_stays_product_side_and_cannot_execute_relations() {
 		product_0007_spec_leaks("fn render(_: ChannelBinding) {}", false),
 		vec!["intermediate channel binding escaped the specification module"],
 		"positive control: PRODUCT-0007 intermediate-type guard must fire"
+	);
+}
+
+#[test]
+fn product_0007_rendering_consumes_resolved_fields_without_inference() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plot");
+	let mut sources = vec![src.join("factory.rs")];
+	for entry in std::fs::read_dir(src.join("kernels")).expect("read plot kernels") {
+		let path = entry.expect("kernel entry").path();
+		if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+			sources.push(path);
+		}
+	}
+	let mut leaks = Vec::new();
+	for path in sources {
+		let source = std::fs::read_to_string(&path).expect("read rendering source");
+		for finding in product_0007_render_inference_leaks(&source) {
+			leaks.push(format!("{}: {finding}", path.display()));
+		}
+	}
+	assert!(
+		leaks.is_empty(),
+		"PRODUCT-0007 rendering inferred or substituted a channel:\n{}",
+		leaks.join("\n")
+	);
+	assert_eq!(
+		product_0007_render_inference_leaks(
+			"let numeric_cols = df.columns(); let y = values.get(1).unwrap_or(x);"
+		),
+		vec![
+			"numeric dtype partition",
+			"positional frame-column scan",
+			"x substituted for another channel"
+		],
+		"positive control: PRODUCT-0007 rendering guard must fire"
 	);
 }

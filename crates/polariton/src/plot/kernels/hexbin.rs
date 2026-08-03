@@ -202,12 +202,17 @@ pub struct HexbinPreparedData {
 	pub y_label: String,
 }
 
-fn bin_data_to_hex(df: DataFrame, radius: f32) -> PolarsResult<DataFrame> {
+fn bin_data_to_hex(
+	df: DataFrame,
+	x_col: &str,
+	y_col: &str,
+	radius: f32,
+) -> PolarsResult<DataFrame> {
 	let sqrt_3 = 3.0f32.sqrt();
 	let with_frac = df.lazy().with_columns([
-		((lit(sqrt_3 / 3.0) * col("x") - lit(1.0f32 / 3.0) * col("y")) / lit(radius))
+		((lit(sqrt_3 / 3.0) * col(x_col) - lit(1.0f32 / 3.0) * col(y_col)) / lit(radius))
 			.alias("q_frac"),
-		((lit(2.0f32 / 3.0) * col("y")) / lit(radius)).alias("r_frac"),
+		((lit(2.0f32 / 3.0) * col(y_col)) / lit(radius)).alias("r_frac"),
 	]);
 	let with_rounded = with_frac.with_columns([
 		col("q_frac").round(0, RoundMode::HalfToEven).alias("q"),
@@ -251,35 +256,40 @@ fn bin_data_to_hex(df: DataFrame, radius: f32) -> PolarsResult<DataFrame> {
 		.collect()
 }
 
-pub fn prepare_hexbin_data(df: &DataFrame, radius: f32) -> HexbinPreparedData {
-	if df.height() == 0 || df.column("x").is_err() || df.column("y").is_err() {
+pub fn prepare_hexbin_data(
+	df: &DataFrame,
+	x_col: &str,
+	y_col: &str,
+	radius: f32,
+) -> HexbinPreparedData {
+	if df.height() == 0 || df.column(x_col).is_err() || df.column(y_col).is_err() {
 		return HexbinPreparedData {
 			bins: std::collections::HashMap::new(),
 			max_count: 1,
 			radius,
 			x_range: (0.0, 1.0),
 			y_range: (0.0, 1.0),
-			x_label: "x".to_string(),
-			y_label: "y".to_string(),
+			x_label: x_col.to_string(),
+			y_label: y_col.to_string(),
 		};
 	}
-	let x_col_series = match df.column("x") {
+	let x_col_series = match df.column(x_col) {
 		Ok(c) => c
 			.cast(&DataType::Float64)
-			.unwrap_or_else(|_| Column::from(Series::new_empty("x".into(), &DataType::Float64))),
-		Err(_) => Column::from(Series::new_empty("x".into(), &DataType::Float64)),
+			.unwrap_or_else(|_| Column::from(Series::new_empty(x_col.into(), &DataType::Float64))),
+		Err(_) => Column::from(Series::new_empty(x_col.into(), &DataType::Float64)),
 	};
-	let y_col_series = match df.column("y") {
+	let y_col_series = match df.column(y_col) {
 		Ok(c) => c
 			.cast(&DataType::Float64)
-			.unwrap_or_else(|_| Column::from(Series::new_empty("y".into(), &DataType::Float64))),
-		Err(_) => Column::from(Series::new_empty("y".into(), &DataType::Float64)),
+			.unwrap_or_else(|_| Column::from(Series::new_empty(y_col.into(), &DataType::Float64))),
+		Err(_) => Column::from(Series::new_empty(y_col.into(), &DataType::Float64)),
 	};
-	let x_col = x_col_series.f64().unwrap();
-	let y_col = y_col_series.f64().unwrap();
-	let x_range = (x_col.min().unwrap_or(0.0), x_col.max().unwrap_or(1.0));
-	let y_range = (y_col.min().unwrap_or(0.0), y_col.max().unwrap_or(1.0));
-	let binned = match bin_data_to_hex(df.clone(), radius) {
+	let x_values = x_col_series.f64().unwrap();
+	let y_values = y_col_series.f64().unwrap();
+	let x_range = (x_values.min().unwrap_or(0.0), x_values.max().unwrap_or(1.0));
+	let y_range = (y_values.min().unwrap_or(0.0), y_values.max().unwrap_or(1.0));
+	let binned = match bin_data_to_hex(df.clone(), x_col, y_col, radius) {
 		Ok(df) => df,
 		Err(_) => {
 			return HexbinPreparedData {
@@ -288,8 +298,8 @@ pub fn prepare_hexbin_data(df: &DataFrame, radius: f32) -> HexbinPreparedData {
 				radius,
 				x_range,
 				y_range,
-				x_label: "x".to_string(),
-				y_label: "y".to_string(),
+				x_label: x_col.to_string(),
+				y_label: y_col.to_string(),
 			};
 		}
 	};
@@ -322,7 +332,7 @@ pub fn prepare_hexbin_data(df: &DataFrame, radius: f32) -> HexbinPreparedData {
 		radius,
 		x_range,
 		y_range,
-		x_label: "x".to_string(),
-		y_label: "y".to_string(),
+		x_label: x_col.to_string(),
+		y_label: y_col.to_string(),
 	}
 }

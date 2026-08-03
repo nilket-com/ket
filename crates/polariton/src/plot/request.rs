@@ -6,7 +6,6 @@
 //! source like an in-memory frame once deferred database relations arrive
 //! (`plans/wip/rune-data-products.md`).
 
-use crate::plot::composition::PlotComposition;
 use crate::plot::spec::{
 	AuthoredChannel, AuthoredPlotSpec, ColorIdentity, OptionalAuthoredChannel, PlotProvenance,
 	ResolvedPlotSpec, StampedResult, resolve_channels, resolve_domains,
@@ -35,11 +34,7 @@ pub struct PlotRequest {
 #[derive(Clone, Debug)]
 pub struct ResolvedPlot {
 	pub source_name: String,
-	/// Compatibility field consumed by the Stage-2 kernel migration. Its value
-	/// is identical to `resolved_spec.composition`.
-	pub composition: PlotComposition,
 	pub data: Arc<DataFrame>,
-	#[allow(dead_code)] // Stage 1 carries it; Stage 2 makes kernels consume it.
 	pub resolved_spec: ResolvedPlotSpec,
 }
 
@@ -66,7 +61,6 @@ pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 			let data = project_named_channels(&request.authored_spec, data, &name)?;
 			Ok(ResolvedPlot {
 				source_name: name,
-				composition: resolved_spec.composition.clone(),
 				data,
 				resolved_spec,
 			})
@@ -102,6 +96,7 @@ fn project_named_channels(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use polars::df;
 

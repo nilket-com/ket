@@ -2,6 +2,9 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
 	ScatterRenderMode, format_label, polars_type_to_axis_type,
 };
+use crate::plot::spec::{
+	Channel, ResolvedColor, ResolvedLayout, ResolvedPlotSpec, ScaleDomain, ScaleFamily,
+};
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
 use iced::{Color, Point, Rectangle};
@@ -41,6 +44,15 @@ struct ScatterRasterKey {
 
 impl PlotKernel for ScatterPlotKernel {
 	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+		if let Some(categories) = &self.prepared_data.x_categories {
+			return PlotLayout::CategoricalX {
+				categories: categories.clone(),
+				y_range: (
+					settings.y_min.unwrap_or(self.prepared_data.y_range.0),
+					settings.y_max.unwrap_or(self.prepared_data.y_range.1),
+				),
+			};
+		}
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
@@ -110,7 +122,7 @@ impl PlotKernel for ScatterPlotKernel {
 			},
 		);
 		for (i, series) in self.prepared_data.series.iter().enumerate() {
-			let color = settings.color_theme.get_color(series.color_t);
+			let color = series_color(series, &settings);
 			let col = i / max_rows;
 			let row = i % max_rows;
 			let item_x = x + legend_padding + col as f32 * col_width;
@@ -173,11 +185,13 @@ impl ScatterPlotKernel {
 		settings: &PlotSettings,
 	) {
 		for series in &self.prepared_data.series {
-			let color = settings.color_theme.get_color(series.color_t);
+			let color = series
+				.resolved_color
+				.unwrap_or_else(|| settings.color_theme.get_color(series.color_t));
 			backend.fill_path(
 				&|builder| {
 					series.for_each_point(|x, y| {
-						let pixel_p = transform.cartesian(x, y);
+						let pixel_p = scatter_point(transform, x, y);
 						builder.circle(pixel_p, self.prepared_data.point_size_px);
 					});
 				},
@@ -200,7 +214,7 @@ impl ScatterPlotKernel {
 
 		for series in &self.prepared_data.series {
 			let sampled = downsample_series(series, bounds, transform, per_series_target);
-			let color = settings.color_theme.get_color(series.color_t);
+			let color = series_color(series, settings);
 			backend.fill_path(
 				&|builder| {
 					for point in &sampled {
@@ -252,7 +266,7 @@ impl ScatterPlotKernel {
 				.prepared_data
 				.series
 				.iter()
-				.map(|series| color_to_rgba8(settings.color_theme.get_color(series.color_t)))
+				.map(|series| color_to_rgba8(series_color(series, settings)))
 				.collect(),
 		};
 
@@ -291,6 +305,7 @@ pub struct ScatterSeries {
 	pub x_values: Float64Chunked,
 	pub y_values: Float64Chunked,
 	pub color_t: f32,
+	pub resolved_color: Option<Color>,
 }
 
 impl ScatterSeries {
@@ -315,6 +330,7 @@ impl ScatterSeries {
 
 pub struct ScatterPreparedData {
 	pub series: Vec<ScatterSeries>,
+	pub x_categories: Option<Vec<String>>,
 	pub x_range: (f64, f64),
 	pub y_range: (f64, f64),
 	pub x_axis_type: AxisType,
@@ -334,8 +350,17 @@ fn current_x_range_bits(transform: &CoordinateTransformer) -> (u64, u64) {
 
 fn current_y_range_bits(transform: &CoordinateTransformer) -> (u64, u64) {
 	match transform.layout {
-		PlotLayout::Cartesian { y_range, .. } => (y_range.0.to_bits(), y_range.1.to_bits()),
+		PlotLayout::Cartesian { y_range, .. } | PlotLayout::CategoricalX { y_range, .. } => {
+			(y_range.0.to_bits(), y_range.1.to_bits())
+		}
 		_ => (0, 0),
+	}
+}
+
+fn scatter_point(transform: &CoordinateTransformer<'_>, x: f64, y: f64) -> Point {
+	match transform.layout {
+		PlotLayout::CategoricalX { .. } => transform.categorical(x.max(0.0) as usize, y).0,
+		_ => transform.cartesian(x, y),
 	}
 }
 
@@ -346,6 +371,12 @@ fn color_to_rgba8(color: Color) -> [u8; 4] {
 		(color.b * 255.0).round() as u8,
 		(color.a * 255.0).round() as u8,
 	]
+}
+
+fn series_color(series: &ScatterSeries, settings: &PlotSettings) -> Color {
+	series
+		.resolved_color
+		.unwrap_or_else(|| settings.color_theme.get_color(series.color_t))
 }
 
 fn build_raster_rgba(
@@ -359,9 +390,9 @@ fn build_raster_rgba(
 	let mut accum = vec![[0.0_f32; 4]; width * height];
 
 	for series in &prepared_data.series {
-		let color = settings.color_theme.get_color(series.color_t);
+		let color = series_color(series, settings);
 		series.for_each_point(|x, y| {
-			let point = transform.cartesian(x, y);
+			let point = scatter_point(transform, x, y);
 			let xi = point.x.floor() as isize;
 			let yi = point.y.floor() as isize;
 			if xi < 0 || yi < 0 || xi >= width as isize || yi >= height as isize {
@@ -451,7 +482,7 @@ fn downsample_series(
 	let mut cells = vec![None; grid_w * grid_h];
 
 	series.for_each_point(|x, y| {
-		let point = transform.cartesian(x, y);
+		let point = scatter_point(transform, x, y);
 		if point.x < 0.0 || point.y < 0.0 || point.x > bounds.width || point.y > bounds.height {
 			return;
 		}
@@ -468,6 +499,153 @@ fn downsample_series(
 	});
 
 	cells.into_iter().flatten().collect()
+}
+
+pub fn prepare_scatter_data_resolved(
+	df: &DataFrame,
+	spec: &ResolvedPlotSpec,
+	viewport_width: u32,
+	viewport_height: u32,
+	point_size_px: f32,
+) -> ScatterPreparedData {
+	let x = spec
+		.channel(Channel::X)
+		.expect("resolved scatter x channel");
+	let y = spec
+		.channel(Channel::Y)
+		.expect("resolved scatter y channel");
+	let color = spec.channel(Channel::Color);
+	let color_field = color
+		.map(|channel| channel.binding.field.as_str())
+		.unwrap_or("");
+	let x_field = x.binding.field.as_str();
+	let y_field = y.binding.field.as_str();
+	let layout = ResolvedLayout::from_spec(spec, viewport_width, viewport_height);
+
+	if !matches!(x.binding.scale, ScaleFamily::Point | ScaleFamily::Band) {
+		let mut prepared = prepare_scatter_data(df, color_field, x_field, y_field, point_size_px);
+		prepared.x_axis_type = axis_type_from_scale(x.binding.scale);
+		prepared.y_axis_type = axis_type_from_scale(y.binding.scale);
+		prepared.x_range = layout.x_range;
+		prepared.y_range = layout.y_range;
+		apply_resolved_series_colors(&mut prepared.series, color);
+		return prepared;
+	}
+
+	let categories = match &x.domain {
+		ScaleDomain::Categorical(categories) => categories.clone(),
+		_ => Vec::new(),
+	};
+	let y_range = layout.y_range;
+	let partitions = if color_field.is_empty() {
+		vec![df.clone()]
+	} else {
+		df.partition_by([color_field], true)
+			.unwrap_or_else(|_| vec![df.clone()])
+	};
+	let num_partitions = partitions.len();
+	let mut series = Vec::with_capacity(num_partitions);
+	let mut total_points = 0;
+	for (index, group) in partitions.into_iter().enumerate() {
+		let name = if color_field.is_empty() {
+			"All Data".to_owned()
+		} else {
+			group
+				.column(color_field)
+				.and_then(|column| column.get(0))
+				.map(category_label)
+				.unwrap_or_else(|_| "Null".to_owned())
+		};
+		let xs = group
+			.column(x_field)
+			.map(|column| {
+				column
+					.as_materialized_series()
+					.iter()
+					.map(|value| {
+						let value = category_label(value);
+						categories
+							.iter()
+							.position(|category| category == &value)
+							.map(|i| i as f64)
+					})
+					.collect::<Vec<_>>()
+			})
+			.unwrap_or_default();
+		let ys = group
+			.column(y_field)
+			.and_then(|column| column.cast(&DataType::Float64))
+			.ok()
+			.and_then(|column| column.f64().ok().cloned())
+			.unwrap_or_else(|| Float64Chunked::full_null(y_field.into(), xs.len()));
+		let xs = Series::new(x_field.into(), xs).f64().unwrap().clone();
+		total_points += xs.len().min(ys.len());
+		let color_t = if num_partitions > 1 {
+			index as f32 / (num_partitions - 1) as f32
+		} else {
+			0.5
+		};
+		let resolved_color = color
+			.and_then(|channel| channel.colors.iter().find(|entry| entry.category == name))
+			.map(|entry| iced_color(entry.color));
+		series.push(ScatterSeries {
+			name,
+			x_values: xs,
+			y_values: ys,
+			color_t,
+			resolved_color,
+		});
+	}
+	ScatterPreparedData {
+		series,
+		x_categories: Some(categories.clone()),
+		x_range: layout.x_range,
+		y_range,
+		x_axis_type: axis_type_from_scale(x.binding.scale),
+		y_axis_type: axis_type_from_scale(y.binding.scale),
+		point_size_px,
+		x_label: x_field.to_owned(),
+		y_label: y_field.to_owned(),
+		total_points,
+	}
+}
+
+fn apply_resolved_series_colors(
+	series: &mut [ScatterSeries],
+	channel: Option<&crate::plot::spec::ResolvedChannel>,
+) {
+	let Some(channel) = channel else { return };
+	for series in series {
+		series.resolved_color = channel
+			.colors
+			.iter()
+			.find(|entry| entry.category == series.name)
+			.map(|entry| iced_color(entry.color));
+	}
+}
+
+fn iced_color(color: ResolvedColor) -> Color {
+	Color::from_rgba8(
+		color.red,
+		color.green,
+		color.blue,
+		color.alpha as f32 / 255.0,
+	)
+}
+
+fn category_label(value: AnyValue<'_>) -> String {
+	match value {
+		AnyValue::String(value) => value.to_owned(),
+		AnyValue::Null => "Null".to_owned(),
+		value => value.to_string().replace('"', ""),
+	}
+}
+
+fn axis_type_from_scale(scale: ScaleFamily) -> AxisType {
+	match scale {
+		ScaleFamily::Time => AxisType::Datetime(crate::plot::common::TimeUnit::Milliseconds),
+		_ => AxisType::Linear,
+	}
 }
 
 pub fn prepare_scatter_data(
@@ -510,6 +688,7 @@ pub fn prepare_scatter_data(
 	if df.height() == 0 || x_col.is_empty() || y_col.is_empty() {
 		return ScatterPreparedData {
 			series: vec![],
+			x_categories: None,
 			x_range,
 			y_range,
 			x_axis_type,
@@ -570,10 +749,12 @@ pub fn prepare_scatter_data(
 			x_values: xs,
 			y_values: ys,
 			color_t: t,
+			resolved_color: None,
 		});
 	}
 	ScatterPreparedData {
 		series: series_list,
+		x_categories: None,
 		x_range,
 		y_range,
 		x_axis_type,
@@ -588,10 +769,98 @@ pub fn prepare_scatter_data(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::composition::PlotComposition;
+	use crate::plot::core::PlotType;
+	use crate::plot::spec::{
+		AuthoredPlotSpec, ColorIdentity, PlotProvenance, StampedResult, resolve_channels,
+		resolve_domains,
+	};
 	use iced::Size;
 
 	fn bounds(width: f32, height: f32) -> Rectangle {
 		Rectangle::new(Point::ORIGIN, Size::new(width, height))
+	}
+
+	fn resolved_scatter(
+		frame: DataFrame,
+		spec: AuthoredPlotSpec,
+		identity: &ColorIdentity,
+	) -> (ResolvedPlotSpec, ColorIdentity) {
+		let frame = Arc::new(frame);
+		let binding = resolve_channels(&spec, frame.schema().as_ref()).expect("channel binding");
+		resolve_domains(
+			binding,
+			&StampedResult {
+				data: frame,
+				provenance: PlotProvenance {
+					source_name: "scatter fixture".to_owned(),
+					revision: None,
+				},
+			},
+			identity,
+		)
+		.expect("domain resolution")
+	}
+
+	#[test]
+	fn categorical_x_uses_the_requested_field_and_point_scale() {
+		let frame = df!("cat" => ["a", "b", "c"], "val" => [2_i64, 5, 3]).expect("frame");
+		let (spec, _) = resolved_scatter(
+			frame.clone(),
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "cat", "val"),
+			&ColorIdentity::default(),
+		);
+		let prepared = prepare_scatter_data_resolved(&frame, &spec, 800, 480, 3.0);
+		assert_eq!(prepared.x_label, "cat");
+		assert_eq!(prepared.y_label, "val");
+		assert_eq!(
+			prepared.x_categories.as_deref(),
+			Some(&["a".to_owned(), "b".to_owned(), "c".to_owned()][..])
+		);
+		assert_eq!(
+			prepared.series[0]
+				.x_values
+				.into_no_null_iter()
+				.collect::<Vec<_>>(),
+			vec![0.0, 1.0, 2.0]
+		);
+		let kernel = ScatterPlotKernel::new(Arc::new(prepared));
+		assert!(matches!(
+			kernel.layout(PlotSettings::default()),
+			PlotLayout::CategoricalX { categories, .. } if categories == ["a", "b", "c"]
+		));
+	}
+
+	#[test]
+	fn resolved_category_colors_survive_filtering_and_reach_the_kernel() {
+		let composition = PlotComposition::single(PlotType::Scatter);
+		let authored = AuthoredPlotSpec::xy_color(composition, "x", "y", Some("series".to_owned()));
+		let full = df!(
+			"x" => [1_i64, 2, 3],
+			"y" => [2_i64, 4, 6],
+			"series" => ["a", "b", "c"]
+		)
+		.expect("full frame");
+		let (full_spec, identity) =
+			resolved_scatter(full.clone(), authored.clone(), &ColorIdentity::default());
+		let filtered =
+			df!("x" => [2_i64], "y" => [4_i64], "series" => ["b"]).expect("filtered frame");
+		let (filtered_spec, _) = resolved_scatter(filtered.clone(), authored, &identity);
+		let expected = full_spec
+			.channel(Channel::Color)
+			.unwrap()
+			.colors
+			.iter()
+			.find(|entry| entry.category == "b")
+			.unwrap()
+			.color;
+		let prepared = prepare_scatter_data_resolved(&filtered, &filtered_spec, 800, 480, 3.0);
+		assert_eq!(prepared.series.len(), 1);
+		assert_eq!(prepared.series[0].name, "b");
+		assert_eq!(
+			prepared.series[0].resolved_color,
+			Some(iced_color(expected))
+		);
 	}
 
 	#[test]
@@ -692,6 +961,7 @@ mod tests {
 			x_values: Series::new("x".into(), xs).f64().unwrap().clone(),
 			y_values: Series::new("y".into(), ys).f64().unwrap().clone(),
 			color_t: 0.5,
+			resolved_color: None,
 		};
 
 		let sampled = downsample_series(&series, viewport, &transform, 11);

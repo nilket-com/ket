@@ -15,10 +15,8 @@ use crate::gui::{
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
-#[cfg(feature = "toron")]
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
-#[cfg(feature = "toron")]
 use crate::plot::spec::AuthoredPlotSpec;
 use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
@@ -115,15 +113,34 @@ pub type Result = iced::Result;
 fn build_plot_task(
 	df: DataFrame,
 	composition: PlotComposition,
-	on_ready: impl FnOnce(std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>) -> Message
+	on_ready: impl FnOnce(
+		std::result::Result<
+			std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
+			String,
+		>,
+	) -> Message
 	+ Send
 	+ 'static,
 ) -> Task<Message> {
 	Task::perform(
 		async move {
-			tokio::task::spawn_blocking(move || create_plot(&composition, &df, 1200, 1200))
-				.await
-				.expect("plot build task panicked")
+			tokio::task::spawn_blocking(move || {
+				let resolved = plan(PlotRequest {
+					source: PlotSource::Materialized {
+						name: "current result".to_owned(),
+						data: std::sync::Arc::new(df),
+					},
+					authored_spec: AuthoredPlotSpec::automatic(composition),
+				})?;
+				Ok(create_plot(
+					&resolved.resolved_spec,
+					&resolved.data,
+					1200,
+					1200,
+				))
+			})
+			.await
+			.map_err(|error| format!("plot build task panicked: {error}"))?
 		},
 		on_ready,
 	)
@@ -144,10 +161,10 @@ fn build_resolved_plot_task(
 ) -> Task<Message> {
 	Task::perform(
 		async move {
-			let composition = resolved.composition.clone();
+			let spec = resolved.resolved_spec.clone();
 			let data = resolved.data.as_ref().clone();
 			let kernel =
-				tokio::task::spawn_blocking(move || create_plot(&composition, &data, 1200, height))
+				tokio::task::spawn_blocking(move || create_plot(&spec, &data, 1200, height))
 					.await
 					.expect("Rune plot build task panicked");
 			(resolved, kernel)
@@ -199,12 +216,10 @@ fn run_dashboard_message(app_state: &mut AppState, message: DashboardMsg) -> Tas
 			build_plot_task(
 				app_state.data_frame.clone(),
 				composition.clone(),
-				move |kernel| {
-					Message::Dashboard(DashboardMsg::PlotKernelReady {
-						pane: None,
-						composition,
-						kernel,
-					})
+				move |result| Message::DashboardPlotBuilt {
+					pane: None,
+					composition,
+					result,
 				},
 			)
 		}
@@ -214,12 +229,10 @@ fn run_dashboard_message(app_state: &mut AppState, message: DashboardMsg) -> Tas
 			build_plot_task(
 				app_state.data_frame.clone(),
 				composition.clone(),
-				move |kernel| {
-					Message::Dashboard(DashboardMsg::PlotKernelReady {
-						pane: Some(pane),
-						composition,
-						kernel,
-					})
+				move |result| Message::DashboardPlotBuilt {
+					pane: Some(pane),
+					composition,
+					result,
 				},
 			)
 		}
@@ -842,6 +855,25 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::Dashboard(message) => {
 			return run_dashboard_message(app_state, message);
 		}
+		Message::DashboardPlotBuilt {
+			pane,
+			composition,
+			result,
+		} => match result {
+			Ok(kernel) => {
+				app_state.status_error.clear();
+				app_state.status_msg = format!("{} plot ready", composition.title());
+				let _ = app_state.dashboard.update(DashboardMsg::PlotKernelReady {
+					pane,
+					composition,
+					kernel,
+				});
+			}
+			Err(error) => {
+				app_state.status_msg.clear();
+				app_state.status_error = format!("Plot specification failed: {error}");
+			}
+		},
 		Message::ToggleStatusDetail => {
 			if app_state.status_detail.is_some() {
 				app_state.status_detail_open = !app_state.status_detail_open;
@@ -1365,10 +1397,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 			app_state.code_editor.open_dashboard();
 			let previous = app_state.rune_plot_panes.get(&source_buffer).copied();
-			let pane =
-				app_state
-					.dashboard
-					.apply_plot_replacing(previous, resolved.composition, kernel);
+			let composition = resolved.resolved_spec.composition.clone();
+			let pane = app_state
+				.dashboard
+				.apply_plot_replacing(previous, composition, kernel);
 			app_state.rune_plot_panes.insert(source_buffer, pane);
 			app_state.status_error.clear();
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
@@ -1387,10 +1419,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.code_editor.open_dashboard();
 			let key = (source_buffer, form);
 			let previous = app_state.rune_relation_plot_panes.get(&key).copied();
-			let pane =
-				app_state
-					.dashboard
-					.apply_plot_replacing(previous, resolved.composition, kernel);
+			let composition = resolved.resolved_spec.composition.clone();
+			let pane = app_state
+				.dashboard
+				.apply_plot_replacing(previous, composition, kernel);
 			app_state.rune_relation_plot_panes.insert(key, pane);
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
 		}
@@ -1501,17 +1533,18 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			resolved,
 			kernel,
 		} => {
+			let composition = resolved.resolved_spec.composition.clone();
 			match presentation.output {
-				MarkdownCellOutputTarget::Inline => app_state.code_editor.set_markdown_cell_plot(
-					identity,
-					resolved.composition,
-					kernel,
-				),
+				MarkdownCellOutputTarget::Inline => {
+					app_state
+						.code_editor
+						.set_markdown_cell_plot(identity, composition, kernel)
+				}
 				MarkdownCellOutputTarget::Pane => {
 					app_state.code_editor.open_dashboard();
 					let _ = app_state.dashboard.update(DashboardMsg::PlotKernelReady {
 						pane: None,
-						composition: resolved.composition,
+						composition,
 						kernel,
 					});
 				}
@@ -2123,7 +2156,6 @@ mod tests {
 			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(plot)) = &sink.output else {
 				panic!("expected resolved plot");
 			};
-			assert_eq!(plot.composition.primary_plot_type(), expected);
 			assert_eq!(plot.data.height(), 2);
 			assert_eq!(
 				plot.resolved_spec.composition.primary_plot_type(),

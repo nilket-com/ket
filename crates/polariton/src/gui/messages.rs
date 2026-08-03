@@ -57,6 +57,11 @@ pub enum Message {
 	ScratchReady(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
 	AdapterSelected(AdapterSelection),
 	Dashboard(DashboardMsg),
+	DashboardPlotBuilt {
+		pane: Option<crate::gui::pane_grid::PaneId>,
+		composition: crate::plot::composition::PlotComposition,
+		result: std::result::Result<Arc<dyn PlotKernel + Send + Sync>, String>,
+	},
 	CloseSettings,
 	CloseWindow,
 	CodeEditEvent(EditorMsg),

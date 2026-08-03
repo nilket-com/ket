@@ -91,7 +91,8 @@ mod tests {
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use crate::plot::export::SvgBackend;
-	use crate::plot::factory::create_plot;
+	use crate::plot::factory::{create_authored_plot, create_automatic_plot};
+	use crate::plot::spec::AuthoredPlotSpec;
 	use crate::rune_relation_envelope::{RuneViewIntent, transform as transform_rune_view};
 	use iced::Rectangle;
 	use std::path::PathBuf;
@@ -117,7 +118,7 @@ mod tests {
 		assert_eq!(frame.shape(), (4, 2));
 
 		let composition = PlotComposition::single(PlotType::Scatter);
-		let kernel = create_plot(&composition, &frame, 800, 480);
+		let kernel = create_automatic_plot(composition, &frame, 800, 480).expect("resolved plot");
 		let widget = PlotWidget {
 			kernel: kernel.as_ref(),
 			title: "Toron first contact".to_owned(),
@@ -170,10 +171,20 @@ mod tests {
 					assert!(frame.column("val").is_ok());
 				}
 				RuneViewIntent::Plot(plot) => {
+					let expected_x = plot.x.clone();
+					let expected_y = plot.y.clone();
 					let projected = frame
 						.select([plot.x.as_str(), plot.y.as_str()])
 						.expect("project plot fields");
-					let kernel = create_plot(&plot.composition, &projected, 800, 480);
+					let kernel = create_authored_plot(
+						AuthoredPlotSpec::xy(plot.composition, plot.x, plot.y),
+						&projected,
+						800,
+						480,
+					)
+					.expect("resolve relation plot fields");
+					assert_eq!(kernel.x_label(), expected_x);
+					assert_eq!(kernel.y_label(), expected_y);
 					let widget = PlotWidget {
 						kernel: kernel.as_ref(),
 						title: "Rune relation first contact".to_owned(),

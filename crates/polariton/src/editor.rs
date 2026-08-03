@@ -7069,12 +7069,14 @@ mod tests {
 	#[test]
 	fn inline_plot_hover_is_scoped_to_its_cell_identity() {
 		use crate::gui::messages::PlotMessage;
-		use crate::plot::{composition::PlotComposition, core::PlotType, factory::create_plot};
+		use crate::plot::{composition::PlotComposition, core::PlotType};
 		use libaryon::uast::projection::MarkdownCellIdentity;
 
 		let frame = polars::df!("x" => [1_i32, 2], "y" => [2_i32, 4]).expect("frame");
 		let composition = PlotComposition::single(PlotType::Scatter);
-		let kernel = create_plot(&composition, &frame, 600, 360);
+		let kernel =
+			crate::plot::factory::create_automatic_plot(composition.clone(), &frame, 600, 360)
+				.expect("resolved plot");
 		let identity = MarkdownCellIdentity::Explicit {
 			id: "trips-plot".to_owned(),
 		};
