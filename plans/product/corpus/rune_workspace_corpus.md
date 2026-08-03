@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.6. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.7. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -43,22 +43,29 @@ citation rather than silently migrated.
 
 ### Load-bearing invariant
 
-> `RuneDataFrame` → `EncodedViewSet` is simultaneously the type-state boundary,
-> the fan-out boundary, and the Toron–Polariton process boundary.
+> `RuneDataFrame` → `ViewSet` is simultaneously the type-state boundary, the
+> fan-out boundary, and the Toron–Polariton process boundary. `.views([...])` is
+> the transition.
 
 The three coincide, which is the argument for the surface rather than a
 consequence of it:
 
-- **Type-state.** `RuneDataFrame` has no sink methods; `EncodedViewSet` has no
-  relation methods. A chain that appears to make one view consume another is
+- **Type-state.** `RuneDataFrame` has no sink methods; `ViewSet` has no relation
+  methods. A chain that appears to make one view consume another is
   unrepresentable rather than merely discouraged.
-- **Fan-out.** Sinks appended to an `EncodedViewSet` are siblings over one
-  relation. This is the same algebra as the shared-execution fan-out row above:
-  one execution, N sinks, one stamped result shared by identity.
+- **Fan-out.** Sinks in a `ViewSet` are siblings over one relation. This is the
+  same algebra as the shared-execution fan-out row above: one execution, N sinks,
+  one stamped result shared by identity.
 - **Process.** Everything at or below `RuneDataFrame` executes on Toron;
-  everything above `.encode(...)` stays in Polariton. PRODUCT-0002's
+  everything above `.views([...])` stays in Polariton. PRODUCT-0002's
   execution/presentation split stops being a rule a reviewer enforces and becomes
-  one the receiver type enforces.
+  one the receiver kind enforces.
+
+`.views([...])` names the operation that actually occurs — fan one relation into
+several presentation sinks — without asserting that every sink consumes an
+encoding. Encoding is a property of the marks that have one, not of the boundary,
+so channels live inside the individual plot specifications where richer
+Vega-style channel sets naturally belong.
 
 ### Recognition by receiver provenance
 
@@ -75,19 +82,19 @@ propagates:
 
 ```text
 workspace-rooted chain
-  unknown method                → RelationCandidate
-  .encode(...) / .views(...)    → EncodedViewSet
-  direct .scatter(x, y)         → sugar for .encode(x, y).scatter()
-  direct .bar(x, y)             → sugar for .encode(x, y).bar()
-  direct .table()               → EncodedViewSet with a relation-table sink
+  unknown method        → RelationCandidate
+  .views([...])         → ViewSet
+  direct .scatter(x, y) → sugar for .views([scatter(x, y)])
+  direct .bar(x, y)     → sugar for .views([bar(x, y)])
+  direct .table()       → sugar for .views([table()])
 
-EncodedViewSet
-  .scatter() / .bar() / .table() → EncodedViewSet plus one ordered sink
+ViewSet
+  .views([...])         → ViewSet with the further sinks appended
 ```
 
 Bindings preserve the inferred kind and the accumulated specification. Binding
-alone emits nothing. Only a **top-level expression of `EncodedViewSet` kind**
-becomes an output root.
+alone emits nothing. Only a **top-level expression of `ViewSet` kind** becomes an
+output root.
 
 Two properties of this table are load-bearing:
 
@@ -99,11 +106,10 @@ Two properties of this table are load-bearing:
   negatively keeps the analysis ignorant by construction rather than by
   discipline: `workspace.table("t").sort([...])` stays a `RelationCandidate`
   without the analysis holding any opinion about `sort`.
-- **Sink methods are kind-preserving too.** `.scatter()` returns an
-  `EncodedViewSet` with one sink appended, or `v.scatter().bar()` breaks after
-  the first sink. This is also what makes sink **order** fall out of chain order
-  rather than needing a separate rule, and what lets the direct sugar and the
-  chained form share exactly one algebra.
+- **`.views(...)` is kind-preserving on a `ViewSet`.** Applying it again appends
+  rather than nesting or replacing, so sinks accumulate in list order and then
+  chain order. Sink **order** therefore falls out of program order without a
+  separate rule, and every sugared form reduces to the same accumulation.
 
 Receiver provenance is a narrower recognition rule than the free-function name
 matching it replaces. `table(r)` and `plot.bar(...)` are global names a user may
@@ -118,38 +124,52 @@ spelling, not a permanent cost of the proposed one.
 | form | role |
 |---|---|
 | `r.views([...])` | canonical algebra: a relation and an explicit list of sinks |
-| `r.encode(x, y).scatter().bar()` | shared-encoding sugar; sinks append as siblings |
-| `r.scatter(x, y)` | single-view sugar, defined as exactly `r.encode(x, y).scatter()` |
-| `r.table()` | displays the underlying relation; ignores any encoding |
+| `r.scatter(x, y)` | single-view sugar, defined as exactly `r.views([scatter(x, y)])` |
+| `r.bar(x, y)` | single-view sugar, defined as exactly `r.views([bar(x, y)])` |
+| `r.table()` | single-view sugar, defined as exactly `r.views([table()])` |
+
+Written out, the canonical form is the working snippet:
+
+```rune
+workspace
+    .table("test2")
+    .sort([asc(col("cat"))])
+    .views([
+        scatter("cat", "val"),
+        bar("cat", "val"),
+        table(),
+    ])
+```
 
 Rules the hierarchy must satisfy:
 
 - **Sugar is a strict projection.** Each sugared form is definable in terms of
   the canonical form and may carry no semantics the canonical form cannot
   express. A sugared form that grows a private option is a second language.
-- **Binding is lazy.** Constructing an `EncodedViewSet` executes nothing and
-  emits nothing. Only a top-level displayable expression emits output; a
+- **Binding is lazy.** Constructing a `ViewSet` executes nothing and emits
+  nothing. Only a top-level displayable expression emits output; a
   bound-but-unused set renders nothing.
-- **`table` is not a mark.** Marks consume an encoding; a grid consumes a
-  relation. `r.table()` shows the full relation on either receiver, and the fact
-  that it ignores an encoding in scope is stated rather than inferred.
+- **Sinks need not be alike.** `scatter(...)` and `bar(...)` carry channels;
+  `table()` carries none. Because the boundary is `.views([...])` rather than an
+  encoding, a grid sitting beside two marks requires no explanation — there is no
+  ambient encoding for it to ignore.
 
-Receiver typing also retires the earlier namespace question. `workspace.table(name)`
-selects a source and `EncodedViewSet.table()` appends a grid sink; the receiver
-disambiguates, so neither a `plot.` nor a `view.` prefix is required to keep them
-apart.
+Receiver kind also retires the earlier namespace question. `workspace.table(name)`
+selects a source and `table()` inside a `views` list constructs a grid sink; the
+position and receiver disambiguate, so neither a `plot.` nor a `view.` prefix is
+required to keep them apart.
 
 ### Equivalence acceptance cases
 
 The direct and factored forms are one acceptance obligation, not two:
 
 ```rune
-r.encode("cat", "val").scatter().bar();
+r.views([scatter("cat", "val"), bar("cat", "val")]);
 ```
 
 ```rune
-let v = r.encode("cat", "val");
-v.scatter().bar();
+let v = r.views([scatter("cat", "val"), bar("cat", "val")]);
+v
 ```
 
 They must be indistinguishable in executions issued, sinks produced, and stamped
@@ -165,18 +185,28 @@ result identity.
    the first refactor a user performs.
 2. **Data-changing operations lower before the boundary.** Vega-style `bin`,
    `aggregate`, and calculated fields must lower into `RuneDataFrame` operations
-   before an `EncodedViewSet` is constructed. After `.encode(...)`, an operation
-   may describe presentation but must never execute a data transformation
-   locally. An operation that cannot be expressed as a relation operation before
-   the boundary is a typed capability refusal, not a local fallback — otherwise
-   the invariant degrades quietly into a second, undeclared execution engine
-   inside the workbench.
+   before a `ViewSet` is constructed. After `.views([...])`, an operation may
+   describe presentation but must never execute a data transformation locally. An
+   operation that cannot be expressed as a relation operation before the boundary
+   is a typed capability refusal, not a local fallback — otherwise the invariant
+   degrades quietly into a second, undeclared execution engine inside the
+   workbench.
 
 ### What this section does not decide
 
-`PlotSpec` fields, scales, guides, themes, interaction, named views, durable plot
-binding, and the exact spelling of `encode` remain open. The plotting record
-decides them; this section constrains where they may live.
+`PlotSpec` fields, scales, guides, themes, interaction, named views, and durable
+plot binding remain open. The plotting record decides them; this section
+constrains where they may live.
+
+**Shared encoding is explicitly undecided.** An earlier draft made `.encode(x, y)`
+the boundary, with sinks chained after it. That form is withdrawn: it asserted
+that every sink consumes an encoding, which is false for `table()`, and it
+promoted a convenience — hoisting channels two marks happen to share — into the
+process boundary. `.views([...])` expresses the general algebra without it.
+
+Shared encoding may return later as **presentation sugar over the sink list**,
+lowering to the same `ViewSet` and carrying no semantics the list cannot express.
+It must not become the boundary again, and nothing depends on it existing.
 
 ## Mutation and definition lifecycle
 
@@ -207,6 +237,15 @@ decides them; this section constrains where they may live.
 
 ## Change log
 
+- v0.7 (2026-08-02): `.views([...])` becomes the boundary and the canonical
+  form; `EncodedViewSet` is renamed `ViewSet`; the three single-view sugars lower
+  to `.views([...])`. `.encode(...)` is withdrawn from the proposal to an
+  explicit non-decision — it asserted that every sink consumes an encoding, which
+  is false for `table()`, and promoted a shared-channel convenience into the
+  process boundary. Encoding channels belong inside individual plot
+  specifications; shared encoding may return as presentation sugar over the sink
+  list. Supersedes the v0.5 entry below where that entry names `.encode(...)` as
+  the boundary. No row changed status.
 - v0.6 (2026-08-02): recorded receiver-provenance recognition beside the
   invariant — the `RelationCandidate` kind, its propagation table, and the two
   properties that make it implementable without a type model (unknown methods
