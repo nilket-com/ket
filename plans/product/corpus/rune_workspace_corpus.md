@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.8. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.9. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -26,10 +26,10 @@ a cited record).
 
 | family | status | evidence |
 |---|---|---|
-| bounded table view (`table(r)`, inherits the 128 MiB `toron-client` collection ceiling) | pending — live first-contact acceptance | automated seams: `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces` |
-| experimental bar sink (`plot.bar`) | pending — live first-contact acceptance | automated seams: `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces` |
-| experimental scatter sink (`plot.scatter`) | pending — live first-contact acceptance | automated seams: `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces` |
-| shared-execution view fan-out (one execution, N sinks) | pending — fan-out pair target | expansion justified by measurement #2 dogfood evidence, 2026-08-01 |
+| bounded table view (`table(r)`, inherits the 128 MiB `toron-client` collection ceiling) | executable | `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance `live_rune_relation_reaches_table_bar_and_scatter_surfaces` |
+| bar sink (`plot.bar`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`) |
+| scatter sink (`plot.scatter`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`) |
+| shared-execution view fan-out (one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink holds the *same* `Arc`, not equivalent copies; live acceptance issues one `dispatch_rune` and consumes three ordered sinks (`71445df3`, `755e850a`) |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -283,6 +283,19 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.9 (2026-08-03): four rows become **executable** — the three view sinks and
+  shared-execution fan-out. The live relation gate now runs green against an
+  installed deployment and asserts axis identity (`kernel.x_label()` /
+  `y_label()`) rather than path presence, and PRODUCT-0007 closed the
+  field-substitution defect that made scatter's rendered channels untrustworthy.
+  Fan-out is proved from both sides: one `dispatch_rune` produces the live
+  result, three ordered sinks consume it, and the automated fixture asserts every
+  sink holds the same `Arc` rather than equivalent copies — direct evidence for
+  one execution feeding N sinks, independent of any spelling. The `experimental`
+  qualifier is dropped from the bar and scatter rows; their spelling is
+  unchanged. These status changes are deliberately separate from any decision
+  about the proposed surface, so the evidence trail for the current spelling
+  stays intact whatever that record decides.
 - v0.8 (2026-08-02): banked the `ViewSet` normal form — relation origin plus a
   flat ordered sink list, which every surface operation only appends to, so
   execution order holds by construction and step 1's `EnvelopeSemantics` already
