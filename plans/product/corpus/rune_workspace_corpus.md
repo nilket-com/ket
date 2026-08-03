@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.7. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.8. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -33,7 +33,7 @@ a cited record).
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
-## Proposed surface: encoded view fan-out
+## Proposed surface: view fan-out
 
 Status: **proposed**. This section records a candidate spelling and the invariant
 that justifies it. No record accepts it, no implementation depends on it, and the
@@ -118,6 +118,39 @@ method is recognized only on a receiver the analysis already traced to
 `workspace`, so a user-defined `.scatter()` on an unrelated value is never a
 root. The shadowing machinery is a compatibility concern for the current
 spelling, not a permanent cost of the proposed one.
+
+### Sink constructors are contextual
+
+`scatter(...)`, `bar(...)`, and `table()` are recognized as sink constructors
+**only as arguments to `.views([...])`**. The identical call written anywhere
+else is ordinary Rune and reaches the executor untouched.
+
+This is receiver provenance applied one level inward: the argument position has
+already been proven to belong to a `RelationCandidate` → `ViewSet` transition, so
+the names carry meaning only where that proof exists. Reservation is confined to
+a position rather than claimed over a namespace, which is what keeps a
+user-defined `fn table(x)` and a bare `table(1)` legal — the same collision class
+step 1 must handle for the current free-function spelling, and which this
+spelling avoids by construction.
+
+### Normal form
+
+```text
+ViewSet {
+    relation_origin,
+    sinks: flat ordered list,
+}
+```
+
+Every surface operation appends to that list. Nesting never enters the
+representation, so list order followed by chain order **is** execution order by
+construction rather than by a rule someone has to maintain.
+
+This is already the shape step 1 compares. `EnvelopeSemantics`
+(`../impl/0003_typed_output_root_discovery.md`) is a resolved relation origin
+plus ordered, unspanned sink intents — the same normal form. The existing
+equivalence and ordering proofs therefore judge this surface without
+modification, which is what makes step 3 reviewable as lowering alone.
 
 ### Form hierarchy
 
@@ -208,6 +241,19 @@ Shared encoding may return later as **presentation sugar over the sink list**,
 lowering to the same `ViewSet` and carrying no semantics the list cannot express.
 It must not become the boundary again, and nothing depends on it existing.
 
+**Bindable sink specifications are undecided.** A form such as
+
+```rune
+let chart = scatter("cat", "val");
+r.views([chart])
+```
+
+would require `SinkSpec` provenance — the same binding-and-kind analysis extended
+to a third kind, so that a bound constructor stays recognizable inside a `views`
+list. It is a natural extension of the existing mechanism rather than a
+prerequisite, and the first plotting record need not solve it. Until it is
+decided, sink constructors are recognized only in argument position.
+
 ## Mutation and definition lifecycle
 
 | family | status | evidence |
@@ -237,6 +283,13 @@ It must not become the boundary again, and nothing depends on it existing.
 
 ## Change log
 
+- v0.8 (2026-08-02): banked the `ViewSet` normal form — relation origin plus a
+  flat ordered sink list, which every surface operation only appends to, so
+  execution order holds by construction and step 1's `EnvelopeSemantics` already
+  compares the right shape. Recorded that sink constructors are contextual,
+  recognized only in `.views([...])` argument position, confining name
+  reservation to a proven position rather than a namespace. Added bindable sink
+  specifications as an explicit non-decision. No row changed status.
 - v0.7 (2026-08-02): `.views([...])` becomes the boundary and the canonical
   form; `EncodedViewSet` is renamed `ViewSet`; the three single-view sugars lower
   to `.views([...])`. `.encode(...)` is withdrawn from the proposal to an
