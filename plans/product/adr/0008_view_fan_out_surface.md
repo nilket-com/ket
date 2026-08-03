@@ -89,6 +89,21 @@ Reservation is confined to a position that has already been proven to belong to 
 relation-to-sinks transition, rather than claimed over a namespace. A
 user-defined `fn table(x)` and a bare `table(1)` remain legal.
 
+Inside a proven `.views([...])` list, recognition is **atomic**. Once a
+workspace-rooted receiver has established the boundary, every element of that list
+is presentation, and an element that is unknown, malformed, or not yet supported
+is an attributed local refusal naming its span. Partial lowering is prohibited:
+no program may reach Toron with some elements peeled and others left in place,
+and no presentation syntax may reach the executor.
+
+This is deliberately stricter than PRODUCT-0003's free-function recognition,
+which retains everything it does not recognize. The difference is evidence, not
+appetite. There, a bare `table(1)` is genuinely ambiguous between a view and a
+user's own function, so retaining is the only safe reading. Here the receiver has
+already proven the transition, so an unrecognized element is unambiguously a
+mistake inside a presentation list, and retaining it would ship presentation
+syntax to a relation engine.
+
 ### 4. Recognition is by receiver provenance, not by name
 
 Recognition runs on a locally tracked kind named `RelationCandidate` — provenance,

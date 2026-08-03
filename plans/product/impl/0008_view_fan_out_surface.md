@@ -16,22 +16,58 @@ PRODUCT-0008 §7 binds this implementation:
 > invalidates existing executable evidence — the work stops: the proposal is not
 > a respelling and requires a broader record.
 
-Concretely, the work stops if it requires touching `plot/spec/`, `plot/durable.rs`,
-`plot/theme.rs`, any kernel, `plot/factory.rs`, the scheduler, `toron-client`, or
-the transport. It also stops if any test currently cited by an `executable`
-corpus row has to change to stay green. Stopping means reporting the finding, not
-working around it.
+Concretely, the work stops if it requires touching `plot/spec/`,
+`plot/durable.rs`, `plot/theme.rs`, any kernel, `plot/factory.rs`, the scheduler,
+`toron-client`, or the transport. It also stops if any test currently cited by an
+`executable` corpus row has to change to stay green. Stopping means reporting the
+finding, not working around it.
 
-All work is confined to `crates/polariton/src/rune_relation_envelope.rs`, whose
-containment is already guarded by
-`product_0003_terminal_envelope_is_the_only_relation_view_transformation_site`.
+### Where work may land
+
+The earlier draft claimed all work is confined to `rune_relation_envelope.rs`.
+That was wrong, and its own plan contradicted it. Permitted:
+
+- `rune_relation_envelope.rs` — recognition, kind analysis, lowering, refusals;
+- `gui/state.rs` — the dispatch decision only, because a recognized envelope with
+  no emitted root must stop rather than fall through to the local Rune host
+  (today `NoTerminalView` falls through at `state.rs:529`). Routing only; no new
+  execution, scheduling, or result semantics;
+- `adapters/toron/mod.rs` — the live sibling test.
+
+Any other file is a halt.
+
+## Representation: sinks decouple from removable regions
+
+`ParsedView` today is simultaneously *a removable statement* and *one sink*, and
+`retained_regions()` requires the removal spans not to overlap. One
+`.views([a, b, c])` statement carries three sinks, so that conflation cannot
+survive and the earlier claim that `ExecutionEnvelope` is unchanged was
+impossible.
+
+Split it into three independent things:
+
+```text
+peeled regions   presentation-bearing source spans removed from the remote
+                 program; non-overlapping; one per statement or binding
+relation origin  one span, resolved as today (binding -> initializer text,
+                 inline -> its own text)
+sink intents     ordered, each individually spanned for diagnostics
+```
+
+`EnvelopeSemantics` — relation origin, ordered unspanned sink intents, execution
+count — is **unchanged**, and so is every downstream consumer: `RuneViewIntent`
+values, the scheduler, per-sink failure isolation, and stamped-result identity.
+This is permitted lowering, not a stop-condition violation: the change is to how
+a program's presentation is located and removed, not to what any program means.
+
+`diagnostic_fallback()` continues to return the relation span.
 
 ## Kind analysis
 
-Extend the existing binding-and-kind analysis with a receiver-provenance kind.
-It answers only which expressions descend from `workspace` and which names are
-bound — never what any call computes. The PRODUCT-0003 relation-verb assay
-continues to apply unchanged and must not be relaxed.
+Extend step 1's binding-and-kind analysis with receiver provenance. It answers
+only which expressions descend from `workspace` and which names are bound — never
+what any call computes. The PRODUCT-0003 relation-verb assay applies unchanged and
+must not be relaxed.
 
 ```text
 RelationCandidate   rooted at the `workspace` entrypoint parameter;
@@ -40,46 +76,74 @@ ViewSet             produced by `.views([...])`; preserved by further
                     `.views([...])`, which appends
 ```
 
-- sugars `.scatter(x, y)`, `.bar(x, y)`, `.table()` on a `RelationCandidate`
-  expand to the canonical single-element list before anything else observes them,
-  so exactly one lowering path exists;
-- bindings carry kind and accumulated sinks, per step 1's existing binding
-  resolution;
-- only a top-level expression of `ViewSet` kind is an output root;
-- sink constructors are recognized **only** inside a `.views([...])` argument
-  list. Elsewhere they are ordinary calls and are retained.
+Sugars `.scatter(x, y)`, `.bar(x, y)`, `.table()` on a `RelationCandidate` expand
+to the canonical single-element list before anything else observes them, so
+exactly one lowering path exists.
 
-## Lowering and the relation span
+If `workspace` is locally shadowed, no chain is workspace-rooted, no `ViewSet`
+exists, sink constructors are not recognized, and the whole buffer is ordinary
+Rune. Shadowing is a retain path, never a refusal path.
 
-Today a root is a whole statement and the relation is a call argument. Under the
-accepted spelling the root is a method call whose **receiver** is the relation, so
-the relation span is the receiver chain and the retained remote program keeps
-everything up to but excluding `.views(...)`.
+### Presentation bindings are peeled
 
-This is a new span shape, not new semantics: `analyze` still yields an
-`ExecutionEnvelope` of retained statement spans, one relation span, and ordered
-roots, and `render` still splices retained regions and appends the relation as
-the trailing expression. A receiver that is a binding resolves to that binding's
-initializer text, exactly as step 1 already does, so `let r = …; r.views([…])`
-needs no special case.
+Step 1 resolves a binding to its initializer *text* in order to identify a
+relation. That is insufficient here, because a binding may hold presentation:
 
-`diagnostic_fallback()` continues to return the relation span.
+```rune
+let v = r.views([scatter("c", "v")]);
+v.views([bar("c", "v")])
+```
 
-## Sink intents
+`let v = …views(…)` is presentation-bearing. Retaining it would send `.views` and
+`scatter(...)` to Toron. Any binding whose initializer resolves to `ViewSet` kind
+is therefore itself peeled, and the relation origin is taken from the underlying
+`RelationCandidate` receiver chain rather than from the binding's text.
 
-`.views([...])` produces the same `RuneViewIntent` values the free-function
-spelling produces, so downstream code cannot tell the spellings apart. Arity and
-string-literal rules for `scatter`, `bar`, and `table` are reused rather than
-reimplemented, and `MixedRelations` and `DuplicateForm` keep their meaning: all
-sinks in one program share one relation origin, and each form appears once.
+This applies transitively to chained aliases: `let a = r.views([…]); let b =
+a.views([…]); b` peels both bindings and resolves one origin from `r`.
 
-Sink order is list order, then chain order, which falls out of appending.
+### A recognized envelope with no emitted root
+
+A buffer whose `.views(...)` boundary is recognized but which emits no root — the
+corpus's laziness rule — must schedule no Toron execution, emit no view, and
+**not** fall through to the local Rune host. Falling through would hand a
+`workspace`-rooted program to a host that has no `workspace`, producing a
+confusing failure for a program that is simply lazy.
+
+This is distinct from `NoTerminalView`, which means no envelope was recognized at
+all and must keep falling through unchanged.
+
+## Atomicity and refusals
+
+Once a workspace-rooted receiver establishes the boundary, every element of the
+list is presentation. An element that is unknown, malformed, or unsupported is an
+attributed local refusal naming its span. There is no partial lowering: either
+the whole statement is peeled and every element becomes a sink, or the program
+refuses.
+
+Refusable inside a proven list:
+
+- a constructor with wrong arity or non-literal field arguments;
+- an unknown callee;
+- a bound sink specification, such as `let s = scatter("c","v"); r.views([s])`,
+  which PRODUCT-0008 leaves undecided and which therefore refuses rather than
+  guessing;
+- a `ViewSet` binding used anywhere other than a further `.views(...)` or a
+  terminal output position.
+
+`MixedRelations` and `DuplicateForm` keep their meaning across both spellings:
+all sinks in one program share one relation origin, and each form appears once.
+
+These refusals are new, where step 1 introduced none. The justification is
+PRODUCT-0008 §3: the receiver has already proven intent, so retaining an
+unrecognized element would ship presentation syntax to a relation engine rather
+than preserve an ambiguous user program.
 
 ## Tests
 
-The proof burden is three items. Everything else is regression.
+The proof burden is three items; everything else is regression.
 
-1. **Direct versus factored equivalence.** These four programs produce equal
+1. **Direct versus factored equivalence.** These four produce equal
    `EnvelopeSemantics`:
 
    ```rune
@@ -98,34 +162,41 @@ The proof burden is three items. Everything else is regression.
    plot.scatter(r, "c", "v"); plot.bar(r, "c", "v")
    ```
 
-   The fourth is the load-bearing one: the accepted spelling must equal the
-   **existing** spelling, not merely equal itself. Their `ExecutionEnvelope`s
-   differ and the test asserts that too, so the projection is visibly doing the
-   work.
+   The fourth is load-bearing: the accepted spelling must equal the **existing**
+   spelling, not merely equal itself. Their `ExecutionEnvelope`s differ and the
+   test asserts that too. The third additionally asserts that no peeled region
+   overlaps another and that no `.views` or constructor text survives into the
+   remote program.
 
-2. **Sink ordering.** List order then chain order is the sink order; reordering
-   the list or the chain yields unequal semantics, while reordering unrelated
+2. **Sink ordering.** List order then chain order is sink order; reordering the
+   list or the chain yields unequal semantics, while reordering unrelated
    statements yields equal semantics. Both directions asserted.
 
-3. **Contextual constructor recognition.** `scatter("c","v")` as a bare statement,
-   in a binding, and inside a non-`views` call is ordinary Rune, retained and
-   unrefused. A user-defined `fn scatter(a, b)` alongside a real `.views([...])`
-   root is untouched. `.scatter()` on a receiver not descended from `workspace` is
-   never a root. Positive controls prove each form is recognized in the sanctioned
-   position, so the negatives cannot pass by nothing being recognized.
+3. **Contextual constructor recognition.** `scatter("c","v")` as a bare
+   statement, in a binding, and inside a non-`views` call is ordinary Rune,
+   retained and unrefused. A user-defined `fn scatter(a, b)` alongside a real
+   `.views([...])` root is untouched. `.scatter()` on a receiver not descended
+   from `workspace` is never a root. Positive controls prove each form is
+   recognized in the sanctioned position.
 
-**Sugar equivalence.** `r.scatter(x, y)` equals `r.views([scatter(x, y)])` in
-semantics, and likewise for `bar` and `table`, asserted per form.
+**Atomicity controls.** Malformed arity, non-literal fields, unknown callee, a
+bound sink spec, and a misused `ViewSet` binding each refuse with a span; a
+counter proves no partial peel and no dispatch occurred. A shadowed `workspace`
+retains instead of refusing, proving the two paths are distinct.
 
-**Regression.** Every existing envelope test passes unchanged, including both
-`Starting`-era shadow fixtures, the interleaved-roots test, and
+**Laziness through the real caller.** A recognized envelope with no emitted root
+schedules nothing, emits nothing, and does not reach the local Rune host; a
+buffer with no envelope at all still falls through. Both asserted at the
+`gui/state.rs` dispatch decision, not only inside the envelope module.
+
+**Regression.** Every existing envelope test passes unchanged, including the two
+shadow fixtures, the interleaved-roots test, and
 `a_view_before_a_non_view_statement_is_now_an_output_root`. No test cited by an
 `executable` corpus row is modified.
 
-**Live.** `live_rune_relation_reaches_table_bar_and_scatter_surfaces` gains a
-sibling that runs the accepted spelling against the deployment and asserts the
-same axis identity. It seeds nothing new; `test2` already exists and the existing
-gate's shape is reused.
+**Live.** A sibling of `live_rune_relation_reaches_table_bar_and_scatter_surfaces`
+runs the accepted spelling against the deployment and asserts the same axis
+identity. It seeds nothing; `test2` already exists.
 
 ## Non-goals
 
@@ -134,22 +205,30 @@ gate's shape is reused.
 - No retirement or deprecation of `plot.bar`, `plot.scatter`, or `table(r)`.
 - No shared-encoding sugar, no bindable sink specifications, no new sink form.
 - No relaxation of the PRODUCT-0003 relation-verb assay or the containment guard.
-- No change to `EnvelopeSemantics`, `ExecutionEnvelope`, or `render`'s contract
-  beyond the receiver-chain span shape.
+- No change to `EnvelopeSemantics` or to any downstream consumer of
+  `RuneViewIntent`. `ExecutionEnvelope`'s internal shape does change, as recorded
+  above, because one statement can now carry several sinks.
 
 ## Review checklist
 
-- [ ] Work confined to `rune_relation_envelope.rs`; the halt rule was not
-      triggered, and if it was, the work stopped and reported.
+- [ ] Work stayed within the three permitted files; the halt rule was not
+      triggered, or the work stopped and reported.
+- [ ] Peeled regions, relation origin, and sink intents are three independent
+      things; no two peeled regions overlap.
+- [ ] `EnvelopeSemantics` and every downstream consumer are unchanged.
+- [ ] Presentation bindings are peeled, including chained aliases; origin comes
+      from the underlying relation chain.
+- [ ] A recognized envelope with no emitted root stops; `NoTerminalView` still
+      falls through.
+- [ ] Atomicity holds: no partial lowering, no presentation syntax in the remote
+      program, refusals attributed by span.
+- [ ] A shadowed `workspace` retains rather than refuses.
 - [ ] Kind analysis consults only provenance and bound names; the relation-verb
       assay passes unchanged.
-- [ ] Sugars expand before observation, so exactly one lowering path exists.
-- [ ] Sink constructors recognized only in `.views([...])` argument position;
-      every other position retained without refusal.
 - [ ] The four-program equivalence passes, including equality with the existing
       free-function spelling.
-- [ ] Sink ordering proved in both directions.
-- [ ] Contextual recognition proved with positive controls.
+- [ ] Sink ordering proved in both directions; contextual recognition proved with
+      positive controls.
 - [ ] Every existing envelope test passes unmodified; no `executable` row's cited
       test changed.
 - [ ] Live gate for the accepted spelling green against the running deployment.
