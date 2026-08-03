@@ -913,23 +913,19 @@ impl CodeEditor {
 	}
 
 	#[cfg(feature = "toron")]
-	pub fn fail_rune_view(&mut self, panel_id: HostPanelId, message: String) {
-		self.panels.fail_or_stale(panel_id, message);
+	pub fn fail_rune_view(&mut self, panel_id: HostPanelId) {
+		self.panels.fail_or_stale(panel_id);
 	}
 
 	#[cfg(feature = "toron")]
-	pub fn mark_rune_view_producer_stale(
-		&mut self,
-		producer: libaryon::core::BufferId,
-		message: String,
-	) {
+	pub fn mark_rune_view_producer_stale(&mut self, producer: libaryon::core::BufferId) {
 		let panels = self
 			.view_panel_ids
 			.iter()
 			.filter_map(|((buffer, _), panel_id)| (*buffer == producer).then_some(*panel_id))
 			.collect::<Vec<_>>();
 		for panel_id in panels {
-			self.panels.fail_or_stale(panel_id, message.clone());
+			self.panels.fail_or_stale(panel_id);
 		}
 	}
 
@@ -963,7 +959,7 @@ impl CodeEditor {
 	) -> bool {
 		self.rune_view_panel_id(producer, identity)
 			.and_then(|panel_id| self.panels.panels.get(&panel_id))
-			.is_some_and(|entry| matches!(entry.content, PanelContent::Failed(_)))
+			.is_some_and(|entry| matches!(entry.content, PanelContent::Failed))
 	}
 
 	#[cfg(all(test, feature = "toron"))]
@@ -977,7 +973,7 @@ impl CodeEditor {
 		Some(match entry.status {
 			PanelStatus::Fresh => "fresh",
 			PanelStatus::Running => "running",
-			PanelStatus::Stale(_) => "stale",
+			PanelStatus::Stale => "stale",
 			PanelStatus::Orphaned => "orphaned",
 		})
 	}
@@ -1033,13 +1029,6 @@ impl CodeEditor {
 	pub fn set_query_result(&mut self, frame: DataFrame) {
 		self.panels
 			.set_content(RESULT_PANEL, PanelContent::Table(Box::new(frame)));
-	}
-
-	/// A failed query keeps its panel: the error belongs where the results
-	/// would have been, not only in the status bar.
-	pub fn set_query_error(&mut self, message: String) {
-		self.panels
-			.set_content(RESULT_PANEL, PanelContent::Failed(message));
 	}
 
 	/// Complete a non-row SQL command in the results pane. A pane-targeted
@@ -2261,7 +2250,8 @@ enum PanelContent {
 	#[cfg(feature = "toron")]
 	Plot(Box<PlotPaneState>),
 	Message(String),
-	Failed(String),
+	#[cfg(feature = "toron")]
+	Failed,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -2271,7 +2261,7 @@ enum PanelStatus {
 	#[cfg(feature = "toron")]
 	Running,
 	#[cfg(feature = "toron")]
-	Stale(String),
+	Stale,
 	#[cfg(feature = "toron")]
 	Orphaned,
 }
@@ -2409,7 +2399,7 @@ impl PanelRegistry {
 		});
 		if matches!(
 			entry.content,
-			PanelContent::Unresolved | PanelContent::Running | PanelContent::Failed(_)
+			PanelContent::Unresolved | PanelContent::Running | PanelContent::Failed
 		) {
 			entry.content = PanelContent::Running;
 		}
@@ -2417,7 +2407,7 @@ impl PanelRegistry {
 	}
 
 	#[cfg(feature = "toron")]
-	fn fail_or_stale(&mut self, panel_id: HostPanelId, message: String) {
+	fn fail_or_stale(&mut self, panel_id: HostPanelId) {
 		let entry = self.panels.entry(panel_id).or_insert(PanelEntry {
 			revision: PanelRevision::new(0),
 			content: PanelContent::Unresolved,
@@ -2428,9 +2418,9 @@ impl PanelRegistry {
 			entry.content,
 			PanelContent::Table(_) | PanelContent::Plot(_) | PanelContent::Message(_)
 		) {
-			entry.status = PanelStatus::Stale(message);
+			entry.status = PanelStatus::Stale;
 		} else {
-			entry.content = PanelContent::Failed(message);
+			entry.content = PanelContent::Failed;
 			entry.status = PanelStatus::Fresh;
 		}
 	}
@@ -2520,9 +2510,11 @@ impl PanelRegistry {
 				PanelContent::Message(message) => {
 					panel_message(message.clone(), color(palette.preview_text))
 				}
-				PanelContent::Failed(message) => {
-					panel_message(message.clone(), color(palette.status_text))
-				}
+				#[cfg(feature = "toron")]
+				PanelContent::Failed => panel_message(
+					"failed · see status bar".to_owned(),
+					color(palette.status_text),
+				),
 				PanelContent::Unresolved => panel_message(
 					format!(
 						"{} unavailable (revision {})\nrerun to populate",
@@ -2539,7 +2531,7 @@ impl PanelRegistry {
 			#[cfg(feature = "toron")]
 			PanelStatus::Running => Some(("refreshing…".to_owned(), palette.preview_text)),
 			#[cfg(feature = "toron")]
-			PanelStatus::Stale(message) => Some((format!("stale · {message}"), palette.status_text)),
+			PanelStatus::Stale => Some(("stale".to_owned(), palette.status_text)),
 			#[cfg(feature = "toron")]
 			PanelStatus::Orphaned => Some(("orphaned".to_owned(), palette.status_text)),
 		});
@@ -6017,13 +6009,6 @@ mod tests {
 			editor.panels.panels[&RESULT_PANEL].content,
 			PanelContent::Running
 		));
-
-		// A failure keeps the panel and shows the error in place.
-		editor.set_query_error("syntax error at or near \"slect\"".to_owned());
-		let PanelContent::Failed(message) = &editor.panels.panels[&RESULT_PANEL].content else {
-			panic!("a failed query retains its panel");
-		};
-		assert!(message.contains("slect"));
 
 		// Non-row commands must complete the pane too; otherwise a notebook
 		// `output=pane` CREATE/INSERT would leave it stuck on `running…`.

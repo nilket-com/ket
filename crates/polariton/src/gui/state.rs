@@ -428,7 +428,45 @@ fn set_sql_error(app_state: &mut AppState, message: String, source_start_line: O
 	app_state.status_detail_open = false;
 }
 
-fn clear_transient_sql_status_on_editor_activity(
+fn compact_rune_diagnostic(message: &str) -> (String, String) {
+	let lines = message
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty())
+		.collect::<Vec<_>>();
+	let first = lines.first().copied().unwrap_or("unknown failure");
+	let first = first.split_whitespace().collect::<Vec<_>>().join(" ");
+	let first = first.strip_prefix("Error: ").unwrap_or(&first);
+	let first = if let Some(rest) = first.strip_prefix("Rune view syntax at bytes ")
+		&& let Some((span, diagnostic)) = rest.split_once(": ")
+	{
+		format!("bytes {span} · {diagnostic}")
+	} else if let Some(rest) = first.strip_prefix("Rune view syntax: ") {
+		rest.to_owned()
+	} else {
+		first.to_owned()
+	};
+	let more = lines.len().saturating_sub(1);
+	let summary = if more == 0 {
+		format!("Rune · {first}")
+	} else {
+		format!(
+			"Rune · {first} · {more} more diagnostic{}",
+			if more == 1 { "" } else { "s" }
+		)
+	};
+	(summary, message.to_owned())
+}
+
+fn set_rune_error(app_state: &mut AppState, message: String) {
+	let (summary, full) = compact_rune_diagnostic(&message);
+	app_state.status_msg.clear();
+	app_state.status_error = summary.clone();
+	app_state.status_detail = Some(StatusDetail::new(summary, full));
+	app_state.status_detail_open = false;
+}
+
+fn clear_transient_execution_status_on_editor_activity(
 	app_state: &mut AppState,
 	message: &crate::editor::EditorMsg,
 ) {
@@ -444,7 +482,9 @@ fn clear_transient_sql_status_on_editor_activity(
 	);
 	if is_activity
 		&& (app_state.status_msg.starts_with("SQL · ")
-			|| app_state.status_error.starts_with("SQL · "))
+			|| app_state.status_error.starts_with("SQL · ")
+			|| app_state.status_msg.starts_with("Rune · ")
+			|| app_state.status_error.starts_with("Rune · "))
 	{
 		app_state.status_msg.clear();
 		app_state.status_error.clear();
@@ -528,10 +568,10 @@ fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String
 			| RuneEnvelopeError::DuplicateName { .. }),
 		) => {
 			let message = error.to_string();
-			app_state.status_error = format!("Error: {message}");
 			app_state
 				.code_editor
-				.mark_rune_view_producer_stale(source_buffer, message);
+				.mark_rune_view_producer_stale(source_buffer);
+			set_rune_error(app_state, message);
 			return Task::none();
 		}
 		Err(RuneEnvelopeError::RecognizedNoOutput) => {
@@ -557,7 +597,6 @@ fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
-	app_state.code_editor.begin_query();
 	Task::perform(
 		async move {
 			tokio::task::spawn_blocking(move || {
@@ -623,10 +662,10 @@ fn run_rune_relation_view(
 fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> Task<Message> {
 	let Some(connection) = app_state.adapter_state.rune_connection().cloned() else {
 		let message = app_state.adapter_state.local_workspace_unavailable();
-		app_state.status_error = format!("Error: {message}");
 		app_state
 			.code_editor
-			.mark_rune_view_producer_stale(work.source_buffer, message);
+			.mark_rune_view_producer_stale(work.source_buffer);
+		set_rune_error(app_state, message);
 		app_state.rune_view_scheduler.cancel(work.source_buffer);
 		return Task::none();
 	};
@@ -977,7 +1016,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return run_dashboard_message(app_state, message);
 		}
 		Message::CodeEditEvent(edit_event) => {
-			clear_transient_sql_status_on_editor_activity(app_state, &edit_event);
+			clear_transient_execution_status_on_editor_activity(app_state, &edit_event);
 			let task = app_state
 				.code_editor
 				.update(edit_event)
@@ -1314,6 +1353,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			match result {
 				Ok(outcome) => {
 					app_state.status_error.clear();
+					app_state.code_editor.begin_query();
 					app_state.code_editor.set_query_message(
 						outcome
 							.display
@@ -1336,9 +1376,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					app_state.status_msg = "Rune finished.".to_owned();
 				}
 				Err(message) => {
-					app_state.status_error = format!("Error: {message}");
-					app_state.status_msg.clear();
-					app_state.code_editor.set_query_error(message);
+					set_rune_error(app_state, message);
 				}
 			}
 		}
@@ -1406,23 +1444,20 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 									sink.span.start,
 									sink.span.end
 								);
-								app_state
-									.code_editor
-									.fail_rune_view(panel_id, message.clone());
+								app_state.code_editor.fail_rune_view(panel_id);
 								errors.push(message);
 							}
 						}
-					}
-					if errors.is_empty() {
-						app_state.status_error.clear();
-					} else {
-						let message = errors.join("\n");
-						app_state.status_error = format!("Error: {message}");
 					}
 					app_state.status_msg = format!(
 						"Rune workspace rendered {sink_count} shared-result view{}.",
 						if sink_count == 1 { "" } else { "s" }
 					);
+					if errors.is_empty() {
+						app_state.status_error.clear();
+					} else {
+						set_rune_error(app_state, errors.join("\n"));
+					}
 					return Task::batch(plot_tasks);
 				}
 				Err(message) => {
@@ -1431,13 +1466,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.code_editor
 							.rune_view_panel_id(source_buffer, &identity)
 						{
-							app_state
-								.code_editor
-								.fail_rune_view(panel_id, message.clone());
+							app_state.code_editor.fail_rune_view(panel_id);
 						}
 					}
-					app_state.status_error = format!("Error: {message}");
-					app_state.status_msg.clear();
+					set_rune_error(app_state, message);
 				}
 			}
 		}
@@ -1568,12 +1600,12 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					});
 				}
 				Err(message) => {
-					app_state.status_error = format!("Error: {message}");
-					app_state.status_msg.clear();
+					set_rune_error(app_state, message.clone());
 					if presentation.output == MarkdownCellOutputTarget::Inline {
-						app_state
-							.code_editor
-							.set_markdown_cell_error(identity, message);
+						app_state.code_editor.set_markdown_cell_error(
+							identity,
+							"failed · see status bar".to_owned(),
+						);
 					}
 				}
 			}
@@ -1857,8 +1889,8 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use super::{AdapterState, view};
 	use super::{
-		clear_transient_sql_status_on_editor_activity, compact_sql_diagnostic, new, set_sql_error,
-		update,
+		clear_transient_execution_status_on_editor_activity, compact_rune_diagnostic,
+		compact_sql_diagnostic, new, set_rune_error, set_sql_error, update,
 	};
 	#[cfg(feature = "toron")]
 	use super::{dispatch_rune_relation, rune_view_outcome};
@@ -2466,6 +2498,18 @@ mod tests {
 				.status_error
 				.contains(&format!("{second}..{}", second + 6))
 		);
+		assert!(state.status_error.starts_with("Rune · "));
+		let detail = state
+			.status_detail
+			.as_ref()
+			.expect("Rune diagnostic detail");
+		assert_eq!(detail.summary, state.status_error);
+		assert!(detail.full.contains(&format!("{first}..{}", first + 6)));
+		assert!(detail.full.contains(&format!("{second}..{}", second + 6)));
+		assert!(
+			!state.code_editor.has_query_surface(),
+			"a Rune envelope error must not manufacture a result pane"
+		);
 		state.code_editor.shutdown();
 	}
 
@@ -2885,6 +2929,14 @@ plot.bar(a, "x", "y");
 			Some("stale"),
 			"an envelope failure is not deletion"
 		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_table(source_buffer, &stable),
+			"the diagnostic belongs to the toolbar, not over prior panel content"
+		);
+		assert!(state.status_error.starts_with("Rune · "));
+		assert!(state.status_detail.is_some());
 
 		let first_failure = LocalViewIdentity::Named("first-failure".to_owned());
 		state.code_editor.prepare_rune_view_panels(
@@ -2896,9 +2948,7 @@ plot.bar(a, "x", "y");
 			.code_editor
 			.rune_view_panel_id(source_buffer, &first_failure)
 			.expect("first-failure panel");
-		state
-			.code_editor
-			.fail_rune_view(failed_panel, "first run failed".to_owned());
+		state.code_editor.fail_rune_view(failed_panel);
 		assert!(
 			state
 				.code_editor
@@ -3032,6 +3082,48 @@ workspace.table("bad").views([view("bad", table())]);
 		);
 		assert!(full.starts_with(&summary));
 		assert!(full.contains(raw));
+	}
+
+	#[test]
+	fn rune_diagnostics_compact_the_toolbar_and_keep_full_hover_detail() {
+		let raw = "Rune view syntax at bytes 67..81: unknown view sink; expected scatter(...), bar(...), or table()";
+		let (summary, full) = compact_rune_diagnostic(raw);
+
+		assert_eq!(
+			summary,
+			"Rune · bytes 67..81 · unknown view sink; expected scatter(...), bar(...), or table()"
+		);
+		assert_eq!(full, raw);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn rune_execution_error_uses_toolbar_without_manufacturing_a_result_pane() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(97);
+		state.rune_buffer_revisions.insert(source_buffer, 1);
+		let raw = "execution failed at row 2";
+
+		let _ = update(
+			&mut state,
+			Message::RunRuneBufferResult {
+				source_buffer,
+				revision: 1,
+				result: Err(raw.to_owned()),
+			},
+		);
+
+		assert_eq!(state.status_error, "Rune · execution failed at row 2");
+		assert_eq!(
+			state
+				.status_detail
+				.as_ref()
+				.map(|detail| detail.full.as_str()),
+			Some(raw)
+		);
+		assert!(!state.code_editor.has_query_surface());
+		state.code_editor.shutdown();
 	}
 
 	#[test]
@@ -3169,7 +3261,7 @@ workspace.table("bad").views([view("bad", table())]);
 	}
 
 	#[test]
-	fn editor_activity_retires_transient_sql_feedback() {
+	fn editor_activity_retires_transient_execution_feedback() {
 		use crate::editor::EditorMsg;
 		use libaryon::engine::{InputEvent, KeyCode, Modifiers};
 
@@ -3177,10 +3269,22 @@ workspace.table("bad").views([view("bad", table())]);
 		drop(startup);
 		set_sql_error(&mut state, "syntax error".to_owned(), None);
 
-		clear_transient_sql_status_on_editor_activity(
+		clear_transient_execution_status_on_editor_activity(
 			&mut state,
 			&EditorMsg::Input(InputEvent::Key {
 				code: KeyCode::Char('j'),
+				modifiers: Modifiers::NONE,
+			}),
+		);
+
+		assert!(state.status_error.is_empty());
+		assert!(state.status_detail.is_none());
+
+		set_rune_error(&mut state, "Rune failed".to_owned());
+		clear_transient_execution_status_on_editor_activity(
+			&mut state,
+			&EditorMsg::Input(InputEvent::Key {
+				code: KeyCode::Char('k'),
 				modifiers: Modifiers::NONE,
 			}),
 		);
