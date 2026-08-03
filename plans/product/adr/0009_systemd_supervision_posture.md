@@ -97,21 +97,34 @@ deployment owns it, and the other attaches.
 
 ### 4. Restart policy must fail loudly rather than flap
 
-A restarting unit interacts with the profile lock. If `nilket local` exits
-non-zero while a previous instance is still draining, the replacement observes a
-held lock, reports the existing identity, fails health, and exits non-zero again.
+Some startup failures recur on every attempt. A required endpoint occupied by a
+foreign process, a generated artifact that no longer validates, a profile whose
+format version the installed binary does not support, or development PKI that
+cannot be read will each fail preflight identically on the next start, and the
+one after that.
+
+(Contention with a previous instance is *not* such a case, and must not be cited
+as one: systemd waits for the process to exit — up to `TimeoutStopSec` — before
+restarting, so a replacement never races a predecessor that still holds the
+profile lock.)
 
 `Restart=on-failure` with `RestartSec=5s` and systemd's default start limit of
 five starts in ten seconds can never trip that limit, because five restarts five
-seconds apart span twenty-five seconds. A persistently failing deployment would
-therefore retry indefinitely at a low rate and present as a healthy-looking unit
-that is quietly never up.
+seconds apart span twenty-five seconds. A persistently failing deployment
+therefore retries indefinitely at a low rate and presents as an active-looking
+unit that is quietly never up — the worst available outcome for the component the
+whole product now attaches to at startup.
 
-A sanctioned unit must set an explicit `StartLimitIntervalSec` and
-`StartLimitBurst` consistent with its `RestartSec`, so that repeated failure
-reaches a terminal `failed` state a user can see. Silent flapping is not an
-acceptable failure mode for the component the whole product now attaches to on
-startup.
+A sanctioned unit sets an explicit restart budget in `[Unit]`:
+
+```ini
+StartLimitIntervalSec=60s
+StartLimitBurst=5
+```
+
+Five attempts within a minute, then a terminal `failed` state a user can see and
+`systemctl --user status` explains. The budget is stated concretely rather than
+as "consistent with `RestartSec`", so a unit either satisfies it or does not.
 
 ### 5. Linger moves the custody premise, and the warning must follow
 
@@ -181,9 +194,13 @@ approval reports what to run rather than escalating.
 - TORON-532 §3's "service installation" clause is superseded; everything else in
   §3 stands. PRODUCT-0006's non-goal is narrowed to self-daemonization, which is
   what it was protecting.
-- The installed unit must be brought into line with section 4 by adding explicit
-  start-limit directives; every other property it already satisfies.
-- Installation documentation gains the linger custody statement from section 5.
+- The installed unit does not yet satisfy section 4. Bringing it into line is a
+  scheduled `chore: adr 0009 bound service restart failures` commit covering the
+  unit template, the installer's rendered-unit assertions, and the README's
+  unattended development-custody statement from section 5. It is deliberately
+  separate from this record and from any PRODUCT-0008 work, so a packaging change
+  cannot ride along inside a surface commit.
+- Every other property of section 2 the installed unit already satisfies.
 - PRODUCT-0002 §9's promotion checklist stays open, and a future record deciding
   remembered consent or lazy availability must say whether external supervision
   has made either unnecessary rather than assuming it has.
