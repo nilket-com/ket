@@ -12,8 +12,9 @@ become position-independent; every non-view statement retains its existing
 meaning. Position-independence is the feature, so some programs do change — a
 non-trailing `table(r)` reaches the executor today and becomes a local sink
 after this step. What must not change is the meaning of anything the envelope
-does not recognize. The step introduces no new surface syntax and no new
-refusal. No wire change, no Toron change. Deliverable is one `impl:` commit.
+does not recognize. The step introduces no new surface syntax and never refuses
+an unrecognized call. No wire change, no Toron change. Deliverable is one
+`impl:` commit.
 
 ## What "typed" means here, and what it must not become
 
@@ -136,14 +137,21 @@ collisions above forbid. The precise diagnostic can return once the view names
 are formally reserved — the same condition already deferring a nested-call
 diagnostic. The arity half of `:581` is rewritten accordingly, with a citation.
 
-`MixedRelations` (`:223-232`) and `DuplicateForm` (`:233-241`) are unaffected:
-both compare roots that were already recognized, and neither widens to any new
-position.
+`MixedRelations` (`:223-232`) and `DuplicateForm` (`:233-241`) keep their
+meaning, but become position-independent with root recognition. Two newly
+recognized roots separated by an ordinary statement must still share one
+relation and one instance of each form. Those local refusals are an intentional
+consequence of recognizing both calls as roots; malformed or shadowed calls that
+the envelope does not recognize never enter either check.
 
 ## Analysis
 
 Replace the reverse walk with `None => break` (`rune_relation_envelope.rs:209-216`)
-with a forward pass classifying every top-level statement:
+with two passes over the top-level statement list. The first pass collects the
+complete set of top-level names that shadow `table` or `plot`; the second
+classifies every statement with that set already known. Collecting shadows first
+is required by the conservative whole-buffer rule: a later `let table = ...`
+must suppress an earlier `table(r)` candidate.
 
 | classification | example | effect |
 |---|---|---|
@@ -151,10 +159,10 @@ with a forward pass classifying every top-level statement:
 | everything else | `let v = table(r);` · `let r = workspace.table("t");` · `fn table(x) { x }` | retained in the remote program, in order |
 
 Position stops mattering: roots are collected wherever they appear and ordered by
-source position, preserving today's source-order sink contract. No statement
-acquires a new meaning, and no statement that reaches Toron today stops reaching
-it — only recognized roots are removed, and those were already removed when they
-appeared in a trailing block.
+source position, preserving today's source-order sink contract. Unrecognized
+statements are always retained. Recognized roots do change behavior when they
+appear outside today's trailing block: removing those formerly remote calls and
+making them local sinks is the position-independence this step implements.
 
 ### Relation identity
 
@@ -193,8 +201,9 @@ to the local Rune host (`gui/state.rs:512, 531`) exactly as today.
 `ExecutionEnvelope` is therefore **nonempty by construction** — it exists only
 with at least one root — which is what makes `EnvelopeSemantics::execution_count`
 meaningfully always one. An empty envelope is unrepresentable rather than merely
-untested, and the empty case is exercised through the real production transition
-instead of by hand-building an invalid value.
+untested: roots are stored as one required first root plus zero or more remaining
+roots, never as a bare possibly-empty vector. The empty case is exercised through
+the real production transition instead of by hand-building an invalid value.
 
 `ExecutionEnvelope` holds what rendering needs, including spans: the ordered
 spans of retained top-level statements, the span of the relation expression that
@@ -266,7 +275,10 @@ that no longer exists.
    suppresses `plot.bar` and `plot.scatter` recognition while an unshadowed
    `table(r)` in the same buffer is still a root, and the mirror case with
    `table` shadowed. Positive controls without the shadowing binding prove both
-   forms are otherwise recognized.
+   forms are otherwise recognized. A separate ordering fixture places
+   `let table = ...` after an earlier `table(r)` candidate while `plot.bar`
+   establishes the envelope, proving that shadow collection completes before
+   root classification begins.
 8. **View-named calls in binding position, in functions, in blocks, and in
    control flow** are retained and neither refused nor removed.
 9. **A top-level view-named call with wrong arity or non-literal fields is
@@ -291,9 +303,10 @@ that no longer exists.
 
 **Preserved behavior and containment.**
 
-13. `MixedRelations` and `DuplicateForm` (`:546`) keep their behavior under
-    origin-resolved identity, including two identical inline expressions at
-    different spans comparing as the same relation.
+13. `MixedRelations` and `DuplicateForm` (`:546`) keep their meaning under
+    origin-resolved identity and apply across an intervening retained statement.
+    Includes two identical inline expressions at different spans comparing as
+    the same relation.
 14. `diagnostic_fallback()` returns the relation span; an unmappable server error
     is reported against the relation, not against a view.
 15. The relation-verb assay, with its positive control. Shadow-awareness must not
@@ -304,8 +317,10 @@ that no longer exists.
 
 - No `.views(...)`, `.encode(...)`, `EncodedViewSet`, or any new spelling; today's
   `table` / `plot.bar` / `plot.scatter` grammar is preserved exactly.
-- **No new surface semantics and no new refusal.** No construct that reaches
-  Toron today stops reaching it, and none acquires a local meaning it lacked.
+- **No meaning or refusal for unrecognized calls.** Malformed, shadowed, nested,
+  and bound-position calls remain downstream work. Newly recognized roots do
+  acquire position-independent sink semantics and therefore participate in the
+  existing mixed-relation and duplicate-form refusals.
 - No local diagnostic for nested or malformed view-named calls; both wait on
   reserved names.
 - No relation typing, verb resolution, planning, or lowering in Polariton.
@@ -323,7 +338,7 @@ that no longer exists.
       with positive controls proving each form is otherwise recognized.
 - [ ] Both collision programs are proven untouched, including the direct-call one
       that `NoTerminalView` protects today.
-- [ ] No new refusal is introduced; the arity refusal is withdrawn with a
+- [ ] No unrecognized call is refused; the arity refusal is withdrawn with a
       citation rather than widened to new positions.
 - [ ] `ExecutionEnvelope` is nonempty by construction; the empty case runs
       through `OutputRootAnalysis::into_envelope` returning `None`.
@@ -335,5 +350,6 @@ that no longer exists.
       span.
 - [ ] Serialization tests remain narrow: wrapper, trailing expression without
       `;`, and source-map offsets over N segments.
-- [ ] Existing envelope, fan-out, and architecture tests pass unchanged.
+- [ ] The envelope, fan-out, and architecture suites pass; the named contiguity
+      and malformed-arity assertions are deliberately rewritten with citations.
 - [ ] Corpus rows are untouched; this step changes no status and no spelling.
