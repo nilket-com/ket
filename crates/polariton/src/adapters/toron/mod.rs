@@ -87,7 +87,7 @@ impl DatabaseAdapter for ToronAdapter {
 #[cfg(test)]
 mod tests {
 	use super::{DatabaseAdapter, ExecutionResult, ToronAdapter};
-	use crate::plot::common::{PlotRenderLayer, PlotSettings, PlotWidget};
+	use crate::plot::common::{PlotRenderLayer, PlotWidget, PlotSettings};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use crate::plot::export::SvgBackend;
@@ -102,52 +102,91 @@ mod tests {
 			.unwrap_or_else(|_| nilket_local::SQL_ENDPOINT.to_owned())
 	}
 
+	async fn dispatch_live_fixture(adapter: &mut ToronAdapter, sql: &str) -> ExecutionResult {
+		for attempt in 0..20 {
+			let result = adapter.dispatch(sql).await;
+			let exhausted = matches!(
+				&result,
+				ExecutionResult::Err(error) if error.contains("ResourceExhausted")
+			);
+			if !exhausted || attempt == 19 {
+				return result;
+			}
+			tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+		}
+		unreachable!("bounded live-fixture retry always returns")
+	}
+
 	#[tokio::test]
 	#[ignore = "requires a live Toron SQL endpoint"]
 	async fn live_toron_query_reaches_the_existing_plot_kernel() {
 		let mut adapter = ToronAdapter::connect(&live_endpoint())
 			.await
 			.expect("connect to Toron");
-		let ExecutionResult::Rows { frame, statements } = adapter
-			.dispatch("SELECT x, y FROM polariton_first_contact ORDER BY x")
+		let table = format!("polariton_live_plot_{}", std::process::id());
+		let _ = dispatch_live_fixture(&mut adapter, &format!("DROP TABLE IF EXISTS {table}")).await;
+		let outcome: Result<(), String> = async {
+			for statement in [
+				format!("CREATE TABLE {table} (x BIGINT, y BIGINT)"),
+				format!("INSERT INTO {table} VALUES (1, 2), (2, 4), (3, 8), (4, 16)"),
+			] {
+				if let ExecutionResult::Err(error) =
+					dispatch_live_fixture(&mut adapter, &statement).await
+				{
+					return Err(format!("self-seed failed: {error}"));
+				}
+			}
+			let ExecutionResult::Rows { frame, statements } = dispatch_live_fixture(
+				&mut adapter,
+				&format!("SELECT x, y FROM {table} ORDER BY x"),
+			)
 			.await
-		else {
-			panic!("Toron SELECT must return rows");
-		};
-		assert_eq!(statements, 1);
-		assert_eq!(frame.shape(), (4, 2));
+			else {
+				return Err("Toron SELECT did not return rows".to_owned());
+			};
+			if statements != 1 || frame.shape() != (4, 2) {
+				return Err(format!(
+					"self-seeded query returned statements={statements}, shape={:?}",
+					frame.shape()
+				));
+			}
 
-		let composition = PlotComposition::single(PlotType::Scatter);
-		let kernel = create_automatic_plot(composition, &frame, 800, 480).expect("resolved plot");
-		let widget = PlotWidget {
-			kernel: kernel.as_ref(),
-			title: "Toron first contact".to_owned(),
-			padding: 0.0,
-			settings: PlotSettings::default(),
-			render_revision: 0,
-			resize_render_suspended: false,
-			layer: PlotRenderLayer::Full,
-		};
-		let mut backend = SvgBackend::new(800.0, 480.0);
-		widget.render(
-			&mut backend,
-			Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
-		);
-		let svg = backend.finish();
-		assert!(
-			svg.contains("<path"),
-			"plot artifact contains drawn geometry"
-		);
-		assert!(
-			svg.len() > 1_000,
-			"plot artifact is substantively non-empty"
-		);
+			let composition = PlotComposition::single(PlotType::Scatter);
+			let kernel = create_automatic_plot(composition, &frame, 800, 480)?;
+			let widget = PlotWidget {
+				kernel: kernel.as_ref(),
+				title: "Toron SQL live gate".to_owned(),
+				padding: 0.0,
+				settings: PlotSettings::default(),
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: PlotRenderLayer::Full,
+			};
+			let mut backend = SvgBackend::new(800.0, 480.0);
+			widget.render(
+				&mut backend,
+				Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
+			);
+			let svg = backend.finish();
+			if !svg.contains("<path") || svg.len() <= 1_000 {
+				return Err("plot artifact was not substantively rendered".to_owned());
+			}
 
-		let output = std::env::var_os("TORON_FIRST_CONTACT_PLOT")
-			.map(PathBuf::from)
-			.unwrap_or_else(|| std::env::temp_dir().join("toron-first-contact.svg"));
-		std::fs::write(&output, svg).expect("write Toron plot artifact");
-		eprintln!("Toron first-contact plot: {}", output.display());
+			let output = std::env::var_os("TORON_FIRST_CONTACT_PLOT")
+				.map(PathBuf::from)
+				.unwrap_or_else(|| std::env::temp_dir().join("toron-first-contact.svg"));
+			std::fs::write(&output, svg)
+				.map_err(|error| format!("write Toron plot artifact: {error}"))?;
+			eprintln!("Toron first-contact plot: {}", output.display());
+			Ok(())
+		}
+		.await;
+		let cleanup =
+			dispatch_live_fixture(&mut adapter, &format!("DROP TABLE IF EXISTS {table}")).await;
+		if let ExecutionResult::Err(error) = cleanup {
+			panic!("fixture cleanup failed: {error}");
+		}
+		outcome.expect("self-contained Toron SQL live gate");
 	}
 
 	#[tokio::test]
