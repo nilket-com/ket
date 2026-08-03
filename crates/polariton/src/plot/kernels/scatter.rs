@@ -584,3 +584,127 @@ pub fn prepare_scatter_data(
 		total_points,
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use iced::Size;
+
+	fn bounds(width: f32, height: f32) -> Rectangle {
+		Rectangle::new(Point::ORIGIN, Size::new(width, height))
+	}
+
+	#[test]
+	fn automatic_render_mode_preserves_every_threshold_boundary() {
+		let settings = PlotSettings::default();
+		assert_eq!(settings.scatter_max_vector_points, 50_000);
+		assert_eq!(settings.scatter_downsample_target, 200_000);
+		assert_eq!(settings.scatter_raster_threshold, 1_000_000);
+
+		let viewport = bounds(100.0, 100.0);
+		assert_eq!(
+			resolve_render_mode(50_000, true, viewport, &settings),
+			ResolvedScatterRenderMode::Vector
+		);
+		assert_eq!(
+			resolve_render_mode(50_001, true, viewport, &settings),
+			ResolvedScatterRenderMode::Downsampled
+		);
+		assert_eq!(
+			resolve_render_mode(1_000_000, true, viewport, &settings),
+			ResolvedScatterRenderMode::Downsampled
+		);
+		assert_eq!(
+			resolve_render_mode(1_000_001, true, viewport, &settings),
+			ResolvedScatterRenderMode::Rasterized
+		);
+		assert_eq!(
+			resolve_render_mode(1_000_001, false, viewport, &settings),
+			ResolvedScatterRenderMode::Downsampled,
+			"raster threshold cannot override backend capability"
+		);
+
+		let mut density = settings;
+		density.scatter_max_vector_points = 0;
+		density.scatter_raster_threshold = 0;
+		let hundred_pixels = bounds(10.0, 10.0);
+		assert_eq!(
+			resolve_render_mode(800, true, hundred_pixels, &density),
+			ResolvedScatterRenderMode::Downsampled,
+			"eight points per pixel is still downsampled"
+		);
+		assert_eq!(
+			resolve_render_mode(801, true, hundred_pixels, &density),
+			ResolvedScatterRenderMode::Rasterized,
+			"rasterization begins strictly above eight points per pixel"
+		);
+	}
+
+	#[test]
+	fn explicit_render_modes_and_raster_fallback_ignore_auto_thresholds() {
+		let viewport = bounds(1.0, 1.0);
+		let mut settings = PlotSettings {
+			scatter_render_mode: ScatterRenderMode::Vector,
+			..PlotSettings::default()
+		};
+		assert_eq!(
+			resolve_render_mode(usize::MAX, true, viewport, &settings),
+			ResolvedScatterRenderMode::Vector
+		);
+
+		settings.scatter_render_mode = ScatterRenderMode::Downsampled;
+		assert_eq!(
+			resolve_render_mode(0, true, viewport, &settings),
+			ResolvedScatterRenderMode::Downsampled
+		);
+
+		settings.scatter_render_mode = ScatterRenderMode::Rasterized;
+		assert_eq!(
+			resolve_render_mode(0, true, viewport, &settings),
+			ResolvedScatterRenderMode::Rasterized
+		);
+		assert_eq!(
+			resolve_render_mode(0, false, viewport, &settings),
+			ResolvedScatterRenderMode::Downsampled
+		);
+	}
+
+	#[test]
+	fn downsample_grid_output_size_preserves_the_current_cell_budget() {
+		let viewport = bounds(4.0, 3.0);
+		let layout = PlotLayout::Cartesian {
+			x_range: (0.0, 4.0),
+			y_range: (0.0, 3.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+		};
+		let transform = CoordinateTransformer::new(&layout, viewport);
+		let mut xs = Vec::new();
+		let mut ys = Vec::new();
+		for row in 0..3 {
+			for column in 0..4 {
+				xs.push(column as f64 + 0.5);
+				ys.push(3.0 - (row as f64 + 0.5));
+			}
+		}
+		let series = ScatterSeries {
+			name: "grid".to_owned(),
+			x_values: Series::new("x".into(), xs).f64().unwrap().clone(),
+			y_values: Series::new("y".into(), ys).f64().unwrap().clone(),
+			color_t: 0.5,
+		};
+
+		let sampled = downsample_series(&series, viewport, &transform, 11);
+		assert_eq!(
+			sampled.len(),
+			12,
+			"the ceil-derived 4x3 grid currently permits one point beyond target 11"
+		);
+		let one = downsample_series(&series, viewport, &transform, 1);
+		assert_eq!(
+			one.len(),
+			2,
+			"the 4:3 aspect ratio currently expands target one to a 2x1 grid"
+		);
+	}
+}
