@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.10. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.11. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -26,20 +26,19 @@ a cited record).
 
 | family | status | evidence |
 |---|---|---|
-| bounded table view (`table(r)`, inherits the 128 MiB `toron-client` collection ceiling) | executable | `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance `live_rune_relation_reaches_table_bar_and_scatter_surfaces` |
-| bar sink (`plot.bar`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`) |
-| scatter sink (`plot.scatter`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`) |
-| shared-execution view fan-out (one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink holds the *same* `Arc`, not equivalent copies; live acceptance issues one `dispatch_rune` and consumes three ordered sinks (`71445df3`, `755e850a`) |
+| bounded table view (`table(r)`; accepted sugar `r.table()` and canonical `r.views([table()])`, inherits the 128 MiB `toron-client` collection ceiling) | executable | `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance `live_rune_relation_reaches_table_bar_and_scatter_surfaces`; PRODUCT-0008 sugar equivalence in `product_0008_single_view_sugars_are_exact_canonical_projections` (`d4c2d8a8`) |
+| bar sink (`plot.bar`; accepted sugar `r.bar(x, y)` and canonical `r.views([bar(x, y)])`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
+| scatter sink (`plot.scatter`; accepted sugar `r.scatter(x, y)` and canonical `r.views([scatter(x, y)])`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
+| shared-execution view fan-out (`r.views([...])`, one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink holds the *same* `Arc`, not equivalent copies; live acceptance issues one `dispatch_rune` and consumes three ordered sinks (`71445df3`, `755e850a`); direct/factored/legacy equivalence plus accepted-surface live axis identity (`d4c2d8a8`) |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
-## Proposed surface: view fan-out
+## Accepted surface: view fan-out
 
-Status: **proposed**. This section records a candidate spelling and the invariant
-that justifies it. No record accepts it, no implementation depends on it, and the
-executable and pending rows above continue to describe the surface that exists.
-If a later record accepts this surface, the view rows are respelled with that
-citation rather than silently migrated.
+Status: **accepted** by PRODUCT-0008 and executable in `d4c2d8a8`. The view rows
+carry the accepted spelling beside the original free-function spelling and retain
+every earlier evidence citation. This section remains the detailed invariant and
+recognition contract the implementation inherits.
 
 ### Load-bearing invariant
 
@@ -303,6 +302,15 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.11 (2026-08-03): PRODUCT-0008 accepts and implements `.views([...])` plus
+  its three strict single-view sugars. The four executable view rows gain the new
+  spelling and PRODUCT-0008 evidence without replacing any existing citation.
+  `EnvelopeSemantics` proves direct, factored, sugared, and legacy equivalence;
+  ordering is list-then-chain within a set and emission position across roots;
+  contextual constructors refuse atomically; and the live gate preserves axis
+  identity against the installed deployment (`d4c2d8a8`). The implementation
+  halt fired once on PRODUCT-0007's stale `.views(` prohibition and retired only
+  that superseded premise, preserving the `EncodedViewSet` and `SinkSpec` guards.
 - v0.10 (2026-08-03): added the respelling stop condition — the normative limit
   on what an accepting record may implement, and the halt rule if it needs more.
   Recorded because it is falsifiable mid-work rather than only at the end, and
