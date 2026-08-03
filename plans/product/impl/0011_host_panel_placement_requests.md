@@ -69,7 +69,11 @@ calling layout helpers directly:
 5. Close one host-panel tab and observe exactly its disposal while the sibling
    remains projected.
 
-## Stage 2: Polariton grouping policy
+## Stage 2: Polariton placement policy
+
+Amended 2026-08-03 after the shipped grouping policy proved wrong in use. See
+PRODUCT-0011 §4: Polariton infers no grouping, because nothing in a Rune buffer
+distinguishes a comparison from an alternative representation.
 
 All existing non-view panels translate mechanically:
 
@@ -78,23 +82,26 @@ All existing non-view panels translate mechanically:
 - test-only direct host panels keep the direction they currently exercise.
 
 `prepare_rune_view_panels` already receives views in PRODUCT-0010 presentation
-order and allocates identities before results arrive. Resolve the first identity
-as the collection anchor. For an unknown panel:
-
-- index zero requests `Split { Horizontal }`;
-- every later index requests `TabWith { panel_id: anchor }`.
+order and allocates identities before results arrive. Every unknown panel
+requests `Split { Horizontal }`. There is no collection anchor, and Polariton
+issues no `TabWith` request. Because the engine inserts each non-focusing split
+beside the still-focused source pane, first-appearance requests are emitted in
+reverse after identity allocation; the projected panes therefore retain
+presentation order rather than displaying it backwards.
 
 Known panels receive only `RefreshHostPanel`; reruns never relocate author-owned
-layout. A later new view may request the current first view as its anchor, while
-existing views remain wherever the author put them.
+layout, including panels the author has since combined into a tab stack by hand.
 
 ### Behavioral gate
 
 Drive `CodeEditor::prepare_rune_view_panels` with four named views. Through the
-real engine projection, assert one additional pane contains four tab summaries
-in source order and that the original document pane retains focus. Existing
-query-result and dashboard tests remain green and provide the regression gates
-for their unchanged split requests.
+real engine projection, assert four additional panes in source order, no tab
+stack, no `TabWith` request issued, and that the original document pane retains
+focus. Existing query-result and dashboard tests remain green and provide the
+regression gates for their unchanged split requests.
+
+`TabWith` keeps its Stage 1 protocol gates, which are now its only automated
+coverage: its production callers are the author and a future grouping signal.
 
 ## Permitted files
 

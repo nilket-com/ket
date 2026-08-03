@@ -35,12 +35,12 @@ shape or tab chrome changed.
    `closing_one_host_panel_tab_disposes_only_that_panel` closes the sibling by
    stable `view_id`, observes exactly its `PanelDisposed`, and observes the
    anchor tab and pane still live.
-6. **Polariton collection policy.**
-   `rune_view_collection_opens_one_split_with_ordered_host_tabs` drives four
+6. **Polariton placement policy.**
+   `rune_view_collection_opens_one_split_per_view_without_host_tabs` drives four
    semantic views through `CodeEditor::prepare_rune_view_panels` and the live
-   engine. The projection contains the original document pane plus one view
-   pane, four descriptor-titled tabs in PRODUCT-0010 presentation order, the
-   first tab active, and source focus retained. Existing
+   engine. The projection contains the original document pane plus four view
+   panes in PRODUCT-0010 presentation order, each with exactly one tab, and
+   retains source focus. Existing
    `opening_query_results_keeps_workspace_focus_in_the_source_pane` and
    `opening_dashboard_creates_and_focuses_its_host_panel` remain green with
    their original split directions.
@@ -58,11 +58,13 @@ neither pane focus nor its active tab. `focus: true` activates the requested
 panel's exact view before focusing its pane. Existing identities ignore all
 placement metadata, so reruns cannot relocate author-arranged panels.
 
-Polariton resolves the first view id before opening the collection. The first
-unknown panel requests its existing horizontal split; later unknown panels
-request `TabWith` the first. Known panels still issue only
-`RefreshHostPanel`. Query results and the dashboard mechanically retain their
-existing split requests.
+Polariton resolves every view id in presentation order before opening the
+panels. Every unknown panel requests its existing horizontal split; Polariton
+issues no `TabWith` request without an explicit grouping signal. Because each
+non-focusing split is inserted beside the still-focused source pane, first
+appearances are sent in reverse to keep the projected panes in presentation
+order. Known panels still issue only `RefreshHostPanel`. Query results and the
+dashboard mechanically retain their existing split requests.
 
 No Toron, transport, dashboard, plotting-language, projection-structure,
 persistence, or durable-identity file changed. The halt rule did not fire.
@@ -71,7 +73,7 @@ persistence, or durable-identity file changed. The halt rule did not fire.
 
 ```text
 cargo test -p libaryon
-1401 passed; 22 ignored; 13 architecture tests passed; quit-latency test passed
+1402 passed; 22 ignored; 13 architecture tests passed; quit-latency test passed
 
 cargo test -p polariton --features toron
 218 passed; 4 live-service tests ignored; 16 architecture tests passed

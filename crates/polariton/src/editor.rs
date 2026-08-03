@@ -819,15 +819,20 @@ impl CodeEditor {
 			self.panels.mark_orphaned(panel_id);
 		}
 
-		let anchor_panel_id = views
-			.first()
-			.map(|(identity, _)| self.resolve_rune_view_panel(producer, identity.clone()));
-		for (index, (identity, form)) in views.iter().enumerate() {
-			let panel_id = if index == 0 {
-				anchor_panel_id.expect("a non-empty view collection has an anchor")
-			} else {
-				self.resolve_rune_view_panel(producer, identity.clone())
-			};
+		let resolved = views
+			.iter()
+			.map(|(identity, form)| {
+				(
+					identity,
+					form,
+					self.resolve_rune_view_panel(producer, identity.clone()),
+				)
+			})
+			.collect::<Vec<_>>();
+		// A non-focusing split is inserted beside the still-focused source pane.
+		// Issue first appearances in reverse so the projected panes retain Rune's
+		// presentation order rather than displaying that order backwards.
+		for (identity, form, panel_id) in resolved.into_iter().rev() {
 			let known = self.panels.panels.contains_key(&panel_id)
 				&& !self.panels.pending_disposal.contains(&panel_id);
 			if known {
@@ -850,15 +855,8 @@ impl CodeEditor {
 					}
 					.to_owned(),
 					title,
-					placement: if index == 0 {
-						HostPanelPlacement::Split {
-							direction: SplitDirection::Horizontal,
-						}
-					} else {
-						HostPanelPlacement::TabWith {
-							panel_id: anchor_panel_id
-								.expect("later views share the collection anchor"),
-						}
+					placement: HostPanelPlacement::Split {
+						direction: SplitDirection::Horizontal,
 					},
 					focus: false,
 				});
@@ -5476,7 +5474,7 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn rune_view_collection_opens_one_split_with_ordered_host_tabs() {
+	fn rune_view_collection_opens_one_split_per_view_without_host_tabs() {
 		use crate::rune_relation_envelope::{LocalViewIdentity, RuneViewForm};
 		use libaryon::core::BufferId;
 
@@ -5511,12 +5509,11 @@ mod tests {
 		let expected = ["points", "first-data", "totals", "second-data"];
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor.viewport.as_ref().is_none_or(|viewport| {
-			!viewport.panes.iter().any(|pane| {
-				pane.tabs
-					.iter()
-					.map(|tab| tab.title.as_str())
-					.eq(expected.iter().copied())
-			})
+			viewport
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.count() < expected.len()
 		}) && Instant::now() < deadline
 		{
 			editor.poll();
@@ -5524,7 +5521,7 @@ mod tests {
 		}
 
 		let viewport = editor.viewport.as_ref().expect("view collection projected");
-		assert_eq!(viewport.panes.len(), 2, "four views require one new pane");
+		assert_eq!(viewport.panes.len(), 5, "four views require four new panes");
 		assert_eq!(
 			viewport
 				.focused_pane()
@@ -5532,23 +5529,22 @@ mod tests {
 				.pane_id,
 			source_pane
 		);
-		let collection = viewport
+		let view_panes = viewport
 			.panes
 			.iter()
-			.find(|pane| {
-				pane.tabs
-					.iter()
-					.map(|tab| tab.title.as_str())
-					.eq(expected.iter().copied())
-			})
-			.expect("ordered view tab collection");
-		assert_eq!(collection.active_doctab_index, 0);
+			.filter(|pane| pane.host_panel.is_some())
+			.collect::<Vec<_>>();
 		assert_eq!(
-			collection
-				.host_panel
-				.as_ref()
-				.map(|panel| panel.title.as_str()),
-			Some("points")
+			view_panes
+				.iter()
+				.filter_map(|pane| pane.host_panel.as_ref())
+				.map(|panel| panel.title.as_str())
+				.collect::<Vec<_>>(),
+			expected
+		);
+		assert!(
+			view_panes.iter().all(|pane| pane.tabs.len() == 1),
+			"independent views must not be hidden in inferred tab stacks"
 		);
 	}
 

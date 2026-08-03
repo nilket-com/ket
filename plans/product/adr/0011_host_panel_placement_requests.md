@@ -1,6 +1,8 @@
 # ADR 0011: host panel placement requests
 
-Status: accepted 2026-08-03. This record decides one thing: that a frontend may
+Status: accepted 2026-08-03; §4, gate 6, and the first consequence amended the
+same day after the shipped grouping policy proved wrong in use. This record
+decides one thing: that a frontend may
 *request* where a host panel first appears, and that the engine remains the
 authority on whether to honor the request. It is the libaryon protocol extension
 PRODUCT-0010 §9 halted on. It authorizes no layout persistence, no durable
@@ -81,15 +83,36 @@ pane; tab placement makes it observable and therefore part of the contract.
 This preserves the idempotent reopen that PRODUCT-0010's identity resolution
 depends on.
 
-### 4. Polariton groups a producer's views into one collection
+### 4. Polariton requests a pane per view and infers no grouping
 
-The first view of a buffer's run opens with `Split`. Every subsequent view of the
-same run opens with `TabWith` naming the first. Tab order follows PRODUCT-0010 §2's
-presentation order: output-root source position, then list order, then chain order.
+Every view of a run opens with `Split`. Polariton requests `TabWith` only on an
+explicit grouping signal, and no such signal exists today: nothing in a Rune
+buffer distinguishes views the author wants side by side from views that are
+alternative representations of one thing.
 
-This is a **frontend policy**, stated here because it is the observable behavior
-this record exists to produce, and it lives in Polariton rather than in libaryon.
-The engine learns that four panels are one group; it does not learn what a view is.
+The first version of this section grouped every view of a run into one tab stack.
+That was wrong, and the way it was wrong is worth keeping. It optimized a scaling
+worry — a buffer with a dozen views produces a dozen splits — at the cost of the
+case that motivated PRODUCT-0010 in the first place, two relations visible at
+once. Four views became four tabs, of which the author could see one.
+
+The asymmetry that settles the default: **splitting fails loudly and tabbing
+fails silently.** A cramped split is visibly cramped, and the author can see there
+is arranging to do. A view hidden behind a tab it never asked for is
+indistinguishable from a view that never rendered. A default that guesses wrong
+should leave evidence that it guessed.
+
+Grouping by relation origin fails the same way at smaller scale. A table and a
+plot over one relation are exactly as likely to be a comparison as an
+alternative, and the origin says nothing about which.
+
+`TabWith` therefore ships with two legitimate consumers and no automatic one: the
+author arranging panels by hand, and any future record that gives the language a
+grouping signal to act on. That is a real cost — a protocol capability whose
+production caller is a person rather than a code path — and it is smaller than
+the cost of guessing. Tab order, when a grouping signal does exist, still follows
+PRODUCT-0010 §2's presentation order: output-root source position, then list
+order, then chain order.
 
 `RESULT_PANEL` and `DASHBOARD_PANEL` keep their current placement. This record
 changes where *view* panels appear and nothing else.
@@ -129,6 +152,12 @@ two in section 1, and no expression of placement in Rune — PRODUCT-0010 §4 ke
 - **Auto-tabbing every host panel, including the result table:** changes behavior
   that is working and that no evidence complains about. Section 4 confines the
   change to view panels.
+- **Automatically tabbing a run's views together (this record's original §4,
+  reversed after it shipped):** treats every view of one run as an alternative
+  representation of one thing. No Rune buffer says that, and it is false for the
+  two-relation comparison that motivated PRODUCT-0010. It was reversed on first
+  contact with the dogfood buffer, which rendered four tabs where four panes had
+  been working.
 - **Waiting for layout persistence:** placement is observable in one session and
   provable now; persistence is a separate capability with a separate cost, and
   binding them would make a small protocol addition wait on an editor-wide
@@ -136,9 +165,10 @@ two in section 1, and no expression of placement in Rune — PRODUCT-0010 §4 ke
 
 ## Consequences and sequencing
 
-- A buffer with many views produces one pane holding a tab stack rather than N
-  splits, which is what makes a view collection usable and is the first half of
-  the addressable-tabs model.
+- A buffer's views each occupy their own pane, and the author combines them into
+  tabs when they are alternatives rather than comparisons. Bounding the split
+  count for buffers with many views waits for a grouping signal rather than a
+  guess, and is the open half of the addressable-tabs model.
 - `OpenHostPanel`'s signature changes, and its two existing call sites in
   Polariton move to `Split`, preserving today's behavior exactly.
 - Baryon inherits the capability without using it, since it opens no view panels.
@@ -165,6 +195,7 @@ two in section 1, and no expression of placement in Rune — PRODUCT-0010 §4 ke
    activates its exact tab without moving it.
 5. Closing one host-panel tab disposes only that panel and leaves its sibling
    tabs and pane live.
-6. Polariton's four-view dogfood shape produces one new pane with four tabs in
-   PRODUCT-0010 presentation order. `RESULT_PANEL` and `DASHBOARD_PANEL` still
-   request their existing splits.
+6. Polariton's four-view dogfood shape produces four panes, one per view, in
+   PRODUCT-0010 presentation order, with no tab stack and no `TabWith` request
+   issued. `RESULT_PANEL` and `DASHBOARD_PANEL` still request their existing
+   splits.
