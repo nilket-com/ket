@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.11. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.12. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -30,8 +30,40 @@ a cited record).
 | bar sink (`plot.bar`; accepted sugar `r.bar(x, y)` and canonical `r.views([bar(x, y)])`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | scatter sink (`plot.scatter`; accepted sugar `r.scatter(x, y)` and canonical `r.views([scatter(x, y)])`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | shared-execution view fan-out (`r.views([...])`, one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink holds the *same* `Arc`, not equivalent copies; live acceptance issues one `dispatch_rune` and consumes three ordered sinks (`71445df3`, `755e850a`); direct/factored/legacy equivalence plus accepted-surface live axis identity (`d4c2d8a8`) |
+| multi-origin view program (one execution per canonical relation origin) | executable | `multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity` proves canonical-origin deduplication and independent dispatch; `execution_grouping_cannot_reorder_interleaved_host_panels` completes origins out of order without changing presentation (`b99338f8`, `cad42680`) |
+| optional view identity (`view("name", sink)` or anonymous positional identity) | executable | session-scoped: duplicate names refuse with both spans; names retain one host-panel id across reruns and form changes; anonymous views reuse their presentation slot; durable restart identity remains deferred by PRODUCT-0010's recorded protocol halt (`284e88e0`, `cad42680`) |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
+
+## Accepted extension: multi-origin views and view identity
+
+Status: **accepted** by PRODUCT-0010 and executable in `284e88e0`, `b99338f8`,
+and `cad42680`. PRODUCT-0008's one-relation `ViewSet` remains the unit of shared
+execution. PRODUCT-0010 wraps several such units in one buffer program:
+
+```text
+BufferViewProgram {
+    executions:         canonical origin -> ordered sinks,
+    presentation_order: ordered view identities,
+}
+
+LocalViewIdentity = Named(name) | Anonymous(presentation_position)
+```
+
+Canonical origin identity is textual after the existing binding resolution and
+`ket.` → `workspace.` fold. Equal origins execute once and every sink in that
+execution shares one stamped `Arc`; distinct origins execute independently and
+may complete in any order. Execution grouping cannot change the global
+PRODUCT-0008 presentation order.
+
+`view("name", sink)` is an identity wrapper recognized only inside a proven
+`.views([...])` list, not a fourth sink. Names are unique per buffer and buy a
+stable session address; anonymous views remain freely repeatable and use global
+presentation position. Polariton realizes both as ordinary host panels, so two
+tables and two plots from the dogfood buffer have four destinations and no view
+completion opens or mutates the dashboard. The current key uses `BufferId` and
+therefore survives reruns, not application restarts; durable document identity
+and restored layouts require a future libaryon record.
 
 ## Accepted surface: view fan-out
 
@@ -145,11 +177,10 @@ Every surface operation appends to that list. Nesting never enters the
 representation, so list order followed by chain order **is** execution order by
 construction rather than by a rule someone has to maintain.
 
-This is already the shape step 1 compares. `EnvelopeSemantics`
-(`../impl/0003_typed_output_root_discovery.md`) is a resolved relation origin
-plus ordered, unspanned sink intents — the same normal form. The existing
-equivalence and ordering proofs therefore judge this surface without
-modification, which is what makes step 3 reviewable as lowering alone.
+This remains the per-origin shape. PRODUCT-0010's `BufferViewProgram` groups
+these sets by canonical relation origin and separately carries global
+presentation order. The separation preserves this local fan-out algebra while
+preventing execution grouping from becoming visible in the UI.
 
 ### Form hierarchy
 
@@ -302,6 +333,16 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.12 (2026-08-03): PRODUCT-0010 makes multi-origin view programs and optional
+  view identity executable. Canonically equal origins retain one dispatch and
+  shared `Arc`; distinct origins dispatch and fail independently; global
+  presentation order survives reverse completion. `view("name", sink)` provides
+  a session-stable address, anonymous forms are freely repeatable positional
+  views, and `DuplicateForm` is retired. Tables and plots now populate ordinary
+  host panels with stale/orphan lifecycle markers, including the two-table
+  `test5.rn` fixture, without opening or mutating the dashboard (`284e88e0`,
+  `b99338f8`, `cad42680`). Durable identity across restarts remains pending on a
+  future libaryon document-identity and layout-persistence record.
 - v0.11 (2026-08-03): PRODUCT-0008 accepts and implements `.views([...])` plus
   its three strict single-view sugars. The four executable view rows gain the new
   spelling and PRODUCT-0008 evidence without replacing any existing citation.
