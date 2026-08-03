@@ -6,6 +6,7 @@ StartLimitBurst=5
 [Service]
 Type=exec
 ExecStart=@NILKET_EXECUTABLE@ local --data-dir @PROFILE_ROOT@
+LimitNOFILE=524288
 Restart=on-failure
 RestartSec=5s
 

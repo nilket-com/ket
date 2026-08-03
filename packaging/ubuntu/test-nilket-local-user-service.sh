@@ -28,6 +28,7 @@ for directive in \
 	"StartLimitIntervalSec=60s" \
 	"StartLimitBurst=5" \
 	"Type=exec" \
+	"LimitNOFILE=524288" \
 	"Restart=on-failure" \
 	"KillSignal=SIGINT" \
 	"KillMode=mixed" \
