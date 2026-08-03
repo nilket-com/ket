@@ -34,8 +34,29 @@ pub struct PlotRequest {
 #[derive(Clone, Debug)]
 pub struct ResolvedPlot {
 	pub source_name: String,
+	#[allow(dead_code)] // Retained for session durability; no surface is accepted yet.
+	pub authored_spec: Box<AuthoredPlotSpec>,
 	pub data: Arc<DataFrame>,
 	pub resolved_spec: ResolvedPlotSpec,
+}
+
+#[allow(dead_code)] // Conversion is exposed before the gated durable-plot surface.
+impl ResolvedPlot {
+	pub fn into_live_artifact(self) -> Result<crate::plot::durable::DurablePlot, String> {
+		let result = StampedResult {
+			data: self.data,
+			provenance: self.resolved_spec.provenance.clone(),
+		};
+		crate::plot::durable::DurablePlot::live(*self.authored_spec, result)
+	}
+
+	pub fn into_pinned_artifact(self) -> Result<crate::plot::durable::DurablePlot, String> {
+		let result = StampedResult {
+			data: self.data,
+			provenance: self.resolved_spec.provenance.clone(),
+		};
+		crate::plot::durable::DurablePlot::pinned(*self.authored_spec, self.resolved_spec, result)
+	}
 }
 
 /// Resolve a request into a render-ready plot.
@@ -61,6 +82,7 @@ pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 			let data = project_named_channels(&request.authored_spec, data, &name)?;
 			Ok(ResolvedPlot {
 				source_name: name,
+				authored_spec: Box::new(request.authored_spec),
 				data,
 				resolved_spec,
 			})

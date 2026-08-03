@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use crate::plot::kernels::line::{LinePlotKernel, LinePreparedData};
 use crate::plot::kernels::scatter::{ScatterPlotKernel, ScatterPreparedData};
@@ -44,7 +44,7 @@ impl ScatterLinePlotKernel {
 }
 
 impl PlotKernel for ScatterLinePlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.x_range.0),
@@ -65,7 +65,7 @@ impl PlotKernel for ScatterLinePlotKernel {
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		self.scatter
 			.plot(backend, bounds, transform, cursor, settings.clone());
@@ -76,7 +76,7 @@ impl PlotKernel for ScatterLinePlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		self.scatter.draw_legend(backend, bounds, settings);
 	}

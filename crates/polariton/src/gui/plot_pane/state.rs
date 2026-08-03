@@ -1,8 +1,10 @@
 use super::message::PlotPaneMsg;
 use crate::plot::colors;
-use crate::plot::common::{PlotKernel, PlotSettings};
+use crate::plot::common::{PlotKernel, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
+use crate::plot::spec::Override;
+use crate::plot::theme::{PlotSettings, PlotThemeSpec};
 use iced::{Rectangle, Size};
 use std::sync::Arc;
 
@@ -11,7 +13,7 @@ pub struct PlotPaneState {
 	pub hovered_info: Option<String>,
 	pub composition: PlotComposition,
 	pub kernel_composition: PlotComposition,
-	pub plot_settings: PlotSettings,
+	pub plot_settings: ResolvedPlotSettings,
 	pub live_updates_enabled: bool,
 	pub resize_render_suspended: bool,
 	pub render_revision: u64,
@@ -67,7 +69,9 @@ impl PlotPaneState {
 		width: u32,
 		height: u32,
 	) -> Self {
-		let plot_settings = PlotSettings::default();
+		let mut settings = PlotSettings::default();
+		settings.application_theme.theme = Override::Set(PlotThemeSpec::default());
+		let plot_settings = settings.resolve();
 		Self {
 			kernel,
 			hovered_info: None,

@@ -217,7 +217,9 @@ impl DashboardState {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::plot::common::{CoordinateTransformer, PlotBackend, PlotLayout, PlotSettings};
+	use crate::plot::common::{
+		CoordinateTransformer, PlotBackend, PlotLayout, ResolvedPlotSettings,
+	};
 	use crate::plot::core::PlotType;
 	use iced::Rectangle;
 	use iced::advanced::mouse::Cursor;
@@ -225,7 +227,7 @@ mod tests {
 	struct TestKernel;
 
 	impl PlotKernel for TestKernel {
-		fn layout(&self, _settings: PlotSettings) -> PlotLayout {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 			PlotLayout::Radial
 		}
 
@@ -235,7 +237,7 @@ mod tests {
 			_bounds: Rectangle,
 			_transform: &CoordinateTransformer,
 			_cursor: Cursor,
-			_settings: PlotSettings,
+			_settings: ResolvedPlotSettings,
 		) {
 		}
 

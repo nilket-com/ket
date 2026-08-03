@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style, Text};
@@ -20,7 +20,7 @@ pub struct FunnelPreparedData {
 }
 
 impl PlotKernel for FunnelPlotKernel {
-	fn layout(&self, _settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Radial
 	}
 
@@ -30,7 +30,7 @@ impl PlotKernel for FunnelPlotKernel {
 		bounds: Rectangle,
 		_transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_stages = self.prepared_data.stages.len();
 		if num_stages == 0 {
@@ -90,7 +90,7 @@ impl PlotKernel for FunnelPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.stages.len();
 		if num_cats == 0 {

@@ -219,7 +219,7 @@ impl std::fmt::Display for GridLineStyle {
 }
 
 #[derive(Debug, Clone)]
-pub struct PlotSettings {
+pub struct ResolvedPlotSettings {
 	pub max_legend_rows: u32,
 	pub legend_x: f32,
 	pub legend_y: f32,
@@ -275,7 +275,7 @@ pub struct PlotSettings {
 	pub scatter_raster_threshold: u32,
 }
 
-impl Default for PlotSettings {
+impl Default for ResolvedPlotSettings {
 	fn default() -> Self {
 		Self {
 			max_legend_rows: 10,
@@ -488,7 +488,7 @@ impl<'a> PlotBackend for IcedBackend<'a> {
 }
 
 pub trait PlotKernel: Send + Sync {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout;
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout;
 
 	fn plot(
 		&self,
@@ -496,14 +496,14 @@ pub trait PlotKernel: Send + Sync {
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	);
 
 	fn draw_legend(
 		&self,
 		_backend: &mut dyn PlotBackend,
 		_bounds: Rectangle,
-		_settings: PlotSettings,
+		_settings: ResolvedPlotSettings,
 	) {
 	}
 
@@ -522,7 +522,7 @@ pub struct PlotWidget<'a> {
 	pub kernel: &'a dyn PlotKernel,
 	pub title: String,
 	pub padding: f32,
-	pub settings: PlotSettings,
+	pub settings: ResolvedPlotSettings,
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
 	pub layer: PlotRenderLayer,

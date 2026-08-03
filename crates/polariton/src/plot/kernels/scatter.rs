@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	ScatterRenderMode, format_label, polars_type_to_axis_type,
 };
 use crate::plot::spec::{
@@ -43,7 +43,7 @@ struct ScatterRasterKey {
 }
 
 impl PlotKernel for ScatterPlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		if let Some(categories) = &self.prepared_data.x_categories {
 			return PlotLayout::CategoricalX {
 				categories: categories.clone(),
@@ -73,7 +73,7 @@ impl PlotKernel for ScatterPlotKernel {
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let mode = resolve_render_mode(
 			self.prepared_data.total_points,
@@ -96,7 +96,7 @@ impl PlotKernel for ScatterPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_series = self.prepared_data.series.len();
 		if num_series == 0 {
@@ -182,7 +182,7 @@ impl ScatterPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		transform: &CoordinateTransformer,
-		settings: &PlotSettings,
+		settings: &ResolvedPlotSettings,
 	) {
 		for series in &self.prepared_data.series {
 			let color = series
@@ -205,7 +205,7 @@ impl ScatterPlotKernel {
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
-		settings: &PlotSettings,
+		settings: &ResolvedPlotSettings,
 	) {
 		let series_count = self.prepared_data.series.len().max(1);
 		let per_series_target = (settings.scatter_downsample_target.max(1) as usize)
@@ -231,7 +231,7 @@ impl ScatterPlotKernel {
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
-		settings: &PlotSettings,
+		settings: &ResolvedPlotSettings,
 	) {
 		let raster = self.rasterize(bounds, transform, settings);
 		let size = iced::Size::new(bounds.width.max(1.0), bounds.height.max(1.0));
@@ -252,7 +252,7 @@ impl ScatterPlotKernel {
 		&self,
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
-		settings: &PlotSettings,
+		settings: &ResolvedPlotSettings,
 	) -> ScatterRasterCache {
 		let width = bounds.width.max(1.0).ceil() as u32;
 		let height = bounds.height.max(1.0).ceil() as u32;
@@ -373,7 +373,7 @@ fn color_to_rgba8(color: Color) -> [u8; 4] {
 	]
 }
 
-fn series_color(series: &ScatterSeries, settings: &PlotSettings) -> Color {
+fn series_color(series: &ScatterSeries, settings: &ResolvedPlotSettings) -> Color {
 	series
 		.resolved_color
 		.unwrap_or_else(|| settings.color_theme.get_color(series.color_t))
@@ -383,7 +383,7 @@ fn build_raster_rgba(
 	prepared_data: &ScatterPreparedData,
 	bounds: Rectangle,
 	transform: &CoordinateTransformer,
-	settings: &PlotSettings,
+	settings: &ResolvedPlotSettings,
 ) -> Vec<u8> {
 	let width = bounds.width.max(1.0).ceil() as usize;
 	let height = bounds.height.max(1.0).ceil() as usize;
@@ -439,7 +439,7 @@ fn resolve_render_mode(
 	total_points: usize,
 	supports_embedded_raster: bool,
 	bounds: Rectangle,
-	settings: &PlotSettings,
+	settings: &ResolvedPlotSettings,
 ) -> ResolvedScatterRenderMode {
 	match settings.scatter_render_mode {
 		ScatterRenderMode::Vector => ResolvedScatterRenderMode::Vector,
@@ -826,7 +826,7 @@ mod tests {
 		);
 		let kernel = ScatterPlotKernel::new(Arc::new(prepared));
 		assert!(matches!(
-			kernel.layout(PlotSettings::default()),
+			kernel.layout(ResolvedPlotSettings::default()),
 			PlotLayout::CategoricalX { categories, .. } if categories == ["a", "b", "c"]
 		));
 	}
@@ -865,7 +865,7 @@ mod tests {
 
 	#[test]
 	fn automatic_render_mode_preserves_every_threshold_boundary() {
-		let settings = PlotSettings::default();
+		let settings = ResolvedPlotSettings::default();
 		assert_eq!(settings.scatter_max_vector_points, 50_000);
 		assert_eq!(settings.scatter_downsample_target, 200_000);
 		assert_eq!(settings.scatter_raster_threshold, 1_000_000);
@@ -912,9 +912,9 @@ mod tests {
 	#[test]
 	fn explicit_render_modes_and_raster_fallback_ignore_auto_thresholds() {
 		let viewport = bounds(1.0, 1.0);
-		let mut settings = PlotSettings {
+		let mut settings = ResolvedPlotSettings {
 			scatter_render_mode: ScatterRenderMode::Vector,
-			..PlotSettings::default()
+			..ResolvedPlotSettings::default()
 		};
 		assert_eq!(
 			resolve_render_mode(usize::MAX, true, viewport, &settings),

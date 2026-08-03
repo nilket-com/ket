@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
@@ -13,7 +13,7 @@ pub struct CandlestickPlotKernel {
 }
 
 impl PlotKernel for CandlestickPlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
@@ -34,7 +34,7 @@ impl PlotKernel for CandlestickPlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let n = self.prepared_data.x.len();
 		if n == 0 {

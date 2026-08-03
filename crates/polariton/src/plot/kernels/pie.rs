@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -12,7 +12,7 @@ pub struct PiePlotKernel {
 }
 
 impl PlotKernel for PiePlotKernel {
-	fn layout(&self, _settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Radial
 	}
 
@@ -22,7 +22,7 @@ impl PlotKernel for PiePlotKernel {
 		bounds: Rectangle,
 		_transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let center = bounds.center();
 		let radius = bounds.width.min(bounds.height) / 2.0 * 0.8;
@@ -66,7 +66,7 @@ impl PlotKernel for PiePlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_categories = self.prepared_data.categories.len();
 		if num_categories == 0 {

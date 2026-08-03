@@ -1,6 +1,6 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
-	PlotSettings, format_label, polars_type_to_axis_type,
+	ResolvedPlotSettings, format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -14,7 +14,7 @@ pub struct StackedAreaPlotKernel {
 }
 
 impl PlotKernel for StackedAreaPlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
@@ -35,7 +35,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.categories.len();
 		let num_xs = self.prepared_data.unique_xs.len();
@@ -136,7 +136,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.categories.len();
 		if num_cats == 0 {

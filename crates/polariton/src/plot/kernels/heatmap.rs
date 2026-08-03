@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -12,7 +12,7 @@ pub struct HeatmapPlotKernel {
 }
 
 impl PlotKernel for HeatmapPlotKernel {
-	fn layout(&self, _settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalXY {
 			x_categories: self.prepared_data.x_categories.clone(),
 			y_categories: self.prepared_data.y_categories.clone(),
@@ -25,7 +25,7 @@ impl PlotKernel for HeatmapPlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_x = self.prepared_data.x_categories.len();
 		let num_y = self.prepared_data.y_categories.len();
@@ -90,7 +90,7 @@ impl PlotKernel for HeatmapPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let max_val = self.prepared_data.max_val;
 		let legend_width = 60.0;

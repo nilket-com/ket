@@ -363,3 +363,102 @@ fn product_0007_rendering_consumes_resolved_fields_without_inference() {
 		"positive control: PRODUCT-0007 rendering guard must fire"
 	);
 }
+
+#[test]
+fn product_0007_stage_three_stays_session_scoped_and_keeps_ui_out_of_data_color() {
+	let plot = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plot");
+	let durable = std::fs::read_to_string(plot.join("durable.rs")).expect("read durable plots");
+	let durable_production = durable
+		.split("#[cfg(test)]")
+		.next()
+		.expect("durable production source");
+	for forbidden in [
+		"std::fs",
+		"serde",
+		"toml",
+		"workspace artifact",
+		"toron_client",
+		"RuneView",
+	] {
+		assert!(
+			!durable_production.contains(forbidden),
+			"PRODUCT-0007 session durability acquired persistence or execution authority: {forbidden}"
+		);
+	}
+	for required in [
+		"DurabilityMode::Live",
+		"DurabilityMode::Pinned",
+		"ResolvedLayout::from_spec",
+		"RevisionObservation::Unavailable",
+		"RevisionObservation::Unverifiable",
+	] {
+		assert!(
+			durable_production.contains(required),
+			"PRODUCT-0007 durability lost required evidence: {required}"
+		);
+	}
+
+	let theme = std::fs::read_to_string(plot.join("theme.rs")).expect("read plot theme");
+	let common = std::fs::read_to_string(plot.join("common.rs")).expect("read renderer settings");
+	assert!(theme.contains("pub struct PlotSettings {"));
+	assert!(common.contains("pub struct ResolvedPlotSettings {"));
+	assert!(
+		!common.contains("pub struct PlotSettings {"),
+		"the flattened renderer value must not masquerade as the five-layer settings model"
+	);
+	let bridge = theme
+		.split("pub fn chrome_from_ui_palette")
+		.nth(1)
+		.and_then(|tail| tail.split("#[derive").next())
+		.expect("isolated UI palette bridge");
+	for role in ["background", "axis", "gridline", "label"] {
+		assert!(bridge.contains(role), "plot chrome bridge lost {role}");
+	}
+	for forbidden in [
+		"categorical_ramp",
+		"sequential_ramp",
+		"diverging_ramp",
+		"status_ramp",
+	] {
+		assert!(
+			!bridge.contains(forbidden),
+			"UiPalette crossed into data-encoding color through {forbidden}"
+		);
+	}
+	let layer_order = [
+		"library_defaults",
+		"application_theme",
+		"authored_spec",
+		"layer",
+		"pane_override",
+	];
+	let mut cursor = 0;
+	for layer in layer_order {
+		let offset = theme[cursor..]
+			.find(layer)
+			.unwrap_or_else(|| panic!("missing PRODUCT-0007 cascade layer {layer}"));
+		cursor += offset + layer.len();
+	}
+
+	assert!(
+		"let bytes = serde::to_vec(&plot); std::fs::write(path, bytes);".contains("std::fs"),
+		"positive control: session-scope guard must recognize persistence"
+	);
+	assert!(
+		"fn bridge(p: UiPalette) { categorical_ramp = p.accent; }".contains("categorical_ramp"),
+		"positive control: data-color bridge guard must recognize a ramp"
+	);
+
+	let rune_surface = ["rune_host.rs", "rune_relation_envelope.rs"]
+		.into_iter()
+		.map(|name| {
+			std::fs::read_to_string(plot.parent().unwrap().join(name)).expect("read Rune surface")
+		})
+		.collect::<String>();
+	for unaccepted in ["EncodedViewSet", "SinkSpec", ".views("] {
+		assert!(
+			!rune_surface.contains(unaccepted),
+			"PRODUCT-0007 lowered an unaccepted Rune spelling: {unaccepted}"
+		);
+	}
+}

@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
@@ -12,7 +12,7 @@ pub struct HistogramPlotKernel {
 }
 
 impl PlotKernel for HistogramPlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
@@ -33,7 +33,7 @@ impl PlotKernel for HistogramPlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_bins = self.prepared_data.bin_counts.len();
 		let (x_min, x_max) = self.prepared_data.x_range;
@@ -78,7 +78,7 @@ impl PlotKernel for HistogramPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let max_count = self.prepared_data.max_count;
 		let legend_width = 60.0;

@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::Text;
@@ -22,7 +22,7 @@ fn category_label(value: AnyValue<'_>) -> String {
 }
 
 impl PlotKernel for StackedBarPlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		match self.orientation {
 			Orientation::Vertical => PlotLayout::CategoricalX {
 				categories: self.prepared_data.categories.clone(),
@@ -47,7 +47,7 @@ impl PlotKernel for StackedBarPlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.categories.len();
 		let num_groups = self.prepared_data.group_names.len();
@@ -224,7 +224,7 @@ impl PlotKernel for StackedBarPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_groups = self.prepared_data.group_names.len();
 		if num_groups == 0 {

@@ -87,7 +87,7 @@ impl DatabaseAdapter for ToronAdapter {
 #[cfg(test)]
 mod tests {
 	use super::{DatabaseAdapter, ExecutionResult, ToronAdapter};
-	use crate::plot::common::{PlotRenderLayer, PlotWidget, PlotSettings};
+	use crate::plot::common::{PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use crate::plot::export::SvgBackend;
@@ -157,7 +157,7 @@ mod tests {
 				kernel: kernel.as_ref(),
 				title: "Toron SQL live gate".to_owned(),
 				padding: 0.0,
-				settings: PlotSettings::default(),
+				settings: ResolvedPlotSettings::default(),
 				render_revision: 0,
 				resize_render_suspended: false,
 				layer: PlotRenderLayer::Full,
@@ -228,7 +228,7 @@ mod tests {
 						kernel: kernel.as_ref(),
 						title: "Rune relation first contact".to_owned(),
 						padding: 0.0,
-						settings: PlotSettings::default(),
+						settings: ResolvedPlotSettings::default(),
 						render_revision: 0,
 						resize_render_suspended: false,
 						layer: PlotRenderLayer::Full,

@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label, polars_type_to_axis_type,
 };
 use iced::Rectangle;
@@ -13,7 +13,7 @@ pub struct LinePlotKernel {
 }
 
 impl PlotKernel for LinePlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
@@ -34,7 +34,7 @@ impl PlotKernel for LinePlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		for series in &self.prepared_data.series {
 			let color = settings.color_theme.get_color(series.color_t);
@@ -76,7 +76,7 @@ impl PlotKernel for LinePlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_series = self.prepared_data.series.len();
 		if num_series == 0 {

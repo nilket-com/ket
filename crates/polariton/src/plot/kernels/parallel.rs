@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -12,7 +12,7 @@ pub struct ParallelPlotKernel {
 }
 
 impl PlotKernel for ParallelPlotKernel {
-	fn layout(&self, _settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Parallel {
 			dimensions: self.prepared_data.dimensions.clone(),
 			ranges: self.prepared_data.ranges.clone(),
@@ -25,7 +25,7 @@ impl PlotKernel for ParallelPlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_dims = self.prepared_data.dimensions.len();
 		if num_dims < 2 {
@@ -64,7 +64,7 @@ impl PlotKernel for ParallelPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.category_names.len();
 		if num_cats == 0 {

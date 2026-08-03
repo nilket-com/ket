@@ -1,6 +1,6 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
-	PlotSettings, format_label,
+	ResolvedPlotSettings, format_label,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -13,7 +13,7 @@ pub struct RadarPlotKernel {
 }
 
 impl PlotKernel for RadarPlotKernel {
-	fn layout(&self, _settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Radial
 	}
 
@@ -23,7 +23,7 @@ impl PlotKernel for RadarPlotKernel {
 		bounds: Rectangle,
 		_transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_dims = self.prepared_data.dimensions.len();
 		if num_dims < 3 {
@@ -170,7 +170,7 @@ impl PlotKernel for RadarPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.category_names.len();
 		if num_cats == 0 {

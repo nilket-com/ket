@@ -9,7 +9,7 @@ use crate::gui::{
 	dashboard::{self, DashboardMsg, DashboardState},
 	table::{Table, TableScroll},
 };
-use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotSettings, PlotWidget};
+use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
 use iced::keyboard::{self, Key};
 use iced::mouse;
@@ -377,7 +377,7 @@ enum NotebookCellOutput {
 struct NotebookPlotSurface {
 	composition: PlotComposition,
 	kernel: Arc<dyn PlotKernel + Send + Sync>,
-	settings: PlotSettings,
+	settings: ResolvedPlotSettings,
 	hovered_info: Option<String>,
 	render_revision: u64,
 }
@@ -387,7 +387,7 @@ impl NotebookPlotSurface {
 		Self {
 			composition,
 			kernel,
-			settings: PlotSettings::default(),
+			settings: ResolvedPlotSettings::default(),
 			hovered_info: None,
 			render_revision: 0,
 		}

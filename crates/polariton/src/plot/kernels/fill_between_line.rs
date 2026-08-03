@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use crate::plot::kernels::fill_between::{FillBetweenPlotKernel, FillBetweenPreparedData};
 use crate::plot::kernels::line::{LinePlotKernel, LinePreparedData};
@@ -49,7 +49,7 @@ impl FillBetweenLinePlotKernel {
 }
 
 impl PlotKernel for FillBetweenLinePlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.x_range.0),
@@ -70,7 +70,7 @@ impl PlotKernel for FillBetweenLinePlotKernel {
 		bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		self.fill_between
 			.plot(backend, bounds, transform, cursor, settings.clone());

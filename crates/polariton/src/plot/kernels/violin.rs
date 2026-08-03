@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -12,7 +12,7 @@ pub struct ViolinPlotKernel {
 }
 
 impl PlotKernel for ViolinPlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalX {
 			categories: self.prepared_data.categories.clone(),
 			y_range: (
@@ -28,7 +28,7 @@ impl PlotKernel for ViolinPlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_violins = self.prepared_data.categories.len();
 		let tex_height_bins = self.prepared_data.tex_height_bins;
@@ -138,7 +138,7 @@ impl PlotKernel for ViolinPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.categories.len();
 		if num_cats == 0 {

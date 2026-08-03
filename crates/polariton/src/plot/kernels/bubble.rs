@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
@@ -35,7 +35,7 @@ pub struct BubblePoint {
 }
 
 impl PlotKernel for BubblePlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
@@ -56,7 +56,7 @@ impl PlotKernel for BubblePlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let color_min = self.prepared_data.color_range.0;
 		let color_max = self.prepared_data.color_range.1;
@@ -93,7 +93,7 @@ impl PlotKernel for BubblePlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let color_min = self.prepared_data.color_range.0;
 		let color_max = self.prepared_data.color_range.1;

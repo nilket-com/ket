@@ -1,5 +1,5 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, PlotSettings,
+	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
@@ -13,7 +13,7 @@ pub struct BoxPlotKernel {
 }
 
 impl PlotKernel for BoxPlotKernel {
-	fn layout(&self, settings: PlotSettings) -> PlotLayout {
+	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalX {
 			categories: self.prepared_data.categories.clone(),
 			y_range: (
@@ -29,7 +29,7 @@ impl PlotKernel for BoxPlotKernel {
 		_bounds: Rectangle,
 		transform: &CoordinateTransformer,
 		_cursor: Cursor,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.categories.len();
 		for (i, stats) in self.prepared_data.stats.iter().enumerate() {
@@ -150,7 +150,7 @@ impl PlotKernel for BoxPlotKernel {
 		&self,
 		backend: &mut dyn PlotBackend,
 		bounds: Rectangle,
-		settings: PlotSettings,
+		settings: ResolvedPlotSettings,
 	) {
 		let num_cats = self.prepared_data.categories.len();
 		if num_cats == 0 {
