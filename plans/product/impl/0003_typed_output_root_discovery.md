@@ -7,8 +7,9 @@ three-step sequence recorded in `../corpus/rune_workspace_corpus.md` v0.5: it
 establishes the semantic boundary so that `.views(...)` and `.encode(...)` can
 later be lowering rules over a sound analysis rather than parser tricks.
 
-No new surface syntax, no new surface semantics, no wire change, no Toron
-change. Deliverable is one `impl:` commit.
+The step changes **where the envelope looks** and **nothing any program means**.
+It introduces no new surface syntax, no new surface semantics, and no new
+refusal. No wire change, no Toron change. Deliverable is one `impl:` commit.
 
 ## What "typed" means here, and what it must not become
 
@@ -38,36 +39,59 @@ control, and cites PRODUCT-0003 on failure. The existing containment test
 (`tests/architecture_test.rs:45`) keeps the whole analysis inside
 `rune_relation_envelope.rs`.
 
-### The limit this places on refusals
+## Recognition is total, and unrecognized means retained
 
 Callee recognition remains a raw source-text comparison (`:315-317`). The
-analysis cannot tell a view call from a user-defined function of the same name.
-That is tolerable where the envelope has already claimed a buffer, and dangerous
-anywhere else, because a plain Rune program that defines its own `table` must
-keep running on the local host (`gui/state.rs:512, 531`).
+analysis cannot distinguish a view call from a user-defined function of the same
+name, and no amount of scoping fixes that. This program is valid today and must
+stay valid:
 
-Every new refusal in this plan is therefore **scoped to buffers that are already
-envelopes** — those yielding at least one top-level output root. A buffer with no
-top-level root still returns `NoTerminalView` and falls through unchanged. Where
-that scoping is not sufficient to make a refusal safe, this plan retains today's
-behavior instead of inventing one.
+```rune
+fn table(x) { x }
+let n = table(1);
 
-## Scope boundary
+let r = workspace.table("t");
+plot.bar(r, "cat", "val");
+```
 
-Output roots are **top-level statements only**, regardless of position. View-named
-calls nested inside a function body, a block, or any control flow are not roots.
+A genuine `plot.bar` root does not license the analysis to reinterpret
+`table(1)`. Having one real root limits such a collision; it does not make raw
+name matching safe.
 
-Nested calls are **retained as ordinary statements**, exactly as today. They are
-not refused and not removed. A nested call that is genuinely a view fails
-honestly downstream — as an unknown callee in Toron, or in the local host — and a
-nested call that is a user-defined function of the same name keeps working. A
-local refusal here would have to key on raw callee spelling inside arbitrary
-nested scopes, which is precisely where that spelling carries the least
-information.
+The rule is therefore as narrow as it can be:
 
-A better nested diagnostic waits until either the view names are formally
-reserved, or the analysis carries enough context to distinguish a view call from
-a same-named local function. Neither is in this step.
+> A **top-level expression statement** whose callee text and call shape both
+> match a known view form is an output root. **Everything else is retained** and
+> shipped to Toron unchanged.
+
+"Everything else" includes view-named calls in binding position, inside
+functions, inside blocks, and inside control flow — and view-named calls at top
+level whose shape does not match, such as wrong arity or non-literal field
+arguments. Retained statements fail downstream exactly as they do today, in Toron
+or in the local host, and legitimate same-named user functions keep working.
+
+This makes recognition **total and monotone**: recognized becomes a root,
+unrecognized is left alone, and no third outcome exists. It is the only rule
+under which position-independent recognition changes no program's meaning.
+
+### The diagnostic this costs
+
+Today a top-level trailing `plot.bar(r, "x")` refuses with "received 2
+arguments" (`:318-332`, asserted by
+`no_view_stays_outside_the_envelope_and_invalid_view_refuses` at `:581`). Under a
+total recognizer, wrong arity means "not a view," so that call is retained and
+the user sees a Toron unknown-callee error instead of a precise local one.
+
+That is a real regression on a likely typo, and it is accepted deliberately
+rather than overlooked. Keeping the refusal would require treating a name match
+with a shape mismatch as evidence of intent, which is exactly the inference the
+collision above forbids. The precise diagnostic can return once the view names
+are formally reserved — the same condition already deferring a nested-call
+diagnostic. The arity half of `:581` is rewritten accordingly, with a citation.
+
+`MixedRelations` (`:223-232`) and `DuplicateForm` (`:233-241`) are unaffected:
+both compare roots that were already recognized, and neither widens to any new
+position.
 
 ## Analysis
 
@@ -77,32 +101,19 @@ with a forward pass classifying every top-level statement:
 | classification | example | effect |
 |---|---|---|
 | output root | `table(r)` · `plot.bar(r,"cat","val");` | contributes a sink; removed from the remote program |
-| view binding | `let v = table(r);` | typed refusal, scoped to envelope buffers |
-| ordinary statement | `let r = workspace.table("t");` · `let n = 1;` | retained in the remote program, in order |
+| everything else | `let v = table(r);` · `let r = workspace.table("t");` · `fn table(x) { x }` | retained in the remote program, in order |
 
-Consequences:
-
-- **Position stops mattering.** Roots are collected wherever they appear and
-  ordered by source position, preserving today's source-order sink contract.
-- **A view call in binding position refuses.** Today that program reaches Toron
-  and dies as an unknown callee. Step 1 must not convert it into a silently bound
-  value that emits nothing — that is surface semantics, and assigning it here
-  would pre-empt step 3. The refusal names the span and states that a view cannot
-  be bound in this release. It fires only in a buffer that already has a top-level
-  root, so a plain program with its own `table` is untouched.
-- **Laziness is not proved through surface syntax in this step.** The
-  bound-but-unemitted property is asserted against a directly constructed
-  `ExecutionEnvelope`, where a root list can be empty without any program having
-  to mean it. Step 3 exposes the behavior in syntax and re-proves it there.
-
-`DuplicateForm` (`:233-241`) and the arity and string-literal rules
-(`:318-332`, `:349-391`) are unchanged.
+Position stops mattering: roots are collected wherever they appear and ordered by
+source position, preserving today's source-order sink contract. No statement
+acquires a new meaning, and no statement that reaches Toron today stops reaching
+it — only recognized roots are removed, and those were already removed when they
+appeared in a trailing block.
 
 ### Relation identity
 
-`MixedRelations` (`:223-232`) compares source-text slices today, and that
-behavior is preserved exactly. Identity is resolved to a **relation origin**
-before comparison:
+`MixedRelations` compares source-text slices today, and that behavior is
+preserved exactly. Identity is resolved to a **relation origin** before
+comparison:
 
 - an argument that is a binding resolves to the source text of that binding's
   initializer;
@@ -110,44 +121,54 @@ before comparison:
 
 Comparison is then source-text equality on the resolved origin, for both cases.
 Spans are never compared: two identical inline expressions occupy different spans
-and must remain identical relations, which is today's behavior.
+and must remain the same relation, which is today's behavior.
 
 Resolving a binding to its initializer text is also what lets an inline program
 and its factored equivalent compare equal, since both yield the same origin. No
-normalization is introduced — equivalence fixtures write the relation identically,
-and adding whitespace or formatting normalization would turn the suite into a
-formatter test.
+normalization is introduced — equivalence fixtures write the relation
+identically, and adding whitespace or formatting normalization would turn the
+suite into a formatter test.
 
-## Split analysis from serialization
-
-`transform` (`:205`) currently parses, recognizes, and splices in one pass, and
-its product is a `String`. Split it:
+## Two stages, and an envelope that cannot be empty
 
 ```text
-analyze(source)                    -> Result<ExecutionEnvelope, RuneEnvelopeError>
+analyze(source)                      -> Result<OutputRootAnalysis, RuneEnvelopeError>
+OutputRootAnalysis::into_envelope()  -> Option<ExecutionEnvelope>
 ExecutionEnvelope::semantics(source) -> EnvelopeSemantics
-render(source, &ExecutionEnvelope)  -> TransformedRuneView
+render(source, &ExecutionEnvelope)   -> TransformedRuneView
 ```
+
+`OutputRootAnalysis` is the classification of the whole statement list and may
+have **zero** roots. Zero roots means there is no envelope: `into_envelope`
+yields `None`, the caller reports `NoTerminalView`, and the buffer falls through
+to the local Rune host (`gui/state.rs:512, 531`) exactly as today.
+
+`ExecutionEnvelope` is therefore **nonempty by construction** — it exists only
+with at least one root — which is what makes `EnvelopeSemantics::execution_count`
+meaningfully always one. An empty envelope is unrepresentable rather than merely
+untested, and the empty case is exercised through the real production transition
+instead of by hand-building an invalid value.
 
 `ExecutionEnvelope` holds what rendering needs, including spans: the ordered
 spans of retained top-level statements, the span of the relation expression that
 becomes the trailing expression, and the ordered roots as
 `SpannedRuneViewIntent`.
 
-**Equivalence is asserted on `EnvelopeSemantics`, not on `ExecutionEnvelope` and
-not on rendered bytes.** Whole-envelope equality is unachievable by construction:
-an inline program and its factored form differ in retained statements — one keeps
-a `let` — and in every span. `EnvelopeSemantics` is the projection that drops
-what rendering needs and keeps what meaning requires:
+**Equivalence is asserted on `EnvelopeSemantics`**, not on `ExecutionEnvelope`
+and not on rendered bytes. Whole-envelope equality is unachievable by
+construction: an inline program and its factored form differ in retained
+statements — one keeps a `let` — and in every span. The projection drops what
+rendering needs and keeps what meaning requires:
 
 - the resolved relation origin;
 - the ordered sink intents, **unspanned**; and
-- the execution count implied by the envelope, which is always one.
+- the execution count, always one.
+
+Sink **order is part of meaning**. Reordering ordinary statements preserves
+semantics; reordering roots does not.
 
 Byte comparison is excluded for the same reason spans are: it would make the
-equivalence suite fail on formatting. Serialization keeps its own narrow tests —
-wrapper prefix and suffix, the trailing expression carrying no `;`, and
-source-map offsets.
+equivalence suite fail on formatting. Serialization keeps its own narrow tests.
 
 `render` generalizes today's three-segment splice (`:247-277`). Removing roots
 from arbitrary positions produces N retained regions rather than one prefix and
@@ -164,13 +185,11 @@ The fallback exists for a server diagnostic that cannot be mapped through the
 source map. Toron only ever receives the relation program; it has never seen a
 presentation sink. Pointing an unmappable remote error at the first view is
 deterministic but causally wrong, and the old name asserted a contiguous block
-that no longer exists. The relation span is the region the diagnostic is actually
-about.
+that no longer exists.
 
 ## Tests
 
-**Surface — falsify the positional recognizer.** Each is unrepresentable under
-the current implementation and needs no new syntax.
+**Surface — falsify the positional recognizer.**
 
 1. **Inline versus bound relation** produce equal `EnvelopeSemantics`:
    `table(workspace.table("t").sort([asc(col("c"))]))` against the same relation
@@ -187,70 +206,73 @@ the current implementation and needs no new syntax.
 4. **Trailing block still works** — the existing three-view case (`:500`) passes
    unchanged, proving the generalization is a superset.
 
-**Internal — properties whose surface syntax does not exist yet.**
+**Meaning is preserved for everything unrecognized.**
 
-5. **Equivalent sink sets:** envelopes built from differently arranged programs
-   over one relation compare equal under `EnvelopeSemantics`, independent of
-   statement order.
-6. **An empty root list emits nothing:** a directly constructed
-   `ExecutionEnvelope` with zero roots produces no sinks and schedules no
-   execution. A positive control with one root produces one sink, so the test
-   cannot pass by finding nothing anywhere.
-7. **One remote execution feeds ordered local sinks:** an envelope with three
-   roots submits exactly one scheduler execution and yields three sinks in source
-   order sharing one result identity, re-asserting the existing `Arc` invariant
-   (`gui/state.rs:2103`) against position-independent roots.
+5. **The collision program above is untouched**: `fn table(x) { x }` and
+   `let n = table(1);` are retained verbatim in the remote program while
+   `plot.bar` is recognized as the sole root.
+6. **View-named calls in binding position, in functions, in blocks, and in
+   control flow** are retained and neither refused nor removed.
+7. **A top-level view-named call with wrong arity is retained**, replacing the
+   arity-refusal half of `:581` with a citation. The name-only half —
+   `NoTerminalView` for a buffer with no view at all — is unchanged.
 
-**Refusals and preserved behavior.**
+**Internal.**
 
-8. A view call in binding position refuses with its span **in an envelope
-   buffer**; the identical binding in a buffer with no top-level root still
-   returns `NoTerminalView` and reaches the local host. Both directions are
-   asserted, since the scoping is the whole safety argument.
-9. Nested view-named calls — inside `fn`, inside a block, inside `if` — are
-   retained in the remote program and neither refused nor removed, preserving
-   today's behavior.
-10. `MixedRelations` and `DuplicateForm` (`:546`) keep their behavior under
-    origin-resolved identity. Includes two identical inline expressions at
+8. **Semantic equality respects root order:** reordering ordinary statements
+   yields equal `EnvelopeSemantics`; reordering roots yields **unequal**
+   semantics. Both directions are asserted, since order is meaning.
+9. **Zero roots produce no envelope:** an `OutputRootAnalysis` over a
+   view-free buffer yields `None` from `into_envelope`, the caller reports
+   `NoTerminalView`, and no execution is scheduled. A one-root positive control
+   yields an envelope and one execution, so the test cannot pass by finding
+   nothing anywhere.
+10. **One remote execution feeds ordered local sinks:** an envelope with three
+    roots submits exactly one scheduler execution and yields three sinks in
+    source order sharing one result identity, re-asserting the existing `Arc`
+    invariant (`gui/state.rs:2103`) against position-independent roots.
+
+**Preserved behavior and containment.**
+
+11. `MixedRelations` and `DuplicateForm` (`:546`) keep their behavior under
+    origin-resolved identity, including two identical inline expressions at
     different spans comparing as the same relation.
-11. `diagnostic_fallback()` returns the relation span; an unmappable server error
+12. `diagnostic_fallback()` returns the relation span; an unmappable server error
     is reported against the relation, not against a view.
-
-**Containment.**
-
-12. The relation-verb assay described above, with its positive control.
-13. `tests/architecture_test.rs:45` passes unchanged.
+13. The relation-verb assay, with its positive control.
+14. `tests/architecture_test.rs:45` passes unchanged.
 
 ## Non-goals
 
 - No `.views(...)`, `.encode(...)`, `EncodedViewSet`, or any new spelling; today's
   `table` / `plot.bar` / `plot.scatter` grammar is preserved exactly.
-- **No new surface semantics.** No construct that is a Toron error today becomes
-  a meaningful local value. Binding a view refuses; it does not silently bind.
-- No views inside functions or control flow, and no local refusal for them.
+- **No new surface semantics and no new refusal.** No construct that reaches
+  Toron today stops reaching it, and none acquires a local meaning it lacked.
+- No local diagnostic for nested or malformed view-named calls; both wait on
+  reserved names.
 - No relation typing, verb resolution, planning, or lowering in Polariton.
 - No normalization of relation source text.
 - No wire, protocol, `PlotSpec`, scheduler, or pane-routing change.
-- No change to Toron, `toron-client`, or the local Rune host (`rune_host.rs`),
-  which keeps its separate compile path for plain buffers.
+- No change to Toron, `toron-client`, or the local Rune host (`rune_host.rs`).
 
 ## Review checklist
 
 - [ ] The analysis answers only output-root and binding questions; the
       relation-verb assay passes with its positive control.
-- [ ] Recognition is position-independent for top-level statements; nested
-      view-named calls are retained, not refused.
-- [ ] Every new refusal is scoped to envelope buffers, proven in both directions.
-- [ ] Binding a view refuses; no program acquires a new meaning in this step.
+- [ ] Recognition is total: matched top-level expression statements become roots,
+      everything else is retained, and no third outcome exists.
+- [ ] The collision program is proven untouched.
+- [ ] No new refusal is introduced; the arity refusal is withdrawn with a
+      citation rather than widened to new positions.
+- [ ] `ExecutionEnvelope` is nonempty by construction; the empty case runs
+      through `OutputRootAnalysis::into_envelope` returning `None`.
 - [ ] Equivalence compares `EnvelopeSemantics` — resolved origin, unspanned
       intents, order, execution count — never spans and never rendered bytes.
-- [ ] Relation identity is source-text equality on the resolved origin;
-      identical inline expressions at different spans are the same relation.
+- [ ] Root order is proven to be part of semantic equality.
+- [ ] Relation identity is source-text equality on the resolved origin.
 - [ ] `diagnostic_fallback()` replaces `view_block()` and returns the relation
       span.
 - [ ] Serialization tests remain narrow: wrapper, trailing expression without
       `;`, and source-map offsets over N segments.
-- [ ] `a_view_before_a_non_view_statement_is_not_in_the_trailing_block` is
-      rewritten with a citation, not deleted.
 - [ ] Existing envelope, fan-out, and architecture tests pass unchanged.
 - [ ] Corpus rows are untouched; this step changes no status and no spelling.
