@@ -508,73 +508,81 @@ fn run_language_code(
 ) -> Task<Message> {
 	match language_id.as_str() {
 		"sql" => run_code(app_state, source_buffer, code, annotation_source),
-		"rune" => {
-			if code.trim().is_empty() {
-				app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
-				return Task::none();
-			}
-			#[cfg(feature = "toron")]
-			match transform_rune_view(&code) {
-				Ok(view) => return run_rune_relation_view(app_state, source_buffer, view),
-				Err(
-					error @ (RuneEnvelopeError::Invalid(_)
-					| RuneEnvelopeError::MixedRelations { .. }
-					| RuneEnvelopeError::DuplicateForm { .. }),
-				) => {
-					let message = error.to_string();
-					app_state.status_error = format!("Error: {message}");
-					app_state.code_editor.set_query_error(message);
-					return Task::none();
-				}
-				Err(RuneEnvelopeError::NoTerminalView | RuneEnvelopeError::Parse(_)) => {}
-			}
-			let capabilities = RuneCapabilities {
-				results: app_state.result_registry.snapshot(),
-				..RuneCapabilities::default()
-			};
-			let revision = *app_state
-				.rune_buffer_revisions
-				.entry(source_buffer)
-				.and_modify(|revision| *revision = revision.saturating_add(1))
-				.or_insert(1);
-			app_state.status_msg = "Rune running…".into();
-			app_state.status_error.clear();
-			app_state.status_time_elapsed = None;
-			app_state.code_started = Instant::now();
-			app_state.code_editor.begin_query();
-			Task::perform(
-				async move {
-					tokio::task::spawn_blocking(move || {
-						let mut execution = rune_host::execute_body(&code, capabilities)?;
-						let plot = match execution.requests.len() {
-							0 => None,
-							1 => Some(plan(execution.requests.remove(0))?),
-							count => {
-								return Err(format!(
-									"Rune buffer published {count} plots; one buffer currently owns one plot pane."
-								));
-							}
-						};
-						Ok(crate::gui::messages::RuneBufferOutcome {
-							display: execution.display,
-							plot,
-						})
-					})
-					.await
-					.map_err(|error| format!("Rune task panicked: {error}"))?
-				},
-				move |result| Message::RunRuneBufferResult {
-					source_buffer,
-					revision,
-					result,
-				},
-			)
-		}
+		"rune" => run_rune_code(app_state, source_buffer, code),
 		language => {
 			app_state.status_msg = format!("No executor is registered for language: {language}");
 			Task::none()
 		}
 	}
+}
+
+fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String) -> Task<Message> {
+	if code.trim().is_empty() {
+		app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
+		return Task::none();
+	}
+	#[cfg(feature = "toron")]
+	match transform_rune_view(&code) {
+		Ok(view) => return run_rune_relation_view(app_state, source_buffer, view),
+		Err(
+			error @ (RuneEnvelopeError::Invalid(_)
+			| RuneEnvelopeError::InvalidView { .. }
+			| RuneEnvelopeError::MixedRelations { .. }
+			| RuneEnvelopeError::DuplicateForm { .. }),
+		) => {
+			let message = error.to_string();
+			app_state.status_error = format!("Error: {message}");
+			app_state.code_editor.set_query_error(message);
+			return Task::none();
+		}
+		Err(RuneEnvelopeError::RecognizedNoOutput) => {
+			app_state.status_msg = "Rune view set is bound; no output root emitted.".into();
+			app_state.status_error.clear();
+			return Task::none();
+		}
+		Err(RuneEnvelopeError::NoTerminalView | RuneEnvelopeError::Parse(_)) => {}
+	}
+	let capabilities = RuneCapabilities {
+		results: app_state.result_registry.snapshot(),
+		..RuneCapabilities::default()
+	};
+	let revision = *app_state
+		.rune_buffer_revisions
+		.entry(source_buffer)
+		.and_modify(|revision| *revision = revision.saturating_add(1))
+		.or_insert(1);
+	app_state.status_msg = "Rune running…".into();
+	app_state.status_error.clear();
+	app_state.status_time_elapsed = None;
+	app_state.code_started = Instant::now();
+	app_state.code_editor.begin_query();
+	Task::perform(
+		async move {
+			tokio::task::spawn_blocking(move || {
+				let mut execution = rune_host::execute_body(&code, capabilities)?;
+				let plot = match execution.requests.len() {
+					0 => None,
+					1 => Some(plan(execution.requests.remove(0))?),
+					count => {
+						return Err(format!(
+							"Rune buffer published {count} plots; one buffer currently owns one plot pane."
+						));
+					}
+				};
+				Ok(crate::gui::messages::RuneBufferOutcome {
+					display: execution.display,
+					plot,
+				})
+			})
+			.await
+			.map_err(|error| format!("Rune task panicked: {error}"))?
+		},
+		move |result| Message::RunRuneBufferResult {
+			source_buffer,
+			revision,
+			result,
+		},
+	)
 }
 
 #[cfg(feature = "toron")]
@@ -2173,6 +2181,36 @@ mod tests {
 					.is_some()
 			);
 		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn bound_view_set_stops_without_dispatch_while_view_free_rune_still_runs_locally() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(74);
+		let bound = super::run_rune_code(
+			&mut state,
+			source_buffer,
+			"let v = workspace.table(\"t\").views([table()]);".to_owned(),
+		);
+		assert_eq!(bound.units(), 0);
+		assert_eq!(state.rune_view_scheduler.submitted, 0);
+		assert!(!state.rune_buffer_revisions.contains_key(&source_buffer));
+		assert_eq!(
+			state.status_msg,
+			"Rune view set is bound; no output root emitted."
+		);
+
+		let local =
+			super::run_rune_code(&mut state, source_buffer, "let answer = 42; answer".into());
+		assert_eq!(
+			local.units(),
+			1,
+			"view-free Rune still reaches the local host"
+		);
+		assert_eq!(state.rune_buffer_revisions.get(&source_buffer), Some(&1));
+		state.code_editor.shutdown();
 	}
 
 	#[cfg(feature = "toron")]

@@ -245,6 +245,46 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[ignore = "requires the dogfood test2 relation on a live local Toron"]
+	async fn live_product_0008_view_surface_preserves_axis_identity() {
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+		let source = "workspace.table(\"test2\").sort([col(\"cat\").asc()]).views([table(), bar(\"cat\", \"val\"), scatter(\"cat\", \"val\")])";
+		let view = transform_rune_view(source).expect("PRODUCT-0008 view envelope");
+		let frame = adapter
+			.dispatch_rune(&view.source)
+			.await
+			.expect("one Rune relation result");
+		assert!(frame.height() > 0, "dogfood relation is nonempty");
+		assert_eq!(view.views.len(), 3);
+		for view in view.views {
+			match view.intent {
+				RuneViewIntent::Table => {
+					assert!(frame.column("cat").is_ok());
+					assert!(frame.column("val").is_ok());
+				}
+				RuneViewIntent::Plot(plot) => {
+					let expected_x = plot.x.clone();
+					let expected_y = plot.y.clone();
+					let projected = frame
+						.select([plot.x.as_str(), plot.y.as_str()])
+						.expect("project plot fields");
+					let kernel = create_authored_plot(
+						AuthoredPlotSpec::xy(plot.composition, plot.x, plot.y),
+						&projected,
+						800,
+						480,
+					)
+					.expect("resolve relation plot fields");
+					assert_eq!(kernel.x_label(), expected_x);
+					assert_eq!(kernel.y_label(), expected_y);
+				}
+			}
+		}
+	}
+
+	#[tokio::test]
 	#[ignore = "requires a live Toron SQL endpoint"]
 	async fn live_toron_preserves_errors_and_accepts_cancel_frames() {
 		let client =

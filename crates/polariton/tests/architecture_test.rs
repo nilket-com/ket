@@ -455,7 +455,9 @@ fn product_0007_stage_three_stays_session_scoped_and_keeps_ui_out_of_data_color(
 			std::fs::read_to_string(plot.parent().unwrap().join(name)).expect("read Rune surface")
 		})
 		.collect::<String>();
-	for unaccepted in ["EncodedViewSet", "SinkSpec", ".views("] {
+	// PRODUCT-0008 accepts `.views([...])`; the other two spellings remain
+	// withdrawn or explicitly undecided and therefore stay guarded here.
+	for unaccepted in ["EncodedViewSet", "SinkSpec"] {
 		assert!(
 			!rune_surface.contains(unaccepted),
 			"PRODUCT-0007 lowered an unaccepted Rune spelling: {unaccepted}"
