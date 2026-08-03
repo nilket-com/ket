@@ -32,9 +32,36 @@ That was wrong, and its own plan contradicted it. Permitted:
   no emitted root must stop rather than fall through to the local Rune host
   (today `NoTerminalView` falls through at `state.rs:529`). Routing only; no new
   execution, scheduling, or result semantics;
-- `adapters/toron/mod.rs` — the live sibling test.
+- `adapters/toron/mod.rs` — the live sibling test;
+- `tests/architecture_test.rs` — **solely** to retire `.views(` from
+  PRODUCT-0007's unaccepted-spelling list at `:458`, optionally with a comment
+  citing PRODUCT-0008 so the retirement is not later undone by inspection. The
+  `EncodedViewSet` and `SinkSpec` prohibitions in that same list are preserved
+  unchanged: the first was withdrawn from the proposal in corpus v0.7, the second
+  remains an explicit non-decision.
 
 Any other file is a halt.
+
+### Why the stale guard is not a stop-condition violation
+
+The halt rule fired correctly on this guard, and the resolution is an amendment
+rather than an override. The rule asks whether the work requires changing
+execution, resolution, durability, or rendering, or invalidates existing
+executable evidence. Retiring `.views(` does none of those.
+
+That assertion is a **negative guard whose premise PRODUCT-0007 stated and
+PRODUCT-0008 retired**. It said "no record accepts this spelling, so nothing may
+lower it." A record now accepts it. The guard is not being weakened to accommodate
+an inconvenient implementation; it has become false by decision, and leaving it in
+place would assert something the repository has decided against.
+
+It also protects no `executable` corpus row. Every such row cites behavioral
+fixtures, and none cites this guard. Nothing that was proved becomes unproved.
+
+The distinction worth preserving: a guard that fires because the work is doing
+something forbidden is a halt, and a guard that fires because its own premise was
+superseded is a citation to update. Only the second is amendable, and only by a
+record that superseded the premise.
 
 ## Representation: sinks decouple from removable regions
 
@@ -227,8 +254,11 @@ identity. It seeds nothing; `test2` already exists.
 
 ## Review checklist
 
-- [ ] Work stayed within the three permitted files; the halt rule was not
+- [ ] Work stayed within the four permitted files; the halt rule was not
       triggered, or the work stopped and reported.
+- [ ] `.views(` retired from the PRODUCT-0007 spelling guard with
+      `EncodedViewSet` and `SinkSpec` preserved; no other assertion in
+      `tests/architecture_test.rs` touched.
 - [ ] Peeled regions, relation origin, and sink intents are three independent
       things; no two peeled regions overlap.
 - [ ] `EnvelopeSemantics` and every downstream consumer are unchanged.
