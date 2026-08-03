@@ -212,3 +212,100 @@ fn product_0006_creation_authority_stays_feature_gated_and_out_of_discovery() {
 		"positive control: PRODUCT-0006 lifecycle assay must fire"
 	);
 }
+
+fn product_0007_spec_leaks(source: &str, is_spec: bool) -> Vec<&'static str> {
+	let mut findings = Vec::new();
+	for (needle, label) in [
+		(
+			"crate::plot::kernels",
+			"plot specification depends on a kernel",
+		),
+		(
+			"crate::plot::common",
+			"plot specification depends on renderer state",
+		),
+		(
+			"libaryon",
+			"plot specification depends on the interface engine",
+		),
+	] {
+		if is_spec && source.contains(needle) {
+			findings.push(label);
+		}
+	}
+	if !is_spec && source.contains("ChannelBinding") {
+		findings.push("intermediate channel binding escaped the specification module");
+	}
+	findings
+}
+
+fn product_0007_local_transform_leaks(source: &str) -> Vec<&'static str> {
+	let mut findings = Vec::new();
+	for (needle, label) in [
+		("LazyFrame", "lazy relation plan"),
+		("LazyGroupBy", "grouped relation plan"),
+		("JoinArgs", "join"),
+		("SortMultipleOptions", "sort"),
+		("DataFrame::filter", "filter"),
+	] {
+		if source.contains(needle) {
+			findings.push(label);
+		}
+	}
+	findings
+}
+
+#[test]
+fn product_0007_plot_spec_stays_product_side_and_cannot_execute_relations() {
+	let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec_path = src.join("plot/spec/mod.rs");
+	let spec = std::fs::read_to_string(&spec_path).expect("read PRODUCT-0007 specification");
+	assert!(
+		product_0007_spec_leaks(&spec, true).is_empty(),
+		"PRODUCT-0007 specification crossed the renderer/engine boundary"
+	);
+	assert!(
+		product_0007_local_transform_leaks(&spec).is_empty(),
+		"PRODUCT-0007 specification grew a local relation engine: {:?}",
+		product_0007_local_transform_leaks(&spec)
+	);
+
+	let mut pending = vec![src];
+	let mut leaks = Vec::new();
+	while let Some(path) = pending.pop() {
+		for entry in std::fs::read_dir(&path).expect("read Polariton source") {
+			let path = entry.expect("source entry").path();
+			if path.is_dir() {
+				pending.push(path);
+			} else if path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+				&& path != spec_path
+			{
+				let source = std::fs::read_to_string(&path).expect("read source");
+				for finding in product_0007_spec_leaks(&source, false) {
+					leaks.push(format!("{}: {finding}", path.display()));
+				}
+			}
+		}
+	}
+	assert!(
+		leaks.is_empty(),
+		"PRODUCT-0007 intermediate type escaped:\n{}",
+		leaks.join("\n")
+	);
+
+	assert_eq!(
+		product_0007_spec_leaks("use crate::plot::kernels;", true),
+		vec!["plot specification depends on a kernel"],
+		"positive control: PRODUCT-0007 dependency guard must fire"
+	);
+	assert_eq!(
+		product_0007_local_transform_leaks("let _: LazyFrame; let _: JoinArgs;"),
+		vec!["lazy relation plan", "join"],
+		"positive control: PRODUCT-0007 local-execution guard must fire"
+	);
+	assert_eq!(
+		product_0007_spec_leaks("fn render(_: ChannelBinding) {}", false),
+		vec!["intermediate channel binding escaped the specification module"],
+		"positive control: PRODUCT-0007 intermediate-type guard must fire"
+	);
+}

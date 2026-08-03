@@ -10,6 +10,7 @@
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::request::{PlotRequest, PlotSource};
+use crate::plot::spec::AuthoredPlotSpec;
 use polars::frame::DataFrame;
 use rune::runtime::{Value, VmResult};
 use rune::{Any, Context, Module, Source, Sources, Vm};
@@ -352,13 +353,16 @@ fn plot_line(mut plot: RunePlot) -> RunePlot {
 }
 
 fn plot_show(plot: RunePlot) -> VmResult<Result<(), String>> {
+	let authored_spec = match plot.projection {
+		Some((x, y)) => AuthoredPlotSpec::xy(plot.composition, x, y),
+		None => AuthoredPlotSpec::automatic(plot.composition),
+	};
 	let request = PlotRequest {
 		source: PlotSource::Materialized {
 			name: plot.cell.name,
 			data: plot.cell.data,
 		},
-		composition: plot.composition,
-		projection: plot.projection,
+		authored_spec,
 	};
 	match plot
 		.queue
@@ -437,6 +441,7 @@ mod tests {
 		assert_eq!(data.height(), 3);
 		assert!(
 			execution.requests[0]
+				.authored_spec
 				.composition
 				.is_scatter_with_line_overlay()
 		);
@@ -505,8 +510,12 @@ viz.plot(trips).scatter().line().show()?;
 		)
 		.expect("explicit columns execute");
 		assert_eq!(
-			execution.requests[0].projection,
-			Some(("z".to_owned(), "y".to_owned()))
+			execution.requests[0].authored_spec.x.field,
+			crate::plot::spec::AuthoredChannel::Named("z".to_owned())
+		);
+		assert_eq!(
+			execution.requests[0].authored_spec.y.field,
+			crate::plot::spec::AuthoredChannel::Named("y".to_owned())
 		);
 	}
 
@@ -518,7 +527,14 @@ viz.plot(trips).scatter().line().show()?;
 			results("test", data),
 		)
 		.expect("bare scatter executes");
-		assert_eq!(execution.requests[0].projection, None);
+		assert_eq!(
+			execution.requests[0].authored_spec.x.field,
+			crate::plot::spec::AuthoredChannel::Auto
+		);
+		assert_eq!(
+			execution.requests[0].authored_spec.y.field,
+			crate::plot::spec::AuthoredChannel::Auto
+		);
 	}
 
 	#[test]

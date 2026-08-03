@@ -7,6 +7,10 @@
 //! (`plans/wip/rune-data-products.md`).
 
 use crate::plot::composition::PlotComposition;
+use crate::plot::spec::{
+	AuthoredChannel, AuthoredPlotSpec, ColorIdentity, OptionalAuthoredChannel, PlotProvenance,
+	ResolvedPlotSpec, StampedResult, resolve_channels, resolve_domains,
+};
 use polars::frame::DataFrame;
 use std::sync::Arc;
 
@@ -24,18 +28,19 @@ pub enum PlotSource {
 #[derive(Clone, Debug)]
 pub struct PlotRequest {
 	pub source: PlotSource,
-	pub composition: PlotComposition,
-	/// Explicit `(x, y)` column projection from `.scatter("x", "y")`. `None`
-	/// keeps the factory's column inference over the full frame.
-	pub projection: Option<(String, String)>,
+	pub authored_spec: AuthoredPlotSpec,
 }
 
 /// A plan-approved plot: an owned frame the kernel factory can consume.
 #[derive(Clone, Debug)]
 pub struct ResolvedPlot {
 	pub source_name: String,
+	/// Compatibility field consumed by the Stage-2 kernel migration. Its value
+	/// is identical to `resolved_spec.composition`.
 	pub composition: PlotComposition,
 	pub data: Arc<DataFrame>,
+	#[allow(dead_code)] // Stage 1 carries it; Stage 2 makes kernels consume it.
+	pub resolved_spec: ResolvedPlotSpec,
 }
 
 /// Resolve a request into a render-ready plot.
@@ -47,22 +52,51 @@ pub struct ResolvedPlot {
 pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 	match request.source {
 		PlotSource::Materialized { name, data } => {
-			let data = match request.projection {
-				None => data,
-				Some((x, y)) => {
-					let projected = data.select([x.as_str(), y.as_str()]).map_err(|error| {
-						format!("Cannot project ({x}, {y}) from {name}: {error}")
-					})?;
-					Arc::new(projected)
-				}
+			let binding = resolve_channels(&request.authored_spec, data.schema().as_ref())
+				.map_err(|error| format!("{name}: {error}"))?;
+			let stamped = StampedResult {
+				data: Arc::clone(&data),
+				provenance: PlotProvenance {
+					source_name: name.clone(),
+					revision: None,
+				},
 			};
+			let (resolved_spec, _) = resolve_domains(binding, &stamped, &ColorIdentity::default())
+				.map_err(|error| format!("{name}: {error}"))?;
+			let data = project_named_channels(&request.authored_spec, data, &name)?;
 			Ok(ResolvedPlot {
 				source_name: name,
-				composition: request.composition,
+				composition: resolved_spec.composition.clone(),
 				data,
+				resolved_spec,
 			})
 		}
 	}
+}
+
+fn project_named_channels(
+	spec: &AuthoredPlotSpec,
+	data: Arc<DataFrame>,
+	source_name: &str,
+) -> Result<Arc<DataFrame>, String> {
+	let (AuthoredChannel::Named(x), AuthoredChannel::Named(y)) = (&spec.x.field, &spec.y.field)
+	else {
+		return Ok(data);
+	};
+	let mut fields = vec![x.as_str()];
+	if y != x {
+		fields.push(y.as_str());
+	}
+	if let OptionalAuthoredChannel::Named(color) = &spec.color.field
+		&& color != x
+		&& color != y
+	{
+		fields.push(color.as_str());
+	}
+	let projected = data
+		.select(fields)
+		.map_err(|error| format!("Cannot project plot channels from {source_name}: {error}"))?;
+	Ok(Arc::new(projected))
 }
 
 #[cfg(test)]
@@ -83,12 +117,21 @@ mod tests {
 		let frame = df!("x" => [1_i32], "y" => [2_i32], "z" => [3_i32]).expect("frame");
 		let resolved = plan(PlotRequest {
 			source: materialized("test", frame),
-			composition: PlotComposition::single(PlotType::Scatter),
-			projection: None,
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Scatter)),
 		})
 		.expect("plan succeeds");
 		assert_eq!(resolved.source_name, "test");
 		assert_eq!(resolved.data.width(), 3);
+		assert_eq!(resolved.resolved_spec.provenance.source_name, "test");
+		assert_eq!(
+			resolved
+				.resolved_spec
+				.channel(crate::plot::spec::Channel::X)
+				.expect("resolved x")
+				.binding
+				.field,
+			"x"
+		);
 	}
 
 	#[test]
@@ -96,8 +139,11 @@ mod tests {
 		let frame = df!("x" => [1_i32], "y" => [2_i32], "z" => [3_i32]).expect("frame");
 		let resolved = plan(PlotRequest {
 			source: materialized("test", frame),
-			composition: PlotComposition::single(PlotType::Scatter),
-			projection: Some(("z".to_owned(), "x".to_owned())),
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Scatter),
+				"z",
+				"x",
+			),
 		})
 		.expect("plan succeeds");
 		let names: Vec<&str> = resolved
@@ -107,6 +153,24 @@ mod tests {
 			.map(|name| name.as_str())
 			.collect();
 		assert_eq!(names, ["z", "x"]);
+		assert_eq!(
+			resolved
+				.resolved_spec
+				.channel(crate::plot::spec::Channel::X)
+				.expect("resolved x")
+				.binding
+				.field,
+			"z"
+		);
+		assert_eq!(
+			resolved
+				.resolved_spec
+				.channel(crate::plot::spec::Channel::Y)
+				.expect("resolved y")
+				.binding
+				.field,
+			"x"
+		);
 	}
 
 	#[test]
@@ -114,8 +178,11 @@ mod tests {
 		let frame = df!("x" => [1_i32]).expect("frame");
 		let error = plan(PlotRequest {
 			source: materialized("test", frame),
-			composition: PlotComposition::single(PlotType::Scatter),
-			projection: Some(("x".to_owned(), "missing".to_owned())),
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Scatter),
+				"x",
+				"missing",
+			),
 		})
 		.expect_err("missing column fails planning");
 		assert!(error.contains("missing"), "unhelpful error: {error}");

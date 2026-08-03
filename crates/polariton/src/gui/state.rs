@@ -15,7 +15,11 @@ use crate::gui::{
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
+#[cfg(feature = "toron")]
+use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
+#[cfg(feature = "toron")]
+use crate::plot::spec::AuthoredPlotSpec;
 use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
@@ -648,22 +652,16 @@ fn rune_view_outcome(
 			let output = match view.intent {
 				RuneViewIntent::Table => Ok(RuneRelationSinkOutput::Table),
 				RuneViewIntent::Plot(plot) => {
-					let mut fields = vec![plot.x.as_str(), plot.y.as_str()];
-					if let Some(category) = plot.category.as_deref() {
-						fields.push(category);
-					}
-					result
-						.select(fields)
-						.map(|projected| {
-							RuneRelationSinkOutput::Plot(ResolvedPlot {
-								source_name: "workspace relation".to_owned(),
-								composition: plot.composition,
-								data: std::sync::Arc::new(projected),
-							})
-						})
-						.map_err(|error| {
-							format!("Rune plot fields could not be projected: {error}")
-						})
+					let authored_spec =
+						AuthoredPlotSpec::xy_color(plot.composition, plot.x, plot.y, plot.category);
+					plan(PlotRequest {
+						source: PlotSource::Materialized {
+							name: "workspace relation".to_owned(),
+							data: std::sync::Arc::clone(&result),
+						},
+						authored_spec,
+					})
+					.map(RuneRelationSinkOutput::Plot)
 				}
 			};
 			RuneRelationSinkOutcome {
@@ -2127,6 +2125,21 @@ mod tests {
 			};
 			assert_eq!(plot.composition.primary_plot_type(), expected);
 			assert_eq!(plot.data.height(), 2);
+			assert_eq!(
+				plot.resolved_spec.composition.primary_plot_type(),
+				expected,
+				"the Toron producer must carry the resolved specification"
+			);
+			assert!(
+				plot.resolved_spec
+					.channel(crate::plot::spec::Channel::X)
+					.is_some()
+			);
+			assert!(
+				plot.resolved_spec
+					.channel(crate::plot::spec::Channel::Y)
+					.is_some()
+			);
 		}
 	}
 
@@ -2143,7 +2156,13 @@ mod tests {
 		assert_eq!(outcome.sinks[0].form, RuneViewForm::Table);
 		assert!(outcome.sinks[0].output.is_ok());
 		assert_eq!(outcome.sinks[1].form, RuneViewForm::Bar);
-		assert!(outcome.sinks[1].output.is_err());
+		let Err(error) = &outcome.sinks[1].output else {
+			panic!("bad field must fail only this sink");
+		};
+		assert!(
+			error.contains("missing"),
+			"field attribution was lost: {error}"
+		);
 		let span = outcome.sinks[1].span.clone();
 		assert_eq!(
 			&source[span.start as usize..span.end as usize],
