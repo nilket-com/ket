@@ -97,6 +97,10 @@ mod tests {
 	use iced::Rectangle;
 	use std::path::PathBuf;
 
+	// These gates share one live tenant. Serializing them keeps the tenant's
+	// bounded query budget from turning test parallelism into rotating failures.
+	static LIVE_TORON_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
 	fn live_endpoint() -> String {
 		std::env::var("TORON_SQL_ENDPOINT")
 			.unwrap_or_else(|_| nilket_local::SQL_ENDPOINT.to_owned())
@@ -120,6 +124,7 @@ mod tests {
 	#[tokio::test]
 	#[ignore = "requires a live Toron SQL endpoint"]
 	async fn live_toron_query_reaches_the_existing_plot_kernel() {
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
 		let mut adapter = ToronAdapter::connect(&live_endpoint())
 			.await
 			.expect("connect to Toron");
@@ -192,6 +197,7 @@ mod tests {
 	#[tokio::test]
 	#[ignore = "requires the dogfood test2 relation on a live local Toron"]
 	async fn live_rune_relation_reaches_table_bar_and_scatter_surfaces() {
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
 		let mut adapter = ToronAdapter::connect(&live_endpoint())
 			.await
 			.expect("connect to Toron");
@@ -247,6 +253,7 @@ mod tests {
 	#[tokio::test]
 	#[ignore = "requires the dogfood test2 relation on a live local Toron"]
 	async fn live_product_0008_view_surface_preserves_axis_identity() {
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
 		let mut adapter = ToronAdapter::connect(&live_endpoint())
 			.await
 			.expect("connect to Toron");
@@ -287,6 +294,7 @@ mod tests {
 	#[tokio::test]
 	#[ignore = "requires a live Toron SQL endpoint"]
 	async fn live_toron_preserves_errors_and_accepts_cancel_frames() {
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
 		let client =
 			toron_client::ToronClient::loopback(live_endpoint()).expect("configure Toron client");
 		client.health().await.expect("connect to Toron");
