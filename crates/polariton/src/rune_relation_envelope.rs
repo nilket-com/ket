@@ -76,7 +76,7 @@ struct SourceMapSegment {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuneEnvelopeSourceMap {
 	segments: Vec<SourceMapSegment>,
-	view_block: Range<u32>,
+	diagnostic_fallback: Range<u32>,
 }
 
 impl RuneEnvelopeSourceMap {
@@ -95,8 +95,8 @@ impl RuneEnvelopeSourceMap {
 		})
 	}
 
-	pub(crate) fn view_block(&self) -> Range<u32> {
-		self.view_block.clone()
+	pub(crate) fn diagnostic_fallback(&self) -> Range<u32> {
+		self.diagnostic_fallback.clone()
 	}
 }
 
@@ -178,7 +178,7 @@ impl std::fmt::Display for RuneEnvelopeError {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::NoTerminalView => formatter.write_str(
-				"Rune relation views end with table(relation), plot.bar(relation, \"x\", \"y\"), or plot.scatter(relation, \"x\", \"y\")",
+				"Rune relation views use top-level table(relation), plot.bar(relation, \"x\", \"y\"), or plot.scatter(relation, \"x\", \"y\")",
 			),
 			Self::Parse(message) => write!(formatter, "Rune parse: {message}"),
 			Self::Invalid(message) => write!(formatter, "Rune view syntax: {message}"),
@@ -203,35 +203,146 @@ impl std::fmt::Display for RuneEnvelopeError {
 impl std::error::Error for RuneEnvelopeError {}
 
 pub(crate) fn transform(source: &str) -> Result<TransformedRuneView, RuneEnvelopeError> {
-	let block = rune::parse::parse_all::<ast::EmptyBlock>(source, rune::SourceId::EMPTY, false)
-		.map_err(|error| RuneEnvelopeError::Parse(error.to_string()))?;
-	let mut parsed = Vec::new();
-	for statement in block.statements.iter().rev() {
-		match parse_view_statement(statement, source)? {
-			Some(view) => parsed.push(view),
-			None if parsed.is_empty() => return Err(RuneEnvelopeError::NoTerminalView),
-			None => break,
+	let analysis = analyze(source)?;
+	let envelope = analysis
+		.into_envelope()
+		.ok_or(RuneEnvelopeError::NoTerminalView)?;
+	render(source, &envelope)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct OutputRootAnalysis {
+	retained: Vec<Range<usize>>,
+	relation_origin: Option<String>,
+	roots: Vec<ParsedView>,
+	terminate_retained_tail: bool,
+}
+
+impl OutputRootAnalysis {
+	fn into_envelope(self) -> Option<ExecutionEnvelope> {
+		let mut roots = self.roots.into_iter();
+		let first = roots.next()?;
+		Some(ExecutionEnvelope {
+			retained: self.retained,
+			relation: first.relation.clone(),
+			relation_origin: self
+				.relation_origin
+				.expect("a nonempty analysis has a relation origin"),
+			roots: NonEmptyOutputRoots {
+				first,
+				rest: roots.collect(),
+			},
+			terminate_retained_tail: self.terminate_retained_tail,
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExecutionEnvelope {
+	retained: Vec<Range<usize>>,
+	relation: Range<usize>,
+	relation_origin: String,
+	roots: NonEmptyOutputRoots,
+	terminate_retained_tail: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct NonEmptyOutputRoots {
+	first: ParsedView,
+	rest: Vec<ParsedView>,
+}
+
+impl NonEmptyOutputRoots {
+	fn iter(&self) -> impl Iterator<Item = &ParsedView> {
+		std::iter::once(&self.first).chain(&self.rest)
+	}
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct EnvelopeSemantics {
+	relation_origin: String,
+	sinks: Vec<RuneViewIntent>,
+	execution_count: u8,
+}
+
+impl ExecutionEnvelope {
+	#[cfg(test)]
+	fn semantics(&self) -> EnvelopeSemantics {
+		EnvelopeSemantics {
+			relation_origin: self.relation_origin.clone(),
+			sinks: self.roots.iter().map(|root| root.intent.clone()).collect(),
+			execution_count: 1,
 		}
 	}
-	parsed.reverse();
-	let first = parsed.first().ok_or(RuneEnvelopeError::NoTerminalView)?;
-	let relation_source = source
-		.get(first.relation.clone())
-		.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?;
+}
+
+#[derive(Clone, Debug)]
+struct LocalBinding {
+	name: String,
+	initializer: Range<usize>,
+	statement_start: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ViewShadows {
+	table: bool,
+	plot: bool,
+}
+
+impl ViewShadows {
+	fn insert(&mut self, name: &str) {
+		match name {
+			"table" => self.table = true,
+			"plot" => self.plot = true,
+			_ => {}
+		}
+	}
+}
+
+fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
+	let block = rune::parse::parse_all::<ast::EmptyBlock>(source, rune::SourceId::EMPTY, false)
+		.map_err(|error| RuneEnvelopeError::Parse(error.to_string()))?;
+
+	// Whole-buffer shadowing is deliberately conservative. Complete this pass
+	// before classifying any root so a later binding can suppress an earlier call.
+	let mut shadows = ViewShadows::default();
+	let mut bindings = Vec::new();
+	for statement in &block.statements {
+		collect_top_level_bindings(statement, source, &mut shadows, &mut bindings)?;
+	}
+
+	let mut roots = Vec::new();
+	let mut last_retained_is_expression = false;
+	for statement in &block.statements {
+		if let Some(root) = recognize_view_root(statement, source, shadows)? {
+			roots.push(root);
+			continue;
+		}
+		last_retained_is_expression = matches!(statement, ast::Stmt::Expr(_));
+	}
+
+	let Some(first) = roots.first() else {
+		return Ok(OutputRootAnalysis {
+			retained: retained_regions(source.len(), &roots)?,
+			relation_origin: None,
+			roots,
+			terminate_retained_tail: last_retained_is_expression,
+		});
+	};
+	let relation_origin = resolve_relation_origin(source, first, &bindings)?;
 	let first_relation = u32_range(&first.relation, "relation")?;
 	let mut forms = HashMap::<RuneViewForm, Range<u32>>::new();
-	for view in &parsed {
-		let candidate = source
-			.get(view.relation.clone())
-			.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?;
-		if candidate != relation_source {
+	for root in &roots {
+		let candidate = resolve_relation_origin(source, root, &bindings)?;
+		if candidate != relation_origin {
 			return Err(RuneEnvelopeError::MixedRelations {
 				first: first_relation.clone(),
-				differing: u32_range(&view.relation, "relation")?,
+				differing: u32_range(&root.relation, "relation")?,
 			});
 		}
-		let form = view.intent.form();
-		let span = u32_range(&view.statement, "view")?;
+		let form = root.intent.form();
+		let span = u32_range(&root.statement, "view")?;
 		if let Some(first) = forms.insert(form, span.clone()) {
 			return Err(RuneEnvelopeError::DuplicateForm {
 				form,
@@ -240,69 +351,97 @@ pub(crate) fn transform(source: &str) -> Result<TransformedRuneView, RuneEnvelop
 			});
 		}
 	}
-	let view_block = parsed.first().expect("nonempty view block").statement.start
-		..parsed.last().expect("nonempty view block").statement.end;
-	let relation = first.relation.clone();
 
+	let retained = retained_regions(source.len(), &roots)?;
+	Ok(OutputRootAnalysis {
+		retained,
+		relation_origin: Some(relation_origin),
+		roots,
+		terminate_retained_tail: last_retained_is_expression,
+	})
+}
+
+fn render(
+	source: &str,
+	envelope: &ExecutionEnvelope,
+) -> Result<TransformedRuneView, RuneEnvelopeError> {
+	let removed = envelope
+		.roots
+		.iter()
+		.map(|root| root.statement.len())
+		.sum::<usize>();
 	let mut transformed = String::with_capacity(
-		ENTRYPOINT_PREFIX.len() + source.len() - view_block.len()
-			+ relation.len()
-			+ ENTRYPOINT_SUFFIX.len(),
+		ENTRYPOINT_PREFIX.len()
+			+ source.len().saturating_sub(removed)
+			+ envelope.relation.len()
+			+ ENTRYPOINT_SUFFIX.len()
+			+ 3,
 	);
 	transformed.push_str(ENTRYPOINT_PREFIX);
-	let prefix_start = transformed.len();
-	transformed.push_str(&source[..view_block.start]);
-	let prefix_end = transformed.len();
+	let mut segments = Vec::new();
+	for retained in &envelope.retained {
+		let transformed_start = transformed.len();
+		transformed.push_str(source.get(retained.clone()).ok_or_else(|| {
+			RuneEnvelopeError::Invalid("retained source span is not UTF-8".into())
+		})?);
+		let transformed_end = transformed.len();
+		push_segment(
+			&mut segments,
+			transformed_start..transformed_end,
+			u32::try_from(retained.start)
+				.map_err(|_| RuneEnvelopeError::Invalid("source exceeds u32".into()))?,
+		)?;
+	}
+	if envelope.terminate_retained_tail {
+		transformed.push_str("\n;");
+	}
+	transformed.push('\n');
 	let relation_start = transformed.len();
-	transformed.push_str(&source[relation.clone()]);
+	transformed.push_str(
+		source
+			.get(envelope.relation.clone())
+			.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?,
+	);
 	let relation_end = transformed.len();
-	let suffix_start = transformed.len();
-	transformed.push_str(&source[view_block.end..]);
-	let suffix_end = transformed.len();
 	transformed.push_str(ENTRYPOINT_SUFFIX);
 
-	let mut segments = Vec::new();
-	push_segment(&mut segments, prefix_start..prefix_end, 0)?;
 	push_segment(
 		&mut segments,
 		relation_start..relation_end,
-		u32::try_from(relation.start)
-			.map_err(|_| RuneEnvelopeError::Invalid("source exceeds u32".into()))?,
-	)?;
-	push_segment(
-		&mut segments,
-		suffix_start..suffix_end,
-		u32::try_from(view_block.end)
+		u32::try_from(envelope.relation.start)
 			.map_err(|_| RuneEnvelopeError::Invalid("source exceeds u32".into()))?,
 	)?;
 
 	Ok(TransformedRuneView {
 		source: transformed,
-		views: parsed
-			.into_iter()
-			.map(|view| {
+		views: envelope
+			.roots
+			.iter()
+			.map(|root| {
 				Ok(SpannedRuneViewIntent {
-					intent: view.intent,
-					span: u32_range(&view.statement, "view")?,
+					intent: root.intent.clone(),
+					span: u32_range(&root.statement, "view")?,
 				})
 			})
 			.collect::<Result<_, RuneEnvelopeError>>()?,
 		source_map: RuneEnvelopeSourceMap {
 			segments,
-			view_block: u32_range(&view_block, "view block")?,
+			diagnostic_fallback: u32_range(&envelope.relation, "relation")?,
 		},
 	})
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ParsedView {
 	intent: RuneViewIntent,
 	statement: Range<usize>,
 	relation: Range<usize>,
 }
 
-fn parse_view_statement(
+fn recognize_view_root(
 	statement: &ast::Stmt,
 	source: &str,
+	shadows: ViewShadows,
 ) -> Result<Option<ParsedView>, RuneEnvelopeError> {
 	let (expression, statement_span) = match statement {
 		ast::Stmt::Expr(expression) => (expression, expression.span()),
@@ -315,21 +454,21 @@ fn parse_view_statement(
 	let callee = source_slice(source, call.expr.span())?;
 	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
 	let (intent, relation) = match callee.trim() {
-		"table" if args.len() == 1 => (RuneViewIntent::Table, args[0]),
-		"plot.bar" if args.len() == 3 => (
-			RuneViewIntent::Plot(plot_sink(PlotType::Bar, source, &args)?),
+		"table" if !shadows.table && args.len() == 1 => (RuneViewIntent::Table, args[0]),
+		"plot.bar" if !shadows.plot && args.len() == 3 => (
+			RuneViewIntent::Plot(match plot_sink(PlotType::Bar, source, &args)? {
+				Some(sink) => sink,
+				None => return Ok(None),
+			}),
 			args[0],
 		),
-		"plot.scatter" if matches!(args.len(), 3 | 4) => (
-			RuneViewIntent::Plot(plot_sink(PlotType::Scatter, source, &args)?),
+		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
+			RuneViewIntent::Plot(match plot_sink(PlotType::Scatter, source, &args)? {
+				Some(sink) => sink,
+				None => return Ok(None),
+			}),
 			args[0],
 		),
-		"table" | "plot.bar" | "plot.scatter" => {
-			return Err(RuneEnvelopeError::Invalid(format!(
-				"{callee} received {} arguments",
-				args.len()
-			)));
-		}
 		_ => return Ok(None),
 	};
 	Ok(Some(ParsedView {
@@ -337,6 +476,178 @@ fn parse_view_statement(
 		statement: byte_range(statement_span, source.len())?,
 		relation: byte_range(relation.span(), source.len())?,
 	}))
+}
+
+fn retained_regions(
+	source_len: usize,
+	roots: &[ParsedView],
+) -> Result<Vec<Range<usize>>, RuneEnvelopeError> {
+	let mut retained = Vec::with_capacity(roots.len() + 1);
+	let mut cursor = 0;
+	for root in roots {
+		if root.statement.start < cursor || root.statement.end > source_len {
+			return Err(RuneEnvelopeError::Invalid(
+				"view spans overlap or exceed the source".into(),
+			));
+		}
+		if cursor < root.statement.start {
+			retained.push(cursor..root.statement.start);
+		}
+		cursor = root.statement.end;
+	}
+	if cursor < source_len {
+		retained.push(cursor..source_len);
+	}
+	Ok(retained)
+}
+
+fn collect_top_level_bindings(
+	statement: &ast::Stmt,
+	source: &str,
+	shadows: &mut ViewShadows,
+	bindings: &mut Vec<LocalBinding>,
+) -> Result<(), RuneEnvelopeError> {
+	match statement {
+		ast::Stmt::Local(local) => {
+			let mut names = Vec::new();
+			collect_pattern_names(&local.pat, source, &mut names)?;
+			for name in &names {
+				shadows.insert(name);
+			}
+			if names.len() == 1 {
+				bindings.push(LocalBinding {
+					name: names.pop().expect("one local binding"),
+					initializer: byte_range(local.expr.span(), source.len())?,
+					statement_start: byte_range(statement.span(), source.len())?.start,
+				});
+			}
+		}
+		ast::Stmt::Item(item, _) => collect_item_shadows(item, source, shadows)?,
+		_ => {}
+	}
+	Ok(())
+}
+
+fn collect_pattern_names(
+	pattern: &ast::Pat,
+	source: &str,
+	names: &mut Vec<String>,
+) -> Result<(), RuneEnvelopeError> {
+	match pattern {
+		ast::Pat::Path(path) => {
+			let raw = source_slice(source, path.path.span())?.trim();
+			if is_simple_name(raw) {
+				names.push(raw.to_owned());
+			}
+		}
+		ast::Pat::Vec(vector) => {
+			for (pattern, _) in vector.items.iter() {
+				collect_pattern_names(pattern, source, names)?;
+			}
+		}
+		ast::Pat::Tuple(tuple) => {
+			for (pattern, _) in tuple.items.iter() {
+				collect_pattern_names(pattern, source, names)?;
+			}
+		}
+		ast::Pat::Object(object) => {
+			for (pattern, _) in object.items.iter() {
+				collect_pattern_names(pattern, source, names)?;
+			}
+		}
+		ast::Pat::Binding(binding) => {
+			collect_pattern_names(&binding.pat, source, names)?;
+		}
+		_ => {}
+	}
+	Ok(())
+}
+
+fn collect_item_shadows(
+	item: &ast::Item,
+	source: &str,
+	shadows: &mut ViewShadows,
+) -> Result<(), RuneEnvelopeError> {
+	let name = match item {
+		ast::Item::Fn(item) => Some(item.name.span()),
+		ast::Item::Enum(item) => Some(item.name.span()),
+		ast::Item::Struct(item) => Some(item.ident.span()),
+		ast::Item::Mod(item) => Some(item.name.span()),
+		ast::Item::Const(item) => Some(item.name.span()),
+		ast::Item::Use(item) => {
+			collect_use_shadows(&item.path, source, shadows)?;
+			None
+		}
+		_ => None,
+	};
+	if let Some(span) = name {
+		shadows.insert(source_slice(source, span)?.trim());
+	}
+	Ok(())
+}
+
+fn collect_use_shadows(
+	path: &ast::ItemUsePath,
+	source: &str,
+	shadows: &mut ViewShadows,
+) -> Result<(), RuneEnvelopeError> {
+	if let Some((_, alias)) = &path.alias {
+		shadows.insert(source_slice(source, alias.span())?.trim());
+		return Ok(());
+	}
+	let segment = path
+		.segments
+		.last()
+		.map(|(_, segment)| segment)
+		.unwrap_or(&path.first);
+	match segment {
+		ast::ItemUseSegment::PathSegment(segment) => {
+			shadows.insert(source_slice(source, segment.span())?.trim());
+		}
+		ast::ItemUseSegment::Wildcard(_) => {
+			// The imported names are unknowable without semantic resolution. Retain
+			// both forms, which is the conservative direction.
+			shadows.table = true;
+			shadows.plot = true;
+		}
+		ast::ItemUseSegment::Group(group) => {
+			for (path, _) in group.iter() {
+				collect_use_shadows(path, source, shadows)?;
+			}
+		}
+		_ => {}
+	}
+	Ok(())
+}
+
+fn resolve_relation_origin(
+	source: &str,
+	root: &ParsedView,
+	bindings: &[LocalBinding],
+) -> Result<String, RuneEnvelopeError> {
+	let relation = source
+		.get(root.relation.clone())
+		.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?
+		.trim();
+	if is_simple_name(relation)
+		&& let Some(binding) = bindings.iter().rev().find(|binding| {
+			binding.name == relation && binding.statement_start < root.statement.start
+		}) {
+		return Ok(source
+			.get(binding.initializer.clone())
+			.ok_or_else(|| RuneEnvelopeError::Invalid("binding initializer is not UTF-8".into()))?
+			.to_owned());
+	}
+	Ok(relation.to_owned())
+}
+
+fn is_simple_name(raw: &str) -> bool {
+	let mut chars = raw.chars();
+	let Some(first) = chars.next() else {
+		return false;
+	};
+	(first == '_' || first.is_alphabetic())
+		&& chars.all(|character| character == '_' || character.is_alphanumeric())
 }
 
 fn u32_range(range: &Range<usize>, label: &str) -> Result<Range<u32>, RuneEnvelopeError> {
@@ -350,22 +661,31 @@ fn plot_sink(
 	plot_type: PlotType,
 	source: &str,
 	args: &[&ast::Expr],
-) -> Result<DisposableRunePlotSink, RuneEnvelopeError> {
+) -> Result<Option<DisposableRunePlotSink>, RuneEnvelopeError> {
 	let field = |index: usize| {
 		let raw = source_slice(source, args[index].span())?;
-		decode_string_literal(raw).ok_or_else(|| {
-			RuneEnvelopeError::Invalid(format!(
-				"plot field argument {} must be a string literal",
-				index + 1
-			))
-		})
+		Ok::<_, RuneEnvelopeError>(decode_string_literal(raw))
 	};
-	Ok(DisposableRunePlotSink {
+	let Some(x) = field(1)? else {
+		return Ok(None);
+	};
+	let Some(y) = field(2)? else {
+		return Ok(None);
+	};
+	let category = if args.len() == 4 {
+		let Some(category) = field(3)? else {
+			return Ok(None);
+		};
+		Some(category)
+	} else {
+		None
+	};
+	Ok(Some(DisposableRunePlotSink {
 		composition: PlotComposition::single(plot_type),
-		x: field(1)?,
-		y: field(2)?,
-		category: (args.len() == 4).then(|| field(3)).transpose()?,
-	})
+		x,
+		y,
+		category,
+	}))
 }
 
 fn decode_string_literal(raw: &str) -> Option<String> {
@@ -430,12 +750,21 @@ fn push_segment(
 mod tests {
 	use super::*;
 
+	fn envelope(source: &str) -> ExecutionEnvelope {
+		analyze(source)
+			.expect("analyze Rune")
+			.into_envelope()
+			.expect("execution envelope")
+	}
+
 	#[test]
 	fn terminal_table_is_substituted_and_mapped() {
 		let source = "let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]);\ntable(r)";
 		let transformed = transform(source).expect("table envelope");
 		assert_eq!(transformed.views.len(), 1);
 		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+		assert!(transformed.source.starts_with(ENTRYPOINT_PREFIX));
+		assert!(transformed.source.ends_with(ENTRYPOINT_SUFFIX));
 		assert!(transformed.source.contains("let r = workspace.table"));
 		assert!(transformed.source.contains("\nr\n}"));
 		let server_r = transformed
@@ -456,13 +785,26 @@ mod tests {
 				.source_map
 				.map_span(toron_client::RuneSourceSpan { start: 0, end: 3 }),
 			None,
-			"wrapper-only diagnostics must fall back to the terminal view"
+			"wrapper-only diagnostics require the relation fallback"
 		);
-		let terminal = transformed.source_map.view_block();
+		let fallback = transformed.source_map.diagnostic_fallback();
 		assert_eq!(
-			&source[terminal.start as usize..terminal.end as usize],
-			"table(r)"
+			&source[fallback.start as usize..fallback.end as usize],
+			"r",
+			"Toron has seen the relation, not the presentation sink"
 		);
+	}
+
+	#[test]
+	fn inline_and_bound_relations_have_equal_semantics_not_equal_envelopes() {
+		let inline = envelope(
+			"table(workspace.table(\"t\").sort([asc(col(\"c\"))]));\nplot.bar(workspace.table(\"t\").sort([asc(col(\"c\"))]), \"c\", \"v\")",
+		);
+		let bound = envelope(
+			"let r = workspace.table(\"t\").sort([asc(col(\"c\"))]);\ntable(r);\nplot.bar(r, \"c\", \"v\")",
+		);
+		assert_ne!(inline, bound, "rendering structure and spans really differ");
+		assert_eq!(inline.semantics(), bound.semantics());
 	}
 
 	#[test]
@@ -471,6 +813,46 @@ mod tests {
 			.expect("semicolon-terminated table envelope");
 		assert!(transformed.source.contains("\nr\n}"));
 		assert!(!transformed.source.contains("\nr;\n}"));
+	}
+
+	#[test]
+	fn interleaved_roots_are_removed_and_retained_segments_stay_mapped() {
+		let source = "let r = workspace.table(\"test2\");\ntable(r);\nlet marker = 1;\nplot.bar(r, \"cat\", \"val\");\nlet tail = marker + 1;";
+		let transformed = transform(source).expect("interleaved envelope");
+		assert_eq!(
+			transformed
+				.views
+				.iter()
+				.map(|view| view.intent.form())
+				.collect::<Vec<_>>(),
+			[RuneViewForm::Table, RuneViewForm::Bar]
+		);
+		assert!(!transformed.source.contains("table(r)"));
+		assert!(!transformed.source.contains("plot.bar"));
+		assert!(transformed.source.contains("let marker = 1"));
+		assert!(transformed.source.contains("let tail = marker + 1"));
+		let transformed_marker = transformed.source.find("marker").expect("marker retained");
+		let mapped = transformed
+			.source_map
+			.map_span(toron_client::RuneSourceSpan {
+				start: transformed_marker as u32,
+				end: transformed_marker as u32 + 6,
+			})
+			.expect("retained segment maps");
+		assert_eq!(
+			&source[mapped.start as usize..mapped.end as usize],
+			"marker"
+		);
+	}
+
+	#[test]
+	fn retained_trailing_expression_is_terminated_before_the_relation_return() {
+		let transformed =
+			transform("let r = workspace.table(\"test2\");\ntable(r);\nlet marker = 1;\nmarker")
+				.expect("view before trailing expression");
+		assert!(transformed.source.contains("marker\n;\nr\n}"));
+		rune::parse::parse_all::<ast::ItemFn>(&transformed.source, rune::SourceId::EMPTY, false)
+			.expect("rendered entrypoint remains valid Rune");
 	}
 
 	#[test]
@@ -543,48 +925,198 @@ mod tests {
 	}
 
 	#[test]
-	fn mixed_relations_and_duplicate_forms_refuse_with_both_spans() {
-		let mixed = transform("let a = workspace.table(\"a\"); let b = workspace.table(\"b\"); table(a); plot.bar(b, \"x\", \"y\")")
-			.expect_err("mixed relations");
+	fn origin_resolved_identity_keeps_mixed_duplicate_and_inline_behavior() {
+		let mixed_source = "let a = workspace.table(\"a\"); let b = workspace.table(\"b\"); table(a); let marker = 1; plot.bar(b, \"x\", \"y\")";
+		let mixed = transform(mixed_source).expect_err("mixed relations");
 		let RuneEnvelopeError::MixedRelations { first, differing } = mixed else {
 			panic!("expected mixed-relation refusal: {mixed:?}");
 		};
+		assert_eq!(&mixed_source[first.start as usize..first.end as usize], "a");
 		assert_eq!(
-			&"let a = workspace.table(\"a\"); let b = workspace.table(\"b\"); table(a); plot.bar(b, \"x\", \"y\")"
-				[first.start as usize..first.end as usize],
-			"a"
-		);
-		assert_eq!(
-			&"let a = workspace.table(\"a\"); let b = workspace.table(\"b\"); table(a); plot.bar(b, \"x\", \"y\")"
-				[differing.start as usize..differing.end as usize],
+			&mixed_source[differing.start as usize..differing.end as usize],
 			"b"
 		);
 
-		let duplicate = transform("let r = workspace.table(\"t\"); table(r); table(r)")
-			.expect_err("duplicate table form");
+		let duplicate =
+			transform("let r = workspace.table(\"t\"); table(r); let marker = 1; table(r)")
+				.expect_err("duplicate table form");
 		assert!(duplicate.to_string().contains("named views"));
+
+		let repeated_inline = transform(
+			"table(workspace.table(\"t\")); plot.bar(workspace.table(\"t\"), \"x\", \"y\")",
+		)
+		.expect("identical inline origins at different spans");
+		assert_eq!(repeated_inline.views.len(), 2);
 	}
 
 	#[test]
-	fn a_view_before_a_non_view_statement_is_not_in_the_trailing_block() {
+	fn a_view_before_a_non_view_statement_is_now_an_output_root() {
+		// plans/product/impl/0003_typed_output_root_discovery.md deliberately
+		// reverses the former trailing-contiguity assertion.
 		let transformed = transform(
 			"let r = workspace.table(\"test2\"); table(r); let marker = 1; plot.bar(r, \"cat\", \"val\")",
 		)
-		.expect("terminal plot only");
-		assert_eq!(transformed.views.len(), 1);
-		assert_eq!(transformed.views[0].intent.form(), RuneViewForm::Bar);
-		assert!(transformed.source.contains("table(r)"));
+		.expect("position-independent roots");
+		assert_eq!(transformed.views.len(), 2);
+		assert_eq!(transformed.views[0].intent.form(), RuneViewForm::Table);
+		assert_eq!(transformed.views[1].intent.form(), RuneViewForm::Bar);
+		assert!(!transformed.source.contains("table(r)"));
 		assert!(transformed.source.contains("let marker = 1"));
 	}
 
 	#[test]
-	fn no_view_stays_outside_the_envelope_and_invalid_view_refuses() {
+	fn shadowed_binding_and_direct_call_collisions_remain_ordinary_rune() {
+		let binding_collision = "fn table(x) { x }\nlet n = table(1);\nlet r = workspace.table(\"t\");\nplot.bar(r, \"cat\", \"val\");";
+		let transformed = transform(binding_collision).expect("plot establishes envelope");
+		assert_eq!(transformed.views.len(), 1);
+		assert_eq!(transformed.views[0].intent.form(), RuneViewForm::Bar);
+		assert!(transformed.source.contains("fn table(x) { x }"));
+		assert!(transformed.source.contains("let n = table(1);"));
+
+		let direct_collision = "fn table(x) { x }\n\ntable(1);\nlet answer = 42;\nanswer";
+		assert_eq!(
+			transform(direct_collision),
+			Err(RuneEnvelopeError::NoTerminalView),
+			"a user-defined table call must still reach the local Rune host"
+		);
+	}
+
+	#[test]
+	fn shadowing_is_per_form_and_collected_before_root_classification() {
+		let plot_shadowed = transform(
+			"let plot = 1; let r = workspace.table(\"t\"); plot.bar(r, \"x\", \"y\"); table(r)",
+		)
+		.expect("table remains unshadowed");
+		assert_eq!(plot_shadowed.views.len(), 1);
+		assert_eq!(plot_shadowed.views[0].intent.form(), RuneViewForm::Table);
+		assert!(plot_shadowed.source.contains("plot.bar"));
+
+		let table_shadowed = transform(
+			"fn table(x) { x } let r = workspace.table(\"t\"); table(r); plot.bar(r, \"x\", \"y\")",
+		)
+		.expect("plot remains unshadowed");
+		assert_eq!(table_shadowed.views.len(), 1);
+		assert_eq!(table_shadowed.views[0].intent.form(), RuneViewForm::Bar);
+		assert!(table_shadowed.source.contains("table(r)"));
+
+		let later_shadow = transform(
+			"let r = workspace.table(\"t\"); table(r); let table = 1; plot.bar(r, \"x\", \"y\")",
+		)
+		.expect("later table binding suppresses earlier candidate");
+		assert_eq!(later_shadow.views.len(), 1);
+		assert_eq!(later_shadow.views[0].intent.form(), RuneViewForm::Bar);
+		assert!(later_shadow.source.contains("table(r)"));
+
+		let positive =
+			transform("let r = workspace.table(\"t\"); table(r); plot.bar(r, \"x\", \"y\")")
+				.expect("both unshadowed forms");
+		assert_eq!(positive.views.len(), 2);
+	}
+
+	#[test]
+	fn non_root_view_names_and_malformed_calls_are_retained_without_refusal() {
+		let source = "fn helper(r) { table(r); }\nlet r = workspace.table(\"t\");\nlet v = table(r);\nif true { table(r); }\n{ table(r); };\nplot.bar(r, \"x\");\nplot.scatter(r, x, \"y\");\ntable(r)";
+		let transformed = transform(source).expect("only the final table is a root");
+		assert_eq!(transformed.views.len(), 1);
+		assert_eq!(transformed.views[0].intent.form(), RuneViewForm::Table);
+		for retained in [
+			"fn helper(r) { table(r); }",
+			"let v = table(r);",
+			"if true { table(r); }",
+			"{ table(r); };",
+			"plot.bar(r, \"x\");",
+			"plot.scatter(r, x, \"y\");",
+		] {
+			assert!(
+				transformed.source.contains(retained),
+				"retained non-root: {retained}"
+			);
+		}
+
+		// plans/product/impl/0003_typed_output_root_discovery.md withdraws
+		// the old name-only arity refusal until view names are reserved.
+		assert_eq!(
+			transform("plot.bar(workspace.table(\"t\"), \"x\")"),
+			Err(RuneEnvelopeError::NoTerminalView)
+		);
+	}
+
+	#[test]
+	fn semantic_equality_ignores_ordinary_order_but_preserves_root_order() {
+		let ordinary_first = envelope(
+			"let marker = 1; let r = workspace.table(\"t\"); table(r); plot.bar(r, \"x\", \"y\")",
+		);
+		let relation_first = envelope(
+			"let r = workspace.table(\"t\"); let marker = 1; table(r); plot.bar(r, \"x\", \"y\")",
+		);
+		assert_eq!(ordinary_first.semantics(), relation_first.semantics());
+
+		let roots_reordered =
+			envelope("let r = workspace.table(\"t\"); plot.bar(r, \"x\", \"y\"); table(r)");
+		assert_ne!(ordinary_first.semantics(), roots_reordered.semantics());
+	}
+
+	#[test]
+	fn zero_roots_produce_no_envelope_and_no_scheduled_execution() {
+		let analysis = analyze("let r = 1; r").expect("view-free analysis");
+		assert!(analysis.into_envelope().is_none());
 		assert_eq!(
 			transform("let r = 1; r"),
 			Err(RuneEnvelopeError::NoTerminalView)
 		);
-		let error = transform("plot.bar(workspace.table(\"t\"), \"x\")").expect_err("wrong arity");
-		assert!(error.to_string().contains("received 2 arguments"));
+
+		let scheduler = RuneViewScheduler::default();
+		assert_eq!((scheduler.submitted, scheduler.executed), (0, 0));
+
+		let view = transform("let r = workspace.table(\"t\"); table(r)")
+			.expect("one-root positive control");
+		let mut scheduler = RuneViewScheduler::default();
+		assert!(
+			scheduler
+				.submit(PendingRuneView {
+					source_buffer: BufferId::new(42),
+					revision: 1,
+					view,
+				})
+				.is_some()
+		);
+		assert_eq!((scheduler.submitted, scheduler.executed), (1, 1));
+	}
+
+	fn relation_verb_findings(source: &str) -> Vec<&'static str> {
+		let production = source
+			.rsplit_once("\n#[cfg(test)]\nmod tests")
+			.map(|(production, _)| production)
+			.unwrap_or(source);
+		let identifiers = production
+			.split(|character: char| !(character == '_' || character.is_alphanumeric()))
+			.collect::<HashSet<_>>();
+		[
+			"project",
+			"filter",
+			"aggregate",
+			"sort",
+			"limit",
+			"join",
+			"window",
+		]
+		.into_iter()
+		.filter(|name| identifiers.contains(name))
+		.collect()
+	}
+
+	#[test]
+	fn product_0003_analysis_never_interprets_relation_verbs() {
+		let source = include_str!("rune_relation_envelope.rs");
+		assert!(
+			relation_verb_findings(source).is_empty(),
+			"PRODUCT-0003 keeps relation semantics in Toron"
+		);
+		assert_eq!(
+			relation_verb_findings("fn analyze() { relation.sort(keys); }"),
+			vec!["sort"],
+			"positive control: the assay must observe a synthetic relation verb"
+		);
 	}
 
 	#[test]

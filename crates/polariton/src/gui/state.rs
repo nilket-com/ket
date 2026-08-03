@@ -616,7 +616,7 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 								end: span.end,
 							})
 						})
-						.unwrap_or_else(|| view.source_map.view_block());
+						.unwrap_or_else(|| view.source_map.diagnostic_fallback());
 					Err(format!(
 						"Rune {:?} at bytes {}..{}: {}",
 						failure.kind, location.start, location.end, failure.message
@@ -2107,7 +2107,7 @@ mod tests {
 			"y" => [3_i64, 5],
 		)
 		.expect("fixture frame");
-		let source = "let r = workspace.table(\"t\"); table(r); plot.bar(r, \"cat\", \"y\"); plot.scatter(r, \"x\", \"y\", \"cat\")";
+		let source = "let r = workspace.table(\"t\"); table(r); let marker = 1; plot.bar(r, \"cat\", \"y\"); let tail = marker + 1; plot.scatter(r, \"x\", \"y\", \"cat\")";
 		let views = transform_rune_view(source).expect("view envelope").views;
 		let outcome = rune_view_outcome(frame, views);
 		assert_eq!(outcome.sinks.len(), 3);

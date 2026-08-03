@@ -155,7 +155,7 @@ mod tests {
 		let mut adapter = ToronAdapter::connect(&live_endpoint())
 			.await
 			.expect("connect to Toron");
-		let source = "let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); table(r); plot.bar(r, \"cat\", \"val\"); plot.scatter(r, \"cat\", \"val\")";
+		let source = "let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); table(r); let marker = 1; plot.bar(r, \"cat\", \"val\"); let tail = marker + 1; plot.scatter(r, \"cat\", \"val\")";
 		let view = transform_rune_view(source).expect("fan-out view envelope");
 		let frame = adapter
 			.dispatch_rune(&view.source)
