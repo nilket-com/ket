@@ -2321,7 +2321,7 @@ mod tests {
 			"y" => [3_i64, 5],
 		)
 		.expect("fixture frame");
-		let source = "let r = workspace.table(\"t\"); table(r); let marker = 1; plot.bar(r, \"cat\", \"y\"); let tail = marker + 1; plot.scatter(r, \"x\", \"y\", \"cat\")";
+		let source = "let r = workspace.table(\"t\"); table(r); let marker = 1; plot.bar(r, \"cat\", \"y\"); let tail = marker + 1; plot.scatter(r, \"x\", \"y\", \"cat\"); plot.line(r, \"x\", \"y\")";
 		let views = transform_rune_view(source)
 			.expect("view envelope")
 			.into_relations()
@@ -2329,7 +2329,7 @@ mod tests {
 			.expect("one relation")
 			.views;
 		let outcome = rune_view_outcome(frame, views);
-		assert_eq!(outcome.sinks.len(), 3);
+		assert_eq!(outcome.sinks.len(), 4);
 		for sink in &outcome.sinks {
 			assert!(std::sync::Arc::ptr_eq(&outcome.result, &sink.source));
 		}
@@ -2337,9 +2337,10 @@ mod tests {
 			outcome.sinks[0].output,
 			Ok(crate::gui::messages::RuneRelationSinkOutput::Table)
 		));
-		for (sink, expected) in outcome.sinks[1..]
-			.iter()
-			.zip([PlotType::Bar, PlotType::Scatter])
+		for (sink, expected) in
+			outcome.sinks[1..]
+				.iter()
+				.zip([PlotType::Bar, PlotType::Scatter, PlotType::Line])
 		{
 			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(plot)) = &sink.output else {
 				panic!("expected resolved plot");
@@ -2593,7 +2594,7 @@ mod tests {
 ket.table("test1")
 	.sort([col("x").asc()])
 	.views([
-		scatter("x", "y"),
+		line("x", "y"),
 		table()])
 ket.table("test2")
 	.sort([col("cat").asc()])
@@ -2610,7 +2611,7 @@ ket.table("test2")
 		assert_eq!(
 			presentation,
 			vec![
-				(LocalViewIdentity::Anonymous(0), RuneViewForm::Scatter),
+				(LocalViewIdentity::Anonymous(0), RuneViewForm::Line),
 				(LocalViewIdentity::Anonymous(1), RuneViewForm::Table),
 				(LocalViewIdentity::Anonymous(2), RuneViewForm::Bar),
 				(LocalViewIdentity::Anonymous(3), RuneViewForm::Table),
@@ -2675,6 +2676,13 @@ ket.table("test2")
 			state
 				.code_editor
 				.rune_view_panel_is_plot(source_buffer, &LocalViewIdentity::Anonymous(0))
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_plot_type(source_buffer, &LocalViewIdentity::Anonymous(0)),
+			Some(PlotType::Line),
+			"the first dogfood view must reach the existing line renderer"
 		);
 		assert!(
 			state
@@ -3086,12 +3094,12 @@ workspace.table("bad").views([view("bad", table())]);
 
 	#[test]
 	fn rune_diagnostics_compact_the_toolbar_and_keep_full_hover_detail() {
-		let raw = "Rune view syntax at bytes 67..81: unknown view sink; expected scatter(...), bar(...), or table()";
+		let raw = "Rune view syntax at bytes 67..81: unknown view sink; expected scatter(...), bar(...), line(...), or table()";
 		let (summary, full) = compact_rune_diagnostic(raw);
 
 		assert_eq!(
 			summary,
-			"Rune · bytes 67..81 · unknown view sink; expected scatter(...), bar(...), or table()"
+			"Rune · bytes 67..81 · unknown view sink; expected scatter(...), bar(...), line(...), or table()"
 		);
 		assert_eq!(full, raw);
 	}

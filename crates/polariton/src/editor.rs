@@ -851,7 +851,9 @@ impl CodeEditor {
 					panel_id,
 					kind: match form {
 						RuneViewForm::Table => "rune-view-table",
-						RuneViewForm::Bar | RuneViewForm::Scatter => "rune-view-plot",
+						RuneViewForm::Bar | RuneViewForm::Line | RuneViewForm::Scatter => {
+							"rune-view-plot"
+						}
 					}
 					.to_owned(),
 					title,
@@ -949,6 +951,20 @@ impl CodeEditor {
 		self.rune_view_panel_id(producer, identity)
 			.and_then(|panel_id| self.panels.panels.get(&panel_id))
 			.is_some_and(|entry| matches!(entry.content, PanelContent::Plot(_)))
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_plot_type(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<crate::plot::core::PlotType> {
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let entry = self.panels.panels.get(&panel_id)?;
+		let PanelContent::Plot(plot) = &entry.content else {
+			return None;
+		};
+		Some(plot.composition.primary_plot_type())
 	}
 
 	#[cfg(all(test, feature = "toron"))]

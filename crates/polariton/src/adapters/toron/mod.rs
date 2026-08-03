@@ -252,6 +252,60 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[ignore = "requires the dogfood test1 relation on a live local Toron"]
+	async fn live_product_0012_line_view_reaches_the_existing_kernel() {
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+		let source = "ket.table(\"test1\").sort([col(\"x\").asc()]).views([line(\"x\", \"y\")])";
+		let relation = transform_rune_view(source)
+			.expect("PRODUCT-0012 line envelope")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let frame = adapter
+			.dispatch_rune(&relation.source)
+			.await
+			.expect("one Rune relation result");
+		let [view] = relation.views.as_slice() else {
+			panic!("line fixture must produce exactly one view");
+		};
+		let RuneViewIntent::Plot(plot) = &view.intent else {
+			panic!("line fixture must produce a plot");
+		};
+		assert_eq!(plot.composition.primary_plot_type(), PlotType::Line);
+		let projected = frame
+			.select([plot.x.as_str(), plot.y.as_str()])
+			.expect("project distinct line fields");
+		let kernel = create_authored_plot(
+			AuthoredPlotSpec::xy(plot.composition.clone(), plot.x.clone(), plot.y.clone()),
+			&projected,
+			800,
+			480,
+		)
+		.expect("resolve authored line fields");
+		assert_eq!(kernel.x_label(), "x");
+		assert_eq!(kernel.y_label(), "y");
+
+		let widget = PlotWidget {
+			kernel: kernel.as_ref(),
+			title: "Rune line view".to_owned(),
+			padding: 0.0,
+			settings: ResolvedPlotSettings::default(),
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = SvgBackend::new(800.0, 480.0);
+		widget.render(
+			&mut backend,
+			Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
+		);
+		assert!(backend.finish().contains("<path"));
+	}
+
+	#[tokio::test]
 	#[ignore = "requires the dogfood test2 relation on a live local Toron"]
 	async fn live_product_0008_view_surface_preserves_axis_identity() {
 		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;

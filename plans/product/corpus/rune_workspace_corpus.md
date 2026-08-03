@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.13. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.14. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -29,7 +29,8 @@ a cited record).
 | bounded table view (`table(r)`; accepted sugar `r.table()` and canonical `r.views([table()])`, inherits the 128 MiB `toron-client` collection ceiling) | executable | `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance `live_rune_relation_reaches_table_bar_and_scatter_surfaces`; PRODUCT-0008 sugar equivalence in `product_0008_single_view_sugars_are_exact_canonical_projections` (`d4c2d8a8`) |
 | bar sink (`plot.bar`; accepted sugar `r.bar(x, y)` and canonical `r.views([bar(x, y)])`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | scatter sink (`plot.scatter`; accepted sugar `r.scatter(x, y)` and canonical `r.views([scatter(x, y)])`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
-| shared-execution view fan-out (`r.views([...])`, one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink holds the *same* `Arc`, not equivalent copies; live acceptance issues one `dispatch_rune` and consumes three ordered sinks (`71445df3`, `755e850a`); direct/factored/legacy equivalence plus accepted-surface live axis identity (`d4c2d8a8`) |
+| line sink (`plot.line`; accepted sugar `r.line(x, y)` and canonical `r.views([line(x, y)])`) | executable | PRODUCT-0012 equivalence and contextual refusal in `product_0012_line_*`; exact authored x/y projection in `named_line_preserves_exact_xy_and_projects_the_existing_line_contract`; shared-result and real host-panel completion in `rune_relation_results_feed_the_existing_table_and_plot_surfaces` and `dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard`; installed-transport rendering in `live_product_0012_line_view_reaches_the_existing_kernel` |
+| shared-execution view fan-out (`r.views([...])`, one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink, including line, holds the *same* `Arc`, not equivalent copies; direct/factored/legacy equivalence plus accepted-surface live axis identity (`d4c2d8a8`, PRODUCT-0012) |
 | multi-origin view program (one execution per canonical relation origin) | executable | `multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity` proves canonical-origin deduplication and independent dispatch; `execution_grouping_cannot_reorder_interleaved_host_panels` completes origins out of order without changing presentation (`b99338f8`, `cad42680`) |
 | optional view identity (`view("name", sink)` or anonymous positional identity) | executable | session-scoped: duplicate names refuse with both spans; names retain one host-panel id across reruns and form changes; anonymous views reuse their presentation slot; durable restart identity remains deferred by PRODUCT-0010's recorded protocol halt (`284e88e0`, `cad42680`) |
 | view panel placement (one split per view; no inferred grouping) | executable | `host_panel_placement_requests_tab_fallback_and_reopen_without_moving` proves the retained advisory tab-placement capability in libaryon; `rune_view_collection_opens_one_split_per_view_without_host_tabs` projects four independently visible panes in presentation order while retaining source focus (PRODUCT-0011 amended after dogfood, protocol in `8535d662`) |
@@ -65,6 +66,17 @@ tables and two plots from the dogfood buffer have four destinations and no view
 completion opens or mutates the dashboard. The current key uses `BufferId` and
 therefore survives reruns, not application restarts; durable document identity
 and restored layouts require a future libaryon record.
+
+## Accepted extension: line views
+
+Status: **accepted** by PRODUCT-0012 and executable. `plot.line(r, "x", "y")`,
+`r.line("x", "y")`, and `r.views([line("x", "y")])` are exact projections of
+one line intent. The first surface takes exactly two authored string fields and
+resolves them to the existing `ResolvedKernelFields::Line` contract with no
+series field. It inherits origin-keyed execution, shared-result identity, view
+addressing, panel placement, and staleness unchanged. The two-origin dogfood
+fixture now completes line + table and bar + table into four ordinary host
+panels without touching the dashboard.
 
 ## Accepted surface: view fan-out
 
@@ -334,6 +346,12 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.14 (2026-08-03): PRODUCT-0012 adds the strict x/y line view through all
+  three accepted spellings. Exact authored channels now reach the existing line
+  kernel contract; shared-result evidence includes line; and the two-origin
+  dogfood fixture replaces its scatter with a line while retaining four ordinary
+  host panels and no dashboard mutation. Series/group styling remains outside
+  the accepted surface.
 - v0.13 (2026-08-03): PRODUCT-0011 adds advisory `Split` or `TabWith` placement
   while libaryon retains layout authority. Its original automatic grouping
   policy was reversed after dogfood: Polariton now requests one split per view,

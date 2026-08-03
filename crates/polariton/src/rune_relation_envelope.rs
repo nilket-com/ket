@@ -27,6 +27,7 @@ pub(crate) enum RuneViewIntent {
 pub(crate) enum RuneViewForm {
 	Table,
 	Bar,
+	Line,
 	Scatter,
 }
 
@@ -35,6 +36,7 @@ impl RuneViewForm {
 		match self {
 			Self::Table => "table",
 			Self::Bar => "plot.bar",
+			Self::Line => "plot.line",
 			Self::Scatter => "plot.scatter",
 		}
 	}
@@ -46,6 +48,7 @@ impl RuneViewIntent {
 			Self::Table => RuneViewForm::Table,
 			Self::Plot(plot) => match plot.composition.primary_plot_type() {
 				PlotType::Bar => RuneViewForm::Bar,
+				PlotType::Line => RuneViewForm::Line,
 				PlotType::Scatter => RuneViewForm::Scatter,
 				other => unreachable!("first-contact sink admitted unexpected plot type {other:?}"),
 			},
@@ -261,7 +264,7 @@ impl std::fmt::Display for RuneEnvelopeError {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::NoTerminalView => formatter.write_str(
-				"Rune relation views use top-level table(relation), plot.bar(relation, \"x\", \"y\"), or plot.scatter(relation, \"x\", \"y\")",
+				"Rune relation views use top-level table(relation), plot.bar(relation, \"x\", \"y\"), plot.line(relation, \"x\", \"y\"), or plot.scatter(relation, \"x\", \"y\")",
 			),
 			Self::RecognizedNoOutput => {
 				formatter.write_str("Rune view set is bound but has no output root")
@@ -754,6 +757,17 @@ fn provenance_method_on_relation(
 			origin,
 			sinks: vec![parse_sugar_sink(PlotType::Bar, call, args, source)?],
 		})),
+		"line" if args.len() == 2 => Ok(Some(ExpressionProvenance::ViewSet {
+			relation,
+			root,
+			origin,
+			sinks: vec![parse_sugar_sink(PlotType::Line, call, args, source)?],
+		})),
+		"line" => invalid_view(
+			call.span(),
+			source.len(),
+			"line view sugar requires x and y string fields",
+		),
 		"table" if args.is_empty() => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
 			root,
@@ -850,7 +864,7 @@ fn parse_contextual_sink_inner(
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"a views list element must be scatter(...), bar(...), or table()",
+			"a views list element must be scatter(...), bar(...), line(...), or table()",
 		);
 	};
 	let callee = source_slice(source, call.expr.span())?.trim();
@@ -907,6 +921,16 @@ fn parse_contextual_sink_inner(
 			};
 			RuneViewIntent::Plot(sink)
 		}
+		"line" if args.len() == 2 => {
+			let Some(sink) = plot_sink_fields(PlotType::Line, source, &args, 0)? else {
+				return invalid_view(
+					expression.span(),
+					source.len(),
+					"line fields must be strings",
+				);
+			};
+			RuneViewIntent::Plot(sink)
+		}
 		"table" => {
 			return invalid_view(
 				expression.span(),
@@ -921,6 +945,13 @@ fn parse_contextual_sink_inner(
 				"bar(...) takes x and y string fields",
 			);
 		}
+		"line" => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"line(...) takes x and y string fields",
+			);
+		}
 		"scatter" => {
 			return invalid_view(
 				expression.span(),
@@ -932,7 +963,7 @@ fn parse_contextual_sink_inner(
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"unknown view sink; expected scatter(...), bar(...), or table()",
+				"unknown view sink; expected scatter(...), bar(...), line(...), or table()",
 			);
 		}
 	};
@@ -951,16 +982,20 @@ fn parse_sugar_sink(
 	source: &str,
 ) -> Result<ParsedSink, RuneEnvelopeError> {
 	let valid_arity = match plot_type {
-		PlotType::Bar => args.len() == 2,
+		PlotType::Bar | PlotType::Line => args.len() == 2,
 		PlotType::Scatter => matches!(args.len(), 2 | 3),
 		_ => false,
 	};
 	if !valid_arity {
-		return invalid_view(
-			call.span(),
-			source.len(),
-			"plot view sugar requires x and y strings with an optional scatter category",
-		);
+		let message = match plot_type {
+			PlotType::Scatter => {
+				"scatter view sugar requires x and y strings with an optional category"
+			}
+			PlotType::Bar => "bar view sugar requires x and y string fields",
+			PlotType::Line => "line view sugar requires x and y string fields",
+			_ => unreachable!("only Rune plot view forms reach sugar parsing"),
+		};
+		return invalid_view(call.span(), source.len(), message);
 	}
 	let Some(sink) = plot_sink_fields(plot_type, source, args, 0)? else {
 		return invalid_view(
@@ -1096,6 +1131,23 @@ fn recognize_view_root(
 			}),
 			args[0],
 		),
+		"plot.line" if !shadows.plot && args.len() == 3 => {
+			let Some(sink) = plot_sink(PlotType::Line, source, &args)? else {
+				return invalid_view(
+					call.span(),
+					source.len(),
+					"plot.line fields must be string literals",
+				);
+			};
+			(RuneViewIntent::Plot(sink), args[0])
+		}
+		"plot.line" if !shadows.plot => {
+			return invalid_view(
+				call.span(),
+				source.len(),
+				"plot.line(...) takes a relation plus x and y string fields",
+			);
+		}
 		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
 			RuneViewIntent::Plot(match plot_sink(PlotType::Scatter, source, &args)? {
 				Some(sink) => sink,
@@ -1532,6 +1584,17 @@ mod tests {
 		};
 		assert_eq!(scatter.composition.primary_plot_type(), PlotType::Scatter);
 		assert_eq!(scatter.category.as_deref(), Some("cat"));
+
+		let line = transform("let r = workspace.table(\"test2\"); plot.line(r, \"x\", \"y\")")
+			.expect("line envelope");
+		let RuneViewIntent::Plot(line) = &line.views[0].intent else {
+			panic!("expected plot");
+		};
+		assert_eq!(line.composition.primary_plot_type(), PlotType::Line);
+		assert_eq!(
+			(&line.x, &line.y, &line.category),
+			(&"x".to_owned(), &"y".to_owned(), &None)
+		);
 	}
 
 	#[test]
@@ -1863,6 +1926,52 @@ mod tests {
 			assert_eq!(envelope(sugar).semantics(), envelope(canonical).semantics());
 			assert_eq!(envelope(sugar).semantics(), envelope(legacy).semantics());
 		}
+	}
+
+	#[test]
+	fn product_0012_line_spellings_are_exact_canonical_projections() {
+		let sugar = envelope("workspace.table(\"t\").line(\"x\", \"y\")");
+		let canonical = envelope("workspace.table(\"t\").views([line(\"x\", \"y\")])");
+		let legacy = envelope("plot.line(workspace.table(\"t\"), \"x\", \"y\")");
+
+		assert_eq!(sugar.semantics(), canonical.semantics());
+		assert_eq!(sugar.semantics(), legacy.semantics());
+		assert_eq!(sugar.semantics().sinks[0].form(), RuneViewForm::Line);
+	}
+
+	#[test]
+	fn product_0012_line_recognition_is_contextual_shadowed_and_atomic() {
+		let ordinary = "fn line(x, y) { x + y } let value = line(1, 2); value";
+		assert_eq!(transform(ordinary), Err(RuneEnvelopeError::NoTerminalView));
+
+		let plot_shadowed = "let plot = local; plot.line(workspace.table(\"t\"), \"x\", \"y\")";
+		assert_eq!(
+			transform(plot_shadowed),
+			Err(RuneEnvelopeError::NoTerminalView)
+		);
+
+		for source in [
+			"workspace.table(\"t\").views([line(\"x\")])",
+			"workspace.table(\"t\").views([line(\"x\", \"y\", \"series\")])",
+			"workspace.table(\"t\").views([line(x, \"y\")])",
+			"workspace.table(\"t\").line(\"x\")",
+			"plot.line(workspace.table(\"t\"), \"x\")",
+			"plot.line(workspace.table(\"t\"), x, \"y\")",
+		] {
+			assert!(
+				matches!(
+					transform(source),
+					Err(RuneEnvelopeError::InvalidView { .. })
+				),
+				"malformed line must refuse at its sink: {source}"
+			);
+		}
+
+		let partial = "workspace.table(\"t\").views([table(), line(\"x\")])";
+		assert!(matches!(
+			transform(partial),
+			Err(RuneEnvelopeError::InvalidView { .. })
+		));
 	}
 
 	#[test]

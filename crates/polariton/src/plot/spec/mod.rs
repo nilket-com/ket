@@ -495,7 +495,10 @@ pub fn resolve_channels(
 	schema: &Schema,
 ) -> Result<ChannelBinding, ChannelError> {
 	let plot_type = spec.composition.primary_plot_type();
-	if !matches!(plot_type, PlotType::Scatter | PlotType::Bar) {
+	if !matches!(
+		plot_type,
+		PlotType::Scatter | PlotType::Bar | PlotType::Line
+	) {
 		if !matches!(spec.x.field, AuthoredChannel::Auto)
 			|| !matches!(spec.y.field, AuthoredChannel::Auto)
 			|| !matches!(spec.color.field, OptionalAuthoredChannel::Auto)
@@ -675,7 +678,12 @@ fn kernel_fields_from_channels(
 			group: field(Channel::Color),
 			value: required(Channel::Y)?,
 		}),
-		_ => unreachable!("only authored Scatter and Bar channels reach this projection"),
+		PlotType::Line => Ok(ResolvedKernelFields::Line {
+			series: field(Channel::Color),
+			x: required(Channel::X)?,
+			y: required(Channel::Y)?,
+		}),
+		_ => unreachable!("only authored Scatter, Bar, and Line channels reach this projection"),
 	}
 }
 
@@ -968,6 +976,12 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		}
 		(PlotType::Bar, Channel::X) => !matches!(semantic, SemanticType::Quantitative),
 		(PlotType::Bar, Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::Line, Channel::X | Channel::Y) => {
+			matches!(
+				semantic,
+				SemanticType::Quantitative | SemanticType::Temporal
+			)
+		}
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -1043,7 +1057,7 @@ const fn color_job_scale(job: ColorJob) -> ScaleFamily {
 
 const fn categorical_limit(plot_type: PlotType) -> usize {
 	match plot_type {
-		PlotType::Scatter | PlotType::Bar => DEFAULT_CATEGORICAL_LIMIT,
+		PlotType::Scatter | PlotType::Bar | PlotType::Line => DEFAULT_CATEGORICAL_LIMIT,
 		_ => 0,
 	}
 }
@@ -1238,6 +1252,25 @@ mod tests {
 		assert_eq!(y.binding.field, "val");
 		assert_eq!(y.binding.semantic_type, SemanticType::Quantitative);
 		assert_eq!(y.binding.scale, ScaleFamily::Linear);
+	}
+
+	#[test]
+	fn named_line_preserves_exact_xy_and_projects_the_existing_line_contract() {
+		let result = stamped(df!("x" => [1_i64, 2], "y" => [3.0, 5.0]).expect("frame"));
+		let spec = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y");
+		let (resolved, _) = resolve(&spec, &result, &ColorIdentity::default()).expect("resolve");
+
+		assert_eq!(resolved.channel(Channel::X).unwrap().binding.field, "x");
+		assert_eq!(resolved.channel(Channel::Y).unwrap().binding.field, "y");
+		assert!(resolved.channel(Channel::Color).is_none());
+		assert_eq!(
+			resolved.kernel_fields.as_ref(),
+			&ResolvedKernelFields::Line {
+				series: None,
+				x: "x".to_owned(),
+				y: "y".to_owned(),
+			}
+		);
 	}
 
 	#[test]
