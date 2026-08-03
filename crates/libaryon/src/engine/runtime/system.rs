@@ -6005,7 +6005,9 @@ mod tests {
 				panel_id,
 				kind: "result-table".to_string(),
 				title: "Trip distribution".to_string(),
-				split_direction: SplitDirection::Vertical,
+				placement: crate::engine::HostPanelPlacement::Split {
+					direction: SplitDirection::Vertical,
+				},
 				focus: true,
 			},
 		);
@@ -6076,6 +6078,241 @@ mod tests {
 	}
 
 	#[test]
+	fn host_panel_placement_requests_tab_fallback_and_reopen_without_moving() {
+		use crate::engine::{HostPanelId, HostPanelPlacement};
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+		let anchor_id = HostPanelId::new(51);
+		let sibling_id = HostPanelId::new(52);
+		let missing_id = HostPanelId::new(999);
+
+		let anchor = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::OpenHostPanel {
+				panel_id: anchor_id,
+				kind: "rune-view-table".to_owned(),
+				title: "first-data".to_owned(),
+				placement: HostPanelPlacement::Split {
+					direction: SplitDirection::Horizontal,
+				},
+				focus: false,
+			},
+		);
+		let source_pane = anchor.focused_pane().expect("focused source pane").pane_id;
+		let anchor_pane = anchor
+			.panes
+			.iter()
+			.find(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|panel| panel.panel_id == anchor_id)
+			})
+			.expect("anchor panel pane")
+			.pane_id;
+		assert_eq!(anchor.panes.len(), 2);
+		assert!(!anchor.dividers.is_empty());
+
+		let tabbed = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::OpenHostPanel {
+				panel_id: sibling_id,
+				kind: "rune-view-plot".to_owned(),
+				title: "second-plot".to_owned(),
+				placement: HostPanelPlacement::TabWith {
+					panel_id: anchor_id,
+				},
+				focus: false,
+			},
+		);
+		assert_eq!(tabbed.panes.len(), 2, "TabWith must not create a pane");
+		assert_eq!(
+			tabbed
+				.focused_pane()
+				.expect("source focus retained")
+				.pane_id,
+			source_pane
+		);
+		let group = tabbed
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == anchor_pane)
+			.expect("group pane");
+		assert_eq!(
+			group
+				.tabs
+				.iter()
+				.map(|tab| tab.title.as_str())
+				.collect::<Vec<_>>(),
+			vec!["first-data", "second-plot"]
+		);
+		assert_eq!(group.active_doctab_index, 0);
+		assert_eq!(
+			group.host_panel.as_ref().map(|panel| panel.panel_id),
+			Some(anchor_id),
+			"focus:false leaves the anchor tab active"
+		);
+
+		let reopened = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::OpenHostPanel {
+				panel_id: sibling_id,
+				kind: "ignored-on-reopen".to_owned(),
+				title: "ignored-on-reopen".to_owned(),
+				placement: HostPanelPlacement::Split {
+					direction: SplitDirection::Vertical,
+				},
+				focus: true,
+			},
+		);
+		assert_eq!(reopened.panes.len(), 2, "reopen never relocates a panel");
+		let group = reopened
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == anchor_pane)
+			.expect("group survives reopen");
+		assert_eq!(
+			reopened.focused_pane().expect("group focused").pane_id,
+			anchor_pane
+		);
+		assert_eq!(group.active_doctab_index, 1);
+		assert_eq!(
+			group.host_panel.as_ref().map(|panel| panel.panel_id),
+			Some(sibling_id)
+		);
+		assert_eq!(
+			group
+				.tabs
+				.iter()
+				.map(|tab| tab.title.as_str())
+				.collect::<Vec<_>>(),
+			vec!["first-data", "second-plot"],
+			"reopen retains original descriptor and tab order"
+		);
+
+		let fallback_id = HostPanelId::new(53);
+		let fallback = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::OpenHostPanel {
+				panel_id: fallback_id,
+				kind: "fallback".to_owned(),
+				title: "fallback".to_owned(),
+				placement: HostPanelPlacement::TabWith {
+					panel_id: missing_id,
+				},
+				focus: false,
+			},
+		);
+		assert_eq!(fallback.panes.len(), 3);
+		assert!(fallback.panes.iter().any(|pane| {
+			pane.host_panel
+				.as_ref()
+				.is_some_and(|panel| panel.panel_id == fallback_id)
+		}));
+		assert_ne!(
+			fallback.status_message.as_deref(),
+			Some("No room to open a host panel")
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
+	fn closing_one_host_panel_tab_disposes_only_that_panel() {
+		use crate::engine::{
+			EngineConfig, EngineHandle, HostEvent, HostPanelId, HostPanelPlacement,
+		};
+		use std::time::Duration;
+
+		let mut handle = EngineHandle::spawn(EngineConfig::default());
+		let commands = handle.command_sender();
+		let events = handle.take_host_events().expect("host event stream");
+		let viewports = handle.take_viewports().expect("viewports");
+		let anchor_id = HostPanelId::new(61);
+		let sibling_id = HostPanelId::new(62);
+		commands
+			.send(EditorCommand::OpenHostPanel {
+				panel_id: anchor_id,
+				kind: "table".to_owned(),
+				title: "anchor".to_owned(),
+				placement: HostPanelPlacement::Split {
+					direction: SplitDirection::Horizontal,
+				},
+				focus: false,
+			})
+			.expect("open anchor");
+		commands
+			.send(EditorCommand::OpenHostPanel {
+				panel_id: sibling_id,
+				kind: "plot".to_owned(),
+				title: "sibling".to_owned(),
+				placement: HostPanelPlacement::TabWith {
+					panel_id: anchor_id,
+				},
+				focus: false,
+			})
+			.expect("open sibling tab");
+		std::thread::sleep(Duration::from_millis(300));
+		let projected = viewports
+			.try_iter()
+			.last()
+			.expect("tab collection projected");
+		let group = projected
+			.panes
+			.iter()
+			.find(|pane| pane.tabs.iter().any(|tab| tab.title == "sibling"))
+			.expect("group pane");
+		let sibling_view = group
+			.tabs
+			.iter()
+			.find(|tab| tab.title == "sibling")
+			.expect("sibling tab")
+			.view_id;
+		let pane_id = group.pane_id;
+		let _ = events.try_iter().count();
+		commands
+			.send(EditorCommand::CloseDocTab {
+				pane_id,
+				view_id: sibling_view,
+			})
+			.expect("close sibling tab");
+		std::thread::sleep(Duration::from_millis(300));
+
+		let disposals = events
+			.try_iter()
+			.filter_map(|event| match event {
+				HostEvent::PanelDisposed { panel_id } => Some(panel_id),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(disposals, vec![sibling_id]);
+		let projected = viewports.try_iter().last().expect("close projected");
+		let group = projected
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == pane_id)
+			.expect("group pane survives");
+		assert_eq!(
+			group
+				.tabs
+				.iter()
+				.map(|tab| tab.title.as_str())
+				.collect::<Vec<_>>(),
+			vec!["anchor"]
+		);
+		assert_eq!(
+			group.host_panel.as_ref().map(|panel| panel.panel_id),
+			Some(anchor_id)
+		);
+
+		handle.shutdown().expect("engine thread");
+	}
+
+	#[test]
 	fn a_focused_host_panel_declines_document_keys_but_keeps_workspace_control() {
 		use crate::engine::{
 			EngineConfig, EngineHandle, HostEvent, HostPanelId, InputEvent, KeyCode, Modifiers,
@@ -6094,7 +6331,9 @@ mod tests {
 				panel_id,
 				kind: "result-table".to_string(),
 				title: "Results".to_string(),
-				split_direction: SplitDirection::Vertical,
+				placement: crate::engine::HostPanelPlacement::Split {
+					direction: SplitDirection::Vertical,
+				},
 				focus: false,
 			})
 			.expect("open panel");
@@ -6168,7 +6407,9 @@ mod tests {
 				panel_id,
 				kind: "result-table".to_string(),
 				title: "Results".to_string(),
-				split_direction: SplitDirection::Vertical,
+				placement: crate::engine::HostPanelPlacement::Split {
+					direction: SplitDirection::Vertical,
+				},
 				focus: true,
 			})
 			.expect("open panel");
@@ -6225,7 +6466,9 @@ mod tests {
 				panel_id,
 				kind: "dashboard".to_string(),
 				title: "Dashboard".to_string(),
-				split_direction: SplitDirection::Vertical,
+				placement: crate::engine::HostPanelPlacement::Split {
+					direction: SplitDirection::Vertical,
+				},
 				focus: true,
 			})
 			.expect("open panel");

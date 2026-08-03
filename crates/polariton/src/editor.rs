@@ -27,8 +27,8 @@ use libaryon::engine::{
 	Modifiers,
 };
 use libaryon::engine::{
-	HostEvent, HostPanelId, MinimapSnapshot, PaneDropEdge, PanelRevision, SplitDirection,
-	UiPalette, VisualKind, minimap_click_viewport_start_line,
+	HostEvent, HostPanelId, HostPanelPlacement, MinimapSnapshot, PaneDropEdge, PanelRevision,
+	SplitDirection, UiPalette, VisualKind, minimap_click_viewport_start_line,
 };
 use libaryon::svp::markdown_blocks::{
 	ListMarker, MarkdownBlock, MarkdownInlineText, line_start_byte, parse_markdown_blocks,
@@ -786,7 +786,9 @@ impl CodeEditor {
 				panel_id: RESULT_PANEL,
 				kind: "result-table".to_owned(),
 				title: "Results".to_owned(),
-				split_direction: SplitDirection::Horizontal,
+				placement: HostPanelPlacement::Split {
+					direction: SplitDirection::Horizontal,
+				},
 				focus: false,
 			});
 		}
@@ -817,8 +819,15 @@ impl CodeEditor {
 			self.panels.mark_orphaned(panel_id);
 		}
 
-		for (identity, form) in views {
-			let panel_id = self.resolve_rune_view_panel(producer, identity.clone());
+		let anchor_panel_id = views
+			.first()
+			.map(|(identity, _)| self.resolve_rune_view_panel(producer, identity.clone()));
+		for (index, (identity, form)) in views.iter().enumerate() {
+			let panel_id = if index == 0 {
+				anchor_panel_id.expect("a non-empty view collection has an anchor")
+			} else {
+				self.resolve_rune_view_panel(producer, identity.clone())
+			};
 			let known = self.panels.panels.contains_key(&panel_id)
 				&& !self.panels.pending_disposal.contains(&panel_id);
 			if known {
@@ -841,7 +850,16 @@ impl CodeEditor {
 					}
 					.to_owned(),
 					title,
-					split_direction: SplitDirection::Horizontal,
+					placement: if index == 0 {
+						HostPanelPlacement::Split {
+							direction: SplitDirection::Horizontal,
+						}
+					} else {
+						HostPanelPlacement::TabWith {
+							panel_id: anchor_panel_id
+								.expect("later views share the collection anchor"),
+						}
+					},
 					focus: false,
 				});
 			}
@@ -991,7 +1009,9 @@ impl CodeEditor {
 			panel_id: DASHBOARD_PANEL,
 			kind: "dashboard".to_owned(),
 			title: "Dashboard".to_owned(),
-			split_direction: SplitDirection::Vertical,
+			placement: HostPanelPlacement::Split {
+				direction: SplitDirection::Vertical,
+			},
 			focus: true,
 		});
 	}
@@ -4482,9 +4502,9 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 mod tests {
 	use super::{
 		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg,
-		INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors,
-		Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneTabAction, Rgb, SplitDirection,
-		UiPalette, command_bar_fragments, fence_body_start, highlight_span_at,
+		HostPanelPlacement, INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock,
+		MarkdownPreviewColors, Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneTabAction, Rgb,
+		SplitDirection, UiPalette, command_bar_fragments, fence_body_start, highlight_span_at,
 		markdown_code_fragments, metrics, pane_gutter_width, pane_title, parse_markdown_blocks,
 		preview_row_budget, preview_source_window, prompt_cursor_byte, viewport_cells,
 		visible_blocks,
@@ -5426,7 +5446,9 @@ mod tests {
 			panel_id: HostPanelId::new(1),
 			kind: "result-table".to_string(),
 			title: "Results".to_string(),
-			split_direction: SplitDirection::Vertical,
+			placement: HostPanelPlacement::Split {
+				direction: SplitDirection::Vertical,
+			},
 			focus: false,
 		});
 		wait_for_host_panel(&mut editor);
@@ -5452,6 +5474,84 @@ mod tests {
 		assert_eq!(panel.kind, "result-table");
 	}
 
+	#[cfg(feature = "toron")]
+	#[test]
+	fn rune_view_collection_opens_one_split_with_ordered_host_tabs() {
+		use crate::rune_relation_envelope::{LocalViewIdentity, RuneViewForm};
+		use libaryon::core::BufferId;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let source_pane = editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.expect("source pane")
+			.pane_id;
+		let views = [
+			(
+				LocalViewIdentity::Named("points".to_owned()),
+				RuneViewForm::Scatter,
+			),
+			(
+				LocalViewIdentity::Named("first-data".to_owned()),
+				RuneViewForm::Table,
+			),
+			(
+				LocalViewIdentity::Named("totals".to_owned()),
+				RuneViewForm::Bar,
+			),
+			(
+				LocalViewIdentity::Named("second-data".to_owned()),
+				RuneViewForm::Table,
+			),
+		];
+		editor.prepare_rune_view_panels(BufferId::new(901), &views, 1);
+
+		let expected = ["points", "first-data", "totals", "second-data"];
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			!viewport.panes.iter().any(|pane| {
+				pane.tabs
+					.iter()
+					.map(|tab| tab.title.as_str())
+					.eq(expected.iter().copied())
+			})
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+
+		let viewport = editor.viewport.as_ref().expect("view collection projected");
+		assert_eq!(viewport.panes.len(), 2, "four views require one new pane");
+		assert_eq!(
+			viewport
+				.focused_pane()
+				.expect("source focus retained")
+				.pane_id,
+			source_pane
+		);
+		let collection = viewport
+			.panes
+			.iter()
+			.find(|pane| {
+				pane.tabs
+					.iter()
+					.map(|tab| tab.title.as_str())
+					.eq(expected.iter().copied())
+			})
+			.expect("ordered view tab collection");
+		assert_eq!(collection.active_doctab_index, 0);
+		assert_eq!(
+			collection
+				.host_panel
+				.as_ref()
+				.map(|panel| panel.title.as_str()),
+			Some("points")
+		);
+	}
+
 	#[test]
 	fn disposal_releases_only_after_the_projection_agrees() {
 		use libaryon::engine::{HostEvent, HostPanelId};
@@ -5463,7 +5563,9 @@ mod tests {
 			panel_id,
 			kind: "dashboard".to_string(),
 			title: "Dashboard".to_string(),
-			split_direction: SplitDirection::Vertical,
+			placement: HostPanelPlacement::Split {
+				direction: SplitDirection::Vertical,
+			},
 			focus: true,
 		});
 		wait_for_host_panel(&mut editor);
@@ -5820,7 +5922,9 @@ mod tests {
 			panel_id: HostPanelId::new(3),
 			kind: "result-table".to_string(),
 			title: "Results".to_string(),
-			split_direction: SplitDirection::Vertical,
+			placement: HostPanelPlacement::Split {
+				direction: SplitDirection::Vertical,
+			},
 			focus: false,
 		});
 		wait_for_host_panel(&mut editor);
@@ -7515,7 +7619,9 @@ mod tests {
 			panel_id: HostPanelId::new(99),
 			kind: "result-table".to_owned(),
 			title: "Results".to_owned(),
-			split_direction: SplitDirection::Vertical,
+			placement: HostPanelPlacement::Split {
+				direction: SplitDirection::Vertical,
+			},
 			focus: true,
 		});
 		let deadline = Instant::now() + Duration::from_secs(10);

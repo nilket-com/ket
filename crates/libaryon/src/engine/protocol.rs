@@ -90,6 +90,19 @@ pub enum SplitDirection {
 	Vertical,
 }
 
+/// Advisory initial placement for a host-rendered panel. The engine remains
+/// the sole authority over workspace geometry and tab membership and may fall
+/// back to its own placement policy when a request cannot be satisfied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPanelPlacement {
+	Split {
+		direction: SplitDirection,
+	},
+	TabWith {
+		panel_id: crate::engine::HostPanelId,
+	},
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneFocusDirection {
 	Up,
@@ -314,17 +327,17 @@ pub enum EditorCommand {
 	WriteInit {
 		force: bool,
 	},
-	/// Open a host-rendered panel in a split beside the focused pane. The
-	/// engine owns its identity, geometry, focus, and tab membership; the
-	/// frontend draws its contents and owns its backing state. `focus` makes
-	/// focus transfer explicit: query results can appear without interrupting
-	/// typing in their source pane.
+	/// Open a host-rendered panel with an advisory initial placement. The engine
+	/// owns its identity, geometry, focus, and tab membership; the frontend
+	/// draws its contents and owns its backing state. `focus` makes focus
+	/// transfer explicit: query results can appear without interrupting typing
+	/// in their source pane.
 	OpenHostPanel {
 		panel_id: crate::engine::HostPanelId,
 		kind: String,
 		title: String,
-		/// Direction of the initial split when this identity is first opened.
-		split_direction: SplitDirection,
+		/// Ignored when this identity already has a live view.
+		placement: HostPanelPlacement,
 		focus: bool,
 	},
 	/// Rebind a live panel to a new revision of its source, so the frontend can

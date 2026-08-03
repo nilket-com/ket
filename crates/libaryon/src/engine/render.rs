@@ -1576,6 +1576,8 @@ fn render_pane_viewport(
 						"git".to_string()
 					} else if uast_inspector_buffer_ids.contains(&view.buffer_id) {
 						"uast".to_string()
+					} else if let Some(panel) = buffer.host_panel() {
+						panel.descriptor.title.clone()
 					} else if let Some(provenance) = snapshot_provenance {
 						// A snapshot partner: name it after the version it
 						// was cut from, e.g. `main.rs@HEAD~3`.

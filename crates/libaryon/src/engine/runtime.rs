@@ -47,8 +47,8 @@ use super::markdown_image_preview::{
 };
 use super::navigation::{GotoDefinitionRequest, JumpEntry, NavigationResolved, NavigationStamp};
 use super::protocol::{
-	ConfirmAction, EditorCommand, EditorMode, MouseIntent, MoveDirection, PickerAction,
-	PickerCursorMovement, RepoSearchMode, SplitDirection,
+	ConfirmAction, EditorCommand, EditorMode, HostPanelPlacement, MouseIntent, MoveDirection,
+	PickerAction, PickerCursorMovement, RepoSearchMode, SplitDirection,
 };
 use super::render::{RenderParams, render_frame};
 use super::request::{EngineRequest, InternalEvent};
@@ -4191,22 +4191,39 @@ fn dispatch_command(
 			panel_id,
 			kind,
 			title,
-			split_direction,
+			placement,
 			focus,
 		} => {
 			// Reopening an existing identity never duplicates its host object.
 			if let Some(buffer_id) = session.host_panel_buffer_id(panel_id) {
 				if focus
-					&& let Some(pane_id) = session
-						.layout
-						.view_id_for_buffer(buffer_id)
-						.and_then(|view_id| session.layout.pane_id_for_view(view_id))
+					&& let Some(view_id) = session.layout.view_id_for_buffer(buffer_id)
+					&& let Some(pane_id) = session.layout.pane_id_for_view(view_id)
 				{
+					let activated = session
+						.layout
+						.find_pane_mut(pane_id)
+						.expect("resolved host-panel pane remains live during command dispatch")
+						.activate_view(view_id);
+					assert!(activated, "resolved host-panel view belongs to its pane");
 					session.focus_pane(pane_id);
 				}
 			} else {
 				let focused_pane_id = session.focused_pane_id;
-				let (viewport_width, viewport_lines) = new_doctab_viewport(session);
+				let tab_target = match placement {
+					HostPanelPlacement::TabWith { panel_id } => session
+						.host_panel_buffer_id(panel_id)
+						.and_then(|buffer_id| session.layout.view_id_for_buffer(buffer_id))
+						.and_then(|view_id| session.layout.pane_id_for_view(view_id)),
+					HostPanelPlacement::Split { .. } => None,
+				};
+				let (viewport_width, viewport_lines) = tab_target
+					.and_then(|pane_id| session.layout.find_pane(pane_id))
+					.map(|pane| {
+						let active = pane.active_tab().common();
+						(active.viewport_width, active.viewport_lines)
+					})
+					.unwrap_or_else(|| new_doctab_viewport(session));
 				let view = session.create_host_panel_view(
 					panel_id,
 					crate::engine::HostPanelDescriptor { kind, title },
@@ -4214,15 +4231,32 @@ fn dispatch_command(
 					viewport_lines,
 				);
 				let buffer_id = view.buffer_id;
-				let pane = EditorPane::from_view(view);
-				if session
-					.split_pane_with_new_pane_order(focused_pane_id, split_direction, pane, false)
-					.is_none()
-				{
-					release_buffer(runtime, session, buffer_id);
-					session.ui.status_message = Some("No room to open a host panel".to_string());
-				} else if !focus {
-					session.focus_pane(focused_pane_id);
+				if let Some(target_pane_id) = tab_target {
+					let target = session
+						.layout
+						.find_pane_mut(target_pane_id)
+						.expect("resolved tab target remains live during command dispatch");
+					target.tabs.push(view);
+					if focus {
+						target.active_tab_index = target.tabs.len().saturating_sub(1);
+						session.focus_pane(target_pane_id);
+					}
+				} else {
+					let direction = match placement {
+						HostPanelPlacement::Split { direction } => direction,
+						HostPanelPlacement::TabWith { .. } => SplitDirection::Horizontal,
+					};
+					let pane = EditorPane::from_view(view);
+					if session
+						.split_pane_with_new_pane_order(focused_pane_id, direction, pane, false)
+						.is_none()
+					{
+						release_buffer(runtime, session, buffer_id);
+						session.ui.status_message =
+							Some("No room to open a host panel".to_string());
+					} else if !focus {
+						session.focus_pane(focused_pane_id);
+					}
 				}
 			}
 			needs_render = true;
