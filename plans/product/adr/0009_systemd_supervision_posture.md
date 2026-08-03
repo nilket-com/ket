@@ -58,10 +58,12 @@ This partially supersedes TORON-532 §3 on the words "service installation" only
 Its foreground-only rule, its process-group isolation, its drain ordering, and
 its parent-death contract all remain in force unchanged.
 
-### 2. The unit must preserve Nilket's own ordering guarantees
+### 2. The unit must preserve Nilket's runtime preconditions and ordering guarantees
 
 A supervising unit is correct only if the guarantees TORON-532 built survive it.
-Three properties are required of any sanctioned unit:
+It must preserve both the process-control contract and the resource environment
+the same deployment receives when started from the supported terminal path.
+Four properties are required of any sanctioned unit:
 
 - **`Type=exec`**, or an equivalent that supervises a foreground process. A type
   that expects the process to background itself would require the behavior
@@ -76,6 +78,14 @@ Three properties are required of any sanctioned unit:
   carry a 35-second drain. The installed unit uses `TimeoutStopSec=90s` with
   `KillMode=mixed`, so the ordered drain runs first and the cgroup is cleaned only
   if it overruns.
+- **`LimitNOFILE=524288`.** The systemd user manager supplied a soft descriptor
+  limit of 1,024 even though its hard limit, and both limits in the supported
+  login-shell path, were 524,288. Wendelon crossed that lower limit while
+  bootstrapping a dogfood profile containing 42,048 files and failed with
+  `Too many open files`. The service had therefore diverged from the terminal
+  path despite executing the same binary and command. A sanctioned unit raises
+  both limits to the established terminal-path value rather than inheriting a
+  service-manager default that makes a growing profile a restart time bomb.
 
 The unit also selects the profile explicitly with `--data-dir` and restricts
 permissions with `UMask=0077`, matching the profile's own `0700` posture.
@@ -179,6 +189,8 @@ approval reports what to run rather than escalating.
   supervisor implements.
 - **A stop timeout below the drain budget:** converts an ordered shutdown into a
   cgroup kill on every stop.
+- **Inheriting the service manager's descriptor limit:** makes service startup
+  fail at a profile size that succeeds through the supported terminal path.
 - **Default start limits with a five-second restart delay:** unreachable by
   construction, so persistent failure presents as indefinite quiet flapping.
 - **Enabling linger by default:** changes custody posture without the user asking.
@@ -195,13 +207,15 @@ approval reports what to run rather than escalating.
 - TORON-532 §3's "service installation" clause is superseded; everything else in
   §3 stands. PRODUCT-0006's non-goal is narrowed to self-daemonization, which is
   what it was protecting.
-- The installed unit does not yet satisfy section 4. Bringing it into line is a
-  scheduled `chore: adr 0009 bound service restart failures` commit covering the
-  unit template, the installer's rendered-unit assertions, and the README's
-  unattended development-custody statement from section 5. It is deliberately
-  separate from this record and from any PRODUCT-0008 work, so a packaging change
-  cannot ride along inside a surface commit.
-- Every other property of section 2 the installed unit already satisfies.
+- Commit `dc06fa4f` satisfied sections 4 and 5. On the next real restart, the
+  explicit budget stopped five identical `Too many open files` failures in a
+  visible `failed` state rather than flapping indefinitely; the record's failure
+  posture therefore produced the diagnostic evidence that exposed section 2's
+  missing resource precondition.
+- The installed template does not yet satisfy section 2's descriptor limit. A
+  separate fix adds `LimitNOFILE=524288` and an exact rendered-unit assertion.
+  Applying that template to an installed service remains an explicit operator
+  action; this record does not authorize changing a live deployment.
 - PRODUCT-0002 §9's promotion checklist stays open, and a future record deciding
   remembered consent or lazy availability must say whether external supervision
   has made either unnecessary rather than assuming it has.
