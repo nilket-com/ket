@@ -2009,6 +2009,7 @@ fn release_buffer(
 	let Some(mut buffer) = session.buffers.remove(buffer_id) else {
 		return;
 	};
+	session.host_panel_group_producer_released(buffer_id);
 	session.snapshot_partners.remove(&buffer_id);
 	// Callers reach here only once no view references the buffer, so this is
 	// the panel's last workspace reference disappearing.
@@ -2067,6 +2068,7 @@ fn release_buffer(
 			"rootless buffer cannot retire authoritative payload"
 		);
 	}
+	session.collect_unreachable_host_panel_groups();
 }
 
 fn retire_parked_generations(
@@ -4285,7 +4287,13 @@ fn dispatch_command(
 			}
 			needs_render = true;
 		}
-		EditorCommand::ResetHostPanelGroup { .. } => {
+		EditorCommand::ResetHostPanelGroup { group_id } => {
+			let removed = session.reset_host_panel_group(group_id);
+			for buffer_id in removed {
+				if session.layout.view_count_for_buffer(buffer_id) == 0 {
+					release_buffer(runtime, session, buffer_id);
+				}
+			}
 			needs_render = true;
 		}
 		EditorCommand::RefreshHostPanel { panel_id, revision } => {

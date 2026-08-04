@@ -2661,6 +2661,36 @@ fn build_host_panel_group_tile(
 	root
 }
 
+fn build_plain_pane_branch(mut panes: Vec<(PaneId, EditorPane)>) -> Option<LayoutNode> {
+	if panes.is_empty() {
+		return None;
+	}
+	if panes.len() == 1 {
+		let (pane_id, pane) = panes.pop().expect("one plain pane");
+		return Some(LayoutNode::Leaf(LayoutLeaf {
+			group_root: None,
+			pane_id,
+			pane,
+		}));
+	}
+	let count = panes.len();
+	Some(LayoutNode::Split {
+		group_root: None,
+		direction: SplitDirection::Horizontal,
+		children: panes
+			.into_iter()
+			.map(|(pane_id, pane)| {
+				LayoutNode::Leaf(LayoutLeaf {
+					group_root: None,
+					pane_id,
+					pane,
+				})
+			})
+			.collect(),
+		ratios: vec![DEFAULT_SPLIT_RATIO; count],
+	})
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneResizeResult {
 	Resized,
@@ -2674,6 +2704,13 @@ enum ResizeLeafResult {
 	Resized,
 	NoMatchingAncestor,
 	AtLimit,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GroupRootEditResult {
+	NotFound,
+	Replaced,
+	RemoveSelf,
 }
 
 impl LayoutNode {
@@ -2794,6 +2831,64 @@ impl LayoutNode {
 				.any(|child| child.rebuild_group_root(target, rebuild)),
 			Self::Leaf(_) => false,
 		}
+	}
+
+	fn reconcile_group_root(
+		&mut self,
+		target: HostPanelGroupId,
+		reconcile: &mut Option<impl FnOnce(LayoutNode) -> Option<LayoutNode>>,
+	) -> GroupRootEditResult {
+		if self.group_root() == Some(target) {
+			let placeholder = LayoutNode::Split {
+				group_root: None,
+				direction: SplitDirection::Vertical,
+				children: Vec::new(),
+				ratios: Vec::new(),
+			};
+			let old = std::mem::replace(self, placeholder);
+			return if let Some(replacement) =
+				reconcile
+					.take()
+					.expect("a group reconciliation runs exactly once")(old)
+			{
+				*self = replacement;
+				GroupRootEditResult::Replaced
+			} else {
+				GroupRootEditResult::RemoveSelf
+			};
+		}
+
+		let Self::Split {
+			group_root,
+			children,
+			ratios,
+			..
+		} = self
+		else {
+			return GroupRootEditResult::NotFound;
+		};
+		let inherited_group = *group_root;
+		let mut index = 0usize;
+		while index < children.len() {
+			match children[index].reconcile_group_root(target, reconcile) {
+				GroupRootEditResult::NotFound => index += 1,
+				GroupRootEditResult::Replaced => return GroupRootEditResult::Replaced,
+				GroupRootEditResult::RemoveSelf => {
+					children.remove(index);
+					ratios.remove(index);
+					if children.len() == 1 {
+						let mut remaining = children.remove(0);
+						if let Some(group_id) = inherited_group {
+							debug_assert!(remaining.group_root().is_none());
+							remaining.set_group_root(Some(group_id));
+						}
+						*self = remaining;
+					}
+					return GroupRootEditResult::Replaced;
+				}
+			}
+		}
+		GroupRootEditResult::NotFound
 	}
 
 	fn into_leaf_panes(self, out: &mut Vec<(PaneId, EditorPane)>) {
@@ -3000,7 +3095,6 @@ impl LayoutNode {
 				let subtree = subtree
 					.take()
 					.expect("subtree target consumes the candidate exactly once");
-				debug_assert!(subtree.group_root().is_some());
 				let children = if new_first {
 					vec![subtree, old_leaf]
 				} else {
@@ -4653,6 +4747,38 @@ impl EditorSession {
 			.and_then(|view_id| self.layout.pane_id_for_view(view_id))
 	}
 
+	fn group_owning_panel(&self, panel_id: HostPanelId) -> Option<HostPanelGroupId> {
+		self.host_panel_groups.iter().find_map(|(group_id, group)| {
+			(group
+				.current_members
+				.iter()
+				.any(|member| member.panel_id == panel_id)
+				|| group.retained_members.contains_key(&panel_id)
+				|| group.detached_members.contains(&panel_id))
+			.then_some(*group_id)
+		})
+	}
+
+	fn clear_empty_group_root(&mut self, group_id: HostPanelGroupId) {
+		let Some(group) = self.host_panel_groups.get(&group_id) else {
+			return;
+		};
+		let has_attached_member = group
+			.current_members
+			.iter()
+			.map(|member| member.panel_id)
+			.chain(group.retained_members.keys().copied())
+			.filter(|panel_id| !group.detached_members.contains(panel_id))
+			.any(|panel_id| {
+				self.pane_id_for_panel(panel_id).is_some_and(|pane_id| {
+					self.layout.group_containing_pane(pane_id) == Some(group_id)
+				})
+			});
+		if !has_attached_member && let Some(root) = self.layout.find_group_root_mut(group_id) {
+			root.set_group_root(None);
+		}
+	}
+
 	fn group_dimensions(&self, group: &HostPanelGroupState) -> (u16, u32) {
 		group
 			.latest_valid_anchor
@@ -4716,6 +4842,10 @@ impl EditorSession {
 		}
 
 		if let Some(mut group) = self.host_panel_groups.remove(&group_id) {
+			if group.producer_buffer_id.is_none() {
+				self.host_panel_groups.insert(group_id, group);
+				return Vec::new();
+			}
 			let mut unique = HashSet::new();
 			let conflicts = members.iter().any(|member| !unique.insert(member.panel_id))
 				|| self.host_panel_groups.values().any(|other| {
@@ -5043,6 +5173,259 @@ impl EditorSession {
 		);
 		debug_assert!(self.layout.count_group_roots(group_id) <= 1);
 		unplaced
+	}
+
+	/// Reconcile one producer-owned group to its latest successful membership.
+	/// Returns orphan backing buffers whose removed workspace views may now be
+	/// released through the ordinary host-panel lifecycle.
+	pub(crate) fn reset_host_panel_group(&mut self, group_id: HostPanelGroupId) -> Vec<BufferId> {
+		let Some(mut group) = self.host_panel_groups.remove(&group_id) else {
+			return Vec::new();
+		};
+		if group.producer_buffer_id.is_none() {
+			self.host_panel_groups.insert(group_id, group);
+			return Vec::new();
+		}
+
+		let current_ids = group
+			.current_members
+			.iter()
+			.map(|member| member.panel_id)
+			.collect::<HashSet<_>>();
+		let has_root = self.layout.contains_group_root(group_id);
+		let current_panes = group
+			.current_members
+			.iter()
+			.filter_map(|member| self.pane_id_for_panel(member.panel_id))
+			.collect::<HashSet<_>>();
+		let attached_current = group.current_members.iter().all(|member| {
+			!group.detached_members.contains(&member.panel_id)
+				&& self
+					.pane_id_for_panel(member.panel_id)
+					.is_some_and(|pane_id| {
+						self.layout.group_containing_pane(pane_id) == Some(group_id)
+					})
+		});
+		let no_foreign = self
+			.layout
+			.find_group_root(group_id)
+			.is_some_and(|root| root.pane_count() == current_panes.len());
+		if group.layout_state == HostPanelGroupLayoutState::Automatic
+			&& group.retained_members.is_empty()
+			&& group.detached_members.is_empty()
+			&& attached_current
+			&& no_foreign
+		{
+			self.host_panel_groups.insert(group_id, group);
+			return Vec::new();
+		}
+
+		if !has_root && !group.current_members.is_empty() {
+			let Some(anchor) = group
+				.latest_valid_anchor
+				.filter(|pane_id| self.layout.can_host_group_subtree(*pane_id))
+			else {
+				self.host_panel_groups.insert(group_id, group);
+				return Vec::new();
+			};
+			let minimum = host_panel_tile_minimum(group.current_members.len());
+			let fits = self
+				.pane_layouts()
+				.into_iter()
+				.find(|layout| layout.pane_id == anchor)
+				.is_some_and(|anchor_layout| {
+					let width = anchor_layout
+						.rect
+						.width
+						.get()
+						.saturating_sub(SPLIT_DIVIDER_COLS)
+						/ 2;
+					minimum.0 <= width && minimum.1 <= anchor_layout.rect.height.get()
+				});
+			if !fits {
+				self.host_panel_groups.insert(group_id, group);
+				return Vec::new();
+			}
+		}
+
+		let dimensions = self.group_dimensions(&group);
+		let panel_by_buffer = group
+			.current_members
+			.iter()
+			.chain(group.retained_members.values())
+			.filter_map(|member| {
+				self.host_panel_buffer_id(member.panel_id)
+					.map(|buffer_id| (buffer_id, member.panel_id))
+			})
+			.collect::<HashMap<_, _>>();
+		let buffer_by_panel = panel_by_buffer
+			.iter()
+			.map(|(buffer_id, panel_id)| (*panel_id, *buffer_id))
+			.collect::<HashMap<_, _>>();
+		let orphan_ids = group
+			.retained_members
+			.keys()
+			.copied()
+			.chain(
+				group
+					.detached_members
+					.iter()
+					.copied()
+					.filter(|panel_id| !current_ids.contains(panel_id)),
+			)
+			.collect::<HashSet<_>>();
+
+		let mut current_panes_by_panel = HashMap::new();
+		let mut removed_buffers = Vec::new();
+		for member in &group.current_members {
+			let Some(pane_id) = self.pane_id_for_panel(member.panel_id) else {
+				continue;
+			};
+			if self.layout.group_containing_pane(pane_id) == Some(group_id) {
+				continue;
+			}
+			if let Some(pane) = self.layout.take_leaf(pane_id) {
+				current_panes_by_panel.insert(member.panel_id, (pane_id, pane));
+			}
+		}
+		for panel_id in &orphan_ids {
+			let Some(pane_id) = self.pane_id_for_panel(*panel_id) else {
+				continue;
+			};
+			if self.layout.group_containing_pane(pane_id) == Some(group_id) {
+				continue;
+			}
+			if self.layout.take_leaf(pane_id).is_some()
+				&& let Some(buffer_id) = self.host_panel_buffer_id(*panel_id)
+			{
+				removed_buffers.push(buffer_id);
+			}
+		}
+
+		let mut foreign_panes = Vec::new();
+		if has_root {
+			let mut reconcile = Some(|old: LayoutNode| {
+				let mut panes = Vec::new();
+				old.into_leaf_panes(&mut panes);
+				for (pane_id, pane) in panes {
+					let panel_id = pane
+						.tabs
+						.iter()
+						.find_map(|view| panel_by_buffer.get(&view.buffer_id).copied());
+					match panel_id {
+						Some(panel_id) if current_ids.contains(&panel_id) => {
+							current_panes_by_panel.insert(panel_id, (pane_id, pane));
+						}
+						Some(panel_id) if orphan_ids.contains(&panel_id) => {
+							if let Some(buffer_id) = buffer_by_panel.get(&panel_id) {
+								removed_buffers.push(*buffer_id);
+							}
+						}
+						_ => foreign_panes.push((pane_id, pane)),
+					}
+				}
+				None
+			});
+			let edited = self.layout.reconcile_group_root(group_id, &mut reconcile);
+			debug_assert_eq!(edited, GroupRootEditResult::Replaced);
+		}
+
+		for member in &group.current_members {
+			if !current_panes_by_panel.contains_key(&member.panel_id) {
+				let (pane_id, pane, _) = self.make_group_member_pane(member, dimensions);
+				current_panes_by_panel.insert(member.panel_id, (pane_id, pane));
+			}
+		}
+		let tiled = group
+			.current_members
+			.iter()
+			.filter_map(|member| {
+				current_panes_by_panel
+					.remove(&member.panel_id)
+					.map(|(pane_id, pane)| (pane_id, pane, member.shape))
+			})
+			.collect::<Vec<_>>();
+		let tile = (!tiled.is_empty()).then(|| {
+			build_host_panel_group_tile(group_id, tiled, HostPanelGroupLayout::RowMajorTile)
+		});
+		let foreign = build_plain_pane_branch(foreign_panes);
+		let replacement = match (tile, foreign) {
+			(Some(tile), Some(foreign)) => Some(LayoutNode::Split {
+				group_root: None,
+				direction: SplitDirection::Vertical,
+				children: vec![tile, foreign],
+				ratios: vec![DEFAULT_SPLIT_RATIO, DEFAULT_SPLIT_RATIO],
+			}),
+			(Some(tile), None) => Some(tile),
+			(None, Some(foreign)) => Some(foreign),
+			(None, None) => None,
+		};
+
+		if has_root {
+			if let Some(replacement) = replacement {
+				let anchor = group
+					.latest_valid_anchor
+					.filter(|pane_id| self.layout.find_pane(*pane_id).is_some())
+					.unwrap_or(self.focused_pane_id);
+				let inserted = self.layout.split_leaf_with_subtree(
+					anchor,
+					SplitDirection::Vertical,
+					replacement,
+					false,
+				);
+				debug_assert!(inserted);
+			}
+		} else if let Some(replacement) = replacement {
+			let anchor = group.latest_valid_anchor.expect("reset preflighted anchor");
+			let inserted = self.layout.split_leaf_with_subtree(
+				anchor,
+				SplitDirection::Vertical,
+				replacement,
+				false,
+			);
+			debug_assert!(inserted);
+		}
+
+		group.layout_state = HostPanelGroupLayoutState::Automatic;
+		group.retained_members.clear();
+		group.detached_members.clear();
+		self.host_panel_groups.insert(group_id, group);
+		debug_assert!(self.layout.count_group_roots(group_id) <= 1);
+		removed_buffers
+	}
+
+	pub(crate) fn host_panel_group_producer_released(&mut self, buffer_id: BufferId) {
+		for group in self.host_panel_groups.values_mut() {
+			if group.producer_buffer_id == Some(buffer_id) {
+				group.producer_buffer_id = None;
+			}
+		}
+	}
+
+	pub(crate) fn collect_unreachable_host_panel_groups(&mut self) {
+		let unreachable = self
+			.host_panel_groups
+			.iter()
+			.filter_map(|(group_id, group)| {
+				if group.producer_buffer_id.is_some() {
+					return None;
+				}
+				let has_placement = group
+					.current_members
+					.iter()
+					.map(|member| member.panel_id)
+					.chain(group.retained_members.keys().copied())
+					.chain(group.detached_members.iter().copied())
+					.any(|panel_id| self.pane_id_for_panel(panel_id).is_some());
+				(!has_placement).then_some(*group_id)
+			})
+			.collect::<Vec<_>>();
+		for group_id in unreachable {
+			if let Some(root) = self.layout.find_group_root_mut(group_id) {
+				root.set_group_root(None);
+			}
+			self.host_panel_groups.remove(&group_id);
+		}
 	}
 
 	/// Queue an ordered frontend event. Accumulated on the session so producers
@@ -5605,6 +5988,11 @@ impl EditorSession {
 		}
 		let source_group = self.layout.group_containing_pane(source);
 		let destination_group = self.layout.group_containing_pane(target);
+		let source_panel = self
+			.layout
+			.find_pane(source)
+			.and_then(|pane| self.panel_id_in_pane(pane));
+		let owner_group = source_panel.and_then(|panel_id| self.group_owning_panel(panel_id));
 		let moved = match edge {
 			PaneDropEdge::Center => self.layout.swap_leaf_contents(source, target),
 			edge => {
@@ -5623,10 +6011,17 @@ impl EditorSession {
 			}
 		};
 		if moved {
-			if let Some(group_id) = destination_group
-				&& (source_group == Some(group_id) || source_group.is_none())
-			{
+			if let Some(group_id) = destination_group {
 				self.mark_host_panel_group_manual(group_id);
+			}
+			if let (Some(panel_id), Some(owner_group)) = (source_panel, owner_group)
+				&& source_group == Some(owner_group)
+				&& destination_group != Some(owner_group)
+			{
+				if let Some(group) = self.host_panel_groups.get_mut(&owner_group) {
+					group.detached_members.insert(panel_id);
+				}
+				self.clear_empty_group_root(owner_group);
 			}
 			// Center swaps content into the target position; edge drops preserve
 			// the source id. Focusing the target for center drops keeps the
@@ -5696,7 +6091,7 @@ mod tests {
 	use crate::engine::test_support::{build_document, build_split_virtual_document};
 	use crate::engine::{
 		HostPanelDescriptor, HostPanelGroupId, HostPanelGroupLayout, HostPanelGroupMember,
-		HostPanelGroupShape, HostPanelId,
+		HostPanelGroupShape, HostPanelId, PaneDropEdge,
 	};
 	use crate::engine::{SplitDirection, UiColorOverrides, VisualKind};
 	use crate::uast::UastMutation;
@@ -5999,6 +6394,219 @@ mod tests {
 			session.host_panel_groups[&group_id].layout_state,
 			HostPanelGroupLayoutState::Manual
 		);
+	}
+
+	#[test]
+	fn product_0015_detachment_survives_ensure_and_reset_reclaims_across_groups() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		session.update_terminal_size(240, 80);
+		let first_anchor = session.focused_pane_id;
+		assert!(session.split_focused_pane(&registry, SplitDirection::Horizontal));
+		let second_anchor = session.focused_pane_id;
+		session.focus_pane(first_anchor);
+		let first_group = HostPanelGroupId::new(6);
+		let second_group = HostPanelGroupId::new(7);
+		session.ensure_host_panel_group(
+			first_group,
+			Some(first_anchor),
+			product_0015_members(600),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		session.ensure_host_panel_group(
+			second_group,
+			Some(second_anchor),
+			product_0015_members(700),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+
+		let moved = session.pane_id_for_panel(HostPanelId::new(600)).unwrap();
+		let destination = session.pane_id_for_panel(HostPanelId::new(700)).unwrap();
+		assert!(session.move_pane(moved, destination, PaneDropEdge::Bottom));
+		assert!(
+			session.host_panel_groups[&first_group]
+				.detached_members
+				.contains(&HostPanelId::new(600))
+		);
+		assert_eq!(
+			session.host_panel_groups[&first_group].layout_state,
+			HostPanelGroupLayoutState::Automatic,
+			"detachment alone does not dirty the owner"
+		);
+		assert_eq!(
+			session.host_panel_groups[&second_group].layout_state,
+			HostPanelGroupLayoutState::Manual,
+			"the destination geometry was edited"
+		);
+		let external_structure = session.layout.structure();
+		session.ensure_host_panel_group(
+			first_group,
+			Some(first_anchor),
+			product_0015_members(600),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		assert_eq!(session.layout.structure(), external_structure);
+
+		assert!(session.reset_host_panel_group(first_group).is_empty());
+		let reclaimed = session.pane_id_for_panel(HostPanelId::new(600)).unwrap();
+		assert_eq!(
+			session.layout.group_containing_pane(reclaimed),
+			Some(first_group)
+		);
+		assert!(
+			!session.host_panel_groups[&first_group]
+				.detached_members
+				.contains(&HostPanelId::new(600))
+		);
+		assert!(
+			!session.host_panel_groups[&second_group]
+				.current_members
+				.iter()
+				.any(|member| member.panel_id == HostPanelId::new(600))
+		);
+		assert_eq!(session.layout.count_group_roots(first_group), 1);
+		assert_eq!(session.layout.count_group_roots(second_group), 1);
+	}
+
+	#[test]
+	fn product_0015_reset_reconciles_retained_missing_and_foreign_once() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		session.update_terminal_size(220, 80);
+		let group_id = HostPanelGroupId::new(8);
+		let anchor = session.focused_pane_id;
+		let mut members = product_0015_members(800);
+		session.ensure_host_panel_group(
+			group_id,
+			Some(anchor),
+			members.clone(),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+
+		members.retain(|member| member.panel_id != HostPanelId::new(803));
+		session.ensure_host_panel_group(
+			group_id,
+			Some(anchor),
+			members.clone(),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		let detached = session.pane_id_for_panel(HostPanelId::new(800)).unwrap();
+		assert!(session.move_pane(detached, anchor, PaneDropEdge::Bottom));
+		let missing = session.pane_id_for_panel(HostPanelId::new(801)).unwrap();
+		session.focus_pane(missing);
+		assert!(session.close_focused_pane().is_some());
+
+		let foreign_view = session
+			.create_unnamed_text_view(&registry, DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_LINES)
+			.unwrap();
+		let foreign_buffer = foreign_view.buffer_id;
+		let group_target = session.pane_id_for_panel(HostPanelId::new(802)).unwrap();
+		let foreign_pane = session
+			.split_pane_with_new_pane_order(
+				group_target,
+				SplitDirection::Horizontal,
+				EditorPane::from_view(foreign_view),
+				false,
+			)
+			.unwrap();
+
+		let removed = session.reset_host_panel_group(group_id);
+		assert!(
+			removed.contains(
+				&session
+					.host_panel_buffer_id(HostPanelId::new(803))
+					.expect("retained buffer survives until runtime release")
+			)
+		);
+		for panel_id in [800, 801, 802] {
+			let pane_id = session
+				.pane_id_for_panel(HostPanelId::new(panel_id))
+				.unwrap();
+			assert_eq!(
+				session.layout.group_containing_pane(pane_id),
+				Some(group_id)
+			);
+		}
+		assert!(session.pane_id_for_panel(HostPanelId::new(803)).is_none());
+		assert!(session.layout.find_pane(foreign_pane).is_some());
+		assert_eq!(
+			session
+				.layout
+				.find_pane(foreign_pane)
+				.unwrap()
+				.active_tab()
+				.buffer_id,
+			foreign_buffer
+		);
+		assert_eq!(
+			session.host_panel_groups[&group_id].layout_state,
+			HostPanelGroupLayoutState::Automatic
+		);
+		assert!(
+			session.host_panel_groups[&group_id]
+				.retained_members
+				.is_empty()
+		);
+		assert!(
+			session.host_panel_groups[&group_id]
+				.detached_members
+				.is_empty()
+		);
+
+		let layout = session.layout.structure();
+		let focus = session.focused_pane_id;
+		assert!(session.reset_host_panel_group(group_id).is_empty());
+		assert_eq!(session.layout.structure(), layout);
+		assert_eq!(session.focused_pane_id, focus);
+	}
+
+	#[test]
+	fn product_0015_actual_producer_release_retires_only_after_last_placement() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		session.update_terminal_size(180, 60);
+		let group_id = HostPanelGroupId::new(9);
+		let anchor = session.focused_pane_id;
+		let producer = session
+			.layout
+			.find_pane(anchor)
+			.unwrap()
+			.active_tab()
+			.buffer_id;
+		let members = product_0015_members(900);
+		session.ensure_host_panel_group(
+			group_id,
+			Some(anchor),
+			members.clone(),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		session.host_panel_group_producer_released(producer);
+		assert!(
+			session.host_panel_groups[&group_id]
+				.producer_buffer_id
+				.is_none()
+		);
+		let before = session.layout.structure();
+		session.ensure_host_panel_group(
+			group_id,
+			Some(anchor),
+			Vec::new(),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		assert!(session.reset_host_panel_group(group_id).is_empty());
+		assert_eq!(session.layout.structure(), before);
+
+		for member in &members {
+			let pane_id = session.pane_id_for_panel(member.panel_id).unwrap();
+			session.focus_pane(pane_id);
+			assert!(session.close_focused_pane().is_some());
+			session.collect_unreachable_host_panel_groups();
+			if member.panel_id != members.last().unwrap().panel_id {
+				assert!(session.host_panel_groups.contains_key(&group_id));
+			}
+		}
+		assert!(!session.host_panel_groups.contains_key(&group_id));
+		assert_eq!(session.layout.count_group_roots(group_id), 0);
 	}
 
 	fn exact_reachable_nodes(registry: &UastRegistry, root: crate::ecs::NodeId) -> u64 {
