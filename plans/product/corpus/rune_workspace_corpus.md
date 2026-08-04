@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.14. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.15. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -34,6 +34,7 @@ a cited record).
 | multi-origin view program (one execution per canonical relation origin) | executable | `multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity` proves canonical-origin deduplication and independent dispatch; `execution_grouping_cannot_reorder_interleaved_host_panels` completes origins out of order without changing presentation (`b99338f8`, `cad42680`) |
 | optional view identity (`view("name", sink)` or anonymous positional identity) | executable | session-scoped: duplicate names refuse with both spans; names retain one host-panel id across reruns and form changes; anonymous views reuse their presentation slot; durable restart identity remains deferred by PRODUCT-0010's recorded protocol halt (`284e88e0`, `cad42680`) |
 | view panel placement (one split per view; no inferred grouping) | executable | `host_panel_placement_requests_tab_fallback_and_reopen_without_moving` proves the retained advisory tab-placement capability in libaryon; `rune_view_collection_opens_one_split_per_view_without_host_tabs` projects four independently visible panes in presentation order while retaining source focus (PRODUCT-0011 amended after dogfood, protocol in `8535d662`) |
+| layered plot sink (`layers([line(x, y), scatter(x, y)])`) | proposed | PRODUCT-0013's ordered shared-Cartesian substrate is executable, but it deliberately adds no Rune surface; PRODUCT-0014 must decide contextual recognition and lowering before this row can advance |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -77,6 +78,24 @@ series field. It inherits origin-keyed execution, shared-result identity, view
 addressing, panel placement, and staleness unchanged. The two-origin dogfood
 fixture now completes line + table and bar + table into four ordinary host
 panels without touching the dashboard.
+
+## Executable substrate: ordered shared-Cartesian layers
+
+PRODUCT-0013's substrate is executable in `9b581151`, `446c9216`, `4c35071d`,
+and `0e565a9c`, while its Rune spelling remains the proposed row above. It adds
+`LayeredPlotSpec { layers: NonEmpty<LayerSpec> }` beside `AuthoredPlotSpec` and
+admits only line and scatter marks. Each layer owns and independently resolves
+its encoding; every layer must resolve identical x/y field identities and scale
+families, and color must be `Absent`.
+
+One shared Cartesian domain is derived from the common source columns before
+mark preparation. Extracted line and scatter renderers consume that layout and
+paint first-to-last in authored order; SVG evidence observes scatter marks after
+the line path for `[line, scatter]`. One-layer specs retain their existing
+kernels and exact SVG output. The required `PlotKernel` hover and legend methods
+use a temporary, non-gating bridge: topmost geometric hit first and the last
+authored layer's unmerged legend. There is no Rune envelope, panel, dashboard,
+transport, guide, or interaction surface in this substrate.
 
 ## Accepted surface: view fan-out
 
