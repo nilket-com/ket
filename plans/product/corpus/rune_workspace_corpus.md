@@ -33,7 +33,7 @@ a cited record).
 | shared-execution view fan-out (`r.views([...])`, one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink, including line, holds the *same* `Arc`, not equivalent copies; direct/factored/legacy equivalence plus accepted-surface live axis identity (`d4c2d8a8`, PRODUCT-0012) |
 | multi-origin view program (one execution per canonical relation origin) | executable | `multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity` proves canonical-origin deduplication and independent dispatch; `execution_grouping_cannot_reorder_interleaved_host_panels` completes origins out of order without changing presentation (`b99338f8`, `cad42680`) |
 | optional view identity (`view("name", sink)` or anonymous positional identity) | executable | session-scoped: duplicate names refuse with both spans; names retain one host-panel id across reruns and form changes; anonymous views reuse their presentation slot; durable restart identity remains deferred by PRODUCT-0010's recorded protocol halt (`284e88e0`, `cad42680`) |
-| view panel placement (one split per view; no inferred grouping) | executable | `host_panel_placement_requests_tab_fallback_and_reopen_without_moving` proves the retained advisory tab-placement capability in libaryon; `rune_view_collection_opens_one_split_per_view_without_host_tabs` projects four independently visible panes in presentation order while retaining source focus (PRODUCT-0011 amended after dogfood, protocol in `8535d662`) |
+| producer-scoped view panel placement (automatic visible tiling; no inferred tabs) | executable | PRODUCT-0015's thirteen gates: `product_0015_host_panel_groups_tile_atomically_and_fallback_visibly` proves atomic 2x2 placement and all-visible decline; `rune_view_collection_tiles_one_forward_producer_group_without_tabs` proves forward table/layered/table/bar order, Compact/Expansive sizing, unchanged reruns, and Retile no-op; detachment/reset/lifecycle and two-producer isolation land in `6d67e95b`, `fd968496`, `a287b770`, and `67c8f2f5`. PRODUCT-0011's explicit `Split`/`TabWith` remains unchanged. |
 | layered plot sink (`layers([line(x, y), scatter(x, y)])`) | executable | PRODUCT-0013's ordered substrate and PRODUCT-0014's surface are accepted; thirteen surface gates land in `c3edc520`, `a10b4995`, `56c8cb88`, and `d52fc31d`, with installed `test6.rn` dogfood confirming labels, paint order, ordinary host panels, and no dashboard |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
@@ -391,6 +391,14 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.18 (2026-08-03): PRODUCT-0015 replaces Rune's reverse-emitted split chain
+  with one engine-owned producer group. Four views tile visibly as 2x2 in direct
+  presentation order; generic Compact tables and Expansive plots shape rows
+  without content-derived reflow. Automatic/Manual state preserves authored
+  geometry, omission retains orphan tiles, detachment survives reruns, and
+  Retile outputs performs the sole exact-program reconciliation. Two producers
+  remain independent; tabs stay explicit; result panels, dashboard, Rune
+  semantics, and layout persistence are unchanged.
 - v0.17 (2026-08-03): PRODUCT-0013 and PRODUCT-0014 are accepted after the
   installed `test6.rn` dogfood run closes the surface's real-window evidence.
   The layered sink row becomes executable. The canvas and anonymous panel chrome
