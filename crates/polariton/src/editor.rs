@@ -17,6 +17,8 @@ use crate::plot::composition::PlotComposition;
 use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use iced::keyboard::{self, Key};
 use iced::mouse;
+#[cfg(feature = "toron")]
+use iced::widget::tooltip;
 use iced::widget::{
 	Space, button, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
 };
@@ -29,6 +31,10 @@ use libaryon::engine::{
 use libaryon::engine::{
 	HostEvent, HostPanelId, HostPanelPlacement, MinimapSnapshot, PaneDropEdge, PanelRevision,
 	SplitDirection, UiPalette, VisualKind, minimap_click_viewport_start_line,
+};
+#[cfg(feature = "toron")]
+use libaryon::engine::{
+	HostPanelGroupId, HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape,
 };
 use libaryon::svp::markdown_blocks::{
 	ListMarker, MarkdownBlock, MarkdownInlineText, line_start_byte, parse_markdown_blocks,
@@ -128,6 +134,10 @@ pub enum EditorMsg {
 	PaneTabAction {
 		pane_id: libaryon::core::PaneId,
 		action: PaneTabAction,
+	},
+	#[cfg(feature = "toron")]
+	RetileOutputs {
+		pane_id: libaryon::core::PaneId,
 	},
 	Dashboard(DashboardMsg),
 	#[cfg(feature = "toron")]
@@ -346,6 +356,12 @@ pub struct CodeEditor {
 	view_panel_ids: HashMap<(libaryon::core::BufferId, LocalViewIdentity), HostPanelId>,
 	#[cfg(feature = "toron")]
 	next_view_panel_id: u64,
+	/// Placement identity is producer-scoped and intentionally separate from
+	/// semantic view-panel identity.
+	#[cfg(feature = "toron")]
+	view_group_ids: HashMap<libaryon::core::BufferId, HostPanelGroupId>,
+	#[cfg(feature = "toron")]
+	next_view_group_id: u64,
 	/// Monotonic revision for the results panel, so each run supersedes the
 	/// last.
 	result_revision: u64,
@@ -546,6 +562,10 @@ impl CodeEditor {
 			view_panel_ids: HashMap::new(),
 			#[cfg(feature = "toron")]
 			next_view_panel_id: DYNAMIC_VIEW_PANEL_BASE,
+			#[cfg(feature = "toron")]
+			view_group_ids: HashMap::new(),
+			#[cfg(feature = "toron")]
+			next_view_group_id: 1,
 			result_revision: 0,
 			drag: None,
 			pane_drag: None,
@@ -831,10 +851,16 @@ impl CodeEditor {
 				)
 			})
 			.collect::<Vec<_>>();
-		// A non-focusing split is inserted beside the still-focused source pane.
-		// Issue first appearances in reverse so the projected panes retain Rune's
-		// presentation order rather than displaying that order backwards.
-		for (identity, presentation, panel_id) in resolved.into_iter().rev() {
+		let anchor = self.viewport.as_ref().and_then(|viewport| {
+			viewport
+				.panes
+				.iter()
+				.find(|pane| pane.buffer_id == producer)
+				.map(|pane| pane.pane_id)
+		});
+		let group_id = self.resolve_rune_view_group(producer);
+		let mut group_members = Vec::with_capacity(resolved.len());
+		for (identity, presentation, panel_id) in resolved {
 			let known = self.panels.panels.contains_key(&panel_id)
 				&& !self.panels.pending_disposal.contains(&panel_id);
 			if known {
@@ -842,29 +868,70 @@ impl CodeEditor {
 					panel_id,
 					revision: PanelRevision::new(revision),
 				});
-			} else {
-				let title = match identity {
-					LocalViewIdentity::Named(name) => name.clone(),
-					LocalViewIdentity::Anonymous(position) => {
-						format!("{} {}", presentation.display_label, position + 1)
-					}
-				};
-				self.send(EditorCommand::OpenHostPanel {
-					panel_id,
-					kind: match presentation.content_kind {
-						ViewContentKind::Table => "rune-view-table",
-						ViewContentKind::Plot => "rune-view-plot",
-					}
-					.to_owned(),
-					title,
-					placement: HostPanelPlacement::Split {
-						direction: SplitDirection::Horizontal,
-					},
-					focus: false,
-				});
 			}
+			let title = match identity {
+				LocalViewIdentity::Named(name) => name.clone(),
+				LocalViewIdentity::Anonymous(position) => {
+					format!("{} {}", presentation.display_label, position + 1)
+				}
+			};
+			group_members.push(HostPanelGroupMember {
+				panel_id,
+				kind: match presentation.content_kind {
+					ViewContentKind::Table => "rune-view-table",
+					ViewContentKind::Plot => "rune-view-plot",
+				}
+				.to_owned(),
+				title,
+				shape: match presentation.content_kind {
+					ViewContentKind::Table => HostPanelGroupShape::Compact,
+					ViewContentKind::Plot => HostPanelGroupShape::Expansive,
+				},
+			});
 			self.panels.mark_running(panel_id);
 		}
+		self.send(EditorCommand::EnsureHostPanelGroup {
+			group_id,
+			anchor,
+			members: group_members,
+			layout: HostPanelGroupLayout::RowMajorTile,
+		});
+	}
+
+	#[cfg(feature = "toron")]
+	fn resolve_rune_view_group(&mut self, producer: libaryon::core::BufferId) -> HostPanelGroupId {
+		if let Some(group_id) = self.view_group_ids.get(&producer) {
+			return *group_id;
+		}
+		let group_id = HostPanelGroupId::new(self.next_view_group_id);
+		self.next_view_group_id = self
+			.next_view_group_id
+			.checked_add(1)
+			.expect("HostPanelGroupId namespace exhausted");
+		self.view_group_ids.insert(producer, group_id);
+		group_id
+	}
+
+	#[cfg(feature = "toron")]
+	fn rune_view_group_for_pane(
+		&self,
+		pane_id: libaryon::core::PaneId,
+	) -> Option<HostPanelGroupId> {
+		let pane = self
+			.viewport
+			.as_ref()?
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == pane_id)?;
+		if let Some(group_id) = self.view_group_ids.get(&pane.buffer_id) {
+			return Some(*group_id);
+		}
+		let panel_id = pane.host_panel.as_ref()?.panel_id;
+		let producer = self
+			.view_panel_ids
+			.iter()
+			.find_map(|((producer, _), candidate)| (*candidate == panel_id).then_some(*producer))?;
+		self.view_group_ids.get(&producer).copied()
 	}
 
 	#[cfg(feature = "toron")]
@@ -1348,6 +1415,13 @@ impl CodeEditor {
 				});
 				self.request_content();
 			}
+			#[cfg(feature = "toron")]
+			EditorMsg::RetileOutputs { pane_id } => {
+				if let Some(group_id) = self.rune_view_group_for_pane(pane_id) {
+					self.send(EditorCommand::ResetHostPanelGroup { group_id });
+					self.request_content();
+				}
+			}
 			EditorMsg::Dashboard(_) => {}
 			#[cfg(feature = "toron")]
 			EditorMsg::HostPlot { panel_id, message } => {
@@ -1508,7 +1582,11 @@ impl CodeEditor {
 					}
 				}
 			};
-			let content = pane_surface(pane, focused, palette, content);
+			#[cfg(feature = "toron")]
+			let retile_outputs = self.rune_view_group_for_pane(pane.pane_id).is_some();
+			#[cfg(not(feature = "toron"))]
+			let retile_outputs = false;
+			let content = pane_surface(pane, focused, palette, content, retile_outputs);
 			layers.push(positioned(
 				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
 				pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
@@ -2669,6 +2747,7 @@ fn pane_tab_bar<'a>(
 	pane: &'a libaryon::uast::projection::PaneViewport,
 	focused: bool,
 	palette: UiPalette,
+	retile_outputs: bool,
 ) -> Element<'a, EditorMsg> {
 	let header_background = color(if focused {
 		palette.tab_surface
@@ -2756,6 +2835,23 @@ fn pane_tab_bar<'a>(
 		.spacing(0);
 		tabs = tabs.push(row![title, controls].spacing(0));
 	}
+	#[cfg(feature = "toron")]
+	if retile_outputs {
+		let retile = button(text("▦").font(EDITOR_FONT).size(13.0))
+			.padding([2, 6])
+			.height(Length::Fixed(PANE_HEADER_HEIGHT))
+			.style(move |_theme: &Theme, status| tab_button_style(false, focused, palette, status))
+			.on_press(EditorMsg::RetileOutputs {
+				pane_id: pane.pane_id,
+			});
+		tabs = tabs.push(tooltip(
+			retile,
+			text("Retile outputs").font(EDITOR_FONT).size(13.0),
+			tooltip::Position::Bottom,
+		));
+	}
+	#[cfg(not(feature = "toron"))]
+	let _ = retile_outputs;
 	tabs = tabs.push(
 		mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
 			.on_press(EditorMsg::PaneDragStarted(pane.pane_id))
@@ -2779,11 +2875,15 @@ fn pane_surface<'a>(
 	focused: bool,
 	palette: UiPalette,
 	content: Element<'a, EditorMsg>,
+	retile_outputs: bool,
 ) -> Element<'a, EditorMsg> {
 	let surface: Element<'a, EditorMsg> = container(
-		column![pane_tab_bar(pane, focused, palette), content,]
-			.width(Length::Fill)
-			.height(Length::Fill),
+		column![
+			pane_tab_bar(pane, focused, palette, retile_outputs),
+			content,
+		]
+		.width(Length::Fill)
+		.height(Length::Fill),
 	)
 	.width(Length::Fill)
 	.height(Length::Fill)
@@ -5501,9 +5601,8 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn rune_view_collection_opens_one_split_per_view_without_host_tabs() {
-		use crate::rune_relation_envelope::{LocalViewIdentity, RuneViewForm};
-		use libaryon::core::BufferId;
+	fn rune_view_collection_tiles_one_forward_producer_group_without_tabs() {
+		use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 
 		let mut editor = CodeEditor::new("select 1;");
 		wait_for_content(&mut editor, "select 1;");
@@ -5513,27 +5612,45 @@ mod tests {
 			.and_then(|viewport| viewport.focused_pane())
 			.expect("source pane")
 			.pane_id;
+		let producer = editor
+			.viewport
+			.as_ref()
+			.and_then(|viewport| viewport.focused_pane())
+			.expect("source pane")
+			.buffer_id;
 		let views = [
 			(
-				LocalViewIdentity::Named("points".to_owned()),
-				RuneViewForm::Scatter,
-			),
-			(
 				LocalViewIdentity::Named("first-data".to_owned()),
-				RuneViewForm::Table,
+				ViewPresentation {
+					content_kind: ViewContentKind::Table,
+					display_label: "table".to_owned(),
+				},
 			),
 			(
-				LocalViewIdentity::Named("totals".to_owned()),
-				RuneViewForm::Bar,
+				LocalViewIdentity::Named("overlay".to_owned()),
+				ViewPresentation {
+					content_kind: ViewContentKind::Plot,
+					display_label: "Line + Scatter".to_owned(),
+				},
 			),
 			(
 				LocalViewIdentity::Named("second-data".to_owned()),
-				RuneViewForm::Table,
+				ViewPresentation {
+					content_kind: ViewContentKind::Table,
+					display_label: "table".to_owned(),
+				},
+			),
+			(
+				LocalViewIdentity::Named("totals".to_owned()),
+				ViewPresentation {
+					content_kind: ViewContentKind::Plot,
+					display_label: "plot.bar".to_owned(),
+				},
 			),
 		];
-		editor.prepare_rune_view_panels(BufferId::new(901), &views, 1);
+		editor.prepare_rune_view_panels(producer, &views, 1);
 
-		let expected = ["points", "first-data", "totals", "second-data"];
+		let expected = ["first-data", "overlay", "second-data", "totals"];
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while editor.viewport.as_ref().is_none_or(|viewport| {
 			viewport
@@ -5572,6 +5689,239 @@ mod tests {
 		assert!(
 			view_panes.iter().all(|pane| pane.tabs.len() == 1),
 			"independent views must not be hidden in inferred tab stacks"
+		);
+		assert_eq!(
+			view_panes
+				.iter()
+				.map(|pane| pane.rect.screen_row.get())
+				.collect::<std::collections::HashSet<_>>()
+				.len(),
+			2,
+			"four members tile as two visible rows"
+		);
+		assert!(view_panes[1].rect.width.get() > view_panes[0].rect.width.get());
+		assert!(view_panes[3].rect.width.get() > view_panes[2].rect.width.get());
+		let first_projection = view_panes
+			.iter()
+			.map(|pane| {
+				(
+					pane.pane_id,
+					pane.rect,
+					pane.tabs.iter().map(|tab| tab.view_id).collect::<Vec<_>>(),
+					pane.active_doctab_index,
+				)
+			})
+			.collect::<Vec<_>>();
+		assert!(editor.view_group_ids.contains_key(&producer));
+		assert_eq!(
+			editor.rune_view_group_for_pane(source_pane),
+			editor.view_group_ids.get(&producer).copied()
+		);
+		let first_panel = editor
+			.rune_view_panel_id(producer, &views[0].0)
+			.expect("first view panel");
+		editor.fail_rune_view(first_panel);
+		editor.mark_rune_view_producer_stale(producer);
+		assert_eq!(
+			editor
+				.viewport
+				.as_ref()
+				.expect("completion-local projection")
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.map(|pane| (
+					pane.pane_id,
+					pane.rect,
+					pane.tabs.iter().map(|tab| tab.view_id).collect::<Vec<_>>(),
+					pane.active_doctab_index,
+				))
+				.collect::<Vec<_>>(),
+			first_projection,
+			"failure and stale completion state emit no placement"
+		);
+		let _ = editor.update(EditorMsg::RetileOutputs {
+			pane_id: source_pane,
+		});
+		for _ in 0..20 {
+			editor.poll();
+			thread::sleep(Duration::from_millis(2));
+		}
+		assert_eq!(
+			editor
+				.viewport
+				.as_ref()
+				.expect("retile no-op projection")
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.map(|pane| (
+					pane.pane_id,
+					pane.rect,
+					pane.tabs.iter().map(|tab| tab.view_id).collect::<Vec<_>>(),
+					pane.active_doctab_index,
+				))
+				.collect::<Vec<_>>(),
+			first_projection,
+			"Retile outputs is exact on an already-current Automatic group"
+		);
+
+		editor.prepare_rune_view_panels(producer, &views, 2);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while Instant::now() < deadline {
+			editor.poll();
+			let current = editor
+				.viewport
+				.as_ref()
+				.expect("rerun projection")
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.map(|pane| {
+					(
+						pane.pane_id,
+						pane.rect,
+						pane.tabs.iter().map(|tab| tab.view_id).collect::<Vec<_>>(),
+						pane.active_doctab_index,
+					)
+				})
+				.collect::<Vec<_>>();
+			if current == first_projection {
+				break;
+			}
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("stable rerun");
+		assert_eq!(viewport.focused_pane_id, source_pane);
+		assert_eq!(
+			viewport
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.map(|pane| (
+					pane.pane_id,
+					pane.rect,
+					pane.tabs.iter().map(|tab| tab.view_id).collect::<Vec<_>>(),
+					pane.active_doctab_index,
+				))
+				.collect::<Vec<_>>(),
+			first_projection,
+			"unchanged reruns preserve identity, geometry, tabs, and activation"
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn rune_view_groups_are_distinct_and_one_producer_does_not_retile_another() {
+		use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let first_producer = editor.active_buffer_id().expect("first producer");
+		let first_views = [
+			(
+				LocalViewIdentity::Named("a-table".to_owned()),
+				ViewPresentation {
+					content_kind: ViewContentKind::Table,
+					display_label: "table".to_owned(),
+				},
+			),
+			(
+				LocalViewIdentity::Named("a-plot".to_owned()),
+				ViewPresentation {
+					content_kind: ViewContentKind::Plot,
+					display_label: "plot.line".to_owned(),
+				},
+			),
+		];
+		editor.prepare_rune_view_panels(first_producer, &first_views, 1);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			viewport
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.count() < 2
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let first_panels = first_views
+			.iter()
+			.map(|(identity, _)| editor.rune_view_panel_id(first_producer, identity).unwrap())
+			.collect::<std::collections::HashSet<_>>();
+		let first_layout = editor
+			.viewport
+			.as_ref()
+			.unwrap()
+			.panes
+			.iter()
+			.filter_map(|pane| {
+				pane.host_panel
+					.as_ref()
+					.filter(|panel| first_panels.contains(&panel.panel_id))
+					.map(|_| (pane.pane_id, pane.rect))
+			})
+			.collect::<Vec<_>>();
+
+		editor.send(EditorCommand::NewPane {
+			direction: SplitDirection::Horizontal,
+			language: Some("rune".to_owned()),
+		});
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let mut second_producer = None;
+		while Instant::now() < deadline {
+			editor.poll();
+			if let Some(candidate) = editor.active_buffer_id()
+				&& candidate != first_producer
+			{
+				second_producer = Some(candidate);
+				break;
+			}
+			thread::sleep(Duration::from_millis(5));
+		}
+		let second_producer = second_producer.expect("second producer");
+		let second_views = [(
+			LocalViewIdentity::Named("b-table".to_owned()),
+			ViewPresentation {
+				content_kind: ViewContentKind::Table,
+				display_label: "table".to_owned(),
+			},
+		)];
+		editor.prepare_rune_view_panels(second_producer, &second_views, 1);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			viewport
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.count() < 3
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert_ne!(
+			editor.view_group_ids[&first_producer],
+			editor.view_group_ids[&second_producer]
+		);
+		assert_eq!(
+			editor
+				.viewport
+				.as_ref()
+				.unwrap()
+				.panes
+				.iter()
+				.filter_map(|pane| {
+					pane.host_panel
+						.as_ref()
+						.filter(|panel| first_panels.contains(&panel.panel_id))
+						.map(|_| (pane.pane_id, pane.rect))
+				})
+				.collect::<Vec<_>>(),
+			first_layout,
+			"establishing a sibling producer preserves the first group"
 		);
 	}
 
