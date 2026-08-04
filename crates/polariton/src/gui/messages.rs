@@ -122,6 +122,7 @@ pub enum Message {
 		source_buffer: BufferId,
 		revision: u64,
 		panel_id: libaryon::engine::HostPanelId,
+		presentation: ViewPresentation,
 		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},

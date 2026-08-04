@@ -16,7 +16,9 @@ use crate::gui::{
 };
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
-use crate::plot::factory::{create_layered_plot, create_plot};
+#[cfg(feature = "toron")]
+use crate::plot::factory::create_layered_plot;
+use crate::plot::factory::create_plot;
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
 use crate::plot::spec::AuthoredPlotSpec;
@@ -1456,6 +1458,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 								app_state.status_df_size = Some((rows, cols));
 							}
 							Ok(RuneRelationSinkOutput::Plot(resolved)) => {
+								let presentation = sink.presentation;
 								plot_tasks.push(build_resolved_plot_task(
 									resolved,
 									1200,
@@ -1463,6 +1466,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										source_buffer,
 										revision,
 										panel_id,
+										presentation,
 										resolved,
 										kernel,
 									},
@@ -1542,16 +1546,16 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			source_buffer,
 			revision,
 			panel_id,
+			presentation,
 			resolved,
 			kernel,
 		} => {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
-			let composition = resolved.resolved_spec.composition.clone();
 			app_state
 				.code_editor
-				.set_rune_view_plot(panel_id, composition, kernel);
+				.set_rune_view_plot(panel_id, presentation.display_label, kernel);
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
 		}
 		#[cfg(feature = "toron")]
@@ -1567,8 +1571,12 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				return Task::none();
 			}
 			match result {
-				Ok(_kernel) => {
-					// Stage 3 connects successful kernels through the label-only host state.
+				Ok(kernel) => {
+					app_state.code_editor.set_rune_view_plot(
+						panel_id,
+						presentation.display_label.clone(),
+						kernel,
+					);
 					app_state.status_msg = format!("Built {}.", presentation.display_label);
 				}
 				Err(error) => {
@@ -2047,6 +2055,18 @@ mod tests {
 		relation: TransformedRuneRelation,
 		frame: polars::frame::DataFrame,
 	) {
+		enum ReadyPlot {
+			Single(
+				crate::rune_relation_envelope::ViewPresentation,
+				crate::plot::request::ResolvedPlot,
+			),
+			Layered(
+				crate::rune_relation_envelope::ViewPresentation,
+				crate::plot::spec::LayeredPlotSpec,
+				Arc<polars::frame::DataFrame>,
+				std::ops::Range<u32>,
+			),
+		}
 		let origin = relation.origin.clone();
 		let views = relation
 			.views
@@ -2057,12 +2077,23 @@ mod tests {
 		let plots = outcome
 			.sinks
 			.iter()
-			.filter_map(|sink| {
-				let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved)) = &sink.output
-				else {
-					return None;
-				};
-				Some((sink.identity.clone(), resolved.clone()))
+			.filter_map(|sink| match &sink.output {
+				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved)) => Some((
+					sink.identity.clone(),
+					ReadyPlot::Single(sink.presentation.clone(), resolved.clone()),
+				)),
+				Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification)) => {
+					Some((
+						sink.identity.clone(),
+						ReadyPlot::Layered(
+							sink.presentation.clone(),
+							specification.clone(),
+							Arc::clone(&sink.source),
+							sink.span.clone(),
+						),
+					))
+				}
+				_ => None,
 			})
 			.collect::<Vec<_>>();
 
@@ -2076,22 +2107,41 @@ mod tests {
 				result: Ok(outcome),
 			},
 		));
-		for (identity, resolved) in plots {
+		for (identity, plot) in plots {
 			let panel_id = state
 				.code_editor
 				.rune_view_panel_id(source_buffer, &identity)
 				.expect("prepared plot panel");
-			let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
-			drop(update(
-				state,
-				Message::RuneRelationPlotReady {
-					source_buffer,
-					revision,
-					panel_id,
-					resolved,
-					kernel,
-				},
-			));
+			match plot {
+				ReadyPlot::Single(presentation, resolved) => {
+					let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+					drop(update(
+						state,
+						Message::RuneRelationPlotReady {
+							source_buffer,
+							revision,
+							panel_id,
+							presentation,
+							resolved,
+							kernel,
+						},
+					));
+				}
+				ReadyPlot::Layered(presentation, specification, source, span) => {
+					let result = create_layered_plot(&specification, source.as_ref(), 1200, 720);
+					drop(update(
+						state,
+						Message::RuneRelationLayeredPlotReady {
+							source_buffer,
+							revision,
+							panel_id,
+							presentation,
+							span,
+							result,
+						},
+					));
+				}
+			}
 		}
 	}
 
@@ -2746,6 +2796,122 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0014_layered_view_completes_in_a_label_only_host_panel() {
+		let source = r#"
+workspace.table("t").views([
+    table(),
+    bar("cat", "val"),
+    line("x", "y"),
+    scatter("x", "y"),
+    view("trend", layers([line("x", "y"), scatter("x", "y")]))])
+"#;
+		let program = transform_rune_view(source).expect("layered host program");
+		let presentation = program
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			presentation
+				.iter()
+				.map(|(_, presentation)| presentation.display_label.as_str())
+				.collect::<Vec<_>>(),
+			[
+				"table",
+				"plot.bar",
+				"plot.line",
+				"plot.scatter",
+				"Line + Scatter"
+			]
+		);
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(75);
+		let revision = 1;
+		state.rune_buffer_revisions.insert(source_buffer, revision);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, revision);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision,
+					view: program.clone(),
+				})
+				.is_some()
+		);
+		complete_relation_in_head(
+			&mut state,
+			source_buffer,
+			revision,
+			program.into_relations().next().expect("one relation"),
+			polars::df!(
+				"cat" => ["a", "b"],
+				"val" => [3_i64, 5],
+				"x" => [1.0_f64, 2.0],
+				"y" => [2.0_f64, 4.0],
+			)
+			.expect("host fixture"),
+		);
+
+		for (identity, expected) in [
+			(LocalViewIdentity::Anonymous(1), "plot.bar"),
+			(LocalViewIdentity::Anonymous(2), "plot.line"),
+			(LocalViewIdentity::Anonymous(3), "plot.scatter"),
+			(
+				LocalViewIdentity::Named("trend".to_owned()),
+				"Line + Scatter",
+			),
+		] {
+			assert_eq!(
+				state
+					.code_editor
+					.rune_view_panel_display_label(source_buffer, &identity),
+				Some(expected)
+			);
+		}
+		assert!(
+			state.code_editor.rune_view_panel_is_plot(
+				source_buffer,
+				&LocalViewIdentity::Named("trend".to_owned())
+			),
+			"the layered kernel must reach ordinary host plot content"
+		);
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+
+		let trend = LocalViewIdentity::Named("trend".to_owned());
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while state
+			.code_editor
+			.rune_view_panel_projected_title(source_buffer, &trend)
+			.is_none()
+			&& std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_projected_title(source_buffer, &trend),
+			Some("trend"),
+			"panel chrome follows identity while the canvas follows display_label"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_display_label(source_buffer, &trend),
+			Some("Line + Scatter")
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard() {
 		let source = r#"
 ket.table("test1")
@@ -2837,8 +3003,8 @@ ket.table("test2")
 		assert_eq!(
 			state
 				.code_editor
-				.rune_view_panel_plot_type(source_buffer, &LocalViewIdentity::Anonymous(0)),
-			Some(PlotType::Line),
+				.rune_view_panel_display_label(source_buffer, &LocalViewIdentity::Anonymous(0)),
+			Some("plot.line"),
 			"the first dogfood view must reach the existing line renderer"
 		);
 		assert!(
@@ -3012,11 +3178,9 @@ plot.bar(a, "x", "y");
 			})
 			.expect("resolved scatter");
 		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
-		state.code_editor.set_rune_view_plot(
-			stable_panel,
-			resolved.resolved_spec.composition,
-			kernel,
-		);
+		state
+			.code_editor
+			.set_rune_view_plot(stable_panel, "plot.scatter".to_owned(), kernel);
 		assert!(
 			state
 				.code_editor

@@ -6,7 +6,7 @@
 //! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
 #[cfg(feature = "toron")]
-use crate::gui::plot_pane::{self, PlotPaneMsg, PlotPaneState};
+use crate::gui::plot_pane::{self, HostPlotState, PlotPaneMsg};
 use crate::gui::{
 	dashboard::{self, DashboardMsg, DashboardState},
 	table::{Table, TableScroll},
@@ -908,10 +908,10 @@ impl CodeEditor {
 	pub fn set_rune_view_plot(
 		&mut self,
 		panel_id: HostPanelId,
-		composition: PlotComposition,
+		display_label: String,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	) {
-		self.panels.set_plot(panel_id, composition, kernel);
+		self.panels.set_plot(panel_id, display_label, kernel);
 	}
 
 	#[cfg(feature = "toron")]
@@ -954,17 +954,33 @@ impl CodeEditor {
 	}
 
 	#[cfg(all(test, feature = "toron"))]
-	pub(crate) fn rune_view_panel_plot_type(
+	pub(crate) fn rune_view_panel_display_label(
 		&self,
 		producer: libaryon::core::BufferId,
 		identity: &LocalViewIdentity,
-	) -> Option<crate::plot::core::PlotType> {
+	) -> Option<&str> {
 		let panel_id = self.rune_view_panel_id(producer, identity)?;
 		let entry = self.panels.panels.get(&panel_id)?;
 		let PanelContent::Plot(plot) = &entry.content else {
 			return None;
 		};
-		Some(plot.composition.primary_plot_type())
+		Some(plot.display_label.as_str())
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_projected_title(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<&str> {
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		self.viewport
+			.as_ref()?
+			.panes
+			.iter()
+			.filter_map(|pane| pane.host_panel.as_ref())
+			.find(|panel| panel.panel_id == panel_id)
+			.map(|panel| panel.title.as_str())
 	}
 
 	#[cfg(all(test, feature = "toron"))]
@@ -2264,7 +2280,7 @@ enum PanelContent {
 	Running,
 	Table(Box<DataFrame>),
 	#[cfg(feature = "toron")]
-	Plot(Box<PlotPaneState>),
+	Plot(Box<HostPlotState>),
 	Message(String),
 	#[cfg(feature = "toron")]
 	Failed,
@@ -2463,7 +2479,7 @@ impl PanelRegistry {
 	fn set_plot(
 		&mut self,
 		panel_id: HostPanelId,
-		composition: PlotComposition,
+		display_label: String,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	) {
 		if let Some(PanelEntry {
@@ -2472,18 +2488,13 @@ impl PanelRegistry {
 			..
 		}) = self.panels.get_mut(&panel_id)
 		{
-			plot.set_kernel(composition, kernel);
+			plot.replace(display_label, kernel);
 			*status = PanelStatus::Fresh;
 			return;
 		}
 		self.set_content(
 			panel_id,
-			PanelContent::Plot(Box::new(PlotPaneState::with_kernel(
-				composition,
-				kernel,
-				1200,
-				720,
-			))),
+			PanelContent::Plot(Box::new(HostPlotState::new(display_label, kernel))),
 		);
 	}
 

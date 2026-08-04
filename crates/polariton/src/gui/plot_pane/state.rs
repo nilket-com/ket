@@ -8,6 +8,52 @@ use crate::plot::theme::{PlotSettings, PlotThemeSpec};
 use iced::{Rectangle, Size};
 use std::sync::Arc;
 
+fn default_resolved_plot_settings() -> ResolvedPlotSettings {
+	let mut settings = PlotSettings::default();
+	settings.application_theme.theme = Override::Set(PlotThemeSpec::default());
+	settings.resolve()
+}
+
+/// Plot state owned by an ordinary host panel. Unlike `PlotPaneState`, this
+/// type has no authored composition or layer-editing model: Rune supplies an
+/// already-built kernel and a faithful display label.
+#[cfg(feature = "toron")]
+pub struct HostPlotState {
+	pub display_label: String,
+	pub kernel: Arc<dyn PlotKernel + Send + Sync>,
+	pub plot_settings: ResolvedPlotSettings,
+	pub hovered_info: Option<String>,
+	pub render_revision: u64,
+	pub resize_render_suspended: bool,
+}
+
+#[cfg(feature = "toron")]
+impl HostPlotState {
+	pub fn new(display_label: String, kernel: Arc<dyn PlotKernel + Send + Sync>) -> Self {
+		Self {
+			display_label,
+			kernel,
+			plot_settings: default_resolved_plot_settings(),
+			hovered_info: None,
+			render_revision: 0,
+			resize_render_suspended: false,
+		}
+	}
+
+	pub fn replace(&mut self, display_label: String, kernel: Arc<dyn PlotKernel + Send + Sync>) {
+		self.display_label = display_label;
+		self.kernel = kernel;
+		self.hovered_info = None;
+		self.render_revision = self.render_revision.wrapping_add(1);
+	}
+
+	pub fn update(&mut self, message: PlotPaneMsg) {
+		if let PlotPaneMsg::UpdateHover(hover) = message {
+			self.hovered_info = hover;
+		}
+	}
+}
+
 pub struct PlotPaneState {
 	pub kernel: Arc<dyn PlotKernel + Send + Sync>,
 	pub hovered_info: Option<String>,
@@ -69,9 +115,7 @@ impl PlotPaneState {
 		width: u32,
 		height: u32,
 	) -> Self {
-		let mut settings = PlotSettings::default();
-		settings.application_theme.theme = Override::Set(PlotThemeSpec::default());
-		let plot_settings = settings.resolve();
+		let plot_settings = default_resolved_plot_settings();
 		Self {
 			kernel,
 			hovered_info: None,
@@ -377,5 +421,38 @@ impl PlotPaneState {
 		if !was_live_updates_enabled && self.live_updates_enabled {
 			self.render_revision = self.render_revision.wrapping_add(1);
 		}
+	}
+}
+
+#[cfg(all(test, feature = "toron"))]
+mod tests {
+	use super::HostPlotState;
+	use crate::plot::factory::create_layered_plot;
+	use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec};
+
+	#[test]
+	fn product_0014_host_plot_state_cannot_carry_a_plot_composition() {
+		let frame =
+			polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 4.0]).expect("fixture frame");
+		let kernel = create_layered_plot(
+			&LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y")),
+			&frame,
+			1200,
+			720,
+		)
+		.expect("one-layer kernel");
+		let state = HostPlotState::new("Line".to_owned(), kernel);
+		let HostPlotState {
+			display_label,
+			kernel: _,
+			plot_settings: _,
+			hovered_info,
+			render_revision,
+			resize_render_suspended,
+		} = state;
+		assert_eq!(display_label, "Line");
+		assert_eq!(hovered_info, None);
+		assert_eq!(render_revision, 0);
+		assert!(!resize_render_suspended);
 	}
 }

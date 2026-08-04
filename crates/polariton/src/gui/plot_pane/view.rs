@@ -1,3 +1,5 @@
+#[cfg(feature = "toron")]
+use super::HostPlotState;
 use super::PlotPaneState;
 use crate::gui::colors;
 use crate::gui::dashboard::DashboardMsg;
@@ -127,8 +129,8 @@ pub fn view<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMs
 /// closing and layout, so this surface emits only plot interaction and never a
 /// [`DashboardMsg`].
 #[cfg(feature = "toron")]
-pub fn host_view(state: &PlotPaneState) -> Element<'_, PlotMessage> {
-	let title = state.composition.title();
+pub fn host_view(state: &HostPlotState) -> Element<'_, PlotMessage> {
+	let title = state.display_label.clone();
 	let data = canvas(PlotWidget {
 		kernel: state.kernel.as_ref(),
 		title: title.clone(),
