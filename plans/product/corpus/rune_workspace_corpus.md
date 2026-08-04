@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.17. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.18. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -35,6 +35,7 @@ a cited record).
 | optional view identity (`view("name", sink)` or anonymous positional identity) | executable | session-scoped: duplicate names refuse with both spans; names retain one host-panel id across reruns and form changes; anonymous views reuse their presentation slot; durable restart identity remains deferred by PRODUCT-0010's recorded protocol halt (`284e88e0`, `cad42680`) |
 | producer-scoped view panel placement (automatic visible tiling; no inferred tabs) | executable | PRODUCT-0015's thirteen gates: `product_0015_host_panel_groups_tile_atomically_and_fallback_visibly` proves atomic 2x2 placement and all-visible decline; `rune_view_collection_tiles_one_forward_producer_group_without_tabs` proves forward table/layered/table/bar order, Compact/Expansive sizing, unchanged reruns, and Retile no-op; detachment/reset/lifecycle and two-producer isolation land in `6d67e95b`, `fd968496`, `a287b770`, and `67c8f2f5`. PRODUCT-0011's explicit `Split`/`TabWith` remains unchanged. |
 | layered plot sink (`layers([line(x, y), scatter(x, y)])`) | executable | PRODUCT-0013's ordered substrate and PRODUCT-0014's surface are accepted; thirteen surface gates land in `c3edc520`, `a10b4995`, `56c8cb88`, and `d52fc31d`, with installed `test6.rn` dogfood confirming labels, paint order, ordinary host panels, and no dashboard |
+| figure-wide headings (`figure([title(text), subtitle(text), body])`) | executable | PRODUCT-0016's twelve gates in `4278e762`, `267e48c1`, `a39ffd9d`, and `764e2b64`; exact grammar spans, independent settings/body lowering, projected source-current chrome, rendered completion-atomic canvas, stale/removal lifecycle, and installed `test7.rn` launch |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -122,6 +123,30 @@ composition-owning state unchanged. `[line, scatter]` displays exactly
 `Line + Scatter`, while named panel chrome continues to display the view name.
 One-layer form replacement retains positional identity and renders byte-identical
 SVG to the established bare mark.
+
+## Accepted surface: the Rune figure surface
+
+Status: **accepted** by PRODUCT-0016 and executable in `4278e762`, `267e48c1`,
+`a39ffd9d`, and `764e2b64`. Inside a proven `.views([...])` sink position,
+`figure([...])` carries zero or one literal `title`, zero or one literal
+`subtitle`, and exactly one existing mark or `layers` body. Metadata order is
+irrelevant; layer order remains paint order. Outside that position, `figure`,
+`title`, and `subtitle` remain ordinary Rune.
+
+Lowering preserves two independent artifacts: the body follows its existing
+single or layered specification path, while headings enter PRODUCT-0007's
+authored `PlotSettingsLayer` as `Presence::Show`. Omission remains `Inherit`;
+computed text and title hiding are not accepted. The existing
+`Presence::Hide -> None -> generated label` defect remains explicitly deferred.
+
+Panel chrome is source-current and uses view name, else source-authored title,
+else the generated structural label, retaining the anonymous positional suffix.
+Canvas headings resolve through the full settings cascade and become visible
+atomically with the completed kernel. A failed revision can therefore show its
+new source title in chrome while retaining the prior complete canvas as stale;
+later heading removal restores the generated canvas/chrome fallback without
+changing `HostPanelId`, group state, geometry, tabs, focus, routing, or dashboard
+state.
 
 ## Accepted surface: view fan-out
 
