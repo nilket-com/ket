@@ -984,6 +984,14 @@ impl CodeEditor {
 	}
 
 	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_count(&self, producer: libaryon::core::BufferId) -> usize {
+		self.view_panel_ids
+			.keys()
+			.filter(|(buffer, _)| *buffer == producer)
+			.count()
+	}
+
+	#[cfg(all(test, feature = "toron"))]
 	pub(crate) fn rune_view_panel_is_failed(
 		&self,
 		producer: libaryon::core::BufferId,

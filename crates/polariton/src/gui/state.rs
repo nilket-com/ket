@@ -1988,6 +1988,11 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use crate::plot::factory::{create_layered_plot, create_plot};
 	#[cfg(feature = "toron")]
+	use crate::plot::{
+		common::{CoordinateTransformer, PlotKernel, ResolvedPlotSettings},
+		export::SvgBackend,
+	};
+	#[cfg(feature = "toron")]
 	use crate::rune_relation_envelope::{
 		LocalViewIdentity, PendingRuneView, RuneViewForm, TransformedRuneRelation,
 		transform as transform_rune_view,
@@ -2001,6 +2006,23 @@ mod tests {
 	use std::sync::{Arc, Mutex};
 	#[cfg(feature = "toron")]
 	use tokio::sync::RwLock;
+
+	#[cfg(feature = "toron")]
+	fn render_marks(kernel: &dyn PlotKernel) -> String {
+		let bounds = iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 100.0));
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = SvgBackend::new(100.0, 100.0);
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			iced::advanced::mouse::Cursor::Unavailable,
+			settings,
+		);
+		backend.finish()
+	}
 	#[cfg(feature = "toron")]
 	fn local_identity() -> WorkspaceIdentity {
 		WorkspaceIdentity {
@@ -2906,6 +2928,174 @@ workspace.table("t").views([
 				.code_editor
 				.rune_view_panel_display_label(source_buffer, &trend),
 			Some("Line + Scatter")
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0014_named_layer_edits_refresh_one_identity_and_destination() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(76);
+		let identity = LocalViewIdentity::Named("trend".to_owned());
+		let mut first_panel = None;
+		for (revision, source, expected_label) in [
+			(
+				1,
+				"workspace.table(\"t\").views([view(\"trend\", layers([line(\"x\", \"y\"), scatter(\"x\", \"y\")]))])",
+				"Line + Scatter",
+			),
+			(
+				2,
+				"workspace.table(\"t\").views([view(\"trend\", layers([scatter(\"x\", \"y\"), line(\"x\", \"y\")]))])",
+				"Scatter + Line",
+			),
+			(
+				3,
+				"workspace.table(\"t\").views([view(\"trend\", layers([line(\"x\", \"y\")]))])",
+				"Line",
+			),
+		] {
+			let program = transform_rune_view(source).expect("named layered revision");
+			let presentation = program
+				.presentation_views()
+				.into_iter()
+				.map(|view| (view.identity.clone(), view.intent.presentation()))
+				.collect::<Vec<_>>();
+			assert_eq!(presentation.len(), 1, "layers are not views");
+			assert_eq!(presentation[0].0, identity);
+			state.rune_buffer_revisions.insert(source_buffer, revision);
+			state
+				.code_editor
+				.prepare_rune_view_panels(source_buffer, &presentation, revision);
+			let panel_id = state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity)
+				.expect("named layered panel");
+			if let Some(first) = first_panel {
+				assert_eq!(panel_id, first, "layer edits retain the destination");
+			} else {
+				first_panel = Some(panel_id);
+			}
+			assert!(
+				state
+					.rune_view_scheduler
+					.submit(PendingRuneView {
+						source_buffer,
+						revision,
+						view: program.clone(),
+					})
+					.is_some()
+			);
+			complete_relation_in_head(
+				&mut state,
+				source_buffer,
+				revision,
+				program.into_relations().next().expect("one relation"),
+				polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 4.0]).expect("layer frame"),
+			);
+			assert_eq!(
+				state
+					.code_editor
+					.rune_view_panel_display_label(source_buffer, &identity),
+				Some(expected_label)
+			);
+		}
+		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0014_one_layer_spelling_keeps_anonymous_identity_and_svg() {
+		let bare_source = "workspace.table(\"t\").views([line(\"x\", \"y\")])";
+		let layered_source = "workspace.table(\"t\").views([layers([line(\"x\", \"y\")])])";
+		let frame = polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 4.0]).expect("line frame");
+
+		let bare_relation = transform_rune_view(bare_source)
+			.expect("bare line")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let bare_outcome = rune_view_outcome(frame.clone(), bare_relation.views);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved)) =
+			&bare_outcome.sinks[0].output
+		else {
+			panic!("bare line must use the established plot request")
+		};
+		let bare_kernel = create_plot(&resolved.resolved_spec, &resolved.data, 100, 100);
+
+		let layered_relation = transform_rune_view(layered_source)
+			.expect("one-layer surface")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let layered_outcome = rune_view_outcome(frame.clone(), layered_relation.views);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification)) =
+			&layered_outcome.sinks[0].output
+		else {
+			panic!("layers spelling must retain the layered request")
+		};
+		let layered_kernel = create_layered_plot(specification, &frame, 100, 100)
+			.expect("one-layer PRODUCT-0013 path");
+		assert_eq!(
+			render_marks(bare_kernel.as_ref()),
+			render_marks(layered_kernel.as_ref())
+		);
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(77);
+		let identity = LocalViewIdentity::Anonymous(0);
+		let mut panel = None;
+		for (revision, source) in [(1, bare_source), (2, layered_source)] {
+			let program = transform_rune_view(source).expect("line spelling revision");
+			let presentation = program
+				.presentation_views()
+				.into_iter()
+				.map(|view| (view.identity.clone(), view.intent.presentation()))
+				.collect::<Vec<_>>();
+			assert_eq!(presentation[0].0, identity);
+			state.rune_buffer_revisions.insert(source_buffer, revision);
+			state
+				.code_editor
+				.prepare_rune_view_panels(source_buffer, &presentation, revision);
+			let current = state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity)
+				.expect("anonymous line panel");
+			if let Some(first) = panel {
+				assert_eq!(current, first, "spelling is not identity");
+			} else {
+				panel = Some(current);
+			}
+			assert!(
+				state
+					.rune_view_scheduler
+					.submit(PendingRuneView {
+						source_buffer,
+						revision,
+						view: program.clone(),
+					})
+					.is_some()
+			);
+			complete_relation_in_head(
+				&mut state,
+				source_buffer,
+				revision,
+				program.into_relations().next().expect("one relation"),
+				frame.clone(),
+			);
+		}
+		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_display_label(source_buffer, &identity),
+			Some("Line")
 		);
 		state.code_editor.shutdown();
 	}
