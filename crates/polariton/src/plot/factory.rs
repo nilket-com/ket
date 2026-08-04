@@ -1,4 +1,4 @@
-use crate::plot::common::{Orientation, PlotKernel};
+use crate::plot::common::{Orientation, PlotKernel, polars_type_to_axis_type};
 use crate::plot::core::PlotType;
 use crate::plot::kernels::bar::{self, BarPlotKernel};
 use crate::plot::kernels::boxplot::{self, BoxPlotKernel};
@@ -10,6 +10,7 @@ use crate::plot::kernels::funnel::{self, FunnelPlotKernel};
 use crate::plot::kernels::heatmap::{self, HeatmapPlotKernel};
 use crate::plot::kernels::hexbin::{self, HexbinPlotKernel};
 use crate::plot::kernels::histogram::{self, HistogramPlotKernel};
+use crate::plot::kernels::layered::{LayerRenderer, LayeredPlotKernel};
 use crate::plot::kernels::line::{self, LinePlotKernel};
 use crate::plot::kernels::parallel::{self, ParallelPlotKernel};
 use crate::plot::kernels::pie::{self, PiePlotKernel};
@@ -21,8 +22,9 @@ use crate::plot::kernels::stacked_area::{self, StackedAreaPlotKernel};
 use crate::plot::kernels::stacked_bar::{self, StackedBarPlotKernel};
 use crate::plot::kernels::violin::{self, ViolinPlotKernel};
 use crate::plot::spec::{
-	ColorIdentity, LayeredPlotSpec, PlotProvenance, ResolvedKernelFields, ResolvedPlotSpec,
-	StampedResult, resolve_domains, resolve_layered_channels,
+	Channel, LayerMark, LayeredPlotSpec, NonEmpty, PlotProvenance, ResolvedKernelFields,
+	ResolvedLayerSpec, ResolvedLayout, ResolvedPlotSpec, StampedResult, resolve_layered_channels,
+	resolve_layered_domains,
 };
 use polars::frame::DataFrame;
 use std::sync::Arc;
@@ -227,9 +229,9 @@ pub fn create_plot(
 	}
 }
 
-/// Lower PRODUCT-0013's additive layered specification. The multi-layer branch
-/// is completed by the ordered composite stage; one layer deliberately reuses
-/// the established kernel path.
+/// Lower PRODUCT-0013's additive layered specification. One layer deliberately
+/// reuses the established kernel path; multiple layers preserve authored order
+/// in the ordered shared-domain composite.
 pub fn create_layered_plot(
 	spec: &LayeredPlotSpec,
 	df: &DataFrame,
@@ -238,12 +240,6 @@ pub fn create_layered_plot(
 ) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
 	let binding =
 		resolve_layered_channels(spec, df.schema().as_ref()).map_err(|e| e.to_string())?;
-	let (first, rest) = binding.layers.into_parts();
-	if !rest.is_empty() {
-		return Err(
-			"multi-layer rendering is not available until the ordered composite stage".into(),
-		);
-	}
 	let stamped = StampedResult {
 		data: Arc::new(df.clone()),
 		provenance: PlotProvenance {
@@ -251,9 +247,77 @@ pub fn create_layered_plot(
 			revision: None,
 		},
 	};
-	let (resolved, _) = resolve_domains(first.into_binding(), &stamped, &ColorIdentity::default())
-		.map_err(|e| e.to_string())?;
-	Ok(create_plot(&resolved, df, width, height))
+	let resolved = resolve_layered_domains(binding, &stamped).map_err(|e| e.to_string())?;
+	let (first, rest) = resolved.layers.into_parts();
+	if rest.is_empty() {
+		return Ok(create_plot(&first.spec, df, width, height));
+	}
+
+	let shared_layout = ResolvedLayout::from_spec(&first.spec, width, height);
+	let x_label = first
+		.spec
+		.channel(Channel::X)
+		.expect("line and scatter resolve x")
+		.binding
+		.field
+		.clone();
+	let y_label = first
+		.spec
+		.channel(Channel::Y)
+		.expect("line and scatter resolve y")
+		.binding
+		.field
+		.clone();
+	let x_axis_type = polars_type_to_axis_type(
+		df.column(&x_label)
+			.expect("resolved x field remains present")
+			.dtype(),
+	);
+	let y_axis_type = polars_type_to_axis_type(
+		df.column(&y_label)
+			.expect("resolved y field remains present")
+			.dtype(),
+	);
+	let mut layers = NonEmpty::new(prepare_layer_renderer(first, df, width, height));
+	for layer in rest {
+		layers.push(prepare_layer_renderer(layer, df, width, height));
+	}
+	Ok(Arc::new(LayeredPlotKernel::new(
+		layers,
+		shared_layout,
+		x_axis_type,
+		y_axis_type,
+		x_label,
+		y_label,
+	)))
+}
+
+fn prepare_layer_renderer(
+	layer: ResolvedLayerSpec,
+	df: &DataFrame,
+	width: u32,
+	height: u32,
+) -> LayerRenderer {
+	match (layer.mark, layer.spec.kernel_fields.as_ref()) {
+		(LayerMark::Line, ResolvedKernelFields::Line { series, x, y }) => {
+			LayerRenderer::line(Arc::new(line::prepare_line_data(
+				df,
+				series.as_deref().unwrap_or(""),
+				x,
+				y,
+			)))
+		}
+		(LayerMark::Scatter, ResolvedKernelFields::Scatter { .. }) => {
+			LayerRenderer::scatter(Arc::new(scatter::prepare_scatter_data_resolved(
+				df,
+				&layer.spec,
+				width,
+				height,
+				3.0,
+			)))
+		}
+		_ => unreachable!("LayerMark makes unaccepted kernel fields unrepresentable"),
+	}
 }
 
 #[cfg(test)]
@@ -293,7 +357,7 @@ pub fn create_authored_plot(
 #[cfg(test)]
 mod product_0013_baseline_tests {
 	use super::*;
-	use crate::plot::common::{CoordinateTransformer, ResolvedPlotSettings};
+	use crate::plot::common::{CoordinateTransformer, PlotLayout, ResolvedPlotSettings};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::export::SvgBackend;
 	use crate::plot::spec::{AuthoredPlotSpec, LayerMark, LayerSpec, LayeredPlotSpec};
@@ -379,5 +443,33 @@ mod product_0013_baseline_tests {
 		)
 		.expect("layered scatter kernel");
 		assert_eq!(render_marks(kernel.as_ref()), SCATTER_SVG);
+	}
+
+	#[test]
+	fn product_0013_shared_domain_comes_from_common_source_columns() {
+		let frame = df!("x" => [0.0, 100.0], "y" => [10.0, 30.0]).expect("frame");
+		let mut spec = LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y"));
+		spec.push(LayerSpec::xy(LayerMark::Line, "x", "y"));
+		let kernel = create_layered_plot(&spec, &frame, 100, 100).expect("layered kernel");
+		let PlotLayout::Cartesian {
+			x_range, y_range, ..
+		} = kernel.layout(ResolvedPlotSettings::default())
+		else {
+			panic!("layered line plot must be Cartesian");
+		};
+		assert_eq!(x_range, (-10.0, 110.0));
+		assert_eq!(y_range, (8.0, 32.0));
+
+		let prepared = line::prepare_line_data(&frame, "", "x", "y");
+		assert_eq!(prepared.x_range, (-5.0, 105.0));
+		assert_eq!(prepared.y_range, (9.0, 31.0));
+		assert_ne!(
+			x_range, prepared.x_range,
+			"mark padding must not choose layout"
+		);
+		assert_ne!(
+			y_range, prepared.y_range,
+			"mark padding must not choose layout"
+		);
 	}
 }

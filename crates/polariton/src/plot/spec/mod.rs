@@ -401,6 +401,23 @@ pub struct LayeredChannelBinding {
 	pub layers: NonEmpty<LayerChannelBinding>,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedLayerSpec {
+	pub mark: LayerMark,
+	pub spec: ResolvedPlotSpec,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ResolvedLayeredPlotSpec {
+	pub layers: NonEmpty<ResolvedLayerSpec>,
+}
+
+impl ResolvedLayeredPlotSpec {
+	pub fn shared_channel(&self, channel: Channel) -> Option<&ResolvedChannel> {
+		self.layers.first().spec.channel(channel)
+	}
+}
+
 impl ChannelBinding {
 	pub fn channels(&self) -> &[BoundChannel] {
 		&self.channels
@@ -659,6 +676,10 @@ pub enum LayeredPlotError {
 		expected: ScaleFamily,
 		actual: ScaleFamily,
 	},
+	Domain {
+		layer: usize,
+		source: DomainError,
+	},
 }
 
 impl fmt::Display for LayeredPlotError {
@@ -692,6 +713,9 @@ impl fmt::Display for LayeredPlotError {
 				"layer {} {channel} scale {actual:?} is incompatible with shared scale family {expected:?}",
 				layer + 1
 			),
+			Self::Domain { layer, source } => {
+				write!(formatter, "layer {} could not resolve: {source}", layer + 1)
+			}
 		}
 	}
 }
@@ -906,6 +930,55 @@ pub fn resolve_layered_channels(
 		layers.push(layer);
 	}
 	Ok(LayeredChannelBinding { layers })
+}
+
+/// Resolve the common source-column domains before any mark preparation. Only
+/// the first binding scans the stamped result; compatible later bindings reuse
+/// those same resolved x/y domains while retaining their own layer identity.
+pub fn resolve_layered_domains(
+	binding: LayeredChannelBinding,
+	result: &StampedResult,
+) -> Result<ResolvedLayeredPlotSpec, LayeredPlotError> {
+	let (first, rest) = binding.layers.into_parts();
+	let first_mark = first.mark;
+	let (first_spec, _) = resolve_domains(first.into_binding(), result, &ColorIdentity::default())
+		.map_err(|source| LayeredPlotError::Domain { layer: 0, source })?;
+	let shared_channels = first_spec.channels.clone();
+	let mut layers = NonEmpty::new(ResolvedLayerSpec {
+		mark: first_mark,
+		spec: first_spec,
+	});
+
+	for layer in rest {
+		let LayerChannelBinding { mark, binding } = layer;
+		let channels = binding
+			.channels
+			.into_iter()
+			.map(|binding| {
+				let shared = shared_channels
+					.iter()
+					.find(|channel| channel.binding.channel == binding.channel)
+					.expect("compatible layered bindings share x and y channels");
+				ResolvedChannel {
+					binding,
+					domain: shared.domain.clone(),
+					colors: Vec::new(),
+				}
+			})
+			.collect();
+		layers.push(ResolvedLayerSpec {
+			mark,
+			spec: ResolvedPlotSpec {
+				composition: binding.composition,
+				channels,
+				kernel_fields: binding.kernel_fields,
+				color_job: binding.color_job,
+				provenance: result.provenance.clone(),
+			},
+		});
+	}
+
+	Ok(ResolvedLayeredPlotSpec { layers })
 }
 
 pub fn resolve_domains(
@@ -1571,6 +1644,42 @@ mod tests {
 		assert_eq!(spec.title(), "Line + Scatter");
 		assert_eq!(LayerMark::Line.plot_type(), PlotType::Line);
 		assert_eq!(LayerMark::Scatter.plot_type(), PlotType::Scatter);
+	}
+
+	#[test]
+	fn product_0013_resolution_preserves_authored_layer_order() {
+		let result = stamped(df!("x" => [1.0, 2.0], "y" => [2.0, 4.0]).expect("frame"));
+		let spec = layered(
+			LayerSpec::xy(LayerMark::Line, "x", "y"),
+			[LayerSpec::xy(LayerMark::Scatter, "x", "y")],
+		);
+		let binding = resolve_layered_channels(&spec, result.data.schema().as_ref())
+			.expect("channel binding");
+		let resolved = resolve_layered_domains(binding, &result).expect("domain resolution");
+		assert_eq!(
+			resolved
+				.layers
+				.iter()
+				.map(|layer| layer.mark)
+				.collect::<Vec<_>>(),
+			[LayerMark::Line, LayerMark::Scatter]
+		);
+		assert_eq!(
+			resolved
+				.layers
+				.first()
+				.spec
+				.channel(Channel::X)
+				.unwrap()
+				.domain,
+			resolved
+				.layers
+				.last()
+				.spec
+				.channel(Channel::X)
+				.unwrap()
+				.domain
+		);
 	}
 
 	#[test]

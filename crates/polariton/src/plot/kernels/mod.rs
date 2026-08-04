@@ -8,6 +8,7 @@ pub mod funnel;
 pub mod heatmap;
 pub mod hexbin;
 pub mod histogram;
+pub mod layered;
 pub mod line;
 pub mod parallel;
 pub mod pie;
