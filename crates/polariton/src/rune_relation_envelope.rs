@@ -8,6 +8,7 @@
 
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
+use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec};
 use libaryon::core::BufferId;
 use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
@@ -20,9 +21,31 @@ const ENTRYPOINT_SUFFIX: &str = "\n}\n";
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RuneViewIntent {
 	Table,
-	Plot(DisposableRunePlotSink),
+	Plot(RunePlotIntent),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum RunePlotIntent {
+	Single(DisposableRunePlotSink),
+	Layered(LayeredPlotSpec),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub(crate) enum ViewContentKind {
+	Table,
+	Plot,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ViewPresentation {
+	pub(crate) content_kind: ViewContentKind,
+	pub(crate) display_label: String,
+}
+
+// PRODUCT-0014 replaces this production normal form. Keep the old vocabulary
+// test-only while the existing behavioral corpus migrates its type-oriented
+// assertions to `ViewPresentation`.
+#[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum RuneViewForm {
 	Table,
@@ -31,27 +54,60 @@ pub(crate) enum RuneViewForm {
 	Scatter,
 }
 
-impl RuneViewForm {
-	pub(crate) const fn label(self) -> &'static str {
-		match self {
-			Self::Table => "table",
-			Self::Bar => "plot.bar",
-			Self::Line => "plot.line",
-			Self::Scatter => "plot.scatter",
+#[cfg(test)]
+impl From<RuneViewForm> for ViewPresentation {
+	fn from(form: RuneViewForm) -> Self {
+		let (content_kind, display_label) = match form {
+			RuneViewForm::Table => (ViewContentKind::Table, "table"),
+			RuneViewForm::Bar => (ViewContentKind::Plot, "plot.bar"),
+			RuneViewForm::Line => (ViewContentKind::Plot, "plot.line"),
+			RuneViewForm::Scatter => (ViewContentKind::Plot, "plot.scatter"),
+		};
+		Self {
+			content_kind,
+			display_label: display_label.to_owned(),
 		}
 	}
 }
 
 impl RuneViewIntent {
-	pub(crate) fn form(&self) -> RuneViewForm {
+	pub(crate) fn presentation(&self) -> ViewPresentation {
 		match self {
-			Self::Table => RuneViewForm::Table,
-			Self::Plot(plot) => match plot.composition.primary_plot_type() {
-				PlotType::Bar => RuneViewForm::Bar,
-				PlotType::Line => RuneViewForm::Line,
-				PlotType::Scatter => RuneViewForm::Scatter,
-				other => unreachable!("first-contact sink admitted unexpected plot type {other:?}"),
+			Self::Table => ViewPresentation {
+				content_kind: ViewContentKind::Table,
+				display_label: "table".to_owned(),
 			},
+			Self::Plot(RunePlotIntent::Single(plot)) => ViewPresentation {
+				content_kind: ViewContentKind::Plot,
+				display_label: match plot.composition.primary_plot_type() {
+					PlotType::Bar => "plot.bar",
+					PlotType::Line => "plot.line",
+					PlotType::Scatter => "plot.scatter",
+					other => {
+						unreachable!("first-contact sink admitted unexpected plot type {other:?}")
+					}
+				}
+				.to_owned(),
+			},
+			Self::Plot(RunePlotIntent::Layered(plot)) => ViewPresentation {
+				content_kind: ViewContentKind::Plot,
+				display_label: plot.title(),
+			},
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn form(&self) -> RuneViewForm {
+		let presentation = self.presentation();
+		match (
+			presentation.content_kind,
+			presentation.display_label.as_str(),
+		) {
+			(ViewContentKind::Table, "table") => RuneViewForm::Table,
+			(ViewContentKind::Plot, "plot.bar") => RuneViewForm::Bar,
+			(ViewContentKind::Plot, "plot.line") => RuneViewForm::Line,
+			(ViewContentKind::Plot, "plot.scatter") => RuneViewForm::Scatter,
+			_ => panic!("a composite presentation has no legacy RuneViewForm"),
 		}
 	}
 }
@@ -909,7 +965,7 @@ fn parse_contextual_sink_inner(
 					"bar fields must be strings",
 				);
 			};
-			RuneViewIntent::Plot(sink)
+			RuneViewIntent::Plot(RunePlotIntent::Single(sink))
 		}
 		"scatter" if matches!(args.len(), 2 | 3) => {
 			let Some(sink) = plot_sink_fields(PlotType::Scatter, source, &args, 0)? else {
@@ -919,7 +975,7 @@ fn parse_contextual_sink_inner(
 					"scatter fields must be strings",
 				);
 			};
-			RuneViewIntent::Plot(sink)
+			RuneViewIntent::Plot(RunePlotIntent::Single(sink))
 		}
 		"line" if args.len() == 2 => {
 			let Some(sink) = plot_sink_fields(PlotType::Line, source, &args, 0)? else {
@@ -929,7 +985,11 @@ fn parse_contextual_sink_inner(
 					"line fields must be strings",
 				);
 			};
-			RuneViewIntent::Plot(sink)
+			RuneViewIntent::Plot(RunePlotIntent::Single(sink))
+		}
+		"layers" => {
+			let specification = parse_layer_list(expression, &args, source)?;
+			RuneViewIntent::Plot(RunePlotIntent::Layered(specification))
 		}
 		"table" => {
 			return invalid_view(
@@ -963,7 +1023,7 @@ fn parse_contextual_sink_inner(
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"unknown view sink; expected scatter(...), bar(...), line(...), or table()",
+				"unknown view sink; expected scatter(...), bar(...), line(...), table(), or layers([...])",
 			);
 		}
 	};
@@ -973,6 +1033,104 @@ fn parse_contextual_sink_inner(
 		name: None,
 		output_order: 0,
 	})
+}
+
+fn parse_layer_list(
+	outer: &ast::Expr,
+	args: &[&ast::Expr],
+	source: &str,
+) -> Result<LayeredPlotSpec, RuneEnvelopeError> {
+	let [argument] = args else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			"layers(...) takes exactly one literal layer list",
+		);
+	};
+	let ast::Expr::Vec(list) = argument else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			"layers(...) requires a literal layer list",
+		);
+	};
+	let mut items = list.items.iter();
+	let Some((first, _)) = items.next() else {
+		return invalid_view(
+			list.span(),
+			source.len(),
+			"layers([]) cannot form a non-empty plot",
+		);
+	};
+	let mut specification = LayeredPlotSpec::new(parse_layer(first, source)?);
+	for (item, _) in items {
+		specification.push(parse_layer(item, source)?);
+	}
+	Ok(specification)
+}
+
+fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEnvelopeError> {
+	let ast::Expr::Call(call) = expression else {
+		return invalid_view(
+			expression.span(),
+			source.len(),
+			"a layer must be line(x, y) or scatter(x, y)",
+		);
+	};
+	let callee = source_slice(source, call.expr.span())?.trim();
+	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+	let mark = match callee {
+		"line" if args.len() == 2 => LayerMark::Line,
+		"scatter" if args.len() == 2 => LayerMark::Scatter,
+		"layers" => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"layers([...]) cannot be nested inside a layer list",
+			);
+		}
+		"table" | "bar" => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				format!("{callee}(...) is a view sink, not a shared-Cartesian layer"),
+			);
+		}
+		"scatter" if args.len() == 3 => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"scatter layers take x and y only; category color is not part of the layers surface",
+			);
+		}
+		"line" | "scatter" => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				format!("{callee}(...) layers take exactly x and y string fields"),
+			);
+		}
+		_ => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"unknown layer; expected line(x, y) or scatter(x, y)",
+			);
+		}
+	};
+	let mut fields = Vec::with_capacity(2);
+	for field in args {
+		let raw = source_slice(source, field.span())?;
+		let Some(value) = decode_string_literal(raw) else {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				format!("{callee}(...) layer fields must be string literals"),
+			);
+		};
+		fields.push(value);
+	}
+	Ok(LayerSpec::xy(mark, fields[0].clone(), fields[1].clone()))
 }
 
 fn parse_sugar_sink(
@@ -1005,7 +1163,7 @@ fn parse_sugar_sink(
 		);
 	};
 	Ok(ParsedSink {
-		intent: RuneViewIntent::Plot(sink),
+		intent: RuneViewIntent::Plot(RunePlotIntent::Single(sink)),
 		span: byte_range(call.span(), source.len())?,
 		name: None,
 		output_order: 0,
@@ -1125,10 +1283,12 @@ fn recognize_view_root(
 	let (intent, relation) = match callee.trim() {
 		"table" if !shadows.table && args.len() == 1 => (RuneViewIntent::Table, args[0]),
 		"plot.bar" if !shadows.plot && args.len() == 3 => (
-			RuneViewIntent::Plot(match plot_sink(PlotType::Bar, source, &args)? {
-				Some(sink) => sink,
-				None => return Ok(None),
-			}),
+			RuneViewIntent::Plot(RunePlotIntent::Single(
+				match plot_sink(PlotType::Bar, source, &args)? {
+					Some(sink) => sink,
+					None => return Ok(None),
+				},
+			)),
 			args[0],
 		),
 		"plot.line" if !shadows.plot && args.len() == 3 => {
@@ -1139,7 +1299,7 @@ fn recognize_view_root(
 					"plot.line fields must be string literals",
 				);
 			};
-			(RuneViewIntent::Plot(sink), args[0])
+			(RuneViewIntent::Plot(RunePlotIntent::Single(sink)), args[0])
 		}
 		"plot.line" if !shadows.plot => {
 			return invalid_view(
@@ -1149,10 +1309,12 @@ fn recognize_view_root(
 			);
 		}
 		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
-			RuneViewIntent::Plot(match plot_sink(PlotType::Scatter, source, &args)? {
-				Some(sink) => sink,
-				None => return Ok(None),
-			}),
+			RuneViewIntent::Plot(RunePlotIntent::Single(
+				match plot_sink(PlotType::Scatter, source, &args)? {
+					Some(sink) => sink,
+					None => return Ok(None),
+				},
+			)),
 			args[0],
 		),
 		_ => return Ok(None),
@@ -1567,7 +1729,7 @@ mod tests {
 	fn plot_forms_retain_only_view_intent() {
 		let bar = transform("let r = workspace.table(\"test2\"); plot.bar(r, \"cat\", \"val\")")
 			.expect("bar envelope");
-		let RuneViewIntent::Plot(bar) = &bar.views[0].intent else {
+		let RuneViewIntent::Plot(RunePlotIntent::Single(bar)) = &bar.views[0].intent else {
 			panic!("expected plot");
 		};
 		assert_eq!(bar.composition.primary_plot_type(), PlotType::Bar);
@@ -1579,7 +1741,7 @@ mod tests {
 		let scatter =
 			transform("let r = workspace.table(\"test2\"); plot.scatter(r, \"x\", \"y\", \"cat\")")
 				.expect("scatter envelope");
-		let RuneViewIntent::Plot(scatter) = &scatter.views[0].intent else {
+		let RuneViewIntent::Plot(RunePlotIntent::Single(scatter)) = &scatter.views[0].intent else {
 			panic!("expected plot");
 		};
 		assert_eq!(scatter.composition.primary_plot_type(), PlotType::Scatter);
@@ -1587,7 +1749,7 @@ mod tests {
 
 		let line = transform("let r = workspace.table(\"test2\"); plot.line(r, \"x\", \"y\")")
 			.expect("line envelope");
-		let RuneViewIntent::Plot(line) = &line.views[0].intent else {
+		let RuneViewIntent::Plot(RunePlotIntent::Single(line)) = &line.views[0].intent else {
 			panic!("expected plot");
 		};
 		assert_eq!(line.composition.primary_plot_type(), PlotType::Line);
@@ -1972,6 +2134,153 @@ mod tests {
 			transform(partial),
 			Err(RuneEnvelopeError::InvalidView { .. })
 		));
+	}
+
+	#[test]
+	fn product_0014_layers_lower_in_authored_order() {
+		fn lowered(source: &str) -> LayeredPlotSpec {
+			let transformed = transform(source).expect("layers envelope");
+			let RuneViewIntent::Plot(RunePlotIntent::Layered(specification)) =
+				&transformed.views[0].intent
+			else {
+				panic!("expected layered plot intent")
+			};
+			specification.clone()
+		}
+
+		let line_scatter = lowered(
+			"workspace.table(\"t\").views([layers([line(\"x\", \"y\"), scatter(\"x\", \"y\")])])",
+		);
+		assert_eq!(
+			line_scatter
+				.layers
+				.iter()
+				.map(|layer| layer.mark)
+				.collect::<Vec<_>>(),
+			[LayerMark::Line, LayerMark::Scatter]
+		);
+		assert_eq!(line_scatter.title(), "Line + Scatter");
+
+		let scatter_line = lowered(
+			"workspace.table(\"t\").views([layers([scatter(\"x\", \"y\"), line(\"x\", \"y\")])])",
+		);
+		assert_eq!(
+			scatter_line
+				.layers
+				.iter()
+				.map(|layer| layer.mark)
+				.collect::<Vec<_>>(),
+			[LayerMark::Scatter, LayerMark::Line]
+		);
+	}
+
+	#[test]
+	fn product_0014_layer_depth_and_admissible_marks_refuse_at_the_inner_span() {
+		for (source, rejected) in [
+			("workspace.table(\"t\").views([layers([])])", "[]"),
+			(
+				"workspace.table(\"t\").views([layers([layers([line(\"x\", \"y\")])])])",
+				"layers([line(\"x\", \"y\")])",
+			),
+			(
+				"workspace.table(\"t\").views([layers([table()])])",
+				"table()",
+			),
+			(
+				"workspace.table(\"t\").views([layers([bar(\"c\", \"v\")])])",
+				"bar(\"c\", \"v\")",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(source).expect_err("invalid layer must refuse")
+			else {
+				panic!("expected an attributed view refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+		}
+	}
+
+	#[test]
+	fn product_0014_scatter_arity_is_contextual() {
+		let source = "workspace.table(\"t\").views([layers([scatter(\"x\", \"y\", \"cat\")])])";
+		let RuneEnvelopeError::InvalidView { span, .. } =
+			transform(source).expect_err("layer color syntax must refuse")
+		else {
+			panic!("expected an attributed view refusal")
+		};
+		assert_eq!(
+			&source[span.start as usize..span.end as usize],
+			"scatter(\"x\", \"y\", \"cat\")"
+		);
+
+		let control = transform("workspace.table(\"t\").views([scatter(\"x\", \"y\", \"cat\")])")
+			.expect("the established scatter view arity remains legal");
+		let RuneViewIntent::Plot(RunePlotIntent::Single(scatter)) = &control.views[0].intent else {
+			panic!("expected ordinary scatter sink")
+		};
+		assert_eq!(scatter.category.as_deref(), Some("cat"));
+	}
+
+	#[test]
+	fn product_0014_layers_is_ordinary_rune_outside_a_proven_view_list() {
+		let source = r#"
+layers([line("x", "y")]);
+let held = layers([scatter("x", "y")]);
+consume(layers([line("x", "y")]));
+workspace.table("t").views([table()])
+"#;
+		let transformed = transform(source).expect("ordinary layers calls are retained");
+		assert!(transformed.source.contains("layers([line(\"x\", \"y\")]);"));
+		assert!(
+			transformed
+				.source
+				.contains("let held = layers([scatter(\"x\", \"y\")]);")
+		);
+		assert!(
+			transformed
+				.source
+				.contains("consume(layers([line(\"x\", \"y\")]));")
+		);
+		assert_eq!(transformed.views.len(), 1);
+		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+	}
+
+	#[test]
+	fn product_0014_layers_recognition_is_outer_attributed_and_atomic() {
+		for (source, rejected) in [
+			("workspace.table(\"t\").views([layers()])", "layers()"),
+			(
+				"workspace.table(\"t\").views([layers([], [])])",
+				"layers([], [])",
+			),
+			(
+				"let marks = [line(\"x\", \"y\")]; workspace.table(\"t\").views([layers(marks)])",
+				"layers(marks)",
+			),
+			(
+				"workspace.table(\"t\").views([layers([line(\"x\")])])",
+				"line(\"x\")",
+			),
+			(
+				"workspace.table(\"t\").views([layers([scatter(x, \"y\")])])",
+				"scatter(x, \"y\")",
+			),
+			(
+				"workspace.table(\"t\").views([layers([unknown(\"x\", \"y\")])])",
+				"unknown(\"x\", \"y\")",
+			),
+			(
+				"workspace.table(\"t\").views([layers([line(\"x\", \"y\"), unknown()])])",
+				"unknown()",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(source).expect_err("malformed layers sink must refuse atomically")
+			else {
+				panic!("expected an attributed view refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+		}
 	}
 
 	#[test]

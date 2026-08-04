@@ -24,8 +24,9 @@ use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	PendingRuneView, RuneEnvelopeError, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
-	TransformedRuneRelation, TransformedRuneView, transform as transform_rune_view,
+	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RuneViewIntent, RuneViewScheduler,
+	SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView, ViewPresentation,
+	transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -575,9 +576,11 @@ fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String
 			return Task::none();
 		}
 		Err(RuneEnvelopeError::RecognizedNoOutput) => {
-			app_state
-				.code_editor
-				.prepare_rune_view_panels(source_buffer, &[], 0);
+			app_state.code_editor.prepare_rune_view_panels(
+				source_buffer,
+				&[] as &[(LocalViewIdentity, ViewPresentation)],
+				0,
+			);
 			app_state.status_msg = "Rune view set is bound; no output root emitted.".into();
 			app_state.status_error.clear();
 			return Task::none();
@@ -646,7 +649,7 @@ fn run_rune_relation_view(
 		.view
 		.presentation_views()
 		.into_iter()
-		.map(|view| (view.identity.clone(), view.intent.form()))
+		.map(|view| (view.identity.clone(), view.intent.presentation()))
 		.collect::<Vec<_>>();
 	app_state
 		.code_editor
@@ -740,10 +743,12 @@ fn rune_view_outcome(
 	let sinks = views
 		.into_iter()
 		.map(|view| {
-			let form = view.intent.form();
+			let presentation = view.intent.presentation();
 			let output = match view.intent {
 				RuneViewIntent::Table => Ok(RuneRelationSinkOutput::Table),
-				RuneViewIntent::Plot(plot) => {
+				RuneViewIntent::Plot(crate::rune_relation_envelope::RunePlotIntent::Single(
+					plot,
+				)) => {
 					let authored_spec =
 						AuthoredPlotSpec::xy_color(plot.composition, plot.x, plot.y, plot.category);
 					plan(PlotRequest {
@@ -755,10 +760,13 @@ fn rune_view_outcome(
 					})
 					.map(RuneRelationSinkOutput::Plot)
 				}
+				RuneViewIntent::Plot(crate::rune_relation_envelope::RunePlotIntent::Layered(_)) => {
+					Err("layered plot construction is not connected".to_owned())
+				}
 			};
 			RuneRelationSinkOutcome {
 				identity: view.identity,
-				form,
+				presentation,
 				span: view.span,
 				source: std::sync::Arc::clone(&result),
 				output,
@@ -1440,9 +1448,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							Err(message) => {
 								let message = format!(
 									"{} at bytes {}..{}: {message}",
-									sink.form.label(),
-									sink.span.start,
-									sink.span.end
+									sink.presentation.display_label, sink.span.start, sink.span.end
 								);
 								app_state.code_editor.fail_rune_view(panel_id);
 								errors.push(message);
@@ -2530,9 +2536,9 @@ mod tests {
 			transformed.views.clone(),
 		);
 		assert_eq!(outcome.sinks.len(), 2);
-		assert_eq!(outcome.sinks[0].form, RuneViewForm::Table);
+		assert_eq!(outcome.sinks[0].presentation, RuneViewForm::Table.into());
 		assert!(outcome.sinks[0].output.is_ok());
-		assert_eq!(outcome.sinks[1].form, RuneViewForm::Bar);
+		assert_eq!(outcome.sinks[1].presentation, RuneViewForm::Bar.into());
 		let Err(error) = &outcome.sinks[1].output else {
 			panic!("bad field must fail only this sink");
 		};

@@ -93,7 +93,9 @@ mod tests {
 	use crate::plot::export::SvgBackend;
 	use crate::plot::factory::{create_authored_plot, create_automatic_plot};
 	use crate::plot::spec::AuthoredPlotSpec;
-	use crate::rune_relation_envelope::{RuneViewIntent, transform as transform_rune_view};
+	use crate::rune_relation_envelope::{
+		RunePlotIntent, RuneViewIntent, transform as transform_rune_view,
+	};
 	use iced::Rectangle;
 	use std::path::PathBuf;
 
@@ -216,7 +218,7 @@ mod tests {
 					assert!(frame.column("cat").is_ok());
 					assert!(frame.column("val").is_ok());
 				}
-				RuneViewIntent::Plot(plot) => {
+				RuneViewIntent::Plot(RunePlotIntent::Single(plot)) => {
 					let expected_x = plot.x.clone();
 					let expected_y = plot.y.clone();
 					let projected = frame
@@ -247,6 +249,9 @@ mod tests {
 					);
 					assert!(backend.finish().contains("<path"));
 				}
+				RuneViewIntent::Plot(RunePlotIntent::Layered(_)) => {
+					panic!("this legacy fixture contains no layered sink")
+				}
 			}
 		}
 	}
@@ -271,7 +276,7 @@ mod tests {
 		let [view] = relation.views.as_slice() else {
 			panic!("line fixture must produce exactly one view");
 		};
-		let RuneViewIntent::Plot(plot) = &view.intent else {
+		let RuneViewIntent::Plot(RunePlotIntent::Single(plot)) = &view.intent else {
 			panic!("line fixture must produce a plot");
 		};
 		assert_eq!(plot.composition.primary_plot_type(), PlotType::Line);
@@ -327,7 +332,7 @@ mod tests {
 					assert!(frame.column("cat").is_ok());
 					assert!(frame.column("val").is_ok());
 				}
-				RuneViewIntent::Plot(plot) => {
+				RuneViewIntent::Plot(RunePlotIntent::Single(plot)) => {
 					let expected_x = plot.x.clone();
 					let expected_y = plot.y.clone();
 					let projected = frame
@@ -342,6 +347,9 @@ mod tests {
 					.expect("resolve relation plot fields");
 					assert_eq!(kernel.x_label(), expected_x);
 					assert_eq!(kernel.y_label(), expected_y);
+				}
+				RuneViewIntent::Plot(RunePlotIntent::Layered(_)) => {
+					panic!("this legacy fixture contains no layered sink")
 				}
 			}
 		}

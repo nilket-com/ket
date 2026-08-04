@@ -9,7 +9,7 @@ use crate::plot::common::PlotKernel;
 use crate::plot::request::ResolvedPlot;
 use crate::result_registry::PendingPublication;
 #[cfg(feature = "toron")]
-use crate::rune_relation_envelope::{LocalViewIdentity, RuneViewForm};
+use crate::rune_relation_envelope::{LocalViewIdentity, ViewPresentation};
 use iced::window;
 use libaryon::core::BufferId;
 use std::sync::Arc;
@@ -159,7 +159,7 @@ pub struct RuneRelationViewSetOutcome {
 #[derive(Clone)]
 pub struct RuneRelationSinkOutcome {
 	pub identity: LocalViewIdentity,
-	pub form: RuneViewForm,
+	pub presentation: ViewPresentation,
 	pub span: std::ops::Range<u32>,
 	/// Every sink holds the same `Arc` as its containing set. This is the
 	/// stamped-result identity proof, not a value-equivalent copy.

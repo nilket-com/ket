@@ -14,7 +14,7 @@ use crate::gui::{
 use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
 #[cfg(feature = "toron")]
-use crate::rune_relation_envelope::{LocalViewIdentity, RuneViewForm};
+use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use iced::keyboard::{self, Key};
 use iced::mouse;
 use iced::widget::{
@@ -798,12 +798,14 @@ impl CodeEditor {
 	/// Resolve one buffer revision's semantic view identities and establish its
 	/// ordinary host panels in presentation order before any query completes.
 	#[cfg(feature = "toron")]
-	pub fn prepare_rune_view_panels(
+	pub fn prepare_rune_view_panels<P>(
 		&mut self,
 		producer: libaryon::core::BufferId,
-		views: &[(LocalViewIdentity, RuneViewForm)],
+		views: &[(LocalViewIdentity, P)],
 		revision: u64,
-	) {
+	) where
+		P: Clone + Into<ViewPresentation>,
+	{
 		let active = views
 			.iter()
 			.map(|(identity, _)| identity.clone())
@@ -821,10 +823,10 @@ impl CodeEditor {
 
 		let resolved = views
 			.iter()
-			.map(|(identity, form)| {
+			.map(|(identity, presentation)| {
 				(
 					identity,
-					form,
+					presentation.clone().into(),
 					self.resolve_rune_view_panel(producer, identity.clone()),
 				)
 			})
@@ -832,7 +834,7 @@ impl CodeEditor {
 		// A non-focusing split is inserted beside the still-focused source pane.
 		// Issue first appearances in reverse so the projected panes retain Rune's
 		// presentation order rather than displaying that order backwards.
-		for (identity, form, panel_id) in resolved.into_iter().rev() {
+		for (identity, presentation, panel_id) in resolved.into_iter().rev() {
 			let known = self.panels.panels.contains_key(&panel_id)
 				&& !self.panels.pending_disposal.contains(&panel_id);
 			if known {
@@ -844,16 +846,14 @@ impl CodeEditor {
 				let title = match identity {
 					LocalViewIdentity::Named(name) => name.clone(),
 					LocalViewIdentity::Anonymous(position) => {
-						format!("{} {}", form.label(), position + 1)
+						format!("{} {}", presentation.display_label, position + 1)
 					}
 				};
 				self.send(EditorCommand::OpenHostPanel {
 					panel_id,
-					kind: match form {
-						RuneViewForm::Table => "rune-view-table",
-						RuneViewForm::Bar | RuneViewForm::Line | RuneViewForm::Scatter => {
-							"rune-view-plot"
-						}
+					kind: match presentation.content_kind {
+						ViewContentKind::Table => "rune-view-table",
+						ViewContentKind::Plot => "rune-view-plot",
 					}
 					.to_owned(),
 					title,

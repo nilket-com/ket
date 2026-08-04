@@ -52,6 +52,9 @@ dashboard needs an edit, stop.
   label-plus-kernel host plot state authorized by §7;
 - `crates/polariton/src/plot/factory.rs` — only removal of the test-only/dead-code
   annotation when `create_layered_plot` acquires its production caller;
+- `crates/polariton/src/adapters/toron/mod.rs` — test-only match-arm citation
+  updates forced by the `RunePlotIntent` split; adapter production behavior is
+  excluded;
 - this plan, the PRODUCT-0014 evidence file, and the Rune acceptance corpus.
 
 No file under `gui/dashboard/` is permitted. `plot/composition.rs`,
