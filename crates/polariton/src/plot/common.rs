@@ -521,6 +521,7 @@ pub trait PlotKernel: Send + Sync {
 /// Geometry returned by a mark renderer. This is deliberately not hover prose:
 /// PRODUCT-0013's temporary interaction bridge decides how a hit is presented.
 #[derive(Clone, Copy, Debug, PartialEq)]
+#[allow(dead_code)] // The first production caller is PRODUCT-0014.
 pub struct MarkHit {
 	pub data_x: f64,
 	pub data_y: f64,
@@ -529,6 +530,7 @@ pub struct MarkHit {
 
 /// A plot layer's mark-only rendering boundary. It owns neither layout nor
 /// guides, labels, or interaction policy.
+#[allow(dead_code)] // Geometric hit-testing is test-reachable until PRODUCT-0014.
 pub trait MarkRenderer: Send + Sync {
 	fn draw(
 		&self,

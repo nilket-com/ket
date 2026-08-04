@@ -1,3 +1,5 @@
+#![allow(dead_code)] // PRODUCT-0014 supplies the first production caller.
+
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings, format_label,

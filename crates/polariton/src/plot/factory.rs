@@ -232,6 +232,7 @@ pub fn create_plot(
 /// Lower PRODUCT-0013's additive layered specification. One layer deliberately
 /// reuses the established kernel path; multiple layers preserve authored order
 /// in the ordered shared-domain composite.
+#[allow(dead_code)] // PRODUCT-0014 supplies the first production caller.
 pub fn create_layered_plot(
 	spec: &LayeredPlotSpec,
 	df: &DataFrame,
@@ -292,6 +293,7 @@ pub fn create_layered_plot(
 	)))
 }
 
+#[allow(dead_code)] // Reachable through the test-only layered entry point.
 fn prepare_layer_renderer(
 	layer: ResolvedLayerSpec,
 	df: &DataFrame,
@@ -470,6 +472,70 @@ mod product_0013_baseline_tests {
 		assert_ne!(
 			y_range, prepared.y_range,
 			"mark padding must not choose layout"
+		);
+	}
+
+	#[test]
+	fn product_0013_layered_svg_paints_scatter_after_line() {
+		let mut spec = LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y"));
+		spec.push(LayerSpec::xy(LayerMark::Scatter, "x", "y"));
+		let kernel = create_layered_plot(&spec, &fixture(), 100, 100).expect("layered kernel");
+		let svg = render_marks(kernel.as_ref());
+		let line = svg.find("stroke-width=\"2\"").expect("line stroke");
+		let scatter = svg.find("fill-opacity=\"1.00\"").expect("scatter marks");
+		assert!(
+			line < scatter,
+			"scatter must appear after the line in SVG document order:\n{svg}"
+		);
+	}
+
+	#[test]
+	fn product_0013_bridge_hover_prefers_topmost_geometric_hit() {
+		let frame = df!("x" => [1.0, 2.0, 3.0], "y" => [2.0, 4.0, 6.0]).expect("frame");
+		let layered = |first, second| {
+			let mut spec = LayeredPlotSpec::new(LayerSpec::xy(first, "x", "y"));
+			spec.push(LayerSpec::xy(second, "x", "y"));
+			create_layered_plot(&spec, &frame, 100, 100).expect("layered kernel")
+		};
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let settings = ResolvedPlotSettings::default();
+		let line_then_scatter = layered(LayerMark::Line, LayerMark::Scatter);
+		let layout = line_then_scatter.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let point = transform.cartesian(2.0, 4.0);
+		let cursor = Cursor::Available(Point::new(point.x + 1.8, point.y - 3.6));
+		assert_eq!(
+			line_then_scatter.hover(&transform, cursor),
+			Some("X: 2, Y: 4".to_owned()),
+			"the topmost scatter hit must win over the line beneath it"
+		);
+
+		let scatter_then_line = layered(LayerMark::Scatter, LayerMark::Line);
+		let reverse_layout = scatter_then_line.layout(settings);
+		let reverse_transform = CoordinateTransformer::new(&reverse_layout, bounds);
+		assert_ne!(
+			scatter_then_line.hover(&reverse_transform, cursor),
+			Some("X: 2, Y: 4".to_owned()),
+			"reversing authored order must make the line hit win"
+		);
+	}
+
+	#[test]
+	fn product_0013_bridge_legend_delegates_to_last_authored_layer() {
+		let mut spec = LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y"));
+		spec.push(LayerSpec::xy(LayerMark::Scatter, "x", "y"));
+		let kernel = create_layered_plot(&spec, &fixture(), 100, 100).expect("layered kernel");
+		let mut backend = SvgBackend::new(100.0, 100.0);
+		kernel.draw_legend(
+			&mut backend,
+			Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+			ResolvedPlotSettings::default(),
+		);
+		let svg = backend.finish();
+		assert!(svg.contains("A 6.00 6.00"), "scatter swatch missing: {svg}");
+		assert!(
+			!svg.contains("stroke-width=\"3\""),
+			"line legend must not merge into last-layer scatter legend: {svg}"
 		);
 	}
 }

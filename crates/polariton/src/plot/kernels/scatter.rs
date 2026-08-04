@@ -187,6 +187,7 @@ impl ScatterMarkRenderer {
 		}
 	}
 
+	#[allow(dead_code)] // Geometric hit-testing is test-reachable until PRODUCT-0014.
 	fn hit_point(&self, transform: &CoordinateTransformer, cursor: Point) -> Option<MarkHit> {
 		let hit_radius = self.prepared_data.point_size_px + 2.0;
 		let mut nearest_distance = hit_radius * hit_radius;

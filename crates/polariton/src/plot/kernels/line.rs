@@ -95,12 +95,14 @@ impl MarkRenderer for LineMarkRenderer {
 	}
 }
 
+#[allow(dead_code)] // Geometric hit-testing is test-reachable until PRODUCT-0014.
 fn squared_distance(first: Point, second: Point) -> f32 {
 	let dx = first.x - second.x;
 	let dy = first.y - second.y;
 	dx * dx + dy * dy
 }
 
+#[allow(dead_code)] // Geometric hit-testing is test-reachable until PRODUCT-0014.
 fn squared_distance_to_segment(point: Point, start: Point, end: Point) -> (f32, f32) {
 	let dx = end.x - start.x;
 	let dy = end.y - start.y;
