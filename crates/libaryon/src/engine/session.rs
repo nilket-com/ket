@@ -11,8 +11,9 @@ use super::jobs::{JobRuntime, JobSpawnError, JobSpec};
 use super::layout::GutterNumbering;
 use super::minimap::MinimapSnapshot;
 use super::protocol::{
-	CommandRange, EditorMode, PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SearchMatch,
-	SplitDirection, SubstituteFlags, UastInspectorMode, VisualKind,
+	CommandRange, EditorMode, HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape,
+	PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SearchMatch, SplitDirection,
+	SubstituteFlags, UastInspectorMode, VisualKind,
 };
 use super::runtime_registry::{RegistrationBatch, RegistryError, RuntimeRegistries};
 use super::shadow::ShadowSession;
@@ -25,7 +26,9 @@ use crate::core::{
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
-use crate::engine::host_event::{HostPanelDescriptor, HostPanelId, PanelRevision};
+use crate::engine::host_event::{
+	HostPanelDescriptor, HostPanelGroupId, HostPanelId, PanelRevision,
+};
 use crate::engine::language::{AnalysisDepth, FILE_BROWSER_THEME_ID};
 use crate::engine::settings::{EngineSettings, SaveDurability};
 use crate::engine::ui_colors::UiColorOverrides;
@@ -2548,12 +2551,14 @@ impl EditorPane {
 }
 
 pub(crate) struct LayoutLeaf {
+	pub(crate) group_root: Option<crate::engine::HostPanelGroupId>,
 	pub(crate) pane_id: PaneId,
 	pub(crate) pane: EditorPane,
 }
 
 pub(crate) enum LayoutNode {
 	Split {
+		group_root: Option<crate::engine::HostPanelGroupId>,
 		direction: SplitDirection,
 		children: Vec<LayoutNode>,
 		ratios: Vec<u32>,
@@ -2577,6 +2582,85 @@ fn split_divider_cells(direction: SplitDirection) -> u32 {
 	}
 }
 
+fn balanced_tile_columns(member_count: usize) -> usize {
+	let mut columns = 1usize;
+	while columns.saturating_mul(columns) < member_count.max(1) {
+		columns = columns.saturating_add(1);
+	}
+	columns
+}
+
+fn host_panel_tile_minimum(member_count: usize) -> (u32, u32) {
+	if member_count == 0 {
+		return (0, 0);
+	}
+	let columns = balanced_tile_columns(member_count);
+	let rows = member_count.div_ceil(columns);
+	let width = MIN_PANE_EXTENT
+		.saturating_mul(columns as u32)
+		.saturating_add(SPLIT_DIVIDER_COLS.saturating_mul(columns.saturating_sub(1) as u32));
+	let height = MIN_PANE_EXTENT
+		.saturating_mul(rows as u32)
+		.saturating_add(SPLIT_DIVIDER_ROWS.saturating_mul(rows.saturating_sub(1) as u32));
+	(width, height)
+}
+
+fn build_host_panel_group_tile(
+	group_id: HostPanelGroupId,
+	members: Vec<(PaneId, EditorPane, HostPanelGroupShape)>,
+	layout: HostPanelGroupLayout,
+) -> LayoutNode {
+	assert!(!members.is_empty(), "a materialized group is non-empty");
+	match layout {
+		HostPanelGroupLayout::RowMajorTile => {}
+	}
+	let columns = balanced_tile_columns(members.len());
+	let mut rows = Vec::new();
+	let mut members = members.into_iter();
+	loop {
+		let row_members = members.by_ref().take(columns).collect::<Vec<_>>();
+		if row_members.is_empty() {
+			break;
+		}
+		let mut ratios = Vec::with_capacity(row_members.len());
+		let mut children = Vec::with_capacity(row_members.len());
+		for (pane_id, pane, shape) in row_members {
+			ratios.push(match shape {
+				HostPanelGroupShape::Compact => 1,
+				HostPanelGroupShape::Expansive => 3,
+			});
+			children.push(LayoutNode::Leaf(LayoutLeaf {
+				group_root: None,
+				pane_id,
+				pane,
+			}));
+		}
+		rows.push(if children.len() == 1 {
+			children.pop().expect("one row child")
+		} else {
+			LayoutNode::Split {
+				group_root: None,
+				direction: SplitDirection::Vertical,
+				children,
+				ratios,
+			}
+		});
+	}
+	let mut root = if rows.len() == 1 {
+		rows.pop().expect("one tile row")
+	} else {
+		let row_count = rows.len();
+		LayoutNode::Split {
+			group_root: None,
+			direction: SplitDirection::Horizontal,
+			children: rows,
+			ratios: vec![DEFAULT_SPLIT_RATIO; row_count],
+		}
+	};
+	root.set_group_root(Some(group_id));
+	root
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PaneResizeResult {
 	Resized,
@@ -2593,6 +2677,59 @@ enum ResizeLeafResult {
 }
 
 impl LayoutNode {
+	fn group_root(&self) -> Option<HostPanelGroupId> {
+		match self {
+			Self::Split { group_root, .. } => *group_root,
+			Self::Leaf(leaf) => leaf.group_root,
+		}
+	}
+
+	fn set_group_root(&mut self, value: Option<HostPanelGroupId>) {
+		match self {
+			Self::Split { group_root, .. } => *group_root = value,
+			Self::Leaf(leaf) => leaf.group_root = value,
+		}
+	}
+
+	fn find_group_root(&self, target: HostPanelGroupId) -> Option<&Self> {
+		if self.group_root() == Some(target) {
+			return Some(self);
+		}
+		match self {
+			Self::Split { children, .. } => children
+				.iter()
+				.find_map(|child| child.find_group_root(target)),
+			Self::Leaf(_) => None,
+		}
+	}
+
+	fn contains_group_root(&self, target: HostPanelGroupId) -> bool {
+		self.find_group_root(target).is_some()
+	}
+
+	fn can_host_group_subtree(&self, target: PaneId) -> bool {
+		match self {
+			Self::Leaf(leaf) if leaf.pane_id == target => leaf.group_root.is_none(),
+			Self::Leaf(_) => false,
+			Self::Split { children, .. } => children
+				.iter()
+				.any(|child| child.can_host_group_subtree(target)),
+		}
+	}
+
+	fn count_group_roots(&self, target: HostPanelGroupId) -> usize {
+		let own = usize::from(self.group_root() == Some(target));
+		match self {
+			Self::Split { children, .. } => {
+				own + children
+					.iter()
+					.map(|child| child.count_group_roots(target))
+					.sum::<usize>()
+			}
+			Self::Leaf(_) => own,
+		}
+	}
+
 	pub(crate) fn find_pane(&self, target: PaneId) -> Option<&EditorPane> {
 		match self {
 			Self::Leaf(leaf) if leaf.pane_id == target => Some(&leaf.pane),
@@ -2716,6 +2853,68 @@ impl LayoutNode {
 	) -> bool {
 		let mut pane = Some(pane);
 		self.split_leaf_inner_with_order(target, direction, pane_id, &mut pane, new_first)
+	}
+
+	/// Insert a fully-built subtree beside one existing leaf with one mutation.
+	/// Used by atomic host-panel group placement so no temporary split chain is
+	/// ever projected.
+	pub(crate) fn split_leaf_with_subtree(
+		&mut self,
+		target: PaneId,
+		direction: SplitDirection,
+		subtree: LayoutNode,
+		new_first: bool,
+	) -> bool {
+		let mut subtree = Some(subtree);
+		self.split_leaf_with_subtree_inner(target, direction, &mut subtree, new_first)
+	}
+
+	fn split_leaf_with_subtree_inner(
+		&mut self,
+		target: PaneId,
+		direction: SplitDirection,
+		subtree: &mut Option<LayoutNode>,
+		new_first: bool,
+	) -> bool {
+		match self {
+			Self::Leaf(leaf) if leaf.pane_id == target => {
+				if leaf.group_root.is_some() {
+					return false;
+				}
+				let old_leaf = match std::mem::replace(
+					self,
+					Self::Split {
+						group_root: None,
+						direction,
+						children: Vec::new(),
+						ratios: Vec::new(),
+					},
+				) {
+					Self::Leaf(leaf) => Self::Leaf(leaf),
+					Self::Split { .. } => unreachable!("matched a leaf"),
+				};
+				let subtree = subtree
+					.take()
+					.expect("subtree target consumes the candidate exactly once");
+				debug_assert!(subtree.group_root().is_some());
+				let children = if new_first {
+					vec![subtree, old_leaf]
+				} else {
+					vec![old_leaf, subtree]
+				};
+				*self = Self::Split {
+					group_root: None,
+					direction,
+					children,
+					ratios: vec![DEFAULT_SPLIT_RATIO, DEFAULT_SPLIT_RATIO],
+				};
+				true
+			}
+			Self::Leaf(_) => false,
+			Self::Split { children, .. } => children.iter_mut().any(|child| {
+				child.split_leaf_with_subtree_inner(target, direction, subtree, new_first)
+			}),
+		}
 	}
 
 	/// Exchange the contents of two leaf positions while leaving the layout
@@ -2891,9 +3090,11 @@ impl LayoutNode {
 	) -> bool {
 		match self {
 			Self::Leaf(leaf) if leaf.pane_id == target => {
-				let old_leaf = match std::mem::replace(
+				let group_root = leaf.group_root;
+				let mut old_leaf = match std::mem::replace(
 					self,
 					Self::Split {
+						group_root,
 						direction,
 						children: Vec::new(),
 						ratios: Vec::new(),
@@ -2902,7 +3103,9 @@ impl LayoutNode {
 					Self::Leaf(leaf) => leaf,
 					Self::Split { .. } => unreachable!("replaced a leaf with a split"),
 				};
+				old_leaf.group_root = None;
 				let new_leaf = Self::Leaf(LayoutLeaf {
+					group_root: None,
 					pane_id: new_pane_id,
 					pane: new_pane
 						.take()
@@ -2915,6 +3118,7 @@ impl LayoutNode {
 					vec![old_leaf, new_leaf]
 				};
 				*self = Self::Split {
+					group_root,
 					direction,
 					children,
 					ratios: vec![DEFAULT_SPLIT_RATIO, DEFAULT_SPLIT_RATIO],
@@ -3006,6 +3210,7 @@ impl LayoutNode {
 			direction,
 			children,
 			ratios,
+			..
 		} = self
 		else {
 			return false;
@@ -3077,6 +3282,7 @@ impl LayoutNode {
 				direction: split_direction,
 				children,
 				ratios,
+				..
 			} => {
 				let split_direction = *split_direction;
 				if children.is_empty() {
@@ -3128,8 +3334,12 @@ impl LayoutNode {
 		match self {
 			Self::Leaf(_) => None,
 			Self::Split {
-				children, ratios, ..
+				group_root,
+				children,
+				ratios,
+				..
 			} => {
+				let collapsing_group = *group_root;
 				let mut child_index = 0usize;
 				while child_index < children.len() {
 					let remove_child = matches!(&children[child_index], Self::Leaf(leaf) if leaf.pane_id == target);
@@ -3145,7 +3355,14 @@ impl LayoutNode {
 					};
 					if let Some(removed_pane) = removed_pane {
 						if children.len() == 1 {
-							let remaining = children.remove(0);
+							let mut remaining = children.remove(0);
+							if let Some(group_id) = collapsing_group {
+								debug_assert!(
+									remaining.group_root().is_none(),
+									"nested group roots are not an automatic layout"
+								);
+								remaining.set_group_root(Some(group_id));
+							}
 							*self = remaining;
 						}
 						return Some(removed_pane);
@@ -3167,6 +3384,7 @@ impl LayoutNode {
 				direction,
 				children,
 				ratios,
+				..
 			} => {
 				if children.is_empty() {
 					return;
@@ -3624,6 +3842,21 @@ pub(crate) struct TextLifecycleSnapshot {
 	focused: Option<ViewId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HostPanelGroupLayoutState {
+	Automatic,
+	Manual,
+}
+
+pub(crate) struct HostPanelGroupState {
+	pub(crate) producer_buffer_id: Option<BufferId>,
+	pub(crate) layout_state: HostPanelGroupLayoutState,
+	pub(crate) current_members: Vec<HostPanelGroupMember>,
+	pub(crate) retained_members: HashSet<HostPanelId>,
+	pub(crate) detached_members: HashSet<HostPanelId>,
+	pub(crate) latest_valid_anchor: Option<PaneId>,
+}
+
 pub(crate) struct EditorSession {
 	pub(crate) input: InputRuntime,
 	/// The sole session owner of passphrases used by encrypted files and opaque
@@ -3639,6 +3872,7 @@ pub(crate) struct EditorSession {
 	pub(crate) hit_test_fingerprint: Option<u64>,
 	pub(crate) buffers: BufferStore,
 	pub(crate) layout: LayoutNode,
+	pub(crate) host_panel_groups: HashMap<HostPanelGroupId, HostPanelGroupState>,
 	pub(crate) focused_pane_id: PaneId,
 	pub(crate) browser_target_pane_id: Option<PaneId>,
 	pub(crate) diff_pairs: HashMap<PaneId, DiffPair>,
@@ -4188,6 +4422,7 @@ impl EditorSession {
 			hit_test_fingerprint: None,
 			buffers,
 			layout: LayoutNode::Leaf(LayoutLeaf {
+				group_root: None,
 				pane_id: focused_pane_id,
 				pane: EditorPane::new_empty(
 					initial_view_id,
@@ -4196,6 +4431,7 @@ impl EditorSession {
 					&persistent_settings,
 				),
 			}),
+			host_panel_groups: HashMap::new(),
 			focused_pane_id,
 			browser_target_pane_id: Some(focused_pane_id),
 			diff_pairs: HashMap::new(),
@@ -4286,6 +4522,165 @@ impl EditorSession {
 	/// view references this buffer.
 	pub(crate) fn host_panel_buffer_id(&self, panel_id: HostPanelId) -> Option<BufferId> {
 		self.buffers.host_panel_buffer_id(panel_id)
+	}
+
+	/// Establish one complete host-panel group without projecting intermediate
+	/// split geometry. Returns backing buffers that could not be placed and must
+	/// be released by the runtime.
+	pub(crate) fn ensure_host_panel_group(
+		&mut self,
+		group_id: HostPanelGroupId,
+		anchor: Option<PaneId>,
+		members: Vec<HostPanelGroupMember>,
+		layout: HostPanelGroupLayout,
+	) -> Vec<BufferId> {
+		if members.is_empty() && !self.host_panel_groups.contains_key(&group_id) {
+			return Vec::new();
+		}
+
+		if let Some(group) = self.host_panel_groups.get_mut(&group_id) {
+			group.current_members = members;
+			if anchor.is_some_and(|pane_id| self.layout.find_pane(pane_id).is_some()) {
+				group.latest_valid_anchor = anchor;
+			}
+			return Vec::new();
+		}
+
+		let mut unique = HashSet::new();
+		let conflicts = members.iter().any(|member| !unique.insert(member.panel_id))
+			|| self.host_panel_groups.values().any(|group| {
+				group.current_members.iter().any(|existing| {
+					members
+						.iter()
+						.any(|member| member.panel_id == existing.panel_id)
+				})
+			});
+
+		let valid_anchor = anchor.filter(|pane_id| self.layout.find_pane(*pane_id).is_some());
+		let producer_buffer_id = valid_anchor.and_then(|pane_id| {
+			self.layout
+				.find_pane(pane_id)
+				.map(|pane| pane.active_tab().buffer_id)
+		});
+		let dimensions = valid_anchor
+			.and_then(|pane_id| self.layout.find_pane(pane_id))
+			.map(|pane| {
+				let common = pane.active_tab().common();
+				(common.viewport_width, common.viewport_lines)
+			})
+			.unwrap_or((DEFAULT_VIEWPORT_WIDTH, DEFAULT_VIEWPORT_LINES));
+
+		let existing = members.iter().any(|member| {
+			self.host_panel_buffer_id(member.panel_id)
+				.and_then(|buffer_id| self.layout.view_id_for_buffer(buffer_id))
+				.is_some()
+		});
+		let mut created = Vec::new();
+		for member in &members {
+			if self.host_panel_buffer_id(member.panel_id).is_some() {
+				continue;
+			}
+			let view = self.create_host_panel_view(
+				member.panel_id,
+				HostPanelDescriptor {
+					kind: member.kind.clone(),
+					title: member.title.clone(),
+				},
+				dimensions.0,
+				dimensions.1,
+			);
+			let pane_id = self.next_pane_id;
+			self.next_pane_id = self.next_pane_id.next();
+			created.push((
+				member.panel_id,
+				view.buffer_id,
+				pane_id,
+				EditorPane::from_view(view),
+				member.shape,
+			));
+		}
+
+		let minimum = host_panel_tile_minimum(created.len());
+		let fits = valid_anchor
+			.and_then(|pane_id| {
+				self.pane_layouts()
+					.into_iter()
+					.find(|pane| pane.pane_id == pane_id)
+			})
+			.is_some_and(|anchor_layout| {
+				let width = anchor_layout
+					.rect
+					.width
+					.get()
+					.saturating_sub(SPLIT_DIVIDER_COLS)
+					/ 2;
+				let height = anchor_layout.rect.height.get();
+				minimum.0 <= width && minimum.1 <= height
+			});
+		let candidate_allowed = !conflicts
+			&& !existing
+			&& valid_anchor.is_some_and(|pane_id| self.layout.can_host_group_subtree(pane_id))
+			&& fits;
+
+		let materialized = if candidate_allowed {
+			let anchor = valid_anchor.expect("fit candidate has an anchor");
+			let candidate = build_host_panel_group_tile(
+				group_id,
+				created
+					.drain(..)
+					.map(|(_, _, pane_id, pane, shape)| (pane_id, pane, shape))
+					.collect(),
+				layout,
+			);
+			let inserted = self.layout.split_leaf_with_subtree(
+				anchor,
+				SplitDirection::Vertical,
+				candidate,
+				false,
+			);
+			if inserted {
+				self.focus_pane(anchor);
+			}
+			inserted
+		} else {
+			false
+		};
+
+		let mut unplaced = Vec::new();
+		let mut detached_members = HashSet::new();
+		if !materialized {
+			let target = valid_anchor.unwrap_or(self.focused_pane_id);
+			for (panel_id, buffer_id, _, pane, _) in created.into_iter().rev() {
+				if self
+					.split_pane_with_new_pane_order(target, SplitDirection::Horizontal, pane, false)
+					.is_none()
+				{
+					unplaced.push(buffer_id);
+				} else {
+					detached_members.insert(panel_id);
+				}
+			}
+			self.focus_pane(target);
+			for member in &members {
+				if self.host_panel_buffer_id(member.panel_id).is_some() {
+					detached_members.insert(member.panel_id);
+				}
+			}
+		}
+
+		self.host_panel_groups.insert(
+			group_id,
+			HostPanelGroupState {
+				producer_buffer_id,
+				layout_state: HostPanelGroupLayoutState::Automatic,
+				current_members: members,
+				retained_members: HashSet::new(),
+				detached_members,
+				latest_valid_anchor: valid_anchor,
+			},
+		);
+		debug_assert!(self.layout.count_group_roots(group_id) <= 1);
+		unplaced
 	}
 
 	/// Queue an ordered frontend event. Accumulated on the session so producers
@@ -4892,7 +5287,10 @@ mod tests {
 	use crate::engine::jobs::{JobSpawnError, JobSpec};
 	use crate::engine::runtime_registry::{ActionLease, RegistrationBatch};
 	use crate::engine::test_support::{build_document, build_split_virtual_document};
-	use crate::engine::{HostPanelDescriptor, HostPanelId};
+	use crate::engine::{
+		HostPanelDescriptor, HostPanelGroupId, HostPanelGroupLayout, HostPanelGroupMember,
+		HostPanelGroupShape, HostPanelId,
+	};
 	use crate::engine::{SplitDirection, UiColorOverrides, VisualKind};
 	use crate::uast::UastMutation;
 	use std::collections::BTreeMap;
@@ -4935,6 +5333,59 @@ mod tests {
 			BTreeMap::new(),
 			None,
 		)
+	}
+
+	fn product_0015_members(base: u64) -> Vec<HostPanelGroupMember> {
+		(0..4)
+			.map(|offset| HostPanelGroupMember {
+				panel_id: HostPanelId::new(base + offset),
+				kind: "view".to_owned(),
+				title: format!("view-{offset}"),
+				shape: if offset % 2 == 0 {
+					HostPanelGroupShape::Compact
+				} else {
+					HostPanelGroupShape::Expansive
+				},
+			})
+			.collect()
+	}
+
+	#[test]
+	fn product_0015_group_root_is_unique_and_decline_leaves_no_partial_tag() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let group_id = HostPanelGroupId::new(1);
+		let anchor = session.focused_pane_id;
+		let unplaced = session.ensure_host_panel_group(
+			group_id,
+			Some(anchor),
+			product_0015_members(100),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		assert!(unplaced.is_empty());
+		assert_eq!(session.layout.count_group_roots(group_id), 1);
+
+		let mut declined = test_editor_session(&registry);
+		declined.update_terminal_size(8, 6);
+		let group_id = HostPanelGroupId::new(2);
+		let anchor = declined.focused_pane_id;
+		let unplaced = declined.ensure_host_panel_group(
+			group_id,
+			Some(anchor),
+			product_0015_members(200),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		assert!(unplaced.is_empty());
+		assert_eq!(declined.layout.count_group_roots(group_id), 0);
+		assert_eq!(
+			declined
+				.host_panel_groups
+				.get(&group_id)
+				.expect("declined group state")
+				.detached_members
+				.len(),
+			4
+		);
 	}
 
 	fn exact_reachable_nodes(registry: &UastRegistry, root: crate::ecs::NodeId) -> u64 {
@@ -5578,6 +6029,7 @@ mod tests {
 			})
 			.collect();
 		session.layout = LayoutNode::Leaf(LayoutLeaf {
+			group_root: None,
 			pane_id: session.focused_pane_id,
 			pane: EditorPane {
 				tabs,
@@ -5619,6 +6071,7 @@ mod tests {
 		let buffer_id = session.buffers.insert(BufferContent::FileBrowser(browser));
 		let view_id = ViewId::new(100);
 		session.layout = LayoutNode::Leaf(LayoutLeaf {
+			group_root: None,
 			pane_id: session.focused_pane_id,
 			pane: EditorPane::from_view(View::new_file_browser(
 				view_id,
@@ -5842,6 +6295,7 @@ mod tests {
 		);
 		let view_id = view.id;
 		session.layout = LayoutNode::Leaf(LayoutLeaf {
+			group_root: None,
 			pane_id: session.focused_pane_id,
 			pane: EditorPane::from_view(view),
 		});

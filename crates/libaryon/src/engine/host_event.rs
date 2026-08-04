@@ -31,6 +31,23 @@ impl HostPanelId {
 	}
 }
 
+/// Opaque identity of one frontend-requested host-panel layout group.
+///
+/// The engine assigns geometry to this identity but does not interpret the
+/// producer or content semantics behind it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct HostPanelGroupId(u64);
+
+impl HostPanelGroupId {
+	pub const fn new(value: u64) -> Self {
+		Self(value)
+	}
+
+	pub const fn get(self) -> u64 {
+		self.0
+	}
+}
+
 /// Presentation metadata the engine persists for a host panel. Deliberately
 /// free of any host data: no DataFrame, texture, or connection is representable
 /// here.

@@ -3481,6 +3481,8 @@ fn multi_cursor_policy(command: &EditorCommand) -> MultiCursorPolicy {
 		| EditorCommand::WriteInit { .. }
 		| EditorCommand::WriteDefaultInit { .. }
 		| EditorCommand::OpenHostPanel { .. }
+		| EditorCommand::EnsureHostPanelGroup { .. }
+		| EditorCommand::ResetHostPanelGroup { .. }
 		| EditorCommand::RefreshHostPanel { .. }
 		| EditorCommand::ClearVisualSelection
 		| EditorCommand::CheckFileReload
@@ -4259,6 +4261,21 @@ fn dispatch_command(
 					}
 				}
 			}
+			needs_render = true;
+		}
+		EditorCommand::EnsureHostPanelGroup {
+			group_id,
+			anchor,
+			members,
+			layout,
+		} => {
+			let unplaced = session.ensure_host_panel_group(group_id, anchor, members, layout);
+			for buffer_id in unplaced {
+				release_buffer(runtime, session, buffer_id);
+			}
+			needs_render = true;
+		}
+		EditorCommand::ResetHostPanelGroup { .. } => {
 			needs_render = true;
 		}
 		EditorCommand::RefreshHostPanel { panel_id, revision } => {

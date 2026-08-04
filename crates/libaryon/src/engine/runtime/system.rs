@@ -6222,6 +6222,110 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0015_host_panel_groups_tile_atomically_and_fallback_visibly() {
+		use crate::engine::{
+			HostPanelGroupId, HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape,
+			HostPanelId,
+		};
+
+		let members = || {
+			[
+				(71, "table-1", HostPanelGroupShape::Compact),
+				(72, "plot-2", HostPanelGroupShape::Expansive),
+				(73, "table-3", HostPanelGroupShape::Compact),
+				(74, "plot-4", HostPanelGroupShape::Expansive),
+			]
+			.into_iter()
+			.map(|(id, title, shape)| HostPanelGroupMember {
+				panel_id: HostPanelId::new(id),
+				kind: "view".to_owned(),
+				title: title.to_owned(),
+				shape,
+			})
+			.collect::<Vec<_>>()
+		};
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+		let initial = send_refresh_and_recv(&tx_cmd, &rx_view);
+		let source = initial.focused_pane_id;
+		let tiled = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::EnsureHostPanelGroup {
+				group_id: HostPanelGroupId::new(1),
+				anchor: Some(source),
+				members: members(),
+				layout: HostPanelGroupLayout::RowMajorTile,
+			},
+		);
+		assert_eq!(tiled.focused_pane_id, source);
+		assert_eq!(tiled.panes.len(), 5);
+		let mut outputs = tiled
+			.panes
+			.iter()
+			.filter(|pane| pane.host_panel.is_some())
+			.collect::<Vec<_>>();
+		outputs.sort_by_key(|pane| (pane.rect.screen_row.get(), pane.rect.screen_col.get()));
+		assert_eq!(
+			outputs
+				.iter()
+				.map(|pane| pane.host_panel.as_ref().expect("panel").title.as_str())
+				.collect::<Vec<_>>(),
+			vec!["table-1", "plot-2", "table-3", "plot-4"]
+		);
+		assert!(outputs.iter().all(|pane| pane.tabs.len() == 1));
+		assert!(outputs[1].rect.width.get() > outputs[0].rect.width.get());
+		assert!(outputs[3].rect.width.get() > outputs[2].rect.width.get());
+		assert_eq!(outputs[0].rect.screen_row, outputs[1].rect.screen_row);
+		assert_eq!(outputs[2].rect.screen_row, outputs[3].rect.screen_row);
+		assert!(outputs[2].rect.screen_row.get() > outputs[0].rect.screen_row.get());
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+
+		let (tx_cmd, rx_view, handle) = spawn_test_engine_with_sql();
+		let small = send_cmd_and_recv(&tx_cmd, &rx_view, EditorCommand::Resize(8, 6));
+		let source = small.focused_pane_id;
+		let fallback = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::EnsureHostPanelGroup {
+				group_id: HostPanelGroupId::new(2),
+				anchor: Some(source),
+				members: members(),
+				layout: HostPanelGroupLayout::RowMajorTile,
+			},
+		);
+		assert_eq!(fallback.focused_pane_id, source);
+		assert_eq!(
+			fallback
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.count(),
+			4,
+			"declined tiling must still place every member visibly"
+		);
+		assert_ne!(
+			fallback.status_message.as_deref(),
+			Some("No room to open a host panel")
+		);
+		let rerun = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::EnsureHostPanelGroup {
+				group_id: HostPanelGroupId::new(2),
+				anchor: Some(source),
+				members: members(),
+				layout: HostPanelGroupLayout::RowMajorTile,
+			},
+		);
+		assert_eq!(rerun.panes.len(), fallback.panes.len());
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
 	fn closing_one_host_panel_tab_disposes_only_that_panel() {
 		use crate::engine::{
 			EngineConfig, EngineHandle, HostEvent, HostPanelId, HostPanelPlacement,

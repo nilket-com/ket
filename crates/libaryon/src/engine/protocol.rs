@@ -103,6 +103,28 @@ pub enum HostPanelPlacement {
 	},
 }
 
+/// Generic natural-width request for a member of a host-panel group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPanelGroupShape {
+	Compact,
+	Expansive,
+}
+
+/// Engine-owned arrangement requested for a complete host-panel group.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HostPanelGroupLayout {
+	RowMajorTile,
+}
+
+/// One current member in a complete host-panel group request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostPanelGroupMember {
+	pub panel_id: crate::engine::HostPanelId,
+	pub kind: String,
+	pub title: String,
+	pub shape: HostPanelGroupShape,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PaneFocusDirection {
 	Up,
@@ -208,6 +230,8 @@ impl EditorCommand {
 				| Self::DocTabPrev
 				| Self::DocTabClose
 				| Self::OpenHostPanel { .. }
+				| Self::EnsureHostPanelGroup { .. }
+				| Self::ResetHostPanelGroup { .. }
 				| Self::RefreshHostPanel { .. }
 				| Self::OpenFileBrowser
 				| Self::OpenFileBrowserAt(_)
@@ -339,6 +363,19 @@ pub enum EditorCommand {
 		/// Ignored when this identity already has a live view.
 		placement: HostPanelPlacement,
 		focus: bool,
+	},
+	/// Establish or update one producer-scoped host-panel group. Placement is
+	/// advisory; the engine keeps every missing member visible on fallback.
+	EnsureHostPanelGroup {
+		group_id: crate::engine::HostPanelGroupId,
+		anchor: Option<PaneId>,
+		members: Vec<HostPanelGroupMember>,
+		layout: HostPanelGroupLayout,
+	},
+	/// Reconcile a live group to the automatic layout of its latest current
+	/// membership.
+	ResetHostPanelGroup {
+		group_id: crate::engine::HostPanelGroupId,
 	},
 	/// Rebind a live panel to a new revision of its source, so the frontend can
 	/// mark or replace stale output.
