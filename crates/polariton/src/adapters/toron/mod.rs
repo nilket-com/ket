@@ -94,7 +94,7 @@ mod tests {
 	use crate::plot::factory::{create_authored_plot, create_automatic_plot};
 	use crate::plot::spec::AuthoredPlotSpec;
 	use crate::rune_relation_envelope::{
-		RunePlotIntent, RuneViewIntent, transform as transform_rune_view,
+		RunePlotBody, RuneViewIntent, transform as transform_rune_view,
 	};
 	use iced::Rectangle;
 	use std::path::PathBuf;
@@ -218,40 +218,42 @@ mod tests {
 					assert!(frame.column("cat").is_ok());
 					assert!(frame.column("val").is_ok());
 				}
-				RuneViewIntent::Plot(RunePlotIntent::Single(plot)) => {
-					let expected_x = plot.x.clone();
-					let expected_y = plot.y.clone();
-					let projected = frame
-						.select([plot.x.as_str(), plot.y.as_str()])
-						.expect("project plot fields");
-					let kernel = create_authored_plot(
-						AuthoredPlotSpec::xy(plot.composition, plot.x, plot.y),
-						&projected,
-						800,
-						480,
-					)
-					.expect("resolve relation plot fields");
-					assert_eq!(kernel.x_label(), expected_x);
-					assert_eq!(kernel.y_label(), expected_y);
-					let widget = PlotWidget {
-						kernel: kernel.as_ref(),
-						title: "Rune relation first contact".to_owned(),
-						padding: 0.0,
-						settings: ResolvedPlotSettings::default(),
-						render_revision: 0,
-						resize_render_suspended: false,
-						layer: PlotRenderLayer::Full,
-					};
-					let mut backend = SvgBackend::new(800.0, 480.0);
-					widget.render(
-						&mut backend,
-						Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
-					);
-					assert!(backend.finish().contains("<path"));
-				}
-				RuneViewIntent::Plot(RunePlotIntent::Layered(_)) => {
-					panic!("this legacy fixture contains no layered sink")
-				}
+				RuneViewIntent::Plot(plot) => match plot.body {
+					RunePlotBody::Single(plot) => {
+						let expected_x = plot.x.clone();
+						let expected_y = plot.y.clone();
+						let projected = frame
+							.select([plot.x.as_str(), plot.y.as_str()])
+							.expect("project plot fields");
+						let kernel = create_authored_plot(
+							AuthoredPlotSpec::xy(plot.composition, plot.x, plot.y),
+							&projected,
+							800,
+							480,
+						)
+						.expect("resolve relation plot fields");
+						assert_eq!(kernel.x_label(), expected_x);
+						assert_eq!(kernel.y_label(), expected_y);
+						let widget = PlotWidget {
+							kernel: kernel.as_ref(),
+							title: "Rune relation first contact".to_owned(),
+							padding: 0.0,
+							settings: ResolvedPlotSettings::default(),
+							render_revision: 0,
+							resize_render_suspended: false,
+							layer: PlotRenderLayer::Full,
+						};
+						let mut backend = SvgBackend::new(800.0, 480.0);
+						widget.render(
+							&mut backend,
+							Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
+						);
+						assert!(backend.finish().contains("<path"));
+					}
+					RunePlotBody::Layered(_) => {
+						panic!("this legacy fixture contains no layered sink")
+					}
+				},
 			}
 		}
 	}
@@ -276,8 +278,11 @@ mod tests {
 		let [view] = relation.views.as_slice() else {
 			panic!("line fixture must produce exactly one view");
 		};
-		let RuneViewIntent::Plot(RunePlotIntent::Single(plot)) = &view.intent else {
+		let RuneViewIntent::Plot(plot) = &view.intent else {
 			panic!("line fixture must produce a plot");
+		};
+		let RunePlotBody::Single(plot) = &plot.body else {
+			panic!("line fixture must produce one line mark");
 		};
 		assert_eq!(plot.composition.primary_plot_type(), PlotType::Line);
 		let projected = frame
@@ -332,25 +337,27 @@ mod tests {
 					assert!(frame.column("cat").is_ok());
 					assert!(frame.column("val").is_ok());
 				}
-				RuneViewIntent::Plot(RunePlotIntent::Single(plot)) => {
-					let expected_x = plot.x.clone();
-					let expected_y = plot.y.clone();
-					let projected = frame
-						.select([plot.x.as_str(), plot.y.as_str()])
-						.expect("project plot fields");
-					let kernel = create_authored_plot(
-						AuthoredPlotSpec::xy(plot.composition, plot.x, plot.y),
-						&projected,
-						800,
-						480,
-					)
-					.expect("resolve relation plot fields");
-					assert_eq!(kernel.x_label(), expected_x);
-					assert_eq!(kernel.y_label(), expected_y);
-				}
-				RuneViewIntent::Plot(RunePlotIntent::Layered(_)) => {
-					panic!("this legacy fixture contains no layered sink")
-				}
+				RuneViewIntent::Plot(plot) => match plot.body {
+					RunePlotBody::Single(plot) => {
+						let expected_x = plot.x.clone();
+						let expected_y = plot.y.clone();
+						let projected = frame
+							.select([plot.x.as_str(), plot.y.as_str()])
+							.expect("project plot fields");
+						let kernel = create_authored_plot(
+							AuthoredPlotSpec::xy(plot.composition, plot.x, plot.y),
+							&projected,
+							800,
+							480,
+						)
+						.expect("resolve relation plot fields");
+						assert_eq!(kernel.x_label(), expected_x);
+						assert_eq!(kernel.y_label(), expected_y);
+					}
+					RunePlotBody::Layered(_) => {
+						panic!("this legacy fixture contains no layered sink")
+					}
+				},
 			}
 		}
 	}

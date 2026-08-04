@@ -26,9 +26,9 @@ use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RuneViewIntent, RuneViewScheduler,
-	SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView, ViewPresentation,
-	transform as transform_rune_view,
+	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RuneViewIntent,
+	RuneViewScheduler, SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView,
+	ViewPresentation, transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -771,23 +771,32 @@ fn rune_view_outcome(
 			let presentation = view.intent.presentation();
 			let output = match view.intent {
 				RuneViewIntent::Table => Ok(RuneRelationSinkOutput::Table),
-				RuneViewIntent::Plot(crate::rune_relation_envelope::RunePlotIntent::Single(
-					plot,
-				)) => {
-					let authored_spec =
-						AuthoredPlotSpec::xy_color(plot.composition, plot.x, plot.y, plot.category);
-					plan(PlotRequest {
-						source: PlotSource::Materialized {
-							name: "workspace relation".to_owned(),
-							data: std::sync::Arc::clone(&result),
-						},
-						authored_spec,
-					})
-					.map(RuneRelationSinkOutput::Plot)
+				RuneViewIntent::Plot(plot) => {
+					let authored_settings = plot.authored_settings;
+					match plot.body {
+						RunePlotBody::Single(plot) => {
+							let authored_spec = AuthoredPlotSpec::xy_color(
+								plot.composition,
+								plot.x,
+								plot.y,
+								plot.category,
+							);
+							plan(PlotRequest {
+								source: PlotSource::Materialized {
+									name: "workspace relation".to_owned(),
+									data: std::sync::Arc::clone(&result),
+								},
+								authored_spec,
+							})
+							.map(|resolved| {
+								RuneRelationSinkOutput::Plot(resolved, authored_settings)
+							})
+						}
+						RunePlotBody::Layered(specification) => Ok(
+							RuneRelationSinkOutput::LayeredPlot(specification, authored_settings),
+						),
+					}
 				}
-				RuneViewIntent::Plot(crate::rune_relation_envelope::RunePlotIntent::Layered(
-					specification,
-				)) => Ok(RuneRelationSinkOutput::LayeredPlot(specification)),
 			};
 			RuneRelationSinkOutcome {
 				identity: view.identity,
@@ -1457,7 +1466,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 								app_state.data_frame = frame;
 								app_state.status_df_size = Some((rows, cols));
 							}
-							Ok(RuneRelationSinkOutput::Plot(resolved)) => {
+							Ok(RuneRelationSinkOutput::Plot(resolved, authored_settings)) => {
 								let presentation = sink.presentation;
 								plot_tasks.push(build_resolved_plot_task(
 									resolved,
@@ -1467,12 +1476,16 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										revision,
 										panel_id,
 										presentation,
+										authored_settings,
 										resolved,
 										kernel,
 									},
 								));
 							}
-							Ok(RuneRelationSinkOutput::LayeredPlot(specification)) => {
+							Ok(RuneRelationSinkOutput::LayeredPlot(
+								specification,
+								authored_settings,
+							)) => {
 								let presentation = sink.presentation;
 								let span = sink.span;
 								plot_tasks.push(build_layered_plot_task(
@@ -1483,6 +1496,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										revision,
 										panel_id,
 										presentation,
+										authored_settings,
 										span,
 										result,
 									},
@@ -1547,15 +1561,19 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			revision,
 			panel_id,
 			presentation,
+			authored_settings,
 			resolved,
 			kernel,
 		} => {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
-			app_state
-				.code_editor
-				.set_rune_view_plot(panel_id, presentation.display_label, kernel);
+			app_state.code_editor.set_rune_view_plot(
+				panel_id,
+				presentation.display_label,
+				kernel,
+				authored_settings,
+			);
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
 		}
 		#[cfg(feature = "toron")]
@@ -1564,6 +1582,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			revision,
 			panel_id,
 			presentation,
+			authored_settings,
 			span,
 			result,
 		} => {
@@ -1576,6 +1595,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						panel_id,
 						presentation.display_label.clone(),
 						kernel,
+						authored_settings,
 					);
 					app_state.status_msg = format!("Built {}.", presentation.display_label);
 				}
@@ -2081,10 +2101,12 @@ mod tests {
 			Single(
 				crate::rune_relation_envelope::ViewPresentation,
 				crate::plot::request::ResolvedPlot,
+				crate::plot::theme::PlotSettingsLayer,
 			),
 			Layered(
 				crate::rune_relation_envelope::ViewPresentation,
 				crate::plot::spec::LayeredPlotSpec,
+				crate::plot::theme::PlotSettingsLayer,
 				Arc<polars::frame::DataFrame>,
 				std::ops::Range<u32>,
 			),
@@ -2100,21 +2122,30 @@ mod tests {
 			.sinks
 			.iter()
 			.filter_map(|sink| match &sink.output {
-				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved)) => Some((
+				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(
+					resolved,
+					authored_settings,
+				)) => Some((
 					sink.identity.clone(),
-					ReadyPlot::Single(sink.presentation.clone(), resolved.clone()),
+					ReadyPlot::Single(
+						sink.presentation.clone(),
+						resolved.clone(),
+						authored_settings.clone(),
+					),
 				)),
-				Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification)) => {
-					Some((
-						sink.identity.clone(),
-						ReadyPlot::Layered(
-							sink.presentation.clone(),
-							specification.clone(),
-							Arc::clone(&sink.source),
-							sink.span.clone(),
-						),
-					))
-				}
+				Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(
+					specification,
+					authored_settings,
+				)) => Some((
+					sink.identity.clone(),
+					ReadyPlot::Layered(
+						sink.presentation.clone(),
+						specification.clone(),
+						authored_settings.clone(),
+						Arc::clone(&sink.source),
+						sink.span.clone(),
+					),
+				)),
 				_ => None,
 			})
 			.collect::<Vec<_>>();
@@ -2135,7 +2166,7 @@ mod tests {
 				.rune_view_panel_id(source_buffer, &identity)
 				.expect("prepared plot panel");
 			match plot {
-				ReadyPlot::Single(presentation, resolved) => {
+				ReadyPlot::Single(presentation, resolved, authored_settings) => {
 					let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
 					drop(update(
 						state,
@@ -2144,12 +2175,19 @@ mod tests {
 							revision,
 							panel_id,
 							presentation,
+							authored_settings,
 							resolved,
 							kernel,
 						},
 					));
 				}
-				ReadyPlot::Layered(presentation, specification, source, span) => {
+				ReadyPlot::Layered(
+					presentation,
+					specification,
+					authored_settings,
+					source,
+					span,
+				) => {
 					let result = create_layered_plot(&specification, source.as_ref(), 1200, 720);
 					drop(update(
 						state,
@@ -2158,6 +2196,7 @@ mod tests {
 							revision,
 							panel_id,
 							presentation,
+							authored_settings,
 							span,
 							result,
 						},
@@ -2488,7 +2527,8 @@ mod tests {
 				.iter()
 				.zip([PlotType::Bar, PlotType::Scatter, PlotType::Line])
 		{
-			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(plot)) = &sink.output else {
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(plot, _)) = &sink.output
+			else {
 				panic!("expected resolved plot");
 			};
 			assert_eq!(plot.data.height(), 2);
@@ -2759,7 +2799,7 @@ mod tests {
 		let [sink] = outcome.sinks.as_slice() else {
 			panic!("one layers sink must remain one outcome")
 		};
-		let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification)) =
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification, _)) =
 			&sink.output
 		else {
 			panic!("the envelope must hand a layered specification to the head")
@@ -2793,6 +2833,7 @@ mod tests {
 				revision,
 				panel_id,
 				presentation: sink.presentation.clone(),
+				authored_settings: crate::plot::theme::PlotSettingsLayer::default(),
 				span: span.clone(),
 				result: Err(error.clone()),
 			},
@@ -3021,7 +3062,7 @@ workspace.table("t").views([
 			.next()
 			.expect("one relation");
 		let bare_outcome = rune_view_outcome(frame.clone(), bare_relation.views);
-		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved)) =
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _)) =
 			&bare_outcome.sinks[0].output
 		else {
 			panic!("bare line must use the established plot request")
@@ -3034,7 +3075,7 @@ workspace.table("t").views([
 			.next()
 			.expect("one relation");
 		let layered_outcome = rune_view_outcome(frame.clone(), layered_relation.views);
-		let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification)) =
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification, _)) =
 			&layered_outcome.sinks[0].output
 		else {
 			panic!("layers spelling must retain the layered request")
@@ -3363,14 +3404,19 @@ plot.bar(a, "x", "y");
 			.sinks
 			.into_iter()
 			.find_map(|sink| match sink.output {
-				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved)) => Some(resolved),
+				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _)) => {
+					Some(resolved)
+				}
 				_ => None,
 			})
 			.expect("resolved scatter");
 		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
-		state
-			.code_editor
-			.set_rune_view_plot(stable_panel, "plot.scatter".to_owned(), kernel);
+		state.code_editor.set_rune_view_plot(
+			stable_panel,
+			"plot.scatter".to_owned(),
+			kernel,
+			crate::plot::theme::PlotSettingsLayer::default(),
+		);
 		assert!(
 			state
 				.code_editor

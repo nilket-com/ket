@@ -4,14 +4,33 @@ use crate::plot::common::{PlotKernel, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::Override;
-use crate::plot::theme::{PlotSettings, PlotThemeSpec};
+use crate::plot::theme::{PlotSettings, PlotSettingsLayer, PlotThemeSpec};
 use iced::{Rectangle, Size};
 use std::sync::Arc;
 
+fn default_application_plot_settings() -> PlotSettingsLayer {
+	let mut settings = PlotSettingsLayer::default();
+	settings.theme = Override::Set(PlotThemeSpec::default());
+	settings
+}
+
+fn resolve_host_plot_settings(
+	application_theme: PlotSettingsLayer,
+	authored_spec: PlotSettingsLayer,
+) -> ResolvedPlotSettings {
+	PlotSettings {
+		application_theme,
+		authored_spec,
+		..PlotSettings::default()
+	}
+	.resolve()
+}
+
 fn default_resolved_plot_settings() -> ResolvedPlotSettings {
-	let mut settings = PlotSettings::default();
-	settings.application_theme.theme = Override::Set(PlotThemeSpec::default());
-	settings.resolve()
+	resolve_host_plot_settings(
+		default_application_plot_settings(),
+		PlotSettingsLayer::default(),
+	)
 }
 
 /// Plot state owned by an ordinary host panel. Unlike `PlotPaneState`, this
@@ -29,20 +48,34 @@ pub struct HostPlotState {
 
 #[cfg(feature = "toron")]
 impl HostPlotState {
-	pub fn new(display_label: String, kernel: Arc<dyn PlotKernel + Send + Sync>) -> Self {
+	pub fn new(
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+	) -> Self {
 		Self {
 			display_label,
 			kernel,
-			plot_settings: default_resolved_plot_settings(),
+			plot_settings: resolve_host_plot_settings(
+				default_application_plot_settings(),
+				authored_settings,
+			),
 			hovered_info: None,
 			render_revision: 0,
 			resize_render_suspended: false,
 		}
 	}
 
-	pub fn replace(&mut self, display_label: String, kernel: Arc<dyn PlotKernel + Send + Sync>) {
+	pub fn replace(
+		&mut self,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
+	) {
 		self.display_label = display_label;
 		self.kernel = kernel;
+		self.plot_settings =
+			resolve_host_plot_settings(default_application_plot_settings(), authored_settings);
 		self.hovered_info = None;
 		self.render_revision = self.render_revision.wrapping_add(1);
 	}
@@ -426,9 +459,13 @@ impl PlotPaneState {
 
 #[cfg(all(test, feature = "toron"))]
 mod tests {
-	use super::HostPlotState;
+	use super::{HostPlotState, resolve_host_plot_settings};
+	use crate::plot::common::{PlotRenderLayer, PlotWidget};
+	use crate::plot::export::SvgBackend;
 	use crate::plot::factory::create_layered_plot;
-	use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec};
+	use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec, Presence};
+	use crate::plot::theme::PlotSettingsLayer;
+	use std::sync::Arc;
 
 	#[test]
 	fn product_0014_host_plot_state_cannot_carry_a_plot_composition() {
@@ -441,7 +478,7 @@ mod tests {
 			720,
 		)
 		.expect("one-layer kernel");
-		let state = HostPlotState::new("Line".to_owned(), kernel);
+		let state = HostPlotState::new("Line".to_owned(), kernel, PlotSettingsLayer::default());
 		let HostPlotState {
 			display_label,
 			kernel: _,
@@ -454,5 +491,42 @@ mod tests {
 		assert_eq!(hovered_info, None);
 		assert_eq!(render_revision, 0);
 		assert!(!resize_render_suspended);
+	}
+
+	#[test]
+	fn product_0016_application_theme_title_resolves_without_authored_prose() {
+		let frame =
+			polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 4.0]).expect("fixture frame");
+		let kernel = create_layered_plot(
+			&LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y")),
+			&frame,
+			800,
+			480,
+		)
+		.expect("line kernel");
+		let mut application_theme = PlotSettingsLayer::default();
+		application_theme.title = Presence::Show(Arc::new("Application title".to_owned()));
+		let resolved = resolve_host_plot_settings(application_theme, PlotSettingsLayer::default());
+		assert_eq!(
+			resolved.title.as_ref().map(|title| title.as_str()),
+			Some("Application title")
+		);
+		let widget = PlotWidget {
+			kernel: kernel.as_ref(),
+			title: "Line".to_owned(),
+			padding: 0.0,
+			settings: resolved,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = SvgBackend::new(800.0, 480.0);
+		widget.render(
+			&mut backend,
+			iced::Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
+		);
+		let svg = backend.finish();
+		assert!(svg.contains("Application title"));
+		assert!(!svg.contains(">Line<"));
 	}
 }

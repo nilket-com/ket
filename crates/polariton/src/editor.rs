@@ -14,6 +14,10 @@ use crate::gui::{
 use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
 #[cfg(feature = "toron")]
+use crate::plot::spec::Presence;
+#[cfg(feature = "toron")]
+use crate::plot::theme::PlotSettingsLayer;
+#[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use iced::keyboard::{self, Key};
 use iced::mouse;
@@ -872,7 +876,11 @@ impl CodeEditor {
 			let title = match identity {
 				LocalViewIdentity::Named(name) => name.clone(),
 				LocalViewIdentity::Anonymous(position) => {
-					format!("{} {}", presentation.display_label, position + 1)
+					let label = match &presentation.authored_title {
+						Presence::Show(title) => title.as_str(),
+						Presence::Inherit | Presence::Hide => &presentation.display_label,
+					};
+					format!("{label} {}", position + 1)
 				}
 			};
 			group_members.push(HostPanelGroupMember {
@@ -977,8 +985,10 @@ impl CodeEditor {
 		panel_id: HostPanelId,
 		display_label: String,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
 	) {
-		self.panels.set_plot(panel_id, display_label, kernel);
+		self.panels
+			.set_plot(panel_id, display_label, kernel, authored_settings);
 	}
 
 	#[cfg(feature = "toron")]
@@ -2567,6 +2577,7 @@ impl PanelRegistry {
 		panel_id: HostPanelId,
 		display_label: String,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		authored_settings: PlotSettingsLayer,
 	) {
 		if let Some(PanelEntry {
 			content: PanelContent::Plot(plot),
@@ -2574,13 +2585,17 @@ impl PanelRegistry {
 			..
 		}) = self.panels.get_mut(&panel_id)
 		{
-			plot.replace(display_label, kernel);
+			plot.replace(display_label, kernel, authored_settings);
 			*status = PanelStatus::Fresh;
 			return;
 		}
 		self.set_content(
 			panel_id,
-			PanelContent::Plot(Box::new(HostPlotState::new(display_label, kernel))),
+			PanelContent::Plot(Box::new(HostPlotState::new(
+				display_label,
+				kernel,
+				authored_settings,
+			))),
 		);
 	}
 
@@ -5624,6 +5639,7 @@ mod tests {
 				ViewPresentation {
 					content_kind: ViewContentKind::Table,
 					display_label: "table".to_owned(),
+					authored_title: crate::plot::spec::Presence::Inherit,
 				},
 			),
 			(
@@ -5631,6 +5647,7 @@ mod tests {
 				ViewPresentation {
 					content_kind: ViewContentKind::Plot,
 					display_label: "Line + Scatter".to_owned(),
+					authored_title: crate::plot::spec::Presence::Inherit,
 				},
 			),
 			(
@@ -5638,6 +5655,7 @@ mod tests {
 				ViewPresentation {
 					content_kind: ViewContentKind::Table,
 					display_label: "table".to_owned(),
+					authored_title: crate::plot::spec::Presence::Inherit,
 				},
 			),
 			(
@@ -5645,6 +5663,7 @@ mod tests {
 				ViewPresentation {
 					content_kind: ViewContentKind::Plot,
 					display_label: "plot.bar".to_owned(),
+					authored_title: crate::plot::spec::Presence::Inherit,
 				},
 			),
 		];
@@ -5824,6 +5843,7 @@ mod tests {
 				ViewPresentation {
 					content_kind: ViewContentKind::Table,
 					display_label: "table".to_owned(),
+					authored_title: crate::plot::spec::Presence::Inherit,
 				},
 			),
 			(
@@ -5831,6 +5851,7 @@ mod tests {
 				ViewPresentation {
 					content_kind: ViewContentKind::Plot,
 					display_label: "plot.line".to_owned(),
+					authored_title: crate::plot::spec::Presence::Inherit,
 				},
 			),
 		];
@@ -5887,6 +5908,7 @@ mod tests {
 			ViewPresentation {
 				content_kind: ViewContentKind::Table,
 				display_label: "table".to_owned(),
+				authored_title: crate::plot::spec::Presence::Inherit,
 			},
 		)];
 		editor.prepare_rune_view_panels(second_producer, &second_views, 1);

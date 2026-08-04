@@ -8,26 +8,43 @@
 
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
-use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec};
+use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec, Presence};
+use crate::plot::theme::PlotSettingsLayer;
 use libaryon::core::BufferId;
 use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
+use std::sync::Arc;
 
 const WORKSPACE_ENTRYPOINT_PREFIX: &str = "pub fn main(workspace) {\n";
 const KET_ENTRYPOINT_PREFIX: &str = "pub fn main(ket) {\n";
 const ENTRYPOINT_SUFFIX: &str = "\n}\n";
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RuneViewIntent {
 	Table,
 	Plot(RunePlotIntent),
 }
 
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RunePlotIntent {
+	pub(crate) body: RunePlotBody,
+	pub(crate) authored_settings: PlotSettingsLayer,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum RunePlotIntent {
+pub(crate) enum RunePlotBody {
 	Single(DisposableRunePlotSink),
 	Layered(LayeredPlotSpec),
+}
+
+impl RunePlotIntent {
+	fn bare(body: RunePlotBody) -> Self {
+		Self {
+			body,
+			authored_settings: PlotSettingsLayer::default(),
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -40,6 +57,7 @@ pub(crate) enum ViewContentKind {
 pub(crate) struct ViewPresentation {
 	pub(crate) content_kind: ViewContentKind,
 	pub(crate) display_label: String,
+	pub(crate) authored_title: Presence<Arc<String>>,
 }
 
 // PRODUCT-0014 replaces this production normal form. Keep the old vocabulary
@@ -66,6 +84,7 @@ impl From<RuneViewForm> for ViewPresentation {
 		Self {
 			content_kind,
 			display_label: display_label.to_owned(),
+			authored_title: Presence::Inherit,
 		}
 	}
 }
@@ -76,23 +95,26 @@ impl RuneViewIntent {
 			Self::Table => ViewPresentation {
 				content_kind: ViewContentKind::Table,
 				display_label: "table".to_owned(),
+				authored_title: Presence::Inherit,
 			},
-			Self::Plot(RunePlotIntent::Single(plot)) => ViewPresentation {
-				content_kind: ViewContentKind::Plot,
-				display_label: match plot.composition.primary_plot_type() {
-					PlotType::Bar => "plot.bar",
-					PlotType::Line => "plot.line",
-					PlotType::Scatter => "plot.scatter",
-					other => {
-						unreachable!("first-contact sink admitted unexpected plot type {other:?}")
-					}
+			Self::Plot(plot) => {
+				let display_label = match &plot.body {
+					RunePlotBody::Single(plot) => match plot.composition.primary_plot_type() {
+						PlotType::Bar => "plot.bar".to_owned(),
+						PlotType::Line => "plot.line".to_owned(),
+						PlotType::Scatter => "plot.scatter".to_owned(),
+						other => unreachable!(
+							"first-contact sink admitted unexpected plot type {other:?}"
+						),
+					},
+					RunePlotBody::Layered(plot) => plot.title(),
+				};
+				ViewPresentation {
+					content_kind: ViewContentKind::Plot,
+					display_label,
+					authored_title: plot.authored_settings.title.clone(),
 				}
-				.to_owned(),
-			},
-			Self::Plot(RunePlotIntent::Layered(plot)) => ViewPresentation {
-				content_kind: ViewContentKind::Plot,
-				display_label: plot.title(),
-			},
+			}
 		}
 	}
 
@@ -112,7 +134,7 @@ impl RuneViewIntent {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct SpannedRuneViewIntent {
 	pub(crate) intent: RuneViewIntent,
 	pub(crate) span: Range<u32>,
@@ -169,13 +191,13 @@ impl RuneEnvelopeSourceMap {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TransformedRuneView {
 	executions: Vec<TransformedRuneRelation>,
 	presentation_order: Vec<LocalViewIdentity>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TransformedRuneRelation {
 	pub(crate) origin: String,
 	pub(crate) source: String,
@@ -376,7 +398,7 @@ pub(crate) fn transform(source: &str) -> Result<TransformedRuneView, RuneEnvelop
 	})
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct OutputRootAnalysis {
 	envelopes: Vec<ExecutionEnvelope>,
 	recognized_presentation: bool,
@@ -413,7 +435,7 @@ impl OutputRootAnalysis {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ExecutionEnvelope {
 	retained: Vec<Range<usize>>,
 	relation: Range<usize>,
@@ -423,7 +445,7 @@ struct ExecutionEnvelope {
 	terminate_retained_tail: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct NonEmptySinks {
 	first: ParsedSink,
 	rest: Vec<ParsedSink>,
@@ -436,14 +458,14 @@ impl NonEmptySinks {
 }
 
 #[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct EnvelopeSemantics {
 	relation_origin: String,
 	sinks: Vec<RuneViewIntent>,
 }
 
 #[cfg(test)]
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct BufferViewSemantics {
 	executions: Vec<String>,
 	presentation_order: Vec<RuneViewIntent>,
@@ -460,7 +482,7 @@ impl ExecutionEnvelope {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ParsedSink {
 	intent: RuneViewIntent,
 	span: Range<usize>,
@@ -965,7 +987,7 @@ fn parse_contextual_sink_inner(
 					"bar fields must be strings",
 				);
 			};
-			RuneViewIntent::Plot(RunePlotIntent::Single(sink))
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
 		}
 		"scatter" if matches!(args.len(), 2 | 3) => {
 			let Some(sink) = plot_sink_fields(PlotType::Scatter, source, &args, 0)? else {
@@ -975,7 +997,7 @@ fn parse_contextual_sink_inner(
 					"scatter fields must be strings",
 				);
 			};
-			RuneViewIntent::Plot(RunePlotIntent::Single(sink))
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
 		}
 		"line" if args.len() == 2 => {
 			let Some(sink) = plot_sink_fields(PlotType::Line, source, &args, 0)? else {
@@ -985,11 +1007,11 @@ fn parse_contextual_sink_inner(
 					"line fields must be strings",
 				);
 			};
-			RuneViewIntent::Plot(RunePlotIntent::Single(sink))
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
 		}
 		"layers" => {
 			let specification = parse_layer_list(expression, &args, source)?;
-			RuneViewIntent::Plot(RunePlotIntent::Layered(specification))
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Layered(specification)))
 		}
 		"table" => {
 			return invalid_view(
@@ -1163,7 +1185,7 @@ fn parse_sugar_sink(
 		);
 	};
 	Ok(ParsedSink {
-		intent: RuneViewIntent::Plot(RunePlotIntent::Single(sink)),
+		intent: RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink))),
 		span: byte_range(call.span(), source.len())?,
 		name: None,
 		output_order: 0,
@@ -1258,7 +1280,7 @@ fn render(
 	})
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 struct ParsedView {
 	intent: RuneViewIntent,
 	statement: Range<usize>,
@@ -1283,12 +1305,14 @@ fn recognize_view_root(
 	let (intent, relation) = match callee.trim() {
 		"table" if !shadows.table && args.len() == 1 => (RuneViewIntent::Table, args[0]),
 		"plot.bar" if !shadows.plot && args.len() == 3 => (
-			RuneViewIntent::Plot(RunePlotIntent::Single(
-				match plot_sink(PlotType::Bar, source, &args)? {
-					Some(sink) => sink,
-					None => return Ok(None),
-				},
-			)),
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(match plot_sink(
+				PlotType::Bar,
+				source,
+				&args,
+			)? {
+				Some(sink) => sink,
+				None => return Ok(None),
+			}))),
 			args[0],
 		),
 		"plot.line" if !shadows.plot && args.len() == 3 => {
@@ -1299,7 +1323,10 @@ fn recognize_view_root(
 					"plot.line fields must be string literals",
 				);
 			};
-			(RuneViewIntent::Plot(RunePlotIntent::Single(sink)), args[0])
+			(
+				RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink))),
+				args[0],
+			)
 		}
 		"plot.line" if !shadows.plot => {
 			return invalid_view(
@@ -1309,12 +1336,14 @@ fn recognize_view_root(
 			);
 		}
 		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
-			RuneViewIntent::Plot(RunePlotIntent::Single(
-				match plot_sink(PlotType::Scatter, source, &args)? {
-					Some(sink) => sink,
-					None => return Ok(None),
-				},
-			)),
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(match plot_sink(
+				PlotType::Scatter,
+				source,
+				&args,
+			)? {
+				Some(sink) => sink,
+				None => return Ok(None),
+			}))),
 			args[0],
 		),
 		_ => return Ok(None),
@@ -1729,8 +1758,17 @@ mod tests {
 	fn plot_forms_retain_only_view_intent() {
 		let bar = transform("let r = workspace.table(\"test2\"); plot.bar(r, \"cat\", \"val\")")
 			.expect("bar envelope");
-		let RuneViewIntent::Plot(RunePlotIntent::Single(bar)) = &bar.views[0].intent else {
+		assert_eq!(
+			bar.views[0].intent.presentation().authored_title,
+			Presence::Inherit,
+			"bare sinks carry no source-authored chrome title"
+		);
+		let RuneViewIntent::Plot(bar) = &bar.views[0].intent else {
 			panic!("expected plot");
+		};
+		assert_eq!(bar.authored_settings, PlotSettingsLayer::default());
+		let RunePlotBody::Single(bar) = &bar.body else {
+			panic!("expected a single bar mark");
 		};
 		assert_eq!(bar.composition.primary_plot_type(), PlotType::Bar);
 		assert_eq!(
@@ -1741,16 +1779,22 @@ mod tests {
 		let scatter =
 			transform("let r = workspace.table(\"test2\"); plot.scatter(r, \"x\", \"y\", \"cat\")")
 				.expect("scatter envelope");
-		let RuneViewIntent::Plot(RunePlotIntent::Single(scatter)) = &scatter.views[0].intent else {
+		let RuneViewIntent::Plot(scatter) = &scatter.views[0].intent else {
 			panic!("expected plot");
+		};
+		let RunePlotBody::Single(scatter) = &scatter.body else {
+			panic!("expected a single scatter mark");
 		};
 		assert_eq!(scatter.composition.primary_plot_type(), PlotType::Scatter);
 		assert_eq!(scatter.category.as_deref(), Some("cat"));
 
 		let line = transform("let r = workspace.table(\"test2\"); plot.line(r, \"x\", \"y\")")
 			.expect("line envelope");
-		let RuneViewIntent::Plot(RunePlotIntent::Single(line)) = &line.views[0].intent else {
+		let RuneViewIntent::Plot(line) = &line.views[0].intent else {
 			panic!("expected plot");
+		};
+		let RunePlotBody::Single(line) = &line.body else {
+			panic!("expected a single line mark");
 		};
 		assert_eq!(line.composition.primary_plot_type(), PlotType::Line);
 		assert_eq!(
@@ -2140,9 +2184,10 @@ mod tests {
 	fn product_0014_layers_lower_in_authored_order() {
 		fn lowered(source: &str) -> LayeredPlotSpec {
 			let transformed = transform(source).expect("layers envelope");
-			let RuneViewIntent::Plot(RunePlotIntent::Layered(specification)) =
-				&transformed.views[0].intent
-			else {
+			let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+				panic!("expected layered plot intent")
+			};
+			let RunePlotBody::Layered(specification) = &plot.body else {
 				panic!("expected layered plot intent")
 			};
 			specification.clone()
@@ -2215,7 +2260,10 @@ mod tests {
 
 		let control = transform("workspace.table(\"t\").views([scatter(\"x\", \"y\", \"cat\")])")
 			.expect("the established scatter view arity remains legal");
-		let RuneViewIntent::Plot(RunePlotIntent::Single(scatter)) = &control.views[0].intent else {
+		let RuneViewIntent::Plot(scatter) = &control.views[0].intent else {
+			panic!("expected ordinary scatter sink")
+		};
+		let RunePlotBody::Single(scatter) = &scatter.body else {
 			panic!("expected ordinary scatter sink")
 		};
 		assert_eq!(scatter.category.as_deref(), Some("cat"));
