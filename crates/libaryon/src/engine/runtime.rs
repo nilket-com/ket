@@ -1790,6 +1790,7 @@ fn new_doctab_viewport(session: &EditorSession) -> (u16, u32) {
 fn spawn_empty_doctab(registry: &UastRegistry, session: &mut EditorSession) -> Result<(), String> {
 	let (viewport_width, viewport_lines) = new_doctab_viewport(session);
 	let tab = session.create_unnamed_text_view(registry, viewport_width, viewport_lines)?;
+	session.mark_host_panel_group_manual_for_pane(session.focused_pane_id);
 	let pane = focused_pane_mut(&mut session.layout, session.focused_pane_id);
 	pane.tabs.push(tab);
 	pane.active_tab_index = pane.tabs.len().saturating_sub(1);
@@ -1897,6 +1898,7 @@ fn spawn_file_doctab(
 	{
 		session.ui.status_message = Some(err);
 	}
+	session.mark_host_panel_group_manual_for_pane(session.focused_pane_id);
 	let pane = focused_pane_mut(&mut session.layout, session.focused_pane_id);
 	pane.tabs.push(tab);
 	pane.active_tab_index = pane.tabs.len().saturating_sub(1);
@@ -1932,6 +1934,13 @@ fn cycle_active_doctab(session: &mut EditorSession, forward: bool) {
 }
 
 fn close_active_doctab(session: &mut EditorSession, runtime: &RuntimeContext<'_>) {
+	let changes_membership = session
+		.layout
+		.find_pane(session.focused_pane_id)
+		.is_some_and(|pane| pane.tabs.len() > 1);
+	if changes_membership {
+		session.mark_host_panel_group_manual_for_pane(session.focused_pane_id);
+	}
 	let removed_buffer = {
 		let pane = focused_pane_mut(&mut session.layout, session.focused_pane_id);
 		if pane.tabs.len() <= 1 {
@@ -4234,6 +4243,7 @@ fn dispatch_command(
 				);
 				let buffer_id = view.buffer_id;
 				if let Some(target_pane_id) = tab_target {
+					session.mark_host_panel_group_manual_for_pane(target_pane_id);
 					let target = session
 						.layout
 						.find_pane_mut(target_pane_id)
