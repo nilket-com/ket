@@ -1,6 +1,6 @@
 # ADR 0013: ordered shared-Cartesian plot layers
 
-Status: proposed 2026-08-03. This record decides one thing: that a **layered**
+Status: accepted 2026-08-03. This record decides one thing: that a **layered**
 plot specification carries an ordered, non-empty list of layers, each owning its
 own encoding, and that its marks paint in authored order. It is additive —
 existing single-plot specifications remain valid and unchanged. It is the

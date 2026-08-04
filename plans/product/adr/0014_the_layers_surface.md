@@ -1,6 +1,6 @@
 # ADR 0014: the layers surface
 
-Status: proposed 2026-08-03. This record decides one thing: the Rune spelling
+Status: accepted 2026-08-03. This record decides one thing: the Rune spelling
 that reaches PRODUCT-0013's layered specification, and the lowering that gets it
 there. It invents no semantics. Every question about what a layered plot *means*
 — compatibility, domain resolution, painting, the bridge — was decided by

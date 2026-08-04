@@ -1,8 +1,8 @@
 # PRODUCT-0014 implementation evidence
 
-Recorded 2026-08-03 after the full verification pass. PRODUCT-0014 remains
-proposed; this file records landed implementation evidence and does not sign the
-record accepted.
+Recorded 2026-08-03 after the full verification pass and accepted after the
+installed `test6.rn` dogfood run visibly confirmed the layered canvas label,
+anonymous panel chrome, paint order, and dashboard-independent host panels.
 
 ## Gate ledger
 
@@ -118,4 +118,3 @@ passed
 
 All thirteen implementation gates are discharged. The implementation landed as
 four stage commits: `c3edc520`, `a10b4995`, `56c8cb88`, and `d52fc31d`.
-
