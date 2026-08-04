@@ -4827,6 +4827,22 @@ impl EditorSession {
 		self.buffers.host_panel_buffer_id(panel_id)
 	}
 
+	fn refresh_host_panel_descriptor(&mut self, member: &HostPanelGroupMember) -> bool {
+		let Some(buffer_id) = self.host_panel_buffer_id(member.panel_id) else {
+			return false;
+		};
+		let Some(panel) = self
+			.buffers
+			.get_mut(buffer_id)
+			.and_then(Buffer::host_panel_mut)
+		else {
+			return false;
+		};
+		panel.descriptor.kind.clone_from(&member.kind);
+		panel.descriptor.title.clone_from(&member.title);
+		true
+	}
+
 	/// Establish one complete host-panel group without projecting intermediate
 	/// split geometry. Returns backing buffers that could not be placed and must
 	/// be released by the runtime.
@@ -4858,6 +4874,9 @@ impl EditorSession {
 			if conflicts {
 				self.host_panel_groups.insert(group_id, group);
 				return Vec::new();
+			}
+			for member in &members {
+				self.refresh_host_panel_descriptor(member);
 			}
 			if anchor.is_some_and(|pane_id| self.layout.find_pane(pane_id).is_some()) {
 				group.latest_valid_anchor = anchor;
@@ -5047,6 +5066,11 @@ impl EditorSession {
 						.any(|member| member.panel_id == existing.panel_id)
 				})
 			});
+		if !conflicts {
+			for member in &members {
+				self.refresh_host_panel_descriptor(member);
+			}
+		}
 
 		let valid_anchor = anchor.filter(|pane_id| self.layout.find_pane(*pane_id).is_some());
 		let producer_buffer_id = valid_anchor.and_then(|pane_id| {
@@ -6159,6 +6183,186 @@ mod tests {
 			title: format!("view-{panel_id}"),
 			shape,
 		}
+	}
+
+	fn product_0016_descriptor(
+		session: &EditorSession,
+		panel_id: HostPanelId,
+	) -> HostPanelDescriptor {
+		let buffer_id = session
+			.host_panel_buffer_id(panel_id)
+			.expect("host panel buffer");
+		session
+			.buffers
+			.get(buffer_id)
+			.and_then(super::Buffer::host_panel)
+			.expect("host panel descriptor")
+			.descriptor
+			.clone()
+	}
+
+	#[test]
+	fn product_0016_repeated_group_refreshes_descriptors_without_layout_mutation() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		session.update_terminal_size(200, 70);
+		let group_id = HostPanelGroupId::new(16);
+		let anchor = session.focused_pane_id;
+		let mut members = product_0015_members(1_600);
+		assert!(
+			session
+				.ensure_host_panel_group(
+					group_id,
+					Some(anchor),
+					members.clone(),
+					HostPanelGroupLayout::RowMajorTile,
+				)
+				.is_empty()
+		);
+
+		let shared_panel = members[0].panel_id;
+		let shared_buffer = session.host_panel_buffer_id(shared_panel).unwrap();
+		let shared_pane = session.pane_id_for_panel(shared_panel).unwrap();
+		let second_reference = session.create_host_panel_view_for_buffer(
+			shared_buffer,
+			DEFAULT_VIEWPORT_WIDTH,
+			DEFAULT_VIEWPORT_LINES,
+		);
+		session
+			.layout
+			.find_pane_mut(shared_pane)
+			.unwrap()
+			.tabs
+			.push(second_reference);
+
+		let layout = session.layout.structure();
+		let group_structure = session.layout.group_structure(group_id).unwrap();
+		let pane_layouts = session.pane_layouts();
+		let focus = session.focused_pane_id;
+		let tab_state = session
+			.pane_ids()
+			.into_iter()
+			.map(|pane_id| {
+				let pane = session.layout.find_pane(pane_id).unwrap();
+				(
+					pane_id,
+					pane.active_tab_index,
+					pane.tabs.iter().map(|view| view.id).collect::<Vec<_>>(),
+				)
+			})
+			.collect::<Vec<_>>();
+		let panel_buffers = members
+			.iter()
+			.map(|member| {
+				(
+					member.panel_id,
+					session.host_panel_buffer_id(member.panel_id).unwrap(),
+				)
+			})
+			.collect::<Vec<_>>();
+
+		for (index, member) in members.iter_mut().enumerate() {
+			member.kind = format!("kind-{index}");
+			member.title = format!("renamed-{index}");
+		}
+		assert!(
+			session
+				.ensure_host_panel_group(
+					group_id,
+					Some(anchor),
+					members.clone(),
+					HostPanelGroupLayout::RowMajorTile,
+				)
+				.is_empty()
+		);
+
+		for (index, member) in members.iter().enumerate() {
+			assert_eq!(
+				product_0016_descriptor(&session, member.panel_id),
+				HostPanelDescriptor {
+					kind: format!("kind-{index}"),
+					title: format!("renamed-{index}"),
+				}
+			);
+		}
+		assert_eq!(session.layout.structure(), layout);
+		assert_eq!(
+			session.layout.group_structure(group_id).unwrap(),
+			group_structure
+		);
+		assert_eq!(session.pane_layouts(), pane_layouts);
+		assert_eq!(session.focused_pane_id, focus);
+		assert_eq!(
+			session
+				.pane_ids()
+				.into_iter()
+				.map(|pane_id| {
+					let pane = session.layout.find_pane(pane_id).unwrap();
+					(
+						pane_id,
+						pane.active_tab_index,
+						pane.tabs.iter().map(|view| view.id).collect::<Vec<_>>(),
+					)
+				})
+				.collect::<Vec<_>>(),
+			tab_state
+		);
+		assert_eq!(
+			members
+				.iter()
+				.map(|member| {
+					(
+						member.panel_id,
+						session.host_panel_buffer_id(member.panel_id).unwrap(),
+					)
+				})
+				.collect::<Vec<_>>(),
+			panel_buffers
+		);
+		assert_eq!(
+			session.host_panel_groups[&group_id].layout_state,
+			HostPanelGroupLayoutState::Automatic
+		);
+
+		session.mark_host_panel_group_manual(group_id);
+		let manual_structure = session.layout.structure();
+		members[0].title = "manual-title".to_owned();
+		session.ensure_host_panel_group(
+			group_id,
+			Some(anchor),
+			members.clone(),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		assert_eq!(
+			product_0016_descriptor(&session, shared_panel).title,
+			"manual-title"
+		);
+		assert_eq!(session.layout.structure(), manual_structure);
+		assert_eq!(
+			session.host_panel_groups[&group_id].layout_state,
+			HostPanelGroupLayoutState::Manual
+		);
+
+		let retained = members.remove(1);
+		let retained_descriptor = product_0016_descriptor(&session, retained.panel_id);
+		for member in &mut members {
+			member.title.push_str("-current");
+		}
+		session.ensure_host_panel_group(
+			group_id,
+			Some(anchor),
+			members,
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		assert_eq!(
+			product_0016_descriptor(&session, retained.panel_id),
+			retained_descriptor
+		);
+		assert!(
+			session.host_panel_groups[&group_id]
+				.retained_members
+				.contains_key(&retained.panel_id)
+		);
 	}
 
 	#[test]
