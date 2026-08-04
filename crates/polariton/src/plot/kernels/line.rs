@@ -1,15 +1,117 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
-	format_label, polars_type_to_axis_type,
+	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
+	ResolvedPlotSettings, format_label, polars_type_to_axis_type,
 };
-use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
+use iced::{Point, Rectangle};
 use polars::prelude::*;
 use std::sync::Arc;
 
 pub struct LinePlotKernel {
 	pub prepared_data: Arc<LinePreparedData>,
+}
+
+pub struct LineMarkRenderer {
+	pub prepared_data: Arc<LinePreparedData>,
+}
+
+impl LineMarkRenderer {
+	pub fn new(prepared_data: Arc<LinePreparedData>) -> Self {
+		Self { prepared_data }
+	}
+}
+
+impl MarkRenderer for LineMarkRenderer {
+	fn draw(
+		&self,
+		backend: &mut dyn PlotBackend,
+		_bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: ResolvedPlotSettings,
+	) {
+		for series in &self.prepared_data.series {
+			let color = settings.color_theme.get_color(series.color_t);
+			let stroke = Stroke {
+				style: Style::Solid(color),
+				width: 2.0,
+				..Default::default()
+			};
+			backend.stroke_path(
+				&|builder| {
+					for (i, p) in series.points.iter().enumerate() {
+						let pixel_p = transform.cartesian(p[0], p[1]);
+						if i == 0 {
+							builder.move_to(pixel_p);
+						} else {
+							builder.line_to(pixel_p);
+						}
+					}
+				},
+				stroke,
+			);
+		}
+	}
+
+	fn hit_test(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<MarkHit> {
+		const HIT_RADIUS_PX: f32 = 6.0;
+		let cursor = cursor.position()?;
+		let mut nearest = None;
+		let mut nearest_distance = HIT_RADIUS_PX * HIT_RADIUS_PX;
+		let mut mark_index = 0;
+
+		for series in &self.prepared_data.series {
+			if series.points.len() == 1 {
+				let point = series.points[0];
+				let pixel = transform.cartesian(point[0], point[1]);
+				let distance = squared_distance(cursor, pixel);
+				if distance <= nearest_distance {
+					nearest_distance = distance;
+					nearest = Some(MarkHit {
+						data_x: point[0],
+						data_y: point[1],
+						mark_index,
+					});
+				}
+			}
+
+			for points in series.points.windows(2) {
+				let start = transform.cartesian(points[0][0], points[0][1]);
+				let end = transform.cartesian(points[1][0], points[1][1]);
+				let (distance, t) = squared_distance_to_segment(cursor, start, end);
+				if distance <= nearest_distance {
+					nearest_distance = distance;
+					nearest = Some(MarkHit {
+						data_x: points[0][0] + (points[1][0] - points[0][0]) * t as f64,
+						data_y: points[0][1] + (points[1][1] - points[0][1]) * t as f64,
+						mark_index,
+					});
+				}
+				mark_index += 1;
+			}
+			mark_index += usize::from(series.points.len() == 1);
+		}
+		nearest
+	}
+}
+
+fn squared_distance(first: Point, second: Point) -> f32 {
+	let dx = first.x - second.x;
+	let dy = first.y - second.y;
+	dx * dx + dy * dy
+}
+
+fn squared_distance_to_segment(point: Point, start: Point, end: Point) -> (f32, f32) {
+	let dx = end.x - start.x;
+	let dy = end.y - start.y;
+	let length_squared = dx * dx + dy * dy;
+	if length_squared <= f32::EPSILON {
+		return (squared_distance(point, start), 0.0);
+	}
+	let t =
+		(((point.x - start.x) * dx + (point.y - start.y) * dy) / length_squared).clamp(0.0, 1.0);
+	let projection = Point::new(start.x + t * dx, start.y + t * dy);
+	(squared_distance(point, projection), t)
 }
 
 impl PlotKernel for LinePlotKernel {
@@ -36,27 +138,8 @@ impl PlotKernel for LinePlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		for series in &self.prepared_data.series {
-			let color = settings.color_theme.get_color(series.color_t);
-			let stroke = Stroke {
-				style: Style::Solid(color),
-				width: 2.0,
-				..Default::default()
-			};
-			backend.stroke_path(
-				&|builder| {
-					for (i, p) in series.points.iter().enumerate() {
-						let pixel_p = transform.cartesian(p[0], p[1]);
-						if i == 0 {
-							builder.move_to(pixel_p);
-						} else {
-							builder.line_to(pixel_p);
-						}
-					}
-				},
-				stroke,
-			);
-		}
+		LineMarkRenderer::new(Arc::clone(&self.prepared_data))
+			.draw(backend, _bounds, transform, settings);
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
@@ -78,60 +161,7 @@ impl PlotKernel for LinePlotKernel {
 		bounds: Rectangle,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_series = self.prepared_data.series.len();
-		if num_series == 0 {
-			return;
-		}
-		let max_rows = settings.max_legend_rows.max(1) as usize;
-		let num_cols = num_series.div_ceil(max_rows);
-		let actual_rows = num_series.min(max_rows);
-		let item_height = 25.0;
-		let legend_padding = 10.0;
-		let line_width = 20.0;
-		let col_width = 150.0;
-		let legend_width = num_cols as f32 * col_width + legend_padding * 2.0;
-		let legend_height = actual_rows as f32 * item_height + legend_padding * 2.0;
-		let x = (bounds.width - legend_width) * settings.legend_x;
-		let y = (bounds.height - legend_height) * settings.legend_y;
-		backend.fill_rectangle(
-			iced::Point::new(x, y),
-			iced::Size::new(legend_width, legend_height),
-			iced::Color {
-				a: 0.6,
-				..settings.background_color
-			},
-		);
-		for (i, series) in self.prepared_data.series.iter().enumerate() {
-			let color = settings.color_theme.get_color(series.color_t);
-			let col = i / max_rows;
-			let row = i % max_rows;
-			let item_x = x + legend_padding + col as f32 * col_width;
-			let item_y = y + legend_padding + row as f32 * item_height;
-			let stroke = Stroke {
-				style: Style::Solid(color),
-				width: 3.0,
-				..Default::default()
-			};
-			backend.stroke_path(
-				&|builder| {
-					builder.move_to(iced::Point::new(item_x, item_y + item_height / 2.0));
-					builder.line_to(iced::Point::new(
-						item_x + line_width,
-						item_y + item_height / 2.0,
-					));
-				},
-				stroke,
-			);
-			backend.fill_text(iced::widget::canvas::Text {
-				content: series.name.clone(),
-				position: iced::Point::new(item_x + line_width + 10.0, item_y + item_height / 2.0),
-				color: settings.decoration_color,
-				size: iced::Pixels(settings.legend_size),
-				align_x: iced::alignment::Horizontal::Left.into(),
-				align_y: iced::alignment::Vertical::Center,
-				..Default::default()
-			});
-		}
+		draw_line_legend(&self.prepared_data, backend, bounds, settings);
 	}
 
 	fn x_label(&self) -> String {
@@ -140,6 +170,68 @@ impl PlotKernel for LinePlotKernel {
 
 	fn y_label(&self) -> String {
 		self.prepared_data.y_label.clone()
+	}
+}
+
+pub(crate) fn draw_line_legend(
+	prepared_data: &LinePreparedData,
+	backend: &mut dyn PlotBackend,
+	bounds: Rectangle,
+	settings: ResolvedPlotSettings,
+) {
+	let num_series = prepared_data.series.len();
+	if num_series == 0 {
+		return;
+	}
+	let max_rows = settings.max_legend_rows.max(1) as usize;
+	let num_cols = num_series.div_ceil(max_rows);
+	let actual_rows = num_series.min(max_rows);
+	let item_height = 25.0;
+	let legend_padding = 10.0;
+	let line_width = 20.0;
+	let col_width = 150.0;
+	let legend_width = num_cols as f32 * col_width + legend_padding * 2.0;
+	let legend_height = actual_rows as f32 * item_height + legend_padding * 2.0;
+	let x = (bounds.width - legend_width) * settings.legend_x;
+	let y = (bounds.height - legend_height) * settings.legend_y;
+	backend.fill_rectangle(
+		iced::Point::new(x, y),
+		iced::Size::new(legend_width, legend_height),
+		iced::Color {
+			a: 0.6,
+			..settings.background_color
+		},
+	);
+	for (i, series) in prepared_data.series.iter().enumerate() {
+		let color = settings.color_theme.get_color(series.color_t);
+		let col = i / max_rows;
+		let row = i % max_rows;
+		let item_x = x + legend_padding + col as f32 * col_width;
+		let item_y = y + legend_padding + row as f32 * item_height;
+		let stroke = Stroke {
+			style: Style::Solid(color),
+			width: 3.0,
+			..Default::default()
+		};
+		backend.stroke_path(
+			&|builder| {
+				builder.move_to(iced::Point::new(item_x, item_y + item_height / 2.0));
+				builder.line_to(iced::Point::new(
+					item_x + line_width,
+					item_y + item_height / 2.0,
+				));
+			},
+			stroke,
+		);
+		backend.fill_text(iced::widget::canvas::Text {
+			content: series.name.clone(),
+			position: iced::Point::new(item_x + line_width + 10.0, item_y + item_height / 2.0),
+			color: settings.decoration_color,
+			size: iced::Pixels(settings.legend_size),
+			align_x: iced::alignment::Horizontal::Left.into(),
+			align_y: iced::alignment::Vertical::Center,
+			..Default::default()
+		});
 	}
 }
 

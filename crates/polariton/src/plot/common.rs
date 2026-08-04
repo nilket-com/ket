@@ -518,6 +518,29 @@ pub trait PlotKernel: Send + Sync {
 	}
 }
 
+/// Geometry returned by a mark renderer. This is deliberately not hover prose:
+/// PRODUCT-0013's temporary interaction bridge decides how a hit is presented.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct MarkHit {
+	pub data_x: f64,
+	pub data_y: f64,
+	pub mark_index: usize,
+}
+
+/// A plot layer's mark-only rendering boundary. It owns neither layout nor
+/// guides, labels, or interaction policy.
+pub trait MarkRenderer: Send + Sync {
+	fn draw(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: ResolvedPlotSettings,
+	);
+
+	fn hit_test(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<MarkHit>;
+}
+
 pub struct PlotWidget<'a> {
 	pub kernel: &'a dyn PlotKernel,
 	pub title: String,

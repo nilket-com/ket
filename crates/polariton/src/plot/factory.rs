@@ -20,7 +20,10 @@ use crate::plot::kernels::scatter_line::ScatterLinePlotKernel;
 use crate::plot::kernels::stacked_area::{self, StackedAreaPlotKernel};
 use crate::plot::kernels::stacked_bar::{self, StackedBarPlotKernel};
 use crate::plot::kernels::violin::{self, ViolinPlotKernel};
-use crate::plot::spec::{ResolvedKernelFields, ResolvedPlotSpec};
+use crate::plot::spec::{
+	ColorIdentity, LayeredPlotSpec, PlotProvenance, ResolvedKernelFields, ResolvedPlotSpec,
+	StampedResult, resolve_domains, resolve_layered_channels,
+};
 use polars::frame::DataFrame;
 use std::sync::Arc;
 
@@ -224,6 +227,35 @@ pub fn create_plot(
 	}
 }
 
+/// Lower PRODUCT-0013's additive layered specification. The multi-layer branch
+/// is completed by the ordered composite stage; one layer deliberately reuses
+/// the established kernel path.
+pub fn create_layered_plot(
+	spec: &LayeredPlotSpec,
+	df: &DataFrame,
+	width: u32,
+	height: u32,
+) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
+	let binding =
+		resolve_layered_channels(spec, df.schema().as_ref()).map_err(|e| e.to_string())?;
+	let (first, rest) = binding.layers.into_parts();
+	if !rest.is_empty() {
+		return Err(
+			"multi-layer rendering is not available until the ordered composite stage".into(),
+		);
+	}
+	let stamped = StampedResult {
+		data: Arc::new(df.clone()),
+		provenance: PlotProvenance {
+			source_name: "layered plot".to_owned(),
+			revision: None,
+		},
+	};
+	let (resolved, _) = resolve_domains(first.into_binding(), &stamped, &ColorIdentity::default())
+		.map_err(|e| e.to_string())?;
+	Ok(create_plot(&resolved, df, width, height))
+}
+
 #[cfg(test)]
 pub fn create_automatic_plot(
 	composition: crate::plot::composition::PlotComposition,
@@ -264,7 +296,7 @@ mod product_0013_baseline_tests {
 	use crate::plot::common::{CoordinateTransformer, ResolvedPlotSettings};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::export::SvgBackend;
-	use crate::plot::spec::AuthoredPlotSpec;
+	use crate::plot::spec::{AuthoredPlotSpec, LayerMark, LayerSpec, LayeredPlotSpec};
 	use iced::advanced::mouse::Cursor;
 	use iced::{Point, Rectangle, Size};
 	use polars::df;
@@ -289,6 +321,18 @@ mod product_0013_baseline_tests {
 		df!("x" => [1.0, 2.0], "y" => [2.0, 4.0]).expect("frame")
 	}
 
+	const LINE_SVG: &str = concat!(
+		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+		"<path d=\"M 4.55 95.45 L 95.45 4.55 \" stroke=\"rgb(32, 145, 141)\" stroke-width=\"2\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
+		"</svg>"
+	);
+
+	const SCATTER_SVG: &str = concat!(
+		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+		"<path d=\"M 11.33 91.67 A 3.00 3.00 0 1 1 5.33 91.67 A 3.00 3.00 0 1 1 11.33 91.67 Z M 94.67 8.33 A 3.00 3.00 0 1 1 88.67 8.33 A 3.00 3.00 0 1 1 94.67 8.33 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"</svg>"
+	);
+
 	#[test]
 	fn product_0013_pre_extraction_line_svg_baseline() {
 		let kernel = create_authored_plot(
@@ -298,14 +342,7 @@ mod product_0013_baseline_tests {
 			100,
 		)
 		.expect("line kernel");
-		assert_eq!(
-			render_marks(kernel.as_ref()),
-			concat!(
-				"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
-				"<path d=\"M 4.55 95.45 L 95.45 4.55 \" stroke=\"rgb(32, 145, 141)\" stroke-width=\"2\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
-				"</svg>"
-			)
-		);
+		assert_eq!(render_marks(kernel.as_ref()), LINE_SVG);
 	}
 
 	#[test]
@@ -317,13 +354,30 @@ mod product_0013_baseline_tests {
 			100,
 		)
 		.expect("scatter kernel");
-		assert_eq!(
-			render_marks(kernel.as_ref()),
-			concat!(
-				"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
-				"<path d=\"M 11.33 91.67 A 3.00 3.00 0 1 1 5.33 91.67 A 3.00 3.00 0 1 1 11.33 91.67 Z M 94.67 8.33 A 3.00 3.00 0 1 1 88.67 8.33 A 3.00 3.00 0 1 1 94.67 8.33 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
-				"</svg>"
-			)
-		);
+		assert_eq!(render_marks(kernel.as_ref()), SCATTER_SVG);
+	}
+
+	#[test]
+	fn product_0013_one_layer_line_keeps_existing_svg() {
+		let kernel = create_layered_plot(
+			&LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y")),
+			&fixture(),
+			100,
+			100,
+		)
+		.expect("layered line kernel");
+		assert_eq!(render_marks(kernel.as_ref()), LINE_SVG);
+	}
+
+	#[test]
+	fn product_0013_one_layer_scatter_keeps_existing_svg() {
+		let kernel = create_layered_plot(
+			&LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Scatter, "x", "y")),
+			&fixture(),
+			100,
+			100,
+		)
+		.expect("layered scatter kernel");
+		assert_eq!(render_marks(kernel.as_ref()), SCATTER_SVG);
 	}
 }

@@ -1,6 +1,6 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
-	ScatterRenderMode, format_label, polars_type_to_axis_type,
+	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
+	ResolvedPlotSettings, ScatterRenderMode, format_label, polars_type_to_axis_type,
 };
 use crate::plot::spec::{
 	Channel, ResolvedColor, ResolvedLayout, ResolvedPlotSpec, ScaleDomain, ScaleFamily,
@@ -12,6 +12,11 @@ use polars::prelude::*;
 use std::sync::{Arc, Mutex};
 
 pub struct ScatterPlotKernel {
+	pub prepared_data: Arc<ScatterPreparedData>,
+	renderer: ScatterMarkRenderer,
+}
+
+pub struct ScatterMarkRenderer {
 	pub prepared_data: Arc<ScatterPreparedData>,
 	raster_cache: Mutex<Option<ScatterRasterCache>>,
 }
@@ -75,21 +80,7 @@ impl PlotKernel for ScatterPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let mode = resolve_render_mode(
-			self.prepared_data.total_points,
-			backend.supports_embedded_raster(),
-			bounds,
-			&settings,
-		);
-		match mode {
-			ResolvedScatterRenderMode::Vector => self.plot_vector(backend, transform, &settings),
-			ResolvedScatterRenderMode::Downsampled => {
-				self.plot_downsampled(backend, bounds, transform, &settings)
-			}
-			ResolvedScatterRenderMode::Rasterized => {
-				self.plot_rasterized(backend, bounds, transform, &settings)
-			}
-		}
+		self.renderer.draw(backend, bounds, transform, settings);
 	}
 
 	fn draw_legend(
@@ -98,54 +89,7 @@ impl PlotKernel for ScatterPlotKernel {
 		bounds: Rectangle,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_series = self.prepared_data.series.len();
-		if num_series == 0 {
-			return;
-		}
-		let max_rows = settings.max_legend_rows.max(1) as usize;
-		let num_cols = num_series.div_ceil(max_rows);
-		let actual_rows = num_series.min(max_rows);
-		let item_height = 25.0;
-		let legend_padding = 10.0;
-		let swatch_size = 12.0;
-		let col_width = 150.0;
-		let legend_width = num_cols as f32 * col_width + legend_padding * 2.0;
-		let legend_height = actual_rows as f32 * item_height + legend_padding * 2.0;
-		let x = (bounds.width - legend_width) * settings.legend_x;
-		let y = (bounds.height - legend_height) * settings.legend_y;
-		backend.fill_rectangle(
-			iced::Point::new(x, y),
-			iced::Size::new(legend_width, legend_height),
-			Color {
-				a: 0.6,
-				..settings.background_color
-			},
-		);
-		for (i, series) in self.prepared_data.series.iter().enumerate() {
-			let color = series_color(series, &settings);
-			let col = i / max_rows;
-			let row = i % max_rows;
-			let item_x = x + legend_padding + col as f32 * col_width;
-			let item_y = y + legend_padding + row as f32 * item_height;
-			backend.fill_path(
-				&|builder| {
-					builder.circle(
-						iced::Point::new(item_x + swatch_size / 2.0, item_y + item_height / 2.0),
-						swatch_size / 2.0,
-					);
-				},
-				color,
-			);
-			backend.fill_text(iced::widget::canvas::Text {
-				content: series.name.clone(),
-				position: iced::Point::new(item_x + swatch_size + 10.0, item_y + item_height / 2.0),
-				color: settings.decoration_color,
-				size: iced::Pixels(settings.legend_size),
-				align_x: iced::alignment::Horizontal::Left.into(),
-				align_y: iced::alignment::Vertical::Center,
-				..Default::default()
-			});
-		}
+		draw_scatter_legend(&self.prepared_data, backend, bounds, settings);
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
@@ -170,12 +114,102 @@ impl PlotKernel for ScatterPlotKernel {
 	}
 }
 
+pub(crate) fn draw_scatter_legend(
+	prepared_data: &ScatterPreparedData,
+	backend: &mut dyn PlotBackend,
+	bounds: Rectangle,
+	settings: ResolvedPlotSettings,
+) {
+	let num_series = prepared_data.series.len();
+	if num_series == 0 {
+		return;
+	}
+	let max_rows = settings.max_legend_rows.max(1) as usize;
+	let num_cols = num_series.div_ceil(max_rows);
+	let actual_rows = num_series.min(max_rows);
+	let item_height = 25.0;
+	let legend_padding = 10.0;
+	let swatch_size = 12.0;
+	let col_width = 150.0;
+	let legend_width = num_cols as f32 * col_width + legend_padding * 2.0;
+	let legend_height = actual_rows as f32 * item_height + legend_padding * 2.0;
+	let x = (bounds.width - legend_width) * settings.legend_x;
+	let y = (bounds.height - legend_height) * settings.legend_y;
+	backend.fill_rectangle(
+		iced::Point::new(x, y),
+		iced::Size::new(legend_width, legend_height),
+		Color {
+			a: 0.6,
+			..settings.background_color
+		},
+	);
+	for (i, series) in prepared_data.series.iter().enumerate() {
+		let color = series_color(series, &settings);
+		let col = i / max_rows;
+		let row = i % max_rows;
+		let item_x = x + legend_padding + col as f32 * col_width;
+		let item_y = y + legend_padding + row as f32 * item_height;
+		backend.fill_path(
+			&|builder| {
+				builder.circle(
+					iced::Point::new(item_x + swatch_size / 2.0, item_y + item_height / 2.0),
+					swatch_size / 2.0,
+				);
+			},
+			color,
+		);
+		backend.fill_text(iced::widget::canvas::Text {
+			content: series.name.clone(),
+			position: iced::Point::new(item_x + swatch_size + 10.0, item_y + item_height / 2.0),
+			color: settings.decoration_color,
+			size: iced::Pixels(settings.legend_size),
+			align_x: iced::alignment::Horizontal::Left.into(),
+			align_y: iced::alignment::Vertical::Center,
+			..Default::default()
+		});
+	}
+}
+
 impl ScatterPlotKernel {
+	pub fn new(prepared_data: Arc<ScatterPreparedData>) -> Self {
+		Self {
+			prepared_data: Arc::clone(&prepared_data),
+			renderer: ScatterMarkRenderer::new(prepared_data),
+		}
+	}
+}
+
+impl ScatterMarkRenderer {
 	pub fn new(prepared_data: Arc<ScatterPreparedData>) -> Self {
 		Self {
 			prepared_data,
 			raster_cache: Mutex::new(None),
 		}
+	}
+
+	fn hit_point(&self, transform: &CoordinateTransformer, cursor: Point) -> Option<MarkHit> {
+		let hit_radius = self.prepared_data.point_size_px + 2.0;
+		let mut nearest_distance = hit_radius * hit_radius;
+		let mut nearest = None;
+		let mut mark_index = 0;
+		for series in &self.prepared_data.series {
+			series.for_each_point(|x, y| {
+				let pixel = scatter_point(transform, x, y);
+				let dx = cursor.x - pixel.x;
+				let dy = cursor.y - pixel.y;
+				let distance = dx * dx + dy * dy;
+				if distance <= nearest_distance {
+					nearest_distance = distance;
+					nearest = Some(MarkHit {
+						data_x: x,
+						data_y: y,
+						mark_index,
+					});
+				}
+				mark_index += 1;
+			});
+		}
+		nearest
 	}
 
 	fn plot_vector(
@@ -297,6 +331,36 @@ impl ScatterPlotKernel {
 		};
 		*self.raster_cache.lock().unwrap() = Some(cache.clone());
 		cache
+	}
+}
+
+impl MarkRenderer for ScatterMarkRenderer {
+	fn draw(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		settings: ResolvedPlotSettings,
+	) {
+		let mode = resolve_render_mode(
+			self.prepared_data.total_points,
+			backend.supports_embedded_raster(),
+			bounds,
+			&settings,
+		);
+		match mode {
+			ResolvedScatterRenderMode::Vector => self.plot_vector(backend, transform, &settings),
+			ResolvedScatterRenderMode::Downsampled => {
+				self.plot_downsampled(backend, bounds, transform, &settings)
+			}
+			ResolvedScatterRenderMode::Rasterized => {
+				self.plot_rasterized(backend, bounds, transform, &settings)
+			}
+		}
+	}
+
+	fn hit_test(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<MarkHit> {
+		self.hit_point(transform, cursor.position()?)
 	}
 }
 
