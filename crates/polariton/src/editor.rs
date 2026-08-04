@@ -1089,6 +1089,37 @@ impl CodeEditor {
 	}
 
 	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_layout_signature(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<(
+		HostPanelGroupId,
+		libaryon::core::PaneId,
+		PaneRect,
+		Vec<ViewId>,
+		usize,
+		libaryon::core::PaneId,
+	)> {
+		let group_id = self.view_group_ids.get(&producer).copied()?;
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let viewport = self.viewport.as_ref()?;
+		let pane = viewport.panes.iter().find(|pane| {
+			pane.host_panel
+				.as_ref()
+				.is_some_and(|panel| panel.panel_id == panel_id)
+		})?;
+		Some((
+			group_id,
+			pane.pane_id,
+			pane.rect,
+			pane.tabs.iter().map(|tab| tab.view_id).collect(),
+			pane.active_doctab_index,
+			viewport.focused_pane_id,
+		))
+	}
+
+	#[cfg(all(test, feature = "toron"))]
 	pub(crate) fn rune_view_panel_count(&self, producer: libaryon::core::BufferId) -> usize {
 		self.view_panel_ids
 			.keys()

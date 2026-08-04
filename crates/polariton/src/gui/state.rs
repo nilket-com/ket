@@ -3277,6 +3277,278 @@ workspace.table("t").views([
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0016_heading_lifecycle_keeps_destination_layout_and_atomic_canvas() {
+		let anonymous = LocalViewIdentity::Anonymous(0);
+		let named = LocalViewIdentity::Named("stable".to_owned());
+		let identities = [anonymous.clone(), named.clone()];
+		let frame = polars::df!("x" => [1.0_f64, 2.0, 3.0], "y" => [2.0_f64, 4.0, 3.0])
+			.expect("lifecycle frame");
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		let source_buffer = loop {
+			state.code_editor.poll();
+			if let Some(buffer_id) = state.code_editor.active_buffer_id() {
+				break buffer_id;
+			}
+			assert!(
+				std::time::Instant::now() < deadline,
+				"source buffer must project before the lifecycle assay"
+			);
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		};
+
+		let program_a = transform_rune_view(
+			r#"workspace.table("t").views([
+				figure([title("A"), subtitle("A detail"), line("x", "y")]),
+				view("stable", figure([title("Named A"), subtitle("Named detail"), line("x", "y")]))
+			])"#,
+		)
+		.expect("revision A");
+		let presentations_a = program_a
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+		state.rune_buffer_revisions.insert(source_buffer, 1);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentations_a, 1);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision: 1,
+					view: program_a.clone(),
+				})
+				.is_some()
+		);
+		complete_relation_in_head(
+			&mut state,
+			source_buffer,
+			1,
+			program_a.into_relations().next().expect("one A relation"),
+			frame.clone(),
+		);
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while identities.iter().any(|identity| {
+			state
+				.code_editor
+				.rune_view_panel_layout_signature(source_buffer, identity)
+				.is_none()
+		}) && std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		let panels = identities.clone().map(|identity| {
+			state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity)
+				.expect("stable panel")
+		});
+		let layout = identities.clone().map(|identity| {
+			state
+				.code_editor
+				.rune_view_panel_layout_signature(source_buffer, &identity)
+				.expect("stable layout")
+		});
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_projected_title(source_buffer, &anonymous),
+			Some("A 1")
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_projected_title(source_buffer, &named),
+			Some("stable")
+		);
+		for (identity, title, subtitle) in [
+			(&anonymous, "A", "A detail"),
+			(&named, "Named A", "Named detail"),
+		] {
+			let svg = state
+				.code_editor
+				.rune_view_panel_plot_svg(source_buffer, identity)
+				.expect("A canvas");
+			assert!(svg.contains(title));
+			assert!(svg.contains(subtitle));
+		}
+
+		let program_b = transform_rune_view(
+			r#"workspace.table("t").views([
+				figure([title("B"), subtitle("B detail"), line("x", "y")]),
+				view("stable", figure([title("Named B"), subtitle("Changed"), line("x", "y")]))
+			])"#,
+		)
+		.expect("revision B");
+		let presentations_b = program_b
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+		state.rune_buffer_revisions.insert(source_buffer, 2);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentations_b, 2);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision: 2,
+					view: program_b.clone(),
+				})
+				.is_some()
+		);
+		let relation_b = program_b.into_relations().next().expect("one B relation");
+		drop(update(
+			&mut state,
+			Message::RunRuneViewSetResult {
+				source_buffer,
+				revision: 2,
+				origin: relation_b.origin,
+				views: relation_b
+					.views
+					.into_iter()
+					.map(|view| view.identity)
+					.collect(),
+				result: Err("revision B failed".to_owned()),
+			},
+		));
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while state
+			.code_editor
+			.rune_view_panel_projected_title(source_buffer, &anonymous)
+			!= Some("B 1")
+			&& std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_projected_title(source_buffer, &anonymous),
+			Some("B 1"),
+			"chrome follows successfully analyzed source"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_projected_title(source_buffer, &named),
+			Some("stable")
+		);
+		for (identity, title, subtitle) in [
+			(&anonymous, "A", "A detail"),
+			(&named, "Named A", "Named detail"),
+		] {
+			assert_eq!(
+				state
+					.code_editor
+					.rune_view_panel_status(source_buffer, identity),
+				Some("stale")
+			);
+			let svg = state
+				.code_editor
+				.rune_view_panel_plot_svg(source_buffer, identity)
+				.expect("stale A canvas");
+			assert!(svg.contains(title));
+			assert!(svg.contains(subtitle));
+			assert!(!svg.contains("B detail"));
+			assert!(!svg.contains("Named B"));
+		}
+
+		let program_c = transform_rune_view(
+			"workspace.table(\"t\").views([line(\"x\", \"y\"), view(\"stable\", line(\"x\", \"y\"))])",
+		)
+		.expect("revision C");
+		let presentations_c = program_c
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+		state.rune_buffer_revisions.insert(source_buffer, 3);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentations_c, 3);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision: 3,
+					view: program_c.clone(),
+				})
+				.is_some()
+		);
+		complete_relation_in_head(
+			&mut state,
+			source_buffer,
+			3,
+			program_c.into_relations().next().expect("one C relation"),
+			frame,
+		);
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while state
+			.code_editor
+			.rune_view_panel_projected_title(source_buffer, &anonymous)
+			!= Some("plot.line 1")
+			&& std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_projected_title(source_buffer, &anonymous),
+			Some("plot.line 1")
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_projected_title(source_buffer, &named),
+			Some("stable")
+		);
+		for (index, identity) in identities.iter().enumerate() {
+			assert_eq!(
+				state
+					.code_editor
+					.rune_view_panel_id(source_buffer, identity),
+				Some(panels[index])
+			);
+			assert_eq!(
+				state
+					.code_editor
+					.rune_view_panel_layout_signature(source_buffer, identity),
+				Some(layout[index].clone()),
+				"descriptor refresh and completion preserve the output-group layout"
+			);
+			assert_eq!(
+				state
+					.code_editor
+					.rune_view_panel_status(source_buffer, identity),
+				Some("fresh")
+			);
+			let svg = state
+				.code_editor
+				.rune_view_panel_plot_svg(source_buffer, identity)
+				.expect("C canvas");
+			assert!(svg.contains("plot.line"));
+			assert!(!svg.contains("A detail"));
+			assert!(!svg.contains("B detail"));
+		}
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard() {
 		let source = r#"
 ket.table("test1")
