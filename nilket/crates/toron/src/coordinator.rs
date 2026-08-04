@@ -1225,6 +1225,7 @@ where
 		)
 		.with_task_context(TaskExecutionContext::from_execution_context(context))
 		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
+		.with_max_in_flight_tasks(query_budget.max_in_flight_tasks)
 	}
 }
 
@@ -1298,6 +1299,7 @@ where
 			.with_join_runtime_observation_mode(
 				execution_context.join_runtime_observation_mode.clone(),
 			)
+			.with_max_in_flight_tasks(query_budget.max_in_flight_tasks)
 			.with_id_namespace(fragment_id_namespace),
 		)
 		.map_err(fragment_error)?;

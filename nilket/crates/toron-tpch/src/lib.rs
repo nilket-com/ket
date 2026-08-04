@@ -57,10 +57,10 @@ use toron::distributed::determinism::{SortPolicy, canonical_arrow_ipc_digest};
 use toron::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use toron::distributed::identity::{LeaseEpoch, QueryId, WorkerId};
 use toron::distributed::partition_store::InMemoryPartitionStore;
-use toron::distributed::scheduler::StagePlan;
+use toron::distributed::scheduler::{StagePlan, live_publication_report};
 use toron::distributed::task::{
 	JoinBuildProfile, JoinSpillObservation, PartitionWorkConcurrencyObservation, RowCount,
-	TaskInputBinding, TaskOutputBinding, TaskTelemetry, is_streamable_shuffle_consumer,
+	TaskOutputBinding, TaskTelemetry,
 };
 use toron::distributed::worker_registry::{
 	ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
@@ -4829,11 +4829,22 @@ pub struct FragmentShapeReceipt {
 	pub stage_task_counts: Vec<usize>,
 	pub max_stage_width: usize,
 	pub single_task_producer_stages: usize,
-	/// ADR 529 refinement: shuffle-consumer tasks the scheduler may dispatch against a live
-	/// (unsealed) producer. The stall classification (`blocked_appenders > 0` ⟺ non-returning
-	/// wait) is sound only when this is zero — a live-eligible consumer drains concurrently,
-	/// making transient backpressure healthy rather than fatal.
+	/// ADR 529 refinement, corrected by ADR 536: shuffle-consumer tasks the scheduler may
+	/// dispatch against a live (unsealed) producer. The stall classification
+	/// (`blocked_appenders > 0` ⟺ non-returning wait) is sound only when this is zero — a
+	/// live-eligible consumer drains concurrently, making transient backpressure healthy
+	/// rather than fatal. This now consumes the scheduler's own predicate, so an ADR 123
+	/// multi-upstream join consumer is counted; the original narrower test saw zero.
 	pub live_eligible_consumer_tasks: usize,
+	/// ADR 536 Phase 0, observe-only: the live publication structure this plan would ask
+	/// admission for. Recorded so the ADR 123 blast radius is enumerable from the artifact
+	/// instead of inferred from stage widths.
+	pub stage_upstreams: Vec<(u32, Vec<u32>)>,
+	pub live_producer_stages: usize,
+	pub multi_upstream_live_eligible_consumer_tasks: usize,
+	pub live_residency_requirement: usize,
+	pub admission_max_in_flight_tasks: Option<usize>,
+	pub residency_exceeds_admission: bool,
 }
 
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
@@ -4867,7 +4878,10 @@ pub fn classify_fragment_error(error: &FragmentError) -> &'static str {
 /// ADR 528: extract the shape receipt from a fragmented plan. A producer stage is one whose
 /// tasks publish to an exchange; a single-task producer is the fragmenter's hardcoded
 /// one-task-per-join-input shape.
-pub fn fragment_shape_receipt(stages: &[StagePlan]) -> FragmentShapeReceipt {
+pub fn fragment_shape_receipt(
+	stages: &[StagePlan],
+	max_in_flight_tasks: Option<usize>,
+) -> FragmentShapeReceipt {
 	let stage_task_counts: Vec<usize> = stages.iter().map(|stage| stage.tasks.len()).collect();
 	let max_stage_width = stage_task_counts.iter().copied().max().unwrap_or(0);
 	let single_task_producer_stages = stages
@@ -4879,23 +4893,29 @@ pub fn fragment_shape_receipt(stages: &[StagePlan]) -> FragmentShapeReceipt {
 				})
 		})
 		.count();
-	let live_eligible_consumer_tasks = stages
-		.iter()
-		.flat_map(|stage| stage.tasks.iter())
-		.filter(|task| {
-			task.spec
-				.inputs
-				.iter()
-				.any(|input| matches!(input, TaskInputBinding::ShuffleConsumer { .. }))
-				&& is_streamable_shuffle_consumer(&task.spec)
-		})
-		.count();
+	let report = live_publication_report(stages, max_in_flight_tasks);
 	FragmentShapeReceipt {
 		stage_count: stages.len(),
 		stage_task_counts,
 		max_stage_width,
 		single_task_producer_stages,
-		live_eligible_consumer_tasks,
+		live_eligible_consumer_tasks: report.live_eligible_consumer_tasks,
+		stage_upstreams: report
+			.stage_upstreams
+			.iter()
+			.map(|(stage_id, upstreams)| {
+				(
+					stage_id.get(),
+					upstreams.iter().map(|upstream| upstream.get()).collect(),
+				)
+			})
+			.collect(),
+		live_producer_stages: report.live_producer_stages.len(),
+		multi_upstream_live_eligible_consumer_tasks: report
+			.multi_upstream_live_eligible_consumer_tasks,
+		live_residency_requirement: report.live_residency_requirement,
+		admission_max_in_flight_tasks: report.max_in_flight_tasks,
+		residency_exceeds_admission: report.residency_exceeds_admission,
 	}
 }
 
@@ -4947,7 +4967,7 @@ async fn fragment_census_outcome_with_metadata(
 	match fragment_plan(bound, config) {
 		Ok(stages) => (
 			Some(plan_fingerprint),
-			FragmentCensusOutcome::Fragmented(fragment_shape_receipt(&stages)),
+			FragmentCensusOutcome::Fragmented(fragment_shape_receipt(&stages, None)),
 		),
 		Err(error) => (
 			Some(plan_fingerprint),
@@ -5172,7 +5192,8 @@ async fn execution_census_preflight(
 	let context = tpch_execution_context_with_budget(task_telemetry, seed_budget);
 	let fragment_config = FragmentPlanConfig::new(context.query_id, context.task_budget)
 		.with_task_context(TaskExecutionContext::from_execution_context(&context))
-		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone());
+		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
+		.with_max_in_flight_tasks(seed_budget.max_in_flight_tasks);
 	let stages = fragment_plan(bound, fragment_config).map_err(|error| {
 		ExecutionCensusPreflightRejection {
 			phase: Phase::Fragment,
@@ -5185,7 +5206,7 @@ async fn execution_census_preflight(
 		logical,
 		catalog,
 		plan_fingerprint,
-		shape: fragment_shape_receipt(&stages),
+		shape: fragment_shape_receipt(&stages, seed_budget.max_in_flight_tasks),
 	})
 }
 
@@ -5507,6 +5528,12 @@ async fn run_execution_census_input(
 				stage_count: None,
 				stage_task_counts: None,
 				live_eligible_consumer_tasks: None,
+				stage_upstreams: None,
+				live_producer_stages: None,
+				multi_upstream_live_eligible_consumer_tasks: None,
+				live_residency_requirement: None,
+				admission_max_in_flight_tasks: None,
+				residency_exceeds_admission: None,
 				admitted_width: None,
 				task_memory_envelope_bytes: EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES,
 				local_memory_bytes: local_budget.memory_per_task.get(),
@@ -5681,6 +5708,14 @@ async fn run_execution_census_input(
 		stage_count: Some(preflight.shape.stage_count),
 		stage_task_counts: Some(preflight.shape.stage_task_counts),
 		live_eligible_consumer_tasks: Some(preflight.shape.live_eligible_consumer_tasks),
+		stage_upstreams: Some(preflight.shape.stage_upstreams.clone()),
+		live_producer_stages: Some(preflight.shape.live_producer_stages),
+		multi_upstream_live_eligible_consumer_tasks: Some(
+			preflight.shape.multi_upstream_live_eligible_consumer_tasks,
+		),
+		live_residency_requirement: Some(preflight.shape.live_residency_requirement),
+		admission_max_in_flight_tasks: preflight.shape.admission_max_in_flight_tasks,
+		residency_exceeds_admission: Some(preflight.shape.residency_exceeds_admission),
 		admitted_width: Some(width),
 		task_memory_envelope_bytes: EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES,
 		local_memory_bytes: local_budget.memory_per_task.get(),

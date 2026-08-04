@@ -12,9 +12,9 @@ use crate::distributed::budget::DurationMillis;
 use crate::distributed::identity::{AttemptId, QueryId, StageId, TaskIdentity, WorkerId};
 use crate::distributed::task::{
 	LiveProducerPartitionRef, PartitionAddress, PartitionManifest, ProducerPartitionRef,
-	RetryPolicy, ShufflePartitionRef, TaskCompletionOutput, TaskInputBinding, TaskOutputBinding,
-	TaskSpec, TaskTelemetry, exchange_producer_plan_supports_live, is_streamable_exchange_producer,
-	is_streamable_shuffle_consumer,
+	RetryPolicy, ShufflePartitionRef, ShufflePublishMode, TaskCompletionOutput, TaskInputBinding,
+	TaskOutputBinding, TaskSpec, TaskTelemetry, exchange_producer_plan_supports_live,
+	is_streamable_exchange_producer, is_streamable_shuffle_consumer,
 };
 use crate::distributed::task_state::{
 	AcceptanceState, AttemptState, CancelledTaskCount, InvalidatedTask, TaskKey, TaskStateStore,
@@ -1114,6 +1114,141 @@ pub(crate) fn consumer_supports_live_candidate_inputs(
 	live_stage_ids: &BTreeSet<StageId>,
 ) -> bool {
 	consumer_supports_live_inputs_when(stage, task, |stage_id| live_stage_ids.contains(&stage_id))
+}
+
+/// ADR 536 Phase 0 observation: what a resolved stage graph's live publication would ask
+/// of admission. Observe-only — it reads the graph and changes nothing.
+///
+/// `live_eligible_consumer_tasks` is the authoritative count: it consumes the same
+/// predicate the scheduler dispatches on, so an ADR 123 multi-upstream join consumer is
+/// counted as live-eligible rather than overlooked by the narrower unary shape test.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LivePublicationReport {
+	pub stage_upstreams: Vec<(StageId, Vec<StageId>)>,
+	pub live_producer_stages: Vec<StageId>,
+	pub live_eligible_consumer_tasks: usize,
+	pub multi_upstream_live_eligible_consumer_tasks: usize,
+	/// Largest number of tasks that must be resident together for some live component to
+	/// drain. A live producer holds its slot until it seals, so every task of every stage
+	/// reachable across live edges has to fit under the cap at once.
+	pub live_residency_requirement: usize,
+	pub max_in_flight_tasks: Option<usize>,
+	pub residency_exceeds_admission: bool,
+}
+
+/// Describe the live publication structure of an already-resolved stage graph against an
+/// admission cap. Phase 0 records this; it does not act on it.
+pub fn live_publication_report(
+	stages: &[StagePlan],
+	max_in_flight_tasks: Option<usize>,
+) -> LivePublicationReport {
+	let stage_upstreams = stages
+		.iter()
+		.map(|stage| (stage.stage_id, stage.upstream_stages.clone()))
+		.collect::<Vec<_>>();
+
+	let live_producer_stages = stages
+		.iter()
+		.filter(|stage| stage_publishes_live(stage))
+		.map(|stage| stage.stage_id)
+		.collect::<Vec<_>>();
+
+	let mut live_eligible_consumer_tasks = 0;
+	let mut multi_upstream_live_eligible_consumer_tasks = 0;
+	for stage in stages {
+		for task in &stage.tasks {
+			let consumes_shuffle = task
+				.spec
+				.inputs
+				.iter()
+				.any(|input| matches!(input, TaskInputBinding::ShuffleConsumer { .. }));
+			if !consumes_shuffle || !consumer_supports_live_inputs(stage, task, stages) {
+				continue;
+			}
+			live_eligible_consumer_tasks += 1;
+			if stage.upstream_stages.len() > 1 {
+				multi_upstream_live_eligible_consumer_tasks += 1;
+			}
+		}
+	}
+
+	let live_residency_requirement = live_components(stages)
+		.into_iter()
+		.map(|component| {
+			component
+				.iter()
+				.filter_map(|stage_id| stages.iter().find(|stage| stage.stage_id == *stage_id))
+				.map(|stage| stage.tasks.len())
+				.sum::<usize>()
+		})
+		.max()
+		.unwrap_or(0);
+
+	let residency_exceeds_admission =
+		max_in_flight_tasks.is_some_and(|limit| live_residency_requirement > limit);
+
+	LivePublicationReport {
+		stage_upstreams,
+		live_producer_stages,
+		live_eligible_consumer_tasks,
+		multi_upstream_live_eligible_consumer_tasks,
+		live_residency_requirement,
+		max_in_flight_tasks,
+		residency_exceeds_admission,
+	}
+}
+
+fn stage_publishes_live(stage: &StagePlan) -> bool {
+	stage.tasks.iter().any(|task| {
+		matches!(
+			task.spec.output,
+			TaskOutputBinding::ShuffleProducer {
+				publish_mode: ShufflePublishMode::Live,
+				..
+			}
+		)
+	})
+}
+
+/// Stage sets connected by live shuffle edges. A live producer and every stage that would
+/// drain it concurrently must be resident together, so they share one residency budget.
+fn live_components(stages: &[StagePlan]) -> Vec<BTreeSet<StageId>> {
+	let mut components: Vec<BTreeSet<StageId>> = Vec::new();
+
+	for producer in stages.iter().filter(|stage| stage_publishes_live(stage)) {
+		let mut component = BTreeSet::from([producer.stage_id]);
+		let mut frontier = vec![producer.stage_id];
+		while let Some(stage_id) = frontier.pop() {
+			for consumer in stages
+				.iter()
+				.filter(|stage| stage.upstream_stages.contains(&stage_id))
+			{
+				if component.contains(&consumer.stage_id) {
+					continue;
+				}
+				component.insert(consumer.stage_id);
+				// A live consumer that is itself a live producer extends the same
+				// component: its own consumers must also be resident.
+				if stage_publishes_live(consumer) {
+					frontier.push(consumer.stage_id);
+				}
+			}
+		}
+		components.push(component);
+	}
+
+	// Components sharing a stage are one residency budget, not two.
+	let mut merged: Vec<BTreeSet<StageId>> = Vec::new();
+	for component in components {
+		match merged
+			.iter_mut()
+			.find(|existing| !existing.is_disjoint(&component))
+		{
+			Some(existing) => existing.extend(component),
+			None => merged.push(component),
+		}
+	}
+	merged
 }
 
 fn consumer_supports_live_inputs_when(

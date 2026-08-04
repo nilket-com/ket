@@ -1,3 +1,4 @@
+pub(crate) mod admission_seam;
 pub(crate) mod binder_decomposition;
 pub(crate) mod cockpit;
 pub(crate) mod converted_predicate_pushdown;

@@ -5662,6 +5662,7 @@ mod tests {
 			let stages = fragment_plan(
 				bound,
 				FragmentPlanConfig::new(query_id, TaskBudget::from_query_budget(query_budget))
+					.with_max_in_flight_tasks(query_budget.max_in_flight_tasks)
 					.with_id_namespace(fragment_id_namespace),
 			)
 			.map_err(|error| QueryError::Remote {

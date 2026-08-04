@@ -33,6 +33,10 @@ pub struct FragmentPlanConfig {
 	pub runtime_filters_enabled: bool,
 	pub join_runtime_observation_mode: JoinRuntimeObservationMode,
 	pub id_namespace: u32,
+	/// The scheduler's concurrent-task admission cap for this query, or `None` for
+	/// unbounded. Publication-mode resolution must see the same cap the scheduler will
+	/// enforce: a live component whose tasks cannot all be resident at once cannot drain.
+	pub max_in_flight_tasks: Option<usize>,
 }
 
 impl FragmentPlanConfig {
@@ -45,7 +49,16 @@ impl FragmentPlanConfig {
 			runtime_filters_enabled: true,
 			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			id_namespace: 0,
+			max_in_flight_tasks: None,
 		}
+	}
+
+	/// Mirror the scheduler's admission cap. `None` is unbounded, matching
+	/// `DistributedScheduler::with_max_in_flight_tasks`, which also floors a supplied
+	/// limit at one.
+	pub fn with_max_in_flight_tasks(mut self, max_in_flight_tasks: Option<usize>) -> Self {
+		self.max_in_flight_tasks = max_in_flight_tasks.map(|limit| limit.max(1));
+		self
 	}
 
 	pub fn with_task_context(mut self, task_context: TaskExecutionContext) -> Self {
@@ -2137,6 +2150,70 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[test]
+	fn adr536_live_report_counts_multi_upstream_consumers_and_sizes_residency() {
+		use crate::distributed::scheduler::live_publication_report;
+
+		// A hash join over two exchanged scans: stage 2 consumes stages 0 and 1, the
+		// multi-upstream consumer shape. The fragmenter chains stage 1 onto
+		// stage 0 and resolves the whole graph sealed, so the live state is set
+		// explicitly here — the report must describe whatever graph it is handed, and
+		// the counter it replaces saw zero live-eligible consumers in this shape because
+		// it only recognized the unary streamable consumer.
+		let plan = join_plan(
+			exchanged_scan(TableId(1), 2),
+			exchanged_scan(TableId(2), 2),
+			JoinStrategy::HashPartitioned,
+		);
+		let mut stages = fragment_plan(plan, config()).expect("fragment hash join");
+		assert_eq!(
+			stages[2].upstream_stages,
+			vec![StageId::new(0), StageId::new(1)],
+			"stage 2 is the multi-upstream consumer"
+		);
+		for stage_index in [0, 1] {
+			let TaskOutputBinding::ShuffleProducer { publish_mode, .. } =
+				&mut stages[stage_index].tasks[0].spec.output
+			else {
+				panic!("producer output");
+			};
+			*publish_mode = ShufflePublishMode::Live;
+		}
+
+		let unbounded = live_publication_report(&stages, None);
+		assert_eq!(
+			unbounded.live_producer_stages.len(),
+			2,
+			"both producers publish live; stage upstreams: {:?}",
+			unbounded.stage_upstreams
+		);
+		assert_eq!(
+			unbounded.live_eligible_consumer_tasks, 2,
+			"both join consumer tasks are live-eligible through the multi-upstream arm"
+		);
+		assert_eq!(
+			unbounded.multi_upstream_live_eligible_consumer_tasks, 2,
+			"and both reach eligibility through the multi-upstream arm"
+		);
+		assert_eq!(
+			unbounded.live_residency_requirement, 4,
+			"two producers plus the whole two-task consumer stage must be resident"
+		);
+		assert!(
+			!unbounded.residency_exceeds_admission,
+			"an unbounded cap can always host the component"
+		);
+
+		assert!(
+			live_publication_report(&stages, Some(3)).residency_exceeds_admission,
+			"a cap below the residency requirement cannot host the live component"
+		);
+		assert!(
+			!live_publication_report(&stages, Some(4)).residency_exceeds_admission,
+			"a cap that exactly fits the component is admissible"
+		);
 	}
 
 	#[test]

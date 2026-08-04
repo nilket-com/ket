@@ -520,6 +520,13 @@ pub struct ExecutionCensusRow {
 	pub stage_count: Option<usize>,
 	pub stage_task_counts: Option<Vec<usize>>,
 	pub live_eligible_consumer_tasks: Option<usize>,
+	/// ADR 536 Phase 0, observe-only: the live publication structure behind this row.
+	pub stage_upstreams: Option<Vec<(u32, Vec<u32>)>>,
+	pub live_producer_stages: Option<usize>,
+	pub multi_upstream_live_eligible_consumer_tasks: Option<usize>,
+	pub live_residency_requirement: Option<usize>,
+	pub admission_max_in_flight_tasks: Option<usize>,
+	pub residency_exceeds_admission: Option<bool>,
 	pub admitted_width: Option<usize>,
 	pub task_memory_envelope_bytes: u64,
 	pub local_memory_bytes: u64,
@@ -611,6 +618,37 @@ impl ExecutionCensusRow {
 			row.as_object_mut()
 				.expect("execution census JSON row is an object")
 				.insert("diagnostic_message".to_string(), serde_json::json!(message));
+		}
+		// ADR 536 Phase 0, observe-only. Inserted rather than declared in the `json!`
+		// literal above, which is already at the macro's expansion depth.
+		{
+			let object = row
+				.as_object_mut()
+				.expect("execution census JSON row is an object");
+			object.insert(
+				"stage_upstreams".to_string(),
+				serde_json::json!(self.stage_upstreams),
+			);
+			object.insert(
+				"live_producer_stages".to_string(),
+				serde_json::json!(self.live_producer_stages),
+			);
+			object.insert(
+				"multi_upstream_live_eligible_consumer_tasks".to_string(),
+				serde_json::json!(self.multi_upstream_live_eligible_consumer_tasks),
+			);
+			object.insert(
+				"live_residency_requirement".to_string(),
+				serde_json::json!(self.live_residency_requirement),
+			);
+			object.insert(
+				"admission_max_in_flight_tasks".to_string(),
+				serde_json::json!(self.admission_max_in_flight_tasks),
+			);
+			object.insert(
+				"residency_exceeds_admission".to_string(),
+				serde_json::json!(self.residency_exceeds_admission),
+			);
 		}
 		row.to_string()
 	}
