@@ -3163,7 +3163,7 @@ workspace.table("t").views([
 	fn product_0016_figure_headings_reach_canvas_and_source_only_chrome() {
 		let source = r#"workspace.table("t").views([
 			view("stable", figure([title("Named canvas"), line("x", "y")])),
-			figure([title("Revenue"), subtitle("Private detail"), line("x", "y")]),
+			figure([title("Revenue 📈"), subtitle("Private detail"), line("x", "y")]),
 			figure([subtitle("Subtitle only"), line("x", "y")]),
 			figure([title("Revenue"), line("x", "y")]),
 			figure([title("Overlay"), subtitle("Both marks"), layers([line("x", "y"), scatter("x", "y")])]),
@@ -3224,7 +3224,7 @@ workspace.table("t").views([
 			chrome,
 			[
 				"stable",
-				"Revenue 2",
+				"Revenue 📈 2",
 				"plot.line 3",
 				"Revenue 4",
 				"Overlay 5"
@@ -3253,11 +3253,13 @@ workspace.table("t").views([
 					.expect("completed figure canvas")
 			})
 			.collect::<Vec<_>>();
-		for (svg, expected) in
-			canvases
-				.iter()
-				.zip(["Named canvas", "Revenue", "plot.line", "Revenue", "Overlay"])
-		{
+		for (svg, expected) in canvases.iter().zip([
+			"Named canvas",
+			"Revenue 📈",
+			"plot.line",
+			"Revenue",
+			"Overlay",
+		]) {
 			assert!(svg.contains(expected), "canvas must contain {expected}");
 		}
 		assert!(canvases[1].contains("Private detail"));

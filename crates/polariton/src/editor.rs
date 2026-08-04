@@ -3954,9 +3954,18 @@ fn editor_input_for(event: &Event, status: event::Status) -> Option<EditorMsg> {
 		}
 		_ => {}
 	}
+	if status != event::Status::Ignored {
+		return None;
+	}
+	if let Event::InputMethod(iced::advanced::input_method::Event::Commit(committed)) = event
+		&& !committed.is_empty()
+	{
+		return Some(EditorMsg::Input(InputEvent::Paste(committed.clone())));
+	}
 	let Event::Keyboard(keyboard::Event::KeyPressed {
 		modified_key,
 		modifiers,
+		text,
 		..
 	}) = event
 	else {
@@ -3967,8 +3976,27 @@ fn editor_input_for(event: &Event, status: event::Status) -> Option<EditorMsg> {
 			"[input-trace] modified_key={modified_key:?} modifiers={modifiers:?} status={status:?}"
 		);
 	}
-	if status != event::Status::Ignored {
-		return None;
+	// `text` is the compositor's committed-text payload. Emoji pickers, input
+	// methods, and composed graphemes can produce text that has no portable key
+	// identity, or more than one Unicode scalar. Turning `modified_key` into a
+	// `KeyCode::Char` would either drop that input or keep only its first scalar.
+	// Route those commits through the engine's existing modal-safe paste path.
+	// Ordinary single-character keys stay key events so Normal-mode mappings and
+	// command modifiers retain their exact behavior.
+	let command_modified = modifiers.control() || modifiers.alt() || modifiers.logo();
+	if !command_modified
+		&& let Some(committed) = text.as_ref().filter(|value| !value.is_empty())
+		&& (committed.chars().nth(1).is_some()
+			|| key_code(modified_key).is_none()
+			|| matches!(modified_key, Key::Character(value) if value != committed))
+	{
+		return Some(EditorMsg::Input(InputEvent::Paste(committed.to_string())));
+	}
+	if !command_modified
+		&& let Key::Character(committed) = modified_key
+		&& committed.chars().nth(1).is_some()
+	{
+		return Some(EditorMsg::Input(InputEvent::Paste(committed.to_string())));
 	}
 	// `modified_key`, not `key`: iced's `key` is the unshifted layout key
 	// (Shift+; arrives as ';'), while the engine's keymap expects the produced
@@ -6635,8 +6663,14 @@ mod tests {
 
 		// Unconsumed keys reach the engine, which is how `:` opens the prompt.
 		assert!(
-			editor_input_for(&colon, event::Status::Ignored).is_some(),
-			"an unconsumed key reaches Baryon"
+			matches!(
+				editor_input_for(&colon, event::Status::Ignored),
+				Some(EditorMsg::Input(InputEvent::Key {
+					code: KeyCode::Char(':'),
+					modifiers: Modifiers::SHIFT,
+				}))
+			),
+			"an ordinary unconsumed key retains its exact mapping"
 		);
 
 		// Consumed keys are dropped so app chrome (connection name, statement
@@ -6663,6 +6697,56 @@ mod tests {
 			repeat: false,
 		});
 		assert!(editor_input_for(&arrow, event::Status::Ignored).is_some());
+	}
+
+	#[test]
+	fn committed_unicode_text_uses_the_modal_safe_paste_path() {
+		use super::editor_input_for;
+		use iced::{Event, event, keyboard};
+
+		fn key_event(modified_key: keyboard::Key, text: Option<&str>) -> Event {
+			Event::Keyboard(keyboard::Event::KeyPressed {
+				key: modified_key.clone(),
+				modified_key,
+				physical_key: keyboard::key::Physical::Unidentified(
+					keyboard::key::NativeCode::Unidentified,
+				),
+				location: keyboard::Location::Standard,
+				modifiers: keyboard::Modifiers::empty(),
+				text: text.map(Into::into),
+				repeat: false,
+			})
+		}
+
+		let emoji = key_event(keyboard::Key::Unidentified, Some("👩‍💻"));
+		assert!(matches!(
+			editor_input_for(&emoji, event::Status::Ignored),
+			Some(EditorMsg::Input(InputEvent::Paste(text))) if text == "👩‍💻"
+		));
+
+		let replacement_key = key_event(keyboard::Key::Character("�".into()), Some("🚀"));
+		assert!(matches!(
+			editor_input_for(&replacement_key, event::Status::Ignored),
+			Some(EditorMsg::Input(InputEvent::Paste(text))) if text == "🚀"
+		));
+
+		let composed = key_event(keyboard::Key::Character("👩‍💻".into()), None);
+		assert!(matches!(
+			editor_input_for(&composed, event::Status::Ignored),
+			Some(EditorMsg::Input(InputEvent::Paste(text))) if text == "👩‍💻"
+		));
+
+		let ime_commit = Event::InputMethod(iced::advanced::input_method::Event::Commit(
+			"📈🚀".to_owned(),
+		));
+		assert!(matches!(
+			editor_input_for(&ime_commit, event::Status::Ignored),
+			Some(EditorMsg::Input(InputEvent::Paste(text))) if text == "📈🚀"
+		));
+		assert!(
+			editor_input_for(&ime_commit, event::Status::Captured).is_none(),
+			"IME commits captured by application chrome must not edit the document"
+		);
 	}
 
 	#[test]
@@ -6882,6 +6966,29 @@ mod tests {
 		assert!(
 			lines.iter().any(|line| line.contains("ab")),
 			"typed text must reach the rendered projection, got: {lines:?}"
+		);
+	}
+
+	#[test]
+	fn committed_emoji_survive_the_full_render_pipeline() {
+		let mut editor = CodeEditor::new("");
+		wait_for_content(&mut editor, "");
+		send_keys(&mut editor, ['i']);
+		let _ = editor.update(EditorMsg::Input(InputEvent::Paste("👩‍💻📈".to_owned())));
+		wait_for_content(&mut editor, "👩‍💻📈");
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while !rendered_lines(&editor)
+			.iter()
+			.any(|line| line.contains("👩‍💻📈"))
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let lines = rendered_lines(&editor);
+		assert!(
+			lines.iter().any(|line| line.contains("👩‍💻📈")),
+			"committed emoji must reach the rendered projection intact, got: {lines:?}"
 		);
 	}
 
