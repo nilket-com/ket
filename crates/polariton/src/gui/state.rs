@@ -3054,6 +3054,7 @@ workspace.table("t").views([
 	fn product_0014_one_layer_spelling_keeps_anonymous_identity_and_svg() {
 		let bare_source = "workspace.table(\"t\").views([line(\"x\", \"y\")])";
 		let layered_source = "workspace.table(\"t\").views([layers([line(\"x\", \"y\")])])";
+		let figure_source = "workspace.table(\"t\").views([figure([line(\"x\", \"y\")])])";
 		let frame = polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 4.0]).expect("line frame");
 
 		let bare_relation = transform_rune_view(bare_source)
@@ -3082,9 +3083,25 @@ workspace.table("t").views([
 		};
 		let layered_kernel = create_layered_plot(specification, &frame, 100, 100)
 			.expect("one-layer PRODUCT-0013 path");
+		let figure_relation = transform_rune_view(figure_source)
+			.expect("one-body figure")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let figure_outcome = rune_view_outcome(frame.clone(), figure_relation.views);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(figure, _)) =
+			&figure_outcome.sinks[0].output
+		else {
+			panic!("one-body figure must retain the single plot path")
+		};
+		let figure_kernel = create_plot(&figure.resolved_spec, &figure.data, 100, 100);
 		assert_eq!(
 			render_marks(bare_kernel.as_ref()),
 			render_marks(layered_kernel.as_ref())
+		);
+		assert_eq!(
+			render_marks(bare_kernel.as_ref()),
+			render_marks(figure_kernel.as_ref())
 		);
 
 		let (mut state, startup) = new(StartupData::default(), None);
@@ -3092,7 +3109,7 @@ workspace.table("t").views([
 		let source_buffer = libaryon::core::BufferId::new(77);
 		let identity = LocalViewIdentity::Anonymous(0);
 		let mut panel = None;
-		for (revision, source) in [(1, bare_source), (2, layered_source)] {
+		for (revision, source) in [(1, bare_source), (2, layered_source), (3, figure_source)] {
 			let program = transform_rune_view(source).expect("line spelling revision");
 			let presentation = program
 				.presentation_views()
@@ -3136,8 +3153,125 @@ workspace.table("t").views([
 			state
 				.code_editor
 				.rune_view_panel_display_label(source_buffer, &identity),
-			Some("Line")
+			Some("plot.line")
 		);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0016_figure_headings_reach_canvas_and_source_only_chrome() {
+		let source = r#"workspace.table("t").views([
+			view("stable", figure([title("Named canvas"), line("x", "y")])),
+			figure([title("Revenue"), subtitle("Private detail"), line("x", "y")]),
+			figure([subtitle("Subtitle only"), line("x", "y")]),
+			figure([title("Revenue"), line("x", "y")]),
+			figure([title("Overlay"), subtitle("Both marks"), layers([line("x", "y"), scatter("x", "y")])]),
+		])"#;
+		let program = transform_rune_view(source).expect("figure surface");
+		let relation = program.clone().into_relations().next().expect("one origin");
+		let identities = relation
+			.views
+			.iter()
+			.map(|view| view.identity.clone())
+			.collect::<Vec<_>>();
+		let presentations = relation
+			.views
+			.iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(82);
+		let revision = 1;
+		state.rune_buffer_revisions.insert(source_buffer, revision);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentations, revision);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision,
+					view: program,
+				})
+				.is_some()
+		);
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while identities.iter().any(|identity| {
+			state
+				.code_editor
+				.rune_view_panel_projected_title(source_buffer, identity)
+				.is_none()
+		}) && std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		let chrome = identities
+			.iter()
+			.map(|identity| {
+				state
+					.code_editor
+					.rune_view_panel_projected_title(source_buffer, identity)
+					.expect("projected figure panel")
+					.to_owned()
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			chrome,
+			[
+				"stable",
+				"Revenue 2",
+				"plot.line 3",
+				"Revenue 4",
+				"Overlay 5"
+			]
+		);
+		assert!(chrome.iter().all(|title| {
+			!title.contains("Private detail")
+				&& !title.contains("Subtitle only")
+				&& !title.contains("Both marks")
+		}));
+
+		complete_relation_in_head(
+			&mut state,
+			source_buffer,
+			revision,
+			relation,
+			polars::df!("x" => [1.0_f64, 2.0, 3.0], "y" => [2.0_f64, 4.0, 3.0])
+				.expect("figure frame"),
+		);
+		let canvases = identities
+			.iter()
+			.map(|identity| {
+				state
+					.code_editor
+					.rune_view_panel_plot_svg(source_buffer, identity)
+					.expect("completed figure canvas")
+			})
+			.collect::<Vec<_>>();
+		for (svg, expected) in
+			canvases
+				.iter()
+				.zip(["Named canvas", "Revenue", "plot.line", "Revenue", "Overlay"])
+		{
+			assert!(svg.contains(expected), "canvas must contain {expected}");
+		}
+		assert!(canvases[1].contains("Private detail"));
+		assert!(canvases[2].contains("Subtitle only"));
+		assert!(canvases[4].contains("Both marks"));
+		assert!(!canvases[1].contains("plot.line"));
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_display_label(source_buffer, &identities[4]),
+			Some("Line + Scatter")
+		);
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 

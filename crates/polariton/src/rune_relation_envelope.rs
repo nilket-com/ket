@@ -979,6 +979,7 @@ fn parse_contextual_sink_inner(
 	}
 	let intent = match callee {
 		"table" if args.is_empty() => RuneViewIntent::Table,
+		"figure" => RuneViewIntent::Plot(parse_figure(expression, &args, source)?),
 		"bar" if args.len() == 2 => {
 			let Some(sink) = plot_sink_fields(PlotType::Bar, source, &args, 0)? else {
 				return invalid_view(
@@ -1045,7 +1046,7 @@ fn parse_contextual_sink_inner(
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"unknown view sink; expected scatter(...), bar(...), line(...), table(), or layers([...])",
+				"unknown view sink; expected scatter(...), bar(...), line(...), table(), layers([...]), or figure([...])",
 			);
 		}
 	};
@@ -1055,6 +1056,169 @@ fn parse_contextual_sink_inner(
 		name: None,
 		output_order: 0,
 	})
+}
+
+fn parse_figure(
+	outer: &ast::Expr,
+	args: &[&ast::Expr],
+	source: &str,
+) -> Result<RunePlotIntent, RuneEnvelopeError> {
+	let [argument] = args else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			"figure(...) takes exactly one literal figure list",
+		);
+	};
+	let ast::Expr::Vec(list) = argument else {
+		return invalid_view(
+			argument.span(),
+			source.len(),
+			"figure(...) requires a literal figure list",
+		);
+	};
+	let mut title = None;
+	let mut subtitle = None;
+	let mut body = None;
+	for (item, _) in list.items.iter() {
+		let ast::Expr::Call(call) = item else {
+			return invalid_view(
+				item.span(),
+				source.len(),
+				"a figure child must be title(...), subtitle(...), or one plot body",
+			);
+		};
+		let callee = source_slice(source, call.expr.span())?.trim();
+		let child_args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+		match callee {
+			"title" => {
+				if title.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one title",
+					);
+				}
+				title = Some(parse_figure_heading(item, &child_args, source, "title")?);
+			}
+			"subtitle" => {
+				if subtitle.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one subtitle",
+					);
+				}
+				subtitle = Some(parse_figure_heading(item, &child_args, source, "subtitle")?);
+			}
+			_ => {
+				if body.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure contains exactly one plot body",
+					);
+				}
+				body = Some(parse_figure_body(item, callee, &child_args, source)?);
+			}
+		}
+	}
+	let Some(body) = body else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			"a figure requires exactly one plot body",
+		);
+	};
+	let mut authored_settings = PlotSettingsLayer::default();
+	if let Some(title) = title {
+		authored_settings.title = Presence::Show(Arc::new(title));
+	}
+	if let Some(subtitle) = subtitle {
+		authored_settings.subtitle = Presence::Show(Arc::new(subtitle));
+	}
+	Ok(RunePlotIntent {
+		body,
+		authored_settings,
+	})
+}
+
+fn parse_figure_heading(
+	outer: &ast::Expr,
+	args: &[&ast::Expr],
+	source: &str,
+	kind: &str,
+) -> Result<String, RuneEnvelopeError> {
+	let [argument] = args else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{kind}(...) takes exactly one string literal"),
+		);
+	};
+	let raw = source_slice(source, argument.span())?;
+	let Some(value) = decode_string_literal(raw) else {
+		return invalid_view(
+			argument.span(),
+			source.len(),
+			format!("{kind}(...) requires a string literal"),
+		);
+	};
+	Ok(value)
+}
+
+fn parse_figure_body(
+	expression: &ast::Expr,
+	callee: &str,
+	args: &[&ast::Expr],
+	source: &str,
+) -> Result<RunePlotBody, RuneEnvelopeError> {
+	let single = |plot_type, message: &str| -> Result<RunePlotBody, RuneEnvelopeError> {
+		let Some(sink) = plot_sink_fields(plot_type, source, args, 0)? else {
+			return invalid_view(expression.span(), source.len(), message);
+		};
+		Ok(RunePlotBody::Single(sink))
+	};
+	match callee {
+		"bar" if args.len() == 2 => single(PlotType::Bar, "bar fields must be strings"),
+		"line" if args.len() == 2 => single(PlotType::Line, "line fields must be strings"),
+		"scatter" if matches!(args.len(), 2 | 3) => {
+			single(PlotType::Scatter, "scatter fields must be strings")
+		}
+		"layers" => Ok(RunePlotBody::Layered(parse_layer_list(
+			expression, args, source,
+		)?)),
+		"table" => invalid_view(
+			expression.span(),
+			source.len(),
+			"table() is a view sink, not a figure plot body",
+		),
+		"figure" => invalid_view(
+			expression.span(),
+			source.len(),
+			"figure([...]) cannot be nested inside a figure",
+		),
+		"view" => invalid_view(
+			expression.span(),
+			source.len(),
+			"view(...) wraps a figure; it cannot appear inside one",
+		),
+		"bar" | "line" => invalid_view(
+			expression.span(),
+			source.len(),
+			format!("{callee}(...) takes x and y string fields"),
+		),
+		"scatter" => invalid_view(
+			expression.span(),
+			source.len(),
+			"scatter(...) takes x and y strings with an optional category",
+		),
+		_ => invalid_view(
+			expression.span(),
+			source.len(),
+			"unknown figure child; expected one bar, line, scatter, or layers plot body",
+		),
+	}
 }
 
 fn parse_layer_list(
@@ -2291,6 +2455,147 @@ workspace.table("t").views([table()])
 		);
 		assert_eq!(transformed.views.len(), 1);
 		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+	}
+
+	#[test]
+	fn product_0016_figure_lowers_body_and_headings_independently() {
+		let source = r#"workspace.table("t").views([figure([
+			title("Revenue"),
+			subtitle("Trailing twelve months"),
+			layers([line("month", "revenue"), scatter("month", "revenue")]),
+		])])"#;
+		let transformed = transform(source).expect("figure envelope");
+		let [view] = transformed.views.as_slice() else {
+			panic!("one figure remains one view");
+		};
+		let RuneViewIntent::Plot(plot) = &view.intent else {
+			panic!("figure must route as a plot");
+		};
+		let RunePlotBody::Layered(specification) = &plot.body else {
+			panic!("layers body stays layered");
+		};
+		assert_eq!(
+			specification
+				.layers
+				.iter()
+				.map(|layer| layer.mark)
+				.collect::<Vec<_>>(),
+			[LayerMark::Line, LayerMark::Scatter]
+		);
+		let mut expected = PlotSettingsLayer::default();
+		expected.title = Presence::Show(Arc::new("Revenue".to_owned()));
+		expected.subtitle = Presence::Show(Arc::new("Trailing twelve months".to_owned()));
+		assert_eq!(plot.authored_settings, expected);
+		assert_eq!(view.intent.presentation().display_label, "Line + Scatter");
+		assert_eq!(view.intent.presentation().authored_title, expected.title);
+	}
+
+	#[test]
+	fn product_0016_one_body_figure_is_the_same_view_as_its_bare_mark() {
+		fn only_view(source: &str) -> SpannedRuneViewIntent {
+			transform(source)
+				.expect("one-view envelope")
+				.into_relations()
+				.next()
+				.expect("one relation")
+				.views
+				.into_iter()
+				.next()
+				.expect("one view")
+		}
+		let bare = only_view("workspace.table(\"t\").views([view(\"trend\", line(\"x\", \"y\"))])");
+		let figure = only_view(
+			"workspace.table(\"t\").views([view(\"trend\", figure([line(\"x\", \"y\")]))])",
+		);
+		assert_eq!(bare.identity, figure.identity);
+		assert_eq!(bare.intent, figure.intent);
+		assert_eq!(bare.intent.presentation(), figure.intent.presentation());
+	}
+
+	#[test]
+	fn product_0016_figure_refusals_are_inner_attributed_and_atomic() {
+		for (source, rejected) in [
+			("workspace.table(\"t\").views([figure()])", "figure()"),
+			(
+				"workspace.table(\"t\").views([figure([], [])])",
+				"figure([], [])",
+			),
+			(
+				"let parts = [line(\"x\", \"y\")]; workspace.table(\"t\").views([figure(parts)])",
+				"parts",
+			),
+			(
+				"workspace.table(\"t\").views([figure([title(\"a\"), title(\"b\"), line(\"x\", \"y\")])])",
+				"title(\"b\")",
+			),
+			(
+				"workspace.table(\"t\").views([figure([subtitle(\"a\"), subtitle(\"b\"), line(\"x\", \"y\")])])",
+				"subtitle(\"b\")",
+			),
+			(
+				"workspace.table(\"t\").views([figure([title(\"only metadata\")])])",
+				"figure([title(\"only metadata\")])",
+			),
+			(
+				"workspace.table(\"t\").views([figure([line(\"x\", \"y\"), scatter(\"x\", \"y\")])])",
+				"scatter(\"x\", \"y\")",
+			),
+			(
+				"workspace.table(\"t\").views([figure([table()])])",
+				"table()",
+			),
+			(
+				"workspace.table(\"t\").views([figure([figure([line(\"x\", \"y\")])])])",
+				"figure([line(\"x\", \"y\")])",
+			),
+			(
+				"workspace.table(\"t\").views([figure([view(\"inner\", line(\"x\", \"y\"))])])",
+				"view(\"inner\", line(\"x\", \"y\"))",
+			),
+			(
+				"workspace.table(\"t\").views([figure([layers([title(\"wrong level\"), line(\"x\", \"y\")])])])",
+				"title(\"wrong level\")",
+			),
+			(
+				"let heading = \"computed\"; workspace.table(\"t\").views([figure([title(heading), line(\"x\", \"y\")])])",
+				"heading",
+			),
+			(
+				"workspace.table(\"t\").views([figure([subtitle(), line(\"x\", \"y\")])])",
+				"subtitle()",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(source).expect_err("malformed figure must refuse atomically")
+			else {
+				panic!("expected an attributed figure refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+		}
+	}
+
+	#[test]
+	fn product_0016_subtitle_only_is_legal_and_figure_is_contextual() {
+		let source =
+			"workspace.table(\"t\").views([figure([subtitle(\"Detail\"), line(\"x\", \"y\")])])";
+		let transformed = transform(source).expect("subtitle-only figure");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("figure routes as plot");
+		};
+		assert_eq!(plot.authored_settings.title, Presence::Inherit);
+		assert_eq!(
+			plot.authored_settings.subtitle,
+			Presence::Show(Arc::new("Detail".to_owned()))
+		);
+
+		let ordinary = r#"
+			figure([title("ordinary"), line("x", "y")]);
+			let held = figure([subtitle("ordinary"), line("x", "y")]);
+			workspace.table("t").views([table()])
+		"#;
+		let retained = transform(ordinary).expect("figure calls outside views stay ordinary Rune");
+		assert!(retained.source.contains("figure([title(\"ordinary\")"));
+		assert_eq!(retained.views.len(), 1);
 	}
 
 	#[test]

@@ -1061,6 +1061,34 @@ impl CodeEditor {
 	}
 
 	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_plot_svg(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<String> {
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let entry = self.panels.panels.get(&panel_id)?;
+		let PanelContent::Plot(plot) = &entry.content else {
+			return None;
+		};
+		let widget = PlotWidget {
+			kernel: plot.kernel.as_ref(),
+			title: plot.display_label.clone(),
+			padding: 0.0,
+			settings: plot.plot_settings.clone(),
+			render_revision: plot.render_revision,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = crate::plot::export::SvgBackend::new(800.0, 480.0);
+		widget.render(
+			&mut backend,
+			iced::Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
+		);
+		Some(backend.finish())
+	}
+
+	#[cfg(all(test, feature = "toron"))]
 	pub(crate) fn rune_view_panel_count(&self, producer: libaryon::core::BufferId) -> usize {
 		self.view_panel_ids
 			.keys()
