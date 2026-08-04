@@ -1,6 +1,6 @@
 # Audit
 
-Operator-facing audit guidance for Wendelon. This document covers the **sink shapes that exist today**, how they differ, and which sink an operator should treat as the source of truth for a given use case. Architectural intent lives in [ADR 025](../adr/025_audit_event_model_and_tamper_evident_hash_chain.md).
+Operator-facing audit guidance for Wendelon. This document covers the **sink shapes that exist today**, how they differ, and which sink an operator should treat as the source of truth for a given use case. Architectural intent lives in [ADR 025](../adr/0025_audit_event_model_and_tamper_evident_hash_chain.md).
 
 ## 1. Sink Posture
 
@@ -291,7 +291,7 @@ It prints a JSON report and uses exit status as the quick operator signal:
 
 ## References
 
-- [ADR 025](../adr/025_audit_event_model_and_tamper_evident_hash_chain.md)
+- [ADR 025](../adr/0025_audit_event_model_and_tamper_evident_hash_chain.md)
 - [Observability](./observability.md)
 - [Configuration Schema](./configuration.md)
 - [Audit Verify Usage](./audit_verify_usage.md)

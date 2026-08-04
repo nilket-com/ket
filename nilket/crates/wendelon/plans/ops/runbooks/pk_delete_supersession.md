@@ -1,6 +1,6 @@
 # PK Delete Supersession Runbook
 
-ADR: `plans/adr/050_pk_delete_supersession.md`
+ADR: `plans/adr/0050_pk_delete_supersession.md`
 
 ## When to Use PK Delete
 

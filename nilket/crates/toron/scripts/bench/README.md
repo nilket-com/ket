@@ -81,5 +81,5 @@ Existing logs can be summarized directly:
 
 ```bash
 crates/toron/scripts/bench/summarize_runtime_filter_perft.py \
-  crates/toron/plans/impl/006_runtime_filter_pushdown_bench_results.md
+  crates/toron/plans/impl/0006_runtime_filter_pushdown_bench_results.md
 ```

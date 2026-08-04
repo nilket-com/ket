@@ -22,25 +22,25 @@ forward-sequence rewrite.
 Storage hierarchy is shipped through ADR 069 (encoded-validity
 sparse projection, 2026-05-12). ADR 069 is Shipped and promoted
 with evidence at
-`plans/impl/069_encoded_validity_sparse_projection_bench_results.md`;
+`plans/impl/0069_encoded_validity_sparse_projection_bench_results.md`;
 the reader now initializes `Enabled` encoded-validity sparse
 projection coverage and pins the `RowGroupRowCountMismatch`
 guard. ADR 070 (all-null page-skip for nullable sparse
 projection) is implemented with evidence at
-`plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md`
+`plans/impl/0070_all_null_page_skip_sparse_projection_bench_results.md`
 after four council iterations under `plans/wip/`; source plans
 live at
-`plans/adr/070_all_null_page_skip_sparse_projection.md` and
-`plans/impl/070_all_null_page_skip_sparse_projection.md`. The
+`plans/adr/0070_all_null_page_skip_sparse_projection.md` and
+`plans/impl/0070_all_null_page_skip_sparse_projection.md`. The
 Toron-pivot stretch continues to pull compute-adjacent storage
 primitives ahead of OLTP-shaped access surfaces.
 
 **ADR 071 (`nilket wendelon inspect`) implemented — ops/observability
 CLI composition, not a storage-engine continuation.** Planning and
 implementation are complete
-(`plans/adr/071_nilket_wendelon_inspect_real_wiring.md` +
-`plans/impl/071_nilket_wendelon_inspect_real_wiring.md`; evidence in
-`plans/impl/071_nilket_wendelon_inspect_real_wiring_evidence.md`).
+(`plans/adr/0071_nilket_wendelon_inspect_real_wiring.md` +
+`plans/impl/0071_nilket_wendelon_inspect_real_wiring.md`; evidence in
+`plans/impl/0071_nilket_wendelon_inspect_real_wiring_evidence.md`).
 It adds a one-shot
 operator CLI that dials Wendelon's existing mTLS `/ready` listener
 (ADR 027 observability posture), composing over the Toron-sequence
@@ -56,9 +56,9 @@ all code lands in `crates/wendelon`.
 **ADR 072 (Table Descriptor Snapshot Producer) implemented — the
 producer half of cross-ring descriptor liveness, not a
 storage-engine continuation.** Plans at
-`plans/adr/072_table_descriptor_snapshot_producer.md` +
-`plans/impl/072_table_descriptor_snapshot_producer.md`; evidence at
-`plans/impl/072_table_descriptor_snapshot_producer_evidence.md`. A read-only
+`plans/adr/0072_table_descriptor_snapshot_producer.md` +
+`plans/impl/0072_table_descriptor_snapshot_producer.md`; evidence at
+`plans/impl/0072_table_descriptor_snapshot_producer_evidence.md`. A read-only
 Control Ring RPC (`MsgType::TABLE_DESCRIPTOR_GET_REQ` 0x3C /
 `_RESP` 0x3D) answering `(tenant_id, namespace, table_name)` →
 latest `TableSchemaDescriptor` (or not-found) against the Raft
@@ -145,7 +145,7 @@ One-line index. Full context in each ADR; bench evidence under
   admit `Rle { inner: Plain }`; page-local emission with 1:1
   value/validity alignment. Shipped and promoted with bench
   evidence at
-  `plans/impl/069_encoded_validity_sparse_projection_bench_results.md`;
+  `plans/impl/0069_encoded_validity_sparse_projection_bench_results.md`;
   reader config now initializes `Enabled`; guard coverage
   includes `RowGroupRowCountMismatch`.
 
@@ -229,9 +229,9 @@ precedent) and local-span preservation (the iter-3 red-team); Gemini's
 parallel iter-4 held fold-the-Toron-change / sanitized-only replacement,
 resolved against by precedent and the Wendelon-local-observability
 regression. **14 decisions, 16 architecture + 3 convention/meta guards,
-16 fixtures.** Plans: `plans/adr/074_table_query_trace_continuation.md` +
-`plans/impl/074_table_query_trace_continuation.md`; evidence:
-`plans/impl/074_table_query_trace_continuation_evidence.md`. **Next consumer:**
+16 fixtures.** Plans: `plans/adr/0074_table_query_trace_continuation.md` +
+`plans/impl/0074_table_query_trace_continuation.md`; evidence:
+`plans/impl/0074_table_query_trace_continuation_evidence.md`. **Next consumer:**
 the Toron telemetry consumer ADR (Toron sequence) — populate
 `TableQueryOptions.trace_context` from `ScanRequest` with
 `toron.storage.scan` as parent (cross-referenced, not owned here).
@@ -268,9 +268,9 @@ ring: `CancellationToken` (not a hand-rolled lost-wakeup-prone
 ADR 072 precedent). Council: **3-of-3 (Claude, Codex, Gemini)** —
 the strongest-aligned promotion of the cancellation arc; **19
 decisions, 22 architecture guards + 1 meta guard, 19 required
-fixtures**. Plans: `plans/adr/073_table_query_request_cancellation.md`
-+ `plans/impl/073_table_query_request_cancellation.md`; evidence:
-`plans/impl/073_table_query_request_cancellation_evidence.md`.
+fixtures**. Plans: `plans/adr/0073_table_query_request_cancellation.md`
++ `plans/impl/0073_table_query_request_cancellation.md`; evidence:
+`plans/impl/0073_table_query_request_cancellation_evidence.md`.
 **Next consumer:** Toron ADR 060 — wires Toron ADR 059
 cancellation into this primitive (Toron sequence, cross-referenced,
 not owned here).
@@ -284,7 +284,7 @@ descriptor in the trailing section with a pinned `descriptor_len`.
 Seeded by Toron ADR 052 §D15; relocated to the Wendelon sequence at
 promotion (ADR 071 precedent). Status block above; plans at
 `plans/adr/072_*` + `plans/impl/072_*`; evidence at
-`plans/impl/072_table_descriptor_snapshot_producer_evidence.md`.
+`plans/impl/0072_table_descriptor_snapshot_producer_evidence.md`.
 **Next consumer:** the
 Toron bind-miss ADR (Toron sequence, 053) — cross-referenced, not
 owned here.
@@ -299,9 +299,9 @@ codes 0/1/2; empty ALPN; `ObservabilityReady` admission; zero
 daemon-side change. **15 decisions, 16 architecture guards + 1
 convention guard (in `crates/wendelon/tests/architecture_test.rs`),
 15 required fixtures + 2 V1-evidence optional.** Plans:
-`plans/adr/071_nilket_wendelon_inspect_real_wiring.md` +
-`plans/impl/071_nilket_wendelon_inspect_real_wiring.md`; evidence:
-`plans/impl/071_nilket_wendelon_inspect_real_wiring_evidence.md`.
+`plans/adr/0071_nilket_wendelon_inspect_real_wiring.md` +
+`plans/impl/0071_nilket_wendelon_inspect_real_wiring.md`; evidence:
+`plans/impl/0071_nilket_wendelon_inspect_real_wiring_evidence.md`.
 Drafted via the Toron operator-plane council; relocated to the
 Wendelon sequence at promotion (Wendelon owns the consumer ADR). The
 storage-engine forward items below continue independently.
@@ -309,11 +309,11 @@ storage-engine forward items below continue independently.
 1. **All-null page-skip for nullable sparse projection** —
    ADR 070 implemented after four Claude / Codex / Gemini
    council iterations. Plans at
-   `plans/adr/070_all_null_page_skip_sparse_projection.md`
+   `plans/adr/0070_all_null_page_skip_sparse_projection.md`
    and
-   `plans/impl/070_all_null_page_skip_sparse_projection.md`;
+   `plans/impl/0070_all_null_page_skip_sparse_projection.md`;
    bench-results artifact at
-   `plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md`.
+   `plans/impl/0070_all_null_page_skip_sparse_projection_bench_results.md`.
    **Metadata-only zero-RTT elision** via ADR 063 page
    stats: when
    `value_buf.page_stats[k].null_count == page_value_count[k]`

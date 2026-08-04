@@ -4,9 +4,9 @@
 >
 > | Prior §  | Prior position | Superseding ADR(s) | Outcome |
 > |----------|----------------|--------------------|---------|
-> | §1 Logical Isolation | Shared ring with `Hash(NamespaceID \|\| RawKey)` routing | [ADR 021](../adr/021_tenant_aware_architecture_day_one.md) | Superseded: per-tenant first-class keyspaces with `tenant_id` entering the hash input; logical structures (compaction, quotas, KEK bindings) are separate data structures keyed by `tenant_id` rather than prefixes on a shared keyspace. |
-> | §2 RBAC | JWT bearer tokens against Raft-managed RBAC policies | [ADR 018](../adr/018_dual_ca_mtls_identity_authorization.md), [ADR 021](../adr/021_tenant_aware_architecture_day_one.md) | Superseded: identity is the client certificate's OID extension; bearer tokens are not a primary credential. |
-> | §3 Resource Quotas | Token-bucket IOPS + storage-byte aggregation with `QUOTA_EXCEEDED` rejection | [ADR 021](../adr/021_tenant_aware_architecture_day_one.md) | Retained in shape; aligned to the best-effort-at-margin contract (admission-time soft-reject, Raft-authoritative accounting, periodic reconciliation). |
+> | §1 Logical Isolation | Shared ring with `Hash(NamespaceID \|\| RawKey)` routing | [ADR 021](../adr/0021_tenant_aware_architecture_day_one.md) | Superseded: per-tenant first-class keyspaces with `tenant_id` entering the hash input; logical structures (compaction, quotas, KEK bindings) are separate data structures keyed by `tenant_id` rather than prefixes on a shared keyspace. |
+> | §2 RBAC | JWT bearer tokens against Raft-managed RBAC policies | [ADR 018](../adr/0018_dual_ca_mtls_identity_authorization.md), [ADR 021](../adr/0021_tenant_aware_architecture_day_one.md) | Superseded: identity is the client certificate's OID extension; bearer tokens are not a primary credential. |
+> | §3 Resource Quotas | Token-bucket IOPS + storage-byte aggregation with `QUOTA_EXCEEDED` rejection | [ADR 021](../adr/0021_tenant_aware_architecture_day_one.md) | Retained in shape; aligned to the best-effort-at-margin contract (admission-time soft-reject, Raft-authoritative accounting, periodic reconciliation). |
 >
 > The rewrite below is the canonical operational guidance. Wave 2 (ADRs 018/019/020) and Wave 3 (ADR 021) are the authoritative architectural sources.
 
@@ -18,7 +18,7 @@ Wendelon backs massive platforms (Polariton/Baryon) that may host thousands of d
 
 Each tenant owns an independent *logical* keyspace. Keys in tenant A cannot collide with keys in tenant B; every logical structure above the ring (compaction queues, quota counters, Tenant KEK bindings, audit streams) is keyed by `tenant_id` as a first-class dimension, not by a prefix on a shared keyspace.
 
-**Day-one routing function** (on the unified ring from [ADR 002](../adr/002_unified_hash_ring.md)):
+**Day-one routing function** (on the unified ring from [ADR 002](../adr/0002_unified_hash_ring.md)):
 
 ```
 place(tenant_id, key) = nodes_with_data_capability(Hash(tenant_id || key))
@@ -40,7 +40,7 @@ This is a refinement of the unified ring, not a second ring. `tenant_id` enters 
 
 ## 2. Identity and Authorization
 
-Identity and authorization come from the mTLS handshake; see [ADR 018](../adr/018_dual_ca_mtls_identity_authorization.md) for the full model. This section covers the tenant-specific pieces.
+Identity and authorization come from the mTLS handshake; see [ADR 018](../adr/0018_dual_ca_mtls_identity_authorization.md) for the full model. This section covers the tenant-specific pieces.
 
 ### 2.1 Actor vs. Target Tenant
 
@@ -262,9 +262,9 @@ The orchestration mechanism (cluster-bootstrap RPC vs. well-known state-machine 
 
 ## References
 
-- [ADR 002 — Unified Hash Ring Topology](../adr/002_unified_hash_ring.md)
-- [ADR 018 — Dual-CA mTLS Identity and OID-Bound Authorization](../adr/018_dual_ca_mtls_identity_authorization.md)
-- [ADR 019 — Cipher Selection and FIPS Posture](../adr/019_cipher_selection_and_fips_posture.md)
-- [ADR 020 — L2 Envelope Encryption and DEK Lifecycle](../adr/020_l2_envelope_encryption_and_dek_lifecycle.md)
-- [ADR 021 — Tenant-Aware Architecture from Day One](../adr/021_tenant_aware_architecture_day_one.md)
+- [ADR 002 — Unified Hash Ring Topology](../adr/0002_unified_hash_ring.md)
+- [ADR 018 — Dual-CA mTLS Identity and OID-Bound Authorization](../adr/0018_dual_ca_mtls_identity_authorization.md)
+- [ADR 019 — Cipher Selection and FIPS Posture](../adr/0019_cipher_selection_and_fips_posture.md)
+- [ADR 020 — L2 Envelope Encryption and DEK Lifecycle](../adr/0020_l2_envelope_encryption_and_dek_lifecycle.md)
+- [ADR 021 — Tenant-Aware Architecture from Day One](../adr/0021_tenant_aware_architecture_day_one.md)
 - `plans/ops/lifecycle.md` — default-tenant bootstrap mechanism

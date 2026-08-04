@@ -1,6 +1,6 @@
 # Secondary Indexes Runbook
 
-ADR: `plans/adr/052_secondary_indexes.md`
+ADR: `plans/adr/0052_secondary_indexes.md`
 
 ## When to Use This
 

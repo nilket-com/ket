@@ -2719,10 +2719,10 @@ fn test_adr053_wire_ipc_compression_architecture_guards() {
 		}
 	}
 	let bench_results =
-		manifest_dir.join("plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md");
+		manifest_dir.join("plans/impl/0053_wire_arrow_ipc_body_compression_bench_results.md");
 	if !bench_results.exists() {
 		violations.push(
-			"plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md is missing"
+			"plans/impl/0053_wire_arrow_ipc_body_compression_bench_results.md is missing"
 				.to_string(),
 		);
 	} else {
@@ -2734,7 +2734,7 @@ fn test_adr053_wire_ipc_compression_architecture_guards() {
 		] {
 			if !bench_results.contains(required) {
 				violations.push(format!(
-					"plans/impl/053_wire_arrow_ipc_body_compression_bench_results.md: missing ADR 053 bench-results token {required}"
+					"plans/impl/0053_wire_arrow_ipc_body_compression_bench_results.md: missing ADR 053 bench-results token {required}"
 				));
 			}
 		}
@@ -3101,7 +3101,7 @@ fn adr054_cdc_subscription_substrate_contract() {
 		}
 	}
 	let bench_results = fs::read_to_string(
-		manifest_dir.join("plans/impl/054_cdc_subscription_substrate_bench_results.md"),
+		manifest_dir.join("plans/impl/0054_cdc_subscription_substrate_bench_results.md"),
 	)
 	.unwrap();
 	for required in [
@@ -3119,7 +3119,7 @@ fn adr054_cdc_subscription_substrate_contract() {
 	] {
 		if !bench_results.contains(required) {
 			violations.push(format!(
-				"plans/impl/054_cdc_subscription_substrate_bench_results.md: missing ADR 054 bench-results token {required}"
+				"plans/impl/0054_cdc_subscription_substrate_bench_results.md: missing ADR 054 bench-results token {required}"
 			));
 		}
 	}
@@ -3786,11 +3786,11 @@ fn test_adr062_row_group_sizing_profile_guards() {
 	let config = fs::read_to_string(manifest_dir.join("src/config.rs")).unwrap();
 	let example = fs::read_to_string(manifest_dir.join("examples/wendelon.toml.example")).unwrap();
 	let adr056 = fs::read_to_string(
-		manifest_dir.join("plans/adr/056_row_group_fetch_and_page_directory.md"),
+		manifest_dir.join("plans/adr/0056_row_group_fetch_and_page_directory.md"),
 	)
 	.unwrap();
 	let bench_results = fs::read_to_string(
-		manifest_dir.join("plans/impl/062_row_group_sizing_profile_bench_results.md"),
+		manifest_dir.join("plans/impl/0062_row_group_sizing_profile_bench_results.md"),
 	)
 	.unwrap();
 
@@ -3865,7 +3865,7 @@ fn test_adr062_row_group_sizing_profile_guards() {
 	}
 
 	if !adr056.contains("ADR 062 row-group sizing profile is now implemented and") {
-		violations.push("plans/adr/056_row_group_fetch_and_page_directory.md: missing ADR 062 amendment reference".to_string());
+		violations.push("plans/adr/0056_row_group_fetch_and_page_directory.md: missing ADR 062 amendment reference".to_string());
 	}
 
 	for required in [
@@ -3878,7 +3878,7 @@ fn test_adr062_row_group_sizing_profile_guards() {
 	] {
 		if !bench_results.contains(required) {
 			violations.push(format!(
-				"plans/impl/062_row_group_sizing_profile_bench_results.md: missing ADR 062 bench token {required}"
+				"plans/impl/0062_row_group_sizing_profile_bench_results.md: missing ADR 062 bench token {required}"
 			));
 		}
 	}
@@ -4674,7 +4674,7 @@ fn test_adr059_native_cocd_kernel_guards() {
 	let manager = manager_source(manifest_dir);
 	let bench = fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
 	let bench_artifact = fs::read_to_string(
-		manifest_dir.join("plans/impl/059_native_cocd_kernels_bench_results.md"),
+		manifest_dir.join("plans/impl/0059_native_cocd_kernels_bench_results.md"),
 	)
 	.unwrap_or_default();
 
@@ -4885,7 +4885,7 @@ fn test_adr059_native_cocd_kernel_guards() {
 	] {
 		if !bench_artifact.contains(required) {
 			violations.push(format!(
-				"plans/impl/059_native_cocd_kernels_bench_results.md: missing ADR 059 evidence token {required}"
+				"plans/impl/0059_native_cocd_kernels_bench_results.md: missing ADR 059 evidence token {required}"
 			));
 		}
 	}
@@ -5034,9 +5034,10 @@ fn test_adr067_row_safe_fsst_guards() {
 		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
 	let row_group_fetch_bench =
 		fs::read_to_string(manifest_dir.join("benches/row_group_fetch.rs")).unwrap();
-	let bench_results =
-		fs::read_to_string(manifest_dir.join("plans/impl/067_row_canonical_fsst_bench_results.md"))
-			.unwrap_or_default();
+	let bench_results = fs::read_to_string(
+		manifest_dir.join("plans/impl/0067_row_canonical_fsst_bench_results.md"),
+	)
+	.unwrap_or_default();
 
 	for required in [
 		"FsstRowSafe = 9",
@@ -5056,7 +5057,7 @@ fn test_adr067_row_safe_fsst_guards() {
 	// The original Phase 1 architecture guard pinned the opposite (kept it
 	// out of defaults pending Phase 7 evidence); the council promoted it
 	// default-on per the Phase 7 promotion-gate evidence in
-	// plans/impl/067_row_canonical_fsst_bench_results.md.
+	// plans/impl/0067_row_canonical_fsst_bench_results.md.
 	if !encoding_types.contains("Self::FsstRowSafe,\n\t];")
 		&& !encoding_types.contains("Self::FsstRowSafe,\r\n\t];")
 	{
@@ -5164,7 +5165,7 @@ fn test_adr067_row_safe_fsst_guards() {
 	] {
 		if !bench_results.contains(required) {
 			violations.push(format!(
-				"plans/impl/067_row_canonical_fsst_bench_results.md: missing ADR 067 evidence token {required}"
+				"plans/impl/0067_row_canonical_fsst_bench_results.md: missing ADR 067 evidence token {required}"
 			));
 		}
 	}
@@ -5408,11 +5409,11 @@ fn test_adr069_encoded_validity_sparse_projection_guards() {
 	let encoding_compute_bench =
 		fs::read_to_string(manifest_dir.join("benches/encoding_compute.rs")).unwrap();
 	let bench_results = fs::read_to_string(
-		manifest_dir.join("plans/impl/069_encoded_validity_sparse_projection_bench_results.md"),
+		manifest_dir.join("plans/impl/0069_encoded_validity_sparse_projection_bench_results.md"),
 	)
 	.unwrap_or_default();
 	let adr064 =
-		fs::read_to_string(manifest_dir.join("plans/adr/064_nullable_sparse_projection.md"))
+		fs::read_to_string(manifest_dir.join("plans/adr/0064_nullable_sparse_projection.md"))
 			.unwrap();
 	let roadmap = fs::read_to_string(manifest_dir.join("plans/wip/roadmap.md")).unwrap();
 
@@ -5626,7 +5627,7 @@ fn test_adr069_encoded_validity_sparse_projection_guards() {
 	] {
 		if !bench_results.contains(required) {
 			violations.push(format!(
-				"plans/impl/069_encoded_validity_sparse_projection_bench_results.md: missing ADR 069 evidence token {required}"
+				"plans/impl/0069_encoded_validity_sparse_projection_bench_results.md: missing ADR 069 evidence token {required}"
 			));
 		}
 	}
@@ -5637,12 +5638,12 @@ fn test_adr069_encoded_validity_sparse_projection_guards() {
 	] {
 		if !adr064.contains(required) {
 			violations.push(format!(
-				"plans/adr/064_nullable_sparse_projection.md: missing ADR 069 closure token {required}"
+				"plans/adr/0064_nullable_sparse_projection.md: missing ADR 069 closure token {required}"
 			));
 		}
 	}
 	for required in [
-		"plans/impl/069_encoded_validity_sparse_projection_bench_results.md",
+		"plans/impl/0069_encoded_validity_sparse_projection_bench_results.md",
 		"Shipped and promoted",
 		"now initializes `Enabled`",
 		"RowGroupRowCountMismatch",
@@ -5694,22 +5695,22 @@ fn test_adr070_all_null_page_skip_sparse_projection_guards() {
 	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
 	let schema_pbc = fs::read_to_string(manifest_dir.join("src/schema/pbc.rs")).unwrap();
 	let adr = fs::read_to_string(
-		manifest_dir.join("plans/adr/070_all_null_page_skip_sparse_projection.md"),
+		manifest_dir.join("plans/adr/0070_all_null_page_skip_sparse_projection.md"),
 	)
 	.unwrap();
 	let adr064 =
-		fs::read_to_string(manifest_dir.join("plans/adr/064_nullable_sparse_projection.md"))
+		fs::read_to_string(manifest_dir.join("plans/adr/0064_nullable_sparse_projection.md"))
 			.unwrap();
 	let adr069 = fs::read_to_string(
-		manifest_dir.join("plans/adr/069_encoded_validity_sparse_projection.md"),
+		manifest_dir.join("plans/adr/0069_encoded_validity_sparse_projection.md"),
 	)
 	.unwrap();
 	let impl_plan = fs::read_to_string(
-		manifest_dir.join("plans/impl/070_all_null_page_skip_sparse_projection.md"),
+		manifest_dir.join("plans/impl/0070_all_null_page_skip_sparse_projection.md"),
 	)
 	.unwrap();
 	let bench_results = fs::read_to_string(
-		manifest_dir.join("plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md"),
+		manifest_dir.join("plans/impl/0070_all_null_page_skip_sparse_projection_bench_results.md"),
 	)
 	.unwrap();
 
@@ -5810,21 +5811,21 @@ fn test_adr070_all_null_page_skip_sparse_projection_guards() {
 	] {
 		if !adr.contains(required) {
 			violations.push(format!(
-				"plans/adr/070_all_null_page_skip_sparse_projection.md: missing ADR 070 convergence token {required}"
+				"plans/adr/0070_all_null_page_skip_sparse_projection.md: missing ADR 070 convergence token {required}"
 			));
 		}
 	}
 	for required in ["ADR 070 later", "closes this deferral"] {
 		if !adr064.contains(required) {
 			violations.push(format!(
-				"plans/adr/064_nullable_sparse_projection.md: missing ADR 070 closure token {required}"
+				"plans/adr/0064_nullable_sparse_projection.md: missing ADR 070 closure token {required}"
 			));
 		}
 	}
 	for required in ["closed by ADR 070", "metadata-all-null reader path"] {
 		if !adr069.contains(required) {
 			violations.push(format!(
-				"plans/adr/069_encoded_validity_sparse_projection.md: missing ADR 070 boundary-closure token {required}"
+				"plans/adr/0069_encoded_validity_sparse_projection.md: missing ADR 070 boundary-closure token {required}"
 			));
 		}
 	}
@@ -5836,7 +5837,7 @@ fn test_adr070_all_null_page_skip_sparse_projection_guards() {
 	] {
 		if !impl_plan.contains(required) {
 			violations.push(format!(
-				"plans/impl/070_all_null_page_skip_sparse_projection.md: missing ADR 070 implementation token {required}"
+				"plans/impl/0070_all_null_page_skip_sparse_projection.md: missing ADR 070 implementation token {required}"
 			));
 		}
 	}
@@ -5851,7 +5852,7 @@ fn test_adr070_all_null_page_skip_sparse_projection_guards() {
 	] {
 		if !bench_results.contains(required) {
 			violations.push(format!(
-				"plans/impl/070_all_null_page_skip_sparse_projection_bench_results.md: missing ADR 070 evidence token {required}"
+				"plans/impl/0070_all_null_page_skip_sparse_projection_bench_results.md: missing ADR 070 evidence token {required}"
 			));
 		}
 	}
@@ -6053,7 +6054,7 @@ fn test_adr061_authenticated_chunk_layout_guards() {
 		fs::read_to_string(manifest_dir.join("tests/crypto_macro_block_coalescing.rs")).unwrap();
 	let bench_results = fs::read_to_string(
 		manifest_dir
-			.join("plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md"),
+			.join("plans/impl/0061_page_aligned_authenticated_chunk_layout_bench_results.md"),
 	)
 	.unwrap();
 
@@ -6193,7 +6194,7 @@ fn test_adr061_authenticated_chunk_layout_guards() {
 	] {
 		if !bench_results.contains(required) {
 			violations.push(format!(
-				"plans/impl/061_page_aligned_authenticated_chunk_layout_bench_results.md: missing ADR 061 token {required}"
+				"plans/impl/0061_page_aligned_authenticated_chunk_layout_bench_results.md: missing ADR 061 token {required}"
 			));
 		}
 	}
@@ -7015,7 +7016,7 @@ fn adr073_table_query_cancel_is_wendelon_home_producer_only() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
 	let data_server = data_server_workspace_source();
 	let adr060 =
-		read_workspace("crates/toron/plans/adr/060_wendelon_table_query_cancellation_consumer.md");
+		read_workspace("crates/toron/plans/adr/0060_wendelon_table_query_cancellation_consumer.md");
 	assert!(schema.contains("pub struct TableQueryRequestId"));
 	assert!(data_server.contains("ActiveTableQueryRegistry"));
 	assert!(adr060.contains("073 remains producer"));
@@ -7308,7 +7309,7 @@ fn adr073_no_writes_cdc_admin_agg_or_legacy_query_scope() {
 #[test]
 fn adr073_toron_storage_scan_consumer_claim_is_retargeted_by_adr060() {
 	let adr060 =
-		read_workspace("crates/toron/plans/adr/060_wendelon_table_query_cancellation_consumer.md");
+		read_workspace("crates/toron/plans/adr/0060_wendelon_table_query_cancellation_consumer.md");
 	let storage = read_workspace("crates/toron/src/storage.rs");
 	let cancellation = read_workspace("crates/toron/src/distributed/cancellation.rs");
 	assert!(adr060.contains("Toron consumer of Wendelon 073"));

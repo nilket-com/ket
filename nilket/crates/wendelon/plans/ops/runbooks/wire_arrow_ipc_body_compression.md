@@ -1,6 +1,6 @@
 # ADR 053 Wire Arrow IPC Body Compression
 
-ADR: `plans/adr/053_wire_arrow_ipc_body_compression.md`
+ADR: `plans/adr/0053_wire_arrow_ipc_body_compression.md`
 
 Use this runbook during ADR 053 rollout, when
 `network_compression_*` metrics move unexpectedly, or when a

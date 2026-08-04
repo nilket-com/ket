@@ -446,7 +446,7 @@ pub(crate) fn adr059_wendelon_storage_cancellation_claim_is_retargeted_and_metri
 		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
 			.expect("read observability");
 	let adr060 = std::fs::read_to_string(
-		manifest_dir().join("plans/adr/060_wendelon_table_query_cancellation_consumer.md"),
+		manifest_dir().join("plans/adr/0060_wendelon_table_query_cancellation_consumer.md"),
 	)
 	.expect("read adr060");
 
@@ -900,7 +900,7 @@ pub(crate) fn adr060_no_control_ring_uni_stream_sidecar_or_sql_grammar() {
 pub(crate) fn adr060_retargets_adr059_no_wendelon_claim_narrowly() {
 	let adr059_guard = architecture_corpus_source();
 	let adr060 = std::fs::read_to_string(
-		manifest_dir().join("plans/adr/060_wendelon_table_query_cancellation_consumer.md"),
+		manifest_dir().join("plans/adr/0060_wendelon_table_query_cancellation_consumer.md"),
 	)
 	.expect("read adr060");
 

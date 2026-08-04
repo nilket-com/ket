@@ -132,6 +132,6 @@ protocol identifiers.
 - `plans/philosophy.md` — "Linguistic Forbidden Zones" section
   on `Control Plane` / `Data Plane`; same enforcement pattern,
   applied to a different forbidden vocabulary.
-- `plans/adr/041_protocol_naming_decoupling.md` — ADR
+- `plans/adr/0041_protocol_naming_decoupling.md` — ADR
   establishing this convention, with the migration plan for
   existing brand-leaked identifiers.

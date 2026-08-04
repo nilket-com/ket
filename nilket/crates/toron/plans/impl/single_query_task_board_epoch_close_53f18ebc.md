@@ -17,7 +17,7 @@ Activated, default-on: ADR 511 (filtered build-side swap), 512 (reachable-key re
 routing), 518 (semi-filtered reachable keys), 521 (outer count preaggregation on proven keys,
 via the 519 red → 520 uniqueness-evidence infrastructure → 521 reopening arc). Board effect:
 roughly 8x one-thread DuckDB before ADR 511, ~6.4x after 512, **4.2x** at the canonical
-post-521 snapshot (`521_three_engine_board_post_activation_results.md`), with q17
+post-521 snapshot (`0521_three_engine_board_post_activation_results.md`), with q17
 35.5 → 4.2 s, q18 21 → 7.5 s, q21 16.3 → 12.5 s, q08 7.9 → 3.9 s, q09 12.9 → 8.6 s,
 q20 8.7 → 2.0 s, q13 8.5 → 3.1 s and spill eliminated everywhere except q21's 27 MB.
 

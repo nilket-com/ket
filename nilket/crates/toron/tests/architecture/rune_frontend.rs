@@ -760,7 +760,7 @@ pub(crate) fn adr116_rune_unordered_take_surface_registered() {
 #[test]
 pub(crate) fn adr115_rune_boundaries_are_authorial_not_sql_sugar() {
 	let adr =
-		std::fs::read_to_string(manifest_dir().join("plans/adr/115_composable_ordered_top_k.md"))
+		std::fs::read_to_string(manifest_dir().join("plans/adr/0115_composable_ordered_top_k.md"))
 			.expect("read ADR 115");
 	let tests = rune_relation_handles_test_source();
 

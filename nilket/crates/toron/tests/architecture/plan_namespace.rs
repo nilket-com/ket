@@ -17,7 +17,7 @@ fn post_census_adr_and_impl_slugs_match() {
 	assert!(
 		errors.is_empty(),
 		"post-census TORON ADR/implementation slugs diverged:\n{}\n\
-		 see plans/impl/535_global_sort_barrier_completion.md",
+		 see plans/impl/0535_global_sort_barrier_completion.md",
 		errors.join("\n")
 	);
 }
@@ -25,7 +25,7 @@ fn post_census_adr_and_impl_slugs_match() {
 #[test]
 fn post_census_namespace_guard_rejects_a_mismatched_pair() {
 	let errors = namespace_mismatches(
-		&["535_global_sort_barrier_completion.md".to_string()],
+		&["0535_global_sort_barrier_completion.md".to_string()],
 		&["535_sort_barrier_other_name.md".to_string()],
 	);
 
@@ -39,13 +39,13 @@ fn implementation_only_ids_and_historical_companions_are_valid() {
 	let errors = namespace_mismatches(
 		&[
 			"527_old_name.md".to_string(),
-			"528_fragment_capability_census.md".to_string(),
+			"0528_fragment_capability_census.md".to_string(),
 		],
 		&[
 			"527_different_old_name.md".to_string(),
-			"528_fragment_capability_census.md".to_string(),
+			"0528_fragment_capability_census.md".to_string(),
 			"528_fragment_capability_census_results.md".to_string(),
-			"530_dogfood_loop.md".to_string(),
+			"0530_dogfood_loop.md".to_string(),
 		],
 	);
 

@@ -175,7 +175,7 @@ Escalate if:
 
 ## References
 
-- `plans/adr/043_arrow_ipc_body_compression.md`
-- `plans/impl/043_arrow_ipc_body_compression.md`
-- `plans/impl/042_analytical_multi_row_fragments.md`
+- `plans/adr/0043_arrow_ipc_body_compression.md`
+- `plans/impl/0043_arrow_ipc_body_compression.md`
+- `plans/impl/0042_analytical_multi_row_fragments.md`
 - `plans/ops/observability.md`

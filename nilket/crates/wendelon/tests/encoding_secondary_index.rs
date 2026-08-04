@@ -99,7 +99,7 @@ fn secondary_index_adr066_fsst_confirm_step_status_is_explicit() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let manager = rust_identifiers(root, "src/storage/manager.rs", false);
 	let manager_with_tests = rust_identifiers(root, "src/storage/manager.rs", true);
-	let impl_plan = fs::read_to_string(root.join("plans/impl/066_fsst_evaluator.md")).unwrap();
+	let impl_plan = fs::read_to_string(root.join("plans/impl/0066_fsst_evaluator.md")).unwrap();
 
 	assert!(
 		has_identifier(

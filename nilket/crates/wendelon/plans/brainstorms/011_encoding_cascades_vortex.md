@@ -3,7 +3,7 @@
 ## Scope note (post-043 split)
 
 V1.5 — *enable Arrow IPC's native `BodyCompression` (LZ4)* —
-**shipped as ADR 043** (`plans/adr/043_arrow_ipc_body_compression.md`).
+**shipped as ADR 043** (`plans/adr/0043_arrow_ipc_body_compression.md`).
 Per-table opt-in, layout-driven default
 (`MultiRow → Lz4Frame`, `SingleRow → Uncompressed`), readers
 trust the Arrow IPC FlatBuffer for format authority, single

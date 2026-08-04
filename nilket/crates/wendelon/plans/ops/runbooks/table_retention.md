@@ -1,6 +1,6 @@
 # Table Retention Runbook
 
-ADR: `plans/adr/048_per_table_retention_policy.md`
+ADR: `plans/adr/0048_per_table_retention_policy.md`
 
 ## Scope
 

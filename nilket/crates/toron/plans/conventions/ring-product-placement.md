@@ -41,7 +41,7 @@ Composition):
   - Toron-ring → `crates/toron/plans/adr/` (Toron's home sequence
     *is* the aggregator location — see the nuance below).
   - Wendelon-ring → `crates/wendelon/plans/adr/` (e.g.
-    `071_nilket_wendelon_inspect_real_wiring.md`). Guards/fixtures
+    `0071_nilket_wendelon_inspect_real_wiring.md`). Guards/fixtures
     land in `crates/wendelon/tests/`.
 - **Placement follows code-locality + server-side parentage, not
   process-locality.** If all the code lands in one ring's crate

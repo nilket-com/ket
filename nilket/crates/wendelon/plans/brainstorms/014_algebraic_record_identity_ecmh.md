@@ -19,7 +19,7 @@ into the project's lifecycle validation pass:
   Composes with ADR 047 pair-GC under per-table retention
   floors. Second consumer.
 
-ADR 046's bench results (`plans/impl/046_state_digest_bench_results.md`,
+ADR 046's bench results (`plans/impl/0046_state_digest_bench_results.md`,
 2026-04-28) cleared the cut-2 promotion gate: per-element
 Ristretto path 121k–141k/sec/core (above the 45–60k/sec/core
 target), projection-plus-batched 5.4M/sec at 1M rows,
@@ -93,10 +93,10 @@ to node identity. See the status header in
 
 ### References
 
-- ADR 046 (`plans/adr/046_state_digest_substrate.md`) and
+- ADR 046 (`plans/adr/0046_state_digest_substrate.md`) and
   impl plan + bench results.
-- ADR 047 (`plans/adr/047_row_tombstones_append_only.md`).
-- ADR 048 (`plans/adr/048_per_table_retention_policy.md`).
+- ADR 047 (`plans/adr/0047_row_tombstones_append_only.md`).
+- ADR 048 (`plans/adr/0048_per_table_retention_policy.md`).
 - Brainstorm 015 closure (status header in
   `plans/brainstorms/015_algebraic_ring_topology_prime_group.md`).
 - `plans/wip/roadmap.md` — forward sequence past the lifecycle

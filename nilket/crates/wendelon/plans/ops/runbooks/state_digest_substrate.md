@@ -66,7 +66,7 @@ The bench prints one line per case:
   comparison only.
 
 The cut-2 reference run is recorded in
-`plans/impl/046_state_digest_bench_results.md`.
+`plans/impl/0046_state_digest_bench_results.md`.
 
 Cut 3 also adds a test-only multi-row smoke proving the visible digest
 does not change when the same logical rows are packed under different

@@ -1,6 +1,6 @@
 # LSM Compaction Runbook
 
-ADR: `plans/adr/055_lsm_leveled_compaction_substrate.md`
+ADR: `plans/adr/0055_lsm_leveled_compaction_substrate.md`
 
 ## When to Use This
 

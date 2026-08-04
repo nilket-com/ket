@@ -340,6 +340,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/scalar_reduction_test.rs",
 				// ADR 521: proof-gated outer-count structural and equivalence battery.
 				"crates/toron/tests/outer_count_preaggregation_test.rs",
+				// Plan filenames are zero-padded to four digits; this README documents a
+				// command whose argument is one of the renamed implementation docs.
+				"crates/toron/scripts/bench/README.md",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

@@ -321,7 +321,7 @@ pub(crate) fn adr065_audit_schema_version_is_preserved() {
 #[test]
 pub(crate) fn adr065_observability_namespace_reserves_future_telemetry_facet() {
 	let adr = std::fs::read_to_string(
-		manifest_dir().join("plans/adr/065_observability_namespace_audit_substrate.md"),
+		manifest_dir().join("plans/adr/0065_observability_namespace_audit_substrate.md"),
 	)
 	.expect("read ADR 065");
 	let lib = std::fs::read_to_string(workspace_root_dir().join("crates/observability/src/lib.rs"))
@@ -1577,7 +1577,7 @@ pub(crate) fn adr072_no_new_sql_error_or_task_failure_enum_variant() {
 
 #[test]
 pub(crate) fn adr072_response_gating_not_side_effect_gating_documented() {
-	let adr = std::fs::read_to_string(manifest_dir().join("plans/adr/072_audit_fail_closed.md"))
+	let adr = std::fs::read_to_string(manifest_dir().join("plans/adr/0072_audit_fail_closed.md"))
 		.expect("read ADR 072");
 	let daemon =
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");

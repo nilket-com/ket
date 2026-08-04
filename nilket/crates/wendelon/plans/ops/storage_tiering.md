@@ -4,12 +4,12 @@
 >
 > | Prior §  | Prior position | Superseding / amending ADR(s) | Outcome |
 > |----------|----------------|-------------------------------|---------|
-> | §1 Storage Engine Trait | `LocalSlabStore` + `RemoteObjectStore` ad-hoc shape | [ADR 022](../adr/022_l2_slab_format_footer_indexed_range_reads.md) | Replaced: canonical `ObjectStore` trait (one coordinated break) covers `head`, `get`, `get_range`, `put`, `put_multipart`, `delete`, `list`, `copy`. |
-> | §2 Slab Geometry (1 GB slabs, 16 MB range-read chunks) | Slab = 1 GB, logical chunks = 16 MB for range reads | [ADR 022](../adr/022_l2_slab_format_footer_indexed_range_reads.md), [ADR 020](../adr/020_l2_envelope_encryption_and_dek_lifecycle.md) | Superseded: range reads use the footer-embedded offset index (per-record byte offsets into the plaintext stream); the 64 KiB unit inside the slab is the encryption-chunk size (ADR 020), not a range-read unit. Slab size is operator-tunable in `[~16 MiB, 32 GiB]` with `slab_max_bytes = 64 MiB` pilot default. |
-> | §3 Slab Manifest (`#[repr(C)]` POD) | On-NVMe manifest with state enum `{Active, Sealed, Uploading, Stubbed}` | [ADR 023](../adr/023_l2_upload_lifecycle.md) | Superseded: the **authoritative** slab lifecycle lives in the Raft state machine's `tiered_slabs` table (`Pending → Uploaded → Committed → Retired → Reclaimed`, plus `Aborted → Reclaimed`). The on-NVMe manifest survives as a local *summary* that mirrors authoritative fields and records L1-only metadata (temperature, local file descriptor state, per-node L1 presence). Per-node L1 purge is **not** a replicated state — it is a local decision each replica makes after the slab reaches `Committed`. |
-> | §4 Sweeper Policies 1-4 | Sealing / Eviction-Upload / Promotion / E_safe Compaction | [ADR 023](../adr/023_l2_upload_lifecycle.md), [ADR 024](../adr/024_l2_orphan_cleanup_remote_reclaim.md) | Retained in shape; Eviction/Upload now drives the ADR 023 lifecycle transitions and consumes ADR 022's slab format. Reclamation (previously implicit inside "E_safe Compaction") is pulled out into the ADR 024 four-track reclaim sweeper. |
+> | §1 Storage Engine Trait | `LocalSlabStore` + `RemoteObjectStore` ad-hoc shape | [ADR 022](../adr/0022_l2_slab_format_footer_indexed_range_reads.md) | Replaced: canonical `ObjectStore` trait (one coordinated break) covers `head`, `get`, `get_range`, `put`, `put_multipart`, `delete`, `list`, `copy`. |
+> | §2 Slab Geometry (1 GB slabs, 16 MB range-read chunks) | Slab = 1 GB, logical chunks = 16 MB for range reads | [ADR 022](../adr/0022_l2_slab_format_footer_indexed_range_reads.md), [ADR 020](../adr/0020_l2_envelope_encryption_and_dek_lifecycle.md) | Superseded: range reads use the footer-embedded offset index (per-record byte offsets into the plaintext stream); the 64 KiB unit inside the slab is the encryption-chunk size (ADR 020), not a range-read unit. Slab size is operator-tunable in `[~16 MiB, 32 GiB]` with `slab_max_bytes = 64 MiB` pilot default. |
+> | §3 Slab Manifest (`#[repr(C)]` POD) | On-NVMe manifest with state enum `{Active, Sealed, Uploading, Stubbed}` | [ADR 023](../adr/0023_l2_upload_lifecycle.md) | Superseded: the **authoritative** slab lifecycle lives in the Raft state machine's `tiered_slabs` table (`Pending → Uploaded → Committed → Retired → Reclaimed`, plus `Aborted → Reclaimed`). The on-NVMe manifest survives as a local *summary* that mirrors authoritative fields and records L1-only metadata (temperature, local file descriptor state, per-node L1 presence). Per-node L1 purge is **not** a replicated state — it is a local decision each replica makes after the slab reaches `Committed`. |
+> | §4 Sweeper Policies 1-4 | Sealing / Eviction-Upload / Promotion / E_safe Compaction | [ADR 023](../adr/0023_l2_upload_lifecycle.md), [ADR 024](../adr/0024_l2_orphan_cleanup_remote_reclaim.md) | Retained in shape; Eviction/Upload now drives the ADR 023 lifecycle transitions and consumes ADR 022's slab format. Reclamation (previously implicit inside "E_safe Compaction") is pulled out into the ADR 024 four-track reclaim sweeper. |
 >
-> The rewrite below is the canonical operational guidance. [ADR 006](../adr/006_tiered_storage_lazy_migration.md) remains the framing ADR (L0 → L1 → L2, lazy migration); Wave 4 ADRs ([022](../adr/022_l2_slab_format_footer_indexed_range_reads.md), [023](../adr/023_l2_upload_lifecycle.md), [024](../adr/024_l2_orphan_cleanup_remote_reclaim.md)) are the authoritative sources for on-object layout, upload lifecycle, and reclaim.
+> The rewrite below is the canonical operational guidance. [ADR 006](../adr/0006_tiered_storage_lazy_migration.md) remains the framing ADR (L0 → L1 → L2, lazy migration); Wave 4 ADRs ([022](../adr/0022_l2_slab_format_footer_indexed_range_reads.md), [023](../adr/0023_l2_upload_lifecycle.md), [024](../adr/0024_l2_orphan_cleanup_remote_reclaim.md)) are the authoritative sources for on-object layout, upload lifecycle, and reclaim.
 
 Wendelon uses a three-tier storage hierarchy (L0 DRAM, L1 NVMe, L2 Object Storage) driven by an append-only slab allocator and a background Sweeper. Historical data falls out of NVMe onto S3-class object storage; topology changes do **not** trigger eager rebalancing (ADR 006); confidentiality is enforced by client-side envelope encryption (ADR 020).
 
@@ -17,7 +17,7 @@ Wendelon uses a three-tier storage hierarchy (L0 DRAM, L1 NVMe, L2 Object Storag
 
 ## 1. Object-Store Trait Surface
 
-All L2 I/O goes through the canonical `ObjectStore` trait frozen in [ADR 022 §8](../adr/022_l2_slab_format_footer_indexed_range_reads.md). The trait covers three use-case clusters:
+All L2 I/O goes through the canonical `ObjectStore` trait frozen in [ADR 022 §8](../adr/0022_l2_slab_format_footer_indexed_range_reads.md). The trait covers three use-case clusters:
 
 **Object I/O.**
 - `head(key)` — metadata-only fetch; used by orphan-GC triage.
@@ -36,7 +36,7 @@ All L2 I/O goes through the canonical `ObjectStore` trait frozen in [ADR 022 §8
 - `list_parts(key, upload_id, continuation)` — enumerate accepted parts for an in-progress upload (ADR 023 §4 ledger reconciliation).
 - `abort_multipart(key, upload_id)` — free-function abort by id (ADR 024 Track A); equivalent to `MultipartUpload::abort` on a live handle.
 
-Production implementations target AWS S3, GCS, and Azure Blob. The test substrate is [rustfs (ADR 014)](../adr/014_rustfs_test_backend.md); deterministic fault injection uses the mocked `ObjectStore` from [ADR 028](../adr/028_deterministic_simulator_and_asyncfileops_abstraction.md) (planned).
+Production implementations target AWS S3, GCS, and Azure Blob. The test substrate is [rustfs (ADR 014)](../adr/0014_rustfs_test_backend.md); deterministic fault injection uses the mocked `ObjectStore` from [ADR 028](../adr/0028_deterministic_simulator_and_asyncfileops_abstraction.md) (planned).
 
 L1 (NVMe) I/O goes through the `AsyncFileOps` abstraction (ADR 028 planned) wrapping io_uring + `O_DIRECT` (ADR 009). The slab's byte layout is identical on L1 and L2 — L1 writes the slab; the L2 uploader streams the same bytes as one object.
 
@@ -80,7 +80,7 @@ The **local** persistent index (redb per ADR 017) maps `(tenant_id, key_hash) �
 
 ### 3.1 Authoritative Lifecycle (Raft)
 
-The `tiered_slabs` table in the Raft state machine is the authoritative record. Keyed by `slab_id`, each record holds: `slab_id`, `tenant_id`, `state ∈ {Pending, Uploaded, Committed, Retired, Reclaimed, Aborted}`, `target_tier`, `slab_size_bytes`, `wrapped_slab_dek_ref`, `upload_leader_node_id`, `attempt_count`, `created_hlc`, and (once uploaded) `provider_etag` and `provider_uploaded_hlc`. `Retired` adds `retired_hlc` and `retire_reason` ∈ {`compaction_retired`, `retention_expired`, `migration_old_copy`, `tenant_deleted`}. `Aborted` adds `aborted_hlc` and `abort_reason` ∈ {`provider_error_terminal`, `retry_exhausted`, `operator_abort`, `leader_transition`, `orphan_detected`}. See [ADR 023 §1](../adr/023_l2_upload_lifecycle.md) for the full state machine and [ADR 024 decision §2](../adr/024_l2_orphan_cleanup_remote_reclaim.md) for the reclaim transitions.
+The `tiered_slabs` table in the Raft state machine is the authoritative record. Keyed by `slab_id`, each record holds: `slab_id`, `tenant_id`, `state ∈ {Pending, Uploaded, Committed, Retired, Reclaimed, Aborted}`, `target_tier`, `slab_size_bytes`, `wrapped_slab_dek_ref`, `upload_leader_node_id`, `attempt_count`, `created_hlc`, and (once uploaded) `provider_etag` and `provider_uploaded_hlc`. `Retired` adds `retired_hlc` and `retire_reason` ∈ {`compaction_retired`, `retention_expired`, `migration_old_copy`, `tenant_deleted`}. `Aborted` adds `aborted_hlc` and `abort_reason` ∈ {`provider_error_terminal`, `retry_exhausted`, `operator_abort`, `leader_transition`, `orphan_detected`}. See [ADR 023 §1](../adr/0023_l2_upload_lifecycle.md) for the full state machine and [ADR 024 decision §2](../adr/0024_l2_orphan_cleanup_remote_reclaim.md) for the reclaim transitions.
 
 **Local purge is not a replicated state.** After a slab reaches `Committed`, each replica independently decides when to unlink its own L1 copy based on its own NVMe pressure. Per-replica L1 presence is tracked in the node's local redb index (§3.2) and (optionally) gossiped for reader-routing hints; it is **not** recorded in the `tiered_slabs` state.
 
@@ -217,7 +217,7 @@ Every delete is gated by a freshness recheck against the leader's current commit
 
 ## 6. Tenant Integration
 
-- **`tenant_id` is in every durable structure.** Slab header, slab footer, AEAD AAD, `tiered_slabs` record, local redb index key, audit events (ADR 025 planned). See [ADR 021](../adr/021_tenant_aware_architecture_day_one.md).
+- **`tenant_id` is in every durable structure.** Slab header, slab footer, AEAD AAD, `tiered_slabs` record, local redb index key, audit events (ADR 025 planned). See [ADR 021](../adr/0021_tenant_aware_architecture_day_one.md).
 - **Object key naming is deterministic and tenant-prefixed**: `tenant/{tenant_id_hex}/slab/{slab_id_hex}.wnd`. This enables per-tenant prefix-scoped LIST for reclaim Tracks C and D, and aligns with the future per-tenant bucket-routing phase (ADR 021 §8 phase 2).
 - **Storage quota** is accounted at the `Uploaded → Committed` transition in the same Raft commit (ADR 021 §4). The unit is stored ciphertext bytes per logical replica (`plans/ops/multi_tenancy.md` §3.0). Best-effort soft-reject at admission, authoritative counting in Raft, reconciliation-interval-bounded overshoot.
 
@@ -247,15 +247,15 @@ Changes to these belong in ADR supersession or amendment, not in this operationa
 
 ## References
 
-- [ADR 002 — Unified Hash Ring Topology](../adr/002_unified_hash_ring.md)
-- [ADR 006 — Tiered Storage and Lazy Migration](../adr/006_tiered_storage_lazy_migration.md) (framing; extended by 022/023/024)
-- [ADR 009 — io_uring Threading Model](../adr/009_io_uring_threading_model.md)
-- [ADR 014 — rustfs Test Backend](../adr/014_rustfs_test_backend.md)
-- [ADR 017 — Persistent Local Index on redb](../adr/017_persistent_local_index_redb.md)
-- [ADR 019 — Cipher Selection and FIPS Posture](../adr/019_cipher_selection_and_fips_posture.md)
-- [ADR 020 — L2 Envelope Encryption and DEK Lifecycle](../adr/020_l2_envelope_encryption_and_dek_lifecycle.md)
-- [ADR 021 — Tenant-Aware Architecture from Day One](../adr/021_tenant_aware_architecture_day_one.md)
-- [ADR 022 — L2 Slab Format and Footer-Indexed Range Reads](../adr/022_l2_slab_format_footer_indexed_range_reads.md)
-- [ADR 023 — L2 Upload Lifecycle](../adr/023_l2_upload_lifecycle.md)
-- [ADR 024 — L2 Orphan Cleanup and Remote Reclaim](../adr/024_l2_orphan_cleanup_remote_reclaim.md)
-- [ADR 028 — Deterministic Simulator and AsyncFileOps](../adr/028_deterministic_simulator_and_asyncfileops_abstraction.md) (planned)
+- [ADR 002 — Unified Hash Ring Topology](../adr/0002_unified_hash_ring.md)
+- [ADR 006 — Tiered Storage and Lazy Migration](../adr/0006_tiered_storage_lazy_migration.md) (framing; extended by 022/023/024)
+- [ADR 009 — io_uring Threading Model](../adr/0009_io_uring_threading_model.md)
+- [ADR 014 — rustfs Test Backend](../adr/0014_rustfs_test_backend.md)
+- [ADR 017 — Persistent Local Index on redb](../adr/0017_persistent_local_index_redb.md)
+- [ADR 019 — Cipher Selection and FIPS Posture](../adr/0019_cipher_selection_and_fips_posture.md)
+- [ADR 020 — L2 Envelope Encryption and DEK Lifecycle](../adr/0020_l2_envelope_encryption_and_dek_lifecycle.md)
+- [ADR 021 — Tenant-Aware Architecture from Day One](../adr/0021_tenant_aware_architecture_day_one.md)
+- [ADR 022 — L2 Slab Format and Footer-Indexed Range Reads](../adr/0022_l2_slab_format_footer_indexed_range_reads.md)
+- [ADR 023 — L2 Upload Lifecycle](../adr/0023_l2_upload_lifecycle.md)
+- [ADR 024 — L2 Orphan Cleanup and Remote Reclaim](../adr/0024_l2_orphan_cleanup_remote_reclaim.md)
+- [ADR 028 — Deterministic Simulator and AsyncFileOps](../adr/0028_deterministic_simulator_and_asyncfileops_abstraction.md) (planned)
