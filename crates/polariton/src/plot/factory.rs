@@ -257,3 +257,73 @@ pub fn create_authored_plot(
 		height,
 	))
 }
+
+#[cfg(test)]
+mod product_0013_baseline_tests {
+	use super::*;
+	use crate::plot::common::{CoordinateTransformer, ResolvedPlotSettings};
+	use crate::plot::composition::PlotComposition;
+	use crate::plot::export::SvgBackend;
+	use crate::plot::spec::AuthoredPlotSpec;
+	use iced::advanced::mouse::Cursor;
+	use iced::{Point, Rectangle, Size};
+	use polars::df;
+
+	fn render_marks(kernel: &dyn PlotKernel) -> String {
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = SvgBackend::new(100.0, 100.0);
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		backend.finish()
+	}
+
+	fn fixture() -> DataFrame {
+		df!("x" => [1.0, 2.0], "y" => [2.0, 4.0]).expect("frame")
+	}
+
+	#[test]
+	fn product_0013_pre_extraction_line_svg_baseline() {
+		let kernel = create_authored_plot(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y"),
+			&fixture(),
+			100,
+			100,
+		)
+		.expect("line kernel");
+		assert_eq!(
+			render_marks(kernel.as_ref()),
+			concat!(
+				"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+				"<path d=\"M 4.55 95.45 L 95.45 4.55 \" stroke=\"rgb(32, 145, 141)\" stroke-width=\"2\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
+				"</svg>"
+			)
+		);
+	}
+
+	#[test]
+	fn product_0013_pre_extraction_scatter_svg_baseline() {
+		let kernel = create_authored_plot(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&fixture(),
+			100,
+			100,
+		)
+		.expect("scatter kernel");
+		assert_eq!(
+			render_marks(kernel.as_ref()),
+			concat!(
+				"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+				"<path d=\"M 11.33 91.67 A 3.00 3.00 0 1 1 5.33 91.67 A 3.00 3.00 0 1 1 11.33 91.67 Z M 94.67 8.33 A 3.00 3.00 0 1 1 88.67 8.33 A 3.00 3.00 0 1 1 94.67 8.33 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+				"</svg>"
+			)
+		);
+	}
+}

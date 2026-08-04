@@ -164,6 +164,151 @@ impl AuthoredPlotSpec {
 	}
 }
 
+/// A structurally non-empty authored sequence. There is deliberately no
+/// `Default`, empty constructor, or fallible `Vec` conversion: callers must
+/// possess the first layer before a layered plot can exist.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NonEmpty<T> {
+	first: T,
+	rest: Vec<T>,
+}
+
+impl<T> NonEmpty<T> {
+	pub fn new(first: T) -> Self {
+		Self {
+			first,
+			rest: Vec::new(),
+		}
+	}
+
+	pub fn push(&mut self, item: T) {
+		self.rest.push(item);
+	}
+
+	pub fn first(&self) -> &T {
+		&self.first
+	}
+
+	pub fn last(&self) -> &T {
+		self.rest.last().unwrap_or(&self.first)
+	}
+
+	pub fn len(&self) -> usize {
+		1 + self.rest.len()
+	}
+
+	pub fn iter(&self) -> impl Iterator<Item = &T> {
+		std::iter::once(&self.first).chain(&self.rest)
+	}
+
+	pub fn into_parts(self) -> (T, Vec<T>) {
+		(self.first, self.rest)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum LayerMark {
+	Line,
+	Scatter,
+}
+
+impl LayerMark {
+	pub const fn plot_type(self) -> PlotType {
+		match self {
+			Self::Line => PlotType::Line,
+			Self::Scatter => PlotType::Scatter,
+		}
+	}
+
+	pub const fn label(self) -> &'static str {
+		match self {
+			Self::Line => "Line",
+			Self::Scatter => "Scatter",
+		}
+	}
+}
+
+/// PRODUCT-0007 encoding roles owned by one authored layer. This is separate
+/// from `AuthoredPlotSpec`: PRODUCT-0013 adds a second specification and does
+/// not migrate or reshape the established single-plot contract.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerEncoding {
+	pub x: AuthoredChannelSpec,
+	pub y: AuthoredChannelSpec,
+	pub color: OptionalAuthoredChannelSpec,
+	pub color_job: Override<ColorJob>,
+}
+
+impl LayerEncoding {
+	pub fn xy(x: impl Into<String>, y: impl Into<String>) -> Self {
+		Self {
+			x: AuthoredChannelSpec::named(x),
+			y: AuthoredChannelSpec::named(y),
+			color: OptionalAuthoredChannelSpec::absent(),
+			color_job: Override::Inherit,
+		}
+	}
+
+	pub fn automatic() -> Self {
+		Self {
+			x: AuthoredChannelSpec::auto(),
+			y: AuthoredChannelSpec::auto(),
+			color: OptionalAuthoredChannelSpec::auto(),
+			color_job: Override::Inherit,
+		}
+	}
+
+	fn as_authored_plot(&self, mark: LayerMark) -> AuthoredPlotSpec {
+		AuthoredPlotSpec {
+			composition: PlotComposition::single(mark.plot_type()),
+			x: self.x.clone(),
+			y: self.y.clone(),
+			color: self.color.clone(),
+			color_job: self.color_job.clone(),
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerSpec {
+	pub mark: LayerMark,
+	pub encoding: LayerEncoding,
+}
+
+impl LayerSpec {
+	pub fn xy(mark: LayerMark, x: impl Into<String>, y: impl Into<String>) -> Self {
+		Self {
+			mark,
+			encoding: LayerEncoding::xy(x, y),
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayeredPlotSpec {
+	pub layers: NonEmpty<LayerSpec>,
+}
+
+impl LayeredPlotSpec {
+	pub fn new(first: LayerSpec) -> Self {
+		Self {
+			layers: NonEmpty::new(first),
+		}
+	}
+
+	pub fn push(&mut self, layer: LayerSpec) {
+		self.layers.push(layer);
+	}
+
+	pub fn title(&self) -> String {
+		self.layers
+			.iter()
+			.map(|layer| layer.mark.label())
+			.collect::<Vec<_>>()
+			.join(" + ")
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Channel {
 	X,
@@ -233,6 +378,27 @@ pub struct ChannelBinding {
 	kernel_fields: Box<ResolvedKernelFields>,
 	color_job: Option<ColorJob>,
 	categorical_limit: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerChannelBinding {
+	pub mark: LayerMark,
+	binding: ChannelBinding,
+}
+
+impl LayerChannelBinding {
+	pub fn channels(&self) -> &[BoundChannel] {
+		self.binding.channels()
+	}
+
+	pub(crate) fn into_binding(self) -> ChannelBinding {
+		self.binding
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayeredChannelBinding {
+	pub layers: NonEmpty<LayerChannelBinding>,
 }
 
 impl ChannelBinding {
@@ -472,6 +638,67 @@ impl fmt::Display for ChannelError {
 impl std::error::Error for ChannelError {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LayeredPlotError {
+	ColorNotAbsent {
+		layer: usize,
+		authored: String,
+	},
+	Channel {
+		layer: usize,
+		source: ChannelError,
+	},
+	FieldMismatch {
+		layer: usize,
+		channel: Channel,
+		expected: String,
+		actual: String,
+	},
+	ScaleMismatch {
+		layer: usize,
+		channel: Channel,
+		expected: ScaleFamily,
+		actual: ScaleFamily,
+	},
+}
+
+impl fmt::Display for LayeredPlotError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::ColorNotAbsent { layer, authored } => write!(
+				formatter,
+				"layer {} color channel {authored} is unaccepted; ordered shared-Cartesian layers require Absent color",
+				layer + 1
+			),
+			Self::Channel { layer, source } => {
+				write!(formatter, "layer {} could not resolve: {source}", layer + 1)
+			}
+			Self::FieldMismatch {
+				layer,
+				channel,
+				expected,
+				actual,
+			} => write!(
+				formatter,
+				"layer {} {channel} field `{actual}` is incompatible with shared field `{expected}`",
+				layer + 1
+			),
+			Self::ScaleMismatch {
+				layer,
+				channel,
+				expected,
+				actual,
+			} => write!(
+				formatter,
+				"layer {} {channel} scale {actual:?} is incompatible with shared scale family {expected:?}",
+				layer + 1
+			),
+		}
+	}
+}
+
+impl std::error::Error for LayeredPlotError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DomainError {
 	pub channel: Channel,
 	pub field: String,
@@ -594,6 +821,91 @@ pub fn resolve_channels(
 		color_job,
 		categorical_limit: categorical_limit(plot_type),
 	})
+}
+
+/// Resolve every authored layer independently, then apply PRODUCT-0013's
+/// accepted shared-Cartesian compatibility rule atomically.
+pub fn resolve_layered_channels(
+	spec: &LayeredPlotSpec,
+	schema: &Schema,
+) -> Result<LayeredChannelBinding, LayeredPlotError> {
+	let mut resolved = Vec::with_capacity(spec.layers.len());
+	for (ordinal, layer) in spec.layers.iter().enumerate() {
+		let authored_color = match &layer.encoding.color.field {
+			OptionalAuthoredChannel::Absent => None,
+			OptionalAuthoredChannel::Named(field) => Some(format!("`{field}`")),
+			OptionalAuthoredChannel::Auto => Some("<auto>".to_owned()),
+		};
+		if let Some(authored) = authored_color {
+			return Err(LayeredPlotError::ColorNotAbsent {
+				layer: ordinal,
+				authored,
+			});
+		}
+
+		let mut binding = resolve_channels(&layer.encoding.as_authored_plot(layer.mark), schema)
+			.map_err(|source| LayeredPlotError::Channel {
+				layer: ordinal,
+				source,
+			})?;
+		for channel in &mut binding.channels {
+			channel.layer = LayerIdentity {
+				ordinal,
+				plot_type: layer.mark.plot_type(),
+			};
+		}
+		resolved.push(LayerChannelBinding {
+			mark: layer.mark,
+			binding,
+		});
+	}
+
+	let first = resolved
+		.first()
+		.expect("LayeredPlotSpec is structurally non-empty");
+	let shared = [Channel::X, Channel::Y].map(|channel| {
+		let binding = first
+			.channels()
+			.iter()
+			.find(|binding| binding.channel == channel)
+			.expect("line and scatter always resolve x and y channels");
+		(channel, binding.field.clone(), binding.scale)
+	});
+	for (ordinal, layer) in resolved.iter().enumerate().skip(1) {
+		for (channel, expected_field, expected_scale) in &shared {
+			let actual = layer
+				.channels()
+				.iter()
+				.find(|binding| binding.channel == *channel)
+				.expect("line and scatter always resolve x and y channels");
+			if actual.field != *expected_field {
+				return Err(LayeredPlotError::FieldMismatch {
+					layer: ordinal,
+					channel: *channel,
+					expected: expected_field.clone(),
+					actual: actual.field.clone(),
+				});
+			}
+			if actual.scale != *expected_scale {
+				return Err(LayeredPlotError::ScaleMismatch {
+					layer: ordinal,
+					channel: *channel,
+					expected: *expected_scale,
+					actual: actual.scale,
+				});
+			}
+		}
+	}
+
+	let mut resolved = resolved.into_iter();
+	let first = resolved
+		.next()
+		.expect("LayeredPlotSpec is structurally non-empty");
+	let mut layers = NonEmpty::new(first);
+	for layer in resolved {
+		layers.push(layer);
+	}
+	Ok(LayeredChannelBinding { layers })
 }
 
 pub fn resolve_domains(
@@ -1237,6 +1549,155 @@ mod tests {
 		let binding = resolve_channels(spec, result.data.schema().as_ref())
 			.map_err(|error| error.to_string())?;
 		resolve_domains(binding, result, identity).map_err(|error| error.to_string())
+	}
+
+	fn layered(first: LayerSpec, rest: impl IntoIterator<Item = LayerSpec>) -> LayeredPlotSpec {
+		let mut spec = LayeredPlotSpec::new(first);
+		for layer in rest {
+			spec.push(layer);
+		}
+		spec
+	}
+
+	#[test]
+	fn product_0013_layered_spec_is_non_empty_ordered_and_mark_bounded() {
+		let spec = layered(
+			LayerSpec::xy(LayerMark::Line, "x", "y"),
+			[LayerSpec::xy(LayerMark::Scatter, "x", "y")],
+		);
+		assert_eq!(spec.layers.len(), 2);
+		assert_eq!(spec.layers.first().mark, LayerMark::Line);
+		assert_eq!(spec.layers.last().mark, LayerMark::Scatter);
+		assert_eq!(spec.title(), "Line + Scatter");
+		assert_eq!(LayerMark::Line.plot_type(), PlotType::Line);
+		assert_eq!(LayerMark::Scatter.plot_type(), PlotType::Scatter);
+	}
+
+	#[test]
+	fn product_0013_layer_compatibility_names_both_field_identities() {
+		let frame = df!(
+			"x" => [1.0], "y" => [2.0],
+			"other_x" => [3.0], "other_y" => [4.0]
+		)
+		.expect("frame");
+		let schema = frame.schema();
+		for (channel, second) in [
+			(
+				Channel::X,
+				LayerSpec::xy(LayerMark::Scatter, "other_x", "y"),
+			),
+			(
+				Channel::Y,
+				LayerSpec::xy(LayerMark::Scatter, "x", "other_y"),
+			),
+		] {
+			let spec = layered(LayerSpec::xy(LayerMark::Line, "x", "y"), [second]);
+			let error = resolve_layered_channels(&spec, schema.as_ref())
+				.expect_err("different field must refuse");
+			let LayeredPlotError::FieldMismatch {
+				layer,
+				channel: actual_channel,
+				expected,
+				actual,
+			} = &error
+			else {
+				panic!("wrong refusal: {error}");
+			};
+			assert_eq!(*layer, 1);
+			assert_eq!(*actual_channel, channel);
+			assert_eq!(expected, if channel == Channel::X { "x" } else { "y" });
+			assert_eq!(
+				actual,
+				if channel == Channel::X {
+					"other_x"
+				} else {
+					"other_y"
+				}
+			);
+			let message = error.to_string();
+			assert!(message.contains("layer 2"));
+			assert!(message.contains(expected.as_str()));
+			assert!(message.contains(actual.as_str()));
+		}
+	}
+
+	#[test]
+	fn product_0013_layer_scale_families_must_match() {
+		let frame = df!("x" => [1.0], "y" => [2.0]).expect("frame");
+		let schema = frame.schema();
+		let first = LayerSpec::xy(LayerMark::Line, "x", "y");
+		let mut second = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		second.encoding.x.scale = Override::Set(ScaleFamily::Log);
+		let error = resolve_layered_channels(&layered(first, [second]), schema.as_ref())
+			.expect_err("different scale family must refuse");
+		assert!(matches!(
+			error,
+			LayeredPlotError::ScaleMismatch {
+				layer: 1,
+				channel: Channel::X,
+				expected: ScaleFamily::Linear,
+				actual: ScaleFamily::Log,
+			}
+		));
+	}
+
+	#[test]
+	fn product_0013_layer_color_refuses_named_and_auto_with_absent_control() {
+		let frame = df!("x" => [1.0], "y" => [2.0], "series" => ["a"]).expect("frame");
+		let schema = frame.schema();
+		for (field, expected) in [
+			(
+				OptionalAuthoredChannel::Named("series".to_owned()),
+				"`series`",
+			),
+			(OptionalAuthoredChannel::Auto, "<auto>"),
+		] {
+			let mut offending = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+			offending.encoding.color.field = field;
+			let error = resolve_layered_channels(
+				&layered(LayerSpec::xy(LayerMark::Line, "x", "y"), [offending]),
+				schema.as_ref(),
+			)
+			.expect_err("layered color must refuse");
+			assert!(matches!(
+				&error,
+				LayeredPlotError::ColorNotAbsent { layer: 1, authored }
+					if authored == expected
+			));
+			assert!(error.to_string().contains("layer 2"));
+		}
+
+		let control = layered(
+			LayerSpec::xy(LayerMark::Line, "x", "y"),
+			[LayerSpec::xy(LayerMark::Scatter, "x", "y")],
+		);
+		let resolved =
+			resolve_layered_channels(&control, schema.as_ref()).expect("Absent color resolves");
+		assert_eq!(resolved.layers.len(), 2);
+		assert!(resolved.layers.iter().all(|layer| {
+			layer
+				.channels()
+				.iter()
+				.all(|channel| channel.channel != Channel::Color)
+		}));
+	}
+
+	#[test]
+	fn product_0013_layer_channel_failure_is_atomic_and_attributed() {
+		let frame = df!("x" => [1.0], "y" => [2.0]).expect("frame");
+		let schema = frame.schema();
+		let spec = layered(
+			LayerSpec::xy(LayerMark::Line, "x", "y"),
+			[LayerSpec::xy(LayerMark::Scatter, "x", "missing")],
+		);
+		let error = resolve_layered_channels(&spec, schema.as_ref())
+			.expect_err("one bad layer refuses the artifact");
+		let LayeredPlotError::Channel { layer, source } = &error else {
+			panic!("wrong refusal: {error}");
+		};
+		assert_eq!(*layer, 1);
+		assert_eq!(source.field, "missing");
+		assert!(error.to_string().contains("layer 2"));
 	}
 
 	#[test]
