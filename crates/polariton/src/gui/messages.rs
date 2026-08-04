@@ -7,6 +7,8 @@ use crate::editor::EditorMsg;
 use crate::gui::dashboard::DashboardMsg;
 use crate::plot::common::PlotKernel;
 use crate::plot::request::ResolvedPlot;
+#[cfg(feature = "toron")]
+use crate::plot::spec::LayeredPlotSpec;
 use crate::result_registry::PendingPublication;
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{LocalViewIdentity, ViewPresentation};
@@ -123,6 +125,15 @@ pub enum Message {
 		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},
+	#[cfg(feature = "toron")]
+	RuneRelationLayeredPlotReady {
+		source_buffer: BufferId,
+		revision: u64,
+		panel_id: libaryon::engine::HostPanelId,
+		presentation: ViewPresentation,
+		span: std::ops::Range<u32>,
+		result: std::result::Result<Arc<dyn PlotKernel + Send + Sync>, String>,
+	},
 	RunRuneCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,
@@ -172,6 +183,7 @@ pub struct RuneRelationSinkOutcome {
 pub enum RuneRelationSinkOutput {
 	Table,
 	Plot(ResolvedPlot),
+	LayeredPlot(LayeredPlotSpec),
 }
 
 pub use crate::gui::plot_pane::PlotPaneMsg as PlotMessage;

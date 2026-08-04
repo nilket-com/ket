@@ -232,7 +232,6 @@ pub fn create_plot(
 /// Lower PRODUCT-0013's additive layered specification. One layer deliberately
 /// reuses the established kernel path; multiple layers preserve authored order
 /// in the ordered shared-domain composite.
-#[allow(dead_code)] // PRODUCT-0014 supplies the first production caller.
 pub fn create_layered_plot(
 	spec: &LayeredPlotSpec,
 	df: &DataFrame,

@@ -16,7 +16,7 @@ use crate::gui::{
 };
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
-use crate::plot::factory::create_plot;
+use crate::plot::factory::{create_layered_plot, create_plot};
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
 use crate::plot::spec::AuthoredPlotSpec;
@@ -171,6 +171,29 @@ fn build_resolved_plot_task(
 			(resolved, kernel)
 		},
 		move |(resolved, kernel)| on_ready(resolved, kernel),
+	)
+}
+
+#[cfg(feature = "toron")]
+fn build_layered_plot_task(
+	specification: crate::plot::spec::LayeredPlotSpec,
+	source: Arc<DataFrame>,
+	on_ready: impl FnOnce(
+		std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String>,
+	) -> Message
+	+ Send
+	+ 'static,
+) -> Task<Message> {
+	Task::perform(
+		async move {
+			tokio::task::spawn_blocking(move || {
+				create_layered_plot(&specification, source.as_ref(), 1200, 720)
+			})
+			.await
+			.map_err(|error| format!("layered plot build task panicked: {error}"))
+			.and_then(|result| result)
+		},
+		on_ready,
 	)
 }
 
@@ -760,9 +783,9 @@ fn rune_view_outcome(
 					})
 					.map(RuneRelationSinkOutput::Plot)
 				}
-				RuneViewIntent::Plot(crate::rune_relation_envelope::RunePlotIntent::Layered(_)) => {
-					Err("layered plot construction is not connected".to_owned())
-				}
+				RuneViewIntent::Plot(crate::rune_relation_envelope::RunePlotIntent::Layered(
+					specification,
+				)) => Ok(RuneRelationSinkOutput::LayeredPlot(specification)),
 			};
 			RuneRelationSinkOutcome {
 				identity: view.identity,
@@ -1445,6 +1468,22 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 									},
 								));
 							}
+							Ok(RuneRelationSinkOutput::LayeredPlot(specification)) => {
+								let presentation = sink.presentation;
+								let span = sink.span;
+								plot_tasks.push(build_layered_plot_task(
+									specification,
+									sink.source,
+									move |result| Message::RuneRelationLayeredPlotReady {
+										source_buffer,
+										revision,
+										panel_id,
+										presentation,
+										span,
+										result,
+									},
+								));
+							}
 							Err(message) => {
 								let message = format!(
 									"{} at bytes {}..{}: {message}",
@@ -1514,6 +1553,35 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				.code_editor
 				.set_rune_view_plot(panel_id, composition, kernel);
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
+		}
+		#[cfg(feature = "toron")]
+		Message::RuneRelationLayeredPlotReady {
+			source_buffer,
+			revision,
+			panel_id,
+			presentation,
+			span,
+			result,
+		} => {
+			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
+				return Task::none();
+			}
+			match result {
+				Ok(_kernel) => {
+					// Stage 3 connects successful kernels through the label-only host state.
+					app_state.status_msg = format!("Built {}.", presentation.display_label);
+				}
+				Err(error) => {
+					app_state.code_editor.fail_rune_view(panel_id);
+					set_rune_error(
+						app_state,
+						format!(
+							"{} at bytes {}..{}: {error}",
+							presentation.display_label, span.start, span.end
+						),
+					);
+				}
+			}
 		}
 		Message::RunMarkdownCellResult {
 			identity,
@@ -1910,7 +1978,7 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
-	use crate::plot::factory::create_plot;
+	use crate::plot::factory::{create_layered_plot, create_plot};
 	#[cfg(feature = "toron")]
 	use crate::rune_relation_envelope::{
 		LocalViewIdentity, PendingRuneView, RuneViewForm, TransformedRuneRelation,
@@ -2591,6 +2659,89 @@ mod tests {
 			"the plot failure must not replace the sibling table"
 		);
 		assert!(state.status_error.contains("plot.bar at bytes"));
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0014_compatibility_crosses_the_factory_and_returns_to_the_outer_span() {
+		let source = "workspace.table(\"t\").views([layers([line(\"x\", \"y\"), scatter(\"other_x\", \"y\")])])";
+		let relation = transform_rune_view(source)
+			.expect("surface grammar accepts differing fields")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let span = relation.views[0].span.clone();
+		assert_eq!(
+			&source[span.start as usize..span.end as usize],
+			"layers([line(\"x\", \"y\"), scatter(\"other_x\", \"y\")])"
+		);
+		let outcome = rune_view_outcome(
+			polars::df!(
+				"x" => [1.0_f64, 2.0],
+				"other_x" => [3.0_f64, 4.0],
+				"y" => [5.0_f64, 6.0],
+			)
+			.expect("fixture frame"),
+			relation.views,
+		);
+		let [sink] = outcome.sinks.as_slice() else {
+			panic!("one layers sink must remain one outcome")
+		};
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification)) =
+			&sink.output
+		else {
+			panic!("the envelope must hand a layered specification to the head")
+		};
+		let Err(error) = create_layered_plot(specification, sink.source.as_ref(), 1200, 720) else {
+			panic!("PRODUCT-0013 must own incompatible field refusal")
+		};
+		assert!(error.contains("layer 2"));
+		assert!(error.contains("x"));
+		assert!(error.contains("other_x"));
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(74);
+		let revision = 1;
+		state.rune_buffer_revisions.insert(source_buffer, revision);
+		let identity = sink.identity.clone();
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[(identity.clone(), sink.presentation.clone())],
+			revision,
+		);
+		let panel_id = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &identity)
+			.expect("prepared layered destination");
+		drop(update(
+			&mut state,
+			Message::RuneRelationLayeredPlotReady {
+				source_buffer,
+				revision,
+				panel_id,
+				presentation: sink.presentation.clone(),
+				span: span.clone(),
+				result: Err(error.clone()),
+			},
+		));
+		let detail = state.status_detail.as_ref().expect("full Rune diagnostic");
+		assert!(
+			detail
+				.full
+				.contains(&format!("at bytes {}..{}: {error}", span.start, span.end))
+		);
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_failed(source_buffer, &identity)
+		);
+		assert!(
+			!state
+				.code_editor
+				.rune_view_panel_is_plot(source_buffer, &identity)
+		);
+		state.code_editor.shutdown();
 	}
 
 	#[cfg(feature = "toron")]
