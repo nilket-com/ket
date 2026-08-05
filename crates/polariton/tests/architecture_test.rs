@@ -492,7 +492,7 @@ fn product_0010_relation_views_complete_without_dashboard_routing() {
 }
 
 #[test]
-fn product_0017_point_size_is_render_state_without_a_rune_surface() {
+fn product_0018_rune_surface_keeps_point_size_out_of_prepared_data() {
 	let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let scatter = std::fs::read_to_string(source.join("plot/kernels/scatter.rs"))
 		.expect("read scatter kernel");
@@ -503,7 +503,9 @@ fn product_0017_point_size_is_render_state_without_a_rune_surface() {
 	let envelope = std::fs::read_to_string(source.join("rune_relation_envelope.rs"))
 		.expect("read Rune envelope");
 	assert!(
-		!envelope.contains("point_size"),
-		"PRODUCT-0017 must add no Rune spelling before PRODUCT-0018"
+		envelope.contains("\"point_size\"")
+			&& envelope.contains("PointSize::new")
+			&& envelope.contains("LayerSettings"),
+		"PRODUCT-0018 must validate the closed Rune spelling through PRODUCT-0017's typed handoff"
 	);
 }

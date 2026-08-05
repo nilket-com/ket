@@ -8,7 +8,9 @@
 
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
-use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec, Presence};
+use crate::plot::spec::{
+	LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize, Presence,
+};
 use crate::plot::theme::PlotSettingsLayer;
 use libaryon::core::BufferId;
 use rune::ast::{self, Spanned};
@@ -35,6 +37,7 @@ pub(crate) struct RunePlotIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RunePlotBody {
 	Single(DisposableRunePlotSink),
+	StyledSingle(LayerSpec),
 	Layered(LayeredPlotSpec),
 }
 
@@ -106,6 +109,10 @@ impl RuneViewIntent {
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
+					},
+					RunePlotBody::StyledSingle(layer) => match layer.mark {
+						LayerMark::Line => "plot.line".to_owned(),
+						LayerMark::Scatter => "plot.scatter".to_owned(),
 					},
 					RunePlotBody::Layered(plot) => plot.title(),
 				};
@@ -938,6 +945,14 @@ fn parse_contextual_sink_inner(
 	source: &str,
 	allow_identity_wrapper: bool,
 ) -> Result<ParsedSink, RuneEnvelopeError> {
+	if let Some(layer) = parse_modified_mark(expression, source)? {
+		return Ok(ParsedSink {
+			intent: RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(layer))),
+			span: byte_range(expression.span(), source.len())?,
+			name: None,
+			output_order: 0,
+		});
+	}
 	let ast::Expr::Call(call) = expression else {
 		return invalid_view(
 			expression.span(),
@@ -1173,6 +1188,9 @@ fn parse_figure_body(
 	args: &[&ast::Expr],
 	source: &str,
 ) -> Result<RunePlotBody, RuneEnvelopeError> {
+	if let Some(layer) = parse_modified_mark(expression, source)? {
+		return Ok(RunePlotBody::StyledSingle(layer));
+	}
 	let single = |plot_type, message: &str| -> Result<RunePlotBody, RuneEnvelopeError> {
 		let Some(sink) = plot_sink_fields(plot_type, source, args, 0)? else {
 			return invalid_view(expression.span(), source.len(), message);
@@ -1256,6 +1274,9 @@ fn parse_layer_list(
 }
 
 fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEnvelopeError> {
+	if let Some(layer) = parse_modified_mark(expression, source)? {
+		return Ok(layer);
+	}
 	let ast::Expr::Call(call) = expression else {
 		return invalid_view(
 			expression.span(),
@@ -1317,6 +1338,137 @@ fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEn
 		fields.push(value);
 	}
 	Ok(LayerSpec::xy(mark, fields[0].clone(), fields[1].clone()))
+}
+
+/// PRODUCT-0018's closed postfix LayerModifier register. A successful parse
+/// flattens the complete chain directly into one typed `LayerSpec`; no method
+/// node survives into the Rune execution or plot normal form.
+fn parse_modified_mark(
+	expression: &ast::Expr,
+	source: &str,
+) -> Result<Option<LayerSpec>, RuneEnvelopeError> {
+	let ast::Expr::Call(outer_call) = expression else {
+		return Ok(None);
+	};
+	if !matches!(outer_call.expr.as_ref(), ast::Expr::FieldAccess(_)) {
+		return Ok(None);
+	}
+
+	let mut current = expression;
+	let mut point_size = None;
+	loop {
+		let ast::Expr::Call(call) = current else {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"a layer modifier must follow a line(...) or scatter(...) mark",
+			);
+		};
+		let ast::Expr::FieldAccess(field) = call.expr.as_ref() else {
+			break;
+		};
+		let modifier = source_slice(source, field.expr_field.span())?.trim();
+		match modifier {
+			"point_size" => {
+				if point_size.is_some() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"point_size(...) may appear at most once on a mark",
+					);
+				}
+				let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+				let [argument] = args.as_slice() else {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"point_size(...) takes exactly one numeric literal",
+					);
+				};
+				if !matches!(argument, ast::Expr::Lit(lit) if matches!(lit.lit, ast::Lit::Number(_)))
+				{
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"point_size(...) requires a numeric literal",
+					);
+				}
+				let raw = source_slice(source, argument.span())?.replace('_', "");
+				let modifier_span = u32_range(
+					&byte_range(expression.span(), source.len())?,
+					"point-size modifier",
+				)?;
+				let factor = raw
+					.parse::<f32>()
+					.map_err(|_| RuneEnvelopeError::InvalidView {
+						span: modifier_span.clone(),
+						message: "point_size(...) requires an unsuffixed numeric literal"
+							.to_owned(),
+					})?;
+				point_size = Some(PointSize::new(factor).map_err(|error| {
+					RuneEnvelopeError::InvalidView {
+						span: modifier_span,
+						message: error.to_string(),
+					}
+				})?);
+			}
+			_ => {
+				return invalid_view(
+					expression.span(),
+					source.len(),
+					format!("unknown layer modifier {modifier:?}; expected point_size(number)"),
+				);
+			}
+		}
+		current = &field.expr;
+	}
+
+	let ast::Expr::Call(root) = current else {
+		return invalid_view(
+			expression.span(),
+			source.len(),
+			"a layer modifier must follow a line(...) or scatter(...) mark",
+		);
+	};
+	let callee = source_slice(source, root.expr.span())?.trim();
+	let args = root.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+	if callee != "scatter" {
+		return invalid_view(
+			expression.span(),
+			source.len(),
+			if callee == "line" {
+				"point_size(...) is available on scatter marks, not line marks"
+			} else {
+				"a layer modifier must follow a scatter(...) mark"
+			},
+		);
+	}
+	if args.len() != 2 {
+		return invalid_view(
+			expression.span(),
+			source.len(),
+			"a point-sized scatter mark takes exactly x and y string fields; category color is not a Layer setting",
+		);
+	}
+	let mut fields = Vec::with_capacity(2);
+	for field in args {
+		let raw = source_slice(source, field.span())?;
+		let Some(value) = decode_string_literal(raw) else {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"a point-sized scatter mark requires x and y string literals",
+			);
+		};
+		fields.push(value);
+	}
+	let mut layer = LayerSpec::xy(LayerMark::Scatter, fields[0].clone(), fields[1].clone());
+	layer.settings = LayerSettings {
+		point_size: Override::Set(
+			point_size.expect("the outer field-access call supplied one modifier"),
+		),
+	};
+	Ok(Some(layer))
 }
 
 fn parse_sugar_sink(
@@ -2596,6 +2748,149 @@ workspace.table("t").views([table()])
 		let retained = transform(ordinary).expect("figure calls outside views stay ordinary Rune");
 		assert!(retained.source.contains("figure([title(\"ordinary\")"));
 		assert_eq!(retained.views.len(), 1);
+	}
+
+	fn product_0018_only_layer(source: &str) -> LayerSpec {
+		let transformed = transform(source).expect("point-sized scatter envelope");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("point-sized scatter must be a plot")
+		};
+		match &plot.body {
+			RunePlotBody::StyledSingle(layer) => layer.clone(),
+			RunePlotBody::Layered(specification) => specification
+				.layers
+				.iter()
+				.find(|layer| layer.settings.point_size != Override::Inherit)
+				.expect("layered plot contains the styled scatter")
+				.clone(),
+			RunePlotBody::Single(_) => panic!("the modifier must not be discarded"),
+		}
+	}
+
+	#[test]
+	fn product_0018_point_size_flattens_in_every_proven_mark_position() {
+		let layered = product_0018_only_layer(
+			"workspace.table(\"t\").views([layers([line(\"x\", \"y\"), scatter(\"x\", \"y\").point_size(2.0)])])",
+		);
+		let direct = product_0018_only_layer(
+			"workspace.table(\"t\").views([scatter(\"x\", \"y\").point_size(2.0)])",
+		);
+		let figure = product_0018_only_layer(
+			"workspace.table(\"t\").views([figure([title(\"Sized\"), scatter(\"x\", \"y\").point_size(2.0)])])",
+		);
+		for layer in [layered, direct, figure] {
+			assert_eq!(layer.mark, LayerMark::Scatter);
+			assert_eq!(
+				layer.encoding,
+				LayerSpec::xy(LayerMark::Scatter, "x", "y").encoding
+			);
+			assert_eq!(
+				layer.settings.point_size,
+				Override::Set(PointSize::new(2.0).expect("accepted factor"))
+			);
+		}
+	}
+
+	#[test]
+	fn product_0018_point_size_uses_the_substrate_domain_without_clamping() {
+		for factor in ["0.25", "1", "2.0", "8.0"] {
+			let source = format!(
+				"workspace.table(\"t\").views([layers([scatter(\"x\", \"y\").point_size({factor})])])"
+			);
+			let layer = product_0018_only_layer(&source);
+			let Override::Set(size) = layer.settings.point_size else {
+				panic!("accepted source must set point size")
+			};
+			assert_eq!(size.factor(), factor.parse::<f32>().unwrap());
+		}
+
+		for rejected in [
+			"point_size()",
+			"point_size(1.0, 2.0)",
+			"point_size(size)",
+			"point_size(1.0 + 1.0)",
+			"point_size(-1.0)",
+			"point_size(0.0)",
+			"point_size(0.24)",
+			"point_size(8.01)",
+		] {
+			let source = format!(
+				"workspace.table(\"t\").views([layers([scatter(\"x\", \"y\").{rejected}])])"
+			);
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(&source).expect_err("invalid point size must refuse")
+			else {
+				panic!("expected an attributed point-size refusal")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				format!("scatter(\"x\", \"y\").{rejected}")
+			);
+		}
+	}
+
+	#[test]
+	fn product_0018_modifier_register_is_closed_duplicate_free_and_atomic() {
+		for modified in [
+			"scatter(\"x\", \"y\").opacity(0.5)",
+			"scatter(\"x\", \"y\").title(\"wrong level\")",
+			"scatter(\"x\", \"y\").point_size(2.0).point_size(3.0)",
+			"line(\"x\", \"y\").point_size(2.0)",
+			"scatter(\"x\", \"y\", \"cat\").point_size(2.0)",
+		] {
+			let source = format!("workspace.table(\"t\").views([table(), layers([{modified}])])");
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(&source).expect_err("invalid modifier must refuse the whole view set")
+			else {
+				panic!("expected an attributed modifier refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], modified);
+		}
+
+		let category = transform("workspace.table(\"t\").views([scatter(\"x\", \"y\", \"cat\")])")
+			.expect("the established unmodified category scatter remains legal");
+		let RuneViewIntent::Plot(plot) = &category.views[0].intent else {
+			panic!("category scatter remains a plot")
+		};
+		let RunePlotBody::Single(scatter) = &plot.body else {
+			panic!("unmodified category scatter keeps its established body")
+		};
+		assert_eq!(scatter.category.as_deref(), Some("cat"));
+	}
+
+	#[test]
+	fn product_0018_modifier_is_ordinary_rune_outside_proven_positions() {
+		let source = r#"
+			let styled = scatter("x", "y").point_size(2.0);
+			consume(scatter("a", "b").point_size(4.0));
+			workspace.table("t").views([table()])
+		"#;
+		let transformed = transform(source).expect("ordinary method calls are retained");
+		assert!(
+			transformed
+				.source
+				.contains("scatter(\"x\", \"y\").point_size(2.0)")
+		);
+		assert!(
+			transformed
+				.source
+				.contains("scatter(\"a\", \"b\").point_size(4.0)")
+		);
+		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+	}
+
+	#[test]
+	fn product_0018_styled_single_keeps_structural_presentation() {
+		for source in [
+			"workspace.table(\"t\").views([scatter(\"x\", \"y\").point_size(1.0)])",
+			"workspace.table(\"t\").views([figure([scatter(\"x\", \"y\").point_size(2.0)])])",
+		] {
+			let transformed = transform(source).expect("styled single scatter");
+			assert_eq!(
+				transformed.views[0].intent.presentation().display_label,
+				"plot.scatter"
+			);
+		}
 	}
 
 	#[test]

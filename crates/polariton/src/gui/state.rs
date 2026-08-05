@@ -22,6 +22,8 @@ use crate::plot::factory::create_plot;
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
 use crate::plot::spec::AuthoredPlotSpec;
+#[cfg(feature = "toron")]
+use crate::plot::spec::LayeredPlotSpec;
 use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
@@ -791,6 +793,12 @@ fn rune_view_outcome(
 							.map(|resolved| {
 								RuneRelationSinkOutput::Plot(resolved, authored_settings)
 							})
+						}
+						RunePlotBody::StyledSingle(layer) => {
+							Ok(RuneRelationSinkOutput::LayeredPlot(
+								LayeredPlotSpec::new(layer),
+								authored_settings,
+							))
 						}
 						RunePlotBody::Layered(specification) => Ok(
 							RuneRelationSinkOutput::LayeredPlot(specification, authored_settings),

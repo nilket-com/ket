@@ -252,7 +252,7 @@ mod tests {
 						);
 						assert!(backend.finish().contains("<path"));
 					}
-					RunePlotBody::Layered(_) => {
+					RunePlotBody::StyledSingle(_) | RunePlotBody::Layered(_) => {
 						panic!("this legacy fixture contains no layered sink")
 					}
 				},
@@ -357,7 +357,7 @@ mod tests {
 						assert_eq!(kernel.x_label(), expected_x);
 						assert_eq!(kernel.y_label(), expected_y);
 					}
-					RunePlotBody::Layered(_) => {
+					RunePlotBody::StyledSingle(_) | RunePlotBody::Layered(_) => {
 						panic!("this legacy fixture contains no layered sink")
 					}
 				},
