@@ -8,7 +8,7 @@ use crate::configuration::{self, StartupData};
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
 #[cfg(feature = "toron")]
-use crate::gui::table_skin::TableSkin;
+use crate::gui::table_skin::{TableSkin, TableSkinProjection};
 use crate::gui::{
 	components,
 	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
@@ -807,7 +807,8 @@ fn rune_view_outcome(
 				RuneViewIntent::Table(table) => table
 					.skin_name
 					.map_or(Ok(TableSkin::DEFAULT), |name| {
-						TableSkin::from_theme_name(&name).map_err(|error| error.to_string())
+						TableSkin::from_theme_name(&name, TableSkinProjection::Duotone)
+							.map_err(|error| error.to_string())
 					})
 					.map(RuneRelationSinkOutput::Table),
 				RuneViewIntent::Plot(plot) => {
@@ -2109,7 +2110,7 @@ mod tests {
 	use crate::configuration::StartupData;
 	use crate::gui::messages::Message;
 	#[cfg(feature = "toron")]
-	use crate::gui::table_skin::TableSkin;
+	use crate::gui::table_skin::{TableSkin, TableSkinProjection};
 	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
@@ -2948,7 +2949,10 @@ mod tests {
 		else {
 			panic!("styled table must resolve");
 		};
-		assert_eq!(*styled, TableSkin::from_theme_name("terrain_rs10").unwrap());
+		assert_eq!(
+			*styled,
+			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::Duotone).unwrap()
+		);
 		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(default)) =
 			&outcome.sinks[1].output
 		else {
@@ -3004,7 +3008,10 @@ ket.table("test2") // Comment Test1.
 		else {
 			panic!("test1 table must complete with its skin");
 		};
-		assert_eq!(*skin, TableSkin::from_theme_name("terrain_rs10").unwrap());
+		assert_eq!(
+			*skin,
+			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::Duotone).unwrap()
+		);
 		assert!(matches!(
 			first.sinks[1].output,
 			Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(
@@ -3049,7 +3056,8 @@ ket.table("test2") // Comment Test1.
 		let styled = LocalViewIdentity::Named("styled".to_owned());
 		let plain = LocalViewIdentity::Named("plain".to_owned());
 		let bad = LocalViewIdentity::Named("bad".to_owned());
-		let previous_bad_skin = TableSkin::from_theme_name("terrain_r").unwrap();
+		let previous_bad_skin =
+			TableSkin::from_theme_name("terrain_r", TableSkinProjection::Duotone).unwrap();
 
 		let first = program("terrain_rs10");
 		let presentation = first
@@ -3101,7 +3109,7 @@ ket.table("test2") // Comment Test1.
 			state
 				.code_editor
 				.rune_view_panel_table_skin(source_buffer, &styled),
-			Some(TableSkin::from_theme_name("terrain_rs10").unwrap())
+			Some(TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::Duotone).unwrap())
 		);
 		assert_eq!(
 			state
@@ -3171,7 +3179,7 @@ ket.table("test2") // Comment Test1.
 			state
 				.code_editor
 				.rune_view_panel_table_skin(source_buffer, &styled),
-			Some(TableSkin::from_theme_name("terrain_s1").unwrap())
+			Some(TableSkin::from_theme_name("terrain_s1", TableSkinProjection::Duotone).unwrap())
 		);
 		assert_eq!(
 			state.code_editor.rune_view_panel_id(source_buffer, &styled),

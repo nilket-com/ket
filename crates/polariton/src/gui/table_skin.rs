@@ -3,7 +3,7 @@
 //! This model is deliberately independent of editor chrome and plot data ramps.
 
 use libaryon::core::{Rgb, Srgb};
-use libaryon::engine::{ResolvedThemePalette, Theme};
+use libaryon::engine::{ResolvedThemePair, Theme};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TableRgba {
@@ -93,13 +93,32 @@ impl TableSkin {
 	/// assay. Theme-projected skins are validated before construction returns.
 	pub const BUILT_INS: [Self; 1] = [Self::DEFAULT];
 
-	pub fn from_theme_name(name: &str) -> Result<Self, TableSkinProjectionError> {
+	pub fn from_theme_name(
+		name: &str,
+		projection: TableSkinProjection,
+	) -> Result<Self, TableSkinProjectionError> {
 		let theme = Theme::try_new(name).map_err(|_| TableSkinProjectionError::UnknownTheme {
 			name: name.to_owned(),
 		})?;
-		let skin = project_theme_palette(theme.palette());
-		validate_projected_skin(name, skin)?;
-		Ok(skin)
+		match projection {
+			TableSkinProjection::Duotone => {
+				let anchors = DuotoneAnchors::from(theme.palette().most_contrasting_pair());
+				project_duotone(theme.palette().colors(), anchors).map_err(|facts| {
+					TableSkinProjectionError::UnsuitableDuotone {
+						name: name.to_owned(),
+						facts,
+					}
+				})
+			}
+			TableSkinProjection::PaletteForward => {
+				project_palette_forward(theme.palette().colors()).map_err(|facts| {
+					TableSkinProjectionError::UnsuitablePaletteForward {
+						name: name.to_owned(),
+						facts,
+					}
+				})
+			}
+		}
 	}
 }
 
@@ -109,16 +128,164 @@ impl Default for TableSkin {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableSkinProjection {
+	PaletteForward,
+	Duotone,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct VisibleContrastFailure {
+	role: &'static str,
+	ratio: f64,
+	minimum: f64,
+}
+
+impl VisibleContrastFailure {
+	pub const fn role(self) -> &'static str {
+		self.role
+	}
+
+	pub const fn ratio(self) -> f64 {
+		self.ratio
+	}
+
+	pub const fn minimum(self) -> f64 {
+		self.minimum
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct DuotoneAnchors {
+	darker_index: usize,
+	darker: Rgb,
+	lighter_index: usize,
+	lighter: Rgb,
+	contrast_ratio: f64,
+}
+
+impl From<ResolvedThemePair> for DuotoneAnchors {
+	fn from(pair: ResolvedThemePair) -> Self {
+		Self {
+			darker_index: pair.darker_index(),
+			darker: pair.darker(),
+			lighter_index: pair.lighter_index(),
+			lighter: pair.lighter(),
+			contrast_ratio: pair.contrast_ratio(),
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DuotoneProjectionFailure {
+	anchors: DuotoneAnchors,
+	weakest: VisibleContrastFailure,
+}
+
+impl DuotoneProjectionFailure {
+	pub const fn darker_index(self) -> usize {
+		self.anchors.darker_index
+	}
+
+	pub const fn darker(self) -> Rgb {
+		self.anchors.darker
+	}
+
+	pub const fn lighter_index(self) -> usize {
+		self.anchors.lighter_index
+	}
+
+	pub const fn lighter(self) -> Rgb {
+		self.anchors.lighter
+	}
+
+	pub const fn anchor_contrast_ratio(self) -> f64 {
+		self.anchors.contrast_ratio
+	}
+
+	pub const fn weakest(self) -> VisibleContrastFailure {
+		self.weakest
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableTextGroup {
+	Cell,
+	Header,
+	Type,
+	Gutter,
+}
+
+impl TableTextGroup {
+	const fn label(self) -> &'static str {
+		match self {
+			Self::Cell => "cell text",
+			Self::Header => "header text",
+			Self::Type => "type text",
+			Self::Gutter => "gutter text",
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct NeutralCandidateLimit {
+	ink: Rgb,
+	limiting_surface: &'static str,
+	ratio: f64,
+}
+
+impl NeutralCandidateLimit {
+	pub const fn ink(self) -> Rgb {
+		self.ink
+	}
+
+	pub const fn limiting_surface(self) -> &'static str {
+		self.limiting_surface
+	}
+
+	pub const fn ratio(self) -> f64 {
+		self.ratio
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaletteForwardProjectionFailure {
+	group: TableTextGroup,
+	near_black: NeutralCandidateLimit,
+	near_white: NeutralCandidateLimit,
+	minimum: f64,
+}
+
+impl PaletteForwardProjectionFailure {
+	pub const fn group(self) -> TableTextGroup {
+		self.group
+	}
+
+	pub const fn near_black(self) -> NeutralCandidateLimit {
+		self.near_black
+	}
+
+	pub const fn near_white(self) -> NeutralCandidateLimit {
+		self.near_white
+	}
+
+	pub const fn minimum(self) -> f64 {
+		self.minimum
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum TableSkinProjectionError {
 	UnknownTheme {
 		name: String,
 	},
-	UnsuitableTheme {
+	UnsuitableDuotone {
 		name: String,
-		role: &'static str,
-		ratio: f64,
-		minimum: f64,
+		facts: DuotoneProjectionFailure,
+	},
+	UnsuitablePaletteForward {
+		name: String,
+		facts: PaletteForwardProjectionFailure,
 	},
 }
 
@@ -126,14 +293,20 @@ impl std::fmt::Display for TableSkinProjectionError {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::UnknownTheme { name } => write!(formatter, "unknown table skin theme {name:?}"),
-			Self::UnsuitableTheme {
-				name,
-				role,
-				ratio,
-				minimum,
-			} => write!(
+			Self::UnsuitableDuotone { name, facts } => write!(
 				formatter,
-				"theme {name:?} is unsuitable for table skin role {role}: {ratio:.3}:1 is below {minimum:.1}:1"
+				"theme {name:?} is unsuitable for table skin role {}: {:.3}:1 is below {:.1}:1",
+				facts.weakest.role, facts.weakest.ratio, facts.weakest.minimum
+			),
+			Self::UnsuitablePaletteForward { name, facts } => write!(
+				formatter,
+				"theme {name:?} is unsuitable for palette-forward {}: near-black reaches {:.3}:1 on {}, near-white reaches {:.3}:1 on {}; both are below {:.1}:1",
+				facts.group.label(),
+				facts.near_black.ratio,
+				facts.near_black.limiting_surface,
+				facts.near_white.ratio,
+				facts.near_white.limiting_surface,
+				facts.minimum
 			),
 		}
 	}
@@ -142,6 +315,8 @@ impl std::fmt::Display for TableSkinProjectionError {
 impl std::error::Error for TableSkinProjectionError {}
 
 const TABLE_TEXT_CONTRAST_MINIMUM: f64 = 4.5;
+const PALETTE_FORWARD_NEAR_BLACK: Rgb = Rgb::new(16, 16, 16);
+const PALETTE_FORWARD_NEAR_WHITE: Rgb = Rgb::new(245, 245, 245);
 const TABLE_TEXT_CONTRAST_ROLES: [&str; 7] = [
 	"cell text on even row",
 	"cell text on odd row",
@@ -164,11 +339,12 @@ fn mix_encoded_srgb(base: Rgb, accent: Rgb, amount: f64) -> Rgb {
 	)
 }
 
-fn project_theme_palette(palette: &ResolvedThemePalette) -> TableSkin {
-	let colors = palette.colors();
-	let anchors = palette.most_contrasting_pair();
-	let dark = anchors.darker();
-	let light = anchors.lighter();
+fn project_duotone(
+	colors: &[Rgb; 20],
+	anchors: DuotoneAnchors,
+) -> Result<TableSkin, DuotoneProjectionFailure> {
+	let dark = anchors.darker;
+	let light = anchors.lighter;
 	let header = mix_encoded_srgb(dark, colors[2], 0.08);
 	let readable_type = colors
 		.iter()
@@ -176,7 +352,7 @@ fn project_theme_palette(palette: &ResolvedThemePalette) -> TableSkin {
 		.find(|color| color.contrast_ratio(header) >= TABLE_TEXT_CONTRAST_MINIMUM)
 		.unwrap_or(light);
 
-	TableSkin {
+	let skin = TableSkin {
 		body_background: TableRgba::opaque_rgb(dark),
 		header_background: TableRgba::opaque_rgb(header),
 		gutter_background: TableRgba::opaque_rgb(mix_encoded_srgb(dark, colors[3], 0.06)),
@@ -189,7 +365,154 @@ fn project_theme_palette(palette: &ResolvedThemePalette) -> TableSkin {
 		gutter_text: TableRgba::opaque_rgb(light),
 		selection_fill: TableRgba::translucent_rgb(colors[5], 0.18),
 		scrollbar_thumb: TableRgba::translucent_rgb(colors[6], 0.60),
+	};
+	validate_projected_skin(skin)
+		.map_err(|weakest| DuotoneProjectionFailure { anchors, weakest })?;
+	Ok(skin)
+}
+
+#[derive(Clone, Copy)]
+struct VisibleSurface {
+	label: &'static str,
+	color: Srgb,
+}
+
+#[derive(Clone, Copy)]
+struct NeutralSelection {
+	group: TableTextGroup,
+	ink: Rgb,
+	near_black: NeutralCandidateLimit,
+	near_white: NeutralCandidateLimit,
+}
+
+fn candidate_limit(ink: Rgb, surfaces: &[VisibleSurface]) -> NeutralCandidateLimit {
+	let limiting = surfaces
+		.iter()
+		.map(|surface| (surface.label, ink.as_srgb().contrast_ratio(surface.color)))
+		.min_by(|left, right| left.1.total_cmp(&right.1))
+		.expect("a text role is drawn on at least one surface");
+	NeutralCandidateLimit {
+		ink,
+		limiting_surface: limiting.0,
+		ratio: limiting.1,
 	}
+}
+
+fn preferred_neutral(
+	near_black: NeutralCandidateLimit,
+	near_white: NeutralCandidateLimit,
+) -> NeutralCandidateLimit {
+	if near_black.ratio >= near_white.ratio {
+		near_black
+	} else {
+		near_white
+	}
+}
+
+fn select_neutral(group: TableTextGroup, surfaces: &[VisibleSurface]) -> NeutralSelection {
+	let near_black = candidate_limit(PALETTE_FORWARD_NEAR_BLACK, surfaces);
+	let near_white = candidate_limit(PALETTE_FORWARD_NEAR_WHITE, surfaces);
+	let selected = preferred_neutral(near_black, near_white);
+	NeutralSelection {
+		group,
+		ink: selected.ink,
+		near_black,
+		near_white,
+	}
+}
+
+fn text_group_for_role(role: &str) -> TableTextGroup {
+	if role.starts_with("cell text") {
+		TableTextGroup::Cell
+	} else if role.starts_with("header text") {
+		TableTextGroup::Header
+	} else if role.starts_with("type text") {
+		TableTextGroup::Type
+	} else if role.starts_with("gutter text") {
+		TableTextGroup::Gutter
+	} else {
+		unreachable!("validated table role has a text group: {role}")
+	}
+}
+
+fn project_palette_forward(
+	colors: &[Rgb; 20],
+) -> Result<TableSkin, PaletteForwardProjectionFailure> {
+	let row_even_background = TableRgba::opaque_rgb(colors[3]);
+	let row_odd_background = TableRgba::opaque_rgb(colors[4]);
+	let header_background = TableRgba::opaque_rgb(colors[1]);
+	let gutter_background = TableRgba::opaque_rgb(colors[2]);
+	let selection_fill = TableRgba::translucent_rgb(colors[6], 0.18);
+
+	let even = visible_srgb(row_even_background);
+	let odd = visible_srgb(row_odd_background);
+	let selected_even = composite_over(selection_fill, even);
+	let selected_odd = composite_over(selection_fill, odd);
+	let cell = select_neutral(
+		TableTextGroup::Cell,
+		&[
+			VisibleSurface {
+				label: "even row",
+				color: even,
+			},
+			VisibleSurface {
+				label: "odd row",
+				color: odd,
+			},
+			VisibleSurface {
+				label: "selected even row",
+				color: selected_even,
+			},
+			VisibleSurface {
+				label: "selected odd row",
+				color: selected_odd,
+			},
+		],
+	);
+	let header_surface = [VisibleSurface {
+		label: "header",
+		color: visible_srgb(header_background),
+	}];
+	let header = select_neutral(TableTextGroup::Header, &header_surface);
+	let type_text = select_neutral(TableTextGroup::Type, &header_surface);
+	let gutter = select_neutral(
+		TableTextGroup::Gutter,
+		&[VisibleSurface {
+			label: "gutter",
+			color: visible_srgb(gutter_background),
+		}],
+	);
+
+	let skin = TableSkin {
+		body_background: TableRgba::opaque_rgb(colors[0]),
+		header_background,
+		gutter_background,
+		row_even_background,
+		row_odd_background,
+		gridline: TableRgba::translucent_rgb(colors[5], 0.25),
+		cell_text: TableRgba::opaque_rgb(cell.ink),
+		header_text: TableRgba::opaque_rgb(header.ink),
+		type_text: TableRgba::opaque_rgb(type_text.ink),
+		gutter_text: TableRgba::opaque_rgb(gutter.ink),
+		selection_fill,
+		scrollbar_thumb: TableRgba::translucent_rgb(colors[7], 0.60),
+	};
+
+	if let Err(weakest) = validate_projected_skin(skin) {
+		let failed_group = text_group_for_role(weakest.role());
+		let failed = [cell, header, type_text, gutter]
+			.into_iter()
+			.find(|selection| selection.group == failed_group)
+			.expect("every validated text role has a neutral selection");
+		return Err(PaletteForwardProjectionFailure {
+			group: failed.group,
+			near_black: failed.near_black,
+			near_white: failed.near_white,
+			minimum: TABLE_TEXT_CONTRAST_MINIMUM,
+		});
+	}
+
+	Ok(skin)
 }
 
 fn visible_srgb(color: TableRgba) -> Srgb {
@@ -229,15 +552,14 @@ fn text_contrast_ratios(skin: TableSkin) -> [f64; 7] {
 	]
 }
 
-fn validate_projected_skin(name: &str, skin: TableSkin) -> Result<(), TableSkinProjectionError> {
+fn validate_projected_skin(skin: TableSkin) -> Result<(), VisibleContrastFailure> {
 	let weakest = TABLE_TEXT_CONTRAST_ROLES
 		.into_iter()
 		.zip(text_contrast_ratios(skin))
 		.min_by(|(_, left), (_, right)| left.total_cmp(right))
 		.expect("a table skin has seven required contrast roles");
 	if weakest.1 < TABLE_TEXT_CONTRAST_MINIMUM {
-		return Err(TableSkinProjectionError::UnsuitableTheme {
-			name: name.to_owned(),
+		return Err(VisibleContrastFailure {
 			role: weakest.0,
 			ratio: weakest.1,
 			minimum: TABLE_TEXT_CONTRAST_MINIMUM,
@@ -303,7 +625,7 @@ mod tests {
 		let mut snapshot = String::new();
 		for expression in product_0026_theme_expressions() {
 			snapshot.push_str(&expression);
-			match TableSkin::from_theme_name(&expression) {
+			match TableSkin::from_theme_name(&expression, TableSkinProjection::Duotone) {
 				Ok(skin) => {
 					snapshot.push_str("\tOK");
 					for role in [
@@ -327,21 +649,20 @@ mod tests {
 				Err(TableSkinProjectionError::UnknownTheme { name }) => {
 					panic!("registered expression {expression} became unknown as {name}");
 				}
-				Err(error @ TableSkinProjectionError::UnsuitableTheme { .. }) => {
-					let TableSkinProjectionError::UnsuitableTheme {
-						name,
-						role,
-						ratio,
-						minimum,
-					} = &error
-					else {
+				Err(error @ TableSkinProjectionError::UnsuitableDuotone { .. }) => {
+					let TableSkinProjectionError::UnsuitableDuotone { name, facts } = &error else {
 						unreachable!();
 					};
+					let weakest = facts.weakest();
 					snapshot.push_str(&format!(
 						"\tERR\tname={name}\trole={role}\tratio={:016X}\tminimum={:016X}\tdisplay={error}",
-						ratio.to_bits(),
-						minimum.to_bits()
+						weakest.ratio().to_bits(),
+						weakest.minimum().to_bits(),
+						role = weakest.role()
 					));
+				}
+				Err(TableSkinProjectionError::UnsuitablePaletteForward { .. }) => {
+					panic!("Duotone oracle reached PaletteForward failure")
 				}
 			}
 			snapshot.push('\n');
@@ -374,7 +695,8 @@ mod tests {
 
 	#[test]
 	fn product_0026_pre_refactor_named_duotone_anchors_are_readable() {
-		let terrain = TableSkin::from_theme_name("terrain_rs10").unwrap();
+		let terrain =
+			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::Duotone).unwrap();
 		let roles = [
 			terrain.body_background,
 			terrain.header_background,
@@ -422,13 +744,155 @@ mod tests {
 			]
 		);
 
-		let Err(TableSkinProjectionError::UnsuitableTheme { role, ratio, .. }) =
-			TableSkin::from_theme_name("yellows")
+		let Err(TableSkinProjectionError::UnsuitableDuotone { facts, .. }) =
+			TableSkin::from_theme_name("yellows", TableSkinProjection::Duotone)
 		else {
 			panic!("yellows must expose the pre-refactor Duotone failure");
 		};
-		assert_eq!(role, "cell text on selected odd row");
-		assert_eq!(ratio, 3.1750332126087506);
+		assert_eq!(facts.weakest().role(), "cell text on selected odd row");
+		assert_eq!(facts.weakest().ratio(), 3.1750332126087506);
+	}
+
+	#[test]
+	fn product_0026_yellows_separates_duotone_from_palette_forward() {
+		let Err(TableSkinProjectionError::UnsuitableDuotone { facts, .. }) =
+			TableSkin::from_theme_name("yellows", TableSkinProjection::Duotone)
+		else {
+			panic!("yellows must retain its Duotone refusal");
+		};
+		assert_eq!(facts.darker_index(), 19);
+		assert_eq!(facts.darker(), Rgb::new(0x99, 0x66, 0x00));
+		assert_eq!(facts.lighter_index(), 0);
+		assert_eq!(facts.lighter(), Rgb::new(0xFC, 0xFC, 0xCC));
+		assert!(facts.anchor_contrast_ratio() > TABLE_TEXT_CONTRAST_MINIMUM);
+		assert_eq!(facts.weakest().role(), "cell text on selected odd row");
+		assert_eq!(facts.weakest().ratio(), 3.1750332126087506);
+
+		let theme = Theme::try_new("yellows").unwrap();
+		let colors = theme.palette().colors();
+		let skin = TableSkin::from_theme_name("yellows", TableSkinProjection::PaletteForward)
+			.expect("neutral ink makes yellows a valid palette-forward skin");
+		assert_eq!(skin.body_background, TableRgba::opaque_rgb(colors[0]));
+		assert_eq!(skin.header_background, TableRgba::opaque_rgb(colors[1]));
+		assert_eq!(skin.gutter_background, TableRgba::opaque_rgb(colors[2]));
+		assert_eq!(skin.row_even_background, TableRgba::opaque_rgb(colors[3]));
+		assert_eq!(skin.row_odd_background, TableRgba::opaque_rgb(colors[4]));
+		assert_eq!(skin.gridline, TableRgba::translucent_rgb(colors[5], 0.25));
+		assert_eq!(
+			skin.selection_fill,
+			TableRgba::translucent_rgb(colors[6], 0.18)
+		);
+		assert_eq!(
+			skin.scrollbar_thumb,
+			TableRgba::translucent_rgb(colors[7], 0.60)
+		);
+		for ink in [
+			skin.cell_text,
+			skin.header_text,
+			skin.type_text,
+			skin.gutter_text,
+		] {
+			assert_eq!(ink, TableRgba::opaque_rgb(PALETTE_FORWARD_NEAR_BLACK));
+		}
+		for ratio in text_contrast_ratios(skin) {
+			assert!(ratio >= TABLE_TEXT_CONTRAST_MINIMUM, "{ratio}");
+		}
+	}
+
+	#[test]
+	fn product_0026_neutral_selection_is_maximin_and_ties_choose_near_black() {
+		let dark = VisibleSurface {
+			label: "dark",
+			color: Rgb::new(40, 40, 40).as_srgb(),
+		};
+		let selection = select_neutral(TableTextGroup::Header, &[dark]);
+		assert_eq!(selection.ink, PALETTE_FORWARD_NEAR_WHITE);
+		assert!(selection.near_white.ratio > selection.near_black.ratio);
+
+		let tied_black = NeutralCandidateLimit {
+			ink: PALETTE_FORWARD_NEAR_BLACK,
+			limiting_surface: "black limit",
+			ratio: 5.0,
+		};
+		let tied_white = NeutralCandidateLimit {
+			ink: PALETTE_FORWARD_NEAR_WHITE,
+			limiting_surface: "white limit",
+			ratio: 5.0,
+		};
+		assert_eq!(preferred_neutral(tied_black, tied_white), tied_black);
+	}
+
+	#[test]
+	fn product_0026_split_polarity_palette_fails_both_mechanisms_with_distinct_facts() {
+		let darker = Rgb::new(89, 89, 89);
+		let lighter = Rgb::new(149, 149, 149);
+		let mut colors = [darker; 20];
+		colors[4] = lighter;
+		let anchors = DuotoneAnchors {
+			darker_index: 0,
+			darker,
+			lighter_index: 4,
+			lighter,
+			contrast_ratio: darker.contrast_ratio(lighter),
+		};
+		let duotone = project_duotone(&colors, anchors).expect_err("insufficient anchor range");
+		assert!(duotone.anchor_contrast_ratio() < TABLE_TEXT_CONTRAST_MINIMUM);
+		assert!(duotone.weakest().ratio() < TABLE_TEXT_CONTRAST_MINIMUM);
+
+		let palette_forward =
+			project_palette_forward(&colors).expect_err("one cell ink spans opposite polarities");
+		assert_eq!(palette_forward.group(), TableTextGroup::Cell);
+		assert!(palette_forward.near_black().ratio() < TABLE_TEXT_CONTRAST_MINIMUM);
+		assert!(palette_forward.near_white().ratio() < TABLE_TEXT_CONTRAST_MINIMUM);
+		assert_eq!(palette_forward.near_black().limiting_surface(), "even row");
+		assert_eq!(palette_forward.near_white().limiting_surface(), "odd row");
+	}
+
+	#[test]
+	fn product_0026_every_canonical_projection_is_valid_or_mechanism_specific() {
+		let mut duotone_successes = 0;
+		let mut palette_forward_successes = 0;
+		for expression in product_0026_theme_expressions() {
+			for projection in [
+				TableSkinProjection::Duotone,
+				TableSkinProjection::PaletteForward,
+			] {
+				match TableSkin::from_theme_name(&expression, projection) {
+					Ok(skin) => {
+						assert!(
+							validate_projected_skin(skin).is_ok(),
+							"{expression} {projection:?}"
+						);
+						match projection {
+							TableSkinProjection::Duotone => duotone_successes += 1,
+							TableSkinProjection::PaletteForward => palette_forward_successes += 1,
+						}
+					}
+					Err(TableSkinProjectionError::UnsuitableDuotone { .. }) => {
+						assert_eq!(projection, TableSkinProjection::Duotone)
+					}
+					Err(TableSkinProjectionError::UnsuitablePaletteForward { .. }) => {
+						assert_eq!(projection, TableSkinProjection::PaletteForward)
+					}
+					Err(error) => panic!("registered expression {expression}: {error}"),
+				}
+			}
+		}
+		assert!(duotone_successes > 0);
+		assert!(palette_forward_successes > 0);
+	}
+
+	#[test]
+	fn product_0026_palette_forward_observes_final_role_order() {
+		let base =
+			TableSkin::from_theme_name("greens", TableSkinProjection::PaletteForward).unwrap();
+		let reverse =
+			TableSkin::from_theme_name("greens_r", TableSkinProjection::PaletteForward).unwrap();
+		let shift =
+			TableSkin::from_theme_name("greens_s1", TableSkinProjection::PaletteForward).unwrap();
+		assert_ne!(base, reverse);
+		assert_ne!(base, shift);
+		assert_ne!(reverse, shift);
 	}
 
 	#[test]
@@ -487,7 +951,8 @@ mod tests {
 
 	#[test]
 	fn product_0025_terrain_rs10_projects_every_role_and_passes_visible_contrast() {
-		let skin = TableSkin::from_theme_name("terrain_rs10").expect("dogfood table skin");
+		let skin = TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::Duotone)
+			.expect("dogfood table skin");
 		for ratio in text_contrast_ratios(skin) {
 			assert!(ratio >= TABLE_TEXT_CONTRAST_MINIMUM, "{ratio}");
 		}
@@ -513,24 +978,20 @@ mod tests {
 	#[test]
 	fn product_0025_projection_distinguishes_unknown_and_unsuitable_themes() {
 		assert_eq!(
-			TableSkin::from_theme_name("definitely-not-a-theme"),
+			TableSkin::from_theme_name("definitely-not-a-theme", TableSkinProjection::Duotone),
 			Err(TableSkinProjectionError::UnknownTheme {
 				name: "definitely-not-a-theme".to_owned(),
 			})
 		);
 
-		let Err(TableSkinProjectionError::UnsuitableTheme {
-			name,
-			ratio,
-			minimum,
-			..
-		}) = TableSkin::from_theme_name("black")
+		let Err(TableSkinProjectionError::UnsuitableDuotone { name, facts }) =
+			TableSkin::from_theme_name("black", TableSkinProjection::Duotone)
 		else {
 			panic!("a flat palette must be unsuitable rather than unknown");
 		};
 		assert_eq!(name, "black");
-		assert_eq!(ratio, 1.0);
-		assert_eq!(minimum, 4.5);
+		assert_eq!(facts.weakest().ratio(), 1.0);
+		assert_eq!(facts.weakest().minimum(), 4.5);
 	}
 
 	#[test]
@@ -542,7 +1003,7 @@ mod tests {
 				format!("{}_r", spec.name),
 				format!("{}_s1", spec.name),
 			] {
-				match TableSkin::from_theme_name(&expression) {
+				match TableSkin::from_theme_name(&expression, TableSkinProjection::Duotone) {
 					Ok(skin) => {
 						successes += 1;
 						for ratio in text_contrast_ratios(skin) {
@@ -552,7 +1013,10 @@ mod tests {
 							);
 						}
 					}
-					Err(TableSkinProjectionError::UnsuitableTheme { .. }) => {}
+					Err(TableSkinProjectionError::UnsuitableDuotone { .. }) => {}
+					Err(TableSkinProjectionError::UnsuitablePaletteForward { .. }) => {
+						panic!("Duotone request returned PaletteForward facts")
+					}
 					Err(error) => panic!("registered expression {expression} failed: {error}"),
 				}
 			}
@@ -565,9 +1029,10 @@ mod tests {
 
 	#[test]
 	fn product_0025_order_permutations_remain_visible_in_table_roles() {
-		let base = TableSkin::from_theme_name("terrain").unwrap();
-		let reverse = TableSkin::from_theme_name("terrain_r").unwrap();
-		let shift = TableSkin::from_theme_name("terrain_s1").unwrap();
+		let base = TableSkin::from_theme_name("terrain", TableSkinProjection::Duotone).unwrap();
+		let reverse =
+			TableSkin::from_theme_name("terrain_r", TableSkinProjection::Duotone).unwrap();
+		let shift = TableSkin::from_theme_name("terrain_s1", TableSkinProjection::Duotone).unwrap();
 		assert_ne!(base, reverse);
 		assert_ne!(base, shift);
 		assert_ne!(reverse, shift);

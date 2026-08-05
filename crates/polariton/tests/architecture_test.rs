@@ -750,7 +750,10 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("production GUI state source");
-	assert!(state_production.contains("TableSkin::from_theme_name(&name)"));
+	assert!(
+		state_production
+			.contains("TableSkin::from_theme_name(&name, TableSkinProjection::Duotone)")
+	);
 	assert!(state_production.contains("set_rune_view_table_with_skin"));
 
 	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
