@@ -14,8 +14,8 @@ use crate::distributed::scheduler::{
 	producer_stage_supports_live,
 };
 use crate::distributed::task::{
-	JoinRuntimeObservationMode, PartitionCount, ScanShare, ShufflePublishMode, TaskInputBinding,
-	TaskOutputBinding, TaskSpec, shuffle_input_table_id,
+	JoinRuntimeObservationMode, PartitionCount, RuntimeFilterProbeTarget, ScanShare,
+	ShufflePublishMode, TaskInputBinding, TaskOutputBinding, TaskSpec, shuffle_input_table_id,
 };
 use crate::exec::runtime_filter::runtime_filter_key_type;
 use crate::ir::{
@@ -200,6 +200,7 @@ impl FragmentTerminalOutput {
 				partition_count: PartitionCount::new(*partition_count),
 				partition_key: partition_key.clone(),
 				publish_mode: ShufflePublishMode::Sealed,
+				runtime_filter_probe_target: None,
 			},
 		}
 	}
@@ -682,6 +683,7 @@ fn fragment_base_plan(
 			partition_count: PartitionCount::new(boundary.partition_count),
 			partition_key: boundary.key,
 			publish_mode: ShufflePublishMode::Sealed,
+			runtime_filter_probe_target: None,
 		},
 		budget: config.task_budget,
 		trace: None,
@@ -889,6 +891,7 @@ fn union_producer_tasks(
 					partition_count: PartitionCount::new(partition_count),
 					partition_key: key.clone(),
 					publish_mode: ShufflePublishMode::Sealed,
+					runtime_filter_probe_target: None,
 				},
 				budget: config.task_budget,
 				trace: None,
@@ -936,8 +939,9 @@ fn fragment_hash_join_plan(
 	allocator: &mut FragmentIdAllocator,
 	config: FragmentPlanConfig,
 ) -> Result<(Vec<StagePlan>, StageId), FragmentError> {
-	let runtime_filter_enabled =
+	let runtime_filter_shape_eligible =
 		config.runtime_filters_enabled && runtime_filter_join_eligible(&join);
+	let probe_key = join.right_keys.first().copied();
 	reject_sort_barrier_inside_join_inputs(&join)?;
 	reject_undecomposable_aggregate_in_join_consumer(&plan)?;
 	let left_boundary = extract_exchange(*join.left)?;
@@ -948,6 +952,16 @@ fn fragment_hash_join_plan(
 	if left_boundary.partition_count != right_boundary.partition_count {
 		return Err(FragmentError::JoinInputNotExchanged);
 	}
+
+	// A filter is admissible only when the probe key is proven to reach a physical scan
+	// column. A shape-eligible join whose key is synthetic or computed yields no target and
+	// therefore no filter: the query still executes, it just scans more.
+	let runtime_filter_probe_target = runtime_filter_shape_eligible
+		.then(|| {
+			probe_key.and_then(|key| trace_runtime_filter_probe_target(&right_boundary.input, key))
+		})
+		.flatten();
+	let runtime_filter_enabled = runtime_filter_probe_target.is_some();
 
 	let left_exchange_id = allocator.alloc_exchange();
 	let right_exchange_id = allocator.alloc_exchange();
@@ -1026,6 +1040,7 @@ fn fragment_hash_join_plan(
 				left_stage_id,
 				left_exchange_id,
 				left_boundary,
+				None,
 			)],
 		},
 		StagePlan {
@@ -1040,6 +1055,7 @@ fn fragment_hash_join_plan(
 				right_stage_id,
 				right_exchange_id,
 				right_boundary,
+				runtime_filter_probe_target,
 			)],
 		},
 		StagePlan {
@@ -1125,6 +1141,7 @@ fn fragment_broadcast_join_plan(
 				build.stage_id,
 				build.exchange_id,
 				build.boundary,
+				None,
 			)],
 		});
 	}
@@ -1298,6 +1315,7 @@ fn producer_task(
 	stage_id: StageId,
 	exchange_id: ExchangeId,
 	boundary: ExchangeBoundary,
+	runtime_filter_probe_target: Option<RuntimeFilterProbeTarget>,
 ) -> TaskPlan {
 	TaskPlan::new(TaskSpec {
 		identity: TaskIdentity::new(
@@ -1323,6 +1341,7 @@ fn producer_task(
 			partition_count: PartitionCount::new(boundary.partition_count),
 			partition_key: boundary.key,
 			publish_mode: ShufflePublishMode::Sealed,
+			runtime_filter_probe_target,
 		},
 		budget: config.task_budget,
 		trace: None,
@@ -1614,6 +1633,54 @@ fn reject_undecomposable_aggregate_in_join_consumer(
 		// outer join/exchange fragmentation. Both nodes are opaque local leaves to every walker here.
 		| ExecutionPlan::RecursiveCte { .. }
 		| ExecutionPlan::RecursiveRef { .. } => Ok(()),
+	}
+}
+
+/// Trace a probe join key down to the physical scan column it descends from.
+///
+/// Deliberately conservative: it follows only ordinal-preserving nodes and direct column
+/// projections, and answers `None` at literals, computed expressions, aggregates, unions,
+/// joins and anything else. `None` means no runtime filter may be built — an optimization
+/// is skipped, never a wrong answer produced.
+///
+/// The walk is driven by a single ordinal, so it descends one path and cannot choose among
+/// several reachable scans: the target is unique by construction, never "the first scan".
+fn trace_runtime_filter_probe_target(
+	plan: &ExecutionPlan,
+	ordinal: ColumnOrdinal,
+) -> Option<RuntimeFilterProbeTarget> {
+	match plan {
+		ExecutionPlan::Scan {
+			fingerprint,
+			schema,
+			projection,
+			..
+		} => {
+			let output_index = usize::try_from(ordinal.0).ok()?;
+			// A projected scan renames positions: the physical column is what the
+			// projection maps this output position to.
+			let physical = match projection {
+				Some(columns) => *columns.get(output_index)?,
+				None => ordinal,
+			};
+			let field = schema.fields().get(output_index)?;
+			let key_type = runtime_filter_key_type(field.data_type())?;
+			Some(RuntimeFilterProbeTarget {
+				probe_descriptor_fingerprint: *fingerprint,
+				physical_column_ordinal: physical.0,
+				key_type,
+			})
+		}
+		// Ordinal-preserving: these change rows, never column positions.
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Exchange { input, .. } => trace_runtime_filter_probe_target(input, ordinal),
+		ExecutionPlan::Project { input, exprs, .. } => {
+			let column = exprs.root_column_at(usize::try_from(ordinal.0).ok()?)?;
+			trace_runtime_filter_probe_target(input, column.ordinal)
+		}
+		_ => None,
 	}
 }
 
@@ -2289,6 +2356,173 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	/// A descriptor distinct from [`descriptor`], so a test can tell two scans apart by
+	/// fingerprint rather than assuming they differ.
+	fn other_descriptor() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![Field::new("key", DataType::Int32, false)]);
+		TableSchemaDescriptor::new(
+			TableObjectId::new([21; 16]),
+			1,
+			"default",
+			"fragment_test_probe_side",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("key")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.expect("descriptor")
+	}
+
+	fn scan_with_fingerprint(
+		table_id: TableId,
+		object_byte: u8,
+		fingerprint: wendelon::schema::PhysicalDescriptorFingerprint,
+		fields: Vec<Field>,
+	) -> ExecutionPlan {
+		ExecutionPlan::Scan {
+			local_table_id: table_id,
+			table: TableObjectId::new([object_byte; 16]),
+			fingerprint,
+			schema: Arc::new(Schema::new(fields)),
+			projection: None,
+			pbc_program: None,
+			row_identity: crate::storage::RowIdentityProjection::None,
+			row_limit: None,
+			profile_hint: QueryProfileHint::Scan,
+			estimated_byte_size: None,
+			primary_key_columns: vec![ColumnOrdinal(0)],
+			column_ndv: Vec::new(),
+			column_range: Vec::new(),
+			column_range_distributions: Vec::new(),
+			column_heavy_hitters: Vec::new(),
+			column_group_top_k: Default::default(),
+			column_group_ndv: Default::default(),
+		}
+	}
+
+	/// ADR 537 control: a synthetic literal key proves nothing, so no target is produced
+	/// and no runtime filter may be built. This is q11's shape.
+	#[test]
+	fn adr537_literal_probe_key_yields_no_target() {
+		let mut builder = BoundExprProgramBuilder::new();
+		let literal = builder.append_literal(crate::ir::ScalarValue::Int32(Some(1)));
+		builder.push_root(literal);
+		let projected = ExecutionPlan::Project {
+			input: Box::new(scan_plan_with_table(TableId(1), 7)),
+			exprs: builder.build(),
+			output_schema: Arc::new(Schema::new(vec![Field::new(
+				"__having_scalar_inner_key_0",
+				DataType::Int32,
+				false,
+			)])),
+		};
+		assert!(
+			trace_runtime_filter_probe_target(&projected, ColumnOrdinal(0)).is_none(),
+			"a literal key has no physical column and must never yield a probe target"
+		);
+	}
+
+	/// ADR 537 control: a direct base-column key proves an exact target — the positive
+	/// control that keeps this from becoming a blanket disable.
+	#[test]
+	fn adr537_base_column_probe_key_yields_exact_target() {
+		let scan = scan_plan_with_table(TableId(1), 7);
+		let ExecutionPlan::Scan { fingerprint, .. } = &scan else {
+			panic!("scan");
+		};
+		let expected = *fingerprint;
+		let target = trace_runtime_filter_probe_target(&scan, ColumnOrdinal(0))
+			.expect("a base-column key must prove a target");
+		assert_eq!(target.probe_descriptor_fingerprint, expected);
+		assert_eq!(target.physical_column_ordinal, 0);
+		assert_eq!(
+			target.key_type,
+			wendelon::schema::RuntimeFilterKeyType::Int32
+		);
+	}
+
+	/// ADR 537 control: the proof survives a reordering projection, and names the physical
+	/// ordinal rather than the position the key occupies above that projection.
+	#[test]
+	fn adr537_reordered_projection_resolves_physical_ordinal() {
+		let scan = scan_with_fingerprint(
+			TableId(1),
+			7,
+			descriptor().physical_descriptor_fingerprint,
+			vec![
+				Field::new("a", DataType::Int32, false),
+				Field::new("b", DataType::Int32, false),
+				Field::new("key", DataType::Int32, false),
+			],
+		);
+		let mut builder = BoundExprProgramBuilder::new();
+		let key_column = builder.append_column(ResolvedColumn {
+			name: ColumnName("key".to_string()),
+			ordinal: ColumnOrdinal(2),
+			data_type: DataType::Int32,
+			nullable: false,
+			pbc_eligible: true,
+		});
+		builder.push_root(key_column);
+		let projected = ExecutionPlan::Project {
+			input: Box::new(scan),
+			exprs: builder.build(),
+			output_schema: Arc::new(Schema::new(vec![Field::new("key", DataType::Int32, false)])),
+		};
+
+		let target = trace_runtime_filter_probe_target(&projected, ColumnOrdinal(0))
+			.expect("a reordered direct column still proves a target");
+		assert_eq!(
+			target.physical_column_ordinal, 2,
+			"the target must name the physical ordinal, not the post-projection position"
+		);
+	}
+
+	/// ADR 537 control: with two scans of different identity, the carried target names the
+	/// probe side's scan — not the first scan reachable in the plan, which is what the
+	/// removed reconstruction would have chosen.
+	#[test]
+	fn adr537_probe_target_is_not_the_first_scan_in_the_plan() {
+		let left = exchanged_scan(TableId(1), 2);
+		let probe_fingerprint = other_descriptor().physical_descriptor_fingerprint;
+		assert_ne!(
+			probe_fingerprint,
+			descriptor().physical_descriptor_fingerprint,
+			"the two scans must be distinguishable for this control to mean anything"
+		);
+		let right = ExecutionPlan::Exchange {
+			input: Box::new(scan_with_fingerprint(
+				TableId(2),
+				21,
+				probe_fingerprint,
+				vec![Field::new("key", DataType::Int32, false)],
+			)),
+			partition_count: 2,
+			key: key_expr_with_type(DataType::Int32),
+		};
+		let stages = fragment_plan(
+			join_plan(left, right, JoinStrategy::HashPartitioned),
+			config(),
+		)
+		.expect("fragment join");
+
+		let target = stages
+			.iter()
+			.flat_map(|stage| stage.tasks.iter())
+			.find_map(|task| match &task.spec.output {
+				TaskOutputBinding::ShuffleProducer {
+					runtime_filter_probe_target: Some(target),
+					..
+				} => Some(target.clone()),
+				_ => None,
+			})
+			.expect("the probe producer carries a proven target");
+		assert_eq!(
+			target.probe_descriptor_fingerprint, probe_fingerprint,
+			"the target must name the probe side's scan, not the first scan in the plan"
+		);
 	}
 
 	#[test]

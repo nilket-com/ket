@@ -29,7 +29,6 @@ use crate::exec::runtime_filter::{
 #[cfg(test)]
 use crate::ir::{BroadcastReplayEligibility, JoinReplayId};
 use crate::ir::{ExecutionPlan, JoinStrategy};
-use wendelon::schema::PhysicalDescriptorFingerprint;
 
 #[derive(Debug, Clone)]
 pub struct StagePlan {
@@ -993,15 +992,20 @@ where
 		else {
 			return None;
 		};
-		let TaskOutputBinding::ShuffleProducer { partition_key, .. } = &spec.output else {
+		// The target was proven at fragmentation and travels with the task. It is never
+		// rebuilt here: pairing a scan fingerprint with a post-projection ordinal draws two
+		// facts from different schemas, which is what made an unrelated filter look valid.
+		let TaskOutputBinding::ShuffleProducer {
+			runtime_filter_probe_target: Some(target),
+			..
+		} = &spec.output
+		else {
 			return None;
 		};
-		let column = partition_key.single_column_root()?;
-		let probe_descriptor_fingerprint = first_scan_fingerprint(&spec.plan)?;
 		Some(descriptor_from_fragment(
 			fragment,
-			vec![column.ordinal.0],
-			probe_descriptor_fingerprint,
+			vec![target.physical_column_ordinal],
+			target.probe_descriptor_fingerprint,
 		))
 	}
 
@@ -1358,39 +1362,6 @@ fn runtime_filter_build_stage(spec: &TaskSpec, stages: &[StagePlan]) -> bool {
 					matches!(task.spec.output, TaskOutputBinding::ShuffleProducer { .. })
 				})
 		})
-}
-
-fn first_scan_fingerprint(plan: &ExecutionPlan) -> Option<PhysicalDescriptorFingerprint> {
-	match plan {
-		ExecutionPlan::Scan { fingerprint, .. } => Some(*fingerprint),
-		ExecutionPlan::Filter { input, .. }
-		| ExecutionPlan::Project { input, .. }
-		| ExecutionPlan::Aggregate { input, .. }
-		| ExecutionPlan::Exchange { input, .. }
-		| ExecutionPlan::Repeat { input, .. }
-		| ExecutionPlan::Sort { input, .. }
-		| ExecutionPlan::Window { input, .. }
-		| ExecutionPlan::Take { input, .. } => first_scan_fingerprint(input),
-		ExecutionPlan::Join { left, right, .. } => {
-			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
-		}
-		ExecutionPlan::Union { left, right, .. } => {
-			first_scan_fingerprint(left).or_else(|| first_scan_fingerprint(right))
-		}
-		ExecutionPlan::EmptyRelation { .. }
-		| ExecutionPlan::SystemTable { .. }
-		| ExecutionPlan::CreateTable { .. }
-		| ExecutionPlan::CreateLogicalType { .. }
-		| ExecutionPlan::CreateTableAsSelect { .. }
-		| ExecutionPlan::DropTable { .. }
-		| ExecutionPlan::Delete { .. }
-		| ExecutionPlan::Update { .. }
-		| ExecutionPlan::Insert { .. }
-		| ExecutionPlan::InsertSelect { .. }
-		// ADR 255: a recursive CTE is one self-contained local task — opaque to scheduler walkers.
-		| ExecutionPlan::RecursiveCte { .. }
-		| ExecutionPlan::RecursiveRef { .. } => None,
-	}
 }
 
 fn failure_retryable(kind: &TaskFailureKind) -> bool {
@@ -1751,6 +1722,20 @@ mod tests {
 		}
 	}
 
+	/// A proven probe target for tests that exercise filter injection. Under ADR 537 a
+	/// filter is built only when fragmentation proved the probe key reaches a physical
+	/// scan column, so a test that wants a filter must supply that proof.
+	fn proven_probe_target() -> crate::distributed::task::RuntimeFilterProbeTarget {
+		crate::distributed::task::RuntimeFilterProbeTarget {
+			probe_descriptor_fingerprint: physical_fingerprint(),
+			// Deliberately NOT the partition key's ordinal: the removed reconstruction
+			// would have produced 0 here, so this value discriminates a carried target
+			// from a rebuilt one.
+			physical_column_ordinal: 3,
+			key_type: wendelon::schema::RuntimeFilterKeyType::Int64,
+		}
+	}
+
 	fn int64_partition_key() -> BoundExprProgram {
 		let mut builder = BoundExprProgramBuilder::new();
 		let id = builder.append_column(ResolvedColumn {
@@ -1817,6 +1802,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		producer
 	}
@@ -2832,6 +2818,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -2882,6 +2869,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: int64_partition_key(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let build_key = TaskKey::from_identity(build.spec.identity);
 		let mut probe = task(StageId::new(1), TaskId::new(0));
@@ -2890,6 +2878,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: int64_partition_key(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: Some(proven_probe_target()),
 		};
 		let build_manifest = PartitionManifest {
 			query_id: build.spec.identity.query_id,
@@ -2976,10 +2965,12 @@ mod tests {
 			.runtime_filter_fragment
 			.as_ref()
 			.expect("build fragment");
-		assert_eq!(runtime_filter.probe_key_columns, vec![0]);
+		// ADR 537: the descriptor reproduces the carried proof exactly. The ordinal is the
+		// proven physical one, not the producer's partition-key ordinal.
+		assert_eq!(runtime_filter.probe_key_columns, vec![3]);
 		assert_eq!(
 			runtime_filter.probe_descriptor_fingerprint,
-			physical_fingerprint()
+			proven_probe_target().probe_descriptor_fingerprint
 		);
 		assert_eq!(&runtime_filter.kind, &fragment.kind);
 	}
@@ -2994,6 +2985,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: int64_partition_key(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let mut probe = task(StageId::new(1), TaskId::new(0));
 		probe.spec.output = TaskOutputBinding::ShuffleProducer {
@@ -3001,6 +2993,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: int64_partition_key(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: Some(proven_probe_target()),
 		};
 		let build_manifest = PartitionManifest {
 			query_id: build.spec.identity.query_id,
@@ -3155,6 +3148,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let query_id = producer.spec.identity.query_id;
 		let key = TaskKey::from_identity(producer.spec.identity);
@@ -3209,6 +3203,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -3278,6 +3273,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let key = TaskKey::from_identity(producer.spec.identity);
 		let manifest = PartitionManifest {
@@ -3470,6 +3466,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
 		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {
@@ -3544,6 +3541,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let producer_key = TaskKey::from_identity(producer.spec.identity);
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
@@ -3614,6 +3612,7 @@ mod tests {
 			partition_count: crate::distributed::task::PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+			runtime_filter_probe_target: None,
 		};
 		let mut consumer = task(StageId::new(1), TaskId::new(0));
 		consumer.spec.inputs = vec![TaskInputBinding::ShuffleConsumer {

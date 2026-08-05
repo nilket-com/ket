@@ -756,15 +756,6 @@ pub(crate) fn adr032_distributed_walkers_treat_insert_select_as_leaf() {
 		assert!(body.contains(marker), "{function} missing {marker}");
 	}
 	assert!(server.contains("ExecutionPlan::InsertSelect { .. } => \"insert_select\""));
-
-	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
-		.expect("read scheduler source");
-	let first_scan_fingerprint = brace_blocks_after_marker(&scheduler, "fn first_scan_fingerprint")
-		.into_iter()
-		.next()
-		.expect("first_scan_fingerprint body")
-		.1;
-	assert!(first_scan_fingerprint.contains("| ExecutionPlan::RecursiveRef { .. } => None"));
 }
 
 #[test]

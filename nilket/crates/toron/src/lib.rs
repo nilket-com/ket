@@ -2208,6 +2208,7 @@ mod tests {
 				partition_count: PartitionCount::new(2),
 				partition_key: BoundExprProgram::empty(),
 				publish_mode: crate::distributed::task::ShufflePublishMode::Live,
+				runtime_filter_probe_target: None,
 			},
 			..test_task_spec(bound, TaskId::new(55))
 		};

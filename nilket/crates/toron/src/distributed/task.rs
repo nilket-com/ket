@@ -10,7 +10,9 @@ use crate::distributed::identity::{
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::ir::{BoundExprProgram, ExecutionPlan, JoinReplayId, JoinStrategy, TableId};
 use crate::server::spill::SpillId;
-use wendelon::schema::{RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind};
+use wendelon::schema::{
+	PhysicalDescriptorFingerprint, RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ArrowIpcDigest(pub [u8; 32]);
@@ -100,6 +102,18 @@ pub struct TaskTelemetry {
 	/// exist so a divergence can be localized to a seam instead of inferred from a plan.
 	#[serde(default)]
 	pub shuffle_routing_observations: Vec<ShuffleRoutingObservation>,
+}
+
+/// A runtime filter's probe target, proven at fragmentation rather than reconstructed.
+///
+/// All three facts describe the same physical column: the scan that produces it, its
+/// ordinal *in that scan*, and the key type. A descriptor built from this cannot pair a
+/// fingerprint and an ordinal drawn from different schemas.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RuntimeFilterProbeTarget {
+	pub probe_descriptor_fingerprint: PhysicalDescriptorFingerprint,
+	pub physical_column_ordinal: u32,
+	pub key_type: RuntimeFilterKeyType,
 }
 
 /// Whether a task records shuffle routing receipts. Off by default, and a task that
@@ -484,6 +498,14 @@ pub enum TaskOutputBinding {
 		partition_key: BoundExprProgram,
 		#[serde(default)]
 		publish_mode: ShufflePublishMode,
+		/// Proven physical target for a runtime filter probing this producer, established
+		/// at fragmentation by tracing the probe join key through projections to a base
+		/// scan column. `None` means no such proof exists — a synthetic or computed key —
+		/// and no runtime filter may be built. The target travels with the plan precisely
+		/// so scheduling never has to rebuild it from a scan fingerprint and a
+		/// post-projection ordinal, which are facts about different schemas.
+		#[serde(default)]
+		runtime_filter_probe_target: Option<RuntimeFilterProbeTarget>,
 	},
 }
 
@@ -572,6 +594,7 @@ mod shuffle_publish_mode_tests {
 			partition_count: PartitionCount::new(1),
 			partition_key: BoundExprProgram::empty(),
 			publish_mode: mode,
+			runtime_filter_probe_target: None,
 		}
 	}
 
@@ -607,6 +630,66 @@ mod shuffle_publish_mode_tests {
 
 #[cfg(test)]
 mod tests {
+	/// ADR 537 control: a task encoded before the proof existed decodes as `None`, so an
+	/// older peer can never cause a filter to be built without proof. A new round trip
+	/// preserves the target exactly.
+	#[test]
+	fn adr537_probe_target_legacy_decode_is_none_and_round_trip_preserves_some() {
+		let legacy = serde_json::json!({
+			"ShuffleProducer": {
+				"exchange_id": 3,
+				"partition_count": 4,
+				"partition_key": BoundExprProgram::empty(),
+			}
+		});
+		let decoded: TaskOutputBinding =
+			serde_json::from_value(legacy).expect("legacy producer decodes");
+		let TaskOutputBinding::ShuffleProducer {
+			runtime_filter_probe_target,
+			publish_mode,
+			..
+		} = &decoded
+		else {
+			panic!("producer");
+		};
+		assert!(
+			runtime_filter_probe_target.is_none(),
+			"a task without the field must carry no proof"
+		);
+		assert_eq!(
+			*publish_mode,
+			ShufflePublishMode::Sealed,
+			"and must still default to sealed publication"
+		);
+
+		let target = RuntimeFilterProbeTarget {
+			probe_descriptor_fingerprint: serde_json::from_value(
+				serde_json::to_value([9u8; 32]).expect("fingerprint bytes"),
+			)
+			.expect("fingerprint from bytes"),
+			physical_column_ordinal: 2,
+			key_type: RuntimeFilterKeyType::Int64,
+		};
+		let binding = TaskOutputBinding::ShuffleProducer {
+			exchange_id: ExchangeId::new(3),
+			partition_count: PartitionCount::new(4),
+			partition_key: BoundExprProgram::empty(),
+			publish_mode: ShufflePublishMode::Live,
+			runtime_filter_probe_target: Some(target.clone()),
+		};
+		let round_tripped: TaskOutputBinding =
+			serde_json::from_str(&serde_json::to_string(&binding).expect("encode"))
+				.expect("decode");
+		let TaskOutputBinding::ShuffleProducer {
+			runtime_filter_probe_target: Some(decoded_target),
+			..
+		} = &round_tripped
+		else {
+			panic!("producer with target");
+		};
+		assert_eq!(*decoded_target, target);
+	}
+
 	use super::*;
 	use arrow::datatypes::{DataType, Field, Schema};
 	use wendelon::schema::{

@@ -770,6 +770,13 @@ impl BoundExprProgram {
 		self.column_node(root)
 	}
 
+	/// The column a single output position descends from, when that output is a direct
+	/// column reference. `None` for literals and computed expressions — exactly the cases a
+	/// lineage proof must refuse rather than approximate.
+	pub fn root_column_at(&self, index: usize) -> Option<&ResolvedColumn> {
+		self.column_node(*self.roots.get(index)?)
+	}
+
 	pub fn root_columns(&self) -> Option<Vec<&ResolvedColumn>> {
 		self.roots
 			.iter()

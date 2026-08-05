@@ -264,6 +264,7 @@ fn three_global_sort_barriers_allocate_unique_stage_and_exchange_ids() {
 				partition_count,
 				partition_key,
 				publish_mode,
+				..
 			} => {
 				assert_eq!(*partition_count, PartitionCount::new(1));
 				assert!(partition_key.is_empty_roots());
@@ -515,6 +516,7 @@ fn hash_join_ordered_plan_fragments_to_terminal_gather_sort() {
 			partition_count,
 			partition_key,
 			publish_mode,
+			runtime_filter_probe_target: None,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
@@ -549,6 +551,7 @@ fn broadcast_join_ordered_plan_fragments_to_terminal_gather_sort() {
 			partition_count,
 			partition_key,
 			publish_mode,
+			runtime_filter_probe_target: None,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()

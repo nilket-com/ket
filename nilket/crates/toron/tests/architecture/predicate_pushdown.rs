@@ -1419,7 +1419,6 @@ pub(crate) fn adr095_plan_walkers_handle_empty_relation_as_leaf() {
 			"fn replace_exchange_with_scan",
 		),
 		("src/distributed/fragment.rs", "fn replace_first_join"),
-		("src/distributed/scheduler.rs", "fn first_scan_fingerprint"),
 		("src/server/mod.rs", "fn join_strategy_label"),
 		("src/server/mod.rs", "fn contains_join"),
 		("src/server/mod.rs", "fn operator_kind_label"),

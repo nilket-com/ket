@@ -4794,6 +4794,7 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 			partition_count,
 			partition_key,
 			publish_mode: _,
+			runtime_filter_probe_target: None,
 		} if *exchange_id == ExchangeId::new(1)
 			&& *partition_count == PartitionCount::new(4)
 			&& partition_key.root_count() == 1
@@ -4824,6 +4825,7 @@ async fn grouped_aggregate_order_by_fragments_to_terminal_sort_stage() {
 				partition_count,
 				partition_key,
 				publish_mode: _,
+				runtime_filter_probe_target: None,
 			} if *exchange_id == ExchangeId::new(0)
 				&& *partition_count == PartitionCount::new(1)
 				&& partition_key.is_empty_roots()
@@ -4916,6 +4918,7 @@ async fn grouped_aggregate_having_order_by_fragments_filter_into_aggregate_stage
 				partition_count,
 				partition_key,
 				publish_mode: _,
+				runtime_filter_probe_target: None,
 			} if *exchange_id == ExchangeId::new(0)
 				&& *partition_count == PartitionCount::new(1)
 				&& partition_key.is_empty_roots()
@@ -4956,6 +4959,7 @@ async fn scalar_aggregate_having_only_fragments_to_gathered_terminal_fold() {
 			partition_count,
 			partition_key,
 			publish_mode: _,
+			runtime_filter_probe_target: None,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
@@ -5006,6 +5010,7 @@ async fn scalar_aggregate_ordered_fragments_to_gathered_three_stage_chain() {
 			partition_count,
 			partition_key,
 			publish_mode: _,
+			runtime_filter_probe_target: None,
 		} if *exchange_id == ExchangeId::new(1)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
@@ -5026,6 +5031,7 @@ async fn scalar_aggregate_ordered_fragments_to_gathered_three_stage_chain() {
 			partition_count,
 			partition_key,
 			publish_mode: _,
+			runtime_filter_probe_target: None,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()
@@ -5121,6 +5127,7 @@ fn assert_two_exchange_terminal_sort_fragments(
 			partition_count,
 			partition_key,
 			publish_mode: _,
+			runtime_filter_probe_target: None,
 		} if *exchange_id == ExchangeId::new(0)
 			&& *partition_count == PartitionCount::new(1)
 			&& partition_key.is_empty_roots()

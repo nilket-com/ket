@@ -692,15 +692,6 @@ pub(crate) fn adr033_distributed_walkers_treat_ctas_as_leaf() {
 	assert!(
 		server.contains("ExecutionPlan::CreateTableAsSelect { .. } => \"create_table_as_select\"")
 	);
-
-	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
-		.expect("read scheduler source");
-	let first_scan_fingerprint = brace_blocks_after_marker(&scheduler, "fn first_scan_fingerprint")
-		.into_iter()
-		.next()
-		.expect("first_scan_fingerprint body")
-		.1;
-	assert!(first_scan_fingerprint.contains("| ExecutionPlan::CreateTableAsSelect { .. }"));
 }
 
 #[test]
@@ -1010,15 +1001,6 @@ pub(crate) fn adr034_distributed_walkers_treat_drop_table_as_leaf() {
 			"{function} missing DropTable leaf arm"
 		);
 	}
-
-	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
-		.expect("read scheduler source");
-	let first_scan_fingerprint = brace_blocks_after_marker(&scheduler, "fn first_scan_fingerprint")
-		.into_iter()
-		.next()
-		.expect("first_scan_fingerprint body")
-		.1;
-	assert!(first_scan_fingerprint.contains("| ExecutionPlan::DropTable { .. }"));
 
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
