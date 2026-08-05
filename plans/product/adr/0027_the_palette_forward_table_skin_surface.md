@@ -1,6 +1,6 @@
 # ADR 0027: the palette-forward table skin surface
 
-Status: proposed 2026-08-05. This record decides one thing: that a named Rune
+Status: accepted 2026-08-05. This record decides one thing: that a named Rune
 table skin uses PRODUCT-0026's `PaletteForward` projection unless the table sink
 explicitly requests `.duotone()`. The default flip and the escape hatch are one
 indivisible surface change. It adds no palette policy, table role, plot skin,

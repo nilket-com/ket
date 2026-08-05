@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.26. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.27. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -27,7 +27,7 @@ a cited record).
 | family | status | evidence |
 |---|---|---|
 | bounded table view (`table(r)`; accepted sugar `r.table()` and canonical `r.views([table()])`, inherits the 128 MiB `toron-client` collection ceiling) | executable | `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance `live_rune_relation_reaches_table_bar_and_scatter_surfaces`; PRODUCT-0008 sugar equivalence in `product_0008_single_view_sugars_are_exact_canonical_projections` (`d4c2d8a8`) |
-| theme-projected table skin (`table().skin("theme_expression")`) | executable | PRODUCT-0025 resolves only through libaryon's theme authority, validates all twelve projected table roles through PRODUCT-0023's seven visible contrast checks, and carries the resolved skin atomically with the shared frame. Direct/named contextual lowering, refusal classes, default compatibility, stale retention, identity reuse, no-dashboard host completion, and the exact `terrain_rs10` `test8.rn` shape land in `5a526200`, `f8884673`, and `4ba40bb3`. |
+| theme-projected table skin (`table().skin("theme_expression")`; optional `.duotone()`) | executable | PRODUCT-0025 establishes identity resolution, validation, atomic frame/skin lifecycle, and the closed table register. PRODUCT-0027 makes named absence select explicit PaletteForward and `.duotone()` select the preserved two-anchor treatment in one commit (`74d00472`), with truthful `yellows`, unknown-name, and `dark2_s1` diagnostics recorded in `201e3f52`. Bare Rune, SQL, and Markdown tables retain the PRODUCT-0023 compiled default; plot marks still refuse `.skin(...)`. |
 | bar sink (`plot.bar`; accepted sugar `r.bar(x, y)` and canonical `r.views([bar(x, y)])`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | scatter sink (`plot.scatter`; accepted sugar `r.scatter(x, y)` and canonical `r.views([scatter(x, y)])`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | line sink (`plot.line`; accepted sugar `r.line(x, y)` and canonical `r.views([line(x, y)])`) | executable | PRODUCT-0012 equivalence and contextual refusal in `product_0012_line_*`; exact authored x/y projection in `named_line_preserves_exact_xy_and_projects_the_existing_line_contract`; shared-result and real host-panel completion in `rune_relation_results_feed_the_existing_table_and_plot_surfaces` and `dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard`; installed-transport rendering in `live_product_0012_line_view_reaches_the_existing_kernel` |
@@ -469,6 +469,35 @@ The Rune head still selects Duotone explicitly and no grammar row changes
 status; PRODUCT-0027 owns the indivisible PaletteForward default flip and
 `.duotone()` escape hatch.
 
+## Accepted surface: palette-forward Rune table skins
+
+PRODUCT-0027 is accepted and executable in `74d00472`, with historical and
+runtime evidence recorded in `201e3f52`. The Rune table modifier register now
+flattens a named skin and an optional zero-argument treatment into one bounded
+intent:
+
+```text
+table()                                  -> compiled TableSkin::DEFAULT
+table().skin(name)                       -> PaletteForward(name)
+table().skin(name).duotone()             -> Duotone(name)
+table().duotone().skin(name)             -> the same Duotone intent
+```
+
+The implementation commit contains both `.duotone()` recognition and the
+PaletteForward named-skin default flip; its parent contains neither. `yellows`
+completes under ordinary `.skin(name)` and explicit Duotone truthfully refuses
+with a verified instruction to remove the modifier. Unknown names are never
+projection failures, and `dark2_s1` proves the both-projections-fail branch does
+not recommend a broken alternative. Advice probes never become fallback
+content.
+
+Projection remains content rather than identity. Changing or removing
+`.duotone()` reuses the destination and producer layout, replaces frame plus
+skin atomically on success, and preserves the prior pair stale on failure.
+Bare Rune tables and SQL/Markdown tables retain the compiled default. No plot
+mark accepts `skin` or `duotone`; the ahead-of-language `test9.rn` fixture is
+unchanged and supplies no acceptance evidence for plot skin syntax.
+
 ## Mutation and definition lifecycle
 
 | family | status | evidence |
@@ -498,6 +527,14 @@ status; PRODUCT-0027 owns the indivisible PaletteForward default flip and
 
 ## Change log
 
+- v0.27 (2026-08-05): PRODUCT-0027 changes named Rune table skins to explicit
+  PaletteForward-by-absence and adds `.duotone()` as the one-token escape hatch
+  in the same indivisible implementation commit. The bounded normal form makes
+  a treatment without a name and a named skin without a selected projection
+  unrepresentable. `yellows`, unknown identity, and `dark2_s1` exercise all
+  three diagnostic branches without fallback; projection changes preserve
+  panel identity, layout, and atomic frame/skin lifecycle. Bare Rune, SQL, and
+  Markdown tables remain compiled-default, and plot skin stays unaccepted.
 - v0.26 (2026-08-05): PRODUCT-0026 names the existing table treatment
   `Duotone` without changing any of its 8,480 canonical outcomes and adds an
   explicit PaletteForward substrate beside it. PaletteForward preserves the

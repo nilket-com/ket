@@ -45,6 +45,22 @@ guard for construction of libaryon's distinct `Theme` type.
 The evidence commit cannot contain its own hash. The documentation-only closure
 commit records the exact evidence hash and the immutable `I..E` file census.
 
+That closure records:
+
+```text
+E  201e3f520e77ed9af4be171faeb2249c374d6a3e
+
+git diff --name-only \
+  74d004720183fd37e96fcc8dfb1b82372b80e197..\
+  201e3f520e77ed9af4be171faeb2249c374d6a3e
+
+plans/product/impl/0027_the_palette_forward_table_skin_surface_evidence.md
+```
+
+The immutable range from implementation through evidence therefore contains no
+production or test change. This hash must remain in a later closure commit:
+`E` cannot contain its own identity without becoming self-referential.
+
 ## Normal form and register
 
 The envelope normal form is equivalent to:
