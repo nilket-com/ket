@@ -49,6 +49,57 @@ impl<T> Presence<T> {
 	}
 }
 
+/// PRODUCT-0017's unitless, linear scatter-point factor. The private value
+/// makes invalid and renderer-hostile sizes unrepresentable after authoring.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointSize(f32);
+
+// `PointSize::new` excludes NaN, so equality is reflexive for every value the
+// private representation can contain.
+impl Eq for PointSize {}
+
+impl PointSize {
+	pub const MIN_FACTOR: f32 = 0.25;
+	pub const MAX_FACTOR: f32 = 8.0;
+	pub const BASE_RADIUS_PX: f32 = 3.0;
+	pub const ONE: Self = Self(1.0);
+
+	pub fn new(factor: f32) -> Result<Self, PointSizeError> {
+		if factor.is_finite() && (Self::MIN_FACTOR..=Self::MAX_FACTOR).contains(&factor) {
+			Ok(Self(factor))
+		} else {
+			Err(PointSizeError { factor })
+		}
+	}
+
+	pub const fn factor(self) -> f32 {
+		self.0
+	}
+
+	pub fn radius_px(self) -> f32 {
+		Self::BASE_RADIUS_PX * self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PointSizeError {
+	factor: f32,
+}
+
+impl fmt::Display for PointSizeError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"point size must be finite and between {} and {}, got {}",
+			PointSize::MIN_FACTOR,
+			PointSize::MAX_FACTOR,
+			self.factor
+		)
+	}
+}
+
+impl std::error::Error for PointSizeError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthoredChannel {
 	Named(String),
@@ -270,9 +321,23 @@ impl LayerEncoding {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LayerSettings {
+	pub point_size: Override<PointSize>,
+}
+
+impl Default for LayerSettings {
+	fn default() -> Self {
+		Self {
+			point_size: Override::Inherit,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerSpec {
 	pub mark: LayerMark,
 	pub encoding: LayerEncoding,
+	pub settings: LayerSettings,
 }
 
 impl LayerSpec {
@@ -280,6 +345,7 @@ impl LayerSpec {
 		Self {
 			mark,
 			encoding: LayerEncoding::xy(x, y),
+			settings: LayerSettings::default(),
 		}
 	}
 }
@@ -383,6 +449,7 @@ pub struct ChannelBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerChannelBinding {
 	pub mark: LayerMark,
+	pub settings: LayerSettings,
 	binding: ChannelBinding,
 }
 
@@ -404,6 +471,7 @@ pub struct LayeredChannelBinding {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedLayerSpec {
 	pub mark: LayerMark,
+	pub settings: LayerSettings,
 	pub spec: ResolvedPlotSpec,
 }
 
@@ -880,6 +948,7 @@ pub fn resolve_layered_channels(
 		}
 		resolved.push(LayerChannelBinding {
 			mark: layer.mark,
+			settings: layer.settings.clone(),
 			binding,
 		});
 	}
@@ -941,16 +1010,22 @@ pub fn resolve_layered_domains(
 ) -> Result<ResolvedLayeredPlotSpec, LayeredPlotError> {
 	let (first, rest) = binding.layers.into_parts();
 	let first_mark = first.mark;
+	let first_settings = first.settings.clone();
 	let (first_spec, _) = resolve_domains(first.into_binding(), result, &ColorIdentity::default())
 		.map_err(|source| LayeredPlotError::Domain { layer: 0, source })?;
 	let shared_channels = first_spec.channels.clone();
 	let mut layers = NonEmpty::new(ResolvedLayerSpec {
 		mark: first_mark,
+		settings: first_settings,
 		spec: first_spec,
 	});
 
 	for layer in rest {
-		let LayerChannelBinding { mark, binding } = layer;
+		let LayerChannelBinding {
+			mark,
+			settings,
+			binding,
+		} = layer;
 		let channels = binding
 			.channels
 			.into_iter()
@@ -968,6 +1043,7 @@ pub fn resolve_layered_domains(
 			.collect();
 		layers.push(ResolvedLayerSpec {
 			mark,
+			settings,
 			spec: ResolvedPlotSpec {
 				composition: binding.composition,
 				channels,
@@ -2082,5 +2158,31 @@ mod tests {
 			non_associative(3, non_associative(2, 1)),
 			"positive control must expose a non-associative cascade"
 		);
+	}
+
+	#[test]
+	fn product_0017_point_size_is_bounded_and_layer_constructors_inherit() {
+		assert_eq!(PointSize::ONE.radius_px(), 3.0);
+		assert_eq!(PointSize::new(2.0).unwrap().radius_px(), 6.0);
+		assert!(PointSize::new(PointSize::MIN_FACTOR).is_ok());
+		assert!(PointSize::new(PointSize::MAX_FACTOR).is_ok());
+		for invalid in [
+			0.0,
+			-1.0,
+			PointSize::MIN_FACTOR - 0.01,
+			PointSize::MAX_FACTOR + 0.01,
+			f32::NAN,
+			f32::INFINITY,
+			f32::NEG_INFINITY,
+		] {
+			assert!(PointSize::new(invalid).is_err(), "accepted {invalid}");
+		}
+
+		let line = LayerSpec::xy(LayerMark::Line, "x", "y");
+		let scatter = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		assert_eq!(line.settings, LayerSettings::default());
+		assert_eq!(scatter.settings, LayerSettings::default());
+		assert_eq!(line.settings.point_size, Override::Inherit);
+		assert_eq!(scatter.settings.point_size, Override::Inherit);
 	}
 }

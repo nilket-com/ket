@@ -7,7 +7,7 @@
 
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode};
-use crate::plot::spec::{ColorJob, Override, Presence};
+use crate::plot::spec::{ColorJob, LayerSettings, Override, PointSize, Presence};
 use iced::Color;
 use libaryon::engine::UiPalette;
 use std::sync::Arc;
@@ -163,6 +163,7 @@ pub struct PlotSettingsLayer {
 	pub guides: Override<PlotGuideSettings>,
 	pub domains: Override<PlotDomainOverrides>,
 	pub scatter: Override<ScatterPolicy>,
+	pub point_size: Override<PointSize>,
 	pub title: Presence<Arc<String>>,
 	pub subtitle: Presence<Arc<String>>,
 	pub x_label: Presence<Arc<String>>,
@@ -178,6 +179,7 @@ impl Default for PlotSettingsLayer {
 			guides: Override::Inherit,
 			domains: Override::Inherit,
 			scatter: Override::Inherit,
+			point_size: Override::Inherit,
 			title: Presence::Inherit,
 			subtitle: Presence::Inherit,
 			x_label: Presence::Inherit,
@@ -208,6 +210,17 @@ impl PlotSettings {
 		] {
 			apply_layer(&mut settings, layer);
 		}
+		settings
+	}
+
+	/// Resolve with one graphical layer occupying PRODUCT-0007's layer tier.
+	/// The pane override is deliberately applied afterward.
+	pub fn resolve_for_layer(&self, layer: &LayerSettings) -> ResolvedPlotSettings {
+		let mut settings = self.library_defaults.clone();
+		apply_layer(&mut settings, &self.application_theme);
+		apply_layer(&mut settings, &self.authored_spec);
+		apply_layer_settings(&mut settings, layer);
+		apply_layer(&mut settings, &self.pane_override);
 		settings
 	}
 }
@@ -270,10 +283,19 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 		settings.scatter_downsample_target = value.downsample_target;
 		settings.scatter_raster_threshold = value.raster_threshold;
 	}
+	if let Override::Set(value) = layer.point_size {
+		settings.point_size = value;
+	}
 	apply_presence(&mut settings.title, &layer.title);
 	apply_presence(&mut settings.subtitle, &layer.subtitle);
 	apply_presence(&mut settings.x_label, &layer.x_label);
 	apply_presence(&mut settings.y_label, &layer.y_label);
+}
+
+fn apply_layer_settings(settings: &mut ResolvedPlotSettings, layer: &LayerSettings) {
+	if let Override::Set(value) = layer.point_size {
+		settings.point_size = value;
+	}
 }
 
 fn apply_presence(target: &mut Option<Arc<String>>, presence: &Presence<Arc<String>>) {
@@ -364,5 +386,37 @@ mod tests {
 			..PlotThemeSpec::default()
 		});
 		assert_eq!(cascade.resolve().color_theme, ColorTheme::Magma);
+	}
+
+	#[test]
+	fn product_0017_point_size_selects_each_layer_before_pane_override() {
+		let size = |factor| PointSize::new(factor).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.point_size = size(0.25);
+		cascade.application_theme.point_size = Override::Set(size(0.5));
+		cascade.authored_spec.point_size = Override::Set(size(1.5));
+		cascade.layer.point_size = Override::Set(size(2.0));
+		cascade.pane_override.point_size = Override::Set(size(4.0));
+		assert_eq!(cascade.resolve().point_size, size(4.0));
+
+		cascade.pane_override.point_size = Override::Inherit;
+		assert_eq!(cascade.resolve().point_size, size(2.0));
+
+		let small = LayerSettings {
+			point_size: Override::Set(size(0.5)),
+		};
+		let large = LayerSettings {
+			point_size: Override::Set(size(2.0)),
+		};
+		assert_eq!(cascade.resolve_for_layer(&small).point_size, size(0.5));
+		assert_eq!(cascade.resolve_for_layer(&large).point_size, size(2.0));
+
+		cascade.pane_override.point_size = Override::Set(size(0.25));
+		assert_eq!(cascade.resolve_for_layer(&large).point_size, size(0.25));
+		assert_ne!(
+			cascade.resolve_for_layer(&large).point_size.factor(),
+			2.0 * 0.25,
+			"cascade tiers select rather than multiply"
+		);
 	}
 }
