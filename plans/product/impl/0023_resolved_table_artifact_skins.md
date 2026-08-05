@@ -1,8 +1,8 @@
 # Resolved table artifact skins
 
 Scope: implement PRODUCT-0023 only. Deliverable is one pre-extraction evidence
-commit, three `impl:` commits, and one evidence commit. PRODUCT-0024 and
-`.skin(...)` remain unimplemented.
+commit, three `impl:` commits, and one evidence commit. PRODUCT-0024's resolved
+theme palette, PRODUCT-0025, and `.skin(...)` remain unimplemented.
 
 ## Halt rule
 
@@ -158,7 +158,7 @@ Write `plans/product/impl/0023_resolved_table_artifact_skins_evidence.md` with
 the Stage 0 findings, ten-gate ledger, consumer census, operation baseline,
 contrast results computed from the landed built-ins, commit trace, and complete
 verification. Add a corpus v0.23 substrate entry without changing any Rune
-capability-row status; PRODUCT-0024 remains the first surface caller.
+capability-row status; PRODUCT-0025 remains the first surface caller.
 
 Commit: `evidence: close resolved table artifact skins`.
 

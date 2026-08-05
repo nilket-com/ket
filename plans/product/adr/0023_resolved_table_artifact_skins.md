@@ -1,10 +1,12 @@
 # ADR 0023: resolved table artifact skins
 
-Status: accepted 2026-08-04. This record decides one thing: a rendered table
+Status: accepted 2026-08-04; sequencing references amended 2026-08-05 after
+libaryon's theme authority made an observable resolved palette a prerequisite.
+This record decides one thing: a rendered table
 receives one complete, validated skin instead of reading Polariton's compile-time
 GUI color constants. The skin covers only the table artifact's interior chrome.
 It colors no data, changes no editor chrome, and adds no Rune surface;
-PRODUCT-0024 is the first authorized `.skin(...)` spelling.
+PRODUCT-0025 is the first authorized `.skin(...)` spelling.
 
 ## Context
 
@@ -66,9 +68,10 @@ table.
 
 Every production built-in table skin is a complete `TableSkin` and passes §3.
 This record establishes the typed catalog boundary but exposes no authored name.
-PRODUCT-0024 decides the stable built-in keys, workspace definitions, missing-name
-behavior, and user-selected default. User or workspace configuration does not
-enter this substrate cut.
+PRODUCT-0024 makes libaryon's existing theme identity observable as one resolved
+palette. PRODUCT-0025 decides the theme-to-table projection, missing-name and
+insufficient-range behavior, and the authored spelling. User or workspace
+configuration does not enter this substrate cut.
 
 ### 3. Built-ins have executable contrast criteria
 
@@ -120,7 +123,7 @@ This makes completion atomic by structure. `PanelRegistry::fail_or_stale`
 already leaves completed `PanelContent::Table` untouched and changes only status
 (`editor.rs:2620-2635`), so a failed rerun retains the previous frame and its
 previous skin together. It cannot show stale data with a newly authored skin.
-PRODUCT-0024 may rely on this lifecycle without adding a failure-path rule.
+PRODUCT-0025 may rely on this lifecycle without adding a failure-path rule.
 
 ### 6. Skin ends at the artifact boundary
 
@@ -144,10 +147,10 @@ There is no cell-value inspection in skin resolution. Conditional formatting,
 per-column styling, gradients, categorical assignment, and value-driven text or
 background colors are data-encoding work and remain unrepresented.
 
-### 8. The Rune register generalization belongs to PRODUCT-0024
+### 8. The Rune register generalization belongs to PRODUCT-0025
 
 The intended surface is `table().skin("name")`, but this record adds no parser,
-normal form, registry lookup, or Rune handoff. PRODUCT-0024 must generalize
+normal form, theme resolution, or Rune handoff. PRODUCT-0025 must generalize
 PRODUCT-0018's rule explicitly:
 
 > Each sink kind owns a closed modifier register. In a proven sink position,
@@ -158,7 +161,7 @@ PRODUCT-0018's rule explicitly:
 That future rule makes `table().point_size(2.0)`,
 `scatter("x", "y").skin("nord")`, `table().frobnicate(1)`, and duplicate skins
 precise refusals without reserving any method name globally. It is recorded here
-only as the sequencing contract; PRODUCT-0024 owns its executable gates.
+only as the sequencing contract; PRODUCT-0025 owns its executable gates.
 
 ## Acceptance gates
 

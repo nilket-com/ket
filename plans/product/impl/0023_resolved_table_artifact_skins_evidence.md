@@ -3,8 +3,9 @@
 Recorded 2026-08-04 after the pre-extraction oracle, three implementation
 commits, and complete cross-feature verification. Tables now receive one closed,
 resolved artifact skin, and completed frames retain that skin atomically across
-SQL-result, Rune-view, and Markdown-cell lifecycles. PRODUCT-0024 remains the
-first Rune surface caller.
+SQL-result, Rune-view, and Markdown-cell lifecycles. PRODUCT-0024 owns the
+resolved-theme-palette prerequisite; PRODUCT-0025 remains the first Rune surface
+caller.
 
 ## Stage 0 findings
 

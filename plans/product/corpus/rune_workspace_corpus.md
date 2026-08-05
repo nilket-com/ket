@@ -406,7 +406,8 @@ failure retains it together as stale. Drawing remains clipped to the artifact,
 and a skin-only replacement cannot affect panel identity, descriptor, placement,
 focus, tabs, geometry, Markdown container chrome, or libaryon. This substrate
 adds no Rune capability, so no row above changes status. PRODUCT-0024 owns the
-first `.skin("name")` surface and the per-sink closed-register generalization.
+resolved libaryon palette prerequisite; PRODUCT-0025 owns the first
+`.skin("name")` surface and the per-sink closed-register generalization.
 
 ## Mutation and definition lifecycle
 
@@ -445,7 +446,8 @@ first `.skin("name")` surface and the per-sink closed-register generalization.
   SQL-result, Rune-view, and Markdown-cell completions now retain frame plus skin
   as one atomic artifact; stale failure preserves the pair, and skin-only
   replacement cannot escape table content bounds or perturb host layout. No Rune
-  row changes status; PRODUCT-0024 remains the first `.skin("name")` caller.
+  row changes status; PRODUCT-0024 exposes the resolved libaryon palette and
+  PRODUCT-0025 remains the first `.skin("name")` caller.
 - v0.22 (2026-08-04): PRODUCT-0021 makes normalized bar-slot occupancy a typed
   Layer-stage setting and PRODUCT-0022 spells it as the third member of the
   closed postfix register: `bar(category, value).bar_width(fraction)`. The
