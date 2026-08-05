@@ -1103,6 +1103,236 @@ where
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use iced::{Background, Font, Transformation};
+
+	#[derive(Clone, Debug, PartialEq)]
+	enum PaintOperation {
+		Fill {
+			bounds: Rectangle,
+			background: Background,
+		},
+		Text {
+			content: String,
+			position: Point,
+			color: Color,
+			clip_bounds: Rectangle,
+		},
+	}
+
+	#[derive(Default)]
+	struct RecordingRenderer {
+		operations: Vec<PaintOperation>,
+	}
+
+	impl renderer::Renderer for RecordingRenderer {
+		fn start_layer(&mut self, _bounds: Rectangle) {}
+
+		fn end_layer(&mut self) {}
+
+		fn start_transformation(&mut self, _transformation: Transformation) {}
+
+		fn end_transformation(&mut self) {}
+
+		fn fill_quad(&mut self, quad: renderer::Quad, background: impl Into<Background>) {
+			self.operations.push(PaintOperation::Fill {
+				bounds: quad.bounds,
+				background: background.into(),
+			});
+		}
+
+		fn reset(&mut self, _new_bounds: Rectangle) {}
+
+		fn allocate_image(
+			&mut self,
+			_handle: &iced::advanced::image::Handle,
+			callback: impl FnOnce(
+				Result<iced::advanced::image::Allocation, iced::advanced::image::Error>,
+			) + Send
+			+ 'static,
+		) {
+			callback(Err(iced::advanced::image::Error::Unsupported));
+		}
+	}
+
+	impl TextRenderer for RecordingRenderer {
+		type Font = Font;
+		type Paragraph = ();
+		type Editor = ();
+
+		const ICON_FONT: Font = Font::DEFAULT;
+		const CHECKMARK_ICON: char = '0';
+		const ARROW_DOWN_ICON: char = '0';
+		const SCROLL_UP_ICON: char = '0';
+		const SCROLL_DOWN_ICON: char = '0';
+		const SCROLL_LEFT_ICON: char = '0';
+		const SCROLL_RIGHT_ICON: char = '0';
+		const ICED_LOGO: char = '0';
+
+		fn default_font(&self) -> Self::Font {
+			Font::DEFAULT
+		}
+
+		fn default_size(&self) -> Pixels {
+			Pixels(FONT_SIZE)
+		}
+
+		fn fill_paragraph(
+			&mut self,
+			_paragraph: &Self::Paragraph,
+			_position: Point,
+			_color: Color,
+			_clip_bounds: Rectangle,
+		) {
+		}
+
+		fn fill_editor(
+			&mut self,
+			_editor: &Self::Editor,
+			_position: Point,
+			_color: Color,
+			_clip_bounds: Rectangle,
+		) {
+		}
+
+		fn fill_text(
+			&mut self,
+			text: Text<String, Self::Font>,
+			position: Point,
+			color: Color,
+			clip_bounds: Rectangle,
+		) {
+			self.operations.push(PaintOperation::Text {
+				content: text.content,
+				position,
+				color,
+				clip_bounds,
+			});
+		}
+	}
+
+	fn product_0023_recorded_table_operations() -> Vec<PaintOperation> {
+		let frame = polars::df!(
+			"category" => ["A", "B", "C", "D"],
+			"value" => [1_i64, 2, 3, 4],
+		)
+		.expect("table draw fixture");
+		let table = Table::new(&frame, 0).show_column_types(true);
+		let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(120.0, 120.0));
+		let mut tree = Tree {
+			tag: tree::Tag::of::<TableState>(),
+			state: tree::State::new(TableState::default()),
+			children: Vec::new(),
+		};
+		let state = tree.state.downcast_mut::<TableState>();
+		table.col_widths(state, bounds.width);
+		state.selection = Some(TableSelection {
+			anchor: (0, 1),
+			active: (0, 1),
+		});
+
+		let node = Node::new(bounds.size()).move_to(bounds.position());
+		let layout = Layout::new(&node);
+		let mut renderer = RecordingRenderer::default();
+		<Table<'_> as Widget<(), (), RecordingRenderer>>::draw(
+			&table,
+			&tree,
+			&mut renderer,
+			&(),
+			&Style::default(),
+			layout,
+			Cursor::Unavailable,
+			&bounds,
+		);
+		renderer.operations
+	}
+
+	fn product_0023_operation_signature(operations: &[PaintOperation]) -> String {
+		let color = |color: Color| {
+			format!(
+				"#{:02x}{:02x}{:02x}/{:.2}",
+				(color.r * 255.0).round() as u8,
+				(color.g * 255.0).round() as u8,
+				(color.b * 255.0).round() as u8,
+				color.a,
+			)
+		};
+		let rect = |bounds: Rectangle| {
+			format!(
+				"{:.2},{:.2},{:.2},{:.2}",
+				bounds.x, bounds.y, bounds.width, bounds.height
+			)
+		};
+		let point = |position: Point| format!("{:.2},{:.2}", position.x, position.y);
+		operations
+			.iter()
+			.map(|operation| match operation {
+				PaintOperation::Fill { bounds, background } => {
+					let Background::Color(background) = background else {
+						panic!("table oracle does not accept gradient fills")
+					};
+					format!("fill {} {}", rect(*bounds), color(*background))
+				}
+				PaintOperation::Text {
+					content,
+					position,
+					color: text_color,
+					clip_bounds,
+				} => format!(
+					"text {content:?} {} {} clip {}",
+					point(*position),
+					color(*text_color),
+					rect(*clip_bounds)
+				),
+			})
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	#[test]
+	fn product_0023_pre_extraction_draw_operation_oracle() {
+		let signature = product_0023_operation_signature(&product_0023_recorded_table_operations());
+		const PRE_EXTRACTION_DRAW_ORACLE: &str = r##"fill 10.00,20.00,120.00,120.00 #010101/1.00
+fill 10.00,20.00,28.00,48.00 #040404/1.00
+text "#  " 28.00,44.00 #dcdcdc/1.00 clip 18.00,20.00,20.00,48.00
+fill 37.00,20.00,1.00,108.00 #fafafa/0.10
+fill 38.00,20.00,80.00,48.00 #040404/1.00
+text "category" 46.00,36.00 #dcdcdc/1.00 clip 46.00,20.00,67.20,32.00
+text "str" 46.00,60.00 #b496dc/1.00 clip 46.00,52.00,67.20,16.00
+fill 179.20,20.00,1.00,48.00 #fafafa/0.10
+fill 10.00,67.00,108.00,1.00 #fafafa/0.10
+fill 10.00,68.00,28.00,28.00 #040404/1.00
+fill 10.00,95.00,28.00,1.00 #fafafa/0.10
+text "1" 18.00,82.00 #dcdcdc/1.00 clip 18.00,68.00,20.00,28.00
+fill 10.00,96.00,28.00,28.00 #040404/1.00
+fill 10.00,123.00,28.00,1.00 #fafafa/0.10
+text "2" 18.00,110.00 #dcdcdc/1.00 clip 18.00,96.00,20.00,28.00
+fill 10.00,124.00,28.00,28.00 #040404/1.00
+fill 10.00,151.00,28.00,1.00 #fafafa/0.10
+text "3" 18.00,138.00 #dcdcdc/1.00 clip 18.00,124.00,20.00,28.00
+fill 10.00,152.00,28.00,28.00 #040404/1.00
+fill 10.00,179.00,28.00,1.00 #fafafa/0.10
+text "4" 18.00,166.00 #dcdcdc/1.00 clip 18.00,152.00,20.00,28.00
+fill 38.00,68.00,80.00,28.00 #140826/1.00
+fill 38.00,95.00,80.00,1.00 #fafafa/0.10
+text "A" 46.00,82.00 #e6e6e6/1.00 clip 46.00,68.00,67.20,28.00
+fill 179.20,68.00,1.00,28.00 #fafafa/0.10
+fill 38.00,96.00,80.00,28.00 #281446/1.00
+fill 38.00,123.00,80.00,1.00 #fafafa/0.10
+fill 38.00,96.00,83.20,28.00 #8c00fa/0.25
+text "B" 46.00,110.00 #e6e6e6/1.00 clip 46.00,96.00,67.20,28.00
+fill 179.20,96.00,1.00,28.00 #fafafa/0.10
+fill 38.00,124.00,80.00,28.00 #140826/1.00
+fill 38.00,151.00,80.00,1.00 #fafafa/0.10
+text "C" 46.00,138.00 #e6e6e6/1.00 clip 46.00,124.00,67.20,28.00
+fill 179.20,124.00,1.00,28.00 #fafafa/0.10
+fill 38.00,152.00,80.00,28.00 #281446/1.00
+fill 38.00,179.00,80.00,1.00 #fafafa/0.10
+text "D" 46.00,166.00 #e6e6e6/1.00 clip 46.00,152.00,67.20,28.00
+fill 179.20,152.00,1.00,28.00 #fafafa/0.10
+fill 116.00,68.00,8.00,32.14 #8c00fa/0.50
+fill 38.00,130.00,45.33,8.00 #8c00fa/0.50"##;
+		assert_eq!(signature, PRE_EXTRACTION_DRAW_ORACLE);
+	}
 
 	fn assert_close(actual: f32, expected: f32) {
 		assert!(
