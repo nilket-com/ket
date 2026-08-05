@@ -802,7 +802,7 @@ fn rune_view_outcome(
 		.map(|view| {
 			let presentation = view.intent.presentation();
 			let output = match view.intent {
-				RuneViewIntent::Table => Ok(RuneRelationSinkOutput::Table),
+				RuneViewIntent::Table(_) => Ok(RuneRelationSinkOutput::Table),
 				RuneViewIntent::Plot(plot) => {
 					let authored_settings = plot.authored_settings;
 					match plot.body {

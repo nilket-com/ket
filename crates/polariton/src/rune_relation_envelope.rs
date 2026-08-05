@@ -25,8 +25,13 @@ const ENTRYPOINT_SUFFIX: &str = "\n}\n";
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum RuneViewIntent {
-	Table,
+	Table(RuneTableSink),
 	Plot(RunePlotIntent),
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RuneTableSink {
+	pub(crate) skin_name: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -116,7 +121,7 @@ impl From<RuneViewForm> for ViewPresentation {
 impl RuneViewIntent {
 	pub(crate) fn presentation(&self) -> ViewPresentation {
 		match self {
-			Self::Table => ViewPresentation {
+			Self::Table(_) => ViewPresentation {
 				content_kind: ViewContentKind::Table,
 				display_label: "table".to_owned(),
 				authored_title: Presence::Inherit,
@@ -885,7 +890,7 @@ fn provenance_method_on_relation(
 			root,
 			origin,
 			sinks: vec![ParsedSink {
-				intent: RuneViewIntent::Table,
+				intent: RuneViewIntent::Table(RuneTableSink::default()),
 				span: byte_range(call.span(), source.len())?,
 				name: None,
 				output_order: 0,
@@ -972,6 +977,14 @@ fn parse_contextual_sink_inner(
 	source: &str,
 	allow_identity_wrapper: bool,
 ) -> Result<ParsedSink, RuneEnvelopeError> {
+	if let Some(table) = parse_modified_table(expression, source)? {
+		return Ok(ParsedSink {
+			intent: RuneViewIntent::Table(table),
+			span: byte_range(expression.span(), source.len())?,
+			name: None,
+			output_order: 0,
+		});
+	}
 	if let Some(layer) = parse_modified_mark(expression, source)? {
 		return Ok(ParsedSink {
 			intent: RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(layer))),
@@ -1020,7 +1033,7 @@ fn parse_contextual_sink_inner(
 		return Ok(parsed);
 	}
 	let intent = match callee {
-		"table" if args.is_empty() => RuneViewIntent::Table,
+		"table" if args.is_empty() => RuneViewIntent::Table(RuneTableSink::default()),
 		"figure" => RuneViewIntent::Plot(parse_figure(expression, &args, source)?),
 		"bar" if args.len() == 2 => {
 			let Some(sink) = plot_sink_fields(PlotType::Bar, source, &args, 0)? else {
@@ -1372,6 +1385,94 @@ fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEn
 		fields.push(value);
 	}
 	Ok(LayerSpec::xy(mark, fields[0].clone(), fields[1].clone()))
+}
+
+/// PRODUCT-0025's closed postfix table-sink modifier register. Recognition is
+/// contextual: the complete chain is flattened to one authored theme name, and
+/// no palette or resolved artifact color enters the envelope.
+fn parse_modified_table(
+	expression: &ast::Expr,
+	source: &str,
+) -> Result<Option<RuneTableSink>, RuneEnvelopeError> {
+	let ast::Expr::Call(outer_call) = expression else {
+		return Ok(None);
+	};
+	if !matches!(outer_call.expr.as_ref(), ast::Expr::FieldAccess(_)) {
+		return Ok(None);
+	}
+
+	let mut current = expression;
+	let mut modifiers = Vec::new();
+	loop {
+		let ast::Expr::Call(call) = current else {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"a table modifier must follow table()",
+			);
+		};
+		let ast::Expr::FieldAccess(field) = call.expr.as_ref() else {
+			break;
+		};
+		modifiers.push((source_slice(source, field.expr_field.span())?.trim(), call));
+		current = &field.expr;
+	}
+
+	let ast::Expr::Call(root) = current else {
+		return Ok(None);
+	};
+	let callee = source_slice(source, root.expr.span())?.trim();
+	if callee != "table" {
+		return Ok(None);
+	}
+	if !root.args.is_empty() {
+		return invalid_view(
+			expression.span(),
+			source.len(),
+			"a modified table sink starts with table()",
+		);
+	}
+
+	let mut skin_name = None;
+	for (modifier, call) in modifiers {
+		match modifier {
+			"skin" => {
+				if skin_name.is_some() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"skin(...) may appear at most once on a table sink",
+					);
+				}
+				let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+				let [argument] = args.as_slice() else {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"skin(...) takes exactly one theme string literal",
+					);
+				};
+				let raw = source_slice(source, argument.span())?;
+				let Some(name) = decode_string_literal(raw) else {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"skin(...) requires a theme string literal",
+					);
+				};
+				skin_name = Some(name);
+			}
+			_ => {
+				return invalid_view(
+					expression.span(),
+					source.len(),
+					format!("unknown table modifier {modifier:?}; expected skin(string_literal)"),
+				);
+			}
+		}
+	}
+
+	Ok(Some(RuneTableSink { skin_name }))
 }
 
 /// PRODUCT-0018's closed postfix LayerModifier register. A successful parse
@@ -1742,7 +1843,9 @@ fn recognize_view_root(
 	let callee = source_slice(source, call.expr.span())?;
 	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
 	let (intent, relation) = match callee.trim() {
-		"table" if !shadows.table && args.len() == 1 => (RuneViewIntent::Table, args[0]),
+		"table" if !shadows.table && args.len() == 1 => {
+			(RuneViewIntent::Table(RuneTableSink::default()), args[0])
+		}
 		"plot.bar" if !shadows.plot && args.len() == 3 => (
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(match plot_sink(
 				PlotType::Bar,
@@ -2100,7 +2203,10 @@ mod tests {
 		let source = "let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]);\ntable(r)";
 		let transformed = transform(source).expect("table envelope");
 		assert_eq!(transformed.views.len(), 1);
-		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+		assert_eq!(
+			transformed.views[0].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
 		assert!(transformed.source.starts_with(WORKSPACE_ENTRYPOINT_PREFIX));
 		assert!(transformed.source.ends_with(ENTRYPOINT_SUFFIX));
 		assert!(transformed.source.contains("let r = workspace.table"));
@@ -2545,7 +2651,7 @@ mod tests {
 			envelope("let ket = local; workspace.table(\"t\").views([table()])");
 		assert_eq!(
 			workspace_remains.semantics().sinks,
-			vec![RuneViewIntent::Table]
+			vec![RuneViewIntent::Table(RuneTableSink::default())]
 		);
 	}
 
@@ -2729,7 +2835,10 @@ workspace.table("t").views([table()])
 				.contains("consume(layers([line(\"x\", \"y\")]));")
 		);
 		assert_eq!(transformed.views.len(), 1);
-		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+		assert_eq!(
+			transformed.views[0].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
 	}
 
 	#[test]
@@ -3002,7 +3111,10 @@ workspace.table("t").views([table()])
 				.source
 				.contains("scatter(\"a\", \"b\").point_size(4.0)")
 		);
-		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+		assert_eq!(
+			transformed.views[0].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
 	}
 
 	#[test]
@@ -3146,7 +3258,10 @@ workspace.table("t").views([table()])
 				.source
 				.contains("line(\"a\", \"b\").stroke_width(4.0)")
 		);
-		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+		assert_eq!(
+			transformed.views[0].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
 	}
 
 	#[test]
@@ -3443,6 +3558,92 @@ workspace.table("t").views([table()])
 				.is_some()
 		);
 		assert_eq!((scheduler.submitted, scheduler.executed), (1, 1));
+	}
+
+	#[test]
+	fn product_0025_table_skin_flattens_in_direct_and_named_sink_positions() {
+		let transformed = transform(
+			"workspace.table(\"t\").views([table().skin(\"terrain_rs10\"), view(\"named\", table().skin(\"nord_r\")), table()])",
+		)
+		.expect("table skin forms");
+		assert_eq!(transformed.views.len(), 3);
+
+		let RuneViewIntent::Table(first) = &transformed.views[0].intent else {
+			panic!("first sink must remain a table");
+		};
+		assert_eq!(first.skin_name.as_deref(), Some("terrain_rs10"));
+		assert_eq!(
+			transformed.views[0].identity,
+			LocalViewIdentity::Anonymous(0)
+		);
+
+		let RuneViewIntent::Table(named) = &transformed.views[1].intent else {
+			panic!("named sink must remain a table");
+		};
+		assert_eq!(named.skin_name.as_deref(), Some("nord_r"));
+		assert_eq!(
+			transformed.views[1].identity,
+			LocalViewIdentity::Named("named".to_owned())
+		);
+
+		assert_eq!(
+			transformed.views[2].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
+	}
+
+	#[test]
+	fn product_0025_table_modifier_register_is_closed_literal_and_atomic() {
+		for sink in [
+			"table().skin()",
+			"table().skin(\"nord\", \"terrain\")",
+			"table().skin(theme_name)",
+			"table().skin(\"nord\").skin(\"terrain\")",
+			"table().point_size(2.0)",
+			"table().frobnicate(1)",
+			"table(\"wrong\").skin(\"nord\")",
+			"scatter(\"x\", \"y\").skin(\"nord\")",
+		] {
+			let source =
+				format!("workspace.table(\"t\").views([table(), {sink}, line(\"x\", \"y\")])");
+			let error = transform(&source).expect_err("invalid modifier must refuse the view list");
+			let RuneEnvelopeError::InvalidView { span, .. } = error else {
+				panic!("expected an attributed table modifier refusal");
+			};
+			let expected_start = source.find(sink).unwrap() as u32;
+			assert_eq!(
+				span,
+				expected_start..expected_start + sink.len() as u32,
+				"{sink}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0025_table_skin_is_ordinary_rune_outside_proven_sink_positions() {
+		let source = r#"
+let styled = table().skin("terrain_rs10");
+consume(table().skin("nord"));
+workspace.table("t").views([table()])
+"#;
+		let transformed = transform(source).expect("one proven default table view");
+		assert!(
+			transformed
+				.source
+				.contains("table().skin(\"terrain_rs10\")")
+		);
+		assert!(transformed.source.contains("table().skin(\"nord\")"));
+		assert_eq!(
+			transformed.views[0].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
+
+		let sugar = transform("workspace.table(\"t\").table()")
+			.expect("accepted relation table sugar remains default");
+		assert_eq!(
+			sugar.views[0].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
 	}
 
 	fn relation_verb_findings(source: &str) -> Vec<&'static str> {

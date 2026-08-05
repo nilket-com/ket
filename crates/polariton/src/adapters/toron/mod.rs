@@ -215,7 +215,7 @@ mod tests {
 		assert_eq!(view.views.len(), 3);
 		for view in view.views {
 			match view.intent {
-				RuneViewIntent::Table => {
+				RuneViewIntent::Table(_) => {
 					assert!(frame.column("cat").is_ok());
 					assert!(frame.column("val").is_ok());
 				}
@@ -336,7 +336,7 @@ mod tests {
 		assert_eq!(view.views.len(), 3);
 		for view in view.views {
 			match view.intent {
-				RuneViewIntent::Table => {
+				RuneViewIntent::Table(_) => {
 					assert!(frame.column("cat").is_ok());
 					assert!(frame.column("val").is_ok());
 				}
