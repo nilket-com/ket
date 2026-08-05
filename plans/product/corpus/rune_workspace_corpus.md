@@ -416,6 +416,14 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.19 (2026-08-04): PRODUCT-0017 lands the substrate for relative scatter
+  point size without adding Rune syntax. A validated layer-local factor resolves
+  through PRODUCT-0007's existing five tiers; vector, downsampled, raster, and
+  geometric hit-testing share one radius. Size leaves prepared relation data,
+  raster paints clipped discs, and cache identity includes size. Existing 3px
+  vector output, one-layer fast paths, guides, execution, panels, placement, and
+  dashboard behavior remain unchanged. No capability row changes status;
+  PRODUCT-0018 is the first proposed surface caller.
 - v0.18 (2026-08-03): PRODUCT-0015 replaces Rune's reverse-emitted split chain
   with one engine-owned producer group. Four views tile visibly as 2x2 in direct
   presentation order; generic Compact tables and Expansive plots shape rows
