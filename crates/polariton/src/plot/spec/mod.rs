@@ -1797,6 +1797,112 @@ mod tests {
 		resolve_domains(binding, result, identity).map_err(|error| error.to_string())
 	}
 
+	fn legacy_category_frame(categories: &[String]) -> StampedResult {
+		stamped(
+			DataFrame::new(
+				categories.len(),
+				vec![
+					polars::prelude::Column::new("x".into(), vec![1.0; categories.len()]),
+					polars::prelude::Column::new("y".into(), vec![2.0; categories.len()]),
+					polars::prelude::Column::new("series".into(), categories.to_vec()),
+				],
+			)
+			.expect("legacy categorical frame"),
+		)
+	}
+
+	fn legacy_category_spec() -> AuthoredPlotSpec {
+		AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Scatter),
+			"x",
+			"y",
+			Some("series".to_owned()),
+		)
+	}
+
+	fn format_category_colors(assignments: &[CategoryColorAssignment]) -> String {
+		assignments
+			.iter()
+			.map(|assignment| {
+				format!(
+					"{}=#{:02X}{:02X}{:02X}{:02X}",
+					assignment.category,
+					assignment.color.red,
+					assignment.color.green,
+					assignment.color.blue,
+					assignment.color.alpha
+				)
+			})
+			.collect::<Vec<_>>()
+			.join(",")
+	}
+
+	#[test]
+	fn product_0029_pre_refactor_legacy_categorical_oracle() {
+		let spec = legacy_category_spec();
+		let mut actual = String::new();
+		for cardinality in 0..=DEFAULT_CATEGORICAL_LIMIT {
+			let categories = (0..cardinality)
+				.map(|index| format!("c{index}"))
+				.collect::<Vec<_>>();
+			let (resolved, _) = resolve(
+				&spec,
+				&legacy_category_frame(&categories),
+				&ColorIdentity::default(),
+			)
+			.expect("legacy domain resolves");
+			let colors = &resolved.channel(Channel::Color).expect("color").colors;
+			actual.push_str(&format!(
+				"n={cardinality} {}\n",
+				format_category_colors(colors)
+			));
+		}
+
+		let first = vec!["a".to_owned(), "b".to_owned()];
+		let (first_spec, identity) = resolve(
+			&spec,
+			&legacy_category_frame(&first),
+			&ColorIdentity::default(),
+		)
+		.expect("first live result");
+		actual.push_str(&format!(
+			"live=first {}\n",
+			format_category_colors(&first_spec.channel(Channel::Color).unwrap().colors)
+		));
+		let filtered = vec!["b".to_owned()];
+		let (filtered_spec, identity) =
+			resolve(&spec, &legacy_category_frame(&filtered), &identity)
+				.expect("filtered live result");
+		actual.push_str(&format!(
+			"live=filtered {} identity={}\n",
+			format_category_colors(&filtered_spec.channel(Channel::Color).unwrap().colors),
+			identity.len()
+		));
+		let returned = vec!["a".to_owned(), "b".to_owned()];
+		let (returned_spec, _) = resolve(&spec, &legacy_category_frame(&returned), &identity)
+			.expect("returning category");
+		actual.push_str(&format!(
+			"live=returned {}\n",
+			format_category_colors(&returned_spec.channel(Channel::Color).unwrap().colors)
+		));
+
+		let overflow = (0..=DEFAULT_CATEGORICAL_LIMIT)
+			.map(|index| format!("c{index}"))
+			.collect::<Vec<_>>();
+		let error = resolve(
+			&spec,
+			&legacy_category_frame(&overflow),
+			&ColorIdentity::default(),
+		)
+		.expect_err("legacy capacity");
+		actual.push_str(&format!("overflow={error}\n"));
+
+		assert_eq!(
+			actual,
+			include_str!("snapshots/product-0029-legacy-categorical.txt")
+		);
+	}
+
 	fn layered(first: LayerSpec, rest: impl IntoIterator<Item = LayerSpec>) -> LayeredPlotSpec {
 		let mut spec = LayeredPlotSpec::new(first);
 		for layer in rest {
