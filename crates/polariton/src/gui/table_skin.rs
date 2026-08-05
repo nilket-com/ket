@@ -250,6 +250,186 @@ fn validate_projected_skin(name: &str, skin: TableSkin) -> Result<(), TableSkinP
 mod tests {
 	use super::*;
 	use libaryon::engine::THEME_SPECS;
+	use std::collections::HashSet;
+
+	const PRODUCT_0026_DUOTONE_ORACLE: &str =
+		include_str!("snapshots/product-0026-duotone-table-skins.txt");
+
+	fn product_0026_theme_expressions() -> Vec<String> {
+		let mut expressions = Vec::with_capacity(THEME_SPECS.len() * 2 * 2 * 2 * 20);
+		for spec in THEME_SPECS {
+			for reverse in [false, true] {
+				for clip_low in [false, true] {
+					for clip_high in [false, true] {
+						for shift in 0..20 {
+							let mut suffix = String::new();
+							if reverse {
+								suffix.push('r');
+							}
+							if clip_low {
+								suffix.push('c');
+							}
+							if clip_high {
+								suffix.push('C');
+							}
+							if shift != 0 {
+								suffix.push('s');
+								suffix.push_str(&shift.to_string());
+							}
+							expressions.push(if suffix.is_empty() {
+								spec.name.to_owned()
+							} else {
+								format!("{}_{}", spec.name, suffix)
+							});
+						}
+					}
+				}
+			}
+		}
+		expressions
+	}
+
+	fn product_0026_rgba(name: &str, color: TableRgba) -> String {
+		format!(
+			"{name}=#{:02X}{:02X}{:02X}@{:08X}",
+			color.red,
+			color.green,
+			color.blue,
+			color.alpha.to_bits()
+		)
+	}
+
+	fn product_0026_serialize_duotone_oracle() -> String {
+		let mut snapshot = String::new();
+		for expression in product_0026_theme_expressions() {
+			snapshot.push_str(&expression);
+			match TableSkin::from_theme_name(&expression) {
+				Ok(skin) => {
+					snapshot.push_str("\tOK");
+					for role in [
+						("body", skin.body_background),
+						("header", skin.header_background),
+						("gutter", skin.gutter_background),
+						("even", skin.row_even_background),
+						("odd", skin.row_odd_background),
+						("grid", skin.gridline),
+						("cell_text", skin.cell_text),
+						("header_text", skin.header_text),
+						("type_text", skin.type_text),
+						("gutter_text", skin.gutter_text),
+						("selection", skin.selection_fill),
+						("scrollbar", skin.scrollbar_thumb),
+					] {
+						snapshot.push('\t');
+						snapshot.push_str(&product_0026_rgba(role.0, role.1));
+					}
+				}
+				Err(TableSkinProjectionError::UnknownTheme { name }) => {
+					panic!("registered expression {expression} became unknown as {name}");
+				}
+				Err(error @ TableSkinProjectionError::UnsuitableTheme { .. }) => {
+					let TableSkinProjectionError::UnsuitableTheme {
+						name,
+						role,
+						ratio,
+						minimum,
+					} = &error
+					else {
+						unreachable!();
+					};
+					snapshot.push_str(&format!(
+						"\tERR\tname={name}\trole={role}\tratio={:016X}\tminimum={:016X}\tdisplay={error}",
+						ratio.to_bits(),
+						minimum.to_bits()
+					));
+				}
+			}
+			snapshot.push('\n');
+		}
+		snapshot
+	}
+
+	#[test]
+	fn product_0026_complete_pre_refactor_duotone_oracle() {
+		let expressions = product_0026_theme_expressions();
+		assert_eq!(expressions.len(), 8_480);
+		assert_eq!(
+			expressions.iter().collect::<HashSet<_>>().len(),
+			8_480,
+			"every canonical modifier state must have one unique spelling"
+		);
+
+		let actual = product_0026_serialize_duotone_oracle();
+		assert_eq!(actual.lines().count(), 8_480);
+		assert_eq!(actual.bytes().filter(|byte| *byte == b'\n').count(), 8_480);
+		if std::env::var_os("UPDATE_PRODUCT_0026_DUOTONE_SKINS").is_some() {
+			let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+				.join("src/gui/snapshots/product-0026-duotone-table-skins.txt");
+			std::fs::create_dir_all(path.parent().expect("snapshot directory"))
+				.expect("create snapshot directory");
+			std::fs::write(path, &actual).expect("write PRODUCT-0026 Duotone snapshot");
+		}
+		assert_eq!(actual, PRODUCT_0026_DUOTONE_ORACLE);
+	}
+
+	#[test]
+	fn product_0026_pre_refactor_named_duotone_anchors_are_readable() {
+		let terrain = TableSkin::from_theme_name("terrain_rs10").unwrap();
+		let roles = [
+			terrain.body_background,
+			terrain.header_background,
+			terrain.gutter_background,
+			terrain.row_even_background,
+			terrain.row_odd_background,
+			terrain.gridline,
+			terrain.cell_text,
+			terrain.header_text,
+			terrain.type_text,
+			terrain.gutter_text,
+			terrain.selection_fill,
+			terrain.scrollbar_thumb,
+		];
+		let expected = [
+			(0x33, 0x33, 0x99, 1.00_f32),
+			(0x2F, 0x3F, 0x97, 1.00),
+			(0x30, 0x3B, 0x9A, 1.00),
+			(0x34, 0x38, 0x98, 1.00),
+			(0x31, 0x3E, 0x96, 1.00),
+			(0x00, 0xA9, 0xCE, 0.25),
+			(0xFF, 0xFF, 0xFF, 1.00),
+			(0xFF, 0xFF, 0xFF, 1.00),
+			(0x5D, 0xDE, 0x78, 1.00),
+			(0xFF, 0xFF, 0xFF, 1.00),
+			(0x00, 0x9B, 0xF6, 0.18),
+			(0x0A, 0x83, 0xE9, 0.60),
+		];
+		for (role, expected) in roles.into_iter().zip(expected) {
+			assert_eq!(
+				(role.red, role.green, role.blue, role.alpha.to_bits()),
+				(expected.0, expected.1, expected.2, expected.3.to_bits())
+			);
+		}
+		assert_eq!(
+			text_contrast_ratios(terrain),
+			[
+				9.699402088387815,
+				9.291850309460296,
+				9.215605551928507,
+				5.347313350977389,
+				9.468500117805823,
+				7.929932506425018,
+				7.603379704659476,
+			]
+		);
+
+		let Err(TableSkinProjectionError::UnsuitableTheme { role, ratio, .. }) =
+			TableSkin::from_theme_name("yellows")
+		else {
+			panic!("yellows must expose the pre-refactor Duotone failure");
+		};
+		assert_eq!(role, "cell text on selected odd row");
+		assert_eq!(ratio, 3.1750332126087506);
+	}
 
 	#[test]
 	fn product_0023_every_builtin_meets_text_contrast_after_declared_alpha_compositing() {
