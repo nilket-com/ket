@@ -5382,6 +5382,7 @@ fn execution_census_query_error_reason(error: &QueryError) -> String {
 
 struct ExecutionCensusWorkerHarness {
 	entry: WorkerEntry,
+	worker: Arc<ToronWorker>,
 	partition_store: Arc<InMemoryPartitionStore>,
 	cancellation_cleanup: Arc<AtomicBool>,
 	shutdown: tokio::sync::oneshot::Sender<()>,
@@ -5409,16 +5410,24 @@ async fn spawn_execution_census_worker(
 		memory_pool_max_buffer_capacity_bytes,
 	));
 	let partition_store = Arc::new(InMemoryPartitionStore::with_budget(budget));
-	let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+	// Routing receipts hash every key value crossing a shuffle edge, so the census only
+	// pays for them when a run is explicitly asking where rows went.
+	let base_worker = ToronWorker::with_partition_store_and_endpoint(
 		storage,
 		memory,
 		partition_store.clone(),
 		worker_id,
 		endpoint.clone(),
-	));
+	);
+	let worker = Arc::new(if std::env::var("TORON_CENSUS_ROUTING_RECEIPTS").is_ok() {
+		base_worker.with_shuffle_routing_observations()
+	} else {
+		base_worker
+	});
 	let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel();
 	let cancellation_cleanup = Arc::new(AtomicBool::new(false));
 	let worker_cleanup = cancellation_cleanup.clone();
+	let observed_worker = worker.clone();
 	let handle = tokio::spawn(async move {
 		let mut connections = tokio::task::JoinSet::new();
 		loop {
@@ -5445,6 +5454,7 @@ async fn spawn_execution_census_worker(
 		Ok(())
 	});
 	Ok(ExecutionCensusWorkerHarness {
+		worker: observed_worker,
 		entry: WorkerEntry {
 			worker_id,
 			endpoint,
@@ -5720,6 +5730,25 @@ async fn run_execution_census_input(
 		ExecutionCensusDistributedAttempt::LiveBackpressure(receipts) => (None, receipts),
 	};
 	let distributed_elapsed_ms = distributed_start.elapsed().as_secs_f64() * 1000.0;
+	if std::env::var("TORON_CENSUS_ROUTING_RECEIPTS").is_ok() {
+		for worker in &workers {
+			for receipt in worker.worker.drain_shuffle_routing_observations() {
+				eprintln!(
+					"routing_receipt query={} role={:?} exchange={:?} stage={:?} partition={} rows={} schema_fp={:#x} key_fp={:?}",
+					input.query_id,
+					receipt.role,
+					receipt.exchange_id,
+					receipt.stage_id,
+					receipt.partition_id,
+					receipt.row_count,
+					receipt.schema_fingerprint,
+					receipt
+						.key_fingerprint
+						.map(|fingerprint| format!("{fingerprint:#x}")),
+				);
+			}
+		}
+	}
 	shutdown_execution_census_workers(workers).await?;
 
 	// Receipts now arrive only after the live shuffle stood still, with an appender blocked
@@ -9821,6 +9850,131 @@ pub fn q11_oracle_from_rows(
 		threshold_fail_groups,
 		threshold_failed_partkeys,
 	})
+}
+
+#[cfg(test)]
+mod adr537_q11_constant_key_join {
+	use super::*;
+
+	/// Grounding for the q11 divergence: the HAVING scalar subquery lowers to an Inner
+	/// HashPartitioned join whose key is the literal `1` on both sides. This pins the
+	/// symmetry of the two join-input exchanges, which rules out the static explanations
+	/// for zero distributed rows — the cause is not partition count, key type, key value,
+	/// or consumer pairing. A future asymmetry here would reintroduce the class.
+	/// Deep multi-join binds need an explicit stack; run on a dedicated 64 MB thread.
+	#[test]
+	fn q11_constant_key_join_exchanges_are_symmetric() {
+		let (producers, consumers) = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("current-thread runtime");
+				runtime.block_on(async {
+					let spec =
+						build_perf_query_spec("q11", "strict", 0.01).expect("q11 spec at sf=0.01");
+					let (tables, _storage) = metadata_storage_from_tables(spec.tables);
+					let mut timings = PerfPhaseTimings::default();
+					let catalog = load_catalog_from_metadata(tables, &mut timings, Instant::now())
+						.expect("catalog");
+					let logical = SqlPlanner::new().plan(&spec.sql).expect("plan q11");
+					let seed_budget =
+						execution_census_distributed_budget(EXECUTION_CENSUS_FALLBACK_WIDTH);
+					let planner_config =
+						execution_census_distributed_planner_config(seed_budget.memory_per_task);
+					let bound =
+						bind_with_local_join_admissions(&logical, &catalog, &planner_config)
+							.await
+							.map(|(bound, _)| bound)
+							.expect("bind q11 under the distributed posture");
+					let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+					let context = tpch_execution_context_with_budget(task_telemetry, seed_budget);
+					let fragment_config =
+						FragmentPlanConfig::new(context.query_id, context.task_budget)
+							.with_task_context(TaskExecutionContext::from_execution_context(
+								&context,
+							))
+							.with_join_runtime_observation_mode(
+								context.join_runtime_observation_mode.clone(),
+							)
+							.with_max_in_flight_tasks(seed_budget.max_in_flight_tasks);
+					let stages = fragment_plan(bound, fragment_config).expect("fragment q11");
+
+					// The two join-input producers, by partition count and key type.
+					let producers = stages
+						.iter()
+						.flat_map(|stage| stage.tasks.iter())
+						.filter_map(|task| match &task.spec.output {
+							TaskOutputBinding::ShuffleProducer {
+								partition_count,
+								partition_key,
+								..
+							} if !partition_key.roots.is_empty() => {
+								Some((partition_count.get(), partition_key.node_types.clone()))
+							}
+							_ => None,
+						})
+						.collect::<Vec<_>>();
+
+					// Every consuming task pairs the same partition id from both upstreams.
+					let consumers = stages
+						.iter()
+						.flat_map(|stage| stage.tasks.iter())
+						.filter_map(|task| {
+							let bound = task
+								.spec
+								.inputs
+								.iter()
+								.filter_map(|input| {
+									match input {
+									toron::distributed::task::TaskInputBinding::ShuffleConsumer {
+										partition_id,
+										..
+									} => Some(*partition_id),
+									toron::distributed::task::TaskInputBinding::Scan { .. } => None,
+								}
+								})
+								.collect::<Vec<_>>();
+							(bound.len() > 1).then_some(bound)
+						})
+						.collect::<Vec<_>>();
+
+					(producers, consumers)
+				})
+			})
+			.expect("spawn grounding thread")
+			.join()
+			.expect("grounding thread");
+
+		assert_eq!(
+			producers.len(),
+			2,
+			"q11 lowers to exactly two keyed join-input producers"
+		);
+		assert_eq!(
+			producers[0], producers[1],
+			"both sides of a constant-key join must partition identically; an asymmetry \
+			 here sends the sides to different partitions and empties the join"
+		);
+		assert!(
+			producers
+				.iter()
+				.all(|(count, types)| *count > 1 && types.len() == 1),
+			"each side partitions on a single key column across more than one partition: {producers:?}"
+		);
+
+		assert!(
+			!consumers.is_empty(),
+			"the join consumer stage must bind both upstreams"
+		);
+		for bound in &consumers {
+			assert!(
+				bound.windows(2).all(|pair| pair[0] == pair[1]),
+				"a consuming task must read the same partition id from every upstream: {bound:?}"
+			);
+		}
+	}
 }
 
 #[cfg(test)]

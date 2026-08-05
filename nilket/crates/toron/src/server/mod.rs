@@ -22,10 +22,10 @@ use crate::distributed::partition_store::{
 use crate::distributed::scheduler::{DispatchOutcome, TaskDispatcher};
 use crate::distributed::task::{
 	ArrowIpcDigest, LiveProducerPartitionRef, PartitionAddress, PartitionBackend, PartitionCount,
-	PartitionEntry, PartitionManifest, RowCount, ShufflePartitionRef, TaskCompletionOutput,
-	TaskInputBinding, TaskOutputBinding, TaskSpec, TaskTelemetry, TaskTelemetryLabels,
-	is_streamable_exchange_producer, is_streamable_final_result, is_streamable_shuffle_consumer,
-	shuffle_input_table_id,
+	PartitionEntry, PartitionManifest, RowCount, ShufflePartitionRef, ShuffleRoutingObservation,
+	ShuffleRoutingRole, TaskCompletionOutput, TaskInputBinding, TaskOutputBinding, TaskSpec,
+	TaskTelemetry, TaskTelemetryLabels, is_streamable_exchange_producer,
+	is_streamable_final_result, is_streamable_shuffle_consumer, shuffle_input_table_id,
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::error::{
@@ -67,6 +67,57 @@ pub struct ToronWorker {
 	worker_id: WorkerId,
 	endpoint: WorkerEndpoint,
 	audit: ToronAuditEmitter,
+	/// Observe-only shuffle routing receipts. Off by default: the receipts hash every
+	/// key value that crosses a shuffle edge, which a production query must not pay for.
+	shuffle_routing_observations: bool,
+	shuffle_routing_log: Arc<std::sync::Mutex<Vec<ShuffleRoutingObservation>>>,
+}
+
+/// Order-independent digest of the evaluated join-key values in a batch, defined only for
+/// key programs that are plain column references — the shape a shuffle partition key takes.
+/// `None` means the key was computed rather than referenced, and the endpoint records no
+/// key identity rather than a misleading one.
+fn shuffle_key_fingerprint(batch: &RecordBatch, key: &crate::ir::BoundExprProgram) -> Option<u64> {
+	if key.roots.is_empty() {
+		return None;
+	}
+	let mut ordinals = Vec::with_capacity(key.roots.len());
+	for root in &key.roots {
+		match key.nodes.get(root.0 as usize)? {
+			crate::ir::BoundExprNode::Column(column) => ordinals.push(column.ordinal.0 as usize),
+			_ => return None,
+		}
+	}
+	let mut accumulated: u64 = 0;
+	for row in 0..batch.num_rows() {
+		let mut row_hash: u64 = 0xcbf2_9ce4_8422_2325;
+		for ordinal in &ordinals {
+			let array = batch.columns().get(*ordinal)?;
+			let rendered = arrow::util::display::array_value_to_string(array.as_ref(), row).ok()?;
+			for byte in rendered.as_bytes() {
+				row_hash ^= u64::from(*byte);
+				row_hash = row_hash.wrapping_mul(0x0000_0100_0000_01b3);
+			}
+		}
+		// Sum, so the digest does not depend on row order or batching.
+		accumulated = accumulated.wrapping_add(row_hash);
+	}
+	Some(accumulated)
+}
+
+fn shuffle_schema_fingerprint(batch: &RecordBatch) -> u64 {
+	let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+	for field in batch.schema().fields() {
+		for byte in field.name().as_bytes() {
+			hash ^= u64::from(*byte);
+			hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+		}
+		for byte in format!("{:?}", field.data_type()).as_bytes() {
+			hash ^= u64::from(*byte);
+			hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+		}
+	}
+	hash
 }
 
 struct TaskExecutionReport {
@@ -143,7 +194,36 @@ impl ToronWorker {
 			worker_id,
 			endpoint,
 			audit: ToronAuditEmitter::disabled(),
+			shuffle_routing_observations: false,
+			shuffle_routing_log: Arc::new(std::sync::Mutex::new(Vec::new())),
 		}
+	}
+
+	/// Enable observe-only shuffle routing receipts. Diagnostic only: it changes no
+	/// routing, publication or execution behavior, and costs a hash of every key value
+	/// crossing a shuffle edge, so it stays off unless a harness asks for it.
+	pub fn with_shuffle_routing_observations(mut self) -> Self {
+		self.shuffle_routing_observations = true;
+		self
+	}
+
+	fn record_shuffle_routing(
+		&self,
+		_identity: TaskIdentity,
+		receipts: Vec<ShuffleRoutingObservation>,
+	) {
+		if let Ok(mut log) = self.shuffle_routing_log.lock() {
+			log.extend(receipts);
+		}
+	}
+
+	/// Take everything observed so far. Diagnostic surface for a harness; empty unless
+	/// [`Self::with_shuffle_routing_observations`] was set.
+	pub fn drain_shuffle_routing_observations(&self) -> Vec<ShuffleRoutingObservation> {
+		self.shuffle_routing_log
+			.lock()
+			.map(|mut log| std::mem::take(&mut *log))
+			.unwrap_or_default()
 	}
 
 	pub fn with_downstream_cancellation_metrics(
@@ -421,6 +501,28 @@ impl ToronWorker {
 				}
 				ShuffleInputSide::Unknown => {}
 			}
+			if self.shuffle_routing_observations {
+				let row_count = batches
+					.iter()
+					.map(|batch| u64::try_from(batch.num_rows()).unwrap_or(0))
+					.sum::<u64>();
+				// The consumer holds no partition-key program — the join key lives in its
+				// plan — so key identity is recorded producer-side and this endpoint
+				// reports what actually arrived.
+				let receipt = ShuffleRoutingObservation {
+					role: ShuffleRoutingRole::Consumer,
+					exchange_id: *exchange_id,
+					stage_id: spec.identity.stage_id,
+					partition_id: spec.partition.map(|partition| partition.get()).unwrap_or(0),
+					row_count,
+					schema_fingerprint: batches
+						.first()
+						.map(shuffle_schema_fingerprint)
+						.unwrap_or(0),
+					key_fingerprint: None,
+				};
+				self.record_shuffle_routing(spec.identity, vec![receipt]);
+			}
 			let schema = batches
 				.first()
 				.map(RecordBatch::schema)
@@ -577,7 +679,7 @@ impl ToronWorker {
 		let TaskOutputBinding::ShuffleProducer {
 			exchange_id,
 			partition_count,
-			partition_key: _,
+			partition_key,
 			..
 		} = &spec.output
 		else {
@@ -585,6 +687,22 @@ impl ToronWorker {
 				output_digest: None,
 			});
 		};
+		if self.shuffle_routing_observations {
+			let receipts = results
+				.iter()
+				.enumerate()
+				.map(|(idx, batch)| ShuffleRoutingObservation {
+					role: ShuffleRoutingRole::Producer,
+					exchange_id: *exchange_id,
+					stage_id: identity.stage_id,
+					partition_id: u32::try_from(idx).expect("partition index fits u32"),
+					row_count: u64::try_from(batch.num_rows()).expect("row count fits u64"),
+					schema_fingerprint: shuffle_schema_fingerprint(batch),
+					key_fingerprint: shuffle_key_fingerprint(batch, partition_key),
+				})
+				.collect::<Vec<_>>();
+			self.record_shuffle_routing(identity, receipts);
+		}
 
 		let partition_count_usize =
 			usize::try_from(partition_count.get()).expect("partition count fits usize");

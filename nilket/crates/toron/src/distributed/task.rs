@@ -95,6 +95,45 @@ pub struct TaskTelemetry {
 	/// it must not be interpreted as sequential execution.
 	#[serde(default)]
 	pub partition_work_concurrency_observations: Vec<PartitionWorkConcurrencyObservation>,
+	/// Observe-only routing receipts: what a producer wrote into each shuffle partition,
+	/// and what a consumer actually received from each upstream. Behavior-neutral; they
+	/// exist so a divergence can be localized to a seam instead of inferred from a plan.
+	#[serde(default)]
+	pub shuffle_routing_observations: Vec<ShuffleRoutingObservation>,
+}
+
+/// Whether a task records shuffle routing receipts. Off by default, and a task that
+/// decodes without the field stays off — instrumentation must never switch itself on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShuffleRoutingObservationMode {
+	#[default]
+	Disabled,
+	Enabled,
+}
+
+/// Which side of a shuffle edge a receipt describes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ShuffleRoutingRole {
+	Producer,
+	Consumer,
+}
+
+/// One shuffle edge endpoint, recorded where the rows actually crossed it.
+///
+/// `key_fingerprint` is an order-independent digest of the evaluated join-key values in
+/// the rows at this endpoint, so two endpoints carrying the same key set agree regardless
+/// of row order or batching. `None` means no key program applied at this endpoint.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ShuffleRoutingObservation {
+	pub role: ShuffleRoutingRole,
+	pub exchange_id: ExchangeId,
+	pub stage_id: StageId,
+	pub partition_id: u32,
+	pub row_count: u64,
+	pub schema_fingerprint: u64,
+	pub key_fingerprint: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
