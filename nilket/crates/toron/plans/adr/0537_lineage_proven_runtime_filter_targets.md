@@ -79,6 +79,13 @@ tests the predicate directly rather than only through q11.
 3. **Genuine base-column join stays eligible** and receives the proven scan fingerprint and
    physical ordinal — not a reconstructed pair. This is the positive control that prevents the
    cut from degenerating into a blanket disable.
+   **The probe must defeat reconstruction by construction:** use a shape with more than one
+   base scan where the proven target is *not* the first scan in the plan, and a reordered
+   projection where the physical column ordinal *differs* from the post-projection ordinal.
+   Assert the descriptor carries the proven scan's fingerprint and the physical ordinal. Under
+   today's `first_scan_fingerprint` plus `single_column_root` reconstruction this test fails on
+   both axes, so it cannot pass unless the target genuinely travelled with the plan — and it
+   will catch any later reintroduction of that pairing, however disguised.
 4. **Runtime-filter-disabled execution is coherent.** With runtime filters disabled, every
    fragmentation path omits both the dependency edge and the worker scan descriptor. A test
    pins all three paths, since two of them silently ignored the flag before this ADR.
