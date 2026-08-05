@@ -24,6 +24,82 @@ const THEMED_CATEGORIES: [TokenCategory; 20] = [
 	TokenCategory::Whitespace,
 ];
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedThemePalette([Rgb; THEMED_CATEGORIES.len()]);
+
+impl ResolvedThemePalette {
+	pub const fn colors(&self) -> &[Rgb; THEMED_CATEGORIES.len()] {
+		&self.0
+	}
+
+	pub fn color(&self, index: usize) -> Option<Rgb> {
+		self.0.get(index).copied()
+	}
+
+	pub fn most_contrasting_pair(&self) -> ResolvedThemePair {
+		let mut selected = (0, 1);
+		let mut selected_ratio = self.0[0].contrast_ratio(self.0[1]);
+
+		for first in 0..self.0.len() - 1 {
+			for second in first + 1..self.0.len() {
+				let ratio = self.0[first].contrast_ratio(self.0[second]);
+				if ratio > selected_ratio {
+					selected = (first, second);
+					selected_ratio = ratio;
+				}
+			}
+		}
+
+		let (first, second) = selected;
+		let first_luminance = self.0[first].relative_luminance();
+		let second_luminance = self.0[second].relative_luminance();
+		let (darker_index, lighter_index) = if first_luminance <= second_luminance {
+			(first, second)
+		} else {
+			(second, first)
+		};
+
+		ResolvedThemePair {
+			darker_index,
+			darker: self.0[darker_index],
+			lighter_index,
+			lighter: self.0[lighter_index],
+			contrast_ratio: selected_ratio,
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ResolvedThemePair {
+	darker_index: usize,
+	darker: Rgb,
+	lighter_index: usize,
+	lighter: Rgb,
+	contrast_ratio: f64,
+}
+
+impl ResolvedThemePair {
+	pub const fn darker_index(self) -> usize {
+		self.darker_index
+	}
+
+	pub const fn darker(self) -> Rgb {
+		self.darker
+	}
+
+	pub const fn lighter_index(self) -> usize {
+		self.lighter_index
+	}
+
+	pub const fn lighter(self) -> Rgb {
+		self.lighter
+	}
+
+	pub const fn contrast_ratio(self) -> f64 {
+		self.contrast_ratio
+	}
+}
+
 fn set_color(map: &mut [Option<Rgb>; CATEGORY_COUNT], category: TokenCategory, color: Rgb) {
 	map[category as usize] = Some(color);
 }
@@ -1368,7 +1444,10 @@ pub fn canonical_theme_names() -> impl Iterator<Item = &'static str> {
 
 #[cfg(test)]
 mod tests {
-	use super::{THEME_SPECS, THEMED_CATEGORIES, Theme, canonical_theme_names, plasma, viridis};
+	use super::{
+		ResolvedThemePalette, THEME_SPECS, THEMED_CATEGORIES, Theme, canonical_theme_names, plasma,
+		viridis,
+	};
 	use crate::core::Rgb;
 	use crate::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
 	use std::collections::HashSet;
@@ -1475,6 +1554,61 @@ mod tests {
 		let terrain = Theme::try_new("terrain").unwrap().syntax_colors;
 		assert_ne!(Theme::try_new("terrain_c").unwrap().syntax_colors, terrain);
 		assert_ne!(Theme::try_new("terrain_C").unwrap().syntax_colors, terrain);
+	}
+
+	#[test]
+	fn product_0024_resolved_palette_is_fixed_complete_and_immutable() {
+		let colors = [Rgb::new(17, 34, 51); 20];
+		let palette = ResolvedThemePalette(colors);
+		assert_eq!(palette.colors(), &colors);
+		assert_eq!(palette.color(0), Some(colors[0]));
+		assert_eq!(palette.color(19), Some(colors[19]));
+		assert_eq!(palette.color(20), None);
+		assert_eq!(std::mem::size_of::<ResolvedThemePalette>(), 20 * 3);
+	}
+
+	#[test]
+	fn product_0024_contrast_pair_chooses_unique_maximum_and_orients_by_luminance() {
+		let gray = Rgb::new(127, 127, 127);
+		let mut colors = [gray; 20];
+		colors[2] = Rgb::new(255, 255, 255);
+		colors[17] = Rgb::new(0, 0, 0);
+		let palette = ResolvedThemePalette(colors);
+		let pair = palette.most_contrasting_pair();
+
+		assert_eq!(pair.darker_index(), 17);
+		assert_eq!(pair.darker(), colors[17]);
+		assert_eq!(pair.lighter_index(), 2);
+		assert_eq!(pair.lighter(), colors[2]);
+		assert_eq!(pair.contrast_ratio(), 21.0);
+	}
+
+	#[test]
+	fn product_0024_contrast_pair_breaks_maximum_ties_by_source_indices() {
+		let gray = Rgb::new(127, 127, 127);
+		let mut colors = [gray; 20];
+		colors[2] = Rgb::new(0, 0, 0);
+		colors[3] = Rgb::new(0, 0, 0);
+		colors[7] = Rgb::new(255, 255, 255);
+		colors[8] = Rgb::new(255, 255, 255);
+		let palette = ResolvedThemePalette(colors);
+		let pair = palette.most_contrasting_pair();
+
+		assert_eq!((pair.darker_index(), pair.lighter_index()), (2, 7));
+		assert_eq!(pair.darker(), colors[2]);
+		assert_eq!(pair.lighter(), colors[7]);
+	}
+
+	#[test]
+	fn product_0024_flat_palette_is_valid_and_orients_equal_luminance_by_lower_index() {
+		let color = Rgb::new(73, 73, 73);
+		let palette = ResolvedThemePalette([color; 20]);
+		let pair = palette.most_contrasting_pair();
+
+		assert_eq!((pair.darker_index(), pair.lighter_index()), (0, 1));
+		assert_eq!(pair.darker(), color);
+		assert_eq!(pair.lighter(), color);
+		assert_eq!(pair.contrast_ratio(), 1.0);
 	}
 
 	#[test]
