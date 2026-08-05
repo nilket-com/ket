@@ -7,7 +7,9 @@
 
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode};
-use crate::plot::spec::{ColorJob, LayerSettings, Override, PointSize, Presence, StrokeWidth};
+use crate::plot::spec::{
+	BarWidth, ColorJob, LayerSettings, Override, PointSize, Presence, StrokeWidth,
+};
 use iced::Color;
 use libaryon::engine::UiPalette;
 use std::sync::Arc;
@@ -165,6 +167,7 @@ pub struct PlotSettingsLayer {
 	pub scatter: Override<ScatterPolicy>,
 	pub point_size: Override<PointSize>,
 	pub stroke_width: Override<StrokeWidth>,
+	pub bar_width: Override<BarWidth>,
 	pub title: Presence<Arc<String>>,
 	pub subtitle: Presence<Arc<String>>,
 	pub x_label: Presence<Arc<String>>,
@@ -182,6 +185,7 @@ impl Default for PlotSettingsLayer {
 			scatter: Override::Inherit,
 			point_size: Override::Inherit,
 			stroke_width: Override::Inherit,
+			bar_width: Override::Inherit,
 			title: Presence::Inherit,
 			subtitle: Presence::Inherit,
 			x_label: Presence::Inherit,
@@ -300,6 +304,9 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 	if let Override::Set(value) = layer.stroke_width {
 		settings.stroke_width = value;
 	}
+	if let Override::Set(value) = layer.bar_width {
+		settings.bar_width = value;
+	}
 	apply_presence(&mut settings.title, &layer.title);
 	apply_presence(&mut settings.subtitle, &layer.subtitle);
 	apply_presence(&mut settings.x_label, &layer.x_label);
@@ -312,6 +319,9 @@ fn apply_layer_settings(settings: &mut ResolvedPlotSettings, layer: &LayerSettin
 	}
 	if let Override::Set(value) = layer.stroke_width {
 		settings.stroke_width = value;
+	}
+	if let Override::Set(value) = layer.bar_width {
+		settings.bar_width = value;
 	}
 }
 
@@ -468,6 +478,39 @@ mod tests {
 		assert_ne!(
 			cascade.resolve_for_layer(&thick).stroke_width.factor(),
 			2.0 * 0.25,
+			"cascade tiers select rather than multiply"
+		);
+	}
+
+	#[test]
+	fn product_0021_bar_width_selects_each_layer_before_pane_override() {
+		let width = |fraction| BarWidth::new(fraction).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.bar_width = width(0.2);
+		cascade.application_theme.bar_width = Override::Set(width(0.3));
+		cascade.authored_spec.bar_width = Override::Set(width(0.4));
+		cascade.layer.bar_width = Override::Set(width(0.5));
+		cascade.pane_override.bar_width = Override::Set(width(0.6));
+		assert_eq!(cascade.resolve().bar_width, width(0.6));
+
+		cascade.pane_override.bar_width = Override::Inherit;
+		assert_eq!(cascade.resolve().bar_width, width(0.5));
+		let narrow = LayerSettings {
+			bar_width: Override::Set(width(0.25)),
+			..LayerSettings::default()
+		};
+		let wide = LayerSettings {
+			bar_width: Override::Set(width(0.75)),
+			..LayerSettings::default()
+		};
+		assert_eq!(cascade.resolve_for_layer(&narrow).bar_width, width(0.25));
+		assert_eq!(cascade.resolve_for_layer(&wide).bar_width, width(0.75));
+
+		cascade.pane_override.bar_width = Override::Set(width(0.2));
+		assert_eq!(cascade.resolve_for_layer(&wide).bar_width, width(0.2));
+		assert_ne!(
+			cascade.resolve_for_layer(&wide).bar_width.fraction(),
+			0.75 * 0.2,
 			"cascade tiers select rather than multiply"
 		);
 	}

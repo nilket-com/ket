@@ -416,6 +416,10 @@ mod product_0013_baseline_tests {
 		df!("x" => [1.0, 2.0], "y" => [2.0, 4.0]).expect("frame")
 	}
 
+	fn bar_fixture() -> DataFrame {
+		df!("cat" => ["A", "B"], "val" => [1.0, 2.0]).expect("bar frame")
+	}
+
 	const LINE_SVG: &str = concat!(
 		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
 		"<path d=\"M 4.55 95.45 L 95.45 4.55 \" stroke=\"rgb(32, 145, 141)\" stroke-width=\"2\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
@@ -427,6 +431,35 @@ mod product_0013_baseline_tests {
 		"<path d=\"M 11.33 91.67 A 3.00 3.00 0 1 1 5.33 91.67 A 3.00 3.00 0 1 1 11.33 91.67 Z M 94.67 8.33 A 3.00 3.00 0 1 1 88.67 8.33 A 3.00 3.00 0 1 1 94.67 8.33 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
 		"</svg>"
 	);
+
+	const VERTICAL_BAR_SVG: &str = concat!(
+		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+		"<path d=\"M 7.00 54.55 L 43.00 54.55 L 43.00 100.00 L 7.00 100.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"<path d=\"M 57.00 9.09 L 93.00 9.09 L 93.00 100.00 L 57.00 100.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"</svg>"
+	);
+
+	const HORIZONTAL_BAR_SVG: &str = concat!(
+		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+		"<path d=\"M 0.00 57.00 L 45.45 57.00 L 45.45 93.00 L 0.00 93.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"<path d=\"M 0.00 7.00 L 90.91 7.00 L 90.91 43.00 L 0.00 43.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"</svg>"
+	);
+
+	#[test]
+	fn product_0021_pre_geometry_bar_svg_baselines() {
+		let prepared = Arc::new(bar::prepare_bar_data(&bar_fixture(), "cat", "", "val"));
+		for (orientation, expected) in [
+			(Orientation::Vertical, VERTICAL_BAR_SVG),
+			(Orientation::Horizontal, HORIZONTAL_BAR_SVG),
+		] {
+			let kernel = BarPlotKernel {
+				prepared_data: Arc::clone(&prepared),
+				orientation,
+			};
+			assert_eq!(render_marks(&kernel), expected);
+		}
+	}
 
 	#[test]
 	fn product_0013_pre_extraction_line_svg_baseline() {

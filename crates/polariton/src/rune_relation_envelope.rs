@@ -1484,6 +1484,7 @@ fn parse_modified_mark(
 	layer.settings = LayerSettings {
 		point_size: point_size.map_or(Override::Inherit, Override::Set),
 		stroke_width: stroke_width.map_or(Override::Inherit, Override::Set),
+		bar_width: Override::Inherit,
 	};
 	Ok(Some(layer))
 }

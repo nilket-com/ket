@@ -151,6 +151,48 @@ impl fmt::Display for StrokeWidthError {
 
 impl std::error::Error for StrokeWidthError {}
 
+/// PRODUCT-0021's normalized occupancy of one allocated bar slot. Unlike point
+/// and stroke settings this is a proportion, not a relative pixel factor.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarWidth(f32);
+
+// `BarWidth::new` excludes NaN, so equality is reflexive for every value the
+// private representation can contain.
+impl Eq for BarWidth {}
+
+impl BarWidth {
+	pub const DEFAULT: Self = Self(0.9);
+
+	pub fn new(fraction: f32) -> Result<Self, BarWidthError> {
+		if fraction.is_finite() && fraction > 0.0 && fraction <= 1.0 {
+			Ok(Self(fraction))
+		} else {
+			Err(BarWidthError { fraction })
+		}
+	}
+
+	pub const fn fraction(self) -> f32 {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BarWidthError {
+	fraction: f32,
+}
+
+impl fmt::Display for BarWidthError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"bar width must be finite, greater than 0, and at most 1, got {}",
+			self.fraction
+		)
+	}
+}
+
+impl std::error::Error for BarWidthError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthoredChannel {
 	Named(String),
@@ -375,6 +417,7 @@ impl LayerEncoding {
 pub struct LayerSettings {
 	pub point_size: Override<PointSize>,
 	pub stroke_width: Override<StrokeWidth>,
+	pub bar_width: Override<BarWidth>,
 }
 
 impl Default for LayerSettings {
@@ -382,6 +425,7 @@ impl Default for LayerSettings {
 		Self {
 			point_size: Override::Inherit,
 			stroke_width: Override::Inherit,
+			bar_width: Override::Inherit,
 		}
 	}
 }
@@ -2261,5 +2305,22 @@ mod tests {
 		let scatter = LayerSpec::xy(LayerMark::Scatter, "x", "y");
 		assert_eq!(line.settings.stroke_width, Override::Inherit);
 		assert_eq!(scatter.settings.stroke_width, Override::Inherit);
+	}
+
+	#[test]
+	fn product_0021_bar_width_is_normalized_and_layer_constructors_inherit() {
+		assert_eq!(BarWidth::DEFAULT.fraction(), 0.9);
+		for accepted in [f32::MIN_POSITIVE, 0.5, 0.9, 1.0] {
+			assert_eq!(BarWidth::new(accepted).unwrap().fraction(), accepted);
+		}
+		for invalid in [0.0, -0.1, 1.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+			assert!(BarWidth::new(invalid).is_err(), "accepted {invalid}");
+		}
+
+		let line = LayerSpec::xy(LayerMark::Line, "x", "y");
+		let scatter = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		assert_eq!(line.settings.bar_width, Override::Inherit);
+		assert_eq!(scatter.settings.bar_width, Override::Inherit);
+		assert_eq!([LayerMark::Line, LayerMark::Scatter].len(), 2);
 	}
 }
