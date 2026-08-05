@@ -1,6 +1,8 @@
 use crate::plot::common::{
 	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
+use crate::plot::spec::LayerSettings;
+use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::Text;
 use iced::{Color, Rectangle};
@@ -11,6 +13,14 @@ use std::sync::Arc;
 pub struct BarPlotKernel {
 	pub prepared_data: Arc<BarPreparedData>,
 	pub orientation: Orientation,
+	pub layer_settings: LayerSettings,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BarRectangle {
+	rect: Rectangle,
+	category_index: usize,
+	group_index: usize,
 }
 
 fn category_label(value: AnyValue<'_>) -> String {
@@ -18,6 +28,114 @@ fn category_label(value: AnyValue<'_>) -> String {
 		value.to_string()
 	} else {
 		value.to_string().replace('"', "")
+	}
+}
+
+impl BarPlotKernel {
+	fn bar_rectangles(
+		&self,
+		transform: &CoordinateTransformer,
+		width_fraction: f32,
+	) -> Vec<BarRectangle> {
+		let num_cats = self.prepared_data.categories.len();
+		let num_groups = self.prepared_data.group_names.len();
+		let mut bars = Vec::with_capacity(num_cats.saturating_mul(num_groups));
+		match self.orientation {
+			Orientation::Vertical => {
+				let y_base = if let PlotLayout::CategoricalX { y_range, .. } = transform.layout {
+					y_range.0
+				} else {
+					0.0
+				};
+				let band = transform.bounds.width / num_cats as f32;
+				let slot = band / num_groups as f32;
+				let padding = slot * (1.0 - width_fraction) / 2.0;
+				for category_index in 0..num_cats {
+					let category_left = category_index as f32 * band;
+					for group_index in 0..num_groups {
+						let value = self.prepared_data.values[category_index][group_index];
+						if value <= y_base {
+							continue;
+						}
+						let (top, _) = transform.categorical(category_index, value);
+						let (bottom, _) = transform.categorical(category_index, y_base);
+						bars.push(BarRectangle {
+							rect: Rectangle {
+								x: category_left + group_index as f32 * slot + padding,
+								y: top.y,
+								width: slot * width_fraction,
+								height: (bottom.y - top.y).max(1.0),
+							},
+							category_index,
+							group_index,
+						});
+					}
+				}
+			}
+			Orientation::Horizontal => {
+				let x_base = if let PlotLayout::CategoricalY { x_range, .. } = transform.layout {
+					x_range.0
+				} else {
+					0.0
+				};
+				let band = transform.bounds.height / num_cats as f32;
+				let slot = band / num_groups as f32;
+				let padding = slot * (1.0 - width_fraction) / 2.0;
+				for category_index in 0..num_cats {
+					let category_top = (num_cats - 1 - category_index) as f32 * band;
+					for group_index in 0..num_groups {
+						let value = self.prepared_data.values[category_index][group_index];
+						if value <= x_base {
+							continue;
+						}
+						let (right, _) = transform.categorical(category_index, value);
+						let (left, _) = transform.categorical(category_index, x_base);
+						let reversed_group = num_groups - 1 - group_index;
+						bars.push(BarRectangle {
+							rect: Rectangle {
+								x: left.x,
+								y: category_top + reversed_group as f32 * slot + padding,
+								width: (right.x - left.x).max(1.0),
+								height: slot * width_fraction,
+							},
+							category_index,
+							group_index,
+						});
+					}
+				}
+			}
+		}
+		bars
+	}
+
+	fn hover_resolved(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &ResolvedPlotSettings,
+	) -> Option<String> {
+		let cursor_pos = cursor.position()?;
+		let hit = self
+			.bar_rectangles(transform, settings.bar_width.fraction())
+			.into_iter()
+			.find(|bar| bar.rect.contains(cursor_pos))?;
+		let category = &self.prepared_data.categories[hit.category_index];
+		let group = &self.prepared_data.group_names[hit.group_index];
+		let approximate_value = match transform.layout {
+			PlotLayout::CategoricalX { y_range, .. } => {
+				let scale = transform.bounds.height as f64 / (y_range.1 - y_range.0);
+				y_range.0 + (transform.bounds.height - cursor_pos.y) as f64 / scale
+			}
+			PlotLayout::CategoricalY { x_range, .. } => {
+				let scale = transform.bounds.width as f64 / (x_range.1 - x_range.0);
+				x_range.0 + cursor_pos.x as f64 / scale
+			}
+			_ => return None,
+		};
+		Some(format!(
+			"{}: {} (Value: ~{:.2})",
+			category, group, approximate_value
+		))
 	}
 }
 
@@ -49,166 +167,53 @@ impl PlotKernel for BarPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_cats = self.prepared_data.categories.len();
 		let num_groups = self.prepared_data.group_names.len();
-		match self.orientation {
-			Orientation::Vertical => {
-				let y_base = if let PlotLayout::CategoricalX { y_range, .. } = transform.layout {
-					y_range.0
-				} else {
-					0.0
-				};
-				let total_band_width = transform.bounds.width / num_cats as f32;
-				let group_area_width = total_band_width * 0.8;
-				let group_area_offset = (total_band_width - group_area_width) / 2.0;
-				let sub_group_width = group_area_width / num_groups as f32;
-				let bar_padding = sub_group_width * 0.05;
-				for i in 0..num_cats {
-					let cat_left = (i as f32 * total_band_width) + group_area_offset;
-					for j in 0..num_groups {
-						let val = self.prepared_data.values[i][j];
-						if val <= y_base {
-							continue;
-						}
-						let (p_top, _) = transform.categorical(i, val);
-						let (p_bottom, _) = transform.categorical(i, y_base);
-						let x_start = cat_left + (j as f32 * sub_group_width) + bar_padding;
-						let x_end = cat_left + ((j + 1) as f32 * sub_group_width) - bar_padding;
-						let bar_rect = Rectangle {
-							x: x_start,
-							y: p_top.y,
-							width: (x_end - x_start).max(1.0),
-							height: (p_bottom.y - p_top.y).max(1.0),
-						};
-						let t = if num_groups > 1 {
-							j as f32 / (num_groups - 1) as f32
-						} else {
-							0.5
-						};
-						let color = settings.color_theme.get_color(t);
-						backend.fill_rectangle(bar_rect.position(), bar_rect.size(), color);
-					}
-				}
-			}
-			Orientation::Horizontal => {
-				let x_base = if let PlotLayout::CategoricalY { x_range, .. } = transform.layout {
-					x_range.0
-				} else {
-					0.0
-				};
-				let total_band_height = transform.bounds.height / num_cats as f32;
-				let group_area_height = total_band_height * 0.8;
-				let group_area_offset = (total_band_height - group_area_height) / 2.0;
-				let sub_group_height = group_area_height / num_groups as f32;
-				let bar_padding = sub_group_height * 0.05;
-				for i in 0..num_cats {
-					let cat_top = (num_cats - 1 - i) as f32 * total_band_height + group_area_offset;
-					for j in 0..num_groups {
-						let val = self.prepared_data.values[i][j];
-						if val <= x_base {
-							continue;
-						}
-						let (p_right, _) = transform.categorical(i, val);
-						let (p_left, _) = transform.categorical(i, x_base);
-						let y_start =
-							cat_top + (num_groups - 1 - j) as f32 * sub_group_height + bar_padding;
-						let y_end =
-							cat_top + (num_groups - j) as f32 * sub_group_height - bar_padding;
-						let bar_rect = Rectangle {
-							x: p_left.x,
-							y: y_start,
-							width: (p_right.x - p_left.x).max(1.0),
-							height: (y_end - y_start).max(1.0),
-						};
-						let t = if num_groups > 1 {
-							j as f32 / (num_groups - 1) as f32
-						} else {
-							0.5
-						};
-						let color = settings.color_theme.get_color(t);
-						backend.fill_rectangle(bar_rect.position(), bar_rect.size(), color);
-					}
-				}
-			}
+		for bar in self.bar_rectangles(transform, settings.bar_width.fraction()) {
+			let t = if num_groups > 1 {
+				bar.group_index as f32 / (num_groups - 1) as f32
+			} else {
+				0.5
+			};
+			backend.fill_rectangle(
+				bar.rect.position(),
+				bar.rect.size(),
+				settings.color_theme.get_color(t),
+			);
 		}
 	}
 
+	fn plot_with_settings(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+	) {
+		self.plot(
+			backend,
+			bounds,
+			transform,
+			cursor,
+			settings.resolve_for_layer(&self.layer_settings),
+		);
+	}
+
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		if let Some(cursor_pos) = cursor.position() {
-			let num_groups = self.prepared_data.group_names.len();
-			match self.orientation {
-				Orientation::Vertical => {
-					if let PlotLayout::CategoricalX {
-						categories,
-						y_range,
-					} = transform.layout
-					{
-						for (i, cat_name) in categories.iter().enumerate() {
-							let (center, band_width) = transform.categorical(i, 0.0);
-							let left = center.x - band_width / 2.0;
-							let right = center.x + band_width / 2.0;
-							if cursor_pos.x >= left && cursor_pos.x <= right {
-								let group_area_width = band_width * 0.8;
-								let group_area_offset = (band_width - group_area_width) / 2.0;
-								let cluster_left = left + group_area_offset;
-								let cluster_right = left + group_area_offset + group_area_width;
-								if cursor_pos.x >= cluster_left && cursor_pos.x <= cluster_right {
-									let sub_group_width = group_area_width / num_groups as f32;
-									let local_x = cursor_pos.x - cluster_left;
-									let group_idx = (local_x / sub_group_width).floor() as usize;
-									let group_idx = group_idx.min(num_groups - 1);
-									let y_scale =
-										transform.bounds.height as f64 / (y_range.1 - y_range.0);
-									let data_y = y_range.0
-										+ (transform.bounds.height - cursor_pos.y) as f64 / y_scale;
-									let group_name = &self.prepared_data.group_names[group_idx];
-									return Some(format!(
-										"{}: {} (Value: ~{:.2})",
-										cat_name, group_name, data_y
-									));
-								}
-							}
-						}
-					}
-				}
-				Orientation::Horizontal => {
-					if let PlotLayout::CategoricalY {
-						categories,
-						x_range,
-					} = transform.layout
-					{
-						for (i, cat_name) in categories.iter().enumerate() {
-							let (center, band_height) = transform.categorical(i, 0.0);
-							let top = center.y - band_height / 2.0;
-							let bottom = center.y + band_height / 2.0;
-							if cursor_pos.y >= top && cursor_pos.y <= bottom {
-								let group_area_height = band_height * 0.8;
-								let group_area_offset = (band_height - group_area_height) / 2.0;
-								let cluster_top = top + group_area_offset;
-								let cluster_bottom = top + group_area_offset + group_area_height;
-								if cursor_pos.y >= cluster_top && cursor_pos.y <= cluster_bottom {
-									let sub_group_height = group_area_height / num_groups as f32;
-									let local_y = cursor_pos.y - cluster_top;
-									let group_idx = (num_groups
-										- 1 - (local_y / sub_group_height).floor()
-										as usize)
-										.min(num_groups - 1);
-									let x_scale =
-										transform.bounds.width as f64 / (x_range.1 - x_range.0);
-									let data_x = x_range.0 + cursor_pos.x as f64 / x_scale;
-									let group_name = &self.prepared_data.group_names[group_idx];
-									return Some(format!(
-										"{}: {} (Value: ~{:.2})",
-										cat_name, group_name, data_x
-									));
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		None
+		self.hover_resolved(transform, cursor, &ResolvedPlotSettings::default())
+	}
+
+	fn hover_with_settings(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+	) -> Option<String> {
+		self.hover_resolved(
+			transform,
+			cursor,
+			&settings.resolve_for_layer(&self.layer_settings),
+		)
 	}
 
 	fn draw_legend(

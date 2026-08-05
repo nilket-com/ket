@@ -22,9 +22,9 @@ use crate::plot::kernels::stacked_area::{self, StackedAreaPlotKernel};
 use crate::plot::kernels::stacked_bar::{self, StackedBarPlotKernel};
 use crate::plot::kernels::violin::{self, ViolinPlotKernel};
 use crate::plot::spec::{
-	Channel, LayerMark, LayeredPlotSpec, NonEmpty, PlotProvenance, ResolvedKernelFields,
-	ResolvedLayerSpec, ResolvedLayout, ResolvedPlotSpec, StampedResult, resolve_layered_channels,
-	resolve_layered_domains,
+	Channel, LayerMark, LayerSettings, LayeredPlotSpec, NonEmpty, PlotProvenance,
+	ResolvedKernelFields, ResolvedLayerSpec, ResolvedLayout, ResolvedPlotSpec, StampedResult,
+	resolve_layered_channels, resolve_layered_domains,
 };
 use polars::frame::DataFrame;
 use std::sync::Arc;
@@ -63,18 +63,14 @@ pub fn create_plot(
 			category,
 			group,
 			value,
-		} => {
-			let prepared =
-				bar::prepare_bar_data(df, category, group.as_deref().unwrap_or(""), value);
-			Arc::new(BarPlotKernel {
-				prepared_data: Arc::new(prepared),
-				orientation: if plot_type == PlotType::HorizontalBar {
-					Orientation::Horizontal
-				} else {
-					Orientation::Vertical
-				},
-			})
-		}
+		} => create_bar_kernel(
+			df,
+			category,
+			group.as_deref().unwrap_or(""),
+			value,
+			plot_type,
+			LayerSettings::default(),
+		),
 		ResolvedKernelFields::Scatter { color, x, y } => {
 			let scatter_data = Arc::new(scatter::prepare_scatter_data_resolved(
 				df, spec, width, height,
@@ -229,6 +225,50 @@ pub fn create_plot(
 	}
 }
 
+fn create_bar_kernel(
+	df: &DataFrame,
+	category: &str,
+	group: &str,
+	value: &str,
+	plot_type: PlotType,
+	layer_settings: LayerSettings,
+) -> Arc<dyn PlotKernel + Send + Sync> {
+	Arc::new(BarPlotKernel {
+		prepared_data: Arc::new(bar::prepare_bar_data(df, category, group, value)),
+		orientation: if plot_type == PlotType::HorizontalBar {
+			Orientation::Horizontal
+		} else {
+			Orientation::Vertical
+		},
+		layer_settings,
+	})
+}
+
+/// Build a standalone mark with PRODUCT-0007 Layer-stage settings without
+/// admitting that mark to PRODUCT-0013's ordered shared-Cartesian layer type.
+pub fn create_styled_plot(
+	spec: &ResolvedPlotSpec,
+	df: &DataFrame,
+	layer_settings: LayerSettings,
+) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
+	let plot_type = spec.composition.primary_plot_type();
+	match spec.kernel_fields.as_ref() {
+		ResolvedKernelFields::Bar {
+			category,
+			group,
+			value,
+		} => Ok(create_bar_kernel(
+			df,
+			category,
+			group.as_deref().unwrap_or(""),
+			value,
+			plot_type,
+			layer_settings,
+		)),
+		_ => Err("standalone Layer settings are not implemented for this plot mark".to_owned()),
+	}
+}
+
 /// Lower PRODUCT-0013's additive layered specification. One layer deliberately
 /// reuses the established kernel path; multiple layers preserve authored order
 /// in the ordered shared-domain composite.
@@ -373,7 +413,8 @@ mod product_0013_baseline_tests {
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::export::SvgBackend;
 	use crate::plot::spec::{
-		AuthoredPlotSpec, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize,
+		AuthoredPlotSpec, BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override,
+		PointSize,
 	};
 	use crate::plot::theme::PlotSettings;
 	use iced::advanced::mouse::Cursor;
@@ -432,33 +473,174 @@ mod product_0013_baseline_tests {
 		"</svg>"
 	);
 
-	const VERTICAL_BAR_SVG: &str = concat!(
+	const LEGACY_VERTICAL_BAR_SVG: &str = concat!(
 		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
 		"<path d=\"M 7.00 54.55 L 43.00 54.55 L 43.00 100.00 L 7.00 100.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
 		"<path d=\"M 57.00 9.09 L 93.00 9.09 L 93.00 100.00 L 57.00 100.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
 		"</svg>"
 	);
 
-	const HORIZONTAL_BAR_SVG: &str = concat!(
+	const LEGACY_HORIZONTAL_BAR_SVG: &str = concat!(
 		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
 		"<path d=\"M 0.00 57.00 L 45.45 57.00 L 45.45 93.00 L 0.00 93.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
 		"<path d=\"M 0.00 7.00 L 90.91 7.00 L 90.91 43.00 L 0.00 43.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
 		"</svg>"
 	);
 
+	const VERTICAL_BAR_SVG: &str = concat!(
+		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+		"<path d=\"M 2.50 54.55 L 47.50 54.55 L 47.50 100.00 L 2.50 100.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"<path d=\"M 52.50 9.09 L 97.50 9.09 L 97.50 100.00 L 52.50 100.00 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"</svg>"
+	);
+
+	const HORIZONTAL_BAR_SVG: &str = concat!(
+		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+		"<path d=\"M 0.00 52.50 L 45.45 52.50 L 45.45 97.50 L 0.00 97.50 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"<path d=\"M 0.00 2.50 L 90.91 2.50 L 90.91 47.50 L 0.00 47.50 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"</svg>"
+	);
+
 	#[test]
-	fn product_0021_pre_geometry_bar_svg_baselines() {
+	fn product_0021_full_band_default_retires_the_legacy_inset() {
 		let prepared = Arc::new(bar::prepare_bar_data(&bar_fixture(), "cat", "", "val"));
-		for (orientation, expected) in [
-			(Orientation::Vertical, VERTICAL_BAR_SVG),
-			(Orientation::Horizontal, HORIZONTAL_BAR_SVG),
+		for (orientation, expected, legacy) in [
+			(
+				Orientation::Vertical,
+				VERTICAL_BAR_SVG,
+				LEGACY_VERTICAL_BAR_SVG,
+			),
+			(
+				Orientation::Horizontal,
+				HORIZONTAL_BAR_SVG,
+				LEGACY_HORIZONTAL_BAR_SVG,
+			),
 		] {
 			let kernel = BarPlotKernel {
 				prepared_data: Arc::clone(&prepared),
 				orientation,
+				layer_settings: LayerSettings::default(),
 			};
-			assert_eq!(render_marks(&kernel), expected);
+			let rendered = render_marks(&kernel);
+			assert_eq!(rendered, expected);
+			assert_ne!(rendered, legacy, "the hidden 80% inset must be retired");
 		}
+	}
+
+	fn styled_bar(orientation: Orientation, fraction: f32) -> BarPlotKernel {
+		BarPlotKernel {
+			prepared_data: Arc::new(bar::prepare_bar_data(&bar_fixture(), "cat", "", "val")),
+			orientation,
+			layer_settings: LayerSettings {
+				bar_width: Override::Set(BarWidth::new(fraction).unwrap()),
+				..LayerSettings::default()
+			},
+		}
+	}
+
+	#[test]
+	fn product_0021_bar_width_occupies_the_full_band_slot_in_both_orientations() {
+		for (orientation, baseline, half_rectangles, touching_rectangles) in [
+			(
+				Orientation::Vertical,
+				VERTICAL_BAR_SVG,
+				["M 12.50 54.55 L 37.50", "M 62.50 9.09 L 87.50"],
+				["M 0.00 54.55 L 50.00", "M 50.00 9.09 L 100.00"],
+			),
+			(
+				Orientation::Horizontal,
+				HORIZONTAL_BAR_SVG,
+				["M 0.00 62.50 L 45.45", "M 0.00 12.50 L 90.91"],
+				["M 0.00 50.00 L 45.45", "M 0.00 0.00 L 90.91"],
+			),
+		] {
+			let default = styled_bar(orientation, 0.9);
+			assert_eq!(
+				render_marks_with_settings(&default, &PlotSettings::default()),
+				baseline
+			);
+			let half =
+				render_marks_with_settings(&styled_bar(orientation, 0.5), &PlotSettings::default());
+			for rectangle in half_rectangles {
+				assert!(half.contains(rectangle), "missing {rectangle:?} in {half}");
+			}
+			let touching =
+				render_marks_with_settings(&styled_bar(orientation, 1.0), &PlotSettings::default());
+			for rectangle in touching_rectangles {
+				assert!(
+					touching.contains(rectangle),
+					"missing {rectangle:?} in {touching}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn product_0021_bar_hit_uses_the_same_visible_rectangle_as_paint() {
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let settings = PlotSettings::default();
+		for (orientation, visible, padding, expected) in [
+			(
+				Orientation::Vertical,
+				Point::new(20.0, 75.0),
+				Point::new(10.0, 75.0),
+				"A: Value (Value: ~0.55)",
+			),
+			(
+				Orientation::Horizontal,
+				Point::new(20.0, 70.0),
+				Point::new(20.0, 60.0),
+				"A: Value (Value: ~0.44)",
+			),
+		] {
+			let kernel = styled_bar(orientation, 0.5);
+			let layout = kernel.layout(settings.resolve());
+			let transform = CoordinateTransformer::new(&layout, bounds);
+			assert_eq!(
+				kernel.hover_with_settings(&transform, Cursor::Available(visible), &settings),
+				Some(expected.to_owned())
+			);
+			assert_eq!(
+				kernel.hover_with_settings(&transform, Cursor::Available(padding), &settings),
+				None
+			);
+		}
+	}
+
+	#[test]
+	fn product_0021_bar_width_changes_no_layout_preparation_or_guide() {
+		let narrow = styled_bar(Orientation::Vertical, 0.25);
+		let wide = styled_bar(Orientation::Vertical, 1.0);
+		let ranges = |kernel: &BarPlotKernel| match kernel.layout(ResolvedPlotSettings::default()) {
+			PlotLayout::CategoricalX {
+				categories,
+				y_range,
+			} => (categories, y_range),
+			_ => panic!("vertical bar layout"),
+		};
+		assert_eq!(ranges(&narrow), ranges(&wide));
+		assert_eq!(
+			narrow.prepared_data.categories,
+			wide.prepared_data.categories
+		);
+		assert_eq!(
+			narrow.prepared_data.group_names,
+			wide.prepared_data.group_names
+		);
+		assert_eq!(narrow.prepared_data.values, wide.prepared_data.values);
+		assert_eq!(narrow.x_label(), wide.x_label());
+		assert_eq!(narrow.y_label(), wide.y_label());
+
+		let legend = |kernel: &BarPlotKernel| {
+			let mut backend = SvgBackend::new(100.0, 100.0);
+			kernel.draw_legend(
+				&mut backend,
+				Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+				ResolvedPlotSettings::default(),
+			);
+			backend.finish()
+		};
+		assert_eq!(legend(&narrow), legend(&wide));
 	}
 
 	#[test]

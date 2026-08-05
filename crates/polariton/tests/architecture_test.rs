@@ -546,3 +546,35 @@ fn product_0020_extends_the_closed_typed_modifier_register() {
 		"the second setting does not authorize an open modifier map"
 	);
 }
+
+#[test]
+fn product_0021_bar_width_is_render_state_without_bar_layer_admission() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let bar = std::fs::read_to_string(root.join("plot/kernels/bar.rs")).expect("read bar kernel");
+	let prepared = bar
+		.split("pub struct BarPreparedData {")
+		.nth(1)
+		.and_then(|tail| tail.split("}\n").next())
+		.expect("BarPreparedData body");
+	assert!(
+		!prepared.contains("bar_width") && !prepared.contains("BarWidth"),
+		"bar width must remain render state, not prepared relation data"
+	);
+	assert_eq!(
+		bar.matches("bar_rectangles(transform").count(),
+		2,
+		"paint and hover must consume the same bar rectangle calculation"
+	);
+
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let marks = spec
+		.split("pub enum LayerMark {")
+		.nth(1)
+		.and_then(|tail| tail.split("}\n").next())
+		.expect("LayerMark body");
+	assert!(marks.contains("Line") && marks.contains("Scatter"));
+	assert!(
+		!marks.contains("Bar"),
+		"styleability must not admit bar layering"
+	);
+}
