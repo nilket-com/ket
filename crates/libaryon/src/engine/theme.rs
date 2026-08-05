@@ -1370,11 +1370,111 @@ pub fn canonical_theme_names() -> impl Iterator<Item = &'static str> {
 mod tests {
 	use super::{THEME_SPECS, THEMED_CATEGORIES, Theme, canonical_theme_names, plasma, viridis};
 	use crate::core::Rgb;
-	use crate::svp::rust_highlight::TokenCategory;
+	use crate::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
 	use std::collections::HashSet;
+
+	const PRODUCT_0024_SYNTAX_SNAPSHOT: &str =
+		include_str!("snapshots/product-0024-theme-syntax.txt");
+
+	const ALL_CATEGORIES: [TokenCategory; CATEGORY_COUNT] = [
+		TokenCategory::Keyword,
+		TokenCategory::String,
+		TokenCategory::Comment,
+		TokenCategory::Type,
+		TokenCategory::Function,
+		TokenCategory::Number,
+		TokenCategory::Punctuation,
+		TokenCategory::Variable,
+		TokenCategory::Constant,
+		TokenCategory::Macro,
+		TokenCategory::Module,
+		TokenCategory::Lifetime,
+		TokenCategory::Attribute,
+		TokenCategory::Operator,
+		TokenCategory::SelfKeyword,
+		TokenCategory::BuiltinType,
+		TokenCategory::MutableVariable,
+		TokenCategory::Method,
+		TokenCategory::Crate,
+		TokenCategory::Whitespace,
+		TokenCategory::Unclassified,
+		TokenCategory::GitStaged,
+		TokenCategory::GitUnstaged,
+		TokenCategory::GitUntracked,
+		TokenCategory::GitRename,
+		TokenCategory::BodyText,
+	];
 
 	fn color_for(theme: &Theme, category: TokenCategory) -> Rgb {
 		theme.syntax_colors[category as usize].expect("themed color")
+	}
+
+	fn product_0024_theme_expressions() -> Vec<String> {
+		let mut expressions = Vec::new();
+		for spec in THEME_SPECS {
+			for name in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
+				expressions.push(name.to_string());
+				expressions.push(format!("{name}_r"));
+				expressions.push(format!("{name}_c"));
+				expressions.push(format!("{name}_C"));
+				for shift in 0..THEMED_CATEGORIES.len() {
+					expressions.push(format!("{name}_s{shift}"));
+				}
+			}
+		}
+		expressions.extend(
+			["viridis_cCr", "viridis_rcC", "classic_rC", "glowmax_rs1"]
+				.into_iter()
+				.map(str::to_string),
+		);
+		expressions
+	}
+
+	fn product_0024_serialize_theme_syntax() -> String {
+		let mut snapshot = String::new();
+		for expression in product_0024_theme_expressions() {
+			let theme = Theme::try_new(&expression)
+				.unwrap_or_else(|error| panic!("snapshot expression {expression}: {error}"));
+			snapshot.push_str(&expression);
+			for category in ALL_CATEGORIES {
+				snapshot.push('\t');
+				snapshot.push_str(&format!("{category:?}="));
+				match theme.syntax_colors[category as usize] {
+					Some(color) => snapshot.push_str(&color.to_hex()),
+					None => snapshot.push('-'),
+				}
+			}
+			snapshot.push('\n');
+		}
+		snapshot
+	}
+
+	#[test]
+	fn product_0024_complete_pre_refactor_theme_syntax_oracle() {
+		let actual = product_0024_serialize_theme_syntax();
+		if std::env::var_os("UPDATE_PRODUCT_0024_THEME_SYNTAX").is_some() {
+			std::fs::write(
+				concat!(
+					env!("CARGO_MANIFEST_DIR"),
+					"/src/engine/snapshots/product-0024-theme-syntax.txt"
+				),
+				&actual,
+			)
+			.expect("write PRODUCT-0024 theme syntax snapshot");
+			return;
+		}
+		assert_eq!(actual, PRODUCT_0024_SYNTAX_SNAPSHOT);
+	}
+
+	#[test]
+	fn product_0024_records_the_existing_modifier_applicability_matrix() {
+		let nord = Theme::try_new("nord").expect("nord theme").syntax_colors;
+		assert_eq!(Theme::try_new("nord_c").unwrap().syntax_colors, nord);
+		assert_eq!(Theme::try_new("nord_C").unwrap().syntax_colors, nord);
+
+		let terrain = Theme::try_new("terrain").unwrap().syntax_colors;
+		assert_ne!(Theme::try_new("terrain_c").unwrap().syntax_colors, terrain);
+		assert_ne!(Theme::try_new("terrain_C").unwrap().syntax_colors, terrain);
 	}
 
 	#[test]
