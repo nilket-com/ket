@@ -886,3 +886,88 @@ fn product_0027_surface_keeps_projection_intent_bounded_and_plot_registers_close
 	assert!(!state_production.contains("TableSkinProjection::default"));
 	assert!(!state_production.contains("unwrap_or(TableSkinProjection"));
 }
+
+#[test]
+fn product_0028_categorical_palettes_remain_a_libaryon_fact_without_artifact_policy() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let libaryon_theme = manifest_dir.join("../libaryon/src/engine/theme.rs");
+	let theme = std::fs::read_to_string(&libaryon_theme).expect("read libaryon theme source");
+	let production = theme
+		.split("#[cfg(test)]")
+		.next()
+		.expect("libaryon theme production source");
+
+	assert_eq!(
+		production.matches("parse_theme_modifiers(name)").count(),
+		1,
+		"PRODUCT-0028 must consume the existing modifier parser exactly once"
+	);
+	assert!(
+		production.contains("ResolvedCategoricalPalette {\n\tfirst: Rgb,\n\trest: Box<[Rgb]>,"),
+		"categorical palettes must keep private structurally non-empty storage"
+	);
+	for forbidden in [
+		"pub first:",
+		"pub rest:",
+		"pub fn from_",
+		"dedup",
+		"CategoricalCapacityFailure",
+		"geometry_limit",
+		"ColorJob",
+		"ColorIdentity",
+		"PlotType",
+	] {
+		assert!(
+			!production.contains(forbidden),
+			"PRODUCT-0028 crossed or weakened its authority boundary through {forbidden}"
+		);
+	}
+
+	let declared = production
+		.lines()
+		.filter(|line| line.contains("ThemeSpec::curated_categorical("))
+		.map(|line| line.split('"').nth(1).expect("categorical theme name"))
+		.collect::<Vec<_>>();
+	assert_eq!(
+		declared,
+		["dark2", "kelly", "prism", "tab20", "tab20b", "tab20c"],
+		"only curated palettes with an explicit accepted natural declaration are capable"
+	);
+	assert!(production.contains("categorical: None"));
+	assert!(production.contains("categorical: Some(categorical)"));
+	assert!(
+		production.contains("categorical.map(|declaration|")
+			&& production.contains("sampled_colors[1..].iter().copied()"),
+		"categorical resolution must consume explicit curated declarations or accepted continuous samples"
+	);
+
+	let polariton_src = manifest_dir.join("src");
+	let mut pending = vec![polariton_src];
+	let mut leaks = Vec::new();
+	while let Some(path) = pending.pop() {
+		for entry in std::fs::read_dir(path).expect("read Polariton source") {
+			let path = entry.expect("Polariton source entry").path();
+			if path.is_dir() {
+				pending.push(path);
+			} else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+				let source =
+					std::fs::read_to_string(&path).expect("read Polariton production source");
+				for forbidden in ["categorical_palette", "ResolvedCategoricalPalette"] {
+					if source.contains(forbidden) {
+						leaks.push(format!("{}: {forbidden}", path.display()));
+					}
+				}
+			}
+		}
+	}
+	assert!(
+		leaks.is_empty(),
+		"PRODUCT-0028 acquired a Polariton production consumer before PRODUCT-0029:\n{}",
+		leaks.join("\n")
+	);
+	assert!(
+		"fn plot(p: ResolvedCategoricalPalette) { let _ = p.categorical_palette(); }"
+			.contains("ResolvedCategoricalPalette"),
+		"positive control: PRODUCT-0028 consumer assay must observe the forbidden API"
+	);
+}

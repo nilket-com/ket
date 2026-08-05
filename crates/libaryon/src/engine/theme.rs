@@ -81,14 +81,6 @@ pub struct ResolvedCategoricalPalette {
 }
 
 impl ResolvedCategoricalPalette {
-	#[cfg(test)]
-	fn from_declaration(declaration: CategoricalDeclaration) -> Self {
-		Self {
-			first: declaration.first,
-			rest: declaration.rest.into(),
-		}
-	}
-
 	fn from_non_empty_iter(first: Rgb, rest: impl IntoIterator<Item = Rgb>) -> Self {
 		Self {
 			first,
@@ -1755,7 +1747,10 @@ mod tests {
 		declaration: super::CategoricalDeclaration,
 		expected: &[Rgb],
 	) {
-		let resolved = ResolvedCategoricalPalette::from_declaration(declaration);
+		let resolved = ResolvedCategoricalPalette::from_non_empty_iter(
+			declaration.first,
+			declaration.rest.iter().copied(),
+		);
 		assert_eq!(resolved.len(), expected.len());
 		assert_eq!(resolved.iter().collect::<Vec<_>>(), expected);
 		for (index, color) in expected.iter().copied().enumerate() {
