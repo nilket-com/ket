@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.25. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.26. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -450,6 +450,25 @@ never opens the dashboard. The installed `test8.rn` uses `terrain_rs10`; its
 exact two-origin, four-sink source shape is an executable completion assay and
 the live window remains the intentionally human aesthetic oracle.
 
+## Accepted substrate: explicit table skin projections
+
+PRODUCT-0026 is accepted and executable in `5de8826b`, `fe72f0b9`, and
+`296ec1b3`. The accepted PRODUCT-0025 treatment survives byte-for-byte as the
+explicit `Duotone` projection. A second `PaletteForward` projection spends eight
+ordered swatches directly on table surfaces and accents, then selects fixed
+near-black or near-white text per role group by measured maximin contrast over
+the actual visible surfaces. Both modes still pass the unchanged seven
+alpha-composited PRODUCT-0023 checks or refuse with mechanism-specific facts.
+
+The exact 8,480-expression pre-refactor Duotone oracle remains unchanged.
+`yellows` continues to refuse under Duotone because its completed selected-row
+contrast falls below threshold despite an above-threshold raw anchor pair, and
+now succeeds under PaletteForward with `#101010` ink. A constructed
+split-polarity palette proves that either projection can refuse independently.
+The Rune head still selects Duotone explicitly and no grammar row changes
+status; PRODUCT-0027 owns the indivisible PaletteForward default flip and
+`.duotone()` escape hatch.
+
 ## Mutation and definition lifecycle
 
 | family | status | evidence |
@@ -479,6 +498,15 @@ the live window remains the intentionally human aesthetic oracle.
 
 ## Change log
 
+- v0.26 (2026-08-05): PRODUCT-0026 names the existing table treatment
+  `Duotone` without changing any of its 8,480 canonical outcomes and adds an
+  explicit PaletteForward substrate beside it. PaletteForward preserves the
+  resolved colormap's order across five opaque surfaces and three alpha-bearing
+  roles, while neutral maximin ink makes `yellows` legible without weakening a
+  contrast gate. A complete two-mode census and synthetic opposite-polarity
+  assay prove success and both mechanism-specific refusal paths. Rune remains
+  explicitly Duotone in this substrate cut, so the executable `.skin(name)` row
+  and every SQL/Markdown default remain unchanged pending PRODUCT-0027.
 - v0.25 (2026-08-05): PRODUCT-0025 makes libaryon's existing theme vocabulary
   selectable as validated Rune table skins with
   `table().skin("theme_expression")`. Polariton consumes the exact resolved

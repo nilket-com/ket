@@ -1,6 +1,6 @@
 # ADR 0026: palette-forward table skin projection
 
-Status: proposed 2026-08-05. This record decides one thing: that a resolved
+Status: accepted 2026-08-05. This record decides one thing: that a resolved
 libaryon palette has two explicit Polariton table-skin projections,
 `PaletteForward` and `Duotone`. It preserves the accepted PRODUCT-0025 treatment
 exactly as Duotone, adds a palette-forward treatment whose text ink is measured
