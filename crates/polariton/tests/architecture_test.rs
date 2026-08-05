@@ -509,3 +509,22 @@ fn product_0018_rune_surface_keeps_point_size_out_of_prepared_data() {
 		"PRODUCT-0018 must validate the closed Rune spelling through PRODUCT-0017's typed handoff"
 	);
 }
+
+#[test]
+fn product_0019_stroke_width_is_render_state_not_prepared_line_data() {
+	let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plot/kernels/line.rs");
+	let line = std::fs::read_to_string(source).expect("read line kernel");
+	let prepared = line
+		.split("pub struct LinePreparedData {")
+		.nth(1)
+		.and_then(|tail| tail.split("pub fn prepare_line_data").next())
+		.expect("isolate LinePreparedData");
+	assert!(
+		!prepared.contains("stroke_width") && !prepared.contains("StrokeWidth"),
+		"stroke width must remain render-time state outside LinePreparedData"
+	);
+	assert!(
+		line.contains("settings.stroke_width.width_px()"),
+		"the line renderer must consume resolved stroke width"
+	);
+}

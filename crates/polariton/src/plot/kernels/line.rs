@@ -34,7 +34,7 @@ impl MarkRenderer for LineMarkRenderer {
 			let color = settings.color_theme.get_color(series.color_t);
 			let stroke = Stroke {
 				style: Style::Solid(color),
-				width: 2.0,
+				width: settings.stroke_width.width_px(),
 				..Default::default()
 			};
 			backend.stroke_path(
@@ -57,12 +57,13 @@ impl MarkRenderer for LineMarkRenderer {
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
-		_settings: &ResolvedPlotSettings,
+		settings: &ResolvedPlotSettings,
 	) -> Option<MarkHit> {
-		const HIT_RADIUS_PX: f32 = 6.0;
+		const INTERACTION_TOLERANCE_PX: f32 = 5.0;
+		let hit_radius = settings.stroke_width.width_px() / 2.0 + INTERACTION_TOLERANCE_PX;
 		let cursor = cursor.position()?;
 		let mut nearest = None;
-		let mut nearest_distance = HIT_RADIUS_PX * HIT_RADIUS_PX;
+		let mut nearest_distance = hit_radius * hit_radius;
 		let mut mark_index = 0;
 
 		for series in &self.prepared_data.series {

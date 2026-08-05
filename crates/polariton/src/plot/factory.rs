@@ -647,4 +647,112 @@ mod product_0013_baseline_tests {
 		};
 		assert_eq!(render(1.0), render(2.0));
 	}
+
+	#[test]
+	fn product_0019_line_layers_paint_independent_resolved_widths() {
+		let mut thin = LayerSpec::xy(LayerMark::Line, "x", "y");
+		thin.settings.stroke_width =
+			Override::Set(crate::plot::spec::StrokeWidth::new(0.5).unwrap());
+		let mut thick = LayerSpec::xy(LayerMark::Line, "x", "y");
+		thick.settings.stroke_width =
+			Override::Set(crate::plot::spec::StrokeWidth::new(2.0).unwrap());
+		let mut spec = LayeredPlotSpec::new(thin);
+		spec.push(thick);
+		let kernel = create_layered_plot(&spec, &fixture(), 100, 100).expect("line layers");
+		let svg = render_marks_with_settings(kernel.as_ref(), &PlotSettings::default());
+		assert!(
+			svg.contains("stroke-width=\"1\""),
+			"thin line missing: {svg}"
+		);
+		assert!(
+			svg.contains("stroke-width=\"4\""),
+			"thick line missing: {svg}"
+		);
+		let first = svg.find("stroke-width=\"1\"").unwrap();
+		let second = svg.find("stroke-width=\"4\"").unwrap();
+		assert!(
+			first < second,
+			"settings must not change authored paint order"
+		);
+	}
+
+	#[test]
+	fn product_0019_default_and_doubled_line_widths_keep_one_drawing_body() {
+		let standalone = create_authored_plot(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y"),
+			&fixture(),
+			100,
+			100,
+		)
+		.expect("standalone line");
+		let layered = create_layered_plot(
+			&LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y")),
+			&fixture(),
+			100,
+			100,
+		)
+		.expect("layered line");
+		assert_eq!(render_marks(standalone.as_ref()), LINE_SVG);
+		assert_eq!(render_marks(layered.as_ref()), LINE_SVG);
+
+		let mut doubled = PlotSettings::default();
+		doubled.library_defaults.stroke_width = crate::plot::spec::StrokeWidth::new(2.0).unwrap();
+		let svg = render_marks_with_settings(layered.as_ref(), &doubled);
+		assert!(
+			svg.contains("stroke-width=\"4\""),
+			"doubled line missing: {svg}"
+		);
+	}
+
+	#[test]
+	fn product_0019_styled_hit_follows_half_stroke_plus_fixed_tolerance() {
+		let frame = df!("x" => [1.0], "y" => [2.0]).expect("frame");
+		let kernel = |factor| {
+			let mut layer = LayerSpec::xy(LayerMark::Line, "x", "y");
+			layer.settings.stroke_width =
+				Override::Set(crate::plot::spec::StrokeWidth::new(factor).unwrap());
+			create_layered_plot(&LayeredPlotSpec::new(layer), &frame, 100, 100)
+				.expect("styled line")
+		};
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let settings = PlotSettings::default();
+		let normal = kernel(1.0);
+		let layout = normal.layout(settings.resolve());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let point = transform.cartesian(1.0, 2.0);
+		let cursor = Cursor::Available(Point::new(point.x + 6.5, point.y));
+		assert_eq!(
+			normal.hover_with_settings(&transform, cursor, &settings),
+			None
+		);
+
+		let doubled = kernel(2.0);
+		assert_eq!(
+			doubled.hover_with_settings(&transform, cursor, &settings),
+			Some("X: 1, Y: 2".to_owned())
+		);
+	}
+
+	#[test]
+	fn product_0019_stroke_width_does_not_acquire_guide_behavior() {
+		let kernel = create_layered_plot(
+			&LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y")),
+			&fixture(),
+			100,
+			100,
+		)
+		.expect("line kernel");
+		let render = |factor| {
+			let mut backend = SvgBackend::new(100.0, 100.0);
+			let mut settings = ResolvedPlotSettings::default();
+			settings.stroke_width = crate::plot::spec::StrokeWidth::new(factor).unwrap();
+			kernel.draw_legend(
+				&mut backend,
+				Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+				settings,
+			);
+			backend.finish()
+		};
+		assert_eq!(render(1.0), render(2.0));
+	}
 }
