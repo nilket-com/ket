@@ -985,13 +985,13 @@ impl CodeEditor {
 			.copied()
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(all(test, feature = "toron"))]
 	pub fn set_rune_view_table(&mut self, panel_id: HostPanelId, frame: DataFrame) {
 		self.set_rune_view_table_with_skin(panel_id, frame, TableSkin::DEFAULT);
 	}
 
 	#[cfg(feature = "toron")]
-	fn set_rune_view_table_with_skin(
+	pub fn set_rune_view_table_with_skin(
 		&mut self,
 		panel_id: HostPanelId,
 		frame: DataFrame,
@@ -1211,6 +1211,20 @@ impl CodeEditor {
 		let entry = self.panels.panels.get(&panel_id)?;
 		match &entry.content {
 			PanelContent::Table(artifact) => Some(artifact.frame.as_ref()),
+			_ => None,
+		}
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_table_skin(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<TableSkin> {
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let entry = self.panels.panels.get(&panel_id)?;
+		match &entry.content {
+			PanelContent::Table(artifact) => Some(artifact.skin),
 			_ => None,
 		}
 	}

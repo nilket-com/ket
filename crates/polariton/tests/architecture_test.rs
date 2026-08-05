@@ -716,3 +716,52 @@ fn product_0023_table_artifact_is_the_atomic_host_and_markdown_boundary() {
 		}
 	}
 }
+
+#[test]
+fn product_0025_theme_projection_and_table_register_keep_their_authority_boundaries() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let skin = std::fs::read_to_string(root.join("gui/table_skin.rs")).expect("read table skin");
+	let skin_production = skin
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production table-skin source");
+	assert!(skin_production.contains("Theme::try_new(name)"));
+	assert!(skin_production.contains("theme.palette()"));
+	assert!(!skin_production.contains("THEME_SPECS"));
+	assert!(!skin_production.contains("parse_theme_modifiers"));
+	assert!(!skin_production.contains("UiPalette"));
+
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let envelope_production = envelope
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production envelope source");
+	assert!(envelope_production.contains("pub(crate) struct RuneTableSink"));
+	assert!(envelope_production.contains("pub(crate) skin_name: Option<String>"));
+	assert!(envelope_production.contains("\"skin\" =>"));
+	assert!(!envelope_production.contains("TableSkin"));
+	assert!(!envelope_production.contains("ResolvedThemePalette"));
+
+	let messages = std::fs::read_to_string(root.join("gui/messages.rs")).expect("read messages");
+	assert!(messages.contains("Table(TableSkin)"));
+	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	let state_production = state
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production GUI state source");
+	assert!(state_production.contains("TableSkin::from_theme_name(&name)"));
+	assert!(state_production.contains("set_rune_view_table_with_skin"));
+
+	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
+	let editor_production = editor
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production editor source");
+	assert!(editor_production.contains("set_query_result_with_skin(frame, TableSkin::DEFAULT)"));
+	assert!(
+		editor_production
+			.contains("set_markdown_cell_table_with_skin(identity, frame, TableSkin::DEFAULT)")
+	);
+	assert!(!editor_production.contains("TableSkin::from_theme_name"));
+}

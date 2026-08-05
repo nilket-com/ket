@@ -7,6 +7,8 @@ use crate::adapters::{
 use crate::configuration::{self, StartupData};
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
+#[cfg(feature = "toron")]
+use crate::gui::table_skin::TableSkin;
 use crate::gui::{
 	components,
 	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
@@ -802,7 +804,12 @@ fn rune_view_outcome(
 		.map(|view| {
 			let presentation = view.intent.presentation();
 			let output = match view.intent {
-				RuneViewIntent::Table(_) => Ok(RuneRelationSinkOutput::Table),
+				RuneViewIntent::Table(table) => table
+					.skin_name
+					.map_or(Ok(TableSkin::DEFAULT), |name| {
+						TableSkin::from_theme_name(&name).map_err(|error| error.to_string())
+					})
+					.map(RuneRelationSinkOutput::Table),
 				RuneViewIntent::Plot(plot) => {
 					let authored_settings = plot.authored_settings;
 					match plot.body {
@@ -1517,13 +1524,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.rune_view_panel_id(source_buffer, &sink.identity)
 							.expect("a dispatched view has a prepared host panel");
 						match sink.output {
-							Ok(RuneRelationSinkOutput::Table) => {
+							Ok(RuneRelationSinkOutput::Table(skin)) => {
 								let frame = sink.source.as_ref().clone();
 								let rows = frame.height();
 								let cols = frame.width();
-								app_state
-									.code_editor
-									.set_rune_view_table(panel_id, frame.clone());
+								app_state.code_editor.set_rune_view_table_with_skin(
+									panel_id,
+									frame.clone(),
+									skin,
+								);
 								app_state.data_frame = frame;
 								app_state.status_df_size = Some((rows, cols));
 							}
@@ -2100,6 +2109,8 @@ mod tests {
 	use crate::configuration::StartupData;
 	use crate::gui::messages::Message;
 	#[cfg(feature = "toron")]
+	use crate::gui::table_skin::TableSkin;
+	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
 	use crate::plot::factory::{create_layered_plot, create_plot, create_styled_plot};
@@ -2111,8 +2122,10 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use crate::rune_relation_envelope::{
 		LocalViewIdentity, PendingRuneView, RuneViewForm, TransformedRuneRelation,
-		transform as transform_rune_view,
+		TransformedRuneView, transform as transform_rune_view,
 	};
+	#[cfg(feature = "toron")]
+	use libaryon::core::BufferId;
 	#[cfg(feature = "toron")]
 	use nilket_local::{
 		Artifact, Evidence, LocalWorkspace, ObservationContext, ReadyWorkspace, StaleCause,
@@ -2650,10 +2663,12 @@ mod tests {
 		for sink in &outcome.sinks {
 			assert!(std::sync::Arc::ptr_eq(&outcome.result, &sink.source));
 		}
-		assert!(matches!(
-			outcome.sinks[0].output,
-			Ok(crate::gui::messages::RuneRelationSinkOutput::Table)
-		));
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(table_skin)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("first sink must remain the default table");
+		};
+		assert_eq!(*table_skin, TableSkin::DEFAULT);
 		for (sink, expected) in
 			outcome.sinks[1..]
 				.iter()
@@ -2903,6 +2918,268 @@ mod tests {
 			"the plot failure must not replace the sibling table"
 		);
 		assert!(state.status_error.contains("plot.bar at bytes"));
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0025_table_skin_resolution_is_per_sink_and_keeps_shared_identity() {
+		let source = r#"workspace.table("t").views([
+			table().skin("terrain_rs10"),
+			table(),
+			table().skin("black"),
+			line("x", "y")
+		])"#;
+		let relation = transform_rune_view(source)
+			.expect("theme-projected table sinks")
+			.into_relations()
+			.next()
+			.expect("one shared origin");
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [1_i64, 2], "y" => [3_i64, 4]).expect("fixture frame"),
+			relation.views,
+		);
+		assert_eq!(outcome.sinks.len(), 4);
+		for sink in &outcome.sinks {
+			assert!(Arc::ptr_eq(&outcome.result, &sink.source));
+		}
+
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(styled)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("styled table must resolve");
+		};
+		assert_eq!(*styled, TableSkin::from_theme_name("terrain_rs10").unwrap());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(default)) =
+			&outcome.sinks[1].output
+		else {
+			panic!("bare table must resolve");
+		};
+		assert_eq!(*default, TableSkin::DEFAULT);
+		let Err(error) = &outcome.sinks[2].output else {
+			panic!("flat palette must fail only its table sink");
+		};
+		assert!(error.contains("unsuitable"));
+		assert!(matches!(
+			outcome.sinks[3].output,
+			Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(_, _))
+		));
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0025_installed_test8_shape_parses_and_completes_every_sink() {
+		let source = r#"ket.table("test1")
+	.sort([col("x").asc()])
+	.views([
+		table().skin("terrain_rs10"),
+		figure([
+			title("Plot Layer Test"),
+			subtitle("Toron was here"),
+			layers([
+				line("x", "y")
+					.stroke_width(8.0),
+				scatter("x", "y")
+					.point_size(8.0)])])])
+ket.table("test2") // Comment Test1.
+	.sort([col("cat").asc()])
+	.views([
+		table(), // Comment Test2.
+		figure([
+			title("SQL = 💩"),
+			subtitle("Wendelon was here"),
+			bar("cat", "val")
+				.bar_width(0.98)])])"#;
+		let relations = transform_rune_view(source)
+			.expect("installed test8 shape")
+			.into_relations()
+			.collect::<Vec<_>>();
+		assert_eq!(relations.len(), 2);
+
+		let first = rune_view_outcome(
+			polars::df!("x" => [1_i64, 2], "y" => [3_i64, 4]).expect("test1 frame"),
+			relations[0].views.clone(),
+		);
+		assert_eq!(first.sinks.len(), 2);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(skin)) = &first.sinks[0].output
+		else {
+			panic!("test1 table must complete with its skin");
+		};
+		assert_eq!(*skin, TableSkin::from_theme_name("terrain_rs10").unwrap());
+		assert!(matches!(
+			first.sinks[1].output,
+			Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(
+				_,
+				_
+			))
+		));
+
+		let second = rune_view_outcome(
+			polars::df!("cat" => ["a", "b"], "val" => [3_i64, 4]).expect("test2 frame"),
+			relations[1].views.clone(),
+		);
+		assert_eq!(second.sinks.len(), 2);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(skin)) = &second.sinks[0].output
+		else {
+			panic!("test2 table must remain default-skinned");
+		};
+		assert_eq!(*skin, TableSkin::DEFAULT);
+		assert!(matches!(
+			second.sinks[1].output,
+			Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
+				_,
+				_,
+				_
+			))
+		));
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0025_skin_changes_reuse_the_panel_and_bad_skin_retains_the_prior_pair() {
+		fn program(theme: &str) -> TransformedRuneView {
+			transform_rune_view(&format!(
+				"workspace.table(\"t\").views([view(\"styled\", table().skin(\"{theme}\")), view(\"plain\", table()), view(\"bad\", table().skin(\"black\"))])"
+			))
+			.expect("three named tables")
+		}
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = BufferId::new(91);
+		let styled = LocalViewIdentity::Named("styled".to_owned());
+		let plain = LocalViewIdentity::Named("plain".to_owned());
+		let bad = LocalViewIdentity::Named("bad".to_owned());
+		let previous_bad_skin = TableSkin::from_theme_name("terrain_r").unwrap();
+
+		let first = program("terrain_rs10");
+		let presentation = first
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+		state.rune_buffer_revisions.insert(source_buffer, 1);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, 1);
+		let panel_ids = [&styled, &plain, &bad].map(|identity| {
+			state
+				.code_editor
+				.rune_view_panel_id(source_buffer, identity)
+				.expect("prepared named panel")
+		});
+		state.code_editor.set_rune_view_table_with_skin(
+			panel_ids[2],
+			polars::df!("previous" => [1_i64]).expect("previous bad frame"),
+			previous_bad_skin,
+		);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision: 1,
+					view: first.clone(),
+				})
+				.is_some()
+		);
+		let relation = first.into_relations().next().unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("value" => [2_i64]).expect("first frame"),
+			relation.views,
+		);
+		drop(update(
+			&mut state,
+			Message::RunRuneViewSetResult {
+				source_buffer,
+				revision: 1,
+				origin: relation.origin,
+				views: vec![styled.clone(), plain.clone(), bad.clone()],
+				result: Ok(outcome),
+			},
+		));
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_skin(source_buffer, &styled),
+			Some(TableSkin::from_theme_name("terrain_rs10").unwrap())
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_skin(source_buffer, &plain),
+			Some(TableSkin::DEFAULT)
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_skin(source_buffer, &bad),
+			Some(previous_bad_skin),
+			"failed suitability must retain the prior complete artifact"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &bad),
+			Some("stale")
+		);
+		assert!(state.status_error.contains("table at bytes"));
+
+		let second = program("terrain_s1");
+		let presentation = second
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+		state.rune_buffer_revisions.insert(source_buffer, 2);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, 2);
+		assert_eq!(
+			[&styled, &plain, &bad].map(|identity| state
+				.code_editor
+				.rune_view_panel_id(source_buffer, identity)
+				.unwrap()),
+			panel_ids,
+			"skin changes must not replace destinations"
+		);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision: 2,
+					view: second.clone(),
+				})
+				.is_some()
+		);
+		let relation = second.into_relations().next().unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("value" => [3_i64]).expect("second frame"),
+			relation.views,
+		);
+		drop(update(
+			&mut state,
+			Message::RunRuneViewSetResult {
+				source_buffer,
+				revision: 2,
+				origin: relation.origin,
+				views: vec![styled.clone(), plain, bad],
+				result: Ok(outcome),
+			},
+		));
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_skin(source_buffer, &styled),
+			Some(TableSkin::from_theme_name("terrain_s1").unwrap())
+		);
+		assert_eq!(
+			state.code_editor.rune_view_panel_id(source_buffer, &styled),
+			Some(panel_ids[0])
+		);
+		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 3);
+		assert!(state.dashboard.panes.is_none());
+		state.code_editor.shutdown();
 	}
 
 	#[cfg(feature = "toron")]

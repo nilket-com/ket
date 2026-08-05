@@ -5,6 +5,8 @@ use crate::adapters::{
 };
 use crate::editor::EditorMsg;
 use crate::gui::dashboard::DashboardMsg;
+#[cfg(feature = "toron")]
+use crate::gui::table_skin::TableSkin;
 use crate::plot::common::PlotKernel;
 use crate::plot::request::ResolvedPlot;
 #[cfg(feature = "toron")]
@@ -186,7 +188,7 @@ pub struct RuneRelationSinkOutcome {
 #[cfg(feature = "toron")]
 #[derive(Clone)]
 pub enum RuneRelationSinkOutput {
-	Table,
+	Table(TableSkin),
 	Plot(ResolvedPlot, PlotSettingsLayer),
 	StyledPlot(ResolvedPlot, LayerSettings, PlotSettingsLayer),
 	LayeredPlot(LayeredPlotSpec, PlotSettingsLayer),
