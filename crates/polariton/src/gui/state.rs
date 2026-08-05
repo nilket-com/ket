@@ -3171,6 +3171,120 @@ workspace.table("t").views([
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0018_point_size_reaches_every_host_path_and_preserves_the_view() {
+		let frame = polars::df!("x" => [1.0_f64, 2.0, 3.0], "y" => [2.0_f64, 4.0, 3.0])
+			.expect("scatter frame");
+		let every_position = transform_rune_view(
+			r#"workspace.table("t").views([
+				layers([scatter("x", "y").point_size(2.0)]),
+				scatter("x", "y").point_size(2.0),
+				figure([title("Sized"), scatter("x", "y").point_size(2.0)]),
+			])"#,
+		)
+		.expect("all proven modified-mark positions")
+		.into_relations()
+		.next()
+		.expect("one relation");
+		let every_outcome = rune_view_outcome(frame.clone(), every_position.views);
+		assert_eq!(every_outcome.sinks.len(), 3);
+		for sink in &every_outcome.sinks {
+			assert!(Arc::ptr_eq(&every_outcome.result, &sink.source));
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification, _)) =
+				&sink.output
+			else {
+				panic!("every modified mark must use the proved layer-aware output")
+			};
+			let mut layers = specification.layers.iter();
+			let layer = layers.next().expect("one authored layer");
+			assert!(
+				layers.next().is_none(),
+				"each spelling must lower to exactly one authored layer"
+			);
+			assert_eq!(
+				layer.settings.point_size,
+				crate::plot::spec::Override::Set(crate::plot::spec::PointSize::new(2.0).unwrap())
+			);
+		}
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(84);
+		let identity = LocalViewIdentity::Named("points".to_owned());
+		let sources = [
+			"workspace.table(\"t\").views([view(\"points\", scatter(\"x\", \"y\"))])",
+			"workspace.table(\"t\").views([view(\"points\", scatter(\"x\", \"y\").point_size(1.0))])",
+			"workspace.table(\"t\").views([view(\"points\", scatter(\"x\", \"y\").point_size(2.0))])",
+		];
+		let mut panel = None;
+		let mut svgs = Vec::new();
+		for (offset, source) in sources.into_iter().enumerate() {
+			let revision = offset as u64 + 1;
+			let program = transform_rune_view(source).expect("point-size lifecycle revision");
+			let presentation = program
+				.presentation_views()
+				.into_iter()
+				.map(|view| (view.identity.clone(), view.intent.presentation()))
+				.collect::<Vec<_>>();
+			assert_eq!(presentation[0].0, identity);
+			assert_eq!(presentation[0].1.display_label, "plot.scatter");
+			state.rune_buffer_revisions.insert(source_buffer, revision);
+			state
+				.code_editor
+				.prepare_rune_view_panels(source_buffer, &presentation, revision);
+			let current = state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity)
+				.expect("stable point-size panel");
+			if let Some(first) = panel {
+				assert_eq!(current, first, "point size is not view identity");
+			} else {
+				panel = Some(current);
+			}
+			assert!(
+				state
+					.rune_view_scheduler
+					.submit(PendingRuneView {
+						source_buffer,
+						revision,
+						view: program.clone(),
+					})
+					.is_some()
+			);
+			complete_relation_in_head(
+				&mut state,
+				source_buffer,
+				revision,
+				program.into_relations().next().expect("one relation"),
+				frame.clone(),
+			);
+			svgs.push(
+				state
+					.code_editor
+					.rune_view_panel_plot_svg(source_buffer, &identity)
+					.expect("completed point-size canvas"),
+			);
+		}
+		assert_eq!(svgs[0], svgs[1], "factor 1.0 must preserve bare output");
+		assert!(
+			svgs[2].contains("A 6.00 6.00"),
+			"factor 2.0 must reach the six-pixel host rendering: {}",
+			svgs[2]
+		);
+		assert_ne!(svgs[1], svgs[2]);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_display_label(source_buffer, &identity),
+			Some("plot.scatter")
+		);
+		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn product_0016_figure_headings_reach_canvas_and_source_only_chrome() {
 		let source = r#"workspace.table("t").views([
 			view("stable", figure([title("Named canvas"), line("x", "y")])),
