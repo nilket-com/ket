@@ -8,6 +8,7 @@ pub mod plot_pane;
 mod state;
 pub mod statusbar;
 pub mod table;
+pub mod table_skin;
 
 pub use state::Result;
 pub use state::run;

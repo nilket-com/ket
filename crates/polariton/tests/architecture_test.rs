@@ -597,3 +597,45 @@ fn product_0022_bar_width_extends_only_the_closed_styled_single_register() {
 		"the third setting does not authorize open modifier dispatch"
 	);
 }
+
+#[test]
+fn product_0023_table_skin_is_closed_complete_and_separate_from_other_color_models() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let skin = std::fs::read_to_string(root.join("gui/table_skin.rs")).expect("read table skin");
+	let fields = skin
+		.split("pub struct TableSkin {")
+		.nth(1)
+		.and_then(|tail| tail.split("}\n").next())
+		.expect("TableSkin body");
+	for role in [
+		"body_background",
+		"header_background",
+		"gutter_background",
+		"row_even_background",
+		"row_odd_background",
+		"gridline",
+		"cell_text",
+		"header_text",
+		"type_text",
+		"gutter_text",
+		"selection_fill",
+		"scrollbar_thumb",
+	] {
+		assert!(
+			fields.contains(&format!("pub {role}: TableRgba")),
+			"missing {role}"
+		);
+	}
+	assert_eq!(
+		fields.matches(": TableRgba").count(),
+		12,
+		"the resolved skin must contain exactly the accepted roles"
+	);
+	assert!(!fields.contains("Option<") && !fields.contains("HashMap"));
+	assert!(
+		!skin.contains("ColorTheme")
+			&& !skin.contains("PlotThemeSpec")
+			&& !skin.contains("UiPalette"),
+		"table artifact skin must remain separate from ramps and editor chrome"
+	);
+}
