@@ -639,3 +639,24 @@ fn product_0023_table_skin_is_closed_complete_and_separate_from_other_color_mode
 		"table artifact skin must remain separate from ramps and editor chrome"
 	);
 }
+
+#[test]
+fn product_0023_table_draw_reads_only_its_required_resolved_skin() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let table = std::fs::read_to_string(root.join("gui/table.rs")).expect("read table widget");
+	let production = table
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production table source");
+	assert!(
+		production
+			.contains("pub fn new(data_frame: &'a DataFrame, row_offset: usize, skin: TableSkin)")
+	);
+	assert!(production.contains("skin: TableSkin"));
+	assert!(
+		!production.contains("colors::")
+			&& !production.contains("UiPalette")
+			&& !production.contains("ColorTheme"),
+		"the table draw path must consume only its resolved artifact skin"
+	);
+}

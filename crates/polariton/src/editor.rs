@@ -2699,14 +2699,16 @@ impl PanelRegistry {
 			dashboard::view(dashboard).map(EditorMsg::Dashboard)
 		} else {
 			match content {
-				PanelContent::Table(frame) => Table::new(frame, 0)
-					.show_column_types(show_column_types)
-					.scroll_request(
-						self.panels
-							.get(&panel.panel_id)
-							.and_then(|entry| entry.scroll),
-					)
-					.into(),
+				PanelContent::Table(frame) => {
+					Table::new(frame, 0, crate::gui::table_skin::TableSkin::DEFAULT)
+						.show_column_types(show_column_types)
+						.scroll_request(
+							self.panels
+								.get(&panel.panel_id)
+								.and_then(|entry| entry.scroll),
+						)
+						.into()
+				}
 				#[cfg(feature = "toron")]
 				PanelContent::Plot(plot) => {
 					plot_pane::host_view(plot).map(move |message| EditorMsg::HostPlot {
@@ -3824,9 +3826,11 @@ fn markdown_cell_output_surface<'a>(
 			.size(metrics::TEXT_SIZE)
 			.color(color(palette.preview_text))
 			.into(),
-		NotebookCellOutput::Table(frame) => Table::new(frame, 0)
-			.show_column_types(show_column_types)
-			.into(),
+		NotebookCellOutput::Table(frame) => {
+			Table::new(frame, 0, crate::gui::table_skin::TableSkin::DEFAULT)
+				.show_column_types(show_column_types)
+				.into()
+		}
 		NotebookCellOutput::Plot { surface } => {
 			let plot: Element<'_, crate::gui::messages::PlotMessage> = canvas(PlotWidget {
 				kernel: surface.kernel.as_ref(),

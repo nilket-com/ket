@@ -1,4 +1,4 @@
-use crate::gui::colors;
+use crate::gui::table_skin::{TableRgba, TableSkin};
 use iced::{
 	Color, Element, Event,
 	Length::{self, Fill},
@@ -75,6 +75,7 @@ pub enum TableScroll {
 pub struct Table<'a> {
 	data_frame: &'a DataFrame,
 	row_offset: usize,
+	skin: TableSkin,
 	/// `(sequence, action)`. The widget applies an action only when the
 	/// sequence advances, so a value that stays set across frames does not
 	/// override the user's own scrolling.
@@ -84,10 +85,11 @@ pub struct Table<'a> {
 }
 
 impl<'a> Table<'a> {
-	pub fn new(data_frame: &'a DataFrame, row_offset: usize) -> Self {
+	pub fn new(data_frame: &'a DataFrame, row_offset: usize, skin: TableSkin) -> Self {
 		Self {
 			data_frame,
 			row_offset,
+			skin,
 			scroll_request: None,
 			col_width: None,
 			show_column_types: false,
@@ -357,6 +359,10 @@ impl<'a> Table<'a> {
 			height: thumb_h,
 		}
 	}
+}
+
+fn skin_color(color: TableRgba) -> Color {
+	Color::from_rgba8(color.red(), color.green(), color.blue(), color.alpha())
 }
 
 struct TableSelection {
@@ -679,7 +685,7 @@ where
 				border: border::rounded(4),
 				..renderer::Quad::default()
 			},
-			colors::BG_PRIMARY,
+			skin_color(self.skin.body_background),
 		);
 		renderer.with_layer(bounds, |renderer| {
 			renderer.fill_quad(
@@ -692,7 +698,7 @@ where
 					},
 					..renderer::Quad::default()
 				},
-				colors::BG_SECONDARY,
+				skin_color(self.skin.header_background),
 			);
 			draw_text(
 				renderer,
@@ -703,7 +709,7 @@ where
 					width: row_num_w - CELL_PADDING_X,
 					height: header_h,
 				},
-				colors::TABLE_TEXT_HEADER,
+				skin_color(self.skin.header_text),
 				true,
 				Horizontal::Center,
 			);
@@ -717,7 +723,7 @@ where
 					},
 					..renderer::Quad::default()
 				},
-				colors::TABLE_BORDER,
+				skin_color(self.skin.gridline),
 			);
 			let header_clip = Rectangle {
 				x: bounds.x + row_num_w,
@@ -730,7 +736,7 @@ where
 					bounds: header_clip,
 					..renderer::Quad::default()
 				},
-				colors::BG_SECONDARY,
+				skin_color(self.skin.header_background),
 			);
 			renderer.with_layer(header_clip, |renderer| {
 				let col_widths = self.col_widths_ref(state);
@@ -752,14 +758,14 @@ where
 									},
 									..renderer::Quad::default()
 								},
-								colors::TABLE_BORDER,
+								skin_color(self.skin.gridline),
 							);
 						}
 						draw_text(
 							renderer,
 							field.as_str(),
 							text_bounds(cell_x, bounds.y, col_w, HEADER_HEIGHT),
-							colors::TABLE_TEXT_HEADER,
+							skin_color(self.skin.header_text),
 							true,
 							alignment,
 						);
@@ -776,7 +782,7 @@ where
 									col_w,
 									header_h - HEADER_HEIGHT,
 								),
-								colors::TABLE_TYPE_LABEL,
+								skin_color(self.skin.type_text),
 								TYPE_LABEL_FONT_SIZE,
 								alignment,
 							);
@@ -794,7 +800,7 @@ where
 						},
 						..renderer::Quad::default()
 					},
-					colors::TABLE_BORDER,
+					skin_color(self.skin.gridline),
 				);
 			});
 			renderer.fill_quad(
@@ -807,7 +813,7 @@ where
 					},
 					..renderer::Quad::default()
 				},
-				colors::TABLE_BORDER,
+				skin_color(self.skin.gridline),
 			);
 			let first_visible = (v_scroll / ROW_HEIGHT as f64).floor() as usize;
 			let visible_count = ((bounds.height - header_h) / ROW_HEIGHT).ceil() as usize + 1;
@@ -841,7 +847,7 @@ where
 							},
 							..renderer::Quad::default()
 						},
-						colors::BG_SECONDARY,
+						skin_color(self.skin.gutter_background),
 					);
 					renderer.fill_quad(
 						renderer::Quad {
@@ -853,7 +859,7 @@ where
 							},
 							..renderer::Quad::default()
 						},
-						colors::TABLE_BORDER,
+						skin_color(self.skin.gridline),
 					);
 					draw_text(
 						renderer,
@@ -864,7 +870,7 @@ where
 							width: row_num_w - CELL_PADDING_X,
 							height: ROW_HEIGHT,
 						},
-						colors::TABLE_TEXT_HEADER,
+						skin_color(self.skin.gutter_text),
 						true,
 						Horizontal::Left,
 					);
@@ -890,9 +896,9 @@ where
 					let abs_idx = self.row_offset + row_idx;
 
 					let row_bg = if abs_idx.is_multiple_of(2) {
-						colors::TABLE_ROW_EVEN
+						self.skin.row_even_background
 					} else {
-						colors::TABLE_ROW_ODD
+						self.skin.row_odd_background
 					};
 					renderer.fill_quad(
 						renderer::Quad {
@@ -904,7 +910,7 @@ where
 							},
 							..renderer::Quad::default()
 						},
-						row_bg,
+						skin_color(row_bg),
 					);
 					renderer.fill_quad(
 						renderer::Quad {
@@ -916,7 +922,7 @@ where
 							},
 							..renderer::Quad::default()
 						},
-						colors::TABLE_BORDER,
+						skin_color(self.skin.gridline),
 					);
 					let mut cell_x = bounds.x + row_num_w - h_scroll;
 					for (col_idx, &col_w) in col_widths.iter().enumerate() {
@@ -935,7 +941,7 @@ where
 										},
 										..renderer::Quad::default()
 									},
-									colors::TABLE_BORDER,
+									skin_color(self.skin.gridline),
 								);
 							}
 							if state
@@ -953,7 +959,7 @@ where
 										},
 										..renderer::Quad::default()
 									},
-									colors::TABLE_SELECTION,
+									skin_color(self.skin.selection_fill),
 								);
 							}
 							let text = self.cell_str(col_idx, row_idx);
@@ -961,7 +967,7 @@ where
 								renderer,
 								&text,
 								text_bounds(cell_x, row_y, col_w, ROW_HEIGHT),
-								colors::TEXT_PRIMARY,
+								skin_color(self.skin.cell_text),
 								false,
 								alignment,
 							);
@@ -978,7 +984,7 @@ where
 							},
 							..renderer::Quad::default()
 						},
-						colors::TABLE_BORDER,
+						skin_color(self.skin.gridline),
 					);
 				}
 			});
@@ -991,7 +997,7 @@ where
 						border: border::rounded(2),
 						..renderer::Quad::default()
 					},
-					colors::SCROLLBAR_THUMB,
+					skin_color(self.skin.scrollbar_thumb),
 				);
 			}
 			let total_w = self.total_content_width(state);
@@ -1004,7 +1010,7 @@ where
 						border: border::rounded(2),
 						..renderer::Quad::default()
 					},
-					colors::SCROLLBAR_THUMB,
+					skin_color(self.skin.scrollbar_thumb),
 				);
 			}
 		});
@@ -1210,13 +1216,13 @@ mod tests {
 		}
 	}
 
-	fn product_0023_recorded_table_operations() -> Vec<PaintOperation> {
+	fn product_0023_recorded_table_operations(skin: TableSkin) -> Vec<PaintOperation> {
 		let frame = polars::df!(
 			"category" => ["A", "B", "C", "D"],
 			"value" => [1_i64, 2, 3, 4],
 		)
 		.expect("table draw fixture");
-		let table = Table::new(&frame, 0).show_column_types(true);
+		let table = Table::new(&frame, 0, skin).show_column_types(true);
 		let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(120.0, 120.0));
 		let mut tree = Tree {
 			tag: tree::Tag::of::<TableState>(),
@@ -1290,7 +1296,9 @@ mod tests {
 
 	#[test]
 	fn product_0023_pre_extraction_draw_operation_oracle() {
-		let signature = product_0023_operation_signature(&product_0023_recorded_table_operations());
+		let signature = product_0023_operation_signature(&product_0023_recorded_table_operations(
+			TableSkin::DEFAULT,
+		));
 		const PRE_EXTRACTION_DRAW_ORACLE: &str = r##"fill 10.00,20.00,120.00,120.00 #010101/1.00
 fill 10.00,20.00,28.00,48.00 #040404/1.00
 text "#  " 28.00,44.00 #dcdcdc/1.00 clip 18.00,20.00,20.00,48.00
@@ -1334,6 +1342,73 @@ fill 38.00,130.00,45.33,8.00 #8c00fa/0.50"##;
 		assert_eq!(signature, PRE_EXTRACTION_DRAW_ORACLE);
 	}
 
+	#[test]
+	fn product_0023_skin_changes_every_color_role_and_nothing_else() {
+		let assay = TableSkin {
+			body_background: TableRgba::opaque(1, 2, 3),
+			header_background: TableRgba::opaque(4, 5, 6),
+			gutter_background: TableRgba::opaque(7, 8, 9),
+			row_even_background: TableRgba::opaque(10, 11, 12),
+			row_odd_background: TableRgba::opaque(13, 14, 15),
+			gridline: TableRgba::translucent(16, 17, 18, 0.19),
+			cell_text: TableRgba::opaque(20, 21, 22),
+			header_text: TableRgba::opaque(23, 24, 25),
+			type_text: TableRgba::opaque(26, 27, 28),
+			gutter_text: TableRgba::opaque(29, 30, 31),
+			selection_fill: TableRgba::translucent(32, 33, 34, 0.35),
+			scrollbar_thumb: TableRgba::translucent(35, 36, 37, 0.38),
+		};
+		let default = product_0023_recorded_table_operations(TableSkin::DEFAULT);
+		let styled = product_0023_recorded_table_operations(assay);
+
+		let geometry = |operation: &PaintOperation| match operation {
+			PaintOperation::Fill { bounds, .. } => {
+				format!("fill {bounds:?}")
+			}
+			PaintOperation::Text {
+				content,
+				position,
+				clip_bounds,
+				..
+			} => format!("text {content:?} {position:?} {clip_bounds:?}"),
+		};
+		assert_eq!(
+			default.iter().map(geometry).collect::<Vec<_>>(),
+			styled.iter().map(geometry).collect::<Vec<_>>()
+		);
+
+		let styled_colors = styled
+			.iter()
+			.map(|operation| match operation {
+				PaintOperation::Fill {
+					background: Background::Color(color),
+					..
+				} => *color,
+				PaintOperation::Fill { .. } => panic!("table assay does not accept gradients"),
+				PaintOperation::Text { color, .. } => *color,
+			})
+			.collect::<Vec<_>>();
+		for role in [
+			assay.body_background,
+			assay.header_background,
+			assay.gutter_background,
+			assay.row_even_background,
+			assay.row_odd_background,
+			assay.gridline,
+			assay.cell_text,
+			assay.header_text,
+			assay.type_text,
+			assay.gutter_text,
+			assay.selection_fill,
+			assay.scrollbar_thumb,
+		] {
+			assert!(
+				styled_colors.contains(&skin_color(role)),
+				"missing styled role {role:?}"
+			);
+		}
+	}
+
 	fn assert_close(actual: f32, expected: f32) {
 		assert!(
 			(actual - expected).abs() < 0.01,
@@ -1348,7 +1423,7 @@ fill 38.00,130.00,45.33,8.00 #8c00fa/0.50"##;
 			"val" => [1.1_f64, 2.2, 3.3],
 		)
 		.expect("table fixture");
-		let table = Table::new(&frame, 0);
+		let table = Table::new(&frame, 0, TableSkin::DEFAULT);
 		let mut narrow_state = TableState::default();
 		let mut wide_state = TableState::default();
 
@@ -1373,7 +1448,7 @@ fill 38.00,130.00,45.33,8.00 #8c00fa/0.50"##;
 			"very_long" => [very_long],
 		)
 		.expect("table fixture");
-		let table = Table::new(&frame, 0);
+		let table = Table::new(&frame, 0, TableSkin::DEFAULT);
 
 		assert_close(table.measure_col_width(0), MIN_COL_WIDTH);
 		assert_close(
@@ -1392,7 +1467,7 @@ fill 38.00,130.00,45.33,8.00 #8c00fa/0.50"##;
 			"flag" => [true],
 		)
 		.expect("table fixture");
-		let table = Table::new(&frame, 0);
+		let table = Table::new(&frame, 0, TableSkin::DEFAULT);
 
 		assert_eq!(table.column_alignment(0), ColumnAlignment::Left);
 		assert_eq!(table.column_alignment(1), ColumnAlignment::Right);

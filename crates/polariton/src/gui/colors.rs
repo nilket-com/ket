@@ -29,12 +29,6 @@ pub const SELECTION: Color = rgb(110, 10, 240);
 pub const SUCCESS: Color = rgb(40, 200, 40);
 pub const WARNING: Color = rgb(200, 80, 80);
 
-pub const TABLE_ROW_EVEN: Color = rgb(20, 8, 38);
-pub const TABLE_ROW_ODD: Color = rgb(40, 20, 70);
-pub const TABLE_BORDER: Color = rgba(250, 250, 250, 0.1);
-pub const TABLE_TEXT_HEADER: Color = rgb(220, 220, 220);
-pub const TABLE_TYPE_LABEL: Color = rgb(180, 150, 220);
-pub const TABLE_SELECTION: Color = rgba(140, 0, 250, 0.25);
 pub const SCROLLBAR_THUMB: Color = rgba(140, 0, 250, 0.5);
 pub const STATUS_BAR_RAIL_BACKGROUND: Color = rgb(10, 10, 12);
 pub const STATUS_BAR_RAIL_SEPARATOR: Color = BORDER_DIM;
