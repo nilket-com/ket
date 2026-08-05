@@ -3,7 +3,7 @@ use crate::plot::common::{
 	ResolvedPlotSettings, ScatterRenderMode, format_label, polars_type_to_axis_type,
 };
 use crate::plot::spec::{
-	Channel, ResolvedColor, ResolvedLayout, ResolvedPlotSpec, ScaleDomain, ScaleFamily,
+	Channel, PointSize, ResolvedColor, ResolvedLayout, ResolvedPlotSpec, ScaleDomain, ScaleFamily,
 };
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
@@ -189,7 +189,16 @@ impl ScatterMarkRenderer {
 
 	#[allow(dead_code)] // Geometric hit-testing is test-reachable until PRODUCT-0014.
 	fn hit_point(&self, transform: &CoordinateTransformer, cursor: Point) -> Option<MarkHit> {
-		let hit_radius = self.prepared_data.point_size_px + 2.0;
+		self.hit_point_with_radius(transform, cursor, PointSize::ONE.radius_px())
+	}
+
+	fn hit_point_with_radius(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Point,
+		point_radius: f32,
+	) -> Option<MarkHit> {
+		let hit_radius = point_radius + 2.0;
 		let mut nearest_distance = hit_radius * hit_radius;
 		let mut nearest = None;
 		let mut mark_index = 0;
@@ -219,6 +228,7 @@ impl ScatterMarkRenderer {
 		transform: &CoordinateTransformer,
 		settings: &ResolvedPlotSettings,
 	) {
+		let point_radius = settings.point_size.radius_px();
 		for series in &self.prepared_data.series {
 			let color = series
 				.resolved_color
@@ -227,7 +237,7 @@ impl ScatterMarkRenderer {
 				&|builder| {
 					series.for_each_point(|x, y| {
 						let pixel_p = scatter_point(transform, x, y);
-						builder.circle(pixel_p, self.prepared_data.point_size_px);
+						builder.circle(pixel_p, point_radius);
 					});
 				},
 				color,
@@ -242,6 +252,7 @@ impl ScatterMarkRenderer {
 		transform: &CoordinateTransformer,
 		settings: &ResolvedPlotSettings,
 	) {
+		let point_radius = settings.point_size.radius_px();
 		let series_count = self.prepared_data.series.len().max(1);
 		let per_series_target = (settings.scatter_downsample_target.max(1) as usize)
 			.div_ceil(series_count)
@@ -253,7 +264,7 @@ impl ScatterMarkRenderer {
 			backend.fill_path(
 				&|builder| {
 					for point in &sampled {
-						builder.circle(*point, self.prepared_data.point_size_px);
+						builder.circle(*point, point_radius);
 					}
 				},
 				color,
@@ -360,8 +371,17 @@ impl MarkRenderer for ScatterMarkRenderer {
 		}
 	}
 
-	fn hit_test(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<MarkHit> {
-		self.hit_point(transform, cursor.position()?)
+	fn hit_test(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &ResolvedPlotSettings,
+	) -> Option<MarkHit> {
+		self.hit_point_with_radius(
+			transform,
+			cursor.position()?,
+			settings.point_size.radius_px(),
+		)
 	}
 }
 
@@ -400,7 +420,6 @@ pub struct ScatterPreparedData {
 	pub y_range: (f64, f64),
 	pub x_axis_type: AxisType,
 	pub y_axis_type: AxisType,
-	pub point_size_px: f32,
 	pub x_label: String,
 	pub y_label: String,
 	pub total_points: usize,
@@ -571,7 +590,6 @@ pub fn prepare_scatter_data_resolved(
 	spec: &ResolvedPlotSpec,
 	viewport_width: u32,
 	viewport_height: u32,
-	point_size_px: f32,
 ) -> ScatterPreparedData {
 	let x = spec
 		.channel(Channel::X)
@@ -588,7 +606,7 @@ pub fn prepare_scatter_data_resolved(
 	let layout = ResolvedLayout::from_spec(spec, viewport_width, viewport_height);
 
 	if !matches!(x.binding.scale, ScaleFamily::Point | ScaleFamily::Band) {
-		let mut prepared = prepare_scatter_data(df, color_field, x_field, y_field, point_size_px);
+		let mut prepared = prepare_scatter_data(df, color_field, x_field, y_field);
 		prepared.x_axis_type = axis_type_from_scale(x.binding.scale);
 		prepared.y_axis_type = axis_type_from_scale(y.binding.scale);
 		prepared.x_range = layout.x_range;
@@ -668,7 +686,6 @@ pub fn prepare_scatter_data_resolved(
 		y_range,
 		x_axis_type: axis_type_from_scale(x.binding.scale),
 		y_axis_type: axis_type_from_scale(y.binding.scale),
-		point_size_px,
 		x_label: x_field.to_owned(),
 		y_label: y_field.to_owned(),
 		total_points,
@@ -718,7 +735,6 @@ pub fn prepare_scatter_data(
 	cat_col: &str,
 	x_col: &str,
 	y_col: &str,
-	point_size_px: f32,
 ) -> ScatterPreparedData {
 	let x_col_series = match df.column(x_col) {
 		Ok(c) => c
@@ -758,7 +774,6 @@ pub fn prepare_scatter_data(
 			y_range,
 			x_axis_type,
 			y_axis_type,
-			point_size_px,
 			x_label: x_col.to_string(),
 			y_label: y_col.to_string(),
 			total_points: 0,
@@ -824,7 +839,6 @@ pub fn prepare_scatter_data(
 		y_range,
 		x_axis_type,
 		y_axis_type,
-		point_size_px,
 		x_label: x_col.to_string(),
 		y_label: y_col.to_string(),
 		total_points,
@@ -875,7 +889,7 @@ mod tests {
 			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "cat", "val"),
 			&ColorIdentity::default(),
 		);
-		let prepared = prepare_scatter_data_resolved(&frame, &spec, 800, 480, 3.0);
+		let prepared = prepare_scatter_data_resolved(&frame, &spec, 800, 480);
 		assert_eq!(prepared.x_label, "cat");
 		assert_eq!(prepared.y_label, "val");
 		assert_eq!(
@@ -919,7 +933,7 @@ mod tests {
 			.find(|entry| entry.category == "b")
 			.unwrap()
 			.color;
-		let prepared = prepare_scatter_data_resolved(&filtered, &filtered_spec, 800, 480, 3.0);
+		let prepared = prepare_scatter_data_resolved(&filtered, &filtered_spec, 800, 480);
 		assert_eq!(prepared.series.len(), 1);
 		assert_eq!(prepared.series[0].name, "b");
 		assert_eq!(

@@ -1,6 +1,7 @@
 use crate::gui::messages::PlotMessage;
 use crate::plot::colors::ColorTheme;
 use crate::plot::spec::PointSize;
+use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
 use iced::alignment;
@@ -502,6 +503,19 @@ pub trait PlotKernel: Send + Sync {
 		settings: ResolvedPlotSettings,
 	);
 
+	/// PRODUCT-0017 seam: ordinary kernels still consume one flattened setting;
+	/// a layered kernel may resolve the accepted layer tier per mark renderer.
+	fn plot_with_settings(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+	) {
+		self.plot(backend, bounds, transform, cursor, settings.resolve());
+	}
+
 	fn draw_legend(
 		&self,
 		_backend: &mut dyn PlotBackend,
@@ -511,6 +525,15 @@ pub trait PlotKernel: Send + Sync {
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String>;
+
+	fn hover_with_settings(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		_settings: &PlotSettings,
+	) -> Option<String> {
+		self.hover(transform, cursor)
+	}
 
 	fn x_label(&self) -> String {
 		String::new()
@@ -543,7 +566,12 @@ pub trait MarkRenderer: Send + Sync {
 		settings: ResolvedPlotSettings,
 	);
 
-	fn hit_test(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<MarkHit>;
+	fn hit_test(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &ResolvedPlotSettings,
+	) -> Option<MarkHit>;
 }
 
 pub struct PlotWidget<'a> {
@@ -551,6 +579,7 @@ pub struct PlotWidget<'a> {
 	pub title: String,
 	pub padding: f32,
 	pub settings: ResolvedPlotSettings,
+	pub settings_model: PlotSettings,
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
 	pub layer: PlotRenderLayer,
@@ -599,12 +628,12 @@ impl<'a> PlotWidget<'a> {
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		backend.with_save(&mut |backend| {
 			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
-			self.kernel.plot(
+			self.kernel.plot_with_settings(
 				backend,
 				plot_area,
 				&transform,
 				Cursor::Unavailable,
-				self.settings.clone(),
+				&self.settings_model,
 			);
 		});
 	}
@@ -879,7 +908,9 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					}
 					None => Cursor::Unavailable,
 				};
-				let hover = self.kernel.hover(&transform, plot_cursor);
+				let hover =
+					self.kernel
+						.hover_with_settings(&transform, plot_cursor, &self.settings_model);
 				if hover != state.last_hover {
 					state.last_hover = hover.clone();
 					Some(canvas::Action::publish(PlotMessage::UpdateHover(hover)))

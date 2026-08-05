@@ -53,7 +53,12 @@ impl MarkRenderer for LineMarkRenderer {
 		}
 	}
 
-	fn hit_test(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<MarkHit> {
+	fn hit_test(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		_settings: &ResolvedPlotSettings,
+	) -> Option<MarkHit> {
 		const HIT_RADIUS_PX: f32 = 6.0;
 		let cursor = cursor.position()?;
 		let mut nearest = None;

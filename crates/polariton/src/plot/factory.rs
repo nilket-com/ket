@@ -77,7 +77,7 @@ pub fn create_plot(
 		}
 		ResolvedKernelFields::Scatter { color, x, y } => {
 			let scatter_data = Arc::new(scatter::prepare_scatter_data_resolved(
-				df, spec, width, height, 3.0,
+				df, spec, width, height,
 			));
 			if spec.composition.is_scatter_with_line_overlay() {
 				let line_data = Arc::new(line::prepare_line_data(
@@ -249,7 +249,7 @@ pub fn create_layered_plot(
 	};
 	let resolved = resolve_layered_domains(binding, &stamped).map_err(|e| e.to_string())?;
 	let (first, rest) = resolved.layers.into_parts();
-	if rest.is_empty() {
+	if rest.is_empty() && first.settings == crate::plot::spec::LayerSettings::default() {
 		return Ok(create_plot(&first.spec, df, width, height));
 	}
 
@@ -300,23 +300,24 @@ fn prepare_layer_renderer(
 	height: u32,
 ) -> LayerRenderer {
 	match (layer.mark, layer.spec.kernel_fields.as_ref()) {
-		(LayerMark::Line, ResolvedKernelFields::Line { series, x, y }) => {
-			LayerRenderer::line(Arc::new(line::prepare_line_data(
+		(LayerMark::Line, ResolvedKernelFields::Line { series, x, y }) => LayerRenderer::line(
+			Arc::new(line::prepare_line_data(
 				df,
 				series.as_deref().unwrap_or(""),
 				x,
 				y,
-			)))
-		}
-		(LayerMark::Scatter, ResolvedKernelFields::Scatter { .. }) => {
-			LayerRenderer::scatter(Arc::new(scatter::prepare_scatter_data_resolved(
+			)),
+			layer.settings,
+		),
+		(LayerMark::Scatter, ResolvedKernelFields::Scatter { .. }) => LayerRenderer::scatter(
+			Arc::new(scatter::prepare_scatter_data_resolved(
 				df,
 				&layer.spec,
 				width,
 				height,
-				3.0,
-			)))
-		}
+			)),
+			layer.settings,
+		),
 		_ => unreachable!("LayerMark makes unaccepted kernel fields unrepresentable"),
 	}
 }
@@ -361,7 +362,10 @@ mod product_0013_baseline_tests {
 	use crate::plot::common::{CoordinateTransformer, PlotLayout, ResolvedPlotSettings};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::export::SvgBackend;
-	use crate::plot::spec::{AuthoredPlotSpec, LayerMark, LayerSpec, LayeredPlotSpec};
+	use crate::plot::spec::{
+		AuthoredPlotSpec, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize,
+	};
+	use crate::plot::theme::PlotSettings;
 	use iced::advanced::mouse::Cursor;
 	use iced::{Point, Rectangle, Size};
 	use polars::df;
@@ -373,6 +377,22 @@ mod product_0013_baseline_tests {
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		let mut backend = SvgBackend::new(100.0, 100.0);
 		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		backend.finish()
+	}
+
+	fn render_marks_with_settings(kernel: &dyn PlotKernel, settings: &PlotSettings) -> String {
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let resolved = settings.resolve();
+		let layout = kernel.layout(resolved);
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = SvgBackend::new(100.0, 100.0);
+		kernel.plot_with_settings(
 			&mut backend,
 			bounds,
 			&transform,
@@ -535,6 +555,72 @@ mod product_0013_baseline_tests {
 		assert!(
 			!svg.contains("stroke-width=\"3\""),
 			"line legend must not merge into last-layer scatter legend: {svg}"
+		);
+	}
+
+	#[test]
+	fn product_0017_layered_vector_and_downsampled_use_each_resolved_point_size() {
+		let sized = |factor| LayerSettings {
+			point_size: Override::Set(PointSize::new(factor).unwrap()),
+		};
+		let mut first = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		first.settings = sized(0.5);
+		let mut second = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		second.settings = sized(2.0);
+		let mut spec = LayeredPlotSpec::new(first);
+		spec.push(second);
+		let kernel = create_layered_plot(&spec, &fixture(), 100, 100).expect("layered kernel");
+
+		let vector = render_marks_with_settings(kernel.as_ref(), &PlotSettings::default());
+		assert!(
+			vector.contains("A 1.50 1.50"),
+			"small layer missing: {vector}"
+		);
+		assert!(
+			vector.contains("A 6.00 6.00"),
+			"large layer missing: {vector}"
+		);
+
+		let mut downsampled = PlotSettings::default();
+		downsampled.library_defaults.scatter_render_mode =
+			crate::plot::common::ScatterRenderMode::Downsampled;
+		downsampled.library_defaults.scatter_downsample_target = 10;
+		let svg = render_marks_with_settings(kernel.as_ref(), &downsampled);
+		assert!(
+			svg.contains("A 1.50 1.50"),
+			"small sampled layer missing: {svg}"
+		);
+		assert!(
+			svg.contains("A 6.00 6.00"),
+			"large sampled layer missing: {svg}"
+		);
+	}
+
+	#[test]
+	fn product_0017_styled_hit_uses_the_layer_resolved_radius() {
+		let frame = df!("x" => [1.0], "y" => [2.0]).expect("frame");
+		let kernel = |factor| {
+			let mut layer = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+			layer.settings.point_size = Override::Set(PointSize::new(factor).unwrap());
+			create_layered_plot(&LayeredPlotSpec::new(layer), &frame, 100, 100)
+				.expect("styled scatter")
+		};
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let settings = PlotSettings::default();
+		let small = kernel(1.0);
+		let layout = small.layout(settings.resolve());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let point = transform.cartesian(1.0, 2.0);
+		let cursor = Cursor::Available(Point::new(point.x + 6.0, point.y));
+		assert_eq!(
+			small.hover_with_settings(&transform, cursor, &settings),
+			None
+		);
+
+		let large = kernel(2.0);
+		assert_eq!(
+			large.hover_with_settings(&transform, cursor, &settings),
+			Some("X: 1, Y: 2".to_owned())
 		);
 	}
 }

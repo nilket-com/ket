@@ -200,6 +200,15 @@ pub struct PlotSettings {
 }
 
 impl PlotSettings {
+	/// Preserve an already-resolved legacy/editor setting as the library base.
+	/// All later tiers are empty, so resolving is byte-for-byte stable.
+	pub fn from_resolved(library_defaults: ResolvedPlotSettings) -> Self {
+		Self {
+			library_defaults,
+			..Self::default()
+		}
+	}
+
 	pub fn resolve(&self) -> ResolvedPlotSettings {
 		let mut settings = self.library_defaults.clone();
 		for layer in [

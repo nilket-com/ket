@@ -1076,6 +1076,7 @@ impl CodeEditor {
 			title: plot.display_label.clone(),
 			padding: 0.0,
 			settings: plot.plot_settings.clone(),
+			settings_model: plot.plot_settings_model.clone(),
 			render_revision: plot.render_revision,
 			resize_render_suspended: false,
 			layer: PlotRenderLayer::Full,
@@ -3810,6 +3811,9 @@ fn markdown_cell_output_surface<'a>(
 				title: surface.composition.title(),
 				padding: 20.0,
 				settings: surface.settings.clone(),
+				settings_model: crate::plot::theme::PlotSettings::from_resolved(
+					surface.settings.clone(),
+				),
 				render_revision: surface.render_revision,
 				resize_render_suspended: false,
 				layer: PlotRenderLayer::Full,

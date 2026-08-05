@@ -8,6 +8,7 @@ use crate::gui::pane_grid::PaneId;
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, PlotRenderLayer, PlotWidget, ScatterRenderMode};
 use crate::plot::core::PlotType;
+use crate::plot::theme::PlotSettings;
 use iced::widget::{
 	button, canvas, checkbox, column, container, opaque, pick_list, row, scrollable, space, stack,
 	text, text_input,
@@ -23,6 +24,7 @@ pub fn view<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMs
 		title: title.clone(),
 		padding: 20.0,
 		settings: state.plot_settings.clone(),
+		settings_model: PlotSettings::from_resolved(state.plot_settings.clone()),
 		render_revision: state.render_revision,
 		resize_render_suspended: state.resize_render_suspended,
 		layer: PlotRenderLayer::Data,
@@ -35,6 +37,7 @@ pub fn view<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMs
 		title,
 		padding: 20.0,
 		settings: state.plot_settings.clone(),
+		settings_model: PlotSettings::from_resolved(state.plot_settings.clone()),
 		render_revision: state.render_revision,
 		resize_render_suspended: state.resize_render_suspended,
 		layer: PlotRenderLayer::OverlayInteractive,
@@ -136,6 +139,7 @@ pub fn host_view(state: &HostPlotState) -> Element<'_, PlotMessage> {
 		title: title.clone(),
 		padding: 20.0,
 		settings: state.plot_settings.clone(),
+		settings_model: state.plot_settings_model.clone(),
 		render_revision: state.render_revision,
 		resize_render_suspended: state.resize_render_suspended,
 		layer: PlotRenderLayer::Data,
@@ -147,6 +151,7 @@ pub fn host_view(state: &HostPlotState) -> Element<'_, PlotMessage> {
 		title,
 		padding: 20.0,
 		settings: state.plot_settings.clone(),
+		settings_model: state.plot_settings_model.clone(),
 		render_revision: state.render_revision,
 		resize_render_suspended: state.resize_render_suspended,
 		layer: PlotRenderLayer::OverlayInteractive,

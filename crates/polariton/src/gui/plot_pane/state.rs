@@ -18,12 +18,18 @@ fn resolve_host_plot_settings(
 	application_theme: PlotSettingsLayer,
 	authored_spec: PlotSettingsLayer,
 ) -> ResolvedPlotSettings {
+	host_plot_settings_model(application_theme, authored_spec).resolve()
+}
+
+fn host_plot_settings_model(
+	application_theme: PlotSettingsLayer,
+	authored_spec: PlotSettingsLayer,
+) -> PlotSettings {
 	PlotSettings {
 		application_theme,
 		authored_spec,
 		..PlotSettings::default()
 	}
-	.resolve()
 }
 
 fn default_resolved_plot_settings() -> ResolvedPlotSettings {
@@ -41,6 +47,7 @@ pub struct HostPlotState {
 	pub display_label: String,
 	pub kernel: Arc<dyn PlotKernel + Send + Sync>,
 	pub plot_settings: ResolvedPlotSettings,
+	pub plot_settings_model: PlotSettings,
 	pub hovered_info: Option<String>,
 	pub render_revision: u64,
 	pub resize_render_suspended: bool,
@@ -53,13 +60,14 @@ impl HostPlotState {
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 		authored_settings: PlotSettingsLayer,
 	) -> Self {
+		let plot_settings_model =
+			host_plot_settings_model(default_application_plot_settings(), authored_settings);
+		let plot_settings = plot_settings_model.resolve();
 		Self {
 			display_label,
 			kernel,
-			plot_settings: resolve_host_plot_settings(
-				default_application_plot_settings(),
-				authored_settings,
-			),
+			plot_settings,
+			plot_settings_model,
 			hovered_info: None,
 			render_revision: 0,
 			resize_render_suspended: false,
@@ -74,8 +82,9 @@ impl HostPlotState {
 	) {
 		self.display_label = display_label;
 		self.kernel = kernel;
-		self.plot_settings =
-			resolve_host_plot_settings(default_application_plot_settings(), authored_settings);
+		self.plot_settings_model =
+			host_plot_settings_model(default_application_plot_settings(), authored_settings);
+		self.plot_settings = self.plot_settings_model.resolve();
 		self.hovered_info = None;
 		self.render_revision = self.render_revision.wrapping_add(1);
 	}
@@ -464,7 +473,7 @@ mod tests {
 	use crate::plot::export::SvgBackend;
 	use crate::plot::factory::create_layered_plot;
 	use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec, Presence};
-	use crate::plot::theme::PlotSettingsLayer;
+	use crate::plot::theme::{PlotSettings, PlotSettingsLayer};
 	use std::sync::Arc;
 
 	#[test]
@@ -483,6 +492,7 @@ mod tests {
 			display_label,
 			kernel: _,
 			plot_settings: _,
+			plot_settings_model: _,
 			hovered_info,
 			render_revision,
 			resize_render_suspended,
@@ -515,7 +525,8 @@ mod tests {
 			kernel: kernel.as_ref(),
 			title: "Line".to_owned(),
 			padding: 0.0,
-			settings: resolved,
+			settings: resolved.clone(),
+			settings_model: PlotSettings::from_resolved(resolved.clone()),
 			render_revision: 0,
 			resize_render_suspended: false,
 			layer: PlotRenderLayer::Full,

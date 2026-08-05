@@ -1774,6 +1774,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							title: plot_state.composition.title(),
 							padding: 20.0,
 							settings: settings.clone(),
+							settings_model: crate::plot::theme::PlotSettings::from_resolved(
+								settings.clone(),
+							),
 							render_revision: plot_state.render_revision,
 							resize_render_suspended: plot_state.resize_render_suspended,
 							layer: crate::plot::common::PlotRenderLayer::Full,
