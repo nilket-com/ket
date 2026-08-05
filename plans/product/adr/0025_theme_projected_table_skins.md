@@ -1,6 +1,6 @@
 # ADR 0025: theme-projected table skins
 
-Status: proposed 2026-08-05. This record decides one thing: how a libaryon theme
+Status: accepted 2026-08-05. This record decides one thing: how a libaryon theme
 name becomes a validated Polariton table skin and how Rune selects it with
 `table().skin(name)`. Libaryon remains the theme and palette authority;
 Polariton owns the artifact-role projection. It adds no editor-theme coupling,

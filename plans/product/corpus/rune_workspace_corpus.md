@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.23. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.25. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -27,6 +27,7 @@ a cited record).
 | family | status | evidence |
 |---|---|---|
 | bounded table view (`table(r)`; accepted sugar `r.table()` and canonical `r.views([table()])`, inherits the 128 MiB `toron-client` collection ceiling) | executable | `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance `live_rune_relation_reaches_table_bar_and_scatter_surfaces`; PRODUCT-0008 sugar equivalence in `product_0008_single_view_sugars_are_exact_canonical_projections` (`d4c2d8a8`) |
+| theme-projected table skin (`table().skin("theme_expression")`) | executable | PRODUCT-0025 resolves only through libaryon's theme authority, validates all twelve projected table roles through PRODUCT-0023's seven visible contrast checks, and carries the resolved skin atomically with the shared frame. Direct/named contextual lowering, refusal classes, default compatibility, stale retention, identity reuse, no-dashboard host completion, and the exact `terrain_rs10` `test8.rn` shape land in `5a526200`, `f8884673`, and `4ba40bb3`. |
 | bar sink (`plot.bar`; accepted sugar `r.bar(x, y)` and canonical `r.views([bar(x, y)])`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | scatter sink (`plot.scatter`; accepted sugar `r.scatter(x, y)` and canonical `r.views([scatter(x, y)])`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | line sink (`plot.line`; accepted sugar `r.line(x, y)` and canonical `r.views([line(x, y)])`) | executable | PRODUCT-0012 equivalence and contextual refusal in `product_0012_line_*`; exact authored x/y projection in `named_line_preserves_exact_xy_and_projects_the_existing_line_contract`; shared-result and real host-panel completion in `rune_relation_results_feed_the_existing_table_and_plot_surfaces` and `dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard`; installed-transport rendering in `live_product_0012_line_view_reaches_the_existing_kernel` |
@@ -427,8 +428,27 @@ established ratios. The palette's contrast-pair query is total and deterministic
 returns source indices as well as colors, and imposes no artifact threshold.
 Reverse and shift remain observable order-preserving permutations; continuous
 clipping changes the sampled set, while curated clipping's existing no-op is
-guarded without being endorsed. No Rune capability row changes status, and
-PRODUCT-0025 remains the first table-skin projection and `.skin("name")` surface.
+guarded without being endorsed. PRODUCT-0025 now consumes this substrate as the
+first accepted table-skin projection and `.skin("name")` surface.
+
+## Accepted surface: theme-projected Rune table skins
+
+PRODUCT-0025 is accepted and executable in `5a526200`, `f8884673`, and
+`4ba40bb3`. Inside a proven `.views([...])` sink position,
+`table().skin("theme_expression")` carries exactly one authored libaryon theme
+identity. The envelope holds no colors. Polariton resolves the name and all
+modifiers only through `Theme::try_new`, then projects the exact ordered palette
+into a complete `TableSkin` and admits it only after all seven alpha-composited
+PRODUCT-0023 checks pass.
+
+Unknown and resolved-but-unsuitable identities are different diagnostics and
+neither falls back. Failure is per destination and preserves the previous
+frame/skin pair stale. Bare Rune tables, SQL results, and Markdown tables retain
+the byte/draw-compatible default. Skin remains content rather than identity or
+layout: changing it reuses the same host panel, never reaches `UiPalette`, and
+never opens the dashboard. The installed `test8.rn` uses `terrain_rs10`; its
+exact two-origin, four-sink source shape is an executable completion assay and
+the live window remains the intentionally human aesthetic oracle.
 
 ## Mutation and definition lifecycle
 
@@ -459,6 +479,17 @@ PRODUCT-0025 remains the first table-skin projection and `.skin("name")` surface
 
 ## Change log
 
+- v0.25 (2026-08-05): PRODUCT-0025 makes libaryon's existing theme vocabulary
+  selectable as validated Rune table skins with
+  `table().skin("theme_expression")`. Polariton consumes the exact resolved
+  ordered palette, retains reverse/shift observability, projects all twelve
+  table-interior roles, and refuses any result whose weakest one of seven
+  visible text contrasts falls below 4.5:1. The envelope carries only the
+  authored name; completion attaches the resolved skin atomically to the shared
+  frame. Unknown and unsuitable identities remain distinct, bare/SQL/Markdown
+  tables stay defaulted, and skin changes preserve host identity and layout.
+  The exact `terrain_rs10` `test8.rn` shape closes the high-density surface
+  regression without making the repository depend on a live Toron service.
 - v0.24 (2026-08-05): PRODUCT-0024 makes libaryon's exact resolved twenty-color
   theme palette observable beside the unchanged syntax-color projection. A
   1,420-expression textual oracle preserves every full syntax array while
