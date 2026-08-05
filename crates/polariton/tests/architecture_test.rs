@@ -660,3 +660,59 @@ fn product_0023_table_draw_reads_only_its_required_resolved_skin() {
 		"the table draw path must consume only its resolved artifact skin"
 	);
 }
+
+#[test]
+fn product_0023_table_artifact_is_the_atomic_host_and_markdown_boundary() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
+	let production = editor
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production editor source");
+	let artifact = production
+		.split("struct TableArtifact {")
+		.nth(1)
+		.and_then(|tail| tail.split("}\n").next())
+		.expect("TableArtifact body");
+	assert!(artifact.contains("frame: Box<DataFrame>"));
+	assert!(artifact.contains("skin: TableSkin"));
+	assert_eq!(
+		artifact.matches(':').count(),
+		2,
+		"the artifact owns one frame and one skin"
+	);
+	assert_eq!(
+		production.matches("Table(TableArtifact)").count(),
+		2,
+		"host panels and markdown cells must share the atomic artifact"
+	);
+	assert_eq!(
+		production
+			.matches("Table::new(artifact.frame.as_ref(), 0, artifact.skin)")
+			.count(),
+		2,
+		"both consumers must render the skin stored beside the frame"
+	);
+	assert!(
+		production.contains("produced.push(preview_row(markdown_cell_output_surface("),
+		"the Markdown table artifact must remain inside the existing preview-row wrapper"
+	);
+
+	let libaryon = Path::new(env!("CARGO_MANIFEST_DIR")).join("../libaryon/src");
+	let mut pending = vec![libaryon];
+	while let Some(path) = pending.pop() {
+		for entry in std::fs::read_dir(path).expect("read libaryon source") {
+			let path = entry.expect("libaryon entry").path();
+			if path.is_dir() {
+				pending.push(path);
+			} else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+				let source = std::fs::read_to_string(&path).expect("read libaryon file");
+				assert!(
+					!source.contains("TableSkin") && !source.contains("TableArtifact"),
+					"table artifact chrome crossed into editor protocol at {}",
+					path.display()
+				);
+			}
+		}
+	}
+}

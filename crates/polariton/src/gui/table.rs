@@ -1128,18 +1128,27 @@ mod tests {
 	#[derive(Default)]
 	struct RecordingRenderer {
 		operations: Vec<PaintOperation>,
+		layers: Vec<Rectangle>,
+		active_layers: Vec<Rectangle>,
+		operation_layers: Vec<Vec<Rectangle>>,
 	}
 
 	impl renderer::Renderer for RecordingRenderer {
-		fn start_layer(&mut self, _bounds: Rectangle) {}
+		fn start_layer(&mut self, bounds: Rectangle) {
+			self.layers.push(bounds);
+			self.active_layers.push(bounds);
+		}
 
-		fn end_layer(&mut self) {}
+		fn end_layer(&mut self) {
+			self.active_layers.pop();
+		}
 
 		fn start_transformation(&mut self, _transformation: Transformation) {}
 
 		fn end_transformation(&mut self) {}
 
 		fn fill_quad(&mut self, quad: renderer::Quad, background: impl Into<Background>) {
+			self.operation_layers.push(self.active_layers.clone());
 			self.operations.push(PaintOperation::Fill {
 				bounds: quad.bounds,
 				background: background.into(),
@@ -1207,6 +1216,7 @@ mod tests {
 			color: Color,
 			clip_bounds: Rectangle,
 		) {
+			self.operation_layers.push(self.active_layers.clone());
 			self.operations.push(PaintOperation::Text {
 				content: text.content,
 				position,
@@ -1216,7 +1226,14 @@ mod tests {
 		}
 	}
 
-	fn product_0023_recorded_table_operations(skin: TableSkin) -> Vec<PaintOperation> {
+	struct RecordedTableDraw {
+		operations: Vec<PaintOperation>,
+		layers: Vec<Rectangle>,
+		operation_layers: Vec<Vec<Rectangle>>,
+		bounds: Rectangle,
+	}
+
+	fn product_0023_recorded_table_draw(skin: TableSkin) -> RecordedTableDraw {
 		let frame = polars::df!(
 			"category" => ["A", "B", "C", "D"],
 			"value" => [1_i64, 2, 3, 4],
@@ -1249,7 +1266,16 @@ mod tests {
 			Cursor::Unavailable,
 			&bounds,
 		);
-		renderer.operations
+		RecordedTableDraw {
+			operations: renderer.operations,
+			layers: renderer.layers,
+			operation_layers: renderer.operation_layers,
+			bounds,
+		}
+	}
+
+	fn product_0023_recorded_table_operations(skin: TableSkin) -> Vec<PaintOperation> {
+		product_0023_recorded_table_draw(skin).operations
 	}
 
 	fn product_0023_operation_signature(operations: &[PaintOperation]) -> String {
@@ -1490,5 +1516,36 @@ fill 38.00,130.00,45.33,8.00 #8c00fa/0.50"##;
 		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 100.0), 350.0);
 		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 300.0), 200.0);
 		assert_eq!(clamp_horizontal_scroll(350.0, 500.0, 600.0), 0.0);
+	}
+
+	#[test]
+	fn product_0023_table_artifact_draw_is_clipped_to_its_content_bounds() {
+		let recorded = product_0023_recorded_table_draw(TableSkin::DEFAULT);
+		let contained_by = |inner: Rectangle, outer: Rectangle| {
+			inner.x >= outer.x
+				&& inner.y >= outer.y
+				&& inner.x + inner.width <= outer.x + outer.width
+				&& inner.y + inner.height <= outer.y + outer.height
+		};
+		assert_eq!(recorded.layers.first(), Some(&recorded.bounds));
+		assert!(
+			recorded
+				.layers
+				.iter()
+				.all(|bounds| contained_by(*bounds, recorded.bounds)),
+			"every nested draw layer must remain inside the table artifact clip"
+		);
+		assert!(matches!(
+			recorded.operations.first(),
+			Some(PaintOperation::Fill { bounds, .. }) if *bounds == recorded.bounds
+		));
+		assert_eq!(recorded.operations.len(), recorded.operation_layers.len());
+		assert!(recorded.operation_layers[0].is_empty());
+		assert!(
+			recorded.operation_layers[1..]
+				.iter()
+				.all(|layers| layers.first() == Some(&recorded.bounds)),
+			"every operation after the artifact background must execute inside the outer clip"
+		);
 	}
 }

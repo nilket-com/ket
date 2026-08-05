@@ -10,6 +10,7 @@ use crate::gui::plot_pane::{self, HostPlotState, PlotPaneMsg};
 use crate::gui::{
 	dashboard::{self, DashboardMsg, DashboardState},
 	table::{Table, TableScroll},
+	table_skin::TableSkin,
 };
 use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
@@ -403,7 +404,7 @@ pub struct MarkdownCellExecution {
 
 enum NotebookCellOutput {
 	Running,
-	Table(Box<DataFrame>),
+	Table(TableArtifact),
 	Plot { surface: Box<NotebookPlotSurface> },
 	Failed(String),
 }
@@ -738,9 +739,20 @@ impl CodeEditor {
 	}
 
 	pub fn set_markdown_cell_table(&mut self, identity: MarkdownCellIdentity, frame: DataFrame) {
+		self.set_markdown_cell_table_with_skin(identity, frame, TableSkin::DEFAULT);
+	}
+
+	fn set_markdown_cell_table_with_skin(
+		&mut self,
+		identity: MarkdownCellIdentity,
+		frame: DataFrame,
+		skin: TableSkin,
+	) {
 		self.retain_markdown_cell_table(identity.clone(), &frame);
-		self.notebook_outputs
-			.insert(identity, NotebookCellOutput::Table(Box::new(frame)));
+		self.notebook_outputs.insert(
+			identity,
+			NotebookCellOutput::Table(TableArtifact::new(frame, skin)),
+		);
 	}
 
 	pub fn retain_markdown_cell_table(
@@ -975,8 +987,20 @@ impl CodeEditor {
 
 	#[cfg(feature = "toron")]
 	pub fn set_rune_view_table(&mut self, panel_id: HostPanelId, frame: DataFrame) {
-		self.panels
-			.set_content(panel_id, PanelContent::Table(Box::new(frame)));
+		self.set_rune_view_table_with_skin(panel_id, frame, TableSkin::DEFAULT);
+	}
+
+	#[cfg(feature = "toron")]
+	fn set_rune_view_table_with_skin(
+		&mut self,
+		panel_id: HostPanelId,
+		frame: DataFrame,
+		skin: TableSkin,
+	) {
+		self.panels.set_content(
+			panel_id,
+			PanelContent::Table(TableArtifact::new(frame, skin)),
+		);
 	}
 
 	#[cfg(feature = "toron")]
@@ -1186,7 +1210,7 @@ impl CodeEditor {
 		let panel_id = self.rune_view_panel_id(producer, identity)?;
 		let entry = self.panels.panels.get(&panel_id)?;
 		match &entry.content {
-			PanelContent::Table(frame) => Some(frame),
+			PanelContent::Table(artifact) => Some(artifact.frame.as_ref()),
 			_ => None,
 		}
 	}
@@ -1226,8 +1250,14 @@ impl CodeEditor {
 
 	/// Attach a completed result set to the panel.
 	pub fn set_query_result(&mut self, frame: DataFrame) {
-		self.panels
-			.set_content(RESULT_PANEL, PanelContent::Table(Box::new(frame)));
+		self.set_query_result_with_skin(frame, TableSkin::DEFAULT);
+	}
+
+	fn set_query_result_with_skin(&mut self, frame: DataFrame, skin: TableSkin) {
+		self.panels.set_content(
+			RESULT_PANEL,
+			PanelContent::Table(TableArtifact::new(frame, skin)),
+		);
 	}
 
 	/// Complete a non-row SQL command in the results pane. A pane-targeted
@@ -2449,6 +2479,20 @@ struct PanelEntry {
 	scroll: Option<(u64, TableScroll)>,
 }
 
+struct TableArtifact {
+	frame: Box<DataFrame>,
+	skin: TableSkin,
+}
+
+impl TableArtifact {
+	fn new(frame: DataFrame, skin: TableSkin) -> Self {
+		Self {
+			frame: Box::new(frame),
+			skin,
+		}
+	}
+}
+
 /// Host-owned backing state for a panel. None of this is representable in
 /// libaryon: the engine only knows the panel exists.
 enum PanelContent {
@@ -2456,7 +2500,7 @@ enum PanelContent {
 	/// a panel from a persisted layout or one seen before its object exists.
 	Unresolved,
 	Running,
-	Table(Box<DataFrame>),
+	Table(TableArtifact),
 	#[cfg(feature = "toron")]
 	Plot(Box<HostPlotState>),
 	Message(String),
@@ -2699,8 +2743,8 @@ impl PanelRegistry {
 			dashboard::view(dashboard).map(EditorMsg::Dashboard)
 		} else {
 			match content {
-				PanelContent::Table(frame) => {
-					Table::new(frame, 0, crate::gui::table_skin::TableSkin::DEFAULT)
+				PanelContent::Table(artifact) => {
+					Table::new(artifact.frame.as_ref(), 0, artifact.skin)
 						.show_column_types(show_column_types)
 						.scroll_request(
 							self.panels
@@ -3826,8 +3870,8 @@ fn markdown_cell_output_surface<'a>(
 			.size(metrics::TEXT_SIZE)
 			.color(color(palette.preview_text))
 			.into(),
-		NotebookCellOutput::Table(frame) => {
-			Table::new(frame, 0, crate::gui::table_skin::TableSkin::DEFAULT)
+		NotebookCellOutput::Table(artifact) => {
+			Table::new(artifact.frame.as_ref(), 0, artifact.skin)
 				.show_column_types(show_column_types)
 				.into()
 		}
@@ -4760,12 +4804,13 @@ mod tests {
 	use super::{
 		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg,
 		HostPanelPlacement, INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock,
-		MarkdownPreviewColors, Modifiers, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneTabAction, Rgb,
-		SplitDirection, UiPalette, command_bar_fragments, fence_body_start, highlight_span_at,
-		markdown_code_fragments, metrics, pane_gutter_width, pane_title, parse_markdown_blocks,
-		preview_row_budget, preview_source_window, prompt_cursor_byte, viewport_cells,
-		visible_blocks,
+		MarkdownPreviewColors, Modifiers, NotebookCellOutput, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP,
+		PaneTabAction, PanelContent, PanelStatus, Rgb, SplitDirection, UiPalette,
+		command_bar_fragments, fence_body_start, highlight_span_at, markdown_code_fragments,
+		metrics, pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
+		preview_source_window, prompt_cursor_byte, viewport_cells, visible_blocks,
 	};
+	use crate::gui::table_skin::{TableRgba, TableSkin};
 	use libaryon::svp::markdown_highlight::MarkdownConstruct;
 	use libaryon::svp::rust_highlight::TokenCategory;
 	use std::thread;
@@ -6542,6 +6587,127 @@ mod tests {
 			panic!("a completed non-row query replaces the running panel state");
 		};
 		assert_eq!(message, "Rows affected: 3");
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0023_completed_table_artifacts_replace_and_stale_as_atomic_pairs() {
+		use libaryon::engine::HostPanelId;
+		use libaryon::uast::projection::MarkdownCellIdentity;
+
+		let alternate_skin = TableSkin {
+			body_background: TableRgba::opaque(9, 8, 7),
+			..TableSkin::DEFAULT
+		};
+		let first = polars::df!("n" => [1_i64]).expect("first frame");
+		let second = polars::df!("n" => [2_i64, 3]).expect("second frame");
+		let assert_pair = |content: &PanelContent, first_value, height, skin| {
+			let PanelContent::Table(artifact) = content else {
+				panic!("completed table content must retain one table artifact")
+			};
+			assert_eq!(artifact.frame.height(), height);
+			assert_eq!(
+				artifact
+					.frame
+					.column("n")
+					.expect("n column")
+					.i64()
+					.expect("i64 column")
+					.get(0),
+				Some(first_value)
+			);
+			assert_eq!(artifact.skin, skin);
+		};
+
+		let mut editor = CodeEditor::new("select 1;");
+		editor.set_query_result_with_skin(first.clone(), TableSkin::DEFAULT);
+		assert_pair(
+			&editor.panels.panels[&super::RESULT_PANEL].content,
+			1,
+			1,
+			TableSkin::DEFAULT,
+		);
+		editor.set_query_result_with_skin(second.clone(), alternate_skin);
+		assert_pair(
+			&editor.panels.panels[&super::RESULT_PANEL].content,
+			2,
+			2,
+			alternate_skin,
+		);
+		editor.panels.fail_or_stale(super::RESULT_PANEL);
+		assert_pair(
+			&editor.panels.panels[&super::RESULT_PANEL].content,
+			2,
+			2,
+			alternate_skin,
+		);
+		assert_eq!(
+			editor.panels.panels[&super::RESULT_PANEL].status,
+			PanelStatus::Stale
+		);
+
+		let rune_panel = HostPanelId::new(99);
+		editor.set_rune_view_table_with_skin(rune_panel, first.clone(), TableSkin::DEFAULT);
+		editor.set_rune_view_table_with_skin(rune_panel, second.clone(), alternate_skin);
+		editor.panels.fail_or_stale(rune_panel);
+		assert_pair(
+			&editor.panels.panels[&rune_panel].content,
+			2,
+			2,
+			alternate_skin,
+		);
+		assert_eq!(editor.panels.panels[&rune_panel].status, PanelStatus::Stale);
+
+		let identity = MarkdownCellIdentity::Explicit {
+			id: "table-skin".to_owned(),
+		};
+		editor.set_markdown_cell_table_with_skin(identity.clone(), first, TableSkin::DEFAULT);
+		editor.set_markdown_cell_table_with_skin(identity.clone(), second, alternate_skin);
+		let Some(NotebookCellOutput::Table(artifact)) = editor.notebook_outputs.get(&identity)
+		else {
+			panic!("markdown completion must retain one table artifact")
+		};
+		assert_eq!(artifact.frame.height(), 2);
+		assert_eq!(artifact.skin, alternate_skin);
+	}
+
+	#[test]
+	fn product_0023_skin_only_replacement_does_not_mutate_host_panel_layout() {
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		let frame = polars::df!("n" => [1_i64]).expect("frame");
+		editor.set_query_result_with_skin(frame.clone(), TableSkin::DEFAULT);
+
+		let panel_snapshot = |editor: &CodeEditor| {
+			let viewport = editor.viewport.as_ref().expect("viewport");
+			let pane = viewport
+				.panes
+				.iter()
+				.find(|pane| {
+					pane.host_panel
+						.as_ref()
+						.is_some_and(|panel| panel.panel_id == super::RESULT_PANEL)
+				})
+				.expect("result panel");
+			(
+				viewport.focused_pane_id,
+				pane.pane_id,
+				pane.rect,
+				pane.host_panel.clone(),
+				pane.tabs.clone(),
+				pane.active_doctab_index,
+			)
+		};
+		let before = panel_snapshot(&editor);
+		let alternate_skin = TableSkin {
+			body_background: TableRgba::opaque(9, 8, 7),
+			..TableSkin::DEFAULT
+		};
+		editor.set_query_result_with_skin(frame, alternate_skin);
+		let after = panel_snapshot(&editor);
+		assert_eq!(before, after);
 	}
 
 	#[test]
