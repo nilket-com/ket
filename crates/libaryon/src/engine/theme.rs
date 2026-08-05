@@ -69,6 +69,201 @@ impl ResolvedThemePalette {
 	}
 }
 
+/// An immutable, naturally ordered palette for categorical data.
+///
+/// Private storage makes an empty categorical palette unrepresentable through
+/// the public API. Unlike [`ResolvedThemePalette`], its length is the theme's
+/// declared categorical capacity rather than the syntax category count.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedCategoricalPalette {
+	first: Rgb,
+	rest: Box<[Rgb]>,
+}
+
+impl ResolvedCategoricalPalette {
+	fn from_declaration(declaration: CategoricalDeclaration) -> Self {
+		Self {
+			first: declaration.first,
+			rest: declaration.rest.into(),
+		}
+	}
+
+	fn from_non_empty_iter(first: Rgb, rest: impl IntoIterator<Item = Rgb>) -> Self {
+		Self {
+			first,
+			rest: rest.into_iter().collect(),
+		}
+	}
+
+	pub fn len(&self) -> usize {
+		1 + self.rest.len()
+	}
+
+	pub fn color(&self, index: usize) -> Option<Rgb> {
+		if index == 0 {
+			Some(self.first)
+		} else {
+			self.rest.get(index - 1).copied()
+		}
+	}
+
+	pub fn iter(&self) -> impl Iterator<Item = Rgb> + '_ {
+		std::iter::once(self.first).chain(self.rest.iter().copied())
+	}
+}
+
+#[derive(Clone, Copy)]
+struct CategoricalDeclaration {
+	first: Rgb,
+	rest: &'static [Rgb],
+}
+
+impl CategoricalDeclaration {
+	const fn new(first: Rgb, rest: &'static [Rgb]) -> Self {
+		Self { first, rest }
+	}
+
+	fn color(self, index: usize) -> Rgb {
+		if index == 0 {
+			self.first
+		} else {
+			self.rest[index - 1]
+		}
+	}
+}
+
+macro_rules! categorical_declaration {
+	($first:expr $(, $rest:expr)+ $(,)?) => {
+		CategoricalDeclaration::new($first, &[$($rest),+])
+	};
+}
+
+const TAB20_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	Rgb::new(31, 119, 180),
+	Rgb::new(174, 199, 232),
+	Rgb::new(255, 127, 14),
+	Rgb::new(255, 187, 120),
+	Rgb::new(44, 160, 44),
+	Rgb::new(152, 223, 138),
+	Rgb::new(214, 39, 40),
+	Rgb::new(255, 152, 150),
+	Rgb::new(148, 103, 189),
+	Rgb::new(197, 176, 213),
+	Rgb::new(140, 86, 75),
+	Rgb::new(196, 156, 148),
+	Rgb::new(227, 119, 194),
+	Rgb::new(247, 182, 210),
+	Rgb::new(127, 127, 127),
+	Rgb::new(199, 199, 199),
+	Rgb::new(188, 189, 34),
+	Rgb::new(219, 219, 141),
+	Rgb::new(23, 190, 207),
+	Rgb::new(158, 218, 229),
+);
+
+const TAB20B_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	Rgb::new(57, 59, 121),
+	Rgb::new(82, 84, 163),
+	Rgb::new(107, 110, 207),
+	Rgb::new(156, 158, 222),
+	Rgb::new(99, 121, 57),
+	Rgb::new(140, 162, 82),
+	Rgb::new(181, 207, 107),
+	Rgb::new(206, 219, 156),
+	Rgb::new(140, 109, 49),
+	Rgb::new(189, 158, 57),
+	Rgb::new(231, 186, 82),
+	Rgb::new(231, 203, 148),
+	Rgb::new(132, 60, 57),
+	Rgb::new(173, 73, 74),
+	Rgb::new(214, 97, 107),
+	Rgb::new(231, 150, 156),
+	Rgb::new(123, 65, 115),
+	Rgb::new(165, 81, 148),
+	Rgb::new(206, 109, 189),
+	Rgb::new(222, 158, 214),
+);
+
+const TAB20C_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	Rgb::new(49, 130, 189),
+	Rgb::new(107, 174, 214),
+	Rgb::new(158, 202, 225),
+	Rgb::new(198, 219, 239),
+	Rgb::new(230, 85, 13),
+	Rgb::new(253, 141, 60),
+	Rgb::new(253, 174, 107),
+	Rgb::new(253, 208, 162),
+	Rgb::new(49, 163, 84),
+	Rgb::new(116, 196, 118),
+	Rgb::new(161, 217, 155),
+	Rgb::new(199, 233, 192),
+	Rgb::new(117, 107, 177),
+	Rgb::new(158, 154, 200),
+	Rgb::new(188, 189, 220),
+	Rgb::new(218, 218, 235),
+	Rgb::new(166, 54, 3),
+	Rgb::new(0, 109, 44),
+	Rgb::new(63, 0, 125),
+	Rgb::new(150, 150, 150),
+);
+
+const DARK2_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	Rgb::new(27, 158, 119),
+	Rgb::new(217, 95, 2),
+	Rgb::new(117, 112, 179),
+	Rgb::new(231, 41, 138),
+	Rgb::new(102, 166, 30),
+	Rgb::new(230, 171, 2),
+	Rgb::new(166, 118, 29),
+	Rgb::new(102, 102, 102),
+);
+
+const KELLY_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	Rgb::new(255, 179, 0),
+	Rgb::new(128, 62, 117),
+	Rgb::new(166, 189, 215),
+	Rgb::new(255, 104, 0),
+	Rgb::new(193, 0, 32),
+	Rgb::new(206, 162, 98),
+	Rgb::new(129, 112, 102),
+	Rgb::new(0, 125, 52),
+	Rgb::new(246, 118, 142),
+	Rgb::new(0, 83, 138),
+	Rgb::new(255, 122, 92),
+	Rgb::new(83, 55, 122),
+	Rgb::new(255, 142, 0),
+	Rgb::new(179, 40, 81),
+	Rgb::new(244, 200, 0),
+	Rgb::new(127, 24, 13),
+	Rgb::new(147, 170, 0),
+	Rgb::new(89, 51, 21),
+	Rgb::new(35, 44, 22),
+	Rgb::new(18, 18, 18),
+);
+
+const PRISM_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	Rgb::new(255, 0, 64),
+	Rgb::new(0, 255, 128),
+	Rgb::new(76, 76, 76),
+	Rgb::new(0, 128, 255),
+	Rgb::new(255, 215, 0),
+	Rgb::new(255, 85, 0),
+	Rgb::new(224, 224, 224),
+	Rgb::new(128, 255, 0),
+	Rgb::new(255, 0, 255),
+	Rgb::new(0, 255, 255),
+	Rgb::new(123, 104, 238),
+	Rgb::new(154, 205, 50),
+	Rgb::new(186, 85, 211),
+	Rgb::new(255, 165, 0),
+	Rgb::new(205, 92, 92),
+	Rgb::new(32, 178, 170),
+	Rgb::new(218, 112, 214),
+	Rgb::new(184, 134, 11),
+	Rgb::new(95, 158, 160),
+	Rgb::new(26, 26, 26),
+);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResolvedThemePair {
 	darker_index: usize,
@@ -148,11 +343,16 @@ fn parse_theme_modifiers(name: &str) -> (&str, bool, bool, bool, usize) {
 pub struct Theme {
 	pub syntax_colors: [Option<Rgb>; CATEGORY_COUNT],
 	palette: ResolvedThemePalette,
+	categorical_palette: Option<ResolvedCategoricalPalette>,
 }
 
 impl Theme {
 	pub const fn palette(&self) -> &ResolvedThemePalette {
 		&self.palette
+	}
+
+	pub const fn categorical_palette(&self) -> Option<&ResolvedCategoricalPalette> {
+		self.categorical_palette.as_ref()
 	}
 
 	pub fn try_new(name: &str) -> Result<Self, String> {
@@ -167,7 +367,7 @@ impl Theme {
 			return Err(format!("Unknown theme: {}", name));
 		};
 
-		if let ThemePalette::Discrete(fill) = spec.palette {
+		if let ThemePalette::Discrete { fill, .. } = spec.palette {
 			fill(&mut colors);
 			let mut resolved = [Rgb::new(0, 0, 0); THEMED_CATEGORIES.len()];
 			for (index, category) in THEMED_CATEGORIES.iter().copied().enumerate() {
@@ -191,6 +391,7 @@ impl Theme {
 			return Ok(Self {
 				syntax_colors: colors,
 				palette: ResolvedThemePalette(resolved),
+				categorical_palette: None,
 			});
 		}
 
@@ -224,6 +425,7 @@ impl Theme {
 		Ok(Self {
 			syntax_colors: colors,
 			palette: ResolvedThemePalette(sampled_colors),
+			categorical_palette: None,
 		})
 	}
 
@@ -399,26 +601,26 @@ impl Theme {
 	}
 
 	fn fill_tab20(map: &mut [Option<Rgb>; CATEGORY_COUNT]) {
-		let c01 = Rgb::new(31, 119, 180);
-		let c02 = Rgb::new(174, 199, 232);
-		let c03 = Rgb::new(255, 127, 14);
-		let c04 = Rgb::new(255, 187, 120);
-		let c05 = Rgb::new(44, 160, 44);
-		let c06 = Rgb::new(152, 223, 138);
-		let c07 = Rgb::new(214, 39, 40);
-		let c08 = Rgb::new(255, 152, 150);
-		let c09 = Rgb::new(148, 103, 189);
-		let c10 = Rgb::new(197, 176, 213);
-		let c11 = Rgb::new(140, 86, 75);
-		let c12 = Rgb::new(196, 156, 148);
-		let c13 = Rgb::new(227, 119, 194);
-		let c14 = Rgb::new(247, 182, 210);
-		let c15 = Rgb::new(127, 127, 127);
-		let c16 = Rgb::new(199, 199, 199);
-		let c17 = Rgb::new(188, 189, 34);
-		let c18 = Rgb::new(219, 219, 141);
-		let c19 = Rgb::new(23, 190, 207);
-		let c20 = Rgb::new(158, 218, 229);
+		let c01 = TAB20_CATEGORICAL.color(0);
+		let c02 = TAB20_CATEGORICAL.color(1);
+		let c03 = TAB20_CATEGORICAL.color(2);
+		let c04 = TAB20_CATEGORICAL.color(3);
+		let c05 = TAB20_CATEGORICAL.color(4);
+		let c06 = TAB20_CATEGORICAL.color(5);
+		let c07 = TAB20_CATEGORICAL.color(6);
+		let c08 = TAB20_CATEGORICAL.color(7);
+		let c09 = TAB20_CATEGORICAL.color(8);
+		let c10 = TAB20_CATEGORICAL.color(9);
+		let c11 = TAB20_CATEGORICAL.color(10);
+		let c12 = TAB20_CATEGORICAL.color(11);
+		let c13 = TAB20_CATEGORICAL.color(12);
+		let c14 = TAB20_CATEGORICAL.color(13);
+		let c15 = TAB20_CATEGORICAL.color(14);
+		let c16 = TAB20_CATEGORICAL.color(15);
+		let c17 = TAB20_CATEGORICAL.color(16);
+		let c18 = TAB20_CATEGORICAL.color(17);
+		let c19 = TAB20_CATEGORICAL.color(18);
+		let c20 = TAB20_CATEGORICAL.color(19);
 
 		set_color(map, TokenCategory::Keyword, c01);
 		set_color(map, TokenCategory::String, c02);
@@ -444,26 +646,26 @@ impl Theme {
 	}
 
 	fn fill_tab20b(map: &mut [Option<Rgb>; CATEGORY_COUNT]) {
-		let c01 = Rgb::new(57, 59, 121);
-		let c02 = Rgb::new(82, 84, 163);
-		let c03 = Rgb::new(107, 110, 207);
-		let c04 = Rgb::new(156, 158, 222);
-		let c05 = Rgb::new(99, 121, 57);
-		let c06 = Rgb::new(140, 162, 82);
-		let c07 = Rgb::new(181, 207, 107);
-		let c08 = Rgb::new(206, 219, 156);
-		let c09 = Rgb::new(140, 109, 49);
-		let c10 = Rgb::new(189, 158, 57);
-		let c11 = Rgb::new(231, 186, 82);
-		let c12 = Rgb::new(231, 203, 148);
-		let c13 = Rgb::new(132, 60, 57);
-		let c14 = Rgb::new(173, 73, 74);
-		let c15 = Rgb::new(214, 97, 107);
-		let c16 = Rgb::new(231, 150, 156);
-		let c17 = Rgb::new(123, 65, 115);
-		let c18 = Rgb::new(165, 81, 148);
-		let c19 = Rgb::new(206, 109, 189);
-		let c20 = Rgb::new(222, 158, 214);
+		let c01 = TAB20B_CATEGORICAL.color(0);
+		let c02 = TAB20B_CATEGORICAL.color(1);
+		let c03 = TAB20B_CATEGORICAL.color(2);
+		let c04 = TAB20B_CATEGORICAL.color(3);
+		let c05 = TAB20B_CATEGORICAL.color(4);
+		let c06 = TAB20B_CATEGORICAL.color(5);
+		let c07 = TAB20B_CATEGORICAL.color(6);
+		let c08 = TAB20B_CATEGORICAL.color(7);
+		let c09 = TAB20B_CATEGORICAL.color(8);
+		let c10 = TAB20B_CATEGORICAL.color(9);
+		let c11 = TAB20B_CATEGORICAL.color(10);
+		let c12 = TAB20B_CATEGORICAL.color(11);
+		let c13 = TAB20B_CATEGORICAL.color(12);
+		let c14 = TAB20B_CATEGORICAL.color(13);
+		let c15 = TAB20B_CATEGORICAL.color(14);
+		let c16 = TAB20B_CATEGORICAL.color(15);
+		let c17 = TAB20B_CATEGORICAL.color(16);
+		let c18 = TAB20B_CATEGORICAL.color(17);
+		let c19 = TAB20B_CATEGORICAL.color(18);
+		let c20 = TAB20B_CATEGORICAL.color(19);
 
 		set_color(map, TokenCategory::Keyword, c01);
 		set_color(map, TokenCategory::String, c05);
@@ -489,26 +691,26 @@ impl Theme {
 	}
 
 	fn fill_tab20c(map: &mut [Option<Rgb>; CATEGORY_COUNT]) {
-		let c01 = Rgb::new(49, 130, 189);
-		let c02 = Rgb::new(107, 174, 214);
-		let c03 = Rgb::new(158, 202, 225);
-		let c04 = Rgb::new(198, 219, 239);
-		let c05 = Rgb::new(230, 85, 13);
-		let c06 = Rgb::new(253, 141, 60);
-		let c07 = Rgb::new(253, 174, 107);
-		let c08 = Rgb::new(253, 208, 162);
-		let c09 = Rgb::new(49, 163, 84);
-		let c10 = Rgb::new(116, 196, 118);
-		let c11 = Rgb::new(161, 217, 155);
-		let c12 = Rgb::new(199, 233, 192);
-		let c13 = Rgb::new(117, 107, 177);
-		let c14 = Rgb::new(158, 154, 200);
-		let c15 = Rgb::new(188, 189, 220);
-		let c16 = Rgb::new(218, 218, 235);
-		let c17 = Rgb::new(166, 54, 3);
-		let c18 = Rgb::new(0, 109, 44);
-		let c19 = Rgb::new(63, 0, 125);
-		let c20 = Rgb::new(150, 150, 150);
+		let c01 = TAB20C_CATEGORICAL.color(0);
+		let c02 = TAB20C_CATEGORICAL.color(1);
+		let c03 = TAB20C_CATEGORICAL.color(2);
+		let c04 = TAB20C_CATEGORICAL.color(3);
+		let c05 = TAB20C_CATEGORICAL.color(4);
+		let c06 = TAB20C_CATEGORICAL.color(5);
+		let c07 = TAB20C_CATEGORICAL.color(6);
+		let c08 = TAB20C_CATEGORICAL.color(7);
+		let c09 = TAB20C_CATEGORICAL.color(8);
+		let c10 = TAB20C_CATEGORICAL.color(9);
+		let c11 = TAB20C_CATEGORICAL.color(10);
+		let c12 = TAB20C_CATEGORICAL.color(11);
+		let c13 = TAB20C_CATEGORICAL.color(12);
+		let c14 = TAB20C_CATEGORICAL.color(13);
+		let c15 = TAB20C_CATEGORICAL.color(14);
+		let c16 = TAB20C_CATEGORICAL.color(15);
+		let c17 = TAB20C_CATEGORICAL.color(16);
+		let c18 = TAB20C_CATEGORICAL.color(17);
+		let c19 = TAB20C_CATEGORICAL.color(18);
+		let c20 = TAB20C_CATEGORICAL.color(19);
 
 		set_color(map, TokenCategory::Keyword, c01);
 		set_color(map, TokenCategory::String, c09);
@@ -534,14 +736,14 @@ impl Theme {
 	}
 
 	fn fill_dark2(map: &mut [Option<Rgb>; CATEGORY_COUNT]) {
-		let green = Rgb::new(27, 158, 119);
-		let orange = Rgb::new(217, 95, 2);
-		let purple = Rgb::new(117, 112, 179);
-		let pink = Rgb::new(231, 41, 138);
-		let lime = Rgb::new(102, 166, 30);
-		let yellow = Rgb::new(230, 171, 2);
-		let brown = Rgb::new(166, 118, 29);
-		let gray = Rgb::new(102, 102, 102);
+		let green = DARK2_CATEGORICAL.color(0);
+		let orange = DARK2_CATEGORICAL.color(1);
+		let purple = DARK2_CATEGORICAL.color(2);
+		let pink = DARK2_CATEGORICAL.color(3);
+		let lime = DARK2_CATEGORICAL.color(4);
+		let yellow = DARK2_CATEGORICAL.color(5);
+		let brown = DARK2_CATEGORICAL.color(6);
+		let gray = DARK2_CATEGORICAL.color(7);
 
 		set_color(map, TokenCategory::String, green);
 		set_color(map, TokenCategory::Variable, orange);
@@ -750,26 +952,26 @@ impl Theme {
 	}
 
 	fn fill_kelly(map: &mut [Option<Rgb>; CATEGORY_COUNT]) {
-		let c01 = Rgb::new(255, 179, 0);
-		let c02 = Rgb::new(128, 62, 117);
-		let c03 = Rgb::new(166, 189, 215);
-		let c04 = Rgb::new(255, 104, 0);
-		let c05 = Rgb::new(193, 0, 32);
-		let c06 = Rgb::new(206, 162, 98);
-		let c07 = Rgb::new(129, 112, 102);
-		let c08 = Rgb::new(0, 125, 52);
-		let c09 = Rgb::new(246, 118, 142);
-		let c10 = Rgb::new(0, 83, 138);
-		let c11 = Rgb::new(255, 122, 92);
-		let c12 = Rgb::new(83, 55, 122);
-		let c13 = Rgb::new(255, 142, 0);
-		let c14 = Rgb::new(179, 40, 81);
-		let c15 = Rgb::new(244, 200, 0);
-		let c16 = Rgb::new(127, 24, 13);
-		let c17 = Rgb::new(147, 170, 0);
-		let c18 = Rgb::new(89, 51, 21);
-		let c19 = Rgb::new(35, 44, 22);
-		let c20 = Rgb::new(18, 18, 18);
+		let c01 = KELLY_CATEGORICAL.color(0);
+		let c02 = KELLY_CATEGORICAL.color(1);
+		let c03 = KELLY_CATEGORICAL.color(2);
+		let c04 = KELLY_CATEGORICAL.color(3);
+		let c05 = KELLY_CATEGORICAL.color(4);
+		let c06 = KELLY_CATEGORICAL.color(5);
+		let c07 = KELLY_CATEGORICAL.color(6);
+		let c08 = KELLY_CATEGORICAL.color(7);
+		let c09 = KELLY_CATEGORICAL.color(8);
+		let c10 = KELLY_CATEGORICAL.color(9);
+		let c11 = KELLY_CATEGORICAL.color(10);
+		let c12 = KELLY_CATEGORICAL.color(11);
+		let c13 = KELLY_CATEGORICAL.color(12);
+		let c14 = KELLY_CATEGORICAL.color(13);
+		let c15 = KELLY_CATEGORICAL.color(14);
+		let c16 = KELLY_CATEGORICAL.color(15);
+		let c17 = KELLY_CATEGORICAL.color(16);
+		let c18 = KELLY_CATEGORICAL.color(17);
+		let c19 = KELLY_CATEGORICAL.color(18);
+		let c20 = KELLY_CATEGORICAL.color(19);
 
 		set_color(map, TokenCategory::Keyword, c01);
 		set_color(map, TokenCategory::String, c02);
@@ -795,26 +997,26 @@ impl Theme {
 	}
 
 	fn fill_prism(map: &mut [Option<Rgb>; CATEGORY_COUNT]) {
-		let c01 = Rgb::new(255, 0, 64);
-		let c02 = Rgb::new(0, 255, 128);
-		let c03 = Rgb::new(76, 76, 76);
-		let c04 = Rgb::new(0, 128, 255);
-		let c05 = Rgb::new(255, 215, 0);
-		let c06 = Rgb::new(255, 85, 0);
-		let c07 = Rgb::new(224, 224, 224);
-		let c08 = Rgb::new(128, 255, 0);
-		let c09 = Rgb::new(255, 0, 255);
-		let c10 = Rgb::new(0, 255, 255);
-		let c11 = Rgb::new(123, 104, 238);
-		let c12 = Rgb::new(154, 205, 50);
-		let c13 = Rgb::new(186, 85, 211);
-		let c14 = Rgb::new(255, 165, 0);
-		let c15 = Rgb::new(205, 92, 92);
-		let c16 = Rgb::new(32, 178, 170);
-		let c17 = Rgb::new(218, 112, 214);
-		let c18 = Rgb::new(184, 134, 11);
-		let c19 = Rgb::new(95, 158, 160);
-		let c20 = Rgb::new(26, 26, 26);
+		let c01 = PRISM_CATEGORICAL.color(0);
+		let c02 = PRISM_CATEGORICAL.color(1);
+		let c03 = PRISM_CATEGORICAL.color(2);
+		let c04 = PRISM_CATEGORICAL.color(3);
+		let c05 = PRISM_CATEGORICAL.color(4);
+		let c06 = PRISM_CATEGORICAL.color(5);
+		let c07 = PRISM_CATEGORICAL.color(6);
+		let c08 = PRISM_CATEGORICAL.color(7);
+		let c09 = PRISM_CATEGORICAL.color(8);
+		let c10 = PRISM_CATEGORICAL.color(9);
+		let c11 = PRISM_CATEGORICAL.color(10);
+		let c12 = PRISM_CATEGORICAL.color(11);
+		let c13 = PRISM_CATEGORICAL.color(12);
+		let c14 = PRISM_CATEGORICAL.color(13);
+		let c15 = PRISM_CATEGORICAL.color(14);
+		let c16 = PRISM_CATEGORICAL.color(15);
+		let c17 = PRISM_CATEGORICAL.color(16);
+		let c18 = PRISM_CATEGORICAL.color(17);
+		let c19 = PRISM_CATEGORICAL.color(18);
+		let c20 = PRISM_CATEGORICAL.color(19);
 
 		set_color(map, TokenCategory::Keyword, c01);
 		set_color(map, TokenCategory::String, c02);
@@ -1332,7 +1534,10 @@ type ThemeColors = [Option<Rgb>; CATEGORY_COUNT];
 
 #[derive(Clone, Copy)]
 enum ThemePalette {
-	Discrete(fn(&mut ThemeColors)),
+	Discrete {
+		fill: fn(&mut ThemeColors),
+		categorical: Option<CategoricalDeclaration>,
+	},
 	Continuous(fn(f32) -> Rgb),
 }
 
@@ -1357,7 +1562,26 @@ impl ThemeSpec {
 		Self {
 			name,
 			aliases,
-			palette: ThemePalette::Discrete(fill),
+			palette: ThemePalette::Discrete {
+				fill,
+				categorical: None,
+			},
+		}
+	}
+
+	const fn curated_categorical(
+		name: &'static str,
+		aliases: &'static [&'static str],
+		fill: fn(&mut ThemeColors),
+		categorical: CategoricalDeclaration,
+	) -> Self {
+		Self {
+			name,
+			aliases,
+			palette: ThemePalette::Discrete {
+				fill,
+				categorical: Some(categorical),
+			},
 		}
 	}
 
@@ -1375,7 +1599,7 @@ impl ThemeSpec {
 
 	pub const fn family(&self) -> ThemeFamily {
 		match self.palette {
-			ThemePalette::Discrete(_) => ThemeFamily::Curated,
+			ThemePalette::Discrete { .. } => ThemeFamily::Curated,
 			ThemePalette::Continuous(_) => ThemeFamily::Continuous,
 		}
 	}
@@ -1385,21 +1609,21 @@ pub static THEME_SPECS: &[ThemeSpec] = &[
 	ThemeSpec::curated("amazon", &[], Theme::fill_amazon),
 	ThemeSpec::curated("arcade", &[], Theme::fill_arcade),
 	ThemeSpec::curated("classic", &["original"], Theme::fill_classic),
-	ThemeSpec::curated("dark2", &[], Theme::fill_dark2),
+	ThemeSpec::curated_categorical("dark2", &[], Theme::fill_dark2, DARK2_CATEGORICAL),
 	ThemeSpec::curated("dracula", &[], Theme::fill_dracula),
 	ThemeSpec::curated("glowmax", &[], Theme::fill_glowmax),
 	ThemeSpec::curated("gruvbox", &[], Theme::fill_gruvbox),
 	ThemeSpec::curated("kanagawa", &[], Theme::fill_kanagawa),
-	ThemeSpec::curated("kelly", &[], Theme::fill_kelly),
+	ThemeSpec::curated_categorical("kelly", &[], Theme::fill_kelly, KELLY_CATEGORICAL),
 	ThemeSpec::curated("nebula", &[], Theme::fill_nebula),
 	ThemeSpec::curated("nord", &[], Theme::fill_nord),
 	ThemeSpec::curated("onedark", &["one_dark"], Theme::fill_one_dark),
 	ThemeSpec::curated("pretty", &[], Theme::fill_pretty),
-	ThemeSpec::curated("prism", &[], Theme::fill_prism),
+	ThemeSpec::curated_categorical("prism", &[], Theme::fill_prism, PRISM_CATEGORICAL),
 	ThemeSpec::curated("solarized", &["solarized_dark"], Theme::fill_solarized),
-	ThemeSpec::curated("tab20", &[], Theme::fill_tab20),
-	ThemeSpec::curated("tab20b", &[], Theme::fill_tab20b),
-	ThemeSpec::curated("tab20c", &[], Theme::fill_tab20c),
+	ThemeSpec::curated_categorical("tab20", &[], Theme::fill_tab20, TAB20_CATEGORICAL),
+	ThemeSpec::curated_categorical("tab20b", &[], Theme::fill_tab20b, TAB20B_CATEGORICAL),
+	ThemeSpec::curated_categorical("tab20c", &[], Theme::fill_tab20c, TAB20C_CATEGORICAL),
 	ThemeSpec::curated("tokyonight", &["tokyo_night"], Theme::fill_tokyo_night),
 	ThemeSpec::curated("turbo", &[], Theme::fill_turbo),
 	ThemeSpec::curated("vapor", &[], Theme::fill_vapor),
@@ -1450,8 +1674,9 @@ pub fn canonical_theme_names() -> impl Iterator<Item = &'static str> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		ResolvedThemePalette, THEME_SPECS, THEMED_CATEGORIES, Theme, canonical_theme_names, plasma,
-		viridis,
+		DARK2_CATEGORICAL, KELLY_CATEGORICAL, PRISM_CATEGORICAL, ResolvedCategoricalPalette,
+		ResolvedThemePalette, TAB20_CATEGORICAL, TAB20B_CATEGORICAL, TAB20C_CATEGORICAL,
+		THEME_SPECS, THEMED_CATEGORIES, Theme, canonical_theme_names, plasma, viridis,
 	};
 	use crate::core::Rgb;
 	use crate::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
@@ -1491,6 +1716,161 @@ mod tests {
 
 	fn color_for(theme: &Theme, category: TokenCategory) -> Rgb {
 		theme.syntax_colors[category as usize].expect("themed color")
+	}
+
+	fn assert_categorical_declaration(
+		declaration: super::CategoricalDeclaration,
+		expected: &[Rgb],
+	) {
+		let resolved = ResolvedCategoricalPalette::from_declaration(declaration);
+		assert_eq!(resolved.len(), expected.len());
+		assert_eq!(resolved.iter().collect::<Vec<_>>(), expected);
+		for (index, color) in expected.iter().copied().enumerate() {
+			assert_eq!(resolved.color(index), Some(color));
+		}
+		assert_eq!(resolved.color(expected.len()), None);
+	}
+
+	#[test]
+	fn product_0028_curated_categorical_declarations_are_exact_and_non_empty() {
+		assert_categorical_declaration(
+			TAB20_CATEGORICAL,
+			&[
+				Rgb::new(31, 119, 180),
+				Rgb::new(174, 199, 232),
+				Rgb::new(255, 127, 14),
+				Rgb::new(255, 187, 120),
+				Rgb::new(44, 160, 44),
+				Rgb::new(152, 223, 138),
+				Rgb::new(214, 39, 40),
+				Rgb::new(255, 152, 150),
+				Rgb::new(148, 103, 189),
+				Rgb::new(197, 176, 213),
+				Rgb::new(140, 86, 75),
+				Rgb::new(196, 156, 148),
+				Rgb::new(227, 119, 194),
+				Rgb::new(247, 182, 210),
+				Rgb::new(127, 127, 127),
+				Rgb::new(199, 199, 199),
+				Rgb::new(188, 189, 34),
+				Rgb::new(219, 219, 141),
+				Rgb::new(23, 190, 207),
+				Rgb::new(158, 218, 229),
+			],
+		);
+		assert_categorical_declaration(
+			TAB20B_CATEGORICAL,
+			&[
+				Rgb::new(57, 59, 121),
+				Rgb::new(82, 84, 163),
+				Rgb::new(107, 110, 207),
+				Rgb::new(156, 158, 222),
+				Rgb::new(99, 121, 57),
+				Rgb::new(140, 162, 82),
+				Rgb::new(181, 207, 107),
+				Rgb::new(206, 219, 156),
+				Rgb::new(140, 109, 49),
+				Rgb::new(189, 158, 57),
+				Rgb::new(231, 186, 82),
+				Rgb::new(231, 203, 148),
+				Rgb::new(132, 60, 57),
+				Rgb::new(173, 73, 74),
+				Rgb::new(214, 97, 107),
+				Rgb::new(231, 150, 156),
+				Rgb::new(123, 65, 115),
+				Rgb::new(165, 81, 148),
+				Rgb::new(206, 109, 189),
+				Rgb::new(222, 158, 214),
+			],
+		);
+		assert_categorical_declaration(
+			TAB20C_CATEGORICAL,
+			&[
+				Rgb::new(49, 130, 189),
+				Rgb::new(107, 174, 214),
+				Rgb::new(158, 202, 225),
+				Rgb::new(198, 219, 239),
+				Rgb::new(230, 85, 13),
+				Rgb::new(253, 141, 60),
+				Rgb::new(253, 174, 107),
+				Rgb::new(253, 208, 162),
+				Rgb::new(49, 163, 84),
+				Rgb::new(116, 196, 118),
+				Rgb::new(161, 217, 155),
+				Rgb::new(199, 233, 192),
+				Rgb::new(117, 107, 177),
+				Rgb::new(158, 154, 200),
+				Rgb::new(188, 189, 220),
+				Rgb::new(218, 218, 235),
+				Rgb::new(166, 54, 3),
+				Rgb::new(0, 109, 44),
+				Rgb::new(63, 0, 125),
+				Rgb::new(150, 150, 150),
+			],
+		);
+		assert_categorical_declaration(
+			DARK2_CATEGORICAL,
+			&[
+				Rgb::new(27, 158, 119),
+				Rgb::new(217, 95, 2),
+				Rgb::new(117, 112, 179),
+				Rgb::new(231, 41, 138),
+				Rgb::new(102, 166, 30),
+				Rgb::new(230, 171, 2),
+				Rgb::new(166, 118, 29),
+				Rgb::new(102, 102, 102),
+			],
+		);
+		assert_categorical_declaration(
+			KELLY_CATEGORICAL,
+			&[
+				Rgb::new(255, 179, 0),
+				Rgb::new(128, 62, 117),
+				Rgb::new(166, 189, 215),
+				Rgb::new(255, 104, 0),
+				Rgb::new(193, 0, 32),
+				Rgb::new(206, 162, 98),
+				Rgb::new(129, 112, 102),
+				Rgb::new(0, 125, 52),
+				Rgb::new(246, 118, 142),
+				Rgb::new(0, 83, 138),
+				Rgb::new(255, 122, 92),
+				Rgb::new(83, 55, 122),
+				Rgb::new(255, 142, 0),
+				Rgb::new(179, 40, 81),
+				Rgb::new(244, 200, 0),
+				Rgb::new(127, 24, 13),
+				Rgb::new(147, 170, 0),
+				Rgb::new(89, 51, 21),
+				Rgb::new(35, 44, 22),
+				Rgb::new(18, 18, 18),
+			],
+		);
+		assert_categorical_declaration(
+			PRISM_CATEGORICAL,
+			&[
+				Rgb::new(255, 0, 64),
+				Rgb::new(0, 255, 128),
+				Rgb::new(76, 76, 76),
+				Rgb::new(0, 128, 255),
+				Rgb::new(255, 215, 0),
+				Rgb::new(255, 85, 0),
+				Rgb::new(224, 224, 224),
+				Rgb::new(128, 255, 0),
+				Rgb::new(255, 0, 255),
+				Rgb::new(0, 255, 255),
+				Rgb::new(123, 104, 238),
+				Rgb::new(154, 205, 50),
+				Rgb::new(186, 85, 211),
+				Rgb::new(255, 165, 0),
+				Rgb::new(205, 92, 92),
+				Rgb::new(32, 178, 170),
+				Rgb::new(218, 112, 214),
+				Rgb::new(184, 134, 11),
+				Rgb::new(95, 158, 160),
+				Rgb::new(26, 26, 26),
+			],
+		);
 	}
 
 	fn product_0024_theme_expressions() -> Vec<String> {

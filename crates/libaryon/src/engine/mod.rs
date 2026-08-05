@@ -77,7 +77,8 @@ pub use self::protocol::{
 };
 pub use self::request::{CommandSender, InputSender};
 pub use self::theme::{
-	ResolvedThemePair, ResolvedThemePalette, THEME_SPECS, Theme, ThemeFamily, canonical_theme_names,
+	ResolvedCategoricalPalette, ResolvedThemePair, ResolvedThemePalette, THEME_SPECS, Theme,
+	ThemeFamily, canonical_theme_names,
 };
 pub use self::ui_colors::{
 	ResolvedUiColor, UI_COLOR_COUNT, UI_COLOR_SPECS, UiColorDefault, UiColorKey, UiColorOverrides,
