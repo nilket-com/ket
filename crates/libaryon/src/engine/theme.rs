@@ -81,6 +81,7 @@ pub struct ResolvedCategoricalPalette {
 }
 
 impl ResolvedCategoricalPalette {
+	#[cfg(test)]
 	fn from_declaration(declaration: CategoricalDeclaration) -> Self {
 		Self {
 			first: declaration.first,
@@ -93,6 +94,25 @@ impl ResolvedCategoricalPalette {
 			first,
 			rest: rest.into_iter().collect(),
 		}
+	}
+
+	fn from_declaration_with_modifiers(
+		declaration: CategoricalDeclaration,
+		reverse: bool,
+		shift: usize,
+	) -> Self {
+		let mut colors = std::iter::once(declaration.first)
+			.chain(declaration.rest.iter().copied())
+			.collect::<Vec<_>>();
+		if reverse {
+			colors.reverse();
+		}
+		if shift > 0 {
+			let offset = shift % colors.len();
+			colors.rotate_right(offset);
+		}
+		let first = colors[0];
+		Self::from_non_empty_iter(first, colors.into_iter().skip(1))
 	}
 
 	pub fn len(&self) -> usize {
@@ -367,7 +387,7 @@ impl Theme {
 			return Err(format!("Unknown theme: {}", name));
 		};
 
-		if let ThemePalette::Discrete { fill, .. } = spec.palette {
+		if let ThemePalette::Discrete { fill, categorical } = spec.palette {
 			fill(&mut colors);
 			let mut resolved = [Rgb::new(0, 0, 0); THEMED_CATEGORIES.len()];
 			for (index, category) in THEMED_CATEGORIES.iter().copied().enumerate() {
@@ -391,7 +411,13 @@ impl Theme {
 			return Ok(Self {
 				syntax_colors: colors,
 				palette: ResolvedThemePalette(resolved),
-				categorical_palette: None,
+				categorical_palette: categorical.map(|declaration| {
+					ResolvedCategoricalPalette::from_declaration_with_modifiers(
+						declaration,
+						reverse,
+						shift,
+					)
+				}),
 			});
 		}
 
@@ -422,10 +448,15 @@ impl Theme {
 			colors[cat as usize] = Some(color);
 		}
 
+		let categorical_palette = ResolvedCategoricalPalette::from_non_empty_iter(
+			sampled_colors[0],
+			sampled_colors[1..].iter().copied(),
+		);
+
 		Ok(Self {
 			syntax_colors: colors,
 			palette: ResolvedThemePalette(sampled_colors),
-			categorical_palette: None,
+			categorical_palette: Some(categorical_palette),
 		})
 	}
 
@@ -1684,6 +1715,8 @@ mod tests {
 
 	const PRODUCT_0024_SYNTAX_SNAPSHOT: &str =
 		include_str!("snapshots/product-0024-theme-syntax.txt");
+	const PRODUCT_0028_CATEGORICAL_SNAPSHOT: &str =
+		include_str!("snapshots/product-0028-categorical-palettes.txt");
 
 	const ALL_CATEGORIES: [TokenCategory; CATEGORY_COUNT] = [
 		TokenCategory::Keyword,
@@ -1911,6 +1944,162 @@ mod tests {
 			snapshot.push('\n');
 		}
 		snapshot
+	}
+
+	fn categorical_colors(theme: &Theme) -> Option<Vec<Rgb>> {
+		theme
+			.categorical_palette()
+			.map(|palette| palette.iter().collect())
+	}
+
+	fn product_0028_serialize_categorical_palettes() -> String {
+		let mut snapshot = String::new();
+		for expression in product_0024_theme_expressions() {
+			let theme = Theme::try_new(&expression)
+				.unwrap_or_else(|error| panic!("snapshot expression {expression}: {error}"));
+			snapshot.push_str(&expression);
+			match theme.categorical_palette() {
+				None => snapshot.push_str("\t-"),
+				Some(palette) => {
+					snapshot.push_str(&format!("\t{}", palette.len()));
+					for color in palette.iter() {
+						snapshot.push('\t');
+						snapshot.push_str(&color.to_hex());
+					}
+				}
+			}
+			snapshot.push('\n');
+		}
+		snapshot
+	}
+
+	#[test]
+	fn product_0028_complete_categorical_palette_oracle() {
+		let actual = product_0028_serialize_categorical_palettes();
+		if std::env::var_os("UPDATE_PRODUCT_0028_CATEGORICAL_PALETTES").is_some() {
+			std::fs::write(
+				concat!(
+					env!("CARGO_MANIFEST_DIR"),
+					"/src/engine/snapshots/product-0028-categorical-palettes.txt"
+				),
+				&actual,
+			)
+			.expect("write PRODUCT-0028 categorical palette snapshot");
+			return;
+		}
+		assert_eq!(actual, PRODUCT_0028_CATEGORICAL_SNAPSHOT);
+	}
+
+	#[test]
+	fn product_0028_capability_is_independent_of_theme_family() {
+		let expected_curated = ["dark2", "kelly", "prism", "tab20", "tab20b", "tab20c"];
+		let mut actual_curated = Vec::new();
+		for spec in THEME_SPECS {
+			let theme = Theme::try_new(spec.name).unwrap();
+			match spec.family() {
+				super::ThemeFamily::Continuous => {
+					assert_eq!(
+						theme.categorical_palette().unwrap().len(),
+						20,
+						"{}",
+						spec.name
+					);
+				}
+				super::ThemeFamily::Curated => {
+					if let Some(palette) = theme.categorical_palette() {
+						actual_curated.push(spec.name);
+						let expected_len = if spec.name == "dark2" { 8 } else { 20 };
+						assert_eq!(palette.len(), expected_len, "{}", spec.name);
+					}
+				}
+			}
+		}
+		assert_eq!(actual_curated, expected_curated);
+		for expression in ["nord", "nord_r", "nord_s1", "nord_c", "nord_C"] {
+			assert!(
+				Theme::try_new(expression)
+					.unwrap()
+					.categorical_palette()
+					.is_none()
+			);
+		}
+	}
+
+	#[test]
+	fn product_0028_tab20c_natural_order_differs_from_syntax_order() {
+		let theme = Theme::try_new("tab20c").unwrap();
+		let natural = categorical_colors(&theme).unwrap();
+		assert_eq!(natural[0], TAB20C_CATEGORICAL.color(0));
+		assert_eq!(natural[1], TAB20C_CATEGORICAL.color(1));
+		assert_eq!(natural[19], TAB20C_CATEGORICAL.color(19));
+		assert_eq!(color_for(&theme, TokenCategory::Keyword), natural[0]);
+		assert_eq!(color_for(&theme, TokenCategory::String), natural[8]);
+		assert_eq!(color_for(&theme, TokenCategory::Comment), natural[19]);
+		assert_ne!(theme.palette().colors().as_slice(), natural.as_slice());
+	}
+
+	#[test]
+	fn product_0028_modifiers_apply_to_each_projection_at_its_own_length() {
+		for name in [
+			"tab20", "tab20b", "tab20c", "dark2", "kelly", "prism", "terrain",
+		] {
+			let base = categorical_colors(&Theme::try_new(name).unwrap()).unwrap();
+			let mut reversed = base.clone();
+			reversed.reverse();
+			assert_eq!(
+				categorical_colors(&Theme::try_new(&format!("{name}_r")).unwrap()).unwrap(),
+				reversed,
+				"categorical reverse for {name}"
+			);
+
+			let mut shifted = base;
+			shifted.rotate_right(1);
+			assert_eq!(
+				categorical_colors(&Theme::try_new(&format!("{name}_s1")).unwrap()).unwrap(),
+				shifted,
+				"categorical shift for {name}"
+			);
+		}
+
+		let dark2 = categorical_colors(&Theme::try_new("dark2").unwrap()).unwrap();
+		let mut dark2_s20 = dark2.clone();
+		dark2_s20.rotate_right(4);
+		assert_eq!(
+			categorical_colors(&Theme::try_new("dark2_s20").unwrap()).unwrap(),
+			dark2_s20
+		);
+		assert_eq!(
+			Theme::try_new("dark2_s20").unwrap().palette(),
+			Theme::try_new("dark2").unwrap().palette(),
+			"syntax remains modulo twenty"
+		);
+
+		let terrain = Theme::try_new("terrain_s12").unwrap();
+		assert_eq!(
+			categorical_colors(&terrain).unwrap(),
+			terrain.palette().colors().to_vec()
+		);
+	}
+
+	#[test]
+	fn product_0028_clipping_keeps_existing_family_applicability() {
+		for expression in ["terrain_c", "terrain_C", "terrain_cC"] {
+			let theme = Theme::try_new(expression).unwrap();
+			assert_eq!(
+				categorical_colors(&theme).unwrap(),
+				theme.palette().colors().to_vec(),
+				"continuous projection for {expression}"
+			);
+		}
+
+		for name in ["tab20c", "dark2"] {
+			let base = Theme::try_new(name).unwrap();
+			for suffix in ["c", "C", "cC"] {
+				let modified = Theme::try_new(&format!("{name}_{suffix}")).unwrap();
+				assert_eq!(modified.palette(), base.palette());
+				assert_eq!(categorical_colors(&modified), categorical_colors(&base));
+			}
+		}
 	}
 
 	#[test]
