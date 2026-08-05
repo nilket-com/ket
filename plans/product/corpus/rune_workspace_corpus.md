@@ -498,6 +498,25 @@ Bare Rune tables and SQL/Markdown tables retain the compiled default. No plot
 mark accepts `skin` or `duotone`; the ahead-of-language `test9.rn` fixture is
 unchanged and supplies no acceptance evidence for plot skin syntax.
 
+## Accepted substrate: optional categorical theme palettes
+
+PRODUCT-0028 is accepted and executable in `0153dc83`, `9685e530`, and
+`6880046c`. A resolved libaryon theme now retains an optional naturally ordered
+categorical palette beside the unchanged twenty-position syntax palette.
+Continuous families expose their twenty accepted samples. Exactly `tab20`,
+`tab20b`, `tab20c`, `dark2`, `kelly`, and `prism` expose explicit curated data
+sequences; other curated syntax themes such as `nord` remain valid and report no
+categorical capability.
+
+The two projections share one parsed theme identity but preserve their own
+authoritative order and natural length. Thus `tab20c` exposes `c01..c20` for
+data while retaining its deliberately contrasted syntax-role permutation, and
+`dark2_s20` rotates its eight data colors by four while its twenty syntax slots
+remain unchanged. A structurally non-empty immutable value exposes only length,
+checked indexing, and ordered iteration. No geometry, domain, capacity,
+diagnostic, artifact policy, Polariton production caller, or Rune row is added;
+PRODUCT-0029 owns the first stable categorical plot-position consumer.
+
 ## Mutation and definition lifecycle
 
 | family | status | evidence |
@@ -527,6 +546,15 @@ unchanged and supplies no acceptance evidence for plot skin syntax.
 
 ## Change log
 
+- v0.28 (2026-08-05): PRODUCT-0028 exposes a second authoritative optional
+  sequence from libaryon's existing compact theme identity. Continuous families
+  retain twenty accepted samples; six curated families expose explicit natural
+  categorical declarations, while other curated syntax themes remain valid
+  with no categorical capability. Syntax colors and every table-skin outcome
+  remain byte-identical. Reverse and shift apply to each projection at its own
+  natural length, including `dark2_s20` rotating eight data colors by four while
+  leaving twenty syntax positions unchanged. No plot or Rune consumer lands;
+  PRODUCT-0029 owns categorical identity, capacity, and band-fill policy.
 - v0.27 (2026-08-05): PRODUCT-0027 changes named Rune table skins to explicit
   PaletteForward-by-absence and adds `.duotone()` as the one-token escape hatch
   in the same indivisible implementation commit. The bounded normal form makes

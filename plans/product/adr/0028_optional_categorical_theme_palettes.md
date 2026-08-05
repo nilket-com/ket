@@ -1,6 +1,6 @@
 # ADR 0028: optional categorical theme palettes
 
-Status: proposed 2026-08-05. This record decides one thing: a resolved libaryon
+Status: accepted 2026-08-05. This record decides one thing: a resolved libaryon
 theme may expose a second, optional, naturally ordered categorical palette
 beside its existing syntax-oriented twenty-color palette. It preserves every
 existing theme, syntax, table-skin, and modifier result; adds no plot projection,
@@ -273,4 +273,3 @@ for convenience.
   support.
 - **Add capacity errors to libaryon:** geometry and domain cardinality are
   Polariton facts; libaryon reports only capability and length.
-
