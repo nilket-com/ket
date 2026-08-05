@@ -5104,6 +5104,86 @@ const EXECUTION_CENSUS_BYTES_IN_FLIGHT: u64 = 2 * 1024 * 1024 * 1024;
 const EXECUTION_CENSUS_WORKER_COUNT: usize = 2;
 const EXECUTION_CENSUS_FALLBACK_WIDTH: usize = 4;
 const EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS: usize = 32;
+/// How long the live shuffle must stand completely still, with an appender blocked
+/// throughout, before the wait is evidence of a non-returning cycle rather than pacing.
+const EXECUTION_CENSUS_STALL_PERSISTENCE_WINDOW: std::time::Duration =
+	std::time::Duration::from_secs(2);
+
+/// One sample of live shuffle state across the workers. A bounded backlog blocks an
+/// appender by design once it fills, so a blocked appender alone proves nothing; what
+/// distinguishes a stall is that nothing moves while it stays blocked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveProgressSignature(Vec<(u128, usize, usize, usize)>);
+
+impl LiveProgressSignature {
+	pub fn from_receipts(receipts: &[ExecutionCensusBackpressureReceipt]) -> Self {
+		let mut samples = receipts
+			.iter()
+			.map(|receipt| {
+				(
+					receipt.worker_id.get().as_u128(),
+					receipt.observation.live_partitions,
+					receipt.observation.buffered_chunks,
+					receipt.observation.blocked_appenders,
+				)
+			})
+			.collect::<Vec<_>>();
+		samples.sort_unstable();
+		Self(samples)
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StallVerdict {
+	Progressing,
+	Stalled,
+}
+
+/// Decides a stall from persistence rather than from a single sample. Pure and driven by a
+/// caller-supplied elapsed value so both controls are deterministic.
+#[derive(Debug)]
+pub struct StallPersistenceTracker {
+	window: std::time::Duration,
+	last: Option<LiveProgressSignature>,
+	unchanged_since: Option<std::time::Duration>,
+}
+
+impl StallPersistenceTracker {
+	pub fn new(window: std::time::Duration) -> Self {
+		Self {
+			window,
+			last: None,
+			unchanged_since: None,
+		}
+	}
+
+	/// `signature` is `None` when no appender is blocked anywhere — unambiguous progress.
+	/// A changed signature is progress too: chunks were released or partitions advanced.
+	pub fn observe(
+		&mut self,
+		elapsed: std::time::Duration,
+		signature: Option<LiveProgressSignature>,
+	) -> StallVerdict {
+		let Some(signature) = signature else {
+			self.last = None;
+			self.unchanged_since = None;
+			return StallVerdict::Progressing;
+		};
+		if self.last.as_ref() != Some(&signature) {
+			self.last = Some(signature);
+			self.unchanged_since = Some(elapsed);
+			return StallVerdict::Progressing;
+		}
+		match self.unchanged_since {
+			Some(since) if elapsed.saturating_sub(since) >= self.window => StallVerdict::Stalled,
+			Some(_) => StallVerdict::Progressing,
+			None => {
+				self.unchanged_since = Some(elapsed);
+				StallVerdict::Progressing
+			}
+		}
+	}
+}
 
 fn execution_census_local_budget() -> QueryBudget {
 	QueryBudget {
@@ -5411,6 +5491,8 @@ async fn execute_census_distributed_attempt(
 	.with_task_budget(TaskBudget::from_query_budget(budget));
 	let query_id = context.query_id;
 	let mut execution = Box::pin(coordinator.execute_query_with_context(logical, context));
+	let observation_start = Instant::now();
+	let mut stall_tracker = StallPersistenceTracker::new(EXECUTION_CENSUS_STALL_PERSISTENCE_WINDOW);
 	let mut observation_tick = tokio::time::interval(std::time::Duration::from_millis(1));
 	observation_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 	loop {
@@ -5434,7 +5516,12 @@ async fn execute_census_distributed_attempt(
 						)
 					})
 					.collect::<Vec<_>>();
-				if receipts.is_empty() {
+				let signature = (!receipts.is_empty())
+					.then(|| LiveProgressSignature::from_receipts(&receipts));
+				if matches!(
+					stall_tracker.observe(observation_start.elapsed(), signature),
+					StallVerdict::Progressing
+				) {
 					continue;
 				}
 				for worker in workers {
@@ -5635,18 +5722,12 @@ async fn run_execution_census_input(
 	let distributed_elapsed_ms = distributed_start.elapsed().as_secs_f64() * 1000.0;
 	shutdown_execution_census_workers(workers).await?;
 
-	// ADR 529 refinement: `blocked_appenders > 0` proves a non-returning wait only when no
-	// consumer can drain the live buffer before seal. A shape with live-eligible consumers
-	// makes transient backpressure healthy, so classifying it as stalled would counterfeit a
-	// liveness wall — refuse loudly instead.
-	if !live_backpressure_receipts.is_empty() && preflight.shape.live_eligible_consumer_tasks > 0 {
-		return Err(format!(
-			"execution census stall premise violated for {}: {} live-eligible consumer task(s) \
-			 can drain the live buffer, so a blocked appender is not proof of a non-returning \
-			 wait; extend the receipt with consumer-dispatch state before classifying this shape",
-			input.query_id, preflight.shape.live_eligible_consumer_tasks
-		));
-	}
+	// Receipts now arrive only after the live shuffle stood still, with an appender blocked
+	// throughout, for the whole persistence window. That is direct evidence of non-progress,
+	// so it no longer matters whether some consumer was *eligible* to drain — it demonstrably
+	// did not. This supersedes the earlier shape-based refusal, which asked whether a drainer
+	// could exist and had to abandon the cell when one did; that question is answered by the
+	// observation itself. Eligibility stays on the row as a diagnostic.
 	let (classification, reason, distributed_identity, diagnostic_message) =
 		if !live_backpressure_receipts.is_empty() {
 			(
@@ -9740,6 +9821,100 @@ pub fn q11_oracle_from_rows(
 		threshold_fail_groups,
 		threshold_failed_partkeys,
 	})
+}
+
+#[cfg(test)]
+mod adr536_stall_persistence {
+	use super::*;
+	use std::time::Duration;
+
+	const WINDOW: Duration = Duration::from_secs(2);
+
+	fn signature(live_partitions: usize, buffered: usize, blocked: usize) -> LiveProgressSignature {
+		LiveProgressSignature(vec![(7, live_partitions, buffered, blocked)])
+	}
+
+	/// Control 1 — transient blocked pacing. A bounded backlog blocks an appender while
+	/// the consumer drains; chunks keep moving, so no sample sequence may ever be
+	/// classified stalled, however long it runs.
+	#[test]
+	fn blocked_appender_that_keeps_draining_is_never_stalled() {
+		let mut tracker = StallPersistenceTracker::new(WINDOW);
+		let mut buffered = 32;
+		for tick in 0..200 {
+			// Blocked throughout, but the backlog is being released.
+			buffered = if buffered == 0 { 32 } else { buffered - 1 };
+			let verdict = tracker.observe(
+				Duration::from_millis(tick * 50),
+				Some(signature(8, buffered, 1)),
+			);
+			assert_eq!(
+				verdict,
+				StallVerdict::Progressing,
+				"a draining backlog is designed pacing, not a stall (tick {tick})"
+			);
+		}
+	}
+
+	/// A query that clears its backpressure entirely completes normally.
+	#[test]
+	fn cleared_backpressure_resets_the_persistence_window() {
+		let mut tracker = StallPersistenceTracker::new(WINDOW);
+		assert_eq!(
+			tracker.observe(Duration::ZERO, Some(signature(8, 32, 1))),
+			StallVerdict::Progressing
+		);
+		// No blocked appender anywhere: unambiguous progress.
+		assert_eq!(
+			tracker.observe(Duration::from_secs(1), None),
+			StallVerdict::Progressing
+		);
+		// The same signature returning later starts a fresh window rather than
+		// inheriting the earlier one.
+		assert_eq!(
+			tracker.observe(Duration::from_secs(2), Some(signature(8, 32, 1))),
+			StallVerdict::Progressing
+		);
+		assert_eq!(
+			tracker.observe(Duration::from_millis(3_999), Some(signature(8, 32, 1))),
+			StallVerdict::Progressing
+		);
+	}
+
+	/// Control 2 — persistent non-progress. Nothing moves while an appender stays
+	/// blocked, so past the window the wait is evidence of a non-returning cycle.
+	#[test]
+	fn unchanging_blocked_state_past_the_window_is_stalled() {
+		let mut tracker = StallPersistenceTracker::new(WINDOW);
+		assert_eq!(
+			tracker.observe(Duration::ZERO, Some(signature(8, 32, 1))),
+			StallVerdict::Progressing,
+			"the first sample can never be the verdict"
+		);
+		assert_eq!(
+			tracker.observe(Duration::from_millis(1_999), Some(signature(8, 32, 1))),
+			StallVerdict::Progressing,
+			"inside the window the wait is still admissible"
+		);
+		assert_eq!(
+			tracker.observe(Duration::from_secs(2), Some(signature(8, 32, 1))),
+			StallVerdict::Stalled,
+			"at the window boundary the non-progress is proven"
+		);
+	}
+
+	/// The pre-ADR-536 rail cancelled on the first blocked-appender sample. That behavior
+	/// is what these controls forbid: it cannot distinguish the two cases above.
+	#[test]
+	fn first_sample_alone_is_never_a_verdict() {
+		for blocked in [1, 2, 9] {
+			let mut tracker = StallPersistenceTracker::new(WINDOW);
+			assert_eq!(
+				tracker.observe(Duration::ZERO, Some(signature(8, 32, blocked))),
+				StallVerdict::Progressing
+			);
+		}
+	}
 }
 
 #[cfg(test)]
@@ -18127,14 +18302,19 @@ mod adr528_fragment_census {
 mod adr529_execution_census {
 	use super::*;
 
-	/// The stall classification's premise, pinned board-wide: no fragmented census plan has a
-	/// live-eligible shuffle consumer, so a blocked appender is a non-returning wait. When this
-	/// fails for a new shape, the rail's runtime guard refuses the classification — extend the
-	/// receipt with consumer-dispatch state before widening the census.
+	/// Board-wide blast radius of live multi-upstream publication, pinned at unbounded
+	/// admission. Exactly one cell reaches it; every other cell fragments with no
+	/// live-eligible shuffle consumer at all.
+	///
+	/// This replaces an earlier pin asserting zero board-wide. That held only because the
+	/// counter recognized the unary streamable consumer alone and was blind to the
+	/// multi-upstream arm; corrected, q04 reports its four join consumer tasks. Stall
+	/// classification no longer rests on this count — persistence evidence does — so a
+	/// nonzero cell is now a fact about plan shape, not a threat to soundness.
 	/// Deep multi-join binds (q10+) need an explicit stack; run on a dedicated 64 MB thread
 	/// with a current-thread runtime.
 	#[test]
-	fn stall_premise_no_live_eligible_consumers_across_board() {
+	fn live_eligible_consumers_are_confined_to_one_board_cell() {
 		std::thread::Builder::new()
 			.stack_size(64 * 1024 * 1024)
 			.spawn(|| {
@@ -18142,6 +18322,7 @@ mod adr529_execution_census {
 					.enable_all()
 					.build()
 					.expect("current-thread runtime");
+				let mut live_cells: Vec<(String, usize)> = Vec::new();
 				runtime.block_on(async {
 					for query in ALL_QUERY_IDS {
 						let row = run_fragment_census_query(
@@ -18153,15 +18334,22 @@ mod adr529_execution_census {
 						)
 						.await
 						.expect("fragment census cell");
-						if row.stage_count.is_some() {
-							assert_eq!(
-								row.live_eligible_consumer_tasks,
-								Some(0),
-								"{query}: a live-eligible consumer invalidates blocked-appender ⟺ stall"
-							);
+						if row.stage_count.is_some()
+							&& row.live_eligible_consumer_tasks.unwrap_or(0) > 0
+						{
+							live_cells.push((
+								query.to_string(),
+								row.live_eligible_consumer_tasks.unwrap_or(0),
+							));
 						}
 					}
 				});
+				assert_eq!(
+					live_cells,
+					vec![("q04".to_string(), 4), ("q13".to_string(), 4)],
+					"live multi-upstream publication is confined to a known set at this \
+					 scale and admission; a change here re-derives the blast radius"
+				);
 			})
 			.expect("spawn premise thread")
 			.join()

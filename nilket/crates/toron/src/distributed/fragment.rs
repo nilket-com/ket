@@ -133,10 +133,11 @@ pub enum FragmentError {
 		consumer_stage: Option<StageId>,
 	},
 	#[error(
-		"live shuffle component containing producer stage {producer_stage:?} needs {residency_requirement} concurrently resident tasks but admission allows {max_in_flight_tasks}"
+		"live shuffle producer stage {producer_stage:?} cannot be drained by consumer stage {consumer_stage:?}: the component needs {residency_requirement} concurrently resident tasks but admission allows {max_in_flight_tasks}"
 	)]
 	LiveComponentExceedsAdmission {
 		producer_stage: StageId,
+		consumer_stage: Option<StageId>,
 		residency_requirement: usize,
 		max_in_flight_tasks: usize,
 	},
@@ -450,8 +451,18 @@ pub(crate) fn validate_shuffle_publish_modes(
 			else {
 				continue;
 			};
+			// The immediate downstream stage that cannot be held resident alongside the
+			// producer — the concrete place the component fails to drain.
+			let consumer_stage = stages
+				.iter()
+				.find(|stage| {
+					component.contains(&stage.stage_id)
+						&& stage.upstream_stages.contains(&producer_stage)
+				})
+				.map(|stage| stage.stage_id);
 			return Err(FragmentError::LiveComponentExceedsAdmission {
 				producer_stage,
+				consumer_stage,
 				residency_requirement,
 				max_in_flight_tasks: limit,
 			});
@@ -2403,6 +2414,71 @@ mod tests {
 		assert!(
 			!live_publication_report(&stages, Some(4)).residency_exceeds_admission,
 			"a cap that exactly fits the component is admissible"
+		);
+	}
+
+	#[test]
+	fn adr536_forced_over_cap_live_graph_is_refused_before_any_dispatch() {
+		use crate::distributed::scheduler::live_publication_report;
+
+		// A live component that cannot be held resident under the cap. The resolver never
+		// emits one; deserialization or a future caller can.
+		let live = fragment_plan(
+			join_plan_with_kind(
+				exchanged_scan(TableId(1), 2),
+				exchanged_scan(TableId(2), 2),
+				JoinStrategy::HashPartitioned,
+				JoinKind::LeftSemi,
+			),
+			config(),
+		)
+		.expect("fragment semi join");
+		let residency = live_publication_report(&live, None).live_residency_requirement;
+		assert!(
+			residency > 1,
+			"fixture must publish live for this control to force an over-cap graph"
+		);
+		let starved_cap = residency - 1;
+
+		let mut dispatch_log = Vec::new();
+		let refusal = match validate_shuffle_publish_modes(&live, Some(starved_cap)) {
+			Ok(()) => {
+				dispatch_log.push(live[0].tasks[0].spec.identity);
+				panic!("an over-cap live component must fail closed");
+			}
+			Err(error) => error,
+		};
+
+		let FragmentError::LiveComponentExceedsAdmission {
+			producer_stage,
+			consumer_stage,
+			residency_requirement,
+			max_in_flight_tasks,
+		} = refusal
+		else {
+			panic!("expected the admission refusal, got {refusal:?}");
+		};
+		let consumer_stage = consumer_stage.expect("the blocking consumer must be named");
+		assert!(
+			live.iter().any(|stage| stage.stage_id == consumer_stage
+				&& stage.upstream_stages.contains(&producer_stage)),
+			"the named consumer must actually consume the named producer"
+		);
+		assert_eq!(residency_requirement, residency);
+		assert_eq!(max_in_flight_tasks, starved_cap);
+		assert!(
+			dispatch_log.is_empty(),
+			"refusal must precede every dispatch"
+		);
+
+		// Adjacent admissible control: the same graph at a cap that fits is accepted.
+		validate_shuffle_publish_modes(&live, Some(residency))
+			.expect("a cap that fits the component admits the same graph");
+		dispatch_log.push(live[0].tasks[0].spec.identity);
+		assert_eq!(
+			dispatch_log.len(),
+			1,
+			"the admissible control must reach dispatch"
 		);
 	}
 

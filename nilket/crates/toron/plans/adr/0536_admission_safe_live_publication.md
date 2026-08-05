@@ -99,9 +99,16 @@ controls.
 
 Across the 21 rows, **every cell reports zero live producer stages, zero live-eligible
 consumer tasks and residency zero**: the board resolves sealed throughout. q04 is the sole
-cell exercising multi-upstream live publication. The board is unchanged at 19
-`executes_identical`, q11 `executes_divergent`, q15 `execution_rejected`, as expected from a
-phase that altered no behavior.
+cell exercising multi-upstream live publication **at sf=8 under this envelope**. The board is
+unchanged at 19 `executes_identical`, q11 `executes_divergent`, q15 `execution_rejected`, as
+expected from a phase that altered no behavior.
+
+That scope qualifier is load-bearing, not hedging. Fragment shapes are scale-dependent — ADR
+528 recorded cells that reject at sf=0.01 and fragment at sf=8 — and the direction runs both
+ways here: at sf=0.01 with unbounded admission, q13 reaches live multi-upstream publication
+as well, with four live-eligible consumer tasks. The blast radius is a property of a board at
+a scale under an admission cap, never of the engine, and any restatement of it must carry all
+three.
 
 This retires the risk this ADR was most worried about. Tightening resolution cannot re-seal
 the ten cells ADR 535 cleared, because none of them publish live. Decision 1 moves
@@ -125,12 +132,17 @@ is a later question, after ADR 537 and the correctness gate.
    q04 shape at cap 6 stays `Live`, at cap 4 resolves `Sealed` — so the test would fail under
    a blanket join seal and under an unconditional live path alike.
 3. **Backstop with positive control.** An externally forced unsafe `Live` graph is refused
-   synchronously with the typed error naming producer, consumer, requirement and cap, with a
-   work log proving zero dispatches; the adjacent admissible graph is accepted.
-4. **The rail can tell pacing from a stall.** A regression reproduces the admission-6
-   observation — a blocked-appender receipt in a query that then completes — and the rail
-   classifies it as completed, not stalled. A genuine non-progressing graph is still
-   classified stalled, from persistence evidence rather than a first sample.
+   synchronously with the typed error naming producer, **the blocking consumer**, requirement
+   and cap, with a work log proving zero dispatches; the adjacent admissible graph is
+   accepted. The admission refusal is its own variant, `LiveComponentExceedsAdmission`, and
+   requires its own forced-unsafe control: the pre-existing zero-dispatch test covers
+   `UndrainableLiveShuffle` and does not discharge this.
+4. **The rail can tell pacing from a stall.** Two controls, both required for this ADR to
+   close: a blocked appender whose backlog keeps draining is never classified stalled, and
+   an unchanging blocked state past a declared persistence window is. A first sample is
+   never a verdict. This is an acceptance gate, not a follow-on — a mechanism that seals
+   q04 while leaving the rail unable to distinguish pacing from a stall has not delivered
+   the ADR, because the next live shape would be misclassified.
 5. **Board.** The full census re-runs at the unchanged envelope from the sealed identity.
    Predeclared expectation: 20 `executes_identical`, q11 `executes_divergent`, q15
    `execution_rejected(BroadcastProbeNotStarLinear)`. A cell that changes publication mode
