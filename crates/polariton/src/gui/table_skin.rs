@@ -992,6 +992,10 @@ mod tests {
 		assert_eq!(name, "black");
 		assert_eq!(facts.weakest().ratio(), 1.0);
 		assert_eq!(facts.weakest().minimum(), 4.5);
+		assert_eq!(
+			TableSkinProjectionError::UnsuitableDuotone { name, facts }.to_string(),
+			"theme \"black\" is unsuitable for table skin role cell text on even row: 1.000:1 is below 4.5:1"
+		);
 	}
 
 	#[test]

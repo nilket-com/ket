@@ -768,3 +768,79 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 	);
 	assert!(!editor_production.contains("TableSkin::from_theme_name"));
 }
+
+#[test]
+fn product_0026_projection_choice_stays_explicit_and_outside_rune_and_editor_chrome() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let skin = std::fs::read_to_string(root.join("gui/table_skin.rs")).expect("read table skin");
+	let skin_production = skin
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production table-skin source");
+	assert!(
+		skin_production
+			.contains("pub enum TableSkinProjection {\n\tPaletteForward,\n\tDuotone,\n}")
+	);
+	assert!(!skin_production.contains("impl Default for TableSkinProjection"));
+	assert!(skin_production.contains("projection: TableSkinProjection"));
+	assert_eq!(skin_production.matches("Theme::try_new(name)").count(), 1);
+	assert!(skin_production.contains("fn project_duotone("));
+	assert!(skin_production.contains("fn project_palette_forward("));
+	assert!(!skin_production.contains("pub fn project_duotone("));
+	assert!(!skin_production.contains("pub fn project_palette_forward("));
+	assert!(!skin_production.contains("UiPalette"));
+
+	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	let state_production = state
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production GUI state source");
+	assert_eq!(
+		state_production
+			.matches("TableSkin::from_theme_name")
+			.count(),
+		1
+	);
+	assert_eq!(
+		state_production
+			.matches("TableSkinProjection::Duotone")
+			.count(),
+		1
+	);
+	assert!(!state_production.contains("TableSkinProjection::PaletteForward"));
+
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let envelope_production = envelope
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production Rune envelope source");
+	for forbidden in [
+		"TableSkinProjection",
+		"PaletteForward",
+		"Duotone",
+		"duotone",
+	] {
+		assert!(
+			!envelope_production.contains(forbidden),
+			"Rune envelope acquired table projection vocabulary: {forbidden}"
+		);
+	}
+
+	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
+	let editor_production = editor
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production editor source");
+	assert!(editor_production.contains("set_query_result_with_skin(frame, TableSkin::DEFAULT)"));
+	assert!(
+		editor_production
+			.contains("set_markdown_cell_table_with_skin(identity, frame, TableSkin::DEFAULT)")
+	);
+	for forbidden in ["TableSkinProjection", "PaletteForward", "Duotone"] {
+		assert!(
+			!editor_production.contains(forbidden),
+			"editor artifact path acquired projection policy: {forbidden}"
+		);
+	}
+}
