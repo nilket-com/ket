@@ -166,6 +166,8 @@ pub(crate) fn join_order_soft_margin_application_label(
 
 #[derive(Debug, Clone)]
 pub struct PlannerConfig {
+	/// ADR 537: runtime-filter mode, resolved once here so every fragmentation path agrees.
+	pub runtime_filters_enabled: bool,
 	pub allow_experimental_kernels: bool,
 	pub auto_broadcast_max_build_bytes: Option<ByteCount>,
 	pub force_hash_join_ids: BTreeSet<JoinReplayId>,
@@ -239,6 +241,7 @@ pub struct PlannerConfig {
 impl Default for PlannerConfig {
 	fn default() -> Self {
 		Self {
+			runtime_filters_enabled: true,
 			allow_experimental_kernels: false,
 			auto_broadcast_max_build_bytes: Some(ByteCount::new(1024 * 1024)),
 			force_hash_join_ids: BTreeSet::new(),

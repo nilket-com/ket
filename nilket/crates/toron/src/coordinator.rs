@@ -1226,6 +1226,9 @@ where
 		.with_task_context(TaskExecutionContext::from_execution_context(context))
 		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
 		.with_max_in_flight_tasks(query_budget.max_in_flight_tasks)
+		// ADR 537: one source for the runtime-filter mode. Both fragmentation paths and
+		// the census preflight read it from the planner config resolved at query entry.
+		.with_runtime_filters_enabled(self.config.runtime_filters_enabled)
 	}
 }
 
@@ -1300,6 +1303,7 @@ where
 				execution_context.join_runtime_observation_mode.clone(),
 			)
 			.with_max_in_flight_tasks(query_budget.max_in_flight_tasks)
+			.with_runtime_filters_enabled(config.runtime_filters_enabled)
 			.with_id_namespace(fragment_id_namespace),
 		)
 		.map_err(fragment_error)?;

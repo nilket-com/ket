@@ -602,3 +602,52 @@ fn descriptor(
 	)
 	.expect("descriptor")
 }
+
+/// ADR 537: runtime-filter mode is resolved once at query entry and honoured by the
+/// fragmentation that actually executes. Driving this through the coordinator rather than
+/// `fragment_plan` is the point: a direct-fragment test passed while execution re-fragmented
+/// with the flag defaulted back on, which is how a disabled filter still reached the scans.
+#[tokio::test]
+async fn adr537_coordinator_execution_honors_runtime_filter_mode() -> Result<(), Box<dyn Error>> {
+	for (runtime_filters_enabled, expect_requests) in [(true, true), (false, false)] {
+		let memory = Arc::new(MemoryManager::new(16, 1024 * 1024));
+		let fixture = RuntimeFilterFixture::new(true)?;
+		let mut workers = Vec::new();
+		for worker_index in 0..2 {
+			workers.push(spawn_worker(worker_index, fixture.clone(), memory.clone()).await?);
+		}
+		let registry = Arc::new(StaticWorkerRegistry::new(
+			workers.iter().map(|worker| worker.entry.clone()),
+		));
+		let mut catalog = MockCatalog::new();
+		catalog.register_descriptor(TableId(1), fixture.customers_descriptor.clone())?;
+		catalog.register_descriptor(TableId(2), fixture.orders_descriptor.clone())?;
+
+		let mut planner_config = PlannerConfig::default();
+		planner_config.runtime_filters_enabled = runtime_filters_enabled;
+		planner_config.single_partition_execution = false;
+		let coordinator = toron::coordinator::DistributedQueryCoordinator::new(
+			Arc::new(catalog),
+			registry,
+			memory,
+			Arc::new(TcpTransport::new()),
+			planner_config,
+			query_budget(),
+		);
+		let _ = coordinator.execute_query(&join_plan()).await;
+		let requests = fixture.counters.lock().unwrap().runtime_filter_requests;
+
+		for worker in workers {
+			worker.shutdown.send(()).ok();
+			worker.handle.abort();
+		}
+
+		assert_eq!(
+			requests > 0,
+			expect_requests,
+			"runtime_filters_enabled={runtime_filters_enabled} must decide whether the \
+			 executing fragmentation installs a filter (observed {requests} requests)"
+		);
+	}
+	Ok(())
+}

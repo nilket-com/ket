@@ -5276,7 +5276,8 @@ async fn execution_census_preflight(
 	let fragment_config = FragmentPlanConfig::new(context.query_id, context.task_budget)
 		.with_task_context(TaskExecutionContext::from_execution_context(&context))
 		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
-		.with_max_in_flight_tasks(seed_budget.max_in_flight_tasks);
+		.with_max_in_flight_tasks(seed_budget.max_in_flight_tasks)
+		.with_runtime_filters_enabled(planner_config.runtime_filters_enabled);
 	let stages = fragment_plan(bound, fragment_config).map_err(|error| {
 		ExecutionCensusPreflightRejection {
 			phase: Phase::Fragment,

@@ -99,3 +99,49 @@ fn adr536_admission_cap_default_is_unbounded_and_floors_at_one() {
 		"zero floors to one, matching the scheduler builder"
 	);
 }
+
+/// ADR 537: the runtime-filter probe target is proven at fragmentation and carried, never
+/// rebuilt. Each property below could regress silently while every behavioral control
+/// still passed.
+#[test]
+fn adr537_runtime_filter_target_is_carried_not_reconstructed() {
+	let scheduler = std::fs::read_to_string(manifest_dir().join("src/distributed/scheduler.rs"))
+		.expect("read scheduler source");
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragment source");
+
+	// 1. The reconstruction helper stays deleted — the one-line path back to pairing a
+	//    scan fingerprint with a post-projection ordinal.
+	assert!(
+		!scheduler.contains("fn first_scan_fingerprint"),
+		"ADR 537: first_scan_fingerprint paired facts from different schemas and must not \
+		 return; the probe target is carried on the producer binding instead"
+	);
+
+	// 2. Descriptor construction consumes the carried proof.
+	let descriptor_fn = scheduler
+		.split("fn runtime_filter_descriptor_for_probe")
+		.nth(1)
+		.expect("descriptor constructor");
+	assert!(
+		descriptor_fn.contains("runtime_filter_probe_target: Some(target)"),
+		"ADR 537: the descriptor must be built from the carried target"
+	);
+	assert!(
+		descriptor_fn.contains("target.physical_column_ordinal")
+			&& descriptor_fn.contains("target.probe_descriptor_fingerprint"),
+		"ADR 537: both the ordinal and the fingerprint must come from that one target"
+	);
+
+	// 3. The tracer keeps a fail-closed fallback. It is deliberately not held to the
+	//    exhaustive-leaf discipline of other plan walkers: an unrecognized node must lose
+	//    the optimization, never acquire an unproven filter.
+	let tracer = fragment
+		.split("fn trace_runtime_filter_probe_target")
+		.nth(1)
+		.expect("tracer body");
+	assert!(
+		tracer.contains("_ => None"),
+		"ADR 537: the lineage tracer must fail closed on any node it does not understand"
+	);
+}
