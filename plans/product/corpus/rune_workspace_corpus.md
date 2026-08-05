@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.20. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.21. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -37,6 +37,7 @@ a cited record).
 | layered plot sink (`layers([line(x, y), scatter(x, y)])`) | executable | PRODUCT-0013's ordered substrate and PRODUCT-0014's surface are accepted; thirteen surface gates land in `c3edc520`, `a10b4995`, `56c8cb88`, and `d52fc31d`, with installed `test6.rn` dogfood confirming labels, paint order, ordinary host panels, and no dashboard |
 | figure-wide headings (`figure([title(text), subtitle(text), body])`) | executable | PRODUCT-0016's twelve gates in `4278e762`, `267e48c1`, `a39ffd9d`, and `764e2b64`; exact grammar spans, independent settings/body lowering, projected source-current chrome, rendered completion-atomic canvas, stale/removal lifecycle, and installed `test7.rn` launch |
 | relative scatter point size (`scatter(x, y).point_size(factor)`) | executable | PRODUCT-0017 proves the typed layer setting and all scatter renderer/hit/cache paths; PRODUCT-0018's closed contextual register, exact lowering/refusals, shared-result handoff, byte-identical `1.0`, six-pixel-radius `2.0`, identity/label lifecycle, and no-dashboard host completion land in `5d180e0c` and `0478f8a2`; installed `test7.rn` exercises the accepted `8.0` maximum |
+| relative line stroke width (`line(x, y).stroke_width(factor)`) | executable | PRODUCT-0019 proves the typed layer setting, five-tier selection, exact line paint/hit behavior, fixed guide, and styled-one-layer scale preservation; PRODUCT-0020's closed contextual lowering/refusals, shared-result handoff, byte-identical `1.0`, exact 4px `2.0`, identity/label lifecycle, and combined point-size host assay land in `01a66f4d`; installed `test7.rn` exercises both modifiers in one figure |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -417,6 +418,15 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.21 (2026-08-04): PRODUCT-0019 makes relative line stroke width a typed
+  Layer-stage setting and PRODUCT-0020 spells it as the second member of the
+  closed postfix register: `line(x, y).stroke_width(factor)`. A factor of `1.0`
+  preserves the established 2px stroke and mark-specific scale, while `2.0`
+  paints 4px; geometric hits retain five pixels beyond the visible half-stroke
+  and the guide sample remains fixed. Wrong receivers, incompatible chains,
+  duplicates, computed or invalid factors, and unknown methods refuse
+  atomically. The installed `test7.rn` combines a doubled line with its existing
+  maximum-sized scatter points in one headed layered figure.
 - v0.20 (2026-08-04): PRODUCT-0018 makes relative scatter point size
   scriptable as the closed Layer-stage postfix modifier
   `scatter(x, y).point_size(factor)`. The complete chain flattens atomically
