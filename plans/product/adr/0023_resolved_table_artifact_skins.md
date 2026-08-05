@@ -1,6 +1,6 @@
 # ADR 0023: resolved table artifact skins
 
-Status: proposed 2026-08-04. This record decides one thing: a rendered table
+Status: accepted 2026-08-04. This record decides one thing: a rendered table
 receives one complete, validated skin instead of reading Polariton's compile-time
 GUI color constants. The skin covers only the table artifact's interior chrome.
 It colors no data, changes no editor chrome, and adds no Rune surface;

@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.22. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.23. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -390,6 +390,24 @@ list. It is a natural extension of the existing mechanism rather than a
 prerequisite, and the first plotting record need not solve it. Until it is
 decided, sink constructors are recognized only in argument position.
 
+## Accepted substrate: resolved table artifact skins
+
+PRODUCT-0023 is accepted and executable in `f2dc10ae`, `e8b3f956`, `94749e4a`,
+and `022f6ab6`. `TableSkin` is a closed twelve-role value for table-interior
+chrome, separate from plot data ramps and editor `UiPalette`. Every production
+built-in passes seven alpha-composited 4.5:1 text-contrast checks. The default
+retains the exact pre-extraction Iced draw sequence, while a twelve-sentinel
+assay proves every role reaches the real renderer without changing geometry,
+text, selection, scrolling, or data.
+
+SQL results, Rune table views, and Markdown cell tables store one
+`TableArtifact { frame, skin }`; completion replaces the pair together and host
+failure retains it together as stale. Drawing remains clipped to the artifact,
+and a skin-only replacement cannot affect panel identity, descriptor, placement,
+focus, tabs, geometry, Markdown container chrome, or libaryon. This substrate
+adds no Rune capability, so no row above changes status. PRODUCT-0024 owns the
+first `.skin("name")` surface and the per-sink closed-register generalization.
+
 ## Mutation and definition lifecycle
 
 | family | status | evidence |
@@ -419,6 +437,15 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.23 (2026-08-04): PRODUCT-0023 replaces compile-time table color reads with
+  one closed, validated `TableSkin` passed through the real widget. The default
+  preserves the exact 39-operation pre-extraction draw oracle; every built-in
+  passes seven alpha-composited WCAG text checks, and a twelve-sentinel assay
+  proves complete renderer consumption without geometry or interaction change.
+  SQL-result, Rune-view, and Markdown-cell completions now retain frame plus skin
+  as one atomic artifact; stale failure preserves the pair, and skin-only
+  replacement cannot escape table content bounds or perturb host layout. No Rune
+  row changes status; PRODUCT-0024 remains the first `.skin("name")` caller.
 - v0.22 (2026-08-04): PRODUCT-0021 makes normalized bar-slot occupancy a typed
   Layer-stage setting and PRODUCT-0022 spells it as the third member of the
   closed postfix register: `bar(category, value).bar_width(fraction)`. The
