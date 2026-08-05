@@ -5,7 +5,7 @@ pub mod coords;
 pub mod path;
 
 pub use atomic_file::write_private_state_atomically;
-pub use color::{DEFAULT_SEARCH_HIGHLIGHT_HEX, Rgb, SEARCH_MATCH_BG};
+pub use color::{DEFAULT_SEARCH_HIGHLIGHT_HEX, Rgb, SEARCH_MATCH_BG, Srgb};
 pub use constants::{
 	DEFAULT_VIEWPORT_LINES, DEFAULT_VIEWPORT_WIDTH, DOCTAB_BAR_ROWS, EDITOR_CHROME_ROWS,
 	SPLIT_DIVIDER_COLS, SPLIT_DIVIDER_ROWS, STATUS_BAR_ROWS, TAB_SIZE,
