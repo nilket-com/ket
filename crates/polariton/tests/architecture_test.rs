@@ -738,9 +738,12 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 		.next()
 		.expect("production envelope source");
 	assert!(envelope_production.contains("pub(crate) struct RuneTableSink"));
-	assert!(envelope_production.contains("pub(crate) skin_name: Option<String>"));
+	assert!(envelope_production.contains("pub(crate) skin: RuneTableSkinIntent"));
+	assert!(envelope_production.contains("pub(crate) enum RuneTableSkinIntent"));
 	assert!(envelope_production.contains("\"skin\" =>"));
-	assert!(!envelope_production.contains("TableSkin"));
+	assert!(!envelope_production.contains("use crate::gui::table_skin"));
+	assert!(!envelope_production.contains("TableSkin::"));
+	assert!(!envelope_production.contains("TableRgba"));
 	assert!(!envelope_production.contains("ResolvedThemePalette"));
 
 	let messages = std::fs::read_to_string(root.join("gui/messages.rs")).expect("read messages");
@@ -750,10 +753,8 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("production GUI state source");
-	assert!(
-		state_production
-			.contains("TableSkin::from_theme_name(&name, TableSkinProjection::Duotone)")
-	);
+	assert!(state_production.contains("resolve_rune_table_skin_with"));
+	assert!(state_production.contains("TableSkin::from_theme_name"));
 	assert!(state_production.contains("set_rune_view_table_with_skin"));
 
 	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
@@ -801,13 +802,8 @@ fn product_0026_projection_choice_stays_explicit_and_outside_rune_and_editor_chr
 			.count(),
 		1
 	);
-	assert_eq!(
-		state_production
-			.matches("TableSkinProjection::Duotone")
-			.count(),
-		1
-	);
-	assert!(!state_production.contains("TableSkinProjection::PaletteForward"));
+	assert!(state_production.contains("TableSkinProjection::Duotone"));
+	assert!(state_production.contains("TableSkinProjection::PaletteForward"));
 
 	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
 		.expect("read Rune envelope");
@@ -816,14 +812,14 @@ fn product_0026_projection_choice_stays_explicit_and_outside_rune_and_editor_chr
 		.next()
 		.expect("production Rune envelope source");
 	for forbidden in [
-		"TableSkinProjection",
-		"PaletteForward",
-		"Duotone",
-		"duotone",
+		"use crate::gui::table_skin",
+		"TableSkin::",
+		"TableRgba",
+		"ResolvedThemePalette",
 	] {
 		assert!(
 			!envelope_production.contains(forbidden),
-			"Rune envelope acquired table projection vocabulary: {forbidden}"
+			"Rune envelope acquired resolved GUI table vocabulary: {forbidden}"
 		);
 	}
 
@@ -843,4 +839,50 @@ fn product_0026_projection_choice_stays_explicit_and_outside_rune_and_editor_chr
 			"editor artifact path acquired projection policy: {forbidden}"
 		);
 	}
+}
+
+#[test]
+fn product_0027_surface_keeps_projection_intent_bounded_and_plot_registers_closed() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let envelope_production = envelope
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production Rune envelope source");
+	assert!(
+		envelope_production.contains(
+			"pub(crate) enum RuneTableSkinProjection {\n\tPaletteForward,\n\tDuotone,\n}"
+		)
+	);
+	assert!(envelope_production.contains(
+		"pub(crate) enum RuneTableSkinIntent {\n\t#[default]\n\tDefault,\n\tNamedTheme {"
+	));
+	assert!(envelope_production.contains("\"duotone\" =>"));
+	assert!(envelope_production.contains("\"duotone() takes no arguments\""));
+	assert!(envelope_production.contains("let Some(name) = skin_name else"));
+
+	let mark_register = envelope_production
+		.split("fn parse_modified_mark(")
+		.nth(1)
+		.expect("mark register")
+		.split("fn parse_layer_modifier_factor(")
+		.next()
+		.expect("bounded mark register source");
+	assert!(!mark_register.contains("\"skin\" =>"));
+	assert!(!mark_register.contains("\"duotone\" =>"));
+
+	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	let state_production = state
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production GUI state source");
+	assert!(state_production.contains("projection: RuneTableSkinProjection::PaletteForward"));
+	assert!(state_production.contains("projection: RuneTableSkinProjection::Duotone"));
+	assert!(
+		state_production
+			.contains("the default palette-forward projection succeeds; remove .duotone()")
+	);
+	assert!(!state_production.contains("TableSkinProjection::default"));
+	assert!(!state_production.contains("unwrap_or(TableSkinProjection"));
 }

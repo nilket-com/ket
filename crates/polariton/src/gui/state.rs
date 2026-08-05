@@ -8,7 +8,7 @@ use crate::configuration::{self, StartupData};
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
 #[cfg(feature = "toron")]
-use crate::gui::table_skin::{TableSkin, TableSkinProjection};
+use crate::gui::table_skin::{TableSkin, TableSkinProjection, TableSkinProjectionError};
 use crate::gui::{
 	components,
 	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
@@ -30,9 +30,10 @@ use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RuneViewIntent,
-	RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink, TransformedRuneRelation,
-	TransformedRuneView, ViewPresentation, transform as transform_rune_view,
+	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RuneTableSkinIntent,
+	RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
+	StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView, ViewPresentation,
+	transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -791,6 +792,44 @@ async fn dispatch_rune_relation(
 }
 
 #[cfg(feature = "toron")]
+fn resolve_rune_table_skin_with(
+	intent: RuneTableSkinIntent,
+	mut resolve: impl FnMut(
+		&str,
+		TableSkinProjection,
+	) -> std::result::Result<TableSkin, TableSkinProjectionError>,
+) -> std::result::Result<TableSkin, String> {
+	match intent {
+		RuneTableSkinIntent::Default => Ok(TableSkin::DEFAULT),
+		RuneTableSkinIntent::NamedTheme {
+			name,
+			projection: RuneTableSkinProjection::PaletteForward,
+		} => resolve(&name, TableSkinProjection::PaletteForward).map_err(|error| error.to_string()),
+		RuneTableSkinIntent::NamedTheme {
+			name,
+			projection: RuneTableSkinProjection::Duotone,
+		} => match resolve(&name, TableSkinProjection::Duotone) {
+			Ok(skin) => Ok(skin),
+			Err(error @ TableSkinProjectionError::UnknownTheme { .. }) => Err(error.to_string()),
+			Err(error @ TableSkinProjectionError::UnsuitableDuotone { .. }) => {
+				let diagnostic = error.to_string();
+				if resolve(&name, TableSkinProjection::PaletteForward).is_ok() {
+					Err(format!(
+						"{diagnostic}; the default palette-forward projection succeeds; remove .duotone()"
+					))
+				} else {
+					Err(diagnostic)
+				}
+			}
+			Err(error @ TableSkinProjectionError::UnsuitablePaletteForward { .. }) => {
+				debug_assert!(false, "Duotone request returned PaletteForward facts");
+				Err(error.to_string())
+			}
+		},
+	}
+}
+
+#[cfg(feature = "toron")]
 fn rune_view_outcome(
 	frame: DataFrame,
 	views: Vec<SpannedRuneViewIntent>,
@@ -804,13 +843,10 @@ fn rune_view_outcome(
 		.map(|view| {
 			let presentation = view.intent.presentation();
 			let output = match view.intent {
-				RuneViewIntent::Table(table) => table
-					.skin_name
-					.map_or(Ok(TableSkin::DEFAULT), |name| {
-						TableSkin::from_theme_name(&name, TableSkinProjection::Duotone)
-							.map_err(|error| error.to_string())
-					})
-					.map(RuneRelationSinkOutput::Table),
+				RuneViewIntent::Table(table) => {
+					resolve_rune_table_skin_with(table.skin, TableSkin::from_theme_name)
+						.map(RuneRelationSinkOutput::Table)
+				}
 				RuneViewIntent::Plot(plot) => {
 					let authored_settings = plot.authored_settings;
 					match plot.body {
@@ -2101,7 +2137,7 @@ mod tests {
 		compact_sql_diagnostic, new, set_rune_error, set_sql_error, update,
 	};
 	#[cfg(feature = "toron")]
-	use super::{dispatch_rune_relation, rune_view_outcome};
+	use super::{dispatch_rune_relation, resolve_rune_table_skin_with, rune_view_outcome};
 	use crate::adapters::common::ExecutionResult;
 	#[cfg(feature = "toron")]
 	use crate::adapters::common::{
@@ -2122,8 +2158,9 @@ mod tests {
 	};
 	#[cfg(feature = "toron")]
 	use crate::rune_relation_envelope::{
-		LocalViewIdentity, PendingRuneView, RuneViewForm, TransformedRuneRelation,
-		TransformedRuneView, transform as transform_rune_view,
+		LocalViewIdentity, PendingRuneView, RuneTableSkinIntent, RuneTableSkinProjection,
+		RuneViewForm, TransformedRuneRelation, TransformedRuneView,
+		transform as transform_rune_view,
 	};
 	#[cfg(feature = "toron")]
 	use libaryon::core::BufferId;
@@ -2923,11 +2960,11 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0025_table_skin_resolution_is_per_sink_and_keeps_shared_identity() {
+	fn product_0027_table_skin_resolution_is_per_sink_and_keeps_shared_identity() {
 		let source = r#"workspace.table("t").views([
 			table().skin("terrain_rs10"),
 			table(),
-			table().skin("black"),
+			table().skin("dark2_s1"),
 			line("x", "y")
 		])"#;
 		let relation = transform_rune_view(source)
@@ -2951,7 +2988,8 @@ mod tests {
 		};
 		assert_eq!(
 			*styled,
-			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::Duotone).unwrap()
+			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::PaletteForward)
+				.unwrap()
 		);
 		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(default)) =
 			&outcome.sinks[1].output
@@ -2971,7 +3009,139 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0025_installed_test8_shape_parses_and_completes_every_sink() {
+	fn product_0027_projection_policy_probes_only_a_working_duotone_alternative() {
+		fn themed(name: &str, projection: RuneTableSkinProjection) -> RuneTableSkinIntent {
+			RuneTableSkinIntent::NamedTheme {
+				name: name.to_owned(),
+				projection,
+			}
+		}
+
+		fn resolve_traced(
+			intent: RuneTableSkinIntent,
+		) -> (
+			std::result::Result<TableSkin, String>,
+			Vec<(String, TableSkinProjection)>,
+		) {
+			let mut calls = Vec::new();
+			let result = resolve_rune_table_skin_with(intent, |name, projection| {
+				calls.push((name.to_owned(), projection));
+				TableSkin::from_theme_name(name, projection)
+			});
+			(result, calls)
+		}
+
+		let (default, calls) = resolve_traced(RuneTableSkinIntent::Default);
+		assert_eq!(default, Ok(TableSkin::DEFAULT));
+		assert!(calls.is_empty());
+
+		let (palette_forward, calls) =
+			resolve_traced(themed("yellows", RuneTableSkinProjection::PaletteForward));
+		assert_eq!(
+			palette_forward,
+			TableSkin::from_theme_name("yellows", TableSkinProjection::PaletteForward)
+				.map_err(|error| error.to_string())
+		);
+		assert_eq!(
+			calls,
+			[("yellows".to_owned(), TableSkinProjection::PaletteForward)]
+		);
+
+		let (duotone, calls) = resolve_traced(themed("yellows", RuneTableSkinProjection::Duotone));
+		let error = duotone.expect_err("explicit yellows Duotone must remain unsuitable");
+		let factual = TableSkin::from_theme_name("yellows", TableSkinProjection::Duotone)
+			.expect_err("PRODUCT-0026 differential assay")
+			.to_string();
+		assert_eq!(
+			error,
+			format!(
+				"{factual}; the default palette-forward projection succeeds; remove .duotone()"
+			)
+		);
+		assert!(error.contains("cell text on selected odd row"));
+		assert_eq!(
+			calls,
+			[
+				("yellows".to_owned(), TableSkinProjection::Duotone),
+				("yellows".to_owned(), TableSkinProjection::PaletteForward),
+			]
+		);
+
+		let (unknown, calls) = resolve_traced(themed(
+			"definitely-not-a-theme",
+			RuneTableSkinProjection::Duotone,
+		));
+		assert_eq!(
+			unknown,
+			Err("unknown table skin theme \"definitely-not-a-theme\"".to_owned())
+		);
+		assert_eq!(
+			calls,
+			[(
+				"definitely-not-a-theme".to_owned(),
+				TableSkinProjection::Duotone
+			)]
+		);
+		let (unknown, calls) = resolve_traced(themed(
+			"definitely-not-a-theme",
+			RuneTableSkinProjection::PaletteForward,
+		));
+		assert_eq!(
+			unknown,
+			Err("unknown table skin theme \"definitely-not-a-theme\"".to_owned())
+		);
+		assert_eq!(
+			calls,
+			[(
+				"definitely-not-a-theme".to_owned(),
+				TableSkinProjection::PaletteForward
+			)]
+		);
+
+		let (duotone_success, calls) =
+			resolve_traced(themed("terrain_rs10", RuneTableSkinProjection::Duotone));
+		assert_eq!(
+			duotone_success,
+			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::Duotone)
+				.map_err(|error| error.to_string())
+		);
+		assert_eq!(
+			calls,
+			[("terrain_rs10".to_owned(), TableSkinProjection::Duotone)]
+		);
+
+		let (both_fail, calls) =
+			resolve_traced(themed("dark2_s1", RuneTableSkinProjection::Duotone));
+		let error = both_fail.expect_err("dark2_s1 must fail both projections");
+		assert_eq!(
+			error,
+			TableSkin::from_theme_name("dark2_s1", TableSkinProjection::Duotone)
+				.expect_err("Duotone control")
+				.to_string()
+		);
+		assert!(!error.contains("remove .duotone()"));
+		assert_eq!(
+			calls,
+			[
+				("dark2_s1".to_owned(), TableSkinProjection::Duotone),
+				("dark2_s1".to_owned(), TableSkinProjection::PaletteForward),
+			]
+		);
+
+		let (palette_forward_fail, calls) =
+			resolve_traced(themed("dark2_s1", RuneTableSkinProjection::PaletteForward));
+		let error = palette_forward_fail.expect_err("default projection must report its own facts");
+		assert!(error.contains("palette-forward"));
+		assert!(!error.contains("duotone"));
+		assert_eq!(
+			calls,
+			[("dark2_s1".to_owned(), TableSkinProjection::PaletteForward)]
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0027_focused_high_density_shape_parses_and_completes_every_sink() {
 		let source = r#"ket.table("test1")
 	.sort([col("x").asc()])
 	.views([
@@ -2994,7 +3164,7 @@ ket.table("test2") // Comment Test1.
 			bar("cat", "val")
 				.bar_width(0.98)])])"#;
 		let relations = transform_rune_view(source)
-			.expect("installed test8 shape")
+			.expect("focused accepted high-density shape")
 			.into_relations()
 			.collect::<Vec<_>>();
 		assert_eq!(relations.len(), 2);
@@ -3010,7 +3180,8 @@ ket.table("test2") // Comment Test1.
 		};
 		assert_eq!(
 			*skin,
-			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::Duotone).unwrap()
+			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::PaletteForward)
+				.unwrap()
 		);
 		assert!(matches!(
 			first.sinks[1].output,
@@ -3042,10 +3213,11 @@ ket.table("test2") // Comment Test1.
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0025_skin_changes_reuse_the_panel_and_bad_skin_retains_the_prior_pair() {
-		fn program(theme: &str) -> TransformedRuneView {
+	fn product_0027_projection_changes_reuse_the_panel_and_bad_skin_retains_the_prior_pair() {
+		fn program(theme: &str, duotone: bool) -> TransformedRuneView {
+			let projection = if duotone { ".duotone()" } else { "" };
 			transform_rune_view(&format!(
-				"workspace.table(\"t\").views([view(\"styled\", table().skin(\"{theme}\")), view(\"plain\", table()), view(\"bad\", table().skin(\"black\"))])"
+				"workspace.table(\"t\").views([view(\"styled\", table().skin(\"{theme}\"){projection}), view(\"plain\", table()), view(\"bad\", table().skin(\"dark2_s1\"))])"
 			))
 			.expect("three named tables")
 		}
@@ -3059,7 +3231,7 @@ ket.table("test2") // Comment Test1.
 		let previous_bad_skin =
 			TableSkin::from_theme_name("terrain_r", TableSkinProjection::Duotone).unwrap();
 
-		let first = program("terrain_rs10");
+		let first = program("terrain_rs10", true);
 		let presentation = first
 			.presentation_views()
 			.into_iter()
@@ -3132,7 +3304,7 @@ ket.table("test2") // Comment Test1.
 		);
 		assert!(state.status_error.contains("table at bytes"));
 
-		let second = program("terrain_s1");
+		let second = program("terrain_rs10", false);
 		let presentation = second
 			.presentation_views()
 			.into_iter()
@@ -3179,7 +3351,10 @@ ket.table("test2") // Comment Test1.
 			state
 				.code_editor
 				.rune_view_panel_table_skin(source_buffer, &styled),
-			Some(TableSkin::from_theme_name("terrain_s1", TableSkinProjection::Duotone).unwrap())
+			Some(
+				TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::PaletteForward)
+					.unwrap()
+			)
 		);
 		assert_eq!(
 			state.code_editor.rune_view_panel_id(source_buffer, &styled),

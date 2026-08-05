@@ -29,9 +29,25 @@ pub(crate) enum RuneViewIntent {
 	Plot(RunePlotIntent),
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuneTableSkinProjection {
+	PaletteForward,
+	Duotone,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) enum RuneTableSkinIntent {
+	#[default]
+	Default,
+	NamedTheme {
+		name: String,
+		projection: RuneTableSkinProjection,
+	},
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RuneTableSink {
-	pub(crate) skin_name: Option<String>,
+	pub(crate) skin: RuneTableSkinIntent,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -1387,9 +1403,10 @@ fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEn
 	Ok(LayerSpec::xy(mark, fields[0].clone(), fields[1].clone()))
 }
 
-/// PRODUCT-0025's closed postfix table-sink modifier register. Recognition is
-/// contextual: the complete chain is flattened to one authored theme name, and
-/// no palette or resolved artifact color enters the envelope.
+/// PRODUCT-0027's closed postfix table-sink modifier register. Recognition is
+/// contextual: the complete chain is flattened to one palette identity plus
+/// projection intent, and no palette or resolved artifact color enters the
+/// envelope.
 fn parse_modified_table(
 	expression: &ast::Expr,
 	source: &str,
@@ -1434,6 +1451,7 @@ fn parse_modified_table(
 	}
 
 	let mut skin_name = None;
+	let mut duotone = false;
 	for (modifier, call) in modifiers {
 		match modifier {
 			"skin" => {
@@ -1462,17 +1480,50 @@ fn parse_modified_table(
 				};
 				skin_name = Some(name);
 			}
+			"duotone" => {
+				if duotone {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"duotone() may appear at most once on a table sink",
+					);
+				}
+				if !call.args.is_empty() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"duotone() takes no arguments",
+					);
+				}
+				duotone = true;
+			}
 			_ => {
 				return invalid_view(
 					expression.span(),
 					source.len(),
-					format!("unknown table modifier {modifier:?}; expected skin(string_literal)"),
+					format!(
+						"unknown table modifier {modifier:?}; expected skin(string_literal) or duotone()"
+					),
 				);
 			}
 		}
 	}
 
-	Ok(Some(RuneTableSink { skin_name }))
+	let Some(name) = skin_name else {
+		return invalid_view(
+			expression.span(),
+			source.len(),
+			"a modified table sink requires skin(string_literal)",
+		);
+	};
+	let projection = if duotone {
+		RuneTableSkinProjection::Duotone
+	} else {
+		RuneTableSkinProjection::PaletteForward
+	};
+	Ok(Some(RuneTableSink {
+		skin: RuneTableSkinIntent::NamedTheme { name, projection },
+	}))
 }
 
 /// PRODUCT-0018's closed postfix LayerModifier register. A successful parse
@@ -3561,17 +3612,23 @@ workspace.table("t").views([table()])
 	}
 
 	#[test]
-	fn product_0025_table_skin_flattens_in_direct_and_named_sink_positions() {
+	fn product_0027_table_skin_projection_flattens_in_every_order_and_identity_position() {
 		let transformed = transform(
-			"workspace.table(\"t\").views([table().skin(\"terrain_rs10\"), view(\"named\", table().skin(\"nord_r\")), table()])",
+			"workspace.table(\"t\").views([table().skin(\"terrain_rs10\"), view(\"named\", table().skin(\"nord_r\").duotone()), table().duotone().skin(\"nord_r\"), table()])",
 		)
 		.expect("table skin forms");
-		assert_eq!(transformed.views.len(), 3);
+		assert_eq!(transformed.views.len(), 4);
 
 		let RuneViewIntent::Table(first) = &transformed.views[0].intent else {
 			panic!("first sink must remain a table");
 		};
-		assert_eq!(first.skin_name.as_deref(), Some("terrain_rs10"));
+		assert_eq!(
+			first.skin,
+			RuneTableSkinIntent::NamedTheme {
+				name: "terrain_rs10".to_owned(),
+				projection: RuneTableSkinProjection::PaletteForward,
+			}
+		);
 		assert_eq!(
 			transformed.views[0].identity,
 			LocalViewIdentity::Anonymous(0)
@@ -3580,25 +3637,38 @@ workspace.table("t").views([table()])
 		let RuneViewIntent::Table(named) = &transformed.views[1].intent else {
 			panic!("named sink must remain a table");
 		};
-		assert_eq!(named.skin_name.as_deref(), Some("nord_r"));
+		assert_eq!(
+			named.skin,
+			RuneTableSkinIntent::NamedTheme {
+				name: "nord_r".to_owned(),
+				projection: RuneTableSkinProjection::Duotone,
+			}
+		);
 		assert_eq!(
 			transformed.views[1].identity,
 			LocalViewIdentity::Named("named".to_owned())
 		);
 
 		assert_eq!(
-			transformed.views[2].intent,
+			transformed.views[2].intent, transformed.views[1].intent,
+			"modifier order must not survive flattening"
+		);
+		assert_eq!(
+			transformed.views[3].intent,
 			RuneViewIntent::Table(RuneTableSink::default())
 		);
 	}
 
 	#[test]
-	fn product_0025_table_modifier_register_is_closed_literal_and_atomic() {
+	fn product_0027_table_modifier_register_is_closed_bounded_and_atomic() {
 		for sink in [
 			"table().skin()",
 			"table().skin(\"nord\", \"terrain\")",
 			"table().skin(theme_name)",
 			"table().skin(\"nord\").skin(\"terrain\")",
+			"table().duotone()",
+			"table().skin(\"nord\").duotone(1)",
+			"table().skin(\"nord\").duotone().duotone()",
 			"table().point_size(2.0)",
 			"table().frobnicate(1)",
 			"table(\"wrong\").skin(\"nord\")",
@@ -3620,10 +3690,11 @@ workspace.table("t").views([table()])
 	}
 
 	#[test]
-	fn product_0025_table_skin_is_ordinary_rune_outside_proven_sink_positions() {
+	fn product_0027_table_projection_calls_are_ordinary_rune_outside_proven_positions() {
 		let source = r#"
 let styled = table().skin("terrain_rs10");
 consume(table().skin("nord"));
+consume(table().skin("yellows").duotone());
 workspace.table("t").views([table()])
 "#;
 		let transformed = transform(source).expect("one proven default table view");
@@ -3633,6 +3704,11 @@ workspace.table("t").views([table()])
 				.contains("table().skin(\"terrain_rs10\")")
 		);
 		assert!(transformed.source.contains("table().skin(\"nord\")"));
+		assert!(
+			transformed
+				.source
+				.contains("table().skin(\"yellows\").duotone()")
+		);
 		assert_eq!(
 			transformed.views[0].intent,
 			RuneViewIntent::Table(RuneTableSink::default())
