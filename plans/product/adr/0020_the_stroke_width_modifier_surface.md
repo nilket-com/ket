@@ -57,6 +57,14 @@ The setting never enters Toron source, a kernel type, prepared data, headings,
 or panel metadata. It is pruned at the boundary and applied after the shared
 stamped result returns.
 
+Implementation of gate 6 exposed a missing PRODUCT-0019 boundary: the existing
+styled-single carrier entered PRODUCT-0013's multi-layer domain padding, so
+factor `1.0` changed a line's scale despite preserving its stroke. PRODUCT-0020's
+stop condition fired. PRODUCT-0019 §3 and gate 5 were amended to require a
+styled single layer to retain its mark-specific prepared layout; implementation
+resumed under that substrate authorization. Multi-layer shared-domain behavior
+remains unchanged.
+
 ## Acceptance gates
 
 1. `.stroke_width(2.0)` lowers to the unchanged line mark/encoding plus exact
@@ -91,4 +99,3 @@ stamped result returns.
 - **`.width(...)`:** collides with geometry and encoding meanings.
 - **Generic modifier macro:** deferred until a third setting reveals a stable
   shared abstraction.
-

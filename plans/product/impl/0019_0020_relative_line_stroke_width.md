@@ -41,7 +41,9 @@ hit radius as half the visible stroke plus five pixels. Do not change prepared
 data, line legend, hover prose, ordering, or any other renderer.
 
 Assay preparation independence, byte-identical defaults, exact 4px output,
-6px/7px miss-hit boundary, and identical legend SVG.
+6px/7px miss-hit boundary, and identical legend SVG. A styled one-layer factor
+`1.0` must retain the mark-specific prepared layout; only a genuine composition
+uses PRODUCT-0013's shared-domain layout.
 
 PRODUCT-0019 gates: 4, 5, 6, 7, 8.
 

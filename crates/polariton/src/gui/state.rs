@@ -3285,6 +3285,159 @@ workspace.table("t").views([
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0020_stroke_width_reaches_host_and_combines_with_point_size() {
+		let frame = polars::df!("x" => [1.0_f64, 2.0, 3.0], "y" => [2.0_f64, 4.0, 3.0])
+			.expect("line frame");
+		let positions = transform_rune_view(
+			r#"workspace.table("t").views([
+				layers([line("x", "y").stroke_width(2.0)]),
+				line("x", "y").stroke_width(2.0),
+				figure([title("Wide"), line("x", "y").stroke_width(2.0)]),
+			])"#,
+		)
+		.expect("all proven stroke-width positions")
+		.into_relations()
+		.next()
+		.expect("one relation");
+		let position_outcome = rune_view_outcome(frame.clone(), positions.views);
+		assert_eq!(position_outcome.sinks.len(), 3);
+		for sink in &position_outcome.sinks {
+			assert!(Arc::ptr_eq(&position_outcome.result, &sink.source));
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification, _)) =
+				&sink.output
+			else {
+				panic!("every styled line must use the layer-aware output")
+			};
+			let mut layers = specification.layers.iter();
+			let layer = layers.next().expect("one line layer");
+			assert!(layers.next().is_none());
+			assert_eq!(layer.mark, crate::plot::spec::LayerMark::Line);
+			assert_eq!(
+				layer.settings.stroke_width,
+				crate::plot::spec::Override::Set(crate::plot::spec::StrokeWidth::new(2.0).unwrap())
+			);
+		}
+
+		let combo = transform_rune_view(
+			r#"workspace.table("t").views([figure([
+				title("High density"),
+				subtitle("Two independent Layer settings"),
+				layers([
+					line("x", "y").stroke_width(2.0),
+					scatter("x", "y").point_size(2.0),
+				]),
+			])])"#,
+		)
+		.expect("high-density combo")
+		.into_relations()
+		.next()
+		.expect("one relation");
+		let combo_outcome = rune_view_outcome(frame.clone(), combo.views);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification, settings)) =
+			&combo_outcome.sinks[0].output
+		else {
+			panic!("combo remains one layered output")
+		};
+		let layers = specification.layers.iter().collect::<Vec<_>>();
+		assert_eq!(
+			layers.iter().map(|layer| layer.mark).collect::<Vec<_>>(),
+			[
+				crate::plot::spec::LayerMark::Line,
+				crate::plot::spec::LayerMark::Scatter
+			]
+		);
+		assert!(matches!(
+			layers[0].settings.stroke_width,
+			crate::plot::spec::Override::Set(_)
+		));
+		assert!(matches!(
+			layers[1].settings.point_size,
+			crate::plot::spec::Override::Set(_)
+		));
+		assert!(matches!(
+			settings.title,
+			crate::plot::spec::Presence::Show(_)
+		));
+		assert!(matches!(
+			settings.subtitle,
+			crate::plot::spec::Presence::Show(_)
+		));
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(85);
+		let identity = LocalViewIdentity::Named("line".to_owned());
+		let sources = [
+			"workspace.table(\"t\").views([view(\"line\", line(\"x\", \"y\"))])",
+			"workspace.table(\"t\").views([view(\"line\", line(\"x\", \"y\").stroke_width(1.0))])",
+			"workspace.table(\"t\").views([view(\"line\", line(\"x\", \"y\").stroke_width(2.0))])",
+		];
+		let mut panel = None;
+		let mut svgs = Vec::new();
+		for (offset, source) in sources.into_iter().enumerate() {
+			let revision = offset as u64 + 1;
+			let program = transform_rune_view(source).expect("stroke-width lifecycle revision");
+			let presentation = program
+				.presentation_views()
+				.into_iter()
+				.map(|view| (view.identity.clone(), view.intent.presentation()))
+				.collect::<Vec<_>>();
+			assert_eq!(presentation[0].0, identity);
+			assert_eq!(presentation[0].1.display_label, "plot.line");
+			state.rune_buffer_revisions.insert(source_buffer, revision);
+			state
+				.code_editor
+				.prepare_rune_view_panels(source_buffer, &presentation, revision);
+			let current = state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity)
+				.expect("stable line panel");
+			if let Some(first) = panel {
+				assert_eq!(current, first, "stroke width is not view identity");
+			} else {
+				panel = Some(current);
+			}
+			assert!(
+				state
+					.rune_view_scheduler
+					.submit(PendingRuneView {
+						source_buffer,
+						revision,
+						view: program.clone(),
+					})
+					.is_some()
+			);
+			complete_relation_in_head(
+				&mut state,
+				source_buffer,
+				revision,
+				program.into_relations().next().expect("one relation"),
+				frame.clone(),
+			);
+			svgs.push(
+				state
+					.code_editor
+					.rune_view_panel_plot_svg(source_buffer, &identity)
+					.expect("completed line canvas"),
+			);
+		}
+		assert_eq!(svgs[0], svgs[1], "factor 1.0 must preserve bare line");
+		assert!(svgs[2].contains("stroke-width=\"4\""));
+		assert_ne!(svgs[1], svgs[2]);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_display_label(source_buffer, &identity),
+			Some("plot.line")
+		);
+		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn product_0016_figure_headings_reach_canvas_and_source_only_chrome() {
 		let source = r#"workspace.table("t").views([
 			view("stable", figure([title("Named canvas"), line("x", "y")])),

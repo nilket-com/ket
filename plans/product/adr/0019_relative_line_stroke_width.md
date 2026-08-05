@@ -43,6 +43,11 @@ width from `ResolvedPlotSettings` when drawing. Ordinary line kernels continue
 through the same renderer, so the default path has one drawing implementation
 and byte-identical SVG.
 
+A styled one-layer plot retains that mark's established prepared ranges. Merely
+entering the layer-aware carrier must not route a line through PRODUCT-0013's
+multi-layer shared-domain padding: width is presentation, not scale. Genuine
+multi-layer compositions keep PRODUCT-0013's shared-domain path unchanged.
+
 ### 4. Hit geometry follows the visible stroke
 
 The current 2px line has a 6px geometric hit radius: one visible half-stroke plus
@@ -70,8 +75,9 @@ provisional. A later Guide record may relate samples to marks.
 3. Two line layers over one result can paint distinct widths without changing
    encoding, domain, or order.
 4. `LinePreparedData` contains no width and is identical across rendered widths.
-5. Default standalone and layered line SVG remains byte-identical; factor `2.0`
-   paints a 4px stroke.
+5. Default standalone and layered line SVG remains byte-identical, including a
+   styled one-layer factor `1.0` retaining the standalone line range; factor
+   `2.0` changes only the stroke and paints it at 4px.
 6. A cursor between the default 6px and doubled 7px hit radii misses at `1.0`
    and hits at `2.0` through the layer-aware path.
 7. Legend SVG is identical across stroke widths.
@@ -102,4 +108,3 @@ provisional. A later Guide record may relate samples to marks.
   unchanged.
 - PRODUCT-0020 may add `.stroke_width(2.0)` to the closed modifier register and
   must add no renderer semantics.
-

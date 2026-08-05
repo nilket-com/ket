@@ -249,7 +249,8 @@ pub fn create_layered_plot(
 	};
 	let resolved = resolve_layered_domains(binding, &stamped).map_err(|e| e.to_string())?;
 	let (first, rest) = resolved.layers.into_parts();
-	if rest.is_empty() && first.settings == crate::plot::spec::LayerSettings::default() {
+	let is_single_layer = rest.is_empty();
+	if is_single_layer && first.settings == crate::plot::spec::LayerSettings::default() {
 		return Ok(create_plot(&first.spec, df, width, height));
 	}
 
@@ -278,7 +279,16 @@ pub fn create_layered_plot(
 			.expect("resolved y field remains present")
 			.dtype(),
 	);
-	let mut layers = NonEmpty::new(prepare_layer_renderer(first, df, width, height));
+	let first = prepare_layer_renderer(first, df, width, height);
+	// A modifier changes presentation, not scale. Preserve the established
+	// mark-specific prepared range for a styled one-layer plot; only a genuine
+	// composition enters PRODUCT-0013's shared-domain layout.
+	let shared_layout = if is_single_layer {
+		first.prepared_layout(width, height)
+	} else {
+		shared_layout
+	};
+	let mut layers = NonEmpty::new(first);
 	for layer in rest {
 		layers.push(prepare_layer_renderer(layer, df, width, height));
 	}

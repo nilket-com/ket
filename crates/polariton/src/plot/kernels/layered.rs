@@ -28,6 +28,29 @@ impl LayerRenderer {
 		Self::Scatter(ScatterMarkRenderer::new(prepared_data), settings)
 	}
 
+	pub(crate) fn prepared_layout(
+		&self,
+		viewport_width: u32,
+		viewport_height: u32,
+	) -> ResolvedLayout {
+		let (x_range, y_range) = match self {
+			Self::Line(renderer, _) => (
+				renderer.prepared_data.x_range,
+				renderer.prepared_data.y_range,
+			),
+			Self::Scatter(renderer, _) => (
+				renderer.prepared_data.x_range,
+				renderer.prepared_data.y_range,
+			),
+		};
+		ResolvedLayout {
+			viewport_width,
+			viewport_height,
+			x_range,
+			y_range,
+		}
+	}
+
 	fn settings(&self) -> &LayerSettings {
 		match self {
 			Self::Line(_, settings) | Self::Scatter(_, settings) => settings,

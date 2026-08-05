@@ -528,3 +528,21 @@ fn product_0019_stroke_width_is_render_state_not_prepared_line_data() {
 		"the line renderer must consume resolved stroke width"
 	);
 }
+
+#[test]
+fn product_0020_extends_the_closed_typed_modifier_register() {
+	let envelope = std::fs::read_to_string(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rune_relation_envelope.rs"),
+	)
+	.expect("read Rune envelope");
+	assert!(
+		envelope.contains("\"stroke_width\"")
+			&& envelope.contains("StrokeWidth::new")
+			&& envelope.contains("stroke_width.map_or(Override::Inherit, Override::Set)"),
+		"PRODUCT-0020 must lower the named modifier through PRODUCT-0019's typed handoff"
+	);
+	assert!(
+		!envelope.contains("HashMap<String, LayerModifier"),
+		"the second setting does not authorize an open modifier map"
+	);
+}

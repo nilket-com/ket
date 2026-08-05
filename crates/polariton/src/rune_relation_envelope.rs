@@ -10,6 +10,7 @@ use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize, Presence,
+	StrokeWidth,
 };
 use crate::plot::theme::PlotSettingsLayer;
 use libaryon::core::BufferId;
@@ -1356,6 +1357,7 @@ fn parse_modified_mark(
 
 	let mut current = expression;
 	let mut point_size = None;
+	let mut stroke_width = None;
 	loop {
 		let ast::Expr::Call(call) = current else {
 			return invalid_view(
@@ -1377,35 +1379,32 @@ fn parse_modified_mark(
 						"point_size(...) may appear at most once on a mark",
 					);
 				}
-				let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-				let [argument] = args.as_slice() else {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"point_size(...) takes exactly one numeric literal",
-					);
-				};
-				if !matches!(argument, ast::Expr::Lit(lit) if matches!(lit.lit, ast::Lit::Number(_)))
-				{
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"point_size(...) requires a numeric literal",
-					);
-				}
-				let raw = source_slice(source, argument.span())?.replace('_', "");
+				let factor = parse_layer_modifier_factor(call, expression, source, "point_size")?;
 				let modifier_span = u32_range(
 					&byte_range(expression.span(), source.len())?,
 					"point-size modifier",
 				)?;
-				let factor = raw
-					.parse::<f32>()
-					.map_err(|_| RuneEnvelopeError::InvalidView {
-						span: modifier_span.clone(),
-						message: "point_size(...) requires an unsuffixed numeric literal"
-							.to_owned(),
-					})?;
 				point_size = Some(PointSize::new(factor).map_err(|error| {
+					RuneEnvelopeError::InvalidView {
+						span: modifier_span,
+						message: error.to_string(),
+					}
+				})?);
+			}
+			"stroke_width" => {
+				if stroke_width.is_some() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"stroke_width(...) may appear at most once on a mark",
+					);
+				}
+				let factor = parse_layer_modifier_factor(call, expression, source, "stroke_width")?;
+				let modifier_span = u32_range(
+					&byte_range(expression.span(), source.len())?,
+					"stroke-width modifier",
+				)?;
+				stroke_width = Some(StrokeWidth::new(factor).map_err(|error| {
 					RuneEnvelopeError::InvalidView {
 						span: modifier_span,
 						message: error.to_string(),
@@ -1416,7 +1415,9 @@ fn parse_modified_mark(
 				return invalid_view(
 					expression.span(),
 					source.len(),
-					format!("unknown layer modifier {modifier:?}; expected point_size(number)"),
+					format!(
+						"unknown layer modifier {modifier:?}; expected point_size(number) or stroke_width(number)"
+					),
 				);
 			}
 		}
@@ -1432,23 +1433,40 @@ fn parse_modified_mark(
 	};
 	let callee = source_slice(source, root.expr.span())?.trim();
 	let args = root.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	if callee != "scatter" {
-		return invalid_view(
-			expression.span(),
-			source.len(),
-			if callee == "line" {
-				"point_size(...) is available on scatter marks, not line marks"
-			} else {
-				"a layer modifier must follow a scatter(...) mark"
-			},
-		);
-	}
+	let mark = match callee {
+		"line" => LayerMark::Line,
+		"scatter" => LayerMark::Scatter,
+		_ => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"a layer modifier must follow a line(...) or scatter(...) mark",
+			);
+		}
+	};
 	if args.len() != 2 {
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"a point-sized scatter mark takes exactly x and y string fields; category color is not a Layer setting",
+			"a modified mark takes exactly x and y string fields; category color is not a Layer setting",
 		);
+	}
+	match mark {
+		LayerMark::Line if point_size.is_some() => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"point_size(...) is available on scatter marks, not line marks",
+			);
+		}
+		LayerMark::Scatter if stroke_width.is_some() => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"stroke_width(...) is available on line marks, not scatter marks",
+			);
+		}
+		_ => {}
 	}
 	let mut fields = Vec::with_capacity(2);
 	for field in args {
@@ -1457,19 +1475,47 @@ fn parse_modified_mark(
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"a point-sized scatter mark requires x and y string literals",
+				"a modified mark requires x and y string literals",
 			);
 		};
 		fields.push(value);
 	}
-	let mut layer = LayerSpec::xy(LayerMark::Scatter, fields[0].clone(), fields[1].clone());
+	let mut layer = LayerSpec::xy(mark, fields[0].clone(), fields[1].clone());
 	layer.settings = LayerSettings {
-		point_size: Override::Set(
-			point_size.expect("the outer field-access call supplied one modifier"),
-		),
-		..LayerSettings::default()
+		point_size: point_size.map_or(Override::Inherit, Override::Set),
+		stroke_width: stroke_width.map_or(Override::Inherit, Override::Set),
 	};
 	Ok(Some(layer))
+}
+
+fn parse_layer_modifier_factor(
+	call: &ast::ExprCall,
+	outer: &ast::Expr,
+	source: &str,
+	modifier: &str,
+) -> Result<f32, RuneEnvelopeError> {
+	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+	let [argument] = args.as_slice() else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{modifier}(...) takes exactly one numeric literal"),
+		);
+	};
+	if !matches!(argument, ast::Expr::Lit(lit) if matches!(lit.lit, ast::Lit::Number(_))) {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{modifier}(...) requires a numeric literal"),
+		);
+	}
+	let raw = source_slice(source, argument.span())?.replace('_', "");
+	let span = u32_range(&byte_range(outer.span(), source.len())?, "layer modifier")?;
+	raw.parse::<f32>()
+		.map_err(|_| RuneEnvelopeError::InvalidView {
+			span,
+			message: format!("{modifier}(...) requires an unsuffixed numeric literal"),
+		})
 }
 
 fn parse_sugar_sink(
@@ -2890,6 +2936,147 @@ workspace.table("t").views([table()])
 			assert_eq!(
 				transformed.views[0].intent.presentation().display_label,
 				"plot.scatter"
+			);
+		}
+	}
+
+	fn product_0020_only_line(source: &str) -> LayerSpec {
+		let transformed = transform(source).expect("stroke-width line envelope");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("stroke-width line must be a plot")
+		};
+		match &plot.body {
+			RunePlotBody::StyledSingle(layer) => layer.clone(),
+			RunePlotBody::Layered(specification) => specification
+				.layers
+				.iter()
+				.find(|layer| layer.settings.stroke_width != Override::Inherit)
+				.expect("layered plot contains the styled line")
+				.clone(),
+			RunePlotBody::Single(_) => panic!("the modifier must not be discarded"),
+		}
+	}
+
+	#[test]
+	fn product_0020_stroke_width_flattens_in_every_proven_mark_position() {
+		let layered = product_0020_only_line(
+			"workspace.table(\"t\").views([layers([line(\"x\", \"y\").stroke_width(2.0), scatter(\"x\", \"y\")])])",
+		);
+		let direct = product_0020_only_line(
+			"workspace.table(\"t\").views([line(\"x\", \"y\").stroke_width(2.0)])",
+		);
+		let figure = product_0020_only_line(
+			"workspace.table(\"t\").views([figure([title(\"Wide\"), line(\"x\", \"y\").stroke_width(2.0)])])",
+		);
+		for layer in [layered, direct, figure] {
+			assert_eq!(layer.mark, LayerMark::Line);
+			assert_eq!(
+				layer.encoding,
+				LayerSpec::xy(LayerMark::Line, "x", "y").encoding
+			);
+			assert_eq!(layer.settings.point_size, Override::Inherit);
+			assert_eq!(
+				layer.settings.stroke_width,
+				Override::Set(StrokeWidth::new(2.0).expect("accepted factor"))
+			);
+		}
+	}
+
+	#[test]
+	fn product_0020_stroke_width_inherits_bounds_and_refuses_atomically() {
+		for factor in ["0.25", "1", "2.0", "8.0"] {
+			let source = format!(
+				"workspace.table(\"t\").views([layers([line(\"x\", \"y\").stroke_width({factor})])])"
+			);
+			let layer = product_0020_only_line(&source);
+			let Override::Set(width) = layer.settings.stroke_width else {
+				panic!("accepted source must set stroke width")
+			};
+			assert_eq!(width.factor(), factor.parse::<f32>().unwrap());
+		}
+
+		for rejected in [
+			"stroke_width()",
+			"stroke_width(1.0, 2.0)",
+			"stroke_width(width)",
+			"stroke_width(1.0 + 1.0)",
+			"stroke_width(-1.0)",
+			"stroke_width(0.0)",
+			"stroke_width(0.24)",
+			"stroke_width(8.01)",
+			"stroke_width(2.0).stroke_width(3.0)",
+		] {
+			let source = format!(
+				"workspace.table(\"t\").views([table(), layers([line(\"x\", \"y\").{rejected}])])"
+			);
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(&source).expect_err("invalid stroke width must refuse")
+			else {
+				panic!("expected attributed stroke-width refusal")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				format!("line(\"x\", \"y\").{rejected}")
+			);
+		}
+	}
+
+	#[test]
+	fn product_0020_modifier_compatibility_is_closed_and_order_independent() {
+		for modified in [
+			"scatter(\"x\", \"y\").stroke_width(2.0)",
+			"line(\"x\", \"y\").point_size(2.0)",
+			"line(\"x\", \"y\").stroke_width(2.0).point_size(2.0)",
+			"line(\"x\", \"y\").point_size(2.0).stroke_width(2.0)",
+		] {
+			let source = format!("workspace.table(\"t\").views([layers([{modified}])])");
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(&source).expect_err("wrong receiver must refuse complete chain")
+			else {
+				panic!("expected attributed compatibility refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], modified);
+		}
+
+		for control in [
+			"workspace.table(\"t\").views([line(\"x\", \"y\")])",
+			"workspace.table(\"t\").views([scatter(\"x\", \"y\").point_size(2.0)])",
+		] {
+			transform(control).expect("established control remains legal");
+		}
+	}
+
+	#[test]
+	fn product_0020_stroke_width_is_ordinary_rune_outside_proven_positions() {
+		let source = r#"
+			let styled = line("x", "y").stroke_width(2.0);
+			consume(line("a", "b").stroke_width(4.0));
+			workspace.table("t").views([table()])
+		"#;
+		let transformed = transform(source).expect("ordinary line methods are retained");
+		assert!(
+			transformed
+				.source
+				.contains("line(\"x\", \"y\").stroke_width(2.0)")
+		);
+		assert!(
+			transformed
+				.source
+				.contains("line(\"a\", \"b\").stroke_width(4.0)")
+		);
+		assert_eq!(transformed.views[0].intent, RuneViewIntent::Table);
+	}
+
+	#[test]
+	fn product_0020_styled_single_line_keeps_structural_presentation() {
+		for source in [
+			"workspace.table(\"t\").views([line(\"x\", \"y\").stroke_width(1.0)])",
+			"workspace.table(\"t\").views([figure([line(\"x\", \"y\").stroke_width(2.0)])])",
+		] {
+			let transformed = transform(source).expect("styled single line");
+			assert_eq!(
+				transformed.views[0].intent.presentation().display_label,
+				"plot.line"
 			);
 		}
 	}
