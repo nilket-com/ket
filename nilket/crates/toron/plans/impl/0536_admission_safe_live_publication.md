@@ -100,11 +100,66 @@ toron lib 1,480 passed; toron `architecture_test` 2,100 passed, zero failed. Wen
 carries a pre-existing red unrelated to this work (`tls-pki` in the nilket root manifest
 plus two descriptor-surface guards), independently reproduced at clean `09a6f29f`.
 
+## Completing the acceptance contract (`310736f8`)
+
+The first two commits delivered the mechanism but did not discharge Acceptance 3 or 4. An
+earlier revision of this receipt moved Acceptance 4 to a Forward section; that was a
+post-hoc weakening of a promoted contract and is withdrawn. Both gates are now met.
+
+**Acceptance 3 — the admission backstop is its own control.** The pre-existing
+zero-dispatch test covers `UndrainableLiveShuffle` and does not discharge the admission
+variant. `LiveComponentExceedsAdmission` now also carries `consumer_stage`, the immediate
+downstream stage that cannot be held resident alongside the producer.
+`adr536_forced_over_cap_live_graph_is_refused_before_any_dispatch` forces a live graph past
+the cap, asserts the typed refusal, verifies the named consumer genuinely consumes the named
+producer, checks requirement and cap, proves an empty work log, then accepts the *same graph*
+at a fitting cap and reaches dispatch.
+
+**Acceptance 4 — the rail distinguishes pacing from a stall.** `StallPersistenceTracker` is
+pure and driven by a caller-supplied elapsed value, so both controls are deterministic
+without a cluster. It replaces cancel-on-first-sample in
+`execute_census_distributed_attempt` under a declared two-second window. Controls: a blocked
+appender whose backlog keeps draining is never stalled across 200 samples; cleared
+backpressure starts a fresh window rather than inheriting an earlier one; an unchanging
+blocked state is progressing at 1,999 ms and stalled at the 2,000 ms boundary; a first
+sample is never a verdict.
+
+**A guard inverted, and reconciled.** ADR 529's shape-based premise refusal is removed.
+It asked whether a drainer *could* exist and abandoned the cell when one did — which is
+what aborted the Phase 0 run. Persistence answers the question directly: a receipt now
+arrives only after the shuffle stood still with an appender blocked throughout the window,
+so whether some consumer was eligible no longer bears on soundness. Eligibility remains on
+the row as a diagnostic. Its board-wide pin was inverted rather than deleted: the former
+"zero live-eligible consumers everywhere" held only because the counter was blind to the
+multi-upstream arm, and is now
+`live_eligible_consumers_are_confined_to_one_board_cell`, pinning the observed set and
+instructing a future reader to re-derive the blast radius rather than relax the pin.
+
+**Blast radius, corrected for scope.** "Exactly one cell" is a property of the sf=8 board
+under this envelope, not of the engine. At sf=0.01 with unbounded admission the set is q04
+and q13, four live-eligible consumer tasks each. Fragment shapes are scale-dependent (ADR
+528 recorded cells rejecting at sf=0.01 and fragmenting at sf=8), and the dependence runs
+both ways. Any restatement of the blast radius must carry board, scale and admission cap
+together.
+
+## Final board (`310736f85fa5`)
+
+Artifact: `target/tpch/adr536_final_census/execution_census.jsonl`. Re-run at the unchanged
+envelope from the sealed final identity, now exercising the persistence-aware classifier:
+**20 `executes_identical`, q11 `executes_divergent`, q15 `execution_rejected`** — the
+predeclared expectation. q04 is `executes_identical` with equal digest and schema
+fingerprint, 5 rows on both arms, 3.29 s. No cell publishes live under this cap, so the new
+classifier is inert here by construction and the mechanism, not the rail, is what admits the
+board.
+
+Gates from the final tree: `fmt` and `fmt --check` clean; `check -p toron -p toron-tpch
+--all-targets` clean; toron lib 1,481 passed; toron `architecture_test` 2,100 passed;
+toron-tpch lib 80 passed; zero failures. Wendelon's pre-existing red is unrelated and
+independently reproduced at clean `09a6f29f`.
+
 ## Forward
 
-The persistence-aware stall classification from Decision 3 is **not** in these commits.
-Until it lands the rail can still cancel on a first blocked-appender sample, so a future
-shape that publishes live would be misclassified; it is unreachable on the current board
-because nothing publishes live, but it remains owed. q11's constant-key HAVING-scalar
-divergence is ADR 537. Whether the multi-upstream live path earns its complexity is a
-question for after ADR 537 and the correctness gate, not for this ADR.
+Nothing from this ADR's acceptance contract remains outstanding. q11's constant-key
+HAVING-scalar divergence is ADR 537. Whether the multi-upstream live path earns its
+complexity is a question for after ADR 537 and the correctness gate — it is a reachability
+and performance question, and nothing here licenses touching ADR 123.
