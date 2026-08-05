@@ -578,3 +578,22 @@ fn product_0021_bar_width_is_render_state_without_bar_layer_admission() {
 		"styleability must not admit bar layering"
 	);
 }
+
+#[test]
+fn product_0022_bar_width_extends_only_the_closed_styled_single_register() {
+	let envelope = std::fs::read_to_string(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rune_relation_envelope.rs"),
+	)
+	.expect("read Rune envelope");
+	assert!(
+		envelope.contains("pub(crate) struct StyledRunePlotSink")
+			&& envelope.contains("\"bar_width\"")
+			&& envelope.contains("BarWidth::new")
+			&& envelope.contains("bar_width.map_or(Override::Inherit, Override::Set)"),
+		"PRODUCT-0022 must use the general styled-single carrier and typed substrate"
+	);
+	assert!(
+		!envelope.contains("HashMap<String, LayerModifier"),
+		"the third setting does not authorize open modifier dispatch"
+	);
+}

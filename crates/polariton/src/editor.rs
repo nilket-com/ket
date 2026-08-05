@@ -1090,6 +1090,28 @@ impl CodeEditor {
 	}
 
 	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_plot_hover(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+		bounds: iced::Rectangle,
+		point: iced::Point,
+	) -> Option<String> {
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let entry = self.panels.panels.get(&panel_id)?;
+		let PanelContent::Plot(plot) = &entry.content else {
+			return None;
+		};
+		let layout = plot.kernel.layout(plot.plot_settings.clone());
+		let transform = crate::plot::common::CoordinateTransformer::new(&layout, bounds);
+		plot.kernel.hover_with_settings(
+			&transform,
+			iced::advanced::mouse::Cursor::Available(point),
+			&plot.plot_settings_model,
+		)
+	}
+
+	#[cfg(all(test, feature = "toron"))]
 	pub(crate) fn rune_view_panel_layout_signature(
 		&self,
 		producer: libaryon::core::BufferId,

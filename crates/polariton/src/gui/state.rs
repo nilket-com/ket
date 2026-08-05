@@ -18,7 +18,7 @@ use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 #[cfg(feature = "toron")]
 use crate::plot::factory::create_layered_plot;
-use crate::plot::factory::create_plot;
+use crate::plot::factory::{create_plot, create_styled_plot};
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
 use crate::plot::spec::AuthoredPlotSpec;
@@ -29,8 +29,8 @@ use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
 	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RuneViewIntent,
-	RuneViewScheduler, SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView,
-	ViewPresentation, transform as transform_rune_view,
+	RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink, TransformedRuneRelation,
+	TransformedRuneView, ViewPresentation, transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -198,6 +198,36 @@ fn build_layered_plot_task(
 			.and_then(|result| result)
 		},
 		on_ready,
+	)
+}
+
+#[cfg(feature = "toron")]
+fn build_styled_plot_task(
+	resolved: ResolvedPlot,
+	layer_settings: crate::plot::spec::LayerSettings,
+	on_ready: impl FnOnce(
+		ResolvedPlot,
+		std::result::Result<
+			std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
+			String,
+		>,
+	) -> Message
+	+ Send
+	+ 'static,
+) -> Task<Message> {
+	Task::perform(
+		async move {
+			let spec = resolved.resolved_spec.clone();
+			let data = resolved.data.as_ref().clone();
+			let kernel = tokio::task::spawn_blocking(move || {
+				create_styled_plot(&spec, &data, layer_settings)
+			})
+			.await
+			.map_err(|error| format!("styled plot build task panicked: {error}"))
+			.and_then(|result| result);
+			(resolved, kernel)
+		},
+		move |(resolved, kernel)| on_ready(resolved, kernel),
 	)
 }
 
@@ -794,12 +824,35 @@ fn rune_view_outcome(
 								RuneRelationSinkOutput::Plot(resolved, authored_settings)
 							})
 						}
-						RunePlotBody::StyledSingle(layer) => {
-							Ok(RuneRelationSinkOutput::LayeredPlot(
+						RunePlotBody::StyledSingle(styled) => match styled.into_layer() {
+							Ok(layer) => Ok(RuneRelationSinkOutput::LayeredPlot(
 								LayeredPlotSpec::new(layer),
 								authored_settings,
-							))
-						}
+							)),
+							Err(styled) => {
+								let StyledRunePlotSink { sink, settings } = styled;
+								let authored_spec = AuthoredPlotSpec::xy_color(
+									sink.composition,
+									sink.x,
+									sink.y,
+									sink.category,
+								);
+								plan(PlotRequest {
+									source: PlotSource::Materialized {
+										name: "workspace relation".to_owned(),
+										data: std::sync::Arc::clone(&result),
+									},
+									authored_spec,
+								})
+								.map(|resolved| {
+									RuneRelationSinkOutput::StyledPlot(
+										resolved,
+										settings,
+										authored_settings,
+									)
+								})
+							}
+						},
 						RunePlotBody::Layered(specification) => Ok(
 							RuneRelationSinkOutput::LayeredPlot(specification, authored_settings),
 						),
@@ -1490,6 +1543,38 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 									},
 								));
 							}
+							Ok(RuneRelationSinkOutput::StyledPlot(
+								resolved,
+								layer_settings,
+								authored_settings,
+							)) => {
+								let presentation = sink.presentation;
+								let span = sink.span;
+								plot_tasks.push(build_styled_plot_task(
+									resolved,
+									layer_settings,
+									move |resolved, result| match result {
+										Ok(kernel) => Message::RuneRelationPlotReady {
+											source_buffer,
+											revision,
+											panel_id,
+											presentation,
+											authored_settings,
+											resolved,
+											kernel,
+										},
+										Err(error) => Message::RuneRelationLayeredPlotReady {
+											source_buffer,
+											revision,
+											panel_id,
+											presentation,
+											authored_settings,
+											span,
+											result: Err(error),
+										},
+									},
+								));
+							}
 							Ok(RuneRelationSinkOutput::LayeredPlot(
 								specification,
 								authored_settings,
@@ -2017,7 +2102,7 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
-	use crate::plot::factory::{create_layered_plot, create_plot};
+	use crate::plot::factory::{create_layered_plot, create_plot, create_styled_plot};
 	#[cfg(feature = "toron")]
 	use crate::plot::{
 		common::{CoordinateTransformer, PlotKernel, ResolvedPlotSettings},
@@ -2114,6 +2199,12 @@ mod tests {
 				crate::plot::request::ResolvedPlot,
 				crate::plot::theme::PlotSettingsLayer,
 			),
+			Styled(
+				crate::rune_relation_envelope::ViewPresentation,
+				crate::plot::request::ResolvedPlot,
+				crate::plot::spec::LayerSettings,
+				crate::plot::theme::PlotSettingsLayer,
+			),
 			Layered(
 				crate::rune_relation_envelope::ViewPresentation,
 				crate::plot::spec::LayeredPlotSpec,
@@ -2141,6 +2232,19 @@ mod tests {
 					ReadyPlot::Single(
 						sink.presentation.clone(),
 						resolved.clone(),
+						authored_settings.clone(),
+					),
+				)),
+				Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
+					resolved,
+					layer_settings,
+					authored_settings,
+				)) => Some((
+					sink.identity.clone(),
+					ReadyPlot::Styled(
+						sink.presentation.clone(),
+						resolved.clone(),
+						layer_settings.clone(),
 						authored_settings.clone(),
 					),
 				)),
@@ -2179,6 +2283,23 @@ mod tests {
 			match plot {
 				ReadyPlot::Single(presentation, resolved, authored_settings) => {
 					let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+					drop(update(
+						state,
+						Message::RuneRelationPlotReady {
+							source_buffer,
+							revision,
+							panel_id,
+							presentation,
+							authored_settings,
+							resolved,
+							kernel,
+						},
+					));
+				}
+				ReadyPlot::Styled(presentation, resolved, layer_settings, authored_settings) => {
+					let kernel =
+						create_styled_plot(&resolved.resolved_spec, &resolved.data, layer_settings)
+							.expect("styled plot kernel");
 					drop(update(
 						state,
 						Message::RuneRelationPlotReady {
@@ -3429,6 +3550,139 @@ workspace.table("t").views([
 				.code_editor
 				.rune_view_panel_display_label(source_buffer, &identity),
 			Some("plot.line")
+		);
+		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0022_bar_width_reaches_the_shared_result_and_real_host_panel() {
+		let frame = polars::df!("cat" => ["A", "B"], "val" => [1.0_f64, 2.0]).expect("bar frame");
+		let positions = transform_rune_view(
+			r#"workspace.table("t").views([
+				bar("cat", "val").bar_width(0.5),
+				figure([title("Narrow bars"), bar("cat", "val").bar_width(0.5)]),
+			])"#,
+		)
+		.expect("direct and figure bar width")
+		.into_relations()
+		.next()
+		.expect("one relation");
+		let outcome = rune_view_outcome(frame.clone(), positions.views);
+		assert_eq!(outcome.sinks.len(), 2);
+		for (index, sink) in outcome.sinks.iter().enumerate() {
+			assert!(Arc::ptr_eq(&outcome.result, &sink.source));
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
+				resolved,
+				settings,
+				authored,
+			)) = &sink.output
+			else {
+				panic!("styled bar must use the standalone styled-plot path")
+			};
+			assert_eq!(
+				resolved.resolved_spec.composition.primary_plot_type(),
+				crate::plot::core::PlotType::Bar
+			);
+			assert_eq!(
+				settings.bar_width,
+				crate::plot::spec::Override::Set(crate::plot::spec::BarWidth::new(0.5).unwrap())
+			);
+			assert_eq!(
+				matches!(authored.title, crate::plot::spec::Presence::Show(_)),
+				index == 1
+			);
+		}
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(86);
+		let identity = LocalViewIdentity::Named("bars".to_owned());
+		let sources = [
+			"workspace.table(\"t\").views([view(\"bars\", bar(\"cat\", \"val\"))])",
+			"workspace.table(\"t\").views([view(\"bars\", bar(\"cat\", \"val\").bar_width(0.9))])",
+			"workspace.table(\"t\").views([view(\"bars\", bar(\"cat\", \"val\").bar_width(0.5))])",
+		];
+		let mut panel = None;
+		let mut svgs = Vec::new();
+		for (offset, source) in sources.into_iter().enumerate() {
+			let revision = offset as u64 + 1;
+			let program = transform_rune_view(source).expect("bar-width lifecycle revision");
+			let presentation = program
+				.presentation_views()
+				.into_iter()
+				.map(|view| (view.identity.clone(), view.intent.presentation()))
+				.collect::<Vec<_>>();
+			assert_eq!(presentation[0].0, identity);
+			assert_eq!(presentation[0].1.display_label, "plot.bar");
+			state.rune_buffer_revisions.insert(source_buffer, revision);
+			state
+				.code_editor
+				.prepare_rune_view_panels(source_buffer, &presentation, revision);
+			let current = state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity)
+				.expect("stable bar panel");
+			if let Some(first) = panel {
+				assert_eq!(current, first, "bar width is not view identity");
+			} else {
+				panel = Some(current);
+			}
+			assert!(
+				state
+					.rune_view_scheduler
+					.submit(PendingRuneView {
+						source_buffer,
+						revision,
+						view: program.clone(),
+					})
+					.is_some()
+			);
+			complete_relation_in_head(
+				&mut state,
+				source_buffer,
+				revision,
+				program.into_relations().next().expect("one relation"),
+				frame.clone(),
+			);
+			svgs.push(
+				state
+					.code_editor
+					.rune_view_panel_plot_svg(source_buffer, &identity)
+					.expect("completed bar canvas"),
+			);
+		}
+		assert_eq!(svgs[0], svgs[1], "0.9 must preserve the bare bar");
+		assert_ne!(svgs[1], svgs[2], "0.5 must visibly narrow the bars");
+		let bounds = iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 100.0));
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_plot_hover(
+					source_buffer,
+					&identity,
+					bounds,
+					iced::Point::new(20.0, 75.0),
+				)
+				.is_some()
+		);
+		assert_eq!(
+			state.code_editor.rune_view_panel_plot_hover(
+				source_buffer,
+				&identity,
+				bounds,
+				iced::Point::new(10.0, 75.0),
+			),
+			None
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_display_label(source_buffer, &identity),
+			Some("plot.bar")
 		);
 		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
 		assert!(state.dashboard.panes.is_none());

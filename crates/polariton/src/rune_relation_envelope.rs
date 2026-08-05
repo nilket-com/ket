@@ -9,7 +9,7 @@
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
-	LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize, Presence,
+	BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize, Presence,
 	StrokeWidth,
 };
 use crate::plot::theme::PlotSettingsLayer;
@@ -38,8 +38,28 @@ pub(crate) struct RunePlotIntent {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum RunePlotBody {
 	Single(DisposableRunePlotSink),
-	StyledSingle(LayerSpec),
+	StyledSingle(StyledRunePlotSink),
 	Layered(LayeredPlotSpec),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct StyledRunePlotSink {
+	pub(crate) sink: DisposableRunePlotSink,
+	pub(crate) settings: LayerSettings,
+}
+
+impl StyledRunePlotSink {
+	pub(crate) fn into_layer(self) -> Result<LayerSpec, Self> {
+		let mark = match self.sink.composition.primary_plot_type() {
+			PlotType::Line => LayerMark::Line,
+			PlotType::Scatter => LayerMark::Scatter,
+			PlotType::Bar => return Err(self),
+			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
+		};
+		let mut layer = LayerSpec::xy(mark, self.sink.x, self.sink.y);
+		layer.settings = self.settings;
+		Ok(layer)
+	}
 }
 
 impl RunePlotIntent {
@@ -111,10 +131,16 @@ impl RuneViewIntent {
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
 					},
-					RunePlotBody::StyledSingle(layer) => match layer.mark {
-						LayerMark::Line => "plot.line".to_owned(),
-						LayerMark::Scatter => "plot.scatter".to_owned(),
-					},
+					RunePlotBody::StyledSingle(styled) => {
+						match styled.sink.composition.primary_plot_type() {
+							PlotType::Bar => "plot.bar".to_owned(),
+							PlotType::Line => "plot.line".to_owned(),
+							PlotType::Scatter => "plot.scatter".to_owned(),
+							other => {
+								unreachable!("styled sink admitted unexpected plot type {other:?}")
+							}
+						}
+					}
 					RunePlotBody::Layered(plot) => plot.title(),
 				};
 				ViewPresentation {
@@ -1275,8 +1301,15 @@ fn parse_layer_list(
 }
 
 fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEnvelopeError> {
-	if let Some(layer) = parse_modified_mark(expression, source)? {
-		return Ok(layer);
+	if let Some(styled) = parse_modified_mark(expression, source)? {
+		return match styled.into_layer() {
+			Ok(layer) => Ok(layer),
+			Err(_) => invalid_view(
+				expression.span(),
+				source.len(),
+				"bar(...) is a view sink, not a shared-Cartesian layer",
+			),
+		};
 	}
 	let ast::Expr::Call(call) = expression else {
 		return invalid_view(
@@ -1342,12 +1375,12 @@ fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEn
 }
 
 /// PRODUCT-0018's closed postfix LayerModifier register. A successful parse
-/// flattens the complete chain directly into one typed `LayerSpec`; no method
-/// node survives into the Rune execution or plot normal form.
+/// flattens the complete chain directly into one styled standalone sink; no
+/// method node survives into Rune execution or the plot normal form.
 fn parse_modified_mark(
 	expression: &ast::Expr,
 	source: &str,
-) -> Result<Option<LayerSpec>, RuneEnvelopeError> {
+) -> Result<Option<StyledRunePlotSink>, RuneEnvelopeError> {
 	let ast::Expr::Call(outer_call) = expression else {
 		return Ok(None);
 	};
@@ -1358,12 +1391,13 @@ fn parse_modified_mark(
 	let mut current = expression;
 	let mut point_size = None;
 	let mut stroke_width = None;
+	let mut bar_width = None;
 	loop {
 		let ast::Expr::Call(call) = current else {
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"a layer modifier must follow a line(...) or scatter(...) mark",
+				"a layer modifier must follow a bar(...), line(...), or scatter(...) mark",
 			);
 		};
 		let ast::Expr::FieldAccess(field) = call.expr.as_ref() else {
@@ -1411,12 +1445,32 @@ fn parse_modified_mark(
 					}
 				})?);
 			}
+			"bar_width" => {
+				if bar_width.is_some() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"bar_width(...) may appear at most once on a mark",
+					);
+				}
+				let fraction = parse_layer_modifier_factor(call, expression, source, "bar_width")?;
+				let modifier_span = u32_range(
+					&byte_range(expression.span(), source.len())?,
+					"bar-width modifier",
+				)?;
+				bar_width = Some(BarWidth::new(fraction).map_err(|error| {
+					RuneEnvelopeError::InvalidView {
+						span: modifier_span,
+						message: error.to_string(),
+					}
+				})?);
+			}
 			_ => {
 				return invalid_view(
 					expression.span(),
 					source.len(),
 					format!(
-						"unknown layer modifier {modifier:?}; expected point_size(number) or stroke_width(number)"
+						"unknown layer modifier {modifier:?}; expected point_size(number), stroke_width(number), or bar_width(number)"
 					),
 				);
 			}
@@ -1428,19 +1482,20 @@ fn parse_modified_mark(
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"a layer modifier must follow a line(...) or scatter(...) mark",
+			"a layer modifier must follow a bar(...), line(...), or scatter(...) mark",
 		);
 	};
 	let callee = source_slice(source, root.expr.span())?.trim();
 	let args = root.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	let mark = match callee {
-		"line" => LayerMark::Line,
-		"scatter" => LayerMark::Scatter,
+	let plot_type = match callee {
+		"bar" => PlotType::Bar,
+		"line" => PlotType::Line,
+		"scatter" => PlotType::Scatter,
 		_ => {
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"a layer modifier must follow a line(...) or scatter(...) mark",
+				"a layer modifier must follow a bar(...), line(...), or scatter(...) mark",
 			);
 		}
 	};
@@ -1451,19 +1506,33 @@ fn parse_modified_mark(
 			"a modified mark takes exactly x and y string fields; category color is not a Layer setting",
 		);
 	}
-	match mark {
-		LayerMark::Line if point_size.is_some() => {
+	match plot_type {
+		PlotType::Line if point_size.is_some() => {
 			return invalid_view(
 				expression.span(),
 				source.len(),
 				"point_size(...) is available on scatter marks, not line marks",
 			);
 		}
-		LayerMark::Scatter if stroke_width.is_some() => {
+		PlotType::Scatter if stroke_width.is_some() => {
 			return invalid_view(
 				expression.span(),
 				source.len(),
 				"stroke_width(...) is available on line marks, not scatter marks",
+			);
+		}
+		PlotType::Bar if point_size.is_some() || stroke_width.is_some() => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"point_size(...) and stroke_width(...) are not available on bar marks",
+			);
+		}
+		PlotType::Line | PlotType::Scatter if bar_width.is_some() => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"bar_width(...) is available on bar marks, not line or scatter marks",
 			);
 		}
 		_ => {}
@@ -1480,13 +1549,19 @@ fn parse_modified_mark(
 		};
 		fields.push(value);
 	}
-	let mut layer = LayerSpec::xy(mark, fields[0].clone(), fields[1].clone());
-	layer.settings = LayerSettings {
-		point_size: point_size.map_or(Override::Inherit, Override::Set),
-		stroke_width: stroke_width.map_or(Override::Inherit, Override::Set),
-		bar_width: Override::Inherit,
-	};
-	Ok(Some(layer))
+	Ok(Some(StyledRunePlotSink {
+		sink: DisposableRunePlotSink {
+			composition: PlotComposition::single(plot_type),
+			x: fields[0].clone(),
+			y: fields[1].clone(),
+			category: None,
+		},
+		settings: LayerSettings {
+			point_size: point_size.map_or(Override::Inherit, Override::Set),
+			stroke_width: stroke_width.map_or(Override::Inherit, Override::Set),
+			bar_width: bar_width.map_or(Override::Inherit, Override::Set),
+		},
+	}))
 }
 
 fn parse_layer_modifier_factor(
@@ -2804,7 +2879,10 @@ workspace.table("t").views([table()])
 			panic!("point-sized scatter must be a plot")
 		};
 		match &plot.body {
-			RunePlotBody::StyledSingle(layer) => layer.clone(),
+			RunePlotBody::StyledSingle(styled) => styled
+				.clone()
+				.into_layer()
+				.expect("point-sized scatter remains layer-composable"),
 			RunePlotBody::Layered(specification) => specification
 				.layers
 				.iter()
@@ -2947,7 +3025,10 @@ workspace.table("t").views([table()])
 			panic!("stroke-width line must be a plot")
 		};
 		match &plot.body {
-			RunePlotBody::StyledSingle(layer) => layer.clone(),
+			RunePlotBody::StyledSingle(styled) => styled
+				.clone()
+				.into_layer()
+				.expect("stroke-width line remains layer-composable"),
 			RunePlotBody::Layered(specification) => specification
 				.layers
 				.iter()
@@ -3080,6 +3161,114 @@ workspace.table("t").views([table()])
 				"plot.line"
 			);
 		}
+	}
+
+	fn product_0022_only_bar(source: &str) -> StyledRunePlotSink {
+		let transformed = transform(source).expect("bar-width envelope");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("bar-width sink must be a plot")
+		};
+		let RunePlotBody::StyledSingle(styled) = &plot.body else {
+			panic!("bar width must use the styled-single carrier")
+		};
+		styled.clone()
+	}
+
+	#[test]
+	fn product_0022_bar_width_flattens_in_direct_and_figure_positions() {
+		for source in [
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\").bar_width(0.5)])",
+			"workspace.table(\"t\").views([figure([title(\"Narrow\"), bar(\"cat\", \"val\").bar_width(0.5)])])",
+		] {
+			let styled = product_0022_only_bar(source);
+			assert_eq!(styled.sink.composition.primary_plot_type(), PlotType::Bar);
+			assert_eq!(styled.sink.x, "cat");
+			assert_eq!(styled.sink.y, "val");
+			assert_eq!(styled.sink.category, None);
+			assert_eq!(styled.settings.point_size, Override::Inherit);
+			assert_eq!(styled.settings.stroke_width, Override::Inherit);
+			assert_eq!(
+				styled.settings.bar_width,
+				Override::Set(BarWidth::new(0.5).unwrap())
+			);
+		}
+	}
+
+	#[test]
+	fn product_0022_bar_width_uses_substrate_bounds_and_atomic_refusals() {
+		for fraction in ["0.000001", "0.5", "0.9", "1.0"] {
+			let source = format!(
+				"workspace.table(\"t\").views([bar(\"cat\", \"val\").bar_width({fraction})])"
+			);
+			let styled = product_0022_only_bar(&source);
+			let Override::Set(width) = styled.settings.bar_width else {
+				panic!("accepted bar width must be set")
+			};
+			assert_eq!(width.fraction(), fraction.parse::<f32>().unwrap());
+		}
+
+		for rejected in [
+			"bar_width()",
+			"bar_width(0.5, 0.6)",
+			"bar_width(width)",
+			"bar_width(0.25 + 0.25)",
+			"bar_width(-0.1)",
+			"bar_width(0.0)",
+			"bar_width(1.01)",
+			"bar_width(0.5).bar_width(0.6)",
+			"opacity(0.5)",
+		] {
+			let source =
+				format!("workspace.table(\"t\").views([bar(\"cat\", \"val\").{rejected}])");
+			assert!(transform(&source).is_err(), "accepted {rejected}");
+		}
+	}
+
+	#[test]
+	fn product_0022_receiver_rules_keep_bar_out_of_ordered_layers() {
+		for rejected in [
+			"line(\"x\", \"y\").bar_width(0.5)",
+			"scatter(\"x\", \"y\").bar_width(0.5)",
+			"bar(\"cat\", \"val\").point_size(2.0)",
+			"bar(\"cat\", \"val\").stroke_width(2.0)",
+			"bar(\"cat\", \"val\").bar_width(0.5).point_size(2.0)",
+			"bar(\"cat\", \"val\").stroke_width(2.0).bar_width(0.5)",
+		] {
+			let source = format!("workspace.table(\"t\").views([{rejected}])");
+			assert!(transform(&source).is_err(), "accepted {rejected}");
+		}
+
+		let layered =
+			"workspace.table(\"t\").views([layers([bar(\"cat\", \"val\").bar_width(0.5)])])";
+		let error = transform(layered).expect_err("bar remains outside LayerMark");
+		assert!(error.to_string().contains("not a shared-Cartesian layer"));
+
+		for control in [
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\")])",
+			"workspace.table(\"t\").views([layers([line(\"x\", \"y\").stroke_width(2.0), scatter(\"x\", \"y\").point_size(2.0)])])",
+		] {
+			assert!(transform(control).is_ok(), "rejected control {control}");
+		}
+	}
+
+	#[test]
+	fn product_0022_bar_width_is_ordinary_rune_outside_proven_positions() {
+		let source = r#"
+let styled = bar("cat", "val").bar_width(0.5);
+consume(bar("a", "b").bar_width(0.7));
+workspace.table("t").views([table()])
+"#;
+		let transformed = transform(source).expect("unproven modifiers remain Rune");
+		assert!(
+			transformed
+				.source
+				.contains("bar(\"cat\", \"val\").bar_width(0.5)")
+		);
+		assert!(
+			transformed
+				.source
+				.contains("bar(\"a\", \"b\").bar_width(0.7)")
+		);
 	}
 
 	#[test]

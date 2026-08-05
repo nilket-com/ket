@@ -8,7 +8,7 @@ use crate::gui::dashboard::DashboardMsg;
 use crate::plot::common::PlotKernel;
 use crate::plot::request::ResolvedPlot;
 #[cfg(feature = "toron")]
-use crate::plot::spec::LayeredPlotSpec;
+use crate::plot::spec::{LayerSettings, LayeredPlotSpec};
 #[cfg(feature = "toron")]
 use crate::plot::theme::PlotSettingsLayer;
 use crate::result_registry::PendingPublication;
@@ -188,6 +188,7 @@ pub struct RuneRelationSinkOutcome {
 pub enum RuneRelationSinkOutput {
 	Table,
 	Plot(ResolvedPlot, PlotSettingsLayer),
+	StyledPlot(ResolvedPlot, LayerSettings, PlotSettingsLayer),
 	LayeredPlot(LayeredPlotSpec, PlotSettingsLayer),
 }
 
