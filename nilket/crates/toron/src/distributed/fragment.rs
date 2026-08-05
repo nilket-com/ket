@@ -132,6 +132,14 @@ pub enum FragmentError {
 		producer_stage: StageId,
 		consumer_stage: Option<StageId>,
 	},
+	#[error(
+		"live shuffle component containing producer stage {producer_stage:?} needs {residency_requirement} concurrently resident tasks but admission allows {max_in_flight_tasks}"
+	)]
+	LiveComponentExceedsAdmission {
+		producer_stage: StageId,
+		residency_requirement: usize,
+		max_in_flight_tasks: usize,
+	},
 }
 
 const FRAGMENT_ID_NAMESPACE_STRIDE: u32 = 1_000_000;
@@ -254,18 +262,19 @@ pub fn fragment_plan(
 	}
 
 	let mut allocator = FragmentIdAllocator::new(config.id_namespace)?;
+	let max_in_flight_tasks = config.max_in_flight_tasks;
 	let (mut stages, _) = fragment_execution_plan(
 		plan,
 		FragmentTerminalOutput::FinalResult,
 		&mut allocator,
 		config,
 	)?;
-	resolve_shuffle_publish_modes(&mut stages);
-	validate_shuffle_publish_modes(&stages)?;
+	resolve_shuffle_publish_modes(&mut stages, max_in_flight_tasks);
+	validate_shuffle_publish_modes(&stages, max_in_flight_tasks)?;
 	Ok(stages)
 }
 
-fn resolve_shuffle_publish_modes(stages: &mut [StagePlan]) {
+fn resolve_shuffle_publish_modes(stages: &mut [StagePlan], max_in_flight_tasks: Option<usize>) {
 	let mut live_stage_ids = stages
 		.iter()
 		.filter(|stage| producer_stage_supports_live(stage.stage_id, stages))
@@ -277,6 +286,32 @@ fn resolve_shuffle_publish_modes(stages: &mut [StagePlan]) {
 		live_stage_ids.retain(|stage_id| producer_can_publish_live(*stage_id, stages, &candidates));
 		if live_stage_ids.len() == before {
 			break;
+		}
+	}
+
+	// A live producer holds its scheduler slot until it seals, so every task of every
+	// stage reachable across live edges must be resident at once for the component to
+	// drain. When that exceeds what admission will host, the component cannot be live at
+	// any cost — demote it and re-run the fixpoint, since demoting one component can make
+	// a neighbouring multi-upstream consumer ineligible in turn.
+	if let Some(limit) = max_in_flight_tasks {
+		loop {
+			let over_cap = live_candidate_components(&live_stage_ids, stages)
+				.into_iter()
+				.find(|component| component_residency(component, stages) > limit);
+			let Some(component) = over_cap else {
+				break;
+			};
+			live_stage_ids.retain(|stage_id| !component.contains(stage_id));
+			loop {
+				let before = live_stage_ids.len();
+				let candidates = live_stage_ids.clone();
+				live_stage_ids
+					.retain(|stage_id| producer_can_publish_live(*stage_id, stages, &candidates));
+				if live_stage_ids.len() == before {
+					break;
+				}
+			}
 		}
 	}
 
@@ -296,6 +331,55 @@ fn resolve_shuffle_publish_modes(stages: &mut [StagePlan]) {
 			}
 		}
 	}
+}
+
+/// Tasks that must be resident together for a component to drain.
+pub(crate) fn component_residency(component: &BTreeSet<StageId>, stages: &[StagePlan]) -> usize {
+	stages
+		.iter()
+		.filter(|stage| component.contains(&stage.stage_id))
+		.map(|stage| stage.tasks.len())
+		.sum()
+}
+
+/// Stage sets joined by candidate-live shuffle edges. A candidate live producer and every
+/// stage that would drain it concurrently share one residency budget; components that
+/// overlap are one budget, not two.
+pub(crate) fn live_candidate_components(
+	live_stage_ids: &BTreeSet<StageId>,
+	stages: &[StagePlan],
+) -> Vec<BTreeSet<StageId>> {
+	let mut components: Vec<BTreeSet<StageId>> = Vec::new();
+	for producer_stage_id in live_stage_ids {
+		let mut component = BTreeSet::from([*producer_stage_id]);
+		let mut frontier = vec![*producer_stage_id];
+		while let Some(stage_id) = frontier.pop() {
+			for consumer in stages
+				.iter()
+				.filter(|stage| stage.upstream_stages.contains(&stage_id))
+			{
+				if !component.insert(consumer.stage_id) {
+					continue;
+				}
+				if live_stage_ids.contains(&consumer.stage_id) {
+					frontier.push(consumer.stage_id);
+				}
+			}
+		}
+		components.push(component);
+	}
+
+	let mut merged: Vec<BTreeSet<StageId>> = Vec::new();
+	for component in components {
+		match merged
+			.iter_mut()
+			.find(|existing| !existing.is_disjoint(&component))
+		{
+			Some(existing) => existing.extend(component),
+			None => merged.push(component),
+		}
+	}
+	merged
 }
 
 fn producer_can_publish_live(
@@ -329,7 +413,51 @@ fn task_consumes_stage(task: &TaskPlan, producer_stage_id: StageId) -> bool {
 	})
 }
 
-pub(crate) fn validate_shuffle_publish_modes(stages: &[StagePlan]) -> Result<(), FragmentError> {
+pub(crate) fn validate_shuffle_publish_modes(
+	stages: &[StagePlan],
+	max_in_flight_tasks: Option<usize>,
+) -> Result<(), FragmentError> {
+	// Same admission predicate the resolver uses, so the two cannot disagree. The resolver
+	// never produces an over-cap live component; a graph that arrives with one — through
+	// deserialization or a future caller — is refused here, before any task dispatches.
+	if let Some(limit) = max_in_flight_tasks {
+		let live_stage_ids = stages
+			.iter()
+			.filter(|stage| {
+				stage.tasks.iter().any(|task| {
+					matches!(
+						task.spec.output,
+						TaskOutputBinding::ShuffleProducer {
+							publish_mode: ShufflePublishMode::Live,
+							..
+						}
+					)
+				})
+			})
+			.map(|stage| stage.stage_id)
+			.collect::<BTreeSet<_>>();
+		for component in live_candidate_components(&live_stage_ids, stages) {
+			let residency_requirement = component_residency(&component, stages);
+			if residency_requirement <= limit {
+				continue;
+			}
+			// Components are grown from the live set, so a live producer is present by
+			// construction; if none is, there is no live publication to refuse.
+			let Some(producer_stage) = component
+				.iter()
+				.find(|stage_id| live_stage_ids.contains(stage_id))
+				.copied()
+			else {
+				continue;
+			};
+			return Err(FragmentError::LiveComponentExceedsAdmission {
+				producer_stage,
+				residency_requirement,
+				max_in_flight_tasks: limit,
+			});
+		}
+	}
+
 	for producer_stage in stages {
 		let publishes_live = producer_stage.tasks.iter().any(|task| {
 			matches!(
@@ -2153,6 +2281,55 @@ mod tests {
 	}
 
 	#[test]
+	fn adr536_admission_cap_decides_live_versus_sealed_for_the_same_graph() {
+		use crate::distributed::scheduler::live_publication_report;
+
+		let build = || {
+			join_plan_with_kind(
+				exchanged_scan(TableId(1), 2),
+				exchanged_scan(TableId(2), 2),
+				JoinStrategy::HashPartitioned,
+				JoinKind::LeftSemi,
+			)
+		};
+
+		let unbounded = fragment_plan(build(), config()).expect("fragment semi join");
+		let unbounded_report = live_publication_report(&unbounded, None);
+		let residency = unbounded_report.live_residency_requirement;
+		assert!(
+			unbounded_report.live_producer_stages.len() > 0,
+			"this shape must publish live when admission is unbounded, or it cannot \
+			 discriminate the cap boundary; widths {:?} upstreams {:?}",
+			unbounded
+				.iter()
+				.map(|stage| stage.tasks.len())
+				.collect::<Vec<_>>(),
+			unbounded_report.stage_upstreams
+		);
+
+		let fitting = fragment_plan(build(), config().with_max_in_flight_tasks(Some(residency)))
+			.expect("fragment at a fitting cap");
+		assert_eq!(
+			live_publication_report(&fitting, Some(residency)).live_residency_requirement,
+			residency,
+			"a cap that exactly fits the component keeps it live"
+		);
+
+		let starved = fragment_plan(
+			build(),
+			config().with_max_in_flight_tasks(Some(residency - 1)),
+		)
+		.expect("fragment at a starved cap");
+		let starved_report = live_publication_report(&starved, Some(residency - 1));
+		assert_eq!(
+			starved_report.live_producer_stages.len(),
+			0,
+			"a cap below the residency requirement must resolve the component sealed"
+		);
+		assert_eq!(starved_report.live_residency_requirement, 0);
+	}
+
+	#[test]
 	fn adr536_live_report_counts_multi_upstream_consumers_and_sizes_residency() {
 		use crate::distributed::scheduler::live_publication_report;
 
@@ -2173,6 +2350,19 @@ mod tests {
 			vec![StageId::new(0), StageId::new(1)],
 			"stage 2 is the multi-upstream consumer"
 		);
+
+		// Negative control, same graph: as resolved every producer is sealed, so nothing
+		// is live-eligible. Eligibility must follow the producer's actual publication
+		// mode, not the consumer's shape alone — otherwise a sealed unary path would arm
+		// the global stall premise it has nothing to do with.
+		let sealed = live_publication_report(&stages, Some(4));
+		assert_eq!(sealed.live_producer_stages.len(), 0);
+		assert_eq!(
+			sealed.live_eligible_consumer_tasks, 0,
+			"a consumer reading sealed producers drains nothing concurrently"
+		);
+		assert_eq!(sealed.live_residency_requirement, 0);
+		assert!(!sealed.residency_exceeds_admission);
 		for stage_index in [0, 1] {
 			let TaskOutputBinding::ShuffleProducer { publish_mode, .. } =
 				&mut stages[stage_index].tasks[0].spec.output
@@ -2232,7 +2422,7 @@ mod tests {
 		*publish_mode = ShufflePublishMode::Live;
 
 		let mut dispatch_log = Vec::new();
-		let result = validate_shuffle_publish_modes(&stages);
+		let result = validate_shuffle_publish_modes(&stages, None);
 		if result.is_ok() {
 			dispatch_log.push(stages[0].tasks[0].spec.identity);
 		}
@@ -2252,7 +2442,7 @@ mod tests {
 			panic!("producer output");
 		};
 		*publish_mode = ShufflePublishMode::Sealed;
-		validate_shuffle_publish_modes(&stages).expect("sealed correction is drainable");
+		validate_shuffle_publish_modes(&stages, None).expect("sealed correction is drainable");
 		dispatch_log.push(stages[0].tasks[0].spec.identity);
 		assert_eq!(
 			dispatch_log.len(),

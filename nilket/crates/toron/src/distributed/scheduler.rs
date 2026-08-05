@@ -1162,7 +1162,15 @@ pub fn live_publication_report(
 				.inputs
 				.iter()
 				.any(|input| matches!(input, TaskInputBinding::ShuffleConsumer { .. }));
-			if !consumes_shuffle || !consumer_supports_live_inputs(stage, task, stages) {
+			// Eligibility means consuming a producer that is actually publishing live, not
+			// merely having a shape that could support one. A unary consumer reading a
+			// sealed producer drains nothing concurrently and must not arm the stall
+			// premise. The multi-upstream arm already requires this of every upstream; the
+			// unary arm tests only the consumer's own shape, so it is checked here.
+			if !consumes_shuffle
+				|| !consumer_supports_live_inputs(stage, task, stages)
+				|| !task_consumes_only_live_publishing_producers(task, stages)
+			{
 				continue;
 			}
 			live_eligible_consumer_tasks += 1;
@@ -1196,6 +1204,19 @@ pub fn live_publication_report(
 		max_in_flight_tasks,
 		residency_exceeds_admission,
 	}
+}
+
+/// Every shuffle input of this task is served by a stage that is actually publishing live.
+fn task_consumes_only_live_publishing_producers(task: &TaskPlan, stages: &[StagePlan]) -> bool {
+	task.spec.inputs.iter().all(|input| match input {
+		TaskInputBinding::ShuffleConsumer {
+			producer_stage_id, ..
+		} => stages
+			.iter()
+			.find(|stage| stage.stage_id == *producer_stage_id)
+			.is_some_and(stage_publishes_live),
+		TaskInputBinding::Scan { .. } => true,
+	})
 }
 
 fn stage_publishes_live(stage: &StagePlan) -> bool {

@@ -63,25 +63,56 @@ synchronously by the existing typed `FragmentError::UndrainableLiveShuffle` path
 the producer stage, the blocking consumer stage, the requirement, and the cap. Refusal
 happens before the first task dispatch, never as a statement timeout.
 
-**3. The census rail learns to see what it measures.** Three corrections, each independently
-testable:
+**3. The census rail learns to see what it measures.** Three corrections, and the first two
+are **ordered, not parallel** — Phase 0 proved the dependency by landing the first alone:
 
-- the eligibility receipt counts every task the scheduler would treat as live-eligible,
-  including ADR 123 multi-upstream consumers, by consuming the scheduler's predicate rather
-  than re-deriving a second, narrower one;
-- stall classification requires evidence of non-progress, not a single blocked-appender
-  sample: a blocked appender that persists across an observation window during which no task
-  completes, no manifest is accepted, and no live chunk is released. A transient receipt in a
-  progressing query is healthy and must not be classified or cancelled;
-- rows gain the facts this census could not report: per-stage publication mode, upstream
-  stage edges, live-eligibility per task, and the residency requirement against the cap.
+1. **Corrected eligibility exposes the honest refusal.** The receipt counts every task the
+   scheduler would treat as live-eligible, including multi-upstream consumers, by consuming
+   the scheduler's predicate rather than re-deriving a narrower one. Live-eligible means
+   *consuming an actually live producer* — not merely being a unary consumer whose shape
+   could support one. A unary consumer reading a sealed producer is not live-eligible and
+   must not arm the global stall premise; a sealed-unary negative control pins that, so an
+   unrelated sealed path can never trip the guard.
+2. **Persistence-aware classification restores a total board.** With (1) alone the ADR 529
+   premise guard fires on q04 and returns a harness error, which aborts the whole run — the
+   Phase 0 census measured only q01-q03 before stopping. Classification must therefore
+   require evidence of non-progress rather than a single blocked-appender sample: a blocked
+   appender persisting across an observation window in which no task completes, no manifest
+   is accepted, and no live chunk is released. A transient receipt in a progressing query is
+   healthy and must be neither classified nor cancelled.
+3. Rows gain the facts the previous census could not report: per-stage publication mode,
+   upstream stage edges, live-eligibility per task, and the residency requirement against
+   the cap.
 
-**Phase 0 — blast radius, before the mechanism lands.** The current artifact stores stage
-task widths but not edges, publication modes, or eligibility, so which cells run an ADR 123
-consumer is not knowable from it and width-only inference would be speculation. Emit the new
-fields first and enumerate the 123-shaped cells across all 22. That set is what makes the
-post-fix board predictable rather than hopeful; if it is larger than expected, the mode
-changes in Decision 1 are re-scoped before implementation.
+That the ADR 529 guard had never fired before is not evidence it was unnecessary. It was
+unreachable by construction: with the narrower counter reading zero for every multi-upstream
+shape, its refusal branch could not be entered.
+
+**Phase 0 — blast radius, before the mechanism lands. Complete, `afedc51c`, sf=8.**
+
+The evidence is **21 execution-census rows plus q04's fragment-rail and refusal evidence** —
+not a 22-row execution artifact. q04 emits no execution row at all: with corrected
+eligibility the premise guard refuses it, reporting 4 live-eligible consumer tasks. Its
+shape is established from the fragment rail, which classifies it `fragments_parallel` at
+widths `1,1,4,4,1` with the same 4 live-eligible consumer tasks, and from the discriminating
+controls.
+
+Across the 21 rows, **every cell reports zero live producer stages, zero live-eligible
+consumer tasks and residency zero**: the board resolves sealed throughout. q04 is the sole
+cell exercising multi-upstream live publication. The board is unchanged at 19
+`executes_identical`, q11 `executes_divergent`, q15 `execution_rejected`, as expected from a
+phase that altered no behavior.
+
+This retires the risk this ADR was most worried about. Tightening resolution cannot re-seal
+the ten cells ADR 535 cleared, because none of them publish live. Decision 1 moves
+publication mode for q04 and for nothing else on this workload.
+
+It does not license any change to ADR 123. That the multi-upstream live path is rare *in
+TPC-H* is a reachability and performance observation, not a correctness argument against a
+general scheduler capability: the path is correct and useful whenever admission fits, which
+the cap-6 control demonstrates directly. The defect is selecting it when admission does not
+fit, which is precisely what this ADR repairs. Whether the capability earns its complexity
+is a later question, after ADR 537 and the correctness gate.
 
 ## Acceptance
 

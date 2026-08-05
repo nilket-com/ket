@@ -4872,6 +4872,9 @@ pub fn classify_fragment_error(error: &FragmentError) -> &'static str {
 		| FragmentError::CreateTableAsSelectNotFragmentable => "fragment_coordinator_only_operation",
 		FragmentError::FragmentIdNamespaceOverflow { .. } => "fragment_id_namespace_overflow",
 		FragmentError::UndrainableLiveShuffle { .. } => "fragment_undrainable_live_shuffle",
+		FragmentError::LiveComponentExceedsAdmission { .. } => {
+			"fragment_live_component_exceeds_admission"
+		}
 	}
 }
 
