@@ -490,3 +490,20 @@ fn product_0010_relation_views_complete_without_dashboard_routing() {
 		"positive control: dashboard-routing assay must observe the old path"
 	);
 }
+
+#[test]
+fn product_0017_point_size_is_render_state_without_a_rune_surface() {
+	let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let scatter = std::fs::read_to_string(source.join("plot/kernels/scatter.rs"))
+		.expect("read scatter kernel");
+	assert!(
+		!scatter.contains("point_size_px"),
+		"point size must not return to ScatterPreparedData or preparation arguments"
+	);
+	let envelope = std::fs::read_to_string(source.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	assert!(
+		!envelope.contains("point_size"),
+		"PRODUCT-0017 must add no Rune spelling before PRODUCT-0018"
+	);
+}

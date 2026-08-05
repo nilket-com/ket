@@ -623,4 +623,27 @@ mod product_0013_baseline_tests {
 			Some("X: 1, Y: 2".to_owned())
 		);
 	}
+
+	#[test]
+	fn product_0017_point_size_does_not_acquire_guide_behavior() {
+		let kernel = create_layered_plot(
+			&LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Scatter, "x", "y")),
+			&fixture(),
+			100,
+			100,
+		)
+		.expect("scatter kernel");
+		let render = |point_size| {
+			let mut backend = SvgBackend::new(100.0, 100.0);
+			let mut settings = ResolvedPlotSettings::default();
+			settings.point_size = PointSize::new(point_size).unwrap();
+			kernel.draw_legend(
+				&mut backend,
+				Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+				settings,
+			);
+			backend.finish()
+		};
+		assert_eq!(render(1.0), render(2.0));
+	}
 }

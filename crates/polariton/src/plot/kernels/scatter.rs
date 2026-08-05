@@ -41,6 +41,7 @@ struct ScatterRasterCache {
 struct ScatterRasterKey {
 	width: u32,
 	height: u32,
+	point_size: u32,
 	x_range: (u64, u64),
 	y_range: (u64, u64),
 	background: [u8; 4],
@@ -305,6 +306,7 @@ impl ScatterMarkRenderer {
 		let key = ScatterRasterKey {
 			width,
 			height,
+			point_size: settings.point_size.factor().to_bits(),
 			x_range: current_x_range_bits(transform),
 			y_range: current_y_range_bits(transform),
 			background: color_to_rgba8(settings.background_color),
@@ -472,21 +474,34 @@ fn build_raster_rgba(
 	let width = bounds.width.max(1.0).ceil() as usize;
 	let height = bounds.height.max(1.0).ceil() as usize;
 	let mut accum = vec![[0.0_f32; 4]; width * height];
+	let radius = settings.point_size.radius_px();
+	let radius_squared = radius * radius;
 
 	for series in &prepared_data.series {
 		let color = series_color(series, settings);
 		series.for_each_point(|x, y| {
 			let point = scatter_point(transform, x, y);
-			let xi = point.x.floor() as isize;
-			let yi = point.y.floor() as isize;
-			if xi < 0 || yi < 0 || xi >= width as isize || yi >= height as isize {
+			let min_x = (point.x - radius).floor().max(0.0) as usize;
+			let max_x = (point.x + radius).ceil().min(width as f32 - 1.0) as usize;
+			let min_y = (point.y - radius).floor().max(0.0) as usize;
+			let max_y = (point.y + radius).ceil().min(height as f32 - 1.0) as usize;
+			if min_x > max_x || min_y > max_y {
 				return;
 			}
-			let idx = yi as usize * width + xi as usize;
-			accum[idx][0] += color.r * color.a;
-			accum[idx][1] += color.g * color.a;
-			accum[idx][2] += color.b * color.a;
-			accum[idx][3] += color.a.max(0.1);
+			for yi in min_y..=max_y {
+				for xi in min_x..=max_x {
+					let dx = xi as f32 + 0.5 - point.x;
+					let dy = yi as f32 + 0.5 - point.y;
+					if dx * dx + dy * dy > radius_squared {
+						continue;
+					}
+					let idx = yi * width + xi;
+					accum[idx][0] += color.r * color.a;
+					accum[idx][1] += color.g * color.a;
+					accum[idx][2] += color.b * color.a;
+					accum[idx][3] += color.a.max(0.1);
+				}
+			}
 		});
 	}
 
@@ -1055,5 +1070,70 @@ mod tests {
 			2,
 			"the 4:3 aspect ratio currently expands target one to a 2x1 grid"
 		);
+	}
+
+	fn changed_pixels(rgba: &[u8], background: Color) -> usize {
+		let background = color_to_rgba8(background);
+		rgba.chunks_exact(4)
+			.filter(|pixel| *pixel != background)
+			.count()
+	}
+
+	#[test]
+	fn product_0017_raster_draws_clipped_discs_and_keys_the_resolved_size() {
+		let frame = df!("x" => [5.0], "y" => [5.0]).expect("frame");
+		let (spec, _) = resolved_scatter(
+			frame.clone(),
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&ColorIdentity::default(),
+		);
+		let prepared = Arc::new(prepare_scatter_data_resolved(&frame, &spec, 21, 21));
+		let renderer = ScatterMarkRenderer::new(Arc::clone(&prepared));
+		let viewport = bounds(21.0, 21.0);
+		let centered_layout = PlotLayout::Cartesian {
+			x_range: (4.0, 6.0),
+			y_range: (4.0, 6.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+		};
+		let centered = CoordinateTransformer::new(&centered_layout, viewport);
+		let default_settings = ResolvedPlotSettings::default();
+		let first = renderer.rasterize(viewport, &centered, &default_settings);
+		let repeat = renderer.rasterize(viewport, &centered, &default_settings);
+		assert!(
+			Arc::ptr_eq(&first.rgba, &repeat.rgba),
+			"same key must reuse cache"
+		);
+		let default_pixels = changed_pixels(&first.rgba, default_settings.background_color);
+		assert!(
+			default_pixels > 1,
+			"default radius must be a disc, not one pixel"
+		);
+
+		let mut doubled = default_settings.clone();
+		doubled.point_size = PointSize::new(2.0).unwrap();
+		let large = renderer.rasterize(viewport, &centered, &doubled);
+		assert!(
+			!Arc::ptr_eq(&first.rgba, &large.rgba),
+			"size change must miss the prior cache entry"
+		);
+		assert!(
+			changed_pixels(&large.rgba, doubled.background_color) > default_pixels,
+			"doubled radius must paint a larger footprint"
+		);
+		let large_repeat = renderer.rasterize(viewport, &centered, &doubled);
+		assert!(Arc::ptr_eq(&large.rgba, &large_repeat.rgba));
+
+		let edge_layout = PlotLayout::Cartesian {
+			x_range: (5.0, 7.0),
+			y_range: (3.0, 5.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+		};
+		let edge = CoordinateTransformer::new(&edge_layout, viewport);
+		let clipped = build_raster_rgba(&prepared, viewport, &edge, &default_settings);
+		let clipped_pixels = changed_pixels(&clipped, default_settings.background_color);
+		assert!(clipped_pixels > 0);
+		assert!(clipped_pixels < default_pixels, "edge disc must be clipped");
 	}
 }
