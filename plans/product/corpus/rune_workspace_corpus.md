@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.21. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.22. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -38,6 +38,7 @@ a cited record).
 | figure-wide headings (`figure([title(text), subtitle(text), body])`) | executable | PRODUCT-0016's twelve gates in `4278e762`, `267e48c1`, `a39ffd9d`, and `764e2b64`; exact grammar spans, independent settings/body lowering, projected source-current chrome, rendered completion-atomic canvas, stale/removal lifecycle, and installed `test7.rn` launch |
 | relative scatter point size (`scatter(x, y).point_size(factor)`) | executable | PRODUCT-0017 proves the typed layer setting and all scatter renderer/hit/cache paths; PRODUCT-0018's closed contextual register, exact lowering/refusals, shared-result handoff, byte-identical `1.0`, six-pixel-radius `2.0`, identity/label lifecycle, and no-dashboard host completion land in `5d180e0c` and `0478f8a2`; installed `test7.rn` exercises the accepted `8.0` maximum |
 | relative line stroke width (`line(x, y).stroke_width(factor)`) | executable | PRODUCT-0019 proves the typed layer setting, five-tier selection, exact line paint/hit behavior, fixed guide, and styled-one-layer scale preservation; PRODUCT-0020's closed contextual lowering/refusals, shared-result handoff, byte-identical `1.0`, exact 4px `2.0`, identity/label lifecycle, and combined point-size host assay land in `01a66f4d`; installed `test7.rn` exercises both modifiers in one figure |
+| normalized bar slot width (`bar(category, value).bar_width(fraction)`) | executable | PRODUCT-0021 proves the typed `(0, 1]` Layer-stage setting, default `0.9`, five-tier selection, full-band subgroup allocation, touching `1.0`, shared vertical/horizontal paint-hit rectangles, exact padding misses, fixed preparation/layout/guide output, and no Bar layer admission in `bf4be7a0` and `671ce765`; PRODUCT-0022's closed contextual lowering/refusals, shared-result styled-Bar handoff, byte-identical bare/`0.9`, narrow `0.5`, identity/heading/placement lifecycle, and no-dashboard host assay land in `db4d2be6`; installed `test7.rn` exercises near-touching `0.9999` beside the existing line and scatter modifiers |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -418,6 +419,18 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.22 (2026-08-04): PRODUCT-0021 makes normalized bar-slot occupancy a typed
+  Layer-stage setting and PRODUCT-0022 spells it as the third member of the
+  closed postfix register: `bar(category, value).bar_width(fraction)`. The
+  domain is `(0, 1]`; the complete category band is divided among series before
+  the fraction applies. Default `0.9` leaves 5% padding on each side, `0.5`
+  occupies half its full-band subgroup slot, and `1.0` makes neighbors touch
+  without a hidden group inset or device-pixel gap. Vertical and horizontal
+  paint and hover consume one exact rectangle calculation, so width-created
+  padding is not hittable. Bar remains a standalone mark outside `LayerMark`
+  and `layers([...])`; preparation, domains, guides, identity, headings,
+  placement, and dashboard behavior remain unchanged. The installed `test7.rn`
+  combines all three governed mark modifiers in one two-origin fixture.
 - v0.21 (2026-08-04): PRODUCT-0019 makes relative line stroke width a typed
   Layer-stage setting and PRODUCT-0020 spells it as the second member of the
   closed postfix register: `line(x, y).stroke_width(factor)`. A factor of `1.0`
