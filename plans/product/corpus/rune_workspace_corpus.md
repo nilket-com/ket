@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.18. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.20. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -36,6 +36,7 @@ a cited record).
 | producer-scoped view panel placement (automatic visible tiling; no inferred tabs) | executable | PRODUCT-0015's thirteen gates: `product_0015_host_panel_groups_tile_atomically_and_fallback_visibly` proves atomic 2x2 placement and all-visible decline; `rune_view_collection_tiles_one_forward_producer_group_without_tabs` proves forward table/layered/table/bar order, Compact/Expansive sizing, unchanged reruns, and Retile no-op; detachment/reset/lifecycle and two-producer isolation land in `6d67e95b`, `fd968496`, `a287b770`, and `67c8f2f5`. PRODUCT-0011's explicit `Split`/`TabWith` remains unchanged. |
 | layered plot sink (`layers([line(x, y), scatter(x, y)])`) | executable | PRODUCT-0013's ordered substrate and PRODUCT-0014's surface are accepted; thirteen surface gates land in `c3edc520`, `a10b4995`, `56c8cb88`, and `d52fc31d`, with installed `test6.rn` dogfood confirming labels, paint order, ordinary host panels, and no dashboard |
 | figure-wide headings (`figure([title(text), subtitle(text), body])`) | executable | PRODUCT-0016's twelve gates in `4278e762`, `267e48c1`, `a39ffd9d`, and `764e2b64`; exact grammar spans, independent settings/body lowering, projected source-current chrome, rendered completion-atomic canvas, stale/removal lifecycle, and installed `test7.rn` launch |
+| relative scatter point size (`scatter(x, y).point_size(factor)`) | executable | PRODUCT-0017 proves the typed layer setting and all scatter renderer/hit/cache paths; PRODUCT-0018's closed contextual register, exact lowering/refusals, shared-result handoff, byte-identical `1.0`, six-pixel-radius `2.0`, identity/label lifecycle, and no-dashboard host completion land in `5d180e0c` and `0478f8a2`; installed `test7.rn` exercises the accepted `8.0` maximum |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -416,6 +417,17 @@ decided, sink constructors are recognized only in argument position.
 
 ## Change log
 
+- v0.20 (2026-08-04): PRODUCT-0018 makes relative scatter point size
+  scriptable as the closed Layer-stage postfix modifier
+  `scatter(x, y).point_size(factor)`. The complete chain flattens atomically
+  into PRODUCT-0017's typed `LayerSettings`; unknown and duplicate modifiers,
+  computed or invalid factors, line receivers, and modified category scatters
+  refuse at the mark. Direct, figure-body, and layered positions share the
+  stamped result and the proved layer-aware renderer. `1.0` is byte-identical
+  to bare scatter, `2.0` yields a six-pixel radius, and point-size edits preserve
+  panel identity, labels, placement, guides, headings, and the no-dashboard
+  path. The installed `test7.rn` fixture keeps `8.0` as a visible maximum-bound
+  dogfood case.
 - v0.19 (2026-08-04): PRODUCT-0017 lands the substrate for relative scatter
   point size without adding Rune syntax. A validated layer-local factor resolves
   through PRODUCT-0007's existing five tiers; vector, downsampled, raster, and
