@@ -1,6 +1,6 @@
 # ADR 0024: observable resolved theme palettes
 
-Status: proposed 2026-08-05. This record decides one thing: a resolved libaryon
+Status: accepted 2026-08-05. This record decides one thing: a resolved libaryon
 `Theme` retains and exposes the exact ordered twenty-color palette from which its
 syntax colors were assigned. It centralizes generic luminance and contrast math
 with that color authority. It changes no theme name or modifier behavior, adds

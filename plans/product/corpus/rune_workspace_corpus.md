@@ -409,6 +409,27 @@ adds no Rune capability, so no row above changes status. PRODUCT-0024 owns the
 resolved libaryon palette prerequisite; PRODUCT-0025 owns the first
 `.skin("name")` surface and the per-sink closed-register generalization.
 
+## Accepted substrate: observable resolved theme palettes
+
+PRODUCT-0024 is accepted and executable in `463ad2b5`, `69f25294`, `3b5c4939`,
+and `5581f6ad`. Every libaryon theme now retains the exact ordered twenty-color
+palette used to populate its themed syntax categories. A checked-in textual
+oracle covers all 1,420 canonical, alias, modifier, shift, and composed
+expressions across every syntax slot; it remains byte-identical through the
+resolution refactor. Curated and continuous families expose the same fixed
+`ResolvedThemePalette`, while `BodyText` retains its independent existing
+behavior.
+
+Libaryon now owns validated normalized encoded-sRGB luminance and contrast math.
+Polariton retains table-specific alpha compositing and passes its fractional
+visible colors without eight-bit quantization, preserving PRODUCT-0023's seven
+established ratios. The palette's contrast-pair query is total and deterministic,
+returns source indices as well as colors, and imposes no artifact threshold.
+Reverse and shift remain observable order-preserving permutations; continuous
+clipping changes the sampled set, while curated clipping's existing no-op is
+guarded without being endorsed. No Rune capability row changes status, and
+PRODUCT-0025 remains the first table-skin projection and `.skin("name")` surface.
+
 ## Mutation and definition lifecycle
 
 | family | status | evidence |
@@ -438,6 +459,16 @@ resolved libaryon palette prerequisite; PRODUCT-0025 owns the first
 
 ## Change log
 
+- v0.24 (2026-08-05): PRODUCT-0024 makes libaryon's exact resolved twenty-color
+  theme palette observable beside the unchanged syntax-color projection. A
+  1,420-expression textual oracle preserves every full syntax array while
+  category/palette equations prove both projections share one sequence. Generic
+  normalized-sRGB luminance and contrast math moves to libaryon without
+  quantizing Polariton's fractional table composites. Deterministic indexed
+  contrast pairs expose palette capability without artifact policy; reverse,
+  shift, continuous clipping, and curated clipping's known no-op retain their
+  existing behavior. No Rune row changes status; PRODUCT-0025 remains the first
+  table projection and `.skin("name")` caller.
 - v0.23 (2026-08-04): PRODUCT-0023 replaces compile-time table color reads with
   one closed, validated `TableSkin` passed through the real widget. The default
   preserves the exact 39-operation pre-extraction draw oracle; every built-in
