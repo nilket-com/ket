@@ -1,6 +1,6 @@
 use crate::gui::messages::PlotMessage;
 use crate::plot::colors::ColorTheme;
-use crate::plot::spec::PointSize;
+use crate::plot::spec::{PointSize, StrokeWidth};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
@@ -276,6 +276,7 @@ pub struct ResolvedPlotSettings {
 	pub scatter_downsample_target: u32,
 	pub scatter_raster_threshold: u32,
 	pub point_size: PointSize,
+	pub stroke_width: StrokeWidth,
 }
 
 impl Default for ResolvedPlotSettings {
@@ -335,6 +336,7 @@ impl Default for ResolvedPlotSettings {
 			scatter_downsample_target: 200_000,
 			scatter_raster_threshold: 1_000_000,
 			point_size: PointSize::ONE,
+			stroke_width: StrokeWidth::ONE,
 		}
 	}
 }

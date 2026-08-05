@@ -1467,6 +1467,7 @@ fn parse_modified_mark(
 		point_size: Override::Set(
 			point_size.expect("the outer field-access call supplied one modifier"),
 		),
+		..LayerSettings::default()
 	};
 	Ok(Some(layer))
 }

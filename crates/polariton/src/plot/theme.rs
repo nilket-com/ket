@@ -7,7 +7,7 @@
 
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode};
-use crate::plot::spec::{ColorJob, LayerSettings, Override, PointSize, Presence};
+use crate::plot::spec::{ColorJob, LayerSettings, Override, PointSize, Presence, StrokeWidth};
 use iced::Color;
 use libaryon::engine::UiPalette;
 use std::sync::Arc;
@@ -164,6 +164,7 @@ pub struct PlotSettingsLayer {
 	pub domains: Override<PlotDomainOverrides>,
 	pub scatter: Override<ScatterPolicy>,
 	pub point_size: Override<PointSize>,
+	pub stroke_width: Override<StrokeWidth>,
 	pub title: Presence<Arc<String>>,
 	pub subtitle: Presence<Arc<String>>,
 	pub x_label: Presence<Arc<String>>,
@@ -180,6 +181,7 @@ impl Default for PlotSettingsLayer {
 			domains: Override::Inherit,
 			scatter: Override::Inherit,
 			point_size: Override::Inherit,
+			stroke_width: Override::Inherit,
 			title: Presence::Inherit,
 			subtitle: Presence::Inherit,
 			x_label: Presence::Inherit,
@@ -295,6 +297,9 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 	if let Override::Set(value) = layer.point_size {
 		settings.point_size = value;
 	}
+	if let Override::Set(value) = layer.stroke_width {
+		settings.stroke_width = value;
+	}
 	apply_presence(&mut settings.title, &layer.title);
 	apply_presence(&mut settings.subtitle, &layer.subtitle);
 	apply_presence(&mut settings.x_label, &layer.x_label);
@@ -304,6 +309,9 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 fn apply_layer_settings(settings: &mut ResolvedPlotSettings, layer: &LayerSettings) {
 	if let Override::Set(value) = layer.point_size {
 		settings.point_size = value;
+	}
+	if let Override::Set(value) = layer.stroke_width {
+		settings.stroke_width = value;
 	}
 }
 
@@ -413,9 +421,11 @@ mod tests {
 
 		let small = LayerSettings {
 			point_size: Override::Set(size(0.5)),
+			..LayerSettings::default()
 		};
 		let large = LayerSettings {
 			point_size: Override::Set(size(2.0)),
+			..LayerSettings::default()
 		};
 		assert_eq!(cascade.resolve_for_layer(&small).point_size, size(0.5));
 		assert_eq!(cascade.resolve_for_layer(&large).point_size, size(2.0));
@@ -424,6 +434,39 @@ mod tests {
 		assert_eq!(cascade.resolve_for_layer(&large).point_size, size(0.25));
 		assert_ne!(
 			cascade.resolve_for_layer(&large).point_size.factor(),
+			2.0 * 0.25,
+			"cascade tiers select rather than multiply"
+		);
+	}
+
+	#[test]
+	fn product_0019_stroke_width_selects_each_layer_before_pane_override() {
+		let width = |factor| StrokeWidth::new(factor).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.stroke_width = width(0.25);
+		cascade.application_theme.stroke_width = Override::Set(width(0.5));
+		cascade.authored_spec.stroke_width = Override::Set(width(1.5));
+		cascade.layer.stroke_width = Override::Set(width(2.0));
+		cascade.pane_override.stroke_width = Override::Set(width(4.0));
+		assert_eq!(cascade.resolve().stroke_width, width(4.0));
+
+		cascade.pane_override.stroke_width = Override::Inherit;
+		assert_eq!(cascade.resolve().stroke_width, width(2.0));
+		let thin = LayerSettings {
+			stroke_width: Override::Set(width(0.5)),
+			..LayerSettings::default()
+		};
+		let thick = LayerSettings {
+			stroke_width: Override::Set(width(2.0)),
+			..LayerSettings::default()
+		};
+		assert_eq!(cascade.resolve_for_layer(&thin).stroke_width, width(0.5));
+		assert_eq!(cascade.resolve_for_layer(&thick).stroke_width, width(2.0));
+
+		cascade.pane_override.stroke_width = Override::Set(width(0.25));
+		assert_eq!(cascade.resolve_for_layer(&thick).stroke_width, width(0.25));
+		assert_ne!(
+			cascade.resolve_for_layer(&thick).stroke_width.factor(),
 			2.0 * 0.25,
 			"cascade tiers select rather than multiply"
 		);

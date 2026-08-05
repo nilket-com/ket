@@ -100,6 +100,57 @@ impl fmt::Display for PointSizeError {
 
 impl std::error::Error for PointSizeError {}
 
+/// PRODUCT-0019's unitless, linear line-stroke factor. Keep this distinct from
+/// `PointSize` until a third relative setting establishes a shared abstraction.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrokeWidth(f32);
+
+// `StrokeWidth::new` excludes NaN, so equality is reflexive for every value the
+// private representation can contain.
+impl Eq for StrokeWidth {}
+
+impl StrokeWidth {
+	pub const MIN_FACTOR: f32 = 0.25;
+	pub const MAX_FACTOR: f32 = 8.0;
+	pub const BASE_WIDTH_PX: f32 = 2.0;
+	pub const ONE: Self = Self(1.0);
+
+	pub fn new(factor: f32) -> Result<Self, StrokeWidthError> {
+		if factor.is_finite() && (Self::MIN_FACTOR..=Self::MAX_FACTOR).contains(&factor) {
+			Ok(Self(factor))
+		} else {
+			Err(StrokeWidthError { factor })
+		}
+	}
+
+	pub const fn factor(self) -> f32 {
+		self.0
+	}
+
+	pub fn width_px(self) -> f32 {
+		Self::BASE_WIDTH_PX * self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StrokeWidthError {
+	factor: f32,
+}
+
+impl fmt::Display for StrokeWidthError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"stroke width must be finite and between {} and {}, got {}",
+			StrokeWidth::MIN_FACTOR,
+			StrokeWidth::MAX_FACTOR,
+			self.factor
+		)
+	}
+}
+
+impl std::error::Error for StrokeWidthError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthoredChannel {
 	Named(String),
@@ -323,12 +374,14 @@ impl LayerEncoding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LayerSettings {
 	pub point_size: Override<PointSize>,
+	pub stroke_width: Override<StrokeWidth>,
 }
 
 impl Default for LayerSettings {
 	fn default() -> Self {
 		Self {
 			point_size: Override::Inherit,
+			stroke_width: Override::Inherit,
 		}
 	}
 }
@@ -2184,5 +2237,29 @@ mod tests {
 		assert_eq!(scatter.settings, LayerSettings::default());
 		assert_eq!(line.settings.point_size, Override::Inherit);
 		assert_eq!(scatter.settings.point_size, Override::Inherit);
+	}
+
+	#[test]
+	fn product_0019_stroke_width_is_bounded_and_layer_constructors_inherit() {
+		assert_eq!(StrokeWidth::ONE.width_px(), 2.0);
+		assert_eq!(StrokeWidth::new(2.0).unwrap().width_px(), 4.0);
+		assert!(StrokeWidth::new(StrokeWidth::MIN_FACTOR).is_ok());
+		assert!(StrokeWidth::new(StrokeWidth::MAX_FACTOR).is_ok());
+		for invalid in [
+			0.0,
+			-1.0,
+			StrokeWidth::MIN_FACTOR - 0.01,
+			StrokeWidth::MAX_FACTOR + 0.01,
+			f32::NAN,
+			f32::INFINITY,
+			f32::NEG_INFINITY,
+		] {
+			assert!(StrokeWidth::new(invalid).is_err(), "accepted {invalid}");
+		}
+
+		let line = LayerSpec::xy(LayerMark::Line, "x", "y");
+		let scatter = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		assert_eq!(line.settings.stroke_width, Override::Inherit);
+		assert_eq!(scatter.settings.stroke_width, Override::Inherit);
 	}
 }

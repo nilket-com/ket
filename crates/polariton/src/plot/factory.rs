@@ -562,6 +562,7 @@ mod product_0013_baseline_tests {
 	fn product_0017_layered_vector_and_downsampled_use_each_resolved_point_size() {
 		let sized = |factor| LayerSettings {
 			point_size: Override::Set(PointSize::new(factor).unwrap()),
+			..LayerSettings::default()
 		};
 		let mut first = LayerSpec::xy(LayerMark::Scatter, "x", "y");
 		first.settings = sized(0.5);
