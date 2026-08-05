@@ -147,9 +147,14 @@ fn parse_theme_modifiers(name: &str) -> (&str, bool, bool, bool, usize) {
 
 pub struct Theme {
 	pub syntax_colors: [Option<Rgb>; CATEGORY_COUNT],
+	palette: ResolvedThemePalette,
 }
 
 impl Theme {
+	pub const fn palette(&self) -> &ResolvedThemePalette {
+		&self.palette
+	}
+
 	pub fn try_new(name: &str) -> Result<Self, String> {
 		let mut colors = [None; CATEGORY_COUNT];
 		let (raw_map_name, reverse, clip_low, clip_high, shift) = parse_theme_modifiers(name);
@@ -164,29 +169,28 @@ impl Theme {
 
 		if let ThemePalette::Discrete(fill) = spec.palette {
 			fill(&mut colors);
-			if reverse || shift > 0 {
-				let assigned_cats: Vec<TokenCategory> = THEMED_CATEGORIES
-					.iter()
-					.copied()
-					.filter(|&cat| colors[cat as usize].is_some())
-					.collect();
-				let mut assigned_colors: Vec<Rgb> = assigned_cats
-					.iter()
-					.filter_map(|&cat| colors[cat as usize])
-					.collect();
-				if reverse {
-					assigned_colors.reverse();
-				}
-				if shift > 0 && !assigned_colors.is_empty() {
-					let mid = shift % assigned_colors.len();
-					assigned_colors.rotate_right(mid);
-				}
-				for (cat, color) in assigned_cats.into_iter().zip(assigned_colors) {
-					colors[cat as usize] = Some(color);
-				}
+			let mut resolved = [Rgb::new(0, 0, 0); THEMED_CATEGORIES.len()];
+			for (index, category) in THEMED_CATEGORIES.iter().copied().enumerate() {
+				resolved[index] = colors[category as usize].ok_or_else(|| {
+					format!(
+						"Theme {} did not resolve required category {category:?}",
+						spec.name
+					)
+				})?;
+			}
+			if reverse {
+				resolved.reverse();
+			}
+			if shift > 0 {
+				let mid = shift % resolved.len();
+				resolved.rotate_right(mid);
+			}
+			for (category, color) in THEMED_CATEGORIES.iter().copied().zip(resolved) {
+				colors[category as usize] = Some(color);
 			}
 			return Ok(Self {
 				syntax_colors: colors,
+				palette: ResolvedThemePalette(resolved),
 			});
 		}
 
@@ -219,6 +223,7 @@ impl Theme {
 
 		Ok(Self {
 			syntax_colors: colors,
+			palette: ResolvedThemePalette(sampled_colors),
 		})
 	}
 
@@ -1554,6 +1559,77 @@ mod tests {
 		let terrain = Theme::try_new("terrain").unwrap().syntax_colors;
 		assert_ne!(Theme::try_new("terrain_c").unwrap().syntax_colors, terrain);
 		assert_ne!(Theme::try_new("terrain_C").unwrap().syntax_colors, terrain);
+	}
+
+	#[test]
+	fn product_0024_every_expression_projects_its_retained_palette_to_syntax() {
+		for expression in product_0024_theme_expressions() {
+			let theme = Theme::try_new(&expression).unwrap();
+			for (index, category) in THEMED_CATEGORIES.iter().copied().enumerate() {
+				assert_eq!(
+					theme.syntax_colors[category as usize],
+					theme.palette().color(index),
+					"palette/category disagreement for {expression} at {index}"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn product_0024_every_family_resolves_one_complete_palette() {
+		for spec in THEME_SPECS {
+			let theme = Theme::try_new(spec.name).unwrap();
+			assert_eq!(theme.palette().colors().len(), THEMED_CATEGORIES.len());
+			for (index, color) in theme.palette().colors().iter().copied().enumerate() {
+				assert_eq!(theme.palette().color(index), Some(color));
+			}
+		}
+	}
+
+	#[test]
+	fn product_0024_reverse_and_shift_preserve_exact_palette_permutations() {
+		for spec in THEME_SPECS {
+			let base = *Theme::try_new(spec.name).unwrap().palette().colors();
+
+			let mut reversed = base;
+			reversed.reverse();
+			assert_eq!(
+				Theme::try_new(&format!("{}_r", spec.name))
+					.unwrap()
+					.palette()
+					.colors(),
+				&reversed,
+				"reverse permutation for {}",
+				spec.name
+			);
+
+			for shift in 0..THEMED_CATEGORIES.len() {
+				let mut shifted = base;
+				shifted.rotate_right(shift);
+				assert_eq!(
+					Theme::try_new(&format!("{}_s{shift}", spec.name))
+						.unwrap()
+						.palette()
+						.colors(),
+					&shifted,
+					"shift permutation for {} by {shift}",
+					spec.name
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn product_0024_clipping_matrix_is_observable_on_resolved_palettes() {
+		let nord = Theme::try_new("nord").unwrap();
+		assert_eq!(Theme::try_new("nord_c").unwrap().palette(), nord.palette());
+		assert_eq!(Theme::try_new("nord_C").unwrap().palette(), nord.palette());
+
+		let terrain = Theme::try_new("terrain").unwrap();
+		let clipped_low = Theme::try_new("terrain_c").unwrap();
+		let clipped_high = Theme::try_new("terrain_C").unwrap();
+		assert_ne!(clipped_low.palette(), terrain.palette());
+		assert_ne!(clipped_high.palette(), terrain.palette());
 	}
 
 	#[test]

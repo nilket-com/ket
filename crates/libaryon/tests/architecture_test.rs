@@ -228,3 +228,48 @@ fn product_0001_keeps_editor_crates_out_of_the_nilket_workspace() {
 		ProductBoundary::NilketEngine,
 	);
 }
+
+#[test]
+fn product_0024_theme_construction_remains_owned_by_its_defining_module() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let crates_dir = manifest_dir.parent().expect("workspace crates directory");
+	let mut rust_sources = Vec::new();
+	collect_rs_files(crates_dir, &mut rust_sources);
+
+	let mut possible_literals = Vec::new();
+	for path in rust_sources {
+		let source = fs::read_to_string(&path).expect("Rust source should be readable");
+		for (line_number, line) in source.lines().enumerate() {
+			let mut remainder = line;
+			while let Some(index) = remainder.find("Theme {") {
+				let preceding = remainder[..index].chars().next_back();
+				let standalone = preceding.is_none_or(|ch| !(ch.is_alphanumeric() || ch == '_'));
+				if standalone
+					&& !line.contains("struct Theme {")
+					&& !line.contains("impl Theme {")
+					&& !line.contains("-> Theme {")
+					&& !line.contains("\"Theme {")
+				{
+					possible_literals.push(format!(
+						"{}:{}:{line}",
+						path.display(),
+						line_number + 1
+					));
+				}
+				remainder = &remainder[index + "Theme {".len()..];
+			}
+		}
+	}
+
+	assert!(
+		possible_literals.is_empty(),
+		"Theme struct literals bypass resolved palette construction:\n{}",
+		possible_literals.join("\n")
+	);
+
+	let theme_source = fs::read_to_string(manifest_dir.join("src/engine/theme.rs"))
+		.expect("theme source should be readable");
+	assert!(theme_source.contains("pub syntax_colors: [Option<Rgb>; CATEGORY_COUNT]"));
+	assert!(theme_source.contains("palette: ResolvedThemePalette"));
+	assert!(!theme_source.contains("pub palette: ResolvedThemePalette"));
+}
