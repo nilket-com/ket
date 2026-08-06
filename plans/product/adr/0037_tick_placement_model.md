@@ -1,6 +1,6 @@
 # ADR 0037: the tick placement model
 
-Status: proposed 2026-08-06. This record decides one thing: that major tick
+Status: accepted 2026-08-06. This record decides one thing: that major tick
 positions come from a closed placement model through a single generator, and that
 the model admits an authored step. It adds **no Rune surface**; the
 `x_tick_step`/`y_tick_step` spelling is PRODUCT-0038, which depends on this

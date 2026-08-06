@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.36. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.37. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -587,6 +587,13 @@ PRODUCT-0032 owns the first theme-name projection and direct figure
 | bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
+
+- v0.37 (2026-08-06): PRODUCT-0037 accepts the closed major tick placement
+  substrate without adding Rune grammar. Count(8) remains the compatibility
+  default and is byte-identical through a sixteen-site position oracle. The
+  future `Step` placement is a zero-anchored lattice with shared major/minor
+  positions, declared capacity refusal, and no categorical or temporal
+  semantics; PRODUCT-0038 is its pending figure surface.
 
 - v0.36 (2026-08-06): PRODUCT-0036 exposes the existing numeric domain slot as
   figure-wide `x_bounds(min, max)` and `y_bounds(min, max)`. Paired finite
