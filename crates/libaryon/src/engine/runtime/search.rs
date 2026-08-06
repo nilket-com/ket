@@ -1,5 +1,5 @@
 use super::super::core::{
-	advance_col, build_regex, find_all_matches, resolve_byte_range, substitute_text_delta,
+	advance_text, build_regex, find_all_matches, resolve_byte_range, substitute_text_delta,
 };
 use super::super::document::io::read_document_snapshot;
 use super::super::document::parse::word_object_delta_at_cursor;
@@ -95,12 +95,8 @@ fn line_col_for_prefix_and_replacement(
 ) -> (DocLine, DocDisplayCol) {
 	let mut line = DocLine::ZERO;
 	let mut col = DocDisplayCol::ZERO;
-	for &byte in prefix {
-		advance_col(byte, &mut line, &mut col);
-	}
-	for &byte in replacement.as_bytes() {
-		advance_col(byte, &mut line, &mut col);
-	}
+	advance_text(prefix, &mut line, &mut col);
+	advance_text(replacement.as_bytes(), &mut line, &mut col);
 	(line, col)
 }
 
@@ -675,9 +671,7 @@ pub(super) fn handle_search_command(
 								let (rep_end_line, rep_end_col) = {
 									let mut line = current_match.line;
 									let mut col = current_match.col;
-									for &b in rep {
-										advance_col(b, &mut line, &mut col);
-									}
+									advance_text(rep, &mut line, &mut col);
 									(line, col)
 								};
 								let next_idx = new_matches.iter().position(|m| {

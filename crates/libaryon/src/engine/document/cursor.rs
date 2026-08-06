@@ -164,32 +164,23 @@ pub(crate) fn smart_home_visual_col(
 	}
 }
 
-fn advance_visual_col_only(col: &mut DocDisplayCol, b: u8) {
-	if b == b'\t' {
-		*col = col
-			.checked_add(TAB_SIZE - (col.get() % TAB_SIZE))
-			.expect("DocDisplayCol addition overflow");
-	} else if b != b'\n' {
-		*col = col.checked_add(1).expect("DocDisplayCol addition overflow");
-	}
-}
-
 pub(crate) fn step_left_visual_col(
 	doc: &[u8],
 	target_line: DocLine,
 	current_col: DocDisplayCol,
 ) -> DocDisplayCol {
-	let mut col = DocDisplayCol::ZERO;
-
-	for &b in line_content_slice(doc, target_line) {
-		let char_start = col;
-		advance_visual_col_only(&mut col, b);
-		if current_col <= col {
-			return char_start;
+	let mut column = 0u32;
+	let mut result = DocDisplayCol::ZERO;
+	crate::core::text::visit_display_cells(line_content_slice(doc, target_line), |cell| {
+		let cell_start = column;
+		column = crate::core::text::advance_display_col(column, cell, TAB_SIZE);
+		if current_col.get() <= column {
+			result = DocDisplayCol::new(cell_start);
+			return false;
 		}
-	}
-
-	DocDisplayCol::ZERO
+		true
+	});
+	result
 }
 
 pub(crate) fn step_right_visual_col(
@@ -197,16 +188,17 @@ pub(crate) fn step_right_visual_col(
 	target_line: DocLine,
 	current_col: DocDisplayCol,
 ) -> DocDisplayCol {
-	let mut col = DocDisplayCol::ZERO;
-
-	for &b in line_content_slice(doc, target_line) {
-		advance_visual_col_only(&mut col, b);
-		if current_col < col {
-			return col;
+	let mut column = 0u32;
+	let mut result = None;
+	crate::core::text::visit_display_cells(line_content_slice(doc, target_line), |cell| {
+		column = crate::core::text::advance_display_col(column, cell, TAB_SIZE);
+		if current_col.get() < column {
+			result = Some(DocDisplayCol::new(column));
+			return false;
 		}
-	}
-
-	col
+		true
+	});
+	result.unwrap_or_else(|| DocDisplayCol::new(column))
 }
 
 pub(crate) fn page_motion_step(viewport_lines: u32) -> u64 {
@@ -267,22 +259,18 @@ pub(crate) fn line_col_from_doc_byte_sparse(
 	let prefix_bytes = registry
 		.read_loaded_slice(root, line_start, target_byte)
 		.map_err(|msg| msg.to_string())?;
-	let mut col = DocDisplayCol::ZERO;
-	for &b in &prefix_bytes {
-		advance_visual_col_only(&mut col, b);
-	}
+	let col = crate::core::text::display_width(&prefix_bytes, 0, TAB_SIZE);
 
-	Ok((line, col))
+	Ok((line, DocDisplayCol::new(col)))
 }
 
 #[cfg(test)]
 mod tests {
 	use super::{
-		advance_visual_col_only, line_col_from_doc_byte_sparse, next_word_end, next_word_start,
-		place_cursor_at_line_col, prev_word_start, smart_home_visual_col, step_left_visual_col,
-		step_right_visual_col,
+		line_col_from_doc_byte_sparse, next_word_end, next_word_start, place_cursor_at_line_col,
+		prev_word_start, smart_home_visual_col, step_left_visual_col, step_right_visual_col,
 	};
-	use crate::core::{DocByte, DocDisplayCol, DocLine, StateId, TopologyRev};
+	use crate::core::{DocByte, DocDisplayCol, DocLine, StateId, TAB_SIZE, TopologyRev};
 	use crate::engine::folding::{FoldSet, materialize_fold_boundary_at_cursor};
 	use crate::engine::test_support::{
 		build_document, build_exact_metric_physical_document, build_grafted_rust_document,
@@ -298,11 +286,8 @@ mod tests {
 			.iter()
 			.rposition(|&byte| byte == b'\n')
 			.map_or(0, |newline| newline + 1);
-		let mut col = DocDisplayCol::ZERO;
-		for &byte in &bytes[line_start..target] {
-			advance_visual_col_only(&mut col, byte);
-		}
-		(line, col)
+		let col = crate::core::text::display_width(&bytes[line_start..target], 0, TAB_SIZE);
+		(line, DocDisplayCol::new(col))
 	}
 
 	#[test]
@@ -407,10 +392,11 @@ mod tests {
 		let line_start = source[..get_text_pos]
 			.rfind('\n')
 			.map_or(0, |offset| offset + 1);
-		let mut expected_col = DocDisplayCol::ZERO;
-		for &b in &source.as_bytes()[line_start..get_text_pos] {
-			advance_visual_col_only(&mut expected_col, b);
-		}
+		let expected_col = DocDisplayCol::new(crate::core::text::display_width(
+			&source.as_bytes()[line_start..get_text_pos],
+			0,
+			TAB_SIZE,
+		));
 		assert_eq!(col, expected_col, "get_text start col mismatch");
 
 		// Now simulate the structural bounds for SelectAroundFunction

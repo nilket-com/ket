@@ -2171,13 +2171,14 @@ fn project_lines(
 		let mut line_number = token_line;
 		let mut line_visible = line_is_visible(line_number);
 		let token_text = String::from_utf8_lossy(&token.text);
-		for (offset, ch) in token_text.char_indices() {
-			let byte_len = ch.len_utf8() as u64;
+		for cell in libaryon::core::text::display_cells(token_text.as_bytes()) {
+			let grapheme = &token_text[cell.byte_start..cell.byte_end];
+			let byte_len = (cell.byte_end - cell.byte_start) as u64;
 			if line_number > last_visible_line {
 				break 'tokens;
 			}
 			if !line_visible {
-				if ch == '\n' {
+				if grapheme == "\n" {
 					line_number = line_number.saturating_add(1);
 					line_visible = line_is_visible(line_number);
 					current = line_visible.then_some(ProjectedLine {
@@ -2224,7 +2225,7 @@ fn project_lines(
 			} else {
 				content_background
 			};
-			if ch == '\n' {
+			if grapheme == "\n" {
 				if pane.visible_whitespace {
 					push_fragment(
 						current.as_mut().expect("line initialized"),
@@ -2251,14 +2252,14 @@ fn project_lines(
 			}
 
 			let trailing = line_has_content
-				&& token_text[offset + ch.len_utf8()..]
+				&& token_text[cell.byte_end..]
 					.split_once('\n')
 					.is_some_and(|(rest, _)| {
 						rest.chars()
 							.all(|character| matches!(character, ' ' | '\t'))
 					});
-			let (text, foreground) = match ch {
-				'\t' => {
+			let (text, foreground) = match grapheme {
+				"\t" => {
 					let width = TAB_SIZE - (display_column % TAB_SIZE);
 					let head = if pane.visible_whitespace {
 						if trailing { '~' } else { '▸' }
@@ -2277,21 +2278,21 @@ fn project_lines(
 						},
 					)
 				}
-				' ' if pane.visible_whitespace => (
+				" " if pane.visible_whitespace => (
 					if trailing { "~" } else { "␣" }.to_owned(),
 					VISIBLE_WHITESPACE_COLOR,
 				),
-				'\u{00a0}' if pane.visible_whitespace => ("⍽".to_owned(), VISIBLE_WHITESPACE_COLOR),
-				character if pane.visible_whitespace && character.is_whitespace() => {
+				"\u{00a0}" if pane.visible_whitespace => ("⍽".to_owned(), VISIBLE_WHITESPACE_COLOR),
+				text if pane.visible_whitespace && text.chars().all(char::is_whitespace) => {
 					("␣".to_owned(), VISIBLE_WHITESPACE_COLOR)
 				}
-				_ => (ch.to_string(), foreground),
+				_ => (grapheme.to_owned(), foreground),
 			};
-			if !ch.is_whitespace() {
+			if !grapheme.chars().all(char::is_whitespace) {
 				line_has_content = true;
 			}
 			let line = current.as_mut().expect("line initialized");
-			if cursor && ch == '\t' {
+			if cursor && grapheme == "\t" {
 				let first_end = text
 					.char_indices()
 					.nth(1)
@@ -2315,11 +2316,8 @@ fn project_lines(
 			} else {
 				push_fragment(line, text, color(foreground), background, underline);
 			}
-			display_column = if ch == '\t' {
-				display_column.saturating_add(TAB_SIZE - (display_column % TAB_SIZE))
-			} else {
-				display_column.saturating_add(1)
-			};
+			display_column =
+				libaryon::core::text::advance_display_col(display_column, cell, TAB_SIZE);
 			byte = byte.saturating_add(byte_len);
 		}
 	}
@@ -2393,12 +2391,13 @@ fn wrap_line_at_starts(line: ProjectedLine, starts: &[u32]) -> Vec<ProjectedLine
 		.collect::<Vec<_>>();
 	let mut column = 0u32;
 	for fragment in line.fragments {
-		for ch in fragment.text.chars() {
+		for cell in libaryon::core::text::display_cells(fragment.text.as_bytes()) {
+			let grapheme = &fragment.text[cell.byte_start..cell.byte_end];
 			let index = starts.partition_point(|start| *start <= column);
 			if let Some(index) = index.checked_sub(1) {
 				push_fragment(
 					&mut wrapped[index],
-					ch.to_string(),
+					grapheme.to_owned(),
 					fragment.foreground,
 					fragment.background,
 					fragment.underline,
@@ -2406,19 +2405,11 @@ fn wrap_line_at_starts(line: ProjectedLine, starts: &[u32]) -> Vec<ProjectedLine
 			}
 			// Columns before the first visible row are scrolled off above the
 			// viewport; skip them without emitting anything.
-			column = advance_display_column(column, ch);
+			column =
+				libaryon::core::text::advance_display_col(column, cell, libaryon::core::TAB_SIZE);
 		}
 	}
 	wrapped
-}
-
-fn advance_display_column(column: u32, ch: char) -> u32 {
-	use libaryon::core::TAB_SIZE;
-	if ch == '\t' {
-		column.saturating_add(TAB_SIZE - (column % TAB_SIZE))
-	} else {
-		column.saturating_add(1)
-	}
 }
 
 fn push_fragment(
@@ -7503,6 +7494,26 @@ mod tests {
 		assert!(wrapped[0].show_gutter);
 		assert!(!wrapped[1].show_gutter);
 		assert!(!wrapped[2].show_gutter);
+	}
+
+	#[test]
+	fn wrapped_text_keeps_emoji_sequences_atomic_and_uses_their_width() {
+		use super::{Color, ProjectedLine, StyledFragment, wrap_line_at_starts};
+
+		let line = ProjectedLine {
+			doc_line: 8,
+			fragments: vec![StyledFragment {
+				text: "a☠️b".to_owned(),
+				foreground: Color::WHITE,
+				background: None,
+				underline: false,
+			}],
+			show_gutter: true,
+		};
+		let wrapped = wrap_line_at_starts(line, &[0, 3]);
+		assert_eq!(wrapped.len(), 2);
+		assert_eq!(wrapped[0].fragments[0].text, "a☠️");
+		assert_eq!(wrapped[1].fragments[0].text, "b");
 	}
 
 	#[test]

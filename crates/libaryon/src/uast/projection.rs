@@ -492,14 +492,6 @@ pub struct SnapshotIdentity {
 
 const FOLDED_TOKEN_TEXT: &str = "❯❯❯";
 
-fn advance_visual_col(col: &mut DocDisplayCol, byte: u8) {
-	if byte == b'\t' {
-		*col = col.saturating_add(TAB_SIZE - (col.get() % TAB_SIZE));
-	} else {
-		*col = col.saturating_add(1);
-	}
-}
-
 fn line_start_offset(text: &[u8], target_line_in_node: DocLine) -> Option<usize> {
 	if target_line_in_node == DocLine::ZERO {
 		return Some(0);
@@ -529,37 +521,16 @@ fn offset_for_visual_col(
 	line_bytes: &[u8],
 	target_col: DocDisplayCol,
 ) -> (NodeByteOffset, DocDisplayCol) {
-	let mut display_col = DocDisplayCol::ZERO;
-	let mut byte_offset = 0usize;
-
-	for (i, &b) in line_bytes.iter().enumerate() {
-		if b == b'\n' || display_col >= target_col {
-			break;
-		}
-
-		byte_offset = i + 1;
-		let mut next_col = display_col;
-		advance_visual_col(&mut next_col, b);
-
-		if target_col <= next_col {
-			return (NodeByteOffset::new(byte_offset as u32), next_col);
-		}
-
-		display_col = next_col;
-	}
-
-	(NodeByteOffset::new(byte_offset as u32), display_col)
+	let (byte_offset, display_col) =
+		crate::core::text::byte_offset_for_display_col(line_bytes, target_col.get(), 0, TAB_SIZE);
+	(
+		NodeByteOffset::new(byte_offset as u32),
+		DocDisplayCol::new(display_col),
+	)
 }
 
 fn visual_width_for_line_bytes(line_bytes: &[u8]) -> DocDisplayCol {
-	let mut display_col = DocDisplayCol::ZERO;
-	for &b in line_bytes {
-		if b == b'\n' {
-			break;
-		}
-		advance_visual_col(&mut display_col, b);
-	}
-	display_col
+	DocDisplayCol::new(crate::core::text::display_width(line_bytes, 0, TAB_SIZE))
 }
 
 /// Opaque fold membership used by projection and coordinate lookup.

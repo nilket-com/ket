@@ -200,26 +200,31 @@ fn compute_line_wrap(line: &[u8], text_width: u16) -> WrappedLine {
 	}
 
 	// Keep this visual-cell model aligned with the editor's document columns:
-	// tabs expand to fixed tab stops and every other byte occupies one column.
+	// tabs expand to fixed tab stops and valid text advances by grapheme width.
+	// Invalid bytes remain one visible fallback cell.
 	let width = u32::from(text_width);
 	let mut visual_col = 0u32;
 	let mut row_start = 0u32;
 	let mut word_start = None;
-	for &byte in line.iter().take_while(|&&byte| byte != b'\n') {
-		let cell_width = if byte == b'\t' {
-			TAB_SIZE - (visual_col % TAB_SIZE)
-		} else {
-			1
-		};
-		if byte.is_ascii_whitespace() {
+	crate::core::text::visit_display_cells(line, |cell| {
+		if cell.kind == crate::core::text::DisplayCellKind::Newline {
+			return false;
+		}
+		let cell_bytes = &line[cell.byte_start..cell.byte_end];
+		let is_whitespace = cell.kind == crate::core::text::DisplayCellKind::Tab
+			|| std::str::from_utf8(cell_bytes)
+				.ok()
+				.is_some_and(|text| text.chars().all(char::is_whitespace));
+		if is_whitespace {
 			if let Some(start) = word_start.take() {
 				push_word_wraps(&mut starts, &mut row_start, start, visual_col, width);
 			}
 		} else if word_start.is_none() {
 			word_start = Some(visual_col);
 		}
-		visual_col = visual_col.saturating_add(cell_width);
-	}
+		visual_col = crate::core::text::advance_display_col(visual_col, cell, TAB_SIZE);
+		true
+	});
 	if let Some(start) = word_start {
 		push_word_wraps(&mut starts, &mut row_start, start, visual_col, width);
 	}

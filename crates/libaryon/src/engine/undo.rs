@@ -384,24 +384,22 @@ impl UndoLedger {
 
 /// Compute (line, col) from a global byte offset into raw document bytes.
 pub fn line_col_from_byte_offset(doc: &[u8], byte_offset: DocByte) -> (DocLine, DocDisplayCol) {
-	let mut line = DocLine::ZERO;
-	let mut col = DocDisplayCol::ZERO;
-	for (i, &b) in doc.iter().enumerate() {
-		if i as u64 >= byte_offset.get() {
-			break;
-		}
-		if b == b'\n' {
-			line += DocLineCount::new(1);
-			col = DocDisplayCol::ZERO;
-		} else if b == b'\t' {
-			col = col
-				.checked_add(TAB_SIZE - (col.get() % TAB_SIZE))
-				.expect("DocDisplayCol addition overflow");
-		} else {
-			col = col.checked_add(1).expect("DocDisplayCol addition overflow");
-		}
-	}
-	(line, col)
+	let target = usize::try_from(byte_offset.get())
+		.unwrap_or(usize::MAX)
+		.min(doc.len());
+	let prefix = &doc[..target];
+	let line = DocLine::new(prefix.iter().filter(|&&byte| byte == b'\n').count() as u64);
+	let line_start = prefix
+		.iter()
+		.rposition(|&byte| byte == b'\n')
+		.map_or(0, |offset| offset + 1);
+	let col = crate::core::text::display_col_for_byte_offset(
+		&doc[line_start..],
+		target - line_start,
+		0,
+		TAB_SIZE,
+	);
+	(line, DocDisplayCol::new(col))
 }
 
 /// Compute global byte offset from (line, col) in raw document bytes.
@@ -411,27 +409,25 @@ pub fn byte_offset_from_line_col(
 	target_col: DocDisplayCol,
 ) -> DocByte {
 	let mut line = DocLine::ZERO;
-	let mut col = DocDisplayCol::ZERO;
-	for (i, &b) in doc.iter().enumerate() {
-		if line == target_line && col >= target_col {
-			return DocByte::new(i as u64);
-		}
-		if b == b'\n' {
-			if line == target_line {
-				// Cursor is past end of this line; clamp to newline position.
-				return DocByte::new(i as u64);
-			}
-			line += DocLineCount::new(1);
-			col = DocDisplayCol::ZERO;
-		} else if b == b'\t' {
-			col = col
-				.checked_add(TAB_SIZE - (col.get() % TAB_SIZE))
-				.expect("DocDisplayCol addition overflow");
-		} else {
-			col = col.checked_add(1).expect("DocDisplayCol addition overflow");
-		}
+	let mut line_start = 0usize;
+	while line < target_line {
+		let Some(newline) = doc[line_start..].iter().position(|&byte| byte == b'\n') else {
+			return DocByte::new(doc.len() as u64);
+		};
+		line_start += newline + 1;
+		line += DocLineCount::new(1);
 	}
-	DocByte::new(doc.len() as u64)
+	let line_end = doc[line_start..]
+		.iter()
+		.position(|&byte| byte == b'\n')
+		.map_or(doc.len(), |offset| line_start + offset);
+	let (line_offset, _) = crate::core::text::byte_offset_for_display_col(
+		&doc[line_start..line_end],
+		target_col.get(),
+		0,
+		TAB_SIZE,
+	);
+	DocByte::new((line_start + line_offset) as u64)
 }
 
 #[cfg(test)]

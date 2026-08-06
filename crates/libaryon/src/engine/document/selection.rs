@@ -25,6 +25,50 @@ fn clamp_existing_doc_byte(byte: DocByte, file_size: u64) -> Option<DocByte> {
 	}
 }
 
+fn display_cell_span(buffer: &[u8], byte: DocByte) -> (DocByte, DocByte) {
+	let offset = usize::try_from(byte.get())
+		.unwrap_or(usize::MAX)
+		.min(buffer.len().saturating_sub(1));
+	let line_start = buffer[..offset]
+		.iter()
+		.rposition(|&value| value == b'\n')
+		.map_or(0, |newline| newline + 1);
+	let line_end = buffer[offset..]
+		.iter()
+		.position(|&value| value == b'\n')
+		.map_or(buffer.len(), |newline| offset + newline + 1);
+	let (start, end_exclusive) = crate::core::text::display_cell_span_for_byte_offset(
+		&buffer[line_start..line_end],
+		offset - line_start,
+	)
+	.expect("a clamped byte in a non-empty buffer has a display cell");
+	(
+		DocByte::new((line_start + start) as u64),
+		DocByte::new((line_start + end_exclusive.saturating_sub(1)) as u64),
+	)
+}
+
+fn display_cell_span_sparse(
+	registry: &UastRegistry,
+	root: NodeId,
+	byte: DocByte,
+) -> Result<(DocByte, DocByte), String> {
+	let (line, _) = line_col_from_doc_byte_sparse(registry, root, byte)?;
+	let line_start = line_start_byte_sparse(registry, root, line)?;
+	let line_end = line_end_byte_sparse(registry, root, line, true)?;
+	let bytes = registry
+		.read_loaded_slice(root, line_start, line_end)
+		.map_err(|message| message.to_string())?;
+	let relative = byte.saturating_sub(line_start.get()).get() as usize;
+	let (start, end_exclusive) =
+		crate::core::text::display_cell_span_for_byte_offset(&bytes, relative)
+			.ok_or_else(|| "display cell is unavailable".to_string())?;
+	Ok((
+		line_start.saturating_add(start as u64),
+		line_start.saturating_add(end_exclusive.saturating_sub(1) as u64),
+	))
+}
+
 pub fn resolve_visual_ranges(
 	anchor: DocByte,
 	cursor: DocByte,
@@ -42,7 +86,11 @@ pub fn resolve_visual_ranges(
 	let end = anchor.max(cursor);
 
 	match kind {
-		VisualKind::Char => vec![(start, end)],
+		VisualKind::Char => {
+			let (start, _) = display_cell_span(buffer, start);
+			let (_, end) = display_cell_span(buffer, end);
+			vec![(start, end)]
+		}
 		VisualKind::Line => {
 			let mut expanded_start = start.get() as usize;
 			while expanded_start > 0 && buffer[expanded_start - 1] != b'\n' {
@@ -128,7 +176,11 @@ pub(crate) fn resolve_visual_ranges_sparse(
 	let end = anchor.max(cursor);
 
 	match kind {
-		VisualKind::Char => Ok(vec![(start, end)]),
+		VisualKind::Char => {
+			let (start, _) = display_cell_span_sparse(registry, root, start)?;
+			let (_, end) = display_cell_span_sparse(registry, root, end)?;
+			Ok(vec![(start, end)])
+		}
 		VisualKind::Line => {
 			let (start_line, _) = line_col_from_doc_byte_sparse(registry, root, start)?;
 			let (end_line, _) = line_col_from_doc_byte_sparse(registry, root, end)?;
@@ -234,6 +286,20 @@ mod tests {
 				b"alpha beta\n",
 			),
 			vec![(DocByte::new(3), DocByte::new(8))]
+		);
+	}
+
+	#[test]
+	fn char_ranges_expand_to_complete_graphemes() {
+		let text = "a☠️b";
+		assert_eq!(
+			resolve_visual_ranges(
+				DocByte::new(3),
+				DocByte::new(3),
+				VisualKind::Char,
+				text.as_bytes(),
+			),
+			vec![(DocByte::new(1), DocByte::new(6))]
 		);
 	}
 

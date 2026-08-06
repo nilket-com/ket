@@ -33,17 +33,20 @@ pub(crate) const MAX_MINIMAP_TEXT_BYTES: u64 = 16 * 1024 * 1024;
 #[cfg(test)]
 type SubscriberSetup = Box<dyn FnOnce(&mut EditorSession) + Send>;
 
-pub(super) fn advance_col(b: u8, line: &mut DocLine, col: &mut DocDisplayCol) {
-	if b == b'\n' {
-		*line += DocLineCount::new(1);
-		*col = DocDisplayCol::ZERO;
-	} else if b == b'\t' {
-		*col = col
-			.checked_add(TAB_SIZE - (col.get() % TAB_SIZE))
-			.expect("DocDisplayCol addition overflow");
-	} else {
-		*col = col.checked_add(1).expect("DocDisplayCol addition overflow");
-	}
+pub(super) fn advance_text(bytes: &[u8], line: &mut DocLine, col: &mut DocDisplayCol) {
+	crate::core::text::visit_display_cells(bytes, |cell| {
+		if cell.kind == crate::core::text::DisplayCellKind::Newline {
+			*line += DocLineCount::new(1);
+			*col = DocDisplayCol::ZERO;
+		} else {
+			*col = DocDisplayCol::new(crate::core::text::advance_display_col(
+				col.get(),
+				cell,
+				TAB_SIZE,
+			));
+		}
+		true
+	});
 }
 
 pub(super) fn resolve_byte_range(
@@ -94,18 +97,14 @@ pub(super) fn find_all_matches(doc_bytes: &[u8], re: &Regex) -> Vec<SearchMatch>
 	let mut prev_pos = 0usize;
 
 	for m in re.find_iter(doc_bytes) {
-		for &b in &doc_bytes[prev_pos..m.start()] {
-			advance_col(b, &mut line, &mut col);
-		}
+		advance_text(&doc_bytes[prev_pos..m.start()], &mut line, &mut col);
 		let match_len = m.end() - m.start();
 		matches.push(SearchMatch {
 			line,
 			col,
 			byte_len: match_len,
 		});
-		for &b in &doc_bytes[m.start()..m.end()] {
-			advance_col(b, &mut line, &mut col);
-		}
+		advance_text(&doc_bytes[m.start()..m.end()], &mut line, &mut col);
 		prev_pos = m.end();
 	}
 	matches

@@ -3,6 +3,7 @@ mod color;
 mod constants;
 pub mod coords;
 pub mod path;
+pub mod text;
 
 pub use atomic_file::write_private_state_atomically;
 pub use color::{DEFAULT_SEARCH_HIGHLIGHT_HEX, Rgb, SEARCH_MATCH_BG, Srgb};

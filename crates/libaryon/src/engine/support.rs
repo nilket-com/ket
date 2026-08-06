@@ -41,34 +41,24 @@ pub(crate) fn line_content_slice(doc: &[u8], target_line: DocLine) -> &[u8] {
 	}
 }
 
-pub(crate) fn advance_visual_col_only(col: &mut DocDisplayCol, b: u8) {
-	if b == b'\t' {
-		*col = col
-			.checked_add(TAB_SIZE - (col.get() % TAB_SIZE))
-			.expect("DocDisplayCol addition overflow");
-	} else if b != b'\n' {
-		*col = col.checked_add(1).expect("DocDisplayCol addition overflow");
-	}
-}
-
 pub(crate) fn line_end_visual_col(doc: &[u8], target_line: DocLine) -> DocDisplayCol {
-	let mut col = DocDisplayCol::ZERO;
-	for &b in line_content_slice(doc, target_line) {
-		advance_visual_col_only(&mut col, b);
-	}
-	col
+	DocDisplayCol::new(crate::core::text::display_width(
+		line_content_slice(doc, target_line),
+		0,
+		TAB_SIZE,
+	))
 }
 
 pub(crate) fn first_non_whitespace_visual_col(doc: &[u8], target_line: DocLine) -> DocDisplayCol {
-	let mut col = DocDisplayCol::ZERO;
-	for &b in line_content_slice(doc, target_line) {
-		match b {
-			b' ' | b'\t' => advance_visual_col_only(&mut col, b),
-			_ => return col,
-		}
-	}
-
-	DocDisplayCol::ZERO
+	let line = line_content_slice(doc, target_line);
+	let Some(whitespace_end) = line.iter().position(|byte| !matches!(byte, b' ' | b'\t')) else {
+		return DocDisplayCol::ZERO;
+	};
+	DocDisplayCol::new(crate::core::text::display_width(
+		&line[..whitespace_end],
+		0,
+		TAB_SIZE,
+	))
 }
 
 pub(crate) fn line_start_byte_sparse(

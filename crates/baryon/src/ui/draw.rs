@@ -193,7 +193,9 @@ fn paint_text_segment(
 		return *visual_y < skip_rows.saturating_add(render_height);
 	}
 
-	for c in text.chars() {
+	for cell in libaryon::core::text::display_cells(text.as_bytes()) {
+		let grapheme = &text[cell.byte_start..cell.byte_end];
+		let cell_width = cell.width.max(1) as usize;
 		if wrap_enabled {
 			while let Some(row) = render_rows.get(*next_render_row) {
 				if row.line.get() < current_doc_line
@@ -217,12 +219,12 @@ fn paint_text_segment(
 		if *visual_y >= skip_rows.saturating_add(render_height) {
 			return false;
 		}
-		if *x >= text_right {
+		if x.saturating_add(cell_width) > text_right {
 			if wrap_enabled && render_rows.get(*next_render_row).is_none() {
 				return false;
 			}
-			*x += 1;
-			*current_display_col = current_display_col.saturating_add(1);
+			*x = x.saturating_add(cell_width);
+			*current_display_col = current_display_col.saturating_add(cell_width as u32);
 			continue;
 		}
 		if *visual_y >= skip_rows {
@@ -230,12 +232,10 @@ fn paint_text_segment(
 			if screen_y >= screen_y_offset.saturating_add(render_height) {
 				return false;
 			}
-			if let Some(cell) = buf.cell_mut((*x as u16, screen_y as u16)) {
-				cell.set_char(c).set_style(style);
-			}
+			buf.set_stringn(*x as u16, screen_y as u16, grapheme, cell_width, style);
 		}
-		*x += 1;
-		*current_display_col = current_display_col.saturating_add(1);
+		*x = x.saturating_add(cell_width);
+		*current_display_col = current_display_col.saturating_add(cell_width as u32);
 	}
 
 	*visual_y < skip_rows.saturating_add(render_height)
@@ -1072,7 +1072,10 @@ fn draw_pane(
 				} else if ch == ' ' {
 					(4u8, 1usize)
 				} else {
-					(3u8, ch_len)
+					let grapheme_len =
+						libaryon::core::text::display_cell_span_for_byte_offset(remaining, 0)
+							.map_or(ch_len, |(_, end)| end);
+					(3u8, grapheme_len)
 				}
 			} else {
 				(2u8, 1usize)
@@ -1335,10 +1338,8 @@ fn draw_pane(
 					}
 				}
 				_ => {
-					let (ch, ch_len) =
-						next_utf8_chunk(remaining).expect("printable chunk must decode");
-					let mut encoded = [0u8; 4];
-					let display = ch.encode_utf8(&mut encoded);
+					let display = std::str::from_utf8(&remaining[..chunk_len])
+						.expect("printable grapheme must decode");
 					if !paint_text_segment(
 						buf,
 						&mut x,
@@ -1358,9 +1359,9 @@ fn draw_pane(
 					) {
 						visual_y = max_visual_rows;
 					}
-					byte_idx += ch_len;
+					byte_idx += chunk_len;
 					if has_physical_bytes {
-						current_global_byte = current_global_byte.saturating_add(ch_len as u64);
+						current_global_byte = current_global_byte.saturating_add(chunk_len as u64);
 					}
 					line_has_content = true;
 				}
@@ -2310,6 +2311,37 @@ mod tests {
 			.collect();
 		assert_eq!(first, "hello");
 		assert_eq!(second, "world");
+	}
+
+	#[test]
+	fn text_painting_keeps_emoji_sequences_in_one_wide_cell() {
+		let mut buffer = Buffer::empty(Rect::new(0, 0, 4, 1));
+		let mut x = 0usize;
+		let mut y = 0usize;
+		let mut col = 0u32;
+		let mut next_row = 0usize;
+
+		assert!(paint_text_segment(
+			&mut buffer,
+			&mut x,
+			&mut y,
+			0,
+			&mut col,
+			&mut next_row,
+			&[],
+			0,
+			4,
+			1,
+			0,
+			0,
+			"☠️",
+			Style::default(),
+			false,
+		));
+
+		assert_eq!(buffer[(0, 0)].symbol(), "☠️");
+		assert_eq!(x, 2);
+		assert_eq!(col, 2);
 	}
 
 	#[test]
