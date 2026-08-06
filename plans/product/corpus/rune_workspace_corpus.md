@@ -517,6 +517,31 @@ checked indexing, and ordered iteration. No geometry, domain, capacity,
 diagnostic, artifact policy, Polariton production caller, or Rune row is added;
 PRODUCT-0029 owns the first stable categorical plot-position consumer.
 
+## Accepted substrate: stable categorical palette positions
+
+PRODUCT-0029 is accepted and executable in `3d76e06b`, `13d9f7f4`,
+`d13cde78`, and `94a0aeb6`. Categorical continuation state now retains a
+validated palette position rather than baked RGB, while every completed
+`ResolvedPlotSpec` remains self-contained with exact colors. The existing
+unselected production resolver preserves its twelve colors, sequential
+assignment, filtering lifecycle, capacity refusal, and bar rendering exactly;
+PRODUCT-0030 owns the atomic switch to an authored palette.
+
+The explicit substrate consumes PRODUCT-0028's natural sequence without
+parsing theme grammar. A fresh six-category `tab20c` domain maps
+`A..F -> 0,4,8,11,15,19 -> c01,c05,c09,c12,c16,c20`; reverse and shift keep
+positions while consuming libaryon's exact permuted colors. Live growth retains
+prior meanings (`A->0`, `B->19`, `C->9`), filtering reserves absent positions,
+and geometry and palette capacity failures report either or both limits without
+mutating continuation state.
+
+For a two-field bar with no authored Color channel, the resolved artifact now
+carries exact band-fill assignments. The kernel draws those colors in category
+order without receiving a palette, allocator, or theme expression and without
+originating an encoding or legend. Authored bar color remains authoritative;
+scatter and line with absent color stay single-treatment. No Rune spelling or
+production palette caller lands in this substrate cut.
+
 ## Mutation and definition lifecycle
 
 | family | status | evidence |
@@ -546,6 +571,16 @@ PRODUCT-0029 owns the first stable categorical plot-position consumer.
 
 ## Change log
 
+- v0.29 (2026-08-05): PRODUCT-0029 replaces baked categorical continuation
+  colors with stable validated palette positions while resolved artifacts keep
+  exact render colors. Fresh known domains use even spread; live extensions use
+  deterministic maximin without moving retained meanings. Explicit `tab20c`,
+  `_r`, and `_s1` mappings prove natural-order and modifier delegation, and
+  independent geometry/palette limits refuse atomically with complete facts.
+  Two-field bars carry exact band styling without manufacturing a Color channel
+  or legend; existing production behavior remains byte-compatible behind the
+  unselected resolver. Rune palette authoring and the production switch remain
+  PRODUCT-0030.
 - v0.28 (2026-08-05): PRODUCT-0028 exposes a second authoritative optional
   sequence from libaryon's existing compact theme identity. Continuous families
   retain twenty accepted samples; six curated families expose explicit natural

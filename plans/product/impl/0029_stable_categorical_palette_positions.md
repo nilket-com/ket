@@ -218,7 +218,7 @@ crates/polariton/src/plot/kernels/bar.rs
 crates/polariton/src/plot/spec/snapshots/product-0029-legacy-categorical.txt
 crates/polariton/tests/architecture_test.rs
 plans/product/adr/0029_stable_categorical_palette_positions.md
-plans/product/corpus/rune_relation_views.md
+plans/product/corpus/rune_workspace_corpus.md
 plans/product/impl/0029_stable_categorical_palette_positions.md
 plans/product/impl/0029_stable_categorical_palette_positions_evidence.md
 ```
