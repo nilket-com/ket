@@ -5719,6 +5719,13 @@ workspace.table("bad").views([view("bad", table())]);
 
 		let (_, omitted) = completed(None, false, "tab20c");
 		assert_eq!(omitted.chrome, crate::plot::chrome::PlotChrome::DEFAULT);
+
+		let (_, below_threshold) = completed(Some("tab20c_s9"), false, "tab20c");
+		assert_eq!(
+			below_threshold.chrome.weakest_contrast().role(),
+			"title text"
+		);
+		assert!(!below_threshold.chrome.passes_contrast());
 	}
 
 	#[cfg(feature = "toron")]

@@ -1229,6 +1229,7 @@ fn product_0033_plot_skin_projection_choice_is_bounded_and_renderer_free() {
 	assert_eq!(production.matches("Theme::try_new").count(), 1);
 	assert!(!production.contains("TableSkin"));
 	assert!(!production.contains("UiPalette"));
+	assert!(!production.contains("UnsuitableTheme"));
 	assert_eq!(
 		production
 			.matches("pub enum PlotChromeProjection {")

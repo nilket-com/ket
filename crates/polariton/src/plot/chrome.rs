@@ -162,16 +162,7 @@ impl PlotChrome {
 				PlotChromeAnchors::from(theme.palette().most_contrasting_pair())
 			}
 		};
-		project_anchors(anchors).map_err(|weakest| PlotChromeProjectionError::UnsuitableTheme {
-			name: name.to_owned(),
-			projection,
-			paper_index: anchors.paper_index,
-			paper: anchors.paper,
-			ink_index: anchors.ink_index,
-			ink: anchors.ink,
-			anchor_ratio: anchors.contrast_ratio,
-			weakest,
-		})
+		Ok(project_anchors(anchors))
 	}
 
 	pub fn visible_contrast_checks(self) -> [PlotChromeContrast; 8] {
@@ -242,15 +233,6 @@ pub enum PlotChromeProjection {
 	Duotone,
 }
 
-impl PlotChromeProjection {
-	const fn label(self) -> &'static str {
-		match self {
-			Self::Ordered => "ordered",
-			Self::Duotone => "duotone",
-		}
-	}
-}
-
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct PlotChromeAnchors {
 	paper_index: usize,
@@ -296,7 +278,7 @@ fn ordered_anchors(colors: &[Rgb; 20]) -> PlotChromeAnchors {
 	}
 }
 
-fn project_anchors(anchors: PlotChromeAnchors) -> Result<PlotChrome, PlotChromeContrast> {
+fn project_anchors(anchors: PlotChromeAnchors) -> PlotChrome {
 	let paper = PlotRgba::opaque_rgb(anchors.paper);
 	let ink = PlotRgba::opaque_rgb(anchors.ink);
 	let mut chrome = PlotChrome {
@@ -313,8 +295,8 @@ fn project_anchors(anchors: PlotChromeAnchors) -> Result<PlotChrome, PlotChromeC
 		legend_swatch_border: ink,
 	};
 
-	// Choose the quietest admitted alpha. The finite list is policy, not a
-	// palette sampler, and validation below remains the final authority.
+	// Choose the quietest alpha that reaches the non-text target when possible.
+	// The contrast assay remains observable but never gates the projected skin.
 	for alpha in [0.35, 0.4, 0.5, 0.6, 0.75, 1.0] {
 		chrome.gridline.alpha = alpha;
 		if chrome
@@ -328,76 +310,18 @@ fn project_anchors(anchors: PlotChromeAnchors) -> Result<PlotChrome, PlotChromeC
 		}
 	}
 	chrome.legend_swatch_fill.alpha = chrome.gridline.alpha;
-	if chrome.passes_contrast() {
-		Ok(chrome)
-	} else {
-		Err(chrome.weakest_contrast())
-	}
+	chrome
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum PlotChromeProjectionError {
-	UnknownTheme {
-		name: String,
-	},
-	UnsuitableTheme {
-		name: String,
-		projection: PlotChromeProjection,
-		paper_index: usize,
-		paper: Rgb,
-		ink_index: usize,
-		ink: Rgb,
-		anchor_ratio: f64,
-		weakest: PlotChromeContrast,
-	},
+	UnknownTheme { name: String },
 }
 
 impl PlotChromeProjectionError {
 	pub fn name(&self) -> &str {
 		match self {
-			Self::UnknownTheme { name } | Self::UnsuitableTheme { name, .. } => name,
-		}
-	}
-
-	pub const fn paper_index(&self) -> Option<usize> {
-		match self {
-			Self::UnknownTheme { .. } => None,
-			Self::UnsuitableTheme { paper_index, .. } => Some(*paper_index),
-		}
-	}
-
-	pub const fn ink_index(&self) -> Option<usize> {
-		match self {
-			Self::UnknownTheme { .. } => None,
-			Self::UnsuitableTheme { ink_index, .. } => Some(*ink_index),
-		}
-	}
-
-	pub const fn paper(&self) -> Option<Rgb> {
-		match self {
-			Self::UnknownTheme { .. } => None,
-			Self::UnsuitableTheme { paper, .. } => Some(*paper),
-		}
-	}
-
-	pub const fn ink(&self) -> Option<Rgb> {
-		match self {
-			Self::UnknownTheme { .. } => None,
-			Self::UnsuitableTheme { ink, .. } => Some(*ink),
-		}
-	}
-
-	pub const fn anchor_ratio(&self) -> Option<f64> {
-		match self {
-			Self::UnknownTheme { .. } => None,
-			Self::UnsuitableTheme { anchor_ratio, .. } => Some(*anchor_ratio),
-		}
-	}
-
-	pub const fn weakest(&self) -> Option<PlotChromeContrast> {
-		match self {
-			Self::UnknownTheme { .. } => None,
-			Self::UnsuitableTheme { weakest, .. } => Some(*weakest),
+			Self::UnknownTheme { name } => name,
 		}
 	}
 }
@@ -406,28 +330,6 @@ impl fmt::Display for PlotChromeProjectionError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
 		match self {
 			Self::UnknownTheme { name } => write!(formatter, "unknown plot skin theme `{name}`"),
-			Self::UnsuitableTheme {
-				name,
-				projection,
-				paper_index,
-				paper,
-				ink_index,
-				ink,
-				anchor_ratio,
-				weakest,
-			} => write!(
-				formatter,
-				"{} plot skin `{name}` is unsuitable: paper #{} {:?} and ink #{} {:?} have {:.3}:1 contrast; weakest {} is {:.3}:1, below {:.1}:1",
-				projection.label(),
-				paper_index,
-				paper,
-				ink_index,
-				ink,
-				anchor_ratio,
-				weakest.role(),
-				weakest.ratio(),
-				weakest.minimum(),
-			),
 		}
 	}
 }
@@ -586,7 +488,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0032_unknown_and_low_range_fail_with_distinct_facts() {
+	fn product_0034_unknown_refuses_but_low_range_remains_observable() {
 		let unknown =
 			PlotChrome::from_theme_name("not-a-theme", PlotChromeProjection::Ordered).unwrap_err();
 		assert!(matches!(
@@ -594,7 +496,6 @@ mod tests {
 			PlotChromeProjectionError::UnknownTheme { .. }
 		));
 		assert_eq!(unknown.name(), "not-a-theme");
-		assert!(unknown.weakest().is_none());
 
 		let anchors = PlotChromeAnchors {
 			paper_index: 3,
@@ -603,24 +504,33 @@ mod tests {
 			ink: Rgb::new(120, 120, 120),
 			contrast_ratio: Rgb::new(100, 100, 100).contrast_ratio(Rgb::new(120, 120, 120)),
 		};
-		let weakest = project_anchors(anchors).unwrap_err();
-		let error = PlotChromeProjectionError::UnsuitableTheme {
-			name: "synthetic-low-range".to_owned(),
-			projection: PlotChromeProjection::Ordered,
-			paper_index: anchors.paper_index,
-			paper: anchors.paper,
-			ink_index: anchors.ink_index,
-			ink: anchors.ink,
-			anchor_ratio: anchors.contrast_ratio,
-			weakest,
-		};
-		assert_eq!(error.paper_index(), Some(3));
-		assert_eq!(error.ink_index(), Some(17));
-		assert_eq!(error.paper(), Some(Rgb::new(100, 100, 100)));
-		assert_eq!(error.ink(), Some(Rgb::new(120, 120, 120)));
-		assert!(error.anchor_ratio().unwrap() < 4.5);
-		assert_eq!(error.weakest().unwrap().minimum(), 4.5);
-		assert!(error.to_string().contains("synthetic-low-range"));
+		let chrome = project_anchors(anchors);
+		assert!(!chrome.passes_contrast());
+		assert_eq!(chrome.weakest_contrast().minimum(), 4.5);
+		assert_eq!(
+			chrome.canvas_background,
+			PlotRgba::opaque_rgb(anchors.paper)
+		);
+		assert_eq!(chrome.title_text, PlotRgba::opaque_rgb(anchors.ink));
+	}
+
+	#[test]
+	fn product_0034_tab20c_s9_renders_and_reports_its_title_fact() {
+		let chrome =
+			PlotChrome::from_theme_name("tab20c_s9", PlotChromeProjection::Ordered).unwrap();
+		assert_eq!(
+			chrome.canvas_background,
+			PlotRgba::opaque_rgb(Rgb::new(117, 107, 177))
+		);
+		assert_eq!(
+			chrome.title_text,
+			PlotRgba::opaque_rgb(Rgb::new(199, 233, 192))
+		);
+		let weakest = chrome.weakest_contrast();
+		assert_eq!(weakest.role(), "title text");
+		assert!((weakest.ratio() - 3.526).abs() < 0.001);
+		assert_eq!(weakest.minimum(), 4.5);
+		assert!(!chrome.passes_contrast());
 	}
 
 	#[test]
@@ -651,7 +561,8 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0032_theme_grammar_census_never_falls_back_or_skips_validation() {
+	fn product_0034_theme_grammar_census_always_completes_and_retains_facts() {
+		let mut below_threshold = 0;
 		for spec in libaryon::engine::THEME_SPECS {
 			for base in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
 				let expressions = std::iter::once(base.to_owned())
@@ -660,18 +571,20 @@ mod tests {
 				for expression in expressions {
 					for projection in [PlotChromeProjection::Ordered, PlotChromeProjection::Duotone]
 					{
-						match PlotChrome::from_theme_name(&expression, projection) {
-							Ok(chrome) => assert!(chrome.passes_contrast(), "{expression}"),
-							Err(PlotChromeProjectionError::UnsuitableTheme { weakest, .. }) => {
-								assert!(!weakest.passes(), "{expression}")
-							}
-							Err(error) => {
-								panic!("accepted theme grammar failed as unknown: {error}")
-							}
+						let chrome = PlotChrome::from_theme_name(&expression, projection)
+							.unwrap_or_else(|error| {
+								panic!("accepted theme grammar failed: {error}")
+							});
+						if !chrome.passes_contrast() {
+							below_threshold += 1;
 						}
 					}
 				}
 			}
 		}
+		assert!(
+			below_threshold > 0,
+			"census must exercise nonblocking classifications"
+		);
 	}
 }
