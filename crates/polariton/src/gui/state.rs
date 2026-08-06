@@ -6111,6 +6111,8 @@ workspace.table("bad").views([view("bad", table())]);
 	#[cfg(feature = "toron")]
 	#[test]
 	fn product_0038_tick_step_refuses_discrete_and_dense_requests_at_their_spans() {
+		use polars::prelude::{IntoColumn, NamedFrom};
+
 		let discrete_source =
 			"workspace.table(\"t\").views([figure([x_tick_step(1), bar(\"cat\", \"val\")])])";
 		let relation = transform_rune_view(discrete_source)
@@ -6154,6 +6156,38 @@ workspace.table("bad").views([view("bad", table())]);
 		assert_eq!(
 			&dense_source[span.start as usize..span.end as usize],
 			"y_tick_step(1e-9)"
+		);
+
+		let temporal_source =
+			"workspace.table(\"t\").views([figure([x_tick_step(1), line(\"x\", \"y\")])])";
+		let relation = transform_rune_view(temporal_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let temporal_x = polars::prelude::Series::new("x".into(), &[0_i32, 1_i32])
+			.cast(&polars::prelude::DataType::Date)
+			.unwrap();
+		let frame = polars::prelude::DataFrame::new(
+			2,
+			vec![
+				temporal_x.into_column(),
+				polars::prelude::Series::new("y".into(), &[0.0_f64, 1.0]).into_column(),
+			],
+		)
+		.unwrap();
+		let outcome = rune_view_outcome(frame, relation.views);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("temporal tick step must refuse");
+		};
+		assert!(
+			error.contains("x_tick_step(...)") && error.contains("Time"),
+			"{error}"
+		);
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&temporal_source[span.start as usize..span.end as usize],
+			"x_tick_step(1)"
 		);
 	}
 
