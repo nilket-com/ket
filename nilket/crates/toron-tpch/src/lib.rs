@@ -6017,16 +6017,22 @@ pub struct TimingAtlasReplay {
 }
 
 impl TimingAtlasReplay {
-	/// Authority requires the journal itself to support it: full cohort, one exclusion, a
-	/// terminal seal, and no recomputed violation.
-	pub fn authoritative(&self, conditions: &TimingAuthorityConditions) -> bool {
+	/// Everything the journal must show for authority *except* the terminal seal. Used when
+	/// deciding what the seal should record: the seal carries the decision, so it cannot be
+	/// a precondition of making it.
+	pub fn supports_authority(&self, conditions: &TimingAuthorityConditions) -> bool {
 		self.violations.is_empty()
 			&& self.headers == 1
 			&& self.exclusions.len() == 1
 			&& self.finalized_cells.len() == timing_atlas_cells().len()
-			&& self.terminal_seal
 			&& self.host_end_quiescent == Some(true)
 			&& conditions.granted()
+	}
+
+	/// A *published* artifact must additionally carry its terminal seal. This is the check
+	/// for reading an artifact back, not for writing one.
+	pub fn authoritative(&self, conditions: &TimingAuthorityConditions) -> bool {
+		self.supports_authority(conditions) && self.terminal_seal
 	}
 }
 
@@ -6385,7 +6391,9 @@ pub async fn run_timing_atlas(
 	let journal = std::fs::read_to_string(artifact.partial_path())
 		.map_err(|error| format!("timing atlas reread: {error}"))?;
 	let replay = timing_atlas_replay(&journal);
-	let authoritative = replay.authoritative(&conditions) && conditions.granted();
+	// The seal has not been written yet, so authority is decided on everything else the
+	// journal must show; reading the artifact back later checks the seal too.
+	let authoritative = replay.supports_authority(&conditions);
 
 	artifact.append_seal(&serde_json::json!({
 		"kind": TIMING_ATLAS_SEAL_KIND,
@@ -21569,6 +21577,26 @@ mod adr538_timing_atlas_journal_replay {
 		assert_eq!(row["ratio"], serde_json::Value::Null);
 		assert!(!row.to_string().contains("inf"));
 		assert!(!row.to_string().contains("NaN"));
+	}
+
+	/// The seal records the authority decision, so it cannot also be required to make it.
+	/// A journal missing only its seal must still *support* authority, while a published
+	/// artifact must carry one.
+	#[test]
+	fn seal_is_required_to_read_back_but_not_to_decide() {
+		let cells = timing_atlas_cells();
+		let mut rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		rows.pop(); // drop the seal, as it stands when the decision is made
+		let replay = timing_atlas_replay(&render(&rows));
+		assert!(
+			replay.supports_authority(&granted()),
+			"a complete journal supports authority before its seal exists: {:?}",
+			replay.violations
+		);
+		assert!(
+			!replay.authoritative(&granted()),
+			"but it is not a published artifact until sealed"
+		);
 	}
 }
 
