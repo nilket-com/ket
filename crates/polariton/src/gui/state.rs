@@ -42,9 +42,10 @@ use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
 	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans,
-	RunePlotTickStepSpans, RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent,
-	RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink, TransformedRuneRelation,
-	TransformedRuneView, ViewPresentation, transform as transform_rune_view,
+	RunePlotMinorTickSpans, RunePlotTickStepSpans, RuneTableSkinIntent, RuneTableSkinProjection,
+	RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink,
+	TransformedRuneRelation, TransformedRuneView, ViewPresentation,
+	transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -875,12 +876,15 @@ fn validate_rune_numeric_domain_applicability(
 	body: &RunePlotBody,
 	domain_spans: &RunePlotDomainSpans,
 	tick_step_spans: &RunePlotTickStepSpans,
+	minor_tick_spans: &RunePlotMinorTickSpans,
 	schema: &polars::prelude::Schema,
 ) -> std::result::Result<(), (std::ops::Range<u32>, String)> {
 	if domain_spans.x.is_none()
 		&& domain_spans.y.is_none()
 		&& tick_step_spans.x.is_none()
 		&& tick_step_spans.y.is_none()
+		&& minor_tick_spans.x.is_none()
+		&& minor_tick_spans.y.is_none()
 	{
 		return Ok(());
 	}
@@ -930,16 +934,41 @@ fn validate_rune_numeric_domain_applicability(
 			));
 		}
 	}
+	if let Some(span) = minor_tick_spans.x.as_ref() {
+		if !matches!(x_scale, ScaleFamily::Linear) {
+			return Err((
+				span.clone(),
+				format!(
+					"x_minor_ticks(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
+				),
+			));
+		}
+	}
+	if let Some(span) = minor_tick_spans.y.as_ref() {
+		if !matches!(y_scale, ScaleFamily::Linear) {
+			return Err((
+				span.clone(),
+				format!(
+					"y_minor_ticks(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
+				),
+			));
+		}
+	}
 	Ok(())
 }
 
 #[cfg(feature = "toron")]
-fn validate_rune_tick_step_capacity(
+fn validate_rune_tick_capacity(
 	kernel: &dyn crate::plot::common::PlotKernel,
 	settings: &crate::plot::common::ResolvedPlotSettings,
 	tick_step_spans: &RunePlotTickStepSpans,
+	minor_tick_spans: &RunePlotMinorTickSpans,
 ) -> std::result::Result<(), (std::ops::Range<u32>, String)> {
-	if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+	if tick_step_spans.x.is_none()
+		&& tick_step_spans.y.is_none()
+		&& minor_tick_spans.x.is_none()
+		&& minor_tick_spans.y.is_none()
+	{
 		return Ok(());
 	}
 	let layout = kernel.layout(settings.clone());
@@ -967,23 +996,103 @@ fn validate_rune_tick_step_capacity(
 				TickPlacementError::UnsupportedAxis { axis_type } => {
 					format!("{axis}_tick_step does not apply to {axis_type:?} axes")
 				}
+				TickPlacementError::MinorCapacity { .. } => unreachable!(),
 			};
 			return Err((span.clone().unwrap(), message));
 		}
 		Ok(())
+	};
+	let check_minor = |placement: crate::plot::common::TickPlacement,
+	                   axis: &str,
+	                   range: (f64, f64),
+	                   minor_ticks: u32,
+	                   span: &Option<std::ops::Range<u32>>|
+	 -> std::result::Result<(), (std::ops::Range<u32>, String)> {
+		let Some(span) = span else {
+			return Ok(());
+		};
+		let major = placement.positions(range).map_err(|error| {
+			let message = match error {
+				TickPlacementError::Capacity {
+					step: _,
+					range,
+					requested,
+					limit,
+				} => format!(
+					"{axis}_minor_ticks({minor_ticks}) with {placement:?} over {range:?} generates {requested} major positions, exceeding the {limit}-position capacity"
+				),
+				TickPlacementError::InvalidDomain { range } => {
+					format!("{axis}_minor_ticks({minor_ticks}) has no valid resolved domain {range:?}")
+				}
+				TickPlacementError::UnsupportedAxis { axis_type } => {
+					format!("{axis}_minor_ticks({minor_ticks}) does not apply to {axis_type:?} axes")
+				}
+				TickPlacementError::MinorCapacity { .. } => unreachable!(),
+			};
+			(span.clone(), message)
+		})?;
+		placement
+			.minor_positions(&major, minor_ticks)
+			.map_err(|error| {
+				let TickPlacementError::MinorCapacity {
+					placement,
+					minor_ticks,
+					range,
+					requested,
+					limit,
+				} = error
+				else {
+					unreachable!()
+				};
+				(
+					span.clone(),
+					format!(
+						"{axis}_minor_ticks({minor_ticks}) with {placement:?} over {range:?} generates {requested} total positions, exceeding the {limit}-position capacity"
+					),
+				)
+			})
+			.map(|_| ())
 	};
 	match layout {
 		PlotLayout::Cartesian {
 			x_range, y_range, ..
 		} => {
 			check(settings.x_tick_placement, "x", x_range, &tick_step_spans.x)?;
-			check(settings.y_tick_placement, "y", y_range, &tick_step_spans.y)
+			check(settings.y_tick_placement, "y", y_range, &tick_step_spans.y)?;
+			check_minor(
+				settings.x_tick_placement,
+				"x",
+				x_range,
+				settings.x_minor_ticks,
+				&minor_tick_spans.x,
+			)?;
+			check_minor(
+				settings.y_tick_placement,
+				"y",
+				y_range,
+				settings.y_minor_ticks,
+				&minor_tick_spans.y,
+			)
 		}
 		PlotLayout::CategoricalX { y_range, .. } => {
-			check(settings.y_tick_placement, "y", y_range, &tick_step_spans.y)
+			check(settings.y_tick_placement, "y", y_range, &tick_step_spans.y)?;
+			check_minor(
+				settings.y_tick_placement,
+				"y",
+				y_range,
+				settings.y_minor_ticks,
+				&minor_tick_spans.y,
+			)
 		}
 		PlotLayout::CategoricalY { x_range, .. } => {
-			check(settings.x_tick_placement, "x", x_range, &tick_step_spans.x)
+			check(settings.x_tick_placement, "x", x_range, &tick_step_spans.x)?;
+			check_minor(
+				settings.x_tick_placement,
+				"x",
+				x_range,
+				settings.x_minor_ticks,
+				&minor_tick_spans.x,
+			)
 		}
 		_ => Ok(()),
 	}
@@ -1115,11 +1224,12 @@ fn rune_view_outcome_with_palettes(
 		.map(|view| {
 			let presentation = view.intent.presentation();
 			let identity = view.identity;
-			let (output, tick_step_output_span) = match view.intent {
+			let (output, tick_step_output_span, minor_tick_output_span) = match view.intent {
 				RuneViewIntent::Table(table) => (
 					resolve_rune_table_skin_with(table.skin, TableSkin::from_theme_name)
 						.map(RuneRelationSinkOutput::Table),
 					None,
+					RunePlotMinorTickSpans::default(),
 				),
 				RuneViewIntent::Plot(plot) => {
 					let crate::rune_relation_envelope::RunePlotIntent {
@@ -1128,6 +1238,7 @@ fn rune_view_outcome_with_palettes(
 						plot_skin_span,
 						domain_spans,
 						tick_step_spans,
+						minor_tick_spans,
 					} = plot;
 					let authored_settings = match resolve_rune_plot_skin(authored_settings) {
 						Ok(settings) => settings,
@@ -1145,6 +1256,7 @@ fn rune_view_outcome_with_palettes(
 						&body,
 						&domain_spans,
 						&tick_step_spans,
+						&minor_tick_spans,
 						result.schema().as_ref(),
 					) {
 						return RuneRelationSinkOutcome {
@@ -1185,7 +1297,11 @@ fn rune_view_outcome_with_palettes(
 					let tick_step_output_span = tick_step_spans
 						.x
 						.clone()
-						.or_else(|| tick_step_spans.y.clone());
+						.or_else(|| tick_step_spans.y.clone())
+						.or_else(|| minor_tick_spans.x.clone())
+						.or_else(|| minor_tick_spans.y.clone());
+					let has_authored_minor_ticks =
+						minor_tick_spans.x.is_some() || minor_tick_spans.y.is_some();
 					let output = match body {
 						RunePlotBody::Single(plot) => {
 							let authored_spec = AuthoredPlotSpec::xy_color(
@@ -1206,7 +1322,10 @@ fn rune_view_outcome_with_palettes(
 								&prior_identity,
 							)
 							.and_then(|(resolved, next_identity)| {
-								if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+								if tick_step_spans.x.is_none()
+									&& tick_step_spans.y.is_none()
+									&& !has_authored_minor_ticks
+								{
 									return Ok(RuneRelationSinkOutput::Plot(
 										resolved,
 										authored_settings,
@@ -1218,10 +1337,11 @@ fn rune_view_outcome_with_palettes(
 								}
 								let kernel =
 									create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
-								validate_rune_tick_step_capacity(
+								validate_rune_tick_capacity(
 									kernel.as_ref(),
 									&resolved_tick_settings,
 									&tick_step_spans,
+									&minor_tick_spans,
 								)
 								.map_err(|(_, error)| error)?;
 								Ok(RuneRelationSinkOutput::Plot(
@@ -1237,7 +1357,10 @@ fn rune_view_outcome_with_palettes(
 						RunePlotBody::StyledSingle(styled) => match styled.into_layer() {
 							Ok(layer) => {
 								let specification = LayeredPlotSpec::new(layer);
-								if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+								if tick_step_spans.x.is_none()
+									&& tick_step_spans.y.is_none()
+									&& !has_authored_minor_ticks
+								{
 									Ok(RuneRelationSinkOutput::LayeredPlot(
 										specification,
 										authored_settings,
@@ -1246,10 +1369,11 @@ fn rune_view_outcome_with_palettes(
 									create_layered_plot(&specification, result.as_ref(), 1200, 720)
 										.map_err(|error| error.to_string())
 										.and_then(|kernel| {
-											validate_rune_tick_step_capacity(
+											validate_rune_tick_capacity(
 												kernel.as_ref(),
 												&resolved_tick_settings,
 												&tick_step_spans,
+												&minor_tick_spans,
 											)
 											.map_err(|(_, error)| error)
 											.map(|_| {
@@ -1281,7 +1405,9 @@ fn rune_view_outcome_with_palettes(
 									&prior_identity,
 								)
 								.and_then(|(resolved, next_identity)| {
-									if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+									if tick_step_spans.x.is_none()
+										&& tick_step_spans.y.is_none() && !has_authored_minor_ticks
+									{
 										return Ok(RuneRelationSinkOutput::StyledPlot(
 											resolved,
 											settings,
@@ -1299,10 +1425,11 @@ fn rune_view_outcome_with_palettes(
 									)
 									.map_err(|error| error.to_string())
 									.and_then(|kernel| {
-										validate_rune_tick_step_capacity(
+										validate_rune_tick_capacity(
 											kernel.as_ref(),
 											&resolved_tick_settings,
 											&tick_step_spans,
+											&minor_tick_spans,
 										)
 										.map_err(|(_, error)| error)
 										.map(|_| {
@@ -1321,7 +1448,10 @@ fn rune_view_outcome_with_palettes(
 							}
 						},
 						RunePlotBody::Layered(specification) => {
-							if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+							if tick_step_spans.x.is_none()
+								&& tick_step_spans.y.is_none()
+								&& !has_authored_minor_ticks
+							{
 								Ok(RuneRelationSinkOutput::LayeredPlot(
 									specification,
 									authored_settings,
@@ -1330,10 +1460,11 @@ fn rune_view_outcome_with_palettes(
 								create_layered_plot(&specification, result.as_ref(), 1200, 720)
 									.map_err(|error| error.to_string())
 									.and_then(|kernel| {
-										validate_rune_tick_step_capacity(
+										validate_rune_tick_capacity(
 											kernel.as_ref(),
 											&resolved_tick_settings,
 											&tick_step_spans,
+											&minor_tick_spans,
 										)
 										.map_err(|(_, error)| error)
 										.map(|_| {
@@ -1346,14 +1477,22 @@ fn rune_view_outcome_with_palettes(
 							}
 						}
 					};
-					(output, tick_step_output_span)
+					(output, tick_step_output_span, minor_tick_spans)
 				}
 			};
-			let output_span = if output.is_err() {
-				tick_step_output_span
-			} else {
-				None
-			};
+			let output_span = output.as_ref().err().and_then(|error| {
+				if error.contains("_minor_ticks") {
+					minor_tick_output_span
+						.x
+						.clone()
+						.or_else(|| minor_tick_output_span.y.clone())
+						.or(tick_step_output_span)
+				} else {
+					tick_step_output_span
+						.or_else(|| minor_tick_output_span.x.clone())
+						.or_else(|| minor_tick_output_span.y.clone())
+				}
+			});
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
@@ -6188,6 +6327,143 @@ workspace.table("bad").views([view("bad", table())]);
 		assert_eq!(
 			&temporal_source[span.start as usize..span.end as usize],
 			"x_tick_step(1)"
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0039_minor_ticks_toggle_and_combined_capacity_are_attributed() {
+		use polars::prelude::{IntoColumn, NamedFrom};
+
+		let off_source =
+			"workspace.table(\"t\").views([figure([y_minor_ticks(0), bar(\"cat\", \"val\")])])";
+		let relation = transform_rune_view(off_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(categorical_bar_frame(&["A", "B"]), relation.views);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(_, authored, _)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("zero minor count must render");
+		};
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		assert_eq!(settings.y_minor_ticks, 0);
+		assert_eq!(settings.x_minor_ticks, 4);
+
+		let discrete_source =
+			"workspace.table(\"t\").views([figure([x_minor_ticks(1), bar(\"cat\", \"val\")])])";
+		let relation = transform_rune_view(discrete_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(categorical_bar_frame(&["A", "B"]), relation.views);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("categorical minor ticks must refuse");
+		};
+		assert!(error.contains("x_minor_ticks(...)") && error.contains("Band"));
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&discrete_source[span.start as usize..span.end as usize],
+			"x_minor_ticks(1)"
+		);
+
+		let temporal_source =
+			"workspace.table(\"t\").views([figure([x_minor_ticks(1), line(\"x\", \"y\")])])";
+		let relation = transform_rune_view(temporal_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let temporal_x = polars::prelude::Series::new("x".into(), &[0_i32, 1_i32])
+			.cast(&polars::prelude::DataType::Date)
+			.unwrap();
+		let frame = polars::prelude::DataFrame::new(
+			2,
+			vec![
+				temporal_x.into_column(),
+				polars::prelude::Series::new("y".into(), &[0.0_f64, 1.0]).into_column(),
+			],
+		)
+		.unwrap();
+		let outcome = rune_view_outcome(frame, relation.views);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("temporal minor ticks must refuse");
+		};
+		assert!(error.contains("x_minor_ticks(...)") && error.contains("Time"));
+
+		let major_alone = "workspace.table(\"t\").views([figure([y_bounds(0, 7), y_tick_step(0.001), line(\"x\", \"y\")])])";
+		let relation = transform_rune_view(major_alone)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [0.0_f64, 7.0], "y" => [0.0_f64, 7.0]).unwrap(),
+			relation.views,
+		);
+		assert!(outcome.sinks[0].output.is_ok());
+
+		let minor_alone = "workspace.table(\"t\").views([figure([y_bounds(0, 7), y_minor_ticks(9), line(\"x\", \"y\")])])";
+		let relation = transform_rune_view(minor_alone)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [0.0_f64, 7.0], "y" => [0.0_f64, 7.0]).unwrap(),
+			relation.views,
+		);
+		assert!(outcome.sinks[0].output.is_ok());
+
+		let combined = "workspace.table(\"t\").views([figure([y_bounds(0, 7), y_tick_step(0.001), y_minor_ticks(9), line(\"x\", \"y\")])])";
+		let relation = transform_rune_view(combined)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [0.0_f64, 7.0], "y" => [0.0_f64, 7.0]).unwrap(),
+			relation.views,
+		);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("combined minor lattice must refuse");
+		};
+		assert!(
+			error.contains("y_minor_ticks(9)")
+				&& error.contains("Step")
+				&& error.contains("70001")
+				&& error.contains("capacity"),
+			"{error}"
+		);
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&combined[span.start as usize..span.end as usize],
+			"y_minor_ticks(9)"
+		);
+
+		let huge = "workspace.table(\"t\").views([figure([y_minor_ticks(4294967295), line(\"x\", \"y\")])])";
+		let relation = transform_rune_view(huge)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [0.0_f64, 7.0], "y" => [0.0_f64, 7.0]).unwrap(),
+			relation.views,
+		);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("huge minor count must refuse before allocation");
+		};
+		assert!(
+			error.contains("4294967295") && error.contains("capacity"),
+			"{error}"
 		);
 	}
 

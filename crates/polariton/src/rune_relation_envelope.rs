@@ -61,6 +61,7 @@ pub(crate) struct RunePlotIntent {
 	pub(crate) plot_skin_span: Option<Range<u32>>,
 	pub(crate) domain_spans: RunePlotDomainSpans,
 	pub(crate) tick_step_spans: RunePlotTickStepSpans,
+	pub(crate) minor_tick_spans: RunePlotMinorTickSpans,
 }
 
 impl PartialEq for RunePlotIntent {
@@ -77,6 +78,12 @@ pub(crate) struct RunePlotDomainSpans {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RunePlotTickStepSpans {
+	pub(crate) x: Option<Range<u32>>,
+	pub(crate) y: Option<Range<u32>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunePlotMinorTickSpans {
 	pub(crate) x: Option<Range<u32>>,
 	pub(crate) y: Option<Range<u32>>,
 }
@@ -116,6 +123,7 @@ impl RunePlotIntent {
 			plot_skin_span: None,
 			domain_spans: RunePlotDomainSpans::default(),
 			tick_step_spans: RunePlotTickStepSpans::default(),
+			minor_tick_spans: RunePlotMinorTickSpans::default(),
 		}
 	}
 }
@@ -1184,6 +1192,8 @@ fn parse_figure(
 	let mut y_bounds = None;
 	let mut x_tick_step = None;
 	let mut y_tick_step = None;
+	let mut x_minor_ticks = None;
+	let mut y_minor_ticks = None;
 	let mut body = None;
 	for (item, _) in list.items.iter() {
 		if let Some(selection) = parse_figure_skin(item, source)? {
@@ -1204,7 +1214,7 @@ fn parse_figure(
 			return invalid_view(
 				item.span(),
 				source.len(),
-				"a figure child must be title(...), subtitle(...), skin(...), palette(...), x_bounds(...), y_bounds(...), x_tick_step(...), y_tick_step(...), or one plot body",
+				"a figure child must be title(...), subtitle(...), skin(...), palette(...), x_bounds(...), y_bounds(...), x_tick_step(...), y_tick_step(...), x_minor_ticks(...), y_minor_ticks(...), or one plot body",
 			);
 		};
 		let callee = source_slice(source, call.expr.span())?.trim();
@@ -1292,6 +1302,32 @@ fn parse_figure(
 					u32_range(&byte_range(item.span(), source.len())?, "y tick step")?,
 				));
 			}
+			"x_minor_ticks" => {
+				if x_minor_ticks.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one x_minor_ticks element",
+					);
+				}
+				x_minor_ticks = Some((
+					parse_figure_minor_ticks(item, &child_args, source, "x_minor_ticks")?,
+					u32_range(&byte_range(item.span(), source.len())?, "x minor ticks")?,
+				));
+			}
+			"y_minor_ticks" => {
+				if y_minor_ticks.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one y_minor_ticks element",
+					);
+				}
+				y_minor_ticks = Some((
+					parse_figure_minor_ticks(item, &child_args, source, "y_minor_ticks")?,
+					u32_range(&byte_range(item.span(), source.len())?, "y minor ticks")?,
+				));
+			}
 			_ => {
 				if body.is_some() {
 					return invalid_view(
@@ -1337,8 +1373,14 @@ fn parse_figure(
 		x: x_bounds.map(|(_, span)| span),
 		y: y_bounds.map(|(_, span)| span),
 	};
-	if x_tick_step.is_some() || y_tick_step.is_some() {
+	if x_tick_step.is_some()
+		|| y_tick_step.is_some()
+		|| x_minor_ticks.is_some()
+		|| y_minor_ticks.is_some()
+	{
 		let mut guides = PlotGuideSettings::default();
+		let default_x_minor_ticks = guides.x_minor_ticks;
+		let default_y_minor_ticks = guides.y_minor_ticks;
 		guides.x_tick_placement = x_tick_step
 			.as_ref()
 			.map(|(step, _)| TickPlacement::step(*step).expect("validated tick step"))
@@ -1347,11 +1389,23 @@ fn parse_figure(
 			.as_ref()
 			.map(|(step, _)| TickPlacement::step(*step).expect("validated tick step"))
 			.unwrap_or(TickPlacement::DEFAULT);
+		guides.x_minor_ticks = x_minor_ticks
+			.as_ref()
+			.map(|(count, _)| *count)
+			.unwrap_or(default_x_minor_ticks);
+		guides.y_minor_ticks = y_minor_ticks
+			.as_ref()
+			.map(|(count, _)| *count)
+			.unwrap_or(default_y_minor_ticks);
 		authored_settings.guides = Override::Set(guides);
 	}
 	let tick_step_spans = RunePlotTickStepSpans {
 		x: x_tick_step.map(|(_, span)| span),
 		y: y_tick_step.map(|(_, span)| span),
+	};
+	let minor_tick_spans = RunePlotMinorTickSpans {
+		x: x_minor_ticks.map(|(_, span)| span),
+		y: y_minor_ticks.map(|(_, span)| span),
 	};
 	Ok(RunePlotIntent {
 		body,
@@ -1359,6 +1413,7 @@ fn parse_figure(
 		plot_skin_span,
 		domain_spans,
 		tick_step_spans,
+		minor_tick_spans,
 	})
 }
 
@@ -1399,6 +1454,45 @@ fn parse_figure_tick_step(
 		);
 	}
 	Ok(step)
+}
+
+fn parse_figure_minor_ticks(
+	outer: &ast::Expr,
+	args: &[&ast::Expr],
+	source: &str,
+	constructor: &str,
+) -> Result<u32, RuneEnvelopeError> {
+	let [argument] = args else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) takes exactly one numeric literal"),
+		);
+	};
+	let Some(count) = parse_signed_numeric_literal(argument, source) else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!(
+				"{constructor}(...) requires an unsuffixed numeric literal, optionally negated"
+			),
+		);
+	};
+	if !count.is_finite() {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) requires a finite count"),
+		);
+	}
+	if count < 0.0 || count.fract() != 0.0 || count > u32::MAX as f64 {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) count must be a non-negative integer"),
+		);
+	}
+	Ok(count as u32)
 }
 
 fn parse_figure_bounds(
@@ -3416,6 +3510,74 @@ workspace.table("t").views([table()])
 			"y_tick_step(2)"
 		);
 		assert!(message.contains("at most one y_tick_step"));
+	}
+
+	#[test]
+	fn product_0039_minor_ticks_lower_as_independent_counts() {
+		for (literal, expected) in [("0", 0), ("1", 1), ("1.0", 1), ("4294967295", u32::MAX)] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([x_minor_ticks({literal}), y_minor_ticks({literal}), bar(\"cat\", \"val\")])])"
+			);
+			let transformed = transform(&source).expect("minor tick figure");
+			let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+				panic!("expected plot");
+			};
+			let Override::Set(guides) = &plot.authored_settings.guides else {
+				panic!("expected guide override");
+			};
+			assert_eq!(guides.x_minor_ticks, expected);
+			assert_eq!(guides.y_minor_ticks, expected);
+		}
+
+		let source =
+			"workspace.table(\"t\").views([figure([y_minor_ticks(1), bar(\"cat\", \"val\")])])";
+		let transformed = transform(source).expect("single minor axis");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("expected plot");
+		};
+		assert!(plot.minor_tick_spans.x.is_none());
+		assert_eq!(
+			&source[plot.minor_tick_spans.y.clone().unwrap().start as usize
+				..plot.minor_tick_spans.y.clone().unwrap().end as usize],
+			"y_minor_ticks(1)"
+		);
+	}
+
+	#[test]
+	fn product_0039_minor_tick_value_refusals_are_attributed() {
+		for (constructor, expected) in [
+			("y_minor_ticks(-1)", "count must be a non-negative integer"),
+			("y_minor_ticks(2.5)", "count must be a non-negative integer"),
+			("y_minor_ticks(1e999)", "requires a finite count"),
+			(
+				"y_minor_ticks(value)",
+				"requires an unsuffixed numeric literal",
+			),
+			("y_minor_ticks()", "takes exactly one numeric literal"),
+		] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([{constructor}, line(\"x\", \"y\")])])"
+			);
+			let RuneEnvelopeError::InvalidView { span, message } =
+				transform(&source).expect_err("invalid minor count must refuse")
+			else {
+				panic!("expected invalid-view refusal");
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], constructor);
+			assert!(message.contains(expected), "{message}");
+		}
+
+		let duplicate = "workspace.table(\"t\").views([figure([y_minor_ticks(1), y_minor_ticks(2), line(\"x\", \"y\")])])";
+		let RuneEnvelopeError::InvalidView { span, message } =
+			transform(duplicate).expect_err("duplicate minor count must refuse")
+		else {
+			panic!("expected duplicate refusal");
+		};
+		assert_eq!(
+			&duplicate[span.start as usize..span.end as usize],
+			"y_minor_ticks(2)"
+		);
+		assert!(message.contains("at most one y_minor_ticks"));
 	}
 
 	#[test]

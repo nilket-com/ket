@@ -1059,6 +1059,37 @@ fn product_0038_tick_step_is_the_only_surface_producer_of_step_placement() {
 }
 
 #[test]
+fn product_0039_minor_ticks_have_one_surface_producer_and_checked_total_capacity() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let production = envelope
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("Rune envelope production");
+	let figure_parser = production
+		.split("fn parse_figure(")
+		.nth(1)
+		.expect("figure parser")
+		.split("fn parse_figure_bounds(")
+		.next()
+		.expect("bounded figure parser");
+	assert!(figure_parser.contains("\"x_minor_ticks\" =>"));
+	assert!(figure_parser.contains("\"y_minor_ticks\" =>"));
+	assert!(production.contains("fn parse_figure_minor_ticks("));
+	assert!(production.contains("count must be a non-negative integer"));
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let common_production = common
+		.split("#[cfg(test)]\nmod product_0031_pre_extraction_oracle")
+		.next()
+		.expect("plot common production");
+	assert!(common_production.contains("MinorCapacity"));
+	assert!(common_production.contains("checked_mul(minor_intervals as usize)"));
+	assert!(common_production.contains("checked_add(minor_count)"));
+}
+
+#[test]
 fn product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let libaryon_theme = manifest_dir.join("../libaryon/src/engine/theme.rs");

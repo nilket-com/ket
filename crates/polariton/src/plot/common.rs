@@ -106,9 +106,31 @@ impl TickPlacement {
 		}
 	}
 
-	pub fn minor_positions(self, major: &[f64], minor_intervals: u32) -> Vec<f64> {
+	pub fn minor_positions(
+		self,
+		major: &[f64],
+		minor_intervals: u32,
+	) -> Result<Vec<f64>, TickPlacementError> {
 		if minor_intervals == 0 {
-			return Vec::new();
+			return Ok(Vec::new());
+		}
+		let major_count = major.len();
+		let interval_count = major_count.saturating_sub(1);
+		let minor_count = interval_count
+			.checked_mul(minor_intervals as usize)
+			.unwrap_or(usize::MAX);
+		let total = major_count.checked_add(minor_count).unwrap_or(usize::MAX);
+		if total > MAX_GENERATED_TICK_POSITIONS {
+			return Err(TickPlacementError::MinorCapacity {
+				placement: self,
+				minor_ticks: minor_intervals,
+				range: (
+					*major.first().unwrap_or(&0.0),
+					*major.last().unwrap_or(&0.0),
+				),
+				requested: total,
+				limit: MAX_GENERATED_TICK_POSITIONS,
+			});
 		}
 		match self {
 			Self::Count(intervals) => {
@@ -116,7 +138,7 @@ impl TickPlacement {
 					*major.first().unwrap_or(&0.0),
 					*major.last().unwrap_or(&0.0),
 				);
-				(0..intervals.get())
+				Ok((0..intervals.get())
 					.flat_map(|index| {
 						(1..=minor_intervals).filter_map(move |minor| {
 							let t = (index as f64 + minor as f64 / (minor_intervals + 1) as f64)
@@ -124,9 +146,9 @@ impl TickPlacement {
 							(t <= 1.0).then(|| range.0 + (range.1 - range.0) * t)
 						})
 					})
-					.collect()
+					.collect())
 			}
-			Self::Step(_) => major
+			Self::Step(_) => Ok(major
 				.windows(2)
 				.flat_map(|window| {
 					(1..=minor_intervals).map(move |index| {
@@ -135,7 +157,7 @@ impl TickPlacement {
 								* (index as f64 / (minor_intervals + 1) as f64)
 					})
 				})
-				.collect(),
+				.collect()),
 		}
 	}
 }
@@ -151,6 +173,13 @@ pub enum TickPlacementError {
 		step: f64,
 		range: (f64, f64),
 		requested: f64,
+		limit: usize,
+	},
+	MinorCapacity {
+		placement: TickPlacement,
+		minor_ticks: u32,
+		range: (f64, f64),
+		requested: usize,
 		limit: usize,
 	},
 	UnsupportedAxis {
@@ -749,7 +778,9 @@ impl<'a> PlotWidget<'a> {
 		minor_intervals: u32,
 	) -> Vec<f64> {
 		let major = self.major_tick_positions(placement, range);
-		placement.minor_positions(&major, minor_intervals)
+		placement
+			.minor_positions(&major, minor_intervals)
+			.unwrap_or_default()
 	}
 
 	fn plot_area(&self, bounds: Rectangle) -> Rectangle {
@@ -2068,7 +2099,9 @@ mod product_0037_count_position_oracle {
 			]
 		);
 		assert_eq!(
-			placement.minor_positions(&placement.positions((0.0, 7.0)).unwrap(), 4),
+			placement
+				.minor_positions(&placement.positions((0.0, 7.0)).unwrap(), 4)
+				.unwrap(),
 			legacy_minor_positions((0.0, 7.0), 8, 4)
 		);
 	}
@@ -2097,7 +2130,9 @@ mod product_0037_count_position_oracle {
 			vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
 		);
 		assert_eq!(
-			placement.minor_positions(&placement.positions((0.0, 7.0)).unwrap(), 1),
+			placement
+				.minor_positions(&placement.positions((0.0, 7.0)).unwrap(), 1)
+				.unwrap(),
 			vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5]
 		);
 	}
@@ -2124,6 +2159,45 @@ mod product_0037_count_position_oracle {
 			Err(TickPlacementError::UnsupportedAxis {
 				axis_type: AxisType::Time
 			})
+		));
+	}
+
+	#[test]
+	fn product_0039_minor_subdivision_is_counted_and_capacity_checked() {
+		for placement in [
+			TickPlacement::count(4).unwrap(),
+			TickPlacement::step(1.0).unwrap(),
+		] {
+			let major = placement.positions((0.0, 4.0)).unwrap();
+			let minor = placement.minor_positions(&major, 1).unwrap();
+			assert_eq!(minor, vec![0.5, 1.5, 2.5, 3.5]);
+			assert_eq!(minor.len(), major.len() - 1);
+			assert!(minor.iter().all(|position| !major.contains(position)));
+			assert_eq!(
+				placement.minor_positions(&major, 0).unwrap(),
+				Vec::<f64>::new()
+			);
+		}
+
+		let count = TickPlacement::count(8).unwrap();
+		let major = count.positions((0.0, 7.0)).unwrap();
+		assert!(matches!(
+			count.minor_positions(&major, 1_249),
+			Err(TickPlacementError::MinorCapacity {
+				minor_ticks: 1_249,
+				requested: 10_001,
+				limit: MAX_GENERATED_TICK_POSITIONS,
+				..
+			})
+		));
+		assert!(matches!(
+			count.minor_positions(&major, u32::MAX),
+			Err(TickPlacementError::MinorCapacity {
+				minor_ticks: u32::MAX,
+				requested,
+				limit: MAX_GENERATED_TICK_POSITIONS,
+				..
+			}) if requested > MAX_GENERATED_TICK_POSITIONS
 		));
 	}
 }
