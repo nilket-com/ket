@@ -1,6 +1,6 @@
 # ADR 0036: authored numeric axis bounds
 
-Status: proposed 2026-08-06. This record decides one thing: the Rune spelling
+Status: accepted 2026-08-06. This record decides one thing: the Rune spelling
 that sets a figure's numeric axis bounds, and the lowering that reaches the
 cascade slot already holding them. It adds no substrate, no kernel change, and no
 new cascade algebra. Discrete axes are out of scope.

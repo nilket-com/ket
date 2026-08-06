@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.35. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.36. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -37,6 +37,7 @@ a cited record).
 | producer-scoped view panel placement (automatic visible tiling; no inferred tabs) | executable | PRODUCT-0015's thirteen gates: `product_0015_host_panel_groups_tile_atomically_and_fallback_visibly` proves atomic 2x2 placement and all-visible decline; `rune_view_collection_tiles_one_forward_producer_group_without_tabs` proves forward table/layered/table/bar order, Compact/Expansive sizing, unchanged reruns, and Retile no-op; detachment/reset/lifecycle and two-producer isolation land in `6d67e95b`, `fd968496`, `a287b770`, and `67c8f2f5`. PRODUCT-0011's explicit `Split`/`TabWith` remains unchanged. |
 | layered plot sink (`layers([line(x, y), scatter(x, y)])`) | executable | PRODUCT-0013's ordered substrate and PRODUCT-0014's surface are accepted; thirteen surface gates land in `c3edc520`, `a10b4995`, `56c8cb88`, and `d52fc31d`, with installed `test6.rn` dogfood confirming labels, paint order, ordinary host panels, and no dashboard |
 | figure-wide headings (`figure([title(text), subtitle(text), body])`) | executable | PRODUCT-0016's twelve gates in `4278e762`, `267e48c1`, `a39ffd9d`, and `764e2b64`; exact grammar spans, independent settings/body lowering, projected source-current chrome, rendered completion-atomic canvas, stale/removal lifecycle, and installed `test7.rn` launch |
+| authored numeric axis bounds (`figure([x_bounds(min, max), y_bounds(min, max), body])`) | executable | PRODUCT-0036 adds paired finite literal bounds at figure scope and lowers both axes through one existing domain override (`2ad9357e`). Numeric applicability is checked per resolved axis: a vertical bar admits `y_bounds` and attributes categorical `x_bounds` locally. Excluding all data and any strictly ordered finite span, including `0.0..1e-300`, render exactly; collapse, inversion, non-finite values, malformed literals, and duplicates refuse at the constructor. Layered plots retain one shared Cartesian domain; omission is unchanged. |
 | theme-projected plot chrome (`figure([skin("theme_expression"), body])`; optional `.duotone()`) | executable | PRODUCT-0032 establishes exact figure grammar and atomic host lifecycle. PRODUCT-0033 makes ordinary skin preserve the ordered background slot and retains strongest-pair collapse as explicit `.duotone()` in `5871be41`. PRODUCT-0034 makes contrast observational: every known theme renders exact projected chrome, including below-threshold `tab20c_s9`, while unknown identity still refuses (`f904536d`). Skin never colors data; palette never colors chrome; omission preserves PRODUCT-0031's compatibility default. |
 | relative scatter point size (`scatter(x, y).point_size(factor)`) | executable | PRODUCT-0017 proves the typed layer setting and all scatter renderer/hit/cache paths; PRODUCT-0018's closed contextual register, exact lowering/refusals, shared-result handoff, byte-identical `1.0`, six-pixel-radius `2.0`, identity/label lifecycle, and no-dashboard host completion land in `5d180e0c` and `0478f8a2`; installed `test7.rn` exercises the accepted `8.0` maximum |
 | relative line stroke width (`line(x, y).stroke_width(factor)`) | executable | PRODUCT-0019 proves the typed layer setting, five-tier selection, exact line paint/hit behavior, fixed guide, and styled-one-layer scale preservation; PRODUCT-0020's closed contextual lowering/refusals, shared-result handoff, byte-identical `1.0`, exact 4px `2.0`, identity/label lifecycle, and combined point-size host assay land in `01a66f4d`; installed `test7.rn` exercises both modifiers in one figure |
@@ -586,6 +587,14 @@ PRODUCT-0032 owns the first theme-name projection and direct figure
 | bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
+
+- v0.36 (2026-08-06): PRODUCT-0036 exposes the existing numeric domain slot as
+  figure-wide `x_bounds(min, max)` and `y_bounds(min, max)`. Paired finite
+  literals, including direct unary negatives, lower once and reach every
+  existing Cartesian renderer. Exclusion and arbitrarily small positive spans
+  render as authored; collapse, inversion, malformed values, duplicates, and
+  bounds on a resolved discrete axis refuse at the exact constructor. No
+  minimum-span threshold, per-mark domain, kernel change, or silent drop exists.
 
 - v0.35 (2026-08-06): PRODUCT-0035 makes authored table-skin contrast an inert
   measurement rather than an admission gate. Every registered theme expression
