@@ -25,8 +25,8 @@ Two substrate facts make this a record rather than a spelling.
 ambiguity into the surface permanently.
 
 **There is no generator.** Positions are recomputed inline at **sixteen** loops
-in `common.rs` — eight major loops of the form `for i in 0..=ticks { let t = i as
-f64 / ticks as f64 }` and eight minor loops of the form `for i in 0..ticks`, at
+in `common.rs` — nine major loops of the form `for i in 0..=ticks { let t = i as
+f64 / ticks as f64 }` and seven minor loops of the form `for i in 0..ticks`, at
 lines 998, 1020, 1042, 1058, 1109, 1131, 1150, 1178, 1248, 1267, 1308, 1407,
 1430, 1475, 1636, and 1658. Labels, major ticks, major gridlines, and minor
 gridlines each derive their own positions. That is harmless while every position
