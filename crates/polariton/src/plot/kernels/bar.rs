@@ -1,7 +1,7 @@
 use crate::plot::common::{
 	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
-use crate::plot::spec::LayerSettings;
+use crate::plot::spec::{BandFillAssignment, LayerSettings};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::Text;
@@ -14,6 +14,7 @@ pub struct BarPlotKernel {
 	pub prepared_data: Arc<BarPreparedData>,
 	pub orientation: Orientation,
 	pub layer_settings: LayerSettings,
+	pub band_fills: Vec<BandFillAssignment>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -169,16 +170,27 @@ impl PlotKernel for BarPlotKernel {
 	) {
 		let num_groups = self.prepared_data.group_names.len();
 		for bar in self.bar_rectangles(transform, settings.bar_width.fraction()) {
-			let t = if num_groups > 1 {
-				bar.group_index as f32 / (num_groups - 1) as f32
+			let category = &self.prepared_data.categories[bar.category_index];
+			let color = if let Some(assignment) = self
+				.band_fills
+				.iter()
+				.find(|assignment| assignment.category == *category)
+			{
+				Color::from_rgba8(
+					assignment.color.red,
+					assignment.color.green,
+					assignment.color.blue,
+					assignment.color.alpha as f32 / u8::MAX as f32,
+				)
 			} else {
-				0.5
+				let t = if num_groups > 1 {
+					bar.group_index as f32 / (num_groups - 1) as f32
+				} else {
+					0.5
+				};
+				settings.color_theme.get_color(t)
 			};
-			backend.fill_rectangle(
-				bar.rect.position(),
-				bar.rect.size(),
-				settings.color_theme.get_color(t),
-			);
+			backend.fill_rectangle(bar.rect.position(), bar.rect.size(), color);
 		}
 	}
 

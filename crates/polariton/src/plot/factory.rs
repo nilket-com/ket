@@ -22,9 +22,9 @@ use crate::plot::kernels::stacked_area::{self, StackedAreaPlotKernel};
 use crate::plot::kernels::stacked_bar::{self, StackedBarPlotKernel};
 use crate::plot::kernels::violin::{self, ViolinPlotKernel};
 use crate::plot::spec::{
-	Channel, LayerMark, LayerSettings, LayeredPlotSpec, NonEmpty, PlotProvenance,
-	ResolvedKernelFields, ResolvedLayerSpec, ResolvedLayout, ResolvedPlotSpec, StampedResult,
-	resolve_layered_channels, resolve_layered_domains,
+	BandFillAssignment, Channel, LayerMark, LayerSettings, LayeredPlotSpec, NonEmpty,
+	PlotProvenance, ResolvedKernelFields, ResolvedLayerSpec, ResolvedLayout, ResolvedPlotSpec,
+	StampedResult, resolve_layered_channels, resolve_layered_domains,
 };
 use polars::frame::DataFrame;
 use std::sync::Arc;
@@ -70,6 +70,7 @@ pub fn create_plot(
 			value,
 			plot_type,
 			LayerSettings::default(),
+			&spec.band_fills,
 		),
 		ResolvedKernelFields::Scatter { color, x, y } => {
 			let scatter_data = Arc::new(scatter::prepare_scatter_data_resolved(
@@ -232,6 +233,7 @@ fn create_bar_kernel(
 	value: &str,
 	plot_type: PlotType,
 	layer_settings: LayerSettings,
+	band_fills: &[BandFillAssignment],
 ) -> Arc<dyn PlotKernel + Send + Sync> {
 	Arc::new(BarPlotKernel {
 		prepared_data: Arc::new(bar::prepare_bar_data(df, category, group, value)),
@@ -241,6 +243,7 @@ fn create_bar_kernel(
 			Orientation::Vertical
 		},
 		layer_settings,
+		band_fills: band_fills.to_vec(),
 	})
 }
 
@@ -264,6 +267,7 @@ pub fn create_styled_plot(
 			value,
 			plot_type,
 			layer_settings,
+			&spec.band_fills,
 		)),
 		_ => Err("standalone Layer settings are not implemented for this plot mark".to_owned()),
 	}
@@ -413,8 +417,9 @@ mod product_0013_baseline_tests {
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::export::SvgBackend;
 	use crate::plot::spec::{
-		AuthoredPlotSpec, BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override,
-		PointSize,
+		AuthoredPlotSpec, BarWidth, CategoricalPaletteSelection, Channel, ColorIdentity, LayerMark,
+		LayerSettings, LayerSpec, LayeredPlotSpec, Override, PlotProvenance, PointSize,
+		StampedResult, resolve_channels, resolve_domains_with_categorical_palette,
 	};
 	use crate::plot::theme::PlotSettings;
 	use iced::advanced::mouse::Cursor;
@@ -520,10 +525,56 @@ mod product_0013_baseline_tests {
 				prepared_data: Arc::clone(&prepared),
 				orientation,
 				layer_settings: LayerSettings::default(),
+				band_fills: Vec::new(),
 			};
 			let rendered = render_marks(&kernel);
 			assert_eq!(rendered, expected);
 			assert_ne!(rendered, legacy, "the hidden 80% inset must be retired");
+		}
+	}
+
+	#[test]
+	fn product_0029_bar_draw_consumes_exact_band_fills_in_category_order() {
+		let frame = df!(
+			"cat" => ["A", "B", "C", "D", "E", "F"],
+			"val" => [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+		)
+		.expect("categorical bar frame");
+		let authored = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "cat", "val");
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0029".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").unwrap();
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.unwrap();
+		assert!(resolved.channel(Channel::Color).is_none());
+		assert_eq!(resolved.band_fills.len(), 6);
+
+		let svg = render_marks(create_plot(&resolved, &frame, 100, 100).as_ref());
+		let expected = [
+			"fill=\"rgb(49, 130, 189)\"",
+			"fill=\"rgb(230, 85, 13)\"",
+			"fill=\"rgb(49, 163, 84)\"",
+			"fill=\"rgb(199, 233, 192)\"",
+			"fill=\"rgb(218, 218, 235)\"",
+			"fill=\"rgb(150, 150, 150)\"",
+		];
+		let mut cursor = 0;
+		for fill in expected {
+			let offset = svg[cursor..]
+				.find(fill)
+				.unwrap_or_else(|| panic!("missing ordered {fill} after byte {cursor}:\n{svg}"));
+			cursor += offset + fill.len();
 		}
 	}
 
@@ -535,6 +586,7 @@ mod product_0013_baseline_tests {
 				bar_width: Override::Set(BarWidth::new(fraction).unwrap()),
 				..LayerSettings::default()
 			},
+			band_fills: Vec::new(),
 		}
 	}
 

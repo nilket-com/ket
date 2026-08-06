@@ -655,6 +655,13 @@ pub struct CategoryColorAssignment {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BandFillAssignment {
+	pub category: String,
+	pub position: PalettePosition,
+	pub color: ResolvedColor,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CategoricalPaletteSelection {
 	identity: String,
 	palette: ResolvedCategoricalPalette,
@@ -799,6 +806,7 @@ pub struct PlotProvenance {
 pub struct ResolvedPlotSpec {
 	pub composition: PlotComposition,
 	pub channels: Vec<ResolvedChannel>,
+	pub band_fills: Vec<BandFillAssignment>,
 	pub kernel_fields: Box<ResolvedKernelFields>,
 	pub color_job: Option<ColorJob>,
 	pub provenance: PlotProvenance,
@@ -1335,6 +1343,7 @@ pub fn resolve_layered_domains(
 			spec: ResolvedPlotSpec {
 				composition: binding.composition,
 				channels,
+				band_fills: Vec::new(),
 				kernel_fields: binding.kernel_fields,
 				color_job: binding.color_job,
 				provenance: result.provenance.clone(),
@@ -1391,6 +1400,7 @@ pub fn resolve_domains(
 		ResolvedPlotSpec {
 			composition: binding.composition,
 			channels,
+			band_fills: Vec::new(),
 			kernel_fields: binding.kernel_fields,
 			color_job,
 			provenance: result.provenance.clone(),
@@ -1445,10 +1455,18 @@ pub fn resolve_domains_with_categorical_palette(
 			colors,
 		});
 	}
+	let band_fills = resolve_explicit_band_fills(
+		binding.kernel_fields.as_ref(),
+		&channels,
+		binding.categorical_limit,
+		selection,
+		&mut next_identity,
+	)?;
 	Ok((
 		ResolvedPlotSpec {
 			composition: binding.composition,
 			channels,
+			band_fills,
 			kernel_fields: binding.kernel_fields,
 			color_job,
 			provenance: result.provenance.clone(),
@@ -2127,6 +2145,51 @@ fn resolve_explicit_category_colors(
 	})
 }
 
+fn resolve_explicit_band_fills(
+	kernel_fields: &ResolvedKernelFields,
+	channels: &[ResolvedChannel],
+	geometry_limit: usize,
+	selection: &CategoricalPaletteSelection,
+	identity: &mut ColorIdentity,
+) -> Result<Vec<BandFillAssignment>, CategoricalResolutionError> {
+	let ResolvedKernelFields::Bar { category, .. } = kernel_fields else {
+		return Ok(Vec::new());
+	};
+	if channels
+		.iter()
+		.any(|channel| channel.binding.channel == Channel::Color)
+	{
+		return Ok(Vec::new());
+	}
+	let Some(channel) = channels
+		.iter()
+		.find(|channel| channel.binding.field == *category)
+	else {
+		return Ok(Vec::new());
+	};
+	let ScaleDomain::Categorical(categories) = &channel.domain else {
+		return Ok(Vec::new());
+	};
+	resolve_explicit_positions(
+		categories,
+		&channel.binding,
+		geometry_limit,
+		selection,
+		identity,
+		"bar band fill",
+	)
+	.map(|assignments| {
+		assignments
+			.into_iter()
+			.map(|(category, position)| BandFillAssignment {
+				category,
+				position,
+				color: selection.color(position),
+			})
+			.collect()
+	})
+}
+
 fn resolve_category_colors(
 	categories: &[String],
 	channel: &BoundChannel,
@@ -2746,6 +2809,155 @@ mod tests {
 				..
 			})
 		));
+	}
+
+	#[test]
+	fn product_0029_two_field_bar_resolves_band_fill_without_a_color_channel() {
+		let categories = ["A", "B", "C", "D", "E", "F"];
+		let result = stamped(
+			df!(
+				"cat" => categories,
+				"val" => [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+			)
+			.expect("bar frame"),
+		);
+		let spec = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "cat", "val");
+		let (resolved, _) = resolve_explicit(&spec, &result, &ColorIdentity::default(), "tab20c")
+			.expect("band fill resolution");
+		assert!(resolved.channel(Channel::Color).is_none());
+		assert_eq!(
+			resolved
+				.band_fills
+				.iter()
+				.map(|assignment| (
+					assignment.category.as_str(),
+					assignment.position.index(),
+					assignment.color,
+				))
+				.collect::<Vec<_>>(),
+			[
+				(
+					"A",
+					0,
+					ResolvedColor {
+						red: 49,
+						green: 130,
+						blue: 189,
+						alpha: 255
+					}
+				),
+				(
+					"B",
+					4,
+					ResolvedColor {
+						red: 230,
+						green: 85,
+						blue: 13,
+						alpha: 255
+					}
+				),
+				(
+					"C",
+					8,
+					ResolvedColor {
+						red: 49,
+						green: 163,
+						blue: 84,
+						alpha: 255
+					}
+				),
+				(
+					"D",
+					11,
+					ResolvedColor {
+						red: 199,
+						green: 233,
+						blue: 192,
+						alpha: 255
+					}
+				),
+				(
+					"E",
+					15,
+					ResolvedColor {
+						red: 218,
+						green: 218,
+						blue: 235,
+						alpha: 255
+					}
+				),
+				(
+					"F",
+					19,
+					ResolvedColor {
+						red: 150,
+						green: 150,
+						blue: 150,
+						alpha: 255
+					}
+				),
+			]
+		);
+	}
+
+	#[test]
+	fn product_0029_authored_bar_color_is_authoritative_and_other_marks_stay_unstyled() {
+		let result = stamped(
+			df!(
+				"cat" => ["A", "B"],
+				"val" => [1.0, 2.0],
+				"group" => ["g1", "g2"]
+			)
+			.expect("bar frame"),
+		);
+		let bar = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"cat",
+			"val",
+			Some("group".to_owned()),
+		);
+		let (resolved, _) = resolve_explicit(&bar, &result, &ColorIdentity::default(), "tab20c")
+			.expect("authored bar color");
+		let color = resolved.channel(Channel::Color).expect("authored color");
+		assert_eq!(color.binding.field, "group");
+		assert_eq!(resolved.color_job, Some(ColorJob::Categorical));
+		assert_eq!(color.colors.len(), 2);
+		assert!(resolved.band_fills.is_empty());
+
+		let plain = stamped(df!("x" => [1.0, 2.0], "val" => [1.0, 2.0]).unwrap());
+		for plot_type in [PlotType::Scatter, PlotType::Line] {
+			let mark = AuthoredPlotSpec::xy(PlotComposition::single(plot_type), "x", "val");
+			let (resolved, _) =
+				resolve_explicit(&mark, &plain, &ColorIdentity::default(), "tab20c")
+					.expect("uncolored mark");
+			assert!(resolved.channel(Channel::Color).is_none());
+			assert!(resolved.band_fills.is_empty());
+		}
+	}
+
+	#[test]
+	fn product_0029_bar_band_capacity_is_attributed_to_styling() {
+		let categories = (0..10).map(|index| format!("c{index}")).collect::<Vec<_>>();
+		let result = stamped(
+			DataFrame::new(
+				categories.len(),
+				vec![
+					polars::prelude::Column::new("cat".into(), categories),
+					polars::prelude::Column::new("val".into(), vec![1.0; 10]),
+				],
+			)
+			.unwrap(),
+		);
+		let bar = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "cat", "val");
+		let error = resolve_explicit(&bar, &result, &ColorIdentity::default(), "dark2")
+			.expect_err("short band palette");
+		let CategoricalResolutionError::Capacity(facts) = error else {
+			panic!("wrong failure: {error}");
+		};
+		assert_eq!(facts.field, "cat");
+		assert_eq!(facts.role, "bar band fill");
+		assert!(!facts.geometry_exceeded);
+		assert!(facts.palette_exceeded);
 	}
 
 	fn layered(first: LayerSpec, rest: impl IntoIterator<Item = LayerSpec>) -> LayeredPlotSpec {
