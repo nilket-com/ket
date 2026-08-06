@@ -5092,6 +5092,79 @@ pub fn timing_atlas_pair_outcome(
 	TimingAtlasPairOutcome::Valid
 }
 
+/// Artifact naming. A partial artifact can never be mistaken for an authoritative one:
+/// the suffix is part of the contract, not a convention.
+pub const TIMING_ATLAS_PARTIAL_SUFFIX: &str = ".partial";
+pub const TIMING_ATLAS_SEAL_KIND: &str = "timing_atlas_seal";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingAtlasChildRole {
+	/// Discarded. Runs in parity order but never enters an estimator.
+	Warmup,
+	Measured {
+		pair_index: usize,
+		position: usize,
+	},
+}
+
+impl TimingAtlasChildRole {
+	pub fn is_measured(self) -> bool {
+		matches!(self, Self::Measured { .. })
+	}
+}
+
+/// One planned child. The plan is built before execution so arm order, warmup placement and
+/// query identity are decidable — and testable — without a cluster.
+#[derive(Debug, Clone)]
+pub struct TimingAtlasChildPlan {
+	pub arm: TimingArm,
+	pub role: TimingAtlasChildRole,
+	pub query_id: QueryId,
+}
+
+/// The full child sequence for one cell: two discarded warmups in parity order, then seven
+/// adjacent pairs alternating from that same start. Every child gets a distinct identity.
+pub fn timing_atlas_cell_plan(query: &str) -> Vec<TimingAtlasChildPlan> {
+	let mut plan = Vec::new();
+	let (warm_first, warm_second) = timing_atlas_pair_order(query, 0);
+	for arm in [warm_first, warm_second] {
+		plan.push(TimingAtlasChildPlan {
+			arm,
+			role: TimingAtlasChildRole::Warmup,
+			query_id: QueryId::new(),
+		});
+	}
+	for pair_index in 0..TIMING_ATLAS_MEASURED_PAIRS {
+		let (first, second) = timing_atlas_pair_order(query, pair_index);
+		for (position, arm) in [first, second].into_iter().enumerate() {
+			plan.push(TimingAtlasChildPlan {
+				arm,
+				role: TimingAtlasChildRole::Measured {
+					pair_index,
+					position,
+				},
+				query_id: QueryId::new(),
+			});
+		}
+	}
+	plan
+}
+
+/// Whether a finalized artifact may assert timing authority. Every clause is a veto:
+/// a partial filename, a missing seal, an incomplete cohort, or any failed global
+/// condition all mean non-authoritative.
+pub fn timing_atlas_artifact_is_authoritative(
+	file_name: &str,
+	has_terminal_seal: bool,
+	finalized_cells: usize,
+	conditions: &TimingAuthorityConditions,
+) -> bool {
+	!file_name.ends_with(TIMING_ATLAS_PARTIAL_SUFFIX)
+		&& has_terminal_seal
+		&& finalized_cells == timing_atlas_cells().len()
+		&& conditions.granted()
+}
+
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
 /// construction — a new `FragmentError` variant fails compilation here instead of falling
 /// through to an unrecognized bucket.
@@ -19107,5 +19180,256 @@ mod adr538_timing_atlas_failure_paths {
 		};
 		assert!(!outcome.finalized());
 		assert_eq!(outcome.verdict(), TimingAtlasVerdict::Indistinguishable);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_execution {
+	use super::*;
+	use std::collections::BTreeSet;
+
+	/// Every child gets a distinct query identity, so no residue can be attributed across
+	/// children and no two rows can collide in the artifact.
+	#[test]
+	fn every_child_receives_a_distinct_query_identity() {
+		let plan = timing_atlas_cell_plan("q01");
+		let identities = plan
+			.iter()
+			.map(|child| child.query_id)
+			.collect::<BTreeSet<_>>();
+		assert_eq!(
+			identities.len(),
+			plan.len(),
+			"every child needs its own identity"
+		);
+	}
+
+	/// Two discarded warmups run in parity order, then seven pairs. Warmups are never
+	/// measured children.
+	#[test]
+	fn warmups_follow_parity_order_and_never_enter_estimators() {
+		let plan = timing_atlas_cell_plan("q01");
+		let warmups = plan
+			.iter()
+			.filter(|child| !child.role.is_measured())
+			.collect::<Vec<_>>();
+		assert_eq!(warmups.len(), 2, "two discarded warmups, one per arm");
+		assert_eq!(warmups[0].arm, TimingArm::Local, "q01 is odd: local first");
+		assert_eq!(warmups[1].arm, TimingArm::Distributed);
+		assert!(
+			plan.iter().take(2).all(|child| !child.role.is_measured()),
+			"warmups precede every measured child"
+		);
+
+		let measured = plan.iter().filter(|child| child.role.is_measured()).count();
+		assert_eq!(measured, TIMING_ATLAS_MEASURED_PAIRS * 2);
+	}
+
+	/// Each pair contains exactly one child per arm, and the order alternates.
+	#[test]
+	fn pairs_alternate_and_cover_both_arms() {
+		let plan = timing_atlas_cell_plan("q22");
+		for pair_index in 0..TIMING_ATLAS_MEASURED_PAIRS {
+			let arms = plan
+				.iter()
+				.filter_map(|child| match child.role {
+					TimingAtlasChildRole::Measured {
+						pair_index: index, ..
+					} if index == pair_index => Some(child.arm),
+					_ => None,
+				})
+				.collect::<Vec<_>>();
+			assert_eq!(arms.len(), 2, "pair {pair_index} has two children");
+			assert_ne!(arms[0], arms[1], "a pair covers both arms");
+		}
+		// q22 is even: distributed leads the first pair.
+		let first = plan
+			.iter()
+			.find(|child| {
+				matches!(
+					child.role,
+					TimingAtlasChildRole::Measured {
+						pair_index: 0,
+						position: 0
+					}
+				)
+			})
+			.expect("first measured child");
+		assert_eq!(first.arm, TimingArm::Distributed);
+	}
+
+	/// q15 appears only as the typed manifest exclusion, never as a timed child.
+	#[test]
+	fn q15_is_only_a_manifest_exclusion() {
+		assert!(!timing_atlas_cells().contains(&"q15"));
+		assert!(TIMING_ATLAS_EXCLUDED_CELLS.contains(&"q15"));
+	}
+
+	/// A partial artifact is never authoritative, whatever else holds.
+	#[test]
+	fn partial_artifact_is_never_authoritative() {
+		let conditions = TimingAuthorityConditions {
+			clean_build: true,
+			full_hash_dataset: true,
+			quiescent_host: true,
+			protocol_unmodified: true,
+			complete_cohort: true,
+		};
+		let cells = timing_atlas_cells().len();
+		assert!(timing_atlas_artifact_is_authoritative(
+			"timing_atlas.jsonl",
+			true,
+			cells,
+			&conditions
+		));
+		assert!(
+			!timing_atlas_artifact_is_authoritative(
+				"timing_atlas.jsonl.partial",
+				true,
+				cells,
+				&conditions
+			),
+			"a partial filename vetoes authority"
+		);
+		assert!(
+			!timing_atlas_artifact_is_authoritative(
+				"timing_atlas.jsonl",
+				false,
+				cells,
+				&conditions
+			),
+			"a missing terminal seal vetoes authority — a crash leaves no seal"
+		);
+		assert!(
+			!timing_atlas_artifact_is_authoritative(
+				"timing_atlas.jsonl",
+				true,
+				cells - 1,
+				&conditions
+			),
+			"20 of 21 cells vetoes authority"
+		);
+		let noisy = TimingAuthorityConditions {
+			quiescent_host: false,
+			..conditions
+		};
+		assert!(
+			!timing_atlas_artifact_is_authoritative("timing_atlas.jsonl", true, cells, &noisy),
+			"a failed global condition vetoes authority"
+		);
+	}
+
+	/// Finalization refuses six of seven pairs, and refuses any cell carrying a failure.
+	#[test]
+	fn finalization_refuses_short_cohorts_and_failed_cells() {
+		let pair = |index: usize| TimingAtlasPair {
+			pair_index: index,
+			first_arm: "local",
+			local: TimingAtlasChild {
+				query: "q01".to_string(),
+				arm: "local",
+				pair_index: Some(index),
+				position_in_pair: 0,
+				attempt: 1,
+				query_elapsed_ms: 10.0,
+				row_count: Some(4),
+				identity_matches: Some(true),
+				valid: true,
+				failure: None,
+				failure_is_io: false,
+			},
+			distributed: TimingAtlasChild {
+				query: "q01".to_string(),
+				arm: "distributed",
+				pair_index: Some(index),
+				position_in_pair: 1,
+				attempt: 1,
+				query_elapsed_ms: 20.0,
+				row_count: Some(4),
+				identity_matches: Some(true),
+				valid: true,
+				failure: None,
+				failure_is_io: false,
+			},
+			delta_ms: 10.0,
+			ratio: 2.0,
+		};
+		let base = TimingAtlasCellOutcome {
+			query: "q01".to_string(),
+			setup_ms: 5.0,
+			teardown_ms: 5.0,
+			verification_ms: 5.0,
+			warmups: Vec::new(),
+			pairs: (0..TIMING_ATLAS_MEASURED_PAIRS).map(pair).collect(),
+			invalid_attempts: Vec::new(),
+			failure: None,
+		};
+		assert!(base.finalized());
+		assert_eq!(base.verdict(), TimingAtlasVerdict::Distinguished);
+
+		let short = TimingAtlasCellOutcome {
+			pairs: (0..TIMING_ATLAS_MEASURED_PAIRS - 1).map(pair).collect(),
+			..base.clone()
+		};
+		assert!(!short.finalized(), "six of seven pairs cannot finalize");
+
+		let failed = TimingAtlasCellOutcome {
+			failure: Some("identity mismatch".to_string()),
+			..base.clone()
+		};
+		assert!(!failed.finalized(), "a recorded failure cannot finalize");
+	}
+
+	/// Setup and teardown are recorded but excluded from the paired estimators, which read
+	/// query elapsed alone.
+	#[test]
+	fn setup_and_teardown_are_recorded_but_excluded() {
+		let outcome = TimingAtlasCellOutcome {
+			query: "q01".to_string(),
+			setup_ms: 900.0,
+			teardown_ms: 800.0,
+			verification_ms: 700.0,
+			warmups: Vec::new(),
+			pairs: vec![TimingAtlasPair {
+				pair_index: 0,
+				first_arm: "local",
+				local: TimingAtlasChild {
+					query: "q01".to_string(),
+					arm: "local",
+					pair_index: Some(0),
+					position_in_pair: 0,
+					attempt: 1,
+					query_elapsed_ms: 10.0,
+					row_count: Some(4),
+					identity_matches: Some(true),
+					valid: true,
+					failure: None,
+					failure_is_io: false,
+				},
+				distributed: TimingAtlasChild {
+					query: "q01".to_string(),
+					arm: "distributed",
+					pair_index: Some(0),
+					position_in_pair: 1,
+					attempt: 1,
+					query_elapsed_ms: 25.0,
+					row_count: Some(4),
+					identity_matches: Some(true),
+					valid: true,
+					failure: None,
+					failure_is_io: false,
+				},
+				delta_ms: 15.0,
+				ratio: 2.5,
+			}],
+			invalid_attempts: Vec::new(),
+			failure: None,
+		};
+		assert!(outcome.setup_ms > 0.0 && outcome.teardown_ms > 0.0);
+		assert_eq!(
+			outcome.paired_deltas(),
+			vec![15.0],
+			"the delta reflects query elapsed only; persistent setup is not a per-query cost"
+		);
 	}
 }
