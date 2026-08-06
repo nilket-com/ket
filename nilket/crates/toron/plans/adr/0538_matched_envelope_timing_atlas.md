@@ -33,30 +33,44 @@ and the atlas is worthless if it quietly drifts into a new benchmark.
 **2. Protocol fixed before any measurement.** Every parameter below is declared here so it cannot
 be chosen after seeing data:
 
-- **Repetitions:** 7 paired runs per cell, plus 1 discarded warmup per arm per cell.
+- **Repetitions:** 7 paired runs per cell, preceded by 2 discarded warmups (one per arm).
 - **Pairing:** adjacent local/distributed pairs with **alternating arm order** across repetitions,
   so drift in machine state cannot accrue to one arm.
-- **Estimator:** per-arm median of the 7 elapsed values. The materiality baseline is the
-  **control-arm (local) median**, reported explicitly — a pooled median shrinks by the effect it
+- **Estimator — paired, not per-arm.** The primary estimators are the **median of the 7 paired
+  `distributed - local` deltas** and the **median of the 7 paired `distributed / local` ratios**.
+  Per-arm medians are reported as description only and never drive a verdict: taking them would
+  discard exactly the drift control the adjacent-pair design pays for. The materiality baseline is
+  the control-arm (local) median, reported explicitly — a pooled median shrinks by the effect it
   is meant to measure.
-- **Confidence rule:** a cell is `distinguished` only when all 7 paired deltas share a sign;
-  otherwise `indistinguishable`, regardless of median separation. No p-value is manufactured from
-  7 samples.
-- **Cache/warmup posture:** page cache warm from the discarded warmup; join-spill scratch cleared
-  before the run, not between repetitions.
-- **Retry policy:** a transport flake surfacing as `QueryError::Io` retries once and is recorded
-  on the row; no other retry, and no re-run of a cell whose numbers are disliked.
+- **Confidence rule:** a cell is `distinguished` only when all 7 paired deltas are **strictly
+  positive or strictly negative**. Any zero delta makes the cell `indistinguishable`, whatever the
+  medians show. No p-value is manufactured from 7 samples.
+- **Cache/warmup posture:** page cache warm from the discarded warmups. Join-spill scratch is
+  cleared **before each cell's warmup pair** — not once for the whole atlas — and **not** cleared
+  between that cell's 7 repetitions, so every repetition of a cell sees the same scratch posture.
+- **Retry policy:** an I/O failure **invalidates the entire adjacent pair**. Both arms are retried
+  once, in the same order, and the failed attempt is retained as an invalid receipt. A retried
+  distributed child is **never** timed against its original local partner — that would compare
+  children from different machine states and silently break the pairing. No other retry, and no
+  re-run of a cell whose numbers are disliked.
 
 **3. Every timed child keeps its correctness checks.** Digest, row count, schema fingerprint,
 plan shape and clean-build stamp are verified on each timed run. A timed row that cannot show
 identity is discarded as invalid, never reported as fast. Timing does not get a weaker bar than
 the census that authorized it.
 
-**4. Transport and task overhead are priced from receipts, never inferred.** The distributed arm
-pays dispatch, TCP loopback, partition publication and manifest acceptance that the local arm does
-not. These are attributed from the receipts already emitted — stage task counts, partition bytes,
-shuffle byte counters, per-stage elapsed. **No generic constant is subtracted from any cell.**
-An unattributable remainder is reported as unattributed, which is a finding rather than an
+**4. Transport and task overhead are priced from receipts, never inferred, and only added when
+additivity is real.** The distributed arm pays dispatch, TCP loopback, partition publication and
+manifest acceptance that the local arm does not. These are attributed from the receipts already
+emitted — stage task counts, partition bytes, shuffle byte counters, per-stage elapsed.
+**No generic constant is subtracted from any cell.**
+
+Per-stage and per-task elapsed intervals **overlap**: tasks run concurrently, so summing their
+durations measures work, not wall clock, and would inflate an attribution past the delta it is
+explaining. A component may therefore enter the additive breakdown **only** when the receipts
+establish either non-overlapping wall-clock intervals or a defined critical path through the
+stage graph. **Concurrent task durations are never summed.** Anything that cannot be placed
+additively under that rule stays in the unattributed remainder, which is a finding rather than an
 embarrassment.
 
 **5. Reporting is per cell.** Per-cell local median, distributed median, delta, ratio, and the
@@ -82,8 +96,11 @@ record carries no timing authority.
    reported, not dropped.
 3. **q15 is absent and labelled** as an inherited capability wall, so its absence cannot be read
    as an omission or a failure.
-4. **Overhead attribution reconciles.** For each cell, attributed components plus unattributed
-   remainder equal the measured distributed elapsed. No component is a fitted constant.
+4. **Overhead attribution reconciles additively.** For each cell, attributed components plus the
+   unattributed remainder equal the measured distributed elapsed. No component is a fitted
+   constant, and no component enters the sum without a non-overlap or critical-path justification
+   from its receipts. A breakdown that only reconciles by summing concurrent durations fails this
+   item.
 5. **Quiescent host recorded**, with the service stopped and 7742 free before the authoritative
    run.
 6. **The fork is answered from the data, not narrated.** The atlas names which of the forward
@@ -104,15 +121,31 @@ record carries no timing authority.
 
 ## Forward
 
-The measured stage shares and transport costs decide the next substrate question, and the branches
-are predeclared so the answer cannot be chosen to suit a preferred project:
+The measured stage shares and transport costs decide the next substrate question. Both the branches
+and the arithmetic that selects one are fixed here, so a branch cannot be argued into winning after
+the numbers are in.
 
-- **Scan-side dominance** → the next decision concerns `ScanShare` and scan reuse.
-- **Dispatch/transport dominance** → the next decision concerns task dispatch and the loopback
+**Definitions, applied in this order.**
+
+- Let **S** be the set of cells classified `distinguished` with a median paired delta **greater
+  than zero** — distributed slower than local.
+- **If S is empty, the no-work branch wins outright.** A board where distributed is never
+  distinguishably slower authorizes no substrate work, regardless of what any breakdown suggests.
+- Within a cell of S, a component is **leading** when it accounts for **at least 50%** of that
+  cell's median paired delta under the additivity rule above.
+- A branch **wins** when its component is leading in at least **two thirds of S, rounded up**, and
+  **|S| ≥ 5**. Fewer than five distinguished slower cells is too thin a base to direct substrate
+  work, and the no-work branch wins.
+- If no component meets that bar, there is **no dominant component** and the no-work branch wins.
+
+**Branches.**
+
+- **Scan-side leading** → the next decision concerns `ScanShare` and scan reuse.
+- **Dispatch/transport leading** → the next decision concerns task dispatch and the loopback
   transport, including whether an in-process path is worth its complexity.
-- **A single operator dominating across cells** → that operator earns its own attribution ADR.
-- **No dominant component, or overhead within noise of the local arm** → the honest outcome is
-  that no material substrate work is authorized, and the atlas closes having said so.
+- **A single other operator leading** → that operator earns its own attribution ADR.
+- **No dominant component, S too small, or S empty** → no material substrate work is authorized,
+  and the atlas closes having said so. This is a real outcome, not a failure of the study.
 
 Fragmented-plan fingerprint coverage remains an open item from ADR 537 and is not in scope here,
 though a timing study that compares plans across arms is a plausible future consumer of it.
