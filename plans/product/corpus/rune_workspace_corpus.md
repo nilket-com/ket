@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.27. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.31. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -542,6 +542,21 @@ originating an encoding or legend. Authored bar color remains authoritative;
 scatter and line with absent color stay single-treatment. No Rune spelling or
 production palette caller lands in this substrate cut.
 
+## Accepted substrate: resolved plot artifact chrome
+
+PRODUCT-0031 is accepted and executable in `6ea267e6`, `0f96e594`, and
+`eb37715b`. Every completed plot now carries one closed eleven-role
+`PlotChrome`; renderers consume those roles directly while legacy mark ink and
+application/settings-drawer colors remain separate. The exact pre-extraction
+SVG remains unchanged, including the deliberately measured—not endorsed—legacy
+gridline contrast debt of approximately 1.66:1.
+
+Five visible text roles are assayed at 4.5:1 and three non-text roles at 3:1
+after alpha compositing. Plot chrome changes no mark color, encoded legend
+swatch, guide content, geometry, interaction, identity, or Rune normal form.
+PRODUCT-0032 owns the first theme-name projection and direct figure
+`skin(name)` member.
+
 ## Mutation and definition lifecycle
 
 | family | status | evidence |
@@ -570,6 +585,13 @@ production palette caller lands in this substrate cut.
 | bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
+
+- v0.31 (2026-08-06): PRODUCT-0031 replaces the plot renderer's ambiguous
+  background/decoration pair with a closed eleven-role `PlotChrome`. The exact
+  library/application rendering oracle stays byte-identical; the legacy 0.2
+  white grid over black is classified below the 3:1 non-text threshold without
+  being changed or certified. Mark ink, data colors, guide behavior, and host
+  chrome remain separate, and Rune syntax is unchanged pending PRODUCT-0032.
 
 - v0.29 (2026-08-05): PRODUCT-0029 replaces baked categorical continuation
   colors with stable validated palette positions while resolved artifacts keep

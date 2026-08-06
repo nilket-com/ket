@@ -1,6 +1,6 @@
 # ADR 0031: resolved plot artifact chrome
 
-Status: proposed 2026-08-06. This record decides one thing: a rendered plot
+Status: accepted 2026-08-06. This record decides one thing: a rendered plot
 receives one complete `PlotChrome` value instead of using
 `ResolvedPlotSettings.background_color` and `decoration_color` for unrelated
 artifact roles. The default reproduces current rendering exactly. This record
