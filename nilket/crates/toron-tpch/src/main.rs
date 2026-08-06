@@ -102,6 +102,8 @@ async fn main() -> ExitCode {
 		"ladder" => ladder_command(&args).await,
 		"fragment-census" => fragment_census_command(&args).await,
 		"execution-census" => execution_census_command(&args).await,
+		// ADR 538: the only entry point that can produce timing authority.
+		"timing-atlas" => timing_atlas_command(&args).await,
 		"q17-census" => q17_census_command(&args).await,
 		"q03-plan-proof" => q03_plan_proof_command(&args).await,
 		"polars-q03-value-gate" => polars_q03_value_gate_command(&args),
@@ -114,6 +116,40 @@ async fn main() -> ExitCode {
 			ExitCode::SUCCESS
 		}
 		_ => usage(),
+	}
+}
+
+/// ADR 538: the matched-envelope timing atlas. Explicit-only — no other command produces an
+/// authoritative artifact, and this one refuses to start on a non-quiescent host or an
+/// existing destination. Protocol constants are compiled in and take no override.
+async fn timing_atlas_command(args: &[String]) -> ExitCode {
+	let scale_factor = match resolved_sf(args) {
+		Ok(scale_factor) => scale_factor,
+		Err(message) => return harness_error(&message),
+	};
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_root = data_dir_from_args(args);
+	let output = PathBuf::from(
+		flag_value(args, "--output").unwrap_or("target/tpch/timing_atlas/timing_atlas.jsonl"),
+	);
+	for rejected in ["--pairs", "--warmups", "--runs", "--query"] {
+		if flag_value(args, rejected).is_some() {
+			return harness_error(&format!(
+				"timing atlas takes no {rejected}: ADR 538 fixes the protocol and the cohort \
+				 before measurement"
+			));
+		}
+	}
+
+	match toron_tpch::run_timing_atlas(mode, scale_factor, &data_root, &output).await {
+		Ok(path) => {
+			println!(
+				"tpch_timing_atlas published={} timing_authority=true",
+				path.display()
+			);
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
 	}
 }
 
@@ -5203,7 +5239,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }

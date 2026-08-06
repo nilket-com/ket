@@ -5017,7 +5017,9 @@ pub struct TimingAtlasPair {
 	pub local: TimingAtlasChild,
 	pub distributed: TimingAtlasChild,
 	pub delta_ms: f64,
-	pub ratio: f64,
+	/// `None` when the local arm measured zero: a ratio is undefined there, and NaN or
+	/// infinity must never reach the journal.
+	pub ratio: Option<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -5045,7 +5047,7 @@ impl TimingAtlasCellOutcome {
 	}
 
 	pub fn paired_ratios(&self) -> Vec<f64> {
-		self.pairs.iter().map(|pair| pair.ratio).collect()
+		self.pairs.iter().filter_map(|pair| pair.ratio).collect()
 	}
 
 	pub fn verdict(&self) -> TimingAtlasVerdict {
@@ -5438,11 +5440,9 @@ fn assemble_timing_atlas_pair(
 		(second, first)
 	};
 	let delta_ms = distributed.query_elapsed_ms - local.query_elapsed_ms;
-	let ratio = if local.query_elapsed_ms > 0.0 {
-		distributed.query_elapsed_ms / local.query_elapsed_ms
-	} else {
-		f64::INFINITY
-	};
+	let ratio = (local.query_elapsed_ms > 0.0)
+		.then(|| distributed.query_elapsed_ms / local.query_elapsed_ms)
+		.filter(|ratio| ratio.is_finite());
 	TimingAtlasPair {
 		pair_index,
 		first_arm,
@@ -5850,6 +5850,534 @@ impl CensusTimingAtlasHarness {
 			})
 			.sum()
 	}
+}
+
+// ===== ADR 538: the journal =====
+//
+// Rows are a replayable evidence journal, not formatted output: every verdict the atlas
+// reports must be recomputable from the rows alone. The validator below reconstructs each
+// one by replaying the file, so a summary that memory believes but the journal cannot
+// support fails publication.
+
+pub const TIMING_ATLAS_KIND_HEADER: &str = "artifact_header";
+pub const TIMING_ATLAS_KIND_EXCLUSION: &str = "excluded_cell";
+pub const TIMING_ATLAS_KIND_CELL_SETUP: &str = "cell_setup";
+pub const TIMING_ATLAS_KIND_CHILD: &str = "child_attempt";
+pub const TIMING_ATLAS_KIND_PAIR: &str = "pair_outcome";
+pub const TIMING_ATLAS_KIND_RESIDENCY: &str = "residency";
+pub const TIMING_ATLAS_KIND_CLEANUP: &str = "cleanup";
+pub const TIMING_ATLAS_KIND_CELL_SUMMARY: &str = "cell_summary";
+pub const TIMING_ATLAS_KIND_HOST_END: &str = "host_end";
+
+fn json_ratio(ratio: Option<f64>) -> serde_json::Value {
+	// Never serialize NaN or infinity: a null ratio is honest, a poisoned float is not.
+	match ratio {
+		Some(value) if value.is_finite() => serde_json::json!(value),
+		_ => serde_json::Value::Null,
+	}
+}
+
+pub fn timing_atlas_header_row(
+	conditions_start: &HostQuiescence,
+	dataset_fingerprint: &str,
+	scale_factor: f64,
+	mode: &str,
+) -> serde_json::Value {
+	serde_json::json!({
+		"kind": TIMING_ATLAS_KIND_HEADER,
+		"suite": "tpch_timing_atlas",
+		"build_commit": crate::telemetry::build_commit(),
+		"binary_modified_unix": crate::telemetry::binary_modified_unix(),
+		"scale_factor": scale_factor,
+		"mode": mode,
+		"dataset_manifest_fingerprint": dataset_fingerprint,
+		"measured_pairs": TIMING_ATLAS_MEASURED_PAIRS,
+		"warmup_pairs": TIMING_ATLAS_WARMUP_PAIRS,
+		"cohort": timing_atlas_cells(),
+		"worker_count": EXECUTION_CENSUS_WORKER_COUNT,
+		"transport": "tcp_loopback",
+		"task_memory_envelope_bytes": EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES,
+		"spill_bytes_reserved_per_query": EXECUTION_CENSUS_SPILL_BYTES,
+		"host_start_service_inactive": conditions_start.service_inactive,
+		"host_start_sql_port_free": conditions_start.sql_port_free,
+	})
+}
+
+pub fn timing_atlas_exclusion_row(query: &str) -> serde_json::Value {
+	serde_json::json!({
+		"kind": TIMING_ATLAS_KIND_EXCLUSION,
+		"query": query,
+		"reason": "fragment_broadcast_probe_not_star_linear",
+		"note": "inherited typed capability wall; never attempted, never timed",
+	})
+}
+
+pub fn timing_atlas_child_row(child: &TimingAtlasChild) -> serde_json::Value {
+	serde_json::json!({
+		"kind": TIMING_ATLAS_KIND_CHILD,
+		"query": child.query,
+		"arm": child.arm,
+		"pair_index": child.pair_index,
+		"position_in_pair": child.position_in_pair,
+		"attempt": child.attempt,
+		"query_elapsed_ms": child.query_elapsed_ms,
+		"row_count": child.row_count,
+		"identity_matches": child.identity_matches,
+		"valid": child.valid,
+		"failure": child.failure,
+		"failure_is_io": child.failure_is_io,
+	})
+}
+
+pub fn timing_atlas_pair_row(query: &str, pair: &TimingAtlasPair) -> serde_json::Value {
+	serde_json::json!({
+		"kind": TIMING_ATLAS_KIND_PAIR,
+		"query": query,
+		"pair_index": pair.pair_index,
+		"first_arm": pair.first_arm,
+		"local_elapsed_ms": pair.local.query_elapsed_ms,
+		"distributed_elapsed_ms": pair.distributed.query_elapsed_ms,
+		"delta_ms": pair.delta_ms,
+		"ratio": json_ratio(pair.ratio),
+		"local_attempt": pair.local.attempt,
+		"distributed_attempt": pair.distributed.attempt,
+	})
+}
+
+pub fn timing_atlas_cell_summary_row(outcome: &TimingAtlasCellOutcome) -> serde_json::Value {
+	let mut deltas = outcome.paired_deltas();
+	let mut ratios = outcome.paired_ratios();
+	serde_json::json!({
+		"kind": TIMING_ATLAS_KIND_CELL_SUMMARY,
+		"query": outcome.query,
+		"finalized": outcome.finalized(),
+		"pairs": outcome.pairs.len(),
+		"invalid_attempts": outcome.invalid_attempts.len(),
+		"median_paired_delta_ms": timing_atlas_median(&mut deltas),
+		"median_paired_ratio": json_ratio(timing_atlas_median(&mut ratios)),
+		"verdict": match outcome.verdict() {
+			TimingAtlasVerdict::Distinguished => "distinguished",
+			TimingAtlasVerdict::Indistinguishable => "indistinguishable",
+		},
+		"setup_ms": outcome.setup_ms,
+		"teardown_ms": outcome.teardown_ms,
+		"verification_ms": outcome.verification_ms,
+		"cleanup_ms": outcome.cleanup_ms,
+		"failure": outcome.failure,
+	})
+}
+
+/// What replaying a journal establishes. Every field is recomputed from rows, never copied
+/// from an in-memory summary — a claim the journal cannot support must not be publishable.
+#[derive(Debug, Clone, Default)]
+pub struct TimingAtlasReplay {
+	pub headers: usize,
+	pub exclusions: Vec<String>,
+	pub cells_seen: BTreeSet<String>,
+	pub finalized_cells: BTreeSet<String>,
+	pub pairs_per_cell: BTreeMap<String, usize>,
+	pub child_identities: usize,
+	pub distinct_child_rows: usize,
+	pub retried_children: usize,
+	pub identity_failures: Vec<String>,
+	pub unstable_residency: Vec<String>,
+	pub cleanup_failures: Vec<String>,
+	pub baseline_violations: Vec<String>,
+	pub distinguished_slower: BTreeSet<String>,
+	pub host_end_quiescent: Option<bool>,
+	pub terminal_seal: bool,
+	pub violations: Vec<String>,
+}
+
+impl TimingAtlasReplay {
+	/// Authority requires the journal itself to support it: full cohort, one exclusion, a
+	/// terminal seal, and no recomputed violation.
+	pub fn authoritative(&self, conditions: &TimingAuthorityConditions) -> bool {
+		self.violations.is_empty()
+			&& self.headers == 1
+			&& self.exclusions.len() == 1
+			&& self.finalized_cells.len() == timing_atlas_cells().len()
+			&& self.terminal_seal
+			&& self.host_end_quiescent == Some(true)
+			&& conditions.granted()
+	}
+}
+
+/// Replay a journal and recompute its claims. Verdicts, deltas, ratios and cohort counts are
+/// derived here from child rows, so a pair row that disagrees with its children is a
+/// violation rather than an accepted summary.
+pub fn timing_atlas_replay(journal: &str) -> TimingAtlasReplay {
+	let mut replay = TimingAtlasReplay::default();
+	let mut children: BTreeMap<(String, i64, i64), Vec<serde_json::Value>> = BTreeMap::new();
+	let mut seen_ids: BTreeSet<String> = BTreeSet::new();
+	let mut pair_rows: Vec<serde_json::Value> = Vec::new();
+	let mut summary_rows: Vec<serde_json::Value> = Vec::new();
+	let mut sealed_at: Option<usize> = None;
+	let lines = journal.lines().filter(|line| !line.trim().is_empty());
+
+	for (index, line) in lines.enumerate() {
+		let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+			replay
+				.violations
+				.push(format!("row {index} is not valid json"));
+			continue;
+		};
+		if sealed_at.is_some() {
+			replay
+				.violations
+				.push(format!("row {index} follows the terminal seal"));
+		}
+		let kind = row.get("kind").and_then(|kind| kind.as_str()).unwrap_or("");
+		match kind {
+			TIMING_ATLAS_KIND_HEADER => replay.headers += 1,
+			TIMING_ATLAS_KIND_EXCLUSION => {
+				if let Some(query) = row.get("query").and_then(|q| q.as_str()) {
+					replay.exclusions.push(query.to_string());
+				}
+			}
+			TIMING_ATLAS_KIND_CELL_SETUP => {
+				if let Some(query) = row.get("query").and_then(|q| q.as_str()) {
+					replay.cells_seen.insert(query.to_string());
+				}
+			}
+			TIMING_ATLAS_KIND_CHILD => {
+				replay.child_identities += 1;
+				let query = row
+					.get("query")
+					.and_then(|q| q.as_str())
+					.unwrap_or_default()
+					.to_string();
+				let attempt = row.get("attempt").and_then(|a| a.as_i64()).unwrap_or(1);
+				if attempt > 1 {
+					replay.retried_children += 1;
+				}
+				if row.get("identity_matches") == Some(&serde_json::Value::Bool(false)) {
+					replay.identity_failures.push(query.clone());
+				}
+				let pair_index = row.get("pair_index").and_then(|p| p.as_i64()).unwrap_or(-1);
+				children
+					.entry((query, pair_index, attempt))
+					.or_default()
+					.push(row.clone());
+				if let Some(id) = row.get("child_id").and_then(|id| id.as_str()) {
+					if !seen_ids.insert(id.to_string()) {
+						replay
+							.violations
+							.push(format!("duplicate child identity {id}"));
+					}
+				}
+			}
+			TIMING_ATLAS_KIND_PAIR => pair_rows.push(row.clone()),
+			TIMING_ATLAS_KIND_RESIDENCY => {
+				if row.get("stable") == Some(&serde_json::Value::Bool(false)) {
+					if let Some(query) = row.get("query").and_then(|q| q.as_str()) {
+						replay.unstable_residency.push(query.to_string());
+					}
+				}
+			}
+			TIMING_ATLAS_KIND_CLEANUP => {
+				let query = row
+					.get("query")
+					.and_then(|q| q.as_str())
+					.unwrap_or_default()
+					.to_string();
+				if row.get("succeeded") == Some(&serde_json::Value::Bool(false)) {
+					replay.cleanup_failures.push(query.clone());
+				}
+				if row.get("returned_to_baseline") == Some(&serde_json::Value::Bool(false)) {
+					replay.baseline_violations.push(query);
+				}
+			}
+			TIMING_ATLAS_KIND_CELL_SUMMARY => summary_rows.push(row.clone()),
+			TIMING_ATLAS_KIND_HOST_END => {
+				let inactive = row
+					.get("service_inactive")
+					.and_then(|value| value.as_bool())
+					.unwrap_or(false);
+				let port_free = row
+					.get("sql_port_free")
+					.and_then(|value| value.as_bool())
+					.unwrap_or(false);
+				replay.host_end_quiescent = Some(inactive && port_free);
+			}
+			TIMING_ATLAS_SEAL_KIND => {
+				replay.terminal_seal = true;
+				sealed_at = Some(index);
+			}
+			other => replay
+				.violations
+				.push(format!("row {index} has unknown kind {other}")),
+		}
+	}
+	replay.distinct_child_rows = seen_ids.len();
+
+	// Recompute each pair from its own children rather than trusting the pair row.
+	for pair in &pair_rows {
+		let query = pair
+			.get("query")
+			.and_then(|q| q.as_str())
+			.unwrap_or_default()
+			.to_string();
+		*replay.pairs_per_cell.entry(query.clone()).or_default() += 1;
+		let local = pair
+			.get("local_elapsed_ms")
+			.and_then(|value| value.as_f64())
+			.unwrap_or(f64::NAN);
+		let distributed = pair
+			.get("distributed_elapsed_ms")
+			.and_then(|value| value.as_f64())
+			.unwrap_or(f64::NAN);
+		let claimed_delta = pair
+			.get("delta_ms")
+			.and_then(|value| value.as_f64())
+			.unwrap_or(f64::NAN);
+		let recomputed = distributed - local;
+		if (recomputed - claimed_delta).abs() > 1e-9 {
+			replay.violations.push(format!(
+				"{query} pair delta disagrees with its children: claimed {claimed_delta}, \
+				 recomputed {recomputed}"
+			));
+		}
+		match pair.get("ratio") {
+			Some(serde_json::Value::Null) => {
+				if local > 0.0 {
+					replay
+						.violations
+						.push(format!("{query} null ratio with nonzero local arm"));
+				}
+			}
+			Some(value) => {
+				let claimed = value.as_f64().unwrap_or(f64::NAN);
+				if !claimed.is_finite() {
+					replay
+						.violations
+						.push(format!("{query} ratio is not finite"));
+				} else if local > 0.0 && ((distributed / local) - claimed).abs() > 1e-9 {
+					replay
+						.violations
+						.push(format!("{query} ratio disagrees with its children"));
+				}
+			}
+			None => replay
+				.violations
+				.push(format!("{query} pair row lacks a ratio field")),
+		}
+	}
+
+	// Recompute cohort, per-cell pair counts and the sign verdict.
+	for summary in &summary_rows {
+		let query = summary
+			.get("query")
+			.and_then(|q| q.as_str())
+			.unwrap_or_default()
+			.to_string();
+		let pairs = replay.pairs_per_cell.get(&query).copied().unwrap_or(0);
+		if summary.get("finalized") == Some(&serde_json::Value::Bool(true)) {
+			if pairs != TIMING_ATLAS_MEASURED_PAIRS {
+				replay.violations.push(format!(
+					"{query} claims finalized with {pairs} pair rows, expected {}",
+					TIMING_ATLAS_MEASURED_PAIRS
+				));
+				continue;
+			}
+			replay.finalized_cells.insert(query.clone());
+			let deltas = pair_rows
+				.iter()
+				.filter(|row| row.get("query").and_then(|q| q.as_str()) == Some(query.as_str()))
+				.filter_map(|row| row.get("delta_ms").and_then(|value| value.as_f64()))
+				.collect::<Vec<_>>();
+			let recomputed = timing_atlas_verdict(&deltas);
+			let claimed = summary
+				.get("verdict")
+				.and_then(|value| value.as_str())
+				.unwrap_or("");
+			let claimed_verdict = match claimed {
+				"distinguished" => TimingAtlasVerdict::Distinguished,
+				_ => TimingAtlasVerdict::Indistinguishable,
+			};
+			if recomputed != claimed_verdict {
+				replay
+					.violations
+					.push(format!("{query} verdict disagrees with its pair deltas"));
+			}
+			// Dominance input: distinguished and distributed-slower.
+			let mut sorted = deltas.clone();
+			if recomputed == TimingAtlasVerdict::Distinguished
+				&& timing_atlas_median(&mut sorted).unwrap_or(0.0) > 0.0
+			{
+				replay.distinguished_slower.insert(query.clone());
+			}
+		}
+	}
+
+	if replay.exclusions.len() != 1 {
+		replay.violations.push(format!(
+			"expected exactly one typed exclusion, found {}",
+			replay.exclusions.len()
+		));
+	} else if replay.exclusions[0] != "q15" {
+		replay
+			.violations
+			.push("the excluded cell must be q15".to_string());
+	}
+	if !replay.identity_failures.is_empty() {
+		replay.violations.push(format!(
+			"identity failures recorded for {:?}",
+			replay.identity_failures
+		));
+	}
+	if !replay.unstable_residency.is_empty() {
+		replay.violations.push(format!(
+			"unstable worker residency for {:?}",
+			replay.unstable_residency
+		));
+	}
+	if !replay.cleanup_failures.is_empty() {
+		replay
+			.violations
+			.push(format!("cleanup failed for {:?}", replay.cleanup_failures));
+	}
+	if !replay.baseline_violations.is_empty() {
+		replay.violations.push(format!(
+			"retained bytes did not return to baseline for {:?}",
+			replay.baseline_violations
+		));
+	}
+	replay
+}
+
+/// Drive the whole atlas: one process, 21 cells, journal written as evidence accrues, then
+/// replayed and only then published. The only entry point — there is no implicit path that
+/// produces an authoritative artifact.
+pub async fn run_timing_atlas(
+	mode: &str,
+	scale_factor: f64,
+	data_root: &Path,
+	canonical_path: &Path,
+) -> Result<PathBuf, String> {
+	// Refuse a destination that already exists, before doing any work.
+	let mut artifact = TimingAtlasArtifact::create(canonical_path)?;
+
+	// Host-start quiescence gates the run before the first warmup, not after.
+	let host_start = observe_host_quiescence();
+	if !host_start.quiescent() {
+		artifact.append_row(&serde_json::json!({
+			"kind": TIMING_ATLAS_KIND_HEADER,
+			"aborted": "host_not_quiescent",
+			"host_start_service_inactive": host_start.service_inactive,
+			"host_start_sql_port_free": host_start.sql_port_free,
+		}))?;
+		return Err(
+			"timing atlas refuses to start: nilket-local.service active or port 7742 held"
+				.to_string(),
+		);
+	}
+
+	// Dataset identity comes from the spec the cells will actually load.
+	// Dataset identity from the export the cells will actually load.
+	let dataset_fingerprint = build_persisted_perf_query_spec("q01", mode, scale_factor, data_root)
+		.map(|spec| spec.export.manifest_fingerprint.clone())
+		.unwrap_or_else(|_| "unknown".to_string());
+	artifact.append_row(&timing_atlas_header_row(
+		&host_start,
+		&dataset_fingerprint,
+		scale_factor,
+		mode,
+	))?;
+	for excluded in TIMING_ATLAS_EXCLUDED_CELLS {
+		artifact.append_row(&timing_atlas_exclusion_row(excluded))?;
+	}
+
+	let mut finalized = 0usize;
+	for query in timing_atlas_cells() {
+		// Scratch is cleared per cell, before its warmup pair.
+		let _ = std::fs::remove_dir_all(data_root.parent().unwrap_or(data_root).join("join_spill"));
+		artifact.append_row(&serde_json::json!({
+			"kind": TIMING_ATLAS_KIND_CELL_SETUP, "query": query
+		}))?;
+
+		let mut harness =
+			CensusTimingAtlasHarness::prepare(query, mode, scale_factor, data_root).await?;
+		let baseline_after_setup;
+		let outcome = {
+			harness.setup_cell(query).await?;
+			baseline_after_setup = harness.resident_partition_bytes();
+			let outcome = run_timing_atlas_cell_with(&mut harness, query).await;
+			outcome
+		};
+		let retained = harness.resident_partition_bytes();
+
+		for child in outcome
+			.warmups
+			.iter()
+			.chain(outcome.invalid_attempts.iter())
+		{
+			artifact.append_row(&timing_atlas_child_row(child))?;
+		}
+		for pair in &outcome.pairs {
+			artifact.append_row(&timing_atlas_child_row(&pair.local))?;
+			artifact.append_row(&timing_atlas_child_row(&pair.distributed))?;
+			artifact.append_row(&timing_atlas_pair_row(query, pair))?;
+		}
+		artifact.append_row(&serde_json::json!({
+			"kind": TIMING_ATLAS_KIND_RESIDENCY,
+			"query": query,
+			"observations": harness.residency.len(),
+			"stable": harness.residency.stable(),
+		}))?;
+		artifact.append_row(&serde_json::json!({
+			"kind": TIMING_ATLAS_KIND_CLEANUP,
+			"query": query,
+			"succeeded": outcome.failure.is_none(),
+			"returned_to_baseline": retained == baseline_after_setup,
+			"baseline_bytes": baseline_after_setup,
+			"retained_bytes": retained,
+			"cleanup_ms": outcome.cleanup_ms,
+		}))?;
+		artifact.append_row(&timing_atlas_cell_summary_row(&outcome))?;
+		if outcome.finalized() {
+			finalized += 1;
+		}
+	}
+
+	let host_end = observe_host_quiescence();
+	artifact.append_row(&serde_json::json!({
+		"kind": TIMING_ATLAS_KIND_HOST_END,
+		"service_inactive": host_end.service_inactive,
+		"sql_port_free": host_end.sql_port_free,
+	}))?;
+
+	let conditions = TimingAuthorityConditions {
+		clean_build: !crate::telemetry::build_commit().contains("dirty"),
+		full_hash_dataset: dataset_fingerprint != "unknown",
+		quiescent_host: timing_atlas_quiescent_throughout(&host_start, &host_end),
+		protocol_unmodified: true,
+		complete_cohort: finalized == timing_atlas_cells().len(),
+	};
+
+	// Replay what was written rather than trusting what was remembered.
+	let journal = std::fs::read_to_string(artifact.partial_path())
+		.map_err(|error| format!("timing atlas reread: {error}"))?;
+	let replay = timing_atlas_replay(&journal);
+	let authoritative = replay.authoritative(&conditions) && conditions.granted();
+
+	artifact.append_seal(&serde_json::json!({
+		"kind": TIMING_ATLAS_SEAL_KIND,
+		"timing_authority": authoritative,
+		"withheld_reasons": conditions.withheld_reasons(),
+		"replay_violations": replay.violations,
+		"finalized_cells": replay.finalized_cells.len(),
+		"distinguished_slower_cells": replay.distinguished_slower.len(),
+	}))?;
+
+	if !authoritative {
+		return Err(format!(
+			"timing atlas withheld authority; partial retained. reasons={:?} violations={:?}",
+			conditions.withheld_reasons(),
+			replay.violations
+		));
+	}
+	artifact.publish()
 }
 
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
@@ -20040,7 +20568,7 @@ mod adr538_timing_atlas_execution {
 				failure_is_io: false,
 			},
 			delta_ms: 10.0,
-			ratio: 2.0,
+			ratio: Some(2.0),
 		};
 		let base = TimingAtlasCellOutcome {
 			query: "q01".to_string(),
@@ -20109,7 +20637,7 @@ mod adr538_timing_atlas_execution {
 					failure_is_io: false,
 				},
 				delta_ms: 15.0,
-				ratio: 2.5,
+				ratio: Some(2.5),
 			}],
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
@@ -20805,5 +21333,212 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 			 surviving manifest, live entry or cancellation record would reject this: {:?}",
 			second.err()
 		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_journal_replay {
+	use super::*;
+
+	fn journal_lines(cells: &[&str], pairs_per_cell: usize) -> Vec<serde_json::Value> {
+		let mut rows = vec![
+			timing_atlas_header_row(
+				&HostQuiescence {
+					service_inactive: true,
+					sql_port_free: true,
+				},
+				"fnv1a64:test",
+				8.0,
+				"strict",
+			),
+			timing_atlas_exclusion_row("q15"),
+		];
+		for query in cells {
+			rows.push(serde_json::json!({
+				"kind": TIMING_ATLAS_KIND_CELL_SETUP, "query": query
+			}));
+			for pair_index in 0..pairs_per_cell {
+				rows.push(serde_json::json!({
+					"kind": TIMING_ATLAS_KIND_PAIR,
+					"query": query,
+					"pair_index": pair_index,
+					"first_arm": "local",
+					"local_elapsed_ms": 10.0,
+					"distributed_elapsed_ms": 20.0,
+					"delta_ms": 10.0,
+					"ratio": 2.0,
+					"local_attempt": 1,
+					"distributed_attempt": 1,
+				}));
+			}
+			rows.push(serde_json::json!({
+				"kind": TIMING_ATLAS_KIND_CLEANUP,
+				"query": query,
+				"succeeded": true,
+				"returned_to_baseline": true,
+			}));
+			rows.push(serde_json::json!({
+				"kind": TIMING_ATLAS_KIND_RESIDENCY, "query": query, "stable": true
+			}));
+			rows.push(serde_json::json!({
+				"kind": TIMING_ATLAS_KIND_CELL_SUMMARY,
+				"query": query,
+				"finalized": pairs_per_cell == TIMING_ATLAS_MEASURED_PAIRS,
+				"pairs": pairs_per_cell,
+				"invalid_attempts": 0,
+				"verdict": "distinguished",
+			}));
+		}
+		rows.push(serde_json::json!({
+			"kind": TIMING_ATLAS_KIND_HOST_END,
+			"service_inactive": true,
+			"sql_port_free": true,
+		}));
+		rows.push(serde_json::json!({ "kind": TIMING_ATLAS_SEAL_KIND }));
+		rows
+	}
+
+	fn render(rows: &[serde_json::Value]) -> String {
+		rows.iter()
+			.map(|row| row.to_string())
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	fn granted() -> TimingAuthorityConditions {
+		TimingAuthorityConditions {
+			clean_build: true,
+			full_hash_dataset: true,
+			quiescent_host: true,
+			protocol_unmodified: true,
+			complete_cohort: true,
+		}
+	}
+
+	#[test]
+	fn a_complete_journal_replays_to_authority() {
+		let cells = timing_atlas_cells();
+		let rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		let replay = timing_atlas_replay(&render(&rows));
+		assert!(
+			replay.violations.is_empty(),
+			"violations: {:?}",
+			replay.violations
+		);
+		assert_eq!(replay.finalized_cells.len(), 21);
+		assert_eq!(replay.exclusions, vec!["q15".to_string()]);
+		assert_eq!(replay.distinguished_slower.len(), 21);
+		assert!(replay.authoritative(&granted()));
+	}
+
+	/// Six pairs per cell cannot replay to authority, whatever the summary claims.
+	#[test]
+	fn six_of_seven_pairs_fails_replay() {
+		let cells = timing_atlas_cells();
+		let mut rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS - 1);
+		// Force the summary to lie about finalization.
+		for row in rows.iter_mut() {
+			if row.get("kind").and_then(|k| k.as_str()) == Some(TIMING_ATLAS_KIND_CELL_SUMMARY) {
+				row["finalized"] = serde_json::Value::Bool(true);
+			}
+		}
+		let replay = timing_atlas_replay(&render(&rows));
+		assert!(
+			!replay.violations.is_empty(),
+			"a lying summary must be caught by replay"
+		);
+		assert!(!replay.authoritative(&granted()));
+	}
+
+	/// A pair row whose delta disagrees with its own elapsed values is a violation — the
+	/// journal is recomputed, not trusted.
+	#[test]
+	fn a_pair_row_that_contradicts_itself_is_rejected() {
+		let cells = timing_atlas_cells();
+		let mut rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		for row in rows.iter_mut() {
+			if row.get("kind").and_then(|k| k.as_str()) == Some(TIMING_ATLAS_KIND_PAIR) {
+				row["delta_ms"] = serde_json::json!(999.0);
+				break;
+			}
+		}
+		let replay = timing_atlas_replay(&render(&rows));
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|violation| violation.contains("delta disagrees")),
+			"violations: {:?}",
+			replay.violations
+		);
+	}
+
+	/// A missing terminal seal, a missing host-end observation, or a second exclusion each
+	/// forfeit authority.
+	#[test]
+	fn missing_seal_or_host_end_or_extra_exclusion_forfeits_authority() {
+		let cells = timing_atlas_cells();
+
+		let mut unsealed = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		unsealed.pop();
+		let replay = timing_atlas_replay(&render(&unsealed));
+		assert!(!replay.terminal_seal);
+		assert!(!replay.authoritative(&granted()));
+
+		let mut noisy_end = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		for row in noisy_end.iter_mut() {
+			if row.get("kind").and_then(|k| k.as_str()) == Some(TIMING_ATLAS_KIND_HOST_END) {
+				row["service_inactive"] = serde_json::Value::Bool(false);
+			}
+		}
+		let replay = timing_atlas_replay(&render(&noisy_end));
+		assert_eq!(replay.host_end_quiescent, Some(false));
+		assert!(!replay.authoritative(&granted()));
+
+		let mut twice = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		twice.insert(2, timing_atlas_exclusion_row("q15"));
+		let replay = timing_atlas_replay(&render(&twice));
+		assert!(!replay.authoritative(&granted()));
+	}
+
+	/// Rows after the terminal seal are a violation: the seal is terminal.
+	#[test]
+	fn rows_after_the_seal_are_rejected() {
+		let cells = timing_atlas_cells();
+		let mut rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		rows.push(serde_json::json!({
+			"kind": TIMING_ATLAS_KIND_CELL_SETUP, "query": "q01"
+		}));
+		let replay = timing_atlas_replay(&render(&rows));
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|violation| violation.contains("follows the terminal seal"))
+		);
+	}
+
+	/// A ratio must never be NaN or infinity; a zero local arm serializes null.
+	#[test]
+	fn zero_local_arm_serializes_a_null_ratio() {
+		let child = |arm: &'static str, elapsed: f64| TimingAtlasChild {
+			query: "q01".to_string(),
+			arm,
+			pair_index: Some(0),
+			position_in_pair: 0,
+			attempt: 1,
+			query_elapsed_ms: elapsed,
+			row_count: Some(1),
+			identity_matches: Some(true),
+			valid: true,
+			failure: None,
+			failure_is_io: false,
+		};
+		let pair = assemble_timing_atlas_pair(0, child("local", 0.0), child("distributed", 5.0));
+		assert!(pair.ratio.is_none(), "a zero local arm has no ratio");
+		let row = timing_atlas_pair_row("q01", &pair);
+		assert_eq!(row["ratio"], serde_json::Value::Null);
+		assert!(!row.to_string().contains("inf"));
+		assert!(!row.to_string().contains("NaN"));
 	}
 }
