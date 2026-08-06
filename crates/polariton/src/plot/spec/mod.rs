@@ -1354,6 +1354,9 @@ pub fn resolve_layered_domains(
 	Ok(ResolvedLayeredPlotSpec { layers })
 }
 
+/// PRODUCT-0029 compatibility entrypoint. It preserves the pre-palette
+/// twelve-slot allocation and adds no band fills until PRODUCT-0030 switches
+/// the production caller atomically with authored palette selection.
 pub fn resolve_domains(
 	binding: ChannelBinding,
 	result: &StampedResult,

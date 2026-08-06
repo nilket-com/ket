@@ -224,10 +224,10 @@ fn product_0007_spec_leaks(source: &str, is_spec: bool) -> Vec<&'static str> {
 			"crate::plot::common",
 			"plot specification depends on renderer state",
 		),
-		(
-			"libaryon",
-			"plot specification depends on the interface engine",
-		),
+		// PRODUCT-0029 supersedes the former blanket `libaryon` ban: the
+		// specification resolver may consume its resolved categorical-palette
+		// fact. Dedicated PRODUCT-0028/0029 guards confine that exception and
+		// still prohibit engine, renderer, and artifact policy here.
 	] {
 		if is_spec && source.contains(needle) {
 			findings.push(label);
@@ -888,7 +888,7 @@ fn product_0027_surface_keeps_projection_intent_bounded_and_plot_registers_close
 }
 
 #[test]
-fn product_0028_categorical_palettes_remain_a_libaryon_fact_without_artifact_policy() {
+fn product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let libaryon_theme = manifest_dir.join("../libaryon/src/engine/theme.rs");
 	let theme = std::fs::read_to_string(&libaryon_theme).expect("read libaryon theme source");
@@ -942,6 +942,7 @@ fn product_0028_categorical_palettes_remain_a_libaryon_fact_without_artifact_pol
 	);
 
 	let polariton_src = manifest_dir.join("src");
+	let permitted_consumer = polariton_src.join("plot/spec/mod.rs");
 	let mut pending = vec![polariton_src];
 	let mut leaks = Vec::new();
 	while let Some(path) = pending.pop() {
@@ -949,9 +950,15 @@ fn product_0028_categorical_palettes_remain_a_libaryon_fact_without_artifact_pol
 			let path = entry.expect("Polariton source entry").path();
 			if path.is_dir() {
 				pending.push(path);
-			} else if path.extension().and_then(|extension| extension.to_str()) == Some("rs") {
+			} else if path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+				&& path != permitted_consumer
+			{
 				let source =
 					std::fs::read_to_string(&path).expect("read Polariton production source");
+				let source = source
+					.split("#[cfg(test)]")
+					.next()
+					.expect("Polariton production source");
 				for forbidden in ["categorical_palette", "ResolvedCategoricalPalette"] {
 					if source.contains(forbidden) {
 						leaks.push(format!("{}: {forbidden}", path.display()));
@@ -962,12 +969,73 @@ fn product_0028_categorical_palettes_remain_a_libaryon_fact_without_artifact_pol
 	}
 	assert!(
 		leaks.is_empty(),
-		"PRODUCT-0028 acquired a Polariton production consumer before PRODUCT-0029:\n{}",
+		"PRODUCT-0028 categorical authority escaped PRODUCT-0029's spec resolver:\n{}",
 		leaks.join("\n")
 	);
+	let spec = std::fs::read_to_string(&permitted_consumer).expect("read plot spec consumer");
+	assert!(spec.contains("CategoricalPaletteSelection"));
+	assert_eq!(spec.matches("Theme::try_new(identity)").count(), 1);
+	assert!(spec.contains("theme.categorical_palette().cloned()"));
 	assert!(
 		"fn plot(p: ResolvedCategoricalPalette) { let _ = p.categorical_palette(); }"
 			.contains("ResolvedCategoricalPalette"),
 		"positive control: PRODUCT-0028 consumer assay must observe the forbidden API"
 	);
+}
+
+#[test]
+fn product_0029_positions_and_exact_band_fills_stay_inside_the_plot_boundary() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let production = spec
+		.split("#[cfg(test)]")
+		.next()
+		.expect("plot spec production source");
+	assert!(production.contains("pub struct PalettePosition(usize);"));
+	assert!(production.contains("assignments: HashMap<ColorIdentityKey, PalettePosition>"));
+	assert!(production.contains("pub band_fills: Vec<BandFillAssignment>"));
+	assert!(production.contains("PRODUCT-0029 compatibility entrypoint"));
+	assert!(production.contains("PRODUCT-0029's explicit, test-only categorical palette path"));
+	assert!(production.contains("owns the first production caller and the authored default"));
+	assert!(production.contains("ResolvedKernelFields::Bar { category, .. }"));
+	assert!(production.contains("channel.binding.channel == Channel::Color"));
+
+	for relative in ["plot/factory.rs", "plot/kernels/bar.rs"] {
+		let source = std::fs::read_to_string(root.join(relative)).expect("read render boundary");
+		let source = source
+			.split("#[cfg(test)]")
+			.next()
+			.expect("render production source");
+		for forbidden in [
+			"Theme::try_new",
+			"ResolvedCategoricalPalette",
+			"CategoricalPaletteSelection",
+			"ColorIdentity",
+			"evenly_spread_positions",
+			"maximin_position",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{relative} acquired palette/allocator policy through {forbidden}"
+			);
+		}
+	}
+
+	for relative in [
+		"rune_relation_envelope.rs",
+		"plot/request.rs",
+		"plot/durable.rs",
+	] {
+		let source = std::fs::read_to_string(root.join(relative)).expect("read caller boundary");
+		for forbidden in [
+			"resolve_domains_with_categorical_palette",
+			"CategoricalPaletteSelection",
+			"BandFillAssignment",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{relative} selected PRODUCT-0029 before PRODUCT-0030 through {forbidden}"
+			);
+		}
+	}
 }
