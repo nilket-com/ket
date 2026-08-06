@@ -93,6 +93,8 @@ impl TickPlacement {
 				let count = last - first + 1.0;
 				if !count.is_finite() || count > MAX_GENERATED_TICK_POSITIONS as f64 {
 					return Err(TickPlacementError::Capacity {
+						step,
+						range,
 						requested: count,
 						limit: MAX_GENERATED_TICK_POSITIONS,
 					});
@@ -142,9 +144,18 @@ pub const MAX_GENERATED_TICK_POSITIONS: usize = 10_000;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum TickPlacementError {
-	InvalidDomain { range: (f64, f64) },
-	Capacity { requested: f64, limit: usize },
-	UnsupportedAxis { axis_type: AxisType },
+	InvalidDomain {
+		range: (f64, f64),
+	},
+	Capacity {
+		step: f64,
+		range: (f64, f64),
+		requested: f64,
+		limit: usize,
+	},
+	UnsupportedAxis {
+		axis_type: AxisType,
+	},
 }
 
 #[allow(dead_code)]
