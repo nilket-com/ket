@@ -1790,6 +1790,43 @@ mod tests {
 		(registry, root)
 	}
 
+	fn build_document_with_byte_leaves(chunks: &[&[u8]]) -> (UastRegistry, crate::ecs::NodeId) {
+		let capacity =
+			u32::try_from(chunks.len().saturating_add(1)).expect("test capacity fits u32");
+		let registry = UastRegistry::new(capacity);
+		let mut chunk = registry.reserve_chunk(capacity).expect("OOM");
+		let byte_length = chunks.iter().map(|bytes| bytes.len() as u64).sum();
+		let newlines = chunks
+			.iter()
+			.flat_map(|bytes| bytes.iter())
+			.filter(|&&byte| byte == b'\n')
+			.count() as u64;
+		let root = chunk.spawn_node(
+			SemanticKind::RelationalTable,
+			None,
+			SpanMetrics {
+				byte_length,
+				newlines,
+			},
+		);
+		for bytes in chunks {
+			let leaf = chunk.spawn_node(
+				SemanticKind::Token,
+				None,
+				SpanMetrics {
+					byte_length: bytes.len() as u64,
+					newlines: bytes.iter().filter(|&&byte| byte == b'\n').count() as u64,
+				},
+			);
+			chunk.append_local_child(root, leaf);
+			unsafe {
+				*registry.virtual_data[leaf.index()].get() = Some(bytes.to_vec());
+			}
+		}
+		drop(chunk);
+		(registry, root)
+	}
+
 	fn build_document_with_leaves(chunks: &[&str]) -> (UastRegistry, crate::ecs::NodeId) {
 		let registry = UastRegistry::new((chunks.len() + 1) as u32 + 4);
 		let mut chunk = registry
@@ -2418,6 +2455,27 @@ mod tests {
 		assert_eq!(tokens.len(), 1);
 		assert_eq!(tokens[0].absolute_start_byte, DocByte::new(3));
 		assert_eq!(tokens[0].text, b"\xffbb\ncc".to_vec());
+	}
+
+	#[test]
+	fn valid_utf8_remains_reconstructible_across_render_token_boundaries() {
+		let skull = "☠".as_bytes();
+		let chunks = [&skull[..1], &skull[1..2], &skull[2..]];
+		let (registry, root) = build_document_with_byte_leaves(&chunks);
+
+		let tokens = registry.query_viewport(root, &crate::uast::NoFolds, DocLine::ZERO, 1);
+		let reconstructed = tokens
+			.iter()
+			.flat_map(|token| token.text.iter().copied())
+			.collect::<Vec<_>>();
+
+		assert_eq!(
+			tokens.len(),
+			3,
+			"the byte store need not align leaves to text"
+		);
+		assert_eq!(reconstructed, skull);
+		assert_eq!(std::str::from_utf8(&reconstructed), Ok("☠"));
 	}
 
 	#[test]
