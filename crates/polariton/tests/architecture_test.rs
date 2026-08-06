@@ -975,6 +975,64 @@ fn product_0036_numeric_bounds_have_one_figure_producer_and_no_magnitude_gate() 
 }
 
 #[test]
+fn product_0037_tick_positions_have_one_closed_generator_and_no_surface_caller() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let common_production = common
+		.split("#[cfg(test)]\nmod product_0031_pre_extraction_oracle")
+		.next()
+		.expect("plot common production");
+	assert!(common_production.contains("pub enum TickPlacement"));
+	assert!(common_production.contains("pub fn positions("));
+	assert!(common_production.contains("pub fn minor_positions("));
+	assert_eq!(
+		common_production
+			.matches("self.major_tick_positions(")
+			.count(),
+		10,
+		"the generator helper plus nine major consumers must be present"
+	);
+	assert_eq!(
+		common_production
+			.matches("self.minor_tick_positions(")
+			.count(),
+		7,
+		"all seven minor consumers must be present"
+	);
+	for forbidden in [
+		"self.settings.x_ticks",
+		"self.settings.y_ticks",
+		"i as f64 / self.settings",
+		"j as f64 / self.settings",
+		"k as f64 / self.settings",
+	] {
+		assert!(
+			!common_production.contains(forbidden),
+			"tick site retained {forbidden}"
+		);
+	}
+
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
+	let theme_production = theme
+		.split("#[cfg(test)]")
+		.next()
+		.expect("plot theme production");
+	assert!(theme_production.contains("x_tick_placement: TickPlacement"));
+	assert!(theme_production.contains("y_tick_placement: TickPlacement"));
+	assert!(!theme_production.contains("x_ticks:"));
+	assert!(!theme_production.contains("y_ticks:"));
+
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let envelope_production = envelope
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("Rune envelope production");
+	assert!(!envelope_production.contains("x_tick_step"));
+	assert!(!envelope_production.contains("y_tick_step"));
+}
+
+#[test]
 fn product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let libaryon_theme = manifest_dir.join("../libaryon/src/engine/theme.rs");

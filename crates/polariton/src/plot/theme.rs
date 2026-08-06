@@ -7,7 +7,7 @@
 
 use crate::plot::chrome::{PlotChrome, PlotChromeProjection};
 use crate::plot::colors::ColorTheme;
-use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode};
+use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode, TickPlacement};
 use crate::plot::spec::{
 	BarWidth, ColorJob, LayerSettings, Override, PointSize, Presence, StrokeWidth,
 };
@@ -124,8 +124,8 @@ pub struct PlotGuideSettings {
 	pub max_legend_rows: u32,
 	pub legend_x: f32,
 	pub legend_y: f32,
-	pub x_ticks: u32,
-	pub y_ticks: u32,
+	pub x_tick_placement: TickPlacement,
+	pub y_tick_placement: TickPlacement,
 	pub x_minor_ticks: u32,
 	pub y_minor_ticks: u32,
 	pub x_major_grid: bool,
@@ -336,8 +336,8 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 		settings.max_legend_rows = value.max_legend_rows;
 		settings.legend_x = value.legend_x;
 		settings.legend_y = value.legend_y;
-		settings.x_ticks = value.x_ticks;
-		settings.y_ticks = value.y_ticks;
+		settings.x_tick_placement = value.x_tick_placement;
+		settings.y_tick_placement = value.y_tick_placement;
 		settings.x_minor_ticks = value.x_minor_ticks;
 		settings.y_minor_ticks = value.y_minor_ticks;
 		settings.show_x_major_grid = value.x_major_grid;

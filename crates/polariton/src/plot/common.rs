@@ -8,6 +8,7 @@ use iced::advanced::mouse::Cursor;
 use iced::alignment;
 use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Stroke, Style, Text};
 use iced::{Color, Event, Point, Rectangle, Renderer, Theme};
+use std::num::NonZeroU32;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -30,6 +31,120 @@ pub enum AxisType {
 	Date,
 	Datetime(TimeUnit),
 	Time,
+}
+
+/// Closed major-tick placement. Count preserves the legacy interval model;
+/// Step places ticks on a zero-anchored numeric lattice.
+#[allow(dead_code)] // PRODUCT-0038 is the first production Rune caller.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TickPlacement {
+	Count(NonZeroU32),
+	Step(PositiveFinite),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PositiveFinite(f64);
+
+impl TickPlacement {
+	pub const DEFAULT: Self = Self::Count(NonZeroU32::new(8).unwrap());
+
+	pub fn count(intervals: u32) -> Option<Self> {
+		NonZeroU32::new(intervals).map(Self::Count)
+	}
+
+	pub fn count_value(self) -> Option<u32> {
+		match self {
+			Self::Count(intervals) => Some(intervals.get()),
+			Self::Step(_) => None,
+		}
+	}
+
+	#[allow(dead_code)] // PRODUCT-0038 is the first production Rune caller.
+	pub fn step(step: f64) -> Option<Self> {
+		(step.is_finite() && step > 0.0).then_some(Self::Step(PositiveFinite(step)))
+	}
+
+	#[allow(dead_code)] // PRODUCT-0038 owns destination applicability diagnostics.
+	pub fn positions_for_axis(
+		self,
+		axis_type: AxisType,
+		range: (f64, f64),
+	) -> Result<Vec<f64>, TickPlacementError> {
+		if matches!(self, Self::Step(_)) && !matches!(axis_type, AxisType::Linear) {
+			return Err(TickPlacementError::UnsupportedAxis { axis_type });
+		}
+		self.positions(range)
+	}
+
+	pub fn positions(self, range: (f64, f64)) -> Result<Vec<f64>, TickPlacementError> {
+		if !range.0.is_finite() || !range.1.is_finite() || range.0 > range.1 {
+			return Err(TickPlacementError::InvalidDomain { range });
+		}
+		match self {
+			Self::Count(intervals) => Ok((0..=intervals.get())
+				.map(|i| range.0 + (range.1 - range.0) * (i as f64 / intervals.get() as f64))
+				.collect()),
+			Self::Step(PositiveFinite(step)) => {
+				let first = (range.0 / step).ceil();
+				let last = (range.1 / step).floor();
+				if first > last {
+					return Ok(Vec::new());
+				}
+				let count = last - first + 1.0;
+				if !count.is_finite() || count > MAX_GENERATED_TICK_POSITIONS as f64 {
+					return Err(TickPlacementError::Capacity {
+						requested: count,
+						limit: MAX_GENERATED_TICK_POSITIONS,
+					});
+				}
+				Ok((0..count as usize)
+					.map(|offset| (first + offset as f64) * step)
+					.collect())
+			}
+		}
+	}
+
+	pub fn minor_positions(self, major: &[f64], minor_intervals: u32) -> Vec<f64> {
+		if minor_intervals == 0 {
+			return Vec::new();
+		}
+		match self {
+			Self::Count(intervals) => {
+				let range = (
+					*major.first().unwrap_or(&0.0),
+					*major.last().unwrap_or(&0.0),
+				);
+				(0..intervals.get())
+					.flat_map(|index| {
+						(1..=minor_intervals).filter_map(move |minor| {
+							let t = (index as f64 + minor as f64 / (minor_intervals + 1) as f64)
+								/ intervals.get() as f64;
+							(t <= 1.0).then(|| range.0 + (range.1 - range.0) * t)
+						})
+					})
+					.collect()
+			}
+			Self::Step(_) => major
+				.windows(2)
+				.flat_map(|window| {
+					(1..=minor_intervals).map(move |index| {
+						window[0]
+							+ (window[1] - window[0])
+								* (index as f64 / (minor_intervals + 1) as f64)
+					})
+				})
+				.collect(),
+		}
+	}
+}
+
+pub const MAX_GENERATED_TICK_POSITIONS: usize = 10_000;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum TickPlacementError {
+	InvalidDomain { range: (f64, f64) },
+	Capacity { requested: f64, limit: usize },
+	UnsupportedAxis { axis_type: AxisType },
 }
 
 #[allow(dead_code)]
@@ -256,8 +371,8 @@ pub struct ResolvedPlotSettings {
 	pub x_tick_size: f32,
 	pub y_tick_size: f32,
 	pub legend_size: f32,
-	pub x_ticks: u32,
-	pub y_ticks: u32,
+	pub x_tick_placement: TickPlacement,
+	pub y_tick_placement: TickPlacement,
 	pub x_minor_ticks: u32,
 	pub y_minor_ticks: u32,
 	pub show_x_minor_ticks: bool,
@@ -319,8 +434,8 @@ impl Default for ResolvedPlotSettings {
 			x_tick_size: 18.0,
 			y_tick_size: 18.0,
 			legend_size: 14.0,
-			x_ticks: 8,
-			y_ticks: 8,
+			x_tick_placement: TickPlacement::DEFAULT,
+			y_tick_placement: TickPlacement::DEFAULT,
 			x_minor_ticks: 4,
 			y_minor_ticks: 4,
 			show_x_minor_ticks: true,
@@ -612,6 +727,20 @@ pub struct PlotCanvasState {
 }
 
 impl<'a> PlotWidget<'a> {
+	fn major_tick_positions(&self, placement: TickPlacement, range: (f64, f64)) -> Vec<f64> {
+		placement.positions(range).unwrap_or_default()
+	}
+
+	fn minor_tick_positions(
+		&self,
+		placement: TickPlacement,
+		range: (f64, f64),
+		minor_intervals: u32,
+	) -> Vec<f64> {
+		let major = self.major_tick_positions(placement, range);
+		placement.minor_positions(&major, minor_intervals)
+	}
+
 	fn plot_area(&self, bounds: Rectangle) -> Rectangle {
 		let padding_top = self.padding + self.settings.plot_padding_top;
 		let padding_bottom = self.padding + self.settings.plot_padding_bottom;
@@ -995,21 +1124,17 @@ impl<'a> PlotWidget<'a> {
 				self.settings.y_minor_grid_width,
 				self.settings.y_minor_grid_style,
 			);
-			for i in 0..self.settings.y_ticks {
-				for j in 1..=self.settings.y_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64)
-						/ self.settings.y_ticks as f64;
-					if t > 1.0 {
-						continue;
-					}
-					let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
-					draw_line(
-						backend,
-						transform.cartesian(x_range.0, data_y),
-						transform.cartesian(x_range.1, data_y),
-						stroke,
-					);
-				}
+			for data_y in self.minor_tick_positions(
+				self.settings.y_tick_placement,
+				y_range,
+				self.settings.y_minor_ticks,
+			) {
+				draw_line(
+					backend,
+					transform.cartesian(x_range.0, data_y),
+					transform.cartesian(x_range.1, data_y),
+					stroke,
+				);
 			}
 		}
 		if self.settings.show_x_minor_grid && self.settings.x_minor_ticks > 0 {
@@ -1017,21 +1142,17 @@ impl<'a> PlotWidget<'a> {
 				self.settings.x_minor_grid_width,
 				self.settings.x_minor_grid_style,
 			);
-			for i in 0..self.settings.x_ticks {
-				for j in 1..=self.settings.x_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64)
-						/ self.settings.x_ticks as f64;
-					if t > 1.0 {
-						continue;
-					}
-					let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
-					draw_line(
-						backend,
-						transform.cartesian(data_x, y_range.0),
-						transform.cartesian(data_x, y_range.1),
-						stroke,
-					);
-				}
+			for data_x in self.minor_tick_positions(
+				self.settings.x_tick_placement,
+				x_range,
+				self.settings.x_minor_ticks,
+			) {
+				draw_line(
+					backend,
+					transform.cartesian(data_x, y_range.0),
+					transform.cartesian(data_x, y_range.1),
+					stroke,
+				);
 			}
 		}
 		if self.settings.show_y_major_grid {
@@ -1039,9 +1160,7 @@ impl<'a> PlotWidget<'a> {
 				self.settings.y_major_grid_width,
 				self.settings.y_major_grid_style,
 			);
-			for i in 0..=self.settings.y_ticks {
-				let t = i as f64 / self.settings.y_ticks as f64;
-				let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
+			for data_y in self.major_tick_positions(self.settings.y_tick_placement, y_range) {
 				draw_line(
 					backend,
 					transform.cartesian(x_range.0, data_y),
@@ -1055,9 +1174,7 @@ impl<'a> PlotWidget<'a> {
 				self.settings.x_major_grid_width,
 				self.settings.x_major_grid_style,
 			);
-			for i in 0..=self.settings.x_ticks {
-				let t = i as f64 / self.settings.x_ticks as f64;
-				let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
+			for data_x in self.major_tick_positions(self.settings.x_tick_placement, x_range) {
 				draw_line(
 					backend,
 					transform.cartesian(data_x, y_range.0),
@@ -1106,9 +1223,7 @@ impl<'a> PlotWidget<'a> {
 		};
 		backend.stroke_path(&axes_path, halo_stroke);
 		backend.stroke_path(&axes_path, axis_stroke);
-		for i in 0..=self.settings.y_ticks {
-			let t = i as f64 / self.settings.y_ticks as f64;
-			let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
+		for data_y in self.major_tick_positions(self.settings.y_tick_placement, y_range) {
 			let p_left = transform.cartesian(x_range.0, data_y);
 			backend.stroke_path(
 				&|builder| {
@@ -1128,28 +1243,22 @@ impl<'a> PlotWidget<'a> {
 			});
 		}
 		if self.settings.show_y_minor_ticks && self.settings.y_minor_ticks > 0 {
-			for i in 0..self.settings.y_ticks {
-				for j in 1..=self.settings.y_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64)
-						/ self.settings.y_ticks as f64;
-					if t > 1.0 {
-						continue;
-					}
-					let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
-					let p_left = transform.cartesian(x_range.0, data_y);
-					backend.stroke_path(
-						&|builder| {
-							builder.move_to(p_left);
-							builder.line_to(Point::new(p_left.x - 3.0, p_left.y));
-						},
-						axis_stroke,
-					);
-				}
+			for data_y in self.minor_tick_positions(
+				self.settings.y_tick_placement,
+				y_range,
+				self.settings.y_minor_ticks,
+			) {
+				let p_left = transform.cartesian(x_range.0, data_y);
+				backend.stroke_path(
+					&|builder| {
+						builder.move_to(p_left);
+						builder.line_to(Point::new(p_left.x - 3.0, p_left.y));
+					},
+					axis_stroke,
+				);
 			}
 		}
-		for i in 0..=self.settings.x_ticks {
-			let t = i as f64 / self.settings.x_ticks as f64;
-			let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
+		for data_x in self.major_tick_positions(self.settings.x_tick_placement, x_range) {
 			let p_bottom = transform.cartesian(data_x, y_range.0);
 			backend.stroke_path(
 				&|builder| {
@@ -1175,23 +1284,19 @@ impl<'a> PlotWidget<'a> {
 			});
 		}
 		if self.settings.show_x_minor_ticks && self.settings.x_minor_ticks > 0 {
-			for i in 0..self.settings.x_ticks {
-				for j in 1..=self.settings.x_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64)
-						/ self.settings.x_ticks as f64;
-					if t > 1.0 {
-						continue;
-					}
-					let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
-					let p_bottom = transform.cartesian(data_x, y_range.0);
-					backend.stroke_path(
-						&|builder| {
-							builder.move_to(p_bottom);
-							builder.line_to(Point::new(p_bottom.x, p_bottom.y + 3.0));
-						},
-						axis_stroke,
-					);
-				}
+			for data_x in self.minor_tick_positions(
+				self.settings.x_tick_placement,
+				x_range,
+				self.settings.x_minor_ticks,
+			) {
+				let p_bottom = transform.cartesian(data_x, y_range.0);
+				backend.stroke_path(
+					&|builder| {
+						builder.move_to(p_bottom);
+						builder.line_to(Point::new(p_bottom.x, p_bottom.y + 3.0));
+					},
+					axis_stroke,
+				);
 			}
 		}
 	}
@@ -1245,18 +1350,14 @@ impl<'a> PlotWidget<'a> {
 				self.settings.y_minor_grid_width,
 				self.settings.y_minor_grid_style,
 			);
-			for i in 0..self.settings.y_ticks {
-				for j in 1..=self.settings.y_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.y_minor_ticks + 1) as f64)
-						/ self.settings.y_ticks as f64;
-					if t > 1.0 {
-						continue;
-					}
-					let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
-					let p1 = Point::new(left_edge, transform.categorical(0, data_y).0.y);
-					let p2 = Point::new(right_edge, p1.y);
-					draw_line(backend, p1, p2, stroke);
-				}
+			for data_y in self.minor_tick_positions(
+				self.settings.y_tick_placement,
+				y_range,
+				self.settings.y_minor_ticks,
+			) {
+				let p1 = Point::new(left_edge, transform.categorical(0, data_y).0.y);
+				let p2 = Point::new(right_edge, p1.y);
+				draw_line(backend, p1, p2, stroke);
 			}
 		}
 		if self.settings.show_y_major_grid {
@@ -1264,9 +1365,7 @@ impl<'a> PlotWidget<'a> {
 				self.settings.y_major_grid_width,
 				self.settings.y_major_grid_style,
 			);
-			for i in 0..=self.settings.y_ticks {
-				let t = i as f64 / self.settings.y_ticks as f64;
-				let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
+			for data_y in self.major_tick_positions(self.settings.y_tick_placement, y_range) {
 				let p1 = Point::new(left_edge, transform.categorical(0, data_y).0.y);
 				let p2 = Point::new(right_edge, p1.y);
 				draw_line(backend, p1, p2, stroke);
@@ -1305,9 +1404,7 @@ impl<'a> PlotWidget<'a> {
 		};
 		backend.stroke_path(&axes_path, halo_stroke);
 		backend.stroke_path(&axes_path, axis_stroke);
-		for i in 0..=self.settings.y_ticks {
-			let t = i as f64 / self.settings.y_ticks as f64;
-			let data_y = y_range.0 + (y_range.1 - y_range.0) * t;
+		for data_y in self.major_tick_positions(self.settings.y_tick_placement, y_range) {
 			let (center, band_width) = transform.categorical(0, data_y);
 			let left_edge = center.x - (band_width / 2.0);
 			let p_left = Point::new(left_edge, center.y);
@@ -1404,22 +1501,18 @@ impl<'a> PlotWidget<'a> {
 				self.settings.x_minor_grid_width,
 				self.settings.x_minor_grid_style,
 			);
-			for i in 0..self.settings.x_ticks {
-				for j in 1..=self.settings.x_minor_ticks {
-					let t = (i as f64 + j as f64 / (self.settings.x_minor_ticks + 1) as f64)
-						/ self.settings.x_ticks as f64;
-					if t > 1.0 {
-						continue;
-					}
-					let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
-					let x = transform.categorical(0, data_x).0.x;
-					draw_line(
-						backend,
-						Point::new(x, top_edge),
-						Point::new(x, bottom_edge),
-						stroke,
-					);
-				}
+			for data_x in self.minor_tick_positions(
+				self.settings.x_tick_placement,
+				x_range,
+				self.settings.x_minor_ticks,
+			) {
+				let x = transform.categorical(0, data_x).0.x;
+				draw_line(
+					backend,
+					Point::new(x, top_edge),
+					Point::new(x, bottom_edge),
+					stroke,
+				);
 			}
 		}
 		if self.settings.show_x_major_grid {
@@ -1427,9 +1520,7 @@ impl<'a> PlotWidget<'a> {
 				self.settings.x_major_grid_width,
 				self.settings.x_major_grid_style,
 			);
-			for i in 0..=self.settings.x_ticks {
-				let t = i as f64 / self.settings.x_ticks as f64;
-				let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
+			for data_x in self.major_tick_positions(self.settings.x_tick_placement, x_range) {
 				let x = transform.categorical(0, data_x).0.x;
 				draw_line(
 					backend,
@@ -1472,9 +1563,7 @@ impl<'a> PlotWidget<'a> {
 		};
 		backend.stroke_path(&axes_path, halo_stroke);
 		backend.stroke_path(&axes_path, axis_stroke);
-		for i in 0..=self.settings.x_ticks {
-			let t = i as f64 / self.settings.x_ticks as f64;
-			let data_x = x_range.0 + (x_range.1 - x_range.0) * t;
+		for data_x in self.major_tick_positions(self.settings.x_tick_placement, x_range) {
 			let (center, band_height) = transform.categorical(0, data_x);
 			let bottom_edge = center.y + (band_height / 2.0);
 			let p_bottom = Point::new(center.x, bottom_edge);
@@ -1633,9 +1722,7 @@ impl<'a> PlotWidget<'a> {
 			};
 			backend.stroke_path(&axis_path, halo_stroke);
 			backend.stroke_path(&axis_path, axis_stroke);
-			for j in 0..=self.settings.y_ticks {
-				let t = j as f64 / self.settings.y_ticks as f64;
-				let data_y = range.0 + (range.1 - range.0) * t;
+			for data_y in self.major_tick_positions(self.settings.y_tick_placement, range) {
 				let (p, _) = transform.categorical(i, data_y);
 				backend.stroke_path(
 					&|builder| {
@@ -1655,23 +1742,19 @@ impl<'a> PlotWidget<'a> {
 				});
 			}
 			if self.settings.show_y_minor_ticks && self.settings.y_minor_ticks > 0 {
-				for j in 0..self.settings.y_ticks {
-					for k in 1..=self.settings.y_minor_ticks {
-						let t = (j as f64 + k as f64 / (self.settings.y_minor_ticks + 1) as f64)
-							/ self.settings.y_ticks as f64;
-						if t > 1.0 {
-							continue;
-						}
-						let data_y = range.0 + (range.1 - range.0) * t;
-						let (p, _) = transform.categorical(i, data_y);
-						backend.stroke_path(
-							&|builder| {
-								builder.move_to(p);
-								builder.line_to(Point::new(p.x - 3.0, p.y));
-							},
-							tick_stroke,
-						);
-					}
+				for data_y in self.minor_tick_positions(
+					self.settings.y_tick_placement,
+					range,
+					self.settings.y_minor_ticks,
+				) {
+					let (p, _) = transform.categorical(i, data_y);
+					backend.stroke_path(
+						&|builder| {
+							builder.move_to(p);
+							builder.line_to(Point::new(p.x - 3.0, p.y));
+						},
+						tick_stroke,
+					);
 				}
 			}
 			backend.fill_text(Text {
@@ -1874,8 +1957,8 @@ mod product_0031_pre_extraction_oracle {
 		let settings = ResolvedPlotSettings {
 			title: Some(Arc::new("authored title".to_owned())),
 			subtitle: Some(Arc::new("authored subtitle".to_owned())),
-			x_ticks: 1,
-			y_ticks: 1,
+			x_tick_placement: TickPlacement::count(1).unwrap(),
+			y_tick_placement: TickPlacement::count(1).unwrap(),
 			show_x_minor_ticks: false,
 			show_y_minor_ticks: false,
 			show_x_minor_grid: false,
@@ -1891,6 +1974,8 @@ mod product_0031_pre_extraction_oracle {
 
 #[cfg(test)]
 mod product_0037_count_position_oracle {
+	use super::{AxisType, MAX_GENERATED_TICK_POSITIONS, TickPlacement, TickPlacementError};
+
 	fn legacy_major_positions(range: (f64, f64), intervals: u32) -> Vec<f64> {
 		(0..=intervals)
 			.map(|i| range.0 + (range.1 - range.0) * (i as f64 / intervals as f64))
@@ -1948,5 +2033,82 @@ mod product_0037_count_position_oracle {
 			&minor[28..],
 			&[6.3, 6.4750000000000005, 6.6499999999999995, 6.825]
 		);
+	}
+
+	#[test]
+	fn product_0037_count_generator_matches_the_banked_oracle() {
+		let placement = TickPlacement::count(8).unwrap();
+		assert_eq!(
+			placement.positions((0.0, 7.0)).unwrap(),
+			vec![0.0, 0.875, 1.75, 2.625, 3.5, 4.375, 5.25, 6.125, 7.0]
+		);
+		assert_eq!(
+			placement.positions((1.4, 8.6)).unwrap(),
+			vec![
+				1.4,
+				2.3,
+				3.1999999999999997,
+				4.1,
+				5.0,
+				5.9,
+				6.799999999999999,
+				7.699999999999999,
+				8.6
+			]
+		);
+		assert_eq!(
+			placement.minor_positions(&placement.positions((0.0, 7.0)).unwrap(), 4),
+			legacy_minor_positions((0.0, 7.0), 8, 4)
+		);
+	}
+
+	#[test]
+	fn product_0037_step_is_zero_anchored_and_bounded() {
+		let placement = TickPlacement::step(1.0).unwrap();
+		assert_eq!(
+			placement.positions((0.0, 7.0)).unwrap(),
+			(0..=7).map(f64::from).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			placement.positions((1.4, 8.6)).unwrap(),
+			(2..=8).map(f64::from).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			placement.positions((0.2, 7.2)).unwrap(),
+			(1..=7).map(f64::from).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			placement.positions((-3.5, 2.5)).unwrap(),
+			(-3..=2).map(f64::from).collect::<Vec<_>>()
+		);
+		assert_eq!(
+			placement.positions((0.0, 10.0)).unwrap(),
+			vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
+		);
+	}
+
+	#[test]
+	fn product_0037_step_rejects_invalid_values_and_capacity_without_truncation() {
+		assert!(TickPlacement::step(0.0).is_none());
+		assert!(TickPlacement::step(-1.0).is_none());
+		assert!(TickPlacement::step(f64::NAN).is_none());
+		assert!(TickPlacement::step(f64::INFINITY).is_none());
+		let dense = TickPlacement::step(1e-9).unwrap();
+		assert!(matches!(
+			dense.positions((0.0, 7.0)),
+			Err(TickPlacementError::Capacity { limit, .. }) if limit == MAX_GENERATED_TICK_POSITIONS
+		));
+		assert!(matches!(
+			dense.positions_for_axis(AxisType::Date, (0.0, 7.0)),
+			Err(TickPlacementError::UnsupportedAxis {
+				axis_type: AxisType::Date
+			})
+		));
+		assert!(matches!(
+			dense.positions_for_axis(AxisType::Time, (0.0, 7.0)),
+			Err(TickPlacementError::UnsupportedAxis {
+				axis_type: AxisType::Time
+			})
+		));
 	}
 }

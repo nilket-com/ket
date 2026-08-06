@@ -1,7 +1,7 @@
 use super::message::PlotPaneMsg;
 use crate::plot::chrome::PlotChrome;
 use crate::plot::colors;
-use crate::plot::common::{PlotKernel, ResolvedPlotSettings};
+use crate::plot::common::{PlotKernel, ResolvedPlotSettings, TickPlacement};
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::Override;
@@ -195,8 +195,16 @@ impl PlotPaneState {
 			x_tick_size_input: plot_settings.x_tick_size.to_string(),
 			y_tick_size_input: plot_settings.y_tick_size.to_string(),
 			legend_size_input: plot_settings.legend_size.to_string(),
-			x_ticks_input: plot_settings.x_ticks.to_string(),
-			y_ticks_input: plot_settings.y_ticks.to_string(),
+			x_ticks_input: plot_settings
+				.x_tick_placement
+				.count_value()
+				.unwrap_or(8)
+				.to_string(),
+			y_ticks_input: plot_settings
+				.y_tick_placement
+				.count_value()
+				.unwrap_or(8)
+				.to_string(),
 			x_minor_ticks_input: plot_settings.x_minor_ticks.to_string(),
 			y_minor_ticks_input: plot_settings.y_minor_ticks.to_string(),
 			x_major_grid_width_input: plot_settings.x_major_grid_width.to_string(),
@@ -429,11 +437,15 @@ impl PlotPaneState {
 				self.legend_size_input = val.to_string();
 			}
 			PlotPaneMsg::SetXTicks(val) => {
-				self.plot_settings.x_ticks = val;
+				if let Some(placement) = TickPlacement::count(val) {
+					self.plot_settings.x_tick_placement = placement;
+				}
 				self.x_ticks_input = val.to_string();
 			}
 			PlotPaneMsg::SetYTicks(val) => {
-				self.plot_settings.y_ticks = val;
+				if let Some(placement) = TickPlacement::count(val) {
+					self.plot_settings.y_tick_placement = placement;
+				}
 				self.y_ticks_input = val.to_string();
 			}
 			PlotPaneMsg::ToggleLiveUpdates(val) => self.live_updates_enabled = val,

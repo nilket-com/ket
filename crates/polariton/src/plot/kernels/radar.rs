@@ -36,7 +36,7 @@ impl PlotKernel for RadarPlotKernel {
 			width: 1.0,
 			..Default::default()
 		};
-		let num_circles = settings.x_ticks;
+		let num_circles = settings.x_tick_placement.count_value().unwrap_or(8);
 		for i in 1..=num_circles {
 			let radius = max_radius * (i as f32 / num_circles as f32);
 			backend.stroke_path(
