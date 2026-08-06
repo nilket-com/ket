@@ -18,6 +18,8 @@ use crate::gui::{
 };
 #[cfg(feature = "toron")]
 use crate::plot::chrome::PlotChrome;
+#[cfg(feature = "toron")]
+use crate::plot::common::{PlotLayout, TickPlacementError};
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 #[cfg(feature = "toron")]
@@ -40,9 +42,9 @@ use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
 	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans,
-	RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler,
-	SpannedRuneViewIntent, StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView,
-	ViewPresentation, transform as transform_rune_view,
+	RunePlotTickStepSpans, RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent,
+	RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink, TransformedRuneRelation,
+	TransformedRuneView, ViewPresentation, transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -872,9 +874,14 @@ fn resolved_rune_axis_scales(
 fn validate_rune_numeric_domain_applicability(
 	body: &RunePlotBody,
 	domain_spans: &RunePlotDomainSpans,
+	tick_step_spans: &RunePlotTickStepSpans,
 	schema: &polars::prelude::Schema,
 ) -> std::result::Result<(), (std::ops::Range<u32>, String)> {
-	if domain_spans.x.is_none() && domain_spans.y.is_none() {
+	if domain_spans.x.is_none()
+		&& domain_spans.y.is_none()
+		&& tick_step_spans.x.is_none()
+		&& tick_step_spans.y.is_none()
+	{
 		return Ok(());
 	}
 	let Ok((x_scale, y_scale)) = resolved_rune_axis_scales(body, schema) else {
@@ -883,27 +890,103 @@ fn validate_rune_numeric_domain_applicability(
 		return Ok(());
 	};
 	let numeric = |scale| matches!(scale, ScaleFamily::Linear | ScaleFamily::Log);
-	if let Some(span) = &domain_spans.x
-		&& !numeric(x_scale)
-	{
-		return Err((
-			span.clone(),
-			format!(
-				"x_bounds(...) requires a numeric x axis; this figure resolves x as {x_scale:?}"
-			),
-		));
+	if let Some(span) = domain_spans.x.as_ref() {
+		if !numeric(x_scale) {
+			return Err((
+				span.clone(),
+				format!(
+					"x_bounds(...) requires a numeric x axis; this figure resolves x as {x_scale:?}"
+				),
+			));
+		}
 	}
-	if let Some(span) = &domain_spans.y
-		&& !numeric(y_scale)
-	{
-		return Err((
-			span.clone(),
-			format!(
-				"y_bounds(...) requires a numeric y axis; this figure resolves y as {y_scale:?}"
-			),
-		));
+	if let Some(span) = tick_step_spans.x.as_ref() {
+		if !matches!(x_scale, ScaleFamily::Linear) {
+			return Err((
+				span.clone(),
+				format!(
+					"x_tick_step(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
+				),
+			));
+		}
+	}
+	if let Some(span) = domain_spans.y.as_ref() {
+		if !numeric(y_scale) {
+			return Err((
+				span.clone(),
+				format!(
+					"y_bounds(...) requires a numeric y axis; this figure resolves y as {y_scale:?}"
+				),
+			));
+		}
+	}
+	if let Some(span) = tick_step_spans.y.as_ref() {
+		if !matches!(y_scale, ScaleFamily::Linear) {
+			return Err((
+				span.clone(),
+				format!(
+					"y_tick_step(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
+				),
+			));
+		}
 	}
 	Ok(())
+}
+
+#[cfg(feature = "toron")]
+fn validate_rune_tick_step_capacity(
+	kernel: &dyn crate::plot::common::PlotKernel,
+	settings: &crate::plot::common::ResolvedPlotSettings,
+	tick_step_spans: &RunePlotTickStepSpans,
+) -> std::result::Result<(), (std::ops::Range<u32>, String)> {
+	if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+		return Ok(());
+	}
+	let layout = kernel.layout(settings.clone());
+	let check = |placement: crate::plot::common::TickPlacement,
+	             axis: &str,
+	             range: (f64, f64),
+	             span: &Option<std::ops::Range<u32>>|
+	 -> std::result::Result<(), (std::ops::Range<u32>, String)> {
+		if span.is_none() {
+			return Ok(());
+		}
+		if let Err(error) = placement.positions(range) {
+			let message = match error {
+				TickPlacementError::Capacity {
+					step,
+					range,
+					requested,
+					limit,
+				} => format!(
+					"{axis}_tick_step({step}) over {range:?} generates {requested} positions, exceeding the {limit}-position capacity"
+				),
+				TickPlacementError::InvalidDomain { range } => {
+					format!("{axis}_tick_step has no valid resolved domain {range:?}")
+				}
+				TickPlacementError::UnsupportedAxis { axis_type } => {
+					format!("{axis}_tick_step does not apply to {axis_type:?} axes")
+				}
+			};
+			return Err((span.clone().unwrap(), message));
+		}
+		Ok(())
+	};
+	match layout {
+		PlotLayout::Cartesian {
+			x_range, y_range, ..
+		} => {
+			check(settings.x_tick_placement, "x", x_range, &tick_step_spans.x)?;
+			check(settings.y_tick_placement, "y", y_range, &tick_step_spans.y)
+		}
+		PlotLayout::CategoricalX { y_range, .. } => {
+			check(settings.y_tick_placement, "y", y_range, &tick_step_spans.y)
+		}
+		PlotLayout::CategoricalY { x_range, .. } => {
+			check(settings.x_tick_placement, "x", x_range, &tick_step_spans.x)
+		}
+		_ => Ok(()),
+	}
 }
 
 #[cfg(feature = "toron")]
@@ -1032,17 +1115,19 @@ fn rune_view_outcome_with_palettes(
 		.map(|view| {
 			let presentation = view.intent.presentation();
 			let identity = view.identity;
-			let output = match view.intent {
-				RuneViewIntent::Table(table) => {
+			let (output, tick_step_output_span) = match view.intent {
+				RuneViewIntent::Table(table) => (
 					resolve_rune_table_skin_with(table.skin, TableSkin::from_theme_name)
-						.map(RuneRelationSinkOutput::Table)
-				}
+						.map(RuneRelationSinkOutput::Table),
+					None,
+				),
 				RuneViewIntent::Plot(plot) => {
 					let crate::rune_relation_envelope::RunePlotIntent {
 						body,
 						authored_settings,
 						plot_skin_span,
 						domain_spans,
+						tick_step_spans,
 					} = plot;
 					let authored_settings = match resolve_rune_plot_skin(authored_settings) {
 						Ok(settings) => settings,
@@ -1059,6 +1144,7 @@ fn rune_view_outcome_with_palettes(
 					if let Err((span, error)) = validate_rune_numeric_domain_applicability(
 						&body,
 						&domain_spans,
+						&tick_step_spans,
 						result.schema().as_ref(),
 					) {
 						return RuneRelationSinkOutcome {
@@ -1091,7 +1177,16 @@ fn rune_view_outcome_with_palettes(
 						};
 					};
 					let palette_len = selection.len();
-					match body {
+					let resolved_tick_settings = PlotSettings {
+						authored_spec: authored_settings.clone(),
+						..PlotSettings::default()
+					}
+					.resolve();
+					let tick_step_output_span = tick_step_spans
+						.x
+						.clone()
+						.or_else(|| tick_step_spans.y.clone());
+					let output = match body {
 						RunePlotBody::Single(plot) => {
 							let authored_spec = AuthoredPlotSpec::xy_color(
 								plot.composition,
@@ -1110,22 +1205,62 @@ fn rune_view_outcome_with_palettes(
 								&selection,
 								&prior_identity,
 							)
-							.map(|(resolved, next_identity)| {
-								RuneRelationSinkOutput::Plot(
+							.and_then(|(resolved, next_identity)| {
+								if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+									return Ok(RuneRelationSinkOutput::Plot(
+										resolved,
+										authored_settings,
+										RuneCategoricalContinuation {
+											palette_len,
+											identity: next_identity,
+										},
+									));
+								}
+								let kernel =
+									create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+								validate_rune_tick_step_capacity(
+									kernel.as_ref(),
+									&resolved_tick_settings,
+									&tick_step_spans,
+								)
+								.map_err(|(_, error)| error)?;
+								Ok(RuneRelationSinkOutput::Plot(
 									resolved,
 									authored_settings,
 									RuneCategoricalContinuation {
 										palette_len,
 										identity: next_identity,
 									},
-								)
+								))
 							})
 						}
 						RunePlotBody::StyledSingle(styled) => match styled.into_layer() {
-							Ok(layer) => Ok(RuneRelationSinkOutput::LayeredPlot(
-								LayeredPlotSpec::new(layer),
-								authored_settings,
-							)),
+							Ok(layer) => {
+								let specification = LayeredPlotSpec::new(layer);
+								if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+									Ok(RuneRelationSinkOutput::LayeredPlot(
+										specification,
+										authored_settings,
+									))
+								} else {
+									create_layered_plot(&specification, result.as_ref(), 1200, 720)
+										.map_err(|error| error.to_string())
+										.and_then(|kernel| {
+											validate_rune_tick_step_capacity(
+												kernel.as_ref(),
+												&resolved_tick_settings,
+												&tick_step_spans,
+											)
+											.map_err(|(_, error)| error)
+											.map(|_| {
+												RuneRelationSinkOutput::LayeredPlot(
+													specification,
+													authored_settings,
+												)
+											})
+										})
+								}
+							}
 							Err(styled) => {
 								let StyledRunePlotSink { sink, settings } = styled;
 								let authored_spec = AuthoredPlotSpec::xy_color(
@@ -1145,29 +1280,84 @@ fn rune_view_outcome_with_palettes(
 									&selection,
 									&prior_identity,
 								)
-								.map(|(resolved, next_identity)| {
-									RuneRelationSinkOutput::StyledPlot(
-										resolved,
-										settings,
-										authored_settings,
-										RuneCategoricalContinuation {
-											palette_len,
-											identity: next_identity,
-										},
+								.and_then(|(resolved, next_identity)| {
+									if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+										return Ok(RuneRelationSinkOutput::StyledPlot(
+											resolved,
+											settings,
+											authored_settings,
+											RuneCategoricalContinuation {
+												palette_len,
+												identity: next_identity,
+											},
+										));
+									}
+									create_styled_plot(
+										&resolved.resolved_spec,
+										&resolved.data,
+										settings.clone(),
 									)
+									.map_err(|error| error.to_string())
+									.and_then(|kernel| {
+										validate_rune_tick_step_capacity(
+											kernel.as_ref(),
+											&resolved_tick_settings,
+											&tick_step_spans,
+										)
+										.map_err(|(_, error)| error)
+										.map(|_| {
+											RuneRelationSinkOutput::StyledPlot(
+												resolved,
+												settings,
+												authored_settings,
+												RuneCategoricalContinuation {
+													palette_len,
+													identity: next_identity,
+												},
+											)
+										})
+									})
 								})
 							}
 						},
-						RunePlotBody::Layered(specification) => Ok(
-							RuneRelationSinkOutput::LayeredPlot(specification, authored_settings),
-						),
-					}
+						RunePlotBody::Layered(specification) => {
+							if tick_step_spans.x.is_none() && tick_step_spans.y.is_none() {
+								Ok(RuneRelationSinkOutput::LayeredPlot(
+									specification,
+									authored_settings,
+								))
+							} else {
+								create_layered_plot(&specification, result.as_ref(), 1200, 720)
+									.map_err(|error| error.to_string())
+									.and_then(|kernel| {
+										validate_rune_tick_step_capacity(
+											kernel.as_ref(),
+											&resolved_tick_settings,
+											&tick_step_spans,
+										)
+										.map_err(|(_, error)| error)
+										.map(|_| {
+											RuneRelationSinkOutput::LayeredPlot(
+												specification,
+												authored_settings,
+											)
+										})
+									})
+							}
+						}
+					};
+					(output, tick_step_output_span)
 				}
+			};
+			let output_span = if output.is_err() {
+				tick_step_output_span
+			} else {
+				None
 			};
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
-				span: view.span,
+				span: output_span.unwrap_or(view.span),
 				source: std::sync::Arc::clone(&result),
 				output,
 			}
@@ -5854,6 +6044,117 @@ workspace.table("bad").views([view("bad", table())]);
 				if x_range == (-2.0, 2.0) && y_range == (0.0, 8.0)
 		));
 		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0038_tick_step_reaches_the_existing_renderer_with_and_without_bounds() {
+		let bounded_source = "workspace.table(\"t\").views([figure([y_bounds(0, 7), y_tick_step(1), bar(\"cat\", \"val\")])])";
+		let relation = transform_rune_view(bounded_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(categorical_bar_frame(&["A", "B", "C"]), relation.views);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, authored, _)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("bounded tick step must complete");
+		};
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		assert_eq!(
+			settings.y_tick_placement,
+			crate::plot::common::TickPlacement::step(1.0).unwrap()
+		);
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+		assert!(matches!(
+			kernel.layout(settings.clone()),
+			PlotLayout::CategoricalX { y_range, .. } if y_range == (0.0, 7.0)
+		));
+		assert_eq!(
+			settings.y_tick_placement.positions((0.0, 7.0)).unwrap(),
+			(0..=7).map(f64::from).collect::<Vec<_>>()
+		);
+		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
+
+		let unbounded_source =
+			"workspace.table(\"t\").views([figure([y_tick_step(1), line(\"x\", \"y\")])])";
+		let relation = transform_rune_view(unbounded_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [1.0_f64, 6.0], "y" => [1.4_f64, 8.6]).unwrap(),
+			relation.views,
+		);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(_, authored, _)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("data-derived tick step must complete");
+		};
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		assert_eq!(
+			settings.y_tick_placement.positions((1.4, 8.6)).unwrap(),
+			(2..=8).map(f64::from).collect::<Vec<_>>()
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0038_tick_step_refuses_discrete_and_dense_requests_at_their_spans() {
+		let discrete_source =
+			"workspace.table(\"t\").views([figure([x_tick_step(1), bar(\"cat\", \"val\")])])";
+		let relation = transform_rune_view(discrete_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(categorical_bar_frame(&["A", "B"]), relation.views);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("categorical tick step must refuse");
+		};
+		assert!(
+			error.contains("x_tick_step(...)") && error.contains("Band"),
+			"{error}"
+		);
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&discrete_source[span.start as usize..span.end as usize],
+			"x_tick_step(1)"
+		);
+
+		let dense_source =
+			"workspace.table(\"t\").views([figure([y_tick_step(1e-9), line(\"x\", \"y\")])])";
+		let relation = transform_rune_view(dense_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [0.0_f64, 7.0], "y" => [0.0_f64, 7.0]).unwrap(),
+			relation.views,
+		);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("dense tick step must refuse");
+		};
+		assert!(
+			error.contains("0.000000001") && error.contains("capacity"),
+			"{error}"
+		);
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&dense_source[span.start as usize..span.end as usize],
+			"y_tick_step(1e-9)"
+		);
 	}
 
 	#[cfg(feature = "toron")]

@@ -7,13 +7,16 @@
 //! exclusively to Toron's native Rune frontend.
 
 use crate::plot::chrome::PlotChromeProjection;
+use crate::plot::common::TickPlacement;
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize, Presence,
 	StrokeWidth,
 };
-use crate::plot::theme::{PlotDomainOverrides, PlotSettingsLayer, PlotSkinSelection};
+use crate::plot::theme::{
+	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
+};
 use libaryon::core::BufferId;
 use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
@@ -57,6 +60,7 @@ pub(crate) struct RunePlotIntent {
 	pub(crate) authored_settings: PlotSettingsLayer,
 	pub(crate) plot_skin_span: Option<Range<u32>>,
 	pub(crate) domain_spans: RunePlotDomainSpans,
+	pub(crate) tick_step_spans: RunePlotTickStepSpans,
 }
 
 impl PartialEq for RunePlotIntent {
@@ -67,6 +71,12 @@ impl PartialEq for RunePlotIntent {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RunePlotDomainSpans {
+	pub(crate) x: Option<Range<u32>>,
+	pub(crate) y: Option<Range<u32>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunePlotTickStepSpans {
 	pub(crate) x: Option<Range<u32>>,
 	pub(crate) y: Option<Range<u32>>,
 }
@@ -105,6 +115,7 @@ impl RunePlotIntent {
 			authored_settings: PlotSettingsLayer::default(),
 			plot_skin_span: None,
 			domain_spans: RunePlotDomainSpans::default(),
+			tick_step_spans: RunePlotTickStepSpans::default(),
 		}
 	}
 }
@@ -1171,6 +1182,8 @@ fn parse_figure(
 	let mut palette = None;
 	let mut x_bounds = None;
 	let mut y_bounds = None;
+	let mut x_tick_step = None;
+	let mut y_tick_step = None;
 	let mut body = None;
 	for (item, _) in list.items.iter() {
 		if let Some(selection) = parse_figure_skin(item, source)? {
@@ -1191,7 +1204,7 @@ fn parse_figure(
 			return invalid_view(
 				item.span(),
 				source.len(),
-				"a figure child must be title(...), subtitle(...), skin(...), palette(...), x_bounds(...), y_bounds(...), or one plot body",
+				"a figure child must be title(...), subtitle(...), skin(...), palette(...), x_bounds(...), y_bounds(...), x_tick_step(...), y_tick_step(...), or one plot body",
 			);
 		};
 		let callee = source_slice(source, call.expr.span())?.trim();
@@ -1253,6 +1266,32 @@ fn parse_figure(
 					u32_range(&byte_range(item.span(), source.len())?, "y bounds")?,
 				));
 			}
+			"x_tick_step" => {
+				if x_tick_step.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one x_tick_step element",
+					);
+				}
+				x_tick_step = Some((
+					parse_figure_tick_step(item, &child_args, source, "x_tick_step")?,
+					u32_range(&byte_range(item.span(), source.len())?, "x tick step")?,
+				));
+			}
+			"y_tick_step" => {
+				if y_tick_step.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one y_tick_step element",
+					);
+				}
+				y_tick_step = Some((
+					parse_figure_tick_step(item, &child_args, source, "y_tick_step")?,
+					u32_range(&byte_range(item.span(), source.len())?, "y tick step")?,
+				));
+			}
 			_ => {
 				if body.is_some() {
 					return invalid_view(
@@ -1298,12 +1337,68 @@ fn parse_figure(
 		x: x_bounds.map(|(_, span)| span),
 		y: y_bounds.map(|(_, span)| span),
 	};
+	if x_tick_step.is_some() || y_tick_step.is_some() {
+		let mut guides = PlotGuideSettings::default();
+		guides.x_tick_placement = x_tick_step
+			.as_ref()
+			.map(|(step, _)| TickPlacement::step(*step).expect("validated tick step"))
+			.unwrap_or(TickPlacement::DEFAULT);
+		guides.y_tick_placement = y_tick_step
+			.as_ref()
+			.map(|(step, _)| TickPlacement::step(*step).expect("validated tick step"))
+			.unwrap_or(TickPlacement::DEFAULT);
+		authored_settings.guides = Override::Set(guides);
+	}
+	let tick_step_spans = RunePlotTickStepSpans {
+		x: x_tick_step.map(|(_, span)| span),
+		y: y_tick_step.map(|(_, span)| span),
+	};
 	Ok(RunePlotIntent {
 		body,
 		authored_settings,
 		plot_skin_span,
 		domain_spans,
+		tick_step_spans,
 	})
+}
+
+fn parse_figure_tick_step(
+	outer: &ast::Expr,
+	args: &[&ast::Expr],
+	source: &str,
+	constructor: &str,
+) -> Result<f64, RuneEnvelopeError> {
+	let [argument] = args else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) takes exactly one numeric literal"),
+		);
+	};
+	let Some(step) = parse_signed_numeric_literal(argument, source) else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!(
+				"{constructor}(...) requires an unsuffixed numeric literal, optionally negated"
+			),
+		);
+	};
+	if !step.is_finite() {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) requires a finite step"),
+		);
+	}
+	if step <= 0.0 {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) step must be strictly positive"),
+		);
+	}
+	Ok(step)
 }
 
 fn parse_figure_bounds(
@@ -3248,6 +3343,79 @@ workspace.table("t").views([table()])
 			"y_bounds(2.0, 3.0)"
 		);
 		assert!(message.contains("at most one y_bounds"));
+	}
+
+	#[test]
+	fn product_0038_tick_steps_lower_once_and_keep_axes_independent() {
+		for (literal, expected) in [("1", 1.0), ("1.0", 1.0)] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([y_bounds(0, 7), y_tick_step({literal}), bar(\"cat\", \"val\")])])"
+			);
+			let transformed = transform(&source).expect("tick step figure");
+			let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+				panic!("expected plot");
+			};
+			let Override::Set(guides) = &plot.authored_settings.guides else {
+				panic!("expected guide override");
+			};
+			assert_eq!(
+				guides.y_tick_placement,
+				TickPlacement::step(expected).unwrap()
+			);
+			assert_eq!(guides.x_tick_placement, TickPlacement::DEFAULT);
+			assert_eq!(
+				&source[plot.tick_step_spans.y.clone().unwrap().start as usize
+					..plot.tick_step_spans.y.clone().unwrap().end as usize],
+				format!("y_tick_step({literal})")
+			);
+		}
+
+		let no_bounds = transform(
+			"workspace.table(\"t\").views([figure([y_tick_step(1), line(\"x\", \"y\")])])",
+		)
+		.expect("data-derived step figure");
+		let RuneViewIntent::Plot(plot) = &no_bounds.views[0].intent else {
+			panic!("expected plot");
+		};
+		assert!(plot.domain_spans.x.is_none() && plot.domain_spans.y.is_none());
+		assert_eq!(plot.tick_step_spans.x, None);
+		assert!(plot.tick_step_spans.y.is_some());
+	}
+
+	#[test]
+	fn product_0038_tick_step_refusals_are_value_and_span_attributed() {
+		for (constructor, expected) in [
+			("y_tick_step(0)", "step must be strictly positive"),
+			("y_tick_step(-1)", "step must be strictly positive"),
+			("y_tick_step(1e999)", "requires a finite step"),
+			(
+				"y_tick_step(value)",
+				"requires an unsuffixed numeric literal",
+			),
+			("y_tick_step()", "takes exactly one numeric literal"),
+		] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([{constructor}, line(\"x\", \"y\")])])"
+			);
+			let RuneEnvelopeError::InvalidView { span, message } =
+				transform(&source).expect_err("invalid tick step")
+			else {
+				panic!("expected attributed tick-step refusal");
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], constructor);
+			assert!(message.contains(expected), "{message}");
+		}
+		let duplicate = "workspace.table(\"t\").views([figure([y_tick_step(1), y_tick_step(2), line(\"x\", \"y\")])])";
+		let RuneEnvelopeError::InvalidView { span, message } =
+			transform(duplicate).expect_err("duplicate tick step")
+		else {
+			panic!("expected duplicate tick-step refusal");
+		};
+		assert_eq!(
+			&duplicate[span.start as usize..span.end as usize],
+			"y_tick_step(2)"
+		);
+		assert!(message.contains("at most one y_tick_step"));
 	}
 
 	#[test]

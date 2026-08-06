@@ -142,6 +142,32 @@ pub struct PlotGuideSettings {
 	pub y_minor_grid_style: GridLineStyle,
 }
 
+impl Default for PlotGuideSettings {
+	fn default() -> Self {
+		Self {
+			max_legend_rows: 10,
+			legend_x: 0.95,
+			legend_y: 0.05,
+			x_tick_placement: TickPlacement::DEFAULT,
+			y_tick_placement: TickPlacement::DEFAULT,
+			x_minor_ticks: 4,
+			y_minor_ticks: 4,
+			x_major_grid: true,
+			y_major_grid: true,
+			x_minor_grid: true,
+			y_minor_grid: true,
+			x_major_grid_width: 1.0,
+			y_major_grid_width: 1.0,
+			x_minor_grid_width: 0.5,
+			y_minor_grid_width: 0.5,
+			x_major_grid_style: GridLineStyle::Solid,
+			y_major_grid_style: GridLineStyle::Solid,
+			x_minor_grid_style: GridLineStyle::Solid,
+			y_minor_grid_style: GridLineStyle::Solid,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotDomainOverrides {
 	pub x_min: Option<f64>,

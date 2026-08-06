@@ -1021,15 +1021,41 @@ fn product_0037_tick_positions_have_one_closed_generator_and_no_surface_caller()
 	assert!(theme_production.contains("y_tick_placement: TickPlacement"));
 	assert!(!theme_production.contains("x_ticks:"));
 	assert!(!theme_production.contains("y_ticks:"));
+}
 
+#[test]
+fn product_0038_tick_step_is_the_only_surface_producer_of_step_placement() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
 		.expect("read Rune envelope");
-	let envelope_production = envelope
+	let production = envelope
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("Rune envelope production");
-	assert!(!envelope_production.contains("x_tick_step"));
-	assert!(!envelope_production.contains("y_tick_step"));
+	let figure_parser = production
+		.split("fn parse_figure(")
+		.nth(1)
+		.expect("figure parser")
+		.split("fn parse_figure_bounds(")
+		.next()
+		.expect("bounded figure parser");
+	assert!(figure_parser.contains("\"x_tick_step\" =>"));
+	assert!(figure_parser.contains("\"y_tick_step\" =>"));
+	assert_eq!(
+		figure_parser
+			.matches("authored_settings.guides = Override::Set")
+			.count(),
+		1
+	);
+	assert!(production.contains("fn parse_figure_tick_step("));
+	assert!(production.contains("step must be strictly positive"));
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let common_production = common
+		.split("#[cfg(test)]\nmod product_0031_pre_extraction_oracle")
+		.next()
+		.expect("plot common production");
+	assert_eq!(common_production.matches("TickPlacement::step(").count(), 0);
 }
 
 #[test]
