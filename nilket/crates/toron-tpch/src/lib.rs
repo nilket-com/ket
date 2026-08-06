@@ -5243,23 +5243,43 @@ pub async fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 		match child_plan.role {
 			TimingAtlasChildRole::Warmup => outcome.warmups.push(child),
 			TimingAtlasChildRole::Measured { pair_index, .. } => {
-				if !child.valid || child.identity_matches == Some(false) {
-					outcome.failure.get_or_insert_with(|| {
-						child
-							.failure
-							.clone()
-							.unwrap_or_else(|| "identity mismatch".to_string())
-					});
-					outcome.invalid_attempts.push(child);
-					break;
-				}
 				pending.push(child);
-				if pending.len() == 2 {
-					let second = pending.pop().expect("second child");
-					let first = pending.pop().expect("first child");
-					outcome
-						.pairs
-						.push(assemble_timing_atlas_pair(pair_index, first, second));
+				if pending.len() < 2 {
+					continue;
+				}
+				let second = pending.pop().expect("second child");
+				let first = pending.pop().expect("first child");
+				match timing_atlas_pair_outcome(&first, &second, false) {
+					TimingAtlasPairOutcome::Valid => {
+						outcome
+							.pairs
+							.push(assemble_timing_atlas_pair(pair_index, first, second));
+					}
+					TimingAtlasPairOutcome::RetryableIo => {
+						// The whole pair is invalidated: a retried child must never be
+						// timed against a partner from a different machine state. Both
+						// arms rerun once, in the same order, with fresh identities.
+						outcome.invalid_attempts.push(first);
+						outcome.invalid_attempts.push(second);
+						match retry_timing_atlas_pair(harness, query, pair_index, &mut outcome)
+							.await
+						{
+							Some(pair) => outcome.pairs.push(pair),
+							None => break,
+						}
+					}
+					TimingAtlasPairOutcome::Fatal => {
+						outcome.failure.get_or_insert_with(|| {
+							first
+								.failure
+								.clone()
+								.or_else(|| second.failure.clone())
+								.unwrap_or_else(|| "identity mismatch".to_string())
+						});
+						outcome.invalid_attempts.push(first);
+						outcome.invalid_attempts.push(second);
+						break;
+					}
 				}
 			}
 		}
@@ -5312,6 +5332,15 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 		Err(error) => {
 			child.failure_is_io = timing_atlas_failure_is_io(&error);
 			child.failure = Some(error);
+			// A failed child may still have published partitions before it failed, so its
+			// namespace is reclaimed like any other. Cleanup is awaited on every path.
+			let cleanup_start = harness.now_ms();
+			if let Err(cleanup_error) = harness.cleanup_child(child_plan).await {
+				outcome.failure.get_or_insert_with(|| {
+					format!("cleanup failed, reclamation unproven: {cleanup_error}")
+				});
+			}
+			outcome.cleanup_ms += harness.now_ms() - cleanup_start;
 			return child;
 		}
 	};
@@ -5338,13 +5367,63 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 	// namespace survives into the next child's machine state.
 	let cleanup_start = harness.now_ms();
 	if let Err(error) = harness.cleanup_child(child_plan).await {
+		// An attempted cleanup is not a successful reclamation. If the namespace may still
+		// be resident, every later child of this cell measures a different machine, so the
+		// cell — and its timing authority — is forfeit.
 		child.valid = false;
 		child
 			.failure
 			.get_or_insert_with(|| format!("cleanup: {error}"));
+		outcome
+			.failure
+			.get_or_insert_with(|| format!("cleanup failed, reclamation unproven: {error}"));
 	}
 	outcome.cleanup_ms += harness.now_ms() - cleanup_start;
 	child
+}
+
+/// Rerun one invalidated pair. Both arms rerun in the same order with two fresh identities,
+/// distinct from both identities of the pair being replaced.
+async fn retry_timing_atlas_pair<H: TimingAtlasHarness>(
+	harness: &mut H,
+	query: &str,
+	pair_index: usize,
+	outcome: &mut TimingAtlasCellOutcome,
+) -> Option<TimingAtlasPair> {
+	let (first_arm, second_arm) = timing_atlas_pair_order(query, pair_index);
+	let mut replacements = Vec::with_capacity(2);
+	for (position, arm) in [first_arm, second_arm].into_iter().enumerate() {
+		let child_plan = TimingAtlasChildPlan {
+			arm,
+			role: TimingAtlasChildRole::Measured {
+				pair_index,
+				position,
+			},
+			query_id: QueryId::new(),
+		};
+		let mut child = run_timing_atlas_child(harness, query, &child_plan, outcome).await;
+		child.attempt = 2;
+		replacements.push(child);
+	}
+	let second = replacements.pop().expect("second replacement");
+	let first = replacements.pop().expect("first replacement");
+	match timing_atlas_pair_outcome(&first, &second, true) {
+		TimingAtlasPairOutcome::Valid => {
+			Some(assemble_timing_atlas_pair(pair_index, first, second))
+		}
+		_ => {
+			outcome.failure.get_or_insert_with(|| {
+				first
+					.failure
+					.clone()
+					.or_else(|| second.failure.clone())
+					.unwrap_or_else(|| "pair retry exhausted".to_string())
+			});
+			outcome.invalid_attempts.push(first);
+			outcome.invalid_attempts.push(second);
+			None
+		}
+	}
 }
 
 fn assemble_timing_atlas_pair(
@@ -20508,5 +20587,223 @@ mod adr538_timing_atlas_reclamation {
 				 pairs measure a different machine"
 			);
 		}
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_retry_and_reclamation_controls {
+	use super::*;
+	use std::collections::BTreeSet;
+
+	/// Fails the first distributed child once with an I/O error, then succeeds.
+	struct FlakyHarness {
+		clock_ms: f64,
+		seen: Vec<(String, QueryId)>,
+		failed_once: bool,
+	}
+
+	impl TimingAtlasHarness for FlakyHarness {
+		async fn setup_cell(&mut self, _query: &str) -> Result<(), String> {
+			Ok(())
+		}
+
+		async fn execute_child(
+			&mut self,
+			plan: &TimingAtlasChildPlan,
+		) -> Result<TimingAtlasExecution, String> {
+			self.clock_ms += 10.0;
+			self.seen
+				.push((plan.arm.label().to_string(), plan.query_id));
+			if !self.failed_once
+				&& plan.arm == TimingArm::Distributed
+				&& matches!(
+					plan.role,
+					TimingAtlasChildRole::Measured { pair_index: 0, .. }
+				) {
+				self.failed_once = true;
+				return Err("QueryError::Io(transport reset)".to_string());
+			}
+			Ok(TimingAtlasExecution { row_count: 4 })
+		}
+
+		async fn reduce_child(
+			&mut self,
+			_plan: &TimingAtlasChildPlan,
+			_execution: &TimingAtlasExecution,
+		) -> Result<TimingAtlasReduction, String> {
+			Ok(TimingAtlasReduction {
+				identity_matches: true,
+			})
+		}
+
+		async fn cleanup_child(&mut self, _plan: &TimingAtlasChildPlan) -> Result<(), String> {
+			Ok(())
+		}
+
+		async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
+			Ok(())
+		}
+
+		fn now_ms(&mut self) -> f64 {
+			self.clock_ms
+		}
+	}
+
+	/// A retryable I/O failure replaces the whole pair: four distinct identities across the
+	/// original and replacement children, and the replacement keeps the original arm order.
+	#[tokio::test]
+	async fn retried_pair_uses_four_distinct_identities_and_keeps_arm_order() {
+		let mut harness = FlakyHarness {
+			clock_ms: 0.0,
+			seen: Vec::new(),
+			failed_once: false,
+		};
+		let outcome = run_timing_atlas_cell_with(&mut harness, "q01").await;
+		assert!(
+			outcome.failure.is_none(),
+			"one I/O failure is retryable: {:?}",
+			outcome.failure
+		);
+		assert_eq!(outcome.pairs.len(), TIMING_ATLAS_MEASURED_PAIRS);
+		assert_eq!(
+			outcome.invalid_attempts.len(),
+			2,
+			"both children of the invalidated pair are retained"
+		);
+
+		// The two invalidated children and their two replacements: four distinct ids.
+		let invalid_ids = outcome
+			.invalid_attempts
+			.iter()
+			.map(|child| child.query_elapsed_ms.to_bits())
+			.count();
+		assert_eq!(invalid_ids, 2);
+
+		let pair_zero_children = harness.seen.iter().take(6).cloned().collect::<Vec<_>>();
+		// children 0,1 = warmups; 2,3 = original pair 0; 4,5 = replacement pair 0.
+		let identities = pair_zero_children
+			.iter()
+			.skip(2)
+			.map(|(_, id)| *id)
+			.collect::<BTreeSet<_>>();
+		assert_eq!(
+			identities.len(),
+			4,
+			"original and replacement children need four distinct identities"
+		);
+		assert_eq!(
+			pair_zero_children[2].0, pair_zero_children[4].0,
+			"the replacement keeps the original first arm"
+		);
+		assert_eq!(
+			pair_zero_children[3].0, pair_zero_children[5].0,
+			"and the original second arm"
+		);
+	}
+
+	/// A cleanup failure is fatal: an attempted reclamation is not a proven one, and every
+	/// later child would measure a different machine.
+	#[tokio::test]
+	async fn cleanup_failure_forfeits_the_cell() {
+		struct DirtyHarness {
+			clock_ms: f64,
+		}
+		impl TimingAtlasHarness for DirtyHarness {
+			async fn setup_cell(&mut self, _query: &str) -> Result<(), String> {
+				Ok(())
+			}
+			async fn execute_child(
+				&mut self,
+				_plan: &TimingAtlasChildPlan,
+			) -> Result<TimingAtlasExecution, String> {
+				self.clock_ms += 10.0;
+				Ok(TimingAtlasExecution { row_count: 4 })
+			}
+			async fn reduce_child(
+				&mut self,
+				_plan: &TimingAtlasChildPlan,
+				_execution: &TimingAtlasExecution,
+			) -> Result<TimingAtlasReduction, String> {
+				Ok(TimingAtlasReduction {
+					identity_matches: true,
+				})
+			}
+			async fn cleanup_child(&mut self, _plan: &TimingAtlasChildPlan) -> Result<(), String> {
+				Err("store still resident".to_string())
+			}
+			async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
+				Ok(())
+			}
+			fn now_ms(&mut self) -> f64 {
+				self.clock_ms
+			}
+		}
+
+		let mut harness = DirtyHarness { clock_ms: 0.0 };
+		let outcome = run_timing_atlas_cell_with(&mut harness, "q01").await;
+		assert!(
+			outcome.failure.is_some(),
+			"a failed reclamation must forfeit the cell"
+		);
+		assert!(!outcome.finalized(), "and therefore its timing authority");
+	}
+
+	/// Reclamation frees the namespace itself, not merely its bytes: the same query id can
+	/// be used again with no duplicate address, and no stale cancellation or live state
+	/// blocks it.
+	/// Deep binds need an explicit stack; run on a dedicated 64 MB thread.
+	#[test]
+	fn reclaimed_namespace_can_be_reused_without_stale_state() {
+		let result = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(2)
+					.enable_all()
+					.build()
+					.expect("runtime");
+				runtime.block_on(async {
+					let mut harness = CensusTimingAtlasHarness::prepare(
+						"q06",
+						"strict",
+						0.01,
+						Path::new("unused"),
+					)
+					.await
+					.expect("prepare");
+					harness.setup_cell("q06").await.expect("setup");
+
+					// One namespace, exercised then reclaimed, then exercised again.
+					let reused = QueryId::new();
+					let plan = TimingAtlasChildPlan {
+						arm: TimingArm::Distributed,
+						role: TimingAtlasChildRole::Measured {
+							pair_index: 0,
+							position: 0,
+						},
+						query_id: reused,
+					};
+					let first = harness.execute_child(&plan).await;
+					harness.cleanup_child(&plan).await.expect("cleanup");
+					let after_cleanup = harness.resident_partition_bytes();
+					let second = harness.execute_child(&plan).await;
+					harness.cleanup_child(&plan).await.expect("cleanup");
+					harness.teardown_cell("q06").await.expect("teardown");
+					(first.is_ok(), after_cleanup, second)
+				})
+			})
+			.expect("spawn")
+			.join()
+			.expect("join");
+
+		let (first_ok, after_cleanup, second) = result;
+		assert!(first_ok, "the first use of the namespace succeeds");
+		assert_eq!(after_cleanup, 0, "reclamation returns the bytes");
+		assert!(
+			second.is_ok(),
+			"the same partition addresses must publish again after reclamation — a \
+			 surviving manifest, live entry or cancellation record would reject this: {:?}",
+			second.err()
+		);
 	}
 }

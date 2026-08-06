@@ -178,5 +178,18 @@ the numbers are in.
 - **No dominant component, S too small, or S empty** → no material substrate work is authorized,
   and the atlas closes having said so. This is a real outcome, not a failure of the study.
 
+**Independent finding, recorded not fixed: shuffle state is never reclaimed in production.**
+`PartitionStore::remove_query` exists but has **no caller anywhere in `crates/toron/src`** —
+every call site is inside `partition_store.rs`'s own tests. Measured with the real harness at
+sf=0.01: retained shuffle bytes are **0 at the post-setup baseline and 63,432 after a single
+child**, with no reclamation on query completion. A long-lived production worker therefore
+accumulates one resident namespace per query indefinitely.
+
+This ADR changes nothing about it. The atlas's `cleanup_child` is **repetition isolation after
+the response boundary** — a property of the measurement apparatus, required because workers are
+held resident across sixteen children — and must not be read as describing or relying on
+existing production behavior. Whether production should reclaim is a separate decision with its
+own blast radius, and an attribution-only cut is the wrong place to make it.
+
 Fragmented-plan fingerprint coverage remains an open item from ADR 537 and is not in scope here,
 though a timing study that compares plans across arms is a plausible future consumer of it.
