@@ -5182,29 +5182,32 @@ pub struct TimingAtlasReduction {
 /// The seam the atlas runner drives. Injecting it lets the worker scope and the timer
 /// placement be observed deterministically — the pre-built plan prevents child reordering,
 /// but cannot prove the caller constructs workers once per cell or times only execution.
+// Consumed only through generics inside this crate and never as `dyn`, so the auto-trait
+// bounds this lint protects cannot be needed here.
+#[allow(async_fn_in_trait)]
 pub trait TimingAtlasHarness {
 	/// Construct workers and coordinator for a cell. Exactly once per cell, before warmups.
-	fn setup_cell(&mut self, query: &str) -> Result<(), String>;
+	async fn setup_cell(&mut self, query: &str) -> Result<(), String>;
 	/// Execute one child. This call alone is inside the elapsed boundary.
-	fn execute_child(
+	async fn execute_child(
 		&mut self,
 		plan: &TimingAtlasChildPlan,
 	) -> Result<TimingAtlasExecution, String>;
 	/// Digest, compare identity and reduce receipts. Always after the elapsed boundary.
-	fn reduce_child(
+	async fn reduce_child(
 		&mut self,
 		plan: &TimingAtlasChildPlan,
 		execution: &TimingAtlasExecution,
 	) -> Result<TimingAtlasReduction, String>;
 	/// Tear down workers. Exactly once per cell, after the last measured child.
-	fn teardown_cell(&mut self, query: &str) -> Result<(), String>;
+	async fn teardown_cell(&mut self, query: &str) -> Result<(), String>;
 	/// Elapsed source, in milliseconds.
 	fn now_ms(&mut self) -> f64;
 }
 
 /// Drive one cell: setup once, both warmups, seven pairs, teardown once. Setup, teardown
 /// and reduction are recorded but never enter `query_elapsed_ms`.
-pub fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
+pub async fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 	harness: &mut H,
 	query: &str,
 ) -> TimingAtlasCellOutcome {
@@ -5220,7 +5223,7 @@ pub fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 	};
 
 	let setup_start = harness.now_ms();
-	if let Err(error) = harness.setup_cell(query) {
+	if let Err(error) = harness.setup_cell(query).await {
 		outcome.failure = Some(format!("setup: {error}"));
 		return outcome;
 	}
@@ -5229,7 +5232,7 @@ pub fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 	let plan = timing_atlas_cell_plan(query);
 	let mut pending: Vec<TimingAtlasChild> = Vec::new();
 	for child_plan in &plan {
-		let child = run_timing_atlas_child(harness, query, child_plan, &mut outcome);
+		let child = run_timing_atlas_child(harness, query, child_plan, &mut outcome).await;
 		match child_plan.role {
 			TimingAtlasChildRole::Warmup => outcome.warmups.push(child),
 			TimingAtlasChildRole::Measured { pair_index, .. } => {
@@ -5256,7 +5259,7 @@ pub fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 	}
 
 	let teardown_start = harness.now_ms();
-	if let Err(error) = harness.teardown_cell(query) {
+	if let Err(error) = harness.teardown_cell(query).await {
 		outcome
 			.failure
 			.get_or_insert_with(|| format!("teardown: {error}"));
@@ -5265,7 +5268,7 @@ pub fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 	outcome
 }
 
-fn run_timing_atlas_child<H: TimingAtlasHarness>(
+async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 	harness: &mut H,
 	query: &str,
 	child_plan: &TimingAtlasChildPlan,
@@ -5294,7 +5297,7 @@ fn run_timing_atlas_child<H: TimingAtlasHarness>(
 
 	// The elapsed boundary encloses execution and nothing else.
 	let started = harness.now_ms();
-	let executed = harness.execute_child(child_plan);
+	let executed = harness.execute_child(child_plan).await;
 	child.query_elapsed_ms = harness.now_ms() - started;
 
 	let execution = match executed {
@@ -5309,7 +5312,7 @@ fn run_timing_atlas_child<H: TimingAtlasHarness>(
 
 	// Digesting, identity and receipt reduction happen after the boundary.
 	let verification_start = harness.now_ms();
-	match harness.reduce_child(child_plan, &execution) {
+	match harness.reduce_child(child_plan, &execution).await {
 		Ok(reduction) => {
 			child.identity_matches = Some(reduction.identity_matches);
 			child.valid = reduction.identity_matches;
@@ -5515,6 +5518,211 @@ impl TimingAtlasResidencyLog {
 			return false;
 		};
 		distinct.all(|observation| observation == first)
+	}
+}
+
+/// The real harness: census workers and coordinator, constructed once per cell and reused
+/// by every child. The spec is built once outside every timed region.
+pub struct CensusTimingAtlasHarness {
+	sql: String,
+	tables: Vec<HarnessTableMetadata>,
+	storage: Arc<dyn StorageScan>,
+	catalog: Option<MockCatalog>,
+	width: usize,
+	workers: Vec<ExecutionCensusWorkerHarness>,
+	coordinator: Option<DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport>>,
+	reference_identity: Option<ExecutionIdentityFacts>,
+	last_batches: Option<Vec<RecordBatch>>,
+	pub residency: TimingAtlasResidencyLog,
+}
+
+impl CensusTimingAtlasHarness {
+	/// Build the shared query spec. Outside every timed region by construction: this runs
+	/// before `setup_cell`.
+	pub async fn prepare(
+		query: &str,
+		mode: &str,
+		scale_factor: f64,
+		data_root: &Path,
+	) -> Result<Self, String> {
+		let spec = build_persisted_perf_query_spec(query, mode, scale_factor, data_root)?;
+		let storage: Arc<dyn StorageScan> = spec.storage;
+		let preflight = execution_census_preflight(&spec.sql, spec.tables.clone())
+			.await
+			.map_err(|rejection| {
+				format!(
+					"timing atlas preflight rejected {query} at {}: {} ({})",
+					rejection.phase.as_str(),
+					rejection.reason,
+					rejection.message
+				)
+			})?;
+		let width = preflight.shape.max_stage_width.max(1);
+		Ok(Self {
+			sql: spec.sql.into_owned(),
+			tables: spec.tables,
+			storage,
+			catalog: Some(preflight.catalog),
+			width,
+			workers: Vec::new(),
+			coordinator: None,
+			reference_identity: None,
+			last_batches: None,
+			residency: TimingAtlasResidencyLog::default(),
+		})
+	}
+
+	/// Residency read from the *actual* resident worker entries, never from the values
+	/// handed to setup — recording the intended identity would make stability vacuous.
+	fn observed_residency(&self) -> TimingAtlasResidency {
+		TimingAtlasResidency {
+			worker_ids: self
+				.workers
+				.iter()
+				.map(|worker| worker.entry.worker_id.get().as_u128())
+				.collect(),
+			endpoints: self
+				.workers
+				.iter()
+				.map(|worker| worker.entry.endpoint.as_str().to_string())
+				.collect(),
+		}
+	}
+}
+
+impl TimingAtlasHarness for CensusTimingAtlasHarness {
+	async fn setup_cell(&mut self, query: &str) -> Result<(), String> {
+		let distributed_budget = execution_census_distributed_budget(self.width);
+		let memory_pool_max_buffer_capacity_bytes =
+			usize::try_from(distributed_budget.memory_per_task.get()).unwrap_or(usize::MAX);
+		for worker_index in 0..EXECUTION_CENSUS_WORKER_COUNT {
+			match spawn_execution_census_worker(
+				worker_index,
+				self.storage.clone(),
+				distributed_budget,
+				memory_pool_max_buffer_capacity_bytes,
+			)
+			.await
+			{
+				Ok(worker) => self.workers.push(worker),
+				Err(error) => {
+					let workers = std::mem::take(&mut self.workers);
+					shutdown_execution_census_workers(workers).await?;
+					return Err(format!("timing atlas setup {query}: {error}"));
+				}
+			}
+		}
+		let entries = self
+			.workers
+			.iter()
+			.map(|worker| worker.entry.clone())
+			.collect::<Vec<_>>();
+		let registry = Arc::new(StaticWorkerRegistry::new(entries));
+		let coordinator_memory = Arc::new(MemoryManager::new(
+			EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
+			memory_pool_max_buffer_capacity_bytes,
+		));
+		let catalog: Arc<dyn Catalog> = Arc::new(
+			self.catalog
+				.take()
+				.ok_or_else(|| "timing atlas catalog already consumed".to_string())?,
+		);
+		self.coordinator = Some(DistributedQueryCoordinator::new(
+			catalog,
+			registry,
+			coordinator_memory,
+			Arc::new(TcpTransport::new()),
+			execution_census_distributed_planner_config(distributed_budget.memory_per_task),
+			distributed_budget,
+		));
+		Ok(())
+	}
+
+	async fn execute_child(
+		&mut self,
+		plan: &TimingAtlasChildPlan,
+	) -> Result<TimingAtlasExecution, String> {
+		// Reuse the resident infrastructure; never rebuild it here.
+		self.residency.observe(self.observed_residency());
+		let batches = match plan.arm {
+			TimingArm::Local => {
+				let budget = execution_census_local_budget();
+				execute_query_with_metadata_coordinate(
+					&self.sql,
+					self.tables.clone(),
+					self.storage.clone(),
+					gauge_planner_config_with_task_memory(Some(budget.memory_per_task)),
+					Some(budget),
+				)
+				.await
+				.map_err(|error| format!("local arm {}: {}", error.phase.as_str(), error.message))?
+				.batches
+			}
+			TimingArm::Distributed => {
+				let coordinator = self
+					.coordinator
+					.as_ref()
+					.ok_or_else(|| "timing atlas coordinator absent".to_string())?;
+				let logical = SqlPlanner::new()
+					.plan(&self.sql)
+					.map_err(|error| format!("distributed arm plan: {error}"))?;
+				// The plan's identity is the child's identity. Letting the coordinator mint
+				// its own would collide in the resident partition store, because workers
+				// persist across all sixteen children of a cell.
+				let budget = execution_census_distributed_budget(self.width);
+				let context = ExecutionContext::new(
+					toron::ir::SessionId(538),
+					plan.query_id,
+					toron::storage::TenantId(1),
+					toron::storage::HlcBound(1),
+				)
+				.with_task_budget(TaskBudget::from_query_budget(budget));
+				coordinator
+					.execute_query_with_context(&logical, context)
+					.await
+					.map_err(|error| format!("distributed arm: {error:?}"))?
+			}
+		};
+		let row_count = batches.iter().map(RecordBatch::num_rows).sum();
+		self.last_batches = Some(batches);
+		Ok(TimingAtlasExecution { row_count })
+	}
+
+	async fn reduce_child(
+		&mut self,
+		_plan: &TimingAtlasChildPlan,
+		_execution: &TimingAtlasExecution,
+	) -> Result<TimingAtlasReduction, String> {
+		let batches = self
+			.last_batches
+			.take()
+			.ok_or_else(|| "timing atlas child produced no batches".to_string())?;
+		let facts = execution_identity_facts(&batches)?;
+		let identity_matches = match &self.reference_identity {
+			Some(reference) => {
+				reference.digest == facts.digest
+					&& reference.row_count == facts.row_count
+					&& reference.schema_fingerprint == facts.schema_fingerprint
+			}
+			None => {
+				self.reference_identity = Some(facts);
+				true
+			}
+		};
+		Ok(TimingAtlasReduction { identity_matches })
+	}
+
+	async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
+		self.coordinator = None;
+		let workers = std::mem::take(&mut self.workers);
+		shutdown_execution_census_workers(workers).await
+	}
+
+	fn now_ms(&mut self) -> f64 {
+		std::time::SystemTime::now()
+			.duration_since(std::time::UNIX_EPOCH)
+			.map(|elapsed| elapsed.as_secs_f64() * 1000.0)
+			.unwrap_or(0.0)
 	}
 }
 
@@ -19825,13 +20033,13 @@ mod adr538_timing_atlas_runner {
 	}
 
 	impl TimingAtlasHarness for FakeHarness {
-		fn setup_cell(&mut self, query: &str) -> Result<(), String> {
+		async fn setup_cell(&mut self, query: &str) -> Result<(), String> {
 			self.events.push(Event::Setup(query.to_string()));
 			self.clock_ms += self.setup_ms;
 			Ok(())
 		}
 
-		fn execute_child(
+		async fn execute_child(
 			&mut self,
 			plan: &TimingAtlasChildPlan,
 		) -> Result<TimingAtlasExecution, String> {
@@ -19841,7 +20049,7 @@ mod adr538_timing_atlas_runner {
 			Ok(TimingAtlasExecution { row_count: 4 })
 		}
 
-		fn reduce_child(
+		async fn reduce_child(
 			&mut self,
 			plan: &TimingAtlasChildPlan,
 			_execution: &TimingAtlasExecution,
@@ -19854,7 +20062,7 @@ mod adr538_timing_atlas_runner {
 			})
 		}
 
-		fn teardown_cell(&mut self, query: &str) -> Result<(), String> {
+		async fn teardown_cell(&mut self, query: &str) -> Result<(), String> {
 			self.events.push(Event::Teardown(query.to_string()));
 			self.clock_ms += self.teardown_ms;
 			Ok(())
@@ -19868,10 +20076,10 @@ mod adr538_timing_atlas_runner {
 	/// Workers are constructed exactly once per cell and stay resident: all sixteen
 	/// children execute between the single setup and the single teardown, including the
 	/// local arms, so alternating pairs see one host footprint.
-	#[test]
-	fn workers_start_once_per_cell_and_stay_resident_through_every_child() {
+	#[tokio::test]
+	async fn workers_start_once_per_cell_and_stay_resident_through_every_child() {
 		let mut harness = FakeHarness::new(10.0, 1_000.0);
-		let outcome = run_timing_atlas_cell_with(&mut harness, "q01");
+		let outcome = run_timing_atlas_cell_with(&mut harness, "q01").await;
 		assert!(outcome.finalized());
 
 		let setups = harness
@@ -19919,10 +20127,10 @@ mod adr538_timing_atlas_runner {
 
 	/// The timer surrounds execution only. Reduction is made 100x more expensive than
 	/// execution here: if digesting leaked inside the boundary the deltas would explode.
-	#[test]
-	fn query_elapsed_covers_execution_only_not_digest_or_reduction() {
+	#[tokio::test]
+	async fn query_elapsed_covers_execution_only_not_digest_or_reduction() {
 		let mut harness = FakeHarness::new(10.0, 1_000.0);
-		let outcome = run_timing_atlas_cell_with(&mut harness, "q01");
+		let outcome = run_timing_atlas_cell_with(&mut harness, "q01").await;
 		assert!(outcome.finalized());
 
 		for pair in &outcome.pairs {
@@ -20119,5 +20327,64 @@ mod adr538_timing_atlas_residency {
 			!log.stable(),
 			"no observations cannot vacuously prove residency"
 		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_real_harness {
+	use super::*;
+
+	/// The real harness must reuse what `setup_cell` built. Residency is read from the
+	/// resident worker entries themselves, so a harness that rebuilt infrastructure inside
+	/// `execute_child` would show changed ids and fail here.
+	/// Deep binds need an explicit stack; run on a dedicated 64 MB thread.
+	#[test]
+	fn real_harness_keeps_workers_resident_across_every_child() {
+		let outcome = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(2)
+					.enable_all()
+					.build()
+					.expect("runtime");
+				runtime.block_on(async {
+					let mut harness = CensusTimingAtlasHarness::prepare(
+						"q06",
+						"strict",
+						0.01,
+						Path::new("unused"),
+					)
+					.await
+					.expect("prepare q06");
+					let cell = run_timing_atlas_cell_with(&mut harness, "q06").await;
+					(cell, harness.residency)
+				})
+			})
+			.expect("spawn")
+			.join()
+			.expect("join");
+
+		let (cell, residency) = outcome;
+		assert!(
+			cell.failure.is_none(),
+			"the cell must complete: {:?}",
+			cell.failure
+		);
+		assert_eq!(
+			cell.pairs.len(),
+			TIMING_ATLAS_MEASURED_PAIRS,
+			"seven valid pairs"
+		);
+		assert_eq!(
+			residency.len(),
+			2 + TIMING_ATLAS_MEASURED_PAIRS * 2,
+			"one residency observation per child"
+		);
+		assert!(
+			residency.stable(),
+			"workers built by setup_cell must be reused by every child"
+		);
+		assert!(cell.setup_ms > 0.0 && cell.teardown_ms > 0.0);
 	}
 }

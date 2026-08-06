@@ -1,0 +1,99 @@
+{
+  "chunk_rows": 65536,
+  "format": 2,
+  "manifest_fingerprint": "fnv1a64:e1f58cf6a1e6817d",
+  "mode": "strict",
+  "scale_factor": 0.01,
+  "suite": "tpch_persisted_dataset",
+  "tables": [
+    {
+      "file_hash": "fnv1a64:697213d5fab62166",
+      "logical_bytes": 2406648,
+      "name": "customer",
+      "path": "unused/strict/sf0_01/customer.parquet",
+      "row_count": 1500,
+      "schema_fingerprint": "fnv1a64:47fee385c7b4099d",
+      "schema_signature": "c_custkey:BIGINT|c_mktsegment:VARCHAR|c_name:VARCHAR|c_acctbal:DECIMAL(15,2)|c_address:VARCHAR|c_phone:VARCHAR|c_comment:VARCHAR|c_nationkey:BIGINT",
+      "unique_key_proofs": [
+        {
+          "columns": [
+            0
+          ],
+          "file_hash": "fnv1a64:697213d5fab62166",
+          "provenance": "verified_snapshot",
+          "schema_fingerprint": "fnv1a64:47fee385c7b4099d"
+        }
+      ]
+    },
+    {
+      "file_hash": "fnv1a64:9339d3a3915d6c51",
+      "logical_bytes": 8959648,
+      "name": "lineitem",
+      "path": "unused/strict/sf0_01/lineitem.parquet",
+      "row_count": 60175,
+      "schema_fingerprint": "fnv1a64:1714fec08b655e83",
+      "schema_signature": "l_quantity:DECIMAL(15,2)|l_extendedprice:DECIMAL(15,2)|l_discount:DECIMAL(15,2)|l_shipdate:DATE|l_returnflag:VARCHAR|l_linestatus:VARCHAR|l_tax:DECIMAL(15,2)|l_partkey:BIGINT|l_orderkey:BIGINT|l_suppkey:BIGINT|l_commitdate:DATE|l_receiptdate:DATE|l_shipmode:VARCHAR|l_shipinstruct:VARCHAR",
+      "unique_key_proofs": []
+    },
+    {
+      "file_hash": "fnv1a64:4a105af5c97f70ac",
+      "logical_bytes": 1049272,
+      "name": "nation",
+      "path": "unused/strict/sf0_01/nation.parquet",
+      "row_count": 25,
+      "schema_fingerprint": "fnv1a64:41ad7c0880b2756f",
+      "schema_signature": "n_nationkey:BIGINT|n_name:VARCHAR|n_regionkey:BIGINT",
+      "unique_key_proofs": []
+    },
+    {
+      "file_hash": "fnv1a64:2f96970c7d832654",
+      "logical_bytes": 3998408,
+      "name": "orders",
+      "path": "unused/strict/sf0_01/orders.parquet",
+      "row_count": 15000,
+      "schema_fingerprint": "fnv1a64:0ee369ae45c46e55",
+      "schema_signature": "o_orderkey:BIGINT|o_custkey:BIGINT|o_orderdate:DATE|o_shippriority:INTEGER|o_orderpriority:VARCHAR|o_comment:VARCHAR|o_totalprice:DECIMAL(15,2)|o_orderstatus:VARCHAR",
+      "unique_key_proofs": []
+    },
+    {
+      "file_hash": "fnv1a64:b01579e9b8af0201",
+      "logical_bytes": 1024152,
+      "name": "part",
+      "path": "unused/strict/sf0_01/part.parquet",
+      "row_count": 2000,
+      "schema_fingerprint": "fnv1a64:4d1fef8fba201450",
+      "schema_signature": "p_partkey:BIGINT|p_type:VARCHAR|p_brand:VARCHAR|p_container:VARCHAR|p_size:INTEGER|p_mfgr:VARCHAR|p_name:VARCHAR",
+      "unique_key_proofs": []
+    },
+    {
+      "file_hash": "fnv1a64:6ef93a8c435c5761",
+      "logical_bytes": 2359680,
+      "name": "partsupp",
+      "path": "unused/strict/sf0_01/partsupp.parquet",
+      "row_count": 8000,
+      "schema_fingerprint": "fnv1a64:b37574b7f97ece0b",
+      "schema_signature": "ps_partkey:BIGINT|ps_suppkey:BIGINT|ps_availqty:INTEGER|ps_supplycost:DECIMAL(15,2)",
+      "unique_key_proofs": []
+    },
+    {
+      "file_hash": "fnv1a64:b5cc3ccc1d8f8435",
+      "logical_bytes": 524632,
+      "name": "region",
+      "path": "unused/strict/sf0_01/region.parquet",
+      "row_count": 5,
+      "schema_fingerprint": "fnv1a64:94bedce8fcaad5f1",
+      "schema_signature": "r_regionkey:BIGINT|r_name:VARCHAR",
+      "unique_key_proofs": []
+    },
+    {
+      "file_hash": "fnv1a64:d1b2d2fb927ac2a5",
+      "logical_bytes": 2116096,
+      "name": "supplier",
+      "path": "unused/strict/sf0_01/supplier.parquet",
+      "row_count": 100,
+      "schema_fingerprint": "fnv1a64:8ab9fbfc8df600b4",
+      "schema_signature": "s_suppkey:BIGINT|s_nationkey:BIGINT|s_name:VARCHAR|s_address:VARCHAR|s_phone:VARCHAR|s_acctbal:DECIMAL(15,2)|s_comment:VARCHAR",
+      "unique_key_proofs": []
+    }
+  ]
+}
