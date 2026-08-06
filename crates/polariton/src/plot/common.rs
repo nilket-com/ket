@@ -1888,3 +1888,65 @@ mod product_0031_pre_extraction_oracle {
 		);
 	}
 }
+
+#[cfg(test)]
+mod product_0037_count_position_oracle {
+	fn legacy_major_positions(range: (f64, f64), intervals: u32) -> Vec<f64> {
+		(0..=intervals)
+			.map(|i| range.0 + (range.1 - range.0) * (i as f64 / intervals as f64))
+			.collect()
+	}
+
+	fn legacy_minor_positions(range: (f64, f64), intervals: u32, minor: u32) -> Vec<f64> {
+		(0..intervals)
+			.flat_map(|i| {
+				(1..=minor).filter_map(move |j| {
+					let t = (i as f64 + j as f64 / (minor + 1) as f64) / intervals as f64;
+					(t <= 1.0).then(|| range.0 + (range.1 - range.0) * t)
+				})
+			})
+			.collect()
+	}
+
+	#[test]
+	fn product_0037_banks_count_eight_major_and_minor_positions_before_refactor() {
+		let major = legacy_major_positions((0.0, 7.0), 8);
+		assert_eq!(
+			major,
+			vec![0.0, 0.875, 1.75, 2.625, 3.5, 4.375, 5.25, 6.125, 7.0]
+		);
+
+		let non_zero = legacy_major_positions((1.4, 8.6), 8);
+		assert_eq!(
+			non_zero,
+			vec![
+				1.4,
+				2.3,
+				3.1999999999999997,
+				4.1,
+				5.0,
+				5.9,
+				6.799999999999999,
+				7.699999999999999,
+				8.6
+			]
+		);
+
+		let minor = legacy_minor_positions((0.0, 7.0), 8, 4);
+		assert_eq!(minor.len(), 32);
+		assert_eq!(
+			&minor[..5],
+			&[
+				0.17500000000000002,
+				0.35000000000000003,
+				0.525,
+				0.7000000000000001,
+				1.05
+			]
+		);
+		assert_eq!(
+			&minor[28..],
+			&[6.3, 6.4750000000000005, 6.6499999999999995, 6.825]
+		);
+	}
+}
