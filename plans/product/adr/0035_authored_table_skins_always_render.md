@@ -1,6 +1,6 @@
 # ADR 0035: authored table skins always render
 
-Status: proposed 2026-08-06. This record decides one thing: that contrast never
+Status: accepted 2026-08-06. This record decides one thing: that contrast never
 decides whether an authored table skin is admitted. It is the table half of the
 correction PRODUCT-0034 made for plot chrome, and it changes no projection
 semantics, no identity, and no lifecycle.

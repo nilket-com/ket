@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.34. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.35. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -27,7 +27,7 @@ a cited record).
 | family | status | evidence |
 |---|---|---|
 | bounded table view (`table(r)`; accepted sugar `r.table()` and canonical `r.views([table()])`, inherits the 128 MiB `toron-client` collection ceiling) | executable | `terminal_table_is_substituted_and_mapped` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance `live_rune_relation_reaches_table_bar_and_scatter_surfaces`; PRODUCT-0008 sugar equivalence in `product_0008_single_view_sugars_are_exact_canonical_projections` (`d4c2d8a8`) |
-| theme-projected table skin (`table().skin("theme_expression")`; optional `.duotone()`) | executable | PRODUCT-0025 establishes identity resolution, validation, atomic frame/skin lifecycle, and the closed table register. PRODUCT-0027 makes named absence select explicit PaletteForward and `.duotone()` select the preserved two-anchor treatment in one commit (`74d00472`), with truthful `yellows`, unknown-name, and `dark2_s1` diagnostics recorded in `201e3f52`. Bare Rune, SQL, and Markdown tables retain the PRODUCT-0023 compiled default; plot marks still refuse `.skin(...)`. |
+| theme-projected table skin (`table().skin("theme_expression")`; optional `.duotone()`) | executable | PRODUCT-0025 establishes identity resolution, atomic frame/skin lifecycle, and the closed table register. PRODUCT-0027 makes named absence select PaletteForward and `.duotone()` select the preserved two-anchor treatment (`74d00472`). PRODUCT-0035 makes authored contrast observational: every mechanically defined projection renders exactly, including `yellows.duotone()`, both `dark2_s1` projections, and identical paper/ink, without advice or repair (`cb2daa89`). Unknown identity and other no-defined-answer cases still refuse. Bare Rune, SQL, and Markdown tables retain PRODUCT-0023's contrast-gated compiled default; plot marks still refuse `.skin(...)`. |
 | bar sink (`plot.bar`; accepted sugar `r.bar(x, y)` and canonical `r.views([bar(x, y)])`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | scatter sink (`plot.scatter`; accepted sugar `r.scatter(x, y)` and canonical `r.views([scatter(x, y)])`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | line sink (`plot.line`; accepted sugar `r.line(x, y)` and canonical `r.views([line(x, y)])`) | executable | PRODUCT-0012 equivalence and contextual refusal in `product_0012_line_*`; exact authored x/y projection in `named_line_preserves_exact_xy_and_projects_the_existing_line_contract`; shared-result and real host-panel completion in `rune_relation_results_feed_the_existing_table_and_plot_surfaces` and `dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard`; installed-transport rendering in `live_product_0012_line_view_reaches_the_existing_kernel` |
@@ -586,6 +586,14 @@ PRODUCT-0032 owns the first theme-name projection and direct figure
 | bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
+
+- v0.35 (2026-08-06): PRODUCT-0035 makes authored table-skin contrast an inert
+  measurement rather than an admission gate. Every registered theme expression
+  now completes through both mechanically defined projections; Yellows Duotone
+  renders at 3.175:1, and a degenerate pair renders with paper equal to ink. The
+  prior `.duotone()` removal advice, fallback probe, suitability errors, repair,
+  and warnings are absent. Polariton-selected defaults remain bound by
+  PRODUCT-0023's seven 4.5:1 checks.
 
 - v0.34 (2026-08-06): PRODUCT-0034 makes plot-chrome contrast an observable
   quality fact rather than an artifact admission gate. Every known theme now
