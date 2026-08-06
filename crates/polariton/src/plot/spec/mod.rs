@@ -605,9 +605,50 @@ pub struct ResolvedColor {
 	pub alpha: u8,
 }
 
+/// A validated position in one categorical allocation space.
+///
+/// The value is continuation identity, not a render color or normalized ramp
+/// coordinate. Construction requires the allocation-space length so an invalid
+/// position cannot enter production state.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct PalettePosition(usize);
+
+impl PalettePosition {
+	pub fn new(index: usize, palette_len: usize) -> Result<Self, PalettePositionError> {
+		if index < palette_len {
+			Ok(Self(index))
+		} else {
+			Err(PalettePositionError { index, palette_len })
+		}
+	}
+
+	pub const fn index(self) -> usize {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PalettePositionError {
+	pub index: usize,
+	pub palette_len: usize,
+}
+
+impl fmt::Display for PalettePositionError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			formatter,
+			"categorical palette position {} is outside length {}",
+			self.index, self.palette_len
+		)
+	}
+}
+
+impl std::error::Error for PalettePositionError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CategoryColorAssignment {
 	pub category: String,
+	pub position: PalettePosition,
 	pub color: ResolvedColor,
 }
 
@@ -784,10 +825,31 @@ struct ColorIdentityKey {
 	category: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ColorLineageKey {
+	field: String,
+	layer: LayerIdentity,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ColorAllocationSpace {
+	Legacy { len: usize },
+	CategoricalPalette { len: usize },
+}
+
+impl ColorAllocationSpace {
+	const fn len(self) -> usize {
+		match self {
+			Self::Legacy { len } | Self::CategoricalPalette { len } => len,
+		}
+	}
+}
+
 /// Per-plot continuation state for live categorical resolution.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ColorIdentity {
-	assignments: HashMap<ColorIdentityKey, ResolvedColor>,
+	assignments: HashMap<ColorIdentityKey, PalettePosition>,
+	spaces: HashMap<ColorLineageKey, ColorAllocationSpace>,
 }
 
 impl ColorIdentity {
@@ -1693,6 +1755,27 @@ fn resolve_category_colors(
 	limit: usize,
 	identity: &mut ColorIdentity,
 ) -> Result<Vec<CategoryColorAssignment>, DomainError> {
+	let lineage = ColorLineageKey {
+		field: channel.field.clone(),
+		layer: channel.layer.clone(),
+	};
+	let expected_space = ColorAllocationSpace::Legacy {
+		len: DEFAULT_CATEGORICAL_LIMIT,
+	};
+	if let Some(actual) = identity.spaces.get(&lineage) {
+		if *actual != expected_space {
+			return Err(DomainError {
+				channel: channel.channel,
+				field: channel.field.clone(),
+				reason: format!(
+					"categorical continuation uses an incompatible allocation space of length {}",
+					actual.len()
+				),
+			});
+		}
+	} else {
+		identity.spaces.insert(lineage, expected_space);
+	}
 	let lineage_count = identity
 		.assignments
 		.keys()
@@ -1729,7 +1812,9 @@ fn resolve_category_colors(
 					candidate.field == channel.field && candidate.layer == channel.layer
 				})
 				.count();
-			identity.assignments.insert(key, categorical_color(ordinal));
+			let position = PalettePosition::new(ordinal, DEFAULT_CATEGORICAL_LIMIT)
+				.expect("legacy capacity was checked before assignment");
+			identity.assignments.insert(key, position);
 		}
 	}
 	Ok(categories
@@ -1742,7 +1827,8 @@ fn resolve_category_colors(
 			};
 			CategoryColorAssignment {
 				category: category.clone(),
-				color: identity.assignments[&key],
+				position: identity.assignments[&key],
+				color: categorical_color(identity.assignments[&key].index()),
 			}
 		})
 		.collect())
@@ -1900,6 +1986,56 @@ mod tests {
 		assert_eq!(
 			actual,
 			include_str!("snapshots/product-0029-legacy-categorical.txt")
+		);
+	}
+
+	#[test]
+	fn product_0029_palette_positions_are_validated_continuation_identity() {
+		assert_eq!(PalettePosition::new(0, 1).unwrap().index(), 0);
+		assert_eq!(
+			PalettePosition::new(0, 0),
+			Err(PalettePositionError {
+				index: 0,
+				palette_len: 0,
+			})
+		);
+		assert_eq!(
+			PalettePosition::new(12, 12),
+			Err(PalettePositionError {
+				index: 12,
+				palette_len: 12,
+			})
+		);
+
+		let categories = vec!["a".to_owned(), "b".to_owned()];
+		let (resolved, identity) = resolve(
+			&legacy_category_spec(),
+			&legacy_category_frame(&categories),
+			&ColorIdentity::default(),
+		)
+		.expect("legacy resolution through positions");
+		assert_eq!(
+			identity
+				.assignments
+				.values()
+				.map(|position| position.index())
+				.collect::<HashSet<_>>(),
+			HashSet::from([0, 1])
+		);
+		assert_eq!(
+			resolved.channel(Channel::Color).unwrap().colors,
+			[
+				CategoryColorAssignment {
+					category: "a".to_owned(),
+					position: PalettePosition::new(0, 12).unwrap(),
+					color: categorical_color(0),
+				},
+				CategoryColorAssignment {
+					category: "b".to_owned(),
+					position: PalettePosition::new(1, 12).unwrap(),
+					color: categorical_color(1),
+				},
+			]
 		);
 	}
 
