@@ -4847,6 +4847,151 @@ pub struct FragmentShapeReceipt {
 	pub residency_exceeds_admission: bool,
 }
 
+// ===== ADR 538: matched-envelope timing atlas — protocol core =====
+
+/// Measured pairs per cell. Fixed by ADR 538 before measurement.
+pub const TIMING_ATLAS_MEASURED_PAIRS: usize = 7;
+/// Discarded warmup pairs per cell (two children: one per arm).
+pub const TIMING_ATLAS_WARMUP_PAIRS: usize = 1;
+/// q15 is an inherited capability wall (`BroadcastProbeNotStarLinear`, never attempted).
+/// It is excluded from the executable set by construction, not by omission.
+pub const TIMING_ATLAS_EXCLUDED_CELLS: [&str; 1] = ["q15"];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingArm {
+	Local,
+	Distributed,
+}
+
+impl TimingArm {
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::Local => "local",
+			Self::Distributed => "distributed",
+		}
+	}
+
+	fn other(self) -> Self {
+		match self {
+			Self::Local => Self::Distributed,
+			Self::Distributed => Self::Local,
+		}
+	}
+}
+
+/// The 21 cells the atlas may time. q15 cannot enter this set.
+pub fn timing_atlas_cells() -> Vec<&'static str> {
+	ALL_QUERY_IDS
+		.iter()
+		.copied()
+		.filter(|query| !TIMING_ATLAS_EXCLUDED_CELLS.contains(query))
+		.collect()
+}
+
+/// Which arm a cell starts with. Seven pairs leave one arm first four times, so the
+/// asymmetry is fixed by cell parity rather than left to run order: odd q-numbers start
+/// local, even q-numbers start distributed.
+pub fn timing_atlas_starting_arm(query: &str) -> TimingArm {
+	let number: u32 = query
+		.trim_start_matches('q')
+		.parse()
+		.expect("atlas cell ids are qNN");
+	if number % 2 == 1 {
+		TimingArm::Local
+	} else {
+		TimingArm::Distributed
+	}
+}
+
+/// Arm order for one pair. Alternates across repetitions from the cell's fixed start, so
+/// neither arm accrues a systematic position advantage.
+pub fn timing_atlas_pair_order(query: &str, pair_index: usize) -> (TimingArm, TimingArm) {
+	let start = timing_atlas_starting_arm(query);
+	let first = if pair_index % 2 == 0 {
+		start
+	} else {
+		start.other()
+	};
+	(first, first.other())
+}
+
+/// Paired estimators. ADR 538 makes these primary: per-arm medians are descriptive only,
+/// because taking them would discard the drift control the adjacent-pair design pays for.
+pub fn timing_atlas_median(values: &mut [f64]) -> Option<f64> {
+	if values.is_empty() {
+		return None;
+	}
+	values.sort_by(|left, right| left.partial_cmp(right).expect("elapsed is comparable"));
+	let middle = values.len() / 2;
+	Some(if values.len() % 2 == 1 {
+		values[middle]
+	} else {
+		(values[middle - 1] + values[middle]) / 2.0
+	})
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingAtlasVerdict {
+	Distinguished,
+	Indistinguishable,
+}
+
+/// A cell is distinguished only when every paired delta is strictly positive or strictly
+/// negative. Any zero makes it indistinguishable, whatever the medians show.
+pub fn timing_atlas_verdict(paired_deltas: &[f64]) -> TimingAtlasVerdict {
+	if paired_deltas.len() != TIMING_ATLAS_MEASURED_PAIRS {
+		return TimingAtlasVerdict::Indistinguishable;
+	}
+	let all_positive = paired_deltas.iter().all(|delta| *delta > 0.0);
+	let all_negative = paired_deltas.iter().all(|delta| *delta < 0.0);
+	if all_positive || all_negative {
+		TimingAtlasVerdict::Distinguished
+	} else {
+		TimingAtlasVerdict::Indistinguishable
+	}
+}
+
+/// Every condition that must hold for a row to claim timing authority. Any failure yields
+/// `timing_authority=false` with the reasons stated, never a silent downgrade.
+#[derive(Debug, Clone)]
+pub struct TimingAuthorityConditions {
+	pub clean_build: bool,
+	pub full_hash_dataset: bool,
+	pub quiescent_host: bool,
+	pub protocol_unmodified: bool,
+	pub complete_cohort: bool,
+}
+
+impl TimingAuthorityConditions {
+	pub fn granted(&self) -> bool {
+		self.clean_build
+			&& self.full_hash_dataset
+			&& self.quiescent_host
+			&& self.protocol_unmodified
+			&& self.complete_cohort
+	}
+
+	pub fn withheld_reasons(&self) -> Vec<&'static str> {
+		let mut reasons = Vec::new();
+		if !self.clean_build {
+			reasons.push("build_not_clean");
+		}
+		if !self.full_hash_dataset {
+			reasons.push("dataset_not_full_hash");
+		}
+		if !self.quiescent_host {
+			reasons.push("host_not_quiescent");
+		}
+		if !self.protocol_unmodified {
+			reasons.push("protocol_constants_overridden");
+		}
+		if !self.complete_cohort {
+			reasons.push("cohort_incomplete");
+		}
+		reasons
+	}
+}
+
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
 /// construction — a new `FragmentError` variant fails compilation here instead of falling
 /// through to an unrecognized bucket.
@@ -18623,5 +18768,143 @@ mod adr529_execution_census {
 			value["task_memory_envelope_bytes"],
 			EXECUTION_CENSUS_TASK_MEMORY_ENVELOPE_BYTES
 		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_protocol {
+	use super::*;
+
+	/// The census is a correctness rail. Its `timing_authority=false` is permanent, and
+	/// only the atlas may claim authority — so the two can never be conflated by editing
+	/// one line in the wrong file.
+	#[test]
+	fn execution_census_remains_permanently_non_authoritative() {
+		let source = include_str!("telemetry.rs");
+		let census = source
+			.split("pub struct ExecutionCensusRow")
+			.nth(1)
+			.expect("execution census row");
+		assert!(
+			census.contains("\"timing_authority\": false"),
+			"the execution census must hard-code timing_authority=false; timing authority \
+			 belongs to the ADR 538 atlas rail alone"
+		);
+		// Scan production source only: this file's own test module contains the very
+		// literal being searched for, and a guard that matches itself proves nothing.
+		let lib = include_str!("lib.rs");
+		let production = lib.split("#[cfg(test)]").next().expect("production source");
+		assert!(
+			!production.contains("timing_authority")
+				|| production.contains("TimingAuthorityConditions"),
+			"timing authority must be derived from TimingAuthorityConditions, never set as \
+			 a bare field default"
+		);
+	}
+
+	/// q15 is an inherited capability wall and cannot enter the executable set.
+	#[test]
+	fn q15_cannot_enter_the_atlas_cohort() {
+		let cells = timing_atlas_cells();
+		assert_eq!(
+			cells.len(),
+			21,
+			"the atlas cohort is the 21 identical cells"
+		);
+		assert!(
+			!cells.contains(&"q15"),
+			"q15 is a typed capability wall, excluded by construction"
+		);
+		for excluded in TIMING_ATLAS_EXCLUDED_CELLS {
+			assert!(ALL_QUERY_IDS.contains(&excluded));
+		}
+	}
+
+	/// Protocol constants are fixed by the ADR before measurement. A run that could tune
+	/// them from the environment would not be measuring the declared protocol.
+	#[test]
+	fn protocol_constants_are_not_environment_overridable() {
+		assert_eq!(TIMING_ATLAS_MEASURED_PAIRS, 7);
+		assert_eq!(TIMING_ATLAS_WARMUP_PAIRS, 1);
+		let lib = include_str!("lib.rs");
+		let core = lib
+			.split("ADR 538: matched-envelope timing atlas — protocol core")
+			.nth(1)
+			.expect("protocol core")
+			.split("ADR 528: total classification")
+			.next()
+			.expect("protocol core end");
+		assert!(
+			!core.contains("std::env::var"),
+			"protocol constants must not be readable from the environment"
+		);
+	}
+
+	/// Seven pairs leave one arm first four times; parity fixes which, and the order
+	/// alternates from there.
+	#[test]
+	fn arm_order_is_parity_fixed_and_alternating() {
+		assert_eq!(timing_atlas_starting_arm("q01"), TimingArm::Local);
+		assert_eq!(timing_atlas_starting_arm("q22"), TimingArm::Distributed);
+
+		let (first, second) = timing_atlas_pair_order("q01", 0);
+		assert_eq!((first, second), (TimingArm::Local, TimingArm::Distributed));
+		let (first, second) = timing_atlas_pair_order("q01", 1);
+		assert_eq!((first, second), (TimingArm::Distributed, TimingArm::Local));
+
+		// Odd cell: local leads four of seven. Even cell: distributed leads four of seven.
+		let local_first = (0..TIMING_ATLAS_MEASURED_PAIRS)
+			.filter(|index| timing_atlas_pair_order("q01", *index).0 == TimingArm::Local)
+			.count();
+		assert_eq!(local_first, 4);
+		let distributed_first = (0..TIMING_ATLAS_MEASURED_PAIRS)
+			.filter(|index| timing_atlas_pair_order("q22", *index).0 == TimingArm::Distributed)
+			.count();
+		assert_eq!(distributed_first, 4);
+	}
+
+	/// Any zero delta makes a cell indistinguishable, however far apart the medians are.
+	#[test]
+	fn verdict_requires_seven_strictly_signed_deltas() {
+		assert_eq!(
+			timing_atlas_verdict(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]),
+			TimingAtlasVerdict::Distinguished
+		);
+		assert_eq!(
+			timing_atlas_verdict(&[-1.0, -2.0, -3.0, -4.0, -5.0, -6.0, -7.0]),
+			TimingAtlasVerdict::Distinguished
+		);
+		assert_eq!(
+			timing_atlas_verdict(&[1.0, 2.0, 0.0, 4.0, 5.0, 6.0, 7.0]),
+			TimingAtlasVerdict::Indistinguishable,
+			"a zero delta forbids a verdict"
+		);
+		assert_eq!(
+			timing_atlas_verdict(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+			TimingAtlasVerdict::Indistinguishable,
+			"an incomplete cohort of pairs cannot be distinguished"
+		);
+	}
+
+	/// Timing authority is granted only when every condition holds, and withholding names
+	/// its reasons.
+	#[test]
+	fn timing_authority_requires_every_condition() {
+		let all = TimingAuthorityConditions {
+			clean_build: true,
+			full_hash_dataset: true,
+			quiescent_host: true,
+			protocol_unmodified: true,
+			complete_cohort: true,
+		};
+		assert!(all.granted());
+		assert!(all.withheld_reasons().is_empty());
+
+		let noisy_host = TimingAuthorityConditions {
+			quiescent_host: false,
+			..all.clone()
+		};
+		assert!(!noisy_host.granted());
+		assert_eq!(noisy_host.withheld_reasons(), vec!["host_not_quiescent"]);
 	}
 }

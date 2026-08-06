@@ -54,6 +54,26 @@ be chosen after seeing data:
   children from different machine states and silently break the pairing. No other retry, and no
   re-run of a cell whose numbers are disliked.
 
+**2b. Lifecycle and arm order, fixed before measurement.**
+
+- **One process** runs the whole atlas. Per cell, workers and the coordinator are constructed
+  **once before the warmups**, retained across all 7 pairs, and torn down after the cell.
+- **Workers stay resident during local arms too**, so alternating pairs observe the same host
+  footprint rather than a footprint that changes with the arm being timed.
+- Query elapsed **excludes** worker startup, dataset verification, digesting and teardown. Each is
+  recorded separately. Persistent worker startup is not a per-query substrate cost and must not be
+  charged to one.
+- Every child gets a **fresh query identity**, and shuffle/task state is reconciled before the next
+  child so no residue crosses a boundary.
+- **Starting order is fixed by cell parity**, because 7 pairs leave one arm first four times and
+  that asymmetry must not correlate with anything: **odd q-numbers start local→distributed, even
+  q-numbers start distributed→local.** Warmup order and measured order are recorded on every row.
+- **Durable JSONL retains everything**: each child row, each pair row, each invalid attempt, the
+  correctness facts, and the raw attribution receipts. Nothing is summarized away at write time.
+- `timing_authority=true` is emitted **only** by this rail, and only when **all** of clean-build,
+  full-hash dataset verification, quiescent host, unmodified protocol constants and complete cohort
+  hold. Any one failing yields `timing_authority=false` and a stated reason.
+
 **3. Every timed child keeps its correctness checks.** Digest, row count, schema fingerprint,
 plan shape and clean-build stamp are verified on each timed run. A timed row that cannot show
 identity is discarded as invalid, never reported as fast. Timing does not get a weaker bar than
