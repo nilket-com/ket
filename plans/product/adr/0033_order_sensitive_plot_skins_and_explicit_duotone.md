@@ -1,9 +1,9 @@
 # ADR 0033: order-sensitive plot skins and explicit duotone
 
-Status: proposed 2026-08-06. This record corrects PRODUCT-0032's mandatory
-set-based projection. Ordinary plot skins preserve resolved palette ordering;
-the accepted strongest-pair treatment remains available through an explicit
-`.duotone()` modifier.
+Status: accepted 2026-08-06. Evidence: `c5da61c0`. This record corrects
+PRODUCT-0032's mandatory set-based projection. Ordinary plot skins preserve
+resolved palette ordering; the accepted strongest-pair treatment remains
+available through an explicit `.duotone()` modifier.
 
 ## Context
 
