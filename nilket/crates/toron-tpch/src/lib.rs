@@ -4992,6 +4992,106 @@ impl TimingAuthorityConditions {
 	}
 }
 
+/// One timed child: exactly one query execution on one arm. `query_elapsed_ms` covers the
+/// execution alone — digesting, identity checks and receipt processing happen after the
+/// elapsed boundary so they cannot inflate what the atlas attributes to the engine.
+#[derive(Debug, Clone)]
+pub struct TimingAtlasChild {
+	pub query: String,
+	pub arm: &'static str,
+	pub pair_index: Option<usize>,
+	pub position_in_pair: usize,
+	pub attempt: u32,
+	pub query_elapsed_ms: f64,
+	pub row_count: Option<usize>,
+	pub identity_matches: Option<bool>,
+	pub valid: bool,
+	pub failure: Option<String>,
+	pub failure_is_io: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimingAtlasPair {
+	pub pair_index: usize,
+	pub first_arm: &'static str,
+	pub local: TimingAtlasChild,
+	pub distributed: TimingAtlasChild,
+	pub delta_ms: f64,
+	pub ratio: f64,
+}
+
+#[derive(Debug, Clone)]
+pub struct TimingAtlasCellOutcome {
+	pub query: String,
+	pub setup_ms: f64,
+	pub teardown_ms: f64,
+	pub verification_ms: f64,
+	pub warmups: Vec<TimingAtlasChild>,
+	pub pairs: Vec<TimingAtlasPair>,
+	pub invalid_attempts: Vec<TimingAtlasChild>,
+	pub failure: Option<String>,
+}
+
+impl TimingAtlasCellOutcome {
+	/// A cell finalizes only with exactly seven valid pairs and no recorded failure.
+	pub fn finalized(&self) -> bool {
+		self.failure.is_none() && self.pairs.len() == TIMING_ATLAS_MEASURED_PAIRS
+	}
+
+	pub fn paired_deltas(&self) -> Vec<f64> {
+		self.pairs.iter().map(|pair| pair.delta_ms).collect()
+	}
+
+	pub fn paired_ratios(&self) -> Vec<f64> {
+		self.pairs.iter().map(|pair| pair.ratio).collect()
+	}
+
+	pub fn verdict(&self) -> TimingAtlasVerdict {
+		if !self.finalized() {
+			return TimingAtlasVerdict::Indistinguishable;
+		}
+		timing_atlas_verdict(&self.paired_deltas())
+	}
+}
+
+/// Classify a child failure. Only an I/O failure is retryable, and then only as a whole
+/// pair; everything else forbids timing authority for the cell.
+fn timing_atlas_failure_is_io(message: &str) -> bool {
+	message.contains("QueryError::Io") || message.contains("Io(")
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingAtlasPairOutcome {
+	Valid,
+	RetryableIo,
+	Fatal,
+}
+
+/// Decide a pair's fate from its two children. An I/O failure invalidates the *whole* pair —
+/// a retried distributed child must never be timed against its original local partner,
+/// because they would come from different machine states.
+pub fn timing_atlas_pair_outcome(
+	first: &TimingAtlasChild,
+	second: &TimingAtlasChild,
+	already_retried: bool,
+) -> TimingAtlasPairOutcome {
+	for child in [first, second] {
+		if child.identity_matches == Some(false) {
+			return TimingAtlasPairOutcome::Fatal;
+		}
+	}
+	for child in [first, second] {
+		if !child.valid {
+			return if child.failure_is_io && !already_retried {
+				TimingAtlasPairOutcome::RetryableIo
+			} else {
+				TimingAtlasPairOutcome::Fatal
+			};
+		}
+	}
+	TimingAtlasPairOutcome::Valid
+}
+
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
 /// construction — a new `FragmentError` variant fails compilation here instead of falling
 /// through to an unrecognized bucket.
@@ -18906,5 +19006,106 @@ mod adr538_timing_atlas_protocol {
 		};
 		assert!(!noisy_host.granted());
 		assert_eq!(noisy_host.withheld_reasons(), vec!["host_not_quiescent"]);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_failure_paths {
+	use super::*;
+
+	fn child(arm: &'static str, valid: bool, failure_is_io: bool) -> TimingAtlasChild {
+		TimingAtlasChild {
+			query: "q01".to_string(),
+			arm,
+			pair_index: Some(0),
+			position_in_pair: 0,
+			attempt: 1,
+			query_elapsed_ms: 10.0,
+			row_count: Some(4),
+			identity_matches: Some(true),
+			valid,
+			failure: (!valid).then(|| "boom".to_string()),
+			failure_is_io,
+		}
+	}
+
+	#[test]
+	fn a_clean_pair_is_valid() {
+		let outcome = timing_atlas_pair_outcome(
+			&child("local", true, false),
+			&child("distributed", true, false),
+			false,
+		);
+		assert_eq!(outcome, TimingAtlasPairOutcome::Valid);
+	}
+
+	/// An I/O failure invalidates the whole pair, not just its own child.
+	#[test]
+	fn io_failure_invalidates_the_whole_pair_once() {
+		let outcome = timing_atlas_pair_outcome(
+			&child("local", true, false),
+			&child("distributed", false, true),
+			false,
+		);
+		assert_eq!(outcome, TimingAtlasPairOutcome::RetryableIo);
+	}
+
+	/// A second I/O failure is fatal — one retry, never a loop until the numbers look good.
+	#[test]
+	fn second_io_failure_is_fatal() {
+		let outcome = timing_atlas_pair_outcome(
+			&child("local", true, false),
+			&child("distributed", false, true),
+			true,
+		);
+		assert_eq!(outcome, TimingAtlasPairOutcome::Fatal);
+	}
+
+	/// Any non-I/O failure forbids authority immediately.
+	#[test]
+	fn non_io_failure_is_fatal() {
+		let outcome = timing_atlas_pair_outcome(
+			&child("local", true, false),
+			&child("distributed", false, false),
+			false,
+		);
+		assert_eq!(outcome, TimingAtlasPairOutcome::Fatal);
+	}
+
+	/// An identity mismatch aborts the cell as an ADR failure and is never retried — a
+	/// wrong answer is not a flake.
+	#[test]
+	fn identity_mismatch_is_fatal_even_when_io_would_retry() {
+		let mut mismatched = child("distributed", false, true);
+		mismatched.identity_matches = Some(false);
+		let outcome = timing_atlas_pair_outcome(&child("local", true, false), &mismatched, false);
+		assert_eq!(
+			outcome,
+			TimingAtlasPairOutcome::Fatal,
+			"an identity mismatch outranks a retryable transport flake"
+		);
+	}
+
+	#[test]
+	fn io_classification_recognizes_transport_errors() {
+		assert!(timing_atlas_failure_is_io("QueryError::Io(...)"));
+		assert!(!timing_atlas_failure_is_io("QueryError::Internal { .. }"));
+	}
+
+	/// An incomplete cohort cannot finalize or claim a verdict, however clean its pairs.
+	#[test]
+	fn incomplete_cohort_never_finalizes() {
+		let outcome = TimingAtlasCellOutcome {
+			query: "q01".to_string(),
+			setup_ms: 1.0,
+			teardown_ms: 1.0,
+			verification_ms: 1.0,
+			warmups: Vec::new(),
+			pairs: Vec::new(),
+			invalid_attempts: Vec::new(),
+			failure: None,
+		};
+		assert!(!outcome.finalized());
+		assert_eq!(outcome.verdict(), TimingAtlasVerdict::Indistinguishable);
 	}
 }
