@@ -880,11 +880,35 @@ fn product_0027_surface_keeps_projection_intent_bounded_and_plot_registers_close
 	assert!(state_production.contains("projection: RuneTableSkinProjection::PaletteForward"));
 	assert!(state_production.contains("projection: RuneTableSkinProjection::Duotone"));
 	assert!(
-		state_production
+		!state_production
 			.contains("the default palette-forward projection succeeds; remove .duotone()")
 	);
 	assert!(!state_production.contains("TableSkinProjection::default"));
 	assert!(!state_production.contains("unwrap_or(TableSkinProjection"));
+}
+
+#[test]
+fn product_0035_authored_table_contrast_is_observable_but_never_an_admission_gate() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let skin = std::fs::read_to_string(root.join("gui/table_skin.rs")).expect("read table skin");
+	let skin_production = skin
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production table-skin source");
+	assert!(skin_production.contains("pub fn visible_contrast_checks"));
+	assert!(skin_production.contains("pub fn passes_contrast"));
+	assert!(!skin_production.contains("UnsuitableDuotone"));
+	assert!(!skin_production.contains("UnsuitablePaletteForward"));
+	assert!(!skin_production.contains("validate_projected_skin"));
+
+	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	let state_production = state
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production GUI state source");
+	assert!(!state_production.contains("remove .duotone()"));
+	assert!(!state_production.contains("passes_contrast"));
+	assert!(!state_production.contains("weakest_contrast"));
 }
 
 #[test]

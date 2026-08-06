@@ -926,24 +926,7 @@ fn resolve_rune_table_skin_with(
 		RuneTableSkinIntent::NamedTheme {
 			name,
 			projection: RuneTableSkinProjection::Duotone,
-		} => match resolve(&name, TableSkinProjection::Duotone) {
-			Ok(skin) => Ok(skin),
-			Err(error @ TableSkinProjectionError::UnknownTheme { .. }) => Err(error.to_string()),
-			Err(error @ TableSkinProjectionError::UnsuitableDuotone { .. }) => {
-				let diagnostic = error.to_string();
-				if resolve(&name, TableSkinProjection::PaletteForward).is_ok() {
-					Err(format!(
-						"{diagnostic}; the default palette-forward projection succeeds; remove .duotone()"
-					))
-				} else {
-					Err(diagnostic)
-				}
-			}
-			Err(error @ TableSkinProjectionError::UnsuitablePaletteForward { .. }) => {
-				debug_assert!(false, "Duotone request returned PaletteForward facts");
-				Err(error.to_string())
-			}
-		},
+		} => resolve(&name, TableSkinProjection::Duotone).map_err(|error| error.to_string()),
 	}
 }
 
@@ -3267,7 +3250,7 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0027_table_skin_resolution_is_per_sink_and_keeps_shared_identity() {
+	fn product_0035_authored_table_skin_resolution_is_per_sink_and_keeps_shared_identity() {
 		let source = r#"workspace.table("t").views([
 			table().skin("terrain_rs10"),
 			table(),
@@ -3304,10 +3287,16 @@ mod tests {
 			panic!("bare table must resolve");
 		};
 		assert_eq!(*default, TableSkin::DEFAULT);
-		let Err(error) = &outcome.sinks[2].output else {
-			panic!("flat palette must fail only its table sink");
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(authored)) =
+			&outcome.sinks[2].output
+		else {
+			panic!("defined authored palette must render");
 		};
-		assert!(error.contains("unsuitable"));
+		assert_eq!(
+			*authored,
+			TableSkin::from_theme_name("dark2_s1", TableSkinProjection::PaletteForward).unwrap()
+		);
+		assert!(!authored.passes_contrast());
 		assert!(matches!(
 			outcome.sinks[3].output,
 			Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(..))
@@ -3316,7 +3305,7 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0027_projection_policy_probes_only_a_working_duotone_alternative() {
+	fn product_0035_authored_projection_resolves_once_without_advice_or_fallback() {
 		fn themed(name: &str, projection: RuneTableSkinProjection) -> RuneTableSkinIntent {
 			RuneTableSkinIntent::NamedTheme {
 				name: name.to_owned(),
@@ -3355,23 +3344,15 @@ mod tests {
 		);
 
 		let (duotone, calls) = resolve_traced(themed("yellows", RuneTableSkinProjection::Duotone));
-		let error = duotone.expect_err("explicit yellows Duotone must remain unsuitable");
-		let factual = TableSkin::from_theme_name("yellows", TableSkinProjection::Duotone)
-			.expect_err("PRODUCT-0026 differential assay")
-			.to_string();
 		assert_eq!(
-			error,
-			format!(
-				"{factual}; the default palette-forward projection succeeds; remove .duotone()"
-			)
+			duotone,
+			TableSkin::from_theme_name("yellows", TableSkinProjection::Duotone)
+				.map_err(|error| error.to_string())
 		);
-		assert!(error.contains("cell text on selected odd row"));
+		assert!(!duotone.unwrap().passes_contrast());
 		assert_eq!(
 			calls,
-			[
-				("yellows".to_owned(), TableSkinProjection::Duotone),
-				("yellows".to_owned(), TableSkinProjection::PaletteForward),
-			]
+			[("yellows".to_owned(), TableSkinProjection::Duotone)]
 		);
 
 		let (unknown, calls) = resolve_traced(themed(
@@ -3417,29 +3398,27 @@ mod tests {
 			[("terrain_rs10".to_owned(), TableSkinProjection::Duotone)]
 		);
 
-		let (both_fail, calls) =
+		let (duotone_below, calls) =
 			resolve_traced(themed("dark2_s1", RuneTableSkinProjection::Duotone));
-		let error = both_fail.expect_err("dark2_s1 must fail both projections");
 		assert_eq!(
-			error,
+			duotone_below,
 			TableSkin::from_theme_name("dark2_s1", TableSkinProjection::Duotone)
-				.expect_err("Duotone control")
-				.to_string()
+				.map_err(|error| error.to_string())
 		);
-		assert!(!error.contains("remove .duotone()"));
+		assert!(!duotone_below.unwrap().passes_contrast());
 		assert_eq!(
 			calls,
-			[
-				("dark2_s1".to_owned(), TableSkinProjection::Duotone),
-				("dark2_s1".to_owned(), TableSkinProjection::PaletteForward),
-			]
+			[("dark2_s1".to_owned(), TableSkinProjection::Duotone)]
 		);
 
-		let (palette_forward_fail, calls) =
+		let (palette_forward_below, calls) =
 			resolve_traced(themed("dark2_s1", RuneTableSkinProjection::PaletteForward));
-		let error = palette_forward_fail.expect_err("default projection must report its own facts");
-		assert!(error.contains("palette-forward"));
-		assert!(!error.contains("duotone"));
+		assert_eq!(
+			palette_forward_below,
+			TableSkin::from_theme_name("dark2_s1", TableSkinProjection::PaletteForward)
+				.map_err(|error| error.to_string())
+		);
+		assert!(!palette_forward_below.unwrap().passes_contrast());
 		assert_eq!(
 			calls,
 			[("dark2_s1".to_owned(), TableSkinProjection::PaletteForward)]
@@ -3516,7 +3495,7 @@ ket.table("test2") // Comment Test1.
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0027_projection_changes_reuse_the_panel_and_bad_skin_retains_the_prior_pair() {
+	fn product_0035_projection_changes_reuse_panels_and_below_threshold_skin_replaces_stale() {
 		fn program(theme: &str, duotone: bool) -> TransformedRuneView {
 			let projection = if duotone { ".duotone()" } else { "" };
 			transform_rune_view(&format!(
@@ -3596,16 +3575,19 @@ ket.table("test2") // Comment Test1.
 			state
 				.code_editor
 				.rune_view_panel_table_skin(source_buffer, &bad),
-			Some(previous_bad_skin),
-			"failed suitability must retain the prior complete artifact"
+			Some(
+				TableSkin::from_theme_name("dark2_s1", TableSkinProjection::PaletteForward)
+					.unwrap()
+			),
+			"defined authored projection must replace the prior artifact"
 		);
 		assert_eq!(
 			state
 				.code_editor
 				.rune_view_panel_status(source_buffer, &bad),
-			Some("stale")
+			Some("fresh")
 		);
-		assert!(state.status_error.contains("table at bytes"));
+		assert!(!state.status_error.contains("table at bytes"));
 
 		let second = program("terrain_rs10", false);
 		let presentation = second
