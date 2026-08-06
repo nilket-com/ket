@@ -1,6 +1,6 @@
 # ADR 0038: the tick step figure surface
 
-Status: proposed 2026-08-06. This record decides one thing: the Rune spelling
+Status: accepted 2026-08-06. This record decides one thing: the Rune spelling
 that selects PRODUCT-0037's `TickPlacement::Step`. It invents no placement
 semantics — the anchor, capacity, applicability, and minor-tick rules were all
 decided there — and adds no substrate, kernel, or renderer work.
