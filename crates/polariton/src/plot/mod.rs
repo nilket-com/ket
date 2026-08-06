@@ -1,3 +1,4 @@
+pub mod chrome;
 pub mod colors;
 pub mod common;
 pub mod composition;
