@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.31. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.32. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -37,6 +37,7 @@ a cited record).
 | producer-scoped view panel placement (automatic visible tiling; no inferred tabs) | executable | PRODUCT-0015's thirteen gates: `product_0015_host_panel_groups_tile_atomically_and_fallback_visibly` proves atomic 2x2 placement and all-visible decline; `rune_view_collection_tiles_one_forward_producer_group_without_tabs` proves forward table/layered/table/bar order, Compact/Expansive sizing, unchanged reruns, and Retile no-op; detachment/reset/lifecycle and two-producer isolation land in `6d67e95b`, `fd968496`, `a287b770`, and `67c8f2f5`. PRODUCT-0011's explicit `Split`/`TabWith` remains unchanged. |
 | layered plot sink (`layers([line(x, y), scatter(x, y)])`) | executable | PRODUCT-0013's ordered substrate and PRODUCT-0014's surface are accepted; thirteen surface gates land in `c3edc520`, `a10b4995`, `56c8cb88`, and `d52fc31d`, with installed `test6.rn` dogfood confirming labels, paint order, ordinary host panels, and no dashboard |
 | figure-wide headings (`figure([title(text), subtitle(text), body])`) | executable | PRODUCT-0016's twelve gates in `4278e762`, `267e48c1`, `a39ffd9d`, and `764e2b64`; exact grammar spans, independent settings/body lowering, projected source-current chrome, rendered completion-atomic canvas, stale/removal lifecycle, and installed `test7.rn` launch |
+| theme-projected plot chrome (`figure([skin("theme_expression"), body])`) | executable | PRODUCT-0032's sole darker-paper/lighter-ink projection, exact figure grammar, destination-local diagnostics, atomic host lifecycle, and `skin`/`palette` differential land in `71673752`, with the complete catalog/Nord/gate ledger in `ec3fc6a9`. Omission preserves PRODUCT-0031's exact compatibility chrome. |
 | relative scatter point size (`scatter(x, y).point_size(factor)`) | executable | PRODUCT-0017 proves the typed layer setting and all scatter renderer/hit/cache paths; PRODUCT-0018's closed contextual register, exact lowering/refusals, shared-result handoff, byte-identical `1.0`, six-pixel-radius `2.0`, identity/label lifecycle, and no-dashboard host completion land in `5d180e0c` and `0478f8a2`; installed `test7.rn` exercises the accepted `8.0` maximum |
 | relative line stroke width (`line(x, y).stroke_width(factor)`) | executable | PRODUCT-0019 proves the typed layer setting, five-tier selection, exact line paint/hit behavior, fixed guide, and styled-one-layer scale preservation; PRODUCT-0020's closed contextual lowering/refusals, shared-result handoff, byte-identical `1.0`, exact 4px `2.0`, identity/label lifecycle, and combined point-size host assay land in `01a66f4d`; installed `test7.rn` exercises both modifiers in one figure |
 | normalized bar slot width (`bar(category, value).bar_width(fraction)`) | executable | PRODUCT-0021 proves the typed `(0, 1]` Layer-stage setting, default `0.9`, five-tier selection, full-band subgroup allocation, touching `1.0`, shared vertical/horizontal paint-hit rectangles, exact padding misses, fixed preparation/layout/guide output, and no Bar layer admission in `bf4be7a0` and `671ce765`; PRODUCT-0022's closed contextual lowering/refusals, shared-result styled-Bar handoff, byte-identical bare/`0.9`, narrow `0.5`, identity/heading/placement lifecycle, and no-dashboard host assay land in `db4d2be6`; installed `test7.rn` exercises near-touching `0.9999` beside the existing line and scatter modifiers |
@@ -585,6 +586,15 @@ PRODUCT-0032 owns the first theme-name projection and direct figure
 | bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
+
+- v0.32 (2026-08-06): PRODUCT-0032 adds the direct figure-wide
+  `skin("theme_expression")` member and one validated plot-chrome projection.
+  Skin colors only the closed eleven-role chrome; categorical `palette` colors
+  only data. The paired `viridis_r -> viridis_s5` assay keeps positions fixed,
+  recolors bars, and keeps chrome identical, explicitly proving ordered and
+  set-based consumers can observe the same modifier differently. Nord passes
+  five 4.5:1 text and three 3:1 non-text checks, failures remain
+  destination-local and stale-safe, and omission retains the legacy default.
 
 - v0.31 (2026-08-06): PRODUCT-0031 replaces the plot renderer's ambiguous
   background/decoration pair with a closed eleven-role `PlotChrome`. The exact
