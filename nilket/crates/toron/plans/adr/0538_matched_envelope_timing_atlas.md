@@ -68,6 +68,17 @@ be chosen after seeing data:
 - **Starting order is fixed by cell parity**, because 7 pairs leave one arm first four times and
   that asymmetry must not correlate with anything: **odd q-numbers start local→distributed, even
   q-numbers start distributed→local.** Warmup order and measured order are recorded on every row.
+- **Inter-child cleanup is explicit, awaited, and excluded from query elapsed.** Production
+  completion does **not** reclaim shuffle state: `PartitionStore::remove_query` exists but has
+  no production caller, and a measured child leaves its partitions resident. With workers held
+  across sixteen children, an accumulating store would raise memory pressure as a cell
+  progresses — drift correlated with pair index, which the paired design cannot subtract
+  because it is not machine noise. The apparatus therefore reclaims each child's query
+  namespace explicitly after the elapsed boundary, awaits it, and records it separately as
+  inter-child cleanup cost. Retained bytes must return to the post-setup baseline before the
+  next child begins. Cleanup runs for successful, failed and invalidated attempts alike, and a
+  replacement pair allocates two fresh identities distinct from both identities of the pair it
+  replaces.
 - **Durable JSONL retains everything**: each child row, each pair row, each invalid attempt, the
   correctness facts, and the raw attribution receipts. Nothing is summarized away at write time.
 - `timing_authority=true` is emitted **only** by this rail, and only when **all** of clean-build,

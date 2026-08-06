@@ -5029,6 +5029,8 @@ pub struct TimingAtlasCellOutcome {
 	pub warmups: Vec<TimingAtlasChild>,
 	pub pairs: Vec<TimingAtlasPair>,
 	pub invalid_attempts: Vec<TimingAtlasChild>,
+	/// Inter-child reclamation, recorded separately and never inside query elapsed.
+	pub cleanup_ms: f64,
 	pub failure: Option<String>,
 }
 
@@ -5199,6 +5201,10 @@ pub trait TimingAtlasHarness {
 		plan: &TimingAtlasChildPlan,
 		execution: &TimingAtlasExecution,
 	) -> Result<TimingAtlasReduction, String>;
+	/// Reclaim one child's query namespace. Runs after the elapsed boundary for every
+	/// child — successful, failed or invalidated — and must return retained bytes to the
+	/// post-setup baseline before the next child begins.
+	async fn cleanup_child(&mut self, plan: &TimingAtlasChildPlan) -> Result<(), String>;
 	/// Tear down workers. Exactly once per cell, after the last measured child.
 	async fn teardown_cell(&mut self, query: &str) -> Result<(), String>;
 	/// Elapsed source, in milliseconds.
@@ -5219,6 +5225,7 @@ pub async fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 		warmups: Vec::new(),
 		pairs: Vec::new(),
 		invalid_attempts: Vec::new(),
+		cleanup_ms: 0.0,
 		failure: None,
 	};
 
@@ -5326,6 +5333,17 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 		}
 	}
 	outcome.verification_ms += harness.now_ms() - verification_start;
+
+	// Reclamation runs for every child, including failed and invalidated ones, so no
+	// namespace survives into the next child's machine state.
+	let cleanup_start = harness.now_ms();
+	if let Err(error) = harness.cleanup_child(child_plan).await {
+		child.valid = false;
+		child
+			.failure
+			.get_or_insert_with(|| format!("cleanup: {error}"));
+	}
+	outcome.cleanup_ms += harness.now_ms() - cleanup_start;
 	child
 }
 
@@ -5712,6 +5730,19 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 		Ok(TimingAtlasReduction { identity_matches })
 	}
 
+	async fn cleanup_child(&mut self, plan: &TimingAtlasChildPlan) -> Result<(), String> {
+		// Production completion does not reclaim shuffle state, so the atlas does it
+		// explicitly. This also closes any live pacing semaphore and drops manifests,
+		// reservations and cancellation state for the namespace.
+		for worker in &self.workers {
+			toron::distributed::partition_store::PartitionStore::remove_query(
+				worker.partition_store.as_ref(),
+				plan.query_id,
+			);
+		}
+		Ok(())
+	}
+
 	async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
 		self.coordinator = None;
 		let workers = std::mem::take(&mut self.workers);
@@ -5723,6 +5754,22 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 			.duration_since(std::time::UNIX_EPOCH)
 			.map(|elapsed| elapsed.as_secs_f64() * 1000.0)
 			.unwrap_or(0.0)
+	}
+}
+
+impl CensusTimingAtlasHarness {
+	/// Bytes the resident partition stores still hold. Read from the live stores, so an
+	/// accumulating namespace shows up rather than being assumed away.
+	pub fn resident_partition_bytes(&self) -> u64 {
+		self.workers
+			.iter()
+			.map(|worker| {
+				worker
+					.partition_store
+					.budget_used(toron::distributed::budget::BudgetDimension::ShuffleBytes)
+					.get()
+			})
+			.sum()
 	}
 }
 
@@ -19737,6 +19784,7 @@ mod adr538_timing_atlas_failure_paths {
 			warmups: Vec::new(),
 			pairs: Vec::new(),
 			invalid_attempts: Vec::new(),
+			cleanup_ms: 0.0,
 			failure: None,
 		};
 		assert!(!outcome.finalized());
@@ -19923,6 +19971,7 @@ mod adr538_timing_atlas_execution {
 			warmups: Vec::new(),
 			pairs: (0..TIMING_ATLAS_MEASURED_PAIRS).map(pair).collect(),
 			invalid_attempts: Vec::new(),
+			cleanup_ms: 0.0,
 			failure: None,
 		};
 		assert!(base.finalized());
@@ -19984,6 +20033,7 @@ mod adr538_timing_atlas_execution {
 				ratio: 2.5,
 			}],
 			invalid_attempts: Vec::new(),
+			cleanup_ms: 0.0,
 			failure: None,
 		};
 		assert!(outcome.setup_ms > 0.0 && outcome.teardown_ms > 0.0);
@@ -20004,6 +20054,7 @@ mod adr538_timing_atlas_runner {
 		Setup(String),
 		Execute(String),
 		Reduce(String),
+		Cleanup(String),
 		Teardown(String),
 	}
 
@@ -20015,6 +20066,7 @@ mod adr538_timing_atlas_runner {
 		clock_ms: f64,
 		execute_ms: f64,
 		reduce_ms: f64,
+		cleanup_ms: f64,
 		setup_ms: f64,
 		teardown_ms: f64,
 	}
@@ -20026,6 +20078,7 @@ mod adr538_timing_atlas_runner {
 				clock_ms: 0.0,
 				execute_ms,
 				reduce_ms,
+				cleanup_ms: 40.0,
 				setup_ms: 500.0,
 				teardown_ms: 300.0,
 			}
@@ -20060,6 +20113,13 @@ mod adr538_timing_atlas_runner {
 			Ok(TimingAtlasReduction {
 				identity_matches: true,
 			})
+		}
+
+		async fn cleanup_child(&mut self, plan: &TimingAtlasChildPlan) -> Result<(), String> {
+			self.events
+				.push(Event::Cleanup(plan.arm.label().to_string()));
+			self.clock_ms += self.cleanup_ms;
+			Ok(())
 		}
 
 		async fn teardown_cell(&mut self, query: &str) -> Result<(), String> {
@@ -20386,5 +20446,67 @@ mod adr538_timing_atlas_real_harness {
 			"workers built by setup_cell must be reused by every child"
 		);
 		assert!(cell.setup_ms > 0.0 && cell.teardown_ms > 0.0);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_reclamation {
+	use super::*;
+
+	/// Fresh query ids stop collisions; they do not prove the store gave the memory back.
+	/// With workers resident across sixteen children, an accumulating store would raise
+	/// memory pressure as a cell progresses — drift correlated with pair index, which the
+	/// paired design cannot subtract because it is not machine noise.
+	/// Deep binds need an explicit stack; run on a dedicated 64 MB thread.
+	#[test]
+	fn resident_partition_store_returns_to_baseline_between_children() {
+		let observations = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(2)
+					.enable_all()
+					.build()
+					.expect("runtime");
+				runtime.block_on(async {
+					let mut harness = CensusTimingAtlasHarness::prepare(
+						"q06",
+						"strict",
+						0.01,
+						Path::new("unused"),
+					)
+					.await
+					.expect("prepare q06");
+					harness.setup_cell("q06").await.expect("setup");
+
+					let baseline = harness.resident_partition_bytes();
+					let plan = timing_atlas_cell_plan("q06");
+					let mut after_each = Vec::new();
+					for child_plan in plan.iter().take(4) {
+						let execution = harness.execute_child(child_plan).await.expect("child");
+						harness
+							.reduce_child(child_plan, &execution)
+							.await
+							.expect("reduce");
+						harness.cleanup_child(child_plan).await.expect("cleanup");
+						after_each.push(harness.resident_partition_bytes());
+					}
+					harness.teardown_cell("q06").await.expect("teardown");
+					(baseline, after_each)
+				})
+			})
+			.expect("spawn")
+			.join()
+			.expect("join");
+
+		let (baseline, after_each) = observations;
+		for (index, retained) in after_each.iter().enumerate() {
+			assert_eq!(
+				*retained, baseline,
+				"child {index} left {retained} retained bytes against a {baseline} baseline; \
+				 a resident store must return to baseline before the next child or later \
+				 pairs measure a different machine"
+			);
+		}
 	}
 }
