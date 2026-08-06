@@ -16,6 +16,8 @@ use crate::gui::{
 	messages::{ExportFormat, Message},
 	pane_grid::{self, Axis, PaneId, State as PaneState},
 };
+#[cfg(feature = "toron")]
+use crate::plot::chrome::PlotChrome;
 use crate::plot::composition::PlotComposition;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 #[cfg(feature = "toron")]
@@ -27,7 +29,7 @@ use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
 use crate::plot::spec::AuthoredPlotSpec;
 #[cfg(feature = "toron")]
-use crate::plot::spec::{CategoricalPaletteSelection, ColorIdentity, LayeredPlotSpec};
+use crate::plot::spec::{CategoricalPaletteSelection, ColorIdentity, LayeredPlotSpec, Override};
 #[cfg(feature = "toron")]
 use crate::plot::theme::{PlotSettings, PlotSettingsLayer};
 use crate::result_registry::{ResultRegistry, parse_result_annotation};
@@ -802,6 +804,22 @@ fn resolved_rune_categorical_selection(
 }
 
 #[cfg(feature = "toron")]
+fn resolve_rune_plot_skin(
+	mut authored_settings: PlotSettingsLayer,
+) -> std::result::Result<PlotSettingsLayer, String> {
+	let settings = PlotSettings {
+		authored_spec: authored_settings.clone(),
+		..PlotSettings::default()
+	};
+	if let Some(identity) = settings.resolve_plot_skin_identity() {
+		authored_settings.chrome = Override::Set(
+			PlotChrome::from_theme_name(identity.as_str()).map_err(|error| error.to_string())?,
+		);
+	}
+	Ok(authored_settings)
+}
+
+#[cfg(feature = "toron")]
 fn prepare_rune_categorical_palettes(
 	app_state: &AppState,
 	source_buffer: BufferId,
@@ -950,7 +968,19 @@ fn rune_view_outcome_with_palettes(
 						.map(RuneRelationSinkOutput::Table)
 				}
 				RuneViewIntent::Plot(plot) => {
-					let authored_settings = plot.authored_settings;
+					let plot_skin_span = plot.plot_skin_span.clone();
+					let authored_settings = match resolve_rune_plot_skin(plot.authored_settings) {
+						Ok(settings) => settings,
+						Err(error) => {
+							return RuneRelationSinkOutcome {
+								identity,
+								presentation,
+								span: plot_skin_span.unwrap_or(view.span),
+								source: std::sync::Arc::clone(&result),
+								output: Err(error),
+							};
+						}
+					};
 					let prepared = palettes.remove(&identity).unwrap_or_else(|| {
 						PreparedRuneCategoricalPalette::Failed(
 							"plot destination has no prepared categorical palette".to_owned(),
@@ -5599,6 +5629,182 @@ workspace.table("bad").views([view("bad", table())]);
 			assert!(error.contains(&format!("palette `{palette}` limit {palette_limit}")));
 		}
 
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0032_skin_and_palette_are_disjoint_completed_siblings() {
+		fn completed(
+			skin: Option<&str>,
+			palette: &str,
+		) -> (crate::plot::request::ResolvedPlot, ResolvedPlotSettings) {
+			let skin = skin
+				.map(|name| format!("skin(\"{name}\"), "))
+				.unwrap_or_default();
+			let source = format!(
+				"workspace.table(\"t\").views([figure([{skin}palette(\"{palette}\"), bar(\"cat\", \"val\")])])"
+			);
+			let relation = transform_rune_view(&source)
+				.unwrap()
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome =
+				rune_view_outcome(categorical_bar_frame(&["A", "B", "C"]), relation.views);
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, authored, _)) =
+				&outcome.sinks[0].output
+			else {
+				panic!("expected completed plot")
+			};
+			let settings = crate::plot::theme::PlotSettings {
+				authored_spec: authored.clone(),
+				..crate::plot::theme::PlotSettings::default()
+			}
+			.resolve();
+			(resolved.clone(), settings)
+		}
+
+		let (reversed, reversed_settings) = completed(Some("viridis_r"), "viridis_r");
+		let (shifted, shifted_settings) = completed(Some("viridis_s5"), "viridis_s5");
+		let reversed_bands = band_mapping(&reversed);
+		let shifted_bands = band_mapping(&shifted);
+		assert_eq!(
+			reversed_bands
+				.iter()
+				.map(|(category, position, _)| (category, position))
+				.collect::<Vec<_>>(),
+			shifted_bands
+				.iter()
+				.map(|(category, position, _)| (category, position))
+				.collect::<Vec<_>>()
+		);
+		assert_ne!(
+			reversed_bands, shifted_bands,
+			"ordered data swatches recolor"
+		);
+		assert_eq!(
+			reversed_settings.chrome, shifted_settings.chrome,
+			"set-projected chrome consumes the unchanged pair"
+		);
+		assert_eq!(reversed_settings.mark_decoration_color, iced::Color::WHITE);
+		assert_eq!(shifted_settings.mark_decoration_color, iced::Color::WHITE);
+
+		let (_, nord_tab20c) = completed(Some("nord"), "tab20c");
+		let (yellows, nord_yellows) = completed(Some("nord"), "yellows");
+		assert_eq!(nord_tab20c.chrome, nord_yellows.chrome);
+		assert_eq!(
+			band_mapping(&yellows)
+				.into_iter()
+				.map(|(_, _, color)| color)
+				.collect::<Vec<_>>(),
+			[(252, 252, 204), (247, 210, 48), (153, 102, 0)],
+			"awkward data colors are accepted without a chrome/data contrast gate"
+		);
+
+		let (_, omitted) = completed(None, "tab20c");
+		assert_eq!(omitted.chrome, crate::plot::chrome::PlotChrome::DEFAULT);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0032_skin_failures_are_destination_local() {
+		let source = r#"workspace.table("t").views([
+			view("bad", figure([skin("not-a-theme"), line("x", "y")])),
+			view("good", figure([skin("nord"), line("x", "y")]))
+		])"#;
+		let relation = transform_rune_view(source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [1_i64, 2], "y" => [2_i64, 4]).unwrap(),
+			relation.views,
+		);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("invalid skin must fail its destination")
+		};
+		assert!(error.contains("unknown plot skin"));
+		let span = &outcome.sinks[0].span;
+		assert_eq!(
+			&source[span.start as usize..span.end as usize],
+			"skin(\"not-a-theme\")"
+		);
+		assert!(outcome.sinks[1].output.is_ok());
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0032_skin_lifecycle_reuses_and_atomically_stales_one_host_panel() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = BufferId::new(1032);
+		let identity = LocalViewIdentity::Named("plot".to_owned());
+		let source = |skin: Option<&str>| {
+			let skin = skin
+				.map(|name| format!("skin(\"{name}\"), "))
+				.unwrap_or_default();
+			format!(
+				"workspace.table(\"t\").views([view(\"plot\", figure([{skin}line(\"x\", \"y\")]))])"
+			)
+		};
+		let frame = || polars::df!("x" => [1_i64, 2], "y" => [2_i64, 4]).unwrap();
+
+		run_one_relation_program(&mut state, source_buffer, 1, &source(Some("nord")), frame());
+		let panel = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &identity)
+			.unwrap();
+		let nord_svg = state
+			.code_editor
+			.rune_view_panel_plot_svg(source_buffer, &identity)
+			.unwrap();
+
+		let failed = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			2,
+			&source(Some("not-a-theme")),
+			frame(),
+		);
+		assert!(failed.is_empty());
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_plot_svg(source_buffer, &identity)
+				.unwrap(),
+			nord_svg,
+			"failed projection retains content and chrome as one stale pair"
+		);
+
+		run_one_relation_program(
+			&mut state,
+			source_buffer,
+			3,
+			&source(Some("viridis")),
+			frame(),
+		);
+		let viridis_svg = state
+			.code_editor
+			.rune_view_panel_plot_svg(source_buffer, &identity)
+			.unwrap();
+		assert_ne!(viridis_svg, nord_svg);
+
+		run_one_relation_program(&mut state, source_buffer, 4, &source(None), frame());
+		let default_svg = state
+			.code_editor
+			.rune_view_panel_plot_svg(source_buffer, &identity)
+			.unwrap();
+		assert_ne!(default_svg, viridis_svg);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity),
+			Some(panel)
+		);
 		assert!(state.dashboard.panes.is_none());
 		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();

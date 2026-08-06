@@ -50,10 +50,17 @@ pub(crate) struct RuneTableSink {
 	pub(crate) skin: RuneTableSkinIntent,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) struct RunePlotIntent {
 	pub(crate) body: RunePlotBody,
 	pub(crate) authored_settings: PlotSettingsLayer,
+	pub(crate) plot_skin_span: Option<Range<u32>>,
+}
+
+impl PartialEq for RunePlotIntent {
+	fn eq(&self, other: &Self) -> bool {
+		self.body == other.body && self.authored_settings == other.authored_settings
+	}
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -88,6 +95,7 @@ impl RunePlotIntent {
 		Self {
 			body,
 			authored_settings: PlotSettingsLayer::default(),
+			plot_skin_span: None,
 		}
 	}
 }
@@ -1150,6 +1158,7 @@ fn parse_figure(
 	};
 	let mut title = None;
 	let mut subtitle = None;
+	let mut skin = None;
 	let mut palette = None;
 	let mut body = None;
 	for (item, _) in list.items.iter() {
@@ -1157,7 +1166,7 @@ fn parse_figure(
 			return invalid_view(
 				item.span(),
 				source.len(),
-				"a figure child must be title(...), subtitle(...), palette(...), or one plot body",
+				"a figure child must be title(...), subtitle(...), skin(...), palette(...), or one plot body",
 			);
 		};
 		let callee = source_slice(source, call.expr.span())?.trim();
@@ -1182,6 +1191,19 @@ fn parse_figure(
 					);
 				}
 				subtitle = Some(parse_figure_heading(item, &child_args, source, "subtitle")?);
+			}
+			"skin" => {
+				if skin.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one plot skin",
+					);
+				}
+				skin = Some((
+					parse_figure_heading(item, &child_args, source, "skin")?,
+					u32_range(&byte_range(item.span(), source.len())?, "plot skin")?,
+				));
 			}
 			"palette" => {
 				if palette.is_some() {
@@ -1219,12 +1241,17 @@ fn parse_figure(
 	if let Some(subtitle) = subtitle {
 		authored_settings.subtitle = Presence::Show(Arc::new(subtitle));
 	}
+	let plot_skin_span = skin.as_ref().map(|(_, span)| span.clone());
+	if let Some((skin, _)) = skin {
+		authored_settings.plot_skin = Override::Set(Arc::new(skin));
+	}
 	if let Some(palette) = palette {
 		authored_settings.categorical_palette = Override::Set(Arc::new(palette));
 	}
 	Ok(RunePlotIntent {
 		body,
 		authored_settings,
+		plot_skin_span,
 	})
 }
 
@@ -3138,6 +3165,88 @@ workspace.table("t").views([table()])
 			transform(ordinary).expect("palette stays ordinary Rune outside a figure sink");
 		assert!(retained.source.contains("palette(\"tab20c\");"));
 		assert!(retained.source.contains("palette(\"ordinary\")"));
+		assert_eq!(retained.views.len(), 1);
+	}
+
+	#[test]
+	fn product_0032_skin_is_unordered_direct_figure_metadata() {
+		let only_plot = |source: &str| {
+			transform(source)
+				.expect("plot skin figure")
+				.into_relations()
+				.next()
+				.unwrap()
+				.views
+				.into_iter()
+				.next()
+				.unwrap()
+		};
+		let first = only_plot(
+			r#"workspace.table("t").views([view("bars", figure([
+				skin("nord"), palette("tab20c"), title("Categories"), bar("cat", "val")
+			]))])"#,
+		);
+		let reordered = only_plot(
+			r#"workspace.table("t").views([view("bars", figure([
+				bar("cat", "val"), title("Categories"), palette("tab20c"), skin("nord")
+			]))])"#,
+		);
+		assert_eq!(first.identity, reordered.identity);
+		assert_eq!(first.intent, reordered.intent);
+		let RuneViewIntent::Plot(plot) = first.intent else {
+			panic!("figure plot")
+		};
+		assert_eq!(
+			plot.authored_settings.plot_skin,
+			Override::Set(Arc::new("nord".to_owned()))
+		);
+		assert_eq!(plot.authored_settings.chrome, Override::Inherit);
+	}
+
+	#[test]
+	fn product_0032_skin_refusals_are_contextual_and_attributed() {
+		for (source, rejected) in [
+			(
+				"workspace.table(\"t\").views([figure([skin(\"nord\"), skin(\"viridis\"), bar(\"cat\", \"val\")])])",
+				"skin(\"viridis\")",
+			),
+			(
+				"workspace.table(\"t\").views([figure([skin(), bar(\"cat\", \"val\")])])",
+				"skin()",
+			),
+			(
+				"workspace.table(\"t\").views([figure([skin(\"a\", \"b\"), bar(\"cat\", \"val\")])])",
+				"skin(\"a\", \"b\")",
+			),
+			(
+				"let s = \"nord\"; workspace.table(\"t\").views([figure([skin(s), bar(\"cat\", \"val\")])])",
+				"s",
+			),
+			(
+				"workspace.table(\"t\").views([figure([layers([skin(\"nord\"), line(\"x\", \"y\")])])])",
+				"skin(\"nord\")",
+			),
+			(
+				"workspace.table(\"t\").views([bar(\"cat\", \"val\").skin(\"nord\")])",
+				"bar(\"cat\", \"val\").skin(\"nord\")",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(source).expect_err("invalid plot skin position")
+			else {
+				panic!("attributed refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+		}
+
+		let ordinary = r#"
+			skin("nord");
+			let held = skin("viridis");
+			figure([skin("ordinary"), bar("cat", "val")]);
+			workspace.table("t").views([table().skin("nord")])
+		"#;
+		let retained = transform(ordinary).expect("skin remains contextual");
+		assert!(retained.source.contains("skin(\"nord\");"));
 		assert_eq!(retained.views.len(), 1);
 	}
 

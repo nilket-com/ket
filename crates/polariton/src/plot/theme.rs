@@ -161,6 +161,10 @@ pub struct ScatterPolicy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotSettingsLayer {
 	pub theme: Override<PlotThemeSpec>,
+	/// Authored figure identity; the renderer never resolves this string.
+	pub plot_skin: Override<Arc<String>>,
+	/// Prepared complete chrome, populated only after fallible identity resolution.
+	pub chrome: Override<PlotChrome>,
 	/// Figure-wide categorical palette identity. Resolution remains libaryon-owned;
 	/// this settings layer carries only authored/application/pane intent.
 	pub categorical_palette: Override<Arc<String>>,
@@ -182,6 +186,8 @@ impl Default for PlotSettingsLayer {
 	fn default() -> Self {
 		Self {
 			theme: Override::Inherit,
+			plot_skin: Override::Inherit,
+			chrome: Override::Inherit,
 			categorical_palette: Override::Inherit,
 			typography: Override::Inherit,
 			padding: Override::Inherit,
@@ -230,6 +236,20 @@ impl PlotSettings {
 		identity
 	}
 
+	pub fn resolve_plot_skin_identity(&self) -> Option<Arc<String>> {
+		let mut identity = None;
+		for layer in [
+			&self.application_theme,
+			&self.authored_spec,
+			&self.pane_override,
+		] {
+			if let Override::Set(value) = &layer.plot_skin {
+				identity = Some(Arc::clone(value));
+			}
+		}
+		identity
+	}
+
 	/// Preserve an already-resolved legacy/editor setting as the library base.
 	/// All later tiers are empty, so resolving is byte-for-byte stable.
 	pub fn from_resolved(library_defaults: ResolvedPlotSettings) -> Self {
@@ -273,6 +293,9 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 		settings.mark_decoration_color = decoration;
 		settings.surrounding_background_color = background;
 		settings.surrounding_decoration_color = decoration;
+	}
+	if let Override::Set(chrome) = layer.chrome {
+		settings.chrome = chrome;
 	}
 	if let Override::Set(value) = &layer.typography {
 		settings.title_size = value.title_size;
@@ -475,6 +498,38 @@ mod tests {
 			cascade.resolve_categorical_palette_identity().as_str(),
 			"pane"
 		);
+	}
+
+	#[test]
+	fn product_0032_plot_skin_identity_and_prepared_chrome_follow_the_cascade() {
+		let identity = |value: &str| Override::Set(Arc::new(value.to_owned()));
+		let mut cascade = PlotSettings::default();
+		assert!(cascade.resolve_plot_skin_identity().is_none());
+		assert_eq!(cascade.resolve().chrome, PlotChrome::DEFAULT);
+
+		cascade.application_theme.plot_skin = identity("application");
+		cascade.authored_spec.plot_skin = identity("authored");
+		cascade.layer.plot_skin = identity("wrong-layer");
+		assert_eq!(
+			cascade.resolve_plot_skin_identity().unwrap().as_str(),
+			"authored"
+		);
+
+		let nord = PlotChrome::from_theme_name("nord").unwrap();
+		cascade.authored_spec.chrome = Override::Set(nord);
+		let resolved = cascade.resolve();
+		assert_eq!(resolved.chrome, nord);
+		assert_eq!(resolved.mark_decoration_color, Color::WHITE);
+		assert_eq!(resolved.surrounding_decoration_color, Color::WHITE);
+
+		let viridis = PlotChrome::from_theme_name("viridis").unwrap();
+		cascade.pane_override.plot_skin = identity("pane");
+		cascade.pane_override.chrome = Override::Set(viridis);
+		assert_eq!(
+			cascade.resolve_plot_skin_identity().unwrap().as_str(),
+			"pane"
+		);
+		assert_eq!(cascade.resolve().chrome, viridis);
 	}
 
 	#[test]

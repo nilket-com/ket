@@ -1204,21 +1204,10 @@ fn product_0031_plot_chrome_is_closed_and_mark_ink_stays_separate() {
 			"{relative} mark drawing acquired plot chrome"
 		);
 	}
-
-	let envelope =
-		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
-	let figure_parser = envelope
-		.split("fn parse_figure(")
-		.nth(1)
-		.expect("figure parser")
-		.split("fn parse_figure_heading(")
-		.next()
-		.expect("bounded figure parser");
-	assert!(!figure_parser.contains("\"skin\" =>"));
 }
 
 #[test]
-fn product_0032_banks_the_absent_plot_skin_surface() {
+fn product_0032_plot_skin_surface_is_bounded_and_renderer_free() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
 	let layer = theme
@@ -1228,16 +1217,19 @@ fn product_0032_banks_the_absent_plot_skin_surface() {
 		.split('}')
 		.next()
 		.expect("settings fields");
-	assert!(!layer.contains("plot_skin"));
-	assert!(!layer.contains("chrome: Override<PlotChrome>"));
+	assert!(layer.contains("plot_skin: Override<Arc<String>>"));
+	assert!(layer.contains("chrome: Override<PlotChrome>"));
 
 	let chrome = std::fs::read_to_string(root.join("plot/chrome.rs")).expect("read chrome");
 	let production = chrome
 		.split("#[cfg(test)]")
 		.next()
 		.expect("chrome production");
-	assert!(!production.contains("from_theme_name"));
-	assert!(!production.contains("Theme::try_new"));
+	assert_eq!(production.matches("from_theme_name").count(), 1);
+	assert_eq!(production.matches("Theme::try_new").count(), 1);
+	assert!(!production.contains("TableSkin"));
+	assert!(!production.contains("UiPalette"));
+	assert!(!production.contains("Projection::"));
 
 	let envelope =
 		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
@@ -1248,5 +1240,19 @@ fn product_0032_banks_the_absent_plot_skin_surface() {
 		.split("fn parse_figure_heading(")
 		.next()
 		.expect("bounded parser");
-	assert!(!figure_parser.contains("\"skin\" =>"));
+	assert_eq!(figure_parser.matches("\"skin\" =>").count(), 1);
+	assert!(figure_parser.contains("authored_settings.plot_skin"));
+
+	for relative in ["plot/spec/mod.rs", "plot/factory.rs"] {
+		let source = std::fs::read_to_string(root.join(relative)).expect("read plot boundary");
+		let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+		assert!(
+			!production.contains("plot_skin"),
+			"{relative} acquired skin identity"
+		);
+		assert!(
+			!production.contains("PlotChrome::from_theme_name"),
+			"{relative} resolves names below the completion head"
+		);
+	}
 }

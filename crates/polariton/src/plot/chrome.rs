@@ -2,10 +2,12 @@
 //!
 //! Data colors and mark compatibility ink deliberately live elsewhere.
 
-#![allow(dead_code)] // The renderer migration is the next PRODUCT-0031 commit.
+#![allow(dead_code)] // Public substrate lives in the application binary crate.
 
 use iced::Color;
-use libaryon::core::Srgb;
+use libaryon::core::{Rgb, Srgb};
+use libaryon::engine::{ResolvedThemePair, Theme};
+use std::fmt;
 
 pub const TEXT_CONTRAST_MINIMUM: f64 = 4.5;
 pub const NON_TEXT_CONTRAST_MINIMUM: f64 = 3.0;
@@ -76,6 +78,14 @@ impl PlotRgba {
 	pub(crate) fn from_iced(color: Color) -> Self {
 		Self::new(color.r, color.g, color.b, color.a).expect("Iced colors are normalized")
 	}
+
+	const fn opaque_rgb(color: Rgb) -> Self {
+		Self::opaque(
+			color.r as f32 / 255.0,
+			color.g as f32 / 255.0,
+			color.b as f32 / 255.0,
+		)
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -139,6 +149,22 @@ impl PlotChrome {
 		}
 	}
 
+	pub fn from_theme_name(name: &str) -> Result<Self, PlotChromeProjectionError> {
+		let theme = Theme::try_new(name).map_err(|_| PlotChromeProjectionError::UnknownTheme {
+			name: name.to_owned(),
+		})?;
+		let anchors = PlotChromeAnchors::from(theme.palette().most_contrasting_pair());
+		project_anchors(anchors).map_err(|weakest| PlotChromeProjectionError::UnsuitableTheme {
+			name: name.to_owned(),
+			darker_index: anchors.darker_index,
+			darker: anchors.darker,
+			lighter_index: anchors.lighter_index,
+			lighter: anchors.lighter,
+			anchor_ratio: anchors.contrast_ratio,
+			weakest,
+		})
+	}
+
 	pub fn visible_contrast_checks(self) -> [PlotChromeContrast; 8] {
 		let canvas = visible_srgb(self.canvas_background);
 		let legend = composite_over(self.legend_background, canvas);
@@ -199,6 +225,162 @@ impl PlotChrome {
 			.all(PlotChromeContrast::passes)
 	}
 }
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct PlotChromeAnchors {
+	darker_index: usize,
+	darker: Rgb,
+	lighter_index: usize,
+	lighter: Rgb,
+	contrast_ratio: f64,
+}
+
+impl From<ResolvedThemePair> for PlotChromeAnchors {
+	fn from(pair: ResolvedThemePair) -> Self {
+		Self {
+			darker_index: pair.darker_index(),
+			darker: pair.darker(),
+			lighter_index: pair.lighter_index(),
+			lighter: pair.lighter(),
+			contrast_ratio: pair.contrast_ratio(),
+		}
+	}
+}
+
+fn project_anchors(anchors: PlotChromeAnchors) -> Result<PlotChrome, PlotChromeContrast> {
+	let paper = PlotRgba::opaque_rgb(anchors.darker);
+	let ink = PlotRgba::opaque_rgb(anchors.lighter);
+	let mut chrome = PlotChrome {
+		canvas_background: paper,
+		title_text: ink,
+		subtitle_text: ink,
+		axis_label_text: ink,
+		tick_label_text: ink,
+		axis_line: ink,
+		gridline: ink,
+		legend_background: paper,
+		legend_text: ink,
+		legend_swatch_fill: ink,
+		legend_swatch_border: ink,
+	};
+
+	// Choose the quietest admitted alpha. The finite list is policy, not a
+	// palette sampler, and validation below remains the final authority.
+	for alpha in [0.35, 0.4, 0.5, 0.6, 0.75, 1.0] {
+		chrome.gridline.alpha = alpha;
+		if chrome
+			.visible_contrast_checks()
+			.into_iter()
+			.find(|check| check.role() == "gridline")
+			.expect("gridline assay")
+			.passes()
+		{
+			break;
+		}
+	}
+	chrome.legend_swatch_fill.alpha = chrome.gridline.alpha;
+	if chrome.passes_contrast() {
+		Ok(chrome)
+	} else {
+		Err(chrome.weakest_contrast())
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum PlotChromeProjectionError {
+	UnknownTheme {
+		name: String,
+	},
+	UnsuitableTheme {
+		name: String,
+		darker_index: usize,
+		darker: Rgb,
+		lighter_index: usize,
+		lighter: Rgb,
+		anchor_ratio: f64,
+		weakest: PlotChromeContrast,
+	},
+}
+
+impl PlotChromeProjectionError {
+	pub fn name(&self) -> &str {
+		match self {
+			Self::UnknownTheme { name } | Self::UnsuitableTheme { name, .. } => name,
+		}
+	}
+
+	pub const fn darker_index(&self) -> Option<usize> {
+		match self {
+			Self::UnknownTheme { .. } => None,
+			Self::UnsuitableTheme { darker_index, .. } => Some(*darker_index),
+		}
+	}
+
+	pub const fn lighter_index(&self) -> Option<usize> {
+		match self {
+			Self::UnknownTheme { .. } => None,
+			Self::UnsuitableTheme { lighter_index, .. } => Some(*lighter_index),
+		}
+	}
+
+	pub const fn darker(&self) -> Option<Rgb> {
+		match self {
+			Self::UnknownTheme { .. } => None,
+			Self::UnsuitableTheme { darker, .. } => Some(*darker),
+		}
+	}
+
+	pub const fn lighter(&self) -> Option<Rgb> {
+		match self {
+			Self::UnknownTheme { .. } => None,
+			Self::UnsuitableTheme { lighter, .. } => Some(*lighter),
+		}
+	}
+
+	pub const fn anchor_ratio(&self) -> Option<f64> {
+		match self {
+			Self::UnknownTheme { .. } => None,
+			Self::UnsuitableTheme { anchor_ratio, .. } => Some(*anchor_ratio),
+		}
+	}
+
+	pub const fn weakest(&self) -> Option<PlotChromeContrast> {
+		match self {
+			Self::UnknownTheme { .. } => None,
+			Self::UnsuitableTheme { weakest, .. } => Some(*weakest),
+		}
+	}
+}
+
+impl fmt::Display for PlotChromeProjectionError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::UnknownTheme { name } => write!(formatter, "unknown plot skin theme `{name}`"),
+			Self::UnsuitableTheme {
+				name,
+				darker_index,
+				darker,
+				lighter_index,
+				lighter,
+				anchor_ratio,
+				weakest,
+			} => write!(
+				formatter,
+				"plot skin `{name}` is unsuitable: anchors #{} {:?} and #{} {:?} have {:.3}:1 contrast; weakest {} is {:.3}:1, below {:.1}:1",
+				darker_index,
+				darker,
+				lighter_index,
+				lighter,
+				anchor_ratio,
+				weakest.role(),
+				weakest.ratio(),
+				weakest.minimum(),
+			),
+		}
+	}
+}
+
+impl std::error::Error for PlotChromeProjectionError {}
 
 impl Default for PlotChrome {
 	fn default() -> Self {
@@ -332,5 +514,83 @@ mod tests {
 			PlotRgba::translucent(1.0, 1.0, 1.0, 0.5)
 		);
 		assert_eq!(chrome.legend_swatch_border, ink);
+	}
+
+	#[test]
+	fn product_0032_nord_is_complete_and_validated() {
+		let chrome = PlotChrome::from_theme_name("nord").expect("Nord plot skin");
+		assert!(chrome.passes_contrast());
+		assert_eq!(chrome.visible_contrast_checks().len(), 8);
+		assert_eq!(chrome.canvas_background, chrome.legend_background);
+		assert_eq!(chrome.title_text, chrome.legend_swatch_border);
+		assert!(chrome.gridline.alpha() >= 0.35);
+		assert!(chrome.gridline.alpha() <= 1.0);
+	}
+
+	#[test]
+	fn product_0032_unknown_and_low_range_fail_with_distinct_facts() {
+		let unknown = PlotChrome::from_theme_name("not-a-theme").unwrap_err();
+		assert!(matches!(
+			unknown,
+			PlotChromeProjectionError::UnknownTheme { .. }
+		));
+		assert_eq!(unknown.name(), "not-a-theme");
+		assert!(unknown.weakest().is_none());
+
+		let anchors = PlotChromeAnchors {
+			darker_index: 3,
+			darker: Rgb::new(100, 100, 100),
+			lighter_index: 17,
+			lighter: Rgb::new(120, 120, 120),
+			contrast_ratio: Rgb::new(100, 100, 100).contrast_ratio(Rgb::new(120, 120, 120)),
+		};
+		let weakest = project_anchors(anchors).unwrap_err();
+		let error = PlotChromeProjectionError::UnsuitableTheme {
+			name: "synthetic-low-range".to_owned(),
+			darker_index: anchors.darker_index,
+			darker: anchors.darker,
+			lighter_index: anchors.lighter_index,
+			lighter: anchors.lighter,
+			anchor_ratio: anchors.contrast_ratio,
+			weakest,
+		};
+		assert_eq!(error.darker_index(), Some(3));
+		assert_eq!(error.lighter_index(), Some(17));
+		assert_eq!(error.darker(), Some(Rgb::new(100, 100, 100)));
+		assert_eq!(error.lighter(), Some(Rgb::new(120, 120, 120)));
+		assert!(error.anchor_ratio().unwrap() < 4.5);
+		assert_eq!(error.weakest().unwrap().minimum(), 4.5);
+		assert!(error.to_string().contains("synthetic-low-range"));
+	}
+
+	#[test]
+	fn product_0032_set_preserving_modifiers_collapse_intentionally() {
+		let reversed = PlotChrome::from_theme_name("viridis_r").unwrap();
+		let shifted = PlotChrome::from_theme_name("viridis_s5").unwrap();
+		assert_eq!(reversed, shifted);
+		assert_ne!(
+			Theme::try_new("viridis_r").unwrap().palette().colors(),
+			Theme::try_new("viridis_s5").unwrap().palette().colors()
+		);
+	}
+
+	#[test]
+	fn product_0032_theme_grammar_census_never_falls_back_or_skips_validation() {
+		for spec in libaryon::engine::THEME_SPECS {
+			for base in std::iter::once(spec.name).chain(spec.aliases.iter().copied()) {
+				let expressions = std::iter::once(base.to_owned())
+					.chain(["r", "c", "C"].map(|suffix| format!("{base}_{suffix}")))
+					.chain((0..20).map(|shift| format!("{base}_s{shift}")));
+				for expression in expressions {
+					match PlotChrome::from_theme_name(&expression) {
+						Ok(chrome) => assert!(chrome.passes_contrast(), "{expression}"),
+						Err(PlotChromeProjectionError::UnsuitableTheme { weakest, .. }) => {
+							assert!(!weakest.passes(), "{expression}")
+						}
+						Err(error) => panic!("accepted theme grammar failed as unknown: {error}"),
+					}
+				}
+			}
+		}
 	}
 }
