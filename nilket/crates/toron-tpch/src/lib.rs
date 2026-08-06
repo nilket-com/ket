@@ -5165,6 +5165,194 @@ pub fn timing_atlas_artifact_is_authoritative(
 		&& conditions.granted()
 }
 
+/// What one child execution yields. Produced inside the timed region; everything derived
+/// from it is produced outside.
+#[derive(Debug, Clone)]
+pub struct TimingAtlasExecution {
+	pub row_count: usize,
+}
+
+/// Facts derived after the elapsed boundary: digesting, identity comparison and receipt
+/// reduction. None of this may contribute to `query_elapsed_ms`.
+#[derive(Debug, Clone)]
+pub struct TimingAtlasReduction {
+	pub identity_matches: bool,
+}
+
+/// The seam the atlas runner drives. Injecting it lets the worker scope and the timer
+/// placement be observed deterministically — the pre-built plan prevents child reordering,
+/// but cannot prove the caller constructs workers once per cell or times only execution.
+pub trait TimingAtlasHarness {
+	/// Construct workers and coordinator for a cell. Exactly once per cell, before warmups.
+	fn setup_cell(&mut self, query: &str) -> Result<(), String>;
+	/// Execute one child. This call alone is inside the elapsed boundary.
+	fn execute_child(
+		&mut self,
+		plan: &TimingAtlasChildPlan,
+	) -> Result<TimingAtlasExecution, String>;
+	/// Digest, compare identity and reduce receipts. Always after the elapsed boundary.
+	fn reduce_child(
+		&mut self,
+		plan: &TimingAtlasChildPlan,
+		execution: &TimingAtlasExecution,
+	) -> Result<TimingAtlasReduction, String>;
+	/// Tear down workers. Exactly once per cell, after the last measured child.
+	fn teardown_cell(&mut self, query: &str) -> Result<(), String>;
+	/// Elapsed source, in milliseconds.
+	fn now_ms(&mut self) -> f64;
+}
+
+/// Drive one cell: setup once, both warmups, seven pairs, teardown once. Setup, teardown
+/// and reduction are recorded but never enter `query_elapsed_ms`.
+pub fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
+	harness: &mut H,
+	query: &str,
+) -> TimingAtlasCellOutcome {
+	let mut outcome = TimingAtlasCellOutcome {
+		query: query.to_string(),
+		setup_ms: 0.0,
+		teardown_ms: 0.0,
+		verification_ms: 0.0,
+		warmups: Vec::new(),
+		pairs: Vec::new(),
+		invalid_attempts: Vec::new(),
+		failure: None,
+	};
+
+	let setup_start = harness.now_ms();
+	if let Err(error) = harness.setup_cell(query) {
+		outcome.failure = Some(format!("setup: {error}"));
+		return outcome;
+	}
+	outcome.setup_ms = harness.now_ms() - setup_start;
+
+	let plan = timing_atlas_cell_plan(query);
+	let mut pending: Vec<TimingAtlasChild> = Vec::new();
+	for child_plan in &plan {
+		let child = run_timing_atlas_child(harness, query, child_plan, &mut outcome);
+		match child_plan.role {
+			TimingAtlasChildRole::Warmup => outcome.warmups.push(child),
+			TimingAtlasChildRole::Measured { pair_index, .. } => {
+				if !child.valid || child.identity_matches == Some(false) {
+					outcome.failure.get_or_insert_with(|| {
+						child
+							.failure
+							.clone()
+							.unwrap_or_else(|| "identity mismatch".to_string())
+					});
+					outcome.invalid_attempts.push(child);
+					break;
+				}
+				pending.push(child);
+				if pending.len() == 2 {
+					let second = pending.pop().expect("second child");
+					let first = pending.pop().expect("first child");
+					outcome
+						.pairs
+						.push(assemble_timing_atlas_pair(pair_index, first, second));
+				}
+			}
+		}
+	}
+
+	let teardown_start = harness.now_ms();
+	if let Err(error) = harness.teardown_cell(query) {
+		outcome
+			.failure
+			.get_or_insert_with(|| format!("teardown: {error}"));
+	}
+	outcome.teardown_ms = harness.now_ms() - teardown_start;
+	outcome
+}
+
+fn run_timing_atlas_child<H: TimingAtlasHarness>(
+	harness: &mut H,
+	query: &str,
+	child_plan: &TimingAtlasChildPlan,
+	outcome: &mut TimingAtlasCellOutcome,
+) -> TimingAtlasChild {
+	let (pair_index, position) = match child_plan.role {
+		TimingAtlasChildRole::Warmup => (None, 0),
+		TimingAtlasChildRole::Measured {
+			pair_index,
+			position,
+		} => (Some(pair_index), position),
+	};
+	let mut child = TimingAtlasChild {
+		query: query.to_string(),
+		arm: child_plan.arm.label(),
+		pair_index,
+		position_in_pair: position,
+		attempt: 1,
+		query_elapsed_ms: 0.0,
+		row_count: None,
+		identity_matches: None,
+		valid: false,
+		failure: None,
+		failure_is_io: false,
+	};
+
+	// The elapsed boundary encloses execution and nothing else.
+	let started = harness.now_ms();
+	let executed = harness.execute_child(child_plan);
+	child.query_elapsed_ms = harness.now_ms() - started;
+
+	let execution = match executed {
+		Ok(execution) => execution,
+		Err(error) => {
+			child.failure_is_io = timing_atlas_failure_is_io(&error);
+			child.failure = Some(error);
+			return child;
+		}
+	};
+	child.row_count = Some(execution.row_count);
+
+	// Digesting, identity and receipt reduction happen after the boundary.
+	let verification_start = harness.now_ms();
+	match harness.reduce_child(child_plan, &execution) {
+		Ok(reduction) => {
+			child.identity_matches = Some(reduction.identity_matches);
+			child.valid = reduction.identity_matches;
+			if !reduction.identity_matches {
+				child.failure = Some("identity mismatch".to_string());
+			}
+		}
+		Err(error) => {
+			child.failure_is_io = timing_atlas_failure_is_io(&error);
+			child.failure = Some(error);
+		}
+	}
+	outcome.verification_ms += harness.now_ms() - verification_start;
+	child
+}
+
+fn assemble_timing_atlas_pair(
+	pair_index: usize,
+	first: TimingAtlasChild,
+	second: TimingAtlasChild,
+) -> TimingAtlasPair {
+	let first_arm = first.arm;
+	let (local, distributed) = if first.arm == TimingArm::Local.label() {
+		(first, second)
+	} else {
+		(second, first)
+	};
+	let delta_ms = distributed.query_elapsed_ms - local.query_elapsed_ms;
+	let ratio = if local.query_elapsed_ms > 0.0 {
+		distributed.query_elapsed_ms / local.query_elapsed_ms
+	} else {
+		f64::INFINITY
+	};
+	TimingAtlasPair {
+		pair_index,
+		first_arm,
+		local,
+		distributed,
+		delta_ms,
+		ratio,
+	}
+}
+
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
 /// construction — a new `FragmentError` variant fails compilation here instead of falling
 /// through to an unrecognized bucket.
@@ -19431,5 +19619,160 @@ mod adr538_timing_atlas_execution {
 			vec![15.0],
 			"the delta reflects query elapsed only; persistent setup is not a per-query cost"
 		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_runner {
+	use super::*;
+
+	#[derive(Debug, Clone, PartialEq, Eq)]
+	enum Event {
+		Setup(String),
+		Execute(String),
+		Reduce(String),
+		Teardown(String),
+	}
+
+	/// Fake harness with an event log and a fake clock. Execution advances the clock by
+	/// `execute_ms`; reduction advances it by `reduce_ms`, which must never reach
+	/// `query_elapsed_ms`.
+	struct FakeHarness {
+		events: Vec<Event>,
+		clock_ms: f64,
+		execute_ms: f64,
+		reduce_ms: f64,
+		setup_ms: f64,
+		teardown_ms: f64,
+	}
+
+	impl FakeHarness {
+		fn new(execute_ms: f64, reduce_ms: f64) -> Self {
+			Self {
+				events: Vec::new(),
+				clock_ms: 0.0,
+				execute_ms,
+				reduce_ms,
+				setup_ms: 500.0,
+				teardown_ms: 300.0,
+			}
+		}
+	}
+
+	impl TimingAtlasHarness for FakeHarness {
+		fn setup_cell(&mut self, query: &str) -> Result<(), String> {
+			self.events.push(Event::Setup(query.to_string()));
+			self.clock_ms += self.setup_ms;
+			Ok(())
+		}
+
+		fn execute_child(
+			&mut self,
+			plan: &TimingAtlasChildPlan,
+		) -> Result<TimingAtlasExecution, String> {
+			self.events
+				.push(Event::Execute(plan.arm.label().to_string()));
+			self.clock_ms += self.execute_ms;
+			Ok(TimingAtlasExecution { row_count: 4 })
+		}
+
+		fn reduce_child(
+			&mut self,
+			plan: &TimingAtlasChildPlan,
+			_execution: &TimingAtlasExecution,
+		) -> Result<TimingAtlasReduction, String> {
+			self.events
+				.push(Event::Reduce(plan.arm.label().to_string()));
+			self.clock_ms += self.reduce_ms;
+			Ok(TimingAtlasReduction {
+				identity_matches: true,
+			})
+		}
+
+		fn teardown_cell(&mut self, query: &str) -> Result<(), String> {
+			self.events.push(Event::Teardown(query.to_string()));
+			self.clock_ms += self.teardown_ms;
+			Ok(())
+		}
+
+		fn now_ms(&mut self) -> f64 {
+			self.clock_ms
+		}
+	}
+
+	/// Workers are constructed exactly once per cell and stay resident: all sixteen
+	/// children execute between the single setup and the single teardown, including the
+	/// local arms, so alternating pairs see one host footprint.
+	#[test]
+	fn workers_start_once_per_cell_and_stay_resident_through_every_child() {
+		let mut harness = FakeHarness::new(10.0, 1_000.0);
+		let outcome = run_timing_atlas_cell_with(&mut harness, "q01");
+		assert!(outcome.finalized());
+
+		let setups = harness
+			.events
+			.iter()
+			.filter(|event| matches!(event, Event::Setup(_)))
+			.count();
+		let teardowns = harness
+			.events
+			.iter()
+			.filter(|event| matches!(event, Event::Teardown(_)))
+			.count();
+		assert_eq!(setups, 1, "workers are constructed once per cell");
+		assert_eq!(teardowns, 1, "and torn down once");
+
+		let setup_at = harness
+			.events
+			.iter()
+			.position(|event| matches!(event, Event::Setup(_)))
+			.expect("setup");
+		let teardown_at = harness
+			.events
+			.iter()
+			.position(|event| matches!(event, Event::Teardown(_)))
+			.expect("teardown");
+		let executions = harness
+			.events
+			.iter()
+			.enumerate()
+			.filter(|(_, event)| matches!(event, Event::Execute(_)))
+			.map(|(index, _)| index)
+			.collect::<Vec<_>>();
+		assert_eq!(
+			executions.len(),
+			2 + TIMING_ATLAS_MEASURED_PAIRS * 2,
+			"two warmups plus seven pairs"
+		);
+		assert!(
+			executions
+				.iter()
+				.all(|index| *index > setup_at && *index < teardown_at),
+			"every child runs while the workers are resident"
+		);
+	}
+
+	/// The timer surrounds execution only. Reduction is made 100x more expensive than
+	/// execution here: if digesting leaked inside the boundary the deltas would explode.
+	#[test]
+	fn query_elapsed_covers_execution_only_not_digest_or_reduction() {
+		let mut harness = FakeHarness::new(10.0, 1_000.0);
+		let outcome = run_timing_atlas_cell_with(&mut harness, "q01");
+		assert!(outcome.finalized());
+
+		for pair in &outcome.pairs {
+			assert_eq!(
+				pair.local.query_elapsed_ms, 10.0,
+				"execution alone contributes to query elapsed"
+			);
+			assert_eq!(pair.distributed.query_elapsed_ms, 10.0);
+			assert_eq!(pair.delta_ms, 0.0);
+		}
+		assert!(
+			outcome.verification_ms >= 1_000.0 * 16.0,
+			"reduction time is recorded separately, not discarded"
+		);
+		assert_eq!(outcome.setup_ms, 500.0, "setup recorded but excluded");
+		assert_eq!(outcome.teardown_ms, 300.0, "teardown recorded but excluded");
 	}
 }
