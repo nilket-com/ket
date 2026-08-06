@@ -312,4 +312,25 @@ mod tests {
 			3
 		);
 	}
+
+	#[test]
+	fn product_0032_banks_the_omitted_skin_compatibility_chrome() {
+		let chrome = PlotChrome::DEFAULT;
+		let paper = PlotRgba::opaque(0.001, 0.001, 0.001);
+		let ink = PlotRgba::opaque(1.0, 1.0, 1.0);
+		assert_eq!(chrome.canvas_background, paper);
+		assert_eq!(chrome.title_text, ink);
+		assert_eq!(chrome.subtitle_text, ink);
+		assert_eq!(chrome.axis_label_text, ink);
+		assert_eq!(chrome.tick_label_text, ink);
+		assert_eq!(chrome.axis_line, ink);
+		assert_eq!(chrome.gridline, PlotRgba::translucent(1.0, 1.0, 1.0, 0.2));
+		assert_eq!(chrome.legend_background, paper);
+		assert_eq!(chrome.legend_text, ink);
+		assert_eq!(
+			chrome.legend_swatch_fill,
+			PlotRgba::translucent(1.0, 1.0, 1.0, 0.5)
+		);
+		assert_eq!(chrome.legend_swatch_border, ink);
+	}
 }

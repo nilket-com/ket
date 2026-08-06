@@ -1216,3 +1216,37 @@ fn product_0031_plot_chrome_is_closed_and_mark_ink_stays_separate() {
 		.expect("bounded figure parser");
 	assert!(!figure_parser.contains("\"skin\" =>"));
 }
+
+#[test]
+fn product_0032_banks_the_absent_plot_skin_surface() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
+	let layer = theme
+		.split("pub struct PlotSettingsLayer {")
+		.nth(1)
+		.expect("settings layer")
+		.split('}')
+		.next()
+		.expect("settings fields");
+	assert!(!layer.contains("plot_skin"));
+	assert!(!layer.contains("chrome: Override<PlotChrome>"));
+
+	let chrome = std::fs::read_to_string(root.join("plot/chrome.rs")).expect("read chrome");
+	let production = chrome
+		.split("#[cfg(test)]")
+		.next()
+		.expect("chrome production");
+	assert!(!production.contains("from_theme_name"));
+	assert!(!production.contains("Theme::try_new"));
+
+	let envelope =
+		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
+	let figure_parser = envelope
+		.split("fn parse_figure(")
+		.nth(1)
+		.expect("figure parser")
+		.split("fn parse_figure_heading(")
+		.next()
+		.expect("bounded parser");
+	assert!(!figure_parser.contains("\"skin\" =>"));
+}
