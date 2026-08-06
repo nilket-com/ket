@@ -1150,13 +1150,14 @@ fn parse_figure(
 	};
 	let mut title = None;
 	let mut subtitle = None;
+	let mut palette = None;
 	let mut body = None;
 	for (item, _) in list.items.iter() {
 		let ast::Expr::Call(call) = item else {
 			return invalid_view(
 				item.span(),
 				source.len(),
-				"a figure child must be title(...), subtitle(...), or one plot body",
+				"a figure child must be title(...), subtitle(...), palette(...), or one plot body",
 			);
 		};
 		let callee = source_slice(source, call.expr.span())?.trim();
@@ -1181,6 +1182,16 @@ fn parse_figure(
 					);
 				}
 				subtitle = Some(parse_figure_heading(item, &child_args, source, "subtitle")?);
+			}
+			"palette" => {
+				if palette.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one categorical palette",
+					);
+				}
+				palette = Some(parse_figure_heading(item, &child_args, source, "palette")?);
 			}
 			_ => {
 				if body.is_some() {
@@ -1207,6 +1218,9 @@ fn parse_figure(
 	}
 	if let Some(subtitle) = subtitle {
 		authored_settings.subtitle = Presence::Show(Arc::new(subtitle));
+	}
+	if let Some(palette) = palette {
+		authored_settings.categorical_palette = Override::Set(Arc::new(palette));
 	}
 	Ok(RunePlotIntent {
 		body,
@@ -3030,6 +3044,100 @@ workspace.table("t").views([table()])
 		"#;
 		let retained = transform(ordinary).expect("figure calls outside views stay ordinary Rune");
 		assert!(retained.source.contains("figure([title(\"ordinary\")"));
+		assert_eq!(retained.views.len(), 1);
+	}
+
+	#[test]
+	fn product_0030_palette_is_unordered_figure_metadata_and_identity_stays_structural() {
+		fn only_plot(source: &str) -> SpannedRuneViewIntent {
+			transform(source)
+				.expect("categorical palette figure")
+				.into_relations()
+				.next()
+				.expect("one relation")
+				.views
+				.into_iter()
+				.next()
+				.expect("one view")
+		}
+
+		let first = only_plot(
+			r#"workspace.table("t").views([view("bars", figure([
+				palette("tab20c"), title("Categories"), subtitle("Six"), bar("cat", "val")
+			]))])"#,
+		);
+		let reordered = only_plot(
+			r#"workspace.table("t").views([view("bars", figure([
+				bar("cat", "val"), subtitle("Six"), palette("tab20c"), title("Categories")
+			]))])"#,
+		);
+		assert_eq!(first.identity, reordered.identity);
+		assert_eq!(first.intent, reordered.intent);
+		let presentation = first.intent.presentation();
+		let RuneViewIntent::Plot(plot) = first.intent else {
+			panic!("figure must remain a plot intent")
+		};
+		assert_eq!(
+			plot.authored_settings.categorical_palette,
+			Override::Set(Arc::new("tab20c".to_owned()))
+		);
+		assert_eq!(presentation.display_label, "plot.bar");
+	}
+
+	#[test]
+	fn product_0030_palette_refusals_are_contextual_attributed_and_atomic() {
+		for (source, rejected) in [
+			(
+				"workspace.table(\"t\").views([figure([palette(\"a\"), palette(\"b\"), bar(\"cat\", \"val\")])])",
+				"palette(\"b\")",
+			),
+			(
+				"workspace.table(\"t\").views([figure([palette(), bar(\"cat\", \"val\")])])",
+				"palette()",
+			),
+			(
+				"workspace.table(\"t\").views([figure([palette(\"a\", \"b\"), bar(\"cat\", \"val\")])])",
+				"palette(\"a\", \"b\")",
+			),
+			(
+				"let p = \"tab20c\"; workspace.table(\"t\").views([figure([palette(p), bar(\"cat\", \"val\")])])",
+				"p",
+			),
+			(
+				"workspace.table(\"t\").views([figure([palette(\"tab20c\")])])",
+				"figure([palette(\"tab20c\")])",
+			),
+			(
+				"workspace.table(\"t\").views([figure([layers([palette(\"tab20c\"), line(\"x\", \"y\")])])])",
+				"palette(\"tab20c\")",
+			),
+			(
+				"workspace.table(\"t\").views([bar(\"cat\", \"val\").palette(\"tab20c\")])",
+				"bar(\"cat\", \"val\").palette(\"tab20c\")",
+			),
+			(
+				"workspace.table(\"t\").views([bar(\"cat\", \"val\").skin(\"tab20c\")])",
+				"bar(\"cat\", \"val\").skin(\"tab20c\")",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(source).expect_err("malformed palette surface must refuse atomically")
+			else {
+				panic!("expected an attributed palette refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+		}
+
+		let ordinary = r#"
+			palette("tab20c");
+			let held = palette("tab20c_s1");
+			figure([palette("ordinary"), bar("cat", "val")]);
+			workspace.table("t").views([table()])
+		"#;
+		let retained =
+			transform(ordinary).expect("palette stays ordinary Rune outside a figure sink");
+		assert!(retained.source.contains("palette(\"tab20c\");"));
+		assert!(retained.source.contains("palette(\"ordinary\")"));
 		assert_eq!(retained.views.len(), 1);
 	}
 

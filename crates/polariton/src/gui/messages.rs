@@ -10,7 +10,7 @@ use crate::gui::table_skin::TableSkin;
 use crate::plot::common::PlotKernel;
 use crate::plot::request::ResolvedPlot;
 #[cfg(feature = "toron")]
-use crate::plot::spec::{LayerSettings, LayeredPlotSpec};
+use crate::plot::spec::{ColorIdentity, LayerSettings, LayeredPlotSpec};
 #[cfg(feature = "toron")]
 use crate::plot::theme::PlotSettingsLayer;
 use crate::result_registry::PendingPublication;
@@ -126,8 +126,10 @@ pub enum Message {
 		source_buffer: BufferId,
 		revision: u64,
 		panel_id: libaryon::engine::HostPanelId,
+		identity: LocalViewIdentity,
 		presentation: ViewPresentation,
 		authored_settings: PlotSettingsLayer,
+		continuation: RuneCategoricalContinuation,
 		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},
@@ -185,12 +187,26 @@ pub struct RuneRelationSinkOutcome {
 	pub output: std::result::Result<RuneRelationSinkOutput, String>,
 }
 
+/// A destination-local continuation proposal. It is head-owned asynchronous
+/// state, not database transport or part of the completed plot artifact.
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+pub struct RuneCategoricalContinuation {
+	pub palette_len: usize,
+	pub identity: ColorIdentity,
+}
+
 #[cfg(feature = "toron")]
 #[derive(Clone)]
 pub enum RuneRelationSinkOutput {
 	Table(TableSkin),
-	Plot(ResolvedPlot, PlotSettingsLayer),
-	StyledPlot(ResolvedPlot, LayerSettings, PlotSettingsLayer),
+	Plot(ResolvedPlot, PlotSettingsLayer, RuneCategoricalContinuation),
+	StyledPlot(
+		ResolvedPlot,
+		LayerSettings,
+		PlotSettingsLayer,
+		RuneCategoricalContinuation,
+	),
 	LayeredPlot(LayeredPlotSpec, PlotSettingsLayer),
 }
 

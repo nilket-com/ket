@@ -1412,8 +1412,8 @@ pub fn resolve_domains(
 	))
 }
 
-/// PRODUCT-0029's explicit, test-only categorical palette path. PRODUCT-0030
-/// owns the first production caller and the authored default.
+/// PRODUCT-0029's explicit categorical palette path. PRODUCT-0030 supplies the
+/// first production caller and keeps the authored default in the Rune head.
 pub fn resolve_domains_with_categorical_palette(
 	binding: ChannelBinding,
 	result: &StampedResult,

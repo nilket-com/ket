@@ -96,6 +96,12 @@ the old function's resolved spec, projected frame, error strings, and caller
 surface remain exact. Otherwise keep the small duplication; compatibility is
 more valuable than premature request unification.
 
+PRODUCT-0029's resolver doc comment currently calls the explicit path
+"test-only" and says PRODUCT-0030 owns the first production caller. The caller
+switch makes that comment false in the same indivisible diff. Updating that
+comment in `plot/spec/mod.rs` is permitted documentation at the substrate seam;
+no executable specification code may change there.
+
 ### 0d. Prior continuation can be snapshotted before independent dispatch
 
 The head owns a session-local bank:
@@ -462,6 +468,7 @@ proved from the final tree alone: indivisible history and real-window fidelity.
 crates/polariton/src/rune_relation_envelope.rs
 crates/polariton/src/plot/theme.rs
 crates/polariton/src/plot/request.rs
+crates/polariton/src/plot/spec/mod.rs  # documentation-only caller-status update
 crates/polariton/src/gui/messages.rs
 crates/polariton/src/gui/state.rs
 crates/polariton/src/plot/spec/snapshots/product-0030-pre-switch-categorical.txt

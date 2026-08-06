@@ -21,11 +21,15 @@ use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 #[cfg(feature = "toron")]
 use crate::plot::factory::create_layered_plot;
 use crate::plot::factory::{create_plot, create_styled_plot};
+#[cfg(feature = "toron")]
+use crate::plot::request::plan_with_categorical_palette;
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
 use crate::plot::spec::AuthoredPlotSpec;
 #[cfg(feature = "toron")]
-use crate::plot::spec::LayeredPlotSpec;
+use crate::plot::spec::{CategoricalPaletteSelection, ColorIdentity, LayeredPlotSpec};
+#[cfg(feature = "toron")]
+use crate::plot::theme::{PlotSettings, PlotSettingsLayer};
 use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
@@ -68,6 +72,10 @@ struct AppState {
 	rune_buffer_revisions: HashMap<BufferId, u64>,
 	#[cfg(feature = "toron")]
 	rune_view_scheduler: RuneViewScheduler,
+	/// Session-local categorical continuation keyed by producer, semantic view,
+	/// and the natural length of the selected ordered palette.
+	#[cfg(feature = "toron")]
+	rune_categorical_identities: HashMap<(BufferId, LocalViewIdentity, usize), ColorIdentity>,
 	#[cfg(feature = "toron")]
 	local_creation: crate::local_workspace::CreationGrant,
 	#[cfg(feature = "toron")]
@@ -114,6 +122,16 @@ struct PendingRun {
 	source_buffer: BufferId,
 	language_id: libaryon::engine::LanguageId,
 	kind: PendingRunKind,
+}
+
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+enum PreparedRuneCategoricalPalette {
+	Ready {
+		selection: CategoricalPaletteSelection,
+		identity: ColorIdentity,
+	},
+	Failed(String),
 }
 
 pub type Result = iced::Result;
@@ -359,6 +377,8 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		rune_buffer_revisions: HashMap::new(),
 		#[cfg(feature = "toron")]
 		rune_view_scheduler: RuneViewScheduler::default(),
+		#[cfg(feature = "toron")]
+		rune_categorical_identities: HashMap::new(),
 		#[cfg(feature = "toron")]
 		local_creation: crate::local_workspace::CreationGrant::default(),
 		#[cfg(feature = "toron")]
@@ -745,34 +765,104 @@ fn start_rune_relation_task(app_state: &mut AppState, work: PendingRuneView) -> 
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
-	Task::batch(view.into_relations().map(|view| {
+	let tasks = view.into_relations().map(|view| {
 		let connection = connection.clone();
 		let origin = view.origin.clone();
+		let palettes = prepare_rune_categorical_palettes(app_state, source_buffer, &view);
 		let views = view
 			.views
 			.iter()
 			.map(|view| view.identity.clone())
 			.collect::<Vec<_>>();
-		Task::perform(dispatch_rune_relation(connection, view), move |result| {
-			Message::RunRuneViewSetResult {
+		Task::perform(
+			dispatch_rune_relation_with_palettes(connection, view, palettes),
+			move |result| Message::RunRuneViewSetResult {
 				source_buffer,
 				revision,
 				origin,
 				views,
 				result,
-			}
-		})
-	}))
+			},
+		)
+	});
+	Task::batch(tasks)
 }
 
 #[cfg(feature = "toron")]
-async fn dispatch_rune_relation(
+fn resolved_rune_categorical_selection(
+	authored_settings: &PlotSettingsLayer,
+) -> std::result::Result<CategoricalPaletteSelection, String> {
+	let settings = PlotSettings {
+		authored_spec: authored_settings.clone(),
+		..PlotSettings::default()
+	};
+	let identity = settings.resolve_categorical_palette_identity();
+	CategoricalPaletteSelection::from_theme_name(identity.as_str())
+		.map_err(|error| error.to_string())
+}
+
+#[cfg(feature = "toron")]
+fn prepare_rune_categorical_palettes(
+	app_state: &AppState,
+	source_buffer: BufferId,
+	view: &TransformedRuneRelation,
+) -> HashMap<LocalViewIdentity, PreparedRuneCategoricalPalette> {
+	view.views
+		.iter()
+		.filter_map(|view| {
+			let RuneViewIntent::Plot(plot) = &view.intent else {
+				return None;
+			};
+			let prepared = match resolved_rune_categorical_selection(&plot.authored_settings) {
+				Ok(selection) => {
+					let identity = app_state
+						.rune_categorical_identities
+						.get(&(source_buffer, view.identity.clone(), selection.len()))
+						.cloned()
+						.unwrap_or_default();
+					PreparedRuneCategoricalPalette::Ready {
+						selection,
+						identity,
+					}
+				}
+				Err(error) => PreparedRuneCategoricalPalette::Failed(error),
+			};
+			Some((view.identity.clone(), prepared))
+		})
+		.collect()
+}
+
+#[cfg(all(test, feature = "toron"))]
+fn default_rune_categorical_palettes(
+	views: &[SpannedRuneViewIntent],
+) -> HashMap<LocalViewIdentity, PreparedRuneCategoricalPalette> {
+	views
+		.iter()
+		.filter_map(|view| {
+			let RuneViewIntent::Plot(plot) = &view.intent else {
+				return None;
+			};
+			let prepared = match resolved_rune_categorical_selection(&plot.authored_settings) {
+				Ok(selection) => PreparedRuneCategoricalPalette::Ready {
+					selection,
+					identity: ColorIdentity::default(),
+				},
+				Err(error) => PreparedRuneCategoricalPalette::Failed(error),
+			};
+			Some((view.identity.clone(), prepared))
+		})
+		.collect()
+}
+
+#[cfg(feature = "toron")]
+async fn dispatch_rune_relation_with_palettes(
 	connection: Arc<RwLock<dyn DatabaseAdapter>>,
 	view: TransformedRuneRelation,
+	palettes: HashMap<LocalViewIdentity, PreparedRuneCategoricalPalette>,
 ) -> std::result::Result<crate::gui::messages::RuneRelationViewSetOutcome, String> {
 	let result = connection.write().await.dispatch_rune(&view.source).await;
 	match result {
-		Ok(frame) => Ok(rune_view_outcome(frame, view.views)),
+		Ok(frame) => Ok(rune_view_outcome_with_palettes(frame, view.views, palettes)),
 		Err(failure) => {
 			let location = failure
 				.span
@@ -789,6 +879,15 @@ async fn dispatch_rune_relation(
 			))
 		}
 	}
+}
+
+#[cfg(all(test, feature = "toron"))]
+async fn dispatch_rune_relation(
+	connection: Arc<RwLock<dyn DatabaseAdapter>>,
+	view: TransformedRuneRelation,
+) -> std::result::Result<crate::gui::messages::RuneRelationViewSetOutcome, String> {
+	let palettes = default_rune_categorical_palettes(&view.views);
+	dispatch_rune_relation_with_palettes(connection, view, palettes).await
 }
 
 #[cfg(feature = "toron")]
@@ -830,18 +929,21 @@ fn resolve_rune_table_skin_with(
 }
 
 #[cfg(feature = "toron")]
-fn rune_view_outcome(
+fn rune_view_outcome_with_palettes(
 	frame: DataFrame,
 	views: Vec<SpannedRuneViewIntent>,
+	mut palettes: HashMap<LocalViewIdentity, PreparedRuneCategoricalPalette>,
 ) -> crate::gui::messages::RuneRelationViewSetOutcome {
 	use crate::gui::messages::{
-		RuneRelationSinkOutcome, RuneRelationSinkOutput, RuneRelationViewSetOutcome,
+		RuneCategoricalContinuation, RuneRelationSinkOutcome, RuneRelationSinkOutput,
+		RuneRelationViewSetOutcome,
 	};
 	let result = std::sync::Arc::new(frame);
 	let sinks = views
 		.into_iter()
 		.map(|view| {
 			let presentation = view.intent.presentation();
+			let identity = view.identity;
 			let output = match view.intent {
 				RuneViewIntent::Table(table) => {
 					resolve_rune_table_skin_with(table.skin, TableSkin::from_theme_name)
@@ -849,6 +951,28 @@ fn rune_view_outcome(
 				}
 				RuneViewIntent::Plot(plot) => {
 					let authored_settings = plot.authored_settings;
+					let prepared = palettes.remove(&identity).unwrap_or_else(|| {
+						PreparedRuneCategoricalPalette::Failed(
+							"plot destination has no prepared categorical palette".to_owned(),
+						)
+					});
+					let PreparedRuneCategoricalPalette::Ready {
+						selection,
+						identity: prior_identity,
+					} = prepared
+					else {
+						let PreparedRuneCategoricalPalette::Failed(error) = prepared else {
+							unreachable!()
+						};
+						return RuneRelationSinkOutcome {
+							identity,
+							presentation,
+							span: view.span,
+							source: std::sync::Arc::clone(&result),
+							output: Err(error),
+						};
+					};
+					let palette_len = selection.len();
 					match plot.body {
 						RunePlotBody::Single(plot) => {
 							let authored_spec = AuthoredPlotSpec::xy_color(
@@ -857,15 +981,26 @@ fn rune_view_outcome(
 								plot.y,
 								plot.category,
 							);
-							plan(PlotRequest {
-								source: PlotSource::Materialized {
-									name: "workspace relation".to_owned(),
-									data: std::sync::Arc::clone(&result),
+							plan_with_categorical_palette(
+								PlotRequest {
+									source: PlotSource::Materialized {
+										name: "workspace relation".to_owned(),
+										data: std::sync::Arc::clone(&result),
+									},
+									authored_spec,
 								},
-								authored_spec,
-							})
-							.map(|resolved| {
-								RuneRelationSinkOutput::Plot(resolved, authored_settings)
+								&selection,
+								&prior_identity,
+							)
+							.map(|(resolved, next_identity)| {
+								RuneRelationSinkOutput::Plot(
+									resolved,
+									authored_settings,
+									RuneCategoricalContinuation {
+										palette_len,
+										identity: next_identity,
+									},
+								)
 							})
 						}
 						RunePlotBody::StyledSingle(styled) => match styled.into_layer() {
@@ -881,18 +1016,26 @@ fn rune_view_outcome(
 									sink.y,
 									sink.category,
 								);
-								plan(PlotRequest {
-									source: PlotSource::Materialized {
-										name: "workspace relation".to_owned(),
-										data: std::sync::Arc::clone(&result),
+								plan_with_categorical_palette(
+									PlotRequest {
+										source: PlotSource::Materialized {
+											name: "workspace relation".to_owned(),
+											data: std::sync::Arc::clone(&result),
+										},
+										authored_spec,
 									},
-									authored_spec,
-								})
-								.map(|resolved| {
+									&selection,
+									&prior_identity,
+								)
+								.map(|(resolved, next_identity)| {
 									RuneRelationSinkOutput::StyledPlot(
 										resolved,
 										settings,
 										authored_settings,
+										RuneCategoricalContinuation {
+											palette_len,
+											identity: next_identity,
+										},
 									)
 								})
 							}
@@ -904,7 +1047,7 @@ fn rune_view_outcome(
 				}
 			};
 			RuneRelationSinkOutcome {
-				identity: view.identity,
+				identity,
 				presentation,
 				span: view.span,
 				source: std::sync::Arc::clone(&result),
@@ -913,6 +1056,15 @@ fn rune_view_outcome(
 		})
 		.collect();
 	RuneRelationViewSetOutcome { result, sinks }
+}
+
+#[cfg(all(test, feature = "toron"))]
+fn rune_view_outcome(
+	frame: DataFrame,
+	views: Vec<SpannedRuneViewIntent>,
+) -> crate::gui::messages::RuneRelationViewSetOutcome {
+	let palettes = default_rune_categorical_palettes(&views);
+	rune_view_outcome_with_palettes(frame, views, palettes)
 }
 
 fn queue_plain_run(
@@ -1573,7 +1725,12 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 								app_state.data_frame = frame;
 								app_state.status_df_size = Some((rows, cols));
 							}
-							Ok(RuneRelationSinkOutput::Plot(resolved, authored_settings)) => {
+							Ok(RuneRelationSinkOutput::Plot(
+								resolved,
+								authored_settings,
+								continuation,
+							)) => {
+								let identity = sink.identity.clone();
 								let presentation = sink.presentation;
 								plot_tasks.push(build_resolved_plot_task(
 									resolved,
@@ -1582,8 +1739,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										source_buffer,
 										revision,
 										panel_id,
+										identity,
 										presentation,
 										authored_settings,
+										continuation,
 										resolved,
 										kernel,
 									},
@@ -1593,7 +1752,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 								resolved,
 								layer_settings,
 								authored_settings,
+								continuation,
 							)) => {
+								let identity = sink.identity.clone();
 								let presentation = sink.presentation;
 								let span = sink.span;
 								plot_tasks.push(build_styled_plot_task(
@@ -1604,8 +1765,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 											source_buffer,
 											revision,
 											panel_id,
+											identity,
 											presentation,
 											authored_settings,
+											continuation,
 											resolved,
 											kernel,
 										},
@@ -1699,8 +1862,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			source_buffer,
 			revision,
 			panel_id,
+			identity,
 			presentation,
 			authored_settings,
+			continuation,
 			resolved,
 			kernel,
 		} => {
@@ -1712,6 +1877,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				presentation.display_label,
 				kernel,
 				authored_settings,
+			);
+			app_state.rune_categorical_identities.insert(
+				(source_buffer, identity, continuation.palette_len),
+				continuation.identity,
 			);
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
 		}
@@ -2170,6 +2339,8 @@ mod tests {
 		VersionedArtifact, WorkspaceIdentity,
 	};
 	#[cfg(feature = "toron")]
+	use std::collections::HashMap;
+	#[cfg(feature = "toron")]
 	use std::sync::{Arc, Mutex};
 	#[cfg(feature = "toron")]
 	use tokio::sync::RwLock;
@@ -2243,18 +2414,20 @@ mod tests {
 		revision: u64,
 		relation: TransformedRuneRelation,
 		frame: polars::frame::DataFrame,
-	) {
+	) -> Vec<(LocalViewIdentity, crate::plot::request::ResolvedPlot)> {
 		enum ReadyPlot {
 			Single(
 				crate::rune_relation_envelope::ViewPresentation,
 				crate::plot::request::ResolvedPlot,
 				crate::plot::theme::PlotSettingsLayer,
+				crate::gui::messages::RuneCategoricalContinuation,
 			),
 			Styled(
 				crate::rune_relation_envelope::ViewPresentation,
 				crate::plot::request::ResolvedPlot,
 				crate::plot::spec::LayerSettings,
 				crate::plot::theme::PlotSettingsLayer,
+				crate::gui::messages::RuneCategoricalContinuation,
 			),
 			Layered(
 				crate::rune_relation_envelope::ViewPresentation,
@@ -2270,7 +2443,8 @@ mod tests {
 			.iter()
 			.map(|view| view.identity.clone())
 			.collect::<Vec<_>>();
-		let outcome = rune_view_outcome(frame, relation.views);
+		let palettes = super::prepare_rune_categorical_palettes(state, source_buffer, &relation);
+		let outcome = super::rune_view_outcome_with_palettes(frame, relation.views, palettes);
 		let plots = outcome
 			.sinks
 			.iter()
@@ -2278,18 +2452,21 @@ mod tests {
 				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(
 					resolved,
 					authored_settings,
+					continuation,
 				)) => Some((
 					sink.identity.clone(),
 					ReadyPlot::Single(
 						sink.presentation.clone(),
 						resolved.clone(),
 						authored_settings.clone(),
+						continuation.clone(),
 					),
 				)),
 				Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
 					resolved,
 					layer_settings,
 					authored_settings,
+					continuation,
 				)) => Some((
 					sink.identity.clone(),
 					ReadyPlot::Styled(
@@ -2297,6 +2474,7 @@ mod tests {
 						resolved.clone(),
 						layer_settings.clone(),
 						authored_settings.clone(),
+						continuation.clone(),
 					),
 				)),
 				Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(
@@ -2313,6 +2491,15 @@ mod tests {
 					),
 				)),
 				_ => None,
+			})
+			.collect::<Vec<_>>();
+		let resolved_plots = plots
+			.iter()
+			.filter_map(|(identity, plot)| match plot {
+				ReadyPlot::Single(_, resolved, _, _) | ReadyPlot::Styled(_, resolved, _, _, _) => {
+					Some((identity.clone(), resolved.clone()))
+				}
+				ReadyPlot::Layered(..) => None,
 			})
 			.collect::<Vec<_>>();
 
@@ -2332,7 +2519,7 @@ mod tests {
 				.rune_view_panel_id(source_buffer, &identity)
 				.expect("prepared plot panel");
 			match plot {
-				ReadyPlot::Single(presentation, resolved, authored_settings) => {
+				ReadyPlot::Single(presentation, resolved, authored_settings, continuation) => {
 					let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
 					drop(update(
 						state,
@@ -2340,14 +2527,22 @@ mod tests {
 							source_buffer,
 							revision,
 							panel_id,
+							identity,
 							presentation,
 							authored_settings,
+							continuation,
 							resolved,
 							kernel,
 						},
 					));
 				}
-				ReadyPlot::Styled(presentation, resolved, layer_settings, authored_settings) => {
+				ReadyPlot::Styled(
+					presentation,
+					resolved,
+					layer_settings,
+					authored_settings,
+					continuation,
+				) => {
 					let kernel =
 						create_styled_plot(&resolved.resolved_spec, &resolved.data, layer_settings)
 							.expect("styled plot kernel");
@@ -2357,8 +2552,10 @@ mod tests {
 							source_buffer,
 							revision,
 							panel_id,
+							identity,
 							presentation,
 							authored_settings,
+							continuation,
 							resolved,
 							kernel,
 						},
@@ -2387,6 +2584,85 @@ mod tests {
 				}
 			}
 		}
+		resolved_plots
+	}
+
+	#[cfg(feature = "toron")]
+	fn run_one_relation_program(
+		state: &mut super::AppState,
+		source_buffer: BufferId,
+		revision: u64,
+		source: &str,
+		frame: polars::frame::DataFrame,
+	) -> Vec<(LocalViewIdentity, crate::plot::request::ResolvedPlot)> {
+		let program = transform_rune_view(source).expect("Rune relation program");
+		let presentation = program
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+		state.rune_buffer_revisions.insert(source_buffer, revision);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, revision);
+		assert!(
+			state
+				.rune_view_scheduler
+				.submit(PendingRuneView {
+					source_buffer,
+					revision,
+					view: program.clone(),
+				})
+				.is_some(),
+			"revision must be schedulable"
+		);
+		complete_relation_in_head(
+			state,
+			source_buffer,
+			revision,
+			program.into_relations().next().expect("one relation"),
+			frame,
+		)
+	}
+
+	#[cfg(feature = "toron")]
+	fn band_mapping(
+		resolved: &crate::plot::request::ResolvedPlot,
+	) -> Vec<(String, usize, (u8, u8, u8))> {
+		resolved
+			.resolved_spec
+			.band_fills
+			.iter()
+			.map(|assignment| {
+				(
+					assignment.category.clone(),
+					assignment.position.index(),
+					(
+						assignment.color.red,
+						assignment.color.green,
+						assignment.color.blue,
+					),
+				)
+			})
+			.collect()
+	}
+
+	#[cfg(feature = "toron")]
+	fn categorical_bar_frame(categories: &[&str]) -> polars::frame::DataFrame {
+		polars::frame::DataFrame::new(
+			categories.len(),
+			vec![
+				polars::prelude::Column::new(
+					"cat".into(),
+					categories.iter().copied().collect::<Vec<_>>(),
+				),
+				polars::prelude::Column::new(
+					"val".into(),
+					(1..=categories.len() as i64).collect::<Vec<_>>(),
+				),
+			],
+		)
+		.expect("categorical bar frame")
 	}
 
 	#[cfg(feature = "toron")]
@@ -2712,7 +2988,7 @@ mod tests {
 				.iter()
 				.zip([PlotType::Bar, PlotType::Scatter, PlotType::Line])
 		{
-			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(plot, _)) = &sink.output
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(plot, _, _)) = &sink.output
 			else {
 				panic!("expected resolved plot");
 			};
@@ -3003,7 +3279,7 @@ mod tests {
 		assert!(error.contains("unsuitable"));
 		assert!(matches!(
 			outcome.sinks[3].output,
-			Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(_, _))
+			Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(..))
 		));
 	}
 
@@ -3203,11 +3479,7 @@ ket.table("test2") // Comment Test1.
 		assert_eq!(*skin, TableSkin::DEFAULT);
 		assert!(matches!(
 			second.sinks[1].output,
-			Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
-				_,
-				_,
-				_
-			))
+			Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(..))
 		));
 	}
 
@@ -3655,7 +3927,7 @@ workspace.table("t").views([
 			.next()
 			.expect("one relation");
 		let bare_outcome = rune_view_outcome(frame.clone(), bare_relation.views);
-		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _)) =
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, _)) =
 			&bare_outcome.sinks[0].output
 		else {
 			panic!("bare line must use the established plot request")
@@ -3681,7 +3953,7 @@ workspace.table("t").views([
 			.next()
 			.expect("one relation");
 		let figure_outcome = rune_view_outcome(frame.clone(), figure_relation.views);
-		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(figure, _)) =
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(figure, _, _)) =
 			&figure_outcome.sinks[0].output
 		else {
 			panic!("one-body figure must retain the single plot path")
@@ -4039,6 +4311,7 @@ workspace.table("t").views([
 				resolved,
 				settings,
 				authored,
+				_,
 			)) = &sink.output
 			else {
 				panic!("styled bar must use the standalone styled-plot path")
@@ -4804,7 +5077,7 @@ plot.bar(a, "x", "y");
 			.sinks
 			.into_iter()
 			.find_map(|sink| match sink.output {
-				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _)) => {
+				Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, _)) => {
 					Some(resolved)
 				}
 				_ => None,
@@ -5107,6 +5380,574 @@ workspace.table("bad").views([view("bad", table())]);
 				.as_ref()
 				.map(|detail| detail.full.as_str()),
 			Some("init.rn compile error: broken fixture"),
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0030_rune_default_authored_palette_and_unused_settings_are_exact() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = BufferId::new(1030);
+		let categories = ["A", "B", "C", "D", "E", "F"];
+
+		let default = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			1,
+			"workspace.table(\"t\").views([view(\"plot\", bar(\"cat\", \"val\"))])",
+			categorical_bar_frame(&categories),
+		);
+		assert!(
+			default[0]
+				.1
+				.resolved_spec
+				.channel(crate::plot::spec::Channel::Color)
+				.is_none()
+		);
+		assert_eq!(
+			band_mapping(&default[0].1),
+			[
+				("A".to_owned(), 0, (68, 1, 83)),
+				("B".to_owned(), 4, (60, 69, 130)),
+				("C".to_owned(), 8, (41, 125, 140)),
+				("D".to_owned(), 11, (52, 162, 127)),
+				("E".to_owned(), 15, (119, 205, 88)),
+				("F".to_owned(), 19, (253, 231, 36)),
+			]
+		);
+
+		let tab20c = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			2,
+			r#"workspace.table("t").views([view("plot", figure([
+				title("Categories"), palette("tab20c"), bar("cat", "val")
+			]))])"#,
+			categorical_bar_frame(&categories),
+		);
+		assert_eq!(
+			band_mapping(&tab20c[0].1),
+			[
+				("A".to_owned(), 0, (49, 130, 189)),
+				("B".to_owned(), 4, (230, 85, 13)),
+				("C".to_owned(), 8, (49, 163, 84)),
+				("D".to_owned(), 11, (199, 233, 192)),
+				("E".to_owned(), 15, (218, 218, 235)),
+				("F".to_owned(), 19, (150, 150, 150)),
+			]
+		);
+		let panel = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &LocalViewIdentity::Named("plot".to_owned()))
+			.expect("stable palette panel");
+
+		let yellows = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			3,
+			r#"workspace.table("t").views([view("plot", figure([
+				palette("yellows"), bar("cat", "val")
+			]))])"#,
+			categorical_bar_frame(&categories),
+		);
+		assert_eq!(
+			band_mapping(&yellows[0].1),
+			[
+				("A".to_owned(), 0, (252, 252, 204)),
+				("B".to_owned(), 4, (252, 237, 139)),
+				("C".to_owned(), 8, (252, 222, 75)),
+				("D".to_owned(), 11, (236, 198, 42)),
+				("E".to_owned(), 15, (194, 150, 21)),
+				("F".to_owned(), 19, (153, 102, 0)),
+			],
+			"a weak authored choice reaches the artifact without aesthetic admission"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &LocalViewIdentity::Named("plot".to_owned())),
+			Some(panel)
+		);
+
+		for (revision, body) in [(4, "line(\"x\", \"y\")"), (5, "scatter(\"x\", \"y\")")] {
+			let source = format!(
+				"workspace.table(\"t\").views([view(\"plot\", figure([palette(\"tab20c\"), {body}]))])"
+			);
+			let plots = run_one_relation_program(
+				&mut state,
+				source_buffer,
+				revision,
+				&source,
+				polars::df!("x" => [1_i64, 2], "y" => [2_i64, 4]).unwrap(),
+			);
+			assert!(plots[0].1.resolved_spec.band_fills.is_empty());
+			assert!(
+				plots[0]
+					.1
+					.resolved_spec
+					.channel(crate::plot::spec::Channel::Color)
+					.is_none()
+			);
+		}
+
+		let scatter = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			6,
+			r#"workspace.table("t").views([view("plot", figure([
+				palette("tab20c"), scatter("x", "y", "cat")
+			]))])"#,
+			polars::df!(
+				"x" => [1_i64, 2, 3, 4, 5, 6],
+				"y" => [6_i64, 5, 4, 3, 2, 1],
+				"cat" => categories,
+			)
+			.unwrap(),
+		);
+		assert!(scatter[0].1.resolved_spec.band_fills.is_empty());
+		assert_eq!(
+			scatter[0]
+				.1
+				.resolved_spec
+				.channel(crate::plot::spec::Channel::Color)
+				.expect("authored categorical color channel")
+				.colors
+				.iter()
+				.map(|assignment| (
+					assignment.category.as_str(),
+					assignment.position.index(),
+					(
+						assignment.color.red,
+						assignment.color.green,
+						assignment.color.blue,
+					),
+				))
+				.collect::<Vec<_>>(),
+			[
+				("A", 0, (49, 130, 189)),
+				("B", 4, (230, 85, 13)),
+				("C", 8, (49, 163, 84)),
+				("D", 11, (199, 233, 192)),
+				("E", 15, (218, 218, 235)),
+				("F", 19, (150, 150, 150)),
+			]
+		);
+
+		let layered = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			7,
+			r#"workspace.table("t").views([view("plot", figure([
+				palette("tab20c"), layers([line("x", "y"), scatter("x", "y")])
+			]))])"#,
+			polars::df!("x" => [1_i64, 2], "y" => [2_i64, 4]).unwrap(),
+		);
+		assert!(
+			layered.is_empty(),
+			"layered content has no categorical proposal"
+		);
+		assert!(
+			state.code_editor.rune_view_panel_is_plot(
+				source_buffer,
+				&LocalViewIdentity::Named("plot".to_owned())
+			),
+			"an unused valid palette cannot block layered completion"
+		);
+
+		for (palette, expected) in [("not-a-theme", "not-a-theme"), ("nord", "categorical")] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([palette(\"{palette}\"), line(\"x\", \"y\")])])"
+			);
+			let relation = transform_rune_view(&source)
+				.expect("selection failure is below the envelope")
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(
+				polars::df!("x" => [1_i64], "y" => [2_i64]).unwrap(),
+				relation.views,
+			);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("structurally impossible selection must refuse")
+			};
+			assert!(error.contains(expected), "unhelpful error: {error}");
+		}
+
+		for (palette, cardinality, palette_limit) in
+			[("dark2", 9, 8), ("tab20c", 13, 20), ("dark2", 13, 8)]
+		{
+			let source = format!(
+				"workspace.table(\"t\").views([figure([palette(\"{palette}\"), bar(\"cat\", \"val\")])])"
+			);
+			let relation = transform_rune_view(&source)
+				.unwrap()
+				.into_relations()
+				.next()
+				.unwrap();
+			let categories = (0..cardinality)
+				.map(|index| format!("c{index}"))
+				.collect::<Vec<_>>();
+			let category_refs = categories.iter().map(String::as_str).collect::<Vec<_>>();
+			let outcome = rune_view_outcome(categorical_bar_frame(&category_refs), relation.views);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("capacity failure cannot fall back or truncate")
+			};
+			assert!(error.contains(&format!("requests {cardinality} identities")));
+			assert!(error.contains("geometry limit 12"));
+			assert!(error.contains(&format!("palette `{palette}` limit {palette_limit}")));
+		}
+
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0030_live_identity_commits_with_content_and_retargets_by_length() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = BufferId::new(1031);
+		let source = |palette: &str| {
+			format!(
+				"workspace.table(\"t\").views([view(\"bars\", figure([palette(\"{palette}\"), bar(\"cat\", \"val\")]))])"
+			)
+		};
+
+		for (revision, categories, expected) in [
+			(1, vec!["A"], vec![("A", 0)]),
+			(2, vec!["A", "B"], vec![("A", 0), ("B", 19)]),
+			(3, vec!["A", "B", "C"], vec![("A", 0), ("B", 19), ("C", 9)]),
+		] {
+			let plots = run_one_relation_program(
+				&mut state,
+				source_buffer,
+				revision,
+				&source("tab20c"),
+				categorical_bar_frame(&categories),
+			);
+			assert_eq!(
+				band_mapping(&plots[0].1)
+					.into_iter()
+					.map(|(category, position, _)| (category, position))
+					.collect::<Vec<_>>(),
+				expected
+					.into_iter()
+					.map(|(category, position)| (category.to_owned(), position))
+					.collect::<Vec<_>>()
+			);
+		}
+
+		let identity = LocalViewIdentity::Named("bars".to_owned());
+		assert_eq!(
+			state
+				.rune_categorical_identities
+				.get(&(source_buffer, identity.clone(), 20))
+				.expect("twenty-position bank")
+				.len(),
+			3
+		);
+		let filtered = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			4,
+			&source("tab20c"),
+			categorical_bar_frame(&["A", "C"]),
+		);
+		assert_eq!(
+			band_mapping(&filtered[0].1)
+				.into_iter()
+				.map(|(category, position, _)| (category, position))
+				.collect::<Vec<_>>(),
+			[("A".to_owned(), 0), ("C".to_owned(), 9)]
+		);
+		let returned = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			5,
+			&source("tab20c"),
+			categorical_bar_frame(&["B"]),
+		);
+		assert_eq!(band_mapping(&returned[0].1)[0].1, 19);
+
+		for (revision, palette, expected_colors) in [
+			(
+				6,
+				"tab20c_r",
+				[(150, 150, 150), (49, 130, 189), (161, 217, 155)],
+			),
+			(
+				7,
+				"tab20c_s1",
+				[(150, 150, 150), (63, 0, 125), (49, 163, 84)],
+			),
+			(8, "viridis", [(68, 1, 83), (253, 231, 36), (35, 138, 140)]),
+		] {
+			let plots = run_one_relation_program(
+				&mut state,
+				source_buffer,
+				revision,
+				&source(palette),
+				categorical_bar_frame(&["A", "B", "C"]),
+			);
+			assert_eq!(
+				band_mapping(&plots[0].1),
+				[
+					("A".to_owned(), 0, expected_colors[0]),
+					("B".to_owned(), 19, expected_colors[1]),
+					("C".to_owned(), 9, expected_colors[2]),
+				]
+			);
+		}
+
+		let dark2 = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			9,
+			&source("dark2"),
+			categorical_bar_frame(&["A", "B", "C"]),
+		);
+		assert_eq!(
+			band_mapping(&dark2[0].1)
+				.into_iter()
+				.map(|(category, position, _)| (category, position))
+				.collect::<Vec<_>>(),
+			[
+				("A".to_owned(), 0),
+				("B".to_owned(), 4),
+				("C".to_owned(), 7)
+			]
+		);
+		assert_eq!(
+			state
+				.rune_categorical_identities
+				.get(&(source_buffer, identity.clone(), 8))
+				.unwrap()
+				.len(),
+			3
+		);
+
+		let resumed = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			10,
+			&source("tab20c"),
+			categorical_bar_frame(&["A", "B", "C"]),
+		);
+		assert_eq!(
+			band_mapping(&resumed[0].1)
+				.into_iter()
+				.map(|(category, position, _)| (category, position))
+				.collect::<Vec<_>>(),
+			[
+				("A".to_owned(), 0),
+				("B".to_owned(), 19),
+				("C".to_owned(), 9)
+			]
+		);
+
+		let failed = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			11,
+			&source("dark2"),
+			categorical_bar_frame(&["A", "B", "C", "D", "E", "F", "G", "H", "I"]),
+		);
+		assert!(failed.is_empty(), "capacity failure cannot install content");
+		assert_eq!(
+			state
+				.rune_categorical_identities
+				.get(&(source_buffer, identity.clone(), 8))
+				.unwrap()
+				.len(),
+			3,
+			"failed resolution cannot advance continuation"
+		);
+
+		let stale_source = source("tab20c");
+		let relation = transform_rune_view(&stale_source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let presentation = relation.views[0].intent.presentation();
+		let stale_identity = relation.views[0].identity.clone();
+		let palettes = super::prepare_rune_categorical_palettes(&state, source_buffer, &relation);
+		let outcome = super::rune_view_outcome_with_palettes(
+			categorical_bar_frame(&["A", "B", "C", "D"]),
+			relation.views,
+			palettes,
+		);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(
+			stale_resolved,
+			stale_settings,
+			stale_continuation,
+		)) = outcome.sinks[0].output.clone()
+		else {
+			panic!("stale proposal")
+		};
+		let panel_id = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &stale_identity)
+			.unwrap();
+		state.rune_buffer_revisions.insert(source_buffer, 13);
+		let kernel = create_plot(
+			&stale_resolved.resolved_spec,
+			&stale_resolved.data,
+			1200,
+			720,
+		);
+		drop(update(
+			&mut state,
+			Message::RuneRelationPlotReady {
+				source_buffer,
+				revision: 12,
+				panel_id,
+				identity: stale_identity,
+				presentation,
+				authored_settings: stale_settings,
+				continuation: stale_continuation,
+				resolved: stale_resolved,
+				kernel,
+			},
+		));
+		assert_eq!(
+			state
+				.rune_categorical_identities
+				.get(&(source_buffer, identity.clone(), 20))
+				.unwrap()
+				.len(),
+			3,
+			"superseded content cannot reserve a position"
+		);
+
+		let after_stale = run_one_relation_program(
+			&mut state,
+			source_buffer,
+			13,
+			&source("tab20c"),
+			categorical_bar_frame(&["A", "B", "C", "E"]),
+		);
+		assert_eq!(
+			band_mapping(&after_stale[0].1)
+				.into_iter()
+				.map(|(category, position, _)| (category, position))
+				.collect::<Vec<_>>(),
+			[
+				("A".to_owned(), 0),
+				("B".to_owned(), 19),
+				("C".to_owned(), 9),
+				("E".to_owned(), 14),
+			]
+		);
+		assert!(state.dashboard.panes.is_none());
+		assert!(state.dashboard.content.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0030_origins_and_views_keep_independent_banks_across_completion_order() {
+		let source = r#"
+			workspace.table("left").views([view("left-bars", figure([
+				palette("tab20c"), bar("cat", "val")
+			]))])
+			workspace.table("right").views([view("right-bars", figure([
+				palette("tab20c"), bar("cat", "val")
+			]))])
+		"#;
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = BufferId::new(1032);
+
+		let mut run = |revision: u64, reverse: bool, left: &[&str], right: &[&str]| {
+			let program = transform_rune_view(source).expect("two-origin categorical program");
+			let presentation = program
+				.presentation_views()
+				.into_iter()
+				.map(|view| (view.identity.clone(), view.intent.presentation()))
+				.collect::<Vec<_>>();
+			state.rune_buffer_revisions.insert(source_buffer, revision);
+			state
+				.code_editor
+				.prepare_rune_view_panels(source_buffer, &presentation, revision);
+			assert!(
+				state
+					.rune_view_scheduler
+					.submit(PendingRuneView {
+						source_buffer,
+						revision,
+						view: program.clone(),
+					})
+					.is_some()
+			);
+			let mut relations = program.into_relations().collect::<Vec<_>>();
+			if reverse {
+				relations.reverse();
+			}
+			let mut mappings = HashMap::new();
+			for relation in relations {
+				let is_left = relation.origin.contains("table(\"left\")");
+				let frame = categorical_bar_frame(if is_left { left } else { right });
+				for (identity, resolved) in
+					complete_relation_in_head(&mut state, source_buffer, revision, relation, frame)
+				{
+					mappings.insert(identity, band_mapping(&resolved));
+				}
+			}
+			mappings
+		};
+
+		let first = run(1, true, &["L"], &["R"]);
+		assert_eq!(
+			first[&LocalViewIdentity::Named("left-bars".to_owned())][0].1,
+			0
+		);
+		assert_eq!(
+			first[&LocalViewIdentity::Named("right-bars".to_owned())][0].1,
+			0
+		);
+		let second = run(2, false, &["L", "M", "N"], &["R", "S"]);
+		assert_eq!(
+			second[&LocalViewIdentity::Named("left-bars".to_owned())]
+				.iter()
+				.map(|(_, position, _)| *position)
+				.collect::<Vec<_>>(),
+			[0, 19, 9]
+		);
+		assert_eq!(
+			second[&LocalViewIdentity::Named("right-bars".to_owned())]
+				.iter()
+				.map(|(_, position, _)| *position)
+				.collect::<Vec<_>>(),
+			[0, 19]
+		);
+		drop(run);
+		assert_eq!(
+			state
+				.rune_categorical_identities
+				.get(&(
+					source_buffer,
+					LocalViewIdentity::Named("left-bars".to_owned()),
+					20,
+				))
+				.unwrap()
+				.len(),
+			3
+		);
+		assert_eq!(
+			state
+				.rune_categorical_identities
+				.get(&(
+					source_buffer,
+					LocalViewIdentity::Named("right-bars".to_owned()),
+					20,
+				))
+				.unwrap()
+				.len(),
+			2
 		);
 		state.code_editor.shutdown();
 	}

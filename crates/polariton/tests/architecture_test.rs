@@ -959,7 +959,7 @@ fn product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer()
 					.split("#[cfg(test)]")
 					.next()
 					.expect("Polariton production source");
-				for forbidden in ["categorical_palette", "ResolvedCategoricalPalette"] {
+				for forbidden in ["ResolvedCategoricalPalette"] {
 					if source.contains(forbidden) {
 						leaks.push(format!("{}: {forbidden}", path.display()));
 					}
@@ -995,8 +995,8 @@ fn product_0029_positions_and_exact_band_fills_stay_inside_the_plot_boundary() {
 	assert!(production.contains("assignments: HashMap<ColorIdentityKey, PalettePosition>"));
 	assert!(production.contains("pub band_fills: Vec<BandFillAssignment>"));
 	assert!(production.contains("PRODUCT-0029 compatibility entrypoint"));
-	assert!(production.contains("PRODUCT-0029's explicit, test-only categorical palette path"));
-	assert!(production.contains("owns the first production caller and the authored default"));
+	assert!(production.contains("PRODUCT-0029's explicit categorical palette path"));
+	assert!(production.contains("keeps the authored default in the Rune head"));
 	assert!(production.contains("ResolvedKernelFields::Bar { category, .. }"));
 	assert!(production.contains("channel.binding.channel == Channel::Color"));
 
@@ -1021,11 +1021,7 @@ fn product_0029_positions_and_exact_band_fills_stay_inside_the_plot_boundary() {
 		}
 	}
 
-	for relative in [
-		"rune_relation_envelope.rs",
-		"plot/request.rs",
-		"plot/durable.rs",
-	] {
+	for relative in ["rune_relation_envelope.rs", "plot/durable.rs"] {
 		let source = std::fs::read_to_string(root.join(relative)).expect("read caller boundary");
 		for forbidden in [
 			"resolve_domains_with_categorical_palette",
@@ -1035,6 +1031,114 @@ fn product_0029_positions_and_exact_band_fills_stay_inside_the_plot_boundary() {
 			assert!(
 				!source.contains(forbidden),
 				"{relative} selected PRODUCT-0029 before PRODUCT-0030 through {forbidden}"
+			);
+		}
+	}
+
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	assert!(request.contains("pub fn plan_with_categorical_palette("));
+	assert!(request.contains("resolve_domains_with_categorical_palette("));
+	assert!(request.contains("selection: &CategoricalPaletteSelection"));
+	assert!(request.contains("identity: &ColorIdentity"));
+	assert!(request.contains("Result<(ResolvedPlot, ColorIdentity), String>"));
+
+	let head = std::fs::read_to_string(root.join("gui/state.rs")).expect("read Rune head");
+	assert!(head.contains("rune_categorical_identities"));
+	assert!(head.contains("plan_with_categorical_palette("));
+	assert!(head.contains("resolve_categorical_palette_identity()"));
+	assert!(!head.contains("Theme::try_new"));
+	assert!(!head.contains("ResolvedCategoricalPalette"));
+}
+
+#[test]
+fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let envelope =
+		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
+	let figure_parser = envelope
+		.split("fn parse_figure(")
+		.nth(1)
+		.expect("figure parser")
+		.split("fn parse_figure_heading(")
+		.next()
+		.expect("bounded figure parser");
+	assert!(figure_parser.contains("\"palette\" =>"));
+	assert!(figure_parser.contains("authored_settings.categorical_palette"));
+	for forbidden in [
+		"CategoricalPaletteSelection",
+		"ResolvedCategoricalPalette",
+		"ColorIdentity",
+		"RuneCategoricalContinuation",
+		"Theme::try_new",
+	] {
+		assert!(
+			!figure_parser.contains(forbidden),
+			"Rune normal form acquired resolved/head state through {forbidden}"
+		);
+	}
+	let mark_register = envelope
+		.split("fn parse_modified_mark(")
+		.nth(1)
+		.expect("mark register")
+		.split("fn parse_layer_modifier_factor(")
+		.next()
+		.expect("bounded mark register");
+	assert!(!mark_register.contains("\"palette\""));
+	assert!(!mark_register.contains("\"skin\""));
+
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot settings");
+	assert!(theme.contains("DEFAULT_CATEGORICAL_PALETTE: &'static str = \"viridis\""));
+	assert!(theme.contains("resolve_categorical_palette_identity"));
+	assert!(!theme.contains("Theme::try_new"));
+
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	let explicit = request
+		.split("pub fn plan_with_categorical_palette(")
+		.nth(1)
+		.expect("explicit request")
+		.split("fn project_named_channels(")
+		.next()
+		.expect("explicit request body");
+	assert!(!explicit.contains("viridis"));
+	assert!(!explicit.contains("Theme::try_new"));
+	assert!(explicit.contains("selection: &CategoricalPaletteSelection"));
+	assert!(explicit.contains("identity: &ColorIdentity"));
+
+	let head = std::fs::read_to_string(root.join("gui/state.rs")).expect("read Rune head");
+	assert!(head.contains("(BufferId, LocalViewIdentity, usize), ColorIdentity"));
+	assert!(head.contains("prepare_rune_categorical_palettes("));
+	assert!(head.contains("plan_with_categorical_palette("));
+	let head_production = head
+		.split("\n#[cfg(test)]\nmod tests")
+		.next()
+		.expect("head production source");
+	let ready = head_production
+		.split("Message::RuneRelationPlotReady {")
+		.last()
+		.expect("ready handler");
+	let stale_check = ready
+		.find("rune_buffer_revisions.get(&source_buffer) != Some(&revision)")
+		.expect("stale check");
+	let content = ready.find("set_rune_view_plot(").expect("content install");
+	let continuation = ready
+		.find("rune_categorical_identities.insert(")
+		.expect("continuation commit");
+	assert!(stale_check < content && content < continuation);
+
+	for relative in ["plot/factory.rs", "plot/kernels/bar.rs", "editor.rs"] {
+		let source = std::fs::read_to_string(root.join(relative)).expect("read unchanged boundary");
+		let source = source
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production boundary");
+		for forbidden in [
+			"RuneCategoricalContinuation",
+			"CategoricalPaletteSelection",
+			"ColorIdentity",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"{relative} acquired Rune categorical continuation through {forbidden}"
 			);
 		}
 	}

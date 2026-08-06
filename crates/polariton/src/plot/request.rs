@@ -7,8 +7,9 @@
 //! (`plans/wip/rune-data-products.md`).
 
 use crate::plot::spec::{
-	AuthoredChannel, AuthoredPlotSpec, ColorIdentity, OptionalAuthoredChannel, PlotProvenance,
-	ResolvedPlotSpec, StampedResult, resolve_channels, resolve_domains,
+	AuthoredChannel, AuthoredPlotSpec, CategoricalPaletteSelection, ColorIdentity,
+	OptionalAuthoredChannel, PlotProvenance, ResolvedPlotSpec, StampedResult, resolve_channels,
+	resolve_domains, resolve_domains_with_categorical_palette,
 };
 use polars::frame::DataFrame;
 use std::sync::Arc;
@@ -86,6 +87,41 @@ pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 				data,
 				resolved_spec,
 			})
+		}
+	}
+}
+
+/// Resolve one request through an explicit categorical palette and a snapshot
+/// of its live continuation state. This substrate owns no Rune default.
+pub fn plan_with_categorical_palette(
+	request: PlotRequest,
+	selection: &CategoricalPaletteSelection,
+	identity: &ColorIdentity,
+) -> Result<(ResolvedPlot, ColorIdentity), String> {
+	match request.source {
+		PlotSource::Materialized { name, data } => {
+			let binding = resolve_channels(&request.authored_spec, data.schema().as_ref())
+				.map_err(|error| format!("{name}: {error}"))?;
+			let stamped = StampedResult {
+				data: Arc::clone(&data),
+				provenance: PlotProvenance {
+					source_name: name.clone(),
+					revision: None,
+				},
+			};
+			let (resolved_spec, next_identity) =
+				resolve_domains_with_categorical_palette(binding, &stamped, identity, selection)
+					.map_err(|error| format!("{name}: {error}"))?;
+			let data = project_named_channels(&request.authored_spec, data, &name)?;
+			Ok((
+				ResolvedPlot {
+					source_name: name,
+					authored_spec: Box::new(request.authored_spec),
+					data,
+					resolved_spec,
+				},
+				next_identity,
+			))
 		}
 	}
 }
@@ -297,6 +333,58 @@ mod tests {
 		assert_eq!(
 			actual,
 			include_str!("spec/snapshots/product-0030-pre-switch-categorical.txt")
+		);
+	}
+
+	#[test]
+	fn product_0030_explicit_request_consumes_the_complete_categorical_selection() {
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c_s1")
+			.expect("registered categorical palette");
+		let (resolved, continuation) = plan_with_categorical_palette(
+			PlotRequest {
+				source: materialized(
+					"explicit bar",
+					df!(
+						"cat" => ["A", "B", "C", "D", "E", "F"],
+						"val" => [1_i32, 2, 3, 4, 5, 6],
+					)
+					.expect("bar frame"),
+				),
+				authored_spec: AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::Bar),
+					"cat",
+					"val",
+				),
+			},
+			&selection,
+			&ColorIdentity::default(),
+		)
+		.expect("explicit request");
+		assert!(resolved.resolved_spec.channel(Channel::Color).is_none());
+		assert_eq!(continuation.len(), 6);
+		assert_eq!(
+			resolved
+				.resolved_spec
+				.band_fills
+				.iter()
+				.map(|assignment| (
+					assignment.category.as_str(),
+					assignment.position.index(),
+					(
+						assignment.color.red,
+						assignment.color.green,
+						assignment.color.blue,
+					),
+				))
+				.collect::<Vec<_>>(),
+			[
+				("A", 0, (150, 150, 150)),
+				("B", 4, (198, 219, 239)),
+				("C", 8, (253, 208, 162)),
+				("D", 11, (161, 217, 155)),
+				("E", 15, (188, 189, 220)),
+				("F", 19, (63, 0, 125)),
+			]
 		);
 	}
 }

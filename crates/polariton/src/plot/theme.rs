@@ -160,6 +160,9 @@ pub struct ScatterPolicy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotSettingsLayer {
 	pub theme: Override<PlotThemeSpec>,
+	/// Figure-wide categorical palette identity. Resolution remains libaryon-owned;
+	/// this settings layer carries only authored/application/pane intent.
+	pub categorical_palette: Override<Arc<String>>,
 	pub typography: Override<PlotTypography>,
 	pub padding: Override<PlotPadding>,
 	pub guides: Override<PlotGuideSettings>,
@@ -178,6 +181,7 @@ impl Default for PlotSettingsLayer {
 	fn default() -> Self {
 		Self {
 			theme: Override::Inherit,
+			categorical_palette: Override::Inherit,
 			typography: Override::Inherit,
 			padding: Override::Inherit,
 			guides: Override::Inherit,
@@ -206,6 +210,25 @@ pub struct PlotSettings {
 }
 
 impl PlotSettings {
+	pub const DEFAULT_CATEGORICAL_PALETTE: &'static str = "viridis";
+
+	/// Resolve the figure-wide categorical palette identity before domain
+	/// resolution. The graphical-layer tier is intentionally inapplicable to a
+	/// figure-wide property, while the accepted five-tier order remains intact.
+	pub fn resolve_categorical_palette_identity(&self) -> Arc<String> {
+		let mut identity = Arc::new(Self::DEFAULT_CATEGORICAL_PALETTE.to_owned());
+		for layer in [
+			&self.application_theme,
+			&self.authored_spec,
+			&self.pane_override,
+		] {
+			if let Override::Set(value) = &layer.categorical_palette {
+				identity = Arc::clone(value);
+			}
+		}
+		identity
+	}
+
 	/// Preserve an already-resolved legacy/editor setting as the library base.
 	/// All later tiers are empty, so resolving is byte-for-byte stable.
 	pub fn from_resolved(library_defaults: ResolvedPlotSettings) -> Self {
@@ -413,6 +436,40 @@ mod tests {
 			..PlotThemeSpec::default()
 		});
 		assert_eq!(cascade.resolve().color_theme, ColorTheme::Magma);
+	}
+
+	#[test]
+	fn product_0030_categorical_palette_has_one_explicit_figure_wide_cascade() {
+		let identity = |value: &str| Override::Set(Arc::new(value.to_owned()));
+		let mut cascade = PlotSettings::default();
+		assert_eq!(
+			cascade.resolve_categorical_palette_identity().as_str(),
+			PlotSettings::DEFAULT_CATEGORICAL_PALETTE
+		);
+		assert_eq!(PlotSettings::DEFAULT_CATEGORICAL_PALETTE, "viridis");
+
+		cascade.application_theme.categorical_palette = identity("application");
+		assert_eq!(
+			cascade.resolve_categorical_palette_identity().as_str(),
+			"application"
+		);
+		cascade.authored_spec.categorical_palette = identity("authored");
+		assert_eq!(
+			cascade.resolve_categorical_palette_identity().as_str(),
+			"authored"
+		);
+
+		cascade.layer.categorical_palette = identity("wrong-graphical-layer");
+		assert_eq!(
+			cascade.resolve_categorical_palette_identity().as_str(),
+			"authored",
+			"graphical-layer settings cannot override figure-wide palette identity"
+		);
+		cascade.pane_override.categorical_palette = identity("pane");
+		assert_eq!(
+			cascade.resolve_categorical_palette_identity().as_str(),
+			"pane"
+		);
 	}
 
 	#[test]
