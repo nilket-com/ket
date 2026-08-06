@@ -31,6 +31,43 @@ pub struct RenderToken {
 	pub is_folded: bool,
 }
 
+/// Reassemble contiguous loaded document bytes before publishing them to a
+/// frontend. UAST leaves are byte-storage and semantic boundaries, so a valid
+/// UTF-8 scalar may straddle two of them. A frontend that decodes each leaf in
+/// isolation would therefore fabricate invalid text from a valid document.
+///
+/// Hydration and pinning consume the original tokens before this projection is
+/// applied. Fold placeholders remain separate because their display bytes do
+/// not correspond one-for-one with their physical span.
+pub(crate) fn coalesce_frontend_text_tokens(tokens: Vec<RenderToken>) -> Vec<RenderToken> {
+	let mut coalesced: Vec<RenderToken> = Vec::with_capacity(tokens.len());
+	for mut token in tokens {
+		let Some(previous) = coalesced.last_mut() else {
+			coalesced.push(token);
+			continue;
+		};
+		let previous_end = previous
+			.absolute_start_byte
+			.saturating_add(previous.text.len() as u64);
+		let merged_len = previous.text.len().checked_add(token.text.len());
+		let can_merge = !previous.is_folded
+			&& !token.is_folded
+			&& !previous.text.is_empty()
+			&& !token.text.is_empty()
+			&& previous_end == token.absolute_start_byte
+			&& merged_len.is_some_and(|len| u32::try_from(len).is_ok());
+		if can_merge {
+			previous.text.append(&mut token.text);
+			previous.physical_byte_len = u32::try_from(previous.text.len())
+				.expect("frontend text token length was checked before merging");
+			previous.is_virtual |= token.is_virtual;
+		} else {
+			coalesced.push(token);
+		}
+	}
+	coalesced
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct NodeCursorTarget {
 	pub node_id: NodeId,
@@ -2476,6 +2513,20 @@ mod tests {
 		);
 		assert_eq!(reconstructed, skull);
 		assert_eq!(std::str::from_utf8(&reconstructed), Ok("☠"));
+	}
+
+	#[test]
+	fn frontend_projection_reassembles_valid_utf8_across_render_tokens() {
+		let skull = "☠".as_bytes();
+		let chunks = [&skull[..1], &skull[1..2], &skull[2..]];
+		let (registry, root) = build_document_with_byte_leaves(&chunks);
+		let tokens = registry.query_viewport(root, &crate::uast::NoFolds, DocLine::ZERO, 1);
+
+		let projected = super::coalesce_frontend_text_tokens(tokens);
+
+		assert_eq!(projected.len(), 1);
+		assert_eq!(projected[0].text, skull);
+		assert_eq!(std::str::from_utf8(&projected[0].text), Ok("☠"));
 	}
 
 	#[test]

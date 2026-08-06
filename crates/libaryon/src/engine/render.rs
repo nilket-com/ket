@@ -31,7 +31,7 @@ use crate::svp::rust_highlight::{HighlightSpan, HighlightSpanIndex, TokenCategor
 use crate::svp::semantic::SemanticReactor;
 use crate::uast::projection::{
 	GutterLineNumber, HostPanelViewport, PaneDividerViewport, PickerResultViewport, PickerViewport,
-	ProjectedCaret,
+	ProjectedCaret, coalesce_frontend_text_tokens,
 };
 use crate::uast::{PaneViewport, RenderToken, UastProjection, Viewport};
 use std::collections::{HashMap, HashSet};
@@ -1110,6 +1110,7 @@ fn render_pane_viewport(
 				pane_layout.pane_id.get(),
 				visible_tokens.iter().map(|token| token.node_id),
 			);
+			let visible_tokens = coalesce_frontend_text_tokens(visible_tokens);
 
 			(
 				virtual_tokens,
