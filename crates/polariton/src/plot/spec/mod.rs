@@ -10,6 +10,8 @@
 
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
+use libaryon::core::Rgb;
+use libaryon::engine::{ResolvedCategoricalPalette, Theme};
 use polars::frame::DataFrame;
 use polars::prelude::{AnyValue, DataType, Schema};
 use std::collections::{HashMap, HashSet};
@@ -652,6 +654,133 @@ pub struct CategoryColorAssignment {
 	pub color: ResolvedColor,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CategoricalPaletteSelection {
+	identity: String,
+	palette: ResolvedCategoricalPalette,
+}
+
+impl CategoricalPaletteSelection {
+	pub fn from_theme_name(identity: &str) -> Result<Self, CategoricalPaletteSelectionError> {
+		let theme = Theme::try_new(identity).map_err(|source| {
+			CategoricalPaletteSelectionError::UnknownTheme {
+				identity: identity.to_owned(),
+				source,
+			}
+		})?;
+		let palette = theme.categorical_palette().cloned().ok_or_else(|| {
+			CategoricalPaletteSelectionError::NoCategoricalPalette {
+				identity: identity.to_owned(),
+			}
+		})?;
+		Ok(Self {
+			identity: identity.to_owned(),
+			palette,
+		})
+	}
+
+	pub fn identity(&self) -> &str {
+		&self.identity
+	}
+
+	pub fn len(&self) -> usize {
+		self.palette.len()
+	}
+
+	fn color(&self, position: PalettePosition) -> ResolvedColor {
+		resolved_color(
+			self.palette
+				.color(position.index())
+				.expect("position was validated against this allocation space"),
+		)
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CategoricalPaletteSelectionError {
+	UnknownTheme { identity: String, source: String },
+	NoCategoricalPalette { identity: String },
+}
+
+impl fmt::Display for CategoricalPaletteSelectionError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::UnknownTheme { source, .. } => formatter.write_str(source),
+			Self::NoCategoricalPalette { identity } => write!(
+				formatter,
+				"theme `{identity}` has no declared categorical palette"
+			),
+		}
+	}
+}
+
+impl std::error::Error for CategoricalPaletteSelectionError {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CategoricalCapacityFailure {
+	pub channel: Channel,
+	pub field: String,
+	pub layer: LayerIdentity,
+	pub role: &'static str,
+	pub retained: usize,
+	pub requested: usize,
+	pub geometry_limit: usize,
+	pub palette_identity: String,
+	pub palette_limit: usize,
+	pub geometry_exceeded: bool,
+	pub palette_exceeded: bool,
+}
+
+impl fmt::Display for CategoricalCapacityFailure {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			formatter,
+			"categorical {} `{}` requests {} identities ({} retained); geometry limit {}, palette `{}` limit {}",
+			self.role,
+			self.field,
+			self.requested,
+			self.retained,
+			self.geometry_limit,
+			self.palette_identity,
+			self.palette_limit
+		)
+	}
+}
+
+impl std::error::Error for CategoricalCapacityFailure {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CategoricalResolutionError {
+	Domain(DomainError),
+	Capacity(CategoricalCapacityFailure),
+	IncompatibleAllocationSpace {
+		field: String,
+		layer: LayerIdentity,
+		existing_len: usize,
+		selected_len: usize,
+	},
+}
+
+impl fmt::Display for CategoricalResolutionError {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Domain(source) => source.fmt(formatter),
+			Self::Capacity(source) => source.fmt(formatter),
+			Self::IncompatibleAllocationSpace {
+				field,
+				existing_len,
+				selected_len,
+				..
+			} => write!(
+				formatter,
+				"categorical continuation for `{field}` uses palette length {existing_len}, not selected length {selected_len}"
+			),
+		}
+	}
+}
+
+impl std::error::Error for CategoricalResolutionError {}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct ResolvedChannel {
 	pub binding: BoundChannel,
@@ -1270,6 +1399,64 @@ pub fn resolve_domains(
 	))
 }
 
+/// PRODUCT-0029's explicit, test-only categorical palette path. PRODUCT-0030
+/// owns the first production caller and the authored default.
+pub fn resolve_domains_with_categorical_palette(
+	binding: ChannelBinding,
+	result: &StampedResult,
+	identity: &ColorIdentity,
+	selection: &CategoricalPaletteSelection,
+) -> Result<(ResolvedPlotSpec, ColorIdentity), CategoricalResolutionError> {
+	let mut next_identity = identity.clone();
+	let mut channels = Vec::with_capacity(binding.channels.len());
+	let color_job = binding.color_job;
+	for channel in binding.channels {
+		let column = result.data.column(&channel.field).map_err(|error| {
+			CategoricalResolutionError::Domain(DomainError {
+				channel: channel.channel,
+				field: channel.field.clone(),
+				reason: error.to_string(),
+			})
+		})?;
+		let domain =
+			resolve_domain(column, &channel).map_err(CategoricalResolutionError::Domain)?;
+		let colors =
+			if channel.channel == Channel::Color && color_job == Some(ColorJob::Categorical) {
+				let ScaleDomain::Categorical(categories) = &domain else {
+					return Err(CategoricalResolutionError::Domain(DomainError {
+						channel: channel.channel,
+						field: channel.field.clone(),
+						reason: "categorical color requires a categorical domain".to_owned(),
+					}));
+				};
+				resolve_explicit_category_colors(
+					categories,
+					&channel,
+					binding.categorical_limit,
+					selection,
+					&mut next_identity,
+				)?
+			} else {
+				Vec::new()
+			};
+		channels.push(ResolvedChannel {
+			binding: channel,
+			domain,
+			colors,
+		});
+	}
+	Ok((
+		ResolvedPlotSpec {
+			composition: binding.composition,
+			channels,
+			kernel_fields: binding.kernel_fields,
+			color_job,
+			provenance: result.provenance.clone(),
+		},
+		next_identity,
+	))
+}
+
 fn kernel_fields_from_channels(
 	plot_type: PlotType,
 	channels: &[BoundChannel],
@@ -1749,6 +1936,197 @@ fn category_value(value: AnyValue<'_>) -> Option<String> {
 	}
 }
 
+fn resolved_color(color: Rgb) -> ResolvedColor {
+	ResolvedColor {
+		red: color.r,
+		green: color.g,
+		blue: color.b,
+		alpha: u8::MAX,
+	}
+}
+
+fn evenly_spread_positions(domain_len: usize, palette_len: usize) -> Vec<PalettePosition> {
+	match domain_len {
+		0 => Vec::new(),
+		1 => vec![
+			PalettePosition::new(0, palette_len)
+				.expect("a categorical palette is structurally non-empty"),
+		],
+		_ => (0..domain_len)
+			.map(|index| {
+				let numerator = index * (palette_len - 1);
+				let denominator = domain_len - 1;
+				let rounded = (numerator + denominator / 2) / denominator;
+				PalettePosition::new(rounded, palette_len)
+					.expect("even spread stays inside the palette")
+			})
+			.collect(),
+	}
+}
+
+fn maximin_position(
+	occupied: &HashSet<PalettePosition>,
+	palette_len: usize,
+) -> Option<PalettePosition> {
+	(0..palette_len)
+		.filter_map(|index| {
+			let candidate = PalettePosition::new(index, palette_len).ok()?;
+			(!occupied.contains(&candidate)).then(|| {
+				let score = occupied
+					.iter()
+					.map(|position| position.index().abs_diff(index))
+					.min()
+					.unwrap_or(usize::MAX);
+				(candidate, score)
+			})
+		})
+		.fold(None, |best, candidate| match best {
+			None => Some(candidate),
+			Some((_, best_score)) if candidate.1 > best_score => Some(candidate),
+			Some(best) => Some(best),
+		})
+		.map(|(position, _)| position)
+}
+
+fn resolve_explicit_positions(
+	categories: &[String],
+	channel: &BoundChannel,
+	geometry_limit: usize,
+	selection: &CategoricalPaletteSelection,
+	identity: &mut ColorIdentity,
+	role: &'static str,
+) -> Result<Vec<(String, PalettePosition)>, CategoricalResolutionError> {
+	let lineage = ColorLineageKey {
+		field: channel.field.clone(),
+		layer: channel.layer.clone(),
+	};
+	let selected_space = ColorAllocationSpace::CategoricalPalette {
+		len: selection.len(),
+	};
+	if let Some(existing) = identity.spaces.get(&lineage) {
+		if *existing != selected_space {
+			return Err(CategoricalResolutionError::IncompatibleAllocationSpace {
+				field: channel.field.clone(),
+				layer: channel.layer.clone(),
+				existing_len: existing.len(),
+				selected_len: selection.len(),
+			});
+		}
+	}
+
+	let retained = identity
+		.assignments
+		.keys()
+		.filter(|key| key.field == channel.field && key.layer == channel.layer)
+		.count();
+	let missing = categories
+		.iter()
+		.filter(|category| {
+			!identity.assignments.contains_key(&ColorIdentityKey {
+				field: channel.field.clone(),
+				layer: channel.layer.clone(),
+				category: (*category).clone(),
+			})
+		})
+		.count();
+	let requested = retained.saturating_add(missing);
+	let geometry_exceeded = requested > geometry_limit;
+	let palette_exceeded = requested > selection.len();
+	if geometry_exceeded || palette_exceeded {
+		return Err(CategoricalResolutionError::Capacity(
+			CategoricalCapacityFailure {
+				channel: channel.channel,
+				field: channel.field.clone(),
+				layer: channel.layer.clone(),
+				role,
+				retained,
+				requested,
+				geometry_limit,
+				palette_identity: selection.identity.clone(),
+				palette_limit: selection.len(),
+				geometry_exceeded,
+				palette_exceeded,
+			},
+		));
+	}
+
+	identity.spaces.entry(lineage).or_insert(selected_space);
+	if retained == 0 {
+		for (category, position) in categories
+			.iter()
+			.zip(evenly_spread_positions(categories.len(), selection.len()))
+		{
+			identity.assignments.insert(
+				ColorIdentityKey {
+					field: channel.field.clone(),
+					layer: channel.layer.clone(),
+					category: category.clone(),
+				},
+				position,
+			);
+		}
+	} else {
+		let mut occupied = identity
+			.assignments
+			.iter()
+			.filter(|(key, _)| key.field == channel.field && key.layer == channel.layer)
+			.map(|(_, position)| *position)
+			.collect::<HashSet<_>>();
+		for category in categories {
+			let key = ColorIdentityKey {
+				field: channel.field.clone(),
+				layer: channel.layer.clone(),
+				category: category.clone(),
+			};
+			if !identity.assignments.contains_key(&key) {
+				let position = maximin_position(&occupied, selection.len())
+					.expect("capacity validation guarantees an unoccupied position");
+				occupied.insert(position);
+				identity.assignments.insert(key, position);
+			}
+		}
+	}
+
+	Ok(categories
+		.iter()
+		.map(|category| {
+			let key = ColorIdentityKey {
+				field: channel.field.clone(),
+				layer: channel.layer.clone(),
+				category: category.clone(),
+			};
+			(category.clone(), identity.assignments[&key])
+		})
+		.collect())
+}
+
+fn resolve_explicit_category_colors(
+	categories: &[String],
+	channel: &BoundChannel,
+	geometry_limit: usize,
+	selection: &CategoricalPaletteSelection,
+	identity: &mut ColorIdentity,
+) -> Result<Vec<CategoryColorAssignment>, CategoricalResolutionError> {
+	resolve_explicit_positions(
+		categories,
+		channel,
+		geometry_limit,
+		selection,
+		identity,
+		"color channel",
+	)
+	.map(|assignments| {
+		assignments
+			.into_iter()
+			.map(|(category, position)| CategoryColorAssignment {
+				category,
+				position,
+				color: selection.color(position),
+			})
+			.collect()
+	})
+}
+
 fn resolve_category_colors(
 	categories: &[String],
 	channel: &BoundChannel,
@@ -2037,6 +2415,337 @@ mod tests {
 				},
 			]
 		);
+	}
+
+	fn resolve_explicit(
+		spec: &AuthoredPlotSpec,
+		result: &StampedResult,
+		identity: &ColorIdentity,
+		palette: &str,
+	) -> Result<(ResolvedPlotSpec, ColorIdentity), CategoricalResolutionError> {
+		let binding = resolve_channels(spec, result.data.schema().as_ref())
+			.expect("explicit categorical channel binding");
+		let selection = CategoricalPaletteSelection::from_theme_name(palette)
+			.expect("categorical palette selection");
+		resolve_domains_with_categorical_palette(binding, result, identity, &selection)
+	}
+
+	fn position_color_mapping(resolved: &ResolvedPlotSpec) -> Vec<(String, usize, ResolvedColor)> {
+		resolved
+			.channel(Channel::Color)
+			.expect("color channel")
+			.colors
+			.iter()
+			.map(|assignment| {
+				(
+					assignment.category.clone(),
+					assignment.position.index(),
+					assignment.color,
+				)
+			})
+			.collect()
+	}
+
+	#[test]
+	fn product_0029_fresh_tab20c_spreads_complete_mapping_and_observes_modifiers() {
+		let categories = ["A", "B", "C", "D", "E", "F"]
+			.into_iter()
+			.map(str::to_owned)
+			.collect::<Vec<_>>();
+		let result = legacy_category_frame(&categories);
+		let spec = legacy_category_spec();
+		let expected_positions = [0, 4, 8, 11, 15, 19];
+		let expected_base = [
+			ResolvedColor {
+				red: 49,
+				green: 130,
+				blue: 189,
+				alpha: 255,
+			},
+			ResolvedColor {
+				red: 230,
+				green: 85,
+				blue: 13,
+				alpha: 255,
+			},
+			ResolvedColor {
+				red: 49,
+				green: 163,
+				blue: 84,
+				alpha: 255,
+			},
+			ResolvedColor {
+				red: 199,
+				green: 233,
+				blue: 192,
+				alpha: 255,
+			},
+			ResolvedColor {
+				red: 218,
+				green: 218,
+				blue: 235,
+				alpha: 255,
+			},
+			ResolvedColor {
+				red: 150,
+				green: 150,
+				blue: 150,
+				alpha: 255,
+			},
+		];
+
+		for palette in ["tab20c", "tab20c_r", "tab20c_s1"] {
+			let (resolved, _) =
+				resolve_explicit(&spec, &result, &ColorIdentity::default(), palette)
+					.expect("fresh categorical palette");
+			let mapping = position_color_mapping(&resolved);
+			assert_eq!(
+				mapping
+					.iter()
+					.map(|(category, position, _)| (category.as_str(), *position))
+					.collect::<Vec<_>>(),
+				["A", "B", "C", "D", "E", "F"]
+					.into_iter()
+					.zip(expected_positions)
+					.collect::<Vec<_>>()
+			);
+			let authority = Theme::try_new(palette).unwrap();
+			let authority = authority.categorical_palette().unwrap();
+			assert_eq!(
+				mapping
+					.iter()
+					.map(|(_, _, color)| *color)
+					.collect::<Vec<_>>(),
+				expected_positions
+					.into_iter()
+					.map(|position| resolved_color(authority.color(position).unwrap()))
+					.collect::<Vec<_>>()
+			);
+			if palette == "tab20c" {
+				assert_eq!(
+					mapping
+						.iter()
+						.map(|(_, _, color)| *color)
+						.collect::<Vec<_>>(),
+					expected_base
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn product_0029_fresh_spread_covers_admitted_sizes_and_beats_greedy_control() {
+		assert!(evenly_spread_positions(0, 20).is_empty());
+		assert_eq!(evenly_spread_positions(1, 20)[0].index(), 0);
+		for domain_len in 1..=12 {
+			let positions = evenly_spread_positions(domain_len, 20);
+			assert_eq!(positions.len(), domain_len);
+			assert!(
+				positions
+					.windows(2)
+					.all(|pair| pair[0].index() < pair[1].index())
+			);
+		}
+		let spread = evenly_spread_positions(6, 20)
+			.into_iter()
+			.map(PalettePosition::index)
+			.collect::<Vec<_>>();
+		assert_eq!(spread, [0, 4, 8, 11, 15, 19]);
+		assert_eq!(
+			spread.windows(2).map(|pair| pair[1] - pair[0]).min(),
+			Some(3)
+		);
+
+		let mut greedy = HashSet::new();
+		let mut chosen = Vec::new();
+		for _ in 0..6 {
+			let next = maximin_position(&greedy, 20).unwrap();
+			greedy.insert(next);
+			chosen.push(next.index());
+		}
+		assert_eq!(chosen, [0, 19, 9, 14, 4, 2]);
+		let mut sorted = chosen;
+		sorted.sort_unstable();
+		assert_eq!(
+			sorted.windows(2).map(|pair| pair[1] - pair[0]).min(),
+			Some(2)
+		);
+	}
+
+	#[test]
+	fn product_0029_live_growth_uses_returned_identity_and_fresh_control_differs() {
+		let spec = legacy_category_spec();
+		let mut identity = ColorIdentity::default();
+		for (categories, expected) in [
+			(vec!["A"], vec![("A", 0)]),
+			(vec!["A", "B"], vec![("A", 0), ("B", 19)]),
+			(vec!["A", "B", "C"], vec![("A", 0), ("B", 19), ("C", 9)]),
+		] {
+			let categories = categories
+				.into_iter()
+				.map(str::to_owned)
+				.collect::<Vec<_>>();
+			let (resolved, next) = resolve_explicit(
+				&spec,
+				&legacy_category_frame(&categories),
+				&identity,
+				"tab20c",
+			)
+			.expect("live categorical resolution");
+			assert_eq!(
+				position_color_mapping(&resolved)
+					.into_iter()
+					.map(|(category, position, _)| (category, position))
+					.collect::<Vec<_>>(),
+				expected
+					.into_iter()
+					.map(|(category, position)| (category.to_owned(), position))
+					.collect::<Vec<_>>()
+			);
+			identity = next;
+		}
+
+		let fresh = ["A", "B", "C"]
+			.into_iter()
+			.map(str::to_owned)
+			.collect::<Vec<_>>();
+		let (resolved, _) = resolve_explicit(
+			&spec,
+			&legacy_category_frame(&fresh),
+			&ColorIdentity::default(),
+			"tab20c",
+		)
+		.expect("fresh control");
+		assert_eq!(
+			position_color_mapping(&resolved)
+				.into_iter()
+				.map(|(_, position, _)| position)
+				.collect::<Vec<_>>(),
+			[0, 10, 19]
+		);
+	}
+
+	#[test]
+	fn product_0029_filtering_reserves_positions_and_returning_color() {
+		let spec = legacy_category_spec();
+		let initial = ["A", "B"]
+			.into_iter()
+			.map(str::to_owned)
+			.collect::<Vec<_>>();
+		let (first, identity) = resolve_explicit(
+			&spec,
+			&legacy_category_frame(&initial),
+			&ColorIdentity::default(),
+			"tab20c",
+		)
+		.expect("initial");
+		let b_color = position_color_mapping(&first)[1].2;
+		let filtered = ["A", "C"]
+			.into_iter()
+			.map(str::to_owned)
+			.collect::<Vec<_>>();
+		let (second, identity) = resolve_explicit(
+			&spec,
+			&legacy_category_frame(&filtered),
+			&identity,
+			"tab20c",
+		)
+		.expect("filtered extension");
+		assert_eq!(
+			position_color_mapping(&second)
+				.into_iter()
+				.map(|(category, position, _)| (category, position))
+				.collect::<Vec<_>>(),
+			[("A".to_owned(), 0), ("C".to_owned(), 9)]
+		);
+		let returning = ["B"].into_iter().map(str::to_owned).collect::<Vec<_>>();
+		let (third, _) = resolve_explicit(
+			&spec,
+			&legacy_category_frame(&returning),
+			&identity,
+			"tab20c",
+		)
+		.expect("returning category");
+		assert_eq!(
+			position_color_mapping(&third),
+			[("B".to_owned(), 19, b_color)]
+		);
+	}
+
+	#[test]
+	fn product_0029_selection_and_capacity_failures_remain_distinct_and_atomic() {
+		assert!(matches!(
+			CategoricalPaletteSelection::from_theme_name("not-a-theme"),
+			Err(CategoricalPaletteSelectionError::UnknownTheme { .. })
+		));
+		assert!(matches!(
+			CategoricalPaletteSelection::from_theme_name("nord"),
+			Err(CategoricalPaletteSelectionError::NoCategoricalPalette { identity })
+				if identity == "nord"
+		));
+
+		let spec = legacy_category_spec();
+		for (palette, cardinality, geometry_exceeded, palette_exceeded) in [
+			("dark2", 10, false, true),
+			("tab20c", 13, true, false),
+			("dark2", 13, true, true),
+		] {
+			let categories = (0..cardinality)
+				.map(|index| format!("c{index}"))
+				.collect::<Vec<_>>();
+			let original = ColorIdentity::default();
+			let error = resolve_explicit(
+				&spec,
+				&legacy_category_frame(&categories),
+				&original,
+				palette,
+			)
+			.expect_err("capacity must refuse");
+			let CategoricalResolutionError::Capacity(facts) = error else {
+				panic!("wrong capacity outcome: {error}");
+			};
+			assert_eq!(facts.field, "series");
+			assert_eq!(facts.role, "color channel");
+			assert_eq!(facts.retained, 0);
+			assert_eq!(facts.requested, cardinality);
+			assert_eq!(facts.geometry_limit, 12);
+			assert_eq!(facts.palette_identity, palette);
+			assert_eq!(facts.palette_limit, if palette == "dark2" { 8 } else { 20 });
+			assert_eq!(facts.geometry_exceeded, geometry_exceeded);
+			assert_eq!(facts.palette_exceeded, palette_exceeded);
+			assert!(original.is_empty(), "failure mutated caller identity");
+
+			let control = ["ok"].into_iter().map(str::to_owned).collect::<Vec<_>>();
+			resolve_explicit(&spec, &legacy_category_frame(&control), &original, palette)
+				.expect("identity remains usable after refusal");
+		}
+	}
+
+	#[test]
+	fn product_0029_allocation_spaces_do_not_mix_silently() {
+		let spec = legacy_category_spec();
+		let categories = ["A"].into_iter().map(str::to_owned).collect::<Vec<_>>();
+		let result = legacy_category_frame(&categories);
+		let (_, legacy) = resolve(&spec, &result, &ColorIdentity::default()).unwrap();
+		assert!(matches!(
+			resolve_explicit(&spec, &result, &legacy, "tab20c"),
+			Err(CategoricalResolutionError::IncompatibleAllocationSpace {
+				existing_len: 12,
+				selected_len: 20,
+				..
+			})
+		));
+
+		let (_, dark2) =
+			resolve_explicit(&spec, &result, &ColorIdentity::default(), "dark2").unwrap();
+		assert!(matches!(
+			resolve_explicit(&spec, &result, &dark2, "tab20c"),
+			Err(CategoricalResolutionError::IncompatibleAllocationSpace {
+				existing_len: 8,
+				selected_len: 20,
+				..
+			})
+		));
 	}
 
 	fn layered(first: LayerSpec, rest: impl IntoIterator<Item = LayerSpec>) -> LayeredPlotSpec {
