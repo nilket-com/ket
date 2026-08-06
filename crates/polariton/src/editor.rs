@@ -3910,14 +3910,14 @@ fn markdown_cell_output_surface<'a>(
 						.style(move |_| container::Style {
 							background: Some(Background::Color(Color {
 								a: 0.85,
-								..surface.settings.background_color
+								..surface.settings.surrounding_background_color
 							})),
 							border: iced::Border {
-								color: surface.settings.decoration_color,
+								color: surface.settings.surrounding_decoration_color,
 								width: 1.0,
 								radius: 2.0.into(),
 							},
-							text_color: Some(surface.settings.decoration_color),
+							text_color: Some(surface.settings.surrounding_decoration_color),
 							..Default::default()
 						}),
 				);

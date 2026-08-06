@@ -1,4 +1,5 @@
 use crate::gui::messages::PlotMessage;
+use crate::plot::chrome::PlotChrome;
 use crate::plot::colors::ColorTheme;
 use crate::plot::spec::{BarWidth, PointSize, StrokeWidth};
 use crate::plot::theme::PlotSettings;
@@ -228,8 +229,10 @@ pub struct ResolvedPlotSettings {
 	pub x_label_rotation: f32,
 	pub x_label_offset: f32,
 	pub color_theme: ColorTheme,
-	pub background_color: Color,
-	pub decoration_color: Color,
+	pub chrome: PlotChrome,
+	pub mark_decoration_color: Color,
+	pub surrounding_background_color: Color,
+	pub surrounding_decoration_color: Color,
 	pub x_min: Option<f64>,
 	pub x_max: Option<f64>,
 	pub y_min: Option<f64>,
@@ -289,8 +292,10 @@ impl Default for ResolvedPlotSettings {
 			x_label_rotation: 0.0,
 			x_label_offset: 10.0,
 			color_theme: ColorTheme::default(),
-			background_color: Color::from_rgb(0.001, 0.001, 0.001),
-			decoration_color: Color::WHITE,
+			chrome: PlotChrome::DEFAULT,
+			mark_decoration_color: Color::WHITE,
+			surrounding_background_color: Color::from_rgb(0.001, 0.001, 0.001),
+			surrounding_decoration_color: Color::WHITE,
 			x_min: None,
 			x_max: None,
 			y_min: None,
@@ -626,7 +631,11 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	pub fn render_plot_layer(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
-		backend.fill_rectangle(Point::ORIGIN, bounds.size(), self.settings.background_color);
+		backend.fill_rectangle(
+			Point::ORIGIN,
+			bounds.size(),
+			self.settings.chrome.canvas_background.iced(),
+		);
 		let plot_area = self.plot_area(bounds);
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
@@ -673,7 +682,7 @@ impl<'a> PlotWidget<'a> {
 				_ => {}
 			}
 		});
-		let bg = self.settings.background_color;
+		let bg = self.settings.chrome.canvas_background.iced();
 		let canvas_w = bounds.width;
 		let canvas_h = bounds.height;
 		backend.fill_rectangle(Point::ORIGIN, iced::Size::new(canvas_w, plot_area.y), bg);
@@ -763,7 +772,7 @@ impl<'a> PlotWidget<'a> {
 		backend.fill_text(Text {
 			content: title,
 			position: Point::new(size_only_bounds.width / 2.0, self.settings.title_offset),
-			color: self.settings.decoration_color,
+			color: self.settings.chrome.title_text.iced(),
 			size: iced::Pixels(self.settings.title_size),
 			align_x: alignment::Horizontal::Center.into(),
 			align_y: alignment::Vertical::Top,
@@ -773,7 +782,7 @@ impl<'a> PlotWidget<'a> {
 			backend.fill_text(Text {
 				content: st,
 				position: Point::new(size_only_bounds.width / 2.0, self.settings.subtitle_offset),
-				color: self.settings.decoration_color,
+				color: self.settings.chrome.subtitle_text.iced(),
 				size: iced::Pixels(self.settings.subtitle_size),
 				align_x: alignment::Horizontal::Center.into(),
 				align_y: alignment::Vertical::Top,
@@ -787,7 +796,7 @@ impl<'a> PlotWidget<'a> {
 					plot_area.x + plot_area.width / 2.0,
 					plot_area.y + plot_area.height + self.settings.x_label_padding,
 				),
-				color: self.settings.decoration_color,
+				color: self.settings.chrome.axis_label_text.iced(),
 				size: iced::Pixels(self.settings.x_label_size),
 				align_x: alignment::Horizontal::Center.into(),
 				align_y: alignment::Vertical::Top,
@@ -804,7 +813,7 @@ impl<'a> PlotWidget<'a> {
 				backend.fill_text(Text {
 					content: y_label.clone(),
 					position: Point::ORIGIN,
-					color: self.settings.decoration_color,
+					color: self.settings.chrome.axis_label_text.iced(),
 					size: iced::Pixels(self.settings.y_label_size),
 					align_x: alignment::Horizontal::Center.into(),
 					align_y: alignment::Vertical::Bottom,
@@ -951,10 +960,7 @@ impl<'a> PlotWidget<'a> {
 	) {
 		let grid_stroke = |width: f32, style: GridLineStyle| -> Stroke {
 			let mut s = Stroke {
-				style: Style::Solid(Color {
-					a: 0.2,
-					..self.settings.decoration_color
-				}),
+				style: Style::Solid(self.settings.chrome.gridline.iced()),
 				width,
 				..Default::default()
 			};
@@ -1081,12 +1087,12 @@ impl<'a> PlotWidget<'a> {
 			AxisType::Linear
 		};
 		let halo_stroke = Stroke {
-			style: Style::Solid(self.settings.background_color),
+			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
 			width: 4.0,
 			..Default::default()
 		};
 		let axis_stroke = Stroke {
-			style: Style::Solid(self.settings.decoration_color),
+			style: Style::Solid(self.settings.chrome.axis_line.iced()),
 			width: 2.0,
 			..Default::default()
 		};
@@ -1114,7 +1120,7 @@ impl<'a> PlotWidget<'a> {
 			backend.fill_text(Text {
 				content: format_label(data_y, y_axis_type),
 				position: Point::new(p_left.x - 10.0, p_left.y),
-				color: self.settings.decoration_color,
+				color: self.settings.chrome.tick_label_text.iced(),
 				size: iced::Pixels(self.settings.y_tick_size),
 				align_x: alignment::Horizontal::Right.into(),
 				align_y: alignment::Vertical::Center,
@@ -1161,7 +1167,7 @@ impl<'a> PlotWidget<'a> {
 				backend.fill_text(Text {
 					content: format_label(data_x, x_axis_type),
 					position: Point::ORIGIN,
-					color: self.settings.decoration_color,
+					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.x_tick_size),
 					align_x: alignment::Horizontal::Center.into(),
 					..Default::default()
@@ -1200,10 +1206,7 @@ impl<'a> PlotWidget<'a> {
 	) {
 		let grid_stroke = |width: f32, style: GridLineStyle| -> Stroke {
 			let mut s = Stroke {
-				style: Style::Solid(Color {
-					a: 0.2,
-					..self.settings.decoration_color
-				}),
+				style: Style::Solid(self.settings.chrome.gridline.iced()),
 				width,
 				..Default::default()
 			};
@@ -1280,12 +1283,12 @@ impl<'a> PlotWidget<'a> {
 		y_range: (f64, f64),
 	) {
 		let halo_stroke = Stroke {
-			style: Style::Solid(self.settings.background_color),
+			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
 			width: 4.0,
 			..Default::default()
 		};
 		let axis_stroke = Stroke {
-			style: Style::Solid(self.settings.decoration_color),
+			style: Style::Solid(self.settings.chrome.axis_line.iced()),
 			width: 2.0,
 			..Default::default()
 		};
@@ -1318,7 +1321,7 @@ impl<'a> PlotWidget<'a> {
 			backend.fill_text(Text {
 				content: format_label(data_y, AxisType::Linear),
 				position: Point::new(p_left.x - 10.0, p_left.y),
-				color: self.settings.decoration_color,
+				color: self.settings.chrome.tick_label_text.iced(),
 				size: iced::Pixels(self.settings.y_tick_size),
 				align_x: alignment::Horizontal::Right.into(),
 				align_y: alignment::Vertical::Center,
@@ -1343,7 +1346,7 @@ impl<'a> PlotWidget<'a> {
 				backend.fill_text(Text {
 					content: cat.clone(),
 					position: Point::ORIGIN,
-					color: self.settings.decoration_color,
+					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.x_tick_size),
 					align_x: alignment::Horizontal::Center.into(),
 					..Default::default()
@@ -1362,10 +1365,7 @@ impl<'a> PlotWidget<'a> {
 	) {
 		let grid_stroke = |width: f32, style: GridLineStyle| -> Stroke {
 			let mut s = Stroke {
-				style: Style::Solid(Color {
-					a: 0.2,
-					..self.settings.decoration_color
-				}),
+				style: Style::Solid(self.settings.chrome.gridline.iced()),
 				width,
 				..Default::default()
 			};
@@ -1450,12 +1450,12 @@ impl<'a> PlotWidget<'a> {
 		x_range: (f64, f64),
 	) {
 		let halo_stroke = Stroke {
-			style: Style::Solid(self.settings.background_color),
+			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
 			width: 4.0,
 			..Default::default()
 		};
 		let axis_stroke = Stroke {
-			style: Style::Solid(self.settings.decoration_color),
+			style: Style::Solid(self.settings.chrome.axis_line.iced()),
 			width: 2.0,
 			..Default::default()
 		};
@@ -1488,7 +1488,7 @@ impl<'a> PlotWidget<'a> {
 			backend.fill_text(Text {
 				content: format_label(data_x, AxisType::Linear),
 				position: Point::new(p_bottom.x, p_bottom.y + 10.0),
-				color: self.settings.decoration_color,
+				color: self.settings.chrome.tick_label_text.iced(),
 				size: iced::Pixels(self.settings.x_tick_size),
 				align_x: alignment::Horizontal::Center.into(),
 				..Default::default()
@@ -1506,7 +1506,7 @@ impl<'a> PlotWidget<'a> {
 			backend.fill_text(Text {
 				content: cat.clone(),
 				position: Point::new(center_px.x - 10.0, center_px.y),
-				color: self.settings.decoration_color,
+				color: self.settings.chrome.tick_label_text.iced(),
 				size: iced::Pixels(self.settings.y_tick_size),
 				align_x: alignment::Horizontal::Right.into(),
 				align_y: alignment::Vertical::Center,
@@ -1524,12 +1524,12 @@ impl<'a> PlotWidget<'a> {
 		y_categories: &[String],
 	) {
 		let halo_stroke = Stroke {
-			style: Style::Solid(self.settings.background_color),
+			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
 			width: 4.0,
 			..Default::default()
 		};
 		let axis_stroke = Stroke {
-			style: Style::Solid(self.settings.decoration_color),
+			style: Style::Solid(self.settings.chrome.axis_line.iced()),
 			width: 2.0,
 			..Default::default()
 		};
@@ -1567,7 +1567,7 @@ impl<'a> PlotWidget<'a> {
 				backend.fill_text(Text {
 					content: cat.clone(),
 					position: Point::ORIGIN,
-					color: self.settings.decoration_color,
+					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.x_tick_size),
 					align_x: alignment::Horizontal::Center.into(),
 					..Default::default()
@@ -1588,7 +1588,7 @@ impl<'a> PlotWidget<'a> {
 			backend.fill_text(Text {
 				content: cat.clone(),
 				position: Point::new(tick_x - 10.0, tick_y),
-				color: self.settings.decoration_color,
+				color: self.settings.chrome.tick_label_text.iced(),
 				size: iced::Pixels(self.settings.y_tick_size),
 				align_x: alignment::Horizontal::Right.into(),
 				align_y: alignment::Vertical::Center,
@@ -1606,19 +1606,19 @@ impl<'a> PlotWidget<'a> {
 		ranges: &[(f64, f64)],
 	) {
 		let halo_stroke = Stroke {
-			style: Style::Solid(self.settings.background_color),
+			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
 			width: 10.0,
 			..Default::default()
 		};
 		let axis_stroke = Stroke {
-			style: Style::Solid(self.settings.decoration_color),
+			style: Style::Solid(self.settings.chrome.axis_line.iced()),
 			width: 4.0,
 			..Default::default()
 		};
 		let tick_stroke = Stroke {
 			style: Style::Solid(Color {
 				a: 0.6,
-				..self.settings.decoration_color
+				..self.settings.chrome.axis_line.iced()
 			}),
 			width: 1.5,
 			..Default::default()
@@ -1647,7 +1647,7 @@ impl<'a> PlotWidget<'a> {
 				backend.fill_text(Text {
 					content: format_label(data_y, AxisType::Linear),
 					position: Point::new(p.x - 14.0, p.y),
-					color: self.settings.decoration_color,
+					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.y_tick_size),
 					align_x: alignment::Horizontal::Right.into(),
 					align_y: alignment::Vertical::Center,
@@ -1677,7 +1677,7 @@ impl<'a> PlotWidget<'a> {
 			backend.fill_text(Text {
 				content: dim.clone(),
 				position: Point::new(top_px.x, top_px.y - 20.0),
-				color: self.settings.decoration_color,
+				color: self.settings.chrome.axis_label_text.iced(),
 				size: iced::Pixels(22.0),
 				align_x: alignment::Horizontal::Center.into(),
 				align_y: alignment::Vertical::Bottom,
@@ -1814,7 +1814,7 @@ mod product_0031_pre_extraction_oracle {
 				iced::Size::new(120.0, 36.0),
 				Color {
 					a: 0.6,
-					..settings.background_color
+					..settings.chrome.legend_background.iced()
 				},
 			);
 			backend.stroke_path(
@@ -1822,7 +1822,7 @@ mod product_0031_pre_extraction_oracle {
 					builder.rectangle(Point::new(260.0, 20.0), iced::Size::new(18.0, 18.0));
 				},
 				Stroke {
-					style: Style::Solid(settings.decoration_color),
+					style: Style::Solid(settings.chrome.legend_swatch_border.iced()),
 					width: 1.0,
 					..Default::default()
 				},
@@ -1830,7 +1830,7 @@ mod product_0031_pre_extraction_oracle {
 			backend.fill_text(Text {
 				content: "series".to_owned(),
 				position: Point::new(286.0, 29.0),
-				color: settings.decoration_color,
+				color: settings.chrome.legend_text.iced(),
 				size: iced::Pixels(settings.legend_size),
 				..Default::default()
 			});

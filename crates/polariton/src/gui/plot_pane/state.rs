@@ -1,4 +1,5 @@
 use super::message::PlotPaneMsg;
+use crate::plot::chrome::PlotChrome;
 use crate::plot::colors;
 use crate::plot::common::{PlotKernel, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
@@ -167,8 +168,10 @@ impl PlotPaneState {
 			resize_render_suspended: false,
 			last_bounds: Rectangle::with_size(Size::new(width as f32, height as f32)),
 			render_revision: 0,
-			bg_color_input: colors::color_to_hex(plot_settings.background_color),
-			decoration_color_input: colors::color_to_hex(plot_settings.decoration_color),
+			bg_color_input: colors::color_to_hex(plot_settings.surrounding_background_color),
+			decoration_color_input: colors::color_to_hex(
+				plot_settings.surrounding_decoration_color,
+			),
 			x_min_input: String::new(),
 			x_max_input: String::new(),
 			y_min_input: String::new(),
@@ -294,29 +297,43 @@ impl PlotPaneState {
 			}
 			PlotPaneMsg::ChangeColorTheme(theme) => self.plot_settings.color_theme = theme,
 			PlotPaneMsg::ChangeBackgroundColor(color) => {
-				self.plot_settings.background_color = color;
+				let decoration = colors::contrast_color(color);
+				self.plot_settings.chrome = PlotChrome::legacy_from_iced(color, decoration);
+				self.plot_settings.mark_decoration_color = decoration;
+				self.plot_settings.surrounding_background_color = color;
+				self.plot_settings.surrounding_decoration_color = decoration;
 				self.bg_color_input = colors::color_to_hex(color);
-				self.plot_settings.decoration_color = colors::contrast_color(color);
-				self.decoration_color_input =
-					colors::color_to_hex(self.plot_settings.decoration_color);
+				self.decoration_color_input = colors::color_to_hex(decoration);
 			}
 			PlotPaneMsg::ChangeBackgroundHex(hex) => {
 				self.bg_color_input = hex.clone();
 				if let Some(color) = colors::hex_to_color(&hex) {
-					self.plot_settings.background_color = color;
-					self.plot_settings.decoration_color = colors::contrast_color(color);
-					self.decoration_color_input =
-						colors::color_to_hex(self.plot_settings.decoration_color);
+					let decoration = colors::contrast_color(color);
+					self.plot_settings.chrome = PlotChrome::legacy_from_iced(color, decoration);
+					self.plot_settings.mark_decoration_color = decoration;
+					self.plot_settings.surrounding_background_color = color;
+					self.plot_settings.surrounding_decoration_color = decoration;
+					self.decoration_color_input = colors::color_to_hex(decoration);
 				}
 			}
 			PlotPaneMsg::ChangeDecorationColor(color) => {
-				self.plot_settings.decoration_color = color;
+				self.plot_settings.chrome = PlotChrome::legacy_from_iced(
+					self.plot_settings.surrounding_background_color,
+					color,
+				);
+				self.plot_settings.mark_decoration_color = color;
+				self.plot_settings.surrounding_decoration_color = color;
 				self.decoration_color_input = colors::color_to_hex(color);
 			}
 			PlotPaneMsg::ChangeDecorationHex(hex) => {
 				self.decoration_color_input = hex.clone();
 				if let Some(color) = colors::hex_to_color(&hex) {
-					self.plot_settings.decoration_color = color;
+					self.plot_settings.chrome = PlotChrome::legacy_from_iced(
+						self.plot_settings.surrounding_background_color,
+						color,
+					);
+					self.plot_settings.mark_decoration_color = color;
+					self.plot_settings.surrounding_decoration_color = color;
 				}
 			}
 			PlotPaneMsg::SetXMin(val) => {

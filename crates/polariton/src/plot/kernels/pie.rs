@@ -54,7 +54,7 @@ impl PlotKernel for PiePlotKernel {
 			backend.stroke_path(
 				path_closure,
 				Stroke {
-					style: Style::Solid(settings.background_color),
+					style: Style::Solid(settings.chrome.canvas_background.iced()),
 					width: 1.0,
 					..Default::default()
 				},
@@ -88,7 +88,7 @@ impl PlotKernel for PiePlotKernel {
 			iced::Size::new(legend_width, legend_height),
 			Color {
 				a: 0.6,
-				..settings.background_color
+				..settings.chrome.legend_background.iced()
 			},
 		);
 		for i in 0..num_categories {
@@ -111,7 +111,7 @@ impl PlotKernel for PiePlotKernel {
 			backend.fill_text(iced::widget::canvas::Text {
 				content: name.clone(),
 				position: iced::Point::new(item_x + rect_size + 10.0, item_y + item_height / 2.0),
-				color: settings.decoration_color,
+				color: settings.chrome.legend_text.iced(),
 				size: iced::Pixels(settings.legend_size),
 				align_x: iced::alignment::Horizontal::Left.into(),
 				align_y: iced::alignment::Vertical::Center,

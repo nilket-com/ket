@@ -109,7 +109,7 @@ impl PlotKernel for BubblePlotKernel {
 			iced::Size::new(legend_width, legend_height),
 			Color {
 				a: 0.7,
-				..settings.background_color
+				..settings.chrome.legend_background.iced()
 			},
 		);
 		let bar_width = 15.0;
@@ -132,7 +132,7 @@ impl PlotKernel for BubblePlotKernel {
 		backend.fill_text(Text {
 			content: format!("{:.1}", color_max),
 			position: Point::new(color_label_x, bar_y),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: Pixels(settings.legend_size),
 			align_y: iced::alignment::Vertical::Top,
 			..Default::default()
@@ -140,7 +140,7 @@ impl PlotKernel for BubblePlotKernel {
 		backend.fill_text(Text {
 			content: format!("{:.1}", color_min),
 			position: Point::new(color_label_x, bar_y + bar_height),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: Pixels(settings.legend_size),
 			align_y: iced::alignment::Vertical::Bottom,
 			..Default::default()
@@ -148,7 +148,7 @@ impl PlotKernel for BubblePlotKernel {
 		backend.fill_text(Text {
 			content: self.prepared_data.color_label.clone(),
 			position: Point::new(color_bar_x + bar_width / 2.0, y + 15.0),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: Pixels(16.0),
 			align_x: iced::alignment::Horizontal::Center.into(),
 			align_y: iced::alignment::Vertical::Top,
@@ -159,7 +159,7 @@ impl PlotKernel for BubblePlotKernel {
 		backend.fill_text(Text {
 			content: self.prepared_data.size_label.clone(),
 			position: Point::new(size_title_x, y + 15.0),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: Pixels(16.0),
 			align_x: iced::alignment::Horizontal::Center.into(),
 			align_y: iced::alignment::Vertical::Top,
@@ -179,17 +179,14 @@ impl PlotKernel for BubblePlotKernel {
 				&|builder| {
 					builder.circle(circle_center, radius);
 				},
-				Color {
-					a: 0.5,
-					..settings.decoration_color
-				},
+				settings.chrome.legend_swatch_fill.iced(),
 			);
 			backend.stroke_path(
 				&|builder| {
 					builder.circle(circle_center, radius);
 				},
 				Stroke {
-					style: Style::Solid(settings.decoration_color),
+					style: Style::Solid(settings.chrome.legend_swatch_border.iced()),
 					width: 1.0,
 					..Default::default()
 				},
@@ -197,7 +194,7 @@ impl PlotKernel for BubblePlotKernel {
 			backend.fill_text(Text {
 				content: format!("{:.1}", val),
 				position: Point::new(size_legend_x + 75.0, sample_y),
-				color: settings.decoration_color,
+				color: settings.chrome.legend_text.iced(),
 				size: Pixels(settings.legend_size),
 				align_y: iced::alignment::Vertical::Center,
 				..Default::default()

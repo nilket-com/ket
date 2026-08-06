@@ -88,17 +88,17 @@ pub fn view<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMs
 					.style(|_| container::Style {
 						background: Some(iced::Background::Color(iced::Color {
 							a: 0.85,
-							..state.plot_settings.background_color
+							..state.plot_settings.surrounding_background_color
 						})),
 						border: iced::Border {
 							color: iced::Color {
 								a: 0.2,
-								..state.plot_settings.decoration_color
+								..state.plot_settings.surrounding_decoration_color
 							},
 							width: 1.0,
 							radius: 2.0.into(),
 						},
-						text_color: Some(state.plot_settings.decoration_color),
+						text_color: Some(state.plot_settings.surrounding_decoration_color),
 						..Default::default()
 					}),
 			);
@@ -121,8 +121,10 @@ pub fn view<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, DashboardMs
 	}
 	container(main_stack.width(Fill).height(Fill))
 		.style(|_| container::Style {
-			background: Some(Background::Color(state.plot_settings.background_color)),
-			text_color: Some(state.plot_settings.decoration_color),
+			background: Some(Background::Color(
+				state.plot_settings.surrounding_background_color,
+			)),
+			text_color: Some(state.plot_settings.surrounding_decoration_color),
 			..Default::default()
 		})
 		.into()
@@ -166,17 +168,19 @@ pub fn host_view(state: &HostPlotState) -> Element<'_, PlotMessage> {
 				.style(|_| container::Style {
 					background: Some(iced::Background::Color(iced::Color {
 						a: 0.85,
-						..state.plot_settings.background_color
+						..state.plot_settings.surrounding_background_color
 					})),
-					text_color: Some(state.plot_settings.decoration_color),
+					text_color: Some(state.plot_settings.surrounding_decoration_color),
 					..Default::default()
 				}),
 		);
 	}
 	container(layers.width(Fill).height(Fill))
 		.style(|_| container::Style {
-			background: Some(Background::Color(state.plot_settings.background_color)),
-			text_color: Some(state.plot_settings.decoration_color),
+			background: Some(Background::Color(
+				state.plot_settings.surrounding_background_color,
+			)),
+			text_color: Some(state.plot_settings.surrounding_decoration_color),
 			..Default::default()
 		})
 		.into()
@@ -891,14 +895,14 @@ fn plot_settings_panel<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, 
 	.style(move |_| container::Style {
 		background: Some(Background::Color(Color {
 			a: 0.95,
-			..state.plot_settings.background_color
+			..state.plot_settings.surrounding_background_color
 		})),
 		border: border::Border {
-			color: state.plot_settings.decoration_color,
+			color: state.plot_settings.surrounding_decoration_color,
 			width: 1.0,
 			radius: 0.0.into(),
 		},
-		text_color: Some(state.plot_settings.decoration_color),
+		text_color: Some(state.plot_settings.surrounding_decoration_color),
 		..Default::default()
 	})
 	.into()
@@ -909,7 +913,7 @@ fn layer_section<'a>(id: PaneId, state: &'a PlotPaneState) -> Element<'a, Dashbo
 	let mut rows = column![
 		text(format!("Rendered as {}", state.composition.title())).color(Color {
 			a: 0.75,
-			..state.plot_settings.decoration_color
+			..state.plot_settings.surrounding_decoration_color
 		})
 	]
 	.spacing(8);

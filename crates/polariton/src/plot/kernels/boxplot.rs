@@ -44,7 +44,7 @@ impl PlotKernel for BoxPlotKernel {
 			};
 			let color = settings.color_theme.get_color(t);
 			let color_iced = color;
-			let line_color = settings.decoration_color;
+			let line_color = settings.mark_decoration_color;
 			let (q1_px, _) = transform.categorical(i, stats.q1);
 			let (q3_px, _) = transform.categorical(i, stats.q3);
 			let box_rect = Rectangle {
@@ -172,7 +172,7 @@ impl PlotKernel for BoxPlotKernel {
 			iced::Size::new(legend_width, legend_height),
 			Color {
 				a: 0.6,
-				..settings.background_color
+				..settings.chrome.legend_background.iced()
 			},
 		);
 		for (i, name) in self.prepared_data.categories.iter().enumerate() {
@@ -194,7 +194,7 @@ impl PlotKernel for BoxPlotKernel {
 			backend.fill_text(iced::widget::canvas::Text {
 				content: name.clone(),
 				position: iced::Point::new(item_x + rect_size + 10.0, item_y + item_height / 2.0),
-				color: settings.decoration_color,
+				color: settings.chrome.legend_text.iced(),
 				size: iced::Pixels(settings.legend_size),
 				align_x: iced::alignment::Horizontal::Left.into(),
 				align_y: iced::alignment::Vertical::Center,

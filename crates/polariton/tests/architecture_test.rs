@@ -1143,3 +1143,76 @@ fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary(
 		}
 	}
 }
+
+#[test]
+fn product_0031_plot_chrome_is_closed_and_mark_ink_stays_separate() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let chrome =
+		std::fs::read_to_string(root.join("plot/chrome.rs")).expect("read plot chrome model");
+	let fields = chrome
+		.split("pub struct PlotChrome {")
+		.nth(1)
+		.expect("PlotChrome declaration")
+		.split('}')
+		.next()
+		.expect("PlotChrome fields");
+	assert_eq!(fields.matches("pub ").count(), 11);
+	for forbidden in [
+		"Option<",
+		"HashMap",
+		"BTreeMap",
+		"Theme",
+		"UiPalette",
+		"TableSkin",
+	] {
+		assert!(
+			!fields.contains(forbidden),
+			"PlotChrome acquired {forbidden}"
+		);
+	}
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let production = common
+		.split("#[cfg(test)]")
+		.next()
+		.expect("plot common production");
+	for retired in [
+		"pub background_color:",
+		"pub decoration_color:",
+		"settings.background_color",
+		"settings.decoration_color",
+	] {
+		assert!(!production.contains(retired), "renderer retained {retired}");
+	}
+	assert!(production.contains("pub chrome: PlotChrome"));
+	assert!(production.contains("pub mark_decoration_color: Color"));
+
+	for relative in [
+		"plot/kernels/boxplot.rs",
+		"plot/kernels/violin.rs",
+		"plot/kernels/candlestick.rs",
+		"plot/kernels/funnel.rs",
+	] {
+		let source = std::fs::read_to_string(root.join(relative)).expect("read mark kernel");
+		let mark_draw = source
+			.split("fn draw_legend(")
+			.next()
+			.expect("mark draw before legend");
+		assert!(mark_draw.contains("mark_decoration_color"));
+		assert!(
+			!mark_draw.contains("settings.chrome"),
+			"{relative} mark drawing acquired plot chrome"
+		);
+	}
+
+	let envelope =
+		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
+	let figure_parser = envelope
+		.split("fn parse_figure(")
+		.nth(1)
+		.expect("figure parser")
+		.split("fn parse_figure_heading(")
+		.next()
+		.expect("bounded figure parser");
+	assert!(!figure_parser.contains("\"skin\" =>"));
+}

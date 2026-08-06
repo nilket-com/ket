@@ -93,7 +93,7 @@ impl PlotKernel for HexbinPlotKernel {
 			iced::Size::new(legend_width, legend_height),
 			Color {
 				a: 0.6,
-				..settings.background_color
+				..settings.chrome.legend_background.iced()
 			},
 		);
 		let bar_width = 15.0;
@@ -121,7 +121,7 @@ impl PlotKernel for HexbinPlotKernel {
 				builder.close();
 			},
 			Stroke {
-				style: Style::Solid(settings.decoration_color),
+				style: Style::Solid(settings.chrome.legend_swatch_border.iced()),
 				width: 1.0,
 				..Default::default()
 			},
@@ -130,7 +130,7 @@ impl PlotKernel for HexbinPlotKernel {
 		backend.fill_text(iced::widget::canvas::Text {
 			content: format!("{}", max_count),
 			position: iced::Point::new(label_x, bar_y),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: iced::Pixels(settings.legend_size),
 			align_y: iced::alignment::Vertical::Top,
 			..Default::default()
@@ -138,7 +138,7 @@ impl PlotKernel for HexbinPlotKernel {
 		backend.fill_text(iced::widget::canvas::Text {
 			content: "0".to_string(),
 			position: iced::Point::new(label_x, bar_y + bar_height),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: iced::Pixels(settings.legend_size),
 			align_y: iced::alignment::Vertical::Bottom,
 			..Default::default()
@@ -146,7 +146,7 @@ impl PlotKernel for HexbinPlotKernel {
 		backend.fill_text(iced::widget::canvas::Text {
 			content: "Count".to_string(),
 			position: iced::Point::new(x + legend_width / 2.0, y + 10.0),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: iced::Pixels(settings.legend_size),
 			align_x: iced::alignment::Horizontal::Center.into(),
 			align_y: iced::alignment::Vertical::Top,

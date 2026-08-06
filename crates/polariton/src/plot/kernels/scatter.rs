@@ -141,7 +141,7 @@ pub(crate) fn draw_scatter_legend(
 		iced::Size::new(legend_width, legend_height),
 		Color {
 			a: 0.6,
-			..settings.background_color
+			..settings.chrome.legend_background.iced()
 		},
 	);
 	for (i, series) in prepared_data.series.iter().enumerate() {
@@ -162,7 +162,7 @@ pub(crate) fn draw_scatter_legend(
 		backend.fill_text(iced::widget::canvas::Text {
 			content: series.name.clone(),
 			position: iced::Point::new(item_x + swatch_size + 10.0, item_y + item_height / 2.0),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: iced::Pixels(settings.legend_size),
 			align_x: iced::alignment::Horizontal::Left.into(),
 			align_y: iced::alignment::Vertical::Center,
@@ -309,7 +309,7 @@ impl ScatterMarkRenderer {
 			point_size: settings.point_size.factor().to_bits(),
 			x_range: current_x_range_bits(transform),
 			y_range: current_y_range_bits(transform),
-			background: color_to_rgba8(settings.background_color),
+			background: color_to_rgba8(settings.chrome.canvas_background.iced()),
 			series_colors: self
 				.prepared_data
 				.series
@@ -505,7 +505,7 @@ fn build_raster_rgba(
 		});
 	}
 
-	let bg = settings.background_color;
+	let bg = settings.chrome.canvas_background.iced();
 	let mut rgba = vec![0_u8; width * height * 4];
 	for (i, pixel) in accum.iter().enumerate() {
 		let base = i * 4;
@@ -1104,7 +1104,10 @@ mod tests {
 			Arc::ptr_eq(&first.rgba, &repeat.rgba),
 			"same key must reuse cache"
 		);
-		let default_pixels = changed_pixels(&first.rgba, default_settings.background_color);
+		let default_pixels = changed_pixels(
+			&first.rgba,
+			default_settings.chrome.canvas_background.iced(),
+		);
 		assert!(
 			default_pixels > 1,
 			"default radius must be a disc, not one pixel"
@@ -1118,7 +1121,7 @@ mod tests {
 			"size change must miss the prior cache entry"
 		);
 		assert!(
-			changed_pixels(&large.rgba, doubled.background_color) > default_pixels,
+			changed_pixels(&large.rgba, doubled.chrome.canvas_background.iced()) > default_pixels,
 			"doubled radius must paint a larger footprint"
 		);
 		let large_repeat = renderer.rasterize(viewport, &centered, &doubled);
@@ -1132,7 +1135,8 @@ mod tests {
 		};
 		let edge = CoordinateTransformer::new(&edge_layout, viewport);
 		let clipped = build_raster_rgba(&prepared, viewport, &edge, &default_settings);
-		let clipped_pixels = changed_pixels(&clipped, default_settings.background_color);
+		let clipped_pixels =
+			changed_pixels(&clipped, default_settings.chrome.canvas_background.iced());
 		assert!(clipped_pixels > 0);
 		assert!(clipped_pixels < default_pixels, "edge disc must be clipped");
 	}

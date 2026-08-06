@@ -83,7 +83,7 @@ impl PlotKernel for RadarPlotKernel {
 					center.x + (max_radius + 15.0) * angle.cos(),
 					center.y + (max_radius + 15.0) * angle.sin(),
 				),
-				color: settings.decoration_color,
+				color: settings.chrome.axis_label_text.iced(),
 				size: iced::Pixels(settings.x_label_size),
 				align_x: if angle.cos().abs() < 0.01 {
 					iced::alignment::Horizontal::Center.into()
@@ -115,7 +115,7 @@ impl PlotKernel for RadarPlotKernel {
 						position: label_pos,
 						color: Color {
 							a: 0.7,
-							..settings.decoration_color
+							..settings.chrome.tick_label_text.iced()
 						},
 						size: iced::Pixels(settings.x_tick_size),
 						align_x: iced::alignment::Horizontal::Left.into(),
@@ -192,7 +192,7 @@ impl PlotKernel for RadarPlotKernel {
 			iced::Size::new(legend_width, legend_height),
 			Color {
 				a: 0.6,
-				..settings.background_color
+				..settings.chrome.legend_background.iced()
 			},
 		);
 		for (i, name) in self.prepared_data.category_names.iter().enumerate() {
@@ -214,7 +214,7 @@ impl PlotKernel for RadarPlotKernel {
 			backend.fill_text(iced::widget::canvas::Text {
 				content: name.clone(),
 				position: iced::Point::new(item_x + rect_size + 10.0, item_y + item_height / 2.0),
-				color: settings.decoration_color,
+				color: settings.chrome.legend_text.iced(),
 				size: iced::Pixels(settings.legend_size),
 				align_x: iced::alignment::Horizontal::Left.into(),
 				align_y: iced::alignment::Vertical::Center,

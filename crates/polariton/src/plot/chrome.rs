@@ -115,6 +115,30 @@ impl PlotChrome {
 		}
 	}
 
+	pub(crate) fn legacy_from_iced(background: Color, decoration: Color) -> Self {
+		let background = PlotRgba::from_iced(background);
+		let decoration = PlotRgba::from_iced(decoration);
+		Self {
+			canvas_background: background,
+			title_text: decoration,
+			subtitle_text: decoration,
+			axis_label_text: decoration,
+			tick_label_text: decoration,
+			axis_line: decoration,
+			gridline: PlotRgba {
+				alpha: 0.2,
+				..decoration
+			},
+			legend_background: background,
+			legend_text: decoration,
+			legend_swatch_fill: PlotRgba {
+				alpha: 0.5,
+				..decoration
+			},
+			legend_swatch_border: decoration,
+		}
+	}
+
 	pub fn visible_contrast_checks(self) -> [PlotChromeContrast; 8] {
 		let canvas = visible_srgb(self.canvas_background);
 		let legend = composite_over(self.legend_background, canvas);

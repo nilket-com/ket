@@ -5,6 +5,7 @@
 
 #![allow(dead_code)] // Public cascade API awaits an accepted plot-editing surface.
 
+use crate::plot::chrome::PlotChrome;
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode};
 use crate::plot::spec::{
@@ -266,8 +267,12 @@ impl PlotSettings {
 fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 	if let Override::Set(theme) = layer.theme {
 		settings.color_theme = theme.sequential_ramp;
-		settings.background_color = theme.chrome.background.iced();
-		settings.decoration_color = theme.chrome.label.iced();
+		let background = theme.chrome.background.iced();
+		let decoration = theme.chrome.label.iced();
+		settings.chrome = PlotChrome::legacy_from_iced(background, decoration);
+		settings.mark_decoration_color = decoration;
+		settings.surrounding_background_color = background;
+		settings.surrounding_decoration_color = decoration;
 	}
 	if let Override::Set(value) = &layer.typography {
 		settings.title_size = value.title_size;

@@ -207,7 +207,7 @@ pub(crate) fn draw_line_legend(
 		iced::Size::new(legend_width, legend_height),
 		iced::Color {
 			a: 0.6,
-			..settings.background_color
+			..settings.chrome.legend_background.iced()
 		},
 	);
 	for (i, series) in prepared_data.series.iter().enumerate() {
@@ -234,7 +234,7 @@ pub(crate) fn draw_line_legend(
 		backend.fill_text(iced::widget::canvas::Text {
 			content: series.name.clone(),
 			position: iced::Point::new(item_x + line_width + 10.0, item_y + item_height / 2.0),
-			color: settings.decoration_color,
+			color: settings.chrome.legend_text.iced(),
 			size: iced::Pixels(settings.legend_size),
 			align_x: iced::alignment::Horizontal::Left.into(),
 			align_y: iced::alignment::Vertical::Center,
