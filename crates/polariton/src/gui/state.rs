@@ -29,17 +29,20 @@ use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
 use crate::plot::spec::AuthoredPlotSpec;
 #[cfg(feature = "toron")]
-use crate::plot::spec::{CategoricalPaletteSelection, ColorIdentity, LayeredPlotSpec, Override};
+use crate::plot::spec::{
+	CategoricalPaletteSelection, Channel, ColorIdentity, LayeredPlotSpec, Override, ScaleFamily,
+	resolve_channels, resolve_layered_channels,
+};
 #[cfg(feature = "toron")]
 use crate::plot::theme::{PlotSettings, PlotSettingsLayer};
 use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RuneTableSkinIntent,
-	RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
-	StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView, ViewPresentation,
-	transform as transform_rune_view,
+	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans,
+	RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler,
+	SpannedRuneViewIntent, StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView,
+	ViewPresentation, transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
 use libaryon::core::BufferId;
@@ -821,6 +824,89 @@ fn resolve_rune_plot_skin(
 }
 
 #[cfg(feature = "toron")]
+fn resolved_rune_axis_scales(
+	body: &RunePlotBody,
+	schema: &polars::prelude::Schema,
+) -> std::result::Result<(ScaleFamily, ScaleFamily), String> {
+	let scales = |channels: &[crate::plot::spec::BoundChannel]| {
+		[Channel::X, Channel::Y].map(|channel| {
+			channels
+				.iter()
+				.find(|binding| binding.channel == channel)
+				.map(|binding| binding.scale)
+				.ok_or_else(|| format!("plot has no resolved {channel} axis"))
+		})
+	};
+	let resolved = match body {
+		RunePlotBody::Single(sink) => {
+			let authored = AuthoredPlotSpec::xy_color(
+				sink.composition.clone(),
+				sink.x.clone(),
+				sink.y.clone(),
+				sink.category.clone(),
+			);
+			let binding = resolve_channels(&authored, schema).map_err(|error| error.to_string())?;
+			scales(binding.channels())
+		}
+		RunePlotBody::StyledSingle(styled) => {
+			let sink = &styled.sink;
+			let authored = AuthoredPlotSpec::xy_color(
+				sink.composition.clone(),
+				sink.x.clone(),
+				sink.y.clone(),
+				sink.category.clone(),
+			);
+			let binding = resolve_channels(&authored, schema).map_err(|error| error.to_string())?;
+			scales(binding.channels())
+		}
+		RunePlotBody::Layered(specification) => {
+			let binding = resolve_layered_channels(specification, schema)
+				.map_err(|error| error.to_string())?;
+			scales(binding.layers.first().channels())
+		}
+	};
+	Ok((resolved[0].clone()?, resolved[1].clone()?))
+}
+
+#[cfg(feature = "toron")]
+fn validate_rune_numeric_domain_applicability(
+	body: &RunePlotBody,
+	domain_spans: &RunePlotDomainSpans,
+	schema: &polars::prelude::Schema,
+) -> std::result::Result<(), (std::ops::Range<u32>, String)> {
+	if domain_spans.x.is_none() && domain_spans.y.is_none() {
+		return Ok(());
+	}
+	let Ok((x_scale, y_scale)) = resolved_rune_axis_scales(body, schema) else {
+		// Established planning owns channel-resolution failures. This check only
+		// rejects a successfully resolved axis that is not numeric.
+		return Ok(());
+	};
+	let numeric = |scale| matches!(scale, ScaleFamily::Linear | ScaleFamily::Log);
+	if let Some(span) = &domain_spans.x
+		&& !numeric(x_scale)
+	{
+		return Err((
+			span.clone(),
+			format!(
+				"x_bounds(...) requires a numeric x axis; this figure resolves x as {x_scale:?}"
+			),
+		));
+	}
+	if let Some(span) = &domain_spans.y
+		&& !numeric(y_scale)
+	{
+		return Err((
+			span.clone(),
+			format!(
+				"y_bounds(...) requires a numeric y axis; this figure resolves y as {y_scale:?}"
+			),
+		));
+	}
+	Ok(())
+}
+
+#[cfg(feature = "toron")]
 fn prepare_rune_categorical_palettes(
 	app_state: &AppState,
 	source_buffer: BufferId,
@@ -952,8 +1038,13 @@ fn rune_view_outcome_with_palettes(
 						.map(RuneRelationSinkOutput::Table)
 				}
 				RuneViewIntent::Plot(plot) => {
-					let plot_skin_span = plot.plot_skin_span.clone();
-					let authored_settings = match resolve_rune_plot_skin(plot.authored_settings) {
+					let crate::rune_relation_envelope::RunePlotIntent {
+						body,
+						authored_settings,
+						plot_skin_span,
+						domain_spans,
+					} = plot;
+					let authored_settings = match resolve_rune_plot_skin(authored_settings) {
 						Ok(settings) => settings,
 						Err(error) => {
 							return RuneRelationSinkOutcome {
@@ -965,6 +1056,19 @@ fn rune_view_outcome_with_palettes(
 							};
 						}
 					};
+					if let Err((span, error)) = validate_rune_numeric_domain_applicability(
+						&body,
+						&domain_spans,
+						result.schema().as_ref(),
+					) {
+						return RuneRelationSinkOutcome {
+							identity,
+							presentation,
+							span,
+							source: std::sync::Arc::clone(&result),
+							output: Err(error),
+						};
+					}
 					let prepared = palettes.remove(&identity).unwrap_or_else(|| {
 						PreparedRuneCategoricalPalette::Failed(
 							"plot destination has no prepared categorical palette".to_owned(),
@@ -987,7 +1091,7 @@ fn rune_view_outcome_with_palettes(
 						};
 					};
 					let palette_len = selection.len();
-					match plot.body {
+					match body {
 						RunePlotBody::Single(plot) => {
 							let authored_spec = AuthoredPlotSpec::xy_color(
 								plot.composition,
@@ -2336,7 +2440,7 @@ mod tests {
 	use crate::plot::factory::{create_layered_plot, create_plot, create_styled_plot};
 	#[cfg(feature = "toron")]
 	use crate::plot::{
-		common::{CoordinateTransformer, PlotKernel, ResolvedPlotSettings},
+		common::{CoordinateTransformer, PlotKernel, PlotLayout, ResolvedPlotSettings},
 		export::SvgBackend,
 	};
 	#[cfg(feature = "toron")]
@@ -2361,8 +2465,15 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	fn render_marks(kernel: &dyn PlotKernel) -> String {
+		render_marks_with_settings(kernel, ResolvedPlotSettings::default())
+	}
+
+	#[cfg(feature = "toron")]
+	fn render_marks_with_settings(
+		kernel: &dyn PlotKernel,
+		settings: ResolvedPlotSettings,
+	) -> String {
 		let bounds = iced::Rectangle::new(iced::Point::ORIGIN, iced::Size::new(100.0, 100.0));
-		let settings = ResolvedPlotSettings::default();
 		let layout = kernel.layout(settings.clone());
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		let mut backend = SvgBackend::new(100.0, 100.0);
@@ -5615,6 +5726,134 @@ workspace.table("bad").views([view("bad", table())]);
 		assert!(state.dashboard.panes.is_none());
 		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0036_numeric_bounds_apply_per_axis_and_discrete_bounds_never_disappear() {
+		let y_source =
+			"workspace.table(\"t\").views([figure([y_bounds(-1.0, 1.0), bar(\"cat\", \"val\")])])";
+		let relation = transform_rune_view(y_source)
+			.expect("numeric y bound")
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(categorical_bar_frame(&["A", "B", "C"]), relation.views);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, authored, _)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("numeric bar y bound must complete");
+		};
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		assert_eq!(settings.x_min, None);
+		assert_eq!(settings.x_max, None);
+		assert_eq!((settings.y_min, settings.y_max), (Some(-1.0), Some(1.0)));
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+		assert!(matches!(
+			kernel.layout(settings.clone()),
+			PlotLayout::CategoricalX { y_range, .. } if y_range == (-1.0, 1.0)
+		));
+		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
+
+		let x_source =
+			"workspace.table(\"t\").views([figure([x_bounds(0.0, 1.0), bar(\"cat\", \"val\")])])";
+		let relation = transform_rune_view(x_source)
+			.expect("structurally valid x bound")
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(categorical_bar_frame(&["A", "B"]), relation.views);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("categorical x bound must refuse");
+		};
+		assert!(error.contains("requires a numeric x axis"), "{error}");
+		assert!(error.contains("Band"), "{error}");
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&x_source[span.start as usize..span.end as usize],
+			"x_bounds(0.0, 1.0)"
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0036_exclusion_and_arbitrarily_small_positive_spans_render_exactly() {
+		for (minimum, maximum) in [(100.0, 200.0), (0.0, 1e-300)] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([x_bounds({minimum}, {maximum}), line(\"x\", \"y\")])])"
+			);
+			let relation = transform_rune_view(&source)
+				.expect("strictly ordered finite bounds")
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(
+				polars::df!("x" => [1.0_f64, 6.0], "y" => [1.0_f64, 6.0]).unwrap(),
+				relation.views,
+			);
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, authored, _)) =
+				&outcome.sinks[0].output
+			else {
+				panic!("defined finite bounds must complete: {minimum}..{maximum}");
+			};
+			let settings = crate::plot::theme::PlotSettings {
+				authored_spec: authored.clone(),
+				..crate::plot::theme::PlotSettings::default()
+			}
+			.resolve();
+			assert_eq!(
+				(settings.x_min, settings.x_max),
+				(Some(minimum), Some(maximum))
+			);
+			let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+			assert!(matches!(
+				kernel.layout(settings.clone()),
+				PlotLayout::Cartesian { x_range, .. } if x_range == (minimum, maximum)
+			));
+			let svg = render_marks_with_settings(kernel.as_ref(), settings);
+			assert!(svg.contains("<svg"));
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0036_layered_bounds_reach_one_shared_cartesian_domain() {
+		let source = r#"workspace.table("t").views([figure([
+			x_bounds(-2.0, 2.0), y_bounds(0.0, 8.0),
+			layers([line("x", "y"), scatter("x", "y")])
+		])])"#;
+		let relation = transform_rune_view(source)
+			.expect("bounded layered figure")
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("x" => [-1.0_f64, 1.0], "y" => [2.0_f64, 6.0]).unwrap(),
+			relation.views,
+		);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(specification, authored)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("bounded layered plot must complete");
+		};
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		let kernel =
+			create_layered_plot(specification, outcome.sinks[0].source.as_ref(), 1200, 720)
+				.unwrap();
+		assert!(matches!(
+			kernel.layout(settings.clone()),
+			PlotLayout::Cartesian { x_range, y_range, .. }
+				if x_range == (-2.0, 2.0) && y_range == (0.0, 8.0)
+		));
+		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
 	}
 
 	#[cfg(feature = "toron")]

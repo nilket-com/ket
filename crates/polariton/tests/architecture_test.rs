@@ -912,6 +912,69 @@ fn product_0035_authored_table_contrast_is_observable_but_never_an_admission_gat
 }
 
 #[test]
+fn product_0036_numeric_bounds_have_one_figure_producer_and_no_magnitude_gate() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let envelope_production = envelope
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production Rune envelope source");
+	let figure_parser = envelope_production
+		.split("fn parse_figure(")
+		.nth(1)
+		.expect("figure parser")
+		.split("fn parse_figure_bounds(")
+		.next()
+		.expect("bounded figure parser");
+	assert!(figure_parser.contains("\"x_bounds\" =>"));
+	assert!(figure_parser.contains("\"y_bounds\" =>"));
+	assert_eq!(
+		figure_parser
+			.matches("authored_settings.domains = Override::Set")
+			.count(),
+		1,
+		"both axes must lower through one grouped domain override"
+	);
+
+	let bounds_parser = envelope_production
+		.split("fn parse_figure_bounds(")
+		.nth(1)
+		.expect("bounds parser")
+		.split("fn parse_signed_numeric_literal(")
+		.next()
+		.expect("bounded bounds parser");
+	assert!(bounds_parser.contains("!minimum.is_finite() || !maximum.is_finite()"));
+	assert!(bounds_parser.contains("minimum == maximum"));
+	assert!(bounds_parser.contains("minimum > maximum"));
+	for forbidden in ["EPSILON", ".abs()", "maximum - minimum", "minimum_span"] {
+		assert!(
+			!bounds_parser.contains(forbidden),
+			"numeric bounds acquired a magnitude admission rule through {forbidden}"
+		);
+	}
+
+	let mark_parser = envelope_production
+		.split("fn parse_modified_mark(")
+		.nth(1)
+		.expect("mark parser")
+		.split("fn parse_layer_modifier_factor(")
+		.next()
+		.expect("bounded mark parser");
+	assert!(!mark_parser.contains("x_bounds"));
+	assert!(!mark_parser.contains("y_bounds"));
+
+	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	let state_production = state
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production GUI state source");
+	assert!(state_production.contains("validate_rune_numeric_domain_applicability"));
+	assert!(state_production.contains("requires a numeric x axis"));
+	assert!(state_production.contains("requires a numeric y axis"));
+}
+
+#[test]
 fn product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let libaryon_theme = manifest_dir.join("../libaryon/src/engine/theme.rs");

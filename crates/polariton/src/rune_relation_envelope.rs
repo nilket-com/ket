@@ -13,7 +13,7 @@ use crate::plot::spec::{
 	BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize, Presence,
 	StrokeWidth,
 };
-use crate::plot::theme::{PlotSettingsLayer, PlotSkinSelection};
+use crate::plot::theme::{PlotDomainOverrides, PlotSettingsLayer, PlotSkinSelection};
 use libaryon::core::BufferId;
 use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
@@ -56,12 +56,19 @@ pub(crate) struct RunePlotIntent {
 	pub(crate) body: RunePlotBody,
 	pub(crate) authored_settings: PlotSettingsLayer,
 	pub(crate) plot_skin_span: Option<Range<u32>>,
+	pub(crate) domain_spans: RunePlotDomainSpans,
 }
 
 impl PartialEq for RunePlotIntent {
 	fn eq(&self, other: &Self) -> bool {
 		self.body == other.body && self.authored_settings == other.authored_settings
 	}
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunePlotDomainSpans {
+	pub(crate) x: Option<Range<u32>>,
+	pub(crate) y: Option<Range<u32>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -97,6 +104,7 @@ impl RunePlotIntent {
 			body,
 			authored_settings: PlotSettingsLayer::default(),
 			plot_skin_span: None,
+			domain_spans: RunePlotDomainSpans::default(),
 		}
 	}
 }
@@ -1161,6 +1169,8 @@ fn parse_figure(
 	let mut subtitle = None;
 	let mut skin = None;
 	let mut palette = None;
+	let mut x_bounds = None;
+	let mut y_bounds = None;
 	let mut body = None;
 	for (item, _) in list.items.iter() {
 		if let Some(selection) = parse_figure_skin(item, source)? {
@@ -1181,7 +1191,7 @@ fn parse_figure(
 			return invalid_view(
 				item.span(),
 				source.len(),
-				"a figure child must be title(...), subtitle(...), skin(...), palette(...), or one plot body",
+				"a figure child must be title(...), subtitle(...), skin(...), palette(...), x_bounds(...), y_bounds(...), or one plot body",
 			);
 		};
 		let callee = source_slice(source, call.expr.span())?.trim();
@@ -1217,6 +1227,32 @@ fn parse_figure(
 				}
 				palette = Some(parse_figure_heading(item, &child_args, source, "palette")?);
 			}
+			"x_bounds" => {
+				if x_bounds.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one x_bounds element",
+					);
+				}
+				x_bounds = Some((
+					parse_figure_bounds(item, &child_args, source, "x_bounds")?,
+					u32_range(&byte_range(item.span(), source.len())?, "x bounds")?,
+				));
+			}
+			"y_bounds" => {
+				if y_bounds.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one y_bounds element",
+					);
+				}
+				y_bounds = Some((
+					parse_figure_bounds(item, &child_args, source, "y_bounds")?,
+					u32_range(&byte_range(item.span(), source.len())?, "y bounds")?,
+				));
+			}
 			_ => {
 				if body.is_some() {
 					return invalid_view(
@@ -1250,11 +1286,94 @@ fn parse_figure(
 	if let Some(palette) = palette {
 		authored_settings.categorical_palette = Override::Set(Arc::new(palette));
 	}
+	if x_bounds.is_some() || y_bounds.is_some() {
+		authored_settings.domains = Override::Set(PlotDomainOverrides {
+			x_min: x_bounds.as_ref().map(|(bounds, _)| bounds.0),
+			x_max: x_bounds.as_ref().map(|(bounds, _)| bounds.1),
+			y_min: y_bounds.as_ref().map(|(bounds, _)| bounds.0),
+			y_max: y_bounds.as_ref().map(|(bounds, _)| bounds.1),
+		});
+	}
+	let domain_spans = RunePlotDomainSpans {
+		x: x_bounds.map(|(_, span)| span),
+		y: y_bounds.map(|(_, span)| span),
+	};
 	Ok(RunePlotIntent {
 		body,
 		authored_settings,
 		plot_skin_span,
+		domain_spans,
 	})
+}
+
+fn parse_figure_bounds(
+	outer: &ast::Expr,
+	args: &[&ast::Expr],
+	source: &str,
+	constructor: &str,
+) -> Result<(f64, f64), RuneEnvelopeError> {
+	let [minimum, maximum] = args else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) takes exactly two numeric literals"),
+		);
+	};
+	let Some(minimum) = parse_signed_numeric_literal(minimum, source) else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) requires unsuffixed numeric literals, optionally negated"),
+		);
+	};
+	let Some(maximum) = parse_signed_numeric_literal(maximum, source) else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) requires unsuffixed numeric literals, optionally negated"),
+		);
+	};
+	if !minimum.is_finite() || !maximum.is_finite() {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) requires finite bounds"),
+		);
+	}
+	if minimum == maximum {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) cannot form a collapsed axis; min must be less than max"),
+		);
+	}
+	if minimum > maximum {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			format!("{constructor}(...) cannot reverse an axis; min must be less than max"),
+		);
+	}
+	Ok((minimum, maximum))
+}
+
+fn parse_signed_numeric_literal(expression: &ast::Expr, source: &str) -> Option<f64> {
+	let is_number = match expression {
+		ast::Expr::Lit(literal) => matches!(literal.lit, ast::Lit::Number(_)),
+		ast::Expr::Unary(unary) => {
+			matches!(unary.op, ast::UnOp::Neg(_))
+				&& matches!(unary.expr.as_ref(), ast::Expr::Lit(literal) if matches!(literal.lit, ast::Lit::Number(_)))
+		}
+		_ => false,
+	};
+	if !is_number {
+		return None;
+	}
+	source_slice(source, expression.span())
+		.ok()?
+		.replace('_', "")
+		.parse::<f64>()
+		.ok()
 }
 
 fn parse_figure_skin(
@@ -3022,6 +3141,113 @@ workspace.table("t").views([table()])
 		assert_eq!(plot.authored_settings, expected);
 		assert_eq!(view.intent.presentation().display_label, "Line + Scatter");
 		assert_eq!(view.intent.presentation().authored_title, expected.title);
+	}
+
+	#[test]
+	fn product_0036_figure_bounds_lower_once_as_one_domain_override() {
+		let source = r#"workspace.table("t").views([figure([
+			y_bounds(-1.0, 10.0),
+			title("Bounded"),
+			x_bounds(0.0, 20.0),
+			layers([line("x", "y"), scatter("x", "y")]),
+		])])"#;
+		let transformed = transform(source).expect("bounded figure envelope");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("figure must route as a plot");
+		};
+		assert_eq!(
+			plot.authored_settings.domains,
+			Override::Set(PlotDomainOverrides {
+				x_min: Some(0.0),
+				x_max: Some(20.0),
+				y_min: Some(-1.0),
+				y_max: Some(10.0),
+			})
+		);
+		assert_eq!(
+			&source[plot.domain_spans.x.clone().unwrap().start as usize
+				..plot.domain_spans.x.clone().unwrap().end as usize],
+			"x_bounds(0.0, 20.0)"
+		);
+		assert_eq!(
+			&source[plot.domain_spans.y.clone().unwrap().start as usize
+				..plot.domain_spans.y.clone().unwrap().end as usize],
+			"y_bounds(-1.0, 10.0)"
+		);
+		let RunePlotBody::Layered(specification) = &plot.body else {
+			panic!("bounds must not change the layered body");
+		};
+		assert_eq!(specification.layers.len(), 2);
+		assert!(
+			specification
+				.layers
+				.iter()
+				.all(|layer| layer.settings == LayerSettings::default())
+		);
+	}
+
+	#[test]
+	fn product_0036_negative_bounds_and_omission_are_exact() {
+		let negative = transform(
+			"workspace.table(\"t\").views([figure([y_bounds(-1.0, 1.0), bar(\"cat\", \"val\")])])",
+		)
+		.expect("unary-negated bound");
+		let RuneViewIntent::Plot(negative) = &negative.views[0].intent else {
+			panic!("bounded bar");
+		};
+		assert_eq!(
+			negative.authored_settings.domains,
+			Override::Set(PlotDomainOverrides {
+				x_min: None,
+				x_max: None,
+				y_min: Some(-1.0),
+				y_max: Some(1.0),
+			})
+		);
+
+		let omitted = transform("workspace.table(\"t\").views([figure([line(\"x\", \"y\")])])")
+			.expect("ordinary unbounded figure");
+		let RuneViewIntent::Plot(omitted) = &omitted.views[0].intent else {
+			panic!("ordinary figure");
+		};
+		assert_eq!(omitted.authored_settings.domains, Override::Inherit);
+		assert_eq!(omitted.domain_spans, RunePlotDomainSpans::default());
+	}
+
+	#[test]
+	fn product_0036_undefined_bounds_refuse_at_the_exact_constructor() {
+		for (bounds, expected) in [
+			("x_bounds(1e999, 2.0)", "requires finite bounds"),
+			("x_bounds(10.0, 0.0)", "cannot reverse an axis"),
+			("x_bounds(5.0, 5.0)", "cannot form a collapsed axis"),
+			(
+				"x_bounds(value, 2.0)",
+				"requires unsuffixed numeric literals",
+			),
+			("x_bounds(0.0)", "takes exactly two numeric literals"),
+		] {
+			let source =
+				format!("workspace.table(\"t\").views([figure([{bounds}, line(\"x\", \"y\")])])");
+			let RuneEnvelopeError::InvalidView { span, message } =
+				transform(&source).expect_err("undefined bounds must refuse")
+			else {
+				panic!("expected attributed bounds refusal");
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], bounds);
+			assert!(message.contains(expected), "{message}");
+		}
+
+		let duplicate = "workspace.table(\"t\").views([figure([y_bounds(0.0, 1.0), y_bounds(2.0, 3.0), line(\"x\", \"y\")])])";
+		let RuneEnvelopeError::InvalidView { span, message } =
+			transform(duplicate).expect_err("duplicate bounds must refuse")
+		else {
+			panic!("expected duplicate refusal");
+		};
+		assert_eq!(
+			&duplicate[span.start as usize..span.end as usize],
+			"y_bounds(2.0, 3.0)"
+		);
+		assert!(message.contains("at most one y_bounds"));
 	}
 
 	#[test]
