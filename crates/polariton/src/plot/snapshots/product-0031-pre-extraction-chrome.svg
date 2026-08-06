@@ -1,0 +1,29 @@
+<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 0.00 0.00 L 400.00 0.00 L 400.00 300.00 L 0.00 300.00 Z " fill="rgb(0, 0, 0)" fill-opacity="1.00" />
+<path d="M 100.00 177.50 L 380.00 92.50 " stroke="rgb(17, 34, 51)" stroke-width="3" stroke-opacity="1.00" fill="none" />
+<path d="M 100.00 220.00 L 380.00 220.00 " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="0.20" fill="none" />
+<path d="M 100.00 50.00 L 380.00 50.00 " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="0.20" fill="none" />
+<path d="M 100.00 220.00 L 100.00 50.00 " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="0.20" fill="none" />
+<path d="M 380.00 220.00 L 380.00 50.00 " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="0.20" fill="none" />
+<path d="M 0.00 0.00 L 400.00 0.00 L 400.00 50.00 L 0.00 50.00 Z " fill="rgb(0, 0, 0)" fill-opacity="1.00" />
+<path d="M 0.00 220.00 L 400.00 220.00 L 400.00 300.00 L 0.00 300.00 Z " fill="rgb(0, 0, 0)" fill-opacity="1.00" />
+<path d="M 0.00 50.00 L 100.00 50.00 L 100.00 220.00 L 0.00 220.00 Z " fill="rgb(0, 0, 0)" fill-opacity="1.00" />
+<path d="M 380.00 50.00 L 400.00 50.00 L 400.00 220.00 L 380.00 220.00 Z " fill="rgb(0, 0, 0)" fill-opacity="1.00" />
+<path d="M 100.00 50.00 L 100.00 220.00 L 380.00 220.00 " stroke="rgb(0, 0, 0)" stroke-width="4" stroke-opacity="1.00" fill="none" />
+<path d="M 100.00 50.00 L 100.00 220.00 L 380.00 220.00 " stroke="rgb(255, 255, 255)" stroke-width="2" stroke-opacity="1.00" fill="none" />
+<path d="M 100.00 220.00 L 95.00 220.00 " stroke="rgb(255, 255, 255)" stroke-width="2" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 100.0000 50.0000)" x="-10" y="170" fill="rgb(255, 255, 255)" font-size="18" text-anchor="end" dominant-baseline="central">0</text>
+<path d="M 100.00 50.00 L 95.00 50.00 " stroke="rgb(255, 255, 255)" stroke-width="2" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 100.0000 50.0000)" x="-10" y="0" fill="rgb(255, 255, 255)" font-size="18" text-anchor="end" dominant-baseline="central">1</text>
+<path d="M 100.00 220.00 L 100.00 225.00 " stroke="rgb(255, 255, 255)" stroke-width="2" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 100.0000 230.0000)" x="0" y="0" fill="rgb(255, 255, 255)" font-size="18" text-anchor="middle" dominant-baseline="hanging">0</text>
+<path d="M 380.00 220.00 L 380.00 225.00 " stroke="rgb(255, 255, 255)" stroke-width="2" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 380.0000 230.0000)" x="0" y="0" fill="rgb(255, 255, 255)" font-size="18" text-anchor="middle" dominant-baseline="hanging">1</text>
+<path d="M 250.00 12.00 L 370.00 12.00 L 370.00 48.00 L 250.00 48.00 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 260.00 20.00 L 278.00 20.00 L 278.00 38.00 L 260.00 38.00 Z " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="286" y="29" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="hanging">series</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="200" y="20" fill="rgb(255, 255, 255)" font-size="28" text-anchor="middle" dominant-baseline="hanging">authored title</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="200" y="50" fill="rgb(255, 255, 255)" font-size="20" text-anchor="middle" dominant-baseline="hanging">authored subtitle</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="240" y="265" fill="rgb(255, 255, 255)" font-size="20" text-anchor="middle" dominant-baseline="hanging">x axis</text>
+<text transform="matrix(-0.0000 -1.0000 1.0000 -0.0000 15.0000 135.0000)" x="0" y="0" fill="rgb(255, 255, 255)" font-size="20" text-anchor="middle" dominant-baseline="alphabetic">y axis</text>
+</svg>

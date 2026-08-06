@@ -1759,3 +1759,132 @@ pub fn format_label(value: f64, axis_type: AxisType) -> String {
 		}
 	}
 }
+
+#[cfg(test)]
+mod product_0031_pre_extraction_oracle {
+	use super::*;
+	use crate::plot::export::SvgBackend;
+	use crate::plot::theme::PlotSettings;
+	use iced::advanced::mouse::Cursor;
+	use iced::widget::canvas::{Stroke, Style, Text};
+
+	struct OracleKernel;
+
+	impl PlotKernel for OracleKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+			}
+		}
+
+		fn plot(
+			&self,
+			backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+			let from = transform.cartesian(0.0, 0.25);
+			let to = transform.cartesian(1.0, 0.75);
+			backend.stroke_path(
+				&|builder| {
+					builder.move_to(from);
+					builder.line_to(to);
+				},
+				Stroke {
+					style: Style::Solid(Color::from_rgb8(17, 34, 51)),
+					width: 3.0,
+					..Default::default()
+				},
+			);
+		}
+
+		fn draw_legend(
+			&self,
+			backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			settings: ResolvedPlotSettings,
+		) {
+			backend.fill_rectangle(
+				Point::new(250.0, 12.0),
+				iced::Size::new(120.0, 36.0),
+				Color {
+					a: 0.6,
+					..settings.background_color
+				},
+			);
+			backend.stroke_path(
+				&|builder| {
+					builder.rectangle(Point::new(260.0, 20.0), iced::Size::new(18.0, 18.0));
+				},
+				Stroke {
+					style: Style::Solid(settings.decoration_color),
+					width: 1.0,
+					..Default::default()
+				},
+			);
+			backend.fill_text(Text {
+				content: "series".to_owned(),
+				position: Point::new(286.0, 29.0),
+				color: settings.decoration_color,
+				size: iced::Pixels(settings.legend_size),
+				..Default::default()
+			});
+		}
+
+		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+			None
+		}
+
+		fn x_label(&self) -> String {
+			"x axis".to_owned()
+		}
+
+		fn y_label(&self) -> String {
+			"y axis".to_owned()
+		}
+	}
+
+	fn oracle_svg(settings: ResolvedPlotSettings) -> String {
+		let settings_model = PlotSettings::from_resolved(settings.clone());
+		let widget = PlotWidget {
+			kernel: &OracleKernel,
+			title: "fallback title".to_owned(),
+			padding: 0.0,
+			settings,
+			settings_model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = SvgBackend::new(400.0, 300.0);
+		widget.render(
+			&mut backend,
+			Rectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0)),
+		);
+		backend.finish()
+	}
+
+	#[test]
+	fn product_0031_banks_the_two_field_renderer_before_extraction() {
+		let settings = ResolvedPlotSettings {
+			title: Some(Arc::new("authored title".to_owned())),
+			subtitle: Some(Arc::new("authored subtitle".to_owned())),
+			x_ticks: 1,
+			y_ticks: 1,
+			show_x_minor_ticks: false,
+			show_y_minor_ticks: false,
+			show_x_minor_grid: false,
+			show_y_minor_grid: false,
+			..ResolvedPlotSettings::default()
+		};
+		assert_eq!(
+			oracle_svg(settings),
+			include_str!("snapshots/product-0031-pre-extraction-chrome.svg").trim_end()
+		);
+	}
+}
