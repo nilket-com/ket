@@ -2085,6 +2085,10 @@ mod product_0037_count_position_oracle {
 			placement.positions((0.0, 10.0)).unwrap(),
 			vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0]
 		);
+		assert_eq!(
+			placement.minor_positions(&placement.positions((0.0, 7.0)).unwrap(), 1),
+			vec![0.5, 1.5, 2.5, 3.5, 4.5, 5.5, 6.5]
+		);
 	}
 
 	#[test]
