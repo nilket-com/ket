@@ -1,6 +1,7 @@
 # ADR 0032: theme-projected plot chrome skins
 
-Status: accepted 2026-08-06, with §3-4 amended by PRODUCT-0033. Evidence:
+Status: accepted 2026-08-06, with §3-4 amended by PRODUCT-0033 and contrast
+admission amended by PRODUCT-0034. Evidence:
 `ec3fc6a9`. This record decides one thing: how a libaryon theme
 name becomes a validated Polariton `PlotChrome` and how a Rune figure selects it
 with `skin(name)`. Plot chrome has one duotone-shaped projection, not the two

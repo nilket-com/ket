@@ -1,6 +1,6 @@
 # ADR 0034: non-blocking plot chrome contrast
 
-Status: proposed 2026-08-06. This record changes plot-chrome contrast from an
+Status: accepted 2026-08-06. This record changes plot-chrome contrast from an
 admission gate to an observable quality fact.
 
 ## Context
