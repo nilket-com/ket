@@ -5033,6 +5033,9 @@ pub struct TimingAtlasCellOutcome {
 	pub invalid_attempts: Vec<TimingAtlasChild>,
 	/// Inter-child reclamation, recorded separately and never inside query elapsed.
 	pub cleanup_ms: f64,
+	/// Whether any reclamation actually failed, distinct from the cell failing for some
+	/// other reason.
+	pub cleanup_failed: bool,
 	pub failure: Option<String>,
 }
 
@@ -5228,6 +5231,7 @@ pub async fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 		pairs: Vec::new(),
 		invalid_attempts: Vec::new(),
 		cleanup_ms: 0.0,
+		cleanup_failed: false,
 		failure: None,
 	};
 
@@ -5338,6 +5342,7 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 			// namespace is reclaimed like any other. Cleanup is awaited on every path.
 			let cleanup_start = harness.now_ms();
 			if let Err(cleanup_error) = harness.cleanup_child(child_plan).await {
+				outcome.cleanup_failed = true;
 				outcome.failure.get_or_insert_with(|| {
 					format!("cleanup failed, reclamation unproven: {cleanup_error}")
 				});
@@ -5369,6 +5374,7 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 	// namespace survives into the next child's machine state.
 	let cleanup_start = harness.now_ms();
 	if let Err(error) = harness.cleanup_child(child_plan).await {
+		outcome.cleanup_failed = true;
 		// An attempted cleanup is not a successful reclamation. If the namespace may still
 		// be resident, every later child of this cell measures a different machine, so the
 		// cell — and its timing authority — is forfeit.
@@ -5630,6 +5636,12 @@ pub struct CensusTimingAtlasHarness {
 	coordinator: Option<DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport>>,
 	reference_identity: Option<ExecutionIdentityFacts>,
 	last_batches: Option<Vec<RecordBatch>>,
+	/// Retained bytes immediately after setup, captured by the harness that owns setup so a
+	/// caller cannot observe it at the wrong moment.
+	baseline_bytes: Option<u64>,
+	/// Retained bytes observed at teardown, before the workers are dropped — reading after
+	/// teardown would always be zero and prove nothing.
+	final_retained_bytes: Option<u64>,
 	pub residency: TimingAtlasResidencyLog,
 }
 
@@ -5665,6 +5677,8 @@ impl CensusTimingAtlasHarness {
 			coordinator: None,
 			reference_identity: None,
 			last_batches: None,
+			baseline_bytes: None,
+			final_retained_bytes: None,
 			residency: TimingAtlasResidencyLog::default(),
 		})
 	}
@@ -5724,7 +5738,7 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 				.take()
 				.ok_or_else(|| "timing atlas catalog already consumed".to_string())?,
 		);
-		self.coordinator = Some(DistributedQueryCoordinator::new(
+		let coordinator = Some(DistributedQueryCoordinator::new(
 			catalog,
 			registry,
 			coordinator_memory,
@@ -5732,6 +5746,8 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 			execution_census_distributed_planner_config(distributed_budget.memory_per_task),
 			distributed_budget,
 		));
+		self.coordinator = coordinator;
+		self.baseline_bytes = Some(self.resident_partition_bytes());
 		Ok(())
 	}
 
@@ -5823,6 +5839,7 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 	}
 
 	async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
+		self.final_retained_bytes = Some(self.resident_partition_bytes());
 		self.coordinator = None;
 		let workers = std::mem::take(&mut self.workers);
 		shutdown_execution_census_workers(workers).await
@@ -5839,6 +5856,16 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 impl CensusTimingAtlasHarness {
 	/// Bytes the resident partition stores still hold. Read from the live stores, so an
 	/// accumulating namespace shows up rather than being assumed away.
+	/// Retained bytes captured immediately after setup, or zero before setup ran.
+	pub fn baseline_bytes(&self) -> u64 {
+		self.baseline_bytes.unwrap_or(0)
+	}
+
+	/// Retained bytes at teardown, before workers were dropped.
+	pub fn final_retained_bytes(&self) -> u64 {
+		self.final_retained_bytes.unwrap_or(0)
+	}
+
 	pub fn resident_partition_bytes(&self) -> u64 {
 		self.workers
 			.iter()
@@ -6298,14 +6325,13 @@ pub async fn run_timing_atlas(
 
 		let mut harness =
 			CensusTimingAtlasHarness::prepare(query, mode, scale_factor, data_root).await?;
-		let baseline_after_setup;
-		let outcome = {
-			harness.setup_cell(query).await?;
-			baseline_after_setup = harness.resident_partition_bytes();
-			let outcome = run_timing_atlas_cell_with(&mut harness, query).await;
-			outcome
-		};
-		let retained = harness.resident_partition_bytes();
+		// The runner owns the cell lifecycle: setting up here as well would construct a
+		// second set of workers and consume the catalog twice.
+		// Boxed: the per-cell future is large, and twenty-one of them inline in one driver
+		// future would live on the stack.
+		let outcome = Box::pin(run_timing_atlas_cell_with(&mut harness, query)).await;
+		let baseline_after_setup = harness.baseline_bytes();
+		let retained = harness.final_retained_bytes();
 
 		for child in outcome
 			.warmups
@@ -6328,7 +6354,7 @@ pub async fn run_timing_atlas(
 		artifact.append_row(&serde_json::json!({
 			"kind": TIMING_ATLAS_KIND_CLEANUP,
 			"query": query,
-			"succeeded": outcome.failure.is_none(),
+			"succeeded": !outcome.cleanup_failed,
 			"returned_to_baseline": retained == baseline_after_setup,
 			"baseline_bytes": baseline_after_setup,
 			"retained_bytes": retained,
@@ -20392,6 +20418,7 @@ mod adr538_timing_atlas_failure_paths {
 			pairs: Vec::new(),
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
+			cleanup_failed: false,
 			failure: None,
 		};
 		assert!(!outcome.finalized());
@@ -20579,6 +20606,7 @@ mod adr538_timing_atlas_execution {
 			pairs: (0..TIMING_ATLAS_MEASURED_PAIRS).map(pair).collect(),
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
+			cleanup_failed: false,
 			failure: None,
 		};
 		assert!(base.finalized());
@@ -20641,6 +20669,7 @@ mod adr538_timing_atlas_execution {
 			}],
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
+			cleanup_failed: false,
 			failure: None,
 		};
 		assert!(outcome.setup_ms > 0.0 && outcome.teardown_ms > 0.0);
@@ -21540,5 +21569,63 @@ mod adr538_timing_atlas_journal_replay {
 		assert_eq!(row["ratio"], serde_json::Value::Null);
 		assert!(!row.to_string().contains("inf"));
 		assert!(!row.to_string().contains("NaN"));
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_driver {
+	use super::*;
+
+	/// End-to-end through the real driver at a small scale. The unit tests all passed while
+	/// the driver constructed workers twice and consumed the catalog before the first child,
+	/// because nothing exercised `run_timing_atlas` itself.
+	/// Deep binds need an explicit stack; run on a dedicated 64 MB thread.
+	#[test]
+	fn driver_produces_a_journal_that_replays_without_violations() {
+		let root = std::env::temp_dir().join(format!("adr538-driver-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let canonical = root.join("timing_atlas.jsonl");
+
+		let journal = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn({
+				let canonical = canonical.clone();
+				move || {
+					// Current-thread runtime: deep multi-join binds (q10+) then run on this
+					// thread's 64 MB stack rather than on runtime workers, whose stacks are
+					// independent of the spawning thread's.
+					let runtime = tokio::runtime::Builder::new_current_thread()
+						.enable_all()
+						.build()
+						.expect("runtime");
+					runtime.block_on(async {
+						let _ =
+							run_timing_atlas("strict", 0.01, Path::new("unused"), &canonical).await;
+						let partial = PathBuf::from(format!("{}.partial", canonical.display()));
+						std::fs::read_to_string(&partial)
+							.or_else(|_| std::fs::read_to_string(&canonical))
+							.unwrap_or_default()
+					})
+				}
+			})
+			.expect("spawn")
+			.join()
+			.expect("join");
+
+		assert!(!journal.is_empty(), "the driver must write a journal");
+		let replay = timing_atlas_replay(&journal);
+		assert_eq!(
+			replay.finalized_cells.len(),
+			timing_atlas_cells().len(),
+			"every cell must finalize; violations: {:?}",
+			replay.violations
+		);
+		assert!(
+			replay.violations.is_empty(),
+			"the journal must replay without violations: {:?}",
+			replay.violations
+		);
+		assert_eq!(replay.exclusions, vec!["q15".to_string()]);
+		let _ = std::fs::remove_dir_all(&root);
 	}
 }
