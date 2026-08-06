@@ -120,6 +120,7 @@ mod tests {
 	use super::*;
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
+	use crate::plot::spec::Channel;
 	use polars::df;
 
 	fn materialized(name: &str, data: DataFrame) -> PlotSource {
@@ -206,6 +207,96 @@ mod tests {
 		assert!(
 			error.contains("test"),
 			"error must name the source: {error}"
+		);
+	}
+
+	#[test]
+	fn product_0030_banks_the_pre_switch_legacy_request_boundary() {
+		let mut actual = String::new();
+		let scatter = plan(PlotRequest {
+			source: materialized(
+				"pre-switch scatter",
+				df!(
+					"x" => [1_i32, 2, 3, 4, 5, 6],
+					"y" => [6_i32, 5, 4, 3, 2, 1],
+					"cat" => ["A", "B", "C", "D", "E", "F"],
+				)
+				.expect("scatter frame"),
+			),
+			authored_spec: AuthoredPlotSpec::xy_color(
+				PlotComposition::single(PlotType::Scatter),
+				"x",
+				"y",
+				Some("cat".to_owned()),
+			),
+		})
+		.expect("legacy scatter request");
+		let fields = scatter
+			.data
+			.get_column_names()
+			.iter()
+			.map(|field| field.as_str())
+			.collect::<Vec<_>>()
+			.join(",");
+		actual.push_str(&format!("scatter.fields={fields}\n"));
+		actual.push_str(&format!(
+			"scatter.band_fills={}\n",
+			scatter.resolved_spec.band_fills.len()
+		));
+		for assignment in &scatter
+			.resolved_spec
+			.channel(Channel::Color)
+			.expect("categorical color")
+			.colors
+		{
+			let color = assignment.color;
+			actual.push_str(&format!(
+				"scatter.{}@{}=#{:02X}{:02X}{:02X}{:02X}\n",
+				assignment.category,
+				assignment.position.index(),
+				color.red,
+				color.green,
+				color.blue,
+				color.alpha,
+			));
+		}
+
+		let bar = plan(PlotRequest {
+			source: materialized(
+				"pre-switch bar",
+				df!(
+					"cat" => ["A", "B", "C", "D", "E", "F"],
+					"val" => [1_i32, 2, 3, 4, 5, 6],
+				)
+				.expect("bar frame"),
+			),
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Bar),
+				"cat",
+				"val",
+			),
+		})
+		.expect("legacy bar request");
+		let fields = bar
+			.data
+			.get_column_names()
+			.iter()
+			.map(|field| field.as_str())
+			.collect::<Vec<_>>()
+			.join(",");
+		actual.push_str(&format!("bar.fields={fields}\n"));
+		actual.push_str(&format!(
+			"bar.band_fills={}\n",
+			bar.resolved_spec.band_fills.len()
+		));
+		actual.push_str(&format!(
+			"bar.color_channel={}\n",
+			bar.resolved_spec.channel(Channel::Color).is_some()
+		));
+
+		assert_eq!(
+			actual,
+			include_str!("spec/snapshots/product-0030-pre-switch-categorical.txt")
 		);
 	}
 }

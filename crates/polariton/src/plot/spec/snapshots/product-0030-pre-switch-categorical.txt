@@ -1,0 +1,11 @@
+scatter.fields=x,y,cat
+scatter.band_fills=0
+scatter.A@0=#4C78A8FF
+scatter.B@1=#F28E2BFF
+scatter.C@2=#E15759FF
+scatter.D@3=#76B7B2FF
+scatter.E@4=#59A14FFF
+scatter.F@5=#EDC948FF
+bar.fields=cat,val
+bar.band_fills=0
+bar.color_channel=false
