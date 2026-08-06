@@ -29,10 +29,11 @@ skin("tab20c_s8").duotone()  // explicit set-based strongest pair
 
 Ordinary skin uses the resolved palette's semantic background position (slot
 19, libaryon's `Whitespace` position) as its ordered anchor and chooses that
-anchor's most contrasting mate from the same resolved palette. The pair is
-oriented darker-paper/lighter-ink and completed through PRODUCT-0032's existing
-alpha policy and eight contrast checks. Thus reverse and shift can change the
-anchor and completed chrome without spending unrelated swatches across roles.
+anchor's most contrasting mate from the same resolved palette. The ordered
+anchor remains the paper even for a light theme; its mate becomes ink. The pair
+is completed through PRODUCT-0032's existing alpha policy and eight contrast
+checks. Thus reverse and shift change the dominant canvas treatment without
+spending unrelated swatches across roles.
 
 Explicit Duotone preserves PRODUCT-0032's current global-most-contrasting-pair
 projection exactly. Set-preserving reverse and shift may intentionally collapse

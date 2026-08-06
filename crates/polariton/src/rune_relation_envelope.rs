@@ -6,13 +6,14 @@
 //! owns no relation verbs, typing, planning, or lowering; those belong
 //! exclusively to Toron's native Rune frontend.
 
+use crate::plot::chrome::PlotChromeProjection;
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize, Presence,
 	StrokeWidth,
 };
-use crate::plot::theme::PlotSettingsLayer;
+use crate::plot::theme::{PlotSettingsLayer, PlotSkinSelection};
 use libaryon::core::BufferId;
 use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
@@ -1162,6 +1163,20 @@ fn parse_figure(
 	let mut palette = None;
 	let mut body = None;
 	for (item, _) in list.items.iter() {
+		if let Some(selection) = parse_figure_skin(item, source)? {
+			if skin.is_some() {
+				return invalid_view(
+					item.span(),
+					source.len(),
+					"a figure has at most one plot skin",
+				);
+			}
+			skin = Some((
+				selection,
+				u32_range(&byte_range(item.span(), source.len())?, "plot skin")?,
+			));
+			continue;
+		}
 		let ast::Expr::Call(call) = item else {
 			return invalid_view(
 				item.span(),
@@ -1191,19 +1206,6 @@ fn parse_figure(
 					);
 				}
 				subtitle = Some(parse_figure_heading(item, &child_args, source, "subtitle")?);
-			}
-			"skin" => {
-				if skin.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one plot skin",
-					);
-				}
-				skin = Some((
-					parse_figure_heading(item, &child_args, source, "skin")?,
-					u32_range(&byte_range(item.span(), source.len())?, "plot skin")?,
-				));
 			}
 			"palette" => {
 				if palette.is_some() {
@@ -1243,7 +1245,7 @@ fn parse_figure(
 	}
 	let plot_skin_span = skin.as_ref().map(|(_, span)| span.clone());
 	if let Some((skin, _)) = skin {
-		authored_settings.plot_skin = Override::Set(Arc::new(skin));
+		authored_settings.plot_skin = Override::Set(skin);
 	}
 	if let Some(palette) = palette {
 		authored_settings.categorical_palette = Override::Set(Arc::new(palette));
@@ -1253,6 +1255,62 @@ fn parse_figure(
 		authored_settings,
 		plot_skin_span,
 	})
+}
+
+fn parse_figure_skin(
+	expression: &ast::Expr,
+	source: &str,
+) -> Result<Option<PlotSkinSelection>, RuneEnvelopeError> {
+	let ast::Expr::Call(_) = expression else {
+		return Ok(None);
+	};
+	let mut current = expression;
+	let mut modifiers = Vec::new();
+	while let ast::Expr::Call(call) = current
+		&& let ast::Expr::FieldAccess(field) = call.expr.as_ref()
+	{
+		modifiers.push((source_slice(source, field.expr_field.span())?.trim(), call));
+		current = &field.expr;
+	}
+	let ast::Expr::Call(root) = current else {
+		return Ok(None);
+	};
+	if source_slice(source, root.expr.span())?.trim() != "skin" {
+		return Ok(None);
+	}
+
+	let root_args = root.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+	let name = parse_figure_heading(current, &root_args, source, "skin")?;
+	let mut projection = PlotChromeProjection::Ordered;
+	for (modifier, call) in modifiers {
+		match modifier {
+			"duotone" => {
+				if projection == PlotChromeProjection::Duotone {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"duotone() may appear at most once on a plot skin",
+					);
+				}
+				if !call.args.is_empty() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"duotone() takes no arguments",
+					);
+				}
+				projection = PlotChromeProjection::Duotone;
+			}
+			_ => {
+				return invalid_view(
+					expression.span(),
+					source.len(),
+					format!("unknown plot-skin modifier {modifier:?}; expected duotone()"),
+				);
+			}
+		}
+	}
+	Ok(Some(PlotSkinSelection::new(name, projection)))
 }
 
 fn parse_figure_heading(
@@ -3198,9 +3256,26 @@ workspace.table("t").views([table()])
 		};
 		assert_eq!(
 			plot.authored_settings.plot_skin,
-			Override::Set(Arc::new("nord".to_owned()))
+			Override::Set(PlotSkinSelection::new(
+				"nord".to_owned(),
+				PlotChromeProjection::Ordered,
+			))
 		);
 		assert_eq!(plot.authored_settings.chrome, Override::Inherit);
+
+		let explicit = only_plot(
+			"workspace.table(\"t\").views([figure([skin(\"nord\").duotone(), bar(\"cat\", \"val\")])])",
+		);
+		let RuneViewIntent::Plot(plot) = explicit.intent else {
+			panic!("explicit Duotone figure")
+		};
+		assert_eq!(
+			plot.authored_settings.plot_skin,
+			Override::Set(PlotSkinSelection::new(
+				"nord".to_owned(),
+				PlotChromeProjection::Duotone,
+			))
+		);
 	}
 
 	#[test]
@@ -3230,6 +3305,18 @@ workspace.table("t").views([table()])
 				"workspace.table(\"t\").views([bar(\"cat\", \"val\").skin(\"nord\")])",
 				"bar(\"cat\", \"val\").skin(\"nord\")",
 			),
+			(
+				"workspace.table(\"t\").views([figure([skin(\"nord\").duotone(1), bar(\"cat\", \"val\")])])",
+				"skin(\"nord\").duotone(1)",
+			),
+			(
+				"workspace.table(\"t\").views([figure([skin(\"nord\").duotone().duotone(), bar(\"cat\", \"val\")])])",
+				"skin(\"nord\").duotone().duotone()",
+			),
+			(
+				"workspace.table(\"t\").views([figure([skin(\"nord\").frobnicate(), bar(\"cat\", \"val\")])])",
+				"skin(\"nord\").frobnicate()",
+			),
 		] {
 			let RuneEnvelopeError::InvalidView { span, .. } =
 				transform(source).expect_err("invalid plot skin position")
@@ -3242,6 +3329,7 @@ workspace.table("t").views([table()])
 		let ordinary = r#"
 			skin("nord");
 			let held = skin("viridis");
+			let quiet = skin("tab20c_s8").duotone();
 			figure([skin("ordinary"), bar("cat", "val")]);
 			workspace.table("t").views([table().skin("nord")])
 		"#;

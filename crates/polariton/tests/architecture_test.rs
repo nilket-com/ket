@@ -1207,7 +1207,7 @@ fn product_0031_plot_chrome_is_closed_and_mark_ink_stays_separate() {
 }
 
 #[test]
-fn product_0032_plot_skin_surface_is_bounded_and_renderer_free() {
+fn product_0033_plot_skin_projection_choice_is_bounded_and_renderer_free() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
 	let layer = theme
@@ -1217,7 +1217,7 @@ fn product_0032_plot_skin_surface_is_bounded_and_renderer_free() {
 		.split('}')
 		.next()
 		.expect("settings fields");
-	assert!(layer.contains("plot_skin: Override<Arc<String>>"));
+	assert!(layer.contains("plot_skin: Override<PlotSkinSelection>"));
 	assert!(layer.contains("chrome: Override<PlotChrome>"));
 
 	let chrome = std::fs::read_to_string(root.join("plot/chrome.rs")).expect("read chrome");
@@ -1229,7 +1229,14 @@ fn product_0032_plot_skin_surface_is_bounded_and_renderer_free() {
 	assert_eq!(production.matches("Theme::try_new").count(), 1);
 	assert!(!production.contains("TableSkin"));
 	assert!(!production.contains("UiPalette"));
-	assert!(!production.contains("Projection::"));
+	assert_eq!(
+		production
+			.matches("pub enum PlotChromeProjection {")
+			.count(),
+		1
+	);
+	assert!(production.contains("Ordered"));
+	assert!(production.contains("Duotone"));
 
 	let envelope =
 		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
@@ -1240,8 +1247,16 @@ fn product_0032_plot_skin_surface_is_bounded_and_renderer_free() {
 		.split("fn parse_figure_heading(")
 		.next()
 		.expect("bounded parser");
-	assert_eq!(figure_parser.matches("\"skin\" =>").count(), 1);
 	assert!(figure_parser.contains("authored_settings.plot_skin"));
+	let skin_parser = envelope
+		.split("fn parse_figure_skin(")
+		.nth(1)
+		.expect("plot skin parser")
+		.split("fn parse_figure_heading(")
+		.next()
+		.expect("bounded plot skin parser");
+	assert_eq!(skin_parser.matches("\"duotone\"").count(), 1);
+	assert!(!skin_parser.contains("TableSkin"));
 
 	for relative in ["plot/spec/mod.rs", "plot/factory.rs"] {
 		let source = std::fs::read_to_string(root.join(relative)).expect("read plot boundary");

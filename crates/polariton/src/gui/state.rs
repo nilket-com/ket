@@ -811,9 +811,10 @@ fn resolve_rune_plot_skin(
 		authored_spec: authored_settings.clone(),
 		..PlotSettings::default()
 	};
-	if let Some(identity) = settings.resolve_plot_skin_identity() {
+	if let Some(selection) = settings.resolve_plot_skin() {
 		authored_settings.chrome = Override::Set(
-			PlotChrome::from_theme_name(identity.as_str()).map_err(|error| error.to_string())?,
+			PlotChrome::from_theme_name(selection.name.as_str(), selection.projection)
+				.map_err(|error| error.to_string())?,
 		);
 	}
 	Ok(authored_settings)
@@ -5636,13 +5637,19 @@ workspace.table("bad").views([view("bad", table())]);
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0032_skin_and_palette_are_disjoint_completed_siblings() {
+	fn product_0033_ordered_skin_and_explicit_duotone_keep_palette_disjoint() {
 		fn completed(
 			skin: Option<&str>,
+			duotone: bool,
 			palette: &str,
 		) -> (crate::plot::request::ResolvedPlot, ResolvedPlotSettings) {
 			let skin = skin
-				.map(|name| format!("skin(\"{name}\"), "))
+				.map(|name| {
+					format!(
+						"skin(\"{name}\"){}, ",
+						if duotone { ".duotone()" } else { "" }
+					)
+				})
 				.unwrap_or_default();
 			let source = format!(
 				"workspace.table(\"t\").views([figure([{skin}palette(\"{palette}\"), bar(\"cat\", \"val\")])])"
@@ -5667,8 +5674,8 @@ workspace.table("bad").views([view("bad", table())]);
 			(resolved.clone(), settings)
 		}
 
-		let (reversed, reversed_settings) = completed(Some("viridis_r"), "viridis_r");
-		let (shifted, shifted_settings) = completed(Some("viridis_s5"), "viridis_s5");
+		let (reversed, reversed_settings) = completed(Some("viridis_r"), false, "viridis_r");
+		let (shifted, shifted_settings) = completed(Some("viridis_s5"), false, "viridis_s5");
 		let reversed_bands = band_mapping(&reversed);
 		let shifted_bands = band_mapping(&shifted);
 		assert_eq!(
@@ -5685,15 +5692,21 @@ workspace.table("bad").views([view("bad", table())]);
 			reversed_bands, shifted_bands,
 			"ordered data swatches recolor"
 		);
-		assert_eq!(
+		assert_ne!(
 			reversed_settings.chrome, shifted_settings.chrome,
-			"set-projected chrome consumes the unchanged pair"
+			"ordinary skin preserves resolved ordering"
+		);
+		let (_, reversed_duotone) = completed(Some("viridis_r"), true, "viridis_r");
+		let (_, shifted_duotone) = completed(Some("viridis_s5"), true, "viridis_s5");
+		assert_eq!(
+			reversed_duotone.chrome, shifted_duotone.chrome,
+			"explicit Duotone intentionally consumes the unchanged set"
 		);
 		assert_eq!(reversed_settings.mark_decoration_color, iced::Color::WHITE);
 		assert_eq!(shifted_settings.mark_decoration_color, iced::Color::WHITE);
 
-		let (_, nord_tab20c) = completed(Some("nord"), "tab20c");
-		let (yellows, nord_yellows) = completed(Some("nord"), "yellows");
+		let (_, nord_tab20c) = completed(Some("nord"), false, "tab20c");
+		let (yellows, nord_yellows) = completed(Some("nord"), false, "yellows");
 		assert_eq!(nord_tab20c.chrome, nord_yellows.chrome);
 		assert_eq!(
 			band_mapping(&yellows)
@@ -5704,7 +5717,7 @@ workspace.table("bad").views([view("bad", table())]);
 			"awkward data colors are accepted without a chrome/data contrast gate"
 		);
 
-		let (_, omitted) = completed(None, "tab20c");
+		let (_, omitted) = completed(None, false, "tab20c");
 		assert_eq!(omitted.chrome, crate::plot::chrome::PlotChrome::DEFAULT);
 	}
 
