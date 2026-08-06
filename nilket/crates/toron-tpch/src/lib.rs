@@ -5353,6 +5353,171 @@ fn assemble_timing_atlas_pair(
 	}
 }
 
+/// One observation of host quiescence. ADR 538 requires this at the start of the run and
+/// again at the final seal: a service restarted mid-atlas would otherwise pass a single
+/// check and still contaminate the measurements it was supposed to be absent from.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostQuiescence {
+	pub service_inactive: bool,
+	pub sql_port_free: bool,
+}
+
+impl HostQuiescence {
+	pub fn quiescent(&self) -> bool {
+		self.service_inactive && self.sql_port_free
+	}
+}
+
+/// Observe the host: the local deployment service must be inactive and its SQL port free.
+pub fn observe_host_quiescence() -> HostQuiescence {
+	let service_inactive = std::process::Command::new("systemctl")
+		.args(["--user", "is-active", "nilket-local.service"])
+		.output()
+		.map(|output| String::from_utf8_lossy(&output.stdout).trim() != "active")
+		.unwrap_or(true);
+	// Binding succeeds only when nothing else holds the endpoint.
+	let sql_port_free = std::net::UdpSocket::bind("127.0.0.1:7742").is_ok();
+	HostQuiescence {
+		service_inactive,
+		sql_port_free,
+	}
+}
+
+/// Authority requires quiescence at both observations, not just one.
+pub fn timing_atlas_quiescent_throughout(start: &HostQuiescence, seal: &HostQuiescence) -> bool {
+	start.quiescent() && seal.quiescent()
+}
+
+#[derive(Debug)]
+pub struct TimingAtlasArtifact {
+	partial_path: PathBuf,
+	canonical_path: PathBuf,
+	file: std::fs::File,
+	sealed: bool,
+}
+
+impl TimingAtlasArtifact {
+	/// Open a fresh partial artifact. Refuses when either the partial or the canonical
+	/// destination already exists — a run never overwrites a previous atlas.
+	pub fn create(canonical_path: &Path) -> Result<Self, String> {
+		let partial_path = PathBuf::from(format!(
+			"{}{TIMING_ATLAS_PARTIAL_SUFFIX}",
+			canonical_path.display()
+		));
+		if canonical_path.exists() {
+			return Err(format!(
+				"timing atlas refuses to overwrite existing artifact {}",
+				canonical_path.display()
+			));
+		}
+		if partial_path.exists() {
+			return Err(format!(
+				"timing atlas refuses to reuse existing partial {}",
+				partial_path.display()
+			));
+		}
+		if let Some(parent) = canonical_path.parent() {
+			std::fs::create_dir_all(parent)
+				.map_err(|error| format!("timing atlas output dir: {error}"))?;
+		}
+		let file = std::fs::File::options()
+			.write(true)
+			.create_new(true)
+			.open(&partial_path)
+			.map_err(|error| format!("timing atlas partial {}: {error}", partial_path.display()))?;
+		Ok(Self {
+			partial_path,
+			canonical_path: canonical_path.to_path_buf(),
+			file,
+			sealed: false,
+		})
+	}
+
+	pub fn partial_path(&self) -> &Path {
+		&self.partial_path
+	}
+
+	/// Append one row. Rows are written as they are produced so a crash preserves progress.
+	pub fn append_row(&mut self, row: &serde_json::Value) -> Result<(), String> {
+		use std::io::Write;
+		writeln!(self.file, "{row}").map_err(|error| format!("timing atlas append: {error}"))
+	}
+
+	/// Append the terminal seal. Written last, after every row, and only once.
+	pub fn append_seal(&mut self, seal: &serde_json::Value) -> Result<(), String> {
+		if self.sealed {
+			return Err("timing atlas already sealed".to_string());
+		}
+		self.append_row(seal)?;
+		self.sealed = true;
+		Ok(())
+	}
+
+	/// Flush, sync and atomically rename the partial into place. Refuses to publish an
+	/// unsealed artifact or to clobber a canonical destination that appeared meanwhile.
+	pub fn publish(mut self) -> Result<PathBuf, String> {
+		use std::io::Write;
+		if !self.sealed {
+			return Err("timing atlas refuses to publish without a terminal seal".to_string());
+		}
+		if self.canonical_path.exists() {
+			return Err(format!(
+				"timing atlas refuses to overwrite existing artifact {}",
+				self.canonical_path.display()
+			));
+		}
+		self.file
+			.flush()
+			.map_err(|error| format!("timing atlas flush: {error}"))?;
+		self.file
+			.sync_all()
+			.map_err(|error| format!("timing atlas sync: {error}"))?;
+		std::fs::rename(&self.partial_path, &self.canonical_path)
+			.map_err(|error| format!("timing atlas publish: {error}"))?;
+		Ok(self.canonical_path.clone())
+	}
+}
+
+/// Identity of the resident infrastructure for one cell. Captured per child so a harness
+/// that quietly rebuilds workers between children is caught: the trait proves the runner's
+/// call topology, but only this proves `setup_cell` owns the workers and `execute_child`
+/// reuses them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimingAtlasResidency {
+	pub worker_ids: Vec<u128>,
+	pub endpoints: Vec<String>,
+}
+
+/// Records the residency observed at each child, so a whole cell can be checked at once.
+#[derive(Debug, Clone, Default)]
+pub struct TimingAtlasResidencyLog {
+	observations: Vec<TimingAtlasResidency>,
+}
+
+impl TimingAtlasResidencyLog {
+	pub fn observe(&mut self, residency: TimingAtlasResidency) {
+		self.observations.push(residency);
+	}
+
+	pub fn len(&self) -> usize {
+		self.observations.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.observations.is_empty()
+	}
+
+	/// Every child of a cell saw the same worker ids and endpoints — infrastructure was
+	/// constructed once and reused, not recreated inside `execute_child`.
+	pub fn stable(&self) -> bool {
+		let mut distinct = self.observations.iter();
+		let Some(first) = distinct.next() else {
+			return false;
+		};
+		distinct.all(|observation| observation == first)
+	}
+}
+
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
 /// construction — a new `FragmentError` variant fails compilation here instead of falling
 /// through to an unrecognized bucket.
@@ -19774,5 +19939,185 @@ mod adr538_timing_atlas_runner {
 		);
 		assert_eq!(outcome.setup_ms, 500.0, "setup recorded but excluded");
 		assert_eq!(outcome.teardown_ms, 300.0, "teardown recorded but excluded");
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_publication {
+	use super::*;
+
+	fn temp_dir(name: &str) -> PathBuf {
+		let root = std::env::temp_dir().join(format!("adr538-{name}-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		std::fs::create_dir_all(&root).expect("temp dir");
+		root
+	}
+
+	fn row(kind: &str) -> serde_json::Value {
+		serde_json::json!({ "kind": kind })
+	}
+
+	/// While a run is in flight only the partial exists; the canonical artifact appears at
+	/// publication and never before.
+	#[test]
+	fn partial_exists_while_running_and_canonical_does_not() {
+		let root = temp_dir("running");
+		let canonical = root.join("timing_atlas.jsonl");
+		let mut artifact = TimingAtlasArtifact::create(&canonical).expect("create");
+		artifact.append_row(&row("child")).expect("append");
+
+		assert!(
+			artifact.partial_path().exists(),
+			"partial exists while running"
+		);
+		assert!(
+			!canonical.exists(),
+			"canonical must not exist before publication"
+		);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// A failed or abandoned run retains the partial and publishes nothing.
+	#[test]
+	fn failed_run_retains_partial_and_never_publishes() {
+		let root = temp_dir("failed");
+		let canonical = root.join("timing_atlas.jsonl");
+		let mut artifact = TimingAtlasArtifact::create(&canonical).expect("create");
+		artifact.append_row(&row("child")).expect("append");
+		let partial = artifact.partial_path().to_path_buf();
+
+		// No seal: publication is refused.
+		let error = artifact.publish().expect_err("unsealed publish must fail");
+		assert!(error.contains("terminal seal"));
+		assert!(partial.exists(), "the partial is retained for inspection");
+		assert!(!canonical.exists());
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// Successful finalization writes the seal last and publishes atomically.
+	#[test]
+	fn successful_finalization_seals_then_publishes_atomically() {
+		let root = temp_dir("sealed");
+		let canonical = root.join("timing_atlas.jsonl");
+		let mut artifact = TimingAtlasArtifact::create(&canonical).expect("create");
+		artifact.append_row(&row("child")).expect("append");
+		artifact.append_row(&row("pair")).expect("append");
+		artifact
+			.append_seal(&serde_json::json!({ "kind": TIMING_ATLAS_SEAL_KIND }))
+			.expect("seal");
+		let partial = artifact.partial_path().to_path_buf();
+		let published = artifact.publish().expect("publish");
+
+		assert_eq!(published, canonical);
+		assert!(canonical.exists(), "canonical artifact is published");
+		assert!(!partial.exists(), "the partial is renamed, not copied");
+
+		let contents = std::fs::read_to_string(&canonical).expect("read");
+		let last = contents.lines().last().expect("last line");
+		assert!(
+			last.contains(TIMING_ATLAS_SEAL_KIND),
+			"the terminal seal is the final record"
+		);
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// A run never overwrites an existing atlas, at creation or at publication.
+	#[test]
+	fn publication_refuses_to_overwrite_an_existing_artifact() {
+		let root = temp_dir("existing");
+		let canonical = root.join("timing_atlas.jsonl");
+		std::fs::write(&canonical, "{}\n").expect("pre-existing artifact");
+
+		let error = TimingAtlasArtifact::create(&canonical).expect_err("create must refuse");
+		assert!(error.contains("refuses to overwrite"));
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// A double seal is refused: the terminal record is written once.
+	#[test]
+	fn a_second_seal_is_refused() {
+		let root = temp_dir("double-seal");
+		let canonical = root.join("timing_atlas.jsonl");
+		let mut artifact = TimingAtlasArtifact::create(&canonical).expect("create");
+		let seal = serde_json::json!({ "kind": TIMING_ATLAS_SEAL_KIND });
+		artifact.append_seal(&seal).expect("first seal");
+		assert!(artifact.append_seal(&seal).is_err(), "one seal only");
+		let _ = std::fs::remove_dir_all(&root);
+	}
+
+	/// Authority requires quiescence at the start AND at the final seal — a service
+	/// restarted mid-atlas must not pass on a single early observation.
+	#[test]
+	fn quiescence_is_required_at_both_observations() {
+		let quiet = HostQuiescence {
+			service_inactive: true,
+			sql_port_free: true,
+		};
+		let noisy = HostQuiescence {
+			service_inactive: false,
+			sql_port_free: false,
+		};
+		assert!(timing_atlas_quiescent_throughout(&quiet, &quiet));
+		assert!(
+			!timing_atlas_quiescent_throughout(&quiet, &noisy),
+			"a service restarted before the seal forfeits authority"
+		);
+		assert!(!timing_atlas_quiescent_throughout(&noisy, &quiet));
+		assert!(
+			!HostQuiescence {
+				service_inactive: true,
+				sql_port_free: false
+			}
+			.quiescent(),
+			"both the service and the port must be clear"
+		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_residency {
+	use super::*;
+
+	fn residency(worker: u128) -> TimingAtlasResidency {
+		TimingAtlasResidency {
+			worker_ids: vec![worker, worker + 1],
+			endpoints: vec![format!("127.0.0.1:{}", 9000 + worker)],
+		}
+	}
+
+	/// The real harness must reuse the workers `setup_cell` built. Stable ids and endpoints
+	/// across all sixteen children is what distinguishes reuse from silent reconstruction.
+	#[test]
+	fn stable_worker_identity_across_every_child_of_a_cell() {
+		let mut log = TimingAtlasResidencyLog::default();
+		for _ in 0..(2 + TIMING_ATLAS_MEASURED_PAIRS * 2) {
+			log.observe(residency(1));
+		}
+		assert_eq!(log.len(), 16);
+		assert!(log.stable(), "one cell, one set of resident workers");
+	}
+
+	/// A harness that rebuilt infrastructure mid-cell would change identity, and that is a
+	/// failure even if every child otherwise succeeded.
+	#[test]
+	fn rebuilt_workers_are_detected_as_unstable() {
+		let mut log = TimingAtlasResidencyLog::default();
+		for index in 0..16u128 {
+			// A rebuild between children 7 and 8.
+			log.observe(residency(if index < 8 { 1 } else { 2 }));
+		}
+		assert!(
+			!log.stable(),
+			"changed worker identity means execute_child recreated infrastructure"
+		);
+	}
+
+	#[test]
+	fn an_empty_log_is_not_stable() {
+		let log = TimingAtlasResidencyLog::default();
+		assert!(
+			!log.stable(),
+			"no observations cannot vacuously prove residency"
+		);
 	}
 }
