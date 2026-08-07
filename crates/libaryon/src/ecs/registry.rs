@@ -1002,9 +1002,12 @@ impl UastRegistry {
 		self.bump_inspector_revision();
 	}
 
-	/// Rebind a leaf to the just-saved file generation and discard its resident
-	/// copy. Existing physical leaves change device without entering owner
-	/// accounting; virtual leaves leave it exactly once.
+	/// Rebind a leaf to the just-saved file generation. Unpinned resident bytes
+	/// are discarded so a save still re-sparsifies the document, but leaves in a
+	/// current viewport keep their resident copy. The latter is important because
+	/// the save command renders immediately, before a cold-leaf hydration can
+	/// complete; dropping a visible leaf would paint a blank frame until the next
+	/// edit happened to request another repaint.
 	pub(crate) fn rebind_data_to_saved_span(&self, node: NodeId, span: Option<SvpPointer>) {
 		let idx = self
 			.checked_node_index(node)
@@ -1015,6 +1018,12 @@ impl UastRegistry {
 			"saved-span rebind raced a retired UAST node"
 		);
 		let was_authoritative = unsafe { (*self.spans[idx].get()).is_none() };
+		let preserve_resident = self
+			.viewport_resident_pins
+			.lock()
+			.unwrap()
+			.values()
+			.any(|nodes| nodes.contains(&node));
 		let authoritative_len = if was_authoritative {
 			unsafe {
 				(&*self.virtual_data[idx].get())
@@ -1026,26 +1035,57 @@ impl UastRegistry {
 		};
 		unsafe {
 			*self.spans[idx].get() = span;
-			let payload = &mut *self.virtual_data[idx].get();
-			if span.is_some() {
-				payload.take();
-			} else {
+			if !preserve_resident && span.is_some() {
+				(&mut *self.virtual_data[idx].get()).take();
+				(&mut *self.partial_residency[idx].get()).clear();
+			} else if span.is_none() {
 				assert_eq!(
 					authoritative_len, 0,
 					"nonempty saved leaf requires a physical span"
 				);
-				*payload = Some(Vec::new());
+				if !preserve_resident {
+					*(&mut *self.virtual_data[idx].get()) = Some(Vec::new());
+				}
 			}
-			(&mut *self.partial_residency[idx].get()).clear();
 		}
-		let accounted = self.resident_accounted_bytes[idx].swap(0, Ordering::AcqRel);
-		if accounted > 0 {
-			self.resident_bytes.fetch_sub(accounted, Ordering::AcqRel);
+		if preserve_resident && span.is_some() {
+			let new_accounted = unsafe {
+				let full = (&*self.virtual_data[idx].get())
+					.as_ref()
+					.map_or(0, |bytes| bytes.len() as u64);
+				let partial = (&*self.partial_residency[idx].get())
+					.iter()
+					.map(|range| range.bytes.len() as u64)
+					.sum::<u64>();
+				full.saturating_add(partial)
+			};
+			let old_accounted =
+				self.resident_accounted_bytes[idx].swap(new_accounted, Ordering::AcqRel);
+			if new_accounted >= old_accounted {
+				self.resident_bytes
+					.fetch_add(new_accounted - old_accounted, Ordering::AcqRel);
+			} else {
+				self.resident_bytes
+					.fetch_sub(old_accounted - new_accounted, Ordering::AcqRel);
+			}
+			if new_accounted > 0 {
+				if !self.resident_counted_hot[idx].swap(true, Ordering::AcqRel) {
+					self.hot_extent_count.fetch_add(1, Ordering::Relaxed);
+				}
+			} else if self.resident_counted_hot[idx].swap(false, Ordering::AcqRel) {
+				self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
+			}
+			self.touch_resident_lru(node, new_accounted > 0);
+		} else {
+			let accounted = self.resident_accounted_bytes[idx].swap(0, Ordering::AcqRel);
+			if accounted > 0 {
+				self.resident_bytes.fetch_sub(accounted, Ordering::AcqRel);
+			}
+			if self.resident_counted_hot[idx].swap(false, Ordering::AcqRel) {
+				self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
+			}
+			self.touch_resident_lru(node, false);
 		}
-		if self.resident_counted_hot[idx].swap(false, Ordering::AcqRel) {
-			self.hot_extent_count.fetch_sub(1, Ordering::AcqRel);
-		}
-		self.touch_resident_lru(node, false);
 		Self::checked_monotonic_add(
 			&self.authoritative_bytes_removed,
 			authoritative_len,

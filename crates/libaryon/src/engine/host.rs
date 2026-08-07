@@ -3642,6 +3642,45 @@ pub fn main(editor) {{
 	}
 
 	#[test]
+	fn saving_a_loaded_file_keeps_the_top_line_visible() {
+		let path = std::env::temp_dir().join(format!(
+			"baryon-save-top-line-{}-{}.txt",
+			std::process::id(),
+			SystemTime::now()
+				.duration_since(UNIX_EPOCH)
+				.expect("system clock")
+				.as_nanos()
+		));
+		let source = b"first line\nsecond line\nthird line\n";
+		fs::write(&path, source).expect("write fixture");
+
+		let mut handle = EngineHandle::spawn(EngineConfig {
+			initial_file: Some(path.to_string_lossy().into_owned()),
+			..EngineConfig::default()
+		});
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport receiver");
+		commands
+			.send(EditorCommand::Resize(80, 24))
+			.expect("resize engine");
+		recv_viewport_until(&viewports, "source text", |viewport| {
+			visible_text(viewport) == source
+		});
+
+		commands.send(EditorCommand::WriteFile).expect("save file");
+		let saved = recv_viewport_until(&viewports, "saved source text", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|status| status.contains("written"))
+		});
+		assert_eq!(visible_text(&saved), source);
+
+		handle.shutdown().expect("join engine");
+		let _ = fs::remove_file(path);
+	}
+
+	#[test]
 	fn public_host_edits_and_saves_an_unnamed_document() {
 		let path = std::env::temp_dir().join(format!(
 			"baryon-headless-unnamed-{}-{}.txt",
