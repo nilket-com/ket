@@ -253,7 +253,29 @@ const KELLY_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
 	Rgb::new(18, 18, 18),
 );
 
-const PRISM_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+// Glowmax's three achromatic syntax-furniture colors (comment grey, punctuation
+// white, and whitespace grey) are deliberately not data identities.
+const GLOWMAX_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	Rgb::new(255, 0, 255),
+	Rgb::new(0, 255, 0),
+	Rgb::new(0, 255, 255),
+	Rgb::new(255, 255, 0),
+	Rgb::new(255, 128, 0),
+	Rgb::new(0, 127, 255),
+	Rgb::new(255, 0, 127),
+	Rgb::new(127, 255, 0),
+	Rgb::new(191, 0, 255),
+	Rgb::new(0, 255, 127),
+	Rgb::new(127, 0, 255),
+	Rgb::new(255, 191, 0),
+	Rgb::new(0, 191, 255),
+	Rgb::new(255, 0, 0),
+	Rgb::new(0, 255, 191),
+	Rgb::new(255, 255, 127),
+	Rgb::new(191, 191, 0),
+);
+
+const PRISM_SYNTAX: [Rgb; 20] = [
 	Rgb::new(255, 0, 64),
 	Rgb::new(0, 255, 128),
 	Rgb::new(76, 76, 76),
@@ -274,6 +296,26 @@ const PRISM_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
 	Rgb::new(184, 134, 11),
 	Rgb::new(95, 158, 160),
 	Rgb::new(26, 26, 26),
+];
+
+const PRISM_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	PRISM_SYNTAX[0],
+	PRISM_SYNTAX[1],
+	PRISM_SYNTAX[3],
+	PRISM_SYNTAX[4],
+	PRISM_SYNTAX[5],
+	PRISM_SYNTAX[7],
+	PRISM_SYNTAX[8],
+	PRISM_SYNTAX[9],
+	PRISM_SYNTAX[10],
+	PRISM_SYNTAX[11],
+	PRISM_SYNTAX[12],
+	PRISM_SYNTAX[13],
+	PRISM_SYNTAX[14],
+	PRISM_SYNTAX[15],
+	PRISM_SYNTAX[16],
+	PRISM_SYNTAX[17],
+	PRISM_SYNTAX[18],
 );
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1020,26 +1062,26 @@ impl Theme {
 	}
 
 	fn fill_prism(map: &mut [Option<Rgb>; CATEGORY_COUNT]) {
-		let c01 = PRISM_CATEGORICAL.color(0);
-		let c02 = PRISM_CATEGORICAL.color(1);
-		let c03 = PRISM_CATEGORICAL.color(2);
-		let c04 = PRISM_CATEGORICAL.color(3);
-		let c05 = PRISM_CATEGORICAL.color(4);
-		let c06 = PRISM_CATEGORICAL.color(5);
-		let c07 = PRISM_CATEGORICAL.color(6);
-		let c08 = PRISM_CATEGORICAL.color(7);
-		let c09 = PRISM_CATEGORICAL.color(8);
-		let c10 = PRISM_CATEGORICAL.color(9);
-		let c11 = PRISM_CATEGORICAL.color(10);
-		let c12 = PRISM_CATEGORICAL.color(11);
-		let c13 = PRISM_CATEGORICAL.color(12);
-		let c14 = PRISM_CATEGORICAL.color(13);
-		let c15 = PRISM_CATEGORICAL.color(14);
-		let c16 = PRISM_CATEGORICAL.color(15);
-		let c17 = PRISM_CATEGORICAL.color(16);
-		let c18 = PRISM_CATEGORICAL.color(17);
-		let c19 = PRISM_CATEGORICAL.color(18);
-		let c20 = PRISM_CATEGORICAL.color(19);
+		let c01 = PRISM_SYNTAX[0];
+		let c02 = PRISM_SYNTAX[1];
+		let c03 = PRISM_SYNTAX[2];
+		let c04 = PRISM_SYNTAX[3];
+		let c05 = PRISM_SYNTAX[4];
+		let c06 = PRISM_SYNTAX[5];
+		let c07 = PRISM_SYNTAX[6];
+		let c08 = PRISM_SYNTAX[7];
+		let c09 = PRISM_SYNTAX[8];
+		let c10 = PRISM_SYNTAX[9];
+		let c11 = PRISM_SYNTAX[10];
+		let c12 = PRISM_SYNTAX[11];
+		let c13 = PRISM_SYNTAX[12];
+		let c14 = PRISM_SYNTAX[13];
+		let c15 = PRISM_SYNTAX[14];
+		let c16 = PRISM_SYNTAX[15];
+		let c17 = PRISM_SYNTAX[16];
+		let c18 = PRISM_SYNTAX[17];
+		let c19 = PRISM_SYNTAX[18];
+		let c20 = PRISM_SYNTAX[19];
 
 		set_color(map, TokenCategory::Keyword, c01);
 		set_color(map, TokenCategory::String, c02);
@@ -1634,7 +1676,7 @@ pub static THEME_SPECS: &[ThemeSpec] = &[
 	ThemeSpec::curated("classic", &["original"], Theme::fill_classic),
 	ThemeSpec::curated_categorical("dark2", &[], Theme::fill_dark2, DARK2_CATEGORICAL),
 	ThemeSpec::curated("dracula", &[], Theme::fill_dracula),
-	ThemeSpec::curated("glowmax", &[], Theme::fill_glowmax),
+	ThemeSpec::curated_categorical("glowmax", &[], Theme::fill_glowmax, GLOWMAX_CATEGORICAL),
 	ThemeSpec::curated("gruvbox", &[], Theme::fill_gruvbox),
 	ThemeSpec::curated("kanagawa", &[], Theme::fill_kanagawa),
 	ThemeSpec::curated_categorical("kelly", &[], Theme::fill_kelly, KELLY_CATEGORICAL),
@@ -1697,9 +1739,10 @@ pub fn canonical_theme_names() -> impl Iterator<Item = &'static str> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		DARK2_CATEGORICAL, KELLY_CATEGORICAL, PRISM_CATEGORICAL, ResolvedCategoricalPalette,
-		ResolvedThemePalette, TAB20_CATEGORICAL, TAB20B_CATEGORICAL, TAB20C_CATEGORICAL,
-		THEME_SPECS, THEMED_CATEGORIES, Theme, canonical_theme_names, plasma, viridis,
+		DARK2_CATEGORICAL, GLOWMAX_CATEGORICAL, KELLY_CATEGORICAL, PRISM_CATEGORICAL,
+		ResolvedCategoricalPalette, ResolvedThemePalette, TAB20_CATEGORICAL, TAB20B_CATEGORICAL,
+		TAB20C_CATEGORICAL, THEME_SPECS, THEMED_CATEGORIES, Theme, canonical_theme_names, plasma,
+		viridis,
 	};
 	use crate::core::Rgb;
 	use crate::svp::rust_highlight::{CATEGORY_COUNT, TokenCategory};
@@ -1875,15 +1918,35 @@ mod tests {
 			],
 		);
 		assert_categorical_declaration(
+			GLOWMAX_CATEGORICAL,
+			&[
+				Rgb::new(255, 0, 255),
+				Rgb::new(0, 255, 0),
+				Rgb::new(0, 255, 255),
+				Rgb::new(255, 255, 0),
+				Rgb::new(255, 128, 0),
+				Rgb::new(0, 127, 255),
+				Rgb::new(255, 0, 127),
+				Rgb::new(127, 255, 0),
+				Rgb::new(191, 0, 255),
+				Rgb::new(0, 255, 127),
+				Rgb::new(127, 0, 255),
+				Rgb::new(255, 191, 0),
+				Rgb::new(0, 191, 255),
+				Rgb::new(255, 0, 0),
+				Rgb::new(0, 255, 191),
+				Rgb::new(255, 255, 127),
+				Rgb::new(191, 191, 0),
+			],
+		);
+		assert_categorical_declaration(
 			PRISM_CATEGORICAL,
 			&[
 				Rgb::new(255, 0, 64),
 				Rgb::new(0, 255, 128),
-				Rgb::new(76, 76, 76),
 				Rgb::new(0, 128, 255),
 				Rgb::new(255, 215, 0),
 				Rgb::new(255, 85, 0),
-				Rgb::new(224, 224, 224),
 				Rgb::new(128, 255, 0),
 				Rgb::new(255, 0, 255),
 				Rgb::new(0, 255, 255),
@@ -1896,7 +1959,6 @@ mod tests {
 				Rgb::new(218, 112, 214),
 				Rgb::new(184, 134, 11),
 				Rgb::new(95, 158, 160),
-				Rgb::new(26, 26, 26),
 			],
 		);
 	}
@@ -1987,7 +2049,9 @@ mod tests {
 
 	#[test]
 	fn product_0028_capability_is_independent_of_theme_family() {
-		let expected_curated = ["dark2", "kelly", "prism", "tab20", "tab20b", "tab20c"];
+		let expected_curated = [
+			"dark2", "glowmax", "kelly", "prism", "tab20", "tab20b", "tab20c",
+		];
 		let mut actual_curated = Vec::new();
 		for spec in THEME_SPECS {
 			let theme = Theme::try_new(spec.name).unwrap();
@@ -2003,7 +2067,11 @@ mod tests {
 				super::ThemeFamily::Curated => {
 					if let Some(palette) = theme.categorical_palette() {
 						actual_curated.push(spec.name);
-						let expected_len = if spec.name == "dark2" { 8 } else { 20 };
+						let expected_len = match spec.name {
+							"dark2" => 8,
+							"glowmax" | "prism" => 17,
+							_ => 20,
+						};
 						assert_eq!(palette.len(), expected_len, "{}", spec.name);
 					}
 				}
@@ -2036,7 +2104,7 @@ mod tests {
 	#[test]
 	fn product_0028_modifiers_apply_to_each_projection_at_its_own_length() {
 		for name in [
-			"tab20", "tab20b", "tab20c", "dark2", "kelly", "prism", "terrain",
+			"tab20", "tab20b", "tab20c", "dark2", "glowmax", "kelly", "prism", "terrain",
 		] {
 			let base = categorical_colors(&Theme::try_new(name).unwrap()).unwrap();
 			let mut reversed = base.clone();

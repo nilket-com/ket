@@ -1161,7 +1161,9 @@ fn product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer()
 		.collect::<Vec<_>>();
 	assert_eq!(
 		declared,
-		["dark2", "kelly", "prism", "tab20", "tab20b", "tab20c"],
+		[
+			"dark2", "glowmax", "kelly", "prism", "tab20", "tab20b", "tab20c",
+		],
 		"only curated palettes with an explicit accepted natural declaration are capable"
 	);
 	assert!(production.contains("categorical: None"));
