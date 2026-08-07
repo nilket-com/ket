@@ -181,6 +181,8 @@ pub struct RuneRelationSinkOutcome {
 	pub identity: LocalViewIdentity,
 	pub presentation: ViewPresentation,
 	pub span: std::ops::Range<u32>,
+	/// Structural facet intent retained beside the resolved sink output.
+	pub facet: Option<String>,
 	/// Every sink holds the same `Arc` as its containing set. This is the
 	/// stamped-result identity proof, not a value-equivalent copy.
 	pub source: Arc<polars::frame::DataFrame>,

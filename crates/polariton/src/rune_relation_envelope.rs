@@ -57,8 +57,10 @@ pub(crate) struct RuneTableSink {
 #[derive(Clone, Debug)]
 pub(crate) struct RunePlotIntent {
 	pub(crate) body: RunePlotBody,
+	pub(crate) facet: Option<String>,
 	pub(crate) authored_settings: PlotSettingsLayer,
 	pub(crate) plot_skin_span: Option<Range<u32>>,
+	pub(crate) facet_span: Option<Range<u32>>,
 	pub(crate) domain_spans: RunePlotDomainSpans,
 	pub(crate) tick_step_spans: RunePlotTickStepSpans,
 	pub(crate) minor_tick_spans: RunePlotMinorTickSpans,
@@ -66,7 +68,9 @@ pub(crate) struct RunePlotIntent {
 
 impl PartialEq for RunePlotIntent {
 	fn eq(&self, other: &Self) -> bool {
-		self.body == other.body && self.authored_settings == other.authored_settings
+		self.body == other.body
+			&& self.facet == other.facet
+			&& self.authored_settings == other.authored_settings
 	}
 }
 
@@ -119,8 +123,10 @@ impl RunePlotIntent {
 	fn bare(body: RunePlotBody) -> Self {
 		Self {
 			body,
+			facet: None,
 			authored_settings: PlotSettingsLayer::default(),
 			plot_skin_span: None,
+			facet_span: None,
 			domain_spans: RunePlotDomainSpans::default(),
 			tick_step_spans: RunePlotTickStepSpans::default(),
 			minor_tick_spans: RunePlotMinorTickSpans::default(),
@@ -1225,6 +1231,7 @@ fn parse_figure(
 	};
 	let mut title = None;
 	let mut subtitle = None;
+	let mut facet = None;
 	let mut skin = None;
 	let mut palette = None;
 	let mut x_bounds = None;
@@ -1234,6 +1241,8 @@ fn parse_figure(
 	let mut x_minor_ticks = None;
 	let mut y_minor_ticks = None;
 	let mut body = None;
+	let mut facet_span = None;
+	let mut facet_expr_span = None;
 	for (item, _) in list.items.iter() {
 		if let Some(selection) = parse_figure_skin(item, source, literal_bindings)? {
 			if skin.is_some() {
@@ -1290,6 +1299,24 @@ fn parse_figure(
 					"subtitle",
 					literal_bindings,
 				)?);
+			}
+			"facet" => {
+				if facet.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one facet element",
+					);
+				}
+				facet = Some(parse_figure_heading(
+					item,
+					&child_args,
+					source,
+					"facet",
+					literal_bindings,
+				)?);
+				facet_span = Some(u32_range(&byte_range(item.span(), source.len())?, "facet")?);
+				facet_expr_span = Some(item.span());
 			}
 			"palette" => {
 				if palette.is_some() {
@@ -1423,7 +1450,7 @@ fn parse_figure(
 	}
 	let Some(body) = body else {
 		return invalid_view(
-			outer.span(),
+			facet_expr_span.unwrap_or_else(|| outer.span()),
 			source.len(),
 			"a figure requires exactly one plot body",
 		);
@@ -1490,8 +1517,10 @@ fn parse_figure(
 	};
 	Ok(RunePlotIntent {
 		body,
+		facet,
 		authored_settings,
 		plot_skin_span,
+		facet_span,
 		domain_spans,
 		tick_step_spans,
 		minor_tick_spans,
@@ -3678,6 +3707,35 @@ workspace.table("t").views([table()])
 		assert_eq!(plot.authored_settings, expected);
 		assert_eq!(view.intent.presentation().display_label, "Line + Scatter");
 		assert_eq!(view.intent.presentation().authored_title, expected.title);
+	}
+
+	#[test]
+	fn product_0042_facet_is_structural_figure_metadata_and_resolves_bindings() {
+		let source = r#"
+let field = "region";
+workspace.table("t").views([figure([
+		facet(field),
+		title("Revenue"),
+		bar("region", "revenue"),
+	])])"#;
+		let transformed = transform(source).expect("facet figure envelope");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("facet must route as a plot");
+		};
+		assert_eq!(plot.facet.as_deref(), Some("region"));
+		assert!(plot.facet_span.is_some());
+
+		for source in [
+			"workspace.table(\"t\").views([figure([facet(\"region\")])])",
+			"workspace.table(\"t\").views([figure([facet(\"region\"), facet(\"other\"), bar(\"region\", \"revenue\")])])",
+			"workspace.table(\"t\").views([figure([layers([facet(\"region\"), line(\"x\", \"y\")])])])",
+			"workspace.table(\"t\").views([figure([facet(\"region\")])])",
+		] {
+			assert!(
+				transform(source).is_err(),
+				"accepted malformed facet: {source}"
+			);
+		}
 	}
 
 	#[test]

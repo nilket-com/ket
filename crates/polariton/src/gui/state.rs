@@ -26,6 +26,8 @@ use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_layered_plot;
 use crate::plot::factory::{create_plot, create_styled_plot};
 #[cfg(feature = "toron")]
+use crate::plot::grid::{PlotGrid, PlotGridKernel};
+#[cfg(feature = "toron")]
 use crate::plot::request::plan_with_categorical_palette;
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
@@ -208,9 +210,53 @@ fn build_resolved_plot_task(
 }
 
 #[cfg(feature = "toron")]
-fn build_layered_plot_task(
+fn build_facet_resolved_plot_task(
+	resolved: ResolvedPlot,
+	source: Arc<DataFrame>,
+	facet: Option<String>,
+	layer_settings: Option<crate::plot::spec::LayerSettings>,
+	on_ready: impl FnOnce(
+		ResolvedPlot,
+		std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String>,
+	) -> Message
+	+ Send
+	+ 'static,
+) -> Task<Message> {
+	Task::perform(
+		async move {
+			let source = crate::plot::spec::StampedResult {
+				data: source,
+				provenance: resolved.resolved_spec.provenance.clone(),
+			};
+			let spec = Arc::new(resolved.resolved_spec.clone());
+			let result = tokio::task::spawn_blocking(move || {
+				let grid = match facet {
+					Some(facet) => PlotGrid::value_facet_derived(spec, &source, facet)
+						.map_err(|error| error.to_string())?,
+					None => PlotGrid::single(spec, Arc::clone(&source.data)),
+				};
+				match layer_settings {
+					Some(settings) => PlotGridKernel::from_styled_grid(grid, settings, 1200, 720),
+					None => Ok(PlotGridKernel::from_grid(grid, 1200, 720)),
+				}
+			})
+			.await
+			.map_err(|error| format!("facet plot build task panicked: {error}"))
+			.and_then(|result| result)
+			.map(|kernel| {
+				Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>
+			});
+			(resolved, result)
+		},
+		move |(resolved, result)| on_ready(resolved, result),
+	)
+}
+
+#[cfg(feature = "toron")]
+fn build_facet_layered_plot_task(
 	specification: crate::plot::spec::LayeredPlotSpec,
 	source: Arc<DataFrame>,
+	facet: Option<String>,
 	on_ready: impl FnOnce(
 		std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String>,
 	) -> Message
@@ -220,43 +266,36 @@ fn build_layered_plot_task(
 	Task::perform(
 		async move {
 			tokio::task::spawn_blocking(move || {
-				create_layered_plot(&specification, source.as_ref(), 1200, 720)
+				let stamped = crate::plot::spec::StampedResult {
+					data: Arc::clone(&source),
+					provenance: crate::plot::spec::PlotProvenance {
+						source_name: "workspace relation".to_owned(),
+						revision: None,
+					},
+				};
+				let binding =
+					resolve_layered_channels(&specification, stamped.data.schema().as_ref())
+						.map_err(|error| error.to_string())?;
+				let resolved = crate::plot::spec::resolve_layered_domains(binding, &stamped)
+					.map_err(|error| error.to_string())?;
+				let body = Arc::new(resolved.layers.first().spec.clone());
+				let grid = match facet {
+					Some(facet) => PlotGrid::value_facet_derived(body, &stamped, facet)
+						.map_err(|error| error.to_string())?,
+					None => PlotGrid::single(body, Arc::clone(&stamped.data)),
+				};
+				PlotGridKernel::from_grid_with_factory(grid, 1200, 720, |_, data| {
+					create_layered_plot(&specification, data, 1200, 720)
+				})
+				.map(|kernel| {
+					Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>
+				})
 			})
 			.await
-			.map_err(|error| format!("layered plot build task panicked: {error}"))
+			.map_err(|error| format!("facet layered plot build task panicked: {error}"))
 			.and_then(|result| result)
 		},
 		on_ready,
-	)
-}
-
-#[cfg(feature = "toron")]
-fn build_styled_plot_task(
-	resolved: ResolvedPlot,
-	layer_settings: crate::plot::spec::LayerSettings,
-	on_ready: impl FnOnce(
-		ResolvedPlot,
-		std::result::Result<
-			std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
-			String,
-		>,
-	) -> Message
-	+ Send
-	+ 'static,
-) -> Task<Message> {
-	Task::perform(
-		async move {
-			let spec = resolved.resolved_spec.clone();
-			let data = resolved.data.as_ref().clone();
-			let kernel = tokio::task::spawn_blocking(move || {
-				create_styled_plot(&spec, &data, layer_settings)
-			})
-			.await
-			.map_err(|error| format!("styled plot build task panicked: {error}"))
-			.and_then(|result| result);
-			(resolved, kernel)
-		},
-		move |(resolved, kernel)| on_ready(resolved, kernel),
 	)
 }
 
@@ -1224,6 +1263,10 @@ fn rune_view_outcome_with_palettes(
 		.map(|view| {
 			let presentation = view.intent.presentation();
 			let identity = view.identity;
+			let (facet, facet_span) = match &view.intent {
+				RuneViewIntent::Plot(plot) => (plot.facet.clone(), plot.facet_span.clone()),
+				RuneViewIntent::Table(_) => (None, None),
+			};
 			let (output, tick_step_output_span, minor_tick_output_span) = match view.intent {
 				RuneViewIntent::Table(table) => (
 					resolve_rune_table_skin_with(table.skin, TableSkin::from_theme_name)
@@ -1234,8 +1277,10 @@ fn rune_view_outcome_with_palettes(
 				RuneViewIntent::Plot(plot) => {
 					let crate::rune_relation_envelope::RunePlotIntent {
 						body,
+						facet: plot_facet,
 						authored_settings,
 						plot_skin_span,
+						facet_span: _,
 						domain_spans,
 						tick_step_spans,
 						minor_tick_spans,
@@ -1247,6 +1292,7 @@ fn rune_view_outcome_with_palettes(
 								identity,
 								presentation,
 								span: plot_skin_span.unwrap_or(view.span),
+								facet: plot_facet.clone(),
 								source: std::sync::Arc::clone(&result),
 								output: Err(error),
 							};
@@ -1263,6 +1309,7 @@ fn rune_view_outcome_with_palettes(
 							identity,
 							presentation,
 							span,
+							facet: plot_facet.clone(),
 							source: std::sync::Arc::clone(&result),
 							output: Err(error),
 						};
@@ -1284,6 +1331,7 @@ fn rune_view_outcome_with_palettes(
 							identity,
 							presentation,
 							span: view.span,
+							facet: plot_facet.clone(),
 							source: std::sync::Arc::clone(&result),
 							output: Err(error),
 						};
@@ -1496,7 +1544,8 @@ fn rune_view_outcome_with_palettes(
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
-				span: output_span.unwrap_or(view.span),
+				span: output_span.or(facet_span).unwrap_or(view.span),
+				facet,
 				source: std::sync::Arc::clone(&result),
 				output,
 			}
@@ -2159,6 +2208,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.code_editor
 							.rune_view_panel_id(source_buffer, &sink.identity)
 							.expect("a dispatched view has a prepared host panel");
+						let sink_facet = sink.facet.clone();
 						match sink.output {
 							Ok(RuneRelationSinkOutput::Table(skin)) => {
 								let frame = sink.source.as_ref().clone();
@@ -2179,21 +2229,66 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							)) => {
 								let identity = sink.identity.clone();
 								let presentation = sink.presentation;
-								plot_tasks.push(build_resolved_plot_task(
-									resolved,
-									1200,
-									move |resolved, kernel| Message::RuneRelationPlotReady {
-										source_buffer,
-										revision,
-										panel_id,
-										identity,
-										presentation,
-										authored_settings,
-										continuation,
+								if let Some(facet) = sink_facet {
+									let span = sink.span;
+									plot_tasks.push(build_facet_resolved_plot_task(
 										resolved,
-										kernel,
-									},
-								));
+										Arc::clone(&sink.source),
+										Some(facet),
+										None,
+										move |resolved, result| match result {
+											Ok(kernel) => Message::RuneRelationPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												identity,
+												presentation,
+												authored_settings,
+												continuation,
+												resolved,
+												kernel,
+											},
+											Err(error) => Message::RuneRelationLayeredPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												presentation,
+												authored_settings,
+												span,
+												result: Err(error),
+											},
+										},
+									));
+								} else {
+									plot_tasks.push(build_facet_resolved_plot_task(
+										resolved,
+										Arc::clone(&sink.source),
+										None,
+										None,
+										move |resolved, result| match result {
+											Ok(kernel) => Message::RuneRelationPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												identity,
+												presentation,
+												authored_settings,
+												continuation,
+												resolved,
+												kernel,
+											},
+											Err(error) => Message::RuneRelationLayeredPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												presentation,
+												authored_settings,
+												span: sink.span,
+												result: Err(error),
+											},
+										},
+									));
+								}
 							}
 							Ok(RuneRelationSinkOutput::StyledPlot(
 								resolved,
@@ -2204,32 +2299,65 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 								let identity = sink.identity.clone();
 								let presentation = sink.presentation;
 								let span = sink.span;
-								plot_tasks.push(build_styled_plot_task(
-									resolved,
-									layer_settings,
-									move |resolved, result| match result {
-										Ok(kernel) => Message::RuneRelationPlotReady {
-											source_buffer,
-											revision,
-											panel_id,
-											identity,
-											presentation,
-											authored_settings,
-											continuation,
-											resolved,
-											kernel,
+								if let Some(facet) = sink_facet {
+									plot_tasks.push(build_facet_resolved_plot_task(
+										resolved,
+										Arc::clone(&sink.source),
+										Some(facet),
+										Some(layer_settings),
+										move |resolved, result| match result {
+											Ok(kernel) => Message::RuneRelationPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												identity,
+												presentation,
+												authored_settings,
+												continuation,
+												resolved,
+												kernel,
+											},
+											Err(error) => Message::RuneRelationLayeredPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												presentation,
+												authored_settings,
+												span,
+												result: Err(error),
+											},
 										},
-										Err(error) => Message::RuneRelationLayeredPlotReady {
-											source_buffer,
-											revision,
-											panel_id,
-											presentation,
-											authored_settings,
-											span,
-											result: Err(error),
+									));
+								} else {
+									plot_tasks.push(build_facet_resolved_plot_task(
+										resolved,
+										Arc::clone(&sink.source),
+										None,
+										Some(layer_settings),
+										move |resolved, result| match result {
+											Ok(kernel) => Message::RuneRelationPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												identity,
+												presentation,
+												authored_settings,
+												continuation,
+												resolved,
+												kernel,
+											},
+											Err(error) => Message::RuneRelationLayeredPlotReady {
+												source_buffer,
+												revision,
+												panel_id,
+												presentation,
+												authored_settings,
+												span,
+												result: Err(error),
+											},
 										},
-									},
-								));
+									));
+								}
 							}
 							Ok(RuneRelationSinkOutput::LayeredPlot(
 								specification,
@@ -2237,19 +2365,37 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							)) => {
 								let presentation = sink.presentation;
 								let span = sink.span;
-								plot_tasks.push(build_layered_plot_task(
-									specification,
-									sink.source,
-									move |result| Message::RuneRelationLayeredPlotReady {
-										source_buffer,
-										revision,
-										panel_id,
-										presentation,
-										authored_settings,
-										span,
-										result,
-									},
-								));
+								if let Some(facet) = sink_facet {
+									plot_tasks.push(build_facet_layered_plot_task(
+										specification,
+										sink.source,
+										Some(facet),
+										move |result| Message::RuneRelationLayeredPlotReady {
+											source_buffer,
+											revision,
+											panel_id,
+											presentation,
+											authored_settings,
+											span,
+											result,
+										},
+									));
+								} else {
+									plot_tasks.push(build_facet_layered_plot_task(
+										specification,
+										sink.source,
+										None,
+										move |result| Message::RuneRelationLayeredPlotReady {
+											source_buffer,
+											revision,
+											panel_id,
+											presentation,
+											authored_settings,
+											span,
+											result,
+										},
+									));
+								}
 							}
 							Err(message) => {
 								let message = format!(
@@ -2767,6 +2913,8 @@ mod tests {
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
 	use crate::plot::factory::{create_layered_plot, create_plot, create_styled_plot};
+	#[cfg(feature = "toron")]
+	use crate::plot::grid::PlotGrid;
 	#[cfg(feature = "toron")]
 	use crate::plot::{
 		common::{CoordinateTransformer, PlotKernel, PlotLayout, ResolvedPlotSettings},
@@ -6464,6 +6612,41 @@ workspace.table("bad").views([view("bad", table())]);
 		assert!(
 			error.contains("4294967295") && error.contains("capacity"),
 			"{error}"
+		);
+	}
+
+	#[test]
+	fn product_0042_facet_reaches_the_head_as_structural_intent() {
+		let source = "workspace.table(\"t\").views([figure([facet(\"cat\"), title(\"Revenue\"), bar(\"cat\", \"val\")])])";
+		let relation = transform_rune_view(source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(categorical_bar_frame(&["A", "B", "A"]), relation.views);
+		assert_eq!(outcome.sinks[0].facet.as_deref(), Some("cat"));
+		let crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, _) =
+			outcome.sinks[0].output.clone().expect("facet resolves")
+		else {
+			panic!("facet bar should use the regular resolved plot path");
+		};
+		let stamped = crate::plot::spec::StampedResult {
+			data: Arc::clone(&outcome.result),
+			provenance: resolved.resolved_spec.provenance.clone(),
+		};
+		let grid = PlotGrid::value_facet_derived(
+			Arc::new(resolved.resolved_spec.clone()),
+			&stamped,
+			"cat",
+		)
+		.expect("facet grid");
+		assert_eq!(grid.cells.len(), 2);
+		assert_eq!(
+			grid.arrangement,
+			crate::plot::grid::GridArrangement {
+				rows: 1,
+				columns: 2
+			}
 		);
 	}
 

@@ -11,8 +11,8 @@ use crate::plot::common::{
 	CoordinateTransformer, PlotBackend, PlotComposite, PlotKernel, PlotLayout, PlotWidget,
 	ResolvedPlotSettings,
 };
-use crate::plot::factory::create_plot;
-use crate::plot::spec::{NonEmpty, ResolvedPlotSpec, StampedResult};
+use crate::plot::factory::{create_plot, create_styled_plot};
+use crate::plot::spec::{LayerSettings, NonEmpty, ResolvedPlotSpec, StampedResult};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
 use iced::{Point, Rectangle as IcedRectangle};
@@ -46,9 +46,12 @@ impl GridArrangement {
 		Ok(Self { rows, columns })
 	}
 
-	pub fn for_cell_count(count: usize) -> Self {
-		let columns = (count as f64).sqrt().ceil().max(1.0) as usize;
-		let rows = count.div_ceil(columns).max(1);
+	/// PRODUCT-0042's derived facet arrangement: floor-sqrt rows and a
+	/// sufficient number of columns, yielding a deliberately wider grid.
+	pub fn for_facet_cell_count(count: usize) -> Self {
+		let count = count.max(1);
+		let rows = (count as f64).sqrt().floor().max(1.0) as usize;
+		let columns = count.div_ceil(rows);
 		Self { rows, columns }
 	}
 
@@ -161,6 +164,53 @@ impl fmt::Display for GridError {
 impl std::error::Error for GridError {}
 
 impl PlotGrid {
+	pub fn single(body: Arc<ResolvedPlotSpec>, data: Arc<DataFrame>) -> Self {
+		let cell = GridCell {
+			position: GridPosition { row: 0, column: 0 },
+			body,
+			data,
+			x_group: 0,
+			y_group: 0,
+			label: None,
+		};
+		Self::new(
+			NonEmpty::new(cell),
+			GridArrangement {
+				rows: 1,
+				columns: 1,
+			},
+		)
+		.expect("the one-cell grid arrangement is valid")
+	}
+
+	pub fn value_facet_derived(
+		body: Arc<ResolvedPlotSpec>,
+		stamped: &StampedResult,
+		field: impl Into<String>,
+	) -> Result<Self, GridError> {
+		let probe = GridArrangement::new(MAX_GRID_CELLS, MAX_GRID_CELLS)
+			.expect("the facet probe arrangement is positive");
+		let mut grid = Self::value_facet(body, stamped, field, probe)?;
+		let arrangement = GridArrangement::for_facet_cell_count(grid.cells.len());
+		let (mut first, mut rest) = grid.cells.into_parts();
+		for (index, cell) in std::iter::once(&mut first)
+			.chain(rest.iter_mut())
+			.enumerate()
+		{
+			cell.position = GridPosition {
+				row: index / arrangement.columns,
+				column: index % arrangement.columns,
+			};
+		}
+		let mut cells = NonEmpty::new(first);
+		for cell in rest {
+			cells.push(cell);
+		}
+		grid.cells = cells;
+		grid.arrangement = arrangement;
+		Ok(grid)
+	}
+
 	pub fn new(cells: NonEmpty<GridCell>, arrangement: GridArrangement) -> Result<Self, GridError> {
 		let count = cells.len();
 		if arrangement.capacity() < count {
@@ -324,19 +374,45 @@ pub struct PlotGridKernel {
 
 impl PlotGridKernel {
 	pub fn from_grid(grid: PlotGrid, width: u32, height: u32) -> Self {
+		Self::from_grid_with_factory(grid, width, height, |spec, data| {
+			Ok(create_plot(spec, data, width, height))
+		})
+		.expect("plain plot grid kernels are infallible")
+	}
+
+	pub fn from_grid_with_factory(
+		grid: PlotGrid,
+		_width: u32,
+		_height: u32,
+		mut factory: impl FnMut(
+			&ResolvedPlotSpec,
+			&DataFrame,
+		) -> Result<Arc<dyn PlotKernel + Send + Sync>, String>,
+	) -> Result<Self, String> {
 		let (first, rest) = grid.cells.into_parts();
-		let prepare = |cell: GridCell| PreparedGridCell {
-			kernel: create_plot(&cell.body, &cell.data, width, height),
-			cell,
+		let mut prepare = |cell: GridCell| -> Result<PreparedGridCell, String> {
+			let kernel = factory(&cell.body, &cell.data)?;
+			Ok(PreparedGridCell { kernel, cell })
 		};
-		let mut cells = NonEmpty::new(prepare(first));
+		let mut cells = NonEmpty::new(prepare(first)?);
 		for cell in rest {
-			cells.push(prepare(cell));
+			cells.push(prepare(cell)?);
 		}
-		Self {
+		Ok(Self {
 			cells,
 			arrangement: grid.arrangement,
-		}
+		})
+	}
+
+	pub fn from_styled_grid(
+		grid: PlotGrid,
+		layer_settings: LayerSettings,
+		width: u32,
+		height: u32,
+	) -> Result<Self, String> {
+		Self::from_grid_with_factory(grid, width, height, |spec, data| {
+			create_styled_plot(spec, data, layer_settings.clone())
+		})
 	}
 
 	fn cell_layouts(&self, settings: ResolvedPlotSettings) -> Vec<(GridPosition, PlotLayout)> {
@@ -391,6 +467,10 @@ impl PlotComposite for PlotGridKernel {
 		title: &str,
 		settings: &PlotSettings,
 	) {
+		// The backend frame is widget-local; `bounds` carries the widget's
+		// absolute window position. Like PlotWidget::plot_area, the grid
+		// consumes only the size.
+		let bounds = IcedRectangle::new(Point::ORIGIN, bounds.size());
 		if self.cells.len() == 1 {
 			let cell = self.cells.first();
 			let helper = PlotWidget {
@@ -407,11 +487,19 @@ impl PlotComposite for PlotGridKernel {
 			return;
 		}
 		let resolved = settings.resolve();
-		backend.fill_rectangle(
-			Point::ORIGIN,
-			bounds.size(),
-			resolved.chrome.canvas_background.iced(),
-		);
+		// iced_wgpu 0.14 converts a frame's direct fills into meshes only at
+		// frame completion, AFTER `with_clip` children have been pasted, so a
+		// parent-level fill z-orders ABOVE every clipped child on the live
+		// renderer even though SVG and tiny-skia preserve call order. No
+		// parent-level draw may coexist with clipped children: the canvas
+		// background is therefore emitted as the first clipped child itself.
+		backend.with_clip(bounds, &mut |backend| {
+			backend.fill_rectangle(
+				Point::ORIGIN,
+				bounds.size(),
+				resolved.chrome.canvas_background.iced(),
+			);
+		});
 		let outer = grid_outer_area(bounds, padding);
 		let layouts = self.cell_layouts(resolved.clone());
 		for (index, cell) in self.cells.iter().enumerate() {
@@ -447,6 +535,7 @@ impl PlotComposite for PlotGridKernel {
 		title: &str,
 		settings: &PlotSettings,
 	) {
+		let bounds = IcedRectangle::new(Point::ORIGIN, bounds.size());
 		if self.cells.len() == 1 {
 			let cell = self.cells.first();
 			let helper = PlotWidget {
@@ -547,9 +636,15 @@ impl PlotComposite for PlotGridKernel {
 				if let Some(label) = &cell.cell.label {
 					backend.fill_text(iced::widget::canvas::Text {
 						content: label.clone(),
-						position: Point::new(cell_bounds.x + 8.0, cell_bounds.y + 8.0),
+						// A facet label is a per-cell heading, not a corner annotation.
+						// Center it over the actual plot area so it reads like a
+						// miniature plot title while leaving the shared figure heading
+						// independent.
+						position: Point::new(inner.x + inner.width / 2.0, cell_bounds.y + 8.0),
 						color: resolved.chrome.title_text.iced(),
 						size: iced::Pixels((resolved.legend_size + 2.0).max(10.0)),
+						align_x: iced::alignment::Horizontal::Center.into(),
+						align_y: iced::alignment::Vertical::Top,
 						..Default::default()
 					});
 				}
@@ -564,6 +659,9 @@ impl PlotComposite for PlotGridKernel {
 		cursor: Cursor,
 		settings: &PlotSettings,
 	) -> Option<String> {
+		// The caller supplies a widget-local cursor; cell rects must be
+		// computed in the same local space.
+		let bounds = IcedRectangle::new(Point::ORIGIN, bounds.size());
 		let cursor = cursor.position()?;
 		let resolved = settings.resolve();
 		let outer = grid_outer_area(bounds, padding);
@@ -835,7 +933,7 @@ mod tests {
 				provenance: stamped.provenance.clone(),
 			},
 			"facet",
-			GridArrangement::for_cell_count(3),
+			GridArrangement::new(2, 2).expect("arrangement"),
 		)
 		.expect("reordered facet");
 		let labels: Vec<_> = reordered_grid
@@ -860,7 +958,7 @@ mod tests {
 				provenance: stamped.provenance,
 			},
 			"facet",
-			GridArrangement::for_cell_count(2),
+			GridArrangement::new(1, 2).expect("arrangement"),
 		)
 		.expect("filtered facet");
 		let labels: Vec<_> = filtered_grid
@@ -1103,7 +1201,7 @@ mod tests {
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
 		);
 		let svg = backend.finish();
-		assert_eq!(svg.matches("<clipPath").count(), 4);
+		assert_eq!(svg.matches("<clipPath").count(), 5);
 		assert!(svg.matches("<path").count() >= 2);
 	}
 
@@ -1148,7 +1246,7 @@ mod tests {
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
 		);
 		let svg = backend.finish();
-		assert_eq!(svg.matches("<clipPath").count(), 8);
+		assert_eq!(svg.matches("<clipPath").count(), 9);
 		for label in ["A", "B", "C", "D"] {
 			assert!(svg.contains(label), "missing panel label {label}");
 		}
@@ -1161,7 +1259,7 @@ mod tests {
 		let ticks: Vec<_> = origins
 			.iter()
 			.enumerate()
-			.map(|(index, origin)| rendered_tick_paths(&svg, 4 + index, *origin))
+			.map(|(index, origin)| rendered_tick_paths(&svg, 5 + index, *origin))
 			.collect();
 		assert!(ticks.iter().all(|paths| !paths.is_empty()));
 		assert!(ticks[1..].iter().all(|paths| paths == &ticks[0]));
@@ -1178,10 +1276,149 @@ mod tests {
 				grid_cell_bounds(outer, GridArrangement::new(2, 2).unwrap(), *position);
 			let inner = plot_area(cell_bounds, 0.0, &ResolvedPlotSettings::default());
 			let expected = CoordinateTransformer::new(layout, inner).cartesian(x, y);
-			let actual = rendered_single_mark(&svg, index);
+			let actual = rendered_single_mark(&svg, 1 + index);
 			assert!((actual.x - (inner.x + expected.x)).abs() < 0.01);
 			assert!((actual.y - (inner.y + expected.y)).abs() < 0.01);
 		}
+	}
+
+	#[test]
+	fn multi_cell_layers_draw_nothing_outside_clip_groups() {
+		// iced_wgpu 0.14 z-orders a parent frame's direct fills ABOVE its
+		// pasted `with_clip` children, so any parent-level draw in a
+		// multi-cell layer paints over the cells on the live renderer. The
+		// invariant that keeps backends equivalent is structural: every draw
+		// in a multi-cell layer lives inside a clip group. SVG preserves
+		// call order, so a parent-level draw shows up outside every <g>.
+		let (body, _data, stamped) = fixture();
+		let grid = PlotGrid::value_facet(
+			body,
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).expect("arrangement"),
+		)
+		.expect("facet");
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let model = PlotSettings::default();
+		let mut backend = SvgBackend::new(800.0, 400.0);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
+		);
+		let svg = backend.finish();
+		let mut clip_depth = 0usize;
+		let mut in_defs = false;
+		for (index, fragment) in svg.split('<').enumerate().skip(1) {
+			if fragment.starts_with("defs") {
+				in_defs = true;
+			} else if fragment.starts_with("/defs") {
+				in_defs = false;
+			} else if fragment.starts_with("g clip-path") {
+				clip_depth += 1;
+			} else if fragment.starts_with("/g") {
+				clip_depth = clip_depth.saturating_sub(1);
+			} else if clip_depth == 0
+				&& !in_defs && (fragment.starts_with("path")
+				|| fragment.starts_with("rect")
+				|| fragment.starts_with("image"))
+			{
+				panic!("draw operation outside every clip group at fragment {index}: <{fragment}");
+			}
+		}
+	}
+
+	#[test]
+	fn grid_rendering_is_invariant_to_bounds_origin() {
+		let (body, _data, stamped) = fixture();
+		let grid = PlotGrid::value_facet(
+			body,
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).expect("arrangement"),
+		)
+		.expect("facet");
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let model = PlotSettings::default();
+		let render_at = |origin: Point| {
+			let mut backend = SvgBackend::new(800.0, 400.0);
+			let widget = PlotWidget {
+				kernel: &kernel,
+				title: String::new(),
+				padding: 0.0,
+				settings: model.resolve(),
+				settings_model: model.clone(),
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: PlotRenderLayer::Full,
+			};
+			widget.render(
+				&mut backend,
+				IcedRectangle::new(origin, iced::Size::new(800.0, 400.0)),
+			);
+			backend.finish()
+		};
+		let at_origin = render_at(Point::ORIGIN);
+		let at_panel = render_at(Point::new(500.0, 40.0));
+		assert_eq!(
+			at_origin, at_panel,
+			"a widget-local frame must render identically wherever the panel sits"
+		);
+	}
+
+	#[test]
+	fn grid_hover_hits_cells_under_nonzero_bounds_origin() {
+		let (body, _data, stamped) = fixture();
+		let grid = PlotGrid::value_facet(
+			body,
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).expect("arrangement"),
+		)
+		.expect("facet");
+		let arrangement = grid.arrangement;
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let model = PlotSettings::default();
+		let resolved = model.resolve();
+		let layouts = kernel.cell_layouts(resolved.clone());
+		let local = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+		let outer = grid_outer_area(local, 0.0);
+		let (position, layout) = &layouts[0];
+		let cell_bounds = grid_cell_bounds(outer, arrangement, *position);
+		let inner = plot_area(cell_bounds, 0.0, &resolved);
+		let transform = CoordinateTransformer::new(layout, inner);
+		let p0 = transform.cartesian(0.0, 1.0);
+		let p1 = transform.cartesian(2.0, 3.0);
+		let cursor = Point::new(inner.x + (p0.x + p1.x) / 2.0, inner.y + (p0.y + p1.y) / 2.0);
+		let panel = IcedRectangle::new(Point::new(500.0, 40.0), iced::Size::new(800.0, 400.0));
+		let hover = PlotComposite::hover(&kernel, panel, 0.0, Cursor::Available(cursor), &model);
+		assert!(
+			hover.is_some(),
+			"a widget-local cursor over cell A's line must hit regardless of panel origin"
+		);
+		// Cell kernels keep their legacy hover semantics (x-nearest for a
+		// line), so the composite's own miss case is a cursor outside every
+		// cell region, not one merely off the marks.
+		let miss = PlotComposite::hover(
+			&kernel,
+			panel,
+			0.0,
+			Cursor::Available(Point::new(cursor.x, 401.0)),
+			&model,
+		);
+		assert!(
+			miss.is_none(),
+			"a cursor outside every cell region must miss"
+		);
 	}
 
 	#[test]
@@ -1201,7 +1438,7 @@ mod tests {
 			Arc::clone(&body),
 			&admissible,
 			"facet",
-			GridArrangement::for_cell_count(128),
+			GridArrangement::new(11, 12).expect("arrangement"),
 		)
 		.expect("hundreds of cells remain admissible");
 		assert_eq!(admissible_grid.cells.len(), 128);
@@ -1222,7 +1459,7 @@ mod tests {
 			&mut backend,
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(640.0, 480.0)),
 		);
-		assert_eq!(backend.finish().matches("<clipPath").count(), 256);
+		assert_eq!(backend.finish().matches("<clipPath").count(), 257);
 		let values: Vec<String> = (0..513).map(|index| format!("v{index}")).collect();
 		let x: Vec<f64> = (0..513).map(|index| index as f64).collect();
 		let y = x.clone();
@@ -1231,7 +1468,7 @@ mod tests {
 			data,
 			provenance: stamped.provenance,
 		};
-		let arrangement = GridArrangement::for_cell_count(513);
+		let arrangement = GridArrangement::new(23, 23).expect("arrangement");
 		let error = match PlotGrid::value_facet(body, &stamped, "facet", arrangement) {
 			Ok(_) => panic!("513 cells exceed the declared capacity"),
 			Err(error) => error,
@@ -1290,5 +1527,104 @@ mod tests {
 			backend.finish()
 		};
 		assert_eq!(make_svg(ordinary.as_ref()), make_svg(&grid_kernel));
+	}
+
+	#[test]
+	fn product_0042_facet_arrangement_is_wide_and_row_major() {
+		assert_eq!(
+			GridArrangement::for_facet_cell_count(1),
+			GridArrangement {
+				rows: 1,
+				columns: 1
+			}
+		);
+		assert_eq!(
+			GridArrangement::for_facet_cell_count(3),
+			GridArrangement {
+				rows: 1,
+				columns: 3
+			}
+		);
+		assert_eq!(
+			GridArrangement::for_facet_cell_count(4),
+			GridArrangement {
+				rows: 2,
+				columns: 2
+			}
+		);
+		assert_eq!(
+			GridArrangement::for_facet_cell_count(5),
+			GridArrangement {
+				rows: 2,
+				columns: 3
+			}
+		);
+		assert_eq!(
+			GridArrangement::for_facet_cell_count(7),
+			GridArrangement {
+				rows: 2,
+				columns: 4
+			}
+		);
+	}
+
+	#[test]
+	fn product_0042_faceted_bars_retain_their_values() {
+		let data = Arc::new(
+			df!(
+				"region" => ["East", "East", "North", "North"],
+				"product" => ["Atlas", "Delta", "Atlas", "Delta"],
+				"revenue" => [141.2_f64, 58.4, 128.4, 51.6]
+			)
+			.expect("bar fixture"),
+		);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "bar facet fixture".to_owned(),
+				data: Arc::clone(&data),
+			},
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Bar),
+				"product",
+				"revenue",
+			),
+		})
+		.expect("bar resolves");
+		let stamped = StampedResult {
+			data,
+			provenance: resolved.resolved_spec.provenance.clone(),
+		};
+		let grid =
+			PlotGrid::value_facet_derived(Arc::new(resolved.resolved_spec), &stamped, "region")
+				.expect("bar facet");
+		let kernel = PlotGridKernel::from_grid(grid, 640, 480);
+		let model = PlotSettings::default();
+		let mut backend = SvgBackend::new(640.0, 480.0);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(640.0, 480.0)),
+		);
+		let svg = backend.finish();
+		assert!(
+			svg.matches("<rect").count() >= 4,
+			"faceted bars disappeared: {svg}"
+		);
+	}
+
+	/// PRODUCT-0042 gate 10: this oracle is deliberately banked before the
+	/// Rune head routes unfaceted figures through the grid path.
+	#[test]
+	fn bank_unfaceted_one_cell_parity_oracle() {
+		one_cell_grid_matches_the_ordinary_svg_path();
 	}
 }
