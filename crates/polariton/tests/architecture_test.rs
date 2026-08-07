@@ -686,12 +686,13 @@ fn product_0023_table_artifact_is_the_atomic_host_and_markdown_boundary() {
 		2,
 		"host panels and markdown cells must share the atomic artifact"
 	);
-	assert_eq!(
-		production
-			.matches("Table::new(artifact.frame.as_ref(), 0, artifact.skin)")
-			.count(),
-		2,
-		"both consumers must render the skin stored beside the frame"
+	assert!(
+		production.contains("self.table_skin_at_draw(panel.panel_id, artifact.skin)"),
+		"PRODUCT-0045 permits only the host pane to flatten its draw-time tier"
+	);
+	assert!(
+		production.contains("Table::new(artifact.frame.as_ref(), 0, artifact.skin)"),
+		"the Markdown consumer still renders the skin stored beside the frame"
 	);
 	assert!(
 		production.contains("produced.push(preview_row(markdown_cell_output_surface("),
@@ -753,8 +754,8 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("production GUI state source");
-	assert!(state_production.contains("resolve_rune_table_skin_with"));
-	assert!(state_production.contains("TableSkin::from_theme_name"));
+	assert!(state_production.contains("resolve_rune_table_skin"));
+	assert!(state_production.contains("TableSkinCascade"));
 	assert!(state_production.contains("set_rune_view_table_with_skin"));
 
 	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
@@ -762,11 +763,13 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("production editor source");
-	assert!(editor_production.contains("set_query_result_with_skin(frame, TableSkin::DEFAULT)"));
 	assert!(
 		editor_production
-			.contains("set_markdown_cell_table_with_skin(identity, frame, TableSkin::DEFAULT)")
+			.contains("set_query_result_with_skin(frame, TableSkinCascade::library_floor())")
 	);
+	assert!(editor_production.contains(
+		"set_markdown_cell_table_with_skin(identity, frame, TableSkinCascade::library_floor())"
+	));
 	assert!(!editor_production.contains("TableSkin::from_theme_name"));
 }
 
@@ -796,12 +799,8 @@ fn product_0026_projection_choice_stays_explicit_and_outside_rune_and_editor_chr
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("production GUI state source");
-	assert_eq!(
-		state_production
-			.matches("TableSkin::from_theme_name")
-			.count(),
-		1
-	);
+	assert!(state_production.contains("TableSkinCascade"));
+	assert!(state_production.contains("TableSkinSpec::new"));
 	assert!(state_production.contains("TableSkinProjection::Duotone"));
 	assert!(state_production.contains("TableSkinProjection::PaletteForward"));
 
@@ -828,11 +827,13 @@ fn product_0026_projection_choice_stays_explicit_and_outside_rune_and_editor_chr
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("production editor source");
-	assert!(editor_production.contains("set_query_result_with_skin(frame, TableSkin::DEFAULT)"));
 	assert!(
 		editor_production
-			.contains("set_markdown_cell_table_with_skin(identity, frame, TableSkin::DEFAULT)")
+			.contains("set_query_result_with_skin(frame, TableSkinCascade::library_floor())")
 	);
+	assert!(editor_production.contains(
+		"set_markdown_cell_table_with_skin(identity, frame, TableSkinCascade::library_floor())"
+	));
 	for forbidden in ["TableSkinProjection", "PaletteForward", "Duotone"] {
 		assert!(
 			!editor_production.contains(forbidden),

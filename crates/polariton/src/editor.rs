@@ -10,7 +10,7 @@ use crate::gui::plot_pane::{self, HostPlotState, PlotPaneMsg};
 use crate::gui::{
 	dashboard::{self, DashboardMsg, DashboardState},
 	table::{Table, TableScroll},
-	table_skin::TableSkin,
+	table_skin::{TableSkin, TableSkinCascade, TableSkinSpec},
 };
 use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
@@ -739,7 +739,7 @@ impl CodeEditor {
 	}
 
 	pub fn set_markdown_cell_table(&mut self, identity: MarkdownCellIdentity, frame: DataFrame) {
-		self.set_markdown_cell_table_with_skin(identity, frame, TableSkin::DEFAULT);
+		self.set_markdown_cell_table_with_skin(identity, frame, TableSkinCascade::library_floor());
 	}
 
 	fn set_markdown_cell_table_with_skin(
@@ -987,7 +987,7 @@ impl CodeEditor {
 
 	#[cfg(all(test, feature = "toron"))]
 	pub fn set_rune_view_table(&mut self, panel_id: HostPanelId, frame: DataFrame) {
-		self.set_rune_view_table_with_skin(panel_id, frame, TableSkin::DEFAULT);
+		self.set_rune_view_table_with_skin(panel_id, frame, TableSkinCascade::library_floor());
 	}
 
 	#[cfg(feature = "toron")]
@@ -1229,6 +1229,47 @@ impl CodeEditor {
 		}
 	}
 
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_table_draw_skin(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<TableSkin> {
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let entry = self.panels.panels.get(&panel_id)?;
+		match &entry.content {
+			PanelContent::Table(artifact) => {
+				Some(self.panels.table_skin_at_draw(panel_id, artifact.skin))
+			}
+			_ => None,
+		}
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn set_test_rune_view_pane_table_skin(
+		&mut self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+		skin: TableSkinSpec,
+	) {
+		let panel_id = self
+			.rune_view_panel_id(producer, identity)
+			.expect("prepared Rune table panel");
+		self.panels.set_test_pane_table_skin(panel_id, skin);
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn clear_test_rune_view_pane_table_skin(
+		&mut self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) {
+		let panel_id = self
+			.rune_view_panel_id(producer, identity)
+			.expect("prepared Rune table panel");
+		self.panels.clear_test_pane_table_skin(panel_id);
+	}
+
 	#[cfg(test)]
 	pub(crate) fn has_query_surface(&self) -> bool {
 		self.panels.panels.contains_key(&RESULT_PANEL)
@@ -1264,7 +1305,7 @@ impl CodeEditor {
 
 	/// Attach a completed result set to the panel.
 	pub fn set_query_result(&mut self, frame: DataFrame) {
-		self.set_query_result_with_skin(frame, TableSkin::DEFAULT);
+		self.set_query_result_with_skin(frame, TableSkinCascade::library_floor());
 	}
 
 	fn set_query_result_with_skin(&mut self, frame: DataFrame, skin: TableSkin) {
@@ -2467,6 +2508,9 @@ fn color(color: Rgb) -> Color {
 #[derive(Default)]
 pub struct PanelRegistry {
 	panels: std::collections::HashMap<HostPanelId, PanelEntry>,
+	/// PRODUCT-0045's draw-time tier. No production surface writes it yet;
+	/// retaining the intent here makes a future pane producer a local change.
+	pane_table_skins: std::collections::HashMap<HostPanelId, TableSkinSpec>,
 	/// Disposals observed but not yet confirmed by a projection. Releasing
 	/// immediately would blank the pane for a frame whenever the event arrives
 	/// before the viewport that stops referencing it.
@@ -2587,6 +2631,7 @@ impl PanelRegistry {
 				return true;
 			}
 			self.panels.remove(panel_id);
+			self.pane_table_skins.remove(panel_id);
 			false
 		});
 
@@ -2646,6 +2691,26 @@ impl PanelRegistry {
 		});
 		entry.content = content;
 		entry.status = PanelStatus::Fresh;
+	}
+
+	fn table_skin_at_draw(&self, panel_id: HostPanelId, baked: TableSkin) -> TableSkin {
+		self.pane_table_skins
+			.get(&panel_id)
+			.map(|spec| {
+				spec.resolve()
+					.expect("pane table-skin intents are validated by their producer")
+			})
+			.unwrap_or(baked)
+	}
+
+	#[cfg(test)]
+	fn set_test_pane_table_skin(&mut self, panel_id: HostPanelId, skin: TableSkinSpec) {
+		self.pane_table_skins.insert(panel_id, skin);
+	}
+
+	#[cfg(test)]
+	fn clear_test_pane_table_skin(&mut self, panel_id: HostPanelId) {
+		self.pane_table_skins.remove(&panel_id);
 	}
 
 	#[cfg(feature = "toron")]
@@ -2748,16 +2813,18 @@ impl PanelRegistry {
 			dashboard::view(dashboard).map(EditorMsg::Dashboard)
 		} else {
 			match content {
-				PanelContent::Table(artifact) => {
-					Table::new(artifact.frame.as_ref(), 0, artifact.skin)
-						.show_column_types(show_column_types)
-						.scroll_request(
-							self.panels
-								.get(&panel.panel_id)
-								.and_then(|entry| entry.scroll),
-						)
-						.into()
-				}
+				PanelContent::Table(artifact) => Table::new(
+					artifact.frame.as_ref(),
+					0,
+					self.table_skin_at_draw(panel.panel_id, artifact.skin),
+				)
+				.show_column_types(show_column_types)
+				.scroll_request(
+					self.panels
+						.get(&panel.panel_id)
+						.and_then(|entry| entry.scroll),
+				)
+				.into(),
 				#[cfg(feature = "toron")]
 				PanelContent::Plot(plot) => {
 					plot_pane::host_view(plot).map(move |message| EditorMsg::HostPlot {

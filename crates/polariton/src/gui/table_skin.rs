@@ -5,6 +5,8 @@
 use libaryon::core::{Rgb, Srgb};
 use libaryon::engine::{ResolvedThemePair, Theme};
 
+use crate::plot::spec::Override;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TableRgba {
 	red: u8,
@@ -144,6 +146,117 @@ impl Default for TableSkin {
 pub enum TableSkinProjection {
 	PaletteForward,
 	Duotone,
+}
+
+/// A table-skin choice before the head resolves its theme expression.
+///
+/// The cascade carries this intent rather than twelve resolved colors, so a
+/// completion has one explicit resolution moment while a pane can later
+/// flatten its own intent over the completed artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableSkinSpec {
+	pub identity: String,
+	pub projection: TableSkinProjection,
+}
+
+impl TableSkinSpec {
+	pub fn new(identity: impl Into<String>, projection: TableSkinProjection) -> Self {
+		Self {
+			identity: identity.into(),
+			projection,
+		}
+	}
+
+	pub fn resolve(&self) -> Result<TableSkin, TableSkinProjectionError> {
+		TableSkin::from_theme_name(&self.identity, self.projection)
+	}
+}
+
+/// PRODUCT-0045's table-specific part of the shared settings cascade.
+///
+/// The library floor has no named intent because its exact legacy pixels are
+/// the default. Application and authored values bake at completion; pane is
+/// deliberately kept aside for the view layer to flatten over that artifact.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableSkinCascade {
+	pub application: Override<TableSkinSpec>,
+	pub authored: Override<TableSkinSpec>,
+	pub pane_override: Override<TableSkinSpec>,
+}
+
+impl Default for TableSkinCascade {
+	fn default() -> Self {
+		Self {
+			application: Override::Inherit,
+			authored: Override::Inherit,
+			pane_override: Override::Inherit,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableSkinCompletion {
+	pub skin: TableSkin,
+	pub application_error: Option<TableSkinProjectionError>,
+}
+
+impl TableSkinCascade {
+	pub fn library_floor() -> TableSkin {
+		Self::default()
+			.resolve_through_authored()
+			.expect("the compiled library floor has no fallible identity")
+			.skin
+	}
+
+	pub fn resolve_through_authored(
+		&self,
+	) -> Result<TableSkinCompletion, TableSkinProjectionError> {
+		let (application_skin, application_error) = match &self.application {
+			Override::Inherit => (TableSkin::DEFAULT, None),
+			Override::Set(spec) => match spec.resolve() {
+				Ok(skin) => (skin, None),
+				Err(error) => (TableSkin::DEFAULT, Some(error)),
+			},
+		};
+		let skin = match &self.authored {
+			Override::Inherit => application_skin,
+			Override::Set(spec) => spec.resolve()?,
+		};
+		Ok(TableSkinCompletion {
+			skin,
+			application_error,
+		})
+	}
+
+	#[cfg(test)]
+	pub fn resolve_through_authored_with(
+		&self,
+		mut resolve: impl FnMut(&TableSkinSpec) -> Result<TableSkin, TableSkinProjectionError>,
+	) -> Result<TableSkinCompletion, TableSkinProjectionError> {
+		let (application_skin, application_error) = match &self.application {
+			Override::Inherit => (TableSkin::DEFAULT, None),
+			Override::Set(spec) => match resolve(spec) {
+				Ok(skin) => (skin, None),
+				Err(error) => (TableSkin::DEFAULT, Some(error)),
+			},
+		};
+		let skin = match &self.authored {
+			Override::Inherit => application_skin,
+			Override::Set(spec) => resolve(spec)?,
+		};
+		Ok(TableSkinCompletion {
+			skin,
+			application_error,
+		})
+	}
+
+	#[cfg(test)]
+	pub fn flatten_pane(&self, baked: TableSkin) -> Result<TableSkin, TableSkinProjectionError> {
+		match &self.pane_override {
+			Override::Inherit => Ok(baked),
+			Override::Set(spec) => spec.resolve(),
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -995,6 +1108,78 @@ mod tests {
 		assert!(
 			below_threshold > 0,
 			"below-threshold projection coverage must be non-vacuous"
+		);
+	}
+
+	#[test]
+	fn product_0045_table_skin_cascade_bakes_through_authored_and_flattens_pane() {
+		let spec = |name, projection| TableSkinSpec::new(name, projection);
+		let application = spec("terrain", TableSkinProjection::PaletteForward);
+		let authored = spec("yellows", TableSkinProjection::Duotone);
+		let pane = spec("dark2_s1", TableSkinProjection::PaletteForward);
+		let cascade = TableSkinCascade {
+			application: Override::Set(application.clone()),
+			authored: Override::Set(authored.clone()),
+			pane_override: Override::Set(pane.clone()),
+		};
+		let baked = cascade
+			.resolve_through_authored()
+			.expect("an authored identity resolves");
+		assert_eq!(
+			baked.skin,
+			authored.resolve().expect("authored skin wins application")
+		);
+		assert!(baked.application_error.is_none());
+		assert_eq!(
+			cascade
+				.flatten_pane(baked.skin)
+				.expect("pane identity resolves"),
+			pane.resolve().expect("pane skin wins authored")
+		);
+		assert_eq!(
+			TableSkinCascade {
+				application: Override::Set(application.clone()),
+				..TableSkinCascade::default()
+			}
+			.resolve_through_authored()
+			.expect("application identity resolves")
+			.skin,
+			application.resolve().unwrap()
+		);
+		assert_eq!(
+			TableSkinCascade::default()
+				.resolve_through_authored()
+				.expect("library floor resolves")
+				.skin,
+			TableSkin::DEFAULT
+		);
+	}
+
+	#[test]
+	fn product_0045_bad_application_falls_to_the_floor_but_bad_authored_refuses() {
+		let bad = TableSkinSpec::new("not-a-theme", TableSkinProjection::Duotone);
+		let application = TableSkinCascade {
+			application: Override::Set(bad.clone()),
+			..TableSkinCascade::default()
+		}
+		.resolve_through_authored()
+		.expect("Polariton's bad application default must not fail an artifact");
+		assert_eq!(application.skin, TableSkin::DEFAULT);
+		assert_eq!(
+			application.application_error,
+			Some(TableSkinProjectionError::UnknownTheme {
+				name: "not-a-theme".to_owned(),
+			})
+		);
+		assert_eq!(
+			TableSkinCascade {
+				authored: Override::Set(bad),
+				..TableSkinCascade::default()
+			}
+			.resolve_through_authored(),
+			Err(TableSkinProjectionError::UnknownTheme {
+				name: "not-a-theme".to_owned(),
+			})
 		);
 	}
 

@@ -7,8 +7,10 @@ use crate::adapters::{
 use crate::configuration::{self, StartupData};
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
+#[cfg(test)]
+use crate::gui::table_skin::TableSkinProjectionError;
 #[cfg(feature = "toron")]
-use crate::gui::table_skin::{TableSkin, TableSkinProjection, TableSkinProjectionError};
+use crate::gui::table_skin::{TableSkin, TableSkinCascade, TableSkinProjection, TableSkinSpec};
 use crate::gui::{
 	components,
 	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
@@ -1227,6 +1229,39 @@ async fn dispatch_rune_relation(
 }
 
 #[cfg(feature = "toron")]
+fn rune_table_skin_authored(
+	intent: RuneTableSkinIntent,
+) -> crate::plot::spec::Override<TableSkinSpec> {
+	match intent {
+		RuneTableSkinIntent::Default => crate::plot::spec::Override::Inherit,
+		RuneTableSkinIntent::NamedTheme {
+			name,
+			projection: RuneTableSkinProjection::PaletteForward,
+		} => crate::plot::spec::Override::Set(TableSkinSpec::new(
+			name,
+			TableSkinProjection::PaletteForward,
+		)),
+		RuneTableSkinIntent::NamedTheme {
+			name,
+			projection: RuneTableSkinProjection::Duotone,
+		} => {
+			crate::plot::spec::Override::Set(TableSkinSpec::new(name, TableSkinProjection::Duotone))
+		}
+	}
+}
+
+#[cfg(feature = "toron")]
+fn resolve_rune_table_skin(intent: RuneTableSkinIntent) -> std::result::Result<TableSkin, String> {
+	TableSkinCascade {
+		authored: rune_table_skin_authored(intent),
+		..TableSkinCascade::default()
+	}
+	.resolve_through_authored()
+	.map(|completion| completion.skin)
+	.map_err(|error| error.to_string())
+}
+
+#[cfg(all(test, feature = "toron"))]
 fn resolve_rune_table_skin_with(
 	intent: RuneTableSkinIntent,
 	mut resolve: impl FnMut(
@@ -1234,17 +1269,13 @@ fn resolve_rune_table_skin_with(
 		TableSkinProjection,
 	) -> std::result::Result<TableSkin, TableSkinProjectionError>,
 ) -> std::result::Result<TableSkin, String> {
-	match intent {
-		RuneTableSkinIntent::Default => Ok(TableSkin::DEFAULT),
-		RuneTableSkinIntent::NamedTheme {
-			name,
-			projection: RuneTableSkinProjection::PaletteForward,
-		} => resolve(&name, TableSkinProjection::PaletteForward).map_err(|error| error.to_string()),
-		RuneTableSkinIntent::NamedTheme {
-			name,
-			projection: RuneTableSkinProjection::Duotone,
-		} => resolve(&name, TableSkinProjection::Duotone).map_err(|error| error.to_string()),
+	TableSkinCascade {
+		authored: rune_table_skin_authored(intent),
+		..TableSkinCascade::default()
 	}
+	.resolve_through_authored_with(|spec| resolve(&spec.identity, spec.projection))
+	.map(|completion| completion.skin)
+	.map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "toron")]
@@ -1269,8 +1300,7 @@ fn rune_view_outcome_with_palettes(
 			};
 			let (output, tick_step_output_span, minor_tick_output_span) = match view.intent {
 				RuneViewIntent::Table(table) => (
-					resolve_rune_table_skin_with(table.skin, TableSkin::from_theme_name)
-						.map(RuneRelationSinkOutput::Table),
+					resolve_rune_table_skin(table.skin).map(RuneRelationSinkOutput::Table),
 					None,
 					RunePlotMinorTickSpans::default(),
 				),
@@ -2908,7 +2938,7 @@ mod tests {
 	use crate::configuration::StartupData;
 	use crate::gui::messages::Message;
 	#[cfg(feature = "toron")]
-	use crate::gui::table_skin::{TableSkin, TableSkinProjection};
+	use crate::gui::table_skin::{TableSkin, TableSkinProjection, TableSkinSpec};
 	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
@@ -4011,6 +4041,87 @@ mod tests {
 			calls,
 			[("dark2_s1".to_owned(), TableSkinProjection::PaletteForward)]
 		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0045_pane_table_skin_restyles_only_the_completed_draw() {
+		let source_buffer = BufferId::new(111);
+		let identity = LocalViewIdentity::Named("table".to_owned());
+		let program = transform_rune_view(
+			"workspace.table(\"t\").views([view(\"table\", table().skin(\"terrain_rs10\"))])",
+		)
+		.expect("named authored table");
+		let presentation = program
+			.presentation_views()
+			.into_iter()
+			.map(|view| (view.identity.clone(), view.intent.presentation()))
+			.collect::<Vec<_>>();
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		state.rune_buffer_revisions.insert(source_buffer, 1);
+		state
+			.code_editor
+			.prepare_rune_view_panels(source_buffer, &presentation, 1);
+		let frame = polars::df!("value" => [1_i64, 2]).expect("table frame");
+		let baked = TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::PaletteForward)
+			.expect("authored baked skin");
+		let panel_id = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &identity)
+			.expect("prepared table panel");
+		state
+			.code_editor
+			.set_rune_view_table_with_skin(panel_id, frame.clone(), baked);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_skin(source_buffer, &identity),
+			Some(baked)
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_draw_skin(source_buffer, &identity),
+			Some(baked)
+		);
+
+		let pane = TableSkinSpec::new("yellows", TableSkinProjection::Duotone);
+		let pane_skin = pane.resolve().expect("valid pane test producer");
+		state
+			.code_editor
+			.set_test_rune_view_pane_table_skin(source_buffer, &identity, pane);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_skin(source_buffer, &identity),
+			Some(baked),
+			"the pane tier must not mutate the completed artifact"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_draw_skin(source_buffer, &identity),
+			Some(pane_skin)
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table(source_buffer, &identity),
+			Some(&frame),
+			"the pane tier must not replace the completed frame"
+		);
+		state
+			.code_editor
+			.clear_test_rune_view_pane_table_skin(source_buffer, &identity);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_table_draw_skin(source_buffer, &identity),
+			Some(baked),
+			"removing the pane tier restores the baked artifact without a rerun"
+		);
+		state.code_editor.shutdown();
 	}
 
 	#[cfg(feature = "toron")]
