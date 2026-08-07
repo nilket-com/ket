@@ -72,13 +72,11 @@ impl PlotKernel for ScatterLinePlotKernel {
 		self.line.plot(backend, bounds, transform, cursor, settings);
 	}
 
-	fn draw_legend(
+	fn legend_content(
 		&self,
-		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
-		settings: ResolvedPlotSettings,
-	) {
-		self.scatter.draw_legend(backend, bounds, settings);
+		settings: &ResolvedPlotSettings,
+	) -> Option<crate::plot::legend::LegendContent> {
+		self.scatter.legend_content(settings)
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {

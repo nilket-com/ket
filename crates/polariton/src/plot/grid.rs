@@ -627,11 +627,14 @@ impl PlotComposite for PlotGridKernel {
 				helper.draw_axis_labels(backend, inner);
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(cell_bounds.x, cell_bounds.y));
-					cell.kernel.draw_legend(
-						backend,
-						IcedRectangle::new(Point::ORIGIN, cell_bounds.size()),
-						resolved.clone(),
-					);
+					if let Some(content) = cell.kernel.legend_content(&resolved) {
+						crate::plot::legend::render_legend(
+							backend,
+							IcedRectangle::new(Point::ORIGIN, cell_bounds.size()),
+							&content,
+							&resolved,
+						);
+					}
 				});
 				if let Some(label) = &cell.cell.label {
 					backend.fill_text(iced::widget::canvas::Text {

@@ -86,73 +86,19 @@ impl PlotKernel for HeatmapPlotKernel {
 		None
 	}
 
-	fn draw_legend(
+	fn legend_content(
 		&self,
-		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
-		settings: ResolvedPlotSettings,
-	) {
-		let max_val = self.prepared_data.max_val;
-		let legend_width = 60.0;
-		let legend_height = 200.0;
-		let legend_padding = 10.0;
-		let x = (bounds.width - legend_width) * settings.legend_x;
-		let y = (bounds.height - legend_height) * settings.legend_y;
-		backend.fill_rectangle(
-			Point::new(x, y),
-			Size::new(legend_width, legend_height),
-			Color {
-				a: 0.6,
-				..settings.chrome.legend_background.iced()
-			},
-		);
-		let bar_width = 15.0;
-		let bar_height = legend_height - 55.0;
-		let bar_x = x + legend_padding;
-		let bar_y = y + 35.0;
-		let steps = 50;
-		for i in 0..steps {
-			let t = i as f32 / (steps - 1) as f32;
-			let color = settings.color_theme.get_color(t);
-			let step_height = bar_height / steps as f32;
-			let step_y = bar_y + bar_height - (i as f32 + 1.0) * step_height;
-			backend.fill_rectangle(
-				Point::new(bar_x, step_y),
-				iced::Size::new(bar_width, step_height + 0.5),
-				color,
-			);
-		}
-		backend.stroke_path(
-			&|builder| {
-				builder.move_to(Point::new(bar_x, bar_y));
-				builder.line_to(Point::new(bar_x + bar_width, bar_y));
-				builder.line_to(Point::new(bar_x + bar_width, bar_y + bar_height));
-				builder.line_to(Point::new(bar_x, bar_y + bar_height));
-				builder.close();
-			},
-			Stroke {
-				style: Style::Solid(settings.chrome.legend_swatch_border.iced()),
-				width: 1.0,
-				..Default::default()
-			},
-		);
-		let label_x = bar_x + bar_width + 5.0;
-		backend.fill_text(iced::widget::canvas::Text {
-			content: format!("{:.1}", max_val),
-			position: Point::new(label_x, bar_y),
-			color: settings.chrome.legend_text.iced(),
-			size: iced::Pixels(settings.legend_size),
-			align_y: iced::alignment::Vertical::Top,
-			..Default::default()
-		});
-		backend.fill_text(iced::widget::canvas::Text {
-			content: "0.0".to_string(),
-			position: Point::new(label_x, bar_y + bar_height),
-			color: settings.chrome.legend_text.iced(),
-			size: iced::Pixels(settings.legend_size),
-			align_y: iced::alignment::Vertical::Bottom,
-			..Default::default()
-		});
+		settings: &ResolvedPlotSettings,
+	) -> Option<crate::plot::legend::LegendContent> {
+		Some(crate::plot::legend::LegendContent(
+			crate::plot::spec::NonEmpty::new(crate::plot::legend::LegendSection::Gradient {
+				label: "Value".to_owned(),
+				low: 0.0,
+				high: self.prepared_data.max_val as f64,
+				low_color: settings.color_theme.get_color(0.0),
+				high_color: settings.color_theme.get_color(1.0),
+			}),
+		))
 	}
 
 	fn x_label(&self) -> String {

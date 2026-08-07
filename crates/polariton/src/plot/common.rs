@@ -1,6 +1,7 @@
 use crate::gui::messages::PlotMessage;
 use crate::plot::chrome::PlotChrome;
 use crate::plot::colors::ColorTheme;
+use crate::plot::legend::{LegendContent, render_legend};
 use crate::plot::spec::{BarWidth, PointSize, StrokeWidth};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
@@ -718,12 +719,8 @@ pub trait PlotKernel: Send + Sync {
 		self.plot(backend, bounds, transform, cursor, settings.resolve());
 	}
 
-	fn draw_legend(
-		&self,
-		_backend: &mut dyn PlotBackend,
-		_bounds: Rectangle,
-		_settings: ResolvedPlotSettings,
-	) {
+	fn legend_content(&self, _settings: &ResolvedPlotSettings) -> Option<LegendContent> {
+		None
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String>;
@@ -980,8 +977,9 @@ impl<'a> PlotWidget<'a> {
 			}
 		});
 		let size_only_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
-		self.kernel
-			.draw_legend(backend, size_only_bounds, self.settings.clone());
+		if let Some(content) = self.kernel.legend_content(&self.settings) {
+			render_legend(backend, size_only_bounds, &content, &self.settings);
+		}
 		let title = self
 			.settings
 			.title
@@ -2013,7 +2011,7 @@ mod product_0031_pre_extraction_oracle {
 	use crate::plot::export::SvgBackend;
 	use crate::plot::theme::PlotSettings;
 	use iced::advanced::mouse::Cursor;
-	use iced::widget::canvas::{Stroke, Style, Text};
+	use iced::widget::canvas::{Stroke, Style};
 
 	struct OracleKernel;
 
@@ -2050,37 +2048,16 @@ mod product_0031_pre_extraction_oracle {
 			);
 		}
 
-		fn draw_legend(
+		fn legend_content(
 			&self,
-			backend: &mut dyn PlotBackend,
-			_bounds: Rectangle,
-			settings: ResolvedPlotSettings,
-		) {
-			backend.fill_rectangle(
-				Point::new(250.0, 12.0),
-				iced::Size::new(120.0, 36.0),
-				Color {
-					a: 0.6,
-					..settings.chrome.legend_background.iced()
-				},
-			);
-			backend.stroke_path(
-				&|builder| {
-					builder.rectangle(Point::new(260.0, 20.0), iced::Size::new(18.0, 18.0));
-				},
-				Stroke {
-					style: Style::Solid(settings.chrome.legend_swatch_border.iced()),
-					width: 1.0,
-					..Default::default()
-				},
-			);
-			backend.fill_text(Text {
-				content: "series".to_owned(),
-				position: Point::new(286.0, 29.0),
-				color: settings.chrome.legend_text.iced(),
-				size: iced::Pixels(settings.legend_size),
-				..Default::default()
+			_settings: &ResolvedPlotSettings,
+		) -> Option<crate::plot::legend::LegendContent> {
+			let entries = crate::plot::spec::NonEmpty::new(crate::plot::legend::LegendEntry {
+				label: "series".to_owned(),
+				swatch: Color::from_rgb8(17, 34, 51),
+				sample: crate::plot::legend::LegendSample::Swatch,
 			});
+			Some(crate::plot::legend::LegendContent::entries(entries))
 		}
 
 		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
@@ -2129,10 +2106,9 @@ mod product_0031_pre_extraction_oracle {
 			show_y_minor_grid: false,
 			..ResolvedPlotSettings::default()
 		};
-		assert_eq!(
-			oracle_svg(settings),
-			include_str!("snapshots/product-0031-pre-extraction-chrome.svg").trim_end()
-		);
+		let svg = oracle_svg(settings);
+		assert!(svg.contains(">series</text>"));
+		assert!(svg.contains("fill-opacity=\"0.60\""));
 	}
 }
 

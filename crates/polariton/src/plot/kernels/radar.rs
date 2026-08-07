@@ -166,61 +166,14 @@ impl PlotKernel for RadarPlotKernel {
 		}
 	}
 
-	fn draw_legend(
+	fn legend_content(
 		&self,
-		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
-		settings: ResolvedPlotSettings,
-	) {
-		let num_cats = self.prepared_data.category_names.len();
-		if num_cats == 0 {
-			return;
-		}
-		let max_rows = settings.max_legend_rows.max(1) as usize;
-		let num_cols = num_cats.div_ceil(max_rows);
-		let actual_rows = num_cats.min(max_rows);
-		let item_height = 25.0;
-		let legend_padding = 10.0;
-		let rect_size = 15.0;
-		let col_width = 150.0;
-		let legend_width = num_cols as f32 * col_width + legend_padding * 2.0;
-		let legend_height = actual_rows as f32 * item_height + legend_padding * 2.0;
-		let x = (bounds.width - legend_width) * settings.legend_x;
-		let y = (bounds.height - legend_height) * settings.legend_y;
-		backend.fill_rectangle(
-			iced::Point::new(x, y),
-			iced::Size::new(legend_width, legend_height),
-			Color {
-				a: 0.6,
-				..settings.chrome.legend_background.iced()
-			},
-		);
-		for (i, name) in self.prepared_data.category_names.iter().enumerate() {
-			let t = if num_cats > 1 {
-				(i as f32 / (num_cats - 1) as f32).clamp(0.1, 0.9)
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(t);
-			let col = i / max_rows;
-			let row = i % max_rows;
-			let item_x = x + legend_padding + col as f32 * col_width;
-			let item_y = y + legend_padding + row as f32 * item_height;
-			backend.fill_rectangle(
-				iced::Point::new(item_x, item_y + (item_height - rect_size) / 2.0),
-				iced::Size::new(rect_size, rect_size),
-				color,
-			);
-			backend.fill_text(iced::widget::canvas::Text {
-				content: name.clone(),
-				position: iced::Point::new(item_x + rect_size + 10.0, item_y + item_height / 2.0),
-				color: settings.chrome.legend_text.iced(),
-				size: iced::Pixels(settings.legend_size),
-				align_x: iced::alignment::Horizontal::Left.into(),
-				align_y: iced::alignment::Vertical::Center,
-				..Default::default()
-			});
-		}
+		settings: &ResolvedPlotSettings,
+	) -> Option<crate::plot::legend::LegendContent> {
+		crate::plot::legend::entries_from_labels(
+			self.prepared_data.category_names.iter().cloned(),
+			settings,
+		)
 	}
 
 	fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {

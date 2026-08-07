@@ -3,8 +3,8 @@ use crate::plot::common::{
 	format_label, polars_type_to_axis_type,
 };
 use iced::advanced::mouse::Cursor;
-use iced::widget::canvas::{Stroke, Style, Text};
-use iced::{Color, Pixels, Point, Rectangle};
+use iced::widget::canvas::{Stroke, Style};
+use iced::{Color, Rectangle};
 use polars::prelude::*;
 use std::sync::Arc;
 
@@ -89,117 +89,25 @@ impl PlotKernel for BubblePlotKernel {
 		}
 	}
 
-	fn draw_legend(
+	fn legend_content(
 		&self,
-		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
-		settings: ResolvedPlotSettings,
-	) {
-		let color_min = self.prepared_data.color_range.0;
-		let color_max = self.prepared_data.color_range.1;
-		let size_min = self.prepared_data.size_range.0;
-		let size_max = self.prepared_data.size_range.1;
-		let legend_width = 250.0;
-		let legend_height = 240.0;
-		let legend_padding = 20.0;
-		let x = (bounds.width - legend_width) * settings.legend_x;
-		let y = (bounds.height - legend_height) * settings.legend_y;
-		backend.fill_rectangle(
-			Point::new(x, y),
-			iced::Size::new(legend_width, legend_height),
-			Color {
-				a: 0.7,
-				..settings.chrome.legend_background.iced()
+		settings: &ResolvedPlotSettings,
+	) -> Option<crate::plot::legend::LegendContent> {
+		let mut content = crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(
+			crate::plot::legend::LegendSection::Gradient {
+				label: self.prepared_data.color_label.clone(),
+				low: self.prepared_data.color_range.0,
+				high: self.prepared_data.color_range.1,
+				low_color: settings.color_theme.get_color(0.0),
+				high_color: settings.color_theme.get_color(1.0),
 			},
-		);
-		let bar_width = 15.0;
-		let bar_height = legend_height - 80.0;
-		let color_bar_x = x + legend_width - 70.0;
-		let bar_y = y + 50.0;
-		let steps = 50;
-		for i in 0..steps {
-			let t = i as f32 / (steps - 1) as f32;
-			let color = settings.color_theme.get_color(t);
-			let step_height = bar_height / steps as f32;
-			let step_y = bar_y + bar_height - (i as f32 + 1.0) * step_height;
-			backend.fill_rectangle(
-				Point::new(color_bar_x, step_y),
-				iced::Size::new(bar_width, step_height + 0.5),
-				color,
-			);
-		}
-		let color_label_x = color_bar_x + bar_width + 8.0;
-		backend.fill_text(Text {
-			content: format!("{:.1}", color_max),
-			position: Point::new(color_label_x, bar_y),
-			color: settings.chrome.legend_text.iced(),
-			size: Pixels(settings.legend_size),
-			align_y: iced::alignment::Vertical::Top,
-			..Default::default()
+		));
+		content.push(crate::plot::legend::LegendSection::SizeSample {
+			label: self.prepared_data.size_label.clone(),
+			low: self.prepared_data.size_range.0,
+			high: self.prepared_data.size_range.1,
 		});
-		backend.fill_text(Text {
-			content: format!("{:.1}", color_min),
-			position: Point::new(color_label_x, bar_y + bar_height),
-			color: settings.chrome.legend_text.iced(),
-			size: Pixels(settings.legend_size),
-			align_y: iced::alignment::Vertical::Bottom,
-			..Default::default()
-		});
-		backend.fill_text(Text {
-			content: self.prepared_data.color_label.clone(),
-			position: Point::new(color_bar_x + bar_width / 2.0, y + 15.0),
-			color: settings.chrome.legend_text.iced(),
-			size: Pixels(16.0),
-			align_x: iced::alignment::Horizontal::Center.into(),
-			align_y: iced::alignment::Vertical::Top,
-			..Default::default()
-		});
-		let size_legend_x = x + legend_padding;
-		let size_title_x = size_legend_x + 40.0;
-		backend.fill_text(Text {
-			content: self.prepared_data.size_label.clone(),
-			position: Point::new(size_title_x, y + 15.0),
-			color: settings.chrome.legend_text.iced(),
-			size: Pixels(16.0),
-			align_x: iced::alignment::Horizontal::Center.into(),
-			align_y: iced::alignment::Vertical::Top,
-			..Default::default()
-		});
-		let num_samples = 3;
-		let max_radius = 30.0;
-		let min_radius = 2.0;
-		for i in 0..num_samples {
-			let t = i as f32 / (num_samples - 1) as f32;
-			let val = size_min + (size_max - size_min) * t as f64;
-			let radius = min_radius + t * (max_radius - min_radius);
-			let sample_y =
-				(bar_y + bar_height - min_radius) - t * (bar_height - max_radius - min_radius);
-			let circle_center = Point::new(size_legend_x + 35.0, sample_y);
-			backend.fill_path(
-				&|builder| {
-					builder.circle(circle_center, radius);
-				},
-				settings.chrome.legend_swatch_fill.iced(),
-			);
-			backend.stroke_path(
-				&|builder| {
-					builder.circle(circle_center, radius);
-				},
-				Stroke {
-					style: Style::Solid(settings.chrome.legend_swatch_border.iced()),
-					width: 1.0,
-					..Default::default()
-				},
-			);
-			backend.fill_text(Text {
-				content: format!("{:.1}", val),
-				position: Point::new(size_legend_x + 75.0, sample_y),
-				color: settings.chrome.legend_text.iced(),
-				size: Pixels(settings.legend_size),
-				align_y: iced::alignment::Vertical::Center,
-				..Default::default()
-			});
-		}
+		Some(content)
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {

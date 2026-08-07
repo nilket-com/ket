@@ -1,0 +1,351 @@
+# legend corpus; source tree ab06a8a9\n## Bar Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 11.50 L 388.50 11.50 L 388.50 81.50 L 218.50 81.50 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 26.50 L 243.50 26.50 L 243.50 41.50 L 228.50 41.50 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="34" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">G1</text>
+<path d="M 228.50 51.50 L 243.50 51.50 L 243.50 66.50 L 228.50 66.50 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="59" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">G2</text>
+</svg>
+## Box Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 25.25 L 243.50 25.25 L 243.50 40.25 L 228.50 40.25 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+<path d="M 228.50 50.25 L 243.50 50.25 L 243.50 65.25 L 228.50 65.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 75.25 L 243.50 75.25 L 243.50 90.25 L 228.50 90.25 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+</svg>
+## Bubble Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 142.50 3.00 L 392.50 3.00 L 392.50 243.00 L 142.50 243.00 Z " fill="rgb(0, 0, 0)" fill-opacity="0.70" />
+<path d="M 322.50 209.80 L 337.50 209.80 L 337.50 213.50 L 322.50 213.50 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<path d="M 322.50 206.60 L 337.50 206.60 L 337.50 210.30 L 322.50 210.30 Z " fill="rgb(67, 7, 88)" fill-opacity="1.00" />
+<path d="M 322.50 203.40 L 337.50 203.40 L 337.50 207.10 L 322.50 207.10 Z " fill="rgb(66, 14, 92)" fill-opacity="1.00" />
+<path d="M 322.50 200.20 L 337.50 200.20 L 337.50 203.90 L 322.50 203.90 Z " fill="rgb(65, 20, 97)" fill-opacity="1.00" />
+<path d="M 322.50 197.00 L 337.50 197.00 L 337.50 200.70 L 322.50 200.70 Z " fill="rgb(65, 27, 101)" fill-opacity="1.00" />
+<path d="M 322.50 193.80 L 337.50 193.80 L 337.50 197.50 L 322.50 197.50 Z " fill="rgb(64, 34, 106)" fill-opacity="1.00" />
+<path d="M 322.50 190.60 L 337.50 190.60 L 337.50 194.30 L 322.50 194.30 Z " fill="rgb(63, 40, 110)" fill-opacity="1.00" />
+<path d="M 322.50 187.40 L 337.50 187.40 L 337.50 191.10 L 322.50 191.10 Z " fill="rgb(62, 47, 115)" fill-opacity="1.00" />
+<path d="M 322.50 184.20 L 337.50 184.20 L 337.50 187.90 L 322.50 187.90 Z " fill="rgb(62, 53, 119)" fill-opacity="1.00" />
+<path d="M 322.50 181.00 L 337.50 181.00 L 337.50 184.70 L 322.50 184.70 Z " fill="rgb(61, 60, 124)" fill-opacity="1.00" />
+<path d="M 322.50 177.80 L 337.50 177.80 L 337.50 181.50 L 322.50 181.50 Z " fill="rgb(60, 67, 128)" fill-opacity="1.00" />
+<path d="M 322.50 174.60 L 337.50 174.60 L 337.50 178.30 L 322.50 178.30 Z " fill="rgb(59, 73, 133)" fill-opacity="1.00" />
+<path d="M 322.50 171.40 L 337.50 171.40 L 337.50 175.10 L 322.50 175.10 Z " fill="rgb(59, 80, 137)" fill-opacity="1.00" />
+<path d="M 322.50 168.20 L 337.50 168.20 L 337.50 171.90 L 322.50 171.90 Z " fill="rgb(57, 85, 139)" fill-opacity="1.00" />
+<path d="M 322.50 165.00 L 337.50 165.00 L 337.50 168.70 L 322.50 168.70 Z " fill="rgb(55, 91, 139)" fill-opacity="1.00" />
+<path d="M 322.50 161.80 L 337.50 161.80 L 337.50 165.50 L 322.50 165.50 Z " fill="rgb(53, 96, 139)" fill-opacity="1.00" />
+<path d="M 322.50 158.60 L 337.50 158.60 L 337.50 162.30 L 322.50 162.30 Z " fill="rgb(50, 101, 139)" fill-opacity="1.00" />
+<path d="M 322.50 155.40 L 337.50 155.40 L 337.50 159.10 L 322.50 159.10 Z " fill="rgb(48, 106, 139)" fill-opacity="1.00" />
+<path d="M 322.50 152.20 L 337.50 152.20 L 337.50 155.90 L 322.50 155.90 Z " fill="rgb(46, 111, 139)" fill-opacity="1.00" />
+<path d="M 322.50 149.00 L 337.50 149.00 L 337.50 152.70 L 322.50 152.70 Z " fill="rgb(44, 116, 140)" fill-opacity="1.00" />
+<path d="M 322.50 145.80 L 337.50 145.80 L 337.50 149.50 L 322.50 149.50 Z " fill="rgb(42, 121, 140)" fill-opacity="1.00" />
+<path d="M 322.50 142.60 L 337.50 142.60 L 337.50 146.30 L 322.50 146.30 Z " fill="rgb(40, 127, 140)" fill-opacity="1.00" />
+<path d="M 322.50 139.40 L 337.50 139.40 L 337.50 143.10 L 322.50 143.10 Z " fill="rgb(38, 132, 140)" fill-opacity="1.00" />
+<path d="M 322.50 136.20 L 337.50 136.20 L 337.50 139.90 L 322.50 139.90 Z " fill="rgb(36, 137, 140)" fill-opacity="1.00" />
+<path d="M 322.50 133.00 L 337.50 133.00 L 337.50 136.70 L 322.50 136.70 Z " fill="rgb(33, 142, 140)" fill-opacity="1.00" />
+<path d="M 322.50 129.80 L 337.50 129.80 L 337.50 133.50 L 322.50 133.50 Z " fill="rgb(35, 147, 139)" fill-opacity="1.00" />
+<path d="M 322.50 126.60 L 337.50 126.60 L 337.50 130.30 L 322.50 130.30 Z " fill="rgb(40, 151, 135)" fill-opacity="1.00" />
+<path d="M 322.50 123.40 L 337.50 123.40 L 337.50 127.10 L 322.50 127.10 Z " fill="rgb(45, 156, 132)" fill-opacity="1.00" />
+<path d="M 322.50 120.20 L 337.50 120.20 L 337.50 123.90 L 322.50 123.90 Z " fill="rgb(50, 161, 128)" fill-opacity="1.00" />
+<path d="M 322.50 117.00 L 337.50 117.00 L 337.50 120.70 L 322.50 120.70 Z " fill="rgb(55, 165, 125)" fill-opacity="1.00" />
+<path d="M 322.50 113.80 L 337.50 113.80 L 337.50 117.50 L 322.50 117.50 Z " fill="rgb(60, 170, 121)" fill-opacity="1.00" />
+<path d="M 322.50 110.60 L 337.50 110.60 L 337.50 114.30 L 322.50 114.30 Z " fill="rgb(65, 174, 118)" fill-opacity="1.00" />
+<path d="M 322.50 107.40 L 337.50 107.40 L 337.50 111.10 L 322.50 111.10 Z " fill="rgb(70, 179, 114)" fill-opacity="1.00" />
+<path d="M 322.50 104.20 L 337.50 104.20 L 337.50 107.90 L 322.50 107.90 Z " fill="rgb(75, 184, 111)" fill-opacity="1.00" />
+<path d="M 322.50 101.00 L 337.50 101.00 L 337.50 104.70 L 322.50 104.70 Z " fill="rgb(80, 188, 107)" fill-opacity="1.00" />
+<path d="M 322.50 97.80 L 337.50 97.80 L 337.50 101.50 L 322.50 101.50 Z " fill="rgb(85, 193, 104)" fill-opacity="1.00" />
+<path d="M 322.50 94.60 L 337.50 94.60 L 337.50 98.30 L 322.50 98.30 Z " fill="rgb(90, 197, 100)" fill-opacity="1.00" />
+<path d="M 322.50 91.40 L 337.50 91.40 L 337.50 95.10 L 322.50 95.10 Z " fill="rgb(97, 201, 96)" fill-opacity="1.00" />
+<path d="M 322.50 88.20 L 337.50 88.20 L 337.50 91.90 L 322.50 91.90 Z " fill="rgb(110, 204, 91)" fill-opacity="1.00" />
+<path d="M 322.50 85.00 L 337.50 85.00 L 337.50 88.70 L 322.50 88.70 Z " fill="rgb(123, 206, 86)" fill-opacity="1.00" />
+<path d="M 322.50 81.80 L 337.50 81.80 L 337.50 85.50 L 322.50 85.50 Z " fill="rgb(136, 209, 81)" fill-opacity="1.00" />
+<path d="M 322.50 78.60 L 337.50 78.60 L 337.50 82.30 L 322.50 82.30 Z " fill="rgb(149, 211, 76)" fill-opacity="1.00" />
+<path d="M 322.50 75.40 L 337.50 75.40 L 337.50 79.10 L 322.50 79.10 Z " fill="rgb(162, 213, 71)" fill-opacity="1.00" />
+<path d="M 322.50 72.20 L 337.50 72.20 L 337.50 75.90 L 322.50 75.90 Z " fill="rgb(175, 216, 66)" fill-opacity="1.00" />
+<path d="M 322.50 69.00 L 337.50 69.00 L 337.50 72.70 L 322.50 72.70 Z " fill="rgb(188, 218, 61)" fill-opacity="1.00" />
+<path d="M 322.50 65.80 L 337.50 65.80 L 337.50 69.50 L 322.50 69.50 Z " fill="rgb(201, 221, 56)" fill-opacity="1.00" />
+<path d="M 322.50 62.60 L 337.50 62.60 L 337.50 66.30 L 322.50 66.30 Z " fill="rgb(214, 223, 51)" fill-opacity="1.00" />
+<path d="M 322.50 59.40 L 337.50 59.40 L 337.50 63.10 L 322.50 63.10 Z " fill="rgb(227, 226, 46)" fill-opacity="1.00" />
+<path d="M 322.50 56.20 L 337.50 56.20 L 337.50 59.90 L 322.50 59.90 Z " fill="rgb(240, 228, 41)" fill-opacity="1.00" />
+<path d="M 322.50 53.00 L 337.50 53.00 L 337.50 56.70 L 322.50 56.70 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="345.5" y="53" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="hanging">15.0</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="345.5" y="213" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="alphabetic">5.0</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="330" y="18" fill="rgb(255, 255, 255)" font-size="16" text-anchor="middle" dominant-baseline="hanging">size</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="202.5" y="18" fill="rgb(255, 255, 255)" font-size="16" text-anchor="middle" dominant-baseline="hanging">y</text>
+<path d="M 199.50 211.00 A 2.00 2.00 0 1 1 195.50 211.00 A 2.00 2.00 0 1 1 199.50 211.00 Z " fill="rgb(255, 255, 255)" fill-opacity="0.50" />
+<path d="M 199.50 211.00 A 2.00 2.00 0 1 1 195.50 211.00 A 2.00 2.00 0 1 1 199.50 211.00 Z " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="237.5" y="211" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">2.0</text>
+<path d="M 213.50 147.00 A 16.00 16.00 0 1 1 181.50 147.00 A 16.00 16.00 0 1 1 213.50 147.00 Z " fill="rgb(255, 255, 255)" fill-opacity="0.50" />
+<path d="M 213.50 147.00 A 16.00 16.00 0 1 1 181.50 147.00 A 16.00 16.00 0 1 1 213.50 147.00 Z " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="237.5" y="147" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">4.0</text>
+<path d="M 227.50 83.00 A 30.00 30.00 0 1 1 167.50 83.00 A 30.00 30.00 0 1 1 227.50 83.00 Z " fill="rgb(255, 255, 255)" fill-opacity="0.50" />
+<path d="M 227.50 83.00 A 30.00 30.00 0 1 1 167.50 83.00 A 30.00 30.00 0 1 1 227.50 83.00 Z " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="237.5" y="83" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">6.0</text>
+</svg>
+## Funnel Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 25.25 L 243.50 25.25 L 243.50 40.25 L 228.50 40.25 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+<path d="M 228.50 50.25 L 243.50 50.25 L 243.50 65.25 L 228.50 65.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 75.25 L 243.50 75.25 L 243.50 90.25 L 228.50 90.25 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+</svg>
+## Heatmap\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 323.00 5.00 L 383.00 5.00 L 383.00 205.00 L 323.00 205.00 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 333.00 182.10 L 348.00 182.10 L 348.00 185.50 L 333.00 185.50 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<path d="M 333.00 179.20 L 348.00 179.20 L 348.00 182.60 L 333.00 182.60 Z " fill="rgb(67, 7, 88)" fill-opacity="1.00" />
+<path d="M 333.00 176.30 L 348.00 176.30 L 348.00 179.70 L 333.00 179.70 Z " fill="rgb(66, 14, 92)" fill-opacity="1.00" />
+<path d="M 333.00 173.40 L 348.00 173.40 L 348.00 176.80 L 333.00 176.80 Z " fill="rgb(65, 20, 97)" fill-opacity="1.00" />
+<path d="M 333.00 170.50 L 348.00 170.50 L 348.00 173.90 L 333.00 173.90 Z " fill="rgb(65, 27, 101)" fill-opacity="1.00" />
+<path d="M 333.00 167.60 L 348.00 167.60 L 348.00 171.00 L 333.00 171.00 Z " fill="rgb(64, 34, 106)" fill-opacity="1.00" />
+<path d="M 333.00 164.70 L 348.00 164.70 L 348.00 168.10 L 333.00 168.10 Z " fill="rgb(63, 40, 110)" fill-opacity="1.00" />
+<path d="M 333.00 161.80 L 348.00 161.80 L 348.00 165.20 L 333.00 165.20 Z " fill="rgb(62, 47, 115)" fill-opacity="1.00" />
+<path d="M 333.00 158.90 L 348.00 158.90 L 348.00 162.30 L 333.00 162.30 Z " fill="rgb(62, 53, 119)" fill-opacity="1.00" />
+<path d="M 333.00 156.00 L 348.00 156.00 L 348.00 159.40 L 333.00 159.40 Z " fill="rgb(61, 60, 124)" fill-opacity="1.00" />
+<path d="M 333.00 153.10 L 348.00 153.10 L 348.00 156.50 L 333.00 156.50 Z " fill="rgb(60, 67, 128)" fill-opacity="1.00" />
+<path d="M 333.00 150.20 L 348.00 150.20 L 348.00 153.60 L 333.00 153.60 Z " fill="rgb(59, 73, 133)" fill-opacity="1.00" />
+<path d="M 333.00 147.30 L 348.00 147.30 L 348.00 150.70 L 333.00 150.70 Z " fill="rgb(59, 80, 137)" fill-opacity="1.00" />
+<path d="M 333.00 144.40 L 348.00 144.40 L 348.00 147.80 L 333.00 147.80 Z " fill="rgb(57, 85, 139)" fill-opacity="1.00" />
+<path d="M 333.00 141.50 L 348.00 141.50 L 348.00 144.90 L 333.00 144.90 Z " fill="rgb(55, 91, 139)" fill-opacity="1.00" />
+<path d="M 333.00 138.60 L 348.00 138.60 L 348.00 142.00 L 333.00 142.00 Z " fill="rgb(53, 96, 139)" fill-opacity="1.00" />
+<path d="M 333.00 135.70 L 348.00 135.70 L 348.00 139.10 L 333.00 139.10 Z " fill="rgb(50, 101, 139)" fill-opacity="1.00" />
+<path d="M 333.00 132.80 L 348.00 132.80 L 348.00 136.20 L 333.00 136.20 Z " fill="rgb(48, 106, 139)" fill-opacity="1.00" />
+<path d="M 333.00 129.90 L 348.00 129.90 L 348.00 133.30 L 333.00 133.30 Z " fill="rgb(46, 111, 139)" fill-opacity="1.00" />
+<path d="M 333.00 127.00 L 348.00 127.00 L 348.00 130.40 L 333.00 130.40 Z " fill="rgb(44, 116, 140)" fill-opacity="1.00" />
+<path d="M 333.00 124.10 L 348.00 124.10 L 348.00 127.50 L 333.00 127.50 Z " fill="rgb(42, 121, 140)" fill-opacity="1.00" />
+<path d="M 333.00 121.20 L 348.00 121.20 L 348.00 124.60 L 333.00 124.60 Z " fill="rgb(40, 127, 140)" fill-opacity="1.00" />
+<path d="M 333.00 118.30 L 348.00 118.30 L 348.00 121.70 L 333.00 121.70 Z " fill="rgb(38, 132, 140)" fill-opacity="1.00" />
+<path d="M 333.00 115.40 L 348.00 115.40 L 348.00 118.80 L 333.00 118.80 Z " fill="rgb(36, 137, 140)" fill-opacity="1.00" />
+<path d="M 333.00 112.50 L 348.00 112.50 L 348.00 115.90 L 333.00 115.90 Z " fill="rgb(33, 142, 140)" fill-opacity="1.00" />
+<path d="M 333.00 109.60 L 348.00 109.60 L 348.00 113.00 L 333.00 113.00 Z " fill="rgb(35, 147, 139)" fill-opacity="1.00" />
+<path d="M 333.00 106.70 L 348.00 106.70 L 348.00 110.10 L 333.00 110.10 Z " fill="rgb(40, 151, 135)" fill-opacity="1.00" />
+<path d="M 333.00 103.80 L 348.00 103.80 L 348.00 107.20 L 333.00 107.20 Z " fill="rgb(45, 156, 132)" fill-opacity="1.00" />
+<path d="M 333.00 100.90 L 348.00 100.90 L 348.00 104.30 L 333.00 104.30 Z " fill="rgb(50, 161, 128)" fill-opacity="1.00" />
+<path d="M 333.00 98.00 L 348.00 98.00 L 348.00 101.40 L 333.00 101.40 Z " fill="rgb(55, 165, 125)" fill-opacity="1.00" />
+<path d="M 333.00 95.10 L 348.00 95.10 L 348.00 98.50 L 333.00 98.50 Z " fill="rgb(60, 170, 121)" fill-opacity="1.00" />
+<path d="M 333.00 92.20 L 348.00 92.20 L 348.00 95.60 L 333.00 95.60 Z " fill="rgb(65, 174, 118)" fill-opacity="1.00" />
+<path d="M 333.00 89.30 L 348.00 89.30 L 348.00 92.70 L 333.00 92.70 Z " fill="rgb(70, 179, 114)" fill-opacity="1.00" />
+<path d="M 333.00 86.40 L 348.00 86.40 L 348.00 89.80 L 333.00 89.80 Z " fill="rgb(75, 184, 111)" fill-opacity="1.00" />
+<path d="M 333.00 83.50 L 348.00 83.50 L 348.00 86.90 L 333.00 86.90 Z " fill="rgb(80, 188, 107)" fill-opacity="1.00" />
+<path d="M 333.00 80.60 L 348.00 80.60 L 348.00 84.00 L 333.00 84.00 Z " fill="rgb(85, 193, 104)" fill-opacity="1.00" />
+<path d="M 333.00 77.70 L 348.00 77.70 L 348.00 81.10 L 333.00 81.10 Z " fill="rgb(90, 197, 100)" fill-opacity="1.00" />
+<path d="M 333.00 74.80 L 348.00 74.80 L 348.00 78.20 L 333.00 78.20 Z " fill="rgb(97, 201, 96)" fill-opacity="1.00" />
+<path d="M 333.00 71.90 L 348.00 71.90 L 348.00 75.30 L 333.00 75.30 Z " fill="rgb(110, 204, 91)" fill-opacity="1.00" />
+<path d="M 333.00 69.00 L 348.00 69.00 L 348.00 72.40 L 333.00 72.40 Z " fill="rgb(123, 206, 86)" fill-opacity="1.00" />
+<path d="M 333.00 66.10 L 348.00 66.10 L 348.00 69.50 L 333.00 69.50 Z " fill="rgb(136, 209, 81)" fill-opacity="1.00" />
+<path d="M 333.00 63.20 L 348.00 63.20 L 348.00 66.60 L 333.00 66.60 Z " fill="rgb(149, 211, 76)" fill-opacity="1.00" />
+<path d="M 333.00 60.30 L 348.00 60.30 L 348.00 63.70 L 333.00 63.70 Z " fill="rgb(162, 213, 71)" fill-opacity="1.00" />
+<path d="M 333.00 57.40 L 348.00 57.40 L 348.00 60.80 L 333.00 60.80 Z " fill="rgb(175, 216, 66)" fill-opacity="1.00" />
+<path d="M 333.00 54.50 L 348.00 54.50 L 348.00 57.90 L 333.00 57.90 Z " fill="rgb(188, 218, 61)" fill-opacity="1.00" />
+<path d="M 333.00 51.60 L 348.00 51.60 L 348.00 55.00 L 333.00 55.00 Z " fill="rgb(201, 221, 56)" fill-opacity="1.00" />
+<path d="M 333.00 48.70 L 348.00 48.70 L 348.00 52.10 L 333.00 52.10 Z " fill="rgb(214, 223, 51)" fill-opacity="1.00" />
+<path d="M 333.00 45.80 L 348.00 45.80 L 348.00 49.20 L 333.00 49.20 Z " fill="rgb(227, 226, 46)" fill-opacity="1.00" />
+<path d="M 333.00 42.90 L 348.00 42.90 L 348.00 46.30 L 333.00 46.30 Z " fill="rgb(240, 228, 41)" fill-opacity="1.00" />
+<path d="M 333.00 40.00 L 348.00 40.00 L 348.00 43.40 L 333.00 43.40 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<path d="M 333.00 40.00 L 348.00 40.00 L 348.00 185.00 L 333.00 185.00 Z " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="353" y="40" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="hanging">3.0</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="353" y="185" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="alphabetic">0.0</text>
+</svg>
+## Hexbin Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 323.00 5.00 L 383.00 5.00 L 383.00 205.00 L 323.00 205.00 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 333.00 182.10 L 348.00 182.10 L 348.00 185.50 L 333.00 185.50 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<path d="M 333.00 179.20 L 348.00 179.20 L 348.00 182.60 L 333.00 182.60 Z " fill="rgb(67, 7, 88)" fill-opacity="1.00" />
+<path d="M 333.00 176.30 L 348.00 176.30 L 348.00 179.70 L 333.00 179.70 Z " fill="rgb(66, 14, 92)" fill-opacity="1.00" />
+<path d="M 333.00 173.40 L 348.00 173.40 L 348.00 176.80 L 333.00 176.80 Z " fill="rgb(65, 20, 97)" fill-opacity="1.00" />
+<path d="M 333.00 170.50 L 348.00 170.50 L 348.00 173.90 L 333.00 173.90 Z " fill="rgb(65, 27, 101)" fill-opacity="1.00" />
+<path d="M 333.00 167.60 L 348.00 167.60 L 348.00 171.00 L 333.00 171.00 Z " fill="rgb(64, 34, 106)" fill-opacity="1.00" />
+<path d="M 333.00 164.70 L 348.00 164.70 L 348.00 168.10 L 333.00 168.10 Z " fill="rgb(63, 40, 110)" fill-opacity="1.00" />
+<path d="M 333.00 161.80 L 348.00 161.80 L 348.00 165.20 L 333.00 165.20 Z " fill="rgb(62, 47, 115)" fill-opacity="1.00" />
+<path d="M 333.00 158.90 L 348.00 158.90 L 348.00 162.30 L 333.00 162.30 Z " fill="rgb(62, 53, 119)" fill-opacity="1.00" />
+<path d="M 333.00 156.00 L 348.00 156.00 L 348.00 159.40 L 333.00 159.40 Z " fill="rgb(61, 60, 124)" fill-opacity="1.00" />
+<path d="M 333.00 153.10 L 348.00 153.10 L 348.00 156.50 L 333.00 156.50 Z " fill="rgb(60, 67, 128)" fill-opacity="1.00" />
+<path d="M 333.00 150.20 L 348.00 150.20 L 348.00 153.60 L 333.00 153.60 Z " fill="rgb(59, 73, 133)" fill-opacity="1.00" />
+<path d="M 333.00 147.30 L 348.00 147.30 L 348.00 150.70 L 333.00 150.70 Z " fill="rgb(59, 80, 137)" fill-opacity="1.00" />
+<path d="M 333.00 144.40 L 348.00 144.40 L 348.00 147.80 L 333.00 147.80 Z " fill="rgb(57, 85, 139)" fill-opacity="1.00" />
+<path d="M 333.00 141.50 L 348.00 141.50 L 348.00 144.90 L 333.00 144.90 Z " fill="rgb(55, 91, 139)" fill-opacity="1.00" />
+<path d="M 333.00 138.60 L 348.00 138.60 L 348.00 142.00 L 333.00 142.00 Z " fill="rgb(53, 96, 139)" fill-opacity="1.00" />
+<path d="M 333.00 135.70 L 348.00 135.70 L 348.00 139.10 L 333.00 139.10 Z " fill="rgb(50, 101, 139)" fill-opacity="1.00" />
+<path d="M 333.00 132.80 L 348.00 132.80 L 348.00 136.20 L 333.00 136.20 Z " fill="rgb(48, 106, 139)" fill-opacity="1.00" />
+<path d="M 333.00 129.90 L 348.00 129.90 L 348.00 133.30 L 333.00 133.30 Z " fill="rgb(46, 111, 139)" fill-opacity="1.00" />
+<path d="M 333.00 127.00 L 348.00 127.00 L 348.00 130.40 L 333.00 130.40 Z " fill="rgb(44, 116, 140)" fill-opacity="1.00" />
+<path d="M 333.00 124.10 L 348.00 124.10 L 348.00 127.50 L 333.00 127.50 Z " fill="rgb(42, 121, 140)" fill-opacity="1.00" />
+<path d="M 333.00 121.20 L 348.00 121.20 L 348.00 124.60 L 333.00 124.60 Z " fill="rgb(40, 127, 140)" fill-opacity="1.00" />
+<path d="M 333.00 118.30 L 348.00 118.30 L 348.00 121.70 L 333.00 121.70 Z " fill="rgb(38, 132, 140)" fill-opacity="1.00" />
+<path d="M 333.00 115.40 L 348.00 115.40 L 348.00 118.80 L 333.00 118.80 Z " fill="rgb(36, 137, 140)" fill-opacity="1.00" />
+<path d="M 333.00 112.50 L 348.00 112.50 L 348.00 115.90 L 333.00 115.90 Z " fill="rgb(33, 142, 140)" fill-opacity="1.00" />
+<path d="M 333.00 109.60 L 348.00 109.60 L 348.00 113.00 L 333.00 113.00 Z " fill="rgb(35, 147, 139)" fill-opacity="1.00" />
+<path d="M 333.00 106.70 L 348.00 106.70 L 348.00 110.10 L 333.00 110.10 Z " fill="rgb(40, 151, 135)" fill-opacity="1.00" />
+<path d="M 333.00 103.80 L 348.00 103.80 L 348.00 107.20 L 333.00 107.20 Z " fill="rgb(45, 156, 132)" fill-opacity="1.00" />
+<path d="M 333.00 100.90 L 348.00 100.90 L 348.00 104.30 L 333.00 104.30 Z " fill="rgb(50, 161, 128)" fill-opacity="1.00" />
+<path d="M 333.00 98.00 L 348.00 98.00 L 348.00 101.40 L 333.00 101.40 Z " fill="rgb(55, 165, 125)" fill-opacity="1.00" />
+<path d="M 333.00 95.10 L 348.00 95.10 L 348.00 98.50 L 333.00 98.50 Z " fill="rgb(60, 170, 121)" fill-opacity="1.00" />
+<path d="M 333.00 92.20 L 348.00 92.20 L 348.00 95.60 L 333.00 95.60 Z " fill="rgb(65, 174, 118)" fill-opacity="1.00" />
+<path d="M 333.00 89.30 L 348.00 89.30 L 348.00 92.70 L 333.00 92.70 Z " fill="rgb(70, 179, 114)" fill-opacity="1.00" />
+<path d="M 333.00 86.40 L 348.00 86.40 L 348.00 89.80 L 333.00 89.80 Z " fill="rgb(75, 184, 111)" fill-opacity="1.00" />
+<path d="M 333.00 83.50 L 348.00 83.50 L 348.00 86.90 L 333.00 86.90 Z " fill="rgb(80, 188, 107)" fill-opacity="1.00" />
+<path d="M 333.00 80.60 L 348.00 80.60 L 348.00 84.00 L 333.00 84.00 Z " fill="rgb(85, 193, 104)" fill-opacity="1.00" />
+<path d="M 333.00 77.70 L 348.00 77.70 L 348.00 81.10 L 333.00 81.10 Z " fill="rgb(90, 197, 100)" fill-opacity="1.00" />
+<path d="M 333.00 74.80 L 348.00 74.80 L 348.00 78.20 L 333.00 78.20 Z " fill="rgb(97, 201, 96)" fill-opacity="1.00" />
+<path d="M 333.00 71.90 L 348.00 71.90 L 348.00 75.30 L 333.00 75.30 Z " fill="rgb(110, 204, 91)" fill-opacity="1.00" />
+<path d="M 333.00 69.00 L 348.00 69.00 L 348.00 72.40 L 333.00 72.40 Z " fill="rgb(123, 206, 86)" fill-opacity="1.00" />
+<path d="M 333.00 66.10 L 348.00 66.10 L 348.00 69.50 L 333.00 69.50 Z " fill="rgb(136, 209, 81)" fill-opacity="1.00" />
+<path d="M 333.00 63.20 L 348.00 63.20 L 348.00 66.60 L 333.00 66.60 Z " fill="rgb(149, 211, 76)" fill-opacity="1.00" />
+<path d="M 333.00 60.30 L 348.00 60.30 L 348.00 63.70 L 333.00 63.70 Z " fill="rgb(162, 213, 71)" fill-opacity="1.00" />
+<path d="M 333.00 57.40 L 348.00 57.40 L 348.00 60.80 L 333.00 60.80 Z " fill="rgb(175, 216, 66)" fill-opacity="1.00" />
+<path d="M 333.00 54.50 L 348.00 54.50 L 348.00 57.90 L 333.00 57.90 Z " fill="rgb(188, 218, 61)" fill-opacity="1.00" />
+<path d="M 333.00 51.60 L 348.00 51.60 L 348.00 55.00 L 333.00 55.00 Z " fill="rgb(201, 221, 56)" fill-opacity="1.00" />
+<path d="M 333.00 48.70 L 348.00 48.70 L 348.00 52.10 L 333.00 52.10 Z " fill="rgb(214, 223, 51)" fill-opacity="1.00" />
+<path d="M 333.00 45.80 L 348.00 45.80 L 348.00 49.20 L 333.00 49.20 Z " fill="rgb(227, 226, 46)" fill-opacity="1.00" />
+<path d="M 333.00 42.90 L 348.00 42.90 L 348.00 46.30 L 333.00 46.30 Z " fill="rgb(240, 228, 41)" fill-opacity="1.00" />
+<path d="M 333.00 40.00 L 348.00 40.00 L 348.00 43.40 L 333.00 43.40 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<path d="M 333.00 40.00 L 348.00 40.00 L 348.00 185.00 L 333.00 185.00 Z " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="353" y="40" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="hanging">1</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="353" y="185" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="alphabetic">0</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="353" y="15" fill="rgb(255, 255, 255)" font-size="14" text-anchor="middle" dominant-baseline="hanging">Count</text>
+</svg>
+## Histogram Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 323.00 5.00 L 383.00 5.00 L 383.00 205.00 L 323.00 205.00 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 333.00 182.10 L 348.00 182.10 L 348.00 185.50 L 333.00 185.50 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<path d="M 333.00 179.20 L 348.00 179.20 L 348.00 182.60 L 333.00 182.60 Z " fill="rgb(67, 7, 88)" fill-opacity="1.00" />
+<path d="M 333.00 176.30 L 348.00 176.30 L 348.00 179.70 L 333.00 179.70 Z " fill="rgb(66, 14, 92)" fill-opacity="1.00" />
+<path d="M 333.00 173.40 L 348.00 173.40 L 348.00 176.80 L 333.00 176.80 Z " fill="rgb(65, 20, 97)" fill-opacity="1.00" />
+<path d="M 333.00 170.50 L 348.00 170.50 L 348.00 173.90 L 333.00 173.90 Z " fill="rgb(65, 27, 101)" fill-opacity="1.00" />
+<path d="M 333.00 167.60 L 348.00 167.60 L 348.00 171.00 L 333.00 171.00 Z " fill="rgb(64, 34, 106)" fill-opacity="1.00" />
+<path d="M 333.00 164.70 L 348.00 164.70 L 348.00 168.10 L 333.00 168.10 Z " fill="rgb(63, 40, 110)" fill-opacity="1.00" />
+<path d="M 333.00 161.80 L 348.00 161.80 L 348.00 165.20 L 333.00 165.20 Z " fill="rgb(62, 47, 115)" fill-opacity="1.00" />
+<path d="M 333.00 158.90 L 348.00 158.90 L 348.00 162.30 L 333.00 162.30 Z " fill="rgb(62, 53, 119)" fill-opacity="1.00" />
+<path d="M 333.00 156.00 L 348.00 156.00 L 348.00 159.40 L 333.00 159.40 Z " fill="rgb(61, 60, 124)" fill-opacity="1.00" />
+<path d="M 333.00 153.10 L 348.00 153.10 L 348.00 156.50 L 333.00 156.50 Z " fill="rgb(60, 67, 128)" fill-opacity="1.00" />
+<path d="M 333.00 150.20 L 348.00 150.20 L 348.00 153.60 L 333.00 153.60 Z " fill="rgb(59, 73, 133)" fill-opacity="1.00" />
+<path d="M 333.00 147.30 L 348.00 147.30 L 348.00 150.70 L 333.00 150.70 Z " fill="rgb(59, 80, 137)" fill-opacity="1.00" />
+<path d="M 333.00 144.40 L 348.00 144.40 L 348.00 147.80 L 333.00 147.80 Z " fill="rgb(57, 85, 139)" fill-opacity="1.00" />
+<path d="M 333.00 141.50 L 348.00 141.50 L 348.00 144.90 L 333.00 144.90 Z " fill="rgb(55, 91, 139)" fill-opacity="1.00" />
+<path d="M 333.00 138.60 L 348.00 138.60 L 348.00 142.00 L 333.00 142.00 Z " fill="rgb(53, 96, 139)" fill-opacity="1.00" />
+<path d="M 333.00 135.70 L 348.00 135.70 L 348.00 139.10 L 333.00 139.10 Z " fill="rgb(50, 101, 139)" fill-opacity="1.00" />
+<path d="M 333.00 132.80 L 348.00 132.80 L 348.00 136.20 L 333.00 136.20 Z " fill="rgb(48, 106, 139)" fill-opacity="1.00" />
+<path d="M 333.00 129.90 L 348.00 129.90 L 348.00 133.30 L 333.00 133.30 Z " fill="rgb(46, 111, 139)" fill-opacity="1.00" />
+<path d="M 333.00 127.00 L 348.00 127.00 L 348.00 130.40 L 333.00 130.40 Z " fill="rgb(44, 116, 140)" fill-opacity="1.00" />
+<path d="M 333.00 124.10 L 348.00 124.10 L 348.00 127.50 L 333.00 127.50 Z " fill="rgb(42, 121, 140)" fill-opacity="1.00" />
+<path d="M 333.00 121.20 L 348.00 121.20 L 348.00 124.60 L 333.00 124.60 Z " fill="rgb(40, 127, 140)" fill-opacity="1.00" />
+<path d="M 333.00 118.30 L 348.00 118.30 L 348.00 121.70 L 333.00 121.70 Z " fill="rgb(38, 132, 140)" fill-opacity="1.00" />
+<path d="M 333.00 115.40 L 348.00 115.40 L 348.00 118.80 L 333.00 118.80 Z " fill="rgb(36, 137, 140)" fill-opacity="1.00" />
+<path d="M 333.00 112.50 L 348.00 112.50 L 348.00 115.90 L 333.00 115.90 Z " fill="rgb(33, 142, 140)" fill-opacity="1.00" />
+<path d="M 333.00 109.60 L 348.00 109.60 L 348.00 113.00 L 333.00 113.00 Z " fill="rgb(35, 147, 139)" fill-opacity="1.00" />
+<path d="M 333.00 106.70 L 348.00 106.70 L 348.00 110.10 L 333.00 110.10 Z " fill="rgb(40, 151, 135)" fill-opacity="1.00" />
+<path d="M 333.00 103.80 L 348.00 103.80 L 348.00 107.20 L 333.00 107.20 Z " fill="rgb(45, 156, 132)" fill-opacity="1.00" />
+<path d="M 333.00 100.90 L 348.00 100.90 L 348.00 104.30 L 333.00 104.30 Z " fill="rgb(50, 161, 128)" fill-opacity="1.00" />
+<path d="M 333.00 98.00 L 348.00 98.00 L 348.00 101.40 L 333.00 101.40 Z " fill="rgb(55, 165, 125)" fill-opacity="1.00" />
+<path d="M 333.00 95.10 L 348.00 95.10 L 348.00 98.50 L 333.00 98.50 Z " fill="rgb(60, 170, 121)" fill-opacity="1.00" />
+<path d="M 333.00 92.20 L 348.00 92.20 L 348.00 95.60 L 333.00 95.60 Z " fill="rgb(65, 174, 118)" fill-opacity="1.00" />
+<path d="M 333.00 89.30 L 348.00 89.30 L 348.00 92.70 L 333.00 92.70 Z " fill="rgb(70, 179, 114)" fill-opacity="1.00" />
+<path d="M 333.00 86.40 L 348.00 86.40 L 348.00 89.80 L 333.00 89.80 Z " fill="rgb(75, 184, 111)" fill-opacity="1.00" />
+<path d="M 333.00 83.50 L 348.00 83.50 L 348.00 86.90 L 333.00 86.90 Z " fill="rgb(80, 188, 107)" fill-opacity="1.00" />
+<path d="M 333.00 80.60 L 348.00 80.60 L 348.00 84.00 L 333.00 84.00 Z " fill="rgb(85, 193, 104)" fill-opacity="1.00" />
+<path d="M 333.00 77.70 L 348.00 77.70 L 348.00 81.10 L 333.00 81.10 Z " fill="rgb(90, 197, 100)" fill-opacity="1.00" />
+<path d="M 333.00 74.80 L 348.00 74.80 L 348.00 78.20 L 333.00 78.20 Z " fill="rgb(97, 201, 96)" fill-opacity="1.00" />
+<path d="M 333.00 71.90 L 348.00 71.90 L 348.00 75.30 L 333.00 75.30 Z " fill="rgb(110, 204, 91)" fill-opacity="1.00" />
+<path d="M 333.00 69.00 L 348.00 69.00 L 348.00 72.40 L 333.00 72.40 Z " fill="rgb(123, 206, 86)" fill-opacity="1.00" />
+<path d="M 333.00 66.10 L 348.00 66.10 L 348.00 69.50 L 333.00 69.50 Z " fill="rgb(136, 209, 81)" fill-opacity="1.00" />
+<path d="M 333.00 63.20 L 348.00 63.20 L 348.00 66.60 L 333.00 66.60 Z " fill="rgb(149, 211, 76)" fill-opacity="1.00" />
+<path d="M 333.00 60.30 L 348.00 60.30 L 348.00 63.70 L 333.00 63.70 Z " fill="rgb(162, 213, 71)" fill-opacity="1.00" />
+<path d="M 333.00 57.40 L 348.00 57.40 L 348.00 60.80 L 333.00 60.80 Z " fill="rgb(175, 216, 66)" fill-opacity="1.00" />
+<path d="M 333.00 54.50 L 348.00 54.50 L 348.00 57.90 L 333.00 57.90 Z " fill="rgb(188, 218, 61)" fill-opacity="1.00" />
+<path d="M 333.00 51.60 L 348.00 51.60 L 348.00 55.00 L 333.00 55.00 Z " fill="rgb(201, 221, 56)" fill-opacity="1.00" />
+<path d="M 333.00 48.70 L 348.00 48.70 L 348.00 52.10 L 333.00 52.10 Z " fill="rgb(214, 223, 51)" fill-opacity="1.00" />
+<path d="M 333.00 45.80 L 348.00 45.80 L 348.00 49.20 L 333.00 49.20 Z " fill="rgb(227, 226, 46)" fill-opacity="1.00" />
+<path d="M 333.00 42.90 L 348.00 42.90 L 348.00 46.30 L 333.00 46.30 Z " fill="rgb(240, 228, 41)" fill-opacity="1.00" />
+<path d="M 333.00 40.00 L 348.00 40.00 L 348.00 43.40 L 333.00 43.40 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<path d="M 333.00 40.00 L 348.00 40.00 L 348.00 185.00 L 333.00 185.00 Z " stroke="rgb(255, 255, 255)" stroke-width="1" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="353" y="40" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="hanging">1</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="353" y="185" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="alphabetic">0</text>
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="353" y="15" fill="rgb(255, 255, 255)" font-size="14" text-anchor="middle" dominant-baseline="hanging">Frequency</text>
+</svg>
+## Line Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 32.75 L 248.50 32.75 " stroke="rgb(68, 1, 83)" stroke-width="3" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="258.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+<path d="M 228.50 57.75 L 248.50 57.75 " stroke="rgb(32, 145, 141)" stroke-width="3" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="258.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 82.75 L 248.50 82.75 " stroke="rgb(253, 231, 36)" stroke-width="3" stroke-opacity="1.00" fill="none" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="258.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+</svg>
+## Parallel Coordinates Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 25.25 L 243.50 25.25 L 243.50 40.25 L 228.50 40.25 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+<path d="M 228.50 50.25 L 243.50 50.25 L 243.50 65.25 L 228.50 65.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 75.25 L 243.50 75.25 L 243.50 90.25 L 228.50 90.25 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+</svg>
+## Pie Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 25.25 L 243.50 25.25 L 243.50 40.25 L 228.50 40.25 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+<path d="M 228.50 50.25 L 243.50 50.25 L 243.50 65.25 L 228.50 65.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 75.25 L 243.50 75.25 L 243.50 90.25 L 228.50 90.25 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+</svg>
+## Radar Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 25.25 L 243.50 25.25 L 243.50 40.25 L 228.50 40.25 Z " fill="rgb(64, 33, 105)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+<path d="M 228.50 50.25 L 243.50 50.25 L 243.50 65.25 L 228.50 65.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 75.25 L 243.50 75.25 L 243.50 90.25 L 228.50 90.25 Z " fill="rgb(189, 219, 61)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+</svg>
+## Radial Dial Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 25.25 L 243.50 25.25 L 243.50 40.25 L 228.50 40.25 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+<path d="M 228.50 50.25 L 243.50 50.25 L 243.50 65.25 L 228.50 65.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 75.25 L 243.50 75.25 L 243.50 90.25 L 228.50 90.25 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+</svg>
+## Scatter Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 11.50 L 388.50 11.50 L 388.50 81.50 L 218.50 81.50 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 240.50 34.00 A 6.00 6.00 0 1 1 228.50 34.00 A 6.00 6.00 0 1 1 240.50 34.00 Z " fill="rgb(76, 120, 168)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="250.5" y="34" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">G1</text>
+<path d="M 240.50 59.00 A 6.00 6.00 0 1 1 228.50 59.00 A 6.00 6.00 0 1 1 240.50 59.00 Z " fill="rgb(242, 142, 43)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="250.5" y="59" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">G2</text>
+</svg>
+## Stacked Area Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 25.25 L 243.50 25.25 L 243.50 40.25 L 228.50 40.25 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+<path d="M 228.50 50.25 L 243.50 50.25 L 243.50 65.25 L 228.50 65.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 75.25 L 243.50 75.25 L 243.50 90.25 L 228.50 90.25 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+</svg>
+## Stacked Bar Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 11.50 L 388.50 11.50 L 388.50 81.50 L 218.50 81.50 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 26.50 L 243.50 26.50 L 243.50 41.50 L 228.50 41.50 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="34" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">G1</text>
+<path d="M 228.50 51.50 L 243.50 51.50 L 243.50 66.50 L 228.50 66.50 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="59" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">G2</text>
+</svg>
+## Violin Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 10.25 L 388.50 10.25 L 388.50 105.25 L 218.50 105.25 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 228.50 25.25 L 243.50 25.25 L 243.50 40.25 L 228.50 40.25 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="32.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">A</text>
+<path d="M 228.50 50.25 L 243.50 50.25 L 243.50 65.25 L 228.50 65.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="57.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">B</text>
+<path d="M 228.50 75.25 L 243.50 75.25 L 243.50 90.25 L 228.50 90.25 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="253.5" y="82.75" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">C</text>
+</svg>
+## Layered Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 12.75 L 388.50 12.75 L 388.50 57.75 L 218.50 57.75 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 240.50 35.25 A 6.00 6.00 0 1 1 228.50 35.25 A 6.00 6.00 0 1 1 240.50 35.25 Z " fill="rgb(32, 145, 141)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="250.5" y="35.25" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">All Data</text>
+</svg>
+## Scatter Line Plot\n<svg width="400" height="300" viewBox="0 0 400 300" xmlns="http://www.w3.org/2000/svg">
+<path d="M 218.50 11.50 L 388.50 11.50 L 388.50 81.50 L 218.50 81.50 Z " fill="rgb(0, 0, 0)" fill-opacity="0.60" />
+<path d="M 240.50 34.00 A 6.00 6.00 0 1 1 228.50 34.00 A 6.00 6.00 0 1 1 240.50 34.00 Z " fill="rgb(68, 1, 83)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="250.5" y="34" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">G2</text>
+<path d="M 240.50 59.00 A 6.00 6.00 0 1 1 228.50 59.00 A 6.00 6.00 0 1 1 240.50 59.00 Z " fill="rgb(253, 231, 36)" fill-opacity="1.00" />
+<text transform="matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)" x="250.5" y="59" fill="rgb(255, 255, 255)" font-size="14" text-anchor="start" dominant-baseline="central">G1</text>
+</svg>
+

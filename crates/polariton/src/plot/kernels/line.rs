@@ -163,13 +163,18 @@ impl PlotKernel for LinePlotKernel {
 		None
 	}
 
-	fn draw_legend(
+	fn legend_content(
 		&self,
-		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
-		settings: ResolvedPlotSettings,
-	) {
-		draw_line_legend(&self.prepared_data, backend, bounds, settings);
+		settings: &ResolvedPlotSettings,
+	) -> Option<crate::plot::legend::LegendContent> {
+		crate::plot::legend::entries_from_labels_with_sample(
+			self.prepared_data
+				.series
+				.iter()
+				.map(|series| series.name.clone()),
+			settings,
+			crate::plot::legend::LegendSample::LineSample,
+		)
 	}
 
 	fn x_label(&self) -> String {
@@ -178,68 +183,6 @@ impl PlotKernel for LinePlotKernel {
 
 	fn y_label(&self) -> String {
 		self.prepared_data.y_label.clone()
-	}
-}
-
-pub(crate) fn draw_line_legend(
-	prepared_data: &LinePreparedData,
-	backend: &mut dyn PlotBackend,
-	bounds: Rectangle,
-	settings: ResolvedPlotSettings,
-) {
-	let num_series = prepared_data.series.len();
-	if num_series == 0 {
-		return;
-	}
-	let max_rows = settings.max_legend_rows.max(1) as usize;
-	let num_cols = num_series.div_ceil(max_rows);
-	let actual_rows = num_series.min(max_rows);
-	let item_height = 25.0;
-	let legend_padding = 10.0;
-	let line_width = 20.0;
-	let col_width = 150.0;
-	let legend_width = num_cols as f32 * col_width + legend_padding * 2.0;
-	let legend_height = actual_rows as f32 * item_height + legend_padding * 2.0;
-	let x = (bounds.width - legend_width) * settings.legend_x;
-	let y = (bounds.height - legend_height) * settings.legend_y;
-	backend.fill_rectangle(
-		iced::Point::new(x, y),
-		iced::Size::new(legend_width, legend_height),
-		iced::Color {
-			a: 0.6,
-			..settings.chrome.legend_background.iced()
-		},
-	);
-	for (i, series) in prepared_data.series.iter().enumerate() {
-		let color = settings.color_theme.get_color(series.color_t);
-		let col = i / max_rows;
-		let row = i % max_rows;
-		let item_x = x + legend_padding + col as f32 * col_width;
-		let item_y = y + legend_padding + row as f32 * item_height;
-		let stroke = Stroke {
-			style: Style::Solid(color),
-			width: 3.0,
-			..Default::default()
-		};
-		backend.stroke_path(
-			&|builder| {
-				builder.move_to(iced::Point::new(item_x, item_y + item_height / 2.0));
-				builder.line_to(iced::Point::new(
-					item_x + line_width,
-					item_y + item_height / 2.0,
-				));
-			},
-			stroke,
-		);
-		backend.fill_text(iced::widget::canvas::Text {
-			content: series.name.clone(),
-			position: iced::Point::new(item_x + line_width + 10.0, item_y + item_height / 2.0),
-			color: settings.chrome.legend_text.iced(),
-			size: iced::Pixels(settings.legend_size),
-			align_x: iced::alignment::Horizontal::Left.into(),
-			align_y: iced::alignment::Vertical::Center,
-			..Default::default()
-		});
 	}
 }
 

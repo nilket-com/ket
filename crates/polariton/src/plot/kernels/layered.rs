@@ -4,10 +4,8 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings, format_label,
 };
-use crate::plot::kernels::line::{LineMarkRenderer, LinePreparedData, draw_line_legend};
-use crate::plot::kernels::scatter::{
-	ScatterMarkRenderer, ScatterPreparedData, draw_scatter_legend,
-};
+use crate::plot::kernels::line::{LineMarkRenderer, LinePreparedData};
+use crate::plot::kernels::scatter::{ScatterMarkRenderer, ScatterPreparedData};
 use crate::plot::spec::{LayerSettings, NonEmpty, ResolvedLayout};
 use crate::plot::theme::PlotSettings;
 use iced::Rectangle;
@@ -82,19 +80,31 @@ impl LayerRenderer {
 		}
 	}
 
-	fn draw_legend(
+	fn legend_content(
 		&self,
-		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
-		settings: ResolvedPlotSettings,
-	) {
+		settings: &ResolvedPlotSettings,
+	) -> Option<crate::plot::legend::LegendContent> {
 		match self {
-			Self::Line(renderer, _) => {
-				draw_line_legend(&renderer.prepared_data, backend, bounds, settings)
-			}
-			Self::Scatter(renderer, _) => {
-				draw_scatter_legend(&renderer.prepared_data, backend, bounds, settings)
-			}
+			Self::Line(renderer, _) => crate::plot::legend::entries_from_labels_with_sample(
+				renderer
+					.prepared_data
+					.series
+					.iter()
+					.map(|series| series.name.clone()),
+				settings,
+				crate::plot::legend::LegendSample::LineSample,
+			),
+			Self::Scatter(renderer, _) => crate::plot::legend::entries_from_pairs_with_sample(
+				renderer.prepared_data.series.iter().map(|series| {
+					(
+						series.name.clone(),
+						series
+							.resolved_color
+							.unwrap_or_else(|| settings.color_theme.get_color(series.color_t)),
+					)
+				}),
+				crate::plot::legend::LegendSample::PointSample,
+			),
 		}
 	}
 }
@@ -202,13 +212,11 @@ impl PlotKernel for LayeredPlotKernel {
 
 	/// PRODUCT-0013 bridge: the last authored (topmost painted) layer owns the
 	/// temporary, unmerged legend output.
-	fn draw_legend(
+	fn legend_content(
 		&self,
-		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
-		settings: ResolvedPlotSettings,
-	) {
-		self.layers.last().draw_legend(backend, bounds, settings);
+		settings: &ResolvedPlotSettings,
+	) -> Option<crate::plot::legend::LegendContent> {
+		self.layers.last().legend_content(settings)
 	}
 
 	fn x_label(&self) -> String {
