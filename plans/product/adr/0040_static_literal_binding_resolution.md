@@ -1,6 +1,6 @@
 # ADR 0040: static literal binding resolution
 
-Status: proposed 2026-08-06. This record decides one thing: that a recognized
+Status: accepted 2026-08-06. This record decides one thing: that a recognized
 presentation argument may be written as a name bound to a literal, resolved
 statically in the envelope. It authorizes no Rune evaluation, no new element, and
 no change to what any element means once its value is known.
