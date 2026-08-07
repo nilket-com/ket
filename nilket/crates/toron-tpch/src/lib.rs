@@ -5033,6 +5033,9 @@ pub struct TimingAtlasCellOutcome {
 	pub invalid_attempts: Vec<TimingAtlasChild>,
 	/// Inter-child reclamation, recorded separately and never inside query elapsed.
 	pub cleanup_ms: f64,
+	/// Whether any reclamation actually failed, distinct from the cell failing for some
+	/// other reason.
+	pub cleanup_failed: bool,
 	pub failure: Option<String>,
 }
 
@@ -5228,6 +5231,7 @@ pub async fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 		pairs: Vec::new(),
 		invalid_attempts: Vec::new(),
 		cleanup_ms: 0.0,
+		cleanup_failed: false,
 		failure: None,
 	};
 
@@ -5338,6 +5342,7 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 			// namespace is reclaimed like any other. Cleanup is awaited on every path.
 			let cleanup_start = harness.now_ms();
 			if let Err(cleanup_error) = harness.cleanup_child(child_plan).await {
+				outcome.cleanup_failed = true;
 				outcome.failure.get_or_insert_with(|| {
 					format!("cleanup failed, reclamation unproven: {cleanup_error}")
 				});
@@ -5369,6 +5374,7 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 	// namespace survives into the next child's machine state.
 	let cleanup_start = harness.now_ms();
 	if let Err(error) = harness.cleanup_child(child_plan).await {
+		outcome.cleanup_failed = true;
 		// An attempted cleanup is not a successful reclamation. If the namespace may still
 		// be resident, every later child of this cell measures a different machine, so the
 		// cell — and its timing authority — is forfeit.
@@ -5630,6 +5636,12 @@ pub struct CensusTimingAtlasHarness {
 	coordinator: Option<DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport>>,
 	reference_identity: Option<ExecutionIdentityFacts>,
 	last_batches: Option<Vec<RecordBatch>>,
+	/// Retained bytes immediately after setup, captured by the harness that owns setup so a
+	/// caller cannot observe it at the wrong moment.
+	baseline_bytes: Option<u64>,
+	/// Retained bytes observed at teardown, before the workers are dropped — reading after
+	/// teardown would always be zero and prove nothing.
+	final_retained_bytes: Option<u64>,
 	pub residency: TimingAtlasResidencyLog,
 }
 
@@ -5665,6 +5677,8 @@ impl CensusTimingAtlasHarness {
 			coordinator: None,
 			reference_identity: None,
 			last_batches: None,
+			baseline_bytes: None,
+			final_retained_bytes: None,
 			residency: TimingAtlasResidencyLog::default(),
 		})
 	}
@@ -5724,7 +5738,7 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 				.take()
 				.ok_or_else(|| "timing atlas catalog already consumed".to_string())?,
 		);
-		self.coordinator = Some(DistributedQueryCoordinator::new(
+		let coordinator = Some(DistributedQueryCoordinator::new(
 			catalog,
 			registry,
 			coordinator_memory,
@@ -5732,6 +5746,8 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 			execution_census_distributed_planner_config(distributed_budget.memory_per_task),
 			distributed_budget,
 		));
+		self.coordinator = coordinator;
+		self.baseline_bytes = Some(self.resident_partition_bytes());
 		Ok(())
 	}
 
@@ -5823,6 +5839,7 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 	}
 
 	async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
+		self.final_retained_bytes = Some(self.resident_partition_bytes());
 		self.coordinator = None;
 		let workers = std::mem::take(&mut self.workers);
 		shutdown_execution_census_workers(workers).await
@@ -5839,6 +5856,16 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 impl CensusTimingAtlasHarness {
 	/// Bytes the resident partition stores still hold. Read from the live stores, so an
 	/// accumulating namespace shows up rather than being assumed away.
+	/// Retained bytes captured immediately after setup, or zero before setup ran.
+	pub fn baseline_bytes(&self) -> u64 {
+		self.baseline_bytes.unwrap_or(0)
+	}
+
+	/// Retained bytes at teardown, before workers were dropped.
+	pub fn final_retained_bytes(&self) -> u64 {
+		self.final_retained_bytes.unwrap_or(0)
+	}
+
 	pub fn resident_partition_bytes(&self) -> u64 {
 		self.workers
 			.iter()
@@ -5867,6 +5894,9 @@ pub const TIMING_ATLAS_KIND_PAIR: &str = "pair_outcome";
 pub const TIMING_ATLAS_KIND_RESIDENCY: &str = "residency";
 pub const TIMING_ATLAS_KIND_CLEANUP: &str = "cleanup";
 pub const TIMING_ATLAS_KIND_CELL_SUMMARY: &str = "cell_summary";
+/// One receipt-backed overhead component for a cell. Only components carrying a
+/// non-overlap or critical-path justification may enter the additive breakdown.
+pub const TIMING_ATLAS_KIND_ATTRIBUTION: &str = "attribution_component";
 pub const TIMING_ATLAS_KIND_HOST_END: &str = "host_end";
 
 fn json_ratio(ratio: Option<f64>) -> serde_json::Value {
@@ -5984,22 +6014,62 @@ pub struct TimingAtlasReplay {
 	pub cleanup_failures: Vec<String>,
 	pub baseline_violations: Vec<String>,
 	pub distinguished_slower: BTreeSet<String>,
+	/// Cells carrying at least one receipt-backed attribution component.
+	pub cells_with_attribution: BTreeSet<String>,
+	/// Components rejected from the additive breakdown for lacking a non-overlap or
+	/// critical-path justification. They stay in the journal; they just cannot be summed.
+	pub non_additive_components: Vec<String>,
 	pub host_end_quiescent: Option<bool>,
 	pub terminal_seal: bool,
 	pub violations: Vec<String>,
 }
 
 impl TimingAtlasReplay {
-	/// Authority requires the journal itself to support it: full cohort, one exclusion, a
-	/// terminal seal, and no recomputed violation.
+	/// Everything the journal must show for authority *except* the terminal seal. Used when
+	/// deciding what the seal should record: the seal carries the decision, so it cannot be
+	/// a precondition of making it.
+	pub fn supports_authority(&self, conditions: &TimingAuthorityConditions) -> bool {
+		self.withheld_reasons().is_empty() && conditions.granted()
+	}
+
+	/// Why the journal itself withholds authority, independent of host conditions. Timing
+	/// deltas alone do not discharge ADR 538: the dominance fork is decided from
+	/// receipt-backed components, so a journal without them is incomplete evidence rather
+	/// than a lighter form of the same result.
+	pub fn withheld_reasons(&self) -> Vec<String> {
+		let mut reasons = Vec::new();
+		if !self.violations.is_empty() {
+			reasons.push("replay_violations".to_string());
+		}
+		if self.headers != 1 {
+			reasons.push("header_count".to_string());
+		}
+		if self.exclusions.len() != 1 {
+			reasons.push("exclusion_count".to_string());
+		}
+		if self.finalized_cells.len() != timing_atlas_cells().len() {
+			reasons.push("cohort_incomplete".to_string());
+		}
+		if self.host_end_quiescent != Some(true) {
+			reasons.push("host_not_quiescent_at_seal".to_string());
+		}
+		let missing = self
+			.finalized_cells
+			.difference(&self.cells_with_attribution)
+			.count();
+		if missing > 0 {
+			reasons.push(format!("attribution_receipts_missing({missing} cells)"));
+		}
+		if !self.non_additive_components.is_empty() {
+			reasons.push("non_additive_components".to_string());
+		}
+		reasons
+	}
+
+	/// A *published* artifact must additionally carry its terminal seal. This is the check
+	/// for reading an artifact back, not for writing one.
 	pub fn authoritative(&self, conditions: &TimingAuthorityConditions) -> bool {
-		self.violations.is_empty()
-			&& self.headers == 1
-			&& self.exclusions.len() == 1
-			&& self.finalized_cells.len() == timing_atlas_cells().len()
-			&& self.terminal_seal
-			&& self.host_end_quiescent == Some(true)
-			&& conditions.granted()
+		self.supports_authority(conditions) && self.terminal_seal
 	}
 }
 
@@ -6087,6 +6157,29 @@ pub fn timing_atlas_replay(journal: &str) -> TimingAtlasReplay {
 				if row.get("returned_to_baseline") == Some(&serde_json::Value::Bool(false)) {
 					replay.baseline_violations.push(query);
 				}
+			}
+			TIMING_ATLAS_KIND_ATTRIBUTION => {
+				let query = row
+					.get("query")
+					.and_then(|q| q.as_str())
+					.unwrap_or_default()
+					.to_string();
+				let additive = row
+					.get("additive")
+					.and_then(|value| value.as_bool())
+					.unwrap_or(false);
+				let basis = row
+					.get("basis")
+					.and_then(|value| value.as_str())
+					.unwrap_or("");
+				// Only a non-overlap or critical-path basis licenses addition. A stage
+				// duration summed from concurrent tasks measures work, not wall clock.
+				if additive && !matches!(basis, "non_overlapping" | "critical_path") {
+					replay.non_additive_components.push(format!(
+						"{query}: component claims additive with basis {basis}"
+					));
+				}
+				replay.cells_with_attribution.insert(query);
 			}
 			TIMING_ATLAS_KIND_CELL_SUMMARY => summary_rows.push(row.clone()),
 			TIMING_ATLAS_KIND_HOST_END => {
@@ -6298,14 +6391,13 @@ pub async fn run_timing_atlas(
 
 		let mut harness =
 			CensusTimingAtlasHarness::prepare(query, mode, scale_factor, data_root).await?;
-		let baseline_after_setup;
-		let outcome = {
-			harness.setup_cell(query).await?;
-			baseline_after_setup = harness.resident_partition_bytes();
-			let outcome = run_timing_atlas_cell_with(&mut harness, query).await;
-			outcome
-		};
-		let retained = harness.resident_partition_bytes();
+		// The runner owns the cell lifecycle: setting up here as well would construct a
+		// second set of workers and consume the catalog twice.
+		// Boxed: the per-cell future is large, and twenty-one of them inline in one driver
+		// future would live on the stack.
+		let outcome = Box::pin(run_timing_atlas_cell_with(&mut harness, query)).await;
+		let baseline_after_setup = harness.baseline_bytes();
+		let retained = harness.final_retained_bytes();
 
 		for child in outcome
 			.warmups
@@ -6328,7 +6420,7 @@ pub async fn run_timing_atlas(
 		artifact.append_row(&serde_json::json!({
 			"kind": TIMING_ATLAS_KIND_CLEANUP,
 			"query": query,
-			"succeeded": outcome.failure.is_none(),
+			"succeeded": !outcome.cleanup_failed,
 			"returned_to_baseline": retained == baseline_after_setup,
 			"baseline_bytes": baseline_after_setup,
 			"retained_bytes": retained,
@@ -6359,7 +6451,9 @@ pub async fn run_timing_atlas(
 	let journal = std::fs::read_to_string(artifact.partial_path())
 		.map_err(|error| format!("timing atlas reread: {error}"))?;
 	let replay = timing_atlas_replay(&journal);
-	let authoritative = replay.authoritative(&conditions) && conditions.granted();
+	// The seal has not been written yet, so authority is decided on everything else the
+	// journal must show; reading the artifact back later checks the seal too.
+	let authoritative = replay.supports_authority(&conditions);
 
 	artifact.append_seal(&serde_json::json!({
 		"kind": TIMING_ATLAS_SEAL_KIND,
@@ -6378,6 +6472,538 @@ pub async fn run_timing_atlas(
 		));
 	}
 	artifact.publish()
+}
+
+/// The frozen component taxonomy. Shared by both arms so a contribution always compares
+/// like with like, and kept deliberately granular: a `stage` component bracketing several
+/// concurrent operators would bound where cost sits, not what it is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TimingAtlasComponent {
+	Scan,
+	Operator,
+	Shuffle,
+	Dispatch,
+	Transport,
+	Reduction,
+}
+
+impl TimingAtlasComponent {
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::Scan => "scan",
+			Self::Operator => "operator",
+			Self::Shuffle => "shuffle",
+			Self::Dispatch => "dispatch",
+			Self::Transport => "transport",
+			Self::Reduction => "reduction",
+		}
+	}
+
+	pub const ALL: [Self; 6] = [
+		Self::Scan,
+		Self::Operator,
+		Self::Shuffle,
+		Self::Dispatch,
+		Self::Transport,
+		Self::Reduction,
+	];
+
+	/// How this component's local side must be supplied. Three distinct states, because
+	/// collapsing them is exactly how a zero gets invented or a real gap gets reported as a
+	/// defect.
+	pub fn local_pairing(self) -> TimingAtlasLocalPairing {
+		match self {
+			// The local arm genuinely does this work; a missing receipt is a defect.
+			// `shuffle` belongs here on evidence: twenty of twenty-one local plans carry an
+			// `Exchange` and repartition in memory.
+			Self::Scan | Self::Operator | Self::Shuffle => TimingAtlasLocalPairing::Required,
+			// The local arm structurally cannot incur it, so zero is the true value.
+			Self::Transport => TimingAtlasLocalPairing::DeclaredZero,
+			// No semantically equivalent local interval exists. Retained raw as evidence,
+			// but never paired and never allowed to lead — a distributed-only figure is not
+			// a contribution.
+			Self::Dispatch => TimingAtlasLocalPairing::NoLocalEquivalent,
+			// After the elapsed boundary; not a timed component at all.
+			Self::Reduction => TimingAtlasLocalPairing::NotTimed,
+		}
+	}
+
+	pub fn local_counterpart_is_defined_zero(self) -> bool {
+		matches!(self.local_pairing(), TimingAtlasLocalPairing::DeclaredZero)
+	}
+
+	/// Whether this component participates in timed reconciliation and dominance.
+	/// `reduction` happens after the elapsed boundary by construction, so it is metadata
+	/// rather than a contribution — and must not be given a fabricated in-bound zero.
+	pub fn participates_in_timed_attribution(self) -> bool {
+		!matches!(self, Self::Reduction)
+	}
+}
+
+/// How a component's local side is supplied.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingAtlasLocalPairing {
+	/// Both arms must emit a receipt; a missing local side is a defect.
+	Required,
+	/// The local arm structurally cannot incur it, so zero is the true value.
+	DeclaredZero,
+	/// No semantically equivalent local interval exists. Kept as raw evidence, excluded
+	/// from paired contributions and from dominance.
+	NoLocalEquivalent,
+	/// Outside the elapsed boundary entirely.
+	NotTimed,
+}
+
+impl TimingAtlasLocalPairing {
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::Required => "paired",
+			Self::DeclaredZero => "declared_zero_local",
+			Self::NoLocalEquivalent => "no_local_equivalent",
+			Self::NotTimed => "not_timed",
+		}
+	}
+}
+
+/// Why an interval may be added. A sum of concurrent task durations is not a basis: it
+/// measures work, not wall clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimingAtlasBasis {
+	NonOverlapping,
+	CriticalPath,
+	/// Retained as evidence, never added.
+	ConcurrentSpan,
+}
+
+impl TimingAtlasBasis {
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::NonOverlapping => "non_overlapping",
+			Self::CriticalPath => "critical_path",
+			Self::ConcurrentSpan => "concurrent_span",
+		}
+	}
+
+	pub fn admissible(self) -> bool {
+		matches!(self, Self::NonOverlapping | Self::CriticalPath)
+	}
+}
+
+/// One component measurement on one arm of one child.
+#[derive(Debug, Clone)]
+pub struct TimingAtlasComponentReceipt {
+	pub component: TimingAtlasComponent,
+	pub scope: String,
+	pub arm: TimingArm,
+	pub child_query_id: QueryId,
+	pub raw_elapsed_ms: f64,
+	pub basis: TimingAtlasBasis,
+}
+
+/// A component's paired contribution, formed only from a local/distributed pair of receipts
+/// or from a component whose local counterpart is a declared zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimingAtlasContribution {
+	pub component: TimingAtlasComponent,
+	pub local_ms: f64,
+	pub distributed_ms: f64,
+	pub contribution_ms: f64,
+	pub basis: TimingAtlasBasis,
+	pub admissible: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TimingAtlasPairingError {
+	MissingLocalCounterpart(TimingAtlasComponent),
+	MissingDistributedReceipt(TimingAtlasComponent),
+	BasisDisagreement(TimingAtlasComponent),
+}
+
+/// Pair receipts into contributions. A distributed receipt with no local counterpart is an
+/// error unless the taxonomy declares that counterpart zero — silently substituting zero
+/// would let an unimplemented probe claim the whole delta.
+pub fn timing_atlas_contributions(
+	receipts: &[TimingAtlasComponentReceipt],
+) -> Result<Vec<TimingAtlasContribution>, TimingAtlasPairingError> {
+	let mut contributions = Vec::new();
+	for component in TimingAtlasComponent::ALL {
+		if !component.participates_in_timed_attribution() {
+			continue;
+		}
+		let local = receipts
+			.iter()
+			.find(|receipt| receipt.component == component && receipt.arm == TimingArm::Local);
+		let distributed = receipts.iter().find(|receipt| {
+			receipt.component == component && receipt.arm == TimingArm::Distributed
+		});
+		let Some(distributed) = distributed else {
+			if local.is_some() {
+				return Err(TimingAtlasPairingError::MissingDistributedReceipt(
+					component,
+				));
+			}
+			continue;
+		};
+		let local_ms = match (local, component.local_pairing()) {
+			(Some(local), _) => {
+				if local.basis != distributed.basis {
+					return Err(TimingAtlasPairingError::BasisDisagreement(component));
+				}
+				local.raw_elapsed_ms
+			}
+			(None, TimingAtlasLocalPairing::DeclaredZero) => 0.0,
+			// Retained raw elsewhere; never a contribution, so it cannot lead a cell.
+			(None, TimingAtlasLocalPairing::NoLocalEquivalent) => continue,
+			(None, TimingAtlasLocalPairing::NotTimed) => continue,
+			(None, TimingAtlasLocalPairing::Required) => {
+				return Err(TimingAtlasPairingError::MissingLocalCounterpart(component));
+			}
+		};
+		contributions.push(TimingAtlasContribution {
+			component,
+			local_ms,
+			distributed_ms: distributed.raw_elapsed_ms,
+			contribution_ms: distributed.raw_elapsed_ms - local_ms,
+			basis: distributed.basis,
+			admissible: distributed.basis.admissible(),
+		});
+	}
+	Ok(contributions)
+}
+
+/// Whether one arm's admissible components plus its unattributed remainder reconcile to that
+/// arm's measured elapsed.
+pub fn timing_atlas_arm_reconciles(
+	receipts: &[TimingAtlasComponentReceipt],
+	arm: TimingArm,
+	measured_elapsed_ms: f64,
+	unattributed_ms: f64,
+) -> bool {
+	let attributed: f64 = receipts
+		.iter()
+		.filter(|receipt| receipt.arm == arm && receipt.basis.admissible())
+		.map(|receipt| receipt.raw_elapsed_ms)
+		.sum();
+	(attributed + unattributed_ms - measured_elapsed_ms).abs() < 1e-6
+}
+
+/// The leading component for a cell: at least half the cell's median paired delta, counted
+/// only from admissible paired contributions.
+pub fn timing_atlas_leading_component(
+	contributions: &[TimingAtlasContribution],
+	median_paired_delta_ms: f64,
+) -> Option<TimingAtlasComponent> {
+	if median_paired_delta_ms <= 0.0 {
+		return None;
+	}
+	contributions
+		.iter()
+		.filter(|contribution| contribution.admissible)
+		.find(|contribution| contribution.contribution_ms >= 0.5 * median_paired_delta_ms)
+		.map(|contribution| contribution.component)
+}
+
+/// One task in the stage DAG, with its wall clock partitioned into component portions.
+/// The partition is `non_overlapping` *within this task* — that is what the phase counters
+/// establish — and says nothing about tasks running beside it.
+#[derive(Debug, Clone)]
+pub struct TimingAtlasTaskNode {
+	pub stage_id: u32,
+	pub task_id: u32,
+	pub wall_ms: f64,
+	pub components: Vec<(TimingAtlasComponent, f64)>,
+	/// Immediate predecessors, as (stage, task).
+	pub upstream: Vec<(u32, u32)>,
+}
+
+impl TimingAtlasTaskNode {
+	pub fn key(&self) -> (u32, u32) {
+		(self.stage_id, self.task_id)
+	}
+}
+
+/// The selected path and the components attributable along it. Persisted so replay can walk
+/// every edge and re-derive every figure.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TimingAtlasCriticalPath {
+	pub path: Vec<(u32, u32)>,
+	pub total_wall_ms: f64,
+	pub components: BTreeMap<String, f64>,
+}
+
+/// Derive a per-cell figure by critical path through the stage DAG.
+///
+/// The rule that matters: **one path is selected by total wall duration, and only that
+/// path's component portions are attributed.** Taking each component's maximum across tasks
+/// independently and summing those maxima would recreate exactly the cross-task
+/// overcounting the task-scope partition was meant to avoid — it would describe a task that
+/// never existed.
+pub fn timing_atlas_critical_path(
+	nodes: &[TimingAtlasTaskNode],
+) -> Option<TimingAtlasCriticalPath> {
+	if nodes.is_empty() {
+		return None;
+	}
+	let index: BTreeMap<(u32, u32), &TimingAtlasTaskNode> =
+		nodes.iter().map(|node| (node.key(), node)).collect();
+
+	// Longest-wall path ending at each node, memoized over the DAG.
+	fn best_path(
+		key: (u32, u32),
+		index: &BTreeMap<(u32, u32), &TimingAtlasTaskNode>,
+		memo: &mut BTreeMap<(u32, u32), (f64, Vec<(u32, u32)>)>,
+		visiting: &mut BTreeSet<(u32, u32)>,
+	) -> (f64, Vec<(u32, u32)>) {
+		if let Some(found) = memo.get(&key) {
+			return found.clone();
+		}
+		// A cycle is not a DAG; refuse rather than loop.
+		if !visiting.insert(key) {
+			return (0.0, Vec::new());
+		}
+		let Some(node) = index.get(&key) else {
+			visiting.remove(&key);
+			return (0.0, Vec::new());
+		};
+		let mut best = (0.0_f64, Vec::new());
+		for upstream in &node.upstream {
+			let candidate = best_path(*upstream, index, memo, visiting);
+			if candidate.0 > best.0 {
+				best = candidate;
+			}
+		}
+		let mut path = best.1;
+		path.push(key);
+		let total = best.0 + node.wall_ms;
+		visiting.remove(&key);
+		memo.insert(key, (total, path.clone()));
+		(total, path)
+	}
+
+	let mut memo = BTreeMap::new();
+	let mut selected: Option<(f64, Vec<(u32, u32)>)> = None;
+	for node in nodes {
+		let mut visiting = BTreeSet::new();
+		let candidate = best_path(node.key(), &index, &mut memo, &mut visiting);
+		if selected
+			.as_ref()
+			.is_none_or(|current| candidate.0 > current.0)
+		{
+			selected = Some(candidate);
+		}
+	}
+	let (total_wall_ms, path) = selected?;
+
+	// Components come only from nodes on the selected path.
+	let mut components: BTreeMap<String, f64> = BTreeMap::new();
+	for key in &path {
+		let Some(node) = index.get(key) else { continue };
+		for (component, portion) in &node.components {
+			*components
+				.entry(component.label().to_string())
+				.or_insert(0.0) += portion;
+		}
+	}
+	Some(TimingAtlasCriticalPath {
+		path,
+		total_wall_ms,
+		components,
+	})
+}
+
+/// A component receipt bound to an exact task in the stage DAG. Eligibility is a claim the
+/// validator checks, never a property the emitter can assert on its own.
+#[derive(Debug, Clone)]
+pub struct TimingAtlasPathBoundReceipt {
+	pub component: TimingAtlasComponent,
+	pub arm: TimingArm,
+	pub stage_id: u32,
+	pub task_id: u32,
+	pub scope: String,
+	pub basis: TimingAtlasBasis,
+	pub raw_elapsed_ms: f64,
+	/// What the emitter claimed. Recomputed and compared; never trusted.
+	pub emitted_contribution_ms: Option<f64>,
+	pub eligible: bool,
+}
+
+impl TimingAtlasPathBoundReceipt {
+	pub fn node(&self) -> (u32, u32) {
+		(self.stage_id, self.task_id)
+	}
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct TimingAtlasPathValidation {
+	pub violations: Vec<String>,
+	/// Recomputed from raw values on the selected path — never copied from an emitted figure.
+	pub contributions: Vec<TimingAtlasContribution>,
+	pub off_path_retained: usize,
+	pub selected_wall_ms: f64,
+	pub remainder_ms: f64,
+}
+
+impl TimingAtlasPathValidation {
+	pub fn dominance_allowed(&self) -> bool {
+		self.violations.is_empty()
+	}
+}
+
+/// Validate receipts against the persisted path, then recompute every figure from raw
+/// values. An eligible receipt from a task that was not on the selected path is rejected:
+/// otherwise a component from a road not taken could lead a cell.
+pub fn timing_atlas_validate_path_bound_receipts(
+	nodes: &[TimingAtlasTaskNode],
+	path: &[(u32, u32)],
+	receipts: &[TimingAtlasPathBoundReceipt],
+	measured_elapsed_ms: f64,
+) -> TimingAtlasPathValidation {
+	let mut validation = TimingAtlasPathValidation::default();
+	let index: BTreeMap<(u32, u32), &TimingAtlasTaskNode> =
+		nodes.iter().map(|node| (node.key(), node)).collect();
+	let on_path: BTreeSet<(u32, u32)> = path.iter().copied().collect();
+
+	if path.is_empty() {
+		validation
+			.violations
+			.push("no selected path was persisted".to_string());
+		return validation;
+	}
+
+	for window in path.windows(2) {
+		let Some(successor) = index.get(&window[1]) else {
+			validation
+				.violations
+				.push(format!("path node {:?} is not in the graph", window[1]));
+			continue;
+		};
+		if !successor.upstream.contains(&window[0]) {
+			validation.violations.push(format!(
+				"persisted edge {:?} -> {:?} is not an edge in the stage graph",
+				window[0], window[1]
+			));
+		}
+	}
+
+	validation.selected_wall_ms = path
+		.iter()
+		.filter_map(|key| index.get(key))
+		.map(|node| node.wall_ms)
+		.sum();
+
+	let mut eligible: Vec<&TimingAtlasPathBoundReceipt> = Vec::new();
+	for receipt in receipts {
+		if !receipt.eligible {
+			validation.off_path_retained += 1;
+			continue;
+		}
+		if !on_path.contains(&receipt.node()) {
+			validation.violations.push(format!(
+				"{} receipt claims eligibility from task {:?}, which is not on the selected path",
+				receipt.component.label(),
+				receipt.node()
+			));
+			continue;
+		}
+		if !receipt.basis.admissible() {
+			validation.violations.push(format!(
+				"{} receipt claims eligibility with inadmissible basis {}",
+				receipt.component.label(),
+				receipt.basis.label()
+			));
+			continue;
+		}
+		eligible.push(receipt);
+	}
+
+	let mut seen: BTreeSet<(&str, &str)> = BTreeSet::new();
+	for receipt in &eligible {
+		if !seen.insert((receipt.component.label(), receipt.arm.label())) {
+			validation.violations.push(format!(
+				"{} has more than one eligible {} receipt",
+				receipt.component.label(),
+				receipt.arm.label()
+			));
+		}
+	}
+
+	for component in TimingAtlasComponent::ALL {
+		let local = eligible
+			.iter()
+			.find(|receipt| receipt.component == component && receipt.arm == TimingArm::Local);
+		let distributed = eligible.iter().find(|receipt| {
+			receipt.component == component && receipt.arm == TimingArm::Distributed
+		});
+		let Some(distributed) = distributed else {
+			continue;
+		};
+		let local_ms = match (local, component.local_pairing()) {
+			(Some(local), _) => {
+				if local.basis != distributed.basis {
+					validation
+						.violations
+						.push(format!("{} basis disagrees across arms", component.label()));
+					continue;
+				}
+				if local.scope != distributed.scope {
+					validation.violations.push(format!(
+						"{} scope disagrees across arms: {} vs {}",
+						component.label(),
+						local.scope,
+						distributed.scope
+					));
+					continue;
+				}
+				local.raw_elapsed_ms
+			}
+			(None, TimingAtlasLocalPairing::DeclaredZero) => 0.0,
+			(None, TimingAtlasLocalPairing::NoLocalEquivalent) => {
+				validation.violations.push(format!(
+					"{} has no local equivalent and must not be eligible",
+					component.label()
+				));
+				continue;
+			}
+			(None, TimingAtlasLocalPairing::NotTimed) => continue,
+			(None, TimingAtlasLocalPairing::Required) => {
+				validation.violations.push(format!(
+					"{} is missing its local counterpart",
+					component.label()
+				));
+				continue;
+			}
+		};
+		let recomputed = distributed.raw_elapsed_ms - local_ms;
+		if let Some(claimed) = distributed.emitted_contribution_ms
+			&& (claimed - recomputed).abs() > 1e-9
+		{
+			validation.violations.push(format!(
+				"{} emitted contribution {claimed} disagrees with recomputed {recomputed}",
+				component.label()
+			));
+		}
+		validation.contributions.push(TimingAtlasContribution {
+			component,
+			local_ms,
+			distributed_ms: distributed.raw_elapsed_ms,
+			contribution_ms: recomputed,
+			basis: distributed.basis,
+			admissible: true,
+		});
+	}
+
+	let attributed: f64 = validation
+		.contributions
+		.iter()
+		.map(|contribution| contribution.distributed_ms)
+		.sum();
+	validation.remainder_ms = measured_elapsed_ms - attributed;
+	if validation.remainder_ms < -1e-9 {
+		validation.violations.push(format!(
+			"attributed {attributed} exceeds measured {measured_elapsed_ms}"
+		));
+	}
+	validation
 }
 
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
@@ -20392,6 +21018,7 @@ mod adr538_timing_atlas_failure_paths {
 			pairs: Vec::new(),
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
+			cleanup_failed: false,
 			failure: None,
 		};
 		assert!(!outcome.finalized());
@@ -20579,6 +21206,7 @@ mod adr538_timing_atlas_execution {
 			pairs: (0..TIMING_ATLAS_MEASURED_PAIRS).map(pair).collect(),
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
+			cleanup_failed: false,
 			failure: None,
 		};
 		assert!(base.finalized());
@@ -20641,6 +21269,7 @@ mod adr538_timing_atlas_execution {
 			}],
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
+			cleanup_failed: false,
 			failure: None,
 		};
 		assert!(outcome.setup_ms > 0.0 && outcome.teardown_ms > 0.0);
@@ -21381,6 +22010,14 @@ mod adr538_timing_atlas_journal_replay {
 				"kind": TIMING_ATLAS_KIND_RESIDENCY, "query": query, "stable": true
 			}));
 			rows.push(serde_json::json!({
+				"kind": TIMING_ATLAS_KIND_ATTRIBUTION,
+				"query": query,
+				"component": "dispatch",
+				"additive": true,
+				"basis": "critical_path",
+				"contribution_ms": 6.0,
+			}));
+			rows.push(serde_json::json!({
 				"kind": TIMING_ATLAS_KIND_CELL_SUMMARY,
 				"query": query,
 				"finalized": pairs_per_cell == TIMING_ATLAS_MEASURED_PAIRS,
@@ -21540,5 +22177,1210 @@ mod adr538_timing_atlas_journal_replay {
 		assert_eq!(row["ratio"], serde_json::Value::Null);
 		assert!(!row.to_string().contains("inf"));
 		assert!(!row.to_string().contains("NaN"));
+	}
+
+	/// The seal records the authority decision, so it cannot also be required to make it.
+	/// A journal missing only its seal must still *support* authority, while a published
+	/// artifact must carry one.
+	#[test]
+	fn seal_is_required_to_read_back_but_not_to_decide() {
+		let cells = timing_atlas_cells();
+		let mut rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		rows.pop(); // drop the seal, as it stands when the decision is made
+		let replay = timing_atlas_replay(&render(&rows));
+		assert!(
+			replay.supports_authority(&granted()),
+			"a complete journal supports authority before its seal exists: {:?}",
+			replay.violations
+		);
+		assert!(
+			!replay.authoritative(&granted()),
+			"but it is not a published artifact until sealed"
+		);
+	}
+
+	/// The defect this veto closes: the first authoritative run published complete timing
+	/// for all 21 cells with zero component receipts, so the dominance fork it was meant to
+	/// decide could not be evaluated. Timing deltas alone must withhold authority.
+	#[test]
+	fn complete_timing_without_component_receipts_is_withheld() {
+		let cells = timing_atlas_cells();
+		// Exactly the first authoritative run's shape: full timing, no component receipts.
+		let rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS)
+			.into_iter()
+			.filter(|row| {
+				row.get("kind").and_then(|kind| kind.as_str())
+					!= Some(TIMING_ATLAS_KIND_ATTRIBUTION)
+			})
+			.collect::<Vec<_>>();
+		let replay = timing_atlas_replay(&render(&rows));
+		assert_eq!(
+			replay.finalized_cells.len(),
+			21,
+			"timing itself is complete"
+		);
+		assert!(replay.violations.is_empty(), "and internally consistent");
+		assert!(
+			replay
+				.withheld_reasons()
+				.iter()
+				.any(|reason| reason.starts_with("attribution_receipts_missing")),
+			"but authority is withheld for missing receipts: {:?}",
+			replay.withheld_reasons()
+		);
+		assert!(!replay.supports_authority(&granted()));
+	}
+
+	/// A component claiming additivity without a non-overlap or critical-path basis cannot
+	/// enter the breakdown, and forfeits authority for the run.
+	#[test]
+	fn non_additive_components_cannot_produce_a_dominance_verdict() {
+		let cells = timing_atlas_cells();
+		let mut rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		for query in &cells {
+			rows.insert(
+				2,
+				serde_json::json!({
+					"kind": TIMING_ATLAS_KIND_ATTRIBUTION,
+					"query": query,
+					"component": "stage_durations",
+					"additive": true,
+					// Summing concurrent task durations measures work, not wall clock.
+					"basis": "concurrent_task_sum",
+					"contribution_ms": 100.0,
+				}),
+			);
+		}
+		let replay = timing_atlas_replay(&render(&rows));
+		assert!(
+			!replay.non_additive_components.is_empty(),
+			"a concurrent-sum basis must be rejected"
+		);
+		assert!(
+			replay
+				.withheld_reasons()
+				.contains(&"non_additive_components".to_string())
+		);
+		assert!(!replay.supports_authority(&granted()));
+	}
+
+	/// Only receipt-backed components with an admissible basis satisfy the veto.
+	#[test]
+	fn receipt_backed_components_satisfy_the_attribution_requirement() {
+		let cells = timing_atlas_cells();
+		let mut rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
+		for query in &cells {
+			rows.insert(
+				2,
+				serde_json::json!({
+					"kind": TIMING_ATLAS_KIND_ATTRIBUTION,
+					"query": query,
+					"component": "dispatch",
+					"additive": true,
+					"basis": "critical_path",
+					"contribution_ms": 12.0,
+				}),
+			);
+		}
+		let replay = timing_atlas_replay(&render(&rows));
+		assert_eq!(replay.cells_with_attribution.len(), 21);
+		assert!(replay.non_additive_components.is_empty());
+		assert!(
+			replay.withheld_reasons().is_empty(),
+			"reasons: {:?}",
+			replay.withheld_reasons()
+		);
+		assert!(replay.supports_authority(&granted()));
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_driver {
+	use super::*;
+
+	/// End-to-end through the real driver at a small scale. The unit tests all passed while
+	/// the driver constructed workers twice and consumed the catalog before the first child,
+	/// because nothing exercised `run_timing_atlas` itself.
+	/// Deep binds need an explicit stack; run on a dedicated 64 MB thread.
+	#[test]
+	fn driver_produces_a_journal_that_replays_without_violations() {
+		let root = std::env::temp_dir().join(format!("adr538-driver-{}", std::process::id()));
+		let _ = std::fs::remove_dir_all(&root);
+		let canonical = root.join("timing_atlas.jsonl");
+
+		let journal = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn({
+				let canonical = canonical.clone();
+				move || {
+					// Current-thread runtime: deep multi-join binds (q10+) then run on this
+					// thread's 64 MB stack rather than on runtime workers, whose stacks are
+					// independent of the spawning thread's.
+					let runtime = tokio::runtime::Builder::new_current_thread()
+						.enable_all()
+						.build()
+						.expect("runtime");
+					runtime.block_on(async {
+						let _ =
+							run_timing_atlas("strict", 0.01, Path::new("unused"), &canonical).await;
+						let partial = PathBuf::from(format!("{}.partial", canonical.display()));
+						std::fs::read_to_string(&partial)
+							.or_else(|_| std::fs::read_to_string(&canonical))
+							.unwrap_or_default()
+					})
+				}
+			})
+			.expect("spawn")
+			.join()
+			.expect("join");
+
+		assert!(!journal.is_empty(), "the driver must write a journal");
+		let replay = timing_atlas_replay(&journal);
+
+		// The driver refuses to start on a non-quiescent host, so this test asserts the
+		// behavior appropriate to the machine it runs on rather than silently depending on
+		// whether a local deployment happens to be up.
+		if journal.contains("host_not_quiescent") {
+			assert_eq!(
+				replay.finalized_cells.len(),
+				0,
+				"an aborted run measures nothing"
+			);
+			assert!(
+				!replay.supports_authority(&TimingAuthorityConditions {
+					clean_build: true,
+					full_hash_dataset: true,
+					quiescent_host: false,
+					protocol_unmodified: true,
+					complete_cohort: false,
+				}),
+				"and cannot support authority"
+			);
+		} else {
+			assert_eq!(
+				replay.finalized_cells.len(),
+				timing_atlas_cells().len(),
+				"every cell must finalize; violations: {:?}",
+				replay.violations
+			);
+			assert!(
+				replay.violations.is_empty(),
+				"the journal must replay without violations: {:?}",
+				replay.violations
+			);
+			assert_eq!(replay.exclusions, vec!["q15".to_string()]);
+		}
+		let _ = std::fs::remove_dir_all(&root);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_component_taxonomy {
+	use super::*;
+
+	fn receipt(
+		component: TimingAtlasComponent,
+		arm: TimingArm,
+		elapsed: f64,
+		basis: TimingAtlasBasis,
+	) -> TimingAtlasComponentReceipt {
+		TimingAtlasComponentReceipt {
+			component,
+			scope: format!("{}::{}", component.label(), arm.label()),
+			arm,
+			child_query_id: QueryId::new(),
+			raw_elapsed_ms: elapsed,
+			basis,
+		}
+	}
+
+	/// Admissible components plus the unattributed remainder reconcile each arm's measured
+	/// elapsed — per arm, not pooled.
+	#[test]
+	fn admissible_components_reconcile_each_arm() {
+		let receipts = vec![
+			receipt(
+				TimingAtlasComponent::Scan,
+				TimingArm::Local,
+				40.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Local,
+				30.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+			receipt(
+				TimingAtlasComponent::Scan,
+				TimingArm::Distributed,
+				45.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Distributed,
+				35.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+			receipt(
+				TimingAtlasComponent::Transport,
+				TimingArm::Distributed,
+				20.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+		];
+		assert!(timing_atlas_arm_reconciles(
+			&receipts,
+			TimingArm::Local,
+			100.0,
+			30.0
+		));
+		assert!(timing_atlas_arm_reconciles(
+			&receipts,
+			TimingArm::Distributed,
+			120.0,
+			20.0
+		));
+		assert!(
+			!timing_atlas_arm_reconciles(&receipts, TimingArm::Local, 100.0, 0.0),
+			"a remainder that does not close the arm must fail"
+		);
+	}
+
+	/// A concurrent span is retained as evidence but never enters the additive breakdown,
+	/// unless the receipt explicitly claims a critical path.
+	#[test]
+	fn overlapping_spans_are_rejected_unless_marked_critical_path() {
+		let concurrent = vec![
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Local,
+				10.0,
+				TimingAtlasBasis::ConcurrentSpan,
+			),
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Distributed,
+				90.0,
+				TimingAtlasBasis::ConcurrentSpan,
+			),
+		];
+		let contributions = timing_atlas_contributions(&concurrent).expect("pairs");
+		assert_eq!(contributions.len(), 1);
+		assert!(
+			!contributions[0].admissible,
+			"a concurrent span measures work, not wall clock"
+		);
+		assert_eq!(
+			timing_atlas_leading_component(&contributions, 100.0),
+			None,
+			"and therefore cannot lead a cell"
+		);
+
+		let critical = vec![
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Local,
+				10.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Distributed,
+				90.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+		];
+		let contributions = timing_atlas_contributions(&critical).expect("pairs");
+		assert!(contributions[0].admissible);
+		assert_eq!(
+			timing_atlas_leading_component(&contributions, 100.0),
+			Some(TimingAtlasComponent::Operator),
+			"80 of a 100 ms delta leads"
+		);
+	}
+
+	/// A distributed receipt with no local counterpart is an error, not a zero — otherwise
+	/// an unimplemented local probe would hand the whole delta to that component.
+	#[test]
+	fn missing_local_counterparts_cannot_silently_become_zero() {
+		let orphan = vec![receipt(
+			TimingAtlasComponent::Scan,
+			TimingArm::Distributed,
+			90.0,
+			TimingAtlasBasis::CriticalPath,
+		)];
+		assert_eq!(
+			timing_atlas_contributions(&orphan),
+			Err(TimingAtlasPairingError::MissingLocalCounterpart(
+				TimingAtlasComponent::Scan
+			)),
+			"scan exists on both arms, so a missing local side is a defect"
+		);
+
+		// Transport is the declared exception: the local arm cannot incur it.
+		let transport = vec![receipt(
+			TimingAtlasComponent::Transport,
+			TimingArm::Distributed,
+			25.0,
+			TimingAtlasBasis::CriticalPath,
+		)];
+		let contributions = timing_atlas_contributions(&transport).expect("declared zero");
+		assert_eq!(contributions[0].local_ms, 0.0);
+		assert_eq!(contributions[0].contribution_ms, 25.0);
+		assert!(
+			TimingAtlasComponent::Transport.local_counterpart_is_defined_zero(),
+			"and the exception is declared in the taxonomy, not inferred"
+		);
+		assert!(!TimingAtlasComponent::Scan.local_counterpart_is_defined_zero());
+	}
+
+	/// Basis must agree across arms: comparing a critical-path distributed figure against a
+	/// concurrent-span local one would not be like for like.
+	#[test]
+	fn basis_must_agree_across_arms() {
+		let mismatched = vec![
+			receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Local,
+				5.0,
+				TimingAtlasBasis::ConcurrentSpan,
+			),
+			receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Distributed,
+				50.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+		];
+		assert_eq!(
+			timing_atlas_contributions(&mismatched),
+			Err(TimingAtlasPairingError::BasisDisagreement(
+				TimingAtlasComponent::Shuffle
+			))
+		);
+	}
+
+	/// Only paired contributions drive dominance, and a negative or absent delta leads
+	/// nothing.
+	#[test]
+	fn dominance_uses_paired_contributions_only() {
+		let contributions = vec![TimingAtlasContribution {
+			component: TimingAtlasComponent::Dispatch,
+			local_ms: 5.0,
+			distributed_ms: 60.0,
+			contribution_ms: 55.0,
+			basis: TimingAtlasBasis::CriticalPath,
+			admissible: true,
+		}];
+		assert_eq!(
+			timing_atlas_leading_component(&contributions, 100.0),
+			Some(TimingAtlasComponent::Dispatch)
+		);
+		assert_eq!(
+			timing_atlas_leading_component(&contributions, 200.0),
+			None,
+			"55 of 200 ms does not reach half"
+		);
+		assert_eq!(
+			timing_atlas_leading_component(&contributions, -10.0),
+			None,
+			"a distributed-faster cell is not in S and leads nothing"
+		);
+	}
+
+	/// The taxonomy stays granular: no summed stage component may stand in for concurrent
+	/// operator spans.
+	#[test]
+	fn taxonomy_keeps_categories_distinct() {
+		let labels = TimingAtlasComponent::ALL
+			.iter()
+			.map(|component| component.label())
+			.collect::<Vec<_>>();
+		assert_eq!(
+			labels,
+			vec![
+				"scan",
+				"operator",
+				"shuffle",
+				"dispatch",
+				"transport",
+				"reduction"
+			]
+		);
+		assert!(
+			!labels.contains(&"stage"),
+			"a stage component would hide concurrent spans behind one figure"
+		);
+	}
+
+	/// `reduction` happens after the elapsed boundary, so it must never appear among timed
+	/// contributions — and must not be handed a fabricated zero to make it fit.
+	#[test]
+	fn reduction_does_not_participate_in_timed_attribution() {
+		assert!(!TimingAtlasComponent::Reduction.participates_in_timed_attribution());
+		for component in TimingAtlasComponent::ALL {
+			if component != TimingAtlasComponent::Reduction {
+				assert!(component.participates_in_timed_attribution());
+			}
+		}
+		let receipts = vec![
+			receipt(
+				TimingAtlasComponent::Reduction,
+				TimingArm::Local,
+				10.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+			receipt(
+				TimingAtlasComponent::Reduction,
+				TimingArm::Distributed,
+				900.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+		];
+		let contributions = timing_atlas_contributions(&receipts).expect("pairs");
+		assert!(
+			contributions.is_empty(),
+			"reduction is metadata, not a timed contribution"
+		);
+		assert_eq!(timing_atlas_leading_component(&contributions, 100.0), None);
+	}
+
+	/// Only `transport` carries the zero-local exception. `shuffle` was refused on evidence:
+	/// twenty of twenty-one local plans repartition in memory.
+	#[test]
+	fn transport_is_the_only_declared_zero_local_component() {
+		let declared = TimingAtlasComponent::ALL
+			.iter()
+			.filter(|component| component.local_counterpart_is_defined_zero())
+			.copied()
+			.collect::<Vec<_>>();
+		assert_eq!(declared, vec![TimingAtlasComponent::Transport]);
+		assert!(!TimingAtlasComponent::Shuffle.local_counterpart_is_defined_zero());
+		assert!(!TimingAtlasComponent::Dispatch.local_counterpart_is_defined_zero());
+		assert_eq!(
+			timing_atlas_contributions(&[receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Distributed,
+				50.0,
+				TimingAtlasBasis::CriticalPath
+			)]),
+			Err(TimingAtlasPairingError::MissingLocalCounterpart(
+				TimingAtlasComponent::Shuffle
+			))
+		);
+	}
+
+	/// Dispatch has no semantically equivalent local interval. It must be retained as raw
+	/// evidence — not invented as a zero, and not reported as a missing-counterpart defect.
+	#[test]
+	fn dispatch_without_a_counterpart_is_retained_not_zeroed_nor_an_error() {
+		let dispatch_only = vec![receipt(
+			TimingAtlasComponent::Dispatch,
+			TimingArm::Distributed,
+			400.0,
+			TimingAtlasBasis::CriticalPath,
+		)];
+		let contributions =
+			timing_atlas_contributions(&dispatch_only).expect("must not be an error");
+		assert!(
+			contributions.is_empty(),
+			"a distributed-only figure is not a contribution"
+		);
+		assert_eq!(
+			timing_atlas_leading_component(&contributions, 500.0),
+			None,
+			"and raw distributed dispatch time must never lead a cell"
+		);
+		assert_eq!(
+			TimingAtlasComponent::Dispatch.local_pairing(),
+			TimingAtlasLocalPairing::NoLocalEquivalent
+		);
+		assert!(!TimingAtlasComponent::Dispatch.local_counterpart_is_defined_zero());
+	}
+
+	/// Shuffle is paired per cell. A distributed-only shuffle receipt is a defect, and q06's
+	/// structural zero must arrive as an observed local receipt rather than an exception.
+	#[test]
+	fn shuffle_pairs_per_cell_with_q06_as_an_observed_zero() {
+		assert_eq!(
+			TimingAtlasComponent::Shuffle.local_pairing(),
+			TimingAtlasLocalPairing::Required
+		);
+		assert_eq!(
+			timing_atlas_contributions(&[receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Distributed,
+				60.0,
+				TimingAtlasBasis::CriticalPath
+			)]),
+			Err(TimingAtlasPairingError::MissingLocalCounterpart(
+				TimingAtlasComponent::Shuffle
+			)),
+			"a missing local shuffle receipt is a defect, not a zero"
+		);
+
+		// q06: the one cell whose local plan carries no Exchange. Its local receipt is
+		// observed and reads zero, which is evidence rather than a declaration.
+		let q06 = vec![
+			receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Local,
+				0.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+			receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Distributed,
+				60.0,
+				TimingAtlasBasis::CriticalPath,
+			),
+		];
+		let contributions = timing_atlas_contributions(&q06).expect("observed zero pairs");
+		assert_eq!(contributions[0].local_ms, 0.0);
+		assert_eq!(contributions[0].contribution_ms, 60.0);
+		assert!(contributions[0].admissible);
+	}
+
+	/// Only transport may reach dominance without a local receipt.
+	#[test]
+	fn only_transport_can_lead_without_a_local_receipt() {
+		let transport_only = vec![receipt(
+			TimingAtlasComponent::Transport,
+			TimingArm::Distributed,
+			80.0,
+			TimingAtlasBasis::CriticalPath,
+		)];
+		let contributions = timing_atlas_contributions(&transport_only).expect("declared zero");
+		assert_eq!(
+			timing_atlas_leading_component(&contributions, 100.0),
+			Some(TimingAtlasComponent::Transport)
+		);
+
+		let pairings = TimingAtlasComponent::ALL
+			.iter()
+			.filter(|component| component.local_pairing() == TimingAtlasLocalPairing::DeclaredZero)
+			.copied()
+			.collect::<Vec<_>>();
+		assert_eq!(pairings, vec![TimingAtlasComponent::Transport]);
+	}
+}
+
+#[cfg(test)]
+mod adr538_local_arm_structure {
+	use super::*;
+
+	fn contains_exchange(plan: &toron::ir::ExecutionPlan) -> bool {
+		use toron::ir::ExecutionPlan as P;
+		match plan {
+			P::Exchange { .. } => true,
+			P::Join { left, right, .. } => contains_exchange(left) || contains_exchange(right),
+			P::Union { left, right, .. } => contains_exchange(left) || contains_exchange(right),
+			P::Filter { input, .. }
+			| P::Project { input, .. }
+			| P::Aggregate { input, .. }
+			| P::Sort { input, .. }
+			| P::Window { input, .. }
+			| P::Take { input, .. }
+			| P::Repeat { input, .. } => contains_exchange(input),
+			_ => false,
+		}
+	}
+
+	/// ADR 538 decision 2, answered empirically: `shuffle` is NOT a structural zero-local
+	/// component. Twenty of the twenty-one eligible cells bind a local plan containing an
+	/// `Exchange`, which the local executor runs through `bound_exchange` as real in-memory
+	/// repartitioning. Only q06 — a scalar aggregate with no exchange — lacks one. Shuffle
+	/// therefore requires a real local counterpart and cannot borrow transport's exception.
+	/// Deep multi-join binds (q10+) need an explicit stack.
+	#[test]
+	fn local_plans_carry_exchanges_so_shuffle_is_not_zero_local() {
+		let offenders = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("runtime");
+				runtime.block_on(async {
+					let mut offenders: Vec<String> = Vec::new();
+					for query in timing_atlas_cells() {
+						let spec = build_perf_query_spec(query, "strict", 0.01).expect("spec");
+						let (tables, _storage) = metadata_storage_from_tables(spec.tables);
+						let mut timings = PerfPhaseTimings::default();
+						let catalog =
+							load_catalog_from_metadata(tables, &mut timings, Instant::now())
+								.expect("catalog");
+						let logical = SqlPlanner::new().plan(&spec.sql).expect("plan");
+						let budget = execution_census_local_budget();
+						let config =
+							gauge_planner_config_with_task_memory(Some(budget.memory_per_task));
+						let bound = bind(&logical, &catalog, &config).await.expect("bind");
+						if contains_exchange(&bound) {
+							offenders.push(query.to_string());
+						}
+					}
+					offenders
+				})
+			})
+			.expect("spawn")
+			.join()
+			.expect("join");
+
+		let with_exchange = offenders;
+		assert_eq!(
+			with_exchange.len(),
+			20,
+			"twenty cells bind a local exchange; a change here re-opens whether shuffle can \
+			 be a declared zero-local component: {with_exchange:?}"
+		);
+		assert!(
+			!with_exchange.contains(&"q06".to_string()),
+			"q06 is the sole exchange-free local plan"
+		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_timing_atlas_critical_path {
+	use super::*;
+
+	fn node(
+		stage: u32,
+		task: u32,
+		wall: f64,
+		components: Vec<(TimingAtlasComponent, f64)>,
+		upstream: Vec<(u32, u32)>,
+	) -> TimingAtlasTaskNode {
+		TimingAtlasTaskNode {
+			stage_id: stage,
+			task_id: task,
+			wall_ms: wall,
+			components,
+			upstream,
+		}
+	}
+
+	/// The path is chosen by total wall through the DAG, and only that path's portions are
+	/// attributed. This fixture is built so the per-component maxima taken independently
+	/// would exceed the selected path — the overcounting the rule forbids.
+	#[test]
+	fn attribution_follows_one_selected_path_not_per_component_maxima() {
+		// Producer, then two concurrent consumers, then a terminal.
+		let nodes = vec![
+			node(
+				0,
+				0,
+				100.0,
+				vec![(TimingAtlasComponent::Scan, 100.0)],
+				vec![],
+			),
+			// Slow on operator, cheap on shuffle.
+			node(
+				1,
+				0,
+				400.0,
+				vec![
+					(TimingAtlasComponent::Operator, 380.0),
+					(TimingAtlasComponent::Shuffle, 20.0),
+				],
+				vec![(0, 0)],
+			),
+			// Faster overall, but the largest shuffle figure in the graph.
+			node(
+				1,
+				1,
+				200.0,
+				vec![
+					(TimingAtlasComponent::Operator, 10.0),
+					(TimingAtlasComponent::Shuffle, 190.0),
+				],
+				vec![(0, 0)],
+			),
+			node(
+				2,
+				0,
+				50.0,
+				vec![(TimingAtlasComponent::Operator, 50.0)],
+				vec![(1, 0), (1, 1)],
+			),
+		];
+
+		let derived = timing_atlas_critical_path(&nodes).expect("a path");
+		assert_eq!(
+			derived.path,
+			vec![(0, 0), (1, 0), (2, 0)],
+			"the longest-wall path runs through the slow consumer"
+		);
+		assert_eq!(derived.total_wall_ms, 550.0);
+		assert_eq!(derived.components.get("scan"), Some(&100.0));
+		assert_eq!(derived.components.get("operator"), Some(&430.0));
+		assert_eq!(
+			derived.components.get("shuffle"),
+			Some(&20.0),
+			"shuffle comes from the selected path's task, not from the graph's largest \
+			 shuffle figure"
+		);
+
+		// The forbidden derivation, computed here only to show it differs.
+		let per_component_maxima: f64 = [
+			nodes
+				.iter()
+				.flat_map(|n| n.components.iter())
+				.filter(|(component, _)| *component == TimingAtlasComponent::Shuffle)
+				.map(|(_, portion)| *portion)
+				.fold(0.0_f64, f64::max),
+			nodes
+				.iter()
+				.flat_map(|n| n.components.iter())
+				.filter(|(component, _)| *component == TimingAtlasComponent::Operator)
+				.map(|(_, portion)| *portion)
+				.fold(0.0_f64, f64::max),
+		]
+		.iter()
+		.sum();
+		assert!(
+			per_component_maxima > derived.components["operator"] + derived.components["shuffle"],
+			"summing independent per-component maxima overcounts, which is why the rule \
+			 selects one path first"
+		);
+	}
+
+	/// The selected path is persisted edge by edge so replay can re-walk it.
+	#[test]
+	fn selected_path_is_persisted_for_replay() {
+		let nodes = vec![
+			node(0, 0, 10.0, vec![(TimingAtlasComponent::Scan, 10.0)], vec![]),
+			node(
+				1,
+				0,
+				30.0,
+				vec![(TimingAtlasComponent::Operator, 30.0)],
+				vec![(0, 0)],
+			),
+		];
+		let derived = timing_atlas_critical_path(&nodes).expect("a path");
+		assert_eq!(derived.path, vec![(0, 0), (1, 0)]);
+		for window in derived.path.windows(2) {
+			let successor = nodes
+				.iter()
+				.find(|n| n.key() == window[1])
+				.expect("successor on the path");
+			assert!(
+				successor.upstream.contains(&window[0]),
+				"every persisted edge must exist in the DAG"
+			);
+		}
+		assert_eq!(derived.total_wall_ms, 40.0);
+	}
+
+	/// A single-path local execution uses the same rule, and q06's observed zero survives it.
+	#[test]
+	fn local_single_path_uses_the_same_rule_including_an_observed_zero() {
+		let q06_local = vec![node(
+			0,
+			0,
+			120.0,
+			vec![
+				(TimingAtlasComponent::Scan, 100.0),
+				(TimingAtlasComponent::Operator, 20.0),
+				// No Exchange in q06's local plan: observed, not declared.
+				(TimingAtlasComponent::Shuffle, 0.0),
+			],
+			vec![],
+		)];
+		let derived = timing_atlas_critical_path(&q06_local).expect("a path");
+		assert_eq!(derived.path, vec![(0, 0)]);
+		assert_eq!(derived.components.get("shuffle"), Some(&0.0));
+		assert_eq!(derived.total_wall_ms, 120.0);
+	}
+
+	#[test]
+	fn an_empty_graph_yields_no_path() {
+		assert!(timing_atlas_critical_path(&[]).is_none());
+	}
+}
+
+#[cfg(test)]
+mod adr538_exchange_receipts {
+	use super::*;
+
+	/// The exchange component must be produced on BOTH arms, or it cannot be paired. It is
+	/// captured in the executor, so a local plan carrying an `Exchange` records it exactly
+	/// as a distributed producer task does — and q06, whose local plan has none, records a
+	/// genuine observed zero.
+	/// Deep binds need an explicit stack.
+	#[test]
+	fn exchange_repartition_is_recorded_on_the_local_arm() {
+		let (with_exchange, q06) = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_current_thread()
+					.enable_all()
+					.build()
+					.expect("runtime");
+				runtime.block_on(async {
+					let measure = |query: &'static str| async move {
+						let spec = build_perf_query_spec(query, "strict", 0.01).expect("spec");
+						let (tables, storage) = metadata_storage_from_tables(spec.tables);
+						let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
+						let budget = execution_census_local_budget();
+						let context = tpch_execution_context_with_budget(telemetry.clone(), budget);
+						let catalog = {
+							let mut timings = PerfPhaseTimings::default();
+							load_catalog_from_metadata(tables, &mut timings, Instant::now())
+								.expect("catalog")
+						};
+						let logical = SqlPlanner::new().plan(&spec.sql).expect("plan");
+						let config =
+							gauge_planner_config_with_task_memory(Some(budget.memory_per_task));
+						let bound = bind(&logical, &catalog, &config).await.expect("bind");
+						let executor = Executor::with_context(storage, context);
+						executor.execute_bound(&bound, None).await.expect("execute");
+						let phases = telemetry.lock().expect("telemetry").phases;
+						phases.exchange_repartition_micros
+					};
+					(measure("q03").await, measure("q06").await)
+				})
+			})
+			.expect("spawn")
+			.join()
+			.expect("join");
+
+		assert!(
+			with_exchange > 0,
+			"a local plan containing an Exchange must record repartition time, or the \
+			 component cannot be paired against the distributed arm"
+		);
+		assert_eq!(
+			q06, 0,
+			"q06's local plan carries no Exchange, so its zero is observed rather than \
+			 declared"
+		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_path_bound_validation {
+	use super::*;
+
+	fn nodes() -> Vec<TimingAtlasTaskNode> {
+		vec![
+			TimingAtlasTaskNode {
+				stage_id: 0,
+				task_id: 0,
+				wall_ms: 100.0,
+				components: vec![],
+				upstream: vec![],
+			},
+			TimingAtlasTaskNode {
+				stage_id: 1,
+				task_id: 0,
+				wall_ms: 400.0,
+				components: vec![],
+				upstream: vec![(0, 0)],
+			},
+			// Concurrent sibling: never on the selected path.
+			TimingAtlasTaskNode {
+				stage_id: 1,
+				task_id: 1,
+				wall_ms: 200.0,
+				components: vec![],
+				upstream: vec![(0, 0)],
+			},
+		]
+	}
+
+	fn receipt(
+		component: TimingAtlasComponent,
+		arm: TimingArm,
+		node: (u32, u32),
+		elapsed: f64,
+		eligible: bool,
+	) -> TimingAtlasPathBoundReceipt {
+		TimingAtlasPathBoundReceipt {
+			component,
+			arm,
+			stage_id: node.0,
+			task_id: node.1,
+			scope: component.label().to_string(),
+			basis: TimingAtlasBasis::CriticalPath,
+			raw_elapsed_ms: elapsed,
+			emitted_contribution_ms: None,
+			eligible,
+		}
+	}
+
+	#[test]
+	fn a_well_formed_path_bound_set_validates_and_recomputes() {
+		let receipts = vec![
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Local,
+				(1, 0),
+				30.0,
+				true,
+			),
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Distributed,
+				(1, 0),
+				80.0,
+				true,
+			),
+		];
+		let validation = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			&[(0, 0), (1, 0)],
+			&receipts,
+			500.0,
+		);
+		assert!(
+			validation.violations.is_empty(),
+			"{:?}",
+			validation.violations
+		);
+		assert!(validation.dominance_allowed());
+		assert_eq!(validation.contributions.len(), 1);
+		assert_eq!(validation.contributions[0].contribution_ms, 50.0);
+		assert_eq!(validation.selected_wall_ms, 500.0);
+		assert_eq!(validation.remainder_ms, 420.0);
+	}
+
+	/// A receipt from the concurrent sibling is rejected however plausible its figure.
+	#[test]
+	fn eligible_receipts_from_off_path_tasks_are_rejected() {
+		let receipts = vec![
+			receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Local,
+				(1, 1),
+				5.0,
+				true,
+			),
+			receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Distributed,
+				(1, 1),
+				190.0,
+				true,
+			),
+		];
+		let validation = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			&[(0, 0), (1, 0)],
+			&receipts,
+			500.0,
+		);
+		assert_eq!(
+			validation.violations.len(),
+			2,
+			"both off-path receipts are rejected: {:?}",
+			validation.violations
+		);
+		assert!(
+			validation
+				.violations
+				.iter()
+				.all(|v| v.contains("not on the selected path"))
+		);
+		assert!(!validation.dominance_allowed());
+		assert!(validation.contributions.is_empty());
+	}
+
+	/// Off-path receipts may be retained as raw evidence, and stay permanently ineligible.
+	#[test]
+	fn off_path_receipts_are_retained_raw_and_never_eligible() {
+		let receipts = vec![
+			receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Local,
+				(1, 1),
+				5.0,
+				false,
+			),
+			receipt(
+				TimingAtlasComponent::Shuffle,
+				TimingArm::Distributed,
+				(1, 1),
+				190.0,
+				false,
+			),
+		];
+		let validation = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			&[(0, 0), (1, 0)],
+			&receipts,
+			500.0,
+		);
+		assert!(validation.violations.is_empty());
+		assert_eq!(validation.off_path_retained, 2);
+		assert!(
+			validation.contributions.is_empty(),
+			"retained evidence never becomes a contribution"
+		);
+	}
+
+	/// The emitted contribution is compared against a recomputation, not trusted.
+	#[test]
+	fn an_emitted_contribution_that_disagrees_is_rejected() {
+		let mut distributed = receipt(
+			TimingAtlasComponent::Operator,
+			TimingArm::Distributed,
+			(1, 0),
+			80.0,
+			true,
+		);
+		distributed.emitted_contribution_ms = Some(500.0);
+		let receipts = vec![
+			receipt(
+				TimingAtlasComponent::Operator,
+				TimingArm::Local,
+				(1, 0),
+				30.0,
+				true,
+			),
+			distributed,
+		];
+		let validation = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			&[(0, 0), (1, 0)],
+			&receipts,
+			500.0,
+		);
+		assert!(
+			validation
+				.violations
+				.iter()
+				.any(|v| v.contains("disagrees with recomputed")),
+			"{:?}",
+			validation.violations
+		);
+	}
+
+	/// A persisted path claiming an edge the graph does not have is rejected.
+	#[test]
+	fn an_invalid_persisted_edge_is_rejected() {
+		let validation = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			// (1,1) is not upstream of (1,0).
+			&[(1, 1), (1, 0)],
+			&[],
+			500.0,
+		);
+		assert!(
+			validation
+				.violations
+				.iter()
+				.any(|v| v.contains("not an edge in the stage graph")),
+			"{:?}",
+			validation.violations
+		);
+	}
+
+	/// Scope, basis, uniqueness and pairing are all checked before dominance is allowed.
+	#[test]
+	fn scope_basis_uniqueness_and_pairing_gate_dominance() {
+		let mut mismatched_scope = receipt(
+			TimingAtlasComponent::Operator,
+			TimingArm::Local,
+			(1, 0),
+			30.0,
+			true,
+		);
+		mismatched_scope.scope = "operator::something_else".to_string();
+		let validation = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			&[(0, 0), (1, 0)],
+			&[
+				mismatched_scope,
+				receipt(
+					TimingAtlasComponent::Operator,
+					TimingArm::Distributed,
+					(1, 0),
+					80.0,
+					true,
+				),
+			],
+			500.0,
+		);
+		assert!(
+			validation
+				.violations
+				.iter()
+				.any(|v| v.contains("scope disagrees"))
+		);
+
+		let duplicated = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			&[(0, 0), (1, 0)],
+			&[
+				receipt(
+					TimingAtlasComponent::Scan,
+					TimingArm::Distributed,
+					(1, 0),
+					10.0,
+					true,
+				),
+				receipt(
+					TimingAtlasComponent::Scan,
+					TimingArm::Distributed,
+					(1, 0),
+					20.0,
+					true,
+				),
+			],
+			500.0,
+		);
+		assert!(
+			duplicated
+				.violations
+				.iter()
+				.any(|v| v.contains("more than one eligible"))
+		);
+
+		let dispatch = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			&[(0, 0), (1, 0)],
+			&[receipt(
+				TimingAtlasComponent::Dispatch,
+				TimingArm::Distributed,
+				(1, 0),
+				40.0,
+				true,
+			)],
+			500.0,
+		);
+		assert!(
+			dispatch
+				.violations
+				.iter()
+				.any(|v| v.contains("no local equivalent")),
+			"dispatch must never be eligible: {:?}",
+			dispatch.violations
+		);
+
+		let inadmissible = timing_atlas_validate_path_bound_receipts(
+			&nodes(),
+			&[(0, 0), (1, 0)],
+			&[TimingAtlasPathBoundReceipt {
+				basis: TimingAtlasBasis::ConcurrentSpan,
+				..receipt(
+					TimingAtlasComponent::Scan,
+					TimingArm::Distributed,
+					(1, 0),
+					10.0,
+					true,
+				)
+			}],
+			500.0,
+		);
+		assert!(
+			inadmissible
+				.violations
+				.iter()
+				.any(|v| v.contains("inadmissible basis"))
+		);
 	}
 }

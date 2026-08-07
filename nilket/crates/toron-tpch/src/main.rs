@@ -42,8 +42,20 @@ use toron_tpch::{
 /// The default scale factor when `--sf` is omitted (a tiny reachability scale).
 const DEFAULT_SF: f64 = 0.01;
 
-#[tokio::main]
-async fn main() -> ExitCode {
+// Deep multi-join binds (q10+) exceed a default worker stack, and the timing atlas walks
+// every cell in one process. The runtime is built explicitly so the worker stacks are
+// large enough for every command; `#[tokio::main]` cannot express this.
+fn main() -> ExitCode {
+	tokio::runtime::Builder::new_multi_thread()
+		.worker_threads(4)
+		.thread_stack_size(64 * 1024 * 1024)
+		.enable_all()
+		.build()
+		.expect("tokio runtime")
+		.block_on(run())
+}
+
+async fn run() -> ExitCode {
 	let args: Vec<String> = std::env::args().skip(1).collect();
 	let Some(command) = args.first().map(String::as_str) else {
 		return usage();

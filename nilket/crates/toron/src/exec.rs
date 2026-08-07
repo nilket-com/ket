@@ -1158,6 +1158,9 @@ impl Executor {
 		let mut partition_batches: Vec<Vec<RecordBatch>> =
 			(0..partition_count_usize).map(|_| Vec::new()).collect();
 
+		// Accumulated in a local, then recorded once: no per-batch locking or allocation
+		// inside the timed path.
+		let repartition_started = Instant::now();
 		for batch in input_batches {
 			for (partition, partitioned) in
 				self.repartition_exchange_batch(&batch, partition_count, key)?
@@ -1165,8 +1168,18 @@ impl Executor {
 				partition_batches[partition].push(partitioned);
 			}
 		}
-
-		finalize_exchange_partitions(schema, partition_batches)
+		let finalized = finalize_exchange_partitions(schema, partition_batches);
+		let repartition_micros =
+			u64::try_from(repartition_started.elapsed().as_micros()).unwrap_or(u64::MAX);
+		if let Some(telemetry) = self.context.task_telemetry.as_ref()
+			&& let Ok(mut task) = telemetry.lock()
+		{
+			task.phases.exchange_repartition_micros = task
+				.phases
+				.exchange_repartition_micros
+				.saturating_add(repartition_micros);
+		}
+		finalized
 	}
 
 	fn repartition_exchange_batch(

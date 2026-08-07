@@ -90,6 +90,109 @@ plan shape and clean-build stamp are verified on each timed run. A timed row tha
 identity is discarded as invalid, never reported as fast. Timing does not get a weaker bar than
 the census that authorized it.
 
+**4a-i. The component taxonomy, frozen before instrumentation.** One taxonomy is shared by
+both arms, so a component always names the same thing on each side and contributions are
+comparable:
+
+| component | scope |
+|---|---|
+| `scan` | reading base relations from storage |
+| `operator` | **join only** (`scope=join`): build, probe, spill |
+| `shuffle` | partitioning, publication and consumption of exchange partitions |
+| `dispatch` | task admission, scheduling and manifest acceptance |
+| `transport` | loopback TCP encode, send, receive, decode |
+| `reduction` | digesting, identity comparison and receipt processing |
+
+These stay distinct. In particular, **no `stage` component may hide concurrent task spans
+behind a single summed figure** — a stage bracketing several concurrent operators bounds
+where cost sits, not what it is.
+
+**`operator` is scoped to joins for this ADR.** The existing evidence covers join build, probe
+and spill only; aggregate, filter, sort and projection are uninstrumented on both arms.
+Labelling that partial coverage as generic operator time would let a fraction of execution
+compete in the ≥50% leading test as though it were the whole. Non-join execution stays in the
+**unattributed remainder and cannot lead a cell**. A future all-operator atlas may extend the
+taxonomy on its own evidence.
+
+**Local pairing has three states, and collapsing them is how a zero gets invented.**
+
+- **paired** (`scan`, `operator`, `shuffle`): both arms emit a receipt; a missing local side
+  is a defect. **`shuffle` is paired per cell.** q06 — the sole cell whose local plan carries
+  no `Exchange` — supplies an **observed local receipt reading zero**, which is evidence, not
+  a global exception.
+- **declared zero-local** (`transport` only): the local arm structurally cannot incur it.
+- **no local equivalent** (`dispatch`): no semantically equivalent local interval exists.
+  Distributed dispatch receipts are **retained raw as evidence** and **excluded from paired
+  contributions and from dominance**. Without this state the validator would either invent a
+  zero or wrongly raise `MissingLocalCounterpart`. Consequently the dispatch/transport
+  forward branch may be selected only from **receipt-backed transport**, or from dispatch once
+  a genuine local counterpart exists — raw distributed-only dispatch time can never lead a
+  cell.
+
+**`transport` is the only structural zero-local component, verified rather than assumed.**
+`shuffle` was a candidate and is **refused**: twenty of the twenty-one eligible cells bind a
+local plan containing an `Exchange`, which the local executor runs via `bound_exchange` as real
+in-memory repartitioning (only q06 lacks one). Shuffle therefore requires a genuine local
+counterpart. `dispatch` likewise gets no exception in this cut: rather than declare a zero from
+the absence of a scheduler in the local path, it must either carry a local counterpart or stay
+unattributed. Declaring a zero is precisely what lets an unimplemented probe claim a whole
+delta, so the bar is a verified structural impossibility, not an observed absence.
+
+**`reduction` is out of band and does not participate.** Digesting, identity comparison and
+receipt processing occur after the elapsed boundary by construction, so they are recorded as
+metadata (`verification_ms`) and are **excluded from arm reconciliation and from dominance**.
+No in-bound zero receipt is fabricated for them; the validator must not accept a `reduction`
+component among timed contributions.
+
+**A distributed-only receipt cannot produce a paired contribution.** For every component the
+atlas emits **both** a local and a distributed receipt, and the contribution is
+`distributed − local`. The sole exception is a component whose local counterpart is
+**explicitly defined as zero** because the local arm cannot incur it — `transport` is the
+motivating case, and any such exception must be declared in this table rather than inferred
+at runtime. **A missing local receipt is never treated as zero**: it withholds authority, so
+an unimplemented local probe cannot silently inflate a distributed component to 100% of a
+delta.
+
+Reconciliation is per arm: a cell's admissible components for one arm, plus that arm's
+unattributed remainder, equal that arm's measured elapsed.
+
+**Per-cell distributed values are derived by stage-graph critical path.** The per-task phase
+counters partition one task's wall clock and are `non_overlapping` **at task scope only**; a
+stage runs several tasks concurrently, so their walls must never be summed. A per-cell figure
+is admissible only as a `critical_path` derivation through the stage graph, under these rules:
+
+1. Select **one** task path through the stage DAG, by **total wall duration**.
+2. Attribute **only that selected path's** component portions.
+3. **Never** take each component's maximum across tasks independently and sum those maxima.
+   That recreates the cross-task overcounting the task-scope partition exists to prevent, and
+   describes a task that never ran.
+4. **Persist the selected stage/task path**, edge by edge, so replay can verify every edge and
+   every component basis rather than trusting a derived total.
+
+The local arm applies the same principle over its single execution path. q06's observed local
+shuffle zero survives that derivation as evidence; the other twenty cells require real
+exchange timing. Each eligible
+component emits matching local and distributed records carrying the same scope and basis, so
+every contribution is dimensional and replayable.
+
+**4a. Component semantics, fixed before instrumentation.** A component may be compared
+against a cell's median paired delta only when its receipt carries all of:
+
+- an explicit **basis** of `non_overlapping` (the interval provably overlaps no other counted
+  interval) or `critical_path` (the interval lies on a defined path through the stage graph).
+  No other basis is admissible, and a **sum of concurrent task durations is not a basis** —
+  it measures work, not wall clock;
+- a **paired contribution**: the component's cost in the distributed arm minus its cost in the
+  local arm, so it is dimensionally comparable to the paired delta it is being weighed
+  against. A distributed-only absolute is not a contribution;
+- the **raw receipt fields** it was derived from, retained even when the component cannot
+  enter the additive breakdown.
+
+A component failing any clause stays in the journal as evidence but is excluded from the
+breakdown and from the ≥50% leading test. A journal whose finalized cells carry no component
+receipts at all does not discharge this ADR and must withhold authority
+(`attribution_receipts_missing`).
+
 **4. Transport and task overhead are priced from receipts, never inferred, and only added when
 additivity is real.** The distributed arm pays dispatch, TCP loopback, partition publication and
 manifest acceptance that the local arm does not. These are attributed from the receipts already

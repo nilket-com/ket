@@ -289,6 +289,11 @@ pub struct TaskTelemetryPhases {
 	pub batch_decode_micros: u64,
 	pub dispatch_wait_micros: u64,
 	pub telemetry_lock_micros: u64,
+	/// Time spent partitioning batches across an exchange boundary. Written by the executor,
+	/// so it is produced on both arms: locally as in-memory repartitioning, and inside a
+	/// distributed producer task. That symmetry is what makes it a paired component.
+	#[serde(default)]
+	pub exchange_repartition_micros: u64,
 	pub framework_overhead_micros: u64,
 }
 

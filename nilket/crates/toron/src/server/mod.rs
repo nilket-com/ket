@@ -1271,7 +1271,8 @@ fn recompute_framework_overhead(telemetry: &mut TaskTelemetry) {
 		.saturating_add(telemetry.phases.task_setup_micros)
 		.saturating_add(telemetry.phases.batch_encode_micros)
 		.saturating_add(telemetry.phases.batch_send_micros)
-		.saturating_add(telemetry.phases.telemetry_lock_micros);
+		.saturating_add(telemetry.phases.telemetry_lock_micros)
+		.saturating_add(telemetry.phases.exchange_repartition_micros);
 	telemetry.phases.framework_overhead_micros =
 		telemetry.phases.task_wall_micros.saturating_sub(accounted);
 }
