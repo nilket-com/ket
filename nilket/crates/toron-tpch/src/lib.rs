@@ -24663,3 +24663,90 @@ mod adr538_attribution_end_to_end {
 		assert!(dispatch_row["contribution_ms"].is_null());
 	}
 }
+
+#[cfg(test)]
+mod adr538_phase_partition_probe {
+	use super::*;
+
+	/// Diagnostic probe pinning the run-4 finding: on which counters does a producer
+	/// task's phase sum exceed its own wall? Prints raw counters so the overlap class is
+	/// identified from evidence rather than hypothesis.
+	#[test]
+	#[ignore = "diagnostic probe; run explicitly"]
+	fn dump_q01_distributed_raw_phases() {
+		let report = std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(|| {
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(2)
+					.enable_all()
+					.build()
+					.expect("runtime");
+				runtime.block_on(async {
+					let mut harness = CensusTimingAtlasHarness::prepare(
+						"q01",
+						"strict",
+						0.01,
+						Path::new("unused"),
+					)
+					.await
+					.expect("prepare");
+					harness.setup_cell("q01").await.expect("setup");
+					let plan = TimingAtlasChildPlan {
+						arm: TimingArm::Distributed,
+						role: TimingAtlasChildRole::Warmup,
+						query_id: QueryId::new(),
+					};
+					harness.execute_child(&plan).await.expect("execute");
+					let report = harness
+						.telemetry_retention
+						.lock()
+						.expect("retention")
+						.remove(&plan.query_id)
+						.expect("report");
+					harness.teardown_cell("q01").await.expect("teardown");
+					report
+				})
+			})
+			.expect("spawn")
+			.join()
+			.expect("join");
+		for record in &report.tasks {
+			let p = &record.telemetry.phases;
+			let accounted = p.shuffle_pull_decode_micros
+				+ p.build_micros
+				+ p.probe_micros
+				+ p.spill_micros
+				+ p.output_publish_micros
+				+ p.task_setup_micros
+				+ p.batch_encode_micros
+				+ p.batch_send_micros
+				+ p.telemetry_lock_micros
+				+ p.exchange_repartition_micros
+				+ p.scan_micros;
+			println!(
+				"stage {} task {} attempt {}: wall={} accounted={} over={} | pull_decode={} build={} probe={} spill={} publish={} setup={} enc={} send={} dec={} dispatch_wait={} lock={} repart={} scan={} overhead={}",
+				record.identity.stage_id.0,
+				record.identity.task_id.0,
+				record.identity.attempt_id.0,
+				p.task_wall_micros,
+				accounted,
+				accounted.saturating_sub(p.task_wall_micros),
+				p.shuffle_pull_decode_micros,
+				p.build_micros,
+				p.probe_micros,
+				p.spill_micros,
+				p.output_publish_micros,
+				p.task_setup_micros,
+				p.batch_encode_micros,
+				p.batch_send_micros,
+				p.batch_decode_micros,
+				p.dispatch_wait_micros,
+				p.telemetry_lock_micros,
+				p.exchange_repartition_micros,
+				p.scan_micros,
+				p.framework_overhead_micros,
+			);
+		}
+	}
+}
