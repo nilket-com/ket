@@ -655,6 +655,44 @@ impl<'a> PlotBackend for IcedBackend<'a> {
 	}
 }
 
+/// Composite plot surfaces own their cell arrangement while retaining the
+/// ordinary kernel contract for marks and hover. The default is `None`, so
+/// existing kernels remain byte-for-byte on the ordinary PlotWidget path.
+pub trait PlotComposite: Send + Sync {
+	/// Whether this composite emitted the figure-level title and subtitle.
+	/// Ordinary composites leave those headings to `PlotWidget` so existing
+	/// kernels retain their current ownership.
+	fn owns_global_headings(&self) -> bool {
+		false
+	}
+
+	fn render_plot_layer(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+	);
+
+	fn render_overlay_layer(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		padding: f32,
+		title: &str,
+		settings: &PlotSettings,
+	);
+
+	fn hover(
+		&self,
+		bounds: Rectangle,
+		padding: f32,
+		cursor: Cursor,
+		settings: &PlotSettings,
+	) -> Option<String>;
+}
+
 pub trait PlotKernel: Send + Sync {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout;
 
@@ -697,6 +735,10 @@ pub trait PlotKernel: Send + Sync {
 		_settings: &PlotSettings,
 	) -> Option<String> {
 		self.hover(transform, cursor)
+	}
+
+	fn composite(&self) -> Option<&dyn PlotComposite> {
+		None
 	}
 
 	fn x_label(&self) -> String {
@@ -802,6 +844,16 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	pub fn render_plot_layer(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
+		if let Some(composite) = self.kernel.composite() {
+			composite.render_plot_layer(
+				backend,
+				bounds,
+				self.padding,
+				&self.title,
+				&self.settings_model,
+			);
+			return;
+		}
 		backend.fill_rectangle(
 			Point::ORIGIN,
 			bounds.size(),
@@ -823,6 +875,19 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	pub fn render_overlay_layer(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
+		if let Some(composite) = self.kernel.composite() {
+			composite.render_overlay_layer(
+				backend,
+				bounds,
+				self.padding,
+				&self.title,
+				&self.settings_model,
+			);
+			if !composite.owns_global_headings() {
+				self.render_global_headings(backend, bounds);
+			}
+			return;
+		}
 		let plot_area = self.plot_area(bounds);
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
@@ -928,18 +993,6 @@ impl<'a> PlotWidget<'a> {
 			.subtitle
 			.as_ref()
 			.map(|s| s.as_ref().to_string());
-		let x_label = self
-			.settings
-			.x_label
-			.as_ref()
-			.map(|s: &Arc<String>| s.to_string())
-			.unwrap_or(self.kernel.x_label());
-		let y_label = self
-			.settings
-			.y_label
-			.as_ref()
-			.map(|s: &Arc<String>| s.to_string())
-			.unwrap_or(self.kernel.y_label());
 		backend.fill_text(Text {
 			content: title,
 			position: Point::new(size_only_bounds.width / 2.0, self.settings.title_offset),
@@ -960,6 +1013,56 @@ impl<'a> PlotWidget<'a> {
 				..Default::default()
 			});
 		}
+		self.draw_axis_labels(backend, plot_area);
+	}
+
+	fn render_global_headings(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
+		let title = self
+			.settings
+			.title
+			.as_ref()
+			.map(|s: &Arc<String>| s.to_string())
+			.unwrap_or(self.title.clone());
+		backend.fill_text(Text {
+			content: title,
+			position: Point::new(bounds.width / 2.0, self.settings.title_offset),
+			color: self.settings.chrome.title_text.iced(),
+			size: iced::Pixels(self.settings.title_size),
+			align_x: alignment::Horizontal::Center.into(),
+			align_y: alignment::Vertical::Top,
+			..Default::default()
+		});
+		if let Some(subtitle) = self
+			.settings
+			.subtitle
+			.as_ref()
+			.map(|s| s.as_ref().to_string())
+		{
+			backend.fill_text(Text {
+				content: subtitle,
+				position: Point::new(bounds.width / 2.0, self.settings.subtitle_offset),
+				color: self.settings.chrome.subtitle_text.iced(),
+				size: iced::Pixels(self.settings.subtitle_size),
+				align_x: alignment::Horizontal::Center.into(),
+				align_y: alignment::Vertical::Top,
+				..Default::default()
+			});
+		}
+	}
+
+	pub(crate) fn draw_axis_labels(&self, backend: &mut dyn PlotBackend, plot_area: Rectangle) {
+		let x_label = self
+			.settings
+			.x_label
+			.as_ref()
+			.map(|s: &Arc<String>| s.to_string())
+			.unwrap_or(self.kernel.x_label());
+		let y_label = self
+			.settings
+			.y_label
+			.as_ref()
+			.map(|s: &Arc<String>| s.to_string())
+			.unwrap_or(self.kernel.y_label());
 		if !x_label.is_empty() {
 			backend.fill_text(Text {
 				content: x_label,
@@ -1070,6 +1173,25 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 		}
 		match event {
 			Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
+				if let Some(composite) = self.kernel.composite() {
+					let relative_cursor = match cursor.position() {
+						Some(pos) => {
+							Cursor::Available(Point::new(pos.x - bounds.x, pos.y - bounds.y))
+						}
+						None => Cursor::Unavailable,
+					};
+					let hover = composite.hover(
+						bounds,
+						self.padding,
+						relative_cursor,
+						&self.settings_model,
+					);
+					if hover != state.last_hover {
+						state.last_hover = hover.clone();
+						return Some(canvas::Action::publish(PlotMessage::UpdateHover(hover)));
+					}
+					return None;
+				}
 				let padding_top = self.padding + self.settings.plot_padding_top;
 				let padding_bottom = self.padding + self.settings.plot_padding_bottom;
 				let padding_left = self.padding + self.settings.plot_padding_left;
@@ -1121,7 +1243,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 }
 
 impl<'a> PlotWidget<'a> {
-	fn draw_cartesian_grid(
+	pub(crate) fn draw_cartesian_grid(
 		&self,
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,
@@ -1227,7 +1349,7 @@ impl<'a> PlotWidget<'a> {
 		}
 	}
 
-	fn draw_cartesian_axes(
+	pub(crate) fn draw_cartesian_axes(
 		&self,
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,
@@ -1343,7 +1465,7 @@ impl<'a> PlotWidget<'a> {
 		}
 	}
 
-	fn draw_categorical_grid(
+	pub(crate) fn draw_categorical_grid(
 		&self,
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,
@@ -1415,7 +1537,7 @@ impl<'a> PlotWidget<'a> {
 		}
 	}
 
-	fn draw_categorical_axes(
+	pub(crate) fn draw_categorical_axes(
 		&self,
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,
@@ -1494,7 +1616,7 @@ impl<'a> PlotWidget<'a> {
 		}
 	}
 
-	fn draw_categorical_y_grid(
+	pub(crate) fn draw_categorical_y_grid(
 		&self,
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,
@@ -1574,7 +1696,7 @@ impl<'a> PlotWidget<'a> {
 		}
 	}
 
-	fn draw_categorical_y_axes(
+	pub(crate) fn draw_categorical_y_axes(
 		&self,
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,
@@ -1646,7 +1768,7 @@ impl<'a> PlotWidget<'a> {
 		}
 	}
 
-	fn draw_categorical_xy_axes(
+	pub(crate) fn draw_categorical_xy_axes(
 		&self,
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,
@@ -1728,7 +1850,7 @@ impl<'a> PlotWidget<'a> {
 		}
 	}
 
-	fn draw_parallel_axes(
+	pub(crate) fn draw_parallel_axes(
 		&self,
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,

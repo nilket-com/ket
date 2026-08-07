@@ -1,6 +1,6 @@
 # PRODUCT-0041 implementation plan: the plot grid model
 
-Status: proposed 2026-08-06. This plan implements the accepted substrate in
+Status: implemented 2026-08-06. This plan implements the accepted substrate in
 `plans/product/adr/0041_the_plot_grid_model.md`. It adds no Rune producer; the
 surface and arrangement spelling remain PRODUCT-0042.
 

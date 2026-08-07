@@ -6,6 +6,7 @@ pub mod core;
 pub mod durable;
 pub mod export;
 pub mod factory;
+pub mod grid;
 pub mod kernels;
 pub mod request;
 pub mod spec;
