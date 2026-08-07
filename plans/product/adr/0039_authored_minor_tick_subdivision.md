@@ -1,6 +1,6 @@
 # ADR 0039: authored minor tick subdivision
 
-Status: proposed 2026-08-06. This record decides one thing: the Rune spelling
+Status: accepted 2026-08-06. This record decides one thing: the Rune spelling
 that sets how many minor ticks subdivide each major interval, including none. It
 adds one figure element per axis and completes PRODUCT-0037 §6's capacity rule on
 the minor path, which that record left unchecked.

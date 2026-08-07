@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.38. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.39. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -39,6 +39,7 @@ a cited record).
 | figure-wide headings (`figure([title(text), subtitle(text), body])`) | executable | PRODUCT-0016's twelve gates in `4278e762`, `267e48c1`, `a39ffd9d`, and `764e2b64`; exact grammar spans, independent settings/body lowering, projected source-current chrome, rendered completion-atomic canvas, stale/removal lifecycle, and installed `test7.rn` launch |
 | authored numeric axis bounds (`figure([x_bounds(min, max), y_bounds(min, max), body])`) | executable | PRODUCT-0036 adds paired finite literal bounds at figure scope and lowers both axes through one existing domain override (`2ad9357e`). Numeric applicability is checked per resolved axis: a vertical bar admits `y_bounds` and attributes categorical `x_bounds` locally. Excluding all data and any strictly ordered finite span, including `0.0..1e-300`, render exactly; collapse, inversion, non-finite values, malformed literals, and duplicates refuse at the constructor. Layered plots retain one shared Cartesian domain; omission is unchanged. |
 | authored numeric tick step (`figure([x_tick_step(step), y_tick_step(step), body])`) | executable | PRODUCT-0038 exposes the closed PRODUCT-0037 `Step` placement through figure-wide guide settings. Positive finite literals, including direct integer and decimal spellings, lower independently per axis; bounds are optional and data-derived domains use the zero-anchored lattice. Categorical/band, temporal, and dense-capacity requests refuse at the exact constructor span. Omission remains Count(8), layered bodies retain one shared placement, and no minor/count surface is added (`2385a8d5`, `3c1b277f`). |
+| authored minor tick subdivision (`figure([x_minor_ticks(count), y_minor_ticks(count), body])`) | executable | PRODUCT-0039 exposes the existing per-interval minor subdivision count through figure-wide guide settings. Zero disables marks and grids together; positive non-negative integer literals lower independently, and Count/Step major placements produce exactly that many strictly interior ticks. Categorical/band, temporal, and combined-lattice capacity requests refuse at the authored span; checked arithmetic prevents overflow before allocation. Omission preserves the default count of 4, with visibility flags and absolute spacing remaining internal (`a914f46c`). |
 | theme-projected plot chrome (`figure([skin("theme_expression"), body])`; optional `.duotone()`) | executable | PRODUCT-0032 establishes exact figure grammar and atomic host lifecycle. PRODUCT-0033 makes ordinary skin preserve the ordered background slot and retains strongest-pair collapse as explicit `.duotone()` in `5871be41`. PRODUCT-0034 makes contrast observational: every known theme renders exact projected chrome, including below-threshold `tab20c_s9`, while unknown identity still refuses (`f904536d`). Skin never colors data; palette never colors chrome; omission preserves PRODUCT-0031's compatibility default. |
 | relative scatter point size (`scatter(x, y).point_size(factor)`) | executable | PRODUCT-0017 proves the typed layer setting and all scatter renderer/hit/cache paths; PRODUCT-0018's closed contextual register, exact lowering/refusals, shared-result handoff, byte-identical `1.0`, six-pixel-radius `2.0`, identity/label lifecycle, and no-dashboard host completion land in `5d180e0c` and `0478f8a2`; installed `test7.rn` exercises the accepted `8.0` maximum |
 | relative line stroke width (`line(x, y).stroke_width(factor)`) | executable | PRODUCT-0019 proves the typed layer setting, five-tier selection, exact line paint/hit behavior, fixed guide, and styled-one-layer scale preservation; PRODUCT-0020's closed contextual lowering/refusals, shared-result handoff, byte-identical `1.0`, exact 4px `2.0`, identity/label lifecycle, and combined point-size host assay land in `01a66f4d`; installed `test7.rn` exercises both modifiers in one figure |
@@ -588,6 +589,15 @@ PRODUCT-0032 owns the first theme-name projection and direct figure
 | bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
+
+- v0.39 (2026-08-06): PRODUCT-0039 exposes `x_minor_ticks(count)` and
+  `y_minor_ticks(count)` as figure-wide subdivision controls. Zero disables
+  minor marks and grids together; positive counts place strict interior ticks
+  relative to each major interval under both Count and Step placement. The
+  combined major-plus-minor lattice is checked with overflow-safe arithmetic
+  before allocation, with categorical, temporal, and over-capacity requests
+  refusing at the authored element. Visibility flags and absolute spacing stay
+  internal.
 
 - v0.38 (2026-08-06): PRODUCT-0038 exposes `x_tick_step(step)` and
   `y_tick_step(step)` as figure-wide Rune elements selecting the closed
