@@ -1160,3 +1160,70 @@ pub(crate) fn adr068_prior_adr045_to_067_guards_continue_to_pass_except_external
 	}
 	assert!(architecture_test.contains("adr068_explicit_sampled_field_is_authoritative"));
 }
+
+/// ADR 538: the task phase counters partition task wall clock — that is the design
+/// `recompute_framework_overhead` assumes and the basis the timing atlas's receipts claim.
+/// The defect class that broke it was one wall interval fed into two phase counters
+/// (`build_started` into both `build_micros` and `spill_micros`), which the overhead's
+/// saturating subtraction silently masked. Each timer may feed exactly one counter.
+#[test]
+pub(crate) fn adr538_no_wall_interval_feeds_two_phase_counters() {
+	for file in [
+		"src/exec.rs",
+		"src/exec/join.rs",
+		"src/exec/join/streaming.rs",
+		"src/server/mod.rs",
+	] {
+		let text = std::fs::read_to_string(manifest_dir().join(file)).expect("read source");
+		for (offset, _) in text.match_indices("record_task_telemetry(") {
+			let body_end = text[offset..]
+				.find("});")
+				.map(|end| offset + end)
+				.unwrap_or(text.len());
+			let body = &text[offset..body_end];
+			let mut timer_to_counters: std::collections::BTreeMap<&str, Vec<&str>> =
+				std::collections::BTreeMap::new();
+			let mut cursor = 0usize;
+			while let Some(position) = body[cursor..].find("task.phases.") {
+				let counter_start = cursor + position + "task.phases.".len();
+				let counter_len = body[counter_start..]
+					.find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+					.unwrap_or(0);
+				let counter = &body[counter_start..counter_start + counter_len];
+				// A read inside an add chain is not a write; only `counter = ...` counts.
+				if !body[counter_start + counter_len..]
+					.trim_start()
+					.starts_with('=')
+				{
+					cursor = counter_start;
+					continue;
+				}
+				// One statement only: a timer on the next statement is not this counter's.
+				let window_end = body[counter_start..]
+					.find(';')
+					.map(|end| counter_start + end)
+					.unwrap_or(body.len());
+				let window = &body[counter_start..window_end];
+				if let Some(timer_at) = window.find("duration_micros(") {
+					let timer_start = timer_at + "duration_micros(".len();
+					if let Some(timer_len) = window[timer_start..].find(')') {
+						let timer = &window[timer_start..timer_start + timer_len];
+						let counters = timer_to_counters.entry(timer).or_default();
+						if !counters.contains(&counter) {
+							counters.push(counter);
+						}
+					}
+				}
+				cursor = counter_start;
+			}
+			for (timer, counters) in &timer_to_counters {
+				assert!(
+					counters.len() <= 1,
+					"{file}: timer {timer} feeds {counters:?} — one wall interval must \
+					 land in exactly one phase counter, or the counters stop \
+					 partitioning task wall"
+				);
+			}
+		}
+	}
+}

@@ -542,10 +542,6 @@ pub(super) async fn execute_hash_join_into_global_aggregate(
 				.counters
 				.build_rows
 				.saturating_add(spilled.input_row_count());
-			task.phases.spill_micros = task
-				.phases
-				.spill_micros
-				.saturating_add(duration_micros(build_started));
 			task.counters.spill_bytes = task
 				.counters
 				.spill_bytes
@@ -1902,10 +1898,6 @@ pub(super) async fn try_execute_streamed_spilled_left_semi_join(
 			.counters
 			.build_rows
 			.saturating_add(spilled.input_row_count());
-		task.phases.spill_micros = task
-			.phases
-			.spill_micros
-			.saturating_add(duration_micros(build_started));
 		task.counters.spill_bytes = task
 			.counters
 			.spill_bytes
@@ -2115,10 +2107,6 @@ pub(super) async fn try_execute_partitioned_spilled_left_outer_join(
 				.build_micros
 				.saturating_add(duration_micros(build_started));
 			task.counters.build_rows = task.counters.build_rows.saturating_add(build_rows);
-			task.phases.spill_micros = task
-				.phases
-				.spill_micros
-				.saturating_add(duration_micros(build_started));
 			task.counters.spill_bytes = task
 				.counters
 				.spill_bytes
@@ -2479,10 +2467,6 @@ pub(super) async fn try_execute_streamed_spilled_inner_join(
 			.counters
 			.build_rows
 			.saturating_add(spilled.input_row_count());
-		task.phases.spill_micros = task
-			.phases
-			.spill_micros
-			.saturating_add(duration_micros(build_started));
 		task.counters.spill_bytes = task
 			.counters
 			.spill_bytes

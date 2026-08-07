@@ -5902,10 +5902,6 @@ impl Executor {
 					.counters
 					.build_rows
 					.saturating_add(spilled.input_row_count());
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
-					.saturating_add(duration_micros(build_started));
 				task.counters.spill_bytes = task
 					.counters
 					.spill_bytes
@@ -6032,10 +6028,6 @@ impl Executor {
 					.counters
 					.build_rows
 					.saturating_add(spilled.input_row_count());
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
-					.saturating_add(duration_micros(build_started));
 				task.counters.spill_bytes = task
 					.counters
 					.spill_bytes
@@ -6483,10 +6475,6 @@ impl Executor {
 					.phases
 					.build_micros
 					.saturating_add(duration_micros(build_started));
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
-					.saturating_add(duration_micros(build_started));
 				task.counters.build_rows =
 					task.counters.build_rows.saturating_add(group_build_rows);
 				task.counters.spill_bytes =
@@ -6784,10 +6772,6 @@ impl Executor {
 					.phases
 					.build_micros
 					.saturating_add(duration_micros(build_started));
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
-					.saturating_add(duration_micros(build_started));
 				task.counters.build_rows =
 					task.counters.build_rows.saturating_add(group_build_rows);
 				task.counters.spill_bytes =
@@ -7030,10 +7014,6 @@ impl Executor {
 				task.phases.build_micros = task
 					.phases
 					.build_micros
-					.saturating_add(duration_micros(build_started));
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
 					.saturating_add(duration_micros(build_started));
 				task.counters.build_rows =
 					task.counters.build_rows.saturating_add(group_build_rows);
@@ -9157,10 +9137,6 @@ impl Executor {
 					.counters
 					.build_rows
 					.saturating_add(spilled.input_row_count());
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
-					.saturating_add(duration_micros(build_started));
 				task.counters.spill_bytes = task
 					.counters
 					.spill_bytes
@@ -9425,10 +9401,6 @@ impl Executor {
 						task.phases.build_micros = task
 							.phases
 							.build_micros
-							.saturating_add(duration_micros(build_started));
-						task.phases.spill_micros = task
-							.phases
-							.spill_micros
 							.saturating_add(duration_micros(build_started));
 						task.counters.spill_bytes = task
 							.counters
@@ -11060,10 +11032,6 @@ impl Executor {
 			task.phases.build_micros = task
 				.phases
 				.build_micros
-				.saturating_add(duration_micros(build_started));
-			task.phases.spill_micros = task
-				.phases
-				.spill_micros
 				.saturating_add(duration_micros(build_started));
 			task.counters.build_rows = task
 				.counters
@@ -14040,10 +14008,6 @@ impl Executor {
 				.phases
 				.build_micros
 				.saturating_add(duration_micros(terminal_build_started));
-			task.phases.spill_micros = task
-				.phases
-				.spill_micros
-				.saturating_add(duration_micros(terminal_build_started));
 			task.counters.spill_bytes = task
 				.counters
 				.spill_bytes
@@ -16664,10 +16628,6 @@ impl Executor {
 					.phases
 					.build_micros
 					.saturating_add(duration_micros(build_started));
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
-					.saturating_add(duration_micros(build_started));
 				task.counters.spill_bytes = task
 					.counters
 					.spill_bytes
@@ -16766,10 +16726,6 @@ impl Executor {
 				task.phases.build_micros = task
 					.phases
 					.build_micros
-					.saturating_add(duration_micros(build_started));
-				task.phases.spill_micros = task
-					.phases
-					.spill_micros
 					.saturating_add(duration_micros(build_started));
 				task.counters.spill_bytes = task
 					.counters
@@ -17767,10 +17723,6 @@ impl Executor {
 				.phases
 				.build_micros
 				.saturating_add(duration_micros(build_started));
-			task.phases.spill_micros = task
-				.phases
-				.spill_micros
-				.saturating_add(duration_micros(build_started));
 			task.counters.spill_bytes = task.counters.spill_bytes.saturating_add(total_spill_bytes);
 		});
 		Ok(Some((
@@ -17927,10 +17879,6 @@ impl Executor {
 			task.phases.build_micros = task
 				.phases
 				.build_micros
-				.saturating_add(duration_micros(build_started));
-			task.phases.spill_micros = task
-				.phases
-				.spill_micros
 				.saturating_add(duration_micros(build_started));
 			task.counters.spill_bytes = task.counters.spill_bytes.saturating_add(total_spill_bytes);
 		});
@@ -18553,10 +18501,6 @@ impl Executor {
 			task.phases.build_micros = task
 				.phases
 				.build_micros
-				.saturating_add(duration_micros(build_started));
-			task.phases.spill_micros = task
-				.phases
-				.spill_micros
 				.saturating_add(duration_micros(build_started));
 			task.counters.spill_bytes = task
 				.counters
