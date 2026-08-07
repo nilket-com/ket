@@ -98,9 +98,26 @@ The initial curated capability set is exactly:
 | `tab20c` | 20 |
 | `dark2` | 8 |
 | `kelly` | 20 |
-| `prism` | 20 |
+| `prism` | 17 |
+| `glowmax` | 17 |
 
-Every other curated family returns `None`. `None` is not a theme-resolution
+Every other curated family returns `None`.
+
+*Amended 2026-08-07, under this record's own extension mechanism and the
+dark2 rule.* `glowmax` is declared at seventeen: its fill is already an
+ordered `c01..c20` sequence, and its three achromatics — grey (Comment),
+white (shared by Punctuation and BodyText), dark grey (Whitespace) — are
+syntax furniture, present for token roles and excluded from the data palette
+exactly as dark2's whitespace neutral was. `prism` is narrowed from twenty to
+seventeen by the same rule: its three achromatics sit in the fill for
+punctuation and comments, not in the palette. This is authoring, not the
+inference §4 forbids — the categorical declaration is written by hand, the
+same act as dark2's eight. The narrowing is free today (no buffer names
+`prism` categorically) and would be a breaking change to capacity and `sN`
+modulus once one did, which is why it is decided now. The line it draws:
+**hand-authored fills exclude their furniture; published external sequences
+keep their canonical content** — `tab20c`'s trailing grey stays because it is
+matplotlib's published twenty, not ours. `None` is not a theme-resolution
 error and does not weaken syntax or table capability.
 
 `ThemeFamily::Curated` does not imply categorical availability. Family
@@ -194,9 +211,10 @@ vocabulary.
    production constructor and exposes immutable length, indexed colors, and
    ordered iteration.
 2. Every continuous canonical family resolves `Some` with exactly twenty colors.
-   Exactly the six declared curated families resolve `Some` at the lengths in
-   §2; every other curated family, including `nord`, resolves `None` while
-   remaining a valid syntax theme and table skin.
+   Exactly the declared curated families — seven since the 2026-08-07
+   amendment — resolve `Some` at the lengths in §2; every other curated
+   family, including `nord`, resolves `None` while remaining a valid syntax
+   theme and table skin.
 3. Base `tab20c` exposes exactly `c01..c20` in Matplotlib order, while its
    existing `Theme::palette()` retains the distinct syntax-role order beginning
    `c01, c09, c20, c02, c10`.
