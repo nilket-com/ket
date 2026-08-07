@@ -12,11 +12,23 @@ pub enum LegendSample {
 	PointSample,
 }
 
+/// Whether the label was read from the relation or manufactured by a kernel.
+///
+/// This is content provenance, not a rendering preference: PRODUCT-0044's
+/// policy needs it to distinguish a one-entry named series from a synthetic
+/// fallback such as `All Data` without inspecting the label text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LegendProvenance {
+	Named,
+	Synthetic,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct LegendEntry {
 	pub label: String,
 	pub swatch: Color,
 	pub sample: LegendSample,
+	pub provenance: LegendProvenance,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -53,6 +65,86 @@ impl LegendContent {
 	}
 }
 
+/// Apply PRODUCT-0044's content policy to one legend.
+///
+/// A lone synthetic entry describes no data identity, so it does not earn the
+/// chrome required to render it.  Kernels always produce their content; this
+/// is deliberately the only omission decision.
+pub fn apply_policy(content: LegendContent) -> Option<LegendContent> {
+	let (first, rest) = content.0.into_parts();
+	let mut sections = Vec::with_capacity(1 + rest.len());
+	sections.push(first);
+	sections.extend(rest);
+	let mut retained = sections.into_iter().filter(|section| {
+		!matches!(section, LegendSection::Entries(entries)
+			if entries.len() == 1
+				&& entries.first().provenance == LegendProvenance::Synthetic)
+	});
+	let first = retained.next()?;
+	let mut content = LegendContent(NonEmpty::new(first));
+	for section in retained {
+		content.push(section);
+	}
+	Some(content)
+}
+
+/// Combine content contributed in paint or cell order.
+///
+/// Entry identity is precisely the printed triple: label, swatch, and sample.
+/// Provenance deliberately does not participate.  If identical entries arrive
+/// with different provenance, a data-read name wins over a manufactured one.
+pub fn union<I>(contents: I) -> Option<LegendContent>
+where
+	I: IntoIterator<Item = LegendContent>,
+{
+	let mut sections = Vec::new();
+	let mut entry_section = None;
+	for content in contents {
+		for section in content.0.iter().cloned() {
+			match section {
+				LegendSection::Entries(entries) => {
+					let index = *entry_section.get_or_insert_with(|| {
+						sections.push(LegendSection::Entries(entries.clone()));
+						sections.len() - 1
+					});
+					if let LegendSection::Entries(existing) = &mut sections[index] {
+						for candidate in entries.iter().cloned() {
+							let current = existing.iter().position(|entry| {
+								entry.label == candidate.label
+									&& entry.swatch == candidate.swatch
+									&& entry.sample == candidate.sample
+							});
+							if let Some(current) = current {
+								let (first, rest) = existing.clone().into_parts();
+								let mut values = vec![first];
+								values.extend(rest);
+								if candidate.provenance == LegendProvenance::Named {
+									values[current].provenance = LegendProvenance::Named;
+								}
+								let mut rebuilt = NonEmpty::new(values.remove(0));
+								for value in values {
+									rebuilt.push(value);
+								}
+								*existing = rebuilt;
+							} else {
+								existing.push(candidate);
+							}
+						}
+					}
+				}
+				other => sections.push(other),
+			}
+		}
+	}
+	let mut sections = sections.into_iter();
+	let first = sections.next()?;
+	let mut content = LegendContent(NonEmpty::new(first));
+	for section in sections {
+		content.push(section);
+	}
+	apply_policy(content)
+}
+
 pub fn entries_from_labels<I, S>(
 	labels: I,
 	settings: &ResolvedPlotSettings,
@@ -61,13 +153,19 @@ where
 	I: IntoIterator<Item = S>,
 	S: Into<String>,
 {
-	entries_from_labels_with_sample(labels, settings, LegendSample::Swatch)
+	entries_from_labels_with_sample_and_provenance(
+		labels,
+		settings,
+		LegendSample::Swatch,
+		LegendProvenance::Named,
+	)
 }
 
-pub fn entries_from_labels_with_sample<I, S>(
+pub fn entries_from_labels_with_sample_and_provenance<I, S>(
 	labels: I,
 	settings: &ResolvedPlotSettings,
 	sample: LegendSample,
+	provenance: LegendProvenance,
 ) -> Option<LegendContent>
 where
 	I: IntoIterator<Item = S>,
@@ -83,6 +181,7 @@ where
 			.color_theme
 			.get_color(if total > 1 { 0.0 } else { 0.5 }),
 		sample: sample.clone(),
+		provenance,
 	});
 	for (index, label) in iter {
 		let t = if total > 1 {
@@ -94,20 +193,17 @@ where
 			label,
 			swatch: settings.color_theme.get_color(t),
 			sample: sample.clone(),
+			provenance,
 		});
 	}
 	Some(LegendContent::entries(entries))
 }
 
-pub fn entries_from_pairs<I, S>(pairs: I) -> Option<LegendContent>
-where
-	I: IntoIterator<Item = (S, Color)>,
-	S: Into<String>,
-{
-	entries_from_pairs_with_sample(pairs, LegendSample::Swatch)
-}
-
-pub fn entries_from_pairs_with_sample<I, S>(pairs: I, sample: LegendSample) -> Option<LegendContent>
+pub fn entries_from_pairs_with_sample_and_provenance<I, S>(
+	pairs: I,
+	sample: LegendSample,
+	provenance: LegendProvenance,
+) -> Option<LegendContent>
 where
 	I: IntoIterator<Item = (S, Color)>,
 	S: Into<String>,
@@ -118,12 +214,14 @@ where
 		label: label.into(),
 		swatch,
 		sample: sample.clone(),
+		provenance,
 	});
 	for (label, swatch) in iter {
 		entries.push(LegendEntry {
 			label: label.into(),
 			swatch,
 			sample: sample.clone(),
+			provenance,
 		});
 	}
 	Some(LegendContent::entries(entries))
@@ -485,5 +583,83 @@ pub fn render_legend(
 				offset += 180.0;
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	fn entry(label: &str, sample: LegendSample, provenance: LegendProvenance) -> LegendEntry {
+		LegendEntry {
+			label: label.to_owned(),
+			swatch: Color::from_rgb8(12, 34, 56),
+			sample,
+			provenance,
+		}
+	}
+
+	fn content(entry: LegendEntry) -> LegendContent {
+		LegendContent::entries(NonEmpty::new(entry))
+	}
+
+	#[test]
+	fn product_0044_policy_omits_only_lone_synthetic_entries() {
+		assert!(
+			apply_policy(content(entry(
+				"All Data",
+				LegendSample::PointSample,
+				LegendProvenance::Synthetic,
+			)))
+			.is_none()
+		);
+		assert!(
+			apply_policy(content(entry(
+				"Adelie",
+				LegendSample::PointSample,
+				LegendProvenance::Named,
+			)))
+			.is_some()
+		);
+	}
+
+	#[test]
+	fn product_0044_union_deduplicates_the_printed_triple_and_named_wins() {
+		let merged = union([
+			content(entry(
+				"Value",
+				LegendSample::Swatch,
+				LegendProvenance::Synthetic,
+			)),
+			content(entry(
+				"Value",
+				LegendSample::Swatch,
+				LegendProvenance::Named,
+			)),
+		])
+		.expect("named duplicate survives the merge");
+		let LegendSection::Entries(entries) = merged.0.first() else {
+			panic!("entries section");
+		};
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries.first().provenance, LegendProvenance::Named);
+
+		let distinct_samples = union([
+			content(entry(
+				"series",
+				LegendSample::LineSample,
+				LegendProvenance::Named,
+			)),
+			content(entry(
+				"series",
+				LegendSample::PointSample,
+				LegendProvenance::Named,
+			)),
+		])
+		.expect("different samples remain distinct");
+		let LegendSection::Entries(entries) = distinct_samples.0.first() else {
+			panic!("entries section");
+		};
+		assert_eq!(entries.len(), 2);
 	}
 }

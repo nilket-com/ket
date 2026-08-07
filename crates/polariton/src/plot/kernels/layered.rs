@@ -85,26 +85,44 @@ impl LayerRenderer {
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
 		match self {
-			Self::Line(renderer, _) => crate::plot::legend::entries_from_labels_with_sample(
-				renderer
-					.prepared_data
-					.series
-					.iter()
-					.map(|series| series.name.clone()),
-				settings,
-				crate::plot::legend::LegendSample::LineSample,
-			),
-			Self::Scatter(renderer, _) => crate::plot::legend::entries_from_pairs_with_sample(
-				renderer.prepared_data.series.iter().map(|series| {
-					(
-						series.name.clone(),
-						series
-							.resolved_color
-							.unwrap_or_else(|| settings.color_theme.get_color(series.color_t)),
-					)
-				}),
-				crate::plot::legend::LegendSample::PointSample,
-			),
+			Self::Line(renderer, _) => {
+				crate::plot::legend::entries_from_labels_with_sample_and_provenance(
+					renderer
+						.prepared_data
+						.series
+						.iter()
+						.map(|series| series.name.clone()),
+					settings,
+					crate::plot::legend::LegendSample::LineSample,
+					renderer
+						.prepared_data
+						.series
+						.first()
+						.map_or(crate::plot::legend::LegendProvenance::Named, |series| {
+							series.provenance
+						}),
+				)
+			}
+			Self::Scatter(renderer, _) => {
+				crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+					renderer.prepared_data.series.iter().map(|series| {
+						(
+							series.name.clone(),
+							series
+								.resolved_color
+								.unwrap_or_else(|| settings.color_theme.get_color(series.color_t)),
+						)
+					}),
+					crate::plot::legend::LegendSample::PointSample,
+					renderer
+						.prepared_data
+						.series
+						.first()
+						.map_or(crate::plot::legend::LegendProvenance::Named, |series| {
+							series.provenance
+						}),
+				)
+			}
 		}
 	}
 }
@@ -210,13 +228,15 @@ impl PlotKernel for LayeredPlotKernel {
 		None
 	}
 
-	/// PRODUCT-0013 bridge: the last authored (topmost painted) layer owns the
-	/// temporary, unmerged legend output.
 	fn legend_content(
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		self.layers.last().legend_content(settings)
+		crate::plot::legend::union(
+			self.layers
+				.iter()
+				.filter_map(|layer| layer.legend_content(settings)),
+		)
 	}
 
 	fn x_label(&self) -> String {

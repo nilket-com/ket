@@ -554,6 +554,11 @@ impl PlotComposite for PlotGridKernel {
 		let resolved = settings.resolve();
 		let outer = grid_outer_area(bounds, padding);
 		let layouts = self.cell_layouts(resolved.clone());
+		let figure_legend = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+		);
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
 			let cell_bounds = grid_cell_bounds(outer, self.arrangement, *position);
@@ -625,17 +630,6 @@ impl PlotComposite for PlotGridKernel {
 					}
 				});
 				helper.draw_axis_labels(backend, inner);
-				backend.with_save(&mut |backend| {
-					backend.translate(iced::Vector::new(cell_bounds.x, cell_bounds.y));
-					if let Some(content) = cell.kernel.legend_content(&resolved) {
-						crate::plot::legend::render_legend(
-							backend,
-							IcedRectangle::new(Point::ORIGIN, cell_bounds.size()),
-							&content,
-							&resolved,
-						);
-					}
-				});
 				if let Some(label) = &cell.cell.label {
 					backend.fill_text(iced::widget::canvas::Text {
 						content: label.clone(),
@@ -652,6 +646,9 @@ impl PlotComposite for PlotGridKernel {
 					});
 				}
 			});
+		}
+		if let Some(content) = figure_legend {
+			crate::plot::legend::render_legend(backend, bounds, &content, &resolved);
 		}
 	}
 
@@ -885,6 +882,50 @@ mod tests {
 			.expect("single-point mark")
 	}
 
+	struct LegendOnlyKernel {
+		content: crate::plot::legend::LegendContent,
+	}
+
+	impl PlotKernel for LegendOnlyKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_axis_type: crate::plot::common::AxisType::Linear,
+				y_axis_type: crate::plot::common::AxisType::Linear,
+			}
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: IcedRectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn legend_content(
+			&self,
+			_settings: &ResolvedPlotSettings,
+		) -> Option<crate::plot::legend::LegendContent> {
+			Some(self.content.clone())
+		}
+
+		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+			None
+		}
+
+		fn x_label(&self) -> String {
+			"x".to_owned()
+		}
+
+		fn y_label(&self) -> String {
+			"y".to_owned()
+		}
+	}
+
 	#[test]
 	fn value_facet_preserves_partition_order_and_exact_slices() {
 		let (body, _data, stamped) = fixture();
@@ -916,6 +957,65 @@ mod tests {
 			.collect();
 		assert_eq!(first_x, vec![0.0, 2.0]);
 		assert_eq!(second_x, vec![1.0, 3.0]);
+	}
+
+	#[test]
+	fn product_0044_grid_renders_one_figure_legend_from_cell_union() {
+		let (body, _data, stamped) = fixture();
+		let grid = PlotGrid::value_facet(
+			body,
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).expect("arrangement"),
+		)
+		.expect("facet");
+		let kernel = PlotGridKernel::from_grid_with_factory(grid, 400, 300, |_spec, data| {
+			let cell = data
+				.column("facet")
+				.expect("facet column")
+				.get(0)
+				.expect("facet value")
+				.to_string()
+				.trim_matches('"')
+				.to_owned();
+			let mut entries = NonEmpty::new(crate::plot::legend::LegendEntry {
+				label: "shared".to_owned(),
+				swatch: iced::Color::from_rgb8(10, 20, 30),
+				sample: crate::plot::legend::LegendSample::PointSample,
+				provenance: crate::plot::legend::LegendProvenance::Named,
+			});
+			entries.push(crate::plot::legend::LegendEntry {
+				label: format!("series-{cell}"),
+				swatch: iced::Color::from_rgb8(40, 50, 60),
+				sample: crate::plot::legend::LegendSample::PointSample,
+				provenance: crate::plot::legend::LegendProvenance::Named,
+			});
+			Ok(Arc::new(LegendOnlyKernel {
+				content: crate::plot::legend::LegendContent::entries(entries),
+			}))
+		})
+		.expect("grid kernel");
+		let model = PlotSettings::default();
+		let mut backend = SvgBackend::new(400.0, 300.0);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0)),
+		);
+		let svg = backend.finish();
+		assert_eq!(svg.matches("fill-opacity=\"0.60\"").count(), 1, "{svg}");
+		assert_eq!(svg.matches(">shared</text>").count(), 1, "{svg}");
+		assert_eq!(svg.matches(">series-A</text>").count(), 1, "{svg}");
+		assert_eq!(svg.matches(">series-B</text>").count(), 1, "{svg}");
 	}
 
 	#[test]

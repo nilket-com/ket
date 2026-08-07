@@ -2,6 +2,7 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings, format_label, polars_type_to_axis_type,
 };
+use crate::plot::legend::LegendProvenance;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Point, Rectangle};
@@ -167,13 +168,17 @@ impl PlotKernel for LinePlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels_with_sample(
+		crate::plot::legend::entries_from_labels_with_sample_and_provenance(
 			self.prepared_data
 				.series
 				.iter()
 				.map(|series| series.name.clone()),
 			settings,
 			crate::plot::legend::LegendSample::LineSample,
+			self.prepared_data
+				.series
+				.first()
+				.map_or(LegendProvenance::Named, |series| series.provenance),
 		)
 	}
 
@@ -191,6 +196,7 @@ pub struct SeriesData {
 	pub name: String,
 	pub points: Vec<[f64; 2]>,
 	pub color_t: f32,
+	pub provenance: LegendProvenance,
 }
 
 pub struct LinePreparedData {
@@ -303,7 +309,48 @@ pub fn prepare_line_data(
 			name: cat_name,
 			points,
 			color_t: t,
+			provenance: if cat_col.is_empty() {
+				LegendProvenance::Synthetic
+			} else {
+				LegendProvenance::Named
+			},
 		});
+	}
+	if !cat_col.is_empty() {
+		let first_appearance = df
+			.column(cat_col)
+			.ok()
+			.into_iter()
+			.flat_map(|column| (0..df.height()).filter_map(move |index| column.get(index).ok()))
+			.map(|value| {
+				if let AnyValue::String(value) = value {
+					value.to_owned()
+				} else if value.is_null() {
+					"Null".to_owned()
+				} else {
+					value.to_string().replace('"', "")
+				}
+			})
+			.fold(Vec::new(), |mut seen, label| {
+				if !seen.contains(&label) {
+					seen.push(label);
+				}
+				seen
+			});
+		series_list.sort_by_key(|series| {
+			first_appearance
+				.iter()
+				.position(|label| label == &series.name)
+				.unwrap_or(usize::MAX)
+		});
+		let total = series_list.len();
+		for (index, series) in series_list.iter_mut().enumerate() {
+			series.color_t = if total > 1 {
+				index as f32 / (total - 1) as f32
+			} else {
+				0.5
+			};
+		}
 	}
 	LinePreparedData {
 		series: series_list,

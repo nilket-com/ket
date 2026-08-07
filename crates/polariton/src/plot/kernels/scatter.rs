@@ -2,6 +2,7 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings, ScatterRenderMode, format_label, polars_type_to_axis_type,
 };
+use crate::plot::legend::LegendProvenance;
 use crate::plot::spec::{
 	Channel, PointSize, ResolvedColor, ResolvedLayout, ResolvedPlotSpec, ScaleDomain, ScaleFamily,
 };
@@ -96,9 +97,13 @@ impl PlotKernel for ScatterPlotKernel {
 					.unwrap_or_else(|| settings.color_theme.get_color(series.color_t)),
 			)
 		});
-		crate::plot::legend::entries_from_pairs_with_sample(
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			pairs,
 			crate::plot::legend::LegendSample::PointSample,
+			self.prepared_data
+				.series
+				.first()
+				.map_or(LegendProvenance::Named, |series| series.provenance),
 		)
 	}
 
@@ -346,6 +351,7 @@ pub struct ScatterSeries {
 	pub y_values: Float64Chunked,
 	pub color_t: f32,
 	pub resolved_color: Option<Color>,
+	pub provenance: LegendProvenance,
 }
 
 impl ScatterSeries {
@@ -645,7 +651,15 @@ pub fn prepare_scatter_data_resolved(
 			y_values: ys,
 			color_t,
 			resolved_color,
+			provenance: if color_field.is_empty() {
+				LegendProvenance::Synthetic
+			} else {
+				LegendProvenance::Named
+			},
 		});
+	}
+	if !color_field.is_empty() {
+		order_series_by_display_domain(&mut series, df, color_field);
 	}
 	ScatterPreparedData {
 		series,
@@ -688,6 +702,38 @@ fn category_label(value: AnyValue<'_>) -> String {
 		AnyValue::String(value) => value.to_owned(),
 		AnyValue::Null => "Null".to_owned(),
 		value => value.to_string().replace('"', ""),
+	}
+}
+
+/// `partition_by` has no display-order contract. Marks and their legends
+/// share palette positions, so restore the source's first-appearance order
+/// before assigning those positions.
+fn order_series_by_display_domain(series: &mut [ScatterSeries], df: &DataFrame, field: &str) {
+	let order = df
+		.column(field)
+		.ok()
+		.into_iter()
+		.flat_map(|column| (0..df.height()).filter_map(move |index| column.get(index).ok()))
+		.map(category_label)
+		.fold(Vec::new(), |mut seen, label| {
+			if !seen.contains(&label) {
+				seen.push(label);
+			}
+			seen
+		});
+	series.sort_by_key(|item| {
+		order
+			.iter()
+			.position(|label| label == &item.name)
+			.unwrap_or(usize::MAX)
+	});
+	let total = series.len();
+	for (index, item) in series.iter_mut().enumerate() {
+		item.color_t = if total > 1 {
+			index as f32 / (total - 1) as f32
+		} else {
+			0.5
+		};
 	}
 }
 
@@ -798,7 +844,15 @@ pub fn prepare_scatter_data(
 			y_values: ys,
 			color_t: t,
 			resolved_color: None,
+			provenance: if cat_col.is_empty() {
+				LegendProvenance::Synthetic
+			} else {
+				LegendProvenance::Named
+			},
 		});
+	}
+	if !cat_col.is_empty() {
+		order_series_by_display_domain(&mut series_list, df, cat_col);
 	}
 	ScatterPreparedData {
 		series: series_list,
@@ -876,6 +930,31 @@ mod tests {
 			kernel.layout(ResolvedPlotSettings::default()),
 			PlotLayout::CategoricalX { categories, .. } if categories == ["a", "b", "c"]
 		));
+	}
+
+	#[test]
+	fn product_0044_series_order_follows_the_display_domain() {
+		let first = polars::df!(
+			"series" => ["B", "A", "C", "B"],
+			"x" => [1.0_f64, 2.0, 3.0, 4.0],
+			"y" => [4.0_f64, 3.0, 2.0, 1.0]
+		)
+		.expect("first-order frame");
+		let reordered = polars::df!(
+			"series" => ["C", "B", "A", "B"],
+			"x" => [3.0_f64, 1.0, 2.0, 4.0],
+			"y" => [2.0_f64, 4.0, 3.0, 1.0]
+		)
+		.expect("reordered frame");
+		let names = |frame: &DataFrame| {
+			prepare_scatter_data(frame, "series", "x", "y")
+				.series
+				.into_iter()
+				.map(|series| series.name)
+				.collect::<Vec<_>>()
+		};
+		assert_eq!(names(&first), ["B", "A", "C"]);
+		assert_eq!(names(&reordered), ["C", "B", "A"]);
 	}
 
 	#[test]
@@ -1009,6 +1088,7 @@ mod tests {
 			y_values: Series::new("y".into(), ys).f64().unwrap().clone(),
 			color_t: 0.5,
 			resolved_color: None,
+			provenance: LegendProvenance::Named,
 		};
 
 		let sampled = downsample_series(&series, viewport, &transform, 11);

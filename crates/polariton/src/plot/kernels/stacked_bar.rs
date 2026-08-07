@@ -1,6 +1,7 @@
 use crate::plot::common::{
 	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
+use crate::plot::legend::LegendProvenance;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use polars::prelude::*;
@@ -223,9 +224,11 @@ impl PlotKernel for StackedBarPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
+		crate::plot::legend::entries_from_labels_with_sample_and_provenance(
 			self.prepared_data.group_names.iter().cloned(),
 			settings,
+			crate::plot::legend::LegendSample::Swatch,
+			self.prepared_data.group_provenance,
 		)
 	}
 
@@ -251,6 +254,7 @@ pub struct StackedBarPreparedData {
 	pub y_range: (f64, f64),
 	pub x_label: String,
 	pub y_label: String,
+	pub group_provenance: LegendProvenance,
 }
 
 pub fn prepare_stacked_bar_data(
@@ -267,6 +271,7 @@ pub fn prepare_stacked_bar_data(
 			y_range: (0.0, 1.0),
 			x_label: cat_col.to_string(),
 			y_label: val_col.to_string(),
+			group_provenance: LegendProvenance::Synthetic,
 		};
 	}
 	let (categories, _categories_series) = if cat_col.is_empty() {
@@ -398,6 +403,11 @@ pub fn prepare_stacked_bar_data(
 		y_range,
 		x_label: cat_col.to_string(),
 		y_label: val_col.to_string(),
+		group_provenance: if group_col.is_empty() {
+			LegendProvenance::Synthetic
+		} else {
+			LegendProvenance::Named
+		},
 	}
 }
 

@@ -1,6 +1,6 @@
 # ADR 0044: the legend policy
 
-Status: proposed 2026-08-07. This record decides what a legend says: entry
+Status: accepted 2026-08-07. This record decides what a legend says: entry
 ordering, merging across layers, one legend versus N across grid cells, what a
 band-filled bar's legend contains, and the panel-label rule. Every decision is
 policy over PRODUCT-0043's `LegendContent`, with **one explicitly authorized

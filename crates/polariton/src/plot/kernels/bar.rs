@@ -1,6 +1,7 @@
 use crate::plot::common::{
 	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
+use crate::plot::legend::LegendProvenance;
 use crate::plot::spec::{BandFillAssignment, LayerSettings};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
@@ -231,6 +232,9 @@ impl PlotKernel for BarPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
+		if !self.band_fills.is_empty() {
+			return None;
+		}
 		let total = self.prepared_data.group_names.len();
 		let pairs = self
 			.prepared_data
@@ -238,37 +242,18 @@ impl PlotKernel for BarPlotKernel {
 			.iter()
 			.enumerate()
 			.map(|(i, name)| {
-				let fallback = settings.color_theme.get_color(if total > 1 {
+				let color = settings.color_theme.get_color(if total > 1 {
 					i as f32 / (total - 1) as f32
 				} else {
 					0.5
 				});
-				let color = self
-					.band_fills
-					.iter()
-					.find(|fill| fill.category == *name)
-					.map(|fill| {
-						iced::Color::from_rgba8(
-							fill.color.red,
-							fill.color.green,
-							fill.color.blue,
-							fill.color.alpha as f32 / 255.0,
-						)
-					})
-					.or_else(|| {
-						self.band_fills.get(i).map(|fill| {
-							iced::Color::from_rgba8(
-								fill.color.red,
-								fill.color.green,
-								fill.color.blue,
-								fill.color.alpha as f32 / 255.0,
-							)
-						})
-					})
-					.unwrap_or(fallback);
 				(name.clone(), color)
 			});
-		crate::plot::legend::entries_from_pairs(pairs)
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+			pairs,
+			crate::plot::legend::LegendSample::Swatch,
+			self.prepared_data.group_provenance,
+		)
 	}
 
 	fn x_label(&self) -> String {
@@ -293,6 +278,7 @@ pub struct BarPreparedData {
 	pub y_range: (f64, f64),
 	pub x_label: String,
 	pub y_label: String,
+	pub group_provenance: LegendProvenance,
 }
 
 pub fn prepare_bar_data(
@@ -309,6 +295,7 @@ pub fn prepare_bar_data(
 			y_range: (0.0, 1.0),
 			x_label: cat_col.to_string(),
 			y_label: val_col.to_string(),
+			group_provenance: LegendProvenance::Synthetic,
 		};
 	}
 	let (categories, _categories_series) = if cat_col.is_empty() {
@@ -437,6 +424,11 @@ pub fn prepare_bar_data(
 		y_range,
 		x_label: cat_col.to_string(),
 		y_label: val_col.to_string(),
+		group_provenance: if group_col.is_empty() {
+			LegendProvenance::Synthetic
+		} else {
+			LegendProvenance::Named
+		},
 	}
 }
 

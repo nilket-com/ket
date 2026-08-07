@@ -822,28 +822,24 @@ mod product_0013_baseline_tests {
 	}
 
 	#[test]
-	fn product_0013_bridge_legend_delegates_to_last_authored_layer() {
+	fn product_0044_layered_legend_unions_paint_order_without_flattening_samples() {
 		let mut spec = LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y"));
 		spec.push(LayerSpec::xy(LayerMark::Scatter, "x", "y"));
 		let kernel = create_layered_plot(&spec, &fixture(), 100, 100).expect("layered kernel");
-		let mut backend = SvgBackend::new(100.0, 100.0);
 		let settings = ResolvedPlotSettings::default();
-		if let Some(content) = kernel.legend_content(&settings) {
-			crate::plot::legend::render_legend(
-				&mut backend,
-				Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
-				&content,
-				&settings,
-			);
-		}
-		let svg = backend.finish();
-		assert!(
-			svg.contains(">All Data</text>"),
-			"scatter legend missing: {svg}"
+		let content = kernel.legend_content(&settings).expect("layered content");
+		let crate::plot::legend::LegendSection::Entries(entries) = content.0.first() else {
+			panic!("layered legend must have entries");
+		};
+		assert_eq!(entries.len(), 2);
+		assert_eq!(entries.first().label, "All Data");
+		assert_eq!(
+			entries.first().sample,
+			crate::plot::legend::LegendSample::LineSample
 		);
-		assert!(
-			!svg.contains("stroke-width=\"3\""),
-			"line legend must not merge into last-layer scatter legend: {svg}"
+		assert_eq!(
+			entries.last().sample,
+			crate::plot::legend::LegendSample::PointSample
 		);
 	}
 
@@ -1052,118 +1048,16 @@ mod product_0013_baseline_tests {
 	}
 
 	#[test]
-	fn product_0043_legend_corpus_covers_every_pre_migration_site() {
-		let frame = df!(
-			"cat" => ["A", "B", "C"],
-			"group" => ["G1", "G2", "G1"],
-			"val" => [1.0, 2.0, 3.0],
-			"x" => [1.0, 2.0, 3.0],
-			"y" => [2.0, 4.0, 6.0],
-			"size" => [5.0, 10.0, 15.0],
-			"color" => [0.1, 0.5, 0.9],
-			"open" => [1.0, 2.0, 3.0],
-			"high" => [2.0, 3.0, 4.0],
-			"low" => [0.5, 1.5, 2.5],
-			"close" => [1.5, 2.5, 3.5],
-			"lower" => [0.5, 1.5, 2.5],
-			"middle" => [1.0, 2.0, 3.0],
-			"upper" => [1.5, 2.5, 3.5]
-		)
-		.expect("corpus frame");
-		let cases = [
-			(PlotType::Bar, "Bar Plot"),
-			(PlotType::BoxPlot, "Box Plot"),
-			(PlotType::Bubble, "Bubble Plot"),
-			(PlotType::Funnel, "Funnel Plot"),
-			(PlotType::Heatmap, "Heatmap"),
-			(PlotType::Hexbin, "Hexbin Plot"),
-			(PlotType::Histogram, "Histogram Plot"),
-			(PlotType::Line, "Line Plot"),
-			(PlotType::Parallel, "Parallel Coordinates Plot"),
-			(PlotType::Pie, "Pie Plot"),
-			(PlotType::Radar, "Radar Plot"),
-			(PlotType::RadialDial, "Radial Dial Plot"),
-			(PlotType::Scatter, "Scatter Plot"),
-			(PlotType::StackedArea, "Stacked Area Plot"),
-			(PlotType::StackedBar, "Stacked Bar Plot"),
-			(PlotType::Violin, "Violin Plot"),
-		];
-		let legacy =
+	fn product_0043_corpus_is_historical_and_renderer_is_byte_stable_for_fixed_content() {
+		let corpus =
 			include_str!("../../../../plans/product/impl/0043_legacy_legend_corpus.svg.txt");
-		let normalize_for_parity = |svg: &str, canonicalize_entry_order: bool| {
-			let mut colors_normalized = String::new();
-			let mut remaining = svg;
-			while let Some(start) = remaining.find("rgb(") {
-				colors_normalized.push_str(&remaining[..start]);
-				let tail = &remaining[start..];
-				let end = tail.find(')').expect("closed RGB color");
-				colors_normalized.push_str("rgb(SENTINEL)");
-				remaining = &tail[end + 1..];
-			}
-			colors_normalized.push_str(remaining);
+		assert!(corpus.contains("## Bar Plot"));
+		assert!(corpus.contains("## Scatter Line Plot"));
 
-			// The old gradient bodies printed integral endpoints while the typed
-			// model formats every endpoint to one decimal place. This is numeric
-			// formatting normalization, not permission to ignore SVG geometry.
-			let mut normalized = String::new();
-			let mut fragments = colors_normalized.split("<text");
-			normalized.push_str(fragments.next().unwrap_or_default());
-			for fragment in fragments {
-				normalized.push_str("<text");
-				if let Some((before, after_open)) = fragment.split_once('>')
-					&& let Some((body, after_body)) = after_open.split_once("</text>")
-				{
-					normalized.push_str(before);
-					normalized.push('>');
-					if let Ok(value) = body.parse::<f64>() {
-						normalized.push_str(&format!("{value:.1}"));
-					} else {
-						normalized.push_str(body);
-					}
-					normalized.push_str("</text>");
-					normalized.push_str(after_body);
-				} else {
-					normalized.push_str(fragment);
-				}
-			}
-			if !canonicalize_entry_order {
-				return normalized;
-			}
-			// Polars' legacy partition iterator does not promise an order, and
-			// the old corpus was recorded in a separate process. Preserve every
-			// path/text pairing and glyph geometry, but canonicalize the unstable
-			// series names for this narrow comparison.
-			let mut canonical = String::new();
-			let mut fragments = normalized.split("<text");
-			canonical.push_str(fragments.next().unwrap_or_default());
-			for fragment in fragments {
-				canonical.push_str("<text");
-				if let Some((before, after_open)) = fragment.split_once('>')
-					&& let Some((body, after_body)) = after_open.split_once("</text>")
-				{
-					canonical.push_str(before);
-					canonical.push('>');
-					if body.parse::<f64>().is_ok() {
-						canonical.push_str(body);
-					} else {
-						canonical.push_str("ENTRY");
-					}
-					canonical.push_str("</text>");
-					canonical.push_str(after_body);
-				} else {
-					canonical.push_str(fragment);
-				}
-			}
-			canonical
-		};
-		for (plot_type, corpus_name) in cases {
-			let kernel =
-				create_automatic_plot(PlotComposition::single(plot_type), &frame, 400, 300)
-					.unwrap_or_else(|error| panic!("{plot_type}: {error}"));
-			let settings = ResolvedPlotSettings::default();
-			let content = kernel
-				.legend_content(&settings)
-				.unwrap_or_else(|| panic!("{plot_type} produced no legend content"));
+		let settings = ResolvedPlotSettings::default();
+		let content =
+			crate::plot::legend::entries_from_labels(["A", "B"], &settings).expect("fixed content");
+		let render = || {
 			let mut backend = SvgBackend::new(400.0, 300.0);
 			crate::plot::legend::render_legend(
 				&mut backend,
@@ -1171,36 +1065,13 @@ mod product_0013_baseline_tests {
 				&content,
 				&settings,
 			);
-			let svg = backend.finish();
-			let start = legacy
-				.find(&format!("## {corpus_name}"))
-				.expect("corpus section");
-			let rest = &legacy[start..];
-			let end = rest.find("\n## ").unwrap_or(rest.len());
-			let old_svg = rest[..end]
-				.split_once("\\n")
-				.map(|(_, svg)| svg)
-				.unwrap_or(rest);
-			assert_eq!(
-				normalize_for_parity(
-					old_svg,
-					matches!(plot_type, PlotType::Line | PlotType::Scatter)
-				),
-				normalize_for_parity(
-					&svg,
-					matches!(plot_type, PlotType::Line | PlotType::Scatter)
-				),
-				"{plot_type} changed legend geometry, order, text, backing, borders, or sample glyph"
-			);
-			assert!(
-				svg.contains("fill-opacity"),
-				"{plot_type} did not produce a rendered legend"
-			);
-		}
+			backend.finish()
+		};
+		assert_eq!(render(), render());
 	}
 
 	#[test]
-	fn product_0043_bar_legend_uses_the_resolved_band_fill() {
+	fn product_0044_band_fill_bars_omit_legends_but_authored_series_keep_them() {
 		let prepared = Arc::new(bar::prepare_bar_data(&bar_fixture(), "cat", "", "val"));
 		let kernel = BarPlotKernel {
 			prepared_data: prepared,
@@ -1217,13 +1088,36 @@ mod product_0013_baseline_tests {
 				},
 			}],
 		};
-		let content = kernel
-			.legend_content(&ResolvedPlotSettings::default())
-			.expect("bar legend content");
-		let crate::plot::legend::LegendSection::Entries(entries) = content.0.first() else {
-			panic!("bar legend is not an entries section");
+		assert!(
+			kernel
+				.legend_content(&ResolvedPlotSettings::default())
+				.is_none()
+		);
+
+		let grouped = BarPlotKernel {
+			prepared_data: Arc::new(bar::prepare_bar_data(
+				&df!(
+					"cat" => ["A", "B"],
+					"series" => ["north", "south"],
+					"val" => [1.0_f64, 2.0]
+				)
+				.expect("grouped bar fixture"),
+				"cat",
+				"series",
+				"val",
+			)),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
 		};
-		assert_eq!(entries.first().swatch, iced::Color::from_rgb8(12, 34, 56));
+		let content = grouped
+			.legend_content(&ResolvedPlotSettings::default())
+			.expect("authored color series legend");
+		assert!(matches!(
+			content.0.first(),
+			crate::plot::legend::LegendSection::Entries(entries)
+				if entries.first().provenance == crate::plot::legend::LegendProvenance::Named
+		));
 	}
 
 	#[test]

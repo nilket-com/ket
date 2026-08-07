@@ -977,7 +977,11 @@ impl<'a> PlotWidget<'a> {
 			}
 		});
 		let size_only_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
-		if let Some(content) = self.kernel.legend_content(&self.settings) {
+		if let Some(content) = self
+			.kernel
+			.legend_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy)
+		{
 			render_legend(backend, size_only_bounds, &content, &self.settings);
 		}
 		let title = self
@@ -2056,6 +2060,7 @@ mod product_0031_pre_extraction_oracle {
 				label: "series".to_owned(),
 				swatch: Color::from_rgb8(17, 34, 51),
 				sample: crate::plot::legend::LegendSample::Swatch,
+				provenance: crate::plot::legend::LegendProvenance::Named,
 			});
 			Some(crate::plot::legend::LegendContent::entries(entries))
 		}
