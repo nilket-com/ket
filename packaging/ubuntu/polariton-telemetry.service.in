@@ -1,0 +1,18 @@
+[Unit]
+Description=Polariton telemetry sampler - internal telemetry landed in Toron
+# The sampler tolerates the deployment being down (it retries), so it only wants
+# the service ordering, never a hard binding that would gap the record on restart.
+After=nilket-local.service
+Wants=nilket-local.service
+
+[Service]
+Type=exec
+ExecStart="@SAMPLER@"
+Environment=POLARITON_NILKET_BIN=@NILKET_EXECUTABLE@
+Environment=POLARITON_PROFILE_ROOT=@PROFILE_ROOT@
+Restart=always
+RestartSec=10s
+UMask=0077
+
+[Install]
+WantedBy=default.target
