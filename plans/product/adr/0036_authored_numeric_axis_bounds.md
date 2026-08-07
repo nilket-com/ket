@@ -30,8 +30,13 @@ position reached by reasoning alone.
 which maps forward to pixel `0`. Forward and inverse disagree.
 
 **Negative bounds are not literals.** Rune parses `-1.0` as
-`Expr::Unary(Neg, Expr::Lit(Number))`, and the envelope has no numeric-literal
-precedent at all — every field it recognizes today is a string.
+`Expr::Unary(Neg, Expr::Lit(Number))`, and no **figure element** has a
+numeric-literal precedent — every figure argument recognized today is a string.
+(The closed mark-modifier registers of PRODUCT-0018, 0020, and 0022 already
+decode unsuffixed numeric literals as arguments; the figure-element grammar,
+including unary negation, is fixed here. This sentence originally claimed the
+envelope had no numeric-literal precedent at all; corrected 2026-08-06 by the
+architectural review's record-accuracy pass.)
 
 ## Decision
 

@@ -1,6 +1,13 @@
 # ADR 0030: the categorical palette figure surface
 
-Status: proposed 2026-08-05. This record decides one thing: how a Rune figure
+Status: accepted 2026-08-05, with gate 16 open and named — the real-window
+fidelity observation has not yet been confirmed. Accepted-with-an-open-gate
+means the record's decisions are landed and may be depended upon (PRODUCT-0032,
+0036, and 0038 already do) while one named observation gate remains
+deliberately unclosed; it replaces the prior "proposed" status, which was
+untrue the moment other accepted records built on this one. Status corrected
+2026-08-06 by the architectural review's record-accuracy pass. This record
+decides one thing: how a Rune figure
 selects the categorical palette used by plots. It adds `palette(name)` as
 figure-wide metadata, gives absence the explicit `viridis` library default,
 switches Rune plots from PRODUCT-0029's legacy compatibility resolver to its

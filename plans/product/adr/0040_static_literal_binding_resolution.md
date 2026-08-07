@@ -117,8 +117,12 @@ implements it for **figure elements** — `title`, `subtitle`, `skin`, `palette`
 `x_bounds`, `y_bounds`, `x_tick_step`, `y_tick_step`, `x_minor_ticks`,
 `y_minor_ticks`.
 
-Mark arguments — `bar(cat_field, "val")` — are **not** implemented here, and that
-is a coverage limit rather than a semantic boundary. A bound field name resolves
+Mark arguments — `bar(cat_field, "val")` — are **not** implemented here, and
+neither are register modifier arguments: `table().skin(s)` and numeric modifier
+arguments such as `.point_size(sz)`. Each is a coverage limit rather than a
+semantic boundary. (The register cases were unnamed when this record was first
+accepted; named 2026-08-06 by the architectural review's record-accuracy pass
+so their exclusion reads as coverage, not decision.) A bound field name resolves
 to its literal before PRODUCT-0007 §2's channel resolution runs, so nothing
 downstream can distinguish it from the literal spelled inline. Extending
 coverage later is the same rule applied further and needs no record, the way

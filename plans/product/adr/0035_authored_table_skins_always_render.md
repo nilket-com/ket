@@ -121,7 +121,10 @@ deliberately.
 This record supersedes, **only** where they make contrast an admission
 condition:
 
-- PRODUCT-0026 §5 and §6, and acceptance gates 6 and 7;
+- PRODUCT-0026 §4, §5, and §6, and acceptance gates 6 and 7 — §4's "palette-forward
+  refuses rather than changing palette positions" clause included, omitted from
+  this list when first accepted and added 2026-08-06 by the architectural
+  review's record-accuracy pass;
 - PRODUCT-0027 §5, and acceptance gates 6 and 8.
 
 Their projection semantics, mechanism-specific facts, spans, and every other
