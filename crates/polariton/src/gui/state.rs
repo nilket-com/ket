@@ -70,7 +70,7 @@ struct AppState {
 	status_msg: String,
 	status_error: String,
 	status_df_size: Option<(usize, usize)>,
-	status_time_elapsed: Option<f64>,
+	status_time_elapsed: Option<Duration>,
 	status_detail: Option<StatusDetail>,
 	status_detail_open: bool,
 	adapter_state: AdapterState,
@@ -2103,8 +2103,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			result: er,
 			publish,
 		} => {
-			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
-			app_state.status_time_elapsed = Some(time_elapsed);
+			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			if let Some(claim) = publish.as_ref() {
 				match &er {
 					ExecutionResult::Rows { frame, .. } => {
@@ -2174,7 +2173,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
-			app_state.status_time_elapsed = Some(app_state.code_started.elapsed().as_secs_f64());
+			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
 				Ok(outcome) => {
 					app_state.status_error.clear();
@@ -2222,7 +2221,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
-			app_state.status_time_elapsed = Some(app_state.code_started.elapsed().as_secs_f64());
+			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
 				Ok(outcome) => {
 					use crate::gui::messages::RuneRelationSinkOutput;
@@ -2548,8 +2547,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			source_start_line,
 			result,
 		} => {
-			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
-			app_state.status_time_elapsed = Some(time_elapsed);
+			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
 				ExecutionResult::Rows {
 					frame: df,
@@ -2617,8 +2615,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			presentation,
 			result,
 		} => {
-			let time_elapsed = (app_state.code_started.elapsed().as_millis() as f64) / 1000.0;
-			app_state.status_time_elapsed = Some(time_elapsed);
+			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
 				Ok(resolved) => {
 					app_state.status_error.clear();

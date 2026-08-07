@@ -20,6 +20,7 @@ use iced::{
 	theme::{Palette, Theme},
 	window::Direction,
 };
+use std::time::Duration;
 
 pub const BUTTON_SIZE_DEFAULT: (u32, u32) = (120, 40);
 
@@ -156,7 +157,7 @@ pub fn main_screen<'a>(
 	status_msg: &'a str,
 	status_error: &'a str,
 	status_df_size: Option<(usize, usize)>,
-	status_time_elapsed: Option<f64>,
+	status_time_elapsed: Option<Duration>,
 	editor_spinner_phase: Option<usize>,
 	adapter_state: &'a AdapterState,
 	showing_settings: bool,
@@ -333,7 +334,7 @@ fn app_status_bar(
 	status_msg: &str,
 	status_error: &str,
 	status_df_size: Option<(usize, usize)>,
-	status_time_elapsed: Option<f64>,
+	status_time_elapsed: Option<Duration>,
 	editor_spinner_phase: Option<usize>,
 	adapter_state: &AdapterState,
 ) -> StatusBar {
@@ -383,10 +384,7 @@ fn app_status_bar(
 		);
 	}
 	if let Some(time_elapsed) = status_time_elapsed {
-		bar = bar.right(
-			Segment::label_value("time", format!("{time_elapsed:.3}s"), Tone::Normal)
-				.reserve_chars(12),
-		);
+		bar = bar.right(Segment::timer("time", time_elapsed, Tone::Normal).reserve_chars(12));
 	}
 	bar
 }

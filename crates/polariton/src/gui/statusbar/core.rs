@@ -586,16 +586,63 @@ impl Default for StatusBarStyle {
 	}
 }
 
-#[allow(dead_code)]
 pub fn format_elapsed(duration: Duration) -> String {
-	let total_ms = duration.as_millis() as u64;
-	let millis = total_ms % 1000;
-	let seconds = total_ms / 1000;
-	let minutes = seconds / 60;
-	let seconds = seconds % 60;
-	if minutes > 0 {
-		format!("{minutes:02}:{seconds:02}.{millis:03}")
+	let (value, unit) = if duration >= Duration::from_secs(86_400) {
+		(duration.as_secs_f64() / 86_400.0, "d")
+	} else if duration >= Duration::from_secs(3_600) {
+		(duration.as_secs_f64() / 3_600.0, "h")
+	} else if duration >= Duration::from_secs(60) {
+		(duration.as_secs_f64() / 60.0, "m")
+	} else if duration >= Duration::from_secs(1) {
+		(duration.as_secs_f64(), "s")
+	} else if duration >= Duration::from_millis(1) {
+		(duration.as_secs_f64() * 1_000.0, "ms")
+	} else if duration >= Duration::from_micros(1) {
+		(duration.as_secs_f64() * 1_000_000.0, "µs")
 	} else {
-		format!("{seconds}.{millis:03}s")
+		(duration.as_secs_f64() * 1_000_000_000.0, "ns")
+	};
+	let precision = if value < 10.0 {
+		2
+	} else if value < 100.0 {
+		1
+	} else {
+		0
+	};
+	format!("{value:.precision$}{unit}")
+}
+
+#[cfg(test)]
+mod tests {
+	use super::format_elapsed;
+	use std::time::Duration;
+
+	#[test]
+	fn elapsed_time_uses_the_largest_human_scale_with_three_significant_digits() {
+		for (duration, expected) in [
+			(Duration::from_nanos(250), "250ns"),
+			(Duration::from_micros(20), "20.0µs"),
+			(Duration::from_millis(2), "2.00ms"),
+			(Duration::from_millis(20), "20.0ms"),
+			(Duration::from_secs_f64(2.5), "2.50s"),
+			(Duration::from_secs(75), "1.25m"),
+			(Duration::from_secs(7_200), "2.00h"),
+			(Duration::from_secs(172_800), "2.00d"),
+		] {
+			assert_eq!(format_elapsed(duration), expected);
+		}
+	}
+
+	#[test]
+	fn elapsed_time_changes_units_at_exact_boundaries() {
+		assert_eq!(format_elapsed(Duration::from_nanos(999)), "999ns");
+		assert_eq!(format_elapsed(Duration::from_micros(1)), "1.00µs");
+		assert_eq!(format_elapsed(Duration::from_micros(999)), "999µs");
+		assert_eq!(format_elapsed(Duration::from_millis(1)), "1.00ms");
+		assert_eq!(format_elapsed(Duration::from_millis(999)), "999ms");
+		assert_eq!(format_elapsed(Duration::from_secs(1)), "1.00s");
+		assert_eq!(format_elapsed(Duration::from_secs(60)), "1.00m");
+		assert_eq!(format_elapsed(Duration::from_secs(3_600)), "1.00h");
+		assert_eq!(format_elapsed(Duration::from_secs(86_400)), "1.00d");
 	}
 }
