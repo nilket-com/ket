@@ -130,18 +130,98 @@ its own editor arc.
 
 ---
 
-## Tallies
+## Tallies (corrected 2026-08-06 after the pre-ratification self-check)
 
-- **Will do:** 2 clusters (Guide; Persistence×4) + 9 items — `ColorTheme`
-  retirement, curated `c`/`C` decision, gridline-debt repair record, dashboard
-  fate, deferred relations arc, artifact store, mark/register binding coverage,
-  kernel-retirement check, `Presence::Hide` repair.
-- **If asked:** 15 items, each with its trigger named.
-- **Closed:** 27 items — of which 11 already carry their closure rule in the
-  record itself and need only the triage pointer; 16 need the one-line reason
-  copied into the named record.
-- **Held out:** facets.
+Over the ledger's 59 open items (IDs now in `deferred_ledger.md`):
 
-The seeding matches the review's expectation: closing the twenty-seven is
+- **Will do: 15** — Guide cluster (3: IG-01, IG-02, IG-05), Persistence
+  cluster (3: LI-01, LI-02, LC-02), and 9 singles (CI-03, CI-06, CI-09, LI-04,
+  DB-01, DB-02, DB-03, DB-14, DB-18).
+- **If asked: 18**, each with its trigger named.
+- **Closed: 25** — of which 13 already carry their closure rule in the record
+  itself and need only the triage pointer; 12 need the one-line reason copied
+  into the named record.
+- **Held out: 1** (IG-03, facets).
+
+15 + 18 + 25 + 1 = 59. The first published tallies (15/27, 11/16 sub-split)
+were arithmetic errors in this summary — the tables were complete; the
+paragraph miscounted them. Caught by an external parse disagreeing before
+ratification.
+
+Two deliberate row artifacts an item-count parse must know about:
+
+- **AX-02 spans two rows.** The ledger's single "reversed and collapsed axes"
+  entry is triaged as two rows (reversed / collapsed) because the two halves
+  close for different reasons.
+- **One non-ledger row.** "Register-argument bindings" is triage-added — it
+  entered the language's coverage story via the 2026-08-06 record-accuracy
+  pass on 0040 §6, after the ledger was extracted — so it appears in a bucket
+  without a ledger ID.
+
+The seeding matches the review's expectation: closing the twenty-five is
 worth more than scheduling any five, and the will-do list is dominated by two
 arcs (Guide, Persistence) plus debt retirement rather than new surface.
+
+## Reconciliation — every ledger ID exactly once
+
+| ID | Item | Bucket |
+|---|---|---|
+| AX-01 | Scale composition | if asked |
+| AX-02 | Reversed and collapsed axes | closed (two rows) |
+| AX-03 | Discrete-axis bounds | closed |
+| AX-04 | Partial bounds | closed |
+| AX-05 | Log axes | if asked |
+| AX-06 | Temporal steps | if asked |
+| AX-07 | Nice-number / automatic placement | if asked |
+| AX-08 | Minor grid style | closed |
+| AX-09 | Minor visibility flags | closed |
+| AX-10 | Mark-factor bound widening | closed |
+| CI-01 | Layered color | if asked |
+| CI-02 | Sequential / diverging / status authoring | if asked |
+| CI-03 | `ColorTheme` retirement + legacy resolver | will do |
+| CI-04 | Explicit palette cycling | closed |
+| CI-05 | Recolor / reset affordance | if asked |
+| CI-06 | Curated `c`/`C` no-op decision | will do |
+| CI-07 | Opt-in contrast assay | if asked |
+| CI-08 | Table non-text contrast criterion | closed |
+| CI-09 | Default gridline debt repair | will do |
+| CI-10 | Broader viz-theme identity / config | if asked |
+| CI-11 | Value-driven table coloring | if asked |
+| CI-12 | SQL / Markdown skin authoring | closed |
+| CI-13 | Per-surface ink | closed |
+| LI-01 | Layout persistence | will do (cluster) |
+| LI-02 | Durable identity | will do (cluster) |
+| LI-03 | Grouping signal | if asked |
+| LI-04 | Dashboard's fate | will do |
+| LI-05 | Panel commands / placements | closed |
+| LI-06 | Content-derived layout shape | closed |
+| LI-07 | Durable member hiding | closed |
+| DB-01 | Deferred relations / live-table planning | will do |
+| DB-02 | Workspace artifact store / durable plots | will do |
+| DB-03 | Mark-argument bindings | will do |
+| DB-04 | Computed presentation values | closed |
+| DB-05 | Non-top-level bindings | closed |
+| DB-06 | Shared-encoding sugar | closed |
+| DB-07 | Bindable sink specifications | closed |
+| DB-08 | Relation handles | if asked |
+| DB-09 | Free-function spelling retirement | closed |
+| DB-10 | Line series argument | if asked |
+| DB-11 | Sink-method sugar | closed |
+| DB-12 | New `LayerMark` marks | if asked |
+| DB-13 | Plot-spec unification | if asked |
+| DB-14 | `ScatterLinePlotKernel` retirement | will do |
+| DB-15 | Cross-origin layering | closed |
+| DB-16 | Figure-wide mark-setting defaults | closed |
+| DB-17 | Pane-override / app-theme producers | if asked |
+| DB-18 | `Presence::Hide` repair | will do |
+| DB-19 | Axis-label authoring | if asked |
+| DB-20 | Bare-string source sugar | closed |
+| DB-21 | Headless data-products crate | closed |
+| DB-22 | Properties-panel shared-binding rule | closed as item |
+| IG-01 | Guides | will do (cluster) |
+| IG-02 | Interaction | will do (cluster) |
+| IG-03 | Facets | held out |
+| IG-04 | Data-driven size encoding | if asked |
+| IG-05 | Categorical legend for band fill | will do (cluster) |
+| LC-01 | `BufferReleased` event | closed |
+| LC-02 | Producer-release reattachment | will do (cluster) |
