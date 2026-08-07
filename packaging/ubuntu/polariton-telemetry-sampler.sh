@@ -23,6 +23,12 @@ INTERVAL_SECS="${POLARITON_TELEMETRY_INTERVAL_SECS:-60}"
 # Metrics are scraped every Nth tick; process and health samples land every tick.
 METRICS_EVERY_TICKS="${POLARITON_TELEMETRY_METRICS_EVERY_TICKS:-5}"
 METRICS_URL="${POLARITON_METRICS_URL:-https://127.0.0.1:7433/metrics}"
+# Curated by default while the second-flush read-wedge defect is open (see
+# plans/impl/polariton_soak_findings_20260807.md): a full scrape is ~2,300 rows and a
+# table's second multi-thousand-row ingest cycle silently becomes write-only. The
+# curated set (~70 rows) keeps the viewport's key series queryable; set the filter to
+# '.' to ingest the full scrape — which currently doubles as the reproduction harness.
+METRICS_NAME_FILTER="${POLARITON_METRICS_NAME_FILTER:-^wendelon_(raft_|liveness_|lsm_|metrics_scrapes|cdc_)}"
 HEALTH_URL="${POLARITON_HEALTH_URL:-http://127.0.0.1:7431/health}"
 READY_URL="${POLARITON_READY_URL:-https://127.0.0.1:7432/ready}"
 PKI_DIR="$PROFILE_ROOT/pki"
@@ -106,7 +112,7 @@ sample_metrics() {
 			count=0
 		fi
 	done < <(curl -sk -m 10 --cert "$PKI_DIR/local-operator.crt" --key "$PKI_DIR/local-operator.key" \
-		"$METRICS_URL" 2>/dev/null | awk -v now="$now" '
+		"$METRICS_URL" 2>/dev/null | awk -v now="$now" -v keep="$METRICS_NAME_FILTER" '
 		/^#/ { next }
 		{
 			value = $NF
@@ -119,6 +125,8 @@ sample_metrics() {
 				name = substr(series, 1, open - 1)
 				labels = substr(series, open)
 			}
+			if (name !~ keep) next
+			if (name ~ /_bucket$/) next
 			gsub(/'\''/, "'\'''\''", labels)
 			printf "(%s,'\''%s'\'','\''%s'\'',%s)\n", now, name, labels, value
 		}')
