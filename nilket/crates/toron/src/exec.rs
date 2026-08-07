@@ -861,9 +861,20 @@ impl Executor {
 						.expect("ExecutionPlan::Scan should build a ScanRequest");
 					let row_limit = req.row_limit;
 					let span = crate::telemetry::storage_scan_span(&req);
+					// One interval, recorded once after materialization: sequential within
+					// this task, so it partitions the wall, never a sibling phase.
+					let scan_started = Instant::now();
 					let stream = self.storage.scan(req).instrument(span).await?;
-					self.materialize_scan_stream_with_budget(stream, row_limit)
-						.await
+					let batches = self
+						.materialize_scan_stream_with_budget(stream, row_limit)
+						.await;
+					join::record_task_telemetry(&self.context.task_telemetry, |task| {
+						task.phases.scan_micros = task
+							.phases
+							.scan_micros
+							.saturating_add(join::duration_micros(scan_started));
+					});
+					batches
 				}
 				ExecutionPlan::Filter {
 					input,
@@ -1169,16 +1180,12 @@ impl Executor {
 			}
 		}
 		let finalized = finalize_exchange_partitions(schema, partition_batches);
-		let repartition_micros =
-			u64::try_from(repartition_started.elapsed().as_micros()).unwrap_or(u64::MAX);
-		if let Some(telemetry) = self.context.task_telemetry.as_ref()
-			&& let Ok(mut task) = telemetry.lock()
-		{
+		join::record_task_telemetry(&self.context.task_telemetry, |task| {
 			task.phases.exchange_repartition_micros = task
 				.phases
 				.exchange_repartition_micros
-				.saturating_add(repartition_micros);
-		}
+				.saturating_add(join::duration_micros(repartition_started));
+		});
 		finalized
 	}
 

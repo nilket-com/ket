@@ -294,6 +294,13 @@ pub struct TaskTelemetryPhases {
 	/// distributed producer task. That symmetry is what makes it a paired component.
 	#[serde(default)]
 	pub exchange_repartition_micros: u64,
+	/// Time spent awaiting and materializing a storage scan at the generic executor tree's
+	/// `ExecutionPlan::Scan` node. Written at that single site only: scans fused inside a
+	/// streaming operator loop are already covered by that operator's own phase bracket, and
+	/// writing them here as well would break the task-wall partition. Produced on both arms
+	/// by the same executor code.
+	#[serde(default)]
+	pub scan_micros: u64,
 	pub framework_overhead_micros: u64,
 }
 

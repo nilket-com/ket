@@ -1,4 +1,4 @@
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -29,7 +29,10 @@ use crate::distributed::cancellation::{
 use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use crate::distributed::identity::QueryId;
-use crate::distributed::scheduler::{DistributedScheduler, SchedulerError, StagePlan};
+use crate::distributed::identity::StageId;
+use crate::distributed::scheduler::{
+	DistributedScheduler, SchedulerError, StagePlan, TaskTelemetryRecord,
+};
 use crate::distributed::task::{JoinRuntimeObservation, JoinRuntimeObservationMode, TaskTelemetry};
 use crate::distributed::task_state::TaskKey;
 use crate::distributed::worker_registry::WorkerRegistry;
@@ -63,7 +66,47 @@ type RemoteCancelSpawner =
 
 struct DistributedAttemptOutput {
 	final_results: Vec<RecordBatch>,
-	task_telemetry: Vec<TaskTelemetry>,
+	task_telemetry: Vec<TaskTelemetryRecord>,
+}
+
+/// Everything one distributed query's attribution needs, retained only when a caller opted
+/// in: per-task telemetry keyed by the task that produced it, plus the stage graph's
+/// upstream edges so a per-cell figure can be derived along a real path rather than summed
+/// across concurrent tasks.
+#[derive(Debug, Clone)]
+pub struct QueryTaskTelemetryReport {
+	pub query_id: QueryId,
+	/// `(stage, its upstream stages)` for every stage in the fragmented plan, control
+	/// dependencies included — any edge that orders execution belongs in a wall-clock path.
+	pub stage_upstreams: Vec<(StageId, Vec<StageId>)>,
+	pub tasks: Vec<TaskTelemetryRecord>,
+}
+
+/// Opt-in retention slot for [`QueryTaskTelemetryReport`]s. Reports accumulate keyed by
+/// query until taken, so the holder must drain what it asked for; production coordinators
+/// that never opt in retain nothing.
+pub type TaskTelemetryRetention = Arc<Mutex<BTreeMap<QueryId, QueryTaskTelemetryReport>>>;
+
+fn retain_task_telemetry_report(
+	retention: &Option<TaskTelemetryRetention>,
+	query_id: QueryId,
+	stages: &[StagePlan],
+	tasks: &[TaskTelemetryRecord],
+) {
+	let Some(retention) = retention.as_ref() else {
+		return;
+	};
+	let report = QueryTaskTelemetryReport {
+		query_id,
+		stage_upstreams: stages
+			.iter()
+			.map(|stage| (stage.stage_id, stage.upstream_stages.clone()))
+			.collect(),
+		tasks: tasks.to_vec(),
+	};
+	if let Ok(mut retained) = retention.lock() {
+		retained.insert(query_id, report);
+	}
 }
 
 pub(crate) async fn materialize_scan_stream(
@@ -150,6 +193,7 @@ where
 	writer: Arc<dyn StorageWrite>,
 	deleter: Arc<dyn StorageDeleteRows>,
 	admin: Arc<dyn StorageAdmin>,
+	task_telemetry_retention: Option<TaskTelemetryRetention>,
 }
 
 impl<Registry, Transport> DistributedQueryCoordinator<Registry, Transport>
@@ -341,7 +385,16 @@ where
 			writer,
 			deleter,
 			admin,
+			task_telemetry_retention: None,
 		}
+	}
+
+	/// Opt in to retaining each query's per-task telemetry report in `retention`. Reports
+	/// stay keyed by query until the holder takes them, so only callers that drain what
+	/// they request should opt in.
+	pub fn with_task_telemetry_retention(mut self, retention: TaskTelemetryRetention) -> Self {
+		self.task_telemetry_retention = Some(retention);
+		self
 	}
 
 	pub fn with_tenant_budget_policy(mut self, tenant_budgets: TenantBudgetPolicy) -> Self {
@@ -454,6 +507,7 @@ where
 		let config = self.config.clone();
 		let plan = plan.clone();
 		let stream_active_query = active_query_handle.clone();
+		let telemetry_retention = self.task_telemetry_retention.clone();
 		tokio::spawn(async move {
 			let _admitted = admitted;
 			let _active_query = active_query;
@@ -469,6 +523,7 @@ where
 				active_query_handle.clone(),
 				sender.clone(),
 				batch_sent,
+				telemetry_retention,
 			)
 			.await;
 			if let Err(error) = result {
@@ -638,6 +693,7 @@ where
 		let config = planner_config;
 		let plan = plan.clone();
 		let stream_active_query = active_query_handle.clone();
+		let telemetry_retention = self.task_telemetry_retention.clone();
 		tokio::spawn(async move {
 			let _admitted = admitted;
 			let _active_query = active_query;
@@ -653,6 +709,7 @@ where
 				active_query_handle.clone(),
 				sender.clone(),
 				batch_sent,
+				telemetry_retention,
 			)
 			.await;
 			if let Err(error) = result {
@@ -1191,6 +1248,12 @@ where
 				return Err(DistributedAttemptError::Scheduler { error, stages });
 			}
 		};
+		retain_task_telemetry_report(
+			&self.task_telemetry_retention,
+			context.query_id,
+			&stages,
+			&run.telemetry.task_telemetry,
+		);
 		Ok(DistributedAttemptOutput {
 			final_results: run.final_results,
 			task_telemetry: run.telemetry.task_telemetry,
@@ -1244,6 +1307,7 @@ async fn run_streaming_read_driver<Registry, Transport>(
 	active_query: ActiveQueryHandle,
 	sender: mpsc::Sender<Result<RecordBatch, QueryError>>,
 	batch_sent: Arc<AtomicBool>,
+	telemetry_retention: Option<TaskTelemetryRetention>,
 ) -> Result<(), QueryError>
 where
 	Registry: WorkerRegistry + ?Sized + 'static,
@@ -1314,6 +1378,12 @@ where
 			.with_final_result_sender(Some(sender.clone()), Some(batch_sent.clone()));
 		match scheduler.dispatch_loop(&stages, &dispatcher).await {
 			Ok(run) => {
+				retain_task_telemetry_report(
+					&telemetry_retention,
+					execution_context.query_id,
+					&stages,
+					&run.telemetry.task_telemetry,
+				);
 				if let Some(binding) = measured_binding.as_ref() {
 					let observations =
 						join_observations_from_task_telemetry(&run.telemetry.task_telemetry);
@@ -1489,11 +1559,11 @@ fn should_measure_runtime_verdict(rate: u32, counter: &AtomicU64) -> bool {
 }
 
 fn join_observations_from_task_telemetry(
-	task_telemetry: &[TaskTelemetry],
+	task_telemetry: &[TaskTelemetryRecord],
 ) -> Vec<JoinRuntimeObservation> {
 	task_telemetry
 		.iter()
-		.flat_map(|telemetry| telemetry.join_observations.iter().cloned())
+		.flat_map(|record| record.telemetry.join_observations.iter().cloned())
 		.collect()
 }
 

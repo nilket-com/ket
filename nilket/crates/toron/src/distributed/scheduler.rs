@@ -84,9 +84,18 @@ pub struct SchedulerRun {
 	pub telemetry: SchedulerTelemetry,
 }
 
+/// One completed attempt's telemetry, keyed by the task that produced it. The identity is
+/// recorded by the scheduler at completion — the worker's payload already names it — so a
+/// per-task figure can never be attributed to a task other than the one that ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TaskTelemetryRecord {
+	pub identity: TaskIdentity,
+	pub telemetry: TaskTelemetry,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct SchedulerTelemetry {
-	pub task_telemetry: Vec<TaskTelemetry>,
+	pub task_telemetry: Vec<TaskTelemetryRecord>,
 	pub retry_count: u64,
 	pub stale_rejection_count: u64,
 	pub cancellation_cleanup_count: u64,
@@ -464,7 +473,10 @@ where
 					.phases
 					.dispatch_wait_micros
 					.saturating_add(completion.dispatch_wait_micros);
-				self.telemetry.task_telemetry.push(telemetry);
+				self.telemetry.task_telemetry.push(TaskTelemetryRecord {
+					identity: completion.identity,
+					telemetry,
+				});
 				self.accept_dispatch_completion(
 					&spec,
 					stages,
@@ -495,7 +507,10 @@ where
 					.phases
 					.dispatch_wait_micros
 					.saturating_add(completion.dispatch_wait_micros);
-				self.telemetry.task_telemetry.push(telemetry);
+				self.telemetry.task_telemetry.push(TaskTelemetryRecord {
+					identity: completion.identity,
+					telemetry,
+				});
 				self.accept_dispatch_failure(
 					key,
 					completion.identity,
@@ -2768,9 +2783,11 @@ mod tests {
 
 		assert_eq!(run.telemetry.task_telemetry.len(), 1);
 		let collected = &run.telemetry.task_telemetry[0];
-		assert_eq!(collected.labels.operator_kind, "join");
-		assert_eq!(collected.counters.pulled_shuffle_bytes, 128);
-		assert!(collected.phases.dispatch_wait_micros > 0);
+		assert_eq!(collected.identity.stage_id, StageId::new(0));
+		assert_eq!(collected.identity.task_id, TaskId::new(0));
+		assert_eq!(collected.telemetry.labels.operator_kind, "join");
+		assert_eq!(collected.telemetry.counters.pulled_shuffle_bytes, 128);
+		assert!(collected.telemetry.phases.dispatch_wait_micros > 0);
 	}
 
 	#[tokio::test]

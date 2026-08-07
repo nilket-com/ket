@@ -525,7 +525,11 @@ fn aggregate_telemetry(
 		cancellation_cleanup_count: telemetry.cancellation_cleanup_count,
 		..AggregatedTelemetry::default()
 	};
-	for task in &telemetry.task_telemetry {
+	for task in telemetry
+		.task_telemetry
+		.iter()
+		.map(|record| &record.telemetry)
+	{
 		aggregated.pulled_shuffle_bytes = aggregated
 			.pulled_shuffle_bytes
 			.saturating_add(task.counters.pulled_shuffle_bytes);

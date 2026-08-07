@@ -60,7 +60,7 @@ use toron::distributed::partition_store::InMemoryPartitionStore;
 use toron::distributed::scheduler::{StagePlan, live_publication_report};
 use toron::distributed::task::{
 	JoinBuildProfile, JoinSpillObservation, PartitionWorkConcurrencyObservation, RowCount,
-	TaskOutputBinding, TaskTelemetry,
+	TaskOutputBinding, TaskTelemetry, TaskTelemetryPhases,
 };
 use toron::distributed::worker_registry::{
 	ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
@@ -4204,6 +4204,9 @@ struct QueryExecution {
 	local_join_admissions: Vec<String>,
 	join_spill_observations: Vec<JoinSpillObservation>,
 	partition_work_concurrency_observations: Vec<PartitionWorkConcurrencyObservation>,
+	/// The executor's phase counters for this run. `Copy`, read once after the elapsed
+	/// boundary — the local arm's raw material for ADR 538 component receipts.
+	task_phases: TaskTelemetryPhases,
 }
 
 /// The shared Load→Plan→Bind→Execute substrate for both the reachability and correctness rails: register
@@ -4420,6 +4423,7 @@ async fn execute_logical_with_catalog_timed(
 	let join_spill_observations = telemetry.join_spill_observations.clone();
 	let partition_work_concurrency_observations =
 		telemetry.partition_work_concurrency_observations.clone();
+	let task_phases = telemetry.phases;
 	drop(telemetry);
 
 	Ok(QueryExecution {
@@ -4433,6 +4437,7 @@ async fn execute_logical_with_catalog_timed(
 			.collect(),
 		join_spill_observations,
 		partition_work_concurrency_observations,
+		task_phases,
 	})
 }
 
@@ -5008,6 +5013,10 @@ pub struct TimingAtlasChild {
 	pub valid: bool,
 	pub failure: Option<String>,
 	pub failure_is_io: bool,
+	/// Derived after the elapsed boundary from the child's actual receipts. `None` on
+	/// warmups, failures and invalid attempts — those may retain raw telemetry elsewhere
+	/// but must never produce eligible attribution.
+	pub attribution: Option<TimingAtlasChildAttribution>,
 }
 
 #[derive(Debug, Clone)]
@@ -5184,6 +5193,9 @@ pub struct TimingAtlasExecution {
 #[derive(Debug, Clone)]
 pub struct TimingAtlasReduction {
 	pub identity_matches: bool,
+	/// The child's component attribution, derived from actual receipts strictly after the
+	/// elapsed boundary.
+	pub attribution: Option<TimingAtlasChildAttribution>,
 }
 
 /// The seam the atlas runner drives. Injecting it lets the worker scope and the timer
@@ -5326,6 +5338,7 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 		valid: false,
 		failure: None,
 		failure_is_io: false,
+		attribution: None,
 	};
 
 	// The elapsed boundary encloses execution and nothing else.
@@ -5361,6 +5374,11 @@ async fn run_timing_atlas_child<H: TimingAtlasHarness>(
 			child.valid = reduction.identity_matches;
 			if !reduction.identity_matches {
 				child.failure = Some("identity mismatch".to_string());
+			}
+			// Attribution rides only a valid child: an invalid attempt keeps its raw
+			// telemetry in the harness but must not carry an eligible receipt.
+			if child.valid {
+				child.attribution = reduction.attribution;
 			}
 		}
 		Err(error) => {
@@ -5643,6 +5661,12 @@ pub struct CensusTimingAtlasHarness {
 	/// teardown would always be zero and prove nothing.
 	final_retained_bytes: Option<u64>,
 	pub residency: TimingAtlasResidencyLog,
+	/// Opt-in retention the coordinator fills with each distributed child's per-task
+	/// telemetry report. Drained in `reduce_child`, so it never accumulates across children.
+	telemetry_retention: toron::coordinator::TaskTelemetryRetention,
+	/// The local arm's executor window and phase counters, captured in `execute_child` (the
+	/// copy is `Copy`-cheap) and consumed in `reduce_child` after the boundary.
+	last_local_execution: Option<(f64, TaskTelemetryPhases)>,
 }
 
 impl CensusTimingAtlasHarness {
@@ -5680,6 +5704,8 @@ impl CensusTimingAtlasHarness {
 			baseline_bytes: None,
 			final_retained_bytes: None,
 			residency: TimingAtlasResidencyLog::default(),
+			telemetry_retention: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+			last_local_execution: None,
 		})
 	}
 
@@ -5738,14 +5764,17 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 				.take()
 				.ok_or_else(|| "timing atlas catalog already consumed".to_string())?,
 		);
-		let coordinator = Some(DistributedQueryCoordinator::new(
-			catalog,
-			registry,
-			coordinator_memory,
-			Arc::new(TcpTransport::new()),
-			execution_census_distributed_planner_config(distributed_budget.memory_per_task),
-			distributed_budget,
-		));
+		let coordinator = Some(
+			DistributedQueryCoordinator::new(
+				catalog,
+				registry,
+				coordinator_memory,
+				Arc::new(TcpTransport::new()),
+				execution_census_distributed_planner_config(distributed_budget.memory_per_task),
+				distributed_budget,
+			)
+			.with_task_telemetry_retention(self.telemetry_retention.clone()),
+		);
 		self.coordinator = coordinator;
 		self.baseline_bytes = Some(self.resident_partition_bytes());
 		Ok(())
@@ -5760,7 +5789,7 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 		let batches = match plan.arm {
 			TimingArm::Local => {
 				let budget = execution_census_local_budget();
-				execute_query_with_metadata_coordinate(
+				let execution = execute_query_with_metadata_coordinate(
 					&self.sql,
 					self.tables.clone(),
 					self.storage.clone(),
@@ -5768,8 +5797,14 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 					Some(budget),
 				)
 				.await
-				.map_err(|error| format!("local arm {}: {}", error.phase.as_str(), error.message))?
-				.batches
+				.map_err(|error| {
+					format!("local arm {}: {}", error.phase.as_str(), error.message)
+				})?;
+				// A `Copy` of the counters and one float: the only attribution work inside
+				// the boundary. Node building and path derivation wait for `reduce_child`.
+				self.last_local_execution =
+					Some((execution.timings.execute_ms, execution.task_phases));
+				execution.batches
 			}
 			TimingArm::Distributed => {
 				let coordinator = self
@@ -5803,7 +5838,7 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 
 	async fn reduce_child(
 		&mut self,
-		_plan: &TimingAtlasChildPlan,
+		plan: &TimingAtlasChildPlan,
 		_execution: &TimingAtlasExecution,
 	) -> Result<TimingAtlasReduction, String> {
 		let batches = self
@@ -5822,7 +5857,38 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 				true
 			}
 		};
-		Ok(TimingAtlasReduction { identity_matches })
+		// Attribution is derived here, strictly after the elapsed boundary, from what the
+		// child actually recorded. A completed child whose receipts are missing is an
+		// apparatus defect and fails loudly — substituting an empty attribution would let
+		// the cell publish receipts it cannot back.
+		let nodes = match plan.arm {
+			TimingArm::Local => {
+				let (execute_ms, phases) = self
+					.last_local_execution
+					.take()
+					.ok_or_else(|| "local child completed without executor phases".to_string())?;
+				vec![timing_atlas_local_task_node(execute_ms, &phases)]
+			}
+			TimingArm::Distributed => {
+				let report = self
+					.telemetry_retention
+					.lock()
+					.map_err(|_| "telemetry retention poisoned".to_string())?
+					.remove(&plan.query_id)
+					.ok_or_else(|| {
+						"distributed child completed without a task telemetry report".to_string()
+					})?;
+				timing_atlas_nodes_from_report(&report)
+			}
+		};
+		let attribution = timing_atlas_child_attribution(nodes);
+		if attribution.is_none() {
+			return Err("child receipts yielded no attributable task nodes".to_string());
+		}
+		Ok(TimingAtlasReduction {
+			identity_matches,
+			attribution,
+		})
 	}
 
 	async fn cleanup_child(&mut self, plan: &TimingAtlasChildPlan) -> Result<(), String> {
@@ -5897,6 +5963,9 @@ pub const TIMING_ATLAS_KIND_CELL_SUMMARY: &str = "cell_summary";
 /// One receipt-backed overhead component for a cell. Only components carrying a
 /// non-overlap or critical-path justification may enter the additive breakdown.
 pub const TIMING_ATLAS_KIND_ATTRIBUTION: &str = "attribution_component";
+/// One measured child's full attribution receipt: its task nodes, the selected path and
+/// the portions along it, replayable without trusting any emitted figure.
+pub const TIMING_ATLAS_KIND_ATTRIBUTION_PATH: &str = "attribution_path";
 pub const TIMING_ATLAS_KIND_HOST_END: &str = "host_end";
 
 fn json_ratio(ratio: Option<f64>) -> serde_json::Value {
@@ -6073,6 +6142,154 @@ impl TimingAtlasReplay {
 	}
 }
 
+/// Re-derive one attribution-path row from its own nodes. The persisted path, its wall,
+/// its portions and its remainder are all recomputed and compared; on success the
+/// recomputed portions are returned for the cell-level component checks.
+fn timing_atlas_replay_attribution_path(
+	row: &serde_json::Value,
+) -> Result<BTreeMap<String, f64>, Vec<String>> {
+	let mut problems = Vec::new();
+	let mut nodes = Vec::new();
+	for node in row
+		.get("nodes")
+		.and_then(|value| value.as_array())
+		.map(Vec::as_slice)
+		.unwrap_or(&[])
+	{
+		let stage_id = node.get("stage").and_then(|value| value.as_u64());
+		let task_id = node.get("task").and_then(|value| value.as_u64());
+		let wall_ms = node.get("wall_ms").and_then(|value| value.as_f64());
+		let (Some(stage_id), Some(task_id), Some(wall_ms)) = (stage_id, task_id, wall_ms) else {
+			problems.push("node lacks stage, task or wall".to_string());
+			continue;
+		};
+		let mut components = Vec::new();
+		if let Some(map) = node.get("components").and_then(|value| value.as_object()) {
+			for (label, portion) in map {
+				match timing_atlas_component_from_label(label) {
+					Some(component) => {
+						components.push((component, portion.as_f64().unwrap_or(f64::NAN)))
+					}
+					None => problems.push(format!("node names unknown component {label}")),
+				}
+			}
+		}
+		let mut upstream = Vec::new();
+		for edge in node
+			.get("upstream")
+			.and_then(|value| value.as_array())
+			.map(Vec::as_slice)
+			.unwrap_or(&[])
+		{
+			let pair = edge.as_array();
+			let stage = pair
+				.and_then(|pair| pair.first())
+				.and_then(|value| value.as_u64());
+			let task = pair
+				.and_then(|pair| pair.get(1))
+				.and_then(|value| value.as_u64());
+			match (stage, task) {
+				(Some(stage), Some(task)) => upstream.push((stage as u32, task as u32)),
+				_ => problems.push("node carries a malformed upstream edge".to_string()),
+			}
+		}
+		nodes.push(TimingAtlasTaskNode {
+			stage_id: stage_id as u32,
+			task_id: task_id as u32,
+			wall_ms,
+			components,
+			upstream,
+		});
+	}
+	if !problems.is_empty() {
+		return Err(problems);
+	}
+	let Some(recomputed) = timing_atlas_critical_path(&nodes) else {
+		return Err(vec!["path row carries no attributable nodes".to_string()]);
+	};
+
+	let persisted_path: Vec<(u32, u32)> = row
+		.get("path")
+		.and_then(|value| value.as_array())
+		.map(Vec::as_slice)
+		.unwrap_or(&[])
+		.iter()
+		.filter_map(|edge| {
+			let pair = edge.as_array()?;
+			Some((
+				pair.first()?.as_u64()? as u32,
+				pair.get(1)?.as_u64()? as u32,
+			))
+		})
+		.collect();
+	if persisted_path != recomputed.path {
+		problems.push(format!(
+			"persisted path {persisted_path:?} disagrees with the path re-derived from \
+			 its nodes {:?}",
+			recomputed.path
+		));
+	}
+	let claimed_wall = row
+		.get("path_wall_ms")
+		.and_then(|value| value.as_f64())
+		.unwrap_or(f64::NAN);
+	if !claimed_wall.is_finite() || (claimed_wall - recomputed.total_wall_ms).abs() > 1e-6 {
+		problems.push(format!(
+			"path wall {claimed_wall} disagrees with recomputed {}",
+			recomputed.total_wall_ms
+		));
+	}
+	if let Some(claimed_components) = row
+		.get("path_components")
+		.and_then(|value| value.as_object())
+	{
+		for (label, claimed) in claimed_components {
+			let claimed = claimed.as_f64().unwrap_or(f64::NAN);
+			let recomputed_portion = recomputed.components.get(label).copied().unwrap_or(0.0);
+			if !claimed.is_finite() || (claimed - recomputed_portion).abs() > 1e-6 {
+				problems.push(format!(
+					"path component {label} claims {claimed}, recomputed \
+					 {recomputed_portion}"
+				));
+			}
+		}
+	}
+
+	// Reconciliation: eligible portions plus the remainder must cover measured elapsed,
+	// and attribution may never exceed it.
+	let measured = row
+		.get("measured_elapsed_ms")
+		.and_then(|value| value.as_f64())
+		.unwrap_or(f64::NAN);
+	let attributed: f64 = recomputed
+		.components
+		.iter()
+		.filter(|(label, _)| {
+			timing_atlas_component_from_label(label).is_some_and(|component| {
+				component.participates_in_timed_attribution()
+					&& !matches!(
+						component.local_pairing(),
+						TimingAtlasLocalPairing::NoLocalEquivalent
+					)
+			})
+		})
+		.map(|(_, value)| value)
+		.sum();
+	if !measured.is_finite() {
+		problems.push("path row lacks a measured elapsed".to_string());
+	} else if attributed - measured > 1e-6 {
+		problems.push(format!(
+			"attributed {attributed} exceeds measured elapsed {measured}"
+		));
+	}
+
+	if problems.is_empty() {
+		Ok(recomputed.components)
+	} else {
+		Err(problems)
+	}
+}
+
 /// Replay a journal and recompute its claims. Verdicts, deltas, ratios and cohort counts are
 /// derived here from child rows, so a pair row that disagrees with its children is a
 /// violation rather than an accepted summary.
@@ -6082,6 +6299,8 @@ pub fn timing_atlas_replay(journal: &str) -> TimingAtlasReplay {
 	let mut seen_ids: BTreeSet<String> = BTreeSet::new();
 	let mut pair_rows: Vec<serde_json::Value> = Vec::new();
 	let mut summary_rows: Vec<serde_json::Value> = Vec::new();
+	let mut component_rows: Vec<serde_json::Value> = Vec::new();
+	let mut path_rows: BTreeMap<(String, i64, String), serde_json::Value> = BTreeMap::new();
 	let mut sealed_at: Option<usize> = None;
 	let lines = journal.lines().filter(|line| !line.trim().is_empty());
 
@@ -6168,8 +6387,16 @@ pub fn timing_atlas_replay(journal: &str) -> TimingAtlasReplay {
 					.get("additive")
 					.and_then(|value| value.as_bool())
 					.unwrap_or(false);
+				let eligible = row
+					.get("eligible")
+					.and_then(|value| value.as_bool())
+					.unwrap_or(additive);
 				let basis = row
 					.get("basis")
+					.and_then(|value| value.as_str())
+					.unwrap_or("");
+				let label = row
+					.get("component")
 					.and_then(|value| value.as_str())
 					.unwrap_or("");
 				// Only a non-overlap or critical-path basis licenses addition. A stage
@@ -6179,7 +6406,55 @@ pub fn timing_atlas_replay(journal: &str) -> TimingAtlasReplay {
 						"{query}: component claims additive with basis {basis}"
 					));
 				}
+				match timing_atlas_component_from_label(label) {
+					None => replay.violations.push(format!(
+						"{query} attribution names unknown component {label}"
+					)),
+					Some(component) => {
+						if !component.participates_in_timed_attribution() {
+							replay.violations.push(format!(
+								"{query} {label} is outside the timed boundary and \
+								 must not carry an attribution row"
+							));
+						}
+						if matches!(
+							component.local_pairing(),
+							TimingAtlasLocalPairing::NoLocalEquivalent
+						) && (eligible || additive)
+						{
+							replay.violations.push(format!(
+								"{query} {label} has no local equivalent and must not \
+								 be eligible or additive"
+							));
+						}
+					}
+				}
+				component_rows.push(row.clone());
 				replay.cells_with_attribution.insert(query);
+			}
+			TIMING_ATLAS_KIND_ATTRIBUTION_PATH => {
+				let query = row
+					.get("query")
+					.and_then(|q| q.as_str())
+					.unwrap_or_default()
+					.to_string();
+				let arm = row
+					.get("arm")
+					.and_then(|value| value.as_str())
+					.unwrap_or_default()
+					.to_string();
+				let pair_index = row
+					.get("pair_index")
+					.and_then(|value| value.as_i64())
+					.unwrap_or(-1);
+				if path_rows
+					.insert((query.clone(), pair_index, arm.clone()), row.clone())
+					.is_some()
+				{
+					replay.violations.push(format!(
+						"{query} pair {pair_index} {arm} has more than one attribution path"
+					));
+				}
 			}
 			TIMING_ATLAS_KIND_CELL_SUMMARY => summary_rows.push(row.clone()),
 			TIMING_ATLAS_KIND_HOST_END => {
@@ -6303,6 +6578,99 @@ pub fn timing_atlas_replay(journal: &str) -> TimingAtlasReplay {
 		}
 	}
 
+	// Re-derive every attribution path from its own nodes, then recompute each cell's
+	// component figures from the re-derived paths. Nothing an emitter wrote is trusted:
+	// the persisted path, its portions and every contribution are recomputed here.
+	let mut verified_paths: BTreeMap<(String, i64, String), BTreeMap<String, f64>> =
+		BTreeMap::new();
+	for ((query, pair_index, arm), row) in &path_rows {
+		match timing_atlas_replay_attribution_path(row) {
+			Ok(components) => {
+				verified_paths.insert((query.clone(), *pair_index, arm.clone()), components);
+			}
+			Err(mut problems) => {
+				for problem in problems.drain(..) {
+					replay
+						.violations
+						.push(format!("{query} pair {pair_index} {arm}: {problem}"));
+				}
+			}
+		}
+	}
+	for row in &component_rows {
+		let query = row
+			.get("query")
+			.and_then(|q| q.as_str())
+			.unwrap_or_default()
+			.to_string();
+		let pairs = replay.pairs_per_cell.get(&query).copied().unwrap_or(0);
+		if pairs == 0 {
+			continue;
+		}
+		let label = row
+			.get("component")
+			.and_then(|value| value.as_str())
+			.unwrap_or_default();
+		let Some(component) = timing_atlas_component_from_label(label) else {
+			continue;
+		};
+		// A component row is a summary over the cell's paths; a cell that claims component
+		// receipts must carry a verified path for both arms of every measured pair.
+		let mut contributions = Vec::new();
+		let mut complete = true;
+		for pair_index in 0..pairs as i64 {
+			let local = verified_paths.get(&(query.clone(), pair_index, "local".to_string()));
+			let distributed =
+				verified_paths.get(&(query.clone(), pair_index, "distributed".to_string()));
+			let (Some(local), Some(distributed)) = (local, distributed) else {
+				replay.violations.push(format!(
+					"{query} claims component receipts but pair {pair_index} lacks a \
+					 verified attribution path on both arms"
+				));
+				complete = false;
+				break;
+			};
+			let local_ms = local
+				.get(label)
+				.copied()
+				.unwrap_or(match component.local_pairing() {
+					TimingAtlasLocalPairing::DeclaredZero
+					| TimingAtlasLocalPairing::NoLocalEquivalent => 0.0,
+					_ => f64::NAN,
+				});
+			if local_ms.is_nan() {
+				replay.violations.push(format!(
+					"{query} {label} is required on the local arm but pair {pair_index} \
+					 carries no local portion"
+				));
+				complete = false;
+				break;
+			}
+			let distributed_ms = distributed.get(label).copied().unwrap_or(0.0);
+			contributions.push(distributed_ms - local_ms);
+		}
+		if !complete {
+			continue;
+		}
+		let eligible = row
+			.get("eligible")
+			.and_then(|value| value.as_bool())
+			.unwrap_or(false);
+		if eligible {
+			let recomputed = timing_atlas_median(&mut contributions).unwrap_or(f64::NAN);
+			let claimed = row
+				.get("contribution_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(f64::NAN);
+			if !claimed.is_finite() || (claimed - recomputed).abs() > 1e-6 {
+				replay.violations.push(format!(
+					"{query} {label} contribution disagrees with its paths: claimed \
+					 {claimed}, recomputed {recomputed}"
+				));
+			}
+		}
+	}
+
 	if replay.exclusions.len() != 1 {
 		replay.violations.push(format!(
 			"expected exactly one typed exclusion, found {}",
@@ -6410,6 +6778,21 @@ pub async fn run_timing_atlas(
 			artifact.append_row(&timing_atlas_child_row(&pair.local))?;
 			artifact.append_row(&timing_atlas_child_row(&pair.distributed))?;
 			artifact.append_row(&timing_atlas_pair_row(query, pair))?;
+			for child in [&pair.local, &pair.distributed] {
+				if let Some(attribution) = child.attribution.as_ref() {
+					artifact.append_row(&timing_atlas_attribution_path_row(
+						query,
+						child.arm,
+						pair.pair_index,
+						child.attempt,
+						child.query_elapsed_ms,
+						attribution,
+					))?;
+				}
+			}
+		}
+		for component_row in timing_atlas_component_rows(query, &outcome.pairs) {
+			artifact.append_row(&component_row)?;
 		}
 		artifact.append_row(&serde_json::json!({
 			"kind": TIMING_ATLAS_KIND_RESIDENCY,
@@ -7004,6 +7387,336 @@ pub fn timing_atlas_validate_path_bound_receipts(
 		));
 	}
 	validation
+}
+
+// ===== ADR 538: phase-to-component wiring =====
+//
+// The one place phase counters become component portions. Everything downstream — task
+// nodes, critical paths, receipts, replay — consumes this mapping, so a wrong answer here
+// is the one defect internal-consistency checks cannot catch. The mapping is therefore
+// deliberately total over the counters it claims: a counter is either mapped to exactly one
+// component, or named in `TIMING_ATLAS_UNATTRIBUTED_PHASES` as remainder.
+
+/// Phase counters that stay in the unattributed remainder: bookkeeping, the residual the
+/// worker computes, and the task wall itself.
+pub const TIMING_ATLAS_UNATTRIBUTED_PHASES: [&str; 3] = [
+	"telemetry_lock_micros",
+	"framework_overhead_micros",
+	"task_wall_micros",
+];
+
+/// The frozen phase → component mapping (operator-set):
+/// `operator` = join build/probe/spill; `shuffle` = exchange repartition plus shuffle
+/// pull/publish; `transport` = encode/send/decode; `dispatch` = wait/setup, retained raw
+/// and never eligible; `scan` = the scan interval. Every timed component is present in the
+/// result even at zero — presence is what distinguishes an observed zero from a missing
+/// receipt.
+pub fn timing_atlas_component_portions_ms(
+	phases: &TaskTelemetryPhases,
+) -> Vec<(TimingAtlasComponent, f64)> {
+	let ms = |micros: u64| micros as f64 / 1000.0;
+	vec![
+		(TimingAtlasComponent::Scan, ms(phases.scan_micros)),
+		(
+			TimingAtlasComponent::Operator,
+			ms(phases
+				.build_micros
+				.saturating_add(phases.probe_micros)
+				.saturating_add(phases.spill_micros)),
+		),
+		(
+			TimingAtlasComponent::Shuffle,
+			ms(phases
+				.exchange_repartition_micros
+				.saturating_add(phases.shuffle_pull_decode_micros)
+				.saturating_add(phases.output_publish_micros)),
+		),
+		(
+			TimingAtlasComponent::Dispatch,
+			ms(phases
+				.dispatch_wait_micros
+				.saturating_add(phases.task_setup_micros)),
+		),
+		(
+			TimingAtlasComponent::Transport,
+			ms(phases
+				.batch_encode_micros
+				.saturating_add(phases.batch_send_micros)
+				.saturating_add(phases.batch_decode_micros)),
+		),
+	]
+}
+
+pub fn timing_atlas_component_from_label(label: &str) -> Option<TimingAtlasComponent> {
+	TimingAtlasComponent::ALL
+		.into_iter()
+		.find(|component| component.label() == label)
+}
+
+/// The `scope` a component's receipts carry. `operator` is scoped to joins for this ADR:
+/// build, probe and spill are the only captured operator phases, and labelling that
+/// fraction as generic operator time would let it compete in the dominance test as though
+/// it were the whole.
+pub fn timing_atlas_component_scope(component: TimingAtlasComponent) -> &'static str {
+	match component {
+		TimingAtlasComponent::Scan => "scan",
+		TimingAtlasComponent::Operator => "join",
+		TimingAtlasComponent::Shuffle => "exchange",
+		TimingAtlasComponent::Dispatch => "scheduler",
+		TimingAtlasComponent::Transport => "wire",
+		TimingAtlasComponent::Reduction => "out_of_boundary",
+	}
+}
+
+/// One child's derived attribution: the task nodes it actually ran, the selected path, and
+/// the component portions along that path. Built from actual child receipts after the
+/// elapsed boundary, never from planned stage shapes.
+#[derive(Debug, Clone)]
+pub struct TimingAtlasChildAttribution {
+	pub nodes: Vec<TimingAtlasTaskNode>,
+	pub path: Vec<(u32, u32)>,
+	pub path_wall_ms: f64,
+	pub path_components: BTreeMap<String, f64>,
+}
+
+impl TimingAtlasChildAttribution {
+	/// The sum a receipt may claim against measured elapsed: eligible components only.
+	/// `dispatch` is retained in the map as raw evidence but has no local equivalent, so it
+	/// never enters the attributed figure.
+	pub fn attributed_ms(&self) -> f64 {
+		self.path_components
+			.iter()
+			.filter(|(label, _)| {
+				timing_atlas_component_from_label(label).is_some_and(|component| {
+					component.participates_in_timed_attribution()
+						&& !matches!(
+							component.local_pairing(),
+							TimingAtlasLocalPairing::NoLocalEquivalent
+						)
+				})
+			})
+			.map(|(_, value)| value)
+			.sum()
+	}
+}
+
+/// Build task nodes from a distributed run's retained report. Node identity comes from the
+/// tasks that actually completed; stage-level upstream edges expand to task-level edges
+/// against the tasks the report actually contains. Where a task retried, the last attempt
+/// wins — it is the attempt whose output was accepted.
+pub fn timing_atlas_nodes_from_report(
+	report: &toron::coordinator::QueryTaskTelemetryReport,
+) -> Vec<TimingAtlasTaskNode> {
+	use std::collections::btree_map::Entry;
+	let mut latest: BTreeMap<(u32, u32), &toron::distributed::scheduler::TaskTelemetryRecord> =
+		BTreeMap::new();
+	for record in &report.tasks {
+		let key = (record.identity.stage_id.0, record.identity.task_id.0);
+		match latest.entry(key) {
+			Entry::Vacant(vacant) => {
+				vacant.insert(record);
+			}
+			Entry::Occupied(mut occupied) => {
+				if record.identity.attempt_id >= occupied.get().identity.attempt_id {
+					occupied.insert(record);
+				}
+			}
+		}
+	}
+	let mut tasks_per_stage: BTreeMap<u32, Vec<u32>> = BTreeMap::new();
+	for (stage, task) in latest.keys() {
+		tasks_per_stage.entry(*stage).or_default().push(*task);
+	}
+	let upstream_stages: BTreeMap<u32, Vec<u32>> = report
+		.stage_upstreams
+		.iter()
+		.map(|(stage, upstreams)| {
+			(
+				stage.0,
+				upstreams.iter().map(|upstream| upstream.0).collect(),
+			)
+		})
+		.collect();
+	latest
+		.iter()
+		.map(|((stage, task), record)| {
+			let mut upstream = Vec::new();
+			if let Some(upstreams) = upstream_stages.get(stage) {
+				for upstream_stage in upstreams {
+					if let Some(upstream_tasks) = tasks_per_stage.get(upstream_stage) {
+						for upstream_task in upstream_tasks {
+							upstream.push((*upstream_stage, *upstream_task));
+						}
+					}
+				}
+			}
+			TimingAtlasTaskNode {
+				stage_id: *stage,
+				task_id: *task,
+				wall_ms: record.telemetry.phases.task_wall_micros as f64 / 1000.0,
+				components: timing_atlas_component_portions_ms(&record.telemetry.phases),
+				upstream,
+			}
+		})
+		.collect()
+}
+
+/// The local arm's single execution path as one task node, so its evidence flows through
+/// the same critical-path machinery as the distributed arm's. Wall clock is the executor
+/// window; the phases partition it exactly as they partition a distributed task's wall.
+pub fn timing_atlas_local_task_node(
+	execute_wall_ms: f64,
+	phases: &TaskTelemetryPhases,
+) -> TimingAtlasTaskNode {
+	TimingAtlasTaskNode {
+		stage_id: 0,
+		task_id: 0,
+		wall_ms: execute_wall_ms,
+		components: timing_atlas_component_portions_ms(phases),
+		upstream: Vec::new(),
+	}
+}
+
+/// Derive one child's attribution from its task nodes. `None` when the child produced no
+/// nodes — the caller decides whether that is a defect (a completed distributed child with
+/// no retained report is) rather than this function inventing an empty receipt.
+pub fn timing_atlas_child_attribution(
+	nodes: Vec<TimingAtlasTaskNode>,
+) -> Option<TimingAtlasChildAttribution> {
+	let selected = timing_atlas_critical_path(&nodes)?;
+	Some(TimingAtlasChildAttribution {
+		nodes,
+		path: selected.path,
+		path_wall_ms: selected.total_wall_ms,
+		path_components: selected.components,
+	})
+}
+
+/// One measured child's attribution receipt as a journal row: the full node set, the
+/// selected path, and the portions along it, so replay can re-derive every figure from the
+/// nodes rather than trusting the emitted path.
+pub fn timing_atlas_attribution_path_row(
+	query: &str,
+	arm: &str,
+	pair_index: usize,
+	attempt: u32,
+	measured_elapsed_ms: f64,
+	attribution: &TimingAtlasChildAttribution,
+) -> serde_json::Value {
+	let nodes: Vec<serde_json::Value> = attribution
+		.nodes
+		.iter()
+		.map(|node| {
+			let components: serde_json::Map<String, serde_json::Value> = node
+				.components
+				.iter()
+				.map(|(component, portion)| {
+					(component.label().to_string(), serde_json::json!(portion))
+				})
+				.collect();
+			serde_json::json!({
+				"stage": node.stage_id,
+				"task": node.task_id,
+				"wall_ms": node.wall_ms,
+				"components": components,
+				"upstream": node.upstream,
+			})
+		})
+		.collect();
+	serde_json::json!({
+		"kind": TIMING_ATLAS_KIND_ATTRIBUTION_PATH,
+		"query": query,
+		"arm": arm,
+		"pair_index": pair_index,
+		"attempt": attempt,
+		"measured_elapsed_ms": measured_elapsed_ms,
+		"nodes": nodes,
+		"path": attribution.path,
+		"path_wall_ms": attribution.path_wall_ms,
+		"path_components": attribution.path_components,
+		"remainder_ms": measured_elapsed_ms - attribution.attributed_ms(),
+	})
+}
+
+/// Per-cell component rows from the cell's measured pairs. The estimator is symmetric with
+/// the timing estimator: the cell's component contribution is the median over pairs of
+/// (distributed portion − local portion), exactly as the cell's delta is the median of
+/// paired deltas. Components pair per the taxonomy: `dispatch` is emitted raw and never
+/// additive; `transport`'s absent local side is the declared zero; `reduction` is out of
+/// the boundary and gets no row at all.
+pub fn timing_atlas_component_rows(
+	query: &str,
+	pairs: &[TimingAtlasPair],
+) -> Vec<serde_json::Value> {
+	let mut rows = Vec::new();
+	let attributed: Vec<(&TimingAtlasChildAttribution, &TimingAtlasChildAttribution)> = pairs
+		.iter()
+		.filter_map(|pair| {
+			Some((
+				pair.local.attribution.as_ref()?,
+				pair.distributed.attribution.as_ref()?,
+			))
+		})
+		.collect();
+	if attributed.len() != pairs.len() || attributed.is_empty() {
+		// A measured pair without attribution on both children is an apparatus defect the
+		// caller has already surfaced; emitting partial component rows here would let a
+		// cell claim receipts it cannot back.
+		return rows;
+	}
+	for component in TimingAtlasComponent::ALL {
+		if !component.participates_in_timed_attribution() {
+			continue;
+		}
+		let label = component.label();
+		let mut local_values = Vec::new();
+		let mut distributed_values = Vec::new();
+		let mut contributions = Vec::new();
+		for (local, distributed) in &attributed {
+			let local_ms = local.path_components.get(label).copied();
+			let distributed_ms = distributed
+				.path_components
+				.get(label)
+				.copied()
+				.unwrap_or(0.0);
+			let local_ms = match (local_ms, component.local_pairing()) {
+				(Some(value), _) => value,
+				(None, TimingAtlasLocalPairing::DeclaredZero) => 0.0,
+				(None, TimingAtlasLocalPairing::NoLocalEquivalent) => 0.0,
+				// Required components are always present in a local portion map by
+				// construction; an absent entry means the mapping regressed, and a zero
+				// here would silently hand the whole delta to this component.
+				(None, _) => continue,
+			};
+			local_values.push(local_ms);
+			distributed_values.push(distributed_ms);
+			contributions.push(distributed_ms - local_ms);
+		}
+		if contributions.len() != attributed.len() {
+			continue;
+		}
+		let eligible = !matches!(
+			component.local_pairing(),
+			TimingAtlasLocalPairing::NoLocalEquivalent
+		);
+		let median_contribution = timing_atlas_median(&mut contributions);
+		rows.push(serde_json::json!({
+			"kind": TIMING_ATLAS_KIND_ATTRIBUTION,
+			"query": query,
+			"component": label,
+			"scope": timing_atlas_component_scope(component),
+			"basis": TimingAtlasBasis::CriticalPath.label(),
+			"pairing": component.local_pairing().label(),
+			"eligible": eligible,
+			"additive": eligible,
+			"pairs": attributed.len(),
+			"median_local_ms": timing_atlas_median(&mut local_values),
+			"median_distributed_ms": timing_atlas_median(&mut distributed_values),
+			"contribution_ms": if eligible { serde_json::json!(median_contribution) } else { serde_json::Value::Null },
+			"raw_distributed_median_ms": timing_atlas_median(&mut distributed_values),
+		}));
+	}
+	rows
 }
 
 /// ADR 528: total classification of the fragmenter's reject taxonomy. Exhaustive by
@@ -20940,6 +21653,7 @@ mod adr538_timing_atlas_failure_paths {
 			valid,
 			failure: (!valid).then(|| "boom".to_string()),
 			failure_is_io,
+			attribution: None,
 		}
 	}
 
@@ -21180,6 +21894,7 @@ mod adr538_timing_atlas_execution {
 				valid: true,
 				failure: None,
 				failure_is_io: false,
+				attribution: None,
 			},
 			distributed: TimingAtlasChild {
 				query: "q01".to_string(),
@@ -21193,6 +21908,7 @@ mod adr538_timing_atlas_execution {
 				valid: true,
 				failure: None,
 				failure_is_io: false,
+				attribution: None,
 			},
 			delta_ms: 10.0,
 			ratio: Some(2.0),
@@ -21250,6 +21966,7 @@ mod adr538_timing_atlas_execution {
 					valid: true,
 					failure: None,
 					failure_is_io: false,
+					attribution: None,
 				},
 				distributed: TimingAtlasChild {
 					query: "q01".to_string(),
@@ -21263,6 +21980,7 @@ mod adr538_timing_atlas_execution {
 					valid: true,
 					failure: None,
 					failure_is_io: false,
+					attribution: None,
 				},
 				delta_ms: 15.0,
 				ratio: Some(2.5),
@@ -21348,6 +22066,7 @@ mod adr538_timing_atlas_runner {
 			self.clock_ms += self.reduce_ms;
 			Ok(TimingAtlasReduction {
 				identity_matches: true,
+				attribution: None,
 			})
 		}
 
@@ -21790,6 +22509,7 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 		) -> Result<TimingAtlasReduction, String> {
 			Ok(TimingAtlasReduction {
 				identity_matches: true,
+				attribution: None,
 			})
 		}
 
@@ -21883,6 +22603,7 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 			) -> Result<TimingAtlasReduction, String> {
 				Ok(TimingAtlasReduction {
 					identity_matches: true,
+					attribution: None,
 				})
 			}
 			async fn cleanup_child(&mut self, _plan: &TimingAtlasChildPlan) -> Result<(), String> {
@@ -21969,7 +22690,83 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 mod adr538_timing_atlas_journal_replay {
 	use super::*;
 
-	fn journal_lines(cells: &[&str], pairs_per_cell: usize) -> Vec<serde_json::Value> {
+	/// The fixture's local arm: one node whose portions include an observed shuffle and no
+	/// transport, exactly the shape a real local plan with an in-memory exchange produces.
+	fn fixture_local_attribution() -> TimingAtlasChildAttribution {
+		timing_atlas_child_attribution(vec![TimingAtlasTaskNode {
+			stage_id: 0,
+			task_id: 0,
+			wall_ms: 9.0,
+			components: vec![
+				(TimingAtlasComponent::Scan, 2.0),
+				(TimingAtlasComponent::Operator, 3.0),
+				(TimingAtlasComponent::Shuffle, 1.0),
+				(TimingAtlasComponent::Dispatch, 0.0),
+				(TimingAtlasComponent::Transport, 0.0),
+			],
+			upstream: Vec::new(),
+		}])
+		.expect("local fixture attributes")
+	}
+
+	/// The fixture's distributed arm: a producer feeding a consumer, so the selected path
+	/// has a real edge for replay to verify.
+	fn fixture_distributed_attribution() -> TimingAtlasChildAttribution {
+		timing_atlas_child_attribution(vec![
+			TimingAtlasTaskNode {
+				stage_id: 0,
+				task_id: 0,
+				wall_ms: 8.0,
+				components: vec![
+					(TimingAtlasComponent::Scan, 1.5),
+					(TimingAtlasComponent::Operator, 2.0),
+					(TimingAtlasComponent::Shuffle, 2.0),
+					(TimingAtlasComponent::Dispatch, 1.0),
+					(TimingAtlasComponent::Transport, 0.5),
+				],
+				upstream: Vec::new(),
+			},
+			TimingAtlasTaskNode {
+				stage_id: 1,
+				task_id: 0,
+				wall_ms: 10.0,
+				components: vec![
+					(TimingAtlasComponent::Scan, 0.0),
+					(TimingAtlasComponent::Operator, 3.0),
+					(TimingAtlasComponent::Shuffle, 1.0),
+					(TimingAtlasComponent::Dispatch, 0.5),
+					(TimingAtlasComponent::Transport, 1.0),
+				],
+				upstream: vec![(0, 0)],
+			},
+		])
+		.expect("distributed fixture attributes")
+	}
+
+	fn fixture_child(
+		query: &str,
+		arm: &'static str,
+		pair_index: usize,
+		elapsed: f64,
+		attribution: TimingAtlasChildAttribution,
+	) -> TimingAtlasChild {
+		TimingAtlasChild {
+			query: query.to_string(),
+			arm,
+			pair_index: Some(pair_index),
+			position_in_pair: 0,
+			attempt: 1,
+			query_elapsed_ms: elapsed,
+			row_count: Some(4),
+			identity_matches: Some(true),
+			valid: true,
+			failure: None,
+			failure_is_io: false,
+			attribution: Some(attribution),
+		}
+	}
+
+	pub(crate) fn journal_lines(cells: &[&str], pairs_per_cell: usize) -> Vec<serde_json::Value> {
 		let mut rows = vec![
 			timing_atlas_header_row(
 				&HostQuiescence {
@@ -21986,6 +22783,7 @@ mod adr538_timing_atlas_journal_replay {
 			rows.push(serde_json::json!({
 				"kind": TIMING_ATLAS_KIND_CELL_SETUP, "query": query
 			}));
+			let mut pairs = Vec::new();
 			for pair_index in 0..pairs_per_cell {
 				rows.push(serde_json::json!({
 					"kind": TIMING_ATLAS_KIND_PAIR,
@@ -21999,7 +22797,42 @@ mod adr538_timing_atlas_journal_replay {
 					"local_attempt": 1,
 					"distributed_attempt": 1,
 				}));
+				// Attribution rows come from the production emitters, so the fixture
+				// cannot drift from what the driver actually writes.
+				let local = fixture_child(
+					query,
+					"local",
+					pair_index,
+					10.0,
+					fixture_local_attribution(),
+				);
+				let distributed = fixture_child(
+					query,
+					"distributed",
+					pair_index,
+					20.0,
+					fixture_distributed_attribution(),
+				);
+				for child in [&local, &distributed] {
+					rows.push(timing_atlas_attribution_path_row(
+						query,
+						child.arm,
+						pair_index,
+						child.attempt,
+						child.query_elapsed_ms,
+						child.attribution.as_ref().expect("fixture attribution"),
+					));
+				}
+				pairs.push(TimingAtlasPair {
+					pair_index,
+					first_arm: "local",
+					local,
+					distributed,
+					delta_ms: 10.0,
+					ratio: Some(2.0),
+				});
 			}
+			rows.extend(timing_atlas_component_rows(query, &pairs));
 			rows.push(serde_json::json!({
 				"kind": TIMING_ATLAS_KIND_CLEANUP,
 				"query": query,
@@ -22008,14 +22841,6 @@ mod adr538_timing_atlas_journal_replay {
 			}));
 			rows.push(serde_json::json!({
 				"kind": TIMING_ATLAS_KIND_RESIDENCY, "query": query, "stable": true
-			}));
-			rows.push(serde_json::json!({
-				"kind": TIMING_ATLAS_KIND_ATTRIBUTION,
-				"query": query,
-				"component": "dispatch",
-				"additive": true,
-				"basis": "critical_path",
-				"contribution_ms": 6.0,
 			}));
 			rows.push(serde_json::json!({
 				"kind": TIMING_ATLAS_KIND_CELL_SUMMARY,
@@ -22170,6 +22995,7 @@ mod adr538_timing_atlas_journal_replay {
 			valid: true,
 			failure: None,
 			failure_is_io: false,
+			attribution: None,
 		};
 		let pair = assemble_timing_atlas_pair(0, child("local", 0.0), child("distributed", 5.0));
 		assert!(pair.ratio.is_none(), "a zero local arm has no ratio");
@@ -22264,24 +23090,14 @@ mod adr538_timing_atlas_journal_replay {
 		assert!(!replay.supports_authority(&granted()));
 	}
 
-	/// Only receipt-backed components with an admissible basis satisfy the veto.
+	/// Only receipt-backed components with an admissible basis satisfy the veto — and the
+	/// component rows the emitters produce carry exactly the taxonomy's pairing: four
+	/// eligible additive components, dispatch raw with a null contribution, reduction
+	/// absent entirely.
 	#[test]
 	fn receipt_backed_components_satisfy_the_attribution_requirement() {
 		let cells = timing_atlas_cells();
-		let mut rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
-		for query in &cells {
-			rows.insert(
-				2,
-				serde_json::json!({
-					"kind": TIMING_ATLAS_KIND_ATTRIBUTION,
-					"query": query,
-					"component": "dispatch",
-					"additive": true,
-					"basis": "critical_path",
-					"contribution_ms": 12.0,
-				}),
-			);
-		}
+		let rows = journal_lines(&cells, TIMING_ATLAS_MEASURED_PAIRS);
 		let replay = timing_atlas_replay(&render(&rows));
 		assert_eq!(replay.cells_with_attribution.len(), 21);
 		assert!(replay.non_additive_components.is_empty());
@@ -22291,6 +23107,36 @@ mod adr538_timing_atlas_journal_replay {
 			replay.withheld_reasons()
 		);
 		assert!(replay.supports_authority(&granted()));
+
+		let q01_components: Vec<&serde_json::Value> = rows
+			.iter()
+			.filter(|row| {
+				row.get("kind").and_then(|kind| kind.as_str())
+					== Some(TIMING_ATLAS_KIND_ATTRIBUTION)
+					&& row.get("query").and_then(|q| q.as_str()) == Some("q01")
+			})
+			.collect();
+		let labels: Vec<&str> = q01_components
+			.iter()
+			.filter_map(|row| row.get("component").and_then(|c| c.as_str()))
+			.collect();
+		assert_eq!(
+			labels,
+			vec!["scan", "operator", "shuffle", "dispatch", "transport"],
+			"every timed component gets a row; reduction never does"
+		);
+		for row in &q01_components {
+			let label = row.get("component").and_then(|c| c.as_str()).unwrap();
+			let eligible = row.get("eligible").and_then(|e| e.as_bool()).unwrap();
+			let additive = row.get("additive").and_then(|a| a.as_bool()).unwrap();
+			if label == "dispatch" {
+				assert!(!eligible && !additive, "dispatch stays raw");
+				assert!(row.get("contribution_ms").unwrap().is_null());
+			} else {
+				assert!(eligible && additive, "{label} is receipt-backed");
+				assert!(row.get("contribution_ms").unwrap().is_f64());
+			}
+		}
 	}
 }
 
@@ -23382,5 +24228,438 @@ mod adr538_path_bound_validation {
 				.iter()
 				.any(|v| v.contains("inadmissible basis"))
 		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_phase_component_wiring {
+	use super::*;
+	use toron::coordinator::QueryTaskTelemetryReport;
+	use toron::distributed::identity::{AttemptId, StageId, TaskId, TaskIdentity};
+	use toron::distributed::scheduler::TaskTelemetryRecord;
+
+	/// Distinct primes per counter, so any counter mapped to the wrong component — or to
+	/// two components — changes a sum and fails. The ten mapped counters and the three
+	/// named remainder counters are the whole of `TaskTelemetryPhases`.
+	#[test]
+	fn every_phase_counter_is_mapped_once_or_named_as_remainder() {
+		let phases = TaskTelemetryPhases {
+			task_wall_micros: 104_729,
+			shuffle_pull_decode_micros: 2,
+			build_micros: 3,
+			probe_micros: 5,
+			spill_micros: 7,
+			output_publish_micros: 11,
+			task_setup_micros: 13,
+			batch_encode_micros: 17,
+			batch_send_micros: 19,
+			batch_decode_micros: 23,
+			dispatch_wait_micros: 29,
+			telemetry_lock_micros: 31,
+			exchange_repartition_micros: 37,
+			scan_micros: 41,
+			framework_overhead_micros: 43,
+		};
+		let portions = timing_atlas_component_portions_ms(&phases);
+		let by_label: BTreeMap<&str, f64> = portions
+			.iter()
+			.map(|(component, portion)| (component.label(), *portion))
+			.collect();
+		assert_eq!(by_label["scan"], 41.0 / 1000.0);
+		assert_eq!(by_label["operator"], (3.0 + 5.0 + 7.0) / 1000.0);
+		assert_eq!(by_label["shuffle"], (37.0 + 2.0 + 11.0) / 1000.0);
+		assert_eq!(by_label["dispatch"], (29.0 + 13.0) / 1000.0);
+		assert_eq!(by_label["transport"], (17.0 + 19.0 + 23.0) / 1000.0);
+		// Totality: mapped micros plus the named remainder counters account for every
+		// counter except the wall itself.
+		let mapped_micros: f64 = portions.iter().map(|(_, portion)| portion * 1000.0).sum();
+		let remainder_micros =
+			(phases.telemetry_lock_micros + phases.framework_overhead_micros) as f64;
+		assert_eq!(
+			mapped_micros + remainder_micros,
+			(2 + 3 + 5 + 7 + 11 + 13 + 17 + 19 + 23 + 29 + 31 + 37 + 41 + 43) as f64,
+			"a counter is either mapped to exactly one component or named as remainder"
+		);
+		assert_eq!(TIMING_ATLAS_UNATTRIBUTED_PHASES.len(), 3);
+	}
+
+	/// Presence at zero is what distinguishes an observed zero from a missing receipt, so
+	/// every timed component appears even when its counters are all zero.
+	#[test]
+	fn every_timed_component_is_present_even_at_zero() {
+		let portions = timing_atlas_component_portions_ms(&TaskTelemetryPhases::default());
+		let labels: Vec<&str> = portions
+			.iter()
+			.map(|(component, _)| component.label())
+			.collect();
+		assert_eq!(
+			labels,
+			vec!["scan", "operator", "shuffle", "dispatch", "transport"]
+		);
+		assert!(portions.iter().all(|(_, portion)| *portion == 0.0));
+	}
+
+	fn record(stage: u32, task: u32, attempt: u32, wall_micros: u64) -> TaskTelemetryRecord {
+		let mut telemetry = TaskTelemetry::default();
+		telemetry.phases.task_wall_micros = wall_micros;
+		TaskTelemetryRecord {
+			identity: TaskIdentity::new(
+				QueryId::from_u128(538),
+				StageId::new(stage),
+				TaskId::new(task),
+				AttemptId::new(attempt),
+			),
+			telemetry,
+		}
+	}
+
+	/// Stage-level upstream edges expand against the tasks the report actually contains,
+	/// and a retried task contributes only its accepted attempt.
+	#[test]
+	fn nodes_expand_stage_edges_from_actual_tasks_and_last_attempt_wins() {
+		let report = QueryTaskTelemetryReport {
+			query_id: QueryId::from_u128(538),
+			stage_upstreams: vec![
+				(StageId::new(0), vec![]),
+				(StageId::new(1), vec![StageId::new(0)]),
+			],
+			tasks: vec![
+				record(0, 0, 0, 8_000),
+				record(0, 1, 0, 6_000),
+				// A retry: the first attempt's wall must not survive into the node.
+				record(1, 0, 0, 1_000),
+				record(1, 0, 1, 12_000),
+			],
+		};
+		let nodes = timing_atlas_nodes_from_report(&report);
+		assert_eq!(nodes.len(), 3, "one node per task, not per attempt");
+		let consumer = nodes
+			.iter()
+			.find(|node| node.key() == (1, 0))
+			.expect("consumer node");
+		assert_eq!(consumer.wall_ms, 12.0, "the accepted attempt's wall");
+		assert_eq!(
+			consumer.upstream,
+			vec![(0, 0), (0, 1)],
+			"edges expand to every task of the upstream stage"
+		);
+		let path = timing_atlas_critical_path(&nodes).expect("path");
+		assert_eq!(
+			path.path,
+			vec![(0, 0), (1, 0)],
+			"selected through the slower producer"
+		);
+	}
+
+	/// The local arm's evidence flows through the same machinery: a single node whose
+	/// observed shuffle portion — including a genuine zero — survives path derivation.
+	#[test]
+	fn local_node_flows_through_the_same_critical_path_machinery() {
+		let mut phases = TaskTelemetryPhases::default();
+		phases.exchange_repartition_micros = 4_200;
+		phases.scan_micros = 1_800;
+		let node = timing_atlas_local_task_node(25.0, &phases);
+		let attribution = timing_atlas_child_attribution(vec![node]).expect("local attributes");
+		assert_eq!(attribution.path, vec![(0, 0)]);
+		assert_eq!(attribution.path_wall_ms, 25.0);
+		assert_eq!(attribution.path_components["shuffle"], 4.2);
+		assert_eq!(attribution.path_components["scan"], 1.8);
+		assert_eq!(attribution.path_components["transport"], 0.0);
+	}
+}
+
+#[cfg(test)]
+mod adr538_attribution_replay_vetoes {
+	use super::*;
+
+	fn tampered_journal<F: FnMut(&mut serde_json::Value) -> bool>(
+		kind: &str,
+		mut tamper: F,
+	) -> TimingAtlasReplay {
+		let cells = timing_atlas_cells();
+		let mut rows = super::adr538_timing_atlas_journal_replay::journal_lines(
+			&cells,
+			TIMING_ATLAS_MEASURED_PAIRS,
+		);
+		let mut tampered = false;
+		for row in rows.iter_mut() {
+			if row.get("kind").and_then(|k| k.as_str()) == Some(kind) && tamper(row) {
+				tampered = true;
+				break;
+			}
+		}
+		assert!(tampered, "fixture must contain a {kind} row to tamper");
+		let journal = rows
+			.iter()
+			.map(|row| row.to_string())
+			.collect::<Vec<_>>()
+			.join("\n");
+		timing_atlas_replay(&journal)
+	}
+
+	/// A persisted path that disagrees with the path re-derived from its own nodes is
+	/// rejected — the emitter cannot assert its own selection.
+	#[test]
+	fn a_path_row_lying_about_its_selection_is_rejected() {
+		let replay = tampered_journal(TIMING_ATLAS_KIND_ATTRIBUTION_PATH, |row| {
+			if row.get("arm").and_then(|a| a.as_str()) != Some("distributed") {
+				return false;
+			}
+			row["path"] = serde_json::json!([[1, 0]]);
+			true
+		});
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|violation| violation.contains("disagrees with the path re-derived")),
+			"violations: {:?}",
+			replay.violations
+		);
+	}
+
+	/// A path component portion that disagrees with its nodes is rejected.
+	#[test]
+	fn a_path_row_lying_about_a_portion_is_rejected() {
+		let replay = tampered_journal(TIMING_ATLAS_KIND_ATTRIBUTION_PATH, |row| {
+			row["path_components"]["operator"] = serde_json::json!(400.0);
+			true
+		});
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|violation| violation.contains("path component operator claims")),
+			"violations: {:?}",
+			replay.violations
+		);
+	}
+
+	/// Attribution can never exceed the child's measured elapsed: eligible portions plus
+	/// remainder must cover the measurement, so an inflated attribution is a defect.
+	#[test]
+	fn attribution_exceeding_measured_elapsed_is_rejected() {
+		let replay = tampered_journal(TIMING_ATLAS_KIND_ATTRIBUTION_PATH, |row| {
+			row["measured_elapsed_ms"] = serde_json::json!(1.0);
+			true
+		});
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|violation| violation.contains("exceeds measured elapsed")),
+			"violations: {:?}",
+			replay.violations
+		);
+	}
+
+	/// A component row whose contribution disagrees with the paths it summarizes is
+	/// rejected — the emitted median is recomputed, never trusted.
+	#[test]
+	fn a_component_row_lying_about_its_contribution_is_rejected() {
+		let replay = tampered_journal(TIMING_ATLAS_KIND_ATTRIBUTION, |row| {
+			if row.get("component").and_then(|c| c.as_str()) != Some("shuffle") {
+				return false;
+			}
+			row["contribution_ms"] = serde_json::json!(999.0);
+			true
+		});
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|violation| violation.contains("shuffle contribution disagrees")),
+			"violations: {:?}",
+			replay.violations
+		);
+	}
+
+	/// Component rows without a verified path behind every measured pair are rejected: a
+	/// cell cannot claim receipts its journal does not back.
+	#[test]
+	fn component_rows_without_backing_paths_are_rejected() {
+		let cells = timing_atlas_cells();
+		let rows = super::adr538_timing_atlas_journal_replay::journal_lines(
+			&cells,
+			TIMING_ATLAS_MEASURED_PAIRS,
+		)
+		.into_iter()
+		.filter(|row| {
+			row.get("kind").and_then(|kind| kind.as_str())
+				!= Some(TIMING_ATLAS_KIND_ATTRIBUTION_PATH)
+		})
+		.collect::<Vec<_>>();
+		let journal = rows
+			.iter()
+			.map(|row| row.to_string())
+			.collect::<Vec<_>>()
+			.join("\n");
+		let replay = timing_atlas_replay(&journal);
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|violation| violation.contains("lacks a verified attribution path")),
+			"violations: {:?}",
+			replay.violations
+		);
+	}
+}
+
+#[cfg(test)]
+mod adr538_attribution_end_to_end {
+	use super::*;
+
+	/// Run one full cell on the real harness at sf 0.01 and journal it exactly as the
+	/// driver would, so the rows replay through the strict validator.
+	/// Deep binds need an explicit stack; run on a dedicated 64 MB thread.
+	fn run_cell(query: &'static str) -> TimingAtlasCellOutcome {
+		std::thread::Builder::new()
+			.stack_size(64 * 1024 * 1024)
+			.spawn(move || {
+				let runtime = tokio::runtime::Builder::new_multi_thread()
+					.worker_threads(2)
+					.enable_all()
+					.build()
+					.expect("runtime");
+				runtime.block_on(async {
+					let mut harness = CensusTimingAtlasHarness::prepare(
+						query,
+						"strict",
+						0.01,
+						Path::new("unused"),
+					)
+					.await
+					.expect("prepare");
+					run_timing_atlas_cell_with(&mut harness, query).await
+				})
+			})
+			.expect("spawn")
+			.join()
+			.expect("join")
+	}
+
+	fn journal_for(outcome: &TimingAtlasCellOutcome) -> String {
+		let mut rows = vec![
+			timing_atlas_header_row(
+				&HostQuiescence {
+					service_inactive: true,
+					sql_port_free: true,
+				},
+				"fnv1a64:test",
+				0.01,
+				"strict",
+			),
+			timing_atlas_exclusion_row("q15"),
+			serde_json::json!({
+				"kind": TIMING_ATLAS_KIND_CELL_SETUP, "query": outcome.query
+			}),
+		];
+		for pair in &outcome.pairs {
+			rows.push(timing_atlas_child_row(&pair.local));
+			rows.push(timing_atlas_child_row(&pair.distributed));
+			rows.push(timing_atlas_pair_row(&outcome.query, pair));
+			for child in [&pair.local, &pair.distributed] {
+				let attribution = child
+					.attribution
+					.as_ref()
+					.expect("every valid measured child carries attribution");
+				rows.push(timing_atlas_attribution_path_row(
+					&outcome.query,
+					child.arm,
+					pair.pair_index,
+					child.attempt,
+					child.query_elapsed_ms,
+					attribution,
+				));
+			}
+		}
+		rows.extend(timing_atlas_component_rows(&outcome.query, &outcome.pairs));
+		rows.push(timing_atlas_cell_summary_row(outcome));
+		rows.push(serde_json::json!({
+			"kind": TIMING_ATLAS_KIND_HOST_END,
+			"service_inactive": true,
+			"sql_port_free": true,
+		}));
+		rows.push(serde_json::json!({ "kind": TIMING_ATLAS_SEAL_KIND }));
+		rows.iter()
+			.map(|row| row.to_string())
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	fn shuffle_portion(child: &TimingAtlasChild) -> f64 {
+		child
+			.attribution
+			.as_ref()
+			.expect("attribution")
+			.path_components
+			.get("shuffle")
+			.copied()
+			.expect("shuffle portion is always present")
+	}
+
+	/// q03 binds an `Exchange` in its local plan, so shuffle must appear as a *paired*
+	/// figure: real repartition time on the local arm, real shuffle time on the
+	/// distributed arm — and the whole cell must replay through the strict validator.
+	#[test]
+	fn q03_produces_paired_shuffle_receipts_on_both_arms() {
+		let outcome = run_cell("q03");
+		assert!(outcome.failure.is_none(), "cell: {:?}", outcome.failure);
+		assert_eq!(outcome.pairs.len(), TIMING_ATLAS_MEASURED_PAIRS);
+		for pair in &outcome.pairs {
+			assert!(
+				shuffle_portion(&pair.local) > 0.0,
+				"q03's local exchange repartitions in memory; its shuffle is a real \
+				 local figure, not a declared zero"
+			);
+			assert!(
+				shuffle_portion(&pair.distributed) > 0.0,
+				"the distributed arm publishes and pulls shuffle partitions"
+			);
+		}
+		let replay = timing_atlas_replay(&journal_for(&outcome));
+		assert!(
+			replay.violations.is_empty(),
+			"violations: {:?}",
+			replay.violations
+		);
+		assert!(replay.cells_with_attribution.contains("q03"));
+	}
+
+	/// q06 is the one eligible cell whose local plan has no exchange: its local shuffle
+	/// arrives as an *observed* zero through the same instrument as every other figure,
+	/// never as a declaration.
+	#[test]
+	fn q06_local_shuffle_is_an_observed_zero() {
+		let outcome = run_cell("q06");
+		assert!(outcome.failure.is_none(), "cell: {:?}", outcome.failure);
+		assert_eq!(outcome.pairs.len(), TIMING_ATLAS_MEASURED_PAIRS);
+		for pair in &outcome.pairs {
+			assert_eq!(
+				shuffle_portion(&pair.local),
+				0.0,
+				"q06's local plan has no exchange; the zero is observed, not declared"
+			);
+		}
+		let journal = journal_for(&outcome);
+		let replay = timing_atlas_replay(&journal);
+		assert!(
+			replay.violations.is_empty(),
+			"violations: {:?}",
+			replay.violations
+		);
+		// The dispatch rows the cell emitted stay raw: present, ineligible, null
+		// contribution — on real receipts, not just fixtures.
+		let dispatch_row = journal
+			.lines()
+			.filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+			.find(|row| {
+				row.get("kind").and_then(|k| k.as_str()) == Some(TIMING_ATLAS_KIND_ATTRIBUTION)
+					&& row.get("component").and_then(|c| c.as_str()) == Some("dispatch")
+			})
+			.expect("dispatch component row");
+		assert_eq!(dispatch_row["eligible"], serde_json::json!(false));
+		assert!(dispatch_row["contribution_ms"].is_null());
 	}
 }
