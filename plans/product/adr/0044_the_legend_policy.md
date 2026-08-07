@@ -100,6 +100,13 @@ Deduplication removes repetition; it never removes information. This is the
 ad hoc, answered where it belongs: identity is the entry triple, defined by
 the model, not a similarity judgment.
 
+When collapsing duplicates whose provenance differs, the survivor is
+`Named`: a data-read name is never demoted to an omittable synthetic by
+merging with a synthetic twin. Provenance stays outside merge identity —
+this rule chooses the survivor's field, not the collapse. (Stated 2026-08-07
+by the implementation review's record-accuracy pass; the rule shipped
+documented in code and evidence but unstated here.)
+
 The last-authored-layer delegation and its bridge tests retire. The hover
 half of the bridge is untouched.
 
