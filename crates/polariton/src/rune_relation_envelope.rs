@@ -107,6 +107,9 @@ pub(crate) struct StyledRunePlotSink {
 
 impl StyledRunePlotSink {
 	pub(crate) fn into_layer(self) -> Result<LayerSpec, Self> {
+		if self.sink.category.is_some() {
+			return Err(self);
+		}
 		let mark = match self.sink.composition.primary_plot_type() {
 			PlotType::Line => LayerMark::Line,
 			PlotType::Scatter => LayerMark::Scatter,
@@ -2435,11 +2438,11 @@ fn parse_modified_mark(
 			);
 		}
 	};
-	if args.len() != 2 {
+	if !matches!(args.len(), 2 | 3) || (plot_type != PlotType::Scatter && args.len() != 2) {
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"a modified mark takes exactly x and y string fields; category color is not a Layer setting",
+			"a modified scatter takes x and y string fields, with one optional category color field",
 		);
 	}
 	match plot_type {
@@ -2473,14 +2476,14 @@ fn parse_modified_mark(
 		}
 		_ => {}
 	}
-	let mut fields = Vec::with_capacity(2);
+	let mut fields = Vec::with_capacity(args.len());
 	for field in args {
 		let raw = source_slice(source, field.span())?;
 		let Some(value) = decode_string_literal(raw) else {
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"a modified mark requires x and y string literals",
+				"a modified mark requires string literal fields",
 			);
 		};
 		fields.push(value);
@@ -2490,7 +2493,7 @@ fn parse_modified_mark(
 			composition: PlotComposition::single(plot_type),
 			x: fields[0].clone(),
 			y: fields[1].clone(),
-			category: None,
+			category: fields.get(2).cloned(),
 		},
 		settings: LayerSettings {
 			point_size: point_size.map_or(Override::Inherit, Override::Set),
@@ -4429,6 +4432,26 @@ workspace.table("t").views([figure([
 	}
 
 	#[test]
+	fn product_0046_category_scatter_keeps_its_encoding_and_point_size() {
+		let transformed = transform(
+			"workspace.table(\"t\").views([figure([scatter(\"units\", \"revenue\", \"product\").point_size(2.0)])])",
+		)
+		.expect("styled category scatter envelope");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("plot intent");
+		};
+		let RunePlotBody::StyledSingle(styled) = &plot.body else {
+			panic!("styled standalone scatter");
+		};
+		assert_eq!(styled.sink.category.as_deref(), Some("product"));
+		assert_eq!(
+			styled.settings.point_size,
+			Override::Set(PointSize::new(2.0).unwrap())
+		);
+		assert!(styled.clone().into_layer().is_err());
+	}
+
+	#[test]
 	fn product_0018_point_size_uses_the_substrate_domain_without_clamping() {
 		for factor in ["0.25", "1", "2.0", "8.0"] {
 			let source = format!(
@@ -4473,7 +4496,6 @@ workspace.table("t").views([figure([
 			"scatter(\"x\", \"y\").title(\"wrong level\")",
 			"scatter(\"x\", \"y\").point_size(2.0).point_size(3.0)",
 			"line(\"x\", \"y\").point_size(2.0)",
-			"scatter(\"x\", \"y\", \"cat\").point_size(2.0)",
 		] {
 			let source = format!("workspace.table(\"t\").views([table(), layers([{modified}])])");
 			let RuneEnvelopeError::InvalidView { span, .. } =

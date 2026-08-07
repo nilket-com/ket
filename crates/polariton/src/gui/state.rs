@@ -4739,6 +4739,105 @@ workspace.table("t").views([
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0046_category_scatter_point_size_uses_the_standalone_carrier() {
+		let frame = polars::df!(
+			"units" => [10.0_f64, 20.0, 30.0],
+			"revenue" => [40.0_f64, 80.0, 120.0],
+			"product" => ["A", "B", "C"],
+		)
+		.expect("categorical scatter frame");
+		let program = transform_rune_view(
+			r#"workspace.table("t").views([figure([
+				scatter("units", "revenue", "product").point_size(2.0),
+			])])"#,
+		)
+		.expect("styled categorical scatter");
+		let relation = program
+			.clone()
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let outcome = rune_view_outcome(frame.clone(), relation.views);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
+			resolved,
+			layer_settings,
+			_,
+			_,
+		)) = &outcome.sinks[0].output
+		else {
+			panic!("a styled categorical scatter must use the standalone carrier")
+		};
+		assert_eq!(
+			resolved.resolved_spec.composition.primary_plot_type(),
+			crate::plot::core::PlotType::Scatter
+		);
+		assert_eq!(
+			layer_settings.point_size,
+			crate::plot::spec::Override::Set(crate::plot::spec::PointSize::new(2.0).unwrap())
+		);
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(110);
+		let identity = LocalViewIdentity::Named("points".to_owned());
+		let sources = [
+			"workspace.table(\"t\").views([view(\"points\", scatter(\"units\", \"revenue\", \"product\").point_size(1.0))])",
+			"workspace.table(\"t\").views([view(\"points\", scatter(\"units\", \"revenue\", \"product\").point_size(2.0))])",
+		];
+		let mut panel = None;
+		let mut svgs = Vec::new();
+		for (offset, source) in sources.into_iter().enumerate() {
+			let revision = offset as u64 + 1;
+			let program = transform_rune_view(source).expect("categorical point-size revision");
+			let presentation = program
+				.presentation_views()
+				.into_iter()
+				.map(|view| (view.identity.clone(), view.intent.presentation()))
+				.collect::<Vec<_>>();
+			state.rune_buffer_revisions.insert(source_buffer, revision);
+			state
+				.code_editor
+				.prepare_rune_view_panels(source_buffer, &presentation, revision);
+			let current = state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity)
+				.expect("stable categorical point-size panel");
+			if let Some(first) = panel {
+				assert_eq!(current, first, "point size is not view identity");
+			} else {
+				panel = Some(current);
+			}
+			assert!(
+				state
+					.rune_view_scheduler
+					.submit(PendingRuneView {
+						source_buffer,
+						revision,
+						view: program.clone(),
+					})
+					.is_some()
+			);
+			complete_relation_in_head(
+				&mut state,
+				source_buffer,
+				revision,
+				program.into_relations().next().expect("one relation"),
+				frame.clone(),
+			);
+			svgs.push(
+				state
+					.code_editor
+					.rune_view_panel_plot_svg(source_buffer, &identity)
+					.expect("completed categorical point-size canvas"),
+			);
+		}
+		assert!(svgs[1].contains("A 6.00 6.00"));
+		assert_ne!(svgs[0], svgs[1]);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn product_0020_stroke_width_reaches_host_and_combines_with_point_size() {
 		let frame = polars::df!("x" => [1.0_f64, 2.0, 3.0], "y" => [2.0_f64, 4.0, 3.0])
 			.expect("line frame");

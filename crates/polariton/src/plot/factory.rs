@@ -256,6 +256,16 @@ pub fn create_styled_plot(
 ) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
 	let plot_type = spec.composition.primary_plot_type();
 	match spec.kernel_fields.as_ref() {
+		ResolvedKernelFields::Scatter { .. } => Ok(Arc::new(
+			crate::plot::kernels::scatter::ScatterPlotKernel::with_layer_settings(
+				Arc::new(
+					crate::plot::kernels::scatter::prepare_scatter_data_resolved(
+						df, spec, 1200, 720,
+					),
+				),
+				layer_settings,
+			),
+		)),
 		ResolvedKernelFields::Bar {
 			category,
 			group,

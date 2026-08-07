@@ -4,8 +4,10 @@ use crate::plot::common::{
 };
 use crate::plot::legend::LegendProvenance;
 use crate::plot::spec::{
-	Channel, PointSize, ResolvedColor, ResolvedLayout, ResolvedPlotSpec, ScaleDomain, ScaleFamily,
+	Channel, LayerSettings, PointSize, ResolvedColor, ResolvedLayout, ResolvedPlotSpec,
+	ScaleDomain, ScaleFamily,
 };
+use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
 use iced::{Color, Point, Rectangle};
@@ -15,6 +17,7 @@ use std::sync::{Arc, Mutex};
 pub struct ScatterPlotKernel {
 	pub prepared_data: Arc<ScatterPreparedData>,
 	renderer: ScatterMarkRenderer,
+	layer_settings: LayerSettings,
 }
 
 pub struct ScatterMarkRenderer {
@@ -85,6 +88,22 @@ impl PlotKernel for ScatterPlotKernel {
 		self.renderer.draw(backend, bounds, transform, settings);
 	}
 
+	fn plot_with_settings(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		_cursor: Cursor,
+		settings: &PlotSettings,
+	) {
+		self.renderer.draw(
+			backend,
+			bounds,
+			transform,
+			settings.resolve_for_layer(&self.layer_settings),
+		);
+	}
+
 	fn legend_content(
 		&self,
 		settings: &ResolvedPlotSettings,
@@ -131,9 +150,17 @@ impl PlotKernel for ScatterPlotKernel {
 
 impl ScatterPlotKernel {
 	pub fn new(prepared_data: Arc<ScatterPreparedData>) -> Self {
+		Self::with_layer_settings(prepared_data, LayerSettings::default())
+	}
+
+	pub fn with_layer_settings(
+		prepared_data: Arc<ScatterPreparedData>,
+		layer_settings: LayerSettings,
+	) -> Self {
 		Self {
 			prepared_data: Arc::clone(&prepared_data),
 			renderer: ScatterMarkRenderer::new(prepared_data),
+			layer_settings,
 		}
 	}
 }
