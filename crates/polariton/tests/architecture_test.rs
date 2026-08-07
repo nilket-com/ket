@@ -1090,6 +1090,35 @@ fn product_0039_minor_ticks_have_one_surface_producer_and_checked_total_capacity
 }
 
 #[test]
+fn product_0040_static_literal_bindings_resolve_only_at_the_envelope_boundary() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let production = envelope
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("Rune envelope production");
+	assert!(production.contains("fn resolve_static_literal("));
+	assert!(production.contains("fn resolve_static_literal_text("));
+	assert!(production.contains("statement_start < use_start"));
+	assert!(production.contains("binding {name:?} does not resolve to a literal"));
+	assert!(production.contains("fn parse_figure_heading("));
+	assert!(production.contains("fn parse_figure_bounds("));
+	assert!(production.contains("fn parse_figure_tick_step("));
+	assert!(production.contains("fn parse_figure_minor_ticks("));
+	for forbidden in [
+		"parse_all::<ast::EmptyBlock>(initializer",
+		"rune::runtime",
+		"rune::Vm",
+	] {
+		assert!(
+			!production.contains(forbidden),
+			"static literal resolution evaluated Rune through {forbidden}"
+		);
+	}
+}
+
+#[test]
 fn product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let libaryon_theme = manifest_dir.join("../libaryon/src/engine/theme.rs");

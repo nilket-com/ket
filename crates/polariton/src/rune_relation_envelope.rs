@@ -604,6 +604,18 @@ struct LocalBinding {
 	statement_start: usize,
 }
 
+#[derive(Clone, Debug, PartialEq)]
+enum StaticLiteralValue {
+	String(String),
+	Number(f64),
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct ResolvedStaticLiteral {
+	value: StaticLiteralValue,
+	binding: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 struct ViewShadows {
 	table: bool,
@@ -684,7 +696,8 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 
 		if let ast::Stmt::Local(local) = statement {
 			let statement_span = byte_range(statement.span(), source.len())?;
-			let provenance = expression_provenance(&local.expr, source, &kinds, shadows)?;
+			let provenance =
+				expression_provenance(&local.expr, source, &kinds, shadows, &bindings)?;
 			if let Some(binding) = bindings
 				.iter()
 				.find(|binding| binding.statement == statement_span)
@@ -713,7 +726,7 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 				root,
 				origin,
 				sinks,
-			}) = expression_provenance(expression, source, &kinds, shadows)?
+			}) = expression_provenance(expression, source, &kinds, shadows, &bindings)?
 		{
 			let emission = byte_range(statement.span(), source.len())?;
 			recognized_presentation = true;
@@ -800,6 +813,7 @@ fn expression_provenance(
 	source: &str,
 	bindings: &HashMap<String, ExpressionProvenance>,
 	shadows: ViewShadows,
+	literal_bindings: &[LocalBinding],
 ) -> Result<Option<ExpressionProvenance>, RuneEnvelopeError> {
 	match expression {
 		ast::Expr::Path(path) => {
@@ -820,12 +834,20 @@ fn expression_provenance(
 			}
 			Ok(bindings.get(raw).cloned())
 		}
-		ast::Expr::Group(group) => expression_provenance(&group.expr, source, bindings, shadows),
+		ast::Expr::Group(group) => {
+			expression_provenance(&group.expr, source, bindings, shadows, literal_bindings)
+		}
 		ast::Expr::Call(call) => {
 			let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
 			if let ast::Expr::FieldAccess(field) = call.expr.as_ref() {
 				let method = source_slice(source, field.expr_field.span())?.trim();
-				let receiver = expression_provenance(&field.expr, source, bindings, shadows)?;
+				let receiver = expression_provenance(
+					&field.expr,
+					source,
+					bindings,
+					shadows,
+					literal_bindings,
+				)?;
 				return match receiver {
 					Some(ExpressionProvenance::RelationCandidate { span, root, origin }) => {
 						provenance_method_on_relation(
@@ -837,6 +859,7 @@ fn expression_provenance(
 							origin,
 							&args,
 							source,
+							literal_bindings,
 						)
 					}
 					Some(ExpressionProvenance::ViewSet {
@@ -845,14 +868,22 @@ fn expression_provenance(
 						origin,
 						sinks,
 					}) => provenance_method_on_view_set(
-						call, method, relation, root, origin, sinks, &args, source,
+						call,
+						method,
+						relation,
+						root,
+						origin,
+						sinks,
+						&args,
+						source,
+						literal_bindings,
 					),
 					None => Ok(None),
 				};
 			}
 
 			if matches!(
-				expression_provenance(&call.expr, source, bindings, shadows)?,
+				expression_provenance(&call.expr, source, bindings, shadows, literal_bindings)?,
 				Some(ExpressionProvenance::ViewSet { .. })
 			) {
 				return invalid_view(
@@ -863,7 +894,7 @@ fn expression_provenance(
 			}
 			for arg in &args {
 				if matches!(
-					expression_provenance(arg, source, bindings, shadows)?,
+					expression_provenance(arg, source, bindings, shadows, literal_bindings)?,
 					Some(ExpressionProvenance::ViewSet { .. })
 				) {
 					return invalid_view(
@@ -878,7 +909,7 @@ fn expression_provenance(
 		ast::Expr::Vec(vector) => {
 			for (item, _) in vector.items.iter() {
 				if matches!(
-					expression_provenance(item, source, bindings, shadows)?,
+					expression_provenance(item, source, bindings, shadows, literal_bindings)?,
 					Some(ExpressionProvenance::ViewSet { .. })
 				) {
 					return invalid_view(
@@ -903,10 +934,11 @@ fn provenance_method_on_relation(
 	mut origin: String,
 	args: &[&ast::Expr],
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<Option<ExpressionProvenance>, RuneEnvelopeError> {
 	match method {
 		"views" => {
-			let sinks = parse_view_list(call, args, source)?;
+			let sinks = parse_view_list(call, args, source, literal_bindings)?;
 			Ok(Some(ExpressionProvenance::ViewSet {
 				relation,
 				root,
@@ -972,6 +1004,7 @@ fn provenance_method_on_view_set(
 	mut sinks: Vec<ParsedSink>,
 	args: &[&ast::Expr],
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<Option<ExpressionProvenance>, RuneEnvelopeError> {
 	if method != "views" {
 		return invalid_view(
@@ -980,7 +1013,7 @@ fn provenance_method_on_view_set(
 			"a ViewSet may only be emitted or extended with .views([...])",
 		);
 	}
-	sinks.extend(parse_view_list(call, args, source)?);
+	sinks.extend(parse_view_list(call, args, source, literal_bindings)?);
 	Ok(Some(ExpressionProvenance::ViewSet {
 		relation,
 		root,
@@ -993,6 +1026,7 @@ fn parse_view_list(
 	call: &ast::ExprCall,
 	args: &[&ast::Expr],
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<Vec<ParsedSink>, RuneEnvelopeError> {
 	let [argument] = args else {
 		return invalid_view(
@@ -1013,21 +1047,23 @@ fn parse_view_list(
 	}
 	list.items
 		.iter()
-		.map(|(item, _)| parse_contextual_sink(item, source))
+		.map(|(item, _)| parse_contextual_sink(item, source, literal_bindings))
 		.collect()
 }
 
 fn parse_contextual_sink(
 	expression: &ast::Expr,
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<ParsedSink, RuneEnvelopeError> {
-	parse_contextual_sink_inner(expression, source, true)
+	parse_contextual_sink_inner(expression, source, true, literal_bindings)
 }
 
 fn parse_contextual_sink_inner(
 	expression: &ast::Expr,
 	source: &str,
 	allow_identity_wrapper: bool,
+	literal_bindings: &[LocalBinding],
 ) -> Result<ParsedSink, RuneEnvelopeError> {
 	if let Some(table) = parse_modified_table(expression, source)? {
 		return Ok(ParsedSink {
@@ -1077,7 +1113,7 @@ fn parse_contextual_sink_inner(
 				"view name must be a string literal",
 			);
 		};
-		let mut parsed = parse_contextual_sink_inner(sink, source, false)?;
+		let mut parsed = parse_contextual_sink_inner(sink, source, false, literal_bindings)?;
 		parsed.name = Some(ParsedViewName {
 			value,
 			span: byte_range(name.span(), source.len())?,
@@ -1086,7 +1122,9 @@ fn parse_contextual_sink_inner(
 	}
 	let intent = match callee {
 		"table" if args.is_empty() => RuneViewIntent::Table(RuneTableSink::default()),
-		"figure" => RuneViewIntent::Plot(parse_figure(expression, &args, source)?),
+		"figure" => {
+			RuneViewIntent::Plot(parse_figure(expression, &args, source, literal_bindings)?)
+		}
 		"bar" if args.len() == 2 => {
 			let Some(sink) = plot_sink_fields(PlotType::Bar, source, &args, 0)? else {
 				return invalid_view(
@@ -1169,6 +1207,7 @@ fn parse_figure(
 	outer: &ast::Expr,
 	args: &[&ast::Expr],
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<RunePlotIntent, RuneEnvelopeError> {
 	let [argument] = args else {
 		return invalid_view(
@@ -1196,7 +1235,7 @@ fn parse_figure(
 	let mut y_minor_ticks = None;
 	let mut body = None;
 	for (item, _) in list.items.iter() {
-		if let Some(selection) = parse_figure_skin(item, source)? {
+		if let Some(selection) = parse_figure_skin(item, source, literal_bindings)? {
 			if skin.is_some() {
 				return invalid_view(
 					item.span(),
@@ -1228,7 +1267,13 @@ fn parse_figure(
 						"a figure has at most one title",
 					);
 				}
-				title = Some(parse_figure_heading(item, &child_args, source, "title")?);
+				title = Some(parse_figure_heading(
+					item,
+					&child_args,
+					source,
+					"title",
+					literal_bindings,
+				)?);
 			}
 			"subtitle" => {
 				if subtitle.is_some() {
@@ -1238,7 +1283,13 @@ fn parse_figure(
 						"a figure has at most one subtitle",
 					);
 				}
-				subtitle = Some(parse_figure_heading(item, &child_args, source, "subtitle")?);
+				subtitle = Some(parse_figure_heading(
+					item,
+					&child_args,
+					source,
+					"subtitle",
+					literal_bindings,
+				)?);
 			}
 			"palette" => {
 				if palette.is_some() {
@@ -1248,7 +1299,13 @@ fn parse_figure(
 						"a figure has at most one categorical palette",
 					);
 				}
-				palette = Some(parse_figure_heading(item, &child_args, source, "palette")?);
+				palette = Some(parse_figure_heading(
+					item,
+					&child_args,
+					source,
+					"palette",
+					literal_bindings,
+				)?);
 			}
 			"x_bounds" => {
 				if x_bounds.is_some() {
@@ -1259,7 +1316,7 @@ fn parse_figure(
 					);
 				}
 				x_bounds = Some((
-					parse_figure_bounds(item, &child_args, source, "x_bounds")?,
+					parse_figure_bounds(item, &child_args, source, "x_bounds", literal_bindings)?,
 					u32_range(&byte_range(item.span(), source.len())?, "x bounds")?,
 				));
 			}
@@ -1272,7 +1329,7 @@ fn parse_figure(
 					);
 				}
 				y_bounds = Some((
-					parse_figure_bounds(item, &child_args, source, "y_bounds")?,
+					parse_figure_bounds(item, &child_args, source, "y_bounds", literal_bindings)?,
 					u32_range(&byte_range(item.span(), source.len())?, "y bounds")?,
 				));
 			}
@@ -1285,7 +1342,13 @@ fn parse_figure(
 					);
 				}
 				x_tick_step = Some((
-					parse_figure_tick_step(item, &child_args, source, "x_tick_step")?,
+					parse_figure_tick_step(
+						item,
+						&child_args,
+						source,
+						"x_tick_step",
+						literal_bindings,
+					)?,
 					u32_range(&byte_range(item.span(), source.len())?, "x tick step")?,
 				));
 			}
@@ -1298,7 +1361,13 @@ fn parse_figure(
 					);
 				}
 				y_tick_step = Some((
-					parse_figure_tick_step(item, &child_args, source, "y_tick_step")?,
+					parse_figure_tick_step(
+						item,
+						&child_args,
+						source,
+						"y_tick_step",
+						literal_bindings,
+					)?,
 					u32_range(&byte_range(item.span(), source.len())?, "y tick step")?,
 				));
 			}
@@ -1311,7 +1380,13 @@ fn parse_figure(
 					);
 				}
 				x_minor_ticks = Some((
-					parse_figure_minor_ticks(item, &child_args, source, "x_minor_ticks")?,
+					parse_figure_minor_ticks(
+						item,
+						&child_args,
+						source,
+						"x_minor_ticks",
+						literal_bindings,
+					)?,
 					u32_range(&byte_range(item.span(), source.len())?, "x minor ticks")?,
 				));
 			}
@@ -1324,7 +1399,13 @@ fn parse_figure(
 					);
 				}
 				y_minor_ticks = Some((
-					parse_figure_minor_ticks(item, &child_args, source, "y_minor_ticks")?,
+					parse_figure_minor_ticks(
+						item,
+						&child_args,
+						source,
+						"y_minor_ticks",
+						literal_bindings,
+					)?,
 					u32_range(&byte_range(item.span(), source.len())?, "y minor ticks")?,
 				));
 			}
@@ -1422,6 +1503,7 @@ fn parse_figure_tick_step(
 	args: &[&ast::Expr],
 	source: &str,
 	constructor: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<f64, RuneEnvelopeError> {
 	let [argument] = args else {
 		return invalid_view(
@@ -1430,12 +1512,39 @@ fn parse_figure_tick_step(
 			format!("{constructor}(...) takes exactly one numeric literal"),
 		);
 	};
-	let Some(step) = parse_signed_numeric_literal(argument, source) else {
+	let Some(resolved) = resolve_static_literal(
+		argument,
+		source,
+		literal_bindings,
+		outer.span().start.into_usize(),
+	)?
+	else {
 		return invalid_view(
 			outer.span(),
 			source.len(),
+			static_binding_name(
+				argument,
+				source,
+				literal_bindings,
+				outer.span().start.into_usize(),
+			)
+			.map(|name| {
+				format!("{constructor}(...) binding {name:?} does not resolve to a literal")
+			})
+			.unwrap_or_else(|| {
+				format!(
+					"{constructor}(...) requires an unsuffixed numeric literal, optionally negated"
+				)
+			}),
+		);
+	};
+	let StaticLiteralValue::Number(step) = resolved.value else {
+		return invalid_view(
+			argument.span(),
+			source.len(),
 			format!(
-				"{constructor}(...) requires an unsuffixed numeric literal, optionally negated"
+				"{constructor}(...) binding {} resolved to a string literal; expected a numeric literal",
+				resolved.binding.as_deref().unwrap_or("argument")
 			),
 		);
 	};
@@ -1461,6 +1570,7 @@ fn parse_figure_minor_ticks(
 	args: &[&ast::Expr],
 	source: &str,
 	constructor: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<u32, RuneEnvelopeError> {
 	let [argument] = args else {
 		return invalid_view(
@@ -1469,12 +1579,39 @@ fn parse_figure_minor_ticks(
 			format!("{constructor}(...) takes exactly one numeric literal"),
 		);
 	};
-	let Some(count) = parse_signed_numeric_literal(argument, source) else {
+	let Some(resolved) = resolve_static_literal(
+		argument,
+		source,
+		literal_bindings,
+		outer.span().start.into_usize(),
+	)?
+	else {
 		return invalid_view(
 			outer.span(),
 			source.len(),
+			static_binding_name(
+				argument,
+				source,
+				literal_bindings,
+				outer.span().start.into_usize(),
+			)
+			.map(|name| {
+				format!("{constructor}(...) binding {name:?} does not resolve to a literal")
+			})
+			.unwrap_or_else(|| {
+				format!(
+					"{constructor}(...) requires an unsuffixed numeric literal, optionally negated"
+				)
+			}),
+		);
+	};
+	let StaticLiteralValue::Number(count) = resolved.value else {
+		return invalid_view(
+			argument.span(),
+			source.len(),
 			format!(
-				"{constructor}(...) requires an unsuffixed numeric literal, optionally negated"
+				"{constructor}(...) binding {} resolved to a string literal; expected a numeric literal",
+				resolved.binding.as_deref().unwrap_or("argument")
 			),
 		);
 	};
@@ -1500,6 +1637,7 @@ fn parse_figure_bounds(
 	args: &[&ast::Expr],
 	source: &str,
 	constructor: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<(f64, f64), RuneEnvelopeError> {
 	let [minimum, maximum] = args else {
 		return invalid_view(
@@ -1508,18 +1646,76 @@ fn parse_figure_bounds(
 			format!("{constructor}(...) takes exactly two numeric literals"),
 		);
 	};
-	let Some(minimum) = parse_signed_numeric_literal(minimum, source) else {
+	let Some(minimum) = resolve_static_literal(
+		minimum,
+		source,
+		literal_bindings,
+		outer.span().start.into_usize(),
+	)?
+	else {
 		return invalid_view(
 			outer.span(),
 			source.len(),
-			format!("{constructor}(...) requires unsuffixed numeric literals, optionally negated"),
+			static_binding_name(
+				args[0],
+				source,
+				literal_bindings,
+				outer.span().start.into_usize(),
+			)
+			.map(|name| {
+				format!("{constructor}(...) binding {name:?} does not resolve to a literal")
+			})
+			.unwrap_or_else(|| {
+				format!(
+					"{constructor}(...) requires unsuffixed numeric literals, optionally negated"
+				)
+			}),
 		);
 	};
-	let Some(maximum) = parse_signed_numeric_literal(maximum, source) else {
+	let Some(maximum) = resolve_static_literal(
+		maximum,
+		source,
+		literal_bindings,
+		outer.span().start.into_usize(),
+	)?
+	else {
 		return invalid_view(
 			outer.span(),
 			source.len(),
-			format!("{constructor}(...) requires unsuffixed numeric literals, optionally negated"),
+			static_binding_name(
+				args[1],
+				source,
+				literal_bindings,
+				outer.span().start.into_usize(),
+			)
+			.map(|name| {
+				format!("{constructor}(...) binding {name:?} does not resolve to a literal")
+			})
+			.unwrap_or_else(|| {
+				format!(
+					"{constructor}(...) requires unsuffixed numeric literals, optionally negated"
+				)
+			}),
+		);
+	};
+	let StaticLiteralValue::Number(minimum) = minimum.value else {
+		return invalid_view(
+			args[0].span(),
+			source.len(),
+			format!(
+				"{constructor}(...) binding {} resolved to a string literal; expected a numeric literal",
+				minimum.binding.as_deref().unwrap_or("minimum")
+			),
+		);
+	};
+	let StaticLiteralValue::Number(maximum) = maximum.value else {
+		return invalid_view(
+			args[1].span(),
+			source.len(),
+			format!(
+				"{constructor}(...) binding {} resolved to a string literal; expected a numeric literal",
+				maximum.binding.as_deref().unwrap_or("maximum")
+			),
 		);
 	};
 	if !minimum.is_finite() || !maximum.is_finite() {
@@ -1565,9 +1761,138 @@ fn parse_signed_numeric_literal(expression: &ast::Expr, source: &str) -> Option<
 		.ok()
 }
 
+fn resolve_static_literal(
+	expression: &ast::Expr,
+	source: &str,
+	bindings: &[LocalBinding],
+	use_start: usize,
+) -> Result<Option<ResolvedStaticLiteral>, RuneEnvelopeError> {
+	let mut visited = Vec::new();
+	resolve_static_literal_inner(expression, source, bindings, use_start, &mut visited)
+}
+
+fn static_binding_name(
+	expression: &ast::Expr,
+	source: &str,
+	bindings: &[LocalBinding],
+	use_start: usize,
+) -> Option<String> {
+	let raw = source_slice(source, expression.span()).ok()?.trim();
+	if !matches!(expression, ast::Expr::Path(_)) || !is_simple_name(raw) {
+		return None;
+	}
+	bindings
+		.iter()
+		.rev()
+		.find(|binding| binding.name == raw && binding.statement_start < use_start)
+		.map(|_| raw.to_owned())
+}
+
+fn resolve_static_literal_inner(
+	expression: &ast::Expr,
+	source: &str,
+	bindings: &[LocalBinding],
+	use_start: usize,
+	visited: &mut Vec<String>,
+) -> Result<Option<ResolvedStaticLiteral>, RuneEnvelopeError> {
+	let raw = source_slice(source, expression.span())?.trim();
+	if let Some(value) = decode_string_literal(raw) {
+		return Ok(Some(ResolvedStaticLiteral {
+			value: StaticLiteralValue::String(value),
+			binding: None,
+		}));
+	}
+	if let Some(value) = parse_signed_numeric_literal(expression, source) {
+		return Ok(Some(ResolvedStaticLiteral {
+			value: StaticLiteralValue::Number(value),
+			binding: None,
+		}));
+	}
+	if !matches!(expression, ast::Expr::Path(_)) || !is_simple_name(raw) {
+		return Ok(None);
+	}
+	let Some(binding) = bindings
+		.iter()
+		.rev()
+		.find(|binding| binding.name == raw && binding.statement_start < use_start)
+	else {
+		return Ok(None);
+	};
+	if visited.iter().any(|name| name == raw) {
+		return Ok(None);
+	}
+	visited.push(raw.to_owned());
+	let initializer = source
+		.get(binding.initializer.clone())
+		.ok_or_else(|| RuneEnvelopeError::Invalid("binding initializer is not UTF-8".into()))?;
+	let resolved = resolve_static_literal_text(
+		initializer.trim(),
+		source,
+		bindings,
+		binding.statement_start,
+		visited,
+	)?;
+	visited.pop();
+	Ok(resolved.map(|mut resolved| {
+		resolved.binding = Some(raw.to_owned());
+		resolved
+	}))
+}
+
+fn resolve_static_literal_text(
+	raw: &str,
+	source: &str,
+	bindings: &[LocalBinding],
+	use_start: usize,
+	visited: &mut Vec<String>,
+) -> Result<Option<ResolvedStaticLiteral>, RuneEnvelopeError> {
+	if let Some(value) = decode_string_literal(raw) {
+		return Ok(Some(ResolvedStaticLiteral {
+			value: StaticLiteralValue::String(value),
+			binding: None,
+		}));
+	}
+	if let Ok(value) = raw.replace('_', "").parse::<f64>() {
+		return Ok(Some(ResolvedStaticLiteral {
+			value: StaticLiteralValue::Number(value),
+			binding: None,
+		}));
+	}
+	if !is_simple_name(raw) {
+		return Ok(None);
+	}
+	let Some(binding) = bindings
+		.iter()
+		.rev()
+		.find(|binding| binding.name == raw && binding.statement_start < use_start)
+	else {
+		return Ok(None);
+	};
+	if visited.iter().any(|name| name == raw) {
+		return Ok(None);
+	}
+	visited.push(raw.to_owned());
+	let initializer = source
+		.get(binding.initializer.clone())
+		.ok_or_else(|| RuneEnvelopeError::Invalid("binding initializer is not UTF-8".into()))?;
+	let resolved = resolve_static_literal_text(
+		initializer.trim(),
+		source,
+		bindings,
+		binding.statement_start,
+		visited,
+	)?;
+	visited.pop();
+	Ok(resolved.map(|mut resolved| {
+		resolved.binding = Some(raw.to_owned());
+		resolved
+	}))
+}
+
 fn parse_figure_skin(
 	expression: &ast::Expr,
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<Option<PlotSkinSelection>, RuneEnvelopeError> {
 	let ast::Expr::Call(_) = expression else {
 		return Ok(None);
@@ -1588,7 +1913,7 @@ fn parse_figure_skin(
 	}
 
 	let root_args = root.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	let name = parse_figure_heading(current, &root_args, source, "skin")?;
+	let name = parse_figure_heading(current, &root_args, source, "skin", literal_bindings)?;
 	let mut projection = PlotChromeProjection::Ordered;
 	for (modifier, call) in modifiers {
 		match modifier {
@@ -1626,6 +1951,7 @@ fn parse_figure_heading(
 	args: &[&ast::Expr],
 	source: &str,
 	kind: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<String, RuneEnvelopeError> {
 	let [argument] = args else {
 		return invalid_view(
@@ -1634,12 +1960,34 @@ fn parse_figure_heading(
 			format!("{kind}(...) takes exactly one string literal"),
 		);
 	};
-	let raw = source_slice(source, argument.span())?;
-	let Some(value) = decode_string_literal(raw) else {
+	let Some(resolved) = resolve_static_literal(
+		argument,
+		source,
+		literal_bindings,
+		outer.span().start.into_usize(),
+	)?
+	else {
 		return invalid_view(
 			argument.span(),
 			source.len(),
-			format!("{kind}(...) requires a string literal"),
+			static_binding_name(
+				argument,
+				source,
+				literal_bindings,
+				outer.span().start.into_usize(),
+			)
+			.map(|name| format!("{kind}(...) binding {name:?} does not resolve to a literal"))
+			.unwrap_or_else(|| format!("{kind}(...) requires a string literal")),
+		);
+	};
+	let StaticLiteralValue::String(value) = resolved.value else {
+		return invalid_view(
+			argument.span(),
+			source.len(),
+			format!(
+				"{kind}(...) binding {} resolved to a numeric literal; expected a string literal",
+				resolved.binding.as_deref().unwrap_or("argument")
+			),
 		);
 	};
 	Ok(value)
@@ -3581,6 +3929,90 @@ workspace.table("t").views([table()])
 	}
 
 	#[test]
+	fn product_0040_static_literal_bindings_feed_every_figure_element() {
+		let source = r#"
+let title_text = "Bound title";
+let title_alias = title_text;
+let subtitle_text = "Bound subtitle";
+let skin_name = "magma_r";
+let palette_name = "terrain";
+let minimum = 0;
+let maximum = 7;
+let major_step = 1;
+let minor_count = 2;
+workspace.table("t").views([figure([
+    title(title_alias),
+    subtitle(subtitle_text),
+    skin(skin_name),
+    palette(palette_name),
+    y_bounds(minimum, maximum),
+    y_tick_step(major_step),
+    y_minor_ticks(minor_count),
+    bar("cat", "val"),
+])])
+"#;
+		let transformed = transform(source).expect("static literal bindings");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("expected plot");
+		};
+		assert_eq!(
+			plot.authored_settings.title,
+			Presence::Show(Arc::new("Bound title".to_owned()))
+		);
+		assert_eq!(
+			plot.authored_settings.subtitle,
+			Presence::Show(Arc::new("Bound subtitle".to_owned()))
+		);
+		assert_eq!(
+			plot.authored_settings.plot_skin,
+			Override::Set(PlotSkinSelection::new(
+				"magma_r".to_owned(),
+				PlotChromeProjection::Ordered,
+			))
+		);
+		assert_eq!(
+			plot.authored_settings.categorical_palette,
+			Override::Set(Arc::new("terrain".to_owned()))
+		);
+		assert_eq!(
+			plot.authored_settings.domains,
+			Override::Set(PlotDomainOverrides {
+				x_min: None,
+				x_max: None,
+				y_min: Some(0.0),
+				y_max: Some(7.0),
+			})
+		);
+		let Override::Set(guides) = &plot.authored_settings.guides else {
+			panic!("expected guide override");
+		};
+		assert_eq!(guides.y_tick_placement, TickPlacement::step(1.0).unwrap());
+		assert_eq!(guides.y_minor_ticks, 2);
+
+		for (source, expected) in [
+			(
+				"let title_text = make_title(); workspace.table(\"t\").views([figure([title(title_text), line(\"x\", \"y\")])])",
+				"binding \"title_text\" does not resolve to a literal",
+			),
+			(
+				"let step = -1; workspace.table(\"t\").views([figure([y_tick_step(step), line(\"x\", \"y\")])])",
+				"step must be strictly positive",
+			),
+			(
+				"let maximum = 0; workspace.table(\"t\").views([figure([y_bounds(1, maximum), line(\"x\", \"y\")])])",
+				"cannot reverse an axis",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { message, .. } =
+				transform(source).expect_err("static binding refusal")
+			else {
+				panic!("expected attributed static-binding refusal");
+			};
+			assert!(message.contains(expected), "{message}");
+		}
+	}
+
+	#[test]
 	fn product_0016_one_body_figure_is_the_same_view_as_its_bare_mark() {
 		fn only_view(source: &str) -> SpannedRuneViewIntent {
 			transform(source)
@@ -3647,7 +4079,7 @@ workspace.table("t").views([table()])
 				"title(\"wrong level\")",
 			),
 			(
-				"let heading = \"computed\"; workspace.table(\"t\").views([figure([title(heading), line(\"x\", \"y\")])])",
+				"let heading = title_text(); workspace.table(\"t\").views([figure([title(heading), line(\"x\", \"y\")])])",
 				"heading",
 			),
 			(
@@ -3741,7 +4173,7 @@ workspace.table("t").views([table()])
 				"palette(\"a\", \"b\")",
 			),
 			(
-				"let p = \"tab20c\"; workspace.table(\"t\").views([figure([palette(p), bar(\"cat\", \"val\")])])",
+				"let p = make_palette(); workspace.table(\"t\").views([figure([palette(p), bar(\"cat\", \"val\")])])",
 				"p",
 			),
 			(
@@ -3850,7 +4282,7 @@ workspace.table("t").views([table()])
 				"skin(\"a\", \"b\")",
 			),
 			(
-				"let s = \"nord\"; workspace.table(\"t\").views([figure([skin(s), bar(\"cat\", \"val\")])])",
+				"let s = make_skin(); workspace.table(\"t\").views([figure([skin(s), bar(\"cat\", \"val\")])])",
 				"s",
 			),
 			(
