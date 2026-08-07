@@ -129,6 +129,21 @@ taxonomy on its own evidence.
   a genuine local counterpart exists — raw distributed-only dispatch time can never lead a
   cell.
 
+**Phase counters are same-timeline intervals.** A component receipt at task scope claims a
+partition of that task's wall clock, so a phase counter may contain only intervals measured on
+the task's own execution thread within its wall. The fourth authoritative run falsified the
+prior state: the dispatcher's decode of streamed result batches — measured on the coordinator
+while the worker's wall was still running — was folded into the task's `batch_decode_micros`,
+counting the transfer window at both ends (send worker-side, decode coordinator-side). Eligible
+portions exceeded their own task wall on 81 nodes across ten cells (worst: q01's producer,
++921 ms), hidden wherever the coordinator-side remainder was thick enough to absorb it and
+exposed by q22's thin one. Consequences: dispatcher-side decode lives in a **non-phase field**
+(`dispatcher_batch_decode_micros`), retained raw and never a portion; the worker-side decode of
+pulled shuffle inputs is **split out of `shuffle_pull_decode` into `batch_decode_micros`**, so
+`transport` remains encode + send + decode with every interval a worker-side wall slice; and
+replay verifies the partition **per node** — a node whose eligible portions exceed its own wall
+is a violation, not a rounding artifact.
+
 **`transport` is the only structural zero-local component, verified rather than assumed.**
 `shuffle` was a candidate and is **refused**: twenty of the twenty-one eligible cells bind a
 local plan containing an `Exchange`, which the local executor runs via `bound_exchange` as real

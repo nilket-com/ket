@@ -97,6 +97,13 @@ pub struct TaskTelemetry {
 	/// it must not be interpreted as sequential execution.
 	#[serde(default)]
 	pub partition_work_concurrency_observations: Vec<PartitionWorkConcurrencyObservation>,
+	/// Decode time the dispatcher spent on this task's streamed result batches, measured on
+	/// the dispatcher's thread while the task's wall was still running. Another timeline
+	/// entirely, so it is retained here as raw evidence and is deliberately NOT a phase:
+	/// phase counters partition the task's own wall, and folding a second timeline into
+	/// them counts the transfer window at both ends.
+	#[serde(default)]
+	pub dispatcher_batch_decode_micros: u64,
 	/// Observe-only routing receipts: what a producer wrote into each shuffle partition,
 	/// and what a consumer actually received from each upstream. Behavior-neutral; they
 	/// exist so a divergence can be localized to a seam instead of inferred from a plan.

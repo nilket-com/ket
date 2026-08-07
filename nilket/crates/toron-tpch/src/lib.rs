@@ -6204,6 +6204,33 @@ fn timing_atlas_replay_attribution_path(
 	if !problems.is_empty() {
 		return Err(problems);
 	}
+	// The partition claim is per node: a task's eligible portions may not exceed its own
+	// wall. Checked on every node, on or off the path — run 4 proved this class hides
+	// wherever a cell-level remainder is thick enough to absorb it.
+	for node in &nodes {
+		let eligible: f64 = node
+			.components
+			.iter()
+			.filter(|(component, _)| {
+				component.participates_in_timed_attribution()
+					&& !matches!(
+						component.local_pairing(),
+						TimingAtlasLocalPairing::NoLocalEquivalent
+					)
+			})
+			.map(|(_, portion)| portion)
+			.sum();
+		if eligible > node.wall_ms + 1e-6 {
+			problems.push(format!(
+				"node ({}, {}) eligible portions {eligible} exceed its own wall {} — the \
+				 phase counters stopped partitioning that task's wall",
+				node.stage_id, node.task_id, node.wall_ms
+			));
+		}
+	}
+	if !problems.is_empty() {
+		return Err(problems);
+	}
 	let Some(recomputed) = timing_atlas_critical_path(&nodes) else {
 		return Err(vec!["path row carries no attributable nodes".to_string()]);
 	};
@@ -24748,5 +24775,55 @@ mod adr538_phase_partition_probe {
 				p.framework_overhead_micros,
 			);
 		}
+	}
+}
+
+#[cfg(test)]
+mod adr538_node_partition_veto {
+	use super::*;
+
+	/// A node whose eligible portions exceed its own wall is rejected wherever it sits —
+	/// run 4 carried 81 such nodes that the cell-level check caught only where the
+	/// remainder was thin.
+	#[test]
+	fn a_node_whose_portions_exceed_its_wall_is_rejected() {
+		let cells = timing_atlas_cells();
+		let mut rows = super::adr538_timing_atlas_journal_replay::journal_lines(
+			&cells,
+			TIMING_ATLAS_MEASURED_PAIRS,
+		);
+		let mut tampered = false;
+		for row in rows.iter_mut() {
+			if row.get("kind").and_then(|k| k.as_str()) == Some(TIMING_ATLAS_KIND_ATTRIBUTION_PATH)
+				&& !tampered
+			{
+				// Inflate one node's transport beyond its wall; the same wall segment
+				// counted twice is exactly the defect class this check exists to catch.
+				row["nodes"][0]["components"]["transport"] = serde_json::json!(500.0);
+				tampered = true;
+			}
+		}
+		assert!(tampered);
+		let journal = rows
+			.iter()
+			.map(|row| row.to_string())
+			.collect::<Vec<_>>()
+			.join("\n");
+		let replay = timing_atlas_replay(&journal);
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|violation| violation.contains("exceed its own wall")),
+			"violations: {:?}",
+			replay.violations
+		);
+		assert!(!replay.supports_authority(&TimingAuthorityConditions {
+			clean_build: true,
+			full_hash_dataset: true,
+			quiescent_host: true,
+			protocol_unmodified: true,
+			complete_cohort: true,
+		}));
 	}
 }

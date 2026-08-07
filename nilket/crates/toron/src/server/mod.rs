@@ -145,6 +145,9 @@ struct ShuffleInputTelemetry {
 	pulled_shuffle_bytes: u64,
 	left_shuffle_bytes: u64,
 	right_shuffle_bytes: u64,
+	/// Worker-side decode of pulled shuffle payloads, timed apart from the pull so
+	/// `transport` receives a genuine wall slice rather than a share of `shuffle`'s.
+	decode_micros: u64,
 }
 
 impl ToronWorker {
@@ -272,7 +275,14 @@ impl ToronWorker {
 			let shuffle_started = Instant::now();
 			let (overrides, shuffle_telemetry) = self.shuffle_input_overrides(spec).await?;
 			record_worker_telemetry(&telemetry, |task| {
-				task.phases.shuffle_pull_decode_micros = duration_micros(shuffle_started);
+				// One wall interval, two disjoint slices: the pull keeps its bracket minus
+				// the decode inside it, and the decode is transport's worker-side share.
+				task.phases.shuffle_pull_decode_micros = duration_micros(shuffle_started)
+					.saturating_sub(shuffle_telemetry.decode_micros);
+				task.phases.batch_decode_micros = task
+					.phases
+					.batch_decode_micros
+					.saturating_add(shuffle_telemetry.decode_micros);
 				task.counters.pulled_shuffle_bytes = shuffle_telemetry.pulled_shuffle_bytes;
 				task.counters.left_shuffle_bytes = shuffle_telemetry.left_shuffle_bytes;
 				task.counters.right_shuffle_bytes = shuffle_telemetry.right_shuffle_bytes;
@@ -441,10 +451,11 @@ impl ToronWorker {
 	async fn pull_shuffle_inputs(
 		&self,
 		partitions: &[ShufflePartitionRef],
-	) -> Result<(Vec<RecordBatch>, u64), QueryError> {
+	) -> Result<(Vec<RecordBatch>, u64, u64), QueryError> {
 		let coordinator = ToronCoordinator::new(self.memory.clone());
 		let mut batches = Vec::new();
 		let mut pulled_bytes = 0u64;
+		let mut decode_micros = 0u64;
 
 		for partition in partitions {
 			let Some(partition) = partition.as_sealed() else {
@@ -458,10 +469,12 @@ impl ToronWorker {
 				.pull_partition_from_worker(stream, partition.address, partition.address.attempt_id)
 				.await?;
 			pulled_bytes = pulled_bytes.saturating_add(payload.payload.as_slice().len() as u64);
+			let decode_started = Instant::now();
 			batches.extend(decode_record_batches(payload.payload.as_slice())?);
+			decode_micros = decode_micros.saturating_add(duration_micros(decode_started));
 		}
 
-		Ok((batches, pulled_bytes))
+		Ok((batches, pulled_bytes, decode_micros))
 	}
 
 	async fn shuffle_input_overrides(
@@ -487,9 +500,11 @@ impl ToronWorker {
 				continue;
 			}
 			let table_id = shuffle_input_table_id(*exchange_id);
-			let (batches, pulled_bytes) = self.pull_shuffle_inputs(producer_partitions).await?;
+			let (batches, pulled_bytes, decode_micros) =
+				self.pull_shuffle_inputs(producer_partitions).await?;
 			telemetry.pulled_shuffle_bytes =
 				telemetry.pulled_shuffle_bytes.saturating_add(pulled_bytes);
+			telemetry.decode_micros = telemetry.decode_micros.saturating_add(decode_micros);
 			match shuffle_input_side_for_telemetry(spec, input_index) {
 				ShuffleInputSide::Left => {
 					telemetry.left_shuffle_bytes =
@@ -1273,7 +1288,8 @@ fn recompute_framework_overhead(telemetry: &mut TaskTelemetry) {
 		.saturating_add(telemetry.phases.batch_send_micros)
 		.saturating_add(telemetry.phases.telemetry_lock_micros)
 		.saturating_add(telemetry.phases.exchange_repartition_micros)
-		.saturating_add(telemetry.phases.scan_micros);
+		.saturating_add(telemetry.phases.scan_micros)
+		.saturating_add(telemetry.phases.batch_decode_micros);
 	telemetry.phases.framework_overhead_micros =
 		telemetry.phases.task_wall_micros.saturating_sub(accounted);
 }
@@ -4760,9 +4776,11 @@ impl ToronCoordinator {
 						});
 					}
 					let mut telemetry = payload.telemetry.unwrap_or_default();
-					telemetry.phases.batch_decode_micros = telemetry
-						.phases
-						.batch_decode_micros
+					// Measured on this dispatcher while the worker's wall was still
+					// running: another timeline, so it is evidence, never a phase — a
+					// phase counter may only hold intervals from the task's own thread.
+					telemetry.dispatcher_batch_decode_micros = telemetry
+						.dispatcher_batch_decode_micros
 						.saturating_add(batch_decode_micros);
 					break Ok((payload.output, telemetry));
 				}
