@@ -78,6 +78,25 @@ workspace.table("sales").views([
 including, `1.0`. The reserve stays centered on each categorical label and
 scales with the plot.
 
+Bar orientation follows the resolved x/y channel pair, without a second mark
+word. Put the quantitative value on x and the category on y for a horizontal
+bar; the same grouped colors and bar register apply:
+
+```rune
+workspace.table("sales").views([
+    figure([
+        x_bounds(0, 150),
+        bar("revenue", "region", "product")
+            .bar_width(0.9)
+            .category_gap(0.2),
+    ]),
+])
+```
+
+Exactly one axis must be quantitative. The other keeps Bar's existing
+non-quantitative category role; pairs with two quantitative or two
+non-quantitative axes refuse rather than guessing an orientation.
+
 #### Rune line presentation:
 
 Lines accept an optional categorical series field. Rows connect only within

@@ -1729,6 +1729,111 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0055_faceted_horizontal_bars_keep_shared_domains_colors_and_one_legend() {
+		use crate::plot::legend::LegendSection;
+		use crate::plot::spec::{
+			CategoricalPaletteSelection, ColorIdentity, resolve_channels,
+			resolve_domains_with_categorical_palette,
+		};
+
+		let frame = df!(
+			"series" => ["Atlas", "Atlas", "Beacon", "Beacon", "Cinder", "Cinder", "Delta", "Delta"],
+			"category" => ["East", "West", "East", "West", "East", "West", "East", "West"],
+			"value" => [2.0_f64, 4.0, 3.0, 5.0, 4.0, 6.0, 5.0, 7.0]
+		)
+		.unwrap();
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"value",
+			"category",
+			Some("series".to_owned()),
+		);
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0055".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").unwrap();
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.unwrap();
+		assert_eq!(
+			resolved.composition.primary_plot_type(),
+			PlotType::HorizontalBar
+		);
+		let assignments = resolved.channel(Channel::Color).unwrap().colors.clone();
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved),
+			&stamped,
+			"series",
+			GridArrangement::new(2, 2).unwrap(),
+		)
+		.unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 800, 600);
+		let settings = ResolvedPlotSettings::default();
+		assert!(kernel.cells.iter().all(|cell| matches!(
+			cell.kernel.layout(settings.clone()),
+			PlotLayout::CategoricalY { .. }
+		)));
+		let legend = crate::plot::legend::union(
+			kernel
+				.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&settings)),
+		)
+		.expect("one figure legend");
+		let LegendSection::Entries(entries) = legend.0.first() else {
+			panic!("horizontal grid must union named swatches");
+		};
+		assert_eq!(entries.len(), assignments.len());
+		for (entry, assignment) in entries.iter().zip(&assignments) {
+			assert_eq!(entry.label, assignment.category);
+			assert_eq!(entry.sample, crate::plot::legend::LegendSample::Swatch);
+			assert_eq!(
+				entry.swatch,
+				iced::Color::from_rgba8(
+					assignment.color.red,
+					assignment.color.green,
+					assignment.color.blue,
+					assignment.color.alpha as f32 / u8::MAX as f32,
+				)
+			);
+		}
+
+		let model = PlotSettings::default();
+		let mut backend = SvgBackend::new(800.0, 600.0);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
+		);
+		let svg = backend.finish();
+		for assignment in assignments {
+			let fill = format!(
+				"fill=\"rgb({}, {}, {})\"",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert!(svg.contains(&fill), "missing panel-blind {fill}");
+		}
+	}
+
+	#[test]
 	fn product_0054_faceted_series_lines_keep_panel_blind_colors_and_one_union_legend() {
 		use crate::plot::legend::LegendSection;
 		use crate::plot::spec::{

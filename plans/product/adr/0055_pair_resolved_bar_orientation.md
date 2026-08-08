@@ -1,6 +1,6 @@
 # ADR 0055: pair-resolved bar orientation
 
-Status: proposed 2026-08-08. This record restores horizontal-bar authoring
+Status: accepted 2026-08-08. This record restores horizontal-bar authoring
 without adding a second bar word. Rune continues to author one `bar(x, y,
 series?)` family; schema-resolved channel roles select its canonical `Bar` or
 `HorizontalBar` member. Orientation may change geometry, axes, and guides; it
@@ -74,8 +74,8 @@ meaning, not position.
 Rune keeps its existing two- or three-field bar spelling in every standalone
 position. No `hbar`, `horizontal_bar`, or `.horizontal()` member is added.
 
-After the named x and y fields resolve from the returned schema, their semantic
-roles select orientation:
+After the named x and y fields of a Rune-authored `Bar` resolve from the
+returned schema, their semantic roles select orientation:
 
 ```text
 x category-role compatible, y quantitative -> Bar
@@ -141,14 +141,22 @@ channels are `Named` remains refused by the authored-role gate. The only Rune
 constructor word is `bar`.
 
 The phase boundary governs the existing Bar-only resolver decisions. The
-authored-role allowlist continues to admit `Bar`, not `HorizontalBar`; Bar's x
-and y channels admit the two candidate semantic roles until the pair is known;
+authored-role allowlist continues to admit `Bar`, not `HorizontalBar`; a named
+Rune Bar's x and y channels admit the two candidate semantic roles until the
+pair is known;
 nominal or ordinal category roles select the existing band default on either
 physical axis; kernel-field projection maps category and value from the chosen
 pair; and categorical capacity remains a property of the authored bar family.
 Only after those family rules produce one valid pair does composition
 canonicalize to the resolved member. Mechanically widening every Bar-only match
 to `Bar | HorizontalBar` would cross the boundary and fails §2's negative gate.
+
+Automatic dashboard specifications do not enter this pair-resolution rule.
+Their selected `Bar` or `HorizontalBar` member remains authoritative, including
+the dashboard's existing schema-order inference. This is not merely a current
+implementation convenience: globally widening Bar's per-channel compatibility
+would let a numeric-first automatic `Bar` rotate despite the dashboard having
+selected the vertical member.
 
 ### 3. X and Y remain physical axes; kernel roles follow them
 
@@ -267,8 +275,10 @@ record is amended or superseded before 0055 exposes it.
 5. A negative architecture-boundary gate directly constructs an
    `AuthoredPlotSpec` composed as `HorizontalBar` with named x/y channels and
    observes refusal. The dashboard's existing automatic `HorizontalBar` path
-   still resolves and renders, proving that canonical output did not become a
-   second Rune constructor. Source inspection does not discharge either half.
+   still resolves and renders, while a numeric-first automatic `Bar` remains
+   vertical, proving that canonical output did not become a second Rune
+   constructor or override dashboard selection. Source inspection does not
+   discharge either half.
 6. Through production Rune completion, horizontal `x_bounds`, `x_tick_step`,
    and `x_minor_ticks` apply to the numeric axis while their y counterparts
    refuse with the existing category-scale attribution. The vertical control
@@ -304,6 +314,57 @@ record is amended or superseded before 0055 exposes it.
     invalid quadrants may refresh only to §1's named pair-attribution class.
     `../uat/test19.rn` supplies the new grouped horizontal exhibit using the same
     data and series identities as the vertical control.
+
+## Implementation evidence
+
+- Pair resolution is confined to a Rune-authored `Bar` with two named physical
+  channels. The Stage 0 implementation initially exposed why that qualifier is
+  load-bearing: widening Bar's per-channel compatibility globally would also
+  reinterpret automatic dashboard specifications. Behavioral controls now
+  prove that the dashboard's selected `HorizontalBar` still resolves and that a
+  numeric-first automatic `Bar` remains vertical.
+- The complete semantic matrix is exercised directly. Category X/value Y
+  resolves `Bar`; value X/category Y resolves `HorizontalBar`; both invalid
+  pairs refuse with §1's exact field-and-semantic reason. Existing one-channel
+  failures retain their earlier attribution because the relaxed compatibility
+  applies only while resolving a complete named Bar pair.
+- Canonicalization changes `ChannelBinding.composition` and the completed
+  `ResolvedPlotSpec` to `HorizontalBar`, then projects value from X, category
+  from Y, and the optional group from color. Every `BoundChannel` retains
+  `LayerIdentity { ordinal: 0, plot_type: Bar }`. Rotation therefore preserves
+  exact series assignments, while changing the series field supplies the
+  required fresh-lineage control.
+- Production Rune completion reaches the horizontal member through legacy,
+  relation-sugar, canonical, named-view, figure, two-field, and three-field
+  spellings. Both `.bar_width(...)` and `.category_gap(...)` reach the styled
+  horizontal factory in either order. The directly-authored named
+  `HorizontalBar` control refuses.
+- The Stage 0 renderer gate drives a grouped horizontal plot through real
+  channel resolution, domain resolution, and factory construction at 100px and
+  300px plot heights. Exact resolved colors reach paint and legend, grouped
+  centroids equal the categorical transform, category reserves miss hit tests,
+  paint and hit share rectangles, and hover derives its asserted value from
+  `CategoricalY.x_range` and cursor x.
+- Production completion pins the physical-axis matrix: x bounds, major step,
+  and minor ticks apply to the horizontal numeric axis; corresponding y
+  settings refuse as categorical. It separately pins `display_label ==
+  "plot.bar"` and the resolved composition title `"Horizontal Bar Plot"`, with
+  messages documenting their intentional family/geometry divergence.
+- A real 2x2 faceted grouped horizontal grid retains shared categorical
+  domains, panel-blind resolved colors, congruent cell layouts, and one unioned
+  named-swatch legend.
+- Eight PRODUCT-0055 behavior tests cover the strict widening, negative
+  authoring boundary, dashboard controls, lineage, surface spellings and
+  modifiers, physical axes and descriptions, native horizontal geometry, and
+  faceted union. No SVG, image, draw-operation, expected-byte, or refusal
+  baseline was refreshed.
+- `crates/polariton/README.md` documents physical-axis ordering and horizontal
+  controls. `../uat/test19.rn` renders the grouped horizontal `demo_sales`
+  exhibit with Vapor colors, category clustering, and inherited gutter legend.
+- `cargo test --workspace --all-targets --no-fail-fast` and `cargo check
+  --workspace --all-targets` pass. The Polariton portion is 467 unit tests
+  passed (five live tests ignored), 41 architecture tests, and the trybuild UI
+  pair.
 
 ## Stop condition
 

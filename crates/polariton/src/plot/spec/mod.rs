@@ -1212,6 +1212,9 @@ pub fn resolve_channels(
 		ordinal: 0,
 		plot_type,
 	};
+	let pair_resolved_bar = plot_type == PlotType::Bar
+		&& matches!(spec.x.field, AuthoredChannel::Named(_))
+		&& matches!(spec.y.field, AuthoredChannel::Named(_));
 	let mut unavailable_to_auto = HashSet::new();
 	let inferred_x = (matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto))
@@ -1227,6 +1230,7 @@ pub fn resolve_channels(
 		x_spec.as_ref().unwrap_or(&spec.x),
 		plot_type,
 		&layer,
+		pair_resolved_bar,
 		schema,
 		&mut unavailable_to_auto,
 	)?;
@@ -1235,14 +1239,24 @@ pub fn resolve_channels(
 		&spec.y,
 		plot_type,
 		&layer,
+		pair_resolved_bar,
 		schema,
 		&mut unavailable_to_auto,
 	)?;
+	// PRODUCT-0055: Rune authors the Bar family; the resolved physical channel
+	// pair selects its canonical rendering member. Keep `layer` family-keyed so
+	// rotating a bar does not begin a new categorical color lineage.
+	let resolved_plot_type = if pair_resolved_bar {
+		resolve_bar_orientation(&x, &y)?
+	} else {
+		plot_type
+	};
 	let mut color = resolve_optional(
 		Channel::Color,
 		&spec.color,
 		plot_type,
 		&layer,
+		pair_resolved_bar,
 		schema,
 		&mut unavailable_to_auto,
 	)?;
@@ -1290,14 +1304,39 @@ pub fn resolve_channels(
 	}
 	let mut channels = vec![x, y];
 	channels.extend(color);
-	let kernel_fields = Box::new(kernel_fields_from_channels(plot_type, &channels)?);
+	let kernel_fields = Box::new(kernel_fields_from_channels(resolved_plot_type, &channels)?);
+	let mut composition = spec.composition.clone();
+	if plot_type == PlotType::Bar {
+		composition.set_single(resolved_plot_type);
+	}
 	Ok(ChannelBinding {
-		composition: spec.composition.clone(),
+		composition,
 		channels,
 		kernel_fields,
 		color_job,
 		categorical_limit: categorical_limit(plot_type),
 	})
+}
+
+fn resolve_bar_orientation(x: &BoundChannel, y: &BoundChannel) -> Result<PlotType, ChannelError> {
+	match (
+		x.semantic_type == SemanticType::Quantitative,
+		y.semantic_type == SemanticType::Quantitative,
+	) {
+		(false, true) => Ok(PlotType::Bar),
+		(true, false) => Ok(PlotType::HorizontalBar),
+		_ => Err(ChannelError {
+			// Resolution failures are attributed to the complete Rune sink. The
+			// existing carrier requires a channel and field, while the reason names
+			// both facts and deliberately assigns blame to neither one alone.
+			channel: Channel::X,
+			field: x.field.clone(),
+			reason: format!(
+				"bar requires exactly one quantitative value axis and one non-quantitative category axis; x `{}` resolved as {:?}, y `{}` resolved as {:?}",
+				x.field, x.semantic_type, y.field, y.semantic_type
+			),
+		}),
+	}
 }
 
 /// Resolve every authored layer independently, then apply PRODUCT-0013's
@@ -1595,12 +1634,19 @@ fn kernel_fields_from_channels(
 			group: field(Channel::Color),
 			value: required(Channel::Y)?,
 		}),
+		PlotType::HorizontalBar => Ok(ResolvedKernelFields::Bar {
+			category: required(Channel::Y)?,
+			group: field(Channel::Color),
+			value: required(Channel::X)?,
+		}),
 		PlotType::Line => Ok(ResolvedKernelFields::Line {
 			series: field(Channel::Color),
 			x: required(Channel::X)?,
 			y: required(Channel::Y)?,
 		}),
-		_ => unreachable!("only authored Scatter, Bar, and Line channels reach this projection"),
+		_ => unreachable!(
+			"only authored Scatter, Bar-family, and Line channels reach this projection"
+		),
 	}
 }
 
@@ -1750,6 +1796,7 @@ fn resolve_required(
 	spec: &AuthoredChannelSpec,
 	plot_type: PlotType,
 	layer: &LayerIdentity,
+	pair_resolved_bar: bool,
 	schema: &Schema,
 	used_by_auto: &mut HashSet<String>,
 ) -> Result<BoundChannel, ChannelError> {
@@ -1777,7 +1824,10 @@ fn resolve_required(
 		Override::Inherit => inferred_semantic,
 		Override::Set(declared) => declared,
 	};
-	if !semantic_is_compatible(plot_type, channel, semantic_type) {
+	let pair_candidate = pair_resolved_bar
+		&& matches!(channel, Channel::X | Channel::Y)
+		&& plot_type == PlotType::Bar;
+	if !pair_candidate && !semantic_is_compatible(plot_type, channel, semantic_type) {
 		return Err(ChannelError {
 			channel,
 			field,
@@ -1813,6 +1863,7 @@ fn resolve_optional(
 	spec: &OptionalAuthoredChannelSpec,
 	plot_type: PlotType,
 	layer: &LayerIdentity,
+	pair_resolved_bar: bool,
 	schema: &Schema,
 	used_by_auto: &mut HashSet<String>,
 ) -> Result<Option<BoundChannel>, ChannelError> {
@@ -1834,7 +1885,16 @@ fn resolve_optional(
 			}
 		}
 	};
-	resolve_required(channel, &required, plot_type, layer, schema, used_by_auto).map(Some)
+	resolve_required(
+		channel,
+		&required,
+		plot_type,
+		layer,
+		pair_resolved_bar,
+		schema,
+		used_by_auto,
+	)
+	.map(Some)
 }
 
 fn infer_field(
@@ -3269,6 +3329,181 @@ mod tests {
 				x: "x".to_owned(),
 				y: "y".to_owned(),
 			}
+		);
+	}
+
+	#[test]
+	fn product_0055_bar_channel_pair_is_a_strict_orientation_widening() {
+		let vertical = df!("category" => ["A"], "value" => [1.0]).unwrap();
+		let vertical_spec =
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "category", "value");
+		let vertical_binding =
+			resolve_channels(&vertical_spec, vertical.schema().as_ref()).unwrap();
+		assert_eq!(
+			vertical_binding.composition.primary_plot_type(),
+			PlotType::Bar
+		);
+		assert_eq!(
+			vertical_binding.kernel_fields.as_ref(),
+			&ResolvedKernelFields::Bar {
+				category: "category".to_owned(),
+				group: None,
+				value: "value".to_owned(),
+			}
+		);
+
+		let horizontal_spec =
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "value", "category");
+		let horizontal_binding =
+			resolve_channels(&horizontal_spec, vertical.schema().as_ref()).unwrap();
+		assert_eq!(
+			horizontal_binding.composition.primary_plot_type(),
+			PlotType::HorizontalBar
+		);
+		assert_eq!(
+			horizontal_binding.kernel_fields.as_ref(),
+			&ResolvedKernelFields::Bar {
+				category: "category".to_owned(),
+				group: None,
+				value: "value".to_owned(),
+			}
+		);
+		for channel in horizontal_binding.channels() {
+			assert_eq!(
+				channel.layer,
+				LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::Bar,
+				},
+				"orientation may change geometry, axes, and guides; it may not change identity"
+			);
+		}
+
+		for (frame, expected_x, expected_y) in [
+			(
+				df!("x" => [1.0], "y" => [2.0]).unwrap(),
+				SemanticType::Quantitative,
+				SemanticType::Quantitative,
+			),
+			(
+				df!("x" => ["A"], "y" => ["B"]).unwrap(),
+				SemanticType::Nominal,
+				SemanticType::Nominal,
+			),
+		] {
+			let invalid = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "x", "y");
+			let error = resolve_channels(&invalid, frame.schema().as_ref())
+				.expect_err("an invalid pair must refuse after both channels resolve");
+			assert_eq!(
+				error.reason,
+				format!(
+					"bar requires exactly one quantitative value axis and one non-quantitative category axis; x `x` resolved as {expected_x:?}, y `y` resolved as {expected_y:?}"
+				)
+			);
+		}
+	}
+
+	#[test]
+	fn product_0055_canonical_horizontal_output_does_not_create_authoring_authority() {
+		let frame = df!("value" => [1.0], "category" => ["A"]).unwrap();
+		let named = AuthoredPlotSpec::xy(
+			PlotComposition::single(PlotType::HorizontalBar),
+			"value",
+			"category",
+		);
+		let error = resolve_channels(&named, frame.schema().as_ref())
+			.expect_err("HorizontalBar is resolved output, not an authored constructor");
+		assert!(
+			error
+				.reason
+				.contains("does not yet expose authored channel roles")
+		);
+
+		let automatic =
+			AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::HorizontalBar));
+		let binding = resolve_channels(&automatic, frame.schema().as_ref())
+			.expect("the dashboard's automatic HorizontalBar remains admitted");
+		assert_eq!(
+			binding.composition.primary_plot_type(),
+			PlotType::HorizontalBar
+		);
+		assert!(matches!(
+			binding.kernel_fields.as_ref(),
+			ResolvedKernelFields::Bar { category, value, .. }
+				if category == "category" && value == "value"
+		));
+
+		let dashboard_vertical =
+			AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Bar));
+		let binding = resolve_channels(&dashboard_vertical, frame.schema().as_ref())
+			.expect("automatic dashboard Bar keeps its fixed vertical contract");
+		assert_eq!(binding.composition.primary_plot_type(), PlotType::Bar);
+		assert!(matches!(
+			binding.kernel_fields.as_ref(),
+			ResolvedKernelFields::Bar { category, value, .. }
+				if category == "category" && value == "value"
+		));
+	}
+
+	#[test]
+	fn product_0055_rotation_preserves_color_lineage_while_a_series_field_change_does_not() {
+		let full = stamped(
+			df!(
+				"category" => ["East", "West"],
+				"value" => [1.0, 2.0],
+				"series" => ["Atlas", "Beacon"],
+				"other_series" => ["Atlas", "Beacon"],
+			)
+			.unwrap(),
+		);
+		let vertical = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"category",
+			"value",
+			Some("series".to_owned()),
+		);
+		let (vertical_resolved, identity) =
+			resolve_explicit(&vertical, &full, &ColorIdentity::default(), "tab20c").unwrap();
+		let beacon_before = position_color_mapping(&vertical_resolved)
+			.into_iter()
+			.find(|(category, _, _)| category == "Beacon")
+			.unwrap();
+
+		let filtered = stamped(
+			df!(
+				"category" => ["West"],
+				"value" => [2.0],
+				"series" => ["Beacon"],
+				"other_series" => ["Beacon"],
+			)
+			.unwrap(),
+		);
+		let horizontal = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"value",
+			"category",
+			Some("series".to_owned()),
+		);
+		let (horizontal_resolved, identity) =
+			resolve_explicit(&horizontal, &filtered, &identity, "tab20c").unwrap();
+		assert_eq!(
+			position_color_mapping(&horizontal_resolved),
+			vec![beacon_before.clone()],
+			"orientation may change geometry, axes, and guides; it may not change identity"
+		);
+
+		let changed_series = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"value",
+			"category",
+			Some("other_series".to_owned()),
+		);
+		let (changed_resolved, _) =
+			resolve_explicit(&changed_series, &filtered, &identity, "tab20c").unwrap();
+		assert_ne!(
+			position_color_mapping(&changed_resolved),
+			vec![beacon_before],
+			"changing the series field must begin a new lineage"
 		);
 	}
 

@@ -6527,6 +6527,193 @@ workspace.table("bad").views([view("bad", table())]);
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0055_horizontal_bar_keeps_physical_axes_and_family_label_through_completion() {
+		let source = r#"workspace.table("t").views([figure([
+			x_bounds(0, 10), x_tick_step(1), x_minor_ticks(2),
+			bar("value", "category", "series")
+		])])"#;
+		let relation = transform_rune_view(source)
+			.expect("horizontal bar remains the bar surface")
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!(
+				"category" => ["East", "East", "West", "West"],
+				"value" => [2.0, 4.0, 6.0, 8.0],
+				"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+			)
+			.unwrap(),
+			relation.views,
+		);
+		let sink = &outcome.sinks[0];
+		assert_eq!(
+			sink.presentation.display_label, "plot.bar",
+			"label names authored family"
+		);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, authored, _)) =
+			&sink.output
+		else {
+			panic!("pair-resolved horizontal bar must complete");
+		};
+		assert_eq!(
+			resolved.resolved_spec.composition.primary_plot_type(),
+			PlotType::HorizontalBar
+		);
+		assert_eq!(
+			resolved.resolved_spec.composition.title(),
+			"Horizontal Bar Plot",
+			"composition names resolved geometry"
+		);
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		assert_eq!((settings.x_min, settings.x_max), (Some(0.0), Some(10.0)));
+		assert_eq!(
+			settings.x_tick_placement,
+			crate::plot::common::TickPlacement::step(1.0).unwrap()
+		);
+		assert_eq!(settings.x_minor_ticks, 2);
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+		assert!(matches!(
+			kernel.layout(settings.clone()),
+			PlotLayout::CategoricalY { x_range, .. } if x_range == (0.0, 10.0)
+		));
+		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
+
+		for modifier in ["y_bounds(0, 10)", "y_tick_step(1)", "y_minor_ticks(2)"] {
+			let refusing = format!(
+				"workspace.table(\"t\").views([figure([{modifier}, bar(\"value\", \"category\")])])"
+			);
+			let relation = transform_rune_view(&refusing)
+				.unwrap()
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(
+				polars::df!("category" => ["East"], "value" => [2.0]).unwrap(),
+				relation.views,
+			);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("categorical y modifier must refuse: {modifier}");
+			};
+			assert!(error.contains("Band"), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&refusing[span.start as usize..span.end as usize], modifier);
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0055_pair_refusal_is_attributed_to_the_complete_bar_sink() {
+		let source = "workspace.table(\"t\").views([bar(\"revenue\", \"profit\")])";
+		let relation = transform_rune_view(source)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("revenue" => [1.0], "profit" => [2.0]).unwrap(),
+			relation.views,
+		);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("two quantitative bar axes must refuse as a pair");
+		};
+		assert!(error.contains(
+			"bar requires exactly one quantitative value axis and one non-quantitative category axis; x `revenue` resolved as Quantitative, y `profit` resolved as Quantitative"
+		));
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&source[span.start as usize..span.end as usize],
+			"bar(\"revenue\", \"profit\")"
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0055_horizontal_pair_reaches_every_bar_spelling_and_its_register() {
+		let sources = [
+			"plot.bar(workspace.table(\"t\"), \"value\", \"category\", \"series\")",
+			"workspace.table(\"t\").bar(\"value\", \"category\", \"series\")",
+			"workspace.table(\"t\").views([bar(\"value\", \"category\", \"series\")])",
+			"workspace.table(\"t\").views([view(\"bars\", bar(\"value\", \"category\", \"series\"))])",
+			"workspace.table(\"t\").views([figure([bar(\"value\", \"category\", \"series\")])])",
+		];
+		for source in sources {
+			let relation = transform_rune_view(source)
+				.expect("every established bar spelling admits the horizontal pair")
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(
+				polars::df!(
+					"category" => ["East"],
+					"value" => [2.0],
+					"series" => ["Atlas"],
+				)
+				.unwrap(),
+				relation.views,
+			);
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, _)) =
+				&outcome.sinks[0].output
+			else {
+				panic!("horizontal spelling did not complete: {source}");
+			};
+			assert_eq!(
+				resolved.resolved_spec.composition.primary_plot_type(),
+				PlotType::HorizontalBar
+			);
+			assert_eq!(outcome.sinks[0].presentation.display_label, "plot.bar");
+		}
+
+		for source in [
+			"workspace.table(\"t\").views([figure([bar(\"value\", \"category\").bar_width(0.5).category_gap(0.2)])])",
+			"workspace.table(\"t\").views([figure([bar(\"value\", \"category\", \"series\").category_gap(0.2).bar_width(0.5)])])",
+		] {
+			let relation = transform_rune_view(source)
+				.expect("the whole bar register is orientation-independent")
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(
+				polars::df!(
+					"category" => ["East"],
+					"value" => [2.0],
+					"series" => ["Atlas"],
+				)
+				.unwrap(),
+				relation.views,
+			);
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(resolved, layer, _, _)) =
+				&outcome.sinks[0].output
+			else {
+				panic!("modified horizontal bar did not complete: {source}");
+			};
+			assert_eq!(
+				resolved.resolved_spec.composition.primary_plot_type(),
+				PlotType::HorizontalBar
+			);
+			assert_eq!(
+				layer.bar_width,
+				crate::plot::spec::Override::Set(crate::plot::spec::BarWidth::new(0.5).unwrap())
+			);
+			assert_eq!(
+				layer.category_gap,
+				crate::plot::spec::Override::Set(crate::plot::spec::CategoryGap::new(0.2).unwrap())
+			);
+			let kernel = create_styled_plot(&resolved.resolved_spec, &resolved.data, layer.clone())
+				.expect("resolved horizontal member reaches the styled bar factory");
+			assert!(matches!(
+				kernel.layout(ResolvedPlotSettings::default()),
+				PlotLayout::CategoricalY { .. }
+			));
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn product_0036_exclusion_and_arbitrarily_small_positive_spans_render_exactly() {
 		for (minimum, maximum) in [(100.0, 200.0), (0.0, 1e-300)] {
 			let source = format!(

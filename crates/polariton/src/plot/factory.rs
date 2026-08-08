@@ -464,18 +464,53 @@ mod product_0013_baseline_tests {
 	use super::*;
 	use crate::coordinate::{Pt, Rect, Widget};
 	use crate::plot::common::{CoordinateTransformer, PlotLayout, ResolvedPlotSettings};
+	use crate::plot::common::{PathBuilder, PlotBackend};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::export::SvgBackend;
 	use crate::plot::spec::{
-		AuthoredPlotSpec, BarWidth, CategoricalPaletteSelection, Channel, ColorIdentity, LayerMark,
-		LayerSettings, LayerSpec, LayeredPlotSpec, Override, PalettePosition, PlotProvenance,
-		PointSize, ResolvedColor, StampedResult, resolve_channels,
+		AuthoredPlotSpec, BarWidth, CategoricalPaletteSelection, CategoryGap, Channel,
+		ColorIdentity, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override,
+		PalettePosition, PlotProvenance, PointSize, ResolvedColor, StampedResult, resolve_channels,
 		resolve_domains_with_categorical_palette,
 	};
 	use crate::plot::theme::PlotSettings;
 	use iced::advanced::mouse::Cursor;
 	use iced::{Point, Rectangle, Size};
 	use polars::df;
+
+	#[derive(Default)]
+	struct RectangleBackend {
+		rectangles: Vec<(Point, Size, iced::Color)>,
+	}
+
+	impl PlotBackend for RectangleBackend {
+		fn stroke_path(
+			&mut self,
+			_f: &dyn Fn(&mut dyn PathBuilder),
+			_stroke: iced::widget::canvas::Stroke,
+		) {
+		}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: iced::Color) {}
+
+		fn fill_rectangle(&mut self, top_left: Point, size: Size, color: iced::Color) {
+			self.rectangles.push((top_left, size, color));
+		}
+
+		fn fill_text(&mut self, _text: iced::widget::canvas::Text) {}
+
+		fn translate(&mut self, _translation: iced::Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
 
 	fn legacy_legend_origin(
 		bounds: Rectangle,
@@ -817,6 +852,147 @@ mod product_0013_baseline_tests {
 				.is_none(),
 			"the two-field bar keeps its legend-free default"
 		);
+	}
+
+	#[test]
+	fn product_0055_real_resolution_drives_grouped_horizontal_geometry_color_hit_and_hover() {
+		let frame = df!(
+			"category" => ["East", "East", "West", "West"],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+			"value" => [2.0, 4.0, 6.0, 8.0],
+		)
+		.unwrap();
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"value",
+			"category",
+			Some("series".to_owned()),
+		);
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0055".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").unwrap();
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.unwrap();
+		assert_eq!(
+			resolved.composition.primary_plot_type(),
+			PlotType::HorizontalBar,
+			"Stage 0 must enter through pair resolution, not a hand-built orientation"
+		);
+		let assignments = &resolved.channel(Channel::Color).unwrap().colors;
+		let layer = LayerSettings {
+			bar_width: Override::Set(BarWidth::new(0.5).unwrap()),
+			category_gap: Override::Set(CategoryGap::new(0.2).unwrap()),
+			..LayerSettings::default()
+		};
+		let kernel = create_styled_plot(&resolved, &frame, layer)
+			.expect("the inherited bar register reaches the resolved horizontal member");
+		let plot_settings = PlotSettings::default();
+		let resolved_settings = plot_settings.resolve();
+
+		let content = kernel
+			.legend_content(&resolved_settings)
+			.expect("a grouped horizontal bar earns the existing series legend");
+		let crate::plot::legend::LegendSection::Entries(entries) = content.0.first() else {
+			panic!("grouped horizontal legend must contain named swatches");
+		};
+		assert_eq!(
+			entries
+				.iter()
+				.map(|entry| (entry.label.as_str(), entry.swatch))
+				.collect::<Vec<_>>(),
+			assignments
+				.iter()
+				.map(|assignment| {
+					(
+						assignment.category.as_str(),
+						iced::Color::from_rgba8(
+							assignment.color.red,
+							assignment.color.green,
+							assignment.color.blue,
+							assignment.color.alpha as f32 / u8::MAX as f32,
+						),
+					)
+				})
+				.collect::<Vec<_>>()
+		);
+
+		for height in [100.0, 300.0] {
+			let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, height));
+			let layout = kernel.layout(resolved_settings.clone());
+			let x_range = match &layout {
+				PlotLayout::CategoricalY { x_range, .. } => *x_range,
+				_ => panic!("canonical HorizontalBar must construct CategoricalY"),
+			};
+			let transform = CoordinateTransformer::new(&layout, bounds);
+			let mut backend = RectangleBackend::default();
+			kernel.plot_with_settings(
+				&mut backend,
+				bounds,
+				&transform,
+				Cursor::Unavailable,
+				&plot_settings,
+			);
+			assert_eq!(backend.rectangles.len(), 4);
+			for (index, (_, _, actual)) in backend.rectangles.iter().enumerate() {
+				let expected = &assignments[index % assignments.len()].color;
+				assert_eq!(
+					*actual,
+					iced::Color::from_rgba8(
+						expected.red,
+						expected.green,
+						expected.blue,
+						expected.alpha as f32 / u8::MAX as f32,
+					),
+					"paint must consume the exact resolved series assignment"
+				);
+			}
+
+			for category_index in 0..2 {
+				let mut intervals = backend.rectangles[category_index * 2..category_index * 2 + 2]
+					.iter()
+					.map(|(origin, size, _)| (origin.y, origin.y + size.height))
+					.collect::<Vec<_>>();
+				intervals.sort_by(|left, right| left.0.total_cmp(&right.0));
+				let centroid = (intervals[0].0 + intervals[1].1) / 2.0;
+				let transformed = transform.categorical(category_index, x_range.0).0.y;
+				assert!(
+					(centroid - transformed).abs() < 0.0001,
+					"cluster centroid {centroid} must equal transformer answer {transformed}"
+				);
+				let band = height / 2.0;
+				let slot = band * 0.8 / 2.0;
+				assert!((intervals[1].0 - intervals[0].1 - slot * 0.5).abs() < 0.0001);
+			}
+
+			let (origin, size, _) = backend.rectangles[0];
+			let visible = Point::new(origin.x + size.width / 2.0, origin.y + size.height / 2.0);
+			let hover = kernel
+				.hover_with_settings(&transform, Cursor::Available(visible), &plot_settings)
+				.expect("painted rectangle must hit");
+			let expected_value =
+				x_range.0 + visible.x as f64 / bounds.width as f64 * (x_range.1 - x_range.0);
+			assert!(
+				hover.contains(&format!("Value: ~{expected_value:.2}")),
+				"horizontal hover must derive value from x_range and cursor x: {hover}"
+			);
+			let reserve = Point::new(visible.x, height / 2.0 + 1.0);
+			assert_eq!(
+				kernel.hover_with_settings(&transform, Cursor::Available(reserve), &plot_settings,),
+				None,
+				"category reserve is neither paint nor hit"
+			);
+		}
 	}
 
 	fn styled_bar(orientation: Orientation, fraction: f32) -> BarPlotKernel {
