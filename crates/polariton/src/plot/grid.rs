@@ -8,8 +8,8 @@
 #![allow(dead_code)]
 
 use crate::plot::common::{
-	CoordinateTransformer, PlotBackend, PlotComposite, PlotKernel, PlotLayout, PlotWidget,
-	ResolvedPlotSettings,
+	AxisTextVisibility, CoordinateTransformer, PlotBackend, PlotComposite, PlotKernel, PlotLayout,
+	PlotWidget, ResolvedPlotSettings,
 };
 use crate::plot::factory::{create_plot, create_styled_plot};
 use crate::plot::spec::{LayerSettings, NonEmpty, ResolvedPlotSpec, StampedResult};
@@ -367,6 +367,36 @@ struct PreparedGridCell {
 	kernel: Arc<dyn PlotKernel + Send + Sync>,
 }
 
+#[derive(Clone, Copy)]
+struct AxisTextCell {
+	position: GridPosition,
+	x_group: DomainGroupId,
+	y_group: DomainGroupId,
+}
+
+fn axis_text_visibility(cell: AxisTextCell, cells: &[AxisTextCell]) -> AxisTextVisibility {
+	let left = cell
+		.position
+		.column
+		.checked_sub(1)
+		.map(|column| GridPosition {
+			row: cell.position.row,
+			column,
+		});
+	let below = GridPosition {
+		row: cell.position.row.saturating_add(1),
+		column: cell.position.column,
+	};
+	AxisTextVisibility {
+		y: !cells
+			.iter()
+			.any(|other| Some(other.position) == left && other.y_group == cell.y_group),
+		x: !cells
+			.iter()
+			.any(|other| other.position == below && other.x_group == cell.x_group),
+	}
+}
+
 pub struct PlotGridKernel {
 	cells: NonEmpty<PreparedGridCell>,
 	arrangement: GridArrangement,
@@ -425,6 +455,17 @@ impl PlotGridKernel {
 		local
 			.into_iter()
 			.map(|(position, layout)| (position, merge_layout(layout, &shared)))
+			.collect()
+	}
+
+	fn axis_text_cells(&self) -> Vec<AxisTextCell> {
+		self.cells
+			.iter()
+			.map(|cell| AxisTextCell {
+				position: cell.cell.position,
+				x_group: cell.cell.x_group,
+				y_group: cell.cell.y_group,
+			})
 			.collect()
 	}
 }
@@ -501,11 +542,12 @@ impl PlotComposite for PlotGridKernel {
 			);
 		});
 		let outer = grid_outer_area(bounds, padding);
+		let tiled = grid_tiled_area(outer, &resolved);
 		let layouts = self.cell_layouts(resolved.clone());
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
-			let cell_bounds = grid_cell_bounds(outer, self.arrangement, *position);
-			let inner = plot_area(cell_bounds, 0.0, &resolved);
+			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
+			let inner = grid_plot_area(cell_bounds, &resolved);
 			let transform = CoordinateTransformer::new(layout, inner);
 			backend.with_clip(cell_bounds, &mut |backend| {
 				backend.fill_rectangle(
@@ -553,7 +595,9 @@ impl PlotComposite for PlotGridKernel {
 		}
 		let resolved = settings.resolve();
 		let outer = grid_outer_area(bounds, padding);
+		let tiled = grid_tiled_area(outer, &resolved);
 		let layouts = self.cell_layouts(resolved.clone());
+		let axis_cells = self.axis_text_cells();
 		let figure_legend = crate::plot::legend::union(
 			self.cells
 				.iter()
@@ -561,9 +605,10 @@ impl PlotComposite for PlotGridKernel {
 		);
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
-			let cell_bounds = grid_cell_bounds(outer, self.arrangement, *position);
-			let inner = plot_area(cell_bounds, 0.0, &resolved);
+			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
+			let inner = grid_plot_area(cell_bounds, &resolved);
 			let transform = CoordinateTransformer::new(layout, inner);
+			let axis_text = axis_text_visibility(axis_cells[index], &axis_cells);
 			let helper = PlotWidget {
 				kernel: cell.kernel.as_ref(),
 				title: String::new(),
@@ -574,7 +619,11 @@ impl PlotComposite for PlotGridKernel {
 				resize_render_suspended: false,
 				layer: crate::plot::common::PlotRenderLayer::Full,
 			};
-			backend.with_clip(cell_bounds, &mut |backend| {
+			// Edge text deliberately extends out of its occupied slot: into the
+			// shared gutters, or into the vacant below-slot of a partial row.
+			// Keep the backend's composite draw inside a child clip while using
+			// the figure bounds as that clip so the text is not orphaned.
+			backend.with_clip(bounds, &mut |backend| {
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(inner.x, inner.y));
 					match layout {
@@ -585,7 +634,7 @@ impl PlotComposite for PlotGridKernel {
 								backend, inner, &transform, *x_range, *y_range,
 							);
 							helper.draw_cartesian_axes(
-								backend, inner, &transform, *x_range, *y_range,
+								backend, inner, &transform, *x_range, *y_range, axis_text,
 							);
 						}
 						PlotLayout::CategoricalX {
@@ -596,7 +645,7 @@ impl PlotComposite for PlotGridKernel {
 								backend, inner, &transform, categories, *y_range,
 							);
 							helper.draw_categorical_axes(
-								backend, inner, &transform, categories, *y_range,
+								backend, inner, &transform, categories, *y_range, axis_text,
 							);
 						}
 						PlotLayout::CategoricalY {
@@ -607,7 +656,7 @@ impl PlotComposite for PlotGridKernel {
 								backend, inner, &transform, categories, *x_range,
 							);
 							helper.draw_categorical_y_axes(
-								backend, inner, &transform, categories, *x_range,
+								backend, inner, &transform, categories, *x_range, axis_text,
 							);
 						}
 						PlotLayout::CategoricalXY {
@@ -620,16 +669,17 @@ impl PlotComposite for PlotGridKernel {
 								&transform,
 								x_categories,
 								y_categories,
+								axis_text,
 							);
 						}
 						PlotLayout::Parallel { dimensions, ranges } => {
-							helper
-								.draw_parallel_axes(backend, inner, &transform, dimensions, ranges);
+							helper.draw_parallel_axes(
+								backend, inner, &transform, dimensions, ranges, axis_text,
+							);
 						}
 						PlotLayout::Radial => {}
 					}
 				});
-				helper.draw_axis_labels(backend, inner);
 				if let Some(label) = &cell.cell.label {
 					backend.fill_text(iced::widget::canvas::Text {
 						content: label.clone(),
@@ -647,6 +697,19 @@ impl PlotComposite for PlotGridKernel {
 				}
 			});
 		}
+		let shared_extent = grid_plot_extent(tiled, self.arrangement, &resolved);
+		let first = self.cells.first();
+		let helper = PlotWidget {
+			kernel: first.kernel.as_ref(),
+			title: String::new(),
+			padding: 0.0,
+			settings: resolved.clone(),
+			settings_model: settings.clone(),
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: crate::plot::common::PlotRenderLayer::Full,
+		};
+		helper.draw_axis_labels(backend, shared_extent);
 		if let Some(content) = figure_legend {
 			crate::plot::legend::render_legend(backend, bounds, &content, &resolved);
 		}
@@ -665,14 +728,15 @@ impl PlotComposite for PlotGridKernel {
 		let cursor = cursor.position()?;
 		let resolved = settings.resolve();
 		let outer = grid_outer_area(bounds, padding);
+		let tiled = grid_tiled_area(outer, &resolved);
 		let layouts = self.cell_layouts(resolved.clone());
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
-			let cell_bounds = grid_cell_bounds(outer, self.arrangement, *position);
+			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
 			if !cell_bounds.contains(cursor) {
 				continue;
 			}
-			let inner = plot_area(cell_bounds, 0.0, &resolved);
+			let inner = grid_plot_area(cell_bounds, &resolved);
 			let transform = CoordinateTransformer::new(layout, inner);
 			let local = Point::new(cursor.x - inner.x, cursor.y - inner.y);
 			return cell
@@ -706,6 +770,56 @@ fn grid_outer_area(bounds: IcedRectangle, padding: f32) -> IcedRectangle {
 		y: bounds.y + padding,
 		width: (bounds.width - 2.0 * padding).max(0.0),
 		height: (bounds.height - 2.0 * padding).max(0.0),
+	}
+}
+
+fn grid_tiled_area(outer: IcedRectangle, settings: &ResolvedPlotSettings) -> IcedRectangle {
+	let left = settings.plot_padding_left.min(outer.width);
+	let bottom = settings.plot_padding_bottom.min(outer.height);
+	IcedRectangle {
+		x: outer.x + left,
+		y: outer.y,
+		width: (outer.width - left).max(0.0),
+		height: (outer.height - bottom).max(0.0),
+	}
+}
+
+fn grid_plot_area(cell_bounds: IcedRectangle, settings: &ResolvedPlotSettings) -> IcedRectangle {
+	let top = settings.plot_padding_top.min(cell_bounds.height);
+	let right = settings.plot_padding_right.min(cell_bounds.width);
+	IcedRectangle {
+		x: cell_bounds.x,
+		y: cell_bounds.y + top,
+		width: (cell_bounds.width - right).max(0.0),
+		height: (cell_bounds.height - top).max(0.0),
+	}
+}
+
+fn grid_plot_extent(
+	tiled: IcedRectangle,
+	arrangement: GridArrangement,
+	settings: &ResolvedPlotSettings,
+) -> IcedRectangle {
+	let first = grid_plot_area(
+		grid_cell_bounds(tiled, arrangement, GridPosition { row: 0, column: 0 }),
+		settings,
+	);
+	let last = grid_plot_area(
+		grid_cell_bounds(
+			tiled,
+			arrangement,
+			GridPosition {
+				row: arrangement.rows.saturating_sub(1),
+				column: arrangement.columns.saturating_sub(1),
+			},
+		),
+		settings,
+	);
+	IcedRectangle {
+		x: first.x,
+		y: first.y,
+		width: (last.x + last.width - first.x).max(0.0),
+		height: (last.y + last.height - first.y).max(0.0),
 	}
 }
 
@@ -820,6 +934,57 @@ mod tests {
 		(body, data, stamped)
 	}
 
+	fn rendered_facet(
+		count: usize,
+		arrangement: GridArrangement,
+		width: f32,
+		height: f32,
+	) -> (PlotGridKernel, String) {
+		let facets: Vec<String> = (0..count).map(|index| format!("panel-{index}")).collect();
+		let x: Vec<f64> = (0..count).map(|index| index as f64).collect();
+		let y: Vec<f64> = (0..count).map(|index| index as f64 + 10.0).collect();
+		let data = Arc::new(df!("facet" => facets, "x" => x, "y" => y).expect("facet frame"));
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "shared-edge fixture".to_owned(),
+				data: Arc::clone(&data),
+			},
+			authored_spec: AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y"),
+		})
+		.expect("facet resolves");
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved.resolved_spec),
+			&StampedResult {
+				data,
+				provenance: PlotProvenance {
+					source_name: "shared-edge fixture".to_owned(),
+					revision: None,
+				},
+			},
+			"facet",
+			arrangement,
+		)
+		.expect("facet grid");
+		let kernel = PlotGridKernel::from_grid(grid, width as u32, height as u32);
+		let model = PlotSettings::default();
+		let mut backend = SvgBackend::new(width, height);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(width, height)),
+		);
+		(kernel, backend.finish())
+	}
+
 	fn rendered_tick_paths(svg: &str, clip_id: usize, origin: Point) -> Vec<[f32; 4]> {
 		let marker = format!(r#"<g clip-path="url(#{})">"#, format!("clip_{clip_id}"));
 		let body = svg
@@ -851,6 +1016,53 @@ mod tests {
 			.collect();
 		paths.sort_by(|left, right| left.partial_cmp(right).expect("finite tick coordinates"));
 		paths
+	}
+
+	fn clipped_text(svg: &str, clip_id: usize) -> Vec<String> {
+		let marker = format!(r#"<g clip-path="url(#clip_{clip_id})">"#);
+		let body = svg
+			.split_once(&marker)
+			.and_then(|(_, rest)| rest.split_once("</g>"))
+			.map(|(body, _)| body)
+			.expect("overlay clip body");
+		body.split("<text ")
+			.skip(1)
+			.filter_map(|fragment| {
+				fragment
+					.split_once('>')
+					.and_then(|(_, text)| text.split_once("</text>"))
+					.map(|(text, _)| text.to_owned())
+			})
+			.collect()
+	}
+
+	fn text_element<'a>(svg: &'a str, content: &str) -> &'a str {
+		svg.split("<text ")
+			.skip(1)
+			.find(|fragment| fragment.contains(&format!(">{content}</text>")))
+			.unwrap_or_else(|| panic!("missing text element `{content}`"))
+	}
+
+	fn text_transform_translation(element: &str) -> Point {
+		let coefficients = element
+			.split_once("matrix(")
+			.and_then(|(_, rest)| rest.split_once(')'))
+			.map(|(matrix, _)| matrix)
+			.expect("text transform matrix")
+			.split_whitespace()
+			.map(|value| value.parse::<f32>().expect("matrix coefficient"))
+			.collect::<Vec<_>>();
+		assert_eq!(coefficients.len(), 6);
+		Point::new(coefficients[4], coefficients[5])
+	}
+
+	fn text_coordinate(element: &str, axis: char) -> f32 {
+		let marker = format!(r#"{axis}=""#);
+		element
+			.split_once(&marker)
+			.and_then(|(_, rest)| rest.split_once('"'))
+			.map(|(value, _)| value.parse::<f32>().expect("text coordinate"))
+			.expect("text coordinate attribute")
 	}
 
 	fn round_coordinate(value: f32) -> f32 {
@@ -1439,12 +1651,19 @@ mod tests {
 		for label in ["A", "B", "C", "D"] {
 			assert!(svg.contains(label), "missing panel label {label}");
 		}
-		let origins = [
-			Point::new(0.0, 0.0),
-			Point::new(406.0, 0.0),
-			Point::new(0.0, 306.0),
-			Point::new(406.0, 306.0),
-		];
+		let resolved = ResolvedPlotSettings::default();
+		let outer = grid_outer_area(
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
+			0.0,
+		);
+		let tiled = grid_tiled_area(outer, &resolved);
+		let origins = layouts
+			.iter()
+			.map(|(position, _)| {
+				let cell_bounds = grid_cell_bounds(tiled, kernel.arrangement, *position);
+				Point::new(cell_bounds.x, cell_bounds.y)
+			})
+			.collect::<Vec<_>>();
 		let ticks: Vec<_> = origins
 			.iter()
 			.enumerate()
@@ -1452,23 +1671,182 @@ mod tests {
 			.collect();
 		assert!(ticks.iter().all(|paths| !paths.is_empty()));
 		assert!(ticks[1..].iter().all(|paths| paths == &ticks[0]));
-		let outer = grid_outer_area(
-			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
-			0.0,
-		);
 		for (index, ((position, layout), (x, y))) in layouts
 			.iter()
 			.zip([(0.0, 1.0), (1.0, 2.0), (2.0, 3.0), (3.0, 4.0)])
 			.enumerate()
 		{
-			let cell_bounds =
-				grid_cell_bounds(outer, GridArrangement::new(2, 2).unwrap(), *position);
-			let inner = plot_area(cell_bounds, 0.0, &ResolvedPlotSettings::default());
+			let cell_bounds = grid_cell_bounds(tiled, kernel.arrangement, *position);
+			let inner = grid_plot_area(cell_bounds, &resolved);
 			let expected = CoordinateTransformer::new(layout, inner).cartesian(x, y);
 			let actual = rendered_single_mark(&svg, 1 + index);
 			assert!((actual.x - (inner.x + expected.x)).abs() < 0.01);
 			assert!((actual.y - (inner.y + expected.y)).abs() < 0.01);
 		}
+	}
+
+	#[test]
+	fn product_0048_shared_edges_suppress_only_repeated_tick_text() {
+		let (kernel, svg) = rendered_facet(
+			4,
+			GridArrangement::new(2, 2).expect("arrangement"),
+			800.0,
+			600.0,
+		);
+		// clip 0 is the figure background, 1..=4 are data cells, and
+		// 5..=8 are the corresponding overlay cells.
+		let tick_text: Vec<_> = (5..=8)
+			.map(|clip| {
+				clipped_text(&svg, clip)
+					.into_iter()
+					.filter(|text| !text.starts_with("panel-"))
+					.collect::<Vec<_>>()
+			})
+			.collect();
+		let y_count = tick_text[0].len();
+		let x_count = tick_text[3].len();
+		assert!(x_count > 0 && y_count > 0);
+		assert!(
+			tick_text[1].is_empty(),
+			"top-right is interior on both axes"
+		);
+		assert_eq!(tick_text[0].len(), y_count, "top-left keeps only y text");
+		assert_eq!(
+			tick_text[2].len(),
+			x_count + y_count,
+			"bottom-left keeps both edge texts"
+		);
+		assert_eq!(
+			tick_text[3].len(),
+			x_count,
+			"bottom-right keeps only x text"
+		);
+		assert_eq!(svg.matches(">x</text>").count(), 1, "one shared x title");
+		assert_eq!(svg.matches(">y</text>").count(), 1, "one shared y title");
+		for index in 0..4 {
+			assert_eq!(
+				svg.matches(&format!(">panel-{index}</text>")).count(),
+				1,
+				"panel labels remain per cell"
+			);
+		}
+
+		let resolved = ResolvedPlotSettings::default();
+		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let tiled = grid_tiled_area(grid_outer_area(bounds, 0.0), &resolved);
+		let shared = grid_plot_extent(tiled, kernel.arrangement, &resolved);
+		let x_title = text_element(&svg, "x");
+		assert!((text_coordinate(x_title, 'x') - (shared.x + shared.width / 2.0)).abs() < 0.01);
+		let y_title = text_element(&svg, "y");
+		let y_translation = text_transform_translation(y_title);
+		assert!((y_translation.y - (shared.y + shared.height / 2.0)).abs() < 0.01);
+	}
+
+	#[test]
+	fn product_0048_partial_row_text_lands_directly_in_the_empty_below_slot() {
+		let (kernel, svg) = rendered_facet(
+			5,
+			GridArrangement::new(2, 3).expect("arrangement"),
+			900.0,
+			600.0,
+		);
+		// Five data clips make the top-right overlay clip 8. It has no
+		// below neighbor, so its x tick text must be present even though it
+		// is not on the arrangement's final row.
+		let tick_text = |clip| {
+			clipped_text(&svg, clip)
+				.into_iter()
+				.filter(|text| !text.starts_with("panel-"))
+				.collect::<Vec<_>>()
+		};
+		let top_right_text = tick_text(8);
+		let bottom_middle_text = tick_text(10);
+		assert!(!top_right_text.is_empty());
+		assert_eq!(
+			top_right_text.len(),
+			bottom_middle_text.len(),
+			"both cells carry exactly the shared x tick labels"
+		);
+
+		let resolved = ResolvedPlotSettings::default();
+		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(900.0, 600.0));
+		let tiled = grid_tiled_area(grid_outer_area(bounds, 0.0), &resolved);
+		let top_right = grid_cell_bounds(
+			tiled,
+			kernel.arrangement,
+			GridPosition { row: 0, column: 2 },
+		);
+		let first_tick = svg
+			.split_once(r#"<g clip-path="url(#clip_8)">"#)
+			.and_then(|(_, rest)| rest.split_once("</g>"))
+			.and_then(|(body, _)| body.split("<text ").nth(1))
+			.expect("top-right rendered x tick");
+		let tick_origin = text_transform_translation(first_tick);
+		assert!(tick_origin.y > top_right.y + top_right.height);
+		assert!(
+			tick_origin.y - (top_right.y + top_right.height) <= resolved.x_label_offset + 0.01,
+			"x text belongs immediately below the occupied cell: {tick_origin:?} vs {top_right:?}"
+		);
+	}
+
+	#[test]
+	fn product_0048_gutter_geometry_is_congruent_and_reclaims_space() {
+		let arrangement = GridArrangement::new(2, 2).expect("arrangement");
+		let settings = ResolvedPlotSettings::default();
+		let outer = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let tiled = grid_tiled_area(outer, &settings);
+		let mut inners = Vec::new();
+		let mut legacy = Vec::new();
+		for row in 0..arrangement.rows {
+			for column in 0..arrangement.columns {
+				let position = GridPosition { row, column };
+				inners.push(grid_plot_area(
+					grid_cell_bounds(tiled, arrangement, position),
+					&settings,
+				));
+				legacy.push(plot_area(
+					grid_cell_bounds(outer, arrangement, position),
+					0.0,
+					&settings,
+				));
+			}
+		}
+		assert!(
+			inners
+				.iter()
+				.all(|inner| inner.width == inners[0].width && inner.height == inners[0].height),
+			"shared domains must map over congruent pixel extents"
+		);
+		assert!(inners[0].width > legacy[0].width);
+		assert!(inners[0].height > legacy[0].height);
+	}
+
+	#[test]
+	fn product_0048_group_comparison_restores_text_for_differing_groups() {
+		let left = AxisTextCell {
+			position: GridPosition { row: 0, column: 0 },
+			x_group: 0,
+			y_group: 0,
+		};
+		let right = AxisTextCell {
+			position: GridPosition { row: 0, column: 1 },
+			x_group: 0,
+			y_group: 1,
+		};
+		let cells = [left, right];
+		assert!(axis_text_visibility(left, &cells).y);
+		assert!(
+			axis_text_visibility(right, &cells).y,
+			"a different-group left neighbor does not shadow y text"
+		);
+		let same_group_right = AxisTextCell {
+			y_group: 0,
+			..right
+		};
+		assert!(
+			!axis_text_visibility(same_group_right, &[left, same_group_right]).y,
+			"the comparison, not column position, suppresses repeated text"
+		);
 	}
 
 	#[test]
@@ -1581,9 +1959,10 @@ mod tests {
 		let layouts = kernel.cell_layouts(resolved.clone());
 		let local = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
 		let outer = grid_outer_area(local, 0.0);
+		let tiled = grid_tiled_area(outer, &resolved);
 		let (position, layout) = &layouts[0];
-		let cell_bounds = grid_cell_bounds(outer, arrangement, *position);
-		let inner = plot_area(cell_bounds, 0.0, &resolved);
+		let cell_bounds = grid_cell_bounds(tiled, arrangement, *position);
+		let inner = grid_plot_area(cell_bounds, &resolved);
 		let transform = CoordinateTransformer::new(layout, inner);
 		let p0 = transform.cartesian(0.0, 1.0);
 		let p1 = transform.cartesian(2.0, 3.0);

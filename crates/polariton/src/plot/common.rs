@@ -795,6 +795,16 @@ pub enum PlotRenderLayer {
 	Full,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AxisTextVisibility {
+	pub x: bool,
+	pub y: bool,
+}
+
+impl AxisTextVisibility {
+	pub const ALL: Self = Self { x: true, y: true };
+}
+
 #[derive(Default)]
 pub struct PlotCanvasState {
 	last_click: Option<std::time::Instant>,
@@ -940,14 +950,26 @@ impl<'a> PlotWidget<'a> {
 				PlotLayout::Cartesian {
 					x_range, y_range, ..
 				} => {
-					self.draw_cartesian_axes(backend, plot_area, &transform, *x_range, *y_range);
+					self.draw_cartesian_axes(
+						backend,
+						plot_area,
+						&transform,
+						*x_range,
+						*y_range,
+						AxisTextVisibility::ALL,
+					);
 				}
 				PlotLayout::CategoricalX {
 					categories,
 					y_range,
 				} => {
 					self.draw_categorical_axes(
-						backend, plot_area, &transform, categories, *y_range,
+						backend,
+						plot_area,
+						&transform,
+						categories,
+						*y_range,
+						AxisTextVisibility::ALL,
 					);
 				}
 				PlotLayout::CategoricalY {
@@ -955,7 +977,12 @@ impl<'a> PlotWidget<'a> {
 					x_range,
 				} => {
 					self.draw_categorical_y_axes(
-						backend, plot_area, &transform, categories, *x_range,
+						backend,
+						plot_area,
+						&transform,
+						categories,
+						*x_range,
+						AxisTextVisibility::ALL,
 					);
 				}
 				PlotLayout::CategoricalXY {
@@ -968,10 +995,18 @@ impl<'a> PlotWidget<'a> {
 						&transform,
 						x_categories,
 						y_categories,
+						AxisTextVisibility::ALL,
 					);
 				}
 				PlotLayout::Parallel { dimensions, ranges } => {
-					self.draw_parallel_axes(backend, plot_area, &transform, dimensions, ranges);
+					self.draw_parallel_axes(
+						backend,
+						plot_area,
+						&transform,
+						dimensions,
+						ranges,
+						AxisTextVisibility::ALL,
+					);
 				}
 				PlotLayout::Radial => {}
 			}
@@ -1358,6 +1393,7 @@ impl<'a> PlotWidget<'a> {
 		transform: &CoordinateTransformer,
 		x_range: (f64, f64),
 		y_range: (f64, f64),
+		text: AxisTextVisibility,
 	) {
 		let x_axis_type = if let PlotLayout::Cartesian { x_axis_type, .. } = transform.layout {
 			*x_axis_type
@@ -1398,15 +1434,17 @@ impl<'a> PlotWidget<'a> {
 				},
 				axis_stroke,
 			);
-			backend.fill_text(Text {
-				content: format_label(data_y, y_axis_type),
-				position: Point::new(p_left.x - 10.0, p_left.y),
-				color: self.settings.chrome.tick_label_text.iced(),
-				size: iced::Pixels(self.settings.y_tick_size),
-				align_x: alignment::Horizontal::Right.into(),
-				align_y: alignment::Vertical::Center,
-				..Default::default()
-			});
+			if text.y {
+				backend.fill_text(Text {
+					content: format_label(data_y, y_axis_type),
+					position: Point::new(p_left.x - 10.0, p_left.y),
+					color: self.settings.chrome.tick_label_text.iced(),
+					size: iced::Pixels(self.settings.y_tick_size),
+					align_x: alignment::Horizontal::Right.into(),
+					align_y: alignment::Vertical::Center,
+					..Default::default()
+				});
+			}
 		}
 		if self.settings.show_y_minor_ticks && self.settings.y_minor_ticks > 0 {
 			for data_y in self.minor_tick_positions(
@@ -1433,21 +1471,23 @@ impl<'a> PlotWidget<'a> {
 				},
 				axis_stroke,
 			);
-			backend.with_save(&mut |backend| {
-				backend.translate(iced::Vector::new(
-					p_bottom.x,
-					p_bottom.y + self.settings.x_label_offset,
-				));
-				backend.rotate(self.settings.x_label_rotation.to_radians());
-				backend.fill_text(Text {
-					content: format_label(data_x, x_axis_type),
-					position: Point::ORIGIN,
-					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.x_tick_size),
-					align_x: alignment::Horizontal::Center.into(),
-					..Default::default()
+			if text.x {
+				backend.with_save(&mut |backend| {
+					backend.translate(iced::Vector::new(
+						p_bottom.x,
+						p_bottom.y + self.settings.x_label_offset,
+					));
+					backend.rotate(self.settings.x_label_rotation.to_radians());
+					backend.fill_text(Text {
+						content: format_label(data_x, x_axis_type),
+						position: Point::ORIGIN,
+						color: self.settings.chrome.tick_label_text.iced(),
+						size: iced::Pixels(self.settings.x_tick_size),
+						align_x: alignment::Horizontal::Center.into(),
+						..Default::default()
+					});
 				});
-			});
+			}
 		}
 		if self.settings.show_x_minor_ticks && self.settings.x_minor_ticks > 0 {
 			for data_x in self.minor_tick_positions(
@@ -1546,6 +1586,7 @@ impl<'a> PlotWidget<'a> {
 		transform: &CoordinateTransformer,
 		categories: &[String],
 		y_range: (f64, f64),
+		text: AxisTextVisibility,
 	) {
 		let halo_stroke = Stroke {
 			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
@@ -1581,15 +1622,17 @@ impl<'a> PlotWidget<'a> {
 				},
 				axis_stroke,
 			);
-			backend.fill_text(Text {
-				content: format_label(data_y, AxisType::Linear),
-				position: Point::new(p_left.x - 10.0, p_left.y),
-				color: self.settings.chrome.tick_label_text.iced(),
-				size: iced::Pixels(self.settings.y_tick_size),
-				align_x: alignment::Horizontal::Right.into(),
-				align_y: alignment::Vertical::Center,
-				..Default::default()
-			});
+			if text.y {
+				backend.fill_text(Text {
+					content: format_label(data_y, AxisType::Linear),
+					position: Point::new(p_left.x - 10.0, p_left.y),
+					color: self.settings.chrome.tick_label_text.iced(),
+					size: iced::Pixels(self.settings.y_tick_size),
+					align_x: alignment::Horizontal::Right.into(),
+					align_y: alignment::Vertical::Center,
+					..Default::default()
+				});
+			}
 		}
 		for (i, cat) in categories.iter().enumerate() {
 			let (center_px, _band_width) = transform.categorical(i, y_range.0);
@@ -1600,21 +1643,23 @@ impl<'a> PlotWidget<'a> {
 				},
 				axis_stroke,
 			);
-			backend.with_save(&mut |backend| {
-				backend.translate(iced::Vector::new(
-					center_px.x,
-					center_px.y + self.settings.x_label_offset,
-				));
-				backend.rotate(self.settings.x_label_rotation.to_radians());
-				backend.fill_text(Text {
-					content: cat.clone(),
-					position: Point::ORIGIN,
-					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.x_tick_size),
-					align_x: alignment::Horizontal::Center.into(),
-					..Default::default()
+			if text.x {
+				backend.with_save(&mut |backend| {
+					backend.translate(iced::Vector::new(
+						center_px.x,
+						center_px.y + self.settings.x_label_offset,
+					));
+					backend.rotate(self.settings.x_label_rotation.to_radians());
+					backend.fill_text(Text {
+						content: cat.clone(),
+						position: Point::ORIGIN,
+						color: self.settings.chrome.tick_label_text.iced(),
+						size: iced::Pixels(self.settings.x_tick_size),
+						align_x: alignment::Horizontal::Center.into(),
+						..Default::default()
+					});
 				});
-			});
+			}
 		}
 	}
 
@@ -1705,6 +1750,7 @@ impl<'a> PlotWidget<'a> {
 		transform: &CoordinateTransformer,
 		categories: &[String],
 		x_range: (f64, f64),
+		text: AxisTextVisibility,
 	) {
 		let halo_stroke = Stroke {
 			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
@@ -1740,14 +1786,16 @@ impl<'a> PlotWidget<'a> {
 				},
 				axis_stroke,
 			);
-			backend.fill_text(Text {
-				content: format_label(data_x, AxisType::Linear),
-				position: Point::new(p_bottom.x, p_bottom.y + 10.0),
-				color: self.settings.chrome.tick_label_text.iced(),
-				size: iced::Pixels(self.settings.x_tick_size),
-				align_x: alignment::Horizontal::Center.into(),
-				..Default::default()
-			});
+			if text.x {
+				backend.fill_text(Text {
+					content: format_label(data_x, AxisType::Linear),
+					position: Point::new(p_bottom.x, p_bottom.y + 10.0),
+					color: self.settings.chrome.tick_label_text.iced(),
+					size: iced::Pixels(self.settings.x_tick_size),
+					align_x: alignment::Horizontal::Center.into(),
+					..Default::default()
+				});
+			}
 		}
 		for (i, cat) in categories.iter().enumerate() {
 			let (center_px, _band_height) = transform.categorical(i, x_range.0);
@@ -1758,15 +1806,17 @@ impl<'a> PlotWidget<'a> {
 				},
 				axis_stroke,
 			);
-			backend.fill_text(Text {
-				content: cat.clone(),
-				position: Point::new(center_px.x - 10.0, center_px.y),
-				color: self.settings.chrome.tick_label_text.iced(),
-				size: iced::Pixels(self.settings.y_tick_size),
-				align_x: alignment::Horizontal::Right.into(),
-				align_y: alignment::Vertical::Center,
-				..Default::default()
-			});
+			if text.y {
+				backend.fill_text(Text {
+					content: cat.clone(),
+					position: Point::new(center_px.x - 10.0, center_px.y),
+					color: self.settings.chrome.tick_label_text.iced(),
+					size: iced::Pixels(self.settings.y_tick_size),
+					align_x: alignment::Horizontal::Right.into(),
+					align_y: alignment::Vertical::Center,
+					..Default::default()
+				});
+			}
 		}
 	}
 
@@ -1777,6 +1827,7 @@ impl<'a> PlotWidget<'a> {
 		transform: &CoordinateTransformer,
 		x_categories: &[String],
 		y_categories: &[String],
+		text: AxisTextVisibility,
 	) {
 		let halo_stroke = Stroke {
 			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
@@ -1813,21 +1864,23 @@ impl<'a> PlotWidget<'a> {
 				},
 				axis_stroke,
 			);
-			backend.with_save(&mut |backend| {
-				backend.translate(iced::Vector::new(
-					tick_x,
-					tick_y + self.settings.x_label_offset,
-				));
-				backend.rotate(self.settings.x_label_rotation.to_radians());
-				backend.fill_text(Text {
-					content: cat.clone(),
-					position: Point::ORIGIN,
-					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.x_tick_size),
-					align_x: alignment::Horizontal::Center.into(),
-					..Default::default()
+			if text.x {
+				backend.with_save(&mut |backend| {
+					backend.translate(iced::Vector::new(
+						tick_x,
+						tick_y + self.settings.x_label_offset,
+					));
+					backend.rotate(self.settings.x_label_rotation.to_radians());
+					backend.fill_text(Text {
+						content: cat.clone(),
+						position: Point::ORIGIN,
+						color: self.settings.chrome.tick_label_text.iced(),
+						size: iced::Pixels(self.settings.x_tick_size),
+						align_x: alignment::Horizontal::Center.into(),
+						..Default::default()
+					});
 				});
-			});
+			}
 		}
 		for (i, cat) in y_categories.iter().enumerate() {
 			let (p, bw, _bh) = transform.categorical_2d(0, i);
@@ -1840,15 +1893,17 @@ impl<'a> PlotWidget<'a> {
 				},
 				axis_stroke,
 			);
-			backend.fill_text(Text {
-				content: cat.clone(),
-				position: Point::new(tick_x - 10.0, tick_y),
-				color: self.settings.chrome.tick_label_text.iced(),
-				size: iced::Pixels(self.settings.y_tick_size),
-				align_x: alignment::Horizontal::Right.into(),
-				align_y: alignment::Vertical::Center,
-				..Default::default()
-			});
+			if text.y {
+				backend.fill_text(Text {
+					content: cat.clone(),
+					position: Point::new(tick_x - 10.0, tick_y),
+					color: self.settings.chrome.tick_label_text.iced(),
+					size: iced::Pixels(self.settings.y_tick_size),
+					align_x: alignment::Horizontal::Right.into(),
+					align_y: alignment::Vertical::Center,
+					..Default::default()
+				});
+			}
 		}
 	}
 
@@ -1859,6 +1914,7 @@ impl<'a> PlotWidget<'a> {
 		transform: &CoordinateTransformer,
 		dimensions: &[String],
 		ranges: &[(f64, f64)],
+		text: AxisTextVisibility,
 	) {
 		let halo_stroke = Stroke {
 			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
@@ -1897,15 +1953,17 @@ impl<'a> PlotWidget<'a> {
 					},
 					tick_stroke,
 				);
-				backend.fill_text(Text {
-					content: format_label(data_y, AxisType::Linear),
-					position: Point::new(p.x - 14.0, p.y),
-					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.y_tick_size),
-					align_x: alignment::Horizontal::Right.into(),
-					align_y: alignment::Vertical::Center,
-					..Default::default()
-				});
+				if text.y {
+					backend.fill_text(Text {
+						content: format_label(data_y, AxisType::Linear),
+						position: Point::new(p.x - 14.0, p.y),
+						color: self.settings.chrome.tick_label_text.iced(),
+						size: iced::Pixels(self.settings.y_tick_size),
+						align_x: alignment::Horizontal::Right.into(),
+						align_y: alignment::Vertical::Center,
+						..Default::default()
+					});
+				}
 			}
 			if self.settings.show_y_minor_ticks && self.settings.y_minor_ticks > 0 {
 				for data_y in self.minor_tick_positions(
@@ -1923,15 +1981,17 @@ impl<'a> PlotWidget<'a> {
 					);
 				}
 			}
-			backend.fill_text(Text {
-				content: dim.clone(),
-				position: Point::new(top_px.x, top_px.y - 20.0),
-				color: self.settings.chrome.axis_label_text.iced(),
-				size: iced::Pixels(22.0),
-				align_x: alignment::Horizontal::Center.into(),
-				align_y: alignment::Vertical::Bottom,
-				..Default::default()
-			});
+			if text.x {
+				backend.fill_text(Text {
+					content: dim.clone(),
+					position: Point::new(top_px.x, top_px.y - 20.0),
+					color: self.settings.chrome.axis_label_text.iced(),
+					size: iced::Pixels(22.0),
+					align_x: alignment::Horizontal::Center.into(),
+					align_y: alignment::Vertical::Bottom,
+					..Default::default()
+				});
+			}
 		}
 	}
 }

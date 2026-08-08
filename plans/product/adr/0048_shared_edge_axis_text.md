@@ -62,6 +62,13 @@ label space **once**: a left gutter sized for y tick labels and title, a
 bottom gutter for x, with the cells tiled in the remaining area. Edge cells'
 tick labels render in the gutters, aligned to their cells.
 
+The existing per-cell top reservation remains because it belongs to the
+non-deduplicable panel label, and the right breathing room remains part of
+each cell's frame. Only the repeated left and bottom reservations are
+reclaimed. Both retained reservations are identical in every slot, so they
+preserve congruence rather than weakening it; this is also why the expected
+top-edge stop condition below does not fire in this cut.
+
 One placement follows from occupancy rather than from the gutters: a cell
 whose below-slot is empty — the columns that outlast a partial final row —
 draws its x text **into that empty slot**, directly beneath itself, not a
@@ -197,3 +204,9 @@ congruence outranks tightness.
   four-exhibit overlay docket.
 - The gutter model gives any future outer-edge chrome — a shared color bar,
   a figure-level size legend — a place to land that already exists.
+- This is the first substrate cut in the arc that does not pay to bank a new
+  parity oracle. Gate 1 consumes `grid.rs`'s existing
+  `bank_unfaceted_one_cell_parity_oracle`, landed by PRODUCT-0042 before that
+  record routed ordinary figures through the grid. The discipline compounds:
+  0048 changes every multi-cell layout while inheriting a safety net built
+  two cuts earlier.
