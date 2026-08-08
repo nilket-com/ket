@@ -961,7 +961,7 @@ fn provenance_method_on_relation(
 			origin,
 			sinks: vec![parse_sugar_sink(PlotType::Scatter, call, args, source)?],
 		})),
-		"bar" if args.len() == 2 => Ok(Some(ExpressionProvenance::ViewSet {
+		"bar" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
 			root,
 			origin,
@@ -1134,7 +1134,7 @@ fn parse_contextual_sink_inner(
 		"figure" => {
 			RuneViewIntent::Plot(parse_figure(expression, &args, source, literal_bindings)?)
 		}
-		"bar" if args.len() == 2 => {
+		"bar" if matches!(args.len(), 2 | 3) => {
 			let Some(sink) = plot_sink_fields(PlotType::Bar, source, &args, 0)? else {
 				return invalid_view(
 					expression.span(),
@@ -1179,7 +1179,7 @@ fn parse_contextual_sink_inner(
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"bar(...) takes x and y string fields",
+				"bar(...) takes x and y strings with an optional series",
 			);
 		}
 		"line" => {
@@ -2041,7 +2041,7 @@ fn parse_figure_body(
 		Ok(RunePlotBody::Single(sink))
 	};
 	match callee {
-		"bar" if args.len() == 2 => single(PlotType::Bar, "bar fields must be strings"),
+		"bar" if matches!(args.len(), 2 | 3) => single(PlotType::Bar, "bar fields must be strings"),
 		"line" if args.len() == 2 => single(PlotType::Line, "line fields must be strings"),
 		"scatter" if matches!(args.len(), 2 | 3) => {
 			single(PlotType::Scatter, "scatter fields must be strings")
@@ -2064,10 +2064,15 @@ fn parse_figure_body(
 			source.len(),
 			"view(...) wraps a figure; it cannot appear inside one",
 		),
-		"bar" | "line" => invalid_view(
+		"bar" => invalid_view(
 			expression.span(),
 			source.len(),
-			format!("{callee}(...) takes x and y string fields"),
+			"bar(...) takes x and y strings with an optional series",
+		),
+		"line" => invalid_view(
+			expression.span(),
+			source.len(),
+			"line(...) takes x and y string fields",
 		),
 		"scatter" => invalid_view(
 			expression.span(),
@@ -2438,11 +2443,22 @@ fn parse_modified_mark(
 			);
 		}
 	};
-	if !matches!(args.len(), 2 | 3) || (plot_type != PlotType::Scatter && args.len() != 2) {
+	// PRODUCT-0046 §1: a register belongs to the mark, so every encoding form of
+	// that mark admits it. Line has one form; bar and scatter each take an
+	// optional third color field.
+	let arity_ok = match plot_type {
+		PlotType::Line => args.len() == 2,
+		_ => matches!(args.len(), 2 | 3),
+	};
+	if !arity_ok {
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"a modified scatter takes x and y string fields, with one optional category color field",
+			match plot_type {
+				PlotType::Line => "a modified line takes x and y string fields",
+				PlotType::Bar => "a modified bar takes x and y strings with an optional series",
+				_ => "a modified scatter takes x and y strings with an optional category",
+			},
 		);
 	}
 	match plot_type {
@@ -2540,8 +2556,8 @@ fn parse_sugar_sink(
 	source: &str,
 ) -> Result<ParsedSink, RuneEnvelopeError> {
 	let valid_arity = match plot_type {
-		PlotType::Bar | PlotType::Line => args.len() == 2,
-		PlotType::Scatter => matches!(args.len(), 2 | 3),
+		PlotType::Line => args.len() == 2,
+		PlotType::Bar | PlotType::Scatter => matches!(args.len(), 2 | 3),
 		_ => false,
 	};
 	if !valid_arity {
@@ -2549,7 +2565,7 @@ fn parse_sugar_sink(
 			PlotType::Scatter => {
 				"scatter view sugar requires x and y strings with an optional category"
 			}
-			PlotType::Bar => "bar view sugar requires x and y string fields",
+			PlotType::Bar => "bar view sugar requires x and y strings with an optional series",
 			PlotType::Line => "line view sugar requires x and y string fields",
 			_ => unreachable!("only Rune plot view forms reach sugar parsing"),
 		};
@@ -2684,7 +2700,7 @@ fn recognize_view_root(
 		"table" if !shadows.table && args.len() == 1 => {
 			(RuneViewIntent::Table(RuneTableSink::default()), args[0])
 		}
-		"plot.bar" if !shadows.plot && args.len() == 3 => (
+		"plot.bar" if !shadows.plot && matches!(args.len(), 3 | 4) => (
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(match plot_sink(
 				PlotType::Bar,
 				source,
@@ -4428,6 +4444,98 @@ workspace.table("t").views([figure([
 				layer.settings.point_size,
 				Override::Set(PointSize::new(2.0).expect("accepted factor"))
 			);
+		}
+	}
+
+	fn product_0047_single_sink(source: &str) -> DisposableRunePlotSink {
+		let transformed = transform(source).expect("series bar envelope");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("plot intent");
+		};
+		match &plot.body {
+			RunePlotBody::Single(sink) => sink.clone(),
+			RunePlotBody::StyledSingle(styled) => styled.sink.clone(),
+			other => panic!("standalone bar body, got {other:?}"),
+		}
+	}
+
+	#[test]
+	fn product_0047_three_field_bar_normalizes_across_all_three_spellings() {
+		// PRODUCT-0008 §2: the spellings are exact projections of one normal form.
+		let free = product_0047_single_sink(
+			"plot.bar(workspace.table(\"t\"), \"cat\", \"val\", \"series\")",
+		);
+		let sugar =
+			product_0047_single_sink("workspace.table(\"t\").bar(\"cat\", \"val\", \"series\")");
+		let canonical = product_0047_single_sink(
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", \"series\")])",
+		);
+		let figure = product_0047_single_sink(
+			"workspace.table(\"t\").views([figure([bar(\"cat\", \"val\", \"series\")])])",
+		);
+		assert_eq!(free, sugar);
+		assert_eq!(free, canonical);
+		assert_eq!(free, figure);
+		assert_eq!(
+			(free.x.as_str(), free.y.as_str(), free.category.as_deref()),
+			("cat", "val", Some("series"))
+		);
+		assert_eq!(free.composition.primary_plot_type(), PlotType::Bar);
+	}
+
+	#[test]
+	fn product_0047_two_field_bar_is_unchanged_at_every_spelling() {
+		for source in [
+			"plot.bar(workspace.table(\"t\"), \"cat\", \"val\")",
+			"workspace.table(\"t\").bar(\"cat\", \"val\")",
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\")])",
+			"workspace.table(\"t\").views([figure([bar(\"cat\", \"val\")])])",
+		] {
+			let sink = product_0047_single_sink(source);
+			assert_eq!(sink.category, None, "two-field bar names no color channel");
+			assert_eq!((sink.x.as_str(), sink.y.as_str()), ("cat", "val"));
+		}
+	}
+
+	#[test]
+	fn product_0047_series_bar_inherits_the_bar_width_register() {
+		// PRODUCT-0046 §1's first new-form application: the register belongs to
+		// the mark, so the new encoding form admits it without a new record.
+		let transformed = transform(
+			"workspace.table(\"t\").views([figure([bar(\"cat\", \"val\", \"series\").bar_width(0.5)])])",
+		)
+		.expect("styled series bar envelope");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("plot intent");
+		};
+		let RunePlotBody::StyledSingle(styled) = &plot.body else {
+			panic!("styled standalone bar");
+		};
+		assert_eq!(styled.sink.category.as_deref(), Some("series"));
+		assert_eq!(
+			styled.settings.bar_width,
+			Override::Set(BarWidth::new(0.5).expect("accepted fraction"))
+		);
+		assert!(styled.clone().into_layer().is_err());
+	}
+
+	#[test]
+	fn product_0047_series_bar_refusals_are_inherited_unchanged() {
+		// Wrong arity, non-literal fields, and the layers admission all refuse
+		// exactly as they did at two fields.
+		for source in [
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", \"series\", \"extra\")])",
+			"workspace.table(\"t\").views([figure([bar(\"cat\", \"val\", \"series\", \"extra\")])])",
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", series)])",
+			"workspace.table(\"t\").views([layers([bar(\"cat\", \"val\", \"series\")])])",
+			"workspace.table(\"t\").views([layers([bar(\"cat\", \"val\")])])",
+			"workspace.table(\"t\").views([figure([bar(\"cat\", \"val\", \"series\").point_size(2.0)])])",
+		] {
+			let error = transform(source).expect_err("inherited refusal");
+			let RuneEnvelopeError::InvalidView { span, .. } = error else {
+				panic!("span-attributed refusal for {source}: {error:?}");
+			};
+			assert!(span.start < span.end, "refusal names its span");
 		}
 	}
 

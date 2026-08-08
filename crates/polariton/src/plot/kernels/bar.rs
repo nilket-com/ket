@@ -2,7 +2,7 @@ use crate::plot::common::{
 	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use crate::plot::legend::LegendProvenance;
-use crate::plot::spec::{BandFillAssignment, LayerSettings};
+use crate::plot::spec::{BandFillAssignment, CategoryColorAssignment, LayerSettings};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
 use iced::{Color, Rectangle};
@@ -15,6 +15,29 @@ pub struct BarPlotKernel {
 	pub orientation: Orientation,
 	pub layer_settings: LayerSettings,
 	pub band_fills: Vec<BandFillAssignment>,
+	/// PRODUCT-0029 §1: the renderer consumes only resolved colors. An authored
+	/// categorical channel supplies one assignment per series; sampling
+	/// `ColorTheme` by render index is the sin that record's Rejected list names.
+	pub group_colors: Vec<CategoryColorAssignment>,
+}
+
+impl BarPlotKernel {
+	/// The exact resolved colour of one series, when an authored channel
+	/// assigned one. Bars with neither band fill nor an authored channel keep
+	/// the legacy single-treatment ramp sample.
+	fn group_color(&self, group_index: usize) -> Option<Color> {
+		let name = self.prepared_data.group_names.get(group_index)?;
+		let assignment = self
+			.group_colors
+			.iter()
+			.find(|assignment| assignment.category == *name)?;
+		Some(Color::from_rgba8(
+			assignment.color.red,
+			assignment.color.green,
+			assignment.color.blue,
+			assignment.color.alpha as f32 / u8::MAX as f32,
+		))
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -182,6 +205,8 @@ impl PlotKernel for BarPlotKernel {
 					assignment.color.blue,
 					assignment.color.alpha as f32 / u8::MAX as f32,
 				)
+			} else if let Some(resolved) = self.group_color(bar.group_index) {
+				resolved
 			} else {
 				let t = if num_groups > 1 {
 					bar.group_index as f32 / (num_groups - 1) as f32
@@ -242,10 +267,12 @@ impl PlotKernel for BarPlotKernel {
 			.iter()
 			.enumerate()
 			.map(|(i, name)| {
-				let color = settings.color_theme.get_color(if total > 1 {
-					i as f32 / (total - 1) as f32
-				} else {
-					0.5
+				let color = self.group_color(i).unwrap_or_else(|| {
+					settings.color_theme.get_color(if total > 1 {
+						i as f32 / (total - 1) as f32
+					} else {
+						0.5
+					})
 				});
 				(name.clone(), color)
 			});

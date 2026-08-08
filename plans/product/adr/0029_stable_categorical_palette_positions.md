@@ -248,6 +248,17 @@ If a bar has an authored categorical color channel, that encoding is
 authoritative. Its categories receive ordinary color-channel assignments and
 band fill is absent. No bar has two competing color sources.
 
+The kernel obligation spelled out above for band fill was always §1's general
+rule — "the renderer consumes only those resolved colors" — and it binds the
+authored channel identically: the bar kernel draws each group from its exact
+category assignment and does not sample `ColorTheme` by `t`. (Clause stated
+2026-08-07, when PRODUCT-0047 made the grouped form spellable and its first
+live figure showed the marks sampling the legacy ramp — the path was
+unreachable from source when this record was accepted, its halt fired per
+0047's stop condition, and this is the 0019-under-0020 amendment: the record
+corrected under its own invariant, with the correction landing in the surface
+commit.)
+
 This distinction preserves PRODUCT-0007 §2: styling bands is not a resolver-
 originated repetition into a color channel. A later authored color channel may
 name the same field deliberately, and that authored encoding remains legal.

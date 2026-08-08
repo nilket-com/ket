@@ -1309,6 +1309,92 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0047_faceted_series_cells_keep_their_own_stable_colors() {
+		// PRODUCT-0041 §11 with PRODUCT-0029 §1: faceting by the series field
+		// gives every cell one series, and each cell paints that series' stable
+		// assignment. Cells share one resolved body whose assignments span the
+		// whole domain, so the colour is panel-blind by construction — never a
+		// per-cell re-derivation and never a render-index ramp sample.
+		use crate::plot::spec::{
+			CategoricalPaletteSelection, ColorIdentity, resolve_channels,
+			resolve_domains_with_categorical_palette,
+		};
+
+		let frame = df!(
+			"cat" => ["A", "B", "A", "B", "A", "B", "A", "B"],
+			"series" => ["w", "w", "x", "x", "y", "y", "z", "z"],
+			"val" => [1.0_f64, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+		)
+		.expect("faceted series frame");
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"cat",
+			"val",
+			Some("series".to_owned()),
+		);
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("channels");
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0047".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").expect("palette");
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.expect("series bar resolution");
+		let assignments = resolved
+			.channel(Channel::Color)
+			.expect("authored channel")
+			.colors
+			.clone();
+		assert_eq!(assignments.len(), 4, "the domain spans every cell");
+
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved),
+			&stamped,
+			"series",
+			GridArrangement::new(2, 2).expect("arrangement"),
+		)
+		.expect("faceted grid");
+		let kernel = PlotGridKernel::from_grid(grid, 800, 600);
+		let model = PlotSettings::default();
+		let mut backend = SvgBackend::new(800.0, 600.0);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
+		);
+		let svg = backend.finish();
+
+		for assignment in &assignments {
+			let fill = format!(
+				"fill=\"rgb({}, {}, {})\"",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert!(
+				svg.contains(&fill),
+				"cell {} must paint its own stable {fill}",
+				assignment.category
+			);
+		}
+	}
+
+	#[test]
 	fn four_cell_value_facet_renders_four_regions() {
 		let (body, _data, stamped) = fixture();
 		let data = Arc::new(

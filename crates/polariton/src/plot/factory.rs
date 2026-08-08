@@ -22,9 +22,10 @@ use crate::plot::kernels::stacked_area::{self, StackedAreaPlotKernel};
 use crate::plot::kernels::stacked_bar::{self, StackedBarPlotKernel};
 use crate::plot::kernels::violin::{self, ViolinPlotKernel};
 use crate::plot::spec::{
-	BandFillAssignment, Channel, LayerMark, LayerSettings, LayeredPlotSpec, NonEmpty,
-	PlotProvenance, ResolvedKernelFields, ResolvedLayerSpec, ResolvedLayout, ResolvedPlotSpec,
-	StampedResult, resolve_layered_channels, resolve_layered_domains,
+	BandFillAssignment, CategoryColorAssignment, Channel, LayerMark, LayerSettings,
+	LayeredPlotSpec, NonEmpty, PlotProvenance, ResolvedKernelFields, ResolvedLayerSpec,
+	ResolvedLayout, ResolvedPlotSpec, StampedResult, resolve_layered_channels,
+	resolve_layered_domains,
 };
 use polars::frame::DataFrame;
 use std::sync::Arc;
@@ -71,6 +72,7 @@ pub fn create_plot(
 			plot_type,
 			LayerSettings::default(),
 			&spec.band_fills,
+			resolved_group_colors(spec),
 		),
 		ResolvedKernelFields::Scatter { color, x, y } => {
 			let scatter_data = Arc::new(scatter::prepare_scatter_data_resolved(
@@ -234,6 +236,7 @@ fn create_bar_kernel(
 	plot_type: PlotType,
 	layer_settings: LayerSettings,
 	band_fills: &[BandFillAssignment],
+	group_colors: &[CategoryColorAssignment],
 ) -> Arc<dyn PlotKernel + Send + Sync> {
 	Arc::new(BarPlotKernel {
 		prepared_data: Arc::new(bar::prepare_bar_data(df, category, group, value)),
@@ -244,7 +247,16 @@ fn create_bar_kernel(
 		},
 		layer_settings,
 		band_fills: band_fills.to_vec(),
+		group_colors: group_colors.to_vec(),
 	})
+}
+
+/// PRODUCT-0029 §1: the exact assignments an authored categorical channel wrote
+/// into the resolved artifact, empty when no such channel exists.
+fn resolved_group_colors(spec: &ResolvedPlotSpec) -> &[CategoryColorAssignment] {
+	spec.channel(Channel::Color)
+		.map(|channel| channel.colors.as_slice())
+		.unwrap_or(&[])
 }
 
 /// Build a standalone mark with PRODUCT-0007 Layer-stage settings without
@@ -278,6 +290,7 @@ pub fn create_styled_plot(
 			plot_type,
 			layer_settings,
 			&spec.band_fills,
+			resolved_group_colors(spec),
 		)),
 		_ => Err("standalone Layer settings are not implemented for this plot mark".to_owned()),
 	}
@@ -537,6 +550,7 @@ mod product_0013_baseline_tests {
 				orientation,
 				layer_settings: LayerSettings::default(),
 				band_fills: Vec::new(),
+				group_colors: Vec::new(),
 			};
 			let rendered = render_marks(&kernel);
 			assert_eq!(rendered, expected);
@@ -589,6 +603,182 @@ mod product_0013_baseline_tests {
 		}
 	}
 
+	fn product_0047_resolved(frame: &DataFrame, series: &str) -> ResolvedPlotSpec {
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"cat",
+			"val",
+			Some(series.to_owned()),
+		);
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("channels");
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0047".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").expect("palette");
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.expect("series bar resolution");
+		resolved
+	}
+
+	#[test]
+	fn product_0047_series_bar_groups_by_channel_and_suppresses_band_fills() {
+		// PRODUCT-0029 §6: the authored channel is authoritative, band fill absent.
+		let frame = df!(
+			"cat" => ["A", "A", "B", "B", "C", "C", "D", "D"],
+			"series" => ["x", "y", "x", "y", "x", "y", "x", "y"],
+			"val" => [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+		)
+		.expect("series bar frame");
+		let resolved = product_0047_resolved(&frame, "series");
+		assert!(
+			resolved.channel(Channel::Color).is_some(),
+			"the series field resolves as an authored color channel"
+		);
+		assert!(
+			resolved.band_fills.is_empty(),
+			"an authored channel suppresses band fill (PRODUCT-0029 §6)"
+		);
+
+		let ResolvedKernelFields::Bar { group, .. } = &*resolved.kernel_fields else {
+			panic!("bar kernel fields");
+		};
+		assert_eq!(
+			group.as_deref(),
+			Some("series"),
+			"the color channel supplies the grouping column"
+		);
+
+		// Four categories x two series occupy eight distinct subgroup slots.
+		let svg = render_marks(create_plot(&resolved, &frame, 400, 100).as_ref());
+		assert_eq!(
+			svg.matches("<path").count(),
+			8,
+			"one rectangle per bar:\n{svg}"
+		);
+
+		// PRODUCT-0029 §1: the renderer consumes only the resolved colors. Every
+		// painted fill is one of the authored channel's exact assignments, and
+		// none is a render-index sample of the legacy ramp.
+		let assignments = &resolved
+			.channel(Channel::Color)
+			.expect("authored channel")
+			.colors;
+		assert_eq!(assignments.len(), 2, "one assignment per series");
+		for assignment in assignments {
+			let fill = format!(
+				"fill=\"rgb({}, {}, {})\"",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert!(
+				svg.contains(&fill),
+				"series {} must paint its resolved {fill}:\n{svg}",
+				assignment.category
+			);
+		}
+		let legacy = ResolvedPlotSettings::default().color_theme;
+		for index in 0..2 {
+			let sampled = legacy.get_color(index as f32);
+			let ramp = format!(
+				"fill=\"rgb({}, {}, {})\"",
+				(sampled.r * 255.0).round() as u8,
+				(sampled.g * 255.0).round() as u8,
+				(sampled.b * 255.0).round() as u8
+			);
+			assert!(
+				!svg.contains(&ramp),
+				"a grouped bar must not sample the legacy ramp at index {index}:\n{svg}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0047_single_valued_series_still_suppresses_band_fills() {
+		// Suppression keys on channel presence, never on series cardinality: a
+		// one-value series field is N = 1 *with* a channel, unlike the two-field
+		// bar's N = 1 without one.
+		let frame = df!(
+			"cat" => ["A", "B", "C"],
+			"series" => ["only", "only", "only"],
+			"val" => [1.0, 2.0, 3.0]
+		)
+		.expect("single-series frame");
+		let resolved = product_0047_resolved(&frame, "series");
+		assert!(resolved.channel(Channel::Color).is_some());
+		assert!(
+			resolved.band_fills.is_empty(),
+			"cardinality one is still an authored channel"
+		);
+	}
+
+	#[test]
+	fn product_0047_series_bar_earns_the_legend_the_two_field_form_declines() {
+		// PRODUCT-0044 §5 both halves: the authored channel names identities the
+		// axis does not, so this form earns entries; the band-filled form does not.
+		let series_frame = df!(
+			"cat" => ["A", "A", "B", "B"],
+			"series" => ["x", "y", "x", "y"],
+			"val" => [1.0, 2.0, 3.0, 4.0]
+		)
+		.expect("series bar frame");
+		let resolved = product_0047_resolved(&series_frame, "series");
+		let kernel = create_plot(&resolved, &series_frame, 200, 100);
+		let settings = ResolvedPlotSettings::default();
+		let content = kernel
+			.legend_content(&settings)
+			.expect("a series bar earns a legend");
+		let crate::plot::legend::LegendSection::Entries(entries) = content.0.first() else {
+			panic!("series legend must have entries");
+		};
+		assert_eq!(
+			entries
+				.iter()
+				.map(|entry| entry.label.as_str())
+				.collect::<Vec<_>>(),
+			["x", "y"],
+			"entries are the series values in display-domain order"
+		);
+		assert!(
+			entries
+				.iter()
+				.all(|entry| entry.provenance == crate::plot::legend::LegendProvenance::Named),
+			"series names come from the data, so they survive PRODUCT-0044 §1"
+		);
+
+		let band_frame = df!("cat" => ["A", "B"], "val" => [1.0, 2.0]).expect("band frame");
+		let authored = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "cat", "val");
+		let binding = resolve_channels(&authored, band_frame.schema().as_ref()).expect("channels");
+		let stamped = StampedResult {
+			data: Arc::new(band_frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0047".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").expect("palette");
+		let (band_resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.expect("band bar resolution");
+		assert!(
+			create_plot(&band_resolved, &band_frame, 200, 100)
+				.legend_content(&settings)
+				.is_none(),
+			"the two-field bar keeps its legend-free default"
+		);
+	}
+
 	fn styled_bar(orientation: Orientation, fraction: f32) -> BarPlotKernel {
 		BarPlotKernel {
 			prepared_data: Arc::new(bar::prepare_bar_data(&bar_fixture(), "cat", "", "val")),
@@ -598,6 +788,7 @@ mod product_0013_baseline_tests {
 				..LayerSettings::default()
 			},
 			band_fills: Vec::new(),
+			group_colors: Vec::new(),
 		}
 	}
 
@@ -1097,6 +1288,7 @@ mod product_0013_baseline_tests {
 					alpha: 255,
 				},
 			}],
+			group_colors: Vec::new(),
 		};
 		assert!(
 			kernel
@@ -1119,6 +1311,7 @@ mod product_0013_baseline_tests {
 			orientation: Orientation::Vertical,
 			layer_settings: LayerSettings::default(),
 			band_fills: Vec::new(),
+			group_colors: Vec::new(),
 		};
 		let content = grouped
 			.legend_content(&ResolvedPlotSettings::default())
