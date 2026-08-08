@@ -61,6 +61,23 @@ workspace.table("events").views([
 `.show_types()` composes in either order with the table's `.skin(...)` and
 `.duotone()` members.
 
+#### Rune bar presentation:
+
+Grouped bars can reserve normalized space between category clusters without
+changing the spacing model inside each series slot:
+
+```rune
+workspace.table("sales").views([
+    bar("region", "revenue", "product")
+        .bar_width(0.9)
+        .category_gap(0.2),
+])
+```
+
+`category_gap` accepts values from `0.0` (the unchanged default) up to, but not
+including, `1.0`. The reserve stays centered on each categorical label and
+scales with the plot.
+
 #### Adapters:
  - SQLite (file or memory)
  - Parquet (single file)

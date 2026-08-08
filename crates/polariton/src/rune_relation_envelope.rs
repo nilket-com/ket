@@ -11,8 +11,8 @@ use crate::plot::common::TickPlacement;
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
-	BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, LegendPosition, Override,
-	PointSize, Presence, StrokeWidth,
+	BarWidth, CategoryGap, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, LegendPosition,
+	Override, PointSize, Presence, StrokeWidth,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -2468,6 +2468,7 @@ fn parse_modified_mark(
 	let mut point_size = None;
 	let mut stroke_width = None;
 	let mut bar_width = None;
+	let mut category_gap = None;
 	loop {
 		let ast::Expr::Call(call) = current else {
 			return invalid_view(
@@ -2541,12 +2542,33 @@ fn parse_modified_mark(
 					}
 				})?);
 			}
+			"category_gap" => {
+				if category_gap.is_some() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"category_gap(...) may appear at most once on a mark",
+					);
+				}
+				let fraction =
+					parse_layer_modifier_factor(call, expression, source, "category_gap")?;
+				let modifier_span = u32_range(
+					&byte_range(expression.span(), source.len())?,
+					"category-gap modifier",
+				)?;
+				category_gap = Some(CategoryGap::new(fraction).map_err(|error| {
+					RuneEnvelopeError::InvalidView {
+						span: modifier_span,
+						message: error.to_string(),
+					}
+				})?);
+			}
 			_ => {
 				return invalid_view(
 					expression.span(),
 					source.len(),
 					format!(
-						"unknown layer modifier {modifier:?}; expected point_size(number), stroke_width(number), or bar_width(number)"
+						"unknown layer modifier {modifier:?}; expected point_size(number), stroke_width(number), bar_width(number), or category_gap(number)"
 					),
 				);
 			}
@@ -2622,6 +2644,13 @@ fn parse_modified_mark(
 				"bar_width(...) is available on bar marks, not line or scatter marks",
 			);
 		}
+		PlotType::Line | PlotType::Scatter if category_gap.is_some() => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"category_gap(...) is available on bar marks, not line or scatter marks",
+			);
+		}
 		_ => {}
 	}
 	let mut fields = Vec::with_capacity(args.len());
@@ -2647,6 +2676,7 @@ fn parse_modified_mark(
 			point_size: point_size.map_or(Override::Inherit, Override::Set),
 			stroke_width: stroke_width.map_or(Override::Inherit, Override::Set),
 			bar_width: bar_width.map_or(Override::Inherit, Override::Set),
+			category_gap: category_gap.map_or(Override::Inherit, Override::Set),
 		},
 	}))
 }
@@ -5066,6 +5096,7 @@ workspace.table("t").views([figure([
 			assert_eq!(styled.sink.category, None);
 			assert_eq!(styled.settings.point_size, Override::Inherit);
 			assert_eq!(styled.settings.stroke_width, Override::Inherit);
+			assert_eq!(styled.settings.category_gap, Override::Inherit);
 			assert_eq!(
 				styled.settings.bar_width,
 				Override::Set(BarWidth::new(0.5).unwrap())
@@ -5148,6 +5179,93 @@ workspace.table("t").views([table()])
 				.source
 				.contains("bar(\"a\", \"b\").bar_width(0.7)")
 		);
+	}
+
+	#[test]
+	fn product_0053_category_gap_flattens_across_bar_forms_and_modifier_order() {
+		for source in [
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\").category_gap(0.2)])",
+			"workspace.table(\"t\").views([figure([bar(\"cat\", \"val\", \"series\").category_gap(0.2)])])",
+		] {
+			let styled = product_0022_only_bar(source);
+			assert_eq!(styled.sink.composition.primary_plot_type(), PlotType::Bar);
+			assert_eq!(
+				styled.settings.category_gap,
+				Override::Set(CategoryGap::new(0.2).unwrap())
+			);
+			assert_eq!(styled.settings.bar_width, Override::Inherit);
+			assert!(styled.clone().into_layer().is_err());
+		}
+
+		let width_then_gap = product_0022_only_bar(
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", \"series\").bar_width(0.5).category_gap(0.2)])",
+		);
+		let gap_then_width = product_0022_only_bar(
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", \"series\").category_gap(0.2).bar_width(0.5)])",
+		);
+		assert_eq!(width_then_gap, gap_then_width);
+		assert_eq!(
+			width_then_gap.settings.bar_width,
+			Override::Set(BarWidth::new(0.5).unwrap())
+		);
+		assert_eq!(
+			width_then_gap.settings.category_gap,
+			Override::Set(CategoryGap::new(0.2).unwrap())
+		);
+	}
+
+	#[test]
+	fn product_0053_category_gap_bounds_receivers_and_context_are_closed() {
+		for fraction in ["0.0", "0.000001", "0.2", "0.999999"] {
+			let source = format!(
+				"workspace.table(\"t\").views([bar(\"cat\", \"val\").category_gap({fraction})])"
+			);
+			let styled = product_0022_only_bar(&source);
+			let Override::Set(gap) = styled.settings.category_gap else {
+				panic!("accepted category gap must be set")
+			};
+			assert_eq!(gap.fraction(), fraction.parse::<f32>().unwrap());
+		}
+
+		for rejected in [
+			"category_gap()",
+			"category_gap(0.2, 0.3)",
+			"category_gap(gap)",
+			"category_gap(0.1 + 0.1)",
+			"category_gap(-0.1)",
+			"category_gap(1.0)",
+			"category_gap(1.01)",
+			"category_gap(0.2).category_gap(0.3)",
+		] {
+			let source =
+				format!("workspace.table(\"t\").views([bar(\"cat\", \"val\").{rejected}])");
+			assert!(transform(&source).is_err(), "accepted {rejected}");
+		}
+
+		for rejected in [
+			"line(\"x\", \"y\").category_gap(0.2)",
+			"scatter(\"x\", \"y\").category_gap(0.2)",
+		] {
+			let source = format!("workspace.table(\"t\").views([{rejected}])");
+			assert!(transform(&source).is_err(), "accepted {rejected}");
+		}
+		let layered =
+			"workspace.table(\"t\").views([layers([bar(\"cat\", \"val\").category_gap(0.2)])])";
+		assert!(
+			transform(layered)
+				.expect_err("bar remains outside LayerMark")
+				.to_string()
+				.contains("not a shared-Cartesian layer")
+		);
+
+		let source = r#"
+let styled = bar("cat", "val").category_gap(0.2);
+consume(bar("a", "b").category_gap(0.4));
+workspace.table("t").views([table()])
+"#;
+		let transformed = transform(source).expect("unproven modifiers remain Rune");
+		assert!(transformed.source.contains("category_gap(0.2)"));
+		assert!(transformed.source.contains("category_gap(0.4)"));
 	}
 
 	#[test]

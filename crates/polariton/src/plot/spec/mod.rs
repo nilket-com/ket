@@ -226,6 +226,48 @@ impl fmt::Display for BarWidthError {
 
 impl std::error::Error for BarWidthError {}
 
+/// PRODUCT-0053's normalized reserve outside one centered category cluster.
+/// Unlike `BarWidth`, zero is meaningful and one would remove the cluster.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CategoryGap(f32);
+
+// `CategoryGap::new` excludes NaN, so equality is reflexive for every value
+// the private representation can contain.
+impl Eq for CategoryGap {}
+
+impl CategoryGap {
+	pub const DEFAULT: Self = Self(0.0);
+
+	pub fn new(fraction: f32) -> Result<Self, CategoryGapError> {
+		if fraction.is_finite() && (0.0..1.0).contains(&fraction) {
+			Ok(Self(fraction))
+		} else {
+			Err(CategoryGapError { fraction })
+		}
+	}
+
+	pub const fn fraction(self) -> f32 {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct CategoryGapError {
+	fraction: f32,
+}
+
+impl fmt::Display for CategoryGapError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"category gap must be finite, at least 0, and less than 1, got {}",
+			self.fraction
+		)
+	}
+}
+
+impl std::error::Error for CategoryGapError {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AuthoredChannel {
 	Named(String),
@@ -451,6 +493,7 @@ pub struct LayerSettings {
 	pub point_size: Override<PointSize>,
 	pub stroke_width: Override<StrokeWidth>,
 	pub bar_width: Override<BarWidth>,
+	pub category_gap: Override<CategoryGap>,
 }
 
 impl Default for LayerSettings {
@@ -459,6 +502,7 @@ impl Default for LayerSettings {
 			point_size: Override::Inherit,
 			stroke_width: Override::Inherit,
 			bar_width: Override::Inherit,
+			category_gap: Override::Inherit,
 		}
 	}
 }
@@ -3519,5 +3563,21 @@ mod tests {
 		assert_eq!(line.settings.bar_width, Override::Inherit);
 		assert_eq!(scatter.settings.bar_width, Override::Inherit);
 		assert_eq!([LayerMark::Line, LayerMark::Scatter].len(), 2);
+	}
+
+	#[test]
+	fn product_0053_category_gap_is_a_bounded_zero_default_and_constructors_inherit() {
+		assert_eq!(CategoryGap::DEFAULT.fraction(), 0.0);
+		for accepted in [0.0, f32::MIN_POSITIVE, 0.25, 0.999_999] {
+			assert_eq!(CategoryGap::new(accepted).unwrap().fraction(), accepted);
+		}
+		for invalid in [-0.1, 1.0, 1.01, f32::NAN, f32::INFINITY, f32::NEG_INFINITY] {
+			assert!(CategoryGap::new(invalid).is_err(), "accepted {invalid}");
+		}
+
+		let line = LayerSpec::xy(LayerMark::Line, "x", "y");
+		let scatter = LayerSpec::xy(LayerMark::Scatter, "x", "y");
+		assert_eq!(line.settings.category_gap, Override::Inherit);
+		assert_eq!(scatter.settings.category_gap, Override::Inherit);
 	}
 }

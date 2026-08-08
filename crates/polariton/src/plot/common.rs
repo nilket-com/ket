@@ -3,7 +3,9 @@ use crate::gui::messages::PlotMessage;
 use crate::plot::chrome::PlotChrome;
 use crate::plot::colors::ColorTheme;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
-use crate::plot::spec::{BarWidth, LegendPosition, PointSize, ResolvedPresence, StrokeWidth};
+use crate::plot::spec::{
+	BarWidth, CategoryGap, LegendPosition, PointSize, ResolvedPresence, StrokeWidth,
+};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
@@ -439,6 +441,7 @@ pub struct ResolvedPlotSettings {
 	pub point_size: PointSize,
 	pub stroke_width: StrokeWidth,
 	pub bar_width: BarWidth,
+	pub category_gap: CategoryGap,
 }
 
 impl Default for ResolvedPlotSettings {
@@ -503,6 +506,7 @@ impl Default for ResolvedPlotSettings {
 			point_size: PointSize::ONE,
 			stroke_width: StrokeWidth::ONE,
 			bar_width: BarWidth::DEFAULT,
+			category_gap: CategoryGap::DEFAULT,
 		}
 	}
 }

@@ -598,17 +598,24 @@ fn product_0020_extends_the_closed_typed_modifier_register() {
 fn product_0021_bar_width_is_render_state_without_bar_layer_admission() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let bar = std::fs::read_to_string(root.join("plot/kernels/bar.rs")).expect("read bar kernel");
-	let prepared = bar
+	let production = bar
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production bar kernel source");
+	let prepared = production
 		.split("pub struct BarPreparedData {")
 		.nth(1)
 		.and_then(|tail| tail.split("}\n").next())
 		.expect("BarPreparedData body");
 	assert!(
-		!prepared.contains("bar_width") && !prepared.contains("BarWidth"),
-		"bar width must remain render state, not prepared relation data"
+		!prepared.contains("bar_width")
+			&& !prepared.contains("BarWidth")
+			&& !prepared.contains("category_gap")
+			&& !prepared.contains("CategoryGap"),
+		"bar geometry settings must remain render state, not prepared relation data"
 	);
 	assert_eq!(
-		bar.matches("bar_rectangles(transform").count(),
+		production.matches(".bar_rectangles(").count(),
 		2,
 		"paint and hover must consume the same bar rectangle calculation"
 	);
@@ -642,6 +649,30 @@ fn product_0022_bar_width_extends_only_the_closed_styled_single_register() {
 	assert!(
 		!envelope.contains("HashMap<String, LayerModifier"),
 		"the third setting does not authorize open modifier dispatch"
+	);
+}
+
+#[test]
+fn product_0053_category_gap_extends_only_the_bar_register_and_shared_geometry() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	assert!(
+		envelope.contains("\"category_gap\"")
+			&& envelope.contains("CategoryGap::new")
+			&& envelope.contains("category_gap.map_or(Override::Inherit, Override::Set)"),
+		"PRODUCT-0053 must lower the named modifier through the closed typed bar register"
+	);
+	assert!(
+		!envelope.contains("HashMap<String, LayerModifier"),
+		"category gap does not authorize open modifier dispatch"
+	);
+
+	let stacked = std::fs::read_to_string(root.join("plot/kernels/stacked_bar.rs"))
+		.expect("read stacked bar");
+	assert!(
+		!stacked.contains("category_gap") && !stacked.contains("CategoryGap"),
+		"PRODUCT-0053 must not widen the dashboard stacked-bar geometry"
 	);
 }
 

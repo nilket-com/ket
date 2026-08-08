@@ -9,7 +9,7 @@ use crate::plot::chrome::{PlotChrome, PlotChromeProjection};
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode, TickPlacement};
 use crate::plot::spec::{
-	BarWidth, ColorJob, LayerSettings, LegendPosition, Override, PointSize, Presence,
+	BarWidth, CategoryGap, ColorJob, LayerSettings, LegendPosition, Override, PointSize, Presence,
 	ResolvedPresence, StrokeWidth,
 };
 use iced::Color;
@@ -204,6 +204,7 @@ pub struct PlotSettingsLayer {
 	pub point_size: Override<PointSize>,
 	pub stroke_width: Override<StrokeWidth>,
 	pub bar_width: Override<BarWidth>,
+	pub category_gap: Override<CategoryGap>,
 	pub title: Presence<Arc<String>>,
 	pub subtitle: Presence<Arc<String>>,
 	pub x_label: Presence<Arc<String>>,
@@ -241,6 +242,7 @@ impl Default for PlotSettingsLayer {
 			point_size: Override::Inherit,
 			stroke_width: Override::Inherit,
 			bar_width: Override::Inherit,
+			category_gap: Override::Inherit,
 			title: Presence::Inherit,
 			subtitle: Presence::Inherit,
 			x_label: Presence::Inherit,
@@ -403,6 +405,9 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 	if let Override::Set(value) = layer.bar_width {
 		settings.bar_width = value;
 	}
+	if let Override::Set(value) = layer.category_gap {
+		settings.category_gap = value;
+	}
 	apply_presence(&mut settings.title, &layer.title);
 	apply_presence(&mut settings.subtitle, &layer.subtitle);
 	apply_presence(&mut settings.x_label, &layer.x_label);
@@ -419,6 +424,9 @@ fn apply_layer_settings(settings: &mut ResolvedPlotSettings, layer: &LayerSettin
 	}
 	if let Override::Set(value) = layer.bar_width {
 		settings.bar_width = value;
+	}
+	if let Override::Set(value) = layer.category_gap {
+		settings.category_gap = value;
 	}
 }
 
@@ -694,6 +702,45 @@ mod tests {
 		assert_ne!(
 			cascade.resolve_for_layer(&wide).bar_width.fraction(),
 			0.75 * 0.2,
+			"cascade tiers select rather than multiply"
+		);
+	}
+
+	#[test]
+	fn product_0053_category_gap_selects_each_layer_before_pane_override() {
+		let gap = |fraction| CategoryGap::new(fraction).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.category_gap = gap(0.1);
+		cascade.application_theme.category_gap = Override::Set(gap(0.2));
+		cascade.authored_spec.category_gap = Override::Set(gap(0.3));
+		cascade.layer.category_gap = Override::Set(gap(0.4));
+		cascade.pane_override.category_gap = Override::Set(gap(0.5));
+		assert_eq!(cascade.resolve().category_gap, gap(0.5));
+
+		cascade.pane_override.category_gap = Override::Inherit;
+		assert_eq!(cascade.resolve().category_gap, gap(0.4));
+		let close = LayerSettings {
+			category_gap: Override::Set(gap(0.15)),
+			..LayerSettings::default()
+		};
+		let separated = LayerSettings {
+			category_gap: Override::Set(gap(0.7)),
+			..LayerSettings::default()
+		};
+		assert_eq!(cascade.resolve_for_layer(&close).category_gap, gap(0.15));
+		assert_eq!(cascade.resolve_for_layer(&separated).category_gap, gap(0.7));
+
+		cascade.pane_override.category_gap = Override::Set(gap(0.25));
+		assert_eq!(
+			cascade.resolve_for_layer(&separated).category_gap,
+			gap(0.25)
+		);
+		assert_ne!(
+			cascade
+				.resolve_for_layer(&separated)
+				.category_gap
+				.fraction(),
+			0.7 * 0.25,
 			"cascade tiers select rather than multiply"
 		);
 	}

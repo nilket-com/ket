@@ -1,6 +1,6 @@
 # ADR 0053: normalized bar category gap
 
-Status: proposed 2026-08-08. This record adds an opt-in normalized reserve
+Status: accepted 2026-08-08. This record adds an opt-in normalized reserve
 between categorical bar clusters. The default changes no pixels.
 
 ## Context
@@ -136,6 +136,44 @@ change.
 10. Prepared data, domains, axis positions, labels, legend content, color
     identity, placement, facet congruence, and dashboard stacked bars pass
     unchanged.
+
+## Implementation evidence
+
+- `CategoryGap` is a private-representation validated value in `[0, 1)`, with
+  `0` as its named default. `LayerSettings`, the five-tier cascade, and
+  `ResolvedPlotSettings` carry the typed value without multiplication or an
+  open modifier map.
+- The Rune envelope admits `.category_gap(number_literal)` only through the
+  closed standalone bar register. Two- and three-field bars, figure position,
+  either order with `.bar_width`, contextual non-sink Rune, invalid values,
+  duplicate members, cross-register use, and layered-bar refusal are all
+  exercised behaviorally.
+- `bar_rectangles` computes the centered cluster once for both paint and hit.
+  Its geometry tests cover both orientations at categorical extents of 100 and
+  500 pixels. Cluster centroids are compared directly with
+  `CoordinateTransformer::categorical`, while separate gates measure the
+  within-category equation, the between-category equation, half-reserves at
+  both plot edges, exact single-series redundancy, and blank interactive
+  reserve.
+- Eight PRODUCT-0053 behavior tests cover the typed domain, cascade, surface,
+  geometry, resize, composition, and hit semantics. A ninth architecture gate
+  proves the setting stays outside prepared data, both production consumers
+  use shared rectangle geometry, the register stays closed, and dashboard
+  stacked bars do not acquire the setting.
+- Every existing bar draw and SVG oracle passes unchanged. No image, SVG, draw
+  operation, or expected-byte baseline was refreshed, establishing the zero
+  default as a byte-identical premise rather than an inferred formula.
+- `crates/polariton/README.md` documents the grouped-bar spelling, bounds,
+  centered-label invariant, and unchanged default.
+
+One architecture expectation is a premise update: PRODUCT-0021 formerly
+counted the exact one-line spelling `bar_rectangles(transform`, which ceased to
+exist when the second argument formatted the calls across lines. It now scans
+only the production half of the kernel and counts the two method calls, so test
+helpers cannot satisfy the paint-and-hit guard. All 41 architecture gates pass.
+The full workspace suite and `cargo check --workspace --all-targets` pass; its
+Polariton portion is 443 unit tests passed (five live tests ignored), 41
+architecture tests, and the trybuild UI pair.
 
 ## Stop condition
 

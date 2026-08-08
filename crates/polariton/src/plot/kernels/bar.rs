@@ -60,6 +60,7 @@ impl BarPlotKernel {
 		&self,
 		transform: &CoordinateTransformer,
 		width_fraction: f32,
+		category_gap_fraction: f32,
 	) -> Vec<BarRectangle> {
 		let num_cats = self.prepared_data.categories.len();
 		let num_groups = self.prepared_data.group_names.len();
@@ -72,7 +73,9 @@ impl BarPlotKernel {
 					0.0
 				};
 				let band = transform.bounds.width / num_cats as f32;
-				let slot = band / num_groups as f32;
+				let cluster = band * (1.0 - category_gap_fraction);
+				let category_inset = (band - cluster) / 2.0;
+				let slot = cluster / num_groups as f32;
 				let padding = slot * (1.0 - width_fraction) / 2.0;
 				for category_index in 0..num_cats {
 					let category_left = category_index as f32 * band;
@@ -85,7 +88,9 @@ impl BarPlotKernel {
 						let (bottom, _) = transform.categorical(category_index, y_base);
 						bars.push(BarRectangle {
 							rect: Rectangle {
-								x: category_left + group_index as f32 * slot + padding,
+								x: category_left
+									+ category_inset + group_index as f32 * slot
+									+ padding,
 								y: top.y,
 								width: slot * width_fraction,
 								height: (bottom.y - top.y).max(1.0),
@@ -103,7 +108,9 @@ impl BarPlotKernel {
 					0.0
 				};
 				let band = transform.bounds.height / num_cats as f32;
-				let slot = band / num_groups as f32;
+				let cluster = band * (1.0 - category_gap_fraction);
+				let category_inset = (band - cluster) / 2.0;
+				let slot = cluster / num_groups as f32;
 				let padding = slot * (1.0 - width_fraction) / 2.0;
 				for category_index in 0..num_cats {
 					let category_top = (num_cats - 1 - category_index) as f32 * band;
@@ -118,7 +125,9 @@ impl BarPlotKernel {
 						bars.push(BarRectangle {
 							rect: Rectangle {
 								x: left.x,
-								y: category_top + reversed_group as f32 * slot + padding,
+								y: category_top
+									+ category_inset + reversed_group as f32 * slot
+									+ padding,
 								width: (right.x - left.x).max(1.0),
 								height: slot * width_fraction,
 							},
@@ -140,7 +149,11 @@ impl BarPlotKernel {
 	) -> Option<String> {
 		let cursor_pos = cursor.position()?;
 		let hit = self
-			.bar_rectangles(transform, settings.bar_width.fraction())
+			.bar_rectangles(
+				transform,
+				settings.bar_width.fraction(),
+				settings.category_gap.fraction(),
+			)
 			.into_iter()
 			.find(|bar| bar.rect.contains(cursor_pos))?;
 		let category = &self.prepared_data.categories[hit.category_index];
@@ -192,7 +205,11 @@ impl PlotKernel for BarPlotKernel {
 		settings: ResolvedPlotSettings,
 	) {
 		let num_groups = self.prepared_data.group_names.len();
-		for bar in self.bar_rectangles(transform, settings.bar_width.fraction()) {
+		for bar in self.bar_rectangles(
+			transform,
+			settings.bar_width.fraction(),
+			settings.category_gap.fraction(),
+		) {
 			let category = &self.prepared_data.categories[bar.category_index];
 			let color = if let Some(assignment) = self
 				.band_fills
@@ -462,6 +479,53 @@ pub fn prepare_bar_data(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::spec::{BarWidth, CategoryGap};
+	use iced::{Point, Size};
+
+	fn grouped_kernel(orientation: Orientation) -> BarPlotKernel {
+		let frame = polars::df!(
+			"cat" => ["A", "A", "B", "B"],
+			"group" => ["left", "right", "left", "right"],
+			"val" => [10_i64, 11, 20, 21],
+		)
+		.expect("grouped bar fixture");
+		BarPlotKernel {
+			prepared_data: Arc::new(prepare_bar_data(&frame, "cat", "group", "val")),
+			orientation,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+		}
+	}
+
+	fn single_series_kernel(orientation: Orientation) -> BarPlotKernel {
+		let frame = polars::df!(
+			"cat" => ["A", "B"],
+			"val" => [10_i64, 20],
+		)
+		.expect("single-series bar fixture");
+		BarPlotKernel {
+			prepared_data: Arc::new(prepare_bar_data(&frame, "cat", "", "val")),
+			orientation,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+		}
+	}
+
+	fn categorical_interval(rect: Rectangle, orientation: Orientation) -> (f32, f32) {
+		match orientation {
+			Orientation::Vertical => (rect.x, rect.x + rect.width),
+			Orientation::Horizontal => (rect.y, rect.y + rect.height),
+		}
+	}
+
+	fn assert_close(actual: f32, expected: f32) {
+		assert!(
+			(actual - expected).abs() < 0.0001,
+			"expected {expected}, got {actual}"
+		);
+	}
 
 	#[test]
 	fn values_follow_category_identity_after_labels_are_sorted() {
@@ -504,5 +568,138 @@ mod tests {
 		assert_eq!(prepared.categories, ["A", "B"]);
 		assert_eq!(prepared.group_names, ["left", "right"]);
 		assert_eq!(prepared.values, vec![vec![10.0, 11.0], vec![20.0, 21.0]]);
+	}
+
+	#[test]
+	fn product_0053_clusters_follow_transform_centers_and_gap_equations_when_resized() {
+		for orientation in [Orientation::Vertical, Orientation::Horizontal] {
+			for axis_extent in [100.0, 500.0] {
+				let kernel = grouped_kernel(orientation);
+				let bounds = match orientation {
+					Orientation::Vertical => {
+						Rectangle::new(Point::ORIGIN, Size::new(axis_extent, 100.0))
+					}
+					Orientation::Horizontal => {
+						Rectangle::new(Point::ORIGIN, Size::new(100.0, axis_extent))
+					}
+				};
+				let layout = kernel.layout(ResolvedPlotSettings::default());
+				let transform = CoordinateTransformer::new(&layout, bounds);
+				let rectangles = kernel.bar_rectangles(&transform, 0.5, 0.2);
+				let band = axis_extent / 2.0;
+				let slot = band * 0.8 / 2.0;
+				let within = slot * 0.5;
+
+				for category_index in 0..2 {
+					let mut intervals = rectangles
+						.iter()
+						.filter(|bar| bar.category_index == category_index)
+						.map(|bar| categorical_interval(bar.rect, orientation))
+						.collect::<Vec<_>>();
+					intervals.sort_by(|left, right| left.0.total_cmp(&right.0));
+					let cluster_center = (intervals[0].0 + intervals[1].1) / 2.0;
+					let transformed = transform.categorical(category_index, 0.0).0;
+					let transformed_center = match orientation {
+						Orientation::Vertical => transformed.x,
+						Orientation::Horizontal => transformed.y,
+					};
+					assert_close(cluster_center, transformed_center);
+					assert_close(intervals[1].0 - intervals[0].1, within);
+				}
+
+				let mut clusters = (0..2)
+					.map(|category_index| {
+						let intervals = rectangles
+							.iter()
+							.filter(|bar| bar.category_index == category_index)
+							.map(|bar| categorical_interval(bar.rect, orientation))
+							.collect::<Vec<_>>();
+						(
+							intervals
+								.iter()
+								.map(|interval| interval.0)
+								.fold(f32::INFINITY, f32::min),
+							intervals
+								.iter()
+								.map(|interval| interval.1)
+								.fold(f32::NEG_INFINITY, f32::max),
+						)
+					})
+					.collect::<Vec<_>>();
+				clusters.sort_by(|left, right| left.0.total_cmp(&right.0));
+				assert_close(clusters[1].0 - clusters[0].1, band * 0.2 + within);
+			}
+		}
+	}
+
+	#[test]
+	fn product_0053_full_width_isolates_the_centered_category_reserve() {
+		for orientation in [Orientation::Vertical, Orientation::Horizontal] {
+			let kernel = grouped_kernel(orientation);
+			let layout = kernel.layout(ResolvedPlotSettings::default());
+			let transform = CoordinateTransformer::new(
+				&layout,
+				Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+			);
+			let rectangles = kernel.bar_rectangles(&transform, 1.0, 0.2);
+			let mut intervals = rectangles
+				.iter()
+				.map(|bar| categorical_interval(bar.rect, orientation))
+				.collect::<Vec<_>>();
+			intervals.sort_by(|left, right| left.0.total_cmp(&right.0));
+			assert_close(intervals[0].0, 5.0);
+			assert_close(intervals[1].0 - intervals[0].1, 0.0);
+			assert_close(intervals[2].0 - intervals[1].1, 10.0);
+			assert_close(intervals[3].0 - intervals[2].1, 0.0);
+			assert_close(100.0 - intervals[3].1, 5.0);
+		}
+	}
+
+	#[test]
+	fn product_0053_single_series_composition_is_exactly_redundant() {
+		for orientation in [Orientation::Vertical, Orientation::Horizontal] {
+			let kernel = single_series_kernel(orientation);
+			let layout = kernel.layout(ResolvedPlotSettings::default());
+			let transform = CoordinateTransformer::new(
+				&layout,
+				Rectangle::new(Point::ORIGIN, Size::new(128.0, 128.0)),
+			);
+			assert_eq!(
+				kernel.bar_rectangles(&transform, 0.5, 0.5),
+				kernel.bar_rectangles(&transform, 0.25, 0.0)
+			);
+		}
+	}
+
+	#[test]
+	fn product_0053_paint_and_hit_share_visible_fill_and_category_reserve() {
+		for orientation in [Orientation::Vertical, Orientation::Horizontal] {
+			let kernel = grouped_kernel(orientation);
+			let layout = kernel.layout(ResolvedPlotSettings::default());
+			let transform = CoordinateTransformer::new(
+				&layout,
+				Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+			);
+			let settings = ResolvedPlotSettings {
+				bar_width: BarWidth::new(1.0).unwrap(),
+				category_gap: CategoryGap::new(0.2).unwrap(),
+				..ResolvedPlotSettings::default()
+			};
+			let rectangles = kernel.bar_rectangles(&transform, 1.0, 0.2);
+			let visible = rectangles[0].rect.center();
+			assert!(
+				kernel
+					.hover_resolved(&transform, Cursor::Available(visible), &settings)
+					.is_some()
+			);
+			let reserve = match orientation {
+				Orientation::Vertical => Point::new(1.0, visible.y),
+				Orientation::Horizontal => Point::new(visible.x, 51.0),
+			};
+			assert_eq!(
+				kernel.hover_resolved(&transform, Cursor::Available(reserve), &settings),
+				None
+			);
+		}
 	}
 }
