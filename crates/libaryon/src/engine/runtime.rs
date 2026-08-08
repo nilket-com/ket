@@ -6103,8 +6103,8 @@ mod event_bus_integration_tests {
 	use crate::engine::{InputEvent, KeyCode, Modifiers};
 	use std::collections::BTreeMap;
 	use std::fs;
-	use std::sync::atomic::{AtomicUsize, Ordering};
 	use std::sync::mpsc;
+	use std::sync::{Condvar, Mutex};
 	use std::thread;
 	use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -6117,8 +6117,92 @@ mod event_bus_integration_tests {
 		thread: thread::JoinHandle<()>,
 	}
 
-	struct NavigationTestProvider;
-	static NAVIGATION_SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+	#[derive(Default)]
+	struct NavigationPhaseGate {
+		entered: (Mutex<bool>, Condvar),
+		released: (Mutex<bool>, Condvar),
+	}
+
+	impl NavigationPhaseGate {
+		fn enter_and_wait(&self) {
+			let (entered, entered_cv) = &self.entered;
+			*entered.lock().expect("navigation entered gate") = true;
+			entered_cv.notify_all();
+
+			let (released, released_cv) = &self.released;
+			let mut released = released.lock().expect("navigation release gate");
+			while !*released {
+				released = released_cv.wait(released).expect("navigation release wait");
+			}
+		}
+
+		fn wait_until_entered(&self) {
+			let deadline = Instant::now() + Duration::from_secs(2);
+			let (entered, entered_cv) = &self.entered;
+			let mut entered = entered.lock().expect("navigation entered gate");
+			while !*entered {
+				let remaining = deadline.saturating_duration_since(Instant::now());
+				assert!(!remaining.is_zero(), "provider did not enter gated phase");
+				let (next, timeout) = entered_cv
+					.wait_timeout(entered, remaining)
+					.expect("navigation entered wait");
+				entered = next;
+				assert!(
+					!timeout.timed_out() || *entered,
+					"provider did not enter gated phase"
+				);
+			}
+		}
+
+		fn release(&self) {
+			let (released, released_cv) = &self.released;
+			*released.lock().expect("navigation release gate") = true;
+			released_cv.notify_all();
+		}
+	}
+
+	#[derive(Clone, Copy, PartialEq, Eq)]
+	enum NavigationBlockedPhase {
+		Analysis,
+		FirstNavigation,
+	}
+
+	struct NavigationTestControl {
+		blocked_phase: NavigationBlockedPhase,
+		gate: NavigationPhaseGate,
+		navigation_cursors: Mutex<Vec<DocByte>>,
+	}
+
+	impl NavigationTestControl {
+		fn new(blocked_phase: NavigationBlockedPhase) -> Arc<Self> {
+			Arc::new(Self {
+				blocked_phase,
+				gate: NavigationPhaseGate::default(),
+				navigation_cursors: Mutex::new(Vec::new()),
+			})
+		}
+
+		fn record_navigation(&self, cursor: DocByte) -> usize {
+			let mut cursors = self
+				.navigation_cursors
+				.lock()
+				.expect("navigation cursor log");
+			cursors.push(cursor);
+			cursors.len()
+		}
+
+		fn navigation_cursors(&self) -> Vec<DocByte> {
+			self.navigation_cursors
+				.lock()
+				.expect("navigation cursor log")
+				.clone()
+		}
+	}
+
+	#[derive(Default)]
+	struct NavigationTestProvider {
+		control: Option<Arc<NavigationTestControl>>,
+	}
 
 	impl LanguageProvider for NavigationTestProvider {
 		fn language_id(&self) -> &'static str {
@@ -6143,10 +6227,16 @@ mod event_bus_integration_tests {
 
 		fn semantic_reactor(
 			&self,
-			_full_source: Arc<String>,
+			full_source: Arc<String>,
 			_global_offset: DocByte,
 			_file_path: &str,
 		) -> SemanticOutput {
+			if full_source.contains("cursor-targets")
+				&& let Some(control) = &self.control
+				&& control.blocked_phase == NavigationBlockedPhase::Analysis
+			{
+				control.gate.enter_and_wait();
+			}
 			SemanticOutput::default()
 		}
 
@@ -6154,7 +6244,7 @@ mod event_bus_integration_tests {
 			&self,
 			source: Arc<String>,
 			_file_path: &str,
-			_cursor: DocByte,
+			cursor: DocByte,
 		) -> DefinitionResult {
 			if source.contains("slow") {
 				thread::sleep(Duration::from_millis(75));
@@ -6162,22 +6252,34 @@ mod event_bus_integration_tests {
 			if source.contains("unsupported") {
 				return DefinitionResult::Unsupported;
 			}
-			if source.contains("sequence") {
-				let key = if NAVIGATION_SEQUENCE.fetch_add(1, Ordering::SeqCst) == 0 {
-					thread::sleep(Duration::from_millis(75));
-					"first="
-				} else {
-					"second="
+			if source.contains("cursor-targets") {
+				// Fixture results belong to request-owned input, never invocation order.
+				// Pending navigation may coalesce before a provider call begins, so call
+				// order cannot identify which request survived.
+				if let Some(control) = &self.control {
+					let invocation = control.record_navigation(cursor);
+					if control.blocked_phase == NavigationBlockedPhase::FirstNavigation
+						&& invocation == 1
+					{
+						control.gate.enter_and_wait();
+					}
+				}
+				let cursor = usize::try_from(cursor.get())
+					.unwrap_or(usize::MAX)
+					.min(source.len());
+				let line_start = source[..cursor].rfind('\n').map_or(0, |index| index + 1);
+				let line = source[line_start..].lines().next().unwrap_or_default();
+				let Some((name, path)) = line.split_once('=') else {
+					return DefinitionResult::Failed(
+						"cursor-target fixture requires name=path at the request cursor"
+							.to_string(),
+					);
 				};
-				let path = source
-					.find(key)
-					.and_then(|marker| source[marker + key.len()..].lines().next())
-					.unwrap_or_default();
 				return DefinitionResult::Targets(vec![DefinitionTarget {
 					location: DefinitionLocation::File(PathBuf::from(path)),
 					focus_range: Some((0, 4)),
 					full_range: (0, 4),
-					name: key.to_string(),
+					name: name.to_string(),
 				}]);
 			}
 			let Some(marker) = source.find("target=") else {
@@ -6214,6 +6316,13 @@ mod event_bus_integration_tests {
 	}
 
 	fn spawn_test_engine(initial_file: Option<String>) -> RunningTestEngine {
+		spawn_test_engine_with_navigation_provider(initial_file, NavigationTestProvider::default())
+	}
+
+	fn spawn_test_engine_with_navigation_provider(
+		initial_file: Option<String>,
+		navigation_provider: NavigationTestProvider,
+	) -> RunningTestEngine {
 		let (commands, _input, internal, requests) = crate::engine::request::channel();
 		let (tx_view, views) = mpsc::channel();
 		let (tx_event, events) = mpsc::channel();
@@ -6225,7 +6334,7 @@ mod event_bus_integration_tests {
 		));
 		let mut languages = super::super::language::LanguageRegistry::new();
 		languages.register(crate::svp::rust_provider::RustProvider::new());
-		languages.register(NavigationTestProvider);
+		languages.register(navigation_provider);
 		let languages = Arc::new(languages);
 		let engine = Engine::new(
 			registry.clone(),
@@ -7403,32 +7512,67 @@ pub fn main(editor) {
 		let _ = std::fs::remove_dir_all(directory);
 	}
 
+	fn cursor_target_source(first: &Path, second: &Path) -> String {
+		format!(
+			"first={}\nsecond={}\ncursor-targets\n",
+			first.display(),
+			second.display()
+		)
+	}
+
+	fn move_to_second_cursor_target(engine: &RunningTestEngine) -> DocByte {
+		engine
+			.commands
+			.send(EditorCommand::MoveCursor(MoveDirection::Down))
+			.expect("move to second target request");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes[0].cursor_abs_byte > DocByte::ZERO
+		})
+		.panes[0]
+			.cursor_abs_byte
+	}
+
+	fn fence_second_navigation_request(engine: &RunningTestEngine, request_cursor: DocByte) {
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request newer definition");
+		// Commands are processed in channel order. Observing the following cursor
+		// move proves the newer navigation request reached the reactor before its
+		// controlled provider phase is released.
+		engine
+			.commands
+			.send(EditorCommand::MoveCursor(MoveDirection::Right))
+			.expect("fence newer definition request");
+		recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.panes[0].cursor_abs_byte > request_cursor
+		});
+	}
+
 	#[test]
-	fn a_newer_goto_definition_request_supersedes_an_older_response() {
+	fn a_newer_goto_definition_request_supersedes_an_older_in_flight_response() {
 		let directory = crate::engine::test_support::temp_test_path("goto-supersede");
 		std::fs::create_dir_all(&directory).expect("create target directory");
 		let first = directory.join("a.txt");
 		let second = directory.join("b.txt");
 		std::fs::write(&first, "first").expect("write first target");
 		std::fs::write(&second, "second").expect("write second target");
-		NAVIGATION_SEQUENCE.store(0, Ordering::SeqCst);
-		let engine = spawn_test_engine(None);
-		let _ = install_navigation_test_source(
-			&engine,
-			format!(
-				"sequence\nfirst={}\nsecond={}\n",
-				first.display(),
-				second.display()
-			),
+		let control = NavigationTestControl::new(NavigationBlockedPhase::FirstNavigation);
+		let engine = spawn_test_engine_with_navigation_provider(
+			None,
+			NavigationTestProvider {
+				control: Some(control.clone()),
+			},
 		);
+		let _ = install_navigation_test_source(&engine, cursor_target_source(&first, &second));
 		engine
 			.commands
 			.send(EditorCommand::GotoDefinition)
 			.expect("request first definition");
-		engine
-			.commands
-			.send(EditorCommand::GotoDefinition)
-			.expect("request newer definition");
+		control.gate.wait_until_entered();
+		let second_cursor = move_to_second_cursor_target(&engine);
+		fence_second_navigation_request(&engine, second_cursor);
+		control.gate.release();
 		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
 			viewport.status_message.as_deref() == Some("Jumped to definition")
 				&& viewport.panes[0]
@@ -7441,6 +7585,60 @@ pub fn main(editor) {
 				.file_name
 				.as_deref()
 				.is_some_and(|name| name.ends_with("b.txt"))
+		);
+		assert_eq!(
+			control.navigation_cursors(),
+			vec![DocByte::ZERO, second_cursor],
+			"the older provider call was in flight before the newer request superseded it"
+		);
+
+		engine.commands.send(EditorCommand::Quit).unwrap();
+		engine.thread.join().unwrap();
+		let _ = std::fs::remove_dir_all(directory);
+	}
+
+	#[test]
+	fn a_newer_goto_definition_request_coalesces_before_provider_invocation() {
+		let directory = crate::engine::test_support::temp_test_path("goto-coalesce");
+		std::fs::create_dir_all(&directory).expect("create target directory");
+		let first = directory.join("a.txt");
+		let second = directory.join("b.txt");
+		std::fs::write(&first, "first").expect("write first target");
+		std::fs::write(&second, "second").expect("write second target");
+		let control = NavigationTestControl::new(NavigationBlockedPhase::Analysis);
+		let engine = spawn_test_engine_with_navigation_provider(
+			None,
+			NavigationTestProvider {
+				control: Some(control.clone()),
+			},
+		);
+		let _ = install_navigation_test_source(&engine, cursor_target_source(&first, &second));
+		control.gate.wait_until_entered();
+		engine
+			.commands
+			.send(EditorCommand::GotoDefinition)
+			.expect("request definition that should remain pending");
+		let second_cursor = move_to_second_cursor_target(&engine);
+		fence_second_navigation_request(&engine, second_cursor);
+		control.gate.release();
+
+		let viewport = recv_viewport_until(&engine._views, Duration::from_secs(5), |viewport| {
+			viewport.status_message.as_deref() == Some("Jumped to definition")
+				&& viewport.panes[0]
+					.file_name
+					.as_deref()
+					.is_some_and(|name| name.ends_with("b.txt"))
+		});
+		assert!(
+			viewport.panes[0]
+				.file_name
+				.as_deref()
+				.is_some_and(|name| name.ends_with("b.txt"))
+		);
+		assert_eq!(
+			control.navigation_cursors(),
+			vec![second_cursor],
+			"the older pending request must be coalesced before provider invocation"
 		);
 
 		engine.commands.send(EditorCommand::Quit).unwrap();

@@ -308,19 +308,18 @@ inferred from the final picture or asserted after both changes have mixed.
   bars, stacked bars, heatmaps, and facets. After the enumerated premise
   updates, Polariton passes 473 unit tests with five live tests ignored, 41
   architecture tests, and the trybuild UI pair. `cargo check --workspace
-  --all-targets` passes. The final workspace-wide test sweep also leaves every
-  Polariton target green but is not recorded as globally green: the unrelated
-  libaryon test
-  `a_newer_goto_definition_request_supersedes_an_older_response` timed out
-  waiting for a viewport, then reproduced in an isolated exact-test rerun.
-  Stage 2 changes no libaryon source; Stage 1's workspace-wide bank passed
-  before the semantic change.
+  --all-targets` passes. The initial final sweep exposed and repaired an
+  unrelated deterministic libaryon test-fixture failure; the fixture in
+  `engine/runtime.rs` owns the general rule and its two phase-controlled gates.
+  The final `cargo test --workspace --all-targets --no-fail-fast` passes,
+  including 1,439 libaryon unit tests with 22 ignored.
 - `crates/polariton/README.md` now states the authored rule: categorical y
   display domains read top-down, relation sorting remains authoritative,
   grouped bars agree with their named legend, and heatmap x remains
-  left-to-right. `/home/me/work/uat/test19.rn` was not edited; its ascending
-  region and product domains remain the live contact fixture for the new
-  order.
+  left-to-right. `/home/me/work/uat/test19.rn` was not edited. The live exhibit
+  `/home/me/Pictures/Screenshots/Screenshot From 2026-08-08 12-36-23.png`
+  confirms East, North, South, West and Atlas, Beacon, Cinder, Delta top-down,
+  with the gridlines retaining the complete physical frame.
 - The record originated in the first live screenshot of PRODUCT-0055, not in a
   renderer gate: the horizontal bars opposed the legend even though each was
   independently correct under inherited dashboard geometry. Rune did not
