@@ -8572,9 +8572,11 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"data_server.rs",
 			"counter.rs",
 			"descriptor_migration.rs",
-			// ADR 541's two clocks: a self-contained mechanism with its own
-			// invariants, carved so the bounded root keeps ratcheting down.
+			// ADR 541's two clocks and its bounded encode quanta: self-contained
+			// mechanisms with their own invariants, carved so the bounded root
+			// keeps ratcheting down rather than absorbing each new one.
 			"query_clocks.rs",
+			"query_encode.rs",
 			"replica_routing.rs",
 			"streaming.rs",
 			"table_query.rs",

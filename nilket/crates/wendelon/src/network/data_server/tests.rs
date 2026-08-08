@@ -1,4 +1,10 @@
 use super::*;
+// ADR 077: the encode quanta live in their own submodule; the fixtures that pin their
+// bounds reach them directly rather than widening the root's imports for test-only use.
+use super::query_encode::{
+	ENCODE_QUANTUM_BYTES, ENCODE_QUANTUM_ROWS, bounded_blocking_encode, encode_blocking_slot_count,
+	encode_quantum_rows,
+};
 use crate::crypto::CryptoManager;
 use crate::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
@@ -13794,4 +13800,164 @@ async fn batch_within_the_quantum_encodes_as_one_blob() {
 		.expect("a progressing encode never expires");
 
 	assert_eq!(encoded.len(), 1);
+}
+
+/// ADR 541: a row bound alone does not bound encode work. This batch is far below
+/// `ENCODE_QUANTUM_ROWS` yet far above the byte bound, so a row-only quantum would hand
+/// the whole thing to one synchronous encode — the exact hole the quantum exists to
+/// close. Fails if the byte bound stops binding.
+#[tokio::test]
+async fn byte_heavy_batch_below_the_row_bound_still_splits() {
+	use arrow::array::StringArray;
+	use arrow::datatypes::{DataType, Field, Schema};
+
+	let rows = 64usize;
+	let value = "x".repeat(512 * 1024);
+	let schema = Arc::new(Schema::new(vec![Field::new("blob", DataType::Utf8, false)]));
+	let array = StringArray::from(vec![value.as_str(); rows]);
+	let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+
+	assert!(
+		rows < ENCODE_QUANTUM_ROWS,
+		"the fixture must stay under the row bound, else it proves nothing about bytes"
+	);
+	let quantum = encode_quantum_rows(&batch);
+	assert!(
+		quantum < rows,
+		"the byte bound must bind first: {quantum} rows/quantum for {rows} rows"
+	);
+
+	let mut clocks = QueryClocks::new(Duration::from_secs(3600), None);
+	let encoded = encode_query_stream_batches_with_deadline(vec![batch], &mut clocks)
+		.await
+		.unwrap()
+		.expect("a progressing encode never expires");
+
+	assert_eq!(encoded.len(), rows.div_ceil(quantum));
+	assert!(
+		encoded.len() > 1,
+		"a byte-heavy batch must not encode whole"
+	);
+}
+
+/// ADR 541: the declared policy for a row wider than the byte bound. One row is the
+/// indivisible unit of encoding, so such a row is encoded alone and the byte bound is
+/// knowingly exceeded for it — a stated limit, not a silent one.
+#[tokio::test]
+async fn a_row_wider_than_the_byte_bound_encodes_alone() {
+	use arrow::array::StringArray;
+	use arrow::datatypes::{DataType, Field, Schema};
+
+	let rows = 3usize;
+	let value = "x".repeat(ENCODE_QUANTUM_BYTES + 1024);
+	let schema = Arc::new(Schema::new(vec![Field::new("blob", DataType::Utf8, false)]));
+	let array = StringArray::from(vec![value.as_str(); rows]);
+	let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+
+	assert_eq!(
+		encode_quantum_rows(&batch),
+		1,
+		"one row is the floor: an oversize row is encoded alone, never split"
+	);
+
+	let mut clocks = QueryClocks::new(Duration::from_secs(3600), None);
+	let encoded = encode_query_stream_batches_with_deadline(vec![batch], &mut clocks)
+		.await
+		.unwrap()
+		.expect("a progressing encode never expires");
+
+	assert_eq!(encoded.len(), rows, "each oversize row is its own quantum");
+}
+
+/// ADR 541: the blocking-worker invariant, proved with an injected slow encoder rather
+/// than inferred from the generic clock helper. Holds every slot occupied and then shows
+/// that a further attempt (a) expires with a typed cause, (b) never enters blocking work
+/// at all, and (c) that permits recover once the held work truly ends. Without the
+/// concurrency bound, abandoned encodes would accumulate on the blocking pool — which is
+/// precisely what a detached `spawn_blocking` cannot prevent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn blocking_encode_slots_bound_concurrency_and_keep_expiry_typed() {
+	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+	let limit = encode_blocking_slot_count();
+	let entered = Arc::new(AtomicUsize::new(0));
+	// Held work self-releases on a deadline rather than rendezvousing with this task.
+	// A barrier would park the blocking pool forever the moment an assertion below
+	// panicked, turning a failing test into a hanging one — strictly worse than a red.
+	let release = Arc::new(AtomicBool::new(false));
+	let hold_limit = Duration::from_secs(30);
+
+	let mut holders = Vec::with_capacity(limit);
+	for _ in 0..limit {
+		let entered = Arc::clone(&entered);
+		let release = Arc::clone(&release);
+		holders.push(tokio::spawn(async move {
+			let mut clocks = QueryClocks::new(Duration::from_secs(3600), None);
+			bounded_blocking_encode(&mut clocks, move || {
+				entered.fetch_add(1, Ordering::SeqCst);
+				let deadline = std::time::Instant::now() + hold_limit;
+				while !release.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
+					std::thread::sleep(Duration::from_millis(5));
+				}
+				Ok(Vec::<u8>::new())
+			})
+			.await
+			.map(|inner| inner.is_ok())
+		}));
+	}
+
+	// Every slot genuinely occupied before the queued attempt is made.
+	while entered.load(Ordering::SeqCst) < limit {
+		tokio::time::sleep(Duration::from_millis(5)).await;
+	}
+
+	let queued_ran = Arc::new(AtomicUsize::new(0));
+	let mut tight = QueryClocks::new(Duration::from_millis(20), None);
+	let outcome = {
+		let queued_ran = Arc::clone(&queued_ran);
+		bounded_blocking_encode(&mut tight, move || {
+			queued_ran.fetch_add(1, Ordering::SeqCst);
+			Ok(Vec::<u8>::new())
+		})
+		.await
+	};
+	let queued_entered = queued_ran.load(Ordering::SeqCst);
+	let peak_entered = entered.load(Ordering::SeqCst);
+	let expiry = outcome.err();
+
+	// Release before asserting, so a red is a red and never a hang.
+	release.store(true, Ordering::SeqCst);
+
+	assert_eq!(
+		expiry,
+		Some(ReadStatus::QUERY_STALLED),
+		"a queued attempt expires through the clocks with its cause named"
+	);
+	assert_eq!(
+		queued_entered, 0,
+		"a queued attempt must never enter blocking work"
+	);
+	assert_eq!(
+		peak_entered, limit,
+		"no more than the slot bound may occupy blocking work at once"
+	);
+
+	for holder in holders {
+		let encoded_ok = holder.await.expect("holder task joins");
+		assert_eq!(encoded_ok, Ok(true));
+	}
+
+	// Permits recover only when the work truly ended — not when a caller stopped waiting.
+	let recovered = Arc::new(AtomicUsize::new(0));
+	let mut after = QueryClocks::new(Duration::from_secs(3600), None);
+	let outcome = {
+		let recovered = Arc::clone(&recovered);
+		bounded_blocking_encode(&mut after, move || {
+			recovered.fetch_add(1, Ordering::SeqCst);
+			Ok(Vec::<u8>::new())
+		})
+		.await
+	};
+	assert!(outcome.is_ok(), "a released slot admits new work");
+	assert_eq!(recovered.load(Ordering::SeqCst), 1);
 }

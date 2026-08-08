@@ -58,6 +58,20 @@ cap denominated in milliseconds.
    typed status boundary. Collapsing them into one indistinguishable failure is exactly the
    defect class this arc keeps finding, and it is unrepresentable here by construction.
 
+5. **Synchronous encode work is bounded by rows *and* bytes, and raced under a
+   concurrency cap.** Encoding cannot be preempted mid-call, so polling between whole
+   batches bounds nothing: one oversize batch overruns the stall bound with nothing able to
+   observe it. A quantum is therefore capped by row count *and* by column bytes — a row cap
+   alone leaves the hole open, since a few rows holding large variable-width values are
+   arbitrarily expensive. Each quantum is raced through both clocks on a blocking thread
+   drawn from a bounded slot pool, with the permit held for the true lifetime of the work
+   rather than the caller's patience; a detached blocking task would let every expiry pile
+   another unbounded encode onto the pool.
+
+   Declared limit: **one row is the indivisible unit.** A single row wider than the byte
+   bound is encoded alone and exceeds the bound, because there is nothing beneath a row to
+   split. Stating it here keeps it a known limit of the mechanism rather than a silent one.
+
 ## Grounding
 
 Phase 0 maps every consumer of `QueryExecutionBudget.max_wall_time` — plan preparation, the
@@ -68,10 +82,15 @@ the audit, ~250 ms server time per failure. The discriminating fixture drives a 
 scan an order of magnitude past today's failure point under concurrent ingest and requires
 completion; its sibling stalls a scan artificially and requires the typed budget failure.
 
-The run also recorded silent insert-batch failures near the same boundary; Phase 0 determines
-whether those share this clock or are a separate write-path finding, and names the answer
-rather than absorbing it — one collapsed symptom has already misattributed two mechanisms in
-this arc.
+The run also recorded silent insert-batch failures near the same boundary. **Answered: they
+are a separate write-path finding, not this clock.** INSERT routes through
+`WendelonStorageWrite::write` → `Client::table_write`, and that path carries none of this
+ADR's machinery — `WriteRequest` has no deadline field, `TableWriteRequestMeta` carries
+neither a deadline nor a budget, and no `QueryExecutionBudget` or `QueryClocks` is
+constructed anywhere along it. The shared symptom was proximity in time, not a shared
+mechanism. Any remedy is a new ADR; this one does not absorb it, because absorbing a
+second mechanism into the first one found is exactly the misattribution this arc has
+already paid for twice.
 
 ## Acceptance
 
@@ -103,7 +122,14 @@ this arc.
 ## Forward
 
 On success the dogfood viewport's tables stop having a size ceiling, and the ADR 0539
-confirmation rerun becomes schedulable. The open question from the confirmation profile — no
-secondary index was ever created for the sampler's tables, so what created the old profile's
-indexes — is carried by the rerun protocol, which creates one explicitly rather than assuming
-the write path does.
+confirmation rerun becomes schedulable.
+
+Two questions the confirmation raised are ruled and closed here rather than left open:
+
+- **Historical secondary-index provenance does not block confirmation.** What created the old
+  profile's indexes is a forensic question, not a gate: the rerun does not depend on the
+  answer because it creates its index explicitly and proves the gauge series exists before
+  the measured window opens. The wedged profile is preserved unchanged so the forensics stay
+  available.
+- **Insert-batch failures are a separate write-path finding** (see Grounding) and travel in
+  their own ADR.

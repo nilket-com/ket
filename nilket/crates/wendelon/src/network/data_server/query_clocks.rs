@@ -94,8 +94,11 @@ impl QueryClocks {
 /// horizon. Propagating that `None` as "no caller deadline" would let an absurdly large
 /// wire value *remove* the caller's cap — presence degrading into absence, which is the
 /// same permissive inversion as conflating the absent-sentinels. A deadline the platform
-/// cannot represent is instead clamped to the furthest instant it can: descend by halves
-/// so the clamp is deterministic and needs no platform constant.
+/// cannot represent is instead clamped to *a* representable instant, found by descending
+/// halves: deterministic, and needing no platform constant. It is deliberately not the
+/// furthest such instant — halving lands on a conservative one, at most a factor of two
+/// short of the horizon. That is the safe direction (an earlier deadline never removes a
+/// cap) and it only ever applies to durations no real caller sends.
 fn instant_after_clamped(now: Instant, duration: Duration) -> Instant {
 	if let Some(instant) = now.checked_add(duration) {
 		return instant;
