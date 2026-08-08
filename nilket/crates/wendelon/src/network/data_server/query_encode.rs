@@ -48,22 +48,61 @@ fn encode_blocking_slots() -> &'static Semaphore {
 	SLOTS.get_or_init(|| Semaphore::new(encode_blocking_slot_count()))
 }
 
-/// Rows per encode quantum for this batch, bounded by rows *and* by bytes.
+/// Bytes the rows *in this slice* logically occupy.
 ///
-/// Policy for a row wider than the byte bound: one row is the indivisible unit of
-/// encoding — there is nothing beneath it to split — so such a row is encoded alone and
-/// the byte bound is knowingly exceeded for it. Saying so here makes that a declared
-/// limit of the mechanism rather than a silent one.
-pub(crate) fn encode_quantum_rows(batch: &RecordBatch) -> usize {
-	let rows = batch.num_rows();
-	if rows == 0 {
-		return 0;
+/// Deliberately not `get_array_memory_size`: that reports the allocated backing buffers,
+/// so a one-row slice of a large batch still reports the whole buffer. Dividing it by the
+/// row count then assumes every row is the same width, and a skewed batch — sixty-three
+/// tiny strings and one enormous one — defeats that average, grouping the wide row with
+/// its neighbours precisely when it must not be. `get_slice_memory_size` is offset- and
+/// length-aware, so it prices the rows actually being encoded.
+///
+/// An unmeasurable column is priced as unbounded: refusing is the safe direction when the
+/// whole point of the number is to bound work.
+fn slice_memory_size(batch: &RecordBatch) -> usize {
+	batch
+		.columns()
+		.iter()
+		.map(|column| {
+			column
+				.to_data()
+				.get_slice_memory_size()
+				.unwrap_or(usize::MAX)
+		})
+		.fold(0usize, |total, size| total.saturating_add(size))
+}
+
+/// The largest contiguous run starting at `offset` that satisfies both the row bound and
+/// the byte bound, or `None` when the single row at `offset` exceeds the byte bound on
+/// its own.
+///
+/// `None` is a refusal, not a licence. There is nothing beneath one row to split, so a
+/// row wider than the bound cannot be encoded within it — and "knowingly exceeds the
+/// bound" is not a bound. The caller turns this into a typed `QUERY_BUDGET_EXCEEDED`
+/// before any encode work is spawned.
+pub(crate) fn encode_quantum_len(batch: &RecordBatch, offset: usize) -> Option<usize> {
+	let remaining = batch.num_rows().saturating_sub(offset);
+	if remaining == 0 {
+		return Some(0);
 	}
-	let bytes_per_row = batch.get_array_memory_size().div_ceil(rows).max(1);
-	(ENCODE_QUANTUM_BYTES / bytes_per_row)
-		.max(1)
-		.min(ENCODE_QUANTUM_ROWS)
-		.min(rows)
+	let mut hi = ENCODE_QUANTUM_ROWS.min(remaining);
+	if slice_memory_size(&batch.slice(offset, hi)) <= ENCODE_QUANTUM_BYTES {
+		return Some(hi);
+	}
+	if slice_memory_size(&batch.slice(offset, 1)) > ENCODE_QUANTUM_BYTES {
+		return None;
+	}
+	// Slice size grows with length, so the largest satisfying length is a binary search.
+	let mut lo = 1usize;
+	while lo < hi {
+		let mid = lo + (hi - lo).div_ceil(2);
+		if slice_memory_size(&batch.slice(offset, mid)) <= ENCODE_QUANTUM_BYTES {
+			lo = mid;
+		} else {
+			hi = mid - 1;
+		}
+	}
+	Some(lo)
 }
 
 /// Run one unit of synchronous work on a blocking thread, under both clocks and the
@@ -116,7 +155,6 @@ pub(crate) async fn encode_query_stream_batches_with_deadline(
 	let mut encoded = Vec::with_capacity(batches.len());
 	for batch in batches {
 		let rows = batch.num_rows();
-		let quantum_limit = encode_quantum_rows(&batch);
 		let mut offset = 0usize;
 		loop {
 			if let Some(expired) = clocks.expired() {
@@ -126,7 +164,13 @@ pub(crate) async fn encode_query_stream_batches_with_deadline(
 			let quantum = if rows == 0 {
 				batch.clone()
 			} else {
-				batch.slice(offset, quantum_limit.min(rows - offset))
+				let Some(len) = encode_quantum_len(&batch, offset) else {
+					// One row wider than the byte bound cannot be bounded. Refuse with
+					// a typed status *before* spawning encode work, rather than
+					// exceeding the bound and calling it a policy.
+					return Ok(Err(ReadStatus::QUERY_BUDGET_EXCEEDED));
+				};
+				batch.slice(offset, len)
 			};
 			let quantum_rows = quantum.num_rows();
 			let arrow = match bounded_blocking_encode(clocks, move || {

@@ -68,9 +68,18 @@ cap denominated in milliseconds.
    rather than the caller's patience; a detached blocking task would let every expiry pile
    another unbounded encode onto the pool.
 
-   Declared limit: **one row is the indivisible unit.** A single row wider than the byte
-   bound is encoded alone and exceeds the bound, because there is nothing beneath a row to
-   split. Stating it here keeps it a known limit of the mechanism rather than a silent one.
+   The byte measure must be **slice-aware**. Allocated-buffer size divided by row count
+   assumes uniform row widths, and skew is exactly the case that matters: sixty-three tiny
+   values beside one enormous one average to a small per-row width, so the wide row gets
+   grouped with its neighbours — the bound reports success while doing the unbounded work
+   it exists to prevent. Each candidate slice is priced by what those rows actually
+   occupy, and the quantum is the largest contiguous run satisfying both bounds.
+
+   **A row wider than the byte bound is refused, not encoded anyway.** There is nothing
+   beneath one row to split, so the bound cannot be honoured for it; the query fails with
+   the typed budget status before any encode work is spawned. An exception that
+   "knowingly exceeds the bound" is not a bound — it is the unbounded case wearing the
+   bound's name, which is the defect shape this arc keeps finding.
 
 ## Grounding
 

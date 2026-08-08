@@ -3,7 +3,7 @@ use super::*;
 // bounds reach them directly rather than widening the root's imports for test-only use.
 use super::query_encode::{
 	ENCODE_QUANTUM_BYTES, ENCODE_QUANTUM_ROWS, bounded_blocking_encode, encode_blocking_slot_count,
-	encode_quantum_rows,
+	encode_quantum_len,
 };
 use crate::crypto::CryptoManager;
 use crate::integration::compute::{
@@ -13821,7 +13821,7 @@ async fn byte_heavy_batch_below_the_row_bound_still_splits() {
 		rows < ENCODE_QUANTUM_ROWS,
 		"the fixture must stay under the row bound, else it proves nothing about bytes"
 	);
-	let quantum = encode_quantum_rows(&batch);
+	let quantum = encode_quantum_len(&batch, 0).expect("no single row exceeds the bound");
 	assert!(
 		quantum < rows,
 		"the byte bound must bind first: {quantum} rows/quantum for {rows} rows"
@@ -13840,11 +13840,12 @@ async fn byte_heavy_batch_below_the_row_bound_still_splits() {
 	);
 }
 
-/// ADR 541: the declared policy for a row wider than the byte bound. One row is the
-/// indivisible unit of encoding, so such a row is encoded alone and the byte bound is
-/// knowingly exceeded for it — a stated limit, not a silent one.
+/// ADR 541: a row wider than the byte bound is *refused*, not encoded anyway. There is
+/// nothing beneath one row to split, so the bound cannot be met for it — and a bound that
+/// is knowingly exceeded is not a bound. The refusal is typed and happens before any
+/// encode work is spawned.
 #[tokio::test]
-async fn a_row_wider_than_the_byte_bound_encodes_alone() {
+async fn a_row_wider_than_the_byte_bound_is_rejected_before_encoding() {
 	use arrow::array::StringArray;
 	use arrow::datatypes::{DataType, Field, Schema};
 
@@ -13855,18 +13856,85 @@ async fn a_row_wider_than_the_byte_bound_encodes_alone() {
 	let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
 
 	assert_eq!(
-		encode_quantum_rows(&batch),
-		1,
-		"one row is the floor: an oversize row is encoded alone, never split"
+		encode_quantum_len(&batch, 0),
+		None,
+		"a row wider than the bound admits no satisfying quantum"
 	);
 
 	let mut clocks = QueryClocks::new(Duration::from_secs(3600), None);
-	let encoded = encode_query_stream_batches_with_deadline(vec![batch], &mut clocks)
+	let outcome = encode_query_stream_batches_with_deadline(vec![batch], &mut clocks)
 		.await
-		.unwrap()
-		.expect("a progressing encode never expires");
+		.unwrap();
 
-	assert_eq!(encoded.len(), rows, "each oversize row is its own quantum");
+	assert_eq!(outcome, Err(ReadStatus::QUERY_BUDGET_EXCEEDED));
+	assert_eq!(
+		clocks.progress_marks, 0,
+		"the refusal must precede any encode work"
+	);
+}
+
+/// ADR 541: skewed row widths are the case an averaged byte estimate gets wrong. With
+/// `get_array_memory_size() / rows`, many narrow values beside one wide one average to a
+/// small per-row width and the wide row is grouped with its neighbours. Slice-aware
+/// measurement must isolate it wherever it sits — first, middle, or last — and must reject
+/// it outright once it alone exceeds the bound.
+///
+/// Sizing matters here: the wide row is chosen so that it fits the bound *alone* but not
+/// beside any neighbour. A wide row merely close to the bound with negligible neighbours
+/// would legitimately group with them, which would test nothing.
+#[tokio::test]
+async fn skewed_batch_isolates_or_rejects_the_wide_row() {
+	use arrow::array::StringArray;
+	use arrow::datatypes::{DataType, Field, Schema};
+
+	const NARROW_BYTES: usize = 1024 * 1024;
+	let rows = 32usize;
+
+	fn skewed(rows: usize, wide_at: usize, wide_bytes: usize, narrow_bytes: usize) -> RecordBatch {
+		let schema = Arc::new(Schema::new(vec![Field::new("blob", DataType::Utf8, false)]));
+		let wide = "x".repeat(wide_bytes);
+		let narrow = "n".repeat(narrow_bytes);
+		let values: Vec<&str> = (0..rows)
+			.map(|index| {
+				if index == wide_at {
+					wide.as_str()
+				} else {
+					narrow.as_str()
+				}
+			})
+			.collect();
+		let array = StringArray::from(values);
+		RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap()
+	}
+
+	for wide_at in [0usize, 16, 31] {
+		// Fits alone, cannot fit beside a neighbour: must be isolated.
+		let isolatable = ENCODE_QUANTUM_BYTES - NARROW_BYTES / 2;
+		let batch = skewed(rows, wide_at, isolatable, NARROW_BYTES);
+		assert_eq!(
+			encode_quantum_len(&batch, wide_at),
+			Some(1),
+			"the wide row at {wide_at} must be isolated, not grouped with neighbours"
+		);
+		let mut clocks = QueryClocks::new(Duration::from_secs(3600), None);
+		let encoded = encode_query_stream_batches_with_deadline(vec![batch], &mut clocks)
+			.await
+			.unwrap()
+			.expect("an isolatable wide row still encodes");
+		assert!(encoded.len() > 1, "isolation implies more than one quantum");
+
+		// Exceeds the bound alone: refused, wherever it sits.
+		let batch = skewed(rows, wide_at, ENCODE_QUANTUM_BYTES + 1024, NARROW_BYTES);
+		let mut clocks = QueryClocks::new(Duration::from_secs(3600), None);
+		let outcome = encode_query_stream_batches_with_deadline(vec![batch], &mut clocks)
+			.await
+			.unwrap();
+		assert_eq!(
+			outcome,
+			Err(ReadStatus::QUERY_BUDGET_EXCEEDED),
+			"a wide row at {wide_at} exceeding the bound must be refused"
+		);
+	}
 }
 
 /// ADR 541: the blocking-worker invariant, proved with an injected slow encoder rather
@@ -13885,7 +13953,7 @@ async fn blocking_encode_slots_bound_concurrency_and_keep_expiry_typed() {
 	// A barrier would park the blocking pool forever the moment an assertion below
 	// panicked, turning a failing test into a hanging one — strictly worse than a red.
 	let release = Arc::new(AtomicBool::new(false));
-	let hold_limit = Duration::from_secs(30);
+	let hold_limit = Duration::from_secs(120);
 
 	let mut holders = Vec::with_capacity(limit);
 	for _ in 0..limit {
@@ -13906,8 +13974,20 @@ async fn blocking_encode_slots_bound_concurrency_and_keep_expiry_typed() {
 		}));
 	}
 
-	// Every slot genuinely occupied before the queued attempt is made.
+	// Every slot genuinely occupied before the queued attempt is made — but bounded, and
+	// releasing before it fails. The platform may simply be unable to start
+	// `available_parallelism()` blocking workers, and an unbounded wait would turn that
+	// into a hang rather than a diagnosis.
+	let waited_from = std::time::Instant::now();
 	while entered.load(Ordering::SeqCst) < limit {
+		if waited_from.elapsed() >= Duration::from_secs(60) {
+			release.store(true, Ordering::SeqCst);
+			panic!(
+				"only {} of {limit} blocking workers started within 60s; this platform \
+				 cannot supply the slots this fixture assumes",
+				entered.load(Ordering::SeqCst)
+			);
+		}
 		tokio::time::sleep(Duration::from_millis(5)).await;
 	}
 
