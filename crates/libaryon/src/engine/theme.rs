@@ -318,6 +318,52 @@ const PRISM_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
 	PRISM_SYNTAX[18],
 );
 
+const VAPOR_SYNTAX: [Rgb; 20] = [
+	Rgb::new(255, 113, 206),
+	Rgb::new(1, 205, 254),
+	Rgb::new(80, 80, 80),
+	Rgb::new(255, 251, 150),
+	Rgb::new(185, 103, 255),
+	Rgb::new(5, 255, 161),
+	Rgb::new(255, 255, 255),
+	Rgb::new(255, 32, 121),
+	Rgb::new(8, 247, 254),
+	Rgb::new(254, 83, 187),
+	Rgb::new(245, 211, 0),
+	Rgb::new(113, 34, 250),
+	Rgb::new(255, 124, 0),
+	Rgb::new(19, 202, 145),
+	Rgb::new(255, 148, 114),
+	Rgb::new(182, 255, 0),
+	Rgb::new(229, 9, 20),
+	Rgb::new(157, 0, 255),
+	Rgb::new(0, 255, 159),
+	Rgb::new(18, 18, 18),
+];
+
+// Vapor's three achromatic syntax-furniture colors (comment grey at index 2,
+// punctuation white at 6, and whitespace near-black at 19) are deliberately not
+// data identities, on the PRODUCT-0028 §4 dark2 precedent.
+const VAPOR_CATEGORICAL: CategoricalDeclaration = categorical_declaration!(
+	VAPOR_SYNTAX[0],
+	VAPOR_SYNTAX[1],
+	VAPOR_SYNTAX[3],
+	VAPOR_SYNTAX[4],
+	VAPOR_SYNTAX[5],
+	VAPOR_SYNTAX[7],
+	VAPOR_SYNTAX[8],
+	VAPOR_SYNTAX[9],
+	VAPOR_SYNTAX[10],
+	VAPOR_SYNTAX[11],
+	VAPOR_SYNTAX[12],
+	VAPOR_SYNTAX[13],
+	VAPOR_SYNTAX[14],
+	VAPOR_SYNTAX[15],
+	VAPOR_SYNTAX[16],
+	VAPOR_SYNTAX[17],
+	VAPOR_SYNTAX[18],
+);
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ResolvedThemePair {
 	darker_index: usize,
@@ -1287,26 +1333,26 @@ impl Theme {
 	}
 
 	fn fill_vapor(map: &mut [Option<Rgb>; CATEGORY_COUNT]) {
-		let c01 = Rgb::new(255, 113, 206);
-		let c02 = Rgb::new(1, 205, 254);
-		let c03 = Rgb::new(80, 80, 80);
-		let c04 = Rgb::new(255, 251, 150);
-		let c05 = Rgb::new(185, 103, 255);
-		let c06 = Rgb::new(5, 255, 161);
-		let c07 = Rgb::new(255, 255, 255);
-		let c08 = Rgb::new(255, 32, 121);
-		let c09 = Rgb::new(8, 247, 254);
-		let c10 = Rgb::new(254, 83, 187);
-		let c11 = Rgb::new(245, 211, 0);
-		let c12 = Rgb::new(113, 34, 250);
-		let c13 = Rgb::new(255, 124, 0);
-		let c14 = Rgb::new(19, 202, 145);
-		let c15 = Rgb::new(255, 148, 114);
-		let c16 = Rgb::new(182, 255, 0);
-		let c17 = Rgb::new(229, 9, 20);
-		let c18 = Rgb::new(157, 0, 255);
-		let c19 = Rgb::new(0, 255, 159);
-		let c20 = Rgb::new(18, 18, 18);
+		let c01 = VAPOR_SYNTAX[0];
+		let c02 = VAPOR_SYNTAX[1];
+		let c03 = VAPOR_SYNTAX[2];
+		let c04 = VAPOR_SYNTAX[3];
+		let c05 = VAPOR_SYNTAX[4];
+		let c06 = VAPOR_SYNTAX[5];
+		let c07 = VAPOR_SYNTAX[6];
+		let c08 = VAPOR_SYNTAX[7];
+		let c09 = VAPOR_SYNTAX[8];
+		let c10 = VAPOR_SYNTAX[9];
+		let c11 = VAPOR_SYNTAX[10];
+		let c12 = VAPOR_SYNTAX[11];
+		let c13 = VAPOR_SYNTAX[12];
+		let c14 = VAPOR_SYNTAX[13];
+		let c15 = VAPOR_SYNTAX[14];
+		let c16 = VAPOR_SYNTAX[15];
+		let c17 = VAPOR_SYNTAX[16];
+		let c18 = VAPOR_SYNTAX[17];
+		let c19 = VAPOR_SYNTAX[18];
+		let c20 = VAPOR_SYNTAX[19];
 
 		set_color(map, TokenCategory::Keyword, c01);
 		set_color(map, TokenCategory::String, c02);
@@ -1691,7 +1737,7 @@ pub static THEME_SPECS: &[ThemeSpec] = &[
 	ThemeSpec::curated_categorical("tab20c", &[], Theme::fill_tab20c, TAB20C_CATEGORICAL),
 	ThemeSpec::curated("tokyonight", &["tokyo_night"], Theme::fill_tokyo_night),
 	ThemeSpec::curated("turbo", &[], Theme::fill_turbo),
-	ThemeSpec::curated("vapor", &[], Theme::fill_vapor),
+	ThemeSpec::curated_categorical("vapor", &[], Theme::fill_vapor, VAPOR_CATEGORICAL),
 	ThemeSpec::continuous("autumn", &[], autumn),
 	ThemeSpec::continuous("black", &[], black),
 	ThemeSpec::continuous("bluegreen", &[], blue_green),
@@ -2050,7 +2096,7 @@ mod tests {
 	#[test]
 	fn product_0028_capability_is_independent_of_theme_family() {
 		let expected_curated = [
-			"dark2", "glowmax", "kelly", "prism", "tab20", "tab20b", "tab20c",
+			"dark2", "glowmax", "kelly", "prism", "tab20", "tab20b", "tab20c", "vapor",
 		];
 		let mut actual_curated = Vec::new();
 		for spec in THEME_SPECS {
@@ -2069,7 +2115,7 @@ mod tests {
 						actual_curated.push(spec.name);
 						let expected_len = match spec.name {
 							"dark2" => 8,
-							"glowmax" | "prism" => 17,
+							"glowmax" | "prism" | "vapor" => 17,
 							_ => 20,
 						};
 						assert_eq!(palette.len(), expected_len, "{}", spec.name);

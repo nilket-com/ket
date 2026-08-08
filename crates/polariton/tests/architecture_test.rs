@@ -1243,7 +1243,7 @@ fn product_0028_categorical_palettes_reach_only_the_product_0029_spec_consumer()
 	assert_eq!(
 		declared,
 		[
-			"dark2", "glowmax", "kelly", "prism", "tab20", "tab20b", "tab20c",
+			"dark2", "glowmax", "kelly", "prism", "tab20", "tab20b", "tab20c", "vapor",
 		],
 		"only curated palettes with an explicit accepted natural declaration are capable"
 	);
