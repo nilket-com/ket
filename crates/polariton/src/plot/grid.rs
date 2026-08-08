@@ -1729,6 +1729,102 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0054_faceted_series_lines_keep_panel_blind_colors_and_one_union_legend() {
+		use crate::plot::legend::LegendSection;
+		use crate::plot::spec::{
+			CategoricalPaletteSelection, ColorIdentity, resolve_channels,
+			resolve_domains_with_categorical_palette,
+		};
+
+		let frame = df!(
+			"series" => ["Atlas", "Atlas", "Beacon", "Beacon", "Cinder", "Cinder", "Delta", "Delta"],
+			"x" => [1.0_f64, 2.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0],
+			"y" => [2.0_f64, 4.0, 3.0, 5.0, 4.0, 6.0, 5.0, 7.0]
+		)
+		.expect("faceted series-line frame");
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Line),
+			"x",
+			"y",
+			Some("series".to_owned()),
+		);
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("channels");
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0054".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").unwrap();
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.expect("series-line resolution");
+		let assignments = resolved
+			.channel(Channel::Color)
+			.expect("authored series channel")
+			.colors
+			.clone();
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved),
+			&stamped,
+			"series",
+			GridArrangement::new(2, 2).unwrap(),
+		)
+		.expect("series-line facet");
+		let kernel = PlotGridKernel::from_grid(grid, 800, 600);
+		let model = PlotSettings::default();
+		let resolved_settings = model.resolve();
+		let legend = crate::plot::legend::union(
+			kernel
+				.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&resolved_settings)),
+		)
+		.expect("figure legend union");
+		let LegendSection::Entries(entries) = legend.0.first() else {
+			panic!("series-line grid must union entry legends")
+		};
+		assert_eq!(entries.len(), assignments.len());
+		for (entry, assignment) in entries.iter().zip(&assignments) {
+			assert_eq!(entry.label, assignment.category);
+			assert_eq!(entry.sample, crate::plot::legend::LegendSample::LineSample);
+		}
+
+		let mut backend = SvgBackend::new(800.0, 600.0);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
+		);
+		let svg = backend.finish();
+		for assignment in assignments {
+			let stroke = format!(
+				"stroke=\"rgb({}, {}, {})\"",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert!(
+				svg.contains(&stroke),
+				"cell {} must paint its globally resolved {stroke}",
+				assignment.category
+			);
+		}
+	}
+
+	#[test]
 	fn four_cell_value_facet_renders_four_regions() {
 		let (body, _data, stamped) = fixture();
 		let data = Arc::new(

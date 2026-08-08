@@ -977,7 +977,7 @@ fn provenance_method_on_relation(
 			origin,
 			sinks: vec![parse_sugar_sink(PlotType::Bar, call, args, source)?],
 		})),
-		"line" if args.len() == 2 => Ok(Some(ExpressionProvenance::ViewSet {
+		"line" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
 			root,
 			origin,
@@ -986,7 +986,7 @@ fn provenance_method_on_relation(
 		"line" => invalid_view(
 			call.span(),
 			source.len(),
-			"line view sugar requires x and y string fields",
+			"line view sugar requires x and y strings with an optional series",
 		),
 		"table" if args.is_empty() => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
@@ -1164,7 +1164,7 @@ fn parse_contextual_sink_inner(
 			};
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
 		}
-		"line" if args.len() == 2 => {
+		"line" if matches!(args.len(), 2 | 3) => {
 			let Some(sink) = plot_sink_fields(PlotType::Line, source, &args, 0)? else {
 				return invalid_view(
 					expression.span(),
@@ -1196,7 +1196,7 @@ fn parse_contextual_sink_inner(
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"line(...) takes x and y string fields",
+				"line(...) takes x and y strings with an optional series",
 			);
 		}
 		"scatter" => {
@@ -2150,7 +2150,9 @@ fn parse_figure_body(
 	};
 	match callee {
 		"bar" if matches!(args.len(), 2 | 3) => single(PlotType::Bar, "bar fields must be strings"),
-		"line" if args.len() == 2 => single(PlotType::Line, "line fields must be strings"),
+		"line" if matches!(args.len(), 2 | 3) => {
+			single(PlotType::Line, "line fields must be strings")
+		}
 		"scatter" if matches!(args.len(), 2 | 3) => {
 			single(PlotType::Scatter, "scatter fields must be strings")
 		}
@@ -2180,7 +2182,7 @@ fn parse_figure_body(
 		"line" => invalid_view(
 			expression.span(),
 			source.len(),
-			"line(...) takes x and y string fields",
+			"line(...) takes x and y strings with an optional series",
 		),
 		"scatter" => invalid_view(
 			expression.span(),
@@ -2624,10 +2626,10 @@ fn parse_modified_mark(
 		}
 	};
 	// PRODUCT-0046 §1: a register belongs to the mark, so every encoding form of
-	// that mark admits it. Line has one form; bar and scatter each take an
-	// optional third color field.
+	// that mark admits it. Line, bar, and scatter each take an optional third
+	// color field in standalone positions.
 	let arity_ok = match plot_type {
-		PlotType::Line => args.len() == 2,
+		PlotType::Line => matches!(args.len(), 2 | 3),
 		_ => matches!(args.len(), 2 | 3),
 	};
 	if !arity_ok {
@@ -2635,7 +2637,7 @@ fn parse_modified_mark(
 			expression.span(),
 			source.len(),
 			match plot_type {
-				PlotType::Line => "a modified line takes x and y string fields",
+				PlotType::Line => "a modified line takes x and y strings with an optional series",
 				PlotType::Bar => "a modified bar takes x and y strings with an optional series",
 				_ => "a modified scatter takes x and y strings with an optional category",
 			},
@@ -2744,7 +2746,7 @@ fn parse_sugar_sink(
 	source: &str,
 ) -> Result<ParsedSink, RuneEnvelopeError> {
 	let valid_arity = match plot_type {
-		PlotType::Line => args.len() == 2,
+		PlotType::Line => matches!(args.len(), 2 | 3),
 		PlotType::Bar | PlotType::Scatter => matches!(args.len(), 2 | 3),
 		_ => false,
 	};
@@ -2754,7 +2756,7 @@ fn parse_sugar_sink(
 				"scatter view sugar requires x and y strings with an optional category"
 			}
 			PlotType::Bar => "bar view sugar requires x and y strings with an optional series",
-			PlotType::Line => "line view sugar requires x and y string fields",
+			PlotType::Line => "line view sugar requires x and y strings with an optional series",
 			_ => unreachable!("only Rune plot view forms reach sugar parsing"),
 		};
 		return invalid_view(call.span(), source.len(), message);
@@ -2899,7 +2901,7 @@ fn recognize_view_root(
 			}))),
 			args[0],
 		),
-		"plot.line" if !shadows.plot && args.len() == 3 => {
+		"plot.line" if !shadows.plot && matches!(args.len(), 3 | 4) => {
 			let Some(sink) = plot_sink(PlotType::Line, source, &args)? else {
 				return invalid_view(
 					call.span(),
@@ -2916,7 +2918,7 @@ fn recognize_view_root(
 			return invalid_view(
 				call.span(),
 				source.len(),
-				"plot.line(...) takes a relation plus x and y string fields",
+				"plot.line(...) takes a relation plus x and y strings with an optional series",
 			);
 		}
 		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
@@ -3745,7 +3747,7 @@ mod tests {
 
 		for source in [
 			"workspace.table(\"t\").views([line(\"x\")])",
-			"workspace.table(\"t\").views([line(\"x\", \"y\", \"series\")])",
+			"workspace.table(\"t\").views([line(\"x\", \"y\", \"series\", \"extra\")])",
 			"workspace.table(\"t\").views([line(x, \"y\")])",
 			"workspace.table(\"t\").line(\"x\")",
 			"plot.line(workspace.table(\"t\"), \"x\")",
@@ -3765,6 +3767,92 @@ mod tests {
 			transform(partial),
 			Err(RuneEnvelopeError::InvalidView { .. })
 		));
+	}
+
+	#[test]
+	fn product_0054_series_line_spellings_project_one_named_color_channel() {
+		let sources = [
+			"workspace.table(\"t\").line(\"x\", \"y\", \"series\")",
+			"workspace.table(\"t\").views([line(\"x\", \"y\", \"series\")])",
+			"plot.line(workspace.table(\"t\"), \"x\", \"y\", \"series\")",
+		];
+		let semantics = sources.map(|source| envelope(source).semantics());
+		assert_eq!(semantics[0], semantics[1]);
+		assert_eq!(semantics[0], semantics[2]);
+		for semantics in semantics {
+			let RuneViewIntent::Plot(plot) = &semantics.sinks[0] else {
+				panic!("series line must remain a plot sink")
+			};
+			let RunePlotBody::Single(line) = &plot.body else {
+				panic!("unmodified series line must remain a single mark")
+			};
+			assert_eq!(line.composition.primary_plot_type(), PlotType::Line);
+			assert_eq!((&line.x, &line.y), (&"x".to_owned(), &"y".to_owned()));
+			assert_eq!(line.category.as_deref(), Some("series"));
+		}
+	}
+
+	#[test]
+	fn product_0054_series_line_reaches_named_figure_and_native_modifier_positions() {
+		for source in [
+			"workspace.table(\"t\").views([view(\"trend\", line(\"x\", \"y\", \"series\"))])",
+			"workspace.table(\"t\").views([figure([line(\"x\", \"y\", \"series\")])])",
+		] {
+			let transformed = transform(source).expect("series line position");
+			let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+				panic!("series line must remain a plot")
+			};
+			let RunePlotBody::Single(line) = &plot.body else {
+				panic!("unmodified series line must remain a single mark")
+			};
+			assert_eq!(line.category.as_deref(), Some("series"));
+		}
+
+		let styled = transform(
+			"workspace.table(\"t\").views([figure([line(\"x\", \"y\", \"series\").stroke_width(2.0)])])",
+		)
+		.expect("styled series line");
+		let RuneViewIntent::Plot(plot) = &styled.views[0].intent else {
+			panic!("styled series line must remain a plot")
+		};
+		let RunePlotBody::StyledSingle(styled) = &plot.body else {
+			panic!("series modifier must be retained")
+		};
+		assert_eq!(styled.sink.category.as_deref(), Some("series"));
+		assert_eq!(
+			styled.settings.stroke_width,
+			Override::Set(StrokeWidth::new(2.0).unwrap())
+		);
+	}
+
+	#[test]
+	fn product_0054_series_line_refusals_keep_layers_closed_and_rune_contextual() {
+		for source in [
+			"workspace.table(\"t\").views([line(\"x\", \"y\", \"series\", \"extra\")])",
+			"workspace.table(\"t\").views([line(\"x\", \"y\", series)])",
+			"workspace.table(\"t\").views([layers([line(\"x\", \"y\", \"series\")])])",
+		] {
+			assert!(
+				matches!(
+					transform(source),
+					Err(RuneEnvelopeError::InvalidView { .. })
+				),
+				"malformed series line must refuse: {source}"
+			);
+		}
+
+		let source = r#"
+let held = line("x", "y", "series");
+consume(line("a", "b", "group"));
+workspace.table("t").views([table()])
+"#;
+		let transformed = transform(source).expect("ordinary line calls stay ordinary Rune");
+		assert!(
+			transformed
+				.source
+				.contains("line(\"x\", \"y\", \"series\")")
+		);
+		assert!(transformed.source.contains("line(\"a\", \"b\", \"group\")"));
 	}
 
 	#[test]

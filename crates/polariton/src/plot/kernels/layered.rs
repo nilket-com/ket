@@ -4,7 +4,7 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings, format_label,
 };
-use crate::plot::kernels::line::{LineMarkRenderer, LinePreparedData};
+use crate::plot::kernels::line::{LineMarkRenderer, LinePreparedData, series_color};
 use crate::plot::kernels::scatter::{ScatterMarkRenderer, ScatterPreparedData};
 use crate::plot::spec::{LayerSettings, NonEmpty, ResolvedLayout};
 use crate::plot::theme::PlotSettings;
@@ -86,13 +86,12 @@ impl LayerRenderer {
 	) -> Option<crate::plot::legend::LegendContent> {
 		match self {
 			Self::Line(renderer, _) => {
-				crate::plot::legend::entries_from_labels_with_sample_and_provenance(
+				crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 					renderer
 						.prepared_data
 						.series
 						.iter()
-						.map(|series| series.name.clone()),
-					settings,
+						.map(|series| (series.name.clone(), series_color(series, settings))),
 					crate::plot::legend::LegendSample::LineSample,
 					renderer
 						.prepared_data

@@ -1246,6 +1246,20 @@ pub fn resolve_channels(
 		schema,
 		&mut unavailable_to_auto,
 	)?;
+	if plot_type == PlotType::Line
+		&& color.as_ref().is_some_and(|channel| {
+			!matches!(
+				channel.semantic_type,
+				SemanticType::Nominal | SemanticType::Ordinal
+			)
+		}) {
+		let color = color.as_ref().expect("checked as present");
+		return Err(ChannelError {
+			channel: Channel::Color,
+			field: color.field.clone(),
+			reason: "line series must be categorical".to_owned(),
+		});
+	}
 	let color_job = color.as_ref().map(|channel| match spec.color_job {
 		Override::Set(job) => job,
 		Override::Inherit => default_color_job(channel.semantic_type),
@@ -2381,6 +2395,7 @@ fn categorical_color(index: usize) -> ResolvedColor {
 mod tests {
 	use super::*;
 	use polars::df;
+	use polars::prelude::Column;
 
 	fn stamped(data: DataFrame) -> StampedResult {
 		StampedResult {
@@ -3254,6 +3269,78 @@ mod tests {
 				x: "x".to_owned(),
 				y: "y".to_owned(),
 			}
+		);
+	}
+
+	#[test]
+	fn product_0054_line_series_is_categorical_bounded_and_exactly_attributed() {
+		let accepted = stamped(
+			df!(
+				"x" => [1.0, 2.0],
+				"y" => [3.0, 5.0],
+				"series" => ["Atlas", "Beacon"]
+			)
+			.unwrap(),
+		);
+		let spec = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Line),
+			"x",
+			"y",
+			Some("series".to_owned()),
+		);
+		let (resolved, _) = resolve(&spec, &accepted, &ColorIdentity::default()).unwrap();
+		assert_eq!(resolved.color_job, Some(ColorJob::Categorical));
+		assert_eq!(
+			resolved
+				.channel(Channel::Color)
+				.expect("series channel")
+				.colors
+				.len(),
+			2
+		);
+		assert!(matches!(
+			resolved.kernel_fields.as_ref(),
+			ResolvedKernelFields::Line { series: Some(series), .. } if series == "series"
+		));
+
+		let missing = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Line),
+			"x",
+			"y",
+			Some("missing".to_owned()),
+		);
+		let error = resolve(&missing, &accepted, &ColorIdentity::default()).unwrap_err();
+		assert!(error.contains("missing"), "{error}");
+
+		let numeric = stamped(
+			df!(
+				"x" => [1.0, 2.0],
+				"y" => [3.0, 5.0],
+				"series" => [10.0, 20.0]
+			)
+			.unwrap(),
+		);
+		let error = resolve(&spec, &numeric, &ColorIdentity::default()).unwrap_err();
+		assert!(error.contains("series"), "{error}");
+		assert!(error.contains("categorical"), "{error}");
+
+		let categories = (0..13).map(|index| format!("s{index}")).collect::<Vec<_>>();
+		let over_capacity = stamped(
+			DataFrame::new(
+				categories.len(),
+				vec![
+					Column::new("x".into(), (0..13).map(f64::from).collect::<Vec<_>>()),
+					Column::new("y".into(), (0..13).map(f64::from).collect::<Vec<_>>()),
+					Column::new("series".into(), categories),
+				],
+			)
+			.unwrap(),
+		);
+		let error = resolve(&spec, &over_capacity, &ColorIdentity::default()).unwrap_err();
+		assert!(error.contains("series"), "{error}");
+		assert!(
+			error.contains("cardinality exceeds declared limit 12"),
+			"{error}"
 		);
 	}
 

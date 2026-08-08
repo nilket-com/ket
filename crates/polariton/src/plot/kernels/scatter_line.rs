@@ -36,9 +36,7 @@ impl ScatterLinePlotKernel {
 			x_label: scatter_data.x_label.clone(),
 			y_label: scatter_data.y_label.clone(),
 			scatter: ScatterPlotKernel::new(scatter_data),
-			line: LinePlotKernel {
-				prepared_data: line_data,
-			},
+			line: LinePlotKernel::new(line_data),
 		}
 	}
 }

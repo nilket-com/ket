@@ -1,6 +1,6 @@
 # ADR 0054: the series line surface
 
-Status: proposed 2026-08-08. This record makes the existing grouped-line
+Status: accepted 2026-08-08. This record makes the existing grouped-line
 substrate authorable as `line("x", "y", "series")` and repairs the two routing
 seams that Stage 0 found before exposing it: authored series colors must reach
 line paint and legend as resolved assignments, and the inherited line modifier
@@ -97,6 +97,12 @@ from a resolved color channel, including scatter-line overlay, so its line and
 point samples cannot disagree about one series. Unrelated dashboard line
 consumers without a resolved channel remain unchanged.
 
+This repair changes no committed overlay pixel contingently: the existing
+PRODUCT-0043 scatter-line baseline calls `prepare_line_data` with an empty
+series field, so it has no resolved channel to reroute. Gates 8 and 11 can both
+hold for that measured reason, not because color routing is pixel-neutral when
+a channel exists.
+
 ### 4. The inherited line register reaches the standalone form
 
 PRODUCT-0046 already decides that line's register contains
@@ -118,6 +124,11 @@ synthetic `All Data` entry remains omitted.
 
 Changing a view between `line(x, y)` and `line(x, y, series)` changes its
 encoding, not its view identity, panel, placement group, or label.
+
+Hover remains the accepted coordinate-only wording, `X: …, Y: …`. A geometric
+hit may select one of the paths, as it already does for a styled line, but the
+prepared series name does not enter the prose. Series-aware interaction is an
+explicit non-decision and remains the stop condition's named boundary.
 
 ## Acceptance gates
 
@@ -142,16 +153,75 @@ encoding, not its view identity, panel, placement group, or label.
    display domain, not partition iteration.
 8. Scatter-line overlay uses identical resolved colors for each line and point
    series after the routing repair; ordinary scatter, grouped bars, and stacked
-   or fill-between kernels pass unchanged.
-9. Four fields, nonliteral fields, duplicate/cross-register modifiers, and a
+   or fill-between kernels pass unchanged. The existing overlay baseline has
+   an empty series field, proving why its bytes remain unchanged.
+9. Hovering a series-line geometric hit returns the existing coordinate-only
+   `X: …, Y: …` prose with no series name; the same point in a two-field control
+   has identical wording. No series-aware hover model or fallback is added.
+10. Four fields, nonliteral fields, duplicate/cross-register modifiers, and a
    three-field line inside `layers([...])` refuse at the existing contextual
    boundaries. Ordinary Rune outside a proven sink remains ordinary.
-10. Every existing two-field line SVG, paint/hit oracle, panel lifecycle test,
+11. Every existing two-field line SVG, paint/hit oracle, panel lifecycle test,
     and layered-line baseline is byte-identical. No baseline is refreshed.
-11. The implementation adds `../uat/test18.rn` over `demo_sales`, explicitly
+12. The implementation adds `../uat/test18.rn` over `demo_sales`, explicitly
     sorted within product, showing four product lines and their named legend.
     The already-created `../uat/test17.rn` remains the corresponding
     four-product scatter exhibit.
+
+## Implementation evidence
+
+- The Rune envelope admits the optional series literal in legacy, relation
+  sugar, canonical, named-view, figure, and standalone modified positions.
+  Three spellings normalize to one sink with the third field retained as the
+  named color channel. Four fields, nonliterals, contextual ordinary Rune, and
+  the categorized form inside `layers([...])` are exercised as refusals.
+- Channel resolution now states the mark-specific semantic boundary that the
+  new surface requires: a line series must be nominal or ordinal. Missing,
+  quantitative, and thirteen-value over-capacity fields refuse with the series
+  field and categorical limit in the error; a valid series resolves exact
+  categorical assignments into `ResolvedKernelFields::Line`.
+- Line preparation has two explicit routes. A channel-absent compatibility
+  line keeps the existing theme sample and exact SVG. A resolved categorical
+  line requires one assignment for every data-read series, retains the exact
+  RGBA, and panics in the synthetic inconsistent-artifact gate rather than
+  silently falling back. Paint and `LineSample` legend entries consume the
+  same retained value.
+- The interleaved four-series gate observes three points per path in original
+  within-series order (`3,1,2` in the first path) and four separate prepared
+  point vectors. No implicit x sort or cross-partition segment is introduced.
+  When exact assignments are present, legend and paint order follows their
+  resolved display order rather than `partition_by` iteration.
+- The standalone styled factory now admits `ResolvedKernelFields::Line` and
+  retains its `LayerSettings`. A native two-series kernel paints two 4px paths
+  for `.stroke_width(2.0)`, hits geometrically, and returns the exact existing
+  coordinate-only prose; a two-field control returns identical prose at the
+  same point.
+- Scatter-line preparation now sends categorical resolver assignments to both
+  renderers. The behavioral overlay gate finds every resolved RGB as both a
+  point fill and line stroke. Its committed PRODUCT-0043 baseline remains
+  byte-identical because that fixture has no color channel, exactly the
+  contingent premise recorded in §3.
+- A real 2×2 `PlotGrid` faceted by four line series consumes one globally
+  resolved body, paints each cell with its panel-blind assignment, and unions
+  four named line samples into one figure legend. A separate continuation gate
+  filters and reorders the domain, restores it, and compares the renderer's
+  retained name/color pairs for exact equality.
+- Fourteen PRODUCT-0054 behavior tests cover the surface, semantic refusal,
+  partition geometry, exact color handoff, no-fallback invariant, legend
+  policy, continuation identity, composite routing, native modifier, hover,
+  and grid union. All 41 existing architecture gates remain green; the closed
+  Scatter/Bar/Line projection needs no source-shape premise update.
+- No SVG, image, draw-operation, or expected-byte baseline was refreshed.
+  Every existing two-field line and the empty-series overlay corpus pass
+  unchanged. `crates/polariton/README.md` and the Rune workspace corpus now
+  document the optional series spelling and explicit-sort rule.
+- `../uat/test18.rn` sorts `demo_sales` by product then units and renders four
+  product paths with the Vapor categorical palette, a named legend, and the
+  inherited doubled stroke. `test17.rn` remains its grouped-scatter pair.
+- `cargo test --workspace --all-targets --no-fail-fast` and `cargo check
+  --workspace --all-targets` pass. The Polariton portion is 459 unit tests
+  passed (five live tests ignored), 41 architecture tests, and the trybuild UI
+  pair.
 
 ## Stop condition
 
@@ -189,4 +259,8 @@ encoding, not its view identity, panel, placement group, or label.
 - The visual audit gains paired UAT exhibits: `test17.rn` for grouped scatter
   now, and `test18.rn` for series lines when this record lands.
 - The line substrate stops being the remaining categorical renderer that
-  reconstructs resolved colors from local cardinality.
+  reconstructs resolved colors from local cardinality. This closes the class
+  at three: `kernel_fields_from_channels` exhaustively projects authored color
+  channels only for Scatter, Bar, and Line, with every other mark unreachable.
+  A fourth categorical renderer cannot enter without changing that closed
+  match explicitly.

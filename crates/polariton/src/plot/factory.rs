@@ -22,7 +22,7 @@ use crate::plot::kernels::stacked_area::{self, StackedAreaPlotKernel};
 use crate::plot::kernels::stacked_bar::{self, StackedBarPlotKernel};
 use crate::plot::kernels::violin::{self, ViolinPlotKernel};
 use crate::plot::spec::{
-	BandFillAssignment, CategoryColorAssignment, Channel, LayerMark, LayerSettings,
+	BandFillAssignment, CategoryColorAssignment, Channel, ColorJob, LayerMark, LayerSettings,
 	LayeredPlotSpec, NonEmpty, PlotProvenance, ResolvedKernelFields, ResolvedLayerSpec,
 	ResolvedLayout, ResolvedPlotSpec, StampedResult, resolve_layered_channels,
 	resolve_layered_domains,
@@ -55,10 +55,8 @@ pub fn create_plot(
 			})
 		}
 		ResolvedKernelFields::Line { series, x, y } => {
-			let prepared = line::prepare_line_data(df, series.as_deref().unwrap_or(""), x, y);
-			Arc::new(LinePlotKernel {
-				prepared_data: Arc::new(prepared),
-			})
+			let prepared = prepare_resolved_line(spec, df, series.as_deref().unwrap_or(""), x, y);
+			Arc::new(LinePlotKernel::new(Arc::new(prepared)))
 		}
 		ResolvedKernelFields::Bar {
 			category,
@@ -72,14 +70,15 @@ pub fn create_plot(
 			plot_type,
 			LayerSettings::default(),
 			&spec.band_fills,
-			resolved_group_colors(spec),
+			resolved_category_colors(spec),
 		),
 		ResolvedKernelFields::Scatter { color, x, y } => {
 			let scatter_data = Arc::new(scatter::prepare_scatter_data_resolved(
 				df, spec, width, height,
 			));
 			if spec.composition.is_scatter_with_line_overlay() {
-				let line_data = Arc::new(line::prepare_line_data(
+				let line_data = Arc::new(prepare_resolved_line(
+					spec,
 					df,
 					color.as_deref().unwrap_or(""),
 					x,
@@ -253,10 +252,25 @@ fn create_bar_kernel(
 
 /// PRODUCT-0029 §1: the exact assignments an authored categorical channel wrote
 /// into the resolved artifact, empty when no such channel exists.
-fn resolved_group_colors(spec: &ResolvedPlotSpec) -> &[CategoryColorAssignment] {
+fn resolved_category_colors(spec: &ResolvedPlotSpec) -> &[CategoryColorAssignment] {
 	spec.channel(Channel::Color)
 		.map(|channel| channel.colors.as_slice())
 		.unwrap_or(&[])
+}
+
+fn prepare_resolved_line(
+	spec: &ResolvedPlotSpec,
+	df: &DataFrame,
+	series: &str,
+	x: &str,
+	y: &str,
+) -> line::LinePreparedData {
+	match (spec.channel(Channel::Color), spec.color_job) {
+		(Some(channel), Some(ColorJob::Categorical)) => {
+			line::prepare_line_data_with_colors(df, series, x, y, &channel.colors)
+		}
+		_ => line::prepare_line_data(df, series, x, y),
+	}
 }
 
 /// Build a standalone mark with PRODUCT-0007 Layer-stage settings without
@@ -290,8 +304,20 @@ pub fn create_styled_plot(
 			plot_type,
 			layer_settings,
 			&spec.band_fills,
-			resolved_group_colors(spec),
+			resolved_category_colors(spec),
 		)),
+		ResolvedKernelFields::Line { series, x, y } => {
+			Ok(Arc::new(LinePlotKernel::with_layer_settings(
+				Arc::new(prepare_resolved_line(
+					spec,
+					df,
+					series.as_deref().unwrap_or(""),
+					x,
+					y,
+				)),
+				layer_settings,
+			)))
+		}
 		_ => Err("standalone Layer settings are not implemented for this plot mark".to_owned()),
 	}
 }
@@ -1451,5 +1477,168 @@ mod product_0013_baseline_tests {
 			include_str!("../../../../plans/product/impl/0043_legacy_legend_corpus.svg.txt");
 		assert!(corpus.contains("## Layered Plot"));
 		assert!(corpus.contains("## Scatter Line Plot"));
+	}
+
+	fn product_0054_resolved_line(
+		frame: &DataFrame,
+		composition: PlotComposition,
+		identity: &ColorIdentity,
+	) -> (ResolvedPlotSpec, ColorIdentity) {
+		let authored = AuthoredPlotSpec::xy_color(composition, "x", "y", Some("series".to_owned()));
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("line channels");
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0054".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").unwrap();
+		resolve_domains_with_categorical_palette(binding, &stamped, identity, &selection)
+			.expect("series line resolution")
+	}
+
+	#[test]
+	fn product_0054_factory_routes_resolved_colors_to_line_paint_and_legend() {
+		let frame = df!(
+			"series" => ["Atlas", "Beacon", "Cinder", "Atlas", "Beacon", "Cinder"],
+			"x" => [1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+			"y" => [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+		)
+		.expect("series line frame");
+		let (resolved, _) = product_0054_resolved_line(
+			&frame,
+			PlotComposition::single(PlotType::Line),
+			&ColorIdentity::default(),
+		);
+		let assignments = resolved
+			.channel(Channel::Color)
+			.expect("authored line color channel")
+			.colors
+			.clone();
+		let kernel = create_plot(&resolved, &frame, 100, 100);
+		let svg = render_marks(kernel.as_ref());
+		let settings = ResolvedPlotSettings::default();
+		let content = kernel
+			.legend_content(&settings)
+			.expect("series line legend");
+		let crate::plot::legend::LegendSection::Entries(entries) = content.0.first() else {
+			panic!("series line entries")
+		};
+		assert_eq!(entries.len(), assignments.len());
+		for (entry, assignment) in entries.iter().zip(&assignments) {
+			assert_eq!(entry.label, assignment.category);
+			assert_eq!(
+				entry.swatch,
+				iced::Color::from_rgba8(
+					assignment.color.red,
+					assignment.color.green,
+					assignment.color.blue,
+					assignment.color.alpha as f32 / 255.0,
+				)
+			);
+			let stroke = format!(
+				"stroke=\"rgb({}, {}, {})\"",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert!(svg.contains(&stroke), "missing {stroke}:\n{svg}");
+		}
+	}
+
+	#[test]
+	fn product_0054_filter_and_restore_keep_line_identity_at_the_renderer_boundary() {
+		fn mapping(spec: &ResolvedPlotSpec, frame: &DataFrame) -> Vec<(String, iced::Color)> {
+			let prepared = line::prepare_line_data_with_colors(
+				frame,
+				"series",
+				"x",
+				"y",
+				resolved_category_colors(spec),
+			);
+			prepared
+				.series
+				.into_iter()
+				.map(|series| (series.name, series.resolved_color.unwrap()))
+				.collect()
+		}
+
+		let full = df!(
+			"series" => ["Atlas", "Beacon", "Cinder", "Atlas", "Beacon", "Cinder"],
+			"x" => [1.0, 1.0, 1.0, 2.0, 2.0, 2.0],
+			"y" => [2.0, 3.0, 4.0, 5.0, 6.0, 7.0]
+		)
+		.expect("full line frame");
+		let filtered = df!(
+			"series" => ["Cinder", "Atlas", "Cinder", "Atlas"],
+			"x" => [1.0, 1.0, 2.0, 2.0],
+			"y" => [4.0, 2.0, 7.0, 5.0]
+		)
+		.expect("filtered line frame");
+		let composition = PlotComposition::single(PlotType::Line);
+		let (first, identity) =
+			product_0054_resolved_line(&full, composition.clone(), &ColorIdentity::default());
+		let (middle, identity) =
+			product_0054_resolved_line(&filtered, composition.clone(), &identity);
+		let (restored, _) = product_0054_resolved_line(&full, composition, &identity);
+		let first = mapping(&first, &full);
+		let middle = mapping(&middle, &filtered);
+		let restored = mapping(&restored, &full);
+		assert_eq!(first, restored);
+		for (name, color) in middle {
+			assert_eq!(
+				color,
+				first
+					.iter()
+					.find(|(candidate, _)| candidate == &name)
+					.expect("retained identity")
+					.1
+			);
+		}
+	}
+
+	#[test]
+	fn product_0054_scatter_line_overlay_shares_each_resolved_series_color() {
+		let frame = df!(
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+			"x" => [1.0, 1.0, 2.0, 2.0],
+			"y" => [2.0, 3.0, 4.0, 5.0]
+		)
+		.expect("overlay frame");
+		let mut composition = PlotComposition::single(PlotType::Scatter);
+		assert!(composition.add_layer(PlotType::Line));
+		let (resolved, _) =
+			product_0054_resolved_line(&frame, composition, &ColorIdentity::default());
+		let assignments = resolved_category_colors(&resolved).to_vec();
+		let svg = render_marks(create_plot(&resolved, &frame, 100, 100).as_ref());
+		for assignment in assignments {
+			let rgb = format!(
+				"rgb({}, {}, {})",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert!(svg.contains(&format!("fill=\"{rgb}\"")), "{svg}");
+			assert!(svg.contains(&format!("stroke=\"{rgb}\"")), "{svg}");
+		}
+	}
+
+	#[test]
+	fn product_0054_standalone_styled_factory_admits_the_series_line() {
+		let frame = df!(
+			"series" => ["Atlas", "Atlas", "Beacon", "Beacon"],
+			"x" => [1.0, 2.0, 1.0, 2.0],
+			"y" => [2.0, 4.0, 3.0, 5.0]
+		)
+		.expect("styled line frame");
+		let (resolved, _) = product_0054_resolved_line(
+			&frame,
+			PlotComposition::single(PlotType::Line),
+			&ColorIdentity::default(),
+		);
+		let settings = LayerSettings {
+			stroke_width: Override::Set(crate::plot::spec::StrokeWidth::new(2.0).unwrap()),
+			..LayerSettings::default()
+		};
+		let kernel = create_styled_plot(&resolved, &frame, settings).expect("styled series line");
+		let svg = render_marks_with_settings(kernel.as_ref(), &PlotSettings::default());
+		assert_eq!(svg.matches("stroke-width=\"4\"").count(), 2, "{svg}");
 	}
 }

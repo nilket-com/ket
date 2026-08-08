@@ -41,9 +41,7 @@ impl FillBetweenLinePlotKernel {
 			fill_between: FillBetweenPlotKernel {
 				prepared_data: fill_between_data,
 			},
-			line: LinePlotKernel {
-				prepared_data: line_data,
-			},
+			line: LinePlotKernel::new(line_data),
 		}
 	}
 }

@@ -30,7 +30,7 @@ a cited record).
 | theme-projected table skin (`table().skin("theme_expression")`; optional `.duotone()`) | executable | PRODUCT-0025 establishes identity resolution, atomic frame/skin lifecycle, and the closed table register. PRODUCT-0027 makes named absence select PaletteForward and `.duotone()` select the preserved two-anchor treatment (`74d00472`). PRODUCT-0035 makes authored contrast observational: every mechanically defined projection renders exactly, including `yellows.duotone()`, both `dark2_s1` projections, and identical paper/ink, without advice or repair (`cb2daa89`). Unknown identity and other no-defined-answer cases still refuse. Bare Rune, SQL, and Markdown tables retain PRODUCT-0023's contrast-gated compiled default; plot marks still refuse `.skin(...)`. |
 | bar sink (`plot.bar`; accepted sugar `r.bar(x, y)` and canonical `r.views([bar(x, y)])`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | scatter sink (`plot.scatter`; accepted sugar `r.scatter(x, y)` and canonical `r.views([scatter(x, y)])`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
-| line sink (`plot.line`; accepted sugar `r.line(x, y)` and canonical `r.views([line(x, y)])`) | executable | PRODUCT-0012 equivalence and contextual refusal in `product_0012_line_*`; exact authored x/y projection in `named_line_preserves_exact_xy_and_projects_the_existing_line_contract`; shared-result and real host-panel completion in `rune_relation_results_feed_the_existing_table_and_plot_surfaces` and `dogfood_multi_origin_views_populate_four_host_panels_without_a_dashboard`; installed-transport rendering in `live_product_0012_line_view_reaches_the_existing_kernel` |
+| line sink (`plot.line`; accepted sugar `r.line(x, y[, series])` and canonical `r.views([line(x, y[, series])])`) | executable | PRODUCT-0012 establishes the two-field form. PRODUCT-0054 adds the optional named series channel in every standalone position, preserves within-series relation order, routes exact resolved colors through paint/legend/composites, admits native `.stroke_width(...)`, and keeps categorized lines out of `layers([...])`; `test18.rn` is the four-product exhibit. |
 | shared-execution view fan-out (`r.views([...])`, one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink, including line, holds the *same* `Arc`, not equivalent copies; direct/factored/legacy equivalence plus accepted-surface live axis identity (`d4c2d8a8`, PRODUCT-0012) |
 | multi-origin view program (one execution per canonical relation origin) | executable | `multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity` proves canonical-origin deduplication and independent dispatch; `execution_grouping_cannot_reorder_interleaved_host_panels` completes origins out of order without changing presentation (`b99338f8`, `cad42680`) |
 | optional view identity (`view("name", sink)` or anonymous positional identity) | executable | session-scoped: duplicate names refuse with both spans; names retain one host-panel id across reruns and form changes; anonymous views reuse their presentation slot; durable restart identity remains deferred by PRODUCT-0010's recorded protocol halt (`284e88e0`, `cad42680`) |
@@ -80,14 +80,15 @@ and restored layouts require a future libaryon record.
 
 ## Accepted extension: line views
 
-Status: **accepted** by PRODUCT-0012 and executable. `plot.line(r, "x", "y")`,
-`r.line("x", "y")`, and `r.views([line("x", "y")])` are exact projections of
-one line intent. The first surface takes exactly two authored string fields and
-resolves them to the existing `ResolvedKernelFields::Line` contract with no
-series field. It inherits origin-keyed execution, shared-result identity, view
-addressing, panel placement, and staleness unchanged. The two-origin dogfood
-fixture now completes line + table and bar + table into four ordinary host
-panels without touching the dashboard.
+Status: **accepted** by PRODUCT-0012 and extended by PRODUCT-0054. The legacy,
+relation-sugar, and canonical forms are exact projections of one line intent
+with two authored strings plus an optional categorical series string. A named
+series lowers to the resolved color channel, partitions paths without crossing
+or implicit sorting, and consumes exact resolver assignments in both paint and
+legend. The two-field synthetic path remains unchanged. Categorized lines are
+standalone marks, inherit `.stroke_width(...)`, and remain excluded from
+`layers([...])`. Origin-keyed execution, shared-result identity, view addressing,
+panel placement, and staleness remain unchanged.
 
 ## Accepted substrate: ordered shared-Cartesian layers
 

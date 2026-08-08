@@ -3,14 +3,17 @@ use crate::plot::common::{
 	ResolvedPlotSettings, format_label, polars_type_to_axis_type,
 };
 use crate::plot::legend::LegendProvenance;
+use crate::plot::spec::{CategoryColorAssignment, LayerSettings, ResolvedColor};
+use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
-use iced::{Point, Rectangle};
+use iced::{Color, Point, Rectangle};
 use polars::prelude::*;
 use std::sync::Arc;
 
 pub struct LinePlotKernel {
 	pub prepared_data: Arc<LinePreparedData>,
+	layer_settings: Option<LayerSettings>,
 }
 
 pub struct LineMarkRenderer {
@@ -23,6 +26,25 @@ impl LineMarkRenderer {
 	}
 }
 
+impl LinePlotKernel {
+	pub fn new(prepared_data: Arc<LinePreparedData>) -> Self {
+		Self {
+			prepared_data,
+			layer_settings: None,
+		}
+	}
+
+	pub fn with_layer_settings(
+		prepared_data: Arc<LinePreparedData>,
+		layer_settings: LayerSettings,
+	) -> Self {
+		Self {
+			prepared_data,
+			layer_settings: Some(layer_settings),
+		}
+	}
+}
+
 impl MarkRenderer for LineMarkRenderer {
 	fn draw(
 		&self,
@@ -32,7 +54,7 @@ impl MarkRenderer for LineMarkRenderer {
 		settings: ResolvedPlotSettings,
 	) {
 		for series in &self.prepared_data.series {
-			let color = settings.color_theme.get_color(series.color_t);
+			let color = series_color(series, &settings);
 			let stroke = Stroke {
 				style: Style::Solid(color),
 				width: settings.stroke_width.width_px(),
@@ -151,6 +173,22 @@ impl PlotKernel for LinePlotKernel {
 			.draw(backend, _bounds, transform, settings);
 	}
 
+	fn plot_with_settings(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		_cursor: Cursor,
+		settings: &PlotSettings,
+	) {
+		let resolved = self.layer_settings.as_ref().map_or_else(
+			|| settings.resolve(),
+			|layer| settings.resolve_for_layer(layer),
+		);
+		LineMarkRenderer::new(Arc::clone(&self.prepared_data))
+			.draw(backend, bounds, transform, resolved);
+	}
+
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position()
 			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
@@ -164,16 +202,34 @@ impl PlotKernel for LinePlotKernel {
 		None
 	}
 
+	fn hover_with_settings(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+	) -> Option<String> {
+		let Some(layer) = self.layer_settings.as_ref() else {
+			return self.hover(transform, cursor);
+		};
+		let resolved = settings.resolve_for_layer(layer);
+		let hit = LineMarkRenderer::new(Arc::clone(&self.prepared_data))
+			.hit_test(transform, cursor, &resolved)?;
+		Some(format!(
+			"X: {}, Y: {}",
+			format_label(hit.data_x, self.prepared_data.x_axis_type),
+			format_label(hit.data_y, self.prepared_data.y_axis_type)
+		))
+	}
+
 	fn legend_content(
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels_with_sample_and_provenance(
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data
 				.series
 				.iter()
-				.map(|series| series.name.clone()),
-			settings,
+				.map(|series| (series.name.clone(), series_color(series, settings))),
 			crate::plot::legend::LegendSample::LineSample,
 			self.prepared_data
 				.series
@@ -196,6 +252,7 @@ pub struct SeriesData {
 	pub name: String,
 	pub points: Vec<[f64; 2]>,
 	pub color_t: f32,
+	pub resolved_color: Option<Color>,
 	pub provenance: LegendProvenance,
 }
 
@@ -214,6 +271,26 @@ pub fn prepare_line_data(
 	cat_col: &str,
 	x_col: &str,
 	y_col: &str,
+) -> LinePreparedData {
+	prepare_line_data_inner(df, cat_col, x_col, y_col, None)
+}
+
+pub fn prepare_line_data_with_colors(
+	df: &DataFrame,
+	cat_col: &str,
+	x_col: &str,
+	y_col: &str,
+	colors: &[CategoryColorAssignment],
+) -> LinePreparedData {
+	prepare_line_data_inner(df, cat_col, x_col, y_col, Some(colors))
+}
+
+fn prepare_line_data_inner(
+	df: &DataFrame,
+	cat_col: &str,
+	x_col: &str,
+	y_col: &str,
+	colors: Option<&[CategoryColorAssignment]>,
 ) -> LinePreparedData {
 	let x_col_series = match df.column(x_col) {
 		Ok(c) => c
@@ -305,10 +382,22 @@ pub fn prepare_line_data(
 		for j in 0..group_df.height() {
 			points.push([xs.get(j).unwrap(), ys.get(j).unwrap()]);
 		}
+		let resolved_color = colors.map(|colors| {
+			iced_color(
+				colors
+					.iter()
+					.find(|assignment| assignment.category == cat_name)
+					.unwrap_or_else(|| {
+						panic!("resolved line series {cat_name:?} has no color assignment")
+					})
+					.color,
+			)
+		});
 		series_list.push(SeriesData {
 			name: cat_name,
 			points,
 			color_t: t,
+			resolved_color,
 			provenance: if cat_col.is_empty() {
 				LegendProvenance::Synthetic
 			} else {
@@ -317,26 +406,37 @@ pub fn prepare_line_data(
 		});
 	}
 	if !cat_col.is_empty() {
-		let first_appearance = df
-			.column(cat_col)
-			.ok()
-			.into_iter()
-			.flat_map(|column| (0..df.height()).filter_map(move |index| column.get(index).ok()))
-			.map(|value| {
-				if let AnyValue::String(value) = value {
-					value.to_owned()
-				} else if value.is_null() {
-					"Null".to_owned()
-				} else {
-					value.to_string().replace('"', "")
-				}
-			})
-			.fold(Vec::new(), |mut seen, label| {
-				if !seen.contains(&label) {
-					seen.push(label);
-				}
-				seen
-			});
+		let first_appearance = colors.map_or_else(
+			|| {
+				df.column(cat_col)
+					.ok()
+					.into_iter()
+					.flat_map(|column| {
+						(0..df.height()).filter_map(move |index| column.get(index).ok())
+					})
+					.map(|value| {
+						if let AnyValue::String(value) = value {
+							value.to_owned()
+						} else if value.is_null() {
+							"Null".to_owned()
+						} else {
+							value.to_string().replace('"', "")
+						}
+					})
+					.fold(Vec::new(), |mut seen, label| {
+						if !seen.contains(&label) {
+							seen.push(label);
+						}
+						seen
+					})
+			},
+			|colors| {
+				colors
+					.iter()
+					.map(|assignment| assignment.category.clone())
+					.collect()
+			},
+		);
 		series_list.sort_by_key(|series| {
 			first_appearance
 				.iter()
@@ -360,5 +460,237 @@ pub fn prepare_line_data(
 		y_axis_type,
 		x_label: x_col.to_string(),
 		y_label: y_col.to_string(),
+	}
+}
+
+pub(crate) fn series_color(series: &SeriesData, settings: &ResolvedPlotSettings) -> Color {
+	series
+		.resolved_color
+		.unwrap_or_else(|| settings.color_theme.get_color(series.color_t))
+}
+
+fn iced_color(color: ResolvedColor) -> Color {
+	Color::from_rgba8(
+		color.red,
+		color.green,
+		color.blue,
+		color.alpha as f32 / 255.0,
+	)
+}
+
+#[cfg(test)]
+mod product_0054_tests {
+	use super::*;
+	use crate::plot::export::SvgBackend;
+	use crate::plot::legend::{LegendSample, LegendSection, apply_policy};
+	use crate::plot::spec::{Override, PalettePosition, StrokeWidth};
+	use iced::Size;
+	use polars::df;
+
+	fn assignments(names: &[&str]) -> Vec<CategoryColorAssignment> {
+		let colors = [
+			ResolvedColor {
+				red: 12,
+				green: 34,
+				blue: 56,
+				alpha: 255,
+			},
+			ResolvedColor {
+				red: 78,
+				green: 90,
+				blue: 123,
+				alpha: 255,
+			},
+			ResolvedColor {
+				red: 145,
+				green: 167,
+				blue: 189,
+				alpha: 255,
+			},
+			ResolvedColor {
+				red: 210,
+				green: 220,
+				blue: 230,
+				alpha: 255,
+			},
+		];
+		names
+			.iter()
+			.enumerate()
+			.map(|(index, name)| CategoryColorAssignment {
+				category: (*name).to_owned(),
+				position: PalettePosition::new(index, names.len()).unwrap(),
+				color: colors[index],
+			})
+			.collect()
+	}
+
+	#[test]
+	fn interleaved_rows_partition_without_crossing_or_implicit_sorting() {
+		let frame = df!(
+			"series" => ["Atlas", "Beacon", "Cinder", "Delta", "Atlas", "Beacon", "Cinder", "Delta", "Atlas", "Beacon", "Cinder", "Delta"],
+			"x" => [3.0, 30.0, 300.0, 3000.0, 1.0, 10.0, 100.0, 1000.0, 2.0, 20.0, 200.0, 2000.0],
+			"y" => [3.5, 30.5, 300.5, 3000.5, 1.5, 10.5, 100.5, 1000.5, 2.5, 20.5, 200.5, 2000.5]
+		)
+		.expect("interleaved line frame");
+		let prepared = prepare_line_data(&frame, "series", "x", "y");
+
+		assert_eq!(
+			prepared
+				.series
+				.iter()
+				.map(|series| series.name.as_str())
+				.collect::<Vec<_>>(),
+			["Atlas", "Beacon", "Cinder", "Delta"]
+		);
+		assert_eq!(
+			prepared.series[0].points,
+			[[3.0, 3.5], [1.0, 1.5], [2.0, 2.5]]
+		);
+		assert_eq!(
+			prepared.series[1].points,
+			[[30.0, 30.5], [10.0, 10.5], [20.0, 20.5]]
+		);
+		assert_eq!(
+			prepared.series[2].points,
+			[[300.0, 300.5], [100.0, 100.5], [200.0, 200.5]]
+		);
+		assert_eq!(
+			prepared.series[3].points,
+			[[3000.0, 3000.5], [1000.0, 1000.5], [2000.0, 2000.5]]
+		);
+		assert!(
+			prepared
+				.series
+				.iter()
+				.all(|series| series.points.len() == 3)
+		);
+	}
+
+	#[test]
+	fn paint_and_named_legend_consume_the_same_exact_resolved_assignments() {
+		let frame = df!(
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+			"x" => [1.0, 1.0, 2.0, 2.0],
+			"y" => [1.0, 2.0, 3.0, 4.0]
+		)
+		.expect("series line frame");
+		let assignments = assignments(&["Beacon", "Atlas"]);
+		let prepared = Arc::new(prepare_line_data_with_colors(
+			&frame,
+			"series",
+			"x",
+			"y",
+			&assignments,
+		));
+		let kernel = LinePlotKernel::new(prepared);
+		let settings = ResolvedPlotSettings::default();
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = SvgBackend::new(100.0, 100.0);
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		let svg = backend.finish();
+		assert!(svg.contains("stroke=\"rgb(12, 34, 56)\""), "{svg}");
+		assert!(svg.contains("stroke=\"rgb(78, 90, 123)\""), "{svg}");
+
+		let content = kernel.legend_content(&settings).expect("named line legend");
+		let LegendSection::Entries(entries) = content.0.first() else {
+			panic!("series line must emit entry samples")
+		};
+		assert_eq!(entries.len(), 2);
+		assert_eq!(entries.first().label, "Beacon");
+		assert_eq!(entries.first().sample, LegendSample::LineSample);
+		assert_eq!(entries.first().swatch, iced_color(assignments[0].color));
+		assert_eq!(entries.last().label, "Atlas");
+		assert_eq!(entries.last().swatch, iced_color(assignments[1].color));
+	}
+
+	#[test]
+	#[should_panic(expected = "resolved line series \"Beacon\" has no color assignment")]
+	fn authored_series_never_falls_back_when_a_resolved_assignment_is_missing() {
+		let frame = df!(
+			"series" => ["Atlas", "Beacon"],
+			"x" => [1.0, 2.0],
+			"y" => [2.0, 4.0]
+		)
+		.expect("inconsistent resolved fixture");
+		let incomplete = assignments(&["Atlas"]);
+		let _ = prepare_line_data_with_colors(&frame, "series", "x", "y", &incomplete);
+	}
+
+	#[test]
+	fn named_single_series_keeps_one_entry_while_synthetic_control_is_omitted() {
+		let frame = df!("series" => ["Atlas", "Atlas"], "x" => [1.0, 2.0], "y" => [2.0, 4.0])
+			.expect("one-series frame");
+		let settings = ResolvedPlotSettings::default();
+		let named = LinePlotKernel::new(Arc::new(prepare_line_data(&frame, "series", "x", "y")));
+		let named = apply_policy(named.legend_content(&settings).unwrap())
+			.expect("a data-read identity earns a legend");
+		let LegendSection::Entries(entries) = named.0.first() else {
+			panic!("named series legend")
+		};
+		assert_eq!(entries.len(), 1);
+		assert_eq!(entries.first().label, "Atlas");
+
+		let synthetic = LinePlotKernel::new(Arc::new(prepare_line_data(&frame, "", "x", "y")));
+		assert!(apply_policy(synthetic.legend_content(&settings).unwrap()).is_none());
+	}
+
+	#[test]
+	fn native_series_modifier_controls_stroke_and_keeps_coordinate_only_hover() {
+		let frame = df!(
+			"series" => ["Atlas", "Atlas", "Beacon", "Beacon"],
+			"x" => [1.0, 2.0, 1.0, 2.0],
+			"y" => [1.0, 1.0, 2.0, 2.0]
+		)
+		.expect("styled series frame");
+		let prepared = Arc::new(prepare_line_data(&frame, "series", "x", "y"));
+		let layer = LayerSettings {
+			stroke_width: Override::Set(StrokeWidth::new(2.0).unwrap()),
+			..LayerSettings::default()
+		};
+		let kernel = LinePlotKernel::with_layer_settings(prepared, layer);
+		let settings = PlotSettings::default();
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let layout = kernel.layout(settings.resolve());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = SvgBackend::new(100.0, 100.0);
+		kernel.plot_with_settings(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			&settings,
+		);
+		let svg = backend.finish();
+		assert_eq!(svg.matches("stroke-width=\"4\"").count(), 2, "{svg}");
+
+		let on_atlas = transform.cartesian(1.5, 1.0);
+		let hover = kernel
+			.hover_with_settings(&transform, Cursor::Available(on_atlas), &settings)
+			.expect("styled path hit");
+		assert_eq!(hover, "X: 1.5, Y: 1");
+		assert!(!hover.contains("Atlas"));
+		assert!(!hover.contains("Beacon"));
+
+		let two_field = LinePlotKernel::with_layer_settings(
+			Arc::new(prepare_line_data(&frame, "", "x", "y")),
+			LayerSettings {
+				stroke_width: Override::Set(StrokeWidth::new(2.0).unwrap()),
+				..LayerSettings::default()
+			},
+		);
+		assert_eq!(
+			two_field.hover_with_settings(&transform, Cursor::Available(on_atlas), &settings),
+			Some(hover),
+			"the new partition must not enter accepted hover prose"
+		);
 	}
 }

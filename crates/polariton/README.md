@@ -78,6 +78,24 @@ workspace.table("sales").views([
 including, `1.0`. The reserve stays centered on each categorical label and
 scales with the plot.
 
+#### Rune line presentation:
+
+Lines accept an optional categorical series field. Rows connect only within
+their series and retain relation order, so sort explicitly when x order matters:
+
+```rune
+workspace.table("sales")
+    .sort([col("product").asc(), col("units").asc()])
+    .views([
+        line("units", "revenue", "product")
+            .stroke_width(2.0),
+    ])
+```
+
+The named series share the figure palette and legend with grouped scatter and
+bar marks. The three-field form is a standalone mark and is not accepted inside
+`layers([...])`.
+
 #### Adapters:
  - SQLite (file or memory)
  - Parquet (single file)
