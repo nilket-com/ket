@@ -2401,32 +2401,37 @@ fn retry_read_status(status: ReadStatus, leader_hint: NodeId) -> Option<RetryDir
 	}
 }
 
-fn query_failure_error(status: ReadStatus) -> Error {
-	match status {
-		s if s == ReadStatus::RETENTION_EXPIRED => {
-			Error::new(ErrorKind::Other, "Wendelon query failed: RETENTION_EXPIRED")
-		}
-		s if s == ReadStatus::QUERY_INVALID_PROGRAM => Error::new(
-			ErrorKind::InvalidInput,
-			"Wendelon query failed: QUERY_INVALID_PROGRAM",
-		),
-		s if s == ReadStatus::TABLE_DESCRIPTOR_EVOLVED => Error::new(
-			ErrorKind::InvalidData,
-			"Wendelon query failed: TABLE_DESCRIPTOR_EVOLVED",
-		),
-		s if s == ReadStatus::QUERY_BUDGET_EXCEEDED => Error::new(
-			ErrorKind::Other,
-			"Wendelon query failed: QUERY_BUDGET_EXCEEDED",
-		),
-		s if s == ReadStatus::QUERY_CANCELLED => Error::new(
-			ErrorKind::Interrupted,
-			"Wendelon query failed: QUERY_CANCELLED",
-		),
-		other => Error::new(
-			ErrorKind::Other,
-			format!("Wendelon query failed: status={}", other.0),
-		),
+/// A failed query status, carried as the io error's typed source so it survives the
+/// transport seam intact — the same pattern as `TableReferenceIntegrityQueryError`. A
+/// status the server took the trouble to name must never degrade into a string on the
+/// way to the caller, and an *unnamed* status stays typed too, carrying its numeric
+/// value rather than falling back to a generic error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueryStatusError {
+	pub status: ReadStatus,
+}
+
+impl std::fmt::Display for QueryStatusError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"Wendelon query failed: {}({})",
+			self.status.as_str(),
+			self.status.0
+		)
 	}
+}
+
+impl std::error::Error for QueryStatusError {}
+
+fn query_failure_error(status: ReadStatus) -> Error {
+	let kind = match status {
+		s if s == ReadStatus::QUERY_INVALID_PROGRAM => ErrorKind::InvalidInput,
+		s if s == ReadStatus::TABLE_DESCRIPTOR_EVOLVED => ErrorKind::InvalidData,
+		s if s == ReadStatus::QUERY_CANCELLED => ErrorKind::Interrupted,
+		_ => ErrorKind::Other,
+	};
+	Error::new(kind, QueryStatusError { status })
 }
 
 fn query_failure_error_with_integrity(
@@ -4490,30 +4495,34 @@ mod tests {
 	fn query_failure_error_messages_name_terminal_query_statuses() {
 		assert_eq!(
 			query_failure_error(ReadStatus::QUERY_INVALID_PROGRAM).to_string(),
-			"Wendelon query failed: QUERY_INVALID_PROGRAM"
+			"Wendelon query failed: query_invalid_program(10)"
 		);
 		assert_eq!(
 			query_failure_error(ReadStatus::QUERY_BUDGET_EXCEEDED).to_string(),
-			"Wendelon query failed: QUERY_BUDGET_EXCEEDED"
+			"Wendelon query failed: query_budget_exceeded(11)"
 		);
 		assert_eq!(
 			query_failure_error(ReadStatus::RETENTION_EXPIRED).to_string(),
-			"Wendelon query failed: RETENTION_EXPIRED"
+			"Wendelon query failed: retention_expired(12)"
 		);
 		assert_eq!(
 			query_failure_error(ReadStatus::TABLE_DESCRIPTOR_EVOLVED).to_string(),
-			"Wendelon query failed: TABLE_DESCRIPTOR_EVOLVED"
+			"Wendelon query failed: table_descriptor_evolved(14)"
 		);
 		assert_eq!(
 			query_failure_error(ReadStatus::QUERY_CANCELLED).to_string(),
-			"Wendelon query failed: QUERY_CANCELLED"
+			"Wendelon query failed: query_cancelled(15)"
 		);
+		// An unnamed raw status stays typed and carries its numeric value — it must
+		// never degrade to a bare string or a generic error.
+		let unknown = query_failure_error(ReadStatus(200));
+		assert_eq!(unknown.to_string(), "Wendelon query failed: unknown(200)");
 		assert_eq!(
-			query_failure_error(ReadStatus::TENANT_UNAVAILABLE).to_string(),
-			format!(
-				"Wendelon query failed: status={}",
-				ReadStatus::TENANT_UNAVAILABLE.0
-			)
+			unknown
+				.get_ref()
+				.and_then(|source| source.downcast_ref::<QueryStatusError>())
+				.map(|error| error.status),
+			Some(ReadStatus(200))
 		);
 	}
 
@@ -4610,7 +4619,15 @@ mod tests {
 		assert!(result.next_batch().await.unwrap().is_some());
 		let err = result.next_batch().await.unwrap_err();
 		assert_eq!(err.kind(), ErrorKind::Other);
-		assert!(err.to_string().contains("QUERY_BUDGET_EXCEEDED"));
+		assert!(err.to_string().contains("query_budget_exceeded(11)"));
+		// The typed source survives the stream seam, so downstream consumers never
+		// have to sniff strings.
+		assert_eq!(
+			err.get_ref()
+				.and_then(|source| source.downcast_ref::<QueryStatusError>())
+				.map(|error| error.status),
+			Some(ReadStatus::QUERY_BUDGET_EXCEEDED)
+		);
 	}
 
 	#[tokio::test]

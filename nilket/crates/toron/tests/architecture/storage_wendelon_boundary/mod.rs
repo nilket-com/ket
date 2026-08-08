@@ -1,5 +1,6 @@
 #![allow(unused_imports)]
 
+pub(crate) mod query_status;
 pub(crate) mod ddl_admin;
 pub(crate) mod descriptor_invalidation;
 pub(crate) mod dml_delete_update;

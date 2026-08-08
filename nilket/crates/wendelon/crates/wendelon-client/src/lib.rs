@@ -486,6 +486,8 @@ pub enum ClientError {
 	Admin(WendelonAdminError),
 	#[error("read failed with status {status:?}")]
 	ReadFailed { status: ReadStatus },
+	#[error("wendelon query failed: {}({})", .status.as_str(), .status.0)]
+	QueryFailed { status: ReadStatus },
 }
 
 impl ClientError {
@@ -504,6 +506,7 @@ impl ClientError {
 			Self::SchemaUpdateRejected { .. } => StorageStatusKind::TerminalStorageError,
 			Self::Admin(_) => StorageStatusKind::TerminalStorageError,
 			Self::ReadFailed { status } => map_read_status_for_compute(*status),
+			Self::QueryFailed { status } => map_read_status_for_compute(*status),
 		}
 	}
 }
@@ -1673,7 +1676,22 @@ fn table_query_client_error(error: std::io::Error) -> ClientError {
 	if let Some(failure) = table_reference_integrity_failure_from_io(&error) {
 		return ClientError::TableReferenceIntegrityFailed { failure };
 	}
+	// A named status must cross this seam typed; only errors that genuinely carry no
+	// server status may remain Io — that is what keeps "unavailable" honest downstream.
+	if let Some(status) = query_status_failure_from_io(&error) {
+		return ClientError::QueryFailed { status };
+	}
 	ClientError::Io(error)
+}
+
+/// Extracts the typed query status when a terminal failure travels as an io error —
+/// the parallel of [`table_reference_integrity_failure_from_io`] for every named (and
+/// unnamed-but-numeric) `ReadStatus`.
+pub fn query_status_failure_from_io(error: &std::io::Error) -> Option<ReadStatus> {
+	error
+		.get_ref()
+		.and_then(|source| source.downcast_ref::<wendelon::client::QueryStatusError>())
+		.map(|error| error.status)
 }
 
 /// Extracts the wire diagnostic when a streaming terminal failure arrives
@@ -1796,6 +1814,52 @@ mod tests {
 				}
 			} if tenant_id == TenantId::new(7)
 		));
+	}
+
+	/// ADR 540's discriminating pair: the same io transport carries a budget expiry
+	/// and an integrity wedge, and they must surface as different typed variants —
+	/// this exact confusion cost the soak a day of misattribution.
+	#[test]
+	fn table_query_named_status_surfaces_typed_never_io() {
+		let error = std::io::Error::new(
+			std::io::ErrorKind::Other,
+			wendelon::client::QueryStatusError {
+				status: ReadStatus::QUERY_BUDGET_EXCEEDED,
+			},
+		);
+		let actual = table_query_client_error(error);
+		assert!(matches!(
+			actual,
+			ClientError::QueryFailed {
+				status: ReadStatus::QUERY_BUDGET_EXCEEDED
+			}
+		));
+		assert_eq!(
+			actual.to_string(),
+			"wendelon query failed: query_budget_exceeded(11)"
+		);
+
+		// An unnamed raw status stays typed and keeps its numeric value.
+		let unknown = table_query_client_error(std::io::Error::new(
+			std::io::ErrorKind::Other,
+			wendelon::client::QueryStatusError {
+				status: ReadStatus(200),
+			},
+		));
+		assert!(matches!(
+			unknown,
+			ClientError::QueryFailed {
+				status: ReadStatus(200)
+			}
+		));
+		assert_eq!(unknown.to_string(), "wendelon query failed: unknown(200)");
+
+		// A statusless transport failure is the only thing left for Io.
+		let transport = table_query_client_error(std::io::Error::new(
+			std::io::ErrorKind::ConnectionReset,
+			"peer reset",
+		));
+		assert!(matches!(transport, ClientError::Io(_)));
 	}
 
 	#[test]

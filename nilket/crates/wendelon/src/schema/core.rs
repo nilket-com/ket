@@ -1450,6 +1450,30 @@ impl ReadStatus {
 	/// acknowledged state readable.
 	pub const TABLE_REFERENCE_INTEGRITY_FAILED: Self = Self(16);
 
+	/// The canonical named-status list. ADR 540's totality guard holds the mapping
+	/// honest: a new status constant added without an entry here (and an `as_str`
+	/// name) fails the guard, because a status the server can emit but the boundary
+	/// cannot name is how failures collapse into generic errors.
+	pub const ALL_NAMED: [Self; 17] = [
+		Self::OK,
+		Self::KEY_NOT_FOUND,
+		Self::EPOCH_STALE,
+		Self::NOT_LEADER,
+		Self::LEASE_EXPIRED,
+		Self::INVALID_LEASE_SIGNATURE,
+		Self::E_SAFE_BEHIND,
+		Self::MIGRATION_INCOMPLETE,
+		Self::TENANT_UNAVAILABLE,
+		Self::AUTHORIZATION_FAILED,
+		Self::QUERY_INVALID_PROGRAM,
+		Self::QUERY_BUDGET_EXCEEDED,
+		Self::RETENTION_EXPIRED,
+		Self::BACKPRESSURED,
+		Self::TABLE_DESCRIPTOR_EVOLVED,
+		Self::QUERY_CANCELLED,
+		Self::TABLE_REFERENCE_INTEGRITY_FAILED,
+	];
+
 	pub const fn as_str(self) -> &'static str {
 		match self {
 			Self::OK => "ok",
@@ -2297,5 +2321,26 @@ mod tests {
 			std::mem::offset_of!(LogicalTypeListResponseMeta, definitions_len),
 			16
 		);
+	}
+}
+
+#[cfg(test)]
+mod adr540_read_status_tests {
+	use super::*;
+
+	#[test]
+	fn every_named_status_has_a_distinct_name_and_code() {
+		let mut codes = std::collections::BTreeSet::new();
+		let mut names = std::collections::BTreeSet::new();
+		for status in ReadStatus::ALL_NAMED {
+			assert_ne!(
+				status.as_str(),
+				"unknown",
+				"status {} is in ALL_NAMED without an as_str name",
+				status.0
+			);
+			assert!(codes.insert(status.0), "duplicate code {}", status.0);
+			assert!(names.insert(status.as_str()), "duplicate name");
+		}
 	}
 }

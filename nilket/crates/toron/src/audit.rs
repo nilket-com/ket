@@ -984,6 +984,8 @@ fn storage_error_class(error: &StorageError) -> &'static str {
 		StorageError::InvalidPbcProgram { .. } => "invalid_pbc_program",
 		StorageError::PermissionDenied { .. } => "permission_denied",
 		StorageError::Unavailable { .. } => "storage_unavailable",
+		// One rendering for audit and SQL alike: the server's own status name.
+		StorageError::QueryFailed { status, .. } => status.as_str(),
 		StorageError::TableReferenceIntegrity { .. } => "table_reference_integrity",
 		StorageError::Client { .. } => "storage_client",
 		StorageError::Arrow(_) => "arrow",

@@ -59,6 +59,12 @@ pub enum StorageError {
 		#[source]
 		source: wendelon_client::ClientError,
 	},
+	#[error("wendelon query failed: {}({})", .status.as_str(), .status.0)]
+	QueryFailed {
+		status: wendelon::schema::ReadStatus,
+		#[source]
+		source: wendelon_client::ClientError,
+	},
 	#[error("storage table reference integrity failure: {failure:?}")]
 	TableReferenceIntegrity {
 		failure: wendelon_client::TableReferenceIntegrityFailure,
@@ -106,6 +112,15 @@ impl From<wendelon_client::ClientError> for StorageError {
 				Self::TableReferenceIntegrity {
 					failure,
 					source: ClientError::Io(error),
+				}
+			}
+			source @ ClientError::QueryFailed { .. } => {
+				let ClientError::QueryFailed { status } = source else {
+					unreachable!("bound by the arm pattern above");
+				};
+				Self::QueryFailed {
+					status,
+					source: ClientError::QueryFailed { status },
 				}
 			}
 			source @ ClientError::QuotaExceeded { .. }
@@ -573,5 +588,36 @@ mod tests {
 				files.push(path);
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod adr540_query_status_tests {
+	use super::*;
+
+	/// The typed status arm outranks the Unavailable catch-all, the rendering names
+	/// the status with its numeric value, and `storage unavailable` is reserved for
+	/// failures that genuinely carry no server status.
+	#[test]
+	fn named_status_maps_typed_and_unavailable_stays_reserved() {
+		let status = wendelon::schema::ReadStatus::QUERY_BUDGET_EXCEEDED;
+		let mapped = StorageError::from(wendelon_client::ClientError::QueryFailed { status });
+		assert!(matches!(
+			mapped,
+			StorageError::QueryFailed {
+				status: wendelon::schema::ReadStatus::QUERY_BUDGET_EXCEEDED,
+				..
+			}
+		));
+		assert_eq!(
+			mapped.to_string(),
+			"wendelon query failed: query_budget_exceeded(11)"
+		);
+
+		let transport = StorageError::from(wendelon_client::ClientError::Io(std::io::Error::new(
+			std::io::ErrorKind::ConnectionReset,
+			"peer reset",
+		)));
+		assert_eq!(transport.to_string(), "storage unavailable");
 	}
 }
