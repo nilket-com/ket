@@ -11,8 +11,8 @@ use crate::plot::common::TickPlacement;
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
-	BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, PointSize, Presence,
-	StrokeWidth,
+	BarWidth, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, LegendPosition, Override,
+	PointSize, Presence, StrokeWidth,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -1243,6 +1243,7 @@ fn parse_figure(
 	let mut y_tick_step = None;
 	let mut x_minor_ticks = None;
 	let mut y_minor_ticks = None;
+	let mut legend = None;
 	let mut body = None;
 	let mut facet_span = None;
 	let mut facet_expr_span = None;
@@ -1265,12 +1266,44 @@ fn parse_figure(
 			return invalid_view(
 				item.span(),
 				source.len(),
-				"a figure child must be title(...), subtitle(...), skin(...), palette(...), x_bounds(...), y_bounds(...), x_tick_step(...), y_tick_step(...), x_minor_ticks(...), y_minor_ticks(...), or one plot body",
+				"a figure child must be title(...), subtitle(...), skin(...), palette(...), legend_at(...), hide_legend(), x_bounds(...), y_bounds(...), x_tick_step(...), y_tick_step(...), x_minor_ticks(...), y_minor_ticks(...), or one plot body",
 			);
 		};
 		let callee = source_slice(source, call.expr.span())?.trim();
 		let child_args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
 		match callee {
+			"legend_at" => {
+				if legend.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one legend placement or visibility element",
+					);
+				}
+				legend = Some(Presence::Show(parse_figure_legend_position(
+					item,
+					&child_args,
+					source,
+					literal_bindings,
+				)?));
+			}
+			"hide_legend" => {
+				if legend.is_some() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"a figure has at most one legend placement or visibility element",
+					);
+				}
+				if !child_args.is_empty() {
+					return invalid_view(
+						item.span(),
+						source.len(),
+						"hide_legend() takes no arguments",
+					);
+				}
+				legend = Some(Presence::Hide);
+			}
 			"title" => {
 				if title.is_some() {
 					return invalid_view(
@@ -1465,6 +1498,9 @@ fn parse_figure(
 	if let Some(subtitle) = subtitle {
 		authored_settings.subtitle = Presence::Show(Arc::new(subtitle));
 	}
+	if let Some(legend) = legend {
+		authored_settings.legend = legend;
+	}
 	let plot_skin_span = skin.as_ref().map(|(_, span)| span.clone());
 	if let Some((skin, _)) = skin {
 		authored_settings.plot_skin = Override::Set(skin);
@@ -1528,6 +1564,68 @@ fn parse_figure(
 		tick_step_spans,
 		minor_tick_spans,
 	})
+}
+
+fn parse_figure_legend_position(
+	outer: &ast::Expr,
+	args: &[&ast::Expr],
+	source: &str,
+	literal_bindings: &[LocalBinding],
+) -> Result<LegendPosition, RuneEnvelopeError> {
+	let [x, y] = args else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			"legend_at(...) takes exactly two numeric literals",
+		);
+	};
+	let mut values = [0.0; 2];
+	for (index, argument) in [x, y].into_iter().enumerate() {
+		let Some(resolved) = resolve_static_literal(
+			argument,
+			source,
+			literal_bindings,
+			outer.span().start.into_usize(),
+		)?
+		else {
+			return invalid_view(
+				argument.span(),
+				source.len(),
+				static_binding_name(
+					argument,
+					source,
+					literal_bindings,
+					outer.span().start.into_usize(),
+				)
+				.map(|name| {
+					format!("legend_at(...) binding {name:?} does not resolve to a literal")
+				})
+				.unwrap_or_else(|| {
+					"legend_at(...) requires unsuffixed numeric literals, optionally negated"
+						.to_owned()
+				}),
+			);
+		};
+		let StaticLiteralValue::Number(value) = resolved.value else {
+			return invalid_view(
+				argument.span(),
+				source.len(),
+				format!(
+					"legend_at(...) binding {} resolved to a string literal; expected a numeric literal",
+					resolved.binding.as_deref().unwrap_or("argument")
+				),
+			);
+		};
+		values[index] = value;
+	}
+	let Some(position) = LegendPosition::new(values[0], values[1]) else {
+		return invalid_view(
+			outer.span(),
+			source.len(),
+			"legend_at(...) requires finite positions",
+		);
+	};
+	Ok(position)
 }
 
 fn parse_figure_tick_step(
@@ -3726,6 +3824,106 @@ workspace.table("t").views([table()])
 		assert_eq!(plot.authored_settings, expected);
 		assert_eq!(view.intent.presentation().display_label, "Line + Scatter");
 		assert_eq!(view.intent.presentation().authored_title, expected.title);
+	}
+
+	#[test]
+	fn product_0050_legend_presence_lowers_static_bindings_and_unbounded_fractions() {
+		let source = r#"
+let legend_x = 1.5;
+let legend_y = -0.5;
+workspace.table("t").views([figure([
+	legend_at(legend_x, legend_y),
+	line("x", "y"),
+])])
+"#;
+		let transformed = transform(source).expect("authored legend position");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("expected plot");
+		};
+		let Presence::Show(position) = plot.authored_settings.legend else {
+			panic!("legend_at must lower to Show");
+		};
+		assert_eq!((position.x(), position.y()), (1.5, -0.5));
+
+		let hidden = transform(
+			"workspace.table(\"t\").views([figure([hide_legend(), line(\"x\", \"y\")])])",
+		)
+		.expect("hidden legend");
+		let RuneViewIntent::Plot(hidden) = &hidden.views[0].intent else {
+			panic!("expected plot");
+		};
+		assert!(matches!(hidden.authored_settings.legend, Presence::Hide));
+	}
+
+	#[test]
+	fn product_0050_legend_members_refuse_ambiguity_and_undefined_values_at_source() {
+		for (source, rejected) in [
+			(
+				"workspace.table(\"t\").views([figure([legend_at(0.1, 0.2), hide_legend(), line(\"x\", \"y\")])])",
+				"hide_legend()",
+			),
+			(
+				"workspace.table(\"t\").views([figure([hide_legend(), legend_at(0.1, 0.2), line(\"x\", \"y\")])])",
+				"legend_at(0.1, 0.2)",
+			),
+			(
+				"workspace.table(\"t\").views([figure([legend_at(0.1, 0.2), legend_at(0.3, 0.4), line(\"x\", \"y\")])])",
+				"legend_at(0.3, 0.4)",
+			),
+			(
+				"workspace.table(\"t\").views([figure([hide_legend(), hide_legend(), line(\"x\", \"y\")])])",
+				"hide_legend()",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, message } =
+				transform(source).expect_err("ambiguous legend property must refuse")
+			else {
+				panic!("expected attributed legend refusal");
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+			assert!(message.contains("at most one legend placement or visibility"));
+		}
+
+		for (member, expected) in [
+			("hide_legend(1)", "takes no arguments"),
+			("legend_at(0.5)", "takes exactly two numeric literals"),
+			("legend_at(1e999, 0.5)", "requires finite positions"),
+			(
+				"legend_at(value, 0.5)",
+				"requires unsuffixed numeric literals",
+			),
+		] {
+			let source =
+				format!("workspace.table(\"t\").views([figure([{member}, line(\"x\", \"y\")])])");
+			let RuneEnvelopeError::InvalidView { message, .. } =
+				transform(&source).expect_err("undefined legend property must refuse")
+			else {
+				panic!("expected attributed legend refusal");
+			};
+			assert!(message.contains(expected), "{message}");
+		}
+	}
+
+	#[test]
+	fn product_0050_legend_spellings_are_ordinary_rune_outside_a_figure_member() {
+		let source = r#"
+legend_at(0.98, 0.02);
+let hidden = hide_legend();
+consume(legend_at(1.5, -0.5));
+workspace.table("t").views([table()])
+"#;
+		let transformed = transform(source).expect("ordinary calls are retained");
+		for retained in [
+			"legend_at(0.98, 0.02);",
+			"let hidden = hide_legend();",
+			"consume(legend_at(1.5, -0.5));",
+		] {
+			assert!(transformed.source.contains(retained), "missing {retained}");
+		}
+		assert!(matches!(
+			transformed.views[0].intent,
+			RuneViewIntent::Table(_)
+		));
 	}
 
 	#[test]

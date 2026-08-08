@@ -1,5 +1,9 @@
 use std::path::Path;
 
+#[allow(dead_code)]
+#[path = "../src/coordinate.rs"]
+mod coordinate;
+
 #[path = "../../../tests/support/manifest_dependency_guard.rs"]
 mod manifest_dependency_guard;
 
@@ -44,14 +48,22 @@ fn product_0001_polariton_reaches_nilket_only_through_the_public_client() {
 
 #[test]
 fn product_0049_coordinate_vocabulary_stays_closed_and_opaque() {
+	use coordinate::{ALL_SPACES, SpaceName};
+
 	let coordinate =
 		std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coordinate.rs"))
 			.expect("read coordinate vocabulary");
 
-	assert!(
-		coordinate.contains("define_spaces!(Window, Widget, Cell, Plot, Content);")
-			&& !coordinate.contains("define_spaces!(Window, Widget, Cell, Plot, Content,"),
-		"the closed vocabulary must be generated from exactly the five census-derived spaces"
+	assert_eq!(
+		ALL_SPACES,
+		&[
+			SpaceName::Window,
+			SpaceName::Widget,
+			SpaceName::Cell,
+			SpaceName::Plot,
+			SpaceName::Content,
+		],
+		"the architecture gate must consume the real closed vocabulary"
 	);
 	assert!(
 		coordinate.contains("mod sealed {")

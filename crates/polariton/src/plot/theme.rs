@@ -9,7 +9,8 @@ use crate::plot::chrome::{PlotChrome, PlotChromeProjection};
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode, TickPlacement};
 use crate::plot::spec::{
-	BarWidth, ColorJob, LayerSettings, Override, PointSize, Presence, StrokeWidth,
+	BarWidth, ColorJob, LayerSettings, LegendPosition, Override, PointSize, Presence,
+	ResolvedPresence, StrokeWidth,
 };
 use iced::Color;
 use libaryon::engine::UiPalette;
@@ -207,6 +208,7 @@ pub struct PlotSettingsLayer {
 	pub subtitle: Presence<Arc<String>>,
 	pub x_label: Presence<Arc<String>>,
 	pub y_label: Presence<Arc<String>>,
+	pub legend: Presence<LegendPosition>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -243,6 +245,7 @@ impl Default for PlotSettingsLayer {
 			subtitle: Presence::Inherit,
 			x_label: Presence::Inherit,
 			y_label: Presence::Inherit,
+			legend: Presence::Inherit,
 		}
 	}
 }
@@ -404,6 +407,7 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 	apply_presence(&mut settings.subtitle, &layer.subtitle);
 	apply_presence(&mut settings.x_label, &layer.x_label);
 	apply_presence(&mut settings.y_label, &layer.y_label);
+	apply_presence(&mut settings.legend, &layer.legend);
 }
 
 fn apply_layer_settings(settings: &mut ResolvedPlotSettings, layer: &LayerSettings) {
@@ -418,11 +422,11 @@ fn apply_layer_settings(settings: &mut ResolvedPlotSettings, layer: &LayerSettin
 	}
 }
 
-fn apply_presence(target: &mut Option<Arc<String>>, presence: &Presence<Arc<String>>) {
+fn apply_presence<T: Clone>(target: &mut ResolvedPresence<T>, presence: &Presence<T>) {
 	match presence {
 		Presence::Inherit => {}
-		Presence::Show(value) => *target = Some(Arc::clone(value)),
-		Presence::Hide => *target = None,
+		Presence::Show(value) => *target = ResolvedPresence::Show(value.clone()),
+		Presence::Hide => *target = ResolvedPresence::Hide,
 	}
 }
 
@@ -488,17 +492,34 @@ mod tests {
 	#[test]
 	fn five_layer_precedence_is_right_biased_and_hide_is_not_a_value_override() {
 		let mut cascade = PlotSettings::default();
-		cascade.library_defaults.title = Some(Arc::new("library".to_owned()));
+		assert!(matches!(
+			cascade.resolve().title,
+			ResolvedPresence::Fallback
+		));
+		assert!(matches!(
+			cascade.resolve().legend,
+			ResolvedPresence::Fallback
+		));
+		cascade.library_defaults.title = ResolvedPresence::Show(Arc::new("library".to_owned()));
 		cascade.application_theme.title = Presence::Show(Arc::new("application".to_owned()));
 		cascade.authored_spec.title = Presence::Show(Arc::new("authored".to_owned()));
 		cascade.layer.title = Presence::Show(Arc::new("layer".to_owned()));
 		cascade.pane_override.title = Presence::Show(Arc::new("pane".to_owned()));
-		assert_eq!(
-			cascade.resolve().title.as_deref().map(String::as_str),
-			Some("pane")
-		);
+		assert!(matches!(
+			cascade.resolve().title,
+			ResolvedPresence::Show(ref title) if title.as_str() == "pane"
+		));
 		cascade.pane_override.title = Presence::Hide;
-		assert!(cascade.resolve().title.is_none());
+		assert!(matches!(cascade.resolve().title, ResolvedPresence::Hide));
+
+		let authored_position = LegendPosition::new(0.98, 0.02).unwrap();
+		cascade.authored_spec.legend = Presence::Show(authored_position);
+		assert_eq!(
+			cascade.resolve().legend,
+			ResolvedPresence::Show(authored_position)
+		);
+		cascade.pane_override.legend = Presence::Hide;
+		assert!(matches!(cascade.resolve().legend, ResolvedPresence::Hide));
 
 		cascade.application_theme.theme = Override::Set(PlotThemeSpec::default());
 		cascade.pane_override.theme = Override::Set(PlotThemeSpec {

@@ -2,8 +2,8 @@ use crate::coordinate::{Plot, Pt, Rect, Widget, Window};
 use crate::gui::messages::PlotMessage;
 use crate::plot::chrome::PlotChrome;
 use crate::plot::colors::ColorTheme;
-use crate::plot::legend::{LegendContent, render_legend};
-use crate::plot::spec::{BarWidth, PointSize, StrokeWidth};
+use crate::plot::legend::{LegendContent, legend_layout, render_legend};
+use crate::plot::spec::{BarWidth, LegendPosition, PointSize, ResolvedPresence, StrokeWidth};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
@@ -383,6 +383,7 @@ pub struct ResolvedPlotSettings {
 	pub max_legend_rows: u32,
 	pub legend_x: f32,
 	pub legend_y: f32,
+	pub legend: ResolvedPresence<LegendPosition>,
 	pub x_label_rotation: f32,
 	pub x_label_offset: f32,
 	pub color_theme: ColorTheme,
@@ -394,10 +395,10 @@ pub struct ResolvedPlotSettings {
 	pub x_max: Option<f64>,
 	pub y_min: Option<f64>,
 	pub y_max: Option<f64>,
-	pub title: Option<Arc<String>>,
-	pub subtitle: Option<Arc<String>>,
-	pub x_label: Option<Arc<String>>,
-	pub y_label: Option<Arc<String>>,
+	pub title: ResolvedPresence<Arc<String>>,
+	pub subtitle: ResolvedPresence<Arc<String>>,
+	pub x_label: ResolvedPresence<Arc<String>>,
+	pub y_label: ResolvedPresence<Arc<String>>,
 	pub title_offset: f32,
 	pub subtitle_offset: f32,
 	pub x_label_padding: f32,
@@ -446,6 +447,7 @@ impl Default for ResolvedPlotSettings {
 			max_legend_rows: 10,
 			legend_x: 0.95,
 			legend_y: 0.05,
+			legend: ResolvedPresence::Fallback,
 			x_label_rotation: 0.0,
 			x_label_offset: 10.0,
 			color_theme: ColorTheme::default(),
@@ -457,10 +459,10 @@ impl Default for ResolvedPlotSettings {
 			x_max: None,
 			y_min: None,
 			y_max: None,
-			title: None,
-			subtitle: None,
-			x_label: None,
-			y_label: None,
+			title: ResolvedPresence::Fallback,
+			subtitle: ResolvedPresence::Fallback,
+			x_label: ResolvedPresence::Fallback,
+			y_label: ResolvedPresence::Fallback,
 			title_offset: 20.0,
 			subtitle_offset: 50.0,
 			x_label_padding: 45.0,
@@ -806,6 +808,17 @@ impl AxisTextVisibility {
 	pub const ALL: Self = Self { x: true, y: true };
 }
 
+fn resolve_canvas_text(
+	presence: &ResolvedPresence<Arc<String>>,
+	fallback: Option<String>,
+) -> Option<String> {
+	match presence {
+		ResolvedPresence::Fallback => fallback,
+		ResolvedPresence::Show(value) => Some(value.as_ref().to_owned()),
+		ResolvedPresence::Hide => None,
+	}
+}
+
 #[derive(Default)]
 pub struct PlotCanvasState {
 	last_click: Option<std::time::Instant>,
@@ -871,7 +884,12 @@ impl<'a> PlotWidget<'a> {
 			bounds.size(),
 			self.settings.chrome.canvas_background.iced(),
 		);
-		let plot_area = self.plot_area(bounds).into_iced();
+		let legend_content = self
+			.kernel
+			.legend_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
+		let plot_area = self.plot_area(legend.content_bounds).into_iced();
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		backend.with_save(&mut |backend| {
@@ -904,7 +922,12 @@ impl<'a> PlotWidget<'a> {
 			}
 			return;
 		}
-		let plot_area = self.plot_area(bounds).into_iced();
+		let legend_content = self
+			.kernel
+			.legend_content(&self.settings)
+			.and_then(crate::plot::legend::apply_policy);
+		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
+		let plot_area = self.plot_area(legend.content_bounds).into_iced();
 		let bounds = bounds.into_iced();
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
@@ -1022,33 +1045,22 @@ impl<'a> PlotWidget<'a> {
 			}
 		});
 		let size_only_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
-		if let Some(content) = self
-			.kernel
-			.legend_content(&self.settings)
-			.and_then(crate::plot::legend::apply_policy)
-		{
-			render_legend(backend, size_only_bounds, &content, &self.settings);
+		if let (Some(content), Some(origin)) = (legend_content.as_ref(), legend.origin) {
+			render_legend(backend, origin, content, &self.settings);
 		}
-		let title = self
-			.settings
-			.title
-			.as_ref()
-			.map(|s: &Arc<String>| s.to_string())
-			.unwrap_or(self.title.clone());
-		let subtitle = self
-			.settings
-			.subtitle
-			.as_ref()
-			.map(|s| s.as_ref().to_string());
-		backend.fill_text(Text {
-			content: title,
-			position: Point::new(size_only_bounds.width / 2.0, self.settings.title_offset),
-			color: self.settings.chrome.title_text.iced(),
-			size: iced::Pixels(self.settings.title_size),
-			align_x: alignment::Horizontal::Center.into(),
-			align_y: alignment::Vertical::Top,
-			..Default::default()
-		});
+		let title = resolve_canvas_text(&self.settings.title, Some(self.title.clone()));
+		let subtitle = resolve_canvas_text(&self.settings.subtitle, None);
+		if let Some(title) = title {
+			backend.fill_text(Text {
+				content: title,
+				position: Point::new(size_only_bounds.width / 2.0, self.settings.title_offset),
+				color: self.settings.chrome.title_text.iced(),
+				size: iced::Pixels(self.settings.title_size),
+				align_x: alignment::Horizontal::Center.into(),
+				align_y: alignment::Vertical::Top,
+				..Default::default()
+			});
+		}
 		if let Some(st) = subtitle {
 			backend.fill_text(Text {
 				content: st,
@@ -1064,27 +1076,18 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	fn render_global_headings(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
-		let title = self
-			.settings
-			.title
-			.as_ref()
-			.map(|s: &Arc<String>| s.to_string())
-			.unwrap_or(self.title.clone());
-		backend.fill_text(Text {
-			content: title,
-			position: Point::new(bounds.width / 2.0, self.settings.title_offset),
-			color: self.settings.chrome.title_text.iced(),
-			size: iced::Pixels(self.settings.title_size),
-			align_x: alignment::Horizontal::Center.into(),
-			align_y: alignment::Vertical::Top,
-			..Default::default()
-		});
-		if let Some(subtitle) = self
-			.settings
-			.subtitle
-			.as_ref()
-			.map(|s| s.as_ref().to_string())
-		{
+		if let Some(title) = resolve_canvas_text(&self.settings.title, Some(self.title.clone())) {
+			backend.fill_text(Text {
+				content: title,
+				position: Point::new(bounds.width / 2.0, self.settings.title_offset),
+				color: self.settings.chrome.title_text.iced(),
+				size: iced::Pixels(self.settings.title_size),
+				align_x: alignment::Horizontal::Center.into(),
+				align_y: alignment::Vertical::Top,
+				..Default::default()
+			});
+		}
+		if let Some(subtitle) = resolve_canvas_text(&self.settings.subtitle, None) {
 			backend.fill_text(Text {
 				content: subtitle,
 				position: Point::new(bounds.width / 2.0, self.settings.subtitle_offset),
@@ -1098,19 +1101,9 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	pub(crate) fn draw_axis_labels(&self, backend: &mut dyn PlotBackend, plot_area: Rectangle) {
-		let x_label = self
-			.settings
-			.x_label
-			.as_ref()
-			.map(|s: &Arc<String>| s.to_string())
-			.unwrap_or(self.kernel.x_label());
-		let y_label = self
-			.settings
-			.y_label
-			.as_ref()
-			.map(|s: &Arc<String>| s.to_string())
-			.unwrap_or(self.kernel.y_label());
-		if !x_label.is_empty() {
+		let x_label = resolve_canvas_text(&self.settings.x_label, Some(self.kernel.x_label()));
+		let y_label = resolve_canvas_text(&self.settings.y_label, Some(self.kernel.y_label()));
+		if let Some(x_label) = x_label.filter(|label| !label.is_empty()) {
 			backend.fill_text(Text {
 				content: x_label,
 				position: Point::new(
@@ -1124,7 +1117,7 @@ impl<'a> PlotWidget<'a> {
 				..Default::default()
 			});
 		}
-		if !y_label.is_empty() {
+		if let Some(y_label) = y_label.filter(|label| !label.is_empty()) {
 			backend.with_save(&mut |backend| {
 				backend.translate(iced::Vector::new(
 					plot_area.x - self.settings.y_label_padding,
@@ -1238,7 +1231,12 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					}
 					return None;
 				}
-				let plot_area = self.plot_area(widget_bounds);
+				let legend_content = self
+					.kernel
+					.legend_content(&self.settings)
+					.and_then(crate::plot::legend::apply_policy);
+				let legend = legend_layout(widget_bounds, legend_content.as_ref(), &self.settings);
+				let plot_area = self.plot_area(legend.content_bounds);
 				let layout = self.kernel.layout(self.settings.clone());
 				let transform = CoordinateTransformer::new(&layout, plot_area.into_iced());
 				let plot_cursor = widget_cursor
@@ -2072,7 +2070,9 @@ mod product_0031_pre_extraction_oracle {
 	use iced::advanced::mouse::Cursor;
 	use iced::widget::canvas::{Stroke, Style};
 
-	struct OracleKernel;
+	struct OracleKernel {
+		legend: bool,
+	}
 
 	impl PlotKernel for OracleKernel {
 		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
@@ -2111,6 +2111,9 @@ mod product_0031_pre_extraction_oracle {
 			&self,
 			_settings: &ResolvedPlotSettings,
 		) -> Option<crate::plot::legend::LegendContent> {
+			if !self.legend {
+				return None;
+			}
 			let entries = crate::plot::spec::NonEmpty::new(crate::plot::legend::LegendEntry {
 				label: "series".to_owned(),
 				swatch: Color::from_rgb8(17, 34, 51),
@@ -2133,10 +2136,11 @@ mod product_0031_pre_extraction_oracle {
 		}
 	}
 
-	fn oracle_svg(settings: ResolvedPlotSettings) -> String {
+	fn oracle_svg_with_legend(settings: ResolvedPlotSettings, legend: bool) -> String {
 		let settings_model = PlotSettings::from_resolved(settings.clone());
+		let kernel = OracleKernel { legend };
 		let widget = PlotWidget {
-			kernel: &OracleKernel,
+			kernel: &kernel,
 			title: "fallback title".to_owned(),
 			padding: 0.0,
 			settings,
@@ -2153,11 +2157,15 @@ mod product_0031_pre_extraction_oracle {
 		backend.finish()
 	}
 
+	fn oracle_svg(settings: ResolvedPlotSettings) -> String {
+		oracle_svg_with_legend(settings, true)
+	}
+
 	#[test]
 	fn product_0031_banks_the_two_field_renderer_before_extraction() {
 		let settings = ResolvedPlotSettings {
-			title: Some(Arc::new("authored title".to_owned())),
-			subtitle: Some(Arc::new("authored subtitle".to_owned())),
+			title: ResolvedPresence::Show(Arc::new("authored title".to_owned())),
+			subtitle: ResolvedPresence::Show(Arc::new("authored subtitle".to_owned())),
 			x_tick_placement: TickPlacement::count(1).unwrap(),
 			y_tick_placement: TickPlacement::count(1).unwrap(),
 			show_x_minor_ticks: false,
@@ -2169,6 +2177,28 @@ mod product_0031_pre_extraction_oracle {
 		let svg = oracle_svg(settings);
 		assert!(svg.contains(">series</text>"));
 		assert!(svg.contains("fill-opacity=\"0.60\""));
+	}
+
+	#[test]
+	fn product_0050_canvas_presence_keeps_all_three_pixel_states_distinct() {
+		let fallback = oracle_svg_with_legend(ResolvedPlotSettings::default(), false);
+		assert!(fallback.contains(">fallback title</text>"));
+
+		let mut shown = ResolvedPlotSettings::default();
+		shown.title = ResolvedPresence::Show(Arc::new("shown title".to_owned()));
+		let shown = oracle_svg_with_legend(shown, false);
+		assert!(shown.contains(">shown title</text>"));
+		assert!(!shown.contains(">fallback title</text>"));
+
+		let mut hidden = ResolvedPlotSettings::default();
+		hidden.title = ResolvedPresence::Hide;
+		hidden.legend = ResolvedPresence::Hide;
+		let hidden_with_content = oracle_svg_with_legend(hidden, true);
+		let mut hidden_without_content = ResolvedPlotSettings::default();
+		hidden_without_content.title = ResolvedPresence::Hide;
+		let no_content = oracle_svg_with_legend(hidden_without_content, false);
+		assert!(!hidden_with_content.contains(">fallback title</text>"));
+		assert_eq!(hidden_with_content, no_content);
 	}
 }
 

@@ -436,6 +436,7 @@ pub fn create_authored_plot(
 #[cfg(test)]
 mod product_0013_baseline_tests {
 	use super::*;
+	use crate::coordinate::{Pt, Rect, Widget};
 	use crate::plot::common::{CoordinateTransformer, PlotLayout, ResolvedPlotSettings};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::export::SvgBackend;
@@ -449,6 +450,19 @@ mod product_0013_baseline_tests {
 	use iced::advanced::mouse::Cursor;
 	use iced::{Point, Rectangle, Size};
 	use polars::df;
+
+	fn legacy_legend_origin(
+		bounds: Rectangle,
+		content: &crate::plot::legend::LegendContent,
+		settings: &ResolvedPlotSettings,
+	) -> Pt<Widget> {
+		let bounds = Rect::<Widget>::from_iced_frame(bounds);
+		let size = crate::plot::legend::measure_legend(content, settings);
+		bounds.origin().offset(
+			(bounds.width() - size.width) * settings.legend_x,
+			(bounds.height() - size.height) * settings.legend_y,
+		)
+	}
 
 	fn render_marks(kernel: &dyn PlotKernel) -> String {
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
@@ -891,7 +905,11 @@ mod product_0013_baseline_tests {
 			if let Some(content) = kernel.legend_content(&settings) {
 				crate::plot::legend::render_legend(
 					&mut backend,
-					Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+					legacy_legend_origin(
+						Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+						&content,
+						&settings,
+					),
 					&content,
 					&settings,
 				);
@@ -1127,7 +1145,11 @@ mod product_0013_baseline_tests {
 			if let Some(content) = kernel.legend_content(&settings) {
 				crate::plot::legend::render_legend(
 					&mut backend,
-					Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+					legacy_legend_origin(
+						Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+						&content,
+						&settings,
+					),
 					&content,
 					&settings,
 				);
@@ -1238,7 +1260,11 @@ mod product_0013_baseline_tests {
 			if let Some(content) = kernel.legend_content(&settings) {
 				crate::plot::legend::render_legend(
 					&mut backend,
-					Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+					legacy_legend_origin(
+						Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0)),
+						&content,
+						&settings,
+					),
 					&content,
 					&settings,
 				);
@@ -1262,7 +1288,11 @@ mod product_0013_baseline_tests {
 			let mut backend = SvgBackend::new(400.0, 300.0);
 			crate::plot::legend::render_legend(
 				&mut backend,
-				Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)),
+				legacy_legend_origin(
+					Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)),
+					&content,
+					&settings,
+				),
 				&content,
 				&settings,
 			);
@@ -1349,7 +1379,11 @@ mod product_0013_baseline_tests {
 			let mut backend = SvgBackend::new(400.0, 300.0);
 			crate::plot::legend::render_legend(
 				&mut backend,
-				Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)),
+				legacy_legend_origin(
+					Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)),
+					&content,
+					&settings,
+				),
 				&content,
 				&settings,
 			);
@@ -1377,7 +1411,11 @@ mod product_0013_baseline_tests {
 		let mut backend = SvgBackend::new(400.0, 300.0);
 		crate::plot::legend::render_legend(
 			&mut backend,
-			Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)),
+			legacy_legend_origin(
+				Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)),
+				&content,
+				&settings,
+			),
 			&content,
 			&settings,
 		);

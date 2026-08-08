@@ -538,7 +538,13 @@ impl PlotComposite for PlotGridKernel {
 				resolved.chrome.canvas_background.iced(),
 			);
 		});
-		let outer = grid_outer_area(bounds, padding);
+		let figure_legend = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
+		let outer = grid_outer_area(legend.content_bounds, padding);
 		let tiled = grid_tiled_area(outer, &resolved);
 		let layouts = self.cell_layouts(resolved.clone());
 		for (index, cell) in self.cells.iter().enumerate() {
@@ -590,15 +596,16 @@ impl PlotComposite for PlotGridKernel {
 			return;
 		}
 		let resolved = settings.resolve();
-		let outer = grid_outer_area(bounds, padding);
-		let tiled = grid_tiled_area(outer, &resolved);
-		let layouts = self.cell_layouts(resolved.clone());
-		let axis_cells = self.axis_text_cells();
 		let figure_legend = crate::plot::legend::union(
 			self.cells
 				.iter()
 				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
 		);
+		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
+		let outer = grid_outer_area(legend.content_bounds, padding);
+		let tiled = grid_tiled_area(outer, &resolved);
+		let layouts = self.cell_layouts(resolved.clone());
+		let axis_cells = self.axis_text_cells();
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
 			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
@@ -741,8 +748,8 @@ impl PlotComposite for PlotGridKernel {
 			layer: crate::plot::common::PlotRenderLayer::Full,
 		};
 		helper.draw_axis_labels(backend, shared_extent.into_iced());
-		if let Some(content) = figure_legend {
-			crate::plot::legend::render_legend(backend, bounds.into_iced(), &content, &resolved);
+		if let (Some(content), Some(origin)) = (figure_legend.as_ref(), legend.origin) {
+			crate::plot::legend::render_legend(backend, origin, content, &resolved);
 		}
 	}
 
@@ -754,7 +761,13 @@ impl PlotComposite for PlotGridKernel {
 		settings: &PlotSettings,
 	) -> Option<String> {
 		let resolved = settings.resolve();
-		let outer = grid_outer_area(bounds, padding);
+		let figure_legend = crate::plot::legend::union(
+			self.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+		);
+		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
+		let outer = grid_outer_area(legend.content_bounds, padding);
 		let tiled = grid_tiled_area(outer, &resolved);
 		let layouts = self.cell_layouts(resolved.clone());
 		for (index, cell) in self.cells.iter().enumerate() {
@@ -1213,11 +1226,24 @@ mod tests {
 	#[test]
 	fn product_0044_grid_renders_one_figure_legend_from_cell_union() {
 		let (body, _data, stamped) = fixture();
+		// Mirror test16.rn's four product facets so the placement gate covers
+		// the exhibit that triggered the reserved gutter.
+		let stamped = StampedResult {
+			data: Arc::new(
+				df!(
+					"facet" => ["Atlas", "Beacon", "Cinder", "Delta"],
+					"x" => [0.0_f64, 1.0, 2.0, 3.0],
+					"y" => [1.0_f64, 2.0, 3.0, 4.0]
+				)
+				.expect("test16-shaped fixture"),
+			),
+			provenance: stamped.provenance,
+		};
 		let grid = PlotGrid::value_facet(
 			body,
 			&stamped,
 			"facet",
-			GridArrangement::new(1, 2).expect("arrangement"),
+			GridArrangement::new(2, 2).expect("arrangement"),
 		)
 		.expect("facet");
 		let kernel = PlotGridKernel::from_grid_with_factory(grid, 400, 300, |_spec, data| {
@@ -1247,12 +1273,13 @@ mod tests {
 		})
 		.expect("grid kernel");
 		let model = PlotSettings::default();
+		let resolved = model.resolve();
 		let mut backend = SvgBackend::new(400.0, 300.0);
 		let widget = PlotWidget {
 			kernel: &kernel,
 			title: String::new(),
 			padding: 0.0,
-			settings: model.resolve(),
+			settings: resolved.clone(),
 			settings_model: model,
 			render_revision: 0,
 			resize_render_suspended: false,
@@ -1265,8 +1292,51 @@ mod tests {
 		let svg = backend.finish();
 		assert_eq!(svg.matches("fill-opacity=\"0.60\"").count(), 1, "{svg}");
 		assert_eq!(svg.matches(">shared</text>").count(), 1, "{svg}");
-		assert_eq!(svg.matches(">series-A</text>").count(), 1, "{svg}");
-		assert_eq!(svg.matches(">series-B</text>").count(), 1, "{svg}");
+		for product in ["Atlas", "Beacon", "Cinder", "Delta"] {
+			assert_eq!(
+				svg.matches(&format!(">series-{product}</text>")).count(),
+				1,
+				"{svg}"
+			);
+		}
+
+		let content = crate::plot::legend::union(
+			kernel
+				.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&resolved)),
+		)
+		.expect("figure legend");
+		let bounds = widget_rect(IcedRectangle::new(
+			Point::ORIGIN,
+			iced::Size::new(400.0, 300.0),
+		));
+		let legend = crate::plot::legend::legend_layout(bounds, Some(&content), &resolved);
+		let legend_origin = legend.origin.expect("default gutter origin");
+		let tiled = grid_tiled_area(grid_outer_area(legend.content_bounds, 0.0), &resolved);
+		let cell_plots = kernel
+			.cells
+			.iter()
+			.map(|cell| {
+				grid_plot_area(
+					grid_cell_bounds(tiled, kernel.arrangement, cell.cell.position),
+					&resolved,
+				)
+			})
+			.collect::<Vec<_>>();
+		assert!(
+			cell_plots
+				.iter()
+				.all(|plot| plot.right() <= legend_origin.x()),
+			"the figure legend must begin to the right of every cell plot"
+		);
+		assert!(
+			cell_plots
+				.windows(2)
+				.all(|pair| pair[0].width() == pair[1].width()
+					&& pair[0].height() == pair[1].height()),
+			"the figure gutter must preserve cell congruence"
+		);
 	}
 
 	#[test]
@@ -2149,6 +2219,37 @@ mod tests {
 			backend.finish()
 		};
 		assert_eq!(make_svg(ordinary.as_ref()), make_svg(&grid_kernel));
+
+		let content = crate::plot::legend::LegendContent::entries(NonEmpty::new(
+			crate::plot::legend::LegendEntry {
+				label: "authored series".to_owned(),
+				swatch: iced::Color::from_rgb8(10, 20, 30),
+				sample: crate::plot::legend::LegendSample::PointSample,
+				provenance: crate::plot::legend::LegendProvenance::Named,
+			},
+		));
+		let direct = LegendOnlyKernel {
+			content: content.clone(),
+		};
+		let legend_grid = PlotGrid::value_facet(
+			Arc::clone(&body),
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 1).expect("arrangement"),
+		)
+		.expect("one-cell legend facet");
+		let legend_grid =
+			PlotGridKernel::from_grid_with_factory(legend_grid, 400, 300, move |_spec, _data| {
+				Ok(Arc::new(LegendOnlyKernel {
+					content: content.clone(),
+				}))
+			})
+			.expect("one-cell legend grid");
+		assert_eq!(
+			make_svg(&direct),
+			make_svg(&legend_grid),
+			"one-cell parity includes the default legend gutter"
+		);
 	}
 
 	#[test]

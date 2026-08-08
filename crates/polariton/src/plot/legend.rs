@@ -1,9 +1,10 @@
 //! The closed legend-content model and its single renderer.
 
+use crate::coordinate::{Pt, Rect, Widget};
 use crate::plot::common::{PlotBackend, ResolvedPlotSettings};
-use crate::plot::spec::NonEmpty;
+use crate::plot::spec::{NonEmpty, ResolvedPresence};
 use iced::widget::canvas::{Stroke, Style, Text};
-use iced::{Color, Point, Rectangle, Size, alignment};
+use iced::{Color, Point, Size, alignment};
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum LegendSample {
@@ -273,10 +274,94 @@ fn lerp(a: Color, b: Color, t: f32) -> Color {
 	}
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct LegendLayout {
+	pub(crate) content_bounds: Rect<Widget>,
+	pub(crate) origin: Option<Pt<Widget>>,
+}
+
+pub(crate) fn measure_legend(content: &LegendContent, settings: &ResolvedPlotSettings) -> Size {
+	let sections: Vec<&LegendSection> = content.sections().collect();
+	if sections.len() == 2
+		&& matches!(
+			sections.as_slice(),
+			[
+				LegendSection::Gradient { .. },
+				LegendSection::SizeSample { .. }
+			]
+		) {
+		return Size::new(250.0, 240.0);
+	}
+	let padding = 10.0;
+	let width = if sections.len() == 1 {
+		match sections[0] {
+			LegendSection::Entries(entries) => {
+				let max_rows = settings.max_legend_rows.max(1) as usize;
+				entries.len().div_ceil(max_rows) as f32 * 150.0 + padding * 2.0
+			}
+			LegendSection::Gradient { .. } => 60.0,
+			LegendSection::SizeSample { .. } => 180.0,
+		}
+	} else {
+		250.0
+	};
+	let height = sections
+		.iter()
+		.map(|section| match section {
+			LegendSection::Entries(entries) => {
+				let max_rows = settings.max_legend_rows.max(1) as usize;
+				entries.len().min(max_rows) as f32 * 25.0 + padding * 2.0
+			}
+			LegendSection::Gradient { .. } => 200.0,
+			LegendSection::SizeSample { .. } => 180.0,
+		})
+		.sum();
+	Size::new(width, height)
+}
+
+pub(crate) fn legend_layout(
+	bounds: Rect<Widget>,
+	content: Option<&LegendContent>,
+	settings: &ResolvedPlotSettings,
+) -> LegendLayout {
+	let Some(content) = content else {
+		return LegendLayout {
+			content_bounds: bounds,
+			origin: None,
+		};
+	};
+	let size = measure_legend(content, settings);
+	match settings.legend {
+		ResolvedPresence::Hide => LegendLayout {
+			content_bounds: bounds,
+			origin: None,
+		},
+		ResolvedPresence::Show(position) => LegendLayout {
+			content_bounds: bounds,
+			origin: Some(bounds.origin().offset(
+				(bounds.width() - size.width) * position.x(),
+				(bounds.height() - size.height) * position.y(),
+			)),
+		},
+		ResolvedPresence::Fallback => {
+			let content_width = (bounds.width() - size.width).max(0.0);
+			LegendLayout {
+				content_bounds: bounds.region(
+					bounds.x(),
+					bounds.y(),
+					content_width,
+					bounds.height(),
+				),
+				origin: Some(bounds.origin().offset(content_width, 0.0)),
+			}
+		}
+	}
+}
+
 /// Render any closed legend content using the shared chrome roles.
 pub fn render_legend(
 	backend: &mut dyn PlotBackend,
-	bounds: Rectangle,
+	origin: Pt<Widget>,
 	content: &LegendContent,
 	settings: &ResolvedPlotSettings,
 ) {
@@ -286,6 +371,8 @@ pub fn render_legend(
 	}
 	let section_count = sections.len();
 	let padding = 10.0;
+	let x = origin.x();
+	let y = origin.y();
 	// Bubble's two semantic sections were historically laid out as one
 	// horizontal guide: size samples on the left and the color gradient on the
 	// right. Keep that geometry while representing the content as two ordinary
@@ -308,8 +395,6 @@ pub fn render_legend(
 	{
 		let width = 250.0;
 		let height = 240.0;
-		let x = (bounds.width - width) * settings.legend_x;
-		let y = (bounds.height - height) * settings.legend_y;
 		backend.fill_rectangle(
 			Point::new(x, y),
 			Size::new(width, height),
@@ -399,31 +484,9 @@ pub fn render_legend(
 		}
 		return;
 	}
-	let width = if sections.len() == 1 {
-		match sections[0] {
-			LegendSection::Entries(entries) => {
-				let max_rows = settings.max_legend_rows.max(1) as usize;
-				entries.len().div_ceil(max_rows) as f32 * 150.0 + padding * 2.0
-			}
-			LegendSection::Gradient { .. } => 60.0,
-			LegendSection::SizeSample { .. } => 180.0,
-		}
-	} else {
-		250.0
-	};
-	let height: f32 = sections
-		.iter()
-		.map(|section| match section {
-			LegendSection::Entries(entries) => {
-				let max_rows = settings.max_legend_rows.max(1) as usize;
-				entries.len().min(max_rows) as f32 * 25.0 + padding * 2.0
-			}
-			LegendSection::Gradient { .. } => 200.0,
-			LegendSection::SizeSample { .. } => 180.0,
-		})
-		.sum();
-	let x = (bounds.width - width) * settings.legend_x;
-	let y = (bounds.height - height) * settings.legend_y;
+	let size = measure_legend(content, settings);
+	let width = size.width;
+	let height = size.height;
 	backend.fill_rectangle(
 		Point::new(x, y),
 		Size::new(width, height),
@@ -589,6 +652,8 @@ pub fn render_legend(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::spec::{LegendPosition, ResolvedPresence};
+	use iced::{Point, Rectangle};
 
 	fn entry(label: &str, sample: LegendSample, provenance: LegendProvenance) -> LegendEntry {
 		LegendEntry {
@@ -661,5 +726,46 @@ mod tests {
 			panic!("entries section");
 		};
 		assert_eq!(entries.len(), 2);
+	}
+
+	#[test]
+	fn product_0050_layout_distinguishes_gutter_overlay_and_hide() {
+		let content = content(entry(
+			"series",
+			LegendSample::LineSample,
+			LegendProvenance::Named,
+		));
+		let bounds =
+			Rect::<Widget>::from_iced_frame(Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)));
+		let mut settings = ResolvedPlotSettings::default();
+
+		let gutter = legend_layout(bounds, Some(&content), &settings);
+		assert_eq!(gutter.content_bounds.width(), 230.0);
+		assert_eq!(
+			gutter.origin.map(|point| (point.x(), point.y())),
+			Some((230.0, 0.0))
+		);
+
+		settings.legend = ResolvedPresence::Show(LegendPosition::new(0.98, 0.02).unwrap());
+		let overlay = legend_layout(bounds, Some(&content), &settings);
+		assert_eq!(overlay.content_bounds, bounds);
+		assert_eq!(
+			overlay.origin.map(|point| (point.x(), point.y())),
+			Some(((400.0 - 170.0) * 0.98, (300.0 - 45.0) * 0.02))
+		);
+
+		settings.legend = ResolvedPresence::Show(LegendPosition::new(1.5, -0.5).unwrap());
+		let outside = legend_layout(bounds, Some(&content), &settings);
+		assert!(
+			outside.origin.unwrap().x() + measure_legend(&content, &settings).width
+				> bounds.right()
+		);
+		assert!(outside.origin.unwrap().y() < bounds.y());
+
+		settings.legend = ResolvedPresence::Hide;
+		assert_eq!(
+			legend_layout(bounds, Some(&content), &settings),
+			legend_layout(bounds, None, &ResolvedPlotSettings::default())
+		);
 	}
 }

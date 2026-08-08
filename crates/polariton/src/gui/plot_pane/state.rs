@@ -4,7 +4,7 @@ use crate::plot::colors;
 use crate::plot::common::{PlotKernel, ResolvedPlotSettings, TickPlacement};
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
-use crate::plot::spec::Override;
+use crate::plot::spec::{Override, ResolvedPresence};
 use crate::plot::theme::{PlotSettings, PlotSettingsLayer, PlotThemeSpec};
 use iced::{Rectangle, Size};
 use std::sync::Arc;
@@ -361,19 +361,31 @@ impl PlotPaneState {
 				self.y_max_input = val.map(|v| v.to_string()).unwrap_or_default();
 			}
 			PlotPaneMsg::SetTitle(val) => {
-				self.plot_settings.title = val.as_ref().map(|s| Arc::new(s.clone()));
+				self.plot_settings.title = val
+					.as_ref()
+					.map(|s| ResolvedPresence::Show(Arc::new(s.clone())))
+					.unwrap_or(ResolvedPresence::Fallback);
 				self.title_input = val.unwrap_or_default();
 			}
 			PlotPaneMsg::SetSubtitle(val) => {
-				self.plot_settings.subtitle = val.as_ref().map(|s| Arc::new(s.clone()));
+				self.plot_settings.subtitle = val
+					.as_ref()
+					.map(|s| ResolvedPresence::Show(Arc::new(s.clone())))
+					.unwrap_or(ResolvedPresence::Fallback);
 				self.subtitle_input = val.unwrap_or_default();
 			}
 			PlotPaneMsg::SetXLabel(val) => {
-				self.plot_settings.x_label = val.as_ref().map(|s| Arc::new(s.clone()));
+				self.plot_settings.x_label = val
+					.as_ref()
+					.map(|s| ResolvedPresence::Show(Arc::new(s.clone())))
+					.unwrap_or(ResolvedPresence::Fallback);
 				self.x_label_input = val.unwrap_or_default();
 			}
 			PlotPaneMsg::SetYLabel(val) => {
-				self.plot_settings.y_label = val.as_ref().map(|s| Arc::new(s.clone()));
+				self.plot_settings.y_label = val
+					.as_ref()
+					.map(|s| ResolvedPresence::Show(Arc::new(s.clone())))
+					.unwrap_or(ResolvedPresence::Fallback);
 				self.y_label_input = val.unwrap_or_default();
 			}
 			PlotPaneMsg::SetTitleOffset(val) => {
@@ -501,7 +513,7 @@ mod tests {
 	use crate::plot::common::{PlotRenderLayer, PlotWidget};
 	use crate::plot::export::SvgBackend;
 	use crate::plot::factory::create_layered_plot;
-	use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec, Presence};
+	use crate::plot::spec::{LayerMark, LayerSpec, LayeredPlotSpec, Presence, ResolvedPresence};
 	use crate::plot::theme::{PlotSettings, PlotSettingsLayer};
 	use std::sync::Arc;
 
@@ -546,10 +558,10 @@ mod tests {
 		let mut application_theme = PlotSettingsLayer::default();
 		application_theme.title = Presence::Show(Arc::new("Application title".to_owned()));
 		let resolved = resolve_host_plot_settings(application_theme, PlotSettingsLayer::default());
-		assert_eq!(
-			resolved.title.as_ref().map(|title| title.as_str()),
-			Some("Application title")
-		);
+		assert!(matches!(
+			resolved.title,
+			ResolvedPresence::Show(ref title) if title.as_str() == "Application title"
+		));
 		let widget = PlotWidget {
 			kernel: kernel.as_ref(),
 			title: "Line".to_owned(),

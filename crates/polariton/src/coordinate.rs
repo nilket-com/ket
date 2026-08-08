@@ -17,7 +17,6 @@ mod sealed {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[allow(dead_code)] // The enumeration is an executable closure gate, not runtime state.
 pub enum SpaceName {
 	Window,
 	Widget,
@@ -27,7 +26,6 @@ pub enum SpaceName {
 }
 
 pub trait Space: sealed::Sealed + Copy + 'static {
-	#[allow(dead_code)]
 	const NAME: SpaceName;
 }
 
@@ -49,7 +47,6 @@ macro_rules! define_spaces {
 			const _: [(); align_of::<Rectangle>()] = [(); align_of::<Rect<$space>>()];
 		)+
 
-		#[allow(dead_code)]
 		pub(crate) const ALL_SPACES: &[SpaceName] = &[
 			$(<$space as Space>::NAME),+
 		];
@@ -59,6 +56,7 @@ macro_rules! define_spaces {
 // This invocation is the closed vocabulary. The implementations and the
 // enumeration cannot drift because the macro emits both from the same list.
 define_spaces!(Window, Widget, Cell, Plot, Content);
+const _: [(); 5] = [(); ALL_SPACES.len()];
 
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq)]

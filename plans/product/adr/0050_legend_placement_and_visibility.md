@@ -1,6 +1,6 @@
 # ADR 0050: legend placement and visibility
 
-Status: proposed 2026-08-08. This record decides three things that interlock:
+Status: accepted 2026-08-08. This record decides three things that interlock:
 the default legend placement moves to a reserved gutter so a legend stops
 covering the marks it describes; the figure gains one legend property —
 `legend_at(x, y)` and `hide_legend()` — spelled over `Presence`, giving the
@@ -185,6 +185,46 @@ producer. No interaction change.
    provenance — is unchanged under all three `Presence` states.
 10. No Rune behavior outside the two members, no identity, placement,
     group, kernel, or lifecycle change; the suite floor rises, none fall.
+
+## Implementation evidence
+
+- The `test16.rn` exhibit is mirrored by the four-product grid fixture in
+  `product_0044_grid_renders_one_figure_legend_from_cell_union`. Its gate now
+  computes every cell's plot rectangle and the typed legend origin, proves
+  every plot ends before the legend begins, and proves the four cell extents
+  remain congruent. The one-cell parity oracle now exercises a named legend
+  as well as the historical no-legend case.
+- `product_0050_layout_distinguishes_gutter_overlay_and_hide` proves the
+  measured gutter, the exact old `(extent - legend) * fraction` overlay
+  formula, acceptance and clipping geometry for out-of-range fractions, and
+  `Hide`/no-content layout identity. The canvas oracle separately proves
+  byte identity between hidden content and absent content at equal marks.
+- Resolution and rendering are gated independently: the five-layer cascade
+  observes `Fallback`, `Show`, and `Hide` for both headings and legends; the
+  canvas oracle observes generated, authored, and absent text. The extracted
+  `rune_view_chrome_title` consumer proves an authored canvas `Hide` still
+  leaves anonymous and named panel chrome identifiable.
+- The Rune gate covers bound numeric names, unbounded fractions, `Hide`, both
+  conflict orders, both duplicate forms, arity, non-finite and non-literal
+  refusal, exact second-member attribution, and ordinary Rune positions.
+- The PRODUCT-0049 rider now makes `architecture_test` include the production
+  coordinate module and compare its real `ALL_SPACES` value to the five-space
+  census. Production no longer needs dead-code allowances for `SpaceName`,
+  `Space::NAME`, or `ALL_SPACES`; the test-only path include alone suppresses
+  unrelated unused-method warnings.
+
+The premise-update ledger is deliberately short. The
+`five_layer_precedence_is_right_biased_and_hide_is_not_a_value_override`
+theme test (the old `theme.rs:500` site) now asserts the three-state truth
+instead of the known `Option::None` defect. The PRODUCT-0031 canvas oracle's
+authored heading fixtures changed from `Some` to `Show`. Six renderer-only
+factory call sites now pass the historical overlay origin explicitly after
+placement was extracted from `render_legend`; their bytes remain banked as
+fixed-content renderer oracles, while production placement is owned and
+tested by `legend_layout`. No serialized SVG expectation needed a blind
+refresh, and the existing bare-mark and band-fill no-content baselines pass
+unchanged. The full Polariton suite passes at 428 unit tests (five live tests
+ignored), 40 architecture tests, and the trybuild UI pair.
 
 ## Stop condition
 

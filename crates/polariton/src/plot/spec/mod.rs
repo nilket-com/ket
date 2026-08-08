@@ -42,6 +42,37 @@ pub enum Presence<T> {
 	Hide,
 }
 
+/// A resolved turn-off property. `Fallback` retains the renderer's generated
+/// value; unlike `Option`, `Hide` cannot collapse back into that fallback.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResolvedPresence<T> {
+	Fallback,
+	Show(T),
+	Hide,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LegendPosition {
+	x: f32,
+	y: f32,
+}
+
+impl LegendPosition {
+	pub fn new(x: f64, y: f64) -> Option<Self> {
+		let x = x as f32;
+		let y = y as f32;
+		(x.is_finite() && y.is_finite()).then_some(Self { x, y })
+	}
+
+	pub const fn x(self) -> f32 {
+		self.x
+	}
+
+	pub const fn y(self) -> f32 {
+		self.y
+	}
+}
+
 impl<T> Presence<T> {
 	pub fn overlay(self, later: Self) -> Self {
 		match later {

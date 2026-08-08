@@ -63,6 +63,20 @@ const DASHBOARD_PANEL: HostPanelId = HostPanelId::new(2);
 #[cfg(feature = "toron")]
 const DYNAMIC_VIEW_PANEL_BASE: u64 = 1_u64 << 63;
 
+#[cfg(feature = "toron")]
+fn rune_view_chrome_title(identity: &LocalViewIdentity, presentation: &ViewPresentation) -> String {
+	match identity {
+		LocalViewIdentity::Named(name) => name.clone(),
+		LocalViewIdentity::Anonymous(position) => {
+			let label = match &presentation.authored_title {
+				Presence::Show(title) => title.as_str(),
+				Presence::Inherit | Presence::Hide => &presentation.display_label,
+			};
+			format!("{label} {}", position + 1)
+		}
+	}
+}
+
 const INITIAL_COLUMNS: u16 = 120;
 const INITIAL_ROWS: u16 = 40;
 /// A visible, low-friction workspace drag handle. It also establishes the
@@ -885,16 +899,7 @@ impl CodeEditor {
 					revision: PanelRevision::new(revision),
 				});
 			}
-			let title = match identity {
-				LocalViewIdentity::Named(name) => name.clone(),
-				LocalViewIdentity::Anonymous(position) => {
-					let label = match &presentation.authored_title {
-						Presence::Show(title) => title.as_str(),
-						Presence::Inherit | Presence::Hide => &presentation.display_label,
-					};
-					format!("{label} {}", position + 1)
-				}
-			};
+			let title = rune_view_chrome_title(identity, &presentation);
 			group_members.push(HostPanelGroupMember {
 				panel_id,
 				kind: match presentation.content_kind {
@@ -4901,6 +4906,41 @@ mod tests {
 	use libaryon::svp::rust_highlight::TokenCategory;
 	use std::thread;
 	use std::time::{Duration, Instant};
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0050_canvas_hide_keeps_anonymous_and_named_panel_chrome_identifiable() {
+		use crate::plot::spec::Presence;
+		use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+
+		let mut presentation = ViewPresentation {
+			content_kind: ViewContentKind::Plot,
+			display_label: "plot.line".to_owned(),
+			authored_title: Presence::Hide,
+		};
+		assert_eq!(
+			super::rune_view_chrome_title(&LocalViewIdentity::Anonymous(1), &presentation),
+			"plot.line 2"
+		);
+		presentation.authored_title = Presence::Inherit;
+		assert_eq!(
+			super::rune_view_chrome_title(&LocalViewIdentity::Anonymous(1), &presentation),
+			"plot.line 2"
+		);
+		presentation.authored_title =
+			Presence::Show(std::sync::Arc::new("Canvas title".to_owned()));
+		assert_eq!(
+			super::rune_view_chrome_title(&LocalViewIdentity::Anonymous(1), &presentation),
+			"Canvas title 2"
+		);
+		assert_eq!(
+			super::rune_view_chrome_title(
+				&LocalViewIdentity::Named("stable-view".to_owned()),
+				&presentation,
+			),
+			"stable-view"
+		);
+	}
 
 	#[test]
 	fn highlight_lookup_preserves_nested_span_priority() {
