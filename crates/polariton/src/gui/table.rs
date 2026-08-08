@@ -1522,6 +1522,254 @@ fill 38.00,130.00,42.58,8.00 #8c00fa/0.50"##;
 		assert_close(table.measure_col_width(2), MAX_COL_WIDTH);
 	}
 
+	struct MockClipboard {
+		written: Option<String>,
+	}
+
+	impl Clipboard for MockClipboard {
+		fn read(&self, _kind: iced::advanced::clipboard::Kind) -> Option<String> {
+			None
+		}
+		fn write(&mut self, _kind: iced::advanced::clipboard::Kind, contents: String) {
+			self.written = Some(contents);
+		}
+	}
+
+	fn drive(
+		table: &mut Table<'_>,
+		tree: &mut Tree,
+		node: &Node,
+		offset: iced::Vector,
+		event: &Event,
+		cursor: Cursor,
+		clipboard: &mut MockClipboard,
+	) {
+		let renderer = RecordingRenderer::default();
+		let mut messages: Vec<()> = Vec::new();
+		let mut shell = Shell::new(&mut messages);
+		let bounds = Layout::with_offset(offset, node).bounds();
+		<Table<'_> as Widget<(), iced::Theme, RecordingRenderer>>::update(
+			table,
+			tree,
+			event,
+			Layout::with_offset(offset, node),
+			cursor,
+			&renderer,
+			clipboard,
+			&mut shell,
+			&bounds,
+		);
+	}
+
+	fn ctrl_c_event() -> Event {
+		Event::Keyboard(keyboard::Event::KeyPressed {
+			key: keyboard::Key::Character("c".into()),
+			modified_key: keyboard::Key::Character("c".into()),
+			physical_key: keyboard::key::Physical::Code(keyboard::key::Code::KeyC),
+			location: keyboard::Location::Standard,
+			modifiers: keyboard::Modifiers::CTRL,
+			text: None,
+			repeat: false,
+		})
+	}
+
+	/// The selection-and-copy contract had no test until 2026-08-07, when its
+	/// possible regression was raised: click selects a cell, shift-click
+	/// extends, dragging extends, Ctrl+C writes the selection as
+	/// tab-separated rows to the system clipboard, and Escape clears. This
+	/// drives the real `update` path with a mock clipboard so the contract is
+	/// pinned rather than folklore.
+	#[test]
+	fn click_shift_drag_copy_and_escape_cover_the_selection_contract() {
+		selection_contract_at(iced::Vector::new(0.0, 0.0));
+	}
+
+	/// The same contract at a nonzero layout offset. The origin test is blind
+	/// to absolute-position math errors (widget-local and window coordinates
+	/// coincide at the origin), which is the class behind every renderer bug
+	/// this week; a live panel never sits at the origin.
+	#[test]
+	fn the_selection_contract_holds_at_a_nonzero_panel_origin() {
+		selection_contract_at(iced::Vector::new(517.0, 293.0));
+	}
+
+	fn selection_contract_at(offset: iced::Vector) {
+		let frame = polars::df!(
+			"cat" => ["A", "B", "C"],
+			"val" => [1_i64, 2, 3],
+		)
+		.expect("selection fixture");
+		let mut table = Table::new(&frame, 0, TableSkin::DEFAULT);
+		let mut tree = Tree {
+			tag: <Table<'_> as Widget<(), iced::Theme, RecordingRenderer>>::tag(&table),
+			state: <Table<'_> as Widget<(), iced::Theme, RecordingRenderer>>::state(&table),
+			children: Vec::new(),
+		};
+		let node = Node::new(Size::new(400.0, 300.0));
+		let bounds = Layout::with_offset(offset, &node).bounds();
+		let mut clipboard = MockClipboard { written: None };
+		let press = Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left));
+		let release = Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left));
+
+		let row_num_w = table.row_num_width(bounds, 0.0);
+		let header_h = table.header_height();
+
+		// Click selects one cell. Column 0 starts at the row-number gutter,
+		// so the seed point needs no measured widths.
+		let seed = Point::new(bounds.x + row_num_w + 4.0, bounds.y + header_h + 4.0);
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&press,
+			Cursor::Available(seed),
+			&mut clipboard,
+		);
+		let state = tree.state.downcast_ref::<TableState>();
+		let sel = state.selection.as_ref().expect("click selects");
+		assert_eq!(sel.range(), (0, 0, 0, 0));
+		let widths = state.col_widths.clone();
+		let at = move |col: usize, row: usize| {
+			Point::new(
+				bounds.x + row_num_w + widths[..col].iter().sum::<f32>() + 4.0,
+				bounds.y + header_h + row as f32 * ROW_HEIGHT + 4.0,
+			)
+		};
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&release,
+			Cursor::Available(seed),
+			&mut clipboard,
+		);
+
+		// Shift-click extends from the anchor.
+		let shift = Event::Keyboard(keyboard::Event::ModifiersChanged(
+			keyboard::Modifiers::SHIFT,
+		));
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&shift,
+			Cursor::Available(seed),
+			&mut clipboard,
+		);
+		let far = at(1, 2);
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&press,
+			Cursor::Available(far),
+			&mut clipboard,
+		);
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&release,
+			Cursor::Available(far),
+			&mut clipboard,
+		);
+		let state = tree.state.downcast_ref::<TableState>();
+		assert_eq!(
+			state.selection.as_ref().expect("shift extends").range(),
+			(0, 1, 0, 2)
+		);
+
+		// Ctrl+C writes the selection as tab-separated rows.
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&ctrl_c_event(),
+			Cursor::Available(far),
+			&mut clipboard,
+		);
+		assert_eq!(
+			clipboard.written.as_deref(),
+			Some("A\t1\nB\t2\nC\t3\n"),
+			"copy must reproduce the selected cells row-major"
+		);
+
+		// Dragging from a fresh click extends the selection.
+		let unshift = Event::Keyboard(keyboard::Event::ModifiersChanged(
+			keyboard::Modifiers::default(),
+		));
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&unshift,
+			Cursor::Available(seed),
+			&mut clipboard,
+		);
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&press,
+			Cursor::Available(seed),
+			&mut clipboard,
+		);
+		let mid = at(1, 1);
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&Event::Mouse(mouse::Event::CursorMoved { position: mid }),
+			Cursor::Available(mid),
+			&mut clipboard,
+		);
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&release,
+			Cursor::Available(mid),
+			&mut clipboard,
+		);
+		let state = tree.state.downcast_ref::<TableState>();
+		assert_eq!(
+			state.selection.as_ref().expect("drag extends").range(),
+			(0, 1, 0, 1)
+		);
+
+		// Escape clears.
+		let escape = Event::Keyboard(keyboard::Event::KeyPressed {
+			key: keyboard::Key::Named(keyboard::key::Named::Escape),
+			modified_key: keyboard::Key::Named(keyboard::key::Named::Escape),
+			physical_key: keyboard::key::Physical::Code(keyboard::key::Code::Escape),
+			location: keyboard::Location::Standard,
+			modifiers: keyboard::Modifiers::default(),
+			text: None,
+			repeat: false,
+		});
+		drive(
+			&mut table,
+			&mut tree,
+			&node,
+			offset,
+			&escape,
+			Cursor::Available(seed),
+			&mut clipboard,
+		);
+		let state = tree.state.downcast_ref::<TableState>();
+		assert!(state.selection.is_none(), "escape clears the selection");
+	}
+
 	#[test]
 	fn headers_and_cells_share_schema_driven_alignment() {
 		let frame = polars::df!(
