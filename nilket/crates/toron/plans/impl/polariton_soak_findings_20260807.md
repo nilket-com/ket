@@ -110,6 +110,36 @@ unmitigated deliberately, because whether and when it wedges measures the thresh
 shape (rows versus bytes versus flush count) with data the team can read right up to
 the moment it can't.
 
+## Finding 1c — the old binary re-ran the whole cycle organically, and the loop leaks
+
+With no intervention beyond ordinary sampler load, the pre-fix deployment reproduced the
+defect end to end a second time: routine compaction retired slab 8 (itself the replacement
+installed after the first restart) while durable references still named it, and at
+2026-08-07 15:52:59 the lsm_worker entered the loop again (`no slab with id 8 under this
+manager`). Three escalations over the first incident, all verified live:
+
+1. **Total telemetry-table loss.** All three tables — including the 3-row-per-minute
+   process and health tables previously reported as safe — now refuse reads with `storage
+   unavailable`. "Small steady tables are unaffected" was a statement about exposure time,
+   not safety: one missing slab's references can span tables, which is live confirmation of
+   the fence-set cardinality the ADR's Decision 2 anticipated.
+2. **The retry loop leaks a slab file per tick.** 38,810 slab files exist against ~38,800
+   loop warnings — each failed compaction attempt creates a replacement slab, fails against
+   the missing reference, abandons the file, and repeats. Unbounded file-count growth as a
+   third expression of the same defect (81 MB and climbing at the current tick rate). The
+   fixed binary cannot express this: quarantine is checked at compaction entry, so a failed
+   retirement is attempted once, not per tick.
+3. **Readiness reports 200 throughout.** Health and ready surfaces do not consult table
+   integrity, so a deployment with zero readable application tables presents as healthy —
+   the same diagnosability inversion as the uncovered-gauge finding, one layer up. Worth a
+   follow-on decision: whether readiness should reflect fenced/unreadable table state.
+
+Consequence for the soak: the old-binary deployment has nothing further to teach and cannot
+record the ADR 0539 declared measurements (the binary predates both new series, and its
+tables no longer serve reads). The clean-profile rebuild and confirmation run — separately
+authorized — are the only path to the declared baseline. The wedged profile remains live
+evidence for Acceptance 5 until then.
+
 ## Finding 2 — observability endpoints are mTLS by design; document the scrape
 
 Plaintext probes of ready (7432) and metrics (7433) hang or fail; both require the
