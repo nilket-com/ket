@@ -155,6 +155,22 @@ Run the clean two-cycle reproducer, restart/recovery, and compaction tick contro
 binary. Use the full sampler scrape only as an end-to-end deployment confirmation after the
 deterministic fixture proves the mechanism.
 
+**Declared measurements of the deployment confirmation** (added when the read gate moved to the
+invariant, because both are edges of that design meeting a live profile):
+
+1. **Index refusal fraction under sustained ingest.** The gate refuses between slab rotation and
+   buffer seal on the ordinary healthy path, so at the soak's write rate the index could be
+   refusing a large fraction of wall time if backfill latency is comparable to rotation period.
+   The confirmation run measures the fraction of wall time each index has a non-empty gap set —
+   from `wendelon_storage_secondary_index_coverage_gap_slabs`, scraped into Toron by the
+   sampler — plus `wendelon_storage_secondary_index_lookup_refusals_total`. If the fraction is
+   large, the remedy is seal cadence, ruled in advance; the gate does not soften.
+2. **Diagnosability on the invariant axis.** `uncovered_slabs_total` counts in-process failure
+   records: it reads zero after a restart and zero during rotation windows while lookups refuse.
+   The gap gauge is the quantity the gate actually refuses on; both are emitted so the
+   divergence between them is itself observable. The gauge lands before the run — a
+   measurement the run cannot record does not count as declared.
+
 ## Acceptance
 
 1. **Clean reproduction is discriminating.** A fresh table's second ordinary large ingest cycle

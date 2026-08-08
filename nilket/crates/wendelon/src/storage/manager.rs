@@ -1829,6 +1829,17 @@ impl SlabManager {
 			.await;
 		if !gaps.is_empty() {
 			let gap_ids: Vec<u64> = gaps.iter().map(|slab_id| slab_id.get()).collect();
+			metrics().set_storage_secondary_index_coverage_gap_slabs(
+				request.tenant_id,
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+				gaps.len() as u64,
+			);
+			metrics().observe_storage_secondary_index_lookup_refusal(
+				request.tenant_id,
+				descriptor.table_object_id,
+				descriptor.index_object_id,
+			);
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				format!(

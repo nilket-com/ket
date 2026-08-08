@@ -179,6 +179,19 @@ impl SlabManager {
 		let active_buffer_slab = tracker
 			.active_buffer()
 			.map(SecondaryIndexActiveBuffer::source_slab_id);
+		// The invariant-axis gauge: durable gaps before the buffer and budget filters,
+		// on the driver's cadence, so the read gate's refusals are observable without
+		// waiting for a refused query to say so.
+		let durable_gaps = historical_slabs
+			.iter()
+			.filter(|slab_id| !tracker.is_covered(**slab_id))
+			.count() as u64;
+		metrics().set_storage_secondary_index_coverage_gap_slabs(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			durable_gaps,
+		);
 		let candidates = historical_slabs
 			.into_iter()
 			.filter(|slab_id| !tracker.is_covered(*slab_id))
@@ -904,6 +917,12 @@ impl SlabManager {
 		);
 		self.secondary_index_coverage.remove(&coverage_key);
 		metrics().set_storage_secondary_index_uncovered_slabs(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			0,
+		);
+		metrics().set_storage_secondary_index_coverage_gap_slabs(
 			tenant_id,
 			descriptor.table_object_id,
 			descriptor.index_object_id,

@@ -2629,6 +2629,8 @@ pub struct MetricsRegistry {
 	storage_secondary_index_superseded: SecondaryIndexCounters,
 	storage_secondary_index_stale_indexed_value: SecondaryIndexCounters,
 	storage_secondary_index_uncovered_slabs: SecondaryIndexGauges,
+	storage_secondary_index_coverage_gap_slabs: SecondaryIndexGauges,
+	storage_secondary_index_lookup_refusals: SecondaryIndexCounters,
 	storage_secondary_index_backfill_seconds: SecondaryIndexDurationHistograms,
 	storage_secondary_index_segment_state_digest_mismatch: SecondaryIndexCounters,
 	storage_secondary_index_logical_fingerprint_mismatch: SecondaryIndexCounters,
@@ -2932,6 +2934,8 @@ impl Default for MetricsRegistry {
 			storage_secondary_index_superseded: SecondaryIndexCounters::default(),
 			storage_secondary_index_stale_indexed_value: SecondaryIndexCounters::default(),
 			storage_secondary_index_uncovered_slabs: SecondaryIndexGauges::default(),
+			storage_secondary_index_coverage_gap_slabs: SecondaryIndexGauges::default(),
+			storage_secondary_index_lookup_refusals: SecondaryIndexCounters::default(),
 			storage_secondary_index_backfill_seconds: SecondaryIndexDurationHistograms::default(),
 			storage_secondary_index_segment_state_digest_mismatch: SecondaryIndexCounters::default(
 			),
@@ -3736,6 +3740,40 @@ impl MetricsRegistry {
 			table_object_id,
 			index_object_id,
 			uncovered,
+		);
+	}
+
+	/// The invariant axis, distinct from `uncovered_slabs`: historical source slabs
+	/// lacking a durable segment, i.e. exactly what the read gate refuses on. The
+	/// uncovered gauge counts this process's failure records, which empty on restart
+	/// and are absent during an ordinary rotation window — watching it alone shows
+	/// health while every lookup refuses.
+	pub fn set_storage_secondary_index_coverage_gap_slabs(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+		gaps: u64,
+	) {
+		self.storage_secondary_index_coverage_gap_slabs.set(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			gaps,
+		);
+	}
+
+	pub fn observe_storage_secondary_index_lookup_refusal(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+	) {
+		self.storage_secondary_index_lookup_refusals.add(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			1,
 		);
 	}
 
@@ -5357,6 +5395,16 @@ impl MetricsRegistry {
 			"wendelon_storage_secondary_index_uncovered_slabs_total",
 			"Current uncovered source slabs per local secondary-index coverage tracker.",
 		);
+		self.storage_secondary_index_coverage_gap_slabs.render(
+			&mut out,
+			"wendelon_storage_secondary_index_coverage_gap_slabs",
+			"Historical source slabs lacking a durable segment per secondary index — the invariant the read gate refuses on; distinct from uncovered_slabs_total, which counts in-process failure records only.",
+		);
+		self.storage_secondary_index_lookup_refusals.render(
+			&mut out,
+			"wendelon_storage_secondary_index_lookup_refusals_total",
+			"Secondary-index lookups refused because a historical source slab lacks a durable segment.",
+		);
 		self.storage_secondary_index_backfill_seconds.render(
 			&mut out,
 			"wendelon_storage_secondary_index_backfill_seconds",
@@ -6292,6 +6340,8 @@ mod tests {
 		registry.observe_storage_secondary_index_query_plan(tenant, table, index, "indexed");
 		registry.observe_storage_secondary_index_lookup(tenant, table, index, 11, 5, 3, 2);
 		registry.set_storage_secondary_index_uncovered_slabs(tenant, table, index, 4);
+		registry.set_storage_secondary_index_coverage_gap_slabs(tenant, table, index, 2);
+		registry.observe_storage_secondary_index_lookup_refusal(tenant, table, index);
 		registry.observe_storage_secondary_index_backfill_seconds(
 			tenant,
 			table,
@@ -6329,6 +6379,14 @@ mod tests {
 		assert!(rendered.contains(&format!(
 			"{}{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\"}} 4",
 			namespaced_test_metric("storage_secondary_index_uncovered_slabs_total")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\"}} 2",
+			namespaced_test_metric("storage_secondary_index_coverage_gap_slabs")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\"}} 1",
+			namespaced_test_metric("storage_secondary_index_lookup_refusals_total")
 		)));
 		assert!(rendered.contains(&format!(
 			"{}_sum{{tenant=\"52\",table=\"52525252525252525252525252525252\",index=\"9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a9a\"}} 0.009",
