@@ -3462,8 +3462,8 @@ async fn query_budget_exceeded_when_single_location_batch_exceeds_row_cap() {
 /// ADR 541: the two expiry causes are distinct at the encode preflight, and a
 /// progressing encode never dies by lifetime — each cause gets its own fixture and
 /// its own status; no shared assertion.
-#[test]
-fn stream_preflight_encode_expires_by_cause_never_by_lifetime() {
+#[tokio::test]
+async fn stream_preflight_encode_expires_by_cause_never_by_lifetime() {
 	// Caller deadline in the past: absolute, non-resetting, distinct status.
 	let mut expired_deadline = QueryClocks::new(
 		Duration::from_secs(3600),
@@ -3471,21 +3471,25 @@ fn stream_preflight_encode_expires_by_cause_never_by_lifetime() {
 	);
 	let encoded =
 		encode_query_stream_batches_with_deadline(vec![single_kv_batch()], &mut expired_deadline)
+			.await
 			.unwrap();
 	assert_eq!(encoded, Err(ReadStatus::QUERY_DEADLINE_EXCEEDED));
 
 	// No progress for the stall bound: sliding, distinct status.
 	let mut stalled = QueryClocks::new(Duration::from_millis(0), None);
-	std::thread::sleep(Duration::from_millis(2));
-	let encoded =
-		encode_query_stream_batches_with_deadline(vec![single_kv_batch()], &mut stalled).unwrap();
+	tokio::time::sleep(Duration::from_millis(2)).await;
+	let encoded = encode_query_stream_batches_with_deadline(vec![single_kv_batch()], &mut stalled)
+		.await
+		.unwrap();
 	assert_eq!(encoded, Err(ReadStatus::QUERY_STALLED));
 
 	// A progressing encode with a generous stall bound and no caller deadline
 	// completes regardless of how many batches it carries: no lifetime exists.
 	let mut progressing = QueryClocks::new(Duration::from_secs(3600), None);
 	let batches = vec![single_kv_batch(); 64];
-	let encoded = encode_query_stream_batches_with_deadline(batches, &mut progressing).unwrap();
+	let encoded = encode_query_stream_batches_with_deadline(batches, &mut progressing)
+		.await
+		.unwrap();
 	assert_eq!(encoded.map(|arrows| arrows.len()), Ok(64));
 }
 
@@ -13696,12 +13700,19 @@ fn deadline_sentinels_do_not_collapse() {
 		.expect("a zero wall-time budget is a deadline of no time, not an absent deadline");
 	assert!(expired <= Instant::now());
 
-	// Both rules survive an arbitrary wire value without panicking. `checked_add` buys
-	// the absence of a panic on attacker-controlled input, not a particular answer:
-	// whether a given value is representable is a platform property, so this asserts
-	// termination rather than pinning `None`.
-	let _ = caller_deadline_from_remaining_millis(u64::MAX);
-	let _ = caller_deadline_from_budget_millis(u64::MAX - 1);
+	// A *present* deadline stays present at any magnitude. An unrepresentable instant
+	// clamps to the furthest the platform can hold; it must never come back as `None`,
+	// because that would let an absurd wire value delete the caller's cap entirely —
+	// presence degrading into absence is the same permissive inversion as conflating
+	// the two sentinels above.
+	assert!(
+		caller_deadline_from_remaining_millis(u64::MAX).is_some(),
+		"an unrepresentable wire deadline must clamp, never degrade to no deadline"
+	);
+	assert!(
+		caller_deadline_from_budget_millis(u64::MAX - 1).is_some(),
+		"an unrepresentable caller budget must clamp, never degrade to no deadline"
+	);
 }
 
 /// ADR 541: a zero aggregate wall-time budget must expire the query attributably rather
@@ -13731,4 +13742,56 @@ fn zero_aggregate_wall_budget_expires_rather_than_uncaps() {
 	// The unlimited sentinel still means unlimited.
 	let unlimited = aggregate_query_budget(&AggregateBudgets::default());
 	assert_eq!(unlimited.caller_deadline, None);
+}
+
+/// ADR 541: encoding is synchronous CPU work, so the stall bound can only hold if each
+/// encode call is *small*. A batch larger than the quantum must be sliced into bounded
+/// units rather than handed to the encoder whole — otherwise one oversize batch overruns
+/// the bound with nothing able to observe it, which is the hole the review named. This
+/// fails if quantum slicing regresses to whole-batch encoding.
+#[tokio::test]
+async fn oversize_batch_encodes_in_bounded_quanta() {
+	use arrow::array::Int64Array;
+	use arrow::datatypes::{DataType, Field, Schema};
+
+	let rows = ENCODE_QUANTUM_ROWS * 2 + 7;
+	let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
+	let values = Int64Array::from((0..rows as i64).collect::<Vec<_>>());
+	let batch = RecordBatch::try_new(schema, vec![Arc::new(values)]).unwrap();
+
+	let mut clocks = QueryClocks::new(Duration::from_secs(3600), None);
+	let encoded = encode_query_stream_batches_with_deadline(vec![batch], &mut clocks)
+		.await
+		.unwrap()
+		.expect("a progressing encode never expires");
+
+	// ceil(rows / quantum) quanta — one indivisible unit would be a single blob.
+	let expected = rows.div_ceil(ENCODE_QUANTUM_ROWS);
+	assert_eq!(
+		encoded.len(),
+		expected,
+		"an oversize batch must encode in {expected} bounded quanta, got {}",
+		encoded.len()
+	);
+	assert!(expected > 1, "the fixture must actually exceed one quantum");
+
+	// Every quantum is a unit of progress, so the marks track the units of work.
+	assert!(
+		clocks.progress_marks >= expected as u64,
+		"each encoded quantum marks progress; got {} marks for {expected} quanta",
+		clocks.progress_marks
+	);
+}
+
+/// ADR 541: a batch at or under the quantum must be untouched by slicing — the bound is
+/// a ceiling on one unit of work, not a re-chunking of every result.
+#[tokio::test]
+async fn batch_within_the_quantum_encodes_as_one_blob() {
+	let mut clocks = QueryClocks::new(Duration::from_secs(3600), None);
+	let encoded = encode_query_stream_batches_with_deadline(vec![single_kv_batch()], &mut clocks)
+		.await
+		.unwrap()
+		.expect("a progressing encode never expires");
+
+	assert_eq!(encoded.len(), 1);
 }

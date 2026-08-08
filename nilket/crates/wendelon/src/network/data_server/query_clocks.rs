@@ -88,18 +88,46 @@ impl QueryClocks {
 	}
 }
 
+/// Place a duration ahead of `now` without ever losing the fact that a deadline exists.
+///
+/// `Instant::checked_add` reports `None` for a duration past the platform's representable
+/// horizon. Propagating that `None` as "no caller deadline" would let an absurdly large
+/// wire value *remove* the caller's cap — presence degrading into absence, which is the
+/// same permissive inversion as conflating the absent-sentinels. A deadline the platform
+/// cannot represent is instead clamped to the furthest instant it can: descend by halves
+/// so the clamp is deterministic and needs no platform constant.
+fn instant_after_clamped(now: Instant, duration: Duration) -> Instant {
+	if let Some(instant) = now.checked_add(duration) {
+		return instant;
+	}
+	let mut candidate = duration;
+	// u64 millis cannot need more halvings than this; the loop is a bound, not a search.
+	for _ in 0..128 {
+		candidate /= 2;
+		if candidate.is_zero() {
+			break;
+		}
+		if let Some(instant) = now.checked_add(candidate) {
+			return instant;
+		}
+	}
+	now
+}
+
 /// Derive a local monotonic deadline from the table-query wire's remaining duration,
 /// where zero is the encoding for "the caller sent no deadline" — the client transmits
 /// one millisecond rather than zero for an already-expired deadline, precisely so that
-/// expiry stays attributable here instead of vanishing. Checked: an arbitrary wire u64
-/// must not overflow `Instant` arithmetic — an unrepresentable deadline degrades to "no
-/// caller deadline" (the stall bound still applies), never to a panic on
-/// attacker-controlled input.
+/// expiry stays attributable here instead of vanishing. Any non-zero value yields a
+/// deadline: an unrepresentable one clamps (see [`instant_after_clamped`]) rather than
+/// vanishing, and no wire value can panic.
 pub(crate) fn caller_deadline_from_remaining_millis(millis: u64) -> Option<Instant> {
 	if millis == 0 {
 		return None;
 	}
-	Instant::now().checked_add(Duration::from_millis(millis))
+	Some(instant_after_clamped(
+		Instant::now(),
+		Duration::from_millis(millis),
+	))
 }
 
 /// Derive a local monotonic deadline from a caller-transmitted wall-time *budget*, whose
@@ -111,5 +139,8 @@ pub(crate) fn caller_deadline_from_budget_millis(millis: u64) -> Option<Instant>
 	if millis == u64::MAX {
 		return None;
 	}
-	Instant::now().checked_add(Duration::from_millis(millis))
+	Some(instant_after_clamped(
+		Instant::now(),
+		Duration::from_millis(millis),
+	))
 }

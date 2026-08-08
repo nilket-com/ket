@@ -166,9 +166,9 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex as StdMutex, RwLock};
+use std::sync::{Arc, Mutex as StdMutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, OwnedMutexGuard, mpsc, watch};
+use tokio::sync::{Notify, OwnedMutexGuard, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field};
@@ -12815,7 +12815,31 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	})
 }
 
-fn encode_query_stream_batches_with_deadline(
+/// At most this many rows are Arrow-encoded as one indivisible unit of work. Encoding is
+/// synchronous CPU work that cannot be preempted mid-call, so the only way to bound it is
+/// to keep each call small. A batch above this is sliced into quanta; a batch at or under
+/// it encodes exactly as before, as one blob.
+const ENCODE_QUANTUM_ROWS: usize = 4_096;
+
+/// Bounds how much blocking encode work exists at once across every query on this node.
+///
+/// The permit is acquired *inside* the raced future and held *inside* the blocking
+/// closure, so it is released when the work truly finishes — not when a timed-out caller
+/// stops waiting. That ordering is the whole point: `spawn_blocking` cannot be cancelled,
+/// so a detached task alone would let each expiry pile another unbounded encode onto the
+/// blocking pool. Bounding the slots converts "abandoned and unbounded" into "abandoned
+/// and bounded".
+fn encode_blocking_slots() -> &'static Semaphore {
+	static SLOTS: OnceLock<Semaphore> = OnceLock::new();
+	SLOTS.get_or_init(|| {
+		let parallelism = std::thread::available_parallelism()
+			.map(|threads| threads.get())
+			.unwrap_or(4);
+		Semaphore::new(parallelism)
+	})
+}
+
+async fn encode_query_stream_batches_with_deadline(
 	batches: Vec<RecordBatch>,
 	clocks: &mut QueryClocks,
 ) -> std::io::Result<Result<Vec<Vec<u8>>, ReadStatus>> {
@@ -12823,16 +12847,52 @@ fn encode_query_stream_batches_with_deadline(
 	// finishing Arrow serialization before the first QUERY_RESP frame.
 	// Once the first frame is on the wire, continuations have no
 	// status surface for a terminal expiry.
-	// Each encoded batch is a unit of progress: a progressing encode never expires
-	// the stall bound, while the caller deadline stays absolute throughout.
+	//
+	// Polling between whole batches could not bound this work: encoding is synchronous,
+	// so one oversize batch would overrun the stall bound with nothing able to observe
+	// it, and a slow-but-successful encode would then reset the clock and hide the
+	// overrun. Each quantum is therefore bounded in rows *and* raced against both clocks
+	// on a concurrency-capped blocking thread, so expiry stays attributable to the clock
+	// that fired and completion is what marks progress.
 	let mut encoded = Vec::with_capacity(batches.len());
 	for batch in batches {
-		if let Some(expired) = clocks.expired() {
-			return Ok(Err(expired));
+		let rows = batch.num_rows();
+		let mut offset = 0usize;
+		loop {
+			if let Some(expired) = clocks.expired() {
+				return Ok(Err(expired));
+			}
+			// A zero-row batch still encodes once: its schema is the payload.
+			let quantum = if rows == 0 {
+				batch.clone()
+			} else {
+				batch.slice(offset, ENCODE_QUANTUM_ROWS.min(rows - offset))
+			};
+			let quantum_rows = quantum.num_rows();
+			let work = async move {
+				let permit = encode_blocking_slots()
+					.acquire()
+					.await
+					.expect("encode slot semaphore is never closed");
+				spawn_blocking(move || {
+					let _permit = permit;
+					wire_encode_batch_for_path(&quantum, NetworkCompressionPath::QueryResponse)
+				})
+				.await
+			};
+			let arrow = match clocks.bound(work).await {
+				Ok(joined) => joined.map_err(std::io::Error::other)??,
+				Err(expired) => return Ok(Err(expired)),
+			};
+			encoded.push(arrow);
+			if rows == 0 {
+				break;
+			}
+			offset += quantum_rows;
+			if offset >= rows {
+				break;
+			}
 		}
-		let arrow = wire_encode_batch_for_path(&batch, NetworkCompressionPath::QueryResponse)?;
-		clocks.progressed();
-		encoded.push(arrow);
 	}
 	Ok(Ok(encoded))
 }
