@@ -1084,7 +1084,7 @@ fn parse_contextual_sink_inner(
 	allow_identity_wrapper: bool,
 	literal_bindings: &[LocalBinding],
 ) -> Result<ParsedSink, RuneEnvelopeError> {
-	if let Some(table) = parse_modified_table(expression, source)? {
+	if let Some(table) = parse_modified_table(expression, source, literal_bindings)? {
 		return Ok(ParsedSink {
 			intent: RuneViewIntent::Table(table),
 			span: byte_range(expression.span(), source.len())?,
@@ -2306,10 +2306,12 @@ fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEn
 /// PRODUCT-0027's closed postfix table-sink modifier register. Recognition is
 /// contextual: the complete chain is flattened to one palette identity plus
 /// projection intent, and no palette or resolved artifact color enters the
-/// envelope.
+/// envelope. PRODUCT-0040's static-literal resolver covers register arguments
+/// without admitting computed presentation values.
 fn parse_modified_table(
 	expression: &ast::Expr,
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<Option<RuneTableSink>, RuneEnvelopeError> {
 	let ast::Expr::Call(outer_call) = expression else {
 		return Ok(None);
@@ -2371,12 +2373,36 @@ fn parse_modified_table(
 						"skin(...) takes exactly one theme string literal",
 					);
 				};
-				let raw = source_slice(source, argument.span())?;
-				let Some(name) = decode_string_literal(raw) else {
+				let Some(resolved) = resolve_static_literal(
+					argument,
+					source,
+					literal_bindings,
+					expression.span().start.into_usize(),
+				)?
+				else {
 					return invalid_view(
 						expression.span(),
 						source.len(),
-						"skin(...) requires a theme string literal",
+						static_binding_name(
+							argument,
+							source,
+							literal_bindings,
+							expression.span().start.into_usize(),
+						)
+						.map(|name| {
+							format!("skin(...) binding {name:?} does not resolve to a literal")
+						})
+						.unwrap_or_else(|| "skin(...) requires a theme string literal".to_owned()),
+					);
+				};
+				let StaticLiteralValue::String(name) = resolved.value else {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						format!(
+							"skin(...) binding {} resolved to a numeric literal; expected a string literal",
+							resolved.binding.as_deref().unwrap_or("argument")
+						),
 					);
 				};
 				skin_name = Some(name);
@@ -5564,6 +5590,86 @@ workspace.table("t").views([table()])
 			transformed.views[4].intent,
 			RuneViewIntent::Table(RuneTableSink::default())
 		);
+	}
+
+	#[test]
+	fn product_0040_table_skin_register_resolves_bindings_in_every_member_order() {
+		let source = r#"
+let theme = "vapor";
+let alias = theme;
+workspace.table("t").views([
+    table().skin(theme),
+    table().show_types().skin(alias),
+    table().skin(alias).show_types(),
+    table().skin(theme).duotone(),
+    table().duotone().skin(alias),
+])
+"#;
+		let transformed = transform(source).expect("bound table skin forms");
+		assert_eq!(transformed.views.len(), 5);
+
+		let named = RuneTableSkinIntent::NamedTheme {
+			name: "vapor".to_owned(),
+			projection: RuneTableSkinProjection::PaletteForward,
+		};
+		let duotone = RuneTableSkinIntent::NamedTheme {
+			name: "vapor".to_owned(),
+			projection: RuneTableSkinProjection::Duotone,
+		};
+		for index in [0, 1, 2] {
+			let RuneViewIntent::Table(table) = &transformed.views[index].intent else {
+				panic!("bound table skin must remain a table")
+			};
+			assert_eq!(table.skin, named);
+			assert_eq!(
+				table.show_column_types,
+				if index == 0 {
+					Override::Inherit
+				} else {
+					Override::Set(true)
+				}
+			);
+		}
+		for index in [3, 4] {
+			let RuneViewIntent::Table(table) = &transformed.views[index].intent else {
+				panic!("bound duotone skin must remain a table")
+			};
+			assert_eq!(table.skin, duotone);
+		}
+	}
+
+	#[test]
+	fn product_0040_table_skin_register_refuses_bad_bindings_atomically() {
+		for (source, chain, expected) in [
+			(
+				"let theme = make_theme(); workspace.table(\"t\").views([table().show_types().skin(theme)])",
+				"table().show_types().skin(theme)",
+				"binding \"theme\" does not resolve to a literal",
+			),
+			(
+				"let theme = 7; workspace.table(\"t\").views([table().skin(theme).duotone()])",
+				"table().skin(theme).duotone()",
+				"binding theme resolved to a numeric literal",
+			),
+			(
+				"workspace.table(\"t\").views([table().skin(theme)]); let theme = \"vapor\";",
+				"table().skin(theme)",
+				"requires a theme string literal",
+			),
+			(
+				"workspace.table(\"t\").views([table().skin(make_theme())])",
+				"table().skin(make_theme())",
+				"requires a theme string literal",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, message } =
+				transform(source).expect_err("invalid bound table skin must refuse")
+			else {
+				panic!("expected attributed table-skin refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], chain);
+			assert!(message.contains(expected), "{message}");
+		}
 	}
 
 	#[test]
