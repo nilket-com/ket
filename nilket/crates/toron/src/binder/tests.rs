@@ -23836,34 +23836,51 @@ async fn three_hop_chain_interior_middle_explosion_is_missed_win() {
 // ADR 204: the supported-breadth cap. A chain of exactly `MAX_BRIDGE_CHAIN_HOPS` (4) junctions is
 // recognized; one junction deeper declines (no chain row) rather than emitting an unvalidated verdict.
 // Locks the cap boundary (off-by-one) — fails under an uncapped walk (which would emit a row at k=5).
-#[tokio::test]
-async fn chain_supported_breadth_cap_declines_past_boundary() {
-	let chain_row = |rows: &[Vec<ScalarValue>]| {
-		rows.iter()
-			.any(|row| row[0] == ScalarValue::Utf8(Some("join_order_bridge_chain".to_string())))
-	};
-	// k = 4 (== cap): recognized.
-	let (at_cap_catalog, at_cap_sql) = linear_bridge_chain(4);
-	let at_cap = SqlPlanner::new()
-		.plan(&format!("EXPLAIN {at_cap_sql}"))
-		.expect("plan at-cap chain");
-	let (_schema, at_cap_rows) =
-		bind_explain_rows(&at_cap, &at_cap_catalog, &auto_broadcast_config(1 << 30)).await;
-	assert!(
-		chain_row(&at_cap_rows),
-		"a chain at the supported breadth (k=4) is recognized: {at_cap_rows:?}"
-	);
-	// k = 5 (> cap): declined.
-	let (over_catalog, over_sql) = linear_bridge_chain(5);
-	let over = SqlPlanner::new()
-		.plan(&format!("EXPLAIN {over_sql}"))
-		.expect("plan over-cap chain");
-	let (_schema, over_rows) =
-		bind_explain_rows(&over, &over_catalog, &auto_broadcast_config(1 << 30)).await;
-	assert!(
-		!chain_row(&over_rows),
-		"a chain past the supported breadth (k=5) declines: {over_rows:?}"
-	);
+#[test]
+fn chain_supported_breadth_cap_declines_past_boundary() {
+	// The k=5 bind is a deep-recursion graph; it overflows a default test stack, so
+	// this test uses the suite's explicit-stack convention. Semantic body unchanged.
+	std::thread::Builder::new()
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("tokio runtime");
+			runtime.block_on(async {
+				let chain_row = |rows: &[Vec<ScalarValue>]| {
+					rows.iter().any(|row| {
+						row[0] == ScalarValue::Utf8(Some("join_order_bridge_chain".to_string()))
+					})
+				};
+				// k = 4 (== cap): recognized.
+				let (at_cap_catalog, at_cap_sql) = linear_bridge_chain(4);
+				let at_cap = SqlPlanner::new()
+					.plan(&format!("EXPLAIN {at_cap_sql}"))
+					.expect("plan at-cap chain");
+				let (_schema, at_cap_rows) =
+					bind_explain_rows(&at_cap, &at_cap_catalog, &auto_broadcast_config(1 << 30))
+						.await;
+				assert!(
+					chain_row(&at_cap_rows),
+					"a chain at the supported breadth (k=4) is recognized: {at_cap_rows:?}"
+				);
+				// k = 5 (> cap): declined.
+				let (over_catalog, over_sql) = linear_bridge_chain(5);
+				let over = SqlPlanner::new()
+					.plan(&format!("EXPLAIN {over_sql}"))
+					.expect("plan over-cap chain");
+				let (_schema, over_rows) =
+					bind_explain_rows(&over, &over_catalog, &auto_broadcast_config(1 << 30)).await;
+				assert!(
+					!chain_row(&over_rows),
+					"a chain past the supported breadth (k=5) declines: {over_rows:?}"
+				);
+			});
+		})
+		.expect("spawn deep-bind thread")
+		.join()
+		.expect("join deep-bind thread");
 }
 
 // ADR 204: a branch declines. `rel0` is the fact of TWO bridges (`rel1→rel3` and `rel2→rel4`), so the two
