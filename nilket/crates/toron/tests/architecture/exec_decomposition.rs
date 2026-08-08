@@ -2,7 +2,11 @@ use super::support::*;
 
 const EXEC_ROOT_LINE_LIMIT: usize = 11_700;
 const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_500;
+// ADR 541 adds the caller-deadline context field: two doc lines, the field, its
+// default, and one line at each of the two scan-request construction sites. A real
+// new execution-context field, not executor logic drifting back — bumped by exactly
+// its cost, not rounded up.
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_505;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
 

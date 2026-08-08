@@ -13402,3 +13402,333 @@ async fn caller_deadline_is_absolute_and_attributable() {
 	assert_eq!(resp.status, ReadStatus::OK);
 	assert_eq!(resp.rows, 64);
 }
+
+/// ADR 541: a genuinely blocked operation is preempted by whichever clock is nearer,
+/// and the expiry names that clock. Polling between work units can never see this —
+/// a wedged read holds the query open forever, and a slow-but-successful one resets
+/// the clock after the fact, hiding the overrun.
+#[tokio::test]
+async fn blocked_operation_is_preempted_and_attributed() {
+	// Wedged forever, no caller deadline: the stall bound fires and names itself.
+	let mut stalled = QueryClocks::new(Duration::from_millis(10), None);
+	let outcome = stalled.bound(std::future::pending::<()>()).await;
+	assert_eq!(outcome, Err(ReadStatus::QUERY_STALLED));
+
+	// Wedged forever with the caller deadline nearer than the stall bound: the
+	// deadline fires and names itself.
+	let mut deadline = QueryClocks::new(
+		Duration::from_secs(3600),
+		Some(Instant::now() + Duration::from_millis(10)),
+	);
+	let outcome = deadline.bound(std::future::pending::<()>()).await;
+	assert_eq!(outcome, Err(ReadStatus::QUERY_DEADLINE_EXCEEDED));
+
+	// A completing operation marks progress; nothing expires.
+	let mut progressing = QueryClocks::new(Duration::from_secs(3600), None);
+	let before = progressing.progress_marks;
+	let outcome = progressing.bound(async { 42u32 }).await;
+	assert_eq!(outcome, Ok(42));
+	assert_eq!(progressing.progress_marks, before + 1);
+}
+
+/// ADR 541: progress is a property of examination, not of output. A full scan whose
+/// predicate matches nothing examines every location and must mark progress at each,
+/// even though it never produces a batch.
+#[tokio::test]
+async fn no_match_full_scan_progresses_per_examined_location() {
+	use arrow::array::Int64Array;
+	use arrow::datatypes::{DataType, Field, Schema};
+	let schema = Arc::new(Schema::new(vec![Field::new("age", DataType::Int64, false)]));
+	let mgr = make_manager().await;
+	for locality in 0..512u64 {
+		let ages = Int64Array::from(vec![locality as i64]);
+		let batch = RecordBatch::try_new(schema.clone(), vec![Arc::new(ages)]).unwrap();
+		let bytes = encode_batch(&batch).unwrap();
+		mgr.append(tenant(), id(locality), hlc(1 + locality, 0, 1), &bytes)
+			.await
+			.unwrap();
+	}
+
+	// age >= i64::MAX matches nothing anywhere.
+	let mut bytecode = Vec::new();
+	bytecode.push(OP_PUSH_COL);
+	bytecode.extend_from_slice(&0u32.to_le_bytes());
+	bytecode.push(OP_PUSH_INT);
+	bytecode.extend_from_slice(&i64::MAX.to_le_bytes());
+	bytecode.push(OP_GTE);
+
+	let sm = WendelonStateMachine::new();
+	let mut meta = base_meta();
+	meta.bytecode_len = bytecode.len() as u32;
+	let plan = plan_query_execution_with_budget_and_retention_floor(
+		&mgr,
+		&sm,
+		n(1),
+		&meta,
+		&bytecode,
+		QueryExecutionBudget::default(),
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(plan.response.status, ReadStatus::KEY_NOT_FOUND);
+	assert!(
+		plan.clocks.progress_marks >= 512,
+		"a zero-result scan must progress per examined location, got {} marks",
+		plan.clocks.progress_marks
+	);
+}
+
+/// ADR 541: work caps stay real when a caller owns them. The same limits that no
+/// longer cap a server-side scan's totality still terminate a caller-budgeted query
+/// — the conversion re-scoped the caps, it did not delete them.
+#[tokio::test]
+async fn work_caps_bind_totals_only_for_caller_budgets() {
+	let mgr = make_manager().await;
+	for locality in 0..64u64 {
+		seed_record(
+			&mgr,
+			locality,
+			hlc(1, 0, 1),
+			&locality.to_le_bytes(),
+			b"row",
+		)
+		.await;
+	}
+	let sm = WendelonStateMachine::new();
+
+	// Server-side defaults with tiny limits: work-per-yield derivations, not totals.
+	let per_yield = QueryExecutionBudget {
+		max_locations: 4,
+		max_rows: 8,
+		caller_totals: false,
+		..QueryExecutionBudget::default()
+	};
+	let (resp, _arrow) = execute_query_plan_with_budget_and_retention_floor(
+		&mgr,
+		&sm,
+		n(1),
+		&base_meta(),
+		&[],
+		per_yield,
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(resp.status, ReadStatus::OK);
+	assert_eq!(resp.rows, 64);
+
+	// The same limits caller-owned: a hard total, with the budget status.
+	let caller_totals = QueryExecutionBudget {
+		max_locations: 4,
+		max_rows: 8,
+		caller_totals: true,
+		..QueryExecutionBudget::default()
+	};
+	let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
+		&mgr,
+		&sm,
+		n(1),
+		&base_meta(),
+		&[],
+		caller_totals,
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(resp.status, ReadStatus::QUERY_BUDGET_EXCEEDED);
+	assert!(arrow.is_none());
+}
+
+/// ADR 541: expiry causes survive the aggregate protocol distinctly, in both
+/// directions, without disturbing the neighbors they were once collapsed into.
+#[test]
+fn aggregate_reject_mapping_keeps_expiry_causes_distinct() {
+	assert_eq!(
+		aggregate_reject_from_read_status(ReadStatus::QUERY_STALLED),
+		AggRejectCode::Stalled
+	);
+	assert_eq!(
+		aggregate_reject_to_read_status(AggRejectCode::Stalled),
+		ReadStatus::QUERY_STALLED
+	);
+	assert_eq!(
+		aggregate_reject_from_read_status(ReadStatus::QUERY_DEADLINE_EXCEEDED),
+		AggRejectCode::QueryDeadlineExceeded
+	);
+	assert_eq!(
+		aggregate_reject_to_read_status(AggRejectCode::QueryDeadlineExceeded),
+		ReadStatus::QUERY_DEADLINE_EXCEEDED
+	);
+	// The neighbors keep their meanings: budget stays budget, and the e-safe read
+	// deadline keeps its historical code.
+	assert_eq!(
+		aggregate_reject_from_read_status(ReadStatus::QUERY_BUDGET_EXCEEDED),
+		AggRejectCode::BudgetExceeded
+	);
+	assert_eq!(
+		aggregate_reject_to_read_status(AggRejectCode::DeadlineExceeded),
+		ReadStatus::E_SAFE_BEHIND
+	);
+}
+
+/// ADR 541: a location ruled out by column stats is still an examined location. A
+/// scan whose every slab is stats-pruned produces no output and reads no rows, yet
+/// must mark progress for each location it dispositioned.
+#[tokio::test]
+async fn stats_pruned_full_scan_progresses_per_examined_location() {
+	let l2 = Arc::new(MockObjectStore::default());
+	let mgr = make_manager_with_l2(l2.clone()).await;
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![1, 2]);
+	let mut write_meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+	write_meta.tenant_id = tenant();
+	write_meta.table_object_id = descriptor.table_object_id;
+	write_meta.schema_generation = descriptor.schema_generation;
+	write_meta.row_count = encode_table_write_row_count(batch.num_rows()).unwrap();
+	let admission = validate_table_write_request_batch(
+		&write_meta,
+		&batch,
+		&descriptor,
+		WriterNodeId::ZERO,
+		write_meta.client_hlc,
+	)
+	.expect("typed rows should validate");
+	for row in 0..batch.num_rows() {
+		let row_batch = batch.slice(row, 1);
+		let frame = encode_batch(&row_batch).unwrap();
+		mgr.append_durable_with_locality(
+			tenant(),
+			admission.key_identities[row],
+			admission.localities[row],
+			hlc(10 + row as u64, 0, 1),
+			&frame,
+		)
+		.await
+		.unwrap();
+	}
+	let slab_id = mgr.force_seal_active_for_test().await;
+	let raw = mgr.read_sealed_raw(slab_id).await.unwrap();
+	let mut catalog = TableSchemaCatalog::default();
+	catalog.upsert(tenant(), descriptor.clone()).unwrap();
+	let encrypted = mgr
+		.encrypt_tiered_object_blob_with_table_stats(slab_id, &raw, &catalog)
+		.unwrap();
+	let locator = encrypted.stats_locator.expect("stats locator");
+	let l2_uri = l2
+		.put(
+			&format!("adr541-stats-prune-{slab_id}.wnd"),
+			&encrypted.bytes,
+		)
+		.await
+		.unwrap();
+	mgr.apply_tier_slab(TieredSlabPointer {
+		slab_id,
+		l2_uri,
+		payload_hash: payload_digest(&encrypted.bytes),
+		is_encrypted: true,
+		tenant_id: Some(encrypted.tenant_id),
+		tenant_kek_id: Some(encrypted.tenant_kek_id),
+		stats_format_version: Some(locator.stats_format_version),
+		stats_block_len: Some(locator.stats_block_len),
+		stats_block_hash128: Some(locator.stats_block_hash128),
+		tombstone_metadata: TombstoneMetadata::None,
+		supersession_metadata: SupersessionMetadata::None,
+	})
+	.await
+	.unwrap();
+
+	// id >= 100 is outside the slab's id min/max: every location prunes by stats.
+	let mut bytecode = Vec::new();
+	bytecode.push(OP_PUSH_COL);
+	bytecode.extend_from_slice(&0_u32.to_le_bytes());
+	bytecode.push(OP_PUSH_INT);
+	bytecode.extend_from_slice(&100_i64.to_le_bytes());
+	bytecode.push(OP_GTE);
+	let program = pbc::Program::compile(&bytecode).unwrap();
+	let meta = base_meta();
+	let ranges = [QueryScanRange {
+		start: Locality::ZERO,
+		end: Locality::MAX,
+	}];
+
+	let plan = plan_query_execution_for_ranges_with_program(
+		&mgr,
+		n(1),
+		&meta,
+		&program,
+		&ranges,
+		QueryExecutionBudget::default(),
+		None,
+		Some(&descriptor),
+		QueryProjectedExecution::Disabled,
+		RowIdentityProjection::None,
+		None,
+	)
+	.await
+	.unwrap();
+
+	assert_eq!(plan.response.status, ReadStatus::KEY_NOT_FOUND);
+	assert_eq!(plan.stats_explain.slabs_pruned_by_stats, 1);
+	assert!(
+		plan.clocks.progress_marks >= 2,
+		"stats-pruned locations are examined locations and must mark progress, got {}",
+		plan.clocks.progress_marks
+	);
+}
+
+/// ADR 541: the table-query wire and a caller-transmitted budget carry *different*
+/// absent-sentinels, and conflating them inverts the strictest budget into the loosest.
+/// On the wire, zero means "no deadline sent" — the client transmits one millisecond for
+/// an already-expired deadline so expiry stays attributable server-side. In an aggregate
+/// budget, `u64::MAX` means "no cap" and zero is a real budget of no time at all.
+#[test]
+fn deadline_sentinels_do_not_collapse() {
+	// Wire rule: zero is absence, not a zero-length deadline.
+	assert_eq!(caller_deadline_from_remaining_millis(0), None);
+	// The one-millisecond expired-deadline encoding still yields a real instant.
+	assert!(caller_deadline_from_remaining_millis(1).is_some());
+
+	// Budget rule: u64::MAX is absence...
+	assert_eq!(caller_deadline_from_budget_millis(u64::MAX), None);
+	// ...and zero is an already-expired deadline, NOT the absence of one.
+	let expired = caller_deadline_from_budget_millis(0)
+		.expect("a zero wall-time budget is a deadline of no time, not an absent deadline");
+	assert!(expired <= Instant::now());
+
+	// Both rules survive an arbitrary wire value without panicking. `checked_add` buys
+	// the absence of a panic on attacker-controlled input, not a particular answer:
+	// whether a given value is representable is a platform property, so this asserts
+	// termination rather than pinning `None`.
+	let _ = caller_deadline_from_remaining_millis(u64::MAX);
+	let _ = caller_deadline_from_budget_millis(u64::MAX - 1);
+}
+
+/// ADR 541: a zero aggregate wall-time budget must expire the query attributably rather
+/// than removing its deadline. This is the discriminating control for the sentinel
+/// collapse — under the wire rule it would read as "no caller deadline" and the caller's
+/// strictest possible budget would become an uncapped one.
+#[test]
+fn zero_aggregate_wall_budget_expires_rather_than_uncaps() {
+	let budgets = AggregateBudgets {
+		max_wall_time_millis: DurationMillis::new(0),
+		..AggregateBudgets::default()
+	};
+
+	let budget = aggregate_query_budget(&budgets);
+
+	let deadline = budget
+		.caller_deadline
+		.expect("a zero wall-time budget must yield a deadline, not remove it");
+	let clocks = QueryClocks::from_budget(&budget);
+	assert_eq!(
+		clocks.expired(),
+		Some(ReadStatus::QUERY_DEADLINE_EXCEEDED),
+		"an exhausted caller wall budget expires as the deadline cause"
+	);
+	assert!(deadline <= Instant::now());
+
+	// The unlimited sentinel still means unlimited.
+	let unlimited = aggregate_query_budget(&AggregateBudgets::default());
+	assert_eq!(unlimited.caller_deadline, None);
+}

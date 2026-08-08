@@ -341,6 +341,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/tls_listener_test.rs",
 				// ADR 512: the reachable-key reduction's execution equivalence battery.
 				"crates/toron/tests/scalar_reduction_test.rs",
+				// ADR 541: the caller's end-to-end deadline crosses the storage boundary;
+				// the scan request carries it and every construction site fills it.
+				"crates/toron/src/storage.rs",
+				"crates/toron/src/coordinator/delete.rs",
 				// ADR 521: proof-gated outer-count structural and equivalence battery.
 				"crates/toron/tests/outer_count_preaggregation_test.rs",
 				// Plan filenames are zero-padded to four digits; this README documents a

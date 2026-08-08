@@ -1691,6 +1691,16 @@ fn zero_node() -> NodeId {
 }
 
 fn is_table_descriptor_evolved_error(error: &std::io::Error) -> bool {
+	// Descriptor evolution is a *more specific* classification than "some named status
+	// failed", and it must be recognised before the generic typed-status arm claims it.
+	// ADR 540 stopped rendering statuses into the message, so matching on the message
+	// text alone silently stopped recognising this case and collapsed it into
+	// `QueryFailed` — the very reduction ADR 540 exists to prevent, one seam over. The
+	// status is the durable signal; the string match stays only for errors that still
+	// arrive without a typed source.
+	if query_status_failure_from_io(error) == Some(ReadStatus::TABLE_DESCRIPTOR_EVOLVED) {
+		return true;
+	}
 	error.kind() == std::io::ErrorKind::InvalidData
 		&& error.to_string().contains("TABLE_DESCRIPTOR_EVOLVED")
 }
@@ -1800,6 +1810,29 @@ mod tests {
 	}
 
 	#[test]
+	fn adr541_deadline_remaining_is_absent_only_when_no_deadline_exists() {
+		assert_eq!(deadline_remaining_millis(None), 0);
+	}
+
+	#[test]
+	fn adr541_deadline_remaining_is_measured_per_attempt() {
+		let deadline = Instant::now() + std::time::Duration::from_millis(60_000);
+		let first = deadline_remaining_millis(Some(deadline));
+		assert!(first > 0 && first <= 60_000, "remaining {first}");
+		let later = deadline_remaining_millis(Some(deadline));
+		assert!(
+			later <= first,
+			"a later attempt must see no more time than an earlier one: {later} > {first}"
+		);
+	}
+
+	#[test]
+	fn adr541_expired_deadline_still_transmits_a_deadline() {
+		let expired = Instant::now() - std::time::Duration::from_millis(50);
+		assert_eq!(deadline_remaining_millis(Some(expired)), 1);
+	}
+
+	#[test]
 	fn table_descriptor_evolved_io_error_is_detected() {
 		let err = std::io::Error::new(
 			std::io::ErrorKind::InvalidData,
@@ -1807,6 +1840,34 @@ mod tests {
 		);
 
 		assert!(is_table_descriptor_evolved_error(&err));
+	}
+
+	/// ADR 540 must not swallow a *more specific* classification. Descriptor evolution
+	/// arrives as a typed status once messages stop carrying the status name, and it has
+	/// to stay recognisable there — otherwise it collapses into the generic
+	/// `QueryFailed`, which is the reduction ADR 540 was written to prevent.
+	#[test]
+	fn typed_descriptor_evolved_status_is_not_reduced_to_generic_query_failure() {
+		let typed = std::io::Error::new(
+			std::io::ErrorKind::Other,
+			wendelon::client::QueryStatusError {
+				status: ReadStatus::TABLE_DESCRIPTOR_EVOLVED,
+			},
+		);
+
+		assert!(
+			is_table_descriptor_evolved_error(&typed),
+			"a typed TABLE_DESCRIPTOR_EVOLVED status must be recognised without a message match"
+		);
+
+		// The neighbouring status must NOT be captured by the same arm.
+		let neighbour = std::io::Error::new(
+			std::io::ErrorKind::Other,
+			wendelon::client::QueryStatusError {
+				status: ReadStatus::QUERY_BUDGET_EXCEEDED,
+			},
+		);
+		assert!(!is_table_descriptor_evolved_error(&neighbour));
 	}
 
 	#[test]

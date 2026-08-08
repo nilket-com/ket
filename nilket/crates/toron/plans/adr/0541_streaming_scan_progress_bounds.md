@@ -33,6 +33,15 @@ cap denominated in milliseconds.
      consume the original deadline — a retry's remainder is measured from the original
      instant, so retrying can never mint fresh time.
 
+     The two absent-sentinels stay distinct. On the table-query wire, zero encodes "no
+     deadline sent", so the client transmits one millisecond for an already-expired
+     deadline rather than zero — otherwise expiry vanishes at the boundary instead of
+     being named. A caller-transmitted aggregate wall *budget* uses `u64::MAX` for "no
+     cap", which makes zero a real budget of no time at all. Routing the budget through
+     the wire rule inverts the strictest budget into the loosest, so each rule gets its
+     own named derivation and a control that fails if they are merged. Scrutiny found
+     exactly that collapse in the first implementation of this decision.
+
 2. **No pagination.** The ADR 118 streaming contract stays as the one shape for large results;
    this ADR fixes the budget semantics inside it rather than adding a second result-transfer
    mechanism with its own consistency questions.

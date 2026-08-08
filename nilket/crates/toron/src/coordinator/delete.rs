@@ -193,6 +193,7 @@ mod tests {
 				morsel: None,
 				row_limit: None,
 				downstream_cancellation: None,
+				deadline: None,
 			},
 		)
 		.await

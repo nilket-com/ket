@@ -186,6 +186,10 @@ use table_query::{QueryProjectedExecution, RowGroupFetchAuditCounters};
 mod write_replication;
 use write_replication::{DurableQuorumTracker, PendingFinalizationClaims, WriteOutcome};
 mod descriptor_migration;
+mod query_clocks;
+use query_clocks::{
+	QueryClocks, caller_deadline_from_budget_millis, caller_deadline_from_remaining_millis,
+};
 mod streaming;
 use counter::{CounterParticipantFactory, CounterReplicaNetworkTransport};
 use descriptor_migration::MigrationRegistry;
@@ -10566,55 +10570,10 @@ impl Default for QueryExecutionBudget {
 /// wire (zero = absent). Deriving a monotonic instant HERE is what keeps cross-host
 /// wall clocks out of the protocol.
 fn table_query_execution_budget(meta: &TableQueryRequestMeta) -> QueryExecutionBudget {
-	let caller_deadline = if meta.deadline_remaining_millis == 0 {
-		None
-	} else {
-		Some(Instant::now() + Duration::from_millis(meta.deadline_remaining_millis))
-	};
+	let caller_deadline = caller_deadline_from_remaining_millis(meta.deadline_remaining_millis);
 	QueryExecutionBudget {
 		caller_deadline,
 		..QueryExecutionBudget::default()
-	}
-}
-
-/// ADR 541's two clocks, enforced concurrently with distinct expiry statuses.
-#[derive(Debug, Clone, Copy)]
-struct QueryClocks {
-	last_progress: Instant,
-	stall_bound: Duration,
-	caller_deadline: Option<Instant>,
-}
-
-impl QueryClocks {
-	fn new(stall_bound: Duration, caller_deadline: Option<Instant>) -> Self {
-		Self {
-			last_progress: Instant::now(),
-			stall_bound,
-			caller_deadline,
-		}
-	}
-
-	fn from_budget(budget: &QueryExecutionBudget) -> Self {
-		Self::new(budget.max_wall_time, budget.caller_deadline)
-	}
-
-	/// A unit of progress: a location processed or a batch produced. Deliberately not
-	/// per row (a trickle must still expire) and not whole-result (that degenerates
-	/// back into a lifetime).
-	fn progressed(&mut self) {
-		self.last_progress = Instant::now();
-	}
-
-	fn expired(&self) -> Option<ReadStatus> {
-		if let Some(deadline) = self.caller_deadline {
-			if Instant::now() > deadline {
-				return Some(ReadStatus::QUERY_DEADLINE_EXCEEDED);
-			}
-		}
-		if self.last_progress.elapsed() > self.stall_bound {
-			return Some(ReadStatus::QUERY_STALLED);
-		}
-		None
 	}
 }
 
@@ -11527,6 +11486,8 @@ async fn plan_table_query_execution_by_secondary_index(
 	let mut batches = Vec::new();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
+	let mut work_locations_since_yield = 0usize;
+	let mut work_rows_since_yield = 0u64;
 	let mut max_hlc = HybridTimestamp {
 		physical_ms: 0,
 		logical: 0,
@@ -11570,6 +11531,10 @@ async fn plan_table_query_execution_by_secondary_index(
 				));
 			}
 		}
+		// Examining a row is progress whatever its disposition — retention-filtered,
+		// duplicate and rejected rows are work done, and a healthy large no-match
+		// pass must never read as a stall.
+		clocks.progressed();
 		if logical_retention_floor.is_some_and(|floor| row.row_hlc < floor) {
 			metrics().observe_storage_table_retention_read_filtered_rows(1);
 			continue;
@@ -11595,15 +11560,20 @@ async fn plan_table_query_execution_by_secondary_index(
 		if row_limit_satisfied(rows, row_limit) {
 			break;
 		}
-		for (row, result) in read_secondary_index_query_locations(
-			slab,
-			indexed_chunk,
-			table_descriptor,
-			program,
-			projected_execution,
-		)
-		.await?
+		let chunk_reads = match clocks
+			.bound(read_secondary_index_query_locations(
+				slab,
+				indexed_chunk,
+				table_descriptor,
+				program,
+				projected_execution,
+			))
+			.await
 		{
+			Ok(reads) => reads?,
+			Err(expired) => return Ok(query_plan_error(meta, expired, local_node)),
+		};
+		for (row, result) in chunk_reads {
 			if let Some(cancel) = cancellation_token {
 				if cancel.is_cancelled() {
 					return Ok(query_plan_error(
@@ -11632,7 +11602,7 @@ async fn plan_table_query_execution_by_secondary_index(
 			if row.row_hlc > max_hlc {
 				max_hlc = row.row_hlc;
 			}
-			clocks.progressed();
+			work_rows_since_yield = work_rows_since_yield.saturating_add(result.num_rows() as u64);
 			if budget.caller_totals && rows > budget.max_rows {
 				return Ok(query_plan_error(
 					meta,
@@ -11677,6 +11647,18 @@ async fn plan_table_query_execution_by_secondary_index(
 			meta.as_of_hlc,
 		);
 		for (key_identity, locality, location) in scanned {
+			// Examining a location is progress whatever its disposition — pruned,
+			// filtered, duplicate and mismatched locations are work done, and a
+			// healthy large no-match tail scan must never read as a stall.
+			clocks.progressed();
+			work_locations_since_yield = work_locations_since_yield.saturating_add(1);
+			if work_locations_since_yield >= budget.max_locations
+				|| work_rows_since_yield >= budget.max_rows
+			{
+				tokio::task::yield_now().await;
+				work_locations_since_yield = 0;
+				work_rows_since_yield = 0;
+			}
 			if row_limit_satisfied(rows, row_limit) {
 				break 'ranges;
 			}
@@ -11699,17 +11681,25 @@ async fn plan_table_query_execution_by_secondary_index(
 			if let Some(expired) = clocks.expired() {
 				return Ok(query_plan_error(meta, expired, local_node));
 			}
-			if budget.stats_pruning_enabled
-				&& !table_stats_may_match_location(
-					slab,
-					Some(table_descriptor),
-					program,
-					&mut stats_prune_cache,
-					location,
-				)
-				.await?
-			{
-				continue;
+			if budget.stats_pruning_enabled {
+				let may_match = match clocks
+					.bound(table_stats_may_match_location(
+						slab,
+						Some(table_descriptor),
+						program,
+						&mut stats_prune_cache,
+						location,
+					))
+					.await
+				{
+					Ok(may_match) => may_match?,
+					Err(expired) => {
+						return Ok(query_plan_error(meta, expired, local_node));
+					}
+				};
+				if !may_match {
+					continue;
+				}
 			}
 			scanned_locations = scanned_locations.saturating_add(1);
 			if budget.caller_totals && scanned_locations > budget.max_locations {
@@ -11723,18 +11713,23 @@ async fn plan_table_query_execution_by_secondary_index(
 			if !seen.insert(key) {
 				continue;
 			}
-			let Some(result) = read_table_query_location(
-				slab,
-				meta,
-				location,
-				key_identity,
-				locality,
-				table_descriptor,
-				program,
-				projected_execution,
-			)
-			.await?
-			else {
+			let read = match clocks
+				.bound(read_table_query_location(
+					slab,
+					meta,
+					location,
+					key_identity,
+					locality,
+					table_descriptor,
+					program,
+					projected_execution,
+				))
+				.await
+			{
+				Ok(read) => read?,
+				Err(expired) => return Ok(query_plan_error(meta, expired, local_node)),
+			};
+			let Some(result) = read else {
 				continue;
 			};
 			row_group_fetch_audit.merge(result.row_group_fetch_audit);
@@ -11746,7 +11741,9 @@ async fn plan_table_query_execution_by_secondary_index(
 			let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
 				break 'ranges;
 			};
-			if result.num_rows() > max_rows_per_location {
+			// An oversize location terminates only a caller-capped query; with server
+			// defaults it is one large unit of bounded work, not a failure.
+			if budget.caller_totals && result.num_rows() > max_rows_per_location {
 				return Ok(query_plan_error(
 					meta,
 					ReadStatus::QUERY_BUDGET_EXCEEDED,
@@ -11756,7 +11753,6 @@ async fn plan_table_query_execution_by_secondary_index(
 			if location.hlc > max_hlc {
 				max_hlc = location.hlc;
 			}
-			clocks.progressed();
 			if budget.caller_totals && rows > budget.max_rows {
 				return Ok(query_plan_error(
 					meta,
@@ -11780,6 +11776,9 @@ async fn plan_table_query_execution_by_secondary_index(
 
 	if rows == 0 && batches.is_empty() {
 		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
+		// An empty result is a legitimate answer produced by real work: the live
+		// clocks (and their progress marks) belong to it like any other exit.
+		plan.clocks = clocks;
 		plan.stats_explain = stats_prune_cache.explain;
 		plan.secondary_index_access_plan = Some(access_plan.clone());
 		plan.row_group_fetch_audit = row_group_fetch_audit;
@@ -12279,6 +12278,8 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	let mut aggregate_responses = Vec::new();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
+	let mut work_locations_since_yield = 0usize;
+	let mut work_rows_since_yield = 0u64;
 	let mut clocks = QueryClocks::from_budget(&budget);
 	let mut max_hlc = HybridTimestamp {
 		physical_ms: 0,
@@ -12319,6 +12320,21 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			meta.as_of_hlc,
 		);
 		for (key_identity, locality, location) in scanned {
+			// Examining a location is progress whatever its disposition — pruned,
+			// filtered, duplicate, mismatched and zero-result locations are work
+			// done, and a healthy large no-match scan must never read as a stall.
+			clocks.progressed();
+			// ADR 541: with server defaults the caps bound work per yield, not
+			// totality. Cooperative yields keep long scans well-behaved on the
+			// runtime without ever terminating them.
+			work_locations_since_yield = work_locations_since_yield.saturating_add(1);
+			if work_locations_since_yield >= budget.max_locations
+				|| work_rows_since_yield >= budget.max_rows
+			{
+				tokio::task::yield_now().await;
+				work_locations_since_yield = 0;
+				work_rows_since_yield = 0;
+			}
 			if row_limit_satisfied(rows, row_limit) {
 				break 'ranges;
 			}
@@ -12338,17 +12354,25 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			if let Some(expired) = clocks.expired() {
 				return Ok(query_plan_error(meta, expired, local_node));
 			}
-			if budget.stats_pruning_enabled
-				&& !table_stats_may_match_location(
-					slab,
-					table_descriptor,
-					program,
-					&mut stats_prune_cache,
-					location,
-				)
-				.await?
-			{
-				continue;
+			if budget.stats_pruning_enabled {
+				let may_match = match clocks
+					.bound(table_stats_may_match_location(
+						slab,
+						table_descriptor,
+						program,
+						&mut stats_prune_cache,
+						location,
+					))
+					.await
+				{
+					Ok(may_match) => may_match?,
+					Err(expired) => {
+						return Ok(query_plan_error(meta, expired, local_node));
+					}
+				};
+				if !may_match {
+					continue;
+				}
 			}
 			scanned_locations = scanned_locations.saturating_add(1);
 			if budget.caller_totals && scanned_locations > budget.max_locations {
@@ -12365,20 +12389,27 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					request,
 				} = &projected_execution
 				{
-					if let Some(result) = read_aggregate_query_location(
-						slab,
-						request,
-						meta,
-						location,
-						key_identity,
-						locality,
-						descriptor,
-						program,
-						requirement,
-						*user_column_count,
-					)
-					.await?
+					let aggregate_read = match clocks
+						.bound(read_aggregate_query_location(
+							slab,
+							request,
+							meta,
+							location,
+							key_identity,
+							locality,
+							descriptor,
+							program,
+							requirement,
+							*user_column_count,
+						))
+						.await
 					{
+						Ok(read) => read?,
+						Err(expired) => {
+							return Ok(query_plan_error(meta, expired, local_node));
+						}
+					};
+					if let Some(result) = aggregate_read {
 						match result {
 							AggregateQueryLocationRead::Dense(result) => {
 								row_group_fetch_audit.merge(result.row_group_fetch_audit);
@@ -12442,15 +12473,22 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					}
 					continue;
 				}
-				if let Some(result) = read_projected_query_location(
-					slab,
-					location,
-					descriptor,
-					program,
-					&projected_execution,
-				)
-				.await?
+				let projected_read = match clocks
+					.bound(read_projected_query_location(
+						slab,
+						location,
+						descriptor,
+						program,
+						&projected_execution,
+					))
+					.await
 				{
+					Ok(read) => read?,
+					Err(expired) => {
+						return Ok(query_plan_error(meta, expired, local_node));
+					}
+				};
+				if let Some(result) = projected_read {
 					if let Some(cancel) = cancellation_token {
 						if cancel.is_cancelled() {
 							return Ok(query_plan_error(
@@ -12503,7 +12541,10 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					));
 				}
 			}
-			let bytes = slab.read(location).await?;
+			let bytes = match clocks.bound(slab.read(location)).await {
+				Ok(bytes) => bytes?,
+				Err(expired) => return Ok(query_plan_error(meta, expired, local_node)),
+			};
 			let decode_started = Instant::now();
 			let storage_batch = decode_batch(&bytes)?;
 			let storage_row_count = storage_batch.num_rows();
@@ -12532,7 +12573,9 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 						.inc();
 				}
 			}
-			if batch.num_rows() > max_rows_per_location {
+			// An oversize location terminates only a caller-capped query; with server
+			// defaults it is one large unit of bounded work, not a failure.
+			if budget.caller_totals && batch.num_rows() > max_rows_per_location {
 				return Ok(query_plan_error(
 					meta,
 					ReadStatus::QUERY_BUDGET_EXCEEDED,
@@ -12637,7 +12680,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			let Some(result) = take_output_batch(result, &mut rows, row_limit) else {
 				break 'ranges;
 			};
-			clocks.progressed();
+			work_rows_since_yield = work_rows_since_yield.saturating_add(result.num_rows() as u64);
 			if budget.caller_totals && rows > budget.max_rows {
 				return Ok(query_plan_error(
 					meta,
@@ -12742,6 +12785,9 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	// avoid the cost of encoding a zero-row stream.
 	if rows == 0 && batches.is_empty() && aggregate_responses.is_empty() {
 		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
+		// An empty result is a legitimate answer produced by real work: the live
+		// clocks (and their progress marks) belong to it like any other exit.
+		plan.clocks = clocks;
 		plan.stats_explain = stats_prune_cache.explain;
 		plan.row_group_fetch_audit = row_group_fetch_audit;
 		plan.encoding_materialize_audit = encoding_materialize_audit;
@@ -13667,11 +13713,7 @@ fn aggregate_query_budget(budgets: &AggregateBudgets) -> QueryExecutionBudget {
 	// wall budget is an absolute deadline — not a clamp on the stall bound.
 	let max_locations = usize::try_from(budgets.max_locations.get()).unwrap_or(usize::MAX);
 	let max_rows = budgets.max_rows.get();
-	let caller_deadline = if budgets.max_wall_time_millis.get() == u64::MAX {
-		None
-	} else {
-		Some(Instant::now() + Duration::from_millis(budgets.max_wall_time_millis.get()))
-	};
+	let caller_deadline = caller_deadline_from_budget_millis(budgets.max_wall_time_millis.get());
 	QueryExecutionBudget {
 		max_locations,
 		max_rows,
@@ -13688,6 +13730,10 @@ fn aggregate_reject_from_read_status(status: ReadStatus) -> AggRejectCode {
 		ReadStatus::QUERY_BUDGET_EXCEEDED | ReadStatus::BACKPRESSURED => {
 			AggRejectCode::BudgetExceeded
 		}
+		// ADR 541: expiry causes stay attributable through the aggregate protocol —
+		// collapsing them into BudgetExceeded is the same defect one seam over.
+		ReadStatus::QUERY_DEADLINE_EXCEEDED => AggRejectCode::QueryDeadlineExceeded,
+		ReadStatus::QUERY_STALLED => AggRejectCode::Stalled,
 		ReadStatus::EPOCH_STALE => AggRejectCode::SchemaStale,
 		ReadStatus::TENANT_UNAVAILABLE
 		| ReadStatus::AUTHORIZATION_FAILED
@@ -13721,6 +13767,8 @@ fn aggregate_reject_to_read_status(code: AggRejectCode) -> ReadStatus {
 		}
 		AggRejectCode::BudgetExceeded => ReadStatus::QUERY_BUDGET_EXCEEDED,
 		AggRejectCode::DeadlineExceeded => ReadStatus::E_SAFE_BEHIND,
+		AggRejectCode::Stalled => ReadStatus::QUERY_STALLED,
+		AggRejectCode::QueryDeadlineExceeded => ReadStatus::QUERY_DEADLINE_EXCEEDED,
 		AggRejectCode::RetentionExpired => ReadStatus::RETENTION_EXPIRED,
 	}
 }

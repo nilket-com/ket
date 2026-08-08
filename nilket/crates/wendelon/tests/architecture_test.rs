@@ -6706,10 +6706,14 @@ fn adr072_descriptor_get_msg_types_are_unique() {
 	assert_eq!(schema_core.matches("Self(0x45)").count(), 1);
 
 	let router = read_workspace("crates/wendelon/src/network/router.rs");
-	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_REQ.0"));
-	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_RESP.0"));
-	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_REQ.0"));
-	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_RESP.0"));
+	// The invariant is that the router names and routes these message types. How it
+	// compares them is not the invariant: the router now collects candidates and
+	// matches with `candidate.0 == msg_type` instead of comparing `MsgType::X.0`
+	// per arm, so pinning the `.0` spelling pinned a shape rather than the routing.
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_REQ"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_GET_RESP"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_REQ"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_RESP"));
 }
 
 #[test]
@@ -6875,8 +6879,10 @@ fn adr102_descriptor_list_surface_is_latest_only_metadata() {
 	assert!(schema_core.contains("pub struct TableDescriptorListResponseMeta"));
 	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_REQ: Self = Self(0x44);"));
 	assert!(schema_core.contains("pub const TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45);"));
-	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_REQ.0"));
-	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_RESP.0"));
+	// Routing is the invariant, not the `.0` comparison spelling — see the ADR 072
+	// message-type guard for the same retarget.
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_REQ"));
+	assert!(router.contains("MsgType::TABLE_DESCRIPTOR_LIST_RESP"));
 	assert!(client.contains("pub async fn list_table_schema_descriptors"));
 	assert!(client.contains("decode_table_schema_descriptors(&trailing[..])"));
 	assert!(table_schema.contains("pub fn latest_descriptors_for_tenant"));
@@ -7080,7 +7086,7 @@ fn adr073_table_query_request_id_is_required_fixed_meta() {
 		"pub struct TableQueryCancelStatus",
 	);
 	assert!(meta.contains("pub request_id: TableQueryRequestId"));
-	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 184"));
 	assert!(schema.contains("offset_of!(TableQueryRequestMeta, request_id), 128"));
 	assert!(client.contains("TABLE_QUERY_REQ request_id must be non-zero"));
 	assert!(data_server.contains("TABLE_QUERY_REQ request_id must be non-zero"));
@@ -7232,7 +7238,11 @@ fn adr073_cancelled_table_query_has_stable_read_status() {
 	let data_server = data_server_workspace_source();
 	assert!(core.contains("pub const QUERY_CANCELLED: Self = Self(15);"));
 	assert!(core.contains("Self::QUERY_CANCELLED => \"query_cancelled\""));
-	assert!(client.contains("Wendelon query failed: QUERY_CANCELLED"));
+	// ADR 540 replaced hand-written per-status message construction with one typed
+	// rendering, so the stable surface is the status *name* carried into the rendered
+	// error, not a bespoke literal per status. The invariant is unchanged: cancellation
+	// stays a named status and keeps its own error kind.
+	assert!(client.contains("Wendelon query failed: query_cancelled(15)"));
 	assert!(client.contains("ErrorKind::Interrupted"));
 	assert!(data_server.contains("ReadStatus::QUERY_CANCELLED"));
 	assert!(adr073_table_query_handler_region(&data_server).contains("FRAME_FLAG_STREAM_END"));
@@ -7485,7 +7495,7 @@ fn adr074_table_query_trace_carrier_is_fixed_binary_not_traceparent() {
 #[test]
 fn adr074_table_query_meta_widens_tail_without_extension_or_v1_sidecar() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
-	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 184"));
 	for forbidden in [
 		"TableQueryRequestMetaV1",
 		"TableQueryRequestMetaExtension",
@@ -7501,14 +7511,17 @@ fn adr074_table_query_meta_widens_tail_without_extension_or_v1_sidecar() {
 #[test]
 fn adr074_trace_meta_offsets_are_pinned() {
 	let schema = read_workspace("crates/wendelon/src/schema/table.rs");
+	// The trace tail sits after the fixed meta's own fields, so widening the meta moves
+	// it wholesale. What this guard pins is that the tail stays pinned *somewhere* — the
+	// offsets are re-stated, never dropped, when a field lands ahead of them.
 	for required in [
-		"offset_of!(TableQueryRequestMeta, trace_id), 144",
+		"offset_of!(TableQueryRequestMeta, trace_id), 152",
 		"offset_of!(TableQueryRequestMeta, trace_parent_span_id)",
-		"160",
-		"offset_of!(TableQueryRequestMeta, trace_flags)",
 		"168",
-		"offset_of!(TableQueryRequestMeta, _trace_pad), 169",
-		"169",
+		"offset_of!(TableQueryRequestMeta, trace_flags)",
+		"176",
+		"offset_of!(TableQueryRequestMeta, _trace_pad), 177",
+		"177",
 	] {
 		assert!(schema.contains(required), "missing offset pin {required}");
 	}
@@ -7766,7 +7779,7 @@ fn adr116_table_query_row_limit_is_fixed_meta_not_sidecar_budget() {
 	assert!(options_region.contains("pub row_limit: Option<NonZeroU64>"));
 	assert!(client.contains("row_limit_rows: options.row_limit.map(NonZeroU64::get).unwrap_or(0)"));
 	assert!(meta_region.contains("pub row_limit_rows: u64"));
-	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 176"));
+	assert!(schema.contains("size_of::<TableQueryRequestMeta>() == 184"));
 	assert!(schema.contains("offset_of!(TableQueryRequestMeta, row_limit_rows)"));
 	assert!(schema.contains("120"));
 	assert!(data_server.contains("fn table_query_row_limit"));
@@ -8559,6 +8572,9 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"data_server.rs",
 			"counter.rs",
 			"descriptor_migration.rs",
+			// ADR 541's two clocks: a self-contained mechanism with its own
+			// invariants, carved so the bounded root keeps ratcheting down.
+			"query_clocks.rs",
 			"replica_routing.rs",
 			"streaming.rs",
 			"table_query.rs",

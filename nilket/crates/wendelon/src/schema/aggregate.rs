@@ -424,6 +424,12 @@ pub enum AggRejectCode {
 	PartialStateTooLarge = 15,
 	NumericOverflow = 16,
 	RetentionExpired = 17,
+	/// ADR 541: the aggregate made no progress for the server's sliding bound.
+	Stalled = 18,
+	/// ADR 541: the caller's end-to-end query deadline expired. Distinct from
+	/// `DeadlineExceeded`, which names the e-safe read deadline and keeps its
+	/// meaning — overloading it would be a fresh collapse.
+	QueryDeadlineExceeded = 19,
 }
 
 impl AggRejectCode {
@@ -444,6 +450,8 @@ impl AggRejectCode {
 			Self::SchemaStale => "AGG_REJECT_SCHEMA_STALE",
 			Self::SchemaUnknown => "AGG_REJECT_SCHEMA_UNKNOWN",
 			Self::BudgetExceeded => "AGG_REJECT_BUDGET_EXCEEDED",
+			Self::Stalled => "AGG_REJECT_STALLED",
+			Self::QueryDeadlineExceeded => "AGG_REJECT_QUERY_DEADLINE_EXCEEDED",
 			Self::DeadlineExceeded => "AGG_REJECT_DEADLINE_EXCEEDED",
 			Self::CapabilityUnavailable => "AGG_REJECT_CAPABILITY_UNAVAILABLE",
 			Self::PartialCrossbindFailed => "AGG_REJECT_PARTIAL_CROSSBIND_FAILED",
@@ -803,6 +811,8 @@ mod tests {
 		assert_eq!(AggRejectCode::PartialStateTooLarge.code(), 15);
 		assert_eq!(AggRejectCode::NumericOverflow.code(), 16);
 		assert_eq!(AggRejectCode::RetentionExpired.code(), 17);
+		assert_eq!(AggRejectCode::Stalled.code(), 18);
+		assert_eq!(AggRejectCode::QueryDeadlineExceeded.code(), 19);
 	}
 
 	#[test]

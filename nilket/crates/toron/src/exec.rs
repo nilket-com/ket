@@ -111,6 +111,9 @@ pub struct ExecutionContext {
 	pub join_runtime_observation_mode: JoinRuntimeObservationMode,
 	pub runtime_filter: Option<RuntimeFilterDescriptor>,
 	pub downstream_cancellation: Option<DownstreamCancellationContext>,
+	/// ADR 541: the caller's absolute end-to-end query deadline, threaded into every
+	/// storage scan this execution issues. None means no total wall-clock cap.
+	pub deadline: Option<std::time::Instant>,
 	pub partition_parallelism: usize,
 	join_spill_file_ops: Arc<dyn AsyncFileOps>,
 	join_spill_dir: PathBuf,
@@ -162,6 +165,7 @@ impl ExecutionContext {
 			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			runtime_filter: None,
 			downstream_cancellation: None,
+			deadline: None,
 			partition_parallelism: default_partition_parallelism(),
 			join_spill_file_ops: Arc::new(BlockingFileOps),
 			join_spill_dir: crate::exec::join::default_join_spill_dir(),
@@ -295,6 +299,7 @@ impl Executor {
 			morsel,
 			row_limit: *row_limit,
 			downstream_cancellation: self.context.downstream_cancellation.clone(),
+			deadline: self.context.deadline,
 		})
 	}
 
@@ -388,6 +393,7 @@ impl Executor {
 						morsel,
 						row_limit: None,
 						downstream_cancellation: self.context.downstream_cancellation.clone(),
+						deadline: self.context.deadline,
 					};
 					let span = crate::telemetry::storage_scan_span(&req);
 					let stream = self.storage.scan(req).instrument(span).await?;

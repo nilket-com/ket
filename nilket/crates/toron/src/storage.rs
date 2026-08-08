@@ -62,6 +62,9 @@ pub struct ScanRequest {
 	pub morsel: Option<(MorselId, u32)>,
 	pub row_limit: Option<usize>,
 	pub downstream_cancellation: Option<DownstreamCancellationContext>,
+	/// ADR 541: the caller's absolute end-to-end deadline. Propagated to Wendelon as a
+	/// remaining duration per attempt; None means the caller imposed no total cap.
+	pub deadline: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -855,9 +858,36 @@ fn wendelon_table_query_trace_context_with_enabled(
 	}
 }
 
+/// Everything the caller's `ScanRequest` decides about the Wendelon table query, in one
+/// pure mapping. The caller deadline crosses here (ADR 541): dropping it silently
+/// re-creates the unbounded-total defect, so the mapping is unit-tested field by field.
+fn wendelon_table_query_options(request: &ScanRequest) -> wendelon_client::TableQueryOptions {
+	let mut options = wendelon_client::TableQueryOptions {
+		trace_context: wendelon_table_query_trace_context(request),
+		deadline: request.deadline,
+		..wendelon_client::TableQueryOptions::default()
+	};
+	if request.read_bound.0 > 0 {
+		options.as_of_hlc = Some(wendelon::schema::HybridTimestamp {
+			physical_ms: request.read_bound.0,
+			logical: 0,
+			node_id: 0,
+		});
+	}
+	options.physical_descriptor_fingerprint = Some(request.physical_descriptor_fingerprint);
+	options.row_identity = match request.row_identity {
+		RowIdentityProjection::None => wendelon_client::RowIdentityProjection::None,
+		RowIdentityProjection::Append => wendelon_client::RowIdentityProjection::Append,
+	};
+	options.row_limit = request
+		.row_limit
+		.and_then(|limit| std::num::NonZeroU64::new(limit as u64));
+	options
+}
+
 #[async_trait::async_trait]
 impl StorageScan for WendelonStorageScan {
-	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+	async fn scan(&self, mut request: ScanRequest) -> Result<ScanStream, StorageError> {
 		if request.row_identity == RowIdentityProjection::Append
 			&& request.projected_columns.is_some()
 		{
@@ -880,31 +910,12 @@ impl StorageScan for WendelonStorageScan {
 			});
 		}
 
-		let mut options = wendelon_client::TableQueryOptions {
-			trace_context: wendelon_table_query_trace_context(&request),
-			..wendelon_client::TableQueryOptions::default()
-		};
+		let options = wendelon_table_query_options(&request);
 
-		let mut pbc = request.pbc_predicate.unwrap_or_default();
+		let mut pbc = request.pbc_predicate.take().unwrap_or_default();
 		if let Some(projected_columns) = &request.projected_columns {
 			append_projection(&mut pbc, projected_columns)?;
 		}
-
-		if request.read_bound.0 > 0 {
-			options.as_of_hlc = Some(wendelon::schema::HybridTimestamp {
-				physical_ms: request.read_bound.0,
-				logical: 0,
-				node_id: 0,
-			});
-		}
-		options.physical_descriptor_fingerprint = Some(request.physical_descriptor_fingerprint);
-		options.row_identity = match request.row_identity {
-			RowIdentityProjection::None => wendelon_client::RowIdentityProjection::None,
-			RowIdentityProjection::Append => wendelon_client::RowIdentityProjection::Append,
-		};
-		options.row_limit = request
-			.row_limit
-			.and_then(|limit| std::num::NonZeroU64::new(limit as u64));
 
 		let tenant_id = wendelon::schema::TenantId::new(request.tenant_id.0);
 		if request
@@ -1235,6 +1246,26 @@ mod tests {
 		} else {
 			panic!("expected sampled table query trace context");
 		}
+	}
+
+	#[test]
+	fn adr541_caller_deadline_crosses_to_wendelon_options() {
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+		let mut request = table_scan_request(RowIdentityProjection::None);
+		request.deadline = Some(deadline);
+
+		let options = wendelon_table_query_options(&request);
+
+		assert_eq!(options.deadline, Some(deadline));
+	}
+
+	#[test]
+	fn adr541_absent_caller_deadline_stays_absent() {
+		let request = table_scan_request(RowIdentityProjection::None);
+
+		let options = wendelon_table_query_options(&request);
+
+		assert_eq!(options.deadline, None);
 	}
 
 	#[tokio::test]
@@ -1575,6 +1606,7 @@ mod tests {
 			morsel: None,
 			row_limit: None,
 			downstream_cancellation: None,
+			deadline: None,
 		}
 	}
 
@@ -1616,6 +1648,7 @@ mod tests {
 			morsel: Some((MorselId(1), 2)),
 			row_limit: None,
 			downstream_cancellation: None,
+			deadline: None,
 		}
 	}
 

@@ -1035,6 +1035,7 @@ async fn handle_sql_connection(
 				.planner_config()
 				.with_session_timezone(session_timezone.clone());
 			let mut context = sql_execution_context(tenant_id, frame.query_id, session_id);
+			context.deadline = std::time::Instant::now().checked_add(timeout_duration);
 			context.trace_context = query_trace.trace_context();
 			let returns_rows = sql_plan_returns_rows(&plan);
 			let execution = async {
@@ -1426,6 +1427,7 @@ async fn handle_sql_connection(
 				.map(|seconds| std::time::Duration::from_secs(u64::from(seconds)))
 				.unwrap_or(options.statement_timeout);
 			let mut context = sql_execution_context(tenant_id, frame.query_id, session_id);
+			context.deadline = std::time::Instant::now().checked_add(timeout_duration);
 			context.trace_context = query_trace.trace_context();
 			let execution = coordinator
 				.execute_query_with_context(&plan, context)

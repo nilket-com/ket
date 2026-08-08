@@ -737,7 +737,7 @@ pub(crate) fn adr069_only_storage_scan_populates_table_query_trace_context() {
 	);
 	assert_eq!(
 		production
-			.matches("trace_context: wendelon_table_query_trace_context(&request),")
+			.matches("trace_context: wendelon_table_query_trace_context(request),")
 			.count(),
 		1
 	);
@@ -747,26 +747,41 @@ pub(crate) fn adr069_only_storage_scan_populates_table_query_trace_context() {
 pub(crate) fn adr069_trace_context_set_once_on_shared_options() {
 	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
 		.expect("read storage source");
+	// ADR 541 extracted the options build into the pure `wendelon_table_query_options`
+	// helper so the caller-deadline crossing is unit-testable. The invariant is
+	// unchanged: the trace context is set exactly once, on the one shared options
+	// value both cancellation branches consume.
+	let (_, builder_block) =
+		brace_blocks_after_marker(&storage, "fn wendelon_table_query_options(")
+			.into_iter()
+			.next()
+			.expect("wendelon_table_query_options fn block");
+	let options_pos = builder_block
+		.find("let mut options = wendelon_client::TableQueryOptions {")
+		.expect("options initialization");
+	let carrier = "trace_context: wendelon_table_query_trace_context(request),";
+	let carrier_pos = builder_block.find(carrier).expect("trace context carrier");
+	let default_pos = builder_block
+		.find("..wendelon_client::TableQueryOptions::default()")
+		.expect("default options update");
+	assert_eq!(builder_block.matches(carrier).count(), 1);
+	assert!(options_pos < carrier_pos);
+	assert!(carrier_pos < default_pos);
+
 	let (_, scan_block) =
 		brace_blocks_after_marker(&storage, "impl StorageScan for WendelonStorageScan")
 			.into_iter()
 			.next()
 			.expect("WendelonStorageScan impl block");
-	let options_pos = scan_block
-		.find("let mut options = wendelon_client::TableQueryOptions {")
-		.expect("options initialization");
-	let carrier = "trace_context: wendelon_table_query_trace_context(&request),";
-	let carrier_pos = scan_block.find(carrier).expect("trace context carrier");
-	let default_pos = scan_block
-		.find("..wendelon_client::TableQueryOptions::default()")
-		.expect("default options update");
+	let shared_options = "let options = wendelon_table_query_options(&request);";
+	let shared_pos = scan_block
+		.find(shared_options)
+		.expect("shared options build");
 	let branch_pos = scan_block
 		.find("let mut query_stream = if let Some(downstream_cancellation)")
 		.expect("cancellation branch");
-	assert_eq!(scan_block.matches(carrier).count(), 1);
-	assert!(options_pos < carrier_pos);
-	assert!(carrier_pos < default_pos);
-	assert!(default_pos < branch_pos);
+	assert_eq!(scan_block.matches(shared_options).count(), 1);
+	assert!(shared_pos < branch_pos);
 }
 
 #[test]

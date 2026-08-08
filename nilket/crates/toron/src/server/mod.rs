@@ -4255,6 +4255,7 @@ fn drive_streamable_plan<'a>(
 					morsel,
 					row_limit: *row_limit,
 					downstream_cancellation: context.downstream_cancellation.clone(),
+					deadline: context.deadline,
 				};
 				let stream = executor.storage_arc().scan(req).await?;
 				let mut stream = stream.into_batches();

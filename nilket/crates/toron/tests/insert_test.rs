@@ -1340,6 +1340,7 @@ fn scan_request(binding: &TableBinding) -> ScanRequest {
 		morsel: None,
 		row_limit: None,
 		downstream_cancellation: None,
+		deadline: None,
 	}
 }
 
