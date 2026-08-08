@@ -9,7 +9,7 @@ use std::num::NonZeroU64;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use thiserror::Error;
 use tokio::sync::watch;
 use uuid::Uuid;
@@ -185,6 +185,10 @@ pub struct TableQueryOptions {
 	pub row_identity: RowIdentityProjection,
 	pub trace_context: TableQueryTraceContext,
 	pub row_limit: Option<NonZeroU64>,
+	/// ADR 541: the caller's absolute end-to-end deadline, kept as a local monotonic
+	/// instant. Each attempt transmits the REMAINING duration measured from this
+	/// original instant, so retries consume the deadline and can never reset it.
+	pub deadline: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -209,6 +213,7 @@ impl Default for TableQueryOptions {
 			row_identity: RowIdentityProjection::None,
 			trace_context: TableQueryTraceContext::Absent,
 			row_limit: None,
+			deadline: None,
 		}
 	}
 }
@@ -1296,6 +1301,7 @@ impl Client {
 				as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
 				row_limit_rows: options.row_limit.map(NonZeroU64::get).unwrap_or(0),
 				request_id: TableQueryRequestId::ZERO,
+				deadline_remaining_millis: deadline_remaining_millis(options.deadline),
 				trace_id: trace_tail.trace_id,
 				trace_parent_span_id: trace_tail.parent_span_id,
 				trace_flags: trace_tail.flags,
@@ -1529,6 +1535,7 @@ fn table_query_request(
 			as_of_hlc: options.as_of_hlc.unwrap_or_else(zero_hlc),
 			row_limit_rows: options.row_limit.map(NonZeroU64::get).unwrap_or(0),
 			request_id: TableQueryRequestId::ZERO,
+			deadline_remaining_millis: deadline_remaining_millis(options.deadline),
 			trace_id: trace_tail.trace_id,
 			trace_parent_span_id: trace_tail.parent_span_id,
 			trace_flags: trace_tail.flags,
@@ -1649,6 +1656,22 @@ fn default_client_hlc() -> HybridTimestamp {
 		physical_ms,
 		logical: 0,
 		node_id: 0,
+	}
+}
+
+/// Remaining milliseconds until the caller's original absolute deadline, measured at
+/// this attempt. An already-expired deadline transmits one millisecond rather than
+/// zero, because zero means "absent" on the wire — the server then expires it
+/// immediately with the deadline status instead of the client silently dropping it.
+fn deadline_remaining_millis(deadline: Option<Instant>) -> u64 {
+	match deadline {
+		None => 0,
+		Some(deadline) => {
+			let remaining = deadline
+				.saturating_duration_since(Instant::now())
+				.as_millis() as u64;
+			remaining.max(1)
+		}
 	}
 }
 

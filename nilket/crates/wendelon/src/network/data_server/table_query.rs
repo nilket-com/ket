@@ -750,31 +750,33 @@ impl WendelonDataServer {
 		let QueryExecutionPlan {
 			response,
 			batches,
-			deadline,
+			mut clocks,
 			row_group_fetch_audit,
 			encoding_materialize_audit,
 			..
 		} = plan;
-		let Some(encoded_batches) = encode_query_stream_batches_with_deadline(batches, deadline)?
-		else {
-			let budget_resp =
-				query_error_meta(&meta, ReadStatus::QUERY_BUDGET_EXCEEDED, self.local_node);
-			self.emit_query_completion_audit(actor, &meta, &budget_resp, 0)?;
-			self.emit_row_group_fetch_sampled_audit(actor, &meta, &row_group_fetch_audit)?;
-			self.emit_encoding_materialize_sampled_audit(
-				actor,
-				&meta,
-				&encoding_materialize_audit,
-			)?;
-			let response = self.build_query_response_frame(
-				frame.header.stream_id,
-				budget_resp,
-				None,
-				FRAME_FLAG_STREAM_END,
-			);
-			write_frame(&mut *stream, &response.header, &response.meta, None, None).await?;
-			stream.finish().await?;
-			return Ok(());
+		let encoded_batches = match encode_query_stream_batches_with_deadline(batches, &mut clocks)?
+		{
+			Ok(encoded_batches) => encoded_batches,
+			Err(expired) => {
+				let budget_resp = query_error_meta(&meta, expired, self.local_node);
+				self.emit_query_completion_audit(actor, &meta, &budget_resp, 0)?;
+				self.emit_row_group_fetch_sampled_audit(actor, &meta, &row_group_fetch_audit)?;
+				self.emit_encoding_materialize_sampled_audit(
+					actor,
+					&meta,
+					&encoding_materialize_audit,
+				)?;
+				let response = self.build_query_response_frame(
+					frame.header.stream_id,
+					budget_resp,
+					None,
+					FRAME_FLAG_STREAM_END,
+				);
+				write_frame(&mut *stream, &response.header, &response.meta, None, None).await?;
+				stream.finish().await?;
+				return Ok(());
+			}
 		};
 		let total_bytes = encoded_batches.iter().map(|arrow| arrow.len() as u64).sum();
 		self.emit_query_completion_audit(actor, &meta, &response, total_bytes)?;

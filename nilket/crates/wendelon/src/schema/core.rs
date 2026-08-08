@@ -1449,12 +1449,19 @@ impl ReadStatus {
 	/// table/reference/slab/origin diagnostic; retrying cannot make the
 	/// acknowledged state readable.
 	pub const TABLE_REFERENCE_INTEGRITY_FAILED: Self = Self(16);
+	/// The query made no progress for the server's sliding no-progress bound. A
+	/// progressing scan never carries this status; a stalled one always does.
+	pub const QUERY_STALLED: Self = Self(17);
+	/// The caller's end-to-end deadline expired. The deadline is absolute and
+	/// non-resetting; it travels as remaining duration and is derived into a local
+	/// monotonic instant on receipt.
+	pub const QUERY_DEADLINE_EXCEEDED: Self = Self(18);
 
 	/// The canonical named-status list. ADR 540's totality guard holds the mapping
 	/// honest: a new status constant added without an entry here (and an `as_str`
 	/// name) fails the guard, because a status the server can emit but the boundary
 	/// cannot name is how failures collapse into generic errors.
-	pub const ALL_NAMED: [Self; 17] = [
+	pub const ALL_NAMED: [Self; 19] = [
 		Self::OK,
 		Self::KEY_NOT_FOUND,
 		Self::EPOCH_STALE,
@@ -1472,6 +1479,8 @@ impl ReadStatus {
 		Self::TABLE_DESCRIPTOR_EVOLVED,
 		Self::QUERY_CANCELLED,
 		Self::TABLE_REFERENCE_INTEGRITY_FAILED,
+		Self::QUERY_STALLED,
+		Self::QUERY_DEADLINE_EXCEEDED,
 	];
 
 	pub const fn as_str(self) -> &'static str {
@@ -1493,6 +1502,8 @@ impl ReadStatus {
 			Self::TABLE_DESCRIPTOR_EVOLVED => "table_descriptor_evolved",
 			Self::QUERY_CANCELLED => "query_cancelled",
 			Self::TABLE_REFERENCE_INTEGRITY_FAILED => "table_reference_integrity_failed",
+			Self::QUERY_STALLED => "query_stalled",
+			Self::QUERY_DEADLINE_EXCEEDED => "query_deadline_exceeded",
 			_ => "unknown",
 		}
 	}

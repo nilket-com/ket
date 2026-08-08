@@ -588,6 +588,7 @@ fn table_query_meta_for_test(
 		as_of_hlc,
 		row_limit_rows: 0,
 		request_id: TableQueryRequestId::from_u128(1),
+		deadline_remaining_millis: 0,
 		trace_id: [0; 16],
 		trace_parent_span_id: [0; 8],
 		trace_flags: 0,
@@ -3363,6 +3364,8 @@ async fn query_budget_exceeded_returns_structured_status() {
 			max_rows: 10,
 			max_wall_time: Duration::from_secs(1),
 			stats_pruning_enabled: true,
+			caller_totals: true,
+			caller_deadline: None,
 		},
 		None,
 	)
@@ -3411,6 +3414,8 @@ async fn query_budget_counts_scanned_locations_even_when_filter_rejects_rows() {
 			max_rows: 10,
 			max_wall_time: Duration::from_secs(1),
 			stats_pruning_enabled: true,
+			caller_totals: true,
+			caller_deadline: None,
 		},
 		None,
 	)
@@ -3441,6 +3446,8 @@ async fn query_budget_exceeded_when_single_location_batch_exceeds_row_cap() {
 			max_rows: 10,
 			max_wall_time: Duration::from_secs(1),
 			stats_pruning_enabled: true,
+			caller_totals: true,
+			caller_deadline: None,
 		},
 		None,
 	)
@@ -3452,12 +3459,34 @@ async fn query_budget_exceeded_when_single_location_batch_exceeds_row_cap() {
 	assert!(arrow.is_none());
 }
 
+/// ADR 541: the two expiry causes are distinct at the encode preflight, and a
+/// progressing encode never dies by lifetime — each cause gets its own fixture and
+/// its own status; no shared assertion.
 #[test]
-fn stream_preflight_encode_respects_deadline() {
-	let expired = Instant::now() - Duration::from_millis(1);
+fn stream_preflight_encode_expires_by_cause_never_by_lifetime() {
+	// Caller deadline in the past: absolute, non-resetting, distinct status.
+	let mut expired_deadline = QueryClocks::new(
+		Duration::from_secs(3600),
+		Some(Instant::now() - Duration::from_millis(1)),
+	);
 	let encoded =
-		encode_query_stream_batches_with_deadline(vec![single_kv_batch()], expired).unwrap();
-	assert!(encoded.is_none());
+		encode_query_stream_batches_with_deadline(vec![single_kv_batch()], &mut expired_deadline)
+			.unwrap();
+	assert_eq!(encoded, Err(ReadStatus::QUERY_DEADLINE_EXCEEDED));
+
+	// No progress for the stall bound: sliding, distinct status.
+	let mut stalled = QueryClocks::new(Duration::from_millis(0), None);
+	std::thread::sleep(Duration::from_millis(2));
+	let encoded =
+		encode_query_stream_batches_with_deadline(vec![single_kv_batch()], &mut stalled).unwrap();
+	assert_eq!(encoded, Err(ReadStatus::QUERY_STALLED));
+
+	// A progressing encode with a generous stall bound and no caller deadline
+	// completes regardless of how many batches it carries: no lifetime exists.
+	let mut progressing = QueryClocks::new(Duration::from_secs(3600), None);
+	let batches = vec![single_kv_batch(); 64];
+	let encoded = encode_query_stream_batches_with_deadline(batches, &mut progressing).unwrap();
+	assert_eq!(encoded.map(|arrows| arrows.len()), Ok(64));
 }
 
 // ========================================================
@@ -4433,6 +4462,8 @@ async fn aggregate_plan_folds_projected_l2_inputs() {
 			max_rows: 1_000_000,
 			max_wall_time: Duration::from_secs(600),
 			stats_pruning_enabled: true,
+			caller_totals: true,
+			caller_deadline: None,
 		},
 		None,
 		Some(&descriptor),
@@ -4614,6 +4645,8 @@ async fn aggregate_plan_uses_encoded_l2_partials_when_supported() {
 			max_rows: 1_000_000,
 			max_wall_time: Duration::from_secs(600),
 			stats_pruning_enabled: true,
+			caller_totals: true,
+			caller_deadline: None,
 		},
 		None,
 		Some(&descriptor),
@@ -7038,6 +7071,7 @@ async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 		runtime_filter_len: 0,
 		as_of_hlc: hlc(0, 0, 0),
 		row_limit_rows: 0,
+		deadline_remaining_millis: 0,
 		request_id: TableQueryRequestId::from_u128(2),
 		trace_id: [0; 16],
 		trace_parent_span_id: [0; 8],
@@ -13286,4 +13320,85 @@ fn table_write_parent_identity_ignores_idempotency_ttl_and_pad() {
 		"table_write_parent_identity must depend only on the canonical \
 			 idempotency identity (`client_uuid` + `sequence_no`)"
 	);
+}
+
+/// ADR 541 Acceptance 1 (in-repo form): a full-table scan an order of magnitude past
+/// the former 250 ms-lifetime failure point completes under the DEFAULT budget. The
+/// old semantics fail this twice over — 25,000 locations breaks the 4,096 total cap,
+/// and the scan wall breaks the lifetime clock — so this fixture is discriminating
+/// against both retired behaviors at once.
+#[tokio::test]
+async fn full_scan_completes_far_beyond_the_former_lifetime_cap() {
+	let mgr = make_manager().await;
+	for locality in 0..25_000u64 {
+		seed_record(
+			&mgr,
+			locality,
+			hlc(1, 0, 1),
+			&locality.to_le_bytes(),
+			b"row",
+		)
+		.await;
+	}
+	let sm = WendelonStateMachine::new();
+	let (resp, arrow) = execute_query_plan(&mgr, &sm, n(1), &base_meta(), &[])
+		.await
+		.unwrap();
+	assert_eq!(resp.status, ReadStatus::OK);
+	assert_eq!(resp.rows, 25_000);
+	assert!(arrow.is_some());
+}
+
+/// ADR 541 Acceptance 3: a caller deadline tighter than any server policy is honored
+/// with its own status, and a generous caller deadline does not resurrect
+/// lifetime-style failures on a progressing scan.
+#[tokio::test]
+async fn caller_deadline_is_absolute_and_attributable() {
+	let mgr = make_manager().await;
+	for locality in 0..64u64 {
+		seed_record(
+			&mgr,
+			locality,
+			hlc(1, 0, 1),
+			&locality.to_le_bytes(),
+			b"row",
+		)
+		.await;
+	}
+	let sm = WendelonStateMachine::new();
+	let expired = QueryExecutionBudget {
+		caller_deadline: Some(Instant::now() - Duration::from_millis(1)),
+		..QueryExecutionBudget::default()
+	};
+	let (resp, arrow) = execute_query_plan_with_budget_and_retention_floor(
+		&mgr,
+		&sm,
+		n(1),
+		&base_meta(),
+		&[],
+		expired,
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(resp.status, ReadStatus::QUERY_DEADLINE_EXCEEDED);
+	assert!(arrow.is_none());
+
+	let generous = QueryExecutionBudget {
+		caller_deadline: Some(Instant::now() + Duration::from_secs(3600)),
+		..QueryExecutionBudget::default()
+	};
+	let (resp, _arrow) = execute_query_plan_with_budget_and_retention_floor(
+		&mgr,
+		&sm,
+		n(1),
+		&base_meta(),
+		&[],
+		generous,
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(resp.status, ReadStatus::OK);
+	assert_eq!(resp.rows, 64);
 }

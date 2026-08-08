@@ -27,6 +27,12 @@ cap denominated in milliseconds.
      only the caller knows the query. Absent a caller deadline, there is no total wall-clock
      cap — totality is bounded by the caller budget or not at all.
 
+     Protocol condition: the wire carries **remaining duration**, never a cross-host
+     wall-clock timestamp. Toron computes the remainder from its original absolute deadline
+     at each transmission; Wendelon derives a local monotonic deadline on receipt. Retries
+     consume the original deadline — a retry's remainder is measured from the original
+     instant, so retrying can never mint fresh time.
+
 2. **No pagination.** The ADR 118 streaming contract stays as the one shape for large results;
    this ADR fixes the budget semantics inside it rather than adding a second result-transfer
    mechanism with its own consistency questions.
