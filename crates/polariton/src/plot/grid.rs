@@ -7,6 +7,7 @@
 
 #![allow(dead_code)]
 
+use crate::coordinate::{Cell, Plot, Pt, Rect, Widget};
 use crate::plot::common::{
 	AxisTextVisibility, CoordinateTransformer, PlotBackend, PlotComposite, PlotKernel, PlotLayout,
 	PlotWidget, ResolvedPlotSettings,
@@ -503,15 +504,11 @@ impl PlotComposite for PlotGridKernel {
 	fn render_plot_layer(
 		&self,
 		backend: &mut dyn PlotBackend,
-		bounds: IcedRectangle,
+		bounds: Rect<Widget>,
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
 	) {
-		// The backend frame is widget-local; `bounds` carries the widget's
-		// absolute window position. Like PlotWidget::plot_area, the grid
-		// consumes only the size.
-		let bounds = IcedRectangle::new(Point::ORIGIN, bounds.size());
 		if self.cells.len() == 1 {
 			let cell = self.cells.first();
 			let helper = PlotWidget {
@@ -524,7 +521,7 @@ impl PlotComposite for PlotGridKernel {
 				resize_render_suspended: false,
 				layer: crate::plot::common::PlotRenderLayer::Full,
 			};
-			helper.render_plot_layer(backend, bounds);
+			helper.render_plot_layer(backend, bounds.into_iced());
 			return;
 		}
 		let resolved = settings.resolve();
@@ -534,7 +531,7 @@ impl PlotComposite for PlotGridKernel {
 		// renderer even though SVG and tiny-skia preserve call order. No
 		// parent-level draw may coexist with clipped children: the canvas
 		// background is therefore emitted as the first clipped child itself.
-		backend.with_clip(bounds, &mut |backend| {
+		backend.with_clip(bounds.into_iced(), &mut |backend| {
 			backend.fill_rectangle(
 				Point::ORIGIN,
 				bounds.size(),
@@ -548,18 +545,18 @@ impl PlotComposite for PlotGridKernel {
 			let (position, layout) = &layouts[index];
 			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
 			let inner = grid_plot_area(cell_bounds, &resolved);
-			let transform = CoordinateTransformer::new(layout, inner);
-			backend.with_clip(cell_bounds, &mut |backend| {
+			let transform = CoordinateTransformer::new(layout, inner.into_iced());
+			backend.with_clip(cell_bounds.into_iced(), &mut |backend| {
 				backend.fill_rectangle(
-					Point::new(cell_bounds.x, cell_bounds.y),
+					cell_bounds.origin().into_iced(),
 					cell_bounds.size(),
 					resolved.chrome.canvas_background.iced(),
 				);
 				backend.with_save(&mut |backend| {
-					backend.translate(iced::Vector::new(inner.x, inner.y));
+					backend.translate(iced::Vector::new(inner.x(), inner.y()));
 					cell.kernel.plot_with_settings(
 						backend,
-						inner,
+						inner.into_iced(),
 						&transform,
 						Cursor::Unavailable,
 						settings,
@@ -572,12 +569,11 @@ impl PlotComposite for PlotGridKernel {
 	fn render_overlay_layer(
 		&self,
 		backend: &mut dyn PlotBackend,
-		bounds: IcedRectangle,
+		bounds: Rect<Widget>,
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
 	) {
-		let bounds = IcedRectangle::new(Point::ORIGIN, bounds.size());
 		if self.cells.len() == 1 {
 			let cell = self.cells.first();
 			let helper = PlotWidget {
@@ -590,7 +586,7 @@ impl PlotComposite for PlotGridKernel {
 				resize_render_suspended: false,
 				layer: crate::plot::common::PlotRenderLayer::Full,
 			};
-			helper.render_overlay_layer(backend, bounds);
+			helper.render_overlay_layer(backend, bounds.into_iced());
 			return;
 		}
 		let resolved = settings.resolve();
@@ -607,7 +603,7 @@ impl PlotComposite for PlotGridKernel {
 			let (position, layout) = &layouts[index];
 			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
 			let inner = grid_plot_area(cell_bounds, &resolved);
-			let transform = CoordinateTransformer::new(layout, inner);
+			let transform = CoordinateTransformer::new(layout, inner.into_iced());
 			let axis_text = axis_text_visibility(axis_cells[index], &axis_cells);
 			let helper = PlotWidget {
 				kernel: cell.kernel.as_ref(),
@@ -623,18 +619,27 @@ impl PlotComposite for PlotGridKernel {
 			// shared gutters, or into the vacant below-slot of a partial row.
 			// Keep the backend's composite draw inside a child clip while using
 			// the figure bounds as that clip so the text is not orphaned.
-			backend.with_clip(bounds, &mut |backend| {
+			backend.with_clip(bounds.into_iced(), &mut |backend| {
 				backend.with_save(&mut |backend| {
-					backend.translate(iced::Vector::new(inner.x, inner.y));
+					backend.translate(iced::Vector::new(inner.x(), inner.y()));
 					match layout {
 						PlotLayout::Cartesian {
 							x_range, y_range, ..
 						} => {
 							helper.draw_cartesian_grid(
-								backend, inner, &transform, *x_range, *y_range,
+								backend,
+								inner.into_iced(),
+								&transform,
+								*x_range,
+								*y_range,
 							);
 							helper.draw_cartesian_axes(
-								backend, inner, &transform, *x_range, *y_range, axis_text,
+								backend,
+								inner.into_iced(),
+								&transform,
+								*x_range,
+								*y_range,
+								axis_text,
 							);
 						}
 						PlotLayout::CategoricalX {
@@ -642,10 +647,19 @@ impl PlotComposite for PlotGridKernel {
 							y_range,
 						} => {
 							helper.draw_categorical_grid(
-								backend, inner, &transform, categories, *y_range,
+								backend,
+								inner.into_iced(),
+								&transform,
+								categories,
+								*y_range,
 							);
 							helper.draw_categorical_axes(
-								backend, inner, &transform, categories, *y_range, axis_text,
+								backend,
+								inner.into_iced(),
+								&transform,
+								categories,
+								*y_range,
+								axis_text,
 							);
 						}
 						PlotLayout::CategoricalY {
@@ -653,10 +667,19 @@ impl PlotComposite for PlotGridKernel {
 							x_range,
 						} => {
 							helper.draw_categorical_y_grid(
-								backend, inner, &transform, categories, *x_range,
+								backend,
+								inner.into_iced(),
+								&transform,
+								categories,
+								*x_range,
 							);
 							helper.draw_categorical_y_axes(
-								backend, inner, &transform, categories, *x_range, axis_text,
+								backend,
+								inner.into_iced(),
+								&transform,
+								categories,
+								*x_range,
+								axis_text,
 							);
 						}
 						PlotLayout::CategoricalXY {
@@ -665,7 +688,7 @@ impl PlotComposite for PlotGridKernel {
 						} => {
 							helper.draw_categorical_xy_axes(
 								backend,
-								inner,
+								inner.into_iced(),
 								&transform,
 								x_categories,
 								y_categories,
@@ -674,7 +697,12 @@ impl PlotComposite for PlotGridKernel {
 						}
 						PlotLayout::Parallel { dimensions, ranges } => {
 							helper.draw_parallel_axes(
-								backend, inner, &transform, dimensions, ranges, axis_text,
+								backend,
+								inner.into_iced(),
+								&transform,
+								dimensions,
+								ranges,
+								axis_text,
 							);
 						}
 						PlotLayout::Radial => {}
@@ -687,7 +715,10 @@ impl PlotComposite for PlotGridKernel {
 						// Center it over the actual plot area so it reads like a
 						// miniature plot title while leaving the shared figure heading
 						// independent.
-						position: Point::new(inner.x + inner.width / 2.0, cell_bounds.y + 8.0),
+						position: Point::new(
+							inner.x() + inner.width() / 2.0,
+							cell_bounds.y() + 8.0,
+						),
 						color: resolved.chrome.title_text.iced(),
 						size: iced::Pixels((resolved.legend_size + 2.0).max(10.0)),
 						align_x: iced::alignment::Horizontal::Center.into(),
@@ -709,23 +740,19 @@ impl PlotComposite for PlotGridKernel {
 			resize_render_suspended: false,
 			layer: crate::plot::common::PlotRenderLayer::Full,
 		};
-		helper.draw_axis_labels(backend, shared_extent);
+		helper.draw_axis_labels(backend, shared_extent.into_iced());
 		if let Some(content) = figure_legend {
-			crate::plot::legend::render_legend(backend, bounds, &content, &resolved);
+			crate::plot::legend::render_legend(backend, bounds.into_iced(), &content, &resolved);
 		}
 	}
 
 	fn hover(
 		&self,
-		bounds: IcedRectangle,
+		bounds: Rect<Widget>,
 		padding: f32,
-		cursor: Cursor,
+		cursor: Pt<Widget>,
 		settings: &PlotSettings,
 	) -> Option<String> {
-		// The caller supplies a widget-local cursor; cell rects must be
-		// computed in the same local space.
-		let bounds = IcedRectangle::new(Point::ORIGIN, bounds.size());
-		let cursor = cursor.position()?;
 		let resolved = settings.resolve();
 		let outer = grid_outer_area(bounds, padding);
 		let tiled = grid_tiled_area(outer, &resolved);
@@ -736,70 +763,71 @@ impl PlotComposite for PlotGridKernel {
 			if !cell_bounds.contains(cursor) {
 				continue;
 			}
+			// Cell localization is explicit even though the legacy kernel seam
+			// below consumes the still-more-local Plot point.
+			let _cell_cursor = Pt::<Cell>::from_widget(cursor, cell_bounds);
 			let inner = grid_plot_area(cell_bounds, &resolved);
-			let transform = CoordinateTransformer::new(layout, inner);
-			let local = Point::new(cursor.x - inner.x, cursor.y - inner.y);
-			return cell
-				.kernel
-				.hover_with_settings(&transform, Cursor::Available(local), settings);
+			let transform = CoordinateTransformer::new(layout, inner.into_iced());
+			let local = Pt::<Plot>::from_widget(cursor, inner);
+			return cell.kernel.hover_with_settings(
+				&transform,
+				Cursor::Available(local.into_iced()),
+				settings,
+			);
 		}
 		None
 	}
 }
 
-fn plot_area(
-	bounds: IcedRectangle,
-	padding: f32,
-	settings: &ResolvedPlotSettings,
-) -> IcedRectangle {
+fn plot_area(bounds: Rect<Widget>, padding: f32, settings: &ResolvedPlotSettings) -> Rect<Widget> {
 	let left = padding + settings.plot_padding_left;
 	let right = padding + settings.plot_padding_right;
 	let top = padding + settings.plot_padding_top;
 	let bottom = padding + settings.plot_padding_bottom;
-	IcedRectangle {
-		x: bounds.x + left,
-		y: bounds.y + top,
-		width: (bounds.width - left - right).max(0.0),
-		height: (bounds.height - top - bottom).max(0.0),
-	}
+	bounds.region(
+		bounds.x() + left,
+		bounds.y() + top,
+		(bounds.width() - left - right).max(0.0),
+		(bounds.height() - top - bottom).max(0.0),
+	)
 }
 
-fn grid_outer_area(bounds: IcedRectangle, padding: f32) -> IcedRectangle {
-	IcedRectangle {
-		x: bounds.x + padding,
-		y: bounds.y + padding,
-		width: (bounds.width - 2.0 * padding).max(0.0),
-		height: (bounds.height - 2.0 * padding).max(0.0),
-	}
+fn grid_outer_area(bounds: Rect<Widget>, padding: f32) -> Rect<Widget> {
+	bounds.region(
+		bounds.x() + padding,
+		bounds.y() + padding,
+		(bounds.width() - 2.0 * padding).max(0.0),
+		(bounds.height() - 2.0 * padding).max(0.0),
+	)
 }
 
-fn grid_tiled_area(outer: IcedRectangle, settings: &ResolvedPlotSettings) -> IcedRectangle {
-	let left = settings.plot_padding_left.min(outer.width);
-	let bottom = settings.plot_padding_bottom.min(outer.height);
-	IcedRectangle {
-		x: outer.x + left,
-		y: outer.y,
-		width: (outer.width - left).max(0.0),
-		height: (outer.height - bottom).max(0.0),
-	}
+fn grid_tiled_area(outer: Rect<Widget>, settings: &ResolvedPlotSettings) -> Rect<Widget> {
+	let left = settings.plot_padding_left.min(outer.width());
+	let bottom = settings.plot_padding_bottom.min(outer.height());
+	outer.region(
+		outer.x() + left,
+		outer.y(),
+		(outer.width() - left).max(0.0),
+		(outer.height() - bottom).max(0.0),
+	)
 }
 
-fn grid_plot_area(cell_bounds: IcedRectangle, settings: &ResolvedPlotSettings) -> IcedRectangle {
-	let top = settings.plot_padding_top.min(cell_bounds.height);
-	let right = settings.plot_padding_right.min(cell_bounds.width);
-	IcedRectangle {
-		x: cell_bounds.x,
-		y: cell_bounds.y + top,
-		width: (cell_bounds.width - right).max(0.0),
-		height: (cell_bounds.height - top).max(0.0),
-	}
+fn grid_plot_area(cell_bounds: Rect<Widget>, settings: &ResolvedPlotSettings) -> Rect<Widget> {
+	let top = settings.plot_padding_top.min(cell_bounds.height());
+	let right = settings.plot_padding_right.min(cell_bounds.width());
+	cell_bounds.region(
+		cell_bounds.x(),
+		cell_bounds.y() + top,
+		(cell_bounds.width() - right).max(0.0),
+		(cell_bounds.height() - top).max(0.0),
+	)
 }
 
 fn grid_plot_extent(
-	tiled: IcedRectangle,
+	tiled: Rect<Widget>,
 	arrangement: GridArrangement,
 	settings: &ResolvedPlotSettings,
-) -> IcedRectangle {
+) -> Rect<Widget> {
 	let first = grid_plot_area(
 		grid_cell_bounds(tiled, arrangement, GridPosition { row: 0, column: 0 }),
 		settings,
@@ -815,31 +843,31 @@ fn grid_plot_extent(
 		),
 		settings,
 	);
-	IcedRectangle {
-		x: first.x,
-		y: first.y,
-		width: (last.x + last.width - first.x).max(0.0),
-		height: (last.y + last.height - first.y).max(0.0),
-	}
+	tiled.region(
+		first.x(),
+		first.y(),
+		(last.right() - first.x()).max(0.0),
+		(last.bottom() - first.y()).max(0.0),
+	)
 }
 
-pub fn grid_cell_bounds(
-	outer: IcedRectangle,
+pub(crate) fn grid_cell_bounds(
+	outer: Rect<Widget>,
 	arrangement: GridArrangement,
 	position: GridPosition,
-) -> IcedRectangle {
+) -> Rect<Widget> {
 	let columns = arrangement.columns.max(1) as f32;
 	let rows = arrangement.rows.max(1) as f32;
-	let gap_x = GRID_GAP.min(outer.width / columns.max(1.0));
-	let gap_y = GRID_GAP.min(outer.height / rows.max(1.0));
-	let width = (outer.width - gap_x * (columns - 1.0)).max(0.0) / columns;
-	let height = (outer.height - gap_y * (rows - 1.0)).max(0.0) / rows;
-	IcedRectangle {
-		x: outer.x + position.column as f32 * (width + gap_x),
-		y: outer.y + position.row as f32 * (height + gap_y),
+	let gap_x = GRID_GAP.min(outer.width() / columns.max(1.0));
+	let gap_y = GRID_GAP.min(outer.height() / rows.max(1.0));
+	let width = (outer.width() - gap_x * (columns - 1.0)).max(0.0) / columns;
+	let height = (outer.height() - gap_y * (rows - 1.0)).max(0.0) / rows;
+	outer.region(
+		outer.x() + position.column as f32 * (width + gap_x),
+		outer.y() + position.row as f32 * (height + gap_y),
 		width,
 		height,
-	}
+	)
 }
 
 fn shared_layout(local: &[(GridPosition, PlotLayout)]) -> Option<PlotLayout> {
@@ -898,6 +926,7 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::coordinate::Window;
 	use crate::plot::common::{PlotRenderLayer, PlotWidget};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
@@ -905,6 +934,16 @@ mod tests {
 	use crate::plot::request::{PlotRequest, PlotSource, plan};
 	use crate::plot::spec::{AuthoredPlotSpec, Channel, PlotProvenance};
 	use polars::df;
+
+	fn widget_rect(raw: IcedRectangle) -> Rect<Widget> {
+		Rect::<Widget>::from_iced_frame(raw).region(raw.x, raw.y, raw.width, raw.height)
+	}
+
+	fn widget_point(raw: Point) -> Pt<Widget> {
+		let window =
+			Rect::<Window>::from_iced_layout(IcedRectangle::new(Point::ORIGIN, iced::Size::ZERO));
+		Pt::<Widget>::from_window(Pt::<Window>::from_iced_event(raw), window)
+	}
 
 	fn fixture() -> (Arc<ResolvedPlotSpec>, Arc<DataFrame>, StampedResult) {
 		let data = Arc::new(
@@ -1494,9 +1533,10 @@ mod tests {
 		.expect("facet");
 		let arrangement = grid.arrangement;
 		let outer = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
+		let outer = widget_rect(outer);
 		let left = grid_cell_bounds(outer, arrangement, GridPosition { row: 0, column: 0 });
 		let right = grid_cell_bounds(outer, arrangement, GridPosition { row: 0, column: 1 });
-		assert!(left.x + left.width <= right.x);
+		assert!(left.right() <= right.x());
 
 		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
 		let model = PlotSettings::default();
@@ -1653,7 +1693,10 @@ mod tests {
 		}
 		let resolved = ResolvedPlotSettings::default();
 		let outer = grid_outer_area(
-			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
+			widget_rect(IcedRectangle::new(
+				Point::ORIGIN,
+				iced::Size::new(800.0, 600.0),
+			)),
 			0.0,
 		);
 		let tiled = grid_tiled_area(outer, &resolved);
@@ -1661,7 +1704,7 @@ mod tests {
 			.iter()
 			.map(|(position, _)| {
 				let cell_bounds = grid_cell_bounds(tiled, kernel.arrangement, *position);
-				Point::new(cell_bounds.x, cell_bounds.y)
+				cell_bounds.origin().into_iced()
 			})
 			.collect::<Vec<_>>();
 		let ticks: Vec<_> = origins
@@ -1678,10 +1721,10 @@ mod tests {
 		{
 			let cell_bounds = grid_cell_bounds(tiled, kernel.arrangement, *position);
 			let inner = grid_plot_area(cell_bounds, &resolved);
-			let expected = CoordinateTransformer::new(layout, inner).cartesian(x, y);
+			let expected = CoordinateTransformer::new(layout, inner.into_iced()).cartesian(x, y);
 			let actual = rendered_single_mark(&svg, 1 + index);
-			assert!((actual.x - (inner.x + expected.x)).abs() < 0.01);
-			assert!((actual.y - (inner.y + expected.y)).abs() < 0.01);
+			assert!((actual.x - (inner.x() + expected.x)).abs() < 0.01);
+			assert!((actual.y - (inner.y() + expected.y)).abs() < 0.01);
 		}
 	}
 
@@ -1733,13 +1776,13 @@ mod tests {
 
 		let resolved = ResolvedPlotSettings::default();
 		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
-		let tiled = grid_tiled_area(grid_outer_area(bounds, 0.0), &resolved);
+		let tiled = grid_tiled_area(grid_outer_area(widget_rect(bounds), 0.0), &resolved);
 		let shared = grid_plot_extent(tiled, kernel.arrangement, &resolved);
 		let x_title = text_element(&svg, "x");
-		assert!((text_coordinate(x_title, 'x') - (shared.x + shared.width / 2.0)).abs() < 0.01);
+		assert!((text_coordinate(x_title, 'x') - (shared.x() + shared.width() / 2.0)).abs() < 0.01);
 		let y_title = text_element(&svg, "y");
 		let y_translation = text_transform_translation(y_title);
-		assert!((y_translation.y - (shared.y + shared.height / 2.0)).abs() < 0.01);
+		assert!((y_translation.y - (shared.y() + shared.height() / 2.0)).abs() < 0.01);
 	}
 
 	#[test]
@@ -1770,7 +1813,7 @@ mod tests {
 
 		let resolved = ResolvedPlotSettings::default();
 		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(900.0, 600.0));
-		let tiled = grid_tiled_area(grid_outer_area(bounds, 0.0), &resolved);
+		let tiled = grid_tiled_area(grid_outer_area(widget_rect(bounds), 0.0), &resolved);
 		let top_right = grid_cell_bounds(
 			tiled,
 			kernel.arrangement,
@@ -1782,9 +1825,9 @@ mod tests {
 			.and_then(|(body, _)| body.split("<text ").nth(1))
 			.expect("top-right rendered x tick");
 		let tick_origin = text_transform_translation(first_tick);
-		assert!(tick_origin.y > top_right.y + top_right.height);
+		assert!(tick_origin.y > top_right.bottom());
 		assert!(
-			tick_origin.y - (top_right.y + top_right.height) <= resolved.x_label_offset + 0.01,
+			tick_origin.y - top_right.bottom() <= resolved.x_label_offset + 0.01,
 			"x text belongs immediately below the occupied cell: {tick_origin:?} vs {top_right:?}"
 		);
 	}
@@ -1794,6 +1837,7 @@ mod tests {
 		let arrangement = GridArrangement::new(2, 2).expect("arrangement");
 		let settings = ResolvedPlotSettings::default();
 		let outer = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
+		let outer = widget_rect(outer);
 		let tiled = grid_tiled_area(outer, &settings);
 		let mut inners = Vec::new();
 		let mut legacy = Vec::new();
@@ -1814,11 +1858,12 @@ mod tests {
 		assert!(
 			inners
 				.iter()
-				.all(|inner| inner.width == inners[0].width && inner.height == inners[0].height),
+				.all(|inner| inner.width() == inners[0].width()
+					&& inner.height() == inners[0].height()),
 			"shared domains must map over congruent pixel extents"
 		);
-		assert!(inners[0].width > legacy[0].width);
-		assert!(inners[0].height > legacy[0].height);
+		assert!(inners[0].width() > legacy[0].width());
+		assert!(inners[0].height() > legacy[0].height());
 	}
 
 	#[test]
@@ -1958,17 +2003,26 @@ mod tests {
 		let resolved = model.resolve();
 		let layouts = kernel.cell_layouts(resolved.clone());
 		let local = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
-		let outer = grid_outer_area(local, 0.0);
+		let outer = grid_outer_area(widget_rect(local), 0.0);
 		let tiled = grid_tiled_area(outer, &resolved);
 		let (position, layout) = &layouts[0];
 		let cell_bounds = grid_cell_bounds(tiled, arrangement, *position);
 		let inner = grid_plot_area(cell_bounds, &resolved);
-		let transform = CoordinateTransformer::new(layout, inner);
+		let transform = CoordinateTransformer::new(layout, inner.into_iced());
 		let p0 = transform.cartesian(0.0, 1.0);
 		let p1 = transform.cartesian(2.0, 3.0);
-		let cursor = Point::new(inner.x + (p0.x + p1.x) / 2.0, inner.y + (p0.y + p1.y) / 2.0);
+		let cursor = Point::new(
+			inner.x() + (p0.x + p1.x) / 2.0,
+			inner.y() + (p0.y + p1.y) / 2.0,
+		);
 		let panel = IcedRectangle::new(Point::new(500.0, 40.0), iced::Size::new(800.0, 400.0));
-		let hover = PlotComposite::hover(&kernel, panel, 0.0, Cursor::Available(cursor), &model);
+		let hover = PlotComposite::hover(
+			&kernel,
+			Rect::<Widget>::from_iced_frame(panel),
+			0.0,
+			widget_point(cursor),
+			&model,
+		);
 		assert!(
 			hover.is_some(),
 			"a widget-local cursor over cell A's line must hit regardless of panel origin"
@@ -1978,9 +2032,9 @@ mod tests {
 		// cell region, not one merely off the marks.
 		let miss = PlotComposite::hover(
 			&kernel,
-			panel,
+			Rect::<Widget>::from_iced_frame(panel),
 			0.0,
-			Cursor::Available(Point::new(cursor.x, 401.0)),
+			widget_point(Point::new(cursor.x, 401.0)),
 			&model,
 		);
 		assert!(

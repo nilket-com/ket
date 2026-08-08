@@ -1,3 +1,4 @@
+use crate::coordinate::{Plot, Pt, Rect, Widget, Window};
 use crate::gui::messages::PlotMessage;
 use crate::plot::chrome::PlotChrome;
 use crate::plot::colors::ColorTheme;
@@ -670,7 +671,7 @@ pub trait PlotComposite: Send + Sync {
 	fn render_plot_layer(
 		&self,
 		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
+		bounds: Rect<Widget>,
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
@@ -679,7 +680,7 @@ pub trait PlotComposite: Send + Sync {
 	fn render_overlay_layer(
 		&self,
 		backend: &mut dyn PlotBackend,
-		bounds: Rectangle,
+		bounds: Rect<Widget>,
 		padding: f32,
 		title: &str,
 		settings: &PlotSettings,
@@ -687,9 +688,9 @@ pub trait PlotComposite: Send + Sync {
 
 	fn hover(
 		&self,
-		bounds: Rectangle,
+		bounds: Rect<Widget>,
 		padding: f32,
-		cursor: Cursor,
+		cursor: Pt<Widget>,
 		settings: &PlotSettings,
 	) -> Option<String>;
 }
@@ -832,17 +833,17 @@ impl<'a> PlotWidget<'a> {
 			.unwrap_or_default()
 	}
 
-	fn plot_area(&self, bounds: Rectangle) -> Rectangle {
+	fn plot_area(&self, bounds: Rect<Widget>) -> Rect<Widget> {
 		let padding_top = self.padding + self.settings.plot_padding_top;
 		let padding_bottom = self.padding + self.settings.plot_padding_bottom;
 		let padding_left = self.padding + self.settings.plot_padding_left;
 		let padding_right = self.padding + self.settings.plot_padding_right;
-		Rectangle {
-			x: padding_left,
-			y: padding_top,
-			width: bounds.width - padding_left - padding_right,
-			height: bounds.height - padding_top - padding_bottom,
-		}
+		bounds.region(
+			padding_left,
+			padding_top,
+			bounds.width() - padding_left - padding_right,
+			bounds.height() - padding_top - padding_bottom,
+		)
 	}
 
 	pub fn render(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
@@ -851,6 +852,10 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	pub fn render_plot_layer(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
+		self.render_plot_layer_in_widget(backend, Rect::from_iced_frame(bounds));
+	}
+
+	fn render_plot_layer_in_widget(&self, backend: &mut dyn PlotBackend, bounds: Rect<Widget>) {
 		if let Some(composite) = self.kernel.composite() {
 			composite.render_plot_layer(
 				backend,
@@ -866,7 +871,7 @@ impl<'a> PlotWidget<'a> {
 			bounds.size(),
 			self.settings.chrome.canvas_background.iced(),
 		);
-		let plot_area = self.plot_area(bounds);
+		let plot_area = self.plot_area(bounds).into_iced();
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		backend.with_save(&mut |backend| {
@@ -882,6 +887,10 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	pub fn render_overlay_layer(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
+		self.render_overlay_layer_in_widget(backend, Rect::from_iced_frame(bounds));
+	}
+
+	fn render_overlay_layer_in_widget(&self, backend: &mut dyn PlotBackend, bounds: Rect<Widget>) {
 		if let Some(composite) = self.kernel.composite() {
 			composite.render_overlay_layer(
 				backend,
@@ -891,11 +900,12 @@ impl<'a> PlotWidget<'a> {
 				&self.settings_model,
 			);
 			if !composite.owns_global_headings() {
-				self.render_global_headings(backend, bounds);
+				self.render_global_headings(backend, bounds.into_iced());
 			}
 			return;
 		}
-		let plot_area = self.plot_area(bounds);
+		let plot_area = self.plot_area(bounds).into_iced();
+		let bounds = bounds.into_iced();
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		backend.with_save(&mut |backend| {
@@ -1210,47 +1220,32 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 		}
 		match event {
 			Event::Mouse(iced::mouse::Event::CursorMoved { .. }) => {
+				let window_bounds = Rect::<Window>::from_iced_layout(bounds);
+				let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
+				let widget_cursor = cursor.position().map(|position| {
+					Pt::<Widget>::from_window(
+						Pt::<Window>::from_iced_event(position),
+						window_bounds,
+					)
+				});
 				if let Some(composite) = self.kernel.composite() {
-					let relative_cursor = match cursor.position() {
-						Some(pos) => {
-							Cursor::Available(Point::new(pos.x - bounds.x, pos.y - bounds.y))
-						}
-						None => Cursor::Unavailable,
-					};
-					let hover = composite.hover(
-						bounds,
-						self.padding,
-						relative_cursor,
-						&self.settings_model,
-					);
+					let hover = widget_cursor.and_then(|cursor| {
+						composite.hover(widget_bounds, self.padding, cursor, &self.settings_model)
+					});
 					if hover != state.last_hover {
 						state.last_hover = hover.clone();
 						return Some(canvas::Action::publish(PlotMessage::UpdateHover(hover)));
 					}
 					return None;
 				}
-				let padding_top = self.padding + self.settings.plot_padding_top;
-				let padding_bottom = self.padding + self.settings.plot_padding_bottom;
-				let padding_left = self.padding + self.settings.plot_padding_left;
-				let padding_right = self.padding + self.settings.plot_padding_right;
-				let plot_area = Rectangle {
-					x: padding_left,
-					y: padding_top,
-					width: bounds.width - padding_left - padding_right,
-					height: bounds.height - padding_top - padding_bottom,
-				};
+				let plot_area = self.plot_area(widget_bounds);
 				let layout = self.kernel.layout(self.settings.clone());
-				let transform = CoordinateTransformer::new(&layout, plot_area);
-				let relative_cursor = match cursor.position() {
-					Some(pos) => Cursor::Available(Point::new(pos.x - bounds.x, pos.y - bounds.y)),
-					None => Cursor::Unavailable,
-				};
-				let plot_cursor = match relative_cursor.position() {
-					Some(pos) => {
-						Cursor::Available(Point::new(pos.x - plot_area.x, pos.y - plot_area.y))
-					}
-					None => Cursor::Unavailable,
-				};
+				let transform = CoordinateTransformer::new(&layout, plot_area.into_iced());
+				let plot_cursor = widget_cursor
+					.map(|cursor| Pt::<Plot>::from_widget(cursor, plot_area))
+					.map_or(Cursor::Unavailable, |cursor| {
+						Cursor::Available(cursor.into_iced())
+					});
 				let hover =
 					self.kernel
 						.hover_with_settings(&transform, plot_cursor, &self.settings_model);

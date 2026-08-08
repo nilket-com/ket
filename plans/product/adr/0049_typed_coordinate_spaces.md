@@ -218,5 +218,13 @@ this record's own census rule, not a reason to leave the value raw.
   remaining coordinate work is native rather than migrated.
 - The window/widget convention split is finally written down where it
   cannot drift: in signatures.
+- The implementation supplied gate 6's positive control. A direct composite
+  test was first migrated with a nonzero-origin rectangle annotated
+  `Rect<Widget>`; that annotation compiled because types prove consistency,
+  not truth, and the unchanged nonzero-origin hover test immediately failed.
+  Routing the fixture through the real frame seam produced the local
+  `Rect<Widget>` and restored the test. The offset oracle caught exactly the
+  transform-evidence error §3 leaves outside the type system, demonstrating
+  why the types narrow that oracle's responsibility rather than retire it.
 - The measured selection treatment record remains on request, orthogonal to
   this arc — color, not coordinates.

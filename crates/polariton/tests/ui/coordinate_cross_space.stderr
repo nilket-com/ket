@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/coordinate_cross_space.rs:7:16
+  |
+7 |     rect.contains(cursor)
+  |          -------- ^^^^^^ expected `Pt<Window>`, found `Pt<Widget>`
+  |          |
+  |          arguments to this method are incorrect
+  |
+  = note: expected struct `Pt<coordinate::Window>`
+             found struct `Pt<coordinate::Widget>`
+note: method defined here
+ --> tests/ui/../../src/coordinate.rs
+  |
+  |     pub(crate) fn contains(self, point: Pt<S>) -> bool {
+  |                   ^^^^^^^^       ------------

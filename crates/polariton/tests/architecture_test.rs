@@ -43,6 +43,41 @@ fn product_0001_polariton_reaches_nilket_only_through_the_public_client() {
 }
 
 #[test]
+fn product_0049_coordinate_vocabulary_stays_closed_and_opaque() {
+	let coordinate =
+		std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/coordinate.rs"))
+			.expect("read coordinate vocabulary");
+
+	assert!(
+		coordinate.contains("define_spaces!(Window, Widget, Cell, Plot, Content);")
+			&& !coordinate.contains("define_spaces!(Window, Widget, Cell, Plot, Content,"),
+		"the closed vocabulary must be generated from exactly the five census-derived spaces"
+	);
+	assert!(
+		coordinate.contains("mod sealed {")
+			&& coordinate.contains("pub trait Space: sealed::Sealed"),
+		"Space must remain sealed"
+	);
+	assert!(
+		!coordinate.contains("Deref")
+			&& !coordinate.contains("pub raw:")
+			&& !coordinate.contains("pub space:"),
+		"Pt and Rect must not expose their iced representation"
+	);
+	for assertion in [
+		"size_of::<Point>()] = [(); size_of::<Pt<Window>>()",
+		"align_of::<Point>()] = [(); align_of::<Pt<Window>>()",
+		"size_of::<Rectangle>()] = [(); size_of::<Rect<Window>>()",
+		"align_of::<Rectangle>()] = [(); align_of::<Rect<Window>>()",
+	] {
+		assert!(
+			coordinate.contains(assertion),
+			"missing static zero-cost assertion: {assertion}"
+		);
+	}
+}
+
+#[test]
 fn product_0003_terminal_envelope_is_the_only_relation_view_transformation_site() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let mut findings = Vec::new();

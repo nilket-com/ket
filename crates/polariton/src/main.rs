@@ -1,5 +1,6 @@
 mod adapters;
 mod configuration;
+mod coordinate;
 mod core;
 mod editor;
 mod fonts;
