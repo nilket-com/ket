@@ -91,7 +91,7 @@ its own editor arc.
 |---|---|---|---|
 | Deferred relations / live-table planning | will do | The analytics arc's core promise (rune-data-products steps 7–8, "launch gates for live-table plotting"); its own arc, not a plotting record | — |
 | Workspace artifact store / durable plots | will do | Blocks 0007 §4's live/pinned durability — saved work is core product; sequence with (not inside) the persistence cluster | — |
-| Mark-argument bindings | will do | Cheap coverage extension 0040 §6 pre-authorized ("needs no record"); first fixture that factors a field name triggers it | — |
+| Mark-argument bindings | closed | `test16.rn` supplied the trigger; 0058 completes static field coverage before schema and pair resolution | 0058 |
 | Register-argument bindings (`skin(s)`, `.point_size(sz)`) | will do | Same pre-authorized coverage extension, named by the record-accuracy pass | — |
 | Computed presentation values | closed | An evaluator means deciding what runs where (0016 §4, 0040 Rejected); static bindings cover factoring, which was the actual want | 0040 Consequences |
 | Non-top-level bindings | closed | Block scoping opens a resolution question with no motivating case (0040 Rejected already) | 0040 Rejected (already states it) |
@@ -132,18 +132,18 @@ its own editor arc.
 
 ## Tallies (corrected 2026-08-06 after the pre-ratification self-check)
 
-Over the ledger's 59 open items (IDs now in `deferred_ledger.md`):
+Over the ledger's original 59 open items (IDs now in `deferred_ledger.md`):
 
-- **Will do: 15** — Guide cluster (3: IG-01, IG-02, IG-05), Persistence
-  cluster (3: LI-01, LI-02, LC-02), and 9 singles (CI-03, CI-06, CI-09, LI-04,
-  DB-01, DB-02, DB-03, DB-14, DB-18).
+- **Will do: 14** — Guide cluster (3: IG-01, IG-02, IG-05), Persistence
+  cluster (3: LI-01, LI-02, LC-02), and 8 singles (CI-03, CI-06, CI-09, LI-04,
+  DB-01, DB-02, DB-14, DB-18).
 - **If asked: 18**, each with its trigger named.
-- **Closed: 25** — of which 13 already carry their closure rule in the record
+- **Closed: 26** — of which 13 already carry their closure rule in the record
   itself and need only the triage pointer; 12 need the one-line reason copied
   into the named record.
 - **Held out: 1** (IG-03, facets).
 
-15 + 18 + 25 + 1 = 59. The first published tallies (15/27, 11/16 sub-split)
+14 + 18 + 26 + 1 = 59. The first published tallies (15/27, 11/16 sub-split)
 were arithmetic errors in this summary — the tables were complete; the
 paragraph miscounted them. Caught by an external parse disagreeing before
 ratification.
@@ -198,7 +198,7 @@ arcs (Guide, Persistence) plus debt retirement rather than new surface.
 | LI-07 | Durable member hiding | closed |
 | DB-01 | Deferred relations / live-table planning | will do |
 | DB-02 | Workspace artifact store / durable plots | will do |
-| DB-03 | Mark-argument bindings | will do |
+| DB-03 | Mark-argument bindings | closed (0058) |
 | DB-04 | Computed presentation values | closed |
 | DB-05 | Non-top-level bindings | closed |
 | DB-06 | Shared-encoding sugar | closed |

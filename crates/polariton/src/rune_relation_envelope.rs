@@ -694,7 +694,7 @@ fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
 	let mut recognized_presentation = false;
 	let mut last_retained_is_expression = false;
 	for statement in &block.statements {
-		if let Some(root) = recognize_view_root(statement, source, shadows)? {
+		if let Some(root) = recognize_view_root(statement, source, shadows, &bindings)? {
 			let (relation_origin, relation_root) =
 				resolve_relation_origin(source, &root, &bindings, shadows)?;
 			peeled.push(root.statement.clone());
@@ -969,19 +969,37 @@ fn provenance_method_on_relation(
 			relation,
 			root,
 			origin,
-			sinks: vec![parse_sugar_sink(PlotType::Scatter, call, args, source)?],
+			sinks: vec![parse_sugar_sink(
+				PlotType::Scatter,
+				call,
+				args,
+				source,
+				literal_bindings,
+			)?],
 		})),
 		"bar" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
 			root,
 			origin,
-			sinks: vec![parse_sugar_sink(PlotType::Bar, call, args, source)?],
+			sinks: vec![parse_sugar_sink(
+				PlotType::Bar,
+				call,
+				args,
+				source,
+				literal_bindings,
+			)?],
 		})),
 		"line" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
 			root,
 			origin,
-			sinks: vec![parse_sugar_sink(PlotType::Line, call, args, source)?],
+			sinks: vec![parse_sugar_sink(
+				PlotType::Line,
+				call,
+				args,
+				source,
+				literal_bindings,
+			)?],
 		})),
 		"line" => invalid_view(
 			call.span(),
@@ -1092,7 +1110,7 @@ fn parse_contextual_sink_inner(
 			output_order: 0,
 		});
 	}
-	if let Some(layer) = parse_modified_mark(expression, source)? {
+	if let Some(layer) = parse_modified_mark(expression, source, literal_bindings, false)? {
 		return Ok(ParsedSink {
 			intent: RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(layer))),
 			span: byte_range(expression.span(), source.len())?,
@@ -1145,37 +1163,19 @@ fn parse_contextual_sink_inner(
 			RuneViewIntent::Plot(parse_figure(expression, &args, source, literal_bindings)?)
 		}
 		"bar" if matches!(args.len(), 2 | 3) => {
-			let Some(sink) = plot_sink_fields(PlotType::Bar, source, &args, 0)? else {
-				return invalid_view(
-					expression.span(),
-					source.len(),
-					"bar fields must be strings",
-				);
-			};
+			let sink = plot_sink_fields(PlotType::Bar, source, &args, 0, literal_bindings)?;
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
 		}
 		"scatter" if matches!(args.len(), 2 | 3) => {
-			let Some(sink) = plot_sink_fields(PlotType::Scatter, source, &args, 0)? else {
-				return invalid_view(
-					expression.span(),
-					source.len(),
-					"scatter fields must be strings",
-				);
-			};
+			let sink = plot_sink_fields(PlotType::Scatter, source, &args, 0, literal_bindings)?;
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
 		}
 		"line" if matches!(args.len(), 2 | 3) => {
-			let Some(sink) = plot_sink_fields(PlotType::Line, source, &args, 0)? else {
-				return invalid_view(
-					expression.span(),
-					source.len(),
-					"line fields must be strings",
-				);
-			};
+			let sink = plot_sink_fields(PlotType::Line, source, &args, 0, literal_bindings)?;
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
 		}
 		"layers" => {
-			let specification = parse_layer_list(expression, &args, source)?;
+			let specification = parse_layer_list(expression, &args, source, literal_bindings)?;
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Layered(specification)))
 		}
 		"table" => {
@@ -1490,7 +1490,13 @@ fn parse_figure(
 						"a figure contains exactly one plot body",
 					);
 				}
-				body = Some(parse_figure_body(item, callee, &child_args, source)?);
+				body = Some(parse_figure_body(
+					item,
+					callee,
+					&child_args,
+					source,
+					literal_bindings,
+				)?);
 			}
 		}
 	}
@@ -2029,6 +2035,43 @@ fn resolve_static_literal_text(
 	}))
 }
 
+/// PRODUCT-0058: mark-field bindings are source factoring, so resolve them to
+/// the same concrete string normal form as inline literals before any channel
+/// or schema resolution runs.
+fn resolve_mark_field(
+	expression: &ast::Expr,
+	source: &str,
+	literal_bindings: &[LocalBinding],
+	constructor: &str,
+) -> Result<String, RuneEnvelopeError> {
+	let use_start = expression.span().start.into_usize();
+	let Some(resolved) = resolve_static_literal(expression, source, literal_bindings, use_start)?
+	else {
+		let raw = source_slice(source, expression.span())?.trim();
+		let message = if matches!(expression, ast::Expr::Path(_)) && is_simple_name(raw) {
+			format!("{constructor}(...) field binding {raw:?} does not resolve to a string literal")
+		} else {
+			format!("{constructor}(...) fields must be string literals or static string bindings")
+		};
+		return invalid_view(expression.span(), source.len(), message);
+	};
+	match resolved.value {
+		StaticLiteralValue::String(value) => Ok(value),
+		StaticLiteralValue::Number(_) => invalid_view(
+			expression.span(),
+			source.len(),
+			resolved.binding.map_or_else(
+				|| format!("{constructor}(...) field must be a string literal"),
+				|binding| {
+					format!(
+						"{constructor}(...) field binding {binding:?} resolved to a numeric literal; expected a string literal"
+					)
+				},
+			),
+		),
+	}
+}
+
 fn parse_figure_skin(
 	expression: &ast::Expr,
 	source: &str,
@@ -2138,26 +2181,24 @@ fn parse_figure_body(
 	callee: &str,
 	args: &[&ast::Expr],
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<RunePlotBody, RuneEnvelopeError> {
-	if let Some(layer) = parse_modified_mark(expression, source)? {
+	if let Some(layer) = parse_modified_mark(expression, source, literal_bindings, false)? {
 		return Ok(RunePlotBody::StyledSingle(layer));
 	}
-	let single = |plot_type, message: &str| -> Result<RunePlotBody, RuneEnvelopeError> {
-		let Some(sink) = plot_sink_fields(plot_type, source, args, 0)? else {
-			return invalid_view(expression.span(), source.len(), message);
-		};
+	let single = |plot_type| -> Result<RunePlotBody, RuneEnvelopeError> {
+		let sink = plot_sink_fields(plot_type, source, args, 0, literal_bindings)?;
 		Ok(RunePlotBody::Single(sink))
 	};
 	match callee {
-		"bar" if matches!(args.len(), 2 | 3) => single(PlotType::Bar, "bar fields must be strings"),
-		"line" if matches!(args.len(), 2 | 3) => {
-			single(PlotType::Line, "line fields must be strings")
-		}
-		"scatter" if matches!(args.len(), 2 | 3) => {
-			single(PlotType::Scatter, "scatter fields must be strings")
-		}
+		"bar" if matches!(args.len(), 2 | 3) => single(PlotType::Bar),
+		"line" if matches!(args.len(), 2 | 3) => single(PlotType::Line),
+		"scatter" if matches!(args.len(), 2 | 3) => single(PlotType::Scatter),
 		"layers" => Ok(RunePlotBody::Layered(parse_layer_list(
-			expression, args, source,
+			expression,
+			args,
+			source,
+			literal_bindings,
 		)?)),
 		"table" => invalid_view(
 			expression.span(),
@@ -2201,6 +2242,7 @@ fn parse_layer_list(
 	outer: &ast::Expr,
 	args: &[&ast::Expr],
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<LayeredPlotSpec, RuneEnvelopeError> {
 	let [argument] = args else {
 		return invalid_view(
@@ -2224,15 +2266,19 @@ fn parse_layer_list(
 			"layers([]) cannot form a non-empty plot",
 		);
 	};
-	let mut specification = LayeredPlotSpec::new(parse_layer(first, source)?);
+	let mut specification = LayeredPlotSpec::new(parse_layer(first, source, literal_bindings)?);
 	for (item, _) in items {
-		specification.push(parse_layer(item, source)?);
+		specification.push(parse_layer(item, source, literal_bindings)?);
 	}
 	Ok(specification)
 }
 
-fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEnvelopeError> {
-	if let Some(styled) = parse_modified_mark(expression, source)? {
+fn parse_layer(
+	expression: &ast::Expr,
+	source: &str,
+	literal_bindings: &[LocalBinding],
+) -> Result<LayerSpec, RuneEnvelopeError> {
+	if let Some(styled) = parse_modified_mark(expression, source, literal_bindings, true)? {
 		return match styled.into_layer() {
 			Ok(layer) => Ok(layer),
 			Err(_) => invalid_view(
@@ -2292,15 +2338,7 @@ fn parse_layer(expression: &ast::Expr, source: &str) -> Result<LayerSpec, RuneEn
 	};
 	let mut fields = Vec::with_capacity(2);
 	for field in args {
-		let raw = source_slice(source, field.span())?;
-		let Some(value) = decode_string_literal(raw) else {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				format!("{callee}(...) layer fields must be string literals"),
-			);
-		};
-		fields.push(value);
+		fields.push(resolve_mark_field(field, source, literal_bindings, callee)?);
 	}
 	Ok(LayerSpec::xy(mark, fields[0].clone(), fields[1].clone()))
 }
@@ -2484,6 +2522,8 @@ fn parse_modified_table(
 fn parse_modified_mark(
 	expression: &ast::Expr,
 	source: &str,
+	literal_bindings: &[LocalBinding],
+	in_layer: bool,
 ) -> Result<Option<StyledRunePlotSink>, RuneEnvelopeError> {
 	let ast::Expr::Call(outer_call) = expression else {
 		return Ok(None);
@@ -2681,17 +2721,16 @@ fn parse_modified_mark(
 		}
 		_ => {}
 	}
+	if in_layer && (plot_type == PlotType::Bar || args.len() == 3) {
+		return invalid_view(
+			expression.span(),
+			source.len(),
+			"bar(...) is a view sink, not a shared-Cartesian layer",
+		);
+	}
 	let mut fields = Vec::with_capacity(args.len());
 	for field in args {
-		let raw = source_slice(source, field.span())?;
-		let Some(value) = decode_string_literal(raw) else {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"a modified mark requires string literal fields",
-			);
-		};
-		fields.push(value);
+		fields.push(resolve_mark_field(field, source, literal_bindings, callee)?);
 	}
 	Ok(Some(StyledRunePlotSink {
 		sink: DisposableRunePlotSink {
@@ -2744,6 +2783,7 @@ fn parse_sugar_sink(
 	call: &ast::ExprCall,
 	args: &[&ast::Expr],
 	source: &str,
+	literal_bindings: &[LocalBinding],
 ) -> Result<ParsedSink, RuneEnvelopeError> {
 	let valid_arity = match plot_type {
 		PlotType::Line => matches!(args.len(), 2 | 3),
@@ -2761,13 +2801,7 @@ fn parse_sugar_sink(
 		};
 		return invalid_view(call.span(), source.len(), message);
 	}
-	let Some(sink) = plot_sink_fields(plot_type, source, args, 0)? else {
-		return invalid_view(
-			call.span(),
-			source.len(),
-			"plot view fields must be string literals",
-		);
-	};
+	let sink = plot_sink_fields(plot_type, source, args, 0, literal_bindings)?;
 	Ok(ParsedSink {
 		intent: RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink))),
 		span: byte_range(call.span(), source.len())?,
@@ -2875,6 +2909,7 @@ fn recognize_view_root(
 	statement: &ast::Stmt,
 	source: &str,
 	shadows: ViewShadows,
+	literal_bindings: &[LocalBinding],
 ) -> Result<Option<ParsedView>, RuneEnvelopeError> {
 	let (expression, statement_span) = match statement {
 		ast::Stmt::Expr(expression) => (expression, expression.span()),
@@ -2891,24 +2926,16 @@ fn recognize_view_root(
 			(RuneViewIntent::Table(RuneTableSink::default()), args[0])
 		}
 		"plot.bar" if !shadows.plot && matches!(args.len(), 3 | 4) => (
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(match plot_sink(
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(plot_sink(
 				PlotType::Bar,
 				source,
 				&args,
-			)? {
-				Some(sink) => sink,
-				None => return Ok(None),
-			}))),
+				literal_bindings,
+			)?))),
 			args[0],
 		),
 		"plot.line" if !shadows.plot && matches!(args.len(), 3 | 4) => {
-			let Some(sink) = plot_sink(PlotType::Line, source, &args)? else {
-				return invalid_view(
-					call.span(),
-					source.len(),
-					"plot.line fields must be string literals",
-				);
-			};
+			let sink = plot_sink(PlotType::Line, source, &args, literal_bindings)?;
 			(
 				RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink))),
 				args[0],
@@ -2922,14 +2949,12 @@ fn recognize_view_root(
 			);
 		}
 		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(match plot_sink(
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(plot_sink(
 				PlotType::Scatter,
 				source,
 				&args,
-			)? {
-				Some(sink) => sink,
-				None => return Ok(None),
-			}))),
+				literal_bindings,
+			)?))),
 			args[0],
 		),
 		_ => return Ok(None),
@@ -3137,8 +3162,9 @@ fn plot_sink(
 	plot_type: PlotType,
 	source: &str,
 	args: &[&ast::Expr],
-) -> Result<Option<DisposableRunePlotSink>, RuneEnvelopeError> {
-	plot_sink_fields(plot_type, source, args, 1)
+	literal_bindings: &[LocalBinding],
+) -> Result<DisposableRunePlotSink, RuneEnvelopeError> {
+	plot_sink_fields(plot_type, source, args, 1, literal_bindings)
 }
 
 fn plot_sink_fields(
@@ -3146,31 +3172,35 @@ fn plot_sink_fields(
 	source: &str,
 	args: &[&ast::Expr],
 	field_offset: usize,
-) -> Result<Option<DisposableRunePlotSink>, RuneEnvelopeError> {
+	literal_bindings: &[LocalBinding],
+) -> Result<DisposableRunePlotSink, RuneEnvelopeError> {
+	let constructor = match plot_type {
+		PlotType::Bar => "bar",
+		PlotType::Line => "line",
+		PlotType::Scatter => "scatter",
+		_ => unreachable!("only Rune mark families reach field parsing"),
+	};
 	let field = |index: usize| {
-		let raw = source_slice(source, args[field_offset + index].span())?;
-		Ok::<_, RuneEnvelopeError>(decode_string_literal(raw))
+		resolve_mark_field(
+			args[field_offset + index],
+			source,
+			literal_bindings,
+			constructor,
+		)
 	};
-	let Some(x) = field(0)? else {
-		return Ok(None);
-	};
-	let Some(y) = field(1)? else {
-		return Ok(None);
-	};
+	let x = field(0)?;
+	let y = field(1)?;
 	let category = if args.len() == field_offset + 3 {
-		let Some(category) = field(2)? else {
-			return Ok(None);
-		};
-		Some(category)
+		Some(field(2)?)
 	} else {
 		None
 	};
-	Ok(Some(DisposableRunePlotSink {
+	Ok(DisposableRunePlotSink {
 		composition: PlotComposition::single(plot_type),
 		x,
 		y,
 		category,
-	}))
+	})
 }
 
 fn decode_string_literal(raw: &str) -> Option<String> {
@@ -3180,6 +3210,12 @@ fn decode_string_literal(raw: &str) -> Option<String> {
 	let mut chars = body.chars();
 	while let Some(ch) = chars.next() {
 		if ch != '\\' {
+			// A source string literal cannot contain an unescaped quote. Rejecting it
+			// here keeps expressions such as `"x" + "y"` from masquerading as one
+			// literal merely because their complete source begins and ends with `"`.
+			if ch == '"' {
+				return None;
+			}
 			decoded.push(ch);
 			continue;
 		}
@@ -3578,8 +3614,8 @@ mod tests {
 	}
 
 	#[test]
-	fn non_root_view_names_and_malformed_calls_are_retained_without_refusal() {
-		let source = "fn helper(r) { table(r); }\nlet r = workspace.table(\"t\");\nlet v = table(r);\nif true { table(r); }\n{ table(r); };\nplot.bar(r, \"x\");\nplot.scatter(r, x, \"y\");\ntable(r)";
+	fn non_root_view_names_and_wrong_arity_calls_are_retained_without_refusal() {
+		let source = "fn helper(r) { table(r); }\nlet r = workspace.table(\"t\");\nlet v = table(r);\nif true { table(r); }\n{ table(r); };\nplot.bar(r, \"x\");\ntable(r)";
 		let transformed = transform(source).expect("only the final table is a root");
 		assert_eq!(transformed.views.len(), 1);
 		assert_eq!(transformed.views[0].intent.form(), RuneViewForm::Table);
@@ -3589,7 +3625,6 @@ mod tests {
 			"if true { table(r); }",
 			"{ table(r); };",
 			"plot.bar(r, \"x\");",
-			"plot.scatter(r, x, \"y\");",
 		] {
 			assert!(
 				transformed.source.contains(retained),
@@ -4835,6 +4870,242 @@ workspace.table("t").views([figure([
 		}
 	}
 
+	fn product_0058_only_intent(source: &str) -> RuneViewIntent {
+		transform(source)
+			.expect("static mark-field binding")
+			.into_relations()
+			.next()
+			.expect("one relation")
+			.views
+			.into_iter()
+			.next()
+			.expect("one view")
+			.intent
+	}
+
+	#[test]
+	fn product_0058_bound_fields_equal_inline_in_every_standalone_position() {
+		let bindings = r#"
+let first_field = "x";
+let second_field = "y";
+let color_field = "series";
+"#;
+		for mark in ["bar", "line", "scatter"] {
+			for field_count in [2, 3] {
+				let inline_args = if field_count == 2 {
+					"\"x\", \"y\""
+				} else {
+					"\"x\", \"y\", \"series\""
+				};
+				let bound_args = if field_count == 2 {
+					"first_field, second_field"
+				} else {
+					"first_field, second_field, color_field"
+				};
+				let inline_mark = format!("{mark}({inline_args})");
+				let bound_mark = format!("{mark}({bound_args})");
+				for (position, inline, bound) in [
+					(
+						"legacy",
+						format!("plot.{mark}(workspace.table(\"t\"), {inline_args})"),
+						format!("plot.{mark}(workspace.table(\"t\"), {bound_args})"),
+					),
+					(
+						"relation sugar",
+						format!("workspace.table(\"t\").{mark}({inline_args})"),
+						format!("workspace.table(\"t\").{mark}({bound_args})"),
+					),
+					(
+						"canonical",
+						format!("workspace.table(\"t\").views([{inline_mark}])"),
+						format!("workspace.table(\"t\").views([{bound_mark}])"),
+					),
+					(
+						"named",
+						format!("workspace.table(\"t\").views([view(\"named\", {inline_mark})])"),
+						format!("workspace.table(\"t\").views([view(\"named\", {bound_mark})])"),
+					),
+					(
+						"figure",
+						format!("workspace.table(\"t\").views([figure([{inline_mark}])])"),
+						format!("workspace.table(\"t\").views([figure([{bound_mark}])])"),
+					),
+				] {
+					assert_eq!(
+						product_0058_only_intent(&inline),
+						product_0058_only_intent(&format!("{bindings}\n{bound}")),
+						"{mark}/{field_count} fields diverged at {position}"
+					);
+				}
+			}
+		}
+
+		for (mark, modifier) in [
+			("bar", "bar_width(0.5).category_gap(0.2)"),
+			("line", "stroke_width(2.0)"),
+			("scatter", "point_size(2.0)"),
+		] {
+			let inline = format!(
+				"workspace.table(\"t\").views([{mark}(\"x\", \"y\", \"series\").{modifier}])"
+			);
+			let bound = format!(
+				"{bindings}\nworkspace.table(\"t\").views([{mark}(first_field, second_field, color_field).{modifier}])"
+			);
+			assert_eq!(
+				product_0058_only_intent(&inline),
+				product_0058_only_intent(&bound),
+				"bound fields changed {mark}'s modifier register"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0058_bound_layer_fields_preserve_the_closed_layer_surface() {
+		let inline = r#"workspace.table("t").views([layers([
+			line("x", "y").stroke_width(2.0),
+			scatter("x", "y").point_size(2.0),
+		])])"#;
+		let bound = r#"
+let x_field = "x";
+let y_field = "y";
+workspace.table("t").views([layers([
+	line(x_field, y_field).stroke_width(2.0),
+	 scatter(x_field, y_field).point_size(2.0),
+])])
+"#;
+		assert_eq!(
+			product_0058_only_intent(inline),
+			product_0058_only_intent(bound)
+		);
+
+		for source in [
+			r#"let x = "x"; let y = "y"; let series = "series";
+			workspace.table("t").views([layers([line(x, y, series)])])"#,
+			r#"let x = "x"; let y = "y";
+			workspace.table("t").views([layers([bar(x, y)])])"#,
+			r#"let x = "x"; let y = "y"; let width = 2.0;
+			workspace.table("t").views([layers([line(x, y).stroke_width(width)])])"#,
+		] {
+			assert!(
+				transform(source).is_err(),
+				"binding coverage widened the layer/register surface: {source}"
+			);
+		}
+
+		for (source, rejected) in [
+			(
+				r#"workspace.table("t").views([layers([bar(missing, "y").bar_width(0.5)])])"#,
+				"bar(missing, \"y\").bar_width(0.5)",
+			),
+			(
+				r#"workspace.table("t").views([layers([line(missing, "y", "series").stroke_width(2.0)])])"#,
+				"line(missing, \"y\", \"series\").stroke_width(2.0)",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, message } =
+				transform(source).expect_err("layer context refuses before field resolution")
+			else {
+				panic!("expected layer-context refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+			assert!(
+				message.contains("not a shared-Cartesian layer"),
+				"{message}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0058_lookup_retention_and_argument_refusals_follow_product_0040() {
+		let aliases = r#"
+let original = "x";
+let alias = original;
+let y_field = "y";
+workspace.table("t").views([line(alias, y_field)])
+"#;
+		let transformed = transform(aliases).expect("transitive mark-field alias");
+		assert!(transformed.source.contains("let original = \"x\";"));
+		assert!(transformed.source.contains("let alias = original;"));
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("bound line must remain a plot")
+		};
+		let RunePlotBody::Single(sink) = &plot.body else {
+			panic!("bound line must remain a single mark")
+		};
+		assert_eq!((sink.x.as_str(), sink.y.as_str()), ("x", "y"));
+
+		let shadowed = transform(
+			r#"
+let field = "first";
+workspace.table("t").views([line(field, "y")]);
+let field = "second";
+workspace.table("t").views([line(field, "y")])
+"#,
+		)
+		.expect("most recent preceding binding");
+		let xs = shadowed
+			.views
+			.iter()
+			.map(|view| match &view.intent {
+				RuneViewIntent::Plot(RunePlotIntent {
+					body: RunePlotBody::Single(sink),
+					..
+				}) => sink.x.as_str(),
+				_ => panic!("expected single line"),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(xs, ["first", "second"]);
+
+		let collision = product_0058_only_intent(
+			r#"let bar = "region";
+			workspace.table("t").views([bar(bar, "revenue")])"#,
+		);
+		let RuneViewIntent::Plot(RunePlotIntent {
+			body: RunePlotBody::Single(sink),
+			..
+		}) = collision
+		else {
+			panic!("constructor-position bar")
+		};
+		assert_eq!((sink.x.as_str(), sink.y.as_str()), ("region", "revenue"));
+
+		for (source, rejected, expected) in [
+			(
+				"workspace.table(\"t\").views([bar(missing, \"y\")])",
+				"missing",
+				"field binding \"missing\" does not resolve",
+			),
+			(
+				"let field = make_field(); workspace.table(\"t\").views([bar(field, \"y\")])",
+				"field",
+				"field binding \"field\" does not resolve",
+			),
+			(
+				"let field = field; workspace.table(\"t\").views([bar(field, \"y\")])",
+				"field",
+				"field binding \"field\" does not resolve",
+			),
+			(
+				"let field = 7; workspace.table(\"t\").views([bar(field, \"y\")])",
+				"field",
+				"resolved to a numeric literal",
+			),
+			(
+				"workspace.table(\"t\").views([bar(\"x\" + \"z\", \"y\")])",
+				"\"x\" + \"z\"",
+				"fields must be string literals or static string bindings",
+			),
+		] {
+			let RuneEnvelopeError::InvalidView { span, message } =
+				transform(source).expect_err("invalid mark-field binding")
+			else {
+				panic!("expected attributed mark-field refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+			assert!(message.contains(expected), "{message}");
+		}
+	}
+
 	#[test]
 	fn product_0047_three_field_bar_normalizes_across_all_three_spellings() {
 		// PRODUCT-0008 §2: the spellings are exact projections of one normal form.
@@ -5400,7 +5671,7 @@ workspace.table("t").views([table()])
 			),
 			(
 				"workspace.table(\"t\").views([layers([scatter(x, \"y\")])])",
-				"scatter(x, \"y\")",
+				"x",
 			),
 			(
 				"workspace.table(\"t\").views([layers([unknown(\"x\", \"y\")])])",

@@ -1,10 +1,11 @@
 # ADR 0058: static mark-field bindings
 
-Status: proposed 2026-08-08. This record closes DB-03 by applying
+Status: accepted 2026-08-08. This record closes DB-03 by applying
 PRODUCT-0040's accepted static-literal rule to every established mark-field
 position. A bound field resolves to its concrete string in the envelope before
 schema-based channel and bar-pair resolution. It adds no evaluation, mark,
-encoding, modifier, or product pixel.
+encoding, modifier, or product pixel. Implementation evidence is recorded in
+`../impl/0058_static_mark_field_bindings_evidence.md`.
 
 ## Context
 
@@ -286,10 +287,11 @@ all downstream behavior already exist.
    and reuses them in both bar marks. Its two completed figures, resolved
    specifications, draw operations, SVG, and live pixels equal the inline
    version; no rendering baseline changes.
-10. Every existing inline-literal mark test passes unmodified. No plot/table
-    geometry, theme, exporter, draw-operation, screenshot, or refusal baseline
-    changes outside the binding-specific argument diagnostics. The full
-    workspace suite passes.
+10. Existing inline-literal mark behavior remains unchanged except for the two
+    named recognition and attribution premise updates. No plot/table geometry,
+    theme, exporter, draw-operation, screenshot, or refusal baseline changes
+    outside the binding-specific argument diagnostics. The full workspace suite
+    passes.
 11. Documentation closes DB-03 as PRODUCT-0040 coverage now completed across
     all accepted mark positions. It continues to list register-argument
     bindings, computed presentation values, and non-top-level bindings under

@@ -258,7 +258,8 @@ closed by its paired surface record:
   surface, not shipped behavior.
 - **ADR 0040 §6's mark-argument coverage limit:** explicitly "a coverage limit
   rather than a semantic boundary," extendable "at any time, needing no
-  record" — deliberate scoping, not a bridge.
+  record" — deliberate scoping, not a bridge; PRODUCT-0058 later completed the
+  coverage without changing this classification.
 - **Ahead-of-language fixtures `test12.rn`/`test13.rn`** (ADR 0038, ADR 0040):
   each documented and closed within the very record that cites it, so never a
   standing interim state across records.

@@ -47,6 +47,33 @@ while `:init0` restores the editor defaults.
 Missing configuration is a clean no-op. A broken script is reported in the
 status bar while Polariton still opens with compiled defaults.
 
+#### Static presentation bindings:
+
+Repeated field names can be factored into top-level string bindings. The
+envelope resolves them before the returned relation schema chooses channels or
+bar orientation:
+
+```rune
+let category_field = "region";
+let value_field = "revenue";
+let series_field = "product";
+
+workspace.table("sales").views([
+    bar(category_field, value_field, series_field),
+    figure([
+        facet(series_field),
+        bar(category_field, value_field, series_field)
+            .bar_width(0.9),
+    ]),
+])
+```
+
+Direct and aliased top-level bindings work in every established bar, line, and
+scatter field position, including accepted x/y fields inside `layers([...])`.
+They are static source factoring, not runtime variables: computed strings and
+non-top-level bindings refuse. Numeric mark modifiers such as
+`.bar_width(width)` still require inline literals.
+
 #### Rune table presentation:
 
 The application setting applies to every table. A Rune table can opt in

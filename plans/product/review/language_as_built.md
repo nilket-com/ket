@@ -294,9 +294,14 @@ lookup, not evaluation; `let t = compute()` and `a + b` remain refusals. The
 distinction 0016 §4 lumped together is now split: a named literal exists in the
 source at parse time. Refusal attributes to the argument's span and names the
 binding (0040 §4). Bindings are retained, never peeled (0040 §5). Coverage is
-figure elements; mark arguments are a coverage extension needing no record
-(0040 §6). A resolved value is governed by exactly the rule that would govern
-it inline (0040 §7).
+figure elements plus every established bar, line, and scatter field position,
+including legacy and relation sugar, canonical/named views, figure bodies,
+modified marks, and accepted x/y fields inside layers (0058). Mark fields
+resolve to concrete strings before dispatch; schema/channel resolution and
+bar-pair orientation therefore never receive binding identifiers. Numeric mark
+modifier bindings remain a separate unrequested coverage item. A resolved
+value is governed by exactly the rule that would govern it inline (0040 §7,
+0058 §§1–4).
 
 ## 14. The method, as practiced
 

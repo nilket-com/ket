@@ -6633,6 +6633,189 @@ workspace.table("bad").views([view("bad", table())]);
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0058_bound_fields_resolve_before_bar_pair_and_channel_resolution() {
+		let bound_source = r#"
+let x_field = "value";
+let y_field = "category";
+let series_field = "series";
+workspace.table("t").views([bar(x_field, y_field, series_field)])
+"#;
+		let inline_source =
+			"workspace.table(\"t\").views([bar(\"value\", \"category\", \"series\")])";
+		let frame = polars::df!(
+			"category" => ["East", "East", "West", "West"],
+			"value" => [2.0, 4.0, 6.0, 8.0],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+		)
+		.unwrap();
+
+		let complete = |source: &str| {
+			let relation = transform_rune_view(source)
+				.expect("static fields lower before dispatch")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame.clone(), relation.views)
+		};
+		let bound = complete(bound_source);
+		let inline = complete(inline_source);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(bound_plot, _, _)) =
+			&bound.sinks[0].output
+		else {
+			panic!("bound horizontal bar must complete")
+		};
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(inline_plot, _, _)) =
+			&inline.sinks[0].output
+		else {
+			panic!("inline horizontal bar must complete")
+		};
+
+		use crate::plot::spec::{AuthoredChannel, Channel, OptionalAuthoredChannel};
+		assert_eq!(
+			bound_plot.authored_spec.x.field,
+			AuthoredChannel::Named("value".to_owned())
+		);
+		assert_eq!(
+			bound_plot.authored_spec.y.field,
+			AuthoredChannel::Named("category".to_owned())
+		);
+		assert_eq!(
+			bound_plot.authored_spec.color.field,
+			OptionalAuthoredChannel::Named("series".to_owned())
+		);
+		assert_eq!(
+			bound_plot.resolved_spec.composition.primary_plot_type(),
+			PlotType::HorizontalBar
+		);
+		assert_eq!(
+			bound_plot
+				.resolved_spec
+				.channel(Channel::X)
+				.unwrap()
+				.binding
+				.field,
+			"value"
+		);
+		assert_eq!(
+			bound_plot
+				.resolved_spec
+				.channel(Channel::Y)
+				.unwrap()
+				.binding
+				.field,
+			"category"
+		);
+		assert_eq!(
+			bound_plot
+				.resolved_spec
+				.channel(Channel::Color)
+				.unwrap()
+				.binding
+				.field,
+			"series"
+		);
+		assert_eq!(
+			bound_plot.resolved_spec, inline_plot.resolved_spec,
+			"binding identifiers must not enter the authored or resolved plot"
+		);
+
+		let invalid_source = r#"
+let x_field = "revenue";
+let y_field = "profit";
+workspace.table("t").views([bar(x_field, y_field)])
+"#;
+		let relation = transform_rune_view(invalid_source)
+			.expect("both bindings resolve statically")
+			.into_relations()
+			.next()
+			.unwrap();
+		let invalid = rune_view_outcome(
+			polars::df!("revenue" => [1.0], "profit" => [2.0]).unwrap(),
+			relation.views,
+		);
+		let Err(error) = &invalid.sinks[0].output else {
+			panic!("two quantitative bound fields must refuse as a pair")
+		};
+		assert!(
+			error.contains(
+				"x `revenue` resolved as Quantitative, y `profit` resolved as Quantitative"
+			),
+			"{error}"
+		);
+		let span = invalid.sinks[0].span.clone();
+		assert_eq!(
+			&invalid_source[span.start as usize..span.end as usize],
+			"bar(x_field, y_field)"
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0058_bound_third_fields_share_inline_color_resolution_for_every_mark() {
+		let frame = polars::df!(
+			"cat" => ["East", "East", "West", "West"],
+			"value" => [2.0, 4.0, 6.0, 8.0],
+			"x" => [1.0, 2.0, 1.0, 2.0],
+			"y" => [3.0, 4.0, 7.0, 8.0],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+		)
+		.unwrap();
+		for (mark, x, y) in [
+			("bar", "cat", "value"),
+			("line", "x", "y"),
+			("scatter", "x", "y"),
+		] {
+			let inline_source =
+				format!("workspace.table(\"t\").views([{mark}(\"{x}\", \"{y}\", \"series\")])");
+			let bound_source = format!(
+				r#"
+let first_field = "{x}";
+let second_field = "{y}";
+let color_field = "series";
+workspace.table("t").views([{mark}(first_field, second_field, color_field)])
+"#
+			);
+			let complete = |source: &str| {
+				let relation = transform_rune_view(source)
+					.expect("bound categorical field")
+					.into_relations()
+					.next()
+					.unwrap();
+				rune_view_outcome(frame.clone(), relation.views)
+			};
+			let inline = complete(&inline_source);
+			let bound = complete(&bound_source);
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(inline_plot, _, _)) =
+				&inline.sinks[0].output
+			else {
+				panic!("inline {mark} must complete")
+			};
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(bound_plot, _, _)) =
+				&bound.sinks[0].output
+			else {
+				panic!("bound {mark} must complete")
+			};
+
+			use crate::plot::spec::{Channel, OptionalAuthoredChannel};
+			assert_eq!(
+				bound_plot.authored_spec.color.field,
+				OptionalAuthoredChannel::Named("series".to_owned())
+			);
+			let bound_color = bound_plot
+				.resolved_spec
+				.channel(Channel::Color)
+				.expect("bound third field becomes a resolved color channel");
+			assert_eq!(bound_color.binding.field, "series");
+			assert_eq!(bound_color.colors.len(), 2);
+			assert_eq!(
+				bound_plot.resolved_spec, inline_plot.resolved_spec,
+				"bound {mark} must inherit exact inline colors and domains"
+			);
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn product_0055_horizontal_pair_reaches_every_bar_spelling_and_its_register() {
 		let sources = [
 			"plot.bar(workspace.table(\"t\"), \"value\", \"category\", \"series\")",

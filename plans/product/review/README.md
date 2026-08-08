@@ -15,13 +15,13 @@ from the records; nothing is proposed. Four documents:
   where records disagree without acknowledging it, two record-accuracy defects,
   four unspecified cells, and fifteen acknowledged asymmetries checked and set
   aside.
-- **`deferred_ledger.md`** — every forward promise collected: 59 open items in
-  six areas, with all deferring citations and stated dependencies, plus 17
-  since-landed items.
+- **`deferred_ledger.md`** — every forward promise collected: 58 open items in
+  six areas, with all deferring citations and stated dependencies, plus 18
+  since-landed items after PRODUCT-0058 closed DB-03.
 - **`live_bridges.md`** — the 8 behaviors shipped as explicitly provisional or
   documented-not-endorsed and still standing, the 2 closed classes, and the
   borderline exclusions with reasons.
-- **`deferred_triage.md`** — the ledger's 59 open items seeded into
+- **`deferred_triage.md`** — the ledger's original 59 open items seeded into
   will do / if asked / closed with reasons and closure targets, the Guide and
   persistence clusters triaged as one decision each, facets held out.
 

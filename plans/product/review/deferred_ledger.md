@@ -223,11 +223,6 @@ store remains undecided per PRODUCT-0002. Saved authored specs and durable
 plots cannot ship before that record exists." — 0007 Consequences (and §4's
 live/pinned durability depends on it).
 
-**DB-03 · Mark-argument bindings.** Static literal binding resolution covers figure
-elements only; mark arguments (`bar(cat_field, "val")`) are "a coverage limit
-rather than a semantic boundary … extending coverage later is the same rule
-applied further and needs no record." — 0040 §6, Consequences.
-
 **DB-04 · Computed presentation values.** Computed headings — and by extension any
 non-literal presentation value — are deferred because "the envelope lowers
 statically, before dispatch … admitting it is a runtime evaluation and
@@ -378,7 +373,7 @@ and layout persistence that §9 defers." Same for continuation banks. —
 
 ## Since landed
 
-Items deferred by one record and resolved by a later record in this set.
+Items deferred by one record and resolved by a later record.
 
 **SL-01 · Authored numeric axis bounds.** Landed in 0036 (the `x_bounds`/`y_bounds`
 figure elements over the pre-existing `domains` cascade slot, "reachable only
@@ -466,3 +461,10 @@ not enough evidence") and 0020 ("a third setting must provide evidence before
 any shared modifier abstraction is accepted") → settled-in 0022 Rejected:
 "three cases justify shared traversal and literal parsing, not open
 registration or erased typed dispatch."
+
+**SL-18 · Mark-argument bindings (DB-03).** PRODUCT-0040 §6 pre-authorized mark
+arguments as a static-literal coverage extension. The repeated category, value,
+and series fields in `test16.rn` supplied the trigger; PRODUCT-0058 routes every
+established bar, line, scatter, modified-mark, and layer field position through
+the existing static resolver before schema/channel and pair resolution.
+Register-argument bindings remain separate. — landed-in 0058.
