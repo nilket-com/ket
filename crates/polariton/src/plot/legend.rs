@@ -277,7 +277,24 @@ fn lerp(a: Color, b: Color, t: f32) -> Color {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LegendLayout {
 	pub(crate) content_bounds: Rect<Widget>,
-	pub(crate) origin: Option<Pt<Widget>>,
+	origin: Option<LegendOrigin>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum LegendOrigin {
+	Gutter(Pt<Widget>),
+	Overlay(Pt<Widget>),
+}
+
+impl LegendLayout {
+	/// Resolve the gutter's pending vertical anchor from the authoritative plot
+	/// extent. Authored overlays are already final in full-figure coordinates.
+	pub(crate) fn origin(self, plot_extent: Rect<Widget>) -> Option<Pt<Widget>> {
+		match self.origin? {
+			LegendOrigin::Gutter(origin) => Some(origin.offset(0.0, plot_extent.y() - origin.y())),
+			LegendOrigin::Overlay(origin) => Some(origin),
+		}
+	}
 }
 
 pub(crate) fn measure_legend(content: &LegendContent, settings: &ResolvedPlotSettings) -> Size {
@@ -338,10 +355,10 @@ pub(crate) fn legend_layout(
 		},
 		ResolvedPresence::Show(position) => LegendLayout {
 			content_bounds: bounds,
-			origin: Some(bounds.origin().offset(
+			origin: Some(LegendOrigin::Overlay(bounds.origin().offset(
 				(bounds.width() - size.width) * position.x(),
 				(bounds.height() - size.height) * position.y(),
-			)),
+			))),
 		},
 		ResolvedPresence::Fallback => {
 			let content_width = (bounds.width() - size.width).max(0.0);
@@ -352,7 +369,9 @@ pub(crate) fn legend_layout(
 					content_width,
 					bounds.height(),
 				),
-				origin: Some(bounds.origin().offset(content_width, 0.0)),
+				origin: Some(LegendOrigin::Gutter(
+					bounds.origin().offset(content_width, 0.0),
+				)),
 			}
 		}
 	}
@@ -737,35 +756,81 @@ mod tests {
 		));
 		let bounds =
 			Rect::<Widget>::from_iced_frame(Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)));
+		let plot_extent = bounds.region(40.0, 50.0, 170.0, 210.0);
 		let mut settings = ResolvedPlotSettings::default();
 
 		let gutter = legend_layout(bounds, Some(&content), &settings);
 		assert_eq!(gutter.content_bounds.width(), 230.0);
 		assert_eq!(
-			gutter.origin.map(|point| (point.x(), point.y())),
-			Some((230.0, 0.0))
+			gutter
+				.origin(plot_extent)
+				.map(|point| (point.x(), point.y())),
+			Some((230.0, 50.0))
 		);
 
 		settings.legend = ResolvedPresence::Show(LegendPosition::new(0.98, 0.02).unwrap());
 		let overlay = legend_layout(bounds, Some(&content), &settings);
 		assert_eq!(overlay.content_bounds, bounds);
 		assert_eq!(
-			overlay.origin.map(|point| (point.x(), point.y())),
+			overlay
+				.origin(plot_extent)
+				.map(|point| (point.x(), point.y())),
 			Some(((400.0 - 170.0) * 0.98, (300.0 - 45.0) * 0.02))
 		);
 
 		settings.legend = ResolvedPresence::Show(LegendPosition::new(1.5, -0.5).unwrap());
 		let outside = legend_layout(bounds, Some(&content), &settings);
-		assert!(
-			outside.origin.unwrap().x() + measure_legend(&content, &settings).width
-				> bounds.right()
-		);
-		assert!(outside.origin.unwrap().y() < bounds.y());
+		let outside_origin = outside.origin(plot_extent).unwrap();
+		assert!(outside_origin.x() + measure_legend(&content, &settings).width > bounds.right());
+		assert!(outside_origin.y() < bounds.y());
 
 		settings.legend = ResolvedPresence::Hide;
 		assert_eq!(
 			legend_layout(bounds, Some(&content), &settings),
 			legend_layout(bounds, None, &ResolvedPlotSettings::default())
 		);
+	}
+
+	#[test]
+	fn product_0051_tall_legends_keep_the_existing_row_budget_and_may_outlive_the_plot_extent() {
+		let mut entries = NonEmpty::new(entry(
+			"series-0",
+			LegendSample::LineSample,
+			LegendProvenance::Named,
+		));
+		for index in 1..12 {
+			entries.push(entry(
+				&format!("series-{index}"),
+				LegendSample::LineSample,
+				LegendProvenance::Named,
+			));
+		}
+		let content = LegendContent::entries(entries);
+		let settings = ResolvedPlotSettings::default();
+		assert_eq!(measure_legend(&content, &settings), Size::new(320.0, 270.0));
+		let labels = content
+			.sections()
+			.flat_map(|section| match section {
+				LegendSection::Entries(entries) => entries
+					.iter()
+					.map(|entry| entry.label.as_str())
+					.collect::<Vec<_>>(),
+				_ => Vec::new(),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			labels,
+			(0..12)
+				.map(|index| format!("series-{index}"))
+				.collect::<Vec<_>>()
+		);
+
+		let bounds =
+			Rect::<Widget>::from_iced_frame(Rectangle::new(Point::ORIGIN, Size::new(500.0, 180.0)));
+		let plot_extent = bounds.region(40.0, 50.0, 100.0, 90.0);
+		let layout = legend_layout(bounds, Some(&content), &settings);
+		let origin = layout.origin(plot_extent).expect("default gutter");
+		assert_eq!(origin.y(), plot_extent.y());
+		assert!(origin.y() + measure_legend(&content, &settings).height > plot_extent.bottom());
 	}
 }

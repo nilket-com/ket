@@ -748,7 +748,9 @@ impl PlotComposite for PlotGridKernel {
 			layer: crate::plot::common::PlotRenderLayer::Full,
 		};
 		helper.draw_axis_labels(backend, shared_extent.into_iced());
-		if let (Some(content), Some(origin)) = (figure_legend.as_ref(), legend.origin) {
+		if let (Some(content), Some(origin)) =
+			(figure_legend.as_ref(), legend.origin(shared_extent))
+		{
 			crate::plot::legend::render_legend(backend, origin, content, &resolved);
 		}
 	}
@@ -1312,8 +1314,9 @@ mod tests {
 			iced::Size::new(400.0, 300.0),
 		));
 		let legend = crate::plot::legend::legend_layout(bounds, Some(&content), &resolved);
-		let legend_origin = legend.origin.expect("default gutter origin");
 		let tiled = grid_tiled_area(grid_outer_area(legend.content_bounds, 0.0), &resolved);
+		let shared_extent = grid_plot_extent(tiled, kernel.arrangement, &resolved);
+		let legend_origin = legend.origin(shared_extent).expect("default gutter origin");
 		let cell_plots = kernel
 			.cells
 			.iter()
@@ -1329,6 +1332,15 @@ mod tests {
 				.iter()
 				.all(|plot| plot.right() <= legend_origin.x()),
 			"the figure legend must begin to the right of every cell plot"
+		);
+		assert_eq!(
+			legend_origin.y(),
+			shared_extent.y(),
+			"the default figure legend must use the panel-aware plot extent"
+		);
+		assert!(
+			shared_extent.y() > tiled.y(),
+			"the authoritative extent includes per-cell top space"
 		);
 		assert!(
 			cell_plots

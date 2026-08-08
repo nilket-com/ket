@@ -1,6 +1,6 @@
 # ADR 0051: align the default legend with the plot extent
 
-Status: proposed 2026-08-08. This record repairs one ambiguity in 0050's
+Status: accepted 2026-08-08. This record repairs one ambiguity in 0050's
 default legend gutter: "top-aligned" means aligned with the marks' actual
 plot extent, not with the figure edge above the title band.
 
@@ -75,6 +75,40 @@ needs its own exhibit and record.
 7. `test16.rn` deletes `legend_at(1.06, 0.14)` and returns to inherited gutter
    placement. No Rune surface, type, identity, lifecycle, or interaction
    behavior changes.
+
+## Implementation evidence
+
+- `LegendLayout` now carries either a pending typed gutter origin or a final
+  typed overlay origin. `origin(plot_extent)` changes only the former. The
+  ordinary overlay renderer supplies its actual `plot_area`; the multi-cell
+  renderer supplies `grid_plot_extent`. Authored overlays ignore that argument
+  and retain their full-figure coordinates by construction.
+- The production SVG oracle checks title-only, title-plus-subtitle, and neither
+  at `400x300` and `1200x900`. In all six cases the default legend background's
+  top is exactly `plot_padding_top`; each case explicitly differs from the old
+  `(height - legend_height) * 0.14` compensation.
+- The four-product `test16`-shaped grid gate now proves the default origin's
+  y-coordinate equals the panel-aware shared plot extent while every cell plot
+  remains left of the legend and all cell extents remain congruent.
+- A twelve-entry legend retains the historical `320x270` measurement, ten-row
+  partition, and authored order even when that height exceeds the plot extent.
+  Its top aligns and its bottom remains intentionally unconstrained.
+- `/home/me/work/uat/test16.rn` removed `legend_at(1.06, 0.14)` from the grouped
+  bar figure; the faceted figure's independent `hide_legend()` remains.
+
+The second consecutive premise-update ledger is explicit. The sole changed
+expectation is `product_0050_layout_distinguishes_gutter_overlay_and_hide`'s
+default gutter origin, from `(230, 0)` at figure top to `(230, 50)` at the
+supplied plot extent. Its authored `0.98, 0.02` and out-of-range coordinates,
+gutter width, `Hide`, and absent-content expectations are unchanged. The
+PRODUCT-0031 production SVG oracle now observes the moved default legend, while
+its marks and content assertions pass unchanged; the new coordinate assertion
+pins the admitted translation directly. The PRODUCT-0044 grid SVG content,
+0048 congruence/shared-edge corpus, one-cell parity, hover, no-content, and six
+fixed-origin renderer-only factory oracles all pass without refreshed expected
+bytes. No serialized SVG constant was rewritten. The full workspace suite
+passes; its Polariton portion is 430 unit tests (five live tests ignored), 40
+architecture tests, and the trybuild UI pair.
 
 ## Stop condition
 

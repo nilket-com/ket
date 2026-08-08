@@ -927,7 +927,8 @@ impl<'a> PlotWidget<'a> {
 			.legend_content(&self.settings)
 			.and_then(crate::plot::legend::apply_policy);
 		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
-		let plot_area = self.plot_area(legend.content_bounds).into_iced();
+		let plot_extent = self.plot_area(legend.content_bounds);
+		let plot_area = plot_extent.into_iced();
 		let bounds = bounds.into_iced();
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
@@ -1045,7 +1046,8 @@ impl<'a> PlotWidget<'a> {
 			}
 		});
 		let size_only_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
-		if let (Some(content), Some(origin)) = (legend_content.as_ref(), legend.origin) {
+		if let (Some(content), Some(origin)) = (legend_content.as_ref(), legend.origin(plot_extent))
+		{
 			render_legend(backend, origin, content, &self.settings);
 		}
 		let title = resolve_canvas_text(&self.settings.title, Some(self.title.clone()));
@@ -2136,7 +2138,12 @@ mod product_0031_pre_extraction_oracle {
 		}
 	}
 
-	fn oracle_svg_with_legend(settings: ResolvedPlotSettings, legend: bool) -> String {
+	fn oracle_svg_at(
+		settings: ResolvedPlotSettings,
+		legend: bool,
+		width: f32,
+		height: f32,
+	) -> String {
 		let settings_model = PlotSettings::from_resolved(settings.clone());
 		let kernel = OracleKernel { legend };
 		let widget = PlotWidget {
@@ -2149,12 +2156,16 @@ mod product_0031_pre_extraction_oracle {
 			resize_render_suspended: false,
 			layer: PlotRenderLayer::Full,
 		};
-		let mut backend = SvgBackend::new(400.0, 300.0);
+		let mut backend = SvgBackend::new(width, height);
 		widget.render(
 			&mut backend,
-			Rectangle::new(Point::ORIGIN, iced::Size::new(400.0, 300.0)),
+			Rectangle::new(Point::ORIGIN, iced::Size::new(width, height)),
 		);
 		backend.finish()
+	}
+
+	fn oracle_svg_with_legend(settings: ResolvedPlotSettings, legend: bool) -> String {
+		oracle_svg_at(settings, legend, 400.0, 300.0)
 	}
 
 	fn oracle_svg(settings: ResolvedPlotSettings) -> String {
@@ -2199,6 +2210,48 @@ mod product_0031_pre_extraction_oracle {
 		let no_content = oracle_svg_with_legend(hidden_without_content, false);
 		assert!(!hidden_with_content.contains(">fallback title</text>"));
 		assert_eq!(hidden_with_content, no_content);
+	}
+
+	fn legend_background_origin(svg: &str) -> (f32, f32) {
+		let path = svg
+			.lines()
+			.find(|line| line.contains("fill-opacity=\"0.60\""))
+			.expect("legend background path");
+		let coordinates = path
+			.split_once("M ")
+			.expect("path start")
+			.1
+			.split_whitespace()
+			.take(2)
+			.map(|value| value.parse::<f32>().expect("path coordinate"))
+			.collect::<Vec<_>>();
+		(coordinates[0], coordinates[1])
+	}
+
+	#[test]
+	fn product_0051_default_legend_tracks_the_plot_top_across_headings_and_large_resizes() {
+		let mut title_only = ResolvedPlotSettings::default();
+		title_only.title = ResolvedPresence::Show(Arc::new("title".to_owned()));
+		let mut title_and_subtitle = title_only.clone();
+		title_and_subtitle.subtitle = ResolvedPresence::Show(Arc::new("subtitle".to_owned()));
+		let mut neither = ResolvedPlotSettings::default();
+		neither.title = ResolvedPresence::Hide;
+		neither.subtitle = ResolvedPresence::Hide;
+
+		for (width, height) in [(400.0, 300.0), (1200.0, 900.0)] {
+			for settings in [
+				title_only.clone(),
+				title_and_subtitle.clone(),
+				neither.clone(),
+			] {
+				let expected_y = settings.plot_padding_top;
+				let svg = oracle_svg_at(settings, true, width, height);
+				let (legend_x, legend_y) = legend_background_origin(&svg);
+				assert_eq!(legend_x, width - 170.0);
+				assert_eq!(legend_y, expected_y);
+				assert_ne!(legend_y, (height - 45.0) * 0.14);
+			}
+		}
 	}
 }
 
