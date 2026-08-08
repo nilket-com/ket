@@ -9,6 +9,8 @@ pub mod factory;
 pub mod grid;
 pub mod kernels;
 pub mod legend;
+#[cfg(test)]
+mod rendering_oracle;
 pub mod request;
 pub mod spec;
 pub mod theme;

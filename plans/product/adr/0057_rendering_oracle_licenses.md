@@ -1,10 +1,11 @@
 # ADR 0057: rendering-oracle licenses
 
-Status: proposed 2026-08-08. This record classifies which visible claims the
-backend-independent draw-operation stream can prove, assigns each rendering
-oracle an explicit license, and requires production-renderer evidence for
-properties that do not survive into that stream. It adds no Rune surface and
-changes no product pixels.
+Status: accepted 2026-08-08. Implementation evidence:
+`plans/product/impl/0057_rendering_oracle_licenses_evidence.md`. This record
+classifies which visible claims the backend-independent draw-operation stream
+can prove, assigns each rendering oracle an explicit license, and requires
+production-renderer evidence for properties that do not survive into that
+stream. It adds no Rune surface and changes no product pixels.
 
 ## Context
 
@@ -53,6 +54,14 @@ development machine. Neither fact promises byte stability across adapters,
 drivers, or platforms. The feasibility question is therefore whether the
 production renderer can yield any raster whose semantic regions can be
 sampled, not whether it can become another byte-identical baseline.
+
+Implementation confirmed the strongest disposition. The reference machine
+offers Vulkan Intel, Vulkan llvmpipe, and GL Intel adapters; repeated identical
+captures were byte-stable locally, and semantic predicates held at viewports
+three times apart. Overlap, clip enforcement, diagonal MSAA, and production
+text all render headlessly and receive §7 disposition 1. The manual protocol
+remains the governed fallback for a future environment or unavailable probe,
+not this implementation's evidence source.
 
 ## Decision
 
@@ -370,8 +379,9 @@ rather than smuggling renderer infrastructure into this governance record.
 - **Retrofit every historical record:** accepted SVG gates retain their valid
   claims. Overclaims are corrected when identified, and future visible claims
   apply the classifier at authoring time.
-- **Fold DB-03 mark-argument bindings into this record:** that is the next
-  language-surface decision and has no rendering-oracle dependency.
+- **Fold DB-03 mark-argument bindings into this record:** that independent
+  language-surface decision had no rendering-oracle dependency and subsequently
+  shipped as PRODUCT-0058.
 
 ## Consequences
 
@@ -391,5 +401,5 @@ rather than smuggling renderer infrastructure into this governance record.
   text support can remain a visible manual obligation without weakening or
   discarding automated overlap, clipping, and MSAA evidence; each obligation
   disappears when its licensed automated instrument becomes available.
-- The record changes no product output. DB-03 mark-argument bindings remains
-  the next proposed language work after this oracle boundary is accepted.
+- The record changes no product output. DB-03 mark-argument bindings
+  subsequently shipped independently as PRODUCT-0058.
