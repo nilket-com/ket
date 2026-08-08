@@ -5749,28 +5749,18 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 				}
 			}
 		}
-		let entries = self
-			.workers
-			.iter()
-			.map(|worker| worker.entry.clone())
-			.collect::<Vec<_>>();
-		let registry = Arc::new(StaticWorkerRegistry::new(entries));
-		let coordinator_memory = Arc::new(MemoryManager::new(
-			EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
-			memory_pool_max_buffer_capacity_bytes,
-		));
 		let catalog: Arc<dyn Catalog> = Arc::new(
 			self.catalog
 				.take()
 				.ok_or_else(|| "timing atlas catalog already consumed".to_string())?,
 		);
+		// ADR 529's sole construction rail; the atlas only adds its own telemetry
+		// retention on top, rather than reconstructing the coordinator.
 		let coordinator = Some(
-			DistributedQueryCoordinator::new(
+			build_execution_census_coordinator(
 				catalog,
-				registry,
-				coordinator_memory,
-				Arc::new(TcpTransport::new()),
-				execution_census_distributed_planner_config(distributed_budget.memory_per_task),
+				&self.workers,
+				memory_pool_max_buffer_capacity_bytes,
 				distributed_budget,
 			)
 			.with_task_telemetry_retention(self.telemetry_retention.clone()),
@@ -8120,6 +8110,39 @@ fn execution_census_distributed_planner_config(memory_per_task: ByteCount) -> Pl
 	distributed_gauge_planner_config_with_task_memory(Some(memory_per_task))
 }
 
+/// The single ADR 529 coordinator-construction rail.
+///
+/// Both the execution census and the timing-atlas harness build their coordinator here, so
+/// the registry shape, memory-pool sizing, transport and planner config cannot drift apart
+/// between them. A second construction site is exactly how they diverged before: the
+/// duplicate looked harmless because it was copied faithfully, and nothing then kept it
+/// faithful. Callers that need extra configuration chain it onto the returned coordinator
+/// rather than re-calling the constructor.
+fn build_execution_census_coordinator(
+	catalog: Arc<dyn Catalog>,
+	workers: &[ExecutionCensusWorkerHarness],
+	memory_pool_max_buffer_capacity_bytes: usize,
+	distributed_budget: QueryBudget,
+) -> DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport> {
+	let entries = workers
+		.iter()
+		.map(|worker| worker.entry.clone())
+		.collect::<Vec<_>>();
+	let registry = Arc::new(StaticWorkerRegistry::new(entries));
+	let coordinator_memory = Arc::new(MemoryManager::new(
+		EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
+		memory_pool_max_buffer_capacity_bytes,
+	));
+	DistributedQueryCoordinator::new(
+		catalog,
+		registry,
+		coordinator_memory,
+		Arc::new(TcpTransport::new()),
+		execution_census_distributed_planner_config(distributed_budget.memory_per_task),
+		distributed_budget,
+	)
+}
+
 struct ExecutionCensusPreflight {
 	logical: LogicalPlan,
 	catalog: MockCatalog,
@@ -8582,22 +8605,11 @@ async fn run_execution_census_input(
 			}
 		}
 	}
-	let entries = workers
-		.iter()
-		.map(|worker| worker.entry.clone())
-		.collect::<Vec<_>>();
-	let registry = Arc::new(StaticWorkerRegistry::new(entries));
-	let coordinator_memory = Arc::new(MemoryManager::new(
-		EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
-		memory_pool_max_buffer_capacity_bytes,
-	));
 	let catalog: Arc<dyn Catalog> = Arc::new(preflight.catalog);
-	let coordinator = DistributedQueryCoordinator::new(
+	let coordinator = build_execution_census_coordinator(
 		catalog,
-		registry,
-		coordinator_memory,
-		Arc::new(TcpTransport::new()),
-		execution_census_distributed_planner_config(distributed_budget.memory_per_task),
+		&workers,
+		memory_pool_max_buffer_capacity_bytes,
 		distributed_budget,
 	);
 	let distributed_start = Instant::now();

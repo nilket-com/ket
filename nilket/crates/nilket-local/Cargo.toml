@@ -9,6 +9,7 @@ libc = "0.2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 thiserror = "2"
+tls-pki = { path = "../tls-pki" }
 tokio = { version = "1.37", features = ["rt", "time"] }
 toml = "0.8"
 toron-client = { path = "../toron-client" }

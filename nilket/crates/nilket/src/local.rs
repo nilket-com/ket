@@ -18,13 +18,14 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use fs2::FileExt;
 use nilket_local::{
-	FORMAT_VERSION, LocalWorkspace, ProfileMarker, ProfilePaths, RuntimeManifest, SQL_ENDPOINT,
-	WENDELON_ENDPOINT, blocking_discover, process_start_token, resolve_profile_root,
+	DevelopmentPki, FORMAT_VERSION, LocalWorkspace, ProfileMarker, ProfilePaths, RuntimeManifest,
+	SQL_ENDPOINT, WENDELON_ENDPOINT, blocking_discover, process_start_token,
+	publish_runtime_manifest, resolve_profile_root, write_create_new,
+	write_profile_development_pki,
 };
 use nix::sys::signal::{Signal, killpg};
 use nix::unistd::{Pid, getpid, getppid};
 use signal_hook::consts::SIGINT;
-use tls_pki::{DevelopmentPki, write_local_development_pki};
 use toron_client::blocking_health_loopback;
 use uuid::Uuid;
 use wendelon::cli::ReadinessProbe;
@@ -102,6 +103,16 @@ pub fn run(options: LocalOptions) -> ExitCode {
 }
 
 fn run_owned(options: LocalOptions) -> Result<ExitCode, String> {
+	// Production owns the well-known local endpoints; only tests substitute their own,
+	// and they substitute *ephemeral* ones so a running deployment can never decide
+	// whether the suite passes.
+	run_owned_with_requirements(options, &ENDPOINT_REQUIREMENTS)
+}
+
+fn run_owned_with_requirements(
+	options: LocalOptions,
+	requirements: &[EndpointRequirement],
+) -> Result<ExitCode, String> {
 	if !cfg!(target_os = "linux") {
 		return Err("the local profile currently supports Linux only".to_owned());
 	}
@@ -120,7 +131,7 @@ fn run_owned(options: LocalOptions) -> Result<ExitCode, String> {
 	if options.reset {
 		reset_locked_profile(&paths)?;
 	}
-	preflight_endpoints().map_err(|conflict| conflict.to_string())?;
+	preflight_requirements(requirements).map_err(|conflict| conflict.to_string())?;
 	let marker = ensure_profile(&paths)?;
 	let pki = ensure_artifacts(&paths)?;
 	validate_artifacts(&paths)?;
@@ -191,7 +202,7 @@ fn run_owned(options: LocalOptions) -> Result<ExitCode, String> {
 		wendelon_endpoint: WENDELON_ENDPOINT.to_owned(),
 		sql_endpoint: SQL_ENDPOINT.to_owned(),
 	};
-	publish_runtime(&paths.runtime, &runtime)?;
+	publish_runtime_manifest(&paths.runtime, &runtime)?;
 	let ready = LocalReady {
 		sql_endpoint: SQL_ENDPOINT.parse().expect("fixed SQL endpoint"),
 		session_nonce: runtime.session_nonce,
@@ -339,8 +350,7 @@ fn ensure_artifacts(paths: &ProfilePaths) -> Result<DevelopmentPki, String> {
 		fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
 			.map_err(|error| format!("secure {}: {error}", directory.display()))?;
 	}
-	let pki = write_local_development_pki(&paths.pki_dir)
-		.map_err(|error| format!("local development PKI: {error}"))?;
+	let pki = write_profile_development_pki(&paths.pki_dir)?;
 	if !paths.wendelon_config.exists() {
 		write_create_new(
 			&paths.wendelon_config,
@@ -533,10 +543,6 @@ impl std::fmt::Display for EndpointConflict {
 			self.source
 		)
 	}
-}
-
-fn preflight_endpoints() -> Result<(), EndpointConflict> {
-	preflight_requirements(&ENDPOINT_REQUIREMENTS)
 }
 
 fn preflight_requirements(requirements: &[EndpointRequirement]) -> Result<(), EndpointConflict> {
@@ -795,27 +801,6 @@ fn forward_child_line(label: &str, bytes: &[u8], consume_readiness: bool) {
 	eprintln!("{label}: {unprefixed}");
 }
 
-fn publish_runtime(path: &Path, manifest: &RuntimeManifest) -> Result<(), String> {
-	let temporary = path.with_extension(format!("json.tmp-{}", manifest.session_nonce));
-	let bytes = serde_json::to_vec_pretty(manifest)
-		.map_err(|error| format!("serialize runtime identity: {error}"))?;
-	write_create_new(&temporary, &bytes, 0o600)?;
-	fs::rename(&temporary, path)
-		.map_err(|error| format!("publish runtime identity {}: {error}", path.display()))
-}
-
-fn write_create_new(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
-	let mut file = OpenOptions::new()
-		.write(true)
-		.create_new(true)
-		.mode(mode)
-		.open(path)
-		.map_err(|error| format!("create {}: {error}", path.display()))?;
-	file.write_all(bytes)
-		.and_then(|()| file.flush())
-		.map_err(|error| format!("write {}: {error}", path.display()))
-}
-
 fn path_text(path: &Path) -> Result<&str, String> {
 	path.to_str()
 		.ok_or_else(|| format!("local profile path is not UTF-8: {}", path.display()))
@@ -832,6 +817,39 @@ mod tests {
 	// Keep process-spawn fixtures from crossing the proof that a dropped profile
 	// lock is immediately acquirable.
 	static PROCESS_AND_LOCK_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+	/// Serialise without letting one failure become everyone's failure. A panicking
+	/// test poisons the mutex, and `unwrap()` then converts every sibling into an
+	/// unrelated `PoisonError` — which buries the one real diagnosis under a pile of
+	/// second-order ones. These locks order tests; they guard no invariant that a
+	/// panic could have corrupted.
+	fn lock_serial(lock: &'static Mutex<()>) -> std::sync::MutexGuard<'static, ()> {
+		lock.lock()
+			.unwrap_or_else(std::sync::PoisonError::into_inner)
+	}
+
+	/// Endpoints this test owns, discovered by binding ephemeral ports and releasing
+	/// them. Never the production ports: whether a local deployment happens to be
+	/// running must not decide the outcome of a unit test.
+	fn ephemeral_requirements() -> Vec<EndpointRequirement> {
+		ENDPOINT_REQUIREMENTS
+			.iter()
+			.map(|requirement| {
+				let endpoint = match requirement.transport {
+					EndpointTransport::Udp => UdpSocket::bind("127.0.0.1:0")
+						.and_then(|socket| socket.local_addr())
+						.expect("bind ephemeral udp endpoint"),
+					EndpointTransport::Tcp => TcpListener::bind("127.0.0.1:0")
+						.and_then(|listener| listener.local_addr())
+						.expect("bind ephemeral tcp endpoint"),
+				};
+				EndpointRequirement {
+					endpoint: Box::leak(endpoint.to_string().into_boxed_str()),
+					..*requirement
+				}
+			})
+			.collect()
+	}
 
 	fn fresh_root(tag: &str) -> PathBuf {
 		std::env::temp_dir().join(format!(
@@ -917,16 +935,38 @@ mod tests {
 
 	#[test]
 	fn preflight_conflict_precedes_identity_and_leaves_an_absent_profile() {
-		let _serial = PREFLIGHT_TEST_LOCK.lock().unwrap();
-		let occupied = UdpSocket::bind(SQL_ENDPOINT).expect("occupy Toron SQL endpoint");
+		let _serial = lock_serial(&PREFLIGHT_TEST_LOCK);
+		// Occupy an ephemeral endpoint this test owns and inject it as the requirement.
+		// Binding the production port instead made the assertion depend on whether a
+		// local deployment was running — it holds 127.0.0.1:7742, so the bind failed
+		// and this test reported a conflict it never created.
+		let occupied = UdpSocket::bind("127.0.0.1:0").expect("bind ephemeral endpoint");
+		let endpoint: &'static str = Box::leak(
+			occupied
+				.local_addr()
+				.expect("ephemeral local addr")
+				.to_string()
+				.into_boxed_str(),
+		);
+		let requirements = [EndpointRequirement {
+			role: LocalRole::Toron,
+			transport: EndpointTransport::Udp,
+			endpoint,
+		}];
 		let root = fresh_root("preflight-residue");
-		let error = run_owned(LocalOptions {
-			data_dir: Some(root.clone()),
-			reset: false,
-		})
+		let error = run_owned_with_requirements(
+			LocalOptions {
+				data_dir: Some(root.clone()),
+				reset: false,
+			},
+			&requirements,
+		)
 		.unwrap_err();
 		let paths = ProfilePaths::new(root.clone());
-		assert!(error.contains("Toron UDP endpoint 127.0.0.1:7742"));
+		assert!(
+			error.contains(&format!("Toron UDP endpoint {endpoint}")),
+			"conflict must name the injected endpoint: {error}"
+		);
 		assert!(
 			!paths.marker.exists(),
 			"failed creation must publish no identity"
@@ -946,9 +986,7 @@ mod tests {
 
 	#[test]
 	fn every_preflight_conflict_is_typed_without_guessing_an_occupant() {
-		let _serial = PREFLIGHT_TEST_LOCK
-			.lock()
-			.unwrap_or_else(std::sync::PoisonError::into_inner);
+		let _serial = lock_serial(&PREFLIGHT_TEST_LOCK);
 		for requirement in ENDPOINT_REQUIREMENTS {
 			let (occupied, endpoint): (Box<dyn std::any::Any>, SocketAddr) =
 				match requirement.transport {
@@ -995,8 +1033,12 @@ mod tests {
 
 	#[test]
 	fn successful_preflight_allows_identity_and_pki_generation() {
-		let _serial = PREFLIGHT_TEST_LOCK.lock().unwrap();
-		preflight_endpoints().expect("fixture endpoints are unoccupied");
+		let _serial = lock_serial(&PREFLIGHT_TEST_LOCK);
+		// Free endpoints this test owns, not the production ports: the subject here is
+		// that a *satisfied* preflight allows identity and PKI, not which ports the
+		// machine happens to have spare.
+		preflight_requirements(&ephemeral_requirements())
+			.expect("fixture endpoints are unoccupied");
 		let root = fresh_root("preflight-positive");
 		let paths = ProfilePaths::new(root.clone());
 		prepare_root_for_lock(&root).unwrap();
@@ -1127,7 +1169,7 @@ mod tests {
 
 	#[test]
 	fn child_is_in_its_own_process_group_and_drains_on_owned_signal() {
-		let _serial = PROCESS_AND_LOCK_TEST_LOCK.lock().unwrap();
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
 		let mut child = OwnedChild::spawn(
 			"fixture",
 			Path::new("/bin/sh"),
@@ -1145,7 +1187,7 @@ mod tests {
 
 	#[test]
 	fn owned_shutdown_finishes_toron_before_signaling_wendelon() {
-		let _serial = PROCESS_AND_LOCK_TEST_LOCK.lock().unwrap();
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
 		let root = fresh_root("shutdown-order");
 		fs::create_dir_all(&root).unwrap();
 		let log = root.join("signals.log");
@@ -1189,7 +1231,7 @@ mod tests {
 
 	#[test]
 	fn stale_manifest_with_live_recycled_pid_has_no_lock_authority() {
-		let _serial = PROCESS_AND_LOCK_TEST_LOCK.lock().unwrap();
+		let _serial = lock_serial(&PROCESS_AND_LOCK_TEST_LOCK);
 		let root = fresh_root("stale-pid");
 		let paths = ProfilePaths::new(root.clone());
 		prepare_root_for_lock(&root).unwrap();
@@ -1206,7 +1248,7 @@ mod tests {
 			wendelon_endpoint: WENDELON_ENDPOINT.to_owned(),
 			sql_endpoint: SQL_ENDPOINT.to_owned(),
 		};
-		publish_runtime(&paths.runtime, &runtime).unwrap();
+		publish_runtime_manifest(&paths.runtime, &runtime).unwrap();
 		drop(lock);
 		let successor = open_lock(&paths.lock).unwrap();
 		assert!(

@@ -8,12 +8,19 @@
 
 use serde::{Deserialize, Serialize};
 use std::fmt;
-use std::fs::{self, File};
-use std::io::{self, Read};
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::net::SocketAddr;
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
+
+/// This crate owns the local identity schema, so it also owns *writing* that schema and
+/// the development PKI the profile is built from. ADR 071 keeps the `nilket` root binary
+/// runtime-free — no serialization stack, no TLS material — and the only way to honour
+/// that while still publishing identity is for the capability to live here, behind the
+/// crate that defines the format.
+pub use tls_pki::DevelopmentPki;
 
 pub const FORMAT_VERSION: u32 = 1;
 pub const SQL_ENDPOINT: &str = "127.0.0.1:7742";
@@ -1613,4 +1620,43 @@ mod tests {
 		let state = blocking_discover(None);
 		assert!(matches!(state, LocalWorkspace::Ready(_)), "{state}");
 	}
+}
+
+/// Create `path` with exactly `mode`, refusing to follow or clobber anything already
+/// there. `create_new` is the load-bearing part: profile artifacts are identity, so a
+/// pre-existing path is a conflict to report, never a file to overwrite.
+pub fn write_create_new(path: &Path, bytes: &[u8], mode: u32) -> Result<(), String> {
+	let mut file = OpenOptions::new()
+		.write(true)
+		.create_new(true)
+		.mode(mode)
+		.open(path)
+		.map_err(|error| format!("create {}: {error}", path.display()))?;
+	file.write_all(bytes)
+		.and_then(|()| file.flush())
+		.map_err(|error| format!("write {}: {error}", path.display()))
+}
+
+/// Serialize and publish the runtime manifest atomically: write a private temporary
+/// beside the target, then rename over it. The rename is what makes a reader see either
+/// the whole identity or none of it, never a half-written one.
+///
+/// Serialization lives here rather than in the supervisor because this crate defines
+/// [`RuntimeManifest`]; the format and its encoder belong together (ADR 071).
+pub fn publish_runtime_manifest(path: &Path, manifest: &RuntimeManifest) -> Result<(), String> {
+	let temporary = path.with_extension(format!("json.tmp-{}", manifest.session_nonce));
+	let bytes = serde_json::to_vec_pretty(manifest)
+		.map_err(|error| format!("serialize runtime identity: {error}"))?;
+	write_create_new(&temporary, &bytes, 0o600)?;
+	fs::rename(&temporary, path)
+		.map_err(|error| format!("publish runtime identity {}: {error}", path.display()))
+}
+
+/// Generate the local profile's development-only PKI under `pki_dir`.
+///
+/// Wraps `tls_pki` so the TLS material stack stays out of the `nilket` root manifest.
+/// The name keeps saying "development": this is not production custody.
+pub fn write_profile_development_pki(pki_dir: &Path) -> Result<DevelopmentPki, String> {
+	tls_pki::write_local_development_pki(pki_dir)
+		.map_err(|error| format!("local development PKI: {error}"))
 }
