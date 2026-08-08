@@ -107,20 +107,20 @@ impl BarPlotKernel {
 				} else {
 					0.0
 				};
-				let band = transform.bounds.height / num_cats as f32;
+				let (_, band) = transform.categorical(0, x_base);
 				let cluster = band * (1.0 - category_gap_fraction);
 				let category_inset = (band - cluster) / 2.0;
 				let slot = cluster / num_groups as f32;
 				let padding = slot * (1.0 - width_fraction) / 2.0;
 				for category_index in 0..num_cats {
-					let category_top = (num_cats - 1 - category_index) as f32 * band;
+					let (left, _) = transform.categorical(category_index, x_base);
+					let category_top = left.y - band / 2.0;
 					for group_index in 0..num_groups {
 						let value = self.prepared_data.values[category_index][group_index];
 						if value <= x_base {
 							continue;
 						}
 						let (right, _) = transform.categorical(category_index, value);
-						let (left, _) = transform.categorical(category_index, x_base);
 						let reversed_group = num_groups - 1 - group_index;
 						bars.push(BarRectangle {
 							rect: Rectangle {

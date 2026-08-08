@@ -1667,7 +1667,7 @@ impl<'a> PlotWidget<'a> {
 		backend: &mut dyn PlotBackend,
 		_area: Rectangle,
 		transform: &CoordinateTransformer,
-		categories: &[String],
+		_categories: &[String],
 		x_range: (f64, f64),
 	) {
 		let grid_stroke = |width: f32, style: GridLineStyle| -> Stroke {
@@ -1702,10 +1702,8 @@ impl<'a> PlotWidget<'a> {
 				stroke,
 			);
 		};
-		let (first_cat_center, band_height) = transform.categorical(0, x_range.0);
-		let bottom_edge = first_cat_center.y + (band_height / 2.0);
-		let (last_cat_center, _) = transform.categorical(categories.len() - 1, x_range.1);
-		let top_edge = last_cat_center.y - (band_height / 2.0);
+		let top_edge = 0.0;
+		let bottom_edge = transform.bounds.height;
 		if self.settings.show_x_minor_grid && self.settings.x_minor_ticks > 0 {
 			let stroke = grid_stroke(
 				self.settings.x_minor_grid_width,
@@ -1761,22 +1759,19 @@ impl<'a> PlotWidget<'a> {
 			width: 2.0,
 			..Default::default()
 		};
-		let (first_cat_center, band_height) = transform.categorical(0, x_range.0);
-		let bottom_edge = first_cat_center.y + (band_height / 2.0);
-		let (last_cat_center, _) = transform.categorical(categories.len() - 1, x_range.1);
-		let top_edge = last_cat_center.y - (band_height / 2.0);
+		let top_edge = 0.0;
+		let bottom_edge = transform.bounds.height;
+		let (left_edge, _) = transform.categorical(0, x_range.0);
+		let (right_edge, _) = transform.categorical(0, x_range.1);
 		let axes_path = |builder: &mut dyn PathBuilder| {
-			let left_x = first_cat_center.x;
-			let right_x = last_cat_center.x;
-			builder.move_to(Point::new(left_x, top_edge));
-			builder.line_to(Point::new(left_x, bottom_edge));
-			builder.line_to(Point::new(right_x, bottom_edge));
+			builder.move_to(Point::new(left_edge.x, top_edge));
+			builder.line_to(Point::new(left_edge.x, bottom_edge));
+			builder.line_to(Point::new(right_edge.x, bottom_edge));
 		};
 		backend.stroke_path(&axes_path, halo_stroke);
 		backend.stroke_path(&axes_path, axis_stroke);
 		for data_x in self.major_tick_positions(self.settings.x_tick_placement, x_range) {
-			let (center, band_height) = transform.categorical(0, data_x);
-			let bottom_edge = center.y + (band_height / 2.0);
+			let (center, _) = transform.categorical(0, data_x);
 			let p_bottom = Point::new(center.x, bottom_edge);
 			backend.stroke_path(
 				&|builder| {
@@ -1839,13 +1834,10 @@ impl<'a> PlotWidget<'a> {
 			..Default::default()
 		};
 		let axes_path = |builder: &mut dyn PathBuilder| {
-			let (first_p, _bw, bh) = transform.categorical_2d(0, 0);
-			let (last_p, bw, _bh) =
-				transform.categorical_2d(x_categories.len() - 1, y_categories.len() - 1);
-			let left_x = first_p.x - bw / 2.0;
-			let bottom_y = first_p.y + bh / 2.0;
-			let right_x = last_p.x + bw / 2.0;
-			let top_y = last_p.y - bh / 2.0;
+			let left_x = 0.0;
+			let bottom_y = transform.bounds.height;
+			let right_x = transform.bounds.width;
+			let top_y = 0.0;
 			builder.move_to(Point::new(left_x, top_y));
 			builder.line_to(Point::new(left_x, bottom_y));
 			builder.line_to(Point::new(right_x, bottom_y));
@@ -1853,9 +1845,9 @@ impl<'a> PlotWidget<'a> {
 		backend.stroke_path(&axes_path, halo_stroke);
 		backend.stroke_path(&axes_path, axis_stroke);
 		for (i, cat) in x_categories.iter().enumerate() {
-			let (p, _bw, bh) = transform.categorical_2d(i, 0);
+			let (p, _bw, _bh) = transform.categorical_2d(i, 0);
 			let tick_x = p.x;
-			let tick_y = p.y + bh / 2.0;
+			let tick_y = transform.bounds.height;
 			backend.stroke_path(
 				&|builder| {
 					builder.move_to(Point::new(tick_x, tick_y));

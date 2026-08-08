@@ -94,11 +94,12 @@ impl PlotKernel for StackedBarPlotKernel {
 				} else {
 					0.0
 				};
-				let total_band_height = transform.bounds.height / num_cats as f32;
+				let (_, total_band_height) = transform.categorical(0, x_base);
 				let bar_height = total_band_height * 0.8;
 				let bar_offset = (total_band_height - bar_height) / 2.0;
 				for i in 0..num_cats {
-					let cat_top = (num_cats - 1 - i) as f32 * total_band_height + bar_offset;
+					let (category_center, _) = transform.categorical(i, x_base);
+					let cat_top = category_center.y - total_band_height / 2.0 + bar_offset;
 					let mut current_x = x_base;
 					for j in 0..num_groups {
 						let val = self.prepared_data.category_values[i][j];
