@@ -14,23 +14,34 @@ cap denominated in milliseconds.
 
 ## Decision
 
-1. **The server wall clock becomes a no-progress bound.** The budget timer resets on each unit
-   of progress (a batch encoded, a location chunk scanned); it expires only when a scan makes
-   no progress for the bound's duration. A progressing full-table scan can no longer die by
-   lifetime; a stalled one still dies, with the typed status ADR 540 gives it.
+1. **Two clocks, separately owned, enforced concurrently.** They are different quantities and
+   are never reduced to "the tighter of" two comparable durations:
 
-2. **Toron owns the end-to-end deadline.** If a caller has a deadline, Toron propagates it in
-   the query metadata and Wendelon honors the tighter of caller deadline and local policy. The
-   server's own defaults bound *stall*, not *totality*; only the caller knows how long the
-   whole query may take, because only the caller knows the query.
+   - *Wendelon's no-progress timeout* is sliding: it resets on each unit of progress (a batch
+     encoded, a location chunk scanned) and expires only when a scan makes no progress for the
+     bound's duration. A progressing full-table scan can no longer die by lifetime; a stalled
+     one still dies.
+   - *The caller's end-to-end deadline* is absolute and non-resetting: Toron owns it,
+     propagates it in the query metadata, and Wendelon enforces it as a hard instant
+     regardless of progress. Only the caller knows how long the whole query may take, because
+     only the caller knows the query. Absent a caller deadline, there is no total wall-clock
+     cap — totality is bounded by the caller budget or not at all.
 
-3. **No pagination.** The ADR 118 streaming contract stays as the one shape for large results;
+2. **No pagination.** The ADR 118 streaming contract stays as the one shape for large results;
    this ADR fixes the budget semantics inside it rather than adding a second result-transfer
    mechanism with its own consistency questions.
 
-4. **Location and row caps keep their meaning.** `max_locations` and `max_rows` remain
-   explicit, caller-visible budgets in the config-owned budget lineage; this ADR neither
-   raises nor hides them. What changes is only the clock's semantics.
+3. **`max_locations` and `max_rows` stop being total caps.** Today they are hard-coded
+   Wendelon totals — leaving them "unchanged" would merely swap a milliseconds-denominated
+   table-size ceiling for a row-denominated one. Under the streaming design they become
+   bounded work-per-progress/yield limits: how much the server does between progress points,
+   not how much a query may touch in total. Only a propagated caller budget may impose a
+   total query cap.
+
+4. **Every expiry is attributable.** No-progress timeout, caller-deadline expiry, and
+   caller-budget exhaustion are distinct failure reasons, each surfacing through ADR 540's
+   typed status boundary. Collapsing them into one indistinguishable failure is exactly the
+   defect class this arc keeps finding, and it is unrepresentable here by construction.
 
 ## Grounding
 
@@ -54,11 +65,17 @@ this arc.
 2. An artificially stalled scan fails with the typed no-progress status within the bound.
 3. A caller deadline tighter than server policy is honored; a caller deadline looser than the
    stall bound does not resurrect lifetime-style failures.
-4. The ADR 0539 deployment confirmation rerun — with an explicitly created secondary index and
-   induced slab rotation — passes its readable-tables acceptance and records the declared
-   gap-gauge measurements. ADR 0539's own text stays immutable; its Acceptance 6 is met by
-   this rerun or not at all.
-5. Standard Wendelon, Toron, architecture, format and full `--no-fail-fast` gates pass.
+4. Each expiry cause is discriminable in a test: a stalled scan yields the no-progress
+   status; an expired caller deadline yields the deadline status; an exhausted caller budget
+   yields the budget status. One fixture per cause; no shared assertion.
+5. The ADR 0539 deployment confirmation rerun passes under a tightened gate: create the
+   secondary index explicitly; **wait until its gap-gauge series exists before the measured
+   window opens — a missing series is a failed run, not an explanatory result**; sustain both
+   ingest and indexed lookups through the window; span at least one induced slab rotation
+   across 60-second scrapes; and record the gap wall-time fraction, the refusal-counter
+   delta, and the gauge-versus-uncovered divergence. ADR 0539's own text stays immutable; its
+   Acceptance 6 is met by this rerun or not at all.
+6. Standard Wendelon, Toron, architecture, format and full `--no-fail-fast` gates pass.
 
 ## Guardrails
 
