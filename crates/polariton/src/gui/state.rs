@@ -7,10 +7,12 @@ use crate::adapters::{
 use crate::configuration::{self, StartupData};
 use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
+#[cfg(all(test, feature = "toron"))]
+use crate::gui::table_skin::TableSkin;
 #[cfg(test)]
 use crate::gui::table_skin::TableSkinProjectionError;
 #[cfg(feature = "toron")]
-use crate::gui::table_skin::{TableSkin, TableSkinCascade, TableSkinProjection, TableSkinSpec};
+use crate::gui::table_skin::{TableSkinCascade, TableSkinProjection, TableSkinSpec};
 use crate::gui::{
 	components,
 	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
@@ -46,9 +48,9 @@ use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
 	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans,
-	RunePlotMinorTickSpans, RunePlotTickStepSpans, RuneTableSkinIntent, RuneTableSkinProjection,
-	RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink,
-	TransformedRuneRelation, TransformedRuneView, ViewPresentation,
+	RunePlotMinorTickSpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
+	RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
+	StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView, ViewPresentation,
 	transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
@@ -1255,14 +1257,19 @@ fn rune_table_skin_authored(
 }
 
 #[cfg(feature = "toron")]
-fn resolve_rune_table_skin(intent: RuneTableSkinIntent) -> std::result::Result<TableSkin, String> {
-	TableSkinCascade {
-		authored: rune_table_skin_authored(intent),
+fn resolve_rune_table(
+	intent: RuneTableSink,
+) -> std::result::Result<crate::gui::messages::RuneTablePresentation, String> {
+	let completion = TableSkinCascade {
+		authored: rune_table_skin_authored(intent.skin),
 		..TableSkinCascade::default()
 	}
 	.resolve_through_authored()
-	.map(|completion| completion.skin)
-	.map_err(|error| error.to_string())
+	.map_err(|error| error.to_string())?;
+	Ok(crate::gui::messages::RuneTablePresentation {
+		skin: completion.skin,
+		authored_show_column_types: intent.show_column_types,
+	})
 }
 
 #[cfg(all(test, feature = "toron"))]
@@ -1304,7 +1311,7 @@ fn rune_view_outcome_with_palettes(
 			};
 			let (output, tick_step_output_span, minor_tick_output_span) = match view.intent {
 				RuneViewIntent::Table(table) => (
-					resolve_rune_table_skin(table.skin).map(RuneRelationSinkOutput::Table),
+					resolve_rune_table(table).map(RuneRelationSinkOutput::Table),
 					None,
 					RunePlotMinorTickSpans::default(),
 				),
@@ -2243,14 +2250,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.expect("a dispatched view has a prepared host panel");
 						let sink_facet = sink.facet.clone();
 						match sink.output {
-							Ok(RuneRelationSinkOutput::Table(skin)) => {
+							Ok(RuneRelationSinkOutput::Table(presentation)) => {
 								let frame = sink.source.as_ref().clone();
 								let rows = frame.height();
 								let cols = frame.width();
-								app_state.code_editor.set_rune_view_table_with_skin(
+								app_state.code_editor.set_rune_view_table_with_presentation(
 									panel_id,
 									frame.clone(),
-									skin,
+									presentation.skin,
+									presentation.authored_show_column_types,
 								);
 								app_state.data_frame = frame;
 								app_state.status_df_size = Some((rows, cols));
@@ -3615,7 +3623,11 @@ mod tests {
 		else {
 			panic!("first sink must remain the default table");
 		};
-		assert_eq!(*table_skin, TableSkin::DEFAULT);
+		assert_eq!(table_skin.skin, TableSkin::DEFAULT);
+		assert_eq!(
+			table_skin.authored_show_column_types,
+			crate::plot::spec::Override::Inherit
+		);
 		for (sink, expected) in
 			outcome.sinks[1..]
 				.iter()
@@ -3642,6 +3654,52 @@ mod tests {
 					.is_some()
 			);
 		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0052_completion_retains_authored_type_intent_without_resolving_application_state() {
+		let relation = transform_rune_view(
+			"workspace.table(\"t\").views([table().show_types(), table().skin(\"nord\").show_types(), table()])",
+		)
+		.expect("three table presentations")
+		.into_relations()
+		.next()
+		.expect("one relation");
+		let outcome = rune_view_outcome(
+			polars::df!("value" => [1_i64]).expect("table frame"),
+			relation.views,
+		);
+		let presentations = outcome
+			.sinks
+			.iter()
+			.map(|sink| {
+				let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(presentation)) =
+					&sink.output
+				else {
+					panic!("every sink must complete as a table");
+				};
+				presentation
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			presentations[0].authored_show_column_types,
+			crate::plot::spec::Override::Set(true)
+		);
+		assert_eq!(presentations[0].skin, TableSkin::DEFAULT);
+		assert_eq!(
+			presentations[1].authored_show_column_types,
+			crate::plot::spec::Override::Set(true)
+		);
+		assert_eq!(
+			presentations[1].skin,
+			TableSkin::from_theme_name("nord", TableSkinProjection::PaletteForward).unwrap()
+		);
+		assert_eq!(
+			presentations[2].authored_show_column_types,
+			crate::plot::spec::Override::Inherit
+		);
+		assert_eq!(presentations[2].skin, TableSkin::DEFAULT);
 	}
 
 	#[cfg(feature = "toron")]
@@ -3896,7 +3954,7 @@ mod tests {
 			panic!("styled table must resolve");
 		};
 		assert_eq!(
-			*styled,
+			styled.skin,
 			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::PaletteForward)
 				.unwrap()
 		);
@@ -3905,17 +3963,17 @@ mod tests {
 		else {
 			panic!("bare table must resolve");
 		};
-		assert_eq!(*default, TableSkin::DEFAULT);
+		assert_eq!(default.skin, TableSkin::DEFAULT);
 		let Ok(crate::gui::messages::RuneRelationSinkOutput::Table(authored)) =
 			&outcome.sinks[2].output
 		else {
 			panic!("defined authored palette must render");
 		};
 		assert_eq!(
-			*authored,
+			authored.skin,
 			TableSkin::from_theme_name("dark2_s1", TableSkinProjection::PaletteForward).unwrap()
 		);
-		assert!(!authored.passes_contrast());
+		assert!(!authored.skin.passes_contrast());
 		assert!(matches!(
 			outcome.sinks[3].output,
 			Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(..))
@@ -4165,7 +4223,7 @@ ket.table("test2") // Comment Test1.
 			panic!("test1 table must complete with its skin");
 		};
 		assert_eq!(
-			*skin,
+			skin.skin,
 			TableSkin::from_theme_name("terrain_rs10", TableSkinProjection::PaletteForward)
 				.unwrap()
 		);
@@ -4186,7 +4244,7 @@ ket.table("test2") // Comment Test1.
 		else {
 			panic!("test2 table must remain default-skinned");
 		};
-		assert_eq!(*skin, TableSkin::DEFAULT);
+		assert_eq!(skin.skin, TableSkin::DEFAULT);
 		assert!(matches!(
 			second.sinks[1].output,
 			Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(..))

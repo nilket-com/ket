@@ -49,9 +49,19 @@ pub(crate) enum RuneTableSkinIntent {
 	},
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuneTableSink {
 	pub(crate) skin: RuneTableSkinIntent,
+	pub(crate) show_column_types: Override<bool>,
+}
+
+impl Default for RuneTableSink {
+	fn default() -> Self {
+		Self {
+			skin: RuneTableSkinIntent::Default,
+			show_column_types: Override::Inherit,
+		}
+	}
 }
 
 #[derive(Clone, Debug)]
@@ -2342,6 +2352,7 @@ fn parse_modified_table(
 
 	let mut skin_name = None;
 	let mut duotone = false;
+	let mut show_column_types = Override::Inherit;
 	for (modifier, call) in modifiers {
 		match modifier {
 			"skin" => {
@@ -2387,32 +2398,55 @@ fn parse_modified_table(
 				}
 				duotone = true;
 			}
+			"show_types" => {
+				if matches!(show_column_types, Override::Set(_)) {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"show_types() may appear at most once on a table sink",
+					);
+				}
+				if !call.args.is_empty() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"show_types() takes no arguments",
+					);
+				}
+				show_column_types = Override::Set(true);
+			}
 			_ => {
 				return invalid_view(
 					expression.span(),
 					source.len(),
 					format!(
-						"unknown table modifier {modifier:?}; expected skin(string_literal) or duotone()"
+						"unknown table modifier {modifier:?}; expected skin(string_literal), duotone(), or show_types()"
 					),
 				);
 			}
 		}
 	}
 
-	let Some(name) = skin_name else {
+	if duotone && skin_name.is_none() {
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"a modified table sink requires skin(string_literal)",
+			"duotone() requires skin(string_literal)",
 		);
-	};
-	let projection = if duotone {
-		RuneTableSkinProjection::Duotone
+	}
+	let skin = if let Some(name) = skin_name {
+		let projection = if duotone {
+			RuneTableSkinProjection::Duotone
+		} else {
+			RuneTableSkinProjection::PaletteForward
+		};
+		RuneTableSkinIntent::NamedTheme { name, projection }
 	} else {
-		RuneTableSkinProjection::PaletteForward
+		RuneTableSkinIntent::Default
 	};
 	Ok(Some(RuneTableSink {
-		skin: RuneTableSkinIntent::NamedTheme { name, projection },
+		skin,
+		show_column_types,
 	}))
 }
 
@@ -5366,6 +5400,93 @@ workspace.table("t").views([table()])
 				"{sink}"
 			);
 		}
+	}
+
+	#[test]
+	fn product_0052_show_types_has_no_skin_dependency_and_the_register_remains_a_set() {
+		let transformed = transform(
+			"workspace.table(\"t\").views([table().show_types(), view(\"named\", table().skin(\"nord\").show_types()), table().show_types().skin(\"nord\").duotone(), table().duotone().show_types().skin(\"nord\"), table()])",
+		)
+		.expect("authored table type visibility forms");
+		assert_eq!(transformed.views.len(), 5);
+
+		let RuneViewIntent::Table(types_only) = &transformed.views[0].intent else {
+			panic!("first sink must remain a table");
+		};
+		assert_eq!(types_only.skin, RuneTableSkinIntent::Default);
+		assert_eq!(types_only.show_column_types, Override::Set(true));
+
+		let RuneViewIntent::Table(named) = &transformed.views[1].intent else {
+			panic!("named sink must remain a table");
+		};
+		assert_eq!(named.show_column_types, Override::Set(true));
+		assert_eq!(
+			named.skin,
+			RuneTableSkinIntent::NamedTheme {
+				name: "nord".to_owned(),
+				projection: RuneTableSkinProjection::PaletteForward,
+			}
+		);
+		assert_eq!(
+			transformed.views[2].intent, transformed.views[3].intent,
+			"equal modifier sets must flatten identically in either order"
+		);
+		let RuneViewIntent::Table(duotone) = &transformed.views[2].intent else {
+			panic!("duotone sink must remain a table");
+		};
+		assert_eq!(duotone.show_column_types, Override::Set(true));
+		assert_eq!(
+			duotone.skin,
+			RuneTableSkinIntent::NamedTheme {
+				name: "nord".to_owned(),
+				projection: RuneTableSkinProjection::Duotone,
+			}
+		);
+		assert_eq!(
+			transformed.views[4].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
+	}
+
+	#[test]
+	fn product_0052_show_types_refusals_are_atomic_and_duotone_owns_its_dependency() {
+		for (sink, message) in [
+			("table().show_types(1)", "show_types() takes no arguments"),
+			(
+				"table().show_types().show_types()",
+				"show_types() may appear at most once on a table sink",
+			),
+			(
+				"table().duotone().show_types()",
+				"duotone() requires skin(string_literal)",
+			),
+		] {
+			let source =
+				format!("workspace.table(\"t\").views([table(), {sink}, line(\"x\", \"y\")])");
+			let error = transform(&source).expect_err("invalid modifier must refuse the view list");
+			let RuneEnvelopeError::InvalidView {
+				span,
+				message: actual,
+			} = error
+			else {
+				panic!("expected an attributed table modifier refusal");
+			};
+			let expected_start = source.find(sink).unwrap() as u32;
+			assert_eq!(span, expected_start..expected_start + sink.len() as u32);
+			assert_eq!(actual, message);
+		}
+
+		let source = r#"
+let held = table().show_types();
+consume(table().show_types());
+workspace.table("t").views([table()])
+"#;
+		let transformed = transform(source).expect("one proven default table view");
+		assert!(transformed.source.contains("table().show_types()"));
+		assert_eq!(
+			transformed.views[0].intent,
+			RuneViewIntent::Table(RuneTableSink::default())
+		);
 	}
 
 	#[test]

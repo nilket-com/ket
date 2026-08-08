@@ -723,10 +723,11 @@ fn product_0023_table_artifact_is_the_atomic_host_and_markdown_boundary() {
 		.expect("TableArtifact body");
 	assert!(artifact.contains("frame: Box<DataFrame>"));
 	assert!(artifact.contains("skin: TableSkin"));
+	assert!(artifact.contains("authored_show_column_types: Override<bool>"));
 	assert_eq!(
 		artifact.matches(':').count(),
-		2,
-		"the artifact owns one frame and one skin"
+		3,
+		"the artifact owns one frame, one skin, and one authored type intent"
 	);
 	assert_eq!(
 		production.matches("Table(TableArtifact)").count(),
@@ -795,15 +796,15 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 	assert!(!envelope_production.contains("ResolvedThemePalette"));
 
 	let messages = std::fs::read_to_string(root.join("gui/messages.rs")).expect("read messages");
-	assert!(messages.contains("Table(TableSkin)"));
+	assert!(messages.contains("Table(RuneTablePresentation)"));
 	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
 	let state_production = state
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("production GUI state source");
-	assert!(state_production.contains("resolve_rune_table_skin"));
+	assert!(state_production.contains("resolve_rune_table"));
 	assert!(state_production.contains("TableSkinCascade"));
-	assert!(state_production.contains("set_rune_view_table_with_skin"));
+	assert!(state_production.contains("set_rune_view_table_with_presentation"));
 
 	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read editor");
 	let editor_production = editor
@@ -908,7 +909,8 @@ fn product_0027_surface_keeps_projection_intent_bounded_and_plot_registers_close
 	));
 	assert!(envelope_production.contains("\"duotone\" =>"));
 	assert!(envelope_production.contains("\"duotone() takes no arguments\""));
-	assert!(envelope_production.contains("let Some(name) = skin_name else"));
+	assert!(envelope_production.contains("if duotone && skin_name.is_none()"));
+	assert!(envelope_production.contains("\"duotone() requires skin(string_literal)\""));
 
 	let mark_register = envelope_production
 		.split("fn parse_modified_mark(")

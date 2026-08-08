@@ -1,6 +1,6 @@
 # ADR 0052: authored table column types
 
-Status: proposed 2026-08-08. This record adds the opt-in `.show_types()` table
+Status: accepted 2026-08-08. This record adds the opt-in `.show_types()` table
 member without changing the application setting or any existing pixels.
 
 ## Context
@@ -134,6 +134,39 @@ the skin artifact.
    image or SVG is refreshed; any default pixel change fails the record.
 8. SQL, Markdown, table scrolling, column resizing, selection, skin projection,
    plot behavior, identity, and destination failure semantics pass unchanged.
+
+## Implementation evidence
+
+- `RuneTableSink` carries `show_column_types: Override<bool>`. The closed
+  register accepts the zero-argument member alone or in any order with skin
+  members; only `duotone` checks for its named-skin dependency. Full-chain
+  spans and exact diagnostics gate wrong arity, duplication, and missing skin.
+- `RuneTablePresentation` crosses completion with the resolved `TableSkin` and
+  the unresolved authored visibility intent. `TableArtifact` retains those two
+  values with its frame. The production ordinary and Markdown draw paths both
+  call the same artifact resolver against the application boolean.
+- Five PRODUCT-0052 tests cover register normalization and refusal, the
+  completion handoff, the two-authority matrix across already-completed Rune,
+  SQL, and Markdown artifacts, stale retention, synthetic `Set(false)`, and
+  the existing renderer's semantic text, vertical position, and `type_text`
+  color. The matrix reuses each artifact at both application values; no
+  recompletion hides a baked boolean.
+- The default draw and an explicit false draw have byte-identical operation
+  signatures. PRODUCT-0023's full pre-extraction operation oracle and every
+  other existing draw baseline pass without changing one expected byte.
+- `crates/polariton/README.md` documents `.show_types()` and removes the stale
+  column-type-label backlog entry while retaining the application-wide
+  configuration example.
+
+Three architecture expectations are premise updates, not product changes:
+PRODUCT-0023's artifact census now names frame, resolved skin, and authored
+type intent instead of exactly two fields; its head handoff now names
+`RuneTablePresentation` instead of a bare `TableSkin`; and PRODUCT-0027's old
+all-modifiers skin prerequisite now asserts `duotone`'s member-local dependency.
+All 40 architecture gates pass. No image, SVG, or operation-oracle constant was
+refreshed. The full workspace suite passes; its Polariton portion is 435 unit
+tests passed (five live tests ignored), 40 architecture tests, and the trybuild
+UI pair.
 
 ## Stop condition
 

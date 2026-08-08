@@ -14,6 +14,7 @@ use crate::gui::{
 };
 use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
+use crate::plot::spec::Override;
 #[cfg(feature = "toron")]
 use crate::plot::spec::Presence;
 #[cfg(feature = "toron")]
@@ -995,16 +996,31 @@ impl CodeEditor {
 		self.set_rune_view_table_with_skin(panel_id, frame, TableSkinCascade::library_floor());
 	}
 
-	#[cfg(feature = "toron")]
+	#[cfg(all(test, feature = "toron"))]
 	pub fn set_rune_view_table_with_skin(
 		&mut self,
 		panel_id: HostPanelId,
 		frame: DataFrame,
 		skin: TableSkin,
 	) {
+		self.set_rune_view_table_with_presentation(panel_id, frame, skin, Override::Inherit);
+	}
+
+	#[cfg(feature = "toron")]
+	pub fn set_rune_view_table_with_presentation(
+		&mut self,
+		panel_id: HostPanelId,
+		frame: DataFrame,
+		skin: TableSkin,
+		authored_show_column_types: Override<bool>,
+	) {
 		self.panels.set_content(
 			panel_id,
-			PanelContent::Table(TableArtifact::new(frame, skin)),
+			PanelContent::Table(TableArtifact::with_authored_column_types(
+				frame,
+				skin,
+				authored_show_column_types,
+			)),
 		);
 	}
 
@@ -2539,13 +2555,30 @@ struct PanelEntry {
 struct TableArtifact {
 	frame: Box<DataFrame>,
 	skin: TableSkin,
+	authored_show_column_types: Override<bool>,
 }
 
 impl TableArtifact {
 	fn new(frame: DataFrame, skin: TableSkin) -> Self {
+		Self::with_authored_column_types(frame, skin, Override::Inherit)
+	}
+
+	fn with_authored_column_types(
+		frame: DataFrame,
+		skin: TableSkin,
+		authored_show_column_types: Override<bool>,
+	) -> Self {
 		Self {
 			frame: Box::new(frame),
 			skin,
+			authored_show_column_types,
+		}
+	}
+
+	fn resolve_show_column_types(&self, application: bool) -> bool {
+		match self.authored_show_column_types {
+			Override::Inherit => application,
+			Override::Set(authored) => authored,
 		}
 	}
 }
@@ -2832,7 +2865,7 @@ impl PanelRegistry {
 					0,
 					self.table_skin_at_draw(panel.panel_id, artifact.skin),
 				)
-				.show_column_types(show_column_types)
+				.show_column_types(artifact.resolve_show_column_types(show_column_types))
 				.scroll_request(
 					self.panels
 						.get(&panel.panel_id)
@@ -3963,7 +3996,7 @@ fn markdown_cell_output_surface<'a>(
 			.into(),
 		NotebookCellOutput::Table(artifact) => {
 			Table::new(artifact.frame.as_ref(), 0, artifact.skin)
-				.show_column_types(show_column_types)
+				.show_column_types(artifact.resolve_show_column_types(show_column_types))
 				.into()
 		}
 		NotebookCellOutput::Plot { surface } => {
@@ -6727,7 +6760,7 @@ mod tests {
 		};
 		let first = polars::df!("n" => [1_i64]).expect("first frame");
 		let second = polars::df!("n" => [2_i64, 3]).expect("second frame");
-		let assert_pair = |content: &PanelContent, first_value, height, skin| {
+		let assert_pair = |content: &PanelContent, first_value, height, skin, types| {
 			let PanelContent::Table(artifact) = content else {
 				panic!("completed table content must retain one table artifact")
 			};
@@ -6743,6 +6776,7 @@ mod tests {
 				Some(first_value)
 			);
 			assert_eq!(artifact.skin, skin);
+			assert_eq!(artifact.authored_show_column_types, types);
 		};
 
 		let mut editor = CodeEditor::new("select 1;");
@@ -6752,6 +6786,7 @@ mod tests {
 			1,
 			1,
 			TableSkin::DEFAULT,
+			crate::plot::spec::Override::Inherit,
 		);
 		editor.set_query_result_with_skin(second.clone(), alternate_skin);
 		assert_pair(
@@ -6759,6 +6794,7 @@ mod tests {
 			2,
 			2,
 			alternate_skin,
+			crate::plot::spec::Override::Inherit,
 		);
 		editor.panels.fail_or_stale(super::RESULT_PANEL);
 		assert_pair(
@@ -6766,6 +6802,7 @@ mod tests {
 			2,
 			2,
 			alternate_skin,
+			crate::plot::spec::Override::Inherit,
 		);
 		assert_eq!(
 			editor.panels.panels[&super::RESULT_PANEL].status,
@@ -6774,13 +6811,19 @@ mod tests {
 
 		let rune_panel = HostPanelId::new(99);
 		editor.set_rune_view_table_with_skin(rune_panel, first.clone(), TableSkin::DEFAULT);
-		editor.set_rune_view_table_with_skin(rune_panel, second.clone(), alternate_skin);
+		editor.set_rune_view_table_with_presentation(
+			rune_panel,
+			second.clone(),
+			alternate_skin,
+			crate::plot::spec::Override::Set(true),
+		);
 		editor.panels.fail_or_stale(rune_panel);
 		assert_pair(
 			&editor.panels.panels[&rune_panel].content,
 			2,
 			2,
 			alternate_skin,
+			crate::plot::spec::Override::Set(true),
 		);
 		assert_eq!(editor.panels.panels[&rune_panel].status, PanelStatus::Stale);
 
@@ -6795,6 +6838,71 @@ mod tests {
 		};
 		assert_eq!(artifact.frame.height(), 2);
 		assert_eq!(artifact.skin, alternate_skin);
+		assert_eq!(
+			artifact.authored_show_column_types,
+			crate::plot::spec::Override::Inherit
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0052_completed_tables_preserve_the_live_application_authority() {
+		use libaryon::engine::HostPanelId;
+		use libaryon::uast::projection::MarkdownCellIdentity;
+
+		let frame = polars::df!("value" => [1_i64]).expect("table frame");
+		let mut editor = CodeEditor::new("select 1;");
+		editor.set_query_result(frame.clone());
+		let PanelContent::Table(query) = &editor.panels.panels[&super::RESULT_PANEL].content else {
+			panic!("SQL result must complete as a table");
+		};
+		assert!(!query.resolve_show_column_types(false));
+		assert!(query.resolve_show_column_types(true));
+
+		let markdown_identity = MarkdownCellIdentity::Explicit {
+			id: "types".to_owned(),
+		};
+		editor.set_markdown_cell_table(markdown_identity.clone(), frame.clone());
+		let Some(NotebookCellOutput::Table(markdown)) =
+			editor.notebook_outputs.get(&markdown_identity)
+		else {
+			panic!("Markdown result must complete as a table");
+		};
+		assert!(!markdown.resolve_show_column_types(false));
+		assert!(markdown.resolve_show_column_types(true));
+
+		let inherited_panel = HostPanelId::new(150);
+		editor.set_rune_view_table_with_presentation(
+			inherited_panel,
+			frame.clone(),
+			TableSkin::DEFAULT,
+			crate::plot::spec::Override::Inherit,
+		);
+		let PanelContent::Table(inherited) = &editor.panels.panels[&inherited_panel].content else {
+			panic!("bare Rune sink must complete as a table");
+		};
+		assert!(!inherited.resolve_show_column_types(false));
+		assert!(inherited.resolve_show_column_types(true));
+
+		let authored_panel = HostPanelId::new(151);
+		editor.set_rune_view_table_with_presentation(
+			authored_panel,
+			frame,
+			TableSkin::DEFAULT,
+			crate::plot::spec::Override::Set(true),
+		);
+		let PanelContent::Table(authored) = &editor.panels.panels[&authored_panel].content else {
+			panic!("authored Rune sink must complete as a table");
+		};
+		assert!(authored.resolve_show_column_types(false));
+		assert!(authored.resolve_show_column_types(true));
+
+		let synthetic_hidden = super::TableArtifact::with_authored_column_types(
+			polars::df!("value" => [1_i64]).expect("synthetic frame"),
+			TableSkin::DEFAULT,
+			crate::plot::spec::Override::Set(false),
+		);
+		assert!(!synthetic_hidden.resolve_show_column_types(true));
 	}
 
 	#[test]

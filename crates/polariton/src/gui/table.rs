@@ -1281,13 +1281,16 @@ mod tests {
 		bounds: Rectangle,
 	}
 
-	fn product_0023_recorded_table_draw(skin: TableSkin) -> RecordedTableDraw {
+	fn recorded_table_draw(skin: TableSkin, show_column_types: Option<bool>) -> RecordedTableDraw {
 		let frame = polars::df!(
 			"category" => ["A", "B", "C", "D"],
 			"value" => [1_i64, 2, 3, 4],
 		)
 		.expect("table draw fixture");
-		let table = Table::new(&frame, 0, skin).show_column_types(true);
+		let table = match show_column_types {
+			Some(show) => Table::new(&frame, 0, skin).show_column_types(show),
+			None => Table::new(&frame, 0, skin),
+		};
 		let bounds = Rectangle::new(Point::new(10.0, 20.0), Size::new(120.0, 120.0));
 		let mut tree = Tree {
 			tag: tree::Tag::of::<TableState>(),
@@ -1320,6 +1323,10 @@ mod tests {
 			operation_layers: renderer.operation_layers,
 			bounds,
 		}
+	}
+
+	fn product_0023_recorded_table_draw(skin: TableSkin) -> RecordedTableDraw {
+		recorded_table_draw(skin, Some(true))
 	}
 
 	fn product_0023_recorded_table_operations(skin: TableSkin) -> Vec<PaintOperation> {
@@ -1487,6 +1494,35 @@ fill 38.00,130.00,42.58,8.00 #8c00fa/0.50"##;
 				"missing styled role {role:?}"
 			);
 		}
+	}
+
+	#[test]
+	fn product_0052_type_visibility_uses_the_existing_draw_path_and_keeps_default_pixels() {
+		let default = recorded_table_draw(TableSkin::DEFAULT, None).operations;
+		let explicit_hidden = recorded_table_draw(TableSkin::DEFAULT, Some(false)).operations;
+		assert_eq!(
+			product_0023_operation_signature(&default),
+			product_0023_operation_signature(&explicit_hidden),
+			"the default-false table draw must remain byte-identical"
+		);
+
+		let visible = recorded_table_draw(TableSkin::DEFAULT, Some(true)).operations;
+		let type_label = visible.iter().find_map(|operation| match operation {
+			PaintOperation::Text {
+				content,
+				color,
+				position,
+				..
+			} if content == "str" => Some((*color, *position)),
+			_ => None,
+		});
+		let (color, position) = type_label.expect("existing semantic type label");
+		assert_eq!(color, skin_color(TableSkin::DEFAULT.type_text));
+		assert_eq!(position.y, 60.0);
+		assert!(default.iter().all(|operation| !matches!(
+			operation,
+			PaintOperation::Text { content, .. } if content == "str"
+		)));
 	}
 
 	fn assert_close(actual: f32, expected: f32) {

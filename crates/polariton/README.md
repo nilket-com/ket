@@ -47,6 +47,20 @@ while `:init0` restores the editor defaults.
 Missing configuration is a clean no-op. A broken script is reported in the
 status bar while Polariton still opens with compiled defaults.
 
+#### Rune table presentation:
+
+The application setting applies to every table. A Rune table can opt in
+independently in a proven view position:
+
+```rune
+workspace.table("events").views([
+    table().show_types(),
+])
+```
+
+`.show_types()` composes in either order with the table's `.skin(...)` and
+`.duotone()` members.
+
 #### Adapters:
  - SQLite (file or memory)
  - Parquet (single file)
@@ -59,7 +73,6 @@ status bar while Polariton still opens with compiled defaults.
  - Shift+Enter to run code
  - Tab/Shift+Tab gui navigation
  - Improved status bar
- - Column type labels
  - Sort / Filter by column
  - Run selected code, not the entire code editor.
  - Password protection.
