@@ -72,9 +72,9 @@ use crate::schema::{
 	TableDescriptorListResponseMeta, TableObjectId, TableOptimizerFacts,
 	TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
 	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
-	TableQueryRequestMeta, TableSchemaDescriptor, TableWriteRequestMeta, TableWriteResponseMeta,
-	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
-	column_projection_prefix_ranges, decode_table_optimizer_facts,
+	TableQueryRequestMeta, TableReferenceIntegrityFailureMeta, TableSchemaDescriptor,
+	TableWriteRequestMeta, TableWriteResponseMeta, TenantId, WriteRequestMeta, WriteResponseMeta,
+	WriteStatus, WriterNodeId, column_projection_prefix_ranges, decode_table_optimizer_facts,
 	decode_table_schema_descriptor_v1, read_key_schema, read_value_schema,
 	table_spread_prefix_ranges, validate_table_write_request_batch, write_payload_schema,
 };
@@ -108,6 +108,31 @@ pub const FINALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(40);
 pub const LEASE_REFRESH_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 /// Small pause before retrying a bounded post-auth admission miss.
 pub const BACKPRESSURE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Structured terminal query error for an acknowledged table reference whose
+/// backing slab is no longer resolvable. This survives the native wire
+/// boundary so higher layers do not have to infer corruption from an I/O
+/// string.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableReferenceIntegrityQueryError {
+	pub failure: TableReferenceIntegrityFailureMeta,
+}
+
+impl std::fmt::Display for TableReferenceIntegrityQueryError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(
+			f,
+			"Wendelon table reference integrity failure: tenant={} table={:02x?} reference_kind={} missing_slab={} origin={}",
+			self.failure.tenant_id.get(),
+			self.failure.table_object_id,
+			self.failure.reference_kind,
+			self.failure.missing_slab_id,
+			self.failure.origin,
+		)
+	}
+}
+
+impl std::error::Error for TableReferenceIntegrityQueryError {}
 
 // ============================================================
 //  CONFIG
@@ -2061,14 +2086,10 @@ impl StreamingQueryResult {
 					"query terminal response meta too small",
 				));
 			}
-			if frame.trailing.is_some() {
-				return Err(Error::new(
-					ErrorKind::InvalidData,
-					"QUERY_RESP continuation must not carry trailing bytes",
-				));
-			}
 			let ack: &QueryResponseMeta =
 				bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+			let integrity_failure =
+				decode_table_reference_integrity_failure(ack.status, frame.trailing.as_deref())?;
 			if frame.header.arrow_len != ack.arrow_len {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
@@ -2089,7 +2110,7 @@ impl StreamingQueryResult {
 						None => Ok(None),
 					}
 				}
-				other => Err(query_failure_error(other)),
+				other => Err(query_failure_error_with_integrity(other, integrity_failure)),
 			};
 		}
 		if frame.trailing.is_some() {
@@ -2126,6 +2147,34 @@ impl StreamingQueryResult {
 	pub async fn collect_all(mut self) -> std::io::Result<Vec<RecordBatch>> {
 		self.drain_all().await
 	}
+}
+
+fn decode_table_reference_integrity_failure(
+	status: ReadStatus,
+	trailing: Option<&[u8]>,
+) -> std::io::Result<Option<TableReferenceIntegrityFailureMeta>> {
+	if status != ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED {
+		if trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"QUERY_RESP must not carry trailing bytes outside a table integrity failure",
+			));
+		}
+		return Ok(None);
+	}
+	let trailing = trailing.ok_or_else(|| {
+		Error::new(
+			ErrorKind::InvalidData,
+			"table reference integrity response missing diagnostic trailer",
+		)
+	})?;
+	if trailing.len() != std::mem::size_of::<TableReferenceIntegrityFailureMeta>() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"table reference integrity response diagnostic length is invalid",
+		));
+	}
+	Ok(Some(bytemuck::pod_read_unaligned(trailing)))
 }
 
 impl WendelonClient {
@@ -2380,6 +2429,21 @@ fn query_failure_error(status: ReadStatus) -> Error {
 	}
 }
 
+fn query_failure_error_with_integrity(
+	status: ReadStatus,
+	failure: Option<TableReferenceIntegrityFailureMeta>,
+) -> Error {
+	if status == ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED {
+		return Error::new(
+			ErrorKind::InvalidData,
+			TableReferenceIntegrityQueryError {
+				failure: failure.expect("integrity status requires decoded diagnostic"),
+			},
+		);
+	}
+	query_failure_error(status)
+}
+
 fn decode_initial_query_response(
 	resp: crate::network::core::HrftFrame,
 	stream: Box<dyn TransportStream>,
@@ -2403,14 +2467,10 @@ fn decode_initial_query_response(
 			"query response meta too small",
 		));
 	}
-	if resp.trailing.is_some() {
-		return Err(Error::new(
-			ErrorKind::InvalidData,
-			"query response must not carry trailing bytes",
-		));
-	}
 	let ack: &QueryResponseMeta =
 		bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+	let integrity_failure =
+		decode_table_reference_integrity_failure(ack.status, resp.trailing.as_deref())?;
 	let is_end = (resp.header.flags & FRAME_FLAG_STREAM_END) != 0;
 	let retry = retry_read_status(ack.status, ack.leader_hint);
 
@@ -2459,7 +2519,7 @@ fn decode_initial_query_response(
 			meta_mode,
 			_table_query_attempt_guard: attempt_guard,
 		})),
-		other => Err(query_failure_error(other)),
+		other => Err(query_failure_error_with_integrity(other, integrity_failure)),
 	}
 }
 
@@ -4455,6 +4515,41 @@ mod tests {
 				ReadStatus::TENANT_UNAVAILABLE.0
 			)
 		);
+	}
+
+	#[test]
+	fn table_reference_integrity_terminal_requires_and_preserves_its_wire_diagnostic() {
+		let failure = TableReferenceIntegrityFailureMeta {
+			tenant_id: TenantId::new(7),
+			table_object_id: [0xA5; 16],
+			missing_slab_id: 4,
+			reference_kind: 1,
+			origin: 2,
+			_pad: [0; 6],
+		};
+		let decoded = decode_table_reference_integrity_failure(
+			ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+			Some(bytemuck::bytes_of(&failure)),
+		)
+		.unwrap()
+		.expect("typed status carries a diagnostic");
+		assert_eq!(decoded, failure);
+		assert!(
+			decode_table_reference_integrity_failure(
+				ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+				None,
+			)
+			.is_err()
+		);
+		let error = query_failure_error_with_integrity(
+			ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+			Some(decoded),
+		);
+		let preserved = error
+			.get_ref()
+			.and_then(|source| source.downcast_ref::<TableReferenceIntegrityQueryError>())
+			.expect("terminal error remains typed");
+		assert_eq!(preserved.failure, failure);
 	}
 
 	#[tokio::test]

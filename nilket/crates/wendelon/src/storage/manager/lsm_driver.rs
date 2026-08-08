@@ -440,6 +440,13 @@ impl SlabManager {
 					row.routing_locality,
 					row.location,
 				);
+				if let Some(table_object_id) = row.table_object_id {
+					self.add_published_table_reference(
+						row.tenant_id,
+						table_object_id,
+						row.location,
+					);
+				}
 			}
 		}
 
@@ -573,7 +580,12 @@ impl SlabManager {
 		now: HybridTimestamp,
 	) -> Option<CompactionPlan> {
 		let snapshot = self.compaction_manifest_snapshot();
-		pick_compaction(&snapshot, &worker.config(), now)
+		pick_compaction(&snapshot, &worker.config(), now).filter(|plan| {
+			!plan
+				.touched_slabs()
+				.into_iter()
+				.any(|slab_id| self.is_compaction_slab_quarantined(slab_id))
+		})
 	}
 
 	pub async fn run_lsm_compaction_tick(
@@ -942,6 +954,7 @@ impl SlabManager {
 				key_identity: record.row_key_id,
 				routing_locality: self
 					.routing_locality_for_key(record.tenant_id, record.row_key_id),
+				table_object_id: record.table_object_id,
 				location: record.location,
 			})
 			.collect::<Vec<_>>();
@@ -971,6 +984,7 @@ impl SlabManager {
 					key_identity: record.row_key_id,
 					routing_locality: self
 						.routing_locality_for_key(record.tenant_id, record.row_key_id),
+					table_object_id: record.table_object_id,
 					location: *location,
 				});
 			}
@@ -1031,6 +1045,7 @@ impl SlabManager {
 				}
 				entries.push(VersionEntry {
 					tenant_id,
+					table_object_id: self.published_table_object_id(location),
 					row_key_id,
 					row_hlc: location.hlc,
 					record_row_index: location.record_row_index,
@@ -1427,7 +1442,13 @@ impl SlabManager {
 		candidates.sort_unstable();
 		let mut deleted = Vec::new();
 		for slab_id in candidates {
+			if self.is_compaction_slab_quarantined(slab_id) {
+				continue;
+			}
 			if self.slab_pins.pin_count(slab_id) != 0 {
+				continue;
+			}
+			if !self.can_retire_local_slab(slab_id).await? {
 				continue;
 			}
 			for info in self.list_secondary_index_segments_for_source_slab(slab_id) {
@@ -1507,7 +1528,13 @@ impl SlabManager {
 		candidates.sort_unstable();
 		let mut deleted = Vec::new();
 		for slab_id in candidates {
+			if self.is_compaction_slab_quarantined(slab_id) {
+				continue;
+			}
 			if self.slab_pins.pin_count(slab_id) != 0 {
+				continue;
+			}
+			if !self.can_retire_local_slab(slab_id).await? {
 				continue;
 			}
 			for info in self.list_secondary_index_segments_for_source_slab(slab_id) {

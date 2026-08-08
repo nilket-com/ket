@@ -2015,7 +2015,12 @@ impl WendelonControlServer {
 		};
 		let snapshot = self.state_machine.state_snapshot().await;
 		storage_manager
-			.reclaim_tombstoned_ranges(&snapshot.tombstones, usize::MAX)
+			.reclaim_tombstoned_ranges(
+				&snapshot.tombstones,
+				&snapshot.table_schemas,
+				&snapshot.secondary_indexes,
+				usize::MAX,
+			)
 			.await
 			.map_err(|err| WendelonAdminError::Transport {
 				message: format!("schema drop tombstone reclaim failed: {err}"),

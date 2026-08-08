@@ -22,6 +22,7 @@ fn key(byte: u8) -> Identity {
 fn version(key_byte: u8, ms: u64, row_idx: u32, length: u32) -> VersionEntry {
 	VersionEntry {
 		tenant_id: TenantId::ZERO,
+		table_object_id: None,
 		row_key_id: key(key_byte),
 		row_hlc: hlc(ms),
 		record_row_index: RecordRowIndex::new(row_idx),

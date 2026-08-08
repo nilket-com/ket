@@ -97,15 +97,15 @@ use crate::schema::{
 	TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED, TABLE_WRITE_MAX_ROWS,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId,
 	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryCancelStatus,
-	TableQueryRequestId, TableQueryRequestMeta, TableReplicaWriteMeta, TableSchemaDescriptor,
-	TableWriteAdmission, TableWriteRequestMeta, TableWriteResponseMeta, TableWriteValidationError,
-	TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, WriterNodeId,
-	build_runtime_filter_mask, build_runtime_filter_mask_for_batch, cdc_cursor_in_catchup_window,
-	cdc_event_batch, cdc_tombstone_event_batch, cdc_visible_rows_digest,
-	column_projection_predicate_ranges, column_projection_prefix_ranges, encode_aggregate_state,
-	encode_table_write_row_count, migration_record_schema, pbc,
-	query_request_stats_pruning_enabled, read_key_schema, runtime_filter_key_type,
-	table_spread_prefix_ranges, validate_runtime_filter_descriptor,
+	TableQueryRequestId, TableQueryRequestMeta, TableReferenceIntegrityFailureMeta,
+	TableReplicaWriteMeta, TableSchemaDescriptor, TableWriteAdmission, TableWriteRequestMeta,
+	TableWriteResponseMeta, TableWriteValidationError, TenantId, WriteRequestMeta,
+	WriteResponseMeta, WriteStatus, WriterNodeId, build_runtime_filter_mask,
+	build_runtime_filter_mask_for_batch, cdc_cursor_in_catchup_window, cdc_event_batch,
+	cdc_tombstone_event_batch, cdc_visible_rows_digest, column_projection_predicate_ranges,
+	column_projection_prefix_ranges, encode_aggregate_state, encode_table_write_row_count,
+	migration_record_schema, pbc, query_request_stats_pruning_enabled, read_key_schema,
+	runtime_filter_key_type, table_spread_prefix_ranges, validate_runtime_filter_descriptor,
 	validate_table_write_request_batch, write_payload_schema,
 };
 #[cfg(test)]
@@ -3444,7 +3444,12 @@ impl WendelonDataServer {
 	) -> std::io::Result<crate::storage::manager::TombstoneCompactionReport> {
 		let snapshot = self.state_machine.state_snapshot().await;
 		self.slab
-			.reclaim_tombstoned_ranges(&snapshot.tombstones, max_slabs)
+			.reclaim_tombstoned_ranges(
+				&snapshot.tombstones,
+				&snapshot.table_schemas,
+				&snapshot.secondary_indexes,
+				max_slabs,
+			)
 			.await
 	}
 
@@ -4434,6 +4439,42 @@ impl WendelonDataServer {
 			None,
 			FRAME_FLAG_STREAM_END,
 		)
+	}
+
+	fn table_query_integrity_error_frame(
+		&self,
+		stream_id: u32,
+		meta: &TableQueryRequestMeta,
+		failure: crate::storage::manager::PublishedReferenceIntegrityFailure,
+	) -> HrftFrame {
+		let range_meta = table_query_as_range_query(meta);
+		let response = query_error_meta(
+			&range_meta,
+			ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+			self.local_node,
+		);
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&response));
+		let mut trailing = self.pool.acquire();
+		trailing
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&failure.wire_meta()));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_RESP.0,
+				flags: FRAME_FLAG_STREAM_END,
+				stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.len() as u32,
+			},
+			meta: body,
+			arrow_payload: None,
+			trailing: Some(trailing),
+		}
 	}
 
 	fn record_backpressure_rejection(&self, scope: BackpressureScope) {
@@ -8697,6 +8738,20 @@ impl WendelonDataServer {
 				None,
 			));
 		};
+		if self
+			.slab
+			.table_integrity_failure(meta.tenant_id, meta.table_object_id)
+			.is_some()
+		{
+			return Ok((
+				self.table_write_error_response(
+					&meta,
+					WriteStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+					PbcRejectCode::NONE,
+				),
+				None,
+			));
+		}
 
 		// ADR 045: stamp the leader-merged commit HLC *before*
 		// admission. The HLC driver guarantees `merge` returns a
@@ -10084,6 +10139,23 @@ impl<'a> TableQueryResponseStreamWriter<'a> {
 	}
 
 	async fn emit_terminal(&mut self, response: QueryResponseMeta) -> std::io::Result<()> {
+		self.emit_terminal_with_trailing(response, None).await
+	}
+
+	async fn emit_terminal_with_integrity(
+		&mut self,
+		response: QueryResponseMeta,
+		failure: TableReferenceIntegrityFailureMeta,
+	) -> std::io::Result<()> {
+		self.emit_terminal_with_trailing(response, Some(bytemuck::bytes_of(&failure)))
+			.await
+	}
+
+	async fn emit_terminal_with_trailing(
+		&mut self,
+		response: QueryResponseMeta,
+		trailing: Option<&[u8]>,
+	) -> std::io::Result<()> {
 		let response = QueryResponseMeta {
 			arrow_len: 0,
 			..response
@@ -10097,9 +10169,9 @@ impl<'a> TableQueryResponseStreamWriter<'a> {
 			stream_id: self.stream_id,
 			meta_len: meta_bytes.len() as u32,
 			arrow_len: 0,
-			trailing_len: 0,
+			trailing_len: trailing.map(|bytes| bytes.len() as u32).unwrap_or(0),
 		};
-		write_frame(self.stream, &header, meta_bytes, None, None).await
+		write_frame(self.stream, &header, meta_bytes, None, trailing).await
 	}
 }
 

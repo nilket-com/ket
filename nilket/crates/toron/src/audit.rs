@@ -984,6 +984,7 @@ fn storage_error_class(error: &StorageError) -> &'static str {
 		StorageError::InvalidPbcProgram { .. } => "invalid_pbc_program",
 		StorageError::PermissionDenied { .. } => "permission_denied",
 		StorageError::Unavailable { .. } => "storage_unavailable",
+		StorageError::TableReferenceIntegrity { .. } => "table_reference_integrity",
 		StorageError::Client { .. } => "storage_client",
 		StorageError::Arrow(_) => "arrow",
 		StorageError::Internal { .. } => "internal",

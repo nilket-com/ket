@@ -63,8 +63,9 @@ use crate::schema::{
 	LogicalSchemaFingerprint, ManifestEpoch, NdvFact, RecordBodyByteLen, RecordBodyByteOffset,
 	RecordRowIndex, RowCount, RowGroupIndex, SecondaryIndexCatalog, SecondaryIndexDescriptor,
 	SecondaryIndexState, SelectivityFractionMicros, SimdPageValueCount, SlabId, SlabRecordHeader,
-	SupersessionMetadata, TableLifecycleCatalog, TableOptimizerFacts, TenantId, TenantKekId,
-	TombstoneMetadata, WriterNodeId, range_fact_tag_supported,
+	SupersessionMetadata, TableLifecycleCatalog, TableOptimizerFacts,
+	TableReferenceIntegrityFailureMeta, TenantId, TenantKekId, TombstoneMetadata, WriterNodeId,
+	range_fact_tag_supported,
 };
 use crate::storage::columnar::{
 	ColumnFetchRequirement, ColumnOrdinalMapping, ColumnOrdinalSet, ColumnarFallbackReason,
@@ -173,7 +174,7 @@ use arrow::ipc::reader::StreamReader;
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use bytes::Bytes;
-use dashmap::DashMap;
+use dashmap::{DashMap, DashSet};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Error, ErrorKind};
@@ -565,6 +566,25 @@ pub struct SlabManager {
 	/// `Locality::from(key_identity)`; typed table rows can pin a
 	/// table-scoped projection computed at ingest.
 	key_localities: DashMap<TenantKey, Locality>,
+	/// Durable typed-table attribution by published record location. This is
+	/// separate from the key index because table identity cannot be recovered
+	/// from an identity once its backing slab is missing.
+	table_by_location: DashMap<RecordLocation, (TenantId, TableObjectId)>,
+	/// Exact typed-table references by backing slab. Counts, rather than mere
+	/// co-tenancy, define the affected table set for a missing slab.
+	table_references_by_slab: DashMap<SlabId, BTreeMap<(TenantId, TableObjectId), usize>>,
+	/// Exact typed-table secondary-index source references by backing slab.
+	/// Keeping these distinct preserves the failure's actual reference kind.
+	secondary_index_table_references_by_slab:
+		DashMap<SlabId, BTreeMap<(TenantId, TableObjectId), usize>>,
+	/// Fail-closed state derived from a published reference whose backing slab
+	/// cannot be resolved. It is reconstructed from durable references on open;
+	/// it is not a repair journal.
+	integrity_failures: DashMap<(TenantId, TableObjectId), PublishedReferenceIntegrityFailure>,
+	/// Compaction input slabs that have been proven to carry an unresolvable
+	/// published reference. The picker skips only plans touching these slabs;
+	/// transient compaction failures retain their retry behavior.
+	quarantined_compaction_slabs: DashSet<SlabId>,
 	/// Best-effort compatibility map for in-flight readers that
 	/// raced a compaction rewrite. New lookups pivot to the fresh
 	/// location through `key_index`; a stale snapshot of the prior
@@ -610,12 +630,71 @@ pub struct SlabManager {
 	tiered_stats_cache: DashMap<TieredStatsCacheKey, ParsedColumnStatsBlock>,
 }
 
+/// Which durable reference was found to point at a missing backing slab.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishedReferenceKind {
+	RecordLocation,
+	SecondaryIndexSourceSlab,
+}
+
+/// The seam that first observed the broken published reference.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublishedReferenceOrigin {
+	Read,
+	Recovery,
+	Compaction,
+}
+
+/// Typed integrity state retained for every affected typed table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishedReferenceIntegrityFailure {
+	pub tenant_id: TenantId,
+	pub table_object_id: TableObjectId,
+	pub reference_kind: PublishedReferenceKind,
+	pub missing_slab_id: SlabId,
+	pub origin: PublishedReferenceOrigin,
+}
+
+impl PublishedReferenceIntegrityFailure {
+	pub fn wire_meta(self) -> TableReferenceIntegrityFailureMeta {
+		TableReferenceIntegrityFailureMeta {
+			tenant_id: self.tenant_id,
+			table_object_id: self.table_object_id.into(),
+			missing_slab_id: self.missing_slab_id.0,
+			reference_kind: match self.reference_kind {
+				PublishedReferenceKind::RecordLocation => 1,
+				PublishedReferenceKind::SecondaryIndexSourceSlab => 2,
+			},
+			origin: match self.origin {
+				PublishedReferenceOrigin::Read => 1,
+				PublishedReferenceOrigin::Recovery => 2,
+				PublishedReferenceOrigin::Compaction => 3,
+			},
+			_pad: [0; 6],
+		}
+	}
+}
+
 const fn zero_hlc() -> HybridTimestamp {
 	HybridTimestamp {
 		physical_ms: 0,
 		logical: 0,
 		node_id: 0,
 	}
+}
+
+fn table_integrity_error(failure: PublishedReferenceIntegrityFailure) -> std::io::Error {
+	Error::new(
+		ErrorKind::InvalidData,
+		format!(
+			"published reference integrity failure: tenant={} table={:?} reference={:?} missing_slab={} origin={:?}",
+			failure.tenant_id.get(),
+			failure.table_object_id,
+			failure.reference_kind,
+			failure.missing_slab_id,
+			failure.origin,
+		),
+	)
 }
 
 struct ManagerState {
@@ -711,12 +790,16 @@ impl SlabManager {
 		location: RecordLocation,
 	) {
 		let key = (tenant_id, key_identity);
-		let should_remove_key = if let Some(mut versions) = self.key_index.get_mut(&key) {
+		let (removed, should_remove_key) = if let Some(mut versions) = self.key_index.get_mut(&key)
+		{
 			let removed = remove_version_exact(&mut versions, location);
-			removed && versions.is_empty()
+			(removed, removed && versions.is_empty())
 		} else {
-			false
+			(false, false)
 		};
+		if removed {
+			self.remove_published_table_reference(location);
+		}
 		if should_remove_key {
 			self.key_index.remove(&key);
 			self.remove_locality_membership(tenant_id, key_identity);
@@ -845,6 +928,7 @@ impl SlabManager {
 			tenant_id,
 			key_identity,
 			routing_locality: self.routing_locality_for_key(tenant_id, key_identity),
+			table_object_id: self.published_table_object_id(location),
 			location,
 		}
 	}
@@ -965,6 +1049,16 @@ impl SlabManager {
 				"multi-row append requires at least one index entry",
 			));
 		};
+		let batch = decode_record_batch(frame)?;
+		let table_object_ids = entries
+			.iter()
+			.map(|entry| storage_row_table_object_id_at(&batch, entry.record_row_index))
+			.collect::<std::io::Result<BTreeSet<_>>>()?;
+		for table_object_id in table_object_ids.into_iter().flatten() {
+			if let Some(failure) = self.table_integrity_failure(tenant_id, table_object_id) {
+				return Err(table_integrity_error(failure));
+			}
+		}
 		let record_hlc = entries
 			.iter()
 			.map(|entry| entry.row_hlc)
@@ -994,18 +1088,24 @@ impl SlabManager {
 
 		let rows = entries
 			.iter()
-			.map(|entry| PersistentRecordRow {
-				tenant_id,
-				key_identity: entry.key_identity,
-				routing_locality: entry.routing_locality,
-				location: RecordLocation {
-					hlc: entry.row_hlc,
-					record_row_index: entry.record_row_index,
-					is_tombstone: entry.is_tombstone,
-					..base_location
-				},
+			.map(|entry| {
+				Ok(PersistentRecordRow {
+					tenant_id,
+					key_identity: entry.key_identity,
+					routing_locality: entry.routing_locality,
+					table_object_id: storage_row_table_object_id_at(
+						&batch,
+						entry.record_row_index,
+					)?,
+					location: RecordLocation {
+						hlc: entry.row_hlc,
+						record_row_index: entry.record_row_index,
+						is_tombstone: entry.is_tombstone,
+						..base_location
+					},
+				})
 			})
-			.collect::<Vec<_>>();
+			.collect::<std::io::Result<Vec<_>>>()?;
 		if let Err(err) = self.persist_record_rows_strict(rows.clone()).await {
 			slab.rollback_index_entry(tenant_id, primary.key_identity, base_location);
 			for row in &rows {
@@ -1023,6 +1123,9 @@ impl SlabManager {
 				row.routing_locality,
 				row.location,
 			);
+			if let Some(table_object_id) = row.table_object_id {
+				self.add_published_table_reference(tenant_id, table_object_id, row.location);
+			}
 		}
 		for (slab_id, supersession_hlc) in superseded {
 			let _ = self
@@ -1121,6 +1224,13 @@ impl SlabManager {
 		existing_ids.sort_unstable();
 
 		let key_index: DashMap<TenantKey, Vec<RecordLocation>> = DashMap::new();
+		let table_by_location: DashMap<RecordLocation, (TenantId, TableObjectId)> = DashMap::new();
+		let table_references_by_slab: DashMap<SlabId, BTreeMap<(TenantId, TableObjectId), usize>> =
+			DashMap::new();
+		let secondary_index_table_references_by_slab: DashMap<
+			SlabId,
+			BTreeMap<(TenantId, TableObjectId), usize>,
+		> = DashMap::new();
 		let sealed: DashMap<SlabId, Arc<LocalSlabStore>> = DashMap::new();
 		let tiered: DashMap<SlabId, TieredSlabPointer> = DashMap::new();
 		let rehydrated: DashMap<SlabId, RehydratedSlabState> = DashMap::new();
@@ -1195,6 +1305,17 @@ impl SlabManager {
 		if let Some(index) = &persistent_index {
 			match index.load_snapshot().await {
 				Ok(snapshot) => {
+					for row in snapshot.record_rows {
+						if let Some(table_object_id) = row.table_object_id {
+							table_by_location
+								.insert(row.location, (row.tenant_id, table_object_id));
+							*table_references_by_slab
+								.entry(row.location.slab_id)
+								.or_default()
+								.entry((row.tenant_id, table_object_id))
+								.or_default() += 1;
+						}
+					}
 					for pointer in snapshot.tiered_slabs {
 						tiered.insert(pointer.slab_id, pointer);
 					}
@@ -1210,6 +1331,11 @@ impl SlabManager {
 						));
 					}
 					for row in snapshot.secondary_index_segments {
+						*secondary_index_table_references_by_slab
+							.entry(row.key.source_slab_id)
+							.or_default()
+							.entry((row.key.tenant_id, row.key.table_object_id))
+							.or_default() += 1;
 						let coverage_key = secondary_index_coverage_key_from_persistent(&row.key);
 						secondary_index_coverage
 							.entry(coverage_key)
@@ -1283,6 +1409,11 @@ impl SlabManager {
 			key_index,
 			locality_index: RwLock::new(locality_index),
 			key_localities,
+			table_by_location,
+			table_references_by_slab,
+			secondary_index_table_references_by_slab,
+			integrity_failures: DashMap::new(),
+			quarantined_compaction_slabs: DashSet::new(),
 			relocated_reads: DashMap::new(),
 			persistent_index,
 			retired_tiered_cleanup: DashMap::new(),
@@ -1291,9 +1422,19 @@ impl SlabManager {
 			secondary_index_source_slab_leases: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
 		};
+		manager
+			.detect_missing_published_references_on_recovery()
+			.await;
 		let snapshot = manager.compaction_manifest_snapshot();
 		refresh_lsm_level_metrics(&snapshot);
-		manager.rebuild_persistent_index().await;
+		if manager.integrity_failures.is_empty() {
+			manager.rebuild_persistent_index().await;
+		} else {
+			tracing::error!(
+				fenced_table_count = manager.integrity_failures.len(),
+				"published reference integrity failure detected during recovery; preserving durable index evidence"
+			);
+		}
 		Ok(manager)
 	}
 
@@ -1304,6 +1445,240 @@ impl SlabManager {
 
 	pub fn data_dir(&self) -> &Path {
 		&self.config.dir
+	}
+
+	/// Durable typed-table attribution for a published record location.
+	///
+	/// This deliberately returns `None` for legacy/untyped rows. Callers that
+	/// need an integrity fence must treat missing attribution as unknown, never
+	/// infer a table from the irreversible row identity.
+	pub(crate) fn published_table_object_id(
+		&self,
+		location: RecordLocation,
+	) -> Option<TableObjectId> {
+		self.table_by_location
+			.get(&location)
+			.map(|entry| entry.value().1)
+	}
+
+	fn add_published_table_reference(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		location: RecordLocation,
+	) {
+		if let Some(previous) = self
+			.table_by_location
+			.insert(location, (tenant_id, table_object_id))
+		{
+			if previous == (tenant_id, table_object_id) {
+				return;
+			}
+			self.remove_published_table_reference_count(previous.0, previous.1, location.slab_id);
+		}
+		*self
+			.table_references_by_slab
+			.entry(location.slab_id)
+			.or_default()
+			.entry((tenant_id, table_object_id))
+			.or_default() += 1;
+	}
+
+	fn remove_published_table_reference_count(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		slab_id: SlabId,
+	) {
+		let remove_slab =
+			if let Some(mut references) = self.table_references_by_slab.get_mut(&slab_id) {
+				let key = (tenant_id, table_object_id);
+				if let Some(count) = references.get_mut(&key) {
+					*count = count.saturating_sub(1);
+					if *count == 0 {
+						references.remove(&key);
+					}
+				}
+				references.is_empty()
+			} else {
+				false
+			};
+		if remove_slab {
+			self.table_references_by_slab.remove(&slab_id);
+		}
+	}
+
+	fn remove_published_table_reference(&self, location: RecordLocation) {
+		if let Some((_, (tenant_id, table_object_id))) = self.table_by_location.remove(&location) {
+			self.remove_published_table_reference_count(
+				tenant_id,
+				table_object_id,
+				location.slab_id,
+			);
+		}
+	}
+
+	pub(crate) fn add_secondary_index_source_reference(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		source_slab_id: SlabId,
+	) {
+		*self
+			.secondary_index_table_references_by_slab
+			.entry(source_slab_id)
+			.or_default()
+			.entry((tenant_id, table_object_id))
+			.or_default() += 1;
+	}
+
+	pub(crate) fn remove_secondary_index_source_reference(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		source_slab_id: SlabId,
+	) {
+		let remove_slab = if let Some(mut references) = self
+			.secondary_index_table_references_by_slab
+			.get_mut(&source_slab_id)
+		{
+			let key = (tenant_id, table_object_id);
+			if let Some(count) = references.get_mut(&key) {
+				*count = count.saturating_sub(1);
+				if *count == 0 {
+					references.remove(&key);
+				}
+			}
+			references.is_empty()
+		} else {
+			false
+		};
+		if remove_slab {
+			self.secondary_index_table_references_by_slab
+				.remove(&source_slab_id);
+		}
+	}
+
+	fn tables_referencing_slab_by_kind(
+		&self,
+		slab_id: SlabId,
+		reference_kind: PublishedReferenceKind,
+	) -> BTreeSet<(TenantId, TableObjectId)> {
+		let references = match reference_kind {
+			PublishedReferenceKind::RecordLocation => &self.table_references_by_slab,
+			PublishedReferenceKind::SecondaryIndexSourceSlab => {
+				&self.secondary_index_table_references_by_slab
+			}
+		};
+		references
+			.get(&slab_id)
+			.map(|entries| entries.keys().copied().collect())
+			.unwrap_or_default()
+	}
+
+	/// Returns the persistent fail-closed state for a typed table, if a
+	/// published reference has already been found to lack a backing slab.
+	pub(crate) fn table_integrity_failure(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> Option<PublishedReferenceIntegrityFailure> {
+		self.integrity_failures
+			.get(&(tenant_id, table_object_id))
+			.map(|entry| *entry)
+	}
+
+	fn record_missing_published_reference(
+		&self,
+		missing_slab_id: SlabId,
+		reference_kind: PublishedReferenceKind,
+		origin: PublishedReferenceOrigin,
+	) {
+		let affected_tables = self.tables_referencing_slab_by_kind(missing_slab_id, reference_kind);
+		if !affected_tables.is_empty() {
+			self.quarantined_compaction_slabs.insert(missing_slab_id);
+		}
+		for (tenant_id, table_object_id) in affected_tables {
+			self.integrity_failures
+				.entry((tenant_id, table_object_id))
+				.or_insert(PublishedReferenceIntegrityFailure {
+					tenant_id,
+					table_object_id,
+					reference_kind,
+					missing_slab_id,
+					origin,
+				});
+		}
+	}
+
+	fn record_missing_published_references_for_slab(
+		&self,
+		missing_slab_id: SlabId,
+		origin: PublishedReferenceOrigin,
+	) {
+		for reference_kind in [
+			PublishedReferenceKind::RecordLocation,
+			PublishedReferenceKind::SecondaryIndexSourceSlab,
+		] {
+			self.record_missing_published_reference(missing_slab_id, reference_kind, origin);
+		}
+	}
+
+	pub(crate) fn is_compaction_slab_quarantined(&self, slab_id: SlabId) -> bool {
+		self.quarantined_compaction_slabs.contains(&slab_id)
+	}
+
+	/// Reconciliation failed for a retiring slab: quarantine its compaction work with
+	/// one diagnostic, and record the integrity failure against every table whose
+	/// published references name it. The slab file itself is preserved — containment,
+	/// not repair.
+	pub(super) fn quarantine_compaction_slab_for_reconciliation(
+		&self,
+		slab_id: SlabId,
+		error: &std::io::Error,
+	) {
+		let newly_quarantined = self.quarantined_compaction_slabs.insert(slab_id);
+		if newly_quarantined {
+			tracing::error!(
+				slab_id = slab_id.get(),
+				error = %error,
+				"quarantining slab retirement: secondary index reconciliation failed; \
+				 slab file preserved"
+			);
+			self.record_missing_published_reference(
+				slab_id,
+				PublishedReferenceKind::SecondaryIndexSourceSlab,
+				PublishedReferenceOrigin::Compaction,
+			);
+		}
+	}
+
+	async fn detect_missing_published_references_on_recovery(&self) {
+		let referenced_slabs = self
+			.table_references_by_slab
+			.iter()
+			.map(|entry| *entry.key())
+			.chain(
+				self.secondary_index_table_references_by_slab
+					.iter()
+					.map(|entry| *entry.key()),
+			)
+			.collect::<BTreeSet<_>>();
+		for slab_id in referenced_slabs {
+			let present = {
+				let state = self.state.lock().await;
+				state.active.slab_id() == slab_id
+					|| state.sealed.contains_key(&slab_id)
+					|| state.rehydrated.contains_key(&slab_id)
+					|| state.tiered.contains_key(&slab_id)
+			};
+			if !present {
+				self.record_missing_published_references_for_slab(
+					slab_id,
+					PublishedReferenceOrigin::Recovery,
+				);
+			}
+		}
 	}
 
 	/// Test / diagnostic accessor: number of sealed slabs.
@@ -1437,6 +1812,28 @@ impl SlabManager {
 				ErrorKind::InvalidData,
 				format!(
 					"{INDEX_REJECT_LOGICAL_FINGERPRINT_MISMATCH}: secondary index lookup requires a Ready descriptor matching the request",
+				),
+			));
+		}
+
+		// The read-side gate is the INVARIANT — every historical source slab has a
+		// durable segment — never the in-memory failure record. A gate keyed on "did
+		// this process observe a failure" empties on restart and resurrects the
+		// silent-wrong-answer this refusal exists to prevent; completeness derived
+		// from durable state survives restart by construction. Answering from the
+		// remaining segments over a gap would return success while silently omitting
+		// rows — an integrity gap must not be reduced to a successful answer any more
+		// than to a generic error. Unaffected indexes keep serving.
+		let gaps = self
+			.secondary_index_durable_coverage_gaps(request.tenant_id, descriptor)
+			.await;
+		if !gaps.is_empty() {
+			let gap_ids: Vec<u64> = gaps.iter().map(|slab_id| slab_id.get()).collect();
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"secondary index lookup refused: source slab(s) {gap_ids:?} are \
+					 uncovered and a successful answer would silently omit their rows"
 				),
 			));
 		}
@@ -2568,10 +2965,13 @@ impl StorageEngine for SlabManager {
 					.observe_duration(started.elapsed());
 				result
 			}
-			SlabBacking::Missing => Err(Error::new(
-				ErrorKind::NotFound,
-				format!("no slab with id {} under this manager", location.slab_id),
-			)),
+			SlabBacking::Missing => Err(Error::new(ErrorKind::NotFound, {
+				self.record_missing_published_references_for_slab(
+					location.slab_id,
+					PublishedReferenceOrigin::Read,
+				);
+				format!("no slab with id {} under this manager", location.slab_id)
+			})),
 		}
 	}
 
@@ -2922,6 +3322,43 @@ impl SlabManager {
 		}
 	}
 
+	/// A local slab may be unlinked only after the durable index agrees that
+	/// no published record or secondary-index source still names it. Runtime
+	/// `key_index` alone is insufficient: it can already have advanced past a
+	/// source while a failed mirror leaves recovery pointing at that source.
+	///
+	/// A mismatch preserves the slab, quarantines further retirement work for
+	/// it, and leaves repair to an explicit future operator decision.
+	async fn can_retire_local_slab(&self, slab_id: SlabId) -> std::io::Result<bool> {
+		let Some(index) = &self.persistent_index else {
+			return Ok(true);
+		};
+		let snapshot = index.load_snapshot().await?;
+		let record_references = snapshot
+			.record_rows
+			.iter()
+			.chain(snapshot.tiered_records.iter())
+			.filter(|row| row.location.slab_id == slab_id)
+			.count();
+		let secondary_references = snapshot
+			.secondary_index_segments
+			.iter()
+			.filter(|row| row.key.source_slab_id == slab_id)
+			.count();
+		if record_references == 0 && secondary_references == 0 {
+			return Ok(true);
+		}
+
+		self.quarantined_compaction_slabs.insert(slab_id);
+		tracing::error!(
+			slab_id = slab_id.get(),
+			record_references,
+			secondary_references,
+			"refusing to retire slab with durable published references"
+		);
+		Ok(false)
+	}
+
 	async fn persist_record_row(
 		&self,
 		tenant_id: TenantId,
@@ -2957,6 +3394,7 @@ impl SlabManager {
 			tenant_id,
 			key_identity,
 			routing_locality,
+			table_object_id: None,
 			location,
 		};
 		if let Err(err) = index.upsert_record(row).await {
@@ -3028,6 +3466,7 @@ impl SlabManager {
 				tenant_id: record.tenant_id,
 				key_identity: record.key_identity,
 				routing_locality: record.routing_locality,
+				table_object_id: None,
 				location: record.old_location,
 			})
 			.collect::<Vec<_>>();
@@ -3045,6 +3484,7 @@ impl SlabManager {
 		&self,
 		removed: &[CompactionRecord],
 		inserted: &[RelocatedRecord],
+		relocation_tables: &HashMap<RecordLocation, TableObjectId>,
 	) {
 		let removed_rows = removed
 			.iter()
@@ -3052,6 +3492,7 @@ impl SlabManager {
 				tenant_id: record.tenant_id,
 				key_identity: record.key_identity,
 				routing_locality: record.routing_locality,
+				table_object_id: relocation_tables.get(&record.old_location).copied(),
 				location: record.old_location,
 			})
 			.collect::<Vec<_>>();
@@ -3061,6 +3502,7 @@ impl SlabManager {
 				tenant_id: record.tenant_id,
 				key_identity: record.key_identity,
 				routing_locality: record.routing_locality,
+				table_object_id: relocation_tables.get(&record.old_location).copied(),
 				location: record.new_location,
 			})
 			.collect::<Vec<_>>();

@@ -178,6 +178,7 @@ fn version_entries(rows: usize) -> Vec<VersionEntry> {
 			let key_id = key_identity((idx % 4096) as u64);
 			VersionEntry {
 				tenant_id: TenantId::new(55),
+				table_object_id: None,
 				row_key_id: key_id,
 				row_hlc,
 				record_row_index: RecordRowIndex::ZERO,

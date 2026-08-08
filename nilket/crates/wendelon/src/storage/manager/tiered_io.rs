@@ -688,15 +688,26 @@ impl SlabManager {
 		pointer: &TieredSlabPointer,
 	) -> std::io::Result<Vec<PersistentRecordRow>> {
 		let plaintext = self.tiered_plaintext_from_l2(pointer).await?;
-		Ok(recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
+		recover_slab_entries_from_blob(&plaintext, pointer.slab_id)?
 			.into_iter()
-			.map(|entry| PersistentRecordRow {
-				tenant_id: entry.tenant_id,
-				key_identity: entry.key_identity,
-				routing_locality: self.recovered_entry_routing_locality(&entry),
-				location: entry.location,
+			.map(|entry| {
+				let frame = extract_record_from_blob(&plaintext, entry.location)?;
+				let table_object_id = decode_record_batch(&frame)
+					.ok()
+					.map(|batch| {
+						storage_row_table_object_id_at(&batch, entry.location.record_row_index)
+					})
+					.transpose()?
+					.flatten();
+				Ok(PersistentRecordRow {
+					tenant_id: entry.tenant_id,
+					key_identity: entry.key_identity,
+					routing_locality: self.recovered_entry_routing_locality(&entry),
+					table_object_id,
+					location: entry.location,
+				})
 			})
-			.collect::<Vec<_>>())
+			.collect()
 	}
 
 	pub(super) async fn build_tiered_row_refresh_plan_from_l2(
@@ -768,6 +779,9 @@ impl SlabManager {
 				row.key_identity,
 				row.routing_locality,
 			);
+			if let Some(table_object_id) = row.table_object_id {
+				self.add_published_table_reference(row.tenant_id, table_object_id, row.location);
+			}
 		}
 		self.mirror_persistent_update(
 			PersistentIndexUpdate {

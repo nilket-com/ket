@@ -566,6 +566,9 @@ fn error_label(err: &ClientError) -> String {
 			format!("table_write_rejected_{}", reject_code.0)
 		}
 		ClientError::TableDescriptorEvolved { .. } => "table_descriptor_evolved".to_string(),
+		ClientError::TableReferenceIntegrityFailed { .. } => {
+			"table_reference_integrity_failed".to_string()
+		}
 		ClientError::SchemaUpdateRejected { reason_code, .. } => {
 			format!("schema_update_rejected_{reason_code}")
 		}

@@ -1438,7 +1438,12 @@ impl SlabSweeper {
 			authorize_autonomous_action(AutonomousActionSurface::MigrationTombstoneReclaim);
 		let state = self.state_machine.state_snapshot().await;
 		self.slab
-			.reclaim_tombstoned_ranges(&state.tombstones, max_slabs)
+			.reclaim_tombstoned_ranges(
+				&state.tombstones,
+				&state.table_schemas,
+				&state.secondary_indexes,
+				max_slabs,
+			)
 			.await
 	}
 

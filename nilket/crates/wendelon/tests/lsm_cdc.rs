@@ -71,6 +71,7 @@ fn digest_summary() -> CompactionDigestSummary {
 fn version(ms: u64, lifecycle: VersionLifecycle) -> VersionEntry {
 	VersionEntry {
 		tenant_id: TenantId::new(7),
+		table_object_id: None,
 		row_key_id: Identity::new([9; 32]),
 		row_hlc: hlc(ms),
 		record_row_index: RecordRowIndex::ZERO,

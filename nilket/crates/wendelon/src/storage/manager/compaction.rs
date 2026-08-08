@@ -345,6 +345,8 @@ impl SlabManager {
 		&self,
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptor,
+		table_schemas: &TableSchemaCatalog,
+		secondary_indexes: &SecondaryIndexCatalog,
 		max_slabs: usize,
 	) -> std::io::Result<LayoutReclusterReport> {
 		descriptor.validate()?;
@@ -369,7 +371,16 @@ impl SlabManager {
 				break;
 			}
 			if let Some(outcome) = self
-				.recluster_one_sealed_slab(slab_id, slab, tenant_id, descriptor)
+				.recluster_one_sealed_slab(
+					slab_id,
+					slab,
+					tenant_id,
+					descriptor,
+					SecondaryIndexCompactionContext {
+						table_schemas,
+						secondary_indexes,
+					},
+				)
 				.await?
 			{
 				report.rewritten_slabs += 1;
@@ -391,6 +402,7 @@ impl SlabManager {
 		slab_id: SlabId,
 		slab: Arc<LocalSlabStore>,
 		tombstones: &[MigratedRangeTombstone],
+		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Option<CompactionOutcome>> {
 		let mut records: Vec<CompactionRecord> = slab
 			.index
@@ -419,7 +431,7 @@ impl SlabManager {
 			.collect();
 		records.sort_by_key(|record| record.old_location.offset);
 
-		self.compact_sealed_slab_records(slab_id, slab, &records, None)
+		self.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context)
 			.await
 	}
 
@@ -429,7 +441,11 @@ impl SlabManager {
 		slab: Arc<LocalSlabStore>,
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptor,
+		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Option<LayoutReclusterOutcome>> {
+		if self.is_compaction_slab_quarantined(slab_id) {
+			return Ok(None);
+		}
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -761,6 +777,14 @@ impl SlabManager {
 		}
 		replacement.fsync().await?;
 		let new_bytes = replacement.write_cursor();
+		// Enumerated before install so the descriptors reflect what the retiring slab
+		// actually published.
+		let old_secondary_index_descriptors = self
+			.secondary_index_compaction_descriptors_for_source_slab(
+				slab_id,
+				secondary_index_context,
+			)
+			.await?;
 		if !self
 			.finish_compaction_with_replacement(
 				slab_id,
@@ -776,8 +800,23 @@ impl SlabManager {
 			return Ok(None);
 		}
 
-		let old_path = slab_path(&self.config.dir, slab_id);
-		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+		match self
+			.reconcile_secondary_index_segments_after_compaction(
+				slab_id,
+				Some(replacement_id),
+				secondary_index_context,
+				old_secondary_index_descriptors,
+			)
+			.await
+		{
+			Ok(_proof) => {
+				let old_path = slab_path(&self.config.dir, slab_id);
+				unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+			}
+			Err(err) => {
+				self.quarantine_compaction_slab_for_reconciliation(slab_id, &err);
+			}
+		}
 		if multirow_recompact_count > 0 {
 			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
 		}
@@ -794,9 +833,14 @@ impl SlabManager {
 		slab_id: SlabId,
 		slab: Arc<LocalSlabStore>,
 		records: &[CompactionRecord],
-		secondary_index_context: Option<SecondaryIndexCompactionContext<'_>>,
+		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Option<CompactionOutcome>> {
 		if records.is_empty() || records.iter().all(|record| !record.reclaim) {
+			return Ok(None);
+		}
+		// Quarantined work is not retried at every tick; repair is an explicit
+		// future operator decision.
+		if self.is_compaction_slab_quarantined(slab_id) {
 			return Ok(None);
 		}
 
@@ -804,33 +848,31 @@ impl SlabManager {
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();
 		let retention_stats = Self::retention_compaction_stats(records);
 		let survivors = records.iter().filter(|record| !record.reclaim).count();
-		let old_secondary_index_descriptors = match secondary_index_context {
-			Some(context) => match self
-				.secondary_index_compaction_descriptors_for_source_slab(slab_id, context)
+		// Enumerated before any mutation so the descriptors reflect the state the
+		// retiring slab actually published. Failure fails the compaction, untouched.
+		let old_secondary_index_descriptors = self
+			.secondary_index_compaction_descriptors_for_source_slab(
+				slab_id,
+				secondary_index_context,
+			)
+			.await?;
+		if survivors == 0 {
+			// Validate before destroying: reconciliation proof precedes the record
+			// rollback, persistent deletion and unlink inside the finish path.
+			if let Err(err) = self
+				.reconcile_secondary_index_segments_after_compaction(
+					slab_id,
+					None,
+					secondary_index_context,
+					old_secondary_index_descriptors,
+				)
 				.await
 			{
-				Ok(descriptors) => descriptors,
-				Err(err) => {
-					tracing::warn!(
-						slab_id = slab_id.get(),
-						error = %err,
-						"failed to enumerate secondary index descriptors before compaction"
-					);
-					Vec::new()
-				}
-			},
-			None => Vec::new(),
-		};
-		if survivors == 0 {
+				self.quarantine_compaction_slab_for_reconciliation(slab_id, &err);
+				return Ok(None);
+			}
 			self.finish_compaction_without_replacement(slab_id, &records)
 				.await?;
-			self.reconcile_secondary_index_segments_after_compaction(
-				slab_id,
-				None,
-				secondary_index_context,
-				old_secondary_index_descriptors,
-			)
-			.await;
 			return Ok(Some(CompactionOutcome {
 				reclaimed_bytes: old_bytes,
 				reclaimed_records,
@@ -919,15 +961,26 @@ impl SlabManager {
 			return Ok(None);
 		}
 
-		self.reconcile_secondary_index_segments_after_compaction(
-			slab_id,
-			Some(replacement_id),
-			secondary_index_context,
-			old_secondary_index_descriptors,
-		)
-		.await;
-		let old_path = slab_path(&self.config.dir, slab_id);
-		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+		match self
+			.reconcile_secondary_index_segments_after_compaction(
+				slab_id,
+				Some(replacement_id),
+				secondary_index_context,
+				old_secondary_index_descriptors,
+			)
+			.await
+		{
+			Ok(_proof) => {
+				let old_path = slab_path(&self.config.dir, slab_id);
+				unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
+			}
+			Err(err) => {
+				// The replacement is installed and owns the records; the old file is
+				// preserved on disk as evidence, never republished. Containment, not
+				// repair.
+				self.quarantine_compaction_slab_for_reconciliation(slab_id, &err);
+			}
+		}
 		if multirow_recompact_count > 0 {
 			metrics().observe_storage_multirow_recompact(multirow_recompact_count);
 		}
@@ -949,11 +1002,11 @@ impl SlabManager {
 			.await;
 		let removed = {
 			let state = self.state.lock().await;
-			state.sealed.remove(&slab_id).is_some()
+			state.sealed.remove(&slab_id)
 		};
-		if !removed {
+		let Some((_, _removed)) = removed else {
 			return Ok(());
-		}
+		};
 		for record in records {
 			self.rollback_indexed_location(
 				record.tenant_id,
@@ -962,6 +1015,10 @@ impl SlabManager {
 			);
 		}
 		self.delete_persistent_records(records).await;
+		// No negative reference scan here: this path runs only after
+		// `reconcile_secondary_index_segments_after_compaction` returned proof. The
+		// scan-based `can_retire_local_slab` guard remains on the sweep paths, where
+		// no reconciliation proof exists.
 		let old_path = slab_path(&self.config.dir, slab_id);
 		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
 		self.secondary_index_source_slab_leases.remove(&slab_id);
@@ -984,6 +1041,13 @@ impl SlabManager {
 		if !state.sealed.contains_key(&old_slab_id) || state.tiered.contains_key(&old_slab_id) {
 			return Ok(false);
 		}
+		let relocation_tables = relocations
+			.iter()
+			.filter_map(|relocation| {
+				self.published_table_object_id(relocation.old_location)
+					.map(|table_object_id| (relocation.old_location, table_object_id))
+			})
+			.collect::<HashMap<_, _>>();
 		state.sealed.remove(&old_slab_id);
 		state.sealed.insert(new_slab_id, replacement);
 		for record in records {
@@ -1002,9 +1066,18 @@ impl SlabManager {
 			);
 			self.relocated_reads
 				.insert(relocation.old_location, relocation.new_location);
+			if let Some(table_object_id) = relocation_tables.get(&relocation.old_location).copied()
+			{
+				self.add_published_table_reference(
+					relocation.tenant_id,
+					table_object_id,
+					relocation.new_location,
+				);
+			}
 		}
 		drop(state);
-		self.replace_persistent_records(records, relocations).await;
+		self.replace_persistent_records(records, relocations, &relocation_tables)
+			.await;
 		self.secondary_index_source_slab_leases.remove(&old_slab_id);
 		drop(source_slab_lease);
 		Ok(true)

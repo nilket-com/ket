@@ -986,6 +986,9 @@ impl WriteStatus {
 	/// only on the primary, silently violating D3's durable-quorum.
 	/// `rf = 1` (the default) is unaffected.
 	pub const COUNTER_REPLICATION_UNSUPPORTED: Self = Self(17);
+	/// The target table is fenced because a published reference points at a
+	/// missing backing slab. No append is acknowledged while that state holds.
+	pub const TABLE_REFERENCE_INTEGRITY_FAILED: Self = Self(18);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -1007,6 +1010,7 @@ impl WriteStatus {
 			Self::COUNTER_ZERO_DELTA => "counter_zero_delta",
 			Self::COUNTER_OVERFLOW => "counter_overflow",
 			Self::COUNTER_REPLICATION_UNSUPPORTED => "counter_replication_unsupported",
+			Self::TABLE_REFERENCE_INTEGRITY_FAILED => "table_reference_integrity_failed",
 			_ => "unknown",
 		}
 	}
@@ -1440,6 +1444,11 @@ impl ReadStatus {
 	pub const TABLE_DESCRIPTOR_EVOLVED: Self = Self(14);
 	/// The table-query request was cancelled through TABLE_QUERY_CANCEL_REQ.
 	pub const QUERY_CANCELLED: Self = Self(15);
+	/// A published table reference points at a slab that is no longer
+	/// resolvable. The accompanying query-response trailer carries the
+	/// table/reference/slab/origin diagnostic; retrying cannot make the
+	/// acknowledged state readable.
+	pub const TABLE_REFERENCE_INTEGRITY_FAILED: Self = Self(16);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -1459,10 +1468,30 @@ impl ReadStatus {
 			Self::BACKPRESSURED => "backpressured",
 			Self::TABLE_DESCRIPTOR_EVOLVED => "table_descriptor_evolved",
 			Self::QUERY_CANCELLED => "query_cancelled",
+			Self::TABLE_REFERENCE_INTEGRITY_FAILED => "table_reference_integrity_failed",
 			_ => "unknown",
 		}
 	}
 }
+
+/// Fixed diagnostic carried as the trailing payload of a terminal query
+/// response whose status is [`ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED`].
+///
+/// This is deliberately a wire value rather than a formatted error string:
+/// Toron needs the same table/reference/slab/origin identity that caused
+/// Wendelon to fence the table.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(C)]
+pub struct TableReferenceIntegrityFailureMeta {
+	pub tenant_id: TenantId,
+	pub table_object_id: [u8; 16],
+	pub missing_slab_id: u64,
+	pub reference_kind: u8,
+	pub origin: u8,
+	pub _pad: [u8; 6],
+}
+
+const _: () = assert!(std::mem::size_of::<TableReferenceIntegrityFailureMeta>() == 40);
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]

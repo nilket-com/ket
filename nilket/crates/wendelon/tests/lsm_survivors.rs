@@ -24,6 +24,7 @@ fn version(
 ) -> VersionEntry {
 	VersionEntry {
 		tenant_id: TenantId::ZERO,
+		table_object_id: None,
 		row_key_id: key(key_byte),
 		row_hlc: hlc(ms),
 		record_row_index: RecordRowIndex::new(row_idx),

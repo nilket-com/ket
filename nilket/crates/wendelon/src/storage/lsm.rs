@@ -222,6 +222,9 @@ pub enum VersionLifecycle {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct VersionEntry {
 	pub tenant_id: crate::schema::TenantId,
+	/// Durable table attribution for the record location. `None` is a legacy or
+	/// untyped row and must never be promoted to a guessed table fence.
+	pub table_object_id: Option<crate::schema::TableObjectId>,
 	pub row_key_id: Identity,
 	pub row_hlc: HybridTimestamp,
 	pub record_row_index: RecordRowIndex,

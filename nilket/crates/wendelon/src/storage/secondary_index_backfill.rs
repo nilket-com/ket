@@ -306,12 +306,21 @@ impl SecondaryIndexActiveBuffer {
 	}
 }
 
+/// Every backfill failure gets the same bounded retry budget, deliberately not gated
+/// on a transient-versus-structural classification: a structural failure burns its
+/// budget cheaply and lands permanent, while no misclassification can strand a
+/// transient error permanently. Exhaustion removes the slab from backfill candidacy
+/// for this process; read refusal never depends on it — that is derived from durable
+/// coverage completeness.
+pub const SECONDARY_INDEX_BACKFILL_ATTEMPT_BUDGET: u32 = 5;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SecondaryIndexCoverageTracker {
 	key: SecondaryIndexCoverageKey,
 	covered_slabs: BTreeSet<SlabId>,
 	active_slab_buffer: Option<SecondaryIndexActiveBuffer>,
 	uncovered_slabs: BTreeMap<SlabId, SecondaryIndexBackfillError>,
+	backfill_attempts: BTreeMap<SlabId, u32>,
 	last_backfill_error: Option<SecondaryIndexBackfillError>,
 }
 
@@ -322,6 +331,7 @@ impl SecondaryIndexCoverageTracker {
 			covered_slabs: BTreeSet::new(),
 			active_slab_buffer: None,
 			uncovered_slabs: BTreeMap::new(),
+			backfill_attempts: BTreeMap::new(),
 			last_backfill_error: None,
 		}
 	}
@@ -358,6 +368,7 @@ impl SecondaryIndexCoverageTracker {
 	pub fn mark_covered(&mut self, source_slab_id: SlabId) {
 		self.covered_slabs.insert(source_slab_id);
 		self.uncovered_slabs.remove(&source_slab_id);
+		self.backfill_attempts.remove(&source_slab_id);
 		if self
 			.active_slab_buffer
 			.as_ref()
@@ -378,11 +389,23 @@ impl SecondaryIndexCoverageTracker {
 		}
 		self.last_backfill_error = Some(error.clone());
 		self.uncovered_slabs.insert(source_slab_id, error);
+		let attempts = self.backfill_attempts.entry(source_slab_id).or_insert(0);
+		*attempts = attempts.saturating_add(1);
+	}
+
+	/// Whether this slab's bounded retry budget is spent. Only candidacy consults
+	/// this; the read-side gate is durable-completeness-derived and never keys on a
+	/// failure record.
+	pub fn is_backfill_exhausted(&self, source_slab_id: SlabId) -> bool {
+		self.backfill_attempts
+			.get(&source_slab_id)
+			.is_some_and(|attempts| *attempts >= SECONDARY_INDEX_BACKFILL_ATTEMPT_BUDGET)
 	}
 
 	pub fn forget_slab(&mut self, source_slab_id: SlabId) {
 		self.covered_slabs.remove(&source_slab_id);
 		self.uncovered_slabs.remove(&source_slab_id);
+		self.backfill_attempts.remove(&source_slab_id);
 		if self
 			.active_slab_buffer
 			.as_ref()

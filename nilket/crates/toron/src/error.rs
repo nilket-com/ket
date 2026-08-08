@@ -59,6 +59,12 @@ pub enum StorageError {
 		#[source]
 		source: wendelon_client::ClientError,
 	},
+	#[error("storage table reference integrity failure: {failure:?}")]
+	TableReferenceIntegrity {
+		failure: wendelon_client::TableReferenceIntegrityFailure,
+		#[source]
+		source: wendelon_client::ClientError,
+	},
 	#[error("storage client error")]
 	Client {
 		#[source]
@@ -86,6 +92,22 @@ impl From<wendelon_client::ClientError> for StorageError {
 			ClientError::TableDescriptorEvolved { .. } => Self::Internal {
 				message: "descriptor evolved without table context".to_string(),
 			},
+			ClientError::TableReferenceIntegrityFailed { failure } => {
+				Self::TableReferenceIntegrity {
+					failure: failure.clone(),
+					source: ClientError::TableReferenceIntegrityFailed { failure },
+				}
+			}
+			ClientError::Io(error)
+				if wendelon_client::table_reference_integrity_failure_from_io(&error).is_some() =>
+			{
+				let failure = wendelon_client::table_reference_integrity_failure_from_io(&error)
+					.expect("integrity failure checked above");
+				Self::TableReferenceIntegrity {
+					failure,
+					source: ClientError::Io(error),
+				}
+			}
 			source @ ClientError::QuotaExceeded { .. }
 			| source @ ClientError::TenantSuspended { .. }
 			| source @ ClientError::TenantUnavailable { .. }
@@ -384,6 +406,23 @@ mod tests {
 			observed: Some(descriptor_fingerprint()),
 		});
 		assert!(matches!(err, StorageError::Internal { .. }));
+
+		let failure = wendelon_client::TableReferenceIntegrityFailure {
+			tenant_id: TenantId::new(7),
+			table_object_id: TableObjectId::new([0xA5; 16]),
+			reference_kind: 1,
+			missing_slab_id: 4,
+			origin: 2,
+		};
+		let err = StorageError::from(ClientError::TableReferenceIntegrityFailed {
+			failure: failure.clone(),
+		});
+		match err {
+			StorageError::TableReferenceIntegrity {
+				failure: actual, ..
+			} => assert_eq!(actual, failure),
+			other => panic!("integrity diagnosis degraded at Toron boundary: {other:?}"),
+		}
 	}
 
 	fn descriptor_fingerprint() -> wendelon::schema::PhysicalDescriptorFingerprint {

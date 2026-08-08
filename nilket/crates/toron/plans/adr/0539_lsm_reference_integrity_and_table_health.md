@@ -43,6 +43,57 @@ not a retryable compaction inconvenience.
    The required outcome is that an acknowledged write cannot make a table unreadable; an
    unvalidated publication is not acknowledged.
 
+   Ruled amendments, post seam proof:
+
+   - **The skip is unrepresentable.** `reconcile_secondary_index_segments_after_compaction`
+     takes a required `SecondaryIndexCompactionContext` — never an `Option` whose absence
+     silently reports success — and returns a proof:
+     `SecondaryIndexReconciliation::{Reconciled, NothingToReconcile}` or an error. "Nothing to
+     reconcile" is a proven conclusion from the catalogs and the durable segment registry, so
+     it can never be confused with "skipped". Slab retirement on the compaction paths consumes
+     this proof; on failure the slab is quarantined and its file preserved.
+   - **A coverage gap refuses lookups; it never under-reports — and the gate is the
+     invariant, not the failure record.** The non-fatal rebuild exit was justified as
+     "degraded and backfillable"; scrutiny refuted the premise twice over. First, uncovered
+     slabs were excluded from backfill candidacy, making the state permanent while the
+     coverage-blind lookup returned success that silently omitted rows — a strictly worse
+     shape than the unreadable table this ADR opened on. Second, the first fix gated refusal
+     on the in-memory `uncovered_slabs` record, which empties on restart: the silent wrong
+     answer resurrected for every process that never observed the failure. This arc found
+     the same shape three times — a guard bound to a failure record rather than to the
+     invariant — so the ruling binds the gate to the invariant: `table_lookup_by_index`
+     refuses while any historical source slab lacks a durable segment, derived from the
+     segment registry (rebuilt from durable rows at every open) against the live slab
+     inventory. It survives restart by construction and needs no new durable field. There is
+     deliberately no exemption for an open active buffer whose slab has sealed: those rows
+     are index-invisible until the buffer seals, and answering through that window is the
+     silently-incomplete success the gate exists to refuse.
+
+     Retry is budget-bounded, never class-gated: every backfill failure keeps candidacy
+     until a fixed attempt budget spends, then lands permanent — a structural failure burns
+     its budget cheaply, and no transient-versus-structural misclassification can strand a
+     transient error, which is where the expensive mistake would live. Two former marking
+     sites are removed from the failure taxonomy entirely: segment deletion is lifecycle
+     bookkeeping (the registry removal itself re-opens the gap and candidacy), and the
+     still-active seal race is ordinary scheduling noise. The full-scan fallback stays
+     ruled out as silent degradation of query cost. Controls:
+     `secondary_index_lookup_refuses_while_a_source_slab_lacks_a_segment` (both silent
+     shapes, no failure record involved),
+     `secondary_index_lookup_still_refuses_after_reopen` (the restart hole, closed by
+     construction, plus heal-and-survive), and
+     `backfill_candidacy_survives_failures_until_the_budget_spends`.
+   - **Positive proof replaces the negative scan on the compaction paths.** The
+     snapshot-scanning `can_retire_local_slab` guard remains only on the sweep paths, where no
+     reconciliation proof exists; the compaction paths retire on proof, which removes the
+     O(candidates x index) scan from the hot route instead of optimizing it.
+   - **Scope.** Both with-replacement compaction paths are fixed — `compact_sealed_slab_records`
+     and `recluster_one_sealed_slab` (which previously retired without any reconciliation call at
+     all). The tiered retirement paths (`tiered_io.rs`) are **deferred by name**: they retire
+     slab files under the tiered/L2 lifecycle, a different mechanism with its own invariants,
+     and are unguarded today. The follow-on must extend either proof-carrying reconciliation or
+     the sweep scan to tiered retirement; until then finding 1 of the guard review is contained,
+     not closed.
+
 5. **Toron preserves the diagnosis.** The Wendelon-to-Toron error surface carries the typed
    table-integrity failure through the SQL path. A user receives an attributable table/reference/
    slab error rather than `TaskFailureKind::Internal { reason: "storage unavailable" }`.
@@ -50,6 +101,17 @@ not a retryable compaction inconvenience.
 ## Grounding and implementation sequence
 
 ### Phase 0 — deterministic reproduction and source map
+
+**Discharged.** The seam:`compact_sealed_slab_records` unlinked the retiring slab
+unconditionally after a reconciliation whose result was discarded and whose context was
+optional — three of four production-reachable callers passed `None`, making reconciliation a
+silent no-op (`recluster_one_sealed_slab` never reconciled at all). Proven by
+`prune_compaction_must_not_orphan_secondary_index_sources`, authored red with production calls
+only — ordinary writes, seal, production backfill, routine retention prune — failing with the
+live wedge's verbatim error, including the slab id: fresh profiles begin at slab 0. The
+two-cycle sampler-sized fixture is a **smoke check, not evidence**: it is green on the wedging
+base because point lookups bypass secondary coverage; promoting it requires a node-level typed
+table-query executor in the fixture harness, which does not exist yet.
 
 Build a persisted, single-node Wendelon fixture equivalent to the sampler's clean case: a fresh
 table receives two ordinary multi-thousand-row batches, with reads after each cycle. Preserve the

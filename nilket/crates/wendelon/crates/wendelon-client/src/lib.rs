@@ -444,6 +444,17 @@ pub struct QueryResult {
 	pub batches: Vec<RecordBatch>,
 }
 
+/// The typed counterpart of a terminal
+/// `TABLE_REFERENCE_INTEGRITY_FAILED` query response.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TableReferenceIntegrityFailure {
+	pub tenant_id: TenantId,
+	pub table_object_id: TableObjectId,
+	pub reference_kind: u8,
+	pub missing_slab_id: u64,
+	pub origin: u8,
+}
+
 #[derive(Debug, Error)]
 pub enum ClientError {
 	#[error(transparent)]
@@ -465,6 +476,10 @@ pub enum ClientError {
 		expected: PhysicalDescriptorFingerprint,
 		observed: Option<PhysicalDescriptorFingerprint>,
 	},
+	#[error("table reference integrity failure: {failure:?}")]
+	TableReferenceIntegrityFailed {
+		failure: TableReferenceIntegrityFailure,
+	},
 	#[error("schema update rejected with reason {reason_code}: {message}")]
 	SchemaUpdateRejected { reason_code: u8, message: String },
 	#[error("admin operation rejected: {0:?}")]
@@ -485,6 +500,7 @@ impl ClientError {
 			Self::WriteFailed { status } => map_write_status_for_compute(*status),
 			Self::TableWriteRejected { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableDescriptorEvolved { .. } => StorageStatusKind::TerminalStorageError,
+			Self::TableReferenceIntegrityFailed { .. } => StorageStatusKind::TerminalStorageError,
 			Self::SchemaUpdateRejected { .. } => StorageStatusKind::TerminalStorageError,
 			Self::Admin(_) => StorageStatusKind::TerminalStorageError,
 			Self::ReadFailed { status } => map_read_status_for_compute(*status),
@@ -1295,7 +1311,7 @@ impl Client {
 					observed: None,
 				})
 			}
-			Err(error) => Err(error.into()),
+			Err(error) => Err(table_query_client_error(error)),
 		}
 	}
 
@@ -1342,7 +1358,7 @@ impl Client {
 					observed: None,
 				})
 			}
-			Err(error) => Err(error.into()),
+			Err(error) => Err(table_query_client_error(error)),
 		}
 	}
 
@@ -1653,6 +1669,33 @@ fn is_table_descriptor_evolved_error(error: &std::io::Error) -> bool {
 		&& error.to_string().contains("TABLE_DESCRIPTOR_EVOLVED")
 }
 
+fn table_query_client_error(error: std::io::Error) -> ClientError {
+	if let Some(failure) = table_reference_integrity_failure_from_io(&error) {
+		return ClientError::TableReferenceIntegrityFailed { failure };
+	}
+	ClientError::Io(error)
+}
+
+/// Extracts the wire diagnostic when a streaming terminal failure arrives
+/// after the initial query setup. Callers that consume a stream themselves
+/// can preserve the same typed failure as the initial-response path.
+pub fn table_reference_integrity_failure_from_io(
+	error: &std::io::Error,
+) -> Option<TableReferenceIntegrityFailure> {
+	error
+		.get_ref()
+		.and_then(|source| {
+			source.downcast_ref::<wendelon::client::TableReferenceIntegrityQueryError>()
+		})
+		.map(|error| TableReferenceIntegrityFailure {
+			tenant_id: error.failure.tenant_id,
+			table_object_id: TableObjectId::new(error.failure.table_object_id),
+			reference_kind: error.failure.reference_kind,
+			missing_slab_id: error.failure.missing_slab_id,
+			origin: error.failure.origin,
+		})
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1723,6 +1766,36 @@ mod tests {
 		);
 
 		assert!(is_table_descriptor_evolved_error(&err));
+	}
+
+	#[test]
+	fn table_reference_integrity_io_error_preserves_the_wire_diagnosis() {
+		let error = std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			wendelon::client::TableReferenceIntegrityQueryError {
+				failure: wendelon::schema::TableReferenceIntegrityFailureMeta {
+					tenant_id: TenantId::new(7),
+					table_object_id: [0xA5; 16],
+					missing_slab_id: 4,
+					reference_kind: 1,
+					origin: 2,
+					_pad: [0; 6],
+				},
+			},
+		);
+		let actual = table_query_client_error(error);
+		assert!(matches!(
+			actual,
+			ClientError::TableReferenceIntegrityFailed {
+				failure: TableReferenceIntegrityFailure {
+					tenant_id,
+					missing_slab_id: 4,
+					reference_kind: 1,
+					origin: 2,
+					..
+				}
+			} if tenant_id == TenantId::new(7)
+		));
 	}
 
 	#[test]

@@ -171,6 +171,16 @@ impl WendelonDataServer {
 	) -> std::io::Result<HrftFrame> {
 		metrics().data_ring_query_requests_total.inc();
 		let (meta, bytecode, runtime_filter) = self.decode_table_query_request_frame(&frame)?;
+		if let Some(failure) = self
+			.slab
+			.table_integrity_failure(meta.tenant_id, meta.table_object_id)
+		{
+			return Ok(self.table_query_integrity_error_frame(
+				frame.header.stream_id,
+				&meta,
+				failure,
+			));
+		}
 		let audit_meta = table_query_as_range_query(&meta);
 		let trace_carrier = decode_table_query_trace_carrier(&meta);
 		let trace_started_at = Instant::now();
@@ -219,6 +229,16 @@ impl WendelonDataServer {
 		{
 			Ok(plan) => plan,
 			Err(err) => {
+				if let Some(failure) = self
+					.slab
+					.table_integrity_failure(meta.tenant_id, meta.table_object_id)
+				{
+					return Ok(self.table_query_integrity_error_frame(
+						frame.header.stream_id,
+						&meta,
+						failure,
+					));
+				}
 				self.emit_row_group_invariant_audit_for_error(
 					actor,
 					meta.tenant_id,
@@ -239,6 +259,16 @@ impl WendelonDataServer {
 				return Err(err);
 			}
 		};
+		if let Some(failure) = self
+			.slab
+			.table_integrity_failure(meta.tenant_id, meta.table_object_id)
+		{
+			return Ok(self.table_query_integrity_error_frame(
+				frame.header.stream_id,
+				&meta,
+				failure,
+			));
+		}
 		if plan.response.status != ReadStatus::OK || plan.batches.is_empty() {
 			if plan.response.status == ReadStatus::QUERY_CANCELLED {
 				metrics().observe_table_query_cancellation("cancelled_response");
@@ -409,6 +439,26 @@ impl WendelonDataServer {
 	) -> std::io::Result<()> {
 		metrics().data_ring_query_requests_total.inc();
 		let (meta, bytecode, runtime_filter) = self.decode_table_query_request_frame(&frame)?;
+		if let Some(failure) = self
+			.slab
+			.table_integrity_failure(meta.tenant_id, meta.table_object_id)
+		{
+			let response = query_error_meta(
+				&table_query_as_range_query(&meta),
+				ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+				self.local_node,
+			);
+			let mut writer = TableQueryResponseStreamWriter::new(
+				&mut *stream,
+				frame.header.stream_id,
+				query_ok_provisional_meta(&table_query_as_range_query(&meta), self.local_node),
+			);
+			writer
+				.emit_terminal_with_integrity(response, failure.wire_meta())
+				.await?;
+			stream.finish().await?;
+			return Ok(());
+		}
 		let audit_meta = table_query_as_range_query(&meta);
 		let trace_carrier = decode_table_query_trace_carrier(&meta);
 		let trace_started_at = Instant::now();
@@ -465,6 +515,21 @@ impl WendelonDataServer {
 		{
 			Ok(plan) => plan,
 			Err(err) => {
+				if let Some(failure) = self
+					.slab
+					.table_integrity_failure(meta.tenant_id, meta.table_object_id)
+				{
+					let response = query_error_meta(
+						&audit_meta,
+						ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+						self.local_node,
+					);
+					writer
+						.emit_terminal_with_integrity(response, failure.wire_meta())
+						.await?;
+					stream.finish().await?;
+					return Ok(());
+				}
 				self.emit_row_group_invariant_audit_for_error(
 					actor,
 					meta.tenant_id,
@@ -488,6 +553,21 @@ impl WendelonDataServer {
 				return Err(err);
 			}
 		};
+		if let Some(failure) = self
+			.slab
+			.table_integrity_failure(meta.tenant_id, meta.table_object_id)
+		{
+			let response = query_error_meta(
+				&audit_meta,
+				ReadStatus::TABLE_REFERENCE_INTEGRITY_FAILED,
+				self.local_node,
+			);
+			writer
+				.emit_terminal_with_integrity(response, failure.wire_meta())
+				.await?;
+			stream.finish().await?;
+			return Ok(());
+		}
 		let mut response = plan.response;
 		if response.status == ReadStatus::KEY_NOT_FOUND {
 			response.status = ReadStatus::OK;

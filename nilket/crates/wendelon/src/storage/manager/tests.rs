@@ -23,6 +23,7 @@ use crate::storage::EncodingPageDescriptor;
 use crate::storage::io_uring::spawn_io_thread;
 use crate::storage::l2::{LocalFsObjectStore, ObjectStore};
 use crate::storage::multirow::pack_record_batch_by_bucket;
+use crate::storage::secondary_index_backfill::SECONDARY_INDEX_BACKFILL_ATTEMPT_BUDGET;
 use crate::storage::stats::{
 	ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT64, ARROW_STATS_TAG_LARGE_UTF8,
 	ARROW_STATS_TAG_UTF8, COLUMN_STAT_HAS_GROUP_NDV, COLUMN_STAT_HAS_GROUP_TOP_K,
@@ -1753,6 +1754,205 @@ fn encode_test_append_only_storage_frame(
 	encode_test_batch(&batch)
 }
 
+#[tokio::test]
+async fn durable_multirow_table_attribution_survives_manager_reopen() {
+	let dir = fresh_dir("adr0539-table-attribution");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let table_object_id = TableObjectId::new([0x53; 16]);
+	let key_identity = id(5_039);
+	let row_hlc = hlc(5_039);
+	let frame = encode_test_append_only_storage_frame(
+		table_object_id,
+		&[(key_identity, Locality::new(53), row_hlc, 53, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("typed storage frame must expose multi-row entries");
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let location = manager
+		.lookup(tenant(), key_identity)
+		.expect("published typed row");
+	assert_eq!(
+		manager.published_table_object_id(location),
+		Some(table_object_id)
+	);
+	assert_eq!(
+		manager.tables_referencing_slab_by_kind(
+			location.slab_id,
+			PublishedReferenceKind::RecordLocation,
+		),
+		BTreeSet::from([(tenant(), table_object_id)])
+	);
+
+	drop(manager);
+	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	assert_eq!(
+		reopened.published_table_object_id(location),
+		Some(table_object_id)
+	);
+	assert_eq!(
+		reopened.tables_referencing_slab_by_kind(
+			location.slab_id,
+			PublishedReferenceKind::RecordLocation,
+		),
+		BTreeSet::from([(tenant(), table_object_id)])
+	);
+}
+
+#[tokio::test]
+async fn missing_published_reference_fences_the_referencing_typed_table_before_write_ack() {
+	let manager = fresh_manager().await;
+	let table_object_id = TableObjectId::new([0x54; 16]);
+	let key_identity = id(5_040);
+	let row_hlc = hlc(5_040);
+	let frame = encode_test_append_only_storage_frame(
+		table_object_id,
+		&[(key_identity, Locality::new(54), row_hlc, 54, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("typed storage frame must expose multi-row entries");
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let location = manager.lookup(tenant(), key_identity).unwrap();
+	let slab_id = manager.force_seal_active_for_test().await;
+	assert_eq!(location.slab_id, slab_id);
+	let unrelated_table_object_id = TableObjectId::new([0x56; 16]);
+	let unrelated_key_identity = id(5_042);
+	let unrelated_frame = encode_test_append_only_storage_frame(
+		unrelated_table_object_id,
+		&[(
+			unrelated_key_identity,
+			Locality::new(56),
+			hlc(5_042),
+			56,
+			false,
+		)],
+	);
+	let unrelated_entries = storage_multirow_index_entries_from_frame(&unrelated_frame)
+		.unwrap()
+		.expect("typed storage frame must expose multi-row entries");
+	manager
+		.append_durable_multirow_with_locality(tenant(), &unrelated_frame, &unrelated_entries)
+		.await
+		.unwrap();
+	let unrelated_location = manager.lookup(tenant(), unrelated_key_identity).unwrap();
+	assert_ne!(unrelated_location.slab_id, slab_id);
+	manager.state.lock().await.sealed.remove(&slab_id);
+
+	let read_error = manager.read(location).await.unwrap_err();
+	assert_eq!(read_error.kind(), std::io::ErrorKind::NotFound);
+	let failure = manager
+		.table_integrity_failure(tenant(), table_object_id)
+		.expect("missing backing must fence the known referencing table");
+	assert_eq!(failure.missing_slab_id, slab_id);
+	assert_eq!(
+		failure.reference_kind,
+		PublishedReferenceKind::RecordLocation
+	);
+	assert_eq!(failure.origin, PublishedReferenceOrigin::Read);
+	assert!(manager.is_compaction_slab_quarantined(slab_id));
+
+	let write_error = manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap_err();
+	assert_eq!(write_error.kind(), std::io::ErrorKind::InvalidData);
+	assert!(
+		write_error
+			.to_string()
+			.contains("published reference integrity failure")
+	);
+	assert_eq!(
+		manager.table_integrity_failure(tenant(), unrelated_table_object_id),
+		None,
+		"a table without a reference into the missing slab stays outside the fence"
+	);
+	assert!(manager.read(unrelated_location).await.is_ok());
+}
+
+#[tokio::test]
+async fn recovery_fences_durable_reference_to_missing_slab() {
+	let dir = fresh_dir("adr0539-recovery-fence");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let table_object_id = TableObjectId::new([0x55; 16]);
+	let key_identity = id(5_041);
+	let row_hlc = hlc(5_041);
+	let frame = encode_test_append_only_storage_frame(
+		table_object_id,
+		&[(key_identity, Locality::new(55), row_hlc, 55, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("typed storage frame must expose multi-row entries");
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let location = manager.lookup(tenant(), key_identity).unwrap();
+	let slab_id = manager.force_seal_active_for_test().await;
+	assert_eq!(location.slab_id, slab_id);
+	drop(manager);
+	std::fs::remove_file(slab_path(&dir, slab_id)).unwrap();
+
+	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let failure = reopened
+		.table_integrity_failure(tenant(), table_object_id)
+		.expect("recovery must detect the durable reference to the removed slab");
+	assert_eq!(failure.missing_slab_id, slab_id);
+	assert_eq!(failure.origin, PublishedReferenceOrigin::Recovery);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir, io, crypto).await;
+	assert_eq!(
+		reopened_again
+			.table_integrity_failure(tenant(), table_object_id)
+			.expect("recovery must not erase the durable dangling-reference evidence")
+			.origin,
+		PublishedReferenceOrigin::Recovery
+	);
+}
+
+#[tokio::test]
+async fn durable_index_reference_blocks_local_slab_retirement() {
+	let manager = fresh_manager().await;
+	let table_object_id = TableObjectId::new([0x57; 16]);
+	let key_identity = id(5_043);
+	let row_hlc = hlc(5_043);
+	let frame = encode_test_append_only_storage_frame(
+		table_object_id,
+		&[(key_identity, Locality::new(57), row_hlc, 57, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("typed storage frame must expose multi-row entries");
+	manager
+		.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let location = manager.lookup(tenant(), key_identity).unwrap();
+	let slab_id = manager.force_seal_active_for_test().await;
+	assert_eq!(location.slab_id, slab_id);
+
+	// Fault injection: the runtime index has advanced but the durable index
+	// still names the old slab. Retiring the file must stop here.
+	manager.rollback_indexed_location(tenant(), key_identity, location);
+	assert!(
+		!manager.can_retire_local_slab(slab_id).await.unwrap(),
+		"stale durable locations must prevent unlinking their backing slab"
+	);
+	assert!(manager.is_compaction_slab_quarantined(slab_id));
+	assert!(manager.state.lock().await.sealed.contains_key(&slab_id));
+}
+
 fn encode_test_pk_tombstone_marker_frame(
 	descriptor: &TableSchemaDescriptor,
 	key_identity: Identity,
@@ -1965,6 +2165,13 @@ fn storage_compression_l2_fetch_metric_value(codec: RecordBodyCompressionPolicy)
 			}
 		})
 		.unwrap_or(0)
+}
+
+fn empty_compaction_catalogs() -> (TableSchemaCatalog, SecondaryIndexCatalog) {
+	(
+		TableSchemaCatalog::default(),
+		SecondaryIndexCatalog::default(),
+	)
 }
 
 async fn fresh_manager() -> Arc<SlabManager> {
@@ -2996,11 +3203,37 @@ async fn secondary_index_segment_catalog_persists_loads_and_deletes() {
 		.secondary_index_coverage_snapshot(info.coverage_key())
 		.unwrap();
 	assert!(coverage.covered_slabs.is_empty());
-	assert_eq!(coverage.uncovered_slabs[0].0, info.source_slab_id);
+	// Deletion is lifecycle, not failure: no failure record, no spent retry budget —
+	// the slab simply stops being covered, which re-opens the completeness gap and
+	// returns it to backfill candidacy.
+	assert!(coverage.uncovered_slabs.is_empty());
+}
+
+#[tokio::test]
+async fn recovery_fences_missing_secondary_index_source_slab() {
+	let dir = fresh_dir("adr0539-secondary-source-recovery");
+	let crypto = test_crypto();
+	let manager =
+		open_manager_at_dir(dir.clone(), spawn_io_thread(64).unwrap(), crypto.clone()).await;
+	let segment = secondary_index_segment_for_test(SlabId::new(5_039));
+	let info = manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+	drop(manager);
+
+	let reopened = open_manager_at_dir(dir, spawn_io_thread(64).unwrap(), crypto).await;
 	assert_eq!(
-		coverage.uncovered_slabs[0].1.reason,
-		SecondaryIndexBackfillErrorReason::MissingSegment
+		reopened.table_integrity_failure(info.tenant_id, info.table_object_id),
+		Some(PublishedReferenceIntegrityFailure {
+			tenant_id: info.tenant_id,
+			table_object_id: info.table_object_id,
+			reference_kind: PublishedReferenceKind::SecondaryIndexSourceSlab,
+			missing_slab_id: info.source_slab_id,
+			origin: PublishedReferenceOrigin::Recovery,
+		})
 	);
+	assert!(reopened.is_compaction_slab_quarantined(info.source_slab_id));
 }
 
 #[tokio::test]
@@ -4745,7 +4978,15 @@ async fn l1_retention_pruning_filters_partial_multirow_storage_records_once() {
 		.unwrap();
 
 	let old_slab_id = force_seal_active(&mgr).await;
-	let report = mgr.prune_versions_older_than(hlc(50), 1).await.unwrap();
+	let report = mgr
+		.prune_versions_older_than(
+			hlc(50),
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			1,
+		)
+		.await
+		.unwrap();
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 1);
 	assert!(
@@ -5190,7 +5431,15 @@ async fn l1_retention_pruning_pair_gc_drops_data_and_row_tombstone() {
 		.unwrap();
 
 	force_seal_active(&mgr).await;
-	let report = mgr.prune_versions_older_than(hlc(30), 1).await.unwrap();
+	let report = mgr
+		.prune_versions_older_than(
+			hlc(30),
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			1,
+		)
+		.await
+		.unwrap();
 
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 2);
@@ -5217,7 +5466,15 @@ async fn l1_retention_pruning_keeps_pair_until_floor_passes_tombstone() {
 		.unwrap();
 
 	force_seal_active(&mgr).await;
-	let report = mgr.prune_versions_older_than(hlc(20), 1).await.unwrap();
+	let report = mgr
+		.prune_versions_older_than(
+			hlc(20),
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			1,
+		)
+		.await
+		.unwrap();
 
 	assert_eq!(report.compacted_slabs, 0);
 	assert_eq!(report.pruned_versions, 0);
@@ -5756,7 +6013,13 @@ async fn sealed_layout_recluster_single_to_multi_preserves_reads() {
 	let old_slab_id = force_seal_active(&mgr).await;
 
 	let report = mgr
-		.recluster_sealed_table_layout(tenant(), &multi_descriptor, 10)
+		.recluster_sealed_table_layout(
+			tenant(),
+			&multi_descriptor,
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			10,
+		)
 		.await
 		.unwrap();
 
@@ -5783,7 +6046,13 @@ async fn sealed_layout_recluster_single_to_multi_preserves_reads() {
 	);
 
 	let second = mgr
-		.recluster_sealed_table_layout(tenant(), &multi_descriptor, 10)
+		.recluster_sealed_table_layout(
+			tenant(),
+			&multi_descriptor,
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			10,
+		)
 		.await
 		.unwrap();
 	assert_eq!(second, LayoutReclusterReport::default());
@@ -5827,7 +6096,13 @@ async fn sealed_layout_recluster_multi_to_single_preserves_reads() {
 	let old_slab_id = force_seal_active(&mgr).await;
 
 	let report = mgr
-		.recluster_sealed_table_layout(tenant(), &single_descriptor, 10)
+		.recluster_sealed_table_layout(
+			tenant(),
+			&single_descriptor,
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			10,
+		)
 		.await
 		.unwrap();
 
@@ -5916,7 +6191,13 @@ async fn assert_sealed_layout_recluster_updates_multirow_codec(
 	let old_slab_id = force_seal_active(&mgr).await;
 
 	let report = mgr
-		.recluster_sealed_table_layout(tenant(), &target_descriptor, 10)
+		.recluster_sealed_table_layout(
+			tenant(),
+			&target_descriptor,
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			10,
+		)
 		.await
 		.unwrap();
 
@@ -5940,7 +6221,13 @@ async fn assert_sealed_layout_recluster_updates_multirow_codec(
 	}
 
 	let second = mgr
-		.recluster_sealed_table_layout(tenant(), &target_descriptor, 10)
+		.recluster_sealed_table_layout(
+			tenant(),
+			&target_descriptor,
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			10,
+		)
 		.await
 		.unwrap();
 	assert_eq!(second, LayoutReclusterReport::default());
@@ -6525,7 +6812,13 @@ async fn compression_resident_gauge_tracks_sealed_recluster_convergence() {
 	);
 
 	let report = mgr
-		.recluster_sealed_table_layout(tenant(), &target_descriptor, 10)
+		.recluster_sealed_table_layout(
+			tenant(),
+			&target_descriptor,
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			10,
+		)
 		.await
 		.unwrap();
 	assert_eq!(report.rewritten_slabs, 1);
@@ -10065,6 +10358,8 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 				completed_at_hlc: hlc(1),
 				migration_hlc_floor: hlc(0),
 			}],
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
 			1,
 		)
 		.await
@@ -10491,7 +10786,15 @@ async fn retention_pruning_keeps_latest_version_before_floor() {
 	let sealed_id = force_seal_active(&manager).await;
 	assert_eq!(manager.sealed_count().await, 1);
 
-	let report = manager.prune_versions_older_than(hlc(25), 1).await.unwrap();
+	let report = manager
+		.prune_versions_older_than(
+			hlc(25),
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			1,
+		)
+		.await
+		.unwrap();
 	assert_eq!(report.compacted_slabs, 1);
 	assert_eq!(report.pruned_versions, 1);
 	assert!(report.reclaimed_bytes > 0);
@@ -10528,7 +10831,12 @@ async fn retention_pruning_keeps_latest_when_all_versions_precede_floor() {
 	force_seal_active(&manager).await;
 
 	let report = manager
-		.prune_versions_older_than(hlc(100), 1)
+		.prune_versions_older_than(
+			hlc(100),
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			1,
+		)
 		.await
 		.unwrap();
 	assert_eq!(report.compacted_slabs, 1);
@@ -10715,4 +11023,336 @@ impl SlabManager {
 			encrypted_bytes: encrypted.bytes,
 		}))
 	}
+}
+
+/// ADR 0539 Phase 0 seam publication, now the discriminating control. Authored red
+/// against production calls only — ordinary writes, seal, production backfill, then
+/// retention pruning — when the compaction paths could still skip reconciliation via
+/// an optional context and unlink unconditionally. Green requires what the ruling
+/// requires: reconciliation proof before retirement, with the skip unrepresentable.
+#[tokio::test]
+async fn prune_compaction_must_not_orphan_secondary_index_sources() {
+	let dir = fresh_dir("adr0539-prune-orphans-secondary-source");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+
+	for id_value in 0..4_i64 {
+		append_secondary_index_table_row_for_test(
+			&manager,
+			&table,
+			id_value,
+			Some(30 + id_value),
+			hlc(6_000 + id_value as u64),
+		)
+		.await;
+	}
+	// A second version of key 0: its older version is the prunable record that makes
+	// retention pruning take the with-replacement compaction path (survivors remain).
+	append_secondary_index_table_row_for_test(&manager, &table, 0, Some(40), hlc(6_010)).await;
+	let slab_id = manager.force_seal_active_for_test().await;
+
+	// Production backfill: the durable segment now names `slab_id` as its source and
+	// coverage records it covered.
+	let segment = manager
+		.build_secondary_index_segment_for_source_slab(tenant(), &table, &descriptor, slab_id)
+		.await
+		.unwrap();
+	manager
+		.persist_secondary_index_segment(&segment)
+		.await
+		.unwrap();
+
+	// Production retention pruning over the sealed slab. The floor predates every row,
+	// so nothing is prunable: this is the routine keep-everything compaction that
+	// builds a replacement and retires the source.
+	let slab = {
+		let state = manager.state.lock().await;
+		let (_, slab) = state.sealed.remove(&slab_id).expect("sealed slab present");
+		state.sealed.insert(slab_id, slab.clone());
+		slab
+	};
+	let mut catalog_tables = TableSchemaCatalog::default();
+	catalog_tables.upsert(tenant(), table.clone()).unwrap();
+	let mut catalog_indexes = SecondaryIndexCatalog::default();
+	catalog_indexes
+		.create(tenant(), descriptor.clone(), &catalog_tables)
+		.unwrap();
+	let outcome = manager
+		.prune_one_sealed_slab(
+			slab_id,
+			slab,
+			hlc(7_000),
+			SecondaryIndexCompactionContext {
+				table_schemas: &catalog_tables,
+				secondary_indexes: &catalog_indexes,
+			},
+		)
+		.await
+		.unwrap();
+	assert!(
+		outcome.is_some(),
+		"the prune must actually compact: a vacuous run proves nothing"
+	);
+
+	// The published-reference invariant: after retirement, no durable secondary-index
+	// segment may still name the retired slab as a source it expects to resolve.
+	let still_naming_source = manager.list_secondary_index_segments_for_source_slab(slab_id);
+	let source_available = manager
+		.ensure_secondary_index_source_slab_available(slab_id)
+		.await;
+	assert!(
+		still_naming_source.is_empty() || source_available.is_ok(),
+		"prune compaction retired slab {} while durable secondary-index segments still \
+		 name it as their source: segments={}, availability={:?}",
+		slab_id.get(),
+		still_naming_source.len(),
+		source_available.err().map(|error| error.to_string()),
+	);
+}
+
+/// The recluster path carried the identical retire-without-proof shape as the proven
+/// seam. Its sibling control: a durable segment names the source slab while the
+/// catalogs do not know its index, so reconciliation cannot prove retirement safe.
+/// The replacement may install, but the source file must be preserved, the slab
+/// quarantined, and the integrity state recorded — containment, never a dangling ref.
+#[tokio::test]
+async fn recluster_refuses_retirement_without_reconciliation_proof() {
+	let dir = fresh_dir("adr0539-recluster-refuses");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io, crypto).await;
+	let single_descriptor = layout_recluster_descriptor(0x64, 1, RecordLayoutPolicy::SingleRow);
+	let multi_descriptor = layout_recluster_descriptor(
+		0x64,
+		2,
+		RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 4, 1024 * 1024).unwrap()),
+	);
+	let batch = layout_recluster_batch(&[1, 2, 3, 4]);
+	let meta = layout_recluster_meta(&single_descriptor, batch.num_rows());
+	let admission = validate_table_write_request_batch(
+		&meta,
+		&batch,
+		&single_descriptor,
+		WriterNodeId::ZERO,
+		meta.client_hlc,
+	)
+	.unwrap();
+	for row in 0..batch.num_rows() {
+		let row_batch = batch.slice(row, 1);
+		let frame = encode_test_batch(&row_batch);
+		manager
+			.append_durable_with_locality(
+				tenant(),
+				admission.key_identities[row],
+				admission.localities[row],
+				hlc(10 + row as u64),
+				&frame,
+			)
+			.await
+			.unwrap();
+	}
+	let slab_id = manager.force_seal_active_for_test().await;
+	manager
+		.persist_secondary_index_segment(&secondary_index_segment_for_test(slab_id))
+		.await
+		.unwrap();
+
+	let mut catalog_tables = TableSchemaCatalog::default();
+	catalog_tables
+		.upsert(tenant(), multi_descriptor.clone())
+		.unwrap();
+	let catalog_indexes = SecondaryIndexCatalog::default();
+	let slab = {
+		let state = manager.state.lock().await;
+		let (_, slab) = state.sealed.remove(&slab_id).expect("sealed slab present");
+		state.sealed.insert(slab_id, slab.clone());
+		slab
+	};
+	let outcome = manager
+		.recluster_one_sealed_slab(
+			slab_id,
+			slab,
+			tenant(),
+			&multi_descriptor,
+			SecondaryIndexCompactionContext {
+				table_schemas: &catalog_tables,
+				secondary_indexes: &catalog_indexes,
+			},
+		)
+		.await
+		.unwrap();
+	assert!(outcome.is_some(), "the recluster itself proceeds");
+	assert!(
+		manager.is_compaction_slab_quarantined(slab_id),
+		"unproven retirement must quarantine"
+	);
+	assert!(
+		slab_path(&dir, slab_id).exists(),
+		"the unproven slab file must be preserved on disk"
+	);
+	let segment_table = secondary_index_table_descriptor_for_test();
+	assert!(
+		manager
+			.table_integrity_failure(tenant(), segment_table.table_object_id)
+			.is_some(),
+		"the affected table's integrity state must be recorded"
+	);
+}
+
+/// ADR 0539: the read-side gate is the invariant — every historical source slab has
+/// a durable segment — never the in-memory failure record. A slab sealed without a
+/// segment is a gap regardless of whether this process observed any failure, and both
+/// silent shapes must refuse: a key the covered segment CAN answer (silently
+/// incomplete) and a key living only in the gap slab (a successful empty lie).
+#[tokio::test]
+async fn secondary_index_lookup_refuses_while_a_source_slab_lacks_a_segment() {
+	let manager = fresh_manager().await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
+	append_secondary_index_table_row_for_test(&manager, &table, 2, Some(20), hlc(20)).await;
+	force_seal_active(&manager).await;
+	manager
+		.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+		.await
+		.unwrap();
+
+	// A second sealed slab with no segment: a durable gap, no failure record needed.
+	append_secondary_index_table_row_for_test(&manager, &table, 3, Some(30), hlc(30)).await;
+	manager.force_seal_active_for_test().await;
+
+	for probe in [10, 30] {
+		let request = TableLookupByIndexRequest::from_descriptor(
+			tenant(),
+			&descriptor,
+			IndexQuery::PointEqual {
+				encoded_key: secondary_index_encoded_i64_for_test(probe),
+			},
+			hlc(99),
+		);
+		let err = manager
+			.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Ready)
+			.await
+			.expect_err("a lookup over a durable coverage gap must refuse");
+		assert!(
+			err.to_string().contains("uncovered"),
+			"refusal must name the gap: {err}"
+		);
+	}
+}
+
+/// The gate must survive restart, because the failure record does not: a process that
+/// never observed the failure still refuses, from durable completeness alone — the
+/// restart hole that resurrected the silent wrong answer is closed by construction.
+#[tokio::test]
+async fn secondary_index_lookup_still_refuses_after_reopen() {
+	let dir = fresh_dir("adr0539-lookup-gate-survives-reopen");
+	let crypto = test_crypto();
+	let io = spawn_io_thread(64).unwrap();
+	let manager = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
+	force_seal_active(&manager).await;
+	drop(manager);
+
+	let request = TableLookupByIndexRequest::from_descriptor(
+		tenant(),
+		&descriptor,
+		IndexQuery::PointEqual {
+			encoded_key: secondary_index_encoded_i64_for_test(10),
+		},
+		hlc(99),
+	);
+	let reopened = open_manager_at_dir(dir.clone(), io.clone(), crypto.clone()).await;
+	let err = reopened
+		.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Ready)
+		.await
+		.expect_err("a fresh process must refuse over a durable gap it never observed");
+	assert!(err.to_string().contains("uncovered"));
+
+	// Backfill heals the gap; the healed state also survives reopen.
+	reopened
+		.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+		.await
+		.unwrap();
+	let report = reopened
+		.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Ready)
+		.await
+		.unwrap();
+	assert_eq!(report.rows.len(), 1);
+	drop(reopened);
+	let reopened_again = open_manager_at_dir(dir, io, crypto).await;
+	let report = reopened_again
+		.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Ready)
+		.await
+		.unwrap();
+	assert_eq!(report.rows.len(), 1);
+}
+
+/// Candidacy is budget-bounded, never class-gated: every failure retries until the
+/// budget spends, so no misclassification can strand a transient error permanently,
+/// and a structural failure burns its budget cheaply and lands where it should.
+#[tokio::test]
+async fn backfill_candidacy_survives_failures_until_the_budget_spends() {
+	let manager = fresh_manager().await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
+	let slab_id = manager.force_seal_active_for_test().await;
+	let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+		tenant(),
+		&descriptor,
+	));
+
+	for attempt in 0..SECONDARY_INDEX_BACKFILL_ATTEMPT_BUDGET {
+		let plan = manager
+			.ensure_secondary_index_coverage(tenant(), &descriptor, 4096)
+			.await
+			.unwrap();
+		assert!(
+			plan.candidates
+				.iter()
+				.any(|candidate| candidate.source_slab_id == slab_id),
+			"attempt {attempt}: an unexhausted failure record must not remove candidacy"
+		);
+		manager.mark_secondary_index_backfill_uncovered(
+			key,
+			slab_id,
+			SecondaryIndexBackfillError::new(
+				SecondaryIndexBackfillErrorReason::PersistFailure,
+				"injected failure".to_string(),
+			),
+		);
+	}
+	let plan = manager
+		.ensure_secondary_index_coverage(tenant(), &descriptor, 4096)
+		.await
+		.unwrap();
+	assert!(
+		!plan
+			.candidates
+			.iter()
+			.any(|candidate| candidate.source_slab_id == slab_id),
+		"a spent budget removes candidacy"
+	);
+	// The gate refuses throughout regardless of budget state: refusal is derived from
+	// durable completeness, not from the retry bookkeeping.
+	let request = TableLookupByIndexRequest::from_descriptor(
+		tenant(),
+		&descriptor,
+		IndexQuery::PointEqual {
+			encoded_key: secondary_index_encoded_i64_for_test(10),
+		},
+		hlc(99),
+	);
+	assert!(
+		manager
+			.table_lookup_by_index(&request, &descriptor, SecondaryIndexState::Ready)
+			.await
+			.is_err()
+	);
 }

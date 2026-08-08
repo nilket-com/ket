@@ -56,6 +56,8 @@ impl SlabManager {
 	pub async fn reclaim_tombstoned_ranges(
 		&self,
 		tombstones: &[MigratedRangeTombstone],
+		table_schemas: &TableSchemaCatalog,
+		secondary_indexes: &SecondaryIndexCatalog,
 		max_slabs: usize,
 	) -> std::io::Result<TombstoneCompactionReport> {
 		if tombstones.is_empty() {
@@ -86,7 +88,15 @@ impl SlabManager {
 				break;
 			}
 			if let Some(outcome) = self
-				.compact_one_sealed_slab(slab_id, slab, tombstones)
+				.compact_one_sealed_slab(
+					slab_id,
+					slab,
+					tombstones,
+					SecondaryIndexCompactionContext {
+						table_schemas,
+						secondary_indexes,
+					},
+				)
 				.await?
 			{
 				report.compacted_slabs += 1;
@@ -101,6 +111,8 @@ impl SlabManager {
 	pub async fn prune_versions_older_than(
 		&self,
 		retention_floor: HybridTimestamp,
+		table_schemas: &TableSchemaCatalog,
+		secondary_indexes: &SecondaryIndexCatalog,
 		max_slabs: usize,
 	) -> std::io::Result<RetentionPruningReport> {
 		if max_slabs == 0 {
@@ -124,7 +136,15 @@ impl SlabManager {
 				break;
 			}
 			if let Some(outcome) = self
-				.prune_one_sealed_slab(slab_id, slab, retention_floor)
+				.prune_one_sealed_slab(
+					slab_id,
+					slab,
+					retention_floor,
+					SecondaryIndexCompactionContext {
+						table_schemas,
+						secondary_indexes,
+					},
+				)
 				.await?
 			{
 				report.compacted_slabs += 1;
@@ -500,10 +520,10 @@ impl SlabManager {
 			slab_id,
 			slab,
 			&records,
-			Some(SecondaryIndexCompactionContext {
+			SecondaryIndexCompactionContext {
 				table_schemas,
 				secondary_indexes,
-			}),
+			},
 		)
 		.await
 	}
@@ -513,6 +533,7 @@ impl SlabManager {
 		slab_id: SlabId,
 		slab: Arc<LocalSlabStore>,
 		retention_floor: HybridTimestamp,
+		secondary_index_context: SecondaryIndexCompactionContext<'_>,
 	) -> std::io::Result<Option<CompactionOutcome>> {
 		let mut records: Vec<CompactionRecord> = slab
 			.index
@@ -543,7 +564,7 @@ impl SlabManager {
 		Self::mark_retention_prunable_row_tombstone_pairs(&mut records, retention_floor);
 		records.sort_by_key(|record| record.old_location.offset);
 
-		self.compact_sealed_slab_records(slab_id, slab, &records, None)
+		self.compact_sealed_slab_records(slab_id, slab, &records, secondary_index_context)
 			.await
 	}
 
@@ -687,10 +708,10 @@ impl SlabManager {
 				slab_id,
 				slab,
 				&records,
-				Some(SecondaryIndexCompactionContext {
+				SecondaryIndexCompactionContext {
 					table_schemas,
 					secondary_indexes,
-				}),
+				},
 			)
 			.await?;
 

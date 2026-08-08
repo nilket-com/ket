@@ -5150,6 +5150,87 @@ async fn table_write_single_row_commits_typed_arrow_payload() {
 }
 
 #[tokio::test]
+async fn adr0539_two_ordinary_sampler_sized_ingest_cycles_remain_readable() {
+	// SMOKE CHECK ONLY — not evidence for ADR 0539. This fixture is green on the
+	// wedging base (verified d5e5087d + test in a worktree): point lookups through the
+	// runtime key index never touch the secondary-index coverage the live wedge broke.
+	// Promoting it back to evidence requires a node-level typed table-query executor in
+	// this harness (only frame-decode helpers exist), reading through the scan path
+	// after each cycle. The discriminating control for the defect is
+	// `storage::manager::tests::prune_compaction_must_not_orphan_secondary_index_sources`,
+	// which was authored red against production calls.
+
+	const CYCLE_ROWS: i64 = 2_300;
+	const INSERT_ROWS: i64 = 50;
+
+	let dir = bootstrap_tempdir("adr0539-two-cycle-ingest");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		539,
+		dir,
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for leader"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+
+	for cycle in 0..2_i64 {
+		for offset in (0..CYCLE_ROWS).step_by(INSERT_ROWS as usize) {
+			let ids = (offset..offset + INSERT_ROWS)
+				.map(|id| cycle * CYCLE_ROWS + id)
+				.collect::<Vec<_>>();
+			let batch = typed_table_batch(ids);
+			let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+			meta.parent_write_id.sequence_no = 539_000 + (cycle as u64 * 10_000) + offset as u64;
+			let (response, trailing) = node.data_server.table_write(meta, batch).await.unwrap();
+			assert_eq!(
+				response.write.status,
+				WriteStatus::OK,
+				"cycle={cycle}, offset={offset}"
+			);
+			assert!(trailing.is_none());
+		}
+
+		for id in [cycle * CYCLE_ROWS, (cycle + 1) * CYCLE_ROWS - 1] {
+			let key_identity =
+				table_row_identity(tenant(), descriptor.table_object_id, &id.to_le_bytes());
+			let location = node
+				.slab
+				.lookup(tenant(), key_identity)
+				.expect("acknowledged row must remain indexed");
+			let stored = decode_batch(&node.slab.read(location).await.unwrap()).unwrap();
+			assert!(stored.num_rows() > 0);
+		}
+		let _slab_inventory = (
+			node.slab.active_slab_id().await,
+			node.slab.sealed_count().await,
+		);
+	}
+
+	node.handles.abort();
+}
+
+#[tokio::test]
 async fn content_hash_table_write_absorbs_visible_duplicate_content() {
 	let dir = bootstrap_tempdir("content-hash-table-write-duplicate");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
@@ -12745,11 +12826,13 @@ async fn dispatcher_backpressures_cross_tenant_read_when_actor_limit_is_saturate
 	let meta: ReadResponseMeta =
 		*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<ReadResponseMeta>()]);
 	assert_eq!(meta.status, ReadStatus::BACKPRESSURED);
-	assert_eq!(
+	// This process-global counter is shared by concurrently running server tests. The
+	// response above proves this request was rejected; concurrent rejections may add
+	// further increments before this observation.
+	assert!(
 		metrics()
 			.data_ring_backpressure_rejections_actor_total
-			.get(),
-		before + 1
+			.get() >= before + 1
 	);
 
 	node.handles.abort();

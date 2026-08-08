@@ -46,8 +46,14 @@ const RECORD_KEY_LEN: usize = 8 + 32 + 8 + 4 + 4 + 8 + 8;
 const RECORD_VALUE_LEN_V1: usize = 4;
 const RECORD_VALUE_LEN_V2: usize = 4 + 8;
 const RECORD_VALUE_LEN_V3: usize = 4 + 8 + 4 + 4;
-const RECORD_VALUE_LEN: usize = RECORD_VALUE_LEN_V3;
+/// V4 adds the table-object identity that owned this published record
+/// location.  The location key cannot be reverse-mapped to its table after
+/// the slab is missing, so this attribution must travel with the durable
+/// reference itself.
+const RECORD_VALUE_LEN_V4: usize = 4 + 8 + 4 + 4 + 16;
+const RECORD_VALUE_LEN: usize = RECORD_VALUE_LEN_V4;
 const RECORD_FLAG_IS_TOMBSTONE: u32 = 1 << 0;
+const RECORD_FLAG_HAS_TABLE_OBJECT_ID: u32 = 1 << 1;
 const TIERED_POINTER_HASH_LEN: usize = 32;
 const TIERED_POINTER_FLAGS_LEN: usize = 2;
 const TIERED_POINTER_PREFIX_LEN: usize = TIERED_POINTER_HASH_LEN + TIERED_POINTER_FLAGS_LEN;
@@ -88,6 +94,9 @@ pub(crate) struct PersistentRecordRow {
 	pub tenant_id: TenantId,
 	pub key_identity: Identity,
 	pub routing_locality: Locality,
+	/// Present for typed table rows written after ADR 0539. Legacy and
+	/// untyped KV rows deliberately remain unattributed rather than guessed.
+	pub table_object_id: Option<TableObjectId>,
 	pub location: RecordLocation,
 }
 
@@ -113,6 +122,11 @@ pub(crate) struct PersistentSecondaryIndexSegmentRow {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct PersistentIndexSnapshot {
+	/// Every durable record reference, including local L1 records.  Recovery
+	/// still rebuilds the authoritative location index from slab files, but the
+	/// durable rows carry attribution that cannot be reconstructed once a slab
+	/// is missing.
+	pub record_rows: Vec<PersistentRecordRow>,
 	pub tiered_slabs: Vec<TieredSlabPointer>,
 	pub tiered_records: Vec<PersistentRecordRow>,
 	pub record_localities: Vec<(TenantId, Identity, Locality)>,
@@ -226,12 +240,14 @@ impl PersistentLocalIndex {
 			}
 
 			let records_table = read_txn.open_table(RECORDS_TABLE).map_err(redb_to_io)?;
+			let mut record_rows = Vec::new();
 			let mut tiered_records = Vec::new();
 			let mut locality_by_key: HashMap<(TenantId, Identity), (Locality, HybridTimestamp)> =
 				HashMap::new();
 			for entry in records_table.iter().map_err(redb_to_io)? {
 				let (key, value) = entry.map_err(redb_to_io)?;
 				let row = decode_record_row(key.value(), value.value())?;
+				record_rows.push(row);
 				locality_by_key
 					.entry((row.tenant_id, row.key_identity))
 					.and_modify(|(locality, hlc)| {
@@ -280,6 +296,7 @@ impl PersistentLocalIndex {
 				.map(|value| value.value());
 
 			Ok(PersistentIndexSnapshot {
+				record_rows,
 				tiered_slabs,
 				tiered_records,
 				record_localities,
@@ -577,7 +594,13 @@ fn encode_record_value(row: PersistentRecordRow) -> [u8; RECORD_VALUE_LEN] {
 	if row.location.is_tombstone {
 		flags |= RECORD_FLAG_IS_TOMBSTONE;
 	}
+	if row.table_object_id.is_some() {
+		flags |= RECORD_FLAG_HAS_TABLE_OBJECT_ID;
+	}
 	bytes[16..20].copy_from_slice(&flags.to_le_bytes());
+	if let Some(table_object_id) = row.table_object_id {
+		bytes[20..36].copy_from_slice(table_object_id.as_bytes());
+	}
 	bytes
 }
 
@@ -592,13 +615,14 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 		));
 	}
 	if value.len() != RECORD_VALUE_LEN
+		&& value.len() != RECORD_VALUE_LEN_V3
 		&& value.len() != RECORD_VALUE_LEN_V2
 		&& value.len() != RECORD_VALUE_LEN_V1
 	{
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!(
-				"persistent record value length mismatch: expected {RECORD_VALUE_LEN_V1}, {RECORD_VALUE_LEN_V2}, or {RECORD_VALUE_LEN}, got {}",
+				"persistent record value length mismatch: expected {RECORD_VALUE_LEN_V1}, {RECORD_VALUE_LEN_V2}, {RECORD_VALUE_LEN_V3}, or {RECORD_VALUE_LEN}, got {}",
 				value.len()
 			),
 		));
@@ -620,29 +644,43 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 	} else {
 		Locality::from(key_identity)
 	};
-	let record_row_index = if value.len() == RECORD_VALUE_LEN {
+	let record_row_index = if value.len() >= RECORD_VALUE_LEN_V3 {
 		RecordRowIndex::new(u32::from_le_bytes(
 			value[12..16].try_into().expect("validated above"),
 		))
 	} else {
 		RecordRowIndex::ZERO
 	};
-	let flags = if value.len() == RECORD_VALUE_LEN {
+	let flags = if value.len() >= RECORD_VALUE_LEN_V3 {
 		u32::from_le_bytes(value[16..20].try_into().expect("validated above"))
 	} else {
 		0
 	};
-	if flags & !RECORD_FLAG_IS_TOMBSTONE != 0 {
+	if flags & !(RECORD_FLAG_IS_TOMBSTONE | RECORD_FLAG_HAS_TABLE_OBJECT_ID) != 0 {
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!("persistent record row has unknown flags 0x{flags:08x}"),
 		));
 	}
+	let table_object_id = if flags & RECORD_FLAG_HAS_TABLE_OBJECT_ID != 0 {
+		if value.len() != RECORD_VALUE_LEN {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"persistent record row declares a table object id without V4 storage",
+			));
+		}
+		Some(TableObjectId::new(
+			value[20..36].try_into().expect("validated V4 record value"),
+		))
+	} else {
+		None
+	};
 
 	Ok(PersistentRecordRow {
 		tenant_id,
 		key_identity,
 		routing_locality,
+		table_object_id,
 		location: RecordLocation {
 			slab_id: SlabId::new(slab_id),
 			offset,
@@ -1310,6 +1348,7 @@ mod tests {
 			tenant_id: TenantId::new(7),
 			key_identity: Identity::blake3(b"row-key"),
 			routing_locality: Locality::new(0x8877),
+			table_object_id: None,
 			location: RecordLocation {
 				slab_id: SlabId::new(9),
 				offset: 128,
@@ -1420,6 +1459,8 @@ mod tests {
 				0x77, 0x88, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // locality = 0x8877
 				0x07, 0x00, 0x00, 0x00, // record_row_index = 7
 				0x00, 0x00, 0x00, 0x00, // flags
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // table object id absent
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 			]
 		);
 	}
@@ -1437,6 +1478,32 @@ mod tests {
 			decode_record_row(&encode_record_key(row), &value).unwrap(),
 			row
 		);
+	}
+
+	#[test]
+	fn record_row_value_roundtrips_table_object_id() {
+		let mut row = row();
+		row.table_object_id = Some(TableObjectId::new([0x53; 16]));
+		let value = encode_record_value(row);
+		assert_eq!(
+			u32::from_le_bytes(value[16..20].try_into().unwrap()) & RECORD_FLAG_HAS_TABLE_OBJECT_ID,
+			RECORD_FLAG_HAS_TABLE_OBJECT_ID
+		);
+		assert_eq!(&value[20..36], &[0x53; 16]);
+		assert_eq!(
+			decode_record_row(&encode_record_key(row), &value).unwrap(),
+			row
+		);
+	}
+
+	#[test]
+	fn legacy_v3_record_row_decodes_without_table_attribution() {
+		let row = row();
+		let key = encode_record_key(row);
+		let v4 = encode_record_value(row);
+		let decoded = decode_record_row(&key, &v4[..RECORD_VALUE_LEN_V3]).unwrap();
+		assert_eq!(decoded.table_object_id, None);
+		assert_eq!(decoded.location, row.location);
 	}
 
 	#[test]

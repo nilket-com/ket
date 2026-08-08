@@ -97,6 +97,18 @@ pub(super) struct SecondaryIndexCompactionContext<'a> {
 	pub(super) secondary_indexes: &'a SecondaryIndexCatalog,
 }
 
+/// What reconciliation proved about a retiring source slab. Slab retirement consumes
+/// this proof; the compaction paths cannot express "reconciliation skipped", because a
+/// required input modeled as optional — where absence silently reports success — is
+/// the exact shape that produced the ADR 0539 wedge. "Nothing to reconcile" is a
+/// proven conclusion from the catalogs and the durable segment registry, never a
+/// default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum SecondaryIndexReconciliation {
+	Reconciled { retired: usize, rebuilt: usize },
+	NothingToReconcile,
+}
+
 pub(super) struct LsmPreparedSecondaryIndexSegments {
 	pub(super) old_sidecars: Vec<SecondaryIndexSegmentInfo>,
 	pub(super) old_descriptors: Vec<(SlabId, SecondaryIndexCoverageKey)>,
@@ -167,15 +179,14 @@ impl SlabManager {
 		let active_buffer_slab = tracker
 			.active_buffer()
 			.map(SecondaryIndexActiveBuffer::source_slab_id);
-		let uncovered_slabs = tracker
-			.uncovered_slabs()
-			.map(|(slab_id, _error)| slab_id)
-			.collect::<BTreeSet<_>>();
 		let candidates = historical_slabs
 			.into_iter()
 			.filter(|slab_id| !tracker.is_covered(*slab_id))
 			.filter(|slab_id| Some(*slab_id) != active_buffer_slab)
-			.filter(|slab_id| !uncovered_slabs.contains(slab_id))
+			// A prior failure does not exclude a slab from candidacy — only a spent
+			// retry budget does. Predicting transient-versus-structural is exactly
+			// where the expensive mistake would live.
+			.filter(|slab_id| !tracker.is_backfill_exhausted(*slab_id))
 			.map(|source_slab_id| SecondaryIndexBackfillCandidate {
 				key,
 				source_slab_id,
@@ -187,6 +198,34 @@ impl SlabManager {
 			snapshot,
 			candidates,
 		})
+	}
+
+	/// The read-side integrity gate: which historical source slabs have no durable
+	/// segment for this index. Derived from the segment registry (rebuilt from durable
+	/// rows at every open) against the live slab inventory — never from the in-memory
+	/// failure record, so it survives restart by construction. Deliberately no
+	/// exemption for an open active buffer whose slab has already sealed: those rows
+	/// are index-invisible until the buffer seals into a segment, and answering
+	/// through that window is the silently-incomplete success this gate exists to
+	/// refuse. The window closes when the buffer seals or backfill covers the slab.
+	pub(crate) async fn secondary_index_durable_coverage_gaps(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+	) -> Vec<SlabId> {
+		let identity = SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor);
+		let key = SecondaryIndexCoverageKey::from(identity);
+		let (_active_slab_id, historical_slabs) = self.secondary_index_source_slabs().await;
+		let covered: BTreeSet<SlabId> = self
+			.secondary_index_segments
+			.iter()
+			.filter(|row| secondary_index_coverage_key_from_persistent(&row.key) == key)
+			.map(|row| row.key.source_slab_id)
+			.collect();
+		historical_slabs
+			.into_iter()
+			.filter(|slab_id| !covered.contains(slab_id))
+			.collect()
 	}
 
 	pub fn secondary_index_coverage_snapshot(
@@ -399,6 +438,12 @@ impl SlabManager {
 		let segment = match buffer.seal(descriptor) {
 			Ok(segment) => segment,
 			Err(err) => {
+				if err.kind() == ErrorKind::NotFound {
+					self.record_missing_published_references_for_slab(
+						source_slab_id,
+						PublishedReferenceOrigin::Compaction,
+					);
+				}
 				self.mark_secondary_index_uncovered(
 					key,
 					source_slab_id,
@@ -613,6 +658,16 @@ impl SlabManager {
 			.ensure_secondary_index_source_slab_available(source_slab_id)
 			.await
 		{
+			// A source slab that is still active is an ordinary seal race: the next
+			// backfill tick succeeds. Recording it as a failure would spend retry
+			// budget on scheduling noise.
+			if err.kind() != ErrorKind::NotFound {
+				return Err(err);
+			}
+			self.record_missing_published_references_for_slab(
+				source_slab_id,
+				PublishedReferenceOrigin::Compaction,
+			);
 			self.mark_secondary_index_uncovered(
 				key,
 				source_slab_id,
@@ -729,7 +784,18 @@ impl SlabManager {
 				return Err(err);
 			}
 		}
-		self.secondary_index_segments.insert(row.key, row);
+		if let Some(previous) = self.secondary_index_segments.insert(row.key, row) {
+			self.remove_secondary_index_source_reference(
+				previous.key.tenant_id,
+				previous.key.table_object_id,
+				previous.key.source_slab_id,
+			);
+		}
+		self.add_secondary_index_source_reference(
+			info.tenant_id,
+			info.table_object_id,
+			info.source_slab_id,
+		);
 		self.mark_secondary_index_covered(info.coverage_key(), info.source_slab_id);
 		metrics().observe_storage_secondary_index_segment_built(
 			info.tenant_id,
@@ -795,14 +861,20 @@ impl SlabManager {
 		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
 		unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		self.secondary_index_segments.remove(&row.key);
-		self.mark_secondary_index_uncovered(
-			secondary_index_coverage_key_from_persistent(&row.key),
+		self.remove_secondary_index_source_reference(
+			row.key.tenant_id,
+			row.key.table_object_id,
 			row.key.source_slab_id,
-			SecondaryIndexBackfillError::new(
-				SecondaryIndexBackfillErrorReason::MissingSegment,
-				"secondary index sidecar segment deleted",
-			),
 		);
+		// Deletion is lifecycle, not failure: removing the durable row re-opens the
+		// gap for the completeness gate and returns the slab to backfill candidacy.
+		// A failure record here would spend retry budget on an intentional act.
+		if let Some(mut tracker) = self
+			.secondary_index_coverage
+			.get_mut(&secondary_index_coverage_key_from_persistent(&row.key))
+		{
+			tracker.forget_slab(row.key.source_slab_id);
+		}
 		Ok(true)
 	}
 
@@ -928,6 +1000,11 @@ impl SlabManager {
 		let path = secondary_index_sidecar_path(&self.config.dir, &row.segment_path)?;
 		unlink_local_file(self.file_ops.as_ref(), &path).await?;
 		self.secondary_index_segments.remove(&row.key);
+		self.remove_secondary_index_source_reference(
+			row.key.tenant_id,
+			row.key.table_object_id,
+			row.key.source_slab_id,
+		);
 		self.forget_secondary_index_source_slab(info.coverage_key(), info.source_slab_id);
 		Ok(true)
 	}
@@ -1024,43 +1101,60 @@ impl SlabManager {
 		&self,
 		old_slab_id: SlabId,
 		new_slab_id: Option<SlabId>,
-		context: Option<SecondaryIndexCompactionContext<'_>>,
+		context: SecondaryIndexCompactionContext<'_>,
 		old_descriptors: Vec<(TenantId, TableSchemaDescriptor, SecondaryIndexDescriptor)>,
-	) -> usize {
-		let Some(context) = context else {
-			return 0;
-		};
+	) -> std::io::Result<SecondaryIndexReconciliation> {
 		let mut retired_keys = HashSet::new();
-		for old_info in self.list_secondary_index_segments_for_source_slab(old_slab_id) {
+		let mut retired = 0usize;
+		let old_segments = self.list_secondary_index_segments_for_source_slab(old_slab_id);
+		for old_info in &old_segments {
 			let Some(row) = context
 				.secondary_indexes
 				.get(old_info.tenant_id, old_info.index_object_id)
 			else {
-				continue;
+				// A durable segment names the retiring slab but the catalog no longer
+				// knows the index. Retiring anyway would strand the sidecar; refuse.
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"secondary index segment names retiring slab {} but its index \
+						 is absent from the catalog",
+						old_slab_id.get()
+					),
+				));
 			};
 			if !matches!(
 				row.state,
 				SecondaryIndexState::Building | SecondaryIndexState::Ready
 			) {
-				continue;
+				// Transitional index state: its own lifecycle owns the sidecar right
+				// now. Defer retirement rather than racing it.
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"secondary index for retiring slab {} is in a transitional \
+						 state; retirement deferred",
+						old_slab_id.get()
+					),
+				));
 			}
-			match self
-				.retire_secondary_index_segment_for_replaced_slab(&old_info)
+			self.retire_secondary_index_segment_for_replaced_slab(old_info)
 				.await
-			{
-				Ok(_) => {
-					retired_keys.insert(old_info.coverage_key());
-				}
-				Err(err) => {
-					tracing::warn!(
-						old_slab_id = old_slab_id.get(),
-						index_object_id = ?old_info.index_object_id,
-						error = %err,
-						"failed to retire old secondary index sidecar after compaction"
-					);
-				}
-			}
+				.map_err(|err| {
+					Error::new(
+						err.kind(),
+						format!(
+							"retire secondary index sidecar for slab {}: {err}",
+							old_slab_id.get()
+						),
+					)
+				})?;
+			retired = retired.saturating_add(1);
+			retired_keys.insert(old_info.coverage_key());
 		}
+		// Coverage forgets the retiring source only alongside proof: every reachable
+		// segment above either retired or errored out of this function.
+		let had_old_descriptors = !old_descriptors.is_empty();
 		for (tenant_id, _table, descriptor) in old_descriptors {
 			let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
 				tenant_id,
@@ -1072,25 +1166,32 @@ impl SlabManager {
 		}
 
 		let Some(new_slab_id) = new_slab_id else {
-			return 0;
+			return Ok(if retired == 0 && !had_old_descriptors {
+				SecondaryIndexReconciliation::NothingToReconcile
+			} else {
+				SecondaryIndexReconciliation::Reconciled {
+					retired,
+					rebuilt: 0,
+				}
+			});
 		};
-		let descriptors = match self
+		// Enumeration failure is a failure: returning "nothing" here is exactly the
+		// silent-skip ambiguity this type exists to collapse.
+		let descriptors = self
 			.secondary_index_compaction_descriptors_for_source_slab(new_slab_id, context)
 			.await
-		{
-			Ok(descriptors) => descriptors,
-			Err(err) => {
-				tracing::warn!(
-					old_slab_id = old_slab_id.get(),
-					new_slab_id = new_slab_id.get(),
-					error = %err,
-					"failed to enumerate secondary index descriptors for compacted slab"
-				);
-				return 0;
-			}
-		};
+			.map_err(|err| {
+				Error::new(
+					err.kind(),
+					format!(
+						"enumerate secondary index descriptors for compacted slab {}: {err}",
+						new_slab_id.get()
+					),
+				)
+			})?;
 
 		let mut rebuilt = 0usize;
+		let had_rebuild_descriptors = !descriptors.is_empty();
 		for (tenant_id, table, descriptor) in descriptors {
 			let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
 				tenant_id,
@@ -1099,27 +1200,11 @@ impl SlabManager {
 			if retired_keys.insert(key) {
 				self.forget_secondary_index_source_slab(key, old_slab_id);
 			}
-			let old_info = self
-				.list_secondary_index_segments(
-					tenant_id,
-					descriptor.table_object_id,
-					descriptor.index_object_id,
-					descriptor.logical_schema_fingerprint,
-				)
-				.into_iter()
-				.find(|info| info.source_slab_id == old_slab_id);
-			if let Some(old_info) = old_info
-				&& let Err(err) = self
-					.retire_secondary_index_segment_for_replaced_slab(&old_info)
-					.await
-			{
-				tracing::warn!(
-					old_slab_id = old_slab_id.get(),
-					index_object_id = ?descriptor.index_object_id,
-					error = %err,
-					"failed to retire old secondary index sidecar before rebuild"
-				);
-			}
+			// Rebuild failures stay non-fatal for RETIREMENT: retirement safety only
+			// needs the old references gone. But the resulting uncovered state is
+			// permanent absent operator action — uncovered slabs are excluded from
+			// backfill candidacy — so the lookup refuses to answer over the gap
+			// (`table_lookup_by_index`) rather than silently under-reporting.
 			let segment = match self
 				.build_secondary_index_segment_for_source_slab(
 					tenant_id,
@@ -1167,7 +1252,13 @@ impl SlabManager {
 			}
 			rebuilt = rebuilt.saturating_add(1);
 		}
-		rebuilt
+		Ok(
+			if retired == 0 && rebuilt == 0 && !had_old_descriptors && !had_rebuild_descriptors {
+				SecondaryIndexReconciliation::NothingToReconcile
+			} else {
+				SecondaryIndexReconciliation::Reconciled { retired, rebuilt }
+			},
+		)
 	}
 
 	pub(super) async fn prepare_lsm_secondary_index_segments_for_compaction(
