@@ -266,9 +266,7 @@ impl<'a> CoordinateTransformer<'a> {
 			} => {
 				let num_cats = categories.len().max(1) as f32;
 				let band_height = self.bounds.height / num_cats;
-				let center_y = self.bounds.height
-					- (category_index as f32 * band_height)
-					- (band_height / 2.0);
+				let center_y = (category_index as f32 * band_height) + (band_height / 2.0);
 				let x_delta = (x_range.1 - x_range.0).abs().max(f64::EPSILON);
 				let x_scale = self.bounds.width as f64 / x_delta;
 				let pixel_x = ((data_val - x_range.0) * x_scale) as f32;
@@ -299,8 +297,7 @@ impl<'a> CoordinateTransformer<'a> {
 				let band_width = self.bounds.width / num_x;
 				let band_height = self.bounds.height / num_y;
 				let center_x = (x_index as f32 * band_width) + (band_width / 2.0);
-				let center_y =
-					self.bounds.height - (y_index as f32 * band_height) - (band_height / 2.0);
+				let center_y = (y_index as f32 * band_height) + (band_height / 2.0);
 				(Point::new(center_x, center_y), band_width, band_height)
 			}
 			_ => (Point::ORIGIN, 0.0, 0.0),
@@ -2436,5 +2433,258 @@ mod product_0037_count_position_oracle {
 				..
 			}) if requested > MAX_GENERATED_TICK_POSITIONS
 		));
+	}
+}
+
+#[cfg(test)]
+mod product_0056_categorical_y_oracles {
+	use super::*;
+	use crate::plot::theme::PlotSettings;
+	use iced::Size;
+
+	struct FrameKernel;
+
+	impl PlotKernel for FrameKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::CategoricalY {
+				categories: vec!["only".to_owned()],
+				x_range: (0.0, 10.0),
+			}
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+			None
+		}
+	}
+
+	#[derive(Default)]
+	struct RecordingBackend {
+		strokes: Vec<Vec<Point>>,
+		texts: Vec<Text>,
+		translation: iced::Vector,
+	}
+
+	struct RecordingPathBuilder {
+		points: Vec<Point>,
+		translation: iced::Vector,
+	}
+
+	impl RecordingPathBuilder {
+		fn translated(&self, point: Point) -> Point {
+			Point::new(point.x + self.translation.x, point.y + self.translation.y)
+		}
+	}
+
+	impl PathBuilder for RecordingPathBuilder {
+		fn move_to(&mut self, point: Point) {
+			self.points.push(self.translated(point));
+		}
+
+		fn line_to(&mut self, point: Point) {
+			self.points.push(self.translated(point));
+		}
+
+		fn arc_to(&mut self, center: Point, _radius: f32, _start: f32, _end: f32) {
+			self.points.push(self.translated(center));
+		}
+
+		fn circle(&mut self, center: Point, _radius: f32) {
+			self.points.push(self.translated(center));
+		}
+
+		fn rectangle(&mut self, top_left: Point, size: Size) {
+			self.move_to(top_left);
+			self.line_to(Point::new(top_left.x + size.width, top_left.y));
+			self.line_to(Point::new(
+				top_left.x + size.width,
+				top_left.y + size.height,
+			));
+			self.line_to(Point::new(top_left.x, top_left.y + size.height));
+		}
+
+		fn close(&mut self) {}
+	}
+
+	impl PlotBackend for RecordingBackend {
+		fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {
+			let mut builder = RecordingPathBuilder {
+				points: Vec::new(),
+				translation: self.translation,
+			};
+			f(&mut builder);
+			self.strokes.push(builder.points);
+		}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+
+		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, _color: Color) {}
+
+		fn fill_text(&mut self, mut text: Text) {
+			text.position.x += self.translation.x;
+			text.position.y += self.translation.y;
+			self.texts.push(text);
+		}
+
+		fn translate(&mut self, translation: iced::Vector) {
+			self.translation.x += translation.x;
+			self.translation.y += translation.y;
+		}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			let saved = self.translation;
+			f(self);
+			self.translation = saved;
+		}
+
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			self.with_save(f);
+		}
+	}
+
+	fn widget<'a>(kernel: &'a FrameKernel) -> PlotWidget<'a> {
+		let model = PlotSettings::default();
+		PlotWidget {
+			kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		}
+	}
+
+	fn assert_frame_path(path: &[Point], width: f32, height: f32) {
+		assert_eq!(
+			path,
+			[
+				Point::new(0.0, 0.0),
+				Point::new(0.0, height),
+				Point::new(width, height),
+			]
+		);
+	}
+
+	#[test]
+	fn product_0056_transformers_map_every_categorical_y_index_top_down() {
+		for (width, height) in [(120.0, 100.0), (360.0, 500.0)] {
+			for count in [1, 2, 5, 6] {
+				let categories = (0..count).map(|i| format!("c{i}")).collect::<Vec<_>>();
+				let categorical_y = PlotLayout::CategoricalY {
+					categories: categories.clone(),
+					x_range: (0.0, 10.0),
+				};
+				let categorical_xy = PlotLayout::CategoricalXY {
+					x_categories: vec!["x".to_owned()],
+					y_categories: categories,
+				};
+				let bounds = Rectangle::new(Point::ORIGIN, Size::new(width, height));
+				let y_transform = CoordinateTransformer::new(&categorical_y, bounds);
+				let xy_transform = CoordinateTransformer::new(&categorical_xy, bounds);
+				let band = height / count as f32;
+				for index in 0..count {
+					let expected = index as f32 * band + band / 2.0;
+					assert_eq!(y_transform.categorical(index, 0.0).0.y, expected);
+					assert_eq!(xy_transform.categorical_2d(0, index).0.y, expected);
+					if matches!(count, 2 | 6) {
+						let old = height - index as f32 * band - band / 2.0;
+						assert_ne!(expected, old, "even counts have no reversal fixed point");
+					}
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn product_0056_categorical_frames_and_x_axes_ignore_domain_order_and_count() {
+		let kernel = FrameKernel;
+		let widget = widget(&kernel);
+		for (width, height) in [(120.0, 100.0), (360.0, 500.0)] {
+			for count in [1, 2, 5] {
+				let mut categories = (0..count).map(|i| format!("c{i}")).collect::<Vec<_>>();
+				for reversed in [false, true] {
+					if reversed {
+						categories.reverse();
+					}
+					let bounds = Rectangle::new(Point::ORIGIN, Size::new(width, height));
+					let y_layout = PlotLayout::CategoricalY {
+						categories: categories.clone(),
+						x_range: (0.0, 10.0),
+					};
+					let y_transform = CoordinateTransformer::new(&y_layout, bounds);
+
+					let mut grid = RecordingBackend::default();
+					widget.draw_categorical_y_grid(
+						&mut grid,
+						bounds,
+						&y_transform,
+						&categories,
+						(0.0, 10.0),
+					);
+					assert!(!grid.strokes.is_empty());
+					assert!(grid.strokes.iter().all(|path| {
+						path.len() == 2 && path[0].y == 0.0 && path[1].y == height
+					}));
+
+					let mut y_axes = RecordingBackend::default();
+					widget.draw_categorical_y_axes(
+						&mut y_axes,
+						bounds,
+						&y_transform,
+						&categories,
+						(0.0, 10.0),
+						AxisTextVisibility::ALL,
+					);
+					assert_frame_path(&y_axes.strokes[0], width, height);
+					for category in &categories {
+						let text = y_axes
+							.texts
+							.iter()
+							.find(|text| text.content == *category)
+							.expect("every categorical-y label is rendered");
+						let index = categories.iter().position(|item| item == category).unwrap();
+						assert_eq!(text.position.y, y_transform.categorical(index, 0.0).0.y);
+					}
+
+					let xy_layout = PlotLayout::CategoricalXY {
+						x_categories: vec!["x0".to_owned(), "x1".to_owned()],
+						y_categories: categories.clone(),
+					};
+					let xy_transform = CoordinateTransformer::new(&xy_layout, bounds);
+					let mut xy_axes = RecordingBackend::default();
+					widget.draw_categorical_xy_axes(
+						&mut xy_axes,
+						bounds,
+						&xy_transform,
+						&["x0".to_owned(), "x1".to_owned()],
+						&categories,
+						AxisTextVisibility::ALL,
+					);
+					assert_frame_path(&xy_axes.strokes[0], width, height);
+					for category in &categories {
+						let text = xy_axes
+							.texts
+							.iter()
+							.find(|text| text.content == *category)
+							.expect("every heatmap row label is rendered");
+						let index = categories.iter().position(|item| item == category).unwrap();
+						assert_eq!(text.position.y, xy_transform.categorical_2d(0, index).0.y);
+					}
+				}
+			}
+		}
 	}
 }

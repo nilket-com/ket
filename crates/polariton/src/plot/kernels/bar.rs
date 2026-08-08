@@ -121,12 +121,11 @@ impl BarPlotKernel {
 							continue;
 						}
 						let (right, _) = transform.categorical(category_index, value);
-						let reversed_group = num_groups - 1 - group_index;
 						bars.push(BarRectangle {
 							rect: Rectangle {
 								x: left.x,
 								y: category_top
-									+ category_inset + reversed_group as f32 * slot
+									+ category_inset + group_index as f32 * slot
 									+ padding,
 								width: (right.x - left.x).max(1.0),
 								height: slot * width_fraction,
@@ -479,7 +478,10 @@ pub fn prepare_bar_data(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::plot::spec::{BarWidth, CategoryGap};
+	use crate::plot::legend::LegendSection;
+	use crate::plot::spec::{
+		BarWidth, CategoryColorAssignment, CategoryGap, PalettePosition, ResolvedColor,
+	};
 	use iced::{Point, Size};
 
 	fn grouped_kernel(orientation: Orientation) -> BarPlotKernel {
@@ -701,5 +703,84 @@ mod tests {
 				None
 			);
 		}
+	}
+
+	#[test]
+	fn product_0056_horizontal_labels_payloads_and_legend_share_top_down_order() {
+		let mut kernel = grouped_kernel(Orientation::Horizontal);
+		kernel.group_colors = vec![
+			CategoryColorAssignment {
+				category: "left".to_owned(),
+				position: PalettePosition::new(0, 2).unwrap(),
+				color: ResolvedColor {
+					red: 11,
+					green: 22,
+					blue: 33,
+					alpha: 255,
+				},
+			},
+			CategoryColorAssignment {
+				category: "right".to_owned(),
+				position: PalettePosition::new(1, 2).unwrap(),
+				color: ResolvedColor {
+					red: 44,
+					green: 55,
+					blue: 66,
+					alpha: 255,
+				},
+			},
+		];
+		let settings = ResolvedPlotSettings {
+			bar_width: BarWidth::new(0.8).unwrap(),
+			category_gap: CategoryGap::new(0.2).unwrap(),
+			..ResolvedPlotSettings::default()
+		};
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(231.0, 200.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut rectangles = kernel.bar_rectangles(&transform, 0.8, 0.2);
+		rectangles.sort_by(|left, right| left.rect.y.total_cmp(&right.rect.y));
+
+		let observed = rectangles
+			.iter()
+			.map(|bar| {
+				let category = &kernel.prepared_data.categories[bar.category_index];
+				let group = &kernel.prepared_data.group_names[bar.group_index];
+				let value = kernel.prepared_data.values[bar.category_index][bar.group_index];
+				let color = kernel.group_color(bar.group_index).unwrap();
+				assert_close(bar.rect.width, value as f32 * 10.0);
+				assert!(
+					kernel
+						.hover_resolved(&transform, Cursor::Available(bar.rect.center()), &settings)
+						.unwrap()
+						.starts_with(&format!("{category}: {group}"))
+				);
+				(category.as_str(), group.as_str(), value, color)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			observed,
+			vec![
+				("A", "left", 10.0, Color::from_rgb8(11, 22, 33)),
+				("A", "right", 11.0, Color::from_rgb8(44, 55, 66)),
+				("B", "left", 20.0, Color::from_rgb8(11, 22, 33)),
+				("B", "right", 21.0, Color::from_rgb8(44, 55, 66)),
+			]
+		);
+
+		let legend = kernel.legend_content(&settings).unwrap();
+		let LegendSection::Entries(entries) = legend.0.first() else {
+			panic!("grouped bars produce named entries");
+		};
+		assert_eq!(
+			entries
+				.iter()
+				.map(|entry| (entry.label.as_str(), entry.swatch))
+				.collect::<Vec<_>>(),
+			[
+				("left", Color::from_rgb8(11, 22, 33)),
+				("right", Color::from_rgb8(44, 55, 66)),
+			]
+		);
 	}
 }

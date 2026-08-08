@@ -97,6 +97,13 @@ Exactly one axis must be quantitative. The other keeps Bar's existing
 non-quantitative category role; pairs with two quantitative or two
 non-quantitative axes refuse rather than guessing an orientation.
 
+Categorical order is reading order. Horizontal categories render from top to
+bottom in their resolved display-domain order, and grouped series use the same
+top-to-bottom order as the named legend. Relation sorting remains the authority:
+sort ascending for an ascending list, or descending to put the first-ranked bar
+at the top. Heatmap rows follow the same top-down y-domain rule; x remains left
+to right.
+
 #### Rune line presentation:
 
 Lines accept an optional categorical series field. Rows connect only within

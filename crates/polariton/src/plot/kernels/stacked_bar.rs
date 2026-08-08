@@ -415,6 +415,38 @@ pub fn prepare_stacked_bar_data(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::common::PathBuilder;
+	use iced::widget::canvas::{Stroke, Text};
+	use iced::{Color, Point, Size};
+
+	#[derive(Default)]
+	struct RectangleBackend {
+		rectangles: Vec<(Point, Size, Color)>,
+	}
+
+	impl PlotBackend for RectangleBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+
+		fn fill_rectangle(&mut self, top_left: Point, size: Size, color: Color) {
+			self.rectangles.push((top_left, size, color));
+		}
+
+		fn fill_text(&mut self, _text: Text) {}
+
+		fn translate(&mut self, _translation: iced::Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
 
 	#[test]
 	fn stacks_follow_category_and_group_identity() {
@@ -434,5 +466,62 @@ mod tests {
 			vec![vec![10.0, 11.0], vec![20.0, 21.0]]
 		);
 		assert_eq!(prepared.y_range, (0.0, 45.1));
+	}
+
+	#[test]
+	fn product_0056_horizontal_stacks_join_top_down_labels_to_asymmetric_segments() {
+		let frame = polars::df!(
+			"cat" => ["A", "A", "B", "B"],
+			"group" => ["left", "right", "left", "right"],
+			"val" => [10_i64, 11, 20, 21],
+		)
+		.unwrap();
+		let kernel = StackedBarPlotKernel {
+			prepared_data: Arc::new(prepare_stacked_bar_data(&frame, "cat", "group", "val")),
+			orientation: Orientation::Horizontal,
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(451.0, 200.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = RectangleBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		assert_eq!(backend.rectangles.len(), 4);
+
+		for (index, (category, group, value)) in [
+			("A", "left", 10.0_f32),
+			("A", "right", 11.0),
+			("B", "left", 20.0),
+			("B", "right", 21.0),
+		]
+		.into_iter()
+		.enumerate()
+		{
+			let (top_left, size, color) = backend.rectangles[index];
+			let category_index = index / 2;
+			let group_index = index % 2;
+			let expected_center = transform.categorical(category_index, 0.0).0.y;
+			assert_eq!(top_left.y + size.height / 2.0, expected_center);
+			assert!((size.width - value * 10.0).abs() < 0.0001);
+			assert_eq!(
+				color,
+				settings.color_theme.get_color(group_index as f32),
+				"stack segment color keeps group identity"
+			);
+			let cursor = Point::new(top_left.x + size.width / 2.0, expected_center);
+			assert!(
+				kernel
+					.hover(&transform, Cursor::Available(cursor))
+					.unwrap()
+					.starts_with(&format!("{category}: {group}"))
+			);
+		}
+		assert!(backend.rectangles[0].0.y < backend.rectangles[2].0.y);
 	}
 }

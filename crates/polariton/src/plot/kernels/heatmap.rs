@@ -236,3 +236,96 @@ pub fn prepare_heatmap_data(
 		y_label: y_col.to_string(),
 	}
 }
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::plot::common::{PathBuilder, PlotBackend};
+	use iced::widget::canvas::{Stroke, Text};
+
+	#[derive(Default)]
+	struct RectangleBackend {
+		rectangles: Vec<(Point, Size, Color)>,
+	}
+
+	impl PlotBackend for RectangleBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+
+		fn fill_rectangle(&mut self, top_left: Point, size: Size, color: Color) {
+			self.rectangles.push((top_left, size, color));
+		}
+
+		fn fill_text(&mut self, _text: Text) {}
+
+		fn translate(&mut self, _translation: iced::Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
+
+	#[test]
+	fn product_0056_asymmetric_heatmap_rows_join_labels_cells_colors_and_hover() {
+		let frame = polars::df!(
+			"x" => ["c2", "c0", "c1", "c0", "c2", "c1"],
+			"y" => ["row-b", "row-a", "row-b", "row-b", "row-a", "row-a"],
+			"value" => [32_i64, 1, 16, 8, 4, 2],
+		)
+		.unwrap();
+		let kernel = HeatmapPlotKernel {
+			prepared_data: Arc::new(prepare_heatmap_data(&frame, "x", "y", "value")),
+		};
+		assert_eq!(kernel.prepared_data.x_categories, ["c0", "c1", "c2"]);
+		assert_eq!(kernel.prepared_data.y_categories, ["row-a", "row-b"]);
+		assert_eq!(
+			kernel.prepared_data.values,
+			vec![vec![1.0, 8.0], vec![2.0, 16.0], vec![4.0, 32.0]]
+		);
+
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 200.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = RectangleBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		assert_eq!(backend.rectangles.len(), 6);
+
+		for x_index in 0..3 {
+			for y_index in 0..2 {
+				let index = x_index * 2 + y_index;
+				let (top_left, size, color) = backend.rectangles[index];
+				let (center, band_width, band_height) = transform.categorical_2d(x_index, y_index);
+				assert_eq!(top_left, Point::new(center.x - 50.0, center.y - 50.0));
+				assert_eq!(size, Size::new(band_width, band_height));
+				let value = kernel.prepared_data.values[x_index][y_index];
+				assert_eq!(
+					color,
+					settings
+						.color_theme
+						.get_color((value / kernel.prepared_data.max_val) as f32)
+				);
+				let x = &kernel.prepared_data.x_categories[x_index];
+				let y = &kernel.prepared_data.y_categories[y_index];
+				assert_eq!(
+					kernel.hover(&transform, Cursor::Available(center)),
+					Some(format!("X: {x}\nY: {y}\nValue: {value:.2}"))
+				);
+			}
+		}
+		assert!(backend.rectangles[0].0.y < backend.rectangles[1].0.y);
+	}
+}

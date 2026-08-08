@@ -600,8 +600,8 @@ mod product_0013_baseline_tests {
 
 	const HORIZONTAL_BAR_SVG: &str = concat!(
 		"<svg width=\"100\" height=\"100\" viewBox=\"0 0 100 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
-		"<path d=\"M 0.00 52.50 L 45.45 52.50 L 45.45 97.50 L 0.00 97.50 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
-		"<path d=\"M 0.00 2.50 L 90.91 2.50 L 90.91 47.50 L 0.00 47.50 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"<path d=\"M 0.00 2.50 L 45.45 2.50 L 45.45 47.50 L 0.00 47.50 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
+		"<path d=\"M 0.00 52.50 L 90.91 52.50 L 90.91 97.50 L 0.00 97.50 Z \" fill=\"rgb(32, 145, 141)\" fill-opacity=\"1.00\" />\n",
 		"</svg>"
 	);
 
@@ -1020,8 +1020,8 @@ mod product_0013_baseline_tests {
 			(
 				Orientation::Horizontal,
 				HORIZONTAL_BAR_SVG,
-				["M 0.00 62.50 L 45.45", "M 0.00 12.50 L 90.91"],
-				["M 0.00 50.00 L 45.45", "M 0.00 0.00 L 90.91"],
+				["M 0.00 12.50 L 45.45", "M 0.00 62.50 L 90.91"],
+				["M 0.00 0.00 L 45.45", "M 0.00 50.00 L 90.91"],
 			),
 		] {
 			let default = styled_bar(orientation, 0.9);
@@ -1058,8 +1058,8 @@ mod product_0013_baseline_tests {
 			),
 			(
 				Orientation::Horizontal,
-				Point::new(20.0, 70.0),
-				Point::new(20.0, 60.0),
+				Point::new(20.0, 20.0),
+				Point::new(20.0, 10.0),
 				"A: Value (Value: ~0.44)",
 			),
 		] {

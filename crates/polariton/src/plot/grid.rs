@@ -942,13 +942,44 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 mod tests {
 	use super::*;
 	use crate::coordinate::Window;
-	use crate::plot::common::{PlotRenderLayer, PlotWidget};
+	use crate::plot::common::{PathBuilder, PlotBackend, PlotRenderLayer, PlotWidget};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use crate::plot::export::SvgBackend;
 	use crate::plot::request::{PlotRequest, PlotSource, plan};
 	use crate::plot::spec::{AuthoredPlotSpec, Channel, PlotProvenance};
+	use iced::widget::canvas::{Stroke, Text};
+	use iced::{Color, Size};
 	use polars::df;
+
+	#[derive(Default)]
+	struct RectangleBackend {
+		rectangles: Vec<(Point, Size, Color)>,
+	}
+
+	impl PlotBackend for RectangleBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+
+		fn fill_rectangle(&mut self, top_left: Point, size: Size, color: Color) {
+			self.rectangles.push((top_left, size, color));
+		}
+
+		fn fill_text(&mut self, _text: Text) {}
+
+		fn translate(&mut self, _translation: iced::Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, _bounds: IcedRectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
 
 	fn widget_rect(raw: IcedRectangle) -> Rect<Widget> {
 		Rect::<Widget>::from_iced_frame(raw).region(raw.x, raw.y, raw.width, raw.height)
@@ -1830,6 +1861,117 @@ mod tests {
 				assignment.color.red, assignment.color.green, assignment.color.blue
 			);
 			assert!(svg.contains(&fill), "missing panel-blind {fill}");
+		}
+	}
+
+	#[test]
+	fn product_0056_faceted_horizontal_labels_payloads_and_colors_flip_together() {
+		use crate::plot::legend::LegendSection;
+		use crate::plot::spec::{
+			CategoricalPaletteSelection, ColorIdentity, resolve_channels,
+			resolve_domains_with_categorical_palette,
+		};
+
+		let frame = df!(
+			"series" => ["Atlas", "Atlas", "Beacon", "Beacon"],
+			"category" => ["East", "West", "East", "West"],
+			"value" => [10.0_f64, 30.0, 20.0, 40.0]
+		)
+		.unwrap();
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"value",
+			"category",
+			Some("series".to_owned()),
+		);
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0056".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("tab20c").unwrap();
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.unwrap();
+		let assignments = resolved.channel(Channel::Color).unwrap().colors.clone();
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved),
+			&stamped,
+			"series",
+			GridArrangement::new(1, 2).unwrap(),
+		)
+		.unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let settings = ResolvedPlotSettings::default();
+		let legend = crate::plot::legend::union(
+			kernel
+				.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&settings)),
+		)
+		.unwrap();
+		let LegendSection::Entries(entries) = legend.0.first() else {
+			panic!("faceted grouped bars keep one named legend");
+		};
+		assert_eq!(
+			entries
+				.iter()
+				.map(|entry| entry.label.as_str())
+				.collect::<Vec<_>>(),
+			["Atlas", "Beacon"]
+		);
+
+		for cell in kernel.cells.iter() {
+			let layout = cell.kernel.layout(settings.clone());
+			let PlotLayout::CategoricalY { categories, .. } = &layout else {
+				panic!("horizontal facet cell keeps categorical y");
+			};
+			assert_eq!(categories, &["East", "West"]);
+			let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(440.0, 200.0));
+			let transform = CoordinateTransformer::new(&layout, bounds);
+			let mut backend = RectangleBackend::default();
+			cell.kernel.plot(
+				&mut backend,
+				bounds,
+				&transform,
+				Cursor::Unavailable,
+				settings.clone(),
+			);
+			assert_eq!(backend.rectangles.len(), 2);
+			backend
+				.rectangles
+				.sort_by(|left, right| left.0.y.total_cmp(&right.0.y));
+			assert!(backend.rectangles[0].1.width < backend.rectangles[1].1.width);
+			for (index, (top_left, size, color)) in backend.rectangles.iter().enumerate() {
+				assert_eq!(
+					top_left.y + size.height / 2.0,
+					transform.categorical(index, 0.0).0.y,
+					"{} label and payload share one top-down band",
+					categories[index]
+				);
+				let label = cell.cell.label.as_deref().unwrap();
+				let assignment = assignments
+					.iter()
+					.find(|assignment| assignment.category == label)
+					.unwrap();
+				assert_eq!(
+					*color,
+					Color::from_rgba8(
+						assignment.color.red,
+						assignment.color.green,
+						assignment.color.blue,
+						assignment.color.alpha as f32 / u8::MAX as f32,
+					),
+					"facet label retains its panel-blind series color"
+				);
+			}
 		}
 	}
 

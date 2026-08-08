@@ -1,6 +1,6 @@
 # ADR 0056: top-down categorical-y reading order
 
-Status: proposed 2026-08-08. This record makes categorical display-domain
+Status: accepted 2026-08-08. This record makes categorical display-domain
 order equal visual reading order on y: index zero renders at the top for
 horizontal bars, horizontal stacked bars, and heatmap rows. It adds no Rune
 surface and changes no identity, color, domain, or sorting rule.
@@ -258,6 +258,76 @@ inferred from the final picture or asserted after both changes have mixed.
     order renders East, North, South, West top-down, and each cluster renders
     Atlas, Beacon, Cinder, Delta top-down in exact agreement with the unchanged
     named-swatch legend.
+
+## Implementation evidence
+
+- The live plan is `75e0b794`; the earlier `4b46a8a6` object was amended away
+  and is not part of the accepted history. Implementation preserves the
+  record's diagnostic boundary as two commits rather than collapsing the
+  refactor and visible change.
+- Stage 1 is independently banked by `4e053142`. Horizontal bar and stacked-bar
+  bands began deriving their centers and heights from
+  `CoordinateTransformer`; categorical-y and categorical-xy chrome began using
+  physical frame edges and the physical bottom x-axis baseline. The full
+  workspace suite passed before Stage 2 with no expected output, premise, or
+  baseline changed.
+- `product_0056_categorical_frames_and_x_axes_ignore_domain_order_and_count`
+  observes rendered paths and text at 120x100 and 360x500 with one, two, and
+  five categories in both domain directions. Frames remain `(0, 0)` through
+  `(width, height)`, x axes stay at the physical bottom, gridlines span the
+  complete height, and labels use transformer-owned centers.
+- `product_0056_transformers_map_every_categorical_y_index_top_down` checks
+  every index for one, two, five, and six categories at both extents in
+  `CategoricalY` and `CategoricalXY`. The positive equality is required for
+  every count; the old formula is asserted absent only for even counts, where
+  no reversal fixed point exists.
+- The horizontal-bar oracle uses asymmetric values `10`, `11`, `20`, and `21`
+  across two categories and two named series. It joins each top-down rectangle
+  to its category, exact resolved color, value-derived width, hover identity,
+  and the unchanged legend order. The horizontal-stacked-bar oracle makes the
+  equivalent join for labels, totals, ordered segments, colors, numeric
+  geometry, and hover.
+- The heatmap oracle is deliberately non-square and asymmetric: three x
+  columns by two y rows, with unique values in every cell and scrambled input
+  rows. Exact cell position, row label, color, and hover payload agree while x
+  remains left to right. The faceted horizontal-bar oracle separately proves
+  that two cells acquire the shared mapping, keep exact panel-blind colors and
+  payload correspondence, and retain one Atlas/Beacon legend.
+- Stage 2's initial full Polariton run changed exactly three existing
+  PRODUCT-0021 premises:
+  `product_0021_full_band_default_retires_the_legacy_inset` vertically permutes
+  the two horizontal SVG rectangles;
+  `product_0021_bar_width_occupies_the_full_band_slot_in_both_orientations`
+  vertically permutes the horizontal width samples; and
+  `product_0021_bar_hit_uses_the_same_visible_rectangle_as_paint` moves the
+  horizontal A-band probe from the inherited bottom band to the top band. No
+  size, width, numeric x coordinate, color, or vertical-bar expectation
+  changed, and no stacked-bar, heatmap, grid, legend, or layout baseline
+  required refresh.
+- Six PRODUCT-0056 tests cover transformer order and physical frames, grouped
+  bars, stacked bars, heatmaps, and facets. After the enumerated premise
+  updates, Polariton passes 473 unit tests with five live tests ignored, 41
+  architecture tests, and the trybuild UI pair. `cargo check --workspace
+  --all-targets` passes. The final workspace-wide test sweep also leaves every
+  Polariton target green but is not recorded as globally green: the unrelated
+  libaryon test
+  `a_newer_goto_definition_request_supersedes_an_older_response` timed out
+  waiting for a viewport, then reproduced in an isolated exact-test rerun.
+  Stage 2 changes no libaryon source; Stage 1's workspace-wide bank passed
+  before the semantic change.
+- `crates/polariton/README.md` now states the authored rule: categorical y
+  display domains read top-down, relation sorting remains authoritative,
+  grouped bars agree with their named legend, and heatmap x remains
+  left-to-right. `/home/me/work/uat/test19.rn` was not edited; its ascending
+  region and product domains remain the live contact fixture for the new
+  order.
+- The record originated in the first live screenshot of PRODUCT-0055, not in a
+  renderer gate: the horizontal bars opposed the legend even though each was
+  independently correct under inherited dashboard geometry. Rune did not
+  create that pre-language behavior; it created the first reason to inspect
+  it. This is another bounded example for the deferred decision about what the
+  SVG backend is licensed to prove: payload and label presence could not prove
+  their visual reading-order correspondence.
 
 ## Stop condition
 
