@@ -148,6 +148,52 @@ operator identity from the deployment PKI. The sampler and any future scrape mus
 plaintext `ok` by design. Not a defect — recorded so the next person doesn't diagnose
 their curl for an hour.
 
+## Finding 3 — the scan wall-time budget fails whole-table reads, behind the same collapsed error (2026-08-08, clean-profile confirmation run)
+
+**The ADR 0539 confirmation run failed its reads for a reason outside ADR 0539 entirely.**
+On the fixed binary, clean profile, single never-sealed slab, zero compaction activity, zero
+gaps, zero refusals, zero fences and a silent journal, `SELECT COUNT(*)` on the metrics
+table began failing `storage unavailable` at the fifth scrape and never recovered. The
+audit stream holds the truth the SQL error discards: `data.range_query` completions with
+`status: "query_budget_exceeded"` (21 events), ~250 ms of server time each, ~563 KB of
+response prepared then thrown away.
+
+Mechanism: Toron full-table scans pull every row through Wendelon's table-query path, whose
+`QueryExecutionBudget` defaults to `max_wall_time: 250ms` (with `max_locations: 4096`).
+A few thousand text-heavy rows approach the wall; borderline tables flap with concurrent
+load — synthetic probes put one table permanently failing at 3,000 rows while a twin table
+passed at 3,100 in a quieter moment. Insert batches also fail silently near the boundary
+(a probe table read back 2,950 of 3,100 acknowledged-or-not rows; the client harness
+discarded which). `ClientError::Io -> StorageError::Unavailable` collapses the status
+string, so the reason never reaches the operator; the 0539 cut carved only the integrity
+failure out of that catch-all, and every other Wendelon query status still loses its name.
+
+**Attribution corrections this forces.** Two earlier observations blamed on the LSM defect
+were in fact this budget: reproduction 2's "clean bulk ingest re-wedged the recreated
+table" (~4.4k rows) and reproduction 3's "sampler-only wedge at the second scrape" (~4.4k
+rows) — both crossed the scan-time boundary, and the shared collapsed error made them
+indistinguishable from the storage wedge. The LSM defect itself stands on independent
+evidence — dangling references to on-disk-absent slabs, the restart-surviving durable
+state, the warn loop, the per-tick slab leak, and the manager-level seam test that
+reproduces retirement-without-reconciliation with no scan involved — but ADR 0539's
+"second multi-thousand-row ingest cycle" trigger framing was contaminated by this defect
+and should be read as: the LSM seam is real and proven; the second-cycle *read failure*
+signature was the scan budget. One collapsed error string hid two failure classes, and the
+first mechanism found absorbed the second's evidence.
+
+**Also established by the run:** the fixed binary's 0539 machinery stayed clean under the
+load that killed the old binary — no loop, no leak, no fences — and the declared gap-gauge
+measurement could not be recorded because no secondary index was ever created on the fresh
+profile (both metric families render seriesless), which leaves "what created the old
+profile's secondary indexes" as an open question for the follow-on.
+
+Decisions this puts on the table (not taken here): a scan/read-path cut — streaming or
+paginated table scans versus budget policy for full-table reads; widening Acceptance 5's
+attribution requirement to every Wendelon query status rather than integrity alone; and
+re-running the deployment confirmation after that cut, since its acceptance cannot pass
+while any table beyond a few thousand rows is unreadable through the SQL path for reasons
+unrelated to storage integrity.
+
 ## Soak viewport — example queries
 
 ```sql
