@@ -374,6 +374,10 @@ pub fn run(startup_data: StartupData, initial_file: Option<String>) -> Result {
 		.subscription(subscription)
 		.theme(components::theme())
 		.title("Polariton")
+		// Canvas geometry (plot marks, gridlines, legend swatches) is
+		// tessellated triangles; without MSAA every curved edge is aliased
+		// hard enough to read as rasterization. Text is unaffected either way.
+		.antialiasing(true)
 		.font(DEJAVU_SANS_MONO)
 		.window(window::Settings {
 			decorations: false,
