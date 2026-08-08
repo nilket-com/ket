@@ -25,6 +25,13 @@ const HEADER_HEIGHT_WITH_TYPES: f32 = 48.0;
 const TYPE_LABEL_FONT_SIZE: f32 = 13.0;
 const CELL_PADDING_X: f32 = 8.0;
 const FONT_SIZE: f32 = 14.0;
+/// Estimated glyph advance as a fraction of the font size. DejaVu Sans Mono's
+/// true advance is 0.602 em and headers render bold, so the previous 0.6
+/// estimate came out a fraction of a pixel narrow whenever the header was the
+/// column's widest string — which wrapped it ("margin" → "margi\nn"). The
+/// slack covers the advance plus shaping differences between this estimate
+/// and the rendered text.
+const CHAR_ADVANCE: f32 = 0.65;
 const MIN_COL_WIDTH: f32 = 28.0;
 const MAX_COL_WIDTH: f32 = 320.0;
 const V_SCROLLBAR_WIDTH: f32 = 12.0;
@@ -82,6 +89,14 @@ pub struct Table<'a> {
 	scroll_request: Option<(u64, TableScroll)>,
 	col_width: Option<f32>,
 	show_column_types: bool,
+	/// Caller-owned column widths that outlive this widget's tree state. The
+	/// tree state dies whenever the panel content swaps variants (a rerun
+	/// passes through `Running`), so user resizes written only into
+	/// `TableState` were lost on every execution. Widths are seeded from the
+	/// store when the state is (re)built and written back when a resize drag
+	/// ends. A length mismatch (schema change) ignores the store and
+	/// re-measures.
+	width_store: Option<&'a std::cell::RefCell<Option<Vec<f32>>>>,
 }
 
 impl<'a> Table<'a> {
@@ -93,7 +108,13 @@ impl<'a> Table<'a> {
 			scroll_request: None,
 			col_width: None,
 			show_column_types: false,
+			width_store: None,
 		}
+	}
+
+	pub fn width_store(mut self, store: Option<&'a std::cell::RefCell<Option<Vec<f32>>>>) -> Self {
+		self.width_store = store;
+		self
 	}
 
 	pub fn col_width(mut self, width: f32) -> Self {
@@ -178,14 +199,22 @@ impl<'a> Table<'a> {
 			})
 			.unwrap_or(0);
 		let max_chars = max_content_chars.max(col_name.len()).max(type_label_chars);
-		let text_width = max_chars as f32 * FONT_SIZE * 0.6;
+		let text_width = max_chars as f32 * FONT_SIZE * CHAR_ADVANCE;
 		(text_width + CELL_PADDING_X * 2.0).clamp(MIN_COL_WIDTH, MAX_COL_WIDTH)
 	}
 
 	fn col_widths<'s>(&self, state: &'s mut TableState, _viewport_width: f32) -> &'s [f32] {
 		let col_count = self.col_count();
 		if state.col_widths.len() != col_count {
-			state.col_widths = (0..col_count).map(|i| self.measure_col_width(i)).collect();
+			let seeded = self.width_store.and_then(|store| {
+				store
+					.borrow()
+					.as_ref()
+					.filter(|widths| widths.len() == col_count)
+					.cloned()
+			});
+			state.col_widths = seeded
+				.unwrap_or_else(|| (0..col_count).map(|i| self.measure_col_width(i)).collect());
 		}
 		&state.col_widths
 	}
@@ -556,6 +585,9 @@ where
 			Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) => {
 				if state.resizing_col.is_some() {
 					state.resizing_col = None;
+					if let Some(store) = self.width_store {
+						*store.borrow_mut() = Some(state.col_widths.clone());
+					}
 					shell.request_redraw();
 				} else if state.v_dragging_scrollbar || state.h_dragging_scrollbar {
 					state.v_dragging_scrollbar = false;
@@ -1320,6 +1352,12 @@ mod tests {
 			.join("\n")
 	}
 
+	/// Baseline updated 2026-08-07 for the `CHAR_ADVANCE` 0.6 → 0.65 width
+	/// estimate (the "margin" header-wrap fix): only measured column widths
+	/// changed; every fill color, text color, and operation order is
+	/// byte-identical to the pre-extraction recording. Widths were never part
+	/// of PRODUCT-0023's skin scope (§7), so this is a premise update, not a
+	/// parity regression.
 	#[test]
 	fn product_0023_pre_extraction_draw_operation_oracle() {
 		let signature = product_0023_operation_signature(&product_0023_recorded_table_operations(
@@ -1330,9 +1368,9 @@ fill 10.00,20.00,28.00,48.00 #040404/1.00
 text "#  " 28.00,44.00 #dcdcdc/1.00 clip 18.00,20.00,20.00,48.00
 fill 37.00,20.00,1.00,108.00 #fafafa/0.10
 fill 38.00,20.00,80.00,48.00 #040404/1.00
-text "category" 46.00,36.00 #dcdcdc/1.00 clip 46.00,20.00,67.20,32.00
-text "str" 46.00,60.00 #b496dc/1.00 clip 46.00,52.00,67.20,16.00
-fill 179.20,20.00,1.00,48.00 #fafafa/0.10
+text "category" 46.00,36.00 #dcdcdc/1.00 clip 46.00,20.00,72.80,32.00
+text "str" 46.00,60.00 #b496dc/1.00 clip 46.00,52.00,72.80,16.00
+fill 188.30,20.00,1.00,48.00 #fafafa/0.10
 fill 10.00,67.00,108.00,1.00 #fafafa/0.10
 fill 10.00,68.00,28.00,28.00 #040404/1.00
 fill 10.00,95.00,28.00,1.00 #fafafa/0.10
@@ -1348,23 +1386,23 @@ fill 10.00,179.00,28.00,1.00 #fafafa/0.10
 text "4" 18.00,166.00 #dcdcdc/1.00 clip 18.00,152.00,20.00,28.00
 fill 38.00,68.00,80.00,28.00 #140826/1.00
 fill 38.00,95.00,80.00,1.00 #fafafa/0.10
-text "A" 46.00,82.00 #e6e6e6/1.00 clip 46.00,68.00,67.20,28.00
-fill 179.20,68.00,1.00,28.00 #fafafa/0.10
+text "A" 46.00,82.00 #e6e6e6/1.00 clip 46.00,68.00,72.80,28.00
+fill 188.30,68.00,1.00,28.00 #fafafa/0.10
 fill 38.00,96.00,80.00,28.00 #281446/1.00
 fill 38.00,123.00,80.00,1.00 #fafafa/0.10
-fill 38.00,96.00,83.20,28.00 #8c00fa/0.25
-text "B" 46.00,110.00 #e6e6e6/1.00 clip 46.00,96.00,67.20,28.00
-fill 179.20,96.00,1.00,28.00 #fafafa/0.10
+fill 38.00,96.00,88.80,28.00 #8c00fa/0.25
+text "B" 46.00,110.00 #e6e6e6/1.00 clip 46.00,96.00,72.80,28.00
+fill 188.30,96.00,1.00,28.00 #fafafa/0.10
 fill 38.00,124.00,80.00,28.00 #140826/1.00
 fill 38.00,151.00,80.00,1.00 #fafafa/0.10
-text "C" 46.00,138.00 #e6e6e6/1.00 clip 46.00,124.00,67.20,28.00
-fill 179.20,124.00,1.00,28.00 #fafafa/0.10
+text "C" 46.00,138.00 #e6e6e6/1.00 clip 46.00,124.00,72.80,28.00
+fill 188.30,124.00,1.00,28.00 #fafafa/0.10
 fill 38.00,152.00,80.00,28.00 #281446/1.00
 fill 38.00,179.00,80.00,1.00 #fafafa/0.10
-text "D" 46.00,166.00 #e6e6e6/1.00 clip 46.00,152.00,67.20,28.00
-fill 179.20,152.00,1.00,28.00 #fafafa/0.10
+text "D" 46.00,166.00 #e6e6e6/1.00 clip 46.00,152.00,72.80,28.00
+fill 188.30,152.00,1.00,28.00 #fafafa/0.10
 fill 116.00,68.00,8.00,32.14 #8c00fa/0.50
-fill 38.00,130.00,45.33,8.00 #8c00fa/0.50"##;
+fill 38.00,130.00,42.58,8.00 #8c00fa/0.50"##;
 		assert_eq!(signature, PRE_EXTRACTION_DRAW_ORACLE);
 	}
 
@@ -1479,7 +1517,7 @@ fill 38.00,130.00,45.33,8.00 #8c00fa/0.50"##;
 		assert_close(table.measure_col_width(0), MIN_COL_WIDTH);
 		assert_close(
 			table.measure_col_width(1),
-			4.0 * FONT_SIZE * 0.6 + CELL_PADDING_X * 2.0,
+			4.0 * FONT_SIZE * CHAR_ADVANCE + CELL_PADDING_X * 2.0,
 		);
 		assert_close(table.measure_col_width(2), MAX_COL_WIDTH);
 	}

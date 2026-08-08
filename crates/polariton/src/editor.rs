@@ -2526,6 +2526,9 @@ struct PanelEntry {
 	/// Latest keyboard-driven scroll, with a sequence the widget uses to apply
 	/// it exactly once rather than on every frame.
 	scroll: Option<(u64, TableScroll)>,
+	/// User-resized column widths, surviving the widget-tree state that dies
+	/// whenever panel content swaps variants (every rerun passes `Running`).
+	col_widths: std::cell::RefCell<Option<Vec<f32>>>,
 }
 
 struct TableArtifact {
@@ -2586,6 +2589,7 @@ impl PanelRegistry {
 							content: PanelContent::Unresolved,
 							status: PanelStatus::Fresh,
 							scroll: None,
+							col_widths: std::cell::RefCell::new(None),
 						})
 						.revision = *revision;
 				}
@@ -2603,6 +2607,7 @@ impl PanelRegistry {
 							content: PanelContent::Unresolved,
 							status: PanelStatus::Fresh,
 							scroll: None,
+							col_widths: std::cell::RefCell::new(None),
 						},
 					);
 				}
@@ -2645,6 +2650,7 @@ impl PanelRegistry {
 					content: PanelContent::Unresolved,
 					status: PanelStatus::Fresh,
 					scroll: None,
+					col_widths: std::cell::RefCell::new(None),
 				});
 			}
 		}
@@ -2688,6 +2694,7 @@ impl PanelRegistry {
 			content: PanelContent::Unresolved,
 			status: PanelStatus::Fresh,
 			scroll: None,
+			col_widths: std::cell::RefCell::new(None),
 		});
 		entry.content = content;
 		entry.status = PanelStatus::Fresh;
@@ -2720,6 +2727,7 @@ impl PanelRegistry {
 			content: PanelContent::Unresolved,
 			status: PanelStatus::Fresh,
 			scroll: None,
+			col_widths: std::cell::RefCell::new(None),
 		});
 		if matches!(
 			entry.content,
@@ -2737,6 +2745,7 @@ impl PanelRegistry {
 			content: PanelContent::Unresolved,
 			status: PanelStatus::Fresh,
 			scroll: None,
+			col_widths: std::cell::RefCell::new(None),
 		});
 		if matches!(
 			entry.content,
@@ -2823,6 +2832,11 @@ impl PanelRegistry {
 					self.panels
 						.get(&panel.panel_id)
 						.and_then(|entry| entry.scroll),
+				)
+				.width_store(
+					self.panels
+						.get(&panel.panel_id)
+						.map(|entry| &entry.col_widths),
 				)
 				.into(),
 				#[cfg(feature = "toron")]
