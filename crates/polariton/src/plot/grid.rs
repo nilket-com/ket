@@ -13,7 +13,9 @@ use crate::plot::common::{
 	PlotWidget, ResolvedPlotSettings,
 };
 use crate::plot::factory::{create_plot, create_styled_plot};
-use crate::plot::spec::{LayerSettings, NonEmpty, ResolvedPlotSpec, StampedResult};
+use crate::plot::spec::{
+	Channel, LayerSettings, NonEmpty, ResolvedPlotSpec, ScaleDomain, StampedResult,
+};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
 use iced::{Point, Rectangle as IcedRectangle};
@@ -452,7 +454,7 @@ impl PlotGridKernel {
 			.iter()
 			.map(|cell| (cell.cell.position, cell.kernel.layout(settings.clone())))
 			.collect();
-		let shared = shared_layout(&local);
+		let shared = shared_layout(&local, &self.cells.first().cell.body);
 		local
 			.into_iter()
 			.map(|(position, layout)| (position, merge_layout(layout, &shared)))
@@ -885,7 +887,20 @@ pub(crate) fn grid_cell_bounds(
 	)
 }
 
-fn shared_layout(local: &[(GridPosition, PlotLayout)]) -> Option<PlotLayout> {
+fn resolved_categories(body: &ResolvedPlotSpec, channel: Channel) -> Vec<String> {
+	let resolved = body
+		.channel(channel)
+		.unwrap_or_else(|| panic!("categorical grid has no resolved {channel} channel"));
+	let ScaleDomain::Categorical(categories) = &resolved.domain else {
+		panic!("categorical grid's resolved {channel} channel is not categorical")
+	};
+	categories.clone()
+}
+
+fn shared_layout(
+	local: &[(GridPosition, PlotLayout)],
+	body: &ResolvedPlotSpec,
+) -> Option<PlotLayout> {
 	let first = local.first()?.1.clone();
 	match first {
 		PlotLayout::Cartesian {
@@ -913,6 +928,32 @@ fn shared_layout(local: &[(GridPosition, PlotLayout)]) -> Option<PlotLayout> {
 				y_axis_type,
 			})
 		}
+		PlotLayout::CategoricalX { .. } => {
+			let mut y = (f64::INFINITY, f64::NEG_INFINITY);
+			for (_, layout) in local {
+				if let PlotLayout::CategoricalX { y_range, .. } = layout {
+					y.0 = y.0.min(y_range.0);
+					y.1 = y.1.max(y_range.1);
+				}
+			}
+			Some(PlotLayout::CategoricalX {
+				categories: resolved_categories(body, Channel::X),
+				y_range: y,
+			})
+		}
+		PlotLayout::CategoricalY { .. } => {
+			let mut x = (f64::INFINITY, f64::NEG_INFINITY);
+			for (_, layout) in local {
+				if let PlotLayout::CategoricalY { x_range, .. } = layout {
+					x.0 = x.0.min(x_range.0);
+					x.1 = x.1.max(x_range.1);
+				}
+			}
+			Some(PlotLayout::CategoricalY {
+				categories: resolved_categories(body, Channel::Y),
+				x_range: x,
+			})
+		}
 		_ => Some(first),
 	}
 }
@@ -934,6 +975,26 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 			x_axis_type,
 			y_axis_type,
 		},
+		(
+			PlotLayout::CategoricalX { .. },
+			Some(PlotLayout::CategoricalX {
+				categories,
+				y_range,
+			}),
+		) => PlotLayout::CategoricalX {
+			categories: categories.clone(),
+			y_range: *y_range,
+		},
+		(
+			PlotLayout::CategoricalY { .. },
+			Some(PlotLayout::CategoricalY {
+				categories,
+				x_range,
+			}),
+		) => PlotLayout::CategoricalY {
+			categories: categories.clone(),
+			x_range: *x_range,
+		},
 		(layout, _) => layout,
 	}
 }
@@ -942,7 +1003,9 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 mod tests {
 	use super::*;
 	use crate::coordinate::Window;
-	use crate::plot::common::{PathBuilder, PlotBackend, PlotRenderLayer, PlotWidget};
+	use crate::plot::common::{
+		PathBuilder, PlotBackend, PlotRenderLayer, PlotWidget, TickPlacement,
+	};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use crate::plot::export::SvgBackend;
@@ -954,15 +1017,54 @@ mod tests {
 
 	#[derive(Default)]
 	/// PRODUCT-0057 named oracle `plot::grid::tests::RectangleBackend` records
-	/// rectangle tuples only; its shared short name grants no other license.
+	/// rectangle tuples and fill-path points only; its shared short name grants
+	/// no compositing, clipping, antialiasing, or text-metric license.
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size, Color)>,
+		paths: Vec<Vec<Point>>,
+	}
+
+	#[derive(Default)]
+	struct PointPathBuilder {
+		points: Vec<Point>,
+	}
+
+	impl PathBuilder for PointPathBuilder {
+		fn move_to(&mut self, point: Point) {
+			self.points.push(point);
+		}
+
+		fn line_to(&mut self, point: Point) {
+			self.points.push(point);
+		}
+
+		fn arc_to(&mut self, center: Point, _radius: f32, _start_angle: f32, _end_angle: f32) {
+			self.points.push(center);
+		}
+
+		fn circle(&mut self, center: Point, _radius: f32) {
+			self.points.push(center);
+		}
+
+		fn rectangle(&mut self, top_left: Point, size: Size) {
+			self.points.push(top_left);
+			self.points.push(Point::new(
+				top_left.x + size.width,
+				top_left.y + size.height,
+			));
+		}
+
+		fn close(&mut self) {}
 	}
 
 	impl PlotBackend for RectangleBackend {
 		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
 
-		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+		fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {
+			let mut builder = PointPathBuilder::default();
+			f(&mut builder);
+			self.paths.push(builder.points);
+		}
 
 		fn fill_rectangle(&mut self, top_left: Point, size: Size, color: Color) {
 			self.rectangles.push((top_left, size, color));
@@ -1863,6 +1965,487 @@ mod tests {
 				assignment.color.red, assignment.color.green, assignment.color.blue
 			);
 			assert!(svg.contains(&fill), "missing panel-blind {fill}");
+		}
+	}
+
+	#[test]
+	fn product_0065_categorical_x_shares_ragged_domain_and_payload_slots() {
+		let data = Arc::new(
+			df!(
+				"facet" => ["A", "B", "A", "B"],
+				"category" => ["X", "Y", "Z", "X"],
+				"value" => [2.0_f64, 20.0, 3.0, 2.0],
+			)
+			.unwrap(),
+		);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "product-0065-x".into(),
+				data: Arc::clone(&data),
+			},
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Bar),
+				"category",
+				"value",
+			),
+		})
+		.unwrap();
+		let body = Arc::new(resolved.resolved_spec);
+		let expected_categories = match &body.channel(Channel::X).unwrap().domain {
+			crate::plot::spec::ScaleDomain::Categorical(categories) => categories.clone(),
+			_ => panic!("resolved bar category domain"),
+		};
+		assert_eq!(expected_categories, ["X", "Y", "Z"]);
+		let grid = PlotGrid::value_facet(
+			Arc::clone(&body),
+			&StampedResult {
+				data,
+				provenance: PlotProvenance {
+					source_name: "product-0065-x".into(),
+					revision: Some(1),
+				},
+			},
+			"facet",
+			GridArrangement::new(1, 2).unwrap(),
+		)
+		.unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 600, 240);
+		let settings = ResolvedPlotSettings::default();
+		let local = kernel
+			.cells
+			.iter()
+			.map(|cell| cell.kernel.layout(settings.clone()))
+			.collect::<Vec<_>>();
+		let local_domains = local
+			.iter()
+			.map(|layout| match layout {
+				PlotLayout::CategoricalX {
+					categories,
+					y_range,
+				} => (categories.clone(), *y_range),
+				_ => panic!("vertical bar cell"),
+			})
+			.collect::<Vec<_>>();
+		assert_ne!(
+			local_domains[0].0, local_domains[1].0,
+			"the fixture must contain unequal local category domains"
+		);
+		assert_ne!(
+			local_domains[0].1, local_domains[1].1,
+			"the fixture must contain unequal local numeric ranges"
+		);
+		assert!(
+			local_domains
+				.iter()
+				.all(|(categories, _)| categories.len() < 3),
+			"every partition deliberately omits a category"
+		);
+		let expected_range = (
+			local_domains
+				.iter()
+				.map(|(_, range)| range.0)
+				.fold(f64::INFINITY, f64::min),
+			local_domains
+				.iter()
+				.map(|(_, range)| range.1)
+				.fold(f64::NEG_INFINITY, f64::max),
+		);
+		let merged = kernel.cell_layouts(settings.clone());
+		for (_, layout) in &merged {
+			let PlotLayout::CategoricalX {
+				categories,
+				y_range,
+			} = layout
+			else {
+				panic!("merged categorical x")
+			};
+			assert_eq!(categories, &expected_categories);
+			assert_eq!(*y_range, expected_range);
+		}
+
+		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(300.0, 180.0));
+		let placement = TickPlacement::count(4).unwrap();
+		let major = placement.positions(expected_range).unwrap();
+		let minor = placement.minor_positions(&major, 2).unwrap();
+		let reference_transform = CoordinateTransformer::new(&merged[0].1, bounds);
+		let reference_ticks = major
+			.iter()
+			.chain(&minor)
+			.map(|value| reference_transform.categorical(0, *value).0.y)
+			.collect::<Vec<_>>();
+		for (_, layout) in merged.iter().skip(1) {
+			let transform = CoordinateTransformer::new(layout, bounds);
+			assert_eq!(
+				major
+					.iter()
+					.chain(&minor)
+					.map(|value| transform.categorical(0, *value).0.y)
+					.collect::<Vec<_>>(),
+				reference_ticks,
+				"major and minor numeric tick pixels are cell-congruent"
+			);
+		}
+		let mut shared_x_top = Vec::new();
+		for ((cell, local_layout), (_, merged_layout)) in
+			kernel.cells.iter().zip(&local).zip(&merged)
+		{
+			let PlotLayout::CategoricalX {
+				categories: local_categories,
+				..
+			} = local_layout
+			else {
+				unreachable!()
+			};
+			let transform = CoordinateTransformer::new(merged_layout, bounds);
+			let mut backend = RectangleBackend::default();
+			cell.kernel.plot(
+				&mut backend,
+				bounds,
+				&transform,
+				Cursor::Unavailable,
+				settings.clone(),
+			);
+			assert_eq!(backend.rectangles.len(), local_categories.len());
+			for ((top_left, size, _), category) in backend.rectangles.iter().zip(local_categories) {
+				let shared_index = expected_categories
+					.iter()
+					.position(|candidate| candidate == category)
+					.unwrap();
+				assert_eq!(
+					top_left.x + size.width / 2.0,
+					transform.categorical(shared_index, 0.0).0.x,
+					"{category} payload occupies the band carrying its label"
+				);
+				if category == "X" {
+					shared_x_top.push(top_left.y);
+				}
+			}
+		}
+		assert_eq!(
+			shared_x_top[0], shared_x_top[1],
+			"the same value maps to the same cell-relative pixel under one shared range"
+		);
+	}
+
+	#[test]
+	fn product_0065_categorical_y_shares_ragged_domain_and_payload_slots() {
+		let data = Arc::new(
+			df!(
+				"facet" => ["Left", "Right", "Left", "Right"],
+				"category" => ["North", "East", "South", "North"],
+				"value" => [2.0_f64, 40.0, 4.0, 2.0],
+			)
+			.unwrap(),
+		);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "product-0065-y".into(),
+				data: Arc::clone(&data),
+			},
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Bar),
+				"value",
+				"category",
+			),
+		})
+		.unwrap();
+		let body = Arc::new(resolved.resolved_spec);
+		let expected_categories = match &body.channel(Channel::Y).unwrap().domain {
+			crate::plot::spec::ScaleDomain::Categorical(categories) => categories.clone(),
+			_ => panic!("resolved horizontal category domain"),
+		};
+		assert_eq!(expected_categories, ["North", "East", "South"]);
+		let grid = PlotGrid::value_facet(
+			Arc::clone(&body),
+			&StampedResult {
+				data,
+				provenance: PlotProvenance {
+					source_name: "product-0065-y".into(),
+					revision: Some(1),
+				},
+			},
+			"facet",
+			GridArrangement::new(1, 2).unwrap(),
+		)
+		.unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 600, 240);
+		let settings = ResolvedPlotSettings::default();
+		let local = kernel
+			.cells
+			.iter()
+			.map(|cell| cell.kernel.layout(settings.clone()))
+			.collect::<Vec<_>>();
+		let local_domains = local
+			.iter()
+			.map(|layout| match layout {
+				PlotLayout::CategoricalY {
+					categories,
+					x_range,
+				} => (categories.clone(), *x_range),
+				_ => panic!("horizontal bar cell"),
+			})
+			.collect::<Vec<_>>();
+		assert_ne!(local_domains[0].0, local_domains[1].0);
+		assert_ne!(local_domains[0].1, local_domains[1].1);
+		assert!(
+			local_domains
+				.iter()
+				.all(|(categories, _)| categories.len() < 3),
+			"every partition deliberately omits a category"
+		);
+		let expected_range = (
+			local_domains
+				.iter()
+				.map(|(_, range)| range.0)
+				.fold(f64::INFINITY, f64::min),
+			local_domains
+				.iter()
+				.map(|(_, range)| range.1)
+				.fold(f64::NEG_INFINITY, f64::max),
+		);
+		let merged = kernel.cell_layouts(settings.clone());
+		for (_, layout) in &merged {
+			let PlotLayout::CategoricalY {
+				categories,
+				x_range,
+			} = layout
+			else {
+				panic!("merged categorical y")
+			};
+			assert_eq!(categories, &expected_categories);
+			assert_eq!(*x_range, expected_range);
+		}
+
+		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(300.0, 180.0));
+		let placement = TickPlacement::count(4).unwrap();
+		let major = placement.positions(expected_range).unwrap();
+		let minor = placement.minor_positions(&major, 2).unwrap();
+		let reference_transform = CoordinateTransformer::new(&merged[0].1, bounds);
+		let reference_ticks = major
+			.iter()
+			.chain(&minor)
+			.map(|value| reference_transform.categorical(0, *value).0.x)
+			.collect::<Vec<_>>();
+		for (_, layout) in merged.iter().skip(1) {
+			let transform = CoordinateTransformer::new(layout, bounds);
+			assert_eq!(
+				major
+					.iter()
+					.chain(&minor)
+					.map(|value| transform.categorical(0, *value).0.x)
+					.collect::<Vec<_>>(),
+				reference_ticks,
+				"major and minor numeric tick pixels are cell-congruent"
+			);
+		}
+		let mut shared_north_width = Vec::new();
+		for ((cell, local_layout), (_, merged_layout)) in
+			kernel.cells.iter().zip(&local).zip(&merged)
+		{
+			let PlotLayout::CategoricalY {
+				categories: local_categories,
+				..
+			} = local_layout
+			else {
+				unreachable!()
+			};
+			let transform = CoordinateTransformer::new(merged_layout, bounds);
+			let mut backend = RectangleBackend::default();
+			cell.kernel.plot(
+				&mut backend,
+				bounds,
+				&transform,
+				Cursor::Unavailable,
+				settings.clone(),
+			);
+			assert_eq!(backend.rectangles.len(), local_categories.len());
+			for ((top_left, size, _), category) in backend.rectangles.iter().zip(local_categories) {
+				let shared_index = expected_categories
+					.iter()
+					.position(|candidate| candidate == category)
+					.unwrap();
+				assert_eq!(
+					top_left.y + size.height / 2.0,
+					transform.categorical(shared_index, 0.0).0.y,
+					"{category} payload occupies the band carrying its label"
+				);
+				if category == "North" {
+					shared_north_width.push(size.width);
+				}
+			}
+		}
+		assert_eq!(
+			shared_north_width[0], shared_north_width[1],
+			"the same value maps to the same cell-relative pixel under one shared range"
+		);
+	}
+
+	#[test]
+	fn product_0065_box_and_violin_address_shared_slots_by_category_identity() {
+		use crate::plot::kernels::boxplot::{BoxPlotKernel, prepare_box_plot_data};
+		use crate::plot::kernels::violin::{ViolinPlotKernel, prepare_violin_data};
+
+		let data = df!(
+			"category" => ["X", "X", "X", "X", "X", "Z", "Z", "Z", "Z", "Z"],
+			"value" => [1.0_f64, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 6.5, 7.0, 8.0],
+		)
+		.unwrap();
+		let shared_categories = vec!["X".to_owned(), "Y".to_owned(), "Z".to_owned()];
+		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(300.0, 180.0));
+		let settings = ResolvedPlotSettings::default();
+
+		let box_prepared = Arc::new(prepare_box_plot_data(&data, "category", "value"));
+		assert_eq!(box_prepared.categories, ["X", "Z"]);
+		let box_layout = PlotLayout::CategoricalX {
+			categories: shared_categories.clone(),
+			y_range: box_prepared.y_range,
+		};
+		let box_transform = CoordinateTransformer::new(&box_layout, bounds);
+		let box_kernel = BoxPlotKernel {
+			prepared_data: Arc::clone(&box_prepared),
+		};
+		let mut box_backend = RectangleBackend::default();
+		box_kernel.plot(
+			&mut box_backend,
+			bounds,
+			&box_transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		assert_eq!(box_backend.rectangles.len(), 2);
+		assert_eq!(
+			box_backend.rectangles[1].0.x + box_backend.rectangles[1].1.width / 2.0,
+			box_transform.categorical(2, 0.0).0.x,
+			"Z box leaves Y's shared slot empty"
+		);
+		let z_box_center = box_transform.categorical(2, box_prepared.stats[1].median).0;
+		assert!(
+			box_kernel
+				.hover(&box_transform, Cursor::Available(z_box_center))
+				.unwrap()
+				.starts_with("Z\n"),
+			"box hover joins the shared Z band to Z's local statistics"
+		);
+
+		let violin_prepared = Arc::new(prepare_violin_data(&data, "category", "value", None));
+		assert_eq!(violin_prepared.categories, ["X", "Z"]);
+		let violin_layout = PlotLayout::CategoricalX {
+			categories: shared_categories,
+			y_range: violin_prepared.y_range,
+		};
+		let violin_transform = CoordinateTransformer::new(&violin_layout, bounds);
+		let violin_kernel = ViolinPlotKernel {
+			prepared_data: Arc::clone(&violin_prepared),
+		};
+		let mut violin_backend = RectangleBackend::default();
+		violin_kernel.plot(
+			&mut violin_backend,
+			bounds,
+			&violin_transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		assert_eq!(violin_backend.paths.len(), 2);
+		let z_path_mean_x = violin_backend.paths[1]
+			.iter()
+			.map(|point| point.x)
+			.sum::<f32>()
+			/ violin_backend.paths[1].len() as f32;
+		assert!(
+			(z_path_mean_x - violin_transform.categorical(2, 0.0).0.x).abs() < 0.01,
+			"Z violin leaves Y's shared slot empty"
+		);
+		let z_violin_center = violin_transform.categorical(2, 0.0).0;
+		assert_eq!(
+			violin_kernel.hover(&violin_transform, Cursor::Available(z_violin_center)),
+			Some("Z: Median 6.50".to_owned()),
+			"violin hover joins the shared Z band to Z's local median"
+		);
+	}
+
+	#[test]
+	fn product_0065_categorical_scatter_already_uses_the_resolved_domain() {
+		let data = Arc::new(
+			df!(
+				"facet" => ["A", "B", "A", "B"],
+				"category" => ["X", "Y", "Z", "X"],
+				"value" => [2.0_f64, 20.0, 3.0, 2.0],
+			)
+			.unwrap(),
+		);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "product-0065-scatter".into(),
+				data: Arc::clone(&data),
+			},
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Scatter),
+				"category",
+				"value",
+			),
+		})
+		.unwrap();
+		let body = Arc::new(resolved.resolved_spec);
+		let expected_categories = vec!["X".to_owned(), "Y".to_owned(), "Z".to_owned()];
+		let grid = PlotGrid::value_facet(
+			Arc::clone(&body),
+			&StampedResult {
+				data,
+				provenance: PlotProvenance {
+					source_name: "product-0065-scatter".into(),
+					revision: Some(1),
+				},
+			},
+			"facet",
+			GridArrangement::new(1, 2).unwrap(),
+		)
+		.unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 600, 240);
+		let settings = ResolvedPlotSettings::default();
+		let merged = kernel.cell_layouts(settings.clone());
+		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(300.0, 180.0));
+		for (cell, (_, merged_layout)) in kernel.cells.iter().zip(&merged) {
+			let local_layout = cell.kernel.layout(settings.clone());
+			let PlotLayout::CategoricalX { categories, .. } = &local_layout else {
+				panic!("categorical scatter layout")
+			};
+			assert_eq!(
+				categories, &expected_categories,
+				"scatter preparation already consumes the resolved global domain"
+			);
+			let transform = CoordinateTransformer::new(merged_layout, bounds);
+			let expected_slots = cell
+				.cell
+				.data
+				.column("category")
+				.unwrap()
+				.as_materialized_series()
+				.iter()
+				.map(|value| {
+					let value = value.to_string().trim_matches('"').to_owned();
+					expected_categories
+						.iter()
+						.position(|category| category == &value)
+						.unwrap()
+				})
+				.collect::<Vec<_>>();
+			let mut backend = RectangleBackend::default();
+			cell.kernel.plot(
+				&mut backend,
+				bounds,
+				&transform,
+				Cursor::Unavailable,
+				settings.clone(),
+			);
+			let observed = backend.paths.iter().flatten().collect::<Vec<_>>();
+			assert_eq!(observed.len(), expected_slots.len());
+			for (point, expected_slot) in observed.into_iter().zip(expected_slots) {
+				assert_eq!(
+					point.x,
+					transform.categorical(expected_slot, 0.0).0.x,
+					"scatter payload uses its named shared category slot"
+				);
+			}
 		}
 	}
 

@@ -62,15 +62,20 @@ impl PlotKernel for StackedBarPlotKernel {
 				let bar_width = total_band_width * 0.8;
 				let bar_offset = (total_band_width - bar_width) / 2.0;
 				for i in 0..num_cats {
-					let cat_left = (i as f32 * total_band_width) + bar_offset;
+					let Some(shared_index) =
+						transform.category_index(&self.prepared_data.categories[i])
+					else {
+						continue;
+					};
+					let cat_left = (shared_index as f32 * total_band_width) + bar_offset;
 					let mut current_y = y_base;
 					for j in 0..num_groups {
 						let val = self.prepared_data.category_values[i][j];
 						if val <= 0.0 {
 							continue;
 						}
-						let (p_top, _) = transform.categorical(i, current_y + val);
-						let (p_bottom, _) = transform.categorical(i, current_y);
+						let (p_top, _) = transform.categorical(shared_index, current_y + val);
+						let (p_bottom, _) = transform.categorical(shared_index, current_y);
 						let bar_rect = Rectangle {
 							x: cat_left,
 							y: p_top.y,
@@ -98,7 +103,12 @@ impl PlotKernel for StackedBarPlotKernel {
 				let bar_height = total_band_height * 0.8;
 				let bar_offset = (total_band_height - bar_height) / 2.0;
 				for i in 0..num_cats {
-					let (category_center, _) = transform.categorical(i, x_base);
+					let Some(shared_index) =
+						transform.category_index(&self.prepared_data.categories[i])
+					else {
+						continue;
+					};
+					let (category_center, _) = transform.categorical(shared_index, x_base);
 					let cat_top = category_center.y - total_band_height / 2.0 + bar_offset;
 					let mut current_x = x_base;
 					for j in 0..num_groups {
@@ -106,8 +116,8 @@ impl PlotKernel for StackedBarPlotKernel {
 						if val <= 0.0 {
 							continue;
 						}
-						let (p_right, _) = transform.categorical(i, current_x + val);
-						let (p_left, _) = transform.categorical(i, current_x);
+						let (p_right, _) = transform.categorical(shared_index, current_x + val);
+						let (p_left, _) = transform.categorical(shared_index, current_x);
 						let bar_rect = Rectangle {
 							x: p_left.x,
 							y: cat_top,
@@ -132,13 +142,10 @@ impl PlotKernel for StackedBarPlotKernel {
 		if let Some(cursor_pos) = cursor.position() {
 			match self.orientation {
 				Orientation::Vertical => {
-					if let PlotLayout::CategoricalX {
-						categories,
-						y_range,
-					} = transform.layout
-					{
-						for (i, cat_name) in categories.iter().enumerate() {
-							let (center, band_width) = transform.categorical(i, 0.0);
+					if let PlotLayout::CategoricalX { y_range, .. } = transform.layout {
+						for (i, cat_name) in self.prepared_data.categories.iter().enumerate() {
+							let shared_index = transform.category_index(cat_name)?;
+							let (center, band_width) = transform.categorical(shared_index, 0.0);
 							let left = center.x - band_width / 2.0;
 							let right = center.x + band_width / 2.0;
 							if cursor_pos.x >= left && cursor_pos.x <= right {
@@ -175,13 +182,10 @@ impl PlotKernel for StackedBarPlotKernel {
 					}
 				}
 				Orientation::Horizontal => {
-					if let PlotLayout::CategoricalY {
-						categories,
-						x_range,
-					} = transform.layout
-					{
-						for (i, cat_name) in categories.iter().enumerate() {
-							let (center, band_height) = transform.categorical(i, 0.0);
+					if let PlotLayout::CategoricalY { x_range, .. } = transform.layout {
+						for (i, cat_name) in self.prepared_data.categories.iter().enumerate() {
+							let shared_index = transform.category_index(cat_name)?;
+							let (center, band_height) = transform.categorical(shared_index, 0.0);
 							let top = center.y - band_height / 2.0;
 							let bottom = center.y + band_height / 2.0;
 							if cursor_pos.y >= top && cursor_pos.y <= bottom {

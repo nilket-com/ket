@@ -35,7 +35,11 @@ impl PlotKernel for ViolinPlotKernel {
 		let (y_min, y_max) = self.prepared_data.y_range;
 		let y_step = (y_max - y_min) / (tex_height_bins as f64 - 1.0);
 		for i in 0..num_violins {
-			let (_center, band_width) = transform.categorical(i, 0.0);
+			let Some(shared_index) = transform.category_index(&self.prepared_data.categories[i])
+			else {
+				continue;
+			};
+			let (_center, band_width) = transform.categorical(shared_index, 0.0);
 			let width_scale = band_width * 0.4;
 			let t = if num_violins > 1 {
 				i as f32 / (num_violins - 1) as f32
@@ -64,7 +68,7 @@ impl PlotKernel for ViolinPlotKernel {
 				for bin in first_bin..=last_bin {
 					let data_y = y_min + bin as f64 * y_step;
 					let density = self.prepared_data.kde_data[i * tex_height_bins + bin];
-					let (p, _) = transform.categorical(i, data_y);
+					let (p, _) = transform.categorical(shared_index, data_y);
 					if bin == first_bin {
 						builder.move_to(iced::Point::new(p.x - density * width_scale, p.y));
 					} else {
@@ -74,7 +78,7 @@ impl PlotKernel for ViolinPlotKernel {
 				for bin in (first_bin..=last_bin).rev() {
 					let data_y = y_min + bin as f64 * y_step;
 					let density = self.prepared_data.kde_data[i * tex_height_bins + bin];
-					let (p, _) = transform.categorical(i, data_y);
+					let (p, _) = transform.categorical(shared_index, data_y);
 					builder.line_to(iced::Point::new(p.x + density * width_scale, p.y));
 				}
 				builder.close();
@@ -87,7 +91,7 @@ impl PlotKernel for ViolinPlotKernel {
 			};
 			backend.stroke_path(&violin_path_closure, border_stroke);
 			if let Some(&median_val) = self.prepared_data.medians.get(i) {
-				let (median_px, _) = transform.categorical(i, median_val);
+				let (median_px, _) = transform.categorical(shared_index, median_val);
 				let bin_idx = (((median_val - y_min) / (y_max - y_min))
 					* (tex_height_bins as f64 - 1.0))
 					.floor() as usize;
@@ -111,12 +115,17 @@ impl PlotKernel for ViolinPlotKernel {
 		}
 		if let Some(cursor_pos) = cursor.position() {
 			for i in 0..num_violins {
-				let (center, band_width) = transform.categorical(i, 0.0);
+				let Some(shared_index) =
+					transform.category_index(&self.prepared_data.categories[i])
+				else {
+					continue;
+				};
+				let (center, band_width) = transform.categorical(shared_index, 0.0);
 				let left_edge = center.x - (band_width / 2.0);
 				let right_edge = center.x + (band_width / 2.0);
 				if cursor_pos.x >= left_edge && cursor_pos.x <= right_edge {
 					if let Some(&median_val) = self.prepared_data.medians.get(i) {
-						let (median_px, _) = transform.categorical(i, median_val);
+						let (median_px, _) = transform.categorical(shared_index, median_val);
 						backend.stroke_path(
 							&|builder| {
 								builder.circle(median_px, 5.0);
@@ -148,8 +157,12 @@ impl PlotKernel for ViolinPlotKernel {
 		if let Some(cursor_pos) = cursor.position()
 			&& let PlotLayout::CategoricalX { categories, .. } = transform.layout
 		{
-			for (i, cat) in categories.iter().enumerate() {
-				let (center_point, band_width) = transform.categorical(i, 0.0);
+			for (i, cat) in self.prepared_data.categories.iter().enumerate() {
+				let Some(shared_index) = categories.iter().position(|candidate| candidate == cat)
+				else {
+					continue;
+				};
+				let (center_point, band_width) = transform.categorical(shared_index, 0.0);
 				let left_edge = center_point.x - (band_width / 2.0);
 				let right_edge = center_point.x + (band_width / 2.0);
 				if cursor_pos.x >= left_edge

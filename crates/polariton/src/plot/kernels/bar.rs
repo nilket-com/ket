@@ -62,9 +62,13 @@ impl BarPlotKernel {
 		width_fraction: f32,
 		category_gap_fraction: f32,
 	) -> Vec<BarRectangle> {
-		let num_cats = self.prepared_data.categories.len();
 		let num_groups = self.prepared_data.group_names.len();
-		let mut bars = Vec::with_capacity(num_cats.saturating_mul(num_groups));
+		let mut bars = Vec::with_capacity(
+			self.prepared_data
+				.categories
+				.len()
+				.saturating_mul(num_groups),
+		);
 		match self.orientation {
 			Orientation::Vertical => {
 				let y_base = if let PlotLayout::CategoricalX { y_range, .. } = transform.layout {
@@ -72,20 +76,23 @@ impl BarPlotKernel {
 				} else {
 					0.0
 				};
-				let band = transform.bounds.width / num_cats as f32;
-				let cluster = band * (1.0 - category_gap_fraction);
-				let category_inset = (band - cluster) / 2.0;
-				let slot = cluster / num_groups as f32;
-				let padding = slot * (1.0 - width_fraction) / 2.0;
-				for category_index in 0..num_cats {
-					let category_left = category_index as f32 * band;
+				for (category_index, category) in self.prepared_data.categories.iter().enumerate() {
+					let Some(shared_index) = transform.category_index(category) else {
+						continue;
+					};
+					let (center, band) = transform.categorical(shared_index, y_base);
+					let cluster = band * (1.0 - category_gap_fraction);
+					let category_inset = (band - cluster) / 2.0;
+					let slot = cluster / num_groups as f32;
+					let padding = slot * (1.0 - width_fraction) / 2.0;
+					let category_left = center.x - band / 2.0;
 					for group_index in 0..num_groups {
 						let value = self.prepared_data.values[category_index][group_index];
 						if value <= y_base {
 							continue;
 						}
-						let (top, _) = transform.categorical(category_index, value);
-						let (bottom, _) = transform.categorical(category_index, y_base);
+						let (top, _) = transform.categorical(shared_index, value);
+						let (bottom, _) = transform.categorical(shared_index, y_base);
 						bars.push(BarRectangle {
 							rect: Rectangle {
 								x: category_left
@@ -107,20 +114,22 @@ impl BarPlotKernel {
 				} else {
 					0.0
 				};
-				let (_, band) = transform.categorical(0, x_base);
-				let cluster = band * (1.0 - category_gap_fraction);
-				let category_inset = (band - cluster) / 2.0;
-				let slot = cluster / num_groups as f32;
-				let padding = slot * (1.0 - width_fraction) / 2.0;
-				for category_index in 0..num_cats {
-					let (left, _) = transform.categorical(category_index, x_base);
+				for (category_index, category) in self.prepared_data.categories.iter().enumerate() {
+					let Some(shared_index) = transform.category_index(category) else {
+						continue;
+					};
+					let (left, band) = transform.categorical(shared_index, x_base);
+					let cluster = band * (1.0 - category_gap_fraction);
+					let category_inset = (band - cluster) / 2.0;
+					let slot = cluster / num_groups as f32;
+					let padding = slot * (1.0 - width_fraction) / 2.0;
 					let category_top = left.y - band / 2.0;
 					for group_index in 0..num_groups {
 						let value = self.prepared_data.values[category_index][group_index];
 						if value <= x_base {
 							continue;
 						}
-						let (right, _) = transform.categorical(category_index, value);
+						let (right, _) = transform.categorical(shared_index, value);
 						bars.push(BarRectangle {
 							rect: Rectangle {
 								x: left.x,

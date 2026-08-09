@@ -229,6 +229,20 @@ impl<'a> CoordinateTransformer<'a> {
 		Self { layout, bounds }
 	}
 
+	/// Resolve a prepared category's semantic identity into the slot owned by
+	/// the transform's complete display domain. PRODUCT-0065 requires this
+	/// indirection because a faceted slice may omit categories while its shared
+	/// axis deliberately retains their empty slots.
+	pub fn category_index(&self, category: &str) -> Option<usize> {
+		match self.layout {
+			PlotLayout::CategoricalX { categories, .. }
+			| PlotLayout::CategoricalY { categories, .. } => categories
+				.iter()
+				.position(|candidate| candidate == category),
+			_ => None,
+		}
+	}
+
 	pub fn cartesian(&self, data_x: f64, data_y: f64) -> Point {
 		if let PlotLayout::Cartesian {
 			x_range, y_range, ..

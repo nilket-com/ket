@@ -33,7 +33,11 @@ impl PlotKernel for BoxPlotKernel {
 	) {
 		let num_cats = self.prepared_data.categories.len();
 		for (i, stats) in self.prepared_data.stats.iter().enumerate() {
-			let (center, band_width) = transform.categorical(i, 0.0);
+			let Some(shared_index) = transform.category_index(&self.prepared_data.categories[i])
+			else {
+				continue;
+			};
+			let (center, band_width) = transform.categorical(shared_index, 0.0);
 			let box_width = band_width * 0.6;
 			let left = center.x - box_width / 2.0;
 			let right = center.x + box_width / 2.0;
@@ -45,8 +49,8 @@ impl PlotKernel for BoxPlotKernel {
 			let color = settings.color_theme.get_color(t);
 			let color_iced = color;
 			let line_color = settings.mark_decoration_color;
-			let (q1_px, _) = transform.categorical(i, stats.q1);
-			let (q3_px, _) = transform.categorical(i, stats.q3);
+			let (q1_px, _) = transform.categorical(shared_index, stats.q1);
+			let (q3_px, _) = transform.categorical(shared_index, stats.q3);
 			let box_rect = Rectangle {
 				x: left,
 				y: q3_px.y,
@@ -65,7 +69,7 @@ impl PlotKernel for BoxPlotKernel {
 				},
 				outline_stroke,
 			);
-			let (median_px, _) = transform.categorical(i, stats.median);
+			let (median_px, _) = transform.categorical(shared_index, stats.median);
 			let median_stroke = Stroke {
 				style: Style::Solid(line_color),
 				width: 3.5,
@@ -83,8 +87,8 @@ impl PlotKernel for BoxPlotKernel {
 				width: 1.0,
 				..Default::default()
 			};
-			let (min_px, _) = transform.categorical(i, stats.min);
-			let (max_px, _) = transform.categorical(i, stats.max);
+			let (min_px, _) = transform.categorical(shared_index, stats.min);
+			let (max_px, _) = transform.categorical(shared_index, stats.max);
 			backend.stroke_path(
 				&|builder| {
 					builder.move_to(iced::Point::new(center.x, min_px.y));
@@ -119,8 +123,14 @@ impl PlotKernel for BoxPlotKernel {
 				y_range,
 			} = transform.layout
 		{
-			for (i, category) in categories.iter().enumerate() {
-				let (center, band_width) = transform.categorical(i, 0.0);
+			for (i, category) in self.prepared_data.categories.iter().enumerate() {
+				let Some(shared_index) = categories
+					.iter()
+					.position(|candidate| candidate == category)
+				else {
+					continue;
+				};
+				let (center, band_width) = transform.categorical(shared_index, 0.0);
 				let left = center.x - band_width / 2.0;
 				let right = center.x + band_width / 2.0;
 				if cursor_pos.x >= left && cursor_pos.x <= right {
