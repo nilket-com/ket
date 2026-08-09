@@ -479,6 +479,9 @@ mod product_0013_baseline_tests {
 	use polars::df;
 
 	#[derive(Default)]
+	/// PRODUCT-0057 named oracle
+	/// `plot::factory::product_0013_baseline_tests::RectangleBackend` records
+	/// rectangle tuples only; its shared short name grants no other license.
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size, iced::Color)>,
 	}

@@ -517,6 +517,12 @@ pub trait PathBuilder {
 	fn close(&mut self);
 }
 
+/// Backend-independent authored plot operations.
+///
+/// PRODUCT-0057 oracle license: this boundary can prove emitted primitives,
+/// coordinates, content, and order only when a particular implementation
+/// records those fields. It cannot by itself prove production compositing,
+/// clipping enforcement, antialiasing, or realized glyph extents.
 pub trait PlotBackend {
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke);
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color);
@@ -544,6 +550,11 @@ pub trait PlotBackend {
 	fn with_clip(&mut self, bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend));
 }
 
+/// The production iced canvas adapter.
+///
+/// PRODUCT-0057 oracle license: an offscreen capture through this adapter can
+/// prove realized iced/wgpu pixels for the recorded adapter and configuration;
+/// it does not generalize to SVG, tiny-skia, another driver, or another GPU.
 pub struct IcedBackend<'a> {
 	pub frame: &'a mut Frame,
 }
@@ -2468,6 +2479,10 @@ mod product_0056_categorical_y_oracles {
 	}
 
 	#[derive(Default)]
+	/// PRODUCT-0057 named oracle `plot::common::tests::RecordingBackend` records
+	/// stroke-point traces and text after accumulated translation. It discards
+	/// fills, rectangles, rotation, and clip bounds; `with_clip` is flattened to
+	/// `with_save`, so it is not licensed for any clip-scope claim.
 	struct RecordingBackend {
 		strokes: Vec<Vec<Point>>,
 		texts: Vec<Text>,

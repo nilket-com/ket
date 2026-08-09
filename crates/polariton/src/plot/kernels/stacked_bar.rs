@@ -420,6 +420,9 @@ mod tests {
 	use iced::{Color, Point, Size};
 
 	#[derive(Default)]
+	/// PRODUCT-0057 named oracle
+	/// `plot::kernels::stacked_bar::tests::RectangleBackend` records rectangle
+	/// tuples only; its shared short name grants no other license.
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size, Color)>,
 	}

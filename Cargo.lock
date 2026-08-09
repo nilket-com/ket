@@ -6332,6 +6332,7 @@ dependencies = [
  "gcloud-gax",
  "gcloud-googleapis",
  "iced",
+ "iced_wgpu",
  "kurbo 0.13.1",
  "libaryon",
  "mysql_async",

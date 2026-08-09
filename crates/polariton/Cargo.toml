@@ -8,6 +8,7 @@ description = "A strong coupling of data and visualization."
 
 [features]
 default = ["toron"]
+product-0057-render-evidence = []
 toron = [
 	"dep:nilket-local",
 	"dep:nix",
@@ -58,4 +59,11 @@ nilket-local = { path = "../../nilket/crates/nilket-local", optional = true }
 nix = { version = "0.29", features = ["process", "signal"], optional = true }
 
 [dev-dependencies]
+iced_wgpu = "0.14.0"
 trybuild = "1.0.116"
+
+[[test]]
+name = "product_0057_render_evidence"
+path = "tests/product_0057_render_evidence.rs"
+required-features = ["product-0057-render-evidence"]
+harness = false

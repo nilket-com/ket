@@ -953,6 +953,8 @@ mod tests {
 	use polars::df;
 
 	#[derive(Default)]
+	/// PRODUCT-0057 named oracle `plot::grid::tests::RectangleBackend` records
+	/// rectangle tuples only; its shared short name grants no other license.
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size, Color)>,
 	}

@@ -1154,6 +1154,59 @@ where
 	}
 }
 
+/// PRODUCT-0057's test-only production-path seam. The evidence target supplies
+/// a real iced/wgpu renderer; this helper owns only the private widget state
+/// initialization needed to reach the ordinary [`Table::draw`] implementation.
+#[cfg(feature = "product-0057-render-evidence")]
+#[allow(dead_code)] // The named evidence target mirrors this private module; the binary does not.
+pub(crate) struct Product0057TableEvidenceGeometry {
+	pub(crate) row_number_width: f32,
+	pub(crate) column_width: f32,
+	pub(crate) header_height: f32,
+}
+
+#[cfg(feature = "product-0057-render-evidence")]
+#[allow(dead_code)] // The named evidence target mirrors this private module; the binary does not.
+pub(crate) fn draw_product_0057_table_evidence(
+	renderer: &mut iced::Renderer,
+	data_frame: &DataFrame,
+	column_width: Option<f32>,
+	bounds: Rectangle,
+) -> Product0057TableEvidenceGeometry {
+	let mut table = Table::new(data_frame, 0, TableSkin::DEFAULT);
+	if let Some(column_width) = column_width {
+		table = table.col_width(column_width);
+	}
+	let mut tree = Tree {
+		tag: tree::Tag::of::<TableState>(),
+		state: tree::State::new(TableState::default()),
+		children: Vec::new(),
+	};
+	let state = tree.state.downcast_mut::<TableState>();
+	table.col_widths(state, bounds.width);
+	let row_number_width = table.row_num_width(
+		Rect::<Window>::from_iced_layout(bounds),
+		state.v_scroll_offset,
+	);
+	let resolved_column_width = table.col_widths_ref(state)[0];
+	let node = Node::new(bounds.size()).move_to(bounds.position());
+	<Table<'_> as Widget<(), (), iced::Renderer>>::draw(
+		&table,
+		&tree,
+		renderer,
+		&(),
+		&Style::default(),
+		Layout::new(&node),
+		Cursor::Unavailable,
+		&bounds,
+	);
+	Product0057TableEvidenceGeometry {
+		row_number_width,
+		column_width: resolved_column_width,
+		header_height: table.header_height(),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
@@ -1174,6 +1227,9 @@ mod tests {
 	}
 
 	#[derive(Default)]
+	/// PRODUCT-0057 named oracle `gui::table::tests::RecordingRenderer` records
+	/// requested quads and text, text clip bounds, and the active iced layer
+	/// stack. It does not shape or rasterize glyphs and cannot prove wrap or fit.
 	struct RecordingRenderer {
 		operations: Vec<PaintOperation>,
 		layers: Vec<Rectangle>,

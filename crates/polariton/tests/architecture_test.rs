@@ -1586,3 +1586,129 @@ fn product_0033_plot_skin_projection_choice_is_bounded_and_renderer_free() {
 		);
 	}
 }
+
+#[test]
+fn product_0057_rendering_oracle_licenses_are_schema_bound() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let manifest =
+		std::fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Polariton manifest");
+	let production_dependencies = manifest
+		.split("[dev-dependencies]")
+		.next()
+		.expect("production dependencies before development dependencies");
+	assert!(
+		!production_dependencies.contains("iced_wgpu"),
+		"PRODUCT-0057's direct renderer dependency must stay test-only"
+	);
+	for required in [
+		"product-0057-render-evidence = []",
+		"iced_wgpu = \"0.14.0\"",
+		"name = \"product_0057_render_evidence\"",
+		"required-features = [\"product-0057-render-evidence\"]",
+		"harness = false",
+	] {
+		assert!(
+			manifest.contains(required),
+			"missing evidence boundary: {required}"
+		);
+	}
+
+	let source_root = manifest_dir.join("src");
+	let common = std::fs::read_to_string(source_root.join("plot/common.rs"))
+		.expect("read plot common source");
+	for license in [
+		"Backend-independent authored plot operations.",
+		"cannot by itself prove production compositing",
+		"PRODUCT-0057 named oracle `plot::common::tests::RecordingBackend`",
+		"discards",
+		"clip bounds",
+	] {
+		assert!(
+			common.contains(license),
+			"missing common oracle license: {license}"
+		);
+	}
+	let common_recorder = common
+		.split("struct RecordingBackend")
+		.nth(1)
+		.expect("named common recorder");
+	assert!(common_recorder.contains("strokes: Vec<Vec<Point>>"));
+	assert!(common_recorder.contains("texts: Vec<Text>"));
+	assert!(common_recorder.contains("self.with_save(f);"));
+	assert!(common_recorder.contains("fn fill_path") && common_recorder.contains("{}"));
+
+	let table = std::fs::read_to_string(source_root.join("gui/table.rs"))
+		.expect("read table renderer source");
+	for license in [
+		"PRODUCT-0057 named oracle `gui::table::tests::RecordingRenderer`",
+		"text clip bounds",
+		"does not shape or rasterize glyphs",
+	] {
+		assert!(
+			table.contains(license),
+			"missing table oracle license: {license}"
+		);
+	}
+	let table_recorder = table
+		.split("struct RecordingRenderer")
+		.nth(1)
+		.expect("named table recorder");
+	for recorded in ["operations:", "active_layers:", "clip_bounds"] {
+		assert!(
+			table_recorder.contains(recorded),
+			"table recorder no longer records {recorded}"
+		);
+	}
+
+	for (relative, qualified) in [
+		(
+			"plot/kernels/heatmap.rs",
+			"plot::kernels::heatmap::tests::RectangleBackend",
+		),
+		(
+			"plot/kernels/stacked_bar.rs",
+			"plot::kernels::stacked_bar::tests::RectangleBackend",
+		),
+		(
+			"plot/factory.rs",
+			"plot::factory::product_0013_baseline_tests::RectangleBackend",
+		),
+		("plot/grid.rs", "plot::grid::tests::RectangleBackend"),
+	] {
+		let source = std::fs::read_to_string(source_root.join(relative))
+			.expect("read rectangle oracle source");
+		assert_eq!(source.matches("struct RectangleBackend").count(), 1);
+		assert!(
+			source.contains(qualified),
+			"{relative} lacks its qualified oracle name"
+		);
+		let recorder = source
+			.split("struct RectangleBackend")
+			.nth(1)
+			.expect("rectangle recorder");
+		assert!(recorder.contains("rectangles: Vec<(Point, Size"));
+		assert!(recorder.contains("self.rectangles.push((top_left, size, color));"));
+	}
+
+	let export =
+		std::fs::read_to_string(source_root.join("plot/export.rs")).expect("read export backends");
+	for license in [
+		"Serialized SVG oracle.",
+		"cannot prove production-canvas compositing",
+		"SVG-derived PNG exporter",
+		"SVG-derived AVIF exporter",
+	] {
+		assert!(
+			export.contains(license),
+			"missing export oracle license: {license}"
+		);
+	}
+	assert_eq!(export.matches("svg_backend: SvgBackend,\n").count(), 2);
+	assert_eq!(
+		export
+			.matches("let svg_str = self.svg_backend.finish();")
+			.count(),
+		2,
+		"PNG and AVIF must both rasterize the SVG stream"
+	);
+}

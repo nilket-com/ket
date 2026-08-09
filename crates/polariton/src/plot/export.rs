@@ -8,6 +8,12 @@ use std::io::Cursor;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 
+/// Serialized SVG oracle.
+///
+/// PRODUCT-0057 license: emitted primitives, authored order, coordinates,
+/// paths, colors, text, transforms, clip declarations, and clip nesting. SVG
+/// cannot prove production-canvas compositing, clip enforcement, MSAA, or
+/// realized glyph measurement and fit.
 pub struct SvgBackend {
 	pub svg: String,
 	current_transform: Affine,
@@ -259,6 +265,9 @@ impl PlotBackend for SvgBackend {
 	}
 }
 
+/// SVG-derived PNG exporter. PRODUCT-0057 licenses this only to prove resvg's
+/// rasterization of [`SvgBackend`] output, never an iced production-canvas
+/// property.
 pub struct PngBackend {
 	svg_backend: SvgBackend,
 }
@@ -291,6 +300,9 @@ impl PngBackend {
 	}
 }
 
+/// SVG-derived AVIF exporter. PRODUCT-0057 licenses this only to prove resvg's
+/// rasterization of [`SvgBackend`] output, never an iced production-canvas
+/// property.
 pub struct AvifBackend {
 	svg_backend: SvgBackend,
 }

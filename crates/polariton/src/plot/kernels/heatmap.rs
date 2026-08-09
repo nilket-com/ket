@@ -244,6 +244,8 @@ mod tests {
 	use iced::widget::canvas::{Stroke, Text};
 
 	#[derive(Default)]
+	/// PRODUCT-0057 named oracle `plot::kernels::heatmap::tests::RectangleBackend`
+	/// records rectangle tuples only; its shared short name grants no other license.
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size, Color)>,
 	}
