@@ -1,6 +1,7 @@
 # Wendelon ADR 081: Secondary-Index Declaration and Lifecycle Orchestration
 
-**Status:** Proposed 2026-08-09.
+**Status:** Accepted 2026-08-09. Implementation is code-complete; live acceptance remains pending
+the separately authorized ADR 0539/0541 confirmation rerun.
 **Category:** Capability gap discovered while attempting the ADR 0539/0541 confirmation rerun,
 whose window opened 2026-08-08 and closed 2026-08-09. Wendelon owns a complete secondary-index
 mechanism that no supported production path can declare or drive.

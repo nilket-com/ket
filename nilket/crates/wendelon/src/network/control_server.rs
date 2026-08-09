@@ -18,9 +18,9 @@ use crate::consensus::{
 use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
 use crate::integration::compute::{
-	SchemaMutationKind, TableSchemaDropRequest, WendelonAdminError,
+	SchemaMutationKind, SchemaUpdateEnvelope, TableSchemaDropRequest, WendelonAdminError,
 	decode_schema_update_envelope_v1, encode_logical_type_definition,
-	encode_logical_type_definitions,
+	encode_logical_type_definitions, encode_schema_update_envelope_v1,
 };
 use crate::metrics::{TableRetentionMetricPolicy, global as metrics};
 use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
@@ -30,7 +30,9 @@ use crate::network::pool::BufPool;
 use crate::network::ring::RingState;
 use crate::network::router::ControlRingServer;
 use crate::network::server::RequestContext;
-use crate::network::tls::{ActorIdentity, ActorPermission, ActorTrustDomain, authorize_actor};
+use crate::network::tls::{
+	ActorIdentity, ActorPermission, ActorRole, ActorTrustDomain, authorize_actor,
+};
 use crate::network::traits::{TransferLeadershipRequestMeta, TransferLeadershipResponseMeta};
 use crate::network::transfer_signing::TransferAuthority;
 use crate::network::transport::{
@@ -44,10 +46,12 @@ use crate::schema::{
 	LeaseDescriptor, LeaseStatus, LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta,
 	LogicalTypeListRequestMeta, LogicalTypeListResponseMeta, MsgType, NodeId, PolicyGeneration,
 	ProtocolVersionWindow, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta,
+	SecondaryIndexReplicaStatus, SecondaryIndexStatus, SecondaryIndexStatusRequest,
 	TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta, TableDescriptorListRequestMeta,
 	TableDescriptorListResponseMeta, TableObjectId, TableOptimizerFactsGetRequestMeta,
 	TableOptimizerFactsGetResponseMeta, TableRetentionPolicy, TableSchemaDescriptor, TenantId,
-	TenantKekId, TransferToken, decode_table_schema_descriptor_v1, encode_table_optimizer_facts,
+	TenantKekId, TransferToken, decode_secondary_index_lifecycle_complete,
+	decode_table_schema_descriptor_v1, encode_table_optimizer_facts,
 	encode_table_schema_descriptor_v1, epoch_entry_var_schema,
 };
 #[cfg(test)]
@@ -86,8 +90,8 @@ enum ControlOperation {
 	Transfer,
 	AdvanceEpoch,
 	Join,
-	SchemaUpdate,
 	SchemaDrop,
+	IndexStatus,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +164,17 @@ pub struct SchemaUpdateResponseWire {
 	pub accepted: bool,
 	pub reason_code: u8,
 	pub leader_hint: Option<u32>,
+	#[serde(default)]
+	pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryIndexStatusResponseWire {
+	pub accepted: bool,
+	pub reason_code: u8,
+	pub leader_hint: Option<u32>,
+	#[serde(default)]
+	pub indexes: Vec<SecondaryIndexStatus>,
 	#[serde(default)]
 	pub message: Option<String>,
 }
@@ -357,6 +372,74 @@ impl WendelonControlServer {
 		self
 	}
 
+	pub async fn submit_secondary_index_lifecycle(
+		&self,
+		envelope: SchemaUpdateEnvelope,
+	) -> std::io::Result<()> {
+		if envelope.object.kind != crate::integration::compute::SchemaObjectKind::Index
+			|| !matches!(
+				envelope.mutation,
+				SchemaMutationKind::IndexBackfillComplete | SchemaMutationKind::IndexDropGcComplete
+			) {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"internal lifecycle submission requires an index lifecycle mutation",
+			));
+		}
+		let payload = encode_schema_update_envelope_v1(&envelope)?;
+		if self.is_leader().await {
+			let response = self
+				.raft
+				.client_write(WendelonRequest::SchemaUpdate(payload))
+				.await
+				.map_err(|error| Error::new(ErrorKind::Other, error.to_string()))?;
+			return match response.data {
+				WendelonResponse::Success => Ok(()),
+				WendelonResponse::Error(message) => Err(Error::new(ErrorKind::Other, message)),
+				WendelonResponse::LeaseDenied => Err(Error::other(
+					"unexpected lease denial for secondary-index lifecycle mutation",
+				)),
+			};
+		}
+		let leader = self
+			.leader_hint()
+			.await
+			.map(|id| NodeId { id, _reserved: 0 })
+			.ok_or_else(|| Error::new(ErrorKind::NotConnected, "index lifecycle has no leader"))?;
+		let conn = self.factory.get_connection(leader).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::SCHEMA_UPDATE_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: payload.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, &payload, None, None).await?;
+		stream.finish().await?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::SCHEMA_UPDATE_RESP.0 {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"index lifecycle target returned the wrong response type",
+			));
+		}
+		let response: SchemaUpdateResponseWire = wire::decode(&frame.meta)?;
+		if response.accepted {
+			Ok(())
+		} else {
+			Err(Error::new(
+				ErrorKind::Other,
+				response.message.unwrap_or_else(|| {
+					format!("index lifecycle rejected: {}", response.reason_code)
+				}),
+			))
+		}
+	}
+
 	fn authorize_control_operation(
 		&self,
 		context: &RequestContext,
@@ -375,9 +458,8 @@ impl WendelonControlServer {
 			| ControlOperation::Transfer
 			| ControlOperation::AdvanceEpoch
 			| ControlOperation::Join => ActorPermission::ClusterControl,
-			ControlOperation::SchemaUpdate | ControlOperation::SchemaDrop => {
-				ActorPermission::TenantAdminMutation
-			}
+			ControlOperation::SchemaDrop => ActorPermission::TenantAdminMutation,
+			ControlOperation::IndexStatus => ActorPermission::TenantAdminRead,
 		};
 		authorize_actor(&context.actor, permission).map_err(|error| {
 			Error::new(
@@ -444,6 +526,29 @@ impl WendelonControlServer {
 				magic: HRFT_MAGIC,
 				version: 1,
 				msg_type: MsgType::SCHEMA_UPDATE_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	fn build_secondary_index_status_frame(
+		&self,
+		stream_id: u32,
+		response: &SecondaryIndexStatusResponseWire,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, response)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::SECONDARY_INDEX_STATUS_RESP.0,
 				flags: 0,
 				stream_id,
 				meta_len: meta.len() as u32,
@@ -1254,6 +1359,33 @@ impl WendelonControlServer {
 				);
 			}
 		};
+		let lifecycle_replica = if envelope.object.kind
+			== crate::integration::compute::SchemaObjectKind::Index
+			&& matches!(
+				envelope.mutation,
+				SchemaMutationKind::IndexBackfillComplete | SchemaMutationKind::IndexDropGcComplete
+			) {
+			Some(decode_secondary_index_lifecycle_complete(
+				&envelope.payload,
+			)?)
+		} else {
+			None
+		};
+		if let Some(complete) = lifecycle_replica {
+			authorize_actor(&context.actor, ActorPermission::InterNodeTransport)?;
+			if context.actor.role != ActorRole::DataNode
+				|| context.actor.node_id != Some(complete.replica_id)
+			{
+				return self.schema_update_rejection(
+					&frame,
+					CONTROL_REASON_AUTHORIZATION_FAILED,
+					"secondary-index lifecycle completion must identify the authenticated data node",
+					None,
+				);
+			}
+		} else {
+			authorize_actor(&context.actor, ActorPermission::TenantAdminMutation)?;
+		}
 		// Tenant-scoped actors are limited to their claimed tenant.
 		// Cluster/platform actors have no tenant claim and are already
 		// gated by TenantAdminMutation above.
@@ -1358,6 +1490,74 @@ impl WendelonControlServer {
 				None,
 			),
 		}
+	}
+
+	async fn handle_secondary_index_status(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"SECONDARY_INDEX_STATUS_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		let request: SecondaryIndexStatusRequest = wire::decode(&frame.meta)?;
+		if let Some(claimed_tenant) = context.actor.claimed_tenant_id()? {
+			if claimed_tenant != request.tenant_id {
+				return self.build_secondary_index_status_frame(
+					frame.header.stream_id,
+					&SecondaryIndexStatusResponseWire {
+						accepted: false,
+						reason_code: CONTROL_REASON_AUTHORIZATION_FAILED,
+						leader_hint: self.leader_hint().await,
+						indexes: Vec::new(),
+						message: Some("actor tenant does not match index-status tenant".to_owned()),
+					},
+				);
+			}
+		}
+		let Some(storage) = self.storage_manager.as_ref() else {
+			return self.build_secondary_index_status_frame(
+				frame.header.stream_id,
+				&SecondaryIndexStatusResponseWire {
+					accepted: false,
+					reason_code: CONTROL_REASON_INTERNAL_ERROR,
+					leader_hint: self.leader_hint().await,
+					indexes: Vec::new(),
+					message: Some("secondary-index status requires local storage".to_owned()),
+				},
+			);
+		};
+		let snapshot = self.state_machine.state_snapshot().await;
+		let mut indexes = Vec::new();
+		for row in snapshot.secondary_indexes.for_tenant(request.tenant_id) {
+			let gaps = storage
+				.secondary_index_durable_coverage_gaps(request.tenant_id, &row.descriptor)
+				.await;
+			indexes.push(SecondaryIndexStatus {
+				descriptor: row.descriptor.clone(),
+				state: row.state,
+				backfill_completed_by: row.backfill_completed_by(),
+				replicas: vec![SecondaryIndexReplicaStatus {
+					replica_id: self.local_node,
+					initial_backfill_complete: row.has_backfill_completion(self.local_node),
+					coverage_gap_slabs: gaps,
+				}],
+			});
+		}
+		indexes.sort_by_key(|status| status.descriptor.index_object_id);
+		self.build_secondary_index_status_frame(
+			frame.header.stream_id,
+			&SecondaryIndexStatusResponseWire {
+				accepted: true,
+				reason_code: CONTROL_REASON_GRANTED,
+				leader_hint: self.leader_hint().await,
+				indexes,
+				message: None,
+			},
+		)
 	}
 
 	async fn handle_schema_drop(
@@ -3790,13 +3990,14 @@ impl ControlRingServer for WendelonControlServer {
 				self.authorize_control_operation(&context, ControlOperation::Join)?;
 				self.handle_join(&context, frame).await?
 			}
-			MsgType::SCHEMA_UPDATE_REQ => {
-				self.authorize_control_operation(&context, ControlOperation::SchemaUpdate)?;
-				self.handle_schema_update(&context, frame).await?
-			}
+			MsgType::SCHEMA_UPDATE_REQ => self.handle_schema_update(&context, frame).await?,
 			MsgType::SCHEMA_DROP_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::SchemaDrop)?;
 				self.handle_schema_drop(&context, frame).await?
+			}
+			MsgType::SECONDARY_INDEX_STATUS_REQ => {
+				self.authorize_control_operation(&context, ControlOperation::IndexStatus)?;
+				self.handle_secondary_index_status(&context, frame).await?
 			}
 			MsgType::TABLE_DESCRIPTOR_GET_REQ => {
 				self.handle_table_descriptor_get(&context, frame).await?

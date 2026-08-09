@@ -3,7 +3,7 @@ use crate::schema::table::{
 	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
 	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaCatalog, TableSchemaDescriptor,
 };
-use crate::schema::{LogicalSchemaFingerprint, NodeId, TenantId};
+use crate::schema::{LogicalSchemaFingerprint, NodeId, SlabId, TenantId};
 use arrow::datatypes::{DataType, TimeUnit};
 use bytemuck::{Pod, Zeroable};
 use serde::{Deserialize, Serialize};
@@ -147,6 +147,60 @@ pub struct SecondaryIndexDescriptor {
 }
 
 impl SecondaryIndexDescriptor {
+	/// Build the supported single-column descriptor from the authoritative table
+	/// contract. Callers name the table column; they do not reconstruct ordinals,
+	/// Arrow tags, generations, or fingerprints by hand.
+	pub fn for_table_column(
+		index_object_id: IndexObjectId,
+		index_name: impl Into<String>,
+		table: &TableSchemaDescriptor,
+		column_name: &str,
+	) -> std::io::Result<Self> {
+		let schema = table.arrow_schema()?;
+		let (column_ordinal, field) = schema
+			.fields()
+			.iter()
+			.enumerate()
+			.find(|(_, field)| field.name() == column_name)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!("secondary index column does not exist: {column_name}"),
+				)
+			})?;
+		let arrow_type_tag =
+			IndexArrowTypeTag::from_data_type(field.data_type()).ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					format!(
+						"{INDEX_REJECT_UNSUPPORTED_COLUMN_TYPE}: column {column_name} has type {}",
+						field.data_type()
+					),
+				)
+			})?;
+		let descriptor = Self {
+			index_object_id,
+			table_object_id: table.table_object_id,
+			namespace: table.namespace.clone(),
+			index_name: index_name.into(),
+			table_schema_generation: table.schema_generation,
+			logical_schema_fingerprint: table.logical_schema_fingerprint,
+			key: SecondaryIndexKeyDescriptor {
+				column_name: column_name.to_owned(),
+				column_ordinal: u32::try_from(column_ordinal).map_err(|_| {
+					Error::new(
+						ErrorKind::InvalidInput,
+						"secondary index column ordinal exceeds u32",
+					)
+				})?,
+				arrow_type_tag,
+				encoding: IndexKeyEncoding::OrderedScalar,
+			},
+		};
+		descriptor.validate_against_table(table)?;
+		Ok(descriptor)
+	}
+
 	pub fn validate_against_table(&self, table: &TableSchemaDescriptor) -> std::io::Result<()> {
 		table.validate()?;
 		if self.table_object_id != table.table_object_id {
@@ -252,8 +306,27 @@ pub enum SecondaryIndexState {
 pub struct SecondaryIndexCatalogRow {
 	pub descriptor: SecondaryIndexDescriptor,
 	pub state: SecondaryIndexState,
+	/// Durable per-replica lifecycle receipts. The state gives the receipts their
+	/// unambiguous meaning: initial-backfill completion in Building/Ready, then
+	/// drop-GC completion after `mark_dropping` clears the set. Reusing the
+	/// existing field preserves the postcard row shape for pre-ADR-081 snapshots.
 	#[serde(default)]
 	pub drop_gc_completed_by: BTreeSet<u32>,
+}
+
+impl SecondaryIndexCatalogRow {
+	pub fn has_backfill_completion(&self, replica_id: NodeId) -> bool {
+		self.state != SecondaryIndexState::Dropping
+			&& self.drop_gc_completed_by.contains(&replica_id.id)
+	}
+
+	pub fn backfill_completed_by(&self) -> BTreeSet<u32> {
+		if self.state == SecondaryIndexState::Dropping {
+			BTreeSet::new()
+		} else {
+			self.drop_gc_completed_by.clone()
+		}
+	}
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -359,6 +432,8 @@ impl SecondaryIndexCatalog {
 		&mut self,
 		tenant_id: TenantId,
 		index_object_id: IndexObjectId,
+		replica_id: NodeId,
+		current_voters: &BTreeSet<u32>,
 	) -> std::io::Result<()> {
 		let Some(row) = self.by_id.get_mut(&SecondaryIndexCatalogKey {
 			tenant_id,
@@ -370,16 +445,76 @@ impl SecondaryIndexCatalog {
 			));
 		};
 		match row.state {
-			SecondaryIndexState::Building => {
-				row.state = SecondaryIndexState::Ready;
+			SecondaryIndexState::Building | SecondaryIndexState::Ready => {
+				row.drop_gc_completed_by.insert(replica_id.id);
+				if row.state == SecondaryIndexState::Building
+					&& current_voters
+						.iter()
+						.all(|voter| row.drop_gc_completed_by.contains(voter))
+				{
+					row.state = SecondaryIndexState::Ready;
+				}
 				Ok(())
 			}
-			SecondaryIndexState::Ready => Ok(()),
 			SecondaryIndexState::Dropping => Err(Error::new(
 				ErrorKind::InvalidData,
 				"secondary index backfill-complete cannot advance a Dropping index",
 			)),
 		}
+	}
+
+	pub fn has_backfill_completion(
+		&self,
+		tenant_id: TenantId,
+		index_object_id: IndexObjectId,
+		replica_id: NodeId,
+	) -> bool {
+		self.get(tenant_id, index_object_id)
+			.is_some_and(|row| row.has_backfill_completion(replica_id))
+	}
+
+	/// Re-evaluate Building rows after a Raft voter-set change. Removing an
+	/// incomplete voter drops its outstanding requirement immediately; adding a
+	/// voter never demotes Ready and its planner remains scan-only until it earns
+	/// its own receipt.
+	pub fn reconcile_backfill_readiness(
+		&mut self,
+		current_voters: &BTreeSet<u32>,
+	) -> Vec<(TenantId, TableObjectId, IndexObjectId)> {
+		if current_voters.is_empty() {
+			return Vec::new();
+		}
+		let mut promoted = Vec::new();
+		for (key, row) in &mut self.by_id {
+			if row.state == SecondaryIndexState::Building
+				&& current_voters
+					.iter()
+					.all(|voter| row.drop_gc_completed_by.contains(voter))
+			{
+				row.state = SecondaryIndexState::Ready;
+				promoted.push((
+					key.tenant_id,
+					row.descriptor.table_object_id,
+					row.descriptor.index_object_id,
+				));
+			}
+		}
+		promoted
+	}
+
+	pub fn for_tenant(&self, tenant_id: TenantId) -> Vec<&SecondaryIndexCatalogRow> {
+		self.by_id
+			.iter()
+			.filter(|(key, _)| key.tenant_id == tenant_id)
+			.map(|(_, row)| row)
+			.collect()
+	}
+
+	pub fn rows(&self) -> Vec<(TenantId, &SecondaryIndexCatalogRow)> {
+		self.by_id
+			.iter()
+			.map(|(key, row)| (key.tenant_id, row))
+			.collect()
 	}
 
 	pub fn mark_dropping(
@@ -514,6 +649,26 @@ pub struct SecondaryIndexDropRequest {
 pub struct SecondaryIndexLifecycleComplete {
 	pub index_object_id: IndexObjectId,
 	pub replica_id: NodeId,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryIndexReplicaStatus {
+	pub replica_id: NodeId,
+	pub initial_backfill_complete: bool,
+	pub coverage_gap_slabs: Vec<SlabId>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryIndexStatus {
+	pub descriptor: SecondaryIndexDescriptor,
+	pub state: SecondaryIndexState,
+	pub backfill_completed_by: BTreeSet<u32>,
+	pub replicas: Vec<SecondaryIndexReplicaStatus>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecondaryIndexStatusRequest {
+	pub tenant_id: TenantId,
 }
 
 pub fn encode_secondary_index_descriptor(
@@ -677,6 +832,26 @@ mod tests {
 	}
 
 	#[test]
+	fn supported_constructor_derives_descriptor_coordinates_from_the_table() {
+		let table = table();
+		let descriptor = SecondaryIndexDescriptor::for_table_column(
+			IndexObjectId::new([0x91; 16]),
+			"events_customer_idx",
+			&table,
+			"customer_id",
+		)
+		.unwrap();
+		assert_eq!(descriptor.table_object_id, table.table_object_id);
+		assert_eq!(descriptor.table_schema_generation, table.schema_generation);
+		assert_eq!(
+			descriptor.logical_schema_fingerprint,
+			table.logical_schema_fingerprint
+		);
+		assert_eq!(descriptor.key.column_ordinal, 1);
+		assert_eq!(descriptor.key.arrow_type_tag, IndexArrowTypeTag::UInt64);
+	}
+
+	#[test]
 	fn descriptor_rejects_pk_synthetic_and_unsupported_type() {
 		let table = table();
 		let pk = descriptor("id", 0, IndexArrowTypeTag::Int64)
@@ -718,10 +893,30 @@ mod tests {
 			SecondaryIndexState::Building
 		);
 		catalog
-			.mark_backfill_complete(tenant, index_object_id)
+			.mark_backfill_complete(
+				tenant,
+				index_object_id,
+				NodeId {
+					id: 1,
+					_reserved: 0,
+				},
+				&BTreeSet::from([1, 2]),
+			)
 			.unwrap();
+		assert_eq!(
+			catalog.get(tenant, index_object_id).unwrap().state,
+			SecondaryIndexState::Building
+		);
 		catalog
-			.mark_backfill_complete(tenant, index_object_id)
+			.mark_backfill_complete(
+				tenant,
+				index_object_id,
+				NodeId {
+					id: 2,
+					_reserved: 0,
+				},
+				&BTreeSet::from([1, 2]),
+			)
 			.unwrap();
 		assert_eq!(
 			catalog.get(tenant, index_object_id).unwrap().state,
@@ -753,6 +948,92 @@ mod tests {
 			)
 			.unwrap();
 		assert!(catalog.get(tenant, index_object_id).is_none());
+	}
+
+	#[test]
+	fn backfill_receipts_are_durable_and_membership_rules_are_explicit() {
+		let tenant = TenantId::new(7);
+		let table = table();
+		let table_object_id = table.table_object_id;
+		let mut tables = TableSchemaCatalog::default();
+		tables.upsert(tenant, table).unwrap();
+		let mut catalog = SecondaryIndexCatalog::default();
+		let descriptor = descriptor("customer_id", 1, IndexArrowTypeTag::UInt64);
+		let index_object_id = descriptor.index_object_id;
+		catalog.create(tenant, descriptor, &tables).unwrap();
+		catalog
+			.mark_backfill_complete(
+				tenant,
+				index_object_id,
+				NodeId {
+					id: 1,
+					_reserved: 0,
+				},
+				&BTreeSet::from([1, 2]),
+			)
+			.unwrap();
+		assert_eq!(
+			catalog.get(tenant, index_object_id).unwrap().state,
+			SecondaryIndexState::Building
+		);
+
+		let encoded = postcard::to_allocvec(&catalog).unwrap();
+		let mut recovered: SecondaryIndexCatalog = postcard::from_bytes(&encoded).unwrap();
+		assert!(recovered.has_backfill_completion(
+			tenant,
+			index_object_id,
+			NodeId {
+				id: 1,
+				_reserved: 0
+			}
+		));
+		// Removing the incomplete voter drops its outstanding requirement without
+		// requiring a replica to re-submit a completion it already recorded.
+		assert_eq!(
+			recovered.reconcile_backfill_readiness(&BTreeSet::from([1])),
+			vec![(tenant, table_object_id, index_object_id)]
+		);
+		assert_eq!(
+			recovered.get(tenant, index_object_id).unwrap().state,
+			SecondaryIndexState::Ready
+		);
+		// Adding a voter does not demote the durable catalog state; planner
+		// eligibility on that voter remains controlled by its own receipt.
+		assert!(!recovered.has_backfill_completion(
+			tenant,
+			index_object_id,
+			NodeId {
+				id: 2,
+				_reserved: 0
+			}
+		));
+		assert_eq!(
+			recovered.get(tenant, index_object_id).unwrap().state,
+			SecondaryIndexState::Ready
+		);
+	}
+
+	#[test]
+	fn legacy_catalog_row_keeps_drop_receipts_and_defaults_backfill_receipts() {
+		#[derive(Serialize)]
+		struct LegacySecondaryIndexCatalogRow {
+			descriptor: SecondaryIndexDescriptor,
+			state: SecondaryIndexState,
+			drop_gc_completed_by: BTreeSet<u32>,
+		}
+
+		let legacy = LegacySecondaryIndexCatalogRow {
+			descriptor: descriptor("customer_id", 1, IndexArrowTypeTag::UInt64),
+			state: SecondaryIndexState::Dropping,
+			drop_gc_completed_by: BTreeSet::from([1, 3]),
+		};
+		let encoded = postcard::to_allocvec(&legacy).unwrap();
+		let decoded: SecondaryIndexCatalogRow = postcard::from_bytes(&encoded).unwrap();
+		assert_eq!(decoded.drop_gc_completed_by, BTreeSet::from([1, 3]));
+		assert!(!decoded.has_backfill_completion(NodeId {
+			id: 1,
+			_reserved: 0,
+		}));
 	}
 
 	#[test]

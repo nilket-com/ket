@@ -77,17 +77,28 @@ pub use wendelon::schema::{
 	IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint, NdvFact, PbcRejectCode,
 	PhysicalDescriptorFingerprint, PrimaryKeyDescriptor, PrimaryKeyEncoding,
 	RangeDistributionBucket, RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicy,
-	StateDigest, TableObjectId, TableOptimizerFacts, TableSchemaDescriptor,
-	TableSpreadLocalityDescriptor, decode_float32_optimizer_fact_scalar,
-	decode_float64_optimizer_fact_scalar, decode_signed_optimizer_fact_scalar,
-	encode_float32_optimizer_fact_scalar, encode_float64_optimizer_fact_scalar,
-	encode_signed_optimizer_fact_scalar,
+	SecondaryIndexDescriptor, SecondaryIndexDropRequest, SecondaryIndexStatus, StateDigest,
+	TableObjectId, TableOptimizerFacts, TableSchemaDescriptor, TableSpreadLocalityDescriptor,
+	decode_float32_optimizer_fact_scalar, decode_float64_optimizer_fact_scalar,
+	decode_signed_optimizer_fact_scalar, encode_float32_optimizer_fact_scalar,
+	encode_float64_optimizer_fact_scalar, encode_secondary_index_descriptor,
+	encode_secondary_index_drop_request, encode_signed_optimizer_fact_scalar,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapPeer {
 	pub node_id: u32,
 	pub address: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SecondaryIndexCreateRequest {
+	pub index_object_id: IndexObjectId,
+	pub namespace: String,
+	pub table_name: String,
+	pub index_name: String,
+	pub column_name: String,
+	pub intent_id: SchemaIntentId,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -655,6 +666,89 @@ impl Client {
 	) -> Result<Vec<TableSchemaDescriptor>, ClientError> {
 		self.inner
 			.list_table_schema_descriptors(tenant_id)
+			.await
+			.map_err(ClientError::from)
+	}
+
+	pub async fn create_secondary_index(
+		&self,
+		tenant_id: TenantId,
+		request: SecondaryIndexCreateRequest,
+	) -> Result<SchemaUpdateReceipt, ClientError> {
+		let table = self
+			.get_table_schema_descriptor(tenant_id, &request.namespace, &request.table_name)
+			.await?
+			.ok_or_else(|| ClientError::SchemaUpdateRejected {
+				reason_code: wendelon::network::control_server::CONTROL_REASON_NOT_FOUND,
+				message: format!(
+					"table does not exist: {}.{}",
+					request.namespace, request.table_name
+				),
+			})?;
+		let descriptor = SecondaryIndexDescriptor::for_table_column(
+			request.index_object_id,
+			request.index_name,
+			&table,
+			&request.column_name,
+		)?;
+		let payload = encode_secondary_index_descriptor(&descriptor)?;
+		let envelope = SchemaUpdateEnvelope::wendelon_operator_intent(
+			tenant_id,
+			SchemaObjectRef {
+				kind: SchemaObjectKind::Index,
+				namespace: descriptor.namespace.clone(),
+				name: descriptor.index_name.clone(),
+			},
+			SchemaGeneration::ZERO,
+			SchemaGeneration::new(1),
+			request.intent_id,
+			SchemaMutationKind::Create,
+			payload,
+		);
+		self.submit_schema_update_payload(encode_schema_update_envelope_v1(&envelope)?)
+			.await
+	}
+
+	pub async fn drop_secondary_index(
+		&self,
+		tenant_id: TenantId,
+		index_object_id: IndexObjectId,
+		intent_id: SchemaIntentId,
+	) -> Result<SchemaUpdateReceipt, ClientError> {
+		let status = self
+			.list_secondary_indexes(tenant_id)
+			.await?
+			.into_iter()
+			.find(|status| status.descriptor.index_object_id == index_object_id)
+			.ok_or_else(|| ClientError::SchemaUpdateRejected {
+				reason_code: wendelon::network::control_server::CONTROL_REASON_NOT_FOUND,
+				message: "secondary index does not exist".to_owned(),
+			})?;
+		let payload =
+			encode_secondary_index_drop_request(&SecondaryIndexDropRequest { index_object_id })?;
+		let envelope = SchemaUpdateEnvelope::wendelon_operator_intent(
+			tenant_id,
+			SchemaObjectRef {
+				kind: SchemaObjectKind::Index,
+				namespace: status.descriptor.namespace,
+				name: status.descriptor.index_name,
+			},
+			SchemaGeneration::ZERO,
+			SchemaGeneration::new(1),
+			intent_id,
+			SchemaMutationKind::Drop,
+			payload,
+		);
+		self.submit_schema_update_payload(encode_schema_update_envelope_v1(&envelope)?)
+			.await
+	}
+
+	pub async fn list_secondary_indexes(
+		&self,
+		tenant_id: TenantId,
+	) -> Result<Vec<SecondaryIndexStatus>, ClientError> {
+		self.inner
+			.list_secondary_indexes(tenant_id)
 			.await
 			.map_err(ClientError::from)
 	}

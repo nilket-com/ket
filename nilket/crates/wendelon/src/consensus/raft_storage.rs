@@ -2773,6 +2773,19 @@ fn apply_entry_to_state(
 		}
 		EntryPayload::Membership(membership) => {
 			state.last_membership = StoredMembership::new(Some(entry.log_id), membership.clone());
+			let voters = membership.voter_ids().collect::<BTreeSet<_>>();
+			for (tenant_id, table_object_id, index_object_id) in state
+				.secondary_indexes
+				.reconcile_backfill_readiness(&voters)
+			{
+				metrics().observe_storage_secondary_index_lifecycle_transition(
+					tenant_id,
+					table_object_id,
+					index_object_id,
+					"building",
+					"ready",
+				);
+			}
 			(WendelonResponse::Success, None)
 		}
 	}
@@ -4432,6 +4445,7 @@ fn apply_index_schema_update(
 		SchemaMutationKind::IndexBackfillComplete => {
 			let complete = decode_secondary_index_lifecycle_complete(&envelope.payload)
 				.map_err(|err| err.to_string())?;
+			let voters = current_voter_ids(state, complete.replica_id.id);
 			let before = state
 				.secondary_indexes
 				.get(envelope.tenant_id, complete.index_object_id)
@@ -4448,10 +4462,19 @@ fn apply_index_schema_update(
 			}
 			state
 				.secondary_indexes
-				.mark_backfill_complete(envelope.tenant_id, complete.index_object_id)
+				.mark_backfill_complete(
+					envelope.tenant_id,
+					complete.index_object_id,
+					complete.replica_id,
+					&voters,
+				)
 				.map_err(|err| err.to_string())?;
+			let after = state
+				.secondary_indexes
+				.get(envelope.tenant_id, complete.index_object_id);
 			if let Some(row) = before
 				&& row.state == SecondaryIndexState::Building
+				&& after.is_some_and(|row| row.state == SecondaryIndexState::Ready)
 			{
 				metrics().observe_storage_secondary_index_lifecycle_transition(
 					envelope.tenant_id,
@@ -7305,6 +7328,10 @@ mod schema_state_tests {
 	fn secondary_index_lifecycle_mutations_are_linear_and_idempotent() {
 		let table = table_descriptor(1);
 		let mut state = state_with_descriptor(&table);
+		state.last_membership = StoredMembership::new(
+			None,
+			openraft::Membership::new(vec![BTreeSet::from([1, 2])], ()),
+		);
 		let descriptor = index_descriptor(&table);
 		apply_schema_update(
 			&mut state,
@@ -7333,6 +7360,29 @@ mod schema_state_tests {
 		);
 		apply_schema_update(&mut state, &complete_bytes).unwrap();
 		apply_schema_update(&mut state, &complete_bytes).unwrap();
+		assert_eq!(
+			state
+				.secondary_indexes
+				.get(TenantId::new(7), descriptor.index_object_id)
+				.unwrap()
+				.state,
+			SecondaryIndexState::Building
+		);
+		let complete_second = SecondaryIndexLifecycleComplete {
+			index_object_id: descriptor.index_object_id,
+			replica_id: SchemaNodeId {
+				id: 2,
+				_reserved: 0,
+			},
+		};
+		let complete_second_bytes = index_schema_envelope(
+			&descriptor,
+			1,
+			2,
+			SchemaMutationKind::IndexBackfillComplete,
+			encode_secondary_index_lifecycle_complete(&complete_second).unwrap(),
+		);
+		apply_schema_update(&mut state, &complete_second_bytes).unwrap();
 		assert_eq!(
 			state
 				.secondary_indexes
@@ -7372,6 +7422,24 @@ mod schema_state_tests {
 				4,
 				SchemaMutationKind::IndexDropGcComplete,
 				encode_secondary_index_lifecycle_complete(&complete).unwrap(),
+			),
+		)
+		.unwrap();
+		assert!(
+			state
+				.secondary_indexes
+				.get(TenantId::new(7), descriptor.index_object_id)
+				.is_some(),
+			"drop GC completion from one voter cannot retire the global catalog row"
+		);
+		apply_schema_update(
+			&mut state,
+			&index_schema_envelope(
+				&descriptor,
+				3,
+				4,
+				SchemaMutationKind::IndexDropGcComplete,
+				encode_secondary_index_lifecycle_complete(&complete_second).unwrap(),
 			),
 		)
 		.unwrap();

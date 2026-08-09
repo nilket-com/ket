@@ -2443,6 +2443,123 @@ fn test_adr052_secondary_index_architecture_guards() {
 }
 
 #[test]
+fn test_adr081_secondary_index_declaration_and_lifecycle_guards() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut violations = Vec::new();
+	let client =
+		fs::read_to_string(manifest_dir.join("crates/wendelon-client/src/lib.rs")).unwrap();
+	for required in [
+		"pub async fn create_secondary_index(",
+		"pub async fn drop_secondary_index(",
+		"pub async fn list_secondary_indexes(",
+		"SecondaryIndexDescriptor::for_table_column(",
+	] {
+		if !client.contains(required) {
+			violations.push(format!(
+				"crates/wendelon-client/src/lib.rs: ADR 081 missing supported client surface {required}"
+			));
+		}
+	}
+
+	let cli = fs::read_to_string(manifest_dir.join("src/cli/index.rs")).unwrap();
+	for required in [
+		"IndexOperation::Create",
+		"IndexOperation::Drop",
+		"IndexOperation::Status",
+		"--bootstrap",
+		"--tenant",
+	] {
+		if !cli.contains(required) {
+			violations.push(format!(
+				"src/cli/index.rs: ADR 081 missing operator surface {required}"
+			));
+		}
+	}
+
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	for required in [
+		"spawn_secondary_index_lifecycle_driver(",
+		"run_secondary_index_backfill_once(",
+		"gc_secondary_index_segments_for_dropping_index(",
+		"submit_secondary_index_lifecycle(",
+	] {
+		if !node.contains(required) {
+			violations.push(format!(
+				"src/node.rs: ADR 081 production lifecycle driver is missing {required}"
+			));
+		}
+	}
+
+	let schema = fs::read_to_string(manifest_dir.join("src/schema/secondary_index.rs")).unwrap();
+	for required in [
+		"pub fn has_backfill_completion(&self, replica_id: NodeId)",
+		"current_voters: &BTreeSet<u32>",
+		"row.drop_gc_completed_by.insert(replica_id.id)",
+		"pub fn reconcile_backfill_readiness(",
+		"pub struct SecondaryIndexStatus",
+	] {
+		if !schema.contains(required) {
+			violations.push(format!(
+				"src/schema/secondary_index.rs: ADR 081 durable receipt/status guard missing {required}"
+			));
+		}
+	}
+
+	let manager = manager_source(manifest_dir);
+	for required in [
+		"secondary_index_admission_gate",
+		"establish_secondary_index_declaration_cut(",
+		"tracker.take_active_buffer()",
+		"state.active.fsync().await?",
+	] {
+		if !manager.contains(required) {
+			violations.push(format!(
+				"src/storage/manager.rs: ADR 081 serialized full-slab declaration cut missing {required}"
+			));
+		}
+	}
+
+	let planner = fs::read_to_string(manifest_dir.join("src/storage/secondary_index.rs")).unwrap();
+	if !planner.contains("has_backfill_completion(local_replica)") {
+		violations.push(
+			"src/storage/secondary_index.rs: ADR 081 planner eligibility must require the local durable receipt"
+				.to_string(),
+		);
+	}
+
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	for required in [
+		"storage_secondary_index_coverage_gap_slabs.set(",
+		"storage_secondary_index_lookup_refusals.initialize(",
+	] {
+		if !metrics.contains(required) {
+			violations.push(format!(
+				"src/metrics/registry.rs: ADR 081 declaration baseline missing {required}"
+			));
+		}
+	}
+
+	let control = fs::read_to_string(manifest_dir.join("src/network/control_server.rs")).unwrap();
+	for required in [
+		"MsgType::SECONDARY_INDEX_STATUS_REQ",
+		"ActorPermission::InterNodeTransport",
+		"authenticated data node",
+	] {
+		if !control.contains(required) {
+			violations.push(format!(
+				"src/network/control_server.rs: ADR 081 status/lifecycle authority guard missing {required}"
+			));
+		}
+	}
+
+	assert!(
+		violations.is_empty(),
+		"ADR 081 secondary-index declaration/lifecycle invariants violated:\n{}",
+		violations.join("\n")
+	);
+}
+
+#[test]
 fn test_adr053_wire_ipc_compression_architecture_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let mut violations = Vec::new();

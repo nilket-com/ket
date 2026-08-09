@@ -3,7 +3,7 @@ use crate::schema::pbc::{
 };
 use crate::schema::table::TableSchemaDescriptor;
 use crate::schema::{
-	HybridTimestamp, Identity, IndexArrowTypeTag, IndexObjectId, LogicalSchemaFingerprint,
+	HybridTimestamp, Identity, IndexArrowTypeTag, IndexObjectId, LogicalSchemaFingerprint, NodeId,
 	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, TableObjectId, TenantId,
 };
 use crate::storage::RecordLocation;
@@ -314,23 +314,34 @@ pub fn secondary_index_query_from_pbc(
 pub fn secondary_index_access_plan_from_program(
 	catalog: &SecondaryIndexCatalog,
 	tenant_id: TenantId,
+	local_replica: NodeId,
 	table: &TableSchemaDescriptor,
 	program: &Program,
 ) -> std::io::Result<Option<SecondaryIndexAccessPlan>> {
 	let Some(predicates) = program.conjunctive_column_predicates() else {
 		return Ok(None);
 	};
-	secondary_index_access_plan_from_predicates(catalog, tenant_id, table, &predicates)
+	secondary_index_access_plan_from_predicates(
+		catalog,
+		tenant_id,
+		local_replica,
+		table,
+		&predicates,
+	)
 }
 
 pub fn secondary_index_access_plan_from_predicates(
 	catalog: &SecondaryIndexCatalog,
 	tenant_id: TenantId,
+	local_replica: NodeId,
 	table: &TableSchemaDescriptor,
 	predicates: &[ColumnPredicate],
 ) -> std::io::Result<Option<SecondaryIndexAccessPlan>> {
 	for row in catalog.for_table(tenant_id, table.table_object_id) {
 		if row.state != SecondaryIndexState::Ready {
+			continue;
+		}
+		if !row.has_backfill_completion(local_replica) {
 			continue;
 		}
 		if row.descriptor.table_schema_generation != table.schema_generation
@@ -861,7 +872,15 @@ mod tests {
 	use crate::storage::append_storage_synthetic_columns;
 	use arrow::array::{Int32Array, Int64Array, UInt64Array};
 	use arrow::datatypes::{DataType, Field, Schema};
+	use std::collections::BTreeSet;
 	use std::sync::Arc;
+
+	fn local_replica() -> NodeId {
+		NodeId {
+			id: 1,
+			_reserved: 0,
+		}
+	}
 
 	fn hlc(value: u64) -> HybridTimestamp {
 		HybridTimestamp {
@@ -1121,17 +1140,34 @@ mod tests {
 		let program = pbc_eq_age(42);
 
 		assert_eq!(
-			secondary_index_access_plan_from_program(&catalog, tenant_id, &table, &program)
-				.unwrap(),
+			secondary_index_access_plan_from_program(
+				&catalog,
+				tenant_id,
+				local_replica(),
+				&table,
+				&program,
+			)
+			.unwrap(),
 			None
 		);
 
 		catalog
-			.mark_backfill_complete(tenant_id, descriptor.index_object_id)
+			.mark_backfill_complete(
+				tenant_id,
+				descriptor.index_object_id,
+				local_replica(),
+				&BTreeSet::from([local_replica().id]),
+			)
 			.unwrap();
-		let plan = secondary_index_access_plan_from_program(&catalog, tenant_id, &table, &program)
-			.unwrap()
-			.unwrap();
+		let plan = secondary_index_access_plan_from_program(
+			&catalog,
+			tenant_id,
+			local_replica(),
+			&table,
+			&program,
+		)
+		.unwrap()
+		.unwrap();
 		assert_eq!(plan.descriptor, descriptor);
 		assert_eq!(
 			plan.query,
@@ -1153,14 +1189,25 @@ mod tests {
 			.create(tenant_id, descriptor.clone(), &tables)
 			.unwrap();
 		catalog
-			.mark_backfill_complete(tenant_id, descriptor.index_object_id)
+			.mark_backfill_complete(
+				tenant_id,
+				descriptor.index_object_id,
+				local_replica(),
+				&BTreeSet::from([local_replica().id]),
+			)
 			.unwrap();
 		let program = pbc_eq_age(42);
 
 		let stale_table = table_with_generation(2);
 		assert_eq!(
-			secondary_index_access_plan_from_program(&catalog, tenant_id, &stale_table, &program)
-				.unwrap(),
+			secondary_index_access_plan_from_program(
+				&catalog,
+				tenant_id,
+				local_replica(),
+				&stale_table,
+				&program,
+			)
+			.unwrap(),
 			None
 		);
 
@@ -1168,9 +1215,83 @@ mod tests {
 			.mark_dropping(tenant_id, descriptor.index_object_id)
 			.unwrap();
 		assert_eq!(
-			secondary_index_access_plan_from_program(&catalog, tenant_id, &table, &program)
-				.unwrap(),
+			secondary_index_access_plan_from_program(
+				&catalog,
+				tenant_id,
+				local_replica(),
+				&table,
+				&program,
+			)
+			.unwrap(),
 			None
+		);
+	}
+
+	#[test]
+	fn ready_catalog_falls_back_on_a_replica_without_its_durable_receipt() {
+		let tenant_id = TenantId::new(7);
+		let table = table();
+		let descriptor = descriptor_for_table(&table);
+		let mut tables = TableSchemaCatalog::default();
+		tables.upsert(tenant_id, table.clone()).unwrap();
+		let mut catalog = SecondaryIndexCatalog::default();
+		catalog
+			.create(tenant_id, descriptor.clone(), &tables)
+			.unwrap();
+		let first_replica = NodeId {
+			id: 1,
+			_reserved: 0,
+		};
+		let joining_replica = NodeId {
+			id: 2,
+			_reserved: 0,
+		};
+		catalog
+			.mark_backfill_complete(
+				tenant_id,
+				descriptor.index_object_id,
+				first_replica,
+				&BTreeSet::from([first_replica.id]),
+			)
+			.unwrap();
+		assert_eq!(
+			catalog
+				.get(tenant_id, descriptor.index_object_id)
+				.unwrap()
+				.state,
+			SecondaryIndexState::Ready
+		);
+		assert_eq!(
+			secondary_index_access_plan_from_program(
+				&catalog,
+				tenant_id,
+				joining_replica,
+				&table,
+				&pbc_eq_age(42),
+			)
+			.unwrap(),
+			None,
+			"a newly added voter must scan until its own initial-backfill receipt exists"
+		);
+
+		catalog
+			.mark_backfill_complete(
+				tenant_id,
+				descriptor.index_object_id,
+				joining_replica,
+				&BTreeSet::from([first_replica.id, joining_replica.id]),
+			)
+			.unwrap();
+		assert!(
+			secondary_index_access_plan_from_program(
+				&catalog,
+				tenant_id,
+				joining_replica,
+				&table,
+				&pbc_eq_age(42),
+			)
+			.unwrap()
+			.is_some()
 		);
 	}
 

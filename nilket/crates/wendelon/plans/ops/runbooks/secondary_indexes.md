@@ -1,6 +1,7 @@
 # Secondary Indexes Runbook
 
-ADR: `plans/adr/0052_secondary_indexes.md`
+ADRs: `plans/adr/0052_secondary_indexes.md`,
+`plans/adr/0081_secondary_index_declaration_and_lifecycle.md`
 
 ## When to Use This
 
@@ -19,6 +20,22 @@ local sidecar segments beside retained source slabs. The catalog lifecycle is:
 - `dropping -> absent`: every current voter has applied local drop-GC and
   committed `IndexDropGcComplete`.
 
+ADR 081 supplies the production declaration and lifecycle drivers. Declare and
+observe an index through the operator surface (using the deployment's operator
+certificate and Control/Data Ring bootstrap address):
+
+```text
+wendelon index create --bootstrap 1@127.0.0.1:7001 --cert operator.pem --key operator.key --ca ca.pem --tenant 0 --namespace polariton --table metrics --name metrics_name_idx --column name
+wendelon index status --bootstrap 1@127.0.0.1:7001 --cert operator.pem --key operator.key --ca ca.pem --tenant 0
+wendelon index drop --bootstrap 1@127.0.0.1:7001 --cert operator.pem --key operator.key --ca ca.pem --tenant 0 --id <uuid>
+```
+
+Create derives the ordinal, Arrow type, schema generation and logical
+fingerprint from the authoritative table descriptor; operators do not construct
+the storage descriptor by hand. Declaration forces a local slab rotation. The
+driver backfills that complete sealed slab before recording this replica's
+durable initial-backfill receipt.
+
 ## Metrics
 
 Primary catalog and lifecycle signals:
@@ -28,6 +45,8 @@ wendelon_storage_secondary_index_create_total{tenant, table, index}
 wendelon_storage_secondary_index_drop_total{tenant, table, index}
 wendelon_storage_secondary_index_lifecycle_transitions_total{tenant, table, index, from, to}
 wendelon_storage_secondary_index_uncovered_slabs_total{tenant, table, index}
+wendelon_storage_secondary_index_coverage_gap_slabs{tenant, table, index}
+wendelon_storage_secondary_index_lookup_refusals_total{tenant, table, index}
 wendelon_storage_secondary_index_backfill_seconds{tenant, table, index}
 wendelon_storage_secondary_index_drop_gc_seconds{tenant, table, index}
 ```
@@ -101,17 +120,23 @@ Reason labels to search for:
 
 ## First Checks
 
-1. Confirm the catalog state. `building` means planners must not use the index;
-   `dropping` means planners must fall back to full scans while local sidecars
-   are removed.
-2. Check `wendelon_storage_secondary_index_uncovered_slabs_total`. A nonzero
+1. Confirm the catalog and per-replica state with `wendelon index status`.
+   `building` means global Ready has not received every current voter's durable
+   completion receipt. A Ready index still falls back to scan on a newly added
+   replica until that replica earns its own receipt. `dropping` means planners
+   fall back to full scans while local sidecars are removed.
+2. Check `wendelon_storage_secondary_index_coverage_gap_slabs`. It is the
+   invariant axis: historical source slabs lacking durable segments. Compare it
+   with `wendelon_storage_secondary_index_uncovered_slabs_total`, which counts
+   only this process's failure records and may be zero after restart.
+3. Check `wendelon_storage_secondary_index_uncovered_slabs_total`. A nonzero
    value means local coverage is incomplete and backfill should retry.
-3. Group `wendelon_storage_secondary_index_segments_failed_total` by `reason`.
+4. Group `wendelon_storage_secondary_index_segments_failed_total` by `reason`.
    The labels in the active-buffer section describe whether the node needs
    backfill retry, disk investigation, or corrupt-sidecar handling.
-4. Compare `query_plans_total{mode="indexed"}` to
+5. Compare `query_plans_total{mode="indexed"}` to
    `query_plans_total{mode="fallback_full_scan"}` for the same table and index.
-5. For unexpected low selectivity, inspect candidate revalidation:
+6. For unexpected low selectivity, inspect candidate revalidation:
    `superseded_total` is MVCC churn, while `stale_indexed_value_total` means the
    indexed column changed after an older sidecar entry was written.
 
@@ -129,6 +154,10 @@ Reason labels to search for:
   uncovered and avoid serving indexed results from the corrupt segment.
 - Drop-GC is complete only after all current voters have committed
   `IndexDropGcComplete`. A single replica confirmation is insufficient.
+- A Ready index with no local initial-backfill receipt is ordinary lifecycle:
+  the planner scans. A Ready index whose local receipt exists but whose durable
+  segment later disappears is integrity loss: ADR 0539 selects the index and
+  refuses rather than silently returning incomplete rows.
 
 ## Mitigation
 

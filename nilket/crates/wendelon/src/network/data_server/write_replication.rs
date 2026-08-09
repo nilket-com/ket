@@ -375,6 +375,26 @@ impl WendelonDataServer {
 		let (status, ack_level) = if self.degraded_reason().is_some() {
 			(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
 		} else {
+			let _secondary_index_admission =
+				self.slab.acquire_secondary_index_admission_guard().await;
+			let (table_descriptor, secondary_index_descriptors) = {
+				let state = self.state_machine.state_snapshot().await;
+				let descriptor = state
+					.table_schemas
+					.latest_by_id(meta.tenant_id, meta.table_object_id)
+					.cloned();
+				let indexes = descriptor
+					.as_ref()
+					.map(|descriptor| {
+						Self::secondary_index_admission_descriptors(
+							&state.secondary_indexes,
+							meta.tenant_id,
+							descriptor,
+						)
+					})
+					.unwrap_or_default();
+				(descriptor, indexes)
+			};
 			match decode_table_replica_children(&arrow[..]).and_then(|children| {
 				validate_table_replica_payload(&meta, &children).map(|()| children)
 			}) {
@@ -384,22 +404,18 @@ impl WendelonDataServer {
 						meta.tenant_id,
 						meta.commit_hlc,
 						&children,
+						&secondary_index_descriptors,
 					)
 					.await;
 					match append_result {
 						Ok(()) => {
-							let cdc_staging_ok = if let Some(descriptor) = {
-								let state = self.state_machine.state_snapshot().await;
-								state
-									.table_schemas
-									.latest_by_id(meta.tenant_id, meta.table_object_id)
-									.cloned()
-							} {
+							let cdc_staging_ok = if let Some(descriptor) = table_descriptor.as_ref()
+							{
 								match self
 									.stage_cdc_table_replica_children(
 										meta.tenant_id,
 										meta.table_object_id,
-										&descriptor,
+										descriptor,
 										meta.commit_hlc,
 										&children,
 										false,

@@ -256,6 +256,28 @@ impl SchemaUpdateEnvelope {
 		}
 	}
 
+	pub fn wendelon_operator_intent(
+		tenant_id: TenantId,
+		object: SchemaObjectRef,
+		expected_generation: SchemaGeneration,
+		requested_generation: SchemaGeneration,
+		intent_id: SchemaIntentId,
+		mutation: SchemaMutationKind,
+		payload: Vec<u8>,
+	) -> Self {
+		Self {
+			contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+			origin: SchemaIntentOrigin::WendelonOperator,
+			tenant_id,
+			object,
+			expected_generation,
+			requested_generation,
+			intent_id,
+			mutation,
+			payload,
+		}
+	}
+
 	pub fn validate(&self) -> std::io::Result<()> {
 		if self.contract_version != COMPUTE_STORAGE_CONTRACT_VERSION {
 			return Err(Error::new(

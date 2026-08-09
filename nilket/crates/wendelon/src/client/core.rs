@@ -41,19 +41,21 @@
 
 use crate::client::topology::{ClusterStatusWire, TopologySource};
 use crate::integration::compute::{
-	decode_logical_type_definition, decode_logical_type_definitions,
+	SchemaUpdateEnvelope, decode_logical_type_definition, decode_logical_type_definitions,
+	encode_schema_update_envelope_v1,
 };
 use crate::metrics::NetworkCompressionPath;
 use crate::network::control_server::{
 	CONTROL_REASON_AUTHORIZATION_FAILED, CONTROL_REASON_GRANTED, CONTROL_REASON_INVALID_CONFIG,
-	CONTROL_REASON_NOT_FOUND, CONTROL_REASON_NOT_LEADER,
+	CONTROL_REASON_NOT_FOUND, CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire,
+	SecondaryIndexStatusResponseWire,
 };
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::pool::BufPool;
 use crate::network::ring::{RingRouter, RingState};
 use crate::network::transport::{
-	CapabilityResolver, EpochCapabilityResolver, MembershipEpoch, NodeCapability,
+	CapabilityResolver, EpochCapabilityResolver, MembershipEpoch, NodeCapability, NodeRole,
 	TransportProvider, TransportStream, TransportTier, TransportTierSet,
 };
 use crate::schema::table::decode_table_schema_descriptors;
@@ -66,11 +68,11 @@ use crate::schema::{
 	LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta, LogicalTypeListRequestMeta,
 	LogicalTypeListResponseMeta, MsgType, NodeId, PbcRejectCode,
 	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN, StateDigest,
-	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta,
-	TableDescriptorGetResponseMeta, TableDescriptorListRequestMeta,
-	TableDescriptorListResponseMeta, TableObjectId, TableOptimizerFacts,
-	TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
+	ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN,
+	SecondaryIndexStatus, SecondaryIndexStatusRequest, StateDigest, TableDeleteRowsRequestMeta,
+	TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
+	TableDescriptorListRequestMeta, TableDescriptorListResponseMeta, TableObjectId,
+	TableOptimizerFacts, TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
 	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
 	TableQueryRequestMeta, TableReferenceIntegrityFailureMeta, TableSchemaDescriptor,
 	TableWriteRequestMeta, TableWriteResponseMeta, TenantId, WriteRequestMeta, WriteResponseMeta,
@@ -83,7 +85,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::ipc::writer::StreamWriter;
 use arrow::record_batch::RecordBatch;
 use std::any::Any;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{Error, ErrorKind};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
@@ -1044,6 +1046,133 @@ impl WendelonClient {
 		unreachable!("bounded retry loop must return within budget")
 	}
 
+	/// Submit a typed schema-update envelope over the existing Control Ring
+	/// carrier. ADR 081 uses this for index create/drop and lifecycle reports;
+	/// it deliberately does not introduce an index mutation opcode family.
+	pub async fn submit_schema_update_envelope(
+		&self,
+		envelope: &SchemaUpdateEnvelope,
+	) -> std::io::Result<()> {
+		let payload = encode_schema_update_envelope_v1(envelope)?;
+		let mut preferred_target = self.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = match preferred_target.or_else(|| self.leader()) {
+				Some(target) => target,
+				None => {
+					self.refresh_topology().await?;
+					self.leader().ok_or_else(|| {
+						Error::new(
+							ErrorKind::NotConnected,
+							"schema update requires a known Control Ring leader",
+						)
+					})?
+				}
+			};
+			let response = self.schema_update_once(target, &payload).await?;
+			if let Some(leader) = response.leader_hint {
+				*self.leader.write().unwrap() = Some(NodeId {
+					id: leader,
+					_reserved: 0,
+				});
+			}
+			if response.accepted && response.reason_code == CONTROL_REASON_GRANTED {
+				return Ok(());
+			}
+			if response.reason_code == CONTROL_REASON_NOT_LEADER && attempt + 1 < DATA_RETRY_BUDGET
+			{
+				let retry = RetryDirective::redirect(
+					response.leader_hint.map(|id| NodeId { id, _reserved: 0 }),
+				);
+				self.prepare_retry(None, retry).await?;
+				preferred_target = retry.preferred_target.or_else(|| self.leader());
+				continue;
+			}
+			return Err(Error::new(
+				if response.reason_code == CONTROL_REASON_AUTHORIZATION_FAILED {
+					ErrorKind::PermissionDenied
+				} else if response.reason_code == CONTROL_REASON_INVALID_CONFIG {
+					ErrorKind::InvalidInput
+				} else {
+					ErrorKind::Other
+				},
+				response
+					.message
+					.unwrap_or_else(|| format!("schema update rejected: {}", response.reason_code)),
+			));
+		}
+		unreachable!("bounded retry loop must return within budget")
+	}
+
+	/// Collect the local coverage view from every current replica and merge it
+	/// with the replicated lifecycle row. An unreachable replica is an error,
+	/// never an omitted green status.
+	pub async fn list_secondary_indexes(
+		&self,
+		tenant_id: TenantId,
+	) -> std::io::Result<Vec<SecondaryIndexStatus>> {
+		let _ = self.refresh_topology().await;
+		let membership = self.topology_tx.borrow().clone();
+		let mut targets = membership
+			.peers
+			.iter()
+			.filter_map(|(node, peer)| peer.roles.contains(NodeRole::Data).then_some(*node))
+			.collect::<Vec<_>>();
+		if targets.is_empty() {
+			if let Some(leader) = self.leader() {
+				targets.push(leader);
+			}
+		}
+		targets.sort_by_key(|node| node.id);
+		let request = SecondaryIndexStatusRequest { tenant_id };
+		let mut merged = BTreeMap::new();
+		for target in targets {
+			let response = self.secondary_index_status_once(target, &request).await?;
+			if !response.accepted || response.reason_code != CONTROL_REASON_GRANTED {
+				return Err(Error::new(
+					if response.reason_code == CONTROL_REASON_AUTHORIZATION_FAILED {
+						ErrorKind::PermissionDenied
+					} else {
+						ErrorKind::Other
+					},
+					response.message.unwrap_or_else(|| {
+						format!("secondary-index status rejected: {}", response.reason_code)
+					}),
+				));
+			}
+			for status in response.indexes {
+				let key = status.descriptor.index_object_id;
+				match merged.entry(key) {
+					std::collections::btree_map::Entry::Vacant(entry) => {
+						entry.insert(status);
+					}
+					std::collections::btree_map::Entry::Occupied(mut entry) => {
+						let existing = entry.get_mut();
+						if existing.descriptor != status.descriptor
+							|| existing.state != status.state
+						{
+							return Err(Error::new(
+								ErrorKind::InvalidData,
+								"replicas returned divergent secondary-index catalog rows",
+							));
+						}
+						existing
+							.backfill_completed_by
+							.extend(status.backfill_completed_by);
+						existing.replicas.extend(status.replicas);
+					}
+				}
+			}
+		}
+		let mut statuses = merged.into_values().collect::<Vec<_>>();
+		for status in &mut statuses {
+			status.replicas.sort_by_key(|replica| replica.replica_id.id);
+			status
+				.replicas
+				.dedup_by_key(|replica| replica.replica_id.id);
+		}
+		Ok(statuses)
+	}
+
 	/// Fetch a tenant logical type definition by exact name from the
 	/// Control Ring leader.
 	pub async fn get_logical_type_definition(
@@ -1559,6 +1688,77 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 		let frame = read_frame(&mut *stream, &self.pool).await?;
 		decode_table_descriptor_get_response_frame(frame)
+	}
+
+	async fn schema_update_once(
+		&self,
+		target: NodeId,
+		payload: &[u8],
+	) -> std::io::Result<SchemaUpdateResponseWire> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::SCHEMA_UPDATE_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: payload.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, payload, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::SCHEMA_UPDATE_RESP.0
+			|| frame.arrow_payload.is_some()
+			|| frame.trailing.is_some()
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"invalid SCHEMA_UPDATE_RESP frame",
+			));
+		}
+		crate::network::wire::decode(&frame.meta)
+	}
+
+	async fn secondary_index_status_once(
+		&self,
+		target: NodeId,
+		request: &SecondaryIndexStatusRequest,
+	) -> std::io::Result<SecondaryIndexStatusResponseWire> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let meta = crate::network::wire::encode(request)?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::SECONDARY_INDEX_STATUS_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: meta.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, &meta, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::SECONDARY_INDEX_STATUS_RESP.0
+			|| frame.arrow_payload.is_some()
+			|| frame.trailing.is_some()
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"invalid SECONDARY_INDEX_STATUS_RESP frame",
+			));
+		}
+		crate::network::wire::decode(&frame.meta)
 	}
 
 	async fn table_descriptor_list_once(

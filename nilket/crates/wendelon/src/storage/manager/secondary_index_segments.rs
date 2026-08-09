@@ -148,6 +148,93 @@ pub(super) fn secondary_index_sidecar_tmp_path(path: &Path) -> PathBuf {
 }
 
 impl SlabManager {
+	pub async fn acquire_secondary_index_admission_guard(&self) -> OwnedRwLockReadGuard<()> {
+		self.secondary_index_admission_gate
+			.clone()
+			.read_owned()
+			.await
+	}
+
+	/// Establish the declaration boundary on this replica.
+	///
+	/// The write guard makes the catalog-observation/append path and this cut one
+	/// serialized order: a concurrent write either finishes in the old slab (and
+	/// is included in historical backfill) or observes the descriptor and enters
+	/// the new active buffer. It can never fall between those two sets.
+	pub async fn establish_secondary_index_declaration_cut(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &SecondaryIndexDescriptor,
+		table_indexes: &[SecondaryIndexDescriptor],
+		max_buffer_bytes: usize,
+	) -> std::io::Result<SlabId> {
+		let key = SecondaryIndexCoverageKey::from(SecondaryIndexIdentity::from_descriptor(
+			tenant_id, descriptor,
+		));
+		let _admission = self
+			.secondary_index_admission_gate
+			.clone()
+			.write_owned()
+			.await;
+		if self.secondary_index_declaration_cuts.contains(&key) {
+			return Ok(self.active_slab_id().await);
+		}
+		// Preserve already-established indexes before rotating their source slab.
+		// A buffer with no process-local cut proof may be only a suffix (notably
+		// after restart), so discard it and let full-slab backfill repair coverage.
+		// A buffer whose cut is known was populated from this slab's first admitted
+		// row and can be sealed without manufacturing incomplete coverage.
+		for sibling in table_indexes {
+			let sibling_key = SecondaryIndexCoverageKey::from(
+				SecondaryIndexIdentity::from_descriptor(tenant_id, sibling),
+			);
+			if sibling.index_object_id != descriptor.index_object_id
+				&& self.secondary_index_declaration_cuts.contains(&sibling_key)
+			{
+				self.seal_secondary_index_active_buffer(tenant_id, sibling)
+					.await?;
+			} else if let Some(mut tracker) = self.secondary_index_coverage.get_mut(&sibling_key) {
+				let _ = tracker.take_active_buffer();
+			}
+		}
+
+		let sealed_id = {
+			let mut state = self.state.lock().await;
+			state.active.fsync().await?;
+			let sealed = state.active.clone();
+			let sealed_id = sealed.slab_id();
+			let sealed_size = sealed.write_cursor();
+			let next_id = state.next_slab_id;
+			let next = Arc::new(
+				LocalSlabStore::open(
+					&slab_path(&self.config.dir, next_id),
+					next_id,
+					self.file_ops.clone(),
+					self.config.group_commit.clone(),
+				)
+				.await?,
+			);
+			state.active = next;
+			state.sealed.insert(sealed_id, sealed);
+			state.next_slab_id = next_id.saturating_add(1);
+			self.record_l0_compaction_run(sealed_id, sealed_size);
+			sealed_id
+		};
+
+		// Installs the empty buffer on the new active slab and emits the declared
+		// metric series before the lifecycle driver can report completion.
+		for sibling in table_indexes {
+			self.ensure_secondary_index_coverage(tenant_id, sibling, max_buffer_bytes)
+				.await?;
+			self.secondary_index_declaration_cuts
+				.insert(SecondaryIndexCoverageKey::from(
+					SecondaryIndexIdentity::from_descriptor(tenant_id, sibling),
+				));
+		}
+		self.secondary_index_declaration_cuts.insert(key);
+		Ok(sealed_id)
+	}
+
 	pub async fn ensure_secondary_index_coverage(
 		&self,
 		tenant_id: TenantId,
@@ -916,6 +1003,7 @@ impl SlabManager {
 			SecondaryIndexIdentity::from_descriptor(tenant_id, descriptor),
 		);
 		self.secondary_index_coverage.remove(&coverage_key);
+		self.secondary_index_declaration_cuts.remove(&coverage_key);
 		metrics().set_storage_secondary_index_uncovered_slabs(
 			tenant_id,
 			descriptor.table_object_id,

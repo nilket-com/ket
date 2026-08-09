@@ -5425,6 +5425,7 @@ impl WendelonDataServer {
 		let secondary_index_access_plan = secondary_index_access_plan_from_program(
 			&sm_peek.secondary_indexes,
 			meta.tenant_id,
+			self.local_node,
 			&descriptor,
 			&program,
 		)
@@ -8693,6 +8694,7 @@ impl WendelonDataServer {
 			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 		}
 
+		let _secondary_index_admission = self.slab.acquire_secondary_index_admission_guard().await;
 		let (descriptor, drop_fenced, effective_retention, secondary_index_descriptors) = {
 			let state = self.state_machine.state_snapshot().await;
 			let effective_retention = self.table_effective_retention_from_state(
@@ -14558,27 +14560,48 @@ async fn append_table_children_durable(
 	tenant_id: TenantId,
 	commit_hlc: HybridTimestamp,
 	children: &[TableReplicaChildPayload],
+	secondary_index_descriptors: &[SecondaryIndexDescriptor],
 ) -> std::io::Result<()> {
 	for child in children {
 		let decoded = decode_batch(child.frame_bytes.as_slice())?;
 		if has_storage_synthetic_columns(&decoded) {
 			let entries = storage_index_entries_from_batch(&decoded)?;
-			slab.append_durable_multirow_with_locality(
+			let base_location = slab
+				.append_durable_multirow_with_locality(
+					tenant_id,
+					child.frame_bytes.as_slice(),
+					&entries,
+				)
+				.await?;
+			append_secondary_index_active_buffers_for_storage_batch(
+				slab,
 				tenant_id,
-				child.frame_bytes.as_slice(),
-				&entries,
+				secondary_index_descriptors,
+				&decoded,
+				base_location,
 			)
-			.await?;
+			.await;
 			metrics().observe_storage_multirow_record_written(entries.len() as u64);
 		} else {
-			slab.append_durable_with_locality(
+			let location = slab
+				.append_durable_with_locality(
+					tenant_id,
+					child.key_identity,
+					child.locality,
+					commit_hlc,
+					child.frame_bytes.as_slice(),
+				)
+				.await?;
+			append_secondary_index_active_buffers_for_single_row(
+				slab,
 				tenant_id,
+				secondary_index_descriptors,
+				&decoded,
 				child.key_identity,
-				child.locality,
 				commit_hlc,
-				child.frame_bytes.as_slice(),
+				location,
 			)
-			.await?;
+			.await;
 		}
 	}
 	Ok(())

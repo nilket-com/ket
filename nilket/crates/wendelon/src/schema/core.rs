@@ -747,6 +747,10 @@ impl MsgType {
 	pub const TABLE_DESCRIPTOR_LIST_RESP: Self = Self(0x45);
 	pub const TABLE_OPTIMIZER_FACTS_GET_REQ: Self = Self(0x46);
 	pub const TABLE_OPTIMIZER_FACTS_GET_RESP: Self = Self(0x47);
+	/// ADR 081: read-only secondary-index lifecycle/coverage status. Mutations
+	/// continue to use SCHEMA_UPDATE_REQ; this pair is observation only.
+	pub const SECONDARY_INDEX_STATUS_REQ: Self = Self(0x50);
+	pub const SECONDARY_INDEX_STATUS_RESP: Self = Self(0x51);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -834,6 +838,8 @@ impl MsgType {
 		Self::TABLE_DESCRIPTOR_LIST_RESP,
 		Self::TABLE_OPTIMIZER_FACTS_GET_REQ,
 		Self::TABLE_OPTIMIZER_FACTS_GET_RESP,
+		Self::SECONDARY_INDEX_STATUS_REQ,
+		Self::SECONDARY_INDEX_STATUS_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,

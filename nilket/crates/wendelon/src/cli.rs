@@ -24,6 +24,8 @@ use crate::network::{ActorTrustRoots, TlsMaterial, rustls_server_config_with_pee
 use crate::node::{NodeBootstrapConfig, WendelonNode};
 use ::observability::http as observability_http;
 
+mod index;
+
 const DEFAULT_INSPECT_ENDPOINT: &str = "127.0.0.1:7432";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 pub const READ_RESPONSE_TIMEOUT: Duration = Duration::from_secs(5);
@@ -150,6 +152,7 @@ where
 			verify_audit(audit_path)
 		}
 		[cmd, rest @ ..] if cmd == "inspect" => run_inspect(rest),
+		[cmd, rest @ ..] if cmd == "index" => index::run(rest),
 		[flag, path] if flag == "--write-example-config" => match write_example_config(path) {
 			Ok(()) => {
 				eprintln!("wendelon: wrote starter config to {path}");
@@ -173,7 +176,7 @@ fn print_usage(program: &str) {
 		eprintln!("This binary is deprecated; use `nilket wendelon` instead.");
 	}
 	eprintln!(
-		"usage:\n  {program} <path/to/wendelon.toml>\n  {program} inspect [--endpoint <addr>] [--server-name <name>] [--cert <path>] [--key <path>] [--ca <path>] [--json]\n  {program} audit verify <path/to/audit.ndjson>\n  {program} --print-example-config\n  {program} --write-example-config <path/to/wendelon.toml>"
+		"usage:\n  {program} <path/to/wendelon.toml>\n  {program} inspect [--endpoint <addr>] [--server-name <name>] [--cert <path>] [--key <path>] [--ca <path>] [--json]\n  {program} index create --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --namespace <name> --table <name> --name <name> --column <name> [--id <uuid>]\n  {program} index drop --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> --id <uuid>\n  {program} index status --bootstrap <node-id>@<addr> --cert <path> --key <path> --ca <path> --tenant <id> [--json]\n  {program} audit verify <path/to/audit.ndjson>\n  {program} --print-example-config\n  {program} --write-example-config <path/to/wendelon.toml>"
 	);
 }
 

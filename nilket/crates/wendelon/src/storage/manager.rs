@@ -618,6 +618,15 @@ pub struct SlabManager {
 	/// below. The replicated catalog remains authoritative for
 	/// index lifecycle state; this map only tracks local coverage.
 	secondary_index_coverage: DashMap<SecondaryIndexCoverageKey, SecondaryIndexCoverageTracker>,
+	/// Serializes table admission against the one-time declaration cut. Table
+	/// writes hold a read guard from catalog snapshot through local append;
+	/// declaration holds the write guard while it seals the old active slab and
+	/// installs the new active buffer.
+	secondary_index_admission_gate: Arc<AsyncRwLock<()>>,
+	/// Process-local acceleration for declaration cuts already established. A
+	/// restart may repeat a cut before the durable completion receipt exists;
+	/// that is safe and only creates another historical slab to backfill.
+	secondary_index_declaration_cuts: DashSet<SecondaryIndexCoverageKey>,
 	/// Per-source-slab lease used to serialize secondary-index
 	/// backfill reads with compaction retirement of the same source
 	/// slab. Backfill holds a read lease until its sidecar is
@@ -1419,6 +1428,8 @@ impl SlabManager {
 			retired_tiered_cleanup: DashMap::new(),
 			secondary_index_segments,
 			secondary_index_coverage,
+			secondary_index_admission_gate: Arc::new(AsyncRwLock::new(())),
+			secondary_index_declaration_cuts: DashSet::new(),
 			secondary_index_source_slab_leases: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
 		};

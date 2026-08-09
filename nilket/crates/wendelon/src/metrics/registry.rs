@@ -362,6 +362,25 @@ impl TableRetentionActiveTableGauges {
 struct SecondaryIndexCounters(Mutex<BTreeMap<(u64, String, String), u64>>);
 
 impl SecondaryIndexCounters {
+	fn initialize(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+	) {
+		let mut counters = self
+			.0
+			.lock()
+			.expect("secondary-index counter mutex poisoned");
+		counters
+			.entry((
+				tenant_id.get(),
+				table_object_id_label(table_object_id),
+				index_object_id_label(index_object_id),
+			))
+			.or_insert(0);
+	}
+
 	fn add(
 		&self,
 		tenant_id: TenantId,
@@ -3586,6 +3605,26 @@ impl MetricsRegistry {
 			"absent",
 			"building",
 		);
+		// ADR 081: declaration makes both confirmation axes observable from the
+		// first scrape. A counter family with no labelled entry is absence, not a
+		// zero baseline, so initialize it explicitly rather than adding zero.
+		self.storage_secondary_index_coverage_gap_slabs.set(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			0,
+		);
+		self.storage_secondary_index_uncovered_slabs.set(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+			0,
+		);
+		self.storage_secondary_index_lookup_refusals.initialize(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+		);
 	}
 
 	pub fn observe_storage_secondary_index_drop(
@@ -6394,6 +6433,26 @@ mod tests {
 		)));
 		assert!(rendered.contains(&namespaced_test_metric(
 			"storage_secondary_index_drop_gc_seconds"
+		)));
+	}
+
+	#[test]
+	fn secondary_index_declaration_emits_zero_baselines_before_driver_or_lookup() {
+		let registry = MetricsRegistry::default();
+		let tenant = TenantId::new(81);
+		let table = TableObjectId::new([0x81; 16]);
+		let index = IndexObjectId::new([0x18; 16]);
+		registry.observe_storage_secondary_index_create(tenant, table, index);
+
+		let rendered = registry.render_prometheus();
+		let labels = "tenant=\"81\",table=\"81818181818181818181818181818181\",index=\"18181818181818181818181818181818\"";
+		assert!(rendered.contains(&format!(
+			"{}{{{labels}}} 0",
+			namespaced_test_metric("storage_secondary_index_coverage_gap_slabs")
+		)));
+		assert!(rendered.contains(&format!(
+			"{}{{{labels}}} 0",
+			namespaced_test_metric("storage_secondary_index_lookup_refusals_total")
 		)));
 	}
 

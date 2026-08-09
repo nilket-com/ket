@@ -3417,6 +3417,139 @@ async fn secondary_index_active_buffer_seal_persists_sidecar_and_marks_covered()
 }
 
 #[tokio::test]
+async fn secondary_index_declaration_cut_backfills_the_complete_old_active_slab() {
+	let manager = fresh_manager().await;
+	let table = secondary_index_table_descriptor_for_test();
+	let descriptor = secondary_index_descriptor_for_test();
+	let old_active = manager.active_slab_id().await;
+
+	// This row predates publication and therefore has no active-index entry.
+	append_secondary_index_table_row_for_test(&manager, &table, 1, Some(10), hlc(10)).await;
+	// This row models a write admitted after Building became visible but before
+	// the lifecycle driver acquired the declaration cut.
+	append_secondary_index_table_row_for_test(&manager, &table, 2, Some(20), hlc(20)).await;
+	manager
+		.append_secondary_index_active_buffer_entries(
+			tenant(),
+			&descriptor,
+			vec![SecondaryIndexEntry {
+				encoded_key: secondary_index_encoded_i64_for_test(20),
+				row_key_id: Identity::new([2; 32]),
+				row_hlc: hlc(20),
+				record_location: RecordLocation {
+					slab_id: old_active,
+					offset: 0,
+					length: 1,
+					hlc: hlc(20),
+					record_row_index: RecordRowIndex::ZERO,
+					is_tombstone: false,
+				},
+			}],
+			old_active,
+			4096,
+		)
+		.unwrap();
+
+	// An in-flight write owns a read admission; the cut cannot pass it.
+	let admission = manager.acquire_secondary_index_admission_guard().await;
+	let cut_manager = manager.clone();
+	let cut_descriptor = descriptor.clone();
+	let cut = tokio::spawn(async move {
+		cut_manager
+			.establish_secondary_index_declaration_cut(
+				tenant(),
+				&cut_descriptor,
+				std::slice::from_ref(&cut_descriptor),
+				4096,
+			)
+			.await
+	});
+	tokio::task::yield_now().await;
+	assert!(
+		!cut.is_finished(),
+		"declaration cut passed an admitted write"
+	);
+	drop(admission);
+	assert_eq!(cut.await.unwrap().unwrap(), old_active);
+	assert_ne!(manager.active_slab_id().await, old_active);
+
+	let report = manager
+		.run_secondary_index_backfill_once(tenant(), &table, &descriptor, 8, 4096)
+		.await
+		.unwrap();
+	assert!(report.historical_complete);
+	let infos = manager.list_secondary_index_segments(
+		tenant(),
+		descriptor.table_object_id,
+		descriptor.index_object_id,
+		descriptor.logical_schema_fingerprint,
+	);
+	let old_segment = infos
+		.iter()
+		.find(|info| info.source_slab_id == old_active)
+		.expect("declaration cut must backfill the sealed source slab");
+	let segment = manager
+		.load_secondary_index_segment(old_segment)
+		.await
+		.unwrap()
+		.unwrap();
+	assert_eq!(
+		segment.entries.len(),
+		2,
+		"sealing the suffix-only active buffer would omit the pre-declaration row"
+	);
+
+	// A second declaration must rotate without stranding the first index's
+	// complete active buffer on the newly historical slab.
+	let middle_active = manager.active_slab_id().await;
+	append_secondary_index_table_row_for_test(&manager, &table, 3, Some(30), hlc(30)).await;
+	manager
+		.append_secondary_index_active_buffer_entries(
+			tenant(),
+			&descriptor,
+			vec![SecondaryIndexEntry {
+				encoded_key: secondary_index_encoded_i64_for_test(30),
+				row_key_id: Identity::new([3; 32]),
+				row_hlc: hlc(30),
+				record_location: RecordLocation {
+					slab_id: middle_active,
+					offset: 0,
+					length: 1,
+					hlc: hlc(30),
+					record_row_index: RecordRowIndex::ZERO,
+					is_tombstone: false,
+				},
+			}],
+			middle_active,
+			4096,
+		)
+		.unwrap();
+	let mut second_descriptor = descriptor.clone();
+	second_descriptor.index_object_id = IndexObjectId::new([0x9B; 16]);
+	second_descriptor.index_name = "events_age_idx_second".to_owned();
+	manager
+		.establish_secondary_index_declaration_cut(
+			tenant(),
+			&second_descriptor,
+			&[descriptor.clone(), second_descriptor.clone()],
+			4096,
+		)
+		.await
+		.unwrap();
+	let first_index_middle = manager
+		.list_secondary_index_segments(
+			tenant(),
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			descriptor.logical_schema_fingerprint,
+		)
+		.into_iter()
+		.find(|info| info.source_slab_id == middle_active)
+		.expect("the established sibling buffer must seal before another declaration rotates");
+	assert_eq!(first_index_middle.entry_count, 1);
+}
+
+#[tokio::test]
 async fn secondary_index_backfill_source_slab_emits_every_retained_data_version() {
 	let manager = fresh_manager().await;
 	let table = secondary_index_table_descriptor_for_test();

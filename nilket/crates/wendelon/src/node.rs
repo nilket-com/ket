@@ -48,6 +48,10 @@ use crate::consensus::raft_storage::{
 };
 use crate::consensus::{AdvanceEpochRecord, WendelonRaft, WendelonRequest, WendelonResponse};
 use crate::crypto::{CryptoCacheConfig, CryptoManager, RootKekProviderConfig};
+use crate::integration::compute::{
+	SchemaGeneration, SchemaIntentId, SchemaMutationKind, SchemaObjectKind, SchemaObjectRef,
+	SchemaUpdateEnvelope,
+};
 use crate::metrics::IoUringClass;
 use crate::metrics::observability::{
 	DrainState, ListenerAddresses, ReadinessReporter, ReadinessSnapshot,
@@ -59,9 +63,9 @@ use crate::network::control_server::{
 };
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::data_server::{
-	DEFAULT_TENANT_CACHE_REFRESH_INTERVAL, MIGRATION_SWEEP_FAILURE_BACKOFF,
-	MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS, PENDING_FINALIZATION_RETRY_INTERVAL,
-	WendelonDataServer,
+	DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES, DEFAULT_TENANT_CACHE_REFRESH_INTERVAL,
+	MIGRATION_SWEEP_FAILURE_BACKOFF, MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS,
+	PENDING_FINALIZATION_RETRY_INTERVAL, WendelonDataServer,
 };
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::{
@@ -88,7 +92,9 @@ use crate::network::transport::{
 };
 use crate::network::wire;
 use crate::schema::{
-	FrameHeader, MsgType, NodeId, ProtocolVersionWindow, SlabId, TenantId, TenantKekId,
+	FrameHeader, MsgType, NodeId, ProtocolVersionWindow, SecondaryIndexDescriptor,
+	SecondaryIndexLifecycleComplete, SecondaryIndexState, SlabId, TenantId, TenantKekId,
+	encode_secondary_index_lifecycle_complete,
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
@@ -122,6 +128,8 @@ use tokio_rustls::TlsAcceptor;
 // single-tenant clusters exercise the same tenant create/quota code path
 // without tripping an arbitrary cap before operators set a real quota.
 const DEFAULT_TENANT_QUOTA_BYTES: u64 = u64::MAX;
+const SECONDARY_INDEX_LIFECYCLE_INTERVAL: Duration = Duration::from_secs(1);
+const SECONDARY_INDEX_BACKFILL_SLABS_PER_TICK: usize = 8;
 
 // ============================================================
 //  CONFIG
@@ -681,6 +689,7 @@ pub struct NodeHandles {
 	pub lsm_compaction: JoinHandle<()>,
 	pub lsm_compaction_control: LsmCompactionServiceControl,
 	pub lsm_gc: JoinHandle<()>,
+	pub secondary_index_lifecycle: JoinHandle<()>,
 	pub tiering_sweeper: Option<JoinHandle<()>>,
 	pub restore_validation: Option<JoinHandle<()>>,
 	pub audit_chain_root_rollup: JoinHandle<()>,
@@ -702,6 +711,7 @@ impl NodeHandles {
 		self.migration_sweeper.abort();
 		self.lsm_compaction.abort();
 		self.lsm_gc.abort();
+		self.secondary_index_lifecycle.abort();
 		if let Some(handle) = &self.tiering_sweeper {
 			handle.abort();
 		}
@@ -735,6 +745,7 @@ impl NodeHandles {
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
 		await_background_task(self.lsm_compaction, "LSM compaction").await?;
 		await_background_task(self.lsm_gc, "LSM GC").await?;
+		await_background_task(self.secondary_index_lifecycle, "secondary-index lifecycle").await?;
 		if let Some(handle) = self.tiering_sweeper {
 			await_background_task(handle, "tiering sweeper").await?;
 		}
@@ -1803,6 +1814,12 @@ impl WendelonNode {
 			raft_committer.clone(),
 		));
 		let lsm_gc = LsmGcService::new(lsm_gc_driver, lsm_gc_worker).spawn();
+		let secondary_index_lifecycle = spawn_secondary_index_lifecycle_driver(
+			slab.clone(),
+			state_machine.clone(),
+			control_server.clone(),
+			local_node,
+		);
 
 		// 16. Lease manager (plan 018 / ADR 080). Runs in the background,
 		//     renews every configured TTL / 3 and on every ring-epoch
@@ -1902,6 +1919,7 @@ impl WendelonNode {
 				lsm_compaction,
 				lsm_compaction_control,
 				lsm_gc,
+				secondary_index_lifecycle,
 				tiering_sweeper,
 				restore_validation,
 				audit_chain_root_rollup,
@@ -2619,6 +2637,145 @@ async fn send_join_request(
 		));
 	}
 	wire::decode(&resp.meta)
+}
+
+fn secondary_index_lifecycle_envelope(
+	tenant_id: TenantId,
+	descriptor: &SecondaryIndexDescriptor,
+	local_node: NodeId,
+	mutation: SchemaMutationKind,
+) -> std::io::Result<SchemaUpdateEnvelope> {
+	let payload = encode_secondary_index_lifecycle_complete(&SecondaryIndexLifecycleComplete {
+		index_object_id: descriptor.index_object_id,
+		replica_id: local_node,
+	})?;
+	Ok(SchemaUpdateEnvelope::wendelon_operator_intent(
+		tenant_id,
+		SchemaObjectRef {
+			kind: SchemaObjectKind::Index,
+			namespace: descriptor.namespace.clone(),
+			name: descriptor.index_name.clone(),
+		},
+		SchemaGeneration::ZERO,
+		SchemaGeneration::new(1),
+		SchemaIntentId::new(*uuid::Uuid::new_v4().as_bytes()),
+		mutation,
+		payload,
+	))
+}
+
+async fn run_secondary_index_lifecycle_tick(
+	slab: &Arc<SlabManager>,
+	state_machine: &WendelonStateMachine,
+	control: &Arc<WendelonControlServer>,
+	local_node: NodeId,
+) -> std::io::Result<()> {
+	let work = {
+		let state = state_machine.state_snapshot().await;
+		state
+			.secondary_indexes
+			.rows()
+			.into_iter()
+			.map(|(tenant_id, row)| {
+				let table_indexes = state
+					.secondary_indexes
+					.for_table(tenant_id, row.descriptor.table_object_id)
+					.into_iter()
+					.filter(|candidate| candidate.state != SecondaryIndexState::Dropping)
+					.map(|candidate| candidate.descriptor.clone())
+					.collect::<Vec<_>>();
+				(
+					tenant_id,
+					row.clone(),
+					state
+						.table_schemas
+						.latest_by_id(tenant_id, row.descriptor.table_object_id)
+						.cloned(),
+					table_indexes,
+				)
+			})
+			.collect::<Vec<_>>()
+	};
+
+	for (tenant_id, row, table, table_indexes) in work {
+		match row.state {
+			SecondaryIndexState::Building | SecondaryIndexState::Ready => {
+				let Some(table) = table else {
+					tracing::warn!(
+						tenant_id = tenant_id.get(),
+						index_object_id = ?row.descriptor.index_object_id,
+						"secondary-index lifecycle skipped an index whose table descriptor is absent"
+					);
+					continue;
+				};
+				let has_receipt = row.has_backfill_completion(local_node);
+				if !has_receipt {
+					slab.establish_secondary_index_declaration_cut(
+						tenant_id,
+						&row.descriptor,
+						&table_indexes,
+						DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES,
+					)
+					.await?;
+				}
+				let report = slab
+					.run_secondary_index_backfill_once(
+						tenant_id,
+						&table,
+						&row.descriptor,
+						SECONDARY_INDEX_BACKFILL_SLABS_PER_TICK,
+						DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES,
+					)
+					.await?;
+				if report.historical_complete && !has_receipt {
+					control
+						.submit_secondary_index_lifecycle(secondary_index_lifecycle_envelope(
+							tenant_id,
+							&row.descriptor,
+							local_node,
+							SchemaMutationKind::IndexBackfillComplete,
+						)?)
+						.await?;
+				}
+			}
+			SecondaryIndexState::Dropping => {
+				slab.gc_secondary_index_segments_for_dropping_index(tenant_id, &row.descriptor)
+					.await?;
+				control
+					.submit_secondary_index_lifecycle(secondary_index_lifecycle_envelope(
+						tenant_id,
+						&row.descriptor,
+						local_node,
+						SchemaMutationKind::IndexDropGcComplete,
+					)?)
+					.await?;
+			}
+		}
+	}
+	Ok(())
+}
+
+fn spawn_secondary_index_lifecycle_driver(
+	slab: Arc<SlabManager>,
+	state_machine: WendelonStateMachine,
+	control: Arc<WendelonControlServer>,
+	local_node: NodeId,
+) -> JoinHandle<()> {
+	tokio::spawn(async move {
+		loop {
+			if let Err(error) =
+				run_secondary_index_lifecycle_tick(&slab, &state_machine, &control, local_node)
+					.await
+			{
+				tracing::warn!(
+					node_id = local_node.id,
+					error = %error,
+					"secondary-index lifecycle tick failed"
+				);
+			}
+			tokio::time::sleep(SECONDARY_INDEX_LIFECYCLE_INTERVAL).await;
+		}
+	})
 }
 
 // ============================================================
