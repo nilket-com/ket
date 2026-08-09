@@ -17,8 +17,9 @@ from the records; nothing is proposed. Four documents:
   aside.
 - **`deferred_ledger.md`** — every forward promise collected with all deferring
   citations and stated dependencies, plus since-landed dispositions through
-  PRODUCT-0060, which restores libaryon documents and leaves the Polariton
-  layout/view/color owner plus durable named-view consumer open.
+  PRODUCT-0061, which restores libaryon's head-neutral workspace and leaves
+  Polariton's Rune-view/color meaning owner plus durable named-view consumer
+  open.
 - **`live_bridges.md`** — the 8 behaviors shipped as explicitly provisional or
   documented-not-endorsed and still standing, the 2 closed classes, and the
   borderline exclusions with reasons.

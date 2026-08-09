@@ -19,6 +19,7 @@ mod input;
 mod jobs;
 pub mod language;
 mod layout;
+mod layout_checkpoint;
 mod markdown_image_preview;
 mod minimap;
 pub(crate) mod navigation;
@@ -77,7 +78,10 @@ pub use self::protocol::{
 	SplitDirection, SubstituteFlags, UastInspectorMode, VerticalDirection, VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
-pub use self::session_checkpoint::{SessionCheckpointError, SessionRestoreError};
+pub use self::session_checkpoint::{
+	APPLICATION_OWNER_BUDGET, ApplicationCheckpointWitness, ApplicationOwnerId,
+	SessionCheckpointError, SessionRestoreError,
+};
 pub use self::theme::{
 	ResolvedCategoricalPalette, ResolvedThemePair, ResolvedThemePalette, THEME_SPECS, Theme,
 	ThemeFamily, canonical_theme_names,

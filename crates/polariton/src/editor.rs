@@ -372,6 +372,12 @@ pub struct CodeEditor {
 	panels: PanelRegistry,
 	/// Session-local realization of semantic view identities. Dynamic ids live
 	/// in the upper half of the namespace; fixed application panels stay below.
+	///
+	/// PRODUCT-0061's cross-owner checkpoint witness depends on this mapping
+	/// being append-only: removing, recycling, or rebinding an existing entry
+	/// can preserve the same ID census while changing its meaning. Stale entries
+	/// therefore remain until a stronger relational witness supersedes that
+	/// record.
 	#[cfg(feature = "toron")]
 	view_panel_ids: HashMap<(libaryon::core::BufferId, LocalViewIdentity), HostPanelId>,
 	#[cfg(feature = "toron")]
@@ -6266,6 +6272,84 @@ mod tests {
 				.collect::<Vec<_>>(),
 			first_layout,
 			"establishing a sibling producer preserves the first group"
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0061_rune_semantic_panel_identity_is_append_only() {
+		use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+
+		let presentation = || ViewPresentation {
+			content_kind: ViewContentKind::Plot,
+			display_label: "plot.line".to_owned(),
+			authored_title: crate::plot::spec::Presence::Inherit,
+		};
+		let survivor = LocalViewIdentity::Named("survivor".to_owned());
+		let removed = LocalViewIdentity::Named("removed".to_owned());
+		let anonymous = LocalViewIdentity::Anonymous(2);
+		let added = LocalViewIdentity::Named("added".to_owned());
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let producer = editor.active_buffer_id().expect("producer");
+		editor.prepare_rune_view_panels(
+			producer,
+			&[
+				(survivor.clone(), presentation()),
+				(removed.clone(), presentation()),
+				(anonymous.clone(), presentation()),
+			],
+			1,
+		);
+		let survivor_id = editor.rune_view_panel_id(producer, &survivor).unwrap();
+		let removed_id = editor.rune_view_panel_id(producer, &removed).unwrap();
+		let anonymous_id = editor.rune_view_panel_id(producer, &anonymous).unwrap();
+		let old_high_water = editor
+			.view_panel_ids
+			.values()
+			.map(|panel| panel.get())
+			.max()
+			.unwrap();
+		let group_id = editor.view_group_ids[&producer];
+
+		editor.prepare_rune_view_panels(
+			producer,
+			&[
+				(survivor.clone(), presentation()),
+				(anonymous.clone(), presentation()),
+				(added.clone(), presentation()),
+			],
+			2,
+		);
+		assert_eq!(
+			editor.rune_view_panel_id(producer, &survivor),
+			Some(survivor_id),
+			"PRODUCT-0061 witness requires surviving semantic panels never to rebind"
+		);
+		assert_eq!(
+			editor.rune_view_panel_id(producer, &anonymous),
+			Some(anonymous_id),
+			"PRODUCT-0061 witness requires surviving anonymous identity to remain exact"
+		);
+		assert_eq!(
+			editor.rune_view_panel_id(producer, &removed),
+			Some(removed_id),
+			"PRODUCT-0061 witness requires removed semantic mappings to remain stale, not recycle"
+		);
+		assert!(
+			editor.rune_view_panel_id(producer, &added).unwrap().get() > old_high_water,
+			"PRODUCT-0061 witness requires new panels above the prior high-water mark"
+		);
+		assert_eq!(
+			editor.view_group_ids[&producer], group_id,
+			"PRODUCT-0061 witness requires producer group identity to remain stable"
+		);
+		assert!(
+			editor
+				.view_panel_ids
+				.values()
+				.all(|panel| !matches!(panel.get(), 1 | 2)),
+			"PRODUCT-0061 semantic map excludes fixed RESULT_PANEL and DASHBOARD_PANEL roles"
 		);
 	}
 

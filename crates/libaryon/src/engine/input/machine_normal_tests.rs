@@ -469,6 +469,7 @@ mod tests {
 				diff_pair: None,
 			}],
 			focused_pane_id: pane_id,
+			shared_identity_census: None,
 			git_branch: None,
 			git_status_repo_root: None,
 			git_refresh_mode: crate::engine::GitRefreshMode::Interval(7),

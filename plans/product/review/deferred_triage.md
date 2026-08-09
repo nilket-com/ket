@@ -31,8 +31,9 @@ thing a Guide record should replace."
 **PERSISTENCE CLUSTER — will do, as one editor-wide arc, now in progress.**
 PRODUCT-0059 landed shared identity, locking, and atomic owner-partitioned
 snapshots; PRODUCT-0060 now restores exact ordinary-document bytes and durable
-bindings through an explicit saved-engine entrypoint. The remaining order is
-Polariton layout/view/color extension → durable named-panel identity →
+bindings through an explicit saved-engine entrypoint; PRODUCT-0061 restores
+libaryon's logical workspace and supplies the atomic application-owner handoff.
+The remaining order is PRODUCT-0062 Polariton Rune-view/color meanings → durable named-panel identity →
 producer-release reattachment and durable continuation. The earlier phrase
 “layout before durable identity” still governs named-view identity; minted and
 restored libaryon document identity is its now-landed prerequisite.
@@ -77,8 +78,8 @@ restored libaryon document identity is its now-landed prerequisite.
 
 | Item | Rec. | Reason / trigger | Closure lands in |
 |---|---|---|---|
-| Layout persistence | will do | PRODUCT-0060 restored documents; next is Polariton's editor-wide layout/view/color owner extension | — |
-| Durable identity | partial (0059–0060) | Session/document IDs and restart bindings landed; durable named-view identity remains strictly after restored layout | 0059–0060 substrate |
+| Layout persistence | partial (0059–0061) | Libaryon logical workspace restoration and atomic owner handoff landed; PRODUCT-0062 supplies Polariton's Rune-view/color meanings | 0059–0061 substrate |
+| Durable identity | partial (0059–0061) | Session/document IDs, restart bindings, opaque panel joins, and logical layout landed; durable named-view identity is next in PRODUCT-0062 | 0059–0061 substrate |
 | Grouping signal | if asked | Trigger the records already wrote: repeated manual tabbing of the same view sets (0011 §4, 0015 §8) | — |
 | Dashboard's fate | will do | Small decision record; demotion already happened, evidence (0010–0015 arc) suggests retirement; leaving it undecided keeps a zombie surface whose export/resize behaviors need explicit re-homing or discard | — |
 | Panel close/move commands, more placements | closed | "It grows when a use exists, not in advance of one" (0011 §1) — the rule is the closure | 0011 §1 (already states it) |

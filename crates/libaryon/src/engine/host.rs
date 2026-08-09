@@ -82,7 +82,7 @@ pub struct EngineHandle {
 
 impl EngineHandle {
 	pub fn spawn(config: EngineConfig) -> Self {
-		Self::spawn_inner(config, None)
+		Self::spawn_inner(config, None, None)
 			.expect("ephemeral engine construction has no saved-session failure path")
 	}
 
@@ -93,12 +93,37 @@ impl EngineHandle {
 		if config.initial_file.is_some() {
 			return Err(super::session_checkpoint::SessionRestoreError::InitialFileConflict);
 		}
-		Self::spawn_inner(config, Some(saved))
+		Self::spawn_inner(config, Some(saved), None)
+	}
+
+	/// Start a saved engine whose checkpoints must atomically include one
+	/// registered opaque application owner.
+	pub fn spawn_saved_with_application_owner(
+		config: EngineConfig,
+		saved: SavedSession<Writable>,
+		owner: super::session_checkpoint::ApplicationOwnerId,
+	) -> Result<Self, super::session_checkpoint::SessionRestoreError> {
+		if config.initial_file.is_some() {
+			return Err(super::session_checkpoint::SessionRestoreError::InitialFileConflict);
+		}
+		if let Some((_, bytes)) = saved.owner_payload(owner.owner_id())
+			&& bytes.len() as u64 > super::session_checkpoint::APPLICATION_OWNER_BUDGET
+		{
+			return Err(super::session_checkpoint::SessionRestoreError::Refused(
+				format!(
+					"registered application owner is {} bytes (limit is {})",
+					bytes.len(),
+					super::session_checkpoint::APPLICATION_OWNER_BUDGET
+				),
+			));
+		}
+		Self::spawn_inner(config, Some(saved), Some(owner))
 	}
 
 	fn spawn_inner(
 		config: EngineConfig,
 		saved: Option<SavedSession<Writable>>,
+		application_owner: Option<super::session_checkpoint::ApplicationOwnerId>,
 	) -> Result<Self, super::session_checkpoint::SessionRestoreError> {
 		let (commands, input, internal, rx_request) = super::request::channel();
 		let (tx_view, rx_view) = mpsc::channel::<Viewport>();
@@ -121,7 +146,7 @@ impl EngineHandle {
 			tx_io_notify,
 		));
 		let lang_registry = Arc::new(build_language_registry());
-		let initial_session = saved
+		let mut initial_session = saved
 			.map(|saved| {
 				super::session_checkpoint::restore_saved_session(
 					&registry,
@@ -131,6 +156,9 @@ impl EngineHandle {
 				)
 			})
 			.transpose()?;
+		if let Some(session) = initial_session.as_mut() {
+			session.application_owner = application_owner;
+		}
 		let internal_bridge = internal.clone();
 		let bridge_thread = thread::Builder::new()
 			.name("svp-refresh-bridge".into())
@@ -214,12 +242,58 @@ impl EngineHandle {
 		super::request::checkpoint(&self.commands)
 	}
 
+	/// Publish documents, logical layout, and the registered opaque application
+	/// owner as one ordered generation.
+	pub fn checkpoint_with_application_owner(
+		&self,
+		schema_version: u32,
+		bytes: Vec<u8>,
+		witness: super::session_checkpoint::ApplicationCheckpointWitness,
+	) -> Result<(), super::session_checkpoint::SessionCheckpointError> {
+		if bytes.len() as u64 > super::session_checkpoint::APPLICATION_OWNER_BUDGET {
+			return Err(super::session_checkpoint::SessionCheckpointError::Refused(
+				format!(
+					"application payload is {} bytes (limit is {})",
+					bytes.len(),
+					super::session_checkpoint::APPLICATION_OWNER_BUDGET
+				),
+			));
+		}
+		super::request::checkpoint_with_application_owner(
+			&self.commands,
+			super::session_checkpoint::ApplicationCheckpoint {
+				schema_version,
+				bytes,
+				witness,
+			},
+		)
+	}
+
 	#[cfg(test)]
 	fn checkpoint_with_fault(
 		&self,
 		fault: super::session_checkpoint::CheckpointFault,
 	) -> Result<(), super::session_checkpoint::SessionCheckpointError> {
 		super::request::checkpoint_with_fault(&self.commands, fault)
+	}
+
+	#[cfg(test)]
+	fn checkpoint_with_application_owner_and_fault(
+		&self,
+		fault: super::session_checkpoint::CheckpointFault,
+		schema_version: u32,
+		bytes: Vec<u8>,
+		witness: super::session_checkpoint::ApplicationCheckpointWitness,
+	) -> Result<(), super::session_checkpoint::SessionCheckpointError> {
+		super::request::checkpoint_with_application_owner_and_fault(
+			&self.commands,
+			fault,
+			super::session_checkpoint::ApplicationCheckpoint {
+				schema_version,
+				bytes,
+				witness,
+			},
+		)
 	}
 
 	pub fn input_sender(&self) -> InputSender {
@@ -422,6 +496,669 @@ mod tests {
 			"checkpointing must not mark the file state clean"
 		);
 		restored.shutdown().expect("stop restored engine");
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0061_coupled_checkpoint_restores_layout_and_orders_panel_event() {
+		use crate::engine::{
+			ApplicationCheckpointWitness, ApplicationOwnerId, HostEvent, HostPanelId,
+			HostPanelPlacement, SplitDirection,
+		};
+
+		let root = temp_path("saved-engine-layout", "sessions");
+		let store = SessionStore::at(root.clone());
+		let saved = store.create().expect("create saved session");
+		let session_id = saved.snapshot().session_id();
+		let owner = ApplicationOwnerId::new("polariton_workspace").unwrap();
+		let mut handle = EngineHandle::spawn_saved_with_application_owner(
+			EngineConfig::default(),
+			saved,
+			owner.clone(),
+		)
+		.expect("start coupled engine");
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().unwrap();
+		commands.send(EditorCommand::Resize(120, 40)).unwrap();
+		let initial = viewports.recv_timeout(Duration::from_secs(2)).unwrap();
+		let document_id = initial.document_id.expect("durable scratch");
+		commands
+			.send(EditorCommand::SplitPane(SplitDirection::Horizontal))
+			.unwrap();
+		recv_viewport_until(&viewports, "duplicate document view", |viewport| {
+			viewport.panes.len() == 2
+		});
+		let panel_id = HostPanelId::new(1);
+		commands
+			.send(EditorCommand::OpenHostPanel {
+				panel_id,
+				kind: "results".to_owned(),
+				title: "Query results".to_owned(),
+				placement: HostPanelPlacement::Split {
+					direction: SplitDirection::Vertical,
+				},
+				focus: false,
+			})
+			.unwrap();
+		let before = recv_viewport_until(&viewports, "split host panel", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|panel| panel.panel_id == panel_id)
+			})
+		});
+		assert_eq!(before.panes.len(), 3);
+		let before_census = before
+			.shared_identity_census
+			.clone()
+			.expect("saved viewport projects shared identities");
+		assert_eq!(before_census.documents, [document_id].into_iter().collect());
+		assert_eq!(before_census.host_panels, [panel_id].into_iter().collect());
+		assert!(before_census.host_panel_groups.is_empty());
+		assert!(
+			handle
+				.checkpoint()
+				.unwrap_err()
+				.to_string()
+				.contains("requires"),
+			"a coupled engine may never silently publish without its application owner"
+		);
+		handle
+			.checkpoint_with_application_owner(
+				7,
+				b"opaque-polariton-state".to_vec(),
+				ApplicationCheckpointWitness::new([document_id], [panel_id], []),
+			)
+			.expect("publish coupled generation");
+		handle.shutdown().unwrap();
+
+		let saved = store.open_writable(session_id).unwrap();
+		assert_eq!(
+			saved.owner_payload(owner.owner_id()),
+			Some((7, b"opaque-polariton-state".as_slice()))
+		);
+		let mut restored =
+			EngineHandle::spawn_saved_with_application_owner(EngineConfig::default(), saved, owner)
+				.expect("restore coupled engine");
+		let events = restored.take_host_events().unwrap();
+		let commands = restored.command_sender();
+		let viewports = restored.take_viewports().unwrap();
+		commands.send(EditorCommand::Resize(360, 120)).unwrap();
+		assert_eq!(
+			events.recv_timeout(Duration::from_secs(2)).unwrap(),
+			HostEvent::PanelRestored {
+				panel_id,
+				descriptor: crate::engine::HostPanelDescriptor {
+					kind: "results".to_owned(),
+					title: "Query results".to_owned(),
+				},
+			},
+			"PanelRestored must precede the viewport exposing its placeholder"
+		);
+		let reopened = recv_viewport_until(&viewports, "restored split host panel", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|panel| panel.panel_id == panel_id)
+			})
+		});
+		assert_eq!(reopened.panes.len(), 3);
+		assert_eq!(
+			reopened.shared_identity_census.as_ref(),
+			Some(&before_census),
+			"PRODUCT-0061 census is head-neutral across a 3x viewport change"
+		);
+		assert_ne!(
+			reopened.panes[0].rect, before.panes[0].rect,
+			"geometry must actually change so census equality is not a same-frame oracle"
+		);
+		let documents = reopened
+			.panes
+			.iter()
+			.filter(|pane| pane.document_id == Some(document_id))
+			.collect::<Vec<_>>();
+		assert_eq!(
+			documents.len(),
+			2,
+			"duplicate document views survive restore"
+		);
+		assert_eq!(
+			documents[0].buffer_id, documents[1].buffer_id,
+			"duplicate views share one restored document buffer"
+		);
+		assert_ne!(
+			documents[0].view_id, documents[1].view_id,
+			"each restored occurrence receives a fresh view identity"
+		);
+		restored.shutdown().unwrap();
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0061_application_namespace_is_reserved_only_at_mutation_boundary() {
+		use crate::engine::ApplicationOwnerId;
+
+		for name in ["libaryon_documents", "libaryon_layout", "libaryon_future"] {
+			assert!(
+				ApplicationOwnerId::new(name).is_err(),
+				"application mutation must refuse reserved owner {name}"
+			);
+			assert!(
+				crate::core::OwnerId::new(name).is_ok(),
+				"generic owner parsing must preserve forward-compatible owner {name}"
+			);
+		}
+		assert!(ApplicationOwnerId::new("polariton_workspace").is_ok());
+
+		let root = temp_path("future-layout-owner", "sessions");
+		let store = SessionStore::at(root.clone());
+		let mut saved = store.create().unwrap();
+		let session_id = saved.snapshot().session_id();
+		let owner =
+			crate::core::OwnerId::new(crate::engine::layout_checkpoint::LAYOUT_OWNER_ID).unwrap();
+		let opaque = vec![0, 0xff, 6, 1];
+		saved.set_owner_payload(
+			owner.clone(),
+			crate::engine::layout_checkpoint::LAYOUT_OWNER_SCHEMA_VERSION + 1,
+			opaque.clone(),
+		);
+		saved.commit().unwrap();
+		let error = EngineHandle::spawn_saved(EngineConfig::default(), saved)
+			.err()
+			.expect("future logical layout refuses before startup")
+			.to_string();
+		assert!(error.contains("unsupported logical-layout schema"));
+		let generic = store.open_read_only(session_id).unwrap();
+		assert_eq!(
+			generic.owner_payload(&owner),
+			Some((
+				crate::engine::layout_checkpoint::LAYOUT_OWNER_SCHEMA_VERSION + 1,
+				opaque.as_slice(),
+			)),
+			"generic owner parsing preserves unknown future layout bytes"
+		);
+		drop(generic);
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0061_each_application_witness_census_refuses_independently() {
+		use crate::core::DocumentId;
+		use crate::engine::{
+			ApplicationCheckpointWitness, ApplicationOwnerId, HostPanelGroupId,
+			HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape, HostPanelId,
+		};
+
+		let root = temp_path("saved-engine-witness", "sessions");
+		let store = SessionStore::at(root.clone());
+		let saved = store.create().unwrap();
+		let session_id = saved.snapshot().session_id();
+		let owner = ApplicationOwnerId::new("polariton_workspace").unwrap();
+		let mut handle = EngineHandle::spawn_saved_with_application_owner(
+			EngineConfig::default(),
+			saved,
+			owner.clone(),
+		)
+		.unwrap();
+		let commands = handle.command_sender();
+		let views = handle.take_viewports().unwrap();
+		commands.send(EditorCommand::Resize(160, 60)).unwrap();
+		let initial = views.recv_timeout(Duration::from_secs(2)).unwrap();
+		let document = initial.document_id.unwrap();
+		let anchor = initial.focused_pane_id;
+		let group = HostPanelGroupId::new(70);
+		let panels = [HostPanelId::new(1), HostPanelId::new(2)];
+		commands
+			.send(EditorCommand::EnsureHostPanelGroup {
+				group_id: group,
+				anchor: Some(anchor),
+				members: panels
+					.into_iter()
+					.enumerate()
+					.map(|(index, panel_id)| HostPanelGroupMember {
+						panel_id,
+						kind: "fixed-role".to_owned(),
+						title: format!("fixed-{index}"),
+						shape: HostPanelGroupShape::Compact,
+					})
+					.collect(),
+				layout: HostPanelGroupLayout::RowMajorTile,
+			})
+			.unwrap();
+		recv_viewport_until(&views, "complete group", |viewport| {
+			viewport
+				.panes
+				.iter()
+				.filter(|pane| pane.host_panel.is_some())
+				.count() == 2
+		});
+
+		let exact = ApplicationCheckpointWitness::new([document], panels, [group]);
+		handle
+			.checkpoint_with_application_owner(1, b"old".to_vec(), exact.clone())
+			.unwrap();
+		let cases = [
+			ApplicationCheckpointWitness::new([], panels, [group]),
+			ApplicationCheckpointWitness::new(
+				[document, DocumentId::new(999).unwrap()],
+				panels,
+				[group],
+			),
+			ApplicationCheckpointWitness::new([document], [panels[0]], [group]),
+			ApplicationCheckpointWitness::new(
+				[document],
+				[panels[0], panels[1], HostPanelId::new(999)],
+				[group],
+			),
+			ApplicationCheckpointWitness::new([document], panels, []),
+			ApplicationCheckpointWitness::new(
+				[document],
+				panels,
+				[group, HostPanelGroupId::new(999)],
+			),
+		];
+		for (index, stale) in cases.into_iter().enumerate() {
+			let error = handle
+				.checkpoint_with_application_owner(1, format!("stale-{index}").into_bytes(), stale)
+				.unwrap_err()
+				.to_string();
+			assert!(
+				error.contains("stale application snapshot"),
+				"witness mismatch {index} must refuse before staging: {error}"
+			);
+		}
+		handle
+			.checkpoint_with_application_owner(2, b"new".to_vec(), exact)
+			.expect("a rebuilt exact witness succeeds");
+		handle.shutdown().unwrap();
+
+		let reopened = store.open_read_only(session_id).unwrap();
+		assert_eq!(
+			reopened.owner_payload(owner.owner_id()),
+			Some((2, b"new".as_slice())),
+			"six stale payloads must never replace the last complete application owner"
+		);
+		drop(reopened);
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0061_coupled_publication_faults_never_mix_owners() {
+		use crate::engine::session_checkpoint::CheckpointFault;
+		use crate::engine::{
+			ApplicationCheckpointWitness, ApplicationOwnerId, HostPanelId, HostPanelPlacement,
+			SplitDirection,
+		};
+
+		for (label, fault, expect_new) in [
+			("before-current", CheckpointFault::BeforeCurrent, false),
+			("after-current", CheckpointFault::AfterCurrent, true),
+		] {
+			let root = temp_path(&format!("coupled-{label}"), "sessions");
+			let store = SessionStore::at(root.clone());
+			let saved = store.create().unwrap();
+			let session_id = saved.snapshot().session_id();
+			let owner = ApplicationOwnerId::new("polariton_workspace").unwrap();
+			let mut handle = EngineHandle::spawn_saved_with_application_owner(
+				EngineConfig::default(),
+				saved,
+				owner.clone(),
+			)
+			.unwrap();
+			let commands = handle.command_sender();
+			let views = handle.take_viewports().unwrap();
+			commands.send(EditorCommand::Resize(100, 30)).unwrap();
+			let initial = views.recv_timeout(Duration::from_secs(2)).unwrap();
+			let document = initial.document_id.unwrap();
+			handle
+				.checkpoint_with_application_owner(
+					1,
+					b"old".to_vec(),
+					ApplicationCheckpointWitness::new([document], [], []),
+				)
+				.unwrap();
+
+			let panel = HostPanelId::new(44);
+			commands
+				.send(EditorCommand::OpenHostPanel {
+					panel_id: panel,
+					kind: "fixture".to_owned(),
+					title: "new layout".to_owned(),
+					placement: HostPanelPlacement::Split {
+						direction: SplitDirection::Vertical,
+					},
+					focus: false,
+				})
+				.unwrap();
+			recv_viewport_until(&views, "fault candidate panel", |viewport| {
+				viewport.panes.iter().any(|pane| pane.host_panel.is_some())
+			});
+			let error = handle
+				.checkpoint_with_application_owner_and_fault(
+					fault,
+					2,
+					b"new".to_vec(),
+					ApplicationCheckpointWitness::new([document], [panel], []),
+				)
+				.unwrap_err()
+				.to_string();
+			if expect_new {
+				assert!(
+					error.contains("injected fault after CURRENT rename"),
+					"post-CURRENT injection must report the injected publication failure: {error}"
+				);
+				assert!(
+					handle
+						.checkpoint_with_application_owner(
+							2,
+							b"later".to_vec(),
+							ApplicationCheckpointWitness::new([document], [panel], []),
+						)
+						.unwrap_err()
+						.to_string()
+						.contains("publication is uncertain"),
+					"post-CURRENT failure poisons later coupled checkpoints"
+				);
+			}
+			handle.shutdown().unwrap();
+
+			let saved = store.open_writable(session_id).unwrap();
+			assert_eq!(
+				saved.owner_payload(owner.owner_id()),
+				Some(if expect_new {
+					(2, b"new".as_slice())
+				} else {
+					(1, b"old".as_slice())
+				}),
+				"application owner and engine owners must cross CURRENT together"
+			);
+			let mut reopened = EngineHandle::spawn_saved_with_application_owner(
+				EngineConfig::default(),
+				saved,
+				owner,
+			)
+			.unwrap();
+			let commands = reopened.command_sender();
+			let views = reopened.take_viewports().unwrap();
+			commands.send(EditorCommand::Resize(100, 30)).unwrap();
+			let viewport = views.recv_timeout(Duration::from_secs(2)).unwrap();
+			assert_eq!(
+				viewport.panes.iter().any(|pane| pane.host_panel.is_some()),
+				expect_new,
+				"layout owner and application owner must both be old or both be new"
+			);
+			reopened.shutdown().unwrap();
+			let _ = fs::remove_dir_all(root);
+		}
+	}
+
+	#[test]
+	fn product_0061_fifo_lifecycle_races_refuse_stale_application_snapshots() {
+		use crate::engine::{
+			ApplicationCheckpointWitness, ApplicationOwnerId, HostPanelGroupId,
+			HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape, HostPanelId,
+			HostPanelPlacement, SplitDirection,
+		};
+
+		let root = temp_path("coupled-fifo-races", "sessions");
+		let store = SessionStore::at(root.clone());
+		let saved = store.create().unwrap();
+		let owner = ApplicationOwnerId::new("polariton_workspace").unwrap();
+		let mut handle =
+			EngineHandle::spawn_saved_with_application_owner(EngineConfig::default(), saved, owner)
+				.unwrap();
+		let commands = handle.command_sender();
+		let views = handle.take_viewports().unwrap();
+		commands.send(EditorCommand::Resize(160, 60)).unwrap();
+		let initial = views.recv_timeout(Duration::from_secs(2)).unwrap();
+		let first_document = initial.document_id.unwrap();
+
+		commands
+			.send(EditorCommand::NewPane {
+				direction: SplitDirection::Horizontal,
+				language: None,
+			})
+			.unwrap();
+		assert!(
+			handle
+				.checkpoint_with_application_owner(
+					1,
+					b"before-document-open".to_vec(),
+					ApplicationCheckpointWitness::new([first_document], [], []),
+				)
+				.unwrap_err()
+				.to_string()
+				.contains("documents"),
+			"queued document creation must win the FIFO and stale the earlier witness"
+		);
+		let after_document = recv_viewport_until(&views, "second durable document", |viewport| {
+			viewport
+				.panes
+				.iter()
+				.filter_map(|pane| pane.document_id)
+				.collect::<std::collections::BTreeSet<_>>()
+				.len() == 2
+		});
+		let documents = after_document
+			.panes
+			.iter()
+			.filter_map(|pane| pane.document_id)
+			.collect::<std::collections::BTreeSet<_>>();
+		let anchor = after_document.focused_pane_id;
+		let panel = HostPanelId::new(88);
+		commands
+			.send(EditorCommand::OpenHostPanel {
+				panel_id: panel,
+				kind: "race".to_owned(),
+				title: "panel".to_owned(),
+				placement: HostPanelPlacement::Split {
+					direction: SplitDirection::Vertical,
+				},
+				focus: false,
+			})
+			.unwrap();
+		assert!(
+			handle
+				.checkpoint_with_application_owner(
+					1,
+					b"before-panel-open".to_vec(),
+					ApplicationCheckpointWitness::new(documents.clone(), [], []),
+				)
+				.unwrap_err()
+				.to_string()
+				.contains("host panels"),
+			"queued panel creation must win the FIFO and stale the earlier witness"
+		);
+		recv_viewport_until(&views, "new host panel", |viewport| {
+			viewport.panes.iter().any(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|candidate| candidate.panel_id == panel)
+			})
+		});
+		let group = HostPanelGroupId::new(99);
+		commands
+			.send(EditorCommand::EnsureHostPanelGroup {
+				group_id: group,
+				anchor: Some(anchor),
+				members: vec![HostPanelGroupMember {
+					panel_id: panel,
+					kind: "race".to_owned(),
+					title: "panel".to_owned(),
+					shape: HostPanelGroupShape::Compact,
+				}],
+				layout: HostPanelGroupLayout::RowMajorTile,
+			})
+			.unwrap();
+		assert!(
+			handle
+				.checkpoint_with_application_owner(
+					1,
+					b"before-group-open".to_vec(),
+					ApplicationCheckpointWitness::new(documents.clone(), [panel], []),
+				)
+				.unwrap_err()
+				.to_string()
+				.contains("host panel groups"),
+			"queued group creation must win the FIFO and stale the earlier witness"
+		);
+		handle
+			.checkpoint_with_application_owner(
+				2,
+				b"complete".to_vec(),
+				ApplicationCheckpointWitness::new(documents, [panel], [group]),
+			)
+			.expect("rebuilt application snapshot publishes");
+		handle.shutdown().unwrap();
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0061_projected_census_makes_collected_group_refusal_actionable() {
+		use crate::engine::{
+			ApplicationCheckpointWitness, ApplicationOwnerId, HostPanelGroupId,
+			HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape, HostPanelId,
+			SplitDirection,
+		};
+
+		let root = temp_path("projected-shared-census", "sessions");
+		let store = SessionStore::at(root.clone());
+		let saved = store.create().unwrap();
+		let owner = ApplicationOwnerId::new("polariton_workspace").unwrap();
+		let mut handle =
+			EngineHandle::spawn_saved_with_application_owner(EngineConfig::default(), saved, owner)
+				.unwrap();
+		let commands = handle.command_sender();
+		let views = handle.take_viewports().unwrap();
+		commands.send(EditorCommand::Resize(160, 60)).unwrap();
+		let initial = views.recv_timeout(Duration::from_secs(2)).unwrap();
+		let producer_pane = initial.focused_pane_id;
+		let producer_document = initial.document_id.unwrap();
+
+		commands
+			.send(EditorCommand::NewPane {
+				direction: SplitDirection::Horizontal,
+				language: None,
+			})
+			.unwrap();
+		let two_documents = recv_viewport_until(&views, "surviving second document", |viewport| {
+			viewport
+				.shared_identity_census
+				.as_ref()
+				.is_some_and(|census| census.documents.len() == 2)
+		});
+		let survivor = two_documents
+			.panes
+			.iter()
+			.find(|pane| pane.document_id != Some(producer_document))
+			.expect("second durable document")
+			.pane_id;
+
+		let group = HostPanelGroupId::new(91);
+		let panel = HostPanelId::new(1_u64 << 63);
+		commands
+			.send(EditorCommand::EnsureHostPanelGroup {
+				group_id: group,
+				anchor: Some(producer_pane),
+				members: vec![HostPanelGroupMember {
+					panel_id: panel,
+					kind: "rune-view-plot".to_owned(),
+					title: "temporary".to_owned(),
+					shape: HostPanelGroupShape::Expansive,
+				}],
+				layout: HostPanelGroupLayout::RowMajorTile,
+			})
+			.unwrap();
+		let grouped = recv_viewport_until(&views, "projected group census", |viewport| {
+			viewport
+				.shared_identity_census
+				.as_ref()
+				.is_some_and(|census| census.host_panel_groups.contains(&group))
+		});
+		let stale = ApplicationCheckpointWitness::from_census(
+			grouped.shared_identity_census.as_ref().unwrap(),
+		);
+		let panel_pane = grouped
+			.panes
+			.iter()
+			.find(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|candidate| candidate.panel_id == panel)
+			})
+			.expect("group panel is placed")
+			.pane_id;
+
+		commands.send(EditorCommand::FocusPane(panel_pane)).unwrap();
+		commands.send(EditorCommand::ClosePane).unwrap();
+		commands
+			.send(EditorCommand::FocusPane(producer_pane))
+			.unwrap();
+		commands.send(EditorCommand::ClosePane).unwrap();
+		let error = handle
+			.checkpoint_with_application_owner(1, b"stale".to_vec(), stale)
+			.unwrap_err()
+			.to_string();
+		assert!(
+			error.contains("stale application snapshot")
+				&& error.contains("documents")
+				&& error.contains("host panels")
+				&& error.contains("host panel groups"),
+			"queued collection must make every old identity class visibly stale: {error}"
+		);
+
+		let rebuilt = recv_viewport_until(&views, "collected group census", |viewport| {
+			viewport
+				.shared_identity_census
+				.as_ref()
+				.is_some_and(|census| {
+					census.documents.len() == 1
+						&& !census.documents.contains(&producer_document)
+						&& census.host_panels.is_empty()
+						&& census.host_panel_groups.is_empty()
+				})
+		});
+		assert_eq!(rebuilt.focused_pane_id, survivor);
+		handle
+			.checkpoint_with_application_owner(
+				2,
+				b"rebuilt".to_vec(),
+				ApplicationCheckpointWitness::from_census(
+					rebuilt.shared_identity_census.as_ref().unwrap(),
+				),
+			)
+			.expect("the next projected census makes retry converge");
+		handle.shutdown().unwrap();
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0061_registered_application_owner_is_bounded_before_startup() {
+		use crate::engine::{APPLICATION_OWNER_BUDGET, ApplicationOwnerId};
+
+		assert_eq!(APPLICATION_OWNER_BUDGET, 16 * 1024 * 1024);
+		let root = temp_path("oversized-application-owner", "sessions");
+		let store = SessionStore::at(root.clone());
+		let mut saved = store.create().unwrap();
+		let session_id = saved.snapshot().session_id();
+		let owner = ApplicationOwnerId::new("polariton_workspace").unwrap();
+		saved.set_owner_payload(
+			owner.owner_id().clone(),
+			1,
+			vec![0; APPLICATION_OWNER_BUDGET as usize + 1],
+		);
+		saved.commit().unwrap();
+		let error =
+			EngineHandle::spawn_saved_with_application_owner(EngineConfig::default(), saved, owner)
+				.err()
+				.expect("oversized registered owner refuses before engine startup")
+				.to_string();
+		assert!(error.contains("registered application owner"));
+		drop(
+			store
+				.open_writable(session_id)
+				.expect("pre-start refusal releases the session lock"),
+		);
 		let _ = fs::remove_dir_all(root);
 	}
 

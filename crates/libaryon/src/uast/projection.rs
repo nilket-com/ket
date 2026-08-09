@@ -1,4 +1,4 @@
-use crate::core::{BufferId, Rgb};
+use crate::core::{BufferId, DocumentId, Rgb};
 use crate::core::{
 	CursorPosition, DisplayRow, DocByte, DocDisplayCol, DocLine, DocLineCount, NodeByteOffset,
 	PaneId, PaneLocalCol, PaneLocalRow, PaneRect, TAB_SIZE, ViewId, ViewportId,
@@ -6,7 +6,8 @@ use crate::core::{
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::UiPalette;
 use crate::engine::{
-	GutterNumbering, HostPanelId, MinimapSnapshot, PanelRevision, SplitDirection, VisibleRow,
+	GutterNumbering, HostPanelGroupId, HostPanelId, MinimapSnapshot, PanelRevision, SplitDirection,
+	VisibleRow,
 };
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::{CATEGORY_COUNT, HighlightSpan};
@@ -15,6 +16,7 @@ pub use crate::uast::root_line_index::RootChildLineIndex;
 use crate::uast::root_line_index::{
 	KnownLineMetric, RootChildLineIndexEntry, RootChildLineIndexInspectorSnapshot,
 };
+use std::collections::BTreeSet;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
@@ -382,11 +384,27 @@ pub struct PickerViewport {
 	pub error: Option<String>,
 }
 
+/// Complete saved-session identity state shared with an opaque frontend owner.
+///
+/// This projection is intentionally only three sets. It carries no placement,
+/// ordering, descriptor, membership, or other relationship fact; PRODUCT-0061's
+/// checkpoint witness is sufficient only while those facts remain exclusively
+/// owned by libaryon's logical-layout payload.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SharedIdentityCensus {
+	pub documents: BTreeSet<DocumentId>,
+	pub host_panels: BTreeSet<HostPanelId>,
+	pub host_panel_groups: BTreeSet<HostPanelGroupId>,
+}
+
 /// Immutable render projection sent from the engine to a frontend.
 pub struct Viewport {
 	pub viewport_id: ViewportId,
 	pub panes: Vec<PaneViewport>,
 	pub focused_pane_id: PaneId,
+	/// Authoritative shared identities for one saved-engine projection. `None`
+	/// means this engine has no saved session and therefore no coupled owner.
+	pub shared_identity_census: Option<SharedIdentityCensus>,
 	/// Checked-out branch for the focused document's repository, when available.
 	pub git_branch: Option<String>,
 	/// Repository backing the open Git-status pane, if one has been resolved.

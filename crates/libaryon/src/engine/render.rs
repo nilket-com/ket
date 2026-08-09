@@ -310,6 +310,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		}
 	};
 	let picker = picker_viewport(session.picker.as_ref(), session.terminal_height);
+	let shared_identity_census = session.shared_identity_census();
 
 	let EditorSession {
 		input,
@@ -404,6 +405,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		viewport_id: *viewport_id,
 		panes,
 		focused_pane_id: *focused_pane_id,
+		shared_identity_census,
 		git_branch,
 		git_status_repo_root: session.git_status_repo_root.clone(),
 		status_message,

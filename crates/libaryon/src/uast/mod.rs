@@ -22,7 +22,7 @@ pub use mutation::UastMutation;
 #[allow(unused_imports)]
 pub use projection::{
 	FoldPolicy, LineLookupState, NoFolds, NodeByteTarget, NodeCursorTarget, NodeLineLookup,
-	PaneViewport, RenderToken, RootChildLineIndex, UastProjection, Viewport,
+	PaneViewport, RenderToken, RootChildLineIndex, SharedIdentityCensus, UastProjection, Viewport,
 };
 #[allow(unused_imports)]
 pub use topology::TreeEdges;

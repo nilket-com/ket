@@ -36,7 +36,7 @@ use crate::svp::BackingIdentity;
 use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::UastProjection;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -821,9 +821,12 @@ impl SavedDocumentState {
 		self.by_buffer.get(&buffer_id).copied()
 	}
 
-	#[cfg(test)]
 	pub(crate) fn buffer_id(&self, document_id: DocumentId) -> Option<BufferId> {
 		self.by_document.get(&document_id).copied()
+	}
+
+	fn document_ids(&self) -> BTreeSet<DocumentId> {
+		self.by_document.keys().copied().collect()
 	}
 
 	pub(crate) fn update_path(
@@ -4178,6 +4181,10 @@ pub(crate) enum HostPanelGroupLayoutState {
 
 pub(crate) struct HostPanelGroupState {
 	pub(crate) producer_buffer_id: Option<BufferId>,
+	/// True only for a pre-start PRODUCT-0061 restoration that has not yet
+	/// rebound frontend producer meaning. Ordinary producer release must not
+	/// reopen that one-shot capability.
+	pub(crate) reattachable_after_restore: bool,
 	pub(crate) layout_state: HostPanelGroupLayoutState,
 	pub(crate) current_members: Vec<HostPanelGroupMember>,
 	pub(crate) retained_members: HashMap<HostPanelId, HostPanelGroupMember>,
@@ -4200,6 +4207,7 @@ pub(crate) struct EditorSession {
 	pub(crate) hit_test_fingerprint: Option<u64>,
 	pub(crate) buffers: BufferStore,
 	pub(crate) saved_documents: Option<SavedDocumentState>,
+	pub(crate) application_owner: Option<super::session_checkpoint::ApplicationOwnerId>,
 	pub(crate) layout: LayoutNode,
 	pub(crate) host_panel_groups: HashMap<HostPanelGroupId, HostPanelGroupState>,
 	pub(crate) focused_pane_id: PaneId,
@@ -4250,6 +4258,30 @@ pub(crate) const DEFAULT_GIT_REFRESH_MODE: super::protocol::GitRefreshMode =
 	super::protocol::GitRefreshMode::Interval(super::protocol::DEFAULT_GIT_REFRESH_SECONDS);
 
 impl EditorSession {
+	/// Project exactly the shared identities PRODUCT-0061 compares at a coupled
+	/// checkpoint. The absence of placement and relationship data is
+	/// load-bearing: adding any would exceed the three-set witness's license.
+	pub(crate) fn shared_identity_census(
+		&self,
+	) -> Option<crate::uast::projection::SharedIdentityCensus> {
+		let saved = self.saved_documents.as_ref()?;
+		let mut host_panels = BTreeSet::new();
+		self.layout.for_each_doctab(&mut |view| {
+			if let Some(panel) = self
+				.buffers
+				.get(view.buffer_id)
+				.and_then(Buffer::host_panel)
+			{
+				host_panels.insert(panel.panel_id);
+			}
+		});
+		Some(crate::uast::projection::SharedIdentityCensus {
+			documents: saved.document_ids(),
+			host_panels,
+			host_panel_groups: self.host_panel_groups.keys().copied().collect(),
+		})
+	}
+
 	pub(crate) fn attach_new_saved_session(
 		&mut self,
 		session: SavedSession<Writable>,
@@ -4908,6 +4940,7 @@ impl EditorSession {
 			hit_test_fingerprint: None,
 			buffers,
 			saved_documents,
+			application_owner: None,
 			layout,
 			host_panel_groups: HashMap::new(),
 			focused_pane_id,
@@ -5139,6 +5172,38 @@ impl EditorSession {
 
 		if let Some(mut group) = self.host_panel_groups.remove(&group_id) {
 			if group.producer_buffer_id.is_none() {
+				if !group.reattachable_after_restore {
+					self.host_panel_groups.insert(group_id, group);
+					return Vec::new();
+				}
+				let valid_anchor =
+					anchor.filter(|pane_id| self.layout.find_pane(*pane_id).is_some());
+				let producer = valid_anchor.and_then(|pane_id| {
+					self.layout
+						.find_pane(pane_id)
+						.map(|pane| pane.active_tab().buffer_id)
+				});
+				let Some(producer) = producer else {
+					self.host_panel_groups.insert(group_id, group);
+					return Vec::new();
+				};
+				group.producer_buffer_id = Some(producer);
+				group.reattachable_after_restore = false;
+				group.latest_valid_anchor = valid_anchor;
+				for member in &members {
+					self.refresh_host_panel_descriptor(member);
+				}
+				// PRODUCT-0061 restores manual placement as settled workspace
+				// truth. Reattaching producer meaning must not reinterpret that
+				// placement as a request to tile it again.
+				if group.layout_state == HostPanelGroupLayoutState::Manual {
+					self.host_panel_groups.insert(group_id, group);
+					return Vec::new();
+				}
+			} else if let Some(anchor) = anchor
+				&& self.layout.find_pane(anchor).is_some_and(|pane| {
+					Some(pane.active_tab().buffer_id) != group.producer_buffer_id
+				}) {
 				self.host_panel_groups.insert(group_id, group);
 				return Vec::new();
 			}
@@ -5468,6 +5533,7 @@ impl EditorSession {
 			group_id,
 			HostPanelGroupState {
 				producer_buffer_id,
+				reattachable_after_restore: false,
 				layout_state: HostPanelGroupLayoutState::Automatic,
 				current_members: members,
 				retained_members: HashMap::new(),
@@ -6408,7 +6474,7 @@ mod tests {
 	use crate::engine::test_support::{build_document, build_split_virtual_document};
 	use crate::engine::{
 		HostPanelDescriptor, HostPanelGroupId, HostPanelGroupLayout, HostPanelGroupMember,
-		HostPanelGroupShape, HostPanelId, PaneDropEdge,
+		HostPanelGroupShape, HostPanelId, PaneDropEdge, PaneResizeDirection,
 	};
 	use crate::engine::{SplitDirection, UiColorOverrides, VisualKind};
 	use crate::uast::UastMutation;
@@ -6452,6 +6518,335 @@ mod tests {
 			BTreeMap::new(),
 			None,
 		)
+	}
+
+	#[test]
+	fn product_0061_logical_layout_is_head_neutral_before_codec() {
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		let root = std::env::temp_dir().join(format!(
+			"libaryon-layout-head-neutral-{}-{}",
+			std::process::id(),
+			rand::random::<u64>()
+		));
+		let saved = crate::core::SessionStore::at(root.clone())
+			.create()
+			.unwrap();
+		session.attach_new_saved_session(saved).unwrap();
+		session.update_terminal_size(120, 40);
+		assert!(session.split_focused_pane(&registry, SplitDirection::Horizontal));
+		assert!(session.split_focused_pane(&registry, SplitDirection::Vertical));
+		assert_eq!(
+			session.resize_focused_pane(SplitDirection::Vertical, PaneResizeDirection::Increase,),
+			super::PaneResizeResult::Resized,
+			"the oracle needs unequal integer weights, not a symmetric tree"
+		);
+
+		let logical_at_small_viewport = session.layout.structure().into_bytes();
+		let checkpoint_at_small_viewport =
+			crate::engine::layout_checkpoint::capture_layout(&session).unwrap();
+		let document_ids = session
+			.saved_documents
+			.as_ref()
+			.unwrap()
+			.session
+			.snapshot()
+			.documents()
+			.map(crate::core::DocumentIdentity::id)
+			.collect();
+		let owner_at_small_viewport = crate::engine::layout_checkpoint::encode_layout(
+			&checkpoint_at_small_viewport,
+			&document_ids,
+			crate::engine::layout_checkpoint::LAYOUT_OWNER_BUDGET,
+		)
+		.unwrap();
+		let rects_at_small_viewport = session.pane_layouts();
+		assert_eq!(rects_at_small_viewport.len(), 3);
+
+		session.update_terminal_size(360, 120);
+		let logical_at_large_viewport = session.layout.structure().into_bytes();
+		let checkpoint_at_large_viewport =
+			crate::engine::layout_checkpoint::capture_layout(&session).unwrap();
+		let owner_at_large_viewport = crate::engine::layout_checkpoint::encode_layout(
+			&checkpoint_at_large_viewport,
+			&document_ids,
+			crate::engine::layout_checkpoint::LAYOUT_OWNER_BUDGET,
+		)
+		.unwrap();
+		let rects_at_large_viewport = session.pane_layouts();
+
+		assert_eq!(
+			logical_at_large_viewport, logical_at_small_viewport,
+			"logical split direction and integer weights must not depend on viewport geometry"
+		);
+		assert_ne!(
+			rects_at_large_viewport, rects_at_small_viewport,
+			"the rendered PaneRect control must change when the viewport is 3x larger"
+		);
+		assert_eq!(
+			owner_at_large_viewport, owner_at_small_viewport,
+			"production libaryon_layout bytes must be head-neutral across a 3x viewport resize"
+		);
+		assert!(
+			String::from_utf8(logical_at_large_viewport)
+				.unwrap()
+				.contains("H["),
+			"the fixture must contain the outer horizontal split"
+		);
+		drop(session);
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0061_restored_manual_group_reattaches_without_retiling() {
+		use crate::engine::layout_checkpoint::{
+			CheckpointDirection, CheckpointGroupLayoutState, CheckpointGroupShape, DurableTab,
+			HostPanelCheckpoint, HostPanelGroupCheckpoint, HostPanelGroupMemberCheckpoint,
+			LayoutCheckpoint, LayoutCheckpointNode, LeafPath, restore_layout,
+		};
+
+		let root = std::env::temp_dir().join(format!(
+			"libaryon-restored-group-{}-{}",
+			std::process::id(),
+			rand::random::<u64>()
+		));
+		let saved = crate::core::SessionStore::at(root.clone())
+			.create()
+			.unwrap();
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		session.attach_new_saved_session(saved).unwrap();
+		let producer_buffer = session
+			.layout
+			.find_pane(session.focused_pane_id)
+			.unwrap()
+			.active_tab()
+			.buffer_id;
+		let document_id = session
+			.saved_documents
+			.as_ref()
+			.unwrap()
+			.document_id(producer_buffer)
+			.unwrap();
+		let group_id = HostPanelGroupId::new(17);
+		let first = HostPanelId::new(11);
+		let detached = HostPanelId::new(12);
+		let checkpoint = LayoutCheckpoint {
+			root: Some(LayoutCheckpointNode::Split {
+				group_root: None,
+				direction: CheckpointDirection::Vertical,
+				ratios: vec![5, 3, 2],
+				children: vec![
+					LayoutCheckpointNode::Leaf {
+						group_root: None,
+						tabs: vec![DurableTab::Document {
+							document_id: document_id.get(),
+						}],
+						active_tab: 0,
+					},
+					LayoutCheckpointNode::Leaf {
+						group_root: Some(group_id.get()),
+						tabs: vec![DurableTab::HostPanel {
+							panel_id: first.get(),
+						}],
+						active_tab: 0,
+					},
+					LayoutCheckpointNode::Leaf {
+						group_root: None,
+						tabs: vec![
+							DurableTab::HostPanel {
+								panel_id: first.get(),
+							},
+							DurableTab::HostPanel {
+								panel_id: detached.get(),
+							},
+						],
+						active_tab: 1,
+					},
+				],
+			}),
+			focused_leaf: Some(LeafPath(vec![0])),
+			panels: vec![
+				HostPanelCheckpoint {
+					panel_id: first.get(),
+					kind: "plot".to_owned(),
+					title: "same title".to_owned(),
+				},
+				HostPanelCheckpoint {
+					panel_id: detached.get(),
+					kind: "plot".to_owned(),
+					title: "same title".to_owned(),
+				},
+			],
+			groups: vec![HostPanelGroupCheckpoint {
+				group_id: group_id.get(),
+				layout_state: CheckpointGroupLayoutState::Manual,
+				current_members: vec![
+					HostPanelGroupMemberCheckpoint {
+						panel_id: first.get(),
+						shape: CheckpointGroupShape::Compact,
+					},
+					HostPanelGroupMemberCheckpoint {
+						panel_id: detached.get(),
+						shape: CheckpointGroupShape::Expansive,
+					},
+				],
+				retained_members: vec![],
+				detached_members: vec![detached.get()],
+				latest_anchor: Some(LeafPath(vec![0])),
+			}],
+		};
+		let expected_checkpoint = checkpoint.clone();
+		assert!(restore_layout(&registry, &mut session, checkpoint).unwrap());
+		assert_eq!(
+			crate::engine::layout_checkpoint::capture_layout(&session).unwrap(),
+			expected_checkpoint,
+			"PRODUCT-0061 logical meaning must round-trip independently of fresh runtime IDs"
+		);
+		let restored_events = session.take_host_events();
+		assert_eq!(
+			restored_events.len(),
+			2,
+			"a panel present in two views emits one PanelRestored per identity, not per occurrence"
+		);
+		let first_buffer = session.host_panel_buffer_id(first).unwrap();
+		assert_eq!(
+			session.layout.view_count_for_buffer(first_buffer),
+			2,
+			"duplicate panel occurrences share one restored backing buffer"
+		);
+		assert_ne!(
+			first, detached,
+			"identical descriptors do not collapse identity"
+		);
+		let before = session.layout.structure();
+		let anchor = session.focused_pane_id;
+		let members = vec![
+			product_0015_member(first.get(), HostPanelGroupShape::Compact),
+			product_0015_member(detached.get(), HostPanelGroupShape::Expansive),
+		];
+		assert!(
+			session
+				.ensure_host_panel_group(
+					group_id,
+					Some(anchor),
+					members,
+					HostPanelGroupLayout::RowMajorTile,
+				)
+				.is_empty()
+		);
+		let group = &session.host_panel_groups[&group_id];
+		assert_eq!(group.producer_buffer_id, Some(producer_buffer));
+		assert_eq!(group.layout_state, HostPanelGroupLayoutState::Manual);
+		assert!(group.detached_members.contains(&detached));
+		assert_eq!(
+			session.layout.structure(),
+			before,
+			"PRODUCT-0061 producer reattachment must not retile restored manual placement"
+		);
+		drop(session);
+		let _ = std::fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0061_capture_filters_transient_tabs_and_phantom_leaves() {
+		use crate::engine::layout_checkpoint::{DurableTab, LayoutCheckpointNode, capture_layout};
+
+		let root = std::env::temp_dir().join(format!(
+			"libaryon-layout-filter-{}-{}",
+			std::process::id(),
+			rand::random::<u64>()
+		));
+		let saved = crate::core::SessionStore::at(root.clone())
+			.create()
+			.unwrap();
+		let registry = UastRegistry::new(256);
+		let mut session = test_editor_session(&registry);
+		session.attach_new_saved_session(saved).unwrap();
+		let source = session.focused_pane_id;
+		let panel_id = HostPanelId::new(55);
+		let panel = session.create_host_panel_view(
+			panel_id,
+			HostPanelDescriptor {
+				kind: "fixture".to_owned(),
+				title: "durable panel".to_owned(),
+			},
+			DEFAULT_VIEWPORT_WIDTH,
+			DEFAULT_VIEWPORT_LINES,
+		);
+		assert!(
+			session
+				.split_pane_with_new_pane_order(
+					source,
+					SplitDirection::Vertical,
+					EditorPane::from_view(panel),
+					false,
+				)
+				.is_some()
+		);
+		let (output_buffer, _) = session
+			.ensure_output_panel(&registry, "transient-output")
+			.expect("output pane");
+		let output_pane = session
+			.layout
+			.view_id_for_buffer(output_buffer)
+			.and_then(|view| session.layout.pane_id_for_view(view))
+			.expect("output placement");
+		session.focused_pane_id = output_pane;
+		let checkpoint = capture_layout(&session).unwrap();
+		let root_node = checkpoint.root.as_ref().expect("durable remainder");
+		let LayoutCheckpointNode::Split {
+			children, ratios, ..
+		} = root_node
+		else {
+			panic!("document and host panel remain as a split")
+		};
+		assert_eq!(children.len(), 2, "transient-only leaf is removed");
+		assert_eq!(ratios.len(), 2, "removed leaf also removes its ratio");
+		assert!(
+			checkpoint.focused_leaf.is_some(),
+			"focus on a removed transient leaf deterministically rehomes"
+		);
+		let mut tabs = Vec::new();
+		for child in children {
+			let LayoutCheckpointNode::Leaf {
+				tabs: child_tabs, ..
+			} = child
+			else {
+				panic!("fixture children are leaves")
+			};
+			tabs.extend(child_tabs.iter());
+		}
+		assert_eq!(tabs.len(), 2);
+		assert!(
+			tabs.iter()
+				.any(|tab| matches!(tab, DurableTab::Document { .. }))
+		);
+		assert!(tabs.iter().any(|tab| {
+			matches!(tab, DurableTab::HostPanel { panel_id: value } if *value == panel_id.get())
+		}));
+		assert_eq!(checkpoint.panels.len(), 1);
+
+		let transient = session
+			.create_text_view_for_buffer(
+				&registry,
+				output_buffer,
+				DEFAULT_VIEWPORT_WIDTH,
+				DEFAULT_VIEWPORT_LINES,
+			)
+			.unwrap();
+		session.layout = LayoutNode::Leaf(LayoutLeaf {
+			group_root: None,
+			pane_id: session.next_pane_id,
+			pane: EditorPane::from_view(transient),
+		});
+		session.focused_pane_id = session.next_pane_id;
+		let empty = capture_layout(&session).unwrap();
+		assert!(empty.root.is_none());
+		assert!(empty.focused_leaf.is_none());
+		assert!(empty.panels.is_empty());
+		drop(session);
+		let _ = std::fs::remove_dir_all(root);
 	}
 
 	#[test]

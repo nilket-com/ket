@@ -1,6 +1,8 @@
 # ADR 0061: libaryon logical workspace restoration
 
-Status: proposed 2026-08-08. This record makes libaryon persist and restore the
+Status: accepted 2026-08-08. Implemented with evidence in
+`../impl/0061_libaryon_logical_workspace_restoration_evidence.md`. This record
+makes libaryon persist and restore the
 head-neutral workspace topology it already owns: logical splits, ratios, panes,
 tab order, active and focused placement, host-panel placeholders, and
 host-panel group arrangement. It also adds the single bounded application-owner
@@ -376,6 +378,22 @@ application-snapshot refusal. The checkpoint request has not mutated either new
 owner at that point, and the previously committed generation remains
 authoritative.
 
+The same three sets are projected on every saved-engine `Viewport` as
+`SharedIdentityCensus`. This is a purely observational retry instrument: it
+contains exactly `documents`, `host_panels`, and `host_panel_groups`, each as a
+set. It contains no descriptor, membership, pane, tab, order, ratio, revision,
+or other placement/relationship fact. An ephemeral engine projects `None`
+because it has no durable shared-identity neighborhood.
+
+Projection makes a refusal actionable without weakening the witness. The
+frontend copies one census into `ApplicationCheckpointWitness`, submits it, and
+on staleness can copy the next complete projection. This matters especially for
+host-panel groups: libaryon may collect an unreachable group internally, and no
+group lifecycle event exists from which a frontend could otherwise repair its
+set. The checkpoint path compares the projected census against its freshly
+captured document/layout census before it compares the application witness, so
+the projection and publication definitions cannot drift silently.
+
 The host-panel census includes **every** restorable host panel in the
 application snapshot, including fixed-role `RESULT_PANEL` and
 `DASHBOARD_PANEL`. Those fixed IDs deliberately remain absent from
@@ -565,17 +583,23 @@ geometry, never in logical structure.
    `libaryon_future` owner, proving the reservation did not weaken forward
    compatibility.
 
-10. **Each witness set fails independently.** Starting from one valid coupled
+10. **Each witness set fails independently and the projected shape stays
+    closed.** Starting from one valid coupled
     snapshot, tests supply a missing and an extra document, panel, and group ID
     one class at a time. All six requests refuse as stale before staging; the
     committed generation and staged application bytes remain unchanged. A
-    rebuilt exact witness then succeeds.
+    rebuilt exact witness then succeeds. A compile-time architecture test
+    exhaustively destructures `SharedIdentityCensus` into exactly three
+    `BTreeSet`s, so adding a placement or relationship field breaks the gate.
 
 11. **FIFO races become refusals, not mixed generations.** Deterministic
     barriers queue document close/open, panel close/open, and group removal/add
     ahead of coupled checkpoints whose payloads were built from the preceding
     projection. Each stale request refuses. Rebuilt requests publish, and
-    reopen proves all three owners refer to one identity census.
+    reopen proves all three owners refer to one identity census. A production
+    fixture closes a grouped panel and its producer, observes libaryon's silent
+    unreachable-group collection make the old census stale, then copies the
+    next projected census and proves the retry succeeds.
 
 12. **Rune semantic panel identity is append-only.** A Polariton behavioral
     test prepares one producer with named and anonymous views, reruns with one
@@ -649,6 +673,11 @@ geometry, never in logical structure.
 > or group ID can be rebound/recycled, the three-set witness is no longer
 > licensed. Work stops for a relationship digest or shared revision before
 > that behavior ships.
+
+> If the projected census needs a fourth field, or any field other than an
+> identity set, work stops for a stronger witness decision. A descriptor or
+> ordering added merely for frontend convenience would let an opaque owner
+> depend on a relationship the three-set comparison is not licensed to prove.
 
 > If one coupled application owner is insufficient for an actual consumer,
 > work stops for a multi-owner transaction design. V1 may not accept an
@@ -774,7 +803,10 @@ because its containing tree has ratios.
   not a generic relational consistency proof.
 - Explicit checkpoints may occasionally refuse when the frontend snapshot
   loses a race to queued lifecycle work. That refusal is honest, bounded by the
-  user action today, and retryable from a fresh projection.
+  user action today, and retryable from the projected shared-identity census.
+- The projected census couples no new lifetime or ownership. It observes the
+  three identities at one moment; it does not expose where they sit, how they
+  are ordered, or what they mean.
 - The `libaryon_` namespace can grow without exposing each future owner name at
   the application boundary, while generic readers retain byte-forward
   compatibility.

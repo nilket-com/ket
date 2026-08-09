@@ -16,6 +16,75 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 use std::time::{Duration, UNIX_EPOCH};
 
+pub const APPLICATION_OWNER_BUDGET: u64 = 16 * 1024 * 1024;
+
+/// One application-owned sibling admitted to the ordered saved-engine
+/// checkpoint. Internal `libaryon_*` names are reserved at this mutation
+/// boundary without weakening generic owner parsing or copy-forward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationOwnerId(OwnerId);
+
+impl ApplicationOwnerId {
+	pub fn new(value: impl Into<String>) -> Result<Self, SessionStoreError> {
+		let owner = OwnerId::new(value)?;
+		if owner.as_str().starts_with("libaryon_") {
+			return Err(SessionStoreError::InvalidOwnerId(owner.as_str().to_owned()));
+		}
+		Ok(Self(owner))
+	}
+
+	pub fn as_str(&self) -> &str {
+		self.0.as_str()
+	}
+
+	/// Generic owner identity for inspecting an already-committed payload before
+	/// transferring the writable session into the engine.
+	pub fn owner_id(&self) -> &OwnerId {
+		&self.0
+	}
+}
+
+/// Complete shared-identity census accompanying one opaque application
+/// payload. Sorted sets make duplicate inputs unrepresentable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApplicationCheckpointWitness {
+	pub documents: BTreeSet<DocumentId>,
+	pub host_panels: BTreeSet<super::HostPanelId>,
+	pub host_panel_groups: BTreeSet<super::HostPanelGroupId>,
+}
+
+impl ApplicationCheckpointWitness {
+	pub fn new(
+		documents: impl IntoIterator<Item = DocumentId>,
+		host_panels: impl IntoIterator<Item = super::HostPanelId>,
+		host_panel_groups: impl IntoIterator<Item = super::HostPanelGroupId>,
+	) -> Self {
+		Self {
+			documents: documents.into_iter().collect(),
+			host_panels: host_panels.into_iter().collect(),
+			host_panel_groups: host_panel_groups.into_iter().collect(),
+		}
+	}
+
+	/// Copy one authoritative projected census into a checkpoint request.
+	/// Keeping this conversion set-only prevents application callers from
+	/// smuggling layout relationships into the witness.
+	pub fn from_census(census: &crate::uast::SharedIdentityCensus) -> Self {
+		Self {
+			documents: census.documents.clone(),
+			host_panels: census.host_panels.clone(),
+			host_panel_groups: census.host_panel_groups.clone(),
+		}
+	}
+}
+
+#[derive(Debug)]
+pub(crate) struct ApplicationCheckpoint {
+	pub(crate) schema_version: u32,
+	pub(crate) bytes: Vec<u8>,
+	pub(crate) witness: ApplicationCheckpointWitness,
+}
+
 #[allow(
 	dead_code,
 	reason = "consumed by the session-bound engine in the next implementation step"
@@ -130,6 +199,27 @@ fn restore_saved_session_with_budget(
 	content_budget: u64,
 ) -> Result<EditorSession, SessionRestoreError> {
 	let base_documents: Vec<DocumentIdentity> = saved.snapshot().documents().cloned().collect();
+	let document_ids = base_documents
+		.iter()
+		.map(DocumentIdentity::id)
+		.collect::<BTreeSet<_>>();
+	let layout_owner = OwnerId::new(super::layout_checkpoint::LAYOUT_OWNER_ID)?;
+	let layout_checkpoint = match saved.owner_payload(&layout_owner) {
+		None => None,
+		Some((schema, _)) if schema != super::layout_checkpoint::LAYOUT_OWNER_SCHEMA_VERSION => {
+			return Err(SessionRestoreError::Refused(format!(
+				"unsupported logical-layout schema {schema}"
+			)));
+		}
+		Some((_, bytes)) => Some(
+			super::layout_checkpoint::decode_layout(
+				bytes,
+				&document_ids,
+				super::layout_checkpoint::LAYOUT_OWNER_BUDGET,
+			)
+			.map_err(SessionRestoreError::Refused)?,
+		),
+	};
 	let paths: BTreeMap<DocumentId, Option<std::path::PathBuf>> = base_documents
 		.iter()
 		.map(|identity| (identity.id(), identity.path().map(Path::to_path_buf)))
@@ -251,7 +341,7 @@ fn restore_saved_session_with_budget(
 			warnings.join("; ")
 		)
 	});
-	EditorSession::new_restored(
+	let mut session = EditorSession::new_restored(
 		registry,
 		settings.theme_name.clone(),
 		settings.minimap_enabled,
@@ -267,7 +357,12 @@ fn restore_saved_session_with_budget(
 		restored,
 		startup_status,
 	)
-	.map_err(SessionRestoreError::Refused)
+	.map_err(SessionRestoreError::Refused)?;
+	if let Some(layout) = layout_checkpoint {
+		super::layout_checkpoint::restore_layout(registry, &mut session, layout)
+			.map_err(SessionRestoreError::Refused)?;
+	}
+	Ok(session)
 }
 
 pub(crate) fn checkpoint_documents(
@@ -275,7 +370,40 @@ pub(crate) fn checkpoint_documents(
 	session: &mut super::session::EditorSession,
 	content_budget: u64,
 ) -> Result<(), SessionCheckpointError> {
-	checkpoint_documents_with_commit(registry, session, content_budget, |saved| saved.commit())
+	if session.application_owner.is_some() {
+		return Err(SessionCheckpointError::Refused(
+			"registered application owner requires checkpoint_with_application_owner".to_owned(),
+		));
+	}
+	checkpoint_documents_with_commit(registry, session, content_budget, None, |saved| {
+		saved.commit()
+	})
+}
+
+pub(crate) fn checkpoint_with_application_owner(
+	registry: &crate::ecs::UastRegistry,
+	session: &mut super::session::EditorSession,
+	content_budget: u64,
+	application: ApplicationCheckpoint,
+) -> Result<(), SessionCheckpointError> {
+	if application.bytes.len() as u64 > APPLICATION_OWNER_BUDGET {
+		return Err(SessionCheckpointError::Refused(format!(
+			"application payload is {} bytes (limit is {APPLICATION_OWNER_BUDGET})",
+			application.bytes.len()
+		)));
+	}
+	if session.application_owner.is_none() {
+		return Err(SessionCheckpointError::Refused(
+			"engine has no registered application owner".to_owned(),
+		));
+	}
+	checkpoint_documents_with_commit(
+		registry,
+		session,
+		content_budget,
+		Some(application),
+		|saved| saved.commit(),
+	)
 }
 
 fn durable_document_candidate<'a>(
@@ -293,6 +421,7 @@ fn checkpoint_documents_with_commit(
 	registry: &crate::ecs::UastRegistry,
 	session: &mut super::session::EditorSession,
 	content_budget: u64,
+	application: Option<ApplicationCheckpoint>,
 	commit: impl FnOnce(&mut SavedSession<Writable>) -> Result<(), SessionStoreError>,
 ) -> Result<(), SessionCheckpointError> {
 	let saved = session
@@ -346,7 +475,52 @@ fn checkpoint_documents_with_commit(
 		});
 	}
 	let payload = encode_document_owner(&checkpoints, content_budget)?;
+	let layout = super::layout_checkpoint::capture_layout(session)
+		.map_err(SessionCheckpointError::Refused)?;
+	let document_ids = checkpoints
+		.iter()
+		.map(|checkpoint| checkpoint.document_id)
+		.collect::<BTreeSet<_>>();
+	let layout_payload = super::layout_checkpoint::encode_layout(
+		&layout,
+		&document_ids,
+		super::layout_checkpoint::LAYOUT_OWNER_BUDGET,
+	)
+	.map_err(SessionCheckpointError::Refused)?;
+	if let Some(application) = &application {
+		let census = session
+			.shared_identity_census()
+			.expect("saved checkpoint has a shared identity census");
+		let captured = crate::uast::SharedIdentityCensus {
+			documents: document_ids.clone(),
+			host_panels: layout.panel_ids(),
+			host_panel_groups: layout.group_ids(),
+		};
+		if census != captured {
+			return Err(SessionCheckpointError::Refused(
+				"projected and checkpoint shared-identity censuses diverged".to_owned(),
+			));
+		}
+		let exact = ApplicationCheckpointWitness::from_census(&census);
+		if application.witness != exact {
+			let mut mismatches = Vec::new();
+			if application.witness.documents != exact.documents {
+				mismatches.push("documents");
+			}
+			if application.witness.host_panels != exact.host_panels {
+				mismatches.push("host panels");
+			}
+			if application.witness.host_panel_groups != exact.host_panel_groups {
+				mismatches.push("host panel groups");
+			}
+			return Err(SessionCheckpointError::Refused(format!(
+				"stale application snapshot: {} census differs at the checkpoint FIFO head",
+				mismatches.join(", ")
+			)));
+		}
+	}
 	let owner = crate::core::OwnerId::new(DOCUMENT_OWNER_ID)?;
+	let layout_owner = crate::core::OwnerId::new(super::layout_checkpoint::LAYOUT_OWNER_ID)?;
 	let saved = session
 		.saved_documents
 		.as_mut()
@@ -354,6 +528,22 @@ fn checkpoint_documents_with_commit(
 	saved
 		.session
 		.set_owner_payload(owner, DOCUMENT_OWNER_SCHEMA_VERSION, payload);
+	saved.session.set_owner_payload(
+		layout_owner,
+		super::layout_checkpoint::LAYOUT_OWNER_SCHEMA_VERSION,
+		layout_payload,
+	);
+	if let Some(application) = application {
+		let owner = session
+			.application_owner
+			.as_ref()
+			.expect("coupled checkpoint validated registration")
+			.owner_id()
+			.clone();
+		saved
+			.session
+			.set_owner_payload(owner, application.schema_version, application.bytes);
+	}
 	commit(&mut saved.session).map_err(|error| {
 		if matches!(error, SessionStoreError::PublicationUncertain) {
 			SessionCheckpointError::Refused(
@@ -380,10 +570,18 @@ pub(crate) fn checkpoint_documents_with_fault(
 	session: &mut super::session::EditorSession,
 	content_budget: u64,
 	fault: CheckpointFault,
+	application: Option<ApplicationCheckpoint>,
 ) -> Result<(), SessionCheckpointError> {
-	checkpoint_documents_with_commit(registry, session, content_budget, |saved| match fault {
-		CheckpointFault::BeforeCurrent => saved.commit_before_current_failure_for_test(),
-		CheckpointFault::AfterCurrent => saved.commit_after_current_failure_for_test(),
+	if session.application_owner.is_some() != application.is_some() {
+		return Err(SessionCheckpointError::Refused(
+			"fault checkpoint must preserve the engine's application-owner capability".to_owned(),
+		));
+	}
+	checkpoint_documents_with_commit(registry, session, content_budget, application, |saved| {
+		match fault {
+			CheckpointFault::BeforeCurrent => saved.commit_before_current_failure_for_test(),
+			CheckpointFault::AfterCurrent => saved.commit_after_current_failure_for_test(),
+		}
 	})
 }
 

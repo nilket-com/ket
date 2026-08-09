@@ -5746,6 +5746,15 @@ pub(crate) fn run_engine(engine: Engine) {
 		registry.clone(),
 		resolver.clone(),
 	);
+	// PRODUCT-0061 restoration events describe the complete pre-start layout.
+	// Deliver them before an init script can request the first rendered
+	// viewport; otherwise a startup render could expose an unresolved panel
+	// before its unique PanelRestored occurrence.
+	if let Some(sender) = host_events.as_ref() {
+		for event in session.take_host_events() {
+			let _ = sender.send(event);
+		}
+	}
 	session.set_language_registry(lang_registry.clone());
 	#[cfg(not(test))]
 	session.input.load_persistent_history();
@@ -5844,13 +5853,24 @@ pub(crate) fn run_engine(engine: Engine) {
 				let _ = reply.send(result);
 				continue;
 			}
+			EngineRequest::CheckpointWithApplicationOwner(checkpoint, reply) => {
+				let result = super::session_checkpoint::checkpoint_with_application_owner(
+					&registry,
+					&mut session,
+					super::session_checkpoint::DOCUMENT_CONTENT_BUDGET,
+					checkpoint,
+				);
+				let _ = reply.send(result);
+				continue;
+			}
 			#[cfg(test)]
-			EngineRequest::CheckpointWithFault(fault, reply) => {
+			EngineRequest::CheckpointWithFault(fault, application, reply) => {
 				let result = super::session_checkpoint::checkpoint_documents_with_fault(
 					&registry,
 					&mut session,
 					super::session_checkpoint::DOCUMENT_CONTENT_BUDGET,
 					fault,
+					application,
 				);
 				let _ = reply.send(result);
 				continue;

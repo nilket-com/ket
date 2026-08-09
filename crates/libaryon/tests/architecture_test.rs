@@ -305,6 +305,64 @@ fn product_0059_store_stays_capability_closed_and_product_0060_consumption_is_ex
 }
 
 #[test]
+fn product_0061_layout_payload_is_head_neutral_and_application_meaning_free() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source = fs::read_to_string(manifest_dir.join("src/engine/layout_checkpoint.rs"))
+		.expect("read logical-layout owner");
+	let dto = source
+		.split("pub(crate) struct LayoutCheckpoint")
+		.nth(1)
+		.expect("checkpoint DTO start")
+		.split("enum CapturedNode")
+		.next()
+		.expect("checkpoint DTO prefix");
+	for forbidden in [
+		"BufferId",
+		"PaneId",
+		"ViewId",
+		"PaneRect",
+		"viewport_width",
+		"viewport_height",
+		"LocalViewIdentity",
+		"ColorIdentity",
+		"polariton",
+	] {
+		assert!(
+			!dto.contains(forbidden),
+			"PRODUCT-0061 durable DTO must not contain runtime/head/application identity {forbidden}"
+		);
+	}
+	for required in [
+		"document_id",
+		"HostPanelCheckpoint",
+		"HostPanelGroupCheckpoint",
+		"Vec<u32>",
+	] {
+		assert!(
+			dto.contains(required),
+			"PRODUCT-0061 durable DTO lost head-neutral field {required}"
+		);
+	}
+}
+
+#[test]
+fn product_0061_projected_census_is_exactly_three_identity_sets() {
+	use libaryon::uast::SharedIdentityCensus;
+	use std::collections::BTreeSet;
+
+	let SharedIdentityCensus {
+		documents,
+		host_panels,
+		host_panel_groups,
+	} = SharedIdentityCensus::default();
+	fn require_set<T: Ord>(_: &BTreeSet<T>) {}
+	require_set(&documents);
+	require_set(&host_panels);
+	require_set(&host_panel_groups);
+	assert!(documents.is_empty() && host_panels.is_empty() && host_panel_groups.is_empty());
+}
+
+#[test]
 fn product_0060_trybuild_is_a_dev_only_capability_oracle() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read manifest");
