@@ -1,6 +1,8 @@
 # ADR 0062: Polariton Rune-view and colour continuation meanings
 
-Status: proposed 2026-08-08. This record makes Polariton the second owner in a
+Status: accepted 2026-08-09. Implemented and verified in
+[`../impl/0062_polariton_rune_view_and_color_continuation_evidence.md`](../impl/0062_polariton_rune_view_and_color_continuation_evidence.md).
+This record makes Polariton the second owner in a
 saved session. It persists what its opaque panel and group identities *mean* —
 which durable document and semantic view produced them — together with the
 categorical colour allocation that PRODUCT-0007 §8 promises for the life of a

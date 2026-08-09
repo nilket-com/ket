@@ -101,7 +101,11 @@ impl DocumentId {
 		self.0.get()
 	}
 
-	pub(crate) fn new(value: u64) -> Result<Self, SessionStoreError> {
+	/// Reconstitute a durable document identity from its persisted integer.
+	///
+	/// Frontend-owned sibling payloads use this at their schema boundary; zero
+	/// remains structurally invalid and is never admitted as an identity.
+	pub fn new(value: u64) -> Result<Self, SessionStoreError> {
 		NonZeroU64::new(value)
 			.map(Self)
 			.ok_or_else(|| SessionStoreError::Corrupt("document id is zero".to_owned()))

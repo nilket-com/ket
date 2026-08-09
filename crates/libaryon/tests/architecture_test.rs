@@ -294,13 +294,28 @@ fn product_0059_store_stays_capability_closed_and_product_0060_consumption_is_ex
 	collect_rs_files(&polariton, &mut polariton_sources);
 	for path in polariton_sources {
 		let head = fs::read_to_string(&path).expect("read Polariton source");
+		let production = head.split("\n#[cfg(test)]").next().unwrap_or(&head);
 		assert!(
-			!head.contains("SessionStore")
-				&& !head.contains("SavedSession")
-				&& !head.contains("DocumentId"),
-			"{} consumed persistence before the Polariton owner extension",
+			!production.contains("SessionStore"),
+			"{} made store discovery or creation a Polariton concern",
 			path.display()
 		);
+		let file = path.file_name().and_then(|name| name.to_str());
+		if production.contains("SavedSession") {
+			assert_eq!(
+				file,
+				Some("editor.rs"),
+				"{} moved PRODUCT-0062's transferred saved-session capability outside the editor host",
+				path.display()
+			);
+		}
+		if production.contains("DocumentId") {
+			assert!(
+				matches!(file, Some("editor.rs" | "session_persistence.rs")),
+				"{} consumed durable document identity outside PRODUCT-0062's host/schema boundary",
+				path.display()
+			);
+		}
 	}
 }
 

@@ -39,6 +39,64 @@ fn envelope_leaks(source: &str, is_envelope: bool) -> Vec<&'static str> {
 }
 
 #[test]
+fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let persistence = std::fs::read_to_string(root.join("session_persistence.rs"))
+		.expect("read PRODUCT-0062 schema boundary");
+	let dto = persistence
+		.split("struct Payload {")
+		.nth(1)
+		.expect("payload DTO")
+		.split("impl Payload {")
+		.next()
+		.expect("bounded DTO vocabulary");
+	for forbidden in [
+		"BufferId",
+		"PaneId",
+		"libaryon::core::ViewId",
+		"PlotType",
+		"PaneRect",
+		"HostPanelDescriptor",
+		"ratio",
+		"tab_index",
+		"placement",
+	] {
+		assert!(
+			!dto.contains(forbidden),
+			"PRODUCT-0062 DTO acquired placement or renderer authority through {forbidden}"
+		);
+	}
+	assert!(dto.contains("enum AuthoredFamily"));
+	for family in ["Scatter", "Bar", "Line"] {
+		assert!(
+			dto.contains(family),
+			"missing durable authored family {family}"
+		);
+	}
+
+	let mut serialization_sites = Vec::new();
+	let mut pending = vec![root];
+	while let Some(path) = pending.pop() {
+		for entry in std::fs::read_dir(path).expect("read Polariton source") {
+			let path = entry.expect("source entry").path();
+			if path.is_dir() {
+				pending.push(path);
+			} else if path.extension().is_some_and(|extension| extension == "rs") {
+				let source = std::fs::read_to_string(&path).expect("read source");
+				if source.contains("use serde::") || source.contains("serde_json::") {
+					serialization_sites.push(path);
+				}
+			}
+		}
+	}
+	assert_eq!(
+		serialization_sites,
+		vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session_persistence.rs")],
+		"serde belongs only to Polariton's one opaque session owner"
+	);
+}
+
+#[test]
 fn product_0001_polariton_reaches_nilket_only_through_the_public_client() {
 	assert_product_dependency_boundary(
 		Path::new(env!("CARGO_MANIFEST_DIR")),

@@ -1857,6 +1857,14 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				.code_editor
 				.update(edit_event)
 				.map(Message::CodeEditEvent);
+			#[cfg(feature = "toron")]
+			if let Some(colours) = app_state.code_editor.take_restored_colour_meanings() {
+				app_state.rune_categorical_identities = colours.into_map();
+			}
+			#[cfg(feature = "toron")]
+			if let Some(error) = app_state.code_editor.take_session_restore_error() {
+				app_state.status_error = error;
+			}
 			if app_state.code_editor.take_quit_request() {
 				return update(app_state, Message::CloseWindow);
 			}

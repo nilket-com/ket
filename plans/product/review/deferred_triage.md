@@ -30,11 +30,11 @@ thing a Guide record should replace."
 
 **PERSISTENCE CLUSTER — will do, as one editor-wide arc, now in progress.**
 PRODUCT-0059 landed shared identity, locking, and atomic owner-partitioned
-snapshots; PRODUCT-0060 now restores exact ordinary-document bytes and durable
-bindings through an explicit saved-engine entrypoint; PRODUCT-0061 restores
-libaryon's logical workspace and supplies the atomic application-owner handoff.
-The remaining order is PRODUCT-0062 Polariton Rune-view/color meanings → durable named-panel identity →
-producer-release reattachment and durable continuation. The earlier phrase
+snapshots; PRODUCT-0060 restores exact ordinary-document bytes and durable
+bindings; PRODUCT-0061 restores libaryon's logical workspace and supplies the
+atomic application-owner handoff; PRODUCT-0062 restores Polariton's Rune-view,
+group, allocator, and colour meanings. The remaining order is PRODUCT-0063
+durable named-panel identity → producer-release reattachment and durable continuation. The earlier phrase
 “layout before durable identity” still governs named-view identity; minted and
 restored libaryon document identity is its now-landed prerequisite.
 
@@ -78,8 +78,8 @@ restored libaryon document identity is its now-landed prerequisite.
 
 | Item | Rec. | Reason / trigger | Closure lands in |
 |---|---|---|---|
-| Layout persistence | partial (0059–0061) | Libaryon logical workspace restoration and atomic owner handoff landed; PRODUCT-0062 supplies Polariton's Rune-view/color meanings | 0059–0061 substrate |
-| Durable identity | partial (0059–0061) | Session/document IDs, restart bindings, opaque panel joins, and logical layout landed; durable named-view identity is next in PRODUCT-0062 | 0059–0061 substrate |
+| Layout persistence | partial (0059–0062) | Libaryon placement and Polariton meaning/colour continuation land atomically; PRODUCT-0063 supplies the named-panel surface | 0059–0062 substrate |
+| Durable identity | partial (0059–0062) | Session/document IDs, runtime rebindings, opaque panel joins, allocator continuation, and authored view meanings landed; durable naming is next | 0059–0062 substrate |
 | Grouping signal | if asked | Trigger the records already wrote: repeated manual tabbing of the same view sets (0011 §4, 0015 §8) | — |
 | Dashboard's fate | will do | Small decision record; demotion already happened, evidence (0010–0015 arc) suggests retirement; leaving it undecided keeps a zombie surface whose export/resize behaviors need explicit re-homing or discard | — |
 | Panel close/move commands, more placements | closed | "It grows when a use exists, not in advance of one" (0011 §1) — the rule is the closure | 0011 §1 (already states it) |

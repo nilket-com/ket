@@ -6347,6 +6347,8 @@ dependencies = [
  "resvg",
  "rune",
  "rustls",
+ "serde",
+ "serde_json",
  "sqlparser 0.61.0",
  "svg_fmt",
  "tiny-skia 0.12.0",

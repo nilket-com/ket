@@ -21,6 +21,10 @@ use crate::plot::spec::Presence;
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+#[cfg(feature = "toron")]
+use crate::session_persistence::{
+	self, DurableMeanings, RuntimeColours, RuntimeMeanings, SessionPersistenceError,
+};
 use iced::keyboard::{self, Key};
 use iced::mouse;
 #[cfg(feature = "toron")]
@@ -30,6 +34,10 @@ use iced::widget::{
 };
 use iced::{Background, Color, Element, Event, Length, Subscription, Task, Theme, event, time};
 use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb, ViewId};
+#[cfg(feature = "toron")]
+use libaryon::core::{SavedSession, Writable};
+#[cfg(feature = "toron")]
+use libaryon::engine::{ApplicationCheckpointWitness, ApplicationOwnerId};
 use libaryon::engine::{
 	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, LanguageId,
 	Modifiers,
@@ -63,6 +71,12 @@ const RESULT_PANEL: HostPanelId = HostPanelId::new(1);
 const DASHBOARD_PANEL: HostPanelId = HostPanelId::new(2);
 #[cfg(feature = "toron")]
 const DYNAMIC_VIEW_PANEL_BASE: u64 = 1_u64 << 63;
+
+#[cfg(feature = "toron")]
+type RuntimeDocumentBindings = (
+	HashMap<libaryon::core::BufferId, libaryon::core::DocumentId>,
+	HashMap<libaryon::core::DocumentId, libaryon::core::BufferId>,
+);
 
 #[cfg(feature = "toron")]
 fn rune_view_chrome_title(identity: &LocalViewIdentity, presentation: &ViewPresentation) -> String {
@@ -388,6 +402,14 @@ pub struct CodeEditor {
 	view_group_ids: HashMap<libaryon::core::BufferId, HostPanelGroupId>,
 	#[cfg(feature = "toron")]
 	next_view_group_id: u64,
+	/// Decoded application meanings remain inert until the first complete saved
+	/// projection can join all three relations atomically.
+	#[cfg(feature = "toron")]
+	pending_session_meanings: Option<DurableMeanings>,
+	#[cfg(feature = "toron")]
+	restored_colour_meanings: Option<RuntimeColours>,
+	#[cfg(feature = "toron")]
+	session_restore_error: Option<String>,
 	/// Monotonic revision for the results panel, so each run supersedes the
 	/// last.
 	result_revision: u64,
@@ -524,7 +546,50 @@ impl CodeEditor {
 		config
 			.initial_viewport
 			.get_or_insert((INITIAL_COLUMNS, INITIAL_ROWS));
-		let mut engine = EngineHandle::spawn(config);
+		let engine = EngineHandle::spawn(config);
+		Self::from_engine(engine, replacement, None)
+	}
+
+	/// Start a durable libaryon session with Polariton registered as its one
+	/// coupled application owner. Decoding happens before ownership transfers;
+	/// installation waits for the first complete projected census.
+	#[cfg(feature = "toron")]
+	#[allow(
+		dead_code,
+		reason = "PRODUCT-0063 supplies the saved-session launch surface"
+	)]
+	pub fn open_saved_with_init(
+		mut config: EngineConfig,
+		saved: SavedSession<Writable>,
+	) -> Result<Self, String> {
+		config
+			.initial_viewport
+			.get_or_insert((INITIAL_COLUMNS, INITIAL_ROWS));
+		let owner = ApplicationOwnerId::new(session_persistence::OWNER_NAME)
+			.map_err(|error| error.to_string())?;
+		let meanings = match saved.owner_payload(owner.owner_id()) {
+			Some((schema, bytes)) => {
+				DurableMeanings::decode(schema, bytes).map_err(|error| error.to_string())?
+			}
+			None => DurableMeanings {
+				panels: HashMap::new(),
+				groups: HashMap::new(),
+				colours: HashMap::new(),
+				next_view_panel_id: DYNAMIC_VIEW_PANEL_BASE,
+				next_view_group_id: 1,
+			},
+		};
+		let engine = EngineHandle::spawn_saved_with_application_owner(config, saved, owner)
+			.map_err(|error| error.to_string())?;
+		Ok(Self::from_engine(engine, None, Some(meanings)))
+	}
+
+	fn from_engine(
+		mut engine: EngineHandle,
+		replacement: Option<&str>,
+		#[cfg(feature = "toron")] pending_session_meanings: Option<DurableMeanings>,
+		#[cfg(not(feature = "toron"))] _pending_session_meanings: Option<()>,
+	) -> Self {
 		let commands = engine.command_sender();
 		let input = engine.input_sender();
 		let viewports = engine
@@ -592,6 +657,12 @@ impl CodeEditor {
 			view_group_ids: HashMap::new(),
 			#[cfg(feature = "toron")]
 			next_view_group_id: 1,
+			#[cfg(feature = "toron")]
+			pending_session_meanings,
+			#[cfg(feature = "toron")]
+			restored_colour_meanings: None,
+			#[cfg(feature = "toron")]
+			session_restore_error: None,
 			result_revision: 0,
 			drag: None,
 			pane_drag: None,
@@ -630,6 +701,137 @@ impl CodeEditor {
 	/// before dispatch so later focus changes cannot reroute their output.
 	pub fn active_buffer_id(&self) -> Option<libaryon::core::BufferId> {
 		Some(self.viewport.as_ref()?.focused_pane()?.buffer_id)
+	}
+
+	#[cfg(feature = "toron")]
+	fn projected_document_bindings(
+		viewport: &Viewport,
+	) -> Result<RuntimeDocumentBindings, SessionPersistenceError> {
+		let mut by_buffer = HashMap::new();
+		let mut by_document = HashMap::new();
+		for pane in &viewport.panes {
+			for tab in &pane.tabs {
+				let Some(document) = tab.document_id else {
+					continue;
+				};
+				if by_buffer
+					.insert(tab.buffer_id, document)
+					.is_some_and(|old| old != document)
+					|| by_document
+						.insert(document, tab.buffer_id)
+						.is_some_and(|old| old != tab.buffer_id)
+				{
+					return Err(SessionPersistenceError::Refused(
+						"projected document bindings are not one-to-one".to_owned(),
+					));
+				}
+			}
+		}
+		Ok((by_buffer, by_document))
+	}
+
+	/// Publish libaryon's documents/layout and Polariton's semantic meanings as
+	/// one generation. An ephemeral viewport has no census and cannot publish a
+	/// coupled owner.
+	#[cfg(feature = "toron")]
+	#[allow(
+		dead_code,
+		reason = "PRODUCT-0063 supplies the explicit checkpoint surface"
+	)]
+	pub(crate) fn checkpoint_session(&self, colours: &RuntimeColours) -> Result<(), String> {
+		let viewport = self
+			.viewport
+			.as_ref()
+			.ok_or_else(|| "saved-session viewport is not ready".to_owned())?;
+		let census = viewport
+			.shared_identity_census
+			.as_ref()
+			.ok_or_else(|| "ephemeral engine has no application owner to checkpoint".to_owned())?;
+		let (buffer_documents, _) =
+			Self::projected_document_bindings(viewport).map_err(|error| error.to_string())?;
+		let projected_documents = buffer_documents
+			.values()
+			.copied()
+			.collect::<std::collections::BTreeSet<_>>();
+		if projected_documents != census.documents {
+			return Err("projected document bindings do not equal the shared census".to_owned());
+		}
+		let meanings = session_persistence::capture_runtime(
+			&self.view_panel_ids,
+			&self.view_group_ids,
+			colours,
+			&buffer_documents,
+			census,
+			self.next_view_panel_id,
+			self.next_view_group_id,
+		)
+		.map_err(|error| error.to_string())?;
+		let bytes = meanings.encode().map_err(|error| error.to_string())?;
+		self.engine
+			.as_ref()
+			.ok_or_else(|| "editor engine is no longer running".to_owned())?
+			.checkpoint_with_application_owner(
+				session_persistence::SCHEMA_VERSION,
+				bytes,
+				ApplicationCheckpointWitness::from_census(census),
+			)
+			.map_err(|error| error.to_string())
+	}
+
+	#[cfg(feature = "toron")]
+	fn reconcile_pending_session_meanings(&mut self) -> bool {
+		let Some(meanings) = self.pending_session_meanings.take() else {
+			return false;
+		};
+		let Some(viewport) = self.viewport.as_ref() else {
+			self.pending_session_meanings = Some(meanings);
+			return false;
+		};
+		let Some(census) = viewport.shared_identity_census.as_ref() else {
+			self.session_restore_error = Some(
+				"saved Polariton meanings arrived without a shared identity census".to_owned(),
+			);
+			return true;
+		};
+		let (_, document_bindings) = match Self::projected_document_bindings(viewport) {
+			Ok(bindings) => bindings,
+			Err(error) => {
+				self.session_restore_error = Some(error.to_string());
+				return true;
+			}
+		};
+		let runtime = match meanings.join_runtime(&document_bindings, census) {
+			Ok(runtime) => runtime,
+			Err(error) => {
+				self.session_restore_error = Some(error.to_string());
+				return true;
+			}
+		};
+		let RuntimeMeanings {
+			panels,
+			groups,
+			colours,
+			next_view_panel_id,
+			next_view_group_id,
+		} = runtime;
+		// One assignment point is the atomic-install boundary. No relation or
+		// allocator moves if any join above refuses.
+		self.view_panel_ids = panels;
+		self.view_group_ids = groups;
+		self.next_view_panel_id = next_view_panel_id;
+		self.next_view_group_id = next_view_group_id;
+		self.restored_colour_meanings = Some(colours);
+		true
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn take_restored_colour_meanings(&mut self) -> Option<RuntimeColours> {
+		self.restored_colour_meanings.take()
+	}
+
+	#[cfg(feature = "toron")]
+	pub(crate) fn take_session_restore_error(&mut self) -> Option<String> {
+		self.session_restore_error.take()
 	}
 
 	/// Code to run from the focused editor context: an active visual selection,
@@ -1524,6 +1726,10 @@ impl CodeEditor {
 		// pane that is still on screen.
 		changed |= !events.is_empty();
 		self.panels.reconcile(&events, self.viewport.as_ref());
+		#[cfg(feature = "toron")]
+		{
+			changed |= self.reconcile_pending_session_meanings();
+		}
 		changed
 	}
 
@@ -6155,6 +6361,224 @@ mod tests {
 			first_projection,
 			"unchanged reruns preserve identity, geometry, tabs, and activation"
 		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0062_saved_restart_rebinds_views_groups_and_colours_before_rerun() {
+		const CHILD: &str = "POLARITON_PRODUCT_0062_RESTART_CHILD";
+		if std::env::var_os(CHILD).is_none() {
+			let state_home = std::env::temp_dir().join(format!(
+				"polariton-product-0062-{}-{}",
+				std::process::id(),
+				std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.unwrap()
+					.as_nanos()
+			));
+			let status = std::process::Command::new(std::env::current_exe().unwrap())
+				.args([
+					"--exact",
+					"editor::tests::product_0062_saved_restart_rebinds_views_groups_and_colours_before_rerun",
+					"--nocapture",
+				])
+				.env(CHILD, "1")
+				.env("XDG_STATE_HOME", &state_home)
+				.status()
+				.expect("spawn isolated saved-session fixture");
+			let _ = std::fs::remove_dir_all(&state_home);
+			assert!(status.success(), "isolated restart fixture failed");
+			return;
+		}
+
+		use crate::plot::core::PlotType;
+		use crate::plot::spec::{
+			AllocationSpaceSnapshot, ColorAssignmentSnapshot, ColorIdentity, ColorIdentitySnapshot,
+			ColorSpaceSnapshot, LayerIdentity,
+		};
+		use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+		use libaryon::core::SessionStore;
+
+		fn wait_for_saved_projection(editor: &mut CodeEditor) {
+			let deadline = Instant::now() + Duration::from_secs(10);
+			while editor.viewport.as_ref().is_none_or(|viewport| {
+				viewport.shared_identity_census.is_none()
+					|| viewport
+						.focused_pane()
+						.is_none_or(|pane| pane.document_id.is_none())
+			}) && Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			assert!(
+				editor
+					.viewport
+					.as_ref()
+					.and_then(|viewport| viewport.shared_identity_census.as_ref())
+					.is_some(),
+				"saved projection and census arrive"
+			);
+		}
+
+		let store = SessionStore::platform_default().unwrap();
+		let saved = store.create().unwrap();
+		let session_id = saved.snapshot().session_id();
+		let mut editor =
+			CodeEditor::open_saved_with_init(libaryon::engine::EngineConfig::default(), saved)
+				.unwrap();
+		wait_for_saved_projection(&mut editor);
+		assert!(
+			editor.engine.as_ref().unwrap().checkpoint().is_err(),
+			"a registered application owner makes ordinary checkpoints refuse"
+		);
+		let producer = editor.active_buffer_id().unwrap();
+		let document = editor
+			.viewport
+			.as_ref()
+			.unwrap()
+			.focused_pane()
+			.unwrap()
+			.document_id
+			.unwrap();
+		let named = LocalViewIdentity::Named("bars".into());
+		let anonymous = LocalViewIdentity::Anonymous(1);
+		let views = [
+			(
+				named.clone(),
+				ViewPresentation {
+					content_kind: ViewContentKind::Plot,
+					display_label: "plot.bar".into(),
+					authored_title: crate::plot::spec::Presence::Inherit,
+				},
+			),
+			(
+				anonymous.clone(),
+				ViewPresentation {
+					content_kind: ViewContentKind::Plot,
+					display_label: "plot.line".into(),
+					authored_title: crate::plot::spec::Presence::Inherit,
+				},
+			),
+		];
+		editor.prepare_rune_view_panels(producer, &views, 1);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			viewport
+				.shared_identity_census
+				.as_ref()
+				.is_none_or(|census| {
+					census.host_panels.len() < 2 || census.host_panel_groups.is_empty()
+				})
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let named_panel = editor.rune_view_panel_id(producer, &named).unwrap();
+		let anonymous_panel = editor.rune_view_panel_id(producer, &anonymous).unwrap();
+		let group = editor.view_group_ids[&producer];
+		let identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
+			assignments: vec![ColorAssignmentSnapshot {
+				field: "product".into(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::HorizontalBar,
+				},
+				category: "Atlas".into(),
+				position: 2,
+			}],
+			spaces: vec![ColorSpaceSnapshot {
+				field: "product".into(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::HorizontalBar,
+				},
+				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
+			}],
+		})
+		.unwrap();
+		let colours = [((producer, named.clone(), 4), identity.clone())]
+			.into_iter()
+			.collect();
+		editor
+			.checkpoint_session(&crate::session_persistence::RuntimeColours::new(colours))
+			.unwrap();
+		editor.shutdown();
+
+		let saved = store.open_writable(session_id).unwrap();
+		let mut reopened =
+			CodeEditor::open_saved_with_init(libaryon::engine::EngineConfig::default(), saved)
+				.unwrap();
+		wait_for_saved_projection(&mut reopened);
+		let reopened_buffer = reopened.active_buffer_id().unwrap();
+		// BufferId is runtime-only and may coincidentally reuse the same integer;
+		// the durable join below is proved by DocumentId and semantic meaning.
+		assert_eq!(
+			reopened
+				.viewport
+				.as_ref()
+				.unwrap()
+				.focused_pane()
+				.unwrap()
+				.document_id,
+			Some(document)
+		);
+		assert_eq!(
+			reopened.rune_view_panel_id(reopened_buffer, &named),
+			Some(named_panel)
+		);
+		assert_eq!(
+			reopened.rune_view_panel_id(reopened_buffer, &anonymous),
+			Some(anonymous_panel)
+		);
+		assert_eq!(reopened.view_group_ids[&reopened_buffer], group);
+		let restored_colours = reopened.take_restored_colour_meanings().unwrap();
+		let canonical_identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
+			assignments: vec![ColorAssignmentSnapshot {
+				field: "product".into(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::Bar,
+				},
+				category: "Atlas".into(),
+				position: 2,
+			}],
+			spaces: vec![ColorSpaceSnapshot {
+				field: "product".into(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::Bar,
+				},
+				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
+			}],
+		})
+		.unwrap();
+		assert_eq!(
+			restored_colours
+				.as_map()
+				.get(&(reopened_buffer, named.clone(), 4)),
+			Some(&canonical_identity),
+			"resolved horizontal geometry restores the authored bar family"
+		);
+		let before_count = reopened.view_panel_ids.len();
+		reopened.prepare_rune_view_panels(reopened_buffer, &views, 2);
+		assert_eq!(
+			reopened.rune_view_panel_id(reopened_buffer, &named),
+			Some(named_panel)
+		);
+		assert_eq!(
+			reopened.view_panel_ids.len(),
+			before_count,
+			"rerun resolves in place"
+		);
+		let fresh = LocalViewIdentity::Named("fresh".into());
+		let fresh_id = reopened.resolve_rune_view_panel(reopened_buffer, fresh);
+		assert!(
+			fresh_id.get() > anonymous_panel.get(),
+			"allocator resumes above restored identities"
+		);
+		reopened.shutdown();
 	}
 
 	#[cfg(feature = "toron")]

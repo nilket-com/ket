@@ -1072,6 +1072,136 @@ impl ColorIdentity {
 	pub fn is_empty(&self) -> bool {
 		self.assignments.is_empty()
 	}
+
+	pub(crate) fn persistence_snapshot(&self) -> ColorIdentitySnapshot {
+		let mut assignments = self
+			.assignments
+			.iter()
+			.map(|(key, position)| ColorAssignmentSnapshot {
+				field: key.field.clone(),
+				layer: key.layer.clone(),
+				category: key.category.clone(),
+				position: position.index(),
+			})
+			.collect::<Vec<_>>();
+		assignments.sort_by(|left, right| {
+			(
+				&left.field,
+				left.layer.ordinal,
+				left.layer.plot_type,
+				&left.category,
+			)
+				.cmp(&(
+					&right.field,
+					right.layer.ordinal,
+					right.layer.plot_type,
+					&right.category,
+				))
+		});
+		let mut spaces = self
+			.spaces
+			.iter()
+			.map(|(key, space)| ColorSpaceSnapshot {
+				field: key.field.clone(),
+				layer: key.layer.clone(),
+				space: match *space {
+					ColorAllocationSpace::Legacy { len } => AllocationSpaceSnapshot::Legacy { len },
+					ColorAllocationSpace::CategoricalPalette { len } => {
+						AllocationSpaceSnapshot::CategoricalPalette { len }
+					}
+				},
+			})
+			.collect::<Vec<_>>();
+		spaces.sort_by(|left, right| {
+			(&left.field, left.layer.ordinal, left.layer.plot_type).cmp(&(
+				&right.field,
+				right.layer.ordinal,
+				right.layer.plot_type,
+			))
+		});
+		ColorIdentitySnapshot {
+			assignments,
+			spaces,
+		}
+	}
+
+	pub(crate) fn from_persistence_snapshot(
+		snapshot: ColorIdentitySnapshot,
+	) -> Result<Self, String> {
+		let mut spaces = HashMap::new();
+		for entry in snapshot.spaces {
+			let key = ColorLineageKey {
+				field: entry.field,
+				layer: entry.layer,
+			};
+			let space = match entry.space {
+				AllocationSpaceSnapshot::Legacy { len } => ColorAllocationSpace::Legacy { len },
+				AllocationSpaceSnapshot::CategoricalPalette { len } => {
+					ColorAllocationSpace::CategoricalPalette { len }
+				}
+			};
+			if space.len() == 0 {
+				return Err("colour allocation space has zero length".to_owned());
+			}
+			if spaces.insert(key, space).is_some() {
+				return Err("duplicate colour allocation space".to_owned());
+			}
+		}
+
+		let mut assignments = HashMap::new();
+		for entry in snapshot.assignments {
+			let lineage = ColorLineageKey {
+				field: entry.field.clone(),
+				layer: entry.layer.clone(),
+			};
+			let len = spaces
+				.get(&lineage)
+				.ok_or_else(|| "colour assignment has no allocation space".to_owned())?
+				.len();
+			let position =
+				PalettePosition::new(entry.position, len).map_err(|error| error.to_string())?;
+			let key = ColorIdentityKey {
+				field: entry.field,
+				layer: entry.layer,
+				category: entry.category,
+			};
+			if assignments.insert(key, position).is_some() {
+				return Err("duplicate colour assignment".to_owned());
+			}
+		}
+
+		Ok(Self {
+			assignments,
+			spaces,
+		})
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ColorIdentitySnapshot {
+	pub assignments: Vec<ColorAssignmentSnapshot>,
+	pub spaces: Vec<ColorSpaceSnapshot>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ColorAssignmentSnapshot {
+	pub field: String,
+	pub layer: LayerIdentity,
+	pub category: String,
+	pub position: usize,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ColorSpaceSnapshot {
+	pub field: String,
+	pub layer: LayerIdentity,
+	pub space: AllocationSpaceSnapshot,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AllocationSpaceSnapshot {
+	Legacy { len: usize },
+	CategoricalPalette { len: usize },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
