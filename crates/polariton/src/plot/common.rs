@@ -517,14 +517,6 @@ pub trait PathBuilder {
 	fn close(&mut self);
 }
 
-/// Backend-independent plot command stream.
-///
-/// PRODUCT-0057 licenses recordings of this trait to prove emitted primitives,
-/// coordinates, styles, text origins, authored order, transforms, clip
-/// declarations, and relationships among those serialized facts. It is not an
-/// oracle for production compositing, clip enforcement, rasterization,
-/// antialiasing, or measured glyph fit; those properties require the renderer
-/// that realizes them.
 pub trait PlotBackend {
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke);
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color);

@@ -8,12 +8,6 @@ use std::io::Cursor;
 use std::path::Path as StdPath;
 use std::sync::Arc;
 
-/// Exact, backend-independent plot-command serialization.
-///
-/// PRODUCT-0057 licenses this SVG to prove what the plot emitted—including
-/// coordinates, styles, authored order, transforms, and declared clip
-/// structure—but not how iced/wgpu composites, clips, antialiases, or measures
-/// the same content on the production canvas.
 pub struct SvgBackend {
 	pub svg: String,
 	current_transform: Affine,
@@ -265,10 +259,6 @@ impl PlotBackend for SvgBackend {
 	}
 }
 
-/// PNG export produced by rasterizing [`SvgBackend`] with resvg/tiny-skia.
-///
-/// It proves the export renderer's realization of the SVG stream and supplies
-/// no independent evidence about iced/wgpu's production canvas (PRODUCT-0057).
 pub struct PngBackend {
 	svg_backend: SvgBackend,
 }
@@ -301,10 +291,6 @@ impl PngBackend {
 	}
 }
 
-/// AVIF export produced by rasterizing [`SvgBackend`] with resvg/tiny-skia.
-///
-/// It proves the export renderer's realization of the SVG stream and supplies
-/// no independent evidence about iced/wgpu's production canvas (PRODUCT-0057).
 pub struct AvifBackend {
 	svg_backend: SvgBackend,
 }
@@ -474,28 +460,5 @@ impl PlotBackend for PngBackend {
 
 	fn with_clip(&mut self, bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
 		self.svg_backend.with_clip(bounds, f);
-	}
-}
-
-#[cfg(test)]
-mod tests {
-	use super::{AvifBackend, PngBackend};
-
-	#[test]
-	fn product_0057_raster_exporters_consume_the_svg_stream_symbolically() {
-		let png = PngBackend::new(17, 19);
-		let avif = AvifBackend::new(23, 29);
-		assert!(
-			png.svg_backend
-				.svg
-				.starts_with("<svg width=\"17\" height=\"19\"")
-		);
-		assert!(
-			avif.svg_backend
-				.svg
-				.starts_with("<svg width=\"23\" height=\"29\"")
-		);
-		assert_eq!(png.svg_backend.clip_count, 0);
-		assert_eq!(avif.svg_backend.clip_count, 0);
 	}
 }

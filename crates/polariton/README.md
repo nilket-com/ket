@@ -149,21 +149,6 @@ The named series share the figure palette and legend with grouped scatter and
 bar marks. The three-field form is a standalone mark and is not accepted inside
 `layers([...])`.
 
-#### Rendering-test licenses:
-
-Recorded plot operations and SVG are exact oracles for emitted geometry,
-styles, text origins, authored order, transforms, clip declarations, and
-relationships among those facts. They do not prove iced/wgpu compositing, clip
-enforcement, antialiasing, or measured glyph fit. When two renderers could
-receive the same complete operation stream and disagree about the property, use
-the test-only headless iced/wgpu semantic probes instead of strengthening the
-SVG assertion.
-
-GPU probes sample controlled regions and boundary populations; they do not bank
-cross-machine image bytes. See PRODUCT-0057 and
-`plans/product/rendering_oracle_manual_protocol.md` for the classifier,
-controls, and explicit fallback procedure.
-
 #### Adapters:
  - SQLite (file or memory)
  - Parquet (single file)
