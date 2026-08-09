@@ -157,8 +157,8 @@ crates/{toron|wendelon}/plans/wip/{name}_iter_{ITER}_impl_{NNN}.md
 ## Promotion mechanics (operator)
 
 A promotion commit is **exactly two files** — the canonical ADR and its
-impl plan — as `plan: adr NNN <topic>` (co-author trailer; direct to
-`main` per repo convention). There is no central roadmap to rotate (it
+impl plan — as `plan: adr NNN <topic>` (single-line message, no
+attribution trailer; direct to `main` per repo convention). There is no central roadmap to rotate (it
 was retired into [`prioritization.md`](prioritization.md); git holds the
 history); the next-topic hints live in the new ADR's "Forward arc" +
 "Deferred (named)" sections. wip iters stay untracked.
@@ -166,7 +166,27 @@ history); the next-topic hints live in the new ADR's "Forward arc" +
 ## The plan→implement block-chain
 
 `plan: adr NNN` (the design) and `impl: adr NNN` (the implementation)
-are separate commits. After the impl lands, the operator says "ready for
+are separate commits.
+
+**They are also adjacent, and each ADR contributes exactly one of each.**
+`main` should read `plan, impl, plan, impl, …`. Three habits break that,
+and all three are avoidable:
+
+- **Review rounds are not commits.** A plan revised four times still
+  lands as one `plan:`; an impl reworked after findings still lands as
+  one `impl:`. Recompose locally (`git reset --soft` onto the pre-cut
+  parent, re-add, re-commit) and push once review has converged. Never
+  recompose anything already pushed.
+- **Evidence rides its `impl:`.** An implementation receipt is part of
+  the implementation, not a separate `docs:` commit.
+- **Bare `fix:`/`refactor:` is for genuinely unrelated repair only.**
+  Cleanup adjacent to the surface an ADR touches belongs in that ADR's
+  `impl:` (see [`continuous-refactoring.md`](continuous-refactoring.md)).
+
+Named exception: a `plan:` may be pushed ahead of its `impl:` when
+implementation is blocked on another record, or when a parallel
+workstation needs to see it. State the reason in the commit body or the
+ADR itself. It is an exception to be named, not the resting state. After the impl lands, the operator says "ready for
 code review" and the council reviews it **independently**: re-run the
 ADR's architecture guards, the reconciled prior guards, and the
 behavior net — don't just trust the evidence doc. Verdict is APPROVE or
