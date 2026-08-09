@@ -189,7 +189,8 @@ pub trait TransportConnection: Send + Sync {
 
 	/// Peer identity. Used as the cache key in the factory and as
 	/// the attribution target for `RPCError::RemoteError`.
-	fn remote_id(&self) -> NodeId;
+	/// Authenticated node identity, absent for admitted non-node actors.
+	fn remote_id(&self) -> Option<NodeId>;
 
 	/// Verified actor identity derived from the mTLS peer cert (or
 	/// a loopback equivalent in tests). Distinct from record

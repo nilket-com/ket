@@ -7114,7 +7114,7 @@ async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 	let bad_resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		bad_frame,
@@ -7151,7 +7151,7 @@ async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		frame,
@@ -7296,7 +7296,7 @@ async fn aggregate_dispatch_folds_filtered_table_rows() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		frame,
@@ -7479,7 +7479,7 @@ async fn dispatch_aggregate_request(
 	let resp = DataRingServer::handle_data_frame(
 		server.as_ref(),
 		RequestContext {
-			remote: server.local_node,
+			remote: Some(server.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		frame,
@@ -10076,8 +10076,8 @@ impl TransportConnection for LoopbackConnection {
 	async fn accept_bi(&self) -> std::io::Result<Box<dyn TransportStream>> {
 		unreachable!("loopback connections never accept server-initiated streams")
 	}
-	fn remote_id(&self) -> NodeId {
-		self.remote
+	fn remote_id(&self) -> Option<NodeId> {
+		Some(self.remote)
 	}
 	fn actor_identity(&self) -> &ActorIdentity {
 		&self.actor
@@ -10143,7 +10143,7 @@ async fn serve_one_frame(
 	let response = match svc
 		.handle_frame(
 			RequestContext {
-				remote: ZERO_NODE,
+				remote: Some(ZERO_NODE),
 				actor: ActorIdentity::data_node(ZERO_NODE),
 			},
 			frame,
@@ -11261,7 +11261,7 @@ async fn dispatcher_rejects_cross_tenant_write_before_handler() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, Some("7")),
 		},
 		frame,
@@ -11330,7 +11330,7 @@ async fn counter_replicate_dispatch_appends_tentative_with_no_witness() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: ActorIdentity::data_node(node.local_node),
 		},
 		frame,
@@ -11397,7 +11397,7 @@ async fn counter_rollback_dispatch_acks_and_is_idempotent() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: ActorIdentity::data_node(node.local_node),
 		},
 		frame,
@@ -11477,7 +11477,7 @@ async fn dispatch_counter_add(
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		frame,
@@ -11673,7 +11673,7 @@ async fn dispatch_counter_add_shared(
 		let resp = DataRingServer::handle_data_frame(
 			server.as_ref(),
 			RequestContext {
-				remote: local,
+				remote: Some(local),
 				actor: actor(ActorRole::Operator, None),
 			},
 			frame,
@@ -12288,7 +12288,7 @@ async fn dispatcher_rejects_read_only_observer_data_read() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::ReadOnlyObserver, None),
 		},
 		frame,
@@ -12367,7 +12367,7 @@ async fn dispatcher_emits_write_request_and_completion_audit_events() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		frame,
@@ -12456,7 +12456,7 @@ async fn dispatcher_refuses_write_when_data_access_audit_emit_fails() {
 	let err = DataRingServer::handle_data_frame(
 		fail_closed_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		frame,
@@ -12573,7 +12573,7 @@ async fn dispatcher_emits_completed_read_audit_event() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		frame,
@@ -12656,7 +12656,7 @@ async fn dispatcher_emits_completed_range_query_audit_event() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, None),
 		},
 		frame,
@@ -12721,7 +12721,7 @@ async fn dispatcher_rejects_tenant_scoped_actor_opening_finalization_stream() {
 	let err = DataRingServer::handle_data_stream(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: actor(ActorRole::Operator, Some("7")),
 		},
 		first_header,
@@ -12786,7 +12786,7 @@ async fn dispatcher_backpressures_write_when_tenant_limit_is_saturated() {
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: tenant_actor,
 		},
 		frame,
@@ -12859,7 +12859,7 @@ async fn dispatcher_backpressures_cross_tenant_read_when_actor_limit_is_saturate
 	let resp = DataRingServer::handle_data_frame(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: operator,
 		},
 		frame,
@@ -12925,7 +12925,7 @@ async fn query_stream_backpressure_response_marks_stream_end() {
 	DataRingServer::handle_data_stream(
 		node.data_server.as_ref(),
 		RequestContext {
-			remote: node.local_node,
+			remote: Some(node.local_node),
 			actor: tenant_actor,
 		},
 		first_header,

@@ -55,7 +55,10 @@ fn break_glass_actor(scope: BreakGlassScope) -> ActorIdentity {
 }
 
 fn context(actor: ActorIdentity, remote: NodeId) -> RequestContext {
-	RequestContext { remote, actor }
+	RequestContext {
+		remote: Some(remote),
+		actor,
+	}
 }
 
 fn lease_matches_acquire_request(lease: &LeaseDescriptor, req: &AcquireLeaseRequestMeta) -> bool {

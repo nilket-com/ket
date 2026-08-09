@@ -73,7 +73,7 @@ use crate::network::lease_signing::{
 };
 use crate::network::pool::BufPool;
 use crate::network::quic_transport::{
-	QuicTransportProvider, canonical_server_name_resolver, endpoint_from_tls,
+	QuicTransportProvider, canonical_server_name_resolver, endpoint_from_tls_with_peer_roots,
 };
 use crate::network::ring::RingRouter;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
@@ -82,7 +82,9 @@ use crate::network::server::{
 	serve_tcp_tls_with_admission, serve_with_admission,
 };
 use crate::network::tcp_tls_transport::TcpTlsTransportProvider;
-use crate::network::tls::{TlsMaterial, rustls_client_config, rustls_server_config};
+use crate::network::tls::{
+	ActorTrustRoots, TlsMaterial, rustls_client_config, rustls_server_config_with_peer_roots,
+};
 use crate::network::transfer_signing::{
 	TransferAuthority, dev_transfer_signing_secret, transfer_verifying_key_bytes,
 };
@@ -859,11 +861,13 @@ enum BootstrapListener {
 	Quic {
 		endpoint: quinn::Endpoint,
 		cluster_domain: String,
+		trust_roots: Arc<ActorTrustRoots>,
 	},
 	TcpTls {
 		listener: TcpListener,
 		acceptor: TlsAcceptor,
 		cluster_domain: String,
+		trust_roots: Arc<ActorTrustRoots>,
 	},
 }
 
@@ -935,12 +939,24 @@ impl WendelonNode {
 		let (revocation_tx, _) = watch::channel(Arc::new(RevocationSnapshot::default()));
 		if let Some(tls) = cfg.transport_tls.clone() {
 			let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
+			let trust_roots = Arc::new(ActorTrustRoots::load(
+				&tls.node_ca_path,
+				&tls.operator_ca_path,
+			)?);
 			let bind_addr = resolve_socket_addr(&cfg.advertise_address)?;
 			let cluster_domain = tls.cluster_domain.clone();
 			let server_name = canonical_server_name_resolver(&cluster_domain);
-			let quic_endpoint = endpoint_from_tls(&material, bind_addr)?;
+			let quic_endpoint = endpoint_from_tls_with_peer_roots(
+				&material,
+				trust_roots.combined_roots(),
+				bind_addr,
+			)?;
 			let tcp_listener = TcpListener::bind(&cfg.advertise_address).await?;
-			let tcp_acceptor = TlsAcceptor::from(Arc::new(rustls_server_config(&material)?));
+			let tcp_acceptor = TlsAcceptor::from(Arc::new(rustls_server_config_with_peer_roots(
+				&material,
+				trust_roots.combined_roots(),
+				vec![crate::network::tls::HRFT_ALPN.to_vec()],
+			)?));
 			let mut providers: HashMap<TransportTier, Arc<dyn TransportProvider>> = HashMap::new();
 			providers.insert(
 				TransportTier::QuicIoUring,
@@ -972,11 +988,13 @@ impl WendelonNode {
 					BootstrapListener::Quic {
 						endpoint: quic_endpoint,
 						cluster_domain: cluster_domain.clone(),
+						trust_roots: trust_roots.clone(),
 					},
 					BootstrapListener::TcpTls {
 						listener: tcp_listener,
 						acceptor: tcp_acceptor,
 						cluster_domain,
+						trust_roots,
 					},
 				],
 				revocation_tx,
@@ -1309,12 +1327,21 @@ impl WendelonNode {
 				)
 			})?;
 			let material = TlsMaterial::load(&tls.cert_path, &tls.key_path, &tls.node_ca_path)?;
+			let trust_roots = Arc::new(ActorTrustRoots::load(
+				&tls.node_ca_path,
+				&tls.operator_ca_path,
+			)?);
 			let listener = TcpListener::bind(&cfg.advertise_address).await?;
-			let acceptor = TlsAcceptor::from(Arc::new(rustls_server_config(&material)?));
+			let acceptor = TlsAcceptor::from(Arc::new(rustls_server_config_with_peer_roots(
+				&material,
+				trust_roots.combined_roots(),
+				vec![crate::network::tls::HRFT_ALPN.to_vec()],
+			)?));
 			vec![BootstrapListener::TcpTls {
 				listener,
 				acceptor,
 				cluster_domain: tls.cluster_domain.clone(),
+				trust_roots,
 			}]
 		} else {
 			Vec::new()
@@ -1659,6 +1686,7 @@ impl WendelonNode {
 				BootstrapListener::Quic {
 					endpoint,
 					cluster_domain,
+					trust_roots,
 				} => NodeTransportServer::Quic(spawn_quic_server(
 					endpoint,
 					service.clone(),
@@ -1667,11 +1695,13 @@ impl WendelonNode {
 					cfg.transport_admission.clone(),
 					cluster_domain,
 					revocation_tx.subscribe(),
+					trust_roots,
 				)),
 				BootstrapListener::TcpTls {
 					listener,
 					acceptor,
 					cluster_domain,
+					trust_roots,
 				} => NodeTransportServer::TcpTls(spawn_tcp_tls_server(
 					listener,
 					acceptor,
@@ -1681,6 +1711,7 @@ impl WendelonNode {
 					cfg.transport_admission.clone(),
 					cluster_domain,
 					revocation_tx.subscribe(),
+					trust_roots,
 				)),
 			})
 			.collect::<Vec<_>>();
@@ -1954,6 +1985,7 @@ impl WendelonNode {
 		&self,
 		endpoint: quinn::Endpoint,
 		cluster_domain: impl Into<String>,
+		trust_roots: Arc<ActorTrustRoots>,
 	) -> QuicServerHandle {
 		spawn_quic_server(
 			endpoint,
@@ -1963,6 +1995,7 @@ impl WendelonNode {
 			self.transport_admission.clone(),
 			cluster_domain.into(),
 			self.state_machine.subscribe_revocation_snapshot(),
+			trust_roots,
 		)
 	}
 
@@ -1971,6 +2004,7 @@ impl WendelonNode {
 		listener: TcpListener,
 		acceptor: TlsAcceptor,
 		cluster_domain: impl Into<String>,
+		trust_roots: Arc<ActorTrustRoots>,
 	) -> TcpTlsServerHandle {
 		let svc = self.service.clone();
 		let pool = self.pool.clone();
@@ -1990,6 +2024,7 @@ impl WendelonNode {
 					admission,
 					cluster_domain,
 					Some(revocations),
+					Some(trust_roots),
 				)
 				.await
 			}
@@ -2102,6 +2137,7 @@ async fn serve_dyn(
 	admission: ServerAdmissionConfig,
 	cluster_domain: String,
 	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
+	trust_roots: Option<Arc<ActorTrustRoots>>,
 ) -> std::io::Result<()> {
 	struct DynService(Arc<dyn HrftService>);
 	#[async_trait]
@@ -2131,6 +2167,7 @@ async fn serve_dyn(
 		admission,
 		cluster_domain,
 		revocations,
+		trust_roots,
 	)
 	.await
 }
@@ -2144,6 +2181,7 @@ async fn serve_dyn_tcp_tls(
 	admission: ServerAdmissionConfig,
 	cluster_domain: String,
 	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
+	trust_roots: Option<Arc<ActorTrustRoots>>,
 ) -> std::io::Result<()> {
 	struct DynService(Arc<dyn HrftService>);
 	#[async_trait]
@@ -2175,6 +2213,7 @@ async fn serve_dyn_tcp_tls(
 		admission,
 		cluster_domain,
 		revocations,
+		trust_roots,
 	)
 	.await
 }
@@ -2187,6 +2226,7 @@ fn spawn_quic_server(
 	admission: ServerAdmissionConfig,
 	cluster_domain: String,
 	revocations: watch::Receiver<Arc<RevocationSnapshot>>,
+	trust_roots: Arc<ActorTrustRoots>,
 ) -> QuicServerHandle {
 	let task_endpoint = endpoint.clone();
 	let task = tokio::spawn({
@@ -2200,6 +2240,7 @@ fn spawn_quic_server(
 				admission,
 				cluster_domain,
 				Some(revocations),
+				Some(trust_roots),
 			)
 			.await
 		}
@@ -2220,6 +2261,7 @@ fn spawn_tcp_tls_server(
 	admission: ServerAdmissionConfig,
 	cluster_domain: String,
 	revocations: watch::Receiver<Arc<RevocationSnapshot>>,
+	trust_roots: Arc<ActorTrustRoots>,
 ) -> TcpTlsServerHandle {
 	let task = tokio::spawn({
 		let lifecycle = lifecycle.clone();
@@ -2233,6 +2275,7 @@ fn spawn_tcp_tls_server(
 				admission,
 				cluster_domain,
 				Some(revocations),
+				Some(trust_roots),
 			)
 			.await
 		}
@@ -3934,10 +3977,10 @@ mod tests {
 			.router
 			.handle_frame(
 				crate::network::server::RequestContext {
-					remote: crate::schema::NodeId {
+					remote: Some(crate::schema::NodeId {
 						id: 0,
 						_reserved: 0,
-					},
+					}),
 					actor: crate::network::tls::ActorIdentity::data_node(crate::schema::NodeId {
 						id: 0,
 						_reserved: 0,

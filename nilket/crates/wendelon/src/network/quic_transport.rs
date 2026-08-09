@@ -23,13 +23,14 @@
 use crate::consensus::raft_storage::RevocationSnapshot;
 use crate::network::tls::{
 	ActorIdentity, DEFAULT_CLUSTER_DOMAIN, TlsMaterial, client_config, server_config,
-	verified_transport_peer_with_revocations,
+	server_config_with_peer_roots, verified_transport_peer_with_revocations,
 };
 use crate::network::transport::{
 	TransportConnection, TransportProvider, TransportStream, TransportTier,
 };
 use crate::schema::NodeId;
 use async_trait::async_trait;
+use rustls::RootCertStore;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -76,7 +77,7 @@ pub struct QuicTransportConnection {
 	/// Raft config (or, on the server side, from the validated
 	/// client certificate SAN). Exposed via
 	/// [`TransportConnection::remote_id`].
-	remote_id: NodeId,
+	remote_id: Option<NodeId>,
 	actor_identity: ActorIdentity,
 }
 
@@ -84,7 +85,17 @@ impl QuicTransportConnection {
 	pub fn new(inner: quinn::Connection, remote_id: NodeId, actor_identity: ActorIdentity) -> Self {
 		Self {
 			inner,
-			remote_id,
+			remote_id: Some(remote_id),
+			actor_identity,
+		}
+	}
+
+	/// Wrap an accepted connection without inventing a node identity for an
+	/// authenticated non-node actor.
+	pub fn new_inbound(inner: quinn::Connection, actor_identity: ActorIdentity) -> Self {
+		Self {
+			inner,
+			remote_id: actor_identity.node_id,
 			actor_identity,
 		}
 	}
@@ -110,7 +121,7 @@ impl TransportConnection for QuicTransportConnection {
 		Ok(Box::new(QuicTransportStream::new(send, recv)))
 	}
 
-	fn remote_id(&self) -> NodeId {
+	fn remote_id(&self) -> Option<NodeId> {
 		self.remote_id
 	}
 
@@ -195,6 +206,21 @@ pub fn endpoint_from_tls(
 	bind_addr: SocketAddr,
 ) -> std::io::Result<quinn::Endpoint> {
 	let mut endpoint = quinn::Endpoint::server(server_config(material)?, bind_addr)?;
+	endpoint.set_default_client_config(client_config(material)?);
+	Ok(endpoint)
+}
+
+/// Bind the shared inbound HRFT listener with a wider client-auth root set
+/// while keeping its default outbound client config node-root-only.
+pub fn endpoint_from_tls_with_peer_roots(
+	material: &TlsMaterial,
+	peer_roots: Arc<RootCertStore>,
+	bind_addr: SocketAddr,
+) -> std::io::Result<quinn::Endpoint> {
+	let mut endpoint = quinn::Endpoint::server(
+		server_config_with_peer_roots(material, peer_roots)?,
+		bind_addr,
+	)?;
 	endpoint.set_default_client_config(client_config(material)?);
 	Ok(endpoint)
 }

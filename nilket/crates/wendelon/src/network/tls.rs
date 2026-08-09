@@ -565,6 +565,26 @@ pub fn rustls_client_config_with_alpn(
 /// * advertises only [`HRFT_ALPN`].
 pub fn server_config(material: &TlsMaterial) -> std::io::Result<quinn::ServerConfig> {
 	let rustls_cfg = rustls_server_config(material)?;
+	quinn_server_config_from_rustls(rustls_cfg)
+}
+
+/// Build a QUIC server config whose client-auth roots are selected independently
+/// from the node identity's outbound trust roots.
+///
+/// ADR 082 uses this only on the inbound shared HRFT listener. Outbound dials
+/// continue to use [`client_config`] and therefore remain node-root-only.
+pub fn server_config_with_peer_roots(
+	material: &TlsMaterial,
+	peer_roots: Arc<RootCertStore>,
+) -> std::io::Result<quinn::ServerConfig> {
+	let rustls_cfg =
+		rustls_server_config_with_peer_roots(material, peer_roots, vec![HRFT_ALPN.to_vec()])?;
+	quinn_server_config_from_rustls(rustls_cfg)
+}
+
+fn quinn_server_config_from_rustls(
+	rustls_cfg: ServerConfig,
+) -> std::io::Result<quinn::ServerConfig> {
 	let quic_cfg = QuicServerConfig::try_from(rustls_cfg)
 		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicServerConfig: {e}")))?;
 	Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_cfg)))
@@ -647,15 +667,40 @@ pub fn verified_peer_actor_identity_with_revocations(
 	cluster_domain: &str,
 	revocations: Option<&RevocationSnapshot>,
 ) -> std::io::Result<ActorIdentity> {
+	verified_peer_actor_identity_with_trust_roots_and_revocations(
+		connection,
+		cluster_domain,
+		None,
+		revocations,
+	)
+}
+
+/// Verify an inbound QUIC actor against the configured trust domains while
+/// preserving the legitimate absence of a node identity for operator actors.
+pub fn verified_peer_actor_identity_with_trust_roots_and_revocations(
+	connection: &quinn::Connection,
+	cluster_domain: &str,
+	trust_roots: Option<&ActorTrustRoots>,
+	revocations: Option<&RevocationSnapshot>,
+) -> std::io::Result<ActorIdentity> {
 	let identity = connection.peer_identity().ok_or_else(|| {
 		Error::new(
 			ErrorKind::PermissionDenied,
 			"peer presented no TLS identity",
 		)
 	})?;
-	verified_peer_actor_identity_from_identity_with_revocations(
-		identity,
+	let certs = identity
+		.downcast::<Vec<CertificateDer<'static>>>()
+		.map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"peer identity is not a rustls certificate chain",
+			)
+		})?;
+	verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(
+		certs.as_slice(),
 		cluster_domain,
+		trust_roots,
 		revocations,
 	)
 }

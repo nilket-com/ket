@@ -452,8 +452,8 @@ mod tests {
 		async fn accept_bi(&self) -> std::io::Result<Box<dyn TransportStream>> {
 			unimplemented!("mock does not accept streams")
 		}
-		fn remote_id(&self) -> NodeId {
-			self.remote
+		fn remote_id(&self) -> Option<NodeId> {
+			Some(self.remote)
 		}
 		fn actor_identity(&self) -> &ActorIdentity {
 			&self.actor

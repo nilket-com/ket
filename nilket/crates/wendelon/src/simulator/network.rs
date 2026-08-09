@@ -402,7 +402,7 @@ impl TransportConnection for SimulatedTransportConnection {
 					Box::new(SimulatedTransportStream { inner: server_side }),
 					pool,
 					RequestContext {
-						remote,
+						remote: Some(remote),
 						actor: ActorIdentity::data_node(remote),
 					},
 				)
@@ -415,8 +415,8 @@ impl TransportConnection for SimulatedTransportConnection {
 		unreachable!("simulated transport connections do not accept server-initiated streams")
 	}
 
-	fn remote_id(&self) -> NodeId {
-		self.remote
+	fn remote_id(&self) -> Option<NodeId> {
+		Some(self.remote)
 	}
 
 	fn actor_identity(&self) -> &ActorIdentity {

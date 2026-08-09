@@ -58,8 +58,10 @@ use crate::network::core::{HrftFrame, read_frame, write_frame};
 use crate::network::pool::BufPool;
 use crate::network::quic_transport::QuicTransportConnection;
 use crate::network::tcp_tls_transport::InboundTcpTlsConnection;
-use crate::network::tls::ActorIdentity;
+use crate::network::tls::{ActorIdentity, ActorPermission, ActorTrustRoots, authorize_actor};
 use crate::network::tls::{
+	verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations,
+	verified_peer_actor_identity_with_trust_roots_and_revocations,
 	verified_transport_peer_from_chain_with_revocations, verified_transport_peer_with_revocations,
 };
 use crate::network::transport::{TransportConnection, TransportStream};
@@ -81,8 +83,36 @@ use tokio_rustls::TlsAcceptor;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RequestContext {
-	pub remote: NodeId,
+	pub remote: Option<NodeId>,
 	pub actor: ActorIdentity,
+}
+
+impl RequestContext {
+	/// Return the authenticated node identity for node-only ingress.
+	///
+	/// A SAN alone is not enough: the actor must also carry the `DataNode`
+	/// role, and both independently-derived identities must agree.
+	pub fn require_authenticated_node(&self, operation: &str) -> std::io::Result<NodeId> {
+		authorize_actor(&self.actor, ActorPermission::InterNodeTransport).map_err(|error| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				format!("{operation} requires an authenticated data node: {error}"),
+			)
+		})?;
+		let remote = self.remote.ok_or_else(|| {
+			Error::new(
+				ErrorKind::PermissionDenied,
+				format!("{operation} requires an authenticated node identity"),
+			)
+		})?;
+		if self.actor.node_id != Some(remote) {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!("{operation} node identity disagrees with the authenticated actor"),
+			));
+		}
+		Ok(remote)
+	}
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -559,6 +589,7 @@ pub async fn serve<S: HrftService>(
 		ServerAdmissionConfig::default(),
 		cluster_domain,
 		None,
+		None,
 	)
 	.await
 }
@@ -571,6 +602,7 @@ pub async fn serve_with_admission<S: HrftService>(
 	admission: ServerAdmissionConfig,
 	cluster_domain: impl Into<String>,
 	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
+	trust_roots: Option<Arc<ActorTrustRoots>>,
 ) -> std::io::Result<()> {
 	admission.validate()?;
 	let cluster_domain = cluster_domain.into();
@@ -604,6 +636,7 @@ pub async fn serve_with_admission<S: HrftService>(
 				let admission = admission.clone();
 				let cluster_domain = cluster_domain.clone();
 				let revocations = revocations.clone();
+				let trust_roots = trust_roots.clone();
 				let _connection_guard = lifecycle.track_work();
 				tokio::spawn(async move {
 					let _connection_guard = _connection_guard;
@@ -618,6 +651,7 @@ pub async fn serve_with_admission<S: HrftService>(
 							_connection_admission,
 							cluster_domain,
 							revocations,
+							trust_roots,
 						)
 							.await
 					{
@@ -651,6 +685,7 @@ pub async fn serve_tcp_tls<S: HrftService>(
 		ServerAdmissionConfig::default(),
 		cluster_domain,
 		None,
+		None,
 	)
 	.await
 }
@@ -664,6 +699,7 @@ pub async fn serve_tcp_tls_with_admission<S: HrftService>(
 	admission: ServerAdmissionConfig,
 	cluster_domain: impl Into<String>,
 	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
+	trust_roots: Option<Arc<ActorTrustRoots>>,
 ) -> std::io::Result<()> {
 	admission.validate()?;
 	let cluster_domain = cluster_domain.into();
@@ -698,6 +734,7 @@ pub async fn serve_tcp_tls_with_admission<S: HrftService>(
 				let admission = admission.clone();
 				let cluster_domain = cluster_domain.clone();
 				let revocations = revocations.clone();
+				let trust_roots = trust_roots.clone();
 				let _connection_guard = lifecycle.track_work();
 				tokio::spawn(async move {
 					let _connection_guard = _connection_guard;
@@ -712,6 +749,7 @@ pub async fn serve_tcp_tls_with_admission<S: HrftService>(
 						_connection_admission,
 						cluster_domain,
 						revocations,
+						trust_roots,
 					)
 					.await
 					{
@@ -745,19 +783,28 @@ async fn serve_quic_connection<S: HrftService>(
 	connection_admission: ConnectionAdmissionGuard,
 	cluster_domain: String,
 	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
+	trust_roots: Option<Arc<ActorTrustRoots>>,
 ) -> std::io::Result<()> {
 	let connection = incoming.await.map_err(|e| {
 		metrics().quic_handshake_failures_transport_total.inc();
 		Error::new(ErrorKind::ConnectionAborted, e)
 	})?;
-	let peer = verified_transport_peer_with_revocations(
-		&connection,
-		&cluster_domain,
-		revocations
-			.as_ref()
-			.map(|rx| rx.borrow().clone())
-			.as_deref(),
-	)
+	let revocation_snapshot = revocations.as_ref().map(|rx| rx.borrow().clone());
+	let actor = if let Some(trust_roots) = trust_roots.as_deref() {
+		verified_peer_actor_identity_with_trust_roots_and_revocations(
+			&connection,
+			&cluster_domain,
+			Some(trust_roots),
+			revocation_snapshot.as_deref(),
+		)
+	} else {
+		verified_transport_peer_with_revocations(
+			&connection,
+			&cluster_domain,
+			revocation_snapshot.as_deref(),
+		)
+		.map(|peer| peer.actor_identity)
+	}
 	.map_err(|err| {
 		match err.kind() {
 			ErrorKind::PermissionDenied => {
@@ -767,11 +814,8 @@ async fn serve_quic_connection<S: HrftService>(
 		}
 		err
 	})?;
-	let connection: Arc<dyn TransportConnection> = Arc::new(QuicTransportConnection::new(
-		connection,
-		peer.node_id,
-		peer.actor_identity,
-	));
+	let connection: Arc<dyn TransportConnection> =
+		Arc::new(QuicTransportConnection::new_inbound(connection, actor));
 	handle_connection(
 		connection,
 		service,
@@ -793,6 +837,7 @@ async fn serve_tcp_tls_connection<S: HrftService>(
 	connection_admission: ConnectionAdmissionGuard,
 	cluster_domain: String,
 	revocations: Option<watch::Receiver<Arc<RevocationSnapshot>>>,
+	trust_roots: Option<Arc<ActorTrustRoots>>,
 ) -> std::io::Result<()> {
 	let stream = acceptor
 		.accept(stream)
@@ -804,19 +849,24 @@ async fn serve_tcp_tls_connection<S: HrftService>(
 			"peer presented no TLS identity",
 		)
 	})?;
-	let peer = verified_transport_peer_from_chain_with_revocations(
-		certs,
-		&cluster_domain,
-		revocations
-			.as_ref()
-			.map(|rx| rx.borrow().clone())
-			.as_deref(),
-	)?;
-	let connection: Arc<dyn TransportConnection> = Arc::new(InboundTcpTlsConnection::new(
-		peer.node_id,
-		peer.actor_identity,
-		stream,
-	));
+	let revocation_snapshot = revocations.as_ref().map(|rx| rx.borrow().clone());
+	let actor = if let Some(trust_roots) = trust_roots.as_deref() {
+		verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(
+			certs,
+			&cluster_domain,
+			Some(trust_roots),
+			revocation_snapshot.as_deref(),
+		)?
+	} else {
+		verified_transport_peer_from_chain_with_revocations(
+			certs,
+			&cluster_domain,
+			revocation_snapshot.as_deref(),
+		)?
+		.actor_identity
+	};
+	let connection: Arc<dyn TransportConnection> =
+		Arc::new(InboundTcpTlsConnection::new(actor, stream));
 	handle_connection(
 		connection,
 		service,
@@ -887,7 +937,7 @@ async fn handle_connection<S: HrftService>(
 					let _stream_admission = stream_admission;
 					if let Err(error) = handle_stream(stream, service, pool, context.clone()).await {
 						tracing::warn!(
-							remote_node_id = context.remote.id,
+							remote_node_id = ?context.remote.map(|node| node.id),
 							actor_role = %context.actor.role,
 							%error,
 							"wendelon request stream failed"
@@ -1068,8 +1118,8 @@ mod tests {
 			})
 		}
 
-		fn remote_id(&self) -> NodeId {
-			self.remote
+		fn remote_id(&self) -> Option<NodeId> {
+			Some(self.remote)
 		}
 
 		fn actor_identity(&self) -> &ActorIdentity {

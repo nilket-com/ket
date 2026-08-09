@@ -33,7 +33,7 @@ fn status_request(stream_id: u32) -> HrftFrame {
 
 fn context(remote: NodeId) -> RequestContext {
 	RequestContext {
-		remote,
+		remote: Some(remote),
 		actor: ActorIdentity::data_node(remote),
 	}
 }

@@ -219,8 +219,8 @@ impl TransportConnection for TcpTlsTransportConnection {
 		))
 	}
 
-	fn remote_id(&self) -> NodeId {
-		self.remote_id
+	fn remote_id(&self) -> Option<NodeId> {
+		Some(self.remote_id)
 	}
 
 	fn actor_identity(&self) -> &ActorIdentity {
@@ -237,20 +237,16 @@ impl TransportConnection for TcpTlsTransportConnection {
 }
 
 pub struct InboundTcpTlsConnection {
-	remote_id: NodeId,
+	remote_id: Option<NodeId>,
 	actor_identity: ActorIdentity,
 	pending: Mutex<Option<TcpTlsTransportStream>>,
 	closed: AtomicBool,
 }
 
 impl InboundTcpTlsConnection {
-	pub fn new(
-		remote_id: NodeId,
-		actor_identity: ActorIdentity,
-		stream: ServerTlsStream<TcpStream>,
-	) -> Self {
+	pub fn new(actor_identity: ActorIdentity, stream: ServerTlsStream<TcpStream>) -> Self {
 		Self {
-			remote_id,
+			remote_id: actor_identity.node_id,
 			actor_identity,
 			pending: Mutex::new(Some(TcpTlsTransportStream::server(stream, 0))),
 			closed: AtomicBool::new(false),
@@ -278,7 +274,7 @@ impl TransportConnection for InboundTcpTlsConnection {
 		Ok(Box::new(stream))
 	}
 
-	fn remote_id(&self) -> NodeId {
+	fn remote_id(&self) -> Option<NodeId> {
 		self.remote_id
 	}
 

@@ -411,7 +411,7 @@ async fn quic_provider_dials_and_verifies_peer_identity() {
 		.connect(target, &server_addr.to_string())
 		.await
 		.unwrap();
-	assert_eq!(connection.remote_id(), target);
+	assert_eq!(connection.remote_id(), Some(target));
 	assert_eq!(connection.transport_type(), TransportTier::QuicIoUring);
 	assert_eq!(connection.actor_identity().role, ActorRole::DataNode);
 	assert_eq!(
@@ -463,6 +463,7 @@ async fn quic_accept_loop_refuses_connections_over_limit() {
 					max_concurrent_stream_tasks: 16,
 				},
 				tls_pki::CLUSTER_DOMAIN,
+				None,
 				None,
 			)
 			.await
@@ -550,6 +551,7 @@ async fn listener_overload_sheds_excess_handshakes_while_retry_redirect_succeeds
 				},
 				tls_pki::CLUSTER_DOMAIN,
 				None,
+				None,
 			)
 			.await
 			.unwrap();
@@ -572,6 +574,7 @@ async fn listener_overload_sheds_excess_handshakes_while_retry_redirect_succeeds
 					max_concurrent_stream_tasks: 16,
 				},
 				tls_pki::CLUSTER_DOMAIN,
+				None,
 				None,
 			)
 			.await
@@ -767,7 +770,7 @@ async fn shared_factory_falls_back_to_tcp_tls_against_dual_stack_node() {
 	let dialer: Arc<dyn TransportProvider> = factory.clone();
 	let connection = dialer.connect(target, &node_addr).await.unwrap();
 	assert_eq!(connection.transport_type(), TransportTier::TcpTls);
-	assert_eq!(connection.remote_id(), target);
+	assert_eq!(connection.remote_id(), Some(target));
 
 	let pool = BufPool::new(8, 64 * 1024);
 	let mut stream = connection.open_bi().await.unwrap();
@@ -789,6 +792,156 @@ async fn shared_factory_falls_back_to_tcp_tls_against_dual_stack_node() {
 	assert_eq!(response.header.msg_type, MsgType::STATUS_RESP.0);
 
 	node.shutdown().await.unwrap();
+}
+
+async fn send_empty_request(
+	connection: &Arc<dyn TransportConnection>,
+	msg_type: MsgType,
+) -> std::io::Result<HrftFrame> {
+	let pool = BufPool::new(8, 64 * 1024);
+	let mut stream = connection.open_bi().await?;
+	let request = FrameHeader {
+		magic: wendelon::network::HRFT_MAGIC,
+		version: 1,
+		msg_type: msg_type.0,
+		flags: 0,
+		stream_id: 0,
+		meta_len: 0,
+		arrow_len: 0,
+		trailing_len: 0,
+	};
+	write_frame(&mut *stream, &request, &[], None, None).await?;
+	stream.finish().await?;
+	read_frame(&mut *stream, &pool).await
+}
+
+#[tokio::test]
+async fn operator_reaches_only_control_ring_over_both_production_transports() {
+	let root = fresh_dir("operator-shared-ingress");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let node_addr = reserve_socket_addr();
+	let deployment = WendelonNode::bootstrap(bootstrap_cfg(
+		"operator-shared-ingress-node",
+		1,
+		node_addr.clone(),
+		1,
+		&[1],
+		ClusterBootstrapConfig::Bootstrap,
+		&pki.server_cert,
+		&pki.server_key,
+		&pki.ca_cert,
+		&pki.ops_ca_cert,
+	))
+	.await
+	.unwrap();
+
+	let operator_material =
+		TlsMaterial::load(&pki.operator_cert, &pki.operator_key, &pki.ca_cert).unwrap();
+	let operator_quic_endpoint =
+		Arc::new(endpoint_from_tls(&operator_material, "127.0.0.1:0".parse().unwrap()).unwrap());
+	let quic_provider: Arc<dyn TransportProvider> =
+		Arc::new(QuicTransportProvider::with_cluster_domain(
+			operator_quic_endpoint.clone(),
+			canonical_server_name_resolver(tls_pki::CLUSTER_DOMAIN),
+			tls_pki::CLUSTER_DOMAIN,
+		));
+	let tcp_provider: Arc<dyn TransportProvider> =
+		Arc::new(TcpTlsTransportProvider::with_cluster_domain(
+			rustls_client_config(&operator_material).unwrap(),
+			canonical_server_name_resolver(tls_pki::CLUSTER_DOMAIN),
+			tls_pki::CLUSTER_DOMAIN,
+		));
+	let target = node(1);
+
+	for (name, provider) in [("quic", quic_provider), ("tcp_tls", tcp_provider)] {
+		let connection = provider.connect(target, &node_addr).await.unwrap();
+		let status = send_empty_request(&connection, MsgType::STATUS_REQ)
+			.await
+			.unwrap_or_else(|error| panic!("{name} operator status failed: {error}"));
+		assert_eq!(status.header.msg_type, MsgType::STATUS_RESP.0, "{name}");
+
+		for denied in [
+			MsgType::READ_REQ,
+			MsgType::WRITE_REQ,
+			MsgType::APPEND_ENTRIES_REQ,
+		] {
+			assert!(
+				send_empty_request(&connection, denied).await.is_err(),
+				"{name} admitted operator msg_type=0x{:02x} outside Control Ring",
+				denied.0
+			);
+		}
+	}
+
+	operator_quic_endpoint.close(0u32.into(), b"done");
+	deployment.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shared_listener_rejects_cross_domain_roles_on_both_transports() {
+	let root = fresh_dir("cross-domain-shared-ingress");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let node_addr = reserve_socket_addr();
+	let deployment = WendelonNode::bootstrap(bootstrap_cfg(
+		"cross-domain-shared-ingress-node",
+		1,
+		node_addr.clone(),
+		1,
+		&[1],
+		ClusterBootstrapConfig::Bootstrap,
+		&pki.server_cert,
+		&pki.server_key,
+		&pki.ca_cert,
+		&pki.ops_ca_cert,
+	))
+	.await
+	.unwrap();
+	let target = node(1);
+
+	for (identity, cert, key) in [
+		(
+			"operator_on_node_ca",
+			&pki.operator_on_node_ca_cert,
+			&pki.operator_on_node_ca_key,
+		),
+		(
+			"data_node_on_ops_ca",
+			&pki.data_node_on_ops_ca_cert,
+			&pki.data_node_on_ops_ca_key,
+		),
+	] {
+		let material = TlsMaterial::load(cert, key, &pki.ca_cert).unwrap();
+		let endpoint =
+			Arc::new(endpoint_from_tls(&material, "127.0.0.1:0".parse().unwrap()).unwrap());
+		let quic: Arc<dyn TransportProvider> =
+			Arc::new(QuicTransportProvider::with_cluster_domain(
+				endpoint.clone(),
+				canonical_server_name_resolver(tls_pki::CLUSTER_DOMAIN),
+				tls_pki::CLUSTER_DOMAIN,
+			));
+		let tcp: Arc<dyn TransportProvider> =
+			Arc::new(TcpTlsTransportProvider::with_cluster_domain(
+				rustls_client_config(&material).unwrap(),
+				canonical_server_name_resolver(tls_pki::CLUSTER_DOMAIN),
+				tls_pki::CLUSTER_DOMAIN,
+			));
+
+		for (transport, provider) in [("quic", quic), ("tcp_tls", tcp)] {
+			let rejected = match provider.connect(target, &node_addr).await {
+				Err(_) => true,
+				Ok(connection) => send_empty_request(&connection, MsgType::STATUS_REQ)
+					.await
+					.is_err(),
+			};
+			assert!(
+				rejected,
+				"{transport} admitted cross-domain identity {identity}"
+			);
+		}
+		endpoint.close(0u32.into(), b"done");
+	}
+
+	deployment.shutdown().await.unwrap();
 }
 
 #[tokio::test]

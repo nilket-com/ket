@@ -1,6 +1,7 @@
 # Wendelon ADR 082: Operator Admission to the Control Ring over the Shared HRFT Listener
 
-**Status:** Proposed 2026-08-09.
+**Status:** Accepted 2026-08-09. Implementation is code-complete; live acceptance remains
+pending the separately authorized ADR 0539/0541 confirmation rerun.
 **Category:** Trust-boundary correction discovered when ADR 081's operator CLI could not reach
 the control ring it was designed to drive.
 

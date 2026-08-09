@@ -4002,8 +4002,8 @@ mod tests {
 			unimplemented!("client tests never accept inbound streams")
 		}
 
-		fn remote_id(&self) -> NodeId {
-			self.remote
+		fn remote_id(&self) -> Option<NodeId> {
+			Some(self.remote)
 		}
 
 		fn actor_identity(&self) -> &ActorIdentity {

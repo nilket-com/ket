@@ -9018,6 +9018,87 @@ fn adr078_no_mod_rs_root() {
 	);
 }
 
+/// ADR 081 follow-up: the status wire pair must be present in the router, not
+/// merely defined and handled. The omitted request previously closed the stream
+/// with an `early eof` before the control handler could observe it.
+#[test]
+fn adr081_secondary_index_status_is_routed_both_directions() {
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	for required in [
+		"MsgType::SECONDARY_INDEX_STATUS_REQ",
+		"MsgType::SECONDARY_INDEX_STATUS_RESP",
+		"secondary_index_status_routes_to_control_ring",
+	] {
+		assert!(
+			router.contains(required),
+			"ADR 081 status routing control is missing {required}"
+		);
+	}
+}
+
+/// ADR 082: widening TLS trust must preserve the node/operator boundary at
+/// every later seam of the shared HRFT listener.
+#[test]
+fn adr082_shared_ingress_preserves_trust_and_routing_boundaries() {
+	let node = read_workspace("crates/wendelon/src/node.rs");
+	let server = read_workspace("crates/wendelon/src/network/server.rs");
+	let transport = read_workspace("crates/wendelon/src/network/transport.rs");
+	let router = read_workspace("crates/wendelon/src/network/router.rs");
+	let quic = read_workspace("crates/wendelon/src/network/quic_transport.rs");
+
+	for required in [
+		"ActorTrustRoots::load(",
+		"endpoint_from_tls_with_peer_roots(",
+		"rustls_server_config_with_peer_roots(",
+	] {
+		assert!(
+			node.contains(required),
+			"ADR 082 production bootstrap is missing {required}"
+		);
+	}
+	assert!(
+		server.contains("pub remote: Option<NodeId>")
+			&& transport.contains("fn remote_id(&self) -> Option<NodeId>")
+			&& quic.contains("pub fn new_inbound(")
+			&& quic.contains("remote_id: actor_identity.node_id"),
+		"ADR 082 requires optional node identity through connection and request context"
+	);
+	let server_production = server
+		.split("#[cfg(test)]")
+		.next()
+		.expect("server production source");
+	assert!(
+		!server_production.contains("NodeId { id: 0")
+			&& !server_production.contains("NodeId {\n\t\tid: 0"),
+		"ADR 082 forbids a synthetic node identity for admitted operator actors"
+	);
+	for required in [
+		"verified_peer_actor_identity_with_trust_roots_and_revocations(",
+		"verified_peer_actor_identity_from_chain_with_trust_roots_and_revocations(",
+	] {
+		assert!(
+			server.contains(required),
+			"ADR 082 trust-domain binding is missing {required}"
+		);
+	}
+	for required in [
+		"ACTOR_AUTHORIZED_CONTROL_REQUESTS",
+		"MsgType::ALL",
+		"require_authenticated_node",
+		"operator_ingress_is_control_only_and_node_ingress_keeps_attribution",
+		"ingress_census_classifies_every_named_message_and_nothing_unknown",
+	] {
+		assert!(
+			router.contains(required),
+			"ADR 082 guarded ingress census is missing {required}"
+		);
+	}
+	assert!(
+		quic.contains("verified_transport_peer_with_revocations("),
+		"ADR 082 must keep dial-side inter-node verification node-only"
+	);
+}
+
 fn snapshot_header_invents_complete_log_identity(source: &str) -> bool {
 	let compact = source
 		.chars()

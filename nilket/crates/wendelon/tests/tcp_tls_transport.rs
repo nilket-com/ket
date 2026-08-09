@@ -64,7 +64,7 @@ async fn tcp_tls_provider_dials_and_redials_streams() {
 		.connect(target, &local_addr.to_string())
 		.await
 		.unwrap();
-	assert_eq!(connection.remote_id(), target);
+	assert_eq!(connection.remote_id(), Some(target));
 	assert_eq!(connection.transport_type(), TransportTier::TcpTls);
 	assert_eq!(
 		connection.actor_identity().node_id.map(|node| node.id),

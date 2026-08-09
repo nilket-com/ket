@@ -153,6 +153,7 @@ impl HrftService for MsgRouter {
 		frame: HrftFrame,
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = frame.header.msg_type;
+		enforce_ingress(&context, MsgType(msg_type))?;
 		match msg_type {
 			x if x == MsgType::PENDING_WITNESS_REQ.0
 				|| x == MsgType::PENDING_WITNESS_RESP.0
@@ -216,6 +217,7 @@ impl HrftService for MsgRouter {
 		context: RequestContext,
 	) -> std::io::Result<()> {
 		let header = read_frame_header(&mut *stream).await?;
+		enforce_ingress(&context, MsgType(header.msg_type))?;
 		if header.msg_type == MsgType::BULK_WRITE_REQ.0
 			|| header.msg_type == MsgType::STREAM_FIN_REQ.0
 			|| header.msg_type == MsgType::QUERY_REQ.0
@@ -270,6 +272,7 @@ fn is_control_extension_request(msg_type: u8) -> bool {
 		MsgType::LOGICAL_TYPE_LIST_REQ,
 		MsgType::TABLE_DESCRIPTOR_LIST_REQ,
 		MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
+		MsgType::SECONDARY_INDEX_STATUS_REQ,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -285,9 +288,59 @@ fn is_extension_response(msg_type: u8) -> bool {
 		MsgType::LOGICAL_TYPE_LIST_RESP,
 		MsgType::TABLE_DESCRIPTOR_LIST_RESP,
 		MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP,
+		MsgType::SECONDARY_INDEX_STATUS_RESP,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IngressRequirement {
+	NodeRequired,
+	ActorAuthorizedControl,
+}
+
+/// Control requests deliberately reachable by authenticated non-node actors.
+/// Every other known HRFT message is conservatively node-required. Therefore a
+/// new opcode added to `MsgType::ALL` cannot become actor-authorized by omission.
+const ACTOR_AUTHORIZED_CONTROL_REQUESTS: &[MsgType] = &[
+	MsgType::EPOCH_ADV_REQ,
+	MsgType::STATUS_REQ,
+	MsgType::JOIN_REQ,
+	MsgType::TENANT_ADMIN_REQ,
+	MsgType::AUDIT_CHAIN_HEAD_REQ,
+	MsgType::SCHEMA_UPDATE_REQ,
+	MsgType::REVOCATION_ADMIN_REQ,
+	MsgType::SCHEMA_DROP_REQ,
+	MsgType::TABLE_DESCRIPTOR_GET_REQ,
+	MsgType::LOGICAL_TYPE_GET_REQ,
+	MsgType::LOGICAL_TYPE_LIST_REQ,
+	MsgType::TABLE_DESCRIPTOR_LIST_REQ,
+	MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
+	MsgType::SECONDARY_INDEX_STATUS_REQ,
+];
+
+fn ingress_requirement(msg_type: MsgType) -> Option<IngressRequirement> {
+	if ACTOR_AUTHORIZED_CONTROL_REQUESTS.contains(&msg_type) {
+		return Some(IngressRequirement::ActorAuthorizedControl);
+	}
+	MsgType::ALL
+		.contains(&msg_type)
+		.then_some(IngressRequirement::NodeRequired)
+}
+
+fn enforce_ingress(context: &RequestContext, msg_type: MsgType) -> std::io::Result<()> {
+	match ingress_requirement(msg_type) {
+		Some(IngressRequirement::ActorAuthorizedControl) => Ok(()),
+		Some(IngressRequirement::NodeRequired) => {
+			context.require_authenticated_node(&format!("HRFT msg_type=0x{:02x}", msg_type.0))?;
+			Ok(())
+		}
+		None => Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("unclassified HRFT msg_type=0x{:02x}", msg_type.0),
+		)),
+	}
 }
 
 // ============================================================
@@ -341,8 +394,57 @@ fn unhandled(ring: &'static str, msg_type: u8) -> Error {
 
 #[cfg(test)]
 mod tests {
-	use super::{is_control_extension_request, is_extension_response};
-	use crate::schema::MsgType;
+	use super::{
+		ACTOR_AUTHORIZED_CONTROL_REQUESTS, ControlRingServer, MsgRouterBuilder, enforce_ingress,
+		ingress_requirement, is_control_extension_request, is_extension_response,
+	};
+	use crate::network::core::{HRFT_MAGIC, HrftFrame};
+	use crate::network::server::{HrftService, RequestContext};
+	use crate::network::tls::{ActorIdentity, ActorRole};
+	use crate::schema::{FrameHeader, MsgType, NodeId};
+	use async_trait::async_trait;
+	use std::sync::Arc;
+	use std::sync::atomic::{AtomicUsize, Ordering};
+
+	fn operator_context() -> RequestContext {
+		RequestContext {
+			remote: None,
+			actor: ActorIdentity::new(
+				ActorRole::Operator,
+				None,
+				None,
+				vec!["cluster".to_owned()],
+				vec![1, 2, 3, 4],
+			)
+			.unwrap(),
+		}
+	}
+
+	fn node_context(id: u32) -> RequestContext {
+		let node = NodeId { id, _reserved: 0 };
+		RequestContext {
+			remote: Some(node),
+			actor: ActorIdentity::data_node(node),
+		}
+	}
+
+	fn frame(msg_type: MsgType) -> HrftFrame {
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: msg_type.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: 0,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: crate::network::pool::PooledBuf::orphan(Vec::new()),
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
 
 	#[test]
 	fn every_control_extension_preempts_the_raft_numeric_range() {
@@ -355,6 +457,7 @@ mod tests {
 			MsgType::LOGICAL_TYPE_LIST_REQ,
 			MsgType::TABLE_DESCRIPTOR_LIST_REQ,
 			MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
+			MsgType::SECONDARY_INDEX_STATUS_REQ,
 		] {
 			assert!(
 				is_control_extension_request(request.0),
@@ -377,8 +480,93 @@ mod tests {
 			MsgType::LOGICAL_TYPE_LIST_RESP,
 			MsgType::TABLE_DESCRIPTOR_LIST_RESP,
 			MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP,
+			MsgType::SECONDARY_INDEX_STATUS_RESP,
 		] {
 			assert!(is_extension_response(response.0), "0x{:02x}", response.0);
 		}
+	}
+
+	#[test]
+	fn ingress_census_classifies_every_named_message_and_nothing_unknown() {
+		for msg_type in MsgType::ALL {
+			assert!(
+				ingress_requirement(*msg_type).is_some(),
+				"0x{:02x}",
+				msg_type.0
+			);
+		}
+		assert!(ingress_requirement(MsgType(0xFF)).is_none());
+		for request in ACTOR_AUTHORIZED_CONTROL_REQUESTS {
+			assert!(
+				(0x10..=0x1F).contains(&request.0) || is_control_extension_request(request.0),
+				"actor-authorized request 0x{:02x} must route to Control Ring",
+				request.0
+			);
+		}
+	}
+
+	#[test]
+	fn operator_ingress_is_control_only_and_node_ingress_keeps_attribution() {
+		let operator = operator_context();
+		for msg_type in MsgType::ALL {
+			assert_eq!(
+				enforce_ingress(&operator, *msg_type).is_ok(),
+				ACTOR_AUTHORIZED_CONTROL_REQUESTS.contains(msg_type),
+				"operator ingress classification drifted for 0x{:02x}",
+				msg_type.0
+			);
+		}
+		for denied in [
+			MsgType::WRITE_REQ,
+			MsgType::READ_REQ,
+			MsgType::QUERY_REQ,
+			MsgType::APPEND_ENTRIES_REQ,
+		] {
+			let error = enforce_ingress(&operator, denied).unwrap_err();
+			assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+			assert!(error.to_string().contains("authenticated data node"));
+		}
+		for allowed in [
+			MsgType::STATUS_REQ,
+			MsgType::TABLE_DESCRIPTOR_GET_REQ,
+			MsgType::SCHEMA_UPDATE_REQ,
+			MsgType::SECONDARY_INDEX_STATUS_REQ,
+		] {
+			enforce_ingress(&operator, allowed).unwrap();
+		}
+
+		let node = node_context(7);
+		assert_eq!(node.require_authenticated_node("control").unwrap().id, 7);
+		enforce_ingress(&node, MsgType::APPEND_ENTRIES_REQ).unwrap();
+	}
+
+	struct CountingControl(AtomicUsize);
+
+	#[async_trait]
+	impl ControlRingServer for CountingControl {
+		async fn handle_control_frame(
+			&self,
+			_context: RequestContext,
+			_frame: HrftFrame,
+		) -> std::io::Result<Option<HrftFrame>> {
+			self.0.fetch_add(1, Ordering::Relaxed);
+			Ok(None)
+		}
+	}
+
+	#[tokio::test]
+	async fn secondary_index_status_routes_to_control_ring() {
+		let control = Arc::new(CountingControl(AtomicUsize::new(0)));
+		let router = MsgRouterBuilder::default()
+			.with_control_ring(control.clone())
+			.build();
+		router
+			.handle_frame(
+				operator_context(),
+				frame(MsgType::SECONDARY_INDEX_STATUS_REQ),
+			)
+			.await
+			.unwrap();
+		assert_eq!(control.0.load(Ordering::Relaxed), 1);
 	}
 }

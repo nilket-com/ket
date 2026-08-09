@@ -3971,16 +3971,18 @@ impl ControlRingServer for WendelonControlServer {
 			}
 			MsgType::LEASE_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::Lease)?;
-				self.handle_lease(context.remote, frame).await?
+				let remote = context.require_authenticated_node("LEASE_REQ")?;
+				self.handle_lease(remote, frame).await?
 			}
 			MsgType::LEASE_RELEASE_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::LeaseRelease)?;
-				self.handle_release(context.remote, frame).await?
+				let remote = context.require_authenticated_node("LEASE_RELEASE_REQ")?;
+				self.handle_release(remote, frame).await?
 			}
 			MsgType::TRANSFER_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::Transfer)?;
-				self.handle_transfer(&context, context.remote, frame)
-					.await?
+				let remote = context.require_authenticated_node("TRANSFER_REQ")?;
+				self.handle_transfer(&context, remote, frame).await?
 			}
 			MsgType::EPOCH_ADV_REQ => {
 				self.authorize_control_operation(&context, ControlOperation::AdvanceEpoch)?;
