@@ -165,6 +165,8 @@ pub fn main_screen<'a>(
 	status_detail: Option<(&'a str, &'a text_editor::Content)>,
 	status_detail_open: bool,
 	local_workspace_offer: Option<&'a std::path::Path>,
+	saved_session: bool,
+	close_without_checkpoint: bool,
 ) -> Element<'a, Message> {
 	// Baryon's workspace is the sole top-level layout owner. The nested
 	// dashboard still owns its own pixel-space grid inside its host panel.
@@ -209,7 +211,12 @@ pub fn main_screen<'a>(
 	} else {
 		status_bar
 	};
-	let main_window = window_decorations(column![main_content, status_bar], menu_state);
+	let main_window = window_decorations(
+		column![main_content, status_bar],
+		menu_state,
+		saved_session,
+		close_without_checkpoint,
+	);
 	let adapter_modal = adapter_view(adapter_state);
 	let settings_modal: Element<Message> = if showing_settings {
 		settings_dialog_view(show_column_types)
@@ -389,16 +396,23 @@ fn app_status_bar(
 	bar
 }
 
-pub fn menu_bar<'a>(menu_state: &'a MenuState) -> Element<'a, Message> {
+pub fn menu_bar<'a>(
+	menu_state: &'a MenuState,
+	saved_session: bool,
+	close_without_checkpoint: bool,
+) -> Element<'a, Message> {
 	Element::from(
-		MenuBar::new(build_menu_roots(), menu_state)
-			.font_policy(MenuFontPolicy::SystemWithFallback),
+		MenuBar::new(
+			build_menu_roots(saved_session, close_without_checkpoint),
+			menu_state,
+		)
+		.font_policy(MenuFontPolicy::SystemWithFallback),
 	)
 	.map(Message::Menu)
 }
 
-fn build_menu_roots() -> Vec<MenuRoot> {
-	vec![
+fn build_menu_roots(saved_session: bool, close_without_checkpoint: bool) -> Vec<MenuRoot> {
+	let mut roots = vec![
 		MenuRoot {
 			id: "connect".into(),
 			label: "Connect".into(),
@@ -461,7 +475,31 @@ fn build_menu_roots() -> Vec<MenuRoot> {
 				label: "Preferences".into(),
 			}],
 		},
-	]
+	];
+	if saved_session {
+		let mut items = vec![
+			MenuItem::Action {
+				id: "session:checkpoint".into(),
+				label: "Checkpoint".into(),
+			},
+			MenuItem::Action {
+				id: "session:copy-id".into(),
+				label: "Copy session ID".into(),
+			},
+		];
+		if close_without_checkpoint {
+			items.push(MenuItem::Action {
+				id: "session:close-without-checkpoint".into(),
+				label: "Close without checkpoint".into(),
+			});
+		}
+		roots.push(MenuRoot {
+			id: "session".into(),
+			label: "Session".into(),
+			items,
+		});
+	}
+	roots
 }
 
 fn section<'a>(title: &'a str, content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
@@ -495,6 +533,8 @@ fn field<'a>(label: &'a str, widget: impl Into<Element<'a, Message>>) -> Element
 fn window_decorations<'a>(
 	underlay: impl Into<Element<'a, Message>>,
 	menu_state: &'a MenuState,
+	saved_session: bool,
+	close_without_checkpoint: bool,
 ) -> Element<'a, Message> {
 	let resize_thin = 6;
 	let resize_thick = 60;
@@ -534,7 +574,11 @@ fn window_decorations<'a>(
 				row![title_bar()],
 				stack![
 					column![space::vertical().height(32), underlay.into(),],
-					row![menu_bar(menu_state)],
+					row![menu_bar(
+						menu_state,
+						saved_session,
+						close_without_checkpoint
+					)],
 				],
 				row![
 					resize_area_southwest_bottom,
@@ -597,6 +641,37 @@ pub fn styled_text_input<'a, Message: Clone + 'a>(
 				selection: colors::SELECTION,
 			},
 		})
+}
+
+#[cfg(test)]
+mod tests {
+	use super::build_menu_roots;
+	use crate::gui::menu::MenuItem;
+
+	fn action_ids(saved_session: bool, close_without_checkpoint: bool) -> Vec<String> {
+		build_menu_roots(saved_session, close_without_checkpoint)
+			.into_iter()
+			.flat_map(|root| root.items)
+			.filter_map(|item| match item {
+				MenuItem::Action { id, .. } => Some(id),
+				MenuItem::Submenu { .. } | MenuItem::Separator => None,
+			})
+			.collect()
+	}
+
+	#[test]
+	fn product_0063_session_menu_exists_only_for_saved_authority() {
+		let ephemeral = action_ids(false, false);
+		assert!(!ephemeral.iter().any(|id| id.starts_with("session:")));
+
+		let saved = action_ids(true, false);
+		assert!(saved.contains(&"session:checkpoint".to_owned()));
+		assert!(saved.contains(&"session:copy-id".to_owned()));
+		assert!(!saved.contains(&"session:close-without-checkpoint".to_owned()));
+
+		let failed_close = action_ids(true, true);
+		assert!(failed_close.contains(&"session:close-without-checkpoint".to_owned()));
+	}
 }
 
 fn styled_resize_area<'a, WT: Into<Length>, HT: Into<Length>>(

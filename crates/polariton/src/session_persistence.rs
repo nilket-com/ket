@@ -3,11 +3,6 @@
 //! This module is deliberately a schema boundary. Runtime plotting and editor
 //! types do not implement `Serialize`; conversion is explicit so placement,
 //! renderer vocabulary, and process-local identities cannot enter by accident.
-#![allow(
-	dead_code,
-	reason = "PRODUCT-0062 is the persistence substrate consumed by the PRODUCT-0063 launch surface"
-)]
-
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	AllocationSpaceSnapshot, ColorAssignmentSnapshot, ColorIdentity, ColorIdentitySnapshot,

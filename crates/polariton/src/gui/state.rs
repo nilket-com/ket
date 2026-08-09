@@ -54,7 +54,9 @@ use crate::rune_relation_envelope::{
 	transform as transform_rune_view,
 };
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
-use libaryon::core::BufferId;
+use libaryon::core::{BufferId, SessionId};
+#[cfg(feature = "toron")]
+use libaryon::core::{SavedSession, SessionStore, Writable};
 use libaryon::uast::projection::MarkdownCellOutputTarget;
 use polars::frame::DataFrame;
 use std::collections::{HashMap, VecDeque};
@@ -97,6 +99,15 @@ struct AppState {
 	#[cfg(feature = "toron")]
 	closing_local_workspace: bool,
 	pending_runs: VecDeque<PendingRun>,
+	session_id: Option<SessionId>,
+	saved_close_state: SavedCloseState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SavedCloseState {
+	Open,
+	Failed,
+	Frozen,
 }
 
 struct StatusDetail {
@@ -148,7 +159,54 @@ enum PreparedRuneCategoricalPalette {
 	Failed(String),
 }
 
-pub type Result = iced::Result;
+pub type Result = std::result::Result<(), Box<dyn std::error::Error>>;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum StartupTarget {
+	Ephemeral { initial_file: Option<String> },
+	CreateSaved,
+	OpenSaved(SessionId),
+}
+
+enum StartupAuthority {
+	Ephemeral {
+		initial_file: Option<String>,
+	},
+	#[cfg(feature = "toron")]
+	Saved {
+		session_id: SessionId,
+		saved: SavedSession<Writable>,
+	},
+}
+
+fn resolve_startup(target: StartupTarget) -> std::result::Result<StartupAuthority, String> {
+	match target {
+		StartupTarget::Ephemeral { initial_file } => {
+			Ok(StartupAuthority::Ephemeral { initial_file })
+		}
+		#[cfg(feature = "toron")]
+		StartupTarget::CreateSaved => {
+			let saved = SessionStore::platform_default()
+				.map_err(|error| format!("cannot locate the saved-session store: {error}"))?
+				.create()
+				.map_err(|error| format!("cannot create a saved session: {error}"))?;
+			let session_id = saved.snapshot().session_id();
+			Ok(StartupAuthority::Saved { session_id, saved })
+		}
+		#[cfg(feature = "toron")]
+		StartupTarget::OpenSaved(session_id) => {
+			let saved = SessionStore::platform_default()
+				.map_err(|error| format!("cannot locate saved session {session_id}: {error}"))?
+				.open_writable(session_id)
+				.map_err(|error| format!("cannot open saved session {session_id}: {error}"))?;
+			Ok(StartupAuthority::Saved { session_id, saved })
+		}
+		#[cfg(not(feature = "toron"))]
+		StartupTarget::CreateSaved | StartupTarget::OpenSaved(_) => {
+			Err("saved sessions require Polariton's `toron` feature".to_owned())
+		}
+	}
+}
 
 fn build_plot_task(
 	df: DataFrame,
@@ -369,13 +427,24 @@ fn run_dashboard_message(app_state: &mut AppState, message: DashboardMsg) -> Tas
 	}
 }
 
-pub fn run(startup_data: StartupData, initial_file: Option<String>) -> Result {
+pub fn run(startup_data: StartupData, target: StartupTarget) -> Result {
 	let size = Size::new(startup_data.window_size.0, startup_data.window_size.1);
-	let initialize = move || new(startup_data.clone(), initial_file.clone());
+	let authority = resolve_startup(target)
+		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+	let initial = new_with_authority(startup_data, authority)
+		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+	let initial = std::sync::Mutex::new(Some(initial));
+	let initialize = move || {
+		initial
+			.lock()
+			.expect("Polariton boot state lock poisoned")
+			.take()
+			.expect("Polariton boot state may be consumed exactly once")
+	};
 	application(initialize, update, view)
 		.subscription(subscription)
 		.theme(components::theme())
-		.title("Polariton")
+		.title(application_title)
 		// Canvas geometry (plot marks, gridlines, legend swatches) is
 		// tessellated triangles; without MSAA every curved edge is aliased
 		// hard enough to read as rasterization. Text is unaffected either way.
@@ -391,10 +460,20 @@ pub fn run(startup_data: StartupData, initial_file: Option<String>) -> Result {
 			transparent: false,
 			..Default::default()
 		})
-		.run()
+		.run()?;
+	Ok(())
 }
 
+#[cfg(test)]
 fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Task<Message>) {
+	new_with_authority(startup_data, StartupAuthority::Ephemeral { initial_file })
+		.expect("ephemeral startup cannot refuse")
+}
+
+fn new_with_authority(
+	startup_data: StartupData,
+	authority: StartupAuthority,
+) -> std::result::Result<(AppState, Task<Message>), String> {
 	let window_size = Size::new(startup_data.window_size.0, startup_data.window_size.1);
 	let init_error = startup_data.init_error.clone();
 	let init_summary = init_error
@@ -405,9 +484,22 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 	let data_frame = DataFrame::default();
 	let init_script = configuration::default_init_path();
 	let workspace_size = workspace_bounds(window_size).size();
-	let mut code_editor = match initial_file {
-		Some(path) => CodeEditor::open_initial_file_with_init(path, init_script, workspace_size),
-		None => CodeEditor::new_with_init("", init_script, workspace_size),
+	let (mut code_editor, session_id) = match authority {
+		StartupAuthority::Ephemeral { initial_file } => (
+			match initial_file {
+				Some(path) => {
+					CodeEditor::open_initial_file_with_init(path, init_script, workspace_size)
+				}
+				None => CodeEditor::new_with_init("", init_script, workspace_size),
+			},
+			None,
+		),
+		#[cfg(feature = "toron")]
+		StartupAuthority::Saved { session_id, saved } => (
+			CodeEditor::open_saved_with_init(saved, init_script, workspace_size)
+				.map_err(|error| format!("cannot restore saved session {session_id}: {error}"))?,
+			Some(session_id),
+		),
 	};
 	code_editor.set_show_column_types(startup_data.show_column_types);
 	let mut state = AppState {
@@ -441,6 +533,8 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 		#[cfg(feature = "toron")]
 		closing_local_workspace: false,
 		pending_runs: VecDeque::new(),
+		session_id,
+		saved_close_state: SavedCloseState::Open,
 	};
 	sync_workspace_viewport(&mut state);
 	// Eagerly open the session scratch database so SQL always has a target;
@@ -452,11 +546,11 @@ fn new(startup_data: StartupData, initial_file: Option<String>) -> (AppState, Ta
 			nilket_local::discover(None),
 			Message::LocalWorkspaceDiscovered,
 		);
-		(state, Task::batch([scratch, discovery]))
+		Ok((state, Task::batch([scratch, discovery])))
 	}
 	#[cfg(not(feature = "toron"))]
 	{
-		(state, scratch)
+		Ok((state, scratch))
 	}
 }
 
@@ -487,7 +581,20 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		app_state.local_creation.offer(),
 		#[cfg(not(feature = "toron"))]
 		None,
+		app_state.session_id.is_some(),
+		app_state.saved_close_state == SavedCloseState::Failed,
 	)
+}
+
+fn application_title(app_state: &AppState) -> String {
+	app_state.session_id.map_or_else(
+		|| "Polariton".to_owned(),
+		|session_id| format!("Polariton — session {}", session_identity_text(session_id)),
+	)
+}
+
+fn session_identity_text(session_id: SessionId) -> String {
+	session_id.to_string()
 }
 
 fn compact_sql_diagnostic(message: &str, source_start_line: Option<usize>) -> (String, String) {
@@ -1766,7 +1873,42 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 	)
 }
 
+fn begin_window_shutdown(_app_state: &mut AppState) -> Task<Message> {
+	#[cfg(feature = "toron")]
+	{
+		if _app_state.closing_local_workspace {
+			return Task::none();
+		}
+		if let Some(owner) = _app_state.local_workspace_owner.take() {
+			_app_state.closing_local_workspace = true;
+			_app_state.status_error.clear();
+			_app_state.status_msg =
+				"Stopping the local workspace: draining Toron before Wendelon…".into();
+			return Task::perform(
+				async move {
+					tokio::task::spawn_blocking(move || {
+						owner.stop(crate::local_workspace::STOP_DEADLINE)
+					})
+					.await
+					.map_or_else(
+						|error| format!("local workspace stop task failed: {error}"),
+						|outcome| format!("{outcome:?}"),
+					)
+				},
+				Message::LocalWorkspaceStopped,
+			);
+		}
+	}
+	window::latest().and_then(window::close)
+}
+
 fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
+	#[cfg(feature = "toron")]
+	if app_state.saved_close_state == SavedCloseState::Frozen
+		&& !matches!(&message, Message::LocalWorkspaceStopped(_))
+	{
+		return Task::none();
+	}
 	match message {
 		Message::Dashboard(message) => {
 			return run_dashboard_message(app_state, message);
@@ -1798,6 +1940,43 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::CloseStatusDetail => {
 			app_state.status_detail_open = false;
 		}
+		Message::CheckpointSession => {
+			#[cfg(feature = "toron")]
+			{
+				if app_state.session_id.is_none() {
+					app_state.status_error = "This editor is not a saved session.".to_owned();
+					return Task::none();
+				}
+				let colours = crate::session_persistence::RuntimeColours::new(
+					app_state.rune_categorical_identities.clone(),
+				);
+				match app_state.code_editor.checkpoint_session(&colours) {
+					Ok(()) => {
+						app_state.saved_close_state = SavedCloseState::Open;
+						app_state.status_error.clear();
+						app_state.status_msg = "Session checkpointed".to_owned();
+					}
+					Err(error) => {
+						app_state.status_msg.clear();
+						app_state.status_error = format!("Session checkpoint failed: {error}");
+					}
+				}
+			}
+		}
+		Message::CopySessionId => {
+			if let Some(session_id) = app_state.session_id {
+				return iced::clipboard::write(session_identity_text(session_id));
+			}
+		}
+		Message::CloseWithoutCheckpoint => {
+			if app_state.session_id.is_some()
+				&& app_state.saved_close_state == SavedCloseState::Failed
+			{
+				app_state.saved_close_state = SavedCloseState::Frozen;
+				app_state.pending_runs.clear();
+				return begin_window_shutdown(app_state);
+			}
+		}
 		Message::CopyStatusDetail => {
 			if let Some(detail) = app_state.status_detail.as_ref() {
 				return iced::clipboard::write(detail.full.clone());
@@ -1816,27 +1995,32 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				if app_state.closing_local_workspace {
 					return Task::none();
 				}
-				if let Some(owner) = app_state.local_workspace_owner.take() {
-					app_state.closing_local_workspace = true;
-					app_state.status_error.clear();
-					app_state.status_msg =
-						"Stopping the local workspace: draining Toron before Wendelon…".into();
-					return Task::perform(
-						async move {
-							tokio::task::spawn_blocking(move || {
-								owner.stop(crate::local_workspace::STOP_DEADLINE)
-							})
-							.await
-							.map_or_else(
-								|error| format!("local workspace stop task failed: {error}"),
-								|outcome| format!("{outcome:?}"),
-							)
-						},
-						Message::LocalWorkspaceStopped,
+				if app_state.session_id.is_some() {
+					let colours = crate::session_persistence::RuntimeColours::new(
+						app_state.rune_categorical_identities.clone(),
 					);
+					match app_state.code_editor.checkpoint_session(&colours) {
+						Ok(()) => {
+							app_state.saved_close_state = SavedCloseState::Frozen;
+							app_state.pending_runs.clear();
+							return begin_window_shutdown(app_state);
+						}
+						Err(error) => {
+							app_state.saved_close_state = SavedCloseState::Failed;
+							app_state.status_msg.clear();
+							app_state.status_error = if error.is_stale() {
+								format!(
+									"Session close checkpoint failed because the workspace changed before the FIFO head; close again to retry: {error}"
+								)
+							} else {
+								format!("Session close checkpoint failed: {error}")
+							};
+							return Task::none();
+						}
+					}
 				}
 			}
-			return window::latest().and_then(window::close);
+			return begin_window_shutdown(app_state);
 		}
 		Message::Menu(menu_message) => {
 			if let Some(action) = app_state.menu_state.update(menu_message)
@@ -2082,6 +2266,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		#[cfg(feature = "toron")]
 		Message::LocalWorkspaceStopped(outcome) => {
+			if !app_state.closing_local_workspace {
+				return Task::none();
+			}
 			app_state.status_msg = format!("Local workspace stopped ({outcome}).");
 			return window::latest().and_then(window::close);
 		}
@@ -2804,6 +2991,9 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 		"code:run" => Some(Message::Run),
 		"code:run-snippet" => Some(Message::RunSnippet),
 		"settings:preferences" => Some(Message::OpenSettings),
+		"session:checkpoint" => Some(Message::CheckpointSession),
+		"session:copy-id" => Some(Message::CopySessionId),
+		"session:close-without-checkpoint" => Some(Message::CloseWithoutCheckpoint),
 		_ => {
 			if let Some(kind) = action.strip_prefix("plot:new:") {
 				return parse_plot_type(kind)
@@ -2941,12 +3131,16 @@ fn get_node_rects(
 mod tests {
 	#[cfg(feature = "toron")]
 	use super::{AdapterState, view};
-	use super::{
-		clear_transient_execution_status_on_editor_activity, compact_rune_diagnostic,
-		compact_sql_diagnostic, new, set_rune_error, set_sql_error, update,
-	};
 	#[cfg(feature = "toron")]
-	use super::{dispatch_rune_relation, resolve_rune_table_skin_with, rune_view_outcome};
+	use super::{
+		SavedCloseState, StartupAuthority, dispatch_rune_relation, new_with_authority,
+		resolve_rune_table_skin_with, rune_view_outcome,
+	};
+	use super::{
+		application_title, clear_transient_execution_status_on_editor_activity,
+		compact_rune_diagnostic, compact_sql_diagnostic, new, resolve_startup,
+		session_identity_text, set_rune_error, set_sql_error, update,
+	};
 	use crate::adapters::common::ExecutionResult;
 	#[cfg(feature = "toron")]
 	use crate::adapters::common::{
@@ -2990,6 +3184,614 @@ mod tests {
 	#[cfg(feature = "toron")]
 	fn render_marks(kernel: &dyn PlotKernel) -> String {
 		render_marks_with_settings(kernel, ResolvedPlotSettings::default())
+	}
+
+	#[test]
+	fn product_0063_window_title_names_only_saved_sessions() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		assert_eq!(application_title(&state), "Polariton");
+		let id = "1234567890abcdef1234567890abcdef".parse().unwrap();
+		state.session_id = Some(id);
+		assert_eq!(
+			application_title(&state),
+			"Polariton — session 1234567890abcdef1234567890abcdef"
+		);
+		let copied = session_identity_text(id);
+		assert_eq!(copied.as_bytes().len(), 32);
+		assert_eq!(copied, "1234567890abcdef1234567890abcdef");
+		assert_eq!(
+			copied.parse(),
+			Ok(id),
+			"copied identity selects the same session"
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(not(feature = "toron"))]
+	#[test]
+	fn product_0063_no_toron_build_refuses_saved_authority_explicitly() {
+		let Err(error) = resolve_startup(super::StartupTarget::CreateSaved) else {
+			panic!("a no-toron build must refuse saved authority")
+		};
+		assert_eq!(error, "saved sessions require Polariton's `toron` feature");
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0063_saved_startup_checkpoint_close_and_reopen_use_production_authority() {
+		const CHILD: &str = "POLARITON_PRODUCT_0063_SURFACE_CHILD";
+		if std::env::var_os(CHILD).is_none() {
+			let state_home = std::env::temp_dir().join(format!(
+				"polariton-product-0063-{}-{}",
+				std::process::id(),
+				std::time::SystemTime::now()
+					.duration_since(std::time::UNIX_EPOCH)
+					.unwrap()
+					.as_nanos()
+			));
+			let status = std::process::Command::new(std::env::current_exe().unwrap())
+				.args([
+					"--exact",
+					"gui::state::tests::product_0063_saved_startup_checkpoint_close_and_reopen_use_production_authority",
+					"--nocapture",
+				])
+				.env(CHILD, "1")
+				.env("XDG_STATE_HOME", &state_home)
+				.status()
+				.expect("spawn isolated session-surface fixture");
+			let _ = std::fs::remove_dir_all(&state_home);
+			assert!(status.success(), "isolated session-surface fixture failed");
+			return;
+		}
+
+		let authority = resolve_startup(super::StartupTarget::CreateSaved).unwrap();
+		let session_id = match &authority {
+			StartupAuthority::Saved { session_id, .. } => *session_id,
+			StartupAuthority::Ephemeral { .. } => panic!("create must resolve saved authority"),
+		};
+		let (mut state, startup) = new_with_authority(StartupData::default(), authority).unwrap();
+		drop(startup);
+		assert_eq!(state.session_id, Some(session_id));
+		assert_eq!(
+			application_title(&state),
+			format!("Polariton — session {session_id}")
+		);
+
+		let contention = resolve_startup(super::StartupTarget::OpenSaved(session_id));
+		let Err(contention) = contention else {
+			panic!("the production resolver must not switch authority on contention")
+		};
+		assert!(contention.contains(&session_id.to_string()));
+		assert!(contention.contains("already open incompatibly"));
+		let ordinary = resolve_startup(super::StartupTarget::Ephemeral { initial_file: None })
+			.expect("saved sessions in the store never change default authority");
+		assert!(matches!(
+			ordinary,
+			StartupAuthority::Ephemeral { initial_file: None }
+		));
+
+		drop(update(&mut state, Message::CheckpointSession));
+		assert_eq!(state.saved_close_state, SavedCloseState::Open);
+		assert!(state.status_error.contains("viewport is not ready"));
+		assert_eq!(
+			update(&mut state, Message::CloseWithoutCheckpoint).units(),
+			0,
+			"a failed manual checkpoint never arms destructive close"
+		);
+
+		let first_close = update(&mut state, Message::CloseWindow);
+		assert_eq!(
+			first_close.units(),
+			0,
+			"unready checkpoint keeps the window open"
+		);
+		assert_eq!(state.saved_close_state, SavedCloseState::Failed);
+		assert!(state.status_error.contains("viewport is not ready"));
+
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while state.status_msg != "Session checkpointed" && std::time::Instant::now() < deadline {
+			state.code_editor.poll();
+			drop(update(&mut state, Message::CheckpointSession));
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert_eq!(state.status_msg, "Session checkpointed");
+		assert_eq!(state.saved_close_state, SavedCloseState::Open);
+		drop(update(
+			&mut state,
+			Message::CodeEditEvent(crate::editor::EditorMsg::EngineReady),
+		));
+		assert!(state.rune_categorical_identities.is_empty());
+		let producer = state.code_editor.active_buffer_id().unwrap();
+		let stale_view = LocalViewIdentity::Named("stale-witness".to_owned());
+		let companion_view = LocalViewIdentity::Named("companion-table".to_owned());
+		state.code_editor.prepare_rune_view_panels(
+			producer,
+			&[
+				(stale_view.clone(), RuneViewForm::Bar),
+				(companion_view.clone(), RuneViewForm::Table),
+			],
+			1,
+		);
+		let durable_panel = state
+			.code_editor
+			.rune_view_panel_id(producer, &stale_view)
+			.unwrap();
+		let companion_panel = state
+			.code_editor
+			.rune_view_panel_id(producer, &companion_view)
+			.unwrap();
+		use crate::plot::spec::{
+			AllocationSpaceSnapshot, ColorAssignmentSnapshot, ColorIdentity, ColorIdentitySnapshot,
+			ColorSpaceSnapshot, LayerIdentity,
+		};
+		let authored_colour = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
+			assignments: vec![ColorAssignmentSnapshot {
+				field: "product".to_owned(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::HorizontalBar,
+				},
+				category: "Atlas".to_owned(),
+				position: 2,
+			}],
+			spaces: vec![ColorSpaceSnapshot {
+				field: "product".to_owned(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::HorizontalBar,
+				},
+				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
+			}],
+		})
+		.unwrap();
+		state
+			.rune_categorical_identities
+			.insert((producer, stale_view.clone(), 4), authored_colour);
+		let stale_close = update(&mut state, Message::CloseWindow);
+		assert_eq!(stale_close.units(), 0);
+		assert_eq!(state.saved_close_state, SavedCloseState::Failed);
+		assert!(state.status_error.contains("close again to retry"));
+		assert!(state.status_error.contains("stale application snapshot"));
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while (state
+			.code_editor
+			.rune_view_panel_layout_signature(producer, &stale_view)
+			.is_none()
+			|| state
+				.code_editor
+				.rune_view_panel_layout_signature(producer, &companion_view)
+				.is_none())
+			&& std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_layout_signature(producer, &stale_view)
+				.is_some(),
+			"next projected census contains the new panel before deliberate retry"
+		);
+		let durable_layout = state
+			.code_editor
+			.rune_view_panel_persistence_signature(producer, &stale_view)
+			.unwrap();
+		let companion_layout = state
+			.code_editor
+			.rune_view_panel_persistence_signature(producer, &companion_view)
+			.unwrap();
+		assert_eq!(
+			durable_layout.0, companion_layout.0,
+			"one Rune producer owns one durable panel group"
+		);
+
+		use libaryon::engine::{InputEvent, KeyCode, Modifiers};
+		for key in ":pv rune".chars() {
+			drop(update(
+				&mut state,
+				Message::CodeEditEvent(crate::editor::EditorMsg::Input(InputEvent::Key {
+					code: KeyCode::Char(key),
+					modifiers: Modifiers::NONE,
+				})),
+			));
+		}
+		drop(update(
+			&mut state,
+			Message::CodeEditEvent(crate::editor::EditorMsg::Input(InputEvent::Key {
+				code: KeyCode::Enter,
+				modifiers: Modifiers::NONE,
+			})),
+		));
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while state
+			.code_editor
+			.active_language_id()
+			.is_none_or(|language| language.as_str() != "rune")
+			&& std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert_eq!(
+			state.code_editor.active_language_id().map(|id| id.as_str()),
+			Some("rune")
+		);
+		const DIRTY_CLOSE_BYTES: &str = "// dirty close checkpoint";
+		for key in std::iter::once('i').chain(DIRTY_CLOSE_BYTES.chars()) {
+			drop(update(
+				&mut state,
+				Message::CodeEditEvent(crate::editor::EditorMsg::Input(InputEvent::Key {
+					code: KeyCode::Char(key),
+					modifiers: Modifiers::NONE,
+				})),
+			));
+		}
+		drop(update(
+			&mut state,
+			Message::CodeEditEvent(crate::editor::EditorMsg::Input(InputEvent::Key {
+				code: KeyCode::Esc,
+				modifiers: Modifiers::NONE,
+			})),
+		));
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while !state
+			.code_editor
+			.cached_content()
+			.contains(DIRTY_CLOSE_BYTES)
+			&& std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert!(
+			state
+				.code_editor
+				.cached_content()
+				.contains(DIRTY_CLOSE_BYTES)
+		);
+		drop(update(&mut state, Message::Run));
+		assert_eq!(state.pending_runs.len(), 1, "run waits on its snapshot");
+
+		let owner = crate::local_workspace::LocalWorkspaceOwner::launch_command(
+			std::process::Command::new("/bin/true"),
+			nix::sys::signal::Signal::SIGINT,
+		);
+		state.local_workspace_owner = Some(owner);
+		let close = update(&mut state, Message::CloseWindow);
+		assert_eq!(close.units(), 1, "saved close emits one bounded drain task");
+		assert_eq!(state.saved_close_state, SavedCloseState::Frozen);
+		assert!(state.closing_local_workspace);
+		assert!(
+			state.pending_runs.is_empty(),
+			"undispatched run is abandoned"
+		);
+		let status = state.status_msg.clone();
+		assert_eq!(update(&mut state, Message::Run).units(), 0);
+		assert_eq!(
+			update(
+				&mut state,
+				Message::RunResult {
+					result: ExecutionResult::Err("late completion".to_owned()),
+					publish: None,
+				},
+			)
+			.units(),
+			0
+		);
+		assert_eq!(update(&mut state, Message::ScratchReady(None)).units(), 0);
+		assert_eq!(
+			state.status_msg, status,
+			"run initiation and asynchronous completions are discarded"
+		);
+		assert!(state.status_error.is_empty());
+		let finish = update(
+			&mut state,
+			Message::LocalWorkspaceStopped("Stopped".to_owned()),
+		);
+		assert_eq!(
+			finish.units(),
+			1,
+			"drain completion alone closes the window"
+		);
+		assert!(state.status_msg.contains("Local workspace stopped"));
+		drop(finish);
+		drop(close);
+		state.code_editor.shutdown();
+		drop(state);
+
+		let reopened = resolve_startup(super::StartupTarget::OpenSaved(session_id)).unwrap();
+		let (mut state, startup) = new_with_authority(StartupData::default(), reopened).unwrap();
+		drop(startup);
+		assert_eq!(state.session_id, Some(session_id));
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while (state
+			.code_editor
+			.rune_view_producer_for_panel(durable_panel, &stale_view)
+			.is_none()
+			|| state
+				.code_editor
+				.rune_view_producer_for_panel(companion_panel, &companion_view)
+				.is_none()
+			|| state.rune_categorical_identities.is_empty())
+			&& std::time::Instant::now() < deadline
+		{
+			drop(update(
+				&mut state,
+				Message::CodeEditEvent(crate::editor::EditorMsg::EngineReady),
+			));
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		let reopened_producer = state
+			.code_editor
+			.rune_view_producer_for_panel(durable_panel, &stale_view)
+			.expect("restored panel meaning identifies its producer");
+		assert!(
+			state
+				.code_editor
+				.cached_content()
+				.contains(DIRTY_CLOSE_BYTES),
+			"successful close persists the dirty focused scratch before teardown"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_producer_for_panel(companion_panel, &companion_view),
+			Some(reopened_producer),
+			"both restored named panels join to the same durable producer"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_id(reopened_producer, &stale_view),
+			Some(durable_panel),
+			"production reopen installs the exact durable named-panel meaning"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(reopened_producer, &stale_view),
+			Some("fresh"),
+			"startup restores placement and meaning without executing Rune"
+		);
+		assert!(
+			!state
+				.code_editor
+				.rune_view_panel_is_plot(reopened_producer, &stale_view)
+				&& !state
+					.code_editor
+					.rune_view_panel_is_table(reopened_producer, &stale_view),
+			"fresh is the registry spelling for an unresolved restored placeholder"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_id(reopened_producer, &companion_view),
+			Some(companion_panel)
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(reopened_producer, &companion_view),
+			Some("fresh")
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_persistence_signature(reopened_producer, &stale_view),
+			Some(durable_layout),
+			"the named plot returns to its exact group and logical placement"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_persistence_signature(reopened_producer, &companion_view),
+			Some(companion_layout),
+			"the named table returns to its exact group and logical placement"
+		);
+		let canonical_colour = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
+			assignments: vec![ColorAssignmentSnapshot {
+				field: "product".to_owned(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::Bar,
+				},
+				category: "Atlas".to_owned(),
+				position: 2,
+			}],
+			spaces: vec![ColorSpaceSnapshot {
+				field: "product".to_owned(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::Bar,
+				},
+				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
+			}],
+		})
+		.unwrap();
+		assert_eq!(
+			state
+				.rune_categorical_identities
+				.get(&(reopened_producer, stale_view.clone(), 4)),
+			Some(&canonical_colour),
+			"orientation changes geometry, never durable colour identity; restored keys: {:?}",
+			state.rune_categorical_identities.keys().collect::<Vec<_>>()
+		);
+		state.code_editor.prepare_rune_view_panels(
+			reopened_producer,
+			&[
+				(stale_view.clone(), RuneViewForm::Bar),
+				(companion_view.clone(), RuneViewForm::Table),
+			],
+			2,
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_id(reopened_producer, &stale_view),
+			Some(durable_panel),
+			"explicit rerun resolves in the restored panel"
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_id(reopened_producer, &companion_view),
+			Some(companion_panel),
+			"both explicit rerun outputs resolve in place"
+		);
+		let discard_only_view = LocalViewIdentity::Named("discard-only".to_owned());
+		state.code_editor.prepare_rune_view_panels(
+			reopened_producer,
+			&[(discard_only_view, RuneViewForm::Table)],
+			3,
+		);
+		assert_eq!(update(&mut state, Message::CloseWindow).units(), 0);
+		assert_eq!(state.saved_close_state, SavedCloseState::Failed);
+		let discard = update(&mut state, Message::CloseWithoutCheckpoint);
+		assert_eq!(discard.units(), 1, "explicit discard emits the close task");
+		assert_eq!(state.saved_close_state, SavedCloseState::Frozen);
+		drop(discard);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0063_sigkill_is_not_a_close_checkpoint() {
+		const MODE: &str = "POLARITON_PRODUCT_0063_CRASH_MODE";
+		const SESSION_FILE: &str = "POLARITON_PRODUCT_0063_SESSION_FILE";
+		const SESSION_ID: &str = "POLARITON_PRODUCT_0063_SESSION_ID";
+		const UNCOMMITTED: &str = "not checkpointed before sigkill";
+
+		match std::env::var(MODE).as_deref() {
+			Ok("holder") => {
+				let authority = resolve_startup(super::StartupTarget::CreateSaved).unwrap();
+				let session_id = match &authority {
+					StartupAuthority::Saved { session_id, .. } => *session_id,
+					StartupAuthority::Ephemeral { .. } => panic!("holder must be saved"),
+				};
+				let (mut state, startup) =
+					new_with_authority(StartupData::default(), authority).unwrap();
+				drop(startup);
+				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+				while state.status_msg != "Session checkpointed"
+					&& std::time::Instant::now() < deadline
+				{
+					state.code_editor.poll();
+					drop(update(&mut state, Message::CheckpointSession));
+					std::thread::sleep(std::time::Duration::from_millis(5));
+				}
+				assert_eq!(state.status_msg, "Session checkpointed");
+
+				use libaryon::engine::{InputEvent, KeyCode, Modifiers};
+				for key in std::iter::once('i').chain(UNCOMMITTED.chars()) {
+					drop(update(
+						&mut state,
+						Message::CodeEditEvent(crate::editor::EditorMsg::Input(InputEvent::Key {
+							code: KeyCode::Char(key),
+							modifiers: Modifiers::NONE,
+						})),
+					));
+				}
+				drop(update(
+					&mut state,
+					Message::CodeEditEvent(crate::editor::EditorMsg::Input(InputEvent::Key {
+						code: KeyCode::Esc,
+						modifiers: Modifiers::NONE,
+					})),
+				));
+				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+				while !state.code_editor.cached_content().contains(UNCOMMITTED)
+					&& std::time::Instant::now() < deadline
+				{
+					state.code_editor.poll();
+					std::thread::sleep(std::time::Duration::from_millis(5));
+				}
+				assert!(state.code_editor.cached_content().contains(UNCOMMITTED));
+				std::fs::write(
+					std::env::var_os(SESSION_FILE).unwrap(),
+					session_id.to_string(),
+				)
+				.unwrap();
+				loop {
+					std::thread::park();
+				}
+			}
+			Ok("verify") => {
+				let session_id = std::env::var(SESSION_ID).unwrap().parse().unwrap();
+				let authority =
+					resolve_startup(super::StartupTarget::OpenSaved(session_id)).unwrap();
+				let (mut state, startup) =
+					new_with_authority(StartupData::default(), authority).unwrap();
+				drop(startup);
+				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+				while state.code_editor.cached_content().contains(UNCOMMITTED)
+					|| state.code_editor.active_buffer_id().is_none()
+				{
+					assert!(
+						std::time::Instant::now() < deadline,
+						"reopen must project the predecessor"
+					);
+					state.code_editor.poll();
+					std::thread::sleep(std::time::Duration::from_millis(5));
+				}
+				assert!(
+					!state.code_editor.cached_content().contains(UNCOMMITTED),
+					"SIGKILL and Drop publish no edits"
+				);
+				state.code_editor.shutdown();
+			}
+			Ok(other) => panic!("unknown crash fixture mode {other}"),
+			Err(_) => {
+				let root = std::env::temp_dir().join(format!(
+					"polariton-product-0063-crash-{}-{}",
+					std::process::id(),
+					std::time::SystemTime::now()
+						.duration_since(std::time::UNIX_EPOCH)
+						.unwrap()
+						.as_nanos()
+				));
+				std::fs::create_dir_all(&root).unwrap();
+				let session_file = root.join("session-id");
+				let exact = "gui::state::tests::product_0063_sigkill_is_not_a_close_checkpoint";
+				let mut holder = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", exact, "--nocapture"])
+					.env(MODE, "holder")
+					.env(SESSION_FILE, &session_file)
+					.env("XDG_STATE_HOME", &root)
+					.spawn()
+					.unwrap();
+				let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+				while !session_file.exists() && std::time::Instant::now() < deadline {
+					assert!(
+						holder.try_wait().unwrap().is_none(),
+						"holder exited before signal"
+					);
+					std::thread::sleep(std::time::Duration::from_millis(5));
+				}
+				let session_id = std::fs::read_to_string(&session_file).unwrap();
+				nix::sys::signal::kill(
+					nix::unistd::Pid::from_raw(holder.id() as i32),
+					nix::sys::signal::Signal::SIGKILL,
+				)
+				.unwrap();
+				let status = holder.wait().unwrap();
+				assert!(!status.success(), "holder must die by SIGKILL");
+
+				let verifier = std::process::Command::new(std::env::current_exe().unwrap())
+					.args(["--exact", exact, "--nocapture"])
+					.env(MODE, "verify")
+					.env(SESSION_ID, session_id.trim())
+					.env("XDG_STATE_HOME", &root)
+					.status()
+					.unwrap();
+				let _ = std::fs::remove_dir_all(&root);
+				assert!(
+					verifier.success(),
+					"the lock releases and the predecessor reopens"
+				);
+			}
+		}
 	}
 
 	#[cfg(feature = "toron")]
@@ -3505,6 +4307,11 @@ mod tests {
 		}));
 		assert!(state.local_workspace_owner.is_none());
 		let close = update(&mut state, Message::CloseWindow);
+		assert_eq!(
+			close.units(),
+			1,
+			"ephemeral close without an owned workspace must emit the window-close task immediately"
+		);
 		assert!(!state.closing_local_workspace);
 		drop(close);
 		std::thread::sleep(std::time::Duration::from_millis(50));
@@ -3578,6 +4385,16 @@ mod tests {
 			0,
 			"a second close must not start another stop"
 		);
+		let finish = update(
+			&mut state,
+			Message::LocalWorkspaceStopped("Stopped".to_owned()),
+		);
+		assert_eq!(
+			finish.units(),
+			1,
+			"the ephemeral post-drain exit must emit the window-close task"
+		);
+		assert!(state.status_msg.contains("Local workspace stopped"));
 		drop(close);
 		state.code_editor.shutdown();
 	}
@@ -7262,6 +8079,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		);
 	}
 
+	#[cfg(feature = "toron")]
 	#[test]
 	fn product_0042_facet_reaches_the_head_as_structural_intent() {
 		let source = "workspace.table(\"t\").views([figure([facet(\"cat\"), title(\"Revenue\"), bar(\"cat\", \"val\")])])";

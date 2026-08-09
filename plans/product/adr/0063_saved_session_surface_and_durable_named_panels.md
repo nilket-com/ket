@@ -1,6 +1,8 @@
 # ADR 0063: saved-session surface and durable named panels
 
-Status: proposed 2026-08-09. This record makes the saved-session substrate from
+Status: accepted 2026-08-09. Implemented and verified in
+[`../impl/0063_saved_session_surface_and_durable_named_panels_evidence.md`](../impl/0063_saved_session_surface_and_durable_named_panels_evidence.md).
+This record makes the saved-session substrate from
 PRODUCT-0059 through PRODUCT-0062 reachable from Polariton. It adds explicit
 command-line creation and selection, a visible session identity, explicit and
 close-time checkpointing, and an honest failure escape. Durable named Rune

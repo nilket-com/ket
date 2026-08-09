@@ -11,4 +11,5 @@ pub mod table;
 pub mod table_skin;
 
 pub use state::Result;
+pub(crate) use state::StartupTarget;
 pub use state::run;

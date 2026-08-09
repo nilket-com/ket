@@ -110,6 +110,7 @@ pub(crate) struct DocumentCheckpoint {
 pub enum SessionCheckpointError {
 	NotSaved,
 	EngineStopped,
+	StaleApplicationSnapshot(String),
 	Refused(String),
 	Store(SessionStoreError),
 }
@@ -121,6 +122,10 @@ impl std::fmt::Display for SessionCheckpointError {
 			Self::EngineStopped => {
 				formatter.write_str("engine stopped before checkpoint completed")
 			}
+			Self::StaleApplicationSnapshot(kind) => write!(
+				formatter,
+				"stale application snapshot: {kind} census differs at the checkpoint FIFO head"
+			),
 			Self::Refused(reason) => formatter.write_str(reason),
 			Self::Store(error) => error.fmt(formatter),
 		}
@@ -513,10 +518,9 @@ fn checkpoint_documents_with_commit(
 			if application.witness.host_panel_groups != exact.host_panel_groups {
 				mismatches.push("host panel groups");
 			}
-			return Err(SessionCheckpointError::Refused(format!(
-				"stale application snapshot: {} census differs at the checkpoint FIFO head",
-				mismatches.join(", ")
-			)));
+			return Err(SessionCheckpointError::StaleApplicationSnapshot(
+				mismatches.join(", "),
+			));
 		}
 	}
 	let owner = crate::core::OwnerId::new(DOCUMENT_OWNER_ID)?;

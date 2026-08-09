@@ -37,7 +37,7 @@ use libaryon::core::{CursorPosition, DocDisplayCol, DocLine, PaneRect, Rgb, View
 #[cfg(feature = "toron")]
 use libaryon::core::{SavedSession, Writable};
 #[cfg(feature = "toron")]
-use libaryon::engine::{ApplicationCheckpointWitness, ApplicationOwnerId};
+use libaryon::engine::{ApplicationCheckpointWitness, ApplicationOwnerId, SessionCheckpointError};
 use libaryon::engine::{
 	EditorCommand, EditorMode, EngineConfig, EngineHandle, InputEvent, KeyCode, LanguageId,
 	Modifiers,
@@ -435,6 +435,46 @@ struct CachedPreviewBlocks {
 	blocks: Vec<MarkdownBlock>,
 }
 
+#[cfg(feature = "toron")]
+#[derive(Debug)]
+pub(crate) enum PolaritonCheckpointError {
+	NotReady(&'static str),
+	Persistence(SessionPersistenceError),
+	Engine(SessionCheckpointError),
+}
+
+#[cfg(feature = "toron")]
+impl PolaritonCheckpointError {
+	pub(crate) fn is_stale(&self) -> bool {
+		matches!(
+			self,
+			Self::Engine(SessionCheckpointError::StaleApplicationSnapshot(_))
+		)
+	}
+}
+
+#[cfg(feature = "toron")]
+impl std::fmt::Display for PolaritonCheckpointError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::NotReady(reason) => formatter.write_str(reason),
+			Self::Persistence(error) => error.fmt(formatter),
+			Self::Engine(error) => error.fmt(formatter),
+		}
+	}
+}
+
+#[cfg(feature = "toron")]
+impl std::error::Error for PolaritonCheckpointError {
+	fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+		match self {
+			Self::Persistence(error) => Some(error),
+			Self::Engine(error) => Some(error),
+			Self::NotReady(_) => None,
+		}
+	}
+}
+
 /// A runnable fenced SQL cell selected by the engine's cursor projection.
 pub struct MarkdownCellExecution {
 	pub identity: MarkdownCellIdentity,
@@ -554,17 +594,12 @@ impl CodeEditor {
 	/// coupled application owner. Decoding happens before ownership transfers;
 	/// installation waits for the first complete projected census.
 	#[cfg(feature = "toron")]
-	#[allow(
-		dead_code,
-		reason = "PRODUCT-0063 supplies the saved-session launch surface"
-	)]
 	pub fn open_saved_with_init(
-		mut config: EngineConfig,
 		saved: SavedSession<Writable>,
+		init_script: Option<std::path::PathBuf>,
+		viewport: iced::Size,
 	) -> Result<Self, String> {
-		config
-			.initial_viewport
-			.get_or_insert((INITIAL_COLUMNS, INITIAL_ROWS));
+		let config = polariton_engine_config(None, init_script, Some(viewport_cells(viewport)));
 		let owner = ApplicationOwnerId::new(session_persistence::OWNER_NAME)
 			.map_err(|error| error.to_string())?;
 		let meanings = match saved.owner_payload(owner.owner_id()) {
@@ -734,27 +769,35 @@ impl CodeEditor {
 	/// one generation. An ephemeral viewport has no census and cannot publish a
 	/// coupled owner.
 	#[cfg(feature = "toron")]
-	#[allow(
-		dead_code,
-		reason = "PRODUCT-0063 supplies the explicit checkpoint surface"
-	)]
-	pub(crate) fn checkpoint_session(&self, colours: &RuntimeColours) -> Result<(), String> {
+	pub(crate) fn checkpoint_session(
+		&self,
+		colours: &RuntimeColours,
+	) -> Result<(), PolaritonCheckpointError> {
 		let viewport = self
 			.viewport
 			.as_ref()
-			.ok_or_else(|| "saved-session viewport is not ready".to_owned())?;
-		let census = viewport
-			.shared_identity_census
-			.as_ref()
-			.ok_or_else(|| "ephemeral engine has no application owner to checkpoint".to_owned())?;
-		let (buffer_documents, _) =
-			Self::projected_document_bindings(viewport).map_err(|error| error.to_string())?;
+			.ok_or(PolaritonCheckpointError::NotReady(
+				"saved-session viewport is not ready",
+			))?;
+		let census =
+			viewport
+				.shared_identity_census
+				.as_ref()
+				.ok_or(PolaritonCheckpointError::NotReady(
+					"ephemeral engine has no application owner to checkpoint",
+				))?;
+		let (buffer_documents, _) = Self::projected_document_bindings(viewport)
+			.map_err(PolaritonCheckpointError::Persistence)?;
 		let projected_documents = buffer_documents
 			.values()
 			.copied()
 			.collect::<std::collections::BTreeSet<_>>();
 		if projected_documents != census.documents {
-			return Err("projected document bindings do not equal the shared census".to_owned());
+			return Err(PolaritonCheckpointError::Persistence(
+				SessionPersistenceError::Refused(
+					"projected document bindings do not equal the shared census".to_owned(),
+				),
+			));
 		}
 		let meanings = session_persistence::capture_runtime(
 			&self.view_panel_ids,
@@ -765,17 +808,21 @@ impl CodeEditor {
 			self.next_view_panel_id,
 			self.next_view_group_id,
 		)
-		.map_err(|error| error.to_string())?;
-		let bytes = meanings.encode().map_err(|error| error.to_string())?;
+		.map_err(PolaritonCheckpointError::Persistence)?;
+		let bytes = meanings
+			.encode()
+			.map_err(PolaritonCheckpointError::Persistence)?;
 		self.engine
 			.as_ref()
-			.ok_or_else(|| "editor engine is no longer running".to_owned())?
+			.ok_or(PolaritonCheckpointError::NotReady(
+				"editor engine is no longer running",
+			))?
 			.checkpoint_with_application_owner(
 				session_persistence::SCHEMA_VERSION,
 				bytes,
 				ApplicationCheckpointWitness::from_census(census),
 			)
-			.map_err(|error| error.to_string())
+			.map_err(PolaritonCheckpointError::Engine)
 	}
 
 	#[cfg(feature = "toron")]
@@ -1200,6 +1247,19 @@ impl CodeEditor {
 	}
 
 	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_producer_for_panel(
+		&self,
+		panel_id: HostPanelId,
+		identity: &LocalViewIdentity,
+	) -> Option<libaryon::core::BufferId> {
+		self.view_panel_ids
+			.iter()
+			.find_map(|((producer, candidate), panel)| {
+				(*panel == panel_id && candidate == identity).then_some(*producer)
+			})
+	}
+
+	#[cfg(all(test, feature = "toron"))]
 	pub fn set_rune_view_table(&mut self, panel_id: HostPanelId, frame: DataFrame) {
 		self.set_rune_view_table_with_skin(panel_id, frame, TableSkinCascade::library_floor());
 	}
@@ -1392,6 +1452,29 @@ impl CodeEditor {
 			pane.tabs.iter().map(|tab| tab.view_id).collect(),
 			pane.active_doctab_index,
 			viewport.focused_pane_id,
+		))
+	}
+
+	#[cfg(all(test, feature = "toron"))]
+	pub(crate) fn rune_view_panel_persistence_signature(
+		&self,
+		producer: libaryon::core::BufferId,
+		identity: &LocalViewIdentity,
+	) -> Option<(HostPanelGroupId, PaneRect, usize, usize, bool)> {
+		let group_id = self.view_group_ids.get(&producer).copied()?;
+		let panel_id = self.rune_view_panel_id(producer, identity)?;
+		let viewport = self.viewport.as_ref()?;
+		let pane = viewport.panes.iter().find(|pane| {
+			pane.host_panel
+				.as_ref()
+				.is_some_and(|panel| panel.panel_id == panel_id)
+		})?;
+		Some((
+			group_id,
+			pane.rect,
+			pane.tabs.len(),
+			pane.active_doctab_index,
+			pane.pane_id == viewport.focused_pane_id,
 		))
 	}
 
@@ -6425,8 +6508,7 @@ mod tests {
 		let saved = store.create().unwrap();
 		let session_id = saved.snapshot().session_id();
 		let mut editor =
-			CodeEditor::open_saved_with_init(libaryon::engine::EngineConfig::default(), saved)
-				.unwrap();
+			CodeEditor::open_saved_with_init(saved, None, iced::Size::new(900.0, 600.0)).unwrap();
 		wait_for_saved_projection(&mut editor);
 		assert!(
 			editor.engine.as_ref().unwrap().checkpoint().is_err(),
@@ -6508,8 +6590,7 @@ mod tests {
 
 		let saved = store.open_writable(session_id).unwrap();
 		let mut reopened =
-			CodeEditor::open_saved_with_init(libaryon::engine::EngineConfig::default(), saved)
-				.unwrap();
+			CodeEditor::open_saved_with_init(saved, None, iced::Size::new(900.0, 600.0)).unwrap();
 		wait_for_saved_projection(&mut reopened);
 		let reopened_buffer = reopened.active_buffer_id().unwrap();
 		// BufferId is runtime-only and may coincidentally reuse the same integer;
