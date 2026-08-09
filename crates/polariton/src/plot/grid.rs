@@ -14,7 +14,8 @@ use crate::plot::common::{
 };
 use crate::plot::factory::{create_plot, create_styled_plot};
 use crate::plot::spec::{
-	Channel, LayerSettings, NonEmpty, ResolvedPlotSpec, ScaleDomain, StampedResult,
+	Channel, LayerSettings, NonEmpty, ResolvedPlotSpec, ResolvedPresence, ScaleDomain,
+	StampedResult,
 };
 use crate::plot::theme::PlotSettings;
 use iced::advanced::mouse::Cursor;
@@ -726,7 +727,7 @@ impl PlotComposite for PlotGridKernel {
 						// independent.
 						position: Point::new(
 							inner.x() + inner.width() / 2.0,
-							cell_bounds.y() + 8.0,
+							cell_bounds.y() + PANEL_LABEL_TOP_INSET,
 						),
 						color: resolved.chrome.title_text.iced(),
 						size: iced::Pixels((resolved.legend_size + 2.0).max(10.0)),
@@ -821,12 +822,29 @@ fn grid_outer_area(bounds: Rect<Widget>, padding: f32) -> Rect<Widget> {
 fn grid_tiled_area(outer: Rect<Widget>, settings: &ResolvedPlotSettings) -> Rect<Widget> {
 	let left = settings.plot_padding_left.min(outer.width());
 	let bottom = settings.plot_padding_bottom.min(outer.height());
+	let top = grid_heading_band(settings).min((outer.height() - bottom).max(0.0));
 	outer.region(
 		outer.x() + left,
-		outer.y(),
+		outer.y() + top,
 		(outer.width() - left).max(0.0),
-		(outer.height() - bottom).max(0.0),
+		(outer.height() - top - bottom).max(0.0),
 	)
+}
+
+const PANEL_LABEL_TOP_INSET: f32 = 8.0;
+
+fn grid_heading_band(settings: &ResolvedPlotSettings) -> f32 {
+	let title = if matches!(settings.title, ResolvedPresence::Hide) {
+		0.0
+	} else {
+		settings.plot_padding_top
+	};
+	let subtitle = if matches!(settings.subtitle, ResolvedPresence::Show(_)) {
+		settings.subtitle_offset + settings.subtitle_size
+	} else {
+		0.0
+	};
+	title.max(subtitle)
 }
 
 fn grid_plot_area(cell_bounds: Rect<Widget>, settings: &ResolvedPlotSettings) -> Rect<Widget> {
@@ -2856,6 +2874,79 @@ mod tests {
 			assert!((actual.x - (inner.x() + expected.x)).abs() < 0.01);
 			assert!((actual.y - (inner.y() + expected.y)).abs() < 0.01);
 		}
+	}
+
+	#[test]
+	fn product_0066_global_heading_band_separates_first_row_facet_labels() {
+		for height in [300.0_f32, 900.0] {
+			let (kernel, _) = rendered_facet(4, GridArrangement::new(2, 2).unwrap(), 800.0, height);
+			let mut resolved = ResolvedPlotSettings::default();
+			resolved.title =
+				crate::plot::spec::ResolvedPresence::Show(Arc::new("Figure heading".to_owned()));
+			let model = PlotSettings::from_resolved(resolved.clone());
+			let mut backend = SvgBackend::new(800.0, height);
+			let widget = PlotWidget {
+				kernel: &kernel,
+				title: String::new(),
+				padding: 0.0,
+				settings: resolved.clone(),
+				settings_model: model,
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: PlotRenderLayer::Full,
+			};
+			widget.render(
+				&mut backend,
+				IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, height)),
+			);
+			let svg = backend.finish();
+			let title_y = text_coordinate(text_element(&svg, "Figure heading"), 'y');
+			let panel_y = text_coordinate(text_element(&svg, "panel-0"), 'y');
+			assert_eq!(
+				title_y, resolved.title_offset,
+				"the existing global title position must not move"
+			);
+			assert!(
+				panel_y >= title_y + resolved.title_size,
+				"the first facet label must begin below the global title at every viewport: {panel_y} vs {title_y}"
+			);
+
+			let tiled = grid_tiled_area(
+				widget_rect(IcedRectangle::new(
+					Point::ORIGIN,
+					iced::Size::new(800.0, height),
+				)),
+				&resolved,
+			);
+			assert_eq!(tiled.y(), resolved.plot_padding_top);
+			let mut cells = Vec::new();
+			for row in 0..2 {
+				for column in 0..2 {
+					cells.push(grid_plot_area(
+						grid_cell_bounds(tiled, kernel.arrangement, GridPosition { row, column }),
+						&resolved,
+					));
+				}
+			}
+			assert!(cells.iter().all(|cell| {
+				cell.width() == cells[0].width() && cell.height() == cells[0].height()
+			}));
+		}
+
+		let mut subtitle = ResolvedPlotSettings::default();
+		subtitle.title = crate::plot::spec::ResolvedPresence::Hide;
+		subtitle.subtitle =
+			crate::plot::spec::ResolvedPresence::Show(Arc::new("Subtitle".to_owned()));
+		assert_eq!(
+			grid_heading_band(&subtitle),
+			subtitle.subtitle_offset + subtitle.subtitle_size
+		);
+		subtitle.subtitle = crate::plot::spec::ResolvedPresence::Hide;
+		assert_eq!(
+			grid_heading_band(&subtitle),
+			0.0,
+			"fully hidden global headings reclaim their band"
+		);
 	}
 
 	#[test]
