@@ -230,6 +230,99 @@ fn product_0001_keeps_editor_crates_out_of_the_nilket_workspace() {
 }
 
 #[test]
+fn product_0059_session_store_is_capability_closed_and_has_no_startup_consumer() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let store_path = manifest_dir.join("src/core/session_store.rs");
+	let source = fs::read_to_string(&store_path).expect("read session store");
+	let production = source
+		.split("\n\t#[cfg(test)]\n\tmod tests")
+		.next()
+		.expect("session store production source");
+
+	let shared = production
+		.split("impl<Mode: sealed::AccessMode> SavedSession<Mode>")
+		.nth(1)
+		.expect("shared opened-session implementation")
+		.split("pub enum SessionStoreError")
+		.next()
+		.expect("bounded shared implementation");
+	for forbidden in [
+		"mint_document",
+		"update_document_path",
+		"remove_document",
+		"set_owner_payload",
+		"commit(",
+		"cleanup_unreferenced",
+	] {
+		assert!(
+			!shared.contains(forbidden),
+			"read-only/generic SavedSession acquired mutator {forbidden}"
+		);
+	}
+
+	let writable = production
+		.split("impl SavedSession<Writable>")
+		.nth(1)
+		.expect("writable opened-session implementation")
+		.split("fn snapshot_to_disk")
+		.next()
+		.expect("bounded writable implementation");
+	for required in [
+		"mint_document",
+		"update_document_path",
+		"remove_document",
+		"set_owner_payload",
+		"pub fn commit(",
+		"cleanup_unreferenced",
+	] {
+		assert!(
+			writable.contains(required),
+			"exclusive capability lost mutator {required}"
+		);
+	}
+	for required in [
+		"libc::O_CLOEXEC",
+		"libc::O_NOFOLLOW",
+		"libc::LOCK_EX | libc::LOCK_NB",
+		"libc::LOCK_SH | libc::LOCK_NB",
+		"the lock must precede even the first CURRENT read",
+	] {
+		assert!(
+			production.contains(required),
+			"session lock lost {required}"
+		);
+	}
+
+	let mut engine_sources = Vec::new();
+	collect_rs_files(&manifest_dir.join("src/engine"), &mut engine_sources);
+	for path in engine_sources {
+		let engine = fs::read_to_string(&path).expect("read engine source");
+		assert!(
+			!engine.contains("SessionStore") && !engine.contains("SavedSession"),
+			"{} made PRODUCT-0059 reachable from ordinary startup",
+			path.display()
+		);
+	}
+
+	let polariton = manifest_dir
+		.parent()
+		.expect("workspace crates")
+		.join("polariton/src");
+	let mut polariton_sources = Vec::new();
+	collect_rs_files(&polariton, &mut polariton_sources);
+	for path in polariton_sources {
+		let head = fs::read_to_string(&path).expect("read Polariton source");
+		assert!(
+			!head.contains("SessionStore")
+				&& !head.contains("SavedSession")
+				&& !head.contains("DocumentId"),
+			"{} consumed persistence before document restoration",
+			path.display()
+		);
+	}
+}
+
+#[test]
 fn product_0024_theme_construction_remains_owned_by_its_defining_module() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let crates_dir = manifest_dir.parent().expect("workspace crates directory");

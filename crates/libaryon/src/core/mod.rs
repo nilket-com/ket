@@ -3,6 +3,7 @@ mod color;
 mod constants;
 pub mod coords;
 pub mod path;
+pub mod session_store;
 pub mod text;
 
 pub use atomic_file::write_private_state_atomically;
@@ -23,3 +24,7 @@ pub use coords::{
 };
 #[allow(unused_imports)]
 pub use path::expand_path;
+pub use session_store::{
+	DocumentId, DocumentIdentity, OwnerId, ParseSessionIdError, ReadOnly, SavedSession, SessionId,
+	SessionSnapshot, SessionStore, SessionStoreError, Writable,
+};

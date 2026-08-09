@@ -28,14 +28,15 @@ distribution the ledger just fixed. This is the largest standing debt in the
 language and the bridge the records themselves repeatedly name as "the first
 thing a Guide record should replace."
 
-**PERSISTENCE CLUSTER — recommend: will do, as one editor-wide arc, already
-internally ordered.** Members: workspace layout persistence (0015 §11:
-"editor-wide workspace work") → durable named-view identity (0010 §5) →
-producer-release reattachment (0015 §5, 0030 §7) → durable continuation
-(0030 §12). The dependency order is stated in the records and is not
-renegotiable item by item; the arc starts when layout persistence starts, and
-nothing in it can be advanced out of order. Not plotting work — sequence it as
-its own editor arc.
+**PERSISTENCE CLUSTER — will do, as one editor-wide arc, now in progress.**
+PRODUCT-0059 landed the non-visible head: shared session/document identity,
+single-writer locking, and atomic owner-partitioned snapshots. Stage 0 refined
+the remaining order to libaryon document restoration → Polariton layout/view/
+color extension → durable named-panel identity → producer-release reattachment
+and durable continuation. The earlier phrase “layout before durable identity”
+still governs named-view identity; minted libaryon document identity is its
+newly separated prerequisite. Nothing later in the chain advances around
+document restoration.
 
 ---
 
@@ -77,8 +78,8 @@ its own editor arc.
 
 | Item | Rec. | Reason / trigger | Closure lands in |
 |---|---|---|---|
-| Layout persistence | will do | Persistence cluster head — see Clusters | — |
-| Durable identity | will do | Persistence cluster, strictly after layout persistence | — |
+| Layout persistence | will do | After PRODUCT-0059, requires libaryon document restoration, then lands with Polariton's owner extension | — |
+| Durable identity | partial (0059) | Session/document IDs landed; durable named-view identity remains strictly after restored layout | 0059 substrate |
 | Grouping signal | if asked | Trigger the records already wrote: repeated manual tabbing of the same view sets (0011 §4, 0015 §8) | — |
 | Dashboard's fate | will do | Small decision record; demotion already happened, evidence (0010–0015 arc) suggests retirement; leaving it undecided keeps a zombie surface whose export/resize behaviors need explicit re-homing or discard | — |
 | Panel close/move commands, more placements | closed | "It grows when a use exists, not in advance of one" (0011 §1) — the rule is the closure | 0011 §1 (already states it) |
@@ -190,7 +191,7 @@ arcs (Guide, Persistence) plus debt retirement rather than new surface.
 | CI-12 | SQL / Markdown skin authoring | closed |
 | CI-13 | Per-surface ink | closed |
 | LI-01 | Layout persistence | will do (cluster) |
-| LI-02 | Durable identity | will do (cluster) |
+| LI-02 | Durable identity | partial: session/document substrate landed 0059; named-view remainder will do (cluster) |
 | LI-03 | Grouping signal | if asked |
 | LI-04 | Dashboard's fate | will do |
 | LI-05 | Panel commands / placements | closed |

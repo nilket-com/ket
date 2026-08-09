@@ -153,26 +153,27 @@ promise of one.) — 0027 Consequences.
 
 ## Layout & identity
 
-**LI-01 · Layout persistence.** No record writes layout to disk or produces
-`PanelRestored` ("no producer yet: this arrives with layout persistence for
-host panels"). "Workspace layout persistence remains next in its own
-editor-wide arc. It must decide restoration of ordinary document panes, tabs,
-panel groups, group state, and detached placements together." 0015 §11 states
-the size signal: "editor-wide workspace work, not a convenient extension of
-this session feature." — 0010 §10, Consequences; 0011 §6, Rejected,
-Consequences; 0015 §9, §11, §12, Rejected, Consequences; 0030 §7, §12.
+**LI-01 · Layout persistence.** PRODUCT-0059 supplies a locked atomic session
+store but deliberately writes no document content or layout and produces no
+`PanelRestored`. The fixed remaining order is libaryon document restoration →
+Polariton's layout/view/color owner extension. That extension must restore
+ordinary document panes, tabs, panel groups, group state, and detached
+placements together; 0015 §11's size signal remains: “editor-wide workspace
+work, not a convenient extension of this session feature.” — 0010 §10,
+Consequences; 0011 §6, Rejected, Consequences; 0015 §9, §11, §12, Rejected,
+Consequences; 0030 §7, §12; 0059 §§6–7.
 
-**LI-02 · Durable identity.** The durable named-view key
-`(workspace identity, durable document identity, view name)` has an undecided
-persistence mechanism; whether libaryon exposes a suitable durable document
-identity is "an open precondition, not an assumption." It is "unblocked by
-neither this record nor any record that does not also decide layout
-persistence, because a durable address has no observable consequence until a
-layout survives to reattach it"; "durable named-view identity follows that
-observable capability rather than preceding it"; "durable continuation remains
-blocked on workspace layout and document identity persistence." — 0010 §5,
-§10, Consequences; 0011 §6, Consequences; 0015 §5, §9, §12, Consequences;
-0030 §7, §12. Dependency: layout persistence.
+**LI-02 · Durable identity.** PRODUCT-0059 lands opaque `SessionId` and minted,
+path-independent, session-scoped `DocumentId`; runtime `BufferId`, `PaneId`, and
+`ViewId` remain forbidden from the manifest. The durable named-view key still
+waits: after documents restore, Polariton must key its owner payload by
+`DocumentId`, restore layout, and only then attach authored
+`LocalViewIdentity::Named`. Anonymous identity remains positional and may shift
+after a source edit. Thus the earlier “layout before durable identity” remains
+true for observable named-view identity while its libaryon identity substrate
+has landed. — 0010 §5, §10, Consequences; 0011 §6, Consequences; 0015 §5, §9,
+§12, Consequences; 0030 §7, §12; 0059 §§2, 7. Dependency: document restoration
+then layout extension. — substrate-landed-in 0059; named-view half open.
 
 **LI-03 · A grouping signal.** Nothing in a Rune buffer distinguishes views that are
 alternatives from comparisons, so `TabWith` "ships with two legitimate

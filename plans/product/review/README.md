@@ -15,9 +15,10 @@ from the records; nothing is proposed. Four documents:
   where records disagree without acknowledging it, two record-accuracy defects,
   four unspecified cells, and fifteen acknowledged asymmetries checked and set
   aside.
-- **`deferred_ledger.md`** — every forward promise collected: 58 open items in
-  six areas, with all deferring citations and stated dependencies, plus 18
-  since-landed items after PRODUCT-0058 closed DB-03.
+- **`deferred_ledger.md`** — every forward promise collected with all deferring
+  citations and stated dependencies, plus since-landed dispositions through
+  PRODUCT-0059, which separates shared session/document substrate from the
+  still-open document, layout, and durable-view consumers.
 - **`live_bridges.md`** — the 8 behaviors shipped as explicitly provisional or
   documented-not-endorsed and still standing, the 2 closed classes, and the
   borderline exclusions with reasons.

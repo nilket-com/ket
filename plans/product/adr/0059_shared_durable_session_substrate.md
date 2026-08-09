@@ -1,10 +1,11 @@
 # ADR 0059: shared durable session substrate
 
-Status: proposed 2026-08-08. This record establishes the durable identity,
+Status: accepted 2026-08-08. This record establishes the durable identity,
 ownership, concurrency, and atomic-snapshot substrate that libaryon's heads can
 share. It intentionally does not restore a document, pane, result, database, or
 plot. Those consumers follow in order after the substrate can name a continuing
-session and its documents without runtime IDs.
+session and its documents without runtime IDs. Implementation evidence is
+recorded in `../impl/0059_shared_durable_session_substrate_evidence.md`.
 
 ## Context
 
@@ -190,9 +191,11 @@ generations/
 
 `store.json` contains the store schema version, session identity, generation,
 next document identifier, and libaryon's document identity records. Owner
-payload descriptors name an owner and that owner's independent schema version;
+payload descriptors name an owner, that owner's independent schema version, and
+the exact payload byte length used to reject a missing or truncated generation;
 the payload filename is derived exactly as `<owner>.payload`, never read as a
-free path from the manifest.
+free path from the manifest. The byte length validates the container and does
+not interpret the owner's schema.
 
 An owner ID is a validated lowercase ASCII identifier matching
 `[a-z][a-z0-9_-]{0,63}`. It is both the authority name and the complete payload
@@ -226,6 +229,14 @@ returning it. A temporary, incomplete, or unreferenced generation is not a
 partially valid session and may be reclaimed by a later writable open. Failure
 before `CURRENT` changes leaves the preceding generation authoritative. Failure
 after the pointer replacement yields the new complete generation.
+
+Pointer replacement is the commit point even if synchronizing the session
+directory subsequently fails. The opened handle advances to the new generation
+immediately and becomes publication-uncertain: it may be inspected and dropped,
+but cannot clean or commit again. Reopening under a fresh lock re-reads
+`CURRENT` and establishes which complete generation the filesystem exposes.
+This prevents a retry from treating the old generation as current and deleting
+the newly published one.
 
 The generation directory is a publication mechanism, not session history. The
 snapshot referenced by `CURRENT` is the only committed truth; after publication
@@ -318,7 +329,7 @@ SessionSnapshot {
     generation
     next_document_id
     documents: [DocumentIdentity { id, path? }]
-    owners: [OwnerPayload { owner, schema_version }]
+    owners: [OwnerPayload { owner, schema_version, byte_len }]
 }
 ```
 
@@ -431,8 +442,10 @@ fault-injection and unknown-owner oracles.
    `CURRENT`, and while preparing the replacement pointer leaves the previous
    complete generation authoritative. Successful pointer publication exposes
    the complete new base and all owner payloads together. No reader observes a
-   mixed generation. Generation-number exhaustion refuses without staging or
-   altering `CURRENT`.
+   mixed generation. A fault after pointer rename exposes the complete new
+   generation, poisons the old handle against cleanup/retry, and becomes usable
+   again only after reopen. Generation-number exhaustion refuses without
+   staging or altering `CURRENT`.
 9. An incomplete temporary generation and a complete but unreferenced generation
    are ignored by read-only open. A later exclusively locked open may reclaim
    them without changing the committed snapshot. Recovery never selects the
@@ -440,7 +453,8 @@ fault-injection and unknown-owner oracles.
 10. An unknown owner payload containing arbitrary non-UTF-8 bytes survives a
     libaryon-only update byte-for-byte with the same owner and schema version.
     Updating one known owner leaves every sibling identical. Owner-schema and
-    root-schema versions are tested independently.
+    root-schema versions are tested independently; a payload whose byte length
+    disagrees with its strict descriptor refuses as an incomplete generation.
 11. Malformed `CURRENT`, missing referenced files, duplicate owner IDs, unsafe
     owner filenames, base/pointer generation disagreement, session-ID mismatch,
     unknown base fields, and unsupported root versions each refuse without
