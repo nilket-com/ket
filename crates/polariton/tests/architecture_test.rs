@@ -9,6 +9,60 @@ mod manifest_dependency_guard;
 
 use manifest_dependency_guard::{ProductBoundary, assert_product_dependency_boundary};
 
+fn crate_root_modules(
+	source: &str,
+	end_marker: &str,
+) -> std::collections::BTreeMap<String, Option<String>> {
+	let mut modules = std::collections::BTreeMap::new();
+	let mut pending_cfg = None;
+	for line in source
+		.split(end_marker)
+		.next()
+		.expect("bounded crate-root module list")
+		.lines()
+	{
+		let line = line.trim();
+		if line.starts_with("#[cfg(") {
+			pending_cfg = Some(line.to_owned());
+			continue;
+		}
+		if line.starts_with("#[path =")
+			|| line.is_empty()
+			|| line.starts_with("//")
+			|| line.starts_with("#![")
+		{
+			continue;
+		}
+		if let Some(name) = line
+			.strip_prefix("mod ")
+			.and_then(|line| line.strip_suffix(';'))
+		{
+			assert!(
+				modules
+					.insert(name.to_owned(), pending_cfg.take())
+					.is_none(),
+				"duplicate root module {name}"
+			);
+		} else {
+			pending_cfg = None;
+		}
+	}
+	modules
+}
+
+#[test]
+fn product_0057_render_evidence_mirrors_the_binary_module_graph() {
+	let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let main = std::fs::read_to_string(manifest.join("src/main.rs")).expect("read binary root");
+	let harness = std::fs::read_to_string(manifest.join("tests/product_0057_render_evidence.rs"))
+		.expect("read PRODUCT-0057 render harness");
+	assert_eq!(
+		crate_root_modules(&harness, "use gui::"),
+		crate_root_modules(&main, "fn main()"),
+		"PRODUCT-0057 path-includes production modules; every binary-root module and feature gate must be mirrored so the opt-in GPU target stays compilable"
+	);
+}
+
 fn envelope_leaks(source: &str, is_envelope: bool) -> Vec<&'static str> {
 	let mut findings = Vec::new();
 	if !is_envelope {

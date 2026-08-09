@@ -233,3 +233,24 @@ implementation's only lockfile change is Polariton's direct test-only
 
 No product geometry, renderer choice, theme, Rune surface, export baseline, or
 banked draw-operation output changed.
+
+## Module-graph maintenance receipt — 2026-08-09
+
+PRODUCT-0062 added the feature-gated `session_persistence` root module. The
+binary-only PRODUCT-0057 harness path-includes Polariton's private production
+modules, so its manual mirror initially omitted that new declaration and the
+opt-in all-feature target no longer compiled even though the default all-target
+suite stayed green.
+
+The harness now mirrors `session_persistence` under the same `toron` gate.
+`product_0057_render_evidence_mirrors_the_binary_module_graph` compares every
+binary-root module name and feature gate with the harness in the ordinary
+default architecture suite. The maintenance cost of the path-include
+instrument is therefore observable whenever a root module is added, rather
+than only when someone next requests GPU evidence.
+
+The repaired target was run, not merely checked. All four automated probes
+completed on the Intel UHD 770 Vulkan adapter: overlap and clip predicates held,
+MSAA discriminated at 350/0 and 580/0 blended pixels with the integer control
+identical, and measured text retained 225 pixels of accepted ink with the
+88-pixel narrow control.

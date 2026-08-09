@@ -28,6 +28,9 @@ mod rune_host;
 #[cfg(feature = "toron")]
 #[path = "../src/rune_relation_envelope.rs"]
 mod rune_relation_envelope;
+#[cfg(feature = "toron")]
+#[path = "../src/session_persistence.rs"]
+mod session_persistence;
 
 use gui::table::{Product0057TableEvidenceGeometry, draw_product_0057_table_evidence};
 use iced::advanced::graphics::geometry::Renderer as _;
