@@ -223,10 +223,10 @@ pub(crate) fn refresh_uast_inspectors(
 					},
 					document
 						.file_path
-						.as_deref()
-						.or(document.virtual_path.as_deref())
-						.unwrap_or("_")
-						.to_owned(),
+						.as_ref()
+						.map(|path| path.to_string_lossy().into_owned())
+						.or_else(|| document.virtual_path.clone())
+						.unwrap_or_else(|| "_".to_owned()),
 					document
 						.semantic
 						.cached_sum_tree
@@ -848,10 +848,10 @@ pub(crate) fn export_dot(
 				document.active_language_id,
 				document
 					.file_path
-					.as_deref()
-					.or(document.virtual_path.as_deref())
-					.unwrap_or("_")
-					.to_owned(),
+					.as_ref()
+					.map(|path| path.to_string_lossy().into_owned())
+					.or_else(|| document.virtual_path.clone())
+					.unwrap_or_else(|| "_".to_owned()),
 			)
 		})
 		.ok_or_else(|| "The focused pane is not an inspectable source document".to_string())?;

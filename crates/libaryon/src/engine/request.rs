@@ -9,6 +9,12 @@ pub(crate) enum EngineRequest {
 	Command(EditorCommand),
 	Input(InputEvent),
 	Internal(InternalEvent),
+	Checkpoint(mpsc::Sender<Result<(), super::session_checkpoint::SessionCheckpointError>>),
+	#[cfg(test)]
+	CheckpointWithFault(
+		super::session_checkpoint::CheckpointFault,
+		mpsc::Sender<Result<(), super::session_checkpoint::SessionCheckpointError>>,
+	),
 }
 
 #[derive(Debug)]
@@ -43,9 +49,13 @@ impl CommandSender {
 			.send(EngineRequest::Command(command))
 			.map_err(|mpsc::SendError(request)| match request {
 				EngineRequest::Command(command) => mpsc::SendError(command),
-				EngineRequest::Input(_) | EngineRequest::Internal(_) => {
+				EngineRequest::Input(_)
+				| EngineRequest::Internal(_)
+				| EngineRequest::Checkpoint(_) => {
 					unreachable!("sent a command request")
 				}
+				#[cfg(test)]
+				EngineRequest::CheckpointWithFault(_, _) => unreachable!("sent a command request"),
 			})
 	}
 
@@ -88,9 +98,13 @@ impl InputSender {
 		self.tx.send(EngineRequest::Input(event)).map_err(
 			|mpsc::SendError(request)| match request {
 				EngineRequest::Input(event) => mpsc::SendError(event),
-				EngineRequest::Command(_) | EngineRequest::Internal(_) => {
+				EngineRequest::Command(_)
+				| EngineRequest::Internal(_)
+				| EngineRequest::Checkpoint(_) => {
 					unreachable!("sent an input request")
 				}
+				#[cfg(test)]
+				EngineRequest::CheckpointWithFault(_, _) => unreachable!("sent an input request"),
 			},
 		)
 	}
@@ -123,9 +137,13 @@ impl InternalSender {
 			.send(EngineRequest::Internal(event))
 			.map_err(|mpsc::SendError(request)| match request {
 				EngineRequest::Internal(event) => mpsc::SendError(event),
-				EngineRequest::Command(_) | EngineRequest::Input(_) => {
+				EngineRequest::Command(_)
+				| EngineRequest::Input(_)
+				| EngineRequest::Checkpoint(_) => {
 					unreachable!("sent an internal request")
 				}
+				#[cfg(test)]
+				EngineRequest::CheckpointWithFault(_, _) => unreachable!("sent an internal request"),
 			})
 	}
 
@@ -147,6 +165,34 @@ impl InternalSender {
 				}
 			})
 	}
+}
+
+pub(crate) fn checkpoint(
+	commands: &CommandSender,
+) -> Result<(), super::session_checkpoint::SessionCheckpointError> {
+	let (reply, response) = mpsc::channel();
+	commands
+		.tx
+		.send(EngineRequest::Checkpoint(reply))
+		.map_err(|_| super::session_checkpoint::SessionCheckpointError::EngineStopped)?;
+	response
+		.recv()
+		.map_err(|_| super::session_checkpoint::SessionCheckpointError::EngineStopped)?
+}
+
+#[cfg(test)]
+pub(crate) fn checkpoint_with_fault(
+	commands: &CommandSender,
+	fault: super::session_checkpoint::CheckpointFault,
+) -> Result<(), super::session_checkpoint::SessionCheckpointError> {
+	let (reply, response) = mpsc::channel();
+	commands
+		.tx
+		.send(EngineRequest::CheckpointWithFault(fault, reply))
+		.map_err(|_| super::session_checkpoint::SessionCheckpointError::EngineStopped)?;
+	response
+		.recv()
+		.map_err(|_| super::session_checkpoint::SessionCheckpointError::EngineStopped)?
 }
 
 pub(crate) fn channel() -> (

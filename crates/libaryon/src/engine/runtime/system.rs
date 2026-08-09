@@ -27,19 +27,18 @@ use rune::ast::{self, Spanned};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 use std::ops::Range;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 fn detect_language(
 	lang_registry: &super::super::language::LanguageRegistry,
-	path: &str,
+	path: &Path,
 ) -> Option<super::super::language::LanguageId> {
-	Path::new(path)
-		.extension()
+	path.extension()
 		.and_then(|ext| ext.to_str())
 		.and_then(|ext| lang_registry.resolve_language_id(ext))
 }
 
-fn file_stamp_for_path(path: &str) -> Option<FileStamp> {
+fn file_stamp_for_path(path: &Path) -> Option<FileStamp> {
 	std::fs::metadata(path)
 		.ok()
 		.map(|metadata| FileStamp::from_metadata(&metadata))
@@ -902,7 +901,7 @@ fn save_document_with_fresh_backing(
 	ctx: &RuntimeContext<'_>,
 	root: NodeId,
 	source_path: Option<&Path>,
-	target_path: &str,
+	target_path: &Path,
 	durability: SaveDurability,
 	next_dynamic_device_id: &mut u16,
 	backing_device_id: &mut Option<u16>,
@@ -911,13 +910,7 @@ fn save_document_with_fresh_backing(
 	// later save would redirect every older span carrying that id to the new
 	// file, so reserve a fresh id before the save can make any filesystem change.
 	let device_id = allocate_dynamic_device_id(next_dynamic_device_id)?;
-	let outcome = save_document(
-		ctx.registry,
-		root,
-		source_path,
-		Path::new(target_path),
-		durability,
-	)?;
+	let outcome = save_document(ctx.registry, root, source_path, target_path, durability)?;
 	match ctx.resolver.register_device(device_id, target_path) {
 		Ok(()) => {
 			// Only discard resident bytes once both resolver backends can
@@ -942,7 +935,8 @@ fn save_document_with_fresh_backing(
 				outcome,
 				rebound: false,
 				warning: Some(format!(
-					"Saved \"{target_path}\", but could not register its new backing file: {error}; keeping the current in-memory document"
+					"Saved \"{}\", but could not register its new backing file: {error}; keeping the current in-memory document",
+					target_path.to_string_lossy()
 				)),
 			})
 		}
@@ -976,7 +970,7 @@ fn create_document_from_bytes(
 
 pub(super) fn load_root_from_path(
 	ctx: &RuntimeContext<'_>,
-	path: &str,
+	path: &Path,
 	next_dynamic_device_id: &mut u16,
 ) -> Result<(NodeId, NodeId, Option<u16>), String> {
 	let metadata = std::fs::metadata(path).map_err(|e| format!("Open error: {}", e))?;
@@ -991,7 +985,7 @@ pub(super) fn load_root_from_path(
 		ctx.registry,
 		metadata.len(),
 		device_id,
-		path.to_string(),
+		path.to_path_buf(),
 	)?;
 	let cursor_leaf = ctx
 		.registry
@@ -1004,12 +998,13 @@ pub(super) fn load_root_from_path(
 fn initialize_loaded_document(
 	ctx: &RuntimeContext<'_>,
 	root_id: &mut Option<NodeId>,
-	file_path: &mut Option<String>,
+	file_path: &mut Option<PathBuf>,
 	virtual_path: &mut Option<String>,
-	backing_path: &mut Option<String>,
+	backing_path: &mut Option<PathBuf>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
 	active_language_id: &mut Option<super::super::language::LanguageId>,
+	language_selection: &mut super::super::session::LanguageSelection,
 	shadow: &mut Option<ShadowSession>,
 	ledger: &mut UndoLedger,
 	folds: &mut FoldSet,
@@ -1017,9 +1012,9 @@ fn initialize_loaded_document(
 	active_visual: &mut Option<(DocByte, VisualKind)>,
 	scroll_y: &mut u64,
 	scroll_row_offset: &mut DisplayRow,
-	path: Option<String>,
+	path: Option<PathBuf>,
 	new_virtual_path: Option<String>,
-	backing: Option<String>,
+	backing: Option<PathBuf>,
 	language_id: Option<super::super::language::LanguageId>,
 	shadow_session: Option<ShadowSession>,
 	new_root: NodeId,
@@ -1033,6 +1028,7 @@ fn initialize_loaded_document(
 		ctx.registry.cancel_metric_scan(old_root);
 	}
 	*active_language_id = language_id;
+	*language_selection = super::super::session::LanguageSelection::Auto;
 	*file_stamp = path.as_deref().and_then(file_stamp_for_path);
 	*file_path = path;
 	*virtual_path = new_virtual_path;
@@ -1057,12 +1053,13 @@ fn initialize_loaded_document(
 fn reload_loaded_document(
 	ctx: &RuntimeContext<'_>,
 	root_id: &mut Option<NodeId>,
-	file_path: &mut Option<String>,
+	file_path: &mut Option<PathBuf>,
 	virtual_path: &mut Option<String>,
-	backing_path: &mut Option<String>,
+	backing_path: &mut Option<PathBuf>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
 	active_language_id: &mut Option<super::super::language::LanguageId>,
+	language_selection: &mut super::super::session::LanguageSelection,
 	shadow: &mut Option<ShadowSession>,
 	parked_generations: &mut ParkedGenerationCache,
 	pending_parked_retirements: &mut u64,
@@ -1075,7 +1072,7 @@ fn reload_loaded_document(
 	scroll_row_offset: &mut DisplayRow,
 	semantic: &mut SemanticRuntime<'_>,
 	next_dynamic_device_id: &mut u16,
-	path: String,
+	path: PathBuf,
 	preserve_position: bool,
 ) -> Result<u64, String> {
 	let metadata = std::fs::metadata(&path).map_err(|e| format!("Open error: {}", e))?;
@@ -1110,6 +1107,7 @@ fn reload_loaded_document(
 		backing_device_id,
 		file_stamp,
 		active_language_id,
+		language_selection,
 		shadow,
 		ledger,
 		folds,
@@ -1480,8 +1478,9 @@ pub(super) fn handle_persist_view_doctab_command(
 /// path depends on the document's size and leaf layout, so this message is the
 /// only place they can learn that this file now has a tail that a power loss
 /// could tear.
-fn save_status_message(path: &str, outcome: SaveOutcome) -> String {
+fn save_status_message(path: &Path, outcome: SaveOutcome) -> String {
 	let bytes = outcome.stats.logical_bytes;
+	let path = path.to_string_lossy();
 	match outcome.method {
 		SaveMethod::AtomicReplace => format!("\"{path}\" {bytes}B written"),
 		SaveMethod::InPlaceSuffix => {
@@ -1502,7 +1501,7 @@ pub(super) fn handle_file_doctab_command(
 		match read_document_snapshot(
 			ctx.registry,
 			tab.document.root_id,
-			tab.document.backing_path.as_deref().map(Path::new),
+			tab.document.backing_path.as_deref(),
 		) {
 			Ok(bytes) => {
 				ui.document_text_response = Some(String::from_utf8_lossy(&bytes).into_owned());
@@ -1559,6 +1558,7 @@ pub(super) fn handle_file_doctab_command(
 				&mut tab.document.backing_device_id,
 				&mut tab.document.file_stamp,
 				&mut tab.document.active_language_id,
+				&mut tab.document.language_selection,
 				&mut tab.document.shadow,
 				&mut tab.document.parked_generations,
 				&mut tab.document.pending_parked_retirements,
@@ -1630,7 +1630,10 @@ pub(super) fn handle_auto_reload_doctab_command(
 		Err(_) => {
 			if previous_stamp.is_some() {
 				tab.document.file_stamp = None;
-				ui.status_message = Some(format!("\"{}\" no longer exists on disk", path));
+				ui.status_message = Some(format!(
+					"\"{}\" no longer exists on disk",
+					path.to_string_lossy()
+				));
 				return CommandEffect::render();
 			}
 			return CommandEffect::default();
@@ -1643,7 +1646,10 @@ pub(super) fn handle_auto_reload_doctab_command(
 
 	if tab.document.ledger.is_dirty() {
 		tab.document.file_stamp = Some(current_stamp);
-		ui.status_message = Some(format!("\"{}\" changed on disk; use :e! to reload", path));
+		ui.status_message = Some(format!(
+			"\"{}\" changed on disk; use :e! to reload",
+			path.to_string_lossy()
+		));
 		return CommandEffect::render();
 	}
 
@@ -1676,6 +1682,7 @@ pub(super) fn handle_auto_reload_doctab_command(
 				&mut tab.document.backing_device_id,
 				&mut tab.document.file_stamp,
 				&mut tab.document.active_language_id,
+				&mut tab.document.language_selection,
 				&mut tab.document.shadow,
 				&mut tab.document.parked_generations,
 				&mut tab.document.pending_parked_retirements,
@@ -1714,7 +1721,7 @@ pub(super) fn handle_auto_reload_doctab_command(
 			tab.document.search_matches.clear();
 			*tab.match_index = None;
 			*tab.match_info = None;
-			ui.status_message = Some(format!("\"{}\" {}B reloaded", path, len));
+			ui.status_message = Some(format!("\"{}\" {}B reloaded", path.to_string_lossy(), len));
 			CommandEffect::render()
 		}
 		Err(msg) => {
@@ -1735,6 +1742,7 @@ pub(super) fn handle_language_doctab_command(
 		let effect = handle_language_command(
 			lang_registry,
 			&mut tab.document.active_language_id,
+			&mut tab.document.language_selection,
 			tab.document.file_path.is_some(),
 			&mut tab.document.virtual_path,
 			&mut semantic,
@@ -1809,12 +1817,13 @@ pub(super) fn handle_fold_command(
 pub(super) fn handle_file_command(
 	ctx: &RuntimeContext<'_>,
 	root_id: &mut Option<NodeId>,
-	file_path: &mut Option<String>,
+	file_path: &mut Option<PathBuf>,
 	virtual_path: &mut Option<String>,
-	backing_path: &mut Option<String>,
+	backing_path: &mut Option<PathBuf>,
 	backing_device_id: &mut Option<u16>,
 	file_stamp: &mut Option<FileStamp>,
 	active_language_id: &mut Option<super::super::language::LanguageId>,
+	language_selection: &mut super::super::session::LanguageSelection,
 	shadow: &mut Option<ShadowSession>,
 	parked_generations: &mut ParkedGenerationCache,
 	pending_parked_retirements: &mut u64,
@@ -1834,6 +1843,7 @@ pub(super) fn handle_file_command(
 ) -> CommandEffect {
 	match command {
 		EditorCommand::LoadFile(path) => {
+			let path = PathBuf::from(path);
 			super::discard_attached_shadow(
 				ctx,
 				shadow,
@@ -1842,13 +1852,13 @@ pub(super) fn handle_file_command(
 				pending_parked_payload_retirements,
 			);
 			let language_id = detect_language(ctx.lang_registry, &path);
-			match load_shadow_session(Path::new(&path)) {
+			match load_shadow_session(&path) {
 				Ok(Some(recovered_shadow)) => {
 					if let Some(current_generation) = recovered_shadow.current_generation().cloned()
 					{
 						match load_root_from_path(
 							ctx,
-							&current_generation.path,
+							Path::new(&current_generation.path),
 							next_dynamic_device_id,
 						) {
 							Ok((rid, cursor_leaf, device_id)) => {
@@ -1861,6 +1871,7 @@ pub(super) fn handle_file_command(
 									backing_device_id,
 									file_stamp,
 									active_language_id,
+									language_selection,
 									shadow,
 									ledger,
 									folds,
@@ -1870,7 +1881,7 @@ pub(super) fn handle_file_command(
 									scroll_row_offset,
 									Some(path.clone()),
 									None,
-									Some(current_generation.path.clone()),
+									Some(PathBuf::from(current_generation.path.clone())),
 									language_id,
 									Some(recovered_shadow),
 									rid,
@@ -1905,6 +1916,7 @@ pub(super) fn handle_file_command(
 								backing_device_id,
 								file_stamp,
 								active_language_id,
+								language_selection,
 								shadow,
 								ledger,
 								folds,
@@ -1935,6 +1947,7 @@ pub(super) fn handle_file_command(
 								backing_device_id,
 								file_stamp,
 								active_language_id,
+								language_selection,
 								shadow,
 								ledger,
 								folds,
@@ -1972,6 +1985,7 @@ pub(super) fn handle_file_command(
 					backing_device_id,
 					file_stamp,
 					active_language_id,
+					language_selection,
 					shadow,
 					parked_generations,
 					pending_parked_retirements,
@@ -1987,7 +2001,10 @@ pub(super) fn handle_file_command(
 					path.clone(),
 					true,
 				) {
-					Ok(len) => *status_message = Some(format!("\"{}\" {}B reloaded", path, len)),
+					Ok(len) => {
+						*status_message =
+							Some(format!("\"{}\" {}B reloaded", path.to_string_lossy(), len))
+					}
 					Err(msg) => *status_message = Some(msg),
 				}
 			} else {
@@ -2000,7 +2017,7 @@ pub(super) fn handle_file_command(
 					match save_document_with_fresh_backing(
 						ctx,
 						rid,
-						backing_path.as_deref().map(Path::new),
+						backing_path.as_deref(),
 						path,
 						save_durability,
 						next_dynamic_device_id,
@@ -2009,7 +2026,7 @@ pub(super) fn handle_file_command(
 						Ok(completion) => {
 							ledger.mark_saved();
 							if completion.rebound {
-								*backing_path = Some(path.to_string());
+								*backing_path = Some(path.to_path_buf());
 							}
 							*file_stamp = file_stamp_for_path(path);
 							super::discard_attached_shadow(
@@ -2033,8 +2050,9 @@ pub(super) fn handle_file_command(
 			}
 		}
 		EditorCommand::WriteFileAs(path) => {
+			let path = PathBuf::from(path);
 			if let Some(rid) = *root_id {
-				let source_path = backing_path.as_deref().map(Path::new);
+				let source_path = backing_path.as_deref();
 				match save_document_with_fresh_backing(
 					ctx,
 					rid,
@@ -2054,6 +2072,7 @@ pub(super) fn handle_file_command(
 							*backing_path = Some(path.clone());
 						}
 						*active_language_id = detect_language(ctx.lang_registry, &path);
+						*language_selection = super::super::session::LanguageSelection::Auto;
 						semantic.reset_semantic_state();
 						*file_path = Some(path);
 						// The document now has a real file identity; only a
@@ -2079,7 +2098,7 @@ pub(super) fn handle_file_command(
 					match save_document_with_fresh_backing(
 						ctx,
 						rid,
-						backing_path.as_deref().map(Path::new),
+						backing_path.as_deref(),
 						path,
 						save_durability,
 						next_dynamic_device_id,
@@ -2088,7 +2107,7 @@ pub(super) fn handle_file_command(
 						Ok(completion) => {
 							ledger.mark_saved();
 							if completion.rebound {
-								*backing_path = Some(path.to_string());
+								*backing_path = Some(path.to_path_buf());
 							}
 							*file_stamp = file_stamp_for_path(path);
 							super::discard_attached_shadow(
@@ -2117,7 +2136,7 @@ pub(super) fn handle_file_command(
 			language,
 			virtual_path: requested_virtual_path,
 		} => {
-			let (language_id, derived_virtual_path) = match language.as_deref() {
+			let (language_id, derived_virtual_path, selection) = match language.as_deref() {
 				Some(name_or_extension) => {
 					match ctx
 						.lang_registry
@@ -2130,6 +2149,9 @@ pub(super) fn handle_file_command(
 								.extensions()
 								.first()
 								.map(|extension| format!("untitled.{extension}")),
+							super::super::session::LanguageSelection::Explicit(
+								provider.language_id().to_string(),
+							),
 						),
 						None => {
 							*status_message =
@@ -2138,7 +2160,11 @@ pub(super) fn handle_file_command(
 						}
 					}
 				}
-				None => (None, None),
+				None => (
+					None,
+					None,
+					super::super::session::LanguageSelection::ExplicitPlaintext,
+				),
 			};
 			match create_document_from_bytes(ctx.registry, text.into_bytes()) {
 				Ok((rid, leaf)) => {
@@ -2158,6 +2184,7 @@ pub(super) fn handle_file_command(
 						backing_device_id,
 						file_stamp,
 						active_language_id,
+						language_selection,
 						shadow,
 						ledger,
 						folds,
@@ -2175,6 +2202,7 @@ pub(super) fn handle_file_command(
 						None,
 						semantic,
 					);
+					*language_selection = selection;
 				}
 				Err(msg) => *status_message = Some(msg),
 			}
@@ -2188,13 +2216,14 @@ pub(super) fn handle_file_command(
 pub(super) fn handle_language_command(
 	lang_registry: &super::super::language::LanguageRegistry,
 	active_language_id: &mut Option<super::super::language::LanguageId>,
+	language_selection: &mut super::super::session::LanguageSelection,
 	has_file_path: bool,
 	virtual_path: &mut Option<String>,
 	semantic: &mut SemanticRuntime<'_>,
 	status_message: &mut Option<String>,
 	lang_id: Option<String>,
 ) -> CommandEffect {
-	let (language_id, derived_virtual_path) = match lang_id.as_deref() {
+	let (language_id, derived_virtual_path, selection) = match lang_id.as_deref() {
 		Some(name_or_extension) => {
 			match lang_registry.resolve_supported_language_provider(name_or_extension) {
 				Some(provider) => {
@@ -2205,6 +2234,9 @@ pub(super) fn handle_language_command(
 							.extensions()
 							.first()
 							.map(|extension| format!("untitled.{extension}")),
+						super::super::session::LanguageSelection::Explicit(
+							provider.language_id().to_string(),
+						),
 					)
 				}
 				None => {
@@ -2215,10 +2247,15 @@ pub(super) fn handle_language_command(
 		}
 		None => {
 			*status_message = Some("Language set to plaintext".to_string());
-			(None, None)
+			(
+				None,
+				None,
+				super::super::session::LanguageSelection::ExplicitPlaintext,
+			)
 		}
 	};
 	*active_language_id = language_id;
+	*language_selection = selection;
 	// A pathless buffer needs a file-path-shaped identity for the language
 	// services the new language enables; a real file keeps its own identity.
 	if !has_file_path {
@@ -2232,7 +2269,7 @@ pub(super) fn handle_language_command(
 mod tests {
 	use super::{
 		RuntimeContext, create_empty_document, handle_file_doctab_command,
-		save_document_with_fresh_backing,
+		handle_language_doctab_command, save_document_with_fresh_backing,
 	};
 	use crate::core::{CursorPosition, DocByte, DocDisplayCol, DocLine, DocLineCount};
 	use crate::ecs::UastRegistry;
@@ -2240,7 +2277,7 @@ mod tests {
 	use crate::engine::protocol::{
 		ConfirmAction, EditorCommand, MoveDirection, SplitDirection, VerticalDirection,
 	};
-	use crate::engine::session::{SettingsPersistent, TestTextEditor, UiState};
+	use crate::engine::session::{LanguageSelection, SettingsPersistent, TestTextEditor, UiState};
 	use crate::engine::settings::SaveDurability;
 	use crate::engine::test_support::{
 		recv_view, spawn_test_engine, spawn_test_engine_with_csv, spawn_test_engine_with_input,
@@ -2277,6 +2314,43 @@ mod tests {
 	fn write_test_default_init_file_at(path: &std::path::Path, force: bool) -> Result<(), String> {
 		let language_registry = crate::engine::host::build_language_registry();
 		super::write_default_init_file_at(path, "main", &language_registry, force)
+	}
+
+	#[test]
+	fn product_0060_language_selection_retains_authored_provenance() {
+		let registry = UastRegistry::new(64);
+		let languages = crate::engine::host::build_language_registry();
+		let mut fixture =
+			TestTextEditor::new(&registry, &SettingsPersistent::builtin_defaults(), 80, 24);
+		let mut status = None;
+
+		{
+			let mut editor = fixture.editor_mut();
+			handle_language_doctab_command(
+				&languages,
+				&mut editor,
+				&mut status,
+				Some("rs".to_owned()),
+			);
+			assert_eq!(
+				editor.document.language_selection,
+				LanguageSelection::Explicit("rust".to_owned())
+			);
+			assert_eq!(
+				editor.document.active_language_id.map(|id| id.as_str()),
+				Some("rust")
+			);
+		}
+
+		{
+			let mut editor = fixture.editor_mut();
+			handle_language_doctab_command(&languages, &mut editor, &mut status, None);
+			assert_eq!(
+				editor.document.language_selection,
+				LanguageSelection::ExplicitPlaintext
+			);
+			assert_eq!(editor.document.active_language_id, None);
+		}
 	}
 
 	fn persist_test_setting(
@@ -2913,7 +2987,7 @@ mod tests {
 			&ctx,
 			root,
 			None,
-			target.to_str().expect("utf8 target path"),
+			&target,
 			SaveDurability::Atomic,
 			&mut next_device_id,
 			&mut backing_device_id,
@@ -2953,7 +3027,7 @@ mod tests {
 				&ctx,
 				root,
 				source_path,
-				target.to_str().expect("utf8 target path"),
+				&target,
 				SaveDurability::Atomic,
 				&mut next_device_id,
 				&mut backing_device_id,
@@ -3056,7 +3130,7 @@ mod tests {
 		let (notify, _notifications) = mpsc::channel();
 		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), notify);
 		resolver
-			.register_device(77, occupied_backing.to_str().expect("utf8 occupied path"))
+			.register_device(77, &occupied_backing)
 			.expect("occupy next device id");
 		let languages = LanguageRegistry::new();
 		let ctx = RuntimeContext {
@@ -3080,7 +3154,7 @@ mod tests {
 		};
 		let mut fixture = TestTextEditor::from_existing_text(root, leaf, &settings, 80, 24);
 		let mut tab = fixture.editor_mut();
-		tab.document.file_path = Some(target.to_string_lossy().into_owned());
+		tab.document.file_path = Some(target.clone());
 		tab.cursor.primary_mut().reset_to_start(
 			leaf,
 			tab.document.topology_rev,

@@ -43,3 +43,6 @@ zeroize.workspace = true
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"
+
+[dev-dependencies]
+trybuild = "1.0.116"

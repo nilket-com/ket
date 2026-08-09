@@ -4,6 +4,7 @@ use super::language::{LanguageInfo, LanguageRegistry};
 use super::request::{CommandSender, InputSender, InternalEvent, InternalSender};
 use super::settings::EngineSettings;
 use crate::core::expand_path;
+use crate::core::{SavedSession, Writable};
 use crate::ecs::registry::UastRegistry;
 use crate::svp::bash_provider::BashProvider;
 use crate::svp::csv_provider::{CsvProvider, TsvProvider};
@@ -81,6 +82,24 @@ pub struct EngineHandle {
 
 impl EngineHandle {
 	pub fn spawn(config: EngineConfig) -> Self {
+		Self::spawn_inner(config, None)
+			.expect("ephemeral engine construction has no saved-session failure path")
+	}
+
+	pub fn spawn_saved(
+		config: EngineConfig,
+		saved: SavedSession<Writable>,
+	) -> Result<Self, super::session_checkpoint::SessionRestoreError> {
+		if config.initial_file.is_some() {
+			return Err(super::session_checkpoint::SessionRestoreError::InitialFileConflict);
+		}
+		Self::spawn_inner(config, Some(saved))
+	}
+
+	fn spawn_inner(
+		config: EngineConfig,
+		saved: Option<SavedSession<Writable>>,
+	) -> Result<Self, super::session_checkpoint::SessionRestoreError> {
 		let (commands, input, internal, rx_request) = super::request::channel();
 		let (tx_view, rx_view) = mpsc::channel::<Viewport>();
 		let (tx_host_events, rx_host_events) = super::host_event::channel();
@@ -101,6 +120,17 @@ impl EngineHandle {
 			registry.clone(),
 			tx_io_notify,
 		));
+		let lang_registry = Arc::new(build_language_registry());
+		let initial_session = saved
+			.map(|saved| {
+				super::session_checkpoint::restore_saved_session(
+					&registry,
+					&lang_registry,
+					&config.settings,
+					saved,
+				)
+			})
+			.transpose()?;
 		let internal_bridge = internal.clone();
 		let bridge_thread = thread::Builder::new()
 			.name("svp-refresh-bridge".into())
@@ -120,8 +150,6 @@ impl EngineHandle {
 				}
 			})
 			.expect("failed to spawn SVP refresh bridge");
-
-		let lang_registry = Arc::new(build_language_registry());
 		let EngineConfig {
 			settings,
 			initial_file,
@@ -133,7 +161,7 @@ impl EngineHandle {
 			let expanded = expand_path(&path);
 			expanded.to_string_lossy().into_owned()
 		});
-		let engine =
+		let mut engine =
 			Engine::new(
 				registry,
 				resolver,
@@ -158,10 +186,13 @@ impl EngineHandle {
 			.with_rune_host_config(init_script.map(|path| {
 				super::rune_host::RuneHostConfig::with_entrypoint(path, init_entrypoint)
 			}));
+		if let Some(initial_session) = initial_session {
+			engine = engine.with_initial_session(initial_session);
+		}
 		let terminate = engine.termination_handle();
 		let engine_thread = thread::spawn(move || engine.run());
 
-		Self {
+		Ok(Self {
 			commands,
 			input,
 			internal,
@@ -171,11 +202,24 @@ impl EngineHandle {
 			bridge_thread: Some(bridge_thread),
 			terminate,
 			terminate_on_drop: true,
-		}
+		})
 	}
 
 	pub fn command_sender(&self) -> CommandSender {
 		self.commands.clone()
+	}
+
+	/// Publish one ordered saved-session checkpoint synchronously.
+	pub fn checkpoint(&self) -> Result<(), super::session_checkpoint::SessionCheckpointError> {
+		super::request::checkpoint(&self.commands)
+	}
+
+	#[cfg(test)]
+	fn checkpoint_with_fault(
+		&self,
+		fault: super::session_checkpoint::CheckpointFault,
+	) -> Result<(), super::session_checkpoint::SessionCheckpointError> {
+		super::request::checkpoint_with_fault(&self.commands, fault)
 	}
 
 	pub fn input_sender(&self) -> InputSender {
@@ -277,6 +321,7 @@ mod tests {
 		handle.shutdown().expect("engine thread");
 	}
 	use crate::core::DocLine;
+	use crate::core::SessionStore;
 	use crate::engine::shadow::{discard_shadow_session, load_shadow_session, shadow_dir_for_path};
 	use crate::engine::{
 		CommandRange, EditorCommand, EditorMode, InputEvent, KeyCode, Modifiers, SubstituteFlags,
@@ -299,9 +344,18 @@ mod tests {
 	fn recv_viewport_until(
 		viewports: &std::sync::mpsc::Receiver<Viewport>,
 		description: &str,
+		predicate: impl FnMut(&Viewport) -> bool,
+	) -> Viewport {
+		recv_viewport_until_with_timeout(viewports, description, Duration::from_secs(20), predicate)
+	}
+
+	fn recv_viewport_until_with_timeout(
+		viewports: &std::sync::mpsc::Receiver<Viewport>,
+		description: &str,
+		timeout: Duration,
 		mut predicate: impl FnMut(&Viewport) -> bool,
 	) -> Viewport {
-		let deadline = Instant::now() + Duration::from_secs(20);
+		let deadline = Instant::now() + timeout;
 		loop {
 			let viewport = viewports
 				.recv_timeout(deadline.saturating_duration_since(Instant::now()))
@@ -322,6 +376,293 @@ mod tests {
 			writeln!(&mut contents, "{marker}-{line:06}-{marker}").expect("write fixture line");
 		}
 		contents.into_bytes()
+	}
+
+	#[test]
+	fn product_0060_saved_engine_checkpoints_an_ordered_prefix_and_restores_it() {
+		let root = temp_path("saved-engine-prefix", "sessions");
+		let store = SessionStore::at(root.clone());
+		let saved = store.create().expect("create saved session");
+		let session_id = saved.snapshot().session_id();
+		let mut handle =
+			EngineHandle::spawn_saved(EngineConfig::default(), saved).expect("start saved engine");
+		let commands = handle.command_sender();
+		let viewports = handle.take_viewports().expect("viewport receiver");
+		commands.send(EditorCommand::Resize(80, 24)).unwrap();
+		let initial = viewports.recv_timeout(Duration::from_secs(2)).unwrap();
+		let document_id = initial.document_id.expect("durable scratch identity");
+
+		commands
+			.send(EditorCommand::InsertText("A".to_owned()))
+			.unwrap();
+		handle.checkpoint().expect("publish A");
+		commands
+			.send(EditorCommand::InsertText("B".to_owned()))
+			.unwrap();
+		commands.send(EditorCommand::QueryDocumentText).unwrap();
+		let live = recv_viewport_until(&viewports, "live A plus B", |viewport| {
+			viewport.document_text.as_deref() == Some("AB")
+		});
+		assert_eq!(live.document_id, Some(document_id));
+		handle.shutdown().expect("stop first engine");
+
+		let saved = store.open_writable(session_id).expect("reopen checkpoint");
+		let mut restored = EngineHandle::spawn_saved(EngineConfig::default(), saved)
+			.expect("restore saved engine");
+		let commands = restored.command_sender();
+		let viewports = restored.take_viewports().unwrap();
+		commands.send(EditorCommand::Resize(80, 24)).unwrap();
+		commands.send(EditorCommand::QueryDocumentText).unwrap();
+		let reopened = recv_viewport_until(&viewports, "checkpointed prefix A", |viewport| {
+			viewport.document_text.as_deref() == Some("A")
+		});
+		assert_eq!(reopened.document_id, Some(document_id));
+		assert!(
+			reopened.is_dirty,
+			"checkpointing must not mark the file state clean"
+		);
+		restored.shutdown().expect("stop restored engine");
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0060_saved_engine_rejects_initial_file_before_start_and_releases_lock() {
+		let root = temp_path("saved-engine-initial-file", "sessions");
+		let store = SessionStore::at(root.clone());
+		let saved = store.create().unwrap();
+		let session_id = saved.snapshot().session_id();
+		let error = EngineHandle::spawn_saved(
+			EngineConfig {
+				initial_file: Some("competing.txt".to_owned()),
+				..EngineConfig::default()
+			},
+			saved,
+		)
+		.err()
+		.expect("authorities must conflict");
+		assert!(error.to_string().contains("initial_file"));
+		let reopened = store
+			.open_writable(session_id)
+			.expect("refusal must drop the exclusive handle");
+		drop(reopened);
+		let _ = fs::remove_dir_all(root);
+	}
+
+	#[test]
+	fn product_0060_saved_engine_refuses_incomplete_and_future_document_images_pre_start() {
+		use crate::engine::session_checkpoint::{DOCUMENT_OWNER_ID, DOCUMENT_OWNER_SCHEMA_VERSION};
+
+		let missing_root = temp_path("saved-engine-missing-owner", "sessions");
+		let missing_store = SessionStore::at(missing_root.clone());
+		let mut missing = missing_store.create().unwrap();
+		missing.mint_document(None).unwrap();
+		missing.commit().unwrap();
+		let missing_id = missing.snapshot().session_id();
+		let missing_error = EngineHandle::spawn_saved(EngineConfig::default(), missing)
+			.err()
+			.unwrap()
+			.to_string();
+		assert!(missing_error.contains("has no libaryon document payload"));
+		drop(missing_store.open_writable(missing_id).unwrap());
+
+		let future_root = temp_path("saved-engine-future-owner", "sessions");
+		let future_store = SessionStore::at(future_root.clone());
+		let mut future = future_store.create().unwrap();
+		let owner = crate::core::OwnerId::new(DOCUMENT_OWNER_ID).unwrap();
+		let opaque = vec![0, 0xff, 4, 2];
+		future.set_owner_payload(
+			owner.clone(),
+			DOCUMENT_OWNER_SCHEMA_VERSION + 1,
+			opaque.clone(),
+		);
+		future.commit().unwrap();
+		let future_id = future.snapshot().session_id();
+		let future_error = EngineHandle::spawn_saved(EngineConfig::default(), future)
+			.err()
+			.unwrap()
+			.to_string();
+		assert!(future_error.contains("unsupported libaryon document owner schema"));
+		let generic = future_store.open_read_only(future_id).unwrap();
+		assert_eq!(
+			generic.owner_payload(&owner),
+			Some((DOCUMENT_OWNER_SCHEMA_VERSION + 1, opaque.as_slice())),
+			"the generic store must preserve an unknown owner byte-for-byte"
+		);
+		drop(generic);
+		let _ = fs::remove_dir_all(missing_root);
+		let _ = fs::remove_dir_all(future_root);
+	}
+
+	#[test]
+	fn product_0060_checkpoint_faults_preserve_atomic_publication_boundary() {
+		use crate::engine::session_checkpoint::CheckpointFault;
+
+		let pre_root = temp_path("saved-engine-pre-current-fault", "sessions");
+		let pre_store = SessionStore::at(pre_root.clone());
+		let pre_saved = pre_store.create().unwrap();
+		let pre_id = pre_saved.snapshot().session_id();
+		let mut pre = EngineHandle::spawn_saved(EngineConfig::default(), pre_saved).unwrap();
+		let pre_commands = pre.command_sender();
+		let pre_views = pre.take_viewports().unwrap();
+		pre_commands.send(EditorCommand::Resize(80, 24)).unwrap();
+		let _ = pre_views.recv_timeout(Duration::from_secs(2)).unwrap();
+		pre_commands
+			.send(EditorCommand::InsertText("A".to_owned()))
+			.unwrap();
+		pre.checkpoint().unwrap();
+		pre_commands
+			.send(EditorCommand::InsertText("B".to_owned()))
+			.unwrap();
+		assert!(
+			pre.checkpoint_with_fault(CheckpointFault::BeforeCurrent)
+				.is_err()
+		);
+		pre.shutdown().unwrap();
+		let pre_saved = pre_store.open_writable(pre_id).unwrap();
+		let mut pre_reopened =
+			EngineHandle::spawn_saved(EngineConfig::default(), pre_saved).unwrap();
+		let pre_commands = pre_reopened.command_sender();
+		let pre_views = pre_reopened.take_viewports().unwrap();
+		pre_commands.send(EditorCommand::Resize(80, 24)).unwrap();
+		pre_commands.send(EditorCommand::QueryDocumentText).unwrap();
+		recv_viewport_until(&pre_views, "pre-pointer generation A", |viewport| {
+			viewport.document_text.as_deref() == Some("A")
+		});
+		pre_reopened.shutdown().unwrap();
+
+		let post_root = temp_path("saved-engine-post-current-fault", "sessions");
+		let post_store = SessionStore::at(post_root.clone());
+		let mut post_saved = post_store.create().unwrap();
+		let sibling = crate::core::OwnerId::new("synthetic_sibling").unwrap();
+		post_saved.set_owner_payload(sibling.clone(), 77, vec![0, 0xff, 7]);
+		post_saved.commit().unwrap();
+		let post_id = post_saved.snapshot().session_id();
+		let mut post = EngineHandle::spawn_saved(EngineConfig::default(), post_saved).unwrap();
+		let post_commands = post.command_sender();
+		let post_views = post.take_viewports().unwrap();
+		post_commands.send(EditorCommand::Resize(80, 24)).unwrap();
+		let _ = post_views.recv_timeout(Duration::from_secs(2)).unwrap();
+		post_commands
+			.send(EditorCommand::InsertText("A".to_owned()))
+			.unwrap();
+		post.checkpoint().unwrap();
+		post_commands
+			.send(EditorCommand::InsertText("B".to_owned()))
+			.unwrap();
+		assert!(
+			post.checkpoint_with_fault(CheckpointFault::AfterCurrent)
+				.is_err()
+		);
+		post_commands
+			.send(EditorCommand::InsertText("C".to_owned()))
+			.unwrap();
+		let poisoned = post.checkpoint().unwrap_err().to_string();
+		assert!(poisoned.contains("later edits are not session-checkpointable"));
+		post_commands
+			.send(EditorCommand::QueryDocumentText)
+			.unwrap();
+		recv_viewport_until(&post_views, "live post-fault bytes", |viewport| {
+			viewport.document_text.as_deref() == Some("ABC") && viewport.is_dirty
+		});
+		post.shutdown().unwrap();
+
+		let post_saved = post_store.open_writable(post_id).unwrap();
+		assert_eq!(
+			post_saved.owner_payload(&sibling),
+			Some((77, &[0, 0xff, 7][..])),
+			"document checkpoint must preserve an unknown sibling owner"
+		);
+		let mut post_reopened =
+			EngineHandle::spawn_saved(EngineConfig::default(), post_saved).unwrap();
+		let commands = post_reopened.command_sender();
+		let views = post_reopened.take_viewports().unwrap();
+		commands.send(EditorCommand::Resize(80, 24)).unwrap();
+		commands.send(EditorCommand::QueryDocumentText).unwrap();
+		recv_viewport_until(&views, "post-pointer complete AB generation", |viewport| {
+			viewport.document_text.as_deref() == Some("AB")
+		});
+		post_reopened.shutdown().unwrap();
+		let _ = fs::remove_dir_all(pre_root);
+		let _ = fs::remove_dir_all(post_root);
+	}
+
+	#[cfg(unix)]
+	#[test]
+	fn product_0060_saved_engine_restores_and_saves_exact_non_utf8_paths() {
+		use crate::engine::session::{FileStamp, LanguageSelection};
+		use crate::engine::session_checkpoint::{
+			DOCUMENT_OWNER_ID, DOCUMENT_OWNER_SCHEMA_VERSION, DocumentCheckpoint,
+			encode_document_owner,
+		};
+		use std::ffi::OsString;
+		use std::os::unix::ffi::OsStringExt;
+
+		let root = temp_path("saved-engine-non-utf8", "fixture");
+		fs::create_dir_all(&root).unwrap();
+		let first = root.join(OsString::from_vec(vec![
+			b'd', b'o', b'c', b'-', 0xff, b'.', b't', b'x', b't',
+		]));
+		let second = root.join(OsString::from_vec(vec![
+			b'd', b'o', b'c', b'-', 0xfe, b'.', b't', b'x', b't',
+		]));
+		fs::write(&first, b"first").unwrap();
+		fs::write(&second, b"second").unwrap();
+		assert_eq!(first.to_string_lossy(), second.to_string_lossy());
+
+		let store = SessionStore::at(root.join("sessions"));
+		let mut saved = store.create().unwrap();
+		let first_id = saved.mint_document(Some(first.clone())).unwrap();
+		let second_id = saved.mint_document(Some(second.clone())).unwrap();
+		let checkpoint = |document_id, path: &std::path::Path, bytes: &[u8]| DocumentCheckpoint {
+			document_id,
+			bytes: bytes.to_vec(),
+			dirty: false,
+			virtual_path: None,
+			language_selection: LanguageSelection::Auto,
+			file_stamp: Some(FileStamp::from_metadata(&fs::metadata(path).unwrap())),
+		};
+		let payload = encode_document_owner(
+			&[
+				checkpoint(first_id, &first, b"first"),
+				checkpoint(second_id, &second, b"second"),
+			],
+			64,
+		)
+		.unwrap();
+		saved.set_owner_payload(
+			crate::core::OwnerId::new(DOCUMENT_OWNER_ID).unwrap(),
+			DOCUMENT_OWNER_SCHEMA_VERSION,
+			payload,
+		);
+		saved.commit().unwrap();
+
+		let mut handle = EngineHandle::spawn_saved(EngineConfig::default(), saved).unwrap();
+		let commands = handle.command_sender();
+		let views = handle.take_viewports().unwrap();
+		commands.send(EditorCommand::Resize(80, 24)).unwrap();
+		let opened = recv_viewport_until(&views, "exact non-UTF-8 file", |viewport| {
+			viewport.document_id == Some(first_id) && visible_text(viewport).starts_with(b"first")
+		});
+		assert_eq!(opened.tabs.len(), 2, "lossy-equal names must not alias");
+		commands
+			.send(EditorCommand::InsertText("X".to_owned()))
+			.unwrap();
+		commands.send(EditorCommand::WriteFile).unwrap();
+		recv_viewport_until(&views, "exact non-UTF-8 save", |viewport| {
+			viewport
+				.status_message
+				.as_deref()
+				.is_some_and(|status| status.contains("written"))
+		});
+		handle.shutdown().unwrap();
+		assert_eq!(fs::read(&first).unwrap(), b"Xfirst");
+		assert_eq!(fs::read(&second).unwrap(), b"second");
+		let lossy_sibling = std::path::PathBuf::from(first.to_string_lossy().into_owned());
+		assert!(
+			!lossy_sibling.exists(),
+			"the rendered replacement-character spelling must never become an I/O path"
+		);
+		let _ = fs::remove_dir_all(root);
 	}
 
 	fn temp_path(name: &str, extension: &str) -> std::path::PathBuf {
@@ -2611,12 +2952,21 @@ pub fn main(editor) {
 		let input = handle.input_sender();
 		let viewports = handle.take_viewports().expect("viewport receiver");
 		type_ex_command(&input, "readquota");
-		let viewport = recv_viewport_until(&viewports, "Rune read quota error", |viewport| {
-			viewport
-				.status_message
-				.as_deref()
-				.is_some_and(|message| message.contains("read-byte quota exhausted"))
-		});
+		// This deliberately moves 33 MiB through the real host boundary. Under
+		// the full parallel workspace suite it competes with every language and
+		// renderer fixture, so its timeout measures completion rather than the
+		// ordinary low-latency viewport expectation.
+		let viewport = recv_viewport_until_with_timeout(
+			&viewports,
+			"Rune read quota error",
+			Duration::from_secs(60),
+			|viewport| {
+				viewport
+					.status_message
+					.as_deref()
+					.is_some_and(|message| message.contains("read-byte quota exhausted"))
+			},
+		);
 		assert!(
 			viewport
 				.status_message

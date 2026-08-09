@@ -194,14 +194,8 @@ mod tests {
 		let registry = Arc::new(UastRegistry::new(1_000_000));
 		let (tx, _rx) = mpsc::channel();
 		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), tx);
-		let root = ingest_svp_file(
-			&resolver,
-			&registry,
-			identity.length,
-			501,
-			path.to_string_lossy().into_owned(),
-		)
-		.expect("warm sparse ingest");
+		let root = ingest_svp_file(&resolver, &registry, identity.length, 501, path.clone())
+			.expect("warm sparse ingest");
 
 		assert_eq!(registry.exact_line_count(root), Some(1));
 		assert_eq!(registry.stats().allocated_nodes, extent_count + 1);

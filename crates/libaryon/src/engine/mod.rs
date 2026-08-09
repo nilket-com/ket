@@ -34,6 +34,7 @@ mod runtime;
 mod runtime_registry;
 mod semantic;
 mod session;
+mod session_checkpoint;
 pub mod settings;
 mod shadow;
 pub mod structural_graft;
@@ -76,6 +77,7 @@ pub use self::protocol::{
 	SplitDirection, SubstituteFlags, UastInspectorMode, VerticalDirection, VisualKind, WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
+pub use self::session_checkpoint::{SessionCheckpointError, SessionRestoreError};
 pub use self::theme::{
 	ResolvedCategoricalPalette, ResolvedThemePair, ResolvedThemePalette, THEME_SPECS, Theme,
 	ThemeFamily, canonical_theme_names,

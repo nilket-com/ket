@@ -101,7 +101,7 @@ impl DocumentId {
 		self.0.get()
 	}
 
-	fn new(value: u64) -> Result<Self, SessionStoreError> {
+	pub(crate) fn new(value: u64) -> Result<Self, SessionStoreError> {
 		NonZeroU64::new(value)
 			.map(Self)
 			.ok_or_else(|| SessionStoreError::Corrupt("document id is zero".to_owned()))
@@ -164,6 +164,11 @@ pub struct DocumentIdentity {
 }
 
 impl DocumentIdentity {
+	#[cfg(test)]
+	pub(crate) fn new(id: DocumentId, path: Option<PathBuf>) -> Self {
+		Self { id, path }
+	}
+
 	pub const fn id(&self) -> DocumentId {
 		self.id
 	}
@@ -226,7 +231,7 @@ impl SessionStore {
 	}
 
 	#[cfg(test)]
-	fn at(root: PathBuf) -> Self {
+	pub(crate) fn at(root: PathBuf) -> Self {
 		Self { root }
 	}
 }
@@ -643,6 +648,20 @@ mod unix {
 
 		pub fn commit(&mut self) -> Result<(), SessionStoreError> {
 			self.commit_with_fault(CommitFault::None)
+		}
+
+		#[cfg(test)]
+		pub(crate) fn commit_before_current_failure_for_test(
+			&mut self,
+		) -> Result<(), SessionStoreError> {
+			self.commit_with_fault(CommitFault::BeforeCurrentRename)
+		}
+
+		#[cfg(test)]
+		pub(crate) fn commit_after_current_failure_for_test(
+			&mut self,
+		) -> Result<(), SessionStoreError> {
+			self.commit_with_fault(CommitFault::AfterCurrentRename)
 		}
 
 		fn commit_with_fault(&mut self, fault: CommitFault) -> Result<(), SessionStoreError> {

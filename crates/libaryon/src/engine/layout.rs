@@ -1028,7 +1028,7 @@ mod tests {
 
 		std::fs::write(&path, bytes).expect("write temp file");
 		registry
-			.register_device_path(77, path.to_str().expect("utf8 path"))
+			.register_device_path(77, &path)
 			.expect("register backing");
 		drop(chunk);
 		(registry, root, path)

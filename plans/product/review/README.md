@@ -17,8 +17,8 @@ from the records; nothing is proposed. Four documents:
   aside.
 - **`deferred_ledger.md`** — every forward promise collected with all deferring
   citations and stated dependencies, plus since-landed dispositions through
-  PRODUCT-0059, which separates shared session/document substrate from the
-  still-open document, layout, and durable-view consumers.
+  PRODUCT-0060, which restores libaryon documents and leaves the Polariton
+  layout/view/color owner plus durable named-view consumer open.
 - **`live_bridges.md`** — the 8 behaviors shipped as explicitly provisional or
   documented-not-endorsed and still standing, the 2 closed classes, and the
   borderline exclusions with reasons.

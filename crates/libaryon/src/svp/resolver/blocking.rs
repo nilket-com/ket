@@ -3,6 +3,7 @@ use super::{
 	complete_read, request_len,
 };
 use crate::ecs::registry::UastRegistry;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
@@ -34,7 +35,7 @@ impl BlockingBackend {
 		}
 	}
 
-	pub(super) fn register_device(&self, _device_id: u16, _path: &str) -> std::io::Result<()> {
+	pub(super) fn register_device(&self, _device_id: u16, _path: &Path) -> std::io::Result<()> {
 		Ok(())
 	}
 

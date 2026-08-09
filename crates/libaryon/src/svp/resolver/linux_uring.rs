@@ -7,6 +7,7 @@ use io_uring::{IoUring, opcode, types};
 use std::collections::HashMap;
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -42,7 +43,7 @@ impl LinuxUringBackend {
 		}
 	}
 
-	pub(super) fn register_device(&self, device_id: u16, path: &str) -> std::io::Result<()> {
+	pub(super) fn register_device(&self, device_id: u16, path: &Path) -> std::io::Result<()> {
 		let file = Arc::new(File::open(path)?);
 		self.fds.lock().unwrap().insert(device_id, file);
 		Ok(())

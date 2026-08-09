@@ -30,6 +30,7 @@ use crate::svp::diagnostic::DiagnosticSpan;
 use crate::svp::rust_highlight::HighlightSpan;
 use crate::uast::UastProjection;
 use std::collections::HashMap;
+use std::path::Path;
 
 pub(super) fn apply_document_deltas(
 	registry: &UastRegistry,
@@ -2034,7 +2035,7 @@ fn apply_history_replay(
 					)
 				} else {
 					let (root, _cursor_leaf, device_id) =
-						load_root_from_path(ctx, &target.path, next_dynamic_device_id)
+						load_root_from_path(ctx, Path::new(&target.path), next_dynamic_device_id)
 							.map_err(|msg| format!("Failed to reload shadow generation: {msg}"))?;
 					fresh = Some((root, device_id));
 					(root, device_id, None, None)
@@ -2121,7 +2122,7 @@ fn apply_history_replay(
 			tab.document.ledger.commit(direction);
 			tab.document.root_id = rid;
 			tab.view.folds.clear();
-			tab.document.backing_path = Some(target.path.clone());
+			tab.document.backing_path = Some(target.path.clone().into());
 			tab.document.backing_device_id = new_backing_device_id;
 			tab.reset_pipeline();
 			tab.document.search_matches.clear();
@@ -2565,10 +2566,10 @@ mod tests {
 		};
 		let mut next_dynamic_device_id = crate::engine::core::FILE_DEVICE_ID + 1;
 		let (before_root, _, before_device) =
-			load_root_from_path(&ctx, &before.path, &mut next_dynamic_device_id)
+			load_root_from_path(&ctx, Path::new(&before.path), &mut next_dynamic_device_id)
 				.expect("load cached before generation");
 		let (after_root, after_leaf, after_device) =
-			load_root_from_path(&ctx, &after.path, &mut next_dynamic_device_id)
+			load_root_from_path(&ctx, Path::new(&after.path), &mut next_dynamic_device_id)
 				.expect("load active after generation");
 
 		let invalid_dir = temp_test_path("cached-generation-invalid-shadow-dir");
@@ -2576,7 +2577,7 @@ mod tests {
 		let mut fixture = TestTextEditor::new(&registry, &test_settings(), 80, 24);
 		let mut tab = fixture.editor_mut();
 		tab.document.root_id = after_root;
-		tab.document.backing_path = Some(after.path.clone());
+		tab.document.backing_path = Some(after.path.clone().into());
 		tab.document.backing_device_id = after_device;
 		tab.document.shadow = Some(ShadowSession {
 			dir: invalid_dir.to_string_lossy().into_owned(),

@@ -404,6 +404,7 @@ mod tests {
 			panes: vec![PaneViewport {
 				pane_id,
 				buffer_id: crate::core::BufferId::new(1),
+				document_id: None,
 				view_id,
 				rect: PaneRect::new(
 					ScreenCol::ZERO,
@@ -458,6 +459,7 @@ mod tests {
 				background_override: None,
 				tabs: vec![crate::uast::projection::DocTabSummary {
 					buffer_id: crate::core::BufferId::new(1),
+					document_id: None,
 					view_id,
 					title: "test.rs".to_string(),
 					is_dirty: false,

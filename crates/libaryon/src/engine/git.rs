@@ -209,7 +209,7 @@ pub(crate) struct StepContext {
 	/// concurrent `:w PATH` keeps the buffer and the pair but changes what
 	/// the snapshot would be paired against — and stales the repository
 	/// paths captured at dispatch — so any change invalidates the step.
-	pub(crate) left_file_path: Option<String>,
+	pub(crate) left_file_path: Option<std::path::PathBuf>,
 }
 
 /// Parse the pin phase's `git rev-parse` output: exactly one hex object id

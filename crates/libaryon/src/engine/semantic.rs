@@ -352,7 +352,7 @@ mod tests {
 		{
 			let editor = fixture.editor_mut();
 			editor.document.root_id = root;
-			editor.document.file_path = Some(path.to_string());
+			editor.document.file_path = Some(path.into());
 			editor.cursor.primary_mut().reset_to_start(
 				leaf,
 				editor.document.topology_rev,

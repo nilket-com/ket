@@ -20,9 +20,9 @@ use super::shadow::ShadowSession;
 use super::undo::{GenerationTarget, UndoLedger};
 use crate::core::{
 	BufferId, DEFAULT_VIEWPORT_LINES, DEFAULT_VIEWPORT_WIDTH, DisplayRow, DocByte, DocDisplayCol,
-	DocLine, JobId, PaneCol, PaneId, PaneRect, PaneRow, RegistryOwnerId, RegistryRev, RequestId,
-	SPLIT_DIVIDER_COLS, SPLIT_DIVIDER_ROWS, STATUS_BAR_ROWS, ScreenCol, ScreenRow, StateId,
-	TopologyRev, ViewId, ViewportId,
+	DocLine, DocumentId, JobId, PaneCol, PaneId, PaneRect, PaneRow, RegistryOwnerId, RegistryRev,
+	RequestId, SPLIT_DIVIDER_COLS, SPLIT_DIVIDER_ROWS, STATUS_BAR_ROWS, SavedSession, ScreenCol,
+	ScreenRow, StateId, TopologyRev, ViewId, ViewportId, Writable,
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
@@ -592,16 +592,16 @@ pub(crate) struct TextBuffer {
 	pub(crate) pending_parked_retirements: u64,
 	pub(crate) pending_parked_payload_retirements: u64,
 	pub(crate) topology_rev: TopologyRev,
-	pub(crate) file_path: Option<String>,
+	pub(crate) file_path: Option<PathBuf>,
 	/// Encrypted-at-rest backing owned by libaryon. This is intentionally
 	/// distinct from `file_path`: the latter always means plaintext I/O.
-	pub(crate) encrypted_backing: Option<String>,
+	pub(crate) encrypted_backing: Option<PathBuf>,
 	/// File-path-shaped identity for an unsaved in-memory document (e.g.
 	/// `statement.sql`). Feeds language services that expect a path without
 	/// claiming persistence: `file_path` stays `None` and writes still refuse.
 	pub(crate) virtual_path: Option<String>,
 	canonical_path: Option<CanonicalPath>,
-	pub(crate) backing_path: Option<String>,
+	pub(crate) backing_path: Option<PathBuf>,
 	/// Resolver device owned by the current reachable document root.
 	///
 	/// Replaced roots remain allocated in the registry, but are unreachable and
@@ -609,6 +609,7 @@ pub(crate) struct TextBuffer {
 	pub(crate) backing_device_id: Option<u16>,
 	pub(crate) file_stamp: Option<FileStamp>,
 	pub(crate) active_language_id: Option<super::language::LanguageId>,
+	pub(crate) language_selection: LanguageSelection,
 	pub(crate) shadow: Option<ShadowSession>,
 	pub(crate) ledger: UndoLedger,
 	pub(crate) search_matches: Vec<SearchMatch>,
@@ -618,37 +619,60 @@ pub(crate) struct TextBuffer {
 	pub(crate) semantic: Box<SemanticState>,
 }
 
+/// Authored provenance for a document's resolved language.
+///
+/// `active_language_id` is deliberately derived runtime state. This value is
+/// the authority that can cross a saved-session boundary without freezing
+/// extension-based detection or losing an explicit plaintext choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum LanguageSelection {
+	Auto,
+	ExplicitPlaintext,
+	Explicit(String),
+}
+
+pub(crate) struct RestoredDocument {
+	pub(crate) document_id: DocumentId,
+	pub(crate) bytes: Vec<u8>,
+	pub(crate) file_path: Option<PathBuf>,
+	pub(crate) virtual_path: Option<String>,
+	pub(crate) file_stamp: Option<FileStamp>,
+	pub(crate) language_selection: LanguageSelection,
+	pub(crate) active_language_id: Option<super::language::LanguageId>,
+	pub(crate) dirty: bool,
+}
+
 impl TextBuffer {
 	pub(crate) fn canonical_path(&self) -> Option<&CanonicalPath> {
 		self.canonical_path.as_ref()
 	}
 
 	pub(crate) fn new_unnamed(registry: &UastRegistry) -> Result<(Self, NodeId), String> {
+		Self::new_from_bytes(registry, Vec::new())
+	}
+
+	pub(crate) fn new_from_bytes(
+		registry: &UastRegistry,
+		bytes: Vec<u8>,
+	) -> Result<(Self, NodeId), String> {
+		let payload_bytes = bytes.len() as u64;
+		let metrics = crate::uast::SpanMetrics {
+			byte_length: bytes.len() as u64,
+			newlines: bytes.iter().filter(|byte| **byte == b'\n').count() as u64,
+		};
 		let mut chunk = registry
 			.reserve_chunk(2)
 			.ok_or_else(|| registry.capacity_refusal_message("Document creation", 2))?;
-		let root = chunk.spawn_node(
-			crate::uast::SemanticKind::RelationalTable,
-			None,
-			crate::uast::SpanMetrics {
-				byte_length: 0,
-				newlines: 0,
-			},
-		);
-		let leaf = chunk.spawn_node(
-			crate::uast::SemanticKind::Token,
-			None,
-			crate::uast::SpanMetrics {
-				byte_length: 0,
-				newlines: 0,
-			},
-		);
+		let root = chunk.spawn_node(crate::uast::SemanticKind::RelationalTable, None, metrics);
+		let leaf = chunk.spawn_node(crate::uast::SemanticKind::Token, None, metrics);
 		chunk.append_local_child(root, leaf);
-		registry.replace_authoritative_data(leaf, Vec::new());
+		registry.replace_authoritative_data(leaf, bytes);
+		let mut uast_accounting = UastOwnerAccounting::new(2);
+		uast_accounting.record_payload_transaction(payload_bytes, 0, 0);
 		Ok((
 			Self {
 				root_id: root,
-				uast_accounting: UastOwnerAccounting::new(2),
+				uast_accounting,
 				parked_generations: ParkedGenerationCache::default(),
 				pending_root_transition: None,
 				pending_parked_retirements: 0,
@@ -662,6 +686,7 @@ impl TextBuffer {
 				backing_device_id: None,
 				file_stamp: None,
 				active_language_id: None,
+				language_selection: LanguageSelection::Auto,
 				shadow: None,
 				ledger: UndoLedger::new(),
 				search_matches: Vec::new(),
@@ -742,6 +767,106 @@ pub(crate) enum BufferRole {
 	OutputPanel,
 }
 
+/// Saved-session authority plus the runtime/durable identity bijection.
+///
+/// The opened writable handle remains private to the engine for its entire
+/// lifetime. Mutations update its staged snapshot immediately; publication is
+/// still explicit and atomic at checkpoint time.
+pub(crate) struct SavedDocumentState {
+	pub(crate) session: SavedSession<Writable>,
+	by_document: BTreeMap<DocumentId, BufferId>,
+	by_buffer: HashMap<BufferId, DocumentId>,
+}
+
+impl SavedDocumentState {
+	pub(crate) fn new(session: SavedSession<Writable>) -> Self {
+		Self {
+			session,
+			by_document: BTreeMap::new(),
+			by_buffer: HashMap::new(),
+		}
+	}
+
+	pub(crate) fn bind_restored(
+		&mut self,
+		document_id: DocumentId,
+		buffer_id: BufferId,
+	) -> Result<(), String> {
+		if self.by_document.contains_key(&document_id) || self.by_buffer.contains_key(&buffer_id) {
+			return Err("saved document identity is already bound".to_owned());
+		}
+		self.by_document.insert(document_id, buffer_id);
+		self.by_buffer.insert(buffer_id, document_id);
+		Ok(())
+	}
+
+	pub(crate) fn mint(
+		&mut self,
+		buffer_id: BufferId,
+		path: Option<&Path>,
+	) -> Result<DocumentId, String> {
+		if self.by_buffer.contains_key(&buffer_id) {
+			return Err("runtime buffer already has a durable document identity".to_owned());
+		}
+		let path = path.map(absolute_lexical_path).transpose()?;
+		let document_id = self
+			.session
+			.mint_document(path)
+			.map_err(|error| error.to_string())?;
+		self.bind_restored(document_id, buffer_id)?;
+		Ok(document_id)
+	}
+
+	pub(crate) fn document_id(&self, buffer_id: BufferId) -> Option<DocumentId> {
+		self.by_buffer.get(&buffer_id).copied()
+	}
+
+	#[cfg(test)]
+	pub(crate) fn buffer_id(&self, document_id: DocumentId) -> Option<BufferId> {
+		self.by_document.get(&document_id).copied()
+	}
+
+	pub(crate) fn update_path(
+		&mut self,
+		buffer_id: BufferId,
+		path: Option<&Path>,
+	) -> Result<(), String> {
+		let document_id = self
+			.document_id(buffer_id)
+			.ok_or_else(|| "ordinary saved document has no durable identity".to_owned())?;
+		let path = path.map(absolute_lexical_path).transpose()?;
+		self.session
+			.update_document_path(document_id, path)
+			.map_err(|error| error.to_string())
+	}
+
+	pub(crate) fn remove(&mut self, buffer_id: BufferId) -> Result<Option<DocumentId>, String> {
+		let Some(document_id) = self.by_buffer.remove(&buffer_id) else {
+			return Ok(None);
+		};
+		let removed = self.by_document.remove(&document_id);
+		assert_eq!(
+			removed,
+			Some(buffer_id),
+			"saved document bijection diverged"
+		);
+		self.session
+			.remove_document(document_id)
+			.map_err(|error| error.to_string())?;
+		Ok(Some(document_id))
+	}
+}
+
+pub(crate) fn absolute_lexical_path(path: &Path) -> Result<PathBuf, String> {
+	if path.is_absolute() {
+		Ok(path.to_path_buf())
+	} else {
+		std::env::current_dir()
+			.map(|current| current.join(path))
+			.map_err(|error| format!("Current directory unavailable: {error}"))
+	}
+}
+
 pub(crate) struct Buffer {
 	pub(crate) id: BufferId,
 	pub(crate) content: BufferContent,
@@ -780,7 +905,7 @@ impl Buffer {
 
 	pub(crate) fn file_path(&self) -> Option<&str> {
 		match &self.content {
-			BufferContent::Text(buffer) => buffer.file_path.as_deref(),
+			BufferContent::Text(buffer) => buffer.file_path.as_deref().and_then(Path::to_str),
 			BufferContent::FileBrowser(buffer) => Some(&buffer.file_path),
 			BufferContent::MarkdownPreview(buffer) => Some(&buffer.title),
 			// A host panel is never file-backed: it has a title, not a path.
@@ -933,6 +1058,10 @@ impl BufferStore {
 
 	pub(crate) fn insert(&mut self, content: BufferContent) -> BufferId {
 		self.insert_with_role(content, BufferRole::Document)
+	}
+
+	pub(crate) fn next_buffer_id(&self) -> BufferId {
+		self.next_buffer_id
 	}
 
 	pub(crate) fn insert_with_role(
@@ -1844,7 +1973,7 @@ pub(crate) struct CommonViewState {
 	pub(crate) last_minimap_state: Option<StateId>,
 	pub(crate) last_minimap_semantic_revision: u64,
 	pub(crate) last_minimap_total_lines: u64,
-	pub(crate) last_minimap_path: Option<String>,
+	pub(crate) last_minimap_path: Option<PathBuf>,
 }
 
 impl CommonViewState {
@@ -2475,6 +2604,7 @@ impl TestTextEditor {
 					backing_device_id: None,
 					file_stamp: None,
 					active_language_id: None,
+					language_selection: LanguageSelection::Auto,
 					shadow: None,
 					ledger: UndoLedger::new(),
 					search_matches: Vec::new(),
@@ -4069,6 +4199,7 @@ pub(crate) struct EditorSession {
 	pub(crate) viewport_id: ViewportId,
 	pub(crate) hit_test_fingerprint: Option<u64>,
 	pub(crate) buffers: BufferStore,
+	pub(crate) saved_documents: Option<SavedDocumentState>,
 	pub(crate) layout: LayoutNode,
 	pub(crate) host_panel_groups: HashMap<HostPanelGroupId, HostPanelGroupState>,
 	pub(crate) focused_pane_id: PaneId,
@@ -4119,6 +4250,26 @@ pub(crate) const DEFAULT_GIT_REFRESH_MODE: super::protocol::GitRefreshMode =
 	super::protocol::GitRefreshMode::Interval(super::protocol::DEFAULT_GIT_REFRESH_SECONDS);
 
 impl EditorSession {
+	pub(crate) fn attach_new_saved_session(
+		&mut self,
+		session: SavedSession<Writable>,
+	) -> Result<(), String> {
+		if self.saved_documents.is_some() {
+			return Err("editor already owns a saved session".to_owned());
+		}
+		let mut saved = SavedDocumentState::new(session);
+		for (buffer_id, buffer) in self.buffers.iter() {
+			if buffer.role == BufferRole::Document
+				&& !self.snapshot_partners.contains_key(&buffer_id)
+				&& let Some(document) = buffer.text()
+			{
+				saved.mint(buffer_id, document.file_path.as_deref())?;
+			}
+		}
+		self.saved_documents = Some(saved);
+		Ok(())
+	}
+
 	#[allow(dead_code)] // first production caller lands in the Rune jobs binding
 	pub(crate) fn spawn_job(
 		&mut self,
@@ -4608,6 +4759,143 @@ impl EditorSession {
 		let (initial_buffer, initial_leaf) = TextBuffer::new_unnamed(registry)
 			.expect("failed to create initial unnamed text buffer");
 		let initial_buffer_id = buffers.insert(BufferContent::Text(initial_buffer));
+		let layout = LayoutNode::Leaf(LayoutLeaf {
+			group_root: None,
+			pane_id: focused_pane_id,
+			pane: EditorPane::new_empty(
+				initial_view_id,
+				initial_buffer_id,
+				initial_leaf,
+				&persistent_settings,
+			),
+		});
+		Self::from_workspace(
+			persistent_settings,
+			buffers,
+			None,
+			layout,
+			initial_view_id.next(),
+			startup_status,
+		)
+	}
+
+	#[allow(clippy::too_many_arguments)]
+	pub(crate) fn new_restored(
+		registry: &UastRegistry,
+		initial_theme_name: String,
+		initial_minimap_enabled: bool,
+		initial_wrap_enabled: bool,
+		initial_line_numbers_enabled: bool,
+		initial_relative_line_numbers_enabled: bool,
+		initial_visible_whitespace: bool,
+		initial_reload_enabled: bool,
+		initial_save_durability: SaveDurability,
+		initial_ui_colors: UiColorOverrides,
+		initial_language_themes: BTreeMap<String, String>,
+		saved_session: SavedSession<Writable>,
+		mut documents: Vec<RestoredDocument>,
+		startup_status: Option<String>,
+	) -> Result<Self, String> {
+		if documents.is_empty() {
+			let mut session = Self::new(
+				registry,
+				initial_theme_name,
+				initial_minimap_enabled,
+				initial_wrap_enabled,
+				initial_line_numbers_enabled,
+				initial_relative_line_numbers_enabled,
+				initial_visible_whitespace,
+				initial_reload_enabled,
+				initial_save_durability,
+				initial_ui_colors,
+				initial_language_themes,
+				startup_status,
+			);
+			session.attach_new_saved_session(saved_session)?;
+			return Ok(session);
+		}
+
+		documents.sort_by_key(|document| document.document_id);
+		let persistent_settings = SettingsPersistent {
+			theme_name: initial_theme_name,
+			minimap_enabled: initial_minimap_enabled,
+			wrap_enabled: initial_wrap_enabled,
+			line_numbers_enabled: initial_line_numbers_enabled,
+			relative_line_numbers_enabled: initial_relative_line_numbers_enabled,
+			visible_whitespace: initial_visible_whitespace,
+			reload_enabled: initial_reload_enabled,
+			save_durability: initial_save_durability,
+			ui_colors: initial_ui_colors,
+			language_themes: initial_language_themes,
+		};
+		let pane_id = PaneId::new(1);
+		let mut next_view_id = ViewId::new(1);
+		let mut buffers = BufferStore::new();
+		let mut saved_documents = SavedDocumentState::new(saved_session);
+		let mut tabs = Vec::with_capacity(documents.len());
+
+		for restored in documents {
+			let (mut document, initial_leaf) =
+				TextBuffer::new_from_bytes(registry, restored.bytes)?;
+			document.file_path = restored.file_path;
+			document.virtual_path = restored.virtual_path;
+			document.file_stamp = restored.file_stamp;
+			document.language_selection = restored.language_selection;
+			document.active_language_id = restored.active_language_id;
+			if restored.dirty {
+				document.ledger.restore_dirty_baseline();
+			} else {
+				document.ledger.clear();
+			}
+			let canonical_path = document
+				.file_path
+				.as_deref()
+				.map(CanonicalPath::resolve)
+				.transpose()?;
+			let buffer_id = buffers.insert(BufferContent::Text(document));
+			if let Some(path) = canonical_path {
+				let reservation = buffers.reserve_path(buffer_id, path)?;
+				buffers.commit_path(reservation);
+			}
+			saved_documents.bind_restored(restored.document_id, buffer_id)?;
+			tabs.push(View::new_text(
+				next_view_id,
+				buffer_id,
+				initial_leaf,
+				&persistent_settings,
+				DEFAULT_VIEWPORT_WIDTH,
+				DEFAULT_VIEWPORT_LINES,
+			));
+			next_view_id = next_view_id.next();
+		}
+
+		let layout = LayoutNode::Leaf(LayoutLeaf {
+			group_root: None,
+			pane_id,
+			pane: EditorPane {
+				tabs,
+				active_tab_index: 0,
+			},
+		});
+		Ok(Self::from_workspace(
+			persistent_settings,
+			buffers,
+			Some(saved_documents),
+			layout,
+			next_view_id,
+			startup_status,
+		))
+	}
+
+	fn from_workspace(
+		persistent_settings: SettingsPersistent,
+		buffers: BufferStore,
+		saved_documents: Option<SavedDocumentState>,
+		layout: LayoutNode,
+		next_view_id: ViewId,
+		startup_status: Option<String>,
+	) -> Self {
+		let focused_pane_id = PaneId::new(1);
 
 		Self {
 			input: InputRuntime::new(),
@@ -4619,16 +4907,8 @@ impl EditorSession {
 			viewport_id: ViewportId::new(1),
 			hit_test_fingerprint: None,
 			buffers,
-			layout: LayoutNode::Leaf(LayoutLeaf {
-				group_root: None,
-				pane_id: focused_pane_id,
-				pane: EditorPane::new_empty(
-					initial_view_id,
-					initial_buffer_id,
-					initial_leaf,
-					&persistent_settings,
-				),
-			}),
+			saved_documents,
+			layout,
 			host_panel_groups: HashMap::new(),
 			focused_pane_id,
 			browser_target_pane_id: Some(focused_pane_id),
@@ -4659,7 +4939,7 @@ impl EditorSession {
 			},
 			persistent_settings,
 			next_pane_id: PaneId::new(2),
-			next_view_id: initial_view_id.next(),
+			next_view_id,
 			pending_host_events: Vec::new(),
 			next_semantic_request_id: RequestId::new(1),
 			pending_navigation: None,
@@ -5469,8 +5749,21 @@ impl EditorSession {
 		viewport_width: u16,
 		viewport_lines: u32,
 	) -> Result<View, String> {
-		let (buffer, leaf) = TextBuffer::new_unnamed(registry)?;
+		let pending_buffer_id = self.buffers.next_buffer_id();
+		if let Some(saved) = self.saved_documents.as_mut() {
+			saved.mint(pending_buffer_id, None)?;
+		}
+		let (buffer, leaf) = match TextBuffer::new_unnamed(registry) {
+			Ok(created) => created,
+			Err(error) => {
+				if let Some(saved) = self.saved_documents.as_mut() {
+					let _ = saved.remove(pending_buffer_id);
+				}
+				return Err(error);
+			}
+		};
 		let buffer_id = self.buffers.insert(BufferContent::Text(buffer));
+		assert_eq!(buffer_id, pending_buffer_id, "reserved BufferId changed");
 		let view_id = self.allocate_view_id();
 		Ok(View::new_text(
 			view_id,
@@ -6159,6 +6452,112 @@ mod tests {
 			BTreeMap::new(),
 			None,
 		)
+	}
+
+	#[test]
+	fn product_0060_saved_document_bindings_are_bijective_and_never_reuse_ids() {
+		let root = std::env::temp_dir().join(format!(
+			"libaryon-document-bindings-{}-{}",
+			std::process::id(),
+			rand::random::<u64>()
+		));
+		let saved = crate::core::SessionStore::at(root.clone())
+			.create()
+			.expect("create saved session");
+		let registry = UastRegistry::new(128);
+		let mut editor = test_editor_session(&registry);
+		let initial_buffer = editor
+			.layout
+			.find_pane(editor.focused_pane_id)
+			.unwrap()
+			.active_tab()
+			.buffer_id;
+		editor
+			.attach_new_saved_session(saved)
+			.expect("attach saved session");
+		let initial_document = editor
+			.saved_documents
+			.as_ref()
+			.and_then(|saved| saved.document_id(initial_buffer))
+			.expect("initial document id");
+		assert_eq!(initial_document.get(), 1);
+		assert_eq!(
+			editor
+				.saved_documents
+				.as_ref()
+				.and_then(|saved| saved.buffer_id(initial_document)),
+			Some(initial_buffer)
+		);
+
+		let second_view = editor
+			.create_text_view_for_buffer(&registry, initial_buffer, 80, 24)
+			.expect("second view");
+		assert_eq!(second_view.buffer_id, initial_buffer);
+		assert_eq!(
+			editor
+				.saved_documents
+				.as_ref()
+				.unwrap()
+				.session
+				.snapshot()
+				.documents()
+				.count(),
+			1,
+			"a second view must not mint a second document"
+		);
+
+		let later = editor
+			.create_unnamed_text_view(&registry, 80, 24)
+			.expect("later document");
+		let later_document = editor
+			.saved_documents
+			.as_ref()
+			.and_then(|saved| saved.document_id(later.buffer_id))
+			.expect("later document id");
+		assert_eq!(later_document.get(), 2);
+		let lexical = PathBuf::from("symlink-shaped/../kept.txt");
+		editor
+			.saved_documents
+			.as_mut()
+			.unwrap()
+			.update_path(later.buffer_id, Some(&lexical))
+			.expect("update exact path");
+		let expected = std::env::current_dir().unwrap().join(&lexical);
+		assert_eq!(
+			editor
+				.saved_documents
+				.as_ref()
+				.unwrap()
+				.session
+				.snapshot()
+				.document(later_document)
+				.unwrap()
+				.path(),
+			Some(expected.as_path()),
+			"absolute lexical identity must retain parent components"
+		);
+
+		editor
+			.saved_documents
+			.as_mut()
+			.unwrap()
+			.remove(later.buffer_id)
+			.expect("remove binding");
+		let newest = editor
+			.create_unnamed_text_view(&registry, 80, 24)
+			.expect("newest document");
+		assert_eq!(
+			editor
+				.saved_documents
+				.as_ref()
+				.and_then(|saved| saved.document_id(newest.buffer_id))
+				.unwrap()
+				.get(),
+			3,
+			"removed durable ids must never be reused"
+		);
+		drop(editor);
+		let _ = std::fs::remove_dir_all(root);
 	}
 
 	fn product_0015_members(base: u64) -> Vec<HostPanelGroupMember> {

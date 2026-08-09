@@ -207,6 +207,18 @@ impl UndoLedger {
 		self.saved_state_id = baseline;
 	}
 
+	/// Restore an unsaved document without inventing an undo transaction.
+	///
+	/// The current state is deliberately distinct from the saved-to-file
+	/// baseline, while both history stacks remain empty.
+	pub(crate) fn restore_dirty_baseline(&mut self) {
+		self.undo_stack.clear();
+		self.redo_stack.clear();
+		let restored = self.allocate_state_id();
+		self.current_state_id = restored;
+		self.saved_state_id = StateId::ZERO;
+	}
+
 	/// Mark the current state as the saved-to-disk state.
 	pub fn mark_saved(&mut self) {
 		self.saved_state_id = self.current_state_id;

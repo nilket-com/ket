@@ -523,17 +523,17 @@ fn markdown_source_snapshot(
 	let tab = text_editor(buffer, view)
 		.ok_or_else(|| "Markdown preview source is not a text buffer".to_string())?;
 	let root = tab.document.root_id;
-	let bytes = read_document_snapshot(
-		registry,
-		root,
-		tab.document.backing_path.as_deref().map(Path::new),
-	)?;
+	let bytes = read_document_snapshot(registry, root, tab.document.backing_path.as_deref())?;
 	let text = String::from_utf8_lossy(&bytes).into_owned();
 	let cells = markdown_cells(&text);
 	Ok(MarkdownSourceSnapshot {
 		buffer_id: buffer.id,
 		view_id: source_view_id,
-		path: tab.document.file_path.clone(),
+		path: tab
+			.document
+			.file_path
+			.as_ref()
+			.map(|path| path.to_string_lossy().into_owned()),
 		state_id: tab.document.ledger.current_state_id,
 		text,
 		highlights: tab.document.semantic.highlights.clone(),

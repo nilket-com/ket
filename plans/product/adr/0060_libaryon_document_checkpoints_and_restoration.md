@@ -1,12 +1,13 @@
 # ADR 0060: libaryon document checkpoints and restoration
 
-Status: proposed 2026-08-08. This record makes PRODUCT-0059's shared session
+Status: accepted 2026-08-08. This record makes PRODUCT-0059's shared session
 store consume the editor state libaryon actually owns: durable document
 bindings, exact ordinary-document bytes, file/scratch provenance, dirty state,
 and enough deterministic fallback presentation to inspect a restored document
 set. It does not persist the accepted pane topology, host-panel placement,
 cursor state, undo history, or any Polariton object. Those remain the next
-owner extension.
+owner extension. Implementation evidence is recorded in
+`../impl/0060_libaryon_document_checkpoints_and_restoration_evidence.md`.
 
 ## Context
 

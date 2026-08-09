@@ -230,7 +230,7 @@ fn product_0001_keeps_editor_crates_out_of_the_nilket_workspace() {
 }
 
 #[test]
-fn product_0059_session_store_is_capability_closed_and_has_no_startup_consumer() {
+fn product_0059_store_stays_capability_closed_and_product_0060_consumption_is_explicit() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let store_path = manifest_dir.join("src/core/session_store.rs");
 	let source = fs::read_to_string(&store_path).expect("read session store");
@@ -239,47 +239,6 @@ fn product_0059_session_store_is_capability_closed_and_has_no_startup_consumer()
 		.next()
 		.expect("session store production source");
 
-	let shared = production
-		.split("impl<Mode: sealed::AccessMode> SavedSession<Mode>")
-		.nth(1)
-		.expect("shared opened-session implementation")
-		.split("pub enum SessionStoreError")
-		.next()
-		.expect("bounded shared implementation");
-	for forbidden in [
-		"mint_document",
-		"update_document_path",
-		"remove_document",
-		"set_owner_payload",
-		"commit(",
-		"cleanup_unreferenced",
-	] {
-		assert!(
-			!shared.contains(forbidden),
-			"read-only/generic SavedSession acquired mutator {forbidden}"
-		);
-	}
-
-	let writable = production
-		.split("impl SavedSession<Writable>")
-		.nth(1)
-		.expect("writable opened-session implementation")
-		.split("fn snapshot_to_disk")
-		.next()
-		.expect("bounded writable implementation");
-	for required in [
-		"mint_document",
-		"update_document_path",
-		"remove_document",
-		"set_owner_payload",
-		"pub fn commit(",
-		"cleanup_unreferenced",
-	] {
-		assert!(
-			writable.contains(required),
-			"exclusive capability lost mutator {required}"
-		);
-	}
 	for required in [
 		"libc::O_CLOEXEC",
 		"libc::O_NOFOLLOW",
@@ -297,12 +256,35 @@ fn product_0059_session_store_is_capability_closed_and_has_no_startup_consumer()
 	collect_rs_files(&manifest_dir.join("src/engine"), &mut engine_sources);
 	for path in engine_sources {
 		let engine = fs::read_to_string(&path).expect("read engine source");
+		let engine = engine
+			.split("\n#[cfg(test)]\nmod tests {")
+			.next()
+			.expect("production engine prefix");
+		let names = |identifier: &str| {
+			engine
+				.split(|character: char| !(character.is_alphanumeric() || character == '_'))
+				.any(|token| token == identifier)
+		};
 		assert!(
-			!engine.contains("SessionStore") && !engine.contains("SavedSession"),
-			"{} made PRODUCT-0059 reachable from ordinary startup",
+			!names("SessionStore"),
+			"{} made store discovery or creation an engine concern",
 			path.display()
 		);
+		if names("SavedSession") {
+			let name = path.file_name().and_then(|name| name.to_str());
+			assert!(
+				matches!(
+					name,
+					Some("host.rs" | "session.rs" | "session_checkpoint.rs")
+				),
+				"{} consumed the saved-session capability outside PRODUCT-0060's explicit host, live binding, or checkpoint boundary",
+				path.display()
+			);
+		}
 	}
+	let host = fs::read_to_string(manifest_dir.join("src/engine/host.rs")).expect("read host");
+	assert!(host.contains("pub fn spawn(config: EngineConfig) -> Self"));
+	assert!(host.contains("pub fn spawn_saved("));
 
 	let polariton = manifest_dir
 		.parent()
@@ -316,10 +298,29 @@ fn product_0059_session_store_is_capability_closed_and_has_no_startup_consumer()
 			!head.contains("SessionStore")
 				&& !head.contains("SavedSession")
 				&& !head.contains("DocumentId"),
-			"{} consumed persistence before document restoration",
+			"{} consumed persistence before the Polariton owner extension",
 			path.display()
 		);
 	}
+}
+
+#[test]
+fn product_0060_trybuild_is_a_dev_only_capability_oracle() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read manifest");
+	let (production, development) = manifest
+		.split_once("[dev-dependencies]")
+		.expect("libaryon declares dev dependencies");
+	assert!(
+		!production.contains("trybuild"),
+		"trybuild must not enter libaryon's production dependency graph"
+	);
+	assert!(
+		development
+			.lines()
+			.any(|line| line.starts_with("trybuild = ")),
+		"trybuild must remain the dev-only compiler oracle"
+	);
 }
 
 #[test]

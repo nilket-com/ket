@@ -153,27 +153,29 @@ promise of one.) — 0027 Consequences.
 
 ## Layout & identity
 
-**LI-01 · Layout persistence.** PRODUCT-0059 supplies a locked atomic session
-store but deliberately writes no document content or layout and produces no
-`PanelRestored`. The fixed remaining order is libaryon document restoration →
+**LI-01 · Layout persistence.** PRODUCT-0059 supplies the locked atomic session
+store, and PRODUCT-0060 now checkpoints and restores libaryon's ordinary
+documents under durable `DocumentId`s. It deliberately restores only a
+one-pane fallback and produces no `PanelRestored`. The next fixed step is
 Polariton's layout/view/color owner extension. That extension must restore
 ordinary document panes, tabs, panel groups, group state, and detached
 placements together; 0015 §11's size signal remains: “editor-wide workspace
 work, not a convenient extension of this session feature.” — 0010 §10,
 Consequences; 0011 §6, Rejected, Consequences; 0015 §9, §11, §12, Rejected,
-Consequences; 0030 §7, §12; 0059 §§6–7.
+Consequences; 0030 §7, §12; 0059 §§6–7; 0060 §§2, 5, 7–8.
 
 **LI-02 · Durable identity.** PRODUCT-0059 lands opaque `SessionId` and minted,
-path-independent, session-scoped `DocumentId`; runtime `BufferId`, `PaneId`, and
-`ViewId` remain forbidden from the manifest. The durable named-view key still
-waits: after documents restore, Polariton must key its owner payload by
-`DocumentId`, restore layout, and only then attach authored
+path-independent, session-scoped `DocumentId`; PRODUCT-0060 binds those IDs to
+fresh runtime buffers after restart while keeping `BufferId`, `PaneId`, and
+`ViewId` out of the payload. The durable named-view key still waits: Polariton
+must key its owner payload by `DocumentId`, restore layout, and only then attach authored
 `LocalViewIdentity::Named`. Anonymous identity remains positional and may shift
 after a source edit. Thus the earlier “layout before durable identity” remains
 true for observable named-view identity while its libaryon identity substrate
-has landed. — 0010 §5, §10, Consequences; 0011 §6, Consequences; 0015 §5, §9,
-§12, Consequences; 0030 §7, §12; 0059 §§2, 7. Dependency: document restoration
-then layout extension. — substrate-landed-in 0059; named-view half open.
+has landed and acquired a restart consumer. — 0010 §5, §10, Consequences; 0011
+§6, Consequences; 0015 §5, §9, §12, Consequences; 0030 §7, §12; 0059 §§2, 7;
+0060 §§5, 7–8. Dependency: layout extension. — substrate-landed-in 0059–0060;
+named-view half open.
 
 **LI-03 · A grouping signal.** Nothing in a Rune buffer distinguishes views that are
 alternatives from comparisons, so `TabWith` "ships with two legitimate

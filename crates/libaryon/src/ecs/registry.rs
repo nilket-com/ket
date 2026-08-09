@@ -11,7 +11,7 @@ use memchr::memchr_iter;
 use std::cell::UnsafeCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock, RwLockReadGuard};
 use std::time::Instant;
@@ -1717,8 +1717,8 @@ impl UastRegistry {
 			.fetch_max(micros, Ordering::Relaxed);
 	}
 
-	pub fn register_device_path(&self, device_id: u16, path: &str) -> io::Result<()> {
-		let path = PathBuf::from(path);
+	pub fn register_device_path(&self, device_id: u16, path: &Path) -> io::Result<()> {
+		let path = path.to_path_buf();
 		let store = FileBackingStore::open(&path)?;
 		let mut backing_stores = self.backing_stores.lock().unwrap();
 		if backing_stores.contains_key(&device_id) {
@@ -2324,7 +2324,7 @@ mod tests {
 		let _ = std::fs::remove_file(&path);
 
 		let error = registry
-			.register_device_path(17, path.to_str().expect("utf8 path"))
+			.register_device_path(17, &path)
 			.expect_err("missing backing must fail registration");
 
 		assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
@@ -2341,10 +2341,10 @@ mod tests {
 		std::fs::write(&second_path, b"BBBB").expect("write second backing");
 
 		registry
-			.register_device_path(23, first_path.to_str().expect("utf8 first path"))
+			.register_device_path(23, &first_path)
 			.expect("register first backing");
 		let error = registry
-			.register_device_path(23, second_path.to_str().expect("utf8 second path"))
+			.register_device_path(23, &second_path)
 			.expect_err("duplicate device id must be rejected");
 
 		assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);

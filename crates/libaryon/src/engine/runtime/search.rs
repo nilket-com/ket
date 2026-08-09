@@ -76,15 +76,15 @@ fn clear_search_state(
 fn read_search_document(
 	registry: &UastRegistry,
 	root: NodeId,
-	source_path: Option<&str>,
+	source_path: Option<&Path>,
 ) -> Result<Vec<u8>, String> {
-	read_document_snapshot(registry, root, source_path.map(Path::new))
+	read_document_snapshot(registry, root, source_path)
 }
 
 fn should_use_generation_substitute(
 	file_len: u64,
 	has_shadow: bool,
-	visible_path: Option<&str>,
+	visible_path: Option<&Path>,
 ) -> bool {
 	visible_path.is_some() && (has_shadow || file_len >= LARGE_FILE_GENERATION_THRESHOLD_BYTES)
 }
@@ -146,7 +146,7 @@ fn handle_generation_substitute_all(
 	let had_shadow = tab.document.shadow.is_some();
 	let mut shadow = match tab.document.shadow.take() {
 		Some(shadow) => shadow,
-		None => match create_shadow_session(Path::new(&visible_path)) {
+		None => match create_shadow_session(&visible_path) {
 			Ok(shadow) => shadow,
 			Err(msg) => {
 				*status_message = Some(msg);
@@ -193,7 +193,7 @@ fn handle_generation_substitute_all(
 		return Some(CommandEffect::render());
 	};
 	let (new_rid, _cursor_leaf, new_backing_device_id) =
-		match load_root_from_path(ctx, &after.path, next_dynamic_device_id) {
+		match load_root_from_path(ctx, Path::new(&after.path), next_dynamic_device_id) {
 			Ok(loaded) => loaded,
 			Err(msg) => {
 				tab.document.shadow = Some(shadow);
@@ -210,7 +210,7 @@ fn handle_generation_substitute_all(
 	ctx.registry.cancel_metric_scan(tab.document.root_id);
 	tab.document.root_id = new_rid;
 	tab.view.folds.clear();
-	tab.document.backing_path = Some(after.path.clone());
+	tab.document.backing_path = Some(after.path.clone().into());
 	let retired_device_id =
 		std::mem::replace(&mut tab.document.backing_device_id, new_backing_device_id);
 	if let Some(device_id) = retired_device_id {
@@ -395,7 +395,7 @@ pub(super) fn handle_search_command(
 	ledger: &mut UndoLedger,
 	semantic_highlights: &mut Vec<HighlightSpan>,
 	diagnostic_spans: &mut Vec<DiagnosticSpan>,
-	source_path: Option<&str>,
+	source_path: Option<&Path>,
 	search_pattern: &mut Option<String>,
 	search_case_insensitive: &mut bool,
 	search_matches: &mut Vec<SearchMatch>,
@@ -955,7 +955,7 @@ mod tests {
 		let resolver = Arc::new(SvpResolver::new(registry.clone(), tx_io_notify));
 		let lang_registry = Arc::new(LanguageRegistry::new());
 		registry
-			.register_device_path(FILE_DEVICE_ID, path.to_str().expect("utf8 path"))
+			.register_device_path(FILE_DEVICE_ID, path)
 			.expect("register backing");
 		(registry, resolver, lang_registry)
 	}
@@ -1005,7 +1005,7 @@ mod tests {
 			&mut ledger,
 			&mut semantic_highlights,
 			&mut diagnostics,
-			Some(path.to_str().expect("utf8 temp path")),
+			Some(&path),
 			&mut search_pattern,
 			&mut search_case_insensitive,
 			&mut search_matches,
@@ -1058,17 +1058,13 @@ mod tests {
 		};
 		let fixture_backing_count = resolver.registered_device_counts().0;
 		let mut next_dynamic_device_id = FILE_DEVICE_ID + 1;
-		let (root, first_leaf, backing_device_id) = load_root_from_path(
-			&ctx,
-			path.to_str().expect("utf8 path"),
-			&mut next_dynamic_device_id,
-		)
-		.expect("load root");
+		let (root, first_leaf, backing_device_id) =
+			load_root_from_path(&ctx, &path, &mut next_dynamic_device_id).expect("load root");
 		let mut fixture = TestTextEditor::new(&registry, &test_settings(), 120, 40);
 		let mut tab = fixture.editor_mut();
 		tab.document.root_id = root;
-		tab.document.file_path = Some(path.to_string_lossy().into_owned());
-		tab.document.backing_path = Some(path.to_string_lossy().into_owned());
+		tab.document.file_path = Some(path.clone());
+		tab.document.backing_path = Some(path.clone());
 		tab.document.backing_device_id = backing_device_id;
 		assert_eq!(
 			resolver.registered_device_counts().0,
@@ -1351,17 +1347,13 @@ mod tests {
 				init_entrypoint: None,
 			};
 			let mut next_dynamic_device_id = FILE_DEVICE_ID + 1;
-			let (root, first_leaf, backing_device_id) = load_root_from_path(
-				&ctx,
-				path.to_str().expect("utf8 path"),
-				&mut next_dynamic_device_id,
-			)
-			.expect("load root");
+			let (root, first_leaf, backing_device_id) =
+				load_root_from_path(&ctx, &path, &mut next_dynamic_device_id).expect("load root");
 			let mut fixture = TestTextEditor::new(&registry, &test_settings(), 120, 40);
 			let mut tab = fixture.editor_mut();
 			tab.document.root_id = root;
-			tab.document.file_path = Some(path.to_string_lossy().into_owned());
-			tab.document.backing_path = Some(path.to_string_lossy().into_owned());
+			tab.document.file_path = Some(path.clone());
+			tab.document.backing_path = Some(path.clone());
 			tab.document.backing_device_id = backing_device_id;
 			tab.cursor.primary_mut().reset_to_start(
 				first_leaf,

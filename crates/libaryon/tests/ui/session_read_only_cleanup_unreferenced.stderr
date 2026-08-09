@@ -1,0 +1,5 @@
+error[E0599]: no method named `cleanup_unreferenced` found for mutable reference `&mut SavedSession<ReadOnly>` in the current scope
+ --> tests/ui/session_read_only_cleanup_unreferenced.rs:4:18
+  |
+4 |     let _ = session.cleanup_unreferenced();
+  |                     ^^^^^^^^^^^^^^^^^^^^ method not found in `&mut SavedSession<ReadOnly>`

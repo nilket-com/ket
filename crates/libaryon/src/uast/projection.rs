@@ -279,6 +279,8 @@ pub struct PaneViewport {
 	/// hosts use this identity when an asynchronous product belongs to the
 	/// document rather than to one particular view of it.
 	pub buffer_id: BufferId,
+	/// Durable identity of an ordinary document in a saved engine.
+	pub document_id: Option<crate::core::DocumentId>,
 	/// Identity of the active view projected in this pane.
 	pub view_id: ViewId,
 	pub rect: PaneRect,
@@ -471,6 +473,8 @@ impl std::ops::DerefMut for Viewport {
 pub struct DocTabSummary {
 	/// Stable identity of the document behind this tab.
 	pub buffer_id: BufferId,
+	/// Durable identity of an ordinary document in a saved engine.
+	pub document_id: Option<crate::core::DocumentId>,
 	/// Stable identity of this tab's view, including inactive tabs.
 	pub view_id: ViewId,
 	pub title: String,
@@ -2800,7 +2804,7 @@ mod tests {
 
 		let (registry, root) = build_uninflated_physical_document(&["aa\nbb\n", "cc\ndd"]);
 		registry
-			.register_device_path(77, path.to_str().expect("utf8 path"))
+			.register_device_path(77, &path)
 			.expect("register backing");
 
 		let first_leaf = registry.get_first_child(root).expect("first leaf");
@@ -2877,7 +2881,7 @@ mod tests {
 
 		let (registry, root) = build_exact_metric_physical_document(&chunks);
 		registry
-			.register_device_path(77, path.to_str().expect("utf8 path"))
+			.register_device_path(77, &path)
 			.expect("register backing");
 		let line_index = registry.build_root_child_line_index(root);
 		let target_line = DocLine::new((chunk_count - 2) as u64);

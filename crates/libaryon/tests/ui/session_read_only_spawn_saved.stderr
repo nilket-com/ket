@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/ui/session_read_only_spawn_saved.rs:5:64
+  |
+5 |     let _ = EngineHandle::spawn_saved(EngineConfig::default(), session);
+  |             -------------------------                          ^^^^^^^ expected `SavedSession<Writable>`, found `SavedSession<ReadOnly>`
+  |             |
+  |             arguments to this function are incorrect
+  |
+  = note: expected struct `SavedSession<Writable>`
+             found struct `SavedSession<ReadOnly>`
+note: associated function defined here
+ --> src/engine/host.rs
+  |
+  |     pub fn spawn_saved(
+  |            ^^^^^^^^^^^

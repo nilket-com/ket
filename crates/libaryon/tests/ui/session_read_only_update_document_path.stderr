@@ -1,0 +1,5 @@
+error[E0599]: no method named `update_document_path` found for mutable reference `&mut SavedSession<ReadOnly>` in the current scope
+ --> tests/ui/session_read_only_update_document_path.rs:5:18
+  |
+5 |     let _ = session.update_document_path(document, Some(path));
+  |                     ^^^^^^^^^^^^^^^^^^^^ method not found in `&mut SavedSession<ReadOnly>`

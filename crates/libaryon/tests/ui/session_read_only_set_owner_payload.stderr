@@ -1,0 +1,11 @@
+error[E0599]: no method named `set_owner_payload` found for mutable reference `&mut SavedSession<ReadOnly>` in the current scope
+ --> tests/ui/session_read_only_set_owner_payload.rs:4:10
+  |
+4 |     session.set_owner_payload(owner, 1, vec![1, 2, 3]);
+  |             ^^^^^^^^^^^^^^^^^
+  |
+help: there is a method `owner_payload` with a similar name, but with different arguments
+ --> src/core/session_store.rs
+  |
+  |     pub fn owner_payload(&self, owner: &OwnerId) -> Option<(u32, &[u8])> {
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^

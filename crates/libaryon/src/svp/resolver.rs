@@ -4,6 +4,7 @@ use crate::ecs::registry::{IoLifetimeLease, UastRegistry, WholeLeafReadOutcome};
 use crate::svp::pointer::SvpPointer;
 use memchr::memchr_iter;
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::Ordering;
@@ -209,7 +210,7 @@ impl ResolverBackend {
 		}
 	}
 
-	fn register_device(&self, device_id: u16, path: &str) -> std::io::Result<()> {
+	fn register_device(&self, device_id: u16, path: &Path) -> std::io::Result<()> {
 		match self {
 			Self::LinuxUring(backend) => backend.register_device(device_id, path),
 			Self::Blocking(backend) => backend.register_device(device_id, path),
@@ -250,7 +251,7 @@ impl ResolverBackend {
 		}
 	}
 
-	fn register_device(&self, device_id: u16, path: &str) -> std::io::Result<()> {
+	fn register_device(&self, device_id: u16, path: &Path) -> std::io::Result<()> {
 		self.backend.register_device(device_id, path)
 	}
 
@@ -343,7 +344,7 @@ impl SvpResolver {
 		}
 	}
 
-	pub fn register_device(&self, device_id: u16, path: &str) -> std::io::Result<()> {
+	pub fn register_device(&self, device_id: u16, path: &Path) -> std::io::Result<()> {
 		self._registry.register_device_path(device_id, path)?;
 		if let Err(error) = self.backend.register_device(device_id, path) {
 			self._registry.unregister_device(device_id);
@@ -814,7 +815,7 @@ mod tests {
 		let resolver = SvpResolver::new(registry, notify);
 
 		resolver
-			.register_device(37, path.to_str().expect("utf8 backing path"))
+			.register_device(37, &path)
 			.expect("register backing");
 		assert_eq!(resolver.registered_device_counts().0, 1);
 		#[cfg(target_os = "linux")]

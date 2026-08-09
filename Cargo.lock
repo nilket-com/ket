@@ -4466,6 +4466,7 @@ dependencies = [
  "serde_json",
  "sqlparser 0.62.0",
  "triomphe",
+ "trybuild",
  "unicode-segmentation",
  "unicode-width",
  "ureq",

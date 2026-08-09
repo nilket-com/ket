@@ -54,7 +54,7 @@ pub(super) fn build_source_backed_document(
 
 	std::fs::write(&path, bytes).expect("write temp file");
 	registry
-		.register_device_path(91, path.to_str().expect("utf8 path"))
+		.register_device_path(91, &path)
 		.expect("register backing");
 	registry.install_root_child_line_index(root);
 	drop(chunk);

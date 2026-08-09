@@ -366,7 +366,7 @@ pub(crate) fn build_exact_metric_physical_document(
 
 	std::fs::write(&path, chunks.concat()).expect("write temp file");
 	registry
-		.register_device_path(78, path.to_str().expect("utf8 path"))
+		.register_device_path(78, &path)
 		.expect("register backing");
 	registry.install_root_child_line_index(root);
 	drop(chunk);

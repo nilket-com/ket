@@ -1,0 +1,5 @@
+error[E0599]: no method named `remove_document` found for mutable reference `&mut SavedSession<ReadOnly>` in the current scope
+ --> tests/ui/session_read_only_remove_document.rs:4:18
+  |
+4 |     let _ = session.remove_document(document);
+  |                     ^^^^^^^^^^^^^^^ method not found in `&mut SavedSession<ReadOnly>`

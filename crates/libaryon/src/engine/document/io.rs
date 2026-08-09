@@ -546,10 +546,7 @@ mod tests {
 
 		let (registry, root) = build_mixed_save_document();
 		registry
-			.register_device_path(
-				FILE_DEVICE_ID,
-				backing_path.to_str().expect("utf8 backing path"),
-			)
+			.register_device_path(FILE_DEVICE_ID, &backing_path)
 			.expect("register immutable backing");
 		save_document(
 			&registry,

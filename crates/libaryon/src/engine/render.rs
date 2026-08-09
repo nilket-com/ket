@@ -17,7 +17,7 @@ use super::semantic::{
 };
 use super::session::{
 	BufferContent, BufferStore, CachedSumTree, CursorState, DiffPair, EditorPane, EditorSession,
-	PaneLayout, SemanticState, SnapshotProvenance, TextViewState, ViewContent,
+	PaneLayout, SavedDocumentState, SemanticState, SnapshotProvenance, TextViewState, ViewContent,
 };
 use super::support::line_start_byte_sparse;
 use crate::core::{
@@ -36,7 +36,7 @@ use crate::uast::projection::{
 use crate::uast::{PaneViewport, RenderToken, UastProjection, Viewport};
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
 
 pub(crate) struct RenderParams<'a> {
@@ -64,9 +64,9 @@ struct RenderDocumentState {
 	buffer_id: BufferId,
 	root_id: Option<NodeId>,
 	topology_rev: crate::core::TopologyRev,
-	file_path: Option<String>,
+	file_path: Option<PathBuf>,
 	virtual_path: Option<String>,
-	backing_path: Option<String>,
+	backing_path: Option<PathBuf>,
 	active_language_id: Option<super::language::LanguageId>,
 	ledger: RenderLedgerState,
 }
@@ -327,6 +327,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		next_semantic_request_id,
 		output_panels,
 		git_status_branch,
+		saved_documents,
 		..
 	} = session;
 	let git_status_buffer_id = output_panels.get("git-status").copied();
@@ -373,6 +374,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 			pane_layout,
 			pane,
 			buffers,
+			saved_documents.as_ref(),
 			*search_pattern_revision,
 			if is_focused { yank_flash } else { None },
 			&session.diff_pairs,
@@ -614,6 +616,7 @@ fn render_pane_viewport(
 	pane_layout: PaneLayout,
 	pane: &mut EditorPane,
 	buffers: &mut BufferStore,
+	saved_documents: Option<&SavedDocumentState>,
 	search_pattern_revision: u64,
 	yank_flash: Option<(DocByte, DocByte)>,
 	diff_pairs: &HashMap<PaneId, DiffPair>,
@@ -862,7 +865,7 @@ fn render_pane_viewport(
 					buffer_id,
 					root_id: Some(document.root_id),
 					topology_rev: document.topology_rev,
-					file_path: Some(document.file_path.clone()),
+					file_path: Some(PathBuf::from(document.file_path.clone())),
 					virtual_path: None,
 					backing_path: None,
 					active_language_id: lang_registry.resolve_language_id("fs"),
@@ -1171,8 +1174,9 @@ fn render_pane_viewport(
 					.document
 					.file_path
 					.as_deref()
+					.and_then(Path::to_str)
 					.or(tab.document.virtual_path.as_deref()),
-				backing_path: tab.document.backing_path.as_deref(),
+				backing_path: tab.document.backing_path.as_deref().and_then(Path::to_str),
 				active_language_id: tab.document.active_language_id,
 				state_id: tab.document.ledger.current_state_id,
 				analysis_depth,
@@ -1279,7 +1283,7 @@ fn render_pane_viewport(
 							match read_document_snapshot(
 								registry,
 								rid,
-								tab.document.backing_path.as_deref().map(Path::new),
+								tab.document.backing_path.as_deref(),
 							) {
 								Ok(bytes) => build_text_minimap_snapshot(
 									&bytes,
@@ -1398,7 +1402,10 @@ fn render_pane_viewport(
 			secondary_carets,
 			cursor_count,
 			total_lines,
-			tab.document.file_path.clone(),
+			tab.document
+				.file_path
+				.as_ref()
+				.map(|path| path.to_string_lossy().into_owned()),
 			file_size,
 			line_count,
 			tab.document.ledger.is_dirty(),
@@ -1499,6 +1506,7 @@ fn render_pane_viewport(
 	PaneViewport {
 		pane_id: pane_layout.pane_id,
 		buffer_id: active_buffer_id,
+		document_id: saved_documents.and_then(|bindings| bindings.document_id(active_buffer_id)),
 		view_id: active_view_id,
 		host_panel,
 		rect: pane_layout.rect,
@@ -1560,6 +1568,8 @@ fn render_pane_viewport(
 					.filter(|_| buffer.file_path().is_none());
 				crate::uast::projection::DocTabSummary {
 					buffer_id: view.buffer_id,
+					document_id: saved_documents
+						.and_then(|bindings| bindings.document_id(view.buffer_id)),
 					view_id: view.id,
 					snapshot: snapshot_provenance.map(|provenance| match provenance {
 						SnapshotProvenance::GitRevision {

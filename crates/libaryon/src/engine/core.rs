@@ -229,6 +229,7 @@ pub(crate) struct Engine {
 	pub(super) initial_save_durability: SaveDurability,
 	pub(super) initial_ui_colors: UiColorOverrides,
 	pub(super) initial_language_themes: BTreeMap<String, String>,
+	pub(super) initial_session: Option<EditorSession>,
 	pub(super) initial_file: Option<String>,
 	pub(super) initial_viewport: Option<(u16, u16)>,
 	pub(super) rune_host: Option<super::rune_host::RuneHostConfig>,
@@ -282,6 +283,7 @@ impl Engine {
 			initial_save_durability,
 			initial_ui_colors,
 			initial_language_themes,
+			initial_session: None,
 			initial_file: None,
 			initial_viewport: None,
 			rune_host: None,
@@ -316,6 +318,11 @@ impl Engine {
 
 	pub(crate) fn with_initial_file(mut self, initial_file: Option<String>) -> Self {
 		self.initial_file = initial_file;
+		self
+	}
+
+	pub(crate) fn with_initial_session(mut self, initial_session: EditorSession) -> Self {
+		self.initial_session = Some(initial_session);
 		self
 	}
 

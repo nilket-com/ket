@@ -1857,6 +1857,14 @@ fn resolve_or_load_buffer(
 		return Err(error);
 	}
 	session.buffers.commit_path(reservation);
+	if let Some(saved) = session.saved_documents.as_mut() {
+		let path = session
+			.buffers
+			.get(buffer_id)
+			.and_then(|buffer| buffer.text())
+			.and_then(|document| document.file_path.as_deref());
+		saved.update_path(buffer_id, path)?;
+	}
 	Ok((buffer_id, effect))
 }
 
@@ -2009,6 +2017,11 @@ fn release_buffer(
 	let Some(mut buffer) = session.buffers.remove(buffer_id) else {
 		return;
 	};
+	if let Some(saved) = session.saved_documents.as_mut() {
+		saved
+			.remove(buffer_id)
+			.expect("saved document binding must match the live ordinary buffer");
+	}
 	session.host_panel_group_producer_released(buffer_id);
 	session.snapshot_partners.remove(&buffer_id);
 	// Callers reach here only once no view references the buffer, so this is
@@ -2499,8 +2512,9 @@ fn request_goto_definition(
 		.backing_path
 		.as_deref()
 		.or(document.file_path.as_deref())
-		.or(document.virtual_path.as_deref())
-		.map(ToOwned::to_owned)
+		.and_then(Path::to_str)
+		.map(str::to_owned)
+		.or_else(|| document.virtual_path.clone())
 	else {
 		session.ui.status_message = Some("Go to definition requires a document path".to_string());
 		return true;
@@ -2522,7 +2536,7 @@ fn request_goto_definition(
 	let content = match read_document_snapshot(
 		runtime.registry,
 		document.root_id,
-		document.backing_path.as_deref().map(Path::new),
+		document.backing_path.as_deref(),
 	) {
 		Ok(content) => content,
 		Err(error) => {
@@ -3111,14 +3125,20 @@ fn handle_revision_diff_split(session: &mut EditorSession, arg: &str) -> bool {
 			Some("Cannot diff an unnamed buffer against Git history".to_string());
 		return true;
 	};
-	let file = std::path::Path::new(&file_path);
+	let file = file_path.as_path();
 	let canonical = file.canonicalize().unwrap_or_else(|_| file.to_path_buf());
 	let Some(repo_root) = session.git_branch_cache.repo_root_for_path(&canonical) else {
-		session.ui.status_message = Some(format!("{file_path} is not in a Git repository"));
+		session.ui.status_message = Some(format!(
+			"{} is not in a Git repository",
+			file_path.to_string_lossy()
+		));
 		return true;
 	};
 	let Some(rel_path) = super::git::repo_relative_path(&repo_root, &canonical) else {
-		session.ui.status_message = Some(format!("{file_path} is outside its Git repository"));
+		session.ui.status_message = Some(format!(
+			"{} is outside its Git repository",
+			file_path.to_string_lossy()
+		));
 		return true;
 	};
 	// Git permits LF in tracked filenames, but the fetch phase's `--batch`
@@ -4770,6 +4790,7 @@ fn dispatch_command(
 				ui,
 				next_dynamic_device_id,
 				persistent_settings,
+				saved_documents,
 				..
 			} = session;
 			let doctab = focused_doctab(layout, *focused_pane_id);
@@ -4799,6 +4820,11 @@ fn dispatch_command(
 					// The buffer no longer represents its former file, so its
 					// canonical-path claim must not block reopening that file.
 					buffers.detach_path(buffer_id);
+					if let Some(saved) = saved_documents.as_mut()
+						&& let Err(error) = saved.update_path(buffer_id, None)
+					{
+						ui.status_message = Some(error);
+					}
 				}
 				let view = layout.find_view_mut(view_id).expect("replaced view");
 				if let Err(err) =
@@ -5004,6 +5030,7 @@ fn dispatch_command(
 						next_dynamic_device_id,
 						persistent_settings,
 						snapshot_partners,
+						saved_documents,
 						..
 					} = session;
 					if let Some((effect, _language_id)) = handle_file_command_for_view(
@@ -5023,13 +5050,22 @@ fn dispatch_command(
 								.get(buffer_id)
 								.and_then(|buffer| buffer.text())
 								.and_then(|document| document.file_path.as_deref())
-								== Some(path)
+								== Some(Path::new(path))
 						{
 							buffers.commit_path(reservation);
 							// A snapshot written to a real path is an
 							// ordinary file document now; its provenance
 							// identity must not outlive the conversion.
 							snapshot_partners.remove(&buffer_id);
+							if let Some(saved) = saved_documents.as_mut() {
+								let exact_path = buffers
+									.get(buffer_id)
+									.and_then(|buffer| buffer.text())
+									.and_then(|document| document.file_path.as_deref());
+								if let Err(error) = saved.update_path(buffer_id, exact_path) {
+									ui.status_message = Some(error);
+								}
+							}
 						}
 						if write_as_path.is_some()
 							&& let Err(err) =
@@ -5505,7 +5541,7 @@ fn dispatch_command(
 	DispatchOutcome::continue_with(needs_render)
 }
 
-fn encrypted_backing_path(session: &EditorSession) -> Option<String> {
+fn encrypted_backing_path(session: &EditorSession) -> Option<PathBuf> {
 	let view = focused_doctab(&session.layout, session.focused_pane_id);
 	session
 		.buffers
@@ -5529,7 +5565,9 @@ fn write_encrypted_focused(
 		session.ui.status_message = Some("No document to encrypt".to_owned());
 		return DispatchOutcome::continue_with(true);
 	};
-	let path = requested_path.or_else(|| document.encrypted_backing.clone());
+	let path = requested_path
+		.map(PathBuf::from)
+		.or_else(|| document.encrypted_backing.clone());
 	let Some(path) = path else {
 		session.ui.status_message = Some("No encrypted file name; use :wenc PATH".to_owned());
 		return DispatchOutcome::continue_with(true);
@@ -5541,7 +5579,7 @@ fn write_encrypted_focused(
 			return DispatchOutcome::continue_with(true);
 		}
 	};
-	match session.secrets.write(Path::new(&path), &snapshot) {
+	match session.secrets.write(&path, &snapshot) {
 		Ok(()) => {
 			if let Some(text) = session
 				.buffers
@@ -5551,7 +5589,7 @@ fn write_encrypted_focused(
 				text.encrypted_backing = Some(path.clone());
 				text.ledger.mark_saved();
 			}
-			session.ui.status_message = Some(format!("\"{}\" encrypted", path));
+			session.ui.status_message = Some(format!("\"{}\" encrypted", path.to_string_lossy()));
 			if quit_after_write {
 				session.ui.pending_quit = true;
 			}
@@ -5621,7 +5659,7 @@ fn load_encrypted_focused(
 			.get_mut(view.buffer_id)
 			.and_then(|buffer| buffer.text_mut())
 		{
-			document.encrypted_backing = Some(path.clone());
+			document.encrypted_backing = Some(PathBuf::from(path.clone()));
 			document.ledger.mark_saved();
 		}
 		session.ui.status_message = Some(format!("\"{}\" decrypted", path));
@@ -5648,6 +5686,7 @@ pub(crate) fn run_engine(engine: Engine) {
 	let initial_save_durability = engine.initial_save_durability;
 	let initial_ui_colors = engine.initial_ui_colors;
 	let initial_language_themes = engine.initial_language_themes;
+	let initial_session = engine.initial_session;
 	let initial_file = engine.initial_file;
 	let initial_viewport = engine.initial_viewport;
 	let rune_host_config = engine.rune_host;
@@ -5676,20 +5715,22 @@ pub(crate) fn run_engine(engine: Engine) {
 		init_entrypoint: configured_init_entrypoint.as_deref(),
 	};
 	let services = Arc::new(Mutex::new(HostServices::default()));
-	let mut session = EditorSession::new(
-		&registry,
-		initial_theme_name,
-		initial_minimap_enabled,
-		initial_wrap_enabled,
-		initial_line_numbers_enabled,
-		initial_relative_line_numbers_enabled,
-		initial_visible_whitespace,
-		initial_reload_enabled,
-		initial_save_durability,
-		initial_ui_colors,
-		initial_language_themes,
-		None,
-	);
+	let mut session = initial_session.unwrap_or_else(|| {
+		EditorSession::new(
+			&registry,
+			initial_theme_name,
+			initial_minimap_enabled,
+			initial_wrap_enabled,
+			initial_line_numbers_enabled,
+			initial_relative_line_numbers_enabled,
+			initial_visible_whitespace,
+			initial_reload_enabled,
+			initial_save_durability,
+			initial_ui_colors,
+			initial_language_themes,
+			None,
+		)
+	});
 	if let Some((width, height)) = initial_viewport {
 		session.update_terminal_size(width.max(1), height.max(1));
 	}
@@ -5737,7 +5778,10 @@ pub(crate) fn run_engine(engine: Engine) {
 		session.emit_text_lifecycle_since(lifecycle_before);
 	}
 	if initial_file_loaded && let Some(status) = init_report.foreground_status() {
-		session.ui.status_message = Some(status);
+		session.ui.status_message = Some(match session.ui.status_message.take() {
+			Some(restoration) => format!("{restoration}; {status}"),
+			None => status,
+		});
 	}
 	let startup_subscriber_render = drain_run_loop_deliveries(
 		&mut session,
@@ -5791,6 +5835,26 @@ pub(crate) fn run_engine(engine: Engine) {
 				commands: vec![command],
 				..InputDispatch::default()
 			},
+			EngineRequest::Checkpoint(reply) => {
+				let result = super::session_checkpoint::checkpoint_documents(
+					&registry,
+					&mut session,
+					super::session_checkpoint::DOCUMENT_CONTENT_BUDGET,
+				);
+				let _ = reply.send(result);
+				continue;
+			}
+			#[cfg(test)]
+			EngineRequest::CheckpointWithFault(fault, reply) => {
+				let result = super::session_checkpoint::checkpoint_documents_with_fault(
+					&registry,
+					&mut session,
+					super::session_checkpoint::DOCUMENT_CONTENT_BUDGET,
+					fault,
+				);
+				let _ = reply.send(result);
+				continue;
+			}
 			EngineRequest::Input(event) => {
 				let input_context = current_input_context(&registry, &session);
 				match event {

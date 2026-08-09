@@ -5,7 +5,7 @@ use crate::svp::pointer::SvpPointer;
 use crate::svp::resolver::{RequestPriority, SvpRequest, SvpResolver};
 use crate::uast::kind::SemanticKind;
 use crate::uast::metrics::SpanMetrics;
-use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Initial source-backed extent size. Resolver transfers and mutation
@@ -17,7 +17,7 @@ pub fn ingest_svp_file(
 	registry: &Arc<UastRegistry>,
 	file_size: u64,
 	device_id: u16,
-	path: String,
+	path: PathBuf,
 ) -> Result<NodeId, String> {
 	let chunk_count = file_size.div_ceil(COLD_INGEST_EXTENT_SIZE as u64);
 	let node_count = chunk_count
@@ -85,8 +85,7 @@ pub fn ingest_svp_file(
 	let warm_index = registry
 		.backing_identity(device_id)
 		.and_then(|identity| {
-			SparseLineIndex::load_validated(&cache_path_for_backing(Path::new(&path)), identity)
-				.ok()
+			SparseLineIndex::load_validated(&cache_path_for_backing(&path), identity).ok()
 		})
 		.filter(|index| {
 			index.block_size() as usize == COLD_INGEST_EXTENT_SIZE
@@ -234,14 +233,8 @@ mod tests {
 			std::env::temp_dir().join(format!("baryon-missing-ingest-{}", std::process::id()));
 		let _ = std::fs::remove_file(&missing);
 
-		let error = ingest_svp_file(
-			&resolver,
-			&registry,
-			1,
-			91,
-			missing.to_string_lossy().into_owned(),
-		)
-		.expect_err("missing device path must reject after reservation");
+		let error = ingest_svp_file(&resolver, &registry, 1, 91, missing)
+			.expect_err("missing device path must reject after reservation");
 
 		assert!(error.contains("Open error"));
 		assert_eq!(registry.stats().allocated_nodes, 2);
@@ -253,8 +246,14 @@ mod tests {
 		let registry = Arc::new(UastRegistry::new(1));
 		let (notify, _notifications) = mpsc::channel();
 		let resolver = SvpResolver::new_blocking_for_tests(registry.clone(), notify);
-		let error = ingest_svp_file(&resolver, &registry, 1, 91, "unused".to_string())
-			.expect_err("root plus extent cannot fit");
+		let error = ingest_svp_file(
+			&resolver,
+			&registry,
+			1,
+			91,
+			std::path::PathBuf::from("unused"),
+		)
+		.expect_err("root plus extent cannot fit");
 		assert!(error.contains("Loading 1 bytes"));
 		assert!(error.contains("UAST registry"));
 		assert!(error.contains("Wait for reclamation"));
@@ -277,7 +276,7 @@ mod tests {
 
 		let registry = UastRegistry::new(3);
 		registry
-			.register_device_path(9, path.to_str().unwrap())
+			.register_device_path(9, &path)
 			.expect("register backing");
 		let mut chunk = registry.reserve_chunk(3).unwrap();
 		let root = chunk.spawn_node(

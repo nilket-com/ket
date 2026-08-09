@@ -29,14 +29,13 @@ language and the bridge the records themselves repeatedly name as "the first
 thing a Guide record should replace."
 
 **PERSISTENCE CLUSTER — will do, as one editor-wide arc, now in progress.**
-PRODUCT-0059 landed the non-visible head: shared session/document identity,
-single-writer locking, and atomic owner-partitioned snapshots. Stage 0 refined
-the remaining order to libaryon document restoration → Polariton layout/view/
-color extension → durable named-panel identity → producer-release reattachment
-and durable continuation. The earlier phrase “layout before durable identity”
-still governs named-view identity; minted libaryon document identity is its
-newly separated prerequisite. Nothing later in the chain advances around
-document restoration.
+PRODUCT-0059 landed shared identity, locking, and atomic owner-partitioned
+snapshots; PRODUCT-0060 now restores exact ordinary-document bytes and durable
+bindings through an explicit saved-engine entrypoint. The remaining order is
+Polariton layout/view/color extension → durable named-panel identity →
+producer-release reattachment and durable continuation. The earlier phrase
+“layout before durable identity” still governs named-view identity; minted and
+restored libaryon document identity is its now-landed prerequisite.
 
 ---
 
@@ -78,8 +77,8 @@ document restoration.
 
 | Item | Rec. | Reason / trigger | Closure lands in |
 |---|---|---|---|
-| Layout persistence | will do | After PRODUCT-0059, requires libaryon document restoration, then lands with Polariton's owner extension | — |
-| Durable identity | partial (0059) | Session/document IDs landed; durable named-view identity remains strictly after restored layout | 0059 substrate |
+| Layout persistence | will do | PRODUCT-0060 restored documents; next is Polariton's editor-wide layout/view/color owner extension | — |
+| Durable identity | partial (0059–0060) | Session/document IDs and restart bindings landed; durable named-view identity remains strictly after restored layout | 0059–0060 substrate |
 | Grouping signal | if asked | Trigger the records already wrote: repeated manual tabbing of the same view sets (0011 §4, 0015 §8) | — |
 | Dashboard's fate | will do | Small decision record; demotion already happened, evidence (0010–0015 arc) suggests retirement; leaving it undecided keeps a zombie surface whose export/resize behaviors need explicit re-homing or discard | — |
 | Panel close/move commands, more placements | closed | "It grows when a use exists, not in advance of one" (0011 §1) — the rule is the closure | 0011 §1 (already states it) |

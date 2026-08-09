@@ -5626,6 +5626,7 @@ mod tests {
 
 		let clean = DocTabSummary {
 			buffer_id: BufferId::new(1),
+			document_id: None,
 			view_id: ViewId::new(1),
 			title: "query.sql".to_owned(),
 			is_dirty: false,
