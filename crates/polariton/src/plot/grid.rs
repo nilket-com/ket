@@ -2450,6 +2450,126 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0064_faceted_stacks_keep_shared_domains_panel_blind_colors_and_one_legend() {
+		use crate::plot::legend::LegendSection;
+		use crate::plot::spec::{
+			CategoricalPaletteSelection, ColorIdentity, resolve_channels,
+			resolve_domains_with_categorical_palette,
+		};
+
+		let frame = df!(
+			"facet" => ["North", "North", "North", "North", "South", "South", "South", "South"],
+			"category" => ["East", "East", "West", "West", "East", "East", "West", "West"],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon", "Atlas", "Beacon", "Atlas", "Beacon"],
+			"value" => [2.0_f64, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+		)
+		.unwrap();
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"category",
+			"value",
+			Some("series".to_owned()),
+		)
+		.with_stacked_bar();
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0064".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("blues").unwrap();
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.unwrap();
+		assert_eq!(
+			resolved.composition.primary_plot_type(),
+			PlotType::StackedBar
+		);
+		let assignments = resolved.channel(Channel::Color).unwrap().colors.clone();
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved),
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).unwrap(),
+		)
+		.unwrap();
+		let kernel =
+			PlotGridKernel::from_styled_grid(grid, LayerSettings::default(), 800, 400).unwrap();
+		let settings = ResolvedPlotSettings::default();
+		let layouts = kernel.cell_layouts(settings.clone());
+		assert_eq!(layouts.len(), 2);
+		let ranges = layouts
+			.iter()
+			.map(|(_, layout)| match layout {
+				PlotLayout::CategoricalX { y_range, .. } => *y_range,
+				_ => panic!("stacked facet remains categorical x"),
+			})
+			.collect::<Vec<_>>();
+		assert!(
+			ranges.windows(2).all(|pair| pair[0] == pair[1]),
+			"faceted stacks consume one shared summed value domain"
+		);
+		let legend = crate::plot::legend::union(
+			kernel
+				.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&settings)),
+		)
+		.expect("one unioned stacked legend");
+		let LegendSection::Entries(entries) = legend.0.first() else {
+			panic!("stacked grid legend entries")
+		};
+		assert_eq!(entries.len(), assignments.len());
+		for (entry, assignment) in entries.iter().zip(&assignments) {
+			assert_eq!(entry.label, assignment.category);
+			assert_eq!(
+				entry.swatch,
+				iced::Color::from_rgba8(
+					assignment.color.red,
+					assignment.color.green,
+					assignment.color.blue,
+					assignment.color.alpha as f32 / u8::MAX as f32,
+				),
+				"one panel-blind assignment feeds every cell and the unioned legend"
+			);
+		}
+
+		let model = PlotSettings::default();
+		let mut backend = SvgBackend::new(800.0, 400.0);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
+		);
+		let svg = backend.finish();
+		for assignment in assignments {
+			let fill = format!(
+				"fill=\"rgb({}, {}, {})\"",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert!(
+				svg.matches(&fill).count() >= 2,
+				"both cells must contain {fill}"
+			);
+		}
+	}
+
+	#[test]
 	fn product_0056_faceted_horizontal_labels_payloads_and_colors_flip_together() {
 		use crate::plot::legend::LegendSection;
 		use crate::plot::spec::{

@@ -1013,6 +1013,11 @@ fn resolved_rune_axis_scales(
 				sink.y.clone(),
 				sink.category.clone(),
 			);
+			let authored = if styled.stacked {
+				authored.with_stacked_bar()
+			} else {
+				authored
+			};
 			let binding = resolve_channels(&authored, schema).map_err(|error| error.to_string())?;
 			scales(binding.channels())
 		}
@@ -1582,13 +1587,22 @@ fn rune_view_outcome_with_palettes(
 								}
 							}
 							Err(styled) => {
-								let StyledRunePlotSink { sink, settings } = styled;
+								let StyledRunePlotSink {
+									sink,
+									settings,
+									stacked,
+								} = styled;
 								let authored_spec = AuthoredPlotSpec::xy_color(
 									sink.composition,
 									sink.x,
 									sink.y,
 									sink.category,
 								);
+								let authored_spec = if stacked {
+									authored_spec.with_stacked_bar()
+								} else {
+									authored_spec
+								};
 								plan_with_categorical_palette(
 									PlotRequest {
 										source: PlotSource::Materialized {
@@ -7427,6 +7441,115 @@ workspace.table("bad").views([view("bad", table())]);
 			assert!(error.contains("Band"), "{error}");
 			let span = outcome.sinks[0].span.clone();
 			assert_eq!(&refusing[span.start as usize..span.end as usize], modifier);
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0064_stacked_members_keep_family_label_and_physical_axis_rules() {
+		let frame = polars::df!(
+			"category" => ["East", "East", "West", "West"],
+			"value" => [2.0, 4.0, 6.0, 8.0],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+		)
+		.unwrap();
+		for (source, expected, title, expected_layout) in [
+			(
+				r#"workspace.table("t").views([figure([
+					y_bounds(0, 20), y_tick_step(2), y_minor_ticks(2),
+					bar("category", "value", "series").stacked()
+				])])"#,
+				PlotType::StackedBar,
+				"Stacked Bar Plot",
+				"vertical",
+			),
+			(
+				r#"workspace.table("t").views([figure([
+					x_bounds(0, 20), x_tick_step(2), x_minor_ticks(2),
+					bar("value", "category", "series").stacked()
+				])])"#,
+				PlotType::HorizontalStackedBar,
+				"Horizontal Stacked Bar Plot",
+				"horizontal",
+			),
+		] {
+			let relation = transform_rune_view(source)
+				.expect("stacked bar stays inside the authored Bar family")
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(frame.clone(), relation.views);
+			let sink = &outcome.sinks[0];
+			assert_eq!(
+				sink.presentation.display_label, "plot.bar",
+				"the label names authored intent and must survive stacking"
+			);
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
+				resolved,
+				layer,
+				authored,
+				_,
+			)) = &sink.output
+			else {
+				panic!("stacked bar must complete through the standalone styled path")
+			};
+			assert_eq!(
+				resolved.resolved_spec.composition.primary_plot_type(),
+				expected
+			);
+			assert_eq!(
+				resolved.resolved_spec.composition.title(),
+				title,
+				"composition names resolved geometry and must differ from the family label"
+			);
+			let settings = crate::plot::theme::PlotSettings {
+				authored_spec: authored.clone(),
+				..crate::plot::theme::PlotSettings::default()
+			};
+			let resolved_settings = settings.resolve_for_layer(layer);
+			let kernel = create_styled_plot(&resolved.resolved_spec, &resolved.data, layer.clone())
+				.expect("canonical stacked member reaches the styled factory");
+			match (expected_layout, kernel.layout(resolved_settings.clone())) {
+				("vertical", PlotLayout::CategoricalX { y_range, .. }) => {
+					assert_eq!(y_range, (0.0, 20.0));
+					assert_eq!(
+						resolved_settings.y_tick_placement,
+						crate::plot::common::TickPlacement::step(2.0).unwrap()
+					);
+					assert_eq!(resolved_settings.y_minor_ticks, 2);
+				}
+				("horizontal", PlotLayout::CategoricalY { x_range, .. }) => {
+					assert_eq!(x_range, (0.0, 20.0));
+					assert_eq!(
+						resolved_settings.x_tick_placement,
+						crate::plot::common::TickPlacement::step(2.0).unwrap()
+					);
+					assert_eq!(resolved_settings.x_minor_ticks, 2);
+				}
+				_ => panic!("wrong stacked physical layout"),
+			}
+			assert!(
+				render_marks_with_settings(kernel.as_ref(), resolved_settings).contains("<svg")
+			);
+		}
+
+		for (modifier, bar) in [
+			("x_bounds(0, 20)", "bar(\"category\", \"value\").stacked()"),
+			("y_bounds(0, 20)", "bar(\"value\", \"category\").stacked()"),
+		] {
+			let source = format!("workspace.table(\"t\").views([figure([{modifier}, {bar}])])");
+			let relation = transform_rune_view(&source)
+				.unwrap()
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(frame.clone(), relation.views);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("category-axis stacked setting must refuse")
+			};
+			assert!(error.contains("Band"), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], modifier);
 		}
 	}
 

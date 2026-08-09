@@ -115,7 +115,7 @@ The language has exactly three places a property attaches (0030 §1):
 | position | attaches to | members |
 |---|---|---|
 | member of `figure([...])` | the whole graphical artifact | `title`, `subtitle` (0016); `palette` (0030); `skin` + `.duotone()` (0032/0033); `x_bounds`, `y_bounds` (0036); `x_tick_step`, `y_tick_step` (0038); `x_minor_ticks`, `y_minor_ticks` (0039) |
-| postfix on a mark | that mark's Layer-stage styling | `.point_size` (scatter, 0018); `.stroke_width` (line, 0020); `.bar_width` (bar, 0022) |
+| postfix on a mark | that mark's Layer-stage styling or geometry member | `.point_size` (scatter, 0018); `.stroke_width` (line, 0020); `.bar_width` (bar, 0022); `.category_gap` (bar, 0053); `.stacked()` (bar, 0064) |
 | postfix on `table()` | the table artifact's interior treatment | `.skin` (0025); `.duotone()` (0027) |
 
 Every register is closed (0018 §1, 0025 §4): unknown members refuse, duplicates
@@ -154,16 +154,28 @@ application theme → authored spec → layer → pane override (0007 §7). Tier
 select; they never multiply (0017 §2).
 
 Layer-stage settings are typed and flat — `LayerSettings { point_size,
-stroke_width, bar_width }` — never a string-keyed bag (0017 §3, 0019 §2, 0021
-§2). The three value types stay separate: `PointSize` and `StrokeWidth` are
+stroke_width, bar_width, category_gap }` — never a string-keyed bag (0017 §3,
+0019 §2, 0021 §2, 0053). The four value types stay separate: `PointSize` and `StrokeWidth` are
 relative linear factors in `0.25..=8.0` (1.0 preserves today's pixels);
-`BarWidth` is normalized slot occupancy in `(0.0, 1.0]`, default `0.9` (0017
-§1, 0019 §1, 0021 §1). Three specimens validated the register architecture, not
-a shared abstraction (0021 §2).
+`BarWidth` is normalized slot occupancy in `(0.0, 1.0]`, default `0.9`, and
+`CategoryGap` is normalized category reserve in `[0.0, 1.0)`, default `0.0`
+(0017 §1, 0019 §1, 0021 §1, 0053). The specimens validate the register
+architecture, not a shared abstraction (0021 §2).
 
 Settings are render-time presentation, never prepared data: prepared data is
 identical across styled values, and paint and hit geometry consume one resolved
 calculation (0017 §5–6, 0019 §3–4, 0021 §3–4).
+
+Bar is one authored family with four resolved geometry members (0055, 0064).
+The quantitative/non-quantitative channel pair first selects vertical `Bar` or
+horizontal `HorizontalBar`; `.stacked()` then selects the corresponding
+`StackedBar` member. Layer identity remains authored `Bar`, so rotation and
+stacking preserve categorical color lineage and the durable family vocabulary.
+Directly authored stacked plot types remain refused. Stacks begin at true data
+zero and proceed in legend order along the numeric axis. `bar_width` and
+`category_gap` apply to their one band per category; first-row-wins and the
+canonical positive-finite segment sequence remain the data semantics (0064
+§§1–8).
 
 ## 9. Color: one authority, several projections
 

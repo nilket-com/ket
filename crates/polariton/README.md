@@ -131,6 +131,34 @@ sort ascending for an ascending list, or descending to put the first-ranked bar
 at the top. Heatmap rows follow the same top-down y-domain rule; x remains left
 to right.
 
+Add `.stacked()` to select stacked geometry without changing the authored Bar
+family or its color identity. It composes with both orientations and with the
+existing bar geometry modifiers:
+
+```rune
+workspace.table("sales").views([
+    bar("region", "revenue", "product")
+        .stacked()
+        .bar_width(0.8)
+        .category_gap(0.2),
+    bar("revenue", "region", "product")
+        .category_gap(0.2)
+        .stacked(),
+])
+```
+
+Segments stack in legend order outward from data zero: upward for vertical
+bars and rightward for horizontal bars. Authored bounds clip that true-zero
+geometry rather than relocating its origin. Grouped and stacked forms of the
+same series retain the same resolved colors. The two-field form is a valid
+one-segment stack and carries no legend.
+
+Stack preparation remains first-row-wins for each category/series pair, not an
+implicit aggregation. Only positive finite values participate in the summed
+axis, rectangles, hit testing, and hover; aggregate or filter in the relation
+when different data semantics are intended. Percentage-of-total stacking is
+not part of `.stacked()`.
+
 #### Rune line presentation:
 
 Lines accept an optional categorical series field. Rows connect only within

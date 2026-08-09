@@ -346,6 +346,10 @@ pub struct AuthoredPlotSpec {
 	pub y: AuthoredChannelSpec,
 	pub color: OptionalAuthoredChannelSpec,
 	pub color_job: Override<ColorJob>,
+	/// PRODUCT-0064: stacking is authored geometry within the Bar family, not
+	/// a fourth authored plot type. Resolution consumes this only after the
+	/// x/y pair has selected the physical orientation.
+	stacked_bar: bool,
 }
 
 impl AuthoredPlotSpec {
@@ -356,6 +360,7 @@ impl AuthoredPlotSpec {
 			y: AuthoredChannelSpec::auto(),
 			color: OptionalAuthoredChannelSpec::auto(),
 			color_job: Override::Inherit,
+			stacked_bar: false,
 		}
 	}
 
@@ -366,6 +371,7 @@ impl AuthoredPlotSpec {
 			y: AuthoredChannelSpec::named(y),
 			color: OptionalAuthoredChannelSpec::absent(),
 			color_job: Override::Inherit,
+			stacked_bar: false,
 		}
 	}
 
@@ -380,6 +386,11 @@ impl AuthoredPlotSpec {
 			spec.color = OptionalAuthoredChannelSpec::named(color);
 		}
 		spec
+	}
+
+	pub fn with_stacked_bar(mut self) -> Self {
+		self.stacked_bar = true;
+		self
 	}
 }
 
@@ -484,6 +495,7 @@ impl LayerEncoding {
 			y: self.y.clone(),
 			color: self.color.clone(),
 			color_job: self.color_job.clone(),
+			stacked_bar: false,
 		}
 	}
 }
@@ -1376,10 +1388,25 @@ pub fn resolve_channels(
 	// PRODUCT-0055: Rune authors the Bar family; the resolved physical channel
 	// pair selects its canonical rendering member. Keep `layer` family-keyed so
 	// rotating a bar does not begin a new categorical color lineage.
-	let resolved_plot_type = if pair_resolved_bar {
+	let oriented_plot_type = if pair_resolved_bar {
 		resolve_bar_orientation(&x, &y)?
 	} else {
 		plot_type
+	};
+	let resolved_plot_type = if spec.stacked_bar {
+		match oriented_plot_type {
+			PlotType::Bar => PlotType::StackedBar,
+			PlotType::HorizontalBar => PlotType::HorizontalStackedBar,
+			_ => {
+				return Err(ChannelError {
+					channel: Channel::X,
+					field: "<authored>".to_owned(),
+					reason: ".stacked() is available on bar marks".to_owned(),
+				});
+			}
+		}
+	} else {
+		oriented_plot_type
 	};
 	let mut color = resolve_optional(
 		Channel::Color,
@@ -1765,6 +1792,16 @@ fn kernel_fields_from_channels(
 			value: required(Channel::Y)?,
 		}),
 		PlotType::HorizontalBar => Ok(ResolvedKernelFields::Bar {
+			category: required(Channel::Y)?,
+			group: field(Channel::Color),
+			value: required(Channel::X)?,
+		}),
+		PlotType::StackedBar => Ok(ResolvedKernelFields::StackedBar {
+			category: required(Channel::X)?,
+			group: field(Channel::Color),
+			value: required(Channel::Y)?,
+		}),
+		PlotType::HorizontalStackedBar => Ok(ResolvedKernelFields::StackedBar {
 			category: required(Channel::Y)?,
 			group: field(Channel::Color),
 			value: required(Channel::X)?,
@@ -2434,8 +2471,10 @@ fn resolve_explicit_band_fills(
 	selection: &CategoricalPaletteSelection,
 	identity: &mut ColorIdentity,
 ) -> Result<Vec<BandFillAssignment>, CategoricalResolutionError> {
-	let ResolvedKernelFields::Bar { category, .. } = kernel_fields else {
-		return Ok(Vec::new());
+	let category = match kernel_fields {
+		ResolvedKernelFields::Bar { category, .. }
+		| ResolvedKernelFields::StackedBar { category, .. } => category,
+		_ => return Ok(Vec::new()),
 	};
 	if channels
 		.iter()
@@ -3573,6 +3612,152 @@ mod tests {
 			ResolvedKernelFields::Bar { category, value, .. }
 				if category == "category" && value == "value"
 		));
+	}
+
+	#[test]
+	fn product_0064_stacking_selects_members_after_the_bar_pair_rule() {
+		let frame = df!(
+			"category" => ["A"],
+			"value" => [1.0],
+			"series" => ["one"],
+		)
+		.unwrap();
+		for (x, y, stacked, expected, expected_fields) in [
+			(
+				"category",
+				"value",
+				false,
+				PlotType::Bar,
+				ResolvedKernelFields::Bar {
+					category: "category".to_owned(),
+					group: Some("series".to_owned()),
+					value: "value".to_owned(),
+				},
+			),
+			(
+				"value",
+				"category",
+				false,
+				PlotType::HorizontalBar,
+				ResolvedKernelFields::Bar {
+					category: "category".to_owned(),
+					group: Some("series".to_owned()),
+					value: "value".to_owned(),
+				},
+			),
+			(
+				"category",
+				"value",
+				true,
+				PlotType::StackedBar,
+				ResolvedKernelFields::StackedBar {
+					category: "category".to_owned(),
+					group: Some("series".to_owned()),
+					value: "value".to_owned(),
+				},
+			),
+			(
+				"value",
+				"category",
+				true,
+				PlotType::HorizontalStackedBar,
+				ResolvedKernelFields::StackedBar {
+					category: "category".to_owned(),
+					group: Some("series".to_owned()),
+					value: "value".to_owned(),
+				},
+			),
+		] {
+			let authored = AuthoredPlotSpec::xy_color(
+				PlotComposition::single(PlotType::Bar),
+				x,
+				y,
+				Some("series".to_owned()),
+			);
+			let authored = if stacked {
+				authored.with_stacked_bar()
+			} else {
+				authored
+			};
+			let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+			assert_eq!(binding.composition.primary_plot_type(), expected);
+			assert_eq!(binding.kernel_fields.as_ref(), &expected_fields);
+			for channel in binding.channels() {
+				assert_eq!(
+					channel.layer,
+					LayerIdentity {
+						ordinal: 0,
+						plot_type: PlotType::Bar,
+					},
+					"stacking and rotation may change geometry, axes, and guides; neither changes identity"
+				);
+			}
+		}
+
+		for frame in [
+			df!("x" => [1.0], "y" => [2.0]).unwrap(),
+			df!("x" => ["A"], "y" => ["B"]).unwrap(),
+		] {
+			let grouped = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "x", "y");
+			let stacked = grouped.clone().with_stacked_bar();
+			assert_eq!(
+				resolve_channels(&grouped, frame.schema().as_ref()).unwrap_err(),
+				resolve_channels(&stacked, frame.schema().as_ref()).unwrap_err(),
+				"stacking cannot rescue or reattribute an invalid channel pair"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0064_stacking_preserves_lineage_and_canonical_members_gain_no_authority() {
+		let result = stamped(
+			df!(
+				"category" => ["A", "A", "B", "B"],
+				"value" => [1.0, 2.0, 3.0, 4.0],
+				"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+				"other" => ["North", "South", "North", "South"],
+			)
+			.unwrap(),
+		);
+		let grouped = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"category",
+			"value",
+			Some("series".to_owned()),
+		);
+		let stacked = grouped.clone().with_stacked_bar();
+		let (grouped_resolved, identity) =
+			resolve(&grouped, &result, &ColorIdentity::default()).unwrap();
+		let (stacked_resolved, identity) = resolve(&stacked, &result, &identity).unwrap();
+		assert_eq!(
+			grouped_resolved.channel(Channel::Color).unwrap().colors,
+			stacked_resolved.channel(Channel::Color).unwrap().colors,
+			"grouped and stacked geometry share exact categorical continuation"
+		);
+
+		let changed = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"category",
+			"value",
+			Some("other".to_owned()),
+		)
+		.with_stacked_bar();
+		let (_, changed_identity) = resolve(&changed, &result, &identity).unwrap();
+		assert!(
+			changed_identity.assignments.len() > identity.assignments.len(),
+			"changing the series field, unlike stacking, begins a fresh lineage"
+		);
+
+		for member in [PlotType::StackedBar, PlotType::HorizontalStackedBar] {
+			let direct = AuthoredPlotSpec::xy(PlotComposition::single(member), "category", "value");
+			let error = resolve_channels(&direct, result.data.schema().as_ref())
+				.expect_err("canonical stacked members are resolved output, not authored families");
+			assert!(
+				error
+					.reason
+					.contains("does not yet expose authored channel roles")
+			);
+		}
 	}
 
 	#[test]

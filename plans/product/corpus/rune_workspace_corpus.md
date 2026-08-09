@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.40. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.64. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -45,6 +45,7 @@ a cited record).
 | relative scatter point size (`scatter(x, y).point_size(factor)`) | executable | PRODUCT-0017 proves the typed layer setting and all scatter renderer/hit/cache paths; PRODUCT-0018's closed contextual register, exact lowering/refusals, shared-result handoff, byte-identical `1.0`, six-pixel-radius `2.0`, identity/label lifecycle, and no-dashboard host completion land in `5d180e0c` and `0478f8a2`; installed `test7.rn` exercises the accepted `8.0` maximum |
 | relative line stroke width (`line(x, y).stroke_width(factor)`) | executable | PRODUCT-0019 proves the typed layer setting, five-tier selection, exact line paint/hit behavior, fixed guide, and styled-one-layer scale preservation; PRODUCT-0020's closed contextual lowering/refusals, shared-result handoff, byte-identical `1.0`, exact 4px `2.0`, identity/label lifecycle, and combined point-size host assay land in `01a66f4d`; installed `test7.rn` exercises both modifiers in one figure |
 | normalized bar slot width (`bar(category, value).bar_width(fraction)`) | executable | PRODUCT-0021 proves the typed `(0, 1]` Layer-stage setting, default `0.9`, five-tier selection, full-band subgroup allocation, touching `1.0`, shared vertical/horizontal paint-hit rectangles, exact padding misses, fixed preparation/layout/guide output, and no Bar layer admission in `bf4be7a0` and `671ce765`; PRODUCT-0022's closed contextual lowering/refusals, shared-result styled-Bar handoff, byte-identical bare/`0.9`, narrow `0.5`, identity/heading/placement lifecycle, and no-dashboard host assay land in `db4d2be6`; installed `test7.rn` exercises near-touching `0.9999` beside the existing line and scatter modifiers |
+| stacked bar geometry (`bar(category, value[, series]).stacked()`) | executable | PRODUCT-0064 keeps one authored Bar family while selecting vertical or horizontal stacked members after pair-resolved orientation. Exact resolved series and band-fill colors survive grouped/stacked changes; `bar_width` and `category_gap` apply; stacks grow from true zero through one positive-finite segment sequence shared by domain, paint, hit, and hover. The two-field form is the one-segment case, and `test20.rn` compares grouped, vertical stacked, horizontal stacked, and degenerate forms. |
 | durable live plot | pending | — |
 | durable pinned plot | pending | — |
 
@@ -591,6 +592,16 @@ PRODUCT-0032 owns the first theme-name projection and direct figure
 | bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
+
+- v0.64 (2026-08-09): PRODUCT-0064 adds `.stacked()` to the closed Bar
+  register. Pair resolution still chooses orientation first, stacking changes
+  only the resolved geometry member, and the authored Bar identity preserves
+  exact series colors and PRODUCT-0062's durable vocabulary. The repaired
+  substrate consumes resolved series and band-fill assignments, honors
+  `bar_width` and `category_gap`, originates at true zero, and shares one
+  positive-finite segment sequence across domain, rectangles, hit, and hover.
+  `test20.rn` places grouped and stacked controls beside both orientations and
+  the valid two-field one-segment form.
 
 - v0.58 (2026-08-08): PRODUCT-0058 closes DB-03. Every established mark-field
   slot accepts PRODUCT-0040 static string bindings across legacy calls,

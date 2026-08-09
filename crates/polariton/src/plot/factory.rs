@@ -100,14 +100,13 @@ pub fn create_plot(
 				group.as_deref().unwrap_or(""),
 				value,
 			);
-			Arc::new(StackedBarPlotKernel {
-				prepared_data: Arc::new(prepared),
-				orientation: if plot_type == PlotType::HorizontalStackedBar {
-					Orientation::Horizontal
-				} else {
-					Orientation::Vertical
-				},
-			})
+			create_stacked_bar_kernel(
+				prepared,
+				plot_type,
+				LayerSettings::default(),
+				&spec.band_fills,
+				resolved_category_colors(spec),
+			)
 		}
 		ResolvedKernelFields::Pie { category, value } => {
 			let prepared = pie::prepare_pie_data(df, category.as_deref().unwrap_or(""), value);
@@ -250,6 +249,26 @@ fn create_bar_kernel(
 	})
 }
 
+fn create_stacked_bar_kernel(
+	prepared_data: stacked_bar::StackedBarPreparedData,
+	plot_type: PlotType,
+	layer_settings: LayerSettings,
+	band_fills: &[BandFillAssignment],
+	group_colors: &[CategoryColorAssignment],
+) -> Arc<dyn PlotKernel + Send + Sync> {
+	Arc::new(StackedBarPlotKernel {
+		prepared_data: Arc::new(prepared_data),
+		orientation: if plot_type == PlotType::HorizontalStackedBar {
+			Orientation::Horizontal
+		} else {
+			Orientation::Vertical
+		},
+		layer_settings,
+		band_fills: band_fills.to_vec(),
+		group_colors: group_colors.to_vec(),
+	})
+}
+
 /// PRODUCT-0029 §1: the exact assignments an authored categorical channel wrote
 /// into the resolved artifact, empty when no such channel exists.
 fn resolved_category_colors(spec: &ResolvedPlotSpec) -> &[CategoryColorAssignment] {
@@ -318,6 +337,22 @@ pub fn create_styled_plot(
 				layer_settings,
 			)))
 		}
+		ResolvedKernelFields::StackedBar {
+			category,
+			group,
+			value,
+		} => Ok(create_stacked_bar_kernel(
+			stacked_bar::prepare_stacked_bar_data(
+				df,
+				category,
+				group.as_deref().unwrap_or(""),
+				value,
+			),
+			plot_type,
+			layer_settings,
+			&spec.band_fills,
+			resolved_category_colors(spec),
+		)),
 		_ => Err("standalone Layer settings are not implemented for this plot mark".to_owned()),
 	}
 }
@@ -1819,5 +1854,224 @@ mod product_0013_baseline_tests {
 		let kernel = create_styled_plot(&resolved, &frame, settings).expect("styled series line");
 		let svg = render_marks_with_settings(kernel.as_ref(), &PlotSettings::default());
 		assert_eq!(svg.matches("stroke-width=\"4\"").count(), 2, "{svg}");
+	}
+
+	fn product_0064_resolved_stacked(
+		frame: &DataFrame,
+		x: &str,
+		y: &str,
+		series: Option<&str>,
+	) -> crate::plot::spec::ResolvedPlotSpec {
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			x,
+			y,
+			series.map(str::to_owned),
+		)
+		.with_stacked_bar();
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0064".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("blues").unwrap();
+		resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.unwrap()
+		.0
+	}
+
+	#[test]
+	fn product_0064_real_surface_joins_geometry_hit_color_legend_and_orientation() {
+		let frame = df!(
+			"category" => ["East", "East", "West", "West"],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+			"value" => [10.0, 30.0, 20.0, 40.0],
+		)
+		.unwrap();
+		let layer = LayerSettings {
+			bar_width: Override::Set(BarWidth::new(0.5).unwrap()),
+			category_gap: Override::Set(CategoryGap::new(0.2).unwrap()),
+			..LayerSettings::default()
+		};
+		let plot_settings = PlotSettings::default();
+		for (x, y, expected_type, orientation) in [
+			(
+				"category",
+				"value",
+				PlotType::StackedBar,
+				Orientation::Vertical,
+			),
+			(
+				"value",
+				"category",
+				PlotType::HorizontalStackedBar,
+				Orientation::Horizontal,
+			),
+		] {
+			let resolved = product_0064_resolved_stacked(&frame, x, y, Some("series"));
+			assert_eq!(resolved.composition.primary_plot_type(), expected_type);
+			let assignments = &resolved.channel(Channel::Color).unwrap().colors;
+			let expected_colors = assignments
+				.iter()
+				.map(|assignment| {
+					iced::Color::from_rgba8(
+						assignment.color.red,
+						assignment.color.green,
+						assignment.color.blue,
+						assignment.color.alpha as f32 / u8::MAX as f32,
+					)
+				})
+				.collect::<Vec<_>>();
+			let kernel = create_styled_plot(&resolved, &frame, layer.clone()).unwrap();
+			let legend = kernel
+				.legend_content(&plot_settings.resolve())
+				.expect("named stacked series earns a legend");
+			let crate::plot::legend::LegendSection::Entries(entries) = legend.0.first() else {
+				panic!("stacked series legend entries")
+			};
+			assert_eq!(
+				entries.iter().map(|entry| entry.swatch).collect::<Vec<_>>(),
+				expected_colors,
+				"legend consumes the exact resolved blues assignments"
+			);
+
+			for extent in [200.0_f32, 600.0] {
+				let bounds = Rectangle::new(Point::ORIGIN, Size::new(extent, extent));
+				let layout = kernel.layout(plot_settings.resolve());
+				let transform = CoordinateTransformer::new(&layout, bounds);
+				let mut backend = RectangleBackend::default();
+				kernel.plot_with_settings(
+					&mut backend,
+					bounds,
+					&transform,
+					Cursor::Unavailable,
+					&plot_settings,
+				);
+				assert_eq!(backend.rectangles.len(), 4);
+				assert_eq!(
+					backend
+						.rectangles
+						.iter()
+						.map(|(_, _, color)| *color)
+						.collect::<Vec<_>>(),
+					vec![
+						expected_colors[0],
+						expected_colors[1],
+						expected_colors[0],
+						expected_colors[1],
+					],
+					"paint and legend share resolved display-domain order"
+				);
+				let band = extent / 2.0;
+				let expected_cross_extent = band * 0.8 * 0.5;
+				for (_, size, _) in &backend.rectangles {
+					let actual = match orientation {
+						Orientation::Vertical => size.width,
+						Orientation::Horizontal => size.height,
+					};
+					assert!((actual - expected_cross_extent).abs() < 0.0001);
+				}
+
+				for (index, expected_hover) in [
+					"East: Atlas (Value: 10.00, Total: 10.00)",
+					"East: Beacon (Value: 30.00, Total: 40.00)",
+					"West: Atlas (Value: 20.00, Total: 20.00)",
+					"West: Beacon (Value: 40.00, Total: 60.00)",
+				]
+				.into_iter()
+				.enumerate()
+				{
+					let (origin, size, _) = backend.rectangles[index];
+					let cursor =
+						Point::new(origin.x + size.width / 2.0, origin.y + size.height / 2.0);
+					assert_eq!(
+						kernel
+							.hover_with_settings(
+								&transform,
+								Cursor::Available(cursor),
+								&plot_settings
+							)
+							.as_deref(),
+						Some(expected_hover),
+						"paint and hit consume one baseline-outward rectangle sequence"
+					);
+				}
+
+				let (center, band) = transform.categorical(0, 5.0);
+				let reserve = match orientation {
+					Orientation::Vertical => Point::new(center.x - band * 0.45, center.y),
+					Orientation::Horizontal => Point::new(center.x, center.y - band * 0.45),
+				};
+				assert_eq!(
+					kernel.hover_with_settings(
+						&transform,
+						Cursor::Available(reserve),
+						&plot_settings,
+					),
+					None,
+					"category reserve is neither paint nor hit"
+				);
+			}
+		}
+	}
+
+	#[test]
+	fn product_0064_degenerate_stack_matches_grouped_geometry_and_band_fill() {
+		let frame = df!("category" => ["East", "West"], "value" => [10.0, 20.0]).unwrap();
+		let grouped_authored =
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "category", "value");
+		let stacked_resolved = product_0064_resolved_stacked(&frame, "category", "value", None);
+		let grouped_binding = resolve_channels(&grouped_authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0064 grouped".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("blues").unwrap();
+		let (grouped_resolved, _) = resolve_domains_with_categorical_palette(
+			grouped_binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.unwrap();
+		assert_eq!(grouped_resolved.band_fills, stacked_resolved.band_fills);
+		let layer = LayerSettings {
+			bar_width: Override::Set(BarWidth::new(0.6).unwrap()),
+			category_gap: Override::Set(CategoryGap::new(0.2).unwrap()),
+			..LayerSettings::default()
+		};
+		let grouped = create_styled_plot(&grouped_resolved, &frame, layer.clone()).unwrap();
+		let stacked = create_styled_plot(&stacked_resolved, &frame, layer).unwrap();
+		assert_eq!(
+			render_marks_with_settings(grouped.as_ref(), &PlotSettings::default()),
+			render_marks_with_settings(stacked.as_ref(), &PlotSettings::default()),
+			"the one-segment stacked form preserves exact geometry and band-fill color"
+		);
+		assert!(
+			stacked
+				.legend_content(&ResolvedPlotSettings::default())
+				.is_some(),
+			"kernel content is produced before PRODUCT-0044 removes one synthetic entry"
+		);
+		assert!(
+			crate::plot::legend::apply_policy(
+				stacked
+					.legend_content(&ResolvedPlotSettings::default())
+					.unwrap()
+			)
+			.is_none(),
+			"the degenerate stack carries no rendered legend"
+		);
 	}
 }

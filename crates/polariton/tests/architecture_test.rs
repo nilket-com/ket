@@ -765,7 +765,7 @@ fn product_0022_bar_width_extends_only_the_closed_styled_single_register() {
 }
 
 #[test]
-fn product_0053_category_gap_extends_only_the_bar_register_and_shared_geometry() {
+fn product_0053_category_gap_stays_in_the_closed_bar_register() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
 		.expect("read Rune envelope");
@@ -779,13 +779,9 @@ fn product_0053_category_gap_extends_only_the_bar_register_and_shared_geometry()
 		!envelope.contains("HashMap<String, LayerModifier"),
 		"category gap does not authorize open modifier dispatch"
 	);
-
-	let stacked = std::fs::read_to_string(root.join("plot/kernels/stacked_bar.rs"))
-		.expect("read stacked bar");
-	assert!(
-		!stacked.contains("category_gap") && !stacked.contains("CategoryGap"),
-		"PRODUCT-0053 must not widen the dashboard stacked-bar geometry"
-	);
+	// PRODUCT-0064 supersedes 0053's dashboard-only negative boundary by
+	// making stacked bars an authored member of this same closed register.
+	// Its geometry and hit tests prove the accepted equations behaviorally.
 }
 
 #[test]

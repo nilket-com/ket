@@ -113,6 +113,9 @@ pub(crate) enum RunePlotBody {
 pub(crate) struct StyledRunePlotSink {
 	pub(crate) sink: DisposableRunePlotSink,
 	pub(crate) settings: LayerSettings,
+	/// PRODUCT-0064: structural Bar-family member selection, kept separate
+	/// from the Layer-stage geometry settings and from PlotType identity.
+	pub(crate) stacked: bool,
 }
 
 impl StyledRunePlotSink {
@@ -2537,6 +2540,7 @@ fn parse_modified_mark(
 	let mut stroke_width = None;
 	let mut bar_width = None;
 	let mut category_gap = None;
+	let mut stacked = false;
 	loop {
 		let ast::Expr::Call(call) = current else {
 			return invalid_view(
@@ -2631,12 +2635,29 @@ fn parse_modified_mark(
 					}
 				})?);
 			}
+			"stacked" => {
+				if stacked {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"stacked() may appear at most once on a bar mark",
+					);
+				}
+				if !call.args.is_empty() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"stacked() takes no arguments",
+					);
+				}
+				stacked = true;
+			}
 			_ => {
 				return invalid_view(
 					expression.span(),
 					source.len(),
 					format!(
-						"unknown layer modifier {modifier:?}; expected point_size(number), stroke_width(number), bar_width(number), or category_gap(number)"
+						"unknown layer modifier {modifier:?}; expected point_size(number), stroke_width(number), bar_width(number), category_gap(number), or stacked()"
 					),
 				);
 			}
@@ -2719,6 +2740,13 @@ fn parse_modified_mark(
 				"category_gap(...) is available on bar marks, not line or scatter marks",
 			);
 		}
+		PlotType::Line | PlotType::Scatter if stacked => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"stacked() is available on bar marks, not line or scatter marks",
+			);
+		}
 		_ => {}
 	}
 	if in_layer && (plot_type == PlotType::Bar || args.len() == 3) {
@@ -2745,6 +2773,7 @@ fn parse_modified_mark(
 			bar_width: bar_width.map_or(Override::Inherit, Override::Set),
 			category_gap: category_gap.map_or(Override::Inherit, Override::Set),
 		},
+		stacked,
 	}))
 }
 
@@ -5651,6 +5680,62 @@ workspace.table("t").views([table()])
 		let transformed = transform(source).expect("unproven modifiers remain Rune");
 		assert!(transformed.source.contains("category_gap(0.2)"));
 		assert!(transformed.source.contains("category_gap(0.4)"));
+	}
+
+	#[test]
+	fn product_0064_stacked_is_a_zero_argument_order_independent_bar_member() {
+		for source in [
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\").stacked()])",
+			"workspace.table(\"t\").views([figure([bar(\"cat\", \"val\", \"series\").stacked()])])",
+		] {
+			let styled = product_0022_only_bar(source);
+			assert!(styled.stacked);
+			assert_eq!(styled.sink.composition.primary_plot_type(), PlotType::Bar);
+			assert_eq!(styled.settings, LayerSettings::default());
+			assert!(styled.clone().into_layer().is_err());
+			assert_eq!(
+				RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(styled)))
+					.presentation()
+					.display_label,
+				"plot.bar",
+				"the label names authored Bar intent before member resolution"
+			);
+		}
+
+		let first = product_0022_only_bar(
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", \"series\").stacked().bar_width(0.5).category_gap(0.2)])",
+		);
+		let second = product_0022_only_bar(
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", \"series\").category_gap(0.2).bar_width(0.5).stacked()])",
+		);
+		assert_eq!(first, second, "the bar register is a set, not a pipeline");
+	}
+
+	#[test]
+	fn product_0064_stacked_refusals_are_atomic_and_receiver_scoped() {
+		for rejected in [
+			"bar(\"cat\", \"val\").stacked().stacked()",
+			"bar(\"cat\", \"val\").stacked(true)",
+			"bar(\"cat\", \"val\").stacked(1)",
+			"line(\"x\", \"y\").stacked()",
+			"scatter(\"x\", \"y\").stacked()",
+		] {
+			let source = format!("workspace.table(\"t\").views([{rejected}])");
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				transform(&source).expect_err("invalid stacked modifier must refuse")
+			else {
+				panic!("expected attributed stacked refusal")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				rejected,
+				"the complete invalid modifier chain owns the refusal"
+			);
+		}
+
+		let layered = "workspace.table(\"t\").views([layers([bar(\"cat\", \"val\").stacked()])])";
+		let error = transform(layered).expect_err("stacking does not admit bar layering");
+		assert!(error.to_string().contains("not a shared-Cartesian layer"));
 	}
 
 	#[test]

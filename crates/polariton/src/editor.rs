@@ -6580,9 +6580,36 @@ mod tests {
 			}],
 		})
 		.unwrap();
-		let colours = [((producer, named.clone(), 4), identity.clone())]
-			.into_iter()
-			.collect();
+		let grouped_identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
+			assignments: vec![ColorAssignmentSnapshot {
+				field: "product".into(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::Bar,
+				},
+				category: "Atlas".into(),
+				position: 2,
+			}],
+			spaces: vec![ColorSpaceSnapshot {
+				field: "product".into(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::Bar,
+				},
+				space: AllocationSpaceSnapshot::Legacy { len: 12 },
+			}],
+		})
+		.unwrap();
+		let stacked_persistence_view = LocalViewIdentity::Named("stacked-persistence".into());
+		let colours = [
+			((producer, named.clone(), 4), identity.clone()),
+			(
+				(producer, stacked_persistence_view.clone(), 12),
+				grouped_identity,
+			),
+		]
+		.into_iter()
+		.collect();
 		editor
 			.checkpoint_session(&crate::session_persistence::RuntimeColours::new(colours))
 			.unwrap();
@@ -6641,6 +6668,53 @@ mod tests {
 				.get(&(reopened_buffer, named.clone(), 4)),
 			Some(&canonical_identity),
 			"resolved horizontal geometry restores the authored bar family"
+		);
+		let restored_grouped_identity = restored_colours
+			.as_map()
+			.get(&(reopened_buffer, stacked_persistence_view, 12))
+			.expect("grouped Bar identity restores")
+			.clone();
+		let frame = crate::plot::spec::StampedResult {
+			data: std::sync::Arc::new(
+				polars::df!(
+					"region" => ["East", "East"],
+					"revenue" => [40.0, 60.0],
+					"product" => ["Atlas", "Beacon"],
+				)
+				.unwrap(),
+			),
+			provenance: crate::plot::spec::PlotProvenance {
+				source_name: "restored".into(),
+				revision: Some(1),
+			},
+		};
+		let grouped = crate::plot::spec::AuthoredPlotSpec::xy_color(
+			crate::plot::composition::PlotComposition::single(PlotType::Bar),
+			"region",
+			"revenue",
+			Some("product".into()),
+		);
+		let stacked = grouped.clone().with_stacked_bar();
+		let grouped_binding =
+			crate::plot::spec::resolve_channels(&grouped, frame.data.schema().as_ref()).unwrap();
+		let stacked_binding =
+			crate::plot::spec::resolve_channels(&stacked, frame.data.schema().as_ref()).unwrap();
+		let (grouped_resolved, _) =
+			crate::plot::spec::resolve_domains(grouped_binding, &frame, &restored_grouped_identity)
+				.unwrap();
+		let (stacked_resolved, _) =
+			crate::plot::spec::resolve_domains(stacked_binding, &frame, &restored_grouped_identity)
+				.unwrap();
+		assert_eq!(
+			grouped_resolved
+				.channel(crate::plot::spec::Channel::Color)
+				.unwrap()
+				.colors,
+			stacked_resolved
+				.channel(crate::plot::spec::Channel::Color)
+				.unwrap()
+				.colors,
+			"a grouped Bar payload restores onto stacked geometry with exact colours"
 		);
 		let before_count = reopened.view_panel_ids.len();
 		reopened.prepare_rune_view_panels(reopened_buffer, &views, 2);

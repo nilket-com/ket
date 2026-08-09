@@ -2,6 +2,9 @@ use crate::plot::common::{
 	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use crate::plot::legend::LegendProvenance;
+use crate::plot::spec::{BandFillAssignment, CategoryColorAssignment, LayerSettings};
+use crate::plot::theme::PlotSettings;
+use iced::Color;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use polars::prelude::*;
@@ -11,6 +14,23 @@ use std::sync::Arc;
 pub struct StackedBarPlotKernel {
 	pub prepared_data: Arc<StackedBarPreparedData>,
 	pub orientation: Orientation,
+	pub layer_settings: LayerSettings,
+	/// PRODUCT-0064 §4: two-field bars retain their resolved category fills
+	/// when grouped geometry becomes stacked geometry.
+	pub band_fills: Vec<BandFillAssignment>,
+	/// PRODUCT-0064 §4: authored stacked bars consume the resolved categorical
+	/// assignments. Automatic dashboard plots carry an empty vector and retain
+	/// the legacy ramp fallback.
+	pub group_colors: Vec<CategoryColorAssignment>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct StackedBarRectangle {
+	rect: Rectangle,
+	category_index: usize,
+	group_index: usize,
+	value: f64,
+	running_total: f64,
 }
 
 fn category_label(value: AnyValue<'_>) -> String {
@@ -18,6 +38,104 @@ fn category_label(value: AnyValue<'_>) -> String {
 		value.to_string()
 	} else {
 		value.to_string().replace('"', "")
+	}
+}
+
+impl StackedBarPlotKernel {
+	fn group_color(&self, group_index: usize) -> Option<Color> {
+		let name = self.prepared_data.group_names.get(group_index)?;
+		let assignment = self
+			.group_colors
+			.iter()
+			.find(|assignment| assignment.category == *name)?;
+		Some(Color::from_rgba8(
+			assignment.color.red,
+			assignment.color.green,
+			assignment.color.blue,
+			assignment.color.alpha as f32 / u8::MAX as f32,
+		))
+	}
+
+	/// PRODUCT-0064 §§5-8: one positive-segment sequence owns paint and hit
+	/// geometry. Every stack starts at data zero; authored bounds clip it but
+	/// never rebase its values.
+	fn stacked_rectangles(
+		&self,
+		transform: &CoordinateTransformer,
+		width_fraction: f32,
+		category_gap_fraction: f32,
+	) -> Vec<StackedBarRectangle> {
+		let num_cats = self.prepared_data.categories.len();
+		let num_groups = self.prepared_data.group_names.len();
+		let mut bars = Vec::with_capacity(num_cats.saturating_mul(num_groups));
+		for category_index in 0..num_cats {
+			let Some(shared_index) =
+				transform.category_index(&self.prepared_data.categories[category_index])
+			else {
+				continue;
+			};
+			let (category_center, band) = transform.categorical(shared_index, 0.0);
+			let available = band * (1.0 - category_gap_fraction);
+			let bar_extent = available * width_fraction;
+			let mut running_total = 0.0;
+			for group_index in 0..num_groups {
+				let value = self.prepared_data.category_values[category_index][group_index];
+				debug_assert!(value >= 0.0, "prepared stack values are canonicalized");
+				if value == 0.0 {
+					continue;
+				}
+				let next_total = running_total + value;
+				let (start, _) = transform.categorical(shared_index, running_total);
+				let (end, _) = transform.categorical(shared_index, next_total);
+				let rect = match self.orientation {
+					Orientation::Vertical => Rectangle {
+						x: category_center.x - bar_extent / 2.0,
+						y: end.y,
+						width: bar_extent,
+						height: (start.y - end.y).max(1.0),
+					},
+					Orientation::Horizontal => Rectangle {
+						x: start.x,
+						y: category_center.y - bar_extent / 2.0,
+						width: (end.x - start.x).max(1.0),
+						height: bar_extent,
+					},
+				};
+				bars.push(StackedBarRectangle {
+					rect,
+					category_index,
+					group_index,
+					value,
+					running_total: next_total,
+				});
+				running_total = next_total;
+			}
+		}
+		bars
+	}
+
+	fn hover_resolved(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &ResolvedPlotSettings,
+	) -> Option<String> {
+		let cursor = cursor.position()?;
+		let hit = self
+			.stacked_rectangles(
+				transform,
+				settings.bar_width.fraction(),
+				settings.category_gap.fraction(),
+			)
+			.into_iter()
+			.find(|bar| bar.rect.contains(cursor))?;
+		Some(format!(
+			"{}: {} (Value: {:.2}, Total: {:.2})",
+			self.prepared_data.categories[hit.category_index],
+			self.prepared_data.group_names[hit.group_index],
+			hit.value,
+			hit.running_total,
+		))
 	}
 }
 
@@ -49,189 +167,93 @@ impl PlotKernel for StackedBarPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_cats = self.prepared_data.categories.len();
 		let num_groups = self.prepared_data.group_names.len();
-		match self.orientation {
-			Orientation::Vertical => {
-				let y_base = if let PlotLayout::CategoricalX { y_range, .. } = transform.layout {
-					y_range.0
-				} else {
-					0.0
-				};
-				let total_band_width = transform.bounds.width / num_cats as f32;
-				let bar_width = total_band_width * 0.8;
-				let bar_offset = (total_band_width - bar_width) / 2.0;
-				for i in 0..num_cats {
-					let Some(shared_index) =
-						transform.category_index(&self.prepared_data.categories[i])
-					else {
-						continue;
-					};
-					let cat_left = (shared_index as f32 * total_band_width) + bar_offset;
-					let mut current_y = y_base;
-					for j in 0..num_groups {
-						let val = self.prepared_data.category_values[i][j];
-						if val <= 0.0 {
-							continue;
-						}
-						let (p_top, _) = transform.categorical(shared_index, current_y + val);
-						let (p_bottom, _) = transform.categorical(shared_index, current_y);
-						let bar_rect = Rectangle {
-							x: cat_left,
-							y: p_top.y,
-							width: bar_width,
-							height: (p_bottom.y - p_top.y).max(1.0),
-						};
-						let t = if num_groups > 1 {
-							j as f32 / (num_groups - 1) as f32
-						} else {
-							0.5
-						};
-						let color = settings.color_theme.get_color(t);
-						backend.fill_rectangle(bar_rect.position(), bar_rect.size(), color);
-						current_y += val;
-					}
-				}
-			}
-			Orientation::Horizontal => {
-				let x_base = if let PlotLayout::CategoricalY { x_range, .. } = transform.layout {
-					x_range.0
-				} else {
-					0.0
-				};
-				let (_, total_band_height) = transform.categorical(0, x_base);
-				let bar_height = total_band_height * 0.8;
-				let bar_offset = (total_band_height - bar_height) / 2.0;
-				for i in 0..num_cats {
-					let Some(shared_index) =
-						transform.category_index(&self.prepared_data.categories[i])
-					else {
-						continue;
-					};
-					let (category_center, _) = transform.categorical(shared_index, x_base);
-					let cat_top = category_center.y - total_band_height / 2.0 + bar_offset;
-					let mut current_x = x_base;
-					for j in 0..num_groups {
-						let val = self.prepared_data.category_values[i][j];
-						if val <= 0.0 {
-							continue;
-						}
-						let (p_right, _) = transform.categorical(shared_index, current_x + val);
-						let (p_left, _) = transform.categorical(shared_index, current_x);
-						let bar_rect = Rectangle {
-							x: p_left.x,
-							y: cat_top,
-							width: (p_right.x - p_left.x).max(1.0),
-							height: bar_height,
-						};
-						let t = if num_groups > 1 {
-							j as f32 / (num_groups - 1) as f32
-						} else {
-							0.5
-						};
-						let color = settings.color_theme.get_color(t);
-						backend.fill_rectangle(bar_rect.position(), bar_rect.size(), color);
-						current_x += val;
-					}
-				}
-			}
+		for bar in self.stacked_rectangles(
+			transform,
+			settings.bar_width.fraction(),
+			settings.category_gap.fraction(),
+		) {
+			let category = &self.prepared_data.categories[bar.category_index];
+			let color = self
+				.band_fills
+				.iter()
+				.find(|assignment| assignment.category == *category)
+				.map(|assignment| {
+					Color::from_rgba8(
+						assignment.color.red,
+						assignment.color.green,
+						assignment.color.blue,
+						assignment.color.alpha as f32 / u8::MAX as f32,
+					)
+				})
+				.or_else(|| self.group_color(bar.group_index))
+				.unwrap_or_else(|| {
+					settings.color_theme.get_color(if num_groups > 1 {
+						bar.group_index as f32 / (num_groups - 1) as f32
+					} else {
+						0.5
+					})
+				});
+			backend.fill_rectangle(bar.rect.position(), bar.rect.size(), color);
 		}
 	}
 
+	fn plot_with_settings(
+		&self,
+		backend: &mut dyn PlotBackend,
+		bounds: Rectangle,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+	) {
+		self.plot(
+			backend,
+			bounds,
+			transform,
+			cursor,
+			settings.resolve_for_layer(&self.layer_settings),
+		);
+	}
+
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		if let Some(cursor_pos) = cursor.position() {
-			match self.orientation {
-				Orientation::Vertical => {
-					if let PlotLayout::CategoricalX { y_range, .. } = transform.layout {
-						for (i, cat_name) in self.prepared_data.categories.iter().enumerate() {
-							let shared_index = transform.category_index(cat_name)?;
-							let (center, band_width) = transform.categorical(shared_index, 0.0);
-							let left = center.x - band_width / 2.0;
-							let right = center.x + band_width / 2.0;
-							if cursor_pos.x >= left && cursor_pos.x <= right {
-								let bar_width = band_width * 0.8;
-								let bar_offset = (band_width - bar_width) / 2.0;
-								let bar_left = left + bar_offset;
-								let bar_right = left + bar_offset + bar_width;
-								if cursor_pos.x >= bar_left && cursor_pos.x <= bar_right {
-									let y_scale =
-										transform.bounds.height as f64 / (y_range.1 - y_range.0);
-									let data_y = y_range.0
-										+ (transform.bounds.y + transform.bounds.height
-											- cursor_pos.y) as f64 / y_scale;
-									let mut current_sum = 0.0f64;
-									for (j, &val) in
-										self.prepared_data.category_values[i].iter().enumerate()
-									{
-										if data_y >= current_sum && data_y <= current_sum + val {
-											let group_name = &self.prepared_data.group_names[j];
-											return Some(format!(
-												"{}: {} (Value: {:.2}, Total: {:.2})",
-												cat_name,
-												group_name,
-												val,
-												current_sum + val
-											));
-										}
-										current_sum += val;
-									}
-									return Some(format!("{}: Total {:.2}", cat_name, current_sum));
-								}
-							}
-						}
-					}
-				}
-				Orientation::Horizontal => {
-					if let PlotLayout::CategoricalY { x_range, .. } = transform.layout {
-						for (i, cat_name) in self.prepared_data.categories.iter().enumerate() {
-							let shared_index = transform.category_index(cat_name)?;
-							let (center, band_height) = transform.categorical(shared_index, 0.0);
-							let top = center.y - band_height / 2.0;
-							let bottom = center.y + band_height / 2.0;
-							if cursor_pos.y >= top && cursor_pos.y <= bottom {
-								let bar_height = band_height * 0.8;
-								let bar_offset = (band_height - bar_height) / 2.0;
-								let bar_top = top + bar_offset;
-								let bar_bottom = top + bar_offset + bar_height;
-								if cursor_pos.y >= bar_top && cursor_pos.y <= bar_bottom {
-									let x_scale =
-										transform.bounds.width as f64 / (x_range.1 - x_range.0);
-									let data_x = x_range.0
-										+ (cursor_pos.x - transform.bounds.x) as f64 / x_scale;
-									let mut current_sum = 0.0f64;
-									for (j, &val) in
-										self.prepared_data.category_values[i].iter().enumerate()
-									{
-										if data_x >= current_sum && data_x <= current_sum + val {
-											let group_name = &self.prepared_data.group_names[j];
-											return Some(format!(
-												"{}: {} (Value: {:.2}, Total: {:.2})",
-												cat_name,
-												group_name,
-												val,
-												current_sum + val
-											));
-										}
-										current_sum += val;
-									}
-									return Some(format!("{}: Total {:.2}", cat_name, current_sum));
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-		None
+		self.hover_resolved(transform, cursor, &ResolvedPlotSettings::default())
+	}
+
+	fn hover_with_settings(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+	) -> Option<String> {
+		self.hover_resolved(
+			transform,
+			cursor,
+			&settings.resolve_for_layer(&self.layer_settings),
+		)
 	}
 
 	fn legend_content(
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels_with_sample_and_provenance(
-			self.prepared_data.group_names.iter().cloned(),
-			settings,
+		let total = self.prepared_data.group_names.len();
+		let pairs = self
+			.prepared_data
+			.group_names
+			.iter()
+			.enumerate()
+			.map(|(index, name)| {
+				let color = self.group_color(index).unwrap_or_else(|| {
+					settings.color_theme.get_color(if total > 1 {
+						index as f32 / (total - 1) as f32
+					} else {
+						0.5
+					})
+				});
+				(name.clone(), color)
+			});
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+			pairs,
 			crate::plot::legend::LegendSample::Swatch,
 			self.prepared_data.group_provenance,
 		)
@@ -391,7 +413,14 @@ pub fn prepare_stacked_bar_data(
 			continue;
 		};
 		if !assigned[category_idx][group_idx] {
-			category_values[category_idx][group_idx] = vals_f64.get(row).unwrap_or(0.0);
+			let value = vals_f64.get(row).unwrap_or(0.0);
+			// PRODUCT-0064 §8: the canonical sequence contains positive finite
+			// segments only. Domain, paint, hit, and hover all consume this value.
+			category_values[category_idx][group_idx] = if value.is_finite() && value > 0.0 {
+				value
+			} else {
+				0.0
+			};
 			assigned[category_idx][group_idx] = true;
 		}
 	}
@@ -420,6 +449,8 @@ pub fn prepare_stacked_bar_data(
 mod tests {
 	use super::*;
 	use crate::plot::common::PathBuilder;
+	use crate::plot::legend::LegendSection;
+	use crate::plot::spec::{PalettePosition, ResolvedColor};
 	use iced::widget::canvas::{Stroke, Text};
 	use iced::{Color, Point, Size};
 
@@ -486,6 +517,9 @@ mod tests {
 		let kernel = StackedBarPlotKernel {
 			prepared_data: Arc::new(prepare_stacked_bar_data(&frame, "cat", "group", "val")),
 			orientation: Orientation::Horizontal,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
 		};
 		let settings = ResolvedPlotSettings::default();
 		let layout = kernel.layout(settings.clone());
@@ -530,5 +564,237 @@ mod tests {
 			);
 		}
 		assert!(backend.rectangles[0].0.y < backend.rectangles[2].0.y);
+	}
+
+	fn assignment(category: &str, index: usize, color: ResolvedColor) -> CategoryColorAssignment {
+		CategoryColorAssignment {
+			category: category.to_owned(),
+			position: PalettePosition::new(index, 2).unwrap(),
+			color,
+		}
+	}
+
+	#[test]
+	fn product_0064_substrate_consumes_resolved_colors_in_marks_and_legend() {
+		let frame = polars::df!(
+			"cat" => ["A", "A"],
+			"group" => ["left", "right"],
+			"val" => [10_i64, 20],
+		)
+		.unwrap();
+		let left = ResolvedColor {
+			red: 9,
+			green: 19,
+			blue: 29,
+			alpha: 255,
+		};
+		let right = ResolvedColor {
+			red: 199,
+			green: 109,
+			blue: 39,
+			alpha: 255,
+		};
+		let kernel = StackedBarPlotKernel {
+			prepared_data: Arc::new(prepare_stacked_bar_data(&frame, "cat", "group", "val")),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: vec![assignment("left", 0, left), assignment("right", 1, right)],
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 330.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = RectangleBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		let expected = [left, right].map(|color| {
+			Color::from_rgba8(
+				color.red,
+				color.green,
+				color.blue,
+				color.alpha as f32 / u8::MAX as f32,
+			)
+		});
+		assert_eq!(
+			backend
+				.rectangles
+				.iter()
+				.map(|(_, _, color)| *color)
+				.collect::<Vec<_>>(),
+			expected,
+			"the dormant stacked kernel consumes synthetic resolved assignments before Rune exposes it"
+		);
+
+		let legend = kernel
+			.legend_content(&settings)
+			.expect("named groups earn a legend");
+		let LegendSection::Entries(entries) = legend.0.first() else {
+			panic!("stacked groups produce a named-entry legend")
+		};
+		assert_eq!(
+			entries.iter().map(|entry| entry.swatch).collect::<Vec<_>>(),
+			expected,
+			"legend and marks consume the same resolved assignments"
+		);
+
+		let band_frame = polars::df!("cat" => ["A", "B"], "val" => [10_i64, 20]).unwrap();
+		let band_kernel = StackedBarPlotKernel {
+			prepared_data: Arc::new(prepare_stacked_bar_data(&band_frame, "cat", "", "val")),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: vec![
+				BandFillAssignment {
+					category: "A".to_owned(),
+					position: PalettePosition::new(0, 2).unwrap(),
+					color: left,
+				},
+				BandFillAssignment {
+					category: "B".to_owned(),
+					position: PalettePosition::new(1, 2).unwrap(),
+					color: right,
+				},
+			],
+			group_colors: Vec::new(),
+		};
+		let layout = band_kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = RectangleBackend::default();
+		band_kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		assert_eq!(
+			backend
+				.rectangles
+				.iter()
+				.map(|(_, _, color)| *color)
+				.collect::<Vec<_>>(),
+			expected,
+			"the degenerate stacked path consumes exact resolved category band fills"
+		);
+	}
+
+	#[test]
+	fn product_0064_positive_sequence_owns_domain_rectangles_hit_and_hover() {
+		let frame = polars::df!(
+			"cat" => ["A", "A", "A", "A", "A"],
+			"group" => ["a", "b", "c", "d", "a"],
+			"val" => [10.0, -5.0, 0.0, 20.0, 999.0],
+		)
+		.unwrap();
+		let prepared = prepare_stacked_bar_data(&frame, "cat", "group", "val");
+		assert_eq!(
+			prepared.category_values,
+			vec![vec![10.0, 0.0, 0.0, 20.0]],
+			"first-row-wins is retained before the canonical positive filter"
+		);
+		assert_eq!(
+			prepared.y_range,
+			(0.0, 33.0),
+			"the display domain derives from the painted total and retains 10% headroom"
+		);
+		let kernel = StackedBarPlotKernel {
+			prepared_data: Arc::new(prepared),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 330.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let bars = kernel.stacked_rectangles(
+			&transform,
+			settings.bar_width.fraction(),
+			settings.category_gap.fraction(),
+		);
+		assert_eq!(
+			bars.iter()
+				.map(|bar| (bar.group_index, bar.value, bar.running_total))
+				.collect::<Vec<_>>(),
+			vec![(0, 10.0, 10.0), (3, 20.0, 30.0)],
+			"domain, rectangles, hit, and hover share one positive segment sequence"
+		);
+		for (bar, expected) in bars.iter().zip([
+			"A: a (Value: 10.00, Total: 10.00)",
+			"A: d (Value: 20.00, Total: 30.00)",
+		]) {
+			let cursor = Point::new(
+				bar.rect.x + bar.rect.width / 2.0,
+				bar.rect.y + bar.rect.height / 2.0,
+			);
+			assert_eq!(
+				kernel
+					.hover(&transform, Cursor::Available(cursor))
+					.as_deref(),
+				Some(expected),
+				"hover reports the exact segment whose shared rectangle was hit"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0064_stacks_start_at_zero_under_nonzero_bounds_in_both_orientations() {
+		let frame = polars::df!(
+			"cat" => ["A", "A"],
+			"group" => ["first", "second"],
+			"val" => [10.0, 30.0],
+		)
+		.unwrap();
+		for orientation in [Orientation::Vertical, Orientation::Horizontal] {
+			let kernel = StackedBarPlotKernel {
+				prepared_data: Arc::new(prepare_stacked_bar_data(&frame, "cat", "group", "val")),
+				orientation,
+				layer_settings: LayerSettings::default(),
+				band_fills: Vec::new(),
+				group_colors: Vec::new(),
+			};
+			let mut settings = ResolvedPlotSettings::default();
+			match orientation {
+				Orientation::Vertical => {
+					settings.y_min = Some(20.0);
+					settings.y_max = Some(150.0);
+				}
+				Orientation::Horizontal => {
+					settings.x_min = Some(20.0);
+					settings.x_max = Some(150.0);
+				}
+			}
+			let layout = kernel.layout(settings.clone());
+			let bounds = Rectangle::new(Point::ORIGIN, Size::new(260.0, 260.0));
+			let transform = CoordinateTransformer::new(&layout, bounds);
+			let bars = kernel.stacked_rectangles(
+				&transform,
+				settings.bar_width.fraction(),
+				settings.category_gap.fraction(),
+			);
+			assert_eq!(
+				bars.iter()
+					.map(|bar| (bar.value, bar.running_total))
+					.collect::<Vec<_>>(),
+				vec![(10.0, 10.0), (30.0, 40.0)],
+				"authored bounds clip a zero-based stack instead of rebasing it"
+			);
+			let visible = bars[1];
+			let data_point = transform.categorical(0, 25.0).0;
+			assert!(visible.rect.contains(data_point));
+			assert_eq!(
+				kernel
+					.hover_resolved(&transform, Cursor::Available(data_point), &settings)
+					.as_deref(),
+				Some("A: second (Value: 30.00, Total: 40.00)"),
+				"paint and hover agree inside the visible portion of a clipped stack"
+			);
+		}
 	}
 }
