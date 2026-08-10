@@ -116,6 +116,9 @@ pub(crate) struct StyledRunePlotSink {
 	/// PRODUCT-0064: structural Bar-family member selection, kept separate
 	/// from the Layer-stage geometry settings and from PlotType identity.
 	pub(crate) stacked: bool,
+	/// PRODUCT-0072: normalized stack-scale intent. This stays outside
+	/// LayerSettings because themes and panes cannot override data semantics.
+	pub(crate) percent: bool,
 }
 
 impl StyledRunePlotSink {
@@ -2580,6 +2583,7 @@ fn parse_modified_mark(
 	let mut bar_width = None;
 	let mut category_gap = None;
 	let mut stacked = false;
+	let mut percent = false;
 	loop {
 		let ast::Expr::Call(call) = current else {
 			return invalid_view(
@@ -2691,12 +2695,29 @@ fn parse_modified_mark(
 				}
 				stacked = true;
 			}
+			"percent" => {
+				if percent {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"percent() may appear at most once on a stacked mark",
+					);
+				}
+				if !call.args.is_empty() {
+					return invalid_view(
+						expression.span(),
+						source.len(),
+						"percent() takes no arguments",
+					);
+				}
+				percent = true;
+			}
 			_ => {
 				return invalid_view(
 					expression.span(),
 					source.len(),
 					format!(
-						"unknown layer modifier {modifier:?}; expected point_size(number), stroke_width(number), bar_width(number), category_gap(number), or stacked()"
+						"unknown layer modifier {modifier:?}; expected point_size(number), stroke_width(number), bar_width(number), category_gap(number), stacked(), or percent()"
 					),
 				);
 			}
@@ -2819,6 +2840,20 @@ fn parse_modified_mark(
 				"stacked() is available on bar marks, not area marks",
 			);
 		}
+		PlotType::Bar if percent && !stacked => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"percent() requires stacked() on bar marks",
+			);
+		}
+		PlotType::Line | PlotType::Scatter if percent => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"percent() is available on stacked bar and area marks, not line or scatter marks",
+			);
+		}
 		_ => {}
 	}
 	if in_layer && (matches!(plot_type, PlotType::Bar | PlotType::StackedArea) || args.len() == 3) {
@@ -2846,6 +2881,7 @@ fn parse_modified_mark(
 			category_gap: category_gap.map_or(Override::Inherit, Override::Set),
 		},
 		stacked,
+		percent,
 	}))
 }
 
@@ -5828,6 +5864,109 @@ workspace.table("t").views([table()])
 		let layered = "workspace.table(\"t\").views([layers([bar(\"cat\", \"val\").stacked()])])";
 		let error = transform(layered).expect_err("stacking does not admit bar layering");
 		assert!(error.to_string().contains("not a shared-Cartesian layer"));
+	}
+
+	#[test]
+	fn product_0072_percent_is_an_order_independent_stacked_register_member() {
+		let first = product_0022_only_bar(
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", \"series\").stacked().percent()])",
+		);
+		let second = product_0022_only_bar(
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\", \"series\").percent().stacked()])",
+		);
+		assert_eq!(first, second, "the stack register is a set, not a pipeline");
+		assert!(first.stacked && first.percent);
+		let bindings = r#"
+let category_field = "cat";
+let value_field = "val";
+let series_field = "series";
+let x_field = "x";
+"#;
+		assert_eq!(
+			product_0022_only_bar(&format!(
+				"{bindings}\nworkspace.table(\"t\").views([bar(category_field, value_field, series_field).stacked().percent()])"
+			)),
+			first,
+			"static bindings resolve before the vertical percent-bar register"
+		);
+		let horizontal = product_0022_only_bar(
+			"workspace.table(\"t\").views([bar(\"val\", \"cat\", \"series\").stacked().percent()])",
+		);
+		assert_eq!(
+			product_0022_only_bar(&format!(
+				"{bindings}\nworkspace.table(\"t\").views([bar(value_field, category_field, series_field).percent().stacked()])"
+			)),
+			horizontal,
+			"static bindings resolve before horizontal pair selection"
+		);
+
+		let RuneViewIntent::Plot(RunePlotIntent {
+			body: RunePlotBody::StyledSingle(area),
+			..
+		}) = product_0058_only_intent(
+			"workspace.table(\"t\").views([area(\"x\", \"y\", \"series\").percent()])",
+		)
+		else {
+			panic!("percent area uses the styled standalone carrier")
+		};
+		assert!(area.percent);
+		assert!(!area.stacked, "area is inherently stacked");
+		let bound_area = product_0058_only_intent(&format!(
+			"{bindings}\nworkspace.table(\"t\").views([area(x_field, value_field, series_field).percent()])"
+		));
+		let RuneViewIntent::Plot(RunePlotIntent {
+			body: RunePlotBody::StyledSingle(bound_area),
+			..
+		}) = bound_area
+		else {
+			panic!("bound percent area uses the styled standalone carrier")
+		};
+		assert!(bound_area.percent);
+		assert_eq!(
+			(bound_area.sink.x.as_str(), bound_area.sink.y.as_str()),
+			("x", "val")
+		);
+		assert_eq!(bound_area.sink.category.as_deref(), Some("series"));
+
+		let two_field_bar = product_0022_only_bar(
+			"workspace.table(\"t\").views([bar(\"cat\", \"val\").percent().stacked()])",
+		);
+		assert!(two_field_bar.percent && two_field_bar.stacked);
+		let RuneViewIntent::Plot(RunePlotIntent {
+			body: RunePlotBody::StyledSingle(two_field_area),
+			..
+		}) = product_0058_only_intent("workspace.table(\"t\").views([area(\"x\", \"val\").percent()])")
+		else {
+			panic!("two-field percent area is accepted")
+		};
+		assert!(two_field_area.percent);
+		assert_eq!(two_field_area.sink.category, None);
+
+		for (source, reason) in [
+			(
+				"workspace.table(\"t\").views([bar(\"cat\", \"val\").percent()])",
+				"requires stacked()",
+			),
+			(
+				"workspace.table(\"t\").views([line(\"x\", \"y\").percent()])",
+				"stacked bar and area",
+			),
+			(
+				"workspace.table(\"t\").views([scatter(\"x\", \"y\").percent()])",
+				"stacked bar and area",
+			),
+			(
+				"workspace.table(\"t\").views([area(\"x\", \"y\").percent().percent()])",
+				"at most once",
+			),
+			(
+				"workspace.table(\"t\").views([area(\"x\", \"y\").percent(true)])",
+				"takes no arguments",
+			),
+		] {
+			let error = transform(source).expect_err("invalid percent spelling must refuse");
+			assert!(error.to_string().contains(reason), "{error}");
+		}
 	}
 
 	#[test]

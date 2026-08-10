@@ -350,6 +350,7 @@ pub struct AuthoredPlotSpec {
 	/// a fourth authored plot type. Resolution consumes this only after the
 	/// x/y pair has selected the physical orientation.
 	stacked_bar: bool,
+	stack_normalization: StackNormalization,
 }
 
 impl AuthoredPlotSpec {
@@ -361,6 +362,7 @@ impl AuthoredPlotSpec {
 			color: OptionalAuthoredChannelSpec::auto(),
 			color_job: Override::Inherit,
 			stacked_bar: false,
+			stack_normalization: StackNormalization::Absolute,
 		}
 	}
 
@@ -372,6 +374,7 @@ impl AuthoredPlotSpec {
 			color: OptionalAuthoredChannelSpec::absent(),
 			color_job: Override::Inherit,
 			stacked_bar: false,
+			stack_normalization: StackNormalization::Absolute,
 		}
 	}
 
@@ -390,6 +393,11 @@ impl AuthoredPlotSpec {
 
 	pub fn with_stacked_bar(mut self) -> Self {
 		self.stacked_bar = true;
+		self
+	}
+
+	pub fn with_percent(mut self) -> Self {
+		self.stack_normalization = StackNormalization::Percent;
 		self
 	}
 }
@@ -496,6 +504,7 @@ impl LayerEncoding {
 			color: self.color.clone(),
 			color_job: self.color_job.clone(),
 			stacked_bar: false,
+			stack_normalization: StackNormalization::Absolute,
 		}
 	}
 }
@@ -606,6 +615,25 @@ pub enum ColorJob {
 	Status,
 }
 
+/// PRODUCT-0072's closed value-scale projection for stacked marks. This is
+/// authored geometry/scale intent, not a presentation-cascade setting.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum StackNormalization {
+	#[default]
+	Absolute,
+	Percent,
+}
+
+impl StackNormalization {
+	pub fn project(self, cumulative: f64, total: f64) -> f64 {
+		match self {
+			Self::Absolute => cumulative,
+			Self::Percent if total > 0.0 => 100.0 * cumulative / total,
+			Self::Percent => 0.0,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LayerIdentity {
 	pub ordinal: usize,
@@ -630,6 +658,7 @@ pub struct ChannelBinding {
 	kernel_fields: Box<ResolvedKernelFields>,
 	color_job: Option<ColorJob>,
 	categorical_limit: usize,
+	stack_normalization: StackNormalization,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -897,6 +926,7 @@ pub struct ResolvedPlotSpec {
 	pub kernel_fields: Box<ResolvedKernelFields>,
 	pub color_job: Option<ColorJob>,
 	pub provenance: PlotProvenance,
+	pub stack_normalization: StackNormalization,
 }
 
 impl ResolvedPlotSpec {
@@ -1327,6 +1357,21 @@ pub fn resolve_channels(
 	schema: &Schema,
 ) -> Result<ChannelBinding, ChannelError> {
 	let plot_type = spec.composition.primary_plot_type();
+	if matches!(spec.stack_normalization, StackNormalization::Percent) {
+		let admitted =
+			plot_type == PlotType::StackedArea || (plot_type == PlotType::Bar && spec.stacked_bar);
+		if !admitted {
+			return Err(ChannelError {
+				channel: Channel::X,
+				field: "<authored>".to_owned(),
+				reason: if plot_type == PlotType::Bar {
+					"percent() requires stacked() on bar marks".to_owned()
+				} else {
+					"percent() is available on stacked bar and area marks".to_owned()
+				},
+			});
+		}
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -1352,6 +1397,7 @@ pub fn resolve_channels(
 			kernel_fields: Box::new(resolve_automatic_kernel_fields(plot_type, schema)?),
 			color_job: None,
 			categorical_limit: 0,
+			stack_normalization: spec.stack_normalization,
 		});
 	}
 
@@ -1484,6 +1530,7 @@ pub fn resolve_channels(
 		kernel_fields,
 		color_job,
 		categorical_limit: categorical_limit(plot_type),
+		stack_normalization: spec.stack_normalization,
 	})
 }
 
@@ -1644,6 +1691,7 @@ pub fn resolve_layered_domains(
 				kernel_fields: binding.kernel_fields,
 				color_job: binding.color_job,
 				provenance: result.provenance.clone(),
+				stack_normalization: binding.stack_normalization,
 			},
 		});
 	}
@@ -1704,6 +1752,7 @@ pub fn resolve_domains(
 			kernel_fields: binding.kernel_fields,
 			color_job,
 			provenance: result.provenance.clone(),
+			stack_normalization: binding.stack_normalization,
 		},
 		next_identity,
 	))
@@ -1770,6 +1819,7 @@ pub fn resolve_domains_with_categorical_palette(
 			kernel_fields: binding.kernel_fields,
 			color_job,
 			provenance: result.provenance.clone(),
+			stack_normalization: binding.stack_normalization,
 		},
 		next_identity,
 	))
@@ -3759,6 +3809,17 @@ mod tests {
 			grouped_resolved.channel(Channel::Color).unwrap().colors,
 			stacked_resolved.channel(Channel::Color).unwrap().colors,
 			"grouped and stacked geometry share exact categorical continuation"
+		);
+		let percent = stacked.clone().with_percent();
+		let (percent_resolved, identity) = resolve(&percent, &result, &identity).unwrap();
+		assert_eq!(
+			stacked_resolved.channel(Channel::Color).unwrap().colors,
+			percent_resolved.channel(Channel::Color).unwrap().colors,
+			"normalization changes scale, never categorical lineage"
+		);
+		assert_eq!(
+			percent_resolved.stack_normalization,
+			StackNormalization::Percent
 		);
 
 		let changed = AuthoredPlotSpec::xy_color(

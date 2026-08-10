@@ -659,6 +659,7 @@ impl PlotComposite for PlotGridKernel {
 						PlotLayout::CategoricalX {
 							categories,
 							y_range,
+							..
 						} => {
 							helper.draw_categorical_axes(
 								backend,
@@ -672,6 +673,7 @@ impl PlotComposite for PlotGridKernel {
 						PlotLayout::CategoricalY {
 							categories,
 							x_range,
+							..
 						} => {
 							helper.draw_categorical_y_axes(
 								backend,
@@ -937,9 +939,19 @@ fn shared_layout(
 			})
 		}
 		PlotLayout::CategoricalX { .. } => {
+			let y_axis_type = match &first {
+				PlotLayout::CategoricalX { y_axis_type, .. } => *y_axis_type,
+				_ => unreachable!("matched categorical-x layout"),
+			};
 			let mut y = (f64::INFINITY, f64::NEG_INFINITY);
 			for (_, layout) in local {
-				if let PlotLayout::CategoricalX { y_range, .. } = layout {
+				if let PlotLayout::CategoricalX {
+					y_range,
+					y_axis_type: cell_axis_type,
+					..
+				} = layout
+				{
+					debug_assert_eq!(*cell_axis_type, y_axis_type);
 					y.0 = y.0.min(y_range.0);
 					y.1 = y.1.max(y_range.1);
 				}
@@ -947,12 +959,23 @@ fn shared_layout(
 			Some(PlotLayout::CategoricalX {
 				categories: resolved_categories(body, Channel::X),
 				y_range: y,
+				y_axis_type,
 			})
 		}
 		PlotLayout::CategoricalY { .. } => {
+			let x_axis_type = match &first {
+				PlotLayout::CategoricalY { x_axis_type, .. } => *x_axis_type,
+				_ => unreachable!("matched categorical-y layout"),
+			};
 			let mut x = (f64::INFINITY, f64::NEG_INFINITY);
 			for (_, layout) in local {
-				if let PlotLayout::CategoricalY { x_range, .. } = layout {
+				if let PlotLayout::CategoricalY {
+					x_range,
+					x_axis_type: cell_axis_type,
+					..
+				} = layout
+				{
+					debug_assert_eq!(*cell_axis_type, x_axis_type);
 					x.0 = x.0.min(x_range.0);
 					x.1 = x.1.max(x_range.1);
 				}
@@ -960,6 +983,7 @@ fn shared_layout(
 			Some(PlotLayout::CategoricalY {
 				categories: resolved_categories(body, Channel::Y),
 				x_range: x,
+				x_axis_type,
 			})
 		}
 		_ => Some(first),
@@ -988,20 +1012,24 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 			Some(PlotLayout::CategoricalX {
 				categories,
 				y_range,
+				y_axis_type,
 			}),
 		) => PlotLayout::CategoricalX {
 			categories: categories.clone(),
 			y_range: *y_range,
+			y_axis_type: *y_axis_type,
 		},
 		(
 			PlotLayout::CategoricalY { .. },
 			Some(PlotLayout::CategoricalY {
 				categories,
 				x_range,
+				x_axis_type,
 			}),
 		) => PlotLayout::CategoricalY {
 			categories: categories.clone(),
 			x_range: *x_range,
+			x_axis_type: *x_axis_type,
 		},
 		(layout, _) => layout,
 	}
@@ -2123,6 +2151,7 @@ mod tests {
 				PlotLayout::CategoricalX {
 					categories,
 					y_range,
+					..
 				} => (categories.clone(), *y_range),
 				_ => panic!("vertical bar cell"),
 			})
@@ -2156,6 +2185,7 @@ mod tests {
 			let PlotLayout::CategoricalX {
 				categories,
 				y_range,
+				..
 			} = layout
 			else {
 				panic!("merged categorical x")
@@ -2282,6 +2312,7 @@ mod tests {
 				PlotLayout::CategoricalY {
 					categories,
 					x_range,
+					..
 				} => (categories.clone(), *x_range),
 				_ => panic!("horizontal bar cell"),
 			})
@@ -2309,6 +2340,7 @@ mod tests {
 			let PlotLayout::CategoricalY {
 				categories,
 				x_range,
+				..
 			} = layout
 			else {
 				panic!("merged categorical y")
@@ -2400,6 +2432,7 @@ mod tests {
 		let box_layout = PlotLayout::CategoricalX {
 			categories: shared_categories.clone(),
 			y_range: box_prepared.y_range,
+			y_axis_type: AxisType::Linear,
 		};
 		let box_transform = CoordinateTransformer::new(&box_layout, bounds);
 		let box_kernel = BoxPlotKernel {
@@ -2433,6 +2466,7 @@ mod tests {
 		let violin_layout = PlotLayout::CategoricalX {
 			categories: shared_categories,
 			y_range: violin_prepared.y_range,
+			y_axis_type: AxisType::Linear,
 		};
 		let violin_transform = CoordinateTransformer::new(&violin_layout, bounds);
 		let violin_kernel = ViolinPlotKernel {
@@ -2667,6 +2701,57 @@ mod tests {
 				svg.matches(&fill).count() >= 2,
 				"both cells must contain {fill}"
 			);
+		}
+	}
+
+	#[test]
+	fn product_0072_faceted_percent_stacks_share_axis_type_and_fixed_domain() {
+		use crate::plot::spec::{ColorIdentity, resolve_channels, resolve_domains};
+
+		let frame = df!(
+			"facet" => ["North", "North", "South", "South"],
+			"category" => ["East", "East", "East", "East"],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+			"value" => [30.0_f64, 90.0, 20.0, 20.0],
+		)
+		.unwrap();
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::Bar),
+			"category",
+			"value",
+			Some("series".to_owned()),
+		)
+		.with_stacked_bar()
+		.with_percent();
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame),
+			provenance: PlotProvenance {
+				source_name: "product-0072".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let (resolved, _) = resolve_domains(binding, &stamped, &ColorIdentity::default()).unwrap();
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved),
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).unwrap(),
+		)
+		.unwrap();
+		let kernel =
+			PlotGridKernel::from_styled_grid(grid, LayerSettings::default(), 800, 400).unwrap();
+		for (_, layout) in kernel.cell_layouts(ResolvedPlotSettings::default()) {
+			let PlotLayout::CategoricalX {
+				y_range,
+				y_axis_type,
+				..
+			} = layout
+			else {
+				panic!("percent bar facet remains categorical x")
+			};
+			assert_eq!(y_range, (0.0, 100.0));
+			assert_eq!(y_axis_type, AxisType::Percent);
 		}
 	}
 

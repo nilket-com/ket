@@ -6731,15 +6731,21 @@ mod tests {
 			Some("product".into()),
 		);
 		let stacked = grouped.clone().with_stacked_bar();
+		let percent = stacked.clone().with_percent();
 		let grouped_binding =
 			crate::plot::spec::resolve_channels(&grouped, frame.data.schema().as_ref()).unwrap();
 		let stacked_binding =
 			crate::plot::spec::resolve_channels(&stacked, frame.data.schema().as_ref()).unwrap();
+		let percent_binding =
+			crate::plot::spec::resolve_channels(&percent, frame.data.schema().as_ref()).unwrap();
 		let (grouped_resolved, _) =
 			crate::plot::spec::resolve_domains(grouped_binding, &frame, &restored_grouped_identity)
 				.unwrap();
 		let (stacked_resolved, _) =
 			crate::plot::spec::resolve_domains(stacked_binding, &frame, &restored_grouped_identity)
+				.unwrap();
+		let (percent_resolved, _) =
+			crate::plot::spec::resolve_domains(percent_binding, &frame, &restored_grouped_identity)
 				.unwrap();
 		assert_eq!(
 			grouped_resolved
@@ -6751,6 +6757,21 @@ mod tests {
 				.unwrap()
 				.colors,
 			"a grouped Bar payload restores onto stacked geometry with exact colours"
+		);
+		assert_eq!(
+			stacked_resolved
+				.channel(crate::plot::spec::Channel::Color)
+				.unwrap()
+				.colors,
+			percent_resolved
+				.channel(crate::plot::spec::Channel::Color)
+				.unwrap()
+				.colors,
+			"the same schema-v2 Bar payload restores onto percent scale with exact colours"
+		);
+		assert_eq!(
+			percent_resolved.stack_normalization,
+			crate::plot::spec::StackNormalization::Percent
 		);
 		let before_count = reopened.view_panel_ids.len();
 		reopened.prepare_rune_view_panels(reopened_buffer, &views, 2);

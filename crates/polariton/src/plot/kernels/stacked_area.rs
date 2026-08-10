@@ -5,7 +5,7 @@ use crate::plot::common::{
 use crate::plot::legend::{
 	LegendProvenance, LegendSample, entries_from_pairs_with_sample_and_provenance,
 };
-use crate::plot::spec::CategoryColorAssignment;
+use crate::plot::spec::{CategoryColorAssignment, StackNormalization};
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -16,6 +16,7 @@ use std::sync::Arc;
 pub struct StackedAreaPlotKernel {
 	pub prepared_data: Arc<StackedAreaPreparedData>,
 	pub series_colors: Vec<CategoryColorAssignment>,
+	pub normalization: StackNormalization,
 }
 
 impl StackedAreaPlotKernel {
@@ -49,17 +50,26 @@ impl StackedAreaPlotKernel {
 
 impl PlotKernel for StackedAreaPlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+		let percent = matches!(self.normalization, StackNormalization::Percent);
 		PlotLayout::Cartesian {
 			x_range: (
 				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
 				settings.x_max.unwrap_or(self.prepared_data.x_range.1),
 			),
-			y_range: (
-				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
-				settings.y_max.unwrap_or(self.prepared_data.y_range.1),
-			),
+			y_range: if percent {
+				(0.0, 100.0)
+			} else {
+				(
+					settings.y_min.unwrap_or(self.prepared_data.y_range.0),
+					settings.y_max.unwrap_or(self.prepared_data.y_range.1),
+				)
+			},
 			x_axis_type: self.prepared_data.x_axis_type,
-			y_axis_type: self.prepared_data.y_axis_type,
+			y_axis_type: if percent {
+				AxisType::Percent
+			} else {
+				self.prepared_data.y_axis_type
+			},
 		}
 	}
 
@@ -76,8 +86,8 @@ impl PlotKernel for StackedAreaPlotKernel {
 		if num_xs < 2 {
 			return;
 		}
-		let mut prev_stacked_ys = vec![0.0f64; num_xs];
-		let mut current_stacked_ys = vec![0.0f64; num_xs];
+		let mut prev_stacked_values = vec![0.0f64; num_xs];
+		let mut current_stacked_values = vec![0.0f64; num_xs];
 		for cat_idx in 0..num_cats {
 			if self.prepared_data.category_values[cat_idx]
 				.iter()
@@ -87,12 +97,15 @@ impl PlotKernel for StackedAreaPlotKernel {
 			}
 			let color = self.series_color(cat_idx, &settings);
 			for x_idx in 0..num_xs {
-				current_stacked_ys[x_idx] =
-					prev_stacked_ys[x_idx] + self.prepared_data.category_values[cat_idx][x_idx];
+				current_stacked_values[x_idx] =
+					prev_stacked_values[x_idx] + self.prepared_data.category_values[cat_idx][x_idx];
 			}
 			let area_closure = |builder: &mut dyn PathBuilder| {
-				for (x_idx, csy) in current_stacked_ys.iter().enumerate() {
-					let p = transform.cartesian(self.prepared_data.unique_xs[x_idx], *csy);
+				for (x_idx, current) in current_stacked_values.iter().enumerate() {
+					let rendered = self
+						.normalization
+						.project(*current, self.prepared_data.totals[x_idx]);
+					let p = transform.cartesian(self.prepared_data.unique_xs[x_idx], rendered);
 					if x_idx == 0 {
 						builder.move_to(p);
 					} else {
@@ -100,8 +113,10 @@ impl PlotKernel for StackedAreaPlotKernel {
 					}
 				}
 				for x_idx in (0..num_xs).rev() {
-					let p = transform
-						.cartesian(self.prepared_data.unique_xs[x_idx], prev_stacked_ys[x_idx]);
+					let rendered = self
+						.normalization
+						.project(prev_stacked_values[x_idx], self.prepared_data.totals[x_idx]);
+					let p = transform.cartesian(self.prepared_data.unique_xs[x_idx], rendered);
 					builder.line_to(p);
 				}
 				builder.close();
@@ -113,7 +128,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 				..Default::default()
 			};
 			backend.stroke_path(&area_closure, stroke);
-			prev_stacked_ys.copy_from_slice(&current_stacked_ys);
+			prev_stacked_values.copy_from_slice(&current_stacked_values);
 		}
 	}
 
@@ -144,24 +159,39 @@ impl PlotKernel for StackedAreaPlotKernel {
 				}
 			};
 			let actual_x = xs[idx];
-			let mut current_stack_y = 0.0;
+			let total = self.prepared_data.totals[idx];
+			let mut current_stack_value = 0.0;
 			for (j, cat_vals) in self.prepared_data.category_values.iter().enumerate() {
 				let val = cat_vals[idx];
-				if val > 0.0 && y >= current_stack_y && y <= current_stack_y + val {
-					return Some(format!(
-						"X: {}\n{}: {:.2}\nTotal: {:.2}",
-						format_label(actual_x, self.prepared_data.x_axis_type),
-						self.prepared_data.categories[j],
-						val,
-						current_stack_y + val
-					));
+				let next_stack_value = current_stack_value + val;
+				let lower = self.normalization.project(current_stack_value, total);
+				let upper = self.normalization.project(next_stack_value, total);
+				if val > 0.0 && y >= lower && y <= upper {
+					return match self.normalization {
+						StackNormalization::Absolute => Some(format!(
+							"X: {}\n{}: {:.2}\nTotal: {:.2}",
+							format_label(actual_x, self.prepared_data.x_axis_type),
+							self.prepared_data.categories[j],
+							val,
+							next_stack_value
+						)),
+						StackNormalization::Percent => Some(format!(
+							"X: {}\n{}: {:.2}\nShare: {:.1}%\nCumulative: {:.1}%\nTotal: {:.2}",
+							format_label(actual_x, self.prepared_data.x_axis_type),
+							self.prepared_data.categories[j],
+							val,
+							self.normalization.project(val, total),
+							upper,
+							total
+						)),
+					};
 				}
-				current_stack_y += val;
+				current_stack_value = next_stack_value;
 			}
 			return Some(format!(
 				"X: {}, Total Sum: {:.2}",
 				format_label(actual_x, self.prepared_data.x_axis_type),
-				current_stack_y
+				current_stack_value
 			));
 		}
 		None
@@ -195,6 +225,7 @@ pub struct StackedAreaPreparedData {
 	pub categories: Vec<String>,
 	pub unique_xs: Vec<f64>,
 	pub category_values: Vec<Vec<f64>>,
+	pub totals: Vec<f64>,
 	pub x_range: (f64, f64),
 	pub y_range: (f64, f64),
 	pub x_axis_type: AxisType,
@@ -248,6 +279,7 @@ fn prepare_stacked_area_data_inner(
 			categories: vec!["No Data".to_string()],
 			unique_xs: vec![0.0, 1.0],
 			category_values: vec![vec![0.0, 0.0]],
+			totals: vec![0.0, 0.0],
 			x_range: (0.0, 1.0),
 			y_range: (0.0, 1.0),
 			x_axis_type: AxisType::Linear,
@@ -313,6 +345,7 @@ fn prepare_stacked_area_data_inner(
 				unique_xs
 			},
 			category_values: vec![vec![0.0; num_xs.max(2)]; num_cats.max(1)],
+			totals: vec![0.0; num_xs.max(2)],
 			x_range: (0.0, 1.0),
 			y_range: (0.0, 1.0),
 			x_axis_type,
@@ -377,12 +410,14 @@ fn prepare_stacked_area_data_inner(
 			}
 		}
 	}
+	let mut totals = vec![0.0f64; num_xs];
 	let mut max_sum = 0.0f64;
 	for x_idx in 0..num_xs {
 		let mut current_sum = 0.0f64;
 		for values in category_values.iter().take(num_cats) {
 			current_sum += values[x_idx];
 		}
+		totals[x_idx] = current_sum;
 		if current_sum > max_sum {
 			max_sum = current_sum;
 		}
@@ -393,6 +428,7 @@ fn prepare_stacked_area_data_inner(
 		categories,
 		unique_xs,
 		category_values,
+		totals,
 		x_range,
 		y_range,
 		x_axis_type,
@@ -456,6 +492,7 @@ mod product_0068_tests {
 				categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
 				unique_xs: vec![0.0, 1.0, 2.0],
 				category_values: vec![vec![1.0, 2.0, 3.0], vec![2.0, 1.0, 2.0]],
+				totals: vec![3.0, 3.0, 5.0],
 				x_range: (0.0, 2.0),
 				y_range: (0.0, 5.0),
 				x_axis_type: AxisType::Linear,
@@ -465,6 +502,7 @@ mod product_0068_tests {
 				series_provenance: LegendProvenance::Named,
 			}),
 			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		let decoration = Color::from_rgb8(12, 34, 56);
 		let settings = ResolvedPlotSettings {
@@ -548,6 +586,7 @@ mod product_0069_tests {
 		let automatic = StackedAreaPlotKernel {
 			prepared_data: Arc::new(automatic),
 			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		assert_eq!(legend_labels(&automatic), ["Zulu", "Alpha"]);
 
@@ -563,6 +602,7 @@ mod product_0069_tests {
 		let resolved = StackedAreaPlotKernel {
 			prepared_data: Arc::new(resolved),
 			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		assert_eq!(legend_labels(&resolved), ["Alpha", "Zulu"]);
 	}
@@ -673,6 +713,7 @@ mod product_0069_tests {
 		let kernel = StackedAreaPlotKernel {
 			prepared_data: Arc::new(prepared),
 			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		let settings = ResolvedPlotSettings::default();
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 140.0));
@@ -734,6 +775,7 @@ mod product_0069_tests {
 			categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
 			unique_xs: vec![0.0, 1.0],
 			category_values: vec![vec![2.0, 4.0], vec![3.0, 5.0]],
+			totals: vec![5.0, 9.0],
 			x_range: (0.0, 1.0),
 			y_range: (0.0, 9.0 * 1.05),
 			x_axis_type: AxisType::Linear,
@@ -745,6 +787,7 @@ mod product_0069_tests {
 		let kernel = StackedAreaPlotKernel {
 			prepared_data: Arc::new(prepared),
 			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		assert_eq!(kernel.prepared_data.categories, ["Atlas", "Beacon"]);
 		assert_eq!(
@@ -791,6 +834,7 @@ mod product_0069_tests {
 		let banked = StackedAreaPlotKernel {
 			prepared_data: Arc::new(banked),
 			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		assert_eq!(
 			render_svg(&kernel),
@@ -813,6 +857,7 @@ mod product_0069_tests {
 		let kernel = StackedAreaPlotKernel {
 			prepared_data: Arc::new(prepared),
 			series_colors: assignments.to_vec(),
+			normalization: StackNormalization::Absolute,
 		};
 		let settings = ResolvedPlotSettings::default();
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 140.0));
@@ -862,6 +907,7 @@ mod product_0069_tests {
 		let one = StackedAreaPlotKernel {
 			prepared_data: Arc::new(prepare_stacked_area_data(&one, "", "x", "y")),
 			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		let content = one
 			.legend_content(&settings)
@@ -873,6 +919,170 @@ mod product_0069_tests {
 		assert!(
 			apply_policy(content).is_none(),
 			"the unnamed two-field area must not retain an All Data legend"
+		);
+	}
+
+	#[test]
+	fn product_0072_percent_area_uses_x_local_first_row_totals() {
+		let frame = polars::df!(
+			"x" => [0_i64, 0, 1, 1, 0],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon", "Atlas"],
+			"y" => [30.0, 90.0, 20.0, 20.0, 300.0],
+		)
+		.unwrap();
+		let prepared = prepare_stacked_area_data(&frame, "series", "x", "y");
+		assert_eq!(
+			prepared.category_values,
+			[vec![30.0, 20.0], vec![90.0, 20.0]]
+		);
+		assert_eq!(prepared.totals, [120.0, 40.0]);
+		let kernel = StackedAreaPlotKernel {
+			prepared_data: Arc::new(prepared),
+			series_colors: Vec::new(),
+			normalization: StackNormalization::Percent,
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let PlotLayout::Cartesian {
+			y_range,
+			y_axis_type,
+			..
+		} = layout
+		else {
+			panic!("percent area remains Cartesian")
+		};
+		assert_eq!(y_range, (0.0, 100.0));
+		assert_eq!(y_axis_type, AxisType::Percent);
+		let layout = kernel.layout(settings);
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		assert_eq!(
+			kernel
+				.hover(&transform, Cursor::Available(Point::new(0.0, 87.5)))
+				.as_deref(),
+			Some("X: 0\nAtlas: 30.00\nShare: 25.0%\nCumulative: 25.0%\nTotal: 120.00")
+		);
+		assert_eq!(
+			kernel
+				.hover(&transform, Cursor::Available(Point::new(100.0, 75.0)))
+				.as_deref(),
+			Some("X: 1\nAtlas: 20.00\nShare: 50.0%\nCumulative: 50.0%\nTotal: 40.00"),
+			"each x uses its own denominator rather than a figure-wide total"
+		);
+	}
+
+	#[test]
+	fn product_0072_area_invalid_samples_pinch_zero_total_without_inventing_share() {
+		let frame = polars::df!(
+			"x" => [0_i64, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1],
+			"series" => [
+				"negative", "zero", "infinite", "nan", "missing", "positive",
+				"negative", "zero", "infinite", "nan", "missing", "positive",
+			],
+			"y" => [
+				Some(-5.0), Some(0.0), Some(f64::INFINITY), Some(f64::NAN), None, Some(0.0),
+				Some(-1.0), Some(0.0), Some(f64::INFINITY), Some(f64::NAN), None, Some(40.0),
+			],
+		)
+		.unwrap();
+		let prepared = prepare_stacked_area_data(&frame, "series", "x", "y");
+		assert_eq!(prepared.totals, [0.0, 40.0]);
+		assert!(
+			prepared
+				.category_values
+				.iter()
+				.all(|values| values[0] == 0.0),
+			"every band pinches to zero at the zero-total sample"
+		);
+		assert_eq!(
+			prepared
+				.category_values
+				.iter()
+				.map(|values| values[1])
+				.collect::<Vec<_>>(),
+			[0.0, 0.0, 0.0, 0.0, 0.0, 40.0]
+		);
+		let kernel = StackedAreaPlotKernel {
+			prepared_data: Arc::new(prepared),
+			series_colors: Vec::new(),
+			normalization: StackNormalization::Percent,
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		assert!(matches!(
+			layout,
+			PlotLayout::Cartesian {
+				y_range: (0.0, 100.0),
+				y_axis_type: AxisType::Percent,
+				..
+			}
+		));
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = GeometryBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		assert_eq!(
+			backend.fills.len(),
+			1,
+			"only the positive series emits a polygon"
+		);
+		let path = &backend.fills[0];
+		assert_eq!(
+			path[0], path[3],
+			"the upper and lower boundaries meet at x=0"
+		);
+		assert_eq!(
+			path[1].y, 0.0,
+			"the positive x=1 boundary reaches exactly 100%"
+		);
+		assert_eq!(
+			kernel
+				.hover(
+					&transform,
+					Cursor::Available(transform.cartesian(0.0, 50.0))
+				)
+				.as_deref(),
+			Some("X: 0, Total Sum: 0.00"),
+			"zero total may be reported absolutely but never as an invented share"
+		);
+		assert!(
+			!kernel
+				.hover(
+					&transform,
+					Cursor::Available(transform.cartesian(0.0, 50.0))
+				)
+				.unwrap()
+				.contains('%')
+		);
+
+		let one = polars::df!("x" => [0_i64, 1], "y" => [2.0, 3.0]).unwrap();
+		let one = StackedAreaPlotKernel {
+			prepared_data: Arc::new(prepare_stacked_area_data(&one, "", "x", "y")),
+			series_colors: Vec::new(),
+			normalization: StackNormalization::Percent,
+		};
+		let layout = one.layout(ResolvedPlotSettings::default());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		assert_eq!(
+			one.hover(
+				&transform,
+				Cursor::Available(transform.cartesian(1.0, 50.0))
+			)
+			.as_deref(),
+			Some("X: 1\nAll Data: 3.00\nShare: 100.0%\nCumulative: 100.0%\nTotal: 3.00")
+		);
+		let content = one
+			.legend_content(&ResolvedPlotSettings::default())
+			.expect("synthetic one-band content remains observable");
+		assert!(
+			apply_policy(content).is_none(),
+			"a positive two-field 100% area does not manufacture a legend"
 		);
 	}
 }

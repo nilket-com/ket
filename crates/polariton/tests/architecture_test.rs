@@ -1919,3 +1919,43 @@ fn product_0071_chrome_consumes_the_guarded_title_status_and_menu_models() {
 		"MenuBar must consume the tested MenuRoot model without reconstructing it"
 	);
 }
+
+#[test]
+fn product_0072_percent_is_scale_intent_not_cascade_or_durable_identity() {
+	let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(source_root.join("plot/spec/mod.rs"))
+		.expect("read plot specification source");
+	let normalization = spec
+		.split("pub enum StackNormalization")
+		.nth(1)
+		.expect("closed stack-normalization vocabulary")
+		.split("pub struct LayerIdentity")
+		.next()
+		.expect("bounded stack-normalization vocabulary");
+	assert!(normalization.contains("Absolute"));
+	assert!(normalization.contains("Percent"));
+	let layer_settings = spec
+		.split("pub struct LayerSettings")
+		.nth(1)
+		.expect("layer settings")
+		.split("impl Default for LayerSettings")
+		.next()
+		.expect("bounded layer settings");
+	assert!(
+		!layer_settings.contains("StackNormalization") && !layer_settings.contains("percent"),
+		"PRODUCT-0072 normalization is authored scale intent, never a presentation setting"
+	);
+
+	let theme = std::fs::read_to_string(source_root.join("plot/theme.rs"))
+		.expect("read plot presentation cascade");
+	assert!(
+		!theme.contains("StackNormalization"),
+		"themes and pane overrides cannot select a mark's value unit"
+	);
+	let persistence = std::fs::read_to_string(source_root.join("session_persistence.rs"))
+		.expect("read Polariton persistence schema");
+	assert!(
+		!persistence.contains("StackNormalization"),
+		"percent scale must not extend the durable authored-family schema"
+	);
+}

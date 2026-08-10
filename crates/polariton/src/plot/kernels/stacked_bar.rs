@@ -2,7 +2,9 @@ use crate::plot::common::{
 	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use crate::plot::legend::LegendProvenance;
-use crate::plot::spec::{BandFillAssignment, CategoryColorAssignment, LayerSettings};
+use crate::plot::spec::{
+	BandFillAssignment, CategoryColorAssignment, LayerSettings, StackNormalization,
+};
 use crate::plot::theme::PlotSettings;
 use iced::Color;
 use iced::Rectangle;
@@ -22,6 +24,7 @@ pub struct StackedBarPlotKernel {
 	/// assignments. Automatic dashboard plots carry an empty vector and retain
 	/// the legacy ramp fallback.
 	pub group_colors: Vec<CategoryColorAssignment>,
+	pub normalization: StackNormalization,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -31,6 +34,7 @@ struct StackedBarRectangle {
 	group_index: usize,
 	value: f64,
 	running_total: f64,
+	total: f64,
 }
 
 fn category_label(value: AnyValue<'_>) -> String {
@@ -69,6 +73,7 @@ impl StackedBarPlotKernel {
 		let num_groups = self.prepared_data.group_names.len();
 		let mut bars = Vec::with_capacity(num_cats.saturating_mul(num_groups));
 		for category_index in 0..num_cats {
+			let total = self.prepared_data.totals[category_index];
 			let Some(shared_index) =
 				transform.category_index(&self.prepared_data.categories[category_index])
 			else {
@@ -85,19 +90,27 @@ impl StackedBarPlotKernel {
 					continue;
 				}
 				let next_total = running_total + value;
-				let (start, _) = transform.categorical(shared_index, running_total);
-				let (end, _) = transform.categorical(shared_index, next_total);
+				let rendered_start = self.normalization.project(running_total, total);
+				let rendered_end = self.normalization.project(next_total, total);
+				let (start, _) = transform.categorical(shared_index, rendered_start);
+				let (end, _) = transform.categorical(shared_index, rendered_end);
 				let rect = match self.orientation {
 					Orientation::Vertical => Rectangle {
 						x: category_center.x - bar_extent / 2.0,
 						y: end.y,
 						width: bar_extent,
-						height: (start.y - end.y).max(1.0),
+						height: match self.normalization {
+							StackNormalization::Absolute => (start.y - end.y).max(1.0),
+							StackNormalization::Percent => start.y - end.y,
+						},
 					},
 					Orientation::Horizontal => Rectangle {
 						x: start.x,
 						y: category_center.y - bar_extent / 2.0,
-						width: (end.x - start.x).max(1.0),
+						width: match self.normalization {
+							StackNormalization::Absolute => (end.x - start.x).max(1.0),
+							StackNormalization::Percent => end.x - start.x,
+						},
 						height: bar_extent,
 					},
 				};
@@ -107,6 +120,7 @@ impl StackedBarPlotKernel {
 					group_index,
 					value,
 					running_total: next_total,
+					total,
 				});
 				running_total = next_total;
 			}
@@ -129,32 +143,60 @@ impl StackedBarPlotKernel {
 			)
 			.into_iter()
 			.find(|bar| bar.rect.contains(cursor))?;
-		Some(format!(
-			"{}: {} (Value: {:.2}, Total: {:.2})",
-			self.prepared_data.categories[hit.category_index],
-			self.prepared_data.group_names[hit.group_index],
-			hit.value,
-			hit.running_total,
-		))
+		match self.normalization {
+			StackNormalization::Absolute => Some(format!(
+				"{}: {} (Value: {:.2}, Total: {:.2})",
+				self.prepared_data.categories[hit.category_index],
+				self.prepared_data.group_names[hit.group_index],
+				hit.value,
+				hit.running_total,
+			)),
+			StackNormalization::Percent => Some(format!(
+				"{}: {} (Value: {:.2}, Share: {:.1}%, Cumulative: {:.1}%, Total: {:.2})",
+				self.prepared_data.categories[hit.category_index],
+				self.prepared_data.group_names[hit.group_index],
+				hit.value,
+				self.normalization.project(hit.value, hit.total),
+				self.normalization.project(hit.running_total, hit.total),
+				hit.total,
+			)),
+		}
 	}
 }
 
 impl PlotKernel for StackedBarPlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+		let (range, axis_type) = match self.normalization {
+			StackNormalization::Absolute => (
+				self.prepared_data.y_range,
+				crate::plot::common::AxisType::Linear,
+			),
+			StackNormalization::Percent => ((0.0, 100.0), crate::plot::common::AxisType::Percent),
+		};
 		match self.orientation {
 			Orientation::Vertical => PlotLayout::CategoricalX {
 				categories: self.prepared_data.categories.clone(),
-				y_range: (
-					settings.y_min.unwrap_or(self.prepared_data.y_range.0),
-					settings.y_max.unwrap_or(self.prepared_data.y_range.1),
-				),
+				y_axis_type: axis_type,
+				y_range: if matches!(self.normalization, StackNormalization::Percent) {
+					range
+				} else {
+					(
+						settings.y_min.unwrap_or(range.0),
+						settings.y_max.unwrap_or(range.1),
+					)
+				},
 			},
 			Orientation::Horizontal => PlotLayout::CategoricalY {
 				categories: self.prepared_data.categories.clone(),
-				x_range: (
-					settings.x_min.unwrap_or(self.prepared_data.y_range.0),
-					settings.x_max.unwrap_or(self.prepared_data.y_range.1),
-				),
+				x_axis_type: axis_type,
+				x_range: if matches!(self.normalization, StackNormalization::Percent) {
+					range
+				} else {
+					(
+						settings.x_min.unwrap_or(range.0),
+						settings.x_max.unwrap_or(range.1),
+					)
+				},
 			},
 		}
 	}
@@ -278,6 +320,7 @@ pub struct StackedBarPreparedData {
 	pub categories: Vec<String>,
 	pub group_names: Vec<String>,
 	pub category_values: Vec<Vec<f64>>,
+	pub totals: Vec<f64>,
 	pub y_range: (f64, f64),
 	pub x_label: String,
 	pub y_label: String,
@@ -295,6 +338,7 @@ pub fn prepare_stacked_bar_data(
 			categories: vec!["No Data".to_string()],
 			group_names: vec!["Value".to_string()],
 			category_values: vec![vec![0.0]],
+			totals: vec![0.0],
 			y_range: (0.0, 1.0),
 			x_label: cat_col.to_string(),
 			y_label: val_col.to_string(),
@@ -424,16 +468,18 @@ pub fn prepare_stacked_bar_data(
 			assigned[category_idx][group_idx] = true;
 		}
 	}
-	let max_sum = category_values
+	let totals = category_values
 		.iter()
 		.map(|values| values.iter().sum::<f64>())
-		.fold(0.0, f64::max);
+		.collect::<Vec<_>>();
+	let max_sum = totals.iter().copied().fold(0.0, f64::max);
 	let y_min = 0.0f64;
 	let y_range = (y_min, max_sum * 1.1);
 	StackedBarPreparedData {
 		categories,
 		group_names,
 		category_values,
+		totals,
 		y_range,
 		x_label: cat_col.to_string(),
 		y_label: val_col.to_string(),
@@ -449,7 +495,7 @@ pub fn prepare_stacked_bar_data(
 mod tests {
 	use super::*;
 	use crate::plot::common::PathBuilder;
-	use crate::plot::legend::LegendSection;
+	use crate::plot::legend::{LegendSection, apply_policy};
 	use crate::plot::spec::{PalettePosition, ResolvedColor};
 	use iced::widget::canvas::{Stroke, Text};
 	use iced::{Color, Point, Size};
@@ -520,6 +566,7 @@ mod tests {
 			layer_settings: LayerSettings::default(),
 			band_fills: Vec::new(),
 			group_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		let settings = ResolvedPlotSettings::default();
 		let layout = kernel.layout(settings.clone());
@@ -600,6 +647,7 @@ mod tests {
 			layer_settings: LayerSettings::default(),
 			band_fills: Vec::new(),
 			group_colors: vec![assignment("left", 0, left), assignment("right", 1, right)],
+			normalization: StackNormalization::Absolute,
 		};
 		let settings = ResolvedPlotSettings::default();
 		let layout = kernel.layout(settings.clone());
@@ -661,6 +709,7 @@ mod tests {
 				},
 			],
 			group_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		let layout = band_kernel.layout(settings.clone());
 		let transform = CoordinateTransformer::new(&layout, bounds);
@@ -708,6 +757,7 @@ mod tests {
 			layer_settings: LayerSettings::default(),
 			band_fills: Vec::new(),
 			group_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		};
 		let settings = ResolvedPlotSettings::default();
 		let layout = kernel.layout(settings.clone());
@@ -758,6 +808,7 @@ mod tests {
 				layer_settings: LayerSettings::default(),
 				band_fills: Vec::new(),
 				group_colors: Vec::new(),
+				normalization: StackNormalization::Absolute,
 			};
 			let mut settings = ResolvedPlotSettings::default();
 			match orientation {
@@ -796,5 +847,226 @@ mod tests {
 				"paint and hover agree inside the visible portion of a clipped stack"
 			);
 		}
+	}
+
+	#[test]
+	fn product_0072_percent_uses_first_row_total_and_one_geometry_for_hover() {
+		let frame = polars::df!(
+			"cat" => ["East", "East", "East"],
+			"group" => ["Atlas", "Beacon", "Atlas"],
+			"val" => [30.0, 90.0, 300.0],
+		)
+		.unwrap();
+		let prepared = prepare_stacked_bar_data(&frame, "cat", "group", "val");
+		assert_eq!(prepared.category_values, [vec![30.0, 90.0]]);
+		assert_eq!(prepared.totals, [120.0]);
+		let kernel = StackedBarPlotKernel {
+			prepared_data: Arc::new(prepared),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+			normalization: StackNormalization::Percent,
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let PlotLayout::CategoricalX {
+			y_range,
+			y_axis_type,
+			..
+		} = layout
+		else {
+			panic!("vertical percent stack uses categorical x")
+		};
+		assert_eq!(y_range, (0.0, 100.0));
+		assert_eq!(y_axis_type, crate::plot::common::AxisType::Percent);
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let bars = kernel.stacked_rectangles(
+			&transform,
+			settings.bar_width.fraction(),
+			settings.category_gap.fraction(),
+		);
+		assert_eq!(bars.len(), 2);
+		assert_eq!(
+			(bars[0].value, bars[0].running_total, bars[0].total),
+			(30.0, 30.0, 120.0)
+		);
+		assert_eq!(bars[0].rect.y, 75.0);
+		assert_eq!(
+			bars[1].rect.y, 0.0,
+			"the retained total projects exactly to 100%"
+		);
+		let cursor = Point::new(
+			bars[0].rect.x + bars[0].rect.width / 2.0,
+			bars[0].rect.y + bars[0].rect.height / 2.0,
+		);
+		assert_eq!(
+			kernel
+				.hover(&transform, Cursor::Available(cursor))
+				.as_deref(),
+			Some("East: Atlas (Value: 30.00, Share: 25.0%, Cumulative: 25.0%, Total: 120.00)")
+		);
+
+		let horizontal = StackedBarPlotKernel {
+			prepared_data: kernel.prepared_data.clone(),
+			orientation: Orientation::Horizontal,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+			normalization: StackNormalization::Percent,
+		};
+		let layout = horizontal.layout(settings.clone());
+		let PlotLayout::CategoricalY {
+			x_range,
+			x_axis_type,
+			..
+		} = layout
+		else {
+			panic!("horizontal percent stack uses categorical y")
+		};
+		assert_eq!(x_range, (0.0, 100.0));
+		assert_eq!(x_axis_type, crate::plot::common::AxisType::Percent);
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let bars = horizontal.stacked_rectangles(
+			&transform,
+			settings.bar_width.fraction(),
+			settings.category_gap.fraction(),
+		);
+		assert_eq!(bars[0].rect.x, 0.0);
+		assert_eq!(bars[0].rect.width, 25.0);
+		assert_eq!(bars[1].rect.x + bars[1].rect.width, 100.0);
+
+		let narrow = polars::df!(
+			"cat" => ["East", "East"],
+			"group" => ["Atlas", "Beacon"],
+			"val" => [999.0, 1.0],
+		)
+		.unwrap();
+		let narrow = StackedBarPlotKernel {
+			prepared_data: Arc::new(prepare_stacked_bar_data(&narrow, "cat", "group", "val")),
+			orientation: Orientation::Horizontal,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+			normalization: StackNormalization::Percent,
+		};
+		let layout = narrow.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let bars = narrow.stacked_rectangles(
+			&transform,
+			settings.bar_width.fraction(),
+			settings.category_gap.fraction(),
+		);
+		assert!(
+			bars[1].rect.width < 1.0,
+			"percent geometry has no minimum-pixel distortion"
+		);
+		assert_eq!(
+			bars[1].rect.x + bars[1].rect.width,
+			100.0,
+			"even a subpixel final segment ends at the exact retained-total projection"
+		);
+	}
+
+	#[test]
+	fn product_0072_invalid_samples_are_zero_and_zero_totals_invent_no_share() {
+		let frame = polars::df!(
+			"cat" => ["mixed", "mixed", "mixed", "mixed", "mixed", "mixed",
+				"empty", "empty", "empty", "empty", "empty", "empty"],
+			"group" => ["negative", "zero", "infinite", "nan", "missing", "positive",
+				"negative", "zero", "infinite", "nan", "missing", "positive"],
+			"val" => [
+				Some(-5.0), Some(0.0), Some(f64::INFINITY), Some(f64::NAN), None, Some(40.0),
+				Some(-1.0), Some(0.0), Some(f64::INFINITY), Some(f64::NAN), None, Some(0.0),
+			],
+		)
+		.unwrap();
+		let prepared = prepare_stacked_bar_data(&frame, "cat", "group", "val");
+		assert_eq!(prepared.categories, ["empty", "mixed"]);
+		assert_eq!(
+			prepared.group_names,
+			["infinite", "missing", "nan", "negative", "positive", "zero"]
+		);
+		assert_eq!(prepared.totals, [0.0, 40.0]);
+		assert_eq!(
+			prepared.category_values,
+			[
+				vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+				vec![0.0, 0.0, 0.0, 0.0, 40.0, 0.0],
+			],
+			"negative, zero, non-finite, and missing samples enter neither numerator nor denominator"
+		);
+		let kernel = StackedBarPlotKernel {
+			prepared_data: Arc::new(prepared),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+			normalization: StackNormalization::Percent,
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		assert!(matches!(
+			layout,
+			PlotLayout::CategoricalX {
+				y_range: (0.0, 100.0),
+				y_axis_type: crate::plot::common::AxisType::Percent,
+				..
+			}
+		));
+		let transform = CoordinateTransformer::new(
+			&layout,
+			Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0)),
+		);
+		let bars = kernel.stacked_rectangles(
+			&transform,
+			settings.bar_width.fraction(),
+			settings.category_gap.fraction(),
+		);
+		assert_eq!(bars.len(), 1, "the zero-total category emits no rectangles");
+		assert_eq!(bars[0].value, 40.0);
+		assert_eq!(bars[0].total, 40.0);
+		assert_eq!(bars[0].rect.height, 100.0);
+		let empty_center = transform.categorical(0, 50.0).0;
+		assert_eq!(
+			kernel.hover(&transform, Cursor::Available(empty_center)),
+			None,
+			"an absent denominator must not manufacture 0% share prose"
+		);
+
+		let one = polars::df!("cat" => ["A", "B"], "val" => [2.0, 3.0]).unwrap();
+		let one = StackedBarPlotKernel {
+			prepared_data: Arc::new(prepare_stacked_bar_data(&one, "cat", "", "val")),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: Vec::new(),
+			normalization: StackNormalization::Percent,
+		};
+		let layout = one.layout(settings.clone());
+		let transform = CoordinateTransformer::new(
+			&layout,
+			Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0)),
+		);
+		let bars = one.stacked_rectangles(
+			&transform,
+			settings.bar_width.fraction(),
+			settings.category_gap.fraction(),
+		);
+		assert_eq!(bars.len(), 2);
+		assert!(bars.iter().all(|bar| bar.rect.height == 100.0));
+		let content = one
+			.legend_content(&settings)
+			.expect("synthetic one-series content remains observable");
+		let LegendSection::Entries(entries) = content.sections().next().unwrap() else {
+			panic!("synthetic bar legend content is categorical")
+		};
+		assert_eq!(entries.first().provenance, LegendProvenance::Synthetic);
+		assert!(
+			apply_policy(content).is_none(),
+			"a positive two-field 100% stack does not manufacture a legend"
+		);
 	}
 }

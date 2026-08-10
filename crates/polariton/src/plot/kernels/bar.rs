@@ -189,6 +189,7 @@ impl PlotKernel for BarPlotKernel {
 		match self.orientation {
 			Orientation::Vertical => PlotLayout::CategoricalX {
 				categories: self.prepared_data.categories.clone(),
+				y_axis_type: crate::plot::common::AxisType::Linear,
 				y_range: (
 					settings.y_min.unwrap_or(self.prepared_data.y_range.0),
 					settings.y_max.unwrap_or(self.prepared_data.y_range.1),
@@ -196,6 +197,7 @@ impl PlotKernel for BarPlotKernel {
 			},
 			Orientation::Horizontal => PlotLayout::CategoricalY {
 				categories: self.prepared_data.categories.clone(),
+				x_axis_type: crate::plot::common::AxisType::Linear,
 				x_range: (
 					settings.x_min.unwrap_or(self.prepared_data.y_range.0),
 					settings.x_max.unwrap_or(self.prepared_data.y_range.1),

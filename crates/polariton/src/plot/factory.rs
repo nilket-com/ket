@@ -24,7 +24,7 @@ use crate::plot::kernels::violin::{self, ViolinPlotKernel};
 use crate::plot::spec::{
 	BandFillAssignment, CategoryColorAssignment, Channel, ColorJob, LayerMark, LayerSettings,
 	LayeredPlotSpec, NonEmpty, PlotProvenance, ResolvedKernelFields, ResolvedLayerSpec,
-	ResolvedLayout, ResolvedPlotSpec, StampedResult, resolve_layered_channels,
+	ResolvedLayout, ResolvedPlotSpec, StackNormalization, StampedResult, resolve_layered_channels,
 	resolve_layered_domains,
 };
 use polars::frame::DataFrame;
@@ -106,6 +106,7 @@ pub fn create_plot(
 				LayerSettings::default(),
 				&spec.band_fills,
 				resolved_category_colors(spec),
+				spec.stack_normalization,
 			)
 		}
 		ResolvedKernelFields::Pie { category, value } => {
@@ -214,6 +215,7 @@ pub fn create_plot(
 			Arc::new(StackedAreaPlotKernel {
 				prepared_data: Arc::new(prepared),
 				series_colors: assignments.to_vec(),
+				normalization: spec.stack_normalization,
 			})
 		}
 		ResolvedKernelFields::FillBetween {
@@ -266,6 +268,7 @@ fn create_stacked_bar_kernel(
 	layer_settings: LayerSettings,
 	band_fills: &[BandFillAssignment],
 	group_colors: &[CategoryColorAssignment],
+	normalization: StackNormalization,
 ) -> Arc<dyn PlotKernel + Send + Sync> {
 	Arc::new(StackedBarPlotKernel {
 		prepared_data: Arc::new(prepared_data),
@@ -277,6 +280,7 @@ fn create_stacked_bar_kernel(
 		layer_settings,
 		band_fills: band_fills.to_vec(),
 		group_colors: group_colors.to_vec(),
+		normalization,
 	})
 }
 
@@ -363,7 +367,27 @@ pub fn create_styled_plot(
 			layer_settings,
 			&spec.band_fills,
 			resolved_category_colors(spec),
+			spec.stack_normalization,
 		)),
+		ResolvedKernelFields::StackedArea { series, x, y } => {
+			let assignments = resolved_category_colors(spec);
+			let prepared = if assignments.is_empty() {
+				stacked_area::prepare_stacked_area_data(df, series.as_deref().unwrap_or(""), x, y)
+			} else {
+				stacked_area::prepare_stacked_area_data_with_resolved_order(
+					df,
+					series.as_deref().unwrap_or(""),
+					x,
+					y,
+					assignments,
+				)
+			};
+			Ok(Arc::new(StackedAreaPlotKernel {
+				prepared_data: Arc::new(prepared),
+				series_colors: assignments.to_vec(),
+				normalization: spec.stack_normalization,
+			}))
+		}
 		_ => Err("standalone Layer settings are not implemented for this plot mark".to_owned()),
 	}
 }
@@ -1134,6 +1158,7 @@ mod product_0013_baseline_tests {
 			PlotLayout::CategoricalX {
 				categories,
 				y_range,
+				..
 			} => (categories, y_range),
 			_ => panic!("vertical bar layout"),
 		};

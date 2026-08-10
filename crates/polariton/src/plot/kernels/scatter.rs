@@ -57,6 +57,7 @@ impl PlotKernel for ScatterPlotKernel {
 		if let Some(categories) = &self.prepared_data.x_categories {
 			return PlotLayout::CategoricalX {
 				categories: categories.clone(),
+				y_axis_type: self.prepared_data.y_axis_type,
 				y_range: (
 					settings.y_min.unwrap_or(self.prepared_data.y_range.0),
 					settings.y_max.unwrap_or(self.prepared_data.y_range.1),

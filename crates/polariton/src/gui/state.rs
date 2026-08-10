@@ -25,6 +25,8 @@ use crate::plot::chrome::PlotChrome;
 #[cfg(feature = "toron")]
 use crate::plot::common::{PlotLayout, TickPlacementError};
 use crate::plot::composition::PlotComposition;
+#[cfg(feature = "toron")]
+use crate::plot::core::PlotType;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 #[cfg(feature = "toron")]
 use crate::plot::factory::create_layered_plot;
@@ -1011,6 +1013,11 @@ fn resolved_rune_axis_scales(
 			} else {
 				authored
 			};
+			let authored = if styled.percent {
+				authored.with_percent()
+			} else {
+				authored
+			};
 			let binding = resolve_channels(&authored, schema).map_err(|error| error.to_string())?;
 			scales(binding.channels())
 		}
@@ -1045,6 +1052,33 @@ fn validate_rune_numeric_domain_applicability(
 		// rejects a successfully resolved axis that is not numeric.
 		return Ok(());
 	};
+	let percent_value_axis = match body {
+		RunePlotBody::StyledSingle(styled) if styled.percent => {
+			match styled.sink.composition.primary_plot_type() {
+				PlotType::StackedArea => Some("y"),
+				PlotType::Bar if matches!(x_scale, ScaleFamily::Linear) => Some("x"),
+				PlotType::Bar => Some("y"),
+				_ => None,
+			}
+		}
+		_ => None,
+	};
+	if percent_value_axis == Some("x")
+		&& let Some(span) = domain_spans.x.as_ref()
+	{
+		return Err((
+			span.clone(),
+			"x_bounds(...) cannot override the fixed 0..100 percent domain".to_owned(),
+		));
+	}
+	if percent_value_axis == Some("y")
+		&& let Some(span) = domain_spans.y.as_ref()
+	{
+		return Err((
+			span.clone(),
+			"y_bounds(...) cannot override the fixed 0..100 percent domain".to_owned(),
+		));
+	}
 	let numeric = |scale| matches!(scale, ScaleFamily::Linear | ScaleFamily::Log);
 	if let Some(span) = domain_spans.x.as_ref() {
 		if !numeric(x_scale) {
@@ -1584,6 +1618,7 @@ fn rune_view_outcome_with_palettes(
 									sink,
 									settings,
 									stacked,
+									percent,
 								} = styled;
 								let authored_spec = AuthoredPlotSpec::xy_color(
 									sink.composition,
@@ -1593,6 +1628,11 @@ fn rune_view_outcome_with_palettes(
 								);
 								let authored_spec = if stacked {
 									authored_spec.with_stacked_bar()
+								} else {
+									authored_spec
+								};
+								let authored_spec = if percent {
+									authored_spec.with_percent()
 								} else {
 									authored_spec
 								};
@@ -7563,6 +7603,137 @@ workspace.table("bad").views([view("bad", table())]);
 				panic!("category-axis stacked setting must refuse")
 			};
 			assert!(error.contains("Band"), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], modifier);
+		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0072_percent_completion_fixes_value_domain_and_refuses_bounds() {
+		let frame = polars::df!(
+			"category" => ["East", "East", "West", "West"],
+			"value" => [30.0, 90.0, 20.0, 20.0],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+			"x" => [0.0, 0.0, 1.0, 1.0],
+		)
+		.unwrap();
+		for (source, expected, axis) in [
+			(
+				r#"workspace.table("t").views([figure([
+					y_tick_step(25), bar("category", "value", "series").stacked().percent()
+				])])"#,
+				PlotType::StackedBar,
+				"y",
+			),
+			(
+				r#"workspace.table("t").views([figure([
+					x_tick_step(25), bar("value", "category", "series").percent().stacked()
+				])])"#,
+				PlotType::HorizontalStackedBar,
+				"x",
+			),
+			(
+				r#"workspace.table("t").views([figure([
+					y_tick_step(25), area("x", "value", "series").percent()
+				])])"#,
+				PlotType::StackedArea,
+				"y",
+			),
+		] {
+			let relation = transform_rune_view(source)
+				.unwrap()
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(frame.clone(), relation.views);
+			let Ok(crate::gui::messages::RuneRelationSinkOutput::StyledPlot(
+				resolved,
+				layer,
+				authored,
+				_,
+			)) = &outcome.sinks[0].output
+			else {
+				panic!("percent mark must complete through the styled path")
+			};
+			assert_eq!(
+				resolved.resolved_spec.composition.primary_plot_type(),
+				expected
+			);
+			assert_eq!(
+				resolved.resolved_spec.stack_normalization,
+				crate::plot::spec::StackNormalization::Percent
+			);
+			let model = crate::plot::theme::PlotSettings {
+				authored_spec: authored.clone(),
+				..crate::plot::theme::PlotSettings::default()
+			};
+			let settings = model.resolve_for_layer(layer);
+			let kernel = create_styled_plot(&resolved.resolved_spec, &resolved.data, layer.clone())
+				.expect("both percent families reach the styled factory");
+			match (axis, kernel.layout(settings.clone())) {
+				(
+					"y",
+					PlotLayout::CategoricalX {
+						y_range,
+						y_axis_type,
+						..
+					},
+				) => {
+					assert_eq!(y_range, (0.0, 100.0));
+					assert_eq!(y_axis_type, crate::plot::common::AxisType::Percent);
+				}
+				(
+					"x",
+					PlotLayout::CategoricalY {
+						x_range,
+						x_axis_type,
+						..
+					},
+				) => {
+					assert_eq!(x_range, (0.0, 100.0));
+					assert_eq!(x_axis_type, crate::plot::common::AxisType::Percent);
+				}
+				(
+					"y",
+					PlotLayout::Cartesian {
+						y_range,
+						y_axis_type,
+						..
+					},
+				) => {
+					assert_eq!(y_range, (0.0, 100.0));
+					assert_eq!(y_axis_type, crate::plot::common::AxisType::Percent);
+				}
+				_ => panic!("wrong percent layout"),
+			}
+		}
+
+		for (modifier, mark) in [
+			(
+				"y_bounds(0, 100)",
+				"bar(\"category\", \"value\", \"series\").stacked().percent()",
+			),
+			(
+				"x_bounds(0, 100)",
+				"bar(\"value\", \"category\", \"series\").stacked().percent()",
+			),
+			(
+				"y_bounds(0, 100)",
+				"area(\"x\", \"value\", \"series\").percent()",
+			),
+		] {
+			let source = format!("workspace.table(\"t\").views([figure([{modifier}, {mark}])])");
+			let relation = transform_rune_view(&source)
+				.unwrap()
+				.into_relations()
+				.next()
+				.unwrap();
+			let outcome = rune_view_outcome(frame.clone(), relation.views);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("percent value bounds must refuse")
+			};
+			assert!(error.contains("fixed 0..100 percent domain"), "{error}");
 			let span = outcome.sinks[0].span.clone();
 			assert_eq!(&source[span.start as usize..span.end as usize], modifier);
 		}

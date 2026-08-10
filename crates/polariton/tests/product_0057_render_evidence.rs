@@ -47,10 +47,11 @@ use plot::kernels::bar::{BarPlotKernel, BarPreparedData};
 use plot::kernels::line::{LinePlotKernel, LinePreparedData, SeriesData};
 use plot::kernels::scatter::{ScatterPlotKernel, ScatterPreparedData, ScatterSeries};
 use plot::kernels::stacked_area::{StackedAreaPlotKernel, StackedAreaPreparedData};
+use plot::kernels::stacked_bar::{StackedBarPlotKernel, StackedBarPreparedData};
 use plot::legend::LegendProvenance;
 use plot::spec::{
 	BarWidth, CategoryColorAssignment, CategoryGap, LayerSettings, PalettePosition, PointSize,
-	ResolvedColor, ResolvedPresence, StrokeWidth,
+	ResolvedColor, ResolvedPresence, StackNormalization, StrokeWidth,
 };
 use plot::theme::PlotSettings;
 use polars::prelude::{Float64Chunked, NewChunkedArray};
@@ -653,6 +654,7 @@ fn product_0068_stacked_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, 
 				categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
 				unique_xs: vec![0.0, 0.25, 0.5, 0.75, 1.0],
 				category_values: vec![vec![2.0, 2.5, 2.0, 3.0, 2.5], vec![2.0, 1.5, 2.5, 2.0, 2.5]],
+				totals: vec![4.0, 4.0, 4.5, 5.0, 5.0],
 				x_range: (0.0, 1.0),
 				y_range: (0.0, 10.0),
 				x_axis_type: AxisType::Linear,
@@ -662,6 +664,7 @@ fn product_0068_stacked_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, 
 				series_provenance: plot::legend::LegendProvenance::Named,
 			}),
 			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
 		},
 		PlotSettings::from_resolved(resolved),
 		colors,
@@ -798,6 +801,150 @@ fn assert_product_0068_stacked_area_control(
 		"PRODUCT-0068 stacked-area headroom must retain real gridlines; got {headroom_grid} pixels"
 	);
 	(exact_intersections, headroom_grid)
+}
+
+fn product_0072_percent_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, [[u8; 3]; 2]) {
+	let colors = [BLUE, RED];
+	let assignments = ["Atlas", "Beacon"]
+		.into_iter()
+		.zip(colors)
+		.enumerate()
+		.map(
+			|(index, (category, [red, green, blue]))| CategoryColorAssignment {
+				category: category.to_owned(),
+				position: PalettePosition::new(index, 2).unwrap(),
+				color: ResolvedColor {
+					red,
+					green,
+					blue,
+					alpha: u8::MAX,
+				},
+			},
+		)
+		.collect::<Vec<_>>();
+	let mut resolved = product_0068_cartesian_settings().resolve();
+	resolved.mark_decoration_color = Color::WHITE;
+	resolved.y_tick_placement = TickPlacement::step(25.0).unwrap();
+	(
+		StackedAreaPlotKernel {
+			prepared_data: Arc::new(StackedAreaPreparedData {
+				categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
+				unique_xs: vec![0.0, 0.25, 0.5, 0.75, 1.0],
+				category_values: vec![vec![30.0; 5], vec![70.0; 5]],
+				totals: vec![100.0; 5],
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 105.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_label: String::new(),
+				y_label: String::new(),
+				series_provenance: LegendProvenance::Named,
+			}),
+			series_colors: assignments,
+			normalization: StackNormalization::Percent,
+		},
+		PlotSettings::from_resolved(resolved),
+		colors,
+	)
+}
+
+fn product_0072_percent_bar_fixture(
+	gapless: bool,
+) -> (StackedBarPlotKernel, PlotSettings, [[u8; 3]; 2]) {
+	let colors = [BLUE, RED];
+	let assignments = ["Atlas", "Beacon"]
+		.into_iter()
+		.zip(colors)
+		.enumerate()
+		.map(
+			|(index, (category, [red, green, blue]))| CategoryColorAssignment {
+				category: category.to_owned(),
+				position: PalettePosition::new(index, 2).unwrap(),
+				color: ResolvedColor {
+					red,
+					green,
+					blue,
+					alpha: u8::MAX,
+				},
+			},
+		)
+		.collect::<Vec<_>>();
+	let resolved = ResolvedPlotSettings {
+		title: ResolvedPresence::Hide,
+		subtitle: ResolvedPresence::Hide,
+		x_label: ResolvedPresence::Hide,
+		y_label: ResolvedPresence::Hide,
+		legend: ResolvedPresence::Hide,
+		x_tick_placement: TickPlacement::count(1).unwrap(),
+		y_tick_placement: TickPlacement::step(25.0).unwrap(),
+		show_x_minor_ticks: false,
+		show_y_minor_ticks: false,
+		show_x_minor_grid: false,
+		show_y_minor_grid: false,
+		plot_padding_top: 0.0,
+		plot_padding_bottom: 0.0,
+		plot_padding_left: 0.0,
+		plot_padding_right: 0.0,
+		bar_width: BarWidth::new(if gapless { 1.0 } else { 0.72 }).unwrap(),
+		category_gap: CategoryGap::new(if gapless { 0.0 } else { 0.24 }).unwrap(),
+		..ResolvedPlotSettings::default()
+	};
+	(
+		StackedBarPlotKernel {
+			prepared_data: Arc::new(StackedBarPreparedData {
+				categories: vec!["East".to_owned(), "West".to_owned()],
+				group_names: vec!["Atlas".to_owned(), "Beacon".to_owned()],
+				category_values: vec![vec![30.0, 70.0], vec![60.0, 40.0]],
+				totals: vec![100.0, 100.0],
+				y_range: (0.0, 110.0),
+				x_label: String::new(),
+				y_label: String::new(),
+				group_provenance: LegendProvenance::Named,
+			}),
+			orientation: Orientation::Vertical,
+			layer_settings: LayerSettings::default(),
+			band_fills: Vec::new(),
+			group_colors: assignments,
+			normalization: StackNormalization::Percent,
+		},
+		PlotSettings::from_resolved(resolved),
+		colors,
+	)
+}
+
+fn assert_product_0072_occlusion(
+	label: &str,
+	under: &Capture,
+	overlay: &Capture,
+	fills: [[u8; 3]; 2],
+) -> usize {
+	let changed_fill_pixels = under
+		.rgba
+		.chunks_exact(4)
+		.zip(overlay.rgba.chunks_exact(4))
+		.filter(|(under, overlay)| {
+			let under = [under[0], under[1], under[2]];
+			let overlay = [overlay[0], overlay[1], overlay[2]];
+			fills.iter().any(|fill| near(under, *fill, 12))
+				&& fills
+					.iter()
+					.all(|fill| color_distance(overlay, *fill) >= 20)
+		})
+		.count();
+	assert!(
+		changed_fill_pixels >= 100,
+		"PRODUCT-0072 {label}: production grid-under must preserve resolved fill where an overlay-grid control visibly composites; got {changed_fill_pixels} pixels"
+	);
+	for fill in fills {
+		assert!(
+			under
+				.rgba
+				.chunks_exact(4)
+				.any(|pixel| near([pixel[0], pixel[1], pixel[2]], fill, 12)),
+			"PRODUCT-0072 {label}: the fully occupied fixture must realize fill {fill:?}"
+		);
+	}
+	changed_fill_pixels
 }
 
 fn draw_overlap(frame: &mut canvas::Frame) {
@@ -964,6 +1111,113 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	let large = Size::new(448, 320);
 	let mut msaa = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
 	let mut no_aa = gpu.renderer(None).await;
+
+	let percent_size = Size::new(500, 360);
+	let (percent_area, percent_area_settings, percent_area_fills) =
+		product_0072_percent_area_fixture();
+	let percent_area_under = render_product_0068_cartesian_mark(
+		&mut msaa,
+		percent_size,
+		&percent_area,
+		&percent_area_settings,
+		false,
+	);
+	let percent_area_overlay = render_product_0068_cartesian_mark(
+		&mut msaa,
+		percent_size,
+		&percent_area,
+		&percent_area_settings,
+		true,
+	);
+	let area_occluded = assert_product_0072_occlusion(
+		"fully positive area",
+		&percent_area_under,
+		&percent_area_overlay,
+		percent_area_fills,
+	);
+	let mut no_boundary = percent_area_settings.resolve();
+	no_boundary.mark_decoration_color = Color::TRANSPARENT;
+	let percent_area_without_boundary = render_product_0068_cartesian_mark(
+		&mut msaa,
+		percent_size,
+		&percent_area,
+		&PlotSettings::from_resolved(no_boundary),
+		false,
+	);
+	let area_boundary = percent_area_under
+		.rgba
+		.chunks_exact(4)
+		.zip(percent_area_without_boundary.rgba.chunks_exact(4))
+		.filter(|(boundary, plain)| {
+			color_distance(
+				[boundary[0], boundary[1], boundary[2]],
+				[plain[0], plain[1], plain[2]],
+			) >= 20
+		})
+		.count();
+	assert!(
+		area_boundary >= 100,
+		"PRODUCT-0072 percent area keeps an above-mark resolved boundary; got {area_boundary} discriminating pixels"
+	);
+
+	let (percent_wall, percent_wall_settings, percent_bar_fills) =
+		product_0072_percent_bar_fixture(true);
+	let percent_wall_under = render_product_0068_cartesian_mark(
+		&mut msaa,
+		percent_size,
+		&percent_wall,
+		&percent_wall_settings,
+		false,
+	);
+	let percent_wall_overlay = render_product_0068_cartesian_mark(
+		&mut msaa,
+		percent_size,
+		&percent_wall,
+		&percent_wall_settings,
+		true,
+	);
+	let wall_occluded = assert_product_0072_occlusion(
+		"gapless full-width bar wall",
+		&percent_wall_under,
+		&percent_wall_overlay,
+		percent_bar_fills,
+	);
+
+	let (percent_gaps, percent_gap_settings, _) = product_0072_percent_bar_fixture(false);
+	let percent_gaps_with_grid = render_product_0068_cartesian_mark(
+		&mut msaa,
+		percent_size,
+		&percent_gaps,
+		&percent_gap_settings,
+		false,
+	);
+	let mut no_grid = percent_gap_settings.resolve();
+	no_grid.show_x_major_grid = false;
+	no_grid.show_y_major_grid = false;
+	let percent_gaps_without_grid = render_product_0068_cartesian_mark(
+		&mut msaa,
+		percent_size,
+		&percent_gaps,
+		&PlotSettings::from_resolved(no_grid),
+		false,
+	);
+	let exposed_grid = percent_gaps_with_grid
+		.rgba
+		.chunks_exact(4)
+		.zip(percent_gaps_without_grid.rgba.chunks_exact(4))
+		.filter(|(grid, canvas)| {
+			let grid = [grid[0], grid[1], grid[2]];
+			let canvas = [canvas[0], canvas[1], canvas[2]];
+			color_distance(grid, canvas) >= 20 && near(canvas, BACKGROUND, 12)
+		})
+		.count();
+	assert!(
+		exposed_grid >= 100,
+		"PRODUCT-0072 bar gaps must retain the same real grid over exposed canvas; got {exposed_grid} pixels"
+	);
+	println!(
+		"PRODUCT_0072 percent_strata disposition=automated area_occluded={area_occluded} area_boundary={area_boundary} wall_occluded={wall_occluded} exposed_grid={exposed_grid}"
+	);
 
 	let bar_size = Size::new(600, 400);
 	let bar_under = render_product_0068_bar(&mut msaa, bar_size, false);

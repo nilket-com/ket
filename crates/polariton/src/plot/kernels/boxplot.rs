@@ -16,6 +16,7 @@ impl PlotKernel for BoxPlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalX {
 			categories: self.prepared_data.categories.clone(),
+			y_axis_type: self.prepared_data.y_axis_type,
 			y_range: (
 				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
 				settings.y_max.unwrap_or(self.prepared_data.y_range.1),
@@ -121,6 +122,7 @@ impl PlotKernel for BoxPlotKernel {
 			&& let PlotLayout::CategoricalX {
 				categories,
 				y_range,
+				..
 			} = transform.layout
 		{
 			for (i, category) in self.prepared_data.categories.iter().enumerate() {

@@ -157,8 +157,33 @@ one-segment stack and carries no legend.
 Stack preparation remains first-row-wins for each category/series pair, not an
 implicit aggregation. Only positive finite values participate in the summed
 axis, rectangles, hit testing, and hover; aggregate or filter in the relation
-when different data semantics are intended. Percentage-of-total stacking is
-not part of `.stacked()`.
+when different data semantics are intended.
+
+Add `.percent()` to project either stacked family onto a fixed `0..100` scale:
+
+```rune
+workspace.table("sales").views([
+    figure([
+        y_tick_step(25),
+        bar("region", "revenue", "product")
+            .stacked()
+            .percent(),
+    ]),
+    figure([
+        x_tick_step(25),
+        bar("revenue", "region", "product")
+            .percent()
+            .stacked(),
+    ]),
+])
+```
+
+Modifier order is irrelevant. Each category uses the canonical values the mark
+actually draws as its denominator; later duplicate rows are not aggregated.
+The value-axis domain is semantic and fixed, so value-axis bounds refuse even
+when written as `0..100`. Tick steps are percentage points. Hover reports the
+absolute value and total alongside share and cumulative percentage. A
+zero-total category draws nothing rather than inventing a `0%` share.
 
 #### Rune line presentation:
 
@@ -201,6 +226,12 @@ when totals are intended. Non-finite and non-positive samples contribute zero.
 The two-field form has no legend, and areas remain outside `layers([...])`.
 Gridlines render beneath opaque fills while the resolved boundary and exterior
 axis furniture remain visible.
+
+`.percent()` applies the same local-denominator projection at each x sample.
+The area keeps its absolute values for hover, uses an exact `0..100` y domain,
+and accepts percentage-point y tick steps. A zero-total x sample pinches every
+band to zero. A fully occupied percent area can occlude every interior gridline;
+the percentage ticks and resolved series boundaries remain above the fills.
 
 #### Adapters:
  - SQLite (file or memory)

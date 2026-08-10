@@ -1,7 +1,7 @@
 # The plotting language as built
 
-Derived 2026-08-09 from PRODUCT-0007, PRODUCT-0008, and PRODUCT-0010 through
-PRODUCT-0070. This document states backward what exists. It contains no decision
+Derived 2026-08-10 from PRODUCT-0007, PRODUCT-0008, and PRODUCT-0010 through
+PRODUCT-0072. This document states backward what exists. It contains no decision
 that is not already in a record; every claim carries its citation, and where two
 records disagree the later one governs and the supersession is noted. Companion
 documents: `consistency_audit.md`, `deferred_ledger.md`, `live_bridges.md`.
@@ -115,7 +115,7 @@ The language has exactly three places a property attaches (0030 §1):
 | position | attaches to | members |
 |---|---|---|
 | member of `figure([...])` | the whole graphical artifact | `title`, `subtitle` (0016); `palette` (0030); `skin` + `.duotone()` (0032/0033); `x_bounds`, `y_bounds` (0036); `x_tick_step`, `y_tick_step` (0038); `x_minor_ticks`, `y_minor_ticks` (0039) |
-| postfix on a mark | that mark's Layer-stage styling or geometry member | `.point_size` (scatter, 0018); `.stroke_width` (line, 0020); `.bar_width` (bar, 0022); `.category_gap` (bar, 0053); `.stacked()` (bar, 0064) |
+| postfix on a mark | that mark's Layer-stage styling, geometry, or scale member | `.point_size` (scatter, 0018); `.stroke_width` (line, 0020); `.bar_width` (bar, 0022); `.category_gap` (bar, 0053); `.stacked()` (bar, 0064); `.percent()` (stacked bar and area, 0072) |
 | postfix on `table()` | the table artifact's interior treatment | `.skin` (0025); `.duotone()` (0027) |
 
 Every register is closed (0018 §1, 0025 §4): unknown members refuse, duplicates
@@ -166,6 +166,11 @@ Settings are render-time presentation, never prepared data: prepared data is
 identical across styled values, and paint and hit geometry consume one resolved
 calculation (0017 §5–6, 0019 §3–4, 0021 §3–4).
 
+`.percent()` is the one postfix scale selector, not a `LayerSettings` member or
+cascade property. It lowers to the closed `StackNormalization::Percent` fact on
+the authored and resolved specification, so application themes and pane
+overrides cannot change a mark's unit (0072 §1).
+
 Bar is one authored family with four resolved geometry members (0055, 0064).
 The quantitative/non-quantitative channel pair first selects vertical `Bar` or
 horizontal `HorizontalBar`; `.stacked()` then selects the corresponding
@@ -186,6 +191,21 @@ path); duplicate `(x, series)` rows are first-row-wins and non-finite or
 non-positive samples are clamped once in the prepared matrix. The three-field
 form consumes exact resolved colours for fills and named swatches; the
 two-field synthetic entry is omitted (0069–0070).
+
+Percent-of-total is one shared scale choice over both stacked families
+(0072). `bar(...).stacked().percent()` and `area(...).percent()` preserve the
+same composition, authored family, categorical identity, colours, and legend
+as their absolute controls. Each bar category or area x sample divides the
+canonical cumulative positive values by the retained local total and projects
+onto exactly `0..100`; duplicate raw rows are never rescanned or summed. A
+zero-total bar emits no rectangle and a zero-total area pinches to zero while
+retaining the fixed domain. The numeric axis carries `AxisType::Percent` into
+ordinary and faceted shared chrome, where tick steps are percentage points.
+Authored bounds on that value axis refuse even when written as `(0, 100)`;
+area x bounds remain applicable. Percent hover adds absolute value, share,
+cumulative percent, and absolute total. Gridlines remain globally beneath
+marks, so a fully occupied percent stack may occlude every interior gridline
+(0072 §§3–6).
 
 ## 9. Color: one authority, several projections
 

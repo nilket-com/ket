@@ -1,5 +1,6 @@
 use crate::plot::common::{
-	CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
+	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
+	ResolvedPlotSettings,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -15,6 +16,7 @@ impl PlotKernel for ViolinPlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalX {
 			categories: self.prepared_data.categories.clone(),
+			y_axis_type: AxisType::Linear,
 			y_range: (
 				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
 				settings.y_max.unwrap_or(self.prepared_data.y_range.1),

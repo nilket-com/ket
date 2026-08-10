@@ -32,6 +32,8 @@ pub enum TimeUnit {
 pub enum AxisType {
 	#[default]
 	Linear,
+	/// PRODUCT-0072: a linear value scale expressed in percentage points.
+	Percent,
 	Date,
 	Datetime(TimeUnit),
 	Time,
@@ -74,7 +76,9 @@ impl TickPlacement {
 		axis_type: AxisType,
 		range: (f64, f64),
 	) -> Result<Vec<f64>, TickPlacementError> {
-		if matches!(self, Self::Step(_)) && !matches!(axis_type, AxisType::Linear) {
+		if matches!(self, Self::Step(_))
+			&& !matches!(axis_type, AxisType::Linear | AxisType::Percent)
+		{
 			return Err(TickPlacementError::UnsupportedAxis { axis_type });
 		}
 		self.positions(range)
@@ -203,10 +207,12 @@ pub enum PlotLayout {
 	CategoricalX {
 		categories: Vec<String>,
 		y_range: (f64, f64),
+		y_axis_type: AxisType,
 	},
 	CategoricalY {
 		categories: Vec<String>,
 		x_range: (f64, f64),
+		x_axis_type: AxisType,
 	},
 	CategoricalXY {
 		x_categories: Vec<String>,
@@ -265,6 +271,7 @@ impl<'a> CoordinateTransformer<'a> {
 			PlotLayout::CategoricalX {
 				categories,
 				y_range,
+				..
 			} => {
 				let num_cats = categories.len().max(1) as f32;
 				let band_width = self.bounds.width / num_cats;
@@ -277,6 +284,7 @@ impl<'a> CoordinateTransformer<'a> {
 			PlotLayout::CategoricalY {
 				categories,
 				x_range,
+				..
 			} => {
 				let num_cats = categories.len().max(1) as f32;
 				let band_height = self.bounds.height / num_cats;
@@ -996,6 +1004,7 @@ impl<'a> PlotWidget<'a> {
 				PlotLayout::CategoricalX {
 					categories,
 					y_range,
+					..
 				} => {
 					self.draw_categorical_axes(
 						backend,
@@ -1009,6 +1018,7 @@ impl<'a> PlotWidget<'a> {
 				PlotLayout::CategoricalY {
 					categories,
 					x_range,
+					..
 				} => {
 					self.draw_categorical_y_axes(
 						backend,
@@ -1289,10 +1299,12 @@ impl<'a> PlotWidget<'a> {
 			PlotLayout::CategoricalX {
 				categories,
 				y_range,
+				..
 			} => self.draw_categorical_grid(backend, area, transform, categories, *y_range),
 			PlotLayout::CategoricalY {
 				categories,
 				x_range,
+				..
 			} => self.draw_categorical_y_grid(backend, area, transform, categories, *x_range),
 			_ => {}
 		}
@@ -1606,6 +1618,9 @@ impl<'a> PlotWidget<'a> {
 		y_range: (f64, f64),
 		text: AxisTextVisibility,
 	) {
+		let PlotLayout::CategoricalX { y_axis_type, .. } = transform.layout else {
+			unreachable!("categorical-x chrome requires a categorical-x transform")
+		};
 		let halo_stroke = Stroke {
 			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
 			width: 4.0,
@@ -1642,7 +1657,7 @@ impl<'a> PlotWidget<'a> {
 			);
 			if text.y {
 				backend.fill_text(Text {
-					content: format_label(data_y, AxisType::Linear),
+					content: format_label(data_y, *y_axis_type),
 					position: Point::new(p_left.x - 10.0, p_left.y),
 					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.y_tick_size),
@@ -1768,6 +1783,9 @@ impl<'a> PlotWidget<'a> {
 		x_range: (f64, f64),
 		text: AxisTextVisibility,
 	) {
+		let PlotLayout::CategoricalY { x_axis_type, .. } = transform.layout else {
+			unreachable!("categorical-y chrome requires a categorical-y transform")
+		};
 		let halo_stroke = Stroke {
 			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
 			width: 4.0,
@@ -1801,7 +1819,7 @@ impl<'a> PlotWidget<'a> {
 			);
 			if text.x {
 				backend.fill_text(Text {
-					content: format_label(data_x, AxisType::Linear),
+					content: format_label(data_x, *x_axis_type),
 					position: Point::new(p_bottom.x, p_bottom.y + 10.0),
 					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.x_tick_size),
@@ -2033,6 +2051,7 @@ pub fn format_label(value: f64, axis_type: AxisType) -> String {
 				format!("{:.1}", value)
 			}
 		}
+		AxisType::Percent => format!("{}%", format_label(value, AxisType::Linear)),
 		AxisType::Date => {
 			let days = value as i64;
 			if let Some(date) = chrono::NaiveDate::from_num_days_from_ce_opt(days as i32 + 719163) {
@@ -2283,7 +2302,7 @@ mod product_0067_0068_strata_oracles {
 	enum Operation {
 		Fill(Color),
 		Stroke(Color),
-		Text,
+		Text(String),
 	}
 
 	#[derive(Default)]
@@ -2308,8 +2327,8 @@ mod product_0067_0068_strata_oracles {
 			self.operations.push(Operation::Fill(color));
 		}
 
-		fn fill_text(&mut self, _text: Text) {
-			self.operations.push(Operation::Text);
+		fn fill_text(&mut self, text: Text) {
+			self.operations.push(Operation::Text(text.content));
 		}
 
 		fn translate(&mut self, _translation: iced::Vector) {}
@@ -2440,10 +2459,12 @@ mod product_0067_0068_strata_oracles {
 			PlotLayout::CategoricalX {
 				categories: vec!["A".to_owned(), "B".to_owned()],
 				y_range: (0.0, 1.0),
+				y_axis_type: AxisType::Linear,
 			},
 			PlotLayout::CategoricalY {
 				categories: vec!["A".to_owned(), "B".to_owned()],
 				x_range: (0.0, 1.0),
+				x_axis_type: AxisType::Linear,
 			},
 		]
 	}
@@ -2484,6 +2505,57 @@ mod product_0067_0068_strata_oracles {
 				"PRODUCT-0068: axes and tick furniture must remain above marks: {operations:?}"
 			);
 		}
+	}
+
+	#[test]
+	fn product_0072_percent_axis_formats_percentage_points_and_admits_steps() {
+		assert_eq!(format_label(0.0, AxisType::Percent), "0%");
+		assert_eq!(format_label(12.5, AxisType::Percent), "12.5%");
+		assert_eq!(format_label(100.0, AxisType::Percent), "100%");
+		assert_eq!(
+			TickPlacement::step(25.0)
+				.unwrap()
+				.positions_for_axis(AxisType::Percent, (0.0, 100.0))
+				.unwrap(),
+			[0.0, 25.0, 50.0, 75.0, 100.0]
+		);
+
+		let mut settings = settings();
+		settings.y_tick_placement = TickPlacement::step(25.0).unwrap();
+		let percent = render(
+			PlotLayout::CategoricalX {
+				categories: vec!["A".to_owned(), "B".to_owned()],
+				y_range: (0.0, 100.0),
+				y_axis_type: AxisType::Percent,
+			},
+			settings.clone(),
+			false,
+		);
+		let percent_labels = percent
+			.iter()
+			.filter_map(|operation| match operation {
+				Operation::Text(text) if text.ends_with('%') => Some(text.as_str()),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(percent_labels, ["0%", "25%", "50%", "75%", "100%"]);
+
+		let absolute = render(
+			PlotLayout::CategoricalX {
+				categories: vec!["A".to_owned(), "B".to_owned()],
+				y_range: (0.0, 100.0),
+				y_axis_type: AxisType::Linear,
+			},
+			settings,
+			false,
+		);
+		assert!(
+			absolute.iter().all(|operation| !matches!(
+				operation,
+				Operation::Text(text) if text.ends_with('%')
+			)),
+			"the same step on an absolute layout keeps linear labels"
+		);
 	}
 
 	#[test]
@@ -2733,6 +2805,7 @@ mod product_0056_categorical_y_oracles {
 			PlotLayout::CategoricalY {
 				categories: vec!["only".to_owned()],
 				x_range: (0.0, 10.0),
+				x_axis_type: AxisType::Linear,
 			}
 		}
 
@@ -2874,6 +2947,7 @@ mod product_0056_categorical_y_oracles {
 				let categorical_y = PlotLayout::CategoricalY {
 					categories: categories.clone(),
 					x_range: (0.0, 10.0),
+					x_axis_type: AxisType::Linear,
 				};
 				let categorical_xy = PlotLayout::CategoricalXY {
 					x_categories: vec!["x".to_owned()],
@@ -2911,6 +2985,7 @@ mod product_0056_categorical_y_oracles {
 					let y_layout = PlotLayout::CategoricalY {
 						categories: categories.clone(),
 						x_range: (0.0, 10.0),
+						x_axis_type: AxisType::Linear,
 					};
 					let y_transform = CoordinateTransformer::new(&y_layout, bounds);
 
