@@ -290,6 +290,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// variants extend the public client protocol without exposing LogicalPlan.
 				"crates/toron/src/sql_wire.rs",
 				"crates/toron/src/sql_planner.rs",
+				// ADR 544: the terminal CLI composes one-shot requests from exact source
+				// slices; tokenizer ownership remains quarantined under sql_planner/.
+				"crates/toron/src/cli.rs",
+				"crates/toron/src/sql_planner/script.rs",
 				// impl 535: the typed fragment-liveness origin joins the existing bounded
 				// query-error telemetry classifier.
 				"crates/toron/src/telemetry.rs",

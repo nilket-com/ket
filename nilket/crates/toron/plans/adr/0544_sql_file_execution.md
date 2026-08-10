@@ -1,6 +1,7 @@
 # ADR 544 - SQL file execution with explicit partial application
 
-**Status:** Proposed 2026-08-10.
+**Status:** Accepted and implemented 2026-08-10. Implementation receipt:
+`plans/impl/0544_sql_file_execution.md`.
 
 The first live PRODUCT-0072 exhibit needed two relations and four SQL statements.
 The natural command appeared to work:

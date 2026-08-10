@@ -63,6 +63,9 @@ show the same grid on canvas, and area boundaries remain above their fills.
 - `../uat/test24.rn` is the live exhibit, backed by
   `../uat/demo_percent_stacks.sql`: vertical, horizontal, faceted, gapless,
   two-field, duplicate-row, zero-total, area, and faceted-area forms.
+- Load the exhibit fixture directly with
+  `nilket toron sql --file ../uat/demo_percent_stacks.sql`; no shell command
+  substitution or statement-splitting loop is part of the UAT contract.
 - `crates/polariton/README.md` documents the spelling, denominator, fixed
   domain, bounds refusal, hover truth, and occlusion consequence.
 - `plans/product/corpus/rune_workspace_corpus.md` advances to v0.72 with an

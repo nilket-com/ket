@@ -1889,10 +1889,16 @@ pub(crate) fn adr073_sqlparser_is_pinned_to_062() {
 #[test]
 pub(crate) fn adr073_sqlparser_ast_is_quarantined_to_sql_planner() {
 	let toron_manifest = manifest_dir();
+	// ADR 544 carves source-preserving lexical splitting beneath the planner. The
+	// directory is part of the same frontend quarantine, not a second consumer.
 	let mut offenders = source_lines(&toron_manifest.join("src"))
 		.into_iter()
 		.filter(|(path, _, _)| {
-			path.file_name().and_then(|name| name.to_str()) != Some("sql_planner.rs")
+			let relative = path
+				.strip_prefix(toron_manifest.join("src"))
+				.unwrap_or(path);
+			relative != Path::new("sql_planner.rs")
+				&& !relative.starts_with(Path::new("sql_planner"))
 		})
 		.filter(|(_, _, line)| line.contains("sqlparser"))
 		.collect::<Vec<_>>();

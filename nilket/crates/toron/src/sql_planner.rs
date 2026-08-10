@@ -1,3 +1,7 @@
+mod script;
+
+pub(crate) use script::split_sql_script;
+
 use crate::aggregate_kernel;
 use crate::catalog::TableRef;
 use crate::date32::parse_date_ymd;
@@ -27,7 +31,6 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
-use sqlparser::tokenizer::{Token, Tokenizer};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -675,32 +678,10 @@ fn take_sql_word(input: &str) -> Option<(&str, &str)> {
 /// below; this lexical boundary exists because `CREATE LOGICAL TYPE` is intentionally
 /// lowered before that parser and must obey the same one-request/one-statement contract.
 fn require_at_most_one_sql_statement(sql: &str) -> Result<(), FrontendError> {
-	let dialect = GenericDialect {};
-	let tokens =
-		Tokenizer::new(&dialect, sql)
-			.tokenize()
-			.map_err(|error| FrontendError::SqlParse {
-				message: error.to_string(),
-			})?;
-	let mut completed = 0usize;
-	let mut has_content = false;
-
-	for token in tokens {
-		match token {
-			Token::Whitespace(_) | Token::EOF => {}
-			Token::SemiColon if has_content => {
-				completed += 1;
-				has_content = false;
-				if completed > 1 {
-					return Err(unsupported(SQL_ONE_STATEMENT_PER_REQUEST_MESSAGE));
-				}
-			}
-			Token::SemiColon => {}
-			_ => has_content = true,
-		}
-	}
-
-	if has_content && completed > 0 {
+	let statements = split_sql_script(sql).map_err(|error| FrontendError::SqlParse {
+		message: error.to_string(),
+	})?;
+	if statements.len() > 1 {
 		return Err(unsupported(SQL_ONE_STATEMENT_PER_REQUEST_MESSAGE));
 	}
 	Ok(())

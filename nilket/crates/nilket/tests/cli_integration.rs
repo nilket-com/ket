@@ -204,6 +204,16 @@ fn assert_sql_success(endpoint: std::net::SocketAddr, statement: &str) -> String
 	stdout(&output)
 }
 
+fn assert_sql_scalar(endpoint: std::net::SocketAddr, statement: &str, expected: &str) {
+	let rendered = assert_sql_success(endpoint, statement);
+	assert!(
+		rendered
+			.lines()
+			.any(|line| line.split('|').any(|cell| cell.trim() == expected)),
+		"missing exact scalar {expected:?} in {rendered}"
+	);
+}
+
 fn assert_executed_or_typed_refusal(endpoint: std::net::SocketAddr, statement: &str) {
 	let output = run_live_sql(endpoint, statement);
 	if output.status.success() {
@@ -359,7 +369,10 @@ fn nilket_toron_sql_requires_statement() {
 
 	assert_eq!(output.status.code(), Some(2), "{output:?}");
 	assert!(stdout(&output).is_empty(), "{output:?}");
-	assert_eq!(stderr(&output), "toron sql requires <statement...>\n");
+	assert_eq!(
+		stderr(&output),
+		"toron sql requires <statement...> or --file <path>\n"
+	);
 }
 
 #[test]
@@ -465,6 +478,210 @@ fn nilket_toron_sql_reports_connection_failure() {
 		stderr(&output).contains("Toron connection timed out"),
 		"{output:?}"
 	);
+}
+
+#[test]
+fn nilket_toron_sql_refuses_positional_script_before_connecting() {
+	let output = nilket(&[
+		"toron",
+		"sql",
+		"--endpoint",
+		"127.0.0.1:9",
+		"SELECT 1; SELECT 2",
+	]);
+
+	assert_eq!(output.status.code(), Some(2), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	assert_eq!(
+		stderr(&output),
+		"Toron SQL execution accepts exactly one statement per request; use `nilket toron sql --file <path>` for a script\n"
+	);
+}
+
+#[test]
+fn nilket_toron_sql_file_rejects_invalid_sources_before_connecting() {
+	let dir = fresh_dir("toron-sql-file-invalid");
+	let empty = dir.join("empty.sql");
+	let comments = dir.join("comments.sql");
+	let non_utf8 = dir.join("non-utf8.sql");
+	let unterminated = dir.join("unterminated.sql");
+	let missing = dir.join("missing.sql");
+	std::fs::write(&empty, "").expect("write empty SQL");
+	std::fs::write(&comments, "-- only\n/* comments */;").expect("write comments SQL");
+	std::fs::write(&non_utf8, [0xff]).expect("write non-UTF-8 SQL");
+	std::fs::write(&unterminated, "SELECT * FROM first; SELECT 'unterminated")
+		.expect("write unterminated SQL");
+
+	for (path, expected) in [
+		(&empty, "contains no SQL statements"),
+		(&comments, "contains no SQL statements"),
+		(&non_utf8, "not valid UTF-8"),
+		(&unterminated, "could not be tokenized"),
+		(&missing, "No such file"),
+		(&dir, "toron sql --file"),
+	] {
+		let output = nilket(&[
+			"toron",
+			"sql",
+			"--endpoint",
+			"127.0.0.1:9",
+			"--file",
+			path.to_str().expect("utf8 fixture path"),
+		]);
+		assert_eq!(output.status.code(), Some(2), "{output:?}");
+		assert!(stdout(&output).is_empty(), "{output:?}");
+		assert!(stderr(&output).contains(expected), "{output:?}");
+		assert!(!stderr(&output).contains("timed out"), "{output:?}");
+	}
+}
+
+#[test]
+fn nilket_toron_sql_file_first_failure_keeps_ordinary_exit_classification() {
+	let (mut child, endpoint) = spawn_toron_sql_daemon("toron-sql-file-first-failure");
+	let dir = fresh_dir("toron-sql-file-first-failure-source");
+	let path = dir.join("first-fails.sql");
+	std::fs::write(
+		&path,
+		"SELEC * FROM missing; SELECT * FROM never_dispatched;",
+	)
+	.expect("write first-failure SQL file");
+	let output = nilket(&[
+		"toron",
+		"sql",
+		"--endpoint",
+		&endpoint,
+		"--file",
+		path.to_str().expect("utf8 SQL path"),
+	]);
+	let _ = child.kill();
+	let _ = child.wait();
+
+	assert_eq!(output.status.code(), Some(1), "{output:?}");
+	assert!(stdout(&output).is_empty(), "{output:?}");
+	let error = stderr(&output);
+	assert!(
+		error.contains("statement 1/2 failed after 0 completed statements"),
+		"{error}"
+	);
+	assert!(error.contains("Toron SyntaxError"), "{error}");
+	assert!(!error.contains("statement 2/2"), "{error}");
+}
+
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn nilket_toron_sql_file_executes_in_order_and_attributes_results() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("toron-sql-file-success");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let local = LiveLocal::spawn(&profile, &log);
+	let path = harness.join("four.sql");
+	std::fs::write(
+		&path,
+		"CREATE TABLE file_one (id BIGINT NOT NULL, label TEXT);\nINSERT INTO file_one (id, label) VALUES (1, 'one'), (2, 'two');\nCREATE TABLE file_two (id BIGINT NOT NULL, label TEXT);\nINSERT INTO file_two (id, label) VALUES (1, 'one'), (2, 'two'), (3, 'three');",
+	)
+		.expect("write SQL file");
+	let output = nilket_command()
+		.args([
+			"toron",
+			"sql",
+			"--endpoint",
+			&local.ready.sql_endpoint.to_string(),
+			"--file",
+			path.to_str().expect("utf8 SQL path"),
+		])
+		.output()
+		.expect("run four-statement SQL file");
+
+	assert!(output.status.success(), "{output:?}");
+	assert!(stderr(&output).is_empty(), "{output:?}");
+	let output_text = stdout(&output);
+	for heading in [
+		"statement 1/4",
+		"statement 2/4",
+		"statement 3/4",
+		"statement 4/4",
+	] {
+		assert_eq!(output_text.matches(heading).count(), 1, "{output_text}");
+	}
+	assert_eq!(output_text.matches("OK").count(), 4, "{output_text}");
+	assert_sql_scalar(
+		local.ready.sql_endpoint,
+		"SELECT COUNT(*) FROM file_one",
+		"2",
+	);
+	assert_sql_scalar(
+		local.ready.sql_endpoint,
+		"SELECT COUNT(*) FROM file_two",
+		"3",
+	);
+	local.stop_gracefully();
+	std::fs::remove_dir_all(harness).expect("remove SQL-file success fixture");
+}
+
+#[test]
+#[ignore = "requires Linux io_uring and the fixed local-profile ports"]
+fn nilket_toron_sql_file_stops_with_partial_application_diagnostic() {
+	let _serial = LIVE_LOCAL_LOCK.lock().expect("live-profile test lock");
+	let harness = fresh_dir("toron-sql-file-partial");
+	let profile = harness.join("profile");
+	let log = harness.join("local.stderr.log");
+	let local = LiveLocal::spawn(&profile, &log);
+	let path = harness.join("partial.sql");
+	let failing = "INSERT INTO missing\n  VALUES (1)";
+	std::fs::write(
+		&path,
+		format!(
+			"CREATE TABLE partial_one (id BIGINT NOT NULL);\nINSERT INTO partial_one (id) VALUES (1), (2);\n{failing};\nCREATE TABLE partial_four (id BIGINT NOT NULL);"
+		),
+	)
+	.expect("write partial SQL file");
+	let output = nilket_command()
+		.args([
+			"toron",
+			"sql",
+			"--endpoint",
+			&local.ready.sql_endpoint.to_string(),
+			"-f",
+			path.to_str().expect("utf8 SQL path"),
+		])
+		.output()
+		.expect("run partial SQL file");
+
+	assert_eq!(output.status.code(), Some(3), "{output:?}");
+	let output_text = stdout(&output);
+	assert!(output_text.contains("statement 1/4"), "{output:?}");
+	assert!(output_text.contains("statement 2/4"), "{output:?}");
+	assert!(!output_text.contains("statement 3/4"), "{output:?}");
+	assert!(!output_text.contains("statement 4/4"), "{output:?}");
+	let error = stderr(&output);
+	assert!(
+		error.contains("statement 3/4 failed after 2 completed statements"),
+		"{error}"
+	);
+	assert!(
+		error.contains("prior effects were not rolled back"),
+		"{error}"
+	);
+	assert!(
+		error.contains(&format!(
+			"--- failing SQL ---\n{failing}\n--- end failing SQL ---"
+		)),
+		"{error}"
+	);
+	assert!(error.contains("Toron CatalogError"), "{error}");
+	assert_sql_scalar(
+		local.ready.sql_endpoint,
+		"SELECT COUNT(*) FROM partial_one",
+		"2",
+	);
+	let tables = assert_sql_success(
+		local.ready.sql_endpoint,
+		"SELECT * FROM information_schema.tables",
+	);
+	assert!(!tables.contains("partial_four"), "{tables}");
+	local.stop_gracefully();
+	std::fs::remove_dir_all(harness).expect("remove SQL-file partial fixture");
 }
 
 #[test]

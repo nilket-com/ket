@@ -1,5 +1,7 @@
+use std::fs::File;
 use std::future::Future;
 use std::io;
+use std::io::Read;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -15,11 +17,86 @@ use tokio_rustls::TlsConnector;
 const DEFAULT_SQL_ENDPOINT: &str = "127.0.0.1:7742";
 const DEFAULT_INSPECT_ENDPOINT: &str = "127.0.0.1:7781";
 pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_SQL_FILE_BYTES: usize = toron_client::SQL_STATEMENT_BYTES_HARD_CEILING as usize;
+const SQL_FILE_PARTIAL_APPLICATION: u8 = 3;
 
 struct SqlClientOptions {
 	endpoint: SocketAddr,
 	tls: Option<SqlClientTlsOptions>,
 	session_timezone: String,
+}
+
+#[derive(Debug)]
+enum SqlSourceArgs<'a> {
+	Positional(&'a [String]),
+	File(PathBuf),
+}
+
+impl SqlSourceArgs<'_> {
+	#[cfg(test)]
+	fn positional(&self) -> Option<&[String]> {
+		match self {
+			Self::Positional(args) => Some(args),
+			Self::File(_) => None,
+		}
+	}
+}
+
+enum SqlRunMode<'a> {
+	Positional,
+	File { path: &'a Path },
+}
+
+enum SqlStatementFailure {
+	Request(toron_client::ClientError),
+	Decode(arrow::error::ArrowError),
+	Render(arrow::error::ArrowError),
+}
+
+impl SqlStatementFailure {
+	fn response_completed(&self) -> bool {
+		matches!(self, Self::Decode(_) | Self::Render(_))
+	}
+
+	fn ordinary_exit(&self) -> ExitCode {
+		match self {
+			Self::Request(error)
+				if matches!(
+					error,
+					toron_client::ClientError::Configuration(_)
+						| toron_client::ClientError::Transport(_)
+						| toron_client::ClientError::TimedOut(
+							toron_client::ClientOperation::Connect
+						)
+				) =>
+			{
+				ExitCode::from(2)
+			}
+			_ => ExitCode::from(1),
+		}
+	}
+
+	fn report(&self) {
+		match self {
+			Self::Request(error) => eprintln!("toron sql request failed: {error}"),
+			Self::Decode(error) => eprintln!("failed to decode toron sql result batch: {error}"),
+			Self::Render(error) => eprintln!("failed to render toron sql results: {error}"),
+		}
+	}
+}
+
+fn sql_failure_exit(
+	mode: &SqlRunMode<'_>,
+	statement_index: usize,
+	failure: &SqlStatementFailure,
+) -> ExitCode {
+	if matches!(mode, SqlRunMode::File { .. })
+		&& (statement_index > 0 || failure.response_completed())
+	{
+		ExitCode::from(SQL_FILE_PARTIAL_APPLICATION)
+	} else {
+		failure.ordinary_exit()
+	}
 }
 
 struct SqlClientTlsOptions {
@@ -104,7 +181,7 @@ where
 		}
 		[verb, rest @ ..] if verb == "sql" && !rest.is_empty() => run_sql(rest),
 		[verb] if verb == "sql" => {
-			eprintln!("toron sql requires <statement...>");
+			eprintln!("toron sql requires <statement...> or --file <path>");
 			ExitCode::from(2)
 		}
 		[verb, rest @ ..] if verb == "inspect" => run_inspect(rest),
@@ -397,18 +474,46 @@ fn render_readiness_text(snapshot: &crate::network::observability::ReadinessSnap
 }
 
 fn run_sql(args: &[String]) -> ExitCode {
-	let (options, statement_args) = match parse_sql_args(args) {
+	let (options, source_args) = match parse_sql_args(args) {
 		Ok(parsed) => parsed,
 		Err(message) => {
 			eprintln!("{message}");
 			return ExitCode::from(2);
 		}
 	};
-	if statement_args.is_empty() {
-		eprintln!("toron sql requires <statement...>");
+	let (source, file_path) = match source_args {
+		SqlSourceArgs::Positional(statement_args) => {
+			if statement_args.is_empty() {
+				eprintln!("toron sql requires <statement...> or --file <path>");
+				return ExitCode::from(2);
+			}
+			(statement_args.join(" "), None)
+		}
+		SqlSourceArgs::File(path) => match read_sql_file(&path) {
+			Ok(source) => (source, Some(path)),
+			Err(message) => {
+				eprintln!("{message}");
+				return ExitCode::from(2);
+			}
+		},
+	};
+	let statements = match crate::sql_planner::split_sql_script(&source) {
+		Ok(statements) if statements.is_empty() => {
+			eprintln!("toron sql source contains no SQL statements");
+			return ExitCode::from(2);
+		}
+		Ok(statements) => statements,
+		Err(error) => {
+			eprintln!("toron sql source could not be tokenized: {error}");
+			return ExitCode::from(2);
+		}
+	};
+	if file_path.is_none() && statements.len() != 1 {
+		eprintln!(
+			"Toron SQL execution accepts exactly one statement per request; use `nilket toron sql --file <path>` for a script"
+		);
 		return ExitCode::from(2);
 	}
-	let statement = statement_args.join(" ");
 	let runtime = match tokio::runtime::Builder::new_multi_thread()
 		.enable_all()
 		.build()
@@ -419,20 +524,41 @@ fn run_sql(args: &[String]) -> ExitCode {
 			return ExitCode::from(2);
 		}
 	};
-	runtime.block_on(run_sql_async(options, statement))
+	let mode = match file_path.as_deref() {
+		Some(path) => SqlRunMode::File { path },
+		None => SqlRunMode::Positional,
+	};
+	runtime.block_on(run_sql_statements_async(options, &statements, mode))
 }
 
-fn parse_sql_args(args: &[String]) -> Result<(SqlClientOptions, &[String]), String> {
+fn parse_sql_args(args: &[String]) -> Result<(SqlClientOptions, SqlSourceArgs<'_>), String> {
 	let mut endpoint_flag: Option<SocketAddr> = None;
 	let mut server_name_flag: Option<String> = None;
 	let mut cert_flag: Option<PathBuf> = None;
 	let mut key_flag: Option<PathBuf> = None;
 	let mut ca_flag: Option<PathBuf> = None;
 	let mut timezone_flag: Option<String> = None;
+	let mut file_path: Option<PathBuf> = None;
 	let mut index = 0usize;
 
 	while let Some(arg) = args.get(index) {
 		match arg.as_str() {
+			"--file" | "-f" => {
+				if file_path.is_some() {
+					return Err("toron sql accepts --file/-f exactly once".to_string());
+				}
+				let value = args
+					.get(index + 1)
+					.ok_or_else(|| "toron sql --file requires <path>".to_string())?;
+				if value.starts_with('-') && value != "-" {
+					return Err("toron sql --file requires <path>".to_string());
+				}
+				if value == "-" {
+					return Err("toron sql --file does not accept standard input (`-`)".to_string());
+				}
+				file_path = Some(PathBuf::from(value));
+				index += 2;
+			}
 			"--endpoint" => {
 				let value = args
 					.get(index + 1)
@@ -541,21 +667,66 @@ fn parse_sql_args(args: &[String]) -> Result<(SqlClientOptions, &[String]), Stri
 		);
 	};
 	let session_timezone = timezone_flag.unwrap_or_else(detect_local_timezone);
+	let positional = &args[index..];
+	if file_path.is_none()
+		&& positional
+			.iter()
+			.any(|arg| matches!(arg.as_str(), "--file" | "-f"))
+	{
+		return Err("toron sql --file is mutually exclusive with positional SQL".to_string());
+	}
+	if file_path.is_some() && !positional.is_empty() {
+		return Err("toron sql --file is mutually exclusive with positional SQL".to_string());
+	}
+	let source = match file_path {
+		Some(path) => SqlSourceArgs::File(path),
+		None => SqlSourceArgs::Positional(positional),
+	};
 	Ok((
 		SqlClientOptions {
 			endpoint,
 			tls,
 			session_timezone,
 		},
-		&args[index..],
+		source,
 	))
+}
+
+fn read_sql_file(path: &Path) -> Result<String, String> {
+	let file = File::open(path)
+		.map_err(|error| format!("toron sql --file {}: {error}", path.display()))?;
+	read_sql_source_with_limit(file, MAX_SQL_FILE_BYTES)
+		.map_err(|error| format!("toron sql --file {}: {error}", path.display()))
+}
+
+fn read_sql_source_with_limit(reader: impl Read, limit: usize) -> Result<String, String> {
+	let read_limit = u64::try_from(limit).unwrap_or(u64::MAX).saturating_add(1);
+	let mut bytes = Vec::with_capacity(limit.min(64 * 1024));
+	reader
+		.take(read_limit)
+		.read_to_end(&mut bytes)
+		.map_err(|error| format!("failed to read SQL source: {error}"))?;
+	if bytes.len() > limit {
+		return Err(format!("SQL source exceeds the {limit}-byte limit"));
+	}
+	String::from_utf8(bytes).map_err(|_| "SQL source is not valid UTF-8".to_string())
 }
 
 fn detect_local_timezone() -> String {
 	iana_time_zone::get_timezone().unwrap_or_else(|_| "UTC".to_string())
 }
 
+#[cfg(test)]
 async fn run_sql_async(options: SqlClientOptions, statement: String) -> ExitCode {
+	let statements = [statement.as_str()];
+	run_sql_statements_async(options, &statements, SqlRunMode::Positional).await
+}
+
+async fn run_sql_statements_async(
+	options: SqlClientOptions,
+	statements: &[&str],
+	mode: SqlRunMode<'_>,
+) -> ExitCode {
 	let endpoint = options.endpoint;
 	let client = match options.tls {
 		Some(tls) => toron_client::ToronClient::authenticated(
@@ -572,48 +743,75 @@ async fn run_sql_async(options: SqlClientOptions, statement: String) -> ExitCode
 	let client = match client {
 		Ok(client) => client,
 		Err(error) => {
+			if let SqlRunMode::File { path } = mode {
+				print_sql_file_failure(path, 0, statements, 0);
+			}
 			eprintln!("failed to initialize Toron SQL client for {endpoint}: {error}");
 			return ExitCode::from(2);
 		}
 	};
-	let result = match client
-		.execute_with_timezone(&statement, &options.session_timezone)
-		.await
-	{
-		Ok(result) => result,
-		Err(error) => {
-			eprintln!("toron sql request failed: {error}");
-			return if matches!(
-				error,
-				toron_client::ClientError::Configuration(_)
-					| toron_client::ClientError::Transport(_)
-					| toron_client::ClientError::TimedOut(toron_client::ClientOperation::Connect)
-			) {
-				ExitCode::from(2)
-			} else {
-				ExitCode::from(1)
-			};
+	for (statement_index, statement) in statements.iter().enumerate() {
+		match execute_and_render_sql(&client, statement, &options.session_timezone).await {
+			Ok(rendered) => {
+				if matches!(mode, SqlRunMode::File { .. }) {
+					println!("statement {}/{}", statement_index + 1, statements.len());
+				}
+				println!("{rendered}");
+			}
+			Err(failure) => {
+				if let SqlRunMode::File { path } = mode {
+					print_sql_file_failure(path, statement_index, statements, statement_index);
+				}
+				let exit = sql_failure_exit(&mode, statement_index, &failure);
+				failure.report();
+				return exit;
+			}
 		}
-	};
+	}
+	ExitCode::SUCCESS
+}
 
+async fn execute_and_render_sql(
+	client: &toron_client::ToronClient,
+	statement: &str,
+	session_timezone: &str,
+) -> Result<String, SqlStatementFailure> {
+	let result = client
+		.execute_with_timezone(statement, session_timezone)
+		.await
+		.map_err(SqlStatementFailure::Request)?;
 	let mut batches = Vec::new();
 	for batch in &result.batches {
-		if let Err(error) = decode_sql_batch(batch, &mut batches) {
-			eprintln!("failed to decode toron sql result batch: {error}");
-			return ExitCode::from(1);
-		}
+		decode_sql_batch(batch, &mut batches).map_err(SqlStatementFailure::Decode)?;
 	}
 	if batches.is_empty() {
 		if result.row_count == 0 {
-			println!("OK");
+			Ok("OK".to_string())
 		} else {
-			println!("OK rows={}", result.row_count);
+			Ok(format!("OK rows={}", result.row_count))
 		}
-	} else if let Err(error) = render_batches(&batches) {
-		eprintln!("failed to render toron sql results: {error}");
-		return ExitCode::from(1);
+	} else {
+		format_batches_for_display(&batches).map_err(SqlStatementFailure::Render)
 	}
-	ExitCode::SUCCESS
+}
+
+fn print_sql_file_failure(
+	path: &Path,
+	statement_index: usize,
+	statements: &[&str],
+	completed: usize,
+) {
+	let statement = statements.get(statement_index).copied().unwrap_or_default();
+	eprintln!(
+		"toron sql --file {}: statement {}/{} failed after {} completed statements; prior effects were not rolled back",
+		path.display(),
+		statement_index + 1,
+		statements.len(),
+		completed
+	);
+	eprintln!("--- failing SQL ---");
+	eprintln!("{statement}");
+	eprintln!("--- end failing SQL ---");
 }
 
 fn decode_sql_batch(
@@ -627,11 +825,6 @@ fn decode_sql_batch(
 	Ok(())
 }
 
-fn render_batches(batches: &[RecordBatch]) -> Result<(), arrow::error::ArrowError> {
-	println!("{}", format_batches_for_display(batches)?);
-	Ok(())
-}
-
 fn format_batches_for_display(batches: &[RecordBatch]) -> Result<String, arrow::error::ArrowError> {
 	let total_rows = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
 	let rendered = arrow_cast::pretty::pretty_format_batches(batches)?;
@@ -640,7 +833,7 @@ fn format_batches_for_display(batches: &[RecordBatch]) -> Result<String, arrow::
 
 fn print_usage(program: &str) {
 	eprintln!(
-		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql [--endpoint <socket-addr>] [--timezone <iana-timezone>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] <statement...>\n  {program} inspect [--endpoint <socket-addr>] --server-name <dns-name> --cert <path> --key <path> --ca <path> [--json]"
+		"usage:\n  {program} start <path/to/toron.toml>\n  {program} --print-example-config\n  {program} --write-example-config <path>\n  {program} sql [--endpoint <socket-addr>] [--timezone <iana-timezone>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] <statement...>\n  {program} sql [--endpoint <socket-addr>] [--timezone <iana-timezone>] [--server-name <dns-name>] [--cert <path>] [--key <path>] [--ca <path>] (--file|-f) <path>\n  {program} inspect [--endpoint <socket-addr>] --server-name <dns-name> --cert <path> --key <path> --ca <path> [--json]"
 	);
 }
 
@@ -748,10 +941,10 @@ mod tests {
 		let (options, statement) = parse_sql_args(&cli_args).expect("timezone flag parses");
 
 		assert_eq!(options.session_timezone, "America/Chicago");
-		assert_eq!(statement, &cli_args[2..]);
+		assert_eq!(statement.positional().unwrap(), &cli_args[2..]);
 		let frame = crate::sql_wire::SqlFrame::execute_with_timezone(
 			crate::distributed::identity::QueryId::from_u128(150),
-			statement.join(" "),
+			statement.positional().unwrap().join(" "),
 			None,
 			options.session_timezone,
 		);
@@ -776,7 +969,90 @@ mod tests {
 		let (options, statement) = parse_sql_args(&cli_args).expect("default timezone parses");
 
 		assert_eq!(options.session_timezone, detected);
-		assert_eq!(statement, &cli_args[..]);
+		assert_eq!(statement.positional().unwrap(), &cli_args[..]);
+	}
+
+	#[test]
+	fn cli_sql_file_source_is_exclusive_and_exactly_once() {
+		let _guard = SQL_ENV_LOCK.lock().expect("lock SQL env");
+		clear_sql_env();
+
+		for flag in ["--file", "-f"] {
+			let cli_args = args(&[flag, "fixture.sql"]);
+			let (_, source) = parse_sql_args(&cli_args).expect("file source parses");
+			assert!(
+				matches!(source, SqlSourceArgs::File(path) if path == Path::new("fixture.sql"))
+			);
+		}
+		for cli_args in [
+			args(&["--file"]),
+			args(&["--file", "-"]),
+			args(&["--file", "one.sql", "-f", "two.sql"]),
+			args(&["--file", "one.sql", "SELECT", "1"]),
+			args(&["SELECT", "1", "--file", "one.sql"]),
+		] {
+			assert!(parse_sql_args(&cli_args).is_err(), "accepted {cli_args:?}");
+		}
+	}
+
+	#[test]
+	fn bounded_sql_reader_accepts_limit_and_refuses_limit_plus_one() {
+		struct Unreadable;
+		impl Read for Unreadable {
+			fn read(&mut self, _buffer: &mut [u8]) -> io::Result<usize> {
+				Err(io::Error::new(
+					io::ErrorKind::PermissionDenied,
+					"fixture denied",
+				))
+			}
+		}
+
+		let accepted = read_sql_source_with_limit(io::Cursor::new(b"1234"), 4)
+			.expect("exact limit is admitted");
+		assert_eq!(accepted, "1234");
+		assert_eq!(
+			read_sql_source_with_limit(io::Cursor::new(b"12345"), 4).unwrap_err(),
+			"SQL source exceeds the 4-byte limit"
+		);
+		assert_eq!(
+			read_sql_source_with_limit(io::Cursor::new([0xff]), 4).unwrap_err(),
+			"SQL source is not valid UTF-8"
+		);
+		assert_eq!(
+			read_sql_source_with_limit(Unreadable, 4).unwrap_err(),
+			"failed to read SQL source: fixture denied"
+		);
+		assert_eq!(
+			MAX_SQL_FILE_BYTES,
+			toron_client::SQL_STATEMENT_BYTES_HARD_CEILING as usize
+		);
+	}
+
+	#[test]
+	fn partial_application_exit_requires_completed_response_evidence() {
+		let file = SqlRunMode::File {
+			path: Path::new("fixture.sql"),
+		};
+		let transport = SqlStatementFailure::Request(toron_client::ClientError::Transport(
+			"fixture".to_string(),
+		));
+		let decoded_response = SqlStatementFailure::Decode(arrow::error::ArrowError::ParseError(
+			"fixture".to_string(),
+		));
+
+		assert_eq!(sql_failure_exit(&file, 0, &transport), ExitCode::from(2));
+		assert_eq!(
+			sql_failure_exit(&file, 1, &transport),
+			ExitCode::from(SQL_FILE_PARTIAL_APPLICATION)
+		);
+		assert_eq!(
+			sql_failure_exit(&file, 0, &decoded_response),
+			ExitCode::from(SQL_FILE_PARTIAL_APPLICATION)
+		);
+		assert_eq!(
+			sql_failure_exit(&SqlRunMode::Positional, 1, &decoded_response),
+			ExitCode::from(1)
+		);
 	}
 
 	fn clear_sql_env() {
@@ -893,6 +1169,80 @@ mod tests {
 					}),
 				);
 				crate::sql_wire::write_frame(&mut stream, &response)
+					.await
+					.expect("write SQL complete");
+				let _ = stream.finish().await;
+				tokio::time::sleep(Duration::from_millis(25)).await;
+			})
+		}
+
+		fn spawn_complete_many(
+			&self,
+			count: usize,
+		) -> tokio::task::JoinHandle<Vec<(String, String)>> {
+			let endpoint = self.endpoint.clone();
+			tokio::spawn(async move {
+				let mut requests = Vec::with_capacity(count);
+				for _ in 0..count {
+					let mut stream = endpoint.accept_stream().await.expect("accept SQL stream");
+					let frame = crate::sql_wire::read_frame(&mut stream)
+						.await
+						.expect("read SQL request");
+					let crate::sql_wire::SqlMessage::Execute(request) = frame.message else {
+						panic!("unexpected SQL request frame")
+					};
+					requests.push((request.statement, request.session_timezone));
+					if requests.len() < count {
+						assert!(
+							tokio::time::timeout(
+								Duration::from_millis(25),
+								endpoint.accept_stream()
+							)
+							.await
+							.is_err(),
+							"next SQL statement was dispatched before the prior response completed"
+						);
+					}
+					let response = crate::sql_wire::SqlFrame::response(
+						frame.query_id,
+						crate::sql_wire::SqlMessage::Complete(crate::sql_wire::Complete {
+							row_count: 0,
+						}),
+					);
+					crate::sql_wire::write_frame(&mut stream, &response)
+						.await
+						.expect("write SQL complete");
+					let _ = stream.finish().await;
+					tokio::time::sleep(Duration::from_millis(25)).await;
+				}
+				requests
+			})
+		}
+
+		fn spawn_invalid_batch_once(&self) -> tokio::task::JoinHandle<()> {
+			let endpoint = self.endpoint.clone();
+			tokio::spawn(async move {
+				let mut stream = endpoint.accept_stream().await.expect("accept SQL stream");
+				let frame = crate::sql_wire::read_frame(&mut stream)
+					.await
+					.expect("read SQL request");
+				let batch = crate::sql_wire::SqlFrame::response(
+					frame.query_id,
+					crate::sql_wire::SqlMessage::ResultBatch(crate::sql_wire::ResultBatch {
+						batch_index: 0,
+						arrow_ipc_bytes: serde_bytes::ByteBuf::from(vec![0xff]),
+					}),
+				);
+				crate::sql_wire::write_frame(&mut stream, &batch)
+					.await
+					.expect("write invalid result batch");
+				let complete = crate::sql_wire::SqlFrame::response(
+					frame.query_id,
+					crate::sql_wire::SqlMessage::Complete(crate::sql_wire::Complete {
+						row_count: 0,
+					}),
+				);
+				crate::sql_wire::write_frame(&mut stream, &complete)
 					.await
 					.expect("write SQL complete");
 				let _ = stream.finish().await;
@@ -1520,7 +1870,7 @@ mod tests {
 		assert_eq!(tls.cert_path, PathBuf::from("client.pem"));
 		assert_eq!(tls.key_path, PathBuf::from("client.key"));
 		assert_eq!(tls.ca_path, PathBuf::from("ca.pem"));
-		assert_eq!(parsed.1, &cli_args[10..]);
+		assert_eq!(parsed.1.positional().unwrap(), &cli_args[10..]);
 	}
 
 	#[test]
@@ -1551,7 +1901,7 @@ mod tests {
 		assert_eq!(tls.cert_path, PathBuf::from("env-client.pem"));
 		assert_eq!(tls.key_path, PathBuf::from("env-client.key"));
 		assert_eq!(tls.ca_path, PathBuf::from("env-ca.pem"));
-		assert_eq!(parsed.1, &cli_args[..]);
+		assert_eq!(parsed.1.positional().unwrap(), &cli_args[..]);
 
 		clear_sql_env();
 	}
@@ -1597,7 +1947,7 @@ mod tests {
 		assert_eq!(tls.cert_path, PathBuf::from("flag-client.pem"));
 		assert_eq!(tls.key_path, PathBuf::from("flag-client.key"));
 		assert_eq!(tls.ca_path, PathBuf::from("flag-ca.pem"));
-		assert_eq!(parsed.1, &cli_args[10..]);
+		assert_eq!(parsed.1.positional().unwrap(), &cli_args[10..]);
 
 		clear_sql_env();
 	}
@@ -1632,7 +1982,7 @@ mod tests {
 			]);
 			let parsed = parse_sql_args(&cli_args).expect("flag TLS options parse");
 			clear_sql_env();
-			(parsed.0, parsed.1.join(" "))
+			(parsed.0, parsed.1.positional().unwrap().join(" "))
 		};
 		assert_successful_sql_client(flags_options, flags_statement).await;
 		tokio::time::timeout(Duration::from_secs(2), flags_handle)
@@ -1659,7 +2009,7 @@ mod tests {
 			let cli_args = args(&["SELECT", "1"]);
 			let parsed = parse_sql_args(&cli_args).expect("env TLS options parse");
 			clear_sql_env();
-			(parsed.0, parsed.1.join(" "))
+			(parsed.0, parsed.1.positional().unwrap().join(" "))
 		};
 		assert_successful_sql_client(env_options, env_statement).await;
 		tokio::time::timeout(Duration::from_secs(2), env_handle)
@@ -1699,13 +2049,95 @@ mod tests {
 			]);
 			let parsed = parse_sql_args(&cli_args).expect("override TLS options parse");
 			clear_sql_env();
-			(parsed.0, parsed.1.join(" "))
+			(parsed.0, parsed.1.positional().unwrap().join(" "))
 		};
 		assert_successful_sql_client(override_options, override_statement).await;
 		tokio::time::timeout(Duration::from_secs(2), override_handle)
 			.await
 			.expect("override SQL server completed")
 			.expect("override SQL server task");
+	}
+
+	#[tokio::test]
+	async fn sql_file_requests_are_ordered_and_share_authored_timezone() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(154);
+		let pki = CliSqlPki::generate(worker_id, "1");
+		let server = MinimalSqlServer::start(worker_id, &pki);
+		let handle = server.spawn_complete_many(3);
+		let server_name = crate::network::tls::canonical_daemon_dns_name(
+			&worker_id,
+			crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+		);
+		let options = SqlClientOptions {
+			endpoint: server.connect_addr,
+			tls: Some(SqlClientTlsOptions {
+				server_name,
+				cert_path: pki.client_cert.clone(),
+				key_path: pki.client_key.clone(),
+				ca_path: pki.ca_cert.clone(),
+			}),
+			session_timezone: "Pacific/Auckland".to_string(),
+		};
+		let statements = ["SELECT 1", "CREATE LOGICAL TYPE P AS Int64", "SELECT 3"];
+
+		let exit = run_sql_statements_async(
+			options,
+			&statements,
+			SqlRunMode::File {
+				path: Path::new("ordered.sql"),
+			},
+		)
+		.await;
+		let requests = tokio::time::timeout(Duration::from_secs(3), handle)
+			.await
+			.expect("all requests arrived")
+			.expect("recording server task");
+
+		assert_eq!(exit, ExitCode::SUCCESS);
+		assert_eq!(
+			requests,
+			vec![
+				("SELECT 1".to_string(), "Pacific/Auckland".to_string()),
+				(
+					"CREATE LOGICAL TYPE P AS Int64".to_string(),
+					"Pacific/Auckland".to_string()
+				),
+				("SELECT 3".to_string(), "Pacific/Auckland".to_string()),
+			]
+		);
+	}
+
+	#[tokio::test]
+	async fn completed_response_with_local_decode_failure_is_partial_application() {
+		let worker_id = crate::distributed::identity::WorkerId::from_u128(155);
+		let pki = CliSqlPki::generate(worker_id, "1");
+		let server = MinimalSqlServer::start(worker_id, &pki);
+		let handle = server.spawn_invalid_batch_once();
+		let options = SqlClientOptions {
+			endpoint: server.connect_addr,
+			tls: Some(SqlClientTlsOptions {
+				server_name: crate::network::tls::canonical_daemon_dns_name(
+					&worker_id,
+					crate::network::tls::DEFAULT_CLUSTER_DOMAIN,
+				),
+				cert_path: pki.client_cert.clone(),
+				key_path: pki.client_key.clone(),
+				ca_path: pki.ca_cert.clone(),
+			}),
+			session_timezone: "UTC".to_string(),
+		};
+
+		let exit = run_sql_statements_async(
+			options,
+			&["SELECT * FROM fixture"],
+			SqlRunMode::File {
+				path: Path::new("decode.sql"),
+			},
+		)
+		.await;
+		handle.await.expect("invalid batch server task");
+
+		assert_eq!(exit, ExitCode::from(SQL_FILE_PARTIAL_APPLICATION));
 	}
 
 	#[tokio::test]
