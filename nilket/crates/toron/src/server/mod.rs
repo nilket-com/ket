@@ -1612,8 +1612,10 @@ mod tests {
 	use arrow::datatypes::{DataType, Field, Schema};
 	use std::sync::Arc;
 	use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+	use std::task::{Context, Poll};
 	use std::time::Duration;
 	use tokio::io::duplex as test_duplex;
+	use tokio::io::{AsyncRead, ReadBuf};
 	use tokio::sync::{Notify, mpsc};
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, RuntimeFilterBloom,
@@ -2726,6 +2728,50 @@ mod tests {
 			.expect_err("active exchange loss remains an error");
 		assert!(matches!(error, QueryError::Io(_)));
 		endpoint.close();
+	}
+
+	struct ConnectionResetReader;
+
+	impl AsyncRead for ConnectionResetReader {
+		fn poll_read(
+			self: std::pin::Pin<&mut Self>,
+			_context: &mut Context<'_>,
+			_buffer: &mut ReadBuf<'_>,
+		) -> Poll<std::io::Result<()>> {
+			Poll::Ready(Err(std::io::Error::from(
+				std::io::ErrorKind::ConnectionReset,
+			)))
+		}
+	}
+
+	#[tokio::test]
+	async fn tcp_reset_is_clean_only_after_a_completed_terminal_exchange() {
+		let memory = MemoryManager::new(1, 1024);
+		let completed = read_worker_envelope(
+			&mut ConnectionResetReader,
+			&memory,
+			WorkerConnectionPhase::BetweenCompletedExchanges,
+		)
+		.await;
+		assert!(
+			matches!(completed, Ok(None)),
+			"a reset after a complete terminal response is clean: {completed:?}"
+		);
+
+		let active = read_worker_envelope(
+			&mut ConnectionResetReader,
+			&memory,
+			WorkerConnectionPhase::ActiveExchange,
+		)
+		.await;
+		assert!(
+			matches!(
+				active,
+				Err(QueryError::Io(ref error))
+					if error.kind() == std::io::ErrorKind::ConnectionReset
+			),
+			"the same reset before a terminal response must remain fatal: {active:?}"
+		);
 	}
 
 	#[tokio::test]
@@ -4956,11 +5002,15 @@ where
 		Ok(_) => {}
 		Err(error)
 			if phase == WorkerConnectionPhase::BetweenCompletedExchanges
-				&& error.kind() == std::io::ErrorKind::NotConnected =>
+				&& matches!(
+					error.kind(),
+					std::io::ErrorKind::NotConnected | std::io::ErrorKind::ConnectionReset
+				) =>
 		{
 			// Quinn maps a connection disappearing after its final response to
-			// NotConnected. At this exact protocol boundary no work is active;
-			// the same error before a terminal response remains a failure.
+			// NotConnected; TCP can report ConnectionReset when a short-lived
+			// acknowledgement connection closes. At this exact protocol boundary no
+			// work is active; either error before a terminal response remains a failure.
 			return Ok(None);
 		}
 		Err(error) => return Err(error.into()),
