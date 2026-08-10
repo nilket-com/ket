@@ -1820,3 +1820,102 @@ fn product_0057_rendering_oracle_licenses_are_schema_bound() {
 		"PNG and AVIF must both rasterize the SVG stream"
 	);
 }
+
+#[test]
+fn product_0071_chrome_consumes_the_guarded_title_status_and_menu_models() {
+	let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let state = std::fs::read_to_string(source_root.join("gui/state.rs"))
+		.expect("read Polariton GUI state");
+	assert_eq!(
+		state.matches(".title(\"Polariton\")").count(),
+		1,
+		"PRODUCT-0071 native application title must be the product constant"
+	);
+	assert!(
+		!state.contains("fn application_title"),
+		"PRODUCT-0063's unconsumed dynamic title helper must not return"
+	);
+	assert!(
+		!state.contains("Polariton — session"),
+		"opaque durable identity must not return to application chrome"
+	);
+	let copy_branch = state
+		.split("Message::CopySessionId =>")
+		.nth(1)
+		.expect("copy-session action")
+		.split("Message::MenuAction")
+		.next()
+		.expect("bounded copy-session action");
+	assert!(copy_branch.contains("iced::clipboard::write(session_identity_text(session_id))"));
+
+	let components = std::fs::read_to_string(source_root.join("gui/components.rs"))
+		.expect("read Polariton GUI components");
+	let title_bar = components
+		.split("pub fn title_bar")
+		.nth(1)
+		.expect("custom title bar")
+		.split("pub fn main_screen")
+		.next()
+		.expect("bounded custom title bar");
+	assert_eq!(
+		title_bar.matches("text(\"Polariton\")").count(),
+		1,
+		"custom title bar must consume the same constant product identity"
+	);
+	assert!(
+		!title_bar.contains("session"),
+		"custom title bar must not receive persistence presentation state"
+	);
+
+	let main_screen = components
+		.split("pub fn main_screen")
+		.nth(1)
+		.expect("main screen")
+		.split("fn status_detail_overlay")
+		.next()
+		.expect("bounded main screen");
+	let status_binding = main_screen
+		.split("let status_bar: Element<'a, Message> =")
+		.nth(1)
+		.expect("production status model binding")
+		.split("let status_bar: Element<'a, Message> =")
+		.next()
+		.expect("bounded production status model binding");
+	assert_eq!(status_binding.matches("app_status_bar(").count(), 1);
+	assert!(
+		status_binding.contains(")\n\t.view();"),
+		"main screen must render the StatusBar model returned by app_status_bar"
+	);
+	assert!(
+		!main_screen.contains("durable session"),
+		"main screen must not reconstruct the tested status label"
+	);
+
+	let status_builder = components
+		.split("fn app_status_bar(")
+		.nth(1)
+		.expect("application status builder")
+		.split("pub fn menu_bar")
+		.next()
+		.expect("bounded application status builder");
+	assert_eq!(
+		status_builder
+			.matches("Segment::text(\"durable session\")")
+			.count(),
+		1,
+		"durable attachment text must have one production producer"
+	);
+
+	let menu_bar = components
+		.split("pub fn menu_bar")
+		.nth(1)
+		.expect("menu bar")
+		.split("fn build_menu_roots")
+		.next()
+		.expect("bounded menu bar");
+	assert!(menu_bar.contains("MenuBar::new("));
+	assert!(
+		menu_bar.contains("build_menu_roots(saved_session, close_without_checkpoint)"),
+		"MenuBar must consume the tested MenuRoot model without reconstructing it"
+	);
+}

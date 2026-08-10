@@ -189,6 +189,7 @@ pub fn main_screen<'a>(
 		status_time_elapsed,
 		editor_spinner_phase,
 		adapter_state,
+		saved_session,
 	)
 	.view();
 	let status_bar: Element<'a, Message> = if let Some((detail, _)) = status_detail {
@@ -344,6 +345,7 @@ fn app_status_bar(
 	status_time_elapsed: Option<Duration>,
 	editor_spinner_phase: Option<usize>,
 	adapter_state: &AdapterState,
+	saved_session: bool,
 ) -> StatusBar {
 	let (connection_label, connection_tone) = match adapter_state.stage {
 		AdapterStage::Connected => ("connected", Tone::Success),
@@ -363,8 +365,11 @@ fn app_status_bar(
 			adapter_state.selection.adapter_type_str(),
 		)
 	};
-	let mut bar = StatusBar::new()
-		.lane_split(2, 5)
+	let mut bar = StatusBar::new().lane_split(2, 5);
+	if saved_session {
+		bar = bar.left(Segment::text("durable session"));
+	}
+	bar = bar
 		.left(Segment::toned_text(connection_label, connection_tone))
 		.left(Segment::text(target_label));
 	if let Some(phase) = editor_spinner_phase {
@@ -645,7 +650,8 @@ pub fn styled_text_input<'a, Message: Clone + 'a>(
 
 #[cfg(test)]
 mod tests {
-	use super::build_menu_roots;
+	use super::{app_status_bar, build_menu_roots};
+	use crate::adapters::driver::AdapterState;
 	use crate::gui::menu::MenuItem;
 
 	fn action_ids(saved_session: bool, close_without_checkpoint: bool) -> Vec<String> {
@@ -671,6 +677,71 @@ mod tests {
 
 		let failed_close = action_ids(true, true);
 		assert!(failed_close.contains(&"session:close-without-checkpoint".to_owned()));
+	}
+
+	#[test]
+	fn product_0071_durable_session_segment_names_attachment_not_freshness() {
+		let adapter = AdapterState::default();
+		let ephemeral = app_status_bar("", "", None, None, None, &adapter, false);
+		let durable = app_status_bar("", "", None, None, None, &adapter, true);
+		let checkpointed =
+			app_status_bar("Session checkpointed", "", None, None, None, &adapter, true);
+		let failed = app_status_bar("", "checkpoint failed", None, None, None, &adapter, true);
+
+		let durable_segment = ("left", "durable session");
+		assert!(
+			!ephemeral
+				.product_0071_text_segments()
+				.contains(&durable_segment),
+			"ephemeral authority must not render the durable attachment segment"
+		);
+		for (label, bar) in [
+			("ordinary", durable),
+			("checkpointed", checkpointed),
+			("failed", failed),
+		] {
+			let segments = bar.product_0071_text_segments();
+			assert_eq!(
+				segments
+					.iter()
+					.filter(|segment| **segment == durable_segment)
+					.count(),
+				1,
+				"{label} durable authority must expose exactly one attachment segment"
+			);
+			assert!(
+				segments
+					.iter()
+					.filter(|(lane, _)| *lane == "left")
+					.map(|(_, text)| text.to_ascii_lowercase())
+					.all(|text| ["saved", "clean", "dirty"]
+						.iter()
+						.all(|claim| !text.contains(claim))),
+				"persistent attachment chrome must not claim publication freshness"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0071_session_menu_keeps_identity_behind_the_copy_action() {
+		let roots = build_menu_roots(true, false);
+		let session = roots
+			.iter()
+			.find(|root| root.id == "session")
+			.expect("saved authority has one Session menu");
+		let labels = session
+			.items
+			.iter()
+			.map(|item| match item {
+				MenuItem::Action { label, .. } | MenuItem::Submenu { label, .. } => label.as_str(),
+				MenuItem::Separator => "<separator>",
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(labels, ["Checkpoint", "Copy session ID"]);
+		assert!(
+			labels.iter().all(|label| !label.contains("12345678")),
+			"the menu names the exact-copy action without displaying identity bytes"
+		);
 	}
 }
 

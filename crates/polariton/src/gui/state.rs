@@ -444,7 +444,7 @@ pub fn run(startup_data: StartupData, target: StartupTarget) -> Result {
 	application(initialize, update, view)
 		.subscription(subscription)
 		.theme(components::theme())
-		.title(application_title)
+		.title("Polariton")
 		// Canvas geometry (plot marks, gridlines, legend swatches) is
 		// tessellated triangles; without MSAA every curved edge is aliased
 		// hard enough to read as rasterization. Text is unaffected either way.
@@ -583,13 +583,6 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		None,
 		app_state.session_id.is_some(),
 		app_state.saved_close_state == SavedCloseState::Failed,
-	)
-}
-
-fn application_title(app_state: &AppState) -> String {
-	app_state.session_id.map_or_else(
-		|| "Polariton".to_owned(),
-		|session_id| format!("Polariton — session {}", session_identity_text(session_id)),
 	)
 }
 
@@ -2162,10 +2155,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				return Task::none();
 			};
 			app_state.status_error.clear();
-			app_state.status_msg = format!(
-				"Attaching local workspace session {}…",
-				ready.identity.session_nonce
-			);
+			app_state.status_msg = "Attaching Toron workspace…".to_owned();
 			let endpoint = ready.sql_endpoint.to_string();
 			let message_workspace = ready.clone();
 			return Task::perform(
@@ -2206,10 +2196,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					app_state.adapter_state.local_workspace =
 						Some(nilket_local::LocalWorkspace::Ready(workspace.clone()));
 					app_state.status_error.clear();
-					app_state.status_msg = format!(
-						"Joined local workspace session {}.",
-						workspace.identity.session_nonce
-					);
+					app_state.status_msg = "Joined Toron workspace.".to_owned();
 				}
 				Err(cause) => {
 					let unhealthy = nilket_local::LocalWorkspace::Unhealthy {
@@ -3151,9 +3138,9 @@ mod tests {
 		resolve_rune_table_skin_with, rune_view_outcome,
 	};
 	use super::{
-		application_title, clear_transient_execution_status_on_editor_activity,
-		compact_rune_diagnostic, compact_sql_diagnostic, new, resolve_startup,
-		session_identity_text, set_rune_error, set_sql_error, update,
+		clear_transient_execution_status_on_editor_activity, compact_rune_diagnostic,
+		compact_sql_diagnostic, new, resolve_startup, session_identity_text, set_rune_error,
+		set_sql_error, update,
 	};
 	use crate::adapters::common::ExecutionResult;
 	#[cfg(feature = "toron")]
@@ -3201,16 +3188,11 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0063_window_title_names_only_saved_sessions() {
+	fn product_0071_copied_identity_remains_the_exact_cli_authority() {
 		let (mut state, startup) = new(StartupData::default(), None);
 		drop(startup);
-		assert_eq!(application_title(&state), "Polariton");
 		let id = "1234567890abcdef1234567890abcdef".parse().unwrap();
 		state.session_id = Some(id);
-		assert_eq!(
-			application_title(&state),
-			"Polariton — session 1234567890abcdef1234567890abcdef"
-		);
 		let copied = session_identity_text(id);
 		assert_eq!(copied.as_bytes().len(), 32);
 		assert_eq!(copied, "1234567890abcdef1234567890abcdef");
@@ -3267,10 +3249,6 @@ mod tests {
 		let (mut state, startup) = new_with_authority(StartupData::default(), authority).unwrap();
 		drop(startup);
 		assert_eq!(state.session_id, Some(session_id));
-		assert_eq!(
-			application_title(&state),
-			format!("Polariton — session {session_id}")
-		);
 
 		let contention = resolve_startup(super::StartupTarget::OpenSaved(session_id));
 		let Err(contention) = contention else {
@@ -4217,10 +4195,12 @@ mod tests {
 			1,
 			"Ready is the positive control for connection construction"
 		);
+		assert_eq!(state.status_msg, "Attaching Toron workspace…");
 		assert!(
-			state
+			!state
 				.status_msg
-				.contains(&ready.identity.session_nonce.to_string())
+				.contains(&ready.identity.session_nonce.to_string()),
+			"ordinary chrome must not expose the Toron workspace nonce"
 		);
 		assert!(state.local_creation.offer().is_none());
 		state.code_editor.shutdown();
@@ -4243,6 +4223,41 @@ mod tests {
 			"rendering must not synchronously await discovery"
 		);
 		drop(startup);
+		state.code_editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0071_joined_toron_workspace_chrome_omits_the_nonce() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let workspace = ReadyWorkspace {
+			sql_endpoint: "127.0.0.1:9".parse().unwrap(),
+			identity: local_identity(),
+		};
+		let nonce = workspace.identity.session_nonce.to_string();
+		let connection: Arc<RwLock<dyn DatabaseAdapter>> =
+			Arc::new(RwLock::new(RecordingRuneAdapter {
+				calls: Arc::new(Mutex::new(Vec::new())),
+				fail_table: None,
+			}));
+
+		assert_eq!(
+			update(
+				&mut state,
+				Message::LocalWorkspaceAttached {
+					workspace,
+					connection: Ok(connection),
+				},
+			)
+			.units(),
+			0
+		);
+		assert_eq!(state.status_msg, "Joined Toron workspace.");
+		assert!(
+			!state.status_msg.contains(&nonce),
+			"ordinary chrome must not expose the Toron workspace nonce"
+		);
 		state.code_editor.shutdown();
 	}
 

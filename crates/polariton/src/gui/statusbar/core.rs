@@ -298,6 +298,24 @@ impl StatusBar {
 		.width(Length::Fill)
 		.into()
 	}
+
+	/// PRODUCT-0071 test-only observation of the text already stored in the
+	/// production status model. It deliberately performs no presentation
+	/// formatting and is unavailable to production code.
+	#[cfg(test)]
+	pub(crate) fn product_0071_text_segments(&self) -> Vec<(&'static str, &str)> {
+		self.left
+			.iter()
+			.filter_map(|segment| match segment {
+				Segment::Text { value, .. } => Some(("left", value.as_str())),
+				_ => None,
+			})
+			.chain(self.right.iter().filter_map(|segment| match segment {
+				Segment::Text { value, .. } => Some(("right", value.as_str())),
+				_ => None,
+			}))
+			.collect()
+	}
 }
 
 fn lane<Message: 'static>(
