@@ -3802,6 +3802,27 @@ impl MetricsRegistry {
 		);
 	}
 
+	/// Ensure every declared per-index series exists, without disturbing values.
+	///
+	/// Declaration initializes these once, but a process restart recovers indexes from
+	/// the durable catalog without replaying declaration — so a recovered index would
+	/// emit no refusal series at all. A counter family with no labelled entry is
+	/// *absence*, not a zero baseline: the operator cannot tell "no refusals" from
+	/// "not reporting", and a confirmation run cannot record a refusal delta it never
+	/// observes. Idempotent, so the coverage driver may call it on every tick.
+	pub fn initialize_storage_secondary_index_series(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		index_object_id: IndexObjectId,
+	) {
+		self.storage_secondary_index_lookup_refusals.initialize(
+			tenant_id,
+			table_object_id,
+			index_object_id,
+		);
+	}
+
 	pub fn observe_storage_secondary_index_lookup_refusal(
 		&self,
 		tenant_id: TenantId,

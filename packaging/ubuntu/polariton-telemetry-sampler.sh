@@ -43,16 +43,32 @@ sql() {
 	timeout -k 5 -s TERM 30 "$NILKET_BIN" toron sql "$1" >/dev/null 2>&1
 }
 
+# Probe existence rather than matching error strings. Attempting the DDL and
+# classifying the failure text is brittle: once a schema generation advances (a
+# secondary index declaration is enough), `CREATE TABLE` on an existing table is
+# rejected with a generation mismatch rather than "already exists". That text did
+# not match, `tables_ready` stayed 0, and the sampler then silently sampled nothing
+# for as long as it ran. A read probe cannot be fooled that way.
+table_exists() {
+	timeout -k 5 -s TERM 30 "$NILKET_BIN" toron sql "SELECT * FROM $1 LIMIT 0" >/dev/null 2>&1
+}
+
 ensure_tables() {
-	local out
+	local out name
 	for ddl in \
 		"CREATE TABLE polariton_process_samples (sampled_at BIGINT, process TEXT, pid BIGINT, rss_kb BIGINT, vsz_kb BIGINT, fds BIGINT, threads BIGINT, cpu_secs DOUBLE)" \
 		"CREATE TABLE polariton_health_samples (sampled_at BIGINT, endpoint TEXT, status TEXT, latency_ms DOUBLE)" \
 		"CREATE TABLE polariton_metric_samples (sampled_at BIGINT, name TEXT, labels TEXT, value DOUBLE)"; do
+		name="${ddl#CREATE TABLE }"
+		name="${name%% *}"
+		table_exists "$name" && continue
 		out="$(timeout -k 5 -s TERM 30 "$NILKET_BIN" toron sql "$ddl" 2>&1)" || {
 			case "$out" in
 			*"already exists"*) ;;
-			*) return 1 ;;
+			*)
+				echo "sampler: ensure_tables failed for $name: $out" >&2
+				return 1
+				;;
 			esac
 		}
 	done

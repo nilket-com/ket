@@ -279,6 +279,22 @@ impl SlabManager {
 			descriptor.index_object_id,
 			durable_gaps,
 		);
+		// Declaration initializes the declared series once; a restart recovers indexes
+		// from the durable catalog without replaying it. Re-asserting every declared
+		// per-index series here is idempotent and keeps a recovered index observable,
+		// so absence never has to be read as zero. Both confirmation axes are covered:
+		// the gap gauge above, and the failure-record gauge plus refusal counter here.
+		metrics().set_storage_secondary_index_uncovered_slabs(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+			tracker.uncovered_slabs().count() as u64,
+		);
+		metrics().initialize_storage_secondary_index_series(
+			tenant_id,
+			descriptor.table_object_id,
+			descriptor.index_object_id,
+		);
 		let candidates = historical_slabs
 			.into_iter()
 			.filter(|slab_id| !tracker.is_covered(*slab_id))

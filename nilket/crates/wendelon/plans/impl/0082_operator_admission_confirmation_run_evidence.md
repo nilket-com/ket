@@ -92,63 +92,91 @@ live-proven.
 
 ---
 
-# Supplement — in-window rotation, 2026-08-10
+# Supplement — in-window rotation via sampler scrapes, 2026-08-10
 
-Closes ADR 0541 Acceptance 5's in-window rotation condition, which the run above did not meet.
-The preserved `confirm0082` profile was restarted rather than re-run for fifty minutes.
+An earlier attempt at this supplement used direct endpoint reads and could not record a
+refusal delta at all. Both defects it exposed were repaired before this run; the repairs are
+part of ADR 0081, not footnotes.
 
-Measurements are read **directly from the metrics endpoint** with the operator certificate,
-which is the authoritative source; the sampler table is only a copy of it.
+## Repairs made first
 
-## Restart survival (bonus, live)
+1. **Declared per-index series now survive restart.** Declaration initialized them once, but a
+   restart recovers indexes from the durable catalog without replaying declaration, so a
+   recovered index emitted no refusal series — and *absence is not a zero baseline*. A new
+   idempotent `initialize_storage_secondary_index_series`, plus a per-tick re-assert of the
+   failure-record gauge from the tracker's real count, run inside
+   `ensure_secondary_index_coverage`. Both confirmation axes and the refusal counter are now
+   present on every driver tick.
 
-After restart the first index reported `ready … 1:complete:gaps=0` — declaration, lifecycle
-state and the durable per-replica receipt all survived, with coverage recomputed. ADR 0081
-Acceptance 7 is therefore live-proven, not only unit-proven.
+2. **The sampler no longer decides idempotence by error text.** Root cause of its silent stall:
+   `TableSchemaRequest::create()` hardcodes `expected_generation: ZERO`, so once any schema
+   mutation advances the tenant generation — declaring an index is enough — a duplicate
+   `CREATE TABLE` is rejected with a *generation mismatch*, not "already exists". The generation
+   check precedes the existence check. That text did not match `ensure_tables`' case-glob, so it
+   returned 1, `tables_ready` stayed 0, and the sampler sampled nothing for as long as it ran
+   while looking healthy. It now probes existence and reports failures to stderr.
 
-## Sequence and readings — index 1 (`637a1b2a…`, on `name`)
+   Not fixed here, and recorded as a separate finding: a duplicate create should report
+   existence before generation mismatch.
 
-| Point | `query_plans_total{mode="indexed"}` | `candidate_rows_total` | `coverage_gap_slabs` | `uncovered_slabs_total` |
+## Sequence — all readings from 60-second sampler scrapes
+
+Index 1 = `637a1b2a…` on `name`. Rotation forced by declaring an index on another table
+(`polariton_health_samples.endpoint`); all supported columns on the metrics table were already
+indexed, and `value` was correctly rejected with
+`INDEX_REJECT_UNSUPPORTED_COLUMN_TYPE: column value has type Float64`.
+
+| Scrape | slabs | `coverage_gap_slabs` | `lookup_refusals_total` | `uncovered_slabs_total` |
 | --- | --- | --- | --- | --- |
-| Pre-rotation baseline | 10 | 9 | 0 | 0 |
-| After 4 pre-rotation lookups | **14** (+4) | **21** (+12) | 0 | 0 |
-| *Second index created → slabs 2 → 3, in-window rotation* | | | | |
-| After 4 post-rotation lookups | **18** (+4) | **249** (+228) | **0** | **0** |
+| `1786329816` pre-rotation | 4 | 0.0 | **0.0 explicit** | **0.0 explicit** |
+| *declaration → rotation* | 4 → 5 | | | |
+| `1786330000` post-rotation | 5 | **1.0** | **4.0** | 0.0 |
+| `1786330260` | 5 | 0.0 | 4.0 | 0.0 |
+| `1786330322` | 5 | 0.0 | 4.0 | 0.0 |
 
-`entries_indexed_total` for index 1 reached 45,505 with `segments_built_total` 1 and a single
-backfill of 1.035 s, i.e. the index was rebuilt across the new slab and kept serving.
+All three series are present pre-rotation, so the deltas are *recorded*, not inferred from
+absence — which is what the previous supplement could not do.
 
-The delta shape is the point: `query_plans_total` moves exactly with the lookup count (+4 each
-time), proving **selection**; `candidate_rows_total` moves by much more, proving the selections
-produced **nonempty hits**. Neither number alone would show both.
-
-## Index 1's three declared measurements, spanning the rotation
+## The three declared measurements
 
 | Measurement | Result |
 | --- | --- |
-| Gap wall-time fraction | **0** — `coverage_gap_slabs` 0 before and after the rotation |
-| Refusal counter delta | **0** |
-| Gauge-versus-uncovered divergence | **0** — both axes 0, i.e. they agree |
+| Gap wall-time fraction | **1 of 67 scrapes ≈ 1.5%**, entirely the rotation window |
+| Refusal counter delta | **+4** — one per post-rotation lookup, then stable |
+| Gauge-versus-uncovered divergence | **nonzero and observed**: `coverage_gap_slabs` 1 while `uncovered_slabs_total` 0 |
 
-## Two honest gaps in this supplement
+The divergence is the most valuable reading in the arc. ADR 0539 predicted exactly this shape —
+a rotation-window gap with no failure record, where the old gauge reads healthy while lookups
+refuse — and no prior run could produce it because the gap set was never non-empty. Here it is,
+measured: the invariant axis moved, the failure-record axis did not, and the refusal gate fired
+on the invariant.
 
-- **Index 1 emits no `lookup_refusals_total` series**; index 2 emits it explicitly at 0. Both
-  are consistent with zero refusals, but absence and an explicit zero are not the same
-  observation, and the refusal figure for index 1 is inferred from absence rather than read.
-- **The restarted sampler produced zero scrapes** in ~12 minutes despite the process looping,
-  the metrics endpoint returning HTTP 200 with 250 KB, the ready endpoint returning 200, and a
-  direct `INSERT` succeeding. `ensure_tables` tolerates the real "table already exists" text, so
-  that is not the cause. Unexplained, and recorded as a defect to chase: it means the sampler
-  cannot resume against an existing profile, which is why every prior run needed a fresh one.
-  It did not affect this supplement, which read metrics directly.
+## Behaviour observed, for the record
 
-One synthetic row (`name='supplement_probe'`) was inserted into `polariton_metric_samples`
-while testing the write path; it remains in the preserved profile.
+A rotation transiently opens a coverage gap on an already-`Ready` index, and ADR 0539's gate
+refuses lookups against it until backfill closes the gap — here within one scrape interval.
+That is the designed behaviour, not a defect: refusing is correct while coverage is incomplete.
+It is recorded because it is the first live evidence of the rotation-window refusal that ADR
+0541 anticipated, and it bounds the cost at roughly one scrape interval at this write rate.
 
-## Disposition after the supplement
+## Also live-proven
 
-- ADR 0541 Acceptance 5 — **passed**: index created explicitly through the production surface,
-  series present before the window opened, ingest and first-index lookups sustained **across an
-  in-window rotation**, all three declared measurements recorded.
+Restart survival: after restart the index reported `ready … 1:complete:gaps=0`, so declaration,
+lifecycle state and the durable per-replica receipt survived with coverage recomputed — ADR 0081
+Acceptance 7, live rather than unit-only.
+
+## Residue
+
+One synthetic row (`name='supplement_probe'`) remains in `polariton_metric_samples` in the
+preserved profile, from testing the write path during diagnosis.
+
+## Disposition
+
+- ADR 0541 Acceptance 5 — **passed**: index created explicitly through the production surface;
+  all declared series present before the window opened; ingest and first-index lookups sustained
+  across an **in-window** rotation; all three measurements recorded from 60-second sampler
+  scrapes, with nonzero values.
 - ADR 0539 Acceptance 6 — **met**.
-- ADR 0081 Acceptance 7 — live-proven by the restart above.
+- ADR 0081 Acceptance 7 — live-proven.
+- ADR 0082 — sealable independently; its Data Ring and Raft negatives and cross-domain rejection
+  are control-based acceptance by design, not outstanding live requirements.
