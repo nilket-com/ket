@@ -2671,6 +2671,125 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0070_faceted_areas_share_domains_panel_blind_colors_and_one_legend() {
+		use crate::plot::legend::LegendSection;
+		use crate::plot::spec::{
+			CategoricalPaletteSelection, ColorIdentity, resolve_channels,
+			resolve_domains_with_categorical_palette,
+		};
+
+		let frame = df!(
+			"facet" => ["North", "North", "North", "North", "South", "South", "South", "South"],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon", "Atlas", "Beacon", "Atlas", "Beacon"],
+			"x" => [1.0_f64, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0],
+			"y" => [2.0_f64, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+		)
+		.unwrap();
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::StackedArea),
+			"x",
+			"y",
+			Some("series".to_owned()),
+		);
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0070".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("blues").unwrap();
+		let (resolved, _) = resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.unwrap();
+		let assignments = resolved.channel(Channel::Color).unwrap().colors.clone();
+		let grid = PlotGrid::value_facet(
+			Arc::new(resolved),
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).unwrap(),
+		)
+		.unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let settings = ResolvedPlotSettings::default();
+		let layouts = kernel.cell_layouts(settings.clone());
+		assert_eq!(layouts.len(), 2);
+		let cartesian = layouts
+			.iter()
+			.map(|(_, layout)| match layout {
+				PlotLayout::Cartesian {
+					x_range,
+					y_range,
+					x_axis_type,
+					y_axis_type,
+				} => (*x_range, *y_range, *x_axis_type, *y_axis_type),
+				_ => panic!("area facets remain Cartesian"),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			cartesian[0], cartesian[1],
+			"faceted areas share one Cartesian x/y domain and remain congruent"
+		);
+		let legend = crate::plot::legend::union(
+			kernel
+				.cells
+				.iter()
+				.filter_map(|cell| cell.kernel.legend_content(&settings)),
+		)
+		.expect("one unioned area legend");
+		let LegendSection::Entries(entries) = legend.0.first() else {
+			panic!("area grid legend entries")
+		};
+		assert_eq!(entries.len(), assignments.len());
+		for (entry, assignment) in entries.iter().zip(&assignments) {
+			assert_eq!(entry.label, assignment.category);
+			assert_eq!(
+				entry.swatch,
+				iced::Color::from_rgba8(
+					assignment.color.red,
+					assignment.color.green,
+					assignment.color.blue,
+					assignment.color.alpha as f32 / u8::MAX as f32,
+				)
+			);
+		}
+
+		let model = PlotSettings::default();
+		let mut backend = SvgBackend::new(800.0, 400.0);
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: model.resolve(),
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0)),
+		);
+		let svg = backend.finish();
+		for assignment in assignments {
+			let fill = format!(
+				"fill=\"rgb({}, {}, {})\"",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert_eq!(
+				svg.matches(&fill).count(),
+				3,
+				"one panel-blind assignment paints one region in each facet cell plus one figure-level swatch"
+			);
+		}
+	}
+
+	#[test]
 	fn product_0056_faceted_horizontal_labels_payloads_and_colors_flip_together() {
 		use crate::plot::legend::LegendSection;
 		use crate::plot::spec::{

@@ -1,7 +1,7 @@
 # The plotting language as built
 
-Derived 2026-08-06 from PRODUCT-0007, PRODUCT-0008, and PRODUCT-0010 through
-PRODUCT-0040. This document states backward what exists. It contains no decision
+Derived 2026-08-09 from PRODUCT-0007, PRODUCT-0008, and PRODUCT-0010 through
+PRODUCT-0070. This document states backward what exists. It contains no decision
 that is not already in a record; every claim carries its citation, and where two
 records disagree the later one governs and the supersession is noted. Companion
 documents: `consistency_audit.md`, `deferred_ledger.md`, `live_bridges.md`.
@@ -177,6 +177,16 @@ zero and proceed in legend order along the numeric axis. `bar_width` and
 canonical positive-finite segment sequence remain the data semantics (0064
 §§1–8).
 
+Area is a fourth authored standalone mark word and resolves to the sole
+`StackedArea` member; it is not a line modifier and is not admitted to
+`layers([...])`. X is quantitative or temporal, y is quantitative, and the
+optional series channel is categorical. Series stack baseline-outward in the
+resolved display-domain order (first appearance on the automatic dashboard
+path); duplicate `(x, series)` rows are first-row-wins and non-finite or
+non-positive samples are clamped once in the prepared matrix. The three-field
+form consumes exact resolved colours for fills and named swatches; the
+two-field synthetic entry is omitted (0069–0070).
+
 ## 9. Color: one authority, several projections
 
 Libaryon is the sole theme authority: `Theme::try_new` owns names, aliases, and
@@ -306,7 +316,7 @@ lookup, not evaluation; `let t = compute()` and `a + b` remain refusals. The
 distinction 0016 §4 lumped together is now split: a named literal exists in the
 source at parse time. Refusal attributes to the argument's span and names the
 binding (0040 §4). Bindings are retained, never peeled (0040 §5). Coverage is
-figure elements plus every established bar, line, and scatter field position,
+figure elements plus every established bar, line, scatter, and area field position,
 including legacy and relation sugar, canonical/named views, figure bodies,
 modified marks, and accepted x/y fields inside layers (0058). Mark fields
 resolve to concrete strings before dispatch; schema/channel resolution and

@@ -2,6 +2,9 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings, format_label, polars_type_to_axis_type,
 };
+use crate::plot::legend::{
+	LegendProvenance, LegendSample, entries_from_pairs_with_sample_and_provenance,
+};
 use crate::plot::spec::CategoryColorAssignment;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
@@ -12,6 +15,36 @@ use std::sync::Arc;
 
 pub struct StackedAreaPlotKernel {
 	pub prepared_data: Arc<StackedAreaPreparedData>,
+	pub series_colors: Vec<CategoryColorAssignment>,
+}
+
+impl StackedAreaPlotKernel {
+	fn series_color(&self, category_index: usize, settings: &ResolvedPlotSettings) -> iced::Color {
+		let category = &self.prepared_data.categories[category_index];
+		self.series_colors
+			.iter()
+			.find(|assignment| assignment.category == *category)
+			.map(|assignment| {
+				iced::Color::from_rgba8(
+					assignment.color.red,
+					assignment.color.green,
+					assignment.color.blue,
+					assignment.color.alpha as f32 / u8::MAX as f32,
+				)
+			})
+			.unwrap_or_else(|| {
+				if self.series_colors.is_empty() {
+					let total = self.prepared_data.categories.len();
+					settings.color_theme.get_color(if total > 1 {
+						category_index as f32 / (total - 1) as f32
+					} else {
+						0.5
+					})
+				} else {
+					panic!("resolved area series {category:?} has no color assignment")
+				}
+			})
+	}
 }
 
 impl PlotKernel for StackedAreaPlotKernel {
@@ -52,12 +85,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 			{
 				continue;
 			}
-			let t = if num_cats > 1 {
-				cat_idx as f32 / (num_cats - 1) as f32
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(t);
+			let color = self.series_color(cat_idx, &settings);
 			for x_idx in 0..num_xs {
 				current_stacked_ys[x_idx] =
 					prev_stacked_ys[x_idx] + self.prepared_data.category_values[cat_idx][x_idx];
@@ -143,9 +171,14 @@ impl PlotKernel for StackedAreaPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
-			self.prepared_data.categories.iter().cloned(),
-			settings,
+		entries_from_pairs_with_sample_and_provenance(
+			self.prepared_data
+				.categories
+				.iter()
+				.enumerate()
+				.map(|(index, category)| (category.clone(), self.series_color(index, settings))),
+			LegendSample::Swatch,
+			self.prepared_data.series_provenance,
 		)
 	}
 
@@ -168,6 +201,7 @@ pub struct StackedAreaPreparedData {
 	pub y_axis_type: AxisType,
 	pub x_label: String,
 	pub y_label: String,
+	pub series_provenance: LegendProvenance,
 }
 
 pub fn prepare_stacked_area_data(
@@ -220,6 +254,11 @@ fn prepare_stacked_area_data_inner(
 			y_axis_type: AxisType::Linear,
 			x_label: x_col.to_string(),
 			y_label: y_col.to_string(),
+			series_provenance: if cat_col.is_empty() {
+				LegendProvenance::Synthetic
+			} else {
+				LegendProvenance::Named
+			},
 		};
 	}
 	let x_dtype = df
@@ -280,6 +319,11 @@ fn prepare_stacked_area_data_inner(
 			y_axis_type,
 			x_label: x_col.to_string(),
 			y_label: y_col.to_string(),
+			series_provenance: if cat_col.is_empty() {
+				LegendProvenance::Synthetic
+			} else {
+				LegendProvenance::Named
+			},
 		};
 	}
 	let mut category_values = vec![vec![0.0f64; num_xs]; num_cats];
@@ -355,6 +399,11 @@ fn prepare_stacked_area_data_inner(
 		y_axis_type,
 		x_label: x_col.to_string(),
 		y_label: y_col.to_string(),
+		series_provenance: if cat_col.is_empty() {
+			LegendProvenance::Synthetic
+		} else {
+			LegendProvenance::Named
+		},
 	}
 }
 
@@ -413,7 +462,9 @@ mod product_0068_tests {
 				y_axis_type: AxisType::Linear,
 				x_label: "x".to_owned(),
 				y_label: "y".to_owned(),
+				series_provenance: LegendProvenance::Named,
 			}),
+			series_colors: Vec::new(),
 		};
 		let decoration = Color::from_rgb8(12, 34, 56);
 		let settings = ResolvedPlotSettings {
@@ -450,7 +501,7 @@ mod product_0068_tests {
 mod product_0069_tests {
 	use super::*;
 	use crate::plot::export::SvgBackend;
-	use crate::plot::legend::LegendSection;
+	use crate::plot::legend::{LegendSection, apply_policy};
 	use crate::plot::spec::{PalettePosition, ResolvedColor};
 	use iced::widget::canvas::Text;
 	use iced::{Color, Point, Size};
@@ -496,6 +547,7 @@ mod product_0069_tests {
 		);
 		let automatic = StackedAreaPlotKernel {
 			prepared_data: Arc::new(automatic),
+			series_colors: Vec::new(),
 		};
 		assert_eq!(legend_labels(&automatic), ["Zulu", "Alpha"]);
 
@@ -510,6 +562,7 @@ mod product_0069_tests {
 		assert_eq!(resolved.category_values, [vec![5.0, 7.0], vec![2.0, 3.0]]);
 		let resolved = StackedAreaPlotKernel {
 			prepared_data: Arc::new(resolved),
+			series_colors: Vec::new(),
 		};
 		assert_eq!(legend_labels(&resolved), ["Alpha", "Zulu"]);
 	}
@@ -619,6 +672,7 @@ mod product_0069_tests {
 
 		let kernel = StackedAreaPlotKernel {
 			prepared_data: Arc::new(prepared),
+			series_colors: Vec::new(),
 		};
 		let settings = ResolvedPlotSettings::default();
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 140.0));
@@ -686,9 +740,11 @@ mod product_0069_tests {
 			y_axis_type: AxisType::Linear,
 			x_label: "x".to_owned(),
 			y_label: "y".to_owned(),
+			series_provenance: LegendProvenance::Named,
 		};
 		let kernel = StackedAreaPlotKernel {
 			prepared_data: Arc::new(prepared),
+			series_colors: Vec::new(),
 		};
 		assert_eq!(kernel.prepared_data.categories, ["Atlas", "Beacon"]);
 		assert_eq!(
@@ -734,11 +790,89 @@ mod product_0069_tests {
 		};
 		let banked = StackedAreaPlotKernel {
 			prepared_data: Arc::new(banked),
+			series_colors: Vec::new(),
 		};
 		assert_eq!(
 			render_svg(&kernel),
 			render_svg(&banked),
 			"alphabetical, unique, positive stacked areas remain byte-identical to the banked preparation"
+		);
+	}
+
+	#[test]
+	fn product_0070_resolved_colors_reach_fills_and_legend_while_two_field_is_synthetic() {
+		let frame = polars::df!(
+			"x" => [0_i64, 0, 1, 1],
+			"series" => ["Beacon", "Atlas", "Beacon", "Atlas"],
+			"y" => [2.0_f64, 5.0, 3.0, 7.0],
+		)
+		.unwrap();
+		let assignments = [assignment("Atlas", 0, 2), assignment("Beacon", 1, 2)];
+		let prepared =
+			prepare_stacked_area_data_with_resolved_order(&frame, "series", "x", "y", &assignments);
+		let kernel = StackedAreaPlotKernel {
+			prepared_data: Arc::new(prepared),
+			series_colors: assignments.to_vec(),
+		};
+		let settings = ResolvedPlotSettings::default();
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 140.0));
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = GeometryBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		let exact = assignments
+			.iter()
+			.map(|assignment| {
+				Color::from_rgba8(
+					assignment.color.red,
+					assignment.color.green,
+					assignment.color.blue,
+					1.0,
+				)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			backend.fill_colors, exact,
+			"area fills consume resolved assignments rather than reconstructing the ramp"
+		);
+		let legend = kernel.legend_content(&settings).unwrap();
+		let LegendSection::Entries(entries) = legend.sections().next().unwrap() else {
+			panic!("named area legend is categorical")
+		};
+		assert_eq!(
+			entries
+				.iter()
+				.map(|entry| entry.label.as_str())
+				.collect::<Vec<_>>(),
+			["Atlas", "Beacon"]
+		);
+		assert_eq!(
+			entries.iter().map(|entry| entry.swatch).collect::<Vec<_>>(),
+			exact,
+			"legend swatches and fills must share the same resolved colors"
+		);
+
+		let one = polars::df!("x" => [0_i64, 1], "y" => [2.0_f64, 3.0]).unwrap();
+		let one = StackedAreaPlotKernel {
+			prepared_data: Arc::new(prepare_stacked_area_data(&one, "", "x", "y")),
+			series_colors: Vec::new(),
+		};
+		let content = one
+			.legend_content(&settings)
+			.expect("synthetic content remains observable");
+		let LegendSection::Entries(entries) = content.sections().next().unwrap() else {
+			panic!("synthetic area legend is categorical")
+		};
+		assert_eq!(entries.first().provenance, LegendProvenance::Synthetic);
+		assert!(
+			apply_policy(content).is_none(),
+			"the unnamed two-field area must not retain an All Data legend"
 		);
 	}
 }

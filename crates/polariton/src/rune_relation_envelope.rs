@@ -126,7 +126,7 @@ impl StyledRunePlotSink {
 		let mark = match self.sink.composition.primary_plot_type() {
 			PlotType::Line => LayerMark::Line,
 			PlotType::Scatter => LayerMark::Scatter,
-			PlotType::Bar => return Err(self),
+			PlotType::Bar | PlotType::StackedArea => return Err(self),
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
 		};
 		let mut layer = LayerSpec::xy(mark, self.sink.x, self.sink.y);
@@ -173,6 +173,7 @@ pub(crate) enum RuneViewForm {
 	Bar,
 	Line,
 	Scatter,
+	Area,
 }
 
 #[cfg(test)]
@@ -183,6 +184,7 @@ impl From<RuneViewForm> for ViewPresentation {
 			RuneViewForm::Bar => (ViewContentKind::Plot, "plot.bar"),
 			RuneViewForm::Line => (ViewContentKind::Plot, "plot.line"),
 			RuneViewForm::Scatter => (ViewContentKind::Plot, "plot.scatter"),
+			RuneViewForm::Area => (ViewContentKind::Plot, "plot.area"),
 		};
 		Self {
 			content_kind,
@@ -206,6 +208,7 @@ impl RuneViewIntent {
 						PlotType::Bar => "plot.bar".to_owned(),
 						PlotType::Line => "plot.line".to_owned(),
 						PlotType::Scatter => "plot.scatter".to_owned(),
+						PlotType::StackedArea => "plot.area".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -215,6 +218,7 @@ impl RuneViewIntent {
 							PlotType::Bar => "plot.bar".to_owned(),
 							PlotType::Line => "plot.line".to_owned(),
 							PlotType::Scatter => "plot.scatter".to_owned(),
+							PlotType::StackedArea => "plot.area".to_owned(),
 							other => {
 								unreachable!("styled sink admitted unexpected plot type {other:?}")
 							}
@@ -242,6 +246,7 @@ impl RuneViewIntent {
 			(ViewContentKind::Plot, "plot.bar") => RuneViewForm::Bar,
 			(ViewContentKind::Plot, "plot.line") => RuneViewForm::Line,
 			(ViewContentKind::Plot, "plot.scatter") => RuneViewForm::Scatter,
+			(ViewContentKind::Plot, "plot.area") => RuneViewForm::Area,
 			_ => panic!("a composite presentation has no legacy RuneViewForm"),
 		}
 	}
@@ -455,7 +460,7 @@ impl std::fmt::Display for RuneEnvelopeError {
 	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
 		match self {
 			Self::NoTerminalView => formatter.write_str(
-				"Rune relation views use top-level table(relation), plot.bar(relation, \"x\", \"y\"), plot.line(relation, \"x\", \"y\"), or plot.scatter(relation, \"x\", \"y\")",
+				"Rune relation views use top-level table(relation), plot.bar(relation, \"x\", \"y\"), plot.line(relation, \"x\", \"y\"), plot.scatter(relation, \"x\", \"y\"), or plot.area(relation, \"x\", \"y\")",
 			),
 			Self::RecognizedNoOutput => {
 				formatter.write_str("Rune view set is bound but has no output root")
@@ -1004,10 +1009,27 @@ fn provenance_method_on_relation(
 				literal_bindings,
 			)?],
 		})),
+		"area" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
+			relation,
+			root,
+			origin,
+			sinks: vec![parse_sugar_sink(
+				PlotType::StackedArea,
+				call,
+				args,
+				source,
+				literal_bindings,
+			)?],
+		})),
 		"line" => invalid_view(
 			call.span(),
 			source.len(),
 			"line view sugar requires x and y strings with an optional series",
+		),
+		"area" => invalid_view(
+			call.span(),
+			source.len(),
+			"area view sugar requires x and y strings with an optional series",
 		),
 		"table" if args.is_empty() => Ok(Some(ExpressionProvenance::ViewSet {
 			relation,
@@ -1125,7 +1147,7 @@ fn parse_contextual_sink_inner(
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"a views list element must be scatter(...), bar(...), line(...), or table()",
+			"a views list element must be scatter(...), bar(...), line(...), area(...), or table()",
 		);
 	};
 	let callee = source_slice(source, call.expr.span())?.trim();
@@ -1177,6 +1199,10 @@ fn parse_contextual_sink_inner(
 			let sink = plot_sink_fields(PlotType::Line, source, &args, 0, literal_bindings)?;
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
 		}
+		"area" if matches!(args.len(), 2 | 3) => {
+			let sink = plot_sink_fields(PlotType::StackedArea, source, &args, 0, literal_bindings)?;
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
+		}
 		"layers" => {
 			let specification = parse_layer_list(expression, &args, source, literal_bindings)?;
 			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Layered(specification)))
@@ -1202,6 +1228,13 @@ fn parse_contextual_sink_inner(
 				"line(...) takes x and y strings with an optional series",
 			);
 		}
+		"area" => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"area(...) takes x and y strings with an optional series",
+			);
+		}
 		"scatter" => {
 			return invalid_view(
 				expression.span(),
@@ -1213,7 +1246,7 @@ fn parse_contextual_sink_inner(
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"unknown view sink; expected scatter(...), bar(...), line(...), table(), layers([...]), or figure([...])",
+				"unknown view sink; expected scatter(...), bar(...), line(...), area(...), table(), layers([...]), or figure([...])",
 			);
 		}
 	};
@@ -2197,6 +2230,7 @@ fn parse_figure_body(
 		"bar" if matches!(args.len(), 2 | 3) => single(PlotType::Bar),
 		"line" if matches!(args.len(), 2 | 3) => single(PlotType::Line),
 		"scatter" if matches!(args.len(), 2 | 3) => single(PlotType::Scatter),
+		"area" if matches!(args.len(), 2 | 3) => single(PlotType::StackedArea),
 		"layers" => Ok(RunePlotBody::Layered(parse_layer_list(
 			expression,
 			args,
@@ -2233,10 +2267,15 @@ fn parse_figure_body(
 			source.len(),
 			"scatter(...) takes x and y strings with an optional category",
 		),
+		"area" => invalid_view(
+			expression.span(),
+			source.len(),
+			"area(...) takes x and y strings with an optional series",
+		),
 		_ => invalid_view(
 			expression.span(),
 			source.len(),
-			"unknown figure child; expected one bar, line, scatter, or layers plot body",
+			"unknown figure child; expected one bar, line, scatter, area, or layers plot body",
 		),
 	}
 }
@@ -2310,7 +2349,7 @@ fn parse_layer(
 				"layers([...]) cannot be nested inside a layer list",
 			);
 		}
-		"table" | "bar" => {
+		"table" | "bar" | "area" => {
 			return invalid_view(
 				expression.span(),
 				source.len(),
@@ -2546,7 +2585,7 @@ fn parse_modified_mark(
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"a layer modifier must follow a bar(...), line(...), or scatter(...) mark",
+				"a layer modifier must follow a bar(...), line(...), scatter(...), or area(...) mark",
 			);
 		};
 		let ast::Expr::FieldAccess(field) = call.expr.as_ref() else {
@@ -2669,7 +2708,7 @@ fn parse_modified_mark(
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"a layer modifier must follow a bar(...), line(...), or scatter(...) mark",
+			"a layer modifier must follow a bar(...), line(...), scatter(...), or area(...) mark",
 		);
 	};
 	let callee = source_slice(source, root.expr.span())?.trim();
@@ -2678,11 +2717,12 @@ fn parse_modified_mark(
 		"bar" => PlotType::Bar,
 		"line" => PlotType::Line,
 		"scatter" => PlotType::Scatter,
+		"area" => PlotType::StackedArea,
 		_ => {
 			return invalid_view(
 				expression.span(),
 				source.len(),
-				"a layer modifier must follow a bar(...), line(...), or scatter(...) mark",
+				"a layer modifier must follow a bar(...), line(...), scatter(...), or area(...) mark",
 			);
 		}
 	};
@@ -2691,6 +2731,7 @@ fn parse_modified_mark(
 	// color field in standalone positions.
 	let arity_ok = match plot_type {
 		PlotType::Line => matches!(args.len(), 2 | 3),
+		PlotType::StackedArea => matches!(args.len(), 2 | 3),
 		_ => matches!(args.len(), 2 | 3),
 	};
 	if !arity_ok {
@@ -2700,6 +2741,9 @@ fn parse_modified_mark(
 			match plot_type {
 				PlotType::Line => "a modified line takes x and y strings with an optional series",
 				PlotType::Bar => "a modified bar takes x and y strings with an optional series",
+				PlotType::StackedArea => {
+					"a modified area takes x and y strings with an optional series"
+				}
 				_ => "a modified scatter takes x and y strings with an optional category",
 			},
 		);
@@ -2726,11 +2770,25 @@ fn parse_modified_mark(
 				"point_size(...) and stroke_width(...) are not available on bar marks",
 			);
 		}
+		PlotType::StackedArea if point_size.is_some() || stroke_width.is_some() => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"point_size(...) and stroke_width(...) are not available on area marks",
+			);
+		}
 		PlotType::Line | PlotType::Scatter if bar_width.is_some() => {
 			return invalid_view(
 				expression.span(),
 				source.len(),
 				"bar_width(...) is available on bar marks, not line or scatter marks",
+			);
+		}
+		PlotType::StackedArea if bar_width.is_some() => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"bar_width(...) is available on bar marks, not area marks",
 			);
 		}
 		PlotType::Line | PlotType::Scatter if category_gap.is_some() => {
@@ -2740,6 +2798,13 @@ fn parse_modified_mark(
 				"category_gap(...) is available on bar marks, not line or scatter marks",
 			);
 		}
+		PlotType::StackedArea if category_gap.is_some() => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"category_gap(...) is available on bar marks, not area marks",
+			);
+		}
 		PlotType::Line | PlotType::Scatter if stacked => {
 			return invalid_view(
 				expression.span(),
@@ -2747,13 +2812,20 @@ fn parse_modified_mark(
 				"stacked() is available on bar marks, not line or scatter marks",
 			);
 		}
+		PlotType::StackedArea if stacked => {
+			return invalid_view(
+				expression.span(),
+				source.len(),
+				"stacked() is available on bar marks, not area marks",
+			);
+		}
 		_ => {}
 	}
-	if in_layer && (plot_type == PlotType::Bar || args.len() == 3) {
+	if in_layer && (matches!(plot_type, PlotType::Bar | PlotType::StackedArea) || args.len() == 3) {
 		return invalid_view(
 			expression.span(),
 			source.len(),
-			"bar(...) is a view sink, not a shared-Cartesian layer",
+			format!("{callee}(...) is a view sink, not a shared-Cartesian layer"),
 		);
 	}
 	let mut fields = Vec::with_capacity(args.len());
@@ -2816,7 +2888,9 @@ fn parse_sugar_sink(
 ) -> Result<ParsedSink, RuneEnvelopeError> {
 	let valid_arity = match plot_type {
 		PlotType::Line => matches!(args.len(), 2 | 3),
-		PlotType::Bar | PlotType::Scatter => matches!(args.len(), 2 | 3),
+		PlotType::Bar | PlotType::Scatter | PlotType::StackedArea => {
+			matches!(args.len(), 2 | 3)
+		}
 		_ => false,
 	};
 	if !valid_arity {
@@ -2826,6 +2900,9 @@ fn parse_sugar_sink(
 			}
 			PlotType::Bar => "bar view sugar requires x and y strings with an optional series",
 			PlotType::Line => "line view sugar requires x and y strings with an optional series",
+			PlotType::StackedArea => {
+				"area view sugar requires x and y strings with an optional series"
+			}
 			_ => unreachable!("only Rune plot view forms reach sugar parsing"),
 		};
 		return invalid_view(call.span(), source.len(), message);
@@ -2975,6 +3052,20 @@ fn recognize_view_root(
 				call.span(),
 				source.len(),
 				"plot.line(...) takes a relation plus x and y strings with an optional series",
+			);
+		}
+		"plot.area" if !shadows.plot && matches!(args.len(), 3 | 4) => {
+			let sink = plot_sink(PlotType::StackedArea, source, &args, literal_bindings)?;
+			(
+				RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink))),
+				args[0],
+			)
+		}
+		"plot.area" if !shadows.plot => {
+			return invalid_view(
+				call.span(),
+				source.len(),
+				"plot.area(...) takes a relation plus x and y strings with an optional series",
 			);
 		}
 		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
@@ -3207,6 +3298,7 @@ fn plot_sink_fields(
 		PlotType::Bar => "bar",
 		PlotType::Line => "line",
 		PlotType::Scatter => "scatter",
+		PlotType::StackedArea => "area",
 		_ => unreachable!("only Rune mark families reach field parsing"),
 	};
 	let field = |index: usize| {
@@ -5736,6 +5828,112 @@ workspace.table("t").views([table()])
 		let layered = "workspace.table(\"t\").views([layers([bar(\"cat\", \"val\").stacked()])])";
 		let error = transform(layered).expect_err("stacking does not admit bar layering");
 		assert!(error.to_string().contains("not a shared-Cartesian layer"));
+	}
+
+	#[test]
+	fn product_0070_area_spellings_and_static_bindings_share_one_standalone_intent() {
+		let inline = [
+			"plot.area(workspace.table(\"t\"), \"x\", \"y\", \"series\")".to_owned(),
+			"workspace.table(\"t\").area(\"x\", \"y\", \"series\")".to_owned(),
+			"workspace.table(\"t\").views([area(\"x\", \"y\", \"series\")])".to_owned(),
+			"workspace.table(\"t\").views([view(\"market\", area(\"x\", \"y\", \"series\"))])"
+				.to_owned(),
+			"workspace.table(\"t\").views([figure([area(\"x\", \"y\", \"series\")])])".to_owned(),
+		];
+		let expected = product_0058_only_intent(&inline[0]);
+		for (index, source) in inline.iter().enumerate() {
+			assert_eq!(
+				product_0058_only_intent(source),
+				expected,
+				"area position {index} must lower to the same mark intent"
+			);
+		}
+
+		let bindings = r#"
+let x_field = "x";
+let y_field = "y";
+let series_field = "series";
+"#;
+		for bound in [
+			"plot.area(workspace.table(\"t\"), x_field, y_field, series_field)",
+			"workspace.table(\"t\").area(x_field, y_field, series_field)",
+			"workspace.table(\"t\").views([area(x_field, y_field, series_field)])",
+			"workspace.table(\"t\").views([view(\"market\", area(x_field, y_field, series_field))])",
+			"workspace.table(\"t\").views([figure([area(x_field, y_field, series_field)])])",
+		] {
+			assert_eq!(
+				product_0058_only_intent(&format!("{bindings}\n{bound}")),
+				expected,
+				"static bindings are source factoring in every area field position"
+			);
+		}
+
+		let two = product_0058_only_intent("workspace.table(\"t\").views([area(\"x\", \"y\")])");
+		let RuneViewIntent::Plot(RunePlotIntent {
+			body: RunePlotBody::Single(two),
+			..
+		}) = two
+		else {
+			panic!("two-field area remains a standalone plot")
+		};
+		assert_eq!(two.composition.primary_plot_type(), PlotType::StackedArea);
+		assert_eq!((two.x.as_str(), two.y.as_str()), ("x", "y"));
+		assert_eq!(two.category, None);
+		assert_eq!(
+			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(two)))
+				.presentation()
+				.display_label,
+			"plot.area"
+		);
+	}
+
+	#[test]
+	fn product_0070_area_refusals_keep_layers_and_registers_closed() {
+		for source in [
+			"workspace.table(\"t\").views([area(\"x\")])",
+			"workspace.table(\"t\").views([area(\"x\", \"y\", \"series\", \"extra\")])",
+			"workspace.table(\"t\").views([area(missing, \"y\")])",
+			"workspace.table(\"t\").views([layers([area(\"x\", \"y\")])])",
+		] {
+			assert!(
+				matches!(
+					transform(source),
+					Err(RuneEnvelopeError::InvalidView { .. })
+				),
+				"malformed or layered area must refuse: {source}"
+			);
+		}
+
+		for (chain, reason) in [
+			("area(\"x\", \"y\").stacked()", "bar marks, not area"),
+			("area(\"x\", \"y\").bar_width(0.5)", "bar marks, not area"),
+			(
+				"area(\"x\", \"y\").category_gap(0.2)",
+				"bar marks, not area",
+			),
+		] {
+			let source = format!("workspace.table(\"t\").views([{chain}])");
+			let RuneEnvelopeError::InvalidView { span, message } =
+				transform(&source).expect_err("cross-register area modifier refuses")
+			else {
+				panic!("expected attributed area refusal")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], chain);
+			assert!(message.contains(reason), "{message}");
+		}
+
+		let ordinary = r#"
+let held = area("x", "y", "series");
+consume(area("a", "b"));
+workspace.table("t").views([table()])
+"#;
+		let transformed = transform(ordinary).expect("area calls outside view positions stay Rune");
+		assert!(
+			transformed
+				.source
+				.contains("area(\"x\", \"y\", \"series\")")
+		);
+		assert!(transformed.source.contains("area(\"a\", \"b\")"));
 	}
 
 	#[test]

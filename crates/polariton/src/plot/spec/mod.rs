@@ -1327,10 +1327,15 @@ pub fn resolve_channels(
 	schema: &Schema,
 ) -> Result<ChannelBinding, ChannelError> {
 	let plot_type = spec.composition.primary_plot_type();
-	if !matches!(
-		plot_type,
-		PlotType::Scatter | PlotType::Bar | PlotType::Line
-	) {
+	let legacy_automatic_area = plot_type == PlotType::StackedArea
+		&& matches!(spec.x.field, AuthoredChannel::Auto)
+		&& matches!(spec.y.field, AuthoredChannel::Auto)
+		&& matches!(spec.color.field, OptionalAuthoredChannel::Auto);
+	if legacy_automatic_area
+		|| !matches!(
+			plot_type,
+			PlotType::Scatter | PlotType::Bar | PlotType::Line | PlotType::StackedArea
+		) {
 		if !matches!(spec.x.field, AuthoredChannel::Auto)
 			|| !matches!(spec.y.field, AuthoredChannel::Auto)
 			|| !matches!(spec.color.field, OptionalAuthoredChannel::Auto)
@@ -1417,7 +1422,7 @@ pub fn resolve_channels(
 		schema,
 		&mut unavailable_to_auto,
 	)?;
-	if plot_type == PlotType::Line
+	if matches!(plot_type, PlotType::Line | PlotType::StackedArea)
 		&& color.as_ref().is_some_and(|channel| {
 			!matches!(
 				channel.semantic_type,
@@ -1428,7 +1433,14 @@ pub fn resolve_channels(
 		return Err(ChannelError {
 			channel: Channel::Color,
 			field: color.field.clone(),
-			reason: "line series must be categorical".to_owned(),
+			reason: format!(
+				"{} series must be categorical",
+				if plot_type == PlotType::Line {
+					"line"
+				} else {
+					"area"
+				}
+			),
 		});
 	}
 	let color_job = color.as_ref().map(|channel| match spec.color_job {
@@ -1811,8 +1823,13 @@ fn kernel_fields_from_channels(
 			x: required(Channel::X)?,
 			y: required(Channel::Y)?,
 		}),
+		PlotType::StackedArea => Ok(ResolvedKernelFields::StackedArea {
+			series: field(Channel::Color),
+			x: required(Channel::X)?,
+			y: required(Channel::Y)?,
+		}),
 		_ => unreachable!(
-			"only authored Scatter, Bar-family, and Line channels reach this projection"
+			"only authored Scatter, Bar-family, Line, and Area channels reach this projection"
 		),
 	}
 }
@@ -2126,6 +2143,13 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 				SemanticType::Quantitative | SemanticType::Temporal
 			)
 		}
+		(PlotType::StackedArea, Channel::X) => {
+			matches!(
+				semantic,
+				SemanticType::Quantitative | SemanticType::Temporal
+			)
+		}
+		(PlotType::StackedArea, Channel::Y) => semantic == SemanticType::Quantitative,
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -2201,7 +2225,9 @@ const fn color_job_scale(job: ColorJob) -> ScaleFamily {
 
 const fn categorical_limit(plot_type: PlotType) -> usize {
 	match plot_type {
-		PlotType::Scatter | PlotType::Bar | PlotType::Line => DEFAULT_CATEGORICAL_LIMIT,
+		PlotType::Scatter | PlotType::Bar | PlotType::Line | PlotType::StackedArea => {
+			DEFAULT_CATEGORICAL_LIMIT
+		}
 		_ => 0,
 	}
 }
@@ -2624,7 +2650,7 @@ fn categorical_color(index: usize) -> ResolvedColor {
 mod tests {
 	use super::*;
 	use polars::df;
-	use polars::prelude::Column;
+	use polars::prelude::{Column, IntoColumn, NamedFrom};
 
 	fn stamped(data: DataFrame) -> StampedResult {
 		StampedResult {
@@ -3892,6 +3918,174 @@ mod tests {
 			error.contains("cardinality exceeds declared limit 12"),
 			"{error}"
 		);
+	}
+
+	#[test]
+	fn product_0070_area_channels_resolve_to_one_fixed_member_and_family_identity() {
+		let frame = stamped(
+			df!(
+				"x" => [1.0, 2.0],
+				"y" => [3.0, 5.0],
+				"series" => ["Atlas", "Beacon"],
+				"other_series" => ["Atlas", "Beacon"],
+			)
+			.unwrap(),
+		);
+		let area = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::StackedArea),
+			"x",
+			"y",
+			Some("series".to_owned()),
+		);
+		let binding = resolve_channels(&area, frame.data.schema().as_ref()).unwrap();
+		assert_eq!(
+			binding.composition.primary_plot_type(),
+			PlotType::StackedArea
+		);
+		for channel in [Channel::X, Channel::Y, Channel::Color] {
+			let bound = binding
+				.channels()
+				.iter()
+				.find(|bound| bound.channel == channel)
+				.expect("area channel is bound");
+			assert_eq!(
+				bound.layer,
+				LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::StackedArea,
+				},
+				"area identity names the authored family/member and never aliases line"
+			);
+		}
+		assert!(matches!(
+			binding.kernel_fields.as_ref(),
+			ResolvedKernelFields::StackedArea { series: Some(series), x, y }
+				if series == "series" && x == "x" && y == "y"
+		));
+
+		let (_, identity) = resolve(&area, &frame, &ColorIdentity::default()).unwrap();
+		let (_, same_identity) = resolve(&area, &frame, &identity).unwrap();
+		assert_eq!(
+			identity, same_identity,
+			"re-running identical area source preserves every palette position"
+		);
+		let changed = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::StackedArea),
+			"x",
+			"y",
+			Some("other_series".to_owned()),
+		);
+		let (_, changed_identity) = resolve(&changed, &frame, &identity).unwrap();
+		assert!(
+			changed_identity.len() > identity.len(),
+			"changing the area series field must begin a fresh color lineage"
+		);
+	}
+
+	#[test]
+	fn product_0070_area_compatibility_is_line_x_quantitative_y_and_categorical_series() {
+		let temporal_x = polars::prelude::Series::new("when".into(), &[0_i32, 1_i32])
+			.cast(&polars::prelude::DataType::Date)
+			.unwrap();
+		let accepted = stamped(
+			DataFrame::new(
+				2,
+				vec![
+					temporal_x.into_column(),
+					Column::new("value".into(), [3.0_f64, 5.0]),
+					Column::new("series".into(), ["Atlas", "Beacon"]),
+				],
+			)
+			.unwrap(),
+		);
+		let temporal = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::StackedArea),
+			"when",
+			"value",
+			Some("series".to_owned()),
+		);
+		let (resolved, _) = resolve(&temporal, &accepted, &ColorIdentity::default()).unwrap();
+		assert_eq!(
+			resolved.channel(Channel::X).unwrap().binding.semantic_type,
+			SemanticType::Temporal
+		);
+		assert_eq!(
+			resolved.channel(Channel::Y).unwrap().binding.semantic_type,
+			SemanticType::Quantitative
+		);
+
+		let numeric = stamped(
+			df!(
+				"x" => [1.0, 2.0],
+				"y" => [3.0, 5.0],
+				"category" => ["East", "West"],
+				"series_number" => [10.0, 20.0],
+			)
+			.unwrap(),
+		);
+		for (spec, field, expected) in [
+			(
+				AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::StackedArea),
+					"category",
+					"y",
+				),
+				"category",
+				"incompatible",
+			),
+			(
+				AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::StackedArea),
+					"x",
+					"category",
+				),
+				"category",
+				"incompatible",
+			),
+			(
+				AuthoredPlotSpec::xy_color(
+					PlotComposition::single(PlotType::StackedArea),
+					"x",
+					"y",
+					Some("series_number".to_owned()),
+				),
+				"series_number",
+				"categorical",
+			),
+		] {
+			let error = resolve(&spec, &numeric, &ColorIdentity::default()).unwrap_err();
+			assert!(error.contains(field), "field attribution missing: {error}");
+			assert!(
+				error.contains(expected),
+				"semantic refusal missing: {error}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0070_automatic_dashboard_area_keeps_its_assignment_free_projection() {
+		let frame = stamped(
+			df!(
+				"series" => ["Atlas", "Beacon"],
+				"x" => [1.0, 2.0],
+				"y" => [3.0, 5.0],
+			)
+			.unwrap(),
+		);
+		let automatic = AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::StackedArea));
+		let binding = resolve_channels(&automatic, frame.data.schema().as_ref()).unwrap();
+		assert!(
+			binding.channels().is_empty(),
+			"the dashboard's all-Auto area remains outside authored channel and color resolution"
+		);
+		assert!(matches!(
+			binding.kernel_fields.as_ref(),
+			ResolvedKernelFields::StackedArea { series: Some(series), x, y }
+				if series == "series" && x == "x" && y == "y"
+		));
+		let (resolved, identity) = resolve(&automatic, &frame, &ColorIdentity::default()).unwrap();
+		assert!(resolved.channel(Channel::Color).is_none());
+		assert!(identity.is_empty());
 	}
 
 	#[test]

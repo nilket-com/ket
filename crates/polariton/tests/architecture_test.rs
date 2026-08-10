@@ -121,7 +121,7 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 		);
 	}
 	assert!(dto.contains("enum AuthoredFamily"));
-	for family in ["Scatter", "Bar", "Line"] {
+	for family in ["Scatter", "Bar", "Line", "Area"] {
 		assert!(
 			dto.contains(family),
 			"missing durable authored family {family}"

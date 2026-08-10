@@ -17,7 +17,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 pub(crate) const OWNER_NAME: &str = "polariton_session";
-pub(crate) const SCHEMA_VERSION: u32 = 1;
+const FIRST_SCHEMA_VERSION: u32 = 1;
+pub(crate) const SCHEMA_VERSION: u32 = 2;
 pub(crate) const MAX_OWNER_BYTES: usize = 1024 * 1024;
 pub(crate) const DYNAMIC_PANEL_FLOOR: u64 = 1_u64 << 63;
 pub(crate) const GROUP_FLOOR: u64 = 1;
@@ -107,11 +108,7 @@ impl DurableMeanings {
 		bytes: &[u8],
 		bound: usize,
 	) -> Result<Self, SessionPersistenceError> {
-		if schema_version != SCHEMA_VERSION {
-			return Err(SessionPersistenceError::refused(format!(
-				"unsupported schema version {schema_version}"
-			)));
-		}
+		ensure_supported_schema(schema_version, SCHEMA_VERSION)?;
 		if bytes.len() > bound {
 			return Err(SessionPersistenceError::refused(format!(
 				"owner payload is {} bytes (limit is {bound})",
@@ -124,6 +121,7 @@ impl DurableMeanings {
 		deserializer.end().map_err(|error| {
 			SessionPersistenceError::refused(format!("trailing content: {error}"))
 		})?;
+		payload.validate_family_vocabulary(schema_version)?;
 		let meanings = payload.into_meanings()?;
 		validate_marks(&meanings)?;
 		Ok(meanings)
@@ -213,6 +211,18 @@ impl DurableMeanings {
 			next_view_group_id: self.next_view_group_id,
 		})
 	}
+}
+
+fn ensure_supported_schema(
+	schema_version: u32,
+	maximum_supported: u32,
+) -> Result<(), SessionPersistenceError> {
+	if !(FIRST_SCHEMA_VERSION..=maximum_supported).contains(&schema_version) {
+		return Err(SessionPersistenceError::refused(format!(
+			"unsupported schema version {schema_version}"
+		)));
+	}
+	Ok(())
 }
 
 /// Project process-local producer keys onto durable documents. Shared panel
@@ -415,12 +425,13 @@ struct DurableLayer {
 	family: AuthoredFamily,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum AuthoredFamily {
 	Scatter,
 	Bar,
 	Line,
+	Area,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -431,6 +442,30 @@ enum AllocationSpace {
 }
 
 impl Payload {
+	fn validate_family_vocabulary(
+		&self,
+		schema_version: u32,
+	) -> Result<(), SessionPersistenceError> {
+		if schema_version == FIRST_SCHEMA_VERSION
+			&& self.colours.iter().any(|colour| {
+				colour
+					.identity
+					.assignments
+					.iter()
+					.any(|entry| entry.layer.family == AuthoredFamily::Area)
+					|| colour
+						.identity
+						.spaces
+						.iter()
+						.any(|entry| entry.layer.family == AuthoredFamily::Area)
+			}) {
+			return Err(SessionPersistenceError::refused(
+				"authored family area is unsupported in schema version 1",
+			));
+		}
+		Ok(())
+	}
+
 	fn from_meanings(meanings: &DurableMeanings) -> Result<Self, SessionPersistenceError> {
 		let mut panels = meanings
 			.panels
@@ -666,6 +701,7 @@ impl DurableLayer {
 			PlotType::Scatter => AuthoredFamily::Scatter,
 			PlotType::Bar | PlotType::HorizontalBar => AuthoredFamily::Bar,
 			PlotType::Line => AuthoredFamily::Line,
+			PlotType::StackedArea => AuthoredFamily::Area,
 			other => {
 				return Err(SessionPersistenceError::refused(format!(
 					"plot type {other} has no durable authored family"
@@ -685,6 +721,7 @@ impl DurableLayer {
 				AuthoredFamily::Scatter => PlotType::Scatter,
 				AuthoredFamily::Bar => PlotType::Bar,
 				AuthoredFamily::Line => PlotType::Line,
+				AuthoredFamily::Area => PlotType::StackedArea,
 			},
 		})
 	}
@@ -779,8 +816,13 @@ mod tests {
 			DurableMeanings::decode(SCHEMA_VERSION, &bytes).unwrap(),
 			meanings
 		);
+		assert_eq!(
+			DurableMeanings::decode(FIRST_SCHEMA_VERSION, &bytes).unwrap(),
+			meanings,
+			"schema v1 remains readable when the payload uses only its three families"
+		);
 		assert_eq!(meanings.encode().unwrap(), bytes);
-		assert!(DurableMeanings::decode(2, &bytes).is_err());
+		assert!(DurableMeanings::decode(3, &bytes).is_err());
 		assert!(DurableMeanings::decode_with_bound(1, &bytes, 4).is_err());
 		let unknown = br#"{"next_view_panel_id":9223372036854775808,"next_view_group_id":1,"panels":[],"groups":[],"colours":[],"placement":0}"#;
 		assert!(DurableMeanings::decode(1, unknown).is_err());
@@ -790,6 +832,48 @@ mod tests {
 		assert!(DurableMeanings::decode(1, duplicate).is_err());
 		let zero = br#"{"next_view_panel_id":9223372036854775809,"next_view_group_id":1,"panels":[{"document":0,"view":{"kind":"named","name":"x"},"panel":9223372036854775808}],"groups":[],"colours":[]}"#;
 		assert!(DurableMeanings::decode(1, zero).is_err());
+	}
+
+	#[test]
+	fn product_0070_schema_two_adds_area_without_weakening_version_one() {
+		assert_eq!(
+			SCHEMA_VERSION, 2,
+			"writers publish the four-family vocabulary as v2"
+		);
+		let document = DocumentId::new(1).unwrap();
+		let mut meanings = empty_meanings();
+		meanings.colours.insert(
+			(document, LocalViewIdentity::Named("area".into()), 4),
+			colour_identity(PlotType::StackedArea, false),
+		);
+		let bytes = meanings.encode().unwrap();
+		let text = String::from_utf8(bytes.clone()).unwrap();
+		assert!(text.contains("\"family\":\"area\""), "{text}");
+		assert_eq!(DurableMeanings::decode(2, &bytes).unwrap(), meanings);
+		let relabelled = DurableMeanings::decode(1, &bytes).unwrap_err();
+		assert!(
+			relabelled
+				.to_string()
+				.contains("authored family area is unsupported in schema version 1"),
+			"{relabelled}"
+		);
+
+		let old_reader = ensure_supported_schema(2, 1).unwrap_err();
+		assert!(
+			old_reader
+				.to_string()
+				.contains("unsupported schema version 2"),
+			"a v1 reader must refuse a v2 envelope rather than dropping area meanings: {old_reader}"
+		);
+
+		let mut v1 = empty_meanings();
+		v1.colours.insert(
+			(document, LocalViewIdentity::Named("line".into()), 4),
+			colour_identity(PlotType::Line, false),
+		);
+		let v1_bytes = v1.encode().unwrap();
+		assert_eq!(DurableMeanings::decode(1, &v1_bytes).unwrap(), v1);
+		assert_eq!(DurableMeanings::decode(2, &v1_bytes).unwrap(), v1);
 	}
 
 	#[test]

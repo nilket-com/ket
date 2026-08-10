@@ -1,6 +1,6 @@
 # Rune workspace acceptance corpus
 
-Version 0.64. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
+Version 0.70. Charter: PRODUCT-0002 §9. This is a living, versioned acceptance
 artifact — not an ADR. It records the complete destination matrix for the Rune
 workspace with honest per-family status. A row's status changes only with
 landed, cited evidence; the only expansion path for new rows is dogfood diary
@@ -31,6 +31,7 @@ a cited record).
 | bar sink (`plot.bar`; accepted sugar `r.bar(x, y)` and canonical `r.views([bar(x, y)])`) | executable | `plot_forms_retain_only_view_intent` + `rune_relation_results_feed_the_existing_table_and_plot_surfaces`; live acceptance with axis-identity assertions (PRODUCT-0007 stage 2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | scatter sink (`plot.scatter`; accepted sugar `r.scatter(x, y)` and canonical `r.views([scatter(x, y)])`) | executable | as bar, plus the categorical-x resolution that closed the field-substitution defect (PRODUCT-0007 §2, `755e850a`); PRODUCT-0008 sugar equivalence (`d4c2d8a8`) |
 | line sink (`plot.line`; accepted sugar `r.line(x, y[, series])` and canonical `r.views([line(x, y[, series])])`) | executable | PRODUCT-0012 establishes the two-field form. PRODUCT-0054 adds the optional named series channel in every standalone position, preserves within-series relation order, routes exact resolved colors through paint/legend/composites, admits native `.stroke_width(...)`, and keeps categorized lines out of `layers([...])`; `test18.rn` is the four-product exhibit. |
+| area sink (`plot.area`; accepted sugar `r.area(x, y[, series])` and canonical `r.views([area(x, y[, series])])`) | executable | PRODUCT-0069 gives the existing stacked-area kernel display-domain/first-appearance series order, first-row-wins duplicates, and one non-positive-clamped matrix shared by range, polygons, boundaries, and hover. PRODUCT-0070 adds the fourth authored mark word in every standalone position, resolved fills and named swatches, synthetic two-field legend omission, and `polariton_session` schema v2 with a strict v1 vocabulary. `test23.rn` compares both forms and faceting against a series-line control. |
 | shared-execution view fan-out (`r.views([...])`, one execution, N sinks) | executable | `rune_relation_results_feed_the_existing_table_and_plot_surfaces` proves every sink, including line, holds the *same* `Arc`, not equivalent copies; direct/factored/legacy equivalence plus accepted-surface live axis identity (`d4c2d8a8`, PRODUCT-0012) |
 | multi-origin view program (one execution per canonical relation origin) | executable | `multi_origin_dispatch_is_independent_while_each_origin_keeps_shared_identity` proves canonical-origin deduplication and independent dispatch; `execution_grouping_cannot_reorder_interleaved_host_panels` completes origins out of order without changing presentation (`b99338f8`, `cad42680`) |
 | optional view identity (`view("name", sink)` or anonymous positional identity) | executable | session-scoped: duplicate names refuse with both spans; names retain one host-panel id across reruns and form changes; anonymous views reuse their presentation slot; durable restart identity remains deferred by PRODUCT-0010's recorded protocol halt (`284e88e0`, `cad42680`) |
@@ -592,6 +593,16 @@ PRODUCT-0032 owns the first theme-name projection and direct figure
 | bounded finite `collect` | deferred-by-design | `plans/product/impl/0003_rune_relation_first_contact.md` |
 
 ## Change log
+
+- v0.70 (2026-08-09): PRODUCT-0069 repairs stacked-area data semantics before
+  exposure: resolved display-domain order (or first appearance without
+  assignments), first-row-wins duplicate pairs, and one clamped value matrix
+  shared by range, polygon, boundary, and hover. PRODUCT-0070 adds standalone
+  `area(x, y[, series])` across legacy, sugar, canonical, named, and figure
+  positions; routes exact resolved colours to fills and swatches; omits the
+  synthetic two-field legend; and migrates the durable authored-family
+  vocabulary from schema v1 to v2 while retaining strict v1 reads. `test23.rn`
+  exercises single, stacked, and faceted areas beside a multi-series line.
 
 - v0.64 (2026-08-09): PRODUCT-0064 adds `.stacked()` to the closed Bar
   register. Pair resolution still chooses orientation first, stacking changes

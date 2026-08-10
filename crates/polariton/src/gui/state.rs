@@ -7555,6 +7555,83 @@ workspace.table("bad").views([view("bad", table())]);
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0070_area_reaches_completion_with_cartesian_guides_and_fixed_orientation() {
+		let source = r#"workspace.table("t").views([figure([
+			y_bounds(0, 20), y_tick_step(2), y_minor_ticks(2),
+			area("x", "value", "series")
+		])])"#;
+		let relation = transform_rune_view(source)
+			.expect("area surface envelope")
+			.into_relations()
+			.next()
+			.unwrap();
+		let frame = polars::df!(
+			"x" => [1.0_f64, 1.0, 2.0, 2.0],
+			"value" => [2.0_f64, 4.0, 6.0, 8.0],
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+		)
+		.unwrap();
+		let outcome = rune_view_outcome(frame, relation.views);
+		let sink = &outcome.sinks[0];
+		assert_eq!(sink.presentation.display_label, "plot.area");
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, authored, _)) =
+			&sink.output
+		else {
+			panic!("area must complete through the standalone plot path")
+		};
+		assert_eq!(
+			resolved.resolved_spec.composition.primary_plot_type(),
+			PlotType::StackedArea
+		);
+		assert_eq!(
+			resolved.resolved_spec.composition.title(),
+			"Stacked Area Plot"
+		);
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		assert_eq!((settings.y_min, settings.y_max), (Some(0.0), Some(20.0)));
+		assert_eq!(
+			settings.y_tick_placement,
+			crate::plot::common::TickPlacement::step(2.0).unwrap()
+		);
+		assert_eq!(settings.y_minor_ticks, 2);
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+		assert!(matches!(
+			kernel.layout(settings.clone()),
+			PlotLayout::Cartesian { y_range, .. } if y_range == (0.0, 20.0)
+		));
+		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
+
+		let reversed = "workspace.table(\"t\").views([area(\"category\", \"value\")])";
+		let relation = transform_rune_view(reversed)
+			.unwrap()
+			.into_relations()
+			.next()
+			.unwrap();
+		let outcome = rune_view_outcome(
+			polars::df!("category" => ["East"], "value" => [2.0_f64]).unwrap(),
+			relation.views,
+		);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("categorical area x must refuse rather than rotate")
+		};
+		assert!(
+			error.contains("category") && error.contains("incompatible"),
+			"{error}"
+		);
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&reversed[span.start as usize..span.end as usize],
+			"area(\"category\", \"value\")",
+			"the area sink span carries the resolved-field refusal"
+		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn product_0055_pair_refusal_is_attributed_to_the_complete_bar_sink() {
 		let source = "workspace.table(\"t\").views([bar(\"revenue\", \"profit\")])";
 		let relation = transform_rune_view(source)

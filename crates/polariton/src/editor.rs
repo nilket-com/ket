@@ -6448,8 +6448,8 @@ mod tests {
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0062_saved_restart_rebinds_views_groups_and_colours_before_rerun() {
-		const CHILD: &str = "POLARITON_PRODUCT_0062_RESTART_CHILD";
+	fn product_0070_saved_restart_preserves_product_0062_views_groups_and_colours_before_rerun() {
+		const CHILD: &str = "POLARITON_PRODUCT_0062_0070_RESTART_CHILD";
 		if std::env::var_os(CHILD).is_none() {
 			let state_home = std::env::temp_dir().join(format!(
 				"polariton-product-0062-{}-{}",
@@ -6462,7 +6462,7 @@ mod tests {
 			let status = std::process::Command::new(std::env::current_exe().unwrap())
 				.args([
 					"--exact",
-					"editor::tests::product_0062_saved_restart_rebinds_views_groups_and_colours_before_rerun",
+					"editor::tests::product_0070_saved_restart_preserves_product_0062_views_groups_and_colours_before_rerun",
 					"--nocapture",
 				])
 				.env(CHILD, "1")
@@ -6601,11 +6601,40 @@ mod tests {
 		})
 		.unwrap();
 		let stacked_persistence_view = LocalViewIdentity::Named("stacked-persistence".into());
+		let area_persistence_view = LocalViewIdentity::Named("area-persistence".into());
+		let area_identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
+			assignments: ["Atlas", "Beacon", "Cinder"]
+				.into_iter()
+				.enumerate()
+				.map(|(position, category)| ColorAssignmentSnapshot {
+					field: "product".into(),
+					layer: LayerIdentity {
+						ordinal: 0,
+						plot_type: PlotType::StackedArea,
+					},
+					category: category.into(),
+					position,
+				})
+				.collect(),
+			spaces: vec![ColorSpaceSnapshot {
+				field: "product".into(),
+				layer: LayerIdentity {
+					ordinal: 0,
+					plot_type: PlotType::StackedArea,
+				},
+				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
+			}],
+		})
+		.unwrap();
 		let colours = [
 			((producer, named.clone(), 4), identity.clone()),
 			(
 				(producer, stacked_persistence_view.clone(), 12),
 				grouped_identity,
+			),
+			(
+				(producer, area_persistence_view.clone(), 4),
+				area_identity.clone(),
 			),
 		]
 		.into_iter()
@@ -6674,6 +6703,13 @@ mod tests {
 			.get(&(reopened_buffer, stacked_persistence_view, 12))
 			.expect("grouped Bar identity restores")
 			.clone();
+		assert_eq!(
+			restored_colours
+				.as_map()
+				.get(&(reopened_buffer, area_persistence_view, 4)),
+			Some(&area_identity),
+			"a three-series Area publishes schema v2 and restores every exact palette position"
+		);
 		let frame = crate::plot::spec::StampedResult {
 			data: std::sync::Arc::new(
 				polars::df!(

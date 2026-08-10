@@ -213,6 +213,7 @@ pub fn create_plot(
 			};
 			Arc::new(StackedAreaPlotKernel {
 				prepared_data: Arc::new(prepared),
+				series_colors: assignments.to_vec(),
 			})
 		}
 		ResolvedKernelFields::FillBetween {
@@ -1767,6 +1768,83 @@ mod product_0013_baseline_tests {
 			);
 			assert!(svg.contains(&stroke), "missing {stroke}:\n{svg}");
 		}
+	}
+
+	fn product_0070_resolved_area(
+		frame: &DataFrame,
+		series: Option<&str>,
+	) -> (ResolvedPlotSpec, ColorIdentity) {
+		let authored = AuthoredPlotSpec::xy_color(
+			PlotComposition::single(PlotType::StackedArea),
+			"x",
+			"y",
+			series.map(str::to_owned),
+		);
+		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("area channels");
+		let stamped = StampedResult {
+			data: Arc::new(frame.clone()),
+			provenance: PlotProvenance {
+				source_name: "product-0070".to_owned(),
+				revision: Some(1),
+			},
+		};
+		let selection = CategoricalPaletteSelection::from_theme_name("blues").unwrap();
+		resolve_domains_with_categorical_palette(
+			binding,
+			&stamped,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.expect("area domain resolution")
+	}
+
+	#[test]
+	fn product_0070_factory_routes_resolved_area_colors_to_fills_and_named_swatches() {
+		let frame = df!(
+			"series" => ["Atlas", "Beacon", "Atlas", "Beacon"],
+			"x" => [1.0, 1.0, 2.0, 2.0],
+			"y" => [2.0, 3.0, 4.0, 5.0],
+		)
+		.expect("area frame");
+		let (resolved, _) = product_0070_resolved_area(&frame, Some("series"));
+		let assignments = resolved_category_colors(&resolved).to_vec();
+		let kernel = create_plot(&resolved, &frame, 100, 100);
+		let svg = render_marks(kernel.as_ref());
+		let content = kernel
+			.legend_content(&ResolvedPlotSettings::default())
+			.expect("named area legend");
+		let crate::plot::legend::LegendSection::Entries(entries) = content.0.first() else {
+			panic!("area legend is categorical")
+		};
+		assert_eq!(entries.len(), assignments.len());
+		for (entry, assignment) in entries.iter().zip(&assignments) {
+			let expected = iced::Color::from_rgba8(
+				assignment.color.red,
+				assignment.color.green,
+				assignment.color.blue,
+				assignment.color.alpha as f32 / 255.0,
+			);
+			assert_eq!(entry.label, assignment.category);
+			assert_eq!(entry.swatch, expected);
+			let fill = format!(
+				"fill=\"rgb({}, {}, {})\"",
+				assignment.color.red, assignment.color.green, assignment.color.blue
+			);
+			assert!(
+				svg.contains(&fill),
+				"resolved area fill missing {fill}:\n{svg}"
+			);
+		}
+
+		let (single, _) = product_0070_resolved_area(&frame, None);
+		let single = create_plot(&single, &frame, 100, 100);
+		let content = single
+			.legend_content(&ResolvedPlotSettings::default())
+			.expect("kernel exposes synthetic content before policy");
+		assert!(
+			crate::plot::legend::apply_policy(content).is_none(),
+			"two-field area contributes no retained legend"
+		);
 	}
 
 	#[test]

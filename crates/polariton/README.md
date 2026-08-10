@@ -68,8 +68,9 @@ workspace.table("sales").views([
 ])
 ```
 
-Direct and aliased top-level bindings work in every established bar, line, and
-scatter field position, including accepted x/y fields inside `layers([...])`.
+Direct and aliased top-level bindings work in every established bar, line,
+scatter, and area field position, including accepted x/y fields inside
+`layers([...])`.
 They are static source factoring, not runtime variables: computed strings and
 non-top-level bindings refuse. Numeric mark modifiers such as
 `.bar_width(width)` still require inline literals.
@@ -176,6 +177,30 @@ workspace.table("sales")
 The named series share the figure palette and legend with grouped scatter and
 bar marks. The three-field form is a standalone mark and is not accepted inside
 `layers([...])`.
+
+#### Rune area presentation:
+
+Areas use a standalone mark word. The two-field form draws one filled region;
+the optional categorical series field produces a baseline-outward stack with
+named swatches in the same display-domain order:
+
+```rune
+workspace.table("sales")
+    .sort([col("month").asc(), col("product").asc()])
+    .views([
+        figure([
+            palette("vapor_s11"),
+            area("month", "revenue", "product"),
+        ]),
+    ])
+```
+
+Area x accepts quantitative or temporal data; y is quantitative. Duplicate
+`(x, series)` rows are first-row-wins, so aggregate explicitly in the relation
+when totals are intended. Non-finite and non-positive samples contribute zero.
+The two-field form has no legend, and areas remain outside `layers([...])`.
+Gridlines render beneath opaque fills while the resolved boundary and exterior
+axis furniture remain visible.
 
 #### Adapters:
  - SQLite (file or memory)
