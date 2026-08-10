@@ -39,7 +39,22 @@ use iced::widget::canvas::{self, Path, Stroke, Text};
 use iced::{Color, Font, Pixels, Point, Rectangle, Size, Vector};
 use iced_wgpu::graphics::{Antialiasing, Shell};
 use iced_wgpu::{Engine, Renderer as WgpuRenderer, wgpu};
-use plot::common::{IcedBackend, PlotBackend};
+use plot::common::{
+	AxisType, CoordinateTransformer, IcedBackend, Orientation, PlotBackend, PlotKernel,
+	PlotRenderLayer, PlotWidget, ResolvedPlotSettings, TickPlacement,
+};
+use plot::kernels::bar::{BarPlotKernel, BarPreparedData};
+use plot::kernels::line::{LinePlotKernel, LinePreparedData, SeriesData};
+use plot::kernels::scatter::{ScatterPlotKernel, ScatterPreparedData, ScatterSeries};
+use plot::kernels::stacked_area::{StackedAreaPlotKernel, StackedAreaPreparedData};
+use plot::legend::LegendProvenance;
+use plot::spec::{
+	BarWidth, CategoryColorAssignment, CategoryGap, LayerSettings, PalettePosition, PointSize,
+	ResolvedColor, ResolvedPresence, StrokeWidth,
+};
+use plot::theme::PlotSettings;
+use polars::prelude::{Float64Chunked, NewChunkedArray};
+use std::sync::Arc;
 
 const BACKGROUND: [u8; 3] = [0, 0, 0];
 const RED: [u8; 3] = [230, 32, 48];
@@ -172,6 +187,13 @@ fn near(actual: [u8; 3], expected: [u8; 3], tolerance: u8) -> bool {
 		.into_iter()
 		.zip(expected)
 		.all(|(actual, expected)| actual.abs_diff(expected) <= tolerance)
+}
+
+fn color_distance(left: [u8; 3], right: [u8; 3]) -> u16 {
+	left.into_iter()
+		.zip(right)
+		.map(|(left, right)| left.abs_diff(right) as u16)
+		.sum()
 }
 
 fn assert_region(capture: &Capture, bounds: [f32; 4], expected: [u8; 3], label: &str) {
@@ -442,6 +464,340 @@ fn write_product_0068_png(capture: &Capture, path: &std::path::Path) {
 		.expect("write PRODUCT-0068 PNG pixels");
 }
 
+fn product_0068_bar_fixture() -> (BarPlotKernel, PlotSettings) {
+	let colors = [(1, 205, 254), (229, 9, 20), (255, 32, 121)];
+	let names = ["Atlas", "Beacon", "Cinder"];
+	let group_colors = names
+		.into_iter()
+		.zip(colors)
+		.enumerate()
+		.map(
+			|(index, (name, (red, green, blue)))| CategoryColorAssignment {
+				category: name.to_owned(),
+				position: PalettePosition::new(index, 3).unwrap(),
+				color: ResolvedColor {
+					red,
+					green,
+					blue,
+					alpha: u8::MAX,
+				},
+			},
+		)
+		.collect();
+	let kernel = BarPlotKernel {
+		prepared_data: Arc::new(BarPreparedData {
+			categories: vec!["East".to_owned(), "North".to_owned(), "South".to_owned()],
+			group_names: names.into_iter().map(str::to_owned).collect(),
+			values: vec![
+				vec![70.0, 55.0, 35.0],
+				vec![150.0, 120.0, 90.0],
+				vec![225.0, 185.0, 145.0],
+			],
+			y_range: (0.0, 250.0),
+			x_label: String::new(),
+			y_label: String::new(),
+			group_provenance: LegendProvenance::Named,
+		}),
+		orientation: Orientation::Vertical,
+		layer_settings: LayerSettings::default(),
+		band_fills: Vec::new(),
+		group_colors,
+	};
+	let resolved = ResolvedPlotSettings {
+		title: ResolvedPresence::Hide,
+		subtitle: ResolvedPresence::Hide,
+		x_label: ResolvedPresence::Hide,
+		y_label: ResolvedPresence::Hide,
+		legend: ResolvedPresence::Hide,
+		x_tick_placement: TickPlacement::count(1).unwrap(),
+		y_tick_placement: TickPlacement::count(5).unwrap(),
+		show_x_minor_ticks: false,
+		show_y_minor_ticks: false,
+		show_x_minor_grid: false,
+		show_y_minor_grid: false,
+		plot_padding_top: 0.0,
+		plot_padding_bottom: 0.0,
+		plot_padding_left: 0.0,
+		plot_padding_right: 0.0,
+		bar_width: BarWidth::new(0.78).unwrap(),
+		category_gap: CategoryGap::new(0.16).unwrap(),
+		..ResolvedPlotSettings::default()
+	};
+	(kernel, PlotSettings::from_resolved(resolved))
+}
+
+fn render_product_0068_bar(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	overlay_control: bool,
+) -> Capture {
+	let (kernel, settings) = product_0068_bar_fixture();
+	let resolved = settings.resolve();
+	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
+	let widget = PlotWidget {
+		kernel: &kernel,
+		title: String::new(),
+		padding: 0.0,
+		settings: resolved.clone(),
+		settings_model: settings.clone(),
+		render_revision: 0,
+		resize_render_suspended: false,
+		layer: PlotRenderLayer::Full,
+	};
+	render_frame(renderer, size, |frame| {
+		let mut backend = IcedBackend { frame };
+		if overlay_control {
+			backend.fill_rectangle(
+				Point::ORIGIN,
+				bounds.size(),
+				resolved.chrome.canvas_background.iced(),
+			);
+			let layout = kernel.layout(resolved.clone());
+			let transform = CoordinateTransformer::new(&layout, bounds);
+			kernel.plot_with_settings(
+				&mut backend,
+				bounds,
+				&transform,
+				iced::advanced::mouse::Cursor::Unavailable,
+				&settings,
+			);
+			widget.draw_layout_grid(&mut backend, bounds, &transform, &layout);
+			widget.render_overlay_layer(&mut backend, bounds);
+		} else {
+			widget.render_plot_layer(&mut backend, bounds);
+			widget.render_overlay_layer(&mut backend, bounds);
+		}
+	})
+}
+
+fn product_0068_cartesian_settings() -> PlotSettings {
+	PlotSettings::from_resolved(ResolvedPlotSettings {
+		title: ResolvedPresence::Hide,
+		subtitle: ResolvedPresence::Hide,
+		x_label: ResolvedPresence::Hide,
+		y_label: ResolvedPresence::Hide,
+		legend: ResolvedPresence::Hide,
+		x_tick_placement: TickPlacement::count(2).unwrap(),
+		y_tick_placement: TickPlacement::count(2).unwrap(),
+		show_x_minor_ticks: false,
+		show_y_minor_ticks: false,
+		show_x_minor_grid: false,
+		show_y_minor_grid: false,
+		plot_padding_top: 0.0,
+		plot_padding_bottom: 0.0,
+		plot_padding_left: 0.0,
+		plot_padding_right: 0.0,
+		point_size: PointSize::new(3.0).unwrap(),
+		stroke_width: StrokeWidth::new(3.0).unwrap(),
+		..ResolvedPlotSettings::default()
+	})
+}
+
+fn product_0068_line_fixture(color: Color) -> LinePlotKernel {
+	LinePlotKernel::new(Arc::new(LinePreparedData {
+		series: vec![SeriesData {
+			name: "diagonal".to_owned(),
+			points: vec![[0.0, 0.0], [1.0, 1.0]],
+			color_t: 0.0,
+			resolved_color: Some(color),
+			provenance: LegendProvenance::Named,
+		}],
+		x_range: (0.0, 1.0),
+		y_range: (0.0, 1.0),
+		x_axis_type: AxisType::Linear,
+		y_axis_type: AxisType::Linear,
+		x_label: String::new(),
+		y_label: String::new(),
+	}))
+}
+
+fn product_0068_scatter_fixture(color: Color) -> ScatterPlotKernel {
+	ScatterPlotKernel::new(Arc::new(ScatterPreparedData {
+		series: vec![ScatterSeries {
+			name: "point".to_owned(),
+			x_values: Float64Chunked::from_slice("x".into(), &[0.5]),
+			y_values: Float64Chunked::from_slice("y".into(), &[0.5]),
+			color_t: 0.0,
+			resolved_color: Some(color),
+			provenance: LegendProvenance::Named,
+		}],
+		x_categories: None,
+		x_range: (0.0, 1.0),
+		y_range: (0.0, 1.0),
+		x_axis_type: AxisType::Linear,
+		y_axis_type: AxisType::Linear,
+		x_label: String::new(),
+		y_label: String::new(),
+		total_points: 1,
+	}))
+}
+
+fn product_0068_stacked_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, [[u8; 3]; 2]) {
+	let mut resolved = product_0068_cartesian_settings().resolve();
+	resolved.mark_decoration_color = Color::WHITE;
+	resolved.y_tick_placement = TickPlacement::count(5).unwrap();
+	let colors = [
+		resolved.color_theme.get_color(0.0),
+		resolved.color_theme.get_color(1.0),
+	]
+	.map(|color| {
+		[
+			(color.r * 255.0).round() as u8,
+			(color.g * 255.0).round() as u8,
+			(color.b * 255.0).round() as u8,
+		]
+	});
+	(
+		StackedAreaPlotKernel {
+			prepared_data: Arc::new(StackedAreaPreparedData {
+				categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
+				unique_xs: vec![0.0, 0.25, 0.5, 0.75, 1.0],
+				category_values: vec![vec![2.0, 2.5, 2.0, 3.0, 2.5], vec![2.0, 1.5, 2.5, 2.0, 2.5]],
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 10.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_label: String::new(),
+				y_label: String::new(),
+			}),
+		},
+		PlotSettings::from_resolved(resolved),
+		colors,
+	)
+}
+
+fn render_product_0068_cartesian_mark(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	kernel: &dyn PlotKernel,
+	settings: &PlotSettings,
+	overlay_control: bool,
+) -> Capture {
+	let resolved = settings.resolve();
+	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
+	let widget = PlotWidget {
+		kernel,
+		title: String::new(),
+		padding: 0.0,
+		settings: resolved.clone(),
+		settings_model: settings.clone(),
+		render_revision: 0,
+		resize_render_suspended: false,
+		layer: PlotRenderLayer::Full,
+	};
+	render_frame(renderer, size, |frame| {
+		let mut backend = IcedBackend { frame };
+		if overlay_control {
+			backend.fill_rectangle(
+				Point::ORIGIN,
+				bounds.size(),
+				resolved.chrome.canvas_background.iced(),
+			);
+			let layout = kernel.layout(resolved.clone());
+			let transform = CoordinateTransformer::new(&layout, bounds);
+			kernel.plot_with_settings(
+				&mut backend,
+				bounds,
+				&transform,
+				iced::advanced::mouse::Cursor::Unavailable,
+				settings,
+			);
+			widget.draw_layout_grid(&mut backend, bounds, &transform, &layout);
+			widget.render_overlay_layer(&mut backend, bounds);
+		} else {
+			widget.render_plot_layer(&mut backend, bounds);
+			widget.render_overlay_layer(&mut backend, bounds);
+		}
+	})
+}
+
+fn assert_product_0068_cartesian_mark_control(
+	label: &str,
+	under: &Capture,
+	overlay: &Capture,
+	mark: [u8; 3],
+) -> (usize, usize) {
+	assert_eq!(under.width, overlay.width);
+	assert_eq!(under.height, overlay.height);
+	let mut preserved_intersections = 0usize;
+	let mut grid_rows = std::collections::BTreeSet::new();
+	for (index, (under_pixel, overlay_pixel)) in under
+		.rgba
+		.chunks_exact(4)
+		.zip(overlay.rgba.chunks_exact(4))
+		.enumerate()
+	{
+		let under_rgb = [under_pixel[0], under_pixel[1], under_pixel[2]];
+		let overlay_rgb = [overlay_pixel[0], overlay_pixel[1], overlay_pixel[2]];
+		if near(under_rgb, mark, 12) && color_distance(overlay_rgb, mark) >= 20 {
+			preserved_intersections += 1;
+			grid_rows.insert(index as u32 / under.width);
+		}
+	}
+	assert!(
+		preserved_intersections >= 2,
+		"PRODUCT-0068 {label}: the real mark must cross and occlude a real grid in production; got {preserved_intersections} discriminating pixels"
+	);
+	let visible_grid = grid_rows
+		.iter()
+		.flat_map(|row| (0..under.width).map(move |x| under.pixel(x, *row)))
+		.filter(|pixel| {
+			let spread = pixel.iter().max().unwrap() - pixel.iter().min().unwrap();
+			spread <= 3 && pixel[0] >= 24 && pixel[0] <= 120
+		})
+		.count();
+	assert!(
+		visible_grid >= 4,
+		"PRODUCT-0068 {label}: the intersected gridline must remain visible on adjacent canvas; got {visible_grid} pixels"
+	);
+	(preserved_intersections, visible_grid)
+}
+
+fn assert_product_0068_stacked_area_control(
+	under: &Capture,
+	overlay: &Capture,
+	fills: [[u8; 3]; 2],
+) -> (usize, usize) {
+	let mut exact_intersections = 0usize;
+	for (under_pixel, overlay_pixel) in under.rgba.chunks_exact(4).zip(overlay.rgba.chunks_exact(4))
+	{
+		let under_rgb = [under_pixel[0], under_pixel[1], under_pixel[2]];
+		let overlay_rgb = [overlay_pixel[0], overlay_pixel[1], overlay_pixel[2]];
+		if fills.iter().any(|fill| near(under_rgb, *fill, 12))
+			&& fills
+				.iter()
+				.all(|fill| color_distance(overlay_rgb, *fill) >= 20)
+		{
+			exact_intersections += 1;
+		}
+	}
+	assert!(
+		exact_intersections >= 20,
+		"PRODUCT-0068 stacked area must retain exact resolved fills where the overlay control composites grids; got {exact_intersections} pixels"
+	);
+	for fill in fills {
+		assert!(
+			under
+				.rgba
+				.chunks_exact(4)
+				.any(|pixel| near([pixel[0], pixel[1], pixel[2]], fill, 12)),
+			"PRODUCT-0068 stacked-area fixture must realize resolved fill {fill:?}"
+		);
+	}
+	let headroom_grid = (0..under.height / 3)
+		.flat_map(|y| (0..under.width).map(move |x| under.pixel(x, y)))
+		.filter(|pixel| {
+			let spread = pixel.iter().max().unwrap() - pixel.iter().min().unwrap();
+			spread <= 3 && pixel[0] >= 24 && pixel[0] <= 120
+		})
+		.count();
+	assert!(
+		headroom_grid >= 100,
+		"PRODUCT-0068 stacked-area headroom must retain real gridlines; got {headroom_grid} pixels"
+	);
+	(exact_intersections, headroom_grid)
+}
+
 fn draw_overlap(frame: &mut canvas::Frame) {
 	let size = frame.size();
 	let mut backend = IcedBackend { frame };
@@ -606,6 +962,114 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	let large = Size::new(448, 320);
 	let mut msaa = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
 	let mut no_aa = gpu.renderer(None).await;
+
+	let bar_size = Size::new(600, 400);
+	let bar_under = render_product_0068_bar(&mut msaa, bar_size, false);
+	let bar_overlay = render_product_0068_bar(&mut msaa, bar_size, true);
+	let cyan = [1, 205, 254];
+	let crossing_row = [319, 320]
+		.into_iter()
+		.max_by_key(|row| color_distance(bar_overlay.pixel(40, *row), cyan))
+		.expect("PRODUCT-0068 grid crossing row");
+	let under_mark = bar_under.pixel(40, crossing_row);
+	let overlay_mark = bar_overlay.pixel(40, crossing_row);
+	assert!(
+		near(under_mark, cyan, 12),
+		"PRODUCT-0068 grid-under must preserve the exact resolved bar colour: {under_mark:?}"
+	);
+	assert!(
+		color_distance(overlay_mark, cyan) >= 20,
+		"PRODUCT-0068 overlay control must visibly tint the same bar pixel: {overlay_mark:?}"
+	);
+	let gap_grid = bar_under.pixel(195, crossing_row);
+	let gap_canvas = bar_under.pixel(195, 300);
+	assert!(
+		color_distance(gap_grid, gap_canvas) >= 20,
+		"PRODUCT-0068 category gap must retain a real gridline: grid={gap_grid:?} canvas={gap_canvas:?}"
+	);
+	for expected in [[1, 205, 254], [229, 9, 20], [255, 32, 121]] {
+		assert!(
+			bar_under.rgba.chunks_exact(4).any(|pixel| near(
+				[pixel[0], pixel[1], pixel[2]],
+				expected,
+				12
+			)),
+			"PRODUCT-0068 fixture must realize every saturated series colour {expected:?}"
+		);
+	}
+	println!(
+		"PRODUCT_0068 bar_strata disposition=automated crossing_row={crossing_row} under_mark={under_mark:?} overlay_mark={overlay_mark:?} gap_grid={gap_grid:?} gap_canvas={gap_canvas:?}"
+	);
+	let cartesian_size = Size::new(400, 300);
+	let cartesian_settings = product_0068_cartesian_settings();
+	let cyan_color = Color::from_rgb8(cyan[0], cyan[1], cyan[2]);
+	let line = product_0068_line_fixture(cyan_color);
+	let line_under = render_product_0068_cartesian_mark(
+		&mut msaa,
+		cartesian_size,
+		&line,
+		&cartesian_settings,
+		false,
+	);
+	let line_overlay = render_product_0068_cartesian_mark(
+		&mut msaa,
+		cartesian_size,
+		&line,
+		&cartesian_settings,
+		true,
+	);
+	let line_counts =
+		assert_product_0068_cartesian_mark_control("line", &line_under, &line_overlay, cyan);
+	let scatter = product_0068_scatter_fixture(cyan_color);
+	let scatter_under = render_product_0068_cartesian_mark(
+		&mut msaa,
+		cartesian_size,
+		&scatter,
+		&cartesian_settings,
+		false,
+	);
+	let scatter_overlay = render_product_0068_cartesian_mark(
+		&mut msaa,
+		cartesian_size,
+		&scatter,
+		&cartesian_settings,
+		true,
+	);
+	let scatter_counts = assert_product_0068_cartesian_mark_control(
+		"scatter",
+		&scatter_under,
+		&scatter_overlay,
+		cyan,
+	);
+	println!(
+		"PRODUCT_0068 cartesian_controls disposition=automated line_intersection/grid={}/{} scatter_intersection/grid={}/{}",
+		line_counts.0, line_counts.1, scatter_counts.0, scatter_counts.1,
+	);
+	let (stacked_area, stacked_area_settings, stacked_area_fills) =
+		product_0068_stacked_area_fixture();
+	let stacked_area_under = render_product_0068_cartesian_mark(
+		&mut msaa,
+		cartesian_size,
+		&stacked_area,
+		&stacked_area_settings,
+		false,
+	);
+	let stacked_area_overlay = render_product_0068_cartesian_mark(
+		&mut msaa,
+		cartesian_size,
+		&stacked_area,
+		&stacked_area_settings,
+		true,
+	);
+	let stacked_area_counts = assert_product_0068_stacked_area_control(
+		&stacked_area_under,
+		&stacked_area_overlay,
+		stacked_area_fills,
+	);
+	println!(
+		"PRODUCT_0068 stacked_area disposition=automated exact_intersections={} headroom_grid={}",
+		stacked_area_counts.0, stacked_area_counts.1,
+	);
 	if let Some(path) = std::env::var_os("PRODUCT_0068_STAGE0_PNG") {
 		let exhibit = render_frame(
 			&mut msaa,

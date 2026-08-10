@@ -555,6 +555,16 @@ impl PlotComposite for PlotGridKernel {
 			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
 			let inner = grid_plot_area(cell_bounds, &resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
+			let helper = PlotWidget {
+				kernel: cell.kernel.as_ref(),
+				title: String::new(),
+				padding: 0.0,
+				settings: resolved.clone(),
+				settings_model: settings.clone(),
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: crate::plot::common::PlotRenderLayer::Full,
+			};
 			backend.with_clip(cell_bounds.into_iced(), &mut |backend| {
 				backend.fill_rectangle(
 					cell_bounds.origin().into_iced(),
@@ -563,6 +573,7 @@ impl PlotComposite for PlotGridKernel {
 				);
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(inner.x(), inner.y()));
+					helper.draw_layout_grid(backend, inner.into_iced(), &transform, layout);
 					cell.kernel.plot_with_settings(
 						backend,
 						inner.into_iced(),
@@ -636,13 +647,6 @@ impl PlotComposite for PlotGridKernel {
 						PlotLayout::Cartesian {
 							x_range, y_range, ..
 						} => {
-							helper.draw_cartesian_grid(
-								backend,
-								inner.into_iced(),
-								&transform,
-								*x_range,
-								*y_range,
-							);
 							helper.draw_cartesian_axes(
 								backend,
 								inner.into_iced(),
@@ -656,13 +660,6 @@ impl PlotComposite for PlotGridKernel {
 							categories,
 							y_range,
 						} => {
-							helper.draw_categorical_grid(
-								backend,
-								inner.into_iced(),
-								&transform,
-								categories,
-								*y_range,
-							);
 							helper.draw_categorical_axes(
 								backend,
 								inner.into_iced(),
@@ -676,13 +673,6 @@ impl PlotComposite for PlotGridKernel {
 							categories,
 							x_range,
 						} => {
-							helper.draw_categorical_y_grid(
-								backend,
-								inner.into_iced(),
-								&transform,
-								categories,
-								*x_range,
-							);
 							helper.draw_categorical_y_axes(
 								backend,
 								inner.into_iced(),
@@ -1022,7 +1012,7 @@ mod tests {
 	use super::*;
 	use crate::coordinate::Window;
 	use crate::plot::common::{
-		PathBuilder, PlotBackend, PlotRenderLayer, PlotWidget, TickPlacement,
+		AxisType, PathBuilder, PlotBackend, PlotRenderLayer, PlotWidget, TickPlacement,
 	};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
@@ -1100,6 +1090,99 @@ mod tests {
 
 		fn with_clip(&mut self, _bounds: IcedRectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
 			f(self);
+		}
+	}
+
+	#[derive(Clone, Copy, Debug, PartialEq)]
+	struct StrataOperation {
+		kind: StrataOperationKind,
+		clip: Option<IcedRectangle>,
+	}
+
+	#[derive(Clone, Copy, Debug, PartialEq)]
+	enum StrataOperationKind {
+		Fill(Color),
+		Stroke(Color),
+	}
+
+	#[derive(Default)]
+	struct StrataBackend {
+		operations: Vec<StrataOperation>,
+		clips: Vec<IcedRectangle>,
+	}
+
+	impl StrataBackend {
+		fn record(&mut self, kind: StrataOperationKind) {
+			self.operations.push(StrataOperation {
+				kind,
+				clip: self.clips.last().copied(),
+			});
+		}
+	}
+
+	impl PlotBackend for StrataBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke) {
+			let color = match stroke.style {
+				iced::widget::canvas::Style::Solid(color) => color,
+				iced::widget::canvas::Style::Gradient(_) => {
+					panic!("PRODUCT-0068 strata fixture expects solid strokes")
+				}
+			};
+			self.record(StrataOperationKind::Stroke(color));
+		}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), color: Color) {
+			self.record(StrataOperationKind::Fill(color));
+		}
+
+		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, color: Color) {
+			self.record(StrataOperationKind::Fill(color));
+		}
+
+		fn fill_text(&mut self, _text: Text) {}
+
+		fn translate(&mut self, _translation: iced::Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, bounds: IcedRectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			self.clips.push(bounds);
+			f(self);
+			self.clips.pop();
+		}
+	}
+
+	struct Product0068CellKernel {
+		mark: Color,
+	}
+
+	impl PlotKernel for Product0068CellKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+			}
+		}
+
+		fn plot(
+			&self,
+			backend: &mut dyn PlotBackend,
+			_bounds: IcedRectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+			backend.fill_rectangle(Point::new(10.0, 10.0), Size::new(20.0, 20.0), self.mark);
+		}
+
+		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+			None
 		}
 	}
 
@@ -3324,6 +3407,118 @@ mod tests {
 				..
 			}
 		));
+	}
+
+	#[test]
+	fn product_0068_each_facet_cell_clips_grid_then_mark_before_shared_furniture() {
+		let (body, _data, stamped) = fixture();
+		let grid = PlotGrid::value_facet(
+			body,
+			&stamped,
+			"facet",
+			GridArrangement::new(1, 2).expect("arrangement"),
+		)
+		.expect("two-cell facet");
+		let mark = Color::from_rgb8(1, 205, 254);
+		let kernel = PlotGridKernel::from_grid_with_factory(grid, 600, 300, |_spec, _data| {
+			Ok(Arc::new(Product0068CellKernel { mark }))
+		})
+		.expect("strata grid");
+		let resolved = ResolvedPlotSettings {
+			title: ResolvedPresence::Hide,
+			subtitle: ResolvedPresence::Hide,
+			x_label: ResolvedPresence::Hide,
+			y_label: ResolvedPresence::Hide,
+			legend: ResolvedPresence::Hide,
+			x_tick_placement: TickPlacement::count(1).expect("one x interval"),
+			y_tick_placement: TickPlacement::count(1).expect("one y interval"),
+			show_x_minor_ticks: false,
+			show_y_minor_ticks: false,
+			show_x_minor_grid: false,
+			show_y_minor_grid: false,
+			plot_padding_top: 0.0,
+			plot_padding_bottom: 0.0,
+			plot_padding_left: 0.0,
+			plot_padding_right: 0.0,
+			..ResolvedPlotSettings::default()
+		};
+		let grid_color = resolved.chrome.gridline.iced();
+		let axis_color = resolved.chrome.axis_line.iced();
+		let model = PlotSettings::from_resolved(resolved.clone());
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: resolved,
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = StrataBackend::default();
+		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(600.0, 300.0));
+		widget.render(&mut backend, bounds);
+
+		let marks = backend
+			.operations
+			.iter()
+			.enumerate()
+			.filter_map(|(index, operation)| {
+				(operation.kind == StrataOperationKind::Fill(mark))
+					.then_some((index, operation.clip.expect("cell mark must be clipped")))
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			marks.len(),
+			2,
+			"fixture must draw one real mark in each cell"
+		);
+		assert_ne!(marks[0].1, marks[1].1, "each cell owns a distinct clip");
+		for (mark_index, cell_clip) in &marks {
+			assert_ne!(
+				*cell_clip, bounds,
+				"cell guide clip must not widen to the figure"
+			);
+			let grids = backend
+				.operations
+				.iter()
+				.enumerate()
+				.filter(|(_, operation)| {
+					operation.kind == StrataOperationKind::Stroke(grid_color)
+						&& operation.clip == Some(*cell_clip)
+				})
+				.map(|(index, _)| index)
+				.collect::<Vec<_>>();
+			assert!(
+				!grids.is_empty(),
+				"each cell clip must contain real gridlines"
+			);
+			assert!(
+				grids.iter().all(|grid_index| grid_index < mark_index),
+				"PRODUCT-0068: every cell must paint guides before its marks inside the same clip"
+			);
+		}
+		let cell_clips = marks.iter().map(|(_, clip)| *clip).collect::<Vec<_>>();
+		assert!(
+			backend.operations.iter().all(|operation| {
+				operation.kind != StrataOperationKind::Stroke(grid_color)
+					|| operation
+						.clip
+						.is_some_and(|clip| cell_clips.contains(&clip))
+			}),
+			"PRODUCT-0068: no facet grid may paint in a gutter or neighboring clip"
+		);
+		let last_mark = marks.iter().map(|(index, _)| *index).max().expect("marks");
+		assert!(
+			backend
+				.operations
+				.iter()
+				.enumerate()
+				.any(|(index, operation)| {
+					index > last_mark && operation.kind == StrataOperationKind::Stroke(axis_color)
+				}),
+			"PRODUCT-0068: shared facet furniture must remain above all cell marks"
+		);
 	}
 
 	#[test]

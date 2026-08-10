@@ -117,7 +117,7 @@ impl PlotChrome {
 			axis_label_text: decoration,
 			tick_label_text: decoration,
 			axis_line: decoration,
-			gridline: PlotRgba::translucent(1.0, 1.0, 1.0, 0.2),
+			gridline: PlotRgba::translucent(1.0, 1.0, 1.0, 0.35),
 			legend_background: background,
 			legend_text: decoration,
 			legend_swatch_fill: PlotRgba::translucent(1.0, 1.0, 1.0, 0.5),
@@ -136,7 +136,7 @@ impl PlotChrome {
 			tick_label_text: decoration,
 			axis_line: decoration,
 			gridline: PlotRgba {
-				alpha: 0.2,
+				alpha: 0.35,
 				..decoration
 			},
 			legend_background: background,
@@ -415,22 +415,32 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0031_legacy_grid_is_measured_and_not_endorsed() {
-		let checks = PlotChrome::APPLICATION_DEFAULT.visible_contrast_checks();
-		for check in checks {
-			if check.role() == "gridline" {
-				assert!((check.ratio() - 1.6620953314177012).abs() < 1e-6);
-				assert_eq!(check.minimum(), NON_TEXT_CONTRAST_MINIMUM);
-				assert!(!check.passes());
-			} else {
-				assert!(check.passes(), "{}: {:.3}", check.role(), check.ratio());
-			}
+	fn product_0067_defaults_pass_while_the_retired_grid_remains_a_falsifiable_control() {
+		for chrome in [PlotChrome::DEFAULT, PlotChrome::APPLICATION_DEFAULT] {
+			assert_eq!(chrome.gridline.alpha(), 0.35);
+			let grid = chrome
+				.visible_contrast_checks()
+				.into_iter()
+				.find(|check| check.role() == "gridline")
+				.expect("gridline contrast role");
+			assert_eq!(grid.minimum(), NON_TEXT_CONTRAST_MINIMUM);
+			assert!(grid.passes(), "default gridline: {:.3}", grid.ratio());
+			assert!(chrome.passes_contrast());
 		}
-		assert!(!PlotChrome::APPLICATION_DEFAULT.passes_contrast());
-		assert_eq!(
-			PlotChrome::APPLICATION_DEFAULT.weakest_contrast().role(),
-			"gridline"
+
+		let mut retired = PlotChrome::APPLICATION_DEFAULT;
+		retired.gridline = PlotRgba::translucent(1.0, 1.0, 1.0, 0.2);
+		let grid = retired
+			.visible_contrast_checks()
+			.into_iter()
+			.find(|check| check.role() == "gridline")
+			.expect("retired gridline contrast role");
+		assert!((grid.ratio() - 1.6620953314177012).abs() < 1e-6);
+		assert!(
+			!grid.passes(),
+			"the historical control must remain below 3:1"
 		);
+		assert!(!retired.passes_contrast());
 	}
 
 	#[test]
@@ -450,7 +460,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0032_banks_the_omitted_skin_compatibility_chrome() {
+	fn product_0067_only_grid_alpha_supersedes_the_omitted_skin_compatibility_bank() {
 		let chrome = PlotChrome::DEFAULT;
 		let paper = PlotRgba::opaque(0.001, 0.001, 0.001);
 		let ink = PlotRgba::opaque(1.0, 1.0, 1.0);
@@ -460,7 +470,7 @@ mod tests {
 		assert_eq!(chrome.axis_label_text, ink);
 		assert_eq!(chrome.tick_label_text, ink);
 		assert_eq!(chrome.axis_line, ink);
-		assert_eq!(chrome.gridline, PlotRgba::translucent(1.0, 1.0, 1.0, 0.2));
+		assert_eq!(chrome.gridline, PlotRgba::translucent(1.0, 1.0, 1.0, 0.35));
 		assert_eq!(chrome.legend_background, paper);
 		assert_eq!(chrome.legend_text, ink);
 		assert_eq!(
@@ -468,6 +478,10 @@ mod tests {
 			PlotRgba::translucent(1.0, 1.0, 1.0, 0.5)
 		);
 		assert_eq!(chrome.legend_swatch_border, ink);
+
+		let reconstructed = PlotChrome::legacy_from_iced(Color::BLACK, Color::WHITE);
+		assert_eq!(reconstructed.gridline.alpha(), 0.35);
+		assert!(reconstructed.passes_contrast());
 	}
 
 	#[test]

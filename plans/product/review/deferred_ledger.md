@@ -122,11 +122,15 @@ contrast gate; "if a later record does, it uses the WCAG non-text criterion of
 3:1 rather than applying the 4.5:1 text threshold to a hairline." (0031 applied
 3:1 to plot chrome; the table roles remain ungated.) — 0023 §3, Rejected.
 
-**CI-09 · Default plot gridline contrast debt.** The compatibility default's gridline
-measures ≈1.66:1 and is retained as an executable named result; "raising the
-default grid opacity would be a deliberate visual change and needs its own
-record." — 0031 §4, Rejected, stop condition; 0032 §2 (omission preserves it);
-0034 Context (named as the precedent).
+**CI-09 · Default plot gridline contrast debt — retired by PRODUCT-0067.** The
+compatibility default's gridline measured ≈1.66:1 and was retained as an
+executable named result until an exhibit justified the deliberate visual
+change. PRODUCT-0067 raises the three compatibility construction paths to the
+established alpha-`0.35` floor, passes the accepted `3:1` canvas-relative
+assay, and keeps alpha `0.2` as a falsifiable historical control. PRODUCT-0068
+then makes that canvas-relative rule complete by placing visible grids beneath
+opaque marks. — 0031 §4, Rejected, stop condition; 0032 §2; 0034 Context;
+0067 §§1–2, gates 1–7; 0068 §§1–2.
 
 **CI-10 · Broader visualization-theme identity / skin configuration.** "A broader
 visualization-theme identity remains deferred until table and plot evidence

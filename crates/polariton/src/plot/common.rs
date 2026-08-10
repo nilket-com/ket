@@ -920,6 +920,7 @@ impl<'a> PlotWidget<'a> {
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		backend.with_save(&mut |backend| {
 			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
+			self.draw_layout_grid(backend, plot_area, &transform, &layout);
 			self.kernel.plot_with_settings(
 				backend,
 				plot_area,
@@ -958,33 +959,6 @@ impl<'a> PlotWidget<'a> {
 		let bounds = bounds.into_iced();
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
-		backend.with_save(&mut |backend| {
-			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
-			match &layout {
-				PlotLayout::Cartesian {
-					x_range, y_range, ..
-				} => {
-					self.draw_cartesian_grid(backend, plot_area, &transform, *x_range, *y_range);
-				}
-				PlotLayout::CategoricalX {
-					categories,
-					y_range,
-				} => {
-					self.draw_categorical_grid(
-						backend, plot_area, &transform, categories, *y_range,
-					);
-				}
-				PlotLayout::CategoricalY {
-					categories,
-					x_range,
-				} => {
-					self.draw_categorical_y_grid(
-						backend, plot_area, &transform, categories, *x_range,
-					);
-				}
-				_ => {}
-			}
-		});
 		let bg = self.settings.chrome.canvas_background.iced();
 		let canvas_w = bounds.width;
 		let canvas_h = bounds.height;
@@ -1301,6 +1275,29 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 }
 
 impl<'a> PlotWidget<'a> {
+	pub(crate) fn draw_layout_grid(
+		&self,
+		backend: &mut dyn PlotBackend,
+		area: Rectangle,
+		transform: &CoordinateTransformer,
+		layout: &PlotLayout,
+	) {
+		match layout {
+			PlotLayout::Cartesian {
+				x_range, y_range, ..
+			} => self.draw_cartesian_grid(backend, area, transform, *x_range, *y_range),
+			PlotLayout::CategoricalX {
+				categories,
+				y_range,
+			} => self.draw_categorical_grid(backend, area, transform, categories, *y_range),
+			PlotLayout::CategoricalY {
+				categories,
+				x_range,
+			} => self.draw_categorical_y_grid(backend, area, transform, categories, *x_range),
+			_ => {}
+		}
+	}
+
 	pub(crate) fn draw_cartesian_grid(
 		&self,
 		backend: &mut dyn PlotBackend,
@@ -2269,6 +2266,268 @@ mod product_0031_pre_extraction_oracle {
 				assert_eq!(legend_y, expected_y);
 				assert_ne!(legend_y, (height - 45.0) * 0.14);
 			}
+		}
+	}
+}
+
+#[cfg(test)]
+mod product_0067_0068_strata_oracles {
+	use super::*;
+	use crate::plot::theme::PlotSettings;
+	use iced::advanced::mouse::Cursor;
+	use iced::widget::canvas::{Stroke, Text};
+
+	const MARK: Color = Color::from_rgb(0.02, 0.78, 0.94);
+
+	#[derive(Clone, Debug, PartialEq)]
+	enum Operation {
+		Fill(Color),
+		Stroke(Color),
+		Text,
+	}
+
+	#[derive(Default)]
+	struct OperationBackend {
+		operations: Vec<Operation>,
+	}
+
+	impl PlotBackend for OperationBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke) {
+			let color = match stroke.style {
+				Style::Solid(color) => color,
+				Style::Gradient(_) => panic!("strata oracle expects solid plot strokes"),
+			};
+			self.operations.push(Operation::Stroke(color));
+		}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), color: Color) {
+			self.operations.push(Operation::Fill(color));
+		}
+
+		fn fill_rectangle(&mut self, _top_left: Point, _size: iced::Size, color: Color) {
+			self.operations.push(Operation::Fill(color));
+		}
+
+		fn fill_text(&mut self, _text: Text) {
+			self.operations.push(Operation::Text);
+		}
+
+		fn translate(&mut self, _translation: iced::Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
+
+	struct OrderKernel {
+		layout: PlotLayout,
+		mark: bool,
+	}
+
+	impl PlotKernel for OrderKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			self.layout.clone()
+		}
+
+		fn plot(
+			&self,
+			backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+			if self.mark {
+				backend.fill_rectangle(Point::new(20.0, 20.0), iced::Size::new(40.0, 40.0), MARK);
+			}
+		}
+
+		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+			None
+		}
+	}
+
+	fn settings() -> ResolvedPlotSettings {
+		ResolvedPlotSettings {
+			title: ResolvedPresence::Hide,
+			subtitle: ResolvedPresence::Hide,
+			x_label: ResolvedPresence::Hide,
+			y_label: ResolvedPresence::Hide,
+			legend: ResolvedPresence::Hide,
+			x_tick_placement: TickPlacement::count(1).unwrap(),
+			y_tick_placement: TickPlacement::count(1).unwrap(),
+			show_x_minor_ticks: false,
+			show_y_minor_ticks: false,
+			show_x_minor_grid: false,
+			show_y_minor_grid: false,
+			plot_padding_top: 0.0,
+			plot_padding_bottom: 0.0,
+			plot_padding_left: 0.0,
+			plot_padding_right: 0.0,
+			..ResolvedPlotSettings::default()
+		}
+	}
+
+	fn render(layout: PlotLayout, settings: ResolvedPlotSettings, mark: bool) -> Vec<Operation> {
+		let model = PlotSettings::from_resolved(settings.clone());
+		let kernel = OrderKernel { layout, mark };
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings,
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = OperationBackend::default();
+		widget.render(
+			&mut backend,
+			Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 120.0)),
+		);
+		backend.operations
+	}
+
+	fn render_without_plot_layer_grid_dispatch(
+		layout: PlotLayout,
+		settings: ResolvedPlotSettings,
+	) -> Vec<Operation> {
+		let model = PlotSettings::from_resolved(settings.clone());
+		let kernel = OrderKernel { layout, mark: true };
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: settings.clone(),
+			settings_model: model.clone(),
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 120.0));
+		let plot_area = widget.plot_area(Rect::from_iced_frame(bounds)).into_iced();
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, plot_area);
+		let mut backend = OperationBackend::default();
+		backend.fill_rectangle(
+			Point::ORIGIN,
+			bounds.size(),
+			settings.chrome.canvas_background.iced(),
+		);
+		backend.with_save(&mut |backend| {
+			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
+			kernel.plot_with_settings(backend, plot_area, &transform, Cursor::Unavailable, &model);
+		});
+		widget.render_overlay_layer(&mut backend, bounds);
+		backend.operations
+	}
+
+	fn layouts() -> [PlotLayout; 3] {
+		[
+			PlotLayout::Cartesian {
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+			},
+			PlotLayout::CategoricalX {
+				categories: vec!["A".to_owned(), "B".to_owned()],
+				y_range: (0.0, 1.0),
+			},
+			PlotLayout::CategoricalY {
+				categories: vec!["A".to_owned(), "B".to_owned()],
+				x_range: (0.0, 1.0),
+			},
+		]
+	}
+
+	#[test]
+	fn product_0068_guides_precede_marks_and_furniture_follows_for_every_gridded_layout() {
+		let settings = settings();
+		let grid = settings.chrome.gridline.iced();
+		let axis = settings.chrome.axis_line.iced();
+		for layout in layouts() {
+			let operations = render(layout, settings.clone(), true);
+			let mark = operations
+				.iter()
+				.position(|operation| *operation == Operation::Fill(MARK))
+				.expect("real mark operation");
+			let grids = operations
+				.iter()
+				.enumerate()
+				.filter_map(|(index, operation)| {
+					(*operation == Operation::Stroke(grid)).then_some(index)
+				})
+				.collect::<Vec<_>>();
+			let axes = operations
+				.iter()
+				.enumerate()
+				.filter_map(|(index, operation)| {
+					(*operation == Operation::Stroke(axis)).then_some(index)
+				})
+				.collect::<Vec<_>>();
+			assert!(!grids.is_empty(), "fixture must draw real gridlines");
+			assert!(!axes.is_empty(), "fixture must draw real axis furniture");
+			assert!(
+				grids.iter().all(|index| *index < mark),
+				"PRODUCT-0068: guides must precede marks so data colours survive grid intersections: {operations:?}"
+			);
+			assert!(
+				axes.iter().all(|index| *index > mark),
+				"PRODUCT-0068: axes and tick furniture must remain above marks: {operations:?}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0067_marks_free_render_changes_only_the_default_grid_alpha() {
+		let current = settings();
+		let mut retired = current.clone();
+		retired.chrome.gridline = crate::plot::chrome::PlotRgba::translucent(1.0, 1.0, 1.0, 0.2);
+		let current = render(layouts()[0].clone(), current, false);
+		let retired = render(layouts()[0].clone(), retired, false);
+		assert_eq!(current.len(), retired.len());
+		let mut differences = 0;
+		for (current, retired) in current.iter().zip(&retired) {
+			if current == retired {
+				continue;
+			}
+			differences += 1;
+			let (Operation::Stroke(current), Operation::Stroke(retired)) = (current, retired)
+			else {
+				panic!("PRODUCT-0067 may change only grid strokes: {current:?} != {retired:?}");
+			};
+			assert_eq!(
+				(current.r, current.g, current.b),
+				(retired.r, retired.g, retired.b)
+			);
+			assert_eq!(current.a, 0.35);
+			assert_eq!(retired.a, 0.2);
+		}
+		assert!(differences > 0, "marks-free oracle must contain gridlines");
+	}
+
+	#[test]
+	fn product_0068_disabling_every_grid_is_byte_identical_to_the_retired_strata() {
+		let mut settings = settings();
+		settings.show_x_major_grid = false;
+		settings.show_y_major_grid = false;
+		settings.show_x_minor_grid = false;
+		settings.show_y_minor_grid = false;
+		for layout in layouts() {
+			let current = render(layout.clone(), settings.clone(), true);
+			let retired = render_without_plot_layer_grid_dispatch(layout, settings.clone());
+			assert_eq!(
+				current, retired,
+				"PRODUCT-0068: with every guide disabled, moving the empty grid dispatch cannot alter any non-stacked-area draw operation"
+			);
 		}
 	}
 }

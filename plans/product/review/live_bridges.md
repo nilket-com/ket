@@ -81,7 +81,7 @@ No proposals, no prioritization.
   ("curated `c` and `C` remain the preserved no-op for both projections") and
   gate 8; ADR 0028's stop condition also forbids changing it there.
 
-### 4. Compatibility plot chrome default and its 1.66:1 gridline contrast debt
+### 4. Compatibility plot chrome default and its retired gridline contrast debt
 
 - **What:** `PlotChrome::DEFAULT` is "the pre-extraction compatibility
   baseline, not an authored production skin." Its post-composite gridline
@@ -96,12 +96,16 @@ No proposals, no prioritization.
 - **Why accepted:** "An extraction cannot both preserve that output exactly and
   claim the default passes 3:1" (ADR 0031 context); raising grid opacity during
   extraction was rejected as "a visual redesign hidden in a substrate refactor."
-- **Replacement:** "Raising the default grid opacity would be a deliberate
-  visual change and needs its own record."
-- **Still standing:** ADR 0032 §2 keeps omission on "the exact PRODUCT-0031
-  compatibility default" and its consequences note the path "remains honest
-  about its legacy grid"; ADR 0034 cites the 1.66:1 grid as the precedent for
-  non-blocking contrast rather than fixing it. No record changes the default.
+- **Replacement:** PRODUCT-0067 makes the deliberate visual change: every
+  compatibility construction path uses white at alpha `0.35`, the quietest
+  established projection-ladder value that passes the same `3:1` assay.
+  PRODUCT-0068 places grids beneath marks, completing the canvas-relative rule
+  without changing resolved data colours at intersections.
+- **Disposition:** Retired. The old alpha-`0.2` result remains only as the
+  negative control proving the assay can still distinguish the accepted and
+  rejected states. PRODUCT-0031's extraction and PRODUCT-0032's omitted-skin
+  premises are superseded only for grid opacity and grid/mark order; their
+  vocabulary and all sibling role values remain standing.
 
 ### 5. Legacy twelve-color compatibility resolver and the `ColorTheme` catalog
 

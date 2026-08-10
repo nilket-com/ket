@@ -2,9 +2,9 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings, format_label, polars_type_to_axis_type,
 };
+use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
-use iced::{Color, Rectangle};
 use polars::prelude::*;
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -73,7 +73,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 			};
 			backend.fill_path(&area_closure, color);
 			let stroke = Stroke {
-				style: Style::Solid(Color::from_rgba(0.0, 0.0, 0.0, 0.2)),
+				style: Style::Solid(settings.mark_decoration_color),
 				width: 0.5,
 				..Default::default()
 			};
@@ -353,5 +353,93 @@ pub fn prepare_stacked_area_data(
 		y_axis_type,
 		x_label: x_col.to_string(),
 		y_label: y_col.to_string(),
+	}
+}
+
+#[cfg(test)]
+mod product_0068_tests {
+	use super::*;
+	use iced::Color;
+	use iced::widget::canvas::Text;
+
+	#[derive(Default)]
+	struct BoundaryBackend {
+		fills: usize,
+		strokes: Vec<(Color, f32)>,
+	}
+
+	impl PlotBackend for BoundaryBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke) {
+			let color = match stroke.style {
+				Style::Solid(color) => color,
+				Style::Gradient(_) => panic!("stacked-area boundary must be solid"),
+			};
+			self.strokes.push((color, stroke.width));
+		}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {
+			self.fills += 1;
+		}
+
+		fn fill_rectangle(&mut self, _top_left: iced::Point, _size: iced::Size, _color: Color) {}
+
+		fn fill_text(&mut self, _text: Text) {}
+
+		fn translate(&mut self, _translation: iced::Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
+
+	#[test]
+	fn stacked_area_boundaries_use_resolved_mark_decoration_at_the_existing_width() {
+		let kernel = StackedAreaPlotKernel {
+			prepared_data: Arc::new(StackedAreaPreparedData {
+				categories: vec!["Atlas".to_owned(), "Beacon".to_owned()],
+				unique_xs: vec![0.0, 1.0, 2.0],
+				category_values: vec![vec![1.0, 2.0, 3.0], vec![2.0, 1.0, 2.0]],
+				x_range: (0.0, 2.0),
+				y_range: (0.0, 5.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_label: "x".to_owned(),
+				y_label: "y".to_owned(),
+			}),
+		};
+		let decoration = Color::from_rgb8(12, 34, 56);
+		let settings = ResolvedPlotSettings {
+			mark_decoration_color: decoration,
+			..ResolvedPlotSettings::default()
+		};
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(200.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = BoundaryBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+
+		assert_eq!(backend.fills, 2, "both stacked-area fills must render");
+		assert_eq!(backend.strokes.len(), 2, "every fill keeps one boundary");
+		for (color, width) in backend.strokes {
+			assert_eq!(width, 0.5, "PRODUCT-0068 preserves boundary geometry");
+			assert_eq!(color, decoration);
+			assert_ne!(
+				color,
+				Color::from_rgba(0.0, 0.0, 0.0, 0.2),
+				"the theme-blind pre-PRODUCT-0068 boundary must be absent"
+			);
+		}
 	}
 }
