@@ -2057,3 +2057,22 @@ fn product_0073_discovery_is_a_terminal_read_only_store_census() {
 		);
 	}
 }
+
+#[test]
+fn product_0074_polariton_selects_zero_divider_reservation() {
+	let editor =
+		std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/editor.rs"))
+			.expect("read Polariton editor configuration");
+	let config = editor
+		.split("fn polariton_engine_config(")
+		.nth(1)
+		.expect("Polariton engine configuration")
+		.split("impl Drop for CodeEditor")
+		.next()
+		.expect("bounded engine configuration");
+	assert!(config.contains("divider_reservation: PaneDividerReservation::NONE"));
+	assert!(
+		!config.contains("SPLIT_DIVIDER_COLS") && !config.contains("SPLIT_DIVIDER_ROWS"),
+		"the GUI head must not inherit terminal reservation constants"
+	);
+}

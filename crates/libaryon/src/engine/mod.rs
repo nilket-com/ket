@@ -73,9 +73,10 @@ pub use self::minimap::{
 pub use self::protocol::{
 	CommandRange, ConfirmAction, DEFAULT_GIT_REFRESH_SECONDS, EditorCommand, EditorMode,
 	GitRefreshMode, HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape,
-	HostPanelPlacement, MouseIntent, MoveDirection, PaneDropEdge, PaneFocusDirection,
-	PaneResizeDirection, PickerAction, PickerCursorMovement, RepoSearchMode, SecretInput,
-	SplitDirection, SubstituteFlags, UastInspectorMode, VerticalDirection, VisualKind, WordMotion,
+	HostPanelPlacement, MouseIntent, MoveDirection, PaneDividerReservation, PaneDropEdge,
+	PaneFocusDirection, PaneResizeDirection, PickerAction, PickerCursorMovement, RepoSearchMode,
+	SecretInput, SplitDirection, SubstituteFlags, UastInspectorMode, VerticalDirection, VisualKind,
+	WordMotion,
 };
 pub use self::request::{CommandSender, InputSender};
 pub use self::session_checkpoint::{

@@ -4,6 +4,42 @@ use crate::core::{
 use crate::engine::settings::SaveDurability;
 use crate::engine::ui_colors::UiColorKey;
 
+/// Frontend-selected cell reservation between logical pane siblings.
+///
+/// This is runtime presentation state, not part of the persisted layout. A
+/// terminal head reserves visible cells; a graphical head may tile panes and
+/// draw its own pixel-valued chrome inside their bounds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PaneDividerReservation {
+	pub columns: u32,
+	pub rows: u32,
+}
+
+impl PaneDividerReservation {
+	pub const TERMINAL: Self = Self::new(
+		crate::core::SPLIT_DIVIDER_COLS,
+		crate::core::SPLIT_DIVIDER_ROWS,
+	);
+	pub const NONE: Self = Self::new(0, 0);
+
+	pub const fn new(columns: u32, rows: u32) -> Self {
+		Self { columns, rows }
+	}
+
+	pub(crate) const fn cells(self, direction: SplitDirection) -> u32 {
+		match direction {
+			SplitDirection::Vertical => self.columns,
+			SplitDirection::Horizontal => self.rows,
+		}
+	}
+}
+
+impl Default for PaneDividerReservation {
+	fn default() -> Self {
+		Self::TERMINAL
+	}
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EditorMode {
 	Normal,

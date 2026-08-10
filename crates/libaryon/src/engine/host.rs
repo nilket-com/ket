@@ -28,6 +28,8 @@ use std::thread;
 /// Settings and optional initial document used to start an engine instance.
 pub struct EngineConfig {
 	pub settings: EngineSettings,
+	/// Runtime-only pane-divider reservation selected by this frontend.
+	pub divider_reservation: super::PaneDividerReservation,
 	pub initial_file: Option<String>,
 	/// Frontend viewport available during startup, before the command loop can
 	/// receive its first [`EditorCommand::Resize`].
@@ -55,6 +57,7 @@ impl From<EngineSettings> for EngineConfig {
 	fn from(settings: EngineSettings) -> Self {
 		Self {
 			settings,
+			divider_reservation: super::PaneDividerReservation::default(),
 			initial_file: None,
 			initial_viewport: None,
 			init_script: None,
@@ -180,6 +183,7 @@ impl EngineHandle {
 			.expect("failed to spawn SVP refresh bridge");
 		let EngineConfig {
 			settings,
+			divider_reservation,
 			initial_file,
 			initial_viewport,
 			init_script,
@@ -210,6 +214,7 @@ impl EngineHandle {
 			)
 			.with_initial_file(initial_file)
 			.with_initial_viewport(initial_viewport)
+			.with_divider_reservation(divider_reservation)
 			.with_host_events(tx_host_events)
 			.with_rune_host_config(init_script.map(|path| {
 				super::rune_host::RuneHostConfig::with_entrypoint(path, init_entrypoint)

@@ -43,8 +43,9 @@ use libaryon::engine::{
 	Modifiers,
 };
 use libaryon::engine::{
-	HostEvent, HostPanelId, HostPanelPlacement, MinimapSnapshot, PaneDropEdge, PanelRevision,
-	SplitDirection, UiPalette, VisualKind, minimap_click_viewport_start_line,
+	HostEvent, HostPanelId, HostPanelPlacement, MinimapSnapshot, PaneDividerReservation,
+	PaneDropEdge, PanelRevision, SplitDirection, UiPalette, VisualKind,
+	minimap_click_viewport_start_line,
 };
 #[cfg(feature = "toron")]
 use libaryon::engine::{
@@ -57,7 +58,7 @@ use libaryon::svp::markdown_highlight::{MarkdownConstruct, markdown_construct_co
 use libaryon::svp::rust_highlight::{HighlightSpan, default_text_color};
 use libaryon::uast::Viewport;
 use libaryon::uast::projection::{
-	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation,
+	MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellPresentation, PaneDividerViewport,
 };
 use polars::frame::DataFrame;
 use std::collections::{HashMap, VecDeque};
@@ -102,7 +103,14 @@ const PANE_HEADER_HEIGHT: f32 = 22.0;
 /// glyph. The tab-strip surface already distinguishes workspace chrome from
 /// document content.
 const PANE_DRAG_HANDLE_WIDTH: f32 = 30.0;
-const PANE_DRAG_DEADBAND: f32 = 8.0;
+/// Maximum pixel distance from engine-published divider geometry at which a
+/// press may become a resize. This narrows the engine's cell-quantized hit
+/// rectangle; it never creates or widens one.
+const DIVIDER_GRAB_PROXIMITY_PX: f32 = 10.0;
+/// Pointer travel required before a pending press becomes a drag. This is
+/// intentionally independent of divider candidacy: tuning drag feel must not
+/// change how much live pane content is ambiguous.
+const DRAG_ACTIVATION_DEADBAND_PX: f32 = 8.0;
 const DOUBLE_CLICK_INTERVAL: Duration = Duration::from_millis(500);
 /// A plot needs more room than a tabular result, but remains a document block
 /// rather than a workspace pane. Width stays responsive to the preview.
@@ -415,6 +423,10 @@ pub struct CodeEditor {
 	result_revision: u64,
 	/// Divider drag in progress, if any.
 	drag: Option<DividerDrag>,
+	/// A press close enough to an engine-published divider to become a resize.
+	/// Until pointer travel crosses the drag deadband, release resolves it as
+	/// an ordinary click at `origin`.
+	divider_candidate: Option<DividerCandidate>,
 	/// Workspace pane rearrangement in progress. The engine receives one drop
 	/// command on release; it remains the sole owner of the split tree.
 	pane_drag: Option<PaneDrag>,
@@ -529,6 +541,112 @@ struct DividerDrag {
 	/// Distance from the grabbed point to the boundary, so the divider tracks
 	/// the cursor instead of jumping to it.
 	grab_offset: u32,
+}
+
+#[derive(Clone, Copy)]
+struct DividerCandidate {
+	divider: PaneDividerViewport,
+	origin: iced::Point,
+}
+
+fn distance_to_interval(value: f32, start: f32, extent: f32) -> f32 {
+	if extent <= 0.0 {
+		return (value - start).abs();
+	}
+	let end = start + extent;
+	if value < start {
+		start - value
+	} else if value > end {
+		value - end
+	} else {
+		0.0
+	}
+}
+
+fn divider_visual_distance_px(divider: &PaneDividerViewport, point: iced::Point) -> f32 {
+	let visual = pane_pixel_rect(divider.visual_rect);
+	match divider.axis {
+		SplitDirection::Vertical => distance_to_interval(point.x, visual.x, visual.width),
+		SplitDirection::Horizontal => distance_to_interval(point.y, visual.y, visual.height),
+	}
+}
+
+fn divider_press_is_candidate(
+	divider: &PaneDividerViewport,
+	point: iced::Point,
+	proximity: f32,
+) -> bool {
+	let column = (point.x.max(0.0) / metrics::CELL_WIDTH) as u32;
+	let row = (point.y.max(0.0) / metrics::LINE_HEIGHT) as u32;
+	let hit = divider.hit_rect;
+	column >= hit.screen_col.get()
+		&& column < hit.right().get()
+		&& row >= hit.screen_row.get()
+		&& row < hit.bottom().get()
+		&& divider_visual_distance_px(divider, point) <= proximity
+}
+
+fn divider_candidate_at(
+	dividers: &[PaneDividerViewport],
+	point: iced::Point,
+	proximity: f32,
+) -> Option<PaneDividerViewport> {
+	dividers
+		.iter()
+		.find(|divider| divider_press_is_candidate(divider, point, proximity))
+		.copied()
+}
+
+/// Exact pixel region in which the coarse engine hit rectangle and the GUI's
+/// proximity rule agree. This is also the rendered pointer affordance: the
+/// resize cursor must describe the same region that a press can activate.
+fn divider_candidate_rect_px(divider: &PaneDividerViewport, proximity: f32) -> iced::Rectangle {
+	let hit = pane_pixel_rect(divider.hit_rect);
+	let visual = pane_pixel_rect(divider.visual_rect);
+	match divider.axis {
+		SplitDirection::Vertical => {
+			let start = hit.x.max(visual.x - proximity);
+			let end = (hit.x + hit.width).min(visual.x + visual.width + proximity);
+			iced::Rectangle {
+				x: start,
+				y: hit.y,
+				width: (end - start).max(0.0),
+				height: hit.height,
+			}
+		}
+		SplitDirection::Horizontal => {
+			let start = hit.y.max(visual.y - proximity);
+			let end = (hit.y + hit.height).min(visual.y + visual.height + proximity);
+			iced::Rectangle {
+				x: hit.x,
+				y: start,
+				width: hit.width,
+				height: (end - start).max(0.0),
+			}
+		}
+	}
+}
+
+fn drag_activation_reached(origin: iced::Point, pointer: iced::Point, deadband: f32) -> bool {
+	(pointer.x - origin.x).hypot(pointer.y - origin.y) >= deadband
+}
+
+fn divider_drag_from_candidate(candidate: DividerCandidate) -> DividerDrag {
+	let boundary = match candidate.divider.axis {
+		SplitDirection::Vertical => candidate.divider.visual_rect.screen_col.get(),
+		SplitDirection::Horizontal => candidate.divider.visual_rect.screen_row.get(),
+	};
+	let (column, row) = CodeEditor::cell_at(candidate.origin);
+	let position = match candidate.divider.axis {
+		SplitDirection::Vertical => column,
+		SplitDirection::Horizontal => row,
+	};
+	DividerDrag {
+		before: candidate.divider.before,
+		after: candidate.divider.after,
+		axis: candidate.divider.axis,
+		grab_offset: position.saturating_sub(boundary),
+	}
 }
 
 #[derive(Clone, Copy)]
@@ -700,6 +818,7 @@ impl CodeEditor {
 			session_restore_error: None,
 			result_revision: 0,
 			drag: None,
+			divider_candidate: None,
 			pane_drag: None,
 			notebook_outputs: HashMap::new(),
 			notebook_cell_data: HashMap::new(),
@@ -2003,7 +2122,7 @@ impl CodeEditor {
 				// A pane header may publish its more specific press before the
 				// workspace-wide mouse area publishes this generic click. Do not let
 				// the divider hit band steal a drag the header already owns.
-				if self.pane_drag.is_none() && !self.begin_divider_drag() {
+				if self.pane_drag.is_none() && !self.begin_divider_candidate() {
 					self.click_at_pointer();
 					self.begin_pane_drag();
 				}
@@ -2011,11 +2130,15 @@ impl CodeEditor {
 			EditorMsg::PaneDragStarted(pane_id) => {
 				self.cursor_blink.note_activity(time::Instant::now());
 				self.drag = None;
+				self.divider_candidate = None;
 				self.send(EditorCommand::FocusPane(pane_id));
 				self.request_content();
 				self.begin_pane_drag_for(pane_id);
 			}
 			EditorMsg::Release => {
+				if let Some(candidate) = self.divider_candidate.take() {
+					self.click_at(candidate.origin);
+				}
 				self.drag = None;
 				self.finish_pane_drag();
 			}
@@ -2088,17 +2211,24 @@ impl CodeEditor {
 				content,
 			));
 		}
-		// The engine deliberately publishes horizontal divider hit rects wider
-		// than their one-row visual gap. Put those rectangles above pane content:
-		// otherwise a child editor/table captures presses in the expanded rows
-		// and makes the promised grab area unreachable.
+		// Put the exact pixel candidate strip above pane content: otherwise a child
+		// editor/table captures presses in the engine's expanded hit cells and
+		// makes the promised grab area unreachable. The resize cursor makes that
+		// invisible strip discoverable without widening layout space.
 		for divider in &viewport.dividers {
-			let hit = pane_pixel_rect(divider.hit_rect);
+			let candidate = divider_candidate_rect_px(divider, DIVIDER_GRAB_PROXIMITY_PX);
+			if candidate.width <= 0.0 || candidate.height <= 0.0 {
+				continue;
+			}
+			let interaction = match divider.axis {
+				SplitDirection::Vertical => mouse::Interaction::ResizingHorizontally,
+				SplitDirection::Horizontal => mouse::Interaction::ResizingVertically,
+			};
 			layers.push(positioned(
-				hit.x,
-				hit.y,
-				hit.width,
-				hit.height,
+				candidate.x,
+				candidate.y,
+				candidate.width,
+				candidate.height,
 				// Capture the press only. `mouse_area::on_move` reports
 				// coordinates relative to *this* overlay's bounds, which sit at
 				// the divider's offset — publishing them would corrupt
@@ -2111,6 +2241,7 @@ impl CodeEditor {
 						.height(Length::Fill),
 				)
 				.on_press(EditorMsg::Click)
+				.interaction(interaction)
 				.into(),
 			));
 		}
@@ -2228,42 +2359,44 @@ impl CodeEditor {
 		if self.update_pane_drag() {
 			return;
 		}
-		// Continuous resize: every sample while a divider is held becomes a
-		// boundary target, so the split tracks the cursor.
-		if let Some(command) = self.divider_drag_command() {
-			self.send(command);
-		}
+		self.update_divider_gesture();
 	}
 
-	fn begin_divider_drag(&mut self) -> bool {
+	fn begin_divider_candidate(&mut self) -> bool {
 		let (Some(viewport), Some(point)) = (self.viewport.as_ref(), self.last_pointer) else {
 			return false;
 		};
-		let (column, row) = Self::cell_at(point);
-		let Some(divider) = viewport.dividers.iter().find(|divider| {
-			let rect = divider.hit_rect;
-			column >= rect.screen_col.get()
-				&& column < rect.right().get()
-				&& row >= rect.screen_row.get()
-				&& row < rect.bottom().get()
-		}) else {
+		let Some(divider) =
+			divider_candidate_at(&viewport.dividers, point, DIVIDER_GRAB_PROXIMITY_PX)
+		else {
 			return false;
 		};
-		let boundary = match divider.axis {
-			SplitDirection::Vertical => divider.visual_rect.screen_col.get(),
-			SplitDirection::Horizontal => divider.visual_rect.screen_row.get(),
-		};
-		let position = match divider.axis {
-			SplitDirection::Vertical => column,
-			SplitDirection::Horizontal => row,
-		};
-		self.drag = Some(DividerDrag {
-			before: divider.before,
-			after: divider.after,
-			axis: divider.axis,
-			grab_offset: position.saturating_sub(boundary),
+		self.divider_candidate = Some(DividerCandidate {
+			divider,
+			origin: point,
 		});
 		true
+	}
+
+	fn update_divider_gesture(&mut self) -> bool {
+		if let Some(candidate) = self.divider_candidate {
+			let Some(pointer) = self.last_pointer else {
+				return true;
+			};
+			if !drag_activation_reached(candidate.origin, pointer, DRAG_ACTIVATION_DEADBAND_PX) {
+				return true;
+			}
+			self.drag = Some(divider_drag_from_candidate(candidate));
+			self.divider_candidate = None;
+		}
+
+		// Continuous resize: every sample after promotion becomes a boundary
+		// target, so the split tracks the cursor.
+		if let Some(command) = self.divider_drag_command() {
+			self.send(command);
+			return true;
+		}
+		false
 	}
 
 	fn divider_drag_command(&self) -> Option<EditorCommand> {
@@ -2315,7 +2448,7 @@ impl CodeEditor {
 		let Some(pointer) = self.last_pointer else {
 			return true;
 		};
-		if (pointer.x - drag.origin.x).hypot(pointer.y - drag.origin.y) < PANE_DRAG_DEADBAND {
+		if !drag_activation_reached(drag.origin, pointer, DRAG_ACTIVATION_DEADBAND_PX) {
 			return true;
 		}
 		let Some(viewport) = self.viewport.as_ref() else {
@@ -2338,7 +2471,7 @@ impl CodeEditor {
 		let Some(pointer) = self.last_pointer else {
 			return;
 		};
-		if (pointer.x - drag.origin.x).hypot(pointer.y - drag.origin.y) < PANE_DRAG_DEADBAND {
+		if !drag_activation_reached(drag.origin, pointer, DRAG_ACTIVATION_DEADBAND_PX) {
 			return;
 		}
 		if let Some((target, edge)) = drag.target {
@@ -2354,6 +2487,10 @@ impl CodeEditor {
 		let Some(pointer) = self.last_pointer else {
 			return;
 		};
+		self.click_at(pointer);
+	}
+
+	fn click_at(&mut self, pointer: iced::Point) {
 		let Some(viewport) = self.viewport.as_ref() else {
 			return;
 		};
@@ -2432,6 +2569,7 @@ fn polariton_engine_config(
 		initial_viewport,
 		init_script,
 		init_entrypoint: "editor".to_string(),
+		divider_reservation: PaneDividerReservation::NONE,
 		..EngineConfig::default()
 	}
 }
@@ -3227,21 +3365,35 @@ impl PanelRegistry {
 		} else {
 			inner
 		};
-		let surface = color(palette.preview_surface);
-		container(inner)
-			.padding(4)
-			.width(Length::Fill)
-			.height(Length::Fill)
-			.style(move |_| container::Style {
-				background: Some(Background::Color(surface)),
-				border: iced::Border {
-					color: color(palette.divider_surface),
-					width: 1.0,
-					radius: 0.0.into(),
-				},
-				..Default::default()
-			})
-			.into()
+		host_panel_content_frame(inner, palette)
+	}
+}
+
+fn host_panel_content_frame<'a, Renderer>(
+	inner: Element<'a, EditorMsg, Theme, Renderer>,
+	palette: UiPalette,
+) -> Element<'a, EditorMsg, Theme, Renderer>
+where
+	Renderer: iced::advanced::Renderer + 'a,
+{
+	let surface = color(palette.preview_surface);
+	container(inner)
+		.padding(4)
+		.width(Length::Fill)
+		.height(Length::Fill)
+		.style(move |_| host_panel_content_style(surface, palette))
+		.into()
+}
+
+fn host_panel_content_style(surface: Color, palette: UiPalette) -> container::Style {
+	container::Style {
+		background: Some(Background::Color(surface)),
+		border: iced::Border {
+			color: color(palette.divider_surface),
+			width: 1.0,
+			radius: 0.0.into(),
+		},
+		..Default::default()
 	}
 }
 
@@ -3439,14 +3591,10 @@ fn pane_surface<'a>(
 	content: Element<'a, EditorMsg>,
 	retile_outputs: bool,
 ) -> Element<'a, EditorMsg> {
-	let surface: Element<'a, EditorMsg> = container(
-		column![
-			pane_tab_bar(pane, focused, palette, retile_outputs),
-			content,
-		]
-		.width(Length::Fill)
-		.height(Length::Fill),
-	)
+	let surface: Element<'a, EditorMsg> = container(pane_content_stack(
+		pane_tab_bar(pane, focused, palette, retile_outputs),
+		content,
+	))
 	.width(Length::Fill)
 	.height(Length::Fill)
 	.style(move |_| container::Style {
@@ -3459,6 +3607,19 @@ fn pane_surface<'a>(
 	})
 	.into();
 	pane_focus_frame(surface, focused, palette)
+}
+
+fn pane_content_stack<'a, Renderer>(
+	header: Element<'a, EditorMsg, Theme, Renderer>,
+	content: Element<'a, EditorMsg, Theme, Renderer>,
+) -> Element<'a, EditorMsg, Theme, Renderer>
+where
+	Renderer: iced::advanced::Renderer + 'a,
+{
+	column![header, content]
+		.width(Length::Fill)
+		.height(Length::Fill)
+		.into()
 }
 
 const FOCUSED_PANE_BORDER_WIDTH: f32 = 1.0;
@@ -5221,19 +5382,61 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, EditorCommand, EditorMsg,
-		HostPanelPlacement, INITIAL_ROWS, InputEvent, KeyCode, LanguageId, MarkdownBlock,
-		MarkdownPreviewColors, Modifiers, NotebookCellOutput, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP,
-		PaneTabAction, PanelContent, PanelStatus, Rgb, SplitDirection, UiPalette,
-		command_bar_fragments, fence_body_start, highlight_span_at, markdown_code_fragments,
-		metrics, pane_gutter_width, pane_title, parse_markdown_blocks, preview_row_budget,
-		preview_source_window, prompt_cursor_byte, viewport_cells, visible_blocks,
+		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, DIVIDER_GRAB_PROXIMITY_PX,
+		DRAG_ACTIVATION_DEADBAND_PX, EditorCommand, EditorMsg, HostPanelPlacement, INITIAL_ROWS,
+		InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors, Modifiers,
+		NotebookCellOutput, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneTabAction, PanelContent,
+		PanelStatus, Rgb, SplitDirection, UiPalette, command_bar_fragments, divider_candidate_at,
+		divider_candidate_rect_px, divider_press_is_candidate, drag_activation_reached,
+		fence_body_start, highlight_span_at, host_panel_content_frame, host_panel_content_style,
+		markdown_code_fragments, metrics, pane_content_stack, pane_gutter_width, pane_title,
+		parse_markdown_blocks, polariton_engine_config, preview_row_budget, preview_source_window,
+		prompt_cursor_byte, viewport_cells, visible_blocks,
 	};
 	use crate::gui::table_skin::{TableRgba, TableSkin};
 	use libaryon::svp::markdown_highlight::MarkdownConstruct;
 	use libaryon::svp::rust_highlight::TokenCategory;
 	use std::thread;
 	use std::time::{Duration, Instant};
+
+	fn product_0074_framed_host_panel() -> iced::Element<'static, EditorMsg, iced::Theme, ()> {
+		let header: iced::Element<'static, EditorMsg, iced::Theme, ()> = iced::widget::Space::new()
+			.width(iced::Length::Fill)
+			.height(iced::Length::Fixed(PANE_HEADER_HEIGHT))
+			.into();
+		let content: iced::Element<'static, EditorMsg, iced::Theme, ()> =
+			iced::widget::Space::new()
+				.width(iced::Length::Fill)
+				.height(iced::Length::Fill)
+				.into();
+		pane_content_stack(
+			header,
+			host_panel_content_frame(content, UiPalette::default()),
+		)
+	}
+
+	fn product_0074_leaf_bounds(node: &iced::advanced::layout::Node) -> Vec<iced::Rectangle> {
+		fn collect(layout: iced::advanced::Layout<'_>, leaves: &mut Vec<iced::Rectangle>) {
+			let children = layout.children().collect::<Vec<_>>();
+			if children.is_empty() {
+				leaves.push(layout.bounds());
+			} else {
+				for child in children {
+					collect(child, leaves);
+				}
+			}
+		}
+		let mut leaves = Vec::new();
+		collect(iced::advanced::Layout::new(node), &mut leaves);
+		leaves
+	}
+
+	fn product_0074_compact_editor(text: &str) -> CodeEditor {
+		CodeEditor::spawn(
+			polariton_engine_config(None, None, Some((120, 40))),
+			Some(text),
+		)
+	}
 
 	#[cfg(feature = "toron")]
 	#[test]
@@ -7229,8 +7432,8 @@ mod tests {
 			.expect("horizontal divider")
 			.to_owned();
 		// A point squarely inside the hit band, in editor-local pixels.
-		let band_row = divider.hit_rect.screen_row.get();
-		let local_y = (band_row as f32 + 0.5) * metrics::LINE_HEIGHT;
+		let local_y = divider.visual_rect.screen_row.get() as f32 * metrics::LINE_HEIGHT
+			- DIVIDER_GRAB_PROXIMITY_PX / 2.0;
 		let local = Point::new(300.0, local_y);
 
 		// Simulate the workspace chrome: the subscription reports window
@@ -7254,13 +7457,16 @@ mod tests {
 			"subscription window coords convert to editor-local: got {lp:?}, want ~{local:?}"
 		);
 		assert!(
-			editor.begin_divider_drag(),
+			editor.begin_divider_candidate(),
 			"the converted point still resolves the divider"
 		);
 		assert_eq!(
-			editor.drag.map(|d| d.axis),
+			editor
+				.divider_candidate
+				.map(|candidate| candidate.divider.axis),
 			Some(SplitDirection::Horizontal)
 		);
+		assert!(editor.drag.is_none(), "a press alone is not a resize");
 	}
 
 	#[test]
@@ -7304,23 +7510,31 @@ mod tests {
 		assert!(divider.hit_rect.screen_row.get() < divider.visual_rect.screen_row.get());
 		assert_eq!(divider.hit_rect.bottom(), divider.visual_rect.bottom());
 
-		// Every pixel row across the widened band resolves to the drag — the
-		// gap itself and the padding row above it, but not the bottom pane header.
-		let top = divider.hit_rect.screen_row.get();
-		let bottom = divider.hit_rect.bottom().get();
-		for row in top..bottom {
-			let y = (row as f32 + 0.5) * metrics::LINE_HEIGHT;
+		// The painted gap stays eligible at every point, while only the nearest
+		// eight pixels of overlapped live content are ambiguous.
+		let boundary_y = divider.visual_rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
+		for y in [
+			boundary_y + 1.0,
+			boundary_y + metrics::LINE_HEIGHT / 2.0,
+			boundary_y + metrics::LINE_HEIGHT - 1.0,
+			boundary_y - DIVIDER_GRAB_PROXIMITY_PX / 2.0,
+		] {
 			editor.last_pointer = Some(iced::Point::new(300.0, y));
+			editor.divider_candidate = None;
 			editor.drag = None;
-			assert!(
-				editor.begin_divider_drag(),
-				"row {row} inside the hit band must start a drag"
-			);
-			assert_eq!(
-				editor.drag.map(|d| d.axis),
-				Some(SplitDirection::Horizontal)
-			);
+			assert!(editor.begin_divider_candidate(), "y={y} must be eligible");
+			assert!(editor.drag.is_none(), "eligibility is not promotion");
 		}
+
+		editor.last_pointer = Some(iced::Point::new(
+			300.0,
+			boundary_y - DIVIDER_GRAB_PROXIMITY_PX - 2.0,
+		));
+		editor.divider_candidate = None;
+		assert!(
+			!editor.begin_divider_candidate(),
+			"live content beyond pixel proximity must remain an ordinary click"
+		);
 
 		let lower_pane = editor
 			.viewport
@@ -7338,7 +7552,7 @@ mod tests {
 		editor.last_pointer = Some(header_point);
 		editor.drag = None;
 		assert!(
-			!editor.begin_divider_drag(),
+			!editor.begin_divider_candidate(),
 			"the lower pane header must not start divider resizing"
 		);
 		editor.begin_pane_drag();
@@ -7347,6 +7561,397 @@ mod tests {
 			Some(divider.after),
 			"the lower pane header starts pane reordering"
 		);
+	}
+
+	#[test]
+	fn product_0074_default_overlap_release_places_cursor_without_resizing() {
+		use libaryon::engine::SplitDirection;
+
+		let source = (0..100)
+			.map(|index| format!("line{index:03}"))
+			.collect::<Vec<_>>()
+			.join("\n");
+		let mut editor = CodeEditor::new(&source);
+		wait_for_content(&mut editor, &source);
+		editor.resize(1200.0, 800.0);
+		editor.send(EditorCommand::SplitPane(SplitDirection::Horizontal));
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			!viewport
+				.dividers
+				.iter()
+				.any(|divider| divider.axis == SplitDirection::Horizontal)
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+
+		let (press, expected_pane, expected_line, expected_col, rects_before) = {
+			let viewport = editor.viewport.as_ref().expect("split viewport");
+			let divider = viewport
+				.dividers
+				.iter()
+				.find(|divider| divider.axis == SplitDirection::Horizontal)
+				.expect("horizontal divider");
+			assert_eq!(
+				divider.visual_rect.height.get(),
+				1,
+				"gate 2 runs before the compact profile"
+			);
+			let pane = viewport.pane(divider.before).expect("pane above divider");
+			let boundary_y = divider.visual_rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
+			let press = iced::Point::new(
+				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH
+					+ pane_gutter_width(pane)
+					+ metrics::CELL_WIDTH * 2.5,
+				boundary_y - DIVIDER_GRAB_PROXIMITY_PX / 2.0,
+			);
+			let pane_top = pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
+			let local_row =
+				((press.y - pane_top - PANE_HEADER_HEIGHT) / metrics::LINE_HEIGHT).floor() as usize;
+			let visible = pane
+				.visible_rows
+				.get(local_row)
+				.expect("the overlapped row contains live document content");
+			(
+				press,
+				pane.pane_id,
+				visible.line,
+				visible.start_col.get() + 2,
+				viewport
+					.panes
+					.iter()
+					.map(|pane| (pane.pane_id, pane.rect))
+					.collect::<Vec<_>>(),
+			)
+		};
+
+		let _ = editor.update(EditorMsg::PointerMoved(press));
+		let _ = editor.update(EditorMsg::Click);
+		assert!(
+			editor.divider_candidate.is_some(),
+			"press in the overlap is pending rather than an immediate drag"
+		);
+		assert!(editor.drag.is_none(), "the legacy immediate drag is absent");
+		editor.apply_pointer(iced::Point::new(
+			press.x + DRAG_ACTIVATION_DEADBAND_PX / 2.0,
+			press.y,
+		));
+		assert!(
+			editor.divider_candidate.is_some(),
+			"sub-deadband wobble stays pending"
+		);
+		assert!(editor.drag.is_none());
+		let _ = editor.update(EditorMsg::Release);
+		assert!(editor.divider_candidate.is_none());
+		assert!(editor.drag.is_none());
+
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			viewport.focused_pane_id != expected_pane
+				|| viewport.pane(expected_pane).is_none_or(|pane| {
+					pane.cursor_abs_pos.line != expected_line
+						|| pane.cursor_abs_pos.col.get() != expected_col
+				})
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("clicked viewport");
+		let cursor = viewport
+			.pane(expected_pane)
+			.expect("clicked pane")
+			.cursor_abs_pos;
+		assert_eq!(
+			(cursor.line, cursor.col.get()),
+			(expected_line, expected_col)
+		);
+		assert_eq!(
+			viewport
+				.panes
+				.iter()
+				.map(|pane| (pane.pane_id, pane.rect))
+				.collect::<Vec<_>>(),
+			rects_before,
+			"release-resolved click must not move topology"
+		);
+	}
+
+	#[test]
+	fn product_0074_proximity_and_activation_deadband_are_independent() {
+		use libaryon::core::{PaneCol, PaneId, PaneRect, PaneRow, ScreenCol, ScreenRow};
+		use libaryon::uast::projection::PaneDividerViewport;
+
+		let divider = PaneDividerViewport {
+			before: PaneId::new(1),
+			after: PaneId::new(2),
+			axis: SplitDirection::Vertical,
+			visual_rect: PaneRect::new(
+				ScreenCol::new(20),
+				ScreenRow::ZERO,
+				PaneCol::ZERO,
+				PaneRow::new(10),
+			),
+			hit_rect: PaneRect::new(
+				ScreenCol::new(19),
+				ScreenRow::ZERO,
+				PaneCol::new(1),
+				PaneRow::new(10),
+			),
+		};
+		let six_pixels_left = iced::Point::new(20.0 * metrics::CELL_WIDTH - 6.0, 30.0);
+		assert!(divider_press_is_candidate(&divider, six_pixels_left, 8.0));
+		assert!(!divider_press_is_candidate(&divider, six_pixels_left, 4.0));
+		assert_eq!(
+			divider_candidate_at(&[], six_pixels_left, 8.0),
+			None,
+			"a viewport publishing no divider has no candidate anywhere"
+		);
+		let boundary_but_outside_hit = iced::Point::new(20.0 * metrics::CELL_WIDTH, 30.0);
+		assert_eq!(
+			divider_candidate_at(&[divider], boundary_but_outside_hit, 8.0),
+			None,
+			"pixel proximity may never widen engine-published hit authority"
+		);
+
+		let origin = iced::Point::ORIGIN;
+		let six_pixels_moved = iced::Point::new(6.0, 0.0);
+		assert!(!drag_activation_reached(origin, six_pixels_moved, 8.0));
+		assert!(drag_activation_reached(origin, six_pixels_moved, 4.0));
+		assert!(
+			divider_press_is_candidate(&divider, six_pixels_left, 8.0)
+				&& !drag_activation_reached(origin, six_pixels_moved, 8.0),
+			"candidacy and promotion may disagree because they are independent"
+		);
+
+		let vertical_affordance = divider_candidate_rect_px(&divider, 10.0);
+		assert!((vertical_affordance.width - metrics::CELL_WIDTH).abs() < 0.001);
+		assert!(
+			(vertical_affordance.x + vertical_affordance.width - 20.0 * metrics::CELL_WIDTH).abs()
+				< 0.001,
+			"the visible affordance consumes the full published column and never widens it"
+		);
+		let horizontal = PaneDividerViewport {
+			axis: SplitDirection::Horizontal,
+			visual_rect: PaneRect::new(
+				ScreenCol::ZERO,
+				ScreenRow::new(10),
+				PaneCol::new(20),
+				PaneRow::ZERO,
+			),
+			hit_rect: PaneRect::new(
+				ScreenCol::ZERO,
+				ScreenRow::new(9),
+				PaneCol::new(20),
+				PaneRow::new(1),
+			),
+			..divider
+		};
+		let horizontal_affordance = divider_candidate_rect_px(&horizontal, 10.0);
+		assert!((horizontal_affordance.height - 10.0).abs() < 0.001);
+		assert!(
+			(horizontal_affordance.y + horizontal_affordance.height - 10.0 * metrics::LINE_HEIGHT)
+				.abs() < 0.001,
+			"the horizontal affordance ends at the zero-height boundary"
+		);
+	}
+
+	#[test]
+	fn product_0074_rendered_host_canvas_separation_is_eight_by_thirty_pixels() {
+		use iced::advanced::layout::Limits;
+		use iced::advanced::widget::Tree;
+
+		fn layout(
+			mut element: iced::Element<'static, EditorMsg, iced::Theme, ()>,
+		) -> Vec<iced::Rectangle> {
+			let mut tree = Tree::new(element.as_widget());
+			let node = element.as_widget_mut().layout(
+				&mut tree,
+				&(),
+				&Limits::new(iced::Size::ZERO, iced::Size::new(200.0, 200.0)),
+			);
+			product_0074_leaf_bounds(&node)
+		}
+
+		let side_by_side: iced::Element<'static, EditorMsg, iced::Theme, ()> =
+			iced::widget::Row::new()
+				.push(product_0074_framed_host_panel())
+				.push(product_0074_framed_host_panel())
+				.width(iced::Length::Fill)
+				.height(iced::Length::Fill)
+				.into();
+		let side_leaves = layout(side_by_side);
+		assert_eq!(side_leaves.len(), 4, "two headers and two plot canvases");
+		let side_gap = side_leaves[3].x - (side_leaves[1].x + side_leaves[1].width);
+		assert_eq!(
+			side_gap, 8.0,
+			"actual widget layout measures the canvas gutter"
+		);
+
+		let stacked: iced::Element<'static, EditorMsg, iced::Theme, ()> =
+			iced::widget::Column::new()
+				.push(product_0074_framed_host_panel())
+				.push(product_0074_framed_host_panel())
+				.width(iced::Length::Fill)
+				.height(iced::Length::Fill)
+				.into();
+		let stacked_leaves = layout(stacked);
+		assert_eq!(stacked_leaves.len(), 4, "two headers and two plot canvases");
+		let stacked_gap = stacked_leaves[3].y - (stacked_leaves[1].y + stacked_leaves[1].height);
+		assert_eq!(stacked_gap, 30.0);
+		assert_eq!(
+			stacked_gap - side_gap,
+			PANE_HEADER_HEIGHT,
+			"the sole asymmetry is one rendered pane header"
+		);
+
+		let style = host_panel_content_style(
+			super::color(UiPalette::default().preview_surface),
+			UiPalette::default(),
+		);
+		assert_eq!(style.border.width, 1.0);
+		assert!(
+			2.0 * style.border.width < side_gap,
+			"the two-pixel painted seam lies inside the measured eight-pixel layout gutter"
+		);
+	}
+
+	#[test]
+	fn product_0074_zero_reservation_keeps_both_axes_grabbable_and_headers_first() {
+		let mut editor = product_0074_compact_editor("one\ntwo\nthree\n");
+		wait_for_content(&mut editor, "one\ntwo\nthree\n");
+		editor.resize(1200.0, 800.0);
+		editor.send(EditorCommand::SplitPane(SplitDirection::Vertical));
+		editor.send(EditorCommand::SplitPane(SplitDirection::Horizontal));
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			![SplitDirection::Vertical, SplitDirection::Horizontal]
+				.into_iter()
+				.all(|axis| viewport.dividers.iter().any(|divider| divider.axis == axis))
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+
+		let vertical = *editor
+			.viewport
+			.as_ref()
+			.expect("compact split viewport")
+			.dividers
+			.iter()
+			.find(|divider| divider.axis == SplitDirection::Vertical)
+			.expect("zero-width vertical boundary");
+		assert_eq!(vertical.visual_rect.width.get(), 0);
+		let boundary_x = vertical.visual_rect.screen_col.get() as f32 * metrics::CELL_WIDTH;
+		let header_press = iced::Point::new(
+			boundary_x - DIVIDER_GRAB_PROXIMITY_PX / 2.0,
+			vertical.visual_rect.screen_row.get() as f32 * metrics::LINE_HEIGHT
+				+ PANE_HEADER_HEIGHT / 2.0,
+		);
+		assert!(divider_press_is_candidate(
+			&vertical,
+			header_press,
+			DIVIDER_GRAB_PROXIMITY_PX,
+		));
+		editor.last_pointer = Some(header_press);
+		let _ = editor.update(EditorMsg::PaneDragStarted(vertical.before));
+		let _ = editor.update(EditorMsg::Click);
+		assert_eq!(
+			editor.pane_drag.map(|drag| drag.source),
+			Some(vertical.before)
+		);
+		assert!(editor.divider_candidate.is_none());
+		assert!(
+			editor.drag.is_none(),
+			"pane header ownership wins the press"
+		);
+		let _ = editor.update(EditorMsg::Release);
+
+		fn boundary(
+			viewport: &libaryon::uast::Viewport,
+			before: libaryon::core::PaneId,
+			after: libaryon::core::PaneId,
+			axis: SplitDirection,
+		) -> u32 {
+			let divider = viewport
+				.dividers
+				.iter()
+				.find(|divider| {
+					divider.before == before && divider.after == after && divider.axis == axis
+				})
+				.expect("same logical divider survives resize");
+			match axis {
+				SplitDirection::Vertical => divider.visual_rect.screen_col.get(),
+				SplitDirection::Horizontal => divider.visual_rect.screen_row.get(),
+			}
+		}
+
+		for axis in [SplitDirection::Vertical, SplitDirection::Horizontal] {
+			let divider = *editor
+				.viewport
+				.as_ref()
+				.unwrap()
+				.dividers
+				.iter()
+				.find(|divider| divider.axis == axis)
+				.expect("axis boundary");
+			let before_boundary = boundary(
+				editor.viewport.as_ref().unwrap(),
+				divider.before,
+				divider.after,
+				axis,
+			);
+			let press = match axis {
+				SplitDirection::Vertical => iced::Point::new(
+					before_boundary as f32 * metrics::CELL_WIDTH - DIVIDER_GRAB_PROXIMITY_PX / 2.0,
+					(divider.visual_rect.screen_row.get() + divider.visual_rect.height.get() / 2)
+						as f32 * metrics::LINE_HEIGHT,
+				),
+				SplitDirection::Horizontal => iced::Point::new(
+					(divider.visual_rect.screen_col.get() + divider.visual_rect.width.get() / 2)
+						as f32 * metrics::CELL_WIDTH,
+					before_boundary as f32 * metrics::LINE_HEIGHT - DIVIDER_GRAB_PROXIMITY_PX / 2.0,
+				),
+			};
+			editor.last_pointer = Some(press);
+			assert!(editor.begin_divider_candidate());
+			let moved = match axis {
+				SplitDirection::Vertical => {
+					iced::Point::new(press.x + 2.0 * metrics::CELL_WIDTH, press.y)
+				}
+				SplitDirection::Horizontal => {
+					iced::Point::new(press.x, press.y + 2.0 * metrics::LINE_HEIGHT)
+				}
+			};
+			editor.apply_pointer(moved);
+			assert_eq!(editor.drag.map(|drag| drag.axis), Some(axis));
+			let deadline = Instant::now() + Duration::from_secs(5);
+			while boundary(
+				editor.viewport.as_ref().unwrap(),
+				divider.before,
+				divider.after,
+				axis,
+			) == before_boundary
+				&& Instant::now() < deadline
+			{
+				editor.poll();
+				thread::sleep(Duration::from_millis(5));
+			}
+			assert_ne!(
+				boundary(
+					editor.viewport.as_ref().unwrap(),
+					divider.before,
+					divider.after,
+					axis,
+				),
+				before_boundary,
+				"zero-reservation {axis:?} boundary moves on its own axis"
+			);
+			let _ = editor.update(EditorMsg::Release);
+		}
 	}
 
 	#[test]
@@ -7382,11 +7987,20 @@ mod tests {
 				row as f32 * metrics::LINE_HEIGHT,
 			)
 		};
-		editor.last_pointer = Some(point(column, row));
+		editor.last_pointer = Some(iced::Point::new(
+			(column as f32 + 0.5) * metrics::CELL_WIDTH,
+			(row as f32 + 0.5) * metrics::LINE_HEIGHT,
+		));
 		assert!(
-			editor.begin_divider_drag(),
-			"a press inside the published hit rect starts a drag"
+			editor.begin_divider_candidate(),
+			"a press inside the published hit rect starts a candidate"
 		);
+		assert!(editor.drag.is_none(), "press alone cannot resize");
+		let origin = editor.last_pointer.expect("candidate origin");
+		editor.apply_pointer(iced::Point::new(
+			origin.x + DRAG_ACTIVATION_DEADBAND_PX + metrics::CELL_WIDTH,
+			origin.y,
+		));
 		let EditorCommand::ResizePaneBoundary {
 			before: dragged_before,
 			after: dragged_after,
@@ -7404,12 +8018,17 @@ mod tests {
 		else {
 			panic!("divider drag must produce a boundary resize");
 		};
-		assert_eq!(moved, target - 8);
+		assert!(moved < target, "moving left must lower the boundary target");
+		assert_eq!(
+			moved,
+			(column - 8).saturating_sub(editor.drag.expect("active drag").grab_offset)
+		);
 
 		// Away from any divider, a press falls through to cursor placement.
 		editor.drag = None;
+		editor.divider_candidate = None;
 		editor.last_pointer = Some(point(2, row));
-		assert!(!editor.begin_divider_drag());
+		assert!(!editor.begin_divider_candidate());
 	}
 
 	#[test]

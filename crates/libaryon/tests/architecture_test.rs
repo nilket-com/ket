@@ -393,6 +393,27 @@ fn product_0061_projected_census_is_exactly_three_identity_sets() {
 }
 
 #[test]
+fn product_0074_divider_profile_is_runtime_geometry_not_saved_layout() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let session = fs::read_to_string(manifest_dir.join("src/engine/session.rs"))
+		.expect("read session geometry");
+	let render = fs::read_to_string(manifest_dir.join("src/engine/render.rs"))
+		.expect("read divider projection");
+	for (name, source) in [("session", &session), ("render", &render)] {
+		assert!(
+			!source.contains("SPLIT_DIVIDER_COLS") && !source.contains("SPLIT_DIVIDER_ROWS"),
+			"PRODUCT-0074 {name} geometry must consume PaneDividerReservation, not fixed constants"
+		);
+	}
+	let layout = fs::read_to_string(manifest_dir.join("src/engine/layout_checkpoint.rs"))
+		.expect("read logical layout codec");
+	assert!(
+		!layout.contains("PaneDividerReservation") && !layout.contains("divider_reservation"),
+		"PRODUCT-0074 runtime presentation state must not enter libaryon_layout"
+	);
+}
+
+#[test]
 fn product_0060_trybuild_is_a_dev_only_capability_oracle() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read manifest");

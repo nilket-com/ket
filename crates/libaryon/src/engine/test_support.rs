@@ -531,6 +531,18 @@ pub(crate) fn spawn_test_engine_with_sql() -> (
 	mpsc::Receiver<Viewport>,
 	thread::JoinHandle<()>,
 ) {
+	spawn_test_engine_with_sql_and_divider_reservation(
+		crate::engine::PaneDividerReservation::TERMINAL,
+	)
+}
+
+pub(crate) fn spawn_test_engine_with_sql_and_divider_reservation(
+	reservation: crate::engine::PaneDividerReservation,
+) -> (
+	CommandSender,
+	mpsc::Receiver<Viewport>,
+	thread::JoinHandle<()>,
+) {
 	use crate::svp::sql_provider::SqlProvider;
 
 	let (tx_cmd, _input, tx_internal, rx_request) = super::request::channel();
@@ -559,7 +571,8 @@ pub(crate) fn spawn_test_engine_with_sql() -> (
 		SaveDurability::default(),
 		UiColorOverrides::default(),
 		BTreeMap::new(),
-	);
+	)
+	.with_divider_reservation(reservation);
 	let handle = thread::spawn(move || engine.run());
 	(tx_cmd, rx_view, handle)
 }

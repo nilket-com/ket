@@ -135,7 +135,7 @@ zero-extent visual_rect        perpendicular distance to the boundary line
 ```
 
 Without the first clause, a 38.4px divider's centre would sit 19.2px from either
-edge and fail an 8px test, making the painted gap itself ineligible.
+edge and fail a 10px test, making the painted gap itself ineligible.
 
 Two named constants are introduced, and neither is defined in terms of the
 other:
@@ -145,16 +145,22 @@ DIVIDER_GRAB_PROXIMITY_PX     how near the boundary a press may begin a resize
 DRAG_ACTIVATION_DEADBAND_PX   how far the pointer must move to promote a gesture
 ```
 
-Both start at `8.0`. They answer unrelated questions, and tuning header-drag
-feel must not silently widen the strip in which an ordinary click is at risk.
+`DIVIDER_GRAB_PROXIMITY_PX` starts at `10.0` and
+`DRAG_ACTIVATION_DEADBAND_PX` at `8.0`. They answer unrelated questions, and
+tuning header-drag feel must not silently widen the strip in which an ordinary
+click is at risk. The accepted geometry exhibit exposed the distinction: a 2px
+painted seam with an invisible 8px target still felt one pixel wide in direct
+use. The final implementation consumes the full engine-published column (9.6px)
+or 10px of the published row and shows the axis-appropriate resize cursor over
+that exact candidate region. Layout space and the painted seam do not grow.
 `PANE_DRAG_DEADBAND` is renamed to `DRAG_ACTIVATION_DEADBAND_PX` and continues
 to serve pane-header promotion; no third deadband is introduced.
 
 Under today's positive-width gaps the whole painted divider remains eligible,
-and only the 8px nearest the boundary inside the overlapped cell is ambiguous.
-Under §5's zero-reservation profile the same 8px strip beside the boundary stays
-draggable. The remainder of the overlapped cell recovers immediate cursor
-placement it does not have today.
+and only the candidate region nearest the boundary inside the overlapped cell
+is ambiguous. Under §5's zero-reservation profile the full preceding column or
+10px preceding-row strip beside the boundary stays draggable. The remainder of
+the overlapped cell recovers immediate cursor placement it does not have today.
 
 ### 3. The frontend narrows what the engine publishes; it never widens it
 

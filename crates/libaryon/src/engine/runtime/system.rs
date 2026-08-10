@@ -2283,7 +2283,8 @@ mod tests {
 		recv_view, spawn_test_engine, spawn_test_engine_with_csv, spawn_test_engine_with_input,
 		spawn_test_engine_with_markdown, spawn_test_engine_with_python_and_rune,
 		spawn_test_engine_with_rust, spawn_test_engine_with_rust_and_language_themes,
-		spawn_test_engine_with_sql, temp_test_path,
+		spawn_test_engine_with_sql, spawn_test_engine_with_sql_and_divider_reservation,
+		temp_test_path,
 	};
 	use crate::engine::undo::TextDelta;
 	use crate::engine::{EditorMode, GitRefreshMode, GutterNumbering, MouseIntent, Theme};
@@ -6102,6 +6103,15 @@ mod tests {
 			"a split must project a draggable divider"
 		);
 		let divider = opened.dividers.first().expect("divider");
+		assert_eq!(
+			divider.visual_rect.width.get(),
+			crate::core::SPLIT_DIVIDER_COLS,
+			"PRODUCT-0074 banks Baryon's four-column visual divider before profiles exist"
+		);
+		assert_eq!(
+			divider.hit_rect, divider.visual_rect,
+			"PRODUCT-0074 banks Baryon's vertical hit rectangle byte-for-byte"
+		);
 		assert!(
 			divider.hit_rect.width.get() >= divider.visual_rect.width.get()
 				&& divider.hit_rect.height.get() >= divider.visual_rect.height.get(),
@@ -6145,6 +6155,68 @@ mod tests {
 		assert!(
 			panel_pane.tokens.is_empty(),
 			"a host panel projects no text"
+		);
+
+		tx_cmd.send(EditorCommand::Quit).expect("quit");
+		handle.join().expect("engine thread");
+	}
+
+	#[test]
+	fn product_0074_zero_reservation_projects_zero_visuals_and_live_hits_in_both_axes() {
+		use crate::engine::{HostPanelId, PaneDividerReservation};
+
+		let (tx_cmd, rx_view, handle) =
+			spawn_test_engine_with_sql_and_divider_reservation(PaneDividerReservation::NONE);
+		let vertical = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::OpenHostPanel {
+				panel_id: HostPanelId::new(7401),
+				kind: "product-0074".to_owned(),
+				title: "vertical".to_owned(),
+				placement: crate::engine::HostPanelPlacement::Split {
+					direction: SplitDirection::Vertical,
+				},
+				focus: true,
+			},
+		);
+		let vertical = vertical
+			.dividers
+			.iter()
+			.find(|divider| divider.axis == SplitDirection::Vertical)
+			.expect("vertical divider");
+		assert_eq!(vertical.visual_rect.width.get(), 0);
+		assert_eq!(vertical.hit_rect.width.get(), 1);
+		assert_eq!(
+			vertical.hit_rect.right(),
+			vertical.visual_rect.screen_col,
+			"zero-reservation hit authority is exactly the preceding cell"
+		);
+
+		let horizontal = send_cmd_and_recv(
+			&tx_cmd,
+			&rx_view,
+			EditorCommand::OpenHostPanel {
+				panel_id: HostPanelId::new(7402),
+				kind: "product-0074".to_owned(),
+				title: "horizontal".to_owned(),
+				placement: crate::engine::HostPanelPlacement::Split {
+					direction: SplitDirection::Horizontal,
+				},
+				focus: true,
+			},
+		);
+		let horizontal = horizontal
+			.dividers
+			.iter()
+			.find(|divider| divider.axis == SplitDirection::Horizontal)
+			.expect("horizontal divider");
+		assert_eq!(horizontal.visual_rect.height.get(), 0);
+		assert_eq!(horizontal.hit_rect.height.get(), 1);
+		assert_eq!(
+			horizontal.hit_rect.bottom(),
+			horizontal.visual_rect.screen_row,
+			"zero-reservation hit authority is exactly the preceding cell"
 		);
 
 		tx_cmd.send(EditorCommand::Quit).expect("quit");

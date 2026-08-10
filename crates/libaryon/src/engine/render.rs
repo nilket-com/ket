@@ -312,6 +312,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 	let picker = picker_viewport(session.picker.as_ref(), session.terminal_height);
 	let shared_identity_census = session.shared_identity_census();
 
+	let divider_reservation = session.divider_reservation;
 	let EditorSession {
 		input,
 		viewport_id,
@@ -400,7 +401,7 @@ pub(crate) fn render_frame(params: RenderParams<'_>) -> bool {
 		*hit_test_fingerprint = Some(next_hit_test_fingerprint);
 	}
 
-	let dividers = dividers_for(&panes);
+	let dividers = dividers_for(&panes, divider_reservation);
 	let _ = tx_view.send(Viewport {
 		viewport_id: *viewport_id,
 		panes,
@@ -485,7 +486,10 @@ const DIVIDER_HIT_PADDING: u32 = 1;
 
 /// Derive draggable boundaries from the projected pane rectangles. Adjacency
 /// is decided here, once, so no frontend has to know how wide a split gap is.
-fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
+fn dividers_for(
+	panes: &[PaneViewport],
+	reservation: super::PaneDividerReservation,
+) -> Vec<PaneDividerViewport> {
 	let mut dividers = Vec::new();
 	for before in panes {
 		for after in panes {
@@ -497,8 +501,7 @@ fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
 			let shares_rows = before.rect.screen_row.get() < after.rect.bottom().get()
 				&& after.rect.screen_row.get() < before.rect.bottom().get();
 			if shares_rows
-				&& after.rect.screen_col.get()
-					== before.rect.right().get() + crate::core::SPLIT_DIVIDER_COLS
+				&& after.rect.screen_col.get() == before.rect.right().get() + reservation.columns
 			{
 				let top = before
 					.rect
@@ -509,23 +512,35 @@ fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
 				let visual = PaneRect::new(
 					ScreenCol::new(before.rect.right().get()),
 					ScreenRow::new(top),
-					PaneCol::new(crate::core::SPLIT_DIVIDER_COLS),
+					PaneCol::new(reservation.columns),
 					PaneRow::new(bottom.saturating_sub(top)),
 				);
+				// With no reserved cells, publish one preceding content cell as the
+				// coarse engine hit region. A graphical frontend may narrow it in
+				// pixels, but must not invent adjacency or widen this authority.
+				let hit = if reservation.columns == 0 {
+					PaneRect::new(
+						ScreenCol::new(before.rect.right().get().saturating_sub(1)),
+						ScreenRow::new(top),
+						PaneCol::new(1),
+						PaneRow::new(bottom.saturating_sub(top)),
+					)
+				} else {
+					visual
+				};
 				dividers.push(PaneDividerViewport {
 					before: before.pane_id,
 					after: after.pane_id,
 					axis: SplitDirection::Vertical,
 					visual_rect: visual,
-					hit_rect: visual,
+					hit_rect: hit,
 				});
 			}
 
 			let shares_columns = before.rect.screen_col.get() < after.rect.right().get()
 				&& after.rect.screen_col.get() < before.rect.right().get();
 			if shares_columns
-				&& after.rect.screen_row.get()
-					== before.rect.bottom().get() + crate::core::SPLIT_DIVIDER_ROWS
+				&& after.rect.screen_row.get() == before.rect.bottom().get() + reservation.rows
 			{
 				let left = before
 					.rect
@@ -537,11 +552,12 @@ fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
 					ScreenCol::new(left),
 					ScreenRow::new(before.rect.bottom().get()),
 					PaneCol::new(right.saturating_sub(left)),
-					PaneRow::new(crate::core::SPLIT_DIVIDER_ROWS),
+					PaneRow::new(reservation.rows),
 				);
-				// Horizontal gaps are a single row. Grow the grab area into the
-				// pane above, but never into the lower pane's header: that header is
-				// the pane-reordering handle and must own its entire hit area.
+				// Grow the grab area into exactly one preceding row. Under the
+				// terminal default this completes the existing one-row target; at
+				// zero reservation it supplies the sole non-empty engine hit region.
+				// Never grow into the lower pane's header: pane reordering owns it.
 				let hit = PaneRect::new(
 					ScreenCol::new(left),
 					ScreenRow::new(
@@ -552,7 +568,7 @@ fn dividers_for(panes: &[PaneViewport]) -> Vec<PaneDividerViewport> {
 							.saturating_sub(DIVIDER_HIT_PADDING),
 					),
 					PaneCol::new(right.saturating_sub(left)),
-					PaneRow::new(crate::core::SPLIT_DIVIDER_ROWS + DIVIDER_HIT_PADDING),
+					PaneRow::new(reservation.rows + DIVIDER_HIT_PADDING),
 				);
 				dividers.push(PaneDividerViewport {
 					before: before.pane_id,

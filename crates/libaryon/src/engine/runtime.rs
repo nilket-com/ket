@@ -5689,6 +5689,7 @@ pub(crate) fn run_engine(engine: Engine) {
 	let initial_session = engine.initial_session;
 	let initial_file = engine.initial_file;
 	let initial_viewport = engine.initial_viewport;
+	let divider_reservation = engine.divider_reservation;
 	let rune_host_config = engine.rune_host;
 	let configured_init_path = rune_host_config
 		.as_ref()
@@ -5731,6 +5732,7 @@ pub(crate) fn run_engine(engine: Engine) {
 			None,
 		)
 	});
+	session.set_divider_reservation(divider_reservation);
 	if let Some((width, height)) = initial_viewport {
 		session.update_terminal_size(width.max(1), height.max(1));
 	}

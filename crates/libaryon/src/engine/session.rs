@@ -12,8 +12,8 @@ use super::layout::GutterNumbering;
 use super::minimap::MinimapSnapshot;
 use super::protocol::{
 	CommandRange, EditorMode, HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape,
-	PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SearchMatch, SplitDirection,
-	SubstituteFlags, UastInspectorMode, VisualKind,
+	PaneDividerReservation, PaneDropEdge, PaneFocusDirection, PaneResizeDirection, SearchMatch,
+	SplitDirection, SubstituteFlags, UastInspectorMode, VisualKind,
 };
 use super::runtime_registry::{RegistrationBatch, RegistryError, RuntimeRegistries};
 use super::shadow::ShadowSession;
@@ -21,8 +21,8 @@ use super::undo::{GenerationTarget, UndoLedger};
 use crate::core::{
 	BufferId, DEFAULT_VIEWPORT_LINES, DEFAULT_VIEWPORT_WIDTH, DisplayRow, DocByte, DocDisplayCol,
 	DocLine, DocumentId, JobId, PaneCol, PaneId, PaneRect, PaneRow, RegistryOwnerId, RegistryRev,
-	RequestId, SPLIT_DIVIDER_COLS, SPLIT_DIVIDER_ROWS, STATUS_BAR_ROWS, SavedSession, ScreenCol,
-	ScreenRow, StateId, TopologyRev, ViewId, ViewportId, Writable,
+	RequestId, STATUS_BAR_ROWS, SavedSession, ScreenCol, ScreenRow, StateId, TopologyRev, ViewId,
+	ViewportId, Writable,
 };
 use crate::ecs::{NodeId, UastRegistry};
 use crate::engine::Theme;
@@ -2708,11 +2708,8 @@ pub(crate) struct PaneLayout {
 const DEFAULT_SPLIT_RATIO: u32 = 8;
 const MIN_PANE_EXTENT: u32 = 2;
 
-fn split_divider_cells(direction: SplitDirection) -> u32 {
-	match direction {
-		SplitDirection::Vertical => SPLIT_DIVIDER_COLS,
-		SplitDirection::Horizontal => SPLIT_DIVIDER_ROWS,
-	}
+fn split_divider_cells(reservation: PaneDividerReservation, direction: SplitDirection) -> u32 {
+	reservation.cells(direction)
 }
 
 fn balanced_tile_columns(member_count: usize) -> usize {
@@ -2723,7 +2720,7 @@ fn balanced_tile_columns(member_count: usize) -> usize {
 	columns
 }
 
-fn host_panel_tile_minimum(member_count: usize) -> (u32, u32) {
+fn host_panel_tile_minimum(member_count: usize, reservation: PaneDividerReservation) -> (u32, u32) {
 	if member_count == 0 {
 		return (0, 0);
 	}
@@ -2731,10 +2728,16 @@ fn host_panel_tile_minimum(member_count: usize) -> (u32, u32) {
 	let rows = member_count.div_ceil(columns);
 	let width = MIN_PANE_EXTENT
 		.saturating_mul(columns as u32)
-		.saturating_add(SPLIT_DIVIDER_COLS.saturating_mul(columns.saturating_sub(1) as u32));
-	let height = MIN_PANE_EXTENT
-		.saturating_mul(rows as u32)
-		.saturating_add(SPLIT_DIVIDER_ROWS.saturating_mul(rows.saturating_sub(1) as u32));
+		.saturating_add(
+			reservation
+				.columns
+				.saturating_mul(columns.saturating_sub(1) as u32),
+		);
+	let height = MIN_PANE_EXTENT.saturating_mul(rows as u32).saturating_add(
+		reservation
+			.rows
+			.saturating_mul(rows.saturating_sub(1) as u32),
+	);
 	(width, height)
 }
 
@@ -3475,8 +3478,9 @@ impl LayoutNode {
 		axis: SplitDirection,
 		direction: PaneResizeDirection,
 		rect: PaneRect,
+		reservation: PaneDividerReservation,
 	) -> PaneResizeResult {
-		match self.resize_leaf_inner(target, axis, direction, rect) {
+		match self.resize_leaf_inner(target, axis, direction, rect, reservation) {
 			ResizeLeafResult::Resized => PaneResizeResult::Resized,
 			ResizeLeafResult::NotFound | ResizeLeafResult::NoMatchingAncestor => {
 				PaneResizeResult::NoMatchingSplit
@@ -3492,8 +3496,9 @@ impl LayoutNode {
 		axis: SplitDirection,
 		target: u32,
 		rect: PaneRect,
+		reservation: PaneDividerReservation,
 	) -> bool {
-		self.resize_boundary_inner(before, after, axis, target, rect)
+		self.resize_boundary_inner(before, after, axis, target, rect, reservation)
 	}
 
 	fn contains_pane(&self, target: PaneId) -> bool {
@@ -3505,7 +3510,7 @@ impl LayoutNode {
 		}
 	}
 
-	fn minimum_extent(&self, axis: SplitDirection) -> u32 {
+	fn minimum_extent(&self, axis: SplitDirection, reservation: PaneDividerReservation) -> u32 {
 		match self {
 			Self::Leaf(_) => MIN_PANE_EXTENT,
 			Self::Split {
@@ -3514,16 +3519,16 @@ impl LayoutNode {
 				..
 			} if *direction == axis => {
 				let child_extent = children.iter().fold(0u32, |extent, child| {
-					extent.saturating_add(child.minimum_extent(axis))
+					extent.saturating_add(child.minimum_extent(axis, reservation))
 				});
 				child_extent.saturating_add(
-					split_divider_cells(*direction)
+					split_divider_cells(reservation, *direction)
 						.saturating_mul(children.len().saturating_sub(1) as u32),
 				)
 			}
 			Self::Split { children, .. } => children
 				.iter()
-				.map(|child| child.minimum_extent(axis))
+				.map(|child| child.minimum_extent(axis, reservation))
 				.max()
 				.unwrap_or(MIN_PANE_EXTENT),
 		}
@@ -3536,6 +3541,7 @@ impl LayoutNode {
 		axis: SplitDirection,
 		target: u32,
 		rect: PaneRect,
+		reservation: PaneDividerReservation,
 	) -> bool {
 		let Self::Split {
 			direction,
@@ -3556,7 +3562,8 @@ impl LayoutNode {
 			return false;
 		};
 
-		let mut child_rects = split_child_rects(rect, *direction, ratios, children.len());
+		let mut child_rects =
+			split_child_rects(rect, *direction, ratios, children.len(), reservation);
 
 		if before_index != after_index {
 			if *direction != axis || after_index != before_index.saturating_add(1) {
@@ -3568,7 +3575,7 @@ impl LayoutNode {
 				.sum();
 			let minimum_extents = children
 				.iter()
-				.map(|child| child.minimum_extent(*direction))
+				.map(|child| child.minimum_extent(*direction, reservation))
 				.collect::<Vec<_>>();
 			let mut resized = false;
 			loop {
@@ -3586,7 +3593,8 @@ impl LayoutNode {
 					return resized;
 				}
 				resized = true;
-				child_rects = split_child_rects(rect, *direction, ratios, children.len());
+				child_rects =
+					split_child_rects(rect, *direction, ratios, children.len(), reservation);
 			}
 		}
 
@@ -3596,6 +3604,7 @@ impl LayoutNode {
 			axis,
 			target,
 			child_rects[before_index],
+			reservation,
 		)
 	}
 
@@ -3605,6 +3614,7 @@ impl LayoutNode {
 		axis: SplitDirection,
 		direction: PaneResizeDirection,
 		rect: PaneRect,
+		reservation: PaneDividerReservation,
 	) -> ResizeLeafResult {
 		match self {
 			Self::Leaf(leaf) if leaf.pane_id == target => ResizeLeafResult::NoMatchingAncestor,
@@ -3620,20 +3630,22 @@ impl LayoutNode {
 					return ResizeLeafResult::NotFound;
 				}
 
-				let child_rects = split_child_rects(rect, split_direction, ratios, children.len());
+				let child_rects =
+					split_child_rects(rect, split_direction, ratios, children.len(), reservation);
 				let child_extent = child_rects
 					.iter()
 					.map(|rect| rect_extent(*rect, split_direction))
 					.sum();
 				let minimum_extents = children
 					.iter()
-					.map(|child| child.minimum_extent(split_direction))
+					.map(|child| child.minimum_extent(split_direction, reservation))
 					.collect::<Vec<_>>();
 
 				for (child_index, (child, child_rect)) in
 					children.iter_mut().zip(child_rects).enumerate()
 				{
-					let child_result = child.resize_leaf_inner(target, axis, direction, child_rect);
+					let child_result =
+						child.resize_leaf_inner(target, axis, direction, child_rect, reservation);
 					match child_result {
 						ResizeLeafResult::NotFound => {}
 						ResizeLeafResult::Resized => return ResizeLeafResult::Resized,
@@ -3705,7 +3717,12 @@ impl LayoutNode {
 		}
 	}
 
-	pub(crate) fn collect_pane_layouts(&self, rect: PaneRect, out: &mut Vec<PaneLayout>) {
+	pub(crate) fn collect_pane_layouts(
+		&self,
+		rect: PaneRect,
+		out: &mut Vec<PaneLayout>,
+		reservation: PaneDividerReservation,
+	) {
 		match self {
 			Self::Leaf(leaf) => out.push(PaneLayout {
 				pane_id: leaf.pane_id,
@@ -3721,9 +3738,10 @@ impl LayoutNode {
 					return;
 				}
 
-				let child_rects = split_child_rects(rect, *direction, ratios, children.len());
+				let child_rects =
+					split_child_rects(rect, *direction, ratios, children.len(), reservation);
 				for (child, child_rect) in children.iter().zip(child_rects) {
-					child.collect_pane_layouts(child_rect, out);
+					child.collect_pane_layouts(child_rect, out, reservation);
 				}
 			}
 		}
@@ -3749,12 +3767,13 @@ fn split_child_rects(
 	direction: SplitDirection,
 	ratios: &[u32],
 	child_count: usize,
+	reservation: PaneDividerReservation,
 ) -> Vec<PaneRect> {
 	if child_count == 0 {
 		return Vec::new();
 	}
 
-	let divider_cells = split_divider_cells(direction);
+	let divider_cells = split_divider_cells(reservation, direction);
 	let divider_total = divider_cells.saturating_mul(child_count.saturating_sub(1) as u32);
 	let child_extent = rect_extent(rect, direction).saturating_sub(divider_total);
 	let child_sizes = split_extent(child_extent, ratios, child_count);
@@ -4205,6 +4224,9 @@ pub(crate) struct EditorSession {
 	pub(crate) runtime_registries: RuntimeRegistries,
 	pub(crate) viewport_id: ViewportId,
 	pub(crate) hit_test_fingerprint: Option<u64>,
+	/// Runtime presentation profile supplied by the active frontend. This is
+	/// deliberately absent from the saved layout owner.
+	pub(crate) divider_reservation: PaneDividerReservation,
 	pub(crate) buffers: BufferStore,
 	pub(crate) saved_documents: Option<SavedDocumentState>,
 	pub(crate) application_owner: Option<super::session_checkpoint::ApplicationOwnerId>,
@@ -4258,6 +4280,13 @@ pub(crate) const DEFAULT_GIT_REFRESH_MODE: super::protocol::GitRefreshMode =
 	super::protocol::GitRefreshMode::Interval(super::protocol::DEFAULT_GIT_REFRESH_SECONDS);
 
 impl EditorSession {
+	pub(crate) fn set_divider_reservation(&mut self, reservation: PaneDividerReservation) {
+		if self.divider_reservation != reservation {
+			self.divider_reservation = reservation;
+			self.hit_test_fingerprint = None;
+		}
+	}
+
 	/// Project exactly the shared identities PRODUCT-0061 compares at a coupled
 	/// checkpoint. The absence of placement and relationship data is
 	/// load-bearing: adding any would exceed the three-set witness's license.
@@ -4938,6 +4967,7 @@ impl EditorSession {
 			runtime_registries: RuntimeRegistries::new(),
 			viewport_id: ViewportId::new(1),
 			hit_test_fingerprint: None,
+			divider_reservation: PaneDividerReservation::default(),
 			buffers,
 			saved_documents,
 			application_owner: None,
@@ -5461,7 +5491,7 @@ impl EditorSession {
 			));
 		}
 
-		let minimum = host_panel_tile_minimum(created.len());
+		let minimum = host_panel_tile_minimum(created.len(), self.divider_reservation);
 		let fits = valid_anchor
 			.and_then(|pane_id| {
 				self.pane_layouts()
@@ -5473,7 +5503,7 @@ impl EditorSession {
 					.rect
 					.width
 					.get()
-					.saturating_sub(SPLIT_DIVIDER_COLS)
+					.saturating_sub(self.divider_reservation.columns)
 					/ 2;
 				let height = anchor_layout.rect.height.get();
 				minimum.0 <= width && minimum.1 <= height
@@ -5598,7 +5628,8 @@ impl EditorSession {
 				self.host_panel_groups.insert(group_id, group);
 				return Vec::new();
 			};
-			let minimum = host_panel_tile_minimum(group.current_members.len());
+			let minimum =
+				host_panel_tile_minimum(group.current_members.len(), self.divider_reservation);
 			let fits = self
 				.pane_layouts()
 				.into_iter()
@@ -5608,7 +5639,7 @@ impl EditorSession {
 						.rect
 						.width
 						.get()
-						.saturating_sub(SPLIT_DIVIDER_COLS)
+						.saturating_sub(self.divider_reservation.columns)
 						/ 2;
 					minimum.0 <= width && minimum.1 <= anchor_layout.rect.height.get()
 				});
@@ -6040,8 +6071,11 @@ impl EditorSession {
 
 	pub(crate) fn pane_layouts(&self) -> Vec<PaneLayout> {
 		let mut layouts = Vec::new();
-		self.layout
-			.collect_pane_layouts(self.editor_rect(), &mut layouts);
+		self.layout.collect_pane_layouts(
+			self.editor_rect(),
+			&mut layouts,
+			self.divider_reservation,
+		);
 		layouts
 	}
 
@@ -6317,9 +6351,13 @@ impl EditorSession {
 	) -> PaneResizeResult {
 		let group_id = self.layout.group_containing_pane(self.focused_pane_id);
 		let before = group_id.and_then(|group_id| self.layout.group_structure(group_id));
-		let result =
-			self.layout
-				.resize_leaf(self.focused_pane_id, axis, direction, self.editor_rect());
+		let result = self.layout.resize_leaf(
+			self.focused_pane_id,
+			axis,
+			direction,
+			self.editor_rect(),
+			self.divider_reservation,
+		);
 		if result == PaneResizeResult::Resized
 			&& group_id.is_some_and(|group_id| before != self.layout.group_structure(group_id))
 		{
@@ -6338,9 +6376,14 @@ impl EditorSession {
 		let before_group = self.layout.group_containing_pane(before);
 		let internal_group = before_group
 			.filter(|group_id| self.layout.group_containing_pane(after) == Some(*group_id));
-		let resized = self
-			.layout
-			.resize_boundary(before, after, axis, target, self.editor_rect());
+		let resized = self.layout.resize_boundary(
+			before,
+			after,
+			axis,
+			target,
+			self.editor_rect(),
+			self.divider_reservation,
+		);
 		if resized && let Some(group_id) = internal_group {
 			self.mark_host_panel_group_manual(group_id);
 		}
@@ -6456,8 +6499,8 @@ mod tests {
 		DiffPair, DiffRole, EditorPane, EditorSession, GENERATION_PARK_CAP,
 		HostPanelGroupLayoutState, LayoutLeaf, LayoutNode, MAX_CURSORS, ParkedGenerationCache,
 		ParkedGenerationRoot, RootTransition, SettingsPersistent, SnapshotProvenance, TextAnchor,
-		TextBuffer, UastOwnerAccounting, View, caret_from_doc_byte, resolve_theme_name,
-		split_child_rects, with_file_browser_buffer_mut, with_text_buffer_mut,
+		TextBuffer, UastOwnerAccounting, View, caret_from_doc_byte, host_panel_tile_minimum,
+		resolve_theme_name, split_child_rects, with_file_browser_buffer_mut, with_text_buffer_mut,
 	};
 	use crate::core::{
 		BufferId, DEFAULT_VIEWPORT_LINES, DEFAULT_VIEWPORT_WIDTH, DocByte, DocDisplayCol, DocLine,
@@ -6474,7 +6517,8 @@ mod tests {
 	use crate::engine::test_support::{build_document, build_split_virtual_document};
 	use crate::engine::{
 		HostPanelDescriptor, HostPanelGroupId, HostPanelGroupLayout, HostPanelGroupMember,
-		HostPanelGroupShape, HostPanelId, PaneDropEdge, PaneResizeDirection,
+		HostPanelGroupShape, HostPanelId, PaneDividerReservation, PaneDropEdge,
+		PaneResizeDirection,
 	};
 	use crate::engine::{SplitDirection, UiColorOverrides, VisualKind};
 	use crate::uast::UastMutation;
@@ -6574,6 +6618,16 @@ mod tests {
 		)
 		.unwrap();
 		let rects_at_large_viewport = session.pane_layouts();
+		session.set_divider_reservation(PaneDividerReservation::NONE);
+		let checkpoint_at_zero_reservation =
+			crate::engine::layout_checkpoint::capture_layout(&session).unwrap();
+		let owner_at_zero_reservation = crate::engine::layout_checkpoint::encode_layout(
+			&checkpoint_at_zero_reservation,
+			&document_ids,
+			crate::engine::layout_checkpoint::LAYOUT_OWNER_BUDGET,
+		)
+		.unwrap();
+		let rects_at_zero_reservation = session.pane_layouts();
 
 		assert_eq!(
 			logical_at_large_viewport, logical_at_small_viewport,
@@ -6586,6 +6640,14 @@ mod tests {
 		assert_eq!(
 			owner_at_large_viewport, owner_at_small_viewport,
 			"production libaryon_layout bytes must be head-neutral across a 3x viewport resize"
+		);
+		assert_eq!(
+			owner_at_zero_reservation, owner_at_small_viewport,
+			"PRODUCT-0074's runtime divider profile must never enter libaryon_layout bytes"
+		);
+		assert_ne!(
+			rects_at_zero_reservation, rects_at_large_viewport,
+			"the control proves the same logical tree derives head-specific rectangles"
 		);
 		assert!(
 			String::from_utf8(logical_at_large_viewport)
@@ -7194,6 +7256,132 @@ mod tests {
 				.detached_members
 				.len(),
 			4
+		);
+	}
+
+	#[test]
+	fn product_0074_group_admission_and_reset_follow_the_reservation_profile() {
+		let registry = UastRegistry::new(512);
+		let members = product_0015_members(7400);
+
+		let mut default = test_editor_session(&registry);
+		default.update_terminal_size(16, 6);
+		let default_anchor = default.focused_pane_id;
+		default.ensure_host_panel_group(
+			HostPanelGroupId::new(7401),
+			Some(default_anchor),
+			members.clone(),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		assert_eq!(
+			default
+				.layout
+				.count_group_roots(HostPanelGroupId::new(7401)),
+			0,
+			"the four-column default refuses this deliberately marginal anchor"
+		);
+
+		let mut compact = test_editor_session(&registry);
+		compact.set_divider_reservation(PaneDividerReservation::NONE);
+		compact.update_terminal_size(16, 6);
+		let compact_anchor = compact.focused_pane_id;
+		compact.ensure_host_panel_group(
+			HostPanelGroupId::new(7402),
+			Some(compact_anchor),
+			members.clone(),
+			HostPanelGroupLayout::RowMajorTile,
+		);
+		assert_eq!(
+			compact
+				.layout
+				.count_group_roots(HostPanelGroupId::new(7402)),
+			1,
+			"zero reservation admits the same group through ensure_host_panel_group"
+		);
+
+		fn reset_probe(
+			registry: &UastRegistry,
+			reservation: PaneDividerReservation,
+			group_id: HostPanelGroupId,
+			base: u64,
+		) -> usize {
+			let mut session = test_editor_session(registry);
+			session.set_divider_reservation(reservation);
+			session.update_terminal_size(100, 20);
+			let anchor = session.focused_pane_id;
+			session.ensure_host_panel_group(
+				group_id,
+				Some(anchor),
+				product_0015_members(base),
+				HostPanelGroupLayout::RowMajorTile,
+			);
+			let root = session
+				.layout
+				.find_group_root(group_id)
+				.expect("wide fixture materializes");
+			assert_eq!(
+				root.minimum_extent(SplitDirection::Vertical, reservation),
+				if reservation == PaneDividerReservation::NONE {
+					4
+				} else {
+					8
+				},
+				"minimum width consumes the same reservation as rectangle splitting"
+			);
+			assert_eq!(
+				root.minimum_extent(SplitDirection::Horizontal, reservation),
+				if reservation == PaneDividerReservation::NONE {
+					4
+				} else {
+					5
+				},
+				"minimum height consumes the same reservation as rectangle splitting"
+			);
+			session
+				.layout
+				.find_group_root_mut(group_id)
+				.expect("wide fixture materializes")
+				.set_group_root(None);
+			session.update_terminal_size(16, 6);
+			let group = &session.host_panel_groups[&group_id];
+			assert!(group.producer_buffer_id.is_some());
+			assert_eq!(group.latest_valid_anchor, Some(anchor));
+			assert!(session.layout.can_host_group_subtree(anchor));
+			let anchor_rect = session
+				.pane_layouts()
+				.into_iter()
+				.find(|layout| layout.pane_id == anchor)
+				.expect("source anchor remains after clearing the group tag")
+				.rect;
+			let minimum = host_panel_tile_minimum(4, reservation);
+			let available = anchor_rect.width.get().saturating_sub(reservation.columns) / 2;
+			assert_eq!(
+				minimum.0 <= available,
+				reservation == PaneDividerReservation::NONE
+			);
+			assert!(session.reset_host_panel_group(group_id).is_empty());
+			session.layout.count_group_roots(group_id)
+		}
+
+		assert_eq!(
+			reset_probe(
+				&registry,
+				PaneDividerReservation::TERMINAL,
+				HostPanelGroupId::new(7403),
+				7500,
+			),
+			0,
+			"the default reset path refuses the marginal anchor"
+		);
+		assert_eq!(
+			reset_probe(
+				&registry,
+				PaneDividerReservation::NONE,
+				HostPanelGroupId::new(7404),
+				7600,
+			),
+			1,
+			"zero reservation converges through reset_host_panel_group"
 		);
 	}
 
@@ -9368,24 +9556,69 @@ mod tests {
 	}
 
 	#[test]
-	fn shared_child_rects_reserve_dividers_in_both_axes() {
+	fn product_0074_default_child_rects_bank_the_4_by_1_reservation() {
 		let parent = PaneRect::new(
 			ScreenCol::new(10),
 			ScreenRow::new(5),
 			PaneCol::new(100),
 			PaneRow::new(41),
 		);
-		let vertical = split_child_rects(parent, SplitDirection::Vertical, &[1, 1], 2);
+		let vertical = split_child_rects(
+			parent,
+			SplitDirection::Vertical,
+			&[1, 1],
+			2,
+			PaneDividerReservation::TERMINAL,
+		);
 		assert_eq!(vertical[0].screen_col, ScreenCol::new(10));
 		assert_eq!(vertical[0].width, PaneCol::new(48));
 		assert_eq!(vertical[1].screen_col, ScreenCol::new(62));
 		assert_eq!(vertical[1].width, PaneCol::new(48));
 
-		let horizontal = split_child_rects(parent, SplitDirection::Horizontal, &[1, 1], 2);
+		let horizontal = split_child_rects(
+			parent,
+			SplitDirection::Horizontal,
+			&[1, 1],
+			2,
+			PaneDividerReservation::TERMINAL,
+		);
 		assert_eq!(horizontal[0].screen_row, ScreenRow::new(5));
 		assert_eq!(horizontal[0].height, PaneRow::new(20));
 		assert_eq!(horizontal[1].screen_row, ScreenRow::new(26));
 		assert_eq!(horizontal[1].height, PaneRow::new(20));
+	}
+
+	#[test]
+	fn product_0074_zero_reservation_tiles_in_both_axes() {
+		let parent = PaneRect::new(
+			ScreenCol::new(10),
+			ScreenRow::new(5),
+			PaneCol::new(100),
+			PaneRow::new(41),
+		);
+		let vertical = split_child_rects(
+			parent,
+			SplitDirection::Vertical,
+			&[1, 1],
+			2,
+			PaneDividerReservation::NONE,
+		);
+		assert_eq!(vertical[0].screen_col, ScreenCol::new(10));
+		assert_eq!(vertical[0].width, PaneCol::new(50));
+		assert_eq!(vertical[1].screen_col, vertical[0].right());
+		assert_eq!(vertical[1].width, PaneCol::new(50));
+
+		let horizontal = split_child_rects(
+			parent,
+			SplitDirection::Horizontal,
+			&[1, 1],
+			2,
+			PaneDividerReservation::NONE,
+		);
+		assert_eq!(horizontal[0].screen_row, ScreenRow::new(5));
+		assert_eq!(horizontal[0].height, PaneRow::new(20));
+		assert_eq!(horizontal[1].screen_row, horizontal[0].bottom());
+		assert_eq!(horizontal[1].height, PaneRow::new(21));
 	}
 
 	#[test]

@@ -232,6 +232,7 @@ pub(crate) struct Engine {
 	pub(super) initial_session: Option<EditorSession>,
 	pub(super) initial_file: Option<String>,
 	pub(super) initial_viewport: Option<(u16, u16)>,
+	pub(super) divider_reservation: super::PaneDividerReservation,
 	pub(super) rune_host: Option<super::rune_host::RuneHostConfig>,
 	pub(super) terminate: Arc<AtomicBool>,
 	pub(super) dynamic_action_executor:
@@ -286,6 +287,7 @@ impl Engine {
 			initial_session: None,
 			initial_file: None,
 			initial_viewport: None,
+			divider_reservation: super::PaneDividerReservation::default(),
 			rune_host: None,
 			terminate: Arc::new(AtomicBool::new(false)),
 			dynamic_action_executor: Box::new(UnavailableActionExecutor),
@@ -328,6 +330,14 @@ impl Engine {
 
 	pub(crate) fn with_initial_viewport(mut self, initial_viewport: Option<(u16, u16)>) -> Self {
 		self.initial_viewport = initial_viewport;
+		self
+	}
+
+	pub(crate) fn with_divider_reservation(
+		mut self,
+		reservation: super::PaneDividerReservation,
+	) -> Self {
+		self.divider_reservation = reservation;
 		self
 	}
 
