@@ -13,6 +13,7 @@ use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::time::SystemTime;
 
 const STORE_VERSION: u32 = 1;
 const SESSION_ID_HEX_LEN: usize = 32;
@@ -208,6 +209,78 @@ impl SessionSnapshot {
 
 	pub fn document(&self, id: DocumentId) -> Option<&DocumentIdentity> {
 		self.documents.get(&id)
+	}
+}
+
+/// One safely classified entry below the durable-session root.
+///
+/// Discovery reports store truth only. It does not decode any head-owned owner
+/// payload, reclaim generations, or wait for an incompatible live owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SessionDiscoveryEntry {
+	Committed {
+		session_id: SessionId,
+		generation: u64,
+		modified: Option<SystemTime>,
+		documents: Vec<DocumentIdentity>,
+	},
+	Active {
+		session_id: SessionId,
+	},
+	Damaged {
+		session_id: SessionId,
+		reason: String,
+	},
+	Unreadable {
+		session_id: SessionId,
+		reason: String,
+	},
+}
+
+impl SessionDiscoveryEntry {
+	pub const fn session_id(&self) -> SessionId {
+		match self {
+			Self::Committed { session_id, .. }
+			| Self::Active { session_id }
+			| Self::Damaged { session_id, .. }
+			| Self::Unreadable { session_id, .. } => *session_id,
+		}
+	}
+}
+
+/// A non-session child found below the durable-session root.
+///
+/// The exact Unix directory-entry bytes are retained so a frontend can report
+/// the issue without lossy conversion or traversing the entry.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ForeignSessionEntry {
+	name: Vec<u8>,
+}
+
+impl ForeignSessionEntry {
+	pub fn name_bytes(&self) -> &[u8] {
+		&self.name
+	}
+}
+
+/// Complete, non-mutating census of one durable-session root.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionDiscoveryReport {
+	entries: Vec<SessionDiscoveryEntry>,
+	foreign_entries: Vec<ForeignSessionEntry>,
+}
+
+impl SessionDiscoveryReport {
+	pub fn entries(&self) -> &[SessionDiscoveryEntry] {
+		&self.entries
+	}
+
+	pub fn foreign_entries(&self) -> &[ForeignSessionEntry] {
+		&self.foreign_entries
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.entries.is_empty() && self.foreign_entries.is_empty()
 	}
 }
 
@@ -482,7 +555,7 @@ mod unix {
 	use std::fs::{self, File};
 	use std::io::{Read, Write};
 	use std::os::fd::{AsRawFd, FromRawFd, RawFd};
-	use std::os::unix::ffi::OsStrExt;
+	use std::os::unix::ffi::{OsStrExt, OsStringExt};
 	use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
 	const PRIVATE_DIR_MODE: u32 = 0o700;
@@ -506,6 +579,78 @@ mod unix {
 	}
 
 	impl SessionStore {
+		/// Enumerate every child below the saved-session root without mutating it.
+		///
+		/// An absent root is an empty store. A present root retains PRODUCT-0059's
+		/// validation and lock ordering: a live exclusive owner is classified before
+		/// even `CURRENT` is read.
+		pub fn discover(&self) -> Result<SessionDiscoveryReport, SessionStoreError> {
+			let root = match open_existing_root(&self.root) {
+				Ok(root) => root,
+				Err(SessionStoreError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
+					return Ok(SessionDiscoveryReport::default());
+				}
+				Err(error) => return Err(error),
+			};
+
+			let mut raw_names = list_dir_raw(&root)?;
+			raw_names.sort_by(|left, right| left.as_bytes().cmp(right.as_bytes()));
+			let mut report = SessionDiscoveryReport::default();
+			for raw_name in raw_names {
+				let bytes = raw_name.as_bytes();
+				if bytes == b"." || bytes == b".." {
+					continue;
+				}
+				let Some(id) = std::str::from_utf8(bytes)
+					.ok()
+					.and_then(|name| SessionId::parse_canonical(name).ok())
+				else {
+					report.foreign_entries.push(ForeignSessionEntry {
+						name: bytes.to_vec(),
+					});
+					continue;
+				};
+
+				let entry = match self.open_locked(id, LockMode::Shared) {
+					Ok((session_dir, _lock)) => match load_snapshot(&session_dir, id) {
+						Ok((snapshot, _owners)) => {
+							committed_discovery_entry(&session_dir, &snapshot).unwrap_or_else(
+								|error| SessionDiscoveryEntry::Unreadable {
+									session_id: id,
+									reason: error.to_string(),
+								},
+							)
+						}
+						Err(SessionStoreError::Corrupt(reason)) => SessionDiscoveryEntry::Damaged {
+							session_id: id,
+							reason,
+						},
+						Err(SessionStoreError::Io(error))
+							if error.kind() == io::ErrorKind::NotFound =>
+						{
+							SessionDiscoveryEntry::Damaged {
+								session_id: id,
+								reason: format!("committed snapshot component is missing: {error}"),
+							}
+						}
+						Err(error) => SessionDiscoveryEntry::Unreadable {
+							session_id: id,
+							reason: error.to_string(),
+						},
+					},
+					Err(SessionStoreError::Contended(session_id)) => {
+						SessionDiscoveryEntry::Active { session_id }
+					}
+					Err(error) => SessionDiscoveryEntry::Unreadable {
+						session_id: id,
+						reason: error.to_string(),
+					},
+				};
+				report.entries.push(entry);
+			}
+			Ok(report)
+		}
+
 		pub fn create(&self) -> Result<SavedSession<Writable>, SessionStoreError> {
 			self.create_with_minter(SessionId::mint)
 		}
@@ -600,6 +745,27 @@ mod unix {
 			})?;
 			Ok((session_dir, lock))
 		}
+	}
+
+	fn committed_discovery_entry(
+		session_dir: &File,
+		snapshot: &SessionSnapshot,
+	) -> io::Result<SessionDiscoveryEntry> {
+		let session_id = snapshot.session_id();
+		let generation = snapshot.generation();
+		let generations = open_dir_at(session_dir, "generations")?;
+		let generation_dir = open_dir_at(&generations, &generation_name(generation))?;
+		let modified = match generation_dir.metadata()?.modified() {
+			Ok(modified) => Some(modified),
+			Err(error) if error.kind() == io::ErrorKind::Unsupported => None,
+			Err(error) => return Err(error),
+		};
+		Ok(SessionDiscoveryEntry::Committed {
+			session_id,
+			generation,
+			modified,
+			documents: snapshot.documents().cloned().collect(),
+		})
 	}
 
 	impl SavedSession<Writable> {
@@ -1187,7 +1353,7 @@ mod unix {
 			.map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path contains NUL"))
 	}
 
-	fn list_dir(directory: &File) -> io::Result<Vec<String>> {
+	fn list_dir_raw(directory: &File) -> io::Result<Vec<OsString>> {
 		let duplicated = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
 		if duplicated < 0 {
 			return Err(io::Error::last_os_error());
@@ -1211,18 +1377,19 @@ mod unix {
 				return Err(io::Error::from_raw_os_error(code));
 			}
 			let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) };
-			let name = match name.to_str() {
-				Ok(name) => name,
-				Err(_) => {
-					unsafe { libc::closedir(stream) };
-					return Err(io::Error::new(
-						io::ErrorKind::InvalidData,
-						"directory entry is not UTF-8",
-					));
-				}
-			};
-			names.push(name.to_owned());
+			names.push(OsString::from_vec(name.to_bytes().to_vec()));
 		}
+	}
+
+	fn list_dir(directory: &File) -> io::Result<Vec<String>> {
+		list_dir_raw(directory)?
+			.into_iter()
+			.map(|name| {
+				name.into_string().map_err(|_| {
+					io::Error::new(io::ErrorKind::InvalidData, "directory entry is not UTF-8")
+				})
+			})
+			.collect()
 	}
 
 	#[cfg(any(target_os = "linux", target_os = "android"))]
@@ -1870,6 +2037,237 @@ mod unix {
 		}
 
 		#[test]
+		fn product_0073_discovery_keeps_absence_committed_documents_and_foreign_bytes_honest() {
+			let _serial = serialize_process_tests();
+			let root = TempRoot::new("discovery-census");
+			let store = root.store();
+			assert!(store.discover().unwrap().is_empty());
+			assert!(
+				!root.0.exists(),
+				"discovering an absent root must not create it"
+			);
+
+			let mut session = store.create().unwrap();
+			let session_id = session.snapshot().session_id();
+			let scratch = session.mint_document(None).unwrap();
+			let file = session
+				.mint_document(Some(PathBuf::from("/work/notebook.rn")))
+				.unwrap();
+			session.commit().unwrap();
+			drop(session);
+
+			let foreign_utf8 = root.0.join("notes");
+			fs::write(&foreign_utf8, b"foreign").unwrap();
+			let foreign_bytes = OsString::from_vec(vec![b'n', 0xff]);
+			fs::write(root.0.join(&foreign_bytes), b"foreign").unwrap();
+			let unreferenced = session_path(&root, session_id)
+				.join("generations")
+				.join("000000000000ffff");
+			fs::create_dir(&unreferenced).unwrap();
+			let temporary_pointer = session_path(&root, session_id).join(".CURRENT.tmp-foreign");
+			fs::write(&temporary_pointer, b"foreign").unwrap();
+			let lock = session_path(&root, session_id).join("session.lock");
+			let lock_inode = fs::metadata(&lock).unwrap().ino();
+			let before = read_tree(&root.0);
+			let report = store.discover().unwrap();
+			assert_eq!(read_tree(&root.0), before, "discovery must not mutate");
+			assert_eq!(fs::metadata(&lock).unwrap().ino(), lock_inode);
+			assert!(unreferenced.is_dir());
+			assert!(temporary_pointer.is_file());
+			assert_eq!(report.entries().len(), 1);
+			match &report.entries()[0] {
+				SessionDiscoveryEntry::Committed {
+					session_id: found,
+					generation,
+					modified,
+					documents,
+				} => {
+					assert_eq!(*found, session_id);
+					assert_eq!(*generation, 2);
+					assert!(modified.is_some());
+					assert_eq!(
+						documents
+							.iter()
+							.map(DocumentIdentity::id)
+							.collect::<Vec<_>>(),
+						vec![scratch, file],
+						"documents remain ordered by durable identity"
+					);
+					assert_eq!(documents[0].path(), None);
+					assert_eq!(documents[1].path(), Some(Path::new("/work/notebook.rn")));
+				}
+				other => panic!("expected committed discovery, got {other:?}"),
+			}
+			assert_eq!(
+				report
+					.foreign_entries()
+					.iter()
+					.map(ForeignSessionEntry::name_bytes)
+					.collect::<Vec<_>>(),
+				vec![b"notes".as_slice(), &[b'n', 0xff]],
+				"foreign names retain exact bytes and stable byte order"
+			);
+		}
+
+		#[test]
+		fn product_0073_corrupt_sessions_do_not_hide_the_valid_control_or_recover() {
+			let _serial = serialize_process_tests();
+			let root = TempRoot::new("discovery-damage-matrix");
+			let store = root.store();
+			let create_closed = || {
+				let session = store.create().unwrap();
+				let id = session.snapshot().session_id();
+				drop(session);
+				id
+			};
+
+			let valid = create_closed();
+			let malformed_current = create_closed();
+			fs::write(
+				session_path(&root, malformed_current).join("CURRENT"),
+				b"broken\n",
+			)
+			.unwrap();
+
+			let missing_generation = create_closed();
+			fs::remove_dir_all(current_generation_path(&root, missing_generation)).unwrap();
+			let guessed_generation = session_path(&root, missing_generation)
+				.join("generations")
+				.join("000000000000ffff");
+			fs::create_dir(&guessed_generation).unwrap();
+
+			let malformed_manifest = create_closed();
+			fs::write(
+				current_generation_path(&root, malformed_manifest).join("store.json"),
+				b"{",
+			)
+			.unwrap();
+
+			let mut missing_owner = store.create().unwrap();
+			let missing_owner_id = missing_owner.snapshot().session_id();
+			let owner = OwnerId::new("missing_owner").unwrap();
+			missing_owner.set_owner_payload(owner.clone(), 1, b"payload".to_vec());
+			missing_owner.commit().unwrap();
+			drop(missing_owner);
+			fs::remove_file(
+				current_generation_path(&root, missing_owner_id)
+					.join("owners")
+					.join(owner.payload_name()),
+			)
+			.unwrap();
+
+			let mut short_owner = store.create().unwrap();
+			let short_owner_id = short_owner.snapshot().session_id();
+			let owner = OwnerId::new("short_owner").unwrap();
+			short_owner.set_owner_payload(owner.clone(), 1, b"payload".to_vec());
+			short_owner.commit().unwrap();
+			drop(short_owner);
+			fs::write(
+				current_generation_path(&root, short_owner_id)
+					.join("owners")
+					.join(owner.payload_name()),
+				b"x",
+			)
+			.unwrap();
+
+			let report = store.discover().unwrap();
+			assert_eq!(report.entries().len(), 6);
+			assert!(report.entries().iter().any(|entry| {
+				matches!(entry, SessionDiscoveryEntry::Committed { session_id, .. } if *session_id == valid)
+			}));
+			for damaged in [
+				malformed_current,
+				missing_generation,
+				malformed_manifest,
+				missing_owner_id,
+				short_owner_id,
+			] {
+				assert!(
+					report.entries().iter().any(|entry| {
+						matches!(entry, SessionDiscoveryEntry::Damaged { session_id, .. } if *session_id == damaged)
+					}),
+					"damaged session {damaged} disappeared or was generalized"
+				);
+			}
+			assert!(
+				guessed_generation.is_dir(),
+				"discovery must not reclaim or promote the largest generation"
+			);
+			assert_eq!(
+				fs::read_to_string(session_path(&root, missing_generation).join("CURRENT"))
+					.unwrap(),
+				"0000000000000001\n",
+				"discovery must not rewrite the damaged pointer"
+			);
+		}
+
+		#[test]
+		fn product_0073_active_classification_precedes_current_and_damage_returns_after_release() {
+			let _serial = serialize_process_tests();
+			let root = TempRoot::new("discovery-contention");
+			let store = root.store();
+			let session = store.create().unwrap();
+			let id = session.snapshot().session_id();
+			drop(session);
+
+			let ready = root.0.join("discovery-ready");
+			let pid = root.0.join("unused-pid");
+			let mut holder = spawn_helper(&root, id, "exclusive", &ready, &pid);
+			wait_for(&ready);
+			fs::write(session_path(&root, id).join("CURRENT"), b"broken\n").unwrap();
+			assert_eq!(
+				store.discover().unwrap().entries(),
+				&[SessionDiscoveryEntry::Active { session_id: id }],
+				"contention must win before discovery reads CURRENT"
+			);
+			assert!(
+				unsafe { libc::kill(holder.0.as_ref().unwrap().id() as libc::pid_t, 0) } == 0,
+				"active classification is not vacuous after holder exit"
+			);
+
+			holder.kill_and_wait();
+			let report = store.discover().unwrap();
+			assert!(matches!(
+				&report.entries()[0],
+				SessionDiscoveryEntry::Damaged { session_id, reason }
+					if *session_id == id
+						&& reason == "CURRENT must be 16 lowercase hexadecimal digits plus newline"
+			));
+		}
+
+		#[test]
+		fn product_0073_canonical_wrong_types_are_unreadable_and_an_unsafe_root_is_not_empty() {
+			let _serial = serialize_process_tests();
+			let root = TempRoot::new("discovery-types");
+			fs::create_dir_all(&root.0).unwrap();
+			fs::set_permissions(&root.0, fs::Permissions::from_mode(0o700)).unwrap();
+			let regular_id = known_session(0x31);
+			let symlink_id = known_session(0x32);
+			fs::write(root.0.join(regular_id.to_string()), b"not a directory").unwrap();
+			let outside = root.0.join("outside");
+			fs::create_dir(&outside).unwrap();
+			symlink(&outside, root.0.join(symlink_id.to_string())).unwrap();
+
+			let report = root.store().discover().unwrap();
+			assert_eq!(report.entries().len(), 2);
+			assert!(report.entries().iter().any(|entry| {
+				matches!(entry, SessionDiscoveryEntry::Unreadable { session_id, .. } if *session_id == regular_id)
+			}));
+			assert!(report.entries().iter().any(|entry| {
+				matches!(entry, SessionDiscoveryEntry::Unreadable { session_id, .. } if *session_id == symlink_id)
+			}));
+			assert!(outside.is_dir(), "discovery must not traverse the symlink");
+
+			let unsafe_root = TempRoot::new("discovery-unsafe-root");
+			fs::create_dir_all(&unsafe_root.0).unwrap();
+			fs::set_permissions(&unsafe_root.0, fs::Permissions::from_mode(0o755)).unwrap();
+			assert!(
+				unsafe_root.store().discover().is_err(),
+				"an unsafe root must not masquerade as an empty store"
+			);
+		}
+
+		#[test]
 		fn product_0059_lock_contention_precedes_current_and_readers_share() {
 			let _serial = serialize_process_tests();
 			let root = TempRoot::new("locking");
@@ -1999,6 +2397,10 @@ mod unix {
 
 #[cfg(not(unix))]
 impl SessionStore {
+	pub fn discover(&self) -> Result<SessionDiscoveryReport, SessionStoreError> {
+		Err(SessionStoreError::UnsupportedPlatform)
+	}
+
 	pub fn create(&self) -> Result<SavedSession<Writable>, SessionStoreError> {
 		Err(SessionStoreError::UnsupportedPlatform)
 	}

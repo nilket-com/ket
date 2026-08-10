@@ -25,6 +25,7 @@ pub use coords::{
 #[allow(unused_imports)]
 pub use path::expand_path;
 pub use session_store::{
-	DocumentId, DocumentIdentity, OwnerId, ParseSessionIdError, ReadOnly, SavedSession, SessionId,
-	SessionSnapshot, SessionStore, SessionStoreError, Writable,
+	DocumentId, DocumentIdentity, ForeignSessionEntry, OwnerId, ParseSessionIdError, ReadOnly,
+	SavedSession, SessionDiscoveryEntry, SessionDiscoveryReport, SessionId, SessionSnapshot,
+	SessionStore, SessionStoreError, Writable,
 };

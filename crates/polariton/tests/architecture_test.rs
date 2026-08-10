@@ -1959,3 +1959,101 @@ fn product_0072_percent_is_scale_intent_not_cascade_or_durable_identity() {
 		"percent scale must not extend the durable authored-family schema"
 	);
 }
+
+#[test]
+fn product_0073_discovery_is_a_terminal_read_only_store_census() {
+	let source_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let main =
+		std::fs::read_to_string(source_root.join("main.rs")).expect("read Polariton entrypoint");
+	let action = main
+		.split("enum ApplicationAction")
+		.nth(1)
+		.expect("terminal action vocabulary")
+		.split("fn action_from_args")
+		.next()
+		.expect("bounded terminal action vocabulary");
+	assert!(action.contains("Gui(gui::StartupTarget)"));
+	assert!(action.contains("ListSessions"));
+
+	let listing = main
+		.split("fn list_saved_sessions() -> gui::Result")
+		.nth(1)
+		.expect("saved-session terminal action")
+		.split("fn render_session_discovery")
+		.next()
+		.expect("bounded saved-session terminal action");
+	assert!(listing.contains("SessionStore::platform_default()?.discover()?"));
+	for forbidden in [
+		"gui::run",
+		"load_startup_data",
+		"open_writable",
+		"create(",
+		"owner_payload",
+		"set_owner_payload",
+		"delete",
+		"autosave",
+	] {
+		assert!(
+			!listing.contains(forbidden),
+			"PRODUCT-0073 terminal discovery acquired forbidden authority: {forbidden}"
+		);
+	}
+	let store = std::fs::read_to_string(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("../libaryon/src/core/session_store.rs"),
+	)
+	.expect("read head-neutral session store");
+	let discovery = store
+		.split("pub fn discover(&self)")
+		.nth(1)
+		.expect("head-neutral discovery operation")
+		.split("pub fn create(&self)")
+		.next()
+		.expect("bounded head-neutral discovery operation");
+	assert!(discovery.contains("open_existing_root"));
+	assert!(discovery.contains("list_dir_raw"));
+	assert!(discovery.contains("self.open_locked(id, LockMode::Shared)"));
+	for forbidden in [
+		"ensure_root",
+		"open_writable",
+		"cleanup_unreferenced",
+		"commit(",
+		"set_owner_payload",
+		"owner_payload(",
+		"remove_entry_at",
+		"unlink_at",
+		"rename_at",
+	] {
+		assert!(
+			!discovery.contains(forbidden),
+			"PRODUCT-0073 store discovery acquired forbidden authority: {forbidden}"
+		);
+	}
+
+	let gui = std::fs::read_to_string(source_root.join("gui/state.rs"))
+		.expect("read GUI startup vocabulary");
+	let startup = gui
+		.split("pub(crate) enum StartupTarget")
+		.nth(1)
+		.expect("GUI startup vocabulary")
+		.split("enum StartupAuthority")
+		.next()
+		.expect("bounded GUI startup vocabulary");
+	assert_eq!(startup.matches("Ephemeral").count(), 1);
+	assert_eq!(startup.matches("CreateSaved").count(), 1);
+	assert_eq!(startup.matches("OpenSaved").count(), 1);
+	assert!(!startup.contains("List"));
+
+	let readme = std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("README.md"))
+		.expect("read Polariton README");
+	for claim in [
+		"polariton --session list",
+		"polariton --session 24631c77d510daf33ae6331e1f4776ce",
+		"document metadata is intentionally unknown",
+		"has uncheckpointed changes",
+	] {
+		assert!(
+			readme.contains(claim),
+			"missing discovery documentation: {claim}"
+		);
+	}
+}

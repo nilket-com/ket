@@ -47,6 +47,25 @@ while `:init0` restores the editor defaults.
 Missing configuration is a clean no-op. A broken script is reported in the
 status bar while Polariton still opens with compiled defaults.
 
+#### Saved sessions:
+
+Create a durable session explicitly, checkpoint it from the Session menu, and
+reopen it with its complete identity:
+
+```bash
+polariton --session new
+polariton --session list
+polariton --session 24631c77d510daf33ae6331e1f4776ce
+```
+
+The list shows each closed session's committed generation, UTC filesystem time,
+document count, and document paths so the full reopening identity can be chosen
+without maintaining a second name registry. A row marked `active` is already
+held by another window; its document metadata is intentionally unknown because
+listing never reads a live writer's snapshot without the store lock. The
+`UPDATED_UTC` column describes the current committed generation, not whether an
+open window has uncheckpointed changes.
+
 #### Static presentation bindings:
 
 Repeated field names can be factored into top-level string bindings. The

@@ -230,7 +230,7 @@ fn product_0001_keeps_editor_crates_out_of_the_nilket_workspace() {
 }
 
 #[test]
-fn product_0059_store_stays_capability_closed_and_product_0060_consumption_is_explicit() {
+fn product_0059_store_stays_capability_closed_and_later_consumers_are_explicit() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let store_path = manifest_dir.join("src/core/session_store.rs");
 	let source = fs::read_to_string(&store_path).expect("read session store");
@@ -295,12 +295,27 @@ fn product_0059_store_stays_capability_closed_and_product_0060_consumption_is_ex
 	for path in polariton_sources {
 		let head = fs::read_to_string(&path).expect("read Polariton source");
 		let production = head.split("\n#[cfg(test)]").next().unwrap_or(&head);
-		assert!(
-			!production.contains("SessionStore"),
-			"{} made store discovery or creation a Polariton concern",
-			path.display()
-		);
 		let file = path.file_name().and_then(|name| name.to_str());
+		if production.contains("SessionStore") {
+			assert_eq!(
+				file,
+				Some("main.rs"),
+				"{} moved PRODUCT-0073's read-only discovery outside the terminal entrypoint",
+				path.display()
+			);
+			let listing = production
+				.split("fn list_saved_sessions() -> gui::Result")
+				.nth(1)
+				.expect("PRODUCT-0073 terminal discovery")
+				.split("fn render_session_discovery")
+				.next()
+				.expect("bounded PRODUCT-0073 terminal discovery");
+			assert!(listing.contains("SessionStore::platform_default()?.discover()?"));
+			assert!(
+				!listing.contains("create(") && !listing.contains("open_writable"),
+				"PRODUCT-0073 terminal discovery must not acquire writable authority"
+			);
+		}
 		if production.contains("SavedSession") {
 			assert_eq!(
 				file,
