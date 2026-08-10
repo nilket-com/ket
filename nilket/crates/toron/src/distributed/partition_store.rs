@@ -899,10 +899,13 @@ impl PartitionStore for InMemoryPartitionStore {
 		inner
 			.reservations
 			.retain(|address, _| address.query_id != query_id);
+		// Filter on the address, not just the seal flag: `values_mut()` yields no
+		// address, so an unfiltered loop cancels every query's live partitions.
 		for live in inner
 			.live_partitions
-			.values_mut()
-			.filter(|live| !live.sealed)
+			.iter_mut()
+			.filter(|(address, live)| address.query_id == query_id && !live.sealed)
+			.map(|(_, live)| live)
 		{
 			live.cancelled = Some(PartitionMissingReason::CancelledTaskCleanup);
 			live.notify.notify_waiters();
@@ -1539,6 +1542,62 @@ mod tests {
 			.expect("live cancel should wake")
 			.expect("reader task");
 		assert_eq!(observed, Err(PartitionMissingReason::WorkerLost));
+	}
+
+	/// Cancelling one query must not touch another query's live partitions. The
+	/// `retain` calls filter on `query_id`; the live-partition loop iterated
+	/// `values_mut()`, which yields no address to filter on, so every unsealed live
+	/// partition on the worker was cancelled, woken and had its pacing semaphore
+	/// closed — corrupting healthy concurrent queries with a plausible-looking
+	/// `CancelledTaskCleanup`.
+	///
+	/// Proving "the existing chunk did not come back cancelled" is too weak: it would
+	/// pass even with the pacing semaphore closed. B must still accept a further
+	/// append, seal, and be consumed to its normal end.
+	#[tokio::test]
+	async fn cancelling_one_query_leaves_another_querys_live_partition_untouched() {
+		let store = InMemoryPartitionStore::new();
+		let mut victim = address(AttemptId::first());
+		victim.query_id = QueryId::from_u128(2);
+		let cancelled_query = QueryId::from_u128(1);
+
+		store.open_live(victim, test_schema()).expect("open live");
+		store
+			.append_live(ipc_payload(victim, &[1, 2, 3]))
+			.await
+			.expect("first append");
+
+		store.cancel_query(cancelled_query);
+
+		// The pacing semaphore must still be open: a closed one fails this append.
+		store
+			.append_live(ipc_payload(victim, &[4, 5, 6]))
+			.await
+			.expect("append after another query's cancellation must still be admitted");
+		store
+			.seal_live(manifest_for_address(victim))
+			.expect("seal after another query's cancellation must succeed");
+
+		// And B must be consumable to its normal end, never terminating cancelled.
+		let mut stream = store
+			.pull_live(victim, AttemptId::first())
+			.expect("live pull");
+		let mut chunks = 0usize;
+		while let Some(item) =
+			tokio::time::timeout(std::time::Duration::from_secs(1), stream.next())
+				.await
+				.expect("an untouched live partition must not stall")
+		{
+			let payload = item.expect("no chunk of an untouched query may fail");
+			assert!(!payload.bytes.is_empty());
+			chunks += 1;
+		}
+		// Seal reassembles the appends into one materialized payload, so the claim is
+		// normal termination with no failed chunk — not a particular chunk count.
+		assert!(
+			chunks >= 1,
+			"an untouched query must be consumable to its normal end"
+		);
 	}
 
 	#[tokio::test]
