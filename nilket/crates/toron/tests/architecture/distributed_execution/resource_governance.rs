@@ -73,7 +73,7 @@ pub(crate) fn adr050_per_query_budget_sourced_by_tenant_at_coordinator() {
 	for required in [
 		"fn admit_query(&self, context: &ExecutionContext)",
 		"query_budget_for_base(context.tenant_id, self.query_budget)",
-		"execute_query_with_admission(plan, context, query_budget,",
+		"execute_query_with_admission(",
 		"fragment_config(context, query_budget)",
 	] {
 		assert!(
@@ -126,7 +126,8 @@ pub(crate) fn adr050_aggregate_admission_rejects_before_bind_or_execution() {
 		.1;
 
 	assert!(execute_query.contains("let admitted = self.admit_query(&context).await?;"));
-	assert!(execute_query.contains(".execute_query_with_admission(plan, context, query_budget,"));
+	assert!(execute_query.contains(".execute_query_with_admission("));
+	assert!(execute_query.contains("query_budget,"));
 	assert!(
 		helper.contains("let planner_config = distributed_planner_config(self.config.clone());"),
 		"distributed admission derives its binding config after admission"
@@ -1123,7 +1124,7 @@ pub(crate) fn adr055_no_descriptor_registry_refresh_or_sync_change() {
 
 	assert!(!budget.contains("DescriptorRefresh"));
 	assert!(coordinator.contains("let admitted = self.admit_query(&context).await?;"));
-	assert!(coordinator.contains("execute_query_with_admission(plan, context, query_budget,"));
+	assert!(coordinator.contains("execute_query_with_admission("));
 	assert!(coordinator.contains("descriptor_evolved_table_id"));
 	assert!(
 		coordinator

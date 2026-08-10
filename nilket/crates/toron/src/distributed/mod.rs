@@ -5,6 +5,7 @@ pub mod context;
 pub mod determinism;
 pub mod fragment;
 pub mod identity;
+pub mod namespace_lifecycle;
 pub mod partition_store;
 pub mod scheduler;
 pub mod task;

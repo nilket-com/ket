@@ -26,6 +26,7 @@ use crate::distributed::cancellation::{
 	CancellationMetrics, CancellationOutcome, CancellationTrigger, DownstreamCancellationMetrics,
 	DownstreamCancellationOutcome, DownstreamCancellationTrigger,
 };
+use crate::distributed::partition_store::PartitionStore;
 use crate::network::connection::SqlConnectionLimiter;
 use crate::network::observability_http::{READ_REQUEST_TIMEOUT, read_request, write_response};
 use crate::network::tls::accepted_observability_monitor_principal;
@@ -180,6 +181,7 @@ pub struct MetricsRegistry {
 	audit_metrics: Option<Arc<ToronAuditMetrics>>,
 	runtime_evidence: Option<Arc<OptimizerRuntimeEvidence>>,
 	resource_metrics: ResourceMetrics,
+	shuffle_lifecycle: std::sync::RwLock<Option<Arc<dyn PartitionStore>>>,
 }
 
 pub struct MetricsRegistryConfig {
@@ -219,7 +221,15 @@ impl MetricsRegistry {
 				tenant_admission: config.tenant_admission,
 				admission_rejections: config.admission_rejections,
 			},
+			shuffle_lifecycle: std::sync::RwLock::new(None),
 		}
+	}
+
+	pub fn attach_shuffle_lifecycle(&self, store: Arc<dyn PartitionStore>) {
+		*self
+			.shuffle_lifecycle
+			.write()
+			.expect("shuffle lifecycle metrics lock poisoned") = Some(store);
 	}
 
 	pub fn increment_accept(&self, listener: ListenerName) {
@@ -297,8 +307,70 @@ impl MetricsRegistry {
 		self.render_optimizer_evidence_metrics(&mut out);
 		self.render_sql_connection_metrics(&mut out);
 		self.render_audit_metrics(&mut out);
+		self.render_shuffle_lifecycle_metrics(&mut out);
 		self.resource_metrics.render_text(&mut out);
 		out
+	}
+
+	fn render_shuffle_lifecycle_metrics(&self, out: &mut String) {
+		let store = self
+			.shuffle_lifecycle
+			.read()
+			.expect("shuffle lifecycle metrics lock poisoned")
+			.clone();
+		let Some(store) = store else {
+			return;
+		};
+		let snapshot = store.lifecycle_snapshot();
+		for (name, value) in [
+			("shuffle_namespaces", snapshot.resident_namespaces as u64),
+			("shuffle_retained_bytes", snapshot.retained_bytes),
+			(
+				"shuffle_physical_spill_files",
+				snapshot.physical_spill_files as u64,
+			),
+			("shuffle_cleanup_debt", snapshot.cleanup_debt as u64),
+			("shuffle_receipts", snapshot.receipts as u64),
+			(
+				"shuffle_cancelled_tombstones",
+				snapshot.cancelled_tombstones as u64,
+			),
+			(
+				"shuffle_live_partition_records",
+				snapshot.live_partition_records as u64,
+			),
+			(
+				"shuffle_oldest_namespace_age_millis",
+				snapshot.oldest_resident_age_millis,
+			),
+		] {
+			out.push_str(&format!("# TYPE {name} gauge\n{name} {value}\n"));
+		}
+		out.push_str("# TYPE shuffle_reclamations_total counter\n");
+		for (cause, value) in [
+			("quiesced", snapshot.quiesced_reclaims),
+			("cancelled", snapshot.cancelled_reclaims),
+			("failed", snapshot.failed_reclaims),
+			("abandoned", snapshot.abandoned_reclaims),
+		] {
+			out.push_str(&format!(
+				"shuffle_reclamations_total{{cause=\"{cause}\"}} {value}\n"
+			));
+		}
+		out.push_str("# TYPE shuffle_receipt_evictions_total counter\n");
+		out.push_str(&format!(
+			"shuffle_receipt_evictions_total{{cause=\"capacity\"}} {}\n",
+			snapshot.capacity_evictions
+		));
+		out.push_str(&format!(
+			"shuffle_receipt_evictions_total{{cause=\"horizon\"}} {}\n",
+			snapshot.horizon_evictions
+		));
+		out.push_str("# TYPE shuffle_startup_swept_files_total counter\n");
+		out.push_str(&format!(
+			"shuffle_startup_swept_files_total {}\n",
+			snapshot.startup_swept_files
+		));
 	}
 
 	fn render_descriptor_sync_metrics(&self, out: &mut String) {

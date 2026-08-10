@@ -17,7 +17,8 @@ use crate::distributed::cancellation::{
 };
 use crate::distributed::identity::{FrameByteLen, PartitionId, StreamSeq, TaskIdentity, WorkerId};
 use crate::distributed::partition_store::{
-	InMemoryPartitionStore, PartitionPayload, PartitionStore, PartitionStoreError,
+	DEFAULT_WORKER_LOST_AFTER, InMemoryPartitionStore, PartitionPayload, PartitionStore,
+	PartitionStoreError,
 };
 use crate::distributed::scheduler::{DispatchOutcome, TaskDispatcher};
 use crate::distributed::task::{
@@ -39,9 +40,10 @@ use crate::ir::{
 use crate::storage::{ScanRequest, ScanStream, StorageScan};
 use crate::wire::{
 	ArrowIpcBytes, CancelTaskPayload, EnvelopeIdentity, MessageKind, PartitionDataPayload,
-	PartitionMissingPayload, ProtocolVersion, PullPartitionPayload, StartTaskPayload,
-	TaskBatchPayload, TaskCancelledPayload, TaskCompletePayload, TaskFailedPayload,
-	TaskStartedPayload, WireEnvelope, decode_payload, encode_payload,
+	PartitionMissingPayload, ProtocolVersion, PullPartitionPayload, QueryLeaseAcceptedPayload,
+	QueryLeasePayload, QueryRetiredPayload, RetireQueryPayload, StartTaskPayload, TaskBatchPayload,
+	TaskCancelledPayload, TaskCompletePayload, TaskFailedPayload, TaskStartedPayload, WireEnvelope,
+	decode_payload, encode_payload,
 };
 use arrow::array::ArrayRef;
 use arrow::datatypes::SchemaRef;
@@ -165,7 +167,17 @@ impl ToronWorker {
 		_catalog: Arc<dyn Catalog>,
 		_planner_config: PlannerConfig,
 	) -> Self {
-		Self::with_partition_store(storage, memory, Arc::new(InMemoryPartitionStore::new()))
+		Self::with_partition_store(
+			storage,
+			memory,
+			Arc::new(
+				InMemoryPartitionStore::managed(
+					crate::distributed::budget::QueryBudget::test_default(),
+					DEFAULT_WORKER_LOST_AFTER,
+				)
+				.expect("default managed shuffle store"),
+			),
+		)
 	}
 
 	pub fn with_partition_store(
@@ -240,6 +252,10 @@ impl ToronWorker {
 	pub fn with_audit_emitter(mut self, audit: ToronAuditEmitter) -> Self {
 		self.audit = audit;
 		self
+	}
+
+	pub fn reap_expired_shuffle_namespaces(&self) {
+		self.partition_store.reap_expired_queries();
 	}
 
 	pub async fn execute_task_local(
@@ -790,6 +806,47 @@ impl ToronWorker {
 				.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
 
 			match envelope.kind {
+				MessageKind::QueryLease => {
+					let query_id = query_envelope_identity(envelope.identity)?;
+					let payload: QueryLeasePayload = decode_payload(&envelope.payload)?;
+					if payload.query_id != query_id
+						|| payload.lease_term_millis
+							!= self.partition_store.query_lease_term_millis()
+					{
+						return Err(QueryError::UnexpectedMessage {
+							expected: "QueryLease with the worker lifecycle term",
+						});
+					}
+					self.partition_store.issue_or_renew_query_lease(query_id);
+					send_terminal_payload(
+						&mut stream,
+						&mut phase,
+						MessageKind::QueryLeaseAccepted,
+						EnvelopeIdentity::query(query_id),
+						None,
+						&QueryLeaseAcceptedPayload { query_id },
+					)
+					.await?;
+				}
+				MessageKind::RetireQuery => {
+					let query_id = query_envelope_identity(envelope.identity)?;
+					let payload: RetireQueryPayload = decode_payload(&envelope.payload)?;
+					if payload.query_id != query_id {
+						return Err(QueryError::UnexpectedMessage {
+							expected: "RetireQuery for requested query",
+						});
+					}
+					self.partition_store.retire_query(query_id, payload.cause);
+					send_terminal_payload(
+						&mut stream,
+						&mut phase,
+						MessageKind::QueryRetired,
+						EnvelopeIdentity::query(query_id),
+						None,
+						&QueryRetiredPayload { query_id },
+					)
+					.await?;
+				}
 				MessageKind::StartTask => {
 					let payload: StartTaskPayload = decode_payload(&envelope.payload)?;
 					let identity = payload.spec.identity;
@@ -1132,7 +1189,7 @@ impl ToronWorker {
 				}
 				_ => {
 					return Err(QueryError::UnexpectedMessage {
-						expected: "StartTask, CancelTask, or PullPartition",
+						expected: "QueryLease, RetireQuery, StartTask, CancelTask, or PullPartition",
 					});
 				}
 			}
@@ -4630,6 +4687,7 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 
 pub struct ToronCoordinator {
 	memory: Arc<MemoryManager>,
+	query_lease_term_millis: u64,
 }
 
 #[derive(Debug)]
@@ -4702,16 +4760,31 @@ where
 			}
 		}
 
-		match self
+		let execution = self
 			.coordinator
 			.execute_task_on_worker_with_telemetry_and_batch_sender(
 				stream,
 				spec.clone(),
 				self.final_result_sender.clone(),
 				self.final_result_batch_sent.clone(),
-			)
-			.await
-		{
+			);
+		tokio::pin!(execution);
+		let result = if let Some(active_query) = &self.active_query {
+			tokio::select! {
+				result = &mut execution => result,
+				_ = active_query.stopped() => {
+					let kind = active_query.lease_failure_worker().map_or(
+						TaskFailureKind::Cancelled,
+						|worker_id| TaskFailureKind::WorkerLost { worker_id },
+					);
+					Err(QueryError::Runtime(RuntimeError::TaskFailure { kind }))
+				}
+			}
+		} else {
+			execution.await
+		};
+
+		match result {
 			Ok(completion) => DispatchOutcome::CompletedWithTelemetry {
 				output: completion.output,
 				batches: completion.batches,
@@ -4724,7 +4797,83 @@ where
 
 impl ToronCoordinator {
 	pub fn new(memory: Arc<MemoryManager>) -> Self {
-		Self { memory }
+		let config = crate::distributed::namespace_lifecycle::ShuffleLifecycleConfig::from_worker_loss_window(
+			DEFAULT_WORKER_LOST_AFTER,
+		)
+		.expect("default shuffle lifecycle config");
+		Self {
+			memory,
+			query_lease_term_millis: u64::try_from(config.lease_term().as_millis())
+				.expect("query lease term fits wire milliseconds"),
+		}
+	}
+
+	pub async fn issue_or_renew_query_lease_on_worker<Stream>(
+		&self,
+		mut stream: Stream,
+		query_id: crate::distributed::identity::QueryId,
+	) -> Result<(), QueryError>
+	where
+		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
+		send_payload(
+			&mut stream,
+			MessageKind::QueryLease,
+			EnvelopeIdentity::query(query_id),
+			None,
+			&QueryLeasePayload {
+				query_id,
+				lease_term_millis: self.query_lease_term_millis,
+			},
+		)
+		.await?;
+		let response = read_envelope(&mut stream, self.memory.as_ref()).await?;
+		response.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
+		if response.kind != MessageKind::QueryLeaseAccepted {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "QueryLeaseAccepted",
+			});
+		}
+		let payload: QueryLeaseAcceptedPayload = decode_payload(&response.payload)?;
+		if payload.query_id != query_id || response.identity != EnvelopeIdentity::query(query_id) {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "QueryLeaseAccepted for requested query",
+			});
+		}
+		finish_terminal_exchange(&mut stream, Ok(())).await
+	}
+
+	pub async fn retire_query_on_worker<Stream>(
+		&self,
+		mut stream: Stream,
+		query_id: crate::distributed::identity::QueryId,
+		cause: crate::distributed::namespace_lifecycle::QueryTerminalCause,
+	) -> Result<(), QueryError>
+	where
+		Stream: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+	{
+		send_payload(
+			&mut stream,
+			MessageKind::RetireQuery,
+			EnvelopeIdentity::query(query_id),
+			None,
+			&RetireQueryPayload { query_id, cause },
+		)
+		.await?;
+		let response = read_envelope(&mut stream, self.memory.as_ref()).await?;
+		response.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
+		if response.kind != MessageKind::QueryRetired {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "QueryRetired",
+			});
+		}
+		let payload: QueryRetiredPayload = decode_payload(&response.payload)?;
+		if payload.query_id != query_id || response.identity != EnvelopeIdentity::query(query_id) {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "QueryRetired for requested query",
+			});
+		}
+		finish_terminal_exchange(&mut stream, Ok(())).await
 	}
 
 	pub async fn execute_task_on_worker<Stream>(
@@ -4765,6 +4914,31 @@ impl ToronCoordinator {
 		let identity = spec.identity;
 		let forward_final_batches =
 			matches!(spec.output, TaskOutputBinding::FinalResult) && final_result_sender.is_some();
+		send_payload(
+			&mut stream,
+			MessageKind::QueryLease,
+			EnvelopeIdentity::query(identity.query_id),
+			None,
+			&QueryLeasePayload {
+				query_id: identity.query_id,
+				lease_term_millis: self.query_lease_term_millis,
+			},
+		)
+		.await?;
+		let lease_response = read_envelope(&mut stream, self.memory.as_ref()).await?;
+		lease_response
+			.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(u32::MAX))?;
+		if lease_response.kind != MessageKind::QueryLeaseAccepted {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "QueryLeaseAccepted before StartTask",
+			});
+		}
+		let lease: QueryLeaseAcceptedPayload = decode_payload(&lease_response.payload)?;
+		if lease.query_id != identity.query_id {
+			return Err(QueryError::UnexpectedMessage {
+				expected: "QueryLeaseAccepted for task query",
+			});
+		}
 		send_payload(
 			&mut stream,
 			MessageKind::StartTask,
@@ -5154,6 +5328,17 @@ fn task_envelope_identity(identity: EnvelopeIdentity) -> Result<TaskIdentity, Qu
 	}
 }
 
+fn query_envelope_identity(
+	identity: EnvelopeIdentity,
+) -> Result<crate::distributed::identity::QueryId, QueryError> {
+	match identity {
+		EnvelopeIdentity::Query(query_id) => Ok(query_id),
+		_ => Err(QueryError::UnexpectedMessage {
+			expected: "query envelope identity",
+		}),
+	}
+}
+
 fn partition_missing_error(reason: PartitionMissingReason) -> QueryError {
 	QueryError::Runtime(RuntimeError::PartitionStoreMismatch {
 		message: format!("{reason:?}"),
@@ -5248,6 +5433,16 @@ fn partition_store_publish_error(error: PartitionStoreError) -> QueryError {
 		PartitionStoreError::CancelledQuery { .. } => {
 			QueryError::Runtime(RuntimeError::TaskFailure {
 				kind: TaskFailureKind::Cancelled,
+			})
+		}
+		PartitionStoreError::QueryLeaseMissing { .. } => {
+			QueryError::Runtime(RuntimeError::TaskFailure {
+				kind: TaskFailureKind::QueryLeaseMissing,
+			})
+		}
+		PartitionStoreError::QueryLeaseExpired { .. } => {
+			QueryError::Runtime(RuntimeError::TaskFailure {
+				kind: TaskFailureKind::QueryLeaseExpired,
 			})
 		}
 		other => QueryError::Internal {

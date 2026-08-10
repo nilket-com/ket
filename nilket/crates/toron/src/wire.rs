@@ -1,7 +1,8 @@
 use crate::distributed::budget::{BudgetDimension, ByteCount};
 use crate::distributed::identity::{
-	AttemptId, FrameByteLen, LeaseEpoch, StreamSeq, TaskIdentity, WorkerId,
+	AttemptId, FrameByteLen, LeaseEpoch, QueryId, StreamSeq, TaskIdentity, WorkerId,
 };
+use crate::distributed::namespace_lifecycle::QueryTerminalCause;
 use crate::distributed::task::{
 	PartitionAddress, RowCount, TaskCompletionOutput, TaskSpec, TaskTelemetry, TraceContext,
 };
@@ -13,7 +14,7 @@ use serde::{Deserialize, Serialize};
 pub struct ProtocolVersion(pub u16);
 
 impl ProtocolVersion {
-	pub const CURRENT: Self = Self(1);
+	pub const CURRENT: Self = Self(2);
 
 	pub const fn new(value: u16) -> Self {
 		Self(value)
@@ -38,10 +39,14 @@ pub enum MessageKind {
 	PullPartition,
 	PartitionData,
 	PartitionMissing,
+	QueryLease,
+	QueryLeaseAccepted,
+	RetireQuery,
+	QueryRetired,
 }
 
 impl MessageKind {
-	pub const TASK_LIFECYCLE_COUNT: usize = 9;
+	pub const TASK_LIFECYCLE_COUNT: usize = 13;
 	pub const DATA_MOVEMENT_COUNT: usize = 3;
 	pub const COUNT: usize = Self::TASK_LIFECYCLE_COUNT + Self::DATA_MOVEMENT_COUNT;
 	pub const ALL: [Self; Self::COUNT] = [
@@ -57,6 +62,10 @@ impl MessageKind {
 		Self::PullPartition,
 		Self::PartitionData,
 		Self::PartitionMissing,
+		Self::QueryLease,
+		Self::QueryLeaseAccepted,
+		Self::RetireQuery,
+		Self::QueryRetired,
 	];
 
 	pub const fn is_task_lifecycle(self) -> bool {
@@ -71,6 +80,10 @@ impl MessageKind {
 				| Self::TaskCancelled
 				| Self::Progress
 				| Self::Heartbeat
+				| Self::QueryLease
+				| Self::QueryLeaseAccepted
+				| Self::RetireQuery
+				| Self::QueryRetired
 		)
 	}
 
@@ -90,6 +103,7 @@ pub enum EnvelopeIdentity {
 		worker_id: WorkerId,
 		lease_epoch: LeaseEpoch,
 	},
+	Query(QueryId),
 }
 
 impl EnvelopeIdentity {
@@ -106,6 +120,10 @@ impl EnvelopeIdentity {
 			worker_id,
 			lease_epoch,
 		}
+	}
+
+	pub const fn query(query_id: QueryId) -> Self {
+		Self::Query(query_id)
 	}
 }
 
@@ -266,6 +284,28 @@ pub struct HeartbeatPayload {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryLeasePayload {
+	pub query_id: QueryId,
+	pub lease_term_millis: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryLeaseAcceptedPayload {
+	pub query_id: QueryId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetireQueryPayload {
+	pub query_id: QueryId,
+	pub cause: QueryTerminalCause,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QueryRetiredPayload {
+	pub query_id: QueryId,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PullPartitionPayload {
 	pub address: PartitionAddress,
 	pub expected_attempt: AttemptId,
@@ -319,7 +359,15 @@ mod tests {
 	}
 
 	fn identity_for(kind: MessageKind) -> EnvelopeIdentity {
-		if kind == MessageKind::Heartbeat {
+		if matches!(
+			kind,
+			MessageKind::QueryLease
+				| MessageKind::QueryLeaseAccepted
+				| MessageKind::RetireQuery
+				| MessageKind::QueryRetired
+		) {
+			EnvelopeIdentity::query(QueryId::from_u128(1))
+		} else if kind == MessageKind::Heartbeat {
 			EnvelopeIdentity::worker(WorkerId::from_u128(11), LeaseEpoch::new(1))
 		} else if kind.is_data_movement() {
 			EnvelopeIdentity::partition(address())
@@ -358,7 +406,7 @@ mod tests {
 			Vec::new(),
 		)
 		.expect("envelope");
-		envelope.protocol_version = ProtocolVersion::new(2);
+		envelope.protocol_version = ProtocolVersion::new(3);
 
 		let error = envelope
 			.validate_runtime(ProtocolVersion::CURRENT, FrameByteLen::from_u32(1024))
@@ -368,7 +416,7 @@ mod tests {
 			error,
 			RuntimeError::ProtocolMismatch {
 				expected: ProtocolVersion::CURRENT,
-				observed: ProtocolVersion(2)
+				observed: ProtocolVersion(3)
 			}
 		));
 	}
@@ -408,6 +456,11 @@ mod tests {
 				observed_attempt: AttemptId::new(1),
 			},
 			PartitionMissingReason::CancelledTaskCleanup,
+			PartitionMissingReason::QueryFailedCleanup,
+			PartitionMissingReason::NamespaceRetiring,
+			PartitionMissingReason::Reclaimed,
+			PartitionMissingReason::Abandoned,
+			PartitionMissingReason::NamespaceUnknown,
 			PartitionMissingReason::WorkerLost,
 			PartitionMissingReason::StoreEvicted,
 		];
@@ -421,6 +474,34 @@ mod tests {
 			let decoded: PartitionMissingPayload = decode_payload(&encoded).expect("decode");
 			assert_eq!(decoded, payload);
 		}
+	}
+
+	#[test]
+	fn query_lifecycle_carriers_are_query_scoped_and_typed() {
+		let query_id = QueryId::from_u128(42);
+		let lease = QueryLeasePayload {
+			query_id,
+			lease_term_millis: 35_001,
+		};
+		let decoded: QueryLeasePayload =
+			decode_payload(&encode_payload(&lease)).expect("decode lease");
+		assert_eq!(decoded, lease);
+
+		for cause in [
+			QueryTerminalCause::Success,
+			QueryTerminalCause::Cancelled,
+			QueryTerminalCause::Failed,
+			QueryTerminalCause::Abandoned,
+		] {
+			let retirement = RetireQueryPayload { query_id, cause };
+			let decoded: RetireQueryPayload =
+				decode_payload(&encode_payload(&retirement)).expect("decode retirement");
+			assert_eq!(decoded, retirement);
+		}
+		assert_eq!(
+			EnvelopeIdentity::query(query_id),
+			EnvelopeIdentity::Query(query_id)
+		);
 	}
 
 	#[test]

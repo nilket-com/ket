@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock};
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::SchemaRef;
 use aws_lc_rs::aead::{AES_256_GCM_SIV, Aad, LessSafeKey, Nonce, UnboundKey};
@@ -19,16 +20,27 @@ use crate::distributed::cancellation::{
 	DownstreamCancellationContext, DownstreamCancellationTrigger,
 };
 use crate::distributed::identity::{AttemptId, ExchangeId, PartitionId, QueryId, StageId, TaskId};
+use crate::distributed::namespace_lifecycle::{
+	QueryTerminalCause, ShuffleLifecycleConfig, ShuffleLifecycleSnapshot,
+	ShuffleNamespaceLifecycle, WriteLeaseError,
+};
 use crate::distributed::task::{
 	ArrowIpcDigest, PartitionAddress, PartitionBackend, PartitionEntry, PartitionManifest, RowCount,
 };
 use crate::error::PartitionMissingReason;
 use crate::server::spill::SpillId;
 
+pub use crate::distributed::worker_registry::DEFAULT_WORKER_LOST_AFTER;
+
 pub(crate) const LIVE_BACKLOG_DEPTH: usize = 4;
 
 #[async_trait::async_trait]
 pub trait PartitionStore: Send + Sync {
+	fn query_lease_term_millis(&self) -> u64;
+	fn issue_or_renew_query_lease(&self, query_id: QueryId);
+	fn retire_query(&self, query_id: QueryId, cause: QueryTerminalCause);
+	fn reap_expired_queries(&self);
+	fn lifecycle_snapshot(&self) -> ShuffleLifecycleSnapshot;
 	fn publish(
 		&self,
 		manifest: PartitionManifest,
@@ -175,6 +187,7 @@ pub struct LivePartitionStream {
 struct LivePartitionReaderGuard {
 	inner: Arc<RwLock<PartitionStoreInner>>,
 	address: PartitionAddress,
+	lifecycle: ShuffleNamespaceLifecycle,
 }
 
 impl LivePartitionStream {
@@ -191,10 +204,15 @@ impl LivePartitionStream {
 		chunks: BoxStream<'static, Result<PartitionPayload, PartitionMissingReason>>,
 		inner: Arc<RwLock<PartitionStoreInner>>,
 		address: PartitionAddress,
+		lifecycle: ShuffleNamespaceLifecycle,
 	) -> Self {
 		Self {
 			chunks,
-			reader_guard: Some(LivePartitionReaderGuard { inner, address }),
+			reader_guard: Some(LivePartitionReaderGuard {
+				inner,
+				address,
+				lifecycle,
+			}),
 		}
 	}
 
@@ -211,7 +229,7 @@ impl LivePartitionStream {
 
 impl LivePartitionReaderGuard {
 	fn finish(self, cancel_if_unsealed: bool) {
-		let downstream_cancellation = {
+		let (downstream_cancellation, removed) = {
 			let mut inner = self.inner.write().expect("partition store poisoned");
 			let Some(live) = inner.live_partitions.get_mut(&self.address) else {
 				return;
@@ -222,12 +240,21 @@ impl LivePartitionReaderGuard {
 				live.cancelled = Some(PartitionMissingReason::CancelledTaskCleanup);
 				live.notify.notify_waiters();
 				live.pacing_semaphore.close();
-				live.downstream_cancellation.clone()
+				(live.downstream_cancellation.clone(), false)
 			} else {
 				release_live_chunks_if_idle(live);
-				None
+				let removed = try_remove_quiescent_in_memory_query(
+					&mut inner,
+					self.address.query_id,
+					&self.lifecycle,
+				);
+				(None, removed)
 			}
 		};
+		if removed {
+			self.lifecycle
+				.finish_removal(self.address.query_id, Instant::now());
+		}
 		if let Some(downstream_cancellation) = downstream_cancellation {
 			downstream_cancellation
 				.cancel_registered_attempts(DownstreamCancellationTrigger::WorkerCancelTask);
@@ -247,6 +274,10 @@ impl Drop for LivePartitionStream {
 pub enum PartitionStoreError {
 	#[error("query has been cancelled: {query_id:?}")]
 	CancelledQuery { query_id: QueryId },
+	#[error("query has no live shuffle namespace lease: {query_id:?}")]
+	QueryLeaseMissing { query_id: QueryId },
+	#[error("query shuffle namespace lease expired: {query_id:?}")]
+	QueryLeaseExpired { query_id: QueryId },
 	#[error("partition payload address does not belong to manifest")]
 	AddressManifestMismatch,
 	#[error("partition payload is absent from manifest: {partition_id:?}")]
@@ -305,6 +336,7 @@ impl From<ArrowIpcError> for PartitionStoreError {
 pub struct InMemoryPartitionStore {
 	inner: Arc<RwLock<PartitionStoreInner>>,
 	budget: BudgetTracker,
+	lifecycle: ShuffleNamespaceLifecycle,
 }
 
 #[derive(Debug, Default)]
@@ -358,20 +390,94 @@ fn release_live_chunks_if_idle(live: &mut LivePartition) {
 	}
 }
 
+fn try_remove_quiescent_in_memory_query(
+	inner: &mut PartitionStoreInner,
+	query_id: QueryId,
+	lifecycle: &ShuffleNamespaceLifecycle,
+) -> bool {
+	if lifecycle.retirement_cause(query_id).is_none()
+		|| inner
+			.live_partitions
+			.iter()
+			.any(|(address, live)| address.query_id == query_id && live.active_readers != 0)
+	{
+		return false;
+	}
+	for live in inner
+		.live_partitions
+		.iter()
+		.filter(|(address, _)| address.query_id == query_id)
+		.map(|(_, live)| live)
+	{
+		live.pacing_semaphore.close();
+	}
+	inner.manifests.retain(|key, _| key.query_id != query_id);
+	inner
+		.partitions
+		.retain(|address, _| address.query_id != query_id);
+	inner
+		.reservations
+		.retain(|address, _| address.query_id != query_id);
+	inner
+		.live_partitions
+		.retain(|address, _| address.query_id != query_id);
+	if lifecycle.enforces_leases() {
+		inner.cancelled_queries.remove(&query_id);
+	}
+	true
+}
+
 impl InMemoryPartitionStore {
 	pub fn new() -> Self {
 		Self::with_budget(QueryBudget::test_default())
 	}
 
 	pub fn with_budget(budget: QueryBudget) -> Self {
+		let config = ShuffleLifecycleConfig::from_worker_loss_window(DEFAULT_WORKER_LOST_AFTER)
+			.expect("default shuffle lifecycle config");
+		Self::with_budget_and_lifecycle(
+			budget,
+			ShuffleNamespaceLifecycle::unmanaged_fixture(config),
+		)
+	}
+
+	pub fn managed(
+		budget: QueryBudget,
+		worker_lost_after: Duration,
+	) -> Result<Self, PartitionStoreError> {
+		let config = ShuffleLifecycleConfig::from_worker_loss_window(worker_lost_after)
+			.map_err(|error| PartitionStoreError::Io(std::io::Error::other(error)))?;
+		Ok(Self::with_budget_and_lifecycle(
+			budget,
+			ShuffleNamespaceLifecycle::managed(config),
+		))
+	}
+
+	fn with_budget_and_lifecycle(
+		budget: QueryBudget,
+		lifecycle: ShuffleNamespaceLifecycle,
+	) -> Self {
 		Self {
 			inner: Arc::new(RwLock::new(PartitionStoreInner::default())),
 			budget: BudgetTracker::new(budget),
+			lifecycle,
 		}
 	}
 
 	pub fn budget_used(&self, dimension: BudgetDimension) -> ByteCount {
 		self.budget.used(dimension)
+	}
+
+	fn authorize_write(&self, query_id: QueryId) -> Result<(), PartitionStoreError> {
+		match self.lifecycle.authorize_write(query_id, Instant::now()) {
+			Ok(()) => Ok(()),
+			Err(WriteLeaseError::Missing) => {
+				Err(PartitionStoreError::QueryLeaseMissing { query_id })
+			}
+			Err(WriteLeaseError::Expired) => {
+				Err(PartitionStoreError::QueryLeaseExpired { query_id })
+			}
+		}
 	}
 
 	/// Behavior-neutral liveness receipt for a query's live shuffle partitions. A nonzero
@@ -429,11 +535,64 @@ impl Default for InMemoryPartitionStore {
 
 #[async_trait::async_trait]
 impl PartitionStore for InMemoryPartitionStore {
+	fn query_lease_term_millis(&self) -> u64 {
+		u64::try_from(self.lifecycle.config().lease_term().as_millis())
+			.expect("query lease term fits wire milliseconds")
+	}
+
+	fn issue_or_renew_query_lease(&self, query_id: QueryId) {
+		self.lifecycle.issue_or_renew(query_id, Instant::now());
+	}
+
+	fn retire_query(&self, query_id: QueryId, cause: QueryTerminalCause) {
+		self.lifecycle.begin_retirement(query_id, cause);
+		let missing_reason = cause.late_pull_reason();
+		let removed = {
+			let mut inner = self.inner.write().expect("partition store poisoned");
+			if cause != QueryTerminalCause::Success {
+				if !self.lifecycle.enforces_leases() {
+					inner.cancelled_queries.insert(query_id);
+				}
+				for live in inner
+					.live_partitions
+					.iter_mut()
+					.filter(|(address, _)| address.query_id == query_id)
+					.map(|(_, live)| live)
+				{
+					live.cancelled = Some(missing_reason.clone());
+					live.notify.notify_waiters();
+					live.pacing_semaphore.close();
+				}
+			}
+			try_remove_quiescent_in_memory_query(&mut inner, query_id, &self.lifecycle)
+		};
+		if removed {
+			self.lifecycle.finish_removal(query_id, Instant::now());
+		}
+	}
+
+	fn reap_expired_queries(&self) {
+		for query_id in self.lifecycle.expired_queries(Instant::now()) {
+			self.retire_query(query_id, QueryTerminalCause::Abandoned);
+		}
+	}
+
+	fn lifecycle_snapshot(&self) -> ShuffleLifecycleSnapshot {
+		let inner = self.inner.read().expect("partition store poisoned");
+		let mut snapshot = self.lifecycle.snapshot(Instant::now());
+		snapshot.resident_namespaces = in_memory_resident_queries(&inner).len();
+		snapshot.retained_bytes = self.budget.used(BudgetDimension::ShuffleBytes).get();
+		snapshot.cancelled_tombstones = inner.cancelled_queries.len();
+		snapshot.live_partition_records = inner.live_partitions.len();
+		snapshot
+	}
+
 	fn publish(
 		&self,
 		manifest: PartitionManifest,
 		payloads: Vec<PartitionPayload>,
 	) -> Result<PartitionManifest, PartitionStoreError> {
+		self.authorize_write(manifest.query_id)?;
 		let key = ManifestKey::from_manifest(&manifest);
 		validate_manifest_payloads(&manifest, &payloads)?;
 
@@ -465,6 +624,7 @@ impl PartitionStore for InMemoryPartitionStore {
 			inner.reservations.insert(address, reservation);
 		}
 		inner.manifests.insert(key, manifest.clone());
+		self.lifecycle.mark_namespace_present(manifest.query_id);
 		Ok(manifest)
 	}
 
@@ -490,6 +650,9 @@ impl PartitionStore for InMemoryPartitionStore {
 		}
 
 		let inner = self.inner.read().expect("partition store poisoned");
+		if let Some(cause) = self.lifecycle.retirement_cause(address.query_id) {
+			return Err(cause.late_pull_reason());
+		}
 		if inner.cancelled_queries.contains(&address.query_id) {
 			return Err(PartitionMissingReason::CancelledTaskCleanup);
 		}
@@ -509,7 +672,9 @@ impl PartitionStore for InMemoryPartitionStore {
 			});
 		}
 
-		Err(PartitionMissingReason::StoreEvicted)
+		Err(self
+			.lifecycle
+			.missing_reason(address.query_id, Instant::now()))
 	}
 
 	fn open_live(
@@ -526,6 +691,7 @@ impl PartitionStore for InMemoryPartitionStore {
 		schema: SchemaRef,
 		downstream_cancellation: Option<DownstreamCancellationContext>,
 	) -> Result<(), PartitionStoreError> {
+		self.authorize_write(address.query_id)?;
 		let mut inner = self.inner.write().expect("partition store poisoned");
 		if inner.cancelled_queries.contains(&address.query_id) {
 			return Err(PartitionStoreError::CancelledQuery {
@@ -545,10 +711,13 @@ impl PartitionStore for InMemoryPartitionStore {
 			live.downstream_cancellation = downstream_cancellation;
 		}
 		live.notify.notify_waiters();
+		self.lifecycle.mark_namespace_present(address.query_id);
 		Ok(())
 	}
 
 	async fn append_live(&self, payload: PartitionPayload) -> Result<(), PartitionStoreError> {
+		let query_id = payload.address.query_id;
+		self.authorize_write(query_id)?;
 		let (semaphore, blocked_appenders) = {
 			let inner = self.inner.read().expect("partition store poisoned");
 			if inner.cancelled_queries.contains(&payload.address.query_id) {
@@ -625,6 +794,7 @@ impl PartitionStore for InMemoryPartitionStore {
 		live.reservations.push(reservation);
 		live.notify.notify_waiters();
 		permit.forget();
+		self.lifecycle.mark_namespace_present(query_id);
 		Ok(())
 	}
 
@@ -632,6 +802,7 @@ impl PartitionStore for InMemoryPartitionStore {
 		&self,
 		mut manifest: PartitionManifest,
 	) -> Result<PartitionManifest, PartitionStoreError> {
+		self.authorize_write(manifest.query_id)?;
 		enum SealInput {
 			Published(PartitionAddress, PartitionPayload),
 			Chunks {
@@ -744,6 +915,7 @@ impl PartitionStore for InMemoryPartitionStore {
 			manifest.partitions = entries;
 		}
 		inner.manifests.insert(key, manifest.clone());
+		self.lifecycle.mark_namespace_present(manifest.query_id);
 		Ok(manifest)
 	}
 
@@ -756,6 +928,7 @@ impl PartitionStore for InMemoryPartitionStore {
 		live.cancelled = Some(reason);
 		live.notify.notify_waiters();
 		live.pacing_semaphore.close();
+		self.lifecycle.mark_namespace_present(address.query_id);
 	}
 
 	fn pull_live(
@@ -769,12 +942,26 @@ impl PartitionStore for InMemoryPartitionStore {
 				observed_attempt: address.attempt_id,
 			});
 		}
+		if let Some(cause) = self.lifecycle.retirement_cause(address.query_id) {
+			return Err(cause.late_pull_reason());
+		}
 		let inner = self.inner.clone();
 		let fallback = {
 			let mut guard = inner.write().expect("partition store poisoned");
 			if guard.cancelled_queries.contains(&address.query_id) {
 				return Err(PartitionMissingReason::CancelledTaskCleanup);
 			}
+			if !guard.live_partitions.contains_key(&address)
+				&& !guard.partitions.contains_key(&address)
+				&& !self
+					.lifecycle
+					.has_live_lease(address.query_id, Instant::now())
+			{
+				return Err(self
+					.lifecycle
+					.missing_reason(address.query_id, Instant::now()));
+			}
+			let created_live = !guard.live_partitions.contains_key(&address);
 			let use_fallback = {
 				let live = guard
 					.live_partitions
@@ -787,14 +974,14 @@ impl PartitionStore for InMemoryPartitionStore {
 					false
 				}
 			};
+			if created_live {
+				self.lifecycle.mark_namespace_present(address.query_id);
+			}
 			if use_fallback {
-				Some(
-					guard
-						.partitions
-						.get(&address)
-						.cloned()
-						.ok_or(PartitionMissingReason::StoreEvicted)?,
-				)
+				Some(guard.partitions.get(&address).cloned().ok_or_else(|| {
+					self.lifecycle
+						.missing_reason(address.query_id, Instant::now())
+				})?)
 			} else {
 				None
 			}
@@ -864,53 +1051,16 @@ impl PartitionStore for InMemoryPartitionStore {
 			.boxed(),
 			inner,
 			address,
+			self.lifecycle.clone(),
 		))
 	}
 
 	fn remove_query(&self, query_id: QueryId) {
-		let mut inner = self.inner.write().expect("partition store poisoned");
-		for live in inner
-			.live_partitions
-			.iter()
-			.filter(|(address, _)| address.query_id == query_id)
-			.map(|(_, live)| live)
-		{
-			live.pacing_semaphore.close();
-		}
-		inner.manifests.retain(|key, _| key.query_id != query_id);
-		inner
-			.partitions
-			.retain(|address, _| address.query_id != query_id);
-		inner
-			.reservations
-			.retain(|address, _| address.query_id != query_id);
-		inner
-			.live_partitions
-			.retain(|address, _| address.query_id != query_id);
+		self.retire_query(query_id, QueryTerminalCause::Success);
 	}
 
 	fn cancel_query(&self, query_id: QueryId) {
-		let mut inner = self.inner.write().expect("partition store poisoned");
-		inner.cancelled_queries.insert(query_id);
-		inner.manifests.retain(|key, _| key.query_id != query_id);
-		inner
-			.partitions
-			.retain(|address, _| address.query_id != query_id);
-		inner
-			.reservations
-			.retain(|address, _| address.query_id != query_id);
-		// Filter on the address, not just the seal flag: `values_mut()` yields no
-		// address, so an unfiltered loop cancels every query's live partitions.
-		for live in inner
-			.live_partitions
-			.iter_mut()
-			.filter(|(address, live)| address.query_id == query_id && !live.sealed)
-			.map(|(_, live)| live)
-		{
-			live.cancelled = Some(PartitionMissingReason::CancelledTaskCleanup);
-			live.notify.notify_waiters();
-			live.pacing_semaphore.close();
-		}
+		self.retire_query(query_id, QueryTerminalCause::Cancelled);
 	}
 }
 
@@ -918,8 +1068,20 @@ pub struct EncryptedSpillPartitionStore {
 	inner: RwLock<EncryptedSpillInner>,
 	budget: BudgetTracker,
 	spill_dir: PathBuf,
+	incarnation: u64,
 	key: LessSafeKey,
 	next_spill_id: AtomicU64,
+	lifecycle: ShuffleNamespaceLifecycle,
+	cleanup_debt: std::sync::Mutex<Vec<SpillCleanupDebt>>,
+	startup_swept_files: usize,
+	#[cfg(test)]
+	fail_next_cleanup: std::sync::atomic::AtomicBool,
+}
+
+#[derive(Debug)]
+struct SpillCleanupDebt {
+	query_id: QueryId,
+	path: PathBuf,
 }
 
 #[derive(Debug, Default)]
@@ -947,7 +1109,36 @@ impl EncryptedSpillPartitionStore {
 		spill_dir: PathBuf,
 		budget: QueryBudget,
 	) -> Result<Self, PartitionStoreError> {
+		let config = ShuffleLifecycleConfig::from_worker_loss_window(DEFAULT_WORKER_LOST_AFTER)
+			.map_err(|error| PartitionStoreError::Io(std::io::Error::other(error)))?;
+		Self::with_budget_and_lifecycle(
+			spill_dir,
+			budget,
+			ShuffleNamespaceLifecycle::unmanaged_fixture(config),
+		)
+	}
+
+	pub fn managed(
+		spill_dir: PathBuf,
+		budget: QueryBudget,
+		worker_lost_after: Duration,
+	) -> Result<Self, PartitionStoreError> {
+		let config = ShuffleLifecycleConfig::from_worker_loss_window(worker_lost_after)
+			.map_err(|error| PartitionStoreError::Io(std::io::Error::other(error)))?;
+		Self::with_budget_and_lifecycle(
+			spill_dir,
+			budget,
+			ShuffleNamespaceLifecycle::managed(config),
+		)
+	}
+
+	fn with_budget_and_lifecycle(
+		spill_dir: PathBuf,
+		budget: QueryBudget,
+		lifecycle: ShuffleNamespaceLifecycle,
+	) -> Result<Self, PartitionStoreError> {
 		std::fs::create_dir_all(&spill_dir)?;
+		let startup_swept_files = sweep_owned_spill_files(&spill_dir)?;
 		let mut key_bytes = [0u8; 32];
 		aws_lc_rs::rand::fill(&mut key_bytes).map_err(|error| PartitionStoreError::Random {
 			operation: "partition-spill-key-generation",
@@ -960,12 +1151,19 @@ impl EncryptedSpillPartitionStore {
 			}
 		})?;
 
+		let incarnation = rand::random::<u64>();
 		Ok(Self {
 			inner: RwLock::new(EncryptedSpillInner::default()),
 			budget: BudgetTracker::new(budget),
 			spill_dir,
+			incarnation,
 			key: LessSafeKey::new(unbound_key),
 			next_spill_id: AtomicU64::new(1),
+			lifecycle,
+			cleanup_debt: std::sync::Mutex::new(Vec::new()),
+			startup_swept_files,
+			#[cfg(test)]
+			fail_next_cleanup: std::sync::atomic::AtomicBool::new(false),
 		})
 	}
 
@@ -979,10 +1177,106 @@ impl EncryptedSpillPartitionStore {
 
 	fn spill_path(&self, spill_id: SpillId, partition_id: PartitionId) -> PathBuf {
 		self.spill_dir.join(format!(
-			"partition_{}_{}.bin",
+			"toron_shuffle_{}_{}_{}.bin",
+			self.incarnation,
 			spill_id.get(),
 			partition_id.get()
 		))
+	}
+
+	pub fn startup_swept_files(&self) -> usize {
+		self.startup_swept_files
+	}
+
+	pub fn cleanup_debt_len(&self) -> usize {
+		self.cleanup_debt
+			.lock()
+			.expect("spill cleanup debt poisoned")
+			.len()
+	}
+
+	#[cfg(test)]
+	fn fail_next_cleanup(&self) {
+		self.fail_next_cleanup.store(true, Ordering::SeqCst);
+	}
+
+	fn delete_spill_path(&self, path: &std::path::Path) -> std::io::Result<()> {
+		#[cfg(test)]
+		if self.fail_next_cleanup.swap(false, Ordering::SeqCst) {
+			return Err(std::io::Error::other("injected spill cleanup failure"));
+		}
+		std::fs::remove_file(path)
+	}
+
+	fn authorize_write(&self, query_id: QueryId) -> Result<(), PartitionStoreError> {
+		match self.lifecycle.authorize_write(query_id, Instant::now()) {
+			Ok(()) => Ok(()),
+			Err(WriteLeaseError::Missing) => {
+				Err(PartitionStoreError::QueryLeaseMissing { query_id })
+			}
+			Err(WriteLeaseError::Expired) => {
+				Err(PartitionStoreError::QueryLeaseExpired { query_id })
+			}
+		}
+	}
+
+	fn retire_spilled_query(&self, query_id: QueryId, cause: QueryTerminalCause) {
+		self.lifecycle.begin_retirement(query_id, cause);
+		let removed = {
+			let mut inner = self.inner.write().expect("partition store poisoned");
+			if cause != QueryTerminalCause::Success && !self.lifecycle.enforces_leases() {
+				inner.cancelled_queries.insert(query_id);
+			}
+			remove_spilled_query(&mut inner, query_id)
+		};
+		let mut debt = self
+			.cleanup_debt
+			.lock()
+			.expect("spill cleanup debt poisoned");
+		for path in removed {
+			if self.delete_spill_path(&path).is_err() {
+				debt.push(SpillCleanupDebt { query_id, path });
+			}
+		}
+		if !debt.iter().any(|entry| entry.query_id == query_id) {
+			drop(debt);
+			self.lifecycle.finish_removal(query_id, Instant::now());
+		}
+	}
+
+	fn retry_cleanup_debt(&self) {
+		let mut debt = self
+			.cleanup_debt
+			.lock()
+			.expect("spill cleanup debt poisoned");
+		let mut completed = HashSet::new();
+		debt.retain(|entry| {
+			if self.delete_spill_path(&entry.path).is_ok() || !entry.path.exists() {
+				completed.insert(entry.query_id);
+				false
+			} else {
+				true
+			}
+		});
+		for entry in debt.iter() {
+			completed.remove(&entry.query_id);
+		}
+		drop(debt);
+		for query_id in completed {
+			self.lifecycle.finish_removal(query_id, Instant::now());
+		}
+	}
+
+	fn clean_or_retain_paths(&self, query_id: QueryId, paths: Vec<PathBuf>) {
+		let mut debt = self
+			.cleanup_debt
+			.lock()
+			.expect("spill cleanup debt poisoned");
+		for path in paths {
+			if path.exists() && self.delete_spill_path(&path).is_err() {
+				debt.push(SpillCleanupDebt { query_id, path });
+			}
+		}
 	}
 
 	fn encrypt_payload(
@@ -1021,11 +1315,46 @@ impl EncryptedSpillPartitionStore {
 
 #[async_trait::async_trait]
 impl PartitionStore for EncryptedSpillPartitionStore {
+	fn query_lease_term_millis(&self) -> u64 {
+		u64::try_from(self.lifecycle.config().lease_term().as_millis())
+			.expect("query lease term fits wire milliseconds")
+	}
+
+	fn issue_or_renew_query_lease(&self, query_id: QueryId) {
+		self.retry_cleanup_debt();
+		self.lifecycle.issue_or_renew(query_id, Instant::now());
+	}
+
+	fn retire_query(&self, query_id: QueryId, cause: QueryTerminalCause) {
+		self.retire_spilled_query(query_id, cause);
+	}
+
+	fn reap_expired_queries(&self) {
+		self.retry_cleanup_debt();
+		for query_id in self.lifecycle.expired_queries(Instant::now()) {
+			self.retire_spilled_query(query_id, QueryTerminalCause::Abandoned);
+		}
+	}
+
+	fn lifecycle_snapshot(&self) -> ShuffleLifecycleSnapshot {
+		let inner = self.inner.read().expect("partition store poisoned");
+		let mut snapshot = self.lifecycle.snapshot(Instant::now());
+		snapshot.resident_namespaces = spill_resident_queries(&inner).len();
+		snapshot.retained_bytes = self.budget.used(BudgetDimension::SpillBytes).get();
+		snapshot.physical_spill_files = inner.partitions.len() + self.cleanup_debt_len();
+		snapshot.cleanup_debt = self.cleanup_debt_len();
+		snapshot.cancelled_tombstones = inner.cancelled_queries.len();
+		snapshot.startup_swept_files = u64::try_from(self.startup_swept_files).unwrap_or(u64::MAX);
+		snapshot
+	}
+
 	fn publish(
 		&self,
 		mut manifest: PartitionManifest,
 		payloads: Vec<PartitionPayload>,
 	) -> Result<PartitionManifest, PartitionStoreError> {
+		self.authorize_write(manifest.query_id)?;
+		self.retry_cleanup_debt();
 		let key = ManifestKey::from_manifest(&manifest);
 		validate_manifest_payloads(&manifest, &payloads)?;
 
@@ -1044,21 +1373,24 @@ impl PartitionStore for EncryptedSpillPartitionStore {
 		}
 
 		let spill_id = self.next_spill_id();
-		let mut written = Vec::new();
-		let mut spilled = Vec::with_capacity(payloads.len());
-		let mut reservations = Vec::with_capacity(payloads.len());
+		let mut prepared = Vec::with_capacity(payloads.len());
 		for payload in &payloads {
 			let (ciphertext, nonce) = self.encrypt_payload(payload)?;
 			let reserved = ByteCount::from_usize(ciphertext.len());
-			reservations.push((
+			let reservation = (
 				payload.address,
 				self.budget.reserve(BudgetDimension::SpillBytes, reserved)?,
-			));
+			);
 			let path = self.spill_path(spill_id, payload.address.partition_id);
+			prepared.push((payload, ciphertext, nonce, path, reservation));
+		}
+		let mut written = Vec::new();
+		let mut spilled = Vec::with_capacity(prepared.len());
+		let mut reservations = Vec::with_capacity(prepared.len());
+		for (payload, ciphertext, nonce, path, reservation) in prepared {
 			if let Err(error) = std::fs::write(&path, &ciphertext) {
-				for path in &written {
-					let _ = std::fs::remove_file(path);
-				}
+				written.push(path);
+				self.clean_or_retain_paths(manifest.query_id, written);
 				return Err(PartitionStoreError::Io(error));
 			}
 			written.push(path.clone());
@@ -1071,6 +1403,7 @@ impl PartitionStore for EncryptedSpillPartitionStore {
 					digest: payload.digest,
 				},
 			));
+			reservations.push(reservation);
 		}
 
 		manifest.backend = PartitionBackend::EncryptedSpill { spill_id };
@@ -1081,6 +1414,7 @@ impl PartitionStore for EncryptedSpillPartitionStore {
 			inner.reservations.insert(address, reservation);
 		}
 		inner.manifests.insert(key, manifest.clone());
+		self.lifecycle.mark_namespace_present(manifest.query_id);
 		Ok(manifest)
 	}
 
@@ -1107,6 +1441,9 @@ impl PartitionStore for EncryptedSpillPartitionStore {
 
 		let partition = {
 			let inner = self.inner.read().expect("partition store poisoned");
+			if let Some(cause) = self.lifecycle.retirement_cause(address.query_id) {
+				return Err(cause.late_pull_reason());
+			}
 			if inner.cancelled_queries.contains(&address.query_id) {
 				return Err(PartitionMissingReason::CancelledTaskCleanup);
 			}
@@ -1123,7 +1460,9 @@ impl PartitionStore for EncryptedSpillPartitionStore {
 					observed_attempt,
 				});
 			} else {
-				return Err(PartitionMissingReason::StoreEvicted);
+				return Err(self
+					.lifecycle
+					.missing_reason(address.query_id, Instant::now()));
 			}
 		};
 
@@ -1139,20 +1478,11 @@ impl PartitionStore for EncryptedSpillPartitionStore {
 	}
 
 	fn remove_query(&self, query_id: QueryId) {
-		let mut inner = self.inner.write().expect("partition store poisoned");
-		let removed = remove_spilled_query(&mut inner, query_id);
-		for path in removed {
-			let _ = std::fs::remove_file(path);
-		}
+		self.retire_query(query_id, QueryTerminalCause::Success);
 	}
 
 	fn cancel_query(&self, query_id: QueryId) {
-		let mut inner = self.inner.write().expect("partition store poisoned");
-		inner.cancelled_queries.insert(query_id);
-		let removed = remove_spilled_query(&mut inner, query_id);
-		for path in removed {
-			let _ = std::fs::remove_file(path);
-		}
+		self.retire_query(query_id, QueryTerminalCause::Cancelled);
 	}
 }
 
@@ -1160,6 +1490,7 @@ pub struct HybridPartitionStore {
 	in_memory: InMemoryPartitionStore,
 	encrypted_spill: EncryptedSpillPartitionStore,
 	spill_threshold: ByteCount,
+	lifecycle: ShuffleNamespaceLifecycle,
 }
 
 impl HybridPartitionStore {
@@ -1175,10 +1506,47 @@ impl HybridPartitionStore {
 		spill_threshold: ByteCount,
 		budget: QueryBudget,
 	) -> Result<Self, PartitionStoreError> {
-		Ok(Self {
-			in_memory: InMemoryPartitionStore::with_budget(budget),
-			encrypted_spill: EncryptedSpillPartitionStore::with_budget(spill_dir, budget)?,
+		let config = ShuffleLifecycleConfig::from_worker_loss_window(DEFAULT_WORKER_LOST_AFTER)
+			.map_err(|error| PartitionStoreError::Io(std::io::Error::other(error)))?;
+		Self::with_budget_and_lifecycle(
+			spill_dir,
 			spill_threshold,
+			budget,
+			ShuffleNamespaceLifecycle::unmanaged_fixture(config),
+		)
+	}
+
+	pub fn managed(
+		spill_dir: PathBuf,
+		spill_threshold: ByteCount,
+		budget: QueryBudget,
+		worker_lost_after: Duration,
+	) -> Result<Self, PartitionStoreError> {
+		let config = ShuffleLifecycleConfig::from_worker_loss_window(worker_lost_after)
+			.map_err(|error| PartitionStoreError::Io(std::io::Error::other(error)))?;
+		Self::with_budget_and_lifecycle(
+			spill_dir,
+			spill_threshold,
+			budget,
+			ShuffleNamespaceLifecycle::managed(config),
+		)
+	}
+
+	fn with_budget_and_lifecycle(
+		spill_dir: PathBuf,
+		spill_threshold: ByteCount,
+		budget: QueryBudget,
+		lifecycle: ShuffleNamespaceLifecycle,
+	) -> Result<Self, PartitionStoreError> {
+		Ok(Self {
+			in_memory: InMemoryPartitionStore::with_budget_and_lifecycle(budget, lifecycle.clone()),
+			encrypted_spill: EncryptedSpillPartitionStore::with_budget_and_lifecycle(
+				spill_dir,
+				budget,
+				lifecycle.clone(),
+			)?,
+			spill_threshold,
+			lifecycle,
 		})
 	}
 
@@ -1192,6 +1560,66 @@ impl HybridPartitionStore {
 
 #[async_trait::async_trait]
 impl PartitionStore for HybridPartitionStore {
+	fn query_lease_term_millis(&self) -> u64 {
+		u64::try_from(self.lifecycle.config().lease_term().as_millis())
+			.expect("query lease term fits wire milliseconds")
+	}
+
+	fn issue_or_renew_query_lease(&self, query_id: QueryId) {
+		self.lifecycle.issue_or_renew(query_id, Instant::now());
+		self.encrypted_spill.retry_cleanup_debt();
+	}
+
+	fn retire_query(&self, query_id: QueryId, cause: QueryTerminalCause) {
+		self.lifecycle
+			.begin_retirement_with_participants(query_id, cause, 2);
+		self.in_memory.retire_query(query_id, cause);
+		self.encrypted_spill.retire_query(query_id, cause);
+	}
+
+	fn reap_expired_queries(&self) {
+		self.encrypted_spill.retry_cleanup_debt();
+		for query_id in self.lifecycle.expired_queries(Instant::now()) {
+			self.retire_query(query_id, QueryTerminalCause::Abandoned);
+		}
+	}
+
+	fn lifecycle_snapshot(&self) -> ShuffleLifecycleSnapshot {
+		let memory = self
+			.in_memory
+			.inner
+			.read()
+			.expect("partition store poisoned");
+		let spill = self
+			.encrypted_spill
+			.inner
+			.read()
+			.expect("partition store poisoned");
+		let mut resident = in_memory_resident_queries(&memory);
+		resident.extend(spill_resident_queries(&spill));
+		let mut snapshot = self.lifecycle.snapshot(Instant::now());
+		snapshot.resident_namespaces = resident.len();
+		snapshot.retained_bytes = self
+			.in_memory
+			.budget
+			.used(BudgetDimension::ShuffleBytes)
+			.get()
+			.saturating_add(
+				self.encrypted_spill
+					.budget
+					.used(BudgetDimension::SpillBytes)
+					.get(),
+			);
+		snapshot.cleanup_debt = self.encrypted_spill.cleanup_debt_len();
+		snapshot.physical_spill_files = spill.partitions.len() + snapshot.cleanup_debt;
+		snapshot.cancelled_tombstones =
+			memory.cancelled_queries.len() + spill.cancelled_queries.len();
+		snapshot.live_partition_records = memory.live_partitions.len();
+		snapshot.startup_swept_files =
+			u64::try_from(self.encrypted_spill.startup_swept_files).unwrap_or(u64::MAX);
+		snapshot
+	}
+
 	fn publish(
 		&self,
 		manifest: PartitionManifest,
@@ -1223,9 +1651,9 @@ impl PartitionStore for HybridPartitionStore {
 	) -> Result<PartitionPayload, PartitionMissingReason> {
 		match self.in_memory.pull(address, expected_attempt) {
 			Ok(payload) => Ok(payload),
-			Err(PartitionMissingReason::StoreEvicted) => {
-				self.encrypted_spill.pull(address, expected_attempt)
-			}
+			Err(
+				PartitionMissingReason::StoreEvicted | PartitionMissingReason::NamespaceUnknown,
+			) => self.encrypted_spill.pull(address, expected_attempt),
 			Err(reason) => Err(reason),
 		}
 	}
@@ -1275,13 +1703,11 @@ impl PartitionStore for HybridPartitionStore {
 	}
 
 	fn remove_query(&self, query_id: QueryId) {
-		self.in_memory.remove_query(query_id);
-		self.encrypted_spill.remove_query(query_id);
+		self.retire_query(query_id, QueryTerminalCause::Success);
 	}
 
 	fn cancel_query(&self, query_id: QueryId) {
-		self.in_memory.cancel_query(query_id);
-		self.encrypted_spill.cancel_query(query_id);
+		self.retire_query(query_id, QueryTerminalCause::Cancelled);
 	}
 }
 
@@ -1325,6 +1751,69 @@ fn remove_spilled_query(inner: &mut EncryptedSpillInner, query_id: QueryId) -> V
 		.reservations
 		.retain(|address, _| address.query_id != query_id);
 	removed
+}
+
+fn in_memory_resident_queries(inner: &PartitionStoreInner) -> HashSet<QueryId> {
+	inner
+		.manifests
+		.keys()
+		.map(|key| key.query_id)
+		.chain(inner.partitions.keys().map(|address| address.query_id))
+		.chain(inner.live_partitions.keys().map(|address| address.query_id))
+		.collect()
+}
+
+fn spill_resident_queries(inner: &EncryptedSpillInner) -> HashSet<QueryId> {
+	inner
+		.manifests
+		.keys()
+		.map(|key| key.query_id)
+		.chain(inner.partitions.keys().map(|address| address.query_id))
+		.collect()
+}
+
+fn sweep_owned_spill_files(spill_dir: &std::path::Path) -> Result<usize, PartitionStoreError> {
+	sweep_owned_spill_files_with(spill_dir, std::fs::remove_file)
+}
+
+fn sweep_owned_spill_files_with(
+	spill_dir: &std::path::Path,
+	mut remove_file: impl FnMut(PathBuf) -> std::io::Result<()>,
+) -> Result<usize, PartitionStoreError> {
+	let mut removed = 0usize;
+	for entry in std::fs::read_dir(spill_dir)? {
+		let entry = entry?;
+		if !entry.file_type()?.is_file() {
+			continue;
+		}
+		let name = entry.file_name();
+		let Some(name) = name.to_str() else {
+			continue;
+		};
+		if !owned_spill_file_name(name) {
+			continue;
+		}
+		remove_file(entry.path())?;
+		removed += 1;
+	}
+	Ok(removed)
+}
+
+fn owned_spill_file_name(name: &str) -> bool {
+	let Some(body) = name
+		.strip_prefix("toron_shuffle_")
+		.and_then(|name| name.strip_suffix(".bin"))
+	else {
+		return false;
+	};
+	let mut parts = body.split('_');
+	matches!(
+		(parts.next(), parts.next(), parts.next(), parts.next()),
+		(Some(incarnation), Some(spill), Some(partition), None)
+			if incarnation.parse::<u64>().is_ok()
+				&& spill.parse::<u64>().is_ok()
+				&& partition.parse::<u32>().is_ok()
+	)
 }
 
 fn same_logical_partition(candidate: PartitionAddress, requested: PartitionAddress) -> bool {
@@ -2743,5 +3232,364 @@ mod tests {
 			store.pull(payload.address, AttemptId::first()),
 			Err(PartitionMissingReason::CancelledTaskCleanup)
 		);
+	}
+
+	fn managed_memory_store() -> InMemoryPartitionStore {
+		InMemoryPartitionStore::managed(QueryBudget::test_default(), DEFAULT_WORKER_LOST_AFTER)
+			.expect("managed memory store")
+	}
+
+	fn managed_memory_store_with_config(
+		receipt_capacity: usize,
+		receipt_horizon: Duration,
+		lease_term: Duration,
+	) -> InMemoryPartitionStore {
+		let lifecycle = ShuffleNamespaceLifecycle::managed(
+			ShuffleLifecycleConfig::new(
+				std::num::NonZeroUsize::new(receipt_capacity).expect("receipt capacity"),
+				receipt_horizon,
+				Duration::from_millis(5),
+				lease_term,
+				Duration::from_millis(10),
+			)
+			.expect("test lifecycle config"),
+		);
+		InMemoryPartitionStore::with_budget_and_lifecycle(QueryBudget::test_default(), lifecycle)
+	}
+
+	#[test]
+	fn managed_store_requires_positive_lease_before_namespace_creation() {
+		let store = managed_memory_store();
+		let payload = payload(address(AttemptId::first()));
+		assert!(matches!(
+			store.publish(manifest(&payload), vec![payload.clone()]),
+			Err(PartitionStoreError::QueryLeaseMissing { query_id })
+				if query_id == payload.address.query_id
+		));
+
+		store.issue_or_renew_query_lease(payload.address.query_id);
+		store
+			.publish(manifest(&payload), vec![payload])
+			.expect("leased publish");
+	}
+
+	#[tokio::test]
+	async fn successful_retirement_drains_admitted_reader_before_reclaiming() {
+		let store = managed_memory_store();
+		let address = address(AttemptId::first());
+		store.issue_or_renew_query_lease(address.query_id);
+		store
+			.open_live(address, test_schema())
+			.expect("open live partition");
+		store
+			.append_live(ipc_payload(address, &[1, 2]))
+			.await
+			.expect("append live partition");
+		let mut admitted = store
+			.pull_live(address, AttemptId::first())
+			.expect("admit reader before retirement");
+		store
+			.seal_live(manifest_for_address(address))
+			.expect("seal live partition");
+		store.retire_query(address.query_id, QueryTerminalCause::Success);
+
+		assert_eq!(
+			store.pull_live(address, AttemptId::first()).err(),
+			Some(PartitionMissingReason::NamespaceRetiring)
+		);
+		let payload = expect_live_payload(&mut admitted, "admitted reader drains").await;
+		assert_eq!(decoded_i64_values(&payload.bytes), vec![1, 2]);
+		expect_live_eof(&mut admitted, "admitted reader reaches eof").await;
+		assert_eq!(
+			store.pull(address, AttemptId::first()),
+			Err(PartitionMissingReason::Reclaimed)
+		);
+		assert_eq!(store.lifecycle_snapshot().receipts, 1);
+		assert_eq!(
+			store.budget_used(BudgetDimension::ShuffleBytes),
+			ByteCount::ZERO
+		);
+	}
+
+	#[tokio::test]
+	async fn cancellation_terminates_live_pull_with_cancelled_cause() {
+		let store = managed_memory_store();
+		let mut address = address(AttemptId::first());
+		address.query_id = QueryId::from_u128(21);
+		store.issue_or_renew_query_lease(address.query_id);
+		store
+			.open_live(address, test_schema())
+			.expect("open live partition");
+		let mut reader = store
+			.pull_live(address, AttemptId::first())
+			.expect("admit reader");
+		store.retire_query(address.query_id, QueryTerminalCause::Cancelled);
+		assert_eq!(
+			reader.next().await,
+			Some(Err(PartitionMissingReason::CancelledTaskCleanup))
+		);
+		drop(reader);
+		assert_eq!(
+			store.pull(address, AttemptId::first()),
+			Err(PartitionMissingReason::CancelledTaskCleanup)
+		);
+	}
+
+	#[tokio::test]
+	async fn failure_terminates_live_pull_with_failed_cause() {
+		let store = managed_memory_store();
+		let mut address = address(AttemptId::first());
+		address.query_id = QueryId::from_u128(22);
+		store.issue_or_renew_query_lease(address.query_id);
+		store
+			.open_live(address, test_schema())
+			.expect("open live partition");
+		let mut reader = store
+			.pull_live(address, AttemptId::first())
+			.expect("admit reader");
+		store.retire_query(address.query_id, QueryTerminalCause::Failed);
+		assert_eq!(
+			reader.next().await,
+			Some(Err(PartitionMissingReason::QueryFailedCleanup))
+		);
+		drop(reader);
+		assert_eq!(
+			store.pull(address, AttemptId::first()),
+			Err(PartitionMissingReason::QueryFailedCleanup)
+		);
+	}
+
+	#[test]
+	fn repeated_terminal_paths_return_every_immediate_surface_to_baseline() {
+		let store = managed_memory_store_with_config(
+			16,
+			Duration::from_millis(30),
+			Duration::from_millis(40),
+		);
+		for value in 1..=48u128 {
+			let mut address = address(AttemptId::first());
+			address.query_id = QueryId::from_u128(value);
+			let payload = payload(address);
+			store.issue_or_renew_query_lease(address.query_id);
+			store
+				.publish(manifest(&payload), vec![payload])
+				.expect("publish churn fixture");
+			let cause = match value % 3 {
+				0 => QueryTerminalCause::Success,
+				1 => QueryTerminalCause::Cancelled,
+				_ => QueryTerminalCause::Failed,
+			};
+			store.retire_query(address.query_id, cause);
+		}
+		let immediate = store.lifecycle_snapshot();
+		assert_eq!(immediate.resident_namespaces, 0);
+		assert_eq!(immediate.retained_bytes, 0);
+		assert_eq!(immediate.physical_spill_files, 0);
+		assert_eq!(immediate.cleanup_debt, 0);
+		assert_eq!(immediate.cancelled_tombstones, 0);
+		assert_eq!(immediate.live_partition_records, 0);
+		assert_eq!(immediate.receipts, 16);
+		assert_eq!(immediate.capacity_evictions, 32);
+
+		std::thread::sleep(Duration::from_millis(40));
+		let after_horizon = store.lifecycle_snapshot();
+		assert_eq!(after_horizon.receipts, 0);
+		assert_eq!(after_horizon.horizon_evictions, 16);
+	}
+
+	#[test]
+	fn renewed_long_running_query_outlives_one_lease_term() {
+		let store =
+			managed_memory_store_with_config(8, Duration::from_secs(1), Duration::from_millis(30));
+		let payload = payload(address(AttemptId::first()));
+		store.issue_or_renew_query_lease(payload.address.query_id);
+		store
+			.publish(manifest(&payload), vec![payload.clone()])
+			.expect("publish long-running query");
+		for _ in 0..5 {
+			std::thread::sleep(Duration::from_millis(10));
+			store.issue_or_renew_query_lease(payload.address.query_id);
+			store.reap_expired_queries();
+		}
+		assert_eq!(
+			store
+				.pull(payload.address, AttemptId::first())
+				.expect("renewed query remains resident")
+				.bytes,
+			payload.bytes
+		);
+		assert_eq!(store.lifecycle_snapshot().abandoned_reclaims, 0);
+	}
+
+	#[test]
+	fn expired_query_lease_is_distinct_abandonment_reclamation() {
+		let store =
+			managed_memory_store_with_config(8, Duration::from_secs(1), Duration::from_millis(20));
+		let payload = payload(address(AttemptId::first()));
+		store.issue_or_renew_query_lease(payload.address.query_id);
+		store
+			.publish(manifest(&payload), vec![payload.clone()])
+			.expect("publish abandoned query");
+		std::thread::sleep(Duration::from_millis(30));
+		store.reap_expired_queries();
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(snapshot.resident_namespaces, 0);
+		assert_eq!(snapshot.abandoned_reclaims, 1);
+		assert_eq!(
+			store.pull(payload.address, AttemptId::first()),
+			Err(PartitionMissingReason::Abandoned)
+		);
+	}
+
+	#[test]
+	fn superseded_attempt_state_remains_until_query_terminal() {
+		let store = managed_memory_store();
+		let first_address = address(AttemptId::first());
+		let replacement_address = address(AttemptId::first().next());
+		let first = payload(first_address);
+		let replacement = payload_with_bytes(replacement_address, vec![4, 5, 6]);
+		store.issue_or_renew_query_lease(first_address.query_id);
+		store
+			.publish(manifest(&first), vec![first.clone()])
+			.expect("publish stale attempt");
+		store
+			.publish(manifest(&replacement), vec![replacement.clone()])
+			.expect("publish replacement attempt");
+
+		assert_eq!(
+			store
+				.pull(first_address, first_address.attempt_id)
+				.expect("stale attempt remains until query terminal")
+				.bytes,
+			first.bytes
+		);
+		assert_eq!(
+			store
+				.pull(replacement_address, replacement_address.attempt_id)
+				.expect("replacement survives attempt transition")
+				.bytes,
+			replacement.bytes
+		);
+
+		store.retire_query(first_address.query_id, QueryTerminalCause::Success);
+		assert_eq!(store.lifecycle_snapshot().resident_namespaces, 0);
+		assert_eq!(
+			store.pull(first_address, first_address.attempt_id),
+			Err(PartitionMissingReason::Reclaimed)
+		);
+		assert_eq!(
+			store.pull(replacement_address, replacement_address.attempt_id),
+			Err(PartitionMissingReason::Reclaimed)
+		);
+	}
+
+	#[test]
+	fn retirement_redelivery_is_idempotent_after_lost_ack() {
+		let store = managed_memory_store();
+		let payload = payload(address(AttemptId::first()));
+		store.issue_or_renew_query_lease(payload.address.query_id);
+		store
+			.publish(manifest(&payload), vec![payload.clone()])
+			.expect("publish retirement fixture");
+		store.retire_query(payload.address.query_id, QueryTerminalCause::Success);
+		store.retire_query(payload.address.query_id, QueryTerminalCause::Success);
+
+		let snapshot = store.lifecycle_snapshot();
+		assert_eq!(snapshot.quiesced_reclaims, 1);
+		assert_eq!(snapshot.receipts, 1);
+		assert_eq!(snapshot.resident_namespaces, 0);
+	}
+
+	#[test]
+	fn spill_cleanup_failure_is_debt_until_retry_succeeds() {
+		let spill_dir = temp_spill_dir();
+		let store = EncryptedSpillPartitionStore::managed(
+			spill_dir.clone(),
+			QueryBudget::test_default(),
+			DEFAULT_WORKER_LOST_AFTER,
+		)
+		.expect("managed spill store");
+		let payload = payload(address(AttemptId::first()));
+		store.issue_or_renew_query_lease(payload.address.query_id);
+		store
+			.publish(manifest(&payload), vec![payload.clone()])
+			.expect("publish spill");
+		store.fail_next_cleanup();
+		store.retire_query(payload.address.query_id, QueryTerminalCause::Success);
+		assert_eq!(store.cleanup_debt_len(), 1);
+		assert_eq!(store.lifecycle_snapshot().receipts, 0);
+		assert_eq!(store.lifecycle_snapshot().retiring_namespaces, 1);
+
+		store.reap_expired_queries();
+		assert_eq!(store.cleanup_debt_len(), 0);
+		assert_eq!(store.lifecycle_snapshot().receipts, 1);
+		assert_eq!(
+			store.pull(payload.address, AttemptId::first()),
+			Err(PartitionMissingReason::Reclaimed)
+		);
+		std::fs::remove_dir_all(spill_dir).expect("remove spill dir");
+	}
+
+	#[test]
+	fn spill_restart_sweeps_only_owned_files_before_serving() {
+		let spill_dir = temp_spill_dir();
+		let payload = payload(address(AttemptId::first()));
+		{
+			let store = EncryptedSpillPartitionStore::new(spill_dir.clone()).expect("spill store");
+			store
+				.publish(manifest(&payload), vec![payload])
+				.expect("publish spill");
+		}
+		let unrelated = spill_dir.join("operator-note.txt");
+		std::fs::write(&unrelated, b"keep").expect("write unrelated file");
+		let restarted =
+			EncryptedSpillPartitionStore::new(spill_dir.clone()).expect("restart spill store");
+		assert_eq!(restarted.startup_swept_files(), 1);
+		assert!(unrelated.exists());
+		std::fs::remove_dir_all(spill_dir).expect("remove spill dir");
+	}
+
+	#[test]
+	fn spill_restart_fails_closed_when_an_owned_file_cannot_be_removed() {
+		let spill_dir = temp_spill_dir();
+		std::fs::create_dir_all(&spill_dir).expect("create spill dir");
+		let owned = spill_dir.join("toron_shuffle_1_2_3.bin");
+		std::fs::write(&owned, b"orphan").expect("write owned orphan");
+
+		let error = sweep_owned_spill_files_with(&spill_dir, |_path| {
+			Err(std::io::Error::new(
+				std::io::ErrorKind::PermissionDenied,
+				"injected undeletable spill",
+			))
+		})
+		.expect_err("an undeletable owned spill must block startup");
+		assert!(matches!(error, PartitionStoreError::Io(_)));
+		assert!(owned.exists());
+		std::fs::remove_dir_all(spill_dir).expect("remove spill dir");
+	}
+
+	#[test]
+	fn hybrid_uses_one_retirement_receipt_for_both_backends() {
+		let spill_dir = temp_spill_dir();
+		let store = HybridPartitionStore::managed(
+			spill_dir.clone(),
+			ByteCount::new(2),
+			QueryBudget::test_default(),
+			DEFAULT_WORKER_LOST_AFTER,
+		)
+		.expect("managed hybrid store");
+		let payload = payload(address(AttemptId::first()));
+		store.issue_or_renew_query_lease(payload.address.query_id);
+		store
+			.publish(manifest(&payload), vec![payload.clone()])
+			.expect("publish through spill half");
+		store.retire_query(payload.address.query_id, QueryTerminalCause::Success);
+		assert_eq!(store.lifecycle_snapshot().receipts, 1);
+		assert_eq!(store.lifecycle_snapshot().retiring_namespaces, 0);
+		assert_eq!(
+			store.pull(payload.address, AttemptId::first()),
+			Err(PartitionMissingReason::Reclaimed)
+		);
+		std::fs::remove_dir_all(spill_dir).expect("remove spill dir");
 	}
 }

@@ -378,6 +378,7 @@ pub(crate) fn adr077_second_level_modules_are_semantic_not_adr_numbered() {
 		"distributed_execution/sql_ingress.rs",
 		"distributed_execution/worker_lifecycle.rs",
 		"distributed_execution/scheduler_dispatch.rs",
+		"distributed_execution/shuffle_lifecycle.rs",
 		"distributed_execution/resource_governance.rs",
 		"storage_wendelon_boundary/mod.rs",
 		"storage_wendelon_boundary/ddl_admin.rs",

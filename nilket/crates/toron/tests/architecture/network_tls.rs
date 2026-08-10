@@ -396,7 +396,9 @@ pub(crate) fn adr045_metrics_uses_prometheus_text_format_no_histograms() {
 		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
 			.expect("read observability source");
 	let adr045_observability = observability
-		.split("fn render_audit_metrics")
+		// ADR 543's branded shuffle lifecycle family is a later aggregate-only
+		// extension, not part of ADR 045's initial stable metric set.
+		.split("fn render_shuffle_lifecycle_metrics")
 		.next()
 		.expect("pre-audit observability source");
 
@@ -493,7 +495,9 @@ pub(crate) fn adr045_initial_metric_set_is_functional_brand_clean_and_stable() {
 		std::fs::read_to_string(manifest_dir().join("src/network/observability.rs"))
 			.expect("read observability source");
 	let adr045_observability = observability
-		.split("fn render_audit_metrics")
+		// ADR 543's branded shuffle lifecycle family is a later aggregate-only
+		// extension, not part of ADR 045's initial stable metric set.
+		.split("fn render_shuffle_lifecycle_metrics")
 		.next()
 		.expect("pre-audit observability source");
 	let adr045_stable_observability = adr045_observability

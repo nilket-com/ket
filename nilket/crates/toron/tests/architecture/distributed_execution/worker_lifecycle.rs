@@ -35,7 +35,11 @@ pub(crate) fn task_failure_kind_keeps_partition_store_errors_separate() {
 		.and_then(|rest| rest.split("impl TaskFailureKind").next())
 		.expect("TaskFailureKind block");
 
-	assert_eq!(enum_variant_count(task_failure), 7);
+	// ADR 543 keeps missing and expired write leases typed without borrowing
+	// partition-missing or stale-attempt errors.
+	assert_eq!(enum_variant_count(task_failure), 9);
+	assert!(task_failure.contains("QueryLeaseMissing"));
+	assert!(task_failure.contains("QueryLeaseExpired"));
 	assert!(!task_failure.contains("PartitionMissing"));
 	assert!(!task_failure.contains("StaleAttempt"));
 }

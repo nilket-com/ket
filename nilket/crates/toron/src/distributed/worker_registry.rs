@@ -1,10 +1,16 @@
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::distributed::budget::{ByteCount, DurationMillis};
 use crate::distributed::identity::{LeaseEpoch, WorkerId};
+
+/// Single worker-loss window used to derive query-namespace lease safety.
+/// The registry expiry API accepts the same concept explicitly; keeping the
+/// production default here prevents the shuffle store from inventing a second clock.
+pub const DEFAULT_WORKER_LOST_AFTER: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct WorkerEndpoint(pub String);

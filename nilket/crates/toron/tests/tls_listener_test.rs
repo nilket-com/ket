@@ -17,6 +17,8 @@ use toron::config::{
 use toron::daemon::ToronDaemon;
 use toron::distributed::budget::{ByteCount, TenantBudgetPolicy};
 use toron::distributed::identity::{AttemptId, QueryId, StageId, TaskId, TaskIdentity, WorkerId};
+use toron::distributed::namespace_lifecycle::ShuffleLifecycleConfig;
+use toron::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER;
 use toron::network::tls::{
 	DEFAULT_CLUSTER_DOMAIN, canonical_client_dns_name, canonical_daemon_dns_name,
 	client_config_from_paths,
@@ -28,8 +30,8 @@ use toron::sql_wire::{
 };
 use toron::storage::TenantId;
 use toron::wire::{
-	CancelTaskPayload, EnvelopeIdentity, MessageKind, TaskCancelledPayload, WireEnvelope,
-	decode_payload, encode_payload,
+	CancelTaskPayload, EnvelopeIdentity, MessageKind, QueryLeaseAcceptedPayload, QueryLeasePayload,
+	TaskCancelledPayload, WireEnvelope, decode_payload, encode_payload,
 };
 
 struct TestPki {
@@ -645,6 +647,45 @@ async fn try_cancel_task_with_tls(
 		.connect_stream_with_server_name(endpoint, server_name)
 		.await?;
 	let identity = task_identity();
+	let query_id = identity.query_id;
+	let lifecycle = ShuffleLifecycleConfig::from_worker_loss_window(DEFAULT_WORKER_LOST_AFTER)
+		.expect("default shuffle lifecycle config");
+	let lease = QueryLeasePayload {
+		query_id,
+		lease_term_millis: u64::try_from(lifecycle.lease_term().as_millis())
+			.expect("lease term fits wire milliseconds"),
+	};
+	let envelope = WireEnvelope::try_new(
+		MessageKind::QueryLease,
+		EnvelopeIdentity::query(query_id),
+		None,
+		None,
+		encode_payload(&lease),
+	)
+	.map_err(|error| Error::new(ErrorKind::InvalidData, format!("{error}")))?;
+	try_write_envelope(&mut stream, &envelope).await?;
+	let accepted = try_read_envelope(&mut stream).await.map_err(|error| {
+		Error::new(
+			error.kind(),
+			format!("query lease acknowledgement: {error}"),
+		)
+	})?;
+	if accepted.kind != MessageKind::QueryLeaseAccepted
+		|| accepted.identity != EnvelopeIdentity::query(query_id)
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"worker did not acknowledge the query lease",
+		));
+	}
+	let accepted_payload: QueryLeaseAcceptedPayload = decode_payload(&accepted.payload)
+		.map_err(|error| Error::new(ErrorKind::InvalidData, format!("{error}")))?;
+	if accepted_payload.query_id != query_id {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"worker acknowledged a different query lease",
+		));
+	}
 	let payload = CancelTaskPayload { identity };
 	let envelope = WireEnvelope::try_new(
 		MessageKind::CancelTask,
@@ -656,7 +697,9 @@ async fn try_cancel_task_with_tls(
 	.map_err(|error| Error::new(ErrorKind::InvalidData, format!("{error}")))?;
 
 	try_write_envelope(&mut stream, &envelope).await?;
-	try_read_envelope(&mut stream).await
+	try_read_envelope(&mut stream)
+		.await
+		.map_err(|error| Error::new(error.kind(), format!("task cancellation response: {error}")))
 }
 
 async fn try_write_envelope<W>(stream: &mut W, envelope: &WireEnvelope) -> std::io::Result<()>

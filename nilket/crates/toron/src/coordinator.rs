@@ -30,12 +30,13 @@ use crate::distributed::context::TaskExecutionContext;
 use crate::distributed::fragment::{FragmentError, FragmentPlanConfig, fragment_plan};
 use crate::distributed::identity::QueryId;
 use crate::distributed::identity::StageId;
+use crate::distributed::namespace_lifecycle::QueryTerminalCause;
 use crate::distributed::scheduler::{
 	DistributedScheduler, SchedulerError, StagePlan, TaskTelemetryRecord,
 };
 use crate::distributed::task::{JoinRuntimeObservation, JoinRuntimeObservationMode, TaskTelemetry};
 use crate::distributed::task_state::TaskKey;
-use crate::distributed::worker_registry::WorkerRegistry;
+use crate::distributed::worker_registry::{WorkerEntry, WorkerRegistry};
 use crate::error::{
 	CatalogError, ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind,
 };
@@ -63,6 +64,7 @@ const DISTRIBUTED_RESULT_STREAM_DEPTH: usize = 16;
 
 type RemoteCancelSpawner =
 	Arc<dyn Fn(CancellationTrigger, Vec<RemoteTaskCancellation>) + Send + Sync>;
+type RemoteRetireSpawner = Arc<dyn Fn(QueryId, QueryTerminalCause, Vec<WorkerEntry>) + Send + Sync>;
 
 struct DistributedAttemptOutput {
 	final_results: Vec<RecordBatch>,
@@ -493,6 +495,9 @@ where
 			downstream,
 		);
 		let active_query_handle = active_query.handle();
+		self.spawn_query_lease_renewal(active_query_handle.clone());
+		let retire_remote = self.remote_retire_spawner();
+		let query_id = context.query_id;
 		let context = context.with_downstream_cancellation(Some(
 			active_query_handle.downstream_cancellation_context(),
 		));
@@ -526,6 +531,15 @@ where
 				telemetry_retention,
 			)
 			.await;
+			let cause = if active_query_handle.lease_failure_worker().is_some() {
+				QueryTerminalCause::Failed
+			} else if active_query_handle.is_cancelled() {
+				QueryTerminalCause::Cancelled
+			} else if result.is_ok() {
+				QueryTerminalCause::Success
+			} else {
+				QueryTerminalCause::Failed
+			};
 			if let Err(error) = result {
 				let _ = sender.send(Err(error)).await;
 			}
@@ -536,6 +550,9 @@ where
 					driver_cancel_remote(CancellationTrigger::ClientDisconnect, remote_tasks);
 				}
 			}
+			active_query_handle.mark_terminal();
+			drop(sender);
+			retire_remote(query_id, cause, active_query_handle.remote_workers());
 		});
 		Ok(DistributedResultStream::new(
 			receiver,
@@ -575,12 +592,31 @@ where
 			downstream,
 		);
 		let active_query_handle = active_query.handle();
+		self.spawn_query_lease_renewal(active_query_handle.clone());
+		let retire_remote = self.remote_retire_spawner();
+		let query_id = context.query_id;
 		let context = context.with_downstream_cancellation(Some(
 			active_query_handle.downstream_cancellation_context(),
 		));
 		let result = self
-			.execute_query_with_admission(plan, context, query_budget, Some(active_query_handle))
+			.execute_query_with_admission(
+				plan,
+				context,
+				query_budget,
+				Some(active_query_handle.clone()),
+			)
 			.await;
+		let cause = if active_query_handle.lease_failure_worker().is_some() {
+			QueryTerminalCause::Failed
+		} else if active_query_handle.is_cancelled() {
+			QueryTerminalCause::Cancelled
+		} else if result.is_ok() {
+			QueryTerminalCause::Success
+		} else {
+			QueryTerminalCause::Failed
+		};
+		active_query_handle.mark_terminal();
+		retire_remote(query_id, cause, active_query_handle.remote_workers());
 		drop(active_query);
 		drop(admitted);
 		result
@@ -634,6 +670,9 @@ where
 			downstream,
 		);
 		let active_query_handle = active_query.handle();
+		self.spawn_query_lease_renewal(active_query_handle.clone());
+		let retire_remote = self.remote_retire_spawner();
+		let query_id = context.query_id;
 		let context = context.with_downstream_cancellation(Some(
 			active_query_handle.downstream_cancellation_context(),
 		));
@@ -642,10 +681,21 @@ where
 				plan,
 				context,
 				query_budget,
-				Some(active_query_handle),
+				Some(active_query_handle.clone()),
 				planner_config,
 			)
 			.await;
+		let cause = if active_query_handle.lease_failure_worker().is_some() {
+			QueryTerminalCause::Failed
+		} else if active_query_handle.is_cancelled() {
+			QueryTerminalCause::Cancelled
+		} else if result.is_ok() {
+			QueryTerminalCause::Success
+		} else {
+			QueryTerminalCause::Failed
+		};
+		active_query_handle.mark_terminal();
+		retire_remote(query_id, cause, active_query_handle.remote_workers());
 		drop(active_query);
 		drop(admitted);
 		result
@@ -679,6 +729,9 @@ where
 			downstream,
 		);
 		let active_query_handle = active_query.handle();
+		self.spawn_query_lease_renewal(active_query_handle.clone());
+		let retire_remote = self.remote_retire_spawner();
+		let query_id = context.query_id;
 		let context = context.with_downstream_cancellation(Some(
 			active_query_handle.downstream_cancellation_context(),
 		));
@@ -712,6 +765,15 @@ where
 				telemetry_retention,
 			)
 			.await;
+			let cause = if active_query_handle.lease_failure_worker().is_some() {
+				QueryTerminalCause::Failed
+			} else if active_query_handle.is_cancelled() {
+				QueryTerminalCause::Cancelled
+			} else if result.is_ok() {
+				QueryTerminalCause::Success
+			} else {
+				QueryTerminalCause::Failed
+			};
 			if let Err(error) = result {
 				let _ = sender.send(Err(error)).await;
 			}
@@ -722,6 +784,9 @@ where
 					driver_cancel_remote(CancellationTrigger::ClientDisconnect, remote_tasks);
 				}
 			}
+			active_query_handle.mark_terminal();
+			drop(sender);
+			retire_remote(query_id, cause, active_query_handle.remote_workers());
 		});
 		Ok(DistributedResultStream::new(
 			receiver,
@@ -746,6 +811,34 @@ where
 				Arc::clone(&permits),
 				trigger,
 				remote_tasks,
+			);
+		})
+	}
+
+	fn spawn_query_lease_renewal(&self, active_query: ActiveQueryHandle)
+	where
+		Transport: 'static,
+	{
+		spawn_query_lease_renewal_task(
+			Arc::clone(&self.transport),
+			Arc::clone(&self.memory),
+			active_query,
+		);
+	}
+
+	fn remote_retire_spawner(&self) -> RemoteRetireSpawner
+	where
+		Transport: 'static,
+	{
+		let transport = Arc::clone(&self.transport);
+		let memory = Arc::clone(&self.memory);
+		Arc::new(move |query_id, cause, workers| {
+			spawn_remote_retire_fanout_task(
+				Arc::clone(&transport),
+				Arc::clone(&memory),
+				query_id,
+				cause,
+				workers,
 			);
 		})
 	}
@@ -1527,6 +1620,145 @@ fn spawn_remote_cancel_fanout_task<Transport>(
 					);
 				}
 			}
+		}
+	});
+}
+
+fn spawn_query_lease_renewal_task<Transport>(
+	transport: Arc<Transport>,
+	memory: Arc<MemoryManager>,
+	active_query: ActiveQueryHandle,
+) where
+	Transport: ToronTransport + ?Sized + 'static,
+{
+	spawn_query_lease_renewal_task_with_cadence(
+		transport,
+		memory,
+		active_query,
+		crate::distributed::namespace_lifecycle::DEFAULT_QUERY_LEASE_RENEW_CADENCE,
+	);
+}
+
+fn spawn_query_lease_renewal_task_with_cadence<Transport>(
+	transport: Arc<Transport>,
+	memory: Arc<MemoryManager>,
+	active_query: ActiveQueryHandle,
+	cadence: Duration,
+) where
+	Transport: ToronTransport + ?Sized + 'static,
+{
+	tokio::spawn(async move {
+		let coordinator = ToronCoordinator::new(memory);
+		let mut renewals = tokio::time::interval_at(tokio::time::Instant::now() + cadence, cadence);
+		loop {
+			tokio::select! {
+				_ = active_query.stopped() => return,
+				_ = renewals.tick() => {}
+			}
+			for worker in active_query.remote_workers() {
+				let stream = tokio::time::timeout(
+					REMOTE_CANCEL_CONNECT_TIMEOUT,
+					transport.connect_worker(&worker),
+				)
+				.await;
+				let renewed = match stream {
+					Ok(Ok(stream)) => tokio::time::timeout(
+						REMOTE_CANCEL_ACK_TIMEOUT,
+						coordinator.issue_or_renew_query_lease_on_worker(
+							stream,
+							active_query.key().query_id,
+						),
+					)
+					.await
+					.is_ok_and(|result| result.is_ok()),
+					Ok(Err(error)) => {
+						tracing::warn!(
+							error = %error,
+							query_id = ?active_query.key().query_id,
+							worker_id = ?worker.worker_id,
+							"query lease renewal connect failed"
+						);
+						false
+					}
+					Err(_) => false,
+				};
+				if !renewed {
+					// Stop every local dispatcher before the worker's lease can expire.
+					// Dispatch retains the worker id and surfaces this as WorkerLost,
+					// never as a client cancellation.
+					active_query.fail_query_lease(worker.worker_id);
+					return;
+				}
+			}
+		}
+	});
+}
+
+fn spawn_remote_retire_fanout_task<Transport>(
+	transport: Arc<Transport>,
+	memory: Arc<MemoryManager>,
+	query_id: QueryId,
+	cause: QueryTerminalCause,
+	workers: Vec<WorkerEntry>,
+) where
+	Transport: ToronTransport + ?Sized + 'static,
+{
+	if workers.is_empty() {
+		return;
+	}
+	let config =
+		crate::distributed::namespace_lifecycle::ShuffleLifecycleConfig::from_worker_loss_window(
+			crate::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER,
+		)
+		.expect("default shuffle lifecycle config");
+	tokio::spawn(async move {
+		let coordinator = ToronCoordinator::new(memory);
+		let deadline = tokio::time::Instant::now() + config.lease_term();
+		let mut pending = workers;
+		while !pending.is_empty() && tokio::time::Instant::now() < deadline {
+			let mut unacked = Vec::new();
+			for worker in pending {
+				let stream = tokio::time::timeout(
+					REMOTE_CANCEL_CONNECT_TIMEOUT,
+					transport.connect_worker(&worker),
+				)
+				.await;
+				let acknowledged = match stream {
+					Ok(Ok(stream)) => tokio::time::timeout(
+						REMOTE_CANCEL_ACK_TIMEOUT,
+						coordinator.retire_query_on_worker(stream, query_id, cause),
+					)
+					.await
+					.is_ok_and(|result| result.is_ok()),
+					Ok(Err(error)) => {
+						tracing::warn!(
+							error = %error,
+							?query_id,
+							worker_id = ?worker.worker_id,
+							"query retirement connect failed"
+						);
+						false
+					}
+					Err(_) => false,
+				};
+				if !acknowledged {
+					unacked.push(worker);
+				}
+			}
+			pending = unacked;
+			if !pending.is_empty() {
+				tokio::time::sleep_until(
+					(tokio::time::Instant::now() + Duration::from_secs(1)).min(deadline),
+				)
+				.await;
+			}
+		}
+		if !pending.is_empty() {
+			tracing::warn!(
+				?query_id,
+				unacknowledged_workers = pending.len(),
+				"query retirement lease expired before every worker acknowledged"
+			);
 		}
 	});
 }
@@ -2674,7 +2906,8 @@ mod tests {
 		WriteRequest,
 	};
 	use crate::wire::{
-		ArrowIpcBytes, CancelTaskPayload, EnvelopeIdentity, MessageKind, StartTaskPayload,
+		ArrowIpcBytes, CancelTaskPayload, EnvelopeIdentity, MessageKind, QueryLeaseAcceptedPayload,
+		QueryLeasePayload, QueryRetiredPayload, RetireQueryPayload, StartTaskPayload,
 		TaskBatchPayload, TaskCancelledPayload, TaskCompletePayload, TaskFailedPayload,
 		TaskStartedPayload, WireEnvelope, decode_payload, encode_payload,
 	};
@@ -2934,7 +3167,9 @@ mod tests {
 			.await
 			.expect("descriptor evolved retry succeeds under one admission reservation");
 
-		assert_eq!(attempts.load(Ordering::SeqCst), 2);
+		// Two task attempts plus the coordinator-issued terminal retirement. The
+		// retirement is a separate protocol exchange and does not reacquire admission.
+		assert_eq!(attempts.load(Ordering::SeqCst), 3);
 		assert_eq!(results.len(), 1);
 		assert_eq!(results[0].num_rows(), 3);
 		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
@@ -2983,6 +3218,65 @@ mod tests {
 		)
 		.await;
 		assert_eq!(seen.lock().expect("seen lock").as_slice(), &[identity]);
+	}
+
+	#[tokio::test]
+	async fn query_lifetime_renews_worker_lease_until_terminal() {
+		let registry = ActiveQueryRegistry::new();
+		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+		let handle = guard.handle();
+		handle.record_remote_task(scripted_worker(), lease_test_identity());
+		let calls = Arc::new(AtomicUsize::new(0));
+		spawn_query_lease_renewal_task_with_cadence(
+			Arc::new(LeaseRecordingTransport {
+				connect_calls: Arc::clone(&calls),
+				fail_at: None,
+			}),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			handle.clone(),
+			Duration::from_millis(5),
+		);
+
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+		while calls.load(Ordering::SeqCst) < 3 {
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"live query did not renew its worker lease repeatedly"
+			);
+			tokio::time::sleep(Duration::from_millis(2)).await;
+		}
+		assert!(!handle.is_cancelled());
+		assert_eq!(handle.lease_failure_worker(), None);
+
+		handle.mark_terminal();
+		tokio::time::sleep(Duration::from_millis(15)).await;
+		let after_stop = calls.load(Ordering::SeqCst);
+		tokio::time::sleep(Duration::from_millis(15)).await;
+		assert_eq!(calls.load(Ordering::SeqCst), after_stop);
+	}
+
+	#[tokio::test]
+	async fn failed_query_lease_renewal_stops_reliance_with_worker_identity() {
+		let registry = ActiveQueryRegistry::new();
+		let guard = registry.register(TenantId(7), QueryId::from_u128(1));
+		let handle = guard.handle();
+		let worker = scripted_worker();
+		handle.record_remote_task(worker.clone(), lease_test_identity());
+		spawn_query_lease_renewal_task_with_cadence(
+			Arc::new(LeaseRecordingTransport {
+				connect_calls: Arc::new(AtomicUsize::new(0)),
+				fail_at: Some(0),
+			}),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			handle.clone(),
+			Duration::from_millis(5),
+		);
+
+		tokio::time::timeout(Duration::from_secs(1), handle.stopped())
+			.await
+			.expect("failed renewal must stop the query before local lease expiry");
+		assert!(handle.is_cancelled());
+		assert_eq!(handle.lease_failure_worker(), Some(worker.worker_id));
 	}
 
 	#[tokio::test]
@@ -3662,6 +3956,15 @@ mod tests {
 		}
 	}
 
+	fn lease_test_identity() -> TaskIdentity {
+		TaskIdentity::new(
+			QueryId::from_u128(1),
+			StageId::new(1),
+			TaskId::new(1),
+			AttemptId::first(),
+		)
+	}
+
 	struct CancelRecordingTransport {
 		seen: Arc<StdMutex<Vec<TaskIdentity>>>,
 		acked: Arc<Notify>,
@@ -3723,6 +4026,44 @@ mod tests {
 		}
 	}
 
+	struct LeaseRecordingTransport {
+		connect_calls: Arc<AtomicUsize>,
+		fail_at: Option<usize>,
+	}
+
+	#[async_trait::async_trait]
+	impl ToronTransport for LeaseRecordingTransport {
+		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
+			let ordinal = self.connect_calls.fetch_add(1, Ordering::SeqCst);
+			if self.fail_at.is_some_and(|fail_at| ordinal >= fail_at) {
+				return Err(QueryError::Internal {
+					message: "injected lease renewal failure".to_string(),
+				});
+			}
+			let (client, mut server) = test_duplex(1024 * 1024);
+			tokio::spawn(async move {
+				let lease = read_test_envelope(&mut server)
+					.await
+					.expect("read query lease renewal");
+				assert_eq!(lease.kind, MessageKind::QueryLease);
+				let payload: QueryLeasePayload =
+					decode_payload(&lease.payload).expect("decode query lease renewal");
+				send_test_payload(
+					&mut server,
+					MessageKind::QueryLeaseAccepted,
+					EnvelopeIdentity::query(payload.query_id),
+					None,
+					&QueryLeaseAcceptedPayload {
+						query_id: payload.query_id,
+					},
+				)
+				.await
+				.expect("ack query lease renewal");
+			});
+			Ok(Box::new(client))
+		}
+	}
+
 	struct CancelledTaskTransport;
 
 	#[async_trait::async_trait]
@@ -3735,6 +4076,51 @@ mod tests {
 				}
 			});
 			Ok(Box::new(client))
+		}
+	}
+
+	async fn read_start_after_lifecycle(
+		stream: &mut DuplexStream,
+	) -> Result<Option<WireEnvelope>, QueryError> {
+		let first = read_test_envelope(stream).await?;
+		match first.kind {
+			MessageKind::QueryLease => {
+				let lease: QueryLeasePayload = decode_payload(&first.payload)?;
+				send_test_payload(
+					stream,
+					MessageKind::QueryLeaseAccepted,
+					EnvelopeIdentity::query(lease.query_id),
+					None,
+					&QueryLeaseAcceptedPayload {
+						query_id: lease.query_id,
+					},
+				)
+				.await?;
+				let start = read_test_envelope(stream).await?;
+				if start.kind != MessageKind::StartTask {
+					return Err(QueryError::UnexpectedMessage {
+						expected: "StartTask after QueryLeaseAccepted",
+					});
+				}
+				Ok(Some(start))
+			}
+			MessageKind::RetireQuery => {
+				let retirement: RetireQueryPayload = decode_payload(&first.payload)?;
+				send_test_payload(
+					stream,
+					MessageKind::QueryRetired,
+					EnvelopeIdentity::query(retirement.query_id),
+					None,
+					&QueryRetiredPayload {
+						query_id: retirement.query_id,
+					},
+				)
+				.await?;
+				Ok(None)
+			}
+			_ => Err(QueryError::UnexpectedMessage {
+				expected: "QueryLease or RetireQuery",
+			}),
 		}
 	}
 
@@ -3757,12 +4143,9 @@ mod tests {
 	}
 
 	async fn run_scripted_cancelled_worker(mut stream: DuplexStream) -> Result<(), QueryError> {
-		let start = read_test_envelope(&mut stream).await?;
-		if start.kind != MessageKind::StartTask {
-			return Err(QueryError::UnexpectedMessage {
-				expected: "StartTask",
-			});
-		}
+		let Some(start) = read_start_after_lifecycle(&mut stream).await? else {
+			return Ok(());
+		};
 		let payload: StartTaskPayload = decode_payload(&start.payload)?;
 		let identity = payload.spec.identity;
 		send_test_payload(
@@ -3813,12 +4196,9 @@ mod tests {
 		attempt: usize,
 		success_batch: RecordBatch,
 	) -> Result<(), QueryError> {
-		let start = read_test_envelope(&mut stream).await?;
-		if start.kind != MessageKind::StartTask {
-			return Err(QueryError::UnexpectedMessage {
-				expected: "StartTask",
-			});
-		}
+		let Some(start) = read_start_after_lifecycle(&mut stream).await? else {
+			return Ok(());
+		};
 		let payload: StartTaskPayload = decode_payload(&start.payload)?;
 		let identity = payload.spec.identity;
 		send_test_payload(

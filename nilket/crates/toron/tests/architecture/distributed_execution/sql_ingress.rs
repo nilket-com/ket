@@ -21,7 +21,8 @@ pub(crate) fn message_kind_retired_morsel_complete() {
 		.expect("MessageKind block");
 
 	assert!(!message_kind.contains("MorselComplete"));
-	assert_eq!(toron::wire::MessageKind::COUNT, 12);
+	// ADR 543 appends four query-lifecycle messages; MorselComplete stays retired.
+	assert_eq!(toron::wire::MessageKind::COUNT, 16);
 }
 
 #[test]

@@ -345,6 +345,15 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// the scan request carries it and every construction site fills it.
 				"crates/toron/src/storage.rs",
 				"crates/toron/src/coordinator/delete.rs",
+				// ADR 543: query-scoped shuffle leases and typed retirement widen the
+				// worker runtime after the binder-only decomposition record.
+				"crates/toron/src/distributed/cancellation.rs",
+				"crates/toron/src/distributed/mod.rs",
+				"crates/toron/src/distributed/namespace_lifecycle.rs",
+				"crates/toron/src/distributed/worker_registry.rs",
+				"crates/toron/src/error/distributed.rs",
+				"crates/toron/src/wire.rs",
+				"crates/toron-tpch/src/lib.rs",
 				// ADR 521: proof-gated outer-count structural and equivalence battery.
 				"crates/toron/tests/outer_count_preaggregation_test.rs",
 				// Plan filenames are zero-padded to four digits; this README documents a

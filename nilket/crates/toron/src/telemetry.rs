@@ -680,6 +680,8 @@ fn task_failure_class(kind: &TaskFailureKind) -> &'static str {
 		TaskFailureKind::TaskFailed { .. } => "task_failed",
 		TaskFailureKind::BudgetExhausted { .. } => "budget_exhausted",
 		TaskFailureKind::Cancelled => "cancelled",
+		TaskFailureKind::QueryLeaseMissing => "query_lease_missing",
+		TaskFailureKind::QueryLeaseExpired => "query_lease_expired",
 		TaskFailureKind::Internal { .. } => "internal",
 	}
 }

@@ -961,7 +961,9 @@ pub(crate) fn adr120_no_toron_worker_protocol_widening() {
 		.and_then(|rest| rest.split("impl MessageKind").next())
 		.expect("MessageKind block");
 
-	assert_eq!(toron::wire::MessageKind::COUNT, 12);
+	// ADR 543 adds query lease issue/ack and retirement issue/ack without
+	// changing ADR 120's result-stream decision.
+	assert_eq!(toron::wire::MessageKind::COUNT, 16);
 	assert!(!message_kind.contains("ResultStream"));
 	assert!(!message_kind.contains("Cursor"));
 }

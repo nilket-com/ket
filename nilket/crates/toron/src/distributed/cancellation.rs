@@ -776,7 +776,9 @@ pub struct ActiveQueryHandle {
 struct ActiveQueryState {
 	key: ActiveQueryKey,
 	cancelled: AtomicBool,
+	terminal: AtomicBool,
 	notify: Notify,
+	lease_failure_worker: Mutex<Option<crate::distributed::identity::WorkerId>>,
 	remote_tasks: Mutex<Vec<RemoteTaskCancellation>>,
 	downstream: DownstreamAttemptRegistry,
 }
@@ -902,7 +904,9 @@ impl ActiveQueryHandle {
 			inner: Arc::new(ActiveQueryState {
 				key,
 				cancelled: AtomicBool::new(false),
+				terminal: AtomicBool::new(false),
 				notify: Notify::new(),
+				lease_failure_worker: Mutex::new(None),
 				remote_tasks: Mutex::new(Vec::new()),
 				downstream,
 			}),
@@ -915,6 +919,36 @@ impl ActiveQueryHandle {
 
 	pub fn is_cancelled(&self) -> bool {
 		self.inner.cancelled.load(Ordering::SeqCst)
+	}
+
+	pub fn is_terminal(&self) -> bool {
+		self.inner.terminal.load(Ordering::SeqCst)
+	}
+
+	pub fn lease_failure_worker(&self) -> Option<crate::distributed::identity::WorkerId> {
+		*self
+			.inner
+			.lease_failure_worker
+			.lock()
+			.expect("active query lease failure poisoned")
+	}
+
+	pub fn mark_terminal(&self) {
+		if !self.inner.terminal.swap(true, Ordering::SeqCst) {
+			self.inner.notify.notify_waiters();
+		}
+	}
+
+	pub async fn stopped(&self) {
+		loop {
+			let notified = self.inner.notify.notified();
+			tokio::pin!(notified);
+			notified.as_mut().enable();
+			if self.is_cancelled() || self.is_terminal() {
+				return;
+			}
+			notified.await;
+		}
 	}
 
 	pub async fn cancelled(&self) {
@@ -950,12 +984,51 @@ impl ActiveQueryHandle {
 		(first_request, remote_tasks)
 	}
 
+	/// Fail the query when its owner can no longer renew a worker's namespace lease.
+	/// This is not a client cancellation: preserving the worker id lets dispatch surface
+	/// `WorkerLost` rather than flattening an ownership failure into `Cancelled`.
+	pub fn fail_query_lease(&self, worker_id: crate::distributed::identity::WorkerId) -> bool {
+		{
+			let mut failed = self
+				.inner
+				.lease_failure_worker
+				.lock()
+				.expect("active query lease failure poisoned");
+			failed.get_or_insert(worker_id);
+		}
+		let first_request = !self.inner.cancelled.swap(true, Ordering::SeqCst);
+		if first_request {
+			self.inner.notify.notify_waiters();
+			self.inner
+				.downstream
+				.cancel_registered_attempts(DownstreamCancellationTrigger::WorkerCancelTask);
+		}
+		first_request
+	}
+
 	pub fn record_remote_task(&self, worker: WorkerEntry, identity: TaskIdentity) {
 		self.inner
 			.remote_tasks
 			.lock()
 			.expect("active query tasks poisoned")
 			.push(RemoteTaskCancellation { identity, worker });
+	}
+
+	/// Growing per-query worker census. Task attempts may repeat on the same worker;
+	/// retirement addresses the worker namespace once, not each attempt.
+	pub fn remote_workers(&self) -> Vec<WorkerEntry> {
+		let tasks = self
+			.inner
+			.remote_tasks
+			.lock()
+			.expect("active query tasks poisoned");
+		let mut workers = HashMap::new();
+		for task in tasks.iter() {
+			workers
+				.entry(task.worker.worker_id)
+				.or_insert_with(|| task.worker.clone());
+		}
+		workers.into_values().collect()
 	}
 
 	fn ptr_eq(&self, other: &Self) -> bool {

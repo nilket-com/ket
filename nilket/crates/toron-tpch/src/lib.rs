@@ -8255,6 +8255,8 @@ fn task_failure_reason(kind: &TaskFailureKind) -> String {
 			budget_dimension_slug(*dimension).to_string()
 		}
 		TaskFailureKind::Cancelled => "task_cancelled".to_string(),
+		TaskFailureKind::QueryLeaseMissing => "task_query_lease_missing".to_string(),
+		TaskFailureKind::QueryLeaseExpired => "task_query_lease_expired".to_string(),
 		TaskFailureKind::Internal { .. } => "task_internal".to_string(),
 	}
 }

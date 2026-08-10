@@ -28,6 +28,8 @@ pub enum TaskFailureKind {
 		available: ByteCount,
 	},
 	Cancelled,
+	QueryLeaseMissing,
+	QueryLeaseExpired,
 	Internal {
 		reason: String,
 	},
@@ -46,6 +48,8 @@ impl TaskFailureKind {
 			Self::TaskFailed { .. } => "TaskFailed",
 			Self::BudgetExhausted { .. } => "BudgetExhausted",
 			Self::Cancelled => "Cancelled",
+			Self::QueryLeaseMissing => "QueryLeaseMissing",
+			Self::QueryLeaseExpired => "QueryLeaseExpired",
 			Self::Internal { .. } => "Internal",
 		}
 	}
@@ -58,6 +62,11 @@ pub enum PartitionMissingReason {
 		observed_attempt: AttemptId,
 	},
 	CancelledTaskCleanup,
+	QueryFailedCleanup,
+	NamespaceRetiring,
+	Reclaimed,
+	Abandoned,
+	NamespaceUnknown,
 	WorkerLost,
 	StoreEvicted,
 }
@@ -80,7 +89,7 @@ mod tests {
 	use super::*;
 
 	#[test]
-	fn task_failure_taxonomy_has_seven_variants() {
+	fn task_failure_taxonomy_has_nine_variants() {
 		let worker_lost = TaskFailureKind::WorkerLost {
 			worker_id: WorkerId::from_u128(1),
 		};

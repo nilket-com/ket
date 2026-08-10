@@ -241,10 +241,19 @@ impl ToronDaemon {
 		let memory = Arc::new(MemoryManager::new(32, memory_budget_bytes));
 		let worker_storage: Arc<dyn StorageScan> = scanner.clone();
 		let downstream_cancellation_metrics = Arc::new(DownstreamCancellationMetrics::default());
+		let partition_store = Arc::new(
+			InMemoryPartitionStore::managed(
+				config.worker.query_budget(),
+				crate::distributed::partition_store::DEFAULT_WORKER_LOST_AFTER,
+			)
+			.map_err(|error| ToronDaemonError::Invalid {
+				message: error.to_string(),
+			})?,
+		);
 		let worker = ToronWorker::with_partition_store_and_endpoint(
 			worker_storage,
 			Arc::clone(&memory),
-			Arc::new(InMemoryPartitionStore::new()),
+			partition_store.clone(),
 			config.node.worker_id,
 			advertised_endpoint.clone(),
 		)
@@ -345,6 +354,7 @@ impl ToronDaemon {
 			tenant_admission: coordinator.tenant_admission_controller(),
 			admission_rejections: coordinator.admission_rejection_counters(),
 		}));
+		metrics.attach_shuffle_lifecycle(partition_store);
 		let telemetry = if config.observability.telemetry.is_some() {
 			Some(crate::telemetry::install_global(
 				&config,
@@ -612,9 +622,11 @@ async fn run_accept_loop(
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
 	metrics: Arc<MetricsRegistry>,
 ) {
+	let mut lifecycle_tick = tokio::time::interval(std::time::Duration::from_secs(1));
 	loop {
 		tokio::select! {
 			_ = &mut shutdown_rx => break,
+			_ = lifecycle_tick.tick() => worker.reap_expired_shuffle_namespaces(),
 			accepted = listener.accept() => match accepted {
 				Ok((stream, _peer)) => {
 					metrics.increment_accept(ListenerName::Worker);
@@ -648,6 +660,7 @@ async fn run_quic_worker_accept_loop(
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
 	metrics: Arc<MetricsRegistry>,
 ) {
+	let reaper = Arc::clone(&worker);
 	run_quic_worker_accept_loop_with_maintenance_interval(
 		worker,
 		endpoint,
@@ -655,7 +668,7 @@ async fn run_quic_worker_accept_loop(
 		connection_tasks,
 		metrics,
 		Duration::from_secs(1),
-		|| {},
+		move || reaper.reap_expired_shuffle_namespaces(),
 		#[cfg(test)]
 		None,
 	)

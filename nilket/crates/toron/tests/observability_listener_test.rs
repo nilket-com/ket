@@ -33,7 +33,7 @@ use toron::config::{
 };
 use toron::daemon::ToronDaemon;
 use toron::distributed::budget::{
-	AdmissionAttempt, AdmissionResource, ByteCount, TenantAdmissionController,
+	AdmissionAttempt, AdmissionResource, ByteCount, QueryBudget, TenantAdmissionController,
 	TenantAdmissionRejectionCounters, TenantBudget, TenantBudgetPolicy,
 };
 use toron::distributed::cancellation::{
@@ -41,6 +41,9 @@ use toron::distributed::cancellation::{
 	DownstreamCancellationOutcome, DownstreamCancellationTrigger,
 };
 use toron::distributed::identity::WorkerId;
+use toron::distributed::partition_store::{
+	DEFAULT_WORKER_LOST_AFTER, InMemoryPartitionStore, PartitionStore,
+};
 use toron::network::connection::SqlConnectionLimiter;
 use toron::network::observability::{
 	ListenerName, MetricsRegistry, MetricsRegistryConfig, ReadinessSnapshot, RejectReason,
@@ -194,6 +197,55 @@ fn metrics_render_optimizer_evidence_status() {
 		"optimizer_evidence_refresh_failures_total 0\n",
 		"# TYPE optimizer_evidence_durable_enabled gauge\n",
 		"optimizer_evidence_durable_enabled{state=\"ok\"} 0\n",
+	] {
+		assert!(body.contains(expected), "missing {expected} in {body}");
+	}
+}
+
+#[test]
+fn metrics_render_every_shuffle_lifecycle_surface_and_attributed_counter() {
+	let policy = TenantBudgetPolicy::omitted_config(ByteCount::new(1024));
+	let tenant_admission = TenantAdmissionController::new(policy.clone(), None);
+	let metrics = MetricsRegistry::new(MetricsRegistryConfig {
+		descriptors_loaded: 0,
+		static_workers_configured: 0,
+		tenant_budgets: policy.clone(),
+		descriptor_sync_metrics: Arc::new(DescriptorSyncMetrics::default()),
+		descriptor_refresh_metrics: Arc::new(DescriptorRefreshMetrics::default()),
+		cancellation_metrics: Arc::new(CancellationMetrics::default()),
+		downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
+		sql_connection_limiter: None,
+		audit_metrics: None,
+		runtime_evidence: None,
+		tenant_admission,
+		admission_rejections: TenantAdmissionRejectionCounters::new(&policy),
+	});
+	let store: Arc<dyn PartitionStore> = Arc::new(
+		InMemoryPartitionStore::managed(QueryBudget::test_default(), DEFAULT_WORKER_LOST_AFTER)
+			.expect("managed shuffle store"),
+	);
+	metrics.attach_shuffle_lifecycle(store);
+
+	let body = metrics.render_text(&ready_snapshot());
+	for expected in [
+		"# TYPE shuffle_namespaces gauge\nshuffle_namespaces 0\n",
+		"# TYPE shuffle_retained_bytes gauge\nshuffle_retained_bytes 0\n",
+		"# TYPE shuffle_physical_spill_files gauge\nshuffle_physical_spill_files 0\n",
+		"# TYPE shuffle_cleanup_debt gauge\nshuffle_cleanup_debt 0\n",
+		"# TYPE shuffle_receipts gauge\nshuffle_receipts 0\n",
+		"# TYPE shuffle_cancelled_tombstones gauge\nshuffle_cancelled_tombstones 0\n",
+		"# TYPE shuffle_live_partition_records gauge\nshuffle_live_partition_records 0\n",
+		"# TYPE shuffle_oldest_namespace_age_millis gauge\nshuffle_oldest_namespace_age_millis 0\n",
+		"# TYPE shuffle_reclamations_total counter\n",
+		"shuffle_reclamations_total{cause=\"quiesced\"} 0\n",
+		"shuffle_reclamations_total{cause=\"cancelled\"} 0\n",
+		"shuffle_reclamations_total{cause=\"failed\"} 0\n",
+		"shuffle_reclamations_total{cause=\"abandoned\"} 0\n",
+		"# TYPE shuffle_receipt_evictions_total counter\n",
+		"shuffle_receipt_evictions_total{cause=\"capacity\"} 0\n",
+		"shuffle_receipt_evictions_total{cause=\"horizon\"} 0\n",
+		"# TYPE shuffle_startup_swept_files_total counter\n",
+		"shuffle_startup_swept_files_total 0\n",
 	] {
 		assert!(body.contains(expected), "missing {expected} in {body}");
 	}
