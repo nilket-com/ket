@@ -271,11 +271,14 @@ pub(crate) fn adr059_worker_handles_cancel_stream_concurrently_with_task_stream(
 		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
 	let server =
 		std::fs::read_to_string(manifest_dir().join("src/server/mod.rs")).expect("read server");
-	let worker_loop = brace_blocks_after_marker(&daemon, "async fn run_quic_worker_accept_loop")
-		.into_iter()
-		.next()
-		.expect("worker accept loop")
-		.1;
+	let worker_loop = brace_blocks_after_marker(
+		&daemon,
+		"async fn run_quic_worker_accept_loop_with_maintenance_interval",
+	)
+	.into_iter()
+	.next()
+	.expect("worker accept-loop implementation")
+	.1;
 
 	assert!(worker_loop.contains("connection_tasks.lock().await.spawn(async move"));
 	assert!(worker_loop.contains("QuicEndpoint::accept_stream_on(&connection)"));

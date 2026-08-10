@@ -326,7 +326,10 @@ pub(crate) fn adr057_no_worker_transport_or_observability_connection_cap() {
 		.join("\n");
 
 	assert!(worker_loop.contains("run_quic_worker_accept_loop"));
-	assert!(worker_loop.contains("accepted = endpoint.accept_connection()"));
+	// Worker admission splits dequeue from handshake so periodic maintenance cannot
+	// cancel an admitted peer; this remains the worker listener and gains no SQL cap.
+	assert!(worker_loop.contains("accepted = endpoint.accept_sql_incoming()"));
+	assert!(worker_loop.contains("QuicEndpoint::accept_incoming_connection(incoming)"));
 	assert!(!server_source.contains("SqlConnectionLimiter"));
 }
 

@@ -644,18 +644,79 @@ async fn handle_worker_connection(
 async fn run_quic_worker_accept_loop(
 	worker: Arc<ToronWorker>,
 	endpoint: QuicEndpoint,
-	mut shutdown_rx: oneshot::Receiver<()>,
+	shutdown_rx: oneshot::Receiver<()>,
 	connection_tasks: Arc<Mutex<JoinSet<()>>>,
 	metrics: Arc<MetricsRegistry>,
 ) {
+	run_quic_worker_accept_loop_with_maintenance_interval(
+		worker,
+		endpoint,
+		shutdown_rx,
+		connection_tasks,
+		metrics,
+		Duration::from_secs(1),
+		|| {},
+		#[cfg(test)]
+		None,
+	)
+	.await;
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct QuicWorkerHandshakeGate {
+	entered: Arc<tokio::sync::Notify>,
+	release: Arc<tokio::sync::Notify>,
+}
+
+async fn run_quic_worker_accept_loop_with_maintenance_interval<Maintenance>(
+	worker: Arc<ToronWorker>,
+	endpoint: QuicEndpoint,
+	mut shutdown_rx: oneshot::Receiver<()>,
+	connection_tasks: Arc<Mutex<JoinSet<()>>>,
+	metrics: Arc<MetricsRegistry>,
+	maintenance_interval: Duration,
+	maintenance: Maintenance,
+	#[cfg(test)] handshake_gate: Option<QuicWorkerHandshakeGate>,
+) where
+	Maintenance: Fn(),
+{
+	let mut maintenance_tick = tokio::time::interval(maintenance_interval);
 	loop {
 		tokio::select! {
 			_ = &mut shutdown_rx => {
 				endpoint.close();
 				break;
 			}
-			accepted = endpoint.accept_connection() => match accepted {
-				Ok(connection) => {
+			_ = maintenance_tick.tick() => maintenance(),
+			accepted = endpoint.accept_sql_incoming() => match accepted {
+				Ok(incoming) => {
+					// `accept_connection()` combines dequeuing an incoming connection with
+					// completing its handshake. Racing that combined future against the
+					// maintenance tick can drop an already-dequeued `Incoming` and reject a
+					// healthy peer. Once dequeued, the handshake is raced only against
+					// shutdown; maintenance resumes after admission is decided.
+					let admitted = async {
+						#[cfg(test)]
+						if let Some(gate) = handshake_gate.as_ref() {
+							gate.entered.notify_one();
+							gate.release.notified().await;
+						}
+						QuicEndpoint::accept_incoming_connection(incoming).await
+					};
+					let connection = tokio::select! {
+						_ = &mut shutdown_rx => {
+							endpoint.close();
+							break;
+						}
+						accepted = admitted => match accepted {
+							Ok(connection) => connection,
+							Err(error) => {
+								tracing::warn!(error = %error, "QUIC worker handshake failed");
+								continue;
+							}
+						},
+					};
 					metrics.increment_accept(ListenerName::Worker);
 					let worker = Arc::clone(&worker);
 					connection_tasks.lock().await.spawn(async move {
@@ -2207,6 +2268,8 @@ mod tests {
 	use crate::distributed::budget::{BudgetDimension, ByteCount};
 	use crate::error::{ExecutionError, RuntimeError, TaskFailureKind};
 	use arrow::array::Array;
+	use arrow::record_batch::RecordBatch;
+	use tokio::task::JoinSet;
 
 	#[test]
 	fn budget_exhausted_maps_to_resource_exhausted_sql_error() {
@@ -2221,6 +2284,82 @@ mod tests {
 
 		assert_eq!(code, SqlErrorCode::ResourceExhausted);
 		assert_eq!(message, "tenant memory budget exhausted");
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn admitted_quic_worker_handshake_survives_maintenance_ticks() {
+		let memory = Arc::new(MemoryManager::new(2, 1024 * 1024));
+		let store = Arc::new(InMemoryPartitionStore::new());
+		let worker = Arc::new(ToronWorker::with_partition_store_and_endpoint(
+			Arc::new(crate::storage::InMemoryStorageScan {
+				table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+			}),
+			memory,
+			store,
+			crate::distributed::identity::WorkerId::from_u128(543),
+			crate::distributed::worker_registry::WorkerEndpoint::new("127.0.0.1:0"),
+		));
+		let endpoint =
+			QuicEndpoint::bind_loopback("127.0.0.1:0".parse().unwrap()).expect("bind QUIC worker");
+		let address = endpoint.local_addr().expect("worker address");
+		let policy = crate::distributed::budget::TenantBudgetPolicy::omitted_config(
+			ByteCount::new(1024 * 1024),
+		);
+		let tenant_admission =
+			crate::distributed::budget::TenantAdmissionController::new(policy.clone(), None);
+		let metrics = Arc::new(MetricsRegistry::new(MetricsRegistryConfig {
+			descriptors_loaded: 0,
+			static_workers_configured: 0,
+			tenant_budgets: policy.clone(),
+			descriptor_sync_metrics: Arc::new(crate::catalog::DescriptorSyncMetrics::default()),
+			descriptor_refresh_metrics: Arc::new(
+				crate::catalog::DescriptorRefreshMetrics::default(),
+			),
+			cancellation_metrics: Arc::new(CancellationMetrics::default()),
+			downstream_cancellation_metrics: Arc::new(DownstreamCancellationMetrics::default()),
+			sql_connection_limiter: None,
+			audit_metrics: None,
+			runtime_evidence: None,
+			tenant_admission,
+			admission_rejections: crate::distributed::budget::TenantAdmissionRejectionCounters::new(
+				&policy,
+			),
+		}));
+		let connection_tasks = Arc::new(Mutex::new(JoinSet::new()));
+		let gate = QuicWorkerHandshakeGate {
+			entered: Arc::new(tokio::sync::Notify::new()),
+			release: Arc::new(tokio::sync::Notify::new()),
+		};
+		let (shutdown_tx, shutdown_rx) = oneshot::channel();
+		let loop_handle = tokio::spawn(run_quic_worker_accept_loop_with_maintenance_interval(
+			worker,
+			endpoint,
+			shutdown_rx,
+			Arc::clone(&connection_tasks),
+			metrics,
+			Duration::from_millis(5),
+			|| {},
+			Some(gate.clone()),
+		));
+		let client = QuicEndpoint::client_loopback().expect("QUIC client");
+		let connect = tokio::spawn(async move { client.connect_stream(address).await });
+
+		tokio::time::timeout(Duration::from_secs(2), gate.entered.notified())
+			.await
+			.expect("server dequeued the incoming peer");
+		// Make at least one maintenance tick ready while the admitted handshake is
+		// deliberately held. That tick must not participate in the handshake race.
+		tokio::time::sleep(Duration::from_millis(20)).await;
+		gate.release.notify_one();
+		let stream = tokio::time::timeout(Duration::from_secs(2), connect)
+			.await
+			.expect("admitted handshake timeout")
+			.expect("client join")
+			.expect("maintenance must not reject an admitted peer");
+		drop(stream);
+		let _ = shutdown_tx.send(());
+		loop_handle.await.expect("worker accept loop join");
+		connection_tasks.lock().await.abort_all();
 	}
 
 	#[test]
