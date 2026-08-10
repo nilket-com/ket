@@ -35,7 +35,7 @@ mod session_persistence;
 use gui::table::{Product0057TableEvidenceGeometry, draw_product_0057_table_evidence};
 use iced::advanced::graphics::geometry::Renderer as _;
 use iced::advanced::renderer::{Headless as _, Renderer as _};
-use iced::widget::canvas::{self, Path, Stroke};
+use iced::widget::canvas::{self, Path, Stroke, Text};
 use iced::{Color, Font, Pixels, Point, Rectangle, Size, Vector};
 use iced_wgpu::graphics::{Antialiasing, Shell};
 use iced_wgpu::{Engine, Renderer as WgpuRenderer, wgpu};
@@ -209,6 +209,239 @@ fn render_frame(
 	screenshot(renderer, size)
 }
 
+#[derive(Clone, Copy)]
+enum Product0068StrataPrototype {
+	Current,
+	CorrectedOver,
+	CorrectedUnder,
+}
+
+fn product_0068_color(color: plot::chrome::PlotRgba) -> Color {
+	Color::from_rgba(color.red(), color.green(), color.blue(), color.alpha())
+}
+
+fn draw_product_0068_grid(frame: &mut canvas::Frame, bounds: Rectangle, color: Color) {
+	for index in 0..=5 {
+		let y = bounds.y + bounds.height * (1.0 - index as f32 / 5.0);
+		let path = Path::line(
+			Point::new(bounds.x, y),
+			Point::new(bounds.x + bounds.width, y),
+		);
+		frame.stroke(&path, Stroke::default().with_color(color).with_width(1.0));
+	}
+}
+
+fn draw_product_0068_areas(
+	frame: &mut canvas::Frame,
+	bounds: Rectangle,
+	boundary: Color,
+	current_boundary: bool,
+) {
+	let series = [
+		[25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0],
+		[30.0, 28.0, 40.0, 38.0, 55.0, 50.0, 60.0],
+		[20.0, 35.0, 25.0, 45.0, 30.0, 55.0, 40.0],
+	];
+	let colors = [
+		Color::from_rgb8(1, 205, 254),
+		Color::from_rgb8(229, 9, 20),
+		Color::from_rgb8(255, 32, 121),
+	];
+	let x = |index: usize| bounds.x + bounds.width * index as f32 / 6.0;
+	let y = |value: f32| bounds.y + bounds.height * (1.0 - value / 250.0);
+	let mut lower = [0.0f32; 7];
+	for (values, fill) in series.into_iter().zip(colors) {
+		let upper = std::array::from_fn::<_, 7, _>(|index| lower[index] + values[index]);
+		let area = Path::new(|builder| {
+			builder.move_to(Point::new(x(0), y(upper[0])));
+			for index in 1..7 {
+				builder.line_to(Point::new(x(index), y(upper[index])));
+			}
+			for index in (0..7).rev() {
+				builder.line_to(Point::new(x(index), y(lower[index])));
+			}
+			builder.close();
+		});
+		frame.fill(&area, fill);
+		let edge = Path::new(|builder| {
+			builder.move_to(Point::new(x(0), y(upper[0])));
+			for index in 1..7 {
+				builder.line_to(Point::new(x(index), y(upper[index])));
+			}
+		});
+		frame.stroke(
+			&edge,
+			Stroke::default()
+				.with_color(if current_boundary {
+					Color::from_rgba(0.0, 0.0, 0.0, 0.2)
+				} else {
+					boundary
+				})
+				.with_width(0.5),
+		);
+		lower = upper;
+	}
+}
+
+fn draw_product_0068_bars(frame: &mut canvas::Frame, bounds: Rectangle) {
+	let values = [
+		[70.0, 55.0, 35.0],
+		[120.0, 95.0, 75.0],
+		[175.0, 140.0, 110.0],
+		[215.0, 180.0, 145.0],
+	];
+	let colors = [
+		Color::from_rgb8(1, 205, 254),
+		Color::from_rgb8(229, 9, 20),
+		Color::from_rgb8(255, 32, 121),
+	];
+	let band = bounds.width / values.len() as f32;
+	let category_inset = band * 0.08;
+	let usable = band - category_inset * 2.0;
+	let slot = usable / colors.len() as f32;
+	for (category, category_values) in values.into_iter().enumerate() {
+		for (series, value) in category_values.into_iter().enumerate() {
+			let width = slot * 0.78;
+			let x = bounds.x
+				+ category as f32 * band
+				+ category_inset
+				+ series as f32 * slot
+				+ (slot - width) / 2.0;
+			let height = bounds.height * value / 250.0;
+			frame.fill_rectangle(
+				Point::new(x, bounds.y + bounds.height - height),
+				iced::Size::new(width, height),
+				colors[series],
+			);
+		}
+	}
+}
+
+fn draw_product_0068_axes(frame: &mut canvas::Frame, plot: Rectangle, axis: Color) {
+	let x_axis = Path::line(
+		Point::new(plot.x, plot.y + plot.height),
+		Point::new(plot.x + plot.width, plot.y + plot.height),
+	);
+	let y_axis = Path::line(
+		Point::new(plot.x, plot.y),
+		Point::new(plot.x, plot.y + plot.height),
+	);
+	frame.stroke(&x_axis, Stroke::default().with_color(axis).with_width(1.0));
+	frame.stroke(&y_axis, Stroke::default().with_color(axis).with_width(1.0));
+}
+
+fn draw_product_0068_strata_exhibit(frame: &mut canvas::Frame) {
+	use plot::chrome::{PlotChrome, PlotChromeProjection};
+
+	let chrome = PlotChrome::from_theme_name("greys_rs2", PlotChromeProjection::Ordered)
+		.expect("PRODUCT-0068 Stage 0 greys skin");
+	let canvas = product_0068_color(chrome.canvas_background);
+	let axis = product_0068_color(chrome.axis_line);
+	let corrected_grid = Color { a: 0.35, ..axis };
+	let current_grid = Color::from_rgba(1.0, 1.0, 1.0, 0.2);
+	let variants = [
+		(
+			Product0068StrataPrototype::Current,
+			"CURRENT · grid over · weak boundary",
+		),
+		(
+			Product0068StrataPrototype::CorrectedOver,
+			"CORRECTED · grid over",
+		),
+		(
+			Product0068StrataPrototype::CorrectedUnder,
+			"CORRECTED · grid under",
+		),
+	];
+	let panel_width = frame.width() / variants.len() as f32;
+	for (index, (variant, label)) in variants.into_iter().enumerate() {
+		let panel_x = index as f32 * panel_width;
+		frame.fill_rectangle(
+			Point::new(panel_x + 8.0, 8.0),
+			iced::Size::new(panel_width - 16.0, frame.height() - 16.0),
+			canvas,
+		);
+		frame.fill_text(Text {
+			content: label.to_owned(),
+			position: Point::new(panel_x + panel_width / 2.0, 32.0),
+			color: product_0068_color(chrome.title_text),
+			size: Pixels(18.0),
+			align_x: iced::alignment::Horizontal::Center.into(),
+			..Text::default()
+		});
+		frame.fill_text(Text {
+			content: "STACKED AREA".to_owned(),
+			position: Point::new(panel_x + panel_width / 2.0, 68.0),
+			color: product_0068_color(chrome.subtitle_text),
+			size: Pixels(13.0),
+			align_x: iced::alignment::Horizontal::Center.into(),
+			..Text::default()
+		});
+		let area_plot = Rectangle::new(
+			Point::new(panel_x + 56.0, 68.0),
+			iced::Size::new(panel_width - 86.0, 410.0),
+		);
+		if matches!(variant, Product0068StrataPrototype::CorrectedUnder) {
+			draw_product_0068_grid(frame, area_plot, corrected_grid);
+		}
+		draw_product_0068_areas(
+			frame,
+			area_plot,
+			axis,
+			matches!(variant, Product0068StrataPrototype::Current),
+		);
+		match variant {
+			Product0068StrataPrototype::Current => {
+				draw_product_0068_grid(frame, area_plot, current_grid)
+			}
+			Product0068StrataPrototype::CorrectedOver => {
+				draw_product_0068_grid(frame, area_plot, corrected_grid)
+			}
+			Product0068StrataPrototype::CorrectedUnder => {}
+		}
+		draw_product_0068_axes(frame, area_plot, axis);
+
+		frame.fill_text(Text {
+			content: "GROUPED BARS".to_owned(),
+			position: Point::new(panel_x + panel_width / 2.0, 568.0),
+			color: product_0068_color(chrome.subtitle_text),
+			size: Pixels(13.0),
+			align_x: iced::alignment::Horizontal::Center.into(),
+			..Text::default()
+		});
+		let bar_plot = Rectangle::new(
+			Point::new(panel_x + 56.0, 578.0),
+			iced::Size::new(panel_width - 86.0, 410.0),
+		);
+		if matches!(variant, Product0068StrataPrototype::CorrectedUnder) {
+			draw_product_0068_grid(frame, bar_plot, corrected_grid);
+		}
+		draw_product_0068_bars(frame, bar_plot);
+		match variant {
+			Product0068StrataPrototype::Current => {
+				draw_product_0068_grid(frame, bar_plot, current_grid)
+			}
+			Product0068StrataPrototype::CorrectedOver => {
+				draw_product_0068_grid(frame, bar_plot, corrected_grid)
+			}
+			Product0068StrataPrototype::CorrectedUnder => {}
+		}
+		draw_product_0068_axes(frame, bar_plot, axis);
+	}
+}
+
+fn write_product_0068_png(capture: &Capture, path: &std::path::Path) {
+	let file = std::fs::File::create(path).expect("create PRODUCT-0068 Stage 0 PNG");
+	let mut encoder = png::Encoder::new(file, capture.width, capture.height);
+	encoder.set_color(png::ColorType::Rgba);
+	encoder.set_depth(png::BitDepth::Eight);
+	encoder
+		.write_header()
+		.expect("write PRODUCT-0068 PNG header")
+		.write_image_data(&capture.rgba)
+		.expect("write PRODUCT-0068 PNG pixels");
+}
+
 fn draw_overlap(frame: &mut canvas::Frame) {
 	let size = frame.size();
 	let mut backend = IcedBackend { frame };
@@ -373,6 +606,18 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	let large = Size::new(448, 320);
 	let mut msaa = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
 	let mut no_aa = gpu.renderer(None).await;
+	if let Some(path) = std::env::var_os("PRODUCT_0068_STAGE0_PNG") {
+		let exhibit = render_frame(
+			&mut msaa,
+			Size::new(1500, 1050),
+			draw_product_0068_strata_exhibit,
+		);
+		write_product_0068_png(&exhibit, std::path::Path::new(&path));
+		println!(
+			"PRODUCT_0068 Stage 0 exhibit={}",
+			std::path::Path::new(&path).display()
+		);
+	}
 
 	let overlap = render_frame(&mut msaa, base, draw_overlap);
 	let overlap_repeat = render_frame(&mut msaa, base, draw_overlap);
