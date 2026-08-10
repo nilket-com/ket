@@ -199,8 +199,18 @@ pub fn create_plot(
 			})
 		}
 		ResolvedKernelFields::StackedArea { series, x, y } => {
-			let prepared =
-				stacked_area::prepare_stacked_area_data(df, series.as_deref().unwrap_or(""), x, y);
+			let assignments = resolved_category_colors(spec);
+			let prepared = if assignments.is_empty() {
+				stacked_area::prepare_stacked_area_data(df, series.as_deref().unwrap_or(""), x, y)
+			} else {
+				stacked_area::prepare_stacked_area_data_with_resolved_order(
+					df,
+					series.as_deref().unwrap_or(""),
+					x,
+					y,
+					assignments,
+				)
+			};
 			Arc::new(StackedAreaPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
