@@ -6478,6 +6478,34 @@ mod tests {
 	}
 
 	#[test]
+	fn recovered_secondary_index_initializer_is_idempotent_and_never_resets_refusals() {
+		let registry = MetricsRegistry::default();
+		let tenant = TenantId::new(82);
+		let table = TableObjectId::new([0x82; 16]);
+		let index = IndexObjectId::new([0x28; 16]);
+		let labels = "tenant=\"82\",table=\"82828282828282828282828282828282\",index=\"28282828282828282828282828282828\"";
+
+		// A recovered catalog row has no declaration event in this process. The
+		// driver initializer must still make zero observable immediately.
+		registry.initialize_storage_secondary_index_series(tenant, table, index);
+		let rendered = registry.render_prometheus();
+		assert!(rendered.contains(&format!(
+			"{}{{{labels}}} 0",
+			namespaced_test_metric("storage_secondary_index_lookup_refusals_total")
+		)));
+
+		// Reasserting the series on every driver tick must not reset a counter.
+		registry.observe_storage_secondary_index_lookup_refusal(tenant, table, index);
+		registry.initialize_storage_secondary_index_series(tenant, table, index);
+		registry.initialize_storage_secondary_index_series(tenant, table, index);
+		let rendered = registry.render_prometheus();
+		assert!(rendered.contains(&format!(
+			"{}{{{labels}}} 1",
+			namespaced_test_metric("storage_secondary_index_lookup_refusals_total")
+		)));
+	}
+
+	#[test]
 	fn registry_renders_pk_delete_outcome_metric_values() {
 		let registry = MetricsRegistry::default();
 		let table = TableObjectId::new([0x50; 16]);

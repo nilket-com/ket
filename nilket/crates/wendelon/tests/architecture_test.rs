@@ -2511,6 +2511,8 @@ fn test_adr081_secondary_index_declaration_and_lifecycle_guards() {
 		"establish_secondary_index_declaration_cut(",
 		"tracker.take_active_buffer()",
 		"state.active.fsync().await?",
+		"initialize_storage_secondary_index_series(",
+		"tracker.uncovered_slabs().count() as u64",
 	] {
 		if !manager.contains(required) {
 			violations.push(format!(
@@ -2557,6 +2559,87 @@ fn test_adr081_secondary_index_declaration_and_lifecycle_guards() {
 		"ADR 081 secondary-index declaration/lifecycle invariants violated:\n{}",
 		violations.join("\n")
 	);
+}
+
+#[cfg(unix)]
+#[test]
+fn adr081_sampler_table_probe_is_behavioral_and_failure_is_visible() {
+	use std::os::unix::fs::PermissionsExt;
+	use std::process::Command;
+	use std::time::{SystemTime, UNIX_EPOCH};
+
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let sampler = manifest_dir.join("../../../packaging/ubuntu/polariton-telemetry-sampler.sh");
+	let nonce = SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap()
+		.as_nanos();
+	let fixture = std::env::temp_dir().join(format!(
+		"wendelon-adr081-sampler-{}-{nonce}",
+		std::process::id()
+	));
+	fs::create_dir_all(&fixture).unwrap();
+	let fake_nilket = fixture.join("nilket");
+	let sql_log = fixture.join("sql.log");
+	fs::write(
+		&fake_nilket,
+		r#"#!/usr/bin/env bash
+statement="${@: -1}"
+printf '%s\n' "$statement" >>"$FAKE_SQL_LOG"
+case "$statement" in
+	SELECT\ \*\ FROM\ *\ LIMIT\ 0)
+		[ "${FAKE_TABLES_EXIST:-1}" = 1 ]
+		;;
+	CREATE\ TABLE\ *)
+		echo 'schema expected_generation 0 does not match current generation 1' >&2
+		exit 1
+		;;
+	*) exit 2 ;;
+esac
+"#,
+	)
+	.unwrap();
+	let mut permissions = fs::metadata(&fake_nilket).unwrap().permissions();
+	permissions.set_mode(0o700);
+	fs::set_permissions(&fake_nilket, permissions).unwrap();
+
+	let existing = Command::new("bash")
+		.args(["-c", "source \"$1\"; ensure_tables", "bash"])
+		.arg(&sampler)
+		.env("POLARITON_NILKET_BIN", &fake_nilket)
+		.env("FAKE_SQL_LOG", &sql_log)
+		.env("FAKE_TABLES_EXIST", "1")
+		.output()
+		.unwrap();
+	assert!(
+		existing.status.success(),
+		"existing tables must bypass duplicate DDL: {}",
+		String::from_utf8_lossy(&existing.stderr)
+	);
+	let statements = fs::read_to_string(&sql_log).unwrap();
+	assert_eq!(statements.lines().count(), 3);
+	assert!(
+		statements
+			.lines()
+			.all(|line| line.starts_with("SELECT * FROM "))
+	);
+	assert!(!statements.contains("CREATE TABLE"));
+
+	fs::write(&sql_log, "").unwrap();
+	let absent = Command::new("bash")
+		.args(["-c", "source \"$1\"; ensure_tables", "bash"])
+		.arg(&sampler)
+		.env("POLARITON_NILKET_BIN", &fake_nilket)
+		.env("FAKE_SQL_LOG", &sql_log)
+		.env("FAKE_TABLES_EXIST", "0")
+		.output()
+		.unwrap();
+	assert!(!absent.status.success());
+	let stderr = String::from_utf8_lossy(&absent.stderr);
+	assert!(stderr.contains("sampler: ensure_tables failed"));
+	assert!(stderr.contains("expected_generation 0 does not match current generation 1"));
+
+	fs::remove_dir_all(fixture).unwrap();
 }
 
 #[test]

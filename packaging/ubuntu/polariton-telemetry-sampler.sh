@@ -150,20 +150,27 @@ sample_metrics() {
 	return 0
 }
 
-tick=0
-tables_ready=0
-while :; do
-	now="$(date +%s)"
-	if [ "$tables_ready" -eq 0 ]; then
-		ensure_tables && tables_ready=1
-	fi
-	if [ "$tables_ready" -eq 1 ]; then
-		sample_processes "$now"
-		sample_health "$now"
-		if [ $((tick % METRICS_EVERY_TICKS)) -eq 0 ]; then
-			sample_metrics "$now"
+run_sampler() {
+	local tick=0 tables_ready=0 now
+	while :; do
+		now="$(date +%s)"
+		if [ "$tables_ready" -eq 0 ]; then
+			ensure_tables && tables_ready=1
 		fi
-	fi
-	tick=$((tick + 1))
-	sleep "$INTERVAL_SECS"
-done
+		if [ "$tables_ready" -eq 1 ]; then
+			sample_processes "$now"
+			sample_health "$now"
+			if [ $((tick % METRICS_EVERY_TICKS)) -eq 0 ]; then
+				sample_metrics "$now"
+			fi
+		fi
+		tick=$((tick + 1))
+		sleep "$INTERVAL_SECS"
+	done
+}
+
+# Keep the functions sourceable for the discriminating sampler controls. Production
+# execution still enters the same endless loop; sourcing the file only defines its seams.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+	run_sampler
+fi
