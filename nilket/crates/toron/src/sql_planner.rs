@@ -27,6 +27,7 @@ use sqlparser::ast::{
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
+use sqlparser::tokenizer::{Token, Tokenizer};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -60,6 +61,8 @@ const DEFAULT_JOIN_PARTITION_COUNT: u32 = 4;
 const DEFAULT_AGGREGATE_PARTITION_COUNT: u32 = DEFAULT_JOIN_PARTITION_COUNT;
 const MAX_IN_LIST_ITEMS: usize = 32;
 const AGGREGATE_ARGUMENT_SHAPE_MESSAGE: &str = "unsupported aggregate argument";
+const SQL_ONE_STATEMENT_PER_REQUEST_MESSAGE: &str =
+	"Toron SQL execution accepts exactly one statement per request";
 /// ADR 257: the single output column a pulled-up scalar subquery exposes (renamed via its `__scalar_N`
 /// alias's column list). The rewritten expression references `__scalar_N.value`.
 const SCALAR_SUBQUERY_COLUMN: &str = "value";
@@ -667,6 +670,42 @@ fn take_sql_word(input: &str) -> Option<(&str, &str)> {
 	Some((&trimmed[..end], &trimmed[end..]))
 }
 
+/// Reject a request with more than one lexical SQL statement before any syntax-specific
+/// fast path can claim the prefix. The generic parser performs its own cardinality check
+/// below; this lexical boundary exists because `CREATE LOGICAL TYPE` is intentionally
+/// lowered before that parser and must obey the same one-request/one-statement contract.
+fn require_at_most_one_sql_statement(sql: &str) -> Result<(), FrontendError> {
+	let dialect = GenericDialect {};
+	let tokens =
+		Tokenizer::new(&dialect, sql)
+			.tokenize()
+			.map_err(|error| FrontendError::SqlParse {
+				message: error.to_string(),
+			})?;
+	let mut completed = 0usize;
+	let mut has_content = false;
+
+	for token in tokens {
+		match token {
+			Token::Whitespace(_) | Token::EOF => {}
+			Token::SemiColon if has_content => {
+				completed += 1;
+				has_content = false;
+				if completed > 1 {
+					return Err(unsupported(SQL_ONE_STATEMENT_PER_REQUEST_MESSAGE));
+				}
+			}
+			Token::SemiColon => {}
+			_ => has_content = true,
+		}
+	}
+
+	if has_content && completed > 0 {
+		return Err(unsupported(SQL_ONE_STATEMENT_PER_REQUEST_MESSAGE));
+	}
+	Ok(())
+}
+
 fn try_lower_create_logical_type(sql: &str) -> Result<Option<LogicalPlan>, FrontendError> {
 	let trimmed = sql.trim();
 	let statement = trimmed.strip_suffix(';').unwrap_or(trimmed).trim();
@@ -685,6 +724,7 @@ fn try_lower_create_logical_type(sql: &str) -> Result<Option<LogicalPlan>, Front
 	{
 		return Ok(None);
 	}
+	require_at_most_one_sql_statement(sql)?;
 	let Some((name, rest)) = take_sql_word(rest) else {
 		return Err(unsupported(
 			"CREATE LOGICAL TYPE syntax is CREATE LOGICAL TYPE <Name> AS <primitive> [CHECK (<predicate>)]",
@@ -2245,6 +2285,9 @@ impl SqlPlanner {
 
 		if ast.is_empty() {
 			return Err(unsupported("empty SQL statement"));
+		}
+		if ast.len() != 1 {
+			return Err(unsupported(SQL_ONE_STATEMENT_PER_REQUEST_MESSAGE));
 		}
 
 		self.lower_statement(&ast[0])
@@ -10800,6 +10843,40 @@ fn reject_unused_broadcast_hint(
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn terminal_planner_rejects_multiple_generic_sql_statements() {
+		let error = SqlPlanner::new()
+			.plan("SELECT 1; SELECT 2")
+			.expect_err("a request containing two statements must refuse");
+
+		assert!(
+			error
+				.to_string()
+				.contains("Toron SQL execution accepts exactly one statement per request"),
+			"unexpected refusal: {error}"
+		);
+	}
+
+	#[test]
+	fn terminal_planner_fast_path_cannot_bypass_one_statement_boundary() {
+		let error = SqlPlanner::new()
+			.plan("CREATE LOGICAL TYPE Score AS BIGINT; SELECT 2")
+			.expect_err("the logical-type fast path must refuse a second statement");
+
+		assert!(
+			error
+				.to_string()
+				.contains("Toron SQL execution accepts exactly one statement per request"),
+			"unexpected refusal: {error}"
+		);
+	}
+
+	#[test]
+	fn terminal_planner_statement_boundary_is_lexical_not_character_based() {
+		require_at_most_one_sql_statement("SELECT ';' /* ; */ -- ;\n;")
+			.expect("quoted and commented semicolons are not statement boundaries");
+	}
 
 	#[test]
 	fn adr440_structural_expr_equality_discriminates_physical_literal_and_cast_details() {
