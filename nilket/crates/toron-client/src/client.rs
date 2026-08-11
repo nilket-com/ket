@@ -12,8 +12,8 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, Signatur
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::protocol::{
-	ExecuteRuneRequest, HealthyResponse, QueryId, ResultBatch, RuneFailure, SqlErrorCode, SqlFrame,
-	SqlMessage, SqlProtocolVersion,
+	ExecuteRuneRequest, HealthyResponse, MutationOutcomeResponse, QueryId, ResultBatch,
+	RuneFailure, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion,
 };
 
 const LOOPBACK_QUIC_ALPN: &[u8] = b"sql-task-loopback";
@@ -58,6 +58,7 @@ pub enum ClientOperation {
 	Query,
 	RuneQuery,
 	Cancellation,
+	MutationResolution,
 }
 
 impl fmt::Display for ClientOperation {
@@ -68,6 +69,7 @@ impl fmt::Display for ClientOperation {
 			Self::Query => "query",
 			Self::RuneQuery => "Rune query",
 			Self::Cancellation => "cancellation",
+			Self::MutationResolution => "mutation resolution",
 		})
 	}
 }
@@ -166,7 +168,19 @@ impl ToronClient {
 		statement: &str,
 		session_timezone: &str,
 	) -> Result<QueryResult, ClientError> {
-		let query_id = QueryId::new();
+		self.execute_with_query_id(QueryId::new(), statement, session_timezone)
+			.await
+	}
+
+	/// Execute with an explicit caller-retained identity. Retrying a mutation after
+	/// reconnect or process restart reuses this id; ADR 542 therefore never relies
+	/// on a server-minted identity to distinguish replay from a new statement.
+	pub async fn execute_with_query_id(
+		&self,
+		query_id: QueryId,
+		statement: &str,
+		session_timezone: &str,
+	) -> Result<QueryResult, ClientError> {
 		self.exchange(
 			SqlFrame::execute_with_timezone(query_id, statement.to_owned(), None, session_timezone),
 			ExpectedResponse::Query,
@@ -188,7 +202,15 @@ impl ToronClient {
 		&self,
 		request: ExecuteRuneRequest,
 	) -> Result<QueryResult, ClientError> {
-		let query_id = QueryId::new();
+		self.execute_rune_request_with_query_id(QueryId::new(), request)
+			.await
+	}
+
+	pub async fn execute_rune_request_with_query_id(
+		&self,
+		query_id: QueryId,
+		request: ExecuteRuneRequest,
+	) -> Result<QueryResult, ClientError> {
 		self.exchange(
 			SqlFrame::execute_rune_request(query_id, request),
 			ExpectedResponse::RuneQuery,
@@ -213,6 +235,34 @@ impl ToronClient {
 			));
 		}
 		Ok(())
+	}
+
+	/// Resolve the durable outcome named by an earlier SQL or Rune query id
+	/// without re-submitting that mutation's statement or payload.
+	pub async fn resolve_mutation(
+		&self,
+		operation_query_id: QueryId,
+	) -> Result<MutationOutcomeResponse, ClientError> {
+		let request_id = QueryId::new();
+		let request = SqlFrame::resolve_mutation(request_id, operation_query_id);
+		let connection = self.open_connection().await?;
+		let exchange = async {
+			let (mut send, mut recv) = connection
+				.open_bi()
+				.await
+				.map_err(|error| ClientError::Transport(error.to_string()))?;
+			write_client_frame(&mut send, &request).await?;
+			send.finish()
+				.map_err(|error| ClientError::Transport(error.to_string()))?;
+			let result = collect_mutation_outcome(&mut recv, request_id, operation_query_id).await;
+			let _ = tokio::time::timeout(Duration::from_millis(250), recv.read_to_end(0)).await;
+			result
+		};
+		let result = tokio::time::timeout(self.query_timeout, exchange)
+			.await
+			.map_err(|_| ClientError::TimedOut(ClientOperation::MutationResolution))?;
+		connection.close(0_u32.into(), b"request complete");
+		result
 	}
 
 	async fn open_connection(&self) -> Result<quinn::Connection, ClientError> {
@@ -384,6 +434,48 @@ where
 	}
 }
 
+async fn collect_mutation_outcome<R>(
+	reader: &mut R,
+	request_id: QueryId,
+	operation_query_id: QueryId,
+) -> Result<MutationOutcomeResponse, ClientError>
+where
+	R: AsyncRead + Unpin,
+{
+	let frame = read_client_frame(reader).await?;
+	if frame.protocol_version != SqlProtocolVersion::Current {
+		return Err(ClientError::Protocol(
+			"unsupported SQL protocol version".to_owned(),
+		));
+	}
+	if frame.query_id != request_id {
+		return Err(ClientError::Protocol(format!(
+			"response query id {} did not match request {}",
+			frame.query_id.get(),
+			request_id.get()
+		)));
+	}
+	match frame.message {
+		SqlMessage::MutationOutcome(outcome)
+			if outcome.operation_query_id == operation_query_id =>
+		{
+			Ok(outcome)
+		}
+		SqlMessage::MutationOutcome(outcome) => Err(ClientError::Protocol(format!(
+			"mutation outcome id {} did not match requested operation {}",
+			outcome.operation_query_id.get(),
+			operation_query_id.get()
+		))),
+		SqlMessage::Error(error) => Err(ClientError::Remote {
+			code: error.code,
+			message: error.message,
+		}),
+		other => Err(ClientError::Protocol(format!(
+			"unexpected mutation resolution response: {other:?}"
+		))),
+	}
+}
+
 async fn write_client_frame<W>(writer: &mut W, frame: &SqlFrame) -> Result<(), ClientError>
 where
 	W: tokio::io::AsyncWrite + Unpin,
@@ -508,8 +600,8 @@ impl ServerCertVerifier for LoopbackServerVerifier {
 mod tests {
 	use super::*;
 	use crate::protocol::{
-		CancelRequest, Complete, HealthRequest, RuneFailure, RuneFailureKind, RuneSourceSpan,
-		SqlError, write_frame,
+		CancelRequest, Complete, HealthRequest, MutationCommitKnowledge, MutationResolution,
+		MutationStopReason, RuneFailure, RuneFailureKind, RuneSourceSpan, SqlError, write_frame,
 	};
 
 	async fn framed_bytes(frames: &[SqlFrame]) -> tokio::io::DuplexStream {
@@ -538,6 +630,45 @@ mod tests {
 				code: SqlErrorCode::SyntaxError,
 				message: "bad syntax".to_owned(),
 			})
+		);
+	}
+
+	#[tokio::test]
+	async fn mutation_collector_preserves_both_outcome_axes_and_checks_identity() {
+		let request_id = QueryId::from_u128(10);
+		let operation_id = QueryId::from_u128(11);
+		let outcome = MutationOutcomeResponse {
+			operation_query_id: operation_id,
+			resolution: MutationResolution::Present,
+			write_status: 19,
+			stop_reason: MutationStopReason::Deadline,
+			commit_knowledge: MutationCommitKnowledge::Indeterminate,
+			delete_counts: Some([3, 2, 1]),
+		};
+		let mut reader = framed_bytes(&[SqlFrame::response(
+			request_id,
+			SqlMessage::MutationOutcome(outcome),
+		)])
+		.await;
+		assert_eq!(
+			collect_mutation_outcome(&mut reader, request_id, operation_id).await,
+			Ok(outcome)
+		);
+
+		let mut mismatched = framed_bytes(&[SqlFrame::response(
+			request_id,
+			SqlMessage::MutationOutcome(MutationOutcomeResponse {
+				operation_query_id: QueryId::from_u128(12),
+				..outcome
+			}),
+		)])
+		.await;
+		assert!(
+			collect_mutation_outcome(&mut mismatched, request_id, operation_id)
+				.await
+				.unwrap_err()
+				.to_string()
+				.contains("did not match requested operation")
 		);
 	}
 

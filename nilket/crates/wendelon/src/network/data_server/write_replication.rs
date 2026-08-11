@@ -150,6 +150,7 @@ impl WendelonDataServer {
 			write_sequence = meta.parent_write_id.sequence_no,
 		);
 		let (resp, trailing) = self.table_write(meta, payload).instrument(span).await?;
+		let resp = self.finalize_table_write_attempt(meta, resp).await?;
 		Ok(self.build_table_write_response_frame(frame.header.stream_id, resp, trailing))
 	}
 
@@ -177,6 +178,7 @@ impl WendelonDataServer {
 			.table_delete(meta, row_key_ids)
 			.instrument(span)
 			.await?;
+		let resp = self.finalize_table_delete_attempt(meta, resp).await?;
 		self.emit_table_delete_completion_audit(actor, &meta, &resp, distinct_target_count)?;
 		Ok(self.build_table_delete_response_frame(frame.header.stream_id, resp, trailing))
 	}

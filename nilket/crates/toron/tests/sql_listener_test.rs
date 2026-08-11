@@ -30,9 +30,10 @@ use toron::network::tls::{
 };
 use toron::quic::QuicEndpoint;
 use toron::sql_wire::{
-	CancelRequest, Complete, RuneFailure, RuneFailureKind, RuneLanguageSurfaceVersion,
-	RuneRequestProtocolVersion, RuneSandboxContractVersion, RuneSandboxViolation, RuneVersionAxis,
-	SqlError, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion, read_frame as read_sql_frame,
+	CancelRequest, Complete, MutationCommitKnowledge, MutationResolution, MutationStopReason,
+	RuneFailure, RuneFailureKind, RuneLanguageSurfaceVersion, RuneRequestProtocolVersion,
+	RuneSandboxContractVersion, RuneSandboxViolation, RuneVersionAxis, SqlError, SqlErrorCode,
+	SqlFrame, SqlMessage, SqlProtocolVersion, read_frame as read_sql_frame,
 	write_frame as write_sql_frame,
 };
 use toron::storage::TenantId as ToronTenantId;
@@ -1083,6 +1084,54 @@ async fn toron_sql_complete_frame_carries_stable_row_count() {
 		.expect("drop-if-exists response");
 	assert_eq!(drop_missing.complete.row_count, 0);
 	assert!(drop_missing.batches.is_empty());
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_sql_client_resolves_a_mutation_by_id_without_replaying_it() {
+	let fixture = LiveWendelonFixture::start(542).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	let config = toron_config_with_descriptor(descriptor, true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = ToronClient::loopback(endpoint.to_string()).expect("public client");
+	let operation_query_id = QueryId::new();
+
+	client
+		.execute_with_query_id(
+			operation_query_id,
+			"INSERT INTO storage_execution (id, amount, region, ts) \
+			 VALUES (542, 7, 'resolved', 1599998400000)",
+			"UTC",
+		)
+		.await
+		.expect("execute named mutation");
+	let outcome = client
+		.resolve_mutation(operation_query_id)
+		.await
+		.expect("resolve without replay");
+
+	assert_eq!(outcome.operation_query_id, operation_query_id);
+	assert_eq!(outcome.resolution, MutationResolution::Present);
+	assert_eq!(outcome.write_status, 0);
+	assert_eq!(outcome.stop_reason, MutationStopReason::None);
+	assert_eq!(outcome.commit_knowledge, MutationCommitKnowledge::Committed);
+	assert_eq!(outcome.delete_counts, None);
+
+	let rows = client
+		.execute("SELECT id FROM storage_execution WHERE id = 542")
+		.await
+		.expect("read mutation result");
+	assert_eq!(
+		rows.row_count, 1,
+		"resolution must not submit a second write"
+	);
 
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();

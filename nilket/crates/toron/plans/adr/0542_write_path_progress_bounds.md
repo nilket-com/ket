@@ -80,7 +80,10 @@ tries" is not a bound any caller can reason about.
 
    - **Who mints it.** The *caller* (Toron) mints the operation id before first dispatch, because
      only the caller knows that attempt two is a replay of attempt one rather than a new
-     statement. A server-minted id cannot distinguish them.
+     statement. A server-minted id cannot distinguish them. Network SQL/Rune uses its
+     caller-supplied UUIDv7 `QueryId`; the reusable in-process `QueryCoordinator` is itself the
+     caller on that rail and mints a fresh UUIDv7 identity per logical statement rather than
+     reusing its fixed execution context's query id.
    - **How the caller reuses it.** The id travels in the mutation meta on every attempt of the
      same logical operation, including attempts after a caller restart, and is surfaced to the
      SQL/Rune layer so a client can present it again.
@@ -89,13 +92,26 @@ tries" is not a bound any caller can reason about.
      posed after a restart.
    - **How resolution is queried.** A caller holding an id can ask for its outcome and receive
      `committed`, `known-not-committed`, or `indeterminate`, without re-submitting the mutation.
-     Re-submission as the only resolution path is what makes duplication unavoidable today.
+     Terminal outcomes are node-local durable rows, so the smart client asks every current Data
+     node and accepts `Unknown` only after all of them answer; routing the query by a table
+     locality could miss the node that admitted the first-row write locality. Re-submission as
+     the only resolution path is what makes duplication unavoidable today.
    - **Retention, and what reclaim means.** Durable outcomes are retained for a stated window
      and reclaimed on a stated rule; an unbounded outcome log is a second unbounded thing this
      record would be adding while removing the first. **After reclaim, replaying that operation
      id is rejected as expired — never treated as a new mutation.** Without this invariant
      bounded retention quietly reintroduces double application at the retention horizon, which
      is the exact failure the identity protocol exists to prevent, merely delayed.
+
+     The concrete policy is capacity first, age second: at most 4,096 terminal outcomes, each
+     retained for at most five minutes (the existing maximum `ClientWriteId` retention), followed
+     by expired-id evidence bounded independently to 4,096 rows and a 15-minute horizon. Every
+     terminal eviction first publishes expired evidence; merely storing an expiry timestamp
+     without sweeping unqueried rows would still be an unbounded ledger. In-scope caller
+     identities must carry a UUIDv7 namespace: its issuance time makes an old id rejectable after
+     both bounded ledgers reclaim it. Compatibility SDK writes that do not supply a caller
+     identity retain their pre-0542 process-session semantics and are not evidence for restart
+     replay.
 
 6. **Abandoned server work is bounded.** A caller timeout drops its wait while local durable
    work and replica tasks may continue. Repeated expiries must not accumulate detached,
@@ -122,6 +138,36 @@ The write path is not the read path with different nouns. ADR 0541's `QueryClock
 reusable, but only after Decision 3's progress-unit difference is stated; sharing the type
 without sharing the semantics would repeat the absent-sentinel conflation that record already
 paid for.
+
+### Phase 0 results (2026-08-10)
+
+- **Commit unit: the parent batch.** A typed table batch may bifurcate into several locality
+  groups whose child records append durably at different times. Those child appends are not the
+  logical commit: Wendelon advances visibility once, through one parent finalization, only after
+  every replica group has reached durable quorum. DELETE packs its tombstones and enters that
+  same parent-batch path. Partial durable groups therefore create an indeterminate window; they
+  do not redefine the commit unit as per-row or per-locality.
+- **Existing identity: useful but minted in the wrong layer.** `ClientWriteId` is already the
+  parent idempotency identity, and retries inside the smart client preserve it. The public
+  client currently mints it after Toron has dispatched, however. Toron's SQL/Rune `QueryId` is
+  already caller-selected and crosses reconnects when deliberately reused, so its UUIDv7 bytes
+  become the caller-minted parent identity for the one in-scope mutation in that query. The
+  local coordinator is reusable across statements and therefore mints one fresh identity per
+  call; reusing its fixed context id was caught by the live storage target because the second
+  INSERT/UPDATE was misclassified as a duplicate of the first. CTAS deliberately receives no
+  ADR 0542 identity or deadline.
+- **Durability is split.** `PendingFinalizationStore` is a node-local redb ledger and survives
+  restart while the data branch awaits Control Ring finalization. Once finalization completes,
+  that row is removed and only the process-local `DashMap` retains the replayable response;
+  DELETE's row counts are likewise process-local. The existing store is authoritative for the
+  pending window, not for retained terminal outcomes.
+- **Status-bearing failures stay typed.** Table write/delete response frames decode a
+  `WriteStatus`; no status-bearing `io::Error` path was found. I/O errors on these calls are
+  transport/framing failures, so no write-side string/downcast extractor is authorized.
+- **Work after caller loss is asymmetric.** Remote replica tasks live in a `JoinSet` and abort
+  when the request future is dropped. The local durable append lives in a detached
+  `tokio::spawn`; dropping its `JoinHandle` does not stop it. That local task is the abandoned
+  work Decision 6 must bound by a permit held for the task's true lifetime.
 
 ## Acceptance
 

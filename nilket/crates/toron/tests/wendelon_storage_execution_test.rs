@@ -1494,6 +1494,8 @@ async fn write_durable_star_table(
 			payload,
 			profile_hint: Some(QueryProfileHint::Scan),
 			trace_context: None,
+			operation_id: None,
+			deadline: None,
 		})
 		.await
 		.expect("write durable star table");

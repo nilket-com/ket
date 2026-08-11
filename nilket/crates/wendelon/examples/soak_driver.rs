@@ -560,6 +560,9 @@ fn error_label(err: &ClientError) -> String {
 		ClientError::TenantUnavailable { .. } => "tenant_unavailable".to_string(),
 		ClientError::AuthorizationFailed => "authorization_failed".to_string(),
 		ClientError::WriteFailed { status } => format!("write_status_{status:?}"),
+		ClientError::MutationStopped { status, .. } => {
+			format!("mutation_stopped_{}", status.as_str())
+		}
 		ClientError::ReadFailed { status } => format!("read_status_{status:?}"),
 		ClientError::QueryFailed { status } => format!("query_status_{}", status.as_str()),
 		ClientError::Io(err) => format!("io_{}", err.kind()),
@@ -597,6 +600,7 @@ async fn prefill(
 					durability: DurabilityClass::QUORUM,
 					await_finalization,
 					client_hlc: None,
+					..Default::default()
 				},
 			)
 			.await?;
@@ -746,6 +750,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 								durability: DurabilityClass::QUORUM,
 								await_finalization: cfg.await_finalization,
 								client_hlc: None,
+								..Default::default()
 							},
 						)
 						.await;

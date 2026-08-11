@@ -51,8 +51,8 @@ use crate::server::{
 };
 use crate::storage::{
 	CreateLogicalTypeRequest, DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest,
-	RowIdentityProjection, ScanStream, StorageAdmin, StorageDeleteRows, StorageWrite, TenantId,
-	UnsupportedStorageAdmin, WriteOutcome, WriteRequest,
+	ResolvedMutationOutcome, RowIdentityProjection, ScanStream, StorageAdmin, StorageDeleteRows,
+	StorageWrite, TenantId, UnsupportedStorageAdmin, WriteOutcome, WriteRequest,
 };
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -638,6 +638,22 @@ where
 		cancellation
 	}
 
+	/// Resolve a caller-retained SQL/Rune mutation id without executing its
+	/// statement again. Tenant scope comes from the authenticated connection.
+	pub async fn resolve_mutation_outcome(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: QueryId,
+	) -> Result<ResolvedMutationOutcome, QueryError> {
+		self.writer
+			.resolve_mutation(
+				tenant_id,
+				mutation_operation_id(*operation_query_id.get().as_bytes(), 0),
+			)
+			.await
+			.map_err(QueryError::Storage)
+	}
+
 	pub async fn execute_query_with_context_and_config(
 		&self,
 		plan: &LogicalPlan,
@@ -919,6 +935,7 @@ where
 				self.deleter.as_ref(),
 				self.admin.as_ref(),
 				&context,
+				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
 				&bound,
 			)
@@ -948,6 +965,7 @@ where
 				self.deleter.as_ref(),
 				self.admin.as_ref(),
 				&context,
+				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
 				&bound,
 			)
@@ -1077,6 +1095,7 @@ where
 				self.deleter.as_ref(),
 				self.admin.as_ref(),
 				&context,
+				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
 				&bound,
 			)
@@ -1106,6 +1125,7 @@ where
 				self.deleter.as_ref(),
 				self.admin.as_ref(),
 				&context,
+				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
 				&bound,
 			)
@@ -2229,6 +2249,7 @@ async fn execute_write_plan_with_source(
 	deleter: &dyn StorageDeleteRows,
 	admin: &dyn StorageAdmin,
 	context: &ExecutionContext,
+	operation_id: wendelon::schema::ClientWriteId,
 	source_executor: &dyn MutationSourceExecutor,
 	bound: &ExecutionPlan,
 ) -> Result<Vec<RecordBatch>, QueryError> {
@@ -2261,6 +2282,8 @@ async fn execute_write_plan_with_source(
 					payload,
 					profile_hint: context.profile_hint,
 					trace_context: context.trace_context,
+					operation_id: Some(operation_id),
+					deadline: context.deadline,
 				})
 				.await?;
 			if let Some(batches) = returning_batches {
@@ -2307,6 +2330,8 @@ async fn execute_write_plan_with_source(
 					payload,
 					profile_hint: context.profile_hint,
 					trace_context: context.trace_context,
+					operation_id: Some(operation_id),
+					deadline: context.deadline,
 				})
 				.await?;
 			if let Some(batches) = returning_batches {
@@ -2352,6 +2377,8 @@ async fn execute_write_plan_with_source(
 					payload,
 					profile_hint: Some(*profile_hint),
 					trace_context: context.trace_context,
+					operation_id: Some(operation_id),
+					deadline: context.deadline,
 				})
 				.await?;
 			if let Some(batches) = returning_batches {
@@ -2423,6 +2450,10 @@ async fn execute_write_plan_with_source(
 					payload,
 					profile_hint: context.profile_hint,
 					trace_context: context.trace_context,
+					// CTAS is explicitly outside ADR 542: storage alone cannot
+					// resolve its catalog-plus-rows composite outcome.
+					operation_id: None,
+					deadline: None,
 				})
 				.await?;
 			Ok(Vec::new())
@@ -2465,6 +2496,8 @@ async fn execute_write_plan_with_source(
 					row_key_ids,
 					profile_hint: Some(*profile_hint),
 					trace_context: context.trace_context,
+					operation_id,
+					deadline: context.deadline,
 				},
 			)
 			.await?;
@@ -2478,6 +2511,18 @@ async fn execute_write_plan_with_source(
 		other => Err(QueryError::Internal {
 			message: format!("execute_write_plan called with non-DML plan: {other:?}"),
 		}),
+	}
+}
+
+fn mutation_operation_id(
+	client_uuid: [u8; 16],
+	sequence_no: u64,
+) -> wendelon::schema::ClientWriteId {
+	wendelon::schema::ClientWriteId {
+		client_uuid,
+		sequence_no,
+		idempotency_ttl_ms: 300_000,
+		_pad: 0,
 	}
 }
 
@@ -2641,14 +2686,14 @@ impl QueryCoordinator {
 		writer: Arc<dyn StorageWrite>,
 		deleter: Arc<dyn StorageDeleteRows>,
 	) -> Self {
-		Self {
+		Self::with_writer_deleter_and_admin(
 			catalog,
 			executor,
 			config,
 			writer,
 			deleter,
-			admin: Arc::new(UnsupportedStorageAdmin),
-		}
+			Arc::new(UnsupportedStorageAdmin),
+		)
 	}
 
 	pub fn with_storage_admin(mut self, admin: Arc<dyn StorageAdmin>) -> Self {
@@ -2793,6 +2838,11 @@ impl QueryCoordinator {
 		catalog: &dyn Catalog,
 		bound: &ExecutionPlan,
 	) -> Result<Vec<RecordBatch>, QueryError> {
+		// The public local coordinator can execute multiple logical statements through
+		// one fixed ExecutionContext. It is therefore the caller on this rail and mints
+		// a fresh statement identity before each dispatch; reusing context.query_id here
+		// would collapse the second mutation into a replay of the first.
+		let operation_id = mutation_operation_id(*QueryId::new().get().as_bytes(), 0);
 		let source_executor = LocalMutationSourceExecutor {
 			executor: &self.executor,
 		};
@@ -2802,6 +2852,7 @@ impl QueryCoordinator {
 			self.deleter.as_ref(),
 			self.admin.as_ref(),
 			self.executor.context(),
+			operation_id,
 			&source_executor,
 			bound,
 		)
@@ -3174,6 +3225,34 @@ mod tests {
 		assert_eq!(results[0].num_rows(), 3);
 		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
 		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+	}
+
+	#[test]
+	fn caller_query_id_is_the_stable_parent_mutation_identity() {
+		let query_id = QueryId::new();
+		let first = mutation_operation_id(*query_id.get().as_bytes(), 0);
+		let replay = mutation_operation_id(*query_id.get().as_bytes(), 0);
+		assert_eq!(
+			first.canonical_idempotency_bytes(),
+			replay.canonical_idempotency_bytes()
+		);
+		assert_eq!(first.client_uuid, *query_id.get().as_bytes());
+		assert_eq!(
+			first.client_uuid[6] >> 4,
+			7,
+			"production QueryId must remain UUIDv7"
+		);
+	}
+
+	#[test]
+	fn local_statement_identity_distinguishes_mutations_in_one_execution_context() {
+		let first = mutation_operation_id(*QueryId::new().get().as_bytes(), 0);
+		let second = mutation_operation_id(*QueryId::new().get().as_bytes(), 0);
+		assert_ne!(
+			first.canonical_idempotency_bytes(),
+			second.canonical_idempotency_bytes(),
+			"two logical statements must never collapse into one replay identity"
+		);
 	}
 
 	#[tokio::test]

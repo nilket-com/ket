@@ -751,6 +751,10 @@ impl MsgType {
 	/// continue to use SCHEMA_UPDATE_REQ; this pair is observation only.
 	pub const SECONDARY_INDEX_STATUS_REQ: Self = Self(0x50);
 	pub const SECONDARY_INDEX_STATUS_RESP: Self = Self(0x51);
+	/// ADR 542: resolve a retained table-mutation outcome by caller-minted id
+	/// without re-submitting the mutation.
+	pub const MUTATION_OUTCOME_REQ: Self = Self(0x52);
+	pub const MUTATION_OUTCOME_RESP: Self = Self(0x53);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -840,6 +844,8 @@ impl MsgType {
 		Self::TABLE_OPTIMIZER_FACTS_GET_RESP,
 		Self::SECONDARY_INDEX_STATUS_REQ,
 		Self::SECONDARY_INDEX_STATUS_RESP,
+		Self::MUTATION_OUTCOME_REQ,
+		Self::MUTATION_OUTCOME_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,
@@ -995,6 +1001,15 @@ impl WriteStatus {
 	/// The target table is fenced because a published reference points at a
 	/// missing backing slab. No append is acknowledged while that state holds.
 	pub const TABLE_REFERENCE_INTEGRITY_FAILED: Self = Self(18);
+	/// ADR 542: the caller's original end-to-end mutation deadline expired.
+	pub const WRITE_DEADLINE_EXCEEDED: Self = Self(19);
+	/// ADR 542: no durability progress occurred for the server stall bound.
+	pub const WRITE_STALLED: Self = Self(20);
+	/// ADR 542: the caller consumed its bounded attempt budget before either clock.
+	pub const WRITE_ATTEMPTS_EXHAUSTED: Self = Self(21);
+	/// ADR 542: the retained outcome was reclaimed; this id may never be applied anew.
+	pub const WRITE_OPERATION_EXPIRED: Self = Self(22);
+	pub const WRITE_OPERATION_UNKNOWN: Self = Self(23);
 
 	pub const fn as_str(self) -> &'static str {
 		match self {
@@ -1017,9 +1032,40 @@ impl WriteStatus {
 			Self::COUNTER_OVERFLOW => "counter_overflow",
 			Self::COUNTER_REPLICATION_UNSUPPORTED => "counter_replication_unsupported",
 			Self::TABLE_REFERENCE_INTEGRITY_FAILED => "table_reference_integrity_failed",
+			Self::WRITE_DEADLINE_EXCEEDED => "write_deadline_exceeded",
+			Self::WRITE_STALLED => "write_stalled",
+			Self::WRITE_ATTEMPTS_EXHAUSTED => "write_attempts_exhausted",
+			Self::WRITE_OPERATION_EXPIRED => "write_operation_expired",
+			Self::WRITE_OPERATION_UNKNOWN => "write_operation_unknown",
 			_ => "unknown",
 		}
 	}
+}
+
+/// ADR 542's durable-knowledge axis. This is separate from [`WriteStatus`], which
+/// names why an attempt stopped. Keeping both representable prevents an expiry from
+/// pretending to answer whether the parent batch committed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct MutationCommitKnowledge(pub u8);
+
+impl MutationCommitKnowledge {
+	pub const UNSPECIFIED: Self = Self(0);
+	pub const COMMITTED: Self = Self(1);
+	pub const KNOWN_NOT_COMMITTED: Self = Self(2);
+	pub const INDETERMINATE: Self = Self(3);
+}
+
+/// ADR 542's orthogonal stop-cause axis.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct MutationStopReason(pub u8);
+
+impl MutationStopReason {
+	pub const NONE: Self = Self(0);
+	pub const DEADLINE: Self = Self(1);
+	pub const NO_PROGRESS: Self = Self(2);
+	pub const ATTEMPT_EXHAUSTION: Self = Self(3);
 }
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -1040,6 +1086,26 @@ pub struct WriteResponseMeta {
 	/// 1 if a FinalizationMarker follows this frame; 0 otherwise
 	pub has_finalization: u8, //  1 byte
 	pub _pad2: [u8; 7],      //  7 bytes
+}
+
+impl WriteResponseMeta {
+	pub fn with_mutation_outcome(
+		mut self,
+		knowledge: MutationCommitKnowledge,
+		reason: MutationStopReason,
+	) -> Self {
+		self._pad1[0] = knowledge.0;
+		self._pad1[1] = reason.0;
+		self
+	}
+
+	pub const fn mutation_commit_knowledge(self) -> MutationCommitKnowledge {
+		MutationCommitKnowledge(self._pad1[0])
+	}
+
+	pub const fn mutation_stop_reason(self) -> MutationStopReason {
+		MutationStopReason(self._pad1[1])
+	}
 }
 
 // ============================================================

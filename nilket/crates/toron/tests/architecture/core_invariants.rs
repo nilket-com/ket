@@ -510,3 +510,71 @@ pub(crate) fn adr463_daemon_coordinator_budget_is_config_owned() {
 		"daemon coordinator budget must come from ToronWorkerConfig::query_budget()"
 	);
 }
+
+#[test]
+pub(crate) fn adr542_mutation_producer_census_keeps_ctas_visibly_excluded() {
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let start = coordinator
+		.find("async fn execute_write_plan_with_source(")
+		.expect("write execution rail");
+	let end = coordinator[start..]
+		.find("\nfn project_returning_batches(")
+		.map(|offset| start + offset)
+		.expect("end of write execution rail");
+	let rail = &coordinator[start..end];
+	assert_eq!(
+		rail.matches("operation_id: Some(operation_id)").count(),
+		3,
+		"INSERT, INSERT SELECT and UPDATE must carry the caller operation id"
+	);
+	assert_eq!(
+		rail.matches("deadline: context.deadline").count(),
+		4,
+		"INSERT, INSERT SELECT, UPDATE and DELETE must carry one original deadline"
+	);
+	let ctas_start = rail
+		.find("ExecutionPlan::CreateTableAsSelect")
+		.expect("CTAS arm");
+	let delete_start = rail[ctas_start..]
+		.find("ExecutionPlan::Delete")
+		.map(|offset| ctas_start + offset)
+		.expect("DELETE arm after CTAS");
+	let ctas = &rail[ctas_start..delete_start];
+	assert!(ctas.contains("operation_id: None"));
+	assert!(ctas.contains("deadline: None"));
+	let delete = &rail[delete_start..];
+	assert!(delete.contains("DeleteRowsRequest {"));
+	assert!(delete.contains("operation_id,"));
+	assert!(delete.contains("deadline: context.deadline"));
+}
+
+#[test]
+pub(crate) fn adr542_resolution_is_a_tenant_scoped_id_lookup_not_statement_replay() {
+	let daemon = std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("daemon");
+	let arm_start = daemon
+		.find("SqlMessage::ResolveMutation(request) =>")
+		.expect("mutation resolution SQL arm");
+	let arm_end = daemon[arm_start..]
+		.find("\n\t\tSqlMessage::Execute(request) =>")
+		.map(|offset| arm_start + offset)
+		.expect("execute arm after mutation resolution");
+	let arm = &daemon[arm_start..arm_end];
+	assert!(arm.contains("resolve_mutation_outcome(tenant_id, request.operation_query_id)"));
+	assert!(!arm.contains("SqlPlanner"));
+	assert!(!arm.contains("execute_query"));
+
+	let coordinator =
+		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
+	let resolve_start = coordinator
+		.find("pub async fn resolve_mutation_outcome(")
+		.expect("coordinator mutation resolution rail");
+	let resolve_end = coordinator[resolve_start..]
+		.find("\n\tpub async fn execute_query_with_context_and_config")
+		.map(|offset| resolve_start + offset)
+		.expect("end of mutation resolution rail");
+	let resolve = &coordinator[resolve_start..resolve_end];
+	assert!(resolve.contains("self.writer"));
+	assert!(resolve.contains(".resolve_mutation("));
+	assert!(!resolve.contains(".write("));
+}

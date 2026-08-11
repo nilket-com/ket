@@ -135,6 +135,7 @@ impl From<wendelon_client::ClientError> for StorageError {
 				Self::InvalidPbcForDescriptor { source }
 			}
 			source @ ClientError::WriteFailed { .. }
+			| source @ ClientError::MutationStopped { .. }
 			| source @ ClientError::SchemaUpdateRejected { .. }
 			| source @ ClientError::Admin(_) => Self::Client { source },
 		}

@@ -1091,6 +1091,8 @@ async fn write_table(
 			payload,
 			profile_hint: Some(QueryProfileHint::Scan),
 			trace_context: None,
+			operation_id: None,
+			deadline: None,
 		})
 		.await
 		.expect("write fixture table");

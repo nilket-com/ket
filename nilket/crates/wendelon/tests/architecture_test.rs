@@ -615,6 +615,7 @@ fn is_allowed_manifest_line(line: &str) -> bool {
 	line.is_empty()
 		|| line.starts_with("mod ")
 		|| line.starts_with("pub mod ")
+		|| line.starts_with("pub(crate) mod ")
 		|| line.starts_with("use ")
 		|| line.starts_with("pub use ")
 		|| line.starts_with("#[cfg")
@@ -8772,6 +8773,9 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"data_server.rs",
 			"counter.rs",
 			"descriptor_migration.rs",
+			// ADR 542's durable outcome/replay wire is one named protocol seam;
+			// keep its framing and resolution state out of the bounded root.
+			"mutation_protocol.rs",
 			// ADR 541's two clocks and its bounded encode quanta: self-contained
 			// mechanisms with their own invariants, carved so the bounded root
 			// keeps ratcheting down rather than absorbing each new one.
@@ -8780,6 +8784,7 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"replica_routing.rs",
 			"streaming.rs",
 			"table_query.rs",
+			"write_clocks.rs",
 			"write_replication.rs",
 		],
 		"ADR 077 production source manifest changed; update this guard deliberately \
@@ -8825,6 +8830,52 @@ fn adr077_semantic_modules_exist() {
 			"ADR 077 domain module not declared in root: mod {module};"
 		);
 	}
+}
+
+/// ADR 542's abandoned-work cap covers admission and synchronous batch construction,
+/// not merely the later replica phase. Moving the permit below either bifurcation rail
+/// would make the same finite-but-expensive work accumulate again under caller expiry.
+#[test]
+fn impl542_mutation_slot_precedes_table_admission_and_bifurcation() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let table_start = root.find("\n\tasync fn table_write(").expect("table write");
+	let delete_start = root[table_start..]
+		.find("\n\tasync fn table_delete(")
+		.map(|offset| table_start + offset)
+		.expect("table delete");
+	let data_ring_start = root[delete_start..]
+		.find("\n#[async_trait]\nimpl DataRing")
+		.map(|offset| delete_start + offset)
+		.expect("DataRing impl after table delete");
+	let table = &root[table_start..delete_start];
+	let delete = &root[delete_start..data_ring_start];
+	let table_permit = table
+		.find("acquire_table_mutation_permit")
+		.expect("table mutation permit");
+	for later in [
+		"acquire_secondary_index_admission_guard",
+		"bifurcate_content_hash_table_write",
+		"bifurcate_primary_key_table_write",
+	] {
+		assert!(
+			table_permit < table.find(later).expect("table admission operation"),
+			"mutation slot must bind before {later}"
+		);
+	}
+	assert!(
+		delete
+			.find("acquire_delete_mutation_permit")
+			.expect("delete permit")
+			< delete.find("merge_commit_hlc").expect("delete admission"),
+		"delete mutation slot must bind before classification and tombstone packing"
+	);
+
+	let protocol =
+		fs::read_to_string(manifest_dir.join("src/network/data_server/mutation_protocol.rs"))
+			.unwrap();
+	assert!(protocol.contains("acquire_mutation_work_permit("));
+	assert!(protocol.contains("MutationCommitKnowledge::KNOWN_NOT_COMMITTED"));
 }
 
 /// The struct definition and `MsgType` dispatch stay in the root; carved handler

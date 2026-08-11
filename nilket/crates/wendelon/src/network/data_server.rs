@@ -64,6 +64,9 @@ use crate::network::ipc::{
 	observe_wire_encode_error, observe_wire_encode_success, wire_encode_batch_for_path,
 };
 use crate::network::lease_signing::LeaseAuthority;
+use crate::network::mutation_outcomes::{
+	DurableMutationOutcome, MutationOutcomeStore, MutationResolution, mutation_outcomes_path,
+};
 use crate::network::pending_finalizations::{
 	PendingFinalizationId, PendingFinalizationRecord, PendingFinalizationStore,
 	pending_finalizations_path,
@@ -87,7 +90,9 @@ use crate::schema::{
 	CounterRollbackRequestMeta, FRAME_FLAG_STREAM_END, FinalizationMarker, FrameHeader,
 	HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicy,
 	LocalityRange, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
-	MsgType, MultiRowLayoutDescriptor, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
+	MsgType, MultiRowLayoutDescriptor, MutationCommitKnowledge, MutationOperationKind,
+	MutationOutcomeRequestMeta, MutationOutcomeResponseMeta, MutationResolutionStatus,
+	MutationStopReason, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
 	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
 	ReadRequestMeta, ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy,
 	RecordRowIndex, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
@@ -168,7 +173,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, RwLock};
 use std::time::{Duration, Instant};
-use tokio::sync::{Notify, OwnedMutexGuard, mpsc, watch};
+use tokio::sync::{Notify, OwnedMutexGuard, OwnedSemaphorePermit, Semaphore, mpsc, watch};
 use tokio::task::{JoinHandle, JoinSet, spawn_blocking};
 use tokio_util::sync::CancellationToken;
 use tracing::{Instrument, Span, field};
@@ -192,6 +197,10 @@ use query_clocks::{
 };
 mod query_encode;
 use query_encode::encode_query_stream_batches_with_deadline;
+mod write_clocks;
+use write_clocks::{WriteClocks, acquire_mutation_work_permit};
+mod mutation_protocol;
+use mutation_protocol::mutation_expiry_response;
 mod streaming;
 use counter::{CounterParticipantFactory, CounterReplicaNetworkTransport};
 use descriptor_migration::MigrationRegistry;
@@ -631,6 +640,14 @@ pub struct WendelonDataServer {
 	/// payload sections from it and the response `meta` buffer is
 	/// encoded into a pooled Vec on the reply path.
 	pool: Arc<BufPool>,
+	/// ADR 542: a node-wide cap on mutation work that can outlive a caller. The
+	/// permit moves into a spawned local durable append and is released only when
+	/// that work actually finishes, never merely when the caller stops waiting.
+	mutation_work_slots: Arc<Semaphore>,
+	/// ADR 542 durable terminal/expiry outcomes. Unlike the process-local replay
+	/// maps, this store is reopened at bootstrap and supports resolution without
+	/// re-submitting the mutation.
+	mutation_outcomes: Arc<MutationOutcomeStore>,
 	/// Exactly-once cache. The cached value includes any committed
 	/// finalization marker so duplicate retries can replay the same
 	/// durability receipt the original caller observed.
@@ -696,6 +713,8 @@ pub struct WendelonDataServer {
 	local_persistence_distrust_path: PathBuf,
 	#[cfg(test)]
 	fail_next_local_durable_append: Arc<StdMutex<Option<(ErrorKind, String)>>>,
+	#[cfg(test)]
+	delay_next_local_durable_append: Arc<StdMutex<Option<Duration>>>,
 	/// Shared node-wide HLC driver. The leader merges client HLCs
 	/// into this monotonic authority before stamping writes.
 	hlc: Arc<HybridLogicalClockDriver>,
@@ -1068,6 +1087,8 @@ impl Clone for WendelonDataServer {
 			router: self.router.clone(),
 			factory: self.factory.clone(),
 			pool: self.pool.clone(),
+			mutation_work_slots: self.mutation_work_slots.clone(),
+			mutation_outcomes: self.mutation_outcomes.clone(),
 			idempotency: self.idempotency.clone(),
 			table_delete_idempotency: self.table_delete_idempotency.clone(),
 			content_hash_admission_locks: self.content_hash_admission_locks.clone(),
@@ -1083,6 +1104,8 @@ impl Clone for WendelonDataServer {
 			local_persistence_distrust_path: self.local_persistence_distrust_path.clone(),
 			#[cfg(test)]
 			fail_next_local_durable_append: self.fail_next_local_durable_append.clone(),
+			#[cfg(test)]
+			delay_next_local_durable_append: self.delay_next_local_durable_append.clone(),
 			hlc: self.hlc.clone(),
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
@@ -1816,6 +1839,8 @@ impl WendelonDataServer {
 		let hlc = Arc::new(HybridLogicalClockDriver::new(local_node, clock.clone()));
 		let pending_finalizations =
 			PendingFinalizationStore::open(pending_finalizations_path(slab.data_dir()))?;
+		let mutation_outcomes =
+			MutationOutcomeStore::open(mutation_outcomes_path(slab.data_dir()))?;
 		let admission_snapshot_rx = state_machine.subscribe_admission_snapshot();
 		let counter_replica = Arc::new(crate::storage::counter::CounterReplicaService::new(
 			slab.clone(),
@@ -1839,6 +1864,12 @@ impl WendelonDataServer {
 			router,
 			factory,
 			pool,
+			mutation_work_slots: Arc::new(Semaphore::new(
+				std::thread::available_parallelism()
+					.map(|parallelism| parallelism.get())
+					.unwrap_or(4),
+			)),
+			mutation_outcomes,
 			idempotency: Arc::new(DashMap::new()),
 			table_delete_idempotency: Arc::new(DashMap::new()),
 			content_hash_admission_locks: Arc::new(DashMap::new()),
@@ -1856,6 +1887,8 @@ impl WendelonDataServer {
 			local_persistence_distrust_path,
 			#[cfg(test)]
 			fail_next_local_durable_append: Arc::new(StdMutex::new(None)),
+			#[cfg(test)]
+			delay_next_local_durable_append: Arc::new(StdMutex::new(None)),
 			hlc,
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
@@ -2074,6 +2107,14 @@ impl WendelonDataServer {
 			.fail_next_local_durable_append
 			.lock()
 			.expect("local durable append failpoint poisoned") = Some((kind, message.into()));
+	}
+
+	#[cfg(test)]
+	pub(crate) fn delay_next_local_durable_append_for_test(&self, delay: Duration) {
+		*self
+			.delay_next_local_durable_append
+			.lock()
+			.expect("local durable append delay failpoint poisoned") = Some(delay);
 	}
 
 	#[cfg(test)]
@@ -2487,7 +2528,8 @@ impl WendelonDataServer {
 			echoed_write_id: record.write_id,
 			has_finalization: if record.await_finalization { 1 } else { 0 },
 			_pad2: [0; 7],
-		};
+		}
+		.with_mutation_outcome(MutationCommitKnowledge::COMMITTED, MutationStopReason::NONE);
 		let trailing = if record.await_finalization {
 			Some(marker)
 		} else {
@@ -2542,40 +2584,6 @@ impl WendelonDataServer {
 				Err(Error::other(format!("finalize commit failed: {err}")))
 			}
 		}
-	}
-
-	async fn complete_pending_finalization(
-		&self,
-		record: &PendingFinalizationRecord,
-		resolution: PendingFinalizationResolution,
-	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
-		let marker = match resolution {
-			PendingFinalizationResolution::CommittedNow(marker) => {
-				self.note_committed_write(
-					record.finalization.tenant_id,
-					record.finalization.charged_bytes,
-				);
-				marker
-			}
-			PendingFinalizationResolution::ObservedApplied(marker) => marker,
-		};
-		let (response, trailing) = self.committed_response_for(record, marker);
-		let outcome = WriteOutcome::FinalizationCommitted { response, trailing };
-		self.idempotency.insert(
-			Self::idempotency_key_for(record.write_id),
-			CachedWriteOutcome::new(outcome),
-		);
-		self.cdc_release_pending_finalization(record.id).await;
-		if let Err(err) = self.pending_finalizations.remove(record.id).await {
-			tracing::warn!(
-				pending_id = %format_bytes_hex(record.id.as_bytes()),
-				error = %err,
-				"failed to remove reconciled pending finalization"
-			);
-		} else {
-			self.refresh_pending_finalization_backlog_metric();
-		}
-		Ok((response, trailing))
 	}
 
 	fn recoverable_pending_outcome_for_record(
@@ -2671,7 +2679,7 @@ impl WendelonDataServer {
 		let result = async {
 			match self.resolve_pending_finalization(record).await {
 				Ok(resolution) => self
-					.complete_pending_finalization(record, resolution)
+					.complete_pending_finalization(record, resolution, None)
 					.await
 					.map(Some),
 				Err(err) if err.kind() == ErrorKind::WouldBlock => Ok(None),
@@ -4086,135 +4094,6 @@ impl WendelonDataServer {
 		})?;
 		let payload = crate::network::ipc::wire_decode_batch(payload_bytes)?;
 		Ok((meta, payload))
-	}
-
-	fn decode_table_delete_request_frame(
-		&self,
-		frame: &HrftFrame,
-	) -> std::io::Result<(TableDeleteRowsRequestMeta, Vec<Identity>)> {
-		if frame.meta.len() < std::mem::size_of::<TableDeleteRowsRequestMeta>() {
-			return Err(Error::new(
-				ErrorKind::InvalidData,
-				"TABLE_DELETE_REQ meta too small",
-			));
-		}
-		let meta: TableDeleteRowsRequestMeta =
-			*bytemuck::from_bytes(&frame.meta[..std::mem::size_of::<TableDeleteRowsRequestMeta>()]);
-		let payload_bytes = frame.arrow_payload.as_ref().ok_or_else(|| {
-			Error::new(
-				ErrorKind::InvalidData,
-				"TABLE_DELETE_REQ missing Arrow payload",
-			)
-		})?;
-		let payload = crate::network::ipc::wire_decode_batch(payload_bytes)?;
-		let row_key_ids = decode_table_delete_rows_batch(&meta, &payload)?;
-		Ok((meta, row_key_ids))
-	}
-
-	fn build_write_response_frame(
-		&self,
-		msg_type: MsgType,
-		stream_id: u32,
-		resp: WriteResponseMeta,
-		trailing: Option<FinalizationMarker>,
-	) -> HrftFrame {
-		let mut meta_buf = self.pool.acquire();
-		meta_buf
-			.as_mut_vec()
-			.extend_from_slice(bytemuck::bytes_of(&resp));
-		let trailing = trailing.map(|marker| {
-			let mut buf = self.pool.acquire();
-			buf.as_mut_vec()
-				.extend_from_slice(bytemuck::bytes_of(&marker));
-			buf
-		});
-		let trailing_len = trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0);
-
-		HrftFrame {
-			header: FrameHeader {
-				magic: HRFT_MAGIC,
-				version: 1,
-				msg_type: msg_type.0,
-				flags: 0,
-				stream_id,
-				meta_len: meta_buf.len() as u32,
-				arrow_len: 0,
-				trailing_len,
-			},
-			meta: meta_buf,
-			arrow_payload: None,
-			trailing,
-		}
-	}
-
-	fn build_table_write_response_frame(
-		&self,
-		stream_id: u32,
-		resp: TableWriteResponseMeta,
-		trailing: Option<FinalizationMarker>,
-	) -> HrftFrame {
-		let mut meta_buf = self.pool.acquire();
-		meta_buf
-			.as_mut_vec()
-			.extend_from_slice(bytemuck::bytes_of(&resp));
-		let trailing = trailing.map(|marker| {
-			let mut buf = self.pool.acquire();
-			buf.as_mut_vec()
-				.extend_from_slice(bytemuck::bytes_of(&marker));
-			buf
-		});
-		let trailing_len = trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0);
-
-		HrftFrame {
-			header: FrameHeader {
-				magic: HRFT_MAGIC,
-				version: 1,
-				msg_type: MsgType::TABLE_WRITE_RESP.0,
-				flags: 0,
-				stream_id,
-				meta_len: meta_buf.len() as u32,
-				arrow_len: 0,
-				trailing_len,
-			},
-			meta: meta_buf,
-			arrow_payload: None,
-			trailing,
-		}
-	}
-
-	fn build_table_delete_response_frame(
-		&self,
-		stream_id: u32,
-		resp: TableDeleteRowsResponseMeta,
-		trailing: Option<FinalizationMarker>,
-	) -> HrftFrame {
-		let mut meta_buf = self.pool.acquire();
-		meta_buf
-			.as_mut_vec()
-			.extend_from_slice(bytemuck::bytes_of(&resp));
-		let trailing = trailing.map(|marker| {
-			let mut buf = self.pool.acquire();
-			buf.as_mut_vec()
-				.extend_from_slice(bytemuck::bytes_of(&marker));
-			buf
-		});
-		let trailing_len = trailing.as_ref().map(|buf| buf.len() as u32).unwrap_or(0);
-
-		HrftFrame {
-			header: FrameHeader {
-				magic: HRFT_MAGIC,
-				version: 1,
-				msg_type: MsgType::TABLE_DELETE_RESP.0,
-				flags: 0,
-				stream_id,
-				meta_len: meta_buf.len() as u32,
-				arrow_len: 0,
-				trailing_len,
-			},
-			meta: meta_buf,
-			arrow_payload: None,
-			trailing,
-		}
 	}
 
 	fn authorize_actor_for_data(
@@ -6478,6 +6357,7 @@ impl DataRingServer for WendelonDataServer {
 							WriteStatus::BACKPRESSURED,
 							PbcRejectCode::NONE,
 						);
+						let resp = self.finalize_table_write_attempt(meta, resp).await?;
 						return Ok(Some(self.build_table_write_response_frame(
 							frame.header.stream_id,
 							resp,
@@ -6530,6 +6410,7 @@ impl DataRingServer for WendelonDataServer {
 							WriteStatus::BACKPRESSURED,
 							PbcRejectCode::NONE,
 						);
+						let resp = self.finalize_table_delete_attempt(meta, resp).await?;
 						return Ok(Some(self.build_table_delete_response_frame(
 							frame.header.stream_id,
 							resp,
@@ -6540,6 +6421,34 @@ impl DataRingServer for WendelonDataServer {
 				self.handle_table_delete(&context.actor, frame)
 					.await
 					.map(Some)
+			}
+			MsgType::MUTATION_OUTCOME_REQ => {
+				if frame.meta.len() != std::mem::size_of::<MutationOutcomeRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"MUTATION_OUTCOME_REQ meta width mismatch",
+					));
+				}
+				let meta: MutationOutcomeRequestMeta = *bytemuck::from_bytes(&frame.meta);
+				self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Read,
+				)?;
+				let _admission = self
+					.try_admit_data_request(
+						&context.actor,
+						Some(meta.tenant_id),
+						DataOperation::Read,
+					)?
+					.map_err(|_| {
+						Error::new(ErrorKind::WouldBlock, "mutation resolution backpressured")
+					})?;
+				let response = self.resolve_mutation_outcome(meta).await?;
+				Ok(Some(self.build_mutation_outcome_response_frame(
+					frame.header.stream_id,
+					response,
+				)))
 			}
 			MsgType::TABLE_REPLICATE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
@@ -8079,7 +7988,17 @@ impl WendelonDataServer {
 				let key_identity = bifurcated.key_identity;
 				#[cfg(test)]
 				let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
+				#[cfg(test)]
+				let delay_local_durable_append = self
+					.delay_next_local_durable_append
+					.lock()
+					.expect("local durable append delay failpoint poisoned")
+					.take();
 				Some(tokio::spawn(async move {
+					#[cfg(test)]
+					if let Some(delay) = delay_local_durable_append {
+						tokio::time::sleep(delay).await;
+					}
 					#[cfg(test)]
 					if let Some((kind, message)) = fail_next_local_durable_append
 						.lock()
@@ -8188,7 +8107,7 @@ impl WendelonDataServer {
 			match self.resolve_pending_finalization(&pending).await {
 				Ok(resolution) => {
 					let committed = self
-						.complete_pending_finalization(&pending, resolution)
+						.complete_pending_finalization(&pending, resolution, None)
 						.await
 						.map(|(response, trailing)| self.counted_write_result(response, trailing));
 					self.trip_local_persistence_distrust(format!(
@@ -8218,7 +8137,7 @@ impl WendelonDataServer {
 
 		match self.resolve_pending_finalization(&pending).await {
 			Ok(resolution) => self
-				.complete_pending_finalization(&pending, resolution)
+				.complete_pending_finalization(&pending, resolution, None)
 				.await
 				.map(|(response, trailing)| self.counted_write_result(response, trailing)),
 			Err(err) => {
@@ -8296,6 +8215,9 @@ impl WendelonDataServer {
 		commit_hlc: HybridTimestamp,
 		is_append_only: bool,
 		secondary_index_descriptors: Vec<SecondaryIndexDescriptor>,
+		delete_counts: Option<[u32; 3]>,
+		mut clocks: WriteClocks,
+		permit: OwnedSemaphorePermit,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		let mut synthetic = table_write_synthetic_meta(
 			&meta,
@@ -8303,6 +8225,30 @@ impl WendelonDataServer {
 			bifurcated.charged_bytes,
 		);
 		let key = Self::idempotency_key_for(meta.parent_write_id);
+		if let Some(replayed) = self.durable_mutation_replay(&meta).await? {
+			return Ok(replayed);
+		}
+		let mut mutation_permit = Some(permit);
+		// Admission and batch construction happen before this helper. They are finite but
+		// synchronous, so re-check both clocks before any durable work begins. The permit
+		// was acquired before that work and bounds how many such indivisible admissions
+		// can exist node-wide; an overrun here is still known-not-committed.
+		if let Some(expiry) = clocks.expired() {
+			let response = mutation_expiry_response(
+				&synthetic,
+				expiry,
+				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+			);
+			self.record_mutation_outcome(
+				meta.parent_write_id,
+				meta.tenant_id,
+				response,
+				None,
+				delete_counts,
+			)
+			.await?;
+			return Ok((response, None));
+		}
 
 		let lease_gate_is_primary_for_all_groups = if self.lease_gate_enabled {
 			groups.iter().all(|group| {
@@ -8422,42 +8368,59 @@ impl WendelonDataServer {
 			.filter(|(_index, group)| group.replicas.iter().any(|n| n.id == self.local_node.id))
 			.map(|(index, group)| (index, group.children.clone()))
 			.collect::<Vec<_>>();
-		let mut local_durable_task: Option<JoinHandle<std::io::Result<Vec<usize>>>> =
-			if local_groups.is_empty() {
-				None
-			} else {
-				let slab = self.slab.clone();
-				let tenant_id = meta.tenant_id;
-				let secondary_index_descriptors = secondary_index_descriptors.clone();
+		let (mut local_durable_task, mut local_progress_rx): (
+			Option<JoinHandle<std::io::Result<()>>>,
+			Option<mpsc::UnboundedReceiver<usize>>,
+		) = if local_groups.is_empty() {
+			(None, None)
+		} else {
+			let (local_progress_tx, local_progress_rx) = mpsc::unbounded_channel();
+			let mutation_permit = mutation_permit
+				.take()
+				.expect("one mutation permit exists before local durable spawn");
+			let slab = self.slab.clone();
+			let tenant_id = meta.tenant_id;
+			let secondary_index_descriptors = secondary_index_descriptors.clone();
+			#[cfg(test)]
+			let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
+			#[cfg(test)]
+			let delay_local_durable_append = self
+				.delay_next_local_durable_append
+				.lock()
+				.expect("local durable append delay failpoint poisoned")
+				.take();
+			let task = tokio::spawn(async move {
+				let _mutation_permit = mutation_permit;
 				#[cfg(test)]
-				let fail_next_local_durable_append = self.fail_next_local_durable_append.clone();
-				Some(tokio::spawn(async move {
-					#[cfg(test)]
-					if let Some((kind, message)) = fail_next_local_durable_append
-						.lock()
-						.expect("local durable append failpoint poisoned")
-						.take()
-					{
-						return Err(Error::new(
-							kind,
-							format!("injected local durable append failure: {message}"),
-						));
-					}
-					let mut completed = Vec::with_capacity(local_groups.len());
-					for (index, children) in local_groups {
-						append_bifurcated_table_children_durable(
-							&slab,
-							tenant_id,
-							commit_hlc,
-							&children,
-							&secondary_index_descriptors,
-						)
-						.await?;
-						completed.push(index);
-					}
-					Ok(completed)
-				}))
-			};
+				if let Some(delay) = delay_local_durable_append {
+					tokio::time::sleep(delay).await;
+				}
+				#[cfg(test)]
+				if let Some((kind, message)) = fail_next_local_durable_append
+					.lock()
+					.expect("local durable append failpoint poisoned")
+					.take()
+				{
+					return Err(Error::new(
+						kind,
+						format!("injected local durable append failure: {message}"),
+					));
+				}
+				for (index, children) in local_groups {
+					append_bifurcated_table_children_durable(
+						&slab,
+						tenant_id,
+						commit_hlc,
+						&children,
+						&secondary_index_descriptors,
+					)
+					.await?;
+					let _ = local_progress_tx.send(index);
+				}
+				Ok(())
+			});
+			(Some(task), Some(local_progress_rx))
+		};
 		let mut join: JoinSet<std::io::Result<(usize, ReplicaAckLevel)>> = JoinSet::new();
 		for (group_index, group) in groups.iter().enumerate() {
 			let replica_payload = Arc::new(encode_table_replica_children(&group.children)?);
@@ -8487,19 +8450,46 @@ impl WendelonDataServer {
 			.iter()
 			.all(DurableQuorumTracker::is_satisfied)
 		{
+			let (wait, expiry) = clocks.next_expiry();
 			tokio::select! {
-				local = async {
+				_ = tokio::time::sleep(wait) => {
+					let response = mutation_expiry_response(
+						&synthetic,
+						expiry,
+						MutationCommitKnowledge::INDETERMINATE,
+					);
+					self.record_mutation_outcome(
+						meta.parent_write_id,
+						meta.tenant_id,
+						response,
+						None,
+						delete_counts,
+					)
+						.await?;
+					return Ok((response, None));
+				}
+				local_progress = async {
+					match local_progress_rx.as_mut() {
+						Some(receiver) => receiver.recv().await,
+						None => None,
+					}
+				}, if local_progress_rx.is_some() => {
+					match local_progress {
+						Some(index) => {
+							quorum_trackers[index].note_local_durable();
+							clocks.progressed();
+						}
+						None => local_progress_rx = None,
+					}
+				}
+				local_done = async {
 					match local_durable_task.as_mut() {
 						Some(task) => Some(task.await),
 						None => None,
 					}
 				}, if local_durable_task.is_some() => {
-					match local {
-						Some(Ok(Ok(completed))) => {
-							for index in completed {
-								quorum_trackers[index].note_local_durable();
-							}
-						}
+					match local_done {
+						Some(Ok(Ok(()))) => {}
 						Some(Ok(Err(err))) => {
 							self.trip_local_persistence_distrust(format!(
 								"local table durable append returned error: {err}"
@@ -8522,6 +8512,9 @@ impl WendelonDataServer {
 					match remote {
 						Some(Ok(Ok((index, level)))) => {
 							quorum_trackers[index].note_remote_ack(level);
+							if level == ReplicaAckLevel::DURABLE {
+								clocks.progressed();
+							}
 						}
 						Some(_) => { /* leg failed — keep racing */ }
 						None => {}
@@ -8558,7 +8551,11 @@ impl WendelonDataServer {
 			.ok_or_else(|| {
 				Error::other("pending finalization for this table write is already being processed")
 			})?;
-		if let Err(err) = self.pending_finalizations.upsert(pending.clone()).await {
+		if let Err(err) = self
+			.pending_finalizations
+			.upsert_with_delete_counts(pending.clone(), delete_counts)
+			.await
+		{
 			let cdc_staged = self
 				.stage_cdc_table_children(
 					meta.tenant_id,
@@ -8582,7 +8579,7 @@ impl WendelonDataServer {
 			match self.resolve_pending_finalization(&pending).await {
 				Ok(resolution) => {
 					let committed = self
-						.complete_pending_finalization(&pending, resolution)
+						.complete_pending_finalization(&pending, resolution, delete_counts)
 						.await
 						.map(|(response, trailing)| self.counted_write_result(response, trailing));
 					self.trip_local_persistence_distrust(format!(
@@ -8626,7 +8623,7 @@ impl WendelonDataServer {
 
 		match self.resolve_pending_finalization(&pending).await {
 			Ok(resolution) => self
-				.complete_pending_finalization(&pending, resolution)
+				.complete_pending_finalization(&pending, resolution, delete_counts)
 				.await
 				.map(|(response, trailing)| self.counted_write_result(response, trailing)),
 			Err(err) => {
@@ -8687,6 +8684,29 @@ impl WendelonDataServer {
 			let (write, trailing) = self.replay_write_outcome(cached.outcome()).await?;
 			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
 		}
+		if let Some((write, trailing)) = self.durable_mutation_replay(&meta).await? {
+			return Ok((table_write_response(write, PbcRejectCode::NONE), trailing));
+		}
+		let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
+		if let Some(expiry) = clocks.expired() {
+			let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
+			let write = mutation_expiry_response(
+				&synthetic,
+				expiry,
+				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+			);
+			self.record_mutation_outcome(meta.parent_write_id, meta.tenant_id, write, None, None)
+				.await?;
+			return Ok((table_write_response(write, PbcRejectCode::NONE), None));
+		}
+		// Bound the entire admitted mutation, including synchronous bifurcation and
+		// encoding—not only the later replica phase. A row-capped batch can still be
+		// expensive in bytes, and admitting it outside this pool would recreate the
+		// abandoned-work accumulation Decision 6 forbids.
+		let mutation_permit = match self.acquire_table_mutation_permit(&meta, clocks).await? {
+			Ok(permit) => permit,
+			Err(response) => return Ok(response),
+		};
 
 		if self.degraded_reason().is_some() {
 			let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
@@ -8864,6 +8884,8 @@ impl WendelonDataServer {
 				key,
 				CachedWriteOutcome::new(WriteOutcome::NoopCommitted { response: write }),
 			);
+			self.record_mutation_outcome(meta.parent_write_id, meta.tenant_id, write, None, None)
+				.await?;
 			return Ok((table_write_response(write, PbcRejectCode::NONE), None));
 		};
 		let Some(groups) = self.table_batch_replica_groups(&bifurcated.children) else {
@@ -8890,6 +8912,9 @@ impl WendelonDataServer {
 				commit_hlc,
 				is_append_only,
 				secondary_index_descriptors,
+				None,
+				clocks,
+				mutation_permit,
 			)
 			.await?;
 		if matches!(
@@ -9136,6 +9161,34 @@ impl WendelonDataServer {
 		{
 			return Ok((cached.response, cached.trailing));
 		}
+		if let Some(replayed) = self.durable_delete_replay(&meta).await? {
+			return Ok(replayed);
+		}
+		let clocks = WriteClocks::from_remaining_millis(meta.deadline_remaining_millis);
+		if let Some(expiry) = clocks.expired() {
+			let synthetic = table_delete_synthetic_write_meta(&meta, Identity::ZERO, 0);
+			let write = mutation_expiry_response(
+				&synthetic,
+				expiry,
+				MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+			);
+			self.record_mutation_outcome(
+				meta.parent_write_id,
+				meta.tenant_id,
+				write,
+				None,
+				Some([0; 3]),
+			)
+			.await?;
+			return Ok((
+				table_delete_rows_response(write, 0, 0, 0, PbcRejectCode::NONE),
+				None,
+			));
+		}
+		let mutation_permit = match self.acquire_delete_mutation_permit(&meta, clocks).await? {
+			Ok(permit) => permit,
+			Err(response) => return Ok(response),
+		};
 
 		if self.degraded_reason().is_some() {
 			let synthetic = table_delete_synthetic_write_meta(&meta, Identity::ZERO, 0);
@@ -9316,6 +9369,14 @@ impl WendelonDataServer {
 					trailing: None,
 				},
 			);
+			self.record_mutation_outcome(
+				meta.parent_write_id,
+				meta.tenant_id,
+				write,
+				None,
+				Some([deleted_count, already_deleted_count, not_found_count]),
+			)
+			.await?;
 			return Ok((response, None));
 		}
 
@@ -9379,6 +9440,9 @@ impl WendelonDataServer {
 				delete_hlc,
 				false,
 				Vec::new(),
+				Some([deleted_count, already_deleted_count, not_found_count]),
+				clocks,
+				mutation_permit,
 			)
 			.await?;
 		let response = table_delete_rows_response(
@@ -9399,6 +9463,14 @@ impl WendelonDataServer {
 		}
 		self.table_delete_idempotency
 			.insert(key, CachedTableDeleteOutcome { response, trailing });
+		self.record_mutation_outcome(
+			meta.parent_write_id,
+			meta.tenant_id,
+			write,
+			trailing,
+			Some([deleted_count, already_deleted_count, not_found_count]),
+		)
+		.await?;
 		Ok((response, trailing))
 	}
 }
@@ -13936,6 +14008,7 @@ fn table_delete_synthetic_table_write_meta(
 		durability: meta.durability,
 		await_finalization: meta.await_finalization,
 		_pad: [0; 3],
+		deadline_remaining_millis: meta.deadline_remaining_millis,
 	})
 }
 
@@ -13956,6 +14029,7 @@ fn table_delete_noop_write_response(
 		has_finalization: 0,
 		_pad2: [0; 7],
 	}
+	.with_mutation_outcome(MutationCommitKnowledge::COMMITTED, MutationStopReason::NONE)
 }
 
 fn table_write_noop_write_response(
@@ -13975,6 +14049,7 @@ fn table_write_noop_write_response(
 		has_finalization: 0,
 		_pad2: [0; 7],
 	}
+	.with_mutation_outcome(MutationCommitKnowledge::COMMITTED, MutationStopReason::NONE)
 }
 
 fn observe_content_hash_admission_metrics(

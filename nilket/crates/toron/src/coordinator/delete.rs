@@ -223,6 +223,13 @@ mod tests {
 				row_key_ids: Vec::new(),
 				profile_hint: None,
 				trace_context: None,
+				operation_id: wendelon::schema::ClientWriteId {
+					client_uuid: [0; 16],
+					sequence_no: 0,
+					idempotency_ttl_ms: 60_000,
+					_pad: 0,
+				},
+				deadline: None,
 			},
 		)
 		.await
@@ -251,6 +258,8 @@ mod tests {
 				payload: batch(),
 				profile_hint: None,
 				trace_context: None,
+				operation_id: None,
+				deadline: None,
 			})
 			.await
 			.expect("write rows");

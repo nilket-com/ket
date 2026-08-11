@@ -21,7 +21,10 @@ use toron::server::ToronWorker;
 use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
-use toron::storage::{HlcBound, InMemoryTableStorage, StorageWrite, TenantId, WriteRequest};
+use toron::storage::{
+	HlcBound, InMemoryTableStorage, MutationResolution, ResolvedMutationOutcome, StorageWrite,
+	TenantId, WriteRequest,
+};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor,
@@ -56,6 +59,63 @@ async fn distributed_insert_values_writes_without_dispatch() {
 	let rows =
 		people_rows(query(catalog, storage, "SELECT id, name FROM people ORDER BY id").await);
 	assert_eq!(rows, vec![(1, "Ada".to_string()), (2, "Grace".to_string())]);
+}
+
+#[tokio::test]
+async fn mutation_resolution_uses_authenticated_tenant_and_original_query_identity() {
+	let operation_query_id = QueryId::new();
+	let coordinator = DistributedQueryCoordinator::with_writer(
+		Arc::new(catalog_with_tables([])),
+		Arc::new(StaticWorkerRegistry::new([])),
+		Arc::new(MemoryManager::new(1, 1024)),
+		Arc::new(FailingTransport),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+		Arc::new(ResolvingWrite {
+			expected_tenant: TenantId(41),
+			expected_uuid: *operation_query_id.get().as_bytes(),
+		}),
+	);
+
+	let outcome = coordinator
+		.resolve_mutation_outcome(TenantId(41), operation_query_id)
+		.await
+		.expect("resolve mutation without replay");
+	assert_eq!(outcome.resolution, MutationResolution::Present);
+	assert_eq!(outcome.stop_reason, 1);
+	assert_eq!(outcome.commit_knowledge, 3);
+}
+
+struct ResolvingWrite {
+	expected_tenant: TenantId,
+	expected_uuid: [u8; 16],
+}
+
+#[async_trait::async_trait]
+impl StorageWrite for ResolvingWrite {
+	async fn write(
+		&self,
+		_request: WriteRequest,
+	) -> Result<toron::storage::WriteOutcome, toron::error::StorageError> {
+		panic!("resolution must not resubmit the mutation")
+	}
+
+	async fn resolve_mutation(
+		&self,
+		tenant_id: TenantId,
+		operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<ResolvedMutationOutcome, toron::error::StorageError> {
+		assert_eq!(tenant_id, self.expected_tenant);
+		assert_eq!(operation_id.client_uuid, self.expected_uuid);
+		assert_eq!(operation_id.sequence_no, 0);
+		Ok(ResolvedMutationOutcome {
+			resolution: MutationResolution::Present,
+			write_status: 19,
+			stop_reason: 1,
+			commit_knowledge: 3,
+			delete_counts: None,
+		})
+	}
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -253,6 +313,8 @@ async fn seed_people(catalog: &MockCatalog, storage: &InMemoryTableStorage, tabl
 			payload: people_batch(),
 			profile_hint: None,
 			trace_context: None,
+			operation_id: None,
+			deadline: None,
 		})
 		.await
 		.expect("seed people");

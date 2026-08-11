@@ -167,6 +167,8 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::TABLE_QUERY_CANCEL_RESP.0
 				|| x == MsgType::TABLE_DELETE_REQ.0
 				|| x == MsgType::TABLE_DELETE_RESP.0
+				|| x == MsgType::MUTATION_OUTCOME_REQ.0
+				|| x == MsgType::MUTATION_OUTCOME_RESP.0
 				|| x == MsgType::AGG_REQ.0
 				|| x == MsgType::AGG_RESP.0
 				|| x == MsgType::COUNTER_ADD_REQ.0
@@ -395,8 +397,8 @@ fn unhandled(ring: &'static str, msg_type: u8) -> Error {
 #[cfg(test)]
 mod tests {
 	use super::{
-		ACTOR_AUTHORIZED_CONTROL_REQUESTS, ControlRingServer, MsgRouterBuilder, enforce_ingress,
-		ingress_requirement, is_control_extension_request, is_extension_response,
+		ACTOR_AUTHORIZED_CONTROL_REQUESTS, ControlRingServer, DataRingServer, MsgRouterBuilder,
+		enforce_ingress, ingress_requirement, is_control_extension_request, is_extension_response,
 	};
 	use crate::network::core::{HRFT_MAGIC, HrftFrame};
 	use crate::network::server::{HrftService, RequestContext};
@@ -541,6 +543,19 @@ mod tests {
 	}
 
 	struct CountingControl(AtomicUsize);
+	struct CountingData(AtomicUsize);
+
+	#[async_trait]
+	impl DataRingServer for CountingData {
+		async fn handle_data_frame(
+			&self,
+			_context: RequestContext,
+			_frame: HrftFrame,
+		) -> std::io::Result<Option<HrftFrame>> {
+			self.0.fetch_add(1, Ordering::Relaxed);
+			Ok(None)
+		}
+	}
 
 	#[async_trait]
 	impl ControlRingServer for CountingControl {
@@ -568,5 +583,23 @@ mod tests {
 			.await
 			.unwrap();
 		assert_eq!(control.0.load(Ordering::Relaxed), 1);
+	}
+
+	#[tokio::test]
+	async fn mutation_outcome_resolution_routes_to_data_ring_and_stays_node_only() {
+		let data = Arc::new(CountingData(AtomicUsize::new(0)));
+		let router = MsgRouterBuilder::default()
+			.with_data_ring(data.clone())
+			.build();
+		router
+			.handle_frame(node_context(7), frame(MsgType::MUTATION_OUTCOME_REQ))
+			.await
+			.unwrap();
+		assert_eq!(data.0.load(Ordering::Relaxed), 1);
+		let error = router
+			.handle_frame(operator_context(), frame(MsgType::MUTATION_OUTCOME_REQ))
+			.await
+			.unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 	}
 }

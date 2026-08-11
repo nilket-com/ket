@@ -24803,6 +24803,8 @@ async fn write_star_order_table(
 			payload,
 			profile_hint: Some(QueryProfileHint::Scan),
 			trace_context: None,
+			operation_id: None,
+			deadline: None,
 		})
 		.await
 		.expect("write star order fixture");

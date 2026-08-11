@@ -841,6 +841,8 @@ async fn seed_sales_storage(catalog: &MockCatalog, storage: &InMemoryTableStorag
 			payload: sales_batch(),
 			profile_hint: None,
 			trace_context: None,
+			operation_id: None,
+			deadline: None,
 		})
 		.await
 		.expect("seed sales storage");

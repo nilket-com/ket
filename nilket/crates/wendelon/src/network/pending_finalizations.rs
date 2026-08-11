@@ -13,6 +13,12 @@ const PENDING_FINALIZATIONS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("pending_finalizations_v1");
 const PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("pending_finalizations_by_write_id_v1");
+// Sidecar rather than a field on `PendingFinalizationRecord`: postcard encodes that
+// record positionally, so widening it would make pre-ADR-542 pending witnesses
+// unreadable. Presence means the parent mutation is DELETE; the twelve bytes are its
+// three exact row-count outcomes in little-endian order.
+const PENDING_FINALIZATION_DELETE_COUNTS_TABLE: TableDefinition<&[u8], &[u8]> =
+	TableDefinition::new("pending_finalization_delete_counts_v1");
 // Secondary-index key shape: canonical idempotency bytes only
 // (`client_uuid` + `sequence_no`), per the contract documented at
 // `src/schema/core.rs`. `idempotency_ttl_ms` and `_pad` are not
@@ -114,6 +120,11 @@ impl PendingFinalizationStore {
 		{
 			let _table = write_txn
 				.open_table(PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE)
+				.map_err(redb_to_io)?;
+		}
+		{
+			let _table = write_txn
+				.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
 				.map_err(redb_to_io)?;
 		}
 		let mut initial_count = 0u64;
@@ -238,6 +249,14 @@ impl PendingFinalizationStore {
 	}
 
 	pub async fn upsert(&self, record: PendingFinalizationRecord) -> std::io::Result<()> {
+		self.upsert_with_delete_counts(record, None).await
+	}
+
+	pub async fn upsert_with_delete_counts(
+		&self,
+		record: PendingFinalizationRecord,
+		delete_counts: Option<[u32; 3]>,
+	) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
 		#[cfg(test)]
 		if let Some(message) = self
@@ -273,6 +292,15 @@ impl PendingFinalizationStore {
 				by_write_id
 					.insert(write_key.as_slice(), &record.id.as_bytes()[..])
 					.map_err(redb_to_io)?;
+				if let Some(delete_counts) = delete_counts {
+					let encoded_counts = encode_delete_counts(delete_counts);
+					let mut contexts = write_txn
+						.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
+						.map_err(redb_to_io)?;
+					contexts
+						.insert(&record.id.as_bytes()[..], encoded_counts.as_slice())
+						.map_err(redb_to_io)?;
+				}
 				!existed
 			};
 			write_txn.commit().map_err(redb_to_io)?;
@@ -283,6 +311,24 @@ impl PendingFinalizationStore {
 			self.count.fetch_add(1, Ordering::Relaxed);
 		}
 		Ok(())
+	}
+
+	pub async fn delete_counts(
+		&self,
+		id: PendingFinalizationId,
+	) -> std::io::Result<Option<[u32; 3]>> {
+		let db = self.db.clone();
+		spawn_blocking_io(move || {
+			let read_txn = db.begin_read().map_err(redb_to_io)?;
+			let table = read_txn
+				.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
+				.map_err(redb_to_io)?;
+			let Some(value) = table.get(&id.as_bytes()[..]).map_err(redb_to_io)? else {
+				return Ok(None);
+			};
+			decode_delete_counts(value.value()).map(Some)
+		})
+		.await
 	}
 
 	pub async fn remove(&self, id: PendingFinalizationId) -> std::io::Result<()> {
@@ -341,6 +387,10 @@ impl PendingFinalizationStore {
 						}
 					}
 				}
+				let mut contexts = write_txn
+					.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
+					.map_err(redb_to_io)?;
+				let _ = contexts.remove(&id.as_bytes()[..]).map_err(redb_to_io)?;
 				removed_any
 			};
 			write_txn.commit().map_err(redb_to_io)?;
@@ -396,6 +446,31 @@ fn decode_pending_finalization_record(bytes: &[u8]) -> std::io::Result<PendingFi
 
 fn encode_write_id_key(write_id: ClientWriteId) -> [u8; WRITE_ID_KEY_LEN] {
 	write_id.canonical_idempotency_bytes()
+}
+
+fn encode_delete_counts(counts: [u32; 3]) -> [u8; 12] {
+	let mut encoded = [0u8; 12];
+	for (slot, count) in encoded.chunks_exact_mut(4).zip(counts) {
+		slot.copy_from_slice(&count.to_le_bytes());
+	}
+	encoded
+}
+
+fn decode_delete_counts(encoded: &[u8]) -> std::io::Result<[u32; 3]> {
+	if encoded.len() != 12 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"pending finalization delete-count width mismatch: expected=12 actual={}",
+				encoded.len()
+			),
+		));
+	}
+	let mut counts = [0u32; 3];
+	for (count, slot) in counts.iter_mut().zip(encoded.chunks_exact(4)) {
+		*count = u32::from_le_bytes(slot.try_into().expect("four-byte count chunk"));
+	}
+	Ok(counts)
 }
 
 fn pending_store_registry() -> &'static StdMutex<HashMap<PathBuf, Weak<PendingFinalizationStore>>> {
@@ -475,6 +550,29 @@ mod tests {
 				.unwrap()
 				.is_none()
 		);
+	}
+
+	#[tokio::test]
+	async fn delete_context_is_a_durable_sidecar_and_reclaims_with_its_witness() {
+		let path = temp_path("delete-context");
+		let record = record();
+		let counts = [7, 11, 13];
+		{
+			let store = PendingFinalizationStore::open(path.clone()).unwrap();
+			store
+				.upsert_with_delete_counts(record.clone(), Some(counts))
+				.await
+				.unwrap();
+			assert_eq!(store.delete_counts(record.id).await.unwrap(), Some(counts));
+		}
+
+		let reopened = PendingFinalizationStore::open(path).unwrap();
+		assert_eq!(
+			reopened.delete_counts(record.id).await.unwrap(),
+			Some(counts)
+		);
+		reopened.remove(record.id).await.unwrap();
+		assert_eq!(reopened.delete_counts(record.id).await.unwrap(), None);
 	}
 
 	#[tokio::test]

@@ -6,6 +6,7 @@ pub mod data_server;
 pub mod factory;
 pub mod ipc;
 pub mod lease_signing;
+pub(crate) mod mutation_outcomes;
 pub mod pending_finalizations;
 pub mod pool;
 pub mod quic_transport;

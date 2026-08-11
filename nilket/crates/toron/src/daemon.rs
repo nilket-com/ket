@@ -60,7 +60,8 @@ use crate::server::transport::QuicTransport;
 use crate::server::{ToronWorker, memory::MemoryManager};
 use crate::sql_planner::SqlPlanner;
 use crate::sql_wire::{
-	Complete, ResultBatch, RuneCapability, RuneFailure, RuneFailureKind,
+	Complete, MutationCommitKnowledge, MutationOutcomeResponse, MutationResolution,
+	MutationStopReason, ResultBatch, RuneCapability, RuneFailure, RuneFailureKind,
 	RuneLanguageSurfaceVersion, RuneRequestProtocolVersion, RuneSandboxContractVersion,
 	RuneSandboxViolation as PublicRuneSandboxViolation, RuneSourceSpan, RuneVersionAxis,
 	RuneVersionSkew, SqlError, SqlErrorCode, SqlFrame, SqlMessage, read_request_frame_bounded,
@@ -980,6 +981,40 @@ async fn handle_sql_connection(
 			write_sql_frame(&mut stream, &response).await?;
 			stream.finish().await?;
 		}
+		SqlMessage::ResolveMutation(request) => {
+			let outcome = match coordinator
+				.resolve_mutation_outcome(tenant_id, request.operation_query_id)
+				.await
+			{
+				Ok(outcome) => outcome,
+				Err(error) => {
+					return write_sql_error(
+						&mut stream,
+						frame.query_id,
+						SqlErrorCode::StorageError,
+						error.to_string(),
+					)
+					.await;
+				}
+			};
+			let response = SqlFrame::response(
+				frame.query_id,
+				SqlMessage::MutationOutcome(MutationOutcomeResponse {
+					operation_query_id: request.operation_query_id,
+					resolution: match outcome.resolution {
+						crate::storage::MutationResolution::Present => MutationResolution::Present,
+						crate::storage::MutationResolution::Expired => MutationResolution::Expired,
+						crate::storage::MutationResolution::Unknown => MutationResolution::Unknown,
+					},
+					write_status: outcome.write_status,
+					stop_reason: public_mutation_stop_reason(outcome.stop_reason),
+					commit_knowledge: public_mutation_commit_knowledge(outcome.commit_knowledge),
+					delete_counts: outcome.delete_counts,
+				}),
+			);
+			write_sql_frame(&mut stream, &response).await?;
+			stream.finish().await?;
+		}
 		SqlMessage::Execute(request) => {
 			let query_started = std::time::Instant::now();
 			let session_id = new_sql_session_id();
@@ -1683,7 +1718,8 @@ async fn handle_sql_connection(
 		| SqlMessage::Complete(_)
 		| SqlMessage::Error(_)
 		| SqlMessage::RuneError(_)
-		| SqlMessage::Healthy(_) => {
+		| SqlMessage::Healthy(_)
+		| SqlMessage::MutationOutcome(_) => {
 			if !record_sql_audit_required_or_error(
 				&audit,
 				ToronAuditEvent::edge_denial(
@@ -1709,6 +1745,26 @@ async fn handle_sql_connection(
 	}
 
 	Ok(())
+}
+
+fn public_mutation_stop_reason(value: u8) -> MutationStopReason {
+	match value {
+		0 => MutationStopReason::None,
+		1 => MutationStopReason::Deadline,
+		2 => MutationStopReason::NoProgress,
+		3 => MutationStopReason::AttemptsExhausted,
+		other => MutationStopReason::Other(other),
+	}
+}
+
+fn public_mutation_commit_knowledge(value: u8) -> MutationCommitKnowledge {
+	match value {
+		0 => MutationCommitKnowledge::Unspecified,
+		1 => MutationCommitKnowledge::Committed,
+		2 => MutationCommitKnowledge::KnownNotCommitted,
+		3 => MutationCommitKnowledge::Indeterminate,
+		other => MutationCommitKnowledge::Other(other),
+	}
 }
 
 fn new_sql_session_id() -> SessionId {

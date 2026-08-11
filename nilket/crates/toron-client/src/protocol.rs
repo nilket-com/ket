@@ -98,6 +98,17 @@ impl SqlFrame {
 		}
 	}
 
+	/// Resolve a retained mutation outcome without submitting the mutation again.
+	/// The frame query id identifies this resolution exchange; the body retains the
+	/// original SQL/Rune query id that named the mutation.
+	pub const fn resolve_mutation(query_id: QueryId, operation_query_id: QueryId) -> Self {
+		Self {
+			protocol_version: SqlProtocolVersion::Current,
+			query_id,
+			message: SqlMessage::ResolveMutation(ResolveMutationRequest { operation_query_id }),
+		}
+	}
+
 	pub const fn response(query_id: QueryId, message: SqlMessage) -> Self {
 		Self {
 			protocol_version: SqlProtocolVersion::Current,
@@ -124,6 +135,8 @@ pub enum SqlMessage {
 	Healthy(HealthyResponse),
 	ExecuteRune(ExecuteRuneRequest),
 	RuneError(RuneFailure),
+	ResolveMutation(ResolveMutationRequest),
+	MutationOutcome(MutationOutcomeResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -253,6 +266,53 @@ pub struct HealthRequest;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HealthyResponse;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResolveMutationRequest {
+	pub operation_query_id: QueryId,
+}
+
+/// Whether durable evidence for this operation is still retained.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationResolution {
+	Present,
+	Expired,
+	Unknown,
+}
+
+/// Why the mutation attempt stopped. This axis is deliberately independent of
+/// [`MutationCommitKnowledge`]: a deadline can expire before or after commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationStopReason {
+	None,
+	Deadline,
+	NoProgress,
+	AttemptsExhausted,
+	Other(u8),
+}
+
+/// What the durable outcome ledger proves about the mutation's commit state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MutationCommitKnowledge {
+	Unspecified,
+	Committed,
+	KnownNotCommitted,
+	Indeterminate,
+	Other(u8),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MutationOutcomeResponse {
+	pub operation_query_id: QueryId,
+	pub resolution: MutationResolution,
+	/// Wendelon's typed write status, retained as its stable numeric code so a
+	/// newer server never has to collapse an unfamiliar status into another one.
+	pub write_status: u8,
+	pub stop_reason: MutationStopReason,
+	pub commit_knowledge: MutationCommitKnowledge,
+	/// DELETE reports deleted/already-deleted/not-found. Other mutations use None.
+	pub delete_counts: Option<[u32; 3]>,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ResultBatch {
@@ -430,5 +490,28 @@ mod tests {
 		let error_discriminant =
 			postcard::to_allocvec(&SqlMessage::RuneError(failure)).expect("encode")[0];
 		assert_eq!((request_discriminant, error_discriminant), (7, 8));
+	}
+
+	#[test]
+	fn mutation_resolution_variants_append_after_rune_without_renumbering_history() {
+		let operation_query_id = QueryId::from_u128(5);
+		let request = SqlFrame::resolve_mutation(QueryId::from_u128(6), operation_query_id);
+		let response = SqlMessage::MutationOutcome(MutationOutcomeResponse {
+			operation_query_id,
+			resolution: MutationResolution::Present,
+			write_status: 19,
+			stop_reason: MutationStopReason::Deadline,
+			commit_knowledge: MutationCommitKnowledge::Indeterminate,
+			delete_counts: None,
+		});
+		let request_discriminant = postcard::to_allocvec(&request.message).expect("encode")[0];
+		let response_discriminant = postcard::to_allocvec(&response).expect("encode")[0];
+		assert_eq!((request_discriminant, response_discriminant), (9, 10));
+
+		let encoded = postcard::to_allocvec(&response).expect("encode");
+		assert_eq!(
+			postcard::from_bytes::<SqlMessage>(&encoded).unwrap(),
+			response
+		);
 	}
 }

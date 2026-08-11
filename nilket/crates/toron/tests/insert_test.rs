@@ -1319,6 +1319,8 @@ fn write_request(binding: &TableBinding, payload: RecordBatch) -> WriteRequest {
 		payload,
 		profile_hint: None,
 		trace_context: None,
+		operation_id: None,
+		deadline: None,
 	}
 }
 

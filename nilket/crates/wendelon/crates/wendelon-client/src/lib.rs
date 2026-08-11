@@ -15,8 +15,9 @@ use tokio::sync::watch;
 use uuid::Uuid;
 use wendelon::client::{
 	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, CounterAddRequest,
-	CounterReadRequest, DATA_RETRY_BUDGET, ReadRequest, TableDeleteRowsRequest, TableQueryRequest,
-	TableWriteRequest, WendelonClient as InnerClient, WendelonClientConfig, WriteRequest,
+	CounterReadRequest, DATA_RETRY_BUDGET, MutationOutcomeRequest, ReadRequest,
+	TableDeleteRowsRequest, TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient,
+	WendelonClientConfig, WriteRequest,
 };
 use wendelon::network::control_server::{
 	CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire, TableSchemaDropResponseWire,
@@ -35,7 +36,8 @@ use wendelon::network::transport::{
 use wendelon::network::wire;
 use wendelon::schema::{
 	ClientWriteId, CounterAddRequestMeta, CounterReadRequestMeta, FinalizationMarker, FrameHeader,
-	HybridTimestamp, Identity, MsgType, NodeId, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
+	HybridTimestamp, Identity, MsgType, MutationCommitKnowledge, MutationOperationKind,
+	MutationResolutionStatus, MutationStopReason, NodeId, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
 	ReadRequestMeta, ReadStatus, TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED,
 	TableDeleteRowsRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
 	TableQueryRequestMeta, TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
@@ -136,6 +138,12 @@ pub struct WriteOptions {
 	pub durability: DurabilityClass,
 	pub await_finalization: bool,
 	pub client_hlc: Option<HybridTimestamp>,
+	/// Absolute caller deadline. The core client derives a fresh remaining duration
+	/// before every attempt; it never places this process-local instant on the wire.
+	pub deadline: Option<std::time::Instant>,
+	/// Caller-minted logical-operation identity. When absent, the SDK retains its
+	/// ordinary per-client sequence allocation for compatibility callers.
+	pub operation_id: Option<ClientWriteId>,
 }
 
 impl Default for WriteOptions {
@@ -144,6 +152,8 @@ impl Default for WriteOptions {
 			durability: DurabilityClass::QUORUM,
 			await_finalization: false,
 			client_hlc: None,
+			deadline: None,
+			operation_id: None,
 		}
 	}
 }
@@ -281,6 +291,23 @@ pub struct TableDeleteRowsReceipt {
 	pub epoch: u64,
 	pub commit_hlc: HybridTimestamp,
 	pub finalization: Option<FinalizationMarker>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResolvedMutationOutcome {
+	Present {
+		operation_id: ClientWriteId,
+		status: WriteStatus,
+		reason: MutationStopReason,
+		knowledge: MutationCommitKnowledge,
+		delete_counts: Option<[u32; 3]>,
+	},
+	Expired {
+		operation_id: ClientWriteId,
+	},
+	Unknown {
+		operation_id: ClientWriteId,
+	},
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -485,6 +512,15 @@ pub enum ClientError {
 	AuthorizationFailed,
 	#[error("write failed with status {status:?}")]
 	WriteFailed { status: WriteStatus },
+	#[error(
+		"mutation {operation_id:?} stopped with status {status:?}, reason {reason:?}, durable knowledge {knowledge:?}"
+	)]
+	MutationStopped {
+		operation_id: ClientWriteId,
+		status: WriteStatus,
+		reason: wendelon::schema::MutationStopReason,
+		knowledge: wendelon::schema::MutationCommitKnowledge,
+	},
 	#[error("table write rejected with code {reject_code:?}")]
 	TableWriteRejected { reject_code: PbcRejectCode },
 	#[error("table descriptor evolved during query")]
@@ -516,6 +552,7 @@ impl ClientError {
 			}
 			Self::AuthorizationFailed => StorageStatusKind::AuthorizationFailed,
 			Self::WriteFailed { status } => map_write_status_for_compute(*status),
+			Self::MutationStopped { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableWriteRejected { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableDescriptorEvolved { .. } => StorageStatusKind::TerminalStorageError,
 			Self::TableReferenceIntegrityFailed { .. } => StorageStatusKind::TerminalStorageError,
@@ -525,6 +562,27 @@ impl ClientError {
 			Self::QueryFailed { status } => map_read_status_for_compute(*status),
 		}
 	}
+}
+
+fn mutation_stopped_status(status: WriteStatus) -> bool {
+	matches!(
+		status,
+		WriteStatus::WRITE_DEADLINE_EXCEEDED
+			| WriteStatus::WRITE_STALLED
+			| WriteStatus::WRITE_ATTEMPTS_EXHAUSTED
+			| WriteStatus::WRITE_OPERATION_EXPIRED
+	)
+}
+
+fn validate_caller_mutation_id(operation_id: ClientWriteId) -> Result<(), ClientError> {
+	let uuid = operation_id.client_uuid;
+	if uuid[6] >> 4 == 7 && uuid[8] >> 6 == 2 {
+		return Ok(());
+	}
+	Err(ClientError::Io(std::io::Error::new(
+		std::io::ErrorKind::InvalidInput,
+		"caller-supplied mutation identity must use a UUIDv7 client_uuid",
+	)))
 }
 
 pub struct Client {
@@ -1112,14 +1170,21 @@ impl Client {
 	) -> Result<TableWriteReceipt, ClientError> {
 		let rows = payload.num_rows();
 		let sequence_no = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+		let parent_write_id = match options.operation_id {
+			Some(operation_id) => {
+				validate_caller_mutation_id(operation_id)?;
+				operation_id
+			}
+			None => ClientWriteId {
+				client_uuid: self.client_uuid,
+				sequence_no,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+		};
 		let request = TableWriteRequest {
 			meta: TableWriteRequestMeta {
-				parent_write_id: ClientWriteId {
-					client_uuid: self.client_uuid,
-					sequence_no,
-					idempotency_ttl_ms: 60_000,
-					_pad: 0,
-				},
+				parent_write_id,
 				client_hlc: options.client_hlc.unwrap_or_else(default_client_hlc),
 				expected_epoch: self.inner.epoch(),
 				tenant_id,
@@ -1132,9 +1197,11 @@ impl Client {
 				durability: options.durability,
 				await_finalization: u8::from(options.await_finalization),
 				_pad: [0; 3],
+				deadline_remaining_millis: 0,
 			},
 			descriptor: descriptor.clone(),
 			payload,
+			deadline: options.deadline,
 		};
 		let result = self.inner.table_write(request).await?;
 		if result.response.reject_code != PbcRejectCode::NONE.0 {
@@ -1164,6 +1231,12 @@ impl Client {
 				Err(ClientError::TenantUnavailable { tenant_id })
 			}
 			s if s == WriteStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
+			status if mutation_stopped_status(status) => Err(ClientError::MutationStopped {
+				operation_id: response.echoed_write_id,
+				status,
+				reason: response.mutation_stop_reason(),
+				knowledge: response.mutation_commit_knowledge(),
+			}),
 			status => Err(ClientError::WriteFailed { status }),
 		}
 	}
@@ -1183,14 +1256,21 @@ impl Client {
 			)
 		})?;
 		let sequence_no = self.next_sequence.fetch_add(1, Ordering::Relaxed);
+		let parent_write_id = match options.operation_id {
+			Some(operation_id) => {
+				validate_caller_mutation_id(operation_id)?;
+				operation_id
+			}
+			None => ClientWriteId {
+				client_uuid: self.client_uuid,
+				sequence_no,
+				idempotency_ttl_ms: 60_000,
+				_pad: 0,
+			},
+		};
 		let request = TableDeleteRowsRequest {
 			meta: TableDeleteRowsRequestMeta {
-				parent_write_id: ClientWriteId {
-					client_uuid: self.client_uuid,
-					sequence_no,
-					idempotency_ttl_ms: 60_000,
-					_pad: 0,
-				},
+				parent_write_id,
 				client_hlc: options.client_hlc.unwrap_or_else(default_client_hlc),
 				expected_epoch: self.inner.epoch(),
 				tenant_id,
@@ -1200,9 +1280,11 @@ impl Client {
 				durability: options.durability,
 				await_finalization: u8::from(options.await_finalization),
 				_pad: [0; 10],
+				deadline_remaining_millis: 0,
 			},
 			descriptor: descriptor.clone(),
 			row_key_ids,
+			deadline: options.deadline,
 		};
 		let result = self.inner.table_delete(request).await?;
 		if result.response.reject_code != PbcRejectCode::NONE.0 {
@@ -1237,8 +1319,64 @@ impl Client {
 				Err(ClientError::TenantUnavailable { tenant_id })
 			}
 			s if s == WriteStatus::AUTHORIZATION_FAILED => Err(ClientError::AuthorizationFailed),
+			status if mutation_stopped_status(status) => Err(ClientError::MutationStopped {
+				operation_id: response.echoed_write_id,
+				status,
+				reason: response.mutation_stop_reason(),
+				knowledge: response.mutation_commit_knowledge(),
+			}),
 			status => Err(ClientError::WriteFailed { status }),
 		}
+	}
+
+	/// Resolve a retained table mutation without submitting its payload again.
+	pub async fn resolve_table_mutation(
+		&self,
+		tenant_id: TenantId,
+		operation_id: ClientWriteId,
+	) -> Result<ResolvedMutationOutcome, ClientError> {
+		let result = self
+			.inner
+			.resolve_mutation_outcome(MutationOutcomeRequest {
+				tenant_id,
+				operation_id,
+			})
+			.await?;
+		let response = result.response;
+		if response.write.echoed_write_id.canonical_idempotency_bytes()
+			!= operation_id.canonical_idempotency_bytes()
+		{
+			return Err(ClientError::Io(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"mutation outcome response echoed a different operation identity",
+			)));
+		}
+		if response.resolution == MutationResolutionStatus::EXPIRED {
+			return Ok(ResolvedMutationOutcome::Expired { operation_id });
+		}
+		if response.resolution == MutationResolutionStatus::UNKNOWN {
+			return Ok(ResolvedMutationOutcome::Unknown { operation_id });
+		}
+		if response.resolution != MutationResolutionStatus::PRESENT {
+			return Err(ClientError::Io(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"unknown mutation resolution status {}",
+					response.resolution.0
+				),
+			)));
+		}
+		Ok(ResolvedMutationOutcome::Present {
+			operation_id: response.write.echoed_write_id,
+			status: response.write.status,
+			reason: response.write.mutation_stop_reason(),
+			knowledge: response.write.mutation_commit_knowledge(),
+			delete_counts: (response.operation_kind == MutationOperationKind::DELETE).then_some([
+				response.deleted_count,
+				response.already_deleted_count,
+				response.not_found_count,
+			]),
+		})
 	}
 
 	pub async fn read(
@@ -2045,6 +2183,29 @@ mod tests {
 		assert_eq!(
 			TableQueryOptions::default().trace_context,
 			TableQueryTraceContext::Absent
+		);
+	}
+
+	#[test]
+	fn caller_mutation_identity_requires_time_ordered_uuidv7_namespace() {
+		let mut valid_uuid = [0_u8; 16];
+		valid_uuid[6] = 0x70;
+		valid_uuid[8] = 0x80;
+		let valid = ClientWriteId {
+			client_uuid: valid_uuid,
+			sequence_no: 0,
+			idempotency_ttl_ms: 300_000,
+			_pad: 0,
+		};
+		assert!(validate_caller_mutation_id(valid).is_ok());
+
+		let invalid = ClientWriteId {
+			client_uuid: [4; 16],
+			..valid
+		};
+		let error = validate_caller_mutation_id(invalid).unwrap_err();
+		assert!(
+			matches!(error, ClientError::Io(ref io) if io.kind() == std::io::ErrorKind::InvalidInput)
 		);
 	}
 

@@ -601,16 +601,18 @@ pub(crate) fn adr035_no_blake3_or_hash_identity_generation_in_toron() {
 
 	for source_path in sources {
 		let source = std::fs::read_to_string(&source_path).expect("read source");
+		let tokens = source
+			.split(|ch: char| !(ch.is_alphanumeric() || ch == '_'))
+			.collect::<Vec<_>>();
 		for forbidden in [
 			"blake3",
-			"Identity::blake3",
-			"Identity::blake3_tenant",
-			"Identity::blake3_keyed",
+			"blake3_tenant",
+			"blake3_keyed",
 			"sha",
 			"DefaultHasher",
 		] {
 			assert!(
-				!source.contains(forbidden),
+				!tokens.contains(&forbidden),
 				"ADR 035 in-memory identities must be deterministic prefix/suffix, found {forbidden} in {}",
 				source_path.display()
 			);

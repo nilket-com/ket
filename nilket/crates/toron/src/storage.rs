@@ -78,6 +78,13 @@ pub struct WriteRequest {
 	pub payload: RecordBatch,
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
+	/// ADR 542: caller-minted identity for this logical mutation. Every retry carries
+	/// the same value; `None` is reserved for the explicitly-excluded CTAS path and
+	/// compatibility callers outside Toron's statement boundary.
+	pub operation_id: Option<wendelon::schema::ClientWriteId>,
+	/// ADR 542: the caller's absolute end-to-end deadline. Wendelon receives the
+	/// remaining duration on each attempt, so retries consume rather than renew it.
+	pub deadline: Option<std::time::Instant>,
 }
 
 #[derive(Debug)]
@@ -91,6 +98,29 @@ pub struct DeleteRowsRequest {
 	pub row_key_ids: Vec<Identity>,
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
+	/// ADR 542: stable caller-minted identity for the whole delete batch.
+	pub operation_id: wendelon::schema::ClientWriteId,
+	/// ADR 542: absolute end-to-end deadline shared by candidate scan and mutation.
+	pub deadline: Option<std::time::Instant>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MutationResolution {
+	Present,
+	Expired,
+	Unknown,
+}
+
+/// Storage-neutral representation of Wendelon's durable outcome. The three
+/// numeric axes remain independent so Toron never reconstructs commit knowledge
+/// from a stop status or loses a newer Wendelon code it does not yet name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResolvedMutationOutcome {
+	pub resolution: MutationResolution,
+	pub write_status: u8,
+	pub stop_reason: u8,
+	pub commit_knowledge: u8,
+	pub delete_counts: Option<[u32; 3]>,
 }
 
 #[derive(Debug)]
@@ -207,6 +237,16 @@ pub trait StorageScan: Send + Sync {
 #[async_trait::async_trait]
 pub trait StorageWrite: Send + Sync {
 	async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError>;
+
+	async fn resolve_mutation(
+		&self,
+		_tenant_id: TenantId,
+		_operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<ResolvedMutationOutcome, StorageError> {
+		Err(StorageError::Internal {
+			message: "mutation outcome resolution requires Wendelon storage".to_owned(),
+		})
+	}
 }
 
 #[async_trait::async_trait]
@@ -1084,6 +1124,8 @@ impl StorageWrite for WendelonStorageWrite {
 				request.payload,
 				wendelon_client::WriteOptions {
 					await_finalization: true,
+					deadline: request.deadline,
+					operation_id: request.operation_id,
 					..Default::default()
 				},
 			)
@@ -1091,6 +1133,49 @@ impl StorageWrite for WendelonStorageWrite {
 			.map_err(|error| map_wendelon_client_error_to_storage(request.table_id, error))?;
 
 		Ok(WriteOutcome { rows: receipt.rows })
+	}
+
+	async fn resolve_mutation(
+		&self,
+		tenant_id: TenantId,
+		operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<ResolvedMutationOutcome, StorageError> {
+		let outcome = self
+			.client
+			.resolve_table_mutation(wendelon::schema::TenantId::new(tenant_id.0), operation_id)
+			.await
+			.map_err(|error| StorageError::Internal {
+				message: format!("resolve mutation outcome: {error}"),
+			})?;
+		Ok(match outcome {
+			wendelon_client::ResolvedMutationOutcome::Present {
+				status,
+				reason,
+				knowledge,
+				delete_counts,
+				..
+			} => ResolvedMutationOutcome {
+				resolution: MutationResolution::Present,
+				write_status: status.0,
+				stop_reason: reason.0,
+				commit_knowledge: knowledge.0,
+				delete_counts,
+			},
+			wendelon_client::ResolvedMutationOutcome::Expired { .. } => ResolvedMutationOutcome {
+				resolution: MutationResolution::Expired,
+				write_status: wendelon::schema::WriteStatus::WRITE_OPERATION_EXPIRED.0,
+				stop_reason: wendelon::schema::MutationStopReason::NONE.0,
+				commit_knowledge: wendelon::schema::MutationCommitKnowledge::UNSPECIFIED.0,
+				delete_counts: None,
+			},
+			wendelon_client::ResolvedMutationOutcome::Unknown { .. } => ResolvedMutationOutcome {
+				resolution: MutationResolution::Unknown,
+				write_status: wendelon::schema::WriteStatus::WRITE_OPERATION_UNKNOWN.0,
+				stop_reason: wendelon::schema::MutationStopReason::NONE.0,
+				commit_knowledge: wendelon::schema::MutationCommitKnowledge::UNSPECIFIED.0,
+				delete_counts: None,
+			},
+		})
 	}
 }
 
@@ -1152,6 +1237,8 @@ impl StorageDeleteRows for WendelonStorageDeleteRows {
 				request.row_key_ids,
 				wendelon_client::WriteOptions {
 					await_finalization: true,
+					deadline: request.deadline,
+					operation_id: Some(request.operation_id),
 					..Default::default()
 				},
 			)
@@ -1450,6 +1537,13 @@ mod tests {
 				row_key_ids: deleted_ids.clone(),
 				profile_hint: None,
 				trace_context: None,
+				operation_id: wendelon::schema::ClientWriteId {
+					client_uuid: [0; 16],
+					sequence_no: 0,
+					idempotency_ttl_ms: 60_000,
+					_pad: 0,
+				},
+				deadline: None,
 			})
 			.await
 			.expect("delete rows");
@@ -1583,6 +1677,8 @@ mod tests {
 				payload: identity_test_batch(),
 				profile_hint: None,
 				trace_context: None,
+				operation_id: None,
+				deadline: None,
 			})
 			.await
 			.expect("write identity test batch");
@@ -1625,6 +1721,13 @@ mod tests {
 				row_key_ids,
 				profile_hint: None,
 				trace_context: None,
+				operation_id: wendelon::schema::ClientWriteId {
+					client_uuid: [0; 16],
+					sequence_no: 0,
+					idempotency_ttl_ms: 60_000,
+					_pad: 0,
+				},
+				deadline: None,
 			})
 			.await
 			.expect("delete identity rows")

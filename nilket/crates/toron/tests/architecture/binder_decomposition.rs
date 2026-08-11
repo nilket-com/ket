@@ -349,6 +349,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// the scan request carries it and every construction site fills it.
 				"crates/toron/src/storage.rs",
 				"crates/toron/src/coordinator/delete.rs",
+				// ADR 542 widens storage-write fixtures with explicit operation identity
+				// and caller deadlines; no binder behaviour changes.
+				"crates/toron/tests/distributed_write_context_test.rs",
+				"crates/toron/tests/update_test.rs",
 				// ADR 543: query-scoped shuffle leases and typed retirement widen the
 				// worker runtime after the binder-only decomposition record.
 				"crates/toron/src/distributed/cancellation.rs",

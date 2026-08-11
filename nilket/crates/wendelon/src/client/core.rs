@@ -66,10 +66,11 @@ use crate::schema::{
 	CounterReadRequestMeta, CounterReadResponseMeta, FRAME_FLAG_STREAM_END, FinalizationMarker,
 	FrameHeader, HybridTimestamp, Identity, Locality, LogicalSchemaFingerprint,
 	LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta, LogicalTypeListRequestMeta,
-	LogicalTypeListResponseMeta, MsgType, NodeId, PbcRejectCode,
-	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
-	ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN,
-	SecondaryIndexStatus, SecondaryIndexStatusRequest, StateDigest, TableDeleteRowsRequestMeta,
+	LogicalTypeListResponseMeta, MsgType, MutationOutcomeRequestMeta, MutationOutcomeResponseMeta,
+	MutationResolutionStatus, NodeId, PbcRejectCode, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
+	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexStatus,
+	SecondaryIndexStatusRequest, StateDigest, TableDeleteRowsRequestMeta,
 	TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
 	TableDescriptorListRequestMeta, TableDescriptorListResponseMeta, TableObjectId,
 	TableOptimizerFacts, TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
@@ -110,6 +111,28 @@ pub const FINALIZATION_RETRY_BACKOFF: Duration = Duration::from_millis(40);
 pub const LEASE_REFRESH_RETRY_BACKOFF: Duration = Duration::from_millis(25);
 /// Small pause before retrying a bounded post-auth admission miss.
 pub const BACKPRESSURE_RETRY_BACKOFF: Duration = Duration::from_millis(20);
+
+/// Encode an absolute caller deadline as remaining milliseconds for one attempt.
+/// Zero is the wire's absent sentinel, so an already-expired present deadline is
+/// transmitted as one millisecond and remains attributable on the server.
+fn remaining_duration_millis(deadline: Option<Instant>) -> u64 {
+	let Some(deadline) = deadline else {
+		return 0;
+	};
+	let remaining = deadline.saturating_duration_since(Instant::now());
+	u64::try_from(remaining.as_millis())
+		.unwrap_or(u64::MAX)
+		.max(1)
+}
+
+fn prepare_mutation_attempt_deadline(
+	remaining_field: &mut u64,
+	original_deadline: Option<Instant>,
+) -> u64 {
+	let remaining = remaining_duration_millis(original_deadline);
+	*remaining_field = remaining;
+	remaining
+}
 
 /// Structured terminal query error for an acknowledged table reference whose
 /// backing slab is no longer resolvable. This survives the native wire
@@ -367,6 +390,7 @@ pub struct TableWriteRequest {
 	pub meta: TableWriteRequestMeta,
 	pub descriptor: TableSchemaDescriptor,
 	pub payload: RecordBatch,
+	pub deadline: Option<std::time::Instant>,
 }
 
 /// Result of a typed table write.
@@ -382,6 +406,7 @@ pub struct TableDeleteRowsRequest {
 	pub meta: TableDeleteRowsRequestMeta,
 	pub descriptor: TableSchemaDescriptor,
 	pub row_key_ids: Vec<Identity>,
+	pub deadline: Option<std::time::Instant>,
 }
 
 /// Result of an append-only row delete.
@@ -389,6 +414,17 @@ pub struct TableDeleteRowsRequest {
 pub struct TableDeleteRowsResult {
 	pub response: TableDeleteRowsResponseMeta,
 	pub finalization: Option<FinalizationMarker>,
+}
+
+#[derive(Clone, Debug)]
+pub struct MutationOutcomeRequest {
+	pub tenant_id: TenantId,
+	pub operation_id: crate::schema::ClientWriteId,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct MutationOutcomeResult {
+	pub response: MutationOutcomeResponseMeta,
 }
 
 #[derive(Clone, Debug)]
@@ -578,7 +614,7 @@ impl WendelonClient {
 	/// preserving one parent finalization for the logical write.
 	pub async fn table_write(
 		&self,
-		request: TableWriteRequest,
+		mut request: TableWriteRequest,
 	) -> std::io::Result<TableWriteResult> {
 		// Client-side preview admission: used to pick a routing
 		// target via the first row's locality. Pass `client_hlc` as
@@ -609,8 +645,15 @@ impl WendelonClient {
 		};
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
+			request.meta.set_attempts_remaining(
+				u8::try_from(DATA_RETRY_BUDGET - attempt).expect("retry budget fits u8"),
+			);
+			prepare_mutation_attempt_deadline(
+				&mut request.meta.deadline_remaining_millis,
+				request.deadline,
+			);
 			let target = preferred_target.unwrap_or(self.target_for_locality(key_locality)?);
-			let result = self.table_write_once(target, &request).await?;
+			let mut result = self.table_write_once(target, &request).await?;
 			self.observe_write_response(&result.response.write);
 			if result.response.reject_code != PbcRejectCode::NONE.0 {
 				return Ok(result);
@@ -619,6 +662,17 @@ impl WendelonClient {
 				return Ok(result);
 			};
 			if attempt + 1 == DATA_RETRY_BUDGET {
+				let knowledge = if result.response.write.status == WriteStatus::FINALIZATION_PENDING
+				{
+					crate::schema::MutationCommitKnowledge::INDETERMINATE
+				} else {
+					crate::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+				};
+				result.response.write.status = WriteStatus::WRITE_ATTEMPTS_EXHAUSTED;
+				result.response.write = result.response.write.with_mutation_outcome(
+					knowledge,
+					crate::schema::MutationStopReason::ATTEMPT_EXHAUSTION,
+				);
 				return Ok(result);
 			}
 			self.prepare_retry(Some(key_locality), retry).await?;
@@ -632,15 +686,22 @@ impl WendelonClient {
 	/// tombstone-only multi-row records for currently visible rows.
 	pub async fn table_delete(
 		&self,
-		request: TableDeleteRowsRequest,
+		mut request: TableDeleteRowsRequest,
 	) -> std::io::Result<TableDeleteRowsResult> {
 		validate_table_delete_request(&request)?;
 		let route_locality =
 			table_query_route_locality(request.meta.tenant_id, &request.descriptor)?;
 		let mut preferred_target = None;
 		for attempt in 0..DATA_RETRY_BUDGET {
+			request.meta.set_attempts_remaining(
+				u8::try_from(DATA_RETRY_BUDGET - attempt).expect("retry budget fits u8"),
+			);
+			prepare_mutation_attempt_deadline(
+				&mut request.meta.deadline_remaining_millis,
+				request.deadline,
+			);
 			let target = preferred_target.unwrap_or(self.target_for_locality(route_locality)?);
-			let result = self.table_delete_once(target, &request).await?;
+			let mut result = self.table_delete_once(target, &request).await?;
 			self.observe_write_response(&result.response.write);
 			if result.response.reject_code != PbcRejectCode::NONE.0 {
 				return Ok(result);
@@ -649,12 +710,98 @@ impl WendelonClient {
 				return Ok(result);
 			};
 			if attempt + 1 == DATA_RETRY_BUDGET {
+				let knowledge = if result.response.write.status == WriteStatus::FINALIZATION_PENDING
+				{
+					crate::schema::MutationCommitKnowledge::INDETERMINATE
+				} else {
+					crate::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+				};
+				result.response.write.status = WriteStatus::WRITE_ATTEMPTS_EXHAUSTED;
+				result.response.write = result.response.write.with_mutation_outcome(
+					knowledge,
+					crate::schema::MutationStopReason::ATTEMPT_EXHAUSTION,
+				);
 				return Ok(result);
 			}
 			self.prepare_retry(Some(route_locality), retry).await?;
 			preferred_target = retry.preferred_target;
 		}
 		unreachable!("bounded retry loop must return within budget")
+	}
+
+	/// Resolve a table mutation by its caller-minted operation identity without
+	/// submitting any mutation payload. Outcomes are node-local durable records, so
+	/// resolution asks every current Data node: routing by a table/query locality can
+	/// miss the node that admitted the first-row write locality.
+	pub async fn resolve_mutation_outcome(
+		&self,
+		request: MutationOutcomeRequest,
+	) -> std::io::Result<MutationOutcomeResult> {
+		let targets = self.mutation_resolution_targets();
+		if targets.is_empty() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				"no Data node available to resolve mutation outcome",
+			));
+		}
+
+		let mut expired = None;
+		let mut unknown = None;
+		let mut first_error = None;
+		for target in targets {
+			match self.resolve_mutation_outcome_once(target, &request).await {
+				Ok(result) if result.response.resolution == MutationResolutionStatus::PRESENT => {
+					return Ok(result);
+				}
+				Ok(result) if result.response.resolution == MutationResolutionStatus::EXPIRED => {
+					expired.get_or_insert(result);
+				}
+				Ok(result) if result.response.resolution == MutationResolutionStatus::UNKNOWN => {
+					unknown.get_or_insert(result);
+				}
+				Ok(result) => {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"unknown mutation resolution status {} from node {}",
+							result.response.resolution.0, target.id
+						),
+					));
+				}
+				Err(error) => {
+					first_error.get_or_insert(error);
+				}
+			}
+		}
+		if let Some(expired) = expired {
+			return Ok(expired);
+		}
+		if let Some(error) = first_error {
+			// Unknown is safe only after every current Data node answered. A missing
+			// node may be the one holding the durable record, so absence elsewhere
+			// cannot be promoted into knowledge.
+			return Err(error);
+		}
+		if let Some(unknown) = unknown {
+			return Ok(unknown);
+		}
+		Err(Error::new(
+			ErrorKind::NotFound,
+			"no mutation resolution response received",
+		))
+	}
+
+	fn mutation_resolution_targets(&self) -> Vec<NodeId> {
+		let mut targets = self
+			.topology_tx
+			.borrow()
+			.peers
+			.iter()
+			.filter(|(_, peer)| peer.roles.contains(NodeRole::Data))
+			.map(|(node, _)| *node)
+			.collect::<Vec<_>>();
+		targets.sort_unstable_by_key(|node| node.id);
+		targets
 	}
 
 	/// Issue one `TABLE_QUERY_REQ` over HRFT. The descriptor is
@@ -1621,6 +1768,35 @@ impl WendelonClient {
 			.map_err(|e| Error::new(ErrorKind::BrokenPipe, e))?;
 		let frame = read_frame(&mut *stream, &self.pool).await?;
 		decode_table_delete_response_frame(frame)
+	}
+
+	async fn resolve_mutation_outcome_once(
+		&self,
+		target: NodeId,
+		request: &MutationOutcomeRequest,
+	) -> std::io::Result<MutationOutcomeResult> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let meta = MutationOutcomeRequestMeta {
+			operation_id: request.operation_id,
+			tenant_id: request.tenant_id,
+		};
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::MUTATION_OUTCOME_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<MutationOutcomeRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, bytemuck::bytes_of(&meta), None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
+		decode_mutation_outcome_response_frame(read_frame(&mut *stream, &self.pool).await?)
 	}
 
 	async fn read_once(
@@ -3100,6 +3276,32 @@ fn decode_table_delete_response_frame(
 	})
 }
 
+fn decode_mutation_outcome_response_frame(
+	frame: crate::network::core::HrftFrame,
+) -> std::io::Result<MutationOutcomeResult> {
+	if frame.header.msg_type != MsgType::MUTATION_OUTCOME_RESP.0 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"expected MUTATION_OUTCOME_RESP, got msg_type=0x{:02x}",
+				frame.header.msg_type
+			),
+		));
+	}
+	if frame.meta.len() != std::mem::size_of::<MutationOutcomeResponseMeta>()
+		|| frame.arrow_payload.is_some()
+		|| frame.trailing.is_some()
+	{
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			"invalid MUTATION_OUTCOME_RESP frame",
+		));
+	}
+	Ok(MutationOutcomeResult {
+		response: *bytemuck::from_bytes(&frame.meta),
+	})
+}
+
 fn decode_read_response_frame(
 	frame: crate::network::core::HrftFrame,
 ) -> std::io::Result<ReadResult> {
@@ -3846,6 +4048,19 @@ mod tests {
 		}
 	}
 
+	#[tokio::test]
+	async fn mutation_resolution_censuses_every_data_node_without_a_table_locality() {
+		let client = WendelonClient::new(test_config(snapshot(1, Some(1), &[3, 1, 2])));
+		assert_eq!(
+			client
+				.mutation_resolution_targets()
+				.into_iter()
+				.map(|node| node.id)
+				.collect::<Vec<_>>(),
+			vec![1, 2, 3]
+		);
+	}
+
 	#[derive(Clone)]
 	struct DescriptorGetResponseSpec {
 		meta: TableDescriptorGetResponseMeta,
@@ -4588,6 +4803,26 @@ mod tests {
 		assert_eq!(retry.preferred_target, Some(leader));
 		assert_eq!(retry.backoff, Some(FINALIZATION_RETRY_BACKOFF));
 		assert!(retry.refresh_topology);
+	}
+
+	#[test]
+	fn every_retry_attempt_consumes_one_original_mutation_deadline() {
+		let original_deadline = Instant::now() + Duration::from_millis(120);
+		let mut wire_remaining = 0;
+		let mut attempts = Vec::new();
+		for _ in 0..DATA_RETRY_BUDGET {
+			attempts.push(prepare_mutation_attempt_deadline(
+				&mut wire_remaining,
+				Some(original_deadline),
+			));
+			std::thread::sleep(Duration::from_millis(15));
+		}
+		assert_eq!(attempts.len(), DATA_RETRY_BUDGET);
+		assert!(
+			attempts.windows(2).all(|pair| pair[1] < pair[0]),
+			"retry must recompute from the first attempt's absolute deadline: {attempts:?}"
+		);
+		assert_eq!(wire_remaining, *attempts.last().unwrap());
 	}
 
 	#[test]

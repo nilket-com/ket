@@ -722,6 +722,7 @@ mod tests {
 			durability: DurabilityLevel::QUORUM,
 			await_finalization: 0,
 			_pad: [0; 3],
+			deadline_remaining_millis: 0,
 		}
 	}
 

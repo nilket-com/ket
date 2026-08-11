@@ -460,6 +460,7 @@ fn typed_table_meta(descriptor: &TableSchemaDescriptor, row_count: usize) -> Tab
 		durability: DurabilityLevel::QUORUM,
 		await_finalization: 0,
 		_pad: [0; 3],
+		deadline_remaining_millis: 0,
 	}
 }
 
@@ -3869,6 +3870,44 @@ fn table_bifurcation_splits_rows_into_independent_arrow_frames() {
 }
 
 #[test]
+fn parent_table_batch_is_one_commit_unit_across_locality_groups() {
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![7, 8]);
+	let meta = typed_table_meta(&descriptor, batch.num_rows());
+	let bifurcated = bifurcate_table_write(
+		&meta,
+		&batch,
+		&descriptor,
+		WriterNodeId::ZERO,
+		meta.client_hlc,
+	)
+	.unwrap();
+	assert_eq!(bifurcated.children.len(), 2);
+	assert_eq!(bifurcated.record_count, 2);
+
+	let first = table_replica_meta(
+		&meta,
+		&bifurcated,
+		&bifurcated.children[..1],
+		meta.client_hlc,
+	);
+	let second = table_replica_meta(
+		&meta,
+		&bifurcated,
+		&bifurcated.children[1..],
+		meta.client_hlc,
+	);
+	assert_eq!(first.parent_write_id, meta.parent_write_id);
+	assert_eq!(second.parent_write_id, meta.parent_write_id);
+	assert_eq!(first.payload_hash, bifurcated.payload_hash);
+	assert_eq!(second.payload_hash, bifurcated.payload_hash);
+	assert_eq!(first.record_count, 2);
+	assert_eq!(second.record_count, 2);
+	assert_eq!(first.group_record_count, 1);
+	assert_eq!(second.group_record_count, 1);
+}
+
+#[test]
 fn table_bifurcation_packs_multirow_records_with_storage_metadata() {
 	let descriptor = multirow_typed_table_descriptor();
 	let source_ids = same_multirow_locality_ids(&descriptor, 3);
@@ -5132,6 +5171,47 @@ fn table_bifurcation_rejects_duplicate_pk_before_encoding_children() {
 	assert_eq!(err.code, PbcRejectCode::PBC_REJECT_DUPLICATE_PK_IN_BATCH);
 }
 
+#[test]
+fn write_expiry_keeps_cause_and_commit_knowledge_as_orthogonal_axes() {
+	let descriptor = typed_table_descriptor();
+	let meta = typed_table_meta(&descriptor, 1);
+	let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
+
+	let deadline = WriteClocks::new(
+		Duration::from_secs(30),
+		Some(tokio::time::Instant::now() - Duration::from_millis(1)),
+	)
+	.next_expiry()
+	.1;
+	let before_dispatch = mutation_expiry_response(
+		&synthetic,
+		deadline,
+		MutationCommitKnowledge::KNOWN_NOT_COMMITTED,
+	);
+	assert_eq!(before_dispatch.status, WriteStatus::WRITE_DEADLINE_EXCEEDED);
+	assert_eq!(
+		before_dispatch.mutation_stop_reason(),
+		MutationStopReason::DEADLINE
+	);
+	assert_eq!(
+		before_dispatch.mutation_commit_knowledge(),
+		MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+	);
+
+	let stalled = WriteClocks::new(Duration::ZERO, None).next_expiry().1;
+	let after_dispatch =
+		mutation_expiry_response(&synthetic, stalled, MutationCommitKnowledge::INDETERMINATE);
+	assert_eq!(after_dispatch.status, WriteStatus::WRITE_STALLED);
+	assert_eq!(
+		after_dispatch.mutation_stop_reason(),
+		MutationStopReason::NO_PROGRESS
+	);
+	assert_eq!(
+		after_dispatch.mutation_commit_knowledge(),
+		MutationCommitKnowledge::INDETERMINATE
+	);
+}
+
 #[tokio::test]
 async fn table_write_single_row_commits_typed_arrow_payload() {
 	let dir = bootstrap_tempdir("table-write-single-row");
@@ -5190,6 +5270,236 @@ async fn table_write_single_row_commits_typed_arrow_payload() {
 	assert_eq!(ids.value(0), 7);
 
 	node.handles.abort();
+}
+
+#[tokio::test]
+async fn terminal_table_outcome_resolves_and_replays_after_server_reopen_without_reapply() {
+	let dir = bootstrap_tempdir("table-write-durable-outcome-reopen");
+	let cfg = NodeBootstrapConfig::dev(38, dir, "127.0.0.1:0".into());
+	let node = WendelonNode::bootstrap_single_node(cfg.clone())
+		.await
+		.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(tokio::time::Instant::now() < deadline, "leader timeout");
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+
+	let batch = typed_table_batch(vec![73]);
+	let meta = typed_table_meta(&descriptor, batch.num_rows());
+	let (first, _) = node
+		.data_server
+		.table_write(meta, batch.clone())
+		.await
+		.unwrap();
+	assert_eq!(first.write.status, WriteStatus::OK);
+	let durable_bytes = node.slab.local_l1_bytes().await;
+
+	node.handles.abort();
+	drop(node);
+	tokio::time::sleep(Duration::from_millis(25)).await;
+	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+	loop {
+		if reopened.raft.current_leader().await == Some(reopened.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"reopened leader timeout"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	reopened
+		.data_server
+		.refresh_leases_once(&reopened.ring, &*reopened.clock, 60_000)
+		.await;
+	let resolved = reopened
+		.data_server
+		.resolve_mutation_outcome(MutationOutcomeRequestMeta {
+			operation_id: meta.parent_write_id,
+			tenant_id: meta.tenant_id,
+		})
+		.await
+		.unwrap();
+	assert_eq!(resolved.resolution, MutationResolutionStatus::PRESENT);
+	assert_eq!(
+		resolved.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::COMMITTED
+	);
+
+	let (duplicate, _) = reopened.data_server.table_write(meta, batch).await.unwrap();
+	assert_eq!(duplicate.write.status, WriteStatus::DUPLICATE);
+	assert_eq!(
+		reopened.slab.local_l1_bytes().await,
+		durable_bytes,
+		"restart replay must resolve the retained parent operation, never append again"
+	);
+	reopened.handles.abort();
+}
+
+#[tokio::test]
+async fn post_dispatch_expiry_resolves_and_replays_as_one_indeterminate_operation_after_restart() {
+	let dir = bootstrap_tempdir("table-write-indeterminate-outcome-reopen");
+	let cfg = NodeBootstrapConfig::dev(39, dir, "127.0.0.1:0".into());
+	let node = WendelonNode::bootstrap_single_node(cfg.clone())
+		.await
+		.unwrap();
+	let leader_deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < leader_deadline,
+			"leader timeout"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	let descriptor = typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+
+	let batch = typed_table_batch(vec![79]);
+	let mut meta = typed_table_meta(&descriptor, batch.num_rows());
+	meta.deadline_remaining_millis = 100;
+	node.data_server
+		.delay_next_local_durable_append_for_test(Duration::from_millis(300));
+	let (expired, _) = node
+		.data_server
+		.table_write(meta, batch.clone())
+		.await
+		.unwrap();
+	assert_eq!(expired.write.status, WriteStatus::WRITE_DEADLINE_EXCEEDED);
+	assert_eq!(
+		expired.write.mutation_stop_reason(),
+		MutationStopReason::DEADLINE
+	);
+	assert_eq!(
+		expired.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::INDETERMINATE
+	);
+	// `spawn` is deliberately not cancelled with the caller. Wait for the abandoned
+	// append to finish while its node-wide permit remains charged.
+	tokio::time::sleep(Duration::from_millis(350)).await;
+	let durable_bytes = node.slab.local_l1_bytes().await;
+	assert!(durable_bytes > 0, "the post-dispatch append must have run");
+
+	node.handles.abort();
+	drop(node);
+	tokio::time::sleep(Duration::from_millis(25)).await;
+	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+	let leader_deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+	loop {
+		if reopened.raft.current_leader().await == Some(reopened.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < leader_deadline,
+			"reopened leader timeout"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	reopened
+		.data_server
+		.refresh_leases_once(&reopened.ring, &*reopened.clock, 60_000)
+		.await;
+	let resolved = reopened
+		.data_server
+		.resolve_mutation_outcome(MutationOutcomeRequestMeta {
+			operation_id: meta.parent_write_id,
+			tenant_id: meta.tenant_id,
+		})
+		.await
+		.unwrap();
+	assert_eq!(resolved.resolution, MutationResolutionStatus::PRESENT);
+	assert_eq!(resolved.write.status, WriteStatus::WRITE_DEADLINE_EXCEEDED);
+	assert_eq!(
+		resolved.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::INDETERMINATE
+	);
+
+	let (replay, _) = reopened.data_server.table_write(meta, batch).await.unwrap();
+	assert_eq!(replay.write.status, WriteStatus::WRITE_DEADLINE_EXCEEDED);
+	assert_eq!(
+		reopened.slab.local_l1_bytes().await,
+		durable_bytes,
+		"replay must resolve the retained operation, never append a second copy"
+	);
+	reopened.handles.abort();
+}
+
+#[tokio::test]
+async fn final_attempt_exhaustion_is_a_durable_two_axis_outcome() {
+	let dir = bootstrap_tempdir("table-write-attempt-exhaustion-reopen");
+	let cfg = NodeBootstrapConfig::dev(40, dir, "127.0.0.1:0".into());
+	let node = WendelonNode::bootstrap_single_node(cfg.clone())
+		.await
+		.unwrap();
+	let descriptor = typed_table_descriptor();
+	let mut meta = typed_table_meta(&descriptor, 1);
+	meta.set_attempts_remaining(1);
+	let retryable = node.data_server.table_write_error_response(
+		&meta,
+		WriteStatus::BACKPRESSURED,
+		PbcRejectCode::NONE,
+	);
+	let stopped = node
+		.data_server
+		.finalize_table_write_attempt(meta, retryable)
+		.await
+		.unwrap();
+	assert_eq!(stopped.write.status, WriteStatus::WRITE_ATTEMPTS_EXHAUSTED);
+	assert_eq!(
+		stopped.write.mutation_stop_reason(),
+		MutationStopReason::ATTEMPT_EXHAUSTION
+	);
+	assert_eq!(
+		stopped.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+	);
+
+	node.handles.abort();
+	drop(node);
+	let reopened = WendelonNode::bootstrap_single_node(cfg).await.unwrap();
+	let resolved = reopened
+		.data_server
+		.resolve_mutation_outcome(MutationOutcomeRequestMeta {
+			operation_id: meta.parent_write_id,
+			tenant_id: meta.tenant_id,
+		})
+		.await
+		.unwrap();
+	assert_eq!(resolved.write.status, WriteStatus::WRITE_ATTEMPTS_EXHAUSTED);
+	assert_eq!(
+		resolved.write.mutation_stop_reason(),
+		MutationStopReason::ATTEMPT_EXHAUSTION
+	);
+	assert_eq!(
+		resolved.write.mutation_commit_knowledge(),
+		MutationCommitKnowledge::KNOWN_NOT_COMMITTED
+	);
+	reopened.handles.abort();
 }
 
 #[tokio::test]

@@ -25,6 +25,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::io::{Cursor, Error, ErrorKind};
 
+#[cfg(test)]
+use crate::schema::{MutationCommitKnowledge, MutationStopReason, WriteStatus};
+
 const TABLE_ROW_IDENTITY_DOMAIN: &[u8] = b"wendelon.table-row.v1";
 const TABLE_LOCALITY_DOMAIN: &[u8] = b"wendelon.table-locality.v1";
 const TABLE_COLUMN_LOCALITY_HASH_DOMAIN: &[u8] = b"wendelon.table-column-locality.v1";
@@ -240,13 +243,25 @@ pub struct TableWriteRequestMeta {
 	/// If 1, leader streams back FinalizationMarker in the response.
 	pub await_finalization: u8, //  1 byte
 	pub _pad: [u8; 3], //  3 bytes alignment
+	/// Caller deadline as a remaining duration. Zero means absent; an already-expired
+	/// caller sends one millisecond so presence never degrades into absence.
+	pub deadline_remaining_millis: u64, // 8 bytes
 }
 
-const _: () = assert!(std::mem::size_of::<TableWriteRequestMeta>() == 112);
+const _: () = assert!(std::mem::size_of::<TableWriteRequestMeta>() == 120);
 
 impl TableWriteRequestMeta {
 	pub fn decoded_row_count(self) -> usize {
 		decode_table_write_row_count(self.row_count)
+	}
+
+	/// Attempts remaining including this request. Zero is legacy/unspecified.
+	pub const fn attempts_remaining(self) -> u8 {
+		self._pad[0]
+	}
+
+	pub fn set_attempts_remaining(&mut self, attempts: u8) {
+		self._pad[0] = attempts;
 	}
 }
 
@@ -391,9 +406,22 @@ pub struct TableDeleteRowsRequestMeta {
 	pub durability: DurabilityLevel,    //  1 byte
 	pub await_finalization: u8,         //  1 byte
 	pub _pad: [u8; 10],                 // 10 bytes
+	/// Same remaining-duration rule as [`TableWriteRequestMeta`].
+	pub deadline_remaining_millis: u64, // 8 bytes
 }
 
-const _: () = assert!(std::mem::size_of::<TableDeleteRowsRequestMeta>() == 104);
+const _: () = assert!(std::mem::size_of::<TableDeleteRowsRequestMeta>() == 112);
+
+impl TableDeleteRowsRequestMeta {
+	/// Attempts remaining including this request. Zero is legacy/unspecified.
+	pub const fn attempts_remaining(self) -> u8 {
+		self._pad[0]
+	}
+
+	pub fn set_attempts_remaining(&mut self, attempts: u8) {
+		self._pad[0] = attempts;
+	}
+}
 
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
 #[repr(C)]
@@ -407,6 +435,52 @@ pub struct TableDeleteRowsResponseMeta {
 }
 
 const _: () = assert!(std::mem::size_of::<TableDeleteRowsResponseMeta>() == 120);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct MutationResolutionStatus(pub u8);
+
+impl MutationResolutionStatus {
+	pub const UNKNOWN: Self = Self(0);
+	pub const PRESENT: Self = Self(1);
+	pub const EXPIRED: Self = Self(2);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct MutationOperationKind(pub u8);
+
+impl MutationOperationKind {
+	pub const WRITE: Self = Self(0);
+	pub const DELETE: Self = Self(1);
+}
+
+/// ADR 542 resolution request. The descriptor remains client-side for routing;
+/// the tenant travels on the wire for ordinary Data Ring authorization.
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct MutationOutcomeRequestMeta {
+	pub operation_id: ClientWriteId, // 32 bytes
+	pub tenant_id: TenantId,         //  8 bytes
+}
+
+const _: () = assert!(std::mem::size_of::<MutationOutcomeRequestMeta>() == 40);
+
+/// Exact durable mutation result. `resolution == UNKNOWN` is explicitly
+/// indeterminate; it is never represented as known-not-committed by absence.
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct MutationOutcomeResponseMeta {
+	pub write: WriteResponseMeta,              // 96 bytes
+	pub deleted_count: u32,                    //  4 bytes
+	pub already_deleted_count: u32,            //  4 bytes
+	pub not_found_count: u32,                  //  4 bytes
+	pub resolution: MutationResolutionStatus,  //  1 byte
+	pub operation_kind: MutationOperationKind, //  1 byte
+	pub _pad: [u8; 2],                         //  2 bytes
+}
+
+const _: () = assert!(std::mem::size_of::<MutationOutcomeResponseMeta>() == 112);
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DeleteRowsRequest {
@@ -4605,6 +4679,7 @@ mod tests {
 			durability: DurabilityLevel::QUORUM,
 			await_finalization: 0,
 			_pad: [0; 3],
+			deadline_remaining_millis: 0,
 		}
 	}
 
@@ -4624,6 +4699,58 @@ mod tests {
 		assert_eq!(
 			descriptor.record_body_compression_policy,
 			RecordBodyCompressionPolicy::Uncompressed
+		);
+	}
+
+	#[test]
+	fn mutation_outcome_wire_preserves_both_axes_and_resolution_state() {
+		let operation_id = ClientWriteId {
+			client_uuid: [9; 16],
+			sequence_no: 4,
+			idempotency_ttl_ms: 60_000,
+			_pad: 0,
+		};
+		let response = MutationOutcomeResponseMeta {
+			write: WriteResponseMeta {
+				status: WriteStatus::WRITE_DEADLINE_EXCEEDED,
+				_pad1: [0; 7],
+				log_index: 0,
+				term: 0,
+				epoch: 2,
+				commit_hlc: HybridTimestamp {
+					physical_ms: 0,
+					logical: 0,
+					node_id: 0,
+				},
+				leader_hint: NodeId {
+					id: 2,
+					_reserved: 0,
+				},
+				echoed_write_id: operation_id,
+				has_finalization: 0,
+				_pad2: [0; 7],
+			}
+			.with_mutation_outcome(
+				MutationCommitKnowledge::INDETERMINATE,
+				MutationStopReason::DEADLINE,
+			),
+			deleted_count: 0,
+			already_deleted_count: 0,
+			not_found_count: 0,
+			resolution: MutationResolutionStatus::PRESENT,
+			operation_kind: MutationOperationKind::WRITE,
+			_pad: [0; 2],
+		};
+		let decoded: MutationOutcomeResponseMeta =
+			*bytemuck::from_bytes(bytemuck::bytes_of(&response));
+		assert_eq!(decoded.resolution, MutationResolutionStatus::PRESENT);
+		assert_eq!(
+			decoded.write.mutation_commit_knowledge(),
+			MutationCommitKnowledge::INDETERMINATE
+		);
+		assert_eq!(
+			decoded.write.mutation_stop_reason(),
+			MutationStopReason::DEADLINE
 		);
 	}
 
