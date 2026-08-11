@@ -16,9 +16,9 @@ use toron::distributed::task::{PartitionCount, TaskInputBinding, TaskOutputBindi
 use toron::error::{BindingError, ExecutionError, FrontendError, StorageError};
 use toron::exec::Executor;
 use toron::ir::{
-	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram, ColumnOrdinal,
-	ExecutionPlan, Expr, FilterDisposition, JoinKind, JoinStrategyIntent, LogicalPlan, ScalarValue,
-	SortExpr, SystemTableKind, TableId,
+	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram,
+	CUSTOMER_ID_LOGICAL_TYPE, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, JoinKind,
+	JoinStrategyIntent, LogicalPlan, ScalarValue, SortExpr, SystemTableKind, TableId,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -3229,6 +3229,128 @@ async fn float_arithmetic_decimal_point_literals_rewrite_to_float_literals() {
 			other => panic!("unexpected Float64 multiplication row: {other:?}"),
 		}
 	}
+}
+
+#[tokio::test]
+async fn floor_preserves_the_closed_numeric_type_matrix_and_nulls() {
+	let results = run_logical(&plan_sql(
+		"SELECT FLOOR(id), FLOOR(amount), FLOOR(price), FLOOR(rating32) FROM sales",
+	))
+	.await;
+
+	assert_eq!(results[0].schema().field(0).data_type(), &DataType::Int64);
+	assert_eq!(results[0].schema().field(1).data_type(), &DataType::Int32);
+	assert_eq!(results[0].schema().field(2).data_type(), &DataType::Float64);
+	assert_eq!(results[0].schema().field(3).data_type(), &DataType::Float32);
+	assert_eq!(
+		scalar_int64_column_rows(&results, 0),
+		vec![Some(1), Some(2), Some(3), Some(4), Some(5), Some(6)]
+	);
+	assert_eq!(
+		scalar_int32_column_rows(&results, 1),
+		vec![Some(10), Some(20), None, Some(30), None, Some(7)]
+	);
+	assert_eq!(
+		scalar_float64_column_rows(&results, 2),
+		vec![Some(10.0), Some(20.0), None, Some(30.0), None, Some(7.0)]
+	);
+	assert_eq!(
+		scalar_float32_column_rows(&results, 3),
+		vec![Some(1.0), Some(2.0), None, Some(3.0), Some(4.0), Some(0.0)]
+	);
+
+	let (catalog, _) = fixture();
+	let decimal = plan_sql("SELECT FLOOR(decimal_price) FROM sales");
+	let err = bind(&decimal, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("Decimal128 FLOOR must refuse at bind time");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { .. }),
+		"expected typed FLOOR type mismatch, got {err}"
+	);
+
+	let logical = LogicalPlan::Project {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		exprs: vec![Expr::Floor(Box::new(Expr::LogicalAscription {
+			expr: Box::new(Expr::column("id")),
+			logical_type: CUSTOMER_ID_LOGICAL_TYPE,
+		}))],
+		output_names: vec![None],
+	};
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("named logical FLOOR must refuse at bind time");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { .. }),
+		"expected named logical FLOOR type mismatch, got {err}"
+	);
+}
+
+#[tokio::test]
+async fn floor_rejects_non_finite_values_after_reaching_evaluation() {
+	let finite = run_logical(&plan_sql("SELECT FLOOR(price) FROM sales")).await;
+	assert_eq!(
+		scalar_float64_column_rows(&finite, 0),
+		vec![Some(10.0), Some(20.0), None, Some(30.0), None, Some(7.0)]
+	);
+
+	let nan = execute_sql_err("SELECT FLOOR(score) FROM sales").await;
+	assert_kernel_error_prefix(nan, "FLOOR requires finite Float64 input: NaN");
+	let infinity = execute_sql_err("SELECT FLOOR(price / 0.0) FROM sales").await;
+	assert_kernel_error_prefix(infinity, "FLOOR requires finite Float64 input: inf");
+}
+
+#[tokio::test]
+async fn floor_reaches_filter_ordering_and_computed_aggregate_arguments() {
+	let filtered = run_logical(&plan_sql(
+		"SELECT FLOOR(price) AS floored FROM sales \
+		 WHERE FLOOR(price) >= 10.0 ORDER BY floored",
+	))
+	.await;
+	assert_eq!(
+		scalar_float64_column_rows(&filtered, 0),
+		vec![Some(10.0), Some(20.0), Some(30.0)]
+	);
+
+	let aggregate = run_logical(&plan_sql("SELECT SUM(FLOOR(price)) FROM sales")).await;
+	assert_eq!(scalar_float64_column_rows(&aggregate, 0), vec![Some(67.0)]);
+
+	assert_unsupported_message(
+		"SELECT FLOOR(id TO DAY) FROM sales",
+		"datetime FLOOR is not supported",
+	);
+}
+
+#[tokio::test]
+async fn floor_alias_first_bucketing_is_sparse_and_handles_negative_bins() {
+	let logical = plan_sql(
+		"WITH bucketed AS (\
+		   SELECT FLOOR((price - 20.0) / 10.0) * 10.0 AS bin_start \
+		   FROM sales WHERE price + 0.0 IS NOT NULL) \
+		 SELECT bin_start, bin_start + 10.0 AS bin_end, COUNT(*) AS bin_count \
+		 FROM bucketed GROUP BY bin_start ORDER BY bin_start",
+	);
+	// FixtureScan does not interpret storage-pushed predicates. The arithmetic identity keeps this
+	// null filter on Toron's evaluation rail while preserving the canonical query's semantics.
+	let results = run_logical(&logical).await;
+
+	assert_eq!(
+		scalar_float64_column_rows(&results, 0),
+		vec![Some(-20.0), Some(-10.0), Some(0.0), Some(10.0)]
+	);
+	assert_eq!(
+		scalar_float64_column_rows(&results, 1),
+		vec![Some(-10.0), Some(0.0), Some(10.0), Some(20.0)]
+	);
+	assert_eq!(
+		scalar_int64_column_rows(&results, 2),
+		vec![Some(1), Some(1), Some(1), Some(1)]
+	);
+
+	assert_unsupported("SELECT FLOOR(price), COUNT(*) FROM sales GROUP BY FLOOR(price)");
 }
 
 #[tokio::test]

@@ -1,11 +1,12 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 14] = [
+const BINDER_MODULES: [&str; 15] = [
 	"aggregate",
 	"aggregate_exchange",
 	"arithmetic",
 	"decision_log",
 	"explain",
+	"expression_walk",
 	"join",
 	"join_order",
 	"outer_count_preaggregation",
@@ -27,6 +28,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/arithmetic.rs",
 		"src/binder/decision_log.rs",
 		"src/binder/explain.rs",
+		"src/binder/expression_walk.rs",
 		"src/binder/join.rs",
 		"src/binder/join_order.rs",
 		"src/binder/outer_count_preaggregation.rs",

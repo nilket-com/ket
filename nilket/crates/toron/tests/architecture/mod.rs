@@ -16,6 +16,7 @@ pub(crate) mod multi_dedup;
 pub(crate) mod network_tls;
 pub(crate) mod nominal_type_identity;
 pub(crate) mod null_semantics;
+pub(crate) mod numeric_floor;
 pub(crate) mod observability_audit;
 pub(crate) mod observability_telemetry;
 pub(crate) mod optimizer;

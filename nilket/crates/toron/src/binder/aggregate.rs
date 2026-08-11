@@ -190,6 +190,9 @@ pub(super) fn offset_bound_node(
 				.collect(),
 			else_input: offset_id(else_input),
 		},
+		BoundExprNode::Floor { input } => BoundExprNode::Floor {
+			input: offset_id(input),
+		},
 		BoundExprNode::TimeBucket { interval, input } => BoundExprNode::TimeBucket {
 			interval,
 			input: offset_id(input),

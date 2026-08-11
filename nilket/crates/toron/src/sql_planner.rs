@@ -6760,6 +6760,17 @@ impl SqlPlanner {
 					"AT TIME ZONE expects a string literal timezone",
 				)?,
 			)),
+			SqlExpr::Floor { expr, field } => {
+				if !matches!(
+					field,
+					sqlparser::ast::CeilFloorKind::DateTimeField(
+						sqlparser::ast::DateTimeField::NoDateTime
+					)
+				) {
+					return Err(unsupported("datetime FLOOR is not supported"));
+				}
+				Ok(Expr::Floor(Box::new(self.lower_expr(expr)?)))
+			}
 			SqlExpr::Nested(expr) => self.lower_expr(expr),
 			SqlExpr::Function(f) => match conditional_sugar_function_name(&f.name) {
 				Some(ConditionalSugarFunction::Coalesce) => self.lower_coalesce(f),
@@ -7293,6 +7304,7 @@ fn validate_hidden_sort_key_refs(
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
 		| Expr::Substring { input: inner, .. }
+		| Expr::Floor(inner)
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -8119,6 +8131,10 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			18u8.hash(state);
 			hash_expr_structural(inner, state);
 		}
+		Expr::Floor(inner) => {
+			30u8.hash(state);
+			hash_expr_structural(inner, state);
+		}
 		Expr::TimeBucket(interval, inner) => {
 			19u8.hash(state);
 			interval.hash(state);
@@ -8277,7 +8293,8 @@ pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 		}
 		(Expr::Not(left), Expr::Not(right))
 		| (Expr::IsNull(left), Expr::IsNull(right))
-		| (Expr::IsNotNull(left), Expr::IsNotNull(right)) => expr_structural_eq(left, right),
+		| (Expr::IsNotNull(left), Expr::IsNotNull(right))
+		| (Expr::Floor(left), Expr::Floor(right)) => expr_structural_eq(left, right),
 		(Expr::TimeBucket(left_interval, left), Expr::TimeBucket(right_interval, right)) => {
 			left_interval == right_interval && expr_structural_eq(left, right)
 		}
@@ -8665,6 +8682,7 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
 		| Expr::Substring { input: inner, .. }
+		| Expr::Floor(inner)
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -9705,6 +9723,7 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 		Expr::IsNotNull(inner) => {
 			Expr::IsNotNull(Box::new(canonical_aggregate_signature_expr(inner)))
 		}
+		Expr::Floor(inner) => Expr::Floor(Box::new(canonical_aggregate_signature_expr(inner))),
 		Expr::TimeBucket(interval, inner) => Expr::TimeBucket(
 			*interval,
 			Box::new(canonical_aggregate_signature_expr(inner)),
@@ -11715,6 +11734,7 @@ mod tests {
 			| Expr::Extract(_, expr)
 			| Expr::DateTrunc(_, expr)
 			| Expr::Substring { input: expr, .. }
+			| Expr::Floor(expr)
 			| Expr::Cast(expr, _)
 			| Expr::TryCast(expr, _) => expr_references(expr, qualifier, name),
 			Expr::Add(left, right)

@@ -156,6 +156,11 @@ impl PbcCompiler {
 						"CASE is not PBC-eligible".to_string(),
 					));
 				}
+				BoundExprNode::Floor { .. } => {
+					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+						"FLOOR is not PBC-eligible".to_string(),
+					));
+				}
 				BoundExprNode::TimeBucket { .. } => {
 					return Err(PushdownDeclineReason::ExperimentalKernelInPredicate);
 				}
@@ -233,6 +238,7 @@ impl PbcCompiler {
 			| BoundExprNode::Like { .. }
 			| BoundExprNode::Substring { .. }
 			| BoundExprNode::Case { .. }
+			| BoundExprNode::Floor { .. }
 			| BoundExprNode::TimeBucket { .. }
 			| BoundExprNode::AtTimeZone { .. }
 			| BoundExprNode::Extract { .. }

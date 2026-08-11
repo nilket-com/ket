@@ -315,6 +315,10 @@ impl Executor {
 				let res = is_not_null(&arr)?;
 				Ok(Arc::new(res))
 			}
+			Expr::Floor(inner) => {
+				let arr = self.evaluate_expr(inner, batch)?;
+				evaluate_floor(&arr)
+			}
 			Expr::TimeBucket(interval, inner) => {
 				let arr = self.evaluate_expr(inner, batch)?;
 				if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
@@ -463,6 +467,10 @@ impl Executor {
 						.collect::<Result<Vec<_>, ExecutionError>>()?;
 					let else_array = evaluated_child(&outputs, *else_input)?;
 					evaluate_case(&when_then, else_array)?
+				}
+				BoundExprNode::Floor { input } => {
+					let arr = evaluated_child(&outputs, *input)?;
+					evaluate_floor(&arr)?
 				}
 				BoundExprNode::TimeBucket { interval, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -928,6 +936,47 @@ fn evaluate_time_bucket(
 		Err(ExecutionError::InvalidExpression {
 			message: "TimeBucket expects Int64 (ms) input".to_string(),
 		})
+	}
+}
+
+fn evaluate_floor(arr: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	match arr.data_type() {
+		DataType::Int32 | DataType::Int64 => Ok(arr.clone()),
+		DataType::Float32 => {
+			let values = arr
+				.as_any()
+				.downcast_ref::<Float32Array>()
+				.expect("Float32 data type must have Float32Array storage")
+				.iter()
+				.map(|value| match value {
+					Some(value) if !value.is_finite() => Err(ExecutionError::Kernel {
+						message: format!("FLOOR requires finite Float32 input: {value}"),
+					}),
+					Some(value) => Ok(Some(value.floor())),
+					None => Ok(None),
+				})
+				.collect::<Result<Vec<_>, _>>()?;
+			Ok(Arc::new(Float32Array::from(values)))
+		}
+		DataType::Float64 => {
+			let values = arr
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.expect("Float64 data type must have Float64Array storage")
+				.iter()
+				.map(|value| match value {
+					Some(value) if !value.is_finite() => Err(ExecutionError::Kernel {
+						message: format!("FLOOR requires finite Float64 input: {value}"),
+					}),
+					Some(value) => Ok(Some(value.floor())),
+					None => Ok(None),
+				})
+				.collect::<Result<Vec<_>, _>>()?;
+			Ok(Arc::new(Float64Array::from(values)))
+		}
+		data_type => Err(ExecutionError::InvalidExpression {
+			message: format!("FLOOR expects numeric input, got {data_type}"),
+		}),
 	}
 }
 

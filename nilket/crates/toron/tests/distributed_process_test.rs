@@ -1,4 +1,4 @@
-use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+use arrow::array::{Array, Float64Array, Int32Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use futures::StreamExt;
@@ -241,6 +241,12 @@ struct CrossJoinProcessRun {
 struct WindowProcessRun {
 	/// `(partition key value, rank)` rows, sorted.
 	rows: Vec<(Option<i64>, i64)>,
+	selected_workers: Vec<WorkerId>,
+}
+
+#[derive(Debug)]
+struct FloorProcessRun {
+	rows: Vec<f64>,
 	selected_workers: Vec<WorkerId>,
 }
 
@@ -1042,6 +1048,20 @@ async fn grouped_aggregate_sql_matches_hand_built_aggregate_over_processes() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn floor_distributed_execution_matches_the_exact_numeric_result() {
+	let run = run_floor_process_query(1_408, 0).await;
+	assert_eq!(
+		run.rows,
+		(0..16).map(|value| value as f64).collect::<Vec<_>>()
+	);
+	assert_eq!(
+		unique_selected_worker_count(&run.selected_workers),
+		2,
+		"FLOOR must cross the serialized worker boundary, not execute on one local producer"
+	);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn multiple_ordered_top_k_process_query_preserves_inner_barrier() {
 	let mut workers = [
 		FixtureWorkerProcess::spawn(WorkerId::from_u128(1_410)).await,
@@ -1419,6 +1439,50 @@ async fn run_process_query(worker_id_base: u128, start_offset: usize) -> Process
 		group_count_after_exchange_plan(),
 	)
 	.await
+}
+
+async fn run_floor_process_query(worker_id_base: u128, start_offset: usize) -> FloorProcessRun {
+	let mut workers = [
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base)).await,
+		FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + 1)).await,
+	];
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan("SELECT FLOOR(float_val) AS floored FROM fixture ORDER BY floored")
+		.expect("plan distributed FLOOR query");
+	let results = coordinator
+		.execute_query(&logical)
+		.await
+		.expect("distributed FLOOR query");
+	let mut rows = Vec::new();
+	for batch in &results {
+		let values = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("FLOOR Float64 output");
+		rows.extend(values.iter().map(|value| value.expect("fixture value")));
+	}
+	rows.sort_by(f64::total_cmp);
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+
+	FloorProcessRun {
+		rows,
+		selected_workers: registry.selected_workers(),
+	}
 }
 
 async fn run_test_logical_process_query(

@@ -58,6 +58,7 @@ pub(crate) mod aggregate_exchange;
 mod arithmetic;
 mod decision_log;
 mod explain;
+mod expression_walk;
 mod join;
 mod join_order;
 mod outer_count_preaggregation;
@@ -73,6 +74,7 @@ use self::aggregate_exchange::*;
 use self::arithmetic::*;
 use self::decision_log::*;
 use self::explain::*;
+use self::expression_walk::*;
 use self::join::*;
 use self::join_order::*;
 use self::outer_count_preaggregation::*;
@@ -3577,142 +3579,6 @@ fn bind_update_source_for_all_rows(scan: ExecutionPlan) -> (ExecutionPlan, Query
 	(scan, QueryProfileHint::Scan)
 }
 
-fn reject_storage_synthetic_returning_reference(expr: &Expr) -> Result<(), BindingError> {
-	match expr {
-		Expr::Column(column)
-			if STORAGE_SYNTHETIC_COLUMN_NAMES.contains(&column.name.0.as_str()) =>
-		{
-			Err(BindingError::UnsupportedExpression {
-				message: format!(
-					"RETURNING column is reserved for storage metadata: {}",
-					column.name.0
-				),
-			})
-		}
-		Expr::Column(_) | Expr::Literal(_) | Expr::UntypedNull => Ok(()),
-		Expr::LogicalAscription { expr: inner, .. }
-		| Expr::SqlLogicalCast { expr: inner, .. }
-		| Expr::SqlConvert { expr: inner, .. }
-		| Expr::Cast(inner, _)
-		| Expr::TryCast(inner, _)
-		| Expr::Not(inner)
-		| Expr::IsNull(inner)
-		| Expr::IsNotNull(inner)
-		| Expr::Like { expr: inner, .. }
-		| Expr::Substring { input: inner, .. }
-		| Expr::TimeBucket(_, inner)
-		| Expr::AtTimeZone(inner, _)
-		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner) => reject_storage_synthetic_returning_reference(inner),
-		Expr::InList { expr, list, .. } => {
-			reject_storage_synthetic_returning_reference(expr)?;
-			for item in list {
-				reject_storage_synthetic_returning_reference(item)?;
-			}
-			Ok(())
-		}
-		Expr::Case {
-			when_then,
-			else_expr,
-		} => {
-			for (condition, result) in when_then {
-				reject_storage_synthetic_returning_reference(condition)?;
-				reject_storage_synthetic_returning_reference(result)?;
-			}
-			if let Some(else_expr) = else_expr {
-				reject_storage_synthetic_returning_reference(else_expr)?;
-			}
-			Ok(())
-		}
-		Expr::Add(left, right)
-		| Expr::Sub(left, right)
-		| Expr::Mul(left, right)
-		| Expr::Div(left, right)
-		| Expr::Eq(left, right)
-		| Expr::Neq(left, right)
-		| Expr::Lt(left, right)
-		| Expr::Lte(left, right)
-		| Expr::Gt(left, right)
-		| Expr::Gte(left, right)
-		| Expr::And(left, right)
-		| Expr::Or(left, right) => {
-			reject_storage_synthetic_returning_reference(left)?;
-			reject_storage_synthetic_returning_reference(right)
-		}
-	}
-}
-
-fn collect_logical_cast_names(
-	expr: &Expr,
-	names: &mut HashSet<String>,
-) -> Result<(), BindingError> {
-	match expr {
-		Expr::Column(_) | Expr::Literal(_) | Expr::UntypedNull => Ok(()),
-		Expr::SqlLogicalCast {
-			expr,
-			logical_name,
-			try_cast: _,
-		} => {
-			names.insert(logical_name.clone());
-			collect_logical_cast_names(expr, names)
-		}
-		Expr::SqlConvert {
-			expr,
-			target_logical_name,
-		} => {
-			names.insert(target_logical_name.clone());
-			collect_logical_cast_names(expr, names)
-		}
-		Expr::LogicalAscription { expr, .. }
-		| Expr::Cast(expr, _)
-		| Expr::TryCast(expr, _)
-		| Expr::Not(expr)
-		| Expr::IsNull(expr)
-		| Expr::IsNotNull(expr)
-		| Expr::Like { expr, .. }
-		| Expr::Substring { input: expr, .. }
-		| Expr::TimeBucket(_, expr)
-		| Expr::AtTimeZone(expr, _)
-		| Expr::Extract(_, expr)
-		| Expr::DateTrunc(_, expr) => collect_logical_cast_names(expr, names),
-		Expr::InList { expr, list, .. } => {
-			collect_logical_cast_names(expr, names)?;
-			for item in list {
-				collect_logical_cast_names(item, names)?;
-			}
-			Ok(())
-		}
-		Expr::Case {
-			when_then,
-			else_expr,
-		} => {
-			for (condition, result) in when_then {
-				collect_logical_cast_names(condition, names)?;
-				collect_logical_cast_names(result, names)?;
-			}
-			if let Some(else_expr) = else_expr {
-				collect_logical_cast_names(else_expr, names)?;
-			}
-			Ok(())
-		}
-		Expr::Add(left, right)
-		| Expr::Sub(left, right)
-		| Expr::Mul(left, right)
-		| Expr::Div(left, right)
-		| Expr::Eq(left, right)
-		| Expr::Neq(left, right)
-		| Expr::Lt(left, right)
-		| Expr::Lte(left, right)
-		| Expr::Gt(left, right)
-		| Expr::Gte(left, right)
-		| Expr::And(left, right)
-		| Expr::Or(left, right) => {
-			collect_logical_cast_names(left, names)?;
-			collect_logical_cast_names(right, names)
-		}
-	}
-}
-
 fn resolve_insert_target_columns(
 	schema: &SchemaRef,
 	columns: Option<&[String]>,
@@ -4916,6 +4782,7 @@ fn collect_program_node_columns(
 		| Some(BoundExprNode::Unary { input, .. })
 		| Some(BoundExprNode::Like { expr: input, .. })
 		| Some(BoundExprNode::Substring { input, .. })
+		| Some(BoundExprNode::Floor { input })
 		| Some(BoundExprNode::TimeBucket { input, .. })
 		| Some(BoundExprNode::AtTimeZone { input, .. })
 		| Some(BoundExprNode::Extract { input, .. })
@@ -5108,6 +4975,7 @@ fn bind_expr_into_program(
 			let inner = bind_null_test_input(builder, input_schema, ctx, inner)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNotNull, inner, DataType::Boolean))
 		}
+		Expr::Floor(inner) => bind_floor(builder, input_schema, ctx, inner),
 		Expr::TimeBucket(interval, inner) => {
 			if !ctx.config.allow_experimental_kernels {
 				return Err(BindingError::ExperimentalKernel {

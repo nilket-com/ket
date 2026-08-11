@@ -872,6 +872,7 @@ pub enum Expr {
 	},
 	IsNull(Box<Expr>),
 	IsNotNull(Box<Expr>),
+	Floor(Box<Expr>),
 	TimeBucket(std::time::Duration, Box<Expr>),
 	AtTimeZone(Box<Expr>, String),
 	Extract(TemporalExtractField, Box<Expr>),
@@ -907,6 +908,7 @@ impl Expr {
 			| Self::Like { .. }
 			| Self::Substring { .. }
 			| Self::Case { .. }
+			| Self::Floor(_)
 			| Self::TimeBucket(_, _)
 			| Self::AtTimeZone(_, _)
 			| Self::Extract(_, _)
