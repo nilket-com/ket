@@ -64,3 +64,46 @@ pub(crate) fn adr546_quantile_has_one_stable_authoritative_execution_path() {
 		.expect("read Wendelon stats source");
 	assert!(!storage_stats.contains("COLUMN_STATS_KLL_COMPACTION_SEED"));
 }
+
+#[test]
+pub(crate) fn adr547_tukey_relation_does_not_create_a_plot_specific_database_surface() {
+	let production = [
+		"src/ir.rs",
+		"src/ir/execution.rs",
+		"src/sql_planner.rs",
+		"src/aggregate_kernel.rs",
+		"src/exec/aggregate.rs",
+	]
+	.into_iter()
+	.map(|relative| {
+		std::fs::read_to_string(manifest_dir().join(relative))
+			.unwrap_or_else(|error| panic!("read {relative}: {error}"))
+	})
+	.collect::<String>()
+	.to_ascii_lowercase();
+	for plot_specific in ["boxplot", "box_plot", "tukey", "whisker", "polariton"] {
+		assert!(
+			!production.contains(plot_specific),
+			"ADR 547 must remain ordinary relational composition, found {plot_specific}"
+		);
+	}
+
+	let group_by = std::fs::read_to_string(manifest_dir().join("tests/group_by_test.rs"))
+		.expect("read group-by tests");
+	for marker in [
+		"adr547_tukey_relation_preserves_fences_whiskers_outliers_and_null_policy",
+		"vec![\"key\", \"low\", \"q1\", \"median\", \"q3\", \"high\", \"value\"]",
+		"ADR547_TUKEY_SQL",
+	] {
+		assert!(
+			group_by.contains(marker),
+			"missing ADR 547 control {marker}"
+		);
+	}
+	let distributed =
+		std::fs::read_to_string(manifest_dir().join("tests/distributed_process_test.rs"))
+			.expect("read distributed tests");
+	assert!(
+		distributed.contains("adr547_tukey_relation_corresponds_locally_and_across_worker_counts")
+	);
+}

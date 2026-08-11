@@ -211,6 +211,31 @@ struct QuantileProcessRun {
 	selected_workers: Vec<WorkerId>,
 }
 
+const ADR547_TUKEY_SQL: &str = "WITH samples AS ( \
+       SELECT category, sample AS value FROM fixture \
+       WHERE category IS NOT NULL AND sample IS NOT NULL), \
+     quartiles AS ( \
+       SELECT category, APPROX_QUANTILE(value, 0.25) AS q1, \
+              APPROX_QUANTILE(value, 0.50) AS median, \
+              APPROX_QUANTILE(value, 0.75) AS q3 \
+       FROM samples GROUP BY category), \
+     classified AS ( \
+       SELECT s.category, s.value, q.q1, q.median, q.q3, \
+              q.q1 - 1.5 * (q.q3 - q.q1) AS lower_fence, \
+              q.q3 + 1.5 * (q.q3 - q.q1) AS upper_fence \
+       FROM samples s JOIN quartiles q ON s.category = q.category), \
+     summaries AS ( \
+       SELECT category, MIN(CASE WHEN value >= lower_fence THEN value END) AS whisker_low, \
+              MIN(q1) AS q1, MIN(median) AS median, MIN(q3) AS q3, \
+              MAX(CASE WHEN value <= upper_fence THEN value END) AS whisker_high \
+       FROM classified GROUP BY category), \
+     outliers AS ( \
+       SELECT category, value AS outlier FROM classified \
+       WHERE value < lower_fence OR value > upper_fence) \
+   SELECT s.category, s.whisker_low, s.q1, s.median, s.q3, s.whisker_high, o.outlier \
+   FROM summaries s LEFT JOIN outliers o ON s.category = o.category \
+   ORDER BY s.category, o.outlier";
+
 #[derive(Debug)]
 struct JoinProcessRun {
 	digest: toron::distributed::task::ArrowIpcDigest,
@@ -1287,10 +1312,57 @@ async fn adr546_local_and_multiworker_quantiles_correspond_for_one_execution_see
 	);
 }
 
+#[test]
+fn adr547_tukey_relation_corresponds_locally_and_across_worker_counts() {
+	// The canonical nested CTE relation needs an enlarged harness stack. Keeping the bind and
+	// coordinator on this thread prevents a default-stack overflow from masquerading as lineage.
+	std::thread::Builder::new()
+		.name("adr547-distributed-tukey".to_string())
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("ADR 547 runtime");
+			runtime.block_on(async {
+				let seed = [0x47; 32];
+				let local = run_local_quantile_query(ADR547_TUKEY_SQL, seed).await;
+				let local_digest = canonical_arrow_ipc_digest(&local, SortPolicy::None)
+					.expect("local Tukey digest");
+				assert_eq!(local.iter().map(RecordBatch::num_rows).sum::<usize>(), 3);
+
+				let two_workers = run_tukey_process_query(8_480, 2, 0, seed).await;
+				let four_workers = run_tukey_process_query(8_490, 4, 1, seed).await;
+				// The same explicit test seed enters all three execution contexts, and every group is
+				// below the first compaction threshold. Digest equality therefore proves distributed
+				// relation correspondence for the exact population; it is not evidence that independent
+				// seeds or post-compaction sketches are byte-identical across executions.
+				assert_eq!(two_workers.row_count, 3);
+				assert_eq!(four_workers.row_count, 3);
+				assert_eq!(two_workers.digest, local_digest);
+				assert_eq!(four_workers.digest, local_digest);
+				assert_eq!(two_workers.digest, four_workers.digest);
+				assert_eq!(
+					unique_selected_worker_count(&two_workers.selected_workers),
+					2
+				);
+				assert_eq!(
+					unique_selected_worker_count(&four_workers.selected_workers),
+					4
+				);
+			});
+		})
+		.expect("spawn ADR 547 distributed harness thread")
+		.join()
+		.expect("ADR 547 distributed harness thread");
+}
+
 async fn run_local_quantile_query(sql: &str, seed: [u8; 32]) -> Vec<RecordBatch> {
 	let schema = Arc::new(Schema::new(vec![
 		Field::new("val", DataType::Int32, false),
 		Field::new("float_val", DataType::Float64, true),
+		Field::new("category", DataType::Utf8, true),
+		Field::new("sample", DataType::Float64, true),
 	]));
 	let batch = RecordBatch::try_new(
 		schema,
@@ -1301,6 +1373,29 @@ async fn run_local_quantile_query(sql: &str, seed: [u8; 32]) -> Vec<RecordBatch>
 					.map(|row| Some(row as f64 + 0.25))
 					.collect::<Vec<_>>(),
 			)),
+			Arc::new(StringArray::from(
+				(0..16)
+					.map(|row| Some(if row < 9 { "fence" } else { "zero" }))
+					.collect::<Vec<_>>(),
+			)),
+			Arc::new(Float64Array::from(vec![
+				Some(-6.0),
+				Some(-1.0),
+				Some(0.0),
+				Some(1.0),
+				Some(2.0),
+				Some(3.0),
+				Some(4.0),
+				Some(5.0),
+				Some(10.0),
+				Some(0.0),
+				Some(5.0),
+				Some(5.0),
+				Some(5.0),
+				Some(5.0),
+				Some(5.0),
+				Some(10.0),
+			])),
 		],
 	)
 	.expect("local quantile fixture");
@@ -1726,6 +1821,55 @@ async fn run_quantile_process_query(
 			.expect("grouped digest"),
 		global_median,
 		grouped_rows: grouped_results.iter().map(RecordBatch::num_rows).sum(),
+		selected_workers: registry.selected_workers(),
+	};
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+	run
+}
+
+async fn run_tukey_process_query(
+	worker_id_base: u128,
+	worker_count: usize,
+	start_offset: usize,
+	seed: [u8; 32],
+) -> OrderedGroupProcessRun {
+	let mut workers = Vec::new();
+	for index in 0..worker_count {
+		workers.push(
+			FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + index as u128)).await,
+		);
+	}
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let logical = SqlPlanner::new()
+		.plan(ADR547_TUKEY_SQL)
+		.expect("plan distributed Tukey relation");
+	let context = ExecutionContext::new(
+		SessionId(1),
+		QueryId::from_u128(worker_id_base + 102),
+		TenantId(1),
+		HlcBound(1),
+	)
+	.with_quantile_execution(seed, 1_024);
+	let results = coordinator
+		.execute_query_with_context(&logical, context)
+		.await
+		.expect("distributed Tukey relation");
+	let run = OrderedGroupProcessRun {
+		digest: canonical_arrow_ipc_digest(&results, SortPolicy::None).expect("Tukey digest"),
+		row_count: results.iter().map(RecordBatch::num_rows).sum(),
 		selected_workers: registry.selected_workers(),
 	};
 	for worker in &mut workers {
@@ -3120,6 +3264,8 @@ fn test_catalog() -> Arc<MockCatalog> {
 	let schema = Schema::new(vec![
 		Field::new("val", DataType::Int32, false),
 		Field::new("float_val", DataType::Float64, true),
+		Field::new("category", DataType::Utf8, true),
+		Field::new("sample", DataType::Float64, true),
 	]);
 	let mut catalog = MockCatalog::new();
 	catalog

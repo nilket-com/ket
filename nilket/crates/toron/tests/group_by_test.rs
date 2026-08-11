@@ -449,6 +449,151 @@ async fn adr546_stable_quantile_executes_globally_and_grouped_without_experiment
 	);
 }
 
+const ADR547_TUKEY_SQL: &str = "WITH samples AS ( \
+       SELECT category, value FROM measurements \
+       WHERE category IS NOT NULL AND value IS NOT NULL), \
+     quartiles AS ( \
+       SELECT category, \
+              APPROX_QUANTILE(value, 0.25) AS q1, \
+              APPROX_QUANTILE(value, 0.50) AS median, \
+              APPROX_QUANTILE(value, 0.75) AS q3 \
+       FROM samples GROUP BY category), \
+     classified AS ( \
+       SELECT s.category, s.value, q.q1, q.median, q.q3, \
+              q.q1 - 1.5 * (q.q3 - q.q1) AS lower_fence, \
+              q.q3 + 1.5 * (q.q3 - q.q1) AS upper_fence \
+       FROM samples s JOIN quartiles q ON s.category = q.category), \
+     summaries AS ( \
+       SELECT category, \
+              MIN(CASE WHEN value >= lower_fence THEN value END) AS whisker_low, \
+              MIN(q1) AS q1, MIN(median) AS median, MIN(q3) AS q3, \
+              MAX(CASE WHEN value <= upper_fence THEN value END) AS whisker_high \
+       FROM classified GROUP BY category), \
+     outliers AS ( \
+       SELECT category, value AS outlier FROM classified \
+       WHERE value < lower_fence OR value > upper_fence) \
+   SELECT s.category, s.whisker_low, s.q1, s.median, s.q3, s.whisker_high, o.outlier \
+   FROM summaries s LEFT JOIN outliers o ON s.category = o.category \
+   ORDER BY s.category, o.outlier";
+
+#[test]
+fn adr547_tukey_relation_preserves_fences_whiskers_outliers_and_null_policy() {
+	// The canonical five-CTE shape needs the same enlarged harness stack as other deep-plan
+	// fixtures. A default test-thread overflow is a harness limit, not a planner lineage result.
+	std::thread::Builder::new()
+		.name("adr547-tukey-relation".to_string())
+		.stack_size(64 * 1024 * 1024)
+		.spawn(|| {
+			let runtime = tokio::runtime::Builder::new_current_thread()
+				.enable_all()
+				.build()
+				.expect("ADR 547 runtime");
+			runtime.block_on(async {
+				let (catalog, storage) = tukey_fixture();
+				let logical = SqlPlanner::new()
+					.plan(ADR547_TUKEY_SQL)
+					.expect("plan canonical Tukey relation");
+				let bound = bind(&logical, &catalog, &PlannerConfig::default())
+					.await
+					.expect("bind canonical Tukey relation");
+
+				let expected_fields = [
+					("category", DataType::Utf8, true),
+					("whisker_low", DataType::Float64, true),
+					("q1", DataType::Float64, true),
+					("median", DataType::Float64, true),
+					("q3", DataType::Float64, true),
+					("whisker_high", DataType::Float64, true),
+					("outlier", DataType::Float64, true),
+				];
+				assert_eq!(bound.schema().fields().len(), expected_fields.len());
+				for (field, (name, data_type, nullable)) in
+					bound.schema().fields().iter().zip(expected_fields)
+				{
+					assert_eq!(field.name(), name);
+					assert_eq!(field.data_type(), &data_type);
+					assert_eq!(field.is_nullable(), nullable);
+				}
+
+				let neutral_sql = ADR547_TUKEY_SQL
+					.replace(
+						"SELECT s.category, s.whisker_low, s.q1, s.median, s.q3, s.whisker_high, o.outlier",
+						"SELECT s.category AS key, s.whisker_low AS low, s.q1, s.median, s.q3, \
+						 s.whisker_high AS high, o.outlier AS value",
+					)
+					.replace("ORDER BY s.category, o.outlier", "ORDER BY key, value");
+				assert_ne!(neutral_sql, ADR547_TUKEY_SQL);
+				let neutral = SqlPlanner::new()
+					.plan(&neutral_sql)
+					.expect("plan neutral Tukey aliases");
+				let neutral = bind(&neutral, &catalog, &PlannerConfig::default())
+					.await
+					.expect("bind neutral Tukey aliases");
+				assert_eq!(
+					neutral
+						.schema()
+						.fields()
+						.iter()
+						.map(|field| field.name().as_str())
+						.collect::<Vec<_>>(),
+					vec!["key", "low", "q1", "median", "q3", "high", "value"],
+				);
+
+				let results = Executor::new(storage)
+					.execute_bound(&bound, None)
+					.await
+					.expect("execute canonical Tukey relation");
+				assert_eq!(
+					tukey_rows(&results),
+					vec![
+						("fence".to_string(), -6.0, 0.0, 2.0, 4.0, 10.0, None),
+						(
+							"spread".to_string(),
+							0.0,
+							10.0,
+							40.0,
+							70.0,
+							80.0,
+							Some(-100.0)
+						),
+						(
+							"spread".to_string(),
+							0.0,
+							10.0,
+							40.0,
+							70.0,
+							80.0,
+							Some(-100.0)
+						),
+						(
+							"spread".to_string(),
+							0.0,
+							10.0,
+							40.0,
+							70.0,
+							80.0,
+							Some(200.0)
+						),
+						(
+							"spread".to_string(),
+							0.0,
+							10.0,
+							40.0,
+							70.0,
+							80.0,
+							Some(300.0)
+						),
+						("zero".to_string(), 5.0, 5.0, 5.0, 5.0, 5.0, Some(0.0)),
+						("zero".to_string(), 5.0, 5.0, 5.0, 5.0, 5.0, Some(10.0)),
+					],
+				);
+			});
+		})
+		.expect("spawn ADR 547 harness thread")
+		.join()
+		.expect("ADR 547 harness thread");
+}
+
 #[test]
 fn adr546_quantile_parameter_range_refuses_during_planning() {
 	for sql in [
@@ -7048,6 +7193,120 @@ fn fixture() -> (MockCatalog, Arc<FixtureScan>) {
 		]),
 	});
 	(catalog, storage)
+}
+
+fn tukey_fixture() -> (MockCatalog, Arc<TukeyScan>) {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("category", DataType::Utf8, true),
+		Field::new("value", DataType::Float64, true),
+	]));
+	let mut ids = Vec::new();
+	let mut categories = Vec::new();
+	let mut values = Vec::new();
+	let mut push = |category: Option<&'static str>, value: Option<f64>| {
+		ids.push(ids.len() as i64 + 1);
+		categories.push(category);
+		values.push(value);
+	};
+
+	// q1=0, median=2, q3=4: both mathematical fences (-6 and 10) are observations.
+	for value in [-6.0, -1.0, 0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 10.0] {
+		push(Some("fence"), Some(value));
+	}
+	// q1=10, median=40, q3=70: observed whiskers 0/80 differ from fences -80/160 and
+	// raw min/max -100/300. The repeated low outlier pins observation multiplicity.
+	for value in [
+		-100.0, -100.0, 0.0, 10.0, 20.0, 30.0, 40.0, 50.0, 60.0, 70.0, 80.0, 200.0, 300.0,
+	] {
+		push(Some("spread"), Some(value));
+	}
+	// Zero IQR: unequal values are outliers and repeated ordinary values do not create rows.
+	for value in [0.0, 5.0, 5.0, 5.0, 5.0, 5.0, 10.0] {
+		push(Some("zero"), Some(value));
+	}
+	push(None, Some(123.0));
+	push(Some("all_null"), None);
+
+	let batch = RecordBatch::try_new(
+		schema.clone(),
+		vec![
+			Arc::new(Int64Array::from(ids)),
+			Arc::new(StringArray::from(categories)),
+			Arc::new(Float64Array::from(values)),
+		],
+	)
+	.expect("Tukey fixture batch");
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(TableId(6), descriptor(6, "measurements", &schema, "id"))
+		.expect("register Tukey measurements");
+	(catalog, Arc::new(TukeyScan { batch }))
+}
+
+type TukeyRow = (String, f64, f64, f64, f64, f64, Option<f64>);
+
+fn tukey_rows(results: &[RecordBatch]) -> Vec<TukeyRow> {
+	let mut rows = Vec::new();
+	for batch in results {
+		let categories = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("Tukey category");
+		let floats = (1..=6)
+			.map(|column| {
+				batch
+					.column(column)
+					.as_any()
+					.downcast_ref::<Float64Array>()
+					.expect("Tukey numeric column")
+			})
+			.collect::<Vec<_>>();
+		for row in 0..batch.num_rows() {
+			rows.push((
+				categories.value(row).to_string(),
+				floats[0].value(row),
+				floats[1].value(row),
+				floats[2].value(row),
+				floats[3].value(row),
+				floats[4].value(row),
+				(!floats[5].is_null(row)).then(|| floats[5].value(row)),
+			));
+		}
+	}
+	rows
+}
+
+struct TukeyScan {
+	batch: RecordBatch,
+}
+
+#[async_trait::async_trait]
+impl StorageScan for TukeyScan {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		let mut batch = self.batch.clone();
+		if let Some(predicate) = &request.pbc_predicate {
+			batch = wendelon::schema::pbc::execute(predicate, &batch).map_err(|error| {
+				StorageError::InvalidPbcProgram {
+					message: format!("{error:?}"),
+				}
+			})?;
+		}
+		if let Some(projected_columns) = request.projected_columns {
+			let indices = projected_columns
+				.into_iter()
+				.map(|ordinal| ordinal.0 as usize)
+				.collect::<Vec<_>>();
+			batch = batch.project(&indices)?;
+		}
+		Ok(ScanStream::from_batches(
+			batch.schema(),
+			request.session_id,
+			request.query_id,
+			vec![batch],
+		))
+	}
 }
 
 fn sales_schema() -> SchemaRef {

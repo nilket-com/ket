@@ -54,6 +54,8 @@ impl FixtureStorageScan {
 		let vals_schema = Arc::new(Schema::new(vec![
 			Field::new("val", DataType::Int32, false),
 			Field::new("float_val", DataType::Float64, true),
+			Field::new("category", DataType::Utf8, true),
+			Field::new("sample", DataType::Float64, true),
 		]));
 		let orders_schema = Arc::new(Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
@@ -80,6 +82,29 @@ impl FixtureStorageScan {
 						.map(|row| Some(row as f64 + 0.25))
 						.collect::<Vec<_>>(),
 				)),
+				Arc::new(StringArray::from(
+					(0..16)
+						.map(|row| Some(if row < 9 { "fence" } else { "zero" }))
+						.collect::<Vec<_>>(),
+				)),
+				Arc::new(Float64Array::from(vec![
+					Some(-6.0),
+					Some(-1.0),
+					Some(0.0),
+					Some(1.0),
+					Some(2.0),
+					Some(3.0),
+					Some(4.0),
+					Some(5.0),
+					Some(10.0),
+					Some(0.0),
+					Some(5.0),
+					Some(5.0),
+					Some(5.0),
+					Some(5.0),
+					Some(5.0),
+					Some(10.0),
+				])),
 			],
 		)?;
 		let orders = RecordBatch::try_new(

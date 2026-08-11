@@ -1,6 +1,6 @@
 # ADR 547 - Tukey summary relation composition
 
-**Status:** Proposed and blocked on ADR 546, 2026-08-10.
+**Status:** Accepted and implemented 2026-08-11. ADR 546 landed first as required.
 
 ADR 546 makes grouped approximate quartiles a stable database capability. It
 does not by itself produce a conventional box summary. Tukey whiskers require a
@@ -16,33 +16,27 @@ intermediate CTE executes:
 - computed lower and upper fences;
 - conditional `MIN`/`MAX` for in-fence extremes.
 
-A final-recombination failure is **reported** but not yet reproduced. The report
-is that after nested CTEs and grouped summaries, a join projecting the original
-observation returns an unknown qualified column even though that column is
-visible when the source CTE or the immediately preceding CTE is queried alone.
+Once ADR 546 made the real aggregate runnable, the canonical query was executed
+with `APPROX_QUANTILE` rather than a stand-in. It planned, bound, and returned the
+expected seven-column relation. The reported final-recombination failure does
+not reproduce on the real path. Per this record's stop condition, the proposed
+lineage repair and its conditional acceptance gate were removed rather than
+being satisfied by a substitute query that never failed.
 
-This is recorded as a reported failure, not as banked Stage 0 evidence. Eleven
-reconstructed variants — including this record's canonical composition in §3,
-with CTE aliasing, the diamond where `classified` feeds both `summaries` and
-`outliers`, alias reuse across scopes, `CASE WHEN` fences, `AVG`, `LEFT JOIN`,
-and `ORDER BY` on qualified join columns — all bind cleanly against the standard
-fixture. Reproducing it requires the exact failing query, the table schema it
-ran against, and the frontend used (SQL or Rune).
-
-Until it reproduces, whether the cause is a planner/binder column-lineage defect
-is undetermined, and no lineage repair can be written red-first.
+The probe also separated a harness limit from a product result: this deeply
+nested query overflows Rust's default test-thread stack, but plans and executes
+on the repository's established 64 MiB deep-plan harness stack. Durable controls
+use that stack explicitly so a harness crash cannot later be reported as a
+lineage regression.
 
 This record pins one ordinary flat relation capable of carrying Tukey box
 semantics. It adds no box-plot function, array aggregate, renderer, or
-plot-specific server type. Whether it also closes a composition boundary depends
-on whether the reported failure reproduces: if it does not, there is no boundary
-to close and this record delivers the relation alone.
+plot-specific server type.
 
 Grouped quantiles alone are explicitly **not** an unblocker for the Polariton
 box surface. The complete database prerequisite is this record's fence, whisker
-and outlier gates, plus its lineage gates **if the reported failure
-reproduces**. If it does not reproduce, the fence, whisker and outlier gates are
-the whole of it and no lineage gate is owed.
+and outlier gates. No lineage gate is owed because the reported failure did not
+reproduce on the actual quantile query.
 
 ## Decision
 
@@ -187,34 +181,7 @@ Toron may optimize or internally materialize the CTEs, but accepted behavior is
 the result above. The implementation does not recognize this spelling and
 replace it with a box-specific plan.
 
-### 4. Column identity must survive nested CTEs, aggregation, and recombination
-
-**This section is conditional on reproducing the reported failure, and is
-removed with it if the artifact stays unavailable.**
-
-The requirement it states is unconditional and already appears to hold: a column
-selected by a CTE and visible in that CTE's schema remains bindable under its
-current table alias after the CTE participates in a later join and after sibling
-CTEs contain aggregates. What is conditional is that a *repair* is needed at
-all. If the report reproduces, the fix belongs to the normal projection/scope
-lineage; until then no defect in that lineage has been demonstrated.
-
-A stand-in fixture substituting stable `MIN`/`AVG`/`MAX` for q1, median and q3
-over the same join/conditional-summary/final-left-join shape would separate this
-repair from ADR 546's new aggregate state and give it an oracle already
-expressible today.
-
-**This step is conditional and is not currently actionable.** The stand-in shape
-binds cleanly, so there is no red to land first. It becomes a real step only
-when the reported failure reproduces from the exact production query, schema and
-frontend. If that artifact stays unavailable, the step is removed rather than
-satisfied by a query that never failed, and §4 carries no repair.
-
-The fix must not flatten table qualifiers into ambiguous bare names, expose a
-column pruned from the projected schema, or widen wildcard projection. The
-qualified name resolves because the relation really projects it.
-
-### 5. One statement observes one database snapshot
+### 4. One statement observes one database snapshot
 
 The summary query is one SQL request. Every CTE and repeated reference observes
 the same request snapshot under Toron's existing read semantics. The client
@@ -225,7 +192,7 @@ This gives fence classification and returned quartiles one observation moment.
 It does not promise one physical table scan, CTE caching, or a performance
 bound. Those are optimizer questions after correctness.
 
-### 6. The relation is generic; interpretation belongs to its consumer
+### 5. The relation is generic; interpretation belongs to its consumer
 
 Toron adds no `BOX_PLOT`, `TUKEY`, `WHISKERS`, or `OUTLIERS` syntax. It already
 has the scalar arithmetic, `CASE`, computed aggregate arguments, CTEs, joins,
@@ -238,81 +205,64 @@ is useful independently for anomaly reports and percentile summaries.
 
 ## Sequence
 
-1. Obtain the exact production artifact for the reported final-recombination
-   failure — query text, table schema, and frontend — and reproduce it. Eleven
-   reconstructed variants bind cleanly, so no stand-in reproduces it today. **If
-   it cannot be reproduced, remove steps 1 and 2 and §4 from this record** and
-   proceed from step 3; do not substitute a query that never failed.
-2. Only once reproduced: repair projection/scope lineage and land that query
-   green without any quantile or plotting change.
-3. After ADR 546 lands, run the full quantile query at q=0.25/0.50/0.75 and
-   prove Tukey semantics end to end. If steps 1 and 2 were removed for want of a
-   reproduction, this is the first executable step and there are no stand-ins to
-   replace.
-4. Add local/distributed and one-snapshot correspondence gates.
-5. Run the complete database battery and publish an implementation receipt that
+1. After ADR 546 lands, run the full quantile query at q=0.25/0.50/0.75 and
+   prove Tukey semantics end to end. Do not substitute aggregate stand-ins.
+2. Add local/distributed and one-snapshot correspondence gates.
+3. Run the complete database battery and publish an implementation receipt that
    repeats that grouped quantiles alone did not unblock the consumer.
 
 ## Acceptance
 
-1. **Lineage repair, conditional on reproduction.** Once the reported failure in
-   §Context is reproduced from the exact query, schema, and frontend, that query
-   moves from the qualified-column binding error to exact expected rows. Each
-   source and intermediate CTE has a passing direct projection control, so the
-   test cannot be repaired by deleting the missing observation from the final
-   output. If the report does not reproduce, this acceptance item is withdrawn
-   rather than satisfied by a substitute query that never failed.
-2. **Exact output schema.** The full query returns the seven columns in §1 with
+1. **Exact output schema.** The full query returns the seven columns in §1 with
    stable numeric types and a nullable outlier. No nested/list type or second
    result set is introduced.
-3. **Whiskers versus fences.** A fixture places observations between each
+2. **Whiskers versus fences.** A fixture places observations between each
    mathematical fence and the nearest in-fence datum. Returned whiskers equal
    those observed data values, not the fence coordinates and not raw min/max.
-4. **Outlier multiplicity.** The fixture contains different low/high outliers
+3. **Outlier multiplicity.** The fixture contains different low/high outliers
    and two identical outlier observations. The output contains every occurrence
    exactly once. A category with no outliers still emits one row with null
    outlier.
-5. **Fence inclusivity and zero IQR.** Values exactly on both fences remain
+4. **Fence inclusivity and zero IQR.** Values exactly on both fences remain
    in-fence. A zero-IQR category produces coincident quartiles/whiskers and
    classifies unequal observations as outliers without division or empty-state
    failure.
-6. **Canonical quartile correspondence.** Within each category, every output
+5. **Canonical quartile correspondence.** Within each category, every output
    row repeats byte-identical q1/median/q3 values; recomputing a quantile in a
    downstream CTE or producing fence values from a different sketch is
    structurally absent.
-7. **Null policy.** Null observations and null categories are excluded before
+6. **Null policy.** Null observations and null categories are excluded before
    aggregation. An all-null category is absent, not rendered as zeros or a
    fabricated row. A non-null sibling proves the query executed.
-8. **Duplicate ordinary observations.** Repeated in-fence source values affect
+7. **Duplicate ordinary observations.** Repeated in-fence source values affect
    the quantile population and preserve outlier multiplicity rules without
    creating extra summary-only rows. No hidden `DISTINCT` appears.
-9. **Single-request evidence.** A request-level integration gate proves all
+8. **Single-request evidence.** A request-level integration gate proves all
    stages execute as one statement against one snapshot. No client loop or
    interpolated follow-up query is introduced.
-10. **Local/distributed correspondence.** A value-discriminating multi-category
+9. **Local/distributed correspondence.** A value-discriminating multi-category
     fixture returns identical ordered rows locally and with at least two
     workers. ADR 531's global and grouped aggregate correctness posture remains
     intact.
-11. **Genericity.** Production source contains no box-specific logical plan,
+10. **Genericity.** Production source contains no box-specific logical plan,
     aggregate function, schema type, or Polariton dependency. The same query
     shape works with neutral aliases (`key`, `value`, `low`, `high`).
-12. **Complete prerequisite claim.** The receipt names grouped quartiles,
+11. **Complete prerequisite claim.** The receipt names grouped quartiles,
     fences, observed whiskers, variable outlier rows, and the final join as the
     delivered unit. It explicitly states that ADR 546 alone was not an
     unblocker.
-13. **Full battery.** The final tree passes the complete Toron battery and
-    current workspace checks, with no ignored or tolerated failures.
+12. **Full battery.** The final tree passes the complete Toron battery and
+    current workspace checks. No ADR 547 control is ignored or tolerated;
+    pre-existing explicitly ignored environment/weekly evidence targets remain
+    outside this record.
 
 ## Guardrails and stop conditions
 
-- This record is blocked until ADR 546's stable grouped quantiles land, which in
-  turn waits on Wendelon ADR 83. The lineage repair may be implemented first
-  **only if the reported failure is first reproduced from the exact production
-  artifact**; absent that, there is nothing to repair and the step is removed.
-  The record cannot close on stand-ins either way.
+- This record could not close on aggregate stand-ins. ADR 546's stable grouped
+  quantiles had to land first, and the final gate runs the actual quantile query.
 - If the final relation requires a new logical-plan variant, nested Arrow type,
   multi-result protocol, or box-specific executor, halt and redraft that larger
-  capability rather than hiding it as lineage repair.
+  capability rather than hiding it as ordinary relation composition.
 - If separate uses of a CTE can observe different snapshots in one request,
   halt. Do not move the quartiles into client code as a workaround.
 - If distributed planning splits one category's quantile or conditional
