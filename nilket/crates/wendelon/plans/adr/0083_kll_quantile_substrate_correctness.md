@@ -31,6 +31,24 @@ The ascending/descending pair is the diagnosis. The same multiset returns 899 or
 returns 499, which is why this survived: on unordered data it looks correct, and
 merging partially cancels the bias.
 
+Merge direction is independently answer-changing today. A Stage 0 probe split
+the population `0..1233` unevenly: sketch `a` received ascending `0..900`, sketch
+`b` received descending `901..1233`, and both began with seed 42. Reversing only
+the receiver produced:
+
+| merge | retained | reported p50 | serialized state |
+| --- | ---: | ---: | --- |
+| `a.merge(b)` | 50 | **894** | differs |
+| `b.merge(a)` | 50 | **893** | differs |
+
+The exact median is approximately 617. The one-rank difference is the
+load-bearing observation: merge direction changes the answer, not merely an
+irrelevant byte representation. The mechanism is that `merge` keeps the
+receiver's evolved `compaction_seed`, while unequal fragment histories have
+advanced that seed differently. Every production caller of `merge` therefore
+inherits receiver-order dependence, including aggregate-partial and CSB block
+merges.
+
 The mechanism is a missing weight. `KllSketch` holds one flat
 `values: Vec<Vec<u8>>`. `compact_if_needed` sorts, keeps alternating indices, and
 halves again until the buffer fits `k`, but survivors carry no weight and
@@ -140,29 +158,63 @@ than held open. If Stage 0 finds the randomized confidence model unacceptable,
 the answer is to redraft this record around MRL and revise 546 and 547 with it,
 not to leave both algorithms live and let whichever is implemented first win.
 
-### 3. The bound is withdrawn now and replaced only when it is executable
+### 3. The aggregate bound uses an explicit conservative derivation
 
-`rank_error_ppm()` is removed in this cut and **not** replaced with another
-formula. Big-O space complexity cannot produce a parts-per-million number.
+`rank_error_ppm() = 1_000_000 / k` is removed. The fully mergeable KLL result in
+Theorem 4 states an asymptotic bound with an unspecified constant `c₀`; quoting
+that theorem cannot produce a defensible shipped parts-per-million value. This
+record instead derives a larger executable bound from Theorem 3's explicit
+inequalities.
 
-A replacement requires all of the following to be pinned first:
+For the aggregate surface, pin:
 
-- **ε**, the additive rank error the configuration targets;
-- **δ_all**, together with its scope — per sketch, per query execution, or
-  fleet-and-window-wide. A confidence that is per-sketch means something
-  different to an operator reading one number on one column;
-- **δ_single**, satisfying δ_single ≤ ε · δ_all, since that is the value the
-  construction is actually sized for;
-- the **all-quantiles** guarantee rather than the single-quantile one;
-- the **capacity schedule** k_h = k·c^(H−h) for c ∈ (0.5, 1), the height above
-  which k_h = k, and the concrete constants mapping (k, c, H) to ε.
+```text
+c                         = 2/3
+top equal-capacity levels = s = 4
+k                         = next_even(ceil(8 / ε))
+δ_execution               = 2^-10
+maximum sketch states     = 2^10 = 1,024 per query execution
+δ_all per sketch          = δ_execution / 1,024 = 2^-20
+δ_single                  ≤ ε · δ_all
+```
 
-Until those exist the substrate reports **no** rank-error value. A rank error
-without its confidence contract is incomplete, and an incomplete number in an
-optimizer fact is what produced this defect. The existing `AGG_KLL_MIN_K`,
-`AGG_KLL_MAX_K` and `AGG_KLL_DEFAULT_K` bounds are re-derived from ε at that
-point rather than carried forward; `k` changes meaning under a capacity
-schedule.
+Toron ADR 546 enforces the 1,024-state ceiling independently of bytes and
+divides it across terminal tasks so their allowances sum to at most 1,024. A
+per-task ceiling would multiply with worker count and invalidate the execution-
+wide confidence claim.
+
+The derivation allocates half the rank budget to the deterministic top levels
+and half to the sampler and lower compactors. With the lower-system error
+parameter set to `ε/4`, Theorem 3 gives the conservative single-rank failure
+bound
+
+```text
+δ_single,actual ≤ 4 · exp(-(ε² · k² · 4^s) / 768).
+```
+
+The top levels contribute at most `s·n/k ≤ εn/2`. For `s=4` and
+`k≥8/ε`, the displayed probability is at most `4·exp(-64/3)`, below
+`2.2·10^-9`. Across the candidate ε range `[0.005, 0.02]`, that is no larger
+than `ε·2^-20`; the all-quantiles union bound is therefore within `2^-20` per
+sketch, and the declared 1,024-state admission keeps the whole execution within
+`2^-10`. Choosing ε outside that range requires re-running the derivation rather
+than extrapolating it.
+
+The retained-item bound is `7k+1`: at most `4k` across the top equal-capacity
+levels, at most `3k` across the geometrically decreasing lower levels for
+`c=2/3`, and one sampler item. The remaining product choice is ε, with its cost
+visible:
+
+| ε | k | retained-item bound |
+| ---: | ---: | ---: |
+| 0.5% | 1,600 | 11,201 |
+| 1% | 800 | 5,601 |
+| 2% | 400 | 2,801 |
+
+No lone rank-error number ships. Aggregate execution carries ε together with
+the execution-wide confidence and state-cap contract. CSB v2 must pin its own
+confidence scope before it restores range-distribution facts; it cannot inherit
+an execution-scoped δ. Until v2, no CSB rank-error value is reported at all.
 
 ### 4. Randomness has two surfaces and both are specified
 
@@ -299,6 +351,20 @@ independent envelope. The migration is therefore a block-format decision:
 Absence of a fact is a supported state — the binder already handles a column
 with no distribution. A wrong fact is not.
 
+**Landing order is aggregate core first, CSB v2 second.** When the weighted
+core lands, every version 1 range-distribution payload becomes unreadable as a
+quantile fact and new version 1 blocks stop emitting that payload. Min, max,
+null counts, bloom filters, HLL registers and every other valid version 1 fact
+remain available. Until the v2 writer, fleet fence and rebuild driver land,
+there are no range-distribution facts anywhere in the fleet — neither recovered
+legacy facts nor newly written ones.
+
+That interval is deliberate safe degradation, not a migration accident. It can
+change join choices because the binder falls back from distribution-aware
+selectivity, and timing baselines taken before, during and after it are not
+directly comparable. Stage 0 records representative plan shapes and timings
+with the fact class present versus absent before the core is enabled.
+
 ### 6. Legacy aggregate state is validated, not assumed
 
 A weighted reader of `AggregateState::Kll` must verify
@@ -321,6 +387,16 @@ item counts alone, and proves both through sustained insertion *and* repeated
 merging. Merge is where an unbounded implementation grows while every insert
 path looks correct.
 
+Retained canonical values use contiguous fixed-width storage per level, not
+`Vec<Vec<u8>>`. The supported quantile families are four- or eight-byte values;
+storing each as one fixed eight-byte slot makes the largest candidate payload
+about 90 KiB at ε=0.5%, 45 KiB at ε=1%, and 23 KiB at ε=2%, before level,
+sampler and seed metadata. A `Vec<Vec<u8>>` representation would add an outer
+vector object and a separate allocation per retained item, turning thousands of
+group states into hundreds of megabytes or gigabytes before useful data. The
+byte bound charges actual capacities for every level and the sampler, not only
+logical item counts.
+
 Toron ADR 546 currently promises "at most k values plus fixed metadata". That is
 false under either candidate: mergeable KLL retains a capacity schedule of
 lower-level buffers plus a sampler, and MRL grows with n. ADR 546 is revised to
@@ -335,10 +411,10 @@ pin one compaction schedule and over-specify the algorithm.
 
 ## Stage 0
 
-1. **Make the bound executable.** Produce the concrete (ε, δ, δ-scope, capacity
-   schedule, constants) tuple required by decision 3, traced to the paper's
-   theorem for the mergeable construction. Decision 3's replacement value does
-   not ship without it.
+1. **Choose ε with its price visible.** Decision 3 pins the conservative
+   derivation, confidence scope, state cap and schedule. Select 0.5%, 1% or 2%
+   only after accepting the corresponding per-state retained and byte costs in
+   its table. No implementation starts with ε still implicit.
 2. **The ordered multi-block fact measurement.** Build a
    `ColumnRangeDistributionFact` over an ordered column spanning several CSB
    blocks, through the real persist-and-merge path, and compare its buckets to
@@ -348,11 +424,14 @@ pin one compaction schedule and over-specify the algorithm.
    whether any measured production dataset is stored in sorted order — the
    earlier draft asserted that timestamp columns are ascending in storage, which
    is not a source-level invariant and is withdrawn.
-3. **Merge order dependence today.** `merge` checks type and `k` but not
-   `compaction_seed`, and `compact_if_needed` rotates the seed on every
-   compaction, so merging A into B and B into A appear to follow different
-   schedules. Confirm whether merge is commutative and associative today. If it
-   is not, distributed fragment merge order changes the answer.
+   Before suppressing v1 range facts, also record representative binder plan
+   shapes and timings with the fact present versus deliberately absent. This is
+   a comparability receipt for the no-facts interval, not a requirement that the
+   biased fact produce a better plan.
+3. **Merge order dependence today — discharged red.** The measured `894` versus
+   `893` p50 result in §Evidence confirms that receiver order changes both state
+   and answer. That exact uneven-history fixture becomes a red-first control for
+   the commutative pair-merge rules in decisions 2 and 4.
 4. **The rebuild inventory and the fleet fence.** Enumerate where version 1
    payloads exist, what source data can rebuild each, whether a block rewrite
    path already exists, and which mixed-fleet mechanism decision 5 will use.
@@ -392,12 +471,13 @@ pin one compaction schedule and over-specify the algorithm.
 5. **Legacy state is validated.** Uncompacted legacy aggregate state recovers as
    level zero; compacted legacy state is refused; a version 1 CSB block produces
    no range-distribution fact and does not reach the equal-weight path.
-6. **No unsupported bound is reported.** With decision 3's tuple unpinned, the
-   substrate reports no rank error at all, and a control asserts that. Once
-   pinned, the reported value is computed from the selected theorem and the
-   sketch's configuration with the derivation recorded. The Acceptance 1 corpus
-   is a **falsification battery**: it can refute a claimed bound but cannot
-   establish one, and passing it is not treated as proof of the guarantee.
+6. **No unsupported or unscoped bound is reported.** Aggregate execution exposes
+   the selected ε only together with `δ_execution=2^-10` and the 1,024-state
+   ceiling from decision 3. Version 1 CSB facts expose no rank error because they
+   expose no range-distribution fact; CSB v2 does not report one until its own
+   confidence scope is pinned. The Acceptance 1 corpus is a **falsification
+   battery**: it can refute the derived bound but cannot establish it, and
+   passing it is not treated as proof of the guarantee.
 7. **Streams are domain-separated.** Two sketches built independently with
    distinct identities produce **different** compaction coin sequences at the
    same level and index, and a control fails if `sketch_identity` is dropped
@@ -408,13 +488,21 @@ pin one compaction schedule and over-specify the algorithm.
    uses the coordinator-issued seed, and the merge-seed formula is asserted
    commutative on a pair.
 8. **Memory bounds hold** through sustained insertion and repeated merging,
-   charged against real allocation.
+   charged against real allocation. Retained values occupy contiguous
+   fixed-width level buffers; a guard rejects per-item heap allocation.
 9. **The Stage 0 ordered multi-block fact** is within the declared bound.
+10. **The no-facts interval is explicit.** With the weighted aggregate core and
+    v1 writer active, new and recovered v1 blocks produce no range-distribution
+    fact while every unaffected statistic survives. Binder controls prove
+    absence falls back safely, and the plan/timing receipt from Stage 0 records
+    the expected shape change rather than treating it as a regression.
 
 ## Guards and controls
 
 - A guard rejects reintroduction of a flat single-buffer quantile representation
   in the CSB payload, and reintroduction of level flattening in merge.
+- A guard rejects per-item heap ownership in retained quantile levels; canonical
+  values are stored in contiguous fixed-width buffers.
 - A guard rejects an **unsupported** rank-error formula — one not traceable to
   the selected algorithm's theorem and configuration. Deriving a bound from `k`
   together with fixed contract parameters is legitimate; `1_000_000 / k` is not,
@@ -444,6 +532,12 @@ pin one compaction schedule and over-specify the algorithm.
   weight bookkeeping. No `k` fixes an ascending median of 899.
 - **Keep a global constant compaction seed.** Rejected in decision 4: it voids
   the theorem's independence precondition.
+- **Write CSB v2 as part of the aggregate-core landing.** Rejected as the
+  sequence. It would shorten the no-facts interval by letting new blocks carry
+  corrected distributions immediately, but pulls the mixed-fleet writer fence
+  and rebuild mechanism onto the correctness repair's critical path. The fence
+  is the riskiest migration component; safe absence is preferred to delaying
+  the aggregate repair or preserving known-wrong v1 facts.
 - **Cross-execution byte-identical quantiles.** Rejected as a default in
   decision 4; available only with an explicit adversarial-input model.
 - **Repair this inside Toron ADR 546.** Rejected on placement. The sketch, the
@@ -454,10 +548,11 @@ pin one compaction schedule and over-specify the algorithm.
 ## Consequences
 
 Toron ADR 546 becomes implementable once this lands, and inherits a stated
-guarantee it can quote rather than one it must invent. It must first be revised
-on three points that this record contradicts: the fixed seed, the 5,000 ppm
-figure, and the at-most-k memory promise. ADR 547 follows 546 and inherits the
-same change from deterministic quartiles to values stable within an execution.
+guarantee it can quote rather than one it must invent. ADR 546 has been revised
+to withdraw its fixed seed, 5,000 ppm figure and at-most-k memory promise, and to
+enforce the execution-wide state cap this record's confidence requires. ADR 547
+follows 546 and inherits the same change from deterministic quartiles to values
+stable within an execution.
 
 Range-distribution facts change. If Stage 0 finds material end-to-end error,
 existing plan choices on ordered columns were made on biased selectivity, and

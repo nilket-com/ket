@@ -111,9 +111,10 @@ Three properties this record previously asserted are supplied by ADR 83 and are
 **not** decided here:
 
 - **The rank-error bound.** `ceil(1_000_000 / k) = 5_000 ppm` is withdrawn. It
-  derives from no theorem. ADR 83 reports no rank error until ε, δ and δ's
-  scope, the all-quantiles guarantee, and the capacity schedule are pinned; this
-  record quotes whatever that yields and does not restate a figure.
+  derives from no theorem. ADR 83 now pins the conservative Theorem 3
+  derivation, execution-wide confidence, 1,024-state cap and capacity schedule;
+  ε remains its one explicit Stage 0 product choice. This record consumes the
+  selected tuple and does not restate a different figure.
 - **The seed.** A fixed, named compaction seed is withdrawn. The selected
   algorithm is randomized, and its guarantee requires randomness independent of
   the data, which a constant known before the data cannot supply. ADR 83 issues
@@ -208,6 +209,24 @@ state as the size of an enum discriminant. Because one state now serves every
 requested `q` for a group, the charge is per `(group, value expression)` rather
 than per `(group, value expression, q)`.
 
+Memory admission is necessary but cannot license the confidence claim by
+itself. This cut separately declares
+`MAX_QUANTILE_STATES_PER_EXECUTION = 1_024`. The count is over distinct
+`(group, value expression)` sketches; q1, median and q3 finalized from one
+shared sketch count once. The coordinator divides that execution-wide allowance
+deterministically across terminal aggregate tasks, and the task allowances sum
+to at most 1,024. Unused allowance is not silently multiplied per worker or
+recovered by admitting above the execution cap in this cut.
+
+The 1,025th state refuses **before construction** through typed query-budget
+exhaustion with a diagnostic naming `MAX_QUANTILE_STATES_PER_EXECUTION` and the
+value 1,024. This count gate is enforced even when bytes remain. Conversely, the
+ordinary memory gate may refuse below 1,024 when actual charged bytes are
+exhausted; that only makes ADR 83's execution-wide union bound more
+conservative. Inferring the state count from the byte budget is forbidden,
+because the admitted count would then vary with physical value width and heap
+layout while the advertised confidence continued to assume a fixed maximum.
+
 If admitting another group or growing its sketch exceeds the budget, execution
 refuses through the existing typed aggregate-memory path. The implementation
 does not lower `k`, spill, silently skip values, or merge unrelated groups to
@@ -275,10 +294,11 @@ quantile, `MEDIAN` alias, or window-function form enters this record.
 4. **Compaction oracle.** An input much larger than the compaction threshold
    forces compaction. The answer's rank in the exact sorted population is within
    ADR 83's declared bound plus the single-rank discretization allowance. The
-   bound is quoted from ADR 83, not restated here; until ADR 83 pins it, this
-   item cannot be evaluated. The test asserts no value-distance bound and proves
-   compaction occurred. Ordered inputs are included: ascending and descending
-   arrival are the orderings that falsified the previous substrate.
+   bound is quoted from ADR 83, not restated here; this item becomes executable
+   when ADR 83 selects ε from its priced Stage 0 table. The test asserts no
+   value-distance bound and proves compaction occurred. Ordered inputs are
+   included: ascending and descending arrival are the orderings that falsified
+   the previous substrate.
 5. **Canonical encoding.** A fixture whose signed raw big-endian byte order
    differs from numeric order returns the numeric answer. Float encodings cover
    negative values, both zero spellings, and positive values. No direct raw-byte
@@ -294,7 +314,11 @@ quantile, `MEDIAN` alias, or window-function form enters this record.
    flat representation. A many-group fixture crosses a deliberately small task
    budget and receives the existing typed memory refusal rather than OOM,
    truncation, or reduced precision. The charge is per `(group, value
-   expression)`, since one state serves every requested `q`.
+   expression)`, since one state serves every requested `q`. An independent
+   count fixture admits exactly 1,024 sketches and refuses the 1,025th before
+   construction with the cap named; changing physical value width or increasing
+   the byte budget does not move that boundary. A distributed control proves
+   terminal-task allowances sum to 1,024 rather than granting 1,024 per worker.
 8. **Wendelon API authority.** Toron calls `query_quantile`; it never sorts
    `retained_values()` or derives a quantile from `query_buckets()`. Direct
    Wendelon tests cover empty, exact, compacted, and merge-compatible sketches.
@@ -328,6 +352,9 @@ quantile, `MEDIAN` alias, or window-function form enters this record.
   sort-and-index estimate as KLL semantics.
 - If KLL heap ownership cannot be charged through the existing aggregate task
   budget, halt rather than ship an unaccounted per-group allocation.
+- If the execution-wide 1,024-state admission cannot be divided across terminal
+  tasks without any task exceeding the shared total, halt rather than relabel a
+  per-task cap as execution-wide confidence.
 - If current distributed planning can split one logical population among
   independent terminal quantile states, halt and record partial-state merge or
   a correctness funnel separately.
