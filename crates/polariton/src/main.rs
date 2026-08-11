@@ -11,8 +11,12 @@ mod plot;
 mod result_registry;
 mod rune_host;
 #[cfg(feature = "toron")]
+mod rune_presentation;
+#[cfg(feature = "toron")]
 mod rune_relation_envelope;
 mod rune_view;
+#[cfg(feature = "toron")]
+mod rune_view_compiler;
 #[cfg(feature = "toron")]
 mod session_persistence;
 

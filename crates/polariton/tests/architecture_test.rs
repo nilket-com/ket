@@ -63,9 +63,9 @@ fn product_0057_render_evidence_mirrors_the_binary_module_graph() {
 	);
 }
 
-fn envelope_leaks(source: &str, is_envelope: bool) -> Vec<&'static str> {
+fn envelope_leaks(source: &str, is_transport_boundary: bool) -> Vec<&'static str> {
 	let mut findings = Vec::new();
-	if !is_envelope {
+	if !is_transport_boundary {
 		for (needle, label) in [
 			(
 				"ast::EmptyBlock",
@@ -218,9 +218,12 @@ fn product_0003_terminal_envelope_is_the_only_relation_view_transformation_site(
 				continue;
 			}
 			let source = std::fs::read_to_string(&path).expect("read source");
-			let is_envelope = path.file_name().and_then(|name| name.to_str())
-				== Some("rune_relation_envelope.rs");
-			for finding in envelope_leaks(&source, is_envelope) {
+			let boundary = path.file_name().and_then(|name| name.to_str());
+			let is_transport_boundary = matches!(
+				boundary,
+				Some("rune_relation_envelope.rs" | "rune_view_compiler.rs")
+			);
+			for finding in envelope_leaks(&source, is_transport_boundary) {
 				findings.push(format!("{}: {finding}", path.display()));
 			}
 		}
@@ -659,12 +662,12 @@ fn product_0018_rune_surface_keeps_point_size_out_of_prepared_data() {
 		!scatter.contains("point_size_px"),
 		"point size must not return to ScatterPreparedData or preparation arguments"
 	);
-	let envelope = std::fs::read_to_string(source.join("rune_relation_envelope.rs"))
-		.expect("read Rune envelope");
+	let presentation = std::fs::read_to_string(source.join("rune_presentation.rs"))
+		.expect("read typed Rune presentation VM");
 	assert!(
-		envelope.contains("\"point_size\"")
-			&& envelope.contains("PointSize::new")
-			&& envelope.contains("LayerSettings"),
+		presentation.contains("(\"__point_size\", raw_mark_point_size as RawFunction)")
+			&& presentation.contains("PointSize::new")
+			&& presentation.contains("sink.settings.point_size = Override::Set(value)"),
 		"PRODUCT-0018 must validate the closed Rune spelling through PRODUCT-0017's typed handoff"
 	);
 }
@@ -690,18 +693,18 @@ fn product_0019_stroke_width_is_render_state_not_prepared_line_data() {
 
 #[test]
 fn product_0020_extends_the_closed_typed_modifier_register() {
-	let envelope = std::fs::read_to_string(
-		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rune_relation_envelope.rs"),
+	let presentation = std::fs::read_to_string(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rune_presentation.rs"),
 	)
-	.expect("read Rune envelope");
+	.expect("read typed Rune presentation VM");
 	assert!(
-		envelope.contains("\"stroke_width\"")
-			&& envelope.contains("StrokeWidth::new")
-			&& envelope.contains("stroke_width.map_or(Override::Inherit, Override::Set)"),
+		presentation.contains("(\"__stroke_width\", raw_mark_stroke_width as RawFunction)")
+			&& presentation.contains("StrokeWidth::new")
+			&& presentation.contains("sink.settings.stroke_width = Override::Set(value)"),
 		"PRODUCT-0020 must lower the named modifier through PRODUCT-0019's typed handoff"
 	);
 	assert!(
-		!envelope.contains("HashMap<String, LayerModifier"),
+		!presentation.contains("HashMap<String, LayerModifier"),
 		"the second setting does not authorize an open modifier map"
 	);
 }
@@ -747,19 +750,20 @@ fn product_0021_bar_width_is_render_state_without_bar_layer_admission() {
 
 #[test]
 fn product_0022_bar_width_extends_only_the_closed_styled_single_register() {
-	let envelope = std::fs::read_to_string(
-		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rune_relation_envelope.rs"),
-	)
-	.expect("read Rune envelope");
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read transported intent");
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed Rune presentation VM");
 	assert!(
 		envelope.contains("pub(crate) struct StyledRunePlotSink")
-			&& envelope.contains("\"bar_width\"")
-			&& envelope.contains("BarWidth::new")
-			&& envelope.contains("bar_width.map_or(Override::Inherit, Override::Set)"),
+			&& presentation.contains("(\"__bar_width\", raw_mark_bar_width as RawFunction)")
+			&& presentation.contains("BarWidth::new")
+			&& presentation.contains("sink.settings.bar_width = Override::Set(value)"),
 		"PRODUCT-0022 must use the general styled-single carrier and typed substrate"
 	);
 	assert!(
-		!envelope.contains("HashMap<String, LayerModifier"),
+		!presentation.contains("HashMap<String, LayerModifier"),
 		"the third setting does not authorize open modifier dispatch"
 	);
 }
@@ -767,16 +771,16 @@ fn product_0022_bar_width_extends_only_the_closed_styled_single_register() {
 #[test]
 fn product_0053_category_gap_stays_in_the_closed_bar_register() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
-		.expect("read Rune envelope");
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed Rune presentation VM");
 	assert!(
-		envelope.contains("\"category_gap\"")
-			&& envelope.contains("CategoryGap::new")
-			&& envelope.contains("category_gap.map_or(Override::Inherit, Override::Set)"),
+		presentation.contains("(\"__category_gap\", raw_mark_category_gap as RawFunction)")
+			&& presentation.contains("CategoryGap::new")
+			&& presentation.contains("sink.settings.category_gap = Override::Set(value)"),
 		"PRODUCT-0053 must lower the named modifier through the closed typed bar register"
 	);
 	assert!(
-		!envelope.contains("HashMap<String, LayerModifier"),
+		!presentation.contains("HashMap<String, LayerModifier"),
 		"category gap does not authorize open modifier dispatch"
 	);
 	// PRODUCT-0064 supersedes 0053's dashboard-only negative boundary by
@@ -928,7 +932,10 @@ fn product_0025_theme_projection_and_table_register_keep_their_authority_boundar
 	assert!(envelope_production.contains("pub(crate) struct RuneTableSink"));
 	assert!(envelope_production.contains("pub(crate) skin: RuneTableSkinIntent"));
 	assert!(envelope_production.contains("pub(crate) enum RuneTableSkinIntent"));
-	assert!(envelope_production.contains("\"skin\" =>"));
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed presentation VM");
+	assert!(presentation.contains("(\"__skin\", raw_table_skin as RawFunction)"));
+	assert!(presentation.contains("table.skin_name = Some(name.to_owned())"));
 	assert!(!envelope_production.contains("use crate::gui::table_skin"));
 	assert!(!envelope_production.contains("TableSkin::"));
 	assert!(!envelope_production.contains("TableRgba"));
@@ -1046,20 +1053,23 @@ fn product_0027_surface_keeps_projection_intent_bounded_and_plot_registers_close
 	assert!(envelope_production.contains(
 		"pub(crate) enum RuneTableSkinIntent {\n\t#[default]\n\tDefault,\n\tNamedTheme {"
 	));
-	assert!(envelope_production.contains("\"duotone\" =>"));
-	assert!(envelope_production.contains("\"duotone() takes no arguments\""));
-	assert!(envelope_production.contains("if duotone && skin_name.is_none()"));
-	assert!(envelope_production.contains("\"duotone() requires skin(string_literal)\""));
-
-	let mark_register = envelope_production
-		.split("fn parse_modified_mark(")
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed presentation VM");
+	assert!(presentation.contains("(\"__duotone\", raw_table_duotone as RawFunction)"));
+	assert!(presentation.contains("\"duotone() takes no arguments\""));
+	assert!(presentation.contains("if table.duotone && table.skin_name.is_none()"));
+	assert!(presentation.contains("\"duotone() requires skin(string)\""));
+	assert!(presentation.contains(".build_associated::<RuneTable>()"));
+	assert!(presentation.contains(".build_associated::<RuneMark>()"));
+	let mark_register = presentation
+		.split("for (name, function) in [\n\t\t(\"__point_size\"")
 		.nth(1)
-		.expect("mark register")
-		.split("fn parse_layer_modifier_factor(")
+		.expect("typed mark register")
+		.split(".build_associated::<RuneMark>()")
 		.next()
-		.expect("bounded mark register source");
-	assert!(!mark_register.contains("\"skin\" =>"));
-	assert!(!mark_register.contains("\"duotone\" =>"));
+		.expect("bounded typed mark register");
+	assert!(!mark_register.contains("raw_table_skin"));
+	assert!(!mark_register.contains("raw_table_duotone"));
 
 	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
 	let state_production = state
@@ -1103,55 +1113,46 @@ fn product_0035_authored_table_contrast_is_observable_but_never_an_admission_gat
 #[test]
 fn product_0036_numeric_bounds_have_one_figure_producer_and_no_magnitude_gate() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
-		.expect("read Rune envelope");
-	let envelope_production = envelope
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed presentation VM");
+	let production = presentation
 		.split("#[cfg(test)]\nmod tests")
 		.next()
-		.expect("production Rune envelope source");
-	let figure_parser = envelope_production
-		.split("fn parse_figure(")
+		.expect("production presentation source");
+	let bounds = production
+		.split("fn bounds_element(")
 		.nth(1)
-		.expect("figure parser")
-		.split("fn parse_figure_bounds(")
+		.expect("bounds constructor")
+		.split("fn numeric_pair_element(")
 		.next()
-		.expect("bounded figure parser");
-	assert!(figure_parser.contains("\"x_bounds\" =>"));
-	assert!(figure_parser.contains("\"y_bounds\" =>"));
+		.expect("bounded bounds constructor");
+	assert!(production.contains("raw_x_bounds"));
+	assert!(production.contains("raw_y_bounds"));
 	assert_eq!(
-		figure_parser
+		production
 			.matches("authored_settings.domains = Override::Set")
 			.count(),
 		1,
 		"both axes must lower through one grouped domain override"
 	);
-
-	let bounds_parser = envelope_production
-		.split("fn parse_figure_bounds(")
-		.nth(1)
-		.expect("bounds parser")
-		.split("fn parse_signed_numeric_literal(")
-		.next()
-		.expect("bounded bounds parser");
-	assert!(bounds_parser.contains("!minimum.is_finite() || !maximum.is_finite()"));
-	assert!(bounds_parser.contains("minimum == maximum"));
-	assert!(bounds_parser.contains("minimum > maximum"));
+	assert!(bounds.contains("!minimum.is_finite() || !maximum.is_finite()"));
+	assert!(bounds.contains("minimum == maximum"));
+	assert!(bounds.contains("minimum > maximum"));
 	for forbidden in ["EPSILON", ".abs()", "maximum - minimum", "minimum_span"] {
 		assert!(
-			!bounds_parser.contains(forbidden),
+			!bounds.contains(forbidden),
 			"numeric bounds acquired a magnitude admission rule through {forbidden}"
 		);
 	}
-
-	let mark_parser = envelope_production
-		.split("fn parse_modified_mark(")
+	let mark_register = production
+		.split("for (name, function) in [\n\t\t(\"__point_size\"")
 		.nth(1)
-		.expect("mark parser")
-		.split("fn parse_layer_modifier_factor(")
+		.expect("typed mark register")
+		.split(".build_associated::<RuneMark>()")
 		.next()
-		.expect("bounded mark parser");
-	assert!(!mark_parser.contains("x_bounds"));
-	assert!(!mark_parser.contains("y_bounds"));
+		.expect("bounded typed mark register");
+	assert!(!mark_register.contains("x_bounds"));
+	assert!(!mark_register.contains("y_bounds"));
 
 	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
 	let state_production = state
@@ -1215,28 +1216,21 @@ fn product_0037_tick_positions_have_one_closed_generator_and_no_surface_caller()
 #[test]
 fn product_0038_tick_step_is_the_only_surface_producer_of_step_placement() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
-		.expect("read Rune envelope");
-	let production = envelope
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed presentation VM");
+	let production = presentation
 		.split("#[cfg(test)]\nmod tests")
 		.next()
-		.expect("Rune envelope production");
-	let figure_parser = production
-		.split("fn parse_figure(")
-		.nth(1)
-		.expect("figure parser")
-		.split("fn parse_figure_bounds(")
-		.next()
-		.expect("bounded figure parser");
-	assert!(figure_parser.contains("\"x_tick_step\" =>"));
-	assert!(figure_parser.contains("\"y_tick_step\" =>"));
+		.expect("typed presentation production");
+	assert!(production.contains("raw_x_tick_step"));
+	assert!(production.contains("raw_y_tick_step"));
 	assert_eq!(
-		figure_parser
+		production
 			.matches("authored_settings.guides = Override::Set")
 			.count(),
 		1
 	);
-	assert!(production.contains("fn parse_figure_tick_step("));
+	assert!(production.contains("fn numeric_scalar_element("));
 	assert!(production.contains("step must be strictly positive"));
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
@@ -1250,22 +1244,15 @@ fn product_0038_tick_step_is_the_only_surface_producer_of_step_placement() {
 #[test]
 fn product_0039_minor_ticks_have_one_surface_producer_and_checked_total_capacity() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
-		.expect("read Rune envelope");
-	let production = envelope
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed presentation VM");
+	let production = presentation
 		.split("#[cfg(test)]\nmod tests")
 		.next()
-		.expect("Rune envelope production");
-	let figure_parser = production
-		.split("fn parse_figure(")
-		.nth(1)
-		.expect("figure parser")
-		.split("fn parse_figure_bounds(")
-		.next()
-		.expect("bounded figure parser");
-	assert!(figure_parser.contains("\"x_minor_ticks\" =>"));
-	assert!(figure_parser.contains("\"y_minor_ticks\" =>"));
-	assert!(production.contains("fn parse_figure_minor_ticks("));
+		.expect("typed presentation production");
+	assert!(production.contains("raw_x_minor_ticks"));
+	assert!(production.contains("raw_y_minor_ticks"));
+	assert!(production.contains("fn minor_ticks_element("));
 	assert!(production.contains("count must be a non-negative integer"));
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
@@ -1281,25 +1268,17 @@ fn product_0039_minor_ticks_have_one_surface_producer_and_checked_total_capacity
 #[test]
 fn product_0040_static_literal_bindings_resolve_only_at_the_envelope_boundary() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
-		.expect("read Rune envelope");
-	let production = envelope
+	let compiler = std::fs::read_to_string(root.join("rune_view_compiler.rs"))
+		.expect("read static shell compiler");
+	let production = compiler
 		.split("#[cfg(test)]\nmod tests")
 		.next()
-		.expect("Rune envelope production");
-	assert!(production.contains("fn resolve_static_literal("));
-	assert!(production.contains("fn resolve_static_literal_text("));
-	assert!(production.contains("statement_start < use_start"));
-	assert!(production.contains("binding {name:?} does not resolve to a literal"));
-	assert!(production.contains("fn parse_figure_heading("));
-	assert!(production.contains("fn parse_figure_bounds("));
-	assert!(production.contains("fn parse_figure_tick_step("));
-	assert!(production.contains("fn parse_figure_minor_ticks("));
-	for forbidden in [
-		"parse_all::<ast::EmptyBlock>(initializer",
-		"rune::runtime",
-		"rune::Vm",
-	] {
+		.expect("static shell production");
+	assert!(production.contains("fn is_static_literal_expression("));
+	assert!(production.contains("definition.statement.start < use_start"));
+	assert!(production.contains("definition.literal"));
+	assert!(production.contains("only static literal and alias closures may cross both VMs"));
+	for forbidden in ["rune::runtime", "rune::Vm", "execute_generated(source"] {
 		assert!(
 			!production.contains(forbidden),
 			"static literal resolution evaluated Rune through {forbidden}"
@@ -1475,17 +1454,17 @@ fn product_0029_positions_and_exact_band_fills_stay_inside_the_plot_boundary() {
 #[test]
 fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-	let envelope =
-		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
-	let figure_parser = envelope
-		.split("fn parse_figure(")
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed presentation VM");
+	let figure_decoder = presentation
+		.split("fn merge_element(")
 		.nth(1)
-		.expect("figure parser")
-		.split("fn parse_figure_heading(")
+		.expect("figure element decoder")
+		.split("fn finalize_mark_body(")
 		.next()
-		.expect("bounded figure parser");
-	assert!(figure_parser.contains("\"palette\" =>"));
-	assert!(figure_parser.contains("authored_settings.categorical_palette"));
+		.expect("bounded figure decoder");
+	assert!(figure_decoder.contains("FigureElementKind::Palette"));
+	assert!(figure_decoder.contains("authored_settings.categorical_palette"));
 	for forbidden in [
 		"CategoricalPaletteSelection",
 		"ResolvedCategoricalPalette",
@@ -1494,17 +1473,17 @@ fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary(
 		"Theme::try_new",
 	] {
 		assert!(
-			!figure_parser.contains(forbidden),
+			!figure_decoder.contains(forbidden),
 			"Rune normal form acquired resolved/head state through {forbidden}"
 		);
 	}
-	let mark_register = envelope
-		.split("fn parse_modified_mark(")
+	let mark_register = presentation
+		.split("for (name, function) in [\n\t\t(\"__point_size\"")
 		.nth(1)
-		.expect("mark register")
-		.split("fn parse_layer_modifier_factor(")
+		.expect("typed mark register")
+		.split(".build_associated::<RuneMark>()")
 		.next()
-		.expect("bounded mark register");
+		.expect("bounded typed mark register");
 	assert!(!mark_register.contains("\"palette\""));
 	assert!(!mark_register.contains("\"skin\""));
 
@@ -1661,25 +1640,25 @@ fn product_0033_plot_skin_projection_choice_is_bounded_and_renderer_free() {
 	assert!(production.contains("Ordered"));
 	assert!(production.contains("Duotone"));
 
-	let envelope =
-		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
-	let figure_parser = envelope
-		.split("fn parse_figure(")
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed presentation VM");
+	let figure_decoder = presentation
+		.split("fn decode_figure(")
 		.nth(1)
-		.expect("figure parser")
-		.split("fn parse_figure_heading(")
+		.expect("figure decoder")
+		.split("fn presentation_value_origin(")
 		.next()
-		.expect("bounded parser");
-	assert!(figure_parser.contains("authored_settings.plot_skin"));
-	let skin_parser = envelope
-		.split("fn parse_figure_skin(")
+		.expect("bounded figure decoder");
+	assert!(figure_decoder.contains("PlotSkinSelection::new(name, skin.projection)"));
+	let skin_modifier = presentation
+		.split("fn skin_duotone(")
 		.nth(1)
-		.expect("plot skin parser")
-		.split("fn parse_figure_heading(")
+		.expect("plot skin modifier")
+		.split("fn presentation_table(")
 		.next()
-		.expect("bounded plot skin parser");
-	assert_eq!(skin_parser.matches("\"duotone\"").count(), 1);
-	assert!(!skin_parser.contains("TableSkin"));
+		.expect("bounded plot skin modifier");
+	assert!(skin_modifier.contains("PlotChromeProjection::Duotone"));
+	assert!(!skin_modifier.contains("TableSkin"));
 
 	for relative in ["plot/spec/mod.rs", "plot/factory.rs"] {
 		let source = std::fs::read_to_string(root.join(relative)).expect("read plot boundary");
@@ -2172,5 +2151,78 @@ fn product_0075_nested_dashboard_is_absent_and_renderer_catalog_is_exact() {
 	assert_eq!(
 		catalog, variants,
 		"PlotType::ALL is PRODUCT-0075's exact renderer catalog, not picker residue"
+	);
+}
+
+#[test]
+fn product_0076_presentation_has_one_typed_semantic_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune transport");
+	let compiler = std::fs::read_to_string(root.join("rune_view_compiler.rs"))
+		.expect("read static shell compiler");
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read typed presentation VM");
+	let gui_state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read GUI state");
+	fn production(source: &str) -> &str {
+		source
+			.split("\n#[cfg(test)]\nmod tests {")
+			.next()
+			.expect("production source before tests")
+	}
+	for retired in [
+		"fn parse_figure(",
+		"fn parse_modified_mark(",
+		"fn parse_modified_table(",
+		"fn parse_layer(",
+		"fn parse_figure_bounds(",
+	] {
+		assert!(
+			!production(&envelope).contains(retired),
+			"PRODUCT-0076 retired AST semantic recognizer remains: {retired}"
+		);
+	}
+	assert!(production(&gui_state).contains("crate::rune_view_compiler::compile(&work.source)"));
+	assert!(compiler.contains("execute_generated("));
+	assert!(compiler.contains("PresentationMapKind::Synthetic"));
+	assert!(presentation.contains("build_associated::<RuneMark>()"));
+	assert!(presentation.contains("PRESENTATION_INSTRUCTION_BUDGET"));
+	assert!(
+		!compiler.contains("match method {\n\t\t\"stacked\"")
+			&& !compiler.contains("match method {\n\t\t\"percent\""),
+		"stacked and percent semantics belong to registered Rune methods"
+	);
+}
+
+#[test]
+fn product_0076_showcase_and_seed_are_repository_owned() {
+	let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let compiler = std::fs::read_to_string(crate_root.join("src/rune_view_compiler.rs"))
+		.expect("read static shell compiler");
+	let showcase = std::fs::read_to_string(crate_root.join("../../uat/test21.rn"))
+		.expect("read repository-owned PRODUCT-0076 showcase");
+	let seed = std::fs::read_to_string(crate_root.join("../../uat/demo_sales.sql"))
+		.expect("read repository-owned PRODUCT-0076 seed");
+
+	assert!(
+		compiler.contains("include_str!(\"../../../uat/test21.rn\")"),
+		"the compiled showcase gate must consume the repository-owned UAT artifact"
+	);
+	assert!(
+		!compiler.contains("../../../../uat/") && !compiler.contains("/home/me/work/uat"),
+		"a build or gate must not depend on an unversioned sibling UAT directory"
+	);
+	assert_eq!(
+		showcase.matches("view(\"").count(),
+		12,
+		"the canonical showcase retains all twelve bar forms"
+	);
+	assert!(
+		seed.contains("DROP TABLE IF EXISTS demo_sales;")
+			&& seed.contains("CREATE TABLE demo_sales")
+			&& ["'Q1'", "'Q2'", "'Q3'", "'Q4'"]
+				.into_iter()
+				.all(|quarter| seed.contains(quarter)),
+		"the canonical seed is idempotent and makes all four facet quarters observable"
 	);
 }

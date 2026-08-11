@@ -26,10 +26,16 @@ mod result_registry;
 #[path = "../src/rune_host.rs"]
 mod rune_host;
 #[cfg(feature = "toron")]
+#[path = "../src/rune_presentation.rs"]
+mod rune_presentation;
+#[cfg(feature = "toron")]
 #[path = "../src/rune_relation_envelope.rs"]
 mod rune_relation_envelope;
 #[path = "../src/rune_view.rs"]
 mod rune_view;
+#[cfg(feature = "toron")]
+#[path = "../src/rune_view_compiler.rs"]
+mod rune_view_compiler;
 #[cfg(feature = "toron")]
 #[path = "../src/session_persistence.rs"]
 mod session_persistence;

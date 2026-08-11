@@ -14,7 +14,9 @@ use crate::plot::spec::{ColorIdentity, LayerSettings, LayeredPlotSpec, Override}
 use crate::plot::theme::PlotSettingsLayer;
 use crate::result_registry::PendingPublication;
 #[cfg(feature = "toron")]
-use crate::rune_relation_envelope::{LocalViewIdentity, ViewPresentation};
+use crate::rune_relation_envelope::{
+	LocalViewIdentity, RuneEnvelopeError, TransformedRuneView, ViewPresentation,
+};
 use iced::window;
 use libaryon::core::BufferId;
 use std::sync::Arc;
@@ -101,6 +103,15 @@ pub enum Message {
 		source_buffer: BufferId,
 		revision: u64,
 		result: std::result::Result<RuneBufferOutcome, String>,
+	},
+	#[cfg(feature = "toron")]
+	RunRunePresentationResult {
+		source_buffer: BufferId,
+		revision: u64,
+		source: String,
+		/// `None` means a newer revision won before this blocking task invoked
+		/// the local VM; the scheduler still receives the completion.
+		result: Option<std::result::Result<TransformedRuneView, RuneEnvelopeError>>,
 	},
 	#[cfg(feature = "toron")]
 	RunRuneViewSetResult {

@@ -27,7 +27,7 @@ workspace
     ])
 ```
 
-`/home/me/work/uat/test21.rn` refuses at `yb` because `parse_figure` requires
+`uat/test21.rn` refuses at `yb` because `parse_figure` requires
 each child to be an AST call whose callee Polariton recognises. The value is
 valid Rune and has exactly the native type the figure needs; the envelope never
 lets Rune produce it.
@@ -467,13 +467,13 @@ which spelling reached them.
 7. Run the complete inline/bound equivalence matrix and all downstream schema,
    colour, facet, persistence, export, and restore gates. No baseline or saved
    payload changes are expected.
-8. Run `/home/me/work/uat/test21.rn` with its computed `yb`, confirm all bar and
+8. Run `uat/test21.rn` with its computed `yb`, confirm all bar and
    percent panels live, and capture the exhibit. The screenshot is contact
    evidence, not a substitute for gates 1-18.
 
 ## Acceptance gates
 
-1. `/home/me/work/uat/test21.rn` accepts `let yb = y_bounds(0, 160)` and reuses
+1. `uat/test21.rn` accepts `let yb = y_bounds(0, 160)` and reuses
    it in multiple figures. Its rendered bounds equal the prior inline spelling,
    while the banked pre-implementation fixture proves the identifier form was
    genuinely refused before this record.

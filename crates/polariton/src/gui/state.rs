@@ -49,10 +49,10 @@ use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans, RunePlotMinorTickSpans,
-	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
-	RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink,
-	TransformedRuneRelation, TransformedRuneView, transform as transform_rune_view,
+	PendingRunePresentation, PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans,
+	RunePlotMinorTickSpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
+	RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
+	StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView,
 };
 use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, window};
@@ -785,42 +785,34 @@ fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String
 		app_state.status_msg = "Nothing to run in the current Rune buffer.".into();
 		return Task::none();
 	}
-	#[cfg(feature = "toron")]
-	match transform_rune_view(&code) {
-		Ok(view) => return run_rune_relation_view(app_state, source_buffer, view),
-		Err(
-			error @ (RuneEnvelopeError::Invalid(_)
-			| RuneEnvelopeError::InvalidView { .. }
-			| RuneEnvelopeError::DuplicateName { .. }),
-		) => {
-			let message = error.to_string();
-			app_state
-				.code_editor
-				.mark_rune_view_producer_stale(source_buffer);
-			set_rune_error(app_state, message);
-			return Task::none();
-		}
-		Err(RuneEnvelopeError::RecognizedNoOutput) => {
-			app_state.code_editor.prepare_rune_view_panels(
-				source_buffer,
-				&[] as &[(LocalViewIdentity, ViewPresentation)],
-				0,
-			);
-			app_state.status_msg = "Rune view set is bound; no output root emitted.".into();
-			app_state.status_error.clear();
-			return Task::none();
-		}
-		Err(RuneEnvelopeError::NoTerminalView | RuneEnvelopeError::Parse(_)) => {}
-	}
-	let capabilities = RuneCapabilities {
-		results: app_state.result_registry.snapshot(),
-		..RuneCapabilities::default()
-	};
 	let revision = *app_state
 		.rune_buffer_revisions
 		.entry(source_buffer)
 		.and_modify(|revision| *revision = revision.saturating_add(1))
 		.or_insert(1);
+	#[cfg(feature = "toron")]
+	{
+		let work = PendingRunePresentation::new(source_buffer, revision, code);
+		let Some(work) = app_state.rune_view_scheduler.submit_presentation(work) else {
+			app_state.status_msg = "Rune presentation queued newest revision…".into();
+			return Task::none();
+		};
+		return start_rune_presentation_task(app_state, work);
+	}
+	#[cfg(not(feature = "toron"))]
+	return run_plain_rune_code(app_state, source_buffer, revision, code);
+}
+
+fn run_plain_rune_code(
+	app_state: &mut AppState,
+	source_buffer: BufferId,
+	revision: u64,
+	code: String,
+) -> Task<Message> {
+	let capabilities = RuneCapabilities {
+		results: app_state.result_registry.snapshot(),
+		..RuneCapabilities::default()
+	};
 	app_state.status_msg = "Rune running…".into();
 	app_state.status_error.clear();
 	app_state.status_time_elapsed = None;
@@ -855,16 +847,46 @@ fn run_rune_code(app_state: &mut AppState, source_buffer: BufferId, code: String
 }
 
 #[cfg(feature = "toron")]
-fn run_rune_relation_view(
+fn start_rune_presentation_task(
+	app_state: &mut AppState,
+	work: PendingRunePresentation,
+) -> Task<Message> {
+	let source_buffer = work.source_buffer;
+	let revision = work.revision;
+	let source = work.source.clone();
+	app_state.status_msg = "Rune presentation compiling…".into();
+	app_state.status_error.clear();
+	app_state.status_time_elapsed = None;
+	app_state.code_started = Instant::now();
+	Task::perform(
+		async move {
+			tokio::task::spawn_blocking(move || {
+				work.is_current()
+					.then(|| crate::rune_view_compiler::compile(&work.source))
+			})
+			.await
+			.unwrap_or_else(|error| {
+				Some(Err(RuneEnvelopeError::Invalid(format!(
+					"Rune presentation task panicked: {error}"
+				))))
+			})
+		},
+		move |result| Message::RunRunePresentationResult {
+			source_buffer,
+			revision,
+			source,
+			result,
+		},
+	)
+}
+
+#[cfg(feature = "toron")]
+fn run_rune_relation_view_at_revision(
 	app_state: &mut AppState,
 	source_buffer: BufferId,
+	revision: u64,
 	view: TransformedRuneView,
 ) -> Task<Message> {
-	let revision = *app_state
-		.rune_buffer_revisions
-		.entry(source_buffer)
-		.and_modify(|revision| *revision = revision.saturating_add(1))
-		.or_insert(1);
 	let work = PendingRuneView {
 		source_buffer,
 		revision,
@@ -2443,6 +2465,60 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 		}
 		#[cfg(feature = "toron")]
+		Message::RunRunePresentationResult {
+			source_buffer,
+			revision,
+			source,
+			result,
+		} => {
+			let completion = app_state
+				.rune_view_scheduler
+				.complete_presentation(source_buffer, revision);
+			if let Some(next) = completion.next {
+				return start_rune_presentation_task(app_state, next);
+			}
+			if !completion.accepted
+				|| app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision)
+			{
+				return Task::none();
+			}
+			let Some(result) = result else {
+				panic!("an accepted presentation revision must have invoked the local VM");
+			};
+			match result {
+				Ok(view) => {
+					return run_rune_relation_view_at_revision(
+						app_state,
+						source_buffer,
+						revision,
+						view,
+					);
+				}
+				Err(
+					error @ (RuneEnvelopeError::Invalid(_)
+					| RuneEnvelopeError::InvalidView { .. }
+					| RuneEnvelopeError::DuplicateName { .. }),
+				) => {
+					app_state
+						.code_editor
+						.mark_rune_view_producer_stale(source_buffer);
+					set_rune_error(app_state, error.to_string());
+				}
+				Err(RuneEnvelopeError::RecognizedNoOutput) => {
+					app_state.code_editor.prepare_rune_view_panels(
+						source_buffer,
+						&[] as &[(LocalViewIdentity, ViewPresentation)],
+						revision,
+					);
+					app_state.status_msg = "Rune view set is bound; no output root emitted.".into();
+					app_state.status_error.clear();
+				}
+				Err(RuneEnvelopeError::NoTerminalView | RuneEnvelopeError::Parse(_)) => {
+					return run_plain_rune_code(app_state, source_buffer, revision, source);
+				}
+			}
+		}
+		#[cfg(feature = "toron")]
 		Message::RunRuneViewSetResult {
 			source_buffer,
 			revision,
@@ -3050,6 +3126,27 @@ mod tests {
 	use std::sync::{Arc, Mutex};
 	#[cfg(feature = "toron")]
 	use tokio::sync::RwLock;
+
+	#[cfg(feature = "toron")]
+	fn complete_rune_presentation(
+		state: &mut super::AppState,
+		source_buffer: BufferId,
+		source: &str,
+	) -> iced::Task<Message> {
+		let revision = *state
+			.rune_buffer_revisions
+			.get(&source_buffer)
+			.expect("run assigned a revision");
+		update(
+			state,
+			Message::RunRunePresentationResult {
+				source_buffer,
+				revision,
+				source: source.to_owned(),
+				result: Some(crate::rune_view_compiler::compile(source)),
+			},
+		)
+	}
 
 	#[cfg(feature = "toron")]
 	fn render_marks(kernel: &dyn PlotKernel) -> String {
@@ -4512,27 +4609,34 @@ mod tests {
 		let (mut state, startup) = new(StartupData::default(), None);
 		drop(startup);
 		let source_buffer = libaryon::core::BufferId::new(74);
-		let bound = super::run_rune_code(
-			&mut state,
-			source_buffer,
-			"let v = workspace.table(\"t\").views([table()]);".to_owned(),
+		let bound_source = "let v = workspace.table(\"t\").views([table()]);";
+		let bound = super::run_rune_code(&mut state, source_buffer, bound_source.to_owned());
+		assert_eq!(bound.units(), 1);
+		assert_eq!(
+			complete_rune_presentation(&mut state, source_buffer, bound_source).units(),
+			0
 		);
-		assert_eq!(bound.units(), 0);
 		assert_eq!(state.rune_view_scheduler.submitted, 0);
-		assert!(!state.rune_buffer_revisions.contains_key(&source_buffer));
+		assert_eq!(state.rune_view_scheduler.presentation_submitted, 1);
 		assert_eq!(
 			state.status_msg,
 			"Rune view set is bound; no output root emitted."
 		);
 
-		let local =
-			super::run_rune_code(&mut state, source_buffer, "let answer = 42; answer".into());
+		let local_source = "let answer = 42; answer";
+		let local = super::run_rune_code(&mut state, source_buffer, local_source.into());
+		assert_eq!(
+			local.units(),
+			1,
+			"plain Rune first enters presentation preflight"
+		);
+		let local = complete_rune_presentation(&mut state, source_buffer, local_source);
 		assert_eq!(
 			local.units(),
 			1,
 			"view-free Rune still reaches the local host"
 		);
-		assert_eq!(state.rune_buffer_revisions.get(&source_buffer), Some(&1));
+		assert_eq!(state.rune_buffer_revisions.get(&source_buffer), Some(&2));
 		state.code_editor.shutdown();
 	}
 
@@ -4548,8 +4652,13 @@ mod tests {
 
 		let task = super::run_rune_code(&mut state, source_buffer, source.to_owned());
 
-		assert_eq!(task.units(), 0);
+		assert_eq!(task.units(), 1);
+		assert_eq!(
+			complete_rune_presentation(&mut state, source_buffer, source).units(),
+			0
+		);
 		assert_eq!(state.rune_view_scheduler.submitted, 0);
+		assert_eq!(state.rune_view_scheduler.presentation_submitted, 1);
 		assert!(
 			state
 				.status_error
@@ -6734,6 +6843,10 @@ plot.bar(a, "x", "y");
 			"workspace.table(\"t\").views([view(\"same\", table()), view(\"same\", table())])";
 		assert_eq!(
 			super::run_rune_code(&mut state, source_buffer, invalid.to_owned()).units(),
+			1
+		);
+		assert_eq!(
+			complete_rune_presentation(&mut state, source_buffer, invalid).units(),
 			0
 		);
 		assert_eq!(

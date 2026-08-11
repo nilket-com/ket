@@ -1,0 +1,158 @@
+let skin = "greys_rs2";
+let palette = "viridis_cC";
+let category = "region";
+let value = "revenue";
+let series = "product";
+let facet_field = "region";
+let facet_category = "quarter";
+
+ket.table("demo_sales")
+	.sort([
+		col("region").asc(),
+		col("quarter").asc(),
+		col("product").asc(),
+	])
+	.views([
+		view("vertical-grouped", figure([
+			title("Vertical · Grouped"),
+			skin(skin),
+			palette(palette),
+			y_bounds(0, 40),
+			y_tick_step(10),
+			y_minor_ticks(1),
+			bar(category, value, series)
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("vertical-stacked", figure([
+			title("Vertical · Stacked"),
+			skin(skin),
+			palette(palette),
+			y_bounds(0, 100),
+			y_tick_step(10),
+			y_minor_ticks(1),
+			bar(category, value, series)
+				.stacked()
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("vertical-percent", figure([
+			title("Vertical · 100% Stacked"),
+			skin(skin),
+			palette(palette),
+			y_tick_step(25),
+			bar(category, value, series)
+				.stacked()
+				.percent()
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("horizontal-grouped", figure([
+			title("Horizontal · Grouped"),
+			skin(skin),
+			palette(palette),
+			x_bounds(0, 40),
+			x_tick_step(10),
+			x_minor_ticks(1),
+			bar(value, category, series)
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("horizontal-stacked", figure([
+			title("Horizontal · Stacked"),
+			skin(skin),
+			palette(palette),
+			x_bounds(0, 100),
+			x_tick_step(10),
+			x_minor_ticks(1),
+			bar(value, category, series)
+				.stacked()
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("horizontal-percent", figure([
+			title("Horizontal · 100% Stacked"),
+			skin(skin),
+			palette(palette),
+			x_tick_step(25),
+			bar(value, category, series)
+				.stacked()
+				.percent()
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("vertical-faceted-grouped", figure([
+			title("Vertical · Faceted · Grouped"),
+			facet(facet_field),
+			skin(skin),
+			palette(palette),
+			y_bounds(0, 50),
+			y_tick_step(10),
+			y_minor_ticks(1),
+			bar(facet_category, value, series)
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("vertical-faceted-stacked", figure([
+			title("Vertical · Faceted · Stacked"),
+			facet(facet_field),
+			skin(skin),
+			palette(palette),
+			y_bounds(0, 150),
+			y_tick_step(50),
+			y_minor_ticks(1),
+			bar(facet_category, value, series)
+				.stacked()
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("vertical-faceted-percent", figure([
+			title("Vertical · Faceted · 100% Stacked"),
+			facet(facet_field),
+			skin(skin),
+			palette(palette),
+			y_tick_step(25),
+			bar(facet_category, value, series)
+				.stacked()
+				.percent()
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("horizontal-faceted-grouped", figure([
+			title("Horizontal · Faceted · Grouped"),
+			facet(facet_field),
+			skin(skin),
+			palette(palette),
+			x_bounds(0, 40),
+			x_tick_step(10),
+			x_minor_ticks(1),
+			bar(value, facet_category, series)
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("horizontal-faceted-stacked", figure([
+			title("Horizontal · Faceted · Stacked"),
+			facet(facet_field),
+			skin(skin),
+			palette(palette),
+			x_bounds(0, 150),
+			x_tick_step(50),
+			x_minor_ticks(1),
+			bar(value, facet_category, series)
+				.stacked()
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+		view("horizontal-faceted-percent", figure([
+			title("Horizontal · Faceted · 100% Stacked"),
+			facet(facet_field),
+			skin(skin),
+			palette(palette),
+			x_tick_step(25),
+			bar(value, facet_category, series)
+				.stacked()
+				.percent()
+				.bar_width(0.88)
+				.category_gap(0.24),
+		])),
+	])

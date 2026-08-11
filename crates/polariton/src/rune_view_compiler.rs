@@ -1,0 +1,1884 @@
+//! PRODUCT-0076's static view shell, source partition, and generated programs.
+//!
+//! This module may recognize where relation and presentation syntax meet. It
+//! does not interpret presentation values; those execute in `rune_presentation`.
+
+use crate::rune_presentation::{
+	PresentationLimits, PresentationMapKind, PresentationMapSegment, PresentationSourceMap,
+	execute_generated,
+};
+use crate::rune_relation_envelope::{
+	LocalViewIdentity, RuneEnvelopeError, RuneEnvelopeSourceMap, SourceMapSegment,
+	SpannedRuneViewIntent, TransformedRuneRelation, TransformedRuneView,
+};
+use rune::ast::{self, Spanned};
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+
+const WORKSPACE_ENTRYPOINT_PREFIX: &str = "pub fn main(workspace) {\n";
+const KET_ENTRYPOINT_PREFIX: &str = "pub fn main(ket) {\n";
+const ENTRYPOINT_SUFFIX: &str = "\n}\n";
+const PRESENTATION_PREFIX: &str = "polariton_presentation";
+
+const PRESENTATION_FREE: &[&str] = &[
+	"area",
+	"bar",
+	"facet",
+	"figure",
+	"hide_legend",
+	"layers",
+	"legend_at",
+	"line",
+	"palette",
+	"scatter",
+	"skin",
+	"subtitle",
+	"table",
+	"title",
+	"x_bounds",
+	"x_minor_ticks",
+	"x_tick_step",
+	"y_bounds",
+	"y_minor_ticks",
+	"y_tick_step",
+];
+
+const PRESENTATION_METHODS: &[&str] = &[
+	"bar_width",
+	"category_gap",
+	"duotone",
+	"percent",
+	"point_size",
+	"show_types",
+	"skin",
+	"stacked",
+	"stroke_width",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RelationRoot {
+	Workspace,
+	Ket,
+}
+
+#[derive(Clone, Debug)]
+struct Definition {
+	name: String,
+	name_span: Range<usize>,
+	statement: Range<usize>,
+	value: Range<usize>,
+	literal: bool,
+}
+
+#[derive(Clone, Debug)]
+enum StaticPresentationExpr {
+	Copied(Range<usize>),
+	Synthetic {
+		constructor: &'static str,
+		arguments: Vec<Range<usize>>,
+		origin: Range<usize>,
+	},
+}
+
+impl StaticPresentationExpr {
+	fn dependency_ranges(&self) -> impl Iterator<Item = &Range<usize>> {
+		match self {
+			Self::Copied(span) => std::slice::from_ref(span).iter(),
+			Self::Synthetic { arguments, .. } => arguments.iter(),
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+struct StaticSlot {
+	expression: StaticPresentationExpr,
+	span: Range<usize>,
+	name: Option<(String, Range<usize>)>,
+	output_order: usize,
+}
+
+#[derive(Clone, Debug)]
+enum StaticProvenance {
+	Relation {
+		span: Range<usize>,
+		root: RelationRoot,
+		origin: String,
+	},
+	ViewSet {
+		relation: Range<usize>,
+		root: RelationRoot,
+		origin: String,
+		slots: Vec<StaticSlot>,
+	},
+}
+
+#[derive(Clone, Debug)]
+struct StaticRoot {
+	emission: Range<usize>,
+	relation: Range<usize>,
+	root: RelationRoot,
+	origin: String,
+	slots: Vec<StaticSlot>,
+}
+
+#[derive(Clone, Debug)]
+struct StaticExecution {
+	relation: Range<usize>,
+	root: RelationRoot,
+	origin: String,
+	slots: Vec<StaticSlot>,
+}
+
+#[derive(Clone, Debug)]
+struct StaticAnalysis {
+	executions: Vec<StaticExecution>,
+	definitions: Vec<Definition>,
+	statements: Vec<Range<usize>>,
+	output_statements: Vec<Range<usize>>,
+	last_retained_is_expression: bool,
+	recognized_presentation: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum LexKind {
+	Ident(String),
+	Punct(char),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LexToken {
+	kind: LexKind,
+	span: Range<usize>,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ShellShadows {
+	table: bool,
+	plot: bool,
+	workspace: bool,
+	ket: bool,
+}
+
+impl ShellShadows {
+	fn insert(&mut self, name: &str) {
+		match name {
+			"table" => self.table = true,
+			"plot" => self.plot = true,
+			"workspace" => self.workspace = true,
+			"ket" => self.ket = true,
+			_ => {}
+		}
+	}
+}
+
+pub(crate) fn compile(source: &str) -> Result<TransformedRuneView, RuneEnvelopeError> {
+	let analysis = analyze_static(source)?;
+	if analysis.executions.is_empty() {
+		return Err(if analysis.recognized_presentation {
+			RuneEnvelopeError::RecognizedNoOutput
+		} else {
+			RuneEnvelopeError::NoTerminalView
+		});
+	}
+
+	let partition = partition(source, &analysis)?;
+	let ordered_slots = ordered_slots(&analysis);
+	let presentation =
+		render_presentation(source, &ordered_slots, &analysis, &partition.presentation)?;
+	let slot_spans = ordered_slots
+		.iter()
+		.map(|slot| u32_range(&slot.span, "view slot"))
+		.collect::<Result<Vec<_>, _>>()?;
+	let intents = execute_generated(
+		&presentation.source,
+		&slot_spans,
+		&presentation.source_map,
+		PresentationLimits::default(),
+	)
+	.map_err(|failure| RuneEnvelopeError::InvalidView {
+		span: failure.span,
+		message: failure.message,
+	})?;
+	let intents = intents.into_iter().enumerate().collect::<HashMap<_, _>>();
+
+	let mut executions = Vec::with_capacity(analysis.executions.len());
+	for execution in &analysis.executions {
+		let rendered = render_relation(
+			source,
+			execution,
+			&analysis,
+			&partition.presentation,
+			&partition.relation,
+		)?;
+		let views = execution
+			.slots
+			.iter()
+			.map(|slot| {
+				let intent = intents
+					.get(&slot.output_order)
+					.cloned()
+					.expect("one evaluated intent per static slot");
+				Ok(SpannedRuneViewIntent {
+					intent,
+					span: u32_range(&slot.span, "view")?,
+					identity: match &slot.name {
+						Some((name, _)) => LocalViewIdentity::Named(name.clone()),
+						None => LocalViewIdentity::Anonymous(slot.output_order),
+					},
+					output_order: slot.output_order,
+				})
+			})
+			.collect::<Result<Vec<_>, RuneEnvelopeError>>()?;
+		executions.push(TransformedRuneRelation {
+			origin: execution.origin.clone(),
+			source: rendered.source,
+			views,
+			source_map: rendered.source_map,
+		});
+	}
+	let presentation_order = ordered_slots
+		.into_iter()
+		.map(|slot| match &slot.name {
+			Some((name, _)) => LocalViewIdentity::Named(name.clone()),
+			None => LocalViewIdentity::Anonymous(slot.output_order),
+		})
+		.collect();
+	Ok(TransformedRuneView {
+		executions,
+		presentation_order,
+	})
+}
+
+fn ordered_slots(analysis: &StaticAnalysis) -> Vec<&StaticSlot> {
+	let mut slots = analysis
+		.executions
+		.iter()
+		.flat_map(|execution| execution.slots.iter())
+		.collect::<Vec<_>>();
+	slots.sort_by_key(|slot| slot.output_order);
+	slots
+}
+
+fn analyze_static(source: &str) -> Result<StaticAnalysis, RuneEnvelopeError> {
+	let block = rune::parse::parse_all::<ast::EmptyBlock>(source, rune::SourceId::EMPTY, false)
+		.map_err(|error| RuneEnvelopeError::Parse(error.to_string()))?;
+	let mut shadows = ShellShadows::default();
+	let mut definitions = Vec::new();
+	for statement in &block.statements {
+		collect_definition(statement, source, &mut shadows, &mut definitions)?;
+	}
+
+	let mut provenances = HashMap::<String, StaticProvenance>::new();
+	let mut roots = Vec::new();
+	let mut outputs = Vec::new();
+	let mut recognized_presentation = false;
+	let mut last_retained_is_expression = false;
+	for statement in &block.statements {
+		if let Some(root) = recognize_legacy_root(statement, source, shadows, &definitions)? {
+			outputs.push(root.emission.clone());
+			roots.push(root);
+			last_retained_is_expression = false;
+			continue;
+		}
+		if let ast::Stmt::Local(local) = statement {
+			let statement_span = byte_range(statement.span(), source.len())?;
+			if let Some(definition) = definitions
+				.iter()
+				.find(|definition| definition.statement == statement_span)
+				&& let Some(provenance) =
+					static_provenance(&local.expr, source, &provenances, shadows)?
+			{
+				if matches!(provenance, StaticProvenance::ViewSet { .. }) {
+					recognized_presentation = true;
+					outputs.push(statement_span);
+				}
+				provenances.insert(definition.name.clone(), provenance);
+			}
+			last_retained_is_expression = false;
+			continue;
+		}
+		let expression = match statement {
+			ast::Stmt::Expr(expression) => Some(expression),
+			ast::Stmt::Semi(semi) => Some(&semi.expr),
+			_ => None,
+		};
+		if let Some(expression) = expression
+			&& let Some(StaticProvenance::ViewSet {
+				relation,
+				root,
+				origin,
+				slots,
+			}) = static_provenance(expression, source, &provenances, shadows)?
+		{
+			let emission = byte_range(statement.span(), source.len())?;
+			recognized_presentation = true;
+			outputs.push(emission.clone());
+			roots.push(StaticRoot {
+				emission,
+				relation,
+				root,
+				origin,
+				slots,
+			});
+			last_retained_is_expression = false;
+			continue;
+		}
+		last_retained_is_expression = matches!(statement, ast::Stmt::Expr(_));
+	}
+
+	roots.sort_by_key(|root| root.emission.start);
+	outputs.sort_by_key(|span| span.start);
+	let mut names = HashMap::<String, Range<u32>>::new();
+	let mut output_order = 0;
+	for root in &mut roots {
+		for slot in &mut root.slots {
+			slot.output_order = output_order;
+			output_order += 1;
+			if let Some((name, name_span)) = &slot.name {
+				let span = u32_range(name_span, "view name")?;
+				if let Some(first) = names.insert(name.clone(), span.clone()) {
+					return Err(RuneEnvelopeError::DuplicateName {
+						name: name.clone(),
+						first,
+						duplicate: span,
+					});
+				}
+			}
+		}
+	}
+	let mut grouped = Vec::<StaticRoot>::new();
+	let mut by_origin = HashMap::<String, usize>::new();
+	for root in roots {
+		if let Some(index) = by_origin.get(&root.origin).copied() {
+			grouped[index].slots.extend(root.slots);
+		} else {
+			by_origin.insert(root.origin.clone(), grouped.len());
+			grouped.push(root);
+		}
+	}
+	Ok(StaticAnalysis {
+		executions: grouped
+			.into_iter()
+			.map(|root| StaticExecution {
+				relation: root.relation,
+				root: root.root,
+				origin: root.origin,
+				slots: root.slots,
+			})
+			.collect(),
+		definitions,
+		statements: block
+			.statements
+			.iter()
+			.map(|statement| byte_range(statement.span(), source.len()))
+			.collect::<Result<Vec<_>, _>>()?,
+		output_statements: outputs,
+		last_retained_is_expression,
+		recognized_presentation,
+	})
+}
+
+fn static_provenance(
+	expression: &ast::Expr,
+	source: &str,
+	bindings: &HashMap<String, StaticProvenance>,
+	shadows: ShellShadows,
+) -> Result<Option<StaticProvenance>, RuneEnvelopeError> {
+	match expression {
+		ast::Expr::Path(path) => {
+			let raw = source_slice(source, path.span())?.trim();
+			let root = match raw {
+				"workspace" if !shadows.workspace => Some(RelationRoot::Workspace),
+				"ket" if !shadows.ket => Some(RelationRoot::Ket),
+				_ => None,
+			};
+			if let Some(root) = root {
+				return Ok(Some(StaticProvenance::Relation {
+					span: byte_range(path.span(), source.len())?,
+					root,
+					origin: "workspace".to_owned(),
+				}));
+			}
+			Ok(bindings.get(raw).cloned())
+		}
+		ast::Expr::Group(group) => static_provenance(&group.expr, source, bindings, shadows),
+		ast::Expr::Call(call) => {
+			let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+			if let ast::Expr::FieldAccess(field) = call.expr.as_ref() {
+				let method = source_slice(source, field.expr_field.span())?.trim();
+				let receiver = static_provenance(&field.expr, source, bindings, shadows)?;
+				return match receiver {
+					Some(StaticProvenance::Relation { span, root, origin }) => {
+						static_method_on_relation(
+							call,
+							method,
+							&field.expr,
+							span,
+							root,
+							origin,
+							&args,
+							source,
+						)
+					}
+					Some(StaticProvenance::ViewSet {
+						relation,
+						root,
+						origin,
+						mut slots,
+					}) => {
+						if method != "views" {
+							return invalid_view(
+								call.span(),
+								source.len(),
+								"a ViewSet may only be emitted or extended with .views([...])",
+							);
+						}
+						slots.extend(parse_static_view_list(call, &args, source)?);
+						Ok(Some(StaticProvenance::ViewSet {
+							relation,
+							root,
+							origin,
+							slots,
+						}))
+					}
+					None => Ok(None),
+				};
+			}
+			Ok(None)
+		}
+		_ => Ok(None),
+	}
+}
+
+#[allow(clippy::too_many_arguments)]
+fn static_method_on_relation(
+	call: &ast::ExprCall,
+	method: &str,
+	receiver: &ast::Expr,
+	relation: Range<usize>,
+	root: RelationRoot,
+	mut origin: String,
+	args: &[&ast::Expr],
+	source: &str,
+) -> Result<Option<StaticProvenance>, RuneEnvelopeError> {
+	if method == "views" {
+		return Ok(Some(StaticProvenance::ViewSet {
+			relation,
+			root,
+			origin,
+			slots: parse_static_view_list(call, args, source)?,
+		}));
+	}
+	if let Some(constructor) = mark_constructor(method)
+		&& matches!(args.len(), 2 | 3)
+	{
+		return Ok(Some(StaticProvenance::ViewSet {
+			relation,
+			root,
+			origin,
+			slots: vec![synthetic_slot(constructor, args, call.span(), source)?],
+		}));
+	}
+	if matches!(method, "line" | "bar" | "scatter" | "area") {
+		return invalid_view(
+			call.span(),
+			source.len(),
+			format!("{method} view sugar requires x and y strings with an optional series"),
+		);
+	}
+	if method == "table" && args.is_empty() {
+		return Ok(Some(StaticProvenance::ViewSet {
+			relation,
+			root,
+			origin,
+			slots: vec![synthetic_slot("table", args, call.span(), source)?],
+		}));
+	}
+	let receiver = byte_range(receiver.span(), source.len())?;
+	let call_span = byte_range(call.span(), source.len())?;
+	origin.push_str(
+		source.get(receiver.end..call_span.end).ok_or_else(|| {
+			RuneEnvelopeError::Invalid("relation method span is not UTF-8".into())
+		})?,
+	);
+	Ok(Some(StaticProvenance::Relation {
+		span: call_span,
+		root,
+		origin,
+	}))
+}
+
+fn parse_static_view_list(
+	call: &ast::ExprCall,
+	args: &[&ast::Expr],
+	source: &str,
+) -> Result<Vec<StaticSlot>, RuneEnvelopeError> {
+	let [argument] = args else {
+		return invalid_view(
+			call.span(),
+			source.len(),
+			"views(...) takes exactly one sink list",
+		);
+	};
+	let ast::Expr::Vec(list) = argument else {
+		return invalid_view(
+			argument.span(),
+			source.len(),
+			"views(...) requires a literal sink list",
+		);
+	};
+	if list.items.is_empty() {
+		return invalid_view(list.span(), source.len(), "views([]) is empty");
+	}
+	list.items
+		.iter()
+		.map(|(item, _)| parse_static_slot(item, source, true))
+		.collect()
+}
+
+fn parse_static_slot(
+	expression: &ast::Expr,
+	source: &str,
+	allow_view: bool,
+) -> Result<StaticSlot, RuneEnvelopeError> {
+	if let ast::Expr::Call(call) = expression {
+		let callee = source_slice(source, call.expr.span())?.trim();
+		if callee == "view" {
+			if !allow_view {
+				return invalid_view(
+					expression.span(),
+					source.len(),
+					"view(...) wrappers cannot be nested",
+				);
+			}
+			let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+			let [name, body] = args.as_slice() else {
+				return invalid_view(
+					expression.span(),
+					source.len(),
+					"view(...) takes a name string and one sink",
+				);
+			};
+			let name_span = byte_range(name.span(), source.len())?;
+			let Some(name) =
+				decode_string_literal(source.get(name_span.clone()).ok_or_else(|| {
+					RuneEnvelopeError::Invalid("view name span is not UTF-8".into())
+				})?)
+			else {
+				return invalid_view(
+					name.span(),
+					source.len(),
+					"view name must be a string literal",
+				);
+			};
+			let body_span = byte_range(body.span(), source.len())?;
+			return Ok(StaticSlot {
+				expression: StaticPresentationExpr::Copied(body_span.clone()),
+				span: body_span,
+				name: Some((name, name_span)),
+				output_order: 0,
+			});
+		}
+	}
+	let span = byte_range(expression.span(), source.len())?;
+	Ok(StaticSlot {
+		expression: StaticPresentationExpr::Copied(span.clone()),
+		span,
+		name: None,
+		output_order: 0,
+	})
+}
+
+fn recognize_legacy_root(
+	statement: &ast::Stmt,
+	source: &str,
+	shadows: ShellShadows,
+	definitions: &[Definition],
+) -> Result<Option<StaticRoot>, RuneEnvelopeError> {
+	let (expression, statement_span) = match statement {
+		ast::Stmt::Expr(expression) => (expression, expression.span()),
+		ast::Stmt::Semi(statement) => (&statement.expr, statement.span()),
+		_ => return Ok(None),
+	};
+	let ast::Expr::Call(call) = expression else {
+		return Ok(None);
+	};
+	let callee = source_slice(source, call.expr.span())?.trim();
+	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+	if !shadows.plot
+		&& matches!(
+			callee,
+			"plot.bar" | "plot.line" | "plot.scatter" | "plot.area"
+		) && !matches!(args.len(), 3 | 4)
+	{
+		return invalid_view(
+			call.span(),
+			source.len(),
+			format!("{callee}(...) requires a relation, x and y strings, and an optional series"),
+		);
+	}
+	let (relation_expression, presentation) = match callee {
+		"table" if !shadows.table && args.len() == 1 => (
+			args[0],
+			StaticPresentationExpr::Synthetic {
+				constructor: "table",
+				arguments: Vec::new(),
+				origin: byte_range(call.span(), source.len())?,
+			},
+		),
+		"plot.bar" if !shadows.plot && matches!(args.len(), 3 | 4) => (
+			args[0],
+			synthetic_expression("bar", &args[1..], call.span(), source)?,
+		),
+		"plot.line" if !shadows.plot && matches!(args.len(), 3 | 4) => (
+			args[0],
+			synthetic_expression("line", &args[1..], call.span(), source)?,
+		),
+		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
+			args[0],
+			synthetic_expression("scatter", &args[1..], call.span(), source)?,
+		),
+		"plot.area" if !shadows.plot && matches!(args.len(), 3 | 4) => (
+			args[0],
+			synthetic_expression("area", &args[1..], call.span(), source)?,
+		),
+		_ => return Ok(None),
+	};
+	let relation_span = byte_range(relation_expression.span(), source.len())?;
+	let (origin, root) = resolve_relation(
+		source,
+		relation_span.clone(),
+		statement_span.start.into_usize(),
+		definitions,
+		shadows,
+	)?;
+	let emission = byte_range(statement_span, source.len())?;
+	Ok(Some(StaticRoot {
+		emission: emission.clone(),
+		relation: relation_span,
+		root,
+		origin,
+		slots: vec![StaticSlot {
+			expression: presentation,
+			span: emission,
+			name: None,
+			output_order: 0,
+		}],
+	}))
+}
+
+fn synthetic_slot(
+	constructor: &'static str,
+	args: &[&ast::Expr],
+	span: ast::Span,
+	source: &str,
+) -> Result<StaticSlot, RuneEnvelopeError> {
+	let origin = byte_range(span, source.len())?;
+	Ok(StaticSlot {
+		expression: synthetic_expression(constructor, args, span, source)?,
+		span: origin,
+		name: None,
+		output_order: 0,
+	})
+}
+
+fn synthetic_expression(
+	constructor: &'static str,
+	args: &[&ast::Expr],
+	span: ast::Span,
+	source: &str,
+) -> Result<StaticPresentationExpr, RuneEnvelopeError> {
+	Ok(StaticPresentationExpr::Synthetic {
+		constructor,
+		arguments: args
+			.iter()
+			.map(|argument| byte_range(argument.span(), source.len()))
+			.collect::<Result<Vec<_>, _>>()?,
+		origin: byte_range(span, source.len())?,
+	})
+}
+
+fn mark_constructor(method: &str) -> Option<&'static str> {
+	match method {
+		"bar" => Some("bar"),
+		"line" => Some("line"),
+		"scatter" => Some("scatter"),
+		"area" => Some("area"),
+		_ => None,
+	}
+}
+
+fn resolve_relation(
+	source: &str,
+	mut span: Range<usize>,
+	use_start: usize,
+	definitions: &[Definition],
+	shadows: ShellShadows,
+) -> Result<(String, RelationRoot), RuneEnvelopeError> {
+	let mut visited = HashSet::new();
+	loop {
+		let raw = source
+			.get(span.clone())
+			.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?
+			.trim();
+		if raw.starts_with("workspace") && !shadows.workspace {
+			return Ok((
+				canonical_relation_origin(raw, "workspace"),
+				RelationRoot::Workspace,
+			));
+		}
+		if raw.starts_with("ket") && !shadows.ket {
+			return Ok((canonical_relation_origin(raw, "ket"), RelationRoot::Ket));
+		}
+		if !is_simple_name(raw) || !visited.insert(raw.to_owned()) {
+			return Err(RuneEnvelopeError::Invalid(format!(
+				"relation origin {raw:?} does not resolve to workspace or ket"
+			)));
+		}
+		let Some(definition) = resolve_definition(definitions, raw, use_start) else {
+			return Err(RuneEnvelopeError::Invalid(format!(
+				"relation binding {raw:?} has no preceding initializer"
+			)));
+		};
+		span = definition.value.clone();
+	}
+}
+
+fn canonical_relation_origin(raw: &str, root: &str) -> String {
+	if root == "ket" {
+		format!("workspace{}", &raw[3..])
+	} else {
+		raw.to_owned()
+	}
+}
+
+#[derive(Default)]
+struct Partition {
+	presentation: HashSet<Range<usize>>,
+	relation: HashSet<Range<usize>>,
+}
+
+fn partition(source: &str, analysis: &StaticAnalysis) -> Result<Partition, RuneEnvelopeError> {
+	let mut presentation = HashSet::new();
+	let mut relation = HashSet::new();
+	for execution in &analysis.executions {
+		collect_dependencies(
+			source,
+			&execution.relation,
+			&analysis.definitions,
+			&mut relation,
+		)?;
+		for slot in &execution.slots {
+			for range in slot.expression.dependency_ranges() {
+				collect_dependencies(source, range, &analysis.definitions, &mut presentation)?;
+			}
+		}
+	}
+	// A top-level occurrence which calls presentation vocabulary is claimed by
+	// the local program even when no output reads its value. Retaining it in the
+	// Toron program would leak a native Toron does not own. Ordinary unclaimed
+	// statements remain relation-side for compatibility and possible effects.
+	for statement in &analysis.statements {
+		if analysis.output_statements.contains(statement) {
+			continue;
+		}
+		let text = source
+			.get(statement.clone())
+			.ok_or_else(|| RuneEnvelopeError::Invalid("statement span is not UTF-8".into()))?;
+		let (has_presentation, has_relation) =
+			vocabulary_usage(&lex(text, statement.start), &analysis.definitions);
+		if has_presentation && has_relation {
+			return Err(RuneEnvelopeError::InvalidView {
+				span: u32_range(statement, "mixed top-level occurrence")?,
+				message: "a helper cannot depend on both relation and presentation vocabulary"
+					.to_owned(),
+			});
+		}
+		if has_presentation {
+			presentation.insert(statement.clone());
+		}
+	}
+	for statement in presentation.intersection(&relation) {
+		let definition = analysis
+			.definitions
+			.iter()
+			.find(|definition| &definition.statement == statement)
+			.expect("partition sets contain definitions");
+		if !definition.literal {
+			return Err(RuneEnvelopeError::InvalidView {
+				span: u32_range(&definition.statement, "dual-use binding")?,
+				message: format!(
+					"computed binding {:?} is used by both relation and presentation; only static literal and alias closures may cross both VMs",
+					definition.name
+				),
+			});
+		}
+	}
+	for statement in &presentation {
+		let text = source
+			.get(statement.clone())
+			.ok_or_else(|| RuneEnvelopeError::Invalid("definition span is not UTF-8".into()))?;
+		let tokens = lex(text, statement.start);
+		let (has_presentation, has_relation) = vocabulary_usage(&tokens, &analysis.definitions);
+		if has_presentation && has_relation {
+			return Err(RuneEnvelopeError::InvalidView {
+				span: u32_range(statement, "mixed helper")?,
+				message: "a helper cannot depend on both relation and presentation vocabulary"
+					.to_owned(),
+			});
+		}
+	}
+	Ok(Partition {
+		presentation,
+		relation,
+	})
+}
+
+fn vocabulary_usage(tokens: &[LexToken], definitions: &[Definition]) -> (bool, bool) {
+	let mut presentation = false;
+	let mut relation = false;
+	for (index, token) in tokens.iter().enumerate() {
+		let LexKind::Ident(name) = &token.kind else {
+			continue;
+		};
+		let previous = index.checked_sub(1).and_then(|index| tokens.get(index));
+		let next = tokens.get(index + 1);
+		let called = matches!(next.map(|token| &token.kind), Some(LexKind::Punct('(')));
+		let declaration = matches!(previous.map(|token| &token.kind), Some(LexKind::Ident(keyword)) if keyword == "fn");
+		let method = matches!(previous.map(|token| &token.kind), Some(LexKind::Punct('.')));
+		let presentation_call = called
+			&& !declaration
+			&& if method {
+				PRESENTATION_METHODS.contains(&name.as_str())
+			} else {
+				PRESENTATION_FREE.contains(&name.as_str())
+					&& !definitions
+						.iter()
+						.any(|definition| definition.name == *name)
+			};
+		presentation |= presentation_call;
+		relation |= matches!(name.as_str(), "workspace" | "ket") || (called && name == "col");
+	}
+	(presentation, relation)
+}
+
+fn collect_dependencies(
+	source: &str,
+	range: &Range<usize>,
+	definitions: &[Definition],
+	out: &mut HashSet<Range<usize>>,
+) -> Result<(), RuneEnvelopeError> {
+	let text = source
+		.get(range.clone())
+		.ok_or_else(|| RuneEnvelopeError::Invalid("dependency span is not UTF-8".into()))?;
+	let tokens = lex(text, range.start);
+	let locals = local_names(&tokens);
+	for (index, token) in tokens.iter().enumerate() {
+		let LexKind::Ident(name) = &token.kind else {
+			continue;
+		};
+		if locals.contains(name)
+			|| is_keyword(name)
+			|| matches!(
+				tokens.get(index.wrapping_sub(1)).map(|token| &token.kind),
+				Some(LexKind::Punct('.'))
+			) {
+			continue;
+		}
+		let Some(definition) = resolve_definition(definitions, name, token.span.start) else {
+			continue;
+		};
+		if definition.name_span.contains(&token.span.start)
+			|| !out.insert(definition.statement.clone())
+		{
+			continue;
+		}
+		collect_dependencies(source, &definition.value, definitions, out)?;
+	}
+	Ok(())
+}
+
+fn resolve_definition<'a>(
+	definitions: &'a [Definition],
+	name: &str,
+	use_start: usize,
+) -> Option<&'a Definition> {
+	definitions
+		.iter()
+		.filter(|definition| definition.name == name && definition.statement.start < use_start)
+		.max_by_key(|definition| definition.statement.start)
+}
+
+fn local_names(tokens: &[LexToken]) -> HashSet<String> {
+	let mut names = HashSet::new();
+	for window in tokens.windows(2) {
+		if matches!(&window[0].kind, LexKind::Ident(keyword) if keyword == "let")
+			&& let LexKind::Ident(name) = &window[1].kind
+		{
+			names.insert(name.clone());
+		}
+	}
+	if matches!(tokens.first().map(|token| &token.kind), Some(LexKind::Ident(name)) if name == "fn")
+		&& let Some(open) = tokens
+			.iter()
+			.position(|token| token.kind == LexKind::Punct('('))
+		&& let Some(close) = matching_paren(tokens, open)
+	{
+		for token in &tokens[open + 1..close] {
+			if let LexKind::Ident(name) = &token.kind
+				&& !is_keyword(name)
+			{
+				names.insert(name.clone());
+			}
+		}
+	}
+	names
+}
+
+struct RenderedRelation {
+	source: String,
+	source_map: RuneEnvelopeSourceMap,
+}
+
+fn render_relation(
+	source: &str,
+	execution: &StaticExecution,
+	analysis: &StaticAnalysis,
+	presentation: &HashSet<Range<usize>>,
+	relation: &HashSet<Range<usize>>,
+) -> Result<RenderedRelation, RuneEnvelopeError> {
+	let mut peeled = analysis.output_statements.clone();
+	for statement in presentation {
+		if !relation.contains(statement) {
+			peeled.push(statement.clone());
+		}
+	}
+	peeled.sort_by_key(|span| span.start);
+	peeled.dedup();
+	let retained = retained_regions(source.len(), &peeled)?;
+	let prefix = match execution.root {
+		RelationRoot::Workspace => WORKSPACE_ENTRYPOINT_PREFIX,
+		RelationRoot::Ket => KET_ENTRYPOINT_PREFIX,
+	};
+	let mut transformed = String::new();
+	transformed.push_str(prefix);
+	let mut segments = Vec::new();
+	for retained in retained {
+		let start = transformed.len();
+		transformed.push_str(source.get(retained.clone()).ok_or_else(|| {
+			RuneEnvelopeError::Invalid("retained source span is not UTF-8".into())
+		})?);
+		let end = transformed.len();
+		push_segment(&mut segments, start..end, retained.start)?;
+	}
+	if analysis.last_retained_is_expression {
+		transformed.push_str("\n;");
+	}
+	transformed.push('\n');
+	let relation_start = transformed.len();
+	transformed.push_str(
+		source
+			.get(execution.relation.clone())
+			.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?,
+	);
+	let relation_end = transformed.len();
+	transformed.push_str(ENTRYPOINT_SUFFIX);
+	push_segment(
+		&mut segments,
+		relation_start..relation_end,
+		execution.relation.start,
+	)?;
+	Ok(RenderedRelation {
+		source: transformed,
+		source_map: RuneEnvelopeSourceMap {
+			segments,
+			diagnostic_fallback: u32_range(&execution.relation, "relation")?,
+		},
+	})
+}
+
+struct RenderedPresentation {
+	source: String,
+	source_map: PresentationSourceMap,
+}
+
+#[derive(Default)]
+struct PresentationBuilder {
+	source: String,
+	segments: Vec<PresentationMapSegment>,
+}
+
+impl PresentationBuilder {
+	fn plain(&mut self, text: &str) {
+		self.source.push_str(text);
+	}
+
+	fn copied(&mut self, text: &str, original_start: usize) -> Result<(), RuneEnvelopeError> {
+		let start = self.source.len();
+		self.source.push_str(text);
+		let end = self.source.len();
+		self.segment(
+			start..end,
+			PresentationMapKind::Copied {
+				original_start: u32::try_from(original_start)
+					.map_err(|_| RuneEnvelopeError::Invalid("source exceeds u32".into()))?,
+			},
+		)
+	}
+
+	fn synthetic(&mut self, text: &str, owner: &Range<usize>) -> Result<(), RuneEnvelopeError> {
+		let start = self.source.len();
+		self.source.push_str(text);
+		let end = self.source.len();
+		self.segment(
+			start..end,
+			PresentationMapKind::Synthetic {
+				owner: u32_range(owner, "synthetic presentation owner")?,
+			},
+		)
+	}
+
+	fn rewritten(&mut self, fragment: RewrittenFragment) -> Result<(), RuneEnvelopeError> {
+		let offset = self.source.len();
+		self.source.push_str(&fragment.source);
+		for segment in fragment.segments {
+			let start = usize::try_from(segment.generated.start)
+				.map_err(|_| RuneEnvelopeError::Invalid("generated span exceeds usize".into()))?;
+			let end = usize::try_from(segment.generated.end)
+				.map_err(|_| RuneEnvelopeError::Invalid("generated span exceeds usize".into()))?;
+			self.segment(offset + start..offset + end, segment.kind)?;
+		}
+		Ok(())
+	}
+
+	fn segment(
+		&mut self,
+		generated: Range<usize>,
+		kind: PresentationMapKind,
+	) -> Result<(), RuneEnvelopeError> {
+		if generated.is_empty() {
+			return Ok(());
+		}
+		self.segments.push(PresentationMapSegment {
+			generated: u32_range(&generated, "generated presentation")?,
+			kind,
+		});
+		Ok(())
+	}
+}
+
+fn render_presentation(
+	source: &str,
+	slots: &[&StaticSlot],
+	analysis: &StaticAnalysis,
+	presentation_statements: &HashSet<Range<usize>>,
+) -> Result<RenderedPresentation, RuneEnvelopeError> {
+	if source.contains(PRESENTATION_PREFIX) {
+		return Err(RuneEnvelopeError::Invalid(
+			"source uses Polariton's reserved generated presentation namespace".to_owned(),
+		));
+	}
+	let fallback = slots
+		.first()
+		.map(|slot| u32_range(&slot.span, "presentation fallback"))
+		.transpose()?
+		.unwrap_or(0..0);
+	let mut generated = PresentationBuilder::default();
+	generated.plain("pub fn main() {\n");
+	let mut slot_dependencies = HashSet::new();
+	for slot in slots {
+		for range in slot.expression.dependency_ranges() {
+			collect_dependencies(source, range, &analysis.definitions, &mut slot_dependencies)?;
+		}
+	}
+	let mut unclaimed = presentation_statements
+		.iter()
+		.filter(|statement| !slot_dependencies.contains(*statement))
+		.cloned()
+		.collect::<Vec<_>>();
+	unclaimed.sort_by_key(|statement| statement.start);
+	for statement in unclaimed {
+		generated.synthetic("{\n", &statement)?;
+		generated.rewritten(rewrite_calls_mapped(
+			source.get(statement.clone()).ok_or_else(|| {
+				RuneEnvelopeError::Invalid("presentation statement is not UTF-8".into())
+			})?,
+			statement.start,
+		)?)?;
+		generated.synthetic("\n};\n", &statement)?;
+	}
+	generated.plain("[\n");
+	for slot in slots {
+		// Each static slot executes in its own lexical block. This preserves the
+		// most-recent-preceding binding seen at that slot instead of hoisting all
+		// presentation definitions above every slot and letting a later shadow
+		// rewrite an earlier view's meaning.
+		generated.synthetic("{\n", &slot.span)?;
+		let mut definitions = HashSet::new();
+		for range in slot.expression.dependency_ranges() {
+			collect_dependencies(source, range, &analysis.definitions, &mut definitions)?;
+		}
+		let mut definitions = definitions.into_iter().collect::<Vec<_>>();
+		definitions.sort_by_key(|span| span.start);
+		for statement in definitions {
+			let rewritten = rewrite_calls_mapped(
+				source.get(statement.clone()).ok_or_else(|| {
+					RuneEnvelopeError::Invalid("presentation definition is not UTF-8".into())
+				})?,
+				statement.start,
+			)?;
+			generated.rewritten(rewritten)?;
+			generated.plain("\n");
+		}
+		match &slot.expression {
+			StaticPresentationExpr::Copied(span) => {
+				generated.rewritten(rewrite_calls_mapped(
+					source.get(span.clone()).ok_or_else(|| {
+						RuneEnvelopeError::Invalid("presentation slot is not UTF-8".into())
+					})?,
+					span.start,
+				)?)?;
+			}
+			StaticPresentationExpr::Synthetic {
+				constructor,
+				arguments,
+				origin,
+			} => {
+				generated.synthetic(&format!("{PRESENTATION_PREFIX}::__{constructor}("), origin)?;
+				for (index, argument) in arguments.iter().enumerate() {
+					if index > 0 {
+						generated.plain(", ");
+					}
+					generated.copied(
+						source.get(argument.clone()).ok_or_else(|| {
+							RuneEnvelopeError::Invalid("synthetic argument is not UTF-8".into())
+						})?,
+						argument.start,
+					)?;
+				}
+				if !arguments.is_empty() {
+					generated.plain(", ");
+				}
+				generated.synthetic(&format!("{}, {})", origin.start, origin.end), origin)?;
+			}
+		}
+		generated.synthetic("\n},\n", &slot.span)?;
+	}
+	generated.plain("]\n}\n");
+	Ok(RenderedPresentation {
+		source: generated.source,
+		source_map: PresentationSourceMap {
+			segments: generated.segments,
+			fallback,
+		},
+	})
+}
+
+#[derive(Clone, Debug)]
+struct Edit {
+	span: Range<usize>,
+	replacement: String,
+	owner: Range<u32>,
+}
+
+#[cfg(test)]
+fn rewrite_calls(fragment: &str, original_start: usize) -> Result<String, RuneEnvelopeError> {
+	Ok(rewrite_calls_mapped(fragment, original_start)?.source)
+}
+
+struct RewrittenFragment {
+	source: String,
+	segments: Vec<PresentationMapSegment>,
+}
+
+fn rewrite_calls_mapped(
+	fragment: &str,
+	original_start: usize,
+) -> Result<RewrittenFragment, RuneEnvelopeError> {
+	let tokens = lex(fragment, original_start);
+	let mut edits = Vec::new();
+	for (index, token) in tokens.iter().enumerate() {
+		let LexKind::Ident(name) = &token.kind else {
+			continue;
+		};
+		let Some(open) = tokens
+			.get(index + 1)
+			.filter(|token| token.kind == LexKind::Punct('('))
+		else {
+			continue;
+		};
+		let is_method = matches!(
+			tokens.get(index.wrapping_sub(1)).map(|token| &token.kind),
+			Some(LexKind::Punct('.'))
+		);
+		let recognized = if is_method {
+			PRESENTATION_METHODS.contains(&name.as_str())
+		} else {
+			PRESENTATION_FREE.contains(&name.as_str())
+				&& !matches!(tokens.get(index.wrapping_sub(1)).map(|token| &token.kind), Some(LexKind::Ident(keyword)) if keyword == "fn")
+		};
+		if !recognized {
+			continue;
+		}
+		let open_index = index + 1;
+		let Some(close_index) = matching_paren(&tokens, open_index) else {
+			return Err(RuneEnvelopeError::Invalid(
+				"presentation call has no matching close parenthesis".to_owned(),
+			));
+		};
+		let close = &tokens[close_index];
+		let origin_start = if is_method {
+			tokens[index - 1].span.start
+		} else {
+			token.span.start
+		};
+		let origin_end = close.span.end;
+		let replacement = if is_method {
+			format!("__{name}")
+		} else {
+			format!("{PRESENTATION_PREFIX}::__{name}")
+		};
+		edits.push(Edit {
+			span: (token.span.start - original_start)..(token.span.end - original_start),
+			replacement,
+			owner: u32_range(&(origin_start..origin_end), "presentation call origin")?,
+		});
+		let insertion = if open.span.end == close.span.start {
+			format!("{origin_start}, {origin_end}")
+		} else {
+			format!(", {origin_start}, {origin_end}")
+		};
+		edits.push(Edit {
+			span: (close.span.start - original_start)..(close.span.start - original_start),
+			replacement: insertion,
+			owner: u32_range(&(origin_start..origin_end), "presentation call origin")?,
+		});
+	}
+	edits.sort_by(|left, right| {
+		left.span
+			.start
+			.cmp(&right.span.start)
+			.then_with(|| right.span.end.cmp(&left.span.end))
+	});
+	let mut builder = PresentationBuilder::default();
+	let mut cursor = 0;
+	for edit in edits {
+		if cursor < edit.span.start {
+			builder.copied(&fragment[cursor..edit.span.start], original_start + cursor)?;
+		}
+		builder.synthetic(
+			&edit.replacement,
+			&(usize::try_from(edit.owner.start).unwrap_or(0)
+				..usize::try_from(edit.owner.end).unwrap_or(0)),
+		)?;
+		cursor = cursor.max(edit.span.end);
+	}
+	if cursor < fragment.len() {
+		builder.copied(&fragment[cursor..], original_start + cursor)?;
+	}
+	Ok(RewrittenFragment {
+		source: builder.source,
+		segments: builder.segments,
+	})
+}
+
+fn matching_paren(tokens: &[LexToken], open: usize) -> Option<usize> {
+	let mut depth = 0usize;
+	for (index, token) in tokens.iter().enumerate().skip(open) {
+		match token.kind {
+			LexKind::Punct('(') => depth += 1,
+			LexKind::Punct(')') => {
+				depth = depth.checked_sub(1)?;
+				if depth == 0 {
+					return Some(index);
+				}
+			}
+			_ => {}
+		}
+	}
+	None
+}
+
+fn lex(source: &str, offset: usize) -> Vec<LexToken> {
+	let bytes = source.as_bytes();
+	let mut tokens = Vec::new();
+	let mut index = 0;
+	while index < bytes.len() {
+		match bytes[index] {
+			b'/' if bytes.get(index + 1) == Some(&b'/') => {
+				index += 2;
+				while index < bytes.len() && bytes[index] != b'\n' {
+					index += 1;
+				}
+			}
+			b'/' if bytes.get(index + 1) == Some(&b'*') => {
+				index += 2;
+				let mut depth = 1usize;
+				while index < bytes.len() && depth > 0 {
+					if bytes.get(index..index + 2) == Some(&[b'/', b'*']) {
+						depth += 1;
+						index += 2;
+					} else if bytes.get(index..index + 2) == Some(&[b'*', b'/']) {
+						depth -= 1;
+						index += 2;
+					} else {
+						index += 1;
+					}
+				}
+			}
+			b'"' | b'\'' => {
+				let quote = bytes[index];
+				index += 1;
+				while index < bytes.len() {
+					if bytes[index] == b'\\' {
+						index = (index + 2).min(bytes.len());
+					} else if bytes[index] == quote {
+						index += 1;
+						break;
+					} else {
+						index += 1;
+					}
+				}
+			}
+			byte if byte == b'_' || byte.is_ascii_alphabetic() => {
+				let start = index;
+				index += 1;
+				while index < bytes.len()
+					&& (bytes[index] == b'_'
+						|| bytes[index].is_ascii_alphanumeric()
+						|| bytes[index] >= 0x80)
+				{
+					index += 1;
+				}
+				tokens.push(LexToken {
+					kind: LexKind::Ident(source[start..index].to_owned()),
+					span: offset + start..offset + index,
+				});
+			}
+			byte if b"().,:[]{}".contains(&byte) => {
+				tokens.push(LexToken {
+					kind: LexKind::Punct(byte as char),
+					span: offset + index..offset + index + 1,
+				});
+				index += 1;
+			}
+			_ => index += 1,
+		}
+	}
+	tokens
+}
+
+fn collect_definition(
+	statement: &ast::Stmt,
+	source: &str,
+	shadows: &mut ShellShadows,
+	definitions: &mut Vec<Definition>,
+) -> Result<(), RuneEnvelopeError> {
+	match statement {
+		ast::Stmt::Local(local) => {
+			let statement_span = byte_range(statement.span(), source.len())?;
+			let ast::Pat::Path(path) = &local.pat else {
+				return Ok(());
+			};
+			let name_span = byte_range(path.path.span(), source.len())?;
+			let name = source
+				.get(name_span.clone())
+				.ok_or_else(|| RuneEnvelopeError::Invalid("binding name is not UTF-8".into()))?
+				.trim()
+				.to_owned();
+			if !is_simple_name(&name) {
+				return Ok(());
+			}
+			shadows.insert(&name);
+			let value = byte_range(local.expr.span(), source.len())?;
+			definitions.push(Definition {
+				name,
+				name_span,
+				statement: statement_span,
+				literal: is_static_literal_expression(&local.expr, source, definitions),
+				value,
+			});
+		}
+		ast::Stmt::Item(ast::Item::Fn(function), _) => {
+			let name_span = byte_range(function.name.span(), source.len())?;
+			let name = source
+				.get(name_span.clone())
+				.ok_or_else(|| RuneEnvelopeError::Invalid("function name is not UTF-8".into()))?
+				.to_owned();
+			shadows.insert(&name);
+			definitions.push(Definition {
+				name,
+				name_span,
+				statement: byte_range(statement.span(), source.len())?,
+				value: byte_range(statement.span(), source.len())?,
+				literal: false,
+			});
+		}
+		_ => {}
+	}
+	Ok(())
+}
+
+fn is_static_literal_expression(
+	expression: &ast::Expr,
+	source: &str,
+	definitions: &[Definition],
+) -> bool {
+	match expression {
+		ast::Expr::Lit(literal) => matches!(literal.lit, ast::Lit::Str(_) | ast::Lit::Number(_)),
+		ast::Expr::Unary(unary) => {
+			let text = source_slice(source, unary.span())
+				.unwrap_or_default()
+				.trim();
+			text.starts_with('-')
+				&& matches!(unary.expr.as_ref(), ast::Expr::Lit(literal) if matches!(literal.lit, ast::Lit::Number(_)))
+		}
+		ast::Expr::Path(path) => {
+			let Ok(name) = source_slice(source, path.span()) else {
+				return false;
+			};
+			resolve_definition(definitions, name.trim(), path.span().start.into_usize())
+				.is_some_and(|definition| definition.literal)
+		}
+		_ => false,
+	}
+}
+
+fn retained_regions(
+	source_len: usize,
+	peeled: &[Range<usize>],
+) -> Result<Vec<Range<usize>>, RuneEnvelopeError> {
+	let mut retained = Vec::new();
+	let mut cursor = 0;
+	for region in peeled {
+		if region.start < cursor || region.end > source_len {
+			return Err(RuneEnvelopeError::Invalid(
+				"presentation spans overlap or exceed the source".into(),
+			));
+		}
+		if cursor < region.start {
+			retained.push(cursor..region.start);
+		}
+		cursor = region.end;
+	}
+	if cursor < source_len {
+		retained.push(cursor..source_len);
+	}
+	Ok(retained)
+}
+
+fn push_segment(
+	segments: &mut Vec<SourceMapSegment>,
+	transformed: Range<usize>,
+	original_start: usize,
+) -> Result<(), RuneEnvelopeError> {
+	if transformed.is_empty() {
+		return Ok(());
+	}
+	segments.push(SourceMapSegment {
+		transformed: u32_range(&transformed, "transformed source")?,
+		original_start: u32::try_from(original_start)
+			.map_err(|_| RuneEnvelopeError::Invalid("source exceeds u32".into()))?,
+	});
+	Ok(())
+}
+
+fn invalid_view<T>(
+	span: ast::Span,
+	source_len: usize,
+	message: impl Into<String>,
+) -> Result<T, RuneEnvelopeError> {
+	let span = byte_range(span, source_len)?;
+	Err(RuneEnvelopeError::InvalidView {
+		span: u32_range(&span, "view")?,
+		message: message.into(),
+	})
+}
+
+fn source_slice(source: &str, span: ast::Span) -> Result<&str, RuneEnvelopeError> {
+	let range = byte_range(span, source.len())?;
+	source
+		.get(range)
+		.ok_or_else(|| RuneEnvelopeError::Invalid("Rune span is not a UTF-8 boundary".into()))
+}
+
+fn byte_range(span: ast::Span, source_len: usize) -> Result<Range<usize>, RuneEnvelopeError> {
+	let start = span.start.into_usize();
+	let end = span.end.into_usize();
+	if start > end || end > source_len {
+		return Err(RuneEnvelopeError::Invalid(
+			"Rune span exceeds the source".into(),
+		));
+	}
+	Ok(start..end)
+}
+
+fn u32_range(span: &Range<usize>, what: &str) -> Result<Range<u32>, RuneEnvelopeError> {
+	Ok(u32::try_from(span.start)
+		.map_err(|_| RuneEnvelopeError::Invalid(format!("{what} exceeds u32")))?
+		..u32::try_from(span.end)
+			.map_err(|_| RuneEnvelopeError::Invalid(format!("{what} exceeds u32")))?)
+}
+
+fn decode_string_literal(raw: &str) -> Option<String> {
+	let raw = raw.trim();
+	if raw.len() < 2 || !raw.starts_with('"') || !raw.ends_with('"') {
+		return None;
+	}
+	let inner = &raw[1..raw.len() - 1];
+	if inner.contains('"') || inner.contains('\\') {
+		return None;
+	}
+	Some(inner.to_owned())
+}
+
+fn is_simple_name(raw: &str) -> bool {
+	let mut chars = raw.chars();
+	let Some(first) = chars.next() else {
+		return false;
+	};
+	(first == '_' || first.is_alphabetic())
+		&& chars.all(|character| character == '_' || character.is_alphanumeric())
+}
+
+fn is_keyword(name: &str) -> bool {
+	matches!(
+		name,
+		"as" | "async"
+			| "await" | "break"
+			| "const" | "continue"
+			| "else" | "enum"
+			| "false" | "fn"
+			| "for" | "if"
+			| "impl" | "in"
+			| "let" | "loop"
+			| "match" | "mod"
+			| "move" | "pub"
+			| "return"
+			| "self" | "struct"
+			| "true" | "use"
+			| "while"
+	)
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::plot::spec::{Override, Presence};
+	use crate::rune_relation_envelope::RuneViewIntent;
+	use std::sync::Arc;
+
+	#[test]
+	fn product_0076_rewriter_injects_nested_constructor_and_modifier_origins() {
+		let source = "bar(\"x\", \"y\").stacked().percent()";
+		let rewritten = rewrite_calls(source, 100).expect("rewrite presentation calls");
+		assert_eq!(
+			rewritten,
+			"polariton_presentation::__bar(\"x\", \"y\", 100, 113).__stacked(113, 123).__percent(123, 133)"
+		);
+	}
+
+	#[test]
+	fn product_0076_lexer_does_not_rewrite_strings_or_comments() {
+		let source = "// bar(\"x\", \"y\")\nlet text = \"y_bounds(0, 1)\"; title(text)";
+		let rewritten = rewrite_calls(source, 0).expect("rewrite live constructor only");
+		assert!(rewritten.contains("// bar(\"x\", \"y\")"));
+		assert!(rewritten.contains("\"y_bounds(0, 1)\""));
+		assert!(rewritten.contains("polariton_presentation::__title(text"));
+	}
+
+	#[test]
+	fn product_0076_compiler_executes_computed_presentation_with_static_topology() {
+		let source = r#"
+let yb = y_bounds(0, 160);
+let category = "region";
+let value = "revenue";
+let standard = || figure([
+	title("Computed"),
+	yb,
+	bar(category, value).bar_width(0.88),
+]);
+ket.table("demo_sales").views([
+	view("computed", standard()),
+]);
+"#;
+		let compiled = compile(source).expect("computed presentation compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(
+			compiled.presentation_order,
+			vec![LocalViewIdentity::Named("computed".to_owned())]
+		);
+		let relation = &compiled.executions[0];
+		assert!(relation.source.contains("ket.table(\"demo_sales\")"));
+		assert!(!relation.source.contains("y_bounds"));
+		assert!(!relation.source.contains("standard"));
+		let RuneViewIntent::Plot(plot) = &relation.views[0].intent else {
+			panic!("computed figure is a plot");
+		};
+		assert_eq!(
+			plot.authored_settings.title,
+			Presence::Show(Arc::new("Computed".to_owned()))
+		);
+		assert!(matches!(
+			&plot.authored_settings.domains,
+			Override::Set(domain)
+				if domain.y_min == Some(0.0) && domain.y_max == Some(160.0)
+		));
+	}
+
+	#[test]
+	fn product_0076_test21_computed_bounds_compile_as_twelve_static_views() {
+		let source = include_str!("../../../uat/test21.rn");
+		let compiled = compile(source).expect("test21 executable presentation compiles");
+		assert_eq!(compiled.presentation_order.len(), 12);
+		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(compiled.executions[0].views.len(), 12);
+		assert!(compiled.executions[0].source.contains(".sort(["));
+		assert!(!compiled.executions[0].source.contains("y_bounds"));
+	}
+
+	#[test]
+	fn product_0076_helper_failures_keep_the_helper_body_origin() {
+		let source = r#"
+fn bad() { y_bounds(9, 2) }
+fn middle() { bad() }
+fn outer() { middle() }
+workspace.table("t").views([figure([outer(), line("x", "y")])])
+"#;
+		let error = compile(source).expect_err("reversed helper bounds refuse");
+		let RuneEnvelopeError::InvalidView { span, message } = error else {
+			panic!("expected attributed helper refusal");
+		};
+		assert_eq!(
+			&source[span.start as usize..span.end as usize],
+			"y_bounds(9, 2)"
+		);
+		assert!(message.contains("cannot reverse an axis"), "{message}");
+	}
+
+	#[test]
+	fn product_0076_partition_separates_vocabularies_and_keeps_literal_dual_use() {
+		let source = r#"
+let category = "region";
+let yb = y_bounds(0, 10);
+let r = workspace.table("t").sort([col(category).asc()]);
+r.views([figure([yb, bar(category, "revenue")])])
+"#;
+		let analysis = analyze_static(source).expect("static shell");
+		let partition = partition(source, &analysis).expect("partition");
+		let execution = &analysis.executions[0];
+		let relation = render_relation(
+			source,
+			execution,
+			&analysis,
+			&partition.presentation,
+			&partition.relation,
+		)
+		.expect("relation program");
+		let presentation = render_presentation(
+			source,
+			&ordered_slots(&analysis),
+			&analysis,
+			&partition.presentation,
+		)
+		.expect("presentation program");
+		assert!(relation.source.contains("col(category)"));
+		assert!(!relation.source.contains("y_bounds"));
+		assert!(!relation.source.contains("bar(category"));
+		assert!(presentation.source.contains("__y_bounds"));
+		assert!(presentation.source.contains("__bar(category"));
+		assert!(!presentation.source.contains("workspace.table"));
+		assert!(
+			relation.source.contains("let category = \"region\"")
+				&& presentation.source.contains("let category = \"region\"")
+		);
+	}
+
+	#[test]
+	fn product_0076_computed_dual_use_and_mixed_helpers_refuse_before_execution() {
+		let dual = r#"
+fn category() { "region" }
+let r = workspace.table("t").sort([col(category()).asc()]);
+r.views([bar(category(), "revenue")])
+"#;
+		let error = compile(dual).expect_err("computed dual use refuses");
+		assert!(
+			error
+				.to_string()
+				.contains("only static literal and alias closures")
+		);
+
+		let mixed = r#"
+fn impossible() { [col("region"), y_bounds(0, 10)] }
+workspace.table("t").views([figure([impossible(), bar("region", "revenue")])])
+"#;
+		let error = compile(mixed).expect_err("mixed helper refuses");
+		assert!(
+			error
+				.to_string()
+				.contains("both relation and presentation vocabulary")
+		);
+	}
+
+	#[test]
+	fn product_0076_unclaimed_effects_stay_relation_side_but_presentation_does_not_leak() {
+		let source = r#"
+observe("kept");
+let unused = y_bounds(0, 10);
+workspace.table("t").views([bar("region", "revenue")])
+"#;
+		let analysis = analyze_static(source).expect("static shell");
+		let partition = partition(source, &analysis).expect("partition");
+		let relation = render_relation(
+			source,
+			&analysis.executions[0],
+			&analysis,
+			&partition.presentation,
+			&partition.relation,
+		)
+		.expect("relation program");
+		assert!(relation.source.contains("observe(\"kept\")"));
+		assert!(!relation.source.contains("y_bounds"));
+	}
+
+	#[test]
+	fn product_0076_topology_remains_literal_and_names_remain_static() {
+		for source in [
+			"fn build() { [bar(\"x\", \"y\")] } workspace.table(\"t\").views(build())",
+			"let name = \"dynamic\"; workspace.table(\"t\").views([view(name, bar(\"x\", \"y\"))])",
+			"workspace.table(\"t\").views(if true { [bar(\"x\", \"y\")] } else { [] })",
+			"workspace.table(\"t\").views({ let out = []; for n in [1] { out.push(bar(\"x\", \"y\")); } out })",
+			"workspace.table(\"t\").views([view(if true { \"a\" } else { \"b\" }, bar(\"x\", \"y\"))])",
+		] {
+			assert!(
+				matches!(compile(source), Err(RuneEnvelopeError::InvalidView { .. })),
+				"runtime topology must refuse: {source}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0076_helpers_cover_the_complete_presentation_vocabulary() {
+		let helper = r#"
+fn pass(value) { value }
+fn twice(value) { pass(value) }
+fn furniture() { [
+	twice(title("Title")), twice(subtitle("Subtitle")), twice(facet("region")),
+	twice(palette("viridis")), twice(skin("nord").duotone()),
+	twice(legend_at(0.2, 0.8)), twice(x_bounds(0, 10)), twice(y_bounds(0, 20)),
+	twice(x_tick_step(2)), twice(y_tick_step(4)),
+	twice(x_minor_ticks(2)), twice(y_minor_ticks(3)),
+	twice(bar("region", "revenue", "product")
+		.bar_width(0.8).category_gap(0.1).stacked().percent()),
+] }
+let r = workspace.table("t");
+r.views([
+	figure(furniture()),
+	twice(table().skin("nord").duotone().show_types()),
+	twice(layers([
+		twice(line("x", "y").stroke_width(2)),
+		twice(scatter("x", "y").point_size(1.5)),
+	])),
+	twice(area("x", "y", "product")),
+])
+"#;
+		let inline = r#"
+let r = workspace.table("t");
+r.views([
+	figure([
+		title("Title"), subtitle("Subtitle"), facet("region"), palette("viridis"),
+		skin("nord").duotone(), legend_at(0.2, 0.8), x_bounds(0, 10), y_bounds(0, 20),
+		x_tick_step(2), y_tick_step(4), x_minor_ticks(2), y_minor_ticks(3),
+		bar("region", "revenue", "product").bar_width(0.8).category_gap(0.1).stacked().percent(),
+	]),
+	table().skin("nord").duotone().show_types(),
+	layers([line("x", "y").stroke_width(2), scatter("x", "y").point_size(1.5)]),
+	area("x", "y", "product"),
+])
+"#;
+		let helper = compile(helper).expect("two-deep helpers execute every presentation member");
+		let inline = compile(inline).expect("inline control compiles");
+		let helper_intents = helper.executions[0]
+			.views
+			.iter()
+			.map(|view| &view.intent)
+			.collect::<Vec<_>>();
+		let inline_intents = inline.executions[0]
+			.views
+			.iter()
+			.map(|view| &view.intent)
+			.collect::<Vec<_>>();
+		assert_eq!(helper_intents, inline_intents);
+	}
+
+	#[test]
+	fn product_0076_partition_tracks_shadowed_occurrences_by_position() {
+		let source = r#"
+let value = "first";
+let before = y_bounds(0, 1);
+let value = "region";
+let r = workspace.table("t").sort([col(value).asc()]);
+let value = "revenue";
+r.views([figure([before, bar("region", value)])])
+"#;
+		let analysis = analyze_static(source).expect("static shell");
+		let partition = partition(source, &analysis).expect("position-keyed partition");
+		let relation = render_relation(
+			source,
+			&analysis.executions[0],
+			&analysis,
+			&partition.presentation,
+			&partition.relation,
+		)
+		.expect("relation program");
+		let presentation = render_presentation(
+			source,
+			&ordered_slots(&analysis),
+			&analysis,
+			&partition.presentation,
+		)
+		.expect("presentation program");
+		assert!(relation.source.contains("let value = \"region\""));
+		assert!(!relation.source.contains("let value = \"revenue\""));
+		assert!(presentation.source.contains("let value = \"revenue\""));
+		assert!(!presentation.source.contains("let value = \"region\""));
+		assert!(
+			relation.source.contains("let value = \"first\""),
+			"an unclaimed legacy statement remains relation-side"
+		);
+		assert!(!presentation.source.contains("let value = \"first\""));
+	}
+
+	#[test]
+	fn product_0076_context_divergence_executes_locally_but_never_dual_replays() {
+		let local = r#"
+fn category() { let probe = std::char::from_i64(114); "region" }
+workspace.table("t").views([bar(category(), "revenue")])
+"#;
+		compile(local).expect("the presentation context supplies std::char");
+
+		let dual = r#"
+fn category() { let probe = std::char::from_i64(114); "region" }
+let r = workspace.table("t").sort([col(category()).asc()]);
+r.views([bar(category(), "revenue")])
+"#;
+		let error = compile(dual).expect_err("a computed helper cannot replay in both VMs");
+		assert!(
+			error
+				.to_string()
+				.contains("only static literal and alias closures")
+		);
+	}
+
+	#[test]
+	fn product_0076_compile_diagnostics_map_copied_text_to_the_exact_argument() {
+		let source = "workspace.table(\"t\").views([bar(missing, \"y\")])";
+		let RuneEnvelopeError::InvalidView { span, message } =
+			compile(source).expect_err("undefined field binding refuses")
+		else {
+			panic!("expected attributed compile refusal");
+		};
+		assert_eq!(&source[span.start as usize..span.end as usize], "missing");
+		assert!(message.contains("No local variable `missing`"), "{message}");
+	}
+}

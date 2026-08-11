@@ -1,31 +1,36 @@
-//! PRODUCT-0003's deliberately tiny terminal-view envelope.
+//! Static Rune view transport and revision scheduling.
 //!
-//! This module recognizes presentation calls and rewrites their relation
-//! argument into Toron's entrypoint, naming its single capability parameter
-//! `workspace` or the trial alias `ket` to match the proven relation root. It
-//! owns no relation verbs, typing, planning, or lowering; those belong
-//! exclusively to Toron's native Rune frontend.
+//! PRODUCT-0076 moved presentation meaning into a bounded typed Rune VM. This
+//! module owns the transported authored intent, relation source maps, and the
+//! two-stage revision scheduler; the static shell and source partition live in
+//! `rune_view_compiler`, while relation semantics remain Toron's.
 
+#[cfg(test)]
 use crate::plot::chrome::PlotChromeProjection;
+#[cfg(test)]
 use crate::plot::common::TickPlacement;
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
-use crate::plot::spec::{
-	BarWidth, CategoryGap, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, LegendPosition,
-	Override, PointSize, Presence, StrokeWidth,
-};
-use crate::plot::theme::{
-	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
-};
+#[cfg(test)]
+use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
+use crate::plot::spec::{LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, Presence};
+use crate::plot::theme::PlotSettingsLayer;
+#[cfg(test)]
+use crate::plot::theme::{PlotDomainOverrides, PlotSkinSelection};
 pub(crate) use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use libaryon::core::BufferId;
-use rune::ast::{self, Spanned};
+#[cfg(test)]
+use rune::ast;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
+#[cfg(test)]
 const WORKSPACE_ENTRYPOINT_PREFIX: &str = "pub fn main(workspace) {\n";
+#[cfg(test)]
 const KET_ENTRYPOINT_PREFIX: &str = "pub fn main(ket) {\n";
+#[cfg(test)]
 const ENTRYPOINT_SUFFIX: &str = "\n}\n";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -140,7 +145,7 @@ impl StyledRunePlotSink {
 }
 
 impl RunePlotIntent {
-	fn bare(body: RunePlotBody) -> Self {
+	pub(crate) fn bare(body: RunePlotBody) -> Self {
 		Self {
 			body,
 			facet: None,
@@ -262,15 +267,15 @@ pub(crate) struct DisposableRunePlotSink {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct SourceMapSegment {
-	transformed: Range<u32>,
-	original_start: u32,
+pub(crate) struct SourceMapSegment {
+	pub(crate) transformed: Range<u32>,
+	pub(crate) original_start: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct RuneEnvelopeSourceMap {
-	segments: Vec<SourceMapSegment>,
-	diagnostic_fallback: Range<u32>,
+	pub(crate) segments: Vec<SourceMapSegment>,
+	pub(crate) diagnostic_fallback: Range<u32>,
 }
 
 impl RuneEnvelopeSourceMap {
@@ -296,8 +301,8 @@ impl RuneEnvelopeSourceMap {
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct TransformedRuneView {
-	executions: Vec<TransformedRuneRelation>,
-	presentation_order: Vec<LocalViewIdentity>,
+	pub(crate) executions: Vec<TransformedRuneRelation>,
+	pub(crate) presentation_order: Vec<LocalViewIdentity>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -350,16 +355,115 @@ pub(crate) struct PendingRuneView {
 	pub(crate) view: TransformedRuneView,
 }
 
+#[derive(Clone, Debug)]
+pub(crate) struct PendingRunePresentation {
+	pub(crate) source_buffer: BufferId,
+	pub(crate) revision: u64,
+	pub(crate) source: String,
+	freshness: Option<Arc<AtomicU64>>,
+}
+
+impl PendingRunePresentation {
+	pub(crate) fn new(source_buffer: BufferId, revision: u64, source: String) -> Self {
+		Self {
+			source_buffer,
+			revision,
+			source,
+			freshness: None,
+		}
+	}
+
+	pub(crate) fn is_current(&self) -> bool {
+		self.freshness
+			.as_ref()
+			.is_some_and(|latest| latest.load(Ordering::Acquire) == self.revision)
+	}
+}
+
+pub(crate) struct PresentationCompletion {
+	pub(crate) accepted: bool,
+	pub(crate) next: Option<PendingRunePresentation>,
+}
+
 #[derive(Default)]
 pub(crate) struct RuneViewScheduler {
+	presentation_in_flight: HashMap<BufferId, u64>,
+	presentation_pending: HashMap<BufferId, PendingRunePresentation>,
+	presentation_latest: HashMap<BufferId, Arc<AtomicU64>>,
 	in_flight: HashMap<BufferId, HashSet<String>>,
 	pending: HashMap<BufferId, PendingRuneView>,
 	pub(crate) submitted: u64,
 	pub(crate) executed: u64,
 	pub(crate) superseded_before_execution: u64,
+	pub(crate) presentation_submitted: u64,
+	pub(crate) presentation_executed: u64,
+	pub(crate) presentation_superseded_before_execution: u64,
 }
 
 impl RuneViewScheduler {
+	pub(crate) fn submit_presentation(
+		&mut self,
+		mut work: PendingRunePresentation,
+	) -> Option<PendingRunePresentation> {
+		self.presentation_submitted = self.presentation_submitted.saturating_add(1);
+		let latest = self
+			.presentation_latest
+			.entry(work.source_buffer)
+			.or_insert_with(|| Arc::new(AtomicU64::new(work.revision)));
+		latest.store(work.revision, Ordering::Release);
+		work.freshness = Some(Arc::clone(latest));
+		if !self
+			.presentation_in_flight
+			.contains_key(&work.source_buffer)
+		{
+			self.presentation_in_flight
+				.insert(work.source_buffer, work.revision);
+			self.presentation_executed = self.presentation_executed.saturating_add(1);
+			return Some(work);
+		}
+		if self
+			.presentation_pending
+			.insert(work.source_buffer, work)
+			.is_some()
+		{
+			self.presentation_superseded_before_execution = self
+				.presentation_superseded_before_execution
+				.saturating_add(1);
+		}
+		None
+	}
+
+	pub(crate) fn complete_presentation(
+		&mut self,
+		source_buffer: BufferId,
+		revision: u64,
+	) -> PresentationCompletion {
+		let active = self
+			.presentation_in_flight
+			.remove(&source_buffer)
+			.expect("presentation completion requires an in-flight buffer");
+		assert_eq!(
+			active, revision,
+			"presentation completion requires the active revision"
+		);
+		let next = self.presentation_pending.remove(&source_buffer);
+		if let Some(next) = &next {
+			assert!(
+				self.presentation_in_flight
+					.insert(source_buffer, next.revision)
+					.is_none(),
+				"a pending presentation starts only after completion"
+			);
+			self.presentation_executed = self.presentation_executed.saturating_add(1);
+		} else {
+			self.presentation_latest.remove(&source_buffer);
+		}
+		PresentationCompletion {
+			accepted: next.is_none(),
+			next,
+		}
+	}
+
 	pub(crate) fn submit(&mut self, work: PendingRuneView) -> Option<PendingRuneView> {
 		self.submitted = self.submitted.saturating_add(1);
 		if !self.in_flight.contains_key(&work.source_buffer) {
@@ -397,6 +501,9 @@ impl RuneViewScheduler {
 	}
 
 	pub(crate) fn cancel(&mut self, source_buffer: BufferId) {
+		self.presentation_in_flight.remove(&source_buffer);
+		self.presentation_pending.remove(&source_buffer);
+		self.presentation_latest.remove(&source_buffer);
 		self.in_flight.remove(&source_buffer);
 		self.pending.remove(&source_buffer);
 	}
@@ -472,2949 +579,49 @@ impl std::fmt::Display for RuneEnvelopeError {
 
 impl std::error::Error for RuneEnvelopeError {}
 
+#[cfg(test)]
 pub(crate) fn transform(source: &str) -> Result<TransformedRuneView, RuneEnvelopeError> {
-	let analysis = analyze(source)?;
-	let recognized_presentation = analysis.recognized_presentation;
-	let envelopes = analysis.into_envelopes();
-	if envelopes.is_empty() {
-		return Err(if recognized_presentation {
-			RuneEnvelopeError::RecognizedNoOutput
-		} else {
-			RuneEnvelopeError::NoTerminalView
-		});
-	}
-	let executions = envelopes
-		.iter()
-		.map(|envelope| render(source, envelope))
-		.collect::<Result<Vec<_>, _>>()?;
-	let mut ordered = executions
-		.iter()
-		.flat_map(|execution| execution.views.iter())
-		.collect::<Vec<_>>();
-	ordered.sort_by_key(|view| view.output_order);
-	Ok(TransformedRuneView {
-		presentation_order: ordered
-			.into_iter()
-			.map(|view| view.identity.clone())
-			.collect(),
-		executions,
-	})
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct OutputRootAnalysis {
-	envelopes: Vec<ExecutionEnvelope>,
-	recognized_presentation: bool,
-}
-
-impl OutputRootAnalysis {
-	#[cfg(test)]
-	fn into_envelope(self) -> Option<ExecutionEnvelope> {
-		let mut envelopes = self.envelopes;
-		(envelopes.len() == 1).then(|| envelopes.remove(0))
-	}
-
-	fn into_envelopes(self) -> Vec<ExecutionEnvelope> {
-		self.envelopes
-	}
-
-	#[cfg(test)]
-	fn semantics(&self) -> BufferViewSemantics {
-		let mut views = self
-			.envelopes
-			.iter()
-			.flat_map(|envelope| envelope.sinks.iter())
-			.collect::<Vec<_>>();
-		views.sort_by_key(|sink| sink.output_order);
-		BufferViewSemantics {
-			executions: self
-				.envelopes
-				.iter()
-				.map(|envelope| envelope.relation_origin.clone())
-				.collect(),
-			presentation_order: views.into_iter().map(|sink| sink.intent.clone()).collect(),
-			execution_count: self.envelopes.len(),
-		}
-	}
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct ExecutionEnvelope {
-	retained: Vec<Range<usize>>,
-	relation: Range<usize>,
-	relation_root: RelationRoot,
-	relation_origin: String,
-	sinks: NonEmptySinks,
-	terminate_retained_tail: bool,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct NonEmptySinks {
-	first: ParsedSink,
-	rest: Vec<ParsedSink>,
-}
-
-impl NonEmptySinks {
-	fn iter(&self) -> impl Iterator<Item = &ParsedSink> {
-		std::iter::once(&self.first).chain(&self.rest)
-	}
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq)]
-struct EnvelopeSemantics {
-	relation_origin: String,
-	sinks: Vec<RuneViewIntent>,
-}
-
-#[cfg(test)]
-#[derive(Clone, Debug, PartialEq)]
-struct BufferViewSemantics {
-	executions: Vec<String>,
-	presentation_order: Vec<RuneViewIntent>,
-	execution_count: usize,
-}
-
-impl ExecutionEnvelope {
-	#[cfg(test)]
-	fn semantics(&self) -> EnvelopeSemantics {
-		EnvelopeSemantics {
-			relation_origin: self.relation_origin.clone(),
-			sinks: self.sinks.iter().map(|sink| sink.intent.clone()).collect(),
-		}
-	}
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct ParsedSink {
-	intent: RuneViewIntent,
-	span: Range<usize>,
-	name: Option<ParsedViewName>,
-	output_order: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct ParsedViewName {
-	value: String,
-	span: Range<usize>,
-}
-
-#[derive(Clone, Debug)]
-struct ParsedOutputRoot {
-	emission: Range<usize>,
-	relation: Range<usize>,
-	relation_root: RelationRoot,
-	relation_origin: String,
-	sinks: Vec<ParsedSink>,
-}
-
-#[derive(Clone, Debug)]
-struct LocalBinding {
-	name: String,
-	initializer: Range<usize>,
-	statement: Range<usize>,
-	statement_start: usize,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum StaticLiteralValue {
-	String(String),
-	Number(f64),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct ResolvedStaticLiteral {
-	value: StaticLiteralValue,
-	binding: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default)]
-struct ViewShadows {
-	table: bool,
-	plot: bool,
-	workspace: bool,
-	ket: bool,
-}
-
-impl ViewShadows {
-	fn insert(&mut self, name: &str) {
-		match name {
-			"table" => self.table = true,
-			"plot" => self.plot = true,
-			"workspace" => self.workspace = true,
-			"ket" => self.ket = true,
-			_ => {}
-		}
-	}
-}
-
-#[derive(Clone, Debug)]
-enum ExpressionProvenance {
-	RelationCandidate {
-		span: Range<usize>,
-		root: RelationRoot,
-		origin: String,
-	},
-	ViewSet {
-		relation: Range<usize>,
-		root: RelationRoot,
-		origin: String,
-		sinks: Vec<ParsedSink>,
-	},
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum RelationRoot {
-	Workspace,
-	Ket,
-}
-
-fn analyze(source: &str) -> Result<OutputRootAnalysis, RuneEnvelopeError> {
-	let block = rune::parse::parse_all::<ast::EmptyBlock>(source, rune::SourceId::EMPTY, false)
-		.map_err(|error| RuneEnvelopeError::Parse(error.to_string()))?;
-
-	// Whole-buffer shadowing is deliberately conservative. Complete this pass
-	// before classifying any root so a later binding can suppress an earlier call.
-	let mut shadows = ViewShadows::default();
-	let mut bindings = Vec::new();
-	for statement in &block.statements {
-		collect_top_level_bindings(statement, source, &mut shadows, &mut bindings)?;
-	}
-
-	let mut kinds = HashMap::<String, ExpressionProvenance>::new();
-	let mut roots = Vec::<ParsedOutputRoot>::new();
-	let mut peeled = Vec::<Range<usize>>::new();
-	let mut recognized_presentation = false;
-	let mut last_retained_is_expression = false;
-	for statement in &block.statements {
-		if let Some(root) = recognize_view_root(statement, source, shadows, &bindings)? {
-			let (relation_origin, relation_root) =
-				resolve_relation_origin(source, &root, &bindings, shadows)?;
-			peeled.push(root.statement.clone());
-			roots.push(ParsedOutputRoot {
-				emission: root.statement.clone(),
-				relation: root.relation,
-				relation_root,
-				relation_origin,
-				sinks: vec![ParsedSink {
-					intent: root.intent,
-					span: root.statement,
-					name: None,
-					output_order: 0,
-				}],
-			});
-			continue;
-		}
-
-		if let ast::Stmt::Local(local) = statement {
-			let statement_span = byte_range(statement.span(), source.len())?;
-			let provenance =
-				expression_provenance(&local.expr, source, &kinds, shadows, &bindings)?;
-			if let Some(binding) = bindings
-				.iter()
-				.find(|binding| binding.statement == statement_span)
-				&& let Some(provenance) = provenance
-			{
-				if matches!(provenance, ExpressionProvenance::ViewSet { .. }) {
-					recognized_presentation = true;
-					peeled.push(statement_span);
-				}
-				last_retained_is_expression = false;
-				kinds.insert(binding.name.clone(), provenance);
-				continue;
-			}
-			last_retained_is_expression = false;
-			continue;
-		}
-
-		let expression = match statement {
-			ast::Stmt::Expr(expression) => Some(expression),
-			ast::Stmt::Semi(semi) => Some(&semi.expr),
-			_ => None,
-		};
-		if let Some(expression) = expression
-			&& let Some(ExpressionProvenance::ViewSet {
-				relation,
-				root,
-				origin,
-				sinks,
-			}) = expression_provenance(expression, source, &kinds, shadows, &bindings)?
-		{
-			let emission = byte_range(statement.span(), source.len())?;
-			recognized_presentation = true;
-			peeled.push(emission.clone());
-			roots.push(ParsedOutputRoot {
-				emission,
-				relation,
-				relation_root: root,
-				relation_origin: origin,
-				sinks,
-			});
-			last_retained_is_expression = false;
-			continue;
-		}
-		last_retained_is_expression = matches!(statement, ast::Stmt::Expr(_));
-	}
-	roots.sort_by_key(|root| root.emission.start);
-	peeled.sort_by_key(|region| region.start);
-
-	if roots.is_empty() {
-		return Ok(OutputRootAnalysis {
-			envelopes: Vec::new(),
-			recognized_presentation,
-		});
-	}
-
-	let retained = retained_regions(source.len(), &peeled)?;
-	let mut names = HashMap::<String, Range<u32>>::new();
-	let mut next_output_order = 0;
-	for root in &mut roots {
-		for sink in &mut root.sinks {
-			sink.output_order = next_output_order;
-			next_output_order += 1;
-			if let Some(name) = &sink.name {
-				let span = u32_range(&name.span, "view name")?;
-				if let Some(first) = names.insert(name.value.clone(), span.clone()) {
-					return Err(RuneEnvelopeError::DuplicateName {
-						name: name.value.clone(),
-						first,
-						duplicate: span,
-					});
-				}
-			}
-		}
-	}
-
-	let mut grouped = Vec::<ParsedOutputRoot>::new();
-	let mut group_by_origin = HashMap::<String, usize>::new();
-	for root in roots {
-		if let Some(index) = group_by_origin.get(&root.relation_origin).copied() {
-			grouped[index].sinks.extend(root.sinks);
-		} else {
-			group_by_origin.insert(root.relation_origin.clone(), grouped.len());
-			grouped.push(root);
-		}
-	}
-
-	let envelopes = grouped
-		.into_iter()
-		.map(|root| {
-			let mut sinks = root.sinks.into_iter();
-			let first = sinks.next().expect("an output root has at least one sink");
-			ExecutionEnvelope {
-				retained: retained.clone(),
-				relation: root.relation,
-				relation_root: root.relation_root,
-				relation_origin: root.relation_origin,
-				sinks: NonEmptySinks {
-					first,
-					rest: sinks.collect(),
-				},
-				terminate_retained_tail: last_retained_is_expression,
-			}
-		})
-		.collect();
-	Ok(OutputRootAnalysis {
-		envelopes,
-		recognized_presentation,
-	})
-}
-
-fn expression_provenance(
-	expression: &ast::Expr,
-	source: &str,
-	bindings: &HashMap<String, ExpressionProvenance>,
-	shadows: ViewShadows,
-	literal_bindings: &[LocalBinding],
-) -> Result<Option<ExpressionProvenance>, RuneEnvelopeError> {
-	match expression {
-		ast::Expr::Path(path) => {
-			let raw = source_slice(source, path.span())?.trim();
-			let root = match raw {
-				"workspace" if !shadows.workspace => Some(RelationRoot::Workspace),
-				"ket" if !shadows.ket => Some(RelationRoot::Ket),
-				_ => None,
-			};
-			if let Some(root) = root {
-				return Ok(Some(ExpressionProvenance::RelationCandidate {
-					span: byte_range(path.span(), source.len())?,
-					root,
-					// Both spellings name one capability, so semantic identity is
-					// canonical even though synthesis preserves the authored root.
-					origin: "workspace".to_owned(),
-				}));
-			}
-			Ok(bindings.get(raw).cloned())
-		}
-		ast::Expr::Group(group) => {
-			expression_provenance(&group.expr, source, bindings, shadows, literal_bindings)
-		}
-		ast::Expr::Call(call) => {
-			let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-			if let ast::Expr::FieldAccess(field) = call.expr.as_ref() {
-				let method = source_slice(source, field.expr_field.span())?.trim();
-				let receiver = expression_provenance(
-					&field.expr,
-					source,
-					bindings,
-					shadows,
-					literal_bindings,
-				)?;
-				return match receiver {
-					Some(ExpressionProvenance::RelationCandidate { span, root, origin }) => {
-						provenance_method_on_relation(
-							call,
-							method,
-							&field.expr,
-							span,
-							root,
-							origin,
-							&args,
-							source,
-							literal_bindings,
-						)
-					}
-					Some(ExpressionProvenance::ViewSet {
-						relation,
-						root,
-						origin,
-						sinks,
-					}) => provenance_method_on_view_set(
-						call,
-						method,
-						relation,
-						root,
-						origin,
-						sinks,
-						&args,
-						source,
-						literal_bindings,
-					),
-					None => Ok(None),
-				};
-			}
-
-			if matches!(
-				expression_provenance(&call.expr, source, bindings, shadows, literal_bindings)?,
-				Some(ExpressionProvenance::ViewSet { .. })
-			) {
-				return invalid_view(
-					call.expr.span(),
-					source.len(),
-					"a ViewSet may only be emitted or extended with .views([...])",
-				);
-			}
-			for arg in &args {
-				if matches!(
-					expression_provenance(arg, source, bindings, shadows, literal_bindings)?,
-					Some(ExpressionProvenance::ViewSet { .. })
-				) {
-					return invalid_view(
-						arg.span(),
-						source.len(),
-						"a ViewSet binding may only be emitted or extended with .views([...])",
-					);
-				}
-			}
-			Ok(None)
-		}
-		ast::Expr::Vec(vector) => {
-			for (item, _) in vector.items.iter() {
-				if matches!(
-					expression_provenance(item, source, bindings, shadows, literal_bindings)?,
-					Some(ExpressionProvenance::ViewSet { .. })
-				) {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a ViewSet binding may only be emitted or extended with .views([...])",
-					);
-				}
-			}
-			Ok(None)
-		}
-		_ => Ok(None),
-	}
-}
-
-fn provenance_method_on_relation(
-	call: &ast::ExprCall,
-	method: &str,
-	receiver: &ast::Expr,
-	relation: Range<usize>,
-	root: RelationRoot,
-	mut origin: String,
-	args: &[&ast::Expr],
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<Option<ExpressionProvenance>, RuneEnvelopeError> {
-	match method {
-		"views" => {
-			let sinks = parse_view_list(call, args, source, literal_bindings)?;
-			Ok(Some(ExpressionProvenance::ViewSet {
-				relation,
-				root,
-				origin,
-				sinks,
-			}))
-		}
-		"scatter" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
-			relation,
-			root,
-			origin,
-			sinks: vec![parse_sugar_sink(
-				PlotType::Scatter,
-				call,
-				args,
-				source,
-				literal_bindings,
-			)?],
-		})),
-		"bar" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
-			relation,
-			root,
-			origin,
-			sinks: vec![parse_sugar_sink(
-				PlotType::Bar,
-				call,
-				args,
-				source,
-				literal_bindings,
-			)?],
-		})),
-		"line" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
-			relation,
-			root,
-			origin,
-			sinks: vec![parse_sugar_sink(
-				PlotType::Line,
-				call,
-				args,
-				source,
-				literal_bindings,
-			)?],
-		})),
-		"area" if matches!(args.len(), 2 | 3) => Ok(Some(ExpressionProvenance::ViewSet {
-			relation,
-			root,
-			origin,
-			sinks: vec![parse_sugar_sink(
-				PlotType::StackedArea,
-				call,
-				args,
-				source,
-				literal_bindings,
-			)?],
-		})),
-		"line" => invalid_view(
-			call.span(),
-			source.len(),
-			"line view sugar requires x and y strings with an optional series",
-		),
-		"area" => invalid_view(
-			call.span(),
-			source.len(),
-			"area view sugar requires x and y strings with an optional series",
-		),
-		"table" if args.is_empty() => Ok(Some(ExpressionProvenance::ViewSet {
-			relation,
-			root,
-			origin,
-			sinks: vec![ParsedSink {
-				intent: RuneViewIntent::Table(RuneTableSink::default()),
-				span: byte_range(call.span(), source.len())?,
-				name: None,
-				output_order: 0,
-			}],
-		})),
-		_ => {
-			let receiver = byte_range(receiver.span(), source.len())?;
-			let call_span = byte_range(call.span(), source.len())?;
-			origin.push_str(source.get(receiver.end..call_span.end).ok_or_else(|| {
-				RuneEnvelopeError::Invalid("relation method span is not UTF-8".into())
-			})?);
-			Ok(Some(ExpressionProvenance::RelationCandidate {
-				span: call_span,
-				root,
-				origin,
-			}))
-		}
-	}
-}
-
-fn provenance_method_on_view_set(
-	call: &ast::ExprCall,
-	method: &str,
-	relation: Range<usize>,
-	root: RelationRoot,
-	origin: String,
-	mut sinks: Vec<ParsedSink>,
-	args: &[&ast::Expr],
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<Option<ExpressionProvenance>, RuneEnvelopeError> {
-	if method != "views" {
-		return invalid_view(
-			call.span(),
-			source.len(),
-			"a ViewSet may only be emitted or extended with .views([...])",
-		);
-	}
-	sinks.extend(parse_view_list(call, args, source, literal_bindings)?);
-	Ok(Some(ExpressionProvenance::ViewSet {
-		relation,
-		root,
-		origin,
-		sinks,
-	}))
-}
-
-fn parse_view_list(
-	call: &ast::ExprCall,
-	args: &[&ast::Expr],
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<Vec<ParsedSink>, RuneEnvelopeError> {
-	let [argument] = args else {
-		return invalid_view(
-			call.span(),
-			source.len(),
-			"views(...) takes exactly one sink list",
-		);
-	};
-	let ast::Expr::Vec(list) = argument else {
-		return invalid_view(
-			argument.span(),
-			source.len(),
-			"views(...) requires a literal sink list",
-		);
-	};
-	if list.items.is_empty() {
-		return invalid_view(list.span(), source.len(), "views([]) is empty");
-	}
-	list.items
-		.iter()
-		.map(|(item, _)| parse_contextual_sink(item, source, literal_bindings))
-		.collect()
-}
-
-fn parse_contextual_sink(
-	expression: &ast::Expr,
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<ParsedSink, RuneEnvelopeError> {
-	parse_contextual_sink_inner(expression, source, true, literal_bindings)
-}
-
-fn parse_contextual_sink_inner(
-	expression: &ast::Expr,
-	source: &str,
-	allow_identity_wrapper: bool,
-	literal_bindings: &[LocalBinding],
-) -> Result<ParsedSink, RuneEnvelopeError> {
-	if let Some(table) = parse_modified_table(expression, source, literal_bindings)? {
-		return Ok(ParsedSink {
-			intent: RuneViewIntent::Table(table),
-			span: byte_range(expression.span(), source.len())?,
-			name: None,
-			output_order: 0,
-		});
-	}
-	if let Some(layer) = parse_modified_mark(expression, source, literal_bindings, false)? {
-		return Ok(ParsedSink {
-			intent: RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::StyledSingle(layer))),
-			span: byte_range(expression.span(), source.len())?,
-			name: None,
-			output_order: 0,
-		});
-	}
-	let ast::Expr::Call(call) = expression else {
-		return invalid_view(
-			expression.span(),
-			source.len(),
-			"a views list element must be scatter(...), bar(...), line(...), area(...), or table()",
-		);
-	};
-	let callee = source_slice(source, call.expr.span())?.trim();
-	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	if callee == "view" {
-		if !allow_identity_wrapper {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"view(...) wrappers cannot be nested",
-			);
-		}
-		let [name, sink] = args.as_slice() else {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"view(...) takes a name string and one sink",
-			);
-		};
-		let raw_name = source_slice(source, name.span())?;
-		let Some(value) = decode_string_literal(raw_name) else {
-			return invalid_view(
-				name.span(),
-				source.len(),
-				"view name must be a string literal",
-			);
-		};
-		let mut parsed = parse_contextual_sink_inner(sink, source, false, literal_bindings)?;
-		parsed.name = Some(ParsedViewName {
-			value,
-			span: byte_range(name.span(), source.len())?,
-		});
-		return Ok(parsed);
-	}
-	let intent = match callee {
-		"table" if args.is_empty() => RuneViewIntent::Table(RuneTableSink::default()),
-		"figure" => {
-			RuneViewIntent::Plot(parse_figure(expression, &args, source, literal_bindings)?)
-		}
-		"bar" if matches!(args.len(), 2 | 3) => {
-			let sink = plot_sink_fields(PlotType::Bar, source, &args, 0, literal_bindings)?;
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
-		}
-		"scatter" if matches!(args.len(), 2 | 3) => {
-			let sink = plot_sink_fields(PlotType::Scatter, source, &args, 0, literal_bindings)?;
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
-		}
-		"line" if matches!(args.len(), 2 | 3) => {
-			let sink = plot_sink_fields(PlotType::Line, source, &args, 0, literal_bindings)?;
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
-		}
-		"area" if matches!(args.len(), 2 | 3) => {
-			let sink = plot_sink_fields(PlotType::StackedArea, source, &args, 0, literal_bindings)?;
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink)))
-		}
-		"layers" => {
-			let specification = parse_layer_list(expression, &args, source, literal_bindings)?;
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Layered(specification)))
-		}
-		"table" => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"table() takes no arguments",
-			);
-		}
-		"bar" => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"bar(...) takes x and y strings with an optional series",
-			);
-		}
-		"line" => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"line(...) takes x and y strings with an optional series",
-			);
-		}
-		"area" => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"area(...) takes x and y strings with an optional series",
-			);
-		}
-		"scatter" => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"scatter(...) takes x and y strings with an optional category",
-			);
-		}
-		_ => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"unknown view sink; expected scatter(...), bar(...), line(...), area(...), table(), layers([...]), or figure([...])",
-			);
-		}
-	};
-	Ok(ParsedSink {
-		intent,
-		span: byte_range(expression.span(), source.len())?,
-		name: None,
-		output_order: 0,
-	})
-}
-
-fn parse_figure(
-	outer: &ast::Expr,
-	args: &[&ast::Expr],
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<RunePlotIntent, RuneEnvelopeError> {
-	let [argument] = args else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			"figure(...) takes exactly one literal figure list",
-		);
-	};
-	let ast::Expr::Vec(list) = argument else {
-		return invalid_view(
-			argument.span(),
-			source.len(),
-			"figure(...) requires a literal figure list",
-		);
-	};
-	let mut title = None;
-	let mut subtitle = None;
-	let mut facet = None;
-	let mut skin = None;
-	let mut palette = None;
-	let mut x_bounds = None;
-	let mut y_bounds = None;
-	let mut x_tick_step = None;
-	let mut y_tick_step = None;
-	let mut x_minor_ticks = None;
-	let mut y_minor_ticks = None;
-	let mut legend = None;
-	let mut body = None;
-	let mut facet_span = None;
-	let mut facet_expr_span = None;
-	for (item, _) in list.items.iter() {
-		if let Some(selection) = parse_figure_skin(item, source, literal_bindings)? {
-			if skin.is_some() {
-				return invalid_view(
-					item.span(),
-					source.len(),
-					"a figure has at most one plot skin",
-				);
-			}
-			skin = Some((
-				selection,
-				u32_range(&byte_range(item.span(), source.len())?, "plot skin")?,
-			));
-			continue;
-		}
-		let ast::Expr::Call(call) = item else {
-			return invalid_view(
-				item.span(),
-				source.len(),
-				"a figure child must be title(...), subtitle(...), skin(...), palette(...), legend_at(...), hide_legend(), x_bounds(...), y_bounds(...), x_tick_step(...), y_tick_step(...), x_minor_ticks(...), y_minor_ticks(...), or one plot body",
-			);
-		};
-		let callee = source_slice(source, call.expr.span())?.trim();
-		let child_args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-		match callee {
-			"legend_at" => {
-				if legend.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one legend placement or visibility element",
-					);
-				}
-				legend = Some(Presence::Show(parse_figure_legend_position(
-					item,
-					&child_args,
-					source,
-					literal_bindings,
-				)?));
-			}
-			"hide_legend" => {
-				if legend.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one legend placement or visibility element",
-					);
-				}
-				if !child_args.is_empty() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"hide_legend() takes no arguments",
-					);
-				}
-				legend = Some(Presence::Hide);
-			}
-			"title" => {
-				if title.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one title",
-					);
-				}
-				title = Some(parse_figure_heading(
-					item,
-					&child_args,
-					source,
-					"title",
-					literal_bindings,
-				)?);
-			}
-			"subtitle" => {
-				if subtitle.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one subtitle",
-					);
-				}
-				subtitle = Some(parse_figure_heading(
-					item,
-					&child_args,
-					source,
-					"subtitle",
-					literal_bindings,
-				)?);
-			}
-			"facet" => {
-				if facet.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one facet element",
-					);
-				}
-				facet = Some(parse_figure_heading(
-					item,
-					&child_args,
-					source,
-					"facet",
-					literal_bindings,
-				)?);
-				facet_span = Some(u32_range(&byte_range(item.span(), source.len())?, "facet")?);
-				facet_expr_span = Some(item.span());
-			}
-			"palette" => {
-				if palette.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one categorical palette",
-					);
-				}
-				palette = Some(parse_figure_heading(
-					item,
-					&child_args,
-					source,
-					"palette",
-					literal_bindings,
-				)?);
-			}
-			"x_bounds" => {
-				if x_bounds.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one x_bounds element",
-					);
-				}
-				x_bounds = Some((
-					parse_figure_bounds(item, &child_args, source, "x_bounds", literal_bindings)?,
-					u32_range(&byte_range(item.span(), source.len())?, "x bounds")?,
-				));
-			}
-			"y_bounds" => {
-				if y_bounds.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one y_bounds element",
-					);
-				}
-				y_bounds = Some((
-					parse_figure_bounds(item, &child_args, source, "y_bounds", literal_bindings)?,
-					u32_range(&byte_range(item.span(), source.len())?, "y bounds")?,
-				));
-			}
-			"x_tick_step" => {
-				if x_tick_step.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one x_tick_step element",
-					);
-				}
-				x_tick_step = Some((
-					parse_figure_tick_step(
-						item,
-						&child_args,
-						source,
-						"x_tick_step",
-						literal_bindings,
-					)?,
-					u32_range(&byte_range(item.span(), source.len())?, "x tick step")?,
-				));
-			}
-			"y_tick_step" => {
-				if y_tick_step.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one y_tick_step element",
-					);
-				}
-				y_tick_step = Some((
-					parse_figure_tick_step(
-						item,
-						&child_args,
-						source,
-						"y_tick_step",
-						literal_bindings,
-					)?,
-					u32_range(&byte_range(item.span(), source.len())?, "y tick step")?,
-				));
-			}
-			"x_minor_ticks" => {
-				if x_minor_ticks.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one x_minor_ticks element",
-					);
-				}
-				x_minor_ticks = Some((
-					parse_figure_minor_ticks(
-						item,
-						&child_args,
-						source,
-						"x_minor_ticks",
-						literal_bindings,
-					)?,
-					u32_range(&byte_range(item.span(), source.len())?, "x minor ticks")?,
-				));
-			}
-			"y_minor_ticks" => {
-				if y_minor_ticks.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure has at most one y_minor_ticks element",
-					);
-				}
-				y_minor_ticks = Some((
-					parse_figure_minor_ticks(
-						item,
-						&child_args,
-						source,
-						"y_minor_ticks",
-						literal_bindings,
-					)?,
-					u32_range(&byte_range(item.span(), source.len())?, "y minor ticks")?,
-				));
-			}
-			_ => {
-				if body.is_some() {
-					return invalid_view(
-						item.span(),
-						source.len(),
-						"a figure contains exactly one plot body",
-					);
-				}
-				body = Some(parse_figure_body(
-					item,
-					callee,
-					&child_args,
-					source,
-					literal_bindings,
-				)?);
-			}
-		}
-	}
-	let Some(body) = body else {
-		return invalid_view(
-			facet_expr_span.unwrap_or_else(|| outer.span()),
-			source.len(),
-			"a figure requires exactly one plot body",
-		);
-	};
-	let mut authored_settings = PlotSettingsLayer::default();
-	if let Some(title) = title {
-		authored_settings.title = Presence::Show(Arc::new(title));
-	}
-	if let Some(subtitle) = subtitle {
-		authored_settings.subtitle = Presence::Show(Arc::new(subtitle));
-	}
-	if let Some(legend) = legend {
-		authored_settings.legend = legend;
-	}
-	let plot_skin_span = skin.as_ref().map(|(_, span)| span.clone());
-	if let Some((skin, _)) = skin {
-		authored_settings.plot_skin = Override::Set(skin);
-	}
-	if let Some(palette) = palette {
-		authored_settings.categorical_palette = Override::Set(Arc::new(palette));
-	}
-	if x_bounds.is_some() || y_bounds.is_some() {
-		authored_settings.domains = Override::Set(PlotDomainOverrides {
-			x_min: x_bounds.as_ref().map(|(bounds, _)| bounds.0),
-			x_max: x_bounds.as_ref().map(|(bounds, _)| bounds.1),
-			y_min: y_bounds.as_ref().map(|(bounds, _)| bounds.0),
-			y_max: y_bounds.as_ref().map(|(bounds, _)| bounds.1),
-		});
-	}
-	let domain_spans = RunePlotDomainSpans {
-		x: x_bounds.map(|(_, span)| span),
-		y: y_bounds.map(|(_, span)| span),
-	};
-	if x_tick_step.is_some()
-		|| y_tick_step.is_some()
-		|| x_minor_ticks.is_some()
-		|| y_minor_ticks.is_some()
-	{
-		let mut guides = PlotGuideSettings::default();
-		let default_x_minor_ticks = guides.x_minor_ticks;
-		let default_y_minor_ticks = guides.y_minor_ticks;
-		guides.x_tick_placement = x_tick_step
-			.as_ref()
-			.map(|(step, _)| TickPlacement::step(*step).expect("validated tick step"))
-			.unwrap_or(TickPlacement::DEFAULT);
-		guides.y_tick_placement = y_tick_step
-			.as_ref()
-			.map(|(step, _)| TickPlacement::step(*step).expect("validated tick step"))
-			.unwrap_or(TickPlacement::DEFAULT);
-		guides.x_minor_ticks = x_minor_ticks
-			.as_ref()
-			.map(|(count, _)| *count)
-			.unwrap_or(default_x_minor_ticks);
-		guides.y_minor_ticks = y_minor_ticks
-			.as_ref()
-			.map(|(count, _)| *count)
-			.unwrap_or(default_y_minor_ticks);
-		authored_settings.guides = Override::Set(guides);
-	}
-	let tick_step_spans = RunePlotTickStepSpans {
-		x: x_tick_step.map(|(_, span)| span),
-		y: y_tick_step.map(|(_, span)| span),
-	};
-	let minor_tick_spans = RunePlotMinorTickSpans {
-		x: x_minor_ticks.map(|(_, span)| span),
-		y: y_minor_ticks.map(|(_, span)| span),
-	};
-	Ok(RunePlotIntent {
-		body,
-		facet,
-		authored_settings,
-		plot_skin_span,
-		facet_span,
-		domain_spans,
-		tick_step_spans,
-		minor_tick_spans,
-	})
-}
-
-fn parse_figure_legend_position(
-	outer: &ast::Expr,
-	args: &[&ast::Expr],
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<LegendPosition, RuneEnvelopeError> {
-	let [x, y] = args else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			"legend_at(...) takes exactly two numeric literals",
-		);
-	};
-	let mut values = [0.0; 2];
-	for (index, argument) in [x, y].into_iter().enumerate() {
-		let Some(resolved) = resolve_static_literal(
-			argument,
-			source,
-			literal_bindings,
-			outer.span().start.into_usize(),
-		)?
-		else {
-			return invalid_view(
-				argument.span(),
-				source.len(),
-				static_binding_name(
-					argument,
-					source,
-					literal_bindings,
-					outer.span().start.into_usize(),
-				)
-				.map(|name| {
-					format!("legend_at(...) binding {name:?} does not resolve to a literal")
-				})
-				.unwrap_or_else(|| {
-					"legend_at(...) requires unsuffixed numeric literals, optionally negated"
-						.to_owned()
-				}),
-			);
-		};
-		let StaticLiteralValue::Number(value) = resolved.value else {
-			return invalid_view(
-				argument.span(),
-				source.len(),
-				format!(
-					"legend_at(...) binding {} resolved to a string literal; expected a numeric literal",
-					resolved.binding.as_deref().unwrap_or("argument")
-				),
-			);
-		};
-		values[index] = value;
-	}
-	let Some(position) = LegendPosition::new(values[0], values[1]) else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			"legend_at(...) requires finite positions",
-		);
-	};
-	Ok(position)
-}
-
-fn parse_figure_tick_step(
-	outer: &ast::Expr,
-	args: &[&ast::Expr],
-	source: &str,
-	constructor: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<f64, RuneEnvelopeError> {
-	let [argument] = args else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) takes exactly one numeric literal"),
-		);
-	};
-	let Some(resolved) = resolve_static_literal(
-		argument,
-		source,
-		literal_bindings,
-		outer.span().start.into_usize(),
-	)?
-	else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			static_binding_name(
-				argument,
-				source,
-				literal_bindings,
-				outer.span().start.into_usize(),
-			)
-			.map(|name| {
-				format!("{constructor}(...) binding {name:?} does not resolve to a literal")
-			})
-			.unwrap_or_else(|| {
-				format!(
-					"{constructor}(...) requires an unsuffixed numeric literal, optionally negated"
-				)
-			}),
-		);
-	};
-	let StaticLiteralValue::Number(step) = resolved.value else {
-		return invalid_view(
-			argument.span(),
-			source.len(),
-			format!(
-				"{constructor}(...) binding {} resolved to a string literal; expected a numeric literal",
-				resolved.binding.as_deref().unwrap_or("argument")
-			),
-		);
-	};
-	if !step.is_finite() {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) requires a finite step"),
-		);
-	}
-	if step <= 0.0 {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) step must be strictly positive"),
-		);
-	}
-	Ok(step)
-}
-
-fn parse_figure_minor_ticks(
-	outer: &ast::Expr,
-	args: &[&ast::Expr],
-	source: &str,
-	constructor: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<u32, RuneEnvelopeError> {
-	let [argument] = args else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) takes exactly one numeric literal"),
-		);
-	};
-	let Some(resolved) = resolve_static_literal(
-		argument,
-		source,
-		literal_bindings,
-		outer.span().start.into_usize(),
-	)?
-	else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			static_binding_name(
-				argument,
-				source,
-				literal_bindings,
-				outer.span().start.into_usize(),
-			)
-			.map(|name| {
-				format!("{constructor}(...) binding {name:?} does not resolve to a literal")
-			})
-			.unwrap_or_else(|| {
-				format!(
-					"{constructor}(...) requires an unsuffixed numeric literal, optionally negated"
-				)
-			}),
-		);
-	};
-	let StaticLiteralValue::Number(count) = resolved.value else {
-		return invalid_view(
-			argument.span(),
-			source.len(),
-			format!(
-				"{constructor}(...) binding {} resolved to a string literal; expected a numeric literal",
-				resolved.binding.as_deref().unwrap_or("argument")
-			),
-		);
-	};
-	if !count.is_finite() {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) requires a finite count"),
-		);
-	}
-	if count < 0.0 || count.fract() != 0.0 || count > u32::MAX as f64 {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) count must be a non-negative integer"),
-		);
-	}
-	Ok(count as u32)
-}
-
-fn parse_figure_bounds(
-	outer: &ast::Expr,
-	args: &[&ast::Expr],
-	source: &str,
-	constructor: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<(f64, f64), RuneEnvelopeError> {
-	let [minimum, maximum] = args else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) takes exactly two numeric literals"),
-		);
-	};
-	let Some(minimum) = resolve_static_literal(
-		minimum,
-		source,
-		literal_bindings,
-		outer.span().start.into_usize(),
-	)?
-	else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			static_binding_name(
-				args[0],
-				source,
-				literal_bindings,
-				outer.span().start.into_usize(),
-			)
-			.map(|name| {
-				format!("{constructor}(...) binding {name:?} does not resolve to a literal")
-			})
-			.unwrap_or_else(|| {
-				format!(
-					"{constructor}(...) requires unsuffixed numeric literals, optionally negated"
-				)
-			}),
-		);
-	};
-	let Some(maximum) = resolve_static_literal(
-		maximum,
-		source,
-		literal_bindings,
-		outer.span().start.into_usize(),
-	)?
-	else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			static_binding_name(
-				args[1],
-				source,
-				literal_bindings,
-				outer.span().start.into_usize(),
-			)
-			.map(|name| {
-				format!("{constructor}(...) binding {name:?} does not resolve to a literal")
-			})
-			.unwrap_or_else(|| {
-				format!(
-					"{constructor}(...) requires unsuffixed numeric literals, optionally negated"
-				)
-			}),
-		);
-	};
-	let StaticLiteralValue::Number(minimum) = minimum.value else {
-		return invalid_view(
-			args[0].span(),
-			source.len(),
-			format!(
-				"{constructor}(...) binding {} resolved to a string literal; expected a numeric literal",
-				minimum.binding.as_deref().unwrap_or("minimum")
-			),
-		);
-	};
-	let StaticLiteralValue::Number(maximum) = maximum.value else {
-		return invalid_view(
-			args[1].span(),
-			source.len(),
-			format!(
-				"{constructor}(...) binding {} resolved to a string literal; expected a numeric literal",
-				maximum.binding.as_deref().unwrap_or("maximum")
-			),
-		);
-	};
-	if !minimum.is_finite() || !maximum.is_finite() {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) requires finite bounds"),
-		);
-	}
-	if minimum == maximum {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) cannot form a collapsed axis; min must be less than max"),
-		);
-	}
-	if minimum > maximum {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{constructor}(...) cannot reverse an axis; min must be less than max"),
-		);
-	}
-	Ok((minimum, maximum))
-}
-
-fn parse_signed_numeric_literal(expression: &ast::Expr, source: &str) -> Option<f64> {
-	let is_number = match expression {
-		ast::Expr::Lit(literal) => matches!(literal.lit, ast::Lit::Number(_)),
-		ast::Expr::Unary(unary) => {
-			matches!(unary.op, ast::UnOp::Neg(_))
-				&& matches!(unary.expr.as_ref(), ast::Expr::Lit(literal) if matches!(literal.lit, ast::Lit::Number(_)))
-		}
-		_ => false,
-	};
-	if !is_number {
-		return None;
-	}
-	source_slice(source, expression.span())
-		.ok()?
-		.replace('_', "")
-		.parse::<f64>()
-		.ok()
-}
-
-fn resolve_static_literal(
-	expression: &ast::Expr,
-	source: &str,
-	bindings: &[LocalBinding],
-	use_start: usize,
-) -> Result<Option<ResolvedStaticLiteral>, RuneEnvelopeError> {
-	let mut visited = Vec::new();
-	resolve_static_literal_inner(expression, source, bindings, use_start, &mut visited)
-}
-
-fn static_binding_name(
-	expression: &ast::Expr,
-	source: &str,
-	bindings: &[LocalBinding],
-	use_start: usize,
-) -> Option<String> {
-	let raw = source_slice(source, expression.span()).ok()?.trim();
-	if !matches!(expression, ast::Expr::Path(_)) || !is_simple_name(raw) {
-		return None;
-	}
-	bindings
-		.iter()
-		.rev()
-		.find(|binding| binding.name == raw && binding.statement_start < use_start)
-		.map(|_| raw.to_owned())
-}
-
-fn resolve_static_literal_inner(
-	expression: &ast::Expr,
-	source: &str,
-	bindings: &[LocalBinding],
-	use_start: usize,
-	visited: &mut Vec<String>,
-) -> Result<Option<ResolvedStaticLiteral>, RuneEnvelopeError> {
-	let raw = source_slice(source, expression.span())?.trim();
-	if let Some(value) = decode_string_literal(raw) {
-		return Ok(Some(ResolvedStaticLiteral {
-			value: StaticLiteralValue::String(value),
-			binding: None,
-		}));
-	}
-	if let Some(value) = parse_signed_numeric_literal(expression, source) {
-		return Ok(Some(ResolvedStaticLiteral {
-			value: StaticLiteralValue::Number(value),
-			binding: None,
-		}));
-	}
-	if !matches!(expression, ast::Expr::Path(_)) || !is_simple_name(raw) {
-		return Ok(None);
-	}
-	let Some(binding) = bindings
-		.iter()
-		.rev()
-		.find(|binding| binding.name == raw && binding.statement_start < use_start)
-	else {
-		return Ok(None);
-	};
-	if visited.iter().any(|name| name == raw) {
-		return Ok(None);
-	}
-	visited.push(raw.to_owned());
-	let initializer = source
-		.get(binding.initializer.clone())
-		.ok_or_else(|| RuneEnvelopeError::Invalid("binding initializer is not UTF-8".into()))?;
-	let resolved = resolve_static_literal_text(
-		initializer.trim(),
-		source,
-		bindings,
-		binding.statement_start,
-		visited,
-	)?;
-	visited.pop();
-	Ok(resolved.map(|mut resolved| {
-		resolved.binding = Some(raw.to_owned());
-		resolved
-	}))
-}
-
-fn resolve_static_literal_text(
-	raw: &str,
-	source: &str,
-	bindings: &[LocalBinding],
-	use_start: usize,
-	visited: &mut Vec<String>,
-) -> Result<Option<ResolvedStaticLiteral>, RuneEnvelopeError> {
-	if let Some(value) = decode_string_literal(raw) {
-		return Ok(Some(ResolvedStaticLiteral {
-			value: StaticLiteralValue::String(value),
-			binding: None,
-		}));
-	}
-	if let Ok(value) = raw.replace('_', "").parse::<f64>() {
-		return Ok(Some(ResolvedStaticLiteral {
-			value: StaticLiteralValue::Number(value),
-			binding: None,
-		}));
-	}
-	if !is_simple_name(raw) {
-		return Ok(None);
-	}
-	let Some(binding) = bindings
-		.iter()
-		.rev()
-		.find(|binding| binding.name == raw && binding.statement_start < use_start)
-	else {
-		return Ok(None);
-	};
-	if visited.iter().any(|name| name == raw) {
-		return Ok(None);
-	}
-	visited.push(raw.to_owned());
-	let initializer = source
-		.get(binding.initializer.clone())
-		.ok_or_else(|| RuneEnvelopeError::Invalid("binding initializer is not UTF-8".into()))?;
-	let resolved = resolve_static_literal_text(
-		initializer.trim(),
-		source,
-		bindings,
-		binding.statement_start,
-		visited,
-	)?;
-	visited.pop();
-	Ok(resolved.map(|mut resolved| {
-		resolved.binding = Some(raw.to_owned());
-		resolved
-	}))
-}
-
-/// PRODUCT-0058: mark-field bindings are source factoring, so resolve them to
-/// the same concrete string normal form as inline literals before any channel
-/// or schema resolution runs.
-fn resolve_mark_field(
-	expression: &ast::Expr,
-	source: &str,
-	literal_bindings: &[LocalBinding],
-	constructor: &str,
-) -> Result<String, RuneEnvelopeError> {
-	let use_start = expression.span().start.into_usize();
-	let Some(resolved) = resolve_static_literal(expression, source, literal_bindings, use_start)?
-	else {
-		let raw = source_slice(source, expression.span())?.trim();
-		let message = if matches!(expression, ast::Expr::Path(_)) && is_simple_name(raw) {
-			format!("{constructor}(...) field binding {raw:?} does not resolve to a string literal")
-		} else {
-			format!("{constructor}(...) fields must be string literals or static string bindings")
-		};
-		return invalid_view(expression.span(), source.len(), message);
-	};
-	match resolved.value {
-		StaticLiteralValue::String(value) => Ok(value),
-		StaticLiteralValue::Number(_) => invalid_view(
-			expression.span(),
-			source.len(),
-			resolved.binding.map_or_else(
-				|| format!("{constructor}(...) field must be a string literal"),
-				|binding| {
-					format!(
-						"{constructor}(...) field binding {binding:?} resolved to a numeric literal; expected a string literal"
-					)
-				},
-			),
-		),
-	}
-}
-
-fn parse_figure_skin(
-	expression: &ast::Expr,
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<Option<PlotSkinSelection>, RuneEnvelopeError> {
-	let ast::Expr::Call(_) = expression else {
-		return Ok(None);
-	};
-	let mut current = expression;
-	let mut modifiers = Vec::new();
-	while let ast::Expr::Call(call) = current
-		&& let ast::Expr::FieldAccess(field) = call.expr.as_ref()
-	{
-		modifiers.push((source_slice(source, field.expr_field.span())?.trim(), call));
-		current = &field.expr;
-	}
-	let ast::Expr::Call(root) = current else {
-		return Ok(None);
-	};
-	if source_slice(source, root.expr.span())?.trim() != "skin" {
-		return Ok(None);
-	}
-
-	let root_args = root.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	let name = parse_figure_heading(current, &root_args, source, "skin", literal_bindings)?;
-	let mut projection = PlotChromeProjection::Ordered;
-	for (modifier, call) in modifiers {
-		match modifier {
-			"duotone" => {
-				if projection == PlotChromeProjection::Duotone {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"duotone() may appear at most once on a plot skin",
-					);
-				}
-				if !call.args.is_empty() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"duotone() takes no arguments",
-					);
-				}
-				projection = PlotChromeProjection::Duotone;
-			}
-			_ => {
-				return invalid_view(
-					expression.span(),
-					source.len(),
-					format!("unknown plot-skin modifier {modifier:?}; expected duotone()"),
-				);
-			}
-		}
-	}
-	Ok(Some(PlotSkinSelection::new(name, projection)))
-}
-
-fn parse_figure_heading(
-	outer: &ast::Expr,
-	args: &[&ast::Expr],
-	source: &str,
-	kind: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<String, RuneEnvelopeError> {
-	let [argument] = args else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{kind}(...) takes exactly one string literal"),
-		);
-	};
-	let Some(resolved) = resolve_static_literal(
-		argument,
-		source,
-		literal_bindings,
-		outer.span().start.into_usize(),
-	)?
-	else {
-		return invalid_view(
-			argument.span(),
-			source.len(),
-			static_binding_name(
-				argument,
-				source,
-				literal_bindings,
-				outer.span().start.into_usize(),
-			)
-			.map(|name| format!("{kind}(...) binding {name:?} does not resolve to a literal"))
-			.unwrap_or_else(|| format!("{kind}(...) requires a string literal")),
-		);
-	};
-	let StaticLiteralValue::String(value) = resolved.value else {
-		return invalid_view(
-			argument.span(),
-			source.len(),
-			format!(
-				"{kind}(...) binding {} resolved to a numeric literal; expected a string literal",
-				resolved.binding.as_deref().unwrap_or("argument")
-			),
-		);
-	};
-	Ok(value)
-}
-
-fn parse_figure_body(
-	expression: &ast::Expr,
-	callee: &str,
-	args: &[&ast::Expr],
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<RunePlotBody, RuneEnvelopeError> {
-	if let Some(layer) = parse_modified_mark(expression, source, literal_bindings, false)? {
-		return Ok(RunePlotBody::StyledSingle(layer));
-	}
-	let single = |plot_type| -> Result<RunePlotBody, RuneEnvelopeError> {
-		let sink = plot_sink_fields(plot_type, source, args, 0, literal_bindings)?;
-		Ok(RunePlotBody::Single(sink))
-	};
-	match callee {
-		"bar" if matches!(args.len(), 2 | 3) => single(PlotType::Bar),
-		"line" if matches!(args.len(), 2 | 3) => single(PlotType::Line),
-		"scatter" if matches!(args.len(), 2 | 3) => single(PlotType::Scatter),
-		"area" if matches!(args.len(), 2 | 3) => single(PlotType::StackedArea),
-		"layers" => Ok(RunePlotBody::Layered(parse_layer_list(
-			expression,
-			args,
-			source,
-			literal_bindings,
-		)?)),
-		"table" => invalid_view(
-			expression.span(),
-			source.len(),
-			"table() is a view sink, not a figure plot body",
-		),
-		"figure" => invalid_view(
-			expression.span(),
-			source.len(),
-			"figure([...]) cannot be nested inside a figure",
-		),
-		"view" => invalid_view(
-			expression.span(),
-			source.len(),
-			"view(...) wraps a figure; it cannot appear inside one",
-		),
-		"bar" => invalid_view(
-			expression.span(),
-			source.len(),
-			"bar(...) takes x and y strings with an optional series",
-		),
-		"line" => invalid_view(
-			expression.span(),
-			source.len(),
-			"line(...) takes x and y strings with an optional series",
-		),
-		"scatter" => invalid_view(
-			expression.span(),
-			source.len(),
-			"scatter(...) takes x and y strings with an optional category",
-		),
-		"area" => invalid_view(
-			expression.span(),
-			source.len(),
-			"area(...) takes x and y strings with an optional series",
-		),
-		_ => invalid_view(
-			expression.span(),
-			source.len(),
-			"unknown figure child; expected one bar, line, scatter, area, or layers plot body",
-		),
-	}
-}
-
-fn parse_layer_list(
-	outer: &ast::Expr,
-	args: &[&ast::Expr],
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<LayeredPlotSpec, RuneEnvelopeError> {
-	let [argument] = args else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			"layers(...) takes exactly one literal layer list",
-		);
-	};
-	let ast::Expr::Vec(list) = argument else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			"layers(...) requires a literal layer list",
-		);
-	};
-	let mut items = list.items.iter();
-	let Some((first, _)) = items.next() else {
-		return invalid_view(
-			list.span(),
-			source.len(),
-			"layers([]) cannot form a non-empty plot",
-		);
-	};
-	let mut specification = LayeredPlotSpec::new(parse_layer(first, source, literal_bindings)?);
-	for (item, _) in items {
-		specification.push(parse_layer(item, source, literal_bindings)?);
-	}
-	Ok(specification)
-}
-
-fn parse_layer(
-	expression: &ast::Expr,
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<LayerSpec, RuneEnvelopeError> {
-	if let Some(styled) = parse_modified_mark(expression, source, literal_bindings, true)? {
-		return match styled.into_layer() {
-			Ok(layer) => Ok(layer),
-			Err(_) => invalid_view(
-				expression.span(),
-				source.len(),
-				"bar(...) is a view sink, not a shared-Cartesian layer",
-			),
-		};
-	}
-	let ast::Expr::Call(call) = expression else {
-		return invalid_view(
-			expression.span(),
-			source.len(),
-			"a layer must be line(x, y) or scatter(x, y)",
-		);
-	};
-	let callee = source_slice(source, call.expr.span())?.trim();
-	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	let mark = match callee {
-		"line" if args.len() == 2 => LayerMark::Line,
-		"scatter" if args.len() == 2 => LayerMark::Scatter,
-		"layers" => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"layers([...]) cannot be nested inside a layer list",
-			);
-		}
-		"table" | "bar" | "area" => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				format!("{callee}(...) is a view sink, not a shared-Cartesian layer"),
-			);
-		}
-		"scatter" if args.len() == 3 => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"scatter layers take x and y only; category color is not part of the layers surface",
-			);
-		}
-		"line" | "scatter" => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				format!("{callee}(...) layers take exactly x and y string fields"),
-			);
-		}
-		_ => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"unknown layer; expected line(x, y) or scatter(x, y)",
-			);
-		}
-	};
-	let mut fields = Vec::with_capacity(2);
-	for field in args {
-		fields.push(resolve_mark_field(field, source, literal_bindings, callee)?);
-	}
-	Ok(LayerSpec::xy(mark, fields[0].clone(), fields[1].clone()))
-}
-
-/// PRODUCT-0027's closed postfix table-sink modifier register. Recognition is
-/// contextual: the complete chain is flattened to one palette identity plus
-/// projection intent, and no palette or resolved artifact color enters the
-/// envelope. PRODUCT-0040's static-literal resolver covers register arguments
-/// without admitting computed presentation values.
-fn parse_modified_table(
-	expression: &ast::Expr,
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<Option<RuneTableSink>, RuneEnvelopeError> {
-	let ast::Expr::Call(outer_call) = expression else {
-		return Ok(None);
-	};
-	if !matches!(outer_call.expr.as_ref(), ast::Expr::FieldAccess(_)) {
-		return Ok(None);
-	}
-
-	let mut current = expression;
-	let mut modifiers = Vec::new();
-	loop {
-		let ast::Expr::Call(call) = current else {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"a table modifier must follow table()",
-			);
-		};
-		let ast::Expr::FieldAccess(field) = call.expr.as_ref() else {
-			break;
-		};
-		modifiers.push((source_slice(source, field.expr_field.span())?.trim(), call));
-		current = &field.expr;
-	}
-
-	let ast::Expr::Call(root) = current else {
-		return Ok(None);
-	};
-	let callee = source_slice(source, root.expr.span())?.trim();
-	if callee != "table" {
-		return Ok(None);
-	}
-	if !root.args.is_empty() {
-		return invalid_view(
-			expression.span(),
-			source.len(),
-			"a modified table sink starts with table()",
-		);
-	}
-
-	let mut skin_name = None;
-	let mut duotone = false;
-	let mut show_column_types = Override::Inherit;
-	for (modifier, call) in modifiers {
-		match modifier {
-			"skin" => {
-				if skin_name.is_some() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"skin(...) may appear at most once on a table sink",
-					);
-				}
-				let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-				let [argument] = args.as_slice() else {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"skin(...) takes exactly one theme string literal",
-					);
-				};
-				let Some(resolved) = resolve_static_literal(
-					argument,
-					source,
-					literal_bindings,
-					expression.span().start.into_usize(),
-				)?
-				else {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						static_binding_name(
-							argument,
-							source,
-							literal_bindings,
-							expression.span().start.into_usize(),
-						)
-						.map(|name| {
-							format!("skin(...) binding {name:?} does not resolve to a literal")
-						})
-						.unwrap_or_else(|| "skin(...) requires a theme string literal".to_owned()),
-					);
-				};
-				let StaticLiteralValue::String(name) = resolved.value else {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						format!(
-							"skin(...) binding {} resolved to a numeric literal; expected a string literal",
-							resolved.binding.as_deref().unwrap_or("argument")
-						),
-					);
-				};
-				skin_name = Some(name);
-			}
-			"duotone" => {
-				if duotone {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"duotone() may appear at most once on a table sink",
-					);
-				}
-				if !call.args.is_empty() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"duotone() takes no arguments",
-					);
-				}
-				duotone = true;
-			}
-			"show_types" => {
-				if matches!(show_column_types, Override::Set(_)) {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"show_types() may appear at most once on a table sink",
-					);
-				}
-				if !call.args.is_empty() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"show_types() takes no arguments",
-					);
-				}
-				show_column_types = Override::Set(true);
-			}
-			_ => {
-				return invalid_view(
-					expression.span(),
-					source.len(),
-					format!(
-						"unknown table modifier {modifier:?}; expected skin(string_literal), duotone(), or show_types()"
-					),
-				);
-			}
-		}
-	}
-
-	if duotone && skin_name.is_none() {
-		return invalid_view(
-			expression.span(),
-			source.len(),
-			"duotone() requires skin(string_literal)",
-		);
-	}
-	let skin = if let Some(name) = skin_name {
-		let projection = if duotone {
-			RuneTableSkinProjection::Duotone
-		} else {
-			RuneTableSkinProjection::PaletteForward
-		};
-		RuneTableSkinIntent::NamedTheme { name, projection }
-	} else {
-		RuneTableSkinIntent::Default
-	};
-	Ok(Some(RuneTableSink {
-		skin,
-		show_column_types,
-	}))
-}
-
-/// PRODUCT-0018's closed postfix LayerModifier register. A successful parse
-/// flattens the complete chain directly into one styled standalone sink; no
-/// method node survives into Rune execution or the plot normal form.
-fn parse_modified_mark(
-	expression: &ast::Expr,
-	source: &str,
-	literal_bindings: &[LocalBinding],
-	in_layer: bool,
-) -> Result<Option<StyledRunePlotSink>, RuneEnvelopeError> {
-	let ast::Expr::Call(outer_call) = expression else {
-		return Ok(None);
-	};
-	if !matches!(outer_call.expr.as_ref(), ast::Expr::FieldAccess(_)) {
-		return Ok(None);
-	}
-
-	let mut current = expression;
-	let mut point_size = None;
-	let mut stroke_width = None;
-	let mut bar_width = None;
-	let mut category_gap = None;
-	let mut stacked = false;
-	let mut percent = false;
-	loop {
-		let ast::Expr::Call(call) = current else {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"a layer modifier must follow a bar(...), line(...), scatter(...), or area(...) mark",
-			);
-		};
-		let ast::Expr::FieldAccess(field) = call.expr.as_ref() else {
-			break;
-		};
-		let modifier = source_slice(source, field.expr_field.span())?.trim();
-		match modifier {
-			"point_size" => {
-				if point_size.is_some() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"point_size(...) may appear at most once on a mark",
-					);
-				}
-				let factor = parse_layer_modifier_factor(call, expression, source, "point_size")?;
-				let modifier_span = u32_range(
-					&byte_range(expression.span(), source.len())?,
-					"point-size modifier",
-				)?;
-				point_size = Some(PointSize::new(factor).map_err(|error| {
-					RuneEnvelopeError::InvalidView {
-						span: modifier_span,
-						message: error.to_string(),
-					}
-				})?);
-			}
-			"stroke_width" => {
-				if stroke_width.is_some() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"stroke_width(...) may appear at most once on a mark",
-					);
-				}
-				let factor = parse_layer_modifier_factor(call, expression, source, "stroke_width")?;
-				let modifier_span = u32_range(
-					&byte_range(expression.span(), source.len())?,
-					"stroke-width modifier",
-				)?;
-				stroke_width = Some(StrokeWidth::new(factor).map_err(|error| {
-					RuneEnvelopeError::InvalidView {
-						span: modifier_span,
-						message: error.to_string(),
-					}
-				})?);
-			}
-			"bar_width" => {
-				if bar_width.is_some() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"bar_width(...) may appear at most once on a mark",
-					);
-				}
-				let fraction = parse_layer_modifier_factor(call, expression, source, "bar_width")?;
-				let modifier_span = u32_range(
-					&byte_range(expression.span(), source.len())?,
-					"bar-width modifier",
-				)?;
-				bar_width = Some(BarWidth::new(fraction).map_err(|error| {
-					RuneEnvelopeError::InvalidView {
-						span: modifier_span,
-						message: error.to_string(),
-					}
-				})?);
-			}
-			"category_gap" => {
-				if category_gap.is_some() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"category_gap(...) may appear at most once on a mark",
-					);
-				}
-				let fraction =
-					parse_layer_modifier_factor(call, expression, source, "category_gap")?;
-				let modifier_span = u32_range(
-					&byte_range(expression.span(), source.len())?,
-					"category-gap modifier",
-				)?;
-				category_gap = Some(CategoryGap::new(fraction).map_err(|error| {
-					RuneEnvelopeError::InvalidView {
-						span: modifier_span,
-						message: error.to_string(),
-					}
-				})?);
-			}
-			"stacked" => {
-				if stacked {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"stacked() may appear at most once on a bar mark",
-					);
-				}
-				if !call.args.is_empty() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"stacked() takes no arguments",
-					);
-				}
-				stacked = true;
-			}
-			"percent" => {
-				if percent {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"percent() may appear at most once on a stacked mark",
-					);
-				}
-				if !call.args.is_empty() {
-					return invalid_view(
-						expression.span(),
-						source.len(),
-						"percent() takes no arguments",
-					);
-				}
-				percent = true;
-			}
-			_ => {
-				return invalid_view(
-					expression.span(),
-					source.len(),
-					format!(
-						"unknown layer modifier {modifier:?}; expected point_size(number), stroke_width(number), bar_width(number), category_gap(number), stacked(), or percent()"
-					),
-				);
-			}
-		}
-		current = &field.expr;
-	}
-
-	let ast::Expr::Call(root) = current else {
-		return invalid_view(
-			expression.span(),
-			source.len(),
-			"a layer modifier must follow a bar(...), line(...), scatter(...), or area(...) mark",
-		);
-	};
-	let callee = source_slice(source, root.expr.span())?.trim();
-	let args = root.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	let plot_type = match callee {
-		"bar" => PlotType::Bar,
-		"line" => PlotType::Line,
-		"scatter" => PlotType::Scatter,
-		"area" => PlotType::StackedArea,
-		_ => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"a layer modifier must follow a bar(...), line(...), scatter(...), or area(...) mark",
-			);
-		}
-	};
-	// PRODUCT-0046 §1: a register belongs to the mark, so every encoding form of
-	// that mark admits it. Line, bar, and scatter each take an optional third
-	// color field in standalone positions.
-	let arity_ok = match plot_type {
-		PlotType::Line => matches!(args.len(), 2 | 3),
-		PlotType::StackedArea => matches!(args.len(), 2 | 3),
-		_ => matches!(args.len(), 2 | 3),
-	};
-	if !arity_ok {
-		return invalid_view(
-			expression.span(),
-			source.len(),
-			match plot_type {
-				PlotType::Line => "a modified line takes x and y strings with an optional series",
-				PlotType::Bar => "a modified bar takes x and y strings with an optional series",
-				PlotType::StackedArea => {
-					"a modified area takes x and y strings with an optional series"
-				}
-				_ => "a modified scatter takes x and y strings with an optional category",
-			},
-		);
-	}
-	match plot_type {
-		PlotType::Line if point_size.is_some() => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"point_size(...) is available on scatter marks, not line marks",
-			);
-		}
-		PlotType::Scatter if stroke_width.is_some() => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"stroke_width(...) is available on line marks, not scatter marks",
-			);
-		}
-		PlotType::Bar if point_size.is_some() || stroke_width.is_some() => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"point_size(...) and stroke_width(...) are not available on bar marks",
-			);
-		}
-		PlotType::StackedArea if point_size.is_some() || stroke_width.is_some() => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"point_size(...) and stroke_width(...) are not available on area marks",
-			);
-		}
-		PlotType::Line | PlotType::Scatter if bar_width.is_some() => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"bar_width(...) is available on bar marks, not line or scatter marks",
-			);
-		}
-		PlotType::StackedArea if bar_width.is_some() => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"bar_width(...) is available on bar marks, not area marks",
-			);
-		}
-		PlotType::Line | PlotType::Scatter if category_gap.is_some() => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"category_gap(...) is available on bar marks, not line or scatter marks",
-			);
-		}
-		PlotType::StackedArea if category_gap.is_some() => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"category_gap(...) is available on bar marks, not area marks",
-			);
-		}
-		PlotType::Line | PlotType::Scatter if stacked => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"stacked() is available on bar marks, not line or scatter marks",
-			);
-		}
-		PlotType::StackedArea if stacked => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"stacked() is available on bar marks, not area marks",
-			);
-		}
-		PlotType::Bar if percent && !stacked => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"percent() requires stacked() on bar marks",
-			);
-		}
-		PlotType::Line | PlotType::Scatter if percent => {
-			return invalid_view(
-				expression.span(),
-				source.len(),
-				"percent() is available on stacked bar and area marks, not line or scatter marks",
-			);
-		}
-		_ => {}
-	}
-	if in_layer && (matches!(plot_type, PlotType::Bar | PlotType::StackedArea) || args.len() == 3) {
-		return invalid_view(
-			expression.span(),
-			source.len(),
-			format!("{callee}(...) is a view sink, not a shared-Cartesian layer"),
-		);
-	}
-	let mut fields = Vec::with_capacity(args.len());
-	for field in args {
-		fields.push(resolve_mark_field(field, source, literal_bindings, callee)?);
-	}
-	Ok(Some(StyledRunePlotSink {
-		sink: DisposableRunePlotSink {
-			composition: PlotComposition::single(plot_type),
-			x: fields[0].clone(),
-			y: fields[1].clone(),
-			category: fields.get(2).cloned(),
-		},
-		settings: LayerSettings {
-			point_size: point_size.map_or(Override::Inherit, Override::Set),
-			stroke_width: stroke_width.map_or(Override::Inherit, Override::Set),
-			bar_width: bar_width.map_or(Override::Inherit, Override::Set),
-			category_gap: category_gap.map_or(Override::Inherit, Override::Set),
-		},
-		stacked,
-		percent,
-	}))
-}
-
-fn parse_layer_modifier_factor(
-	call: &ast::ExprCall,
-	outer: &ast::Expr,
-	source: &str,
-	modifier: &str,
-) -> Result<f32, RuneEnvelopeError> {
-	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	let [argument] = args.as_slice() else {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{modifier}(...) takes exactly one numeric literal"),
-		);
-	};
-	if !matches!(argument, ast::Expr::Lit(lit) if matches!(lit.lit, ast::Lit::Number(_))) {
-		return invalid_view(
-			outer.span(),
-			source.len(),
-			format!("{modifier}(...) requires a numeric literal"),
-		);
-	}
-	let raw = source_slice(source, argument.span())?.replace('_', "");
-	let span = u32_range(&byte_range(outer.span(), source.len())?, "layer modifier")?;
-	raw.parse::<f32>()
-		.map_err(|_| RuneEnvelopeError::InvalidView {
-			span,
-			message: format!("{modifier}(...) requires an unsuffixed numeric literal"),
-		})
-}
-
-fn parse_sugar_sink(
-	plot_type: PlotType,
-	call: &ast::ExprCall,
-	args: &[&ast::Expr],
-	source: &str,
-	literal_bindings: &[LocalBinding],
-) -> Result<ParsedSink, RuneEnvelopeError> {
-	let valid_arity = match plot_type {
-		PlotType::Line => matches!(args.len(), 2 | 3),
-		PlotType::Bar | PlotType::Scatter | PlotType::StackedArea => {
-			matches!(args.len(), 2 | 3)
-		}
-		_ => false,
-	};
-	if !valid_arity {
-		let message = match plot_type {
-			PlotType::Scatter => {
-				"scatter view sugar requires x and y strings with an optional category"
-			}
-			PlotType::Bar => "bar view sugar requires x and y strings with an optional series",
-			PlotType::Line => "line view sugar requires x and y strings with an optional series",
-			PlotType::StackedArea => {
-				"area view sugar requires x and y strings with an optional series"
-			}
-			_ => unreachable!("only Rune plot view forms reach sugar parsing"),
-		};
-		return invalid_view(call.span(), source.len(), message);
-	}
-	let sink = plot_sink_fields(plot_type, source, args, 0, literal_bindings)?;
-	Ok(ParsedSink {
-		intent: RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink))),
-		span: byte_range(call.span(), source.len())?,
-		name: None,
-		output_order: 0,
-	})
-}
-
-fn invalid_view<T>(
-	span: ast::Span,
-	source_len: usize,
-	message: impl Into<String>,
-) -> Result<T, RuneEnvelopeError> {
-	let span = byte_range(span, source_len)?;
-	Err(RuneEnvelopeError::InvalidView {
-		span: u32_range(&span, "view")?,
-		message: message.into(),
-	})
-}
-
-fn render(
-	source: &str,
-	envelope: &ExecutionEnvelope,
-) -> Result<TransformedRuneRelation, RuneEnvelopeError> {
-	let entrypoint_prefix = match envelope.relation_root {
-		RelationRoot::Workspace => WORKSPACE_ENTRYPOINT_PREFIX,
-		RelationRoot::Ket => KET_ENTRYPOINT_PREFIX,
-	};
-	let retained_len = envelope.retained.iter().map(Range::len).sum::<usize>();
-	let mut transformed = String::with_capacity(
-		entrypoint_prefix.len()
-			+ retained_len
-			+ envelope.relation.len()
-			+ ENTRYPOINT_SUFFIX.len()
-			+ 3,
-	);
-	transformed.push_str(entrypoint_prefix);
-	let mut segments = Vec::new();
-	for retained in &envelope.retained {
-		let transformed_start = transformed.len();
-		transformed.push_str(source.get(retained.clone()).ok_or_else(|| {
-			RuneEnvelopeError::Invalid("retained source span is not UTF-8".into())
-		})?);
-		let transformed_end = transformed.len();
-		push_segment(
-			&mut segments,
-			transformed_start..transformed_end,
-			u32::try_from(retained.start)
-				.map_err(|_| RuneEnvelopeError::Invalid("source exceeds u32".into()))?,
-		)?;
-	}
-	if envelope.terminate_retained_tail {
-		transformed.push_str("\n;");
-	}
-	transformed.push('\n');
-	let relation_start = transformed.len();
-	transformed.push_str(
-		source
-			.get(envelope.relation.clone())
-			.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?,
-	);
-	let relation_end = transformed.len();
-	transformed.push_str(ENTRYPOINT_SUFFIX);
-
-	push_segment(
-		&mut segments,
-		relation_start..relation_end,
-		u32::try_from(envelope.relation.start)
-			.map_err(|_| RuneEnvelopeError::Invalid("source exceeds u32".into()))?,
-	)?;
-
-	Ok(TransformedRuneRelation {
-		origin: envelope.relation_origin.clone(),
-		source: transformed,
-		views: envelope
-			.sinks
-			.iter()
-			.map(|sink| {
-				Ok(SpannedRuneViewIntent {
-					intent: sink.intent.clone(),
-					span: u32_range(&sink.span, "view")?,
-					identity: match &sink.name {
-						Some(name) => LocalViewIdentity::Named(name.value.clone()),
-						None => LocalViewIdentity::Anonymous(sink.output_order),
-					},
-					output_order: sink.output_order,
-				})
-			})
-			.collect::<Result<_, RuneEnvelopeError>>()?,
-		source_map: RuneEnvelopeSourceMap {
-			segments,
-			diagnostic_fallback: u32_range(&envelope.relation, "relation")?,
-		},
-	})
-}
-
-#[derive(Clone, Debug, PartialEq)]
-struct ParsedView {
-	intent: RuneViewIntent,
-	statement: Range<usize>,
-	relation: Range<usize>,
-}
-
-fn recognize_view_root(
-	statement: &ast::Stmt,
-	source: &str,
-	shadows: ViewShadows,
-	literal_bindings: &[LocalBinding],
-) -> Result<Option<ParsedView>, RuneEnvelopeError> {
-	let (expression, statement_span) = match statement {
-		ast::Stmt::Expr(expression) => (expression, expression.span()),
-		ast::Stmt::Semi(statement) => (&statement.expr, statement.span()),
-		_ => return Ok(None),
-	};
-	let ast::Expr::Call(call) = expression else {
-		return Ok(None);
-	};
-	let callee = source_slice(source, call.expr.span())?;
-	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	let (intent, relation) = match callee.trim() {
-		"table" if !shadows.table && args.len() == 1 => {
-			(RuneViewIntent::Table(RuneTableSink::default()), args[0])
-		}
-		"plot.bar" if !shadows.plot && matches!(args.len(), 3 | 4) => (
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(plot_sink(
-				PlotType::Bar,
-				source,
-				&args,
-				literal_bindings,
-			)?))),
-			args[0],
-		),
-		"plot.line" if !shadows.plot && matches!(args.len(), 3 | 4) => {
-			let sink = plot_sink(PlotType::Line, source, &args, literal_bindings)?;
-			(
-				RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink))),
-				args[0],
-			)
-		}
-		"plot.line" if !shadows.plot => {
-			return invalid_view(
-				call.span(),
-				source.len(),
-				"plot.line(...) takes a relation plus x and y strings with an optional series",
-			);
-		}
-		"plot.area" if !shadows.plot && matches!(args.len(), 3 | 4) => {
-			let sink = plot_sink(PlotType::StackedArea, source, &args, literal_bindings)?;
-			(
-				RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(sink))),
-				args[0],
-			)
-		}
-		"plot.area" if !shadows.plot => {
-			return invalid_view(
-				call.span(),
-				source.len(),
-				"plot.area(...) takes a relation plus x and y strings with an optional series",
-			);
-		}
-		"plot.scatter" if !shadows.plot && matches!(args.len(), 3 | 4) => (
-			RuneViewIntent::Plot(RunePlotIntent::bare(RunePlotBody::Single(plot_sink(
-				PlotType::Scatter,
-				source,
-				&args,
-				literal_bindings,
-			)?))),
-			args[0],
-		),
-		_ => return Ok(None),
-	};
-	Ok(Some(ParsedView {
-		intent,
-		statement: byte_range(statement_span, source.len())?,
-		relation: byte_range(relation.span(), source.len())?,
-	}))
-}
-
-fn retained_regions(
-	source_len: usize,
-	peeled: &[Range<usize>],
-) -> Result<Vec<Range<usize>>, RuneEnvelopeError> {
-	let mut retained = Vec::with_capacity(peeled.len() + 1);
-	let mut cursor = 0;
-	for region in peeled {
-		if region.start < cursor || region.end > source_len {
-			return Err(RuneEnvelopeError::Invalid(
-				"presentation spans overlap or exceed the source".into(),
-			));
-		}
-		if cursor < region.start {
-			retained.push(cursor..region.start);
-		}
-		cursor = region.end;
-	}
-	if cursor < source_len {
-		retained.push(cursor..source_len);
-	}
-	Ok(retained)
-}
-
-fn collect_top_level_bindings(
-	statement: &ast::Stmt,
-	source: &str,
-	shadows: &mut ViewShadows,
-	bindings: &mut Vec<LocalBinding>,
-) -> Result<(), RuneEnvelopeError> {
-	match statement {
-		ast::Stmt::Local(local) => {
-			let statement = byte_range(statement.span(), source.len())?;
-			let mut names = Vec::new();
-			collect_pattern_names(&local.pat, source, &mut names)?;
-			for name in &names {
-				shadows.insert(name);
-			}
-			if names.len() == 1 {
-				bindings.push(LocalBinding {
-					name: names.pop().expect("one local binding"),
-					initializer: byte_range(local.expr.span(), source.len())?,
-					statement_start: statement.start,
-					statement,
-				});
-			}
-		}
-		ast::Stmt::Item(item, _) => collect_item_shadows(item, source, shadows)?,
-		_ => {}
-	}
-	Ok(())
-}
-
-fn collect_pattern_names(
-	pattern: &ast::Pat,
-	source: &str,
-	names: &mut Vec<String>,
-) -> Result<(), RuneEnvelopeError> {
-	match pattern {
-		ast::Pat::Path(path) => {
-			let raw = source_slice(source, path.path.span())?.trim();
-			if is_simple_name(raw) {
-				names.push(raw.to_owned());
-			}
-		}
-		ast::Pat::Vec(vector) => {
-			for (pattern, _) in vector.items.iter() {
-				collect_pattern_names(pattern, source, names)?;
-			}
-		}
-		ast::Pat::Tuple(tuple) => {
-			for (pattern, _) in tuple.items.iter() {
-				collect_pattern_names(pattern, source, names)?;
-			}
-		}
-		ast::Pat::Object(object) => {
-			for (pattern, _) in object.items.iter() {
-				collect_pattern_names(pattern, source, names)?;
-			}
-		}
-		ast::Pat::Binding(binding) => {
-			collect_pattern_names(&binding.pat, source, names)?;
-		}
-		_ => {}
-	}
-	Ok(())
-}
-
-fn collect_item_shadows(
-	item: &ast::Item,
-	source: &str,
-	shadows: &mut ViewShadows,
-) -> Result<(), RuneEnvelopeError> {
-	let name = match item {
-		ast::Item::Fn(item) => Some(item.name.span()),
-		ast::Item::Enum(item) => Some(item.name.span()),
-		ast::Item::Struct(item) => Some(item.ident.span()),
-		ast::Item::Mod(item) => Some(item.name.span()),
-		ast::Item::Const(item) => Some(item.name.span()),
-		ast::Item::Use(item) => {
-			collect_use_shadows(&item.path, source, shadows)?;
-			None
-		}
-		_ => None,
-	};
-	if let Some(span) = name {
-		shadows.insert(source_slice(source, span)?.trim());
-	}
-	Ok(())
-}
-
-fn collect_use_shadows(
-	path: &ast::ItemUsePath,
-	source: &str,
-	shadows: &mut ViewShadows,
-) -> Result<(), RuneEnvelopeError> {
-	if let Some((_, alias)) = &path.alias {
-		shadows.insert(source_slice(source, alias.span())?.trim());
-		return Ok(());
-	}
-	let segment = path
-		.segments
-		.last()
-		.map(|(_, segment)| segment)
-		.unwrap_or(&path.first);
-	match segment {
-		ast::ItemUseSegment::PathSegment(segment) => {
-			shadows.insert(source_slice(source, segment.span())?.trim());
-		}
-		ast::ItemUseSegment::Wildcard(_) => {
-			// The imported names are unknowable without semantic resolution. Retain
-			// both forms, which is the conservative direction.
-			shadows.table = true;
-			shadows.plot = true;
-		}
-		ast::ItemUseSegment::Group(group) => {
-			for (path, _) in group.iter() {
-				collect_use_shadows(path, source, shadows)?;
-			}
-		}
-		_ => {}
-	}
-	Ok(())
-}
-
-fn resolve_relation_origin(
-	source: &str,
-	root: &ParsedView,
-	bindings: &[LocalBinding],
-	shadows: ViewShadows,
-) -> Result<(String, RelationRoot), RuneEnvelopeError> {
-	let relation = source
-		.get(root.relation.clone())
-		.ok_or_else(|| RuneEnvelopeError::Invalid("relation span is not UTF-8".into()))?
-		.trim();
-	if is_simple_name(relation)
-		&& let Some(binding) = bindings.iter().rev().find(|binding| {
-			binding.name == relation && binding.statement_start < root.statement.start
-		}) {
-		let origin = source
-			.get(binding.initializer.clone())
-			.ok_or_else(|| RuneEnvelopeError::Invalid("binding initializer is not UTF-8".into()))?
-			.to_owned();
-		return Ok(canonical_relation_origin(origin, shadows));
-	}
-	Ok(canonical_relation_origin(relation.to_owned(), shadows))
-}
-
-fn canonical_relation_origin(origin: String, shadows: ViewShadows) -> (String, RelationRoot) {
-	if !shadows.ket
-		&& let Some(rest) = origin.strip_prefix("ket.")
-	{
-		return (format!("workspace.{rest}"), RelationRoot::Ket);
-	}
-	(origin, RelationRoot::Workspace)
-}
-
-fn is_simple_name(raw: &str) -> bool {
-	let mut chars = raw.chars();
-	let Some(first) = chars.next() else {
-		return false;
-	};
-	(first == '_' || first.is_alphabetic())
-		&& chars.all(|character| character == '_' || character.is_alphanumeric())
-}
-
-fn u32_range(range: &Range<usize>, label: &str) -> Result<Range<u32>, RuneEnvelopeError> {
-	Ok(u32::try_from(range.start)
-		.map_err(|_| RuneEnvelopeError::Invalid(format!("{label} exceeds u32")))?
-		..u32::try_from(range.end)
-			.map_err(|_| RuneEnvelopeError::Invalid(format!("{label} exceeds u32")))?)
-}
-
-fn plot_sink(
-	plot_type: PlotType,
-	source: &str,
-	args: &[&ast::Expr],
-	literal_bindings: &[LocalBinding],
-) -> Result<DisposableRunePlotSink, RuneEnvelopeError> {
-	plot_sink_fields(plot_type, source, args, 1, literal_bindings)
-}
-
-fn plot_sink_fields(
-	plot_type: PlotType,
-	source: &str,
-	args: &[&ast::Expr],
-	field_offset: usize,
-	literal_bindings: &[LocalBinding],
-) -> Result<DisposableRunePlotSink, RuneEnvelopeError> {
-	let constructor = match plot_type {
-		PlotType::Bar => "bar",
-		PlotType::Line => "line",
-		PlotType::Scatter => "scatter",
-		PlotType::StackedArea => "area",
-		_ => unreachable!("only Rune mark families reach field parsing"),
-	};
-	let field = |index: usize| {
-		resolve_mark_field(
-			args[field_offset + index],
-			source,
-			literal_bindings,
-			constructor,
-		)
-	};
-	let x = field(0)?;
-	let y = field(1)?;
-	let category = if args.len() == field_offset + 3 {
-		Some(field(2)?)
-	} else {
-		None
-	};
-	Ok(DisposableRunePlotSink {
-		composition: PlotComposition::single(plot_type),
-		x,
-		y,
-		category,
-	})
-}
-
-fn decode_string_literal(raw: &str) -> Option<String> {
-	let raw = raw.trim();
-	let body = raw.strip_prefix('"')?.strip_suffix('"')?;
-	let mut decoded = String::with_capacity(body.len());
-	let mut chars = body.chars();
-	while let Some(ch) = chars.next() {
-		if ch != '\\' {
-			// A source string literal cannot contain an unescaped quote. Rejecting it
-			// here keeps expressions such as `"x" + "y"` from masquerading as one
-			// literal merely because their complete source begins and ends with `"`.
-			if ch == '"' {
-				return None;
-			}
-			decoded.push(ch);
-			continue;
-		}
-		decoded.push(match chars.next()? {
-			'"' => '"',
-			'\\' => '\\',
-			'n' => '\n',
-			'r' => '\r',
-			't' => '\t',
-			_ => return None,
-		});
-	}
-	Some(decoded)
-}
-
-fn source_slice(source: &str, span: ast::Span) -> Result<&str, RuneEnvelopeError> {
-	let range = byte_range(span, source.len())?;
-	source
-		.get(range)
-		.ok_or_else(|| RuneEnvelopeError::Invalid("Rune span is not a UTF-8 boundary".into()))
-}
-
-fn byte_range(span: ast::Span, source_len: usize) -> Result<Range<usize>, RuneEnvelopeError> {
-	let start = span.start.into_usize();
-	let end = span.end.into_usize();
-	if start > end || end > source_len {
-		return Err(RuneEnvelopeError::Invalid(
-			"Rune span exceeds the source".into(),
-		));
-	}
-	Ok(start..end)
-}
-
-fn push_segment(
-	segments: &mut Vec<SourceMapSegment>,
-	transformed: Range<usize>,
-	original_start: u32,
-) -> Result<(), RuneEnvelopeError> {
-	if transformed.is_empty() {
-		return Ok(());
-	}
-	segments.push(SourceMapSegment {
-		transformed: u32::try_from(transformed.start)
-			.map_err(|_| RuneEnvelopeError::Invalid("transformed source exceeds u32".into()))?
-			..u32::try_from(transformed.end)
-				.map_err(|_| RuneEnvelopeError::Invalid("transformed source exceeds u32".into()))?,
-		original_start,
-	});
-	Ok(())
+	crate::rune_view_compiler::compile(source)
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
 
-	fn envelope(source: &str) -> ExecutionEnvelope {
-		analyze(source)
-			.expect("analyze Rune")
-			.into_envelope()
-			.expect("execution envelope")
+	#[derive(Clone, Debug, PartialEq)]
+	struct TestSemantics {
+		executions: Vec<String>,
+		presentation_order: Vec<RuneViewIntent>,
+		execution_count: usize,
+		sinks: Vec<RuneViewIntent>,
+	}
+
+	trait TestEnvelopeSemantics {
+		fn semantics(&self) -> TestSemantics;
+	}
+
+	impl TestEnvelopeSemantics for TransformedRuneView {
+		fn semantics(&self) -> TestSemantics {
+			let sinks = self
+				.presentation_views()
+				.into_iter()
+				.map(|view| view.intent.clone())
+				.collect::<Vec<_>>();
+			TestSemantics {
+				executions: self
+					.executions
+					.iter()
+					.map(|execution| execution.origin.clone())
+					.collect(),
+				presentation_order: sinks.clone(),
+				execution_count: self.executions.len(),
+				sinks,
+			}
+		}
+	}
+
+	fn envelope(source: &str) -> TransformedRuneView {
+		transform(source).expect("execution envelope")
 	}
 
 	#[test]
@@ -3616,7 +823,7 @@ mod tests {
 	#[test]
 	fn origin_resolved_identity_groups_multiple_origins_and_repeated_inline_text() {
 		let mixed_source = "let a = workspace.table(\"a\"); let b = workspace.table(\"b\"); table(a); let marker = 1; plot.bar(b, \"x\", \"y\")";
-		let semantics = analyze(mixed_source)
+		let semantics = transform(mixed_source)
 			.expect("analyze multiple origins")
 			.semantics();
 		assert_eq!(semantics.execution_count, 2);
@@ -3753,30 +960,20 @@ mod tests {
 	}
 
 	#[test]
-	fn non_root_view_names_and_wrong_arity_calls_are_retained_without_refusal() {
-		let source = "fn helper(r) { table(r); }\nlet r = workspace.table(\"t\");\nlet v = table(r);\nif true { table(r); }\n{ table(r); };\nplot.bar(r, \"x\");\ntable(r)";
+	fn non_root_presentation_is_partitioned_and_wrong_arity_refuses() {
+		let source = "fn helper(r) { table(r); }\nlet r = workspace.table(\"t\");\ntable(r)";
 		let transformed = transform(source).expect("only the final table is a root");
 		assert_eq!(transformed.views.len(), 1);
 		assert_eq!(transformed.views[0].intent.form(), RuneViewForm::Table);
-		for retained in [
-			"fn helper(r) { table(r); }",
-			"let v = table(r);",
-			"if true { table(r); }",
-			"{ table(r); };",
-			"plot.bar(r, \"x\");",
-		] {
-			assert!(
-				transformed.source.contains(retained),
-				"retained non-root: {retained}"
-			);
-		}
-
-		// plans/product/impl/0003_typed_output_root_discovery.md withdraws
-		// the old name-only arity refusal until view names are reserved.
-		assert_eq!(
+		assert!(!transformed.source.contains("fn helper"));
+		assert!(matches!(
 			transform("plot.bar(workspace.table(\"t\"), \"x\")"),
-			Err(RuneEnvelopeError::NoTerminalView)
-		);
+			Err(RuneEnvelopeError::InvalidView { .. })
+		));
+		assert!(matches!(
+			transform("let r = workspace.table(\"t\"); let v = table(r); table(r)"),
+			Err(RuneEnvelopeError::InvalidView { .. })
+		));
 	}
 
 	#[test]
@@ -4020,13 +1217,8 @@ let held = line("x", "y", "series");
 consume(line("a", "b", "group"));
 workspace.table("t").views([table()])
 "#;
-		let transformed = transform(source).expect("ordinary line calls stay ordinary Rune");
-		assert!(
-			transformed
-				.source
-				.contains("line(\"x\", \"y\", \"series\")")
-		);
-		assert!(transformed.source.contains("line(\"a\", \"b\", \"group\")"));
+		let error = transform(source).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -4071,7 +1263,7 @@ workspace.table("t").views([table()])
 	#[test]
 	fn product_0014_layer_depth_and_admissible_marks_refuse_at_the_inner_span() {
 		for (source, rejected) in [
-			("workspace.table(\"t\").views([layers([])])", "[]"),
+			("workspace.table(\"t\").views([layers([])])", "layers([])"),
 			(
 				"workspace.table(\"t\").views([layers([layers([line(\"x\", \"y\")])])])",
 				"layers([line(\"x\", \"y\")])",
@@ -4119,30 +1311,15 @@ workspace.table("t").views([table()])
 	}
 
 	#[test]
-	fn product_0014_layers_is_ordinary_rune_outside_a_proven_view_list() {
+	fn product_0076_layers_outside_a_slot_cannot_leak_to_toron() {
 		let source = r#"
 layers([line("x", "y")]);
 let held = layers([scatter("x", "y")]);
 consume(layers([line("x", "y")]));
 workspace.table("t").views([table()])
 "#;
-		let transformed = transform(source).expect("ordinary layers calls are retained");
-		assert!(transformed.source.contains("layers([line(\"x\", \"y\")]);"));
-		assert!(
-			transformed
-				.source
-				.contains("let held = layers([scatter(\"x\", \"y\")]);")
-		);
-		assert!(
-			transformed
-				.source
-				.contains("consume(layers([line(\"x\", \"y\")]));")
-		);
-		assert_eq!(transformed.views.len(), 1);
-		assert_eq!(
-			transformed.views[0].intent,
-			RuneViewIntent::Table(RuneTableSink::default())
-		);
+		let error = transform(source).expect_err("unknown local consumer refuses before Toron");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -4238,12 +1415,9 @@ workspace.table("t").views([figure([
 
 		for (member, expected) in [
 			("hide_legend(1)", "takes no arguments"),
-			("legend_at(0.5)", "takes exactly two numeric literals"),
+			("legend_at(0.5)", "requires exactly two numeric values"),
 			("legend_at(1e999, 0.5)", "requires finite positions"),
-			(
-				"legend_at(value, 0.5)",
-				"requires unsuffixed numeric literals",
-			),
+			("legend_at(value, 0.5)", "No local variable"),
 		] {
 			let source =
 				format!("workspace.table(\"t\").views([figure([{member}, line(\"x\", \"y\")])])");
@@ -4264,18 +1438,8 @@ let hidden = hide_legend();
 consume(legend_at(1.5, -0.5));
 workspace.table("t").views([table()])
 "#;
-		let transformed = transform(source).expect("ordinary calls are retained");
-		for retained in [
-			"legend_at(0.98, 0.02);",
-			"let hidden = hide_legend();",
-			"consume(legend_at(1.5, -0.5));",
-		] {
-			assert!(transformed.source.contains(retained), "missing {retained}");
-		}
-		assert!(matches!(
-			transformed.views[0].intent,
-			RuneViewIntent::Table(_)
-		));
+		let error = transform(source).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -4384,11 +1548,8 @@ workspace.table("t").views([figure([
 			("x_bounds(1e999, 2.0)", "requires finite bounds"),
 			("x_bounds(10.0, 0.0)", "cannot reverse an axis"),
 			("x_bounds(5.0, 5.0)", "cannot form a collapsed axis"),
-			(
-				"x_bounds(value, 2.0)",
-				"requires unsuffixed numeric literals",
-			),
-			("x_bounds(0.0)", "takes exactly two numeric literals"),
+			("x_bounds(value, 2.0)", "No local variable"),
+			("x_bounds(0.0)", "requires exactly two numeric values"),
 		] {
 			let source =
 				format!("workspace.table(\"t\").views([figure([{bounds}, line(\"x\", \"y\")])])");
@@ -4397,7 +1558,14 @@ workspace.table("t").views([figure([
 			else {
 				panic!("expected attributed bounds refusal");
 			};
-			assert_eq!(&source[span.start as usize..span.end as usize], bounds);
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				if bounds.contains("value") {
+					"value"
+				} else {
+					bounds
+				}
+			);
 			assert!(message.contains(expected), "{message}");
 		}
 
@@ -4457,11 +1625,8 @@ workspace.table("t").views([figure([
 			("y_tick_step(0)", "step must be strictly positive"),
 			("y_tick_step(-1)", "step must be strictly positive"),
 			("y_tick_step(1e999)", "requires a finite step"),
-			(
-				"y_tick_step(value)",
-				"requires an unsuffixed numeric literal",
-			),
-			("y_tick_step()", "takes exactly one numeric literal"),
+			("y_tick_step(value)", "No local variable"),
+			("y_tick_step()", "requires exactly one numeric value"),
 		] {
 			let source = format!(
 				"workspace.table(\"t\").views([figure([{constructor}, line(\"x\", \"y\")])])"
@@ -4471,7 +1636,14 @@ workspace.table("t").views([figure([
 			else {
 				panic!("expected attributed tick-step refusal");
 			};
-			assert_eq!(&source[span.start as usize..span.end as usize], constructor);
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				if constructor.contains("value") {
+					"value"
+				} else {
+					constructor
+				}
+			);
 			assert!(message.contains(expected), "{message}");
 		}
 		let duplicate = "workspace.table(\"t\").views([figure([y_tick_step(1), y_tick_step(2), line(\"x\", \"y\")])])";
@@ -4524,11 +1696,8 @@ workspace.table("t").views([figure([
 			("y_minor_ticks(-1)", "count must be a non-negative integer"),
 			("y_minor_ticks(2.5)", "count must be a non-negative integer"),
 			("y_minor_ticks(1e999)", "requires a finite count"),
-			(
-				"y_minor_ticks(value)",
-				"requires an unsuffixed numeric literal",
-			),
-			("y_minor_ticks()", "takes exactly one numeric literal"),
+			("y_minor_ticks(value)", "No local variable"),
+			("y_minor_ticks()", "requires exactly one numeric value"),
 		] {
 			let source = format!(
 				"workspace.table(\"t\").views([figure([{constructor}, line(\"x\", \"y\")])])"
@@ -4538,7 +1707,14 @@ workspace.table("t").views([figure([
 			else {
 				panic!("expected invalid-view refusal");
 			};
-			assert_eq!(&source[span.start as usize..span.end as usize], constructor);
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				if constructor.contains("value") {
+					"value"
+				} else {
+					constructor
+				}
+			);
 			assert!(message.contains(expected), "{message}");
 		}
 
@@ -4619,7 +1795,7 @@ workspace.table("t").views([figure([
 		for (source, expected) in [
 			(
 				"let title_text = make_title(); workspace.table(\"t\").views([figure([title(title_text), line(\"x\", \"y\")])])",
-				"binding \"title_text\" does not resolve to a literal",
+				"Missing item make_title",
 			),
 			(
 				"let step = -1; workspace.table(\"t\").views([figure([y_tick_step(step), line(\"x\", \"y\")])])",
@@ -4637,6 +1813,29 @@ workspace.table("t").views([figure([
 			};
 			assert!(message.contains(expected), "{message}");
 		}
+	}
+
+	#[test]
+	fn product_0076_stage0_computed_figure_element_is_the_banked_red_boundary() {
+		let source = r#"let yb = y_bounds(0, 160);
+workspace.table("demo_sales").views([figure([
+    title("Grouped bars"),
+    yb,
+    bar("region", "revenue", "product"),
+])])"#;
+		let transformed = transform(source).expect("PRODUCT-0076 inverts the banked refusal");
+		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
+			panic!("computed figure remains a plot")
+		};
+		assert_eq!(
+			plot.authored_settings.domains,
+			Override::Set(PlotDomainOverrides {
+				x_min: None,
+				x_max: None,
+				y_min: Some(0.0),
+				y_max: Some(160.0),
+			})
+		);
 	}
 
 	#[test]
@@ -4670,10 +1869,6 @@ workspace.table("t").views([figure([
 				"figure([], [])",
 			),
 			(
-				"let parts = [line(\"x\", \"y\")]; workspace.table(\"t\").views([figure(parts)])",
-				"parts",
-			),
-			(
 				"workspace.table(\"t\").views([figure([title(\"a\"), title(\"b\"), line(\"x\", \"y\")])])",
 				"title(\"b\")",
 			),
@@ -4699,7 +1894,7 @@ workspace.table("t").views([figure([
 			),
 			(
 				"workspace.table(\"t\").views([figure([view(\"inner\", line(\"x\", \"y\"))])])",
-				"view(\"inner\", line(\"x\", \"y\"))",
+				"view",
 			),
 			(
 				"workspace.table(\"t\").views([figure([layers([title(\"wrong level\"), line(\"x\", \"y\")])])])",
@@ -4707,7 +1902,7 @@ workspace.table("t").views([figure([
 			),
 			(
 				"let heading = title_text(); workspace.table(\"t\").views([figure([title(heading), line(\"x\", \"y\")])])",
-				"heading",
+				"title_text",
 			),
 			(
 				"workspace.table(\"t\").views([figure([subtitle(), line(\"x\", \"y\")])])",
@@ -4721,6 +1916,11 @@ workspace.table("t").views([figure([
 			};
 			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
 		}
+		let computed = transform(
+			"let parts = [line(\"x\", \"y\")]; workspace.table(\"t\").views([figure(parts)])",
+		)
+		.expect("PRODUCT-0076 executes a bound figure array");
+		assert!(matches!(computed.views[0].intent, RuneViewIntent::Plot(_)));
 	}
 
 	#[test]
@@ -4742,8 +1942,8 @@ workspace.table("t").views([figure([
 			let held = figure([subtitle("ordinary"), line("x", "y")]);
 			workspace.table("t").views([table()])
 		"#;
-		let retained = transform(ordinary).expect("figure calls outside views stay ordinary Rune");
-		assert!(retained.source.contains("figure([title(\"ordinary\")"));
+		let retained = transform(ordinary).expect("unclaimed presentation runs locally");
+		assert!(!retained.source.contains("figure([title(\"ordinary\")"));
 		assert_eq!(retained.views.len(), 1);
 	}
 
@@ -4801,7 +2001,7 @@ workspace.table("t").views([figure([
 			),
 			(
 				"let p = make_palette(); workspace.table(\"t\").views([figure([palette(p), bar(\"cat\", \"val\")])])",
-				"p",
+				"make_palette",
 			),
 			(
 				"workspace.table(\"t\").views([figure([palette(\"tab20c\")])])",
@@ -4834,10 +2034,9 @@ workspace.table("t").views([figure([
 			figure([palette("ordinary"), bar("cat", "val")]);
 			workspace.table("t").views([table()])
 		"#;
-		let retained =
-			transform(ordinary).expect("palette stays ordinary Rune outside a figure sink");
-		assert!(retained.source.contains("palette(\"tab20c\");"));
-		assert!(retained.source.contains("palette(\"ordinary\")"));
+		let retained = transform(ordinary).expect("unclaimed presentation runs locally");
+		assert!(!retained.source.contains("palette(\"tab20c\");"));
+		assert!(!retained.source.contains("palette(\"ordinary\")"));
 		assert_eq!(retained.views.len(), 1);
 	}
 
@@ -4910,7 +2109,7 @@ workspace.table("t").views([figure([
 			),
 			(
 				"let s = make_skin(); workspace.table(\"t\").views([figure([skin(s), bar(\"cat\", \"val\")])])",
-				"s",
+				"make_skin",
 			),
 			(
 				"workspace.table(\"t\").views([figure([layers([skin(\"nord\"), line(\"x\", \"y\")])])])",
@@ -4938,7 +2137,12 @@ workspace.table("t").views([figure([
 			else {
 				panic!("attributed refusal")
 			};
-			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
+			let actual = &source[span.start as usize..span.end as usize];
+			if rejected.contains(".duotone") {
+				assert_eq!(actual, &rejected[rejected.rfind('.').expect("modifier")..]);
+			} else {
+				assert_eq!(actual, rejected);
+			}
 		}
 
 		let ordinary = r#"
@@ -4948,8 +2152,8 @@ workspace.table("t").views([figure([
 			figure([skin("ordinary"), bar("cat", "val")]);
 			workspace.table("t").views([table().skin("nord")])
 		"#;
-		let retained = transform(ordinary).expect("skin remains contextual");
-		assert!(retained.source.contains("skin(\"nord\");"));
+		let retained = transform(ordinary).expect("unclaimed presentation runs locally");
+		assert!(!retained.source.contains("skin(\"nord\");"));
 		assert_eq!(retained.views.len(), 1);
 	}
 
@@ -5122,23 +2326,26 @@ workspace.table("t").views([layers([
 			workspace.table("t").views([layers([line(x, y, series)])])"#,
 			r#"let x = "x"; let y = "y";
 			workspace.table("t").views([layers([bar(x, y)])])"#,
-			r#"let x = "x"; let y = "y"; let width = 2.0;
-			workspace.table("t").views([layers([line(x, y).stroke_width(width)])])"#,
 		] {
 			assert!(
 				transform(source).is_err(),
 				"binding coverage widened the layer/register surface: {source}"
 			);
 		}
+		transform(
+			r#"let x = "x"; let y = "y"; let width = 2.0;
+			workspace.table("t").views([layers([line(x, y).stroke_width(width)])])"#,
+		)
+		.expect("PRODUCT-0076 executes a bound layer modifier argument");
 
 		for (source, rejected) in [
 			(
 				r#"workspace.table("t").views([layers([bar(missing, "y").bar_width(0.5)])])"#,
-				"bar(missing, \"y\").bar_width(0.5)",
+				"missing",
 			),
 			(
 				r#"workspace.table("t").views([layers([line(missing, "y", "series").stroke_width(2.0)])])"#,
-				"line(missing, \"y\", \"series\").stroke_width(2.0)",
+				"missing",
 			),
 		] {
 			let RuneEnvelopeError::InvalidView { span, message } =
@@ -5147,15 +2354,12 @@ workspace.table("t").views([layers([
 				panic!("expected layer-context refusal")
 			};
 			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
-			assert!(
-				message.contains("not a shared-Cartesian layer"),
-				"{message}"
-			);
+			assert!(message.contains("No local variable"), "{message}");
 		}
 	}
 
 	#[test]
-	fn product_0058_lookup_retention_and_argument_refusals_follow_product_0040() {
+	fn product_0058_lookup_and_argument_refusals_survive_product_0076_partitioning() {
 		let aliases = r#"
 let original = "x";
 let alias = original;
@@ -5163,8 +2367,11 @@ let y_field = "y";
 workspace.table("t").views([line(alias, y_field)])
 "#;
 		let transformed = transform(aliases).expect("transitive mark-field alias");
-		assert!(transformed.source.contains("let original = \"x\";"));
-		assert!(transformed.source.contains("let alias = original;"));
+		assert!(
+			!transformed.source.contains("let original = \"x\";")
+				&& !transformed.source.contains("let alias = original;"),
+			"PRODUCT-0076 executes presentation-only aliases locally instead of retaining them for Toron"
+		);
 		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
 			panic!("bound line must remain a plot")
 		};
@@ -5212,27 +2419,22 @@ workspace.table("t").views([line(field, "y")])
 			(
 				"workspace.table(\"t\").views([bar(missing, \"y\")])",
 				"missing",
-				"field binding \"missing\" does not resolve",
+				"No local variable",
 			),
 			(
 				"let field = make_field(); workspace.table(\"t\").views([bar(field, \"y\")])",
-				"field",
-				"field binding \"field\" does not resolve",
+				"make_field",
+				"Missing item make_field",
 			),
 			(
 				"let field = field; workspace.table(\"t\").views([bar(field, \"y\")])",
 				"field",
-				"field binding \"field\" does not resolve",
+				"No local variable",
 			),
 			(
 				"let field = 7; workspace.table(\"t\").views([bar(field, \"y\")])",
-				"field",
-				"resolved to a numeric literal",
-			),
-			(
-				"workspace.table(\"t\").views([bar(\"x\" + \"z\", \"y\")])",
-				"\"x\" + \"z\"",
-				"fields must be string literals or static string bindings",
+				"bar(field, \"y\")",
+				"field arguments must evaluate to strings",
 			),
 		] {
 			let RuneEnvelopeError::InvalidView { span, message } =
@@ -5243,6 +2445,16 @@ workspace.table("t").views([line(field, "y")])
 			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
 			assert!(message.contains(expected), "{message}");
 		}
+		let concatenated =
+			product_0058_only_intent("workspace.table(\"t\").views([bar(\"x\" + \"z\", \"y\")])");
+		let RuneViewIntent::Plot(RunePlotIntent {
+			body: RunePlotBody::Single(sink),
+			..
+		}) = concatenated
+		else {
+			panic!("computed string field remains a bar")
+		};
+		assert_eq!(sink.x, "xz");
 	}
 
 	#[test]
@@ -5362,7 +2574,6 @@ workspace.table("t").views([line(field, "y")])
 			"point_size()",
 			"point_size(1.0, 2.0)",
 			"point_size(size)",
-			"point_size(1.0 + 1.0)",
 			"point_size(-1.0)",
 			"point_size(0.0)",
 			"point_size(0.24)",
@@ -5378,18 +2589,35 @@ workspace.table("t").views([line(field, "y")])
 			};
 			assert_eq!(
 				&source[span.start as usize..span.end as usize],
-				format!("scatter(\"x\", \"y\").{rejected}")
+				if rejected == "point_size(size)" {
+					"size".to_owned()
+				} else {
+					format!(".{rejected}")
+				}
 			);
 		}
+		transform(
+			"workspace.table(\"t\").views([layers([scatter(\"x\", \"y\").point_size(1.0 + 1.0)])])",
+		)
+		.expect("PRODUCT-0076 executes computed point size");
 	}
 
 	#[test]
 	fn product_0018_modifier_register_is_closed_duplicate_free_and_atomic() {
-		for modified in [
-			"scatter(\"x\", \"y\").opacity(0.5)",
-			"scatter(\"x\", \"y\").title(\"wrong level\")",
-			"scatter(\"x\", \"y\").point_size(2.0).point_size(3.0)",
-			"line(\"x\", \"y\").point_size(2.0)",
+		for (modified, rejected) in [
+			(
+				"scatter(\"x\", \"y\").opacity(0.5)",
+				"scatter(\"x\", \"y\").opacity(0.5)",
+			),
+			(
+				"scatter(\"x\", \"y\").title(\"wrong level\")",
+				"scatter(\"x\", \"y\").title(\"wrong level\")",
+			),
+			(
+				"scatter(\"x\", \"y\").point_size(2.0).point_size(3.0)",
+				".point_size(3.0)",
+			),
+			("line(\"x\", \"y\").point_size(2.0)", ".point_size(2.0)"),
 		] {
 			let source = format!("workspace.table(\"t\").views([table(), layers([{modified}])])");
 			let RuneEnvelopeError::InvalidView { span, .. } =
@@ -5397,7 +2625,7 @@ workspace.table("t").views([line(field, "y")])
 			else {
 				panic!("expected an attributed modifier refusal")
 			};
-			assert_eq!(&source[span.start as usize..span.end as usize], modified);
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
 		}
 
 		let category = transform("workspace.table(\"t\").views([scatter(\"x\", \"y\", \"cat\")])")
@@ -5418,21 +2646,8 @@ workspace.table("t").views([line(field, "y")])
 			consume(scatter("a", "b").point_size(4.0));
 			workspace.table("t").views([table()])
 		"#;
-		let transformed = transform(source).expect("ordinary method calls are retained");
-		assert!(
-			transformed
-				.source
-				.contains("scatter(\"x\", \"y\").point_size(2.0)")
-		);
-		assert!(
-			transformed
-				.source
-				.contains("scatter(\"a\", \"b\").point_size(4.0)")
-		);
-		assert_eq!(
-			transformed.views[0].intent,
-			RuneViewIntent::Table(RuneTableSink::default())
-		);
+		let error = transform(source).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -5507,16 +2722,15 @@ workspace.table("t").views([line(field, "y")])
 			assert_eq!(width.factor(), factor.parse::<f32>().unwrap());
 		}
 
-		for rejected in [
-			"stroke_width()",
-			"stroke_width(1.0, 2.0)",
-			"stroke_width(width)",
-			"stroke_width(1.0 + 1.0)",
-			"stroke_width(-1.0)",
-			"stroke_width(0.0)",
-			"stroke_width(0.24)",
-			"stroke_width(8.01)",
-			"stroke_width(2.0).stroke_width(3.0)",
+		for (rejected, attributed) in [
+			("stroke_width()", ".stroke_width()"),
+			("stroke_width(1.0, 2.0)", ".stroke_width(1.0, 2.0)"),
+			("stroke_width(width)", "width"),
+			("stroke_width(-1.0)", ".stroke_width(-1.0)"),
+			("stroke_width(0.0)", ".stroke_width(0.0)"),
+			("stroke_width(0.24)", ".stroke_width(0.24)"),
+			("stroke_width(8.01)", ".stroke_width(8.01)"),
+			("stroke_width(2.0).stroke_width(3.0)", ".stroke_width(3.0)"),
 		] {
 			let source = format!(
 				"workspace.table(\"t\").views([table(), layers([line(\"x\", \"y\").{rejected}])])"
@@ -5526,20 +2740,30 @@ workspace.table("t").views([line(field, "y")])
 			else {
 				panic!("expected attributed stroke-width refusal")
 			};
-			assert_eq!(
-				&source[span.start as usize..span.end as usize],
-				format!("line(\"x\", \"y\").{rejected}")
-			);
+			assert_eq!(&source[span.start as usize..span.end as usize], attributed);
 		}
+		transform(
+			"workspace.table(\"t\").views([layers([line(\"x\", \"y\").stroke_width(1.0 + 1.0)])])",
+		)
+		.expect("PRODUCT-0076 executes computed stroke width");
 	}
 
 	#[test]
 	fn product_0020_modifier_compatibility_is_closed_and_order_independent() {
-		for modified in [
-			"scatter(\"x\", \"y\").stroke_width(2.0)",
-			"line(\"x\", \"y\").point_size(2.0)",
-			"line(\"x\", \"y\").stroke_width(2.0).point_size(2.0)",
-			"line(\"x\", \"y\").point_size(2.0).stroke_width(2.0)",
+		for (modified, rejected) in [
+			(
+				"scatter(\"x\", \"y\").stroke_width(2.0)",
+				".stroke_width(2.0)",
+			),
+			("line(\"x\", \"y\").point_size(2.0)", ".point_size(2.0)"),
+			(
+				"line(\"x\", \"y\").stroke_width(2.0).point_size(2.0)",
+				".point_size(2.0)",
+			),
+			(
+				"line(\"x\", \"y\").point_size(2.0).stroke_width(2.0)",
+				".point_size(2.0)",
+			),
 		] {
 			let source = format!("workspace.table(\"t\").views([layers([{modified}])])");
 			let RuneEnvelopeError::InvalidView { span, .. } =
@@ -5547,7 +2771,7 @@ workspace.table("t").views([line(field, "y")])
 			else {
 				panic!("expected attributed compatibility refusal")
 			};
-			assert_eq!(&source[span.start as usize..span.end as usize], modified);
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
 		}
 
 		for control in [
@@ -5565,21 +2789,8 @@ workspace.table("t").views([line(field, "y")])
 			consume(line("a", "b").stroke_width(4.0));
 			workspace.table("t").views([table()])
 		"#;
-		let transformed = transform(source).expect("ordinary line methods are retained");
-		assert!(
-			transformed
-				.source
-				.contains("line(\"x\", \"y\").stroke_width(2.0)")
-		);
-		assert!(
-			transformed
-				.source
-				.contains("line(\"a\", \"b\").stroke_width(4.0)")
-		);
-		assert_eq!(
-			transformed.views[0].intent,
-			RuneViewIntent::Table(RuneTableSink::default())
-		);
+		let error = transform(source).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -5645,7 +2856,6 @@ workspace.table("t").views([line(field, "y")])
 			"bar_width()",
 			"bar_width(0.5, 0.6)",
 			"bar_width(width)",
-			"bar_width(0.25 + 0.25)",
 			"bar_width(-0.1)",
 			"bar_width(0.0)",
 			"bar_width(1.01)",
@@ -5656,6 +2866,8 @@ workspace.table("t").views([line(field, "y")])
 				format!("workspace.table(\"t\").views([bar(\"cat\", \"val\").{rejected}])");
 			assert!(transform(&source).is_err(), "accepted {rejected}");
 		}
+		transform("workspace.table(\"t\").views([bar(\"cat\", \"val\").bar_width(0.25 + 0.25)])")
+			.expect("PRODUCT-0076 executes computed bar width");
 	}
 
 	#[test]
@@ -5692,17 +2904,8 @@ let styled = bar("cat", "val").bar_width(0.5);
 consume(bar("a", "b").bar_width(0.7));
 workspace.table("t").views([table()])
 "#;
-		let transformed = transform(source).expect("unproven modifiers remain Rune");
-		assert!(
-			transformed
-				.source
-				.contains("bar(\"cat\", \"val\").bar_width(0.5)")
-		);
-		assert!(
-			transformed
-				.source
-				.contains("bar(\"a\", \"b\").bar_width(0.7)")
-		);
+		let error = transform(source).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -5755,7 +2958,6 @@ workspace.table("t").views([table()])
 			"category_gap()",
 			"category_gap(0.2, 0.3)",
 			"category_gap(gap)",
-			"category_gap(0.1 + 0.1)",
 			"category_gap(-0.1)",
 			"category_gap(1.0)",
 			"category_gap(1.01)",
@@ -5765,6 +2967,8 @@ workspace.table("t").views([table()])
 				format!("workspace.table(\"t\").views([bar(\"cat\", \"val\").{rejected}])");
 			assert!(transform(&source).is_err(), "accepted {rejected}");
 		}
+		transform("workspace.table(\"t\").views([bar(\"cat\", \"val\").category_gap(0.1 + 0.1)])")
+			.expect("PRODUCT-0076 executes computed category gap");
 
 		for rejected in [
 			"line(\"x\", \"y\").category_gap(0.2)",
@@ -5787,9 +2991,8 @@ let styled = bar("cat", "val").category_gap(0.2);
 consume(bar("a", "b").category_gap(0.4));
 workspace.table("t").views([table()])
 "#;
-		let transformed = transform(source).expect("unproven modifiers remain Rune");
-		assert!(transformed.source.contains("category_gap(0.2)"));
-		assert!(transformed.source.contains("category_gap(0.4)"));
+		let error = transform(source).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -5838,8 +3041,8 @@ workspace.table("t").views([table()])
 			};
 			assert_eq!(
 				&source[span.start as usize..span.end as usize],
-				rejected,
-				"the complete invalid modifier chain owns the refusal"
+				&rejected[rejected.rfind('.').expect("modifier")..],
+				"the offending modifier owns the refusal"
 			);
 		}
 
@@ -6026,12 +3229,9 @@ let series_field = "series";
 		}
 
 		for (chain, reason) in [
-			("area(\"x\", \"y\").stacked()", "bar marks, not area"),
-			("area(\"x\", \"y\").bar_width(0.5)", "bar marks, not area"),
-			(
-				"area(\"x\", \"y\").category_gap(0.2)",
-				"bar marks, not area",
-			),
+			("area(\"x\", \"y\").stacked()", "bar marks"),
+			("area(\"x\", \"y\").bar_width(0.5)", "bar marks"),
+			("area(\"x\", \"y\").category_gap(0.2)", "bar marks"),
 		] {
 			let source = format!("workspace.table(\"t\").views([{chain}])");
 			let RuneEnvelopeError::InvalidView { span, message } =
@@ -6039,7 +3239,11 @@ let series_field = "series";
 			else {
 				panic!("expected attributed area refusal")
 			};
-			assert_eq!(&source[span.start as usize..span.end as usize], chain);
+			let modifier = chain.find(").").expect("receiver modifier") + 1;
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				&chain[modifier..]
+			);
 			assert!(message.contains(reason), "{message}");
 		}
 
@@ -6048,13 +3252,9 @@ let held = area("x", "y", "series");
 consume(area("a", "b"));
 workspace.table("t").views([table()])
 "#;
-		let transformed = transform(ordinary).expect("area calls outside view positions stay Rune");
-		assert!(
-			transformed
-				.source
-				.contains("area(\"x\", \"y\", \"series\")")
-		);
-		assert!(transformed.source.contains("area(\"a\", \"b\")"));
+		let error =
+			transform(ordinary).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -6066,10 +3266,6 @@ workspace.table("t").views([table()])
 				"layers([], [])",
 			),
 			(
-				"let marks = [line(\"x\", \"y\")]; workspace.table(\"t\").views([layers(marks)])",
-				"layers(marks)",
-			),
-			(
 				"workspace.table(\"t\").views([layers([line(\"x\")])])",
 				"line(\"x\")",
 			),
@@ -6079,11 +3275,11 @@ workspace.table("t").views([table()])
 			),
 			(
 				"workspace.table(\"t\").views([layers([unknown(\"x\", \"y\")])])",
-				"unknown(\"x\", \"y\")",
+				"unknown",
 			),
 			(
 				"workspace.table(\"t\").views([layers([line(\"x\", \"y\"), unknown()])])",
-				"unknown()",
+				"unknown",
 			),
 		] {
 			let RuneEnvelopeError::InvalidView { span, .. } =
@@ -6093,6 +3289,17 @@ workspace.table("t").views([table()])
 			};
 			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
 		}
+		let computed = transform(
+			"let marks = [line(\"x\", \"y\")]; workspace.table(\"t\").views([layers(marks)])",
+		)
+		.expect("PRODUCT-0076 executes a bound layer array");
+		assert!(matches!(
+			computed.views[0].intent,
+			RuneViewIntent::Plot(RunePlotIntent {
+				body: RunePlotBody::Layered(_),
+				..
+			})
+		));
 	}
 
 	#[test]
@@ -6165,8 +3372,6 @@ workspace.table("t").views([table()])
 			"workspace.table(\"t\").views([scatter(\"c\")])",
 			"workspace.table(\"t\").views([scatter(c, \"v\")])",
 			"workspace.table(\"t\").views([unknown()])",
-			"let s = scatter(\"c\", \"v\"); workspace.table(\"t\").views([s])",
-			"let v = workspace.table(\"t\").views([table()]); consume(v)",
 			"workspace.table(\"t\").views([view(\"n\")])",
 			"workspace.table(\"t\").views([view(name, table())])",
 			"workspace.table(\"t\").views([view(\"outer\", view(\"inner\", table()))])",
@@ -6190,6 +3395,15 @@ workspace.table("t").views([table()])
 				.len(),
 			1
 		);
+		let computed =
+			transform("let s = scatter(\"c\", \"v\"); workspace.table(\"t\").views([s])")
+				.expect("PRODUCT-0076 executes a bound static slot");
+		assert_eq!(computed.views[0].intent.form(), RuneViewForm::Scatter);
+		assert_eq!(
+			transform("let v = workspace.table(\"t\").views([table()]); consume(v)"),
+			Err(RuneEnvelopeError::RecognizedNoOutput),
+			"a bound view set remains distinct from malformed presentation"
+		);
 	}
 
 	#[test]
@@ -6206,8 +3420,6 @@ workspace.table("t").views([table()])
 
 	#[test]
 	fn zero_roots_produce_no_envelope_and_no_scheduled_execution() {
-		let analysis = analyze("let r = 1; r").expect("view-free analysis");
-		assert!(analysis.into_envelope().is_none());
 		assert_eq!(
 			transform("let r = 1; r"),
 			Err(RuneEnvelopeError::NoTerminalView)
@@ -6281,18 +3493,27 @@ workspace.table("t").views([table()])
 
 	#[test]
 	fn product_0027_table_modifier_register_is_closed_bounded_and_atomic() {
-		for sink in [
-			"table().skin()",
-			"table().skin(\"nord\", \"terrain\")",
-			"table().skin(theme_name)",
-			"table().skin(\"nord\").skin(\"terrain\")",
-			"table().duotone()",
-			"table().skin(\"nord\").duotone(1)",
-			"table().skin(\"nord\").duotone().duotone()",
-			"table().point_size(2.0)",
-			"table().frobnicate(1)",
-			"table(\"wrong\").skin(\"nord\")",
-			"scatter(\"x\", \"y\").skin(\"nord\")",
+		for (sink, rejected) in [
+			("table().skin()", ".skin()"),
+			(
+				"table().skin(\"nord\", \"terrain\")",
+				".skin(\"nord\", \"terrain\")",
+			),
+			("table().skin(theme_name)", "theme_name"),
+			(
+				"table().skin(\"nord\").skin(\"terrain\")",
+				".skin(\"terrain\")",
+			),
+			("table().duotone()", ".duotone()"),
+			("table().skin(\"nord\").duotone(1)", ".duotone(1)"),
+			("table().skin(\"nord\").duotone().duotone()", ".duotone()"),
+			("table().point_size(2.0)", "table().point_size(2.0)"),
+			("table().frobnicate(1)", "table().frobnicate(1)"),
+			("table(\"wrong\").skin(\"nord\")", "table(\"wrong\")"),
+			(
+				"scatter(\"x\", \"y\").skin(\"nord\")",
+				"scatter(\"x\", \"y\").skin(\"nord\")",
+			),
 		] {
 			let source =
 				format!("workspace.table(\"t\").views([table(), {sink}, line(\"x\", \"y\")])");
@@ -6300,10 +3521,9 @@ workspace.table("t").views([table()])
 			let RuneEnvelopeError::InvalidView { span, .. } = error else {
 				panic!("expected an attributed table modifier refusal");
 			};
-			let expected_start = source.find(sink).unwrap() as u32;
 			assert_eq!(
-				span,
-				expected_start..expected_start + sink.len() as u32,
+				&source[span.start as usize..span.end as usize],
+				rejected,
 				"{sink}"
 			);
 		}
@@ -6406,23 +3626,23 @@ workspace.table("t").views([
 		for (source, chain, expected) in [
 			(
 				"let theme = make_theme(); workspace.table(\"t\").views([table().show_types().skin(theme)])",
-				"table().show_types().skin(theme)",
-				"binding \"theme\" does not resolve to a literal",
+				"make_theme",
+				"Missing item make_theme",
 			),
 			(
 				"let theme = 7; workspace.table(\"t\").views([table().skin(theme).duotone()])",
-				"table().skin(theme).duotone()",
-				"binding theme resolved to a numeric literal",
+				".skin(theme)",
+				"requires a theme string",
 			),
 			(
 				"workspace.table(\"t\").views([table().skin(theme)]); let theme = \"vapor\";",
-				"table().skin(theme)",
-				"requires a theme string literal",
+				"theme",
+				"No local variable",
 			),
 			(
 				"workspace.table(\"t\").views([table().skin(make_theme())])",
-				"table().skin(make_theme())",
-				"requires a theme string literal",
+				"make_theme",
+				"Missing item make_theme",
 			),
 		] {
 			let RuneEnvelopeError::InvalidView { span, message } =
@@ -6437,15 +3657,21 @@ workspace.table("t").views([
 
 	#[test]
 	fn product_0052_show_types_refusals_are_atomic_and_duotone_owns_its_dependency() {
-		for (sink, message) in [
-			("table().show_types(1)", "show_types() takes no arguments"),
+		for (sink, rejected, message) in [
+			(
+				"table().show_types(1)",
+				".show_types(1)",
+				"show_types() takes no arguments",
+			),
 			(
 				"table().show_types().show_types()",
+				".show_types()",
 				"show_types() may appear at most once on a table sink",
 			),
 			(
 				"table().duotone().show_types()",
-				"duotone() requires skin(string_literal)",
+				".duotone()",
+				"duotone() requires skin(string)",
 			),
 		] {
 			let source =
@@ -6458,8 +3684,7 @@ workspace.table("t").views([
 			else {
 				panic!("expected an attributed table modifier refusal");
 			};
-			let expected_start = source.find(sink).unwrap() as u32;
-			assert_eq!(span, expected_start..expected_start + sink.len() as u32);
+			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
 			assert_eq!(actual, message);
 		}
 
@@ -6468,12 +3693,8 @@ let held = table().show_types();
 consume(table().show_types());
 workspace.table("t").views([table()])
 "#;
-		let transformed = transform(source).expect("one proven default table view");
-		assert!(transformed.source.contains("table().show_types()"));
-		assert_eq!(
-			transformed.views[0].intent,
-			RuneViewIntent::Table(RuneTableSink::default())
-		);
+		let error = transform(source).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 	}
 
 	#[test]
@@ -6484,22 +3705,8 @@ consume(table().skin("nord"));
 consume(table().skin("yellows").duotone());
 workspace.table("t").views([table()])
 "#;
-		let transformed = transform(source).expect("one proven default table view");
-		assert!(
-			transformed
-				.source
-				.contains("table().skin(\"terrain_rs10\")")
-		);
-		assert!(transformed.source.contains("table().skin(\"nord\")"));
-		assert!(
-			transformed
-				.source
-				.contains("table().skin(\"yellows\").duotone()")
-		);
-		assert_eq!(
-			transformed.views[0].intent,
-			RuneViewIntent::Table(RuneTableSink::default())
-		);
+		let error = transform(source).expect_err("presentation calls cannot leak through consume");
+		assert!(error.to_string().contains("consume"), "{error}");
 
 		let sugar = transform("workspace.table(\"t\").table()")
 			.expect("accepted relation table sugar remains default");
@@ -6600,6 +3807,64 @@ workspace.table("t").views([table()])
 			Some(6),
 			"an unavailable workspace must not leave the buffer permanently in flight"
 		);
+	}
+
+	#[test]
+	fn product_0076_presentation_scheduler_coalesces_before_invocation() {
+		fn work(buffer: BufferId, revision: u64) -> PendingRunePresentation {
+			PendingRunePresentation::new(buffer, revision, format!("revision {revision}"))
+		}
+		let buffer = BufferId::new(76);
+		let mut scheduler = RuneViewScheduler::default();
+		let first = scheduler
+			.submit_presentation(work(buffer, 1))
+			.expect("first revision is offered");
+		assert!(first.is_current());
+		assert!(scheduler.submit_presentation(work(buffer, 2)).is_none());
+		assert!(scheduler.submit_presentation(work(buffer, 3)).is_none());
+		assert!(
+			!first.is_current(),
+			"the blocking closure can reject the old revision before invoking Rune"
+		);
+		let completion = scheduler.complete_presentation(buffer, 1);
+		assert!(!completion.accepted);
+		let newest = completion.next.expect("newest retained revision starts");
+		assert_eq!(newest.revision, 3);
+		assert!(newest.is_current());
+		let completion = scheduler.complete_presentation(buffer, 3);
+		assert!(completion.accepted);
+		assert!(completion.next.is_none());
+		assert_eq!(
+			(
+				scheduler.presentation_submitted,
+				scheduler.presentation_executed,
+				scheduler.presentation_superseded_before_execution,
+			),
+			(3, 2, 1)
+		);
+	}
+
+	#[test]
+	fn product_0076_in_flight_presentation_completion_cannot_publish_after_supersession() {
+		let buffer = BufferId::new(77);
+		let mut scheduler = RuneViewScheduler::default();
+		let first = scheduler
+			.submit_presentation(PendingRunePresentation::new(buffer, 1, "old".to_owned()))
+			.expect("first starts");
+		assert!(first.is_current());
+		assert!(
+			scheduler
+				.submit_presentation(PendingRunePresentation::new(buffer, 2, "new".to_owned(),))
+				.is_none()
+		);
+		let old = scheduler.complete_presentation(buffer, 1);
+		assert!(
+			!old.accepted,
+			"an already-computed old result cannot publish"
+		);
+		assert_eq!(old.next.as_ref().map(|work| work.revision), Some(2));
+		let current = scheduler.complete_presentation(buffer, 2);
+		assert!(current.accepted);
 	}
 
 	#[test]
