@@ -4448,7 +4448,18 @@ pub const PARTITION_WORK_CONCURRENCY_ENV: &str = "TORON_PARTITION_PARALLELISM";
 /// one partitioned scan-build path, not a query-wide thread count. The absent arm mirrors Toron's
 /// engine default; malformed explicit values fail loudly in the performance rail.
 pub fn gauge_partition_work_concurrency_requested() -> Result<(u64, &'static str), String> {
-	match std::env::var(PARTITION_WORK_CONCURRENCY_ENV) {
+	let default = std::thread::available_parallelism()
+		.map(std::num::NonZeroUsize::get)
+		.unwrap_or(1)
+		.max(1);
+	parse_partition_work_concurrency(std::env::var(PARTITION_WORK_CONCURRENCY_ENV), default)
+}
+
+fn parse_partition_work_concurrency(
+	raw: Result<String, std::env::VarError>,
+	default: usize,
+) -> Result<(u64, &'static str), String> {
+	match raw {
 		Ok(raw) => match raw.parse::<usize>() {
 			Ok(value) if value > 0 => u64::try_from(value)
 				.map(|value| (value, "explicit"))
@@ -4457,14 +4468,9 @@ pub fn gauge_partition_work_concurrency_requested() -> Result<(u64, &'static str
 				"{PARTITION_WORK_CONCURRENCY_ENV} must be a positive integer, got {raw:?}"
 			)),
 		},
-		Err(std::env::VarError::NotPresent) => u64::try_from(
-			std::thread::available_parallelism()
-				.map(std::num::NonZeroUsize::get)
-				.unwrap_or(1)
-				.max(1),
-		)
-		.map(|value| (value, "default"))
-		.map_err(|_| format!("{PARTITION_WORK_CONCURRENCY_ENV} default does not fit u64")),
+		Err(std::env::VarError::NotPresent) => u64::try_from(default)
+			.map(|value| (value, "default"))
+			.map_err(|_| format!("{PARTITION_WORK_CONCURRENCY_ENV} default does not fit u64")),
 		Err(error) => Err(format!("{PARTITION_WORK_CONCURRENCY_ENV}: {error}")),
 	}
 }
@@ -4489,9 +4495,7 @@ fn parse_gauge_byte_budget(
 	match raw {
 		Ok(raw) => match raw.parse::<u64>() {
 			Ok(bytes) if bytes > 0 => Ok((bytes, "explicit")),
-			_ => Err(format!(
-				"{name} must be a positive byte count, got {raw:?}"
-			)),
+			_ => Err(format!("{name} must be a positive byte count, got {raw:?}")),
 		},
 		Err(std::env::VarError::NotPresent) => Ok((default, "default")),
 		Err(error) => Err(format!("{name}: {error}")),
@@ -4501,23 +4505,75 @@ fn parse_gauge_byte_budget(
 pub const GAUGE_SPILL_BYTES_RESERVED_ENV: &str = "TORON_TPCH_SPILL_BYTES_RESERVED";
 pub const GAUGE_HASH_SMALLER_BUILD_ENV: &str = "TORON_TPCH_HASH_SMALLER_BUILD";
 
+#[derive(Clone, Copy)]
+enum BooleanGauge {
+	HashSmallerBuild,
+	FilteredBuildSideSwap,
+	ScalarAggregateInputReduction,
+	MembershipFirst,
+	SideLocalFilterRouting,
+	SemiFilteredReachableKeys,
+	OuterCountPreaggregation,
+}
+
+impl BooleanGauge {
+	fn name(self) -> &'static str {
+		match self {
+			Self::HashSmallerBuild => GAUGE_HASH_SMALLER_BUILD_ENV,
+			Self::FilteredBuildSideSwap => GAUGE_FILTERED_BUILD_SIDE_SWAP_ENV,
+			Self::ScalarAggregateInputReduction => GAUGE_SCALAR_AGG_INPUT_REDUCTION_ENV,
+			Self::MembershipFirst => GAUGE_MEMBERSHIP_FIRST_ENV,
+			Self::SideLocalFilterRouting => GAUGE_SIDE_LOCAL_FILTER_ROUTING_ENV,
+			Self::SemiFilteredReachableKeys => GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV,
+			Self::OuterCountPreaggregation => GAUGE_OUTER_COUNT_PREAGGREGATION_ENV,
+		}
+	}
+
+	fn default(self) -> bool {
+		let planner = PlannerConfig::default();
+		match self {
+			Self::HashSmallerBuild => planner.hash_smaller_build_placement,
+			Self::FilteredBuildSideSwap => planner.filtered_build_side_swap,
+			Self::ScalarAggregateInputReduction => planner.scalar_aggregate_input_reduction,
+			Self::MembershipFirst => planner.membership_first_composition,
+			Self::SideLocalFilterRouting => planner.side_local_filter_routing,
+			Self::SemiFilteredReachableKeys => planner.semi_filtered_reachable_keys,
+			Self::OuterCountPreaggregation => planner.outer_count_preaggregation,
+		}
+	}
+
+	fn parse(
+		self,
+		raw: Result<String, std::env::VarError>,
+	) -> Result<(bool, &'static str), String> {
+		parse_gauge_bool(self.name(), raw, self.default())
+	}
+
+	fn from_environment(self) -> Result<(bool, &'static str), String> {
+		self.parse(std::env::var(self.name()))
+	}
+}
+
 /// The gauge's smaller-build placement setting and its provenance: unset means
 /// the engine default; "0"/"1" are explicit arms. Same loud contract as the
 /// budget knobs.
 pub fn gauge_hash_smaller_build() -> Result<(bool, &'static str), String> {
-	match std::env::var(GAUGE_HASH_SMALLER_BUILD_ENV) {
+	BooleanGauge::HashSmallerBuild.from_environment()
+}
+
+fn parse_gauge_bool(
+	name: &str,
+	raw: Result<String, std::env::VarError>,
+	default: bool,
+) -> Result<(bool, &'static str), String> {
+	match raw {
 		Ok(raw) => match raw.as_str() {
 			"0" => Ok((false, "explicit")),
 			"1" => Ok((true, "explicit")),
-			_ => Err(format!(
-				"{GAUGE_HASH_SMALLER_BUILD_ENV} must be \"0\" or \"1\", got {raw:?}"
-			)),
+			_ => Err(format!("{name} must be \"0\" or \"1\", got {raw:?}")),
 		},
-		Err(std::env::VarError::NotPresent) => Ok((
-			PlannerConfig::default().hash_smaller_build_placement,
-			"default",
-		)),
-		Err(error) => Err(format!("{GAUGE_HASH_SMALLER_BUILD_ENV}: {error}")),
+		Err(std::env::VarError::NotPresent) => Ok((default, "default")),
+		Err(error) => Err(format!("{name}: {error}")),
 	}
 }
 
@@ -4527,19 +4583,7 @@ pub const GAUGE_FILTERED_BUILD_SIDE_SWAP_ENV: &str = "TORON_TPCH_FILTERED_BUILD_
 /// the engine default; "0"/"1" are explicit arms. Same loud contract as the
 /// budget knobs.
 pub fn gauge_filtered_build_side_swap() -> Result<(bool, &'static str), String> {
-	match std::env::var(GAUGE_FILTERED_BUILD_SIDE_SWAP_ENV) {
-		Ok(raw) => match raw.as_str() {
-			"0" => Ok((false, "explicit")),
-			"1" => Ok((true, "explicit")),
-			_ => Err(format!(
-				"{GAUGE_FILTERED_BUILD_SIDE_SWAP_ENV} must be \"0\" or \"1\", got {raw:?}"
-			)),
-		},
-		Err(std::env::VarError::NotPresent) => {
-			Ok((PlannerConfig::default().filtered_build_side_swap, "default"))
-		}
-		Err(error) => Err(format!("{GAUGE_FILTERED_BUILD_SIDE_SWAP_ENV}: {error}")),
-	}
+	BooleanGauge::FilteredBuildSideSwap.from_environment()
 }
 
 pub const GAUGE_SCALAR_AGG_INPUT_REDUCTION_ENV: &str = "TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION";
@@ -4548,20 +4592,7 @@ pub const GAUGE_SCALAR_AGG_INPUT_REDUCTION_ENV: &str = "TORON_TPCH_SCALAR_AGG_IN
 /// provenance: unset means the engine default; "0"/"1" are explicit arms. Same
 /// loud contract as the budget knobs.
 pub fn gauge_scalar_agg_input_reduction() -> Result<(bool, &'static str), String> {
-	match std::env::var(GAUGE_SCALAR_AGG_INPUT_REDUCTION_ENV) {
-		Ok(raw) => match raw.as_str() {
-			"0" => Ok((false, "explicit")),
-			"1" => Ok((true, "explicit")),
-			_ => Err(format!(
-				"{GAUGE_SCALAR_AGG_INPUT_REDUCTION_ENV} must be \"0\" or \"1\", got {raw:?}"
-			)),
-		},
-		Err(std::env::VarError::NotPresent) => Ok((
-			PlannerConfig::default().scalar_aggregate_input_reduction,
-			"default",
-		)),
-		Err(error) => Err(format!("{GAUGE_SCALAR_AGG_INPUT_REDUCTION_ENV}: {error}")),
-	}
+	BooleanGauge::ScalarAggregateInputReduction.from_environment()
 }
 
 pub const GAUGE_MEMBERSHIP_FIRST_ENV: &str = "TORON_TPCH_MEMBERSHIP_FIRST";
@@ -4570,20 +4601,7 @@ pub const GAUGE_MEMBERSHIP_FIRST_ENV: &str = "TORON_TPCH_MEMBERSHIP_FIRST";
 /// means the engine default; "0"/"1" are explicit arms. Same loud contract as
 /// the budget knobs.
 pub fn gauge_membership_first() -> Result<(bool, &'static str), String> {
-	match std::env::var(GAUGE_MEMBERSHIP_FIRST_ENV) {
-		Ok(raw) => match raw.as_str() {
-			"0" => Ok((false, "explicit")),
-			"1" => Ok((true, "explicit")),
-			_ => Err(format!(
-				"{GAUGE_MEMBERSHIP_FIRST_ENV} must be \"0\" or \"1\", got {raw:?}"
-			)),
-		},
-		Err(std::env::VarError::NotPresent) => Ok((
-			PlannerConfig::default().membership_first_composition,
-			"default",
-		)),
-		Err(error) => Err(format!("{GAUGE_MEMBERSHIP_FIRST_ENV}: {error}")),
-	}
+	BooleanGauge::MembershipFirst.from_environment()
 }
 
 pub const GAUGE_SIDE_LOCAL_FILTER_ROUTING_ENV: &str = "TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING";
@@ -4592,20 +4610,7 @@ pub const GAUGE_SIDE_LOCAL_FILTER_ROUTING_ENV: &str = "TORON_TPCH_SIDE_LOCAL_FIL
 /// means the engine default; "0"/"1" are explicit arms. Same loud contract as
 /// the budget knobs.
 pub fn gauge_side_local_filter_routing() -> Result<(bool, &'static str), String> {
-	match std::env::var(GAUGE_SIDE_LOCAL_FILTER_ROUTING_ENV) {
-		Ok(raw) => match raw.as_str() {
-			"0" => Ok((false, "explicit")),
-			"1" => Ok((true, "explicit")),
-			_ => Err(format!(
-				"{GAUGE_SIDE_LOCAL_FILTER_ROUTING_ENV} must be \"0\" or \"1\", got {raw:?}"
-			)),
-		},
-		Err(std::env::VarError::NotPresent) => Ok((
-			PlannerConfig::default().side_local_filter_routing,
-			"default",
-		)),
-		Err(error) => Err(format!("{GAUGE_SIDE_LOCAL_FILTER_ROUTING_ENV}: {error}")),
-	}
+	BooleanGauge::SideLocalFilterRouting.from_environment()
 }
 
 pub const GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV: &str = "TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS";
@@ -4613,20 +4618,7 @@ pub const GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV: &str = "TORON_TPCH_SEMI_FILTER
 /// The gauge's membership-filtered reachable-key coverage setting and its
 /// provenance: unset means the engine default; "0"/"1" are explicit arms.
 pub fn gauge_semi_filtered_reachable_keys() -> Result<(bool, &'static str), String> {
-	match std::env::var(GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV) {
-		Ok(raw) => match raw.as_str() {
-			"0" => Ok((false, "explicit")),
-			"1" => Ok((true, "explicit")),
-			_ => Err(format!(
-				"{GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV} must be \"0\" or \"1\", got {raw:?}"
-			)),
-		},
-		Err(std::env::VarError::NotPresent) => Ok((
-			PlannerConfig::default().semi_filtered_reachable_keys,
-			"default",
-		)),
-		Err(error) => Err(format!("{GAUGE_SEMI_FILTERED_REACHABLE_KEYS_ENV}: {error}")),
-	}
+	BooleanGauge::SemiFilteredReachableKeys.from_environment()
 }
 
 pub const GAUGE_OUTER_COUNT_PREAGGREGATION_ENV: &str = "TORON_TPCH_OUTER_COUNT_PREAGGREGATION";
@@ -4634,20 +4626,7 @@ pub const GAUGE_OUTER_COUNT_PREAGGREGATION_ENV: &str = "TORON_TPCH_OUTER_COUNT_P
 /// The gauge's proven-key outer-count rewrite setting and provenance: unset
 /// means the compiled default; "0"/"1" are explicit measurement arms.
 pub fn gauge_outer_count_preaggregation() -> Result<(bool, &'static str), String> {
-	match std::env::var(GAUGE_OUTER_COUNT_PREAGGREGATION_ENV) {
-		Ok(raw) => match raw.as_str() {
-			"0" => Ok((false, "explicit")),
-			"1" => Ok((true, "explicit")),
-			_ => Err(format!(
-				"{GAUGE_OUTER_COUNT_PREAGGREGATION_ENV} must be \"0\" or \"1\", got {raw:?}"
-			)),
-		},
-		Err(std::env::VarError::NotPresent) => Ok((
-			PlannerConfig::default().outer_count_preaggregation,
-			"default",
-		)),
-		Err(error) => Err(format!("{GAUGE_OUTER_COUNT_PREAGGREGATION_ENV}: {error}")),
-	}
+	BooleanGauge::OuterCountPreaggregation.from_environment()
 }
 
 /// Every gauge bind flows through this constructor so the knob cannot be
@@ -4782,7 +4761,7 @@ pub fn gauge_spill_bytes_reserved() -> Result<(u64, &'static str), String> {
 }
 
 #[cfg(test)]
-mod gauge_byte_budget_tests {
+mod gauge_value_tests {
 	use super::*;
 
 	#[test]
@@ -4814,6 +4793,58 @@ mod gauge_byte_budget_tests {
 				)
 				.is_err()
 			);
+		}
+	}
+
+	#[test]
+	fn boolean_gauge_specs_parse_without_mutating_process_environment() {
+		for gauge in [
+			BooleanGauge::HashSmallerBuild,
+			BooleanGauge::FilteredBuildSideSwap,
+			BooleanGauge::ScalarAggregateInputReduction,
+			BooleanGauge::MembershipFirst,
+			BooleanGauge::SideLocalFilterRouting,
+			BooleanGauge::SemiFilteredReachableKeys,
+			BooleanGauge::OuterCountPreaggregation,
+		] {
+			assert_eq!(
+				gauge.parse(Err(std::env::VarError::NotPresent)).unwrap(),
+				(gauge.default(), "default"),
+				"{} default",
+				gauge.name()
+			);
+			assert_eq!(
+				gauge.parse(Ok("0".to_string())).unwrap(),
+				(false, "explicit"),
+				"{} disabled arm",
+				gauge.name()
+			);
+			assert_eq!(
+				gauge.parse(Ok("1".to_string())).unwrap(),
+				(true, "explicit"),
+				"{} enabled arm",
+				gauge.name()
+			);
+			assert!(
+				gauge.parse(Ok("yes".to_string())).is_err(),
+				"{} malformed arm",
+				gauge.name()
+			);
+		}
+	}
+
+	#[test]
+	fn partition_work_concurrency_parses_without_mutating_process_environment() {
+		assert_eq!(
+			parse_partition_work_concurrency(Err(std::env::VarError::NotPresent), 3).unwrap(),
+			(3, "default")
+		);
+		assert_eq!(
+			parse_partition_work_concurrency(Ok("8".to_string()), 3).unwrap(),
+			(8, "explicit")
+		);
+		for invalid in ["0", "many"] {
+			assert!(parse_partition_work_concurrency(Ok(invalid.to_string()), 3).is_err());
 		}
 	}
 }

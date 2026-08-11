@@ -1404,8 +1404,7 @@ struct GaugeBudget {
 impl GaugeBudget {
 	fn from_environment() -> Result<Self, String> {
 		let (memory_per_task, memory_per_task_provenance) = gauge_memory_per_task()?;
-		let (spill_bytes_reserved, spill_bytes_reserved_provenance) =
-			gauge_spill_bytes_reserved()?;
+		let (spill_bytes_reserved, spill_bytes_reserved_provenance) = gauge_spill_bytes_reserved()?;
 		Ok(Self {
 			memory_per_task,
 			memory_per_task_provenance,
@@ -2649,15 +2648,15 @@ fn perf_stub_row(stub: PerfStubRow<'_>) -> serde_json::Value {
 /// ADR 473: engine thread count is a first-class ladder condition — a comparison
 /// that does not record it is not a roofline.
 fn duckdb_thread_setting() -> Option<String> {
-	std::env::var("TORON_TPCH_DUCKDB_THREADS")
-		.ok()
-		.filter(|value| !value.is_empty())
+	reference_thread_setting(std::env::var("TORON_TPCH_DUCKDB_THREADS"))
 }
 
 fn polars_max_threads_setting() -> Option<String> {
-	std::env::var("POLARS_MAX_THREADS")
-		.ok()
-		.filter(|value| !value.is_empty())
+	reference_thread_setting(std::env::var("POLARS_MAX_THREADS"))
+}
+
+fn reference_thread_setting(raw: Result<String, std::env::VarError>) -> Option<String> {
+	raw.ok().filter(|value| !value.is_empty())
 }
 
 /// Observational record of the reference-engine thread pins a perf row ran
@@ -5539,10 +5538,10 @@ mod tests {
 				1,
 				"fnv1a64:cohort",
 				&test_paired_switch(),
-					PairedGate::PlanDistinct,
-					None,
-					budget,
-				)
+				PairedGate::PlanDistinct,
+				None,
+				budget,
+			)
 			.is_err()
 		);
 		// ADR 456: a resume across different budget coordinates is a regime mix
@@ -5564,11 +5563,11 @@ mod tests {
 				1,
 				"fnv1a64:cohort",
 				&test_paired_switch(),
-					PairedGate::PlanDistinct,
-					None,
-					different_budget,
-				)
-				.is_err()
+				PairedGate::PlanDistinct,
+				None,
+				different_budget,
+			)
+			.is_err()
 		);
 		// ADR 452: a regenerated dataset at the same path must refuse to resume,
 		// and an empty fingerprint (no verified dataset) must never launch.
@@ -5584,10 +5583,10 @@ mod tests {
 				1,
 				"fnv1a64:regenerated",
 				&test_paired_switch(),
-					PairedGate::PlanDistinct,
-					None,
-					budget,
-				)
+				PairedGate::PlanDistinct,
+				None,
+				budget,
+			)
 			.is_err()
 		);
 		assert!(
@@ -5602,10 +5601,10 @@ mod tests {
 				1,
 				"",
 				&test_paired_switch(),
-					PairedGate::PlanDistinct,
-					None,
-					budget,
-				)
+				PairedGate::PlanDistinct,
+				None,
+				budget,
+			)
 			.is_err()
 		);
 		std::fs::remove_dir_all(directory).unwrap();
@@ -5646,10 +5645,10 @@ mod tests {
 				1,
 				"fnv1a64:shape",
 				&shape_switch,
-					PairedGate::PlanDistinct,
-					None,
-					budget,
-				)
+				PairedGate::PlanDistinct,
+				None,
+				budget,
+			)
 			.is_err(),
 			"resume must reject a paired-gate mismatch"
 		);
@@ -5665,10 +5664,10 @@ mod tests {
 				1,
 				"fnv1a64:shape",
 				&shape_switch,
-					PairedGate::ShapePreservingSpillIndex,
-					Some(3_555.0),
-					budget,
-				)
+				PairedGate::ShapePreservingSpillIndex,
+				Some(3_555.0),
+				budget,
+			)
 			.is_err(),
 			"resume must reject a fixed-floor mismatch"
 		);
@@ -5827,19 +5826,7 @@ mod tests {
 	}
 
 	#[test]
-	fn adr527_partition_work_pin_is_loud_and_rows_name_requested_concurrency() {
-		// SAFETY: this gate suite runs with --test-threads=1.
-		unsafe { std::env::remove_var("TORON_PARTITION_PARALLELISM") };
-		let (default_value, default_provenance) =
-			gauge_partition_work_concurrency_requested().expect("default partition-work pin");
-		assert!(default_value > 0);
-		assert_eq!(default_provenance, "default");
-
-		unsafe { std::env::set_var("TORON_PARTITION_PARALLELISM", "8") };
-		assert_eq!(
-			gauge_partition_work_concurrency_requested().expect("explicit partition-work pin"),
-			(8, "explicit")
-		);
+	fn adr527_rows_name_requested_partition_work_concurrency() {
 		let mut toron_row = serde_json::json!({});
 		add_partition_work_concurrency_fields(&mut toron_row, Some((8, "explicit")));
 		assert_eq!(toron_row["partition_work_concurrency_requested"], 8);
@@ -5852,12 +5839,6 @@ mod tests {
 		add_partition_work_concurrency_fields(&mut peer_row, None);
 		assert!(peer_row["partition_work_concurrency_requested"].is_null());
 		assert!(peer_row["partition_work_concurrency_requested_provenance"].is_null());
-
-		unsafe { std::env::set_var("TORON_PARTITION_PARALLELISM", "0") };
-		assert!(gauge_partition_work_concurrency_requested().is_err());
-		unsafe { std::env::set_var("TORON_PARTITION_PARALLELISM", "many") };
-		assert!(gauge_partition_work_concurrency_requested().is_err());
-		unsafe { std::env::remove_var("TORON_PARTITION_PARALLELISM") };
 	}
 
 	#[test]
@@ -6566,116 +6547,37 @@ mod tests {
 }
 #[cfg(test)]
 mod adr469_tests {
-	use super::*;
-
 	#[test]
 	fn adr469_hash_smaller_build_knob_contract() {
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::remove_var("TORON_TPCH_HASH_SMALLER_BUILD") };
-		assert_eq!(gauge_hash_smaller_build().unwrap(), (true, "default"));
-		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "0") };
-		assert_eq!(gauge_hash_smaller_build().unwrap(), (false, "explicit"));
-		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "1") };
-		assert_eq!(gauge_hash_smaller_build().unwrap(), (true, "explicit"));
-		unsafe { std::env::set_var("TORON_TPCH_HASH_SMALLER_BUILD", "yes") };
-		assert!(gauge_hash_smaller_build().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_HASH_SMALLER_BUILD") };
+		assert!(toron::binder::PlannerConfig::default().hash_smaller_build_placement);
 	}
 }
 #[cfg(test)]
 mod adr511_tests {
-	use super::*;
-
 	#[test]
 	fn adr511_filtered_build_side_swap_knob_contract() {
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::remove_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP") };
-		assert_eq!(gauge_filtered_build_side_swap().unwrap(), (true, "default"));
-		unsafe { std::env::set_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP", "1") };
-		assert_eq!(
-			gauge_filtered_build_side_swap().unwrap(),
-			(true, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP", "0") };
-		assert_eq!(
-			gauge_filtered_build_side_swap().unwrap(),
-			(false, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP", "yes") };
-		assert!(gauge_filtered_build_side_swap().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_FILTERED_BUILD_SIDE_SWAP") };
+		assert!(toron::binder::PlannerConfig::default().filtered_build_side_swap);
 	}
 }
 #[cfg(test)]
 mod adr512_tests {
-	use super::*;
-
 	#[test]
 	fn adr512_scalar_agg_input_reduction_knob_contract() {
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::remove_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION") };
-		assert_eq!(
-			gauge_scalar_agg_input_reduction().unwrap(),
-			(true, "default")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION", "1") };
-		assert_eq!(
-			gauge_scalar_agg_input_reduction().unwrap(),
-			(true, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION", "0") };
-		assert_eq!(
-			gauge_scalar_agg_input_reduction().unwrap(),
-			(false, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION", "yes") };
-		assert!(gauge_scalar_agg_input_reduction().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_SCALAR_AGG_INPUT_REDUCTION") };
+		assert!(toron::binder::PlannerConfig::default().scalar_aggregate_input_reduction);
 	}
 }
 #[cfg(test)]
 mod adr515_tests {
-	use super::*;
-
 	#[test]
 	fn adr515_membership_first_knob_contract() {
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::remove_var("TORON_TPCH_MEMBERSHIP_FIRST") };
-		assert_eq!(gauge_membership_first().unwrap(), (true, "default"));
-		unsafe { std::env::set_var("TORON_TPCH_MEMBERSHIP_FIRST", "1") };
-		assert_eq!(gauge_membership_first().unwrap(), (true, "explicit"));
-		unsafe { std::env::set_var("TORON_TPCH_MEMBERSHIP_FIRST", "0") };
-		assert_eq!(gauge_membership_first().unwrap(), (false, "explicit"));
-		unsafe { std::env::set_var("TORON_TPCH_MEMBERSHIP_FIRST", "yes") };
-		assert!(gauge_membership_first().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_MEMBERSHIP_FIRST") };
+		assert!(toron::binder::PlannerConfig::default().membership_first_composition);
 	}
 }
 #[cfg(test)]
 mod adr517_tests {
-	use super::*;
-
 	#[test]
 	fn adr517_side_local_filter_routing_knob_contract() {
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::remove_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING") };
-		assert_eq!(
-			gauge_side_local_filter_routing().unwrap(),
-			(true, "default")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING", "1") };
-		assert_eq!(
-			gauge_side_local_filter_routing().unwrap(),
-			(true, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING", "0") };
-		assert_eq!(
-			gauge_side_local_filter_routing().unwrap(),
-			(false, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING", "yes") };
-		assert!(gauge_side_local_filter_routing().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_SIDE_LOCAL_FILTER_ROUTING") };
+		assert!(toron::binder::PlannerConfig::default().side_local_filter_routing);
 	}
 }
 #[cfg(test)]
@@ -6684,80 +6586,27 @@ mod adr518_tests {
 
 	#[test]
 	fn reference_thread_pins_are_observational() {
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::remove_var("TORON_TPCH_DUCKDB_THREADS") };
-		unsafe { std::env::remove_var("POLARS_MAX_THREADS") };
-		assert_eq!(duckdb_thread_setting(), None);
-		assert_eq!(polars_max_threads_setting(), None);
-		assert_eq!(
-			reference_thread_pin_provenance(&duckdb_thread_setting()),
-			"engine_default"
-		);
-		unsafe { std::env::set_var("TORON_TPCH_DUCKDB_THREADS", "1") };
-		unsafe { std::env::set_var("POLARS_MAX_THREADS", "1") };
-		assert_eq!(duckdb_thread_setting().as_deref(), Some("1"));
-		assert_eq!(polars_max_threads_setting().as_deref(), Some("1"));
-		assert_eq!(
-			reference_thread_pin_provenance(&duckdb_thread_setting()),
-			"explicit"
-		);
-		assert_eq!(
-			reference_thread_pin_provenance(&polars_max_threads_setting()),
-			"explicit"
-		);
-		unsafe { std::env::remove_var("TORON_TPCH_DUCKDB_THREADS") };
-		unsafe { std::env::remove_var("POLARS_MAX_THREADS") };
+		let absent = reference_thread_setting(Err(std::env::VarError::NotPresent));
+		let explicit = reference_thread_setting(Ok("1".to_string()));
+		let empty = reference_thread_setting(Ok(String::new()));
+		assert_eq!(absent, None);
+		assert_eq!(empty, None);
+		assert_eq!(explicit.as_deref(), Some("1"));
+		assert_eq!(reference_thread_pin_provenance(&absent), "engine_default");
+		assert_eq!(reference_thread_pin_provenance(&explicit), "explicit");
 	}
 
 	#[test]
 	fn adr518_semi_filtered_reachable_keys_knob_contract() {
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::remove_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS") };
-		assert_eq!(
-			gauge_semi_filtered_reachable_keys().unwrap(),
-			(true, "default")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS", "1") };
-		assert_eq!(
-			gauge_semi_filtered_reachable_keys().unwrap(),
-			(true, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS", "0") };
-		assert_eq!(
-			gauge_semi_filtered_reachable_keys().unwrap(),
-			(false, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS", "yes") };
-		assert!(gauge_semi_filtered_reachable_keys().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_SEMI_FILTERED_REACHABLE_KEYS") };
+		assert!(toron::binder::PlannerConfig::default().semi_filtered_reachable_keys);
 	}
 }
 
 #[cfg(test)]
 mod adr521_tests {
-	use super::*;
-
 	#[test]
 	fn adr521_outer_count_preaggregation_knob_contract() {
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::remove_var("TORON_TPCH_OUTER_COUNT_PREAGGREGATION") };
-		assert_eq!(
-			gauge_outer_count_preaggregation().unwrap(),
-			(true, "default")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_OUTER_COUNT_PREAGGREGATION", "1") };
-		assert_eq!(
-			gauge_outer_count_preaggregation().unwrap(),
-			(true, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_OUTER_COUNT_PREAGGREGATION", "0") };
-		assert_eq!(
-			gauge_outer_count_preaggregation().unwrap(),
-			(false, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_OUTER_COUNT_PREAGGREGATION", "yes") };
-		assert!(gauge_outer_count_preaggregation().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_OUTER_COUNT_PREAGGREGATION") };
+		assert!(toron::binder::PlannerConfig::default().outer_count_preaggregation);
 	}
 }
 

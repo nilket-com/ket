@@ -9,6 +9,21 @@ fn source(relative: &str) -> String {
 }
 
 #[test]
+fn tpch_tests_never_mutate_process_environment() {
+	for relative in ["src/lib.rs", "src/main.rs", "src/telemetry.rs"] {
+		let contents = source(relative);
+		for mutation in ["set_var(", "remove_var("] {
+			assert!(
+				!contents.contains(mutation),
+				"{relative} reintroduced process-global test mutation through {mutation}"
+			);
+		}
+	}
+	assert!(source("src/lib.rs").contains("fn parse_gauge_bool("));
+	assert!(source("src/main.rs").contains("fn reference_thread_setting("));
+}
+
+#[test]
 fn adr261_tpch_helper_is_not_a_toron_library_dependency() {
 	let toron_manifest = source("../toron/Cargo.toml");
 	assert!(
