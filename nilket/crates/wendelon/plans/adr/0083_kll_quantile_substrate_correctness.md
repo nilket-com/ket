@@ -202,14 +202,35 @@ than extrapolating it.
 
 The retained-item bound is `7k+1`: at most `4k` across the top equal-capacity
 levels, at most `3k` across the geometrically decreasing lower levels for
-`c=2/3`, and one sampler item. The remaining product choice is ε, with its cost
-visible:
+`c=2/3`, and one sampler item. **This record selects ε=1%, hence `k=800` and
+at most 5,601 retained items per sketch.** The rejected alternatives and their
+price are retained for comparison:
 
 | ε | k | retained-item bound |
 | ---: | ---: | ---: |
 | 0.5% | 1,600 | 11,201 |
 | 1% | 800 | 5,601 |
 | 2% | 400 | 2,801 |
+
+At eight bytes per canonical value, the selected retained payload is at most
+44,808 bytes (43.8 KiB) per sketch and 43.8 MiB across the 1,024-state execution
+cap. That is about 68% of Toron's default 64 MiB task budget before level,
+sampler, hash-table, key and batch overhead, leaving roughly 20 MiB of payload
+headroom. Four-byte Int32 and Float32 values use 22,404 bytes (21.9 KiB) per
+sketch and 21.9 MiB at the cap. Accounting is therefore width-aware rather than
+charging every accepted type as eight bytes.
+
+The 1,024 count ceiling and 64 MiB default are coupled operationally even though
+they are enforced independently: increasing the count ceiling requires
+re-deriving the execution confidence and demonstrating that the default budget
+still admits the intended workload. Byte headroom never authorizes state 1,025,
+and count headroom never authorizes a state whose bytes do not fit.
+
+ε=0.5% is rejected for this cut because its 87.5 MiB retained payload cannot fit
+the default task budget even before non-sketch state. ε=2% fits cheaply but gives
+quartile edges ±2 rank points on the 25-point q1-to-median separation, visible
+as box-edge jitter in ADR 547's motivating use case. The selected 1% is the
+middle contract, not an inherited default.
 
 No lone rank-error number ships. Aggregate execution carries ε together with
 the execution-wide confidence and state-cap contract. CSB v2 must pin its own
@@ -389,13 +410,12 @@ path looks correct.
 
 Retained canonical values use contiguous fixed-width storage per level, not
 `Vec<Vec<u8>>`. The supported quantile families are four- or eight-byte values;
-storing each as one fixed eight-byte slot makes the largest candidate payload
-about 90 KiB at ε=0.5%, 45 KiB at ε=1%, and 23 KiB at ε=2%, before level,
-sampler and seed metadata. A `Vec<Vec<u8>>` representation would add an outer
-vector object and a separate allocation per retained item, turning thousands of
-group states into hundreds of megabytes or gigabytes before useful data. The
-byte bound charges actual capacities for every level and the sampler, not only
-logical item counts.
+the selected ε=1% payload is at most 43.8 KiB for eight-byte values and 21.9 KiB
+for four-byte values, before level, sampler and seed metadata. A
+`Vec<Vec<u8>>` representation would add an outer vector object and a separate
+allocation per retained item, turning thousands of group states into hundreds
+of megabytes or gigabytes before useful data. The byte bound charges actual
+capacities for every level and the sampler, not only logical item counts.
 
 Toron ADR 546 currently promises "at most k values plus fixed metadata". That is
 false under either candidate: mergeable KLL retains a capacity schedule of
@@ -411,10 +431,10 @@ pin one compaction schedule and over-specify the algorithm.
 
 ## Stage 0
 
-1. **Choose ε with its price visible.** Decision 3 pins the conservative
-   derivation, confidence scope, state cap and schedule. Select 0.5%, 1% or 2%
-   only after accepting the corresponding per-state retained and byte costs in
-   its table. No implementation starts with ε still implicit.
+1. **Choose ε with its price visible — discharged.** Decision 3 selects 1% after
+   recording the 0.5%, 1% and 2% per-state costs. The implementation pins
+   `k=800`, retained items ≤5,601, and width-aware byte accounting; no hidden
+   configuration may substitute another ε.
 2. **The ordered multi-block fact measurement.** Build a
    `ColumnRangeDistributionFact` over an ordered column spanning several CSB
    blocks, through the real persist-and-merge path, and compare its buckets to

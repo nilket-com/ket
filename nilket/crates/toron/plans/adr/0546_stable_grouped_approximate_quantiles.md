@@ -226,6 +226,10 @@ exhausted; that only makes ADR 83's execution-wide union bound more
 conservative. Inferring the state count from the byte budget is forbidden,
 because the admitted count would then vary with physical value width and heap
 layout while the advertised confidence continued to assume a fixed maximum.
+This is a user-visible product limit: a grouped percentile query supports at
+most 1,024 distinct `(group, value expression)` populations per execution in
+this cut. Three requested quartiles over one population still consume one state,
+not three.
 
 If admitting another group or growing its sketch exceeds the budget, execution
 refuses through the existing typed aggregate-memory path. The implementation
@@ -387,6 +391,13 @@ quantile, `MEDIAN` alias, or window-function form enters this record.
 Toron gains stable, bounded percentile reporting across global and grouped
 queries, with one algorithm and one advertised rank error. The feature is useful
 without plotting and gives the next record quartile values it can trust.
+
+ADR 83 selects ε=1%. At the 1,024-state ceiling, retained quantile payload alone
+is at most 43.8 MiB for Int64/Float64 and 21.9 MiB for Int32/Float32. The former
+is about 68% of the default 64 MiB task budget before grouped hash-table, key,
+batch and sketch metadata. Operators should expect byte-budget refusal below
+1,024 for wide or otherwise memory-heavy grouped queries; that does not move the
+independent count boundary or weaken the execution-wide confidence claim.
 
 Nothing in this record authorizes a range-whisker/no-outlier box plot. Partial
 delivery is progress for Toron users, but it is not a green light for that
