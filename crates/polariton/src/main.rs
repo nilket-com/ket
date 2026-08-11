@@ -12,6 +12,7 @@ mod result_registry;
 mod rune_host;
 #[cfg(feature = "toron")]
 mod rune_relation_envelope;
+mod rune_view;
 #[cfg(feature = "toron")]
 mod session_persistence;
 

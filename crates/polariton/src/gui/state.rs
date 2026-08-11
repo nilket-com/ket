@@ -9,34 +9,33 @@ use crate::editor::{CodeEditor, MarkdownCellExecution};
 use crate::fonts::DEJAVU_SANS_MONO;
 #[cfg(all(test, feature = "toron"))]
 use crate::gui::table_skin::TableSkin;
-#[cfg(test)]
+#[cfg(all(test, feature = "toron"))]
 use crate::gui::table_skin::TableSkinProjectionError;
 #[cfg(feature = "toron")]
 use crate::gui::table_skin::{TableSkinCascade, TableSkinProjection, TableSkinSpec};
 use crate::gui::{
 	components,
-	dashboard::{DashboardEffect, DashboardMsg, DashboardState},
 	menu::MenuState,
 	messages::{ExportFormat, Message},
-	pane_grid::{self, Axis, PaneId, State as PaneState},
 };
 #[cfg(feature = "toron")]
 use crate::plot::chrome::PlotChrome;
 #[cfg(feature = "toron")]
 use crate::plot::common::{PlotLayout, TickPlacementError};
-use crate::plot::composition::PlotComposition;
 #[cfg(feature = "toron")]
 use crate::plot::core::PlotType;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
+use crate::plot::factory::create_plot;
 #[cfg(feature = "toron")]
-use crate::plot::factory::create_layered_plot;
-use crate::plot::factory::{create_plot, create_styled_plot};
+use crate::plot::factory::{create_layered_plot, create_styled_plot};
 #[cfg(feature = "toron")]
 use crate::plot::grid::{PlotGrid, PlotGridKernel};
 #[cfg(feature = "toron")]
 use crate::plot::request::plan_with_categorical_palette;
+#[cfg(feature = "toron")]
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::request::{ResolvedPlot, plan};
+#[cfg(feature = "toron")]
 use crate::plot::spec::AuthoredPlotSpec;
 #[cfg(feature = "toron")]
 use crate::plot::spec::{
@@ -44,22 +43,24 @@ use crate::plot::spec::{
 	resolve_channels, resolve_layered_channels,
 };
 #[cfg(feature = "toron")]
-use crate::plot::theme::{PlotSettings, PlotSettingsLayer};
+use crate::plot::theme::PlotSettings;
+use crate::plot::theme::PlotSettingsLayer;
 use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	LocalViewIdentity, PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans,
-	RunePlotMinorTickSpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
-	RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
-	StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView, ViewPresentation,
-	transform as transform_rune_view,
+	PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans, RunePlotMinorTickSpans,
+	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
+	RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink,
+	TransformedRuneRelation, TransformedRuneView, transform as transform_rune_view,
 };
-use iced::{Element, Size, Subscription, Task, application, event, keyboard, time, window};
+use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+use iced::{Element, Size, Subscription, Task, application, event, keyboard, window};
 use libaryon::core::{BufferId, SessionId};
 #[cfg(feature = "toron")]
 use libaryon::core::{SavedSession, SessionStore, Writable};
 use libaryon::uast::projection::MarkdownCellOutputTarget;
+#[cfg(feature = "toron")]
 use polars::frame::DataFrame;
 use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "toron")]
@@ -69,10 +70,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 struct AppState {
-	dashboard: DashboardState,
 	menu_state: MenuState,
 	code_editor: CodeEditor,
-	data_frame: DataFrame,
 	status_msg: String,
 	status_error: String,
 	status_df_size: Option<(usize, usize)>,
@@ -86,7 +85,6 @@ struct AppState {
 	show_column_types: bool,
 	window_size: Size,
 	result_registry: ResultRegistry,
-	rune_plot_panes: HashMap<BufferId, PaneId>,
 	rune_buffer_revisions: HashMap<BufferId, u64>,
 	#[cfg(feature = "toron")]
 	rune_view_scheduler: RuneViewScheduler,
@@ -210,42 +208,6 @@ fn resolve_startup(target: StartupTarget) -> std::result::Result<StartupAuthorit
 	}
 }
 
-fn build_plot_task(
-	df: DataFrame,
-	composition: PlotComposition,
-	on_ready: impl FnOnce(
-		std::result::Result<
-			std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
-			String,
-		>,
-	) -> Message
-	+ Send
-	+ 'static,
-) -> Task<Message> {
-	Task::perform(
-		async move {
-			tokio::task::spawn_blocking(move || {
-				let resolved = plan(PlotRequest {
-					source: PlotSource::Materialized {
-						name: "current result".to_owned(),
-						data: std::sync::Arc::new(df),
-					},
-					authored_spec: AuthoredPlotSpec::automatic(composition),
-				})?;
-				Ok(create_plot(
-					&resolved.resolved_spec,
-					&resolved.data,
-					1200,
-					1200,
-				))
-			})
-			.await
-			.map_err(|error| format!("plot build task panicked: {error}"))?
-		},
-		on_ready,
-	)
-}
-
 /// Build a planned Rune plot without blocking Iced's update loop. Keeping the
 /// resolved product intact through the task preserves its composition and
 /// owned snapshot until the destination surface receives it.
@@ -271,6 +233,81 @@ fn build_resolved_plot_task(
 		},
 		move |(resolved, kernel)| on_ready(resolved, kernel),
 	)
+}
+
+enum RenderedPlotExport {
+	Svg(String),
+	Png(PngBackend),
+	Avif(AvifBackend),
+}
+
+struct PlotExportJob {
+	filename: String,
+	artifact: RenderedPlotExport,
+}
+
+impl PlotExportJob {
+	fn write_to(self, root: &std::path::Path) {
+		let path = root.join(self.filename);
+		match self.artifact {
+			RenderedPlotExport::Svg(svg) => {
+				let _ = std::fs::write(path, svg);
+			}
+			RenderedPlotExport::Png(backend) => backend.save(&path),
+			RenderedPlotExport::Avif(backend) => backend.save(&path),
+		}
+	}
+}
+
+fn render_plot_export(
+	snapshot: crate::editor::HostPlotExport,
+	format: ExportFormat,
+	ordinal: usize,
+) -> PlotExportJob {
+	let width = snapshot.width;
+	let height = snapshot.height;
+	let bounds = iced::Rectangle {
+		x: 0.0,
+		y: 0.0,
+		width,
+		height,
+	};
+	let widget = crate::plot::common::PlotWidget {
+		kernel: snapshot.kernel.as_ref(),
+		title: snapshot.title,
+		padding: 20.0,
+		settings: snapshot.settings,
+		settings_model: snapshot.settings_model,
+		render_revision: snapshot.render_revision,
+		resize_render_suspended: snapshot.resize_render_suspended,
+		layer: crate::plot::common::PlotRenderLayer::Full,
+	};
+	match format {
+		ExportFormat::SVG => {
+			let mut backend = SvgBackend::new(width, height);
+			widget.render(&mut backend, bounds);
+			PlotExportJob {
+				filename: format!("plot_{ordinal}.svg"),
+				artifact: RenderedPlotExport::Svg(backend.finish()),
+			}
+		}
+		ExportFormat::PNG => {
+			let mut backend = PngBackend::new(width as u32, height as u32);
+			widget.render(&mut backend, bounds);
+			PlotExportJob {
+				filename: format!("plot_{ordinal}.png"),
+				artifact: RenderedPlotExport::Png(backend),
+			}
+		}
+		ExportFormat::AVIF => {
+			let mut backend = AvifBackend::new(width as u32, height as u32);
+			widget.render(&mut backend, bounds);
+			PlotExportJob {
+				filename: format!("plot_{ordinal}.avif"),
+				artifact: RenderedPlotExport::Avif(backend),
+			}
+		}
+	}
 }
 
 #[cfg(feature = "toron")]
@@ -378,55 +415,11 @@ fn subscription(state: &AppState) -> Subscription<Message> {
 		}
 		_ => None,
 	});
-	let resize_tick = if state.dashboard.resize_freeze_until().is_some() {
-		time::every(Duration::from_millis(75))
-			.map(|_| Message::Dashboard(DashboardMsg::ResizeSettled))
-	} else {
-		Subscription::none()
-	};
 	Subscription::batch([
 		events,
-		resize_tick,
 		state.code_editor.subscription().map(Message::CodeEditEvent),
 		window::resize_events().map(|(_, size)| Message::CodeEditResize(size)),
 	])
-}
-
-fn run_dashboard_message(app_state: &mut AppState, message: DashboardMsg) -> Task<Message> {
-	if matches!(&message, DashboardMsg::AddPlot(_)) {
-		// Plot creation is the user-facing entry point for the nested dashboard.
-		// Its pixels remain Polariton's, while Baryon owns the workspace pane.
-		app_state.code_editor.open_dashboard();
-	}
-	match app_state.dashboard.update(message) {
-		DashboardEffect::None => Task::none(),
-		DashboardEffect::BuildNewPlot { composition } => {
-			app_state.status_msg =
-				format!("Generating {} plot...", composition.primary_plot_type());
-			build_plot_task(
-				app_state.data_frame.clone(),
-				composition.clone(),
-				move |result| Message::DashboardPlotBuilt {
-					pane: None,
-					composition,
-					result,
-				},
-			)
-		}
-		DashboardEffect::RebuildPlot { pane, composition } => {
-			app_state.status_msg =
-				format!("Generating {} plot...", composition.primary_plot_type());
-			build_plot_task(
-				app_state.data_frame.clone(),
-				composition.clone(),
-				move |result| Message::DashboardPlotBuilt {
-					pane: Some(pane),
-					composition,
-					result,
-				},
-			)
-		}
-	}
 }
 
 pub fn run(startup_data: StartupData, target: StartupTarget) -> Result {
@@ -483,7 +476,6 @@ fn new_with_authority(
 		.map(|_| "init.rn · configuration failed".to_owned())
 		.unwrap_or_default();
 	let init_detail = init_error.map(|error| StatusDetail::new(init_summary.clone(), error));
-	let data_frame = DataFrame::default();
 	let init_script = configuration::default_init_path();
 	let workspace_size = workspace_bounds(window_size).size();
 	let (mut code_editor, session_id) = match authority {
@@ -505,10 +497,8 @@ fn new_with_authority(
 	};
 	code_editor.set_show_column_types(startup_data.show_column_types);
 	let mut state = AppState {
-		dashboard: DashboardState::default(),
 		menu_state: MenuState::default(),
 		code_editor,
-		data_frame,
 		status_msg: "".to_string(),
 		status_error: init_summary,
 		status_df_size: None,
@@ -522,7 +512,6 @@ fn new_with_authority(
 		show_column_types: startup_data.show_column_types,
 		window_size,
 		result_registry: ResultRegistry::default(),
-		rune_plot_panes: HashMap::new(),
 		rune_buffer_revisions: HashMap::new(),
 		#[cfg(feature = "toron")]
 		rune_view_scheduler: RuneViewScheduler::default(),
@@ -566,7 +555,6 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		(detail.summary == *visible_summary).then_some(detail)
 	});
 	components::main_screen(
-		&app_state.dashboard,
 		&app_state.menu_state,
 		&app_state.code_editor,
 		&app_state.status_msg,
@@ -1957,28 +1945,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		return Task::none();
 	}
 	match message {
-		Message::Dashboard(message) => {
-			return run_dashboard_message(app_state, message);
-		}
-		Message::DashboardPlotBuilt {
-			pane,
-			composition,
-			result,
-		} => match result {
-			Ok(kernel) => {
-				app_state.status_error.clear();
-				app_state.status_msg = format!("{} plot ready", composition.title());
-				let _ = app_state.dashboard.update(DashboardMsg::PlotKernelReady {
-					pane,
-					composition,
-					kernel,
-				});
-			}
-			Err(error) => {
-				app_state.status_msg.clear();
-				app_state.status_error = format!("Plot specification failed: {error}");
-			}
-		},
 		Message::ToggleStatusDetail => {
 			if app_state.status_detail.is_some() {
 				app_state.status_detail_open = !app_state.status_detail_open;
@@ -2078,9 +2044,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::DragWindow => {
 			return window::latest().and_then(window::drag);
-		}
-		Message::CodeEditEvent(crate::editor::EditorMsg::Dashboard(message)) => {
-			return run_dashboard_message(app_state, message);
 		}
 		Message::CodeEditEvent(edit_event) => {
 			clear_transient_execution_status_on_editor_activity(app_state, &edit_event);
@@ -2396,7 +2359,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					let cols = df.width();
 					app_state.code_editor.begin_query();
 					app_state.code_editor.set_query_result(df.clone());
-					app_state.data_frame = df;
 					app_state.status_df_size = Some((rows, cols));
 					set_sql_status(
 						app_state,
@@ -2431,6 +2393,25 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.unwrap_or_else(|| "Rune finished.".to_owned()),
 					);
 					if let Some(resolved) = outcome.plot {
+						let (panel_id, display_label) = {
+							let identity = LocalViewIdentity::Anonymous(0);
+							let display_label = resolved.resolved_spec.composition.title();
+							let presentation = ViewPresentation {
+								content_kind: ViewContentKind::Plot,
+								display_label: display_label.clone(),
+								authored_title: crate::plot::spec::Presence::Inherit,
+							};
+							app_state.code_editor.prepare_rune_view_panels(
+								source_buffer,
+								&[(identity.clone(), presentation)],
+								revision,
+							);
+							let panel_id = app_state
+								.code_editor
+								.rune_view_panel_id(source_buffer, &identity)
+								.expect("plain Rune output has a prepared anonymous host panel");
+							(panel_id, display_label)
+						};
 						app_state.status_msg =
 							format!("Building plot from {}…", resolved.source_name);
 						return build_resolved_plot_task(
@@ -2439,14 +2420,24 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							move |resolved, kernel| Message::RuneBufferPlotReady {
 								source_buffer,
 								revision,
+								panel_id,
+								display_label,
 								resolved,
 								kernel,
 							},
 						);
 					}
+					app_state.code_editor.prepare_rune_view_panels(
+						source_buffer,
+						&[] as &[(LocalViewIdentity, ViewPresentation)],
+						revision,
+					);
 					app_state.status_msg = "Rune finished.".to_owned();
 				}
 				Err(message) => {
+					app_state
+						.code_editor
+						.mark_rune_view_producer_stale(source_buffer);
 					set_rune_error(app_state, message);
 				}
 			}
@@ -2496,7 +2487,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 									presentation.skin,
 									presentation.authored_show_column_types,
 								);
-								app_state.data_frame = frame;
 								app_state.status_df_size = Some((rows, cols));
 							}
 							Ok(RuneRelationSinkOutput::Plot(
@@ -2711,19 +2701,20 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::RuneBufferPlotReady {
 			source_buffer,
 			revision,
+			panel_id,
+			display_label,
 			resolved,
 			kernel,
 		} => {
 			if app_state.rune_buffer_revisions.get(&source_buffer) != Some(&revision) {
 				return Task::none();
 			}
-			app_state.code_editor.open_dashboard();
-			let previous = app_state.rune_plot_panes.get(&source_buffer).copied();
-			let composition = resolved.resolved_spec.composition.clone();
-			let pane = app_state
-				.dashboard
-				.apply_plot_replacing(previous, composition, kernel);
-			app_state.rune_plot_panes.insert(source_buffer, pane);
+			app_state.code_editor.set_rune_view_plot(
+				panel_id,
+				display_label,
+				kernel,
+				PlotSettingsLayer::default(),
+			);
 			app_state.status_error.clear();
 			app_state.status_msg = format!("Plotted {}.", resolved.source_name);
 		}
@@ -2818,7 +2809,6 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						}
 						MarkdownCellOutputTarget::None => {}
 					}
-					app_state.data_frame = df;
 					app_state.status_df_size = Some((rows, cols));
 					set_sql_status(
 						app_state,
@@ -2902,12 +2892,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						.set_markdown_cell_plot(identity, composition, kernel)
 				}
 				MarkdownCellOutputTarget::Pane => {
-					app_state.code_editor.open_dashboard();
-					let _ = app_state.dashboard.update(DashboardMsg::PlotKernelReady {
-						pane: None,
-						composition,
-						kernel,
-					});
+					app_state.code_editor.begin_query();
+					app_state
+						.code_editor
+						.set_query_plot(composition.title(), kernel);
 				}
 				MarkdownCellOutputTarget::None => {}
 			}
@@ -2915,92 +2903,30 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_msg = "Plot cell finished.".to_owned();
 		}
 		Message::Export(format) => {
-			return window::latest().and_then(move |id| {
-				window::size(id).map(move |size| Message::ExportWithWindowSize(format, Some(size)))
-			});
-		}
-		Message::ExportWithWindowSize(format, window_size) => {
-			if let Some(dashboard) = app_state.dashboard.panes.as_ref() {
-				let size = window_size.unwrap_or(Size::new(1920.0, 1080.0));
-				let workspace_bounds = workspace_bounds(size);
-				let dashboard_pane_bounds = app_state
-					.code_editor
-					.dashboard_bounds()
-					.map(|rect| iced::Rectangle {
-						x: 0.0,
-						y: 0.0,
-						width: rect.width,
-						height: rect.height,
-					})
-					.unwrap_or(workspace_bounds);
-				let mut export_jobs: Vec<Box<dyn FnOnce() + Send + 'static>> = Vec::new();
-				for (id, rect) in get_pane_rects(dashboard, dashboard_pane_bounds) {
-					if let Some(plot_state) = app_state.dashboard.content.get(&id) {
-						let width = rect.width;
-						let height = rect.height - 30.0;
-						let bounds = iced::Rectangle {
-							x: 0.0,
-							y: 0.0,
-							width,
-							height,
-						};
-						let settings = plot_state.plot_settings.clone();
-						let widget = crate::plot::common::PlotWidget {
-							kernel: plot_state.kernel.as_ref(),
-							title: plot_state.composition.title(),
-							padding: 20.0,
-							settings: settings.clone(),
-							settings_model: crate::plot::theme::PlotSettings::from_resolved(
-								settings.clone(),
-							),
-							render_revision: plot_state.render_revision,
-							resize_render_suspended: plot_state.resize_render_suspended,
-							layer: crate::plot::common::PlotRenderLayer::Full,
-						};
-						match format {
-							ExportFormat::SVG => {
-								let mut backend = SvgBackend::new(width, height);
-								widget.render(&mut backend, bounds);
-								let svg_content = backend.finish();
-								let filename = format!("plot_{}.svg", id.0);
-								export_jobs.push(Box::new(move || {
-									let _ = std::fs::write(filename, svg_content);
-								}));
-							}
-							ExportFormat::PNG => {
-								let mut backend = PngBackend::new(width as u32, height as u32);
-								widget.render(&mut backend, bounds);
-								let filename = format!("plot_{}.png", id.0);
-								export_jobs.push(Box::new(move || {
-									backend.save(std::path::Path::new(&filename));
-								}));
-							}
-							ExportFormat::AVIF => {
-								let mut backend = AvifBackend::new(width as u32, height as u32);
-								widget.render(&mut backend, bounds);
-								let filename = format!("plot_{}.avif", id.0);
-								export_jobs.push(Box::new(move || {
-									backend.save(std::path::Path::new(&filename));
-								}));
-							}
-						}
-					}
-				}
-				let count = export_jobs.len();
-				app_state.status_msg = format!("Exporting {count} plots as {format}...");
-				return Task::perform(
-					async move {
-						tokio::task::spawn_blocking(move || {
-							for job in export_jobs {
-								job();
-							}
-						})
-						.await
-						.unwrap();
-					},
-					move |()| Message::ExportDone(count, format),
-				);
+			let snapshots = app_state.code_editor.host_plot_exports();
+			if snapshots.is_empty() {
+				app_state.status_msg = "No live plots to export.".to_owned();
+				return Task::none();
 			}
+			let export_jobs = snapshots
+				.into_iter()
+				.enumerate()
+				.map(|(index, snapshot)| render_plot_export(snapshot, format, index + 1))
+				.collect::<Vec<_>>();
+			let count = export_jobs.len();
+			app_state.status_msg = format!("Exporting {count} plots as {format}...");
+			return Task::perform(
+				async move {
+					tokio::task::spawn_blocking(move || {
+						for job in export_jobs {
+							job.write_to(std::path::Path::new("."));
+						}
+					})
+					.await
+					.unwrap();
+				},
+				move |()| Message::ExportDone(count, format),
+			);
 		}
 		Message::ExportDone(count, format) => {
 			app_state.status_msg = format!("Exported {count} plots as {format}.");
@@ -3036,43 +2962,11 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 		"session:copy-id" => Some(Message::CopySessionId),
 		"session:close-without-checkpoint" => Some(Message::CloseWithoutCheckpoint),
 		_ => {
-			if let Some(kind) = action.strip_prefix("plot:new:") {
-				return parse_plot_type(kind)
-					.map(|plot_type| Message::Dashboard(DashboardMsg::AddPlot(plot_type)));
-			}
 			if let Some(format) = action.strip_prefix("plot:export:") {
 				return parse_export_format(format).map(Message::Export);
 			}
 			None
 		}
-	}
-}
-
-fn parse_plot_type(kind: &str) -> Option<crate::plot::core::PlotType> {
-	use crate::plot::core::PlotType;
-
-	match kind {
-		"Bar" => Some(PlotType::Bar),
-		"BoxPlot" => Some(PlotType::BoxPlot),
-		"Bubble" => Some(PlotType::Bubble),
-		"Candlestick" => Some(PlotType::Candlestick),
-		"FillBetween" => Some(PlotType::FillBetween),
-		"Funnel" => Some(PlotType::Funnel),
-		"Heatmap" => Some(PlotType::Heatmap),
-		"Hexbin" => Some(PlotType::Hexbin),
-		"Histogram" => Some(PlotType::Histogram),
-		"HorizontalBar" => Some(PlotType::HorizontalBar),
-		"HorizontalStackedBar" => Some(PlotType::HorizontalStackedBar),
-		"Line" => Some(PlotType::Line),
-		"Parallel" => Some(PlotType::Parallel),
-		"Pie" => Some(PlotType::Pie),
-		"Radar" => Some(PlotType::Radar),
-		"RadialDial" => Some(PlotType::RadialDial),
-		"Scatter" => Some(PlotType::Scatter),
-		"StackedArea" => Some(PlotType::StackedArea),
-		"StackedBar" => Some(PlotType::StackedBar),
-		"Violin" => Some(PlotType::Violin),
-		_ => None,
 	}
 }
 
@@ -3085,16 +2979,8 @@ fn parse_export_format(format: &str) -> Option<ExportFormat> {
 	}
 }
 
-fn get_pane_rects(state: &PaneState, bounds: iced::Rectangle) -> Vec<(PaneId, iced::Rectangle)> {
-	let Some(root) = state.root() else {
-		return vec![];
-	};
-	get_node_rects(state, root, bounds)
-}
-
 /// The window rectangle occupied by Baryon's workspace: the window minus the
-/// application chrome and status bar. Shared by dashboard export hit-testing
-/// and editor viewport sizing so the two cannot drift.
+/// application chrome and status bar.
 fn workspace_bounds(size: Size) -> iced::Rectangle {
 	iced::Rectangle {
 		x: 10.0,
@@ -3109,63 +2995,6 @@ fn workspace_bounds(size: Size) -> iced::Rectangle {
 fn sync_workspace_viewport(app_state: &mut AppState) {
 	let bounds = workspace_bounds(app_state.window_size);
 	app_state.code_editor.resize(bounds.width, bounds.height);
-}
-
-fn get_node_rects(
-	state: &PaneState,
-	node: pane_grid::state::NodeId,
-	bounds: iced::Rectangle,
-) -> Vec<(PaneId, iced::Rectangle)> {
-	use pane_grid::state::NodeId;
-
-	match node {
-		NodeId::Pane(pane) => vec![(pane, bounds)],
-		NodeId::Split(split_id) => {
-			let Some(split) = state.get_split(split_id) else {
-				return vec![];
-			};
-			let axis = split.axis;
-			let ratio = split.ratio;
-			let first = split.first;
-			let second = split.second;
-			let spacing = 7.0; // handle thickness
-			let (rect_a, rect_b) = match axis {
-				Axis::Horizontal => {
-					let width_a = (bounds.width - spacing) * ratio;
-					let width_b = bounds.width - spacing - width_a;
-					(
-						iced::Rectangle {
-							width: width_a,
-							..bounds
-						},
-						iced::Rectangle {
-							x: bounds.x + width_a + spacing,
-							width: width_b,
-							..bounds
-						},
-					)
-				}
-				Axis::Vertical => {
-					let height_a = (bounds.height - spacing) * ratio;
-					let height_b = bounds.height - spacing - height_a;
-					(
-						iced::Rectangle {
-							height: height_a,
-							..bounds
-						},
-						iced::Rectangle {
-							y: bounds.y + height_a + spacing,
-							height: height_b,
-							..bounds
-						},
-					)
-				}
-			};
-			let mut rects = get_node_rects(state, first, rect_a);
-			rects.extend(get_node_rects(state, second, rect_b));
-			rects
-		}
-	}
 }
 
 #[cfg(test)]
@@ -5298,7 +5127,6 @@ ket.table("test2") // Comment Test1.
 			Some(panel_ids[0])
 		);
 		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 3);
-		assert!(state.dashboard.panes.is_none());
 		state.code_editor.shutdown();
 	}
 
@@ -5472,8 +5300,6 @@ workspace.table("t").views([
 			),
 			"the layered kernel must reach ordinary host plot content"
 		);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 
 		let trend = LocalViewIdentity::Named("trend".to_owned());
 		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -5573,8 +5399,6 @@ workspace.table("t").views([
 			);
 		}
 		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -5796,8 +5620,6 @@ workspace.table("t").views([
 			Some("plot.scatter")
 		);
 		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -6048,8 +5870,6 @@ workspace.table("t").views([
 			Some("plot.line")
 		);
 		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -6182,8 +6002,6 @@ workspace.table("t").views([
 			Some("plot.bar")
 		);
 		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -6301,8 +6119,6 @@ workspace.table("t").views([
 				.rune_view_panel_display_label(source_buffer, &identities[4]),
 			Some("Line + Scatter")
 		);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -6573,8 +6389,6 @@ workspace.table("t").views([
 			assert!(!svg.contains("A detail"));
 			assert!(!svg.contains("B detail"));
 		}
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -6682,8 +6496,6 @@ ket.table("test2")
 			"bar panel did not resolve: {}",
 			state.status_error
 		);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -7098,6 +6910,287 @@ workspace.table("bad").views([view("bad", table())]);
 		assert_eq!(full, raw);
 	}
 
+	#[test]
+	fn product_0075_plain_plot_owns_anonymous_zero_and_orphans_when_removed() {
+		use crate::gui::messages::RuneBufferOutcome;
+		use crate::plot::composition::PlotComposition;
+		use crate::plot::core::PlotType;
+		use crate::plot::factory::create_plot;
+		use crate::plot::request::{PlotRequest, PlotSource, plan};
+		use crate::plot::spec::AuthoredPlotSpec;
+		use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+		use std::sync::Arc;
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let source_buffer = libaryon::core::BufferId::new(7500);
+		let identity = LocalViewIdentity::Anonymous(0);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "plain".to_owned(),
+				data: Arc::new(
+					polars::df!("x" => [1.0_f64, 2.0], "y" => [3.0_f64, 5.0]).expect("plain frame"),
+				),
+			},
+			authored_spec: AuthoredPlotSpec::xy(
+				PlotComposition::single(PlotType::Scatter),
+				"x",
+				"y",
+			),
+		})
+		.expect("plain plot resolves");
+		let ready = resolved.clone();
+		let display_label = ready.resolved_spec.composition.title();
+		let kernel = create_plot(&ready.resolved_spec, &ready.data, 1200, 720);
+
+		state.rune_buffer_revisions.insert(source_buffer, 1);
+		assert_eq!(
+			update(
+				&mut state,
+				Message::RunRuneBufferResult {
+					source_buffer,
+					revision: 1,
+					result: Ok(RuneBufferOutcome {
+						display: None,
+						plot: Some(resolved),
+					}),
+				},
+			)
+			.units(),
+			1,
+			"one plain plot schedules one kernel build"
+		);
+		let panel_id = state
+			.code_editor
+			.rune_view_panel_id(source_buffer, &identity)
+			.expect("plain Anonymous(0) panel");
+		assert_ne!(
+			panel_id.get(),
+			2,
+			"plain output never reuses the retired role"
+		);
+		assert_eq!(state.code_editor.rune_view_panel_count(source_buffer), 1);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &identity),
+			Some("running")
+		);
+
+		drop(update(
+			&mut state,
+			Message::RuneBufferPlotReady {
+				source_buffer,
+				revision: 1,
+				panel_id,
+				display_label,
+				resolved: ready,
+				kernel,
+			},
+		));
+		assert!(
+			state
+				.code_editor
+				.rune_view_panel_is_plot(source_buffer, &identity)
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &identity),
+			Some("fresh")
+		);
+
+		state.rune_buffer_revisions.insert(source_buffer, 2);
+		drop(update(
+			&mut state,
+			Message::RunRuneBufferResult {
+				source_buffer,
+				revision: 2,
+				result: Ok(RuneBufferOutcome {
+					display: Some("plain value".to_owned()),
+					plot: None,
+				}),
+			},
+		));
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_status(source_buffer, &identity),
+			Some("orphaned"),
+			"removing the sole plot reconciles an empty view set"
+		);
+
+		state.code_editor.prepare_rune_view_panels(
+			source_buffer,
+			&[
+				(
+					identity.clone(),
+					ViewPresentation {
+						content_kind: ViewContentKind::Plot,
+						display_label: "plot.scatter".to_owned(),
+						authored_title: crate::plot::spec::Presence::Inherit,
+					},
+				),
+				(
+					LocalViewIdentity::Named("named".to_owned()),
+					ViewPresentation {
+						content_kind: ViewContentKind::Plot,
+						display_label: "plot.scatter".to_owned(),
+						authored_title: crate::plot::spec::Presence::Inherit,
+					},
+				),
+			],
+			3,
+		);
+		assert_eq!(
+			state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &identity),
+			Some(panel_id),
+			"a relation's first anonymous sink reuses the plain output identity"
+		);
+		assert_ne!(
+			state
+				.code_editor
+				.rune_view_panel_id(source_buffer, &LocalViewIdentity::Named("named".to_owned())),
+			Some(panel_id),
+			"a named sink remains a distinct semantic identity"
+		);
+		state.code_editor.shutdown();
+	}
+
+	#[test]
+	fn product_0075_markdown_pane_plot_uses_results_while_inline_and_none_do_not() {
+		use crate::gui::messages::ExportFormat;
+		use crate::plot::composition::PlotComposition;
+		use crate::plot::core::PlotType;
+		use crate::plot::factory::create_plot;
+		use crate::plot::request::{PlotRequest, PlotSource, plan};
+		use crate::plot::spec::AuthoredPlotSpec;
+		use libaryon::uast::projection::{
+			MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellOutputTarget,
+			MarkdownCellPresentation,
+		};
+		use std::sync::Arc;
+
+		fn fixture() -> (
+			crate::plot::request::ResolvedPlot,
+			Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
+		) {
+			let resolved = plan(PlotRequest {
+				source: PlotSource::Materialized {
+					name: "markdown".to_owned(),
+					data: Arc::new(
+						polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 3.0])
+							.expect("markdown frame"),
+					),
+				},
+				authored_spec: AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::Line),
+					"x",
+					"y",
+				),
+			})
+			.expect("markdown plot resolves");
+			let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 720, 720);
+			(resolved, kernel)
+		}
+
+		let identity = MarkdownCellIdentity::Explicit {
+			id: "chart".to_owned(),
+		};
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let (resolved, kernel) = fixture();
+		drop(update(
+			&mut state,
+			Message::NotebookPlotReady {
+				identity: identity.clone(),
+				presentation: MarkdownCellPresentation {
+					output: MarkdownCellOutputTarget::Pane,
+					code: MarkdownCellCodeVisibility::Show,
+				},
+				resolved,
+				kernel,
+			},
+		));
+		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+		while state.code_editor.host_plot_exports().is_empty()
+			&& std::time::Instant::now() < deadline
+		{
+			state.code_editor.poll();
+			std::thread::sleep(std::time::Duration::from_millis(5));
+		}
+		assert_eq!(
+			state.code_editor.host_plot_exports().len(),
+			1,
+			"pane-targeted Markdown plot occupies the shared visible Results panel"
+		);
+		let export_root = std::env::temp_dir().join(format!(
+			"polariton-product-0075-export-{}",
+			std::process::id()
+		));
+		let _ = std::fs::remove_dir_all(&export_root);
+		std::fs::create_dir(&export_root).expect("create export fixture directory");
+		for (ordinal, format, extension) in [
+			(1, ExportFormat::SVG, "svg"),
+			(2, ExportFormat::PNG, "png"),
+			(3, ExportFormat::AVIF, "avif"),
+		] {
+			let mut snapshot = state.code_editor.host_plot_exports().remove(0);
+			snapshot.width = 160.0;
+			snapshot.height = 100.0;
+			super::render_plot_export(snapshot, format, ordinal).write_to(&export_root);
+			let path = export_root.join(format!("plot_{ordinal}.{extension}"));
+			let bytes = std::fs::read(&path).expect("rendered export artifact");
+			assert!(bytes.len() > 32, "{format} export is non-empty");
+			match format {
+				ExportFormat::SVG => assert!(
+					String::from_utf8(bytes).unwrap().contains("<svg"),
+					"SVG export carries the rendered plot document"
+				),
+				ExportFormat::PNG => assert_eq!(&bytes[..8], b"\x89PNG\r\n\x1a\n"),
+				ExportFormat::AVIF => assert!(
+					bytes.windows(8).any(|window| window == b"ftypavif"),
+					"AVIF export carries the expected container brand"
+				),
+			}
+		}
+		std::fs::remove_dir_all(&export_root).expect("remove export fixture directory");
+		state.code_editor.shutdown();
+
+		for output in [
+			MarkdownCellOutputTarget::Inline,
+			MarkdownCellOutputTarget::None,
+		] {
+			let (mut control, startup) = new(StartupData::default(), None);
+			drop(startup);
+			let (resolved, kernel) = fixture();
+			drop(update(
+				&mut control,
+				Message::NotebookPlotReady {
+					identity: identity.clone(),
+					presentation: MarkdownCellPresentation {
+						output,
+						code: MarkdownCellCodeVisibility::Show,
+					},
+					resolved,
+					kernel,
+				},
+			));
+			assert!(
+				!control.code_editor.has_query_surface(),
+				"{output:?} must not manufacture the shared Results panel"
+			);
+			assert_eq!(
+				control.code_editor.markdown_cell_is_plot(&identity),
+				output == MarkdownCellOutputTarget::Inline,
+				"inline retains native content while none retains no output"
+			);
+			control.code_editor.shutdown();
+		}
+	}
+
 	#[cfg(feature = "toron")]
 	#[test]
 	fn rune_execution_error_uses_toolbar_without_manufacturing_a_result_pane() {
@@ -7362,9 +7455,6 @@ workspace.table("bad").views([view("bad", table())]);
 			assert!(error.contains("geometry limit 12"));
 			assert!(error.contains(&format!("palette `{palette}` limit {palette_limit}")));
 		}
-
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -8691,8 +8781,6 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				.rune_view_panel_id(source_buffer, &identity),
 			Some(panel)
 		);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 
@@ -8934,8 +9022,6 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				("E".to_owned(), 14),
 			]
 		);
-		assert!(state.dashboard.panes.is_none());
-		assert!(state.dashboard.content.is_empty());
 		state.code_editor.shutdown();
 	}
 

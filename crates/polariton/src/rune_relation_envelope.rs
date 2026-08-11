@@ -17,6 +17,7 @@ use crate::plot::spec::{
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
 };
+pub(crate) use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use libaryon::core::BufferId;
 use rune::ast::{self, Spanned};
 use std::collections::{HashMap, HashSet};
@@ -153,19 +154,6 @@ impl RunePlotIntent {
 	}
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum ViewContentKind {
-	Table,
-	Plot,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ViewPresentation {
-	pub(crate) content_kind: ViewContentKind,
-	pub(crate) display_label: String,
-	pub(crate) authored_title: Presence<Arc<String>>,
-}
-
 // PRODUCT-0014 replaces this production normal form. Keep the old vocabulary
 // test-only while the existing behavioral corpus migrates its type-oriented
 // assertions to `ViewPresentation`.
@@ -261,12 +249,6 @@ pub(crate) struct SpannedRuneViewIntent {
 	pub(crate) span: Range<u32>,
 	pub(crate) identity: LocalViewIdentity,
 	pub(crate) output_order: usize,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum LocalViewIdentity {
-	Named(String),
-	Anonymous(usize),
 }
 
 /// First-contact presentation data only. This is not `PlotSpec` v0 and dies

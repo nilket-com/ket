@@ -10,7 +10,6 @@ pub const BG_BUTTON_HOVER: Color = rgb(16, 16, 32);
 pub const BG_MODAL: Color = rgba(2, 2, 2, 0.96);
 
 pub const BORDER_PRIMARY: Color = rgb(60, 8, 100);
-pub const BORDER_SUBTLE: Color = rgb(40, 40, 50);
 pub const BORDER_DIM: Color = rgb(24, 2, 32);
 pub const BORDER_ACCENT: Color = rgb(110, 10, 240);
 pub const BORDER_HOVER: Color = rgb(80, 8, 140);
@@ -29,7 +28,6 @@ pub const SELECTION: Color = rgb(110, 10, 240);
 pub const SUCCESS: Color = rgb(40, 200, 40);
 pub const WARNING: Color = rgb(200, 80, 80);
 
-pub const SCROLLBAR_THUMB: Color = rgba(140, 0, 250, 0.5);
 pub const STATUS_BAR_RAIL_BACKGROUND: Color = rgb(10, 10, 12);
 pub const STATUS_BAR_RAIL_SEPARATOR: Color = BORDER_DIM;
 pub const STATUS_BAR_SEGMENT_BACKGROUND: Color = BG_BUTTON;
@@ -41,14 +39,6 @@ pub const STATUS_BAR_TEXT_WARNING: Color = WARNING;
 pub const STATUS_BAR_TEXT_DANGER: Color = DANGER;
 pub const PROGRESS_BAR_TRACK_BACKGROUND: Color = BG_PRIMARY;
 pub const PROGRESS_BAR_FILL: Color = BRAND_PURPLE;
-
-pub const DROP_OVERLAY: Color = rgba(60, 8, 100, 0.25);
-pub const HANDLE_ARROW: Color = rgb(150, 4, 250);
-pub const HANDLE_ARROW_HOVER: Color = rgb(180, 100, 250);
-pub const HANDLE_BG: Color = rgb(8, 2, 10);
-pub const HANDLE_BORDER: Color = rgba(60, 8, 100, 0.4);
-pub const HANDLE_DOT_BOTTOM: Color = rgb(0, 0, 0);
-pub const HANDLE_DOT_TOP: Color = rgb(150, 4, 250);
 
 pub const WHITE: Color = Color::WHITE;
 

@@ -1,5 +1,8 @@
 use iced::Color;
 
+// Legacy renderer-ramp vocabulary retained until the separately docketed
+// ColorTheme retirement; PRODUCT-0075 removes only its dashboard editor.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ColorTheme {
 	Black,
@@ -43,6 +46,7 @@ pub enum ColorTheme {
 }
 
 impl ColorTheme {
+	#[allow(dead_code)]
 	pub const ALL: [ColorTheme; 37] = [
 		ColorTheme::Black,
 		ColorTheme::BlueGreen,
@@ -402,55 +406,4 @@ pub fn green_purples(t: f32) -> Color {
 
 pub fn purple_greens(t: f32) -> Color {
 	green_purples(1.0 - t)
-}
-
-pub fn color_to_hex(color: Color) -> String {
-	format!(
-		"#{:02X}{:02X}{:02X}",
-		(color.r * 255.0) as u8,
-		(color.g * 255.0) as u8,
-		(color.b * 255.0) as u8
-	)
-}
-
-pub fn hex_to_color(hex: &str) -> Option<Color> {
-	let hex = hex.trim_start_matches('#');
-	match hex.len() {
-		3 => {
-			let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()? as f32 / 255.0;
-			let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()? as f32 / 255.0;
-			let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()? as f32 / 255.0;
-			Some(Color::from_rgb(r, g, b))
-		}
-		4 => {
-			let r = u8::from_str_radix(&hex[0..1].repeat(2), 16).ok()? as f32 / 255.0;
-			let g = u8::from_str_radix(&hex[1..2].repeat(2), 16).ok()? as f32 / 255.0;
-			let b = u8::from_str_radix(&hex[2..3].repeat(2), 16).ok()? as f32 / 255.0;
-			let a = u8::from_str_radix(&hex[3..4].repeat(2), 16).ok()? as f32 / 255.0;
-			Some(Color::from_rgba(r, g, b, a))
-		}
-		6 => {
-			let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
-			let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
-			let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
-			Some(Color::from_rgb(r, g, b))
-		}
-		8 => {
-			let r = u8::from_str_radix(&hex[0..2], 16).ok()? as f32 / 255.0;
-			let g = u8::from_str_radix(&hex[2..4], 16).ok()? as f32 / 255.0;
-			let b = u8::from_str_radix(&hex[4..6], 16).ok()? as f32 / 255.0;
-			let a = u8::from_str_radix(&hex[6..8], 16).ok()? as f32 / 255.0;
-			Some(Color::from_rgba(r, g, b, a))
-		}
-		_ => None,
-	}
-}
-
-pub fn contrast_color(bg: Color) -> Color {
-	let luminance = 0.299 * bg.r + 0.587 * bg.g + 0.114 * bg.b;
-	if luminance > 0.5 {
-		Color::BLACK
-	} else {
-		Color::WHITE
-	}
 }

@@ -3,7 +3,6 @@ use crate::adapters::{
 	driver::{AdapterSelection, AdapterState, fields_for},
 };
 use crate::editor::CodeEditor;
-use crate::gui::dashboard::DashboardState;
 use crate::gui::messages::Message;
 use crate::gui::statusbar::{Segment, StatusBar, Tone};
 use crate::gui::{
@@ -151,7 +150,6 @@ pub fn title_bar<'a>() -> Element<'a, Message> {
 }
 
 pub fn main_screen<'a>(
-	dashboard: &'a DashboardState,
 	menu_state: &'a MenuState,
 	code_editor: &'a CodeEditor,
 	status_msg: &'a str,
@@ -168,9 +166,8 @@ pub fn main_screen<'a>(
 	saved_session: bool,
 	close_without_checkpoint: bool,
 ) -> Element<'a, Message> {
-	// Baryon's workspace is the sole top-level layout owner. The nested
-	// dashboard still owns its own pixel-space grid inside its host panel.
-	let main_content = container(code_editor.view(dashboard).map(Message::CodeEditEvent))
+	// Baryon's workspace is the sole top-level layout owner.
+	let main_content = container(code_editor.view().map(Message::CodeEditEvent))
 		.padding(4)
 		.width(Fill)
 		.height(Fill)
@@ -443,34 +440,21 @@ fn build_menu_roots(saved_session: bool, close_without_checkpoint: bool) -> Vec<
 		MenuRoot {
 			id: "plot".into(),
 			label: "Plot".into(),
-			items: vec![
-				MenuItem::Submenu {
-					id: "plot:new".into(),
-					label: "New".into(),
-					items: crate::plot::core::PlotType::ALL
-						.iter()
-						.map(|plot_type| MenuItem::Action {
-							id: format!("plot:new:{plot_type:?}"),
-							label: plot_type.to_string(),
-						})
-						.collect(),
-				},
-				MenuItem::Submenu {
-					id: "plot:export".into(),
-					label: "Export".into(),
-					items: [
-						crate::gui::messages::ExportFormat::SVG,
-						crate::gui::messages::ExportFormat::PNG,
-						crate::gui::messages::ExportFormat::AVIF,
-					]
-					.into_iter()
-					.map(|format| MenuItem::Action {
-						id: format!("plot:export:{format}"),
-						label: format.to_string(),
-					})
-					.collect(),
-				},
-			],
+			items: vec![MenuItem::Submenu {
+				id: "plot:export".into(),
+				label: "Export".into(),
+				items: [
+					crate::gui::messages::ExportFormat::SVG,
+					crate::gui::messages::ExportFormat::PNG,
+					crate::gui::messages::ExportFormat::AVIF,
+				]
+				.into_iter()
+				.map(|format| MenuItem::Action {
+					id: format!("plot:export:{format}"),
+					label: format.to_string(),
+				})
+				.collect(),
+			}],
 		},
 		MenuRoot {
 			id: "settings".into(),
@@ -677,6 +661,32 @@ mod tests {
 
 		let failed_close = action_ids(true, true);
 		assert!(failed_close.contains(&"session:close-without-checkpoint".to_owned()));
+	}
+
+	#[test]
+	fn product_0075_plot_menu_retains_only_the_three_export_actions() {
+		fn collect(items: &[MenuItem], ids: &mut Vec<String>) {
+			for item in items {
+				match item {
+					MenuItem::Action { id, .. } => ids.push(id.clone()),
+					MenuItem::Submenu { items, .. } => collect(items, ids),
+					MenuItem::Separator => {}
+				}
+			}
+		}
+
+		let roots = build_menu_roots(false, false);
+		let plot = roots
+			.iter()
+			.find(|root| root.id == "plot")
+			.expect("Plot menu remains as the export surface");
+		let mut ids = Vec::new();
+		collect(&plot.items, &mut ids);
+		assert_eq!(
+			ids,
+			["plot:export:SVG", "plot:export:PNG", "plot:export:AVIF"]
+		);
+		assert!(ids.iter().all(|id| !id.starts_with("plot:new:")));
 	}
 
 	#[test]

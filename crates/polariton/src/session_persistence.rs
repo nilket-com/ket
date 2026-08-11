@@ -877,6 +877,42 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0075_plain_anonymous_zero_is_existing_schema_two_vocabulary() {
+		let document = DocumentId::new(75).unwrap();
+		let mut meanings = empty_meanings();
+		meanings.panels.insert(
+			(document, LocalViewIdentity::Anonymous(0)),
+			HostPanelId::new(DYNAMIC_PANEL_FLOOR),
+		);
+		meanings
+			.groups
+			.insert(document, HostPanelGroupId::new(GROUP_FLOOR));
+		meanings.next_view_panel_id = DYNAMIC_PANEL_FLOOR + 1;
+		meanings.next_view_group_id = GROUP_FLOOR + 1;
+
+		let bytes = meanings.encode().unwrap();
+		let text = String::from_utf8(bytes.clone()).unwrap();
+		assert!(text.contains("\"kind\":\"anonymous\""), "{text}");
+		assert!(text.contains("\"ordinal\":0"), "{text}");
+		assert!(
+			!text.contains("plain"),
+			"no plain-only durable identity: {text}"
+		);
+		assert!(
+			!text.contains("dashboard"),
+			"no retired role enters meanings: {text}"
+		);
+		assert_eq!(
+			DurableMeanings::decode(SCHEMA_VERSION, &bytes).unwrap(),
+			meanings
+		);
+		assert_eq!(
+			SCHEMA_VERSION, 2,
+			"PRODUCT-0075 changes population, not grammar"
+		);
+	}
+
+	#[test]
 	fn product_0062_colour_family_is_closed_and_rotation_independent() {
 		let document = DocumentId::new(1).unwrap();
 		let mut meanings = empty_meanings();

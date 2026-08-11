@@ -2076,3 +2076,101 @@ fn product_0074_polariton_selects_zero_divider_reservation() {
 		"the GUI head must not inherit terminal reservation constants"
 	);
 }
+
+#[test]
+fn product_0075_nested_dashboard_is_absent_and_renderer_catalog_is_exact() {
+	let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let source_root = manifest.join("src");
+	assert!(!source_root.join("gui/dashboard").exists());
+	assert!(!source_root.join("gui/pane_grid").exists());
+
+	let editor = std::fs::read_to_string(source_root.join("editor.rs")).expect("read editor");
+	let gui = std::fs::read_to_string(source_root.join("gui/state.rs")).expect("read GUI state");
+	let messages =
+		std::fs::read_to_string(source_root.join("gui/messages.rs")).expect("read GUI messages");
+	let components =
+		std::fs::read_to_string(source_root.join("gui/components.rs")).expect("read GUI chrome");
+	fn production(source: &str) -> &str {
+		source
+			.split("\n#[cfg(test)]\nmod tests {")
+			.next()
+			.expect("production source before test module")
+	}
+	for (name, source) in [
+		("editor", production(&editor)),
+		("state", production(&gui)),
+		("messages", production(&messages)),
+		("components", production(&components)),
+	] {
+		for forbidden in [
+			"DashboardState",
+			"DashboardMsg",
+			"DashboardEffect",
+			"PlotPaneState",
+			"rune_plot_panes",
+			"plot:new:",
+		] {
+			assert!(
+				!source.contains(forbidden),
+				"PRODUCT-0075 retired dashboard symbol remains in {name}: {forbidden}"
+			);
+		}
+	}
+	let app_state = gui
+		.split("struct AppState {")
+		.nth(1)
+		.expect("AppState declaration")
+		.split("\n}")
+		.next()
+		.expect("bounded AppState declaration");
+	assert!(
+		!app_state.contains("data_frame"),
+		"dashboard-derived DataFrame cache must not survive PRODUCT-0075"
+	);
+	assert_eq!(editor.matches("HostPanelId::new(2)").count(), 1);
+	assert!(editor.contains("RETIRED_DASHBOARD_PANEL"));
+
+	let core = std::fs::read_to_string(source_root.join("plot/core.rs"))
+		.expect("read renderer vocabulary");
+	let enum_body = core
+		.split("pub enum PlotType {")
+		.nth(1)
+		.expect("PlotType declaration")
+		.split('}')
+		.next()
+		.expect("bounded PlotType declaration");
+	let variants = enum_body
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty())
+		.map(|line| line.trim_end_matches(',').to_owned())
+		.collect::<std::collections::BTreeSet<_>>();
+	let catalog_body = core
+		.split("pub const ALL:")
+		.nth(1)
+		.expect("renderer catalog")
+		.split("];")
+		.next()
+		.expect("bounded renderer catalog");
+	let entries = catalog_body
+		.lines()
+		.filter_map(|line| {
+			line.trim()
+				.strip_prefix("PlotType::")
+				.map(|variant| variant.trim_end_matches(',').to_owned())
+		})
+		.collect::<Vec<_>>();
+	let catalog = entries
+		.iter()
+		.cloned()
+		.collect::<std::collections::BTreeSet<_>>();
+	assert_eq!(
+		entries.len(),
+		catalog.len(),
+		"renderer catalog has a duplicate"
+	);
+	assert_eq!(
+		catalog, variants,
+		"PlotType::ALL is PRODUCT-0075's exact renderer catalog, not picker residue"
+	);
+}

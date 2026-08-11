@@ -1,3 +1,6 @@
+/// Complete renderer vocabulary. PRODUCT-0075 retired the GUI picker but kept
+/// every kernel; variants without a Rune producer remain direct-test substrate.
+#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum PlotType {
 	Bar,
@@ -23,6 +26,9 @@ pub enum PlotType {
 }
 
 impl PlotType {
+	/// Exhaustive renderer catalog, guarded against drift from the enum by the
+	/// PRODUCT-0075 architecture test. It is not picker data.
+	#[allow(dead_code)]
 	pub const ALL: [PlotType; 20] = [
 		PlotType::Bar,
 		PlotType::BoxPlot,

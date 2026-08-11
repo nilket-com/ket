@@ -4,7 +4,6 @@ use crate::adapters::{
 	driver::AdapterSelection,
 };
 use crate::editor::EditorMsg;
-use crate::gui::dashboard::DashboardMsg;
 #[cfg(feature = "toron")]
 use crate::gui::table_skin::TableSkin;
 use crate::plot::common::PlotKernel;
@@ -62,12 +61,6 @@ pub enum Message {
 	/// The session's in-memory scratch database finished opening at startup.
 	ScratchReady(Option<Arc<RwLock<dyn DatabaseAdapter>>>),
 	AdapterSelected(AdapterSelection),
-	Dashboard(DashboardMsg),
-	DashboardPlotBuilt {
-		pane: Option<crate::gui::pane_grid::PaneId>,
-		composition: crate::plot::composition::PlotComposition,
-		result: std::result::Result<Arc<dyn PlotKernel + Send + Sync>, String>,
-	},
 	CloseSettings,
 	CloseWindow,
 	CheckpointSession,
@@ -80,7 +73,6 @@ pub enum Message {
 	DragWindow,
 	Export(ExportFormat),
 	ExportDone(usize, ExportFormat),
-	ExportWithWindowSize(ExportFormat, Option<iced::Size>),
 	MaximizeWindow,
 	Menu(menu::MenuMessage),
 	MinimizeWindow,
@@ -121,6 +113,8 @@ pub enum Message {
 	RuneBufferPlotReady {
 		source_buffer: BufferId,
 		revision: u64,
+		panel_id: libaryon::engine::HostPanelId,
+		display_label: String,
 		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
 	},

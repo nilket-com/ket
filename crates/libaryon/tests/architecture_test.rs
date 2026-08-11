@@ -297,6 +297,13 @@ fn product_0059_store_stays_capability_closed_and_later_consumers_are_explicit()
 		let production = head.split("\n#[cfg(test)]").next().unwrap_or(&head);
 		let file = path.file_name().and_then(|name| name.to_str());
 		if production.contains("SessionStore") {
+			assert!(
+				matches!(file, Some("main.rs" | "state.rs")),
+				"{} consumed session-store authority outside PRODUCT-0063's saved surface or PRODUCT-0073's terminal discovery",
+				path.display()
+			);
+		}
+		if production.contains(".discover()") {
 			assert_eq!(
 				file,
 				Some("main.rs"),
@@ -317,10 +324,9 @@ fn product_0059_store_stays_capability_closed_and_later_consumers_are_explicit()
 			);
 		}
 		if production.contains("SavedSession") {
-			assert_eq!(
-				file,
-				Some("editor.rs"),
-				"{} moved PRODUCT-0062's transferred saved-session capability outside the editor host",
+			assert!(
+				matches!(file, Some("editor.rs" | "state.rs")),
+				"{} moved PRODUCT-0063's saved startup authority outside the GUI controller/editor host boundary",
 				path.display()
 			);
 		}

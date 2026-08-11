@@ -54,6 +54,9 @@ pub struct PositiveFinite(f64);
 impl TickPlacement {
 	pub const DEFAULT: Self = Self::Count(NonZeroU32::new(8).unwrap());
 
+	// Retained renderer substrate and direct-test constructor after PRODUCT-0075
+	// removes the dashboard control that authored count-based placement.
+	#[allow(dead_code)]
 	pub fn count(intervals: u32) -> Option<Self> {
 		NonZeroU32::new(intervals).map(Self::Count)
 	}
@@ -345,6 +348,10 @@ impl<'a> CoordinateTransformer<'a> {
 	}
 }
 
+// Renderer settings remain substrate after PRODUCT-0075 removes their manual
+// dashboard editor. Direct kernels and future authored surfaces still consume
+// the vocabulary.
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GridLineStyle {
 	Solid,
@@ -352,6 +359,7 @@ pub enum GridLineStyle {
 	Dotted,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ScatterRenderMode {
 	#[default]
@@ -362,6 +370,7 @@ pub enum ScatterRenderMode {
 }
 
 impl ScatterRenderMode {
+	#[allow(dead_code)]
 	pub const ALL: [ScatterRenderMode; 4] = [
 		ScatterRenderMode::Auto,
 		ScatterRenderMode::Vector,
@@ -382,6 +391,7 @@ impl std::fmt::Display for ScatterRenderMode {
 }
 
 impl GridLineStyle {
+	#[allow(dead_code)]
 	pub const ALL: [GridLineStyle; 3] = [
 		GridLineStyle::Solid,
 		GridLineStyle::Dashed,
@@ -855,7 +865,6 @@ fn resolve_canvas_text(
 
 #[derive(Default)]
 pub struct PlotCanvasState {
-	last_click: Option<std::time::Instant>,
 	last_hover: Option<String>,
 	plot_cache: canvas::Cache,
 	overlay_cache: canvas::Cache,
@@ -1265,19 +1274,6 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 				} else {
 					None
 				}
-			}
-			Event::Mouse(iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left)) => {
-				if cursor.is_over(bounds) {
-					let now = std::time::Instant::now();
-					if let Some(last_click) = state.last_click
-						&& now.duration_since(last_click) < std::time::Duration::from_millis(500)
-					{
-						state.last_click = None;
-						return Some(canvas::Action::publish(PlotMessage::ToggleSettings));
-					}
-					state.last_click = Some(now);
-				}
-				None
 			}
 			_ => None,
 		}

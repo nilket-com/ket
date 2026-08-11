@@ -62,14 +62,6 @@ impl PlotComposition {
 		true
 	}
 
-	pub fn remove_layer(&mut self, index: usize) -> bool {
-		if index == 0 || index >= self.layers.len() {
-			return false;
-		}
-		self.layers.remove(index);
-		true
-	}
-
 	pub fn has_line_overlay(&self) -> bool {
 		self.layers
 			.iter()

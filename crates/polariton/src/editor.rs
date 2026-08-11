@@ -5,29 +5,22 @@
 //! renders the focused pane's projection: syntax, gutter, cursor, selection,
 //! diagnostics, folds, engine-owned wrap rows and scrolling, and the minimap.
 
-#[cfg(feature = "toron")]
 use crate::gui::plot_pane::{self, HostPlotState, PlotPaneMsg};
 use crate::gui::{
-	dashboard::{self, DashboardMsg, DashboardState},
 	table::{Table, TableScroll},
 	table_skin::{TableSkin, TableSkinCascade, TableSkinSpec},
 };
 use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotSettings};
 use crate::plot::composition::PlotComposition;
-use crate::plot::spec::Override;
-#[cfg(feature = "toron")]
-use crate::plot::spec::Presence;
-#[cfg(feature = "toron")]
+use crate::plot::spec::{Override, Presence};
 use crate::plot::theme::PlotSettingsLayer;
-#[cfg(feature = "toron")]
-use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
+use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 #[cfg(feature = "toron")]
 use crate::session_persistence::{
 	self, DurableMeanings, RuntimeColours, RuntimeMeanings, SessionPersistenceError,
 };
 use iced::keyboard::{self, Key};
 use iced::mouse;
-#[cfg(feature = "toron")]
 use iced::widget::tooltip;
 use iced::widget::{
 	Space, button, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
@@ -47,7 +40,6 @@ use libaryon::engine::{
 	PaneDropEdge, PanelRevision, SplitDirection, UiPalette, VisualKind,
 	minimap_click_viewport_start_line,
 };
-#[cfg(feature = "toron")]
 use libaryon::engine::{
 	HostPanelGroupId, HostPanelGroupLayout, HostPanelGroupMember, HostPanelGroupShape,
 };
@@ -69,8 +61,11 @@ use std::time::Duration;
 /// The single query-results surface. One stable identity reused for every run,
 /// so results replace in place instead of opening a pane per query.
 const RESULT_PANEL: HostPanelId = HostPanelId::new(1);
-const DASHBOARD_PANEL: HostPanelId = HostPanelId::new(2);
+/// Migration tombstone for sessions written before PRODUCT-0075. No producer
+/// may open this identity; restored occurrences are closed after meanings
+/// reconciliation reaches a terminal outcome.
 #[cfg(feature = "toron")]
+const RETIRED_DASHBOARD_PANEL: HostPanelId = HostPanelId::new(2);
 const DYNAMIC_VIEW_PANEL_BASE: u64 = 1_u64 << 63;
 
 #[cfg(feature = "toron")]
@@ -79,7 +74,6 @@ type RuntimeDocumentBindings = (
 	HashMap<libaryon::core::DocumentId, libaryon::core::BufferId>,
 );
 
-#[cfg(feature = "toron")]
 fn rune_view_chrome_title(identity: &LocalViewIdentity, presentation: &ViewPresentation) -> String {
 	match identity {
 		LocalViewIdentity::Named(name) => name.clone(),
@@ -177,12 +171,9 @@ pub enum EditorMsg {
 		pane_id: libaryon::core::PaneId,
 		action: PaneTabAction,
 	},
-	#[cfg(feature = "toron")]
 	RetileOutputs {
 		pane_id: libaryon::core::PaneId,
 	},
-	Dashboard(DashboardMsg),
-	#[cfg(feature = "toron")]
 	HostPlot {
 		panel_id: HostPanelId,
 		message: PlotPaneMsg,
@@ -201,18 +192,18 @@ pub enum EditorMsg {
 	/// Editor-local pointer motion from the workspace mouse_area.
 	PointerMoved(iced::Point),
 	/// Raw window-space pointer motion from the root subscription. Reaches us
-	/// even while a table/dashboard widget captures its own move events, but in
+	/// even while a table/plot widget captures its own move events, but in
 	/// window coordinates — converted to editor-local via `pointer_offset`.
 	RawCursorMoved(iced::Point),
 	Click,
 	/// Pointer released; ends a divider drag.
 	Release,
 	/// A pane header captured the press. Header-local handling is important:
-	/// native table/dashboard widgets may capture pointer events before the
+	/// native table/plot widgets may capture pointer events before the
 	/// workspace-wide mouse area sees them.
 	PaneDragStarted(libaryon::core::PaneId),
 	/// A message from one inline notebook plot. Identity keeps interactive
-	/// state local to its cell rather than leaking through the dashboard.
+	/// state local to its cell rather than leaking into a host panel.
 	NotebookPlot {
 		identity: MarkdownCellIdentity,
 		message: crate::gui::messages::PlotMessage,
@@ -400,15 +391,11 @@ pub struct CodeEditor {
 	/// can preserve the same ID census while changing its meaning. Stale entries
 	/// therefore remain until a stronger relational witness supersedes that
 	/// record.
-	#[cfg(feature = "toron")]
 	view_panel_ids: HashMap<(libaryon::core::BufferId, LocalViewIdentity), HostPanelId>,
-	#[cfg(feature = "toron")]
 	next_view_panel_id: u64,
 	/// Placement identity is producer-scoped and intentionally separate from
 	/// semantic view-panel identity.
-	#[cfg(feature = "toron")]
 	view_group_ids: HashMap<libaryon::core::BufferId, HostPanelGroupId>,
-	#[cfg(feature = "toron")]
 	next_view_group_id: u64,
 	/// Decoded application meanings remain inert until the first complete saved
 	/// projection can join all three relations atomically.
@@ -418,6 +405,11 @@ pub struct CodeEditor {
 	restored_colour_meanings: Option<RuntimeColours>,
 	#[cfg(feature = "toron")]
 	session_restore_error: Option<String>,
+	/// Legacy dashboard views already queued for ordinary engine closure. The
+	/// set suppresses duplicate close traffic while a projection is catching up.
+	#[cfg(feature = "toron")]
+	retired_dashboard_closures:
+		std::collections::HashSet<(libaryon::core::PaneId, libaryon::core::ViewId)>,
 	/// Monotonic revision for the results panel, so each run supersedes the
 	/// last.
 	result_revision: u64,
@@ -506,7 +498,7 @@ enum NotebookCellOutput {
 
 /// Native interaction state for a plot embedded in the Markdown preview.
 /// It deliberately shares the existing plot kernel and settings model with
-/// dashboard plots, but has its own identity and hover state.
+/// host-panel plots, but has its own identity and hover state.
 struct NotebookPlotSurface {
 	composition: PlotComposition,
 	kernel: Arc<dyn PlotKernel + Send + Sync>,
@@ -527,9 +519,8 @@ impl NotebookPlotSurface {
 	}
 
 	fn update(&mut self, message: crate::gui::messages::PlotMessage) {
-		if let crate::gui::messages::PlotMessage::UpdateHover(hover) = message {
-			self.hovered_info = hover;
-		}
+		let crate::gui::messages::PlotMessage::UpdateHover(hover) = message;
+		self.hovered_info = hover;
 	}
 }
 
@@ -802,13 +793,9 @@ impl CodeEditor {
 			quit_notified: false,
 			show_column_types: false,
 			panels: PanelRegistry::default(),
-			#[cfg(feature = "toron")]
 			view_panel_ids: HashMap::new(),
-			#[cfg(feature = "toron")]
 			next_view_panel_id: DYNAMIC_VIEW_PANEL_BASE,
-			#[cfg(feature = "toron")]
 			view_group_ids: HashMap::new(),
-			#[cfg(feature = "toron")]
 			next_view_group_id: 1,
 			#[cfg(feature = "toron")]
 			pending_session_meanings,
@@ -816,6 +803,8 @@ impl CodeEditor {
 			restored_colour_meanings: None,
 			#[cfg(feature = "toron")]
 			session_restore_error: None,
+			#[cfg(feature = "toron")]
+			retired_dashboard_closures: std::collections::HashSet::new(),
 			result_revision: 0,
 			drag: None,
 			divider_candidate: None,
@@ -1087,7 +1076,7 @@ impl CodeEditor {
 	}
 
 	/// Resolve the Markdown source that owns notebook execution.
-	/// Workspace focus can be on a result or dashboard host panel while the
+	/// Workspace focus can be on a result or Rune host panel while the
 	/// source retains the cursor that identifies the executable cell.
 	fn notebook_source<'a>(
 		&self,
@@ -1173,6 +1162,14 @@ impl CodeEditor {
 		);
 	}
 
+	#[cfg(test)]
+	pub(crate) fn markdown_cell_is_plot(&self, identity: &MarkdownCellIdentity) -> bool {
+		matches!(
+			self.notebook_outputs.get(identity),
+			Some(NotebookCellOutput::Plot { .. })
+		)
+	}
+
 	/// Explicit SQL-cell snapshots available to a Rune notebook cell.
 	///
 	/// Values are owned `Arc`s, so the Rune VM never borrows editor state. An
@@ -1209,7 +1206,7 @@ impl CodeEditor {
 		} else {
 			self.send(EditorCommand::OpenHostPanel {
 				panel_id: RESULT_PANEL,
-				kind: "result-table".to_owned(),
+				kind: "result".to_owned(),
 				title: "Results".to_owned(),
 				placement: HostPanelPlacement::Split {
 					direction: SplitDirection::Horizontal,
@@ -1222,7 +1219,6 @@ impl CodeEditor {
 
 	/// Resolve one buffer revision's semantic view identities and establish its
 	/// ordinary host panels in presentation order before any query completes.
-	#[cfg(feature = "toron")]
 	pub fn prepare_rune_view_panels<P>(
 		&mut self,
 		producer: libaryon::core::BufferId,
@@ -1298,7 +1294,6 @@ impl CodeEditor {
 		});
 	}
 
-	#[cfg(feature = "toron")]
 	fn resolve_rune_view_group(&mut self, producer: libaryon::core::BufferId) -> HostPanelGroupId {
 		if let Some(group_id) = self.view_group_ids.get(&producer) {
 			return *group_id;
@@ -1312,7 +1307,6 @@ impl CodeEditor {
 		group_id
 	}
 
-	#[cfg(feature = "toron")]
 	fn rune_view_group_for_pane(
 		&self,
 		pane_id: libaryon::core::PaneId,
@@ -1334,7 +1328,6 @@ impl CodeEditor {
 		self.view_group_ids.get(&producer).copied()
 	}
 
-	#[cfg(feature = "toron")]
 	fn resolve_rune_view_panel(
 		&mut self,
 		producer: libaryon::core::BufferId,
@@ -1354,7 +1347,6 @@ impl CodeEditor {
 		panel_id
 	}
 
-	#[cfg(feature = "toron")]
 	pub fn rune_view_panel_id(
 		&self,
 		producer: libaryon::core::BufferId,
@@ -1411,7 +1403,6 @@ impl CodeEditor {
 		);
 	}
 
-	#[cfg(feature = "toron")]
 	pub fn set_rune_view_plot(
 		&mut self,
 		panel_id: HostPanelId,
@@ -1428,7 +1419,6 @@ impl CodeEditor {
 		self.panels.fail_or_stale(panel_id);
 	}
 
-	#[cfg(feature = "toron")]
 	pub fn mark_rune_view_producer_stale(&mut self, producer: libaryon::core::BufferId) {
 		let panels = self
 			.view_panel_ids
@@ -1451,7 +1441,7 @@ impl CodeEditor {
 			.is_some_and(|entry| matches!(entry.content, PanelContent::Table(_)))
 	}
 
-	#[cfg(all(test, feature = "toron"))]
+	#[cfg(test)]
 	pub(crate) fn rune_view_panel_is_plot(
 		&self,
 		producer: libaryon::core::BufferId,
@@ -1597,7 +1587,7 @@ impl CodeEditor {
 		))
 	}
 
-	#[cfg(all(test, feature = "toron"))]
+	#[cfg(test)]
 	pub(crate) fn rune_view_panel_count(&self, producer: libaryon::core::BufferId) -> usize {
 		self.view_panel_ids
 			.keys()
@@ -1616,7 +1606,7 @@ impl CodeEditor {
 			.is_some_and(|entry| matches!(entry.content, PanelContent::Failed))
 	}
 
-	#[cfg(all(test, feature = "toron"))]
+	#[cfg(test)]
 	pub(crate) fn rune_view_panel_status(
 		&self,
 		producer: libaryon::core::BufferId,
@@ -1706,37 +1696,22 @@ impl CodeEditor {
 		self.panels.panels.contains_key(&RESULT_PANEL)
 	}
 
-	/// Open (or focus) Polariton's nested dashboard inside the Baryon workspace.
-	pub fn open_dashboard(&mut self) {
-		self.send(EditorCommand::OpenHostPanel {
-			panel_id: DASHBOARD_PANEL,
-			kind: "dashboard".to_owned(),
-			title: "Dashboard".to_owned(),
-			placement: HostPanelPlacement::Split {
-				direction: SplitDirection::Vertical,
-			},
-			focus: true,
-		});
-	}
-
-	/// Pixel bounds relative to the Baryon workspace, for dashboard export.
-	pub fn dashboard_bounds(&self) -> Option<iced::Rectangle> {
-		let pane = self.viewport.as_ref()?.panes.iter().find(|pane| {
-			pane.host_panel
-				.as_ref()
-				.is_some_and(|panel| panel.panel_id == DASHBOARD_PANEL)
-		})?;
-		Some(iced::Rectangle {
-			x: pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
-			y: pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
-			width: pane.rect.width.get() as f32 * metrics::CELL_WIDTH,
-			height: pane.rect.height.get() as f32 * metrics::LINE_HEIGHT,
-		})
-	}
-
 	/// Attach a completed result set to the panel.
 	pub fn set_query_result(&mut self, frame: DataFrame) {
 		self.set_query_result_with_skin(frame, TableSkinCascade::library_floor());
+	}
+
+	pub fn set_query_plot(
+		&mut self,
+		display_label: String,
+		kernel: Arc<dyn PlotKernel + Send + Sync>,
+	) {
+		self.panels.set_plot(
+			RESULT_PANEL,
+			display_label,
+			kernel,
+			PlotSettingsLayer::default(),
+		);
 	}
 
 	fn set_query_result_with_skin(&mut self, frame: DataFrame, skin: TableSkin) {
@@ -1752,6 +1727,53 @@ impl CodeEditor {
 	pub fn set_query_message(&mut self, message: String) {
 		self.panels
 			.set_content(RESULT_PANEL, PanelContent::Message(message));
+	}
+
+	/// Snapshot each unique plot the current host-panel projection visibly
+	/// renders. Export follows the window, including a stale last-good plot, and
+	/// never reaches into producer or persisted state.
+	pub(crate) fn host_plot_exports(&self) -> Vec<HostPlotExport> {
+		let Some(viewport) = self.viewport.as_ref() else {
+			return Vec::new();
+		};
+		self.host_plot_exports_for(
+			viewport
+				.panes
+				.iter()
+				.filter_map(|pane| Some((pane.host_panel.as_ref()?.panel_id, pane.rect))),
+		)
+	}
+
+	fn host_plot_exports_for(
+		&self,
+		projected: impl IntoIterator<Item = (HostPanelId, PaneRect)>,
+	) -> Vec<HostPlotExport> {
+		let mut seen = std::collections::HashSet::new();
+		projected
+			.into_iter()
+			.filter_map(|(panel_id, rect)| {
+				if !seen.insert(panel_id) {
+					return None;
+				}
+				let entry = self.panels.panels.get(&panel_id)?;
+				let PanelContent::Plot(plot) = &entry.content else {
+					return None;
+				};
+				let width = rect.width.get() as f32 * metrics::CELL_WIDTH - 8.0;
+				let height =
+					rect.height.get() as f32 * metrics::LINE_HEIGHT - PANE_HEADER_HEIGHT - 8.0;
+				(width >= 1.0 && height >= 1.0).then(|| HostPlotExport {
+					title: plot.display_label.clone(),
+					kernel: Arc::clone(&plot.kernel),
+					settings: plot.plot_settings.clone(),
+					settings_model: plot.plot_settings_model.clone(),
+					render_revision: plot.render_revision,
+					resize_render_suspended: plot.resize_render_suspended,
+					width,
+					height,
+				})
+			})
+			.collect()
 	}
 
 	pub fn set_show_column_types(&mut self, show_column_types: bool) {
@@ -1931,8 +1953,41 @@ impl CodeEditor {
 		#[cfg(feature = "toron")]
 		{
 			changed |= self.reconcile_pending_session_meanings();
+			changed |= self.retire_legacy_dashboard_panel();
 		}
 		changed
+	}
+
+	/// Remove every projected occurrence of the retired nested-dashboard role
+	/// through libaryon's normal close protocol. This runs after application
+	/// meanings reached a terminal reconciliation outcome for the projection.
+	#[cfg(feature = "toron")]
+	fn retire_legacy_dashboard_panel(&mut self) -> bool {
+		let occurrences = self
+			.viewport
+			.as_ref()
+			.into_iter()
+			.flat_map(|viewport| viewport.panes.iter())
+			.filter(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|panel| panel.panel_id == RETIRED_DASHBOARD_PANEL)
+			})
+			.map(|pane| (pane.pane_id, pane.view_id))
+			.collect::<std::collections::HashSet<_>>();
+		self.retired_dashboard_closures
+			.retain(|occurrence| occurrences.contains(occurrence));
+		let pending = occurrences
+			.into_iter()
+			.filter(|occurrence| self.retired_dashboard_closures.insert(*occurrence))
+			.collect::<Vec<_>>();
+		for (pane_id, view_id) in &pending {
+			self.send(EditorCommand::CloseDocTab {
+				pane_id: *pane_id,
+				view_id: *view_id,
+			});
+		}
+		!pending.is_empty()
 	}
 
 	fn reconcile_notebook_outputs(&mut self, viewport: &Viewport) {
@@ -2027,15 +2082,12 @@ impl CodeEditor {
 				});
 				self.request_content();
 			}
-			#[cfg(feature = "toron")]
 			EditorMsg::RetileOutputs { pane_id } => {
 				if let Some(group_id) = self.rune_view_group_for_pane(pane_id) {
 					self.send(EditorCommand::ResetHostPanelGroup { group_id });
 					self.request_content();
 				}
 			}
-			EditorMsg::Dashboard(_) => {}
-			#[cfg(feature = "toron")]
 			EditorMsg::HostPlot { panel_id, message } => {
 				self.panels.update_plot(panel_id, message);
 			}
@@ -2146,7 +2198,7 @@ impl CodeEditor {
 		Task::none()
 	}
 
-	pub fn view<'a>(&'a self, dashboard: &'a DashboardState) -> Element<'a, EditorMsg> {
+	pub fn view(&self) -> Element<'_, EditorMsg> {
 		let Some(viewport) = self.viewport.as_ref() else {
 			return container(
 				text("Starting editor…")
@@ -2189,19 +2241,13 @@ impl CodeEditor {
 				)
 			} else {
 				match pane.host_panel.as_ref() {
-					Some(panel) => {
-						self.panels
-							.surface(panel, palette, self.show_column_types, dashboard)
-					}
+					Some(panel) => self.panels.surface(panel, palette, self.show_column_types),
 					None => {
 						text_pane_surface(pane, palette, focused && self.cursor_blink.visible())
 					}
 				}
 			};
-			#[cfg(feature = "toron")]
 			let retile_outputs = self.rune_view_group_for_pane(pane.pane_id).is_some();
-			#[cfg(not(feature = "toron"))]
-			let retile_outputs = false;
 			let content = pane_surface(pane, focused, palette, content, retile_outputs);
 			layers.push(positioned(
 				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
@@ -2973,6 +3019,17 @@ pub struct PanelRegistry {
 	scroll_sequence: u64,
 }
 
+pub(crate) struct HostPlotExport {
+	pub(crate) title: String,
+	pub(crate) kernel: Arc<dyn PlotKernel + Send + Sync>,
+	pub(crate) settings: ResolvedPlotSettings,
+	pub(crate) settings_model: crate::plot::theme::PlotSettings,
+	pub(crate) render_revision: u64,
+	pub(crate) resize_render_suspended: bool,
+	pub(crate) width: f32,
+	pub(crate) height: f32,
+}
+
 struct PanelEntry {
 	revision: PanelRevision,
 	content: PanelContent,
@@ -3024,10 +3081,8 @@ enum PanelContent {
 	Unresolved,
 	Running,
 	Table(TableArtifact),
-	#[cfg(feature = "toron")]
 	Plot(Box<HostPlotState>),
 	Message(String),
-	#[cfg(feature = "toron")]
 	Failed,
 }
 
@@ -3035,11 +3090,8 @@ enum PanelContent {
 enum PanelStatus {
 	#[default]
 	Fresh,
-	#[cfg(feature = "toron")]
 	Running,
-	#[cfg(feature = "toron")]
 	Stale,
-	#[cfg(feature = "toron")]
 	Orphaned,
 }
 
@@ -3191,7 +3243,6 @@ impl PanelRegistry {
 		self.pane_table_skins.remove(&panel_id);
 	}
 
-	#[cfg(feature = "toron")]
 	fn mark_running(&mut self, panel_id: HostPanelId) {
 		let entry = self.panels.entry(panel_id).or_insert(PanelEntry {
 			revision: PanelRevision::new(0),
@@ -3209,7 +3260,6 @@ impl PanelRegistry {
 		entry.status = PanelStatus::Running;
 	}
 
-	#[cfg(feature = "toron")]
 	fn fail_or_stale(&mut self, panel_id: HostPanelId) {
 		let entry = self.panels.entry(panel_id).or_insert(PanelEntry {
 			revision: PanelRevision::new(0),
@@ -3229,14 +3279,12 @@ impl PanelRegistry {
 		}
 	}
 
-	#[cfg(feature = "toron")]
 	fn mark_orphaned(&mut self, panel_id: HostPanelId) {
 		if let Some(entry) = self.panels.get_mut(&panel_id) {
 			entry.status = PanelStatus::Orphaned;
 		}
 	}
 
-	#[cfg(feature = "toron")]
 	fn update_plot(&mut self, panel_id: HostPanelId, message: PlotPaneMsg) {
 		if let Some(PanelEntry {
 			content: PanelContent::Plot(plot),
@@ -3247,7 +3295,6 @@ impl PanelRegistry {
 		}
 	}
 
-	#[cfg(feature = "toron")]
 	fn set_plot(
 		&mut self,
 		panel_id: HostPanelId,
@@ -3282,73 +3329,61 @@ impl PanelRegistry {
 		panel: &'a libaryon::uast::projection::HostPanelViewport,
 		palette: UiPalette,
 		show_column_types: bool,
-		dashboard: &'a DashboardState,
 	) -> Element<'a, EditorMsg> {
 		let entry = self.panels.get(&panel.panel_id);
 		let content = entry
 			.map(|entry| &entry.content)
 			.unwrap_or(&PanelContent::Unresolved);
 
-		let inner: Element<'a, EditorMsg> = if panel.panel_id == DASHBOARD_PANEL {
-			dashboard::view(dashboard).map(EditorMsg::Dashboard)
-		} else {
-			match content {
-				PanelContent::Table(artifact) => Table::new(
-					artifact.frame.as_ref(),
-					0,
-					self.table_skin_at_draw(panel.panel_id, artifact.skin),
-				)
-				.show_column_types(artifact.resolve_show_column_types(show_column_types))
-				.scroll_request(
-					self.panels
-						.get(&panel.panel_id)
-						.and_then(|entry| entry.scroll),
-				)
-				.width_store(
-					self.panels
-						.get(&panel.panel_id)
-						.map(|entry| &entry.col_widths),
-				)
-				.into(),
-				#[cfg(feature = "toron")]
-				PanelContent::Plot(plot) => {
-					plot_pane::host_view(plot).map(move |message| EditorMsg::HostPlot {
-						panel_id: panel.panel_id,
-						message,
-					})
-				}
-				PanelContent::Running => {
-					panel_message("running…".to_owned(), color(palette.preview_text))
-				}
-				PanelContent::Message(message) => {
-					panel_message(message.clone(), color(palette.preview_text))
-				}
-				#[cfg(feature = "toron")]
-				PanelContent::Failed => panel_message(
-					"failed · see status bar".to_owned(),
-					color(palette.status_text),
-				),
-				PanelContent::Unresolved => panel_message(
-					format!(
-						"{} unavailable (revision {})\nrerun to populate",
-						panel.kind,
-						panel.revision.get()
-					),
-					color(palette.preview_text),
-				),
+		let inner: Element<'a, EditorMsg> = match content {
+			PanelContent::Table(artifact) => Table::new(
+				artifact.frame.as_ref(),
+				0,
+				self.table_skin_at_draw(panel.panel_id, artifact.skin),
+			)
+			.show_column_types(artifact.resolve_show_column_types(show_column_types))
+			.scroll_request(
+				self.panels
+					.get(&panel.panel_id)
+					.and_then(|entry| entry.scroll),
+			)
+			.width_store(
+				self.panels
+					.get(&panel.panel_id)
+					.map(|entry| &entry.col_widths),
+			)
+			.into(),
+			PanelContent::Plot(plot) => {
+				plot_pane::host_view(plot).map(move |message| EditorMsg::HostPlot {
+					panel_id: panel.panel_id,
+					message,
+				})
 			}
+			PanelContent::Running => {
+				panel_message("running…".to_owned(), color(palette.preview_text))
+			}
+			PanelContent::Message(message) => {
+				panel_message(message.clone(), color(palette.preview_text))
+			}
+			PanelContent::Failed => panel_message(
+				"failed · see status bar".to_owned(),
+				color(palette.status_text),
+			),
+			PanelContent::Unresolved => panel_message(
+				format!(
+					"{} unavailable (revision {})\nrerun to populate",
+					panel.kind,
+					panel.revision.get()
+				),
+				color(palette.preview_text),
+			),
 		};
-		#[cfg(feature = "toron")]
 		let marker = entry.and_then(|entry| match &entry.status {
 			PanelStatus::Fresh => None,
-			#[cfg(feature = "toron")]
 			PanelStatus::Running => Some(("refreshing…".to_owned(), palette.preview_text)),
-			#[cfg(feature = "toron")]
 			PanelStatus::Stale => Some(("stale".to_owned(), palette.status_text)),
-			#[cfg(feature = "toron")]
 			PanelStatus::Orphaned => Some(("orphaned".to_owned(), palette.status_text)),
 		});
-		#[cfg(feature = "toron")]
 		let inner = if let Some((label, tint)) = marker {
 			stack![
 				inner,
@@ -3549,7 +3584,6 @@ fn pane_tab_bar<'a>(
 		.spacing(0);
 		tabs = tabs.push(row![title, controls].spacing(0));
 	}
-	#[cfg(feature = "toron")]
 	if retile_outputs {
 		let retile = button(text("▦").font(EDITOR_FONT).size(13.0))
 			.padding([2, 6])
@@ -3564,8 +3598,6 @@ fn pane_tab_bar<'a>(
 			tooltip::Position::Bottom,
 		));
 	}
-	#[cfg(not(feature = "toron"))]
-	let _ = retile_outputs;
 	tabs = tabs.push(
 		mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
 			.on_press(EditorMsg::PaneDragStarted(pane.pane_id))
@@ -4590,8 +4622,8 @@ fn positioned<'a>(
 /// change and not a local one. See `plans/wip/notebook-with-panes.md`.
 fn editor_input_for(event: &Event, status: event::Status) -> Option<EditorMsg> {
 	// Pointer motion/release is observed at the root so a workspace pane drag
-	// begun in a header continues while the cursor crosses native table or
-	// dashboard widgets that capture their own pointer events. These messages
+	// begun in a header continues while the cursor crosses native table or plot
+	// widgets that capture their own pointer events. These messages
 	// are inert unless the editor has an active drag.
 	match event {
 		Event::Window(iced::window::Event::Focused) => {
@@ -5382,11 +5414,11 @@ fn key_code(key: &Key) -> Option<KeyCode> {
 #[cfg(test)]
 mod tests {
 	use super::{
-		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DASHBOARD_PANEL, DIVIDER_GRAB_PROXIMITY_PX,
+		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DIVIDER_GRAB_PROXIMITY_PX,
 		DRAG_ACTIVATION_DEADBAND_PX, EditorCommand, EditorMsg, HostPanelPlacement, INITIAL_ROWS,
 		InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors, Modifiers,
-		NotebookCellOutput, PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneTabAction, PanelContent,
-		PanelStatus, Rgb, SplitDirection, UiPalette, command_bar_fragments, divider_candidate_at,
+		PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneTabAction, PanelContent, PanelStatus, Rgb,
+		SplitDirection, UiPalette, command_bar_fragments, divider_candidate_at,
 		divider_candidate_rect_px, divider_press_is_candidate, drag_activation_reached,
 		fence_body_start, highlight_span_at, host_panel_content_frame, host_panel_content_style,
 		markdown_code_fragments, metrics, pane_content_stack, pane_gutter_width, pane_title,
@@ -5398,6 +5430,31 @@ mod tests {
 	use libaryon::svp::rust_highlight::TokenCategory;
 	use std::thread;
 	use std::time::{Duration, Instant};
+
+	fn product_0075_test_plot() -> (
+		crate::plot::request::ResolvedPlot,
+		std::sync::Arc<dyn crate::plot::common::PlotKernel + Send + Sync>,
+	) {
+		let resolved = crate::plot::request::plan(crate::plot::request::PlotRequest {
+			source: crate::plot::request::PlotSource::Materialized {
+				name: "PRODUCT-0075 fixture".to_owned(),
+				data: std::sync::Arc::new(
+					polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 4.0]).expect("plot frame"),
+				),
+			},
+			authored_spec: crate::plot::spec::AuthoredPlotSpec::xy(
+				crate::plot::composition::PlotComposition::single(
+					crate::plot::core::PlotType::Line,
+				),
+				"x",
+				"y",
+			),
+		})
+		.expect("resolved line");
+		let kernel =
+			crate::plot::factory::create_plot(&resolved.resolved_spec, &resolved.data, 800, 480);
+		(resolved, kernel)
+	}
 
 	fn product_0074_framed_host_panel() -> iced::Element<'static, EditorMsg, iced::Theme, ()> {
 		let header: iced::Element<'static, EditorMsg, iced::Theme, ()> = iced::widget::Space::new()
@@ -6434,6 +6491,237 @@ mod tests {
 		assert_eq!(panel.kind, "result-table");
 	}
 
+	#[test]
+	fn product_0075_results_replace_table_plot_and_message_under_one_panel() {
+		use super::RESULT_PANEL;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		editor.set_query_result(polars::df!("value" => [1_i64]).expect("result table"));
+		assert!(matches!(
+			editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Table(_)
+		));
+
+		let first_revision = editor.panels.panels[&RESULT_PANEL].revision;
+		let (_, kernel) = product_0075_test_plot();
+		editor.begin_query();
+		editor.set_query_plot("plot.line".to_owned(), kernel);
+		let deadline = Instant::now() + Duration::from_secs(10);
+		while editor.panels.panels[&RESULT_PANEL].revision <= first_revision
+			&& Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(matches!(
+			editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Plot(_)
+		));
+		assert!(
+			editor.panels.panels[&RESULT_PANEL].revision > first_revision,
+			"replacing Results refreshes its one durable host identity"
+		);
+
+		editor.begin_query();
+		editor.set_query_message("done".to_owned());
+		assert!(matches!(
+			&editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Message(message) if message == "done"
+		));
+		editor.begin_query();
+		editor.set_query_result(polars::df!("value" => [2_i64]).expect("replacement table"));
+		assert!(matches!(
+			editor.panels.panels[&RESULT_PANEL].content,
+			PanelContent::Table(_)
+		));
+		assert_eq!(
+			editor
+				.viewport
+				.as_ref()
+				.expect("results viewport")
+				.panes
+				.iter()
+				.filter(|pane| {
+					pane.host_panel
+						.as_ref()
+						.is_some_and(|panel| panel.panel_id == RESULT_PANEL)
+				})
+				.count(),
+			1,
+			"table and plot results replace one panel rather than multiplying panes"
+		);
+		editor.shutdown();
+	}
+
+	#[test]
+	fn product_0075_export_reads_visible_plot_geometry_and_keeps_stale_last_good() {
+		use super::RESULT_PANEL;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		let (_, kernel) = product_0075_test_plot();
+		editor.set_query_plot("same/title ☃".to_owned(), kernel);
+		let pane = editor
+			.viewport
+			.as_ref()
+			.expect("plot viewport")
+			.panes
+			.iter()
+			.find(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|panel| panel.panel_id == RESULT_PANEL)
+			})
+			.expect("visible plot pane");
+		let expected_width = pane.rect.width.get() as f32 * metrics::CELL_WIDTH - 8.0;
+		let expected_height =
+			pane.rect.height.get() as f32 * metrics::LINE_HEIGHT - PANE_HEADER_HEIGHT - 8.0;
+
+		let exports = editor.host_plot_exports();
+		assert_eq!(exports.len(), 1);
+		assert_eq!(exports[0].title, "same/title ☃");
+		assert_eq!(exports[0].width, expected_width);
+		assert_eq!(exports[0].height, expected_height);
+
+		editor.panels.panels.get_mut(&RESULT_PANEL).unwrap().status = PanelStatus::Stale;
+		assert_eq!(
+			editor.host_plot_exports().len(),
+			1,
+			"export describes the stale last-good plot the window still shows"
+		);
+		editor.set_query_message("not a plot".to_owned());
+		assert!(
+			editor.host_plot_exports().is_empty(),
+			"visible non-plot results are excluded"
+		);
+		editor.shutdown();
+	}
+
+	#[test]
+	fn product_0075_export_order_deduplicates_identity_not_titles() {
+		use libaryon::core::PaneRect;
+		use libaryon::engine::HostPanelId;
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		let rect = editor
+			.viewport
+			.as_ref()
+			.expect("viewport")
+			.focused_pane()
+			.expect("pane")
+			.rect;
+		let (_, first) = product_0075_test_plot();
+		let (_, second) = product_0075_test_plot();
+		editor.panels.set_plot(
+			HostPanelId::new(17),
+			"same/title".to_owned(),
+			first,
+			crate::plot::theme::PlotSettingsLayer::default(),
+		);
+		editor.panels.set_content(
+			HostPanelId::new(18),
+			PanelContent::Message("not a plot".to_owned()),
+		);
+		editor.panels.set_plot(
+			HostPanelId::new(19),
+			"same/title".to_owned(),
+			second,
+			crate::plot::theme::PlotSettingsLayer::default(),
+		);
+
+		let exports = editor.host_plot_exports_for([
+			(HostPanelId::new(17), rect),
+			(HostPanelId::new(17), rect),
+			(HostPanelId::new(18), rect),
+			(HostPanelId::new(19), rect),
+		]);
+		assert_eq!(exports.len(), 2, "one visible identity yields one artifact");
+		assert_eq!(
+			exports
+				.iter()
+				.map(|plot| plot.title.as_str())
+				.collect::<Vec<_>>(),
+			["same/title", "same/title"],
+			"first viewport occurrence orders export; titles neither deduplicate nor name files"
+		);
+		assert!(
+			editor
+				.host_plot_exports_for([(HostPanelId::new(17), PaneRect::default())])
+				.is_empty(),
+			"an undersized pane never constructs a zero-sized renderer"
+		);
+		editor.shutdown();
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0075_retired_dashboard_role_closes_once_without_touching_results() {
+		use super::{RESULT_PANEL, RETIRED_DASHBOARD_PANEL};
+
+		let mut editor = CodeEditor::new("select 1;");
+		wait_for_content(&mut editor, "select 1;");
+		editor.session_restore_error = Some("PRODUCT-0075 terminal owner refusal".to_owned());
+		editor.begin_query();
+		wait_for_host_panel(&mut editor);
+		editor.send(EditorCommand::OpenHostPanel {
+			panel_id: RETIRED_DASHBOARD_PANEL,
+			kind: "retired-dashboard".to_owned(),
+			title: "Dashboard".to_owned(),
+			placement: HostPanelPlacement::Split {
+				direction: SplitDirection::Vertical,
+			},
+			focus: false,
+		});
+
+		let deadline = Instant::now() + Duration::from_secs(10);
+		let mut cleanup_was_armed = false;
+		while Instant::now() < deadline {
+			editor.poll();
+			cleanup_was_armed |= !editor.retired_dashboard_closures.is_empty();
+			let dashboard_is_visible = editor.viewport.as_ref().is_some_and(|viewport| {
+				viewport.panes.iter().any(|pane| {
+					pane.host_panel
+						.as_ref()
+						.is_some_and(|panel| panel.panel_id == RETIRED_DASHBOARD_PANEL)
+				})
+			});
+			if cleanup_was_armed && !dashboard_is_visible {
+				break;
+			}
+			thread::sleep(Duration::from_millis(5));
+		}
+		assert!(
+			cleanup_was_armed,
+			"the migration tombstone observed panel 2 before proving its absence"
+		);
+		let viewport = editor.viewport.as_ref().expect("cleaned viewport");
+		assert!(viewport.panes.iter().all(|pane| {
+			pane.host_panel
+				.as_ref()
+				.is_none_or(|panel| panel.panel_id != RETIRED_DASHBOARD_PANEL)
+		}));
+		assert!(
+			viewport.panes.iter().any(|pane| {
+				pane.host_panel
+					.as_ref()
+					.is_some_and(|panel| panel.panel_id == RESULT_PANEL)
+			}),
+			"retiring panel 2 leaves the ordinary Results role untouched"
+		);
+		assert_eq!(
+			editor.session_restore_error.as_deref(),
+			Some("PRODUCT-0075 terminal owner refusal"),
+			"the panel-2 tombstone follows terminal reconciliation without interpreting or replacing its refusal"
+		);
+		editor.shutdown();
+	}
+
 	#[cfg(feature = "toron")]
 	#[test]
 	fn rune_view_collection_tiles_one_forward_producer_group_without_tabs() {
@@ -6727,7 +7015,7 @@ mod tests {
 			.document_id
 			.unwrap();
 		let named = LocalViewIdentity::Named("bars".into());
-		let anonymous = LocalViewIdentity::Anonymous(1);
+		let anonymous = LocalViewIdentity::Anonymous(0);
 		let views = [
 			(
 				named.clone(),
@@ -6872,6 +7160,23 @@ mod tests {
 			reopened.rune_view_panel_id(reopened_buffer, &anonymous),
 			Some(anonymous_panel)
 		);
+		assert!(matches!(
+			reopened.panels.panels[&anonymous_panel].content,
+			PanelContent::Unresolved
+		));
+		let (_, plain_kernel) = product_0075_test_plot();
+		reopened.set_rune_view_plot(
+			anonymous_panel,
+			"plot.line".to_owned(),
+			plain_kernel,
+			crate::plot::theme::PlotSettingsLayer::default(),
+		);
+		assert_eq!(
+			reopened.rune_view_panel_id(reopened_buffer, &LocalViewIdentity::Anonymous(0)),
+			Some(anonymous_panel),
+			"PRODUCT-0075 reruns a restored plain scratch plot in its exact host panel"
+		);
+		assert!(reopened.rune_view_panel_is_plot(reopened_buffer, &anonymous));
 		assert_eq!(reopened.view_group_ids[&reopened_buffer], group);
 		let restored_colours = reopened.take_restored_colour_meanings().unwrap();
 		let canonical_identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
@@ -7188,7 +7493,7 @@ mod tests {
 				.view_panel_ids
 				.values()
 				.all(|panel| !matches!(panel.get(), 1 | 2)),
-			"PRODUCT-0061 semantic map excludes fixed RESULT_PANEL and DASHBOARD_PANEL roles"
+			"PRODUCT-0061 semantic map excludes fixed results and retired dashboard roles"
 		);
 	}
 
@@ -7196,13 +7501,13 @@ mod tests {
 	fn disposal_releases_only_after_the_projection_agrees() {
 		use libaryon::engine::{HostEvent, HostPanelId};
 
-		let panel_id = HostPanelId::new(2);
+		let panel_id = HostPanelId::new(17);
 		let mut editor = CodeEditor::new("select 1;");
 		wait_for_content(&mut editor, "select 1;");
 		editor.send(EditorCommand::OpenHostPanel {
 			panel_id,
-			kind: "dashboard".to_string(),
-			title: "Dashboard".to_string(),
+			kind: "test-panel".to_string(),
+			title: "Test Panel".to_string(),
 			placement: HostPanelPlacement::Split {
 				direction: SplitDirection::Vertical,
 			},
@@ -7365,41 +7670,6 @@ mod tests {
 				.focused_pane_id,
 			panel_id,
 			"a host-panel click must update Baryon's workspace focus"
-		);
-	}
-
-	#[test]
-	fn opening_dashboard_creates_and_focuses_its_host_panel() {
-		let mut editor = CodeEditor::new("select 1;");
-		wait_for_content(&mut editor, "select 1;");
-		editor.open_dashboard();
-
-		let deadline = Instant::now() + Duration::from_secs(10);
-		while editor.viewport.as_ref().is_none_or(|viewport| {
-			!viewport.panes.iter().any(|pane| {
-				pane.host_panel
-					.as_ref()
-					.is_some_and(|panel| panel.panel_id == DASHBOARD_PANEL)
-			})
-		}) && Instant::now() < deadline
-		{
-			editor.poll();
-			thread::sleep(Duration::from_millis(5));
-		}
-		let viewport = editor.viewport.as_ref().expect("dashboard viewport");
-		assert_eq!(
-			viewport.focused_pane_id,
-			viewport
-				.panes
-				.iter()
-				.find(|pane| {
-					pane.host_panel
-						.as_ref()
-						.is_some_and(|panel| panel.panel_id == DASHBOARD_PANEL)
-				})
-				.expect("dashboard pane")
-				.pane_id,
-			"opening the dashboard intentionally transfers workspace focus"
 		);
 	}
 
@@ -8172,7 +8442,8 @@ mod tests {
 		};
 		editor.set_markdown_cell_table_with_skin(identity.clone(), first, TableSkin::DEFAULT);
 		editor.set_markdown_cell_table_with_skin(identity.clone(), second, alternate_skin);
-		let Some(NotebookCellOutput::Table(artifact)) = editor.notebook_outputs.get(&identity)
+		let Some(super::NotebookCellOutput::Table(artifact)) =
+			editor.notebook_outputs.get(&identity)
 		else {
 			panic!("markdown completion must retain one table artifact")
 		};
@@ -8203,7 +8474,7 @@ mod tests {
 			id: "types".to_owned(),
 		};
 		editor.set_markdown_cell_table(markdown_identity.clone(), frame.clone());
-		let Some(NotebookCellOutput::Table(markdown)) =
+		let Some(super::NotebookCellOutput::Table(markdown)) =
 			editor.notebook_outputs.get(&markdown_identity)
 		else {
 			panic!("Markdown result must complete as a table");
