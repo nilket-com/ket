@@ -963,6 +963,10 @@ async fn perf_command(args: &[String]) -> ExitCode {
 			.and_then(serde_json::Value::as_str)
 			.unwrap_or_default()
 			.to_string();
+		let budget = match GaugeBudget::from_environment() {
+			Ok(budget) => budget,
+			Err(message) => return harness_error(&message),
+		};
 		match prepare_paired_ablation_journal(
 			&output_dir,
 			query,
@@ -976,6 +980,7 @@ async fn perf_command(args: &[String]) -> ExitCode {
 			&paired_switch,
 			paired_gate,
 			paired_materiality_floor_ms,
+			budget,
 		) {
 			Ok(journal) => Some(journal),
 			Err(message) => return harness_error(&message),
@@ -1388,6 +1393,38 @@ fn adr450_scale_rungs(args: &[String]) -> Result<Vec<f64>, String> {
 	Ok((1..=10).map(f64::from).collect())
 }
 
+#[derive(Clone, Copy)]
+struct GaugeBudget {
+	memory_per_task: u64,
+	memory_per_task_provenance: &'static str,
+	spill_bytes_reserved: u64,
+	spill_bytes_reserved_provenance: &'static str,
+}
+
+impl GaugeBudget {
+	fn from_environment() -> Result<Self, String> {
+		let (memory_per_task, memory_per_task_provenance) = gauge_memory_per_task()?;
+		let (spill_bytes_reserved, spill_bytes_reserved_provenance) =
+			gauge_spill_bytes_reserved()?;
+		Ok(Self {
+			memory_per_task,
+			memory_per_task_provenance,
+			spill_bytes_reserved,
+			spill_bytes_reserved_provenance,
+		})
+	}
+
+	#[cfg(test)]
+	const fn defaults() -> Self {
+		Self {
+			memory_per_task: 64 * 1024 * 1024,
+			memory_per_task_provenance: "default",
+			spill_bytes_reserved: 512 * 1024 * 1024,
+			spill_bytes_reserved_provenance: "default",
+		}
+	}
+}
+
 fn adr450_scale_ladder_command(args: &[String]) -> ExitCode {
 	let query = flag_value(args, "--query").unwrap_or("q05");
 	if !ALL_QUERY_IDS.contains(&query) {
@@ -1401,7 +1438,19 @@ fn adr450_scale_ladder_command(args: &[String]) -> ExitCode {
 		Ok(scales) => scales,
 		Err(message) => return harness_error(&message),
 	};
-	match run_adr450_scale_ladder(query, &scales, mode, data_source, &data_dir, &output_dir) {
+	let budget = match GaugeBudget::from_environment() {
+		Ok(budget) => budget,
+		Err(message) => return harness_error(&message),
+	};
+	match run_adr450_scale_ladder(
+		query,
+		&scales,
+		mode,
+		data_source,
+		&data_dir,
+		&output_dir,
+		budget,
+	) {
 		Ok(record) => {
 			println!("{record}");
 			ExitCode::SUCCESS
@@ -1417,12 +1466,17 @@ fn run_adr450_scale_ladder(
 	data_source: &str,
 	data_dir: &Path,
 	output_dir: &Path,
+	budget: GaugeBudget,
 ) -> Result<serde_json::Value, String> {
 	if data_source != "parquet" && data_source != "persisted" {
 		return Err("ADR 450 requires --data-source parquet".to_string());
 	}
-	let (memory_per_task, memory_provenance) = gauge_memory_per_task()?;
-	let (spill_bytes_reserved, spill_provenance) = gauge_spill_bytes_reserved()?;
+	let GaugeBudget {
+		memory_per_task,
+		memory_per_task_provenance: memory_provenance,
+		spill_bytes_reserved,
+		spill_bytes_reserved_provenance: spill_provenance,
+	} = budget;
 	// q05 keeps the original artifact names: ADR 449 reads its fixture scale
 	// from `adr450_selected_scale.json` and that contract must not move.
 	let suffix = if query == "q05" {
@@ -4432,12 +4486,13 @@ fn prepare_paired_ablation_journal(
 	switch: &PairedSwitch,
 	paired_gate: PairedGate,
 	fixed_materiality_floor_ms: Option<f64>,
+	budget: GaugeBudget,
 ) -> Result<PerfSampleJournal, String> {
 	if dataset_fingerprint.is_empty() {
 		return Err("paired-ablation manifest requires a dataset fingerprint".to_string());
 	}
-	let (memory_per_task, _) = gauge_memory_per_task()?;
-	let (spill_bytes_reserved, _) = gauge_spill_bytes_reserved()?;
+	let memory_per_task = budget.memory_per_task;
+	let spill_bytes_reserved = budget.spill_bytes_reserved;
 	std::fs::create_dir_all(output_dir)
 		.map_err(|error| format!("create paired-ablation output directory: {error}"))?;
 	let journal_path = output_dir.join(ADR449_PAIRED_JOURNAL);
@@ -5427,6 +5482,7 @@ mod tests {
 			std::env::temp_dir().join(format!("toron-adr449-journal-{}", std::process::id()));
 		let _ = std::fs::remove_dir_all(&directory);
 		let data_dir = Path::new("/tmp/adr449-data");
+		let budget = GaugeBudget::defaults();
 		let journal = prepare_paired_ablation_journal(
 			&directory,
 			"q05",
@@ -5440,6 +5496,7 @@ mod tests {
 			&test_paired_switch(),
 			PairedGate::PlanDistinct,
 			None,
+			budget,
 		)
 		.unwrap();
 		journal
@@ -5465,6 +5522,7 @@ mod tests {
 			&test_paired_switch(),
 			PairedGate::PlanDistinct,
 			None,
+			budget,
 		)
 		.unwrap();
 		assert_eq!(resumed.rows.len(), 1);
@@ -5481,15 +5539,19 @@ mod tests {
 				1,
 				"fnv1a64:cohort",
 				&test_paired_switch(),
-				PairedGate::PlanDistinct,
-				None,
-			)
+					PairedGate::PlanDistinct,
+					None,
+					budget,
+				)
 			.is_err()
 		);
 		// ADR 456: a resume across different budget coordinates is a regime mix
 		// and must refuse exactly like a scale or dataset mismatch.
-		// SAFETY: gate suites run single-threaded; no concurrent env readers.
-		unsafe { std::env::set_var("TORON_TPCH_MEMORY_PER_TASK", "134217728") };
+		let different_budget = GaugeBudget {
+			memory_per_task: 128 * 1024 * 1024,
+			memory_per_task_provenance: "explicit",
+			..budget
+		};
 		assert!(
 			prepare_paired_ablation_journal(
 				&directory,
@@ -5502,12 +5564,12 @@ mod tests {
 				1,
 				"fnv1a64:cohort",
 				&test_paired_switch(),
-				PairedGate::PlanDistinct,
-				None,
-			)
-			.is_err()
+					PairedGate::PlanDistinct,
+					None,
+					different_budget,
+				)
+				.is_err()
 		);
-		unsafe { std::env::remove_var("TORON_TPCH_MEMORY_PER_TASK") };
 		// ADR 452: a regenerated dataset at the same path must refuse to resume,
 		// and an empty fingerprint (no verified dataset) must never launch.
 		assert!(
@@ -5522,9 +5584,10 @@ mod tests {
 				1,
 				"fnv1a64:regenerated",
 				&test_paired_switch(),
-				PairedGate::PlanDistinct,
-				None,
-			)
+					PairedGate::PlanDistinct,
+					None,
+					budget,
+				)
 			.is_err()
 		);
 		assert!(
@@ -5539,9 +5602,10 @@ mod tests {
 				1,
 				"",
 				&test_paired_switch(),
-				PairedGate::PlanDistinct,
-				None,
-			)
+					PairedGate::PlanDistinct,
+					None,
+					budget,
+				)
 			.is_err()
 		);
 		std::fs::remove_dir_all(directory).unwrap();
@@ -5567,6 +5631,7 @@ mod tests {
 			&shape_switch,
 			PairedGate::ShapePreservingSpillIndex,
 			Some(3_554.0),
+			budget,
 		)
 		.unwrap();
 		assert!(
@@ -5581,9 +5646,10 @@ mod tests {
 				1,
 				"fnv1a64:shape",
 				&shape_switch,
-				PairedGate::PlanDistinct,
-				None,
-			)
+					PairedGate::PlanDistinct,
+					None,
+					budget,
+				)
 			.is_err(),
 			"resume must reject a paired-gate mismatch"
 		);
@@ -5599,9 +5665,10 @@ mod tests {
 				1,
 				"fnv1a64:shape",
 				&shape_switch,
-				PairedGate::ShapePreservingSpillIndex,
-				Some(3_555.0),
-			)
+					PairedGate::ShapePreservingSpillIndex,
+					Some(3_555.0),
+					budget,
+				)
 			.is_err(),
 			"resume must reject a fixed-floor mismatch"
 		);
@@ -5737,6 +5804,7 @@ mod tests {
 			"parquet",
 			Path::new("/tmp/adr455-data"),
 			&directory,
+			GaugeBudget::defaults(),
 		)
 		.unwrap();
 		assert_eq!(record["outcome"], "no_commit");
@@ -5750,34 +5818,12 @@ mod tests {
 	}
 
 	#[test]
-	fn adr454_gauge_budget_defaults_and_overrides_with_provenance() {
-		// SAFETY: gate suites run single-threaded (--test-threads=1); no other
-		// thread reads the environment while this test mutates it.
-		unsafe { std::env::remove_var("TORON_TPCH_MEMORY_PER_TASK") };
-		assert_eq!(
-			gauge_memory_per_task().unwrap(),
-			(64 * 1024 * 1024, "default")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_MEMORY_PER_TASK", "268435456") };
-		assert_eq!(gauge_memory_per_task().unwrap(), (268435456, "explicit"));
-		unsafe { std::env::set_var("TORON_TPCH_MEMORY_PER_TASK", "0") };
-		assert!(gauge_memory_per_task().is_err());
-		unsafe { std::env::set_var("TORON_TPCH_MEMORY_PER_TASK", "lots") };
-		assert!(gauge_memory_per_task().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_MEMORY_PER_TASK") };
-		unsafe { std::env::remove_var("TORON_TPCH_SPILL_BYTES_RESERVED") };
-		assert_eq!(
-			gauge_spill_bytes_reserved().unwrap(),
-			(512 * 1024 * 1024, "default")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SPILL_BYTES_RESERVED", "2147483648") };
-		assert_eq!(
-			gauge_spill_bytes_reserved().unwrap(),
-			(2147483648, "explicit")
-		);
-		unsafe { std::env::set_var("TORON_TPCH_SPILL_BYTES_RESERVED", "0") };
-		assert!(gauge_spill_bytes_reserved().is_err());
-		unsafe { std::env::remove_var("TORON_TPCH_SPILL_BYTES_RESERVED") };
+	fn adr454_gauge_budget_defaults_are_explicit_inputs_to_consumers() {
+		let budget = GaugeBudget::defaults();
+		assert_eq!(budget.memory_per_task, 64 * 1024 * 1024);
+		assert_eq!(budget.memory_per_task_provenance, "default");
+		assert_eq!(budget.spill_bytes_reserved, 512 * 1024 * 1024);
+		assert_eq!(budget.spill_bytes_reserved_provenance, "default");
 	}
 
 	#[test]

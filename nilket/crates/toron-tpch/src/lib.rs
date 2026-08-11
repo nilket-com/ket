@@ -4474,17 +4474,27 @@ pub fn gauge_partition_work_concurrency_requested() -> Result<(u64, &'static str
 /// Every perf row records this pair — a gauge figure never floats free of the
 /// budget regime it was measured under.
 pub fn gauge_memory_per_task() -> Result<(u64, &'static str), String> {
-	match std::env::var(GAUGE_MEMORY_PER_TASK_ENV) {
+	parse_gauge_byte_budget(
+		GAUGE_MEMORY_PER_TASK_ENV,
+		std::env::var(GAUGE_MEMORY_PER_TASK_ENV),
+		QueryBudget::test_default().memory_per_task.get(),
+	)
+}
+
+fn parse_gauge_byte_budget(
+	name: &str,
+	raw: Result<String, std::env::VarError>,
+	default: u64,
+) -> Result<(u64, &'static str), String> {
+	match raw {
 		Ok(raw) => match raw.parse::<u64>() {
 			Ok(bytes) if bytes > 0 => Ok((bytes, "explicit")),
 			_ => Err(format!(
-				"{GAUGE_MEMORY_PER_TASK_ENV} must be a positive byte count, got {raw:?}"
+				"{name} must be a positive byte count, got {raw:?}"
 			)),
 		},
-		Err(std::env::VarError::NotPresent) => {
-			Ok((QueryBudget::test_default().memory_per_task.get(), "default"))
-		}
-		Err(error) => Err(format!("{GAUGE_MEMORY_PER_TASK_ENV}: {error}")),
+		Err(std::env::VarError::NotPresent) => Ok((default, "default")),
+		Err(error) => Err(format!("{name}: {error}")),
 	}
 }
 
@@ -4762,20 +4772,49 @@ fn adr528_distributed_posture_differs_only_in_single_partition_execution() {
 /// [`gauge_memory_per_task`]: a frontier probe must be able to move one budget
 /// dimension while holding the others explicitly, not implicitly.
 pub fn gauge_spill_bytes_reserved() -> Result<(u64, &'static str), String> {
-	match std::env::var(GAUGE_SPILL_BYTES_RESERVED_ENV) {
-		Ok(raw) => match raw.parse::<u64>() {
-			Ok(bytes) if bytes > 0 => Ok((bytes, "explicit")),
-			_ => Err(format!(
-				"{GAUGE_SPILL_BYTES_RESERVED_ENV} must be a positive byte count, got {raw:?}"
-			)),
-		},
-		Err(std::env::VarError::NotPresent) => Ok((
-			QueryBudget::test_default()
-				.spill_bytes_reserved_per_query
-				.get(),
-			"default",
-		)),
-		Err(error) => Err(format!("{GAUGE_SPILL_BYTES_RESERVED_ENV}: {error}")),
+	parse_gauge_byte_budget(
+		GAUGE_SPILL_BYTES_RESERVED_ENV,
+		std::env::var(GAUGE_SPILL_BYTES_RESERVED_ENV),
+		QueryBudget::test_default()
+			.spill_bytes_reserved_per_query
+			.get(),
+	)
+}
+
+#[cfg(test)]
+mod gauge_byte_budget_tests {
+	use super::*;
+
+	#[test]
+	fn defaults_overrides_and_invalid_values_do_not_mutate_process_environment() {
+		assert_eq!(
+			parse_gauge_byte_budget(
+				GAUGE_MEMORY_PER_TASK_ENV,
+				Err(std::env::VarError::NotPresent),
+				64 * 1024 * 1024,
+			)
+			.unwrap(),
+			(64 * 1024 * 1024, "default")
+		);
+		assert_eq!(
+			parse_gauge_byte_budget(
+				GAUGE_MEMORY_PER_TASK_ENV,
+				Ok("268435456".to_string()),
+				64 * 1024 * 1024,
+			)
+			.unwrap(),
+			(268435456, "explicit")
+		);
+		for invalid in ["0", "lots"] {
+			assert!(
+				parse_gauge_byte_budget(
+					GAUGE_MEMORY_PER_TASK_ENV,
+					Ok(invalid.to_string()),
+					64 * 1024 * 1024,
+				)
+				.is_err()
+			);
+		}
 	}
 }
 
