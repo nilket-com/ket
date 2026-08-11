@@ -11,6 +11,7 @@ pub(crate) enum StableAggregateKernel {
 	Min = 3,
 	Max = 4,
 	Avg = 5,
+	ApproxQuantile = 6,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +26,7 @@ pub(crate) enum AggregateInputDomain {
 	SumNumeric,
 	AvgNumeric,
 	OrderedMinMax,
+	QuantileNumeric,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -35,6 +37,7 @@ pub(crate) enum AggregateOutputRule {
 	// ADR 268: AVG — Float64 for integer/float input, widened Decimal for Decimal input (subsumes the
 	// former flat `Float64` rule, which AVG was the only user of).
 	AvgNumeric,
+	Float64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -110,9 +113,20 @@ pub(crate) const STABLE_AGGREGATE_KERNELS: &[AggregateKernelSpec] = &[
 		nullable: true,
 		grouped_supported: true,
 	},
+	AggregateKernelSpec {
+		kind: StableAggregateKernel::ApproxQuantile,
+		sql_name: "APPROX_QUANTILE",
+		output_name: "quantile",
+		arity: AggregateArity::One,
+		input_domain: AggregateInputDomain::QuantileNumeric,
+		output_rule: AggregateOutputRule::Float64,
+		nullable: true,
+		grouped_supported: true,
+	},
 ];
 
-pub(crate) const STABLE_AGGREGATE_SQL_NAMES: &[&str] = &["COUNT", "SUM", "MIN", "MAX", "AVG"];
+pub(crate) const STABLE_AGGREGATE_SQL_NAMES: &[&str] =
+	&["COUNT", "SUM", "MIN", "MAX", "AVG", "APPROX_QUANTILE"];
 
 pub(crate) fn stable_kernel_for_function(
 	function: &AggregateFunction,
@@ -124,7 +138,8 @@ pub(crate) fn stable_kernel_for_function(
 		AggregateFunction::Min => Some(StableAggregateKernel::Min),
 		AggregateFunction::Max => Some(StableAggregateKernel::Max),
 		AggregateFunction::Avg => Some(StableAggregateKernel::Avg),
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None,
+		AggregateFunction::ApproxQuantile(_) => Some(StableAggregateKernel::ApproxQuantile),
+		AggregateFunction::LinearRegress => None,
 	}
 }
 
@@ -154,7 +169,6 @@ pub(crate) fn stable_aggregate_sql_name(upper: &str) -> Option<&'static str> {
 pub(crate) fn experimental_aggregate_sql_name(upper: &str) -> Option<&'static str> {
 	match upper {
 		"LINEAR_REGRESS" => Some("LINEAR_REGRESS"),
-		"APPROX_QUANTILE" => Some("APPROX_QUANTILE"),
 		_ => None,
 	}
 }
@@ -172,6 +186,7 @@ pub(crate) fn stable_output_data_type(
 		(AggregateOutputRule::SameAsInput, Some(data_type)) => Some(data_type.clone()),
 		(AggregateOutputRule::SumNumeric, Some(data_type)) => sum_numeric_output(data_type),
 		(AggregateOutputRule::AvgNumeric, Some(data_type)) => avg_numeric_output(data_type),
+		(AggregateOutputRule::Float64, Some(_)) => Some(DataType::Float64),
 		(_, None) => None,
 	}
 }
@@ -190,17 +205,25 @@ pub(crate) fn input_domain_accepts(domain: AggregateInputDomain, input: Option<&
 		AggregateInputDomain::SumNumeric => input.is_some_and(is_sum_numeric_input),
 		AggregateInputDomain::AvgNumeric => input.is_some_and(is_avg_numeric_input),
 		AggregateInputDomain::OrderedMinMax => input.is_some_and(is_ordered_min_max_input),
+		AggregateInputDomain::QuantileNumeric => input.is_some_and(is_quantile_numeric_input),
 	}
 }
 
 fn fallback_output_data_type(rule: AggregateOutputRule) -> DataType {
 	match rule {
 		// ADR 268: AvgNumeric's fallback (no input type available) is Float64, matching plain AVG.
-		AggregateOutputRule::AvgNumeric => DataType::Float64,
+		AggregateOutputRule::AvgNumeric | AggregateOutputRule::Float64 => DataType::Float64,
 		AggregateOutputRule::Int64
 		| AggregateOutputRule::SameAsInput
 		| AggregateOutputRule::SumNumeric => DataType::Int64,
 	}
+}
+
+fn is_quantile_numeric_input(input: &DataType) -> bool {
+	matches!(
+		input,
+		DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+	)
 }
 
 fn sum_numeric_output(input: &DataType) -> Option<DataType> {

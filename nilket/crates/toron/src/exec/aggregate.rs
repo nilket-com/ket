@@ -12,6 +12,8 @@ const PRIMITIVE_INT64_PRODUCER: &str = "primitive Int64 grouped aggregate reside
 const BORROW_SINGLE_UTF8_GROUP_KEY_ENV: &str = "TORON_TPCH_BORROW_SINGLE_UTF8_GROUP_KEY";
 const PRIMITIVE_INT64_COUNT_ENV: &str = "TORON_EXEC_PRIMITIVE_INT64_COUNT";
 const GROUPED_FOLD_RECEIPT_PATH_ENV: &str = "TORON_GROUPED_FOLD_RECEIPT_PATH";
+pub(in crate::exec) const MAX_QUANTILE_STATES_PER_EXECUTION: usize = 1_024;
+const QUANTILE_K: wendelon::schema::KllK = wendelon::schema::KllK::new(800);
 
 #[derive(Default)]
 struct GroupedFoldReceipt {
@@ -767,7 +769,7 @@ impl Executor {
 		let stream = self.storage.scan(req).instrument(span).await?;
 		let mut stream = stream.into_batches();
 		let mut rows = 0usize;
-		let mut state = init_global_aggregate_state(aggr_expr)?;
+		let mut state = init_global_aggregate_state_for_executor(&self.context, aggr_expr)?;
 
 		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
 			let Some(batch) = stream.next().await else {
@@ -1305,7 +1307,7 @@ impl Executor {
 		aggr_expr: &[BoundAggregateCall],
 		output_schema: &arrow::datatypes::SchemaRef,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		let mut state = init_global_aggregate_state(aggr_expr)?;
+		let mut state = init_global_aggregate_state_for_executor(&self.context, aggr_expr)?;
 		for batch in input_batches {
 			self.fold_global_aggregate_state(&mut state, aggr_expr, batch)?;
 		}
@@ -1383,7 +1385,14 @@ impl Executor {
 						update_max_state(state, &arr, row)?;
 					}
 				}
-				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+				AggregateFunction::ApproxQuantile(_) => {
+					let arr =
+						self.evaluate_bound_single_root(&call.args, batch, "APPROX_QUANTILE arg")?;
+					for row in 0..batch.num_rows() {
+						update_quantile_state(state, &arr, row)?;
+					}
+				}
+				AggregateFunction::LinearRegress => {
 					return Err(ExecutionError::NotImplemented {
 						feature: "bound experimental aggregate execution",
 					});
@@ -1712,9 +1721,37 @@ fn streaming_filter_predicate(
 }
 
 pub(in crate::exec) fn init_global_aggregate_state(
+	context: &ExecutionContext,
 	aggr_expr: &[BoundAggregateCall],
 ) -> Result<Vec<AggState>, ExecutionError> {
-	init_bound_states(aggr_expr)
+	init_global_aggregate_state_for_executor(context, aggr_expr)
+}
+
+fn init_global_aggregate_state_for_executor(
+	context: &ExecutionContext,
+	aggr_expr: &[BoundAggregateCall],
+) -> Result<Vec<AggState>, ExecutionError> {
+	let (populations, declared_bytes) = quantile_populations_and_declared_bytes(aggr_expr)?;
+	if populations > context.quantile_state_allowance {
+		return Err(quantile_state_cap_error(populations));
+	}
+	if declared_bytes > context.task_budget.memory.get() {
+		return Err(ExecutionError::BudgetExhausted {
+			dimension: BudgetDimension::Memory,
+			producer: "APPROX_QUANTILE declared accumulator footprint",
+			requested: crate::distributed::budget::ByteCount::new(declared_bytes),
+			available: context.task_budget.memory,
+			detail: crate::error::BudgetExhaustedDetail::None,
+		});
+	}
+	let reservation = reserve_quantile_states(
+		context.quantile_states_admitted.clone(),
+		context.quantile_state_allowance,
+		populations,
+	)?;
+	let states = init_bound_states_with_seed(aggr_expr, context.quantile_execution_seed, &[])?;
+	reservation.commit();
+	Ok(states)
 }
 
 pub(in crate::exec) fn finalize_global_aggregate_state(
@@ -1763,7 +1800,12 @@ pub(in crate::exec) fn finalize_global_aggregate_state(
 					output_schema.field(results_cols.len()).data_type(),
 				)?);
 			}
-			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+			AggregateFunction::ApproxQuantile(_) => {
+				results_cols.push(Arc::new(Float64Array::from(vec![finalize_quantile_state(
+					state,
+				)?])) as ArrayRef);
+			}
+			AggregateFunction::LinearRegress => {
 				return Err(ExecutionError::NotImplemented {
 					feature: "bound experimental aggregate execution",
 				});
@@ -1935,6 +1977,9 @@ impl Executor {
 							| AggState::MaxDecimal128 { .. } => {
 								update_max_state(state, array, row)?;
 							}
+							AggState::Quantile(_) => {
+								update_quantile_state(state, array, row)?;
+							}
 						},
 					}
 				}
@@ -1979,7 +2024,8 @@ impl Executor {
 							| AggState::MaxDecimal128 { .. }
 							| AggState::AvgInt { .. }
 							| AggState::AvgFloat { .. }
-							| AggState::AvgDecimal { .. } => 0,
+							| AggState::AvgDecimal { .. }
+							| AggState::Quantile(_) => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -2060,6 +2106,20 @@ impl Executor {
 		aggr_expr: &[BoundAggregateCall],
 		batch: &RecordBatch,
 	) -> Result<(), ExecutionError> {
+		let (quantile_populations, quantile_bytes) =
+			quantile_populations_and_declared_bytes(aggr_expr)?;
+		groups.configure_quantile_admission(
+			quantile_populations,
+			quantile_bytes,
+			self.context.quantile_state_allowance,
+			self.context.quantile_states_admitted.clone(),
+		);
+		if quantile_populations != 0 {
+			// ADR 0546 adds a byte refusal for quantile populations without silently
+			// changing the long-standing generic grouped-fold budget contract for
+			// every non-quantile aggregate.
+			groups.set_growth_budget_bytes(Some(self.context.task_budget.memory.get()));
+		}
 		let fold_started = groups.profile_enabled().then(Instant::now);
 		// ADR 508 step 2 fold refinement: three batch-level sub-stages inside the `fold` phase, each
 		// reconciling to `fold` rather than to the handler. No per-row locks — probe and growth
@@ -2100,16 +2160,15 @@ impl Executor {
 				| AggregateFunction::Sum
 				| AggregateFunction::Min
 				| AggregateFunction::Max
-				| AggregateFunction::Avg => Ok(Some(self.evaluate_bound_single_root(
+				| AggregateFunction::Avg
+				| AggregateFunction::ApproxQuantile(_) => Ok(Some(self.evaluate_bound_single_root(
 					&call.args,
 					batch,
 					"aggregate arg",
 				)?)),
-				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-					Err(ExecutionError::NotImplemented {
-						feature: "bound grouped experimental aggregate",
-					})
-				}
+				AggregateFunction::LinearRegress => Err(ExecutionError::NotImplemented {
+					feature: "bound grouped experimental aggregate",
+				}),
 			})
 			.collect::<Result<Vec<_>, _>>()?;
 
@@ -2127,6 +2186,7 @@ impl Executor {
 			.map(group_array_reader)
 			.collect::<Result<Vec<_>, _>>()?;
 		let borrow_single_utf8_group_key = borrow_single_utf8_group_key_enabled();
+		let quantile_seed = self.context.quantile_execution_seed;
 		if let Some(stage) = arg_stage {
 			node_attribution::close_stage(stage, &telemetry);
 		}
@@ -2143,14 +2203,23 @@ impl Executor {
 				groups.entry_or_init_single_utf8(
 					(!array.is_null(row)).then(|| array.value(row)),
 					aggr_expr.len(),
-					|| init_bound_states(aggr_expr),
+					|| {
+						let identity = group_identity_bytes(&[match array.is_null(row) {
+							true => GroupValue::Null,
+							false => GroupValue::Utf8(array.value(row).to_owned()),
+						}]);
+						init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+					},
 				)?
 			} else {
 				key.clear();
 				for reader in group_readers.iter() {
 					key.push(reader.value(row));
 				}
-				groups.entry_or_init(&key, aggr_expr.len(), || init_bound_states(aggr_expr))?
+				groups.entry_or_init(&key, aggr_expr.len(), || {
+					let identity = group_identity_bytes(&key);
+					init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
+				})?
 			};
 			for ((state, input), reader) in states
 				.iter_mut()
@@ -2202,6 +2271,9 @@ impl Executor {
 						| AggState::MaxFloat64 { .. }
 						| AggState::MaxDecimal128 { .. } => {
 							update_max_state(state, array, row)?;
+						}
+						AggState::Quantile(_) => {
+							update_quantile_state(state, array, row)?;
 						}
 					},
 				}
@@ -2258,7 +2330,8 @@ impl Executor {
 								| AggState::MaxDecimal128 { .. }
 								| AggState::AvgInt { .. }
 								| AggState::AvgFloat { .. }
-								| AggState::AvgDecimal { .. } => 0,
+								| AggState::AvgDecimal { .. }
+								| AggState::Quantile(_) => 0,
 							})
 							.collect::<Vec<_>>();
 						columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -2275,7 +2348,14 @@ impl Executor {
 						let output_type = output_schema.field(columns.len()).data_type().clone();
 						columns.push(avg_column_from_groups(&entries, agg_idx, &output_type)?);
 					}
-					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+					AggregateFunction::ApproxQuantile(_) => {
+						let values = entries
+							.iter()
+							.map(|entry| finalize_quantile_state(&entry.states[agg_idx]))
+							.collect::<Result<Vec<_>, _>>()?;
+						columns.push(Arc::new(Float64Array::from(values)) as ArrayRef);
+					}
+					AggregateFunction::LinearRegress => {
 						return Err(ExecutionError::NotImplemented {
 							feature: "bound grouped experimental aggregate",
 						});
@@ -2309,6 +2389,49 @@ pub(in crate::exec) enum GroupValue {
 }
 
 #[derive(Debug, Clone, Copy)]
+pub(in crate::exec) enum QuantileInputType {
+	Int32,
+	Int64,
+	Float32,
+	Float64,
+}
+
+impl QuantileInputType {
+	fn from_data_type(data_type: &DataType) -> Result<Self, ExecutionError> {
+		match data_type {
+			DataType::Int32 => Ok(Self::Int32),
+			DataType::Int64 => Ok(Self::Int64),
+			DataType::Float32 => Ok(Self::Float32),
+			DataType::Float64 => Ok(Self::Float64),
+			other => Err(ExecutionError::InvalidExpression {
+				message: format!("APPROX_QUANTILE does not support input type {other:?}"),
+			}),
+		}
+	}
+
+	fn type_tag(self) -> u8 {
+		use wendelon::schema::optimizer_facts::{
+			ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT32,
+			ARROW_STATS_TAG_INT64,
+		};
+		match self {
+			Self::Int32 => ARROW_STATS_TAG_INT32,
+			Self::Int64 => ARROW_STATS_TAG_INT64,
+			Self::Float32 => ARROW_STATS_TAG_FLOAT32,
+			Self::Float64 => ARROW_STATS_TAG_FLOAT64,
+		}
+	}
+}
+
+#[derive(Debug, Clone)]
+pub(in crate::exec) struct QuantileState {
+	sketch: Arc<Mutex<KllSketch>>,
+	q: f64,
+	input_type: QuantileInputType,
+	owner: bool,
+}
+
+#[derive(Debug, Clone)]
 pub(in crate::exec) enum AggState {
 	Count(i64),
 	SumInt {
@@ -2364,6 +2487,7 @@ pub(in crate::exec) enum AggState {
 		count: u64,
 		input_scale: i8,
 	},
+	Quantile(Box<QuantileState>),
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2435,10 +2559,109 @@ fn legacy_aggregate_output_type(function: &AggregateFunction, input_type: &DataT
 	}
 }
 
-pub(in crate::exec) fn init_bound_states(
+fn init_bound_states_with_seed(
 	aggr_expr: &[BoundAggregateCall],
+	seed: [u8; 32],
+	group_identity: &[u8],
 ) -> Result<Vec<AggState>, ExecutionError> {
-	aggr_expr.iter().map(init_bound_state_for_call).collect()
+	let mut shared = HashMap::<Vec<u8>, Arc<Mutex<KllSketch>>>::new();
+	let mut states = Vec::with_capacity(aggr_expr.len());
+	for call in aggr_expr {
+		if let AggregateFunction::ApproxQuantile(q) = call.function {
+			let input_type = QuantileInputType::from_data_type(first_arg_type(call)?)?;
+			let expression =
+				postcard::to_stdvec(&call.args).map_err(|error| ExecutionError::Kernel {
+					message: format!("APPROX_QUANTILE expression identity failed: {error}"),
+				})?;
+			let mut population_key =
+				Vec::with_capacity(expression.len() + group_identity.len() + 8);
+			population_key.extend_from_slice(&(expression.len() as u64).to_be_bytes());
+			population_key.extend_from_slice(&expression);
+			population_key.extend_from_slice(group_identity);
+			let existing = shared.get(&population_key).cloned();
+			let owner = existing.is_none();
+			let sketch = match existing {
+				Some(sketch) => sketch,
+				None => {
+					if shared.len() == MAX_QUANTILE_STATES_PER_EXECUTION {
+						return Err(quantile_state_cap_error(shared.len() + 1));
+					}
+					let identity = *blake3::keyed_hash(&seed, &population_key).as_bytes();
+					let sketch = Arc::new(Mutex::new(
+						KllSketch::new_with_randomness(
+							input_type.type_tag(),
+							QUANTILE_K,
+							seed,
+							identity,
+						)
+						.map_err(|error| ExecutionError::Kernel {
+							message: error.to_string(),
+						})?,
+					));
+					shared.insert(population_key, sketch.clone());
+					sketch
+				}
+			};
+			states.push(AggState::Quantile(Box::new(QuantileState {
+				sketch,
+				q,
+				input_type,
+				owner,
+			})));
+		} else {
+			states.push(init_bound_state_for_call(call)?);
+		}
+	}
+	Ok(states)
+}
+
+fn group_identity_bytes(key: &[GroupValue]) -> Vec<u8> {
+	let mut bytes = Vec::new();
+	for value in key {
+		match value {
+			GroupValue::Null => bytes.push(0),
+			GroupValue::Boolean(value) => bytes.extend_from_slice(&[1, u8::from(*value)]),
+			GroupValue::Int32(value) => {
+				bytes.push(2);
+				bytes.extend_from_slice(&value.to_be_bytes());
+			}
+			GroupValue::Int64(value) => {
+				bytes.push(3);
+				bytes.extend_from_slice(&value.to_be_bytes());
+			}
+			GroupValue::Float32(value) => {
+				bytes.push(4);
+				bytes.extend_from_slice(&value.to_be_bytes());
+			}
+			GroupValue::Float64(value) => {
+				bytes.push(5);
+				bytes.extend_from_slice(&value.to_be_bytes());
+			}
+			GroupValue::Date32(value) => {
+				bytes.push(6);
+				bytes.extend_from_slice(&value.to_be_bytes());
+			}
+			GroupValue::Timestamp(unit, value) => {
+				bytes.push(match unit {
+					TimeUnit::Second => 7,
+					TimeUnit::Millisecond => 8,
+					TimeUnit::Microsecond => 9,
+					TimeUnit::Nanosecond => 10,
+				});
+				bytes.extend_from_slice(&value.to_be_bytes());
+			}
+			GroupValue::Utf8(value) => {
+				bytes.push(11);
+				bytes.extend_from_slice(&(value.len() as u64).to_be_bytes());
+				bytes.extend_from_slice(value.as_bytes());
+			}
+			GroupValue::Decimal128(value) => {
+				bytes.push(12);
+				bytes.extend_from_slice(&value.to_be_bytes());
+			}
+		}
+	}
+	bytes
 }
 
 fn init_bound_state_for_call(call: &BoundAggregateCall) -> Result<AggState, ExecutionError> {
@@ -2465,13 +2688,214 @@ fn init_bound_state_for_call(call: &BoundAggregateCall) -> Result<AggState, Exec
 			.transpose()
 			.map(|state| state.unwrap_or(AggState::MaxInt64 { value: None })),
 		AggregateFunction::Avg => avg_state_for_data_type(first_arg_type(call)?),
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-			Ok(AggState::SumInt {
-				total: 0,
-				seen: false,
-			})
+		AggregateFunction::LinearRegress => Ok(AggState::SumInt {
+			total: 0,
+			seen: false,
+		}),
+		AggregateFunction::ApproxQuantile(_) => unreachable!("quantile state is shared by program"),
+	}
+}
+
+pub(in crate::exec) fn quantile_state_cap_error(requested: usize) -> ExecutionError {
+	ExecutionError::BudgetExhausted {
+		dimension: BudgetDimension::Memory,
+		producer: "MAX_QUANTILE_STATES_PER_EXECUTION=1024",
+		requested: crate::distributed::budget::ByteCount::new(requested as u64),
+		available: crate::distributed::budget::ByteCount::new(
+			MAX_QUANTILE_STATES_PER_EXECUTION as u64,
+		),
+		detail: crate::error::BudgetExhaustedDetail::None,
+	}
+}
+
+pub(in crate::exec) struct QuantileStateReservation {
+	admitted: Arc<std::sync::atomic::AtomicUsize>,
+	count: usize,
+	committed: bool,
+}
+
+impl QuantileStateReservation {
+	pub(in crate::exec) fn commit(mut self) {
+		self.committed = true;
+	}
+}
+
+impl Drop for QuantileStateReservation {
+	fn drop(&mut self) {
+		if !self.committed {
+			self.admitted
+				.fetch_sub(self.count, std::sync::atomic::Ordering::AcqRel);
 		}
 	}
+}
+
+pub(in crate::exec) fn reserve_quantile_states(
+	admitted: Arc<std::sync::atomic::AtomicUsize>,
+	limit: usize,
+	count: usize,
+) -> Result<QuantileStateReservation, ExecutionError> {
+	loop {
+		let current = admitted.load(std::sync::atomic::Ordering::Acquire);
+		let requested = current.saturating_add(count);
+		if requested > limit {
+			return Err(quantile_state_cap_error(requested));
+		}
+		if admitted
+			.compare_exchange_weak(
+				current,
+				requested,
+				std::sync::atomic::Ordering::AcqRel,
+				std::sync::atomic::Ordering::Acquire,
+			)
+			.is_ok()
+		{
+			return Ok(QuantileStateReservation {
+				admitted,
+				count,
+				committed: false,
+			});
+		}
+	}
+}
+
+pub(in crate::exec) fn quantile_populations_and_declared_bytes(
+	aggr_expr: &[BoundAggregateCall],
+) -> Result<(usize, u64), ExecutionError> {
+	let mut programs = Vec::<Vec<u8>>::new();
+	let mut bytes = 0_u64;
+	for call in aggr_expr {
+		if !matches!(call.function, AggregateFunction::ApproxQuantile(_)) {
+			continue;
+		}
+		let program =
+			postcard::to_allocvec(&call.args).map_err(|error| ExecutionError::Kernel {
+				message: format!("APPROX_QUANTILE expression identity failed: {error}"),
+			})?;
+		if programs.iter().any(|existing| existing == &program) {
+			continue;
+		}
+		let width = match first_arg_type(call)? {
+			DataType::Int32 | DataType::Float32 => 4_u64,
+			DataType::Int64 | DataType::Float64 => 8_u64,
+			other => {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!("APPROX_QUANTILE does not support input type {other:?}"),
+				});
+			}
+		};
+		// ADR 0083: 5,601 retained slots at epsilon=1%, plus a conservative fixed
+		// allowance for level vectors, randomness, counters, and sampler metadata.
+		bytes = bytes.saturating_add(5_601_u64.saturating_mul(width).saturating_add(512));
+		programs.push(program);
+	}
+	Ok((programs.len(), bytes))
+}
+
+fn update_quantile_state(
+	state: &mut AggState,
+	array: &ArrayRef,
+	row: usize,
+) -> Result<(), ExecutionError> {
+	let AggState::Quantile(quantile) = state else {
+		return Err(ExecutionError::InvalidExpression {
+			message: "APPROX_QUANTILE value reached non-quantile accumulator".to_string(),
+		});
+	};
+	if !quantile.owner || array.is_null(row) {
+		return Ok(());
+	}
+	use wendelon::schema::optimizer_facts::{
+		encode_float32_optimizer_fact_scalar, encode_float64_optimizer_fact_scalar,
+		encode_signed_optimizer_fact_scalar,
+	};
+	let encoded = match quantile.input_type {
+		QuantileInputType::Int32 => encode_signed_optimizer_fact_scalar(
+			i64::from(
+				array
+					.as_any()
+					.downcast_ref::<Int32Array>()
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: "APPROX_QUANTILE Int32 array type mismatch".to_string(),
+					})?
+					.value(row),
+			),
+			4,
+		),
+		QuantileInputType::Int64 => encode_signed_optimizer_fact_scalar(
+			array
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "APPROX_QUANTILE Int64 array type mismatch".to_string(),
+				})?
+				.value(row),
+			8,
+		),
+		QuantileInputType::Float32 => encode_float32_optimizer_fact_scalar(
+			array
+				.as_any()
+				.downcast_ref::<Float32Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "APPROX_QUANTILE Float32 array type mismatch".to_string(),
+				})?
+				.value(row),
+		),
+		QuantileInputType::Float64 => encode_float64_optimizer_fact_scalar(
+			array
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "APPROX_QUANTILE Float64 array type mismatch".to_string(),
+				})?
+				.value(row),
+		),
+	}
+	.map_err(|error| ExecutionError::Kernel {
+		message: format!("APPROX_QUANTILE observation refused: {error}"),
+	})?;
+	quantile
+		.sketch
+		.lock()
+		.map_err(|_| ExecutionError::Kernel {
+			message: "APPROX_QUANTILE state lock poisoned".to_string(),
+		})?
+		.insert(encoded);
+	Ok(())
+}
+
+fn finalize_quantile_state(state: &AggState) -> Result<Option<f64>, ExecutionError> {
+	let AggState::Quantile(quantile) = state else {
+		return Err(ExecutionError::InvalidExpression {
+			message: "APPROX_QUANTILE finalize over non-quantile state".to_string(),
+		});
+	};
+	let encoded = quantile
+		.sketch
+		.lock()
+		.map_err(|_| ExecutionError::Kernel {
+			message: "APPROX_QUANTILE state lock poisoned".to_string(),
+		})?
+		.query_quantile(quantile.q)
+		.map_err(|error| ExecutionError::Kernel {
+			message: error.to_string(),
+		})?;
+	let Some(encoded) = encoded else {
+		return Ok(None);
+	};
+	use wendelon::schema::optimizer_facts::{
+		decode_float32_optimizer_fact_scalar, decode_float64_optimizer_fact_scalar,
+		decode_signed_optimizer_fact_scalar,
+	};
+	let value = match quantile.input_type {
+		QuantileInputType::Int32 | QuantileInputType::Int64 => {
+			decode_signed_optimizer_fact_scalar(&encoded).map(|value| value as f64)
+		}
+		QuantileInputType::Float32 => decode_float32_optimizer_fact_scalar(&encoded).map(f64::from),
+		QuantileInputType::Float64 => decode_float64_optimizer_fact_scalar(&encoded),
+	};
+	value.map(Some).ok_or_else(|| ExecutionError::Kernel {
+		message: "APPROX_QUANTILE result decode failed".to_string(),
+	})
 }
 
 fn first_arg_type(call: &BoundAggregateCall) -> Result<&DataType, ExecutionError> {
@@ -2740,7 +3164,8 @@ pub(in crate::exec) fn add_sum_value(
 		| (AggState::MaxDecimal128 { .. }, _)
 		| (AggState::AvgInt { .. }, _)
 		| (AggState::AvgFloat { .. }, _)
-		| (AggState::AvgDecimal { .. }, _) => Err(ExecutionError::InvalidExpression {
+		| (AggState::AvgDecimal { .. }, _)
+		| (AggState::Quantile(_), _) => Err(ExecutionError::InvalidExpression {
 			message: "SUM value reached non-SUM accumulator".to_string(),
 		}),
 	}
@@ -2810,7 +3235,8 @@ pub(in crate::exec) fn add_avg_value(
 		| (AggState::MaxInt64 { .. }, _)
 		| (AggState::MaxFloat32 { .. }, _)
 		| (AggState::MaxFloat64 { .. }, _)
-		| (AggState::MaxDecimal128 { .. }, _) => Err(ExecutionError::InvalidExpression {
+		| (AggState::MaxDecimal128 { .. }, _)
+		| (AggState::Quantile(_), _) => Err(ExecutionError::InvalidExpression {
 			message: "AVG value reached non-AVG accumulator".to_string(),
 		}),
 	}
@@ -3119,7 +3545,8 @@ fn sum_column_from_groups(
 					| AggState::MaxDecimal128 { .. }
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
-					| AggState::AvgDecimal { .. } => Ok(None),
+					| AggState::AvgDecimal { .. }
+					| AggState::Quantile(_) => Ok(None),
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
@@ -3143,7 +3570,8 @@ fn sum_column_from_groups(
 					| AggState::MaxDecimal128 { .. }
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
-					| AggState::AvgDecimal { .. } => None,
+					| AggState::AvgDecimal { .. }
+					| AggState::Quantile(_) => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
@@ -3170,7 +3598,8 @@ fn sum_column_from_groups(
 					| AggState::MaxDecimal128 { .. }
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
-					| AggState::AvgDecimal { .. } => None,
+					| AggState::AvgDecimal { .. }
+					| AggState::Quantile(_) => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(
@@ -3746,7 +4175,9 @@ mod tests {
 		let executor = Executor::new(Arc::new(InMemoryStorageScan {
 			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
 		}));
-		let mut unprofiled = init_global_aggregate_state(&calls).expect("unprofiled state");
+		let context = ExecutionContext::local_test();
+		let mut unprofiled =
+			init_global_aggregate_state(&context, &calls).expect("unprofiled state");
 		executor
 			.fold_global_aggregate_state(&mut unprofiled, &calls, &batch)
 			.expect("unprofiled fold");
@@ -3758,7 +4189,7 @@ mod tests {
 		)
 		.expect("test profile");
 		let root = profile.begin_root().expect("begin profile root");
-		let mut profiled = init_global_aggregate_state(&calls).expect("profiled state");
+		let mut profiled = init_global_aggregate_state(&context, &calls).expect("profiled state");
 		executor
 			.fold_global_decimal_sum_state_profiled(&mut profiled, &calls, &batch, &profile)
 			.expect("profiled fold");
@@ -3878,6 +4309,203 @@ mod tests {
 		)
 		.expect("expected grouped output");
 		assert_eq!(output, vec![expected]);
+	}
+
+	#[test]
+	fn adr546_one_grouped_sketch_serves_distinct_quartile_parameters() {
+		let schema = Arc::new(Schema::new(vec![
+			Field::new("group", DataType::Utf8, false),
+			Field::new("value", DataType::Int64, false),
+		]));
+		let input = RecordBatch::try_new(
+			schema,
+			vec![
+				Arc::new(StringArray::from(vec!["g"; 9])),
+				Arc::new(Int64Array::from((-4_i64..=4).collect::<Vec<_>>())),
+			],
+		)
+		.expect("quantile input");
+		let group_expr = column_program("group", ColumnOrdinal(0), DataType::Utf8, false);
+		let value = || column_program("value", ColumnOrdinal(1), DataType::Int64, false);
+		let calls = [0.25, 0.5, 0.75]
+			.into_iter()
+			.map(|q| BoundAggregateCall {
+				function: AggregateFunction::ApproxQuantile(q),
+				args: value(),
+			})
+			.collect::<Vec<_>>();
+
+		let mut states = init_bound_states_with_seed(&calls, [7; 32], b"group-g")
+			.expect("shared quantile states");
+		let sketches = states
+			.iter()
+			.map(|state| match state {
+				AggState::Quantile(quantile) => quantile.sketch.clone(),
+				other => panic!("unexpected state {other:?}"),
+			})
+			.collect::<Vec<_>>();
+		assert!(Arc::ptr_eq(&sketches[0], &sketches[1]));
+		assert!(Arc::ptr_eq(&sketches[1], &sketches[2]));
+		let skewed = Arc::new(Int64Array::from(
+			std::iter::repeat_n(0_i64, 1_600)
+				.chain(std::iter::repeat_n(1_i64, 800))
+				.chain(2_i64..402)
+				.collect::<Vec<_>>(),
+		)) as ArrayRef;
+		for row in 0..skewed.len() {
+			for state in &mut states {
+				update_quantile_state(state, &skewed, row).expect("fold skewed quantile");
+			}
+		}
+		let quartiles = states
+			.iter()
+			.map(finalize_quantile_state)
+			.collect::<Result<Vec<_>, _>>()
+			.expect("finalize shared skewed sketch")
+			.into_iter()
+			.map(|value| value.expect("nonempty skewed quantile"))
+			.collect::<Vec<_>>();
+		assert!(quartiles.windows(2).all(|pair| pair[0] <= pair[1]));
+		assert!(
+			sketches[0]
+				.lock()
+				.expect("shared quantile lock")
+				.retained_item_count()
+				< skewed.len(),
+			"the shared-state ordering control must force compaction"
+		);
+
+		let output_schema = Arc::new(Schema::new(vec![
+			Field::new("group", DataType::Utf8, false),
+			Field::new("lower_quartile", DataType::Float64, true),
+			Field::new("median", DataType::Float64, true),
+			Field::new("upper_quartile", DataType::Float64, true),
+		]));
+		let executor = Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		}));
+		let output = executor
+			.bound_grouped_aggregate(&[input], &group_expr, &calls, &output_schema)
+			.expect("grouped quantiles");
+		let batch = &output[0];
+		let observed = (1..=3)
+			.map(|column| {
+				batch
+					.column(column)
+					.as_any()
+					.downcast_ref::<Float64Array>()
+					.expect("quantile column")
+					.value(0)
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(observed, vec![-2.0, 0.0, 2.0]);
+	}
+
+	#[test]
+	fn adr546_global_initialization_consumes_the_execution_seed_and_admission() {
+		let call = BoundAggregateCall {
+			function: AggregateFunction::ApproxQuantile(0.5),
+			args: column_program("value", ColumnOrdinal(0), DataType::Int64, false),
+		};
+		let seed = [0x54; 32];
+		let context = ExecutionContext::local_test().with_quantile_execution(seed, 1);
+		let states = init_global_aggregate_state(&context, &[call]).expect("global quantile state");
+		let AggState::Quantile(quantile) = &states[0] else {
+			panic!("global quantile must use the canonical sketch state");
+		};
+		let wendelon::schema::aggregate::AggregateState::Kll {
+			seed: state_seed, ..
+		} = quantile
+			.sketch
+			.lock()
+			.expect("quantile state lock")
+			.clone()
+			.into_state()
+		else {
+			panic!("quantile sketch must serialize as KLL state");
+		};
+		assert_eq!(state_seed, seed);
+		assert_eq!(
+			context
+				.quantile_states_admitted
+				.load(std::sync::atomic::Ordering::Acquire),
+			1,
+			"global initialization must consume this terminal task's allowance"
+		);
+	}
+
+	#[test]
+	fn adr546_state_count_cap_refuses_independently_of_the_byte_budget() {
+		let admitted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		reserve_quantile_states(
+			admitted.clone(),
+			MAX_QUANTILE_STATES_PER_EXECUTION,
+			MAX_QUANTILE_STATES_PER_EXECUTION,
+		)
+		.expect("the declared confidence population fits exactly")
+		.commit();
+
+		let error =
+			match reserve_quantile_states(admitted.clone(), MAX_QUANTILE_STATES_PER_EXECUTION, 1) {
+				Ok(_) => panic!("state 1025 must refuse even if bytes remain"),
+				Err(error) => error,
+			};
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: "MAX_QUANTILE_STATES_PER_EXECUTION=1024",
+				requested,
+				available,
+				..
+			} if requested.get() == 1_025 && available.get() == 1_024
+		));
+		assert_eq!(
+			admitted.load(std::sync::atomic::Ordering::Acquire),
+			1_024,
+			"a refused reservation must not mutate admission state"
+		);
+	}
+
+	#[test]
+	fn adr546_grouped_memory_guard_charges_the_declared_sketch_before_construction() {
+		const DECLARED_INT64_SKETCH_BYTES: u64 = 5_601 * 8 + 512;
+		let admission = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		let mut groups = BoundGroupedAggregateGroups::with_test_profile_lookup(4, |_| None);
+		groups.configure_quantile_admission(
+			1,
+			DECLARED_INT64_SKETCH_BYTES,
+			MAX_QUANTILE_STATES_PER_EXECUTION,
+			admission.clone(),
+		);
+		groups.set_growth_budget_bytes(Some(u64::MAX));
+		groups
+			.entry_or_init(&[GroupValue::Int64(1)], 1, || Ok(vec![AggState::Count(0)]))
+			.expect("first group");
+
+		let before = groups.current_resident_bytes();
+		groups
+			.set_growth_budget_bytes(Some(before.saturating_add(DECLARED_INT64_SKETCH_BYTES - 1)));
+		let constructor_called = std::cell::Cell::new(false);
+		let error = groups
+			.entry_or_init(&[GroupValue::Int64(2)], 1, || {
+				constructor_called.set(true);
+				Ok(vec![AggState::Count(0)])
+			})
+			.expect_err("the second declared sketch must exceed the small task budget");
+		assert!(matches!(
+			error,
+			ExecutionError::BudgetExhausted {
+				dimension: BudgetDimension::Memory,
+				producer: "generic bound grouped-fold hash table",
+				..
+			}
+		));
+		assert!(
+			!constructor_called.get(),
+			"refusal must precede state construction"
+		);
+		assert_eq!(admission.load(std::sync::atomic::Ordering::Acquire), 1);
 	}
 
 	#[test]

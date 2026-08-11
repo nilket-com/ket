@@ -148,7 +148,7 @@ use crate::storage::secondary_index_backfill::{
 use crate::storage::secondary_index_segment::{
 	SecondaryIndexSegment, secondary_index_segment_storage_path,
 };
-use crate::storage::sketch::{HllRegisters, KllSketch};
+use crate::storage::sketch::HllRegisters;
 use crate::storage::stats::{
 	COLUMN_STAT_MAX_TRUNCATED, COLUMN_STAT_MIN_TRUNCATED, ColumnStatsDescriptorIdentity,
 	ColumnStatsGroupTopKEntry, ColumnStatsGroupTopKPayload, ParsedColumnStatsBlock,

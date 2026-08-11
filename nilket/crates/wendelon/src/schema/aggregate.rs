@@ -20,7 +20,7 @@ use std::io::{Error, ErrorKind};
 pub const AGG_FORMAT_VERSION: u16 = 1;
 pub const AGG_MAX_AGGREGATES: usize = 64;
 pub const AGG_COUNT_STAR_COLUMN_SENTINEL: u16 = 0xFFFF;
-pub const AGG_KLL_DEFAULT_K: u32 = 200;
+pub const AGG_KLL_DEFAULT_K: u32 = 800;
 pub const AGG_KLL_MIN_K: u32 = 64;
 pub const AGG_KLL_MAX_K: u32 = 2048;
 pub const AGG_MIN_MAX_PREFIX_BYTES: usize = 64;
@@ -158,7 +158,7 @@ impl AggregateFunction {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum QuantileSketch {
-	Kll { k: KllK },
+	Kll { k: KllK, execution_seed: [u8; 32] },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -175,6 +175,17 @@ impl AggregateExpression {
 			tag: AggregateFunctionTag::COUNT_STAR,
 			column_ordinal: AGG_COUNT_STAR_COLUMN_SENTINEL,
 			parameter_block: Vec::new(),
+		}
+	}
+
+	pub fn quantile_kll(column_ordinal: u16, k: KllK, execution_seed: [u8; 32]) -> Self {
+		let mut parameter_block = Vec::with_capacity(36);
+		parameter_block.extend_from_slice(&k.get().to_be_bytes());
+		parameter_block.extend_from_slice(&execution_seed);
+		Self {
+			tag: AggregateFunctionTag::QUANTILE_KLL,
+			column_ordinal,
+			parameter_block,
 		}
 	}
 
@@ -246,11 +257,10 @@ impl AggregateExpression {
 			}
 			AggregateFunctionTag::QUANTILE_KLL => {
 				require_column(self.column_ordinal)?;
+				let (k, execution_seed) = parse_kll_parameter(&self.parameter_block)?;
 				Ok(AggregateFunction::Quantile {
 					column: self.column_ordinal,
-					sketch: QuantileSketch::Kll {
-						k: parse_kll_k_parameter(&self.parameter_block)?,
-					},
+					sketch: QuantileSketch::Kll { k, execution_seed },
 				})
 			}
 			_ => Err(AggRejectCode::UnsupportedFunction),
@@ -289,16 +299,17 @@ fn parse_hll_precision_parameter(parameter_block: &[u8]) -> Result<HllPrecision,
 	Ok(precision)
 }
 
-fn parse_kll_k_parameter(parameter_block: &[u8]) -> Result<KllK, AggRejectCode> {
-	let k = match parameter_block {
-		[] => AGG_KLL_DEFAULT_K,
-		[bytes @ ..] if bytes.len() == 4 => {
-			u32::from_be_bytes(bytes.try_into().expect("validated KLL parameter length"))
-		}
-		_ => return Err(AggRejectCode::SketchParameterInvalid),
-	};
+fn parse_kll_parameter(parameter_block: &[u8]) -> Result<(KllK, [u8; 32]), AggRejectCode> {
+	let (k_bytes, seed_bytes) = parameter_block
+		.split_at_checked(4)
+		.filter(|(_, seed)| seed.len() == 32)
+		.ok_or(AggRejectCode::SketchParameterInvalid)?;
+	let k = u32::from_be_bytes(k_bytes.try_into().expect("four-byte KLL parameter"));
 	validate_kll_k(k)?;
-	Ok(KllK::new(k))
+	Ok((
+		KllK::new(k),
+		seed_bytes.try_into().expect("32-byte KLL execution seed"),
+	))
 }
 
 pub fn validate_kll_k(k: u32) -> Result<(), AggRejectCode> {
@@ -546,6 +557,13 @@ impl AggregateResponse {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct KllSamplerState {
+	pub item: Option<Vec<u8>>,
+	pub weight: u64,
+	pub height: u32,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum AggregateState {
 	Count {
 		value: u64,
@@ -584,7 +602,10 @@ pub enum AggregateState {
 		k: KllK,
 		total_item_count: u64,
 		levels: Vec<Vec<Vec<u8>>>,
-		compaction_seed: u32,
+		seed: [u8; 32],
+		identity: [u8; 32],
+		compaction_counters: Vec<u64>,
+		sampler: KllSamplerState,
 	},
 	Empty,
 }
@@ -717,12 +738,28 @@ pub fn encode_aggregate_state(
 				k,
 				total_item_count,
 				levels,
-				compaction_seed,
+				seed,
+				identity,
+				compaction_counters,
+				sampler,
 			},
 		) => {
+			out.push(0x83);
 			out.push(*arrow_type_tag);
 			out.extend_from_slice(&k.get().to_be_bytes());
 			out.extend_from_slice(&total_item_count.to_be_bytes());
+			out.extend_from_slice(seed);
+			out.extend_from_slice(identity);
+			let counter_count = u32::try_from(compaction_counters.len()).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"KLL compaction counter count exceeds u32::MAX",
+				)
+			})?;
+			out.extend_from_slice(&counter_count.to_be_bytes());
+			for counter in compaction_counters {
+				out.extend_from_slice(&counter.to_be_bytes());
+			}
 			let level_count = u32::try_from(levels.len()).map_err(|_| {
 				Error::new(ErrorKind::InvalidInput, "KLL level count exceeds u32::MAX")
 			})?;
@@ -736,7 +773,12 @@ pub fn encode_aggregate_state(
 					out.extend_from_slice(value);
 				}
 			}
-			out.extend_from_slice(&compaction_seed.to_be_bytes());
+			out.extend_from_slice(&sampler.height.to_be_bytes());
+			out.extend_from_slice(&sampler.weight.to_be_bytes());
+			out.push(u8::from(sampler.item.is_some()));
+			if let Some(item) = sampler.item.as_ref() {
+				out.extend_from_slice(item);
+			}
 		}
 		(_, AggregateState::Empty) => {}
 		_ => {
@@ -835,6 +877,34 @@ mod tests {
 			request.validate_envelope(true).unwrap_err(),
 			AggRejectCode::ApproxNotAllowed
 		);
+	}
+
+	#[test]
+	fn adr083_quantile_parameter_requires_and_preserves_the_execution_seed() {
+		let seed = [0x83; 32];
+		let expression = AggregateExpression::quantile_kll(3, KllK::new(800), seed);
+		assert_eq!(
+			expression.function().unwrap(),
+			AggregateFunction::Quantile {
+				column: 3,
+				sketch: QuantileSketch::Kll {
+					k: KllK::new(800),
+					execution_seed: seed,
+				},
+			}
+		);
+		for legacy in [Vec::new(), 800_u32.to_be_bytes().to_vec()] {
+			let expression = AggregateExpression {
+				tag: AggregateFunctionTag::QUANTILE_KLL,
+				column_ordinal: 3,
+				parameter_block: legacy,
+			};
+			assert_eq!(
+				expression.function().unwrap_err(),
+				AggRejectCode::SketchParameterInvalid,
+				"a legacy k-only block cannot license a randomized guarantee"
+			);
+		}
 	}
 
 	#[test]

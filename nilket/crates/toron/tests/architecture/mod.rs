@@ -30,6 +30,7 @@ pub(crate) mod outer_join_completion;
 pub(crate) mod plan_namespace;
 pub(crate) mod predicate_pushdown;
 pub(crate) mod qualified_resolution;
+pub(crate) mod quantile;
 pub(crate) mod range_distribution;
 pub(crate) mod range_skew;
 pub(crate) mod recursive_cte;

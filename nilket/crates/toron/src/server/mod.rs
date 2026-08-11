@@ -313,7 +313,11 @@ impl ToronWorker {
 			.with_task_telemetry(telemetry.clone())
 			.with_join_runtime_observation_mode(spec.join_runtime_observation_mode.clone())
 			.with_runtime_filter(scan_runtime_filter(spec))
-			.with_downstream_cancellation(downstream_cancellation);
+			.with_downstream_cancellation(downstream_cancellation)
+			.with_quantile_execution(
+				spec.context.quantile_execution_seed,
+				spec.context.quantile_state_allowance,
+			);
 			task_context.trace_context = if crate::telemetry::enabled() {
 				crate::telemetry::task_trace_context(spec)
 			} else {

@@ -120,20 +120,28 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("stable aggregate kernel enum");
-	for variant in ["CountAll", "Count", "Sum", "Min", "Max", "Avg"] {
+	for variant in [
+		"CountAll",
+		"Count",
+		"Sum",
+		"Min",
+		"Max",
+		"Avg",
+		"ApproxQuantile",
+	] {
 		assert!(
 			stable_kernel_enum.contains(variant),
 			"stable aggregate kernel missing {variant}"
 		);
 	}
-	assert_eq!(enum_variant_count(stable_kernel_enum), 6);
+	assert_eq!(enum_variant_count(stable_kernel_enum), 7);
 
 	let stable_rows = catalog
 		.split("STABLE_AGGREGATE_KERNELS")
 		.nth(1)
 		.and_then(|rest| rest.split("];").next())
 		.expect("stable aggregate kernel rows");
-	assert_eq!(stable_rows.matches("AggregateKernelSpec {").count(), 6);
+	assert_eq!(stable_rows.matches("AggregateKernelSpec {").count(), 7);
 	for marker in [
 		"kind: StableAggregateKernel::CountAll",
 		"kind: StableAggregateKernel::Count",
@@ -141,16 +149,19 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		"kind: StableAggregateKernel::Min",
 		"kind: StableAggregateKernel::Max",
 		"kind: StableAggregateKernel::Avg",
+		"kind: StableAggregateKernel::ApproxQuantile",
 		"arity: AggregateArity::Zero",
 		"arity: AggregateArity::One",
 		"input_domain: AggregateInputDomain::Any",
 		"input_domain: AggregateInputDomain::SumNumeric",
 		"input_domain: AggregateInputDomain::AvgNumeric",
 		"input_domain: AggregateInputDomain::OrderedMinMax",
+		"input_domain: AggregateInputDomain::QuantileNumeric",
 		"output_rule: AggregateOutputRule::Int64",
 		"output_rule: AggregateOutputRule::AvgNumeric",
 		"output_rule: AggregateOutputRule::SameAsInput",
 		"output_rule: AggregateOutputRule::SumNumeric",
+		"output_rule: AggregateOutputRule::Float64",
 		"nullable: false",
 		"nullable: true",
 		"grouped_supported: true",
@@ -158,20 +169,20 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		assert!(stable_rows.contains(marker), "catalog missing {marker}");
 	}
 	assert_eq!(stable_rows.matches("sql_name: \"COUNT\"").count(), 2);
-	for sql_name in ["COUNT", "SUM", "MIN", "MAX", "AVG"] {
+	for sql_name in ["COUNT", "SUM", "MIN", "MAX", "AVG", "APPROX_QUANTILE"] {
 		assert!(
 			stable_rows.contains(&format!("sql_name: \"{sql_name}\"")),
 			"catalog missing SQL name {sql_name}"
 		);
 	}
-	for output_name in ["count", "sum", "min", "max", "avg"] {
+	for output_name in ["count", "sum", "min", "max", "avg", "quantile"] {
 		assert!(
 			stable_rows.contains(&format!("output_name: \"{output_name}\"")),
 			"catalog missing output name {output_name}"
 		);
 	}
 	assert!(!stable_rows.contains("LinearRegress"));
-	assert!(!stable_rows.contains("ApproxQuantile"));
+	assert!(stable_rows.contains("ApproxQuantile"));
 
 	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
@@ -197,11 +208,13 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("AggState enum");
-	// ADR 268 added `AvgDecimal`; ADR 284 added Decimal MIN/MAX for strict q02.
-	assert_eq!(enum_variant_count(agg_state_enum), 16);
+	// ADR 268 added `AvgDecimal`; ADR 284 added Decimal MIN/MAX for strict q02;
+	// ADR 546 added the heap-owning shared quantile state.
+	assert_eq!(enum_variant_count(agg_state_enum), 17);
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
-	assert!(derives_above.contains("Copy"));
+	assert!(derives_above.contains("Clone"));
+	assert!(!derives_above.contains("Copy"));
 }
 
 #[test]
@@ -1290,8 +1303,9 @@ pub(crate) fn adr028_experimental_kernels_excluded_from_grouped_signatures() {
 		.next()
 		.expect("stable kernel for function")
 		.1;
+	assert!(mapping.contains("AggregateFunction::LinearRegress => None"));
 	assert!(mapping.contains(
-		"AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None"
+		"AggregateFunction::ApproxQuantile(_) => Some(StableAggregateKernel::ApproxQuantile)"
 	));
 	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
 		.expect("read SQL planner source");
@@ -1416,7 +1430,11 @@ pub(crate) fn adr019_min_max_aggregate_kernels_guards_are_narrow() {
 	assert!(exec.contains("AggState::MaxDecimal128"));
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
-	assert!(derives_above.contains("Copy"));
+	assert!(derives_above.contains("Clone"));
+	assert!(
+		!derives_above.contains("Copy"),
+		"ADR 546 adds an Arc-backed shared quantile state; AggState must not pretend heap ownership is Copy"
+	);
 
 	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
 		.expect("read storage source");
@@ -1451,7 +1469,11 @@ pub(crate) fn adr020_avg_aggregate_kernel_guards_are_narrow() {
 	assert!(exec.contains("fn avg_finalize"));
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
-	assert!(derives_above.contains("Copy"));
+	assert!(derives_above.contains("Clone"));
+	assert!(
+		!derives_above.contains("Copy"),
+		"ADR 546 adds an Arc-backed shared quantile state; AggState must not pretend heap ownership is Copy"
+	);
 
 	let storage = std::fs::read_to_string(manifest_dir().join("src/storage.rs"))
 		.expect("read storage source");

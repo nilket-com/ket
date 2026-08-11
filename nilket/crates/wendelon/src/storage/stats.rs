@@ -47,7 +47,6 @@ const COLUMN_STATS_BLOOM_SIPHASH_ALT_K0: u64 = 0x1716_1514_1312_1110;
 const COLUMN_STATS_BLOOM_SIPHASH_ALT_K1: u64 = 0x1F1E_1D1C_1B1A_1918;
 const COLUMN_STATS_HLL_SIPHASH_K0: u64 = 0x2726_2524_2322_2120;
 const COLUMN_STATS_HLL_SIPHASH_K1: u64 = 0x2F2E_2D2C_2B2A_2928;
-const COLUMN_STATS_KLL_COMPACTION_SEED: u32 = 0x5A17_1590;
 const _: [(); COLUMN_STATS_BLOCK_HEADER_BYTES] = [(); 8 + 4 + 16 + 8 + 32 + 8 + 4 + 4];
 const _: [(); COLUMN_STATS_COLUMN_HEADER_BYTES] = [(); 2 + 1 + 1 + 1 + 4];
 
@@ -748,11 +747,9 @@ fn build_column_stats_block_internal(
 			.heavy_hitters
 			.iter()
 			.find(|spec| spec.column_name.as_str() == field.name().as_str());
-		let range_distribution_spec = descriptor
-			.stats_policy
-			.range_distributions
-			.iter()
-			.find(|spec| spec.column_name.as_str() == field.name().as_str());
+		// ADR 0083: CSB v1 cannot represent weighted KLL levels. Until the v2
+		// writer fence lands, new v1 blocks deliberately omit this fact class.
+		let range_distribution_spec: Option<&ColumnRangeDistributionSpec> = None;
 		pending.push(build_pending_column_stats_entry(
 			column_ordinal,
 			field.as_ref(),
@@ -1638,9 +1635,8 @@ fn collect_column_stats_in_one_pass(
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
 	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
-	let mut range_distribution = range_distribution_spec
-		.map(|spec| KllSketch::new(arrow_type_tag, spec.k, COLUMN_STATS_KLL_COMPACTION_SEED))
-		.transpose()?;
+	let _ = range_distribution_spec;
+	let mut range_distribution: Option<KllSketch> = None;
 
 	for_each_encoded_non_null_value(data_type, array, |value| {
 		if min
@@ -1750,15 +1746,8 @@ fn collect_float32_column_stats(
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
 	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
-	let mut range_distribution = range_distribution_spec
-		.map(|spec| {
-			KllSketch::new(
-				ARROW_STATS_TAG_FLOAT32,
-				spec.k,
-				COLUMN_STATS_KLL_COMPACTION_SEED,
-			)
-		})
-		.transpose()?;
+	let _ = range_distribution_spec;
+	let mut range_distribution: Option<KllSketch> = None;
 	let mut saw_non_finite = false;
 
 	for row in 0..typed.len() {
@@ -1843,15 +1832,8 @@ fn collect_float64_column_stats(
 		.transpose()?;
 	let mut small_set = small_set_spec.map(SmallSetCollector::new);
 	let mut heavy_hitters = heavy_hitter_spec.map(HeavyHitterCollector::new);
-	let mut range_distribution = range_distribution_spec
-		.map(|spec| {
-			KllSketch::new(
-				ARROW_STATS_TAG_FLOAT64,
-				spec.k,
-				COLUMN_STATS_KLL_COMPACTION_SEED,
-			)
-		})
-		.transpose()?;
+	let _ = range_distribution_spec;
+	let mut range_distribution: Option<KllSketch> = None;
 	let mut saw_non_finite = false;
 
 	for row in 0..typed.len() {
@@ -4367,7 +4349,7 @@ mod tests {
 	}
 
 	#[test]
-	fn ciphertext_budget_trims_range_distribution_but_unbounded_keeps_it() {
+	fn adr083_v1_writer_omits_range_distribution_regardless_of_ciphertext_budget() {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("amount", DataType::Int64, true),
@@ -4413,12 +4395,12 @@ mod tests {
 		.unwrap();
 		let parsed = parse_column_stats_block(&unbounded).unwrap();
 		let amount = &parsed.columns[1];
-		assert_ne!(amount.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION, 0);
-		assert!(
+		assert_eq!(amount.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION, 0);
+		assert_eq!(
 			decode_column_stats_payload(amount)
 				.unwrap()
-				.range_distribution
-				.is_some()
+				.range_distribution,
+			None,
 		);
 	}
 
@@ -5005,7 +4987,7 @@ mod tests {
 	}
 
 	#[test]
-	fn range_distribution_stats_builds_kll_payload_and_locator_flag() {
+	fn adr083_v1_writer_omits_range_distribution_but_preserves_base_stats() {
 		let schema = Schema::new(vec![
 			Field::new("id", DataType::Int64, false),
 			Field::new("amount", DataType::Int64, true),
@@ -5033,30 +5015,20 @@ mod tests {
 
 		let encoded = build_always_on_column_stats_block(&descriptor, &batch).unwrap();
 		let parsed = parse_column_stats_block(&encoded).unwrap();
-		assert_ne!(
+		assert_eq!(
 			locator_flags_for_parsed_column_stats_block(&parsed) & (1 << 5),
 			0
 		);
 		let amount = &parsed.columns[1];
-		assert_ne!(amount.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION, 0);
+		assert_eq!(amount.stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION, 0);
 		let decoded = decode_column_stats_payload(amount).unwrap();
-		let range_distribution = decoded
-			.range_distribution
-			.expect("range-distribution payload");
-		assert_eq!(range_distribution.k, KllK::new(100));
-		assert_eq!(range_distribution.total_item_count, 3);
-		assert_eq!(range_distribution.retained_values.len(), 3);
-		assert!(
-			range_distribution
-				.retained_values
-				.binary_search(&encode_signed_optimizer_fact_scalar(10, 8).unwrap())
-				.is_ok()
-		);
-		assert!(
-			range_distribution
-				.retained_values
-				.binary_search(&encode_signed_optimizer_fact_scalar(10_000, 8).unwrap())
-				.is_ok()
+		assert_eq!(decoded.range_distribution, None);
+		assert_eq!(decoded.null_count, Some(1));
+		assert_eq!(decoded.non_null_count, Some(3));
+		assert_eq!(decoded.min, Some(encode_signed_stat_value(10, 8).unwrap()));
+		assert_eq!(
+			decoded.max,
+			Some(encode_signed_stat_value(10_000, 8).unwrap())
 		);
 	}
 

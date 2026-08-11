@@ -54,13 +54,15 @@ pub fn aggregate_record_batches(
 	let mut accumulators = request
 		.aggregates
 		.iter()
-		.map(|expression| {
+		.enumerate()
+		.map(|(expression_index, expression)| {
 			let function = expression.function()?;
 			Accumulator::new(
 				function,
 				request.tenant_id,
 				request.table_object_id,
 				request.request_id.get(),
+				expression_index,
 			)
 		})
 		.collect::<Result<Vec<_>, AggRejectCode>>()?;
@@ -392,6 +394,68 @@ fn decode_aggregate_state(
 }
 
 fn decode_kll_state(bytes: &[u8]) -> Result<AggregateState, AggRejectCode> {
+	if bytes.first() == Some(&0x83) {
+		return decode_kll_state_v2(bytes);
+	}
+	decode_legacy_kll_state(bytes)
+}
+
+fn decode_kll_state_v2(bytes: &[u8]) -> Result<AggregateState, AggRejectCode> {
+	let mut cursor = 1_usize;
+	let arrow_type_tag = read_u8(bytes, &mut cursor)?;
+	let value_width =
+		kll_value_width(arrow_type_tag).ok_or(AggRejectCode::PartialCrossbindFailed)?;
+	let k = KllK::new(read_u32(bytes, &mut cursor)?);
+	validate_kll_k_for_partial(k)?;
+	let total_item_count = read_u64(bytes, &mut cursor)?;
+	let seed = read_array_32(bytes, &mut cursor)?;
+	let identity = read_array_32(bytes, &mut cursor)?;
+	let counter_count = read_u32(bytes, &mut cursor)? as usize;
+	let mut compaction_counters = Vec::with_capacity(counter_count);
+	for _ in 0..counter_count {
+		compaction_counters.push(read_u64(bytes, &mut cursor)?);
+	}
+	let levels = decode_kll_levels(bytes, &mut cursor, value_width)?;
+	let sampler_height = read_u32(bytes, &mut cursor)?;
+	let sampler_weight = read_u64(bytes, &mut cursor)?;
+	let sampler_present = read_u8(bytes, &mut cursor)?;
+	let sampler_item = match sampler_present {
+		0 => None,
+		1 => {
+			let end = cursor
+				.checked_add(value_width)
+				.ok_or(AggRejectCode::PartialCrossbindFailed)?;
+			if end > bytes.len() {
+				return Err(AggRejectCode::PartialCrossbindFailed);
+			}
+			let item = bytes[cursor..end].to_vec();
+			cursor = end;
+			Some(item)
+		}
+		_ => return Err(AggRejectCode::PartialCrossbindFailed),
+	};
+	if cursor != bytes.len() {
+		return Err(AggRejectCode::PartialCrossbindFailed);
+	}
+	KllSketch::from_state(
+		arrow_type_tag,
+		k,
+		total_item_count,
+		levels,
+		seed,
+		identity,
+		compaction_counters,
+		crate::schema::aggregate::KllSamplerState {
+			item: sampler_item,
+			weight: sampler_weight,
+			height: sampler_height,
+		},
+	)
+	.map(KllSketch::into_state)
+	.map_err(|_| AggRejectCode::PartialCrossbindFailed)
+}
+
+fn decode_legacy_kll_state(bytes: &[u8]) -> Result<AggregateState, AggRejectCode> {
 	let mut cursor = 0_usize;
 	let arrow_type_tag = read_u8(bytes, &mut cursor)?;
 	let value_width =
@@ -399,34 +463,50 @@ fn decode_kll_state(bytes: &[u8]) -> Result<AggregateState, AggRejectCode> {
 	let k = KllK::new(read_u32(bytes, &mut cursor)?);
 	validate_kll_k_for_partial(k)?;
 	let total_item_count = read_u64(bytes, &mut cursor)?;
-	let level_count = read_u32(bytes, &mut cursor)? as usize;
+	let levels = decode_kll_levels(bytes, &mut cursor, value_width)?;
+	let compaction_seed = read_u32(bytes, &mut cursor)?;
+	if cursor != bytes.len() {
+		return Err(AggRejectCode::PartialCrossbindFailed);
+	}
+	KllSketch::from_legacy_levels(arrow_type_tag, k, total_item_count, levels, compaction_seed)
+		.map(KllSketch::into_state)
+		.map_err(|_| AggRejectCode::PartialCrossbindFailed)
+}
+
+fn decode_kll_levels(
+	bytes: &[u8],
+	cursor: &mut usize,
+	value_width: usize,
+) -> Result<Vec<Vec<Vec<u8>>>, AggRejectCode> {
+	let level_count = read_u32(bytes, cursor)? as usize;
 	let mut levels = Vec::with_capacity(level_count);
 	for _ in 0..level_count {
-		let level_size = read_u32(bytes, &mut cursor)? as usize;
+		let level_size = read_u32(bytes, cursor)? as usize;
 		let mut level = Vec::with_capacity(level_size);
 		for _ in 0..level_size {
-			let end = cursor
+			let end = (*cursor)
 				.checked_add(value_width)
 				.ok_or(AggRejectCode::PartialCrossbindFailed)?;
 			if end > bytes.len() {
 				return Err(AggRejectCode::PartialCrossbindFailed);
 			}
-			level.push(bytes[cursor..end].to_vec());
-			cursor = end;
+			level.push(bytes[*cursor..end].to_vec());
+			*cursor = end;
 		}
 		levels.push(level);
 	}
-	let compaction_seed = read_u32(bytes, &mut cursor)?;
-	if cursor != bytes.len() {
-		return Err(AggRejectCode::PartialCrossbindFailed);
-	}
-	Ok(AggregateState::Kll {
-		arrow_type_tag,
-		k,
-		total_item_count,
-		levels,
-		compaction_seed,
-	})
+	Ok(levels)
+}
+
+fn read_array_32(bytes: &[u8], cursor: &mut usize) -> Result<[u8; 32], AggRejectCode> {
+	let end = cursor
+		.checked_add(32)
+		.ok_or(AggRejectCode::PartialCrossbindFailed)?;
+	let value = bytes
+		.get(*cursor..end)
+		.ok_or(AggRejectCode::PartialCrossbindFailed)?;
+	*cursor = end;
+	Ok(value.try_into().expect("32-byte slice"))
 }
 
 fn validate_kll_k_for_partial(k: KllK) -> Result<(), AggRejectCode> {
@@ -656,7 +736,10 @@ fn merge_kll_states(
 		k,
 		total_item_count,
 		levels,
-		compaction_seed,
+		seed,
+		identity,
+		compaction_counters,
+		sampler,
 	} = left
 	else {
 		return Err(AggRejectCode::PartialCrossbindFailed);
@@ -666,25 +749,34 @@ fn merge_kll_states(
 		k: rhs_k,
 		total_item_count: rhs_total_item_count,
 		levels: rhs_levels,
-		compaction_seed: rhs_compaction_seed,
+		seed: rhs_seed,
+		identity: rhs_identity,
+		compaction_counters: rhs_compaction_counters,
+		sampler: rhs_sampler,
 	} = right
 	else {
 		return Err(AggRejectCode::PartialCrossbindFailed);
 	};
-	let mut left_sketch = KllSketch::from_retained_values(
+	let mut left_sketch = KllSketch::from_state(
 		arrow_type_tag,
 		k,
 		total_item_count,
-		levels.into_iter().flatten().collect(),
-		compaction_seed,
+		levels,
+		seed,
+		identity,
+		compaction_counters,
+		sampler,
 	)
 	.map_err(|_| AggRejectCode::PartialCrossbindFailed)?;
-	let right_sketch = KllSketch::from_retained_values(
+	let right_sketch = KllSketch::from_state(
 		rhs_arrow_type_tag,
 		rhs_k,
 		rhs_total_item_count,
-		rhs_levels.into_iter().flatten().collect(),
-		rhs_compaction_seed,
+		rhs_levels,
+		rhs_seed,
+		rhs_identity,
+		rhs_compaction_counters,
+		rhs_sampler,
 	)
 	.map_err(|_| AggRejectCode::PartialCrossbindFailed)?;
 	left_sketch
@@ -760,7 +852,8 @@ enum Accumulator {
 	QuantileKll {
 		column: usize,
 		k: KllK,
-		compaction_seed: u32,
+		seed: [u8; 32],
+		identity: [u8; 32],
 		sketch: Option<KllSketch>,
 	},
 }
@@ -771,6 +864,7 @@ impl Accumulator {
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
 		request_id: u128,
+		expression_index: usize,
 	) -> Result<Self, AggRejectCode> {
 		Ok(match function {
 			AggregateFunction::CountStar => Self::CountStar { value: 0 },
@@ -819,11 +913,14 @@ impl Accumulator {
 				hll: HllRegisters::new(precision),
 			},
 			AggregateFunction::Quantile { column, sketch } => {
-				let QuantileSketch::Kll { k } = sketch;
+				let QuantileSketch::Kll { k, execution_seed } = sketch;
+				let identity =
+					kll_sketch_identity(tenant_id, table_object_id, request_id, expression_index);
 				Self::QuantileKll {
 					column: column as usize,
 					k,
-					compaction_seed: kll_compaction_seed(tenant_id, table_object_id, request_id),
+					seed: execution_seed,
+					identity,
 					sketch: None,
 				}
 			}
@@ -921,7 +1018,8 @@ impl Accumulator {
 			Self::QuantileKll {
 				column,
 				k,
-				compaction_seed,
+				seed,
+				identity,
 				sketch,
 			} => {
 				let arrow_type_tag =
@@ -929,7 +1027,7 @@ impl Accumulator {
 						.ok_or(AggRejectCode::TypeUnsupported)?;
 				if sketch.is_none() {
 					*sketch = Some(
-						KllSketch::new(arrow_type_tag, *k, *compaction_seed)
+						KllSketch::new_with_randomness(arrow_type_tag, *k, *seed, *identity)
 							.map_err(|_| AggRejectCode::SketchParameterInvalid)?,
 					);
 				}
@@ -1298,20 +1396,19 @@ fn downcast_array<T: 'static>(array: &dyn Array) -> Result<&T, AggRejectCode> {
 		.ok_or(AggRejectCode::TypeUnsupported)
 }
 
-fn kll_compaction_seed(
+fn kll_sketch_identity(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
 	request_id: u128,
-) -> u32 {
-	let mut hasher = blake3::Hasher::new();
-	hasher.update(&tenant_id.get().to_be_bytes());
-	hasher.update(table_object_id.as_bytes());
-	hasher.update(&request_id.to_be_bytes());
-	u32::from_be_bytes(
-		hasher.finalize().as_bytes()[..4]
-			.try_into()
-			.expect("fixed seed prefix"),
-	)
+	expression_index: usize,
+) -> [u8; 32] {
+	let mut identity_hasher = blake3::Hasher::new();
+	identity_hasher.update(b"nilket-aggregate-kll-sketch-identity-v1");
+	identity_hasher.update(&tenant_id.get().to_be_bytes());
+	identity_hasher.update(table_object_id.as_bytes());
+	identity_hasher.update(&request_id.to_be_bytes());
+	identity_hasher.update(&(expression_index as u64).to_be_bytes());
+	*identity_hasher.finalize().as_bytes()
 }
 
 pub fn slab_visibility_complete(
@@ -1815,6 +1912,87 @@ mod tests {
 		assert_eq!(
 			aggregate_record_batches(&request, &[batch()], false).unwrap_err(),
 			AggRejectCode::TypeUnsupported
+		);
+	}
+
+	#[test]
+	fn adr083_kll_state_round_trips_every_randomness_and_sampler_field() {
+		let state = KllSketch::from_state(
+			ARROW_STATS_TAG_INT32,
+			KllK::new(800),
+			7,
+			vec![
+				vec![1_u32.to_be_bytes().to_vec()],
+				vec![4_u32.to_be_bytes().to_vec(), 8_u32.to_be_bytes().to_vec()],
+			],
+			[0x31; 32],
+			[0x41; 32],
+			vec![7, 9],
+			crate::schema::aggregate::KllSamplerState {
+				item: Some(10_u32.to_be_bytes().to_vec()),
+				weight: 2,
+				height: 2,
+			},
+		)
+		.unwrap()
+		.into_state();
+		let bytes = encode_aggregate_state(AggregateFunctionTag::QUANTILE_KLL, &state).unwrap();
+		assert_eq!(decode_kll_state(&bytes).unwrap(), state);
+	}
+
+	#[test]
+	fn adr083_kll_state_refuses_a_weight_total_mismatch() {
+		let state = KllSketch::from_state(
+			ARROW_STATS_TAG_INT32,
+			KllK::new(800),
+			3,
+			vec![vec![
+				1_u32.to_be_bytes().to_vec(),
+				2_u32.to_be_bytes().to_vec(),
+				3_u32.to_be_bytes().to_vec(),
+			]],
+			[0x51; 32],
+			[0x61; 32],
+			Vec::new(),
+			crate::schema::aggregate::KllSamplerState {
+				item: None,
+				weight: 0,
+				height: 0,
+			},
+		)
+		.unwrap()
+		.into_state();
+		let mut bytes = encode_aggregate_state(AggregateFunctionTag::QUANTILE_KLL, &state).unwrap();
+
+		// V2 marker + type tag + k precede the eight-byte total-item count.
+		bytes[6..14].copy_from_slice(&4_u64.to_be_bytes());
+		assert_eq!(
+			decode_kll_state(&bytes),
+			Err(AggRejectCode::PartialCrossbindFailed),
+		);
+	}
+
+	#[test]
+	fn adr083_legacy_kll_accepts_exact_level_weights_and_refuses_flat_compaction() {
+		fn legacy_bytes(total: u64, levels: &[Vec<u32>]) -> Vec<u8> {
+			let mut bytes = vec![ARROW_STATS_TAG_INT32];
+			bytes.extend_from_slice(&800_u32.to_be_bytes());
+			bytes.extend_from_slice(&total.to_be_bytes());
+			bytes.extend_from_slice(&(levels.len() as u32).to_be_bytes());
+			for level in levels {
+				bytes.extend_from_slice(&(level.len() as u32).to_be_bytes());
+				for value in level {
+					bytes.extend_from_slice(&value.to_be_bytes());
+				}
+			}
+			bytes.extend_from_slice(&42_u32.to_be_bytes());
+			bytes
+		}
+
+		assert!(decode_kll_state(&legacy_bytes(3, &[vec![1, 2, 3]])).is_ok());
+		assert_eq!(
+			decode_kll_state(&legacy_bytes(10, &[vec![1, 9]])),
+			Err(AggRejectCode::PartialCrossbindFailed),
 		);
 	}
 }

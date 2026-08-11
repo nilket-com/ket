@@ -31,27 +31,13 @@ pub(super) fn bind_aggregate_call(
 				args: merge_aggregate_args(args),
 			})
 		}
-		AggregateFunction::ApproxQuantile(_) => {
-			if !ctx.config.allow_experimental_kernels {
-				return Err(BindingError::ExperimentalKernel {
-					kernel: "ApproxQuantile",
-				});
-			}
-			let args = args
-				.iter()
-				.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, ctx))
-				.collect::<Result<Vec<_>, _>>()?;
-			Ok(BoundAggregateCall {
-				function: function.clone(),
-				args: merge_aggregate_args(args),
-			})
-		}
 		AggregateFunction::CountAll
 		| AggregateFunction::Count
 		| AggregateFunction::Sum
 		| AggregateFunction::Min
 		| AggregateFunction::Max
-		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
+		| AggregateFunction::Avg
+		| AggregateFunction::ApproxQuantile(_) => unreachable!("stable aggregate metadata missing"),
 	}
 }
 
@@ -62,6 +48,13 @@ pub(super) fn bind_stable_aggregate_call(
 	ctx: &ExprBindContext<'_>,
 	spec: &AggregateKernelSpec,
 ) -> Result<BoundAggregateCall, BindingError> {
+	if let AggregateFunction::ApproxQuantile(q) = function
+		&& (!q.is_finite() || !(0.0..=1.0).contains(q))
+	{
+		return Err(BindingError::UnsupportedExpression {
+			message: "APPROX_QUANTILE requires a finite quantile literal in [0, 1]".to_string(),
+		});
+	}
 	if args.len() != aggregate_arity_len(spec.arity) {
 		return Err(BindingError::UnsupportedExpression {
 			message: format!("{} requires one argument", spec.sql_name),
@@ -77,6 +70,15 @@ pub(super) fn bind_stable_aggregate_call(
 		if aggregate_kernel::stable_output_data_type(function, Some(data_type)).is_none() {
 			return Err(BindingError::TypeMismatch {
 				message: aggregate_type_mismatch_message(spec.kind, data_type),
+			});
+		}
+		if matches!(function, AggregateFunction::ApproxQuantile(_))
+			&& args
+				.root_logical_type(0)
+				.is_some_and(|logical_type| !logical_type.is_naked())
+		{
+			return Err(BindingError::TypeMismatch {
+				message: "APPROX_QUANTILE requires a naked numeric input".to_string(),
 			});
 		}
 	}
@@ -238,6 +240,9 @@ pub(super) fn aggregate_type_mismatch_message(
 		StableAggregateKernel::Max => {
 			format!("MAX expects Int32, Int64, Float32, or Float64 input, got {data_type:?}")
 		}
+		StableAggregateKernel::ApproxQuantile => format!(
+			"APPROX_QUANTILE expects naked Int32, Int64, Float32, or Float64 input, got {data_type:?}"
+		),
 		StableAggregateKernel::CountAll | StableAggregateKernel::Count => {
 			unreachable!("COUNT accepts any input type")
 		}

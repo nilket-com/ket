@@ -1858,11 +1858,11 @@ async fn count_of_dimensioned_unit_is_naked() {
 }
 
 #[tokio::test]
-async fn experimental_unit_aggregates_are_naked() {
+async fn experimental_unit_aggregate_is_naked_and_quantile_refuses_named_input() {
 	let (catalog, coordinator, planner) = logical_type_writer_coordinator();
 	setup_type_unit_aggregate_samples(&coordinator, &planner).await;
 
-	let sql = "SELECT LINEAR_REGRESS(distance, raw), APPROX_QUANTILE(distance, 0.5) FROM aggregate_samples";
+	let sql = "SELECT LINEAR_REGRESS(distance, raw) FROM aggregate_samples";
 	let config = PlannerConfig {
 		allow_experimental_kernels: true,
 		..PlannerConfig::default()
@@ -1876,7 +1876,19 @@ async fn experimental_unit_aggregates_are_naked() {
 	.expect(sql);
 	let schema = bound.schema();
 	assert_schema_identity(schema.as_ref(), 0, LogicalTypeId::NAKED);
-	assert_schema_identity(schema.as_ref(), 1, LogicalTypeId::NAKED);
+
+	let quantile_sql = "SELECT APPROX_QUANTILE(distance, 0.5) FROM aggregate_samples";
+	let err = bind(
+		&planner.plan(quantile_sql).expect("plan named quantile"),
+		catalog.as_ref(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("APPROX_QUANTILE must refuse named logical input");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("requires a naked numeric input")),
+		"unexpected named-quantile refusal: {err:?}"
+	);
 }
 
 #[tokio::test]

@@ -10,6 +10,12 @@ pub struct TaskExecutionContext {
 	pub tenant_id: TenantId,
 	pub read_bound: HlcBound,
 	pub trace_context: Option<TraceContext>,
+	pub quantile_execution_seed: [u8; 32],
+	pub quantile_state_allowance: usize,
+}
+
+const fn default_quantile_state_allowance() -> usize {
+	1_024
 }
 
 impl TaskExecutionContext {
@@ -24,6 +30,8 @@ impl TaskExecutionContext {
 			tenant_id,
 			read_bound,
 			trace_context,
+			quantile_execution_seed: [0xA5; 32],
+			quantile_state_allowance: default_quantile_state_allowance(),
 		}
 	}
 
@@ -38,5 +46,15 @@ impl TaskExecutionContext {
 			context.read_bound,
 			context.trace_context,
 		)
+		.with_quantile_execution(
+			context.quantile_execution_seed,
+			context.quantile_state_allowance,
+		)
+	}
+
+	pub const fn with_quantile_execution(mut self, seed: [u8; 32], state_allowance: usize) -> Self {
+		self.quantile_execution_seed = seed;
+		self.quantile_state_allowance = state_allowance;
+		self
 	}
 }

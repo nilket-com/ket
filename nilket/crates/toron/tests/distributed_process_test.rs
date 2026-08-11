@@ -22,13 +22,16 @@ use toron::distributed::worker_registry::{
 	ActiveTaskCount, PlacementHints, SimdLaneCount, UnixMillis, WorkerCapabilities, WorkerEndpoint,
 	WorkerEntry, WorkerLease, WorkerRegistry, WorkerResourceState, WorkerStatus,
 };
+use toron::exec::{ExecutionContext, Executor};
 use toron::ir::{
 	AggregateFunction, BroadcastBuildSide, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, SortExpr, TableId,
+	JoinStrategy, JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, SessionId, SortExpr,
+	TableId,
 };
 use toron::server::transport::TcpTransport;
 use toron::server::{NetworkTaskDispatcher, memory::MemoryManager};
 use toron::sql_planner::SqlPlanner;
+use toron::storage::{HlcBound, InMemoryStorageScan, TenantId};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor,
@@ -196,6 +199,15 @@ struct ProcessRun {
 struct OrderedGroupProcessRun {
 	digest: toron::distributed::task::ArrowIpcDigest,
 	row_count: usize,
+	selected_workers: Vec<WorkerId>,
+}
+
+#[derive(Debug)]
+struct QuantileProcessRun {
+	global_digest: toron::distributed::task::ArrowIpcDigest,
+	grouped_digest: toron::distributed::task::ArrowIpcDigest,
+	global_median: f64,
+	grouped_rows: usize,
 	selected_workers: Vec<WorkerId>,
 }
 
@@ -1227,6 +1239,86 @@ async fn ordered_grouped_aggregate_process_digest_is_stable_across_worker_counts
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn adr546_local_and_multiworker_quantiles_correspond_for_one_execution_seed() {
+	let seed = [0x46; 32];
+	let local_global =
+		run_local_quantile_query("SELECT APPROX_QUANTILE(val, 0.5) FROM fixture", seed).await;
+	let local_grouped = run_local_quantile_query(
+		"SELECT val, APPROX_QUANTILE(float_val, 0.5) FROM fixture GROUP BY val ORDER BY val",
+		seed,
+	)
+	.await;
+	let two_workers = run_quantile_process_query(8_460, 2, 0, seed).await;
+	let four_workers = run_quantile_process_query(8_470, 4, 1, seed).await;
+
+	assert_eq!(two_workers.global_median, 8.0);
+	assert_eq!(four_workers.global_median, 8.0);
+	assert_eq!(two_workers.grouped_rows, 16);
+	assert_eq!(four_workers.grouped_rows, 16);
+	assert_eq!(two_workers.global_digest, four_workers.global_digest);
+	assert_eq!(two_workers.grouped_digest, four_workers.grouped_digest);
+	assert_eq!(
+		canonical_arrow_ipc_digest(&local_global, SortPolicy::FullRowLex)
+			.expect("local global digest"),
+		two_workers.global_digest
+	);
+	assert_eq!(
+		canonical_arrow_ipc_digest(&local_grouped, SortPolicy::FullRowLex)
+			.expect("local grouped digest"),
+		two_workers.grouped_digest
+	);
+	assert_eq!(
+		two_workers
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		2
+	);
+	assert_eq!(
+		four_workers
+			.selected_workers
+			.iter()
+			.copied()
+			.collect::<HashSet<_>>()
+			.len(),
+		4
+	);
+}
+
+async fn run_local_quantile_query(sql: &str, seed: [u8; 32]) -> Vec<RecordBatch> {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("val", DataType::Int32, false),
+		Field::new("float_val", DataType::Float64, true),
+	]));
+	let batch = RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int32Array::from((0..16).collect::<Vec<i32>>())),
+			Arc::new(Float64Array::from(
+				(0..16)
+					.map(|row| Some(row as f64 + 0.25))
+					.collect::<Vec<_>>(),
+			)),
+		],
+	)
+	.expect("local quantile fixture");
+	let logical = SqlPlanner::new().plan(sql).expect("plan local quantile");
+	let catalog = test_catalog();
+	let bound = bind(&logical, catalog.as_ref(), &PlannerConfig::default())
+		.await
+		.expect("bind local quantile");
+	Executor::with_context(
+		Arc::new(InMemoryStorageScan { table_data: batch }),
+		ExecutionContext::local_test().with_quantile_execution(seed, 1_024),
+	)
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute local quantile")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ordered_grouped_min_max_process_digest_is_stable_across_worker_counts() {
 	let two_workers = run_ordered_grouped_min_max_process_query(2_500, 2, 0).await;
 	let four_workers = run_ordered_grouped_min_max_process_query(2_600, 4, 1).await;
@@ -1563,6 +1655,83 @@ async fn run_ordered_grouped_aggregate_process_query(
 		row_count,
 		selected_workers: registry.selected_workers(),
 	}
+}
+
+async fn run_quantile_process_query(
+	worker_id_base: u128,
+	worker_count: usize,
+	start_offset: usize,
+	seed: [u8; 32],
+) -> QuantileProcessRun {
+	let mut workers = Vec::new();
+	for index in 0..worker_count {
+		workers.push(
+			FixtureWorkerProcess::spawn(WorkerId::from_u128(worker_id_base + index as u128)).await,
+		);
+	}
+	let registry = Arc::new(RoundRobinRegistry::new(
+		workers.iter().map(worker_entry),
+		start_offset,
+	));
+	let coordinator = DistributedQueryCoordinator::new(
+		test_catalog(),
+		registry.clone(),
+		Arc::new(MemoryManager::new(64, 1024 * 1024)),
+		Arc::new(TcpTransport::new()),
+		PlannerConfig::default(),
+		QueryBudget::test_default(),
+	);
+	let global = SqlPlanner::new()
+		.plan("SELECT APPROX_QUANTILE(val, 0.5) FROM fixture")
+		.expect("plan global quantile");
+	let global_context = ExecutionContext::new(
+		SessionId(1),
+		QueryId::from_u128(worker_id_base + 100),
+		TenantId(1),
+		HlcBound(1),
+	)
+	.with_quantile_execution(seed, 1_024);
+	let global_results = coordinator
+		.execute_query_with_context(&global, global_context)
+		.await
+		.expect("global distributed quantile");
+	let global_median = global_results[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("global quantile output")
+		.value(0);
+
+	let grouped = SqlPlanner::new()
+		.plan(
+			"SELECT val, APPROX_QUANTILE(float_val, 0.5) FROM fixture \
+			 GROUP BY val ORDER BY val",
+		)
+		.expect("plan grouped quantile");
+	let grouped_context = ExecutionContext::new(
+		SessionId(1),
+		QueryId::from_u128(worker_id_base + 101),
+		TenantId(1),
+		HlcBound(1),
+	)
+	.with_quantile_execution(seed, 1_024);
+	let grouped_results = coordinator
+		.execute_query_with_context(&grouped, grouped_context)
+		.await
+		.expect("grouped distributed quantile");
+	let run = QuantileProcessRun {
+		global_digest: canonical_arrow_ipc_digest(&global_results, SortPolicy::FullRowLex)
+			.expect("global digest"),
+		grouped_digest: canonical_arrow_ipc_digest(&grouped_results, SortPolicy::FullRowLex)
+			.expect("grouped digest"),
+		global_median,
+		grouped_rows: grouped_results.iter().map(RecordBatch::num_rows).sum(),
+		selected_workers: registry.selected_workers(),
+	};
+	for worker in &mut workers {
+		worker.shutdown().await;
+	}
+	run
 }
 
 async fn run_ordered_grouped_min_max_process_query(

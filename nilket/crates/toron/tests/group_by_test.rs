@@ -388,17 +388,218 @@ fn group_by_accepts_only_stable_aggregate_set() {
 		"SELECT region, COUNT(amount) FROM sales GROUP BY region",
 		"SELECT region, SUM(amount) FROM sales GROUP BY region",
 		"SELECT region, AVG(amount) FROM sales GROUP BY region",
+		"SELECT region, APPROX_QUANTILE(amount, 0.5) FROM sales GROUP BY region",
+		"SELECT region, APPROX_QUANTILE(amount + 1, 0.5) FROM sales GROUP BY region",
 	] {
 		assert!(plan_sql(sql).is_aggregate(), "{sql}");
 	}
 	for sql in [
 		"SELECT region, LINEAR_REGRESS(amount, id) FROM sales GROUP BY region",
-		"SELECT region, APPROX_QUANTILE(amount, 0.5) FROM sales GROUP BY region",
 		"SELECT region, LINEAR_REGRESS(amount + 1, id) FROM sales GROUP BY region",
-		"SELECT region, APPROX_QUANTILE(amount + 1, 0.5) FROM sales GROUP BY region",
 	] {
 		assert_unsupported(sql);
 	}
+}
+
+#[tokio::test]
+async fn adr546_stable_quantile_executes_globally_and_grouped_without_experimental_flag() {
+	let global = run_logical(&plan_sql(
+		"SELECT APPROX_QUANTILE(amount, 0.5) AS p50 FROM sales",
+	))
+	.await;
+	let p50 = global[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("global quantile");
+	assert_eq!(p50.value(0), 20.0);
+
+	let grouped = run_logical(&plan_sql(
+		"SELECT region, APPROX_QUANTILE(amount, 0.5) AS p50 \
+		 FROM sales GROUP BY region",
+	))
+	.await;
+	let mut rows = Vec::new();
+	for batch in grouped {
+		let regions = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("region");
+		let quantiles = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("grouped quantile");
+		for row in 0..batch.num_rows() {
+			rows.push((
+				(!regions.is_null(row)).then(|| regions.value(row).to_owned()),
+				quantiles.value(row),
+			));
+		}
+	}
+	rows.sort_by(|left, right| left.0.cmp(&right.0));
+	assert_eq!(
+		rows,
+		vec![
+			(None, 7.0),
+			(Some("east".to_string()), 30.0),
+			(Some("west".to_string()), 20.0),
+		]
+	);
+}
+
+#[test]
+fn adr546_quantile_parameter_range_refuses_during_planning() {
+	for sql in [
+		"SELECT APPROX_QUANTILE(amount, -0.1) FROM sales",
+		"SELECT APPROX_QUANTILE(amount, 1.1) FROM sales",
+		"SELECT APPROX_QUANTILE(amount, NULL) FROM sales",
+		"SELECT APPROX_QUANTILE(amount, amount) FROM sales",
+		"SELECT APPROX_QUANTILE(amount, NaN) FROM sales",
+		"SELECT APPROX_QUANTILE(amount, Infinity) FROM sales",
+	] {
+		assert_unsupported_message(
+			sql,
+			"APPROX_QUANTILE requires a finite quantile literal in [0, 1]",
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr546_small_exact_oracle_covers_every_physical_type_and_mixed_signs() {
+	let results = run_logical(&plan_sql(
+		"SELECT \
+		 APPROX_QUANTILE(id, 0), APPROX_QUANTILE(id, 0.25), \
+		 APPROX_QUANTILE(id, 0.5), APPROX_QUANTILE(id, 0.75), APPROX_QUANTILE(id, 1), \
+		 APPROX_QUANTILE(amount, 0), APPROX_QUANTILE(amount, 0.25), \
+		 APPROX_QUANTILE(amount, 0.5), APPROX_QUANTILE(amount, 0.75), APPROX_QUANTILE(amount, 1), \
+		 APPROX_QUANTILE(rating32, 0), APPROX_QUANTILE(rating32, 0.25), \
+		 APPROX_QUANTILE(rating32, 0.5), APPROX_QUANTILE(rating32, 0.75), APPROX_QUANTILE(rating32, 1), \
+		 APPROX_QUANTILE(price, 0), APPROX_QUANTILE(price, 0.25), \
+		 APPROX_QUANTILE(price, 0.5), APPROX_QUANTILE(price, 0.75), APPROX_QUANTILE(price, 1), \
+		 APPROX_QUANTILE(amount - 20, 0.25), APPROX_QUANTILE(price - 20.0, 0.25) \
+		 FROM sales",
+	))
+	.await;
+	let batch = &results[0];
+	let observed = (0..batch.num_columns())
+		.map(|column| {
+			batch
+				.column(column)
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.expect("quantile output")
+				.value(0)
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(
+		observed,
+		vec![
+			1.0, 2.0, 4.0, 5.0, 6.0, // Int64
+			7.0, 10.0, 20.0, 20.0, 30.0, // Int32
+			0.25, 1.5, 2.5, 3.5, 4.5, // Float32
+			7.5, 10.5, 20.5, 20.5, 30.5, // Float64
+			-10.0, -9.5, // mixed-sign canonical ordering
+		]
+	);
+}
+
+#[tokio::test]
+async fn adr546_null_type_and_nonfinite_boundaries_refuse_at_the_stated_layers() {
+	let all_null = run_logical(&plan_sql(
+		"SELECT APPROX_QUANTILE(all_null_amount, 0.5) FROM sales",
+	))
+	.await;
+	assert_eq!(scalar_float64_column_rows(&all_null, 0), vec![None]);
+	let empty = run_logical(&plan_sql(
+		"SELECT APPROX_QUANTILE(amount, 0.5) FROM empty_sales",
+	))
+	.await;
+	assert_eq!(scalar_float64_column_rows(&empty, 0), vec![None]);
+
+	assert_kernel_error_prefix(
+		execute_sql_err("SELECT APPROX_QUANTILE(score, 0.5) FROM sales").await,
+		"APPROX_QUANTILE observation refused: float64 optimizer fact scalar must be finite",
+	);
+
+	let (catalog, _) = fixture();
+	let decimal = plan_sql("SELECT APPROX_QUANTILE(decimal_price, 0.5) FROM sales");
+	assert!(matches!(
+		bind(&decimal, &catalog, &PlannerConfig::default()).await,
+		Err(BindingError::TypeMismatch { .. })
+	));
+	let logical = LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		group_expr: Vec::new(),
+		aggr_expr: vec![(
+			AggregateFunction::ApproxQuantile(0.5),
+			vec![Expr::LogicalAscription {
+				expr: Box::new(Expr::column("id")),
+				logical_type: CUSTOMER_ID_LOGICAL_TYPE,
+			}],
+		)],
+	};
+	assert!(matches!(
+		bind(&logical, &catalog, &PlannerConfig::default()).await,
+		Err(BindingError::TypeMismatch { .. })
+	));
+}
+
+#[tokio::test]
+async fn adr546_sql_and_rune_use_the_same_stable_global_and_grouped_kernel() {
+	let sql_global = plan_sql("SELECT APPROX_QUANTILE(amount, 0.5) FROM sales");
+	let rune_global = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [approx_quantile(col("amount"), 0.5)])
+        }
+    "#,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_global).await, SortPolicy::FullRowLex)
+			.expect("SQL global quantile digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_global).await, SortPolicy::FullRowLex)
+			.expect("Rune global quantile digest")
+	);
+
+	let sql = plan_sql("SELECT region, APPROX_QUANTILE(amount, 0.5) FROM sales GROUP BY region");
+	let rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([col("region")], [approx_quantile(col("amount"), 0.5)])
+        }
+    "#,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql).await, SortPolicy::FullRowLex)
+			.expect("SQL quantile digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune).await, SortPolicy::FullRowLex)
+			.expect("Rune quantile digest")
+	);
+
+	let invalid_rune = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([], [approx_quantile(col("amount"), 1.1)])
+        }
+    "#,
+	)
+	.await;
+	let (catalog, _) = fixture();
+	assert!(matches!(
+		bind(&invalid_rune, &catalog, &PlannerConfig::default()).await,
+		Err(BindingError::UnsupportedExpression { message })
+			if message == "APPROX_QUANTILE requires a finite quantile literal in [0, 1]"
+	));
 }
 
 #[test]

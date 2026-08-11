@@ -63,8 +63,6 @@ pub(super) struct TieredStatsCacheKey {
 	pub(super) stats_block_hash128: [u8; 16],
 }
 
-pub(super) const RANGE_DISTRIBUTION_BUCKET_COUNT: usize = 64;
-
 pub(super) fn ndv_column_candidates(
 	descriptor: &TableSchemaDescriptor,
 ) -> std::io::Result<BTreeMap<u16, NdvColumnCandidate>> {
@@ -460,54 +458,13 @@ pub(super) fn range_fact_for_column(
 }
 
 pub(super) fn range_distribution_fact_for_column(
-	candidate: &RangeDistributionColumnCandidate,
-	blocks: &[ParsedColumnStatsBlock],
+	_candidate: &RangeDistributionColumnCandidate,
+	_blocks: &[ParsedColumnStatsBlock],
 ) -> std::io::Result<Option<ColumnRangeDistributionFact>> {
-	let mut merged: Option<KllSketch> = None;
-	for block in blocks {
-		let Some(entry) = block
-			.columns
-			.iter()
-			.find(|entry| entry.column_ordinal == candidate.ordinal)
-		else {
-			return Ok(None);
-		};
-		if entry.arrow_type_tag != candidate.arrow_type_tag {
-			return Ok(None);
-		}
-		let payload = decode_column_stats_payload(entry)?;
-		let Some(kll) = payload.range_distribution else {
-			return Ok(None);
-		};
-		let sketch = KllSketch::from_retained_values(
-			candidate.arrow_type_tag,
-			kll.k,
-			kll.total_item_count,
-			kll.retained_values,
-			kll.compaction_seed,
-		)?;
-		if let Some(merged) = merged.as_mut() {
-			if merged.merge(&sketch).is_err() {
-				return Ok(None);
-			}
-		} else {
-			merged = Some(sketch);
-		}
-	}
-	let Some(merged) = merged else {
-		return Ok(None);
-	};
-	let buckets = merged.query_buckets(RANGE_DISTRIBUTION_BUCKET_COUNT)?;
-	if buckets.is_empty() {
-		return Ok(None);
-	}
-	Ok(Some(ColumnRangeDistributionFact {
-		column_ordinal: candidate.ordinal,
-		arrow_type_tag: candidate.arrow_type_tag,
-		non_null_count: merged.total_item_count(),
-		rank_error_ppm: merged.rank_error_ppm(),
-		buckets,
-	}))
+	// ADR 0083: a v1 flat payload discarded the weights needed to interpret
+	// its retained values. Absence is supported; manufacturing equal weights is
+	// not. CSB v2 will restore this fact class behind its fleet fence.
+	Ok(None)
 }
 
 pub(super) fn heavy_hitter_fact_for_column(

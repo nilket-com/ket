@@ -1,10 +1,11 @@
-use super::{AggState, GroupValue};
+use super::{AggState, GroupValue, MAX_QUANTILE_STATES_PER_EXECUTION, reserve_quantile_states};
 use crate::distributed::budget::BudgetDimension;
 use crate::error::ExecutionError;
 use ahash::RandomState;
 use serde::Serialize;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,11 @@ struct BoundGroupedAggregateGroupState {
 	peak_resident_bytes: u64,
 	maximum_projected_growth_peak_bytes: u64,
 	maximum_finalize_sort_scratch_bytes: u64,
+	quantile_populations_per_group: usize,
+	quantile_declared_bytes_per_group: u64,
+	quantile_states_admitted: usize,
+	quantile_state_limit: usize,
+	quantile_execution_admission: Option<Arc<std::sync::atomic::AtomicUsize>>,
 	profile: Option<Box<GenericGroupedFoldProfile>>,
 	/// Present only while the growth census is armed.
 	growth_census: Option<Box<GrowthCensus>>,
@@ -242,6 +248,11 @@ impl BoundGroupedAggregateGroups {
 			peak_resident_bytes: 0,
 			maximum_projected_growth_peak_bytes: 0,
 			maximum_finalize_sort_scratch_bytes: 0,
+			quantile_populations_per_group: 0,
+			quantile_declared_bytes_per_group: 0,
+			quantile_states_admitted: 0,
+			quantile_state_limit: MAX_QUANTILE_STATES_PER_EXECUTION,
+			quantile_execution_admission: None,
 			profile,
 			growth_census: None,
 		};
@@ -285,6 +296,19 @@ impl BoundGroupedAggregateGroups {
 
 	pub(in crate::exec) fn set_growth_budget_bytes(&mut self, budget: Option<u64>) {
 		self.state.growth_budget_bytes = budget;
+	}
+
+	pub(in crate::exec) fn configure_quantile_admission(
+		&mut self,
+		populations_per_group: usize,
+		declared_bytes_per_group: u64,
+		state_limit: usize,
+		execution_admission: Arc<std::sync::atomic::AtomicUsize>,
+	) {
+		self.state.quantile_populations_per_group = populations_per_group;
+		self.state.quantile_declared_bytes_per_group = declared_bytes_per_group;
+		self.state.quantile_state_limit = state_limit.min(MAX_QUANTILE_STATES_PER_EXECUTION);
+		self.state.quantile_execution_admission = Some(execution_admission);
 	}
 
 	pub(in crate::exec) fn current_resident_bytes(&self) -> u64 {
@@ -359,6 +383,10 @@ impl BoundGroupedAggregateGroups {
 				.get_mut(entry)
 				.ok_or_else(|| table_error("hash bucket points past aggregate states"));
 		}
+		let requested_quantile_states = self
+			.state
+			.quantile_states_admitted
+			.saturating_add(self.state.quantile_populations_per_group);
 
 		if self.state.keys.len() == self.state.entry_limit {
 			self.state.grow()?;
@@ -384,15 +412,28 @@ impl BoundGroupedAggregateGroups {
 			self.state
 				.current_resident_bytes()
 				.saturating_add(key_bytes)
-				.saturating_add(requested_state_bytes),
+				.saturating_add(requested_state_bytes)
+				.saturating_add(self.state.quantile_declared_bytes_per_group),
 		)?;
+		let reservation = match (
+			self.state.quantile_execution_admission.clone(),
+			self.state.quantile_populations_per_group,
+		) {
+			(Some(admission), count) if count != 0 => Some(reserve_quantile_states(
+				admission,
+				self.state.quantile_state_limit,
+				count,
+			)?),
+			_ => None,
+		};
 		let states = init()?;
 		let actual_state_bytes = capacity_bytes::<AggState>(states.capacity());
 		self.state.guard(
 			self.state
 				.current_resident_bytes()
 				.saturating_add(key_bytes)
-				.saturating_add(actual_state_bytes),
+				.saturating_add(actual_state_bytes)
+				.saturating_add(self.state.quantile_declared_bytes_per_group),
 		)?;
 		let entry = u32::try_from(self.state.keys.len()).map_err(|_| {
 			table_error("generic grouped-fold hash table exceeds the u32 entry domain")
@@ -411,7 +452,12 @@ impl BoundGroupedAggregateGroups {
 			.state
 			.current_resident_bytes
 			.saturating_add(key_bytes)
-			.saturating_add(actual_state_bytes);
+			.saturating_add(actual_state_bytes)
+			.saturating_add(self.state.quantile_declared_bytes_per_group);
+		self.state.quantile_states_admitted = requested_quantile_states;
+		if let Some(reservation) = reservation {
+			reservation.commit();
+		}
 		self.state.observe_peak();
 		self.state
 			.states
@@ -548,7 +594,10 @@ impl BoundGroupedAggregateGroups {
 			.state
 			.states
 			.iter()
-			.map(|states| capacity_bytes::<AggState>(states.capacity()))
+			.map(|states| {
+				capacity_bytes::<AggState>(states.capacity())
+					.saturating_add(self.state.quantile_declared_bytes_per_group)
+			})
 			.fold(0u64, u64::saturating_add);
 		outer.saturating_add(keys).saturating_add(states)
 	}
@@ -1376,8 +1425,8 @@ mod tests {
 			.finalize_sorted()
 			.expect("finalize groups")
 			.iter()
-			.map(|entry| match (&entry.key[0], entry.states[0]) {
-				(GroupValue::Int64(key), AggState::Count(count)) => (*key, count),
+			.map(|entry| match (&entry.key[0], &entry.states[0]) {
+				(GroupValue::Int64(key), AggState::Count(count)) => (*key, *count),
 				other => panic!("unexpected entry {other:?}"),
 			})
 			.collect()
@@ -1406,8 +1455,8 @@ mod tests {
 		let entries = groups.finalize_sorted().expect("finalize compact groups");
 		let observed = entries
 			.iter()
-			.map(|entry| match entry.states[0] {
-				AggState::Count(count) => (entry.key[0].clone(), count),
+			.map(|entry| match &entry.states[0] {
+				AggState::Count(count) => (entry.key[0].clone(), *count),
 				other => panic!("unexpected compact state {other:?}"),
 			})
 			.collect::<Vec<_>>();
@@ -1647,8 +1696,8 @@ mod tests {
 		let entries = groups.finalize_sorted().expect("sorted entries");
 		let observed = entries
 			.iter()
-			.map(|entry| match (&entry.key[0], entry.states[0]) {
-				(GroupValue::Int64(key), AggState::Count(count)) => (*key, count),
+			.map(|entry| match (&entry.key[0], &entry.states[0]) {
+				(GroupValue::Int64(key), AggState::Count(count)) => (*key, *count),
 				other => panic!("unexpected entry {other:?}"),
 			})
 			.collect::<Vec<_>>();

@@ -5275,14 +5275,7 @@ impl SqlPlanner {
 				}
 				self.lower_linear_regress_aggregate(args)
 			}
-			"APPROX_QUANTILE" => {
-				if matches!(mode, AggregateSqlMode::Grouped) {
-					return Err(unsupported(
-						"experimental aggregate functions are not supported with GROUP BY",
-					));
-				}
-				self.lower_approx_quantile_aggregate(args)
-			}
+			"APPROX_QUANTILE" => self.lower_approx_quantile_aggregate(args),
 			_ => Err(unsupported("unsupported aggregate function")),
 		}?;
 		Ok(LoweredAggregateCall {
@@ -5377,22 +5370,12 @@ impl SqlPlanner {
 		}
 		let val = self.lower_arg(&args[0])?;
 		let q = match &args[1] {
-			FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => match sql_value(expr) {
-				Some(Value::Number(n, _)) => {
-					n.parse::<f64>().map_err(|e| unsupported(e.to_string()))?
-				}
-				_ => {
-					return Err(unsupported(
-						"APPROX_QUANTILE expects a numeric literal for quantile",
-					));
-				}
-			},
-			_ => {
-				return Err(unsupported(
-					"APPROX_QUANTILE expects a numeric literal for quantile",
-				));
-			}
+			FunctionArg::Unnamed(FunctionArgExpr::Expr(expr)) => parse_quantile_literal(expr)?,
+			_ => return Err(unsupported(APPROX_QUANTILE_PARAMETER_MESSAGE)),
 		};
+		if !q.is_finite() || !(0.0..=1.0).contains(&q) {
+			return Err(unsupported(APPROX_QUANTILE_PARAMETER_MESSAGE));
+		}
 		Ok((AggregateFunction::ApproxQuantile(q), vec![val]))
 	}
 
@@ -8008,12 +7991,20 @@ struct GroupedAggregateSignature {
 	kernel: aggregate_kernel::StableAggregateKernel,
 	args: Vec<Expr>,
 	distinct: bool,
+	parameter: GroupedAggregateParameter,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum GroupedAggregateParameter {
+	None,
+	Quantile(u64),
 }
 
 impl PartialEq for GroupedAggregateSignature {
 	fn eq(&self, other: &Self) -> bool {
 		self.kernel == other.kernel
 			&& self.distinct == other.distinct
+			&& self.parameter == other.parameter
 			&& self.args.len() == other.args.len()
 			&& self
 				.args
@@ -8029,6 +8020,7 @@ impl Hash for GroupedAggregateSignature {
 	fn hash<H: Hasher>(&self, state: &mut H) {
 		self.kernel.hash(state);
 		self.distinct.hash(state);
+		self.parameter.hash(state);
 		self.args.len().hash(state);
 		for arg in &self.args {
 			hash_expr_structural(arg, state);
@@ -9604,6 +9596,13 @@ fn grouped_aggregate_signature(
 	distinct: bool,
 ) -> Option<GroupedAggregateSignature> {
 	let kernel = aggregate_kernel::stable_kernel_for_function(function)?;
+	let parameter = match function {
+		AggregateFunction::ApproxQuantile(q) => {
+			let canonical = if *q == 0.0 { 0.0 } else { *q };
+			GroupedAggregateParameter::Quantile(canonical.to_bits())
+		}
+		_ => GroupedAggregateParameter::None,
+	};
 	let spec = aggregate_kernel::stable_spec(kernel);
 	if !spec.grouped_supported {
 		return None;
@@ -9613,12 +9612,14 @@ fn grouped_aggregate_signature(
 			kernel,
 			args: Vec::new(),
 			distinct,
+			parameter,
 		}),
 		aggregate_kernel::AggregateArity::One if args.len() == 1 => {
 			Some(GroupedAggregateSignature {
 				kernel,
 				args: vec![canonical_aggregate_signature_expr(&args[0])],
 				distinct,
+				parameter,
 			})
 		}
 		_ => None,
@@ -10126,6 +10127,29 @@ fn parse_non_negative_usize_literal(expr: &SqlExpr) -> Result<usize, FrontendErr
 				.map_err(|_| unsupported("LIMIT/OFFSET expects a non-negative integer"))
 		}
 		_ => Err(unsupported("LIMIT/OFFSET expects a non-negative integer")),
+	}
+}
+
+const APPROX_QUANTILE_PARAMETER_MESSAGE: &str =
+	"APPROX_QUANTILE requires a finite quantile literal in [0, 1]";
+
+fn parse_quantile_literal(expr: &SqlExpr) -> Result<f64, FrontendError> {
+	match strip_nested_sql_expr(expr) {
+		SqlExpr::Value(value) => match &value.value {
+			Value::Number(number, _) => number
+				.parse::<f64>()
+				.map_err(|_| unsupported(APPROX_QUANTILE_PARAMETER_MESSAGE)),
+			_ => Err(unsupported(APPROX_QUANTILE_PARAMETER_MESSAGE)),
+		},
+		SqlExpr::UnaryOp {
+			op: UnaryOperator::Minus,
+			expr,
+		} => Ok(-parse_quantile_literal(expr)?),
+		SqlExpr::UnaryOp {
+			op: UnaryOperator::Plus,
+			expr,
+		} => parse_quantile_literal(expr),
+		_ => Err(unsupported(APPROX_QUANTILE_PARAMETER_MESSAGE)),
 	}
 }
 

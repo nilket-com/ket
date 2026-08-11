@@ -361,6 +361,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/distributed/mod.rs",
 				"crates/toron/src/distributed/namespace_lifecycle.rs",
 				"crates/toron/src/distributed/worker_registry.rs",
+				// ADR 546 carries one execution seed and a conserved quantile-state
+				// allowance through distributed task context; it does not alter binder
+				// decomposition ownership.
+				"crates/toron/src/distributed/context.rs",
 				"crates/toron/src/error/distributed.rs",
 				"crates/toron/src/wire.rs",
 				"crates/toron-tpch/src/lib.rs",

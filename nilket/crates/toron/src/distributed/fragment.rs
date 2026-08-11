@@ -273,7 +273,70 @@ pub fn fragment_plan(
 	)?;
 	resolve_shuffle_publish_modes(&mut stages, max_in_flight_tasks);
 	validate_shuffle_publish_modes(&stages, max_in_flight_tasks)?;
+	distribute_quantile_state_allowance(&mut stages);
 	Ok(stages)
+}
+
+fn distribute_quantile_state_allowance(stages: &mut [StagePlan]) {
+	const EXECUTION_CAP: usize = 1_024;
+	let task_count = stages
+		.iter()
+		.flat_map(|stage| &stage.tasks)
+		.filter(|task| plan_contains_quantile_aggregate(&task.spec.plan))
+		.count();
+	if task_count == 0 {
+		return;
+	}
+	let base = EXECUTION_CAP / task_count;
+	let remainder = EXECUTION_CAP % task_count;
+	let mut ordinal = 0_usize;
+	for task in stages.iter_mut().flat_map(|stage| &mut stage.tasks) {
+		if !plan_contains_quantile_aggregate(&task.spec.plan) {
+			continue;
+		}
+		task.spec.context.quantile_state_allowance = base + usize::from(ordinal < remainder);
+		ordinal += 1;
+	}
+}
+
+fn plan_contains_quantile_aggregate(plan: &ExecutionPlan) -> bool {
+	match plan {
+		ExecutionPlan::Aggregate {
+			input, aggr_expr, ..
+		} => {
+			aggr_expr.iter().any(|call| {
+				matches!(
+					call.function,
+					crate::ir::AggregateFunction::ApproxQuantile(_)
+				)
+			}) || plan_contains_quantile_aggregate(input)
+		}
+		ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
+			plan_contains_quantile_aggregate(left) || plan_contains_quantile_aggregate(right)
+		}
+		ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Window { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Repeat { input, .. } => plan_contains_quantile_aggregate(input),
+		ExecutionPlan::RecursiveCte {
+			seed, recursive, ..
+		} => plan_contains_quantile_aggregate(seed) || plan_contains_quantile_aggregate(recursive),
+		ExecutionPlan::Scan { .. }
+		| ExecutionPlan::EmptyRelation { .. }
+		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::CreateTable { .. }
+		| ExecutionPlan::CreateLogicalType { .. }
+		| ExecutionPlan::CreateTableAsSelect { .. }
+		| ExecutionPlan::DropTable { .. }
+		| ExecutionPlan::Delete { .. }
+		| ExecutionPlan::Update { .. }
+		| ExecutionPlan::Insert { .. }
+		| ExecutionPlan::InsertSelect { .. } => false,
+	}
 }
 
 fn resolve_shuffle_publish_modes(stages: &mut [StagePlan], max_in_flight_tasks: Option<usize>) {
@@ -2328,6 +2391,44 @@ mod tests {
 	}
 
 	#[test]
+	fn adr546_quantile_state_allowance_is_conserved_across_fragment_tasks() {
+		let plan = quantile_aggregate_plan(ExecutionPlan::Exchange {
+			input: Box::new(scan_plan()),
+			partition_count: 3,
+			key: key_expr(),
+		});
+
+		let stages = fragment_plan(plan, config()).expect("fragment grouped quantile");
+		let quantile_tasks = stages
+			.iter()
+			.flat_map(|stage| &stage.tasks)
+			.filter(|task| plan_contains_quantile_aggregate(&task.spec.plan))
+			.collect::<Vec<_>>();
+
+		assert_eq!(quantile_tasks.len(), 3);
+		assert_eq!(
+			quantile_tasks
+				.iter()
+				.map(|task| task.spec.context.quantile_state_allowance)
+				.sum::<usize>(),
+			1_024,
+			"fragmentation must conserve the execution-wide confidence-state cap"
+		);
+		assert_eq!(
+			quantile_tasks
+				.iter()
+				.map(|task| task.spec.context.quantile_state_allowance)
+				.collect::<Vec<_>>(),
+			vec![342, 341, 341],
+			"the deterministic quotient/remainder split must not grant every task the full cap"
+		);
+		assert!(quantile_tasks.windows(2).all(|tasks| {
+			tasks[0].spec.context.quantile_execution_seed
+				== tasks[1].spec.context.quantile_execution_seed
+		}));
+	}
+
+	#[test]
 	fn publication_mode_follows_consumer_drain_eligibility() {
 		let streamable = ExecutionPlan::Exchange {
 			input: Box::new(scan_plan()),
@@ -3532,6 +3633,21 @@ mod tests {
 			output_schema: Arc::new(Schema::new(vec![
 				Field::new("key", DataType::Int32, false),
 				Field::new("count", DataType::Int64, false),
+			])),
+		}
+	}
+
+	fn quantile_aggregate_plan(input: ExecutionPlan) -> ExecutionPlan {
+		ExecutionPlan::Aggregate {
+			input: Box::new(input),
+			group_expr: key_expr(),
+			aggr_expr: vec![BoundAggregateCall {
+				function: AggregateFunction::ApproxQuantile(0.5),
+				args: key_expr(),
+			}],
+			output_schema: Arc::new(Schema::new(vec![
+				Field::new("key", DataType::Int32, false),
+				Field::new("quantile", DataType::Float64, true),
 			])),
 		}
 	}

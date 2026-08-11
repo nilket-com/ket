@@ -54,7 +54,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::fmt;
 use std::io::{Cursor, ErrorKind};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use tracing::Instrument;
@@ -64,7 +64,6 @@ use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, RuntimeFilterDescriptor,
 	SchemaEvolutionPolicy, TableObjectId, TableSchemaDescriptor,
 };
-#[cfg(test)]
 use wendelon::storage::sketch::KllSketch;
 use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 
@@ -108,6 +107,11 @@ pub struct ExecutionContext {
 	pub legacy_table_pins: HashMap<TableId, ScanTablePin>,
 	pub task_budget: TaskBudget,
 	pub task_telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	/// ADR 0083/0546: one data-independent seed shared by every fragment of this execution.
+	pub quantile_execution_seed: [u8; 32],
+	/// This terminal task's share of the execution-wide quantile-state allowance.
+	pub quantile_state_allowance: usize,
+	pub(in crate::exec) quantile_states_admitted: Arc<AtomicUsize>,
 	pub join_runtime_observation_mode: JoinRuntimeObservationMode,
 	pub runtime_filter: Option<RuntimeFilterDescriptor>,
 	pub downstream_cancellation: Option<DownstreamCancellationContext>,
@@ -130,6 +134,7 @@ impl fmt::Debug for ExecutionContext {
 			.field("trace_context", &self.trace_context)
 			.field("legacy_table_pins", &self.legacy_table_pins)
 			.field("task_budget", &self.task_budget)
+			.field("quantile_state_allowance", &self.quantile_state_allowance)
 			.field(
 				"join_runtime_observation_mode",
 				&self.join_runtime_observation_mode,
@@ -152,6 +157,9 @@ impl ExecutionContext {
 		tenant_id: TenantId,
 		read_bound: HlcBound,
 	) -> Self {
+		let mut quantile_execution_seed = [0_u8; 32];
+		aws_lc_rs::rand::fill(&mut quantile_execution_seed)
+			.expect("system CSPRNG must be available for query execution");
 		Self {
 			session_id,
 			query_id,
@@ -162,6 +170,9 @@ impl ExecutionContext {
 			legacy_table_pins: HashMap::new(),
 			task_budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			task_telemetry: None,
+			quantile_execution_seed,
+			quantile_state_allowance: self::aggregate::MAX_QUANTILE_STATES_PER_EXECUTION,
+			quantile_states_admitted: Arc::new(AtomicUsize::new(0)),
 			join_runtime_observation_mode: JoinRuntimeObservationMode::Disabled,
 			runtime_filter: None,
 			downstream_cancellation: None,
@@ -170,6 +181,14 @@ impl ExecutionContext {
 			join_spill_file_ops: Arc::new(BlockingFileOps),
 			join_spill_dir: crate::exec::join::default_join_spill_dir(),
 		}
+	}
+
+	pub fn with_quantile_execution(mut self, seed: [u8; 32], state_allowance: usize) -> Self {
+		self.quantile_execution_seed = seed;
+		self.quantile_state_allowance =
+			state_allowance.min(self::aggregate::MAX_QUANTILE_STATES_PER_EXECUTION);
+		self.quantile_states_admitted = Arc::new(AtomicUsize::new(0));
+		self
 	}
 
 	pub fn with_task_budget(mut self, task_budget: TaskBudget) -> Self {
@@ -664,47 +683,10 @@ impl Executor {
 								));
 							}
 							AggregateFunction::ApproxQuantile(q) => {
-								let mut sketch =
-									KllSketch::new(0x04, wendelon::schema::KllK::new(200), 42)
-										.map_err(|e| ExecutionError::Kernel {
-											message: e.to_string(),
-										})?;
-
-								for batch in &input_batches {
-									let arr = self.evaluate_expr(&args[0], batch)?;
-									if let Some(int_arr) = arr.as_any().downcast_ref::<Int32Array>()
-									{
-										for i in 0..int_arr.len() {
-											if !int_arr.is_null(i) {
-												sketch.insert(
-													int_arr.value(i).to_be_bytes().to_vec(),
-												);
-											}
-										}
-									}
-								}
-
-								// Simple estimate from KLL: sort and pick
-								let values = sketch.retained_values();
-								if values.is_empty() {
-									results_cols
-										.push(Arc::new(Float64Array::from(vec![None])) as ArrayRef);
-								} else {
-									let mut sorted = values.to_vec();
-									sorted.sort();
-									let idx = ((sorted.len() as f64 * q).round() as usize)
-										.min(sorted.len() - 1);
-									let val =
-										i32::from_be_bytes(sorted[idx].clone().try_into().unwrap())
-											as f64;
-									results_cols
-										.push(Arc::new(Float64Array::from(vec![val])) as ArrayRef);
-								}
-								results_fields.push(arrow::datatypes::Field::new(
-									"quantile",
-									arrow::datatypes::DataType::Float64,
-									true,
-								));
+								let _ = q;
+								return Err(ExecutionError::NotImplemented {
+									feature: "APPROX_QUANTILE requires the bound aggregate executor",
+								});
 							}
 						}
 					}

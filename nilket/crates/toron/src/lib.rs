@@ -4982,10 +4982,11 @@ mod tests {
 
 	fn range_skew_produced_storage_distribution_fact()
 	-> wendelon_client::ColumnRangeDistributionFact {
-		let mut sketch = KllSketch::new(
+		let mut sketch = KllSketch::new_with_randomness(
 			wendelon_client::ARROW_STATS_TAG_INT64,
 			KllK::new(2048),
-			0x5A17_1590,
+			[0x5A; 32],
+			[0x17; 32],
 		)
 		.expect("range-skew KLL sketch");
 		for row in 0..RANGE_SKEW_BASE_ROWS {
@@ -5000,7 +5001,9 @@ mod tests {
 			column_ordinal: 1,
 			arrow_type_tag: wendelon_client::ARROW_STATS_TAG_INT64,
 			non_null_count: sketch.total_item_count(),
-			rank_error_ppm: sketch.rank_error_ppm(),
+			// Synthetic binder fixture. CSB v1 range facts are suppressed by ADR 0083;
+			// the real v2 fact will derive this field from its own confidence contract.
+			rank_error_ppm: 10_000,
 			buckets,
 		}
 	}
@@ -6237,7 +6240,7 @@ mod tests {
 	}
 
 	#[tokio::test]
-	async fn experimental_quantile_kernel_executes_under_legacy_path() {
+	async fn stable_quantile_refuses_the_legacy_equal_weight_execution_path() {
 		let schema = Arc::new(Schema::new(vec![Field::new("val", DataType::Int32, true)]));
 
 		let val_array = Int32Array::from((1..=100).collect::<Vec<i32>>());
@@ -6258,15 +6261,12 @@ mod tests {
 			}),
 		};
 
-		let results = executor.execute(&plan, None).await.unwrap();
-		let result_batch = &results[0];
-		let q_array = result_batch
-			.column(0)
-			.as_any()
-			.downcast_ref::<Float64Array>()
-			.unwrap();
-
-		assert!((q_array.value(0) - 50.0).abs() < 5.0);
+		assert!(matches!(
+			executor.execute(&plan, None).await,
+			Err(crate::error::ExecutionError::NotImplemented {
+				feature: "APPROX_QUANTILE requires the bound aggregate executor"
+			})
+		));
 	}
 
 	#[tokio::test]

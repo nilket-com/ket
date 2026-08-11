@@ -5434,7 +5434,7 @@ impl Executor {
 			node_attribution::commit_stage_vocabulary(handle, join0_route.vocabulary_name());
 		}
 
-		let mut state = init_global_aggregate_state(aggr_expr)?;
+		let mut state = init_global_aggregate_state(&self.context, aggr_expr)?;
 		for partition in partition_batches {
 			for preserved_batch in partition {
 				let probe_stage = stage_handle.as_ref().and_then(|h| {
@@ -10348,7 +10348,7 @@ impl Executor {
 			return Ok(None);
 		};
 
-		let mut state = init_global_aggregate_state(aggr_expr)?;
+		let mut state = init_global_aggregate_state(&self.context, aggr_expr)?;
 		let profile = if crate::exec::aggregate::global_fold_join_filter_profile_eligible(
 			join_filter_predicate,
 			project,

@@ -875,7 +875,7 @@ fn partial_contributor_coverage_suppresses_range_distribution_fact() {
 }
 
 #[test]
-fn range_distribution_fact_rank_error_reflects_k_and_preserves_count() {
+fn adr083_v1_range_distribution_payload_does_not_produce_optimizer_fact() {
 	let descriptor = optimizer_fact_amount_range_distribution_descriptor(100);
 	let candidate = RangeDistributionColumnCandidate {
 		ordinal: 1,
@@ -892,18 +892,10 @@ fn range_distribution_fact_rank_error_reflects_k_and_preserves_count() {
 		]),
 	)];
 
-	let fact = range_distribution_fact_for_column(&candidate, &blocks)
-		.expect("range-distribution fact")
-		.expect("complete range-distribution fact");
-	assert_eq!(fact.column_ordinal, 1);
-	assert_eq!(fact.arrow_type_tag, ARROW_STATS_TAG_INT64);
-	assert_eq!(fact.non_null_count, 5);
-	assert_eq!(fact.rank_error_ppm, 10_000);
-	assert!(!fact.buckets.is_empty());
-	assert!(fact.buckets.len() <= RANGE_DISTRIBUTION_BUCKET_COUNT);
 	assert_eq!(
-		fact.buckets.iter().map(|bucket| bucket.count).sum::<u64>(),
-		5
+		range_distribution_fact_for_column(&candidate, &blocks)
+			.expect("range-distribution fact decision"),
+		None,
 	);
 }
 
@@ -1012,7 +1004,7 @@ async fn table_optimizer_facts_merges_tiered_heavy_hitters_into_exact_facts() {
 }
 
 #[tokio::test]
-async fn table_optimizer_facts_merges_tiered_range_distributions_into_global_buckets() {
+async fn adr083_table_optimizer_facts_suppresses_v1_range_distributions() {
 	let (mgr, l2) = fresh_manager_with_l2("optimizer-facts-range-distribution").await;
 	let descriptor = optimizer_fact_amount_range_distribution_descriptor(100);
 	tier_optimizer_fact_batch(
@@ -1041,26 +1033,7 @@ async fn table_optimizer_facts_merges_tiered_range_distributions_into_global_buc
 		.expect("covered range-distribution facts");
 
 	assert_eq!(facts.row_upper_bound, Some(8));
-	assert_eq!(facts.column_range_distributions.len(), 1);
-	let fact = &facts.column_range_distributions[0];
-	assert_eq!(fact.column_ordinal, 1);
-	assert_eq!(fact.arrow_type_tag, ARROW_STATS_TAG_INT64);
-	assert_eq!(fact.non_null_count, 7);
-	assert_eq!(fact.rank_error_ppm, 10_000);
-	assert!(!fact.buckets.is_empty());
-	assert!(fact.buckets.len() <= RANGE_DISTRIBUTION_BUCKET_COUNT);
-	assert_eq!(
-		fact.buckets.iter().map(|bucket| bucket.count).sum::<u64>(),
-		7
-	);
-	assert_eq!(
-		fact.buckets.first().map(|bucket| bucket.lower.as_slice()),
-		Some(encode_signed_stat_value(0, 8).unwrap().as_slice())
-	);
-	assert_eq!(
-		fact.buckets.last().map(|bucket| bucket.upper.as_slice()),
-		Some(encode_signed_stat_value(10_000, 8).unwrap().as_slice())
-	);
+	assert!(facts.column_range_distributions.is_empty());
 }
 
 #[tokio::test]
@@ -2294,7 +2267,7 @@ fn optimizer_fact_range_distribution_block(
 ) -> ParsedColumnStatsBlock {
 	let encoded = build_always_on_column_stats_block(descriptor, batch).unwrap();
 	let parsed = parse_column_stats_block(&encoded).unwrap();
-	assert_ne!(
+	assert_eq!(
 		parsed.columns[1].stat_flags & COLUMN_STAT_HAS_RANGE_DISTRIBUTION,
 		0
 	);
