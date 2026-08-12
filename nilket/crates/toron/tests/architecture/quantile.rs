@@ -1,6 +1,42 @@
 use super::support::{manifest_dir, source_files};
 
 #[test]
+pub(crate) fn adr083_task_execution_context_has_no_default_quantile_seed() {
+	let context = std::fs::read_to_string(manifest_dir().join("src/distributed/context.rs"))
+		.expect("read task execution context source");
+	let constructor = context
+		.split_once("pub const fn new(")
+		.expect("TaskExecutionContext::new")
+		.1
+		.split_once("\n\t}")
+		.expect("TaskExecutionContext::new body")
+		.0;
+
+	// The seed is a required parameter. A constructor that supplies one itself
+	// hands every caller a constant, and Wendelon ADR 83's guarantee requires
+	// randomness drawn independently of the data.
+	assert!(
+		constructor.contains("quantile_execution_seed: [u8; 32]"),
+		"TaskExecutionContext::new must take the execution seed as a parameter"
+	);
+	assert!(
+		!constructor.contains("[0xA5; 32]"),
+		"TaskExecutionContext::new must not embed a placeholder seed"
+	);
+
+	// The named test seed exists, and only the test constructor reaches for it.
+	assert!(context.contains("pub const LOCAL_TEST_QUANTILE_SEED: [u8; 32]"));
+	let test_constructor = context
+		.split_once("pub const fn local_test(")
+		.expect("TaskExecutionContext::local_test")
+		.1
+		.split_once("\n\t}")
+		.expect("TaskExecutionContext::local_test body")
+		.0;
+	assert!(test_constructor.contains("LOCAL_TEST_QUANTILE_SEED"));
+}
+
+#[test]
 pub(crate) fn adr083_fragment_plan_construction_requires_real_execution_context() {
 	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
 		.expect("read fragmenter source");
