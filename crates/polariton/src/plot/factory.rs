@@ -127,7 +127,8 @@ pub fn create_plot(
 			})
 		}
 		ResolvedKernelFields::Heatmap { x, y, value } => {
-			let prepared = heatmap::prepare_heatmap_data(df, x, y, value);
+			let prepared = heatmap::prepare_heatmap_data(df, x, y, value)
+				.expect("PRODUCT-0088 planning validated this heatmap snapshot");
 			Arc::new(HeatmapPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
@@ -1667,6 +1668,11 @@ mod product_0013_baseline_tests {
 			let kernel =
 				create_automatic_plot(PlotComposition::single(plot_type), &frame, 400, 300)
 					.unwrap_or_else(|error| panic!("{plot_type}: {error}"));
+			let expected_low = match plot_type {
+				PlotType::Heatmap => 1.0,
+				PlotType::Hexbin => 0.0,
+				_ => unreachable!("bounded gradient fixture"),
+			};
 			let settings = ResolvedPlotSettings::default();
 			let content = kernel.legend_content(&settings).expect("gradient content");
 			assert_eq!(content.0.len(), 1);
@@ -1674,7 +1680,7 @@ mod product_0013_baseline_tests {
 				content.0.first(),
 				crate::plot::legend::LegendSection::Gradient { stops, .. }
 					if stops.len() > 2
-						&& stops.first_value() == 0.0
+						&& stops.first_value() == expected_low
 						&& stops.last_value().is_finite()
 			));
 			let mut backend = SvgBackend::new(400.0, 300.0);

@@ -1,0 +1,13 @@
+error[E0451]: fields `x_categories`, `y_categories`, `values` and `domain` of struct `HeatmapCells` are private
+  --> tests/ui/heatmap_cells_private.rs:8:3
+   |
+ 7 |     let _ = HeatmapCells {
+   |             ------------ in this type
+ 8 |         x_categories: vec!["x".to_owned()],
+   |         ^^^^^^^^^^^^ private field
+ 9 |         y_categories: vec!["y".to_owned()],
+   |         ^^^^^^^^^^^^ private field
+10 |         values: vec![vec![Some(7.0)]],
+   |         ^^^^^^ private field
+11 |         domain: (7.0, 7.0),
+   |         ^^^^^^ private field

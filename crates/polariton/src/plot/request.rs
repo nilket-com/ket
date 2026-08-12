@@ -6,6 +6,7 @@
 //! source like an in-memory frame once deferred database relations arrive
 //! (`plans/wip/rune-data-products.md`).
 
+use crate::plot::kernels::heatmap::prepare_heatmap_data;
 use crate::plot::kernels::histogram::prepare_histogram_data;
 use crate::plot::spec::{
 	AuthoredChannel, AuthoredPlotSpec, CategoricalPaletteSelection, ColorIdentity,
@@ -141,6 +142,11 @@ pub fn plan_with_categorical_palette(
 }
 
 fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Result<(), String> {
+	if let crate::plot::spec::ResolvedKernelFields::Heatmap { x, y, value } =
+		spec.kernel_fields.as_ref()
+	{
+		prepare_heatmap_data(data, x, y, value).map_err(|error| error.to_string())?;
+	}
 	if let crate::plot::spec::ResolvedKernelFields::Histogram {
 		bin_start,
 		bin_end,
@@ -333,6 +339,41 @@ mod tests {
 			channel.binding.channel != crate::plot::spec::Channel::Color
 				&& channel.colors.is_empty()
 		}));
+	}
+
+	#[test]
+	fn product_0088_planning_surfaces_heatmap_refusals_before_factory_reconstruction() {
+		let duplicate = polars::df!(
+			"x" => ["a", "a"],
+			"y" => ["u", "u"],
+			"value" => [1.0, 9.0],
+		)
+		.unwrap();
+		let error = plan(PlotRequest {
+			source: materialized("duplicate heatmap", duplicate),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Heatmap)),
+		})
+		.unwrap_err();
+		assert!(error.contains("duplicate heatmap: heatmap cell (`a`, `u`)"));
+		assert!(error.contains("aggregate duplicate cells in the relation"));
+
+		let valid = polars::df!(
+			"x" => ["a", "b"],
+			"y" => ["u", "v"],
+			"value" => [1.0, 9.0],
+		)
+		.unwrap();
+		let resolved = plan(PlotRequest {
+			source: materialized("valid heatmap", valid),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Heatmap)),
+		})
+		.expect("planning validates the heatmap snapshot");
+		let _kernel = crate::plot::factory::create_plot(
+			&resolved.resolved_spec,
+			resolved.data.as_ref(),
+			400,
+			300,
+		);
 	}
 
 	#[test]

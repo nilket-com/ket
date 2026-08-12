@@ -1,6 +1,7 @@
 use crate::plot::common::{
 	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
+use crate::plot::kernels::heatmap_cells::{HeatmapCellRow, HeatmapCells, HeatmapCellsError};
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Point, Rectangle, Size};
@@ -14,8 +15,8 @@ pub struct HeatmapPlotKernel {
 impl PlotKernel for HeatmapPlotKernel {
 	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalXY {
-			x_categories: self.prepared_data.x_categories.clone(),
-			y_categories: self.prepared_data.y_categories.clone(),
+			x_categories: self.prepared_data.cells.x_categories().to_vec(),
+			y_categories: self.prepared_data.cells.y_categories().to_vec(),
 		}
 	}
 
@@ -27,14 +28,17 @@ impl PlotKernel for HeatmapPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_x = self.prepared_data.x_categories.len();
-		let num_y = self.prepared_data.y_categories.len();
-		let max_val = self.prepared_data.max_val;
+		let num_x = self.prepared_data.cells.x_categories().len();
+		let num_y = self.prepared_data.cells.y_categories().len();
+		let (low, high) = self.prepared_data.cells.domain();
+		let delta = high - low;
 		for i in 0..num_x {
 			for j in 0..num_y {
-				let val = self.prepared_data.values[i][j];
-				let t = if max_val > 0.0 {
-					(val / max_val) as f32
+				let Some(value) = self.prepared_data.cells.value(i, j) else {
+					continue;
+				};
+				let t = if delta > 0.0 {
+					((value - low) / delta) as f32
 				} else {
 					0.0
 				};
@@ -63,10 +67,13 @@ impl PlotKernel for HeatmapPlotKernel {
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position() {
-			let num_x = self.prepared_data.x_categories.len();
-			let num_y = self.prepared_data.y_categories.len();
+			let num_x = self.prepared_data.cells.x_categories().len();
+			let num_y = self.prepared_data.cells.y_categories().len();
 			for i in 0..num_x {
 				for j in 0..num_y {
+					let Some(value) = self.prepared_data.cells.value(i, j) else {
+						continue;
+					};
 					let (center, bw, bh) = transform.categorical_2d(i, j);
 					let rect = Rectangle {
 						x: center.x - bw / 2.0,
@@ -75,10 +82,9 @@ impl PlotKernel for HeatmapPlotKernel {
 						height: bh,
 					};
 					if rect.contains(cursor_pos) {
-						let x_cat = &self.prepared_data.x_categories[i];
-						let y_cat = &self.prepared_data.y_categories[j];
-						let val = self.prepared_data.values[i][j];
-						return Some(format!("X: {}\nY: {}\nValue: {:.2}", x_cat, y_cat, val));
+						let x_cat = &self.prepared_data.cells.x_categories()[i];
+						let y_cat = &self.prepared_data.cells.y_categories()[j];
+						return Some(format!("X: {}\nY: {}\nValue: {:.2}", x_cat, y_cat, value));
 					}
 				}
 			}
@@ -90,15 +96,11 @@ impl PlotKernel for HeatmapPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::gradient_section(
-			"Value".to_owned(),
-			0.0,
-			self.prepared_data.max_val,
-			settings.color_theme,
-		)
-		.map(|section| {
-			crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(section))
-		})
+		let (low, high) = self.prepared_data.cells.domain();
+		crate::plot::legend::gradient_section("Value".to_owned(), low, high, settings.color_theme)
+			.map(|section| {
+				crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(section))
+			})
 	}
 
 	fn x_label(&self) -> String {
@@ -110,137 +112,63 @@ impl PlotKernel for HeatmapPlotKernel {
 	}
 }
 
+#[derive(Debug)]
 pub struct HeatmapPreparedData {
-	pub x_categories: Vec<String>,
-	pub y_categories: Vec<String>,
-	pub values: Vec<Vec<f64>>,
-	pub max_val: f64,
+	pub cells: HeatmapCells,
 	pub x_label: String,
 	pub y_label: String,
 }
 
-pub fn prepare_heatmap_data(
+pub(crate) fn prepare_heatmap_data(
 	df: &DataFrame,
 	x_col: &str,
 	y_col: &str,
 	val_col: &str,
-) -> HeatmapPreparedData {
-	if df.height() == 0 || val_col.is_empty() {
-		return HeatmapPreparedData {
-			x_categories: vec!["No Data".to_string()],
-			y_categories: vec!["No Data".to_string()],
-			values: vec![vec![0.0]],
-			max_val: 1.0,
-			x_label: x_col.to_string(),
-			y_label: y_col.to_string(),
-		};
+) -> Result<HeatmapPreparedData, HeatmapCellsError> {
+	let x_values = df
+		.column(x_col)
+		.expect("resolved heatmap x field is present");
+	let y_values = df
+		.column(y_col)
+		.expect("resolved heatmap y field is present");
+	let values = df
+		.column(val_col)
+		.expect("resolved heatmap value field is present")
+		.cast(&DataType::Float64)
+		.expect("resolved heatmap value is quantitative");
+	let values = values
+		.f64()
+		.expect("resolved heatmap value casts to Float64");
+	let mut rows = Vec::with_capacity(df.height());
+	for row in 0..df.height() {
+		rows.push(HeatmapCellRow {
+			x: category_key(x_values.get(row).expect("heatmap x row is in bounds")),
+			y: category_key(y_values.get(row).expect("heatmap y row is in bounds")),
+			value: values.get(row),
+		});
 	}
-	let x_cats_series = if x_col.is_empty() {
-		Series::new("dummy_x".into(), &["X"])
-	} else {
-		match df.column(x_col) {
-			Ok(c) => c
-				.unique()
-				.unwrap_or_else(|_| c.clone())
-				.sort(Default::default())
-				.unwrap_or_else(|_| c.clone())
-				.as_materialized_series()
-				.clone(),
-			Err(_) => Series::new("dummy_x".into(), &["X"]),
-		}
-	};
-	let x_categories: Vec<String> = x_cats_series
-		.iter()
-		.map(|v: AnyValue| v.to_string().replace("\"", ""))
-		.collect();
-	let y_cats_series = if y_col.is_empty() {
-		Series::new("dummy_y".into(), &["Y"])
-	} else {
-		match df.column(y_col) {
-			Ok(c) => c
-				.unique()
-				.unwrap_or_else(|_| c.clone())
-				.sort(Default::default())
-				.unwrap_or_else(|_| c.clone())
-				.as_materialized_series()
-				.clone(),
-			Err(_) => Series::new("dummy_y".into(), &["Y"]),
-		}
-	};
-	let y_categories: Vec<String> = y_cats_series
-		.iter()
-		.map(|v: AnyValue| v.to_string().replace("\"", ""))
-		.collect();
-	let num_x = x_categories.len();
-	let num_y = y_categories.len();
-	let mut values = vec![vec![0.0f64; num_y]; num_x];
-	let mut max_val = 0.0f64;
-	let x_to_idx: std::collections::HashMap<String, usize> = x_categories
-		.iter()
-		.enumerate()
-		.map(|(i, s): (usize, &String)| (s.clone(), i))
-		.collect();
-	let y_to_idx: std::collections::HashMap<String, usize> = y_categories
-		.iter()
-		.enumerate()
-		.map(|(i, s): (usize, &String)| (s.clone(), i))
-		.collect();
-	let binding_val = match df.column(val_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
-			Column::from(Series::new_empty(val_col.into(), &DataType::Float64))
-		}),
-		Err(_) => Column::from(Series::new_empty(val_col.into(), &DataType::Float64)),
-	};
-	let p_val = binding_val.f64().unwrap();
-	let p_x = if x_col.is_empty() {
-		Series::new("dummy_x".into(), vec!["X"; df.height()])
-	} else {
-		match df.column(x_col) {
-			Ok(c) => c.as_materialized_series().clone(),
-			Err(_) => Series::new("dummy_x".into(), vec!["X"; df.height()]),
-		}
-	};
-	let p_y = if y_col.is_empty() {
-		Series::new("dummy_y".into(), vec!["Y"; df.height()])
-	} else {
-		match df.column(y_col) {
-			Ok(c) => c.as_materialized_series().clone(),
-			Err(_) => Series::new("dummy_y".into(), vec!["Y"; df.height()]),
-		}
-	};
-	for i in 0..df.height() {
-		let x_v = p_x
-			.get(i)
-			.unwrap_or(AnyValue::Null)
-			.to_string()
-			.replace("\"", "");
-		let y_v = p_y
-			.get(i)
-			.unwrap_or(AnyValue::Null)
-			.to_string()
-			.replace("\"", "");
-		let val = p_val.get(i).unwrap_or(0.0);
-		if let (Some(&xi), Some(&yi)) = (x_to_idx.get(&x_v), y_to_idx.get(&y_v)) {
-			values[xi][yi] = val;
-			if val > max_val {
-				max_val = val;
-			}
-		}
-	}
-	HeatmapPreparedData {
-		x_categories,
-		y_categories,
-		values,
-		max_val,
-		x_label: x_col.to_string(),
-		y_label: y_col.to_string(),
+	Ok(HeatmapPreparedData {
+		cells: HeatmapCells::from_rows(rows)?,
+		x_label: x_col.to_owned(),
+		y_label: y_col.to_owned(),
+	})
+}
+
+fn category_key(value: AnyValue<'_>) -> Option<String> {
+	match value {
+		AnyValue::Null => None,
+		AnyValue::String(value) => Some(value.to_owned()),
+		AnyValue::StringOwned(value) => Some(value.as_str().to_owned()),
+		other => Some(other.to_string()),
 	}
 }
 
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::colors::ColorTheme;
 	use crate::plot::common::{PathBuilder, PlotBackend};
+	use crate::plot::legend::LegendSection;
 	use iced::widget::canvas::{Stroke, Text};
 
 	#[derive(Default)]
@@ -248,10 +176,13 @@ mod tests {
 	/// records rectangle tuples only; its shared short name grants no other license.
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size, Color)>,
+		strokes: usize,
 	}
 
 	impl PlotBackend for RectangleBackend {
-		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {
+			self.strokes += 1;
+		}
 
 		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
 
@@ -274,25 +205,13 @@ mod tests {
 		}
 	}
 
-	#[test]
-	fn product_0056_asymmetric_heatmap_rows_join_labels_cells_colors_and_hover() {
-		let frame = polars::df!(
-			"x" => ["c2", "c0", "c1", "c0", "c2", "c1"],
-			"y" => ["row-b", "row-a", "row-b", "row-b", "row-a", "row-a"],
-			"value" => [32_i64, 1, 16, 8, 4, 2],
-		)
-		.unwrap();
-		let kernel = HeatmapPlotKernel {
-			prepared_data: Arc::new(prepare_heatmap_data(&frame, "x", "y", "value")),
-		};
-		assert_eq!(kernel.prepared_data.x_categories, ["c0", "c1", "c2"]);
-		assert_eq!(kernel.prepared_data.y_categories, ["row-a", "row-b"]);
-		assert_eq!(
-			kernel.prepared_data.values,
-			vec![vec![1.0, 8.0], vec![2.0, 16.0], vec![4.0, 32.0]]
-		);
+	fn kernel(frame: &DataFrame) -> Result<HeatmapPlotKernel, HeatmapCellsError> {
+		Ok(HeatmapPlotKernel {
+			prepared_data: Arc::new(prepare_heatmap_data(frame, "x", "y", "value")?),
+		})
+	}
 
-		let settings = ResolvedPlotSettings::default();
+	fn render(kernel: &HeatmapPlotKernel, settings: ResolvedPlotSettings) -> RectangleBackend {
 		let layout = kernel.layout(settings.clone());
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 200.0));
 		let transform = CoordinateTransformer::new(&layout, bounds);
@@ -302,9 +221,37 @@ mod tests {
 			bounds,
 			&transform,
 			Cursor::Unavailable,
-			settings.clone(),
+			settings,
 		);
+		backend
+	}
+
+	#[test]
+	fn product_0056_asymmetric_heatmap_rows_join_labels_cells_colors_and_hover() {
+		let frame = polars::df!(
+			"x" => ["c2", "c0", "c1", "c0", "c2", "c1"],
+			"y" => ["row-b", "row-a", "row-b", "row-b", "row-a", "row-a"],
+			"value" => [32_i64, 1, 16, 8, 4, 2],
+		)
+		.unwrap();
+		let kernel = kernel(&frame).unwrap();
+		assert_eq!(
+			kernel.prepared_data.cells.x_categories(),
+			["c0", "c1", "c2"]
+		);
+		assert_eq!(
+			kernel.prepared_data.cells.y_categories(),
+			["row-a", "row-b"]
+		);
+		assert_eq!(kernel.prepared_data.cells.domain(), (1.0, 32.0));
+
+		let settings = ResolvedPlotSettings::default();
+		let backend = render(&kernel, settings.clone());
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 200.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
 		assert_eq!(backend.rectangles.len(), 6);
+		assert_eq!(backend.strokes, 6);
 
 		for x_index in 0..3 {
 			for y_index in 0..2 {
@@ -313,15 +260,15 @@ mod tests {
 				let (center, band_width, band_height) = transform.categorical_2d(x_index, y_index);
 				assert_eq!(top_left, Point::new(center.x - 50.0, center.y - 50.0));
 				assert_eq!(size, Size::new(band_width, band_height));
-				let value = kernel.prepared_data.values[x_index][y_index];
+				let value = kernel.prepared_data.cells.value(x_index, y_index).unwrap();
 				assert_eq!(
 					color,
 					settings
 						.color_theme
-						.get_color((value / kernel.prepared_data.max_val) as f32)
+						.get_color(((value - 1.0) / 31.0) as f32)
 				);
-				let x = &kernel.prepared_data.x_categories[x_index];
-				let y = &kernel.prepared_data.y_categories[y_index];
+				let x = &kernel.prepared_data.cells.x_categories()[x_index];
+				let y = &kernel.prepared_data.cells.y_categories()[y_index];
 				assert_eq!(
 					kernel.hover(&transform, Cursor::Available(center)),
 					Some(format!("X: {x}\nY: {y}\nValue: {value:.2}"))
@@ -332,52 +279,172 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0087_heatmap_omits_zero_domain_and_banks_signed_clamping_for_b2() {
-		let zero = HeatmapPlotKernel {
-			prepared_data: Arc::new(HeatmapPreparedData {
-				x_categories: vec!["x".to_owned()],
-				y_categories: vec!["y".to_owned()],
-				values: vec![vec![0.0]],
-				max_val: 0.0,
-				x_label: "x".to_owned(),
-				y_label: "y".to_owned(),
-			}),
-		};
-		assert!(
-			zero.legend_content(&ResolvedPlotSettings::default())
-				.is_none()
-		);
+	fn product_0088_duplicate_order_bank_now_has_one_typed_refusal() {
+		// Stage 0 banked last-write outcomes 9.0 forward and 1.0 reversed.
+		for values in [[1.0, 9.0], [9.0, 1.0], [1.0, 1.0]] {
+			let frame = polars::df!(
+				"x" => ["x", "x"],
+				"y" => ["y", "y"],
+				"value" => values,
+			)
+			.unwrap();
+			let error = prepare_heatmap_data(&frame, "x", "y", "value").unwrap_err();
+			assert!(matches!(
+				error,
+				HeatmapCellsError::DuplicateCell {
+					first_row: 0,
+					second_row: 1,
+					..
+				}
+			));
+			let message = error.to_string();
+			assert!(message.contains("(`x`, `y`)"));
+			assert!(message.contains("aggregate duplicate cells in the relation"));
+		}
+	}
 
-		let signed = HeatmapPlotKernel {
-			prepared_data: Arc::new(HeatmapPreparedData {
-				x_categories: vec!["x".to_owned()],
-				y_categories: vec!["y".to_owned()],
-				values: vec![vec![-10.0]],
-				max_val: 10.0,
-				x_label: "x".to_owned(),
-				y_label: "y".to_owned(),
-			}),
-		};
+	#[test]
+	fn product_0088_null_keys_nonfinite_values_and_literal_null_are_distinct() {
+		let null_x = polars::df!(
+			"x" => [None, Some("null")],
+			"y" => [Some("u"), Some("v")],
+			"value" => [1.0, 2.0],
+		)
+		.unwrap();
+		assert!(matches!(
+			prepare_heatmap_data(&null_x, "x", "y", "value"),
+			Err(HeatmapCellsError::NullX { row: 0 })
+		));
+
+		let literal = polars::df!("x" => ["null"], "y" => ["u"], "value" => [1.0]).unwrap();
+		let literal = kernel(&literal).unwrap();
+		assert_eq!(literal.prepared_data.cells.x_categories(), ["null"]);
+
+		for value in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+			let frame = polars::df!("x" => ["a"], "y" => ["u"], "value" => [value]).unwrap();
+			assert!(matches!(
+				prepare_heatmap_data(&frame, "x", "y", "value"),
+				Err(HeatmapCellsError::NonFiniteValue { row: 0, .. })
+			));
+		}
+		let finite = polars::df!("x" => ["a"], "y" => ["u"], "value" => [1.0]).unwrap();
+		assert!(kernel(&finite).is_ok());
+	}
+
+	#[test]
+	fn product_0088_absence_survives_axes_paint_outline_hover_and_domain() {
+		let frame = polars::df!(
+			"x" => ["a", "b", "c"],
+			"y" => ["u", "v", "u"],
+			"value" => [None, Some(5.0), Some(7.0)],
+		)
+		.unwrap();
+		let kernel = kernel(&frame).unwrap();
+		assert_eq!(kernel.prepared_data.cells.x_categories(), ["a", "b", "c"]);
+		assert_eq!(kernel.prepared_data.cells.y_categories(), ["u", "v"]);
+		assert_eq!(kernel.prepared_data.cells.domain(), (5.0, 7.0));
 		let settings = ResolvedPlotSettings::default();
-		let layout = signed.layout(settings.clone());
-		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let backend = render(&kernel, settings.clone());
+		let layout = kernel.layout(settings);
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 200.0));
 		let transform = CoordinateTransformer::new(&layout, bounds);
-		let mut backend = RectangleBackend::default();
-		signed.plot(
-			&mut backend,
-			bounds,
-			&transform,
-			Cursor::Unavailable,
-			settings.clone(),
+		assert_eq!(backend.rectangles.len(), 2);
+		assert_eq!(backend.strokes, 2);
+
+		let (absent, _, _) = transform.categorical_2d(0, 0);
+		let (observed, _, _) = transform.categorical_2d(1, 1);
+		assert_eq!(kernel.hover(&transform, Cursor::Available(absent)), None);
+		assert_eq!(
+			kernel.hover(&transform, Cursor::Available(observed)),
+			Some("X: b\nY: v\nValue: 5.00".to_owned())
 		);
-		assert_eq!(backend.rectangles[0].2, settings.color_theme.get_color(0.0));
-		let content = signed
+	}
+
+	#[test]
+	fn product_0088_signed_domains_use_both_ramp_ends() {
+		for values in [[-50.0, 100.0], [-40.0, -10.0]] {
+			let frame = polars::df!(
+				"x" => ["a", "b"],
+				"y" => ["u", "u"],
+				"value" => values,
+			)
+			.unwrap();
+			let kernel = kernel(&frame).unwrap();
+			assert_eq!(kernel.prepared_data.cells.domain(), (values[0], values[1]));
+			let settings = ResolvedPlotSettings::default();
+			let backend = render(&kernel, settings.clone());
+			assert_eq!(backend.rectangles[0].2, settings.color_theme.get_color(0.0));
+			assert_eq!(backend.rectangles[1].2, settings.color_theme.get_color(1.0));
+		}
+	}
+
+	#[test]
+	fn product_0088_constant_and_no_data_share_only_gradient_omission() {
+		let constant = polars::df!(
+			"x" => ["a", "b"],
+			"y" => ["u", "u"],
+			"value" => [4.0, 4.0],
+		)
+		.unwrap();
+		let constant = kernel(&constant).unwrap();
+		let settings = ResolvedPlotSettings::default();
+		let painted = render(&constant, settings.clone());
+		assert_eq!(constant.prepared_data.cells.domain(), (4.0, 4.0));
+		assert_eq!(painted.rectangles.len(), 2);
+		assert!(
+			painted
+				.rectangles
+				.iter()
+				.all(|(_, _, color)| *color == settings.color_theme.get_color(0.0))
+		);
+		assert!(constant.legend_content(&settings).is_none());
+
+		let empty = DataFrame::new(
+			0,
+			vec![
+				Series::new("x".into(), Vec::<String>::new()).into(),
+				Series::new("y".into(), Vec::<String>::new()).into(),
+				Series::new("value".into(), Vec::<f64>::new()).into(),
+			],
+		)
+		.unwrap();
+		let empty = kernel(&empty).unwrap();
+		assert_eq!(empty.prepared_data.cells.x_categories(), ["No Data"]);
+		assert_eq!(empty.prepared_data.cells.y_categories(), ["No Data"]);
+		assert_eq!(empty.prepared_data.cells.domain(), (0.0, 0.0));
+		let unpainted = render(&empty, settings.clone());
+		let layout = empty.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 200.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		assert!(unpainted.rectangles.is_empty());
+		assert_eq!(unpainted.strokes, 0);
+		let (center, _, _) = transform.categorical_2d(0, 0);
+		assert_eq!(empty.hover(&transform, Cursor::Available(center)), None);
+		assert!(empty.legend_content(&settings).is_none());
+	}
+
+	#[test]
+	fn product_0088_asymmetric_diverging_neutral_remains_at_twenty_five_for_b3() {
+		let frame = polars::df!(
+			"x" => ["a", "b", "c"],
+			"y" => ["u", "u", "u"],
+			"value" => [-50.0, 25.0, 100.0],
+		)
+		.unwrap();
+		let kernel = kernel(&frame).unwrap();
+		let settings = ResolvedPlotSettings {
+			color_theme: ColorTheme::GreenPurples,
+			..ResolvedPlotSettings::default()
+		};
+		let backend = render(&kernel, settings.clone());
+		assert_eq!(backend.rectangles[1].2, settings.color_theme.get_color(0.5));
+		let guide = kernel
 			.legend_content(&settings)
-			.expect("positive max guide");
-		let crate::plot::legend::LegendSection::Gradient { stops, .. } = content.0.first() else {
+			.expect("non-degenerate guide");
+		let LegendSection::Gradient { stops, .. } = guide.0.first() else {
 			panic!("gradient section")
 		};
-		assert_eq!(stops.first_value(), 0.0);
-		assert!(-10.0 < stops.first_value());
+		assert!(stops.values().any(|value| value == 25.0));
+		assert_eq!(stops.sample_normalized(0.5), backend.rectangles[1].2);
 	}
 }

@@ -351,6 +351,67 @@ fn product_0087_gradient_guides_have_one_stop_and_construction_authority() {
 }
 
 #[test]
+fn product_0088_heatmap_keeps_one_validated_sparse_cell_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let heatmap =
+		std::fs::read_to_string(root.join("plot/kernels/heatmap.rs")).expect("read heatmap kernel");
+	let cells = std::fs::read_to_string(root.join("plot/kernels/heatmap_cells.rs"))
+		.expect("read heatmap cell authority");
+	let request =
+		std::fs::read_to_string(root.join("plot/request.rs")).expect("read plot planning");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let production_heatmap = heatmap
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production heatmap region");
+
+	assert_eq!(
+		production_heatmap
+			.matches("HeatmapCells::from_rows(rows)?")
+			.count(),
+		1
+	);
+	assert!(production_heatmap.contains("let Some(value) = self.prepared_data.cells.value(i, j)"));
+	assert!(production_heatmap.contains("let (low, high) = self.prepared_data.cells.domain()"));
+	for retired in [
+		"values[xi][yi]",
+		"vec![vec![0.0f64",
+		"unwrap_or(0.0)",
+		"max_val",
+		"val / max",
+	] {
+		assert!(
+			!production_heatmap.contains(retired),
+			"PRODUCT-0088 retired heatmap authority survives as {retired}"
+		);
+	}
+	assert!(cells.contains("pub struct HeatmapCells"));
+	assert!(cells.contains("x_categories: Vec<String>"));
+	assert!(!cells.contains("pub x_categories:"));
+	assert!(cells.contains("pub(crate) fn from_rows("));
+	assert!(
+		request.contains("prepare_heatmap_data(data, x, y, value)")
+			&& request.contains("map_err(|error| error.to_string())?")
+	);
+	assert!(
+		factory.contains("PRODUCT-0088 planning validated this heatmap snapshot"),
+		"factory reconstruction must rely on the planning-time validation of the same snapshot"
+	);
+
+	for file in [
+		"plot/kernels/bubble.rs",
+		"plot/colors.rs",
+		"plot/legend.rs",
+		"plot/gradient_stops.rs",
+	] {
+		let source = std::fs::read_to_string(root.join(file))
+			.unwrap_or_else(|error| panic!("read {file}: {error}"));
+		assert!(!source.contains("HeatmapCells"));
+		assert!(!source.contains("PRODUCT-0088"));
+	}
+}
+
+#[test]
 fn product_0001_polariton_reaches_nilket_only_through_the_public_client() {
 	assert_product_dependency_boundary(
 		Path::new(env!("CARGO_MANIFEST_DIR")),

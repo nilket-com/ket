@@ -11,6 +11,7 @@ pub mod fill_between;
 pub mod fill_between_line;
 pub mod funnel;
 pub mod heatmap;
+pub mod heatmap_cells;
 pub mod hexbin;
 // PRODUCT-0078 preserves the validated renderer substrate while its authored
 // producer is deliberately absent until the histogram surface record.
