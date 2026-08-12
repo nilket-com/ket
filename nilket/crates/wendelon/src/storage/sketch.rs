@@ -6,7 +6,6 @@ use crate::storage::ColumnStatsHllPayload;
 use crate::storage::stats::estimate_hll_distinct_count;
 use std::collections::BTreeMap;
 use std::io::{Error, ErrorKind};
-use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HllRegisters {
@@ -153,8 +152,8 @@ const KLL_COMPACTION_DOMAIN: &[u8; 8] = b"KLLCMP01";
 const KLL_SAMPLER_DOMAIN: &[u8; 8] = b"KLLSMP01";
 const KLL_MERGE_SEED_DOMAIN: &[u8] = b"nilket-kll-merge-seed-v1";
 const KLL_MERGE_IDENTITY_DOMAIN: &[u8] = b"nilket-kll-merge-identity-v1";
-
-static LEGACY_KLL_IDENTITY_ORDINAL: AtomicU64 = AtomicU64::new(1);
+const KLL_LEGACY_SEED_DOMAIN: &[u8] = b"nilket-kll-legacy-seed-v2";
+const KLL_LEGACY_IDENTITY_DOMAIN: &[u8] = b"nilket-kll-legacy-identity-v2";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct CanonicalValue([u8; 8]);
@@ -211,16 +210,6 @@ pub struct KllSketch {
 }
 
 impl KllSketch {
-	pub(crate) fn new(arrow_type_tag: u8, k: KllK, compaction_seed: u32) -> std::io::Result<Self> {
-		let ordinal = LEGACY_KLL_IDENTITY_ORDINAL.fetch_add(1, Ordering::Relaxed);
-		let seed = derive_bytes(b"nilket-kll-legacy-seed-v1", &compaction_seed.to_be_bytes());
-		let mut identity_input = Vec::with_capacity(12);
-		identity_input.extend_from_slice(&compaction_seed.to_be_bytes());
-		identity_input.extend_from_slice(&ordinal.to_be_bytes());
-		let identity = derive_bytes(b"nilket-kll-legacy-identity-v1", &identity_input);
-		Self::new_with_randomness(arrow_type_tag, k, seed, identity)
-	}
-
 	pub fn new_with_randomness(
 		arrow_type_tag: u8,
 		k: KllK,
@@ -252,22 +241,6 @@ impl KllSketch {
 		})
 	}
 
-	pub(crate) fn from_retained_values(
-		arrow_type_tag: u8,
-		k: KllK,
-		total_item_count: u64,
-		values: Vec<Vec<u8>>,
-		compaction_seed: u32,
-	) -> std::io::Result<Self> {
-		let mut sketch = Self::new(arrow_type_tag, k, compaction_seed)?;
-		sketch.total_item_count = total_item_count;
-		sketch.levels[0] = values
-			.into_iter()
-			.map(|value| CanonicalValue::from_bytes(&value, sketch.value_width))
-			.collect::<std::io::Result<Vec<_>>>()?;
-		Ok(sketch)
-	}
-
 	pub(crate) fn from_legacy_levels(
 		arrow_type_tag: u8,
 		k: KllK,
@@ -289,7 +262,14 @@ impl KllSketch {
 				"compacted legacy KLL state discarded its level weights",
 			));
 		}
-		let mut sketch = Self::new(arrow_type_tag, k, compaction_seed)?;
+		let (seed, identity) = legacy_randomness_from_content(
+			arrow_type_tag,
+			k,
+			total_item_count,
+			&levels,
+			compaction_seed,
+		)?;
+		let mut sketch = Self::new_with_randomness(arrow_type_tag, k, seed, identity)?;
 		sketch.total_item_count = total_item_count;
 		sketch.levels = levels
 			.into_iter()
@@ -789,6 +769,53 @@ impl KllSketch {
 	}
 }
 
+/// Legacy aggregate state has no execution context from which to obtain fresh
+/// randomness. Deriving its compatibility-only stream from the complete encoded
+/// state keeps decode pure and separates distinct states without a process-global
+/// ordinal. Byte-identical legacy states intentionally resume the same stream;
+/// fresh sketches never use this path. Because the derivation observes retained
+/// data, later compaction of recovered legacy state does not inherit the
+/// fresh-sketch probability guarantee; this is a rolling-compatibility path only.
+fn legacy_randomness_from_content(
+	arrow_type_tag: u8,
+	k: KllK,
+	total_item_count: u64,
+	levels: &[Vec<Vec<u8>>],
+	compaction_seed: u32,
+) -> std::io::Result<([u8; 32], [u8; 32])> {
+	let level_count = u32::try_from(levels.len())
+		.map_err(|_| Error::new(ErrorKind::InvalidData, "legacy KLL level count exceeds u32"))?;
+	let mut content = Vec::new();
+	content.push(arrow_type_tag);
+	content.extend_from_slice(&k.get().to_be_bytes());
+	content.extend_from_slice(&total_item_count.to_be_bytes());
+	content.extend_from_slice(&compaction_seed.to_be_bytes());
+	content.extend_from_slice(&level_count.to_be_bytes());
+	for level in levels {
+		let value_count = u64::try_from(level.len()).map_err(|_| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"legacy KLL level value count exceeds u64",
+			)
+		})?;
+		content.extend_from_slice(&value_count.to_be_bytes());
+		for value in level {
+			let value_len = u32::try_from(value.len()).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"legacy KLL retained value length exceeds u32",
+				)
+			})?;
+			content.extend_from_slice(&value_len.to_be_bytes());
+			content.extend_from_slice(value);
+		}
+	}
+	Ok((
+		derive_bytes(KLL_LEGACY_SEED_DOMAIN, &content),
+		derive_bytes(KLL_LEGACY_IDENTITY_DOMAIN, &content),
+	))
+}
+
 fn derive_bytes(domain: &[u8], input: &[u8]) -> [u8; 32] {
 	let key = *blake3::hash(domain).as_bytes();
 	*blake3::keyed_hash(&key, input).as_bytes()
@@ -856,6 +883,35 @@ mod tests {
 	use super::*;
 
 	#[test]
+	fn adr083_legacy_identity_is_a_pure_function_of_validated_content() {
+		fn decode(values: [u32; 2]) -> KllSketch {
+			KllSketch::from_legacy_levels(
+				0x03,
+				KllK::new(64),
+				2,
+				vec![vec![
+					values[0].to_be_bytes().to_vec(),
+					values[1].to_be_bytes().to_vec(),
+				]],
+				42,
+			)
+			.unwrap()
+		}
+
+		let first = decode([10, 20]);
+		let repeated = decode([10, 20]);
+		let distinct = decode([10, 21]);
+		assert_eq!(
+			first, repeated,
+			"decoding the same legacy state twice must be deterministic"
+		);
+		assert_ne!(
+			first.identity, distinct.identity,
+			"distinct legacy states need distinct compaction domains"
+		);
+	}
+
+	#[test]
 	fn hll_merge_takes_register_maxima() {
 		let precision = HllPrecision::new(10).unwrap();
 		let mut left = HllRegisters::new(precision);
@@ -919,7 +975,13 @@ mod tests {
 
 	#[test]
 	fn kll_query_buckets_merges_duplicate_boundaries_and_preserves_count() {
-		let mut sketch = KllSketch::new(0x04, KllK::new(64), 7).unwrap();
+		let mut sketch = KllSketch::new_with_randomness(
+			0x04,
+			KllK::new(64),
+			derive_bytes(b"bucket-test-seed", b"bucket-test"),
+			derive_bytes(b"bucket-test-identity", b"bucket-test"),
+		)
+		.unwrap();
 		for _ in 0..90 {
 			sketch.insert(0_i64.to_be_bytes().to_vec());
 		}
@@ -1080,8 +1142,10 @@ mod tests {
 
 	#[test]
 	fn adr083_pair_merge_is_receiver_independent() {
-		let mut a = KllSketch::new(0x03, KllK::new(800), 42).unwrap();
-		let mut b = KllSketch::new(0x03, KllK::new(800), 42).unwrap();
+		let mut a =
+			KllSketch::new_with_randomness(0x03, KllK::new(800), [0x42; 32], [0xA1; 32]).unwrap();
+		let mut b =
+			KllSketch::new_with_randomness(0x03, KllK::new(800), [0x42; 32], [0xB2; 32]).unwrap();
 		for value in 0_u32..4_001 {
 			a.insert(value.to_be_bytes().to_vec());
 		}

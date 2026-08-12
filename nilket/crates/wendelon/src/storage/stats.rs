@@ -4,6 +4,11 @@ use crate::schema::table::{
 	ColumnHeavyHitterSpec, ColumnHllSpec, ColumnRangeDistributionSpec, ColumnSmallSetSpec,
 	TableObjectId, TableSchemaDescriptor, max_column_stats_block_ciphertext_bytes_for_slab_payload,
 };
+use crate::schema::{
+	AGG_KLL_MAX_K, AGG_KLL_MIN_K, KllK, LogicalSchemaFingerprint,
+	encode_float32_optimizer_fact_scalar, encode_float64_optimizer_fact_scalar,
+	encode_signed_optimizer_fact_scalar, encode_unsigned_optimizer_fact_scalar, validate_kll_k,
+};
 pub use crate::schema::{
 	ARROW_STATS_TAG_BINARY, ARROW_STATS_TAG_BOOLEAN, ARROW_STATS_TAG_DATE32,
 	ARROW_STATS_TAG_DATE64, ARROW_STATS_TAG_FLOAT32, ARROW_STATS_TAG_FLOAT64, ARROW_STATS_TAG_INT8,
@@ -12,11 +17,6 @@ pub use crate::schema::{
 	ARROW_STATS_TAG_TIMESTAMP_MICROSECOND, ARROW_STATS_TAG_TIMESTAMP_MILLISECOND,
 	ARROW_STATS_TAG_TIMESTAMP_NANOSECOND, ARROW_STATS_TAG_UINT8, ARROW_STATS_TAG_UINT16,
 	ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64, ARROW_STATS_TAG_UTF8,
-};
-use crate::schema::{
-	KllK, LogicalSchemaFingerprint, encode_float32_optimizer_fact_scalar,
-	encode_float64_optimizer_fact_scalar, encode_signed_optimizer_fact_scalar,
-	encode_unsigned_optimizer_fact_scalar,
 };
 use arrow::array::{
 	Array, BinaryArray, BooleanArray, Float32Array, Float64Array, LargeBinaryArray,
@@ -3489,14 +3489,16 @@ fn read_kll_range_distribution(
 			"CSB range-distribution retained values exceed total_item_count",
 		));
 	}
+	validate_kll_k(k).map_err(|_| {
+		Error::new(
+			ErrorKind::InvalidInput,
+			format!(
+				"KLL k must be in {}..={}, observed {k}",
+				AGG_KLL_MIN_K, AGG_KLL_MAX_K
+			),
+		)
+	})?;
 	let k = KllK::new(k);
-	KllSketch::from_retained_values(
-		arrow_type_tag,
-		k,
-		total_item_count,
-		retained_values.clone(),
-		compaction_seed,
-	)?;
 	Ok(ColumnStatsKllPayload {
 		k,
 		total_item_count,
@@ -4402,6 +4404,21 @@ mod tests {
 				.range_distribution,
 			None,
 		);
+	}
+
+	#[test]
+	fn adr083_v1_reader_validates_k_without_constructing_a_weightless_sketch() {
+		let mut payload = Vec::new();
+		payload.extend_from_slice(&AGG_KLL_MIN_K.saturating_sub(1).to_be_bytes());
+		payload.extend_from_slice(&0_u64.to_be_bytes());
+		payload.extend_from_slice(&42_u32.to_be_bytes());
+		payload.extend_from_slice(&0_u32.to_be_bytes());
+		let mut cursor = 0;
+		let error =
+			read_kll_range_distribution(&payload, &mut cursor, ARROW_STATS_TAG_INT32, Some(0))
+				.expect_err("out-of-contract k must remain invalid after removing the constructor");
+		assert_eq!(error.kind(), ErrorKind::InvalidInput);
+		assert!(error.to_string().contains("KLL k must be in"));
 	}
 
 	#[test]

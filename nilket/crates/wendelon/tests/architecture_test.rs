@@ -36,6 +36,17 @@ fn collect_identifiers(tokens: TokenStream, identifiers: &mut Vec<String>) {
 	}
 }
 
+#[test]
+fn adr083_legacy_kll_identity_has_no_process_global_ordinal_or_weightless_constructor() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let sketch = fs::read_to_string(manifest_dir.join("src/storage/sketch.rs"))
+		.expect("read KLL sketch source");
+	assert!(!sketch.contains("LEGACY_KLL_IDENTITY_ORDINAL"));
+	assert!(!sketch.contains("AtomicU64"));
+	assert!(!sketch.contains("from_retained_values"));
+	assert!(sketch.contains("legacy_randomness_from_content"));
+}
+
 fn has_rust_identifier(identifiers: &[String], ident: &str) -> bool {
 	identifiers.iter().any(|candidate| candidate == ident)
 }
