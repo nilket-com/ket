@@ -1,10 +1,10 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
-	format_label, polars_type_to_axis_type,
+	format_label,
 };
+use crate::plot::kernels::histogram_bins::HistogramBins;
 use iced::advanced::mouse::Cursor;
 use iced::{Color, Rectangle};
-use polars::prelude::*;
 use std::sync::Arc;
 
 pub struct HistogramPlotKernel {
@@ -13,14 +13,15 @@ pub struct HistogramPlotKernel {
 
 impl PlotKernel for HistogramPlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+		let (x_range, y_range) = self.prepared_data.bins.ranges();
 		PlotLayout::Cartesian {
 			x_range: (
-				settings.x_min.unwrap_or(self.prepared_data.x_range.0),
-				settings.x_max.unwrap_or(self.prepared_data.x_range.1),
+				settings.x_min.unwrap_or(x_range.0),
+				settings.x_max.unwrap_or(x_range.1),
 			),
 			y_range: (
-				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
-				settings.y_max.unwrap_or(self.prepared_data.y_range.1),
+				settings.y_min.unwrap_or(y_range.0),
+				settings.y_max.unwrap_or(y_range.1),
 			),
 			x_axis_type: self.prepared_data.x_axis_type,
 			y_axis_type: self.prepared_data.y_axis_type,
@@ -35,54 +36,50 @@ impl PlotKernel for HistogramPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_bins = self.prepared_data.bin_counts.len();
-		let (x_min, x_max) = self.prepared_data.x_range;
-		let bin_width_data = (x_max - x_min) / num_bins as f64;
-		let max_count = self.prepared_data.max_count as f64;
-		let y_base = if let PlotLayout::Cartesian { y_range, .. } = transform.layout {
-			y_range.0
-		} else {
-			0.0
+		let Some(max_count) = self.prepared_data.bins.max_positive_count() else {
+			return;
 		};
-		for (i, &count) in self.prepared_data.bin_counts.iter().enumerate() {
-			if count == 0 {
-				continue;
+		let clip = Rectangle::new(iced::Point::ORIGIN, transform.bounds.size());
+		backend.with_clip(clip, &mut |backend| {
+			for bin in self.prepared_data.bins.iter().filter(|bin| bin.count > 0) {
+				let top_left = transform.cartesian(bin.start, bin.count as f64);
+				let bottom_right = transform.cartesian(bin.end, 0.0);
+				let color = settings
+					.color_theme
+					.get_color(bin.count as f32 / max_count as f32);
+				let rect = Rectangle {
+					x: top_left.x,
+					y: top_left.y,
+					width: (bottom_right.x - top_left.x).max(1.0),
+					height: (bottom_right.y - top_left.y).max(1.0),
+				};
+				backend.fill_rectangle(rect.position(), rect.size(), color);
+				backend.stroke_path(
+					&|builder| {
+						builder.rectangle(rect.position(), rect.size());
+					},
+					iced::widget::canvas::Stroke {
+						style: iced::widget::canvas::Style::Solid(Color::from_rgba(
+							0.0, 0.0, 0.0, 0.2,
+						)),
+						width: 0.5,
+						..Default::default()
+					},
+				);
 			}
-			let bin_start_x = x_min + i as f64 * bin_width_data;
-			let bin_end_x = bin_start_x + bin_width_data;
-			let p_top_left = transform.cartesian(bin_start_x, count as f64);
-			let p_bottom_right = transform.cartesian(bin_end_x, y_base);
-			let t = count as f32 / max_count as f32;
-			let color = settings.color_theme.get_color(t);
-			let rect = Rectangle {
-				x: p_top_left.x,
-				y: p_top_left.y,
-				width: (p_bottom_right.x - p_top_left.x).max(1.0),
-				height: (p_bottom_right.y - p_top_left.y).max(1.0),
-			};
-			backend.fill_rectangle(rect.position(), rect.size(), color);
-			backend.stroke_path(
-				&|builder| {
-					builder.rectangle(rect.position(), rect.size());
-				},
-				iced::widget::canvas::Stroke {
-					style: iced::widget::canvas::Style::Solid(Color::from_rgba(0.0, 0.0, 0.0, 0.2)),
-					width: 0.5,
-					..Default::default()
-				},
-			);
-		}
+		});
 	}
 
 	fn legend_content(
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
+		let max_count = self.prepared_data.bins.max_positive_count()?;
 		Some(crate::plot::legend::LegendContent(
 			crate::plot::spec::NonEmpty::new(crate::plot::legend::LegendSection::Gradient {
 				label: "Frequency".to_owned(),
 				low: 0.0,
-				high: self.prepared_data.max_count as f64,
+				high: max_count as f64,
 				low_color: settings.color_theme.get_color(0.0),
 				high_color: settings.color_theme.get_color(1.0),
 			}),
@@ -90,32 +87,16 @@ impl PlotKernel for HistogramPlotKernel {
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		if let Some(cursor_pos) = cursor.position()
-			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
-		{
-			let num_bins = self.prepared_data.bin_counts.len();
-			let (x_min, x_max) = self.prepared_data.x_range;
-			let bin_width = (x_max - x_min) / num_bins as f64;
-			if x >= x_min && x <= x_max {
-				let bin_idx = if bin_width > 0.0 {
-					((x - x_min) / bin_width).floor() as usize
-				} else {
-					0
-				};
-				let bin_idx = bin_idx.min(num_bins - 1);
-				let count = self.prepared_data.bin_counts[bin_idx];
-				let bin_start = x_min + bin_idx as f64 * bin_width;
-				let bin_end = bin_start + bin_width;
-				return Some(format!(
-					"Range: [{}, {}]\nCount: {}\nY-Value: {:.2}",
-					format_label(bin_start, self.prepared_data.x_axis_type),
-					format_label(bin_end, self.prepared_data.x_axis_type),
-					count,
-					y
-				));
-			}
-		}
-		None
+		let cursor_pos = cursor.position()?;
+		let (x, y) = transform.pixel_to_cartesian(cursor_pos)?;
+		let bin = self.prepared_data.bins.find(x)?;
+		Some(format!(
+			"Range: [{}, {})\nCount: {}\nY-Value: {:.2}",
+			format_label(bin.start, self.prepared_data.x_axis_type),
+			format_label(bin.end, self.prepared_data.x_axis_type),
+			bin.count,
+			y
+		))
 	}
 
 	fn x_label(&self) -> String {
@@ -128,72 +109,254 @@ impl PlotKernel for HistogramPlotKernel {
 }
 
 pub struct HistogramPreparedData {
-	pub bin_counts: Vec<u32>,
-	pub x_range: (f64, f64),
-	pub y_range: (f64, f64),
+	pub bins: HistogramBins,
 	pub x_axis_type: AxisType,
 	pub y_axis_type: AxisType,
-	pub max_count: u32,
 	pub x_label: String,
 	pub y_label: String,
 }
 
-pub fn prepare_histogram_data(
-	df: &DataFrame,
-	val_col: &str,
-	num_bins: usize,
-) -> HistogramPreparedData {
-	if df.height() == 0 || val_col.is_empty() {
-		return HistogramPreparedData {
-			bin_counts: vec![0; num_bins],
-			x_range: (0.0, 1.0),
-			y_range: (0.0, 1.0),
-			x_axis_type: AxisType::Linear,
-			y_axis_type: AxisType::Linear,
-			max_count: 1,
-			x_label: val_col.to_string(),
-			y_label: "Frequency".to_string(),
-		};
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::plot::common::{PathBuilder, PlotBackend};
+	use crate::plot::kernels::histogram_bins::{HistogramBin, HistogramBins, HistogramBinsError};
+	use iced::{Point, Size, Vector};
+
+	#[derive(Default)]
+	struct RectangleBackend {
+		rectangles: Vec<(Point, Size)>,
+		clips: Vec<Rectangle>,
 	}
-	let val_dtype = df
-		.column(val_col)
-		.map(|c| c.dtype().clone())
-		.unwrap_or(DataType::Float64);
-	let x_axis_type = polars_type_to_axis_type(&val_dtype);
-	let y_axis_type = AxisType::Linear;
-	let vals = match df.column(val_col) {
-		Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
-			Column::from(Series::new_empty(val_col.into(), &DataType::Float64))
-		}),
-		Err(_) => Column::from(Series::new_empty(val_col.into(), &DataType::Float64)),
-	};
-	let v = vals.f64().unwrap();
-	let x_min = v.min().unwrap_or(0.0);
-	let x_max = v.max().unwrap_or(1.0);
-	let x_range = (x_min, x_max);
-	let mut bin_counts = vec![0u32; num_bins];
-	let bin_width = (x_max - x_min) / num_bins as f64;
-	for val in v.into_no_null_iter() {
-		let bin_idx = if bin_width > 0.0 {
-			((val - x_min) / bin_width).floor() as usize
-		} else {
-			0
-		};
-		let bin_idx = bin_idx.min(num_bins - 1);
-		bin_counts[bin_idx] += 1;
+
+	impl PlotBackend for RectangleBackend {
+		fn stroke_path(
+			&mut self,
+			_f: &dyn Fn(&mut dyn PathBuilder),
+			_stroke: iced::widget::canvas::Stroke,
+		) {
+		}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+
+		fn fill_rectangle(&mut self, top_left: Point, size: Size, _color: Color) {
+			self.rectangles.push((top_left, size));
+		}
+
+		fn fill_text(&mut self, _text: iced::widget::canvas::Text) {}
+
+		fn translate(&mut self, _translation: Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			self.clips.push(bounds);
+			f(self);
+		}
 	}
-	let actual_max = bin_counts.iter().cloned().max().unwrap_or(1);
-	let y_max = actual_max as f64;
-	let y_min = 0.0f64;
-	let y_range = (y_min, y_max * 1.1);
-	HistogramPreparedData {
-		bin_counts,
-		x_range,
-		y_range,
-		x_axis_type,
-		y_axis_type,
-		max_count: actual_max,
-		x_label: val_col.to_string(),
-		y_label: "Frequency".to_string(),
+
+	fn bin(start: f64, end: f64, count: u64) -> HistogramBin {
+		HistogramBin { start, end, count }
+	}
+
+	fn kernel(bins: Vec<HistogramBin>) -> HistogramPlotKernel {
+		HistogramPlotKernel {
+			prepared_data: Arc::new(HistogramPreparedData {
+				bins: HistogramBins::new(bins).expect("valid histogram bins"),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				x_label: "value".to_owned(),
+				y_label: "Frequency".to_owned(),
+			}),
+		}
+	}
+
+	fn render_rectangles(
+		kernel: &HistogramPlotKernel,
+		settings: ResolvedPlotSettings,
+	) -> RectangleBackend {
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0));
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = RectangleBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		backend
+	}
+
+	fn cursor_at(transform: &CoordinateTransformer<'_>, x: f64, y: f64) -> Cursor {
+		Cursor::Available(transform.cartesian(x, y))
+	}
+
+	#[test]
+	fn product_0078_explicit_unequal_intervals_drive_paint_and_preserve_gaps() {
+		let kernel = kernel(vec![bin(0.0, 1.0, 4), bin(2.0, 4.0, 8), bin(4.0, 7.0, 12)]);
+		let rectangles = render_rectangles(&kernel, ResolvedPlotSettings::default()).rectangles;
+		assert_eq!(rectangles.len(), 3, "a gap must not synthesize a mark");
+		let widths = rectangles
+			.iter()
+			.map(|(_, size)| size.width)
+			.collect::<Vec<_>>();
+		assert!((widths[1] / widths[0] - 2.0).abs() < 0.001);
+		assert!((widths[2] / widths[0] - 3.0).abs() < 0.001);
+	}
+
+	#[test]
+	fn product_0078_hover_obeys_gaps_edges_and_half_open_intervals() {
+		let histogram = kernel(vec![bin(0.0, 1.0, 4), bin(2.0, 4.0, 8)]);
+		let settings = ResolvedPlotSettings::default();
+		let layout = histogram.layout(settings);
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		for x in [-0.01, 1.0, 1.5, 4.0, 4.01] {
+			assert_eq!(
+				histogram.hover(&transform, cursor_at(&transform, x, 1.0)),
+				None
+			);
+		}
+		assert!(
+			histogram
+				.hover(&transform, cursor_at(&transform, 0.999, 1.0))
+				.expect("first bin")
+				.contains("Count: 4")
+		);
+		assert!(
+			histogram
+				.hover(&transform, cursor_at(&transform, 2.0, 1.0))
+				.expect("second bin")
+				.contains("Count: 8")
+		);
+
+		let adjacent = kernel(vec![bin(0.0, 1.0, 4), bin(1.0, 2.0, 8)]);
+		let layout = adjacent.layout(ResolvedPlotSettings::default());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		assert!(
+			adjacent
+				.hover(&transform, cursor_at(&transform, 1.0, 1.0))
+				.expect("shared edge belongs to next half-open interval")
+				.contains("Count: 8")
+		);
+	}
+
+	#[test]
+	fn product_0078_validation_names_six_distinct_invalid_shapes() {
+		for (bins, expected) in [
+			(
+				vec![bin(2.0, 3.0, 1), bin(0.0, 1.0, 1)],
+				HistogramBinsError::Unordered { index: 1 },
+			),
+			(
+				vec![bin(0.0, 2.0, 1), bin(1.0, 3.0, 1)],
+				HistogramBinsError::Overlapping { index: 1 },
+			),
+			(
+				vec![bin(1.0, 1.0, 1)],
+				HistogramBinsError::EmptyInterval { index: 0 },
+			),
+			(
+				vec![bin(2.0, 1.0, 1)],
+				HistogramBinsError::ReversedInterval { index: 0 },
+			),
+			(
+				vec![bin(f64::NAN, 1.0, 1)],
+				HistogramBinsError::NonFiniteStart { index: 0 },
+			),
+			(
+				vec![bin(0.0, f64::INFINITY, 1)],
+				HistogramBinsError::NonFiniteEnd { index: 0 },
+			),
+		] {
+			assert_eq!(HistogramBins::new(bins), Err(expected));
+		}
+	}
+
+	#[test]
+	fn product_0078_domain_is_derived_and_counts_keep_database_width() {
+		let small = HistogramBins::new(vec![bin(1.0, 2.0, 3)]).unwrap();
+		let large_count = u64::from(u32::MAX) + 17;
+		let large = HistogramBins::new(vec![bin(-4.0, 9.0, large_count)]).unwrap();
+		assert_eq!(small.ranges(), ((1.0, 2.0), (0.0, 3.0)));
+		assert_eq!(large.ranges(), ((-4.0, 9.0), (0.0, large_count as f64)));
+		assert_eq!(large.find(0.0).unwrap().count, large_count);
+
+		let histogram = kernel(vec![bin(-4.0, 9.0, large_count)]);
+		let layout = histogram.layout(ResolvedPlotSettings::default());
+		let transform = CoordinateTransformer::new(
+			&layout,
+			Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0)),
+		);
+		assert!(
+			histogram
+				.hover(&transform, cursor_at(&transform, 0.0, 1.0))
+				.expect("large-count interval hover")
+				.contains(&format!("Count: {large_count}"))
+		);
+	}
+
+	#[test]
+	fn product_0078_true_zero_geometry_is_distinct_from_realized_clipping() {
+		let kernel = kernel(vec![bin(0.0, 1.0, 40), bin(1.0, 2.0, 80)]);
+		let settings = ResolvedPlotSettings {
+			y_min: Some(20.0),
+			y_max: Some(100.0),
+			..ResolvedPlotSettings::default()
+		};
+		let rendered = render_rectangles(&kernel, settings);
+		let rectangles = rendered.rectangles;
+		assert_eq!(rectangles.len(), 2);
+		assert!((rectangles[1].1.height / rectangles[0].1.height - 2.0).abs() < 0.001);
+		assert_eq!(
+			rendered.clips,
+			vec![Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0))],
+			"true-zero geometry is clipped to the plot viewport rather than rebased"
+		);
+		let visible = rectangles
+			.iter()
+			.map(|(point, size)| (point.y + size.height).min(200.0) - point.y.max(0.0))
+			.collect::<Vec<_>>();
+		assert!((visible[1] / visible[0] - 3.0).abs() < 0.001);
+	}
+
+	#[test]
+	fn product_0078_empty_and_zero_sequences_have_pinned_domains_and_no_legend() {
+		let empty = kernel(vec![]);
+		let zero = kernel(vec![bin(4.0, 6.0, 0), bin(8.0, 9.0, 0)]);
+		for (kernel, expected_x) in [(&empty, (0.0, 1.0)), (&zero, (4.0, 9.0))] {
+			let settings = ResolvedPlotSettings::default();
+			assert_eq!(
+				render_rectangles(&kernel, settings.clone()).rectangles,
+				Vec::new()
+			);
+			assert_eq!(kernel.legend_content(&settings), None);
+			assert!(matches!(
+				kernel.layout(ResolvedPlotSettings::default()),
+				PlotLayout::Cartesian { x_range, y_range, .. }
+					if x_range == expected_x && y_range == (0.0, 1.0)
+			));
+		}
+
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0));
+		let empty_layout = empty.layout(ResolvedPlotSettings::default());
+		let empty_transform = CoordinateTransformer::new(&empty_layout, bounds);
+		assert_eq!(
+			empty.hover(&empty_transform, cursor_at(&empty_transform, 0.5, 0.5)),
+			None
+		);
+		let zero_layout = zero.layout(ResolvedPlotSettings::default());
+		let zero_transform = CoordinateTransformer::new(&zero_layout, bounds);
+		assert!(
+			zero.hover(&zero_transform, cursor_at(&zero_transform, 5.0, 0.5))
+				.expect("reported zero-count interval remains hoverable")
+				.contains("Count: 0")
+		);
 	}
 }

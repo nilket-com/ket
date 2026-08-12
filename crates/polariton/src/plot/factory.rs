@@ -9,7 +9,6 @@ use crate::plot::kernels::fill_between_line::FillBetweenLinePlotKernel;
 use crate::plot::kernels::funnel::{self, FunnelPlotKernel};
 use crate::plot::kernels::heatmap::{self, HeatmapPlotKernel};
 use crate::plot::kernels::hexbin::{self, HexbinPlotKernel};
-use crate::plot::kernels::histogram::{self, HistogramPlotKernel};
 use crate::plot::kernels::layered::{LayerRenderer, LayeredPlotKernel};
 use crate::plot::kernels::line::{self, LinePlotKernel};
 use crate::plot::kernels::parallel::{self, ParallelPlotKernel};
@@ -119,12 +118,6 @@ pub fn create_plot(
 			let prepared =
 				boxplot::prepare_box_plot_data(df, category.as_deref().unwrap_or(""), value);
 			Arc::new(BoxPlotKernel {
-				prepared_data: Arc::new(prepared),
-			})
-		}
-		ResolvedKernelFields::Histogram { value } => {
-			let prepared = histogram::prepare_histogram_data(df, value, 16);
-			Arc::new(HistogramPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
@@ -1640,7 +1633,7 @@ mod product_0013_baseline_tests {
 			"color" => [0.1, 0.5, 0.9]
 		)
 		.expect("gradient frame");
-		for plot_type in [PlotType::Heatmap, PlotType::Hexbin, PlotType::Histogram] {
+		for plot_type in [PlotType::Heatmap, PlotType::Hexbin] {
 			let kernel =
 				create_automatic_plot(PlotComposition::single(plot_type), &frame, 400, 300)
 					.unwrap_or_else(|error| panic!("{plot_type}: {error}"));

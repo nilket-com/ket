@@ -1,0 +1,5 @@
+error[E0451]: field `bins` of struct `HistogramBins` is private
+ --> tests/ui/histogram_bins_private.rs:7:26
+  |
+7 |     let _ = HistogramBins { bins: Vec::new() };
+  |                             ^^^^ private field

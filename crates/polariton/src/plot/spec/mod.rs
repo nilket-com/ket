@@ -978,9 +978,6 @@ pub enum ResolvedKernelFields {
 		category: Option<String>,
 		value: String,
 	},
-	Histogram {
-		value: String,
-	},
 	Bubble {
 		x: String,
 		y: String,
@@ -1960,9 +1957,14 @@ fn resolve_automatic_kernel_fields(
 			category: optional_category(0),
 			value: number(0, "value")?,
 		},
-		PlotType::Histogram => ResolvedKernelFields::Histogram {
-			value: number(0, "value")?,
-		},
+		PlotType::Histogram => {
+			return Err(ChannelError {
+				channel: Channel::X,
+				field: "<histogram>".to_owned(),
+				reason: "Histogram Plot has no producer; explicit interval fields are required"
+					.to_owned(),
+			});
+		}
 		PlotType::Bubble => ResolvedKernelFields::Bubble {
 			x: number(0, "x")?,
 			y: number(1, "y")?,
@@ -2710,6 +2712,20 @@ mod tests {
 				revision: Some(7),
 			},
 		}
+	}
+
+	#[test]
+	fn product_0078_automatic_histogram_resolution_names_the_missing_producer() {
+		let frame = df!("value" => [1.0_f64, 2.0]).expect("histogram schema fixture");
+		let error = resolve_automatic_kernel_fields(PlotType::Histogram, frame.schema().as_ref())
+			.expect_err("histogram has no automatic raw-value producer");
+		assert_eq!(error.field, "<histogram>");
+		assert!(error.reason.contains("Histogram Plot has no producer"));
+		assert!(
+			error
+				.reason
+				.contains("explicit interval fields are required")
+		);
 	}
 
 	fn resolve(

@@ -2263,3 +2263,75 @@ fn product_0077_facet_tick_containment_does_not_measure_or_resize_layout() {
 		}
 	}
 }
+
+#[test]
+fn product_0078_histogram_has_one_interval_authority_and_no_production_surface() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let histogram = std::fs::read_to_string(root.join("plot/kernels/histogram.rs"))
+		.expect("read histogram kernel");
+	let bins = std::fs::read_to_string(root.join("plot/kernels/histogram_bins.rs"))
+		.expect("read validated histogram intervals");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+
+	for retired in [
+		"prepare_histogram_data",
+		"bin_counts",
+		"pub max_count:",
+		"ResolvedKernelFields::Histogram",
+	] {
+		assert!(
+			![
+				histogram.as_str(),
+				bins.as_str(),
+				factory.as_str(),
+				spec.as_str()
+			]
+			.into_iter()
+			.any(|source| source.contains(retired)),
+			"PRODUCT-0078 retired histogram authority remains: {retired}"
+		);
+	}
+	for index_arithmetic in ["/ num_bins", ".min(num_bins", "bin_idx"] {
+		assert!(
+			!histogram.contains(index_arithmetic) && !bins.contains(index_arithmetic),
+			"PRODUCT-0078 histogram interval path retains value-to-index arithmetic: {index_arithmetic}"
+		);
+	}
+	assert!(
+		spec.contains("Histogram Plot has no producer; explicit interval fields are required"),
+		"automatic histogram resolution must refuse with the typed producerless reason"
+	);
+	assert!(
+		!factory.contains("HistogramPlotKernel") && !factory.contains("histogram::"),
+		"the generic factory must not reconstruct the producer mapping deferred by PRODUCT-0078"
+	);
+
+	let prepared = histogram
+		.split("pub struct HistogramPreparedData {")
+		.nth(1)
+		.expect("histogram prepared data")
+		.split('}')
+		.next()
+		.expect("bounded histogram prepared data");
+	assert!(prepared.contains("pub bins: HistogramBins"));
+	assert!(
+		!prepared.contains("range") && !prepared.contains("domain"),
+		"histogram domains must be derived from the validated interval sequence"
+	);
+
+	for surface in [
+		"rune_host.rs",
+		"rune_presentation.rs",
+		"rune_relation_envelope.rs",
+		"rune_view.rs",
+		"rune_view_compiler.rs",
+	] {
+		let source = std::fs::read_to_string(root.join(surface))
+			.unwrap_or_else(|error| panic!("read {surface}: {error}"));
+		assert!(
+			!source.to_ascii_lowercase().contains("histogram"),
+			"PRODUCT-0078 remains substrate-only; {surface} acquired a histogram producer"
+		);
+	}
+}
