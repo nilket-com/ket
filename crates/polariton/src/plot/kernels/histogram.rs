@@ -14,6 +14,10 @@ pub struct HistogramPlotKernel {
 }
 
 impl PlotKernel for HistogramPlotKernel {
+	fn requires_plot_area_clip(&self) -> bool {
+		true
+	}
+
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		let (x_range, y_range) = self.prepared_data.bins.ranges();
 		PlotLayout::Cartesian {
@@ -41,24 +45,21 @@ impl PlotKernel for HistogramPlotKernel {
 		if self.prepared_data.bins.max_positive_count().is_none() {
 			return;
 		}
-		let clip = Rectangle::new(iced::Point::ORIGIN, transform.bounds.size());
-		backend.with_clip(clip, &mut |backend| {
-			for bin in self.prepared_data.bins.iter().filter(|bin| bin.count > 0) {
-				let top_left = transform.cartesian(bin.start, bin.count as f64);
-				let bottom_right = transform.cartesian(bin.end, 0.0);
-				let rect = Rectangle {
-					x: top_left.x,
-					y: top_left.y,
-					width: (bottom_right.x - top_left.x).max(1.0),
-					height: (bottom_right.y - top_left.y).max(1.0),
-				};
-				backend.fill_rectangle(
-					rect.position(),
-					rect.size(),
-					settings.chrome.mark_fill.iced(),
-				);
-			}
-		});
+		for bin in self.prepared_data.bins.iter().filter(|bin| bin.count > 0) {
+			let top_left = transform.cartesian(bin.start, bin.count as f64);
+			let bottom_right = transform.cartesian(bin.end, 0.0);
+			let rect = Rectangle {
+				x: top_left.x,
+				y: top_left.y,
+				width: (bottom_right.x - top_left.x).max(1.0),
+				height: (bottom_right.y - top_left.y).max(1.0),
+			};
+			backend.fill_rectangle(
+				rect.position(),
+				rect.size(),
+				settings.chrome.mark_fill.iced(),
+			);
+		}
 	}
 
 	fn legend_content(
@@ -393,9 +394,10 @@ mod tests {
 		assert!((rectangles[1].1.height / rectangles[0].1.height - 2.0).abs() < 0.001);
 		assert_eq!(
 			rendered.clips,
-			vec![Rectangle::new(Point::ORIGIN, Size::new(400.0, 200.0))],
-			"true-zero geometry is clipped to the plot viewport rather than rebased"
+			Vec::new(),
+			"the common plot stratum owns clipping so the kernel cannot create a nested child beneath the background"
 		);
+		assert!(kernel.requires_plot_area_clip());
 		let visible = rectangles
 			.iter()
 			.map(|(point, size)| (point.y + size.height).min(200.0) - point.y.max(0.0))

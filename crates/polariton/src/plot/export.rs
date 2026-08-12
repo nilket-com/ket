@@ -249,6 +249,7 @@ impl PlotBackend for SvgBackend {
 
 	fn with_clip(&mut self, bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
 		let prev = self.current_transform;
+		self.current_transform = Affine::IDENTITY;
 		let clip_id = format!("clip_{}", self.clip_count);
 		self.clip_count += 1;
 

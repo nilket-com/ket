@@ -586,13 +586,29 @@ impl PlotComposite for PlotGridKernel {
 				resize_render_suspended: false,
 				layer: crate::plot::common::PlotRenderLayer::Full,
 			};
+			let clipped_plot = cell.kernel.requires_plot_area_clip();
 			backend.with_clip(cell_bounds.into_iced(), &mut |backend| {
 				backend.fill_rectangle(
 					cell_bounds.origin().into_iced(),
 					cell_bounds.size(),
 					resolved.chrome.canvas_background.iced(),
 				);
-				backend.with_save(&mut |backend| {
+				if !clipped_plot {
+					backend.with_save(&mut |backend| {
+						backend.translate(iced::Vector::new(inner.x(), inner.y()));
+						helper.draw_layout_grid(backend, inner.into_iced(), &transform, layout);
+						cell.kernel.plot_with_settings(
+							backend,
+							inner.into_iced(),
+							&transform,
+							Cursor::Unavailable,
+							settings,
+						);
+					});
+				}
+			});
+			if clipped_plot {
+				backend.with_clip(inner.into_iced(), &mut |backend| {
 					backend.translate(iced::Vector::new(inner.x(), inner.y()));
 					helper.draw_layout_grid(backend, inner.into_iced(), &transform, layout);
 					cell.kernel.plot_with_settings(
@@ -603,7 +619,7 @@ impl PlotComposite for PlotGridKernel {
 						settings,
 					);
 				});
-			});
+			}
 		}
 	}
 

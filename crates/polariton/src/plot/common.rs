@@ -579,6 +579,9 @@ pub trait PlotBackend {
 	fn translate(&mut self, translation: iced::Vector);
 	fn rotate(&mut self, angle: f32);
 	fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend));
+	/// Draw inside a widget-coordinate clip. Like iced's production canvas,
+	/// the closure starts with an identity transform; callers that draw in a
+	/// local plot coordinate system must establish that origin inside it.
 	fn with_clip(&mut self, bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend));
 }
 
@@ -743,6 +746,14 @@ pub trait PlotComposite: Send + Sync {
 
 pub trait PlotKernel: Send + Sync {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout;
+
+	/// Whether the common renderer must place the grid and marks together in a
+	/// plot-area clip. This is required when emitted geometry deliberately
+	/// extends beyond authored bounds and must be clipped without introducing a
+	/// nested iced child beneath the plot background.
+	fn requires_plot_area_clip(&self) -> bool {
+		false
+	}
 
 	fn plot(
 		&self,
@@ -969,11 +980,22 @@ impl<'a> PlotWidget<'a> {
 			);
 			return;
 		}
-		backend.fill_rectangle(
-			Point::ORIGIN,
-			bounds.size(),
-			self.settings.chrome.canvas_background.iced(),
-		);
+		let clipped_plot = self.kernel.requires_plot_area_clip();
+		if clipped_plot {
+			backend.with_clip(bounds.into_iced(), &mut |backend| {
+				backend.fill_rectangle(
+					bounds.origin().into_iced(),
+					bounds.size(),
+					self.settings.chrome.canvas_background.iced(),
+				);
+			});
+		} else {
+			backend.fill_rectangle(
+				Point::ORIGIN,
+				bounds.size(),
+				self.settings.chrome.canvas_background.iced(),
+			);
+		}
 		let legend_content = self
 			.kernel
 			.legend_content(&self.settings)
@@ -982,7 +1004,7 @@ impl<'a> PlotWidget<'a> {
 		let plot_area = self.plot_area(legend.content_bounds).into_iced();
 		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
-		backend.with_save(&mut |backend| {
+		let draw_plot = &mut |backend: &mut dyn PlotBackend| {
 			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
 			self.draw_layout_grid(backend, plot_area, &transform, &layout);
 			self.kernel.plot_with_settings(
@@ -992,7 +1014,12 @@ impl<'a> PlotWidget<'a> {
 				Cursor::Unavailable,
 				&self.settings_model,
 			);
-		});
+		};
+		if clipped_plot {
+			backend.with_clip(plot_area, draw_plot);
+		} else {
+			backend.with_save(draw_plot);
+		}
 	}
 
 	pub fn render_overlay_layer(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
@@ -2346,6 +2373,8 @@ mod product_0067_0068_strata_oracles {
 		Fill(Color),
 		Stroke(Color),
 		Text(String),
+		ClipStart(Rectangle),
+		ClipEnd,
 	}
 
 	#[derive(Default)]
@@ -2382,8 +2411,42 @@ mod product_0067_0068_strata_oracles {
 			f(self);
 		}
 
-		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+		fn with_clip(&mut self, bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			self.operations.push(Operation::ClipStart(bounds));
 			f(self);
+			self.operations.push(Operation::ClipEnd);
+		}
+	}
+
+	struct ClippedOrderKernel;
+
+	impl PlotKernel for ClippedOrderKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			PlotLayout::Cartesian {
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+			}
+		}
+
+		fn requires_plot_area_clip(&self) -> bool {
+			true
+		}
+
+		fn plot(
+			&self,
+			backend: &mut dyn PlotBackend,
+			_bounds: Rectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+			backend.fill_rectangle(Point::new(20.0, 20.0), iced::Size::new(40.0, 40.0), MARK);
+		}
+
+		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+			None
 		}
 	}
 
@@ -2510,6 +2573,75 @@ mod product_0067_0068_strata_oracles {
 				x_axis_type: AxisType::Linear,
 			},
 		]
+	}
+
+	#[test]
+	fn product_0079_plot_area_clip_keeps_background_below_grid_and_marks() {
+		let settings = settings();
+		let model = PlotSettings::from_resolved(settings.clone());
+		let widget = PlotWidget {
+			kernel: &ClippedOrderKernel,
+			title: String::new(),
+			padding: 0.0,
+			settings,
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 120.0));
+		let mut backend = OperationBackend::default();
+		widget.render_plot_layer(&mut backend, bounds);
+
+		assert_eq!(
+			backend
+				.operations
+				.iter()
+				.filter(|operation| matches!(operation, Operation::ClipStart(_)))
+				.count(),
+			2,
+			"background and plot content are separate clipped children"
+		);
+		let background = backend
+			.operations
+			.iter()
+			.position(|operation| {
+				*operation
+					== Operation::Fill(
+						ResolvedPlotSettings::default()
+							.chrome
+							.canvas_background
+							.iced(),
+					)
+			})
+			.expect("background fill");
+		let mark = backend
+			.operations
+			.iter()
+			.position(|operation| *operation == Operation::Fill(MARK))
+			.expect("mark fill");
+		let first_clip_end = backend
+			.operations
+			.iter()
+			.position(|operation| *operation == Operation::ClipEnd)
+			.expect("background clip closes");
+		let plot_clip_start = backend
+			.operations
+			.iter()
+			.enumerate()
+			.skip(first_clip_end + 1)
+			.find_map(|(index, operation)| {
+				matches!(operation, Operation::ClipStart(_)).then_some(index)
+			})
+			.expect("plot clip opens");
+		assert!(background < first_clip_end);
+		assert!(first_clip_end < plot_clip_start && plot_clip_start < mark);
+		assert!(
+			backend.operations[plot_clip_start..mark]
+				.iter()
+				.any(|operation| matches!(operation, Operation::Stroke(_))),
+			"gridlines and marks share the plot clip, in that order"
+		);
 	}
 
 	#[test]
