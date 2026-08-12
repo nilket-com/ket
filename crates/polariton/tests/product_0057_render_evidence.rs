@@ -55,6 +55,8 @@ use plot::composition::PlotComposition;
 use plot::core::PlotType;
 use plot::grid::{GridArrangement, PlotGrid, PlotGridKernel};
 use plot::kernels::bar::{BarPlotKernel, BarPreparedData};
+use plot::kernels::boxplot::{BoxPlotKernel, BoxPlotPreparedData};
+use plot::kernels::boxplot_tukey::{TukeyBoxRow, TukeyBoxes};
 use plot::kernels::histogram::{HistogramPlotKernel, HistogramPreparedData};
 use plot::kernels::histogram_bins::{HistogramBin, HistogramBins};
 use plot::kernels::line::{LinePlotKernel, LinePreparedData, SeriesData};
@@ -79,6 +81,7 @@ const GREEN: [u8; 3] = [32, 220, 96];
 const WHITE: [u8; 3] = [255, 255, 255];
 const PRODUCT_0077_BANKED_VERTICAL_SPILL: usize = 88;
 const PRODUCT_0077_BANKED_HORIZONTAL_SPILL: usize = 111;
+const PRODUCT_0083_BANKED_MEDIAN_DETAIL: usize = 0;
 
 struct Gpu {
 	adapter: wgpu::Adapter,
@@ -939,6 +942,69 @@ fn product_0080_separator_pixels(
 	count
 }
 
+fn product_0083_box_fixture(fill_detail: plot::chrome::PlotRgba) -> (BoxPlotKernel, PlotSettings) {
+	let boxes = TukeyBoxes::new(vec![TukeyBoxRow {
+		category: "none".to_owned(),
+		whisker_low: 20.0,
+		q1: 21.0,
+		median: 23.0,
+		q3: 24.0,
+		whisker_high: 25.0,
+		outlier: None,
+	}])
+	.expect("PRODUCT-0083 exact non-degenerate test26 relation");
+	let kernel = BoxPlotKernel {
+		prepared_data: Arc::new(BoxPlotPreparedData::new(
+			boxes,
+			AxisType::Linear,
+			String::new(),
+			String::new(),
+		)),
+	};
+	let mut resolved = product_0068_cartesian_settings().resolve();
+	resolved.y_min = Some(0.0);
+	resolved.y_max = Some(40.0);
+	resolved.mark_style.fill_detail = fill_detail;
+	(kernel, PlotSettings::from_resolved(resolved))
+}
+
+fn render_product_0083_box(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	fill_detail: plot::chrome::PlotRgba,
+) -> (Capture, Rectangle) {
+	let (kernel, settings) = product_0083_box_fixture(fill_detail);
+	let resolved = settings.resolve();
+	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
+	let layout = kernel.layout(resolved);
+	let transform = CoordinateTransformer::new(&layout, bounds);
+	let (center, band_width) = transform.categorical(0, 0.0);
+	let median_y = transform.categorical(0, 23.0).0.y;
+	let box_width = band_width * 0.6;
+	let census = Rectangle::new(
+		Point::new(center.x - box_width * 0.25, median_y - 3.0),
+		Size::new(box_width * 0.5, 6.0),
+	);
+	(
+		render_product_0068_cartesian_mark(&mut *renderer, size, &kernel, &settings, false),
+		census,
+	)
+}
+
+fn product_0083_paper_pixels(capture: &Capture, bounds: Rectangle) -> usize {
+	let x0 = bounds.x.floor().max(0.0) as u32;
+	let y0 = bounds.y.floor().max(0.0) as u32;
+	let x1 = (bounds.x + bounds.width).ceil().max(0.0) as u32;
+	let y1 = (bounds.y + bounds.height).ceil().max(0.0) as u32;
+	let mut count = 0;
+	for y in y0.min(capture.height)..y1.min(capture.height) {
+		for x in x0.min(capture.width)..x1.min(capture.width) {
+			count += usize::from(near(capture.pixel(x, y), BACKGROUND, 12));
+		}
+	}
+	count
+}
+
 fn product_0072_percent_bar_fixture(
 	gapless: bool,
 ) -> (StackedBarPlotKernel, PlotSettings, [[u8; 3]; 2]) {
@@ -1416,6 +1482,29 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	);
 	println!(
 		"PRODUCT_0080 histogram_separator disposition=automated banked/accepted={product_0080_banked_separator}/{product_0080_accepted_separator} boundary_x={product_0080_boundary_x:.1}"
+	);
+
+	let product_0083_size = Size::new(500, 300);
+	let product_0083_style = ResolvedPlotSettings::default().mark_style;
+	let (product_0083_accepted, product_0083_census) =
+		render_product_0083_box(&mut msaa, product_0083_size, product_0083_style.fill_detail);
+	let (product_0083_banked, product_0083_banked_census) =
+		render_product_0083_box(&mut msaa, product_0083_size, product_0083_style.fill);
+	assert_eq!(product_0083_census, product_0083_banked_census);
+	let product_0083_banked_detail =
+		product_0083_paper_pixels(&product_0083_banked, product_0083_banked_census);
+	let product_0083_accepted_detail =
+		product_0083_paper_pixels(&product_0083_accepted, product_0083_census);
+	assert_eq!(
+		product_0083_banked_detail, PRODUCT_0083_BANKED_MEDIAN_DETAIL,
+		"PRODUCT-0083 Stage 0 must bank the invisible median as a discriminating zero-paper control"
+	);
+	assert!(
+		product_0083_accepted_detail >= 200,
+		"PRODUCT-0083 fill-detail median must realize paper-counterpart ink in its outline-free interior band"
+	);
+	println!(
+		"PRODUCT_0083 median_detail disposition=automated banked/accepted={product_0083_banked_detail}/{product_0083_accepted_detail}"
 	);
 
 	let percent_size = Size::new(500, 360);

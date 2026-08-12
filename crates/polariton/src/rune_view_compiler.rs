@@ -1737,21 +1737,25 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0082_test26_is_the_real_five_case_exhibit() {
+	fn product_0082_0083_test26_is_the_real_two_panel_five_case_exhibit() {
 		let source = include_str!("../../../uat/test26.rn");
 		let compiled = compile(source).expect("the checked-in box exhibit compiles");
 		assert_eq!(compiled.executions.len(), 1);
-		assert_eq!(compiled.executions[0].views.len(), 1);
-		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
-			panic!("box exhibit produced a table")
-		};
-		let RunePlotBody::Single(sink) = &plot.body else {
-			panic!("box exhibit did not retain one standalone mark")
-		};
-		assert_eq!(
-			sink.composition.primary_plot_type(),
-			crate::plot::core::PlotType::BoxPlot
-		);
+		assert_eq!(compiled.executions[0].views.len(), 2);
+		for view in &compiled.executions[0].views {
+			let RuneViewIntent::Plot(plot) = &view.intent else {
+				panic!("box exhibit produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("box exhibit did not retain one standalone mark")
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::BoxPlot
+			);
+		}
+		assert!(source.contains("y_bounds(0, 40)"));
+		assert!(source.contains("y_bounds(-75, 225)"));
 		for case in ["twin", "lowhigh", "none", "flat", "single"] {
 			assert!(source.contains(case), "exhibit omits {case}");
 		}

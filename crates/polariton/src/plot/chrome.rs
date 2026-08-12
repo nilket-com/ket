@@ -93,6 +93,7 @@ impl PlotRgba {
 pub struct PlotMarkStyle {
 	pub fill: PlotRgba,
 	pub decoration: PlotRgba,
+	pub fill_detail: PlotRgba,
 	pub label_text: PlotRgba,
 	pub separator: PlotRgba,
 }
@@ -107,6 +108,7 @@ impl PlotMarkStyle {
 		Self {
 			fill: ink,
 			decoration: ink,
+			fill_detail: paper,
 			label_text: ink,
 			separator: paper,
 		}
@@ -118,16 +120,23 @@ impl PlotMarkStyle {
 		Self {
 			fill: ink,
 			decoration: ink,
+			fill_detail: paper,
 			label_text: ink,
 			separator: paper,
 		}
 	}
 
-	pub fn visible_contrast_checks(self, chrome: PlotChrome) -> [PlotContrastCheck; 2] {
+	pub fn visible_contrast_checks(self, chrome: PlotChrome) -> [PlotContrastCheck; 3] {
 		let canvas = visible_srgb(chrome.canvas_background);
 		let fill = composite_over(self.fill, canvas);
 		[
 			contrast("mark fill", self.fill, canvas, NON_TEXT_CONTRAST_MINIMUM),
+			contrast(
+				"mark fill detail",
+				self.fill_detail,
+				fill,
+				NON_TEXT_CONTRAST_MINIMUM,
+			),
 			contrast(
 				"mark separator",
 				self.separator,
@@ -401,6 +410,7 @@ fn project_mark_style(anchors: PlotChromeAnchors) -> PlotMarkStyle {
 	PlotMarkStyle {
 		fill: ink,
 		decoration: ink,
+		fill_detail: paper,
 		label_text: ink,
 		separator: paper,
 	}
@@ -579,6 +589,7 @@ mod tests {
 		let style = PlotMarkStyle::DEFAULT;
 		assert_eq!(style.fill, ink);
 		assert_eq!(style.decoration, ink);
+		assert_eq!(style.fill_detail, paper);
 		assert_eq!(style.label_text, ink);
 		assert_eq!(style.separator, paper);
 	}
@@ -627,15 +638,16 @@ mod tests {
 		assert_eq!(chrome.title_text, PlotRgba::opaque_rgb(anchors.ink));
 		let style = project_mark_style(anchors);
 		assert_eq!(style.fill, PlotRgba::opaque_rgb(anchors.ink));
+		assert_eq!(style.fill_detail, PlotRgba::opaque_rgb(anchors.paper));
 		assert_eq!(style.separator, PlotRgba::opaque_rgb(anchors.paper));
 	}
 
 	#[test]
-	fn product_0080_product_0079_default_mark_pairs_pass_but_authored_low_contrast_is_exact() {
+	fn product_0083_product_0080_default_mark_pairs_pass_but_authored_low_contrast_is_exact() {
 		let checks = PlotMarkStyle::DEFAULT.visible_contrast_checks(PlotChrome::DEFAULT);
 		assert_eq!(
 			checks.map(PlotContrastCheck::role),
-			["mark fill", "mark separator"],
+			["mark fill", "mark fill detail", "mark separator"],
 			"decoration and label text have no assay"
 		);
 		let default = checks
@@ -649,6 +661,17 @@ mod tests {
 			default.ratio()
 		);
 		assert!((default.ratio() - 20.968).abs() < 0.001);
+		let fill_detail = checks
+			.into_iter()
+			.find(|check| check.role() == "mark fill detail")
+			.expect("mark fill-detail contrast role");
+		assert_eq!(fill_detail.minimum(), NON_TEXT_CONTRAST_MINIMUM);
+		assert!(
+			fill_detail.passes(),
+			"default mark fill detail: {:.3}",
+			fill_detail.ratio()
+		);
+		assert!((fill_detail.ratio() - 20.968).abs() < 0.001);
 		let separator = checks
 			.into_iter()
 			.find(|check| check.role() == "mark separator")
@@ -672,6 +695,10 @@ mod tests {
 		let authored_style = project_mark_style(anchors);
 		assert_eq!(authored_style.fill, PlotRgba::opaque_rgb(anchors.ink));
 		assert_eq!(
+			authored_style.fill_detail,
+			PlotRgba::opaque_rgb(anchors.paper)
+		);
+		assert_eq!(
 			authored_style.separator,
 			PlotRgba::opaque_rgb(anchors.paper)
 		);
@@ -681,6 +708,14 @@ mod tests {
 			.find(|check| check.role() == "mark fill")
 			.expect("authored mark fill contrast role");
 		assert!(!mark.passes(), "authored low contrast remains observable");
+		let fill_detail = authored_checks
+			.into_iter()
+			.find(|check| check.role() == "mark fill detail")
+			.expect("authored mark fill-detail contrast role");
+		assert!(
+			!fill_detail.passes(),
+			"authored low-contrast fill detail remains observable"
+		);
 		let separator = authored_checks
 			.into_iter()
 			.find(|check| check.role() == "mark separator")
@@ -692,7 +727,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0080_all_mark_roles_map_at_every_entry_point_and_remain_opaque() {
+	fn product_0083_all_mark_roles_map_at_every_entry_point_and_remain_opaque() {
 		let paper = PlotRgba::opaque(0.1, 0.2, 0.3);
 		let ink = PlotRgba::opaque(0.8, 0.7, 0.6);
 		let anchors = PlotChromeAnchors {
@@ -705,18 +740,21 @@ mod tests {
 		let projected = project_mark_style(anchors);
 		assert_eq!(projected.fill, PlotRgba::opaque_rgb(anchors.ink));
 		assert_eq!(projected.decoration, PlotRgba::opaque_rgb(anchors.ink));
+		assert_eq!(projected.fill_detail, PlotRgba::opaque_rgb(anchors.paper));
 		assert_eq!(projected.label_text, PlotRgba::opaque_rgb(anchors.ink));
 		assert_eq!(projected.separator, PlotRgba::opaque_rgb(anchors.paper));
 
 		let legacy = PlotMarkStyle::legacy(0.1, 0.2, 0.3);
 		assert_eq!(legacy.fill, PlotRgba::opaque(1.0, 1.0, 1.0));
 		assert_eq!(legacy.decoration, PlotRgba::opaque(1.0, 1.0, 1.0));
+		assert_eq!(legacy.fill_detail, paper);
 		assert_eq!(legacy.label_text, PlotRgba::opaque(1.0, 1.0, 1.0));
 		assert_eq!(legacy.separator, paper);
 
 		let reconstructed = PlotMarkStyle::legacy_from_iced(paper.iced(), ink.iced());
 		assert_eq!(reconstructed.fill, ink);
 		assert_eq!(reconstructed.decoration, ink);
+		assert_eq!(reconstructed.fill_detail, paper);
 		assert_eq!(reconstructed.label_text, ink);
 		assert_eq!(reconstructed.separator, paper);
 
@@ -724,6 +762,7 @@ mod tests {
 			for role in [
 				style.fill,
 				style.decoration,
+				style.fill_detail,
 				style.label_text,
 				style.separator,
 			] {
@@ -744,6 +783,7 @@ mod tests {
 			[
 				style.fill,
 				style.decoration,
+				style.fill_detail,
 				style.label_text,
 				style.separator,
 			]

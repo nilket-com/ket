@@ -2,11 +2,19 @@ let skin = "nord";
 let boxes = workspace.sql("WITH samples AS (SELECT grp AS category, v AS value FROM box_probe WHERE grp IS NOT NULL AND v IS NOT NULL), quartiles AS (SELECT category, APPROX_QUANTILE(value, 0.25) AS q1, APPROX_QUANTILE(value, 0.50) AS median, APPROX_QUANTILE(value, 0.75) AS q3 FROM samples GROUP BY category), classified AS (SELECT s.category, s.value, q.q1, q.median, q.q3, q.q1 - 1.5 * (q.q3 - q.q1) AS lower_fence, q.q3 + 1.5 * (q.q3 - q.q1) AS upper_fence FROM samples s JOIN quartiles q ON s.category = q.category), summaries AS (SELECT category, MIN(CASE WHEN value >= lower_fence THEN value END) AS whisker_low, MIN(q1) AS q1, MIN(median) AS median, MIN(q3) AS q3, MAX(CASE WHEN value <= upper_fence THEN value END) AS whisker_high FROM classified GROUP BY category), outliers AS (SELECT category, value AS outlier FROM classified WHERE value < lower_fence OR value > upper_fence) SELECT s.category, s.whisker_low, s.q1, s.median, s.q3, s.whisker_high, o.outlier FROM summaries s LEFT JOIN outliers o ON s.category = o.category ORDER BY s.category, o.outlier");
 
 boxes.views([
-    view("box-tukey", figure([
-        title("Box plot · Tukey summary relation"),
-        subtitle("Groups: twin · lowhigh · none · flat · single"),
-        skin(skin),
-        y_bounds(-75, 225),
+    view("box-detail", figure([
+		title("Box plot · Tukey detail"),
+		subtitle("Medians, box outlines, whiskers, and caps"),
+		skin(skin),
+		y_bounds(0, 40),
+		y_tick_step(5),
+		box("category", "whisker_low", "q1", "median", "q3", "whisker_high", "outlier"),
+	])),
+    view("box-outliers", figure([
+		title("Box plot · Tukey outliers"),
+		subtitle("Groups: twin · lowhigh · none · flat · single"),
+		skin(skin),
+		y_bounds(-75, 225),
         y_tick_step(25),
         box("category", "whisker_low", "q1", "median", "q3", "whisker_high", "outlier"),
     ])),

@@ -1546,7 +1546,7 @@ fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary(
 }
 
 #[test]
-fn product_0080_plot_chrome_and_mark_style_are_separate_closed_tiers() {
+fn product_0080_product_0083_plot_chrome_and_mark_style_are_separate_closed_tiers() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let chrome =
 		std::fs::read_to_string(root.join("plot/chrome.rs")).expect("read plot chrome model");
@@ -1579,8 +1579,14 @@ fn product_0080_plot_chrome_and_mark_style_are_separate_closed_tiers() {
 		.split('}')
 		.next()
 		.expect("PlotMarkStyle fields");
-	assert_eq!(mark_fields.matches("pub ").count(), 4);
-	for role in ["fill", "decoration", "label_text", "separator"] {
+	assert_eq!(mark_fields.matches("pub ").count(), 5);
+	for role in [
+		"fill",
+		"decoration",
+		"fill_detail",
+		"label_text",
+		"separator",
+	] {
 		assert!(
 			mark_fields.contains(&format!("pub {role}: PlotRgba")),
 			"missing mark-style role {role}"
@@ -1605,7 +1611,10 @@ fn product_0080_plot_chrome_and_mark_style_are_separate_closed_tiers() {
 	assert!(!production.contains("mark_decoration_color"));
 
 	for (relative, roles) in [
-		("plot/kernels/boxplot.rs", &["mark_style.decoration"][..]),
+		(
+			"plot/kernels/boxplot.rs",
+			&["mark_style.decoration", "mark_style.fill_detail"][..],
+		),
 		("plot/kernels/violin.rs", &["mark_style.decoration"][..]),
 		(
 			"plot/kernels/candlestick.rs",

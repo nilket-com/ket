@@ -471,10 +471,13 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0080_product_0079_count_is_height_only_and_mark_style_is_exact() {
+	fn product_0080_product_0083_product_0079_count_is_height_only_and_mark_style_is_exact() {
 		let histogram = kernel(vec![bin(0.0, 1.0, 4), bin(1.0, 2.0, 11)]);
 		let mut settings = ResolvedPlotSettings::default();
 		settings.mark_style.fill = crate::plot::chrome::PlotRgba::opaque(0.2, 0.4, 0.8);
+		settings.mark_style.decoration = crate::plot::chrome::PlotRgba::opaque(0.3, 0.5, 0.7);
+		settings.mark_style.fill_detail = crate::plot::chrome::PlotRgba::opaque(0.4, 0.6, 0.8);
+		settings.mark_style.label_text = crate::plot::chrome::PlotRgba::opaque(0.5, 0.7, 0.9);
 		settings.mark_style.separator = crate::plot::chrome::PlotRgba::opaque(0.8, 0.4, 0.2);
 		let rendered = render_rectangles(&histogram, settings.clone());
 		assert_eq!(rendered.colors, vec![settings.mark_style.fill.iced(); 2]);

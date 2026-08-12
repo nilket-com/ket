@@ -90,7 +90,8 @@ impl PlotKernel for BoxPlotKernel {
 			let left = center.x - box_width / 2.0;
 			let right = center.x + box_width / 2.0;
 			let color_iced = settings.mark_style.fill.iced();
-			let line_color = settings.mark_style.decoration.iced();
+			let detail_color = settings.mark_style.fill_detail.iced();
+			let decoration_color = settings.mark_style.decoration.iced();
 			let (q1_px, _) = transform.categorical(shared_index, stats.q1());
 			let (q3_px, _) = transform.categorical(shared_index, stats.q3());
 			let box_rect = Rectangle {
@@ -101,7 +102,7 @@ impl PlotKernel for BoxPlotKernel {
 			};
 			backend.fill_rectangle(box_rect.position(), box_rect.size(), color_iced);
 			let outline_stroke = Stroke {
-				style: Style::Solid(line_color),
+				style: Style::Solid(detail_color),
 				width: 1.0,
 				..Default::default()
 			};
@@ -113,7 +114,7 @@ impl PlotKernel for BoxPlotKernel {
 			);
 			let (median_px, _) = transform.categorical(shared_index, stats.median());
 			let median_stroke = Stroke {
-				style: Style::Solid(line_color),
+				style: Style::Solid(detail_color),
 				width: 3.5,
 				..Default::default()
 			};
@@ -125,7 +126,7 @@ impl PlotKernel for BoxPlotKernel {
 				median_stroke,
 			);
 			let whisker_stroke = Stroke {
-				style: Style::Solid(line_color),
+				style: Style::Solid(decoration_color),
 				width: 1.0,
 				..Default::default()
 			};
@@ -142,7 +143,7 @@ impl PlotKernel for BoxPlotKernel {
 			);
 			let cap_width = box_width * 0.4;
 			let cap_stroke = Stroke {
-				style: Style::Solid(line_color),
+				style: Style::Solid(decoration_color),
 				width: 3.5,
 				..Default::default()
 			};
@@ -163,7 +164,7 @@ impl PlotKernel for BoxPlotKernel {
 				backend.stroke_path(
 					&|builder| builder.circle(outlier.center, OUTLIER_RADIUS),
 					Stroke {
-						style: Style::Solid(settings.mark_style.decoration.iced()),
+						style: Style::Solid(settings.mark_style.fill_detail.iced()),
 						width: OUTLIER_OUTLINE_WIDTH,
 						..Default::default()
 					},
@@ -514,7 +515,7 @@ fn outlier_points(
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::plot::chrome::PlotMarkStyle;
+	use crate::plot::chrome::{PlotMarkStyle, PlotRgba};
 	use crate::plot::common::PathBuilder;
 	use crate::plot::kernels::boxplot_tukey::TukeyBoxRow;
 	use iced::{Color, Size, Vector};
@@ -546,6 +547,7 @@ mod tests {
 		filled_rectangles: Vec<(Point, Size, Color)>,
 		filled_circles: Vec<(Point, f32, Color)>,
 		stroked_circles: Vec<(Point, f32, Color, f32)>,
+		stroke_colors: Vec<Color>,
 		stroke_widths: Vec<f32>,
 	}
 
@@ -557,6 +559,7 @@ mod tests {
 				Style::Solid(color) => color,
 				Style::Gradient(_) => panic!("box decoration is solid"),
 			};
+			self.stroke_colors.push(color);
 			self.stroke_widths.push(stroke.width);
 			self.stroked_circles.extend(
 				path.circles
@@ -743,6 +746,51 @@ mod tests {
 		assert_eq!(first.stroked_circles[0].3, OUTLIER_OUTLINE_WIDTH);
 		assert_ne!(first.filled_circles[0].2, second.filled_circles[0].2);
 		assert_ne!(first.stroked_circles[0].2, second.stroked_circles[0].2);
+	}
+
+	#[test]
+	fn product_0083_box_elements_route_through_distinct_semantic_roles() {
+		let kernel = make_kernel(vec![row("A", Some(9.0))]);
+		let fill = PlotRgba::opaque(0.1, 0.2, 0.3);
+		let decoration = PlotRgba::opaque(0.2, 0.3, 0.4);
+		let fill_detail = PlotRgba::opaque(0.3, 0.4, 0.5);
+		let label_text = PlotRgba::opaque(0.4, 0.5, 0.6);
+		let separator = PlotRgba::opaque(0.5, 0.6, 0.7);
+		let settings = ResolvedPlotSettings {
+			mark_style: PlotMarkStyle {
+				fill,
+				decoration,
+				fill_detail,
+				label_text,
+				separator,
+			},
+			..ResolvedPlotSettings::default()
+		};
+		let rendered = render(
+			&kernel,
+			settings,
+			Rectangle::new(Point::ORIGIN, Size::new(200.0, 200.0)),
+		);
+		assert_eq!(rendered.filled_rectangles[0].2, fill.iced());
+		assert_eq!(rendered.filled_circles[0].2, fill.iced());
+		assert_eq!(
+			rendered.stroke_colors,
+			vec![
+				fill_detail.iced(),
+				fill_detail.iced(),
+				decoration.iced(),
+				decoration.iced(),
+				fill_detail.iced(),
+			],
+			"outline, median, whisker, cap, and outlier outline must retain distinct semantic routing"
+		);
+		assert_eq!(
+			rendered.stroke_widths,
+			vec![1.0, 3.5, 1.0, 3.5, OUTLIER_OUTLINE_WIDTH],
+			"PRODUCT-0083 changes role selection without changing geometry"
+		);
+		assert!(!rendered.stroke_colors.contains(&label_text.iced()));
+		assert!(!rendered.stroke_colors.contains(&separator.iced()));
 	}
 
 	#[test]

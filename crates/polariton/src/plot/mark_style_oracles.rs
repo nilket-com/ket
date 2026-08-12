@@ -78,7 +78,7 @@ fn render(kernel: &dyn PlotKernel) -> Vec<BankOperation> {
 }
 
 #[test]
-fn product_0080_0082_default_operation_bank_changes_only_the_box_body_fill() {
+fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 	let settings = ResolvedPlotSettings::default();
 	let ink = Color::WHITE;
 	let translucent_ink = Color { a: 0.2, ..ink };
@@ -133,8 +133,8 @@ fn product_0080_0082_default_operation_bank_changes_only_the_box_body_fill() {
 		render(&boxplot),
 		vec![
 			BankOperation::FillRectangle(settings.mark_style.fill.iced()),
-			BankOperation::Stroke(ink, 1.0_f32.to_bits()),
-			BankOperation::Stroke(ink, 3.5_f32.to_bits()),
+			BankOperation::Stroke(settings.mark_style.fill_detail.iced(), 1.0_f32.to_bits()),
+			BankOperation::Stroke(settings.mark_style.fill_detail.iced(), 3.5_f32.to_bits()),
 			BankOperation::Stroke(ink, 1.0_f32.to_bits()),
 			BankOperation::Stroke(ink, 3.5_f32.to_bits()),
 		]
