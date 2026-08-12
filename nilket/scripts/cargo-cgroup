@@ -6,19 +6,23 @@ usage() {
 Usage: scripts/cargo-cgroup <cargo-subcommand> [cargo-args...]
 
 Runs cargo inside a constrained user cgroup scope, with CPU affinity,
-low IO priority, one cargo build job, and one Rust test thread by default.
+low IO priority, bounded build parallelism, and one Rust test thread by
+default. Lockup protection is the cpuset + quota + nice + ionice, not the
+job count: within a bounded cpuset, parallel jobs contend inside the cage
+rather than starving the machine. Build parallelism is therefore bounded by
+MEMORY_MAX (peak rustc link memory), not by core count.
 
 Environment overrides:
   CARGO_CGROUP_BACKEND=auto        # auto, systemd, nerdctl, affinity
-  CARGO_CGROUP_CPUS=0-1
-  CARGO_CGROUP_CPU_QUOTA=150%
-  CARGO_CGROUP_CONTAINER_CPUS=1.5
-  CARGO_CGROUP_MEMORY_HIGH=8G
-  CARGO_CGROUP_MEMORY_MAX=12G
+  CARGO_CGROUP_CPUS=0-11
+  CARGO_CGROUP_CPU_QUOTA=1200%
+  CARGO_CGROUP_CONTAINER_CPUS=12
+  CARGO_CGROUP_MEMORY_HIGH=12G
+  CARGO_CGROUP_MEMORY_MAX=16G
   CARGO_CGROUP_TASKS_MAX=512
   CARGO_CGROUP_IO_WEIGHT=10
   CARGO_CGROUP_NICE=19
-  CARGO_CGROUP_JOBS=1
+  CARGO_CGROUP_JOBS=6
   CARGO_CGROUP_RUST_TEST_THREADS=1
   CARGO_CGROUP_IMAGE=rust:1
   CARGO_CGROUP_ALLOW_AFFINITY_ONLY=0
@@ -43,15 +47,15 @@ if [[ $# -eq 0 ]]; then
 fi
 
 backend="${CARGO_CGROUP_BACKEND:-auto}"
-cpus="${CARGO_CGROUP_CPUS:-0-1}"
-cpu_quota="${CARGO_CGROUP_CPU_QUOTA:-150%}"
-container_cpus="${CARGO_CGROUP_CONTAINER_CPUS:-1.5}"
-memory_high="${CARGO_CGROUP_MEMORY_HIGH:-8G}"
-memory_max="${CARGO_CGROUP_MEMORY_MAX:-12G}"
+cpus="${CARGO_CGROUP_CPUS:-0-11}"
+cpu_quota="${CARGO_CGROUP_CPU_QUOTA:-1200%}"
+container_cpus="${CARGO_CGROUP_CONTAINER_CPUS:-12}"
+memory_high="${CARGO_CGROUP_MEMORY_HIGH:-12G}"
+memory_max="${CARGO_CGROUP_MEMORY_MAX:-16G}"
 tasks_max="${CARGO_CGROUP_TASKS_MAX:-512}"
 io_weight="${CARGO_CGROUP_IO_WEIGHT:-10}"
 nice_level="${CARGO_CGROUP_NICE:-19}"
-jobs="${CARGO_CGROUP_JOBS:-1}"
+jobs="${CARGO_CGROUP_JOBS:-6}"
 test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1}"
 progress="${CARGO_TERM_PROGRESS_WHEN:-never}"
 image="${CARGO_CGROUP_IMAGE:-rust:1}"
