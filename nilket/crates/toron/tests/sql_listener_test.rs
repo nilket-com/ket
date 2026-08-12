@@ -37,7 +37,7 @@ use toron::sql_wire::{
 	write_frame as write_sql_frame,
 };
 use toron::storage::TenantId as ToronTenantId;
-use toron_client::ToronClient;
+use toron_client::{CtasCompositePhase, ResolvedOperationOutcome, ToronClient};
 use wendelon::client::{ClusterPeerWire, ClusterStatusWire, StaticTopologySource};
 use wendelon::consensus::WendelonRequest;
 use wendelon::integration::compute::{
@@ -1116,6 +1116,9 @@ async fn public_sql_client_resolves_a_mutation_by_id_without_replaying_it() {
 		.resolve_mutation(operation_query_id)
 		.await
 		.expect("resolve without replay");
+	let ResolvedOperationOutcome::Mutation(outcome) = outcome else {
+		panic!("ordinary INSERT must resolve as a row mutation");
+	};
 
 	assert_eq!(outcome.operation_query_id, operation_query_id);
 	assert_eq!(outcome.resolution, MutationResolution::Present);
@@ -1132,6 +1135,95 @@ async fn public_sql_client_resolves_a_mutation_by_id_without_replaying_it() {
 		rows.row_count, 1,
 		"resolution must not submit a second write"
 	);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn public_sql_client_resolves_all_four_ctas_phases_by_id() {
+	let fixture = LiveWendelonFixture::start(548).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+	let config = toron_config_with_descriptor(descriptor, true);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = ToronClient::loopback(endpoint.to_string()).expect("public client");
+	let operation_query_id = QueryId::new();
+
+	client
+		.execute_with_query_id(
+			operation_query_id,
+			"CREATE TABLE ctas_resolution AS SELECT id, amount, region, ts FROM storage_execution",
+			"UTC",
+		)
+		.await
+		.expect("execute named CTAS");
+	let outcome = client
+		.resolve_mutation(operation_query_id)
+		.await
+		.expect("resolve composite CTAS without replay");
+	let ResolvedOperationOutcome::Ctas(outcome) = outcome else {
+		panic!("CTAS must resolve through the composite outcome surface");
+	};
+
+	assert_eq!(outcome.operation_query_id, operation_query_id);
+	assert_eq!(outcome.phase, CtasCompositePhase::Complete);
+	assert_eq!(outcome.row_count, Some(4));
+	assert_eq!(
+		outcome.catalog_commit_knowledge,
+		MutationCommitKnowledge::Committed
+	);
+	assert_eq!(
+		outcome.row_commit_knowledge,
+		MutationCommitKnowledge::Committed
+	);
+	assert_eq!(
+		outcome.publication_commit_knowledge,
+		MutationCommitKnowledge::Committed
+	);
+	assert_eq!(
+		outcome.retirement_commit_knowledge,
+		MutationCommitKnowledge::Committed
+	);
+	assert_eq!(outcome.catalog_cause, None);
+	assert_eq!(outcome.row_cause, None);
+	assert_eq!(outcome.publication_cause, None);
+	assert_eq!(outcome.retirement_cause, None);
+
+	let rows = client
+		.execute("SELECT id FROM ctas_resolution")
+		.await
+		.expect("published CTAS remains queryable after resolution");
+	assert_eq!(rows.row_count, 4);
+
+	let replacement_query_id = QueryId::new();
+	client
+		.execute_with_query_id(
+			replacement_query_id,
+			"CREATE OR REPLACE TABLE ctas_resolution AS SELECT id, amount, region, ts FROM storage_execution WHERE id > 2",
+			"UTC",
+		)
+		.await
+		.expect("stage, publish, and retire a replacement over live Wendelon");
+	let ResolvedOperationOutcome::Ctas(replacement) = client
+		.resolve_mutation(replacement_query_id)
+		.await
+		.expect("resolve completed replacement")
+	else {
+		panic!("replacement CTAS must retain its composite outcome");
+	};
+	assert_eq!(replacement.phase, CtasCompositePhase::Complete);
+	assert_eq!(replacement.row_count, Some(2));
+	let rows = client
+		.execute("SELECT id FROM ctas_resolution")
+		.await
+		.expect("replacement remains queryable after old storage retirement");
+	assert_eq!(rows.row_count, 2);
 
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();

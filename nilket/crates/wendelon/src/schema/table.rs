@@ -466,6 +466,47 @@ pub struct MutationOutcomeRequestMeta {
 
 const _: () = assert!(std::mem::size_of::<MutationOutcomeRequestMeta>() == 40);
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct MutationOutcomePinAction(pub u8);
+
+impl MutationOutcomePinAction {
+	pub const PIN: Self = Self(1);
+	pub const ACKNOWLEDGE: Self = Self(2);
+}
+
+/// ADR 548 data-ring retention handoff. The pin is installed before dispatch;
+/// acknowledgement is sent only after the control-ring saga attests the result.
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct MutationOutcomePinRequestMeta {
+	pub operation_id: ClientWriteId,      // 32 bytes
+	pub tenant_id: TenantId,              //  8 bytes
+	pub action: MutationOutcomePinAction, //  1 byte
+	pub _pad: [u8; 7],                    //  7 bytes
+}
+
+const _: () = assert!(std::mem::size_of::<MutationOutcomePinRequestMeta>() == 48);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Pod, Zeroable)]
+#[repr(transparent)]
+pub struct MutationOutcomePinStatus(pub u8);
+
+impl MutationOutcomePinStatus {
+	pub const APPLIED: Self = Self(0);
+	pub const CAPACITY_EXHAUSTED: Self = Self(1);
+	pub const INVALID_ACTION: Self = Self(2);
+}
+
+#[derive(Clone, Copy, Debug, Pod, Zeroable)]
+#[repr(C)]
+pub struct MutationOutcomePinResponseMeta {
+	pub status: MutationOutcomePinStatus,
+	pub _pad: [u8; 7],
+}
+
+const _: () = assert!(std::mem::size_of::<MutationOutcomePinResponseMeta>() == 8);
+
 /// Exact durable mutation result. `resolution == UNKNOWN` is explicitly
 /// indeterminate; it is never represented as known-not-committed by absence.
 #[derive(Clone, Copy, Debug, Pod, Zeroable)]
@@ -2355,6 +2396,11 @@ pub struct TableSchemaCatalog {
 	by_id: BTreeMap<TableSchemaCatalogKey, TableSchemaDescriptor>,
 	#[serde(default)]
 	latest_by_name: BTreeMap<TableNameCatalogKey, TableSchemaCatalogKey>,
+	/// ADR 548 provisional descriptors exist durably by id but are not live
+	/// catalog objects. Central filtering keeps by-id consumers from treating an
+	/// uncommitted CTAS target as a readable or maintainable table.
+	#[serde(default)]
+	provisional_by_id: BTreeSet<(TenantId, TableObjectId)>,
 }
 
 impl TableSchemaCatalog {
@@ -2400,7 +2446,9 @@ impl TableSchemaCatalog {
 				));
 			}
 		}
-		if let Some(existing) = self.latest_by_id(tenant_id, descriptor.table_object_id) {
+		if let Some(existing) =
+			self.latest_by_id_including_provisional(tenant_id, descriptor.table_object_id)
+		{
 			if existing.namespace != descriptor.namespace
 				|| existing.table_name != descriptor.table_name
 			{
@@ -2422,6 +2470,21 @@ impl TableSchemaCatalog {
 	}
 
 	pub fn get(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		schema_generation: u64,
+	) -> Option<&TableSchemaDescriptor> {
+		if self
+			.provisional_by_id
+			.contains(&(tenant_id, table_object_id))
+		{
+			return None;
+		}
+		self.get_including_provisional(tenant_id, table_object_id, schema_generation)
+	}
+
+	pub fn get_including_provisional(
 		&self,
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
@@ -2472,6 +2535,20 @@ impl TableSchemaCatalog {
 		tenant_id: TenantId,
 		table_object_id: TableObjectId,
 	) -> Option<&TableSchemaDescriptor> {
+		if self
+			.provisional_by_id
+			.contains(&(tenant_id, table_object_id))
+		{
+			return None;
+		}
+		self.latest_by_id_including_provisional(tenant_id, table_object_id)
+	}
+
+	pub fn latest_by_id_including_provisional(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> Option<&TableSchemaDescriptor> {
 		let start = TableSchemaCatalogKey {
 			tenant_id,
 			table_object_id,
@@ -2494,7 +2571,10 @@ impl TableSchemaCatalog {
 		table_object_id: TableObjectId,
 		expected_generation: u64,
 	) -> std::io::Result<Option<TableSchemaDescriptor>> {
-		let Some(descriptor) = self.latest_by_id(tenant_id, table_object_id).cloned() else {
+		let Some(descriptor) = self
+			.latest_by_id_including_provisional(tenant_id, table_object_id)
+			.cloned()
+		else {
 			return Ok(None);
 		};
 		if descriptor.schema_generation != expected_generation {
@@ -2522,6 +2602,29 @@ impl TableSchemaCatalog {
 		Ok(Some(descriptor))
 	}
 
+	/// Retire every generation of an object only after publication moved its name
+	/// binding elsewhere and storage drain completed.
+	pub fn retire_unbound_object(
+		&mut self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> std::io::Result<()> {
+		if self
+			.latest_by_name
+			.values()
+			.any(|key| key.tenant_id == tenant_id && key.table_object_id == table_object_id)
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				"cannot retire a table object that still owns a name binding",
+			));
+		}
+		self.by_id
+			.retain(|key, _| key.tenant_id != tenant_id || key.table_object_id != table_object_id);
+		self.provisional_by_id.remove(&(tenant_id, table_object_id));
+		Ok(())
+	}
+
 	pub fn descriptors_for_tenant(&self, tenant_id: TenantId) -> Vec<TableSchemaDescriptor> {
 		let start = TableSchemaCatalogKey {
 			tenant_id,
@@ -2535,8 +2638,93 @@ impl TableSchemaCatalog {
 		};
 		self.by_id
 			.range(start..=end)
+			.filter(|(key, _)| {
+				!self
+					.provisional_by_id
+					.contains(&(key.tenant_id, key.table_object_id))
+			})
 			.map(|(_, descriptor)| descriptor.clone())
 			.collect()
+	}
+
+	pub fn current_binding_key(
+		&self,
+		tenant_id: TenantId,
+		namespace: &str,
+		table_name: &str,
+	) -> Option<(TableObjectId, u64)> {
+		self.latest_by_name
+			.get(&TableNameCatalogKey {
+				tenant_id,
+				namespace: namespace.to_owned(),
+				table_name: table_name.to_owned(),
+			})
+			.map(|key| (key.table_object_id, key.schema_generation))
+	}
+
+	pub fn insert_provisional(
+		&mut self,
+		tenant_id: TenantId,
+		descriptor: TableSchemaDescriptor,
+	) -> std::io::Result<()> {
+		descriptor.validate()?;
+		let key = TableSchemaCatalogKey {
+			tenant_id,
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+		};
+		if let Some(existing) = self.by_id.get(&key) {
+			if existing != &descriptor {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"provisional table schema key exists with a different descriptor",
+				));
+			}
+		} else {
+			self.by_id.insert(key, descriptor.clone());
+		}
+		self.provisional_by_id
+			.insert((tenant_id, descriptor.table_object_id));
+		Ok(())
+	}
+
+	pub fn publish_provisional(
+		&mut self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+		schema_generation: u64,
+	) -> std::io::Result<TableSchemaDescriptor> {
+		if !self
+			.provisional_by_id
+			.contains(&(tenant_id, table_object_id))
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CTAS publication requires a provisional descriptor",
+			));
+		}
+		let descriptor = self
+			.get_including_provisional(tenant_id, table_object_id, schema_generation)
+			.cloned()
+			.ok_or_else(|| Error::new(ErrorKind::NotFound, "provisional descriptor is missing"))?;
+		let name_key = TableNameCatalogKey {
+			tenant_id,
+			namespace: descriptor.namespace.clone(),
+			table_name: descriptor.table_name.clone(),
+		};
+		let key = TableSchemaCatalogKey {
+			tenant_id,
+			table_object_id,
+			schema_generation,
+		};
+		self.latest_by_name.insert(name_key, key);
+		self.provisional_by_id.remove(&(tenant_id, table_object_id));
+		Ok(descriptor)
+	}
+
+	pub fn is_provisional(&self, tenant_id: TenantId, table_object_id: TableObjectId) -> bool {
+		self.provisional_by_id
+			.contains(&(tenant_id, table_object_id))
 	}
 
 	pub fn latest_descriptors_for_tenant(&self, tenant_id: TenantId) -> Vec<TableSchemaDescriptor> {

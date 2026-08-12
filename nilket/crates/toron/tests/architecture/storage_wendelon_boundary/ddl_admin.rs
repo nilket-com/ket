@@ -232,7 +232,7 @@ pub(crate) fn adr029_coordinators_intercept_create_table() {
 	assert!(helper_body.contains("Ok(Vec::new())"));
 	assert_eq!(
 		coordinator.matches(".create_table_with_outcome(").count(),
-		2
+		1
 	);
 }
 
@@ -319,6 +319,7 @@ pub(crate) fn adr033_execution_ctas_has_no_precreate_identity() {
 	for required in [
 		"table: TableRef,",
 		"schema: SchemaRef,",
+		"intent_fingerprint: wendelon_client::CtasIntentFingerprint,",
 		"if_not_exists: bool,",
 		"source: Box<ExecutionPlan>,",
 	] {
@@ -328,7 +329,6 @@ pub(crate) fn adr033_execution_ctas_has_no_precreate_identity() {
 		"local_table_id",
 		"TableId",
 		"TableObjectId",
-		"fingerprint",
 		"PhysicalDescriptorFingerprint",
 	] {
 		assert!(
@@ -511,8 +511,8 @@ pub(crate) fn adr033_coordinator_reads_source_before_create_table() {
 		.and_then(|rest| rest.split("other =>").next())
 		.expect("CTAS arm");
 	let create_table = ctas_arm
-		.find(".create_table_with_outcome(")
-		.expect("create_table_with_outcome call");
+		.find(".provision_ctas(")
+		.expect("provision_ctas call");
 	let execute_source = ctas_arm
 		.find("source_executor.execute_read_plan(source)")
 		.expect("source execution");
@@ -536,8 +536,8 @@ pub(crate) fn adr033_coordinator_uses_create_table_binding_for_write() {
 		.and_then(|rest| rest.split("other =>").next())
 		.expect("CTAS arm");
 
-	assert!(ctas_arm.contains("let outcome = catalog"));
-	assert!(ctas_arm.contains("let binding = outcome.binding"));
+	assert!(ctas_arm.contains("let provision = match catalog"));
+	assert!(ctas_arm.contains("let binding = provision.binding"));
 	assert!(ctas_arm.contains("table_id: binding.local_table_id"));
 	assert!(ctas_arm.contains("table_object_id: binding.table"));
 	assert!(ctas_arm.contains("physical_descriptor_fingerprint: binding.fingerprint"));
@@ -1245,16 +1245,16 @@ pub(crate) fn adr061_ctas_write_is_gated_on_created_outcome() {
 		.nth(1)
 		.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
 		.expect("CTAS arm");
-	let outcome = ctas_arm
-		.find("let outcome = catalog")
-		.expect("created outcome");
 	let write_gate = ctas_arm
-		.find("if !outcome.created")
-		.expect("created=false write gate");
+		.find("if *if_not_exists")
+		.expect("IF NOT EXISTS compatibility gate");
+	let outcome = ctas_arm
+		.find(".provision_ctas(")
+		.expect("provisional outcome");
 	let writer = ctas_arm.find(".write(WriteRequest").expect("writer call");
 
-	assert!(outcome < write_gate);
-	assert!(write_gate < writer);
+	assert!(write_gate < outcome);
+	assert!(outcome < writer);
 }
 
 #[test]

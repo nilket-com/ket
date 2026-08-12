@@ -259,9 +259,7 @@ pub(crate) fn adr037_ctas_reads_source_before_catalog_create() {
 	let read = ctas_arm
 		.find("source_executor.execute_read_plan(source)")
 		.expect("source read");
-	let create = ctas_arm
-		.find("create_table_with_outcome")
-		.expect("catalog create");
+	let create = ctas_arm.find("provision_ctas").expect("catalog provision");
 
 	assert!(read < create);
 }

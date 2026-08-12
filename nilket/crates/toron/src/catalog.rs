@@ -24,8 +24,10 @@ use wendelon::schema::{
 	TableSchemaDescriptor, TenantId as WendelonTenantId,
 };
 use wendelon_client::{
-	Client, ClientError, DropOperationId, LogicalTypeDefinition, NdvFact as StorageNdvFact,
-	SchemaGeneration, SchemaUpdateReceipt, TableOptimizerFacts as StorageTableOptimizerFacts,
+	Client, ClientError, CtasExpectedBinding, CtasIntentFingerprint, CtasOperationId,
+	CtasSagaEntry, CtasSagaMutation, CtasSagaPhase, CtasSagaResponse, CtasTerminalCause,
+	DropOperationId, LogicalTypeDefinition, NdvFact as StorageNdvFact, SchemaGeneration,
+	SchemaUpdateReceipt, TableOptimizerFacts as StorageTableOptimizerFacts,
 	TableSchemaUpdateRequest,
 };
 
@@ -1116,6 +1118,27 @@ pub struct CreateTableOutcome {
 	pub created: bool,
 }
 
+#[derive(Clone)]
+pub struct CtasProvisionRequest {
+	pub operation_id: CtasOperationId,
+	pub intent_fingerprint: CtasIntentFingerprint,
+	pub name: TableRef,
+	pub schema: SchemaRef,
+	pub row_identity: CreateTableRowIdentity,
+	pub expected_binding: CtasExpectedBinding,
+	pub prior_descriptor: Option<wendelon_client::TableSchemaDescriptor>,
+	pub row_write_id: wendelon::schema::ClientWriteId,
+	pub owner_epoch: u64,
+	pub observed_now_ms: u64,
+	pub owner_lease_expires_at_ms: u64,
+}
+
+#[derive(Clone)]
+pub struct CtasProvisionOutcome {
+	pub entry: CtasSagaEntry,
+	pub binding: TableBinding,
+}
+
 #[async_trait::async_trait]
 pub trait Catalog: Send + Sync {
 	fn scoped(self: Arc<Self>, tenant_id: TenantId) -> Arc<dyn Catalog>;
@@ -1154,6 +1177,51 @@ pub trait Catalog: Send + Sync {
 		table: TableId,
 	) -> Result<Option<InvalidatedDescriptor>, CatalogError>;
 
+	async fn provision_ctas(
+		&self,
+		_request: CtasProvisionRequest,
+	) -> Result<CtasProvisionOutcome, CatalogError> {
+		Err(CatalogError::AdminFailed {
+			message: "CTAS staged publication requires a saga-capable catalog".to_string(),
+		})
+	}
+
+	async fn mutate_ctas_saga(
+		&self,
+		_mutation: CtasSagaMutation,
+	) -> Result<CtasSagaEntry, CatalogError> {
+		Err(CatalogError::AdminFailed {
+			message: "CTAS staged publication requires a saga-capable catalog".to_string(),
+		})
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		_operation_id: CtasOperationId,
+	) -> Result<Option<CtasSagaEntry>, CatalogError> {
+		Ok(None)
+	}
+
+	/// Resolve a saga-owned object by durable identity, including provisional or
+	/// retired objects that are deliberately not name-resolvable.
+	async fn resolve_ctas_object(
+		&self,
+		_table_object_id: TableObjectId,
+	) -> Result<TableBinding, CatalogError> {
+		Err(CatalogError::AdminFailed {
+			message: "CTAS object resolution requires a saga-capable catalog".to_string(),
+		})
+	}
+
+	fn descriptor_for_ctas_binding(
+		&self,
+		_binding: &TableBinding,
+	) -> Result<wendelon_client::TableSchemaDescriptor, CatalogError> {
+		Err(CatalogError::AdminFailed {
+			message: "CTAS descriptor capture requires a saga-capable catalog".to_string(),
+		})
+	}
+
 	async fn create_table_with_outcome(
 		&self,
 		name: &TableRef,
@@ -1191,6 +1259,29 @@ trait SchemaUpdateClient: Send + Sync {
 		&self,
 		request: TableSchemaUpdateRequest,
 	) -> Result<SchemaUpdateReceipt, ClientError>;
+
+	async fn mutate_ctas_saga(
+		&self,
+		mutation: CtasSagaMutation,
+	) -> Result<CtasSagaResponse, ClientError> {
+		let _ = mutation;
+		Err(ClientError::Io(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"schema client does not implement CTAS sagas",
+		)))
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		tenant_id: WendelonTenantId,
+		operation_id: CtasOperationId,
+	) -> Result<CtasSagaResponse, ClientError> {
+		let _ = (tenant_id, operation_id);
+		Err(ClientError::Io(std::io::Error::new(
+			std::io::ErrorKind::Unsupported,
+			"schema client does not implement CTAS saga resolution",
+		)))
+	}
 }
 
 #[async_trait::async_trait]
@@ -1200,6 +1291,21 @@ impl SchemaUpdateClient for Client {
 		request: TableSchemaUpdateRequest,
 	) -> Result<SchemaUpdateReceipt, ClientError> {
 		Client::submit_table_schema_update(self, request).await
+	}
+
+	async fn mutate_ctas_saga(
+		&self,
+		mutation: CtasSagaMutation,
+	) -> Result<CtasSagaResponse, ClientError> {
+		Client::mutate_ctas_saga(self, mutation).await
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		tenant_id: WendelonTenantId,
+		operation_id: CtasOperationId,
+	) -> Result<CtasSagaResponse, ClientError> {
+		Client::resolve_ctas_saga(self, tenant_id, operation_id).await
 	}
 }
 
@@ -1359,6 +1465,9 @@ struct MockCatalogInner {
 	by_ref: HashMap<(TenantId, TableRef), TableId>,
 	by_id: HashMap<(TenantId, TableId), TableBinding>,
 	descriptors: HashMap<(TenantId, TableId), wendelon_client::TableSchemaDescriptor>,
+	provisional:
+		HashMap<(TenantId, TableId), (TableBinding, wendelon_client::TableSchemaDescriptor)>,
+	ctas_sagas: HashMap<(TenantId, CtasOperationId), CtasSagaEntry>,
 	logical_types: HashMap<TenantId, LogicalTypeRegistry>,
 	next_table_id: u64,
 }
@@ -1379,6 +1488,8 @@ impl Default for MockCatalogInner {
 			by_ref: HashMap::new(),
 			by_id: HashMap::new(),
 			descriptors: HashMap::new(),
+			provisional: HashMap::new(),
+			ctas_sagas: HashMap::new(),
 			logical_types: HashMap::new(),
 			next_table_id: 1,
 		}
@@ -1640,6 +1751,322 @@ impl Catalog for MockCatalog {
 			fingerprint: binding.fingerprint,
 			refs,
 		}))
+	}
+
+	async fn provision_ctas(
+		&self,
+		request: CtasProvisionRequest,
+	) -> Result<CtasProvisionOutcome, CatalogError> {
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		if let Some(entry) = inner
+			.ctas_sagas
+			.get(&(self.tenant_id, request.operation_id))
+			.cloned()
+		{
+			if entry.intent_fingerprint != request.intent_fingerprint {
+				return Err(CatalogError::AdminFailed {
+					message: "CTAS provision rejected: intent_mismatch".to_string(),
+				});
+			}
+			let binding = inner
+				.provisional
+				.values()
+				.find_map(|(binding, _)| {
+					(binding.table == entry.descriptor.table_object_id).then(|| binding.clone())
+				})
+				.ok_or_else(|| CatalogError::AdminFailed {
+					message: "CTAS replay lost its provisional binding".to_string(),
+				})?;
+			return Ok(CtasProvisionOutcome { entry, binding });
+		}
+		let observed = inner
+			.by_ref
+			.get(&(self.tenant_id, request.name.clone()))
+			.and_then(|id| inner.by_id.get(&(self.tenant_id, *id)));
+		let matches_expected = match (request.expected_binding, observed) {
+			(CtasExpectedBinding::Absent, None) => true,
+			(
+				CtasExpectedBinding::Bound {
+					table_object_id,
+					schema_generation,
+				},
+				Some(binding),
+			) => {
+				binding.table == table_object_id
+					&& binding.schema_generation == schema_generation.get()
+			}
+			_ => false,
+		};
+		if !matches_expected {
+			return Err(CatalogError::AdminFailed {
+				message: "CTAS provision rejected: binding_changed".to_string(),
+			});
+		}
+		let local_table_id = TableId(inner.next_table_id);
+		inner.next_table_id = inner.next_table_id.saturating_add(1);
+		let table_object_id = TableObjectId::new(*Uuid::new_v4().as_bytes());
+		let descriptor = create_table_descriptor(
+			&request.name,
+			request.schema.as_ref(),
+			&request.row_identity,
+			table_object_id,
+		)?;
+		let logical_types = inner
+			.logical_types
+			.get(&self.tenant_id)
+			.cloned()
+			.unwrap_or_default();
+		let binding = TableBinding::from_descriptor_with_logical_types(
+			local_table_id,
+			&descriptor,
+			LogicalTypeResolver::with_registry(&logical_types),
+		)?;
+		let entry = CtasSagaEntry {
+			tenant_id: wendelon_tenant_id(self.tenant_id),
+			operation_id: request.operation_id,
+			intent_fingerprint: request.intent_fingerprint,
+			descriptor: descriptor.clone(),
+			expected_binding: request.expected_binding,
+			row_write_id: request.row_write_id,
+			prior_descriptor: request.prior_descriptor,
+			row_count: None,
+			phase: CtasSagaPhase::Provisioned,
+			terminal_cause: None,
+			owner_epoch: request.owner_epoch,
+			owner_lease_expires_at_ms: request.owner_lease_expires_at_ms,
+			retry_debt: 0,
+			terminal_at_ms: None,
+		};
+		inner.provisional.insert(
+			(self.tenant_id, local_table_id),
+			(binding.clone(), descriptor),
+		);
+		inner
+			.ctas_sagas
+			.insert((self.tenant_id, request.operation_id), entry.clone());
+		Ok(CtasProvisionOutcome { entry, binding })
+	}
+
+	async fn mutate_ctas_saga(
+		&self,
+		mutation: CtasSagaMutation,
+	) -> Result<CtasSagaEntry, CatalogError> {
+		let operation_id = mutation.operation_id();
+		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		let mut entry = inner
+			.ctas_sagas
+			.get(&(self.tenant_id, operation_id))
+			.cloned()
+			.ok_or_else(|| CatalogError::AdminFailed {
+				message: "CTAS saga transition rejected: not_found".to_string(),
+			})?;
+		match mutation {
+			CtasSagaMutation::MarkRowDispatched {
+				owner_epoch,
+				row_count,
+				..
+			} if owner_epoch == entry.owner_epoch
+				&& matches!(entry.phase, CtasSagaPhase::Provisioned) =>
+			{
+				entry.row_count = Some(row_count);
+				entry.phase = CtasSagaPhase::RowDispatched;
+			}
+			CtasSagaMutation::AttestRowsCommitted {
+				owner_epoch,
+				row_count,
+				..
+			} if owner_epoch == entry.owner_epoch
+				&& matches!(entry.phase, CtasSagaPhase::RowDispatched)
+				&& entry.row_count == Some(row_count) =>
+			{
+				entry.phase = CtasSagaPhase::RowsCommitted { row_count };
+			}
+			CtasSagaMutation::Publish { owner_epoch, .. }
+				if owner_epoch == entry.owner_epoch
+					&& matches!(entry.phase, CtasSagaPhase::RowsCommitted { .. }) =>
+			{
+				let name = TableRef::with_schema(
+					&entry.descriptor.namespace,
+					&entry.descriptor.table_name,
+				);
+				let observed = inner
+					.by_ref
+					.get(&(self.tenant_id, name.clone()))
+					.or_else(|| {
+						inner
+							.by_ref
+							.get(&(self.tenant_id, TableRef::new(name.table.clone())))
+					})
+					.and_then(|id| inner.by_id.get(&(self.tenant_id, *id)));
+				let matches_expected = match (entry.expected_binding, observed) {
+					(CtasExpectedBinding::Absent, None) => true,
+					(
+						CtasExpectedBinding::Bound {
+							table_object_id,
+							schema_generation,
+						},
+						Some(binding),
+					) => {
+						binding.table == table_object_id
+							&& binding.schema_generation == schema_generation.get()
+					}
+					_ => false,
+				};
+				if !matches_expected {
+					return Err(CatalogError::AdminFailed {
+						message: format!(
+							"CTAS saga transition rejected: binding_changed expected={:?} observed={:?}",
+							entry.expected_binding,
+							observed.map(|binding| (binding.table, binding.schema_generation))
+						),
+					});
+				}
+				let key = inner
+					.provisional
+					.iter()
+					.find_map(|(key, (binding, _))| {
+						(binding.table == entry.descriptor.table_object_id).then_some(*key)
+					})
+					.expect("mock CTAS provisional exists");
+				let (binding, descriptor) = inner.provisional.remove(&key).unwrap();
+				inner.by_id.insert(key, binding);
+				inner.descriptors.insert(key, descriptor);
+				inner.by_ref.insert((self.tenant_id, name.clone()), key.1);
+				if name.schema.is_some() {
+					inner
+						.by_ref
+						.insert((self.tenant_id, TableRef::new(name.table)), key.1);
+				}
+				entry.phase = CtasSagaPhase::Published;
+			}
+			CtasSagaMutation::MarkRetiringOld { owner_epoch, .. }
+				if owner_epoch == entry.owner_epoch =>
+			{
+				entry.phase = CtasSagaPhase::RetiringOld;
+			}
+			CtasSagaMutation::Complete {
+				owner_epoch,
+				completed_at_ms,
+				..
+			} if owner_epoch == entry.owner_epoch => {
+				if let CtasExpectedBinding::Bound {
+					table_object_id, ..
+				} = entry.expected_binding
+					&& let Some(old_key) = inner.by_id.iter().find_map(|(key, binding)| {
+						(key.0 == self.tenant_id && binding.table == table_object_id)
+							.then_some(*key)
+					}) {
+					inner.by_id.remove(&old_key);
+					inner.descriptors.remove(&old_key);
+					inner.by_ref.retain(|_, table_id| *table_id != old_key.1);
+				}
+				entry.phase = CtasSagaPhase::Complete;
+				entry.terminal_at_ms = Some(completed_at_ms);
+			}
+			CtasSagaMutation::Reclaim {
+				owner_epoch,
+				cause,
+				completed_at_ms,
+				..
+			} if owner_epoch == entry.owner_epoch => {
+				entry.phase = CtasSagaPhase::Reclaimed;
+				entry.terminal_cause = Some(cause);
+				entry.terminal_at_ms = Some(completed_at_ms);
+				inner
+					.provisional
+					.retain(|_, (binding, _)| binding.table != entry.descriptor.table_object_id);
+			}
+			CtasSagaMutation::RecordPublicationConflict {
+				owner_epoch,
+				completed_at_ms,
+				..
+			} if owner_epoch == entry.owner_epoch => {
+				entry.phase = CtasSagaPhase::Conflict;
+				entry.terminal_cause = Some(CtasTerminalCause::PublicationConflict);
+				entry.terminal_at_ms = Some(completed_at_ms);
+				inner
+					.provisional
+					.retain(|_, (binding, _)| binding.table != entry.descriptor.table_object_id);
+			}
+			CtasSagaMutation::RecordRetryDebt { owner_epoch, .. }
+				if owner_epoch == entry.owner_epoch =>
+			{
+				entry.retry_debt = entry.retry_debt.saturating_add(1);
+				entry.owner_lease_expires_at_ms = 0;
+			}
+			CtasSagaMutation::Claim {
+				expected_owner_epoch,
+				new_owner_epoch,
+				lease_expires_at_ms,
+				..
+			} if expected_owner_epoch == entry.owner_epoch => {
+				entry.owner_epoch = new_owner_epoch;
+				entry.owner_lease_expires_at_ms = lease_expires_at_ms;
+			}
+			_ => {
+				return Err(CatalogError::AdminFailed {
+					message: "CTAS saga transition rejected: invalid_transition".to_string(),
+				});
+			}
+		}
+		inner
+			.ctas_sagas
+			.insert((self.tenant_id, operation_id), entry.clone());
+		Ok(entry)
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		operation_id: CtasOperationId,
+	) -> Result<Option<CtasSagaEntry>, CatalogError> {
+		Ok(self
+			.inner
+			.read()
+			.expect("MockCatalog lock poisoned")
+			.ctas_sagas
+			.get(&(self.tenant_id, operation_id))
+			.cloned())
+	}
+
+	async fn resolve_ctas_object(
+		&self,
+		table_object_id: TableObjectId,
+	) -> Result<TableBinding, CatalogError> {
+		let inner = self.inner.read().expect("MockCatalog lock poisoned");
+		inner
+			.by_id
+			.iter()
+			.find_map(|((tenant_id, _), binding)| {
+				(*tenant_id == self.tenant_id && binding.table == table_object_id)
+					.then(|| binding.clone())
+			})
+			.or_else(|| {
+				inner
+					.provisional
+					.iter()
+					.find_map(|((tenant_id, _), (binding, _))| {
+						(*tenant_id == self.tenant_id && binding.table == table_object_id)
+							.then(|| binding.clone())
+					})
+			})
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: format!("{table_object_id:?}"),
+			})
+	}
+
+	fn descriptor_for_ctas_binding(
+		&self,
+		binding: &TableBinding,
+	) -> Result<wendelon_client::TableSchemaDescriptor, CatalogError> {
+		self.inner
+			.read()
+			.expect("MockCatalog lock poisoned")
+			.descriptors
+			.get(&(self.tenant_id, binding.local_table_id))
+			.cloned()
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: format!("{:?}", binding.local_table_id),
+			})
 	}
 
 	async fn create_table_with_outcome(
@@ -1943,6 +2370,8 @@ struct WendelonDescriptorState {
 	by_ref: HashMap<(TenantId, TableRef), TableId>,
 	by_id: HashMap<(TenantId, TableId), TableBinding>,
 	descriptors: HashMap<(TenantId, TableId), wendelon_client::TableSchemaDescriptor>,
+	provisional:
+		HashMap<(TenantId, TableId), (TableBinding, wendelon_client::TableSchemaDescriptor)>,
 	logical_types: HashMap<TenantId, LogicalTypeRegistry>,
 	finalized_drops: HashMap<(TenantId, TableId), DropOperationId>,
 	next_table_id: u64,
@@ -1954,6 +2383,7 @@ impl Default for WendelonDescriptorState {
 			by_ref: HashMap::new(),
 			by_id: HashMap::new(),
 			descriptors: HashMap::new(),
+			provisional: HashMap::new(),
 			logical_types: HashMap::new(),
 			finalized_drops: HashMap::new(),
 			next_table_id: 1,
@@ -2424,6 +2854,36 @@ impl WendelonDescriptorRegistry {
 			})
 	}
 
+	fn resolve_ctas_object(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> Result<TableBinding, CatalogError> {
+		let state = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		state
+			.by_id
+			.iter()
+			.find_map(|((entry_tenant, _), binding)| {
+				(*entry_tenant == tenant_id && binding.table == table_object_id)
+					.then(|| binding.clone())
+			})
+			.or_else(|| {
+				state
+					.provisional
+					.iter()
+					.find_map(|((entry_tenant, _), (binding, _))| {
+						(*entry_tenant == tenant_id && binding.table == table_object_id)
+							.then(|| binding.clone())
+					})
+			})
+			.ok_or_else(|| CatalogError::TableNotFound {
+				table: format!("{table_object_id:?}"),
+			})
+	}
+
 	pub fn descriptor(
 		&self,
 		tenant_id: TenantId,
@@ -2437,6 +2897,12 @@ impl WendelonDescriptorRegistry {
 			.descriptors
 			.get(&(tenant_id, table))
 			.cloned()
+			.or_else(|| {
+				state
+					.provisional
+					.get(&(tenant_id, table))
+					.map(|(_, descriptor)| descriptor.clone())
+			})
 			.ok_or(StorageError::TableNotFound { table })
 	}
 
@@ -2472,6 +2938,7 @@ impl WendelonDescriptorRegistry {
 		while state
 			.by_id
 			.keys()
+			.chain(state.provisional.keys())
 			.any(|(_, table_id)| *table_id == TableId(state.next_table_id))
 		{
 			state.next_table_id = state
@@ -2485,6 +2952,146 @@ impl WendelonDescriptorRegistry {
 			.checked_add(1)
 			.expect("TableId overflow");
 		table_id
+	}
+
+	fn install_ctas_provisional(
+		&self,
+		tenant_id: TenantId,
+		descriptor: wendelon_client::TableSchemaDescriptor,
+	) -> Result<TableBinding, CatalogError> {
+		if let Ok(binding) = self.resolve_ctas_object(tenant_id, descriptor.table_object_id) {
+			return Ok(binding);
+		}
+		if let Some(binding) = self
+			.inner
+			.read()
+			.expect("WendelonDescriptorRegistry lock poisoned")
+			.provisional
+			.values()
+			.find_map(|(binding, _)| {
+				(binding.table == descriptor.table_object_id).then(|| binding.clone())
+			}) {
+			return Ok(binding);
+		}
+		let table_id = self.allocate_table_id();
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let logical_types = state
+			.logical_types
+			.get(&tenant_id)
+			.cloned()
+			.unwrap_or_default();
+		let binding = TableBinding::from_descriptor_with_logical_types(
+			table_id,
+			&descriptor,
+			LogicalTypeResolver::with_registry(&logical_types),
+		)?;
+		state
+			.provisional
+			.insert((tenant_id, table_id), (binding.clone(), descriptor));
+		Ok(binding)
+	}
+
+	fn publish_ctas_provisional(
+		&self,
+		tenant_id: TenantId,
+		name: &TableRef,
+		table_object_id: TableObjectId,
+	) -> Result<(TableBinding, Option<TableBinding>), CatalogError> {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let key = state
+			.provisional
+			.iter()
+			.find_map(|(key, (binding, _))| {
+				(key.0 == tenant_id && binding.table == table_object_id).then_some(*key)
+			})
+			.ok_or_else(|| CatalogError::AdminFailed {
+				message: "published CTAS provisional descriptor is absent locally".to_string(),
+			})?;
+		let (binding, descriptor) = state
+			.provisional
+			.remove(&key)
+			.expect("provisional key selected above");
+		let prior = state
+			.by_ref
+			.get(&(tenant_id, name.clone()))
+			.and_then(|table_id| state.by_id.get(&(tenant_id, *table_id)))
+			.cloned();
+		state.by_id.insert(key, binding.clone());
+		state.descriptors.insert(key, descriptor);
+		state.by_ref.insert((tenant_id, name.clone()), key.1);
+		if name.schema.is_some() {
+			state
+				.by_ref
+				.insert((tenant_id, TableRef::new(name.table.clone())), key.1);
+		}
+		Ok((binding, prior))
+	}
+
+	fn install_ctas_retired(
+		&self,
+		tenant_id: TenantId,
+		descriptor: wendelon_client::TableSchemaDescriptor,
+	) -> Result<TableBinding, CatalogError> {
+		if let Ok(binding) = self.resolve_ctas_object(tenant_id, descriptor.table_object_id) {
+			return Ok(binding);
+		}
+		let table_id = self.allocate_table_id();
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let logical_types = state
+			.logical_types
+			.get(&tenant_id)
+			.cloned()
+			.unwrap_or_default();
+		let binding = TableBinding::from_descriptor_with_logical_types(
+			table_id,
+			&descriptor,
+			LogicalTypeResolver::with_registry(&logical_types),
+		)?;
+		state.by_id.insert((tenant_id, table_id), binding.clone());
+		state.descriptors.insert((tenant_id, table_id), descriptor);
+		Ok(binding)
+	}
+
+	fn discard_ctas_provisional(&self, tenant_id: TenantId, table_object_id: TableObjectId) {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		state.provisional.retain(|(entry_tenant, _), (binding, _)| {
+			*entry_tenant != tenant_id || binding.table != table_object_id
+		});
+	}
+
+	fn retire_ctas_object(&self, tenant_id: TenantId, table_object_id: TableObjectId) {
+		let mut state = self
+			.inner
+			.write()
+			.expect("WendelonDescriptorRegistry lock poisoned");
+		let retired_ids = state
+			.by_id
+			.iter()
+			.filter_map(|((entry_tenant, table_id), binding)| {
+				(*entry_tenant == tenant_id && binding.table == table_object_id)
+					.then_some(*table_id)
+			})
+			.collect::<Vec<_>>();
+		for table_id in &retired_ids {
+			state.by_id.remove(&(tenant_id, *table_id));
+			state.descriptors.remove(&(tenant_id, *table_id));
+			state.provisional.remove(&(tenant_id, *table_id));
+		}
+		state.by_ref.retain(|(entry_tenant, _), table_id| {
+			*entry_tenant != tenant_id || !retired_ids.contains(table_id)
+		});
 	}
 
 	fn insert_descriptor(
@@ -3038,6 +3645,208 @@ impl Catalog for WendelonCatalog {
 		Ok(invalidated)
 	}
 
+	async fn provision_ctas(
+		&self,
+		request: CtasProvisionRequest,
+	) -> Result<CtasProvisionOutcome, CatalogError> {
+		let client = self
+			.client
+			.as_ref()
+			.ok_or_else(|| CatalogError::AdminFailed {
+				message:
+					"CTAS staged publication requires a configured Wendelon catalog admin client"
+						.to_string(),
+			})?;
+		let table_object_id = TableObjectId::new(*Uuid::new_v4().as_bytes());
+		let row_identity_policy = create_table_row_identity_policy(
+			&request.name,
+			request.schema.as_ref(),
+			&request.row_identity,
+		)?;
+		let descriptor = TableSchemaDescriptor::new_with_layout(
+			table_object_id,
+			1,
+			request.name.schema.as_deref().unwrap_or("default"),
+			&request.name.table,
+			request.schema.as_ref(),
+			row_identity_policy,
+			LocalityPolicy::default_table_spread(),
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default()),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.map_err(|error| CatalogError::FingerprintResolution {
+			message: error.to_string(),
+		})?;
+		let response = client
+			.mutate_ctas_saga(CtasSagaMutation::Provision {
+				tenant_id: wendelon_tenant_id(self.tenant_id),
+				operation_id: request.operation_id,
+				intent_fingerprint: request.intent_fingerprint,
+				descriptor,
+				expected_binding: request.expected_binding,
+				prior_descriptor: request.prior_descriptor,
+				row_write_id: request.row_write_id,
+				owner_epoch: request.owner_epoch,
+				observed_now_ms: request.observed_now_ms,
+				owner_lease_expires_at_ms: request.owner_lease_expires_at_ms,
+			})
+			.await
+			.map_err(|error| CatalogError::AdminFailed {
+				message: format!("provision CTAS saga: {error}"),
+			})?;
+		let entry = match response {
+			CtasSagaResponse::Applied(entry) => entry,
+			CtasSagaResponse::Rejected(reject) => {
+				return Err(map_ctas_saga_reject("CTAS provision", reject));
+			}
+		};
+		let binding = self
+			.registry
+			.install_ctas_provisional(self.tenant_id, entry.descriptor.clone())?;
+		Ok(CtasProvisionOutcome { entry, binding })
+	}
+
+	async fn mutate_ctas_saga(
+		&self,
+		mutation: CtasSagaMutation,
+	) -> Result<CtasSagaEntry, CatalogError> {
+		let client = self
+			.client
+			.as_ref()
+			.ok_or_else(|| CatalogError::AdminFailed {
+				message:
+					"CTAS staged publication requires a configured Wendelon catalog admin client"
+						.to_string(),
+			})?;
+		let publishing = matches!(mutation, CtasSagaMutation::Publish { .. });
+		let completing = matches!(mutation, CtasSagaMutation::Complete { .. });
+		let discarding = matches!(
+			mutation,
+			CtasSagaMutation::Reclaim { .. } | CtasSagaMutation::RecordPublicationConflict { .. }
+		);
+		let response =
+			client
+				.mutate_ctas_saga(mutation)
+				.await
+				.map_err(|error| CatalogError::AdminFailed {
+					message: format!("mutate CTAS saga: {error}"),
+				})?;
+		let entry = match response {
+			CtasSagaResponse::Applied(entry) => entry,
+			CtasSagaResponse::Rejected(reject) => {
+				return Err(map_ctas_saga_reject("CTAS saga transition", reject));
+			}
+		};
+		if publishing {
+			let name =
+				TableRef::with_schema(&entry.descriptor.namespace, &entry.descriptor.table_name);
+			let _ = self.registry.publish_ctas_provisional(
+				self.tenant_id,
+				&name,
+				entry.descriptor.table_object_id,
+			)?;
+		} else if discarding {
+			self.registry
+				.discard_ctas_provisional(self.tenant_id, entry.descriptor.table_object_id);
+		}
+		if completing
+			&& let CtasExpectedBinding::Bound {
+				table_object_id, ..
+			} = entry.expected_binding
+		{
+			self.registry
+				.retire_ctas_object(self.tenant_id, table_object_id);
+		}
+		Ok(entry)
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		operation_id: CtasOperationId,
+	) -> Result<Option<CtasSagaEntry>, CatalogError> {
+		let client = self
+			.client
+			.as_ref()
+			.ok_or_else(|| CatalogError::AdminFailed {
+				message: "CTAS saga resolution requires a configured Wendelon catalog admin client"
+					.to_string(),
+			})?;
+		let entry = match client
+			.resolve_ctas_saga(wendelon_tenant_id(self.tenant_id), operation_id)
+			.await
+			.map_err(|error| CatalogError::AdminFailed {
+				message: format!("resolve CTAS saga: {error}"),
+			})? {
+			CtasSagaResponse::Applied(entry) => entry,
+			CtasSagaResponse::Rejected(wendelon_client::CtasSagaReject::NotFound) => {
+				return Ok(None);
+			}
+			CtasSagaResponse::Rejected(reject) => {
+				return Err(CatalogError::AdminFailed {
+					message: format!("resolve CTAS saga rejected: {}", reject.code()),
+				});
+			}
+		};
+		match entry.phase {
+			CtasSagaPhase::Provisioned
+			| CtasSagaPhase::RowDispatched
+			| CtasSagaPhase::RowsCommitted { .. } => {
+				let _ = self
+					.registry
+					.install_ctas_provisional(self.tenant_id, entry.descriptor.clone())?;
+			}
+			CtasSagaPhase::Published | CtasSagaPhase::RetiringOld | CtasSagaPhase::Complete => {
+				let binding = self
+					.registry
+					.install_ctas_provisional(self.tenant_id, entry.descriptor.clone())?;
+				let name = TableRef::with_schema(
+					&entry.descriptor.namespace,
+					&entry.descriptor.table_name,
+				);
+				if self
+					.registry
+					.try_resolve_table(self.tenant_id, &name)
+					.is_none_or(|current| current.table != binding.table)
+				{
+					let _ = self.registry.publish_ctas_provisional(
+						self.tenant_id,
+						&name,
+						entry.descriptor.table_object_id,
+					)?;
+				}
+			}
+			CtasSagaPhase::Conflict | CtasSagaPhase::Reclaimed => {
+				self.registry
+					.discard_ctas_provisional(self.tenant_id, entry.descriptor.table_object_id);
+			}
+		}
+		if matches!(
+			entry.phase,
+			CtasSagaPhase::Published | CtasSagaPhase::RetiringOld
+		) && let Some(prior) = entry.prior_descriptor.clone()
+		{
+			let _ = self.registry.install_ctas_retired(self.tenant_id, prior)?;
+		}
+		Ok(Some(entry))
+	}
+
+	async fn resolve_ctas_object(
+		&self,
+		table_object_id: TableObjectId,
+	) -> Result<TableBinding, CatalogError> {
+		self.registry
+			.resolve_ctas_object(self.tenant_id, table_object_id)
+	}
+
+	fn descriptor_for_ctas_binding(
+		&self,
+		binding: &TableBinding,
+	) -> Result<wendelon_client::TableSchemaDescriptor, CatalogError> {
+		self.registry
+			.descriptor(self.tenant_id, binding.local_table_id)
+			.map_err(CatalogError::Storage)
+	}
+
 	async fn create_table_with_outcome(
 		&self,
 		name: &TableRef,
@@ -3207,6 +4016,15 @@ fn canonical_table_ref(table: &TableRef) -> TableRef {
 fn descriptor_sync_resource_exhausted() -> CatalogError {
 	CatalogError::ResourceExhausted {
 		message: "tenant descriptor sync limit exhausted".to_string(),
+	}
+}
+
+fn map_ctas_saga_reject(context: &str, reject: wendelon_client::CtasSagaReject) -> CatalogError {
+	let message = format!("{context} rejected: {}", reject.code());
+	if reject == wendelon_client::CtasSagaReject::CapacityExhausted {
+		CatalogError::ResourceExhausted { message }
+	} else {
+		CatalogError::AdminFailed { message }
 	}
 }
 
@@ -3443,6 +4261,20 @@ mod tests {
 		TableObjectId, TableSchemaDescriptor,
 	};
 	use wendelon_client::LogicalTypePhysical;
+
+	#[test]
+	fn adr548_saga_capacity_rejection_reaches_the_typed_resource_exhausted_surface() {
+		let error = map_ctas_saga_reject(
+			"CTAS provision",
+			wendelon_client::CtasSagaReject::CapacityExhausted,
+		);
+		assert!(matches!(error, CatalogError::ResourceExhausted { .. }));
+		let error = map_ctas_saga_reject(
+			"CTAS provision",
+			wendelon_client::CtasSagaReject::BindingChanged,
+		);
+		assert!(matches!(error, CatalogError::AdminFailed { .. }));
+	}
 
 	struct FakeDescriptorSyncClient {
 		responses: tokio::sync::Mutex<VecDeque<Result<Option<TableSchemaDescriptor>, ClientError>>>,

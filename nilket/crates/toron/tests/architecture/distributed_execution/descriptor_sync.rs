@@ -601,11 +601,14 @@ pub(crate) fn adr053_descriptor_evolved_does_not_add_direct_sync_path() {
 		.last()
 		.expect("QueryCoordinator::execute_query")
 		.1;
-	let write_helper = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan(")
-		.into_iter()
-		.next()
-		.expect("execute_write_plan")
-		.1;
+	let write_helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn execute_write_plan_with_operation_id(",
+	)
+	.into_iter()
+	.next()
+	.expect("execute_write_plan")
+	.1;
 
 	assert!(storage.contains("StorageError::DescriptorEvolved"));
 	assert!(select_loop.contains("invalidate_descriptor_evolution(catalog.as_ref(), &error)"));
@@ -787,11 +790,14 @@ pub(crate) fn adr054_invalidation_is_path_agnostic_select_write_delete() {
 pub(crate) fn adr054_writes_invalidate_but_do_not_retry() {
 	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
 		.expect("read coordinator");
-	let write_helper = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan(")
-		.into_iter()
-		.next()
-		.expect("execute_write_plan")
-		.1;
+	let write_helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn execute_write_plan_with_operation_id(",
+	)
+	.into_iter()
+	.next()
+	.expect("execute_write_plan")
+	.1;
 
 	assert!(write_helper.contains("invalidate_descriptor_evolution_on_error"));
 	assert!(!write_helper.contains("loop"));

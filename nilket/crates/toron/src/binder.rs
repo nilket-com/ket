@@ -8,6 +8,7 @@ use std::sync::atomic::AtomicU64;
 use crate::date32::parse_date_ymd;
 use arrow::array::{Array, BooleanArray};
 use arrow::datatypes::{DataType, Field, IntervalUnit, Schema, SchemaRef, TimeUnit};
+use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteOptions};
 use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use chrono_tz::Tz;
 
@@ -1987,6 +1988,7 @@ impl<'a> Binder<'a> {
 				)),
 				LogicalPlan::CreateTableAsSelect {
 					table,
+					intent_request,
 					if_not_exists,
 					or_replace,
 					source,
@@ -1994,6 +1996,7 @@ impl<'a> Binder<'a> {
 					let plan = self
 						.bind_create_table_as_select(
 							table,
+							intent_request,
 							*if_not_exists,
 							*or_replace,
 							source,
@@ -2341,6 +2344,7 @@ impl<'a> Binder<'a> {
 	async fn bind_create_table_as_select(
 		&self,
 		table: &TableRef,
+		intent_request: &str,
 		if_not_exists: bool,
 		or_replace: bool,
 		source: &LogicalPlan,
@@ -2355,10 +2359,18 @@ impl<'a> Binder<'a> {
 		let source = source.plan;
 		let source_schema = source.schema();
 		let schema = infer_ctas_schema(&source_schema)?;
+		let intent_fingerprint = ctas_intent_fingerprint(
+			table,
+			intent_request,
+			&schema,
+			&self.config.session_timezone,
+			self.config.allow_experimental_kernels,
+		);
 
 		Ok(ExecutionPlan::CreateTableAsSelect {
 			table: table.clone(),
 			schema,
+			intent_fingerprint,
 			if_not_exists,
 			or_replace,
 			source: Box::new(source),
@@ -3713,6 +3725,38 @@ fn infer_ctas_schema(source_schema: &SchemaRef) -> Result<SchemaRef, BindingErro
 	Ok(Arc::new(Schema::new(fields)))
 }
 
+fn ctas_intent_fingerprint(
+	table: &TableRef,
+	request_shape: &str,
+	result_schema: &SchemaRef,
+	session_timezone: &str,
+	allow_experimental_kernels: bool,
+) -> wendelon_client::CtasIntentFingerprint {
+	fn field(hasher: &mut blake3::Hasher, bytes: &[u8]) {
+		hasher.update(&(bytes.len() as u64).to_be_bytes());
+		hasher.update(bytes);
+	}
+	let mut hasher = blake3::Hasher::new();
+	hasher.update(b"toron.ctas.intent.v1\0");
+	field(
+		&mut hasher,
+		table.schema.as_deref().unwrap_or("default").as_bytes(),
+	);
+	field(&mut hasher, table.table.as_bytes());
+	field(&mut hasher, request_shape.as_bytes());
+	let encoded_schema = IpcDataGenerator {}
+		.schema_to_bytes_with_dictionary_tracker(
+			result_schema,
+			&mut DictionaryTracker::new(false),
+			&IpcWriteOptions::default(),
+		)
+		.ipc_message;
+	field(&mut hasher, &encoded_schema);
+	field(&mut hasher, session_timezone.as_bytes());
+	hasher.update(&[u8::from(allow_experimental_kernels)]);
+	wendelon_client::CtasIntentFingerprint::new(*hasher.finalize().as_bytes())
+}
+
 fn validate_ctas_column_name(name: &str) -> Result<(), BindingError> {
 	if name.is_empty() {
 		return Err(BindingError::UnsupportedExpression {
@@ -4516,6 +4560,7 @@ fn optimize_for_required(
 		ExecutionPlan::CreateTableAsSelect {
 			table,
 			schema,
+			intent_fingerprint,
 			if_not_exists,
 			or_replace,
 			source,
@@ -4525,6 +4570,7 @@ fn optimize_for_required(
 				ExecutionPlan::CreateTableAsSelect {
 					table,
 					schema,
+					intent_fingerprint,
 					if_not_exists,
 					or_replace,
 					source: Box::new(source),

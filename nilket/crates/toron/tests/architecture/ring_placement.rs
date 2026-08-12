@@ -263,13 +263,11 @@ pub(crate) fn adr041_only_explicit_drop_reaches_the_storage_admin_drop() {
 		.and_then(|rest| rest.split("other =>").next())
 		.expect("DropTable arm");
 
-	assert_eq!(coordinator.matches("DropTableStorageRequest {").count(), 1);
+	assert_eq!(coordinator.matches("DropTableStorageRequest {").count(), 2);
 	assert!(helper.contains("DropTableStorageRequest {"));
-	// Destructive OR REPLACE is withdrawn until staged publication exists, so the
-	// create arm no longer reaches the drop helper. Explicit DROP is its only
-	// caller: replacement used to destroy the target before its replacement
-	// existed, and a preflight absence check could not close that window because
-	// the helper resolves the name again.
+	// No replacement path calls the name-resolving helper. ADR 548 funnels both
+	// post-CAS retirement and lost-CAS cleanup through one object-identified drop
+	// helper, only after the ledger proves which object the saga owns.
 	assert!(!create_arm.contains("drop_existing_table_with_storage_admin"));
 	assert!(create_arm.contains("refuse_destructive_or_replace"));
 	assert!(drop_arm.contains("drop_existing_table_with_storage_admin"));
@@ -293,19 +291,25 @@ pub(crate) fn adr041_ctas_replace_refuses_before_materializing_source() {
 	let source = ctas_arm
 		.find("source_executor.execute_read_plan(source)")
 		.expect("source materialization");
-	let refuse = ctas_arm
-		.find("refuse_destructive_or_replace")
-		.expect("destructive-replace refusal");
-	let create = ctas_arm
-		.find("create_table_with_outcome")
-		.expect("catalog create");
-
-	// The refusal precedes source execution: an existing target must not pay for
-	// a materialized source query before learning the replacement is refused.
-	assert!(refuse < source);
-	// Source still materializes before the catalog create, so a source failure
-	// cannot leave a created-but-unpopulated table.
-	assert!(source < create);
+	let validate = ctas_arm
+		.find("validate_refined_logical_columns(\"CTAS\"")
+		.expect("value validation");
+	let provision = ctas_arm.find(".provision_ctas(").expect("saga provision");
+	let dispatch = ctas_arm
+		.find("CtasSagaMutation::MarkRowDispatched")
+		.expect("durable row dispatch boundary");
+	let finish =
+		brace_blocks_after_marker(&coordinator, "async fn finish_ctas_after_rows_committed")
+			.into_iter()
+			.next()
+			.expect("staged publication helper")
+			.1;
+	// Source/materialization/validation leave no provisional object on failure.
+	assert!(source < validate);
+	assert!(validate < provision);
+	assert!(provision < dispatch);
+	assert!(finish.contains("CtasSagaMutation::Publish"));
+	assert!(finish.contains("CtasSagaMutation::MarkRetiringOld"));
 	assert!(!ctas_arm.contains("drop_existing_table_with_storage_admin"));
 }
 
@@ -893,26 +897,31 @@ pub(crate) fn adr041_replace_refuses_before_any_catalog_mutation() {
 
 	assert!(helper.contains(") -> Result<bool, QueryError>"));
 	assert!(!helper.contains("Result<Option<TableBinding>"));
-	for arm in [
-		create
-			.split("ExecutionPlan::CreateTable")
-			.nth(1)
-			.and_then(|rest| rest.split("ExecutionPlan::DropTable").next())
-			.expect("CreateTable arm"),
-		write
-			.split("ExecutionPlan::CreateTableAsSelect")
-			.nth(1)
-			.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
-			.expect("CTAS arm"),
-	] {
-		let refuse = arm
-			.find("refuse_destructive_or_replace")
-			.expect("destructive-replace refusal");
-		let create = arm.find(".create_table").expect("fresh create");
-		// Replacement no longer drops and recreates; the refusal is evaluated
-		// before any catalog mutation, and a concurrent create surfaces from the
-		// create call as an existence error rather than destroying the winner.
-		assert!(refuse < create);
-		assert!(!arm.contains("drop_existing_table_with_storage_admin"));
-	}
+	let create_arm = create
+		.split("ExecutionPlan::CreateTable")
+		.nth(1)
+		.and_then(|rest| rest.split("ExecutionPlan::DropTable").next())
+		.expect("CreateTable arm");
+	let refuse = create_arm
+		.find("refuse_destructive_or_replace")
+		.expect("plain CREATE destructive-replace refusal");
+	let fresh_create = create_arm.find(".create_table").expect("fresh create");
+	assert!(refuse < fresh_create);
+	assert!(!create_arm.contains("drop_existing_table_with_storage_admin"));
+
+	let ctas = write
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
+		.expect("CTAS arm");
+	let finish =
+		brace_blocks_after_marker(&coordinator, "async fn finish_ctas_after_rows_committed")
+			.into_iter()
+			.next()
+			.expect("staged publication helper")
+			.1;
+	assert!(finish.contains("CtasSagaMutation::Publish"));
+	assert!(finish.contains("CtasSagaMutation::MarkRetiringOld"));
+	assert!(!ctas.contains("refuse_destructive_or_replace"));
+	assert!(!ctas.contains("drop_existing_table_with_storage_admin"));
 }

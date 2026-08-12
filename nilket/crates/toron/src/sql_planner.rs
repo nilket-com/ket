@@ -3288,6 +3288,7 @@ impl SqlPlanner {
 		let source = self.lower_query(query)?;
 		Ok(LogicalPlan::CreateTableAsSelect {
 			table,
+			intent_request: create_table.to_string(),
 			if_not_exists: *if_not_exists,
 			or_replace: *or_replace,
 			source: Box::new(source),

@@ -42,7 +42,8 @@ use crate::network::transport::{
 use crate::network::wire;
 use crate::schema::table::{decode_descriptor_wire_name, encode_table_schema_descriptors};
 use crate::schema::{
-	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, FrameHeader, HybridTimestamp,
+	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, CTAS_SAGA_REJECT_PREFIX, CtasOperationId,
+	CtasSagaMutation, CtasSagaReject, CtasSagaResponse, FrameHeader, HybridTimestamp,
 	LeaseDescriptor, LeaseStatus, LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta,
 	LogicalTypeListRequestMeta, LogicalTypeListResponseMeta, MsgType, NodeId, PolicyGeneration,
 	ProtocolVersionWindow, ReleaseLeaseRequestMeta, ReleaseLeaseResponseMeta,
@@ -166,6 +167,37 @@ pub struct SchemaUpdateResponseWire {
 	pub leader_hint: Option<u32>,
 	#[serde(default)]
 	pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtasSagaRequestWire {
+	Mutate(CtasSagaMutation),
+	Resolve {
+		tenant_id: TenantId,
+		operation_id: CtasOperationId,
+	},
+}
+
+impl CtasSagaRequestWire {
+	pub const fn tenant_id(&self) -> TenantId {
+		match self {
+			Self::Mutate(mutation) => mutation.tenant_id(),
+			Self::Resolve { tenant_id, .. } => *tenant_id,
+		}
+	}
+
+	pub const fn operation_id(&self) -> CtasOperationId {
+		match self {
+			Self::Mutate(mutation) => mutation.operation_id(),
+			Self::Resolve { operation_id, .. } => *operation_id,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtasSagaResponseWire {
+	pub response: CtasSagaResponse,
+	pub leader_hint: Option<u32>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -536,6 +568,128 @@ impl WendelonControlServer {
 			arrow_payload: None,
 			trailing: None,
 		})
+	}
+
+	fn build_ctas_saga_frame(
+		&self,
+		stream_id: u32,
+		response: &CtasSagaResponseWire,
+	) -> std::io::Result<HrftFrame> {
+		let meta = wire::encode_into(&self.pool, response)?;
+		Ok(HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::CTAS_SAGA_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		})
+	}
+
+	async fn handle_ctas_saga(
+		&self,
+		context: &RequestContext,
+		frame: HrftFrame,
+	) -> std::io::Result<HrftFrame> {
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"CTAS_SAGA_REQ must not carry Arrow or trailing payloads",
+			));
+		}
+		let request: CtasSagaRequestWire = wire::decode(&frame.meta)?;
+		// CTAS is driven by Toron's authenticated node-to-node catalog adapter in
+		// production, while administrative clients use the tenant mutation role.
+		// Requiring only the latter silently closed the simulated (and node-cert)
+		// transport with no response, which surfaced to callers as `early eof`.
+		if context.actor.role == ActorRole::DataNode {
+			authorize_actor(&context.actor, ActorPermission::InterNodeTransport)?;
+		} else {
+			authorize_actor(&context.actor, ActorPermission::TenantAdminMutation)?;
+		}
+		if let Some(claimed_tenant) = context.actor.claimed_tenant_id()?
+			&& claimed_tenant != request.tenant_id()
+		{
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				format!(
+					"actor tenant {} cannot access CTAS saga for tenant {}",
+					claimed_tenant.get(),
+					request.tenant_id().get()
+				),
+			));
+		}
+		if !self.is_leader().await {
+			return self.build_ctas_saga_frame(
+				frame.header.stream_id,
+				&CtasSagaResponseWire {
+					response: CtasSagaResponse::Rejected(CtasSagaReject::StaleOwner),
+					leader_hint: self.leader_hint().await,
+				},
+			);
+		}
+
+		let tenant_id = request.tenant_id();
+		let operation_id = request.operation_id();
+		let response = match request {
+			CtasSagaRequestWire::Resolve { .. } => self
+				.state_machine
+				.state_snapshot()
+				.await
+				.ctas_sagas
+				.get(tenant_id, operation_id)
+				.cloned()
+				.map_or(
+					CtasSagaResponse::Rejected(CtasSagaReject::NotFound),
+					CtasSagaResponse::Applied,
+				),
+			CtasSagaRequestWire::Mutate(mutation) => match self
+				.raft
+				.client_write(WendelonRequest::CtasSaga(mutation))
+				.await
+			{
+				Ok(response) => match response.data {
+					WendelonResponse::Success => self
+						.state_machine
+						.state_snapshot()
+						.await
+						.ctas_sagas
+						.get(tenant_id, operation_id)
+						.cloned()
+						.map_or(
+							CtasSagaResponse::Rejected(CtasSagaReject::NotFound),
+							CtasSagaResponse::Applied,
+						),
+					WendelonResponse::Error(message) => message
+						.strip_prefix(CTAS_SAGA_REJECT_PREFIX)
+						.and_then(CtasSagaReject::from_code)
+						.map_or(
+							CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition),
+							CtasSagaResponse::Rejected,
+						),
+					WendelonResponse::LeaseDenied => {
+						CtasSagaResponse::Rejected(CtasSagaReject::StaleOwner)
+					}
+				},
+				Err(error) => {
+					return Err(Error::other(format!("submit CTAS saga mutation: {error}")));
+				}
+			},
+		};
+		self.build_ctas_saga_frame(
+			frame.header.stream_id,
+			&CtasSagaResponseWire {
+				response,
+				leader_hint: Some(self.local_node.id),
+			},
+		)
 	}
 
 	fn build_secondary_index_status_frame(
@@ -1671,7 +1825,14 @@ impl WendelonControlServer {
 		actor: &ActorIdentity,
 		tenant_id: TenantId,
 	) -> std::io::Result<()> {
-		authorize_actor(actor, ActorPermission::TenantAdminRead)?;
+		// Descriptor and logical-type synchronization is an authenticated
+		// node-to-node read for Toron, while external readers use the tenant-admin
+		// surface. A node certificate intentionally carries no tenant claim.
+		if actor.role == ActorRole::DataNode {
+			authorize_actor(actor, ActorPermission::InterNodeTransport)?;
+		} else {
+			authorize_actor(actor, ActorPermission::TenantAdminRead)?;
+		}
 		if let Some(claimed_tenant) = actor.claimed_tenant_id()? {
 			if claimed_tenant != tenant_id {
 				return Err(Error::new(
@@ -2133,13 +2294,19 @@ impl WendelonControlServer {
 				),
 			});
 		}
-		if !snapshot.table_schemas.is_latest_name_bound(
+		let name_is_bound = snapshot.table_schemas.is_latest_name_bound(
 			tenant_id,
 			&descriptor.namespace,
 			&descriptor.table_name,
 			table_object_id,
 			descriptor.schema_generation,
-		) {
+		);
+		let is_ctas_retirement = snapshot.ctas_sagas.retiring_old_binding(
+			tenant_id,
+			table_object_id,
+			expected_generation,
+		);
+		if !name_is_bound && !is_ctas_retirement {
 			return Err(WendelonAdminError::TableAlreadyDropped { table_object_id });
 		}
 		let dependent_indexes = snapshot
@@ -3993,8 +4160,13 @@ impl ControlRingServer for WendelonControlServer {
 				self.handle_join(&context, frame).await?
 			}
 			MsgType::SCHEMA_UPDATE_REQ => self.handle_schema_update(&context, frame).await?,
+			MsgType::CTAS_SAGA_REQ => self.handle_ctas_saga(&context, frame).await?,
 			MsgType::SCHEMA_DROP_REQ => {
-				self.authorize_control_operation(&context, ControlOperation::SchemaDrop)?;
+				if context.actor.role == ActorRole::DataNode {
+					authorize_actor(&context.actor, ActorPermission::InterNodeTransport)?;
+				} else {
+					self.authorize_control_operation(&context, ControlOperation::SchemaDrop)?;
+				}
 				self.handle_schema_drop(&context, frame).await?
 			}
 			MsgType::SECONDARY_INDEX_STATUS_REQ => {

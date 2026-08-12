@@ -982,6 +982,144 @@ async fn handle_sql_connection(
 			stream.finish().await?;
 		}
 		SqlMessage::ResolveMutation(request) => {
+			if let Some(entry) = coordinator
+				.resolve_ctas_outcome(tenant_id, request.operation_query_id)
+				.await
+				.map_err(|error| std::io::Error::other(error.to_string()))?
+			{
+				let (phase, row_count) = match entry.phase {
+					wendelon_client::CtasSagaPhase::Provisioned => {
+						(crate::sql_wire::CtasCompositePhase::Provisioned, None)
+					}
+					wendelon_client::CtasSagaPhase::RowDispatched => (
+						crate::sql_wire::CtasCompositePhase::RowDispatched,
+						entry.row_count,
+					),
+					wendelon_client::CtasSagaPhase::RowsCommitted { row_count } => (
+						crate::sql_wire::CtasCompositePhase::RowsCommitted,
+						Some(row_count),
+					),
+					wendelon_client::CtasSagaPhase::Published => (
+						crate::sql_wire::CtasCompositePhase::Published,
+						entry.row_count,
+					),
+					wendelon_client::CtasSagaPhase::RetiringOld => (
+						crate::sql_wire::CtasCompositePhase::RetiringOld,
+						entry.row_count,
+					),
+					wendelon_client::CtasSagaPhase::Complete => (
+						crate::sql_wire::CtasCompositePhase::Complete,
+						entry.row_count,
+					),
+					wendelon_client::CtasSagaPhase::Conflict => (
+						crate::sql_wire::CtasCompositePhase::Conflict,
+						entry.row_count,
+					),
+					wendelon_client::CtasSagaPhase::Reclaimed => {
+						(crate::sql_wire::CtasCompositePhase::Reclaimed, None)
+					}
+				};
+				let prior_binding = match entry.expected_binding {
+					wendelon_client::CtasExpectedBinding::Absent => None,
+					wendelon_client::CtasExpectedBinding::Bound {
+						table_object_id,
+						schema_generation,
+					} => Some(crate::sql_wire::CtasPriorBinding {
+						table_object_id: *table_object_id.as_bytes(),
+						schema_generation: schema_generation.get(),
+					}),
+				};
+				let terminal_cause = entry.terminal_cause.map(|cause| match cause {
+					wendelon_client::CtasTerminalCause::PublicationConflict => {
+						crate::sql_wire::CtasTerminalCause::PublicationConflict
+					}
+					wendelon_client::CtasTerminalCause::RowKnownNotCommitted => {
+						crate::sql_wire::CtasTerminalCause::RowKnownNotCommitted
+					}
+					wendelon_client::CtasTerminalCause::DeadlineBeforeRowDispatch => {
+						crate::sql_wire::CtasTerminalCause::DeadlineBeforeRowDispatch
+					}
+					wendelon_client::CtasTerminalCause::OwnerAbandonedBeforeRowDispatch => {
+						crate::sql_wire::CtasTerminalCause::OwnerAbandonedBeforeRowDispatch
+					}
+				});
+				let committed = crate::sql_wire::MutationCommitKnowledge::Committed;
+				let known_not_committed =
+					crate::sql_wire::MutationCommitKnowledge::KnownNotCommitted;
+				let indeterminate = crate::sql_wire::MutationCommitKnowledge::Indeterminate;
+				let unspecified = crate::sql_wire::MutationCommitKnowledge::Unspecified;
+				let row_commit_knowledge = match entry.phase {
+					wendelon_client::CtasSagaPhase::Provisioned => known_not_committed,
+					wendelon_client::CtasSagaPhase::RowDispatched => indeterminate,
+					wendelon_client::CtasSagaPhase::RowsCommitted { .. }
+					| wendelon_client::CtasSagaPhase::Published
+					| wendelon_client::CtasSagaPhase::RetiringOld
+					| wendelon_client::CtasSagaPhase::Complete
+					| wendelon_client::CtasSagaPhase::Conflict => committed,
+					wendelon_client::CtasSagaPhase::Reclaimed => known_not_committed,
+				};
+				let publication_commit_knowledge = match entry.phase {
+					wendelon_client::CtasSagaPhase::Published
+					| wendelon_client::CtasSagaPhase::RetiringOld
+					| wendelon_client::CtasSagaPhase::Complete => committed,
+					wendelon_client::CtasSagaPhase::Conflict
+					| wendelon_client::CtasSagaPhase::Reclaimed => known_not_committed,
+					_ => unspecified,
+				};
+				let retirement_commit_knowledge = match entry.phase {
+					wendelon_client::CtasSagaPhase::Complete => committed,
+					wendelon_client::CtasSagaPhase::Published
+					| wendelon_client::CtasSagaPhase::RetiringOld => indeterminate,
+					wendelon_client::CtasSagaPhase::Conflict
+					| wendelon_client::CtasSagaPhase::Reclaimed => known_not_committed,
+					_ => unspecified,
+				};
+				let catalog_cause = match entry.terminal_cause {
+					Some(wendelon_client::CtasTerminalCause::DeadlineBeforeRowDispatch) => {
+						Some(crate::sql_wire::CtasCatalogCause::DeadlineBeforeRowDispatch)
+					}
+					Some(wendelon_client::CtasTerminalCause::OwnerAbandonedBeforeRowDispatch) => {
+						Some(crate::sql_wire::CtasCatalogCause::OwnerAbandonedBeforeRowDispatch)
+					}
+					_ => None,
+				};
+				let row_cause = matches!(
+					entry.terminal_cause,
+					Some(wendelon_client::CtasTerminalCause::RowKnownNotCommitted)
+				)
+				.then_some(crate::sql_wire::CtasRowCause::KnownNotCommitted);
+				let publication_cause = matches!(
+					entry.terminal_cause,
+					Some(wendelon_client::CtasTerminalCause::PublicationConflict)
+				)
+				.then_some(crate::sql_wire::CtasPublicationCause::BindingConflict);
+				let response = SqlFrame::response(
+					frame.query_id,
+					SqlMessage::CtasOutcome(crate::sql_wire::CtasOutcomeResponse {
+						operation_query_id: request.operation_query_id,
+						phase,
+						provisional_table_object_id: *entry.descriptor.table_object_id.as_bytes(),
+						prior_binding,
+						row_count,
+						terminal_cause,
+						catalog_commit_knowledge: committed,
+						catalog_cause,
+						row_commit_knowledge,
+						row_cause,
+						publication_commit_knowledge,
+						publication_cause,
+						retirement_commit_knowledge,
+						retirement_cause: (entry.retry_debt > 0
+							&& entry.phase == wendelon_client::CtasSagaPhase::RetiringOld)
+							.then_some(crate::sql_wire::CtasRetirementCause::RetryDeferred),
+						owner_epoch: entry.owner_epoch,
+						retry_debt: entry.retry_debt,
+					}),
+				);
+				write_sql_frame(&mut stream, &response).await?;
+				stream.finish().await?;
+				return Ok(());
+			}
 			let outcome = match coordinator
 				.resolve_mutation_outcome(tenant_id, request.operation_query_id)
 				.await
@@ -1719,7 +1857,8 @@ async fn handle_sql_connection(
 		| SqlMessage::Error(_)
 		| SqlMessage::RuneError(_)
 		| SqlMessage::Healthy(_)
-		| SqlMessage::MutationOutcome(_) => {
+		| SqlMessage::MutationOutcome(_)
+		| SqlMessage::CtasOutcome(_) => {
 			if !record_sql_audit_required_or_error(
 				&audit,
 				ToronAuditEvent::edge_denial(

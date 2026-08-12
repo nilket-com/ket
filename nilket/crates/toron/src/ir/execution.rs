@@ -364,6 +364,7 @@ pub enum ExecutionPlan {
 	CreateTableAsSelect {
 		table: TableRef,
 		schema: SchemaRef,
+		intent_fingerprint: wendelon_client::CtasIntentFingerprint,
 		if_not_exists: bool,
 		or_replace: bool,
 		source: Box<ExecutionPlan>,

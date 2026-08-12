@@ -319,11 +319,13 @@ impl<'a> Binder<'a> {
 				}),
 				LogicalPlan::CreateTableAsSelect {
 					table,
+					intent_request,
 					if_not_exists,
 					or_replace,
 					source,
 				} => Ok(LogicalPlan::CreateTableAsSelect {
 					table: table.clone(),
+					intent_request: intent_request.clone(),
 					if_not_exists: *if_not_exists,
 					or_replace: *or_replace,
 					source: Box::new(
@@ -606,11 +608,13 @@ impl<'a> Binder<'a> {
 				}
 				LogicalPlan::CreateTableAsSelect {
 					table,
+					intent_request,
 					if_not_exists,
 					or_replace,
 					source,
 				} => Ok(LogicalPlan::CreateTableAsSelect {
 					table: table.clone(),
+					intent_request: intent_request.clone(),
 					if_not_exists: *if_not_exists,
 					or_replace: *or_replace,
 					source: Box::new(self.recognize_cross_equi_joins(source).await?),

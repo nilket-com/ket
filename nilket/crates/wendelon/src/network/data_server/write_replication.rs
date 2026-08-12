@@ -384,7 +384,15 @@ impl WendelonDataServer {
 				let descriptor = state
 					.table_schemas
 					.latest_by_id(meta.tenant_id, meta.table_object_id)
-					.cloned();
+					.cloned()
+					.or_else(|| {
+						let saga = state
+							.ctas_sagas
+							.operation_for_object(meta.tenant_id, meta.table_object_id)?;
+						(saga.row_write_id.canonical_idempotency_bytes()
+							== meta.parent_write_id.canonical_idempotency_bytes())
+						.then(|| saga.descriptor.clone())
+					});
 				let indexes = descriptor
 					.as_ref()
 					.map(|descriptor| {

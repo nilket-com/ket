@@ -137,6 +137,8 @@ pub enum SqlMessage {
 	RuneError(RuneFailure),
 	ResolveMutation(ResolveMutationRequest),
 	MutationOutcome(MutationOutcomeResponse),
+	// Append-only ADR 548 composite CTAS resolution.
+	CtasOutcome(CtasOutcomeResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -312,6 +314,80 @@ pub struct MutationOutcomeResponse {
 	pub commit_knowledge: MutationCommitKnowledge,
 	/// DELETE reports deleted/already-deleted/not-found. Other mutations use None.
 	pub delete_counts: Option<[u32; 3]>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtasCompositePhase {
+	Provisioned,
+	RowDispatched,
+	RowsCommitted,
+	Published,
+	RetiringOld,
+	Complete,
+	Conflict,
+	Reclaimed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtasTerminalCause {
+	PublicationConflict,
+	RowKnownNotCommitted,
+	DeadlineBeforeRowDispatch,
+	OwnerAbandonedBeforeRowDispatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtasPriorBinding {
+	pub table_object_id: [u8; 16],
+	pub schema_generation: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtasCatalogCause {
+	DeadlineBeforeRowDispatch,
+	OwnerAbandonedBeforeRowDispatch,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtasRowCause {
+	KnownNotCommitted,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtasPublicationCause {
+	BindingConflict,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CtasRetirementCause {
+	RetryDeferred,
+}
+
+/// Durable four-phase CTAS outcome: provisioning, rows, publication, retirement.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CtasOutcomeResponse {
+	pub operation_query_id: QueryId,
+	pub phase: CtasCompositePhase,
+	pub provisional_table_object_id: [u8; 16],
+	pub prior_binding: Option<CtasPriorBinding>,
+	pub row_count: Option<u64>,
+	pub terminal_cause: Option<CtasTerminalCause>,
+	pub catalog_commit_knowledge: MutationCommitKnowledge,
+	pub catalog_cause: Option<CtasCatalogCause>,
+	pub row_commit_knowledge: MutationCommitKnowledge,
+	pub row_cause: Option<CtasRowCause>,
+	pub publication_commit_knowledge: MutationCommitKnowledge,
+	pub publication_cause: Option<CtasPublicationCause>,
+	pub retirement_commit_knowledge: MutationCommitKnowledge,
+	pub retirement_cause: Option<CtasRetirementCause>,
+	pub owner_epoch: u64,
+	pub retry_debt: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResolvedOperationOutcome {
+	Mutation(MutationOutcomeResponse),
+	Ctas(CtasOutcomeResponse),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -508,6 +584,38 @@ mod tests {
 		let response_discriminant = postcard::to_allocvec(&response).expect("encode")[0];
 		assert_eq!((request_discriminant, response_discriminant), (9, 10));
 
+		let encoded = postcard::to_allocvec(&response).expect("encode");
+		assert_eq!(
+			postcard::from_bytes::<SqlMessage>(&encoded).unwrap(),
+			response
+		);
+	}
+
+	#[test]
+	fn adr548_composite_ctas_resolution_round_trips_without_renumbering_history() {
+		let operation_query_id = QueryId::from_u128(7);
+		let response = SqlMessage::CtasOutcome(CtasOutcomeResponse {
+			operation_query_id,
+			phase: CtasCompositePhase::RetiringOld,
+			provisional_table_object_id: [0x54; 16],
+			prior_binding: Some(CtasPriorBinding {
+				table_object_id: [0x41; 16],
+				schema_generation: 9,
+			}),
+			row_count: Some(0),
+			terminal_cause: None,
+			catalog_commit_knowledge: MutationCommitKnowledge::Committed,
+			catalog_cause: None,
+			row_commit_knowledge: MutationCommitKnowledge::Committed,
+			row_cause: None,
+			publication_commit_knowledge: MutationCommitKnowledge::Committed,
+			publication_cause: None,
+			retirement_commit_knowledge: MutationCommitKnowledge::Indeterminate,
+			retirement_cause: Some(CtasRetirementCause::RetryDeferred),
+			owner_epoch: 3,
+			retry_debt: 2,
+		});
+		assert_eq!(postcard::to_allocvec(&response).expect("encode")[0], 11);
 		let encoded = postcard::to_allocvec(&response).expect("encode");
 		assert_eq!(
 			postcard::from_bytes::<SqlMessage>(&encoded).unwrap(),

@@ -238,6 +238,25 @@ pub trait StorageScan: Send + Sync {
 pub trait StorageWrite: Send + Sync {
 	async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError>;
 
+	/// Pin row-mutation evidence for a cross-ring CTAS saga. Non-Wendelon test
+	/// storage has no bounded outcome ledger, so the default is intentionally a
+	/// no-op; the production adapter must override both halves of the handoff.
+	async fn pin_mutation_outcome(
+		&self,
+		_tenant_id: TenantId,
+		_operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<(), StorageError> {
+		Ok(())
+	}
+
+	async fn acknowledge_mutation_outcome(
+		&self,
+		_tenant_id: TenantId,
+		_operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<(), StorageError> {
+		Ok(())
+	}
+
 	async fn resolve_mutation(
 		&self,
 		_tenant_id: TenantId,
@@ -1176,6 +1195,35 @@ impl StorageWrite for WendelonStorageWrite {
 				delete_counts: None,
 			},
 		})
+	}
+
+	async fn pin_mutation_outcome(
+		&self,
+		tenant_id: TenantId,
+		operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<(), StorageError> {
+		self.client
+			.pin_table_mutation_outcome(wendelon::schema::TenantId::new(tenant_id.0), operation_id)
+			.await
+			.map_err(|error| StorageError::Internal {
+				message: format!("pin mutation outcome: {error}"),
+			})
+	}
+
+	async fn acknowledge_mutation_outcome(
+		&self,
+		tenant_id: TenantId,
+		operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<(), StorageError> {
+		self.client
+			.acknowledge_table_mutation_outcome(
+				wendelon::schema::TenantId::new(tenant_id.0),
+				operation_id,
+			)
+			.await
+			.map_err(|error| StorageError::Internal {
+				message: format!("acknowledge mutation outcome: {error}"),
+			})
 	}
 }
 

@@ -169,6 +169,8 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::TABLE_DELETE_RESP.0
 				|| x == MsgType::MUTATION_OUTCOME_REQ.0
 				|| x == MsgType::MUTATION_OUTCOME_RESP.0
+				|| x == MsgType::MUTATION_OUTCOME_PIN_REQ.0
+				|| x == MsgType::MUTATION_OUTCOME_PIN_RESP.0
 				|| x == MsgType::AGG_REQ.0
 				|| x == MsgType::AGG_RESP.0
 				|| x == MsgType::COUNTER_ADD_REQ.0
@@ -275,6 +277,7 @@ fn is_control_extension_request(msg_type: u8) -> bool {
 		MsgType::TABLE_DESCRIPTOR_LIST_REQ,
 		MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
 		MsgType::SECONDARY_INDEX_STATUS_REQ,
+		MsgType::CTAS_SAGA_REQ,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -291,6 +294,7 @@ fn is_extension_response(msg_type: u8) -> bool {
 		MsgType::TABLE_DESCRIPTOR_LIST_RESP,
 		MsgType::TABLE_OPTIMIZER_FACTS_GET_RESP,
 		MsgType::SECONDARY_INDEX_STATUS_RESP,
+		MsgType::CTAS_SAGA_RESP,
 	]
 	.iter()
 	.any(|candidate| candidate.0 == msg_type)
@@ -320,6 +324,7 @@ const ACTOR_AUTHORIZED_CONTROL_REQUESTS: &[MsgType] = &[
 	MsgType::TABLE_DESCRIPTOR_LIST_REQ,
 	MsgType::TABLE_OPTIMIZER_FACTS_GET_REQ,
 	MsgType::SECONDARY_INDEX_STATUS_REQ,
+	MsgType::CTAS_SAGA_REQ,
 ];
 
 fn ingress_requirement(msg_type: MsgType) -> Option<IngressRequirement> {

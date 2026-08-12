@@ -755,6 +755,12 @@ impl MsgType {
 	/// without re-submitting the mutation.
 	pub const MUTATION_OUTCOME_REQ: Self = Self(0x52);
 	pub const MUTATION_OUTCOME_RESP: Self = Self(0x53);
+	/// ADR 548: mutate or resolve the durable CTAS staged-publication saga.
+	pub const CTAS_SAGA_REQ: Self = Self(0x54);
+	pub const CTAS_SAGA_RESP: Self = Self(0x55);
+	/// ADR 548: pin row-mutation evidence until the Control Ring acknowledges it.
+	pub const MUTATION_OUTCOME_PIN_REQ: Self = Self(0x56);
+	pub const MUTATION_OUTCOME_PIN_RESP: Self = Self(0x57);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -846,6 +852,10 @@ impl MsgType {
 		Self::SECONDARY_INDEX_STATUS_RESP,
 		Self::MUTATION_OUTCOME_REQ,
 		Self::MUTATION_OUTCOME_RESP,
+		Self::CTAS_SAGA_REQ,
+		Self::CTAS_SAGA_RESP,
+		Self::MUTATION_OUTCOME_PIN_REQ,
+		Self::MUTATION_OUTCOME_PIN_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,

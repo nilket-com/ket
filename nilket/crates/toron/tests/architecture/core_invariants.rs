@@ -530,8 +530,8 @@ pub(crate) fn adr542_mutation_producer_census_keeps_ctas_visibly_excluded() {
 	);
 	assert_eq!(
 		rail.matches("deadline: context.deadline").count(),
-		4,
-		"INSERT, INSERT SELECT, UPDATE and DELETE must carry one original deadline"
+		5,
+		"INSERT, INSERT SELECT, UPDATE, CTAS row dispatch and DELETE carry the original deadline"
 	);
 	let ctas_start = rail
 		.find("ExecutionPlan::CreateTableAsSelect")
@@ -541,8 +541,13 @@ pub(crate) fn adr542_mutation_producer_census_keeps_ctas_visibly_excluded() {
 		.map(|offset| ctas_start + offset)
 		.expect("DELETE arm after CTAS");
 	let ctas = &rail[ctas_start..delete_start];
-	assert!(ctas.contains("operation_id: None"));
-	assert!(ctas.contains("deadline: None"));
+	// ADR 548 closes ADR 542's sole exclusion: CTAS derives a reserved row
+	// sub-identity under the caller UUIDv7 and pins its durable outcome until the
+	// cross-ring saga ledger acknowledges it.
+	assert!(ctas.contains("operation_id: Some(row_write_id)"));
+	assert!(ctas.contains("pin_mutation_outcome"));
+	assert!(ctas.contains("acknowledge_mutation_outcome"));
+	assert!(ctas.contains("deadline: context.deadline"));
 	let delete = &rail[delete_start..];
 	assert!(delete.contains("DeleteRowsRequest {"));
 	assert!(delete.contains("operation_id,"));

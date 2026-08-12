@@ -40,11 +40,14 @@ pub(crate) fn adr038_wendelon_descriptor_registry_shared_by_all_adapters() {
 pub(crate) fn adr063_descriptor_evolved_invalidates_without_retry() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("read coord");
-	let write_helper = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan(")
-		.into_iter()
-		.next()
-		.expect("execute_write_plan")
-		.1;
+	let write_helper = brace_blocks_after_marker(
+		&coordinator,
+		"async fn execute_write_plan_with_operation_id(",
+	)
+	.into_iter()
+	.next()
+	.expect("execute_write_plan")
+	.1;
 
 	assert!(coordinator.contains("LogicalPlan::Update { .. }"));
 	assert!(

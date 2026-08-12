@@ -629,11 +629,12 @@ pub(crate) fn adr032_local_coordinator_intercepts_before_retry() {
 		.expect("descriptor retry loop");
 	assert!(insert_select_branch < retry_loop);
 
-	let execute_write = brace_blocks_after_marker(query_impl, "async fn execute_write_plan")
-		.into_iter()
-		.next()
-		.expect("execute_write_plan body")
-		.1;
+	let execute_write =
+		brace_blocks_after_marker(query_impl, "async fn execute_write_plan_with_operation_id")
+			.into_iter()
+			.next()
+			.expect("execute_write_plan body")
+			.1;
 	assert!(execute_write.contains("LocalMutationSourceExecutor"));
 	assert!(execute_write.contains("execute_write_plan_with_source"));
 

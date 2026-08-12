@@ -1,7 +1,7 @@
 # ADR 548 - CTAS staged publication and composite outcome
 
-**Status:** Proposed 2026-08-12. Restores the replacement withdrawn by
-`73afc779`.
+**Status:** Accepted and implemented 2026-08-12. Restores the replacement
+withdrawn by `73afc779`.
 
 ## Context
 
@@ -286,6 +286,18 @@ Reclamation records bounded expired-operation evidence **in the saga ledger**.
 The row store's `EXPIRED` table cannot serve this: a saga that failed before the
 row phase never had a row identity to age out, so its only trace must be the
 ledger's own.
+
+The bound selected by Stage 0 is concrete: the ledger admits at most **4,096
+active-plus-retained sagas**, retains terminal detail for **15 minutes**, and
+never evicts active work. Provisioning prunes only terminal detail older than
+that horizon; if the pool is still full, it refuses with `capacity_exhausted`.
+Each removal advances a durable per-tenant UUIDv7 issuance-time high-water, so
+bounded retention cannot make a reclaimed operation look new again. A first
+provision must therefore carry a valid caller UUIDv7 no older than the same
+15-minute horizon. That is longer than Toron's 60-second server statement
+timeout and 120-second client query timeout, while making the admission and
+replay contract explicit. An old or malformed identity is refused as `expired`
+or `invalid_operation_id`, never applied afresh.
 
 ## Stage 0
 

@@ -12,7 +12,7 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, Signatur
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::protocol::{
-	ExecuteRuneRequest, HealthyResponse, MutationOutcomeResponse, QueryId, ResultBatch,
+	ExecuteRuneRequest, HealthyResponse, QueryId, ResolvedOperationOutcome, ResultBatch,
 	RuneFailure, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion,
 };
 
@@ -242,7 +242,7 @@ impl ToronClient {
 	pub async fn resolve_mutation(
 		&self,
 		operation_query_id: QueryId,
-	) -> Result<MutationOutcomeResponse, ClientError> {
+	) -> Result<ResolvedOperationOutcome, ClientError> {
 		let request_id = QueryId::new();
 		let request = SqlFrame::resolve_mutation(request_id, operation_query_id);
 		let connection = self.open_connection().await?;
@@ -438,7 +438,7 @@ async fn collect_mutation_outcome<R>(
 	reader: &mut R,
 	request_id: QueryId,
 	operation_query_id: QueryId,
-) -> Result<MutationOutcomeResponse, ClientError>
+) -> Result<ResolvedOperationOutcome, ClientError>
 where
 	R: AsyncRead + Unpin,
 {
@@ -459,10 +459,18 @@ where
 		SqlMessage::MutationOutcome(outcome)
 			if outcome.operation_query_id == operation_query_id =>
 		{
-			Ok(outcome)
+			Ok(ResolvedOperationOutcome::Mutation(outcome))
+		}
+		SqlMessage::CtasOutcome(outcome) if outcome.operation_query_id == operation_query_id => {
+			Ok(ResolvedOperationOutcome::Ctas(outcome))
 		}
 		SqlMessage::MutationOutcome(outcome) => Err(ClientError::Protocol(format!(
 			"mutation outcome id {} did not match requested operation {}",
+			outcome.operation_query_id.get(),
+			operation_query_id.get()
+		))),
+		SqlMessage::CtasOutcome(outcome) => Err(ClientError::Protocol(format!(
+			"CTAS outcome id {} did not match requested operation {}",
 			outcome.operation_query_id.get(),
 			operation_query_id.get()
 		))),
@@ -600,8 +608,10 @@ impl ServerCertVerifier for LoopbackServerVerifier {
 mod tests {
 	use super::*;
 	use crate::protocol::{
-		CancelRequest, Complete, HealthRequest, MutationCommitKnowledge, MutationResolution,
-		MutationStopReason, RuneFailure, RuneFailureKind, RuneSourceSpan, SqlError, write_frame,
+		CancelRequest, Complete, CtasCompositePhase, CtasOutcomeResponse, CtasPriorBinding,
+		CtasRetirementCause, HealthRequest, MutationCommitKnowledge, MutationOutcomeResponse,
+		MutationResolution, MutationStopReason, RuneFailure, RuneFailureKind, RuneSourceSpan,
+		SqlError, write_frame,
 	};
 
 	async fn framed_bytes(frames: &[SqlFrame]) -> tokio::io::DuplexStream {
@@ -652,7 +662,7 @@ mod tests {
 		.await;
 		assert_eq!(
 			collect_mutation_outcome(&mut reader, request_id, operation_id).await,
-			Ok(outcome)
+			Ok(ResolvedOperationOutcome::Mutation(outcome))
 		);
 
 		let mut mismatched = framed_bytes(&[SqlFrame::response(
@@ -669,6 +679,42 @@ mod tests {
 				.unwrap_err()
 				.to_string()
 				.contains("did not match requested operation")
+		);
+	}
+
+	#[tokio::test]
+	async fn adr548_mutation_collector_preserves_composite_ctas_resolution() {
+		let request_id = QueryId::from_u128(13);
+		let operation_id = QueryId::from_u128(14);
+		let outcome = CtasOutcomeResponse {
+			operation_query_id: operation_id,
+			phase: CtasCompositePhase::RetiringOld,
+			provisional_table_object_id: [0x54; 16],
+			prior_binding: Some(CtasPriorBinding {
+				table_object_id: [0x41; 16],
+				schema_generation: 4,
+			}),
+			row_count: Some(6),
+			terminal_cause: None,
+			catalog_commit_knowledge: MutationCommitKnowledge::Committed,
+			catalog_cause: None,
+			row_commit_knowledge: MutationCommitKnowledge::Committed,
+			row_cause: None,
+			publication_commit_knowledge: MutationCommitKnowledge::Committed,
+			publication_cause: None,
+			retirement_commit_knowledge: MutationCommitKnowledge::Unspecified,
+			retirement_cause: Some(CtasRetirementCause::RetryDeferred),
+			owner_epoch: 2,
+			retry_debt: 1,
+		};
+		let mut reader = framed_bytes(&[SqlFrame::response(
+			request_id,
+			SqlMessage::CtasOutcome(outcome),
+		)])
+		.await;
+		assert_eq!(
+			collect_mutation_outcome(&mut reader, request_id, operation_id).await,
+			Ok(ResolvedOperationOutcome::Ctas(outcome))
 		);
 	}
 

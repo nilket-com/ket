@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use arrow::record_batch::RecordBatch;
 use futures::{StreamExt, TryStreamExt};
@@ -15,7 +15,7 @@ use crate::binder::{
 	PlannerConfig, bind, bind_explain_analyze, measured_explain_analyze_verdicts,
 	render_explain_analyze,
 };
-use crate::catalog::{Catalog, InvalidatedDescriptor};
+use crate::catalog::{Catalog, CtasProvisionRequest, InvalidatedDescriptor};
 use crate::distributed::budget::{
 	AdmissionAttempt, AdmissionPolicy, AdmissionReservation, AdmissionResource, BudgetDimension,
 	BudgetRejection, QueryBudget, TaskBudget, TenantAdmissionController, TenantAdmissionRejection,
@@ -51,8 +51,8 @@ use crate::server::{
 };
 use crate::storage::{
 	CreateLogicalTypeRequest, DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest,
-	ResolvedMutationOutcome, RowIdentityProjection, ScanStream, StorageAdmin, StorageDeleteRows,
-	StorageWrite, TenantId, UnsupportedStorageAdmin, WriteOutcome, WriteRequest,
+	MutationResolution, ResolvedMutationOutcome, RowIdentityProjection, ScanStream, StorageAdmin,
+	StorageDeleteRows, StorageWrite, TenantId, UnsupportedStorageAdmin, WriteOutcome, WriteRequest,
 };
 use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
@@ -61,6 +61,8 @@ const REMOTE_CANCEL_CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
 const REMOTE_CANCEL_ACK_TIMEOUT: Duration = Duration::from_millis(100);
 const MAX_REMOTE_CANCEL_FANOUTS: usize = 64;
 const DISTRIBUTED_RESULT_STREAM_DEPTH: usize = 16;
+const CTAS_ROW_WRITE_SEQUENCE_NO: u64 = 0x4354_4153_0000_0001;
+const CTAS_OWNER_LEASE_MS: u64 = 60_000;
 
 type RemoteCancelSpawner =
 	Arc<dyn Fn(CancellationTrigger, Vec<RemoteTaskCancellation>) + Send + Sync>;
@@ -654,6 +656,21 @@ where
 			.map_err(QueryError::Storage)
 	}
 
+	pub async fn resolve_ctas_outcome(
+		&self,
+		tenant_id: TenantId,
+		operation_query_id: QueryId,
+	) -> Result<Option<wendelon_client::CtasSagaEntry>, QueryError> {
+		self.catalog
+			.clone()
+			.scoped(tenant_id)
+			.resolve_ctas_saga(wendelon_client::CtasOperationId::new(
+				*operation_query_id.get().as_bytes(),
+			))
+			.await
+			.map_err(QueryError::Catalog)
+	}
+
 	pub async fn execute_query_with_context_and_config(
 		&self,
 		plan: &LogicalPlan,
@@ -933,6 +950,7 @@ where
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
+				self.admin.as_ref(),
 				&context,
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
@@ -962,6 +980,7 @@ where
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
+				self.admin.as_ref(),
 				&context,
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
@@ -1091,6 +1110,7 @@ where
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
+				self.admin.as_ref(),
 				&context,
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
@@ -1120,6 +1140,7 @@ where
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
+				self.admin.as_ref(),
 				&context,
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
@@ -2122,13 +2143,11 @@ async fn execute_catalog_plan(
 /// Refuse a replace that would destroy an existing table.
 ///
 /// `drop_existing_table_with_storage_admin` drops storage and then the catalog
-/// entry, both durably, before any replacement is created or populated. Every
-/// failure after it therefore destroys the original and leaves nothing in its
-/// place: for CTAS the exposed window spans create, materialize, validation and
-/// the row write; for a plain create it spans the catalog create. Until staged
-/// publication lands — provisional object, then an atomic name-binding swap —
-/// the safe behaviour is to refuse before mutating rather than to destroy and
-/// hope the rest succeeds.
+/// entry, both durably, before any replacement is created. Every failure after
+/// it therefore destroys the original and leaves nothing in its place. CTAS now
+/// uses ADR 548 staged publication and never reaches this guard; plain CREATE
+/// still lacks a provisional-object lifecycle, so it remains refused before
+/// mutation.
 ///
 /// Replacing a table that does not exist is not destructive and stays allowed.
 async fn refuse_destructive_or_replace(
@@ -2276,10 +2295,355 @@ where
 	}
 }
 
+fn ctas_pending_error(entry: &wendelon_client::CtasSagaEntry) -> QueryError {
+	QueryError::Internal {
+		message: format!(
+			"CTAS operation is durably pending in phase {:?} (owner epoch {}, retry debt {}); resolve or resume it by query id",
+			entry.phase, entry.owner_epoch, entry.retry_debt
+		),
+	}
+}
+
+async fn drop_ctas_object_storage(
+	admin: &dyn StorageAdmin,
+	context: &ExecutionContext,
+	binding: &crate::catalog::TableBinding,
+) -> Result<(), QueryError> {
+	match admin
+		.drop_table_storage(DropTableStorageRequest {
+			session_id: context.session_id,
+			query_id: context.query_id,
+			tenant_id: context.tenant_id,
+			table_id: binding.local_table_id,
+			table_object_id: binding.table,
+			schema_generation: binding.schema_generation,
+			physical_descriptor_fingerprint: binding.fingerprint,
+			profile_hint: context.profile_hint,
+			trace_context: context.trace_context,
+		})
+		.await
+	{
+		Ok(_) | Err(StorageError::TableNotFound { .. }) => Ok(()),
+		Err(error) => Err(QueryError::Storage(error)),
+	}
+}
+
+async fn ctas_publication_conflict_is_proven(
+	catalog: &dyn Catalog,
+	entry: &wendelon_client::CtasSagaEntry,
+) -> Result<bool, QueryError> {
+	let name = crate::catalog::TableRef::with_schema(
+		&entry.descriptor.namespace,
+		&entry.descriptor.table_name,
+	);
+	let mut observed = catalog.resolve_table_local(&name).await;
+	if matches!(observed, Err(CatalogError::TableNotFound { .. }))
+		&& entry.descriptor.namespace == "default"
+	{
+		observed = catalog
+			.resolve_table_local(&crate::catalog::TableRef::new(&entry.descriptor.table_name))
+			.await;
+	}
+	match (entry.expected_binding, observed) {
+		(wendelon_client::CtasExpectedBinding::Absent, Ok(_)) => Ok(true),
+		(wendelon_client::CtasExpectedBinding::Absent, Err(CatalogError::TableNotFound { .. })) => {
+			Ok(false)
+		}
+		(
+			wendelon_client::CtasExpectedBinding::Bound {
+				table_object_id,
+				schema_generation,
+			},
+			Ok(binding),
+		) => Ok(binding.table != table_object_id
+			|| binding.schema_generation != schema_generation.get()),
+		(
+			wendelon_client::CtasExpectedBinding::Bound { .. },
+			Err(CatalogError::TableNotFound { .. }),
+		) => Ok(true),
+		(_, Err(error)) => Err(QueryError::Catalog(error)),
+	}
+}
+
+async fn finish_ctas_after_rows_committed(
+	catalog: &dyn Catalog,
+	writer: &dyn StorageWrite,
+	admin: &dyn StorageAdmin,
+	context: &ExecutionContext,
+	mut entry: wendelon_client::CtasSagaEntry,
+	if_not_exists: bool,
+	result_schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<RecordBatch>, QueryError> {
+	let tenant_id = wendelon::schema::TenantId::new(context.tenant_id.0);
+	let operation_id = entry.operation_id;
+	let owner_epoch = entry.owner_epoch;
+	writer
+		.acknowledge_mutation_outcome(context.tenant_id, entry.row_write_id)
+		.await?;
+
+	if matches!(
+		entry.phase,
+		wendelon_client::CtasSagaPhase::RowsCommitted { .. }
+	) {
+		match catalog
+			.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Publish {
+				tenant_id,
+				operation_id,
+				owner_epoch,
+			})
+			.await
+		{
+			Ok(published) => entry = published,
+			Err(publish_error) => {
+				let resolved = catalog.resolve_ctas_saga(operation_id).await?;
+				if let Some(resolved) = resolved
+					&& matches!(
+						resolved.phase,
+						wendelon_client::CtasSagaPhase::Published
+							| wendelon_client::CtasSagaPhase::RetiringOld
+							| wendelon_client::CtasSagaPhase::Complete
+					) {
+					entry = resolved;
+				} else if ctas_publication_conflict_is_proven(catalog, &entry).await? {
+					let provisional = catalog
+						.resolve_ctas_object(entry.descriptor.table_object_id)
+						.await?;
+					drop_ctas_object_storage(admin, context, &provisional).await?;
+					entry = catalog
+						.mutate_ctas_saga(
+							wendelon_client::CtasSagaMutation::RecordPublicationConflict {
+								tenant_id,
+								operation_id,
+								owner_epoch,
+								completed_at_ms: wall_clock_millis(),
+							},
+						)
+						.await?;
+					if if_not_exists
+						&& let Ok(winner) = catalog
+							.resolve_table(&crate::catalog::TableRef::with_schema(
+								&entry.descriptor.namespace,
+								&entry.descriptor.table_name,
+							))
+							.await && winner.schema.as_ref() == result_schema.as_ref()
+					{
+						return Ok(Vec::new());
+					}
+					return Err(QueryError::Catalog(publish_error));
+				} else {
+					let _ = catalog
+						.mutate_ctas_saga(wendelon_client::CtasSagaMutation::RecordRetryDebt {
+							tenant_id,
+							operation_id,
+							owner_epoch,
+						})
+						.await;
+					return Err(QueryError::Catalog(publish_error));
+				}
+			}
+		}
+	}
+
+	if entry.phase == wendelon_client::CtasSagaPhase::Published {
+		if let wendelon_client::CtasExpectedBinding::Bound { .. } = entry.expected_binding {
+			entry = catalog
+				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::MarkRetiringOld {
+					tenant_id,
+					operation_id,
+					owner_epoch,
+				})
+				.await?;
+		} else {
+			catalog
+				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Complete {
+					tenant_id,
+					operation_id,
+					owner_epoch,
+					completed_at_ms: wall_clock_millis(),
+				})
+				.await?;
+			return Ok(Vec::new());
+		}
+	}
+
+	if entry.phase == wendelon_client::CtasSagaPhase::RetiringOld {
+		let wendelon_client::CtasExpectedBinding::Bound {
+			table_object_id, ..
+		} = entry.expected_binding
+		else {
+			return Err(ctas_pending_error(&entry));
+		};
+		let old = catalog.resolve_ctas_object(table_object_id).await?;
+		drop_ctas_object_storage(admin, context, &old).await?;
+		catalog
+			.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Complete {
+				tenant_id,
+				operation_id,
+				owner_epoch,
+				completed_at_ms: wall_clock_millis(),
+			})
+			.await?;
+		return Ok(Vec::new());
+	}
+
+	if entry.phase == wendelon_client::CtasSagaPhase::Complete {
+		return Ok(Vec::new());
+	}
+	Err(ctas_pending_error(&entry))
+}
+
+async fn resume_ctas_saga(
+	catalog: &dyn Catalog,
+	writer: &dyn StorageWrite,
+	admin: &dyn StorageAdmin,
+	context: &ExecutionContext,
+	mut entry: wendelon_client::CtasSagaEntry,
+	if_not_exists: bool,
+	result_schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<RecordBatch>, QueryError> {
+	if entry.phase == wendelon_client::CtasSagaPhase::Complete {
+		return Ok(Vec::new());
+	}
+	if entry.phase == wendelon_client::CtasSagaPhase::Conflict && if_not_exists {
+		let name = crate::catalog::TableRef::with_schema(
+			&entry.descriptor.namespace,
+			&entry.descriptor.table_name,
+		);
+		if let Ok(winner) = catalog.resolve_table(&name).await
+			&& winner.schema.as_ref() == result_schema.as_ref()
+		{
+			return Ok(Vec::new());
+		}
+	}
+	if entry.phase.is_terminal() {
+		return Err(QueryError::Internal {
+			message: format!(
+				"CTAS operation terminated in phase {:?} with cause {:?}",
+				entry.phase, entry.terminal_cause
+			),
+		});
+	}
+	let now = wall_clock_millis();
+	if now < entry.owner_lease_expires_at_ms {
+		return Err(ctas_pending_error(&entry));
+	}
+	let prior_epoch = entry.owner_epoch;
+	entry = catalog
+		.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Claim {
+			tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+			operation_id: entry.operation_id,
+			expected_owner_epoch: prior_epoch,
+			new_owner_epoch: prior_epoch.saturating_add(1),
+			observed_now_ms: now,
+			lease_expires_at_ms: now.saturating_add(CTAS_OWNER_LEASE_MS),
+		})
+		.await?;
+
+	match entry.phase {
+		wendelon_client::CtasSagaPhase::Provisioned => {
+			writer
+				.acknowledge_mutation_outcome(context.tenant_id, entry.row_write_id)
+				.await?;
+			catalog
+				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Reclaim {
+					tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+					operation_id: entry.operation_id,
+					owner_epoch: entry.owner_epoch,
+					cause: wendelon_client::CtasTerminalCause::OwnerAbandonedBeforeRowDispatch,
+					completed_at_ms: wall_clock_millis(),
+				})
+				.await?;
+			Err(QueryError::Internal {
+				message: "CTAS owner disappeared before row dispatch; provisional object reclaimed"
+					.to_string(),
+			})
+		}
+		wendelon_client::CtasSagaPhase::RowDispatched => {
+			let resolved = writer
+				.resolve_mutation(context.tenant_id, entry.row_write_id)
+				.await?;
+			if resolved.resolution == MutationResolution::Present
+				&& resolved.commit_knowledge
+					== wendelon::schema::MutationCommitKnowledge::COMMITTED.0
+			{
+				entry = catalog
+					.mutate_ctas_saga(wendelon_client::CtasSagaMutation::AttestRowsCommitted {
+						tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+						operation_id: entry.operation_id,
+						owner_epoch: entry.owner_epoch,
+						row_count: entry.row_count.ok_or_else(|| QueryError::Internal {
+							message: "dispatched CTAS saga is missing its durable row count"
+								.to_string(),
+						})?,
+					})
+					.await?;
+				finish_ctas_after_rows_committed(
+					catalog,
+					writer,
+					admin,
+					context,
+					entry,
+					if_not_exists,
+					result_schema,
+				)
+				.await
+			} else if resolved.resolution == MutationResolution::Present
+				&& resolved.commit_knowledge
+					== wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED.0
+			{
+				catalog
+					.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Reclaim {
+						tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+						operation_id: entry.operation_id,
+						owner_epoch: entry.owner_epoch,
+						cause: wendelon_client::CtasTerminalCause::RowKnownNotCommitted,
+						completed_at_ms: wall_clock_millis(),
+					})
+					.await?;
+				writer
+					.acknowledge_mutation_outcome(context.tenant_id, entry.row_write_id)
+					.await?;
+				Err(QueryError::Internal {
+					message:
+						"CTAS row mutation is known not committed; provisional object reclaimed"
+							.to_string(),
+				})
+			} else {
+				entry = catalog
+					.mutate_ctas_saga(wendelon_client::CtasSagaMutation::RecordRetryDebt {
+						tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+						operation_id: entry.operation_id,
+						owner_epoch: entry.owner_epoch,
+					})
+					.await?;
+				Err(ctas_pending_error(&entry))
+			}
+		}
+		wendelon_client::CtasSagaPhase::RowsCommitted { .. }
+		| wendelon_client::CtasSagaPhase::Published
+		| wendelon_client::CtasSagaPhase::RetiringOld => {
+			finish_ctas_after_rows_committed(
+				catalog,
+				writer,
+				admin,
+				context,
+				entry,
+				if_not_exists,
+				result_schema,
+			)
+			.await
+		}
+		wendelon_client::CtasSagaPhase::Complete
+		| wendelon_client::CtasSagaPhase::Conflict
+		| wendelon_client::CtasSagaPhase::Reclaimed => unreachable!("terminal checked above"),
+	}
+}
+
 async fn execute_write_plan_with_source(
 	catalog: &dyn Catalog,
 	writer: &dyn StorageWrite,
 	deleter: &dyn StorageDeleteRows,
+	admin: &dyn StorageAdmin,
 	context: &ExecutionContext,
 	operation_id: wendelon::schema::ClientWriteId,
 	source_executor: &dyn MutationSourceExecutor,
@@ -2423,45 +2787,68 @@ async fn execute_write_plan_with_source(
 		ExecutionPlan::CreateTableAsSelect {
 			table,
 			schema,
+			intent_fingerprint,
 			if_not_exists,
 			or_replace,
 			source,
 		} => {
-			if *if_not_exists {
-				match catalog.resolve_table(table).await {
-					Ok(existing) => {
-						if existing.schema.as_ref() == schema.as_ref() {
-							return Ok(Vec::new());
-						}
-						return Err(CatalogError::SchemaMismatch {
-							table: query_table_name(table),
-						}
-						.into());
-					}
-					Err(CatalogError::TableNotFound { .. }) => {}
-					Err(error) => return Err(error.into()),
+			let composite_id = wendelon_client::CtasOperationId::new(operation_id.client_uuid);
+			if let Some(existing_saga) = catalog.resolve_ctas_saga(composite_id).await? {
+				if existing_saga.intent_fingerprint != *intent_fingerprint {
+					return Err(QueryError::Internal {
+						message: "query id was reused for a different CTAS intent".to_string(),
+					});
 				}
-			}
-			// Refuse before executing the source. An existing target must report the
-			// replacement refusal, not a source error raised after materializing a
-			// potentially expensive query. Nothing is dropped once absence is
-			// confirmed; see the plain create path for why.
-			if *or_replace {
-				refuse_destructive_or_replace(catalog, table).await?;
-			}
-			let source_batches = source_executor.execute_read_plan(source).await?;
-			let outcome = catalog
-				.create_table_with_outcome(
-					table,
-					schema.clone(),
-					CreateTableRowIdentity::AppendOnly,
+				return resume_ctas_saga(
+					catalog,
+					writer,
+					admin,
+					context,
+					existing_saga,
 					*if_not_exists,
+					schema,
 				)
-				.await?;
-			if !outcome.created {
-				return Ok(Vec::new());
+				.await;
 			}
-			let binding = outcome.binding;
+			let issued_at_ms =
+				composite_id
+					.issued_at_unix_millis()
+					.ok_or_else(|| QueryError::Internal {
+						message: "CTAS requires a caller UUIDv7 operation id".to_string(),
+					})?;
+			if issued_at_ms.saturating_add(wendelon_client::CTAS_SAGA_DETAIL_RETENTION_MS)
+				<= wall_clock_millis()
+			{
+				return Err(QueryError::Internal {
+					message: "CTAS operation id expired before first durable provisioning"
+						.to_string(),
+				});
+			}
+
+			let prior = match catalog.resolve_table(table).await {
+				Ok(existing) if *if_not_exists => {
+					if existing.schema.as_ref() == schema.as_ref() {
+						return Ok(Vec::new());
+					}
+					return Err(CatalogError::SchemaMismatch {
+						table: query_table_name(table),
+					}
+					.into());
+				}
+				Ok(existing) if *or_replace => Some(existing),
+				Ok(_) => {
+					return Err(CatalogError::TableAlreadyExists {
+						table: query_table_name(table),
+					}
+					.into());
+				}
+				Err(CatalogError::TableNotFound { .. }) => None,
+				Err(error) => return Err(error.into()),
+			};
+
+			// Source execution, materialization, and logical-value validation all
+			// precede provisioning. A failure here leaves no saga and no object.
+			let source_batches = source_executor.execute_read_plan(source).await?;
 			let target_columns = (0..schema.fields().len())
 				.map(|index| ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow")))
 				.collect::<Vec<_>>();
@@ -2474,7 +2861,98 @@ async fn execute_write_plan_with_source(
 				None => write::materialize_empty_record_batch(schema)?,
 			};
 			write::validate_refined_logical_columns("CTAS", &logical_types, &payload)?;
+			let row_count = u64::try_from(payload.num_rows()).unwrap_or(u64::MAX);
+			let row_write_id =
+				mutation_operation_id(operation_id.client_uuid, CTAS_ROW_WRITE_SEQUENCE_NO);
+			let expected_binding =
+				prior
+					.as_ref()
+					.map_or(wendelon_client::CtasExpectedBinding::Absent, |binding| {
+						wendelon_client::CtasExpectedBinding::Bound {
+							table_object_id: binding.table,
+							schema_generation: wendelon_client::SchemaGeneration::new(
+								binding.schema_generation,
+							),
+						}
+					});
+			let prior_descriptor = prior
+				.as_ref()
+				.map(|binding| catalog.descriptor_for_ctas_binding(binding))
+				.transpose()?;
+			if context
+				.deadline
+				.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+			{
+				return Err(QueryError::Internal {
+					message: "CTAS deadline elapsed before provisional catalog dispatch"
+						.to_string(),
+				});
+			}
+			let owner_epoch = 1;
+			let observed_now_ms = wall_clock_millis();
+			let provision = match catalog
+				.provision_ctas(CtasProvisionRequest {
+					operation_id: composite_id,
+					intent_fingerprint: *intent_fingerprint,
+					name: table.clone(),
+					schema: schema.clone(),
+					row_identity: CreateTableRowIdentity::AppendOnly,
+					expected_binding,
+					prior_descriptor,
+					row_write_id,
+					owner_epoch,
+					observed_now_ms,
+					owner_lease_expires_at_ms: observed_now_ms.saturating_add(CTAS_OWNER_LEASE_MS),
+				})
+				.await
+			{
+				Ok(provision) => provision,
+				Err(_error) if *if_not_exists => {
+					if let Ok(winner) = catalog.resolve_table(table).await {
+						if winner.schema.as_ref() == schema.as_ref() {
+							return Ok(Vec::new());
+						}
+						return Err(CatalogError::SchemaMismatch {
+							table: query_table_name(table),
+						}
+						.into());
+					}
+					return Err(_error.into());
+				}
+				Err(error) => return Err(error.into()),
+			};
+			let binding = provision.binding;
+
+			if context
+				.deadline
+				.is_some_and(|deadline| std::time::Instant::now() >= deadline)
+			{
+				catalog
+					.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Reclaim {
+						tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+						operation_id: composite_id,
+						owner_epoch,
+						cause: wendelon_client::CtasTerminalCause::DeadlineBeforeRowDispatch,
+						completed_at_ms: wall_clock_millis(),
+					})
+					.await?;
+				return Err(QueryError::Internal {
+					message: "CTAS deadline elapsed before row dispatch".to_string(),
+				});
+			}
+
 			writer
+				.pin_mutation_outcome(context.tenant_id, row_write_id)
+				.await?;
+			catalog
+				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::MarkRowDispatched {
+					tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+					operation_id: composite_id,
+					owner_epoch,
+					row_count,
+				})
+				.await?;
+			let write_result = writer
 				.write(WriteRequest {
 					session_id: context.session_id,
 					query_id: context.query_id,
@@ -2485,13 +2963,88 @@ async fn execute_write_plan_with_source(
 					payload,
 					profile_hint: context.profile_hint,
 					trace_context: context.trace_context,
-					// CTAS is explicitly outside ADR 542: storage alone cannot
-					// resolve its catalog-plus-rows composite outcome.
-					operation_id: None,
-					deadline: None,
+					operation_id: Some(row_write_id),
+					// The caller deadline belongs to this originating activation.
+					// Recovery activations use durable attempt budgets instead of
+					// reconstructing an Instant across restart.
+					deadline: context.deadline,
+				})
+				.await;
+			let write_outcome = match write_result {
+				Ok(outcome) => outcome,
+				Err(error) => {
+					match writer.resolve_mutation(context.tenant_id, row_write_id).await {
+						Ok(resolved)
+							if resolved.resolution == MutationResolution::Present
+								&& resolved.commit_knowledge
+									== wendelon::schema::MutationCommitKnowledge::COMMITTED.0 =>
+						{
+							let entry = catalog
+								.mutate_ctas_saga(
+									wendelon_client::CtasSagaMutation::AttestRowsCommitted {
+										tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+										operation_id: composite_id,
+										owner_epoch,
+										row_count,
+									},
+								)
+								.await?;
+							return finish_ctas_after_rows_committed(
+								catalog,
+								writer,
+								admin,
+								context,
+								entry,
+								*if_not_exists,
+								schema,
+							)
+							.await;
+						}
+						Ok(resolved)
+							if resolved.resolution == MutationResolution::Present
+								&& resolved.commit_knowledge
+									== wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED.0 =>
+						{
+							catalog
+								.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Reclaim {
+									tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+									operation_id: composite_id,
+									owner_epoch,
+								cause: wendelon_client::CtasTerminalCause::RowKnownNotCommitted,
+								completed_at_ms: wall_clock_millis(),
+								})
+								.await?;
+							writer
+								.acknowledge_mutation_outcome(context.tenant_id, row_write_id)
+								.await?;
+						}
+						_ => {}
+					}
+					return Err(error.into());
+				}
+			};
+			let entry = catalog
+				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::AttestRowsCommitted {
+					tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+					operation_id: composite_id,
+					owner_epoch,
+					row_count,
 				})
 				.await?;
-			Ok(Vec::new())
+			debug_assert_eq!(
+				u64::try_from(write_outcome.rows).unwrap_or(u64::MAX),
+				row_count
+			);
+			finish_ctas_after_rows_committed(
+				catalog,
+				writer,
+				admin,
+				context,
+				entry,
+				*if_not_exists,
+				schema,
+			)
+			.await
 		}
 		ExecutionPlan::Delete {
 			local_table_id,
@@ -2559,6 +3112,15 @@ fn mutation_operation_id(
 		idempotency_ttl_ms: 300_000,
 		_pad: 0,
 	}
+}
+
+fn wall_clock_millis() -> u64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.unwrap_or_default()
+		.as_millis()
+		.try_into()
+		.unwrap_or(u64::MAX)
 }
 
 fn project_returning_batches(
@@ -2868,6 +3430,38 @@ impl QueryCoordinator {
 		}
 	}
 
+	/// Execute a local mutation under a caller-retained query identity. The SQL
+	/// daemon uses the distributed coordinator's context path; this companion
+	/// keeps embedded/local callers capable of resolving ADR 542/548 outcomes
+	/// without changing `execute_query`, whose fixed executor context serves many
+	/// independent statements.
+	pub async fn execute_mutation_with_query_id(
+		&self,
+		plan: &LogicalPlan,
+		query_id: QueryId,
+	) -> Result<Vec<RecordBatch>, QueryError> {
+		if !matches!(
+			plan,
+			LogicalPlan::Insert { .. }
+				| LogicalPlan::InsertSelect { .. }
+				| LogicalPlan::CreateTableAsSelect { .. }
+				| LogicalPlan::Delete { .. }
+				| LogicalPlan::Update { .. }
+		) {
+			return Err(QueryError::Internal {
+				message: "execute_mutation_with_query_id requires a mutation plan".to_string(),
+			});
+		}
+		let catalog = Arc::clone(&self.catalog).scoped(self.executor.context().tenant_id);
+		let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+		self.execute_write_plan_with_operation_id(
+			catalog.as_ref(),
+			&bound,
+			mutation_operation_id(*query_id.get().as_bytes(), 0),
+		)
+		.await
+	}
+
 	async fn execute_write_plan(
 		&self,
 		catalog: &dyn Catalog,
@@ -2878,6 +3472,16 @@ impl QueryCoordinator {
 		// a fresh statement identity before each dispatch; reusing context.query_id here
 		// would collapse the second mutation into a replay of the first.
 		let operation_id = mutation_operation_id(*QueryId::new().get().as_bytes(), 0);
+		self.execute_write_plan_with_operation_id(catalog, bound, operation_id)
+			.await
+	}
+
+	async fn execute_write_plan_with_operation_id(
+		&self,
+		catalog: &dyn Catalog,
+		bound: &ExecutionPlan,
+		operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<Vec<RecordBatch>, QueryError> {
 		let source_executor = LocalMutationSourceExecutor {
 			executor: &self.executor,
 		};
@@ -2885,6 +3489,7 @@ impl QueryCoordinator {
 			catalog,
 			self.writer.as_ref(),
 			self.deleter.as_ref(),
+			self.admin.as_ref(),
 			self.executor.context(),
 			operation_id,
 			&source_executor,

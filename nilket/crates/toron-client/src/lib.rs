@@ -14,12 +14,15 @@ pub use client::{
 	blocking_health_loopback,
 };
 pub use protocol::{
-	CancelRequest, Complete, DEFAULT_SQL_REQUEST_FRAME_BYTES, DEFAULT_SQL_STATEMENT_BYTES,
-	ExecuteRequest, ExecuteRuneRequest, HealthRequest, HealthyResponse, MutationCommitKnowledge,
+	CancelRequest, Complete, CtasCatalogCause, CtasCompositePhase, CtasOutcomeResponse,
+	CtasPriorBinding, CtasPublicationCause, CtasRetirementCause, CtasRowCause, CtasTerminalCause,
+	DEFAULT_SQL_REQUEST_FRAME_BYTES, DEFAULT_SQL_STATEMENT_BYTES, ExecuteRequest,
+	ExecuteRuneRequest, HealthRequest, HealthyResponse, MutationCommitKnowledge,
 	MutationOutcomeResponse, MutationResolution, MutationStopReason, QueryId, RequestFrameTooLarge,
-	ResolveMutationRequest, ResultBatch, RuneCapability, RuneFailure, RuneFailureKind,
-	RuneLanguageSurfaceVersion, RuneRequestProtocolVersion, RuneSandboxContractVersion,
-	RuneSandboxViolation, RuneSourceSpan, RuneVersionAxis, RuneVersionSkew,
-	SQL_REQUEST_FRAME_BYTES_HARD_CEILING, SQL_STATEMENT_BYTES_HARD_CEILING, SqlError, SqlErrorCode,
-	SqlFrame, SqlMessage, SqlProtocolVersion, read_frame, read_request_frame_bounded, write_frame,
+	ResolveMutationRequest, ResolvedOperationOutcome, ResultBatch, RuneCapability, RuneFailure,
+	RuneFailureKind, RuneLanguageSurfaceVersion, RuneRequestProtocolVersion,
+	RuneSandboxContractVersion, RuneSandboxViolation, RuneSourceSpan, RuneVersionAxis,
+	RuneVersionSkew, SQL_REQUEST_FRAME_BYTES_HARD_CEILING, SQL_STATEMENT_BYTES_HARD_CEILING,
+	SqlError, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion, read_frame,
+	read_request_frame_bounded, write_frame,
 };

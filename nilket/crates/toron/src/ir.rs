@@ -1248,6 +1248,8 @@ pub enum LogicalPlan {
 	},
 	CreateTableAsSelect {
 		table: TableRef,
+		/// Canonical SQL request bytes retained for durable CTAS replay identity.
+		intent_request: String,
 		if_not_exists: bool,
 		or_replace: bool,
 		source: Box<LogicalPlan>,

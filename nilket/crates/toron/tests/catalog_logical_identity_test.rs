@@ -768,6 +768,7 @@ fn project_sales(exprs: Vec<Expr>, output_names: Vec<Option<&str>>) -> LogicalPl
 fn ctas_project_customer_id_as_cid(if_not_exists: bool) -> LogicalPlan {
 	LogicalPlan::CreateTableAsSelect {
 		table: TableRef::new("copy"),
+		intent_request: "CREATE TABLE copy AS SELECT customer_id AS cid FROM sales".to_string(),
 		if_not_exists,
 		or_replace: false,
 		source: Box::new(project_sales(
@@ -787,6 +788,7 @@ async fn bound_schema(logical: LogicalPlan) -> SchemaRef {
 async fn bound_ctas_schema(source: LogicalPlan) -> SchemaRef {
 	let plan = LogicalPlan::CreateTableAsSelect {
 		table: TableRef::new("copy"),
+		intent_request: "CREATE TABLE copy AS SELECT * FROM source".to_string(),
 		if_not_exists: false,
 		or_replace: false,
 		source: Box::new(source),

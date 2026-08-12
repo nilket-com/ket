@@ -91,14 +91,16 @@ use crate::schema::{
 	HybridTimestamp, Identity, LeaseDescriptor, LeaseStatus, Locality, LocalityPolicy,
 	LocalityRange, MigrateRequestKind, MigrateRequestMeta, MigrateResponseMeta, MigrateStatus,
 	MsgType, MultiRowLayoutDescriptor, MutationCommitKnowledge, MutationOperationKind,
-	MutationOutcomeRequestMeta, MutationOutcomeResponseMeta, MutationResolutionStatus,
-	MutationStopReason, NodeId, PbcRejectCode, PendingWitnessPullRequestMeta,
-	PendingWitnessPullResponseMeta, PendingWitnessPullStatus, QueryRequestMeta, QueryResponseMeta,
-	ReadRequestMeta, ReadResponseMeta, ReadStatus, RecordBodyCompressionPolicy, RecordLayoutPolicy,
-	RecordRowIndex, ReplicaAckLevel, ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus,
-	RowCount, RowIdentityPolicy, RuntimeFilterDescriptor, RuntimeFilterDropReason,
-	STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexCatalog, SecondaryIndexDescriptor,
-	SecondaryIndexState, SlabId, StreamFinalizationRequestMeta, TABLE_QUERY_TRACE_FLAG_KNOWN_MASK,
+	MutationOutcomePinAction, MutationOutcomePinRequestMeta, MutationOutcomePinResponseMeta,
+	MutationOutcomePinStatus, MutationOutcomeRequestMeta, MutationOutcomeResponseMeta,
+	MutationResolutionStatus, MutationStopReason, NodeId, PbcRejectCode,
+	PendingWitnessPullRequestMeta, PendingWitnessPullResponseMeta, PendingWitnessPullStatus,
+	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
+	RecordBodyCompressionPolicy, RecordLayoutPolicy, RecordRowIndex, ReplicaAckLevel,
+	ReplicaWriteMeta, ReplicaWriteRespMeta, ReplicaWriteStatus, RowCount, RowIdentityPolicy,
+	RuntimeFilterDescriptor, RuntimeFilterDropReason, STORAGE_ROW_KEY_ID_COLUMN,
+	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, SlabId,
+	StreamFinalizationRequestMeta, TABLE_QUERY_TRACE_FLAG_KNOWN_MASK,
 	TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED, TABLE_WRITE_MAX_ROWS,
 	TableDeleteRowsRequestMeta, TableDeleteRowsResponseMeta, TableObjectId,
 	TableQueryCancelRequestMeta, TableQueryCancelResponseMeta, TableQueryCancelStatus,
@@ -6450,6 +6452,10 @@ impl DataRingServer for WendelonDataServer {
 					response,
 				)))
 			}
+			MsgType::MUTATION_OUTCOME_PIN_REQ => {
+				self.handle_mutation_outcome_pin_request(&context.actor, &frame)
+					.await
+			}
 			MsgType::TABLE_REPLICATE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<TableReplicaWriteMeta>() {
 					return Err(Error::new(
@@ -8728,7 +8734,15 @@ impl WendelonDataServer {
 			let descriptor = state
 				.table_schemas
 				.latest_by_id(meta.tenant_id, meta.table_object_id)
-				.cloned();
+				.cloned()
+				.or_else(|| {
+					let saga = state
+						.ctas_sagas
+						.operation_for_object(meta.tenant_id, meta.table_object_id)?;
+					(saga.row_write_id.canonical_idempotency_bytes()
+						== meta.parent_write_id.canonical_idempotency_bytes())
+					.then(|| saga.descriptor.clone())
+				});
 			let secondary_index_descriptors = descriptor
 				.as_ref()
 				.map(|descriptor| {

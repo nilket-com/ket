@@ -2,9 +2,9 @@ use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyse
 use crate::integration::compute::{DropOperationId, SchemaGeneration};
 use crate::network::tls::ActorTrustDomain;
 use crate::schema::{
-	FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId, PolicyGeneration,
-	ReleaseLeaseRequestMeta, SlabId, SupersessionMetadata, TableObjectId, TableRetentionPolicy,
-	TenantId, TenantKekId, TombstoneMetadata,
+	CtasSagaMutation, FinalizationMarker, HybridTimestamp, Identity, LeaseDescriptor, NodeId,
+	PolicyGeneration, ReleaseLeaseRequestMeta, SlabId, SupersessionMetadata, TableObjectId,
+	TableRetentionPolicy, TenantId, TenantKekId, TombstoneMetadata,
 };
 use crate::storage::CompactionCommit;
 use serde::{Deserialize, Serialize};
@@ -524,6 +524,8 @@ pub enum WendelonRequest {
 	TableReclaimCompletion(TableReclaimCompletionRequest),
 	/// ADR 039 Wendelon-internal DROP finalize stage.
 	TableDropFinalize(TableDropFinalizeRequest),
+	/// ADR 548 replicated CTAS staged-publication lifecycle mutation.
+	CtasSaga(CtasSagaMutation),
 }
 
 /// The response returned to the client after a Raft command is committed.

@@ -3,6 +3,48 @@
 use super::*;
 
 impl WendelonDataServer {
+	pub(super) async fn handle_mutation_outcome_pin_request(
+		&self,
+		actor: &ActorIdentity,
+		frame: &HrftFrame,
+	) -> std::io::Result<Option<HrftFrame>> {
+		if frame.meta.len() != std::mem::size_of::<MutationOutcomePinRequestMeta>() {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"MUTATION_OUTCOME_PIN_REQ meta width mismatch",
+			));
+		}
+		let meta: MutationOutcomePinRequestMeta = *bytemuck::from_bytes(&frame.meta);
+		self.authorize_actor_for_data(actor, Some(meta.tenant_id), DataOperation::Write)?;
+		let status = if meta.action == MutationOutcomePinAction::PIN {
+			match self
+				.mutation_outcomes
+				.pin(meta.operation_id, meta.tenant_id)
+				.await
+			{
+				Ok(()) => MutationOutcomePinStatus::APPLIED,
+				Err(error) if error.kind() == ErrorKind::WouldBlock => {
+					MutationOutcomePinStatus::CAPACITY_EXHAUSTED
+				}
+				Err(error) => return Err(error),
+			}
+		} else if meta.action == MutationOutcomePinAction::ACKNOWLEDGE {
+			self.mutation_outcomes
+				.acknowledge_pin(meta.operation_id, meta.tenant_id)
+				.await?;
+			MutationOutcomePinStatus::APPLIED
+		} else {
+			MutationOutcomePinStatus::INVALID_ACTION
+		};
+		Ok(Some(self.build_mutation_outcome_pin_response_frame(
+			frame.header.stream_id,
+			MutationOutcomePinResponseMeta {
+				status,
+				_pad: [0; 7],
+			},
+		)))
+	}
+
 	/// Acquire the node-wide mutation slot before table admission or batch construction.
 	/// A queue expiry precedes every durability action, so its commit knowledge is exact.
 	pub(super) async fn acquire_table_mutation_permit(
@@ -526,6 +568,31 @@ impl WendelonDataServer {
 				magic: HRFT_MAGIC,
 				version: 1,
 				msg_type: MsgType::MUTATION_OUTCOME_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: meta.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
+	pub(super) fn build_mutation_outcome_pin_response_frame(
+		&self,
+		stream_id: u32,
+		response: MutationOutcomePinResponseMeta,
+	) -> HrftFrame {
+		let mut meta = self.pool.acquire();
+		meta.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&response));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::MUTATION_OUTCOME_PIN_RESP.0,
 				flags: 0,
 				stream_id,
 				meta_len: meta.len() as u32,

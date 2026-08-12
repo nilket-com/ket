@@ -8,8 +8,8 @@ use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use toron::binder::{PlannerConfig, bind};
 use toron::catalog::{
-	Catalog, CreateTableOutcome, DescriptorRefreshMetrics, InvalidatedDescriptor, MockCatalog,
-	TableBinding, TableRef,
+	Catalog, CreateTableOutcome, CtasProvisionOutcome, CtasProvisionRequest,
+	DescriptorRefreshMetrics, InvalidatedDescriptor, MockCatalog, TableBinding, TableRef,
 };
 use toron::coordinator::{DistributedQueryCoordinator, QueryCoordinator};
 use toron::distributed::budget::{QueryBudget, TaskBudget};
@@ -23,8 +23,9 @@ use toron::server::memory::MemoryManager;
 use toron::server::transport::{ToronStream, ToronTransport};
 use toron::sql_planner::SqlPlanner;
 use toron::storage::{
-	HlcBound, InMemoryStorageScan, InMemoryTableStorage, StorageWrite, TenantId, WriteOutcome,
-	WriteRequest,
+	DropTableStorageRequest, HlcBound, InMemoryStorageScan, InMemoryTableStorage,
+	MutationResolution, ResolvedMutationOutcome, StorageAdmin, StorageWrite, TenantId,
+	WriteOutcome, WriteRequest,
 };
 
 #[test]
@@ -35,15 +36,21 @@ fn planner_accepts_create_table_as_select_surface() {
 
 	let LogicalPlan::CreateTableAsSelect {
 		table,
+		intent_request,
 		if_not_exists,
 		or_replace,
 		source,
+		..
 	} = plan
 	else {
 		panic!("expected CTAS logical plan");
 	};
 
 	assert_eq!(table, TableRef::new("copy"));
+	assert_eq!(
+		intent_request,
+		"CREATE TABLE copy AS SELECT id, name FROM people"
+	);
 	assert!(!if_not_exists);
 	assert!(!or_replace);
 	assert!(matches!(*source, LogicalPlan::Project { .. }));
@@ -57,6 +64,7 @@ fn planner_accepts_create_or_replace_table_as_select_surface() {
 
 	let LogicalPlan::CreateTableAsSelect {
 		table,
+		intent_request,
 		if_not_exists,
 		or_replace,
 		source,
@@ -66,9 +74,47 @@ fn planner_accepts_create_or_replace_table_as_select_surface() {
 	};
 
 	assert_eq!(table, TableRef::new("copy"));
+	assert_eq!(
+		intent_request,
+		"CREATE OR REPLACE TABLE copy AS SELECT id, name FROM people"
+	);
 	assert!(!if_not_exists);
 	assert!(or_replace);
 	assert!(matches!(*source, LogicalPlan::Project { .. }));
+}
+
+#[tokio::test]
+async fn adr548_intent_fingerprint_includes_the_canonical_ddl_mode() {
+	let catalog = people_catalog().await;
+	let planner = SqlPlanner::new();
+	let create = planner
+		.plan("CREATE TABLE copy AS SELECT id, name FROM people")
+		.expect("plan create CTAS");
+	let replace = planner
+		.plan("CREATE OR REPLACE TABLE copy AS SELECT id, name FROM people")
+		.expect("plan replacement CTAS");
+	let ExecutionPlan::CreateTableAsSelect {
+		intent_fingerprint: create_fingerprint,
+		..
+	} = bind(&create, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind create CTAS")
+	else {
+		panic!("expected create CTAS execution plan");
+	};
+	let ExecutionPlan::CreateTableAsSelect {
+		intent_fingerprint: replace_fingerprint,
+		..
+	} = bind(&replace, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind replacement CTAS")
+	else {
+		panic!("expected replacement CTAS execution plan");
+	};
+	assert_ne!(
+		create_fingerprint, replace_fingerprint,
+		"one caller query id must not resume a saga authored under another DDL mode"
+	);
 }
 
 #[test]
@@ -96,6 +142,7 @@ fn planner_accepts_create_table_if_not_exists_as_select() {
 		if_not_exists,
 		or_replace,
 		source,
+		..
 	} = plan
 	else {
 		panic!("expected CTAS logical plan");
@@ -154,6 +201,7 @@ async fn binder_infers_ctas_schema_without_target_identity() {
 		if_not_exists,
 		or_replace,
 		source,
+		..
 	} = bound
 	else {
 		panic!("expected CTAS execution plan");
@@ -304,14 +352,7 @@ async fn create_or_replace_table_as_select_creates_when_absent() {
 }
 
 #[tokio::test]
-async fn create_or_replace_table_as_select_over_an_existing_table_is_refused() {
-	// Replacement is deliberately withdrawn until staged publication exists.
-	// `drop_existing_table_with_storage_admin` destroys storage and the catalog
-	// entry durably before the replacement is created, materialized, validated or
-	// written, so any failure after it would leave no table at all. Refusing
-	// before mutating is the safe posture; restore replacement — and this test's
-	// original assertions, which are preserved in history — once a provisional
-	// object and an atomic name-binding swap land.
+async fn create_or_replace_table_as_select_publishes_then_retires_the_old_table() {
 	let (catalog, storage, coordinator, planner) = coordinator();
 
 	for sql in [
@@ -330,7 +371,7 @@ async fn create_or_replace_table_as_select_over_an_existing_table_is_refused() {
 		.await
 		.expect("resolve copy");
 
-	let error = coordinator
+	coordinator
 		.execute_query(
 			&planner
 				.plan("CREATE OR REPLACE TABLE copy AS SELECT name FROM people")
@@ -338,27 +379,31 @@ async fn create_or_replace_table_as_select_over_an_existing_table_is_refused() {
 			None,
 		)
 		.await
-		.expect_err("replacing an existing table must be refused");
-	let rendered = error.to_string();
-	assert!(
-		rendered.contains("OR REPLACE on existing table copy is refused"),
-		"expected a destructive-replace refusal, got: {rendered}"
-	);
+		.expect("staged replacement");
 
-	// The refusal happens before any mutation: the original binding, its rows and
-	// the storage inventory are all untouched.
 	let after = catalog
 		.resolve_table(&TableRef::new("copy"))
 		.await
 		.expect("resolve copy after refusal");
-	assert_eq!(before.table, after.table);
+	assert_ne!(before.table, after.table);
 	assert_eq!(storage.table_count(), 2);
-	let batch = concat_query(&coordinator, &planner, "SELECT old_id FROM copy").await;
-	assert_eq!(batch.num_rows(), 1);
+	assert!(matches!(
+		catalog.resolve_table_id(before.local_table_id).await,
+		Err(CatalogError::TableNotFound { .. })
+	));
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT name FROM copy ORDER BY name",
+	)
+	.await;
+	assert_eq!(batch.num_rows(), 2);
+	assert_eq!(string_column(&batch, 0).value(0), "Alice");
+	assert_eq!(string_column(&batch, 0).value(1), "Bob");
 }
 
 #[tokio::test]
-async fn ctas_or_replace_refuses_before_executing_the_source() {
+async fn ctas_or_replace_source_failure_leaves_the_old_binding_live() {
 	let (catalog, _storage, coordinator, planner) = coordinator();
 
 	for sql in [
@@ -384,19 +429,11 @@ async fn ctas_or_replace_refuses_before_executing_the_source() {
 			None,
 		)
 		.await
-		.expect_err("replacing an existing table must be refused");
-	// Ordering control: the refusal must precede source execution. The source here
-	// cannot be read at all, so under the previous ordering this assertion saw
-	// "table not found" — the caller paid for a failed source query before learning
-	// the replacement was never going to be allowed.
+		.expect_err("source without storage must fail before provisioning");
 	let rendered = err.to_string();
 	assert!(
-		rendered.contains("OR REPLACE on existing table target is refused"),
-		"expected the replacement refusal, got: {rendered}"
-	);
-	assert!(
-		!rendered.contains("table not found"),
-		"the source must not be executed for a refused replacement, got: {rendered}"
+		rendered.contains("table not found"),
+		"expected the source failure, got: {rendered}"
 	);
 
 	let after = catalog
@@ -644,8 +681,9 @@ async fn or_replace_losing_a_create_race_does_not_destroy_the_winner() {
 	// local resolution only, which is exactly what losing a create race looks like
 	// from inside the statement.
 	//
-	// Fixed path: the refusal sees the synthetic miss, nothing is dropped, and the
-	// statement loses at the catalog create.
+	// Fixed path: the staged provision compares the captured absent binding with
+	// the now-visible winner, nothing is dropped, and the statement loses before
+	// a provisional object or row write exists.
 	//
 	// Withdrawn path, measured by restoring it: the drop helper performed a SECOND
 	// resolution, saw the winner, and destroyed it — and the statement then
@@ -951,7 +989,7 @@ async fn query_coordinator_ctas_failures_before_catalog_mutation_do_not_create_t
 }
 
 #[tokio::test]
-async fn query_coordinator_ctas_write_failure_leaves_catalog_entry_without_storage() {
+async fn query_coordinator_ctas_write_failure_leaves_no_public_catalog_entry() {
 	let catalog = Arc::new(MockCatalog::new());
 	let storage = Arc::new(InMemoryTableStorage::new());
 	let planner = SqlPlanner::new();
@@ -992,25 +1030,234 @@ async fn query_coordinator_ctas_write_failure_leaves_catalog_entry_without_stora
 		"unexpected error: {err}"
 	);
 
-	let binding = catalog
-		.resolve_table(&TableRef::new("failed_copy"))
-		.await
-		.expect("CTAS write failure leaves catalog entry");
-	assert_field(&binding.schema, 0, "id", &DataType::Int32, false);
+	assert!(matches!(
+		catalog.resolve_table(&TableRef::new("failed_copy")).await,
+		Err(CatalogError::TableNotFound { .. })
+	));
+}
 
-	let err = setup
-		.execute_query(
-			&planner
-				.plan("SELECT id FROM failed_copy")
-				.expect("plan failed_copy scan"),
-			None,
-		)
-		.await
-		.expect_err("failed write should not initialize storage");
-	assert!(
-		err.to_string().contains("table not found"),
-		"unexpected error: {err}"
+#[tokio::test]
+async fn adr548_known_not_committed_rows_reclaim_with_the_row_phase_cause() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let planner = SqlPlanner::new();
+	let setup = QueryCoordinator::with_writer(
+		catalog.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
 	);
+	for sql in [
+		"CREATE TABLE src (id INT NOT NULL)",
+		"INSERT INTO src VALUES (1)",
+	] {
+		setup
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+	let coordinator = QueryCoordinator::with_writer(
+		catalog.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		Arc::new(KnownNotCommittedCtasWrite),
+	)
+	.with_storage_admin(storage.clone());
+	let plan = planner
+		.plan("CREATE TABLE rejected_copy AS SELECT id FROM src")
+		.expect("plan CTAS");
+	let query_id = QueryId::new();
+	let error = coordinator
+		.execute_mutation_with_query_id(&plan, query_id)
+		.await
+		.expect_err("known-not-committed write returns its row error");
+	assert!(error.to_string().contains("known-not-committed CTAS write"));
+	let saga = catalog
+		.resolve_ctas_saga(wendelon_client::CtasOperationId::new(
+			*query_id.get().as_bytes(),
+		))
+		.await
+		.expect("resolve saga")
+		.expect("saga remains attributable");
+	assert_eq!(saga.phase, wendelon_client::CtasSagaPhase::Reclaimed);
+	assert_eq!(
+		saga.terminal_cause,
+		Some(wendelon_client::CtasTerminalCause::RowKnownNotCommitted)
+	);
+	assert!(matches!(
+		catalog.resolve_table(&TableRef::new("rejected_copy")).await,
+		Err(CatalogError::TableNotFound { .. })
+	));
+}
+
+#[tokio::test]
+async fn adr548_rows_committed_then_lost_publication_cas_reclaims_as_conflict() {
+	let base = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let admin = Arc::new(CountingStorageAdmin::new(storage.clone()));
+	let planner = SqlPlanner::new();
+	let setup = QueryCoordinator::with_writer(
+		base.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(admin.clone());
+	for sql in [
+		"CREATE TABLE src (id INT NOT NULL)",
+		"INSERT INTO src VALUES (1), (2)",
+	] {
+		setup
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+	let source = base
+		.resolve_table(&TableRef::new("src"))
+		.await
+		.expect("resolve source schema");
+	let racing = Arc::new(RacingCatalog::at_publication(
+		base.clone(),
+		TableRef::new("raced_copy"),
+		source.schema.clone(),
+	));
+	let coordinator = QueryCoordinator::with_writer(
+		racing,
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(admin.clone());
+	let plan = planner
+		.plan("CREATE TABLE raced_copy AS SELECT id FROM src")
+		.expect("plan raced CTAS");
+	let query_id = QueryId::new();
+	let storage_before = storage.table_count();
+	let error = coordinator
+		.execute_mutation_with_query_id(&plan, query_id)
+		.await
+		.expect_err("the concurrent winner must win publication");
+	assert!(error.to_string().contains("binding_changed"), "{error}");
+
+	let winner = base
+		.resolve_table(&TableRef::new("raced_copy"))
+		.await
+		.expect("concurrent winner remains bound");
+	assert_eq!(winner.schema.as_ref(), source.schema.as_ref());
+	let saga = base
+		.resolve_ctas_saga(wendelon_client::CtasOperationId::new(
+			*query_id.get().as_bytes(),
+		))
+		.await
+		.expect("resolve saga")
+		.expect("saga remains attributable");
+	assert_eq!(
+		saga.phase,
+		wendelon_client::CtasSagaPhase::Conflict,
+		"error={error}; drops={}; saga={saga:?}",
+		admin.drop_count()
+	);
+	assert_eq!(
+		saga.terminal_cause,
+		Some(wendelon_client::CtasTerminalCause::PublicationConflict)
+	);
+	assert_eq!(admin.drop_count(), 1, "populated provisional is reclaimed");
+	assert_eq!(
+		storage.table_count(),
+		storage_before,
+		"provisional storage must not remain stranded"
+	);
+}
+
+#[tokio::test]
+async fn adr548_restart_resolves_committed_rows_without_reexecuting_the_source() {
+	let inner_catalog = Arc::new(MockCatalog::new());
+	let catalog = Arc::new(ExpiredLeaseCatalog::new(inner_catalog.clone()));
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let writer = Arc::new(AmbiguousCommittedCtasWrite::new(storage.clone()));
+	let planner = SqlPlanner::new();
+	let setup = QueryCoordinator::with_writer(
+		catalog.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		writer.clone(),
+	)
+	.with_storage_admin(storage.clone());
+	for sql in [
+		"CREATE TABLE src (id INT NOT NULL)",
+		"INSERT INTO src VALUES (1), (2)",
+	] {
+		setup
+			.execute_query(&planner.plan(sql).expect("plan setup SQL"), None)
+			.await
+			.expect(sql);
+	}
+	let plan = planner
+		.plan("CREATE TABLE resumed_copy AS SELECT id FROM src")
+		.expect("plan CTAS");
+	let query_id = QueryId::new();
+	let context = ExecutionContext::new(SessionId(91), query_id, TenantId(1), HlcBound(1));
+	let coordinator = QueryCoordinator::with_writer(
+		catalog.clone(),
+		Executor::with_context(storage.clone(), context),
+		PlannerConfig::default(),
+		writer,
+	)
+	.with_storage_admin(storage.clone());
+	let first = coordinator
+		.execute_mutation_with_query_id(&plan, query_id)
+		.await
+		.expect_err("first activation loses the committed write response");
+	assert!(first.to_string().contains("ambiguous committed CTAS write"));
+	assert!(matches!(
+		catalog.resolve_table(&TableRef::new("resumed_copy")).await,
+		Err(CatalogError::TableNotFound { .. })
+	));
+
+	// Remove the source storage while leaving its descriptor bindable. A replay
+	// can succeed only by resolving the retained row outcome; re-running SELECT
+	// would now fail with TableNotFound.
+	let source = catalog
+		.resolve_table(&TableRef::new("src"))
+		.await
+		.expect("resolve source");
+	storage
+		.drop_table_storage(DropTableStorageRequest {
+			session_id: SessionId(92),
+			query_id: QueryId::new(),
+			tenant_id: TenantId(1),
+			table_id: source.local_table_id,
+			table_object_id: source.table,
+			schema_generation: source.schema_generation,
+			physical_descriptor_fingerprint: source.fingerprint,
+			profile_hint: None,
+			trace_context: None,
+		})
+		.await
+		.expect("remove source storage after the first activation");
+	catalog.expire_lease_for_resolution();
+
+	coordinator
+		.execute_mutation_with_query_id(&plan, query_id)
+		.await
+		.expect("recovery activation resolves and publishes committed rows");
+	let saga = catalog
+		.resolve_ctas_saga(wendelon_client::CtasOperationId::new(
+			*query_id.get().as_bytes(),
+		))
+		.await
+		.expect("resolve saga")
+		.expect("saga exists");
+	assert_eq!(saga.phase, wendelon_client::CtasSagaPhase::Complete);
+	assert_eq!(saga.owner_epoch, 2);
+	assert_eq!(saga.row_count, Some(2));
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT id FROM resumed_copy ORDER BY id",
+	)
+	.await;
+	assert_eq!(int32_column(&batch, 0).values(), &[1, 2]);
 }
 
 #[tokio::test]
@@ -1088,6 +1335,7 @@ async fn executor_and_fragmenter_reject_direct_ctas_execution() {
 	let plan = ExecutionPlan::CreateTableAsSelect {
 		table: TableRef::new("copy"),
 		schema: source.schema.clone(),
+		intent_fingerprint: wendelon_client::CtasIntentFingerprint::new([0; 32]),
 		if_not_exists: false,
 		or_replace: false,
 		source: Box::new(scan_plan(&source)),
@@ -1296,6 +1544,7 @@ struct RacingCatalog {
 	inner: Arc<MockCatalog>,
 	target: TableRef,
 	raced_schema: SchemaRef,
+	race_at_publication: bool,
 }
 
 impl RacingCatalog {
@@ -1304,6 +1553,16 @@ impl RacingCatalog {
 			inner,
 			target,
 			raced_schema,
+			race_at_publication: false,
+		}
+	}
+
+	fn at_publication(inner: Arc<MockCatalog>, target: TableRef, raced_schema: SchemaRef) -> Self {
+		Self {
+			inner,
+			target,
+			raced_schema,
+			race_at_publication: true,
 		}
 	}
 }
@@ -1345,6 +1604,11 @@ impl Catalog for HidesTargetOnFirstResolve {
 	}
 
 	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		if table == &self.target && !self.hidden.swap(true, std::sync::atomic::Ordering::SeqCst) {
+			return Err(CatalogError::TableNotFound {
+				table: table.table.clone(),
+			});
+		}
 		self.inner.resolve_table(table).await
 	}
 
@@ -1388,6 +1652,41 @@ impl Catalog for HidesTargetOnFirstResolve {
 		self.inner
 			.create_table_with_outcome(name, schema, row_identity, if_not_exists)
 			.await
+	}
+
+	async fn provision_ctas(
+		&self,
+		request: CtasProvisionRequest,
+	) -> Result<CtasProvisionOutcome, CatalogError> {
+		self.inner.provision_ctas(request).await
+	}
+
+	async fn mutate_ctas_saga(
+		&self,
+		mutation: wendelon_client::CtasSagaMutation,
+	) -> Result<wendelon_client::CtasSagaEntry, CatalogError> {
+		self.inner.mutate_ctas_saga(mutation).await
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		operation_id: wendelon_client::CtasOperationId,
+	) -> Result<Option<wendelon_client::CtasSagaEntry>, CatalogError> {
+		self.inner.resolve_ctas_saga(operation_id).await
+	}
+
+	async fn resolve_ctas_object(
+		&self,
+		table_object_id: wendelon_client::TableObjectId,
+	) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_ctas_object(table_object_id).await
+	}
+
+	fn descriptor_for_ctas_binding(
+		&self,
+		binding: &TableBinding,
+	) -> Result<wendelon_client::TableSchemaDescriptor, CatalogError> {
+		self.inner.descriptor_for_ctas_binding(binding)
 	}
 
 	async fn drop_table(
@@ -1456,6 +1755,55 @@ impl Catalog for RacingCatalog {
 			.await
 	}
 
+	async fn provision_ctas(
+		&self,
+		request: CtasProvisionRequest,
+	) -> Result<CtasProvisionOutcome, CatalogError> {
+		if !self.race_at_publication && request.name == self.target {
+			let _ = self
+				.inner
+				.create_table(&request.name, self.raced_schema.clone(), true)
+				.await?;
+		}
+		self.inner.provision_ctas(request).await
+	}
+
+	async fn mutate_ctas_saga(
+		&self,
+		mutation: wendelon_client::CtasSagaMutation,
+	) -> Result<wendelon_client::CtasSagaEntry, CatalogError> {
+		if self.race_at_publication
+			&& matches!(&mutation, wendelon_client::CtasSagaMutation::Publish { .. })
+		{
+			let _ = self
+				.inner
+				.create_table(&self.target, self.raced_schema.clone(), true)
+				.await?;
+		}
+		self.inner.mutate_ctas_saga(mutation).await
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		operation_id: wendelon_client::CtasOperationId,
+	) -> Result<Option<wendelon_client::CtasSagaEntry>, CatalogError> {
+		self.inner.resolve_ctas_saga(operation_id).await
+	}
+
+	async fn resolve_ctas_object(
+		&self,
+		table_object_id: wendelon_client::TableObjectId,
+	) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_ctas_object(table_object_id).await
+	}
+
+	fn descriptor_for_ctas_binding(
+		&self,
+		binding: &TableBinding,
+	) -> Result<wendelon_client::TableSchemaDescriptor, CatalogError> {
+		self.inner.descriptor_for_ctas_binding(binding)
+	}
+
 	async fn drop_table(
 		&self,
 		name: &TableRef,
@@ -1513,5 +1861,216 @@ impl StorageWrite for FailingWrite {
 		Err(StorageError::Internal {
 			message: "forced CTAS write failure".to_string(),
 		})
+	}
+}
+
+struct KnownNotCommittedCtasWrite;
+
+#[async_trait]
+impl StorageWrite for KnownNotCommittedCtasWrite {
+	async fn write(&self, _request: WriteRequest) -> Result<WriteOutcome, StorageError> {
+		Err(StorageError::Internal {
+			message: "known-not-committed CTAS write".to_string(),
+		})
+	}
+
+	async fn resolve_mutation(
+		&self,
+		_tenant_id: TenantId,
+		_operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<ResolvedMutationOutcome, StorageError> {
+		Ok(ResolvedMutationOutcome {
+			resolution: MutationResolution::Present,
+			write_status: wendelon::schema::WriteStatus::INTERNAL_ERROR.0,
+			stop_reason: wendelon::schema::MutationStopReason::NONE.0,
+			commit_knowledge: wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED.0,
+			delete_counts: None,
+		})
+	}
+}
+
+struct AmbiguousCommittedCtasWrite {
+	inner: Arc<InMemoryTableStorage>,
+	failed_once: std::sync::atomic::AtomicBool,
+	resolution_calls: std::sync::atomic::AtomicUsize,
+}
+
+impl AmbiguousCommittedCtasWrite {
+	fn new(inner: Arc<InMemoryTableStorage>) -> Self {
+		Self {
+			inner,
+			failed_once: std::sync::atomic::AtomicBool::new(false),
+			resolution_calls: std::sync::atomic::AtomicUsize::new(0),
+		}
+	}
+}
+
+#[async_trait]
+impl StorageWrite for AmbiguousCommittedCtasWrite {
+	async fn write(&self, request: WriteRequest) -> Result<WriteOutcome, StorageError> {
+		let is_ctas = request
+			.operation_id
+			.is_some_and(|id| id.sequence_no == 0x4354_4153_0000_0001);
+		if is_ctas
+			&& !self
+				.failed_once
+				.swap(true, std::sync::atomic::Ordering::SeqCst)
+		{
+			let _ = self.inner.write(request).await?;
+			return Err(StorageError::Internal {
+				message: "ambiguous committed CTAS write".to_string(),
+			});
+		}
+		self.inner.write(request).await
+	}
+
+	async fn resolve_mutation(
+		&self,
+		_tenant_id: TenantId,
+		_operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<ResolvedMutationOutcome, StorageError> {
+		let call = self
+			.resolution_calls
+			.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		Ok(if call == 0 {
+			ResolvedMutationOutcome {
+				resolution: MutationResolution::Unknown,
+				write_status: 0,
+				stop_reason: 0,
+				commit_knowledge: wendelon::schema::MutationCommitKnowledge::UNSPECIFIED.0,
+				delete_counts: None,
+			}
+		} else {
+			ResolvedMutationOutcome {
+				resolution: MutationResolution::Present,
+				write_status: wendelon::schema::WriteStatus::OK.0,
+				stop_reason: wendelon::schema::MutationStopReason::NONE.0,
+				commit_knowledge: wendelon::schema::MutationCommitKnowledge::COMMITTED.0,
+				delete_counts: None,
+			}
+		})
+	}
+}
+
+struct ExpiredLeaseCatalog {
+	inner: Arc<MockCatalog>,
+	expire_on_resolve: std::sync::atomic::AtomicBool,
+}
+
+impl ExpiredLeaseCatalog {
+	fn new(inner: Arc<MockCatalog>) -> Self {
+		Self {
+			inner,
+			expire_on_resolve: std::sync::atomic::AtomicBool::new(false),
+		}
+	}
+
+	fn expire_lease_for_resolution(&self) {
+		self.expire_on_resolve
+			.store(true, std::sync::atomic::Ordering::SeqCst);
+	}
+}
+
+#[async_trait]
+impl Catalog for ExpiredLeaseCatalog {
+	fn scoped(self: Arc<Self>, _tenant_id: TenantId) -> Arc<dyn Catalog> {
+		self
+	}
+
+	fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics> {
+		self.inner.descriptor_refresh_metrics()
+	}
+
+	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_table(table).await
+	}
+
+	async fn resolve_table_local(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_table_local(table).await
+	}
+
+	async fn resolve_table_id(
+		&self,
+		table: toron::ir::TableId,
+	) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_table_id(table).await
+	}
+
+	async fn resolve_durable_logical_type_by_name(
+		&self,
+		name: &str,
+	) -> Result<toron::ir::LogicalTypeSpec, CatalogError> {
+		self.inner.resolve_durable_logical_type_by_name(name).await
+	}
+
+	async fn invalidate_table_descriptor(
+		&self,
+		table: toron::ir::TableId,
+	) -> Result<Option<InvalidatedDescriptor>, CatalogError> {
+		self.inner.invalidate_table_descriptor(table).await
+	}
+
+	async fn provision_ctas(
+		&self,
+		request: CtasProvisionRequest,
+	) -> Result<CtasProvisionOutcome, CatalogError> {
+		self.inner.provision_ctas(request).await
+	}
+
+	async fn mutate_ctas_saga(
+		&self,
+		mutation: wendelon_client::CtasSagaMutation,
+	) -> Result<wendelon_client::CtasSagaEntry, CatalogError> {
+		self.inner.mutate_ctas_saga(mutation).await
+	}
+
+	async fn resolve_ctas_saga(
+		&self,
+		operation_id: wendelon_client::CtasOperationId,
+	) -> Result<Option<wendelon_client::CtasSagaEntry>, CatalogError> {
+		let mut entry = self.inner.resolve_ctas_saga(operation_id).await?;
+		if self
+			.expire_on_resolve
+			.load(std::sync::atomic::Ordering::SeqCst)
+		{
+			if let Some(entry) = entry.as_mut() {
+				entry.owner_lease_expires_at_ms = 0;
+			}
+		}
+		Ok(entry)
+	}
+
+	async fn resolve_ctas_object(
+		&self,
+		table_object_id: wendelon_client::TableObjectId,
+	) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_ctas_object(table_object_id).await
+	}
+
+	fn descriptor_for_ctas_binding(
+		&self,
+		binding: &TableBinding,
+	) -> Result<wendelon_client::TableSchemaDescriptor, CatalogError> {
+		self.inner.descriptor_for_ctas_binding(binding)
+	}
+
+	async fn create_table_with_outcome(
+		&self,
+		name: &TableRef,
+		schema: SchemaRef,
+		row_identity: CreateTableRowIdentity,
+		if_not_exists: bool,
+	) -> Result<CreateTableOutcome, CatalogError> {
+		self.inner
+			.create_table_with_outcome(name, schema, row_identity, if_not_exists)
+			.await
+	}
+
+	async fn drop_table(
+		&self,
+		name: &TableRef,
+		if_exists: bool,
+	) -> Result<Option<TableBinding>, CatalogError> {
+		self.inner.drop_table(name, if_exists).await
 	}
 }

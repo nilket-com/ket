@@ -15,12 +15,13 @@ use tokio::sync::watch;
 use uuid::Uuid;
 use wendelon::client::{
 	ClusterPeerWire, ClusterStatusWire, ControlRingTopologySource, CounterAddRequest,
-	CounterReadRequest, DATA_RETRY_BUDGET, MutationOutcomeRequest, ReadRequest,
-	TableDeleteRowsRequest, TableQueryRequest, TableWriteRequest, WendelonClient as InnerClient,
-	WendelonClientConfig, WriteRequest,
+	CounterReadRequest, DATA_RETRY_BUDGET, MutationOutcomePinRequest, MutationOutcomeRequest,
+	ReadRequest, TableDeleteRowsRequest, TableQueryRequest, TableWriteRequest,
+	WendelonClient as InnerClient, WendelonClientConfig, WriteRequest,
 };
 use wendelon::network::control_server::{
-	CONTROL_REASON_NOT_LEADER, SchemaUpdateResponseWire, TableSchemaDropResponseWire,
+	CONTROL_REASON_NOT_LEADER, CtasSagaRequestWire, CtasSagaResponseWire, SchemaUpdateResponseWire,
+	TableSchemaDropResponseWire,
 };
 use wendelon::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use wendelon::network::factory::TransportProviderFactory;
@@ -37,10 +38,11 @@ use wendelon::network::wire;
 use wendelon::schema::{
 	ClientWriteId, CounterAddRequestMeta, CounterReadRequestMeta, FinalizationMarker, FrameHeader,
 	HybridTimestamp, Identity, MsgType, MutationCommitKnowledge, MutationOperationKind,
-	MutationResolutionStatus, MutationStopReason, NodeId, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
-	ReadRequestMeta, ReadStatus, TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED,
-	TableDeleteRowsRequestMeta, TableQueryCancelResponseMeta, TableQueryRequestId,
-	TableQueryRequestMeta, TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
+	MutationOutcomePinAction, MutationResolutionStatus, MutationStopReason, NodeId,
+	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, ReadRequestMeta, ReadStatus,
+	TABLE_QUERY_TRACE_FLAG_PRESENT, TABLE_QUERY_TRACE_FLAG_SAMPLED, TableDeleteRowsRequestMeta,
+	TableQueryCancelResponseMeta, TableQueryRequestId, TableQueryRequestMeta,
+	TableWriteRequestMeta, TenantId, WriteRequestMeta, WriteStatus,
 	encode_table_schema_descriptor_v1, encode_table_write_row_count, read_key_schema,
 	write_payload_schema,
 };
@@ -75,8 +77,10 @@ pub use wendelon::schema::{
 	ARROW_STATS_TAG_UINT32, ARROW_STATS_TAG_UINT64, ARROW_STATS_TAG_UTF8, CdcCursor, CdcRejectCode,
 	CdcSubscribeBound, ColumnGroupNdvFact, ColumnGroupTopKEntry, ColumnGroupTopKFact,
 	ColumnHeavyHitterEntry, ColumnHeavyHitterFact, ColumnNdvFact, ColumnRangeDistributionFact,
-	ColumnRangeFact, Consistency as ReadConsistency, DurabilityLevel as DurabilityClass,
-	IndexObjectId, LocalityPolicy, LogicalSchemaFingerprint, NdvFact, PbcRejectCode,
+	ColumnRangeFact, Consistency as ReadConsistency, CtasExpectedBinding, CtasIntentFingerprint,
+	CtasOperationId, CtasSagaEntry, CtasSagaMutation, CtasSagaPhase, CtasSagaReject,
+	CtasSagaResponse, CtasTerminalCause, DurabilityLevel as DurabilityClass, IndexObjectId,
+	LocalityPolicy, LogicalSchemaFingerprint, NdvFact, PbcRejectCode,
 	PhysicalDescriptorFingerprint, PrimaryKeyDescriptor, PrimaryKeyEncoding,
 	RangeDistributionBucket, RowIdentityPolicy, RuntimeFilterDescriptor, SchemaEvolutionPolicy,
 	SecondaryIndexDescriptor, SecondaryIndexDropRequest, SecondaryIndexStatus, StateDigest,
@@ -86,6 +90,8 @@ pub use wendelon::schema::{
 	encode_float64_optimizer_fact_scalar, encode_secondary_index_descriptor,
 	encode_secondary_index_drop_request, encode_signed_optimizer_fact_scalar,
 };
+
+pub use wendelon::schema::{CTAS_SAGA_CAPACITY, CTAS_SAGA_DETAIL_RETENTION_MS};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapPeer {
@@ -840,6 +846,63 @@ impl Client {
 		self.submit_schema_update_payload(payload).await
 	}
 
+	/// Apply one ADR 548 control-ring saga transition.
+	pub async fn mutate_ctas_saga(
+		&self,
+		mutation: CtasSagaMutation,
+	) -> Result<CtasSagaResponse, ClientError> {
+		self.submit_ctas_saga_request(CtasSagaRequestWire::Mutate(mutation))
+			.await
+	}
+
+	/// Resolve the durable ADR 548 composite state without replaying a phase.
+	pub async fn resolve_ctas_saga(
+		&self,
+		tenant_id: TenantId,
+		operation_id: CtasOperationId,
+	) -> Result<CtasSagaResponse, ClientError> {
+		self.submit_ctas_saga_request(CtasSagaRequestWire::Resolve {
+			tenant_id,
+			operation_id,
+		})
+		.await
+	}
+
+	async fn submit_ctas_saga_request(
+		&self,
+		request: CtasSagaRequestWire,
+	) -> Result<CtasSagaResponse, ClientError> {
+		let payload = wire::encode(&request)?;
+		let mut preferred_target = self.inner.leader();
+		for attempt in 0..DATA_RETRY_BUDGET {
+			let target = if let Some(target) = preferred_target {
+				target
+			} else {
+				self.inner.refresh_topology().await?;
+				self.inner.leader().ok_or_else(|| {
+					std::io::Error::new(
+						std::io::ErrorKind::NotConnected,
+						"CTAS saga request requires a known control-ring leader",
+					)
+				})?
+			};
+			let response = self.submit_ctas_saga_once(target, &payload).await?;
+			if response
+				.leader_hint
+				.is_some_and(|leader| leader != target.id)
+				&& attempt + 1 < DATA_RETRY_BUDGET
+			{
+				preferred_target = response.leader_hint.map(|id| NodeId { id, _reserved: 0 });
+				self.inner.refresh_topology().await?;
+				continue;
+			}
+			return Ok(response.response);
+		}
+		Err(ClientError::Admin(WendelonAdminError::Transport {
+			message: "CTAS saga retry budget exhausted".to_owned(),
+		}))
+	}
+
 	pub async fn submit_logical_type_definition_create(
 		&self,
 		request: LogicalTypeDefinitionCreateRequest,
@@ -975,6 +1038,50 @@ impl Client {
 			.into());
 		}
 		Ok(wire::decode::<SchemaUpdateResponseWire>(&frame.meta)?)
+	}
+
+	async fn submit_ctas_saga_once(
+		&self,
+		target: NodeId,
+		payload: &[u8],
+	) -> Result<CtasSagaResponseWire, ClientError> {
+		let conn = self.inner.factory().get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::CTAS_SAGA_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: payload.len() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, payload, None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| std::io::Error::new(std::io::ErrorKind::BrokenPipe, error))?;
+
+		let frame = read_frame(&mut *stream, self.inner.pool()).await?;
+		if frame.header.msg_type != MsgType::CTAS_SAGA_RESP.0 {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!(
+					"expected CTAS_SAGA_RESP, got msg_type=0x{:02x}",
+					frame.header.msg_type
+				),
+			)
+			.into());
+		}
+		if frame.arrow_payload.is_some() || frame.trailing.is_some() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				"CTAS_SAGA_RESP must not carry Arrow or trailing payloads",
+			)
+			.into());
+		}
+		Ok(wire::decode::<CtasSagaResponseWire>(&frame.meta)?)
 	}
 
 	async fn submit_schema_drop_once(
@@ -1377,6 +1484,39 @@ impl Client {
 				response.not_found_count,
 			]),
 		})
+	}
+
+	/// Pin terminal row-mutation evidence before a staged CTAS dispatch.
+	pub async fn pin_table_mutation_outcome(
+		&self,
+		tenant_id: TenantId,
+		operation_id: ClientWriteId,
+	) -> Result<(), ClientError> {
+		self.inner
+			.set_mutation_outcome_pin(MutationOutcomePinRequest {
+				tenant_id,
+				operation_id,
+				action: MutationOutcomePinAction::PIN,
+			})
+			.await
+			.map_err(ClientError::Io)
+	}
+
+	/// Release a staged CTAS pin after the Control Ring durably attests the row
+	/// outcome. This call is idempotent.
+	pub async fn acknowledge_table_mutation_outcome(
+		&self,
+		tenant_id: TenantId,
+		operation_id: ClientWriteId,
+	) -> Result<(), ClientError> {
+		self.inner
+			.set_mutation_outcome_pin(MutationOutcomePinRequest {
+				tenant_id,
+				operation_id,
+				action: MutationOutcomePinAction::ACKNOWLEDGE,
+			})
+			.await
+			.map_err(ClientError::Io)
 	}
 
 	pub async fn read(

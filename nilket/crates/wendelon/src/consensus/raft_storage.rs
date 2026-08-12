@@ -65,9 +65,15 @@ use crate::integration::compute::{
 };
 use crate::metrics::global as metrics;
 use crate::network::tls::ActorTrustDomain;
+#[cfg(test)]
 use crate::schema::{
-	FinalizationMarker, HybridTimestamp, IndexObjectId, Locality, LogEntryKind,
-	NodeId as SchemaNodeId, RaftLogEntryFixed, RowIdentityPolicy,
+	ClientWriteId, CtasIntentFingerprint, CtasOperationId, CtasTerminalCause, SupersessionMetadata,
+	TombstoneMetadata,
+};
+use crate::schema::{
+	CtasExpectedBinding, CtasSagaCatalog, CtasSagaEntry, CtasSagaMutation, CtasSagaPhase,
+	CtasSagaReject, CtasSagaResponse, FinalizationMarker, HybridTimestamp, IndexObjectId, Locality,
+	LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed, RowIdentityPolicy,
 	SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SecondaryIndexCatalog, SecondaryIndexDescriptor,
 	SecondaryIndexState, SlabId, SnapshotHeader, TableDropFenceCatalog, TableLifecycleCatalog,
 	TableRetentionPolicy, TableSchemaCatalog, TableSchemaDescriptor, TenantId, TenantKekId,
@@ -75,8 +81,6 @@ use crate::schema::{
 	decode_secondary_index_lifecycle_complete, decode_table_schema_descriptor_v1,
 	validate_table_schema_evolution,
 };
-#[cfg(test)]
-use crate::schema::{SupersessionMetadata, TombstoneMetadata};
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
 	AsyncFileOps, BlockingFileOps, CompactionCommit, FileHandle, IoUringFileOps, OpenFlags,
@@ -1554,6 +1558,9 @@ pub struct SmState {
 	/// Wendelon-owned DROP orchestration and data-path admission.
 	#[serde(default)]
 	pub table_drop_fences: TableDropFenceCatalog,
+	/// ADR 548 durable CTAS staged-publication saga ledger.
+	#[serde(default)]
+	pub ctas_sagas: CtasSagaCatalog,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3897,6 +3904,17 @@ fn apply_request_at_log_index(
 		WendelonRequest::TableDropFinalize(request) => {
 			(apply_table_drop_finalize(state, request), None)
 		}
+		WendelonRequest::CtasSaga(mutation) => {
+			let response = match apply_ctas_saga_mutation(state, mutation) {
+				CtasSagaResponse::Applied(_) => WendelonResponse::Success,
+				CtasSagaResponse::Rejected(reject) => WendelonResponse::Error(format!(
+					"{}{code}",
+					crate::schema::CTAS_SAGA_REJECT_PREFIX,
+					code = reject.code()
+				)),
+			};
+			(response, None)
+		}
 		WendelonRequest::TierSlab(tier) => {
 			// Idempotent replays keep the existing mapping; pointer
 			// refreshes (for re-encryption or URI/hash repair) update
@@ -4241,6 +4259,400 @@ fn apply_table_schema_update(
 	}
 }
 
+fn ctas_expected_binding_matches(
+	state: &SmState,
+	tenant_id: crate::schema::TenantId,
+	entry: &CtasSagaEntry,
+) -> bool {
+	let current = state.table_schemas.current_binding_key(
+		tenant_id,
+		&entry.descriptor.namespace,
+		&entry.descriptor.table_name,
+	);
+	match entry.expected_binding {
+		CtasExpectedBinding::Absent => current.is_none(),
+		CtasExpectedBinding::Bound {
+			table_object_id,
+			schema_generation,
+		} => current.is_some_and(|binding| binding == (table_object_id, schema_generation.get())),
+	}
+}
+
+fn ctas_owned_entry_mut(
+	state: &mut SmState,
+	tenant_id: crate::schema::TenantId,
+	operation_id: crate::schema::CtasOperationId,
+	owner_epoch: u64,
+) -> Result<&mut CtasSagaEntry, CtasSagaReject> {
+	let entry = state
+		.ctas_sagas
+		.get_mut(tenant_id, operation_id)
+		.ok_or(CtasSagaReject::NotFound)?;
+	if entry.owner_epoch != owner_epoch {
+		return Err(CtasSagaReject::StaleOwner);
+	}
+	Ok(entry)
+}
+
+fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> CtasSagaResponse {
+	match mutation {
+		CtasSagaMutation::Provision {
+			tenant_id,
+			operation_id,
+			intent_fingerprint,
+			descriptor,
+			expected_binding,
+			prior_descriptor,
+			row_write_id,
+			owner_epoch,
+			observed_now_ms,
+			owner_lease_expires_at_ms,
+		} => {
+			state.ctas_sagas.prune_terminal_detail(observed_now_ms);
+			if let Some(existing) = state.ctas_sagas.get(tenant_id, operation_id) {
+				return if existing.intent_fingerprint == intent_fingerprint {
+					CtasSagaResponse::Applied(existing.clone())
+				} else {
+					CtasSagaResponse::Rejected(CtasSagaReject::IntentMismatch)
+				};
+			}
+			if operation_id.issued_at_unix_millis().is_none() {
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidOperationId);
+			}
+			if state
+				.ctas_sagas
+				.is_expired(tenant_id, operation_id, observed_now_ms)
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::Expired);
+			}
+			if state.ctas_sagas.len() >= crate::schema::CTAS_SAGA_CAPACITY {
+				return CtasSagaResponse::Rejected(CtasSagaReject::CapacityExhausted);
+			}
+			let entry = CtasSagaEntry {
+				tenant_id,
+				operation_id,
+				intent_fingerprint,
+				descriptor: descriptor.clone(),
+				expected_binding,
+				prior_descriptor,
+				row_write_id,
+				row_count: None,
+				phase: CtasSagaPhase::Provisioned,
+				terminal_cause: None,
+				owner_epoch,
+				owner_lease_expires_at_ms,
+				retry_debt: 0,
+				terminal_at_ms: None,
+			};
+			let prior_matches = match (entry.expected_binding, entry.prior_descriptor.as_ref()) {
+				(CtasExpectedBinding::Absent, None) => true,
+				(
+					CtasExpectedBinding::Bound {
+						table_object_id,
+						schema_generation,
+					},
+					Some(prior),
+				) => {
+					prior.table_object_id == table_object_id
+						&& prior.schema_generation == schema_generation.get()
+				}
+				_ => false,
+			};
+			if !prior_matches {
+				return CtasSagaResponse::Rejected(CtasSagaReject::BindingChanged);
+			}
+			if !ctas_expected_binding_matches(state, tenant_id, &entry) {
+				return CtasSagaResponse::Rejected(CtasSagaReject::BindingChanged);
+			}
+			if state
+				.ctas_sagas
+				.operation_for_object(tenant_id, descriptor.table_object_id)
+				.is_some()
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::ForeignProvisionalObject);
+			}
+			if state
+				.table_schemas
+				.insert_provisional(tenant_id, descriptor)
+				.is_err()
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::ForeignProvisionalObject);
+			}
+			state.ctas_sagas.insert(entry.clone());
+			CtasSagaResponse::Applied(entry)
+		}
+		CtasSagaMutation::MarkRowDispatched {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+			row_count,
+		} => {
+			let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch) {
+				Ok(entry) => entry,
+				Err(reject) => return CtasSagaResponse::Rejected(reject),
+			};
+			match entry.phase {
+				CtasSagaPhase::Provisioned => {
+					entry.row_count = Some(row_count);
+					entry.phase = CtasSagaPhase::RowDispatched;
+				}
+				CtasSagaPhase::RowDispatched if entry.row_count == Some(row_count) => {}
+				_ => return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition),
+			}
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::AttestRowsCommitted {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+			row_count,
+		} => {
+			let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch) {
+				Ok(entry) => entry,
+				Err(reject) => return CtasSagaResponse::Rejected(reject),
+			};
+			match entry.phase {
+				CtasSagaPhase::RowDispatched if entry.row_count == Some(row_count) => {
+					entry.phase = CtasSagaPhase::RowsCommitted { row_count };
+				}
+				CtasSagaPhase::RowsCommitted {
+					row_count: existing,
+				} if existing == row_count => {}
+				_ => return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition),
+			}
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::Publish {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+		} => {
+			let Some(snapshot) = state.ctas_sagas.get(tenant_id, operation_id).cloned() else {
+				return CtasSagaResponse::Rejected(CtasSagaReject::NotFound);
+			};
+			if snapshot.owner_epoch != owner_epoch {
+				return CtasSagaResponse::Rejected(CtasSagaReject::StaleOwner);
+			}
+			if !matches!(snapshot.phase, CtasSagaPhase::RowsCommitted { .. }) {
+				return CtasSagaResponse::Rejected(CtasSagaReject::RowsNotCommitted);
+			}
+			if !ctas_expected_binding_matches(state, tenant_id, &snapshot) {
+				return CtasSagaResponse::Rejected(CtasSagaReject::BindingChanged);
+			}
+			if !state
+				.table_schemas
+				.is_provisional(tenant_id, snapshot.descriptor.table_object_id)
+				|| state
+					.ctas_sagas
+					.operation_for_object(tenant_id, snapshot.descriptor.table_object_id)
+					.is_none_or(|owner| owner.operation_id != operation_id)
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::ForeignProvisionalObject);
+			}
+			if state
+				.table_schemas
+				.publish_provisional(
+					tenant_id,
+					snapshot.descriptor.table_object_id,
+					snapshot.descriptor.schema_generation,
+				)
+				.is_err()
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::ForeignProvisionalObject);
+			}
+			state.table_lifecycle.ensure_inherit_cluster(
+				tenant_id,
+				snapshot.descriptor.table_object_id,
+				HybridTimestamp {
+					physical_ms: 0,
+					logical: 0,
+					node_id: 0,
+				},
+			);
+			let entry = state
+				.ctas_sagas
+				.get_mut(tenant_id, operation_id)
+				.expect("CTAS snapshot came from the saga ledger");
+			entry.phase = CtasSagaPhase::Published;
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::MarkRetiringOld {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+		} => {
+			let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch) {
+				Ok(entry) => entry,
+				Err(reject) => return CtasSagaResponse::Rejected(reject),
+			};
+			if entry.phase != CtasSagaPhase::Published
+				|| !matches!(entry.expected_binding, CtasExpectedBinding::Bound { .. })
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			entry.phase = CtasSagaPhase::RetiringOld;
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::Complete {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+			completed_at_ms,
+		} => {
+			let old_object = {
+				let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch)
+				{
+					Ok(entry) => entry,
+					Err(reject) => return CtasSagaResponse::Rejected(reject),
+				};
+				let allowed = match entry.expected_binding {
+					CtasExpectedBinding::Absent => entry.phase == CtasSagaPhase::Published,
+					CtasExpectedBinding::Bound { .. } => entry.phase == CtasSagaPhase::RetiringOld,
+				};
+				if !allowed {
+					return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+				}
+				match entry.expected_binding {
+					CtasExpectedBinding::Bound {
+						table_object_id, ..
+					} => Some(table_object_id),
+					CtasExpectedBinding::Absent => None,
+				}
+			};
+			if let Some(table_object_id) = old_object
+				&& state
+					.table_schemas
+					.retire_unbound_object(tenant_id, table_object_id)
+					.is_err()
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			let entry = state
+				.ctas_sagas
+				.get_mut(tenant_id, operation_id)
+				.expect("owned CTAS saga entry remains present");
+			entry.phase = CtasSagaPhase::Complete;
+			entry.terminal_at_ms = Some(completed_at_ms);
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::Reclaim {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+			cause,
+			completed_at_ms,
+		} => {
+			if matches!(cause, crate::schema::CtasTerminalCause::PublicationConflict) {
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			let table_object_id = {
+				let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch)
+				{
+					Ok(entry) => entry,
+					Err(reject) => return CtasSagaResponse::Rejected(reject),
+				};
+				let allowed = match cause {
+					crate::schema::CtasTerminalCause::DeadlineBeforeRowDispatch
+					| crate::schema::CtasTerminalCause::OwnerAbandonedBeforeRowDispatch => {
+						entry.phase == CtasSagaPhase::Provisioned
+					}
+					crate::schema::CtasTerminalCause::RowKnownNotCommitted => {
+						matches!(entry.phase, CtasSagaPhase::RowDispatched)
+					}
+					crate::schema::CtasTerminalCause::PublicationConflict => false,
+				};
+				if !allowed {
+					return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+				}
+				entry.descriptor.table_object_id
+			};
+			if state
+				.table_schemas
+				.retire_unbound_object(tenant_id, table_object_id)
+				.is_err()
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			let entry = state.ctas_sagas.get_mut(tenant_id, operation_id).unwrap();
+			entry.phase = CtasSagaPhase::Reclaimed;
+			entry.terminal_cause = Some(cause);
+			entry.terminal_at_ms = Some(completed_at_ms);
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::RecordPublicationConflict {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+			completed_at_ms,
+		} => {
+			let table_object_id = {
+				let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch)
+				{
+					Ok(entry) => entry,
+					Err(reject) => return CtasSagaResponse::Rejected(reject),
+				};
+				if !matches!(entry.phase, CtasSagaPhase::RowsCommitted { .. }) {
+					return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+				}
+				entry.descriptor.table_object_id
+			};
+			if state
+				.table_schemas
+				.retire_unbound_object(tenant_id, table_object_id)
+				.is_err()
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			let entry = state.ctas_sagas.get_mut(tenant_id, operation_id).unwrap();
+			entry.phase = CtasSagaPhase::Conflict;
+			entry.terminal_cause = Some(crate::schema::CtasTerminalCause::PublicationConflict);
+			entry.terminal_at_ms = Some(completed_at_ms);
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::RecordRetryDebt {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+		} => {
+			let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch) {
+				Ok(entry) => entry,
+				Err(reject) => return CtasSagaResponse::Rejected(reject),
+			};
+			if entry.phase.is_terminal() {
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			entry.retry_debt = entry.retry_debt.saturating_add(1);
+			entry.owner_lease_expires_at_ms = 0;
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::Claim {
+			tenant_id,
+			operation_id,
+			expected_owner_epoch,
+			new_owner_epoch,
+			observed_now_ms,
+			lease_expires_at_ms,
+		} => {
+			let Some(entry) = state.ctas_sagas.get_mut(tenant_id, operation_id) else {
+				return CtasSagaResponse::Rejected(CtasSagaReject::NotFound);
+			};
+			if entry.phase.is_terminal() {
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			if entry.owner_epoch != expected_owner_epoch || new_owner_epoch <= expected_owner_epoch
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::StaleOwner);
+			}
+			if observed_now_ms < entry.owner_lease_expires_at_ms {
+				return CtasSagaResponse::Rejected(CtasSagaReject::OwnerLeaseStillLive);
+			}
+			entry.owner_epoch = new_owner_epoch;
+			entry.owner_lease_expires_at_ms = lease_expires_at_ms;
+			CtasSagaResponse::Applied(entry.clone())
+		}
+	}
+}
+
 fn apply_table_drop_prepare(
 	state: &mut SmState,
 	request: TableDropPrepareRequest,
@@ -4270,13 +4682,19 @@ fn apply_table_drop_prepare(
 			descriptor.schema_generation
 		));
 	}
-	if !state.table_schemas.is_latest_name_bound(
+	let name_is_bound = state.table_schemas.is_latest_name_bound(
 		operation_id.tenant_id,
 		&descriptor.namespace,
 		&descriptor.table_name,
 		operation_id.table_object_id,
 		descriptor.schema_generation,
-	) {
+	);
+	let is_ctas_retirement = state.ctas_sagas.retiring_old_binding(
+		operation_id.tenant_id,
+		operation_id.table_object_id,
+		operation_id.schema_generation,
+	);
+	if !name_is_bound && !is_ctas_retirement {
 		return WendelonResponse::Error(format!(
 			"table {:?} is already dropped",
 			operation_id.table_object_id
@@ -4353,11 +4771,17 @@ fn apply_table_drop_finalize(
 		));
 	}
 	let expected_generation = operation_id.schema_generation.get();
-	if let Err(err) = state.table_schemas.unbind_latest_name(
+	let already_unbound_for_ctas = state.ctas_sagas.retiring_old_binding(
 		operation_id.tenant_id,
 		operation_id.table_object_id,
-		expected_generation,
-	) {
+		operation_id.schema_generation,
+	);
+	if !already_unbound_for_ctas
+		&& let Err(err) = state.table_schemas.unbind_latest_name(
+			operation_id.tenant_id,
+			operation_id.table_object_id,
+			expected_generation,
+		) {
 		return WendelonResponse::Error(err.to_string());
 	}
 	state
@@ -5727,6 +6151,7 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 			(LogEntryKind::CONFIG, r.to.epoch)
 		}
 		EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::CtasSaga(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::RetireTieredSlab(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CompactionCommit(_)) => (LogEntryKind::APPEND, 0),
@@ -6252,8 +6677,15 @@ mod schema_state_tests {
 	}
 
 	fn append_only_table_descriptor(generation: u64) -> TableSchemaDescriptor {
+		append_only_table_descriptor_for(generation, TableObjectId::new([8; 16]))
+	}
+
+	fn append_only_table_descriptor_for(
+		generation: u64,
+		table_object_id: TableObjectId,
+	) -> TableSchemaDescriptor {
 		TableSchemaDescriptor::new_with_layout(
-			TableObjectId::new([8; 16]),
+			table_object_id,
 			generation,
 			"analytics",
 			"append_events",
@@ -6301,6 +6733,514 @@ mod schema_state_tests {
 		)
 		.unwrap();
 		state
+	}
+
+	fn ctas_write_id(byte: u8) -> ClientWriteId {
+		let mut client_uuid = [byte; 16];
+		client_uuid[6] = 0x70;
+		client_uuid[8] = 0x80;
+		ClientWriteId {
+			client_uuid,
+			sequence_no: 7,
+			idempotency_ttl_ms: 300_000,
+			_pad: 0,
+		}
+	}
+
+	fn ctas_operation_id(byte: u8) -> CtasOperationId {
+		let mut bytes = [byte; 16];
+		bytes[..5].fill(0);
+		bytes[5] = 1;
+		bytes[6] = 0x70;
+		bytes[8] = 0x80;
+		CtasOperationId::new(bytes)
+	}
+
+	fn provision_ctas(
+		state: &mut SmState,
+		descriptor: TableSchemaDescriptor,
+		expected_binding: CtasExpectedBinding,
+	) -> CtasSagaEntry {
+		let prior_descriptor = match expected_binding {
+			CtasExpectedBinding::Absent => None,
+			CtasExpectedBinding::Bound {
+				table_object_id,
+				schema_generation,
+			} => state
+				.table_schemas
+				.get_including_provisional(
+					TenantId::new(7),
+					table_object_id,
+					schema_generation.get(),
+				)
+				.cloned(),
+		};
+		let response = apply_ctas_saga_mutation(
+			state,
+			CtasSagaMutation::Provision {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
+				descriptor,
+				expected_binding,
+				prior_descriptor,
+				row_write_id: ctas_write_id(0x54),
+				owner_epoch: 1,
+				observed_now_ms: 1,
+				owner_lease_expires_at_ms: 1_000,
+			},
+		);
+		let CtasSagaResponse::Applied(entry) = response else {
+			panic!("provision CTAS: {response:?}");
+		};
+		entry
+	}
+
+	#[test]
+	fn adr548_provisional_descriptor_is_not_visible_to_by_id_consumers() {
+		let descriptor = append_only_table_descriptor(1);
+		let table_object_id = descriptor.table_object_id;
+		let mut state = SmState::default();
+		let entry = provision_ctas(&mut state, descriptor, CtasExpectedBinding::Absent);
+
+		assert_eq!(entry.phase, CtasSagaPhase::Provisioned);
+		assert!(
+			state
+				.table_schemas
+				.get_including_provisional(TenantId::new(7), table_object_id, 1)
+				.is_some()
+		);
+		assert!(
+			state
+				.table_schemas
+				.latest_by_id(TenantId::new(7), table_object_id)
+				.is_none()
+		);
+		assert!(
+			state
+				.table_schemas
+				.descriptors_for_tenant(TenantId::new(7))
+				.is_empty()
+		);
+		assert!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "append_events")
+				.is_none()
+		);
+	}
+
+	#[test]
+	fn adr548_reused_operation_id_with_different_intent_is_refused() {
+		let mut state = SmState::default();
+		let descriptor = append_only_table_descriptor(1);
+		let original = provision_ctas(&mut state, descriptor.clone(), CtasExpectedBinding::Absent);
+		let response = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Provision {
+				tenant_id: TenantId::new(7),
+				operation_id: original.operation_id,
+				intent_fingerprint: CtasIntentFingerprint::new([0x99; 32]),
+				descriptor,
+				expected_binding: CtasExpectedBinding::Absent,
+				prior_descriptor: None,
+				row_write_id: original.row_write_id,
+				owner_epoch: 1,
+				observed_now_ms: 2,
+				owner_lease_expires_at_ms: 1_001,
+			},
+		);
+		assert_eq!(
+			response,
+			CtasSagaResponse::Rejected(CtasSagaReject::IntentMismatch)
+		);
+		assert_eq!(
+			state
+				.ctas_sagas
+				.get(TenantId::new(7), original.operation_id),
+			Some(&original)
+		);
+	}
+
+	#[test]
+	fn adr548_publication_requires_attestation_and_preserves_a_concurrent_winner() {
+		let provisional = append_only_table_descriptor(1);
+		let mut state = SmState::default();
+		provision_ctas(&mut state, provisional, CtasExpectedBinding::Absent);
+
+		assert_eq!(
+			apply_ctas_saga_mutation(
+				&mut state,
+				CtasSagaMutation::Publish {
+					tenant_id: TenantId::new(7),
+					operation_id: ctas_operation_id(0x54),
+					owner_epoch: 1,
+				},
+			),
+			CtasSagaResponse::Rejected(CtasSagaReject::RowsNotCommitted)
+		);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::MarkRowDispatched {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count: 2,
+			},
+		);
+
+		let winner = append_only_table_descriptor_for(1, TableObjectId::new([0x99; 16]));
+		state
+			.table_schemas
+			.upsert(TenantId::new(7), winner.clone())
+			.unwrap();
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::AttestRowsCommitted {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count: 2,
+			},
+		);
+		assert_eq!(
+			apply_ctas_saga_mutation(
+				&mut state,
+				CtasSagaMutation::Publish {
+					tenant_id: TenantId::new(7),
+					operation_id: ctas_operation_id(0x54),
+					owner_epoch: 1,
+				},
+			),
+			CtasSagaResponse::Rejected(CtasSagaReject::BindingChanged)
+		);
+		assert_eq!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "append_events")
+				.unwrap()
+				.table_object_id,
+			winner.table_object_id
+		);
+	}
+
+	#[test]
+	fn adr548_retiring_old_uses_the_fenced_drop_lifecycle_after_the_name_swap() {
+		let old = append_only_table_descriptor_for(1, TableObjectId::new([0x21; 16]));
+		let replacement = append_only_table_descriptor_for(1, TableObjectId::new([0x22; 16]));
+		let mut state = SmState::default();
+		state
+			.table_schemas
+			.upsert(TenantId::new(7), old.clone())
+			.unwrap();
+		provision_ctas(
+			&mut state,
+			replacement.clone(),
+			CtasExpectedBinding::Bound {
+				table_object_id: old.table_object_id,
+				schema_generation: SchemaGeneration::new(old.schema_generation),
+			},
+		);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::MarkRowDispatched {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count: 2,
+			},
+		);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::AttestRowsCommitted {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count: 2,
+			},
+		);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Publish {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+			},
+		);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::MarkRetiringOld {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+			},
+		);
+
+		let drop_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: old.table_object_id,
+			schema_generation: SchemaGeneration::new(old.schema_generation),
+		};
+		assert_eq!(
+			apply_table_drop_prepare(
+				&mut state,
+				TableDropPrepareRequest::current(drop_id, drop_id.schema_generation),
+				10,
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			apply_table_reclaim_completion(
+				&mut state,
+				TableReclaimCompletionRequest::current(drop_id, 10),
+				11,
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			apply_table_drop_finalize(
+				&mut state,
+				TableDropFinalizeRequest::current(drop_id, 10, 11),
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "append_events")
+				.unwrap()
+				.table_object_id,
+			replacement.table_object_id,
+			"retirement finalization must never unbind the replacement"
+		);
+	}
+
+	#[test]
+	fn adr548_publication_rejects_a_missing_or_foreign_provisional_object() {
+		let provisional = append_only_table_descriptor(1);
+		let object_id = provisional.table_object_id;
+		let mut state = SmState::default();
+		provision_ctas(&mut state, provisional, CtasExpectedBinding::Absent);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::MarkRowDispatched {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count: 1,
+			},
+		);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::AttestRowsCommitted {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count: 1,
+			},
+		);
+		state
+			.table_schemas
+			.retire_unbound_object(TenantId::new(7), object_id)
+			.unwrap();
+		assert_eq!(
+			apply_ctas_saga_mutation(
+				&mut state,
+				CtasSagaMutation::Publish {
+					tenant_id: TenantId::new(7),
+					operation_id: ctas_operation_id(0x54),
+					owner_epoch: 1,
+				},
+			),
+			CtasSagaResponse::Rejected(CtasSagaReject::ForeignProvisionalObject)
+		);
+	}
+
+	#[test]
+	fn adr548_takeover_and_terminal_causes_are_typed() {
+		let mut state = SmState::default();
+		provision_ctas(
+			&mut state,
+			append_only_table_descriptor(1),
+			CtasExpectedBinding::Absent,
+		);
+		assert_eq!(
+			apply_ctas_saga_mutation(
+				&mut state,
+				CtasSagaMutation::Claim {
+					tenant_id: TenantId::new(7),
+					operation_id: ctas_operation_id(0x54),
+					expected_owner_epoch: 1,
+					new_owner_epoch: 2,
+					observed_now_ms: 999,
+					lease_expires_at_ms: 2_000,
+				},
+			),
+			CtasSagaResponse::Rejected(CtasSagaReject::OwnerLeaseStillLive)
+		);
+		let CtasSagaResponse::Applied(claimed) = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Claim {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				expected_owner_epoch: 1,
+				new_owner_epoch: 2,
+				observed_now_ms: 1_000,
+				lease_expires_at_ms: 2_000,
+			},
+		) else {
+			panic!("expired ownership must be claimable");
+		};
+		assert_eq!(claimed.owner_epoch, 2);
+		let CtasSagaResponse::Applied(reclaimed) = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Reclaim {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 2,
+				cause: CtasTerminalCause::OwnerAbandonedBeforeRowDispatch,
+				completed_at_ms: 1_001,
+			},
+		) else {
+			panic!("current owner must reclaim an undispatched saga");
+		};
+		assert_eq!(reclaimed.phase, CtasSagaPhase::Reclaimed);
+		assert_eq!(
+			reclaimed.terminal_cause,
+			Some(CtasTerminalCause::OwnerAbandonedBeforeRowDispatch)
+		);
+		let after_retention =
+			1_001_u64.saturating_add(crate::schema::CTAS_SAGA_DETAIL_RETENTION_MS);
+		assert_eq!(
+			apply_ctas_saga_mutation(
+				&mut state,
+				CtasSagaMutation::Provision {
+					tenant_id: TenantId::new(7),
+					operation_id: ctas_operation_id(0x54),
+					intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
+					descriptor: append_only_table_descriptor(2),
+					expected_binding: CtasExpectedBinding::Absent,
+					prior_descriptor: None,
+					row_write_id: ctas_write_id(0x54),
+					owner_epoch: 1,
+					observed_now_ms: after_retention,
+					owner_lease_expires_at_ms: after_retention.saturating_add(1_000),
+				},
+			),
+			CtasSagaResponse::Rejected(CtasSagaReject::Expired)
+		);
+		assert!(
+			state
+				.ctas_sagas
+				.get(TenantId::new(7), ctas_operation_id(0x54))
+				.is_none(),
+			"terminal detail must be reclaimed while durable expiry evidence remains"
+		);
+	}
+
+	#[test]
+	fn adr548_retry_debt_releases_nonterminal_ownership_for_a_later_activation() {
+		let mut state = SmState::default();
+		provision_ctas(
+			&mut state,
+			append_only_table_descriptor(1),
+			CtasExpectedBinding::Absent,
+		);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::MarkRowDispatched {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count: 3,
+			},
+		);
+		let CtasSagaResponse::Applied(deferred) = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::RecordRetryDebt {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+			},
+		) else {
+			panic!("current owner records retry debt");
+		};
+		assert_eq!(deferred.phase, CtasSagaPhase::RowDispatched);
+		assert_eq!(deferred.retry_debt, 1);
+		assert_eq!(deferred.owner_lease_expires_at_ms, 0);
+		let CtasSagaResponse::Applied(claimed) = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Claim {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				expected_owner_epoch: 1,
+				new_owner_epoch: 2,
+				observed_now_ms: 1,
+				lease_expires_at_ms: 1_001,
+			},
+		) else {
+			panic!("later activation claims released retry debt");
+		};
+		assert_eq!(claimed.owner_epoch, 2);
+		assert!(!claimed.phase.is_terminal());
+	}
+
+	#[test]
+	fn adr548_active_saga_capacity_refuses_without_evicting_live_work() {
+		let mut state = SmState::default();
+		let template = provision_ctas(
+			&mut state,
+			append_only_table_descriptor(1),
+			CtasExpectedBinding::Absent,
+		);
+		let mut counter = 0_u16;
+		while state.ctas_sagas.len() < crate::schema::CTAS_SAGA_CAPACITY {
+			let mut operation_bytes = template.operation_id.into_bytes();
+			operation_bytes[14..].copy_from_slice(&counter.to_be_bytes());
+			let operation_id = CtasOperationId::new(operation_bytes);
+			if state
+				.ctas_sagas
+				.get(TenantId::new(7), operation_id)
+				.is_none()
+			{
+				let mut entry = template.clone();
+				entry.operation_id = operation_id;
+				state.ctas_sagas.insert(entry);
+			}
+			counter = counter.checked_add(1).expect("capacity fixture id space");
+		}
+		let mut refused_bytes = template.operation_id.into_bytes();
+		refused_bytes[14..].copy_from_slice(&u16::MAX.to_be_bytes());
+		let refused_id = CtasOperationId::new(refused_bytes);
+		assert!(state.ctas_sagas.get(TenantId::new(7), refused_id).is_none());
+		let before = state.ctas_sagas.len();
+		let response = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Provision {
+				tenant_id: TenantId::new(7),
+				operation_id: refused_id,
+				intent_fingerprint: CtasIntentFingerprint::new([0x49; 32]),
+				descriptor: append_only_table_descriptor(2),
+				expected_binding: CtasExpectedBinding::Absent,
+				prior_descriptor: None,
+				row_write_id: ctas_write_id(0x55),
+				owner_epoch: 1,
+				observed_now_ms: 1,
+				owner_lease_expires_at_ms: 1_000,
+			},
+		);
+		assert_eq!(
+			response,
+			CtasSagaResponse::Rejected(CtasSagaReject::CapacityExhausted)
+		);
+		assert_eq!(state.ctas_sagas.len(), before);
+		assert_eq!(
+			state
+				.ctas_sagas
+				.get(TenantId::new(7), template.operation_id),
+			Some(&template),
+			"capacity refusal must not evict active work"
+		);
 	}
 
 	fn schema_envelope(

@@ -66,11 +66,12 @@ use crate::schema::{
 	CounterReadRequestMeta, CounterReadResponseMeta, FRAME_FLAG_STREAM_END, FinalizationMarker,
 	FrameHeader, HybridTimestamp, Identity, Locality, LogicalSchemaFingerprint,
 	LogicalTypeGetRequestMeta, LogicalTypeGetResponseMeta, LogicalTypeListRequestMeta,
-	LogicalTypeListResponseMeta, MsgType, MutationOutcomeRequestMeta, MutationOutcomeResponseMeta,
-	MutationResolutionStatus, NodeId, PbcRejectCode, QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING,
-	QueryRequestMeta, QueryResponseMeta, ReadRequestMeta, ReadResponseMeta, ReadStatus,
-	RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN, SecondaryIndexStatus,
-	SecondaryIndexStatusRequest, StateDigest, TableDeleteRowsRequestMeta,
+	LogicalTypeListResponseMeta, MsgType, MutationOutcomePinAction, MutationOutcomePinRequestMeta,
+	MutationOutcomePinResponseMeta, MutationOutcomePinStatus, MutationOutcomeRequestMeta,
+	MutationOutcomeResponseMeta, MutationResolutionStatus, NodeId, PbcRejectCode,
+	QUERY_REQUEST_FLAG_DISABLE_STATS_PRUNING, QueryRequestMeta, QueryResponseMeta, ReadRequestMeta,
+	ReadResponseMeta, ReadStatus, RuntimeFilterDescriptor, STORAGE_ROW_KEY_ID_COLUMN,
+	SecondaryIndexStatus, SecondaryIndexStatusRequest, StateDigest, TableDeleteRowsRequestMeta,
 	TableDeleteRowsResponseMeta, TableDescriptorGetRequestMeta, TableDescriptorGetResponseMeta,
 	TableDescriptorListRequestMeta, TableDescriptorListResponseMeta, TableObjectId,
 	TableOptimizerFacts, TableOptimizerFactsGetRequestMeta, TableOptimizerFactsGetResponseMeta,
@@ -420,6 +421,13 @@ pub struct TableDeleteRowsResult {
 pub struct MutationOutcomeRequest {
 	pub tenant_id: TenantId,
 	pub operation_id: crate::schema::ClientWriteId,
+}
+
+#[derive(Clone, Debug)]
+pub struct MutationOutcomePinRequest {
+	pub tenant_id: TenantId,
+	pub operation_id: crate::schema::ClientWriteId,
+	pub action: MutationOutcomePinAction,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -789,6 +797,46 @@ impl WendelonClient {
 			ErrorKind::NotFound,
 			"no mutation resolution response received",
 		))
+	}
+
+	/// Install or acknowledge ADR 548 outcome retention on every current Data
+	/// node. Writes may be admitted by any of them, so a partial pin is not enough
+	/// to support the control-ring publication decision. A failed PIN deliberately
+	/// leaves any successful pins in place: the request is idempotent, a retry fills
+	/// the missing replicas, and rolling back cannot distinguish a newly installed
+	/// pin from one retained by an earlier attempt. Saga cleanup acknowledges all
+	/// replicas even when row dispatch never began.
+	pub async fn set_mutation_outcome_pin(
+		&self,
+		request: MutationOutcomePinRequest,
+	) -> std::io::Result<()> {
+		let targets = self.mutation_resolution_targets();
+		if targets.is_empty() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				"no Data node available for mutation outcome retention",
+			));
+		}
+		for target in targets {
+			let response = match self.set_mutation_outcome_pin_once(target, &request).await {
+				Ok(response) => response,
+				Err(error) => return Err(error),
+			};
+			if response.status != MutationOutcomePinStatus::APPLIED {
+				return Err(Error::new(
+					if response.status == MutationOutcomePinStatus::CAPACITY_EXHAUSTED {
+						ErrorKind::WouldBlock
+					} else {
+						ErrorKind::InvalidInput
+					},
+					format!(
+						"mutation outcome retention rejected with status {}",
+						response.status.0
+					),
+				));
+			}
+		}
+		Ok(())
 	}
 
 	fn mutation_resolution_targets(&self) -> Vec<NodeId> {
@@ -1797,6 +1845,48 @@ impl WendelonClient {
 			.await
 			.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
 		decode_mutation_outcome_response_frame(read_frame(&mut *stream, &self.pool).await?)
+	}
+
+	async fn set_mutation_outcome_pin_once(
+		&self,
+		target: NodeId,
+		request: &MutationOutcomePinRequest,
+	) -> std::io::Result<MutationOutcomePinResponseMeta> {
+		let conn = self.factory.get_connection(target).await?;
+		let mut stream = conn.open_bi().await?;
+		let meta = MutationOutcomePinRequestMeta {
+			operation_id: request.operation_id,
+			tenant_id: request.tenant_id,
+			action: request.action,
+			_pad: [0; 7],
+		};
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::MUTATION_OUTCOME_PIN_REQ.0,
+			flags: 0,
+			stream_id: 0,
+			meta_len: std::mem::size_of::<MutationOutcomePinRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, bytemuck::bytes_of(&meta), None, None).await?;
+		stream
+			.finish()
+			.await
+			.map_err(|error| Error::new(ErrorKind::BrokenPipe, error))?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::MUTATION_OUTCOME_PIN_RESP.0
+			|| frame.meta.len() != std::mem::size_of::<MutationOutcomePinResponseMeta>()
+			|| frame.arrow_payload.is_some()
+			|| frame.trailing.is_some()
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"invalid MUTATION_OUTCOME_PIN_RESP frame",
+			));
+		}
+		Ok(*bytemuck::from_bytes(&frame.meta))
 	}
 
 	async fn read_once(
