@@ -3,10 +3,9 @@
 //! This module is deliberately a schema boundary. Runtime plotting and editor
 //! types do not implement `Serialize`; conversion is explicit so placement,
 //! renderer vocabulary, and process-local identities cannot enter by accident.
-use crate::plot::core::PlotType;
 use crate::plot::spec::{
-	AllocationSpaceSnapshot, ColorAssignmentSnapshot, ColorIdentity, ColorIdentitySnapshot,
-	ColorSpaceSnapshot, LayerIdentity,
+	AllocationSpaceSnapshot, AuthoredFamilyId, ColorAssignmentSnapshot, ColorIdentity,
+	ColorIdentitySnapshot, ColorLayerIdentity, ColorSpaceSnapshot,
 };
 use crate::rune_relation_envelope::LocalViewIdentity;
 use libaryon::core::{BufferId, DocumentId};
@@ -17,8 +16,9 @@ use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 
 pub(crate) const OWNER_NAME: &str = "polariton_session";
-const FIRST_SCHEMA_VERSION: u32 = 1;
-pub(crate) const SCHEMA_VERSION: u32 = 2;
+const INITIAL_CLOSED_SCHEMA: u32 = 1;
+const AREA_CLOSED_SCHEMA: u32 = 2;
+pub(crate) const SCHEMA_VERSION: u32 = 3;
 pub(crate) const MAX_OWNER_BYTES: usize = 1024 * 1024;
 pub(crate) const DYNAMIC_PANEL_FLOOR: u64 = 1_u64 << 63;
 pub(crate) const GROUP_FLOOR: u64 = 1;
@@ -109,6 +109,7 @@ impl DurableMeanings {
 		bound: usize,
 	) -> Result<Self, SessionPersistenceError> {
 		ensure_supported_schema(schema_version, SCHEMA_VERSION)?;
+		let family_policy = FamilyAdmissionPolicy::for_schema(schema_version)?;
 		if bytes.len() > bound {
 			return Err(SessionPersistenceError::refused(format!(
 				"owner payload is {} bytes (limit is {bound})",
@@ -121,8 +122,7 @@ impl DurableMeanings {
 		deserializer.end().map_err(|error| {
 			SessionPersistenceError::refused(format!("trailing content: {error}"))
 		})?;
-		payload.validate_family_vocabulary(schema_version)?;
-		let meanings = payload.into_meanings()?;
+		let meanings = payload.into_meanings(family_policy)?;
 		validate_marks(&meanings)?;
 		Ok(meanings)
 	}
@@ -217,12 +217,42 @@ fn ensure_supported_schema(
 	schema_version: u32,
 	maximum_supported: u32,
 ) -> Result<(), SessionPersistenceError> {
-	if !(FIRST_SCHEMA_VERSION..=maximum_supported).contains(&schema_version) {
+	if !(INITIAL_CLOSED_SCHEMA..=maximum_supported).contains(&schema_version) {
 		return Err(SessionPersistenceError::refused(format!(
 			"unsupported schema version {schema_version}"
 		)));
 	}
 	Ok(())
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FamilyAdmissionPolicy {
+	InitialClosedFamilies,
+	AreaClosedFamilies,
+	ExtensibleFamilies,
+}
+
+impl FamilyAdmissionPolicy {
+	fn for_schema(schema_version: u32) -> Result<Self, SessionPersistenceError> {
+		match schema_version {
+			INITIAL_CLOSED_SCHEMA => Ok(Self::InitialClosedFamilies),
+			AREA_CLOSED_SCHEMA => Ok(Self::AreaClosedFamilies),
+			3..=SCHEMA_VERSION => Ok(Self::ExtensibleFamilies),
+			other => Err(SessionPersistenceError::refused(format!(
+				"unsupported schema version {other}"
+			))),
+		}
+	}
+
+	fn admits(self, family: &AuthoredFamilyId) -> bool {
+		match self {
+			Self::InitialClosedFamilies => matches!(family.as_str(), "scatter" | "bar" | "line"),
+			Self::AreaClosedFamilies => {
+				matches!(family.as_str(), "scatter" | "bar" | "line" | "area")
+			}
+			Self::ExtensibleFamilies => true,
+		}
+	}
 }
 
 /// Project process-local producer keys onto durable documents. Shared panel
@@ -422,16 +452,7 @@ struct ColourSpace {
 #[serde(deny_unknown_fields)]
 struct DurableLayer {
 	ordinal: u64,
-	family: AuthoredFamily,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-enum AuthoredFamily {
-	Scatter,
-	Bar,
-	Line,
-	Area,
+	family: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -442,30 +463,6 @@ enum AllocationSpace {
 }
 
 impl Payload {
-	fn validate_family_vocabulary(
-		&self,
-		schema_version: u32,
-	) -> Result<(), SessionPersistenceError> {
-		if schema_version == FIRST_SCHEMA_VERSION
-			&& self.colours.iter().any(|colour| {
-				colour
-					.identity
-					.assignments
-					.iter()
-					.any(|entry| entry.layer.family == AuthoredFamily::Area)
-					|| colour
-						.identity
-						.spaces
-						.iter()
-						.any(|entry| entry.layer.family == AuthoredFamily::Area)
-			}) {
-			return Err(SessionPersistenceError::refused(
-				"authored family area is unsupported in schema version 1",
-			));
-		}
-		Ok(())
-	}
-
 	fn from_meanings(meanings: &DurableMeanings) -> Result<Self, SessionPersistenceError> {
 		let mut panels = meanings
 			.panels
@@ -518,7 +515,10 @@ impl Payload {
 		})
 	}
 
-	fn into_meanings(self) -> Result<DurableMeanings, SessionPersistenceError> {
+	fn into_meanings(
+		self,
+		family_policy: FamilyAdmissionPolicy,
+	) -> Result<DurableMeanings, SessionPersistenceError> {
 		let mut panels = HashMap::new();
 		for entry in self.panels {
 			if entry.panel == 0 {
@@ -557,7 +557,7 @@ impl Payload {
 				entry.view.into_runtime()?,
 				palette_len,
 			);
-			let identity = entry.identity.into_runtime()?;
+			let identity = entry.identity.into_runtime(family_policy)?;
 			if identity
 				.persistence_snapshot()
 				.spaces
@@ -654,14 +654,17 @@ impl ColourIdentityDto {
 		})
 	}
 
-	fn into_runtime(self) -> Result<ColorIdentity, SessionPersistenceError> {
+	fn into_runtime(
+		self,
+		family_policy: FamilyAdmissionPolicy,
+	) -> Result<ColorIdentity, SessionPersistenceError> {
 		let assignments = self
 			.assignments
 			.into_iter()
 			.map(|entry| {
 				Ok(ColorAssignmentSnapshot {
 					field: entry.field,
-					layer: entry.layer.into_runtime()?,
+					layer: entry.layer.into_runtime(family_policy)?,
 					category: entry.category,
 					position: to_usize(entry.position, "palette position")?,
 				})
@@ -673,7 +676,7 @@ impl ColourIdentityDto {
 			.map(|entry| {
 				Ok(ColorSpaceSnapshot {
 					field: entry.field,
-					layer: entry.layer.into_runtime()?,
+					layer: entry.layer.into_runtime(family_policy)?,
 					space: match entry.space {
 						AllocationSpace::Legacy { len } => AllocationSpaceSnapshot::Legacy {
 							len: to_usize(len, "allocation length")?,
@@ -696,33 +699,28 @@ impl ColourIdentityDto {
 }
 
 impl DurableLayer {
-	fn from_runtime(layer: LayerIdentity) -> Result<Self, SessionPersistenceError> {
-		let family = match layer.plot_type {
-			PlotType::Scatter => AuthoredFamily::Scatter,
-			PlotType::Bar | PlotType::HorizontalBar => AuthoredFamily::Bar,
-			PlotType::Line => AuthoredFamily::Line,
-			PlotType::StackedArea => AuthoredFamily::Area,
-			other => {
-				return Err(SessionPersistenceError::refused(format!(
-					"plot type {other} has no durable authored family"
-				)));
-			}
-		};
+	fn from_runtime(layer: ColorLayerIdentity) -> Result<Self, SessionPersistenceError> {
 		Ok(Self {
 			ordinal: to_u64(layer.ordinal, "layer ordinal")?,
-			family,
+			family: layer.family.as_str().to_owned(),
 		})
 	}
 
-	fn into_runtime(self) -> Result<LayerIdentity, SessionPersistenceError> {
-		Ok(LayerIdentity {
+	fn into_runtime(
+		self,
+		family_policy: FamilyAdmissionPolicy,
+	) -> Result<ColorLayerIdentity, SessionPersistenceError> {
+		let family =
+			AuthoredFamilyId::parse(self.family).map_err(SessionPersistenceError::refused)?;
+		if !family_policy.admits(&family) {
+			return Err(SessionPersistenceError::refused(format!(
+				"authored family {} is unsupported by this schema's family policy",
+				family.as_str()
+			)));
+		}
+		Ok(ColorLayerIdentity {
 			ordinal: to_usize(self.ordinal, "layer ordinal")?,
-			plot_type: match self.family {
-				AuthoredFamily::Scatter => PlotType::Scatter,
-				AuthoredFamily::Bar => PlotType::Bar,
-				AuthoredFamily::Line => PlotType::Line,
-				AuthoredFamily::Area => PlotType::StackedArea,
-			},
+			family,
 		})
 	}
 }
@@ -744,7 +742,8 @@ fn to_u64(value: usize, label: &str) -> Result<u64, SessionPersistenceError> {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::plot::spec::{AllocationSpaceSnapshot, ColorIdentitySnapshot};
+	use crate::plot::core::PlotType;
+	use crate::plot::spec::{AllocationSpaceSnapshot, ColorIdentitySnapshot, LayerIdentity};
 
 	fn empty_meanings() -> DurableMeanings {
 		DurableMeanings {
@@ -757,10 +756,10 @@ mod tests {
 	}
 
 	fn colour_identity(plot_type: PlotType, legacy: bool) -> ColorIdentity {
-		let layer = LayerIdentity {
+		let layer = ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 			ordinal: usize::from(legacy),
 			plot_type,
-		};
+		});
 		let space = if legacy {
 			AllocationSpaceSnapshot::Legacy { len: 4 }
 		} else {
@@ -777,6 +776,24 @@ mod tests {
 				field: "product".into(),
 				layer,
 				space,
+			}],
+		})
+		.unwrap()
+	}
+
+	fn colour_identity_for_family(family: AuthoredFamilyId) -> ColorIdentity {
+		let layer = ColorLayerIdentity { ordinal: 0, family };
+		ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
+			assignments: vec![ColorAssignmentSnapshot {
+				field: "series".into(),
+				layer: layer.clone(),
+				category: "Atlas".into(),
+				position: 2,
+			}],
+			spaces: vec![ColorSpaceSnapshot {
+				field: "series".into(),
+				layer,
+				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
 			}],
 		})
 		.unwrap()
@@ -817,12 +834,12 @@ mod tests {
 			meanings
 		);
 		assert_eq!(
-			DurableMeanings::decode(FIRST_SCHEMA_VERSION, &bytes).unwrap(),
+			DurableMeanings::decode(INITIAL_CLOSED_SCHEMA, &bytes).unwrap(),
 			meanings,
-			"schema v1 remains readable when the payload uses only its three families"
+			"the initial closed-family policy remains readable for its three families"
 		);
 		assert_eq!(meanings.encode().unwrap(), bytes);
-		assert!(DurableMeanings::decode(3, &bytes).is_err());
+		assert!(DurableMeanings::decode(4, &bytes).is_err());
 		assert!(DurableMeanings::decode_with_bound(1, &bytes, 4).is_err());
 		let unknown = br#"{"next_view_panel_id":9223372036854775808,"next_view_group_id":1,"panels":[],"groups":[],"colours":[],"placement":0}"#;
 		assert!(DurableMeanings::decode(1, unknown).is_err());
@@ -835,10 +852,10 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0070_schema_two_adds_area_without_weakening_version_one() {
+	fn product_0070_area_closed_policy_adds_area_without_weakening_initial_policy() {
 		assert_eq!(
-			SCHEMA_VERSION, 2,
-			"writers publish the four-family vocabulary as v2"
+			SCHEMA_VERSION, 3,
+			"writers publish the extensible-family owner grammar"
 		);
 		let document = DocumentId::new(1).unwrap();
 		let mut meanings = empty_meanings();
@@ -854,30 +871,143 @@ mod tests {
 		assert!(
 			relabelled
 				.to_string()
-				.contains("authored family area is unsupported in schema version 1"),
+				.contains("authored family area is unsupported by this schema's family policy"),
 			"{relabelled}"
 		);
 
-		let old_reader = ensure_supported_schema(2, 1).unwrap_err();
+		let old_reader =
+			ensure_supported_schema(AREA_CLOSED_SCHEMA, INITIAL_CLOSED_SCHEMA).unwrap_err();
 		assert!(
 			old_reader
 				.to_string()
 				.contains("unsupported schema version 2"),
-			"a v1 reader must refuse a v2 envelope rather than dropping area meanings: {old_reader}"
+			"the initial closed-family reader must refuse the area-era envelope rather than dropping area meanings: {old_reader}"
 		);
 
-		let mut v1 = empty_meanings();
-		v1.colours.insert(
+		let mut initial = empty_meanings();
+		initial.colours.insert(
 			(document, LocalViewIdentity::Named("line".into()), 4),
 			colour_identity(PlotType::Line, false),
 		);
-		let v1_bytes = v1.encode().unwrap();
-		assert_eq!(DurableMeanings::decode(1, &v1_bytes).unwrap(), v1);
-		assert_eq!(DurableMeanings::decode(2, &v1_bytes).unwrap(), v1);
+		let initial_bytes = initial.encode().unwrap();
+		assert_eq!(DurableMeanings::decode(1, &initial_bytes).unwrap(), initial);
+		assert_eq!(DurableMeanings::decode(2, &initial_bytes).unwrap(), initial);
 	}
 
 	#[test]
-	fn product_0075_plain_anonymous_zero_is_existing_schema_two_vocabulary() {
+	fn product_0086_extensible_policy_preserves_unknown_family_through_runtime_capture() {
+		let document = DocumentId::new(86).unwrap();
+		let buffer = BufferId::new(8);
+		let view = LocalViewIdentity::Named("future".into());
+		let family = AuthoredFamilyId::parse("future_family".into()).unwrap();
+		assert!(!AuthoredFamilyId::ALL.contains(&family));
+		let identity = colour_identity_for_family(family);
+		let mut meanings = empty_meanings();
+		meanings
+			.colours
+			.insert((document, view.clone(), 4), identity.clone());
+		let bytes = meanings.encode().unwrap();
+		assert!(DurableMeanings::decode(1, &bytes).is_err());
+		assert!(DurableMeanings::decode(2, &bytes).is_err());
+		assert_eq!(DurableMeanings::decode(3, &bytes).unwrap(), meanings);
+
+		let census = SharedIdentityCensus {
+			documents: [document].into_iter().collect(),
+			host_panels: BTreeSet::new(),
+			host_panel_groups: BTreeSet::new(),
+		};
+		let runtime = meanings
+			.join_runtime(&[(document, buffer)].into_iter().collect(), &census)
+			.unwrap();
+		assert_eq!(
+			runtime.colours.as_map().get(&(buffer, view.clone(), 4)),
+			Some(&identity)
+		);
+		let recaptured = capture_runtime(
+			&HashMap::new(),
+			&HashMap::new(),
+			&runtime.colours,
+			&[(buffer, document)].into_iter().collect(),
+			&census,
+			DYNAMIC_PANEL_FLOOR,
+			GROUP_FLOOR,
+		)
+		.unwrap();
+		let reencoded = recaptured.encode().unwrap();
+		assert_eq!(DurableMeanings::decode(3, &reencoded).unwrap(), meanings);
+		assert!(
+			String::from_utf8(reencoded)
+				.unwrap()
+				.contains("\"family\":\"future_family\"")
+		);
+
+		let dropped = capture_runtime(
+			&HashMap::new(),
+			&HashMap::new(),
+			&runtime.colours,
+			&HashMap::new(),
+			&SharedIdentityCensus::default(),
+			DYNAMIC_PANEL_FLOOR,
+			GROUP_FLOOR,
+		)
+		.unwrap();
+		assert!(dropped.colours.is_empty());
+	}
+
+	#[test]
+	fn product_0086_family_admission_policies_and_token_validation_are_exact() {
+		let document = DocumentId::new(86).unwrap();
+		let mut meanings = empty_meanings();
+		meanings.colours.insert(
+			(document, LocalViewIdentity::Named("area".into()), 4),
+			colour_identity(PlotType::StackedArea, false),
+		);
+		let area = meanings.encode().unwrap();
+		assert!(DurableMeanings::decode(1, &area).is_err());
+		assert!(DurableMeanings::decode(2, &area).is_ok());
+		assert!(DurableMeanings::decode(3, &area).is_ok());
+
+		let future = String::from_utf8(area.clone())
+			.unwrap()
+			.replace("\"area\"", "\"future_family\"");
+		assert!(DurableMeanings::decode(1, future.as_bytes()).is_err());
+		assert!(DurableMeanings::decode(2, future.as_bytes()).is_err());
+		assert!(DurableMeanings::decode(3, future.as_bytes()).is_ok());
+		for invalid in [
+			"",
+			"Area",
+			"9area",
+			"two words",
+			"two-words",
+			"two.words",
+			"é",
+		] {
+			let malformed = String::from_utf8(area.clone())
+				.unwrap()
+				.replace("\"area\"", &format!("\"{invalid}\""));
+			assert!(
+				DurableMeanings::decode(3, malformed.as_bytes()).is_err(),
+				"{invalid}"
+			);
+		}
+		for valid in ["a".to_owned(), "a".repeat(64)] {
+			let accepted = String::from_utf8(area.clone())
+				.unwrap()
+				.replace("\"area\"", &format!("\"{valid}\""));
+			assert!(
+				DurableMeanings::decode(3, accepted.as_bytes()).is_ok(),
+				"{valid}"
+			);
+		}
+		let oversized = String::from_utf8(area)
+			.unwrap()
+			.replace("\"area\"", &format!("\"{}\"", "a".repeat(65)));
+		assert!(DurableMeanings::decode(3, oversized.as_bytes()).is_err());
+		assert!(ensure_supported_schema(3, 2).is_err());
+	}
+
+	#[test]
+	fn product_0075_plain_anonymous_zero_uses_the_existing_owner_vocabulary() {
 		let document = DocumentId::new(75).unwrap();
 		let mut meanings = empty_meanings();
 		meanings.panels.insert(
@@ -907,13 +1037,13 @@ mod tests {
 			meanings
 		);
 		assert_eq!(
-			SCHEMA_VERSION, 2,
+			SCHEMA_VERSION, 3,
 			"PRODUCT-0075 changes population, not grammar"
 		);
 	}
 
 	#[test]
-	fn product_0079_histogram_panel_has_a_schema_two_meaning_and_no_colour_footprint() {
+	fn product_0079_histogram_panel_has_owner_meaning_and_no_colour_footprint() {
 		let document = DocumentId::new(79).unwrap();
 		let view = LocalViewIdentity::Named("histogram".into());
 		let panel = HostPanelId::new(DYNAMIC_PANEL_FLOOR);
@@ -927,7 +1057,7 @@ mod tests {
 
 		let bytes = meanings.encode().unwrap();
 		let text = String::from_utf8(bytes.clone()).unwrap();
-		assert_eq!(SCHEMA_VERSION, 2);
+		assert_eq!(SCHEMA_VERSION, 3);
 		assert!(
 			text.contains("\"name\":\"histogram\"")
 				&& text.contains(&format!("\"panel\":{}", panel.get())),
@@ -947,7 +1077,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0082_box_panel_has_a_schema_two_meaning_and_no_colour_footprint() {
+	fn product_0082_box_panel_has_owner_meaning_and_no_colour_footprint() {
 		let document = DocumentId::new(82).unwrap();
 		let view = LocalViewIdentity::Named("box".into());
 		let panel = HostPanelId::new(DYNAMIC_PANEL_FLOOR);
@@ -961,7 +1091,7 @@ mod tests {
 
 		let bytes = meanings.encode().unwrap();
 		let text = String::from_utf8(bytes.clone()).unwrap();
-		assert_eq!(SCHEMA_VERSION, 2);
+		assert_eq!(SCHEMA_VERSION, 3);
 		assert!(
 			text.contains("\"name\":\"box\"")
 				&& text.contains(&format!("\"panel\":{}", panel.get()))
@@ -993,7 +1123,7 @@ mod tests {
 
 		let bytes = meanings.encode().unwrap();
 		let text = String::from_utf8(bytes.clone()).unwrap();
-		assert_eq!(SCHEMA_VERSION, 2);
+		assert_eq!(SCHEMA_VERSION, 3);
 		assert!(
 			!text.contains("x_label") && !text.contains("y_label"),
 			"{text}"
@@ -1005,7 +1135,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0062_colour_family_is_closed_and_rotation_independent() {
+	fn product_0062_colour_family_is_authored_and_rotation_independent() {
 		let document = DocumentId::new(1).unwrap();
 		let mut meanings = empty_meanings();
 		meanings.colours.insert(

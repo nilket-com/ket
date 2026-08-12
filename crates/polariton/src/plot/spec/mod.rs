@@ -13,6 +13,7 @@ use crate::plot::core::PlotType;
 use libaryon::core::Rgb;
 use libaryon::engine::{ResolvedCategoricalPalette, Theme};
 use polars::prelude::{AnyValue, DataType, Schema};
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::Arc;
@@ -707,6 +708,71 @@ pub struct LayerIdentity {
 	pub plot_type: PlotType,
 }
 
+/// Stable authored-family identity for categorical colour continuation.
+///
+/// Known constants are the only identifiers production authoring may originate;
+/// checked owned values allow a newer family's continuation to survive an older
+/// PRODUCT-0086 reader without entering the renderer vocabulary.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct AuthoredFamilyId(Cow<'static, str>);
+
+impl AuthoredFamilyId {
+	pub(crate) const SCATTER: Self = Self(Cow::Borrowed("scatter"));
+	pub(crate) const BAR: Self = Self(Cow::Borrowed("bar"));
+	pub(crate) const LINE: Self = Self(Cow::Borrowed("line"));
+	pub(crate) const AREA: Self = Self(Cow::Borrowed("area"));
+
+	/// Exhaustive catalog of identifiers this binary can originate from authored
+	/// source. It is intentionally narrower than the checked persistence grammar.
+	pub(crate) const ALL: [Self; 4] = [Self::SCATTER, Self::BAR, Self::LINE, Self::AREA];
+
+	pub(crate) fn parse(value: String) -> Result<Self, String> {
+		let bytes = value.as_bytes();
+		if !(1..=64).contains(&bytes.len()) {
+			return Err("authored family must contain 1 through 64 ASCII bytes".to_owned());
+		}
+		if !bytes[0].is_ascii_lowercase()
+			|| !bytes[1..]
+				.iter()
+				.all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'_')
+		{
+			return Err("authored family must match [a-z][a-z0-9_]* using ASCII bytes".to_owned());
+		}
+		Ok(Self(Cow::Owned(value)))
+	}
+
+	pub(crate) fn as_str(&self) -> &str {
+		self.0.as_ref()
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub(crate) struct ColorLayerIdentity {
+	pub(crate) ordinal: usize,
+	pub(crate) family: AuthoredFamilyId,
+}
+
+impl ColorLayerIdentity {
+	pub(crate) fn from_authored_layer(layer: &LayerIdentity) -> Self {
+		let family = match layer.plot_type {
+			PlotType::Scatter => AuthoredFamilyId::SCATTER,
+			PlotType::Bar | PlotType::HorizontalBar => AuthoredFamilyId::BAR,
+			PlotType::Line => AuthoredFamilyId::LINE,
+			PlotType::StackedArea => AuthoredFamilyId::AREA,
+			PlotType::StackedBar | PlotType::HorizontalStackedBar => unreachable!(
+				"PRODUCT-0064 requires stacked bar colour lineage to retain authored Bar identity"
+			),
+			other => {
+				unreachable!("plot type {other} has no live authored categorical-family conversion")
+			}
+		};
+		Self {
+			ordinal: layer.ordinal,
+			family,
+		}
+	}
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BoundChannel {
 	pub channel: Channel,
@@ -1149,14 +1215,14 @@ pub struct StampedResult {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ColorIdentityKey {
 	field: String,
-	layer: LayerIdentity,
+	layer: ColorLayerIdentity,
 	category: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct ColorLineageKey {
 	field: String,
-	layer: LayerIdentity,
+	layer: ColorLayerIdentity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1204,13 +1270,13 @@ impl ColorIdentity {
 			(
 				&left.field,
 				left.layer.ordinal,
-				left.layer.plot_type,
+				&left.layer.family,
 				&left.category,
 			)
 				.cmp(&(
 					&right.field,
 					right.layer.ordinal,
-					right.layer.plot_type,
+					&right.layer.family,
 					&right.category,
 				))
 		});
@@ -1229,10 +1295,10 @@ impl ColorIdentity {
 			})
 			.collect::<Vec<_>>();
 		spaces.sort_by(|left, right| {
-			(&left.field, left.layer.ordinal, left.layer.plot_type).cmp(&(
+			(&left.field, left.layer.ordinal, &left.layer.family).cmp(&(
 				&right.field,
 				right.layer.ordinal,
-				right.layer.plot_type,
+				&right.layer.family,
 			))
 		});
 		ColorIdentitySnapshot {
@@ -1302,7 +1368,7 @@ pub(crate) struct ColorIdentitySnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ColorAssignmentSnapshot {
 	pub field: String,
-	pub layer: LayerIdentity,
+	pub layer: ColorLayerIdentity,
 	pub category: String,
 	pub position: usize,
 }
@@ -1310,7 +1376,7 @@ pub(crate) struct ColorAssignmentSnapshot {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ColorSpaceSnapshot {
 	pub field: String,
-	pub layer: LayerIdentity,
+	pub layer: ColorLayerIdentity,
 	pub space: AllocationSpaceSnapshot,
 }
 
@@ -2656,6 +2722,28 @@ fn maximin_position(
 		.map(|(position, _)| position)
 }
 
+fn assign_fresh_positions(
+	categories: &[String],
+	field: &str,
+	layer: &ColorLayerIdentity,
+	palette_len: usize,
+	assignments: &mut HashMap<ColorIdentityKey, PalettePosition>,
+) {
+	for (category, position) in categories
+		.iter()
+		.zip(evenly_spread_positions(categories.len(), palette_len))
+	{
+		assignments.insert(
+			ColorIdentityKey {
+				field: field.to_owned(),
+				layer: layer.clone(),
+				category: category.clone(),
+			},
+			position,
+		);
+	}
+}
+
 fn resolve_explicit_positions(
 	categories: &[String],
 	channel: &BoundChannel,
@@ -2664,9 +2752,10 @@ fn resolve_explicit_positions(
 	identity: &mut ColorIdentity,
 	role: &'static str,
 ) -> Result<Vec<(String, PalettePosition)>, CategoricalResolutionError> {
+	let color_layer = ColorLayerIdentity::from_authored_layer(&channel.layer);
 	let lineage = ColorLineageKey {
 		field: channel.field.clone(),
-		layer: channel.layer.clone(),
+		layer: color_layer.clone(),
 	};
 	let selected_space = ColorAllocationSpace::CategoricalPalette {
 		len: selection.len(),
@@ -2685,14 +2774,14 @@ fn resolve_explicit_positions(
 	let retained = identity
 		.assignments
 		.keys()
-		.filter(|key| key.field == channel.field && key.layer == channel.layer)
+		.filter(|key| key.field == channel.field && key.layer == color_layer)
 		.count();
 	let missing = categories
 		.iter()
 		.filter(|category| {
 			!identity.assignments.contains_key(&ColorIdentityKey {
 				field: channel.field.clone(),
-				layer: channel.layer.clone(),
+				layer: color_layer.clone(),
 				category: (*category).clone(),
 			})
 		})
@@ -2720,30 +2809,24 @@ fn resolve_explicit_positions(
 
 	identity.spaces.entry(lineage).or_insert(selected_space);
 	if retained == 0 {
-		for (category, position) in categories
-			.iter()
-			.zip(evenly_spread_positions(categories.len(), selection.len()))
-		{
-			identity.assignments.insert(
-				ColorIdentityKey {
-					field: channel.field.clone(),
-					layer: channel.layer.clone(),
-					category: category.clone(),
-				},
-				position,
-			);
-		}
+		assign_fresh_positions(
+			categories,
+			&channel.field,
+			&color_layer,
+			selection.len(),
+			&mut identity.assignments,
+		);
 	} else {
 		let mut occupied = identity
 			.assignments
 			.iter()
-			.filter(|(key, _)| key.field == channel.field && key.layer == channel.layer)
+			.filter(|(key, _)| key.field == channel.field && key.layer == color_layer)
 			.map(|(_, position)| *position)
 			.collect::<HashSet<_>>();
 		for category in categories {
 			let key = ColorIdentityKey {
 				field: channel.field.clone(),
-				layer: channel.layer.clone(),
+				layer: color_layer.clone(),
 				category: category.clone(),
 			};
 			if !identity.assignments.contains_key(&key) {
@@ -2760,7 +2843,7 @@ fn resolve_explicit_positions(
 		.map(|category| {
 			let key = ColorIdentityKey {
 				field: channel.field.clone(),
-				layer: channel.layer.clone(),
+				layer: color_layer.clone(),
 				category: category.clone(),
 			};
 			(category.clone(), identity.assignments[&key])
@@ -2848,9 +2931,10 @@ fn resolve_category_colors(
 	limit: usize,
 	identity: &mut ColorIdentity,
 ) -> Result<Vec<CategoryColorAssignment>, DomainError> {
+	let color_layer = ColorLayerIdentity::from_authored_layer(&channel.layer);
 	let lineage = ColorLineageKey {
 		field: channel.field.clone(),
-		layer: channel.layer.clone(),
+		layer: color_layer.clone(),
 	};
 	let expected_space = ColorAllocationSpace::Legacy {
 		len: DEFAULT_CATEGORICAL_LIMIT,
@@ -2872,14 +2956,14 @@ fn resolve_category_colors(
 	let lineage_count = identity
 		.assignments
 		.keys()
-		.filter(|key| key.field == channel.field && key.layer == channel.layer)
+		.filter(|key| key.field == channel.field && key.layer == color_layer)
 		.count();
 	let missing = categories
 		.iter()
 		.filter(|category| {
 			!identity.assignments.contains_key(&ColorIdentityKey {
 				field: channel.field.clone(),
-				layer: channel.layer.clone(),
+				layer: color_layer.clone(),
 				category: (*category).clone(),
 			})
 		})
@@ -2894,7 +2978,7 @@ fn resolve_category_colors(
 	for category in categories {
 		let key = ColorIdentityKey {
 			field: channel.field.clone(),
-			layer: channel.layer.clone(),
+			layer: color_layer.clone(),
 			category: category.clone(),
 		};
 		if !identity.assignments.contains_key(&key) {
@@ -2902,7 +2986,7 @@ fn resolve_category_colors(
 				.assignments
 				.keys()
 				.filter(|candidate| {
-					candidate.field == channel.field && candidate.layer == channel.layer
+					candidate.field == channel.field && candidate.layer == color_layer
 				})
 				.count();
 			let position = PalettePosition::new(ordinal, DEFAULT_CATEGORICAL_LIMIT)
@@ -2915,7 +2999,7 @@ fn resolve_category_colors(
 		.map(|category| {
 			let key = ColorIdentityKey {
 				field: channel.field.clone(),
-				layer: channel.layer.clone(),
+				layer: color_layer.clone(),
 				category: category.clone(),
 			};
 			CategoryColorAssignment {
@@ -3164,6 +3248,139 @@ mod tests {
 				},
 			]
 		);
+	}
+
+	#[test]
+	fn product_0086_authored_family_is_a_discriminating_colour_lineage_dimension() {
+		let scatter = ColorLayerIdentity {
+			ordinal: 0,
+			family: AuthoredFamilyId::SCATTER,
+		};
+		let line = ColorLayerIdentity {
+			ordinal: 0,
+			family: AuthoredFamilyId::LINE,
+		};
+		let mut assignments = HashMap::new();
+		assign_fresh_positions(
+			&["A".into(), "B".into(), "C".into()],
+			"series",
+			&scatter,
+			5,
+			&mut assignments,
+		);
+		assign_fresh_positions(
+			&["C".into(), "A".into()],
+			"series",
+			&line,
+			5,
+			&mut assignments,
+		);
+		let position = |layer: &ColorLayerIdentity, category: &str| {
+			assignments[&ColorIdentityKey {
+				field: "series".into(),
+				layer: layer.clone(),
+				category: category.into(),
+			}]
+				.index()
+		};
+		assert_eq!(
+			[
+				position(&scatter, "A"),
+				position(&scatter, "B"),
+				position(&scatter, "C")
+			],
+			[0, 2, 4]
+		);
+		assert_eq!([position(&line, "C"), position(&line, "A")], [0, 4]);
+		assert_ne!(position(&scatter, "C"), position(&line, "C"));
+		assert_ne!(position(&scatter, "A"), position(&line, "A"));
+	}
+
+	#[test]
+	fn product_0086_live_family_catalog_is_unique_complete_and_member_normalized() {
+		let tokens = AuthoredFamilyId::ALL
+			.iter()
+			.map(AuthoredFamilyId::as_str)
+			.collect::<Vec<_>>();
+		assert_eq!(tokens, ["scatter", "bar", "line", "area"]);
+		assert_eq!(
+			tokens.iter().copied().collect::<HashSet<_>>().len(),
+			tokens.len()
+		);
+		for (plot_type, expected) in [
+			(PlotType::Scatter, "scatter"),
+			(PlotType::Bar, "bar"),
+			(PlotType::HorizontalBar, "bar"),
+			(PlotType::Line, "line"),
+			(PlotType::StackedArea, "area"),
+		] {
+			let actual = ColorLayerIdentity::from_authored_layer(&LayerIdentity {
+				ordinal: 7,
+				plot_type,
+			});
+			assert_eq!(actual.ordinal, 7);
+			assert_eq!(actual.family.as_str(), expected);
+			assert!(tokens.contains(&expected));
+		}
+	}
+
+	#[test]
+	fn product_0086_family_tokens_are_bounded_canonical_and_open_for_preservation() {
+		for valid in ["a", &"a".repeat(64), "future_family_9"] {
+			assert_eq!(
+				AuthoredFamilyId::parse(valid.to_owned()).unwrap().as_str(),
+				valid
+			);
+		}
+		for invalid in [
+			"".to_owned(),
+			"a".repeat(65),
+			"é".to_owned(),
+			"Area".to_owned(),
+			"9area".to_owned(),
+			"two words".to_owned(),
+			"two-words".to_owned(),
+			"two.words".to_owned(),
+		] {
+			assert!(AuthoredFamilyId::parse(invalid).is_err());
+		}
+	}
+
+	#[test]
+	fn product_0086_forbidden_members_hit_the_authored_family_invariant() {
+		let valid = ColorLayerIdentity::from_authored_layer(&LayerIdentity {
+			ordinal: 0,
+			plot_type: PlotType::Bar,
+		});
+		assert_eq!(valid.family, AuthoredFamilyId::BAR);
+		for plot_type in [PlotType::StackedBar, PlotType::HorizontalStackedBar] {
+			let panic = std::panic::catch_unwind(|| {
+				ColorLayerIdentity::from_authored_layer(&LayerIdentity {
+					ordinal: 0,
+					plot_type,
+				})
+			})
+			.expect_err("stacked renderer member must not reach authored conversion");
+			let message = panic
+				.downcast_ref::<&str>()
+				.copied()
+				.or_else(|| panic.downcast_ref::<String>().map(String::as_str))
+				.unwrap_or("non-string panic");
+			assert!(message.contains("PRODUCT-0064"), "{message}");
+		}
+		let unregistered = std::panic::catch_unwind(|| {
+			ColorLayerIdentity::from_authored_layer(&LayerIdentity {
+				ordinal: 0,
+				plot_type: PlotType::Pie,
+			})
+		})
+		.expect_err("unregistered authored family must expose the missing conversion");
+		let message = unregistered
+			.downcast_ref::<&str>()
+			.copied()
+			.or_else(|| unregistered.downcast_ref::<String>().map(String::as_str))
+			.unwrap_or("non-string panic");
+		assert!(message.contains("no live authored categorical-family conversion"));
 	}
 
 	fn resolve_explicit(

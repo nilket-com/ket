@@ -137,13 +137,8 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 			"PRODUCT-0062 DTO acquired placement or renderer authority through {forbidden}"
 		);
 	}
-	assert!(dto.contains("enum AuthoredFamily"));
-	for family in ["Scatter", "Bar", "Line", "Area"] {
-		assert!(
-			dto.contains(family),
-			"missing durable authored family {family}"
-		);
-	}
+	assert!(dto.contains("family: String"));
+	assert!(!dto.contains("enum AuthoredFamily"));
 
 	let mut serialization_sites = Vec::new();
 	let mut pending = vec![root];
@@ -165,6 +160,132 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 		vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session_persistence.rs")],
 		"serde belongs only to Polariton's one opaque session owner"
 	);
+}
+
+#[test]
+fn product_0086_live_family_catalog_is_source_complete_and_renderer_free() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs"))
+		.expect("read PRODUCT-0086 colour lineage");
+	let family_impl = spec
+		.split("impl AuthoredFamilyId {")
+		.nth(1)
+		.expect("AuthoredFamilyId implementation")
+		.split("impl ColorLayerIdentity {")
+		.next()
+		.expect("bounded family implementation");
+	let constants = family_impl
+		.lines()
+		.filter_map(|line| {
+			let line = line.trim();
+			let rest = line.strip_prefix("pub(crate) const ")?;
+			let (name, declaration) = rest.split_once(':')?;
+			declaration
+				.trim_start()
+				.starts_with("Self =")
+				.then_some(name)
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(constants, ["SCATTER", "BAR", "LINE", "AREA"]);
+	let all = family_impl
+		.split("pub(crate) const ALL:")
+		.nth(1)
+		.expect("AuthoredFamilyId::ALL")
+		.split("= [")
+		.nth(1)
+		.expect("ALL array value")
+		.split("];")
+		.next()
+		.expect("bounded ALL declaration");
+	for constant in &constants {
+		assert!(
+			all.contains(&format!("Self::{constant}")),
+			"family constant {constant} is absent from AuthoredFamilyId::ALL"
+		);
+	}
+	assert_eq!(all.matches("Self::").count(), constants.len());
+
+	let color_identity = spec
+		.split("struct ColorIdentityKey")
+		.nth(1)
+		.expect("colour identity key")
+		.split("pub struct ColorIdentity")
+		.next()
+		.expect("bounded colour-key region");
+	assert!(color_identity.contains("layer: ColorLayerIdentity"));
+	assert!(!color_identity.contains("PlotType"));
+	let production_spec = spec
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production plot specification region");
+	assert_eq!(
+		production_spec
+			.matches("pub(crate) fn from_authored_layer")
+			.count(),
+		1,
+		"authored plot types must enter colour lineage through one conversion authority"
+	);
+	assert_eq!(
+		production_spec
+			.matches("ColorLayerIdentity::from_authored_layer")
+			.count(),
+		2,
+		"both categorical allocation paths must use the conversion authority"
+	);
+
+	let persistence = std::fs::read_to_string(root.join("session_persistence.rs"))
+		.expect("read PRODUCT-0086 owner codec");
+	let production = persistence
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production persistence region");
+	assert!(production.contains("family: String"));
+	assert!(!production.contains("enum AuthoredFamily"));
+	assert!(!production.contains("PlotType::"));
+}
+
+#[test]
+fn product_0086_wire_numbers_do_not_become_session_code_vocabulary() {
+	fn words(source: &str) -> Vec<String> {
+		source
+			.split(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+			.flat_map(|token| token.split('_'))
+			.filter(|token| !token.is_empty())
+			.map(str::to_ascii_lowercase)
+			.collect()
+	}
+
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let persistence =
+		std::fs::read_to_string(root.join("session_persistence.rs")).expect("read session owner");
+	let editor = std::fs::read_to_string(root.join("editor.rs")).expect("read owner assertions");
+	for (path, source) in [
+		("session_persistence.rs", persistence.as_str()),
+		("editor.rs", editor.as_str()),
+	] {
+		let tokens = words(source);
+		for (index, token) in tokens.iter().enumerate() {
+			assert!(
+				!matches!(token.as_str(), "v1" | "v2" | "v3"),
+				"{path} contains number-as-era token {token}"
+			);
+			if matches!(token.as_str(), "version" | "schema")
+				&& let Some(next) = tokens.get(index + 1)
+			{
+				assert!(
+					!matches!(next.as_str(), "one" | "two" | "three"),
+					"{path} contains number-as-era phrase {token}_{next}"
+				);
+			}
+		}
+	}
+	assert!(persistence.contains("SCHEMA_VERSION: u32 = 3"));
+	for wire in [1, 2, 3] {
+		assert!(
+			persistence.contains(&format!("DurableMeanings::decode({wire},")),
+			"codec fixtures must retain explicit wire value {wire}"
+		);
+	}
 }
 
 #[test]

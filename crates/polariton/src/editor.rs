@@ -6968,7 +6968,7 @@ mod tests {
 		use crate::plot::core::PlotType;
 		use crate::plot::spec::{
 			AllocationSpaceSnapshot, ColorAssignmentSnapshot, ColorIdentity, ColorIdentitySnapshot,
-			ColorSpaceSnapshot, LayerIdentity,
+			ColorLayerIdentity, ColorSpaceSnapshot, LayerIdentity,
 		};
 		use crate::rune_relation_envelope::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 		use libaryon::core::SessionStore;
@@ -7064,19 +7064,19 @@ mod tests {
 		let identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
 			assignments: vec![ColorAssignmentSnapshot {
 				field: "product".into(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::HorizontalBar,
-				},
+				}),
 				category: "Atlas".into(),
 				position: 2,
 			}],
 			spaces: vec![ColorSpaceSnapshot {
 				field: "product".into(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::HorizontalBar,
-				},
+				}),
 				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
 			}],
 		})
@@ -7084,19 +7084,19 @@ mod tests {
 		let grouped_identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
 			assignments: vec![ColorAssignmentSnapshot {
 				field: "product".into(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::Bar,
-				},
+				}),
 				category: "Atlas".into(),
 				position: 2,
 			}],
 			spaces: vec![ColorSpaceSnapshot {
 				field: "product".into(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::Bar,
-				},
+				}),
 				space: AllocationSpaceSnapshot::Legacy { len: 12 },
 			}],
 		})
@@ -7109,20 +7109,20 @@ mod tests {
 				.enumerate()
 				.map(|(position, category)| ColorAssignmentSnapshot {
 					field: "product".into(),
-					layer: LayerIdentity {
+					layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 						ordinal: 0,
 						plot_type: PlotType::StackedArea,
-					},
+					}),
 					category: category.into(),
 					position,
 				})
 				.collect(),
 			spaces: vec![ColorSpaceSnapshot {
 				field: "product".into(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::StackedArea,
-				},
+				}),
 				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
 			}],
 		})
@@ -7200,19 +7200,19 @@ mod tests {
 		let canonical_identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
 			assignments: vec![ColorAssignmentSnapshot {
 				field: "product".into(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::Bar,
-				},
+				}),
 				category: "Atlas".into(),
 				position: 2,
 			}],
 			spaces: vec![ColorSpaceSnapshot {
 				field: "product".into(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::Bar,
-				},
+				}),
 				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
 			}],
 		})
@@ -7234,7 +7234,7 @@ mod tests {
 				.as_map()
 				.get(&(reopened_buffer, area_persistence_view, 4)),
 			Some(&area_identity),
-			"a three-series Area publishes schema v2 and restores every exact palette position"
+			"a three-series Area restores every exact palette position through the area-closed family policy"
 		);
 		let frame = crate::plot::spec::StampedResult {
 			data: crate::result_artifact::ResultArtifact::test_frame(
@@ -7294,7 +7294,7 @@ mod tests {
 				.channel(crate::plot::spec::Channel::Color)
 				.unwrap()
 				.colors,
-			"the same schema-v2 Bar payload restores onto percent scale with exact colours"
+			"the same durable Bar meaning restores onto percent scale with exact colours"
 		);
 		assert_eq!(
 			percent_resolved.stack_normalization,

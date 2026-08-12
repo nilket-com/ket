@@ -3397,24 +3397,24 @@ mod tests {
 			.unwrap();
 		use crate::plot::spec::{
 			AllocationSpaceSnapshot, ColorAssignmentSnapshot, ColorIdentity, ColorIdentitySnapshot,
-			ColorSpaceSnapshot, LayerIdentity,
+			ColorLayerIdentity, ColorSpaceSnapshot, LayerIdentity,
 		};
 		let authored_colour = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
 			assignments: vec![ColorAssignmentSnapshot {
 				field: "product".to_owned(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::HorizontalBar,
-				},
+				}),
 				category: "Atlas".to_owned(),
 				position: 2,
 			}],
 			spaces: vec![ColorSpaceSnapshot {
 				field: "product".to_owned(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::HorizontalBar,
-				},
+				}),
 				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
 			}],
 		})
@@ -3667,19 +3667,19 @@ mod tests {
 		let canonical_colour = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
 			assignments: vec![ColorAssignmentSnapshot {
 				field: "product".to_owned(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::Bar,
-				},
+				}),
 				category: "Atlas".to_owned(),
 				position: 2,
 			}],
 			spaces: vec![ColorSpaceSnapshot {
 				field: "product".to_owned(),
-				layer: LayerIdentity {
+				layer: ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 					ordinal: 0,
 					plot_type: PlotType::Bar,
-				},
+				}),
 				space: AllocationSpaceSnapshot::CategoricalPalette { len: 4 },
 			}],
 		})
