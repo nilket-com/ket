@@ -1,0 +1,30 @@
+let skin = "nord";
+let bucketed = workspace.sql("WITH bucketed AS (SELECT FLOOR(revenue / 10.0) * 10.0 AS bin_start FROM demo_sales WHERE revenue IS NOT NULL) SELECT bin_start, bin_start + 10.0 AS bin_end, COUNT(*) AS bin_count FROM bucketed GROUP BY bin_start ORDER BY bin_start");
+let sparse = workspace.sql("WITH bucketed AS (SELECT FLOOR(revenue / 10.0) * 10.0 AS bin_start FROM demo_sales WHERE revenue IS NOT NULL) SELECT bin_start, bin_start + 10.0 AS bin_end, COUNT(*) AS bin_count FROM bucketed WHERE bin_start <> 20.0 GROUP BY bin_start ORDER BY bin_start");
+
+bucketed.views([
+	view("histogram-full", figure([
+		title("Histogram · Relation-side FLOOR bins"),
+		subtitle("Count is encoded once, by height"),
+		skin(skin),
+		palette("viridis_cC"),
+		x_bounds(0, 50),
+		x_tick_step(10),
+		y_bounds(0, 30),
+		y_tick_step(5),
+		histogram("bin_start", "bin_end", "bin_count"),
+	])),
+]);
+
+sparse.views([
+	view("histogram-sparse", figure([
+		title("Histogram · Sparse intervals stay sparse"),
+		subtitle("The absent [20, 30) interval is not invented"),
+		skin(skin),
+		x_bounds(0, 50),
+		x_tick_step(10),
+		y_bounds(0, 30),
+		y_tick_step(5),
+		histogram("bin_start", "bin_end", "bin_count"),
+	])),
+]);

@@ -7016,6 +7016,7 @@ mod tests {
 			.unwrap();
 		let named = LocalViewIdentity::Named("bars".into());
 		let anonymous = LocalViewIdentity::Anonymous(0);
+		let histogram = LocalViewIdentity::Named("histogram".into());
 		let views = [
 			(
 				named.clone(),
@@ -7033,6 +7034,14 @@ mod tests {
 					authored_title: crate::plot::spec::Presence::Inherit,
 				},
 			),
+			(
+				histogram.clone(),
+				ViewPresentation {
+					content_kind: ViewContentKind::Plot,
+					display_label: "plot.histogram".into(),
+					authored_title: crate::plot::spec::Presence::Inherit,
+				},
+			),
 		];
 		editor.prepare_rune_view_panels(producer, &views, 1);
 		let deadline = Instant::now() + Duration::from_secs(10);
@@ -7041,7 +7050,7 @@ mod tests {
 				.shared_identity_census
 				.as_ref()
 				.is_none_or(|census| {
-					census.host_panels.len() < 2 || census.host_panel_groups.is_empty()
+					census.host_panels.len() < 3 || census.host_panel_groups.is_empty()
 				})
 		}) && Instant::now() < deadline
 		{
@@ -7050,6 +7059,7 @@ mod tests {
 		}
 		let named_panel = editor.rune_view_panel_id(producer, &named).unwrap();
 		let anonymous_panel = editor.rune_view_panel_id(producer, &anonymous).unwrap();
+		let histogram_panel = editor.rune_view_panel_id(producer, &histogram).unwrap();
 		let group = editor.view_group_ids[&producer];
 		let identity = ColorIdentity::from_persistence_snapshot(ColorIdentitySnapshot {
 			assignments: vec![ColorAssignmentSnapshot {
@@ -7160,8 +7170,16 @@ mod tests {
 			reopened.rune_view_panel_id(reopened_buffer, &anonymous),
 			Some(anonymous_panel)
 		);
+		assert_eq!(
+			reopened.rune_view_panel_id(reopened_buffer, &histogram),
+			Some(histogram_panel)
+		);
 		assert!(matches!(
 			reopened.panels.panels[&anonymous_panel].content,
+			PanelContent::Unresolved
+		));
+		assert!(matches!(
+			reopened.panels.panels[&histogram_panel].content,
 			PanelContent::Unresolved
 		));
 		let (_, plain_kernel) = product_0075_test_plot();
@@ -7286,6 +7304,11 @@ mod tests {
 		assert_eq!(
 			reopened.rune_view_panel_id(reopened_buffer, &named),
 			Some(named_panel)
+		);
+		assert_eq!(
+			reopened.rune_view_panel_id(reopened_buffer, &histogram),
+			Some(histogram_panel),
+			"a histogram rerun rejoins its unresolved restored panel"
 		);
 		assert_eq!(
 			reopened.view_panel_ids.len(),

@@ -135,7 +135,7 @@ impl StyledRunePlotSink {
 		let mark = match self.sink.composition.primary_plot_type() {
 			PlotType::Line => LayerMark::Line,
 			PlotType::Scatter => LayerMark::Scatter,
-			PlotType::Bar | PlotType::StackedArea => return Err(self),
+			PlotType::Bar | PlotType::StackedArea | PlotType::Histogram => return Err(self),
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
 		};
 		let mut layer = LayerSpec::xy(mark, self.sink.x, self.sink.y);
@@ -170,6 +170,7 @@ pub(crate) enum RuneViewForm {
 	Line,
 	Scatter,
 	Area,
+	Histogram,
 }
 
 #[cfg(test)]
@@ -181,6 +182,7 @@ impl From<RuneViewForm> for ViewPresentation {
 			RuneViewForm::Line => (ViewContentKind::Plot, "plot.line"),
 			RuneViewForm::Scatter => (ViewContentKind::Plot, "plot.scatter"),
 			RuneViewForm::Area => (ViewContentKind::Plot, "plot.area"),
+			RuneViewForm::Histogram => (ViewContentKind::Plot, "plot.histogram"),
 		};
 		Self {
 			content_kind,
@@ -205,6 +207,7 @@ impl RuneViewIntent {
 						PlotType::Line => "plot.line".to_owned(),
 						PlotType::Scatter => "plot.scatter".to_owned(),
 						PlotType::StackedArea => "plot.area".to_owned(),
+						PlotType::Histogram => "plot.histogram".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -215,6 +218,7 @@ impl RuneViewIntent {
 							PlotType::Line => "plot.line".to_owned(),
 							PlotType::Scatter => "plot.scatter".to_owned(),
 							PlotType::StackedArea => "plot.area".to_owned(),
+							PlotType::Histogram => "plot.histogram".to_owned(),
 							other => {
 								unreachable!("styled sink admitted unexpected plot type {other:?}")
 							}
@@ -243,6 +247,7 @@ impl RuneViewIntent {
 			(ViewContentKind::Plot, "plot.line") => RuneViewForm::Line,
 			(ViewContentKind::Plot, "plot.scatter") => RuneViewForm::Scatter,
 			(ViewContentKind::Plot, "plot.area") => RuneViewForm::Area,
+			(ViewContentKind::Plot, "plot.histogram") => RuneViewForm::Histogram,
 			_ => panic!("a composite presentation has no legacy RuneViewForm"),
 		}
 	}
@@ -258,13 +263,32 @@ pub(crate) struct SpannedRuneViewIntent {
 
 /// First-contact presentation data only. This is not `PlotSpec` v0 and dies
 /// when the plotting contract lands.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 pub(crate) struct DisposableRunePlotSink {
 	pub(crate) composition: PlotComposition,
 	pub(crate) x: String,
 	pub(crate) y: String,
 	pub(crate) category: Option<String>,
+	/// PRODUCT-0079: the second edge of an explicit histogram interval.
+	pub(crate) interval_end: Option<String>,
+	/// Original authored mark call, retained for post-query diagnostics.
+	pub(crate) origin: Range<u32>,
 }
+
+// Authored location is diagnostic provenance, not plot semantics. Keeping it
+// out of equality preserves the canonical-spelling equivalences established
+// by PRODUCT-0008 while still carrying it to PRODUCT-0079's post-query errors.
+impl PartialEq for DisposableRunePlotSink {
+	fn eq(&self, other: &Self) -> bool {
+		self.composition == other.composition
+			&& self.x == other.x
+			&& self.y == other.y
+			&& self.category == other.category
+			&& self.interval_end == other.interval_end
+	}
+}
+
+impl Eq for DisposableRunePlotSink {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SourceMapSegment {

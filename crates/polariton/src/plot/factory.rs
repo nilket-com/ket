@@ -211,6 +211,18 @@ pub fn create_plot(
 				normalization: spec.stack_normalization,
 			})
 		}
+		ResolvedKernelFields::Histogram {
+			bin_start,
+			bin_end,
+			count,
+		} => Arc::new(crate::plot::kernels::histogram::HistogramPlotKernel {
+			prepared_data: Arc::new(
+				crate::plot::kernels::histogram::prepare_histogram_data(
+					df, bin_start, bin_end, count,
+				)
+				.expect("resolved histogram was validated during planning"),
+			),
+		}),
 		ResolvedKernelFields::FillBetween {
 			x,
 			middle,

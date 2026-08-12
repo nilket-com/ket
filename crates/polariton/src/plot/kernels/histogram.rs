@@ -2,9 +2,11 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label,
 };
+use crate::plot::kernels::histogram_bins::HistogramBin;
 use crate::plot::kernels::histogram_bins::HistogramBins;
+use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
-use iced::{Color, Rectangle};
+use polars::prelude::{AnyValue, DataFrame, DataType};
 use std::sync::Arc;
 
 pub struct HistogramPlotKernel {
@@ -36,35 +38,24 @@ impl PlotKernel for HistogramPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let Some(max_count) = self.prepared_data.bins.max_positive_count() else {
+		if self.prepared_data.bins.max_positive_count().is_none() {
 			return;
-		};
+		}
 		let clip = Rectangle::new(iced::Point::ORIGIN, transform.bounds.size());
 		backend.with_clip(clip, &mut |backend| {
 			for bin in self.prepared_data.bins.iter().filter(|bin| bin.count > 0) {
 				let top_left = transform.cartesian(bin.start, bin.count as f64);
 				let bottom_right = transform.cartesian(bin.end, 0.0);
-				let color = settings
-					.color_theme
-					.get_color(bin.count as f32 / max_count as f32);
 				let rect = Rectangle {
 					x: top_left.x,
 					y: top_left.y,
 					width: (bottom_right.x - top_left.x).max(1.0),
 					height: (bottom_right.y - top_left.y).max(1.0),
 				};
-				backend.fill_rectangle(rect.position(), rect.size(), color);
-				backend.stroke_path(
-					&|builder| {
-						builder.rectangle(rect.position(), rect.size());
-					},
-					iced::widget::canvas::Stroke {
-						style: iced::widget::canvas::Style::Solid(Color::from_rgba(
-							0.0, 0.0, 0.0, 0.2,
-						)),
-						width: 0.5,
-						..Default::default()
-					},
+				backend.fill_rectangle(
+					rect.position(),
+					rect.size(),
+					settings.chrome.mark_fill.iced(),
 				);
 			}
 		});
@@ -72,18 +63,9 @@ impl PlotKernel for HistogramPlotKernel {
 
 	fn legend_content(
 		&self,
-		settings: &ResolvedPlotSettings,
+		_settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		let max_count = self.prepared_data.bins.max_positive_count()?;
-		Some(crate::plot::legend::LegendContent(
-			crate::plot::spec::NonEmpty::new(crate::plot::legend::LegendSection::Gradient {
-				label: "Frequency".to_owned(),
-				low: 0.0,
-				high: max_count as f64,
-				low_color: settings.color_theme.get_color(0.0),
-				high_color: settings.color_theme.get_color(1.0),
-			}),
-		))
+		None
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
@@ -108,6 +90,7 @@ impl PlotKernel for HistogramPlotKernel {
 	}
 }
 
+#[derive(Debug)]
 pub struct HistogramPreparedData {
 	pub bins: HistogramBins,
 	pub x_axis_type: AxisType,
@@ -116,16 +99,108 @@ pub struct HistogramPreparedData {
 	pub y_label: String,
 }
 
+/// PRODUCT-0079's single ingestion path from an already-aggregated relation.
+/// It retains row indices for diagnostics and delegates interval invariants to
+/// PRODUCT-0078's sole authority, `HistogramBins::new`.
+pub fn prepare_histogram_data(
+	df: &DataFrame,
+	bin_start: &str,
+	bin_end: &str,
+	count: &str,
+) -> Result<HistogramPreparedData, String> {
+	let start_column = df
+		.column(bin_start)
+		.map_err(|error| format!("histogram bin_start `{bin_start}`: {error}"))?;
+	let end_column = df
+		.column(bin_end)
+		.map_err(|error| format!("histogram bin_end `{bin_end}`: {error}"))?;
+	let count_column = df
+		.column(count)
+		.map_err(|error| format!("histogram count `{count}`: {error}"))?;
+	if !matches!(
+		count_column.dtype(),
+		DataType::Int8
+			| DataType::Int16
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::UInt8
+			| DataType::UInt16
+			| DataType::UInt32
+			| DataType::UInt64
+	) {
+		return Err(format!(
+			"histogram count column `{count}` requires an integer dtype through u64, got {:?}",
+			count_column.dtype()
+		));
+	}
+	let starts = start_column
+		.cast(&DataType::Float64)
+		.map_err(|error| format!("histogram bin_start `{bin_start}`: {error}"))?;
+	let ends = end_column
+		.cast(&DataType::Float64)
+		.map_err(|error| format!("histogram bin_end `{bin_end}`: {error}"))?;
+	let starts = starts.f64().map_err(|error| error.to_string())?;
+	let ends = ends.f64().map_err(|error| error.to_string())?;
+	let mut bins = Vec::with_capacity(df.height());
+	for row in 0..df.height() {
+		let start = starts
+			.get(row)
+			.ok_or_else(|| format!("histogram bin_start `{bin_start}` is null at row {row}"))?;
+		let end = ends
+			.get(row)
+			.ok_or_else(|| format!("histogram bin_end `{bin_end}` is null at row {row}"))?;
+		let value = count_column
+			.get(row)
+			.map_err(|error| format!("histogram count `{count}` at row {row}: {error}"))?;
+		let count = histogram_count(value, count, row)?;
+		bins.push(HistogramBin { start, end, count });
+	}
+	let bins = HistogramBins::new(bins).map_err(|error| match error {
+		crate::plot::kernels::histogram_bins::HistogramBinsError::Unordered { index } => format!(
+			"{error}; sort the relation by `{bin_start}` ascending before histogram(...) (offending index {index})"
+		),
+		other => other.to_string(),
+	})?;
+	Ok(HistogramPreparedData {
+		bins,
+		x_axis_type: AxisType::Linear,
+		y_axis_type: AxisType::Linear,
+		x_label: bin_start.to_owned(),
+		y_label: count.to_owned(),
+	})
+}
+
+fn histogram_count(value: AnyValue<'_>, field: &str, row: usize) -> Result<u64, String> {
+	let negative =
+		|value: i128| format!("histogram count `{field}` is negative at row {row}: {value}");
+	match value {
+		AnyValue::Null => Err(format!("histogram count `{field}` is null at row {row}")),
+		AnyValue::Int8(value) => u64::try_from(value).map_err(|_| negative(value.into())),
+		AnyValue::Int16(value) => u64::try_from(value).map_err(|_| negative(value.into())),
+		AnyValue::Int32(value) => u64::try_from(value).map_err(|_| negative(value.into())),
+		AnyValue::Int64(value) => u64::try_from(value).map_err(|_| negative(value.into())),
+		AnyValue::UInt8(value) => Ok(u64::from(value)),
+		AnyValue::UInt16(value) => Ok(u64::from(value)),
+		AnyValue::UInt32(value) => Ok(u64::from(value)),
+		AnyValue::UInt64(value) => Ok(value),
+		other => Err(format!(
+			"histogram count `{field}` has unsupported value {other:?} at row {row}"
+		)),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use crate::plot::common::{PathBuilder, PlotBackend};
 	use crate::plot::kernels::histogram_bins::{HistogramBin, HistogramBins, HistogramBinsError};
-	use iced::{Point, Size, Vector};
+	use iced::{Color, Point, Size, Vector};
 
 	#[derive(Default)]
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size)>,
+		colors: Vec<Color>,
+		strokes: usize,
 		clips: Vec<Rectangle>,
 	}
 
@@ -135,12 +210,14 @@ mod tests {
 			_f: &dyn Fn(&mut dyn PathBuilder),
 			_stroke: iced::widget::canvas::Stroke,
 		) {
+			self.strokes += 1;
 		}
 
 		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
 
-		fn fill_rectangle(&mut self, top_left: Point, size: Size, _color: Color) {
+		fn fill_rectangle(&mut self, top_left: Point, size: Size, color: Color) {
 			self.rectangles.push((top_left, size));
+			self.colors.push(color);
 		}
 
 		fn fill_text(&mut self, _text: iced::widget::canvas::Text) {}
@@ -357,6 +434,110 @@ mod tests {
 			zero.hover(&zero_transform, cursor_at(&zero_transform, 5.0, 0.5))
 				.expect("reported zero-count interval remains hoverable")
 				.contains("Count: 0")
+		);
+	}
+
+	#[test]
+	fn product_0079_count_is_height_only_and_mark_fill_is_exact() {
+		let histogram = kernel(vec![bin(0.0, 1.0, 4), bin(1.0, 2.0, 11)]);
+		let mut settings = ResolvedPlotSettings::default();
+		settings.chrome.mark_fill = crate::plot::chrome::PlotRgba::opaque(0.2, 0.4, 0.8);
+		let rendered = render_rectangles(&histogram, settings.clone());
+		assert_eq!(rendered.colors, vec![settings.chrome.mark_fill.iced(); 2]);
+		assert_ne!(
+			rendered.rectangles[0].1.height,
+			rendered.rectangles[1].1.height
+		);
+		assert_eq!(
+			rendered.strokes, 0,
+			"PRODUCT-0079 ships no histogram outline"
+		);
+		assert_eq!(histogram.legend_content(&settings), None);
+
+		let fills = ["nord", "viridis_r"].map(|name| {
+			let mut settings = ResolvedPlotSettings::default();
+			settings.chrome = crate::plot::chrome::PlotChrome::from_theme_name(
+				name,
+				crate::plot::chrome::PlotChromeProjection::Ordered,
+			)
+			.unwrap();
+			render_rectangles(&histogram, settings).colors[0]
+		});
+		assert_ne!(
+			fills[0], fills[1],
+			"the emitted histogram fill must follow the resolved skin"
+		);
+	}
+
+	#[test]
+	fn product_0079_ingestion_refuses_nulls_and_negatives_and_keeps_integer_extremes() {
+		use polars::prelude::{Column, DataFrame};
+		let frame = |starts: Column, ends: Column, counts: Column| {
+			DataFrame::new(starts.len(), vec![starts, ends, counts]).expect("frame")
+		};
+		let negative = frame(
+			Column::new("start".into(), [0.0]),
+			Column::new("end".into(), [1.0]),
+			Column::new("count".into(), [-1_i64]),
+		);
+		let error = prepare_histogram_data(&negative, "start", "end", "count").unwrap_err();
+		assert!(error.contains("negative") && error.contains("row 0") && error.contains("-1"));
+
+		for (starts, ends, counts, field) in [
+			(
+				Column::new("start".into(), [None::<f64>]),
+				Column::new("end".into(), [Some(1.0)]),
+				Column::new("count".into(), [Some(1_u64)]),
+				"start",
+			),
+			(
+				Column::new("start".into(), [Some(0.0)]),
+				Column::new("end".into(), [None::<f64>]),
+				Column::new("count".into(), [Some(1_u64)]),
+				"end",
+			),
+			(
+				Column::new("start".into(), [Some(0.0)]),
+				Column::new("end".into(), [Some(1.0)]),
+				Column::new("count".into(), [None::<u64>]),
+				"count",
+			),
+		] {
+			let error =
+				prepare_histogram_data(&frame(starts, ends, counts), "start", "end", "count")
+					.unwrap_err();
+			assert!(error.contains(field) && error.contains("null") && error.contains("row 0"));
+		}
+
+		let signed = frame(
+			Column::new("start".into(), [0.0]),
+			Column::new("end".into(), [1.0]),
+			Column::new("count".into(), [i64::MAX]),
+		);
+		assert_eq!(
+			prepare_histogram_data(&signed, "start", "end", "count")
+				.unwrap()
+				.bins
+				.iter()
+				.next()
+				.unwrap()
+				.count,
+			i64::MAX as u64
+		);
+		let unsigned = frame(
+			Column::new("start".into(), [0.0]),
+			Column::new("end".into(), [1.0]),
+			Column::new("count".into(), [u64::MAX]),
+		);
+		assert_eq!(
+			prepare_histogram_data(&unsigned, "start", "end", "count")
+				.unwrap()
+				.bins
+				.iter()
+				.next()
+				.unwrap()
+				.count,
+			u64::MAX
 		);
 	}
 }

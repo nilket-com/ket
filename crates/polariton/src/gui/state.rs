@@ -49,10 +49,10 @@ use crate::result_registry::{ResultRegistry, parse_result_annotation};
 use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
-	PendingRunePresentation, PendingRuneView, RuneEnvelopeError, RunePlotBody, RunePlotDomainSpans,
-	RunePlotMinorTickSpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
-	RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent,
-	StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView,
+	DisposableRunePlotSink, PendingRunePresentation, PendingRuneView, RuneEnvelopeError,
+	RunePlotBody, RunePlotDomainSpans, RunePlotMinorTickSpans, RunePlotTickStepSpans,
+	RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler,
+	SpannedRuneViewIntent, StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView,
 };
 use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, window};
@@ -986,6 +986,25 @@ fn resolve_rune_plot_skin(
 }
 
 #[cfg(feature = "toron")]
+fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
+	if sink.composition.primary_plot_type() == PlotType::Histogram {
+		return AuthoredPlotSpec::histogram(
+			sink.x.clone(),
+			sink.interval_end
+				.clone()
+				.expect("Rune histogram carries its explicit bin_end"),
+			sink.y.clone(),
+		);
+	}
+	AuthoredPlotSpec::xy_color(
+		sink.composition.clone(),
+		sink.x.clone(),
+		sink.y.clone(),
+		sink.category.clone(),
+	)
+}
+
+#[cfg(feature = "toron")]
 fn resolved_rune_axis_scales(
 	body: &RunePlotBody,
 	schema: &polars::prelude::Schema,
@@ -1001,23 +1020,13 @@ fn resolved_rune_axis_scales(
 	};
 	let resolved = match body {
 		RunePlotBody::Single(sink) => {
-			let authored = AuthoredPlotSpec::xy_color(
-				sink.composition.clone(),
-				sink.x.clone(),
-				sink.y.clone(),
-				sink.category.clone(),
-			);
+			let authored = authored_rune_plot_spec(sink);
 			let binding = resolve_channels(&authored, schema).map_err(|error| error.to_string())?;
 			scales(binding.channels())
 		}
 		RunePlotBody::StyledSingle(styled) => {
 			let sink = &styled.sink;
-			let authored = AuthoredPlotSpec::xy_color(
-				sink.composition.clone(),
-				sink.x.clone(),
-				sink.y.clone(),
-				sink.category.clone(),
-			);
+			let authored = authored_rune_plot_spec(sink);
 			let authored = if styled.stacked {
 				authored.with_stacked_bar()
 			} else {
@@ -1458,6 +1467,22 @@ fn rune_view_outcome_with_palettes(
 				RuneViewIntent::Plot(plot) => (plot.facet.clone(), plot.facet_span.clone()),
 				RuneViewIntent::Table(_) => (None, None),
 			};
+			let body_output_span = match &view.intent {
+				RuneViewIntent::Plot(plot) => match &plot.body {
+					RunePlotBody::Single(sink)
+						if sink.composition.primary_plot_type() == PlotType::Histogram =>
+					{
+						Some(sink.origin.clone())
+					}
+					RunePlotBody::StyledSingle(styled)
+						if styled.sink.composition.primary_plot_type() == PlotType::Histogram =>
+					{
+						Some(styled.sink.origin.clone())
+					}
+					_ => None,
+				},
+				RuneViewIntent::Table(_) => None,
+			};
 			let (output, tick_step_output_span, minor_tick_output_span) = match view.intent {
 				RuneViewIntent::Table(table) => (
 					resolve_rune_table(table).map(RuneRelationSinkOutput::Table),
@@ -1542,12 +1567,7 @@ fn rune_view_outcome_with_palettes(
 						minor_tick_spans.x.is_some() || minor_tick_spans.y.is_some();
 					let output = match body {
 						RunePlotBody::Single(plot) => {
-							let authored_spec = AuthoredPlotSpec::xy_color(
-								plot.composition,
-								plot.x,
-								plot.y,
-								plot.category,
-							);
+							let authored_spec = authored_rune_plot_spec(&plot);
 							plan_with_categorical_palette(
 								PlotRequest {
 									source: PlotSource::Materialized {
@@ -1630,12 +1650,7 @@ fn rune_view_outcome_with_palettes(
 									stacked,
 									percent,
 								} = styled;
-								let authored_spec = AuthoredPlotSpec::xy_color(
-									sink.composition,
-									sink.x,
-									sink.y,
-									sink.category,
-								);
+								let authored_spec = authored_rune_plot_spec(&sink);
 								let authored_spec = if stacked {
 									authored_spec.with_stacked_bar()
 								} else {
@@ -1749,7 +1764,10 @@ fn rune_view_outcome_with_palettes(
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
-				span: output_span.or(facet_span).unwrap_or(view.span),
+				span: output_span
+					.or(body_output_span)
+					.or(facet_span)
+					.unwrap_or(view.span),
 				facet,
 				source: std::sync::Arc::clone(&result),
 				output,
@@ -9287,6 +9305,164 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			"a DataFrame is an artifact and must own a result surface"
 		);
 		state.code_editor.shutdown();
+	}
+
+	#[test]
+	#[cfg(feature = "toron")]
+	fn product_0079_histogram_resolves_values_spans_order_and_skin_without_color_identity() {
+		use crate::plot::chrome::PlotChrome;
+		use crate::plot::spec::Channel;
+		use crate::plot::theme::PlotSettings;
+		use polars::frame::DataFrame;
+		let source = r#"workspace.table("bins").views([figure([
+    skin("nord"),
+    palette("tab20c"),
+    histogram("bin_start", "bin_end", "count")
+])])"#;
+		let complete = |source: &str, frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("histogram source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"bin_start" => [0.0, 2.0],
+			"bin_end" => [1.0, 3.0],
+			"count" => [4_i64, 7_i64],
+		)
+		.unwrap();
+		let outcome = complete(source, valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(
+			resolved,
+			authored,
+			continuation,
+		)) = &outcome.sinks[0].output
+		else {
+			panic!("valid histogram must resolve");
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::Histogram { bin_start, bin_end, count }
+				if bin_start == "bin_start" && bin_end == "bin_end" && count == "count"
+		));
+		assert!(resolved.resolved_spec.band_fills.is_empty());
+		assert!(resolved.resolved_spec.channel(Channel::Color).is_none());
+		assert!(
+			continuation
+				.identity
+				.persistence_snapshot()
+				.assignments
+				.is_empty()
+		);
+		let chrome = PlotSettings {
+			authored_spec: authored.clone(),
+			..PlotSettings::default()
+		}
+		.resolve()
+		.chrome;
+		assert_eq!(
+			chrome.mark_fill,
+			PlotChrome::from_theme_name("nord", crate::plot::chrome::PlotChromeProjection::Ordered)
+				.unwrap()
+				.mark_fill
+		);
+		let without_palette = source.replace("    palette(\"tab20c\"),\n", "");
+		let no_palette = complete(&without_palette, valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(
+			no_palette_resolved,
+			no_palette_authored,
+			_,
+		)) = &no_palette.sinks[0].output
+		else {
+			panic!("histogram without palette must resolve");
+		};
+		assert!(no_palette_resolved.resolved_spec.band_fills.is_empty());
+		assert_eq!(
+			PlotSettings {
+				authored_spec: no_palette_authored.clone(),
+				..PlotSettings::default()
+			}
+			.resolve()
+			.chrome
+			.mark_fill,
+			chrome.mark_fill,
+			"palette metadata cannot affect an unencoded histogram fill"
+		);
+
+		for (frame, expected) in [
+			(
+				polars::df!("bin_start" => [0.0], "bin_end" => [1.0], "count" => [1.5]).unwrap(),
+				"integer dtype",
+			),
+			(
+				polars::df!("bin_start" => [0.0], "bin_end" => [1.0], "count" => [-1_i64]).unwrap(),
+				"negative at row 0: -1",
+			),
+			(
+				polars::df!("bin_start" => ["bad"], "bin_end" => [1.0], "count" => [1_i64])
+					.unwrap(),
+				"`bin_start` could not resolve: Nominal is incompatible with Histogram",
+			),
+			(
+				polars::df!("bin_start" => [0.0], "bin_end" => [1.0]).unwrap(),
+				"field is absent",
+			),
+			(
+				polars::df!(
+					"bin_start" => [Some(0.0), None],
+					"bin_end" => [1.0, 2.0],
+					"count" => [1_i64, 1_i64],
+				)
+				.unwrap(),
+				"bin_start `bin_start` is null at row 1",
+			),
+			(
+				polars::df!(
+					"bin_start" => [0.0, 1.0],
+					"bin_end" => [Some(1.0), None],
+					"count" => [1_i64, 1_i64],
+				)
+				.unwrap(),
+				"bin_end `bin_end` is null at row 1",
+			),
+			(
+				polars::df!(
+					"bin_start" => [0.0, 1.0],
+					"bin_end" => [1.0, 2.0],
+					"count" => [Some(1_i64), None],
+				)
+				.unwrap(),
+				"count `count` is null at row 1",
+			),
+		] {
+			let outcome = complete(source, frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid histogram must refuse");
+			};
+			assert!(error.contains(expected), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				"histogram(\"bin_start\", \"bin_end\", \"count\")"
+			);
+			assert!(complete(source, valid.clone()).sinks[0].output.is_ok());
+		}
+
+		let descending = polars::df!(
+			"bin_start" => [2.0, 0.0],
+			"bin_end" => [3.0, 1.0],
+			"count" => [7_i64, 4_i64],
+		)
+		.unwrap();
+		let outcome = complete(source, descending);
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("descending histogram must refuse");
+		};
+		assert!(error.contains("unordered interval") && error.contains("sort the relation"));
+		let ascending = complete(source, valid);
+		assert!(ascending.sinks[0].output.is_ok());
 	}
 
 	#[test]

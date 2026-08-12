@@ -384,6 +384,7 @@ fn build_context() -> Result<Context, String> {
 		("__line", raw_line as RawFunction),
 		("__scatter", raw_scatter as RawFunction),
 		("__area", raw_area as RawFunction),
+		("__histogram", raw_histogram as RawFunction),
 		("__title", raw_title as RawFunction),
 		("__subtitle", raw_subtitle as RawFunction),
 		("__facet", raw_facet as RawFunction),
@@ -463,6 +464,15 @@ fn raw_scatter(
 
 fn raw_area(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
 	raw_mark(PlotType::StackedArea, "area", stack, addr, args, out)
+}
+
+fn raw_histogram(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_mark(PlotType::Histogram, "histogram", stack, addr, args, out)
 }
 
 #[derive(Clone, Copy)]
@@ -835,9 +845,15 @@ fn raw_mark(
 		PlotType::Bar => "bar(...) takes x and y strings with an optional series",
 		PlotType::Line => "line(...) takes x and y strings with an optional series",
 		PlotType::StackedArea => "area(...) takes x and y strings with an optional series",
-		_ => unreachable!("Rune exposes only four authored mark families"),
+		PlotType::Histogram => "histogram(...) takes bin_start, bin_end, and count strings",
+		_ => unreachable!("Rune exposes only five authored mark families"),
 	};
-	let sink = if matches!(fields.len(), 2 | 3) {
+	let arity_ok = if plot_type == PlotType::Histogram {
+		fields.len() == 3
+	} else {
+		matches!(fields.len(), 2 | 3)
+	};
+	let sink = if arity_ok {
 		let mut decoded = Vec::with_capacity(fields.len());
 		for field in fields {
 			match rune::from_value::<Ref<str>>(field.clone()) {
@@ -854,12 +870,29 @@ fn raw_mark(
 				}
 			}
 		}
+		let (x, y, category, interval_end) = if plot_type == PlotType::Histogram {
+			(
+				decoded[0].clone(),
+				decoded[2].clone(),
+				None,
+				Some(decoded[1].clone()),
+			)
+		} else {
+			(
+				decoded[0].clone(),
+				decoded[1].clone(),
+				decoded.get(2).cloned(),
+				None,
+			)
+		};
 		Ok(StyledRunePlotSink {
 			sink: DisposableRunePlotSink {
 				composition: PlotComposition::single(plot_type),
-				x: decoded[0].clone(),
-				y: decoded[1].clone(),
-				category: decoded.get(2).cloned(),
+				x,
+				y,
+				category,
+				interval_end,
+				origin: origin.range(),
 			},
 			settings: LayerSettings::default(),
 			stacked: false,

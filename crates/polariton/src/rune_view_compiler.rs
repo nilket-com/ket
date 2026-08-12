@@ -25,6 +25,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"bar",
 	"facet",
 	"figure",
+	"histogram",
 	"hide_legend",
 	"layers",
 	"legend_at",
@@ -479,11 +480,15 @@ fn static_method_on_relation(
 			slots: vec![synthetic_slot(constructor, args, call.span(), source)?],
 		}));
 	}
-	if matches!(method, "line" | "bar" | "scatter" | "area") {
+	if matches!(method, "line" | "bar" | "scatter" | "area" | "histogram") {
 		return invalid_view(
 			call.span(),
 			source.len(),
-			format!("{method} view sugar requires x and y strings with an optional series"),
+			if method == "histogram" {
+				"histogram view sugar requires bin_start, bin_end, and count strings".to_owned()
+			} else {
+				format!("{method} view sugar requires x and y strings with an optional series")
+			},
 		);
 	}
 	if method == "table" && args.is_empty() {
@@ -704,6 +709,7 @@ fn mark_constructor(method: &str) -> Option<&'static str> {
 		"line" => Some("line"),
 		"scatter" => Some("scatter"),
 		"area" => Some("area"),
+		"histogram" => Some("histogram"),
 		_ => None,
 	}
 }
@@ -1565,7 +1571,7 @@ fn is_keyword(name: &str) -> bool {
 mod tests {
 	use super::*;
 	use crate::plot::spec::{Override, Presence};
-	use crate::rune_relation_envelope::RuneViewIntent;
+	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent};
 	use std::sync::Arc;
 
 	#[test]
@@ -1635,6 +1641,57 @@ ket.table("demo_sales").views([
 		assert_eq!(compiled.executions[0].views.len(), 12);
 		assert!(compiled.executions[0].source.contains(".sort(["));
 		assert!(!compiled.executions[0].source.contains("y_bounds"));
+	}
+
+	#[test]
+	fn product_0079_histogram_is_one_static_three_field_mark_with_empty_register() {
+		let source = r#"
+workspace.table("bins").views([
+    histogram("bin_start", "bin_end", "count"),
+])
+"#;
+		let compiled = compile(source).expect("histogram presentation compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("histogram is a plot");
+		};
+		let RunePlotBody::Single(sink) = &plot.body else {
+			panic!("unmodified histogram is a single mark");
+		};
+		assert_eq!(
+			sink.composition.primary_plot_type(),
+			crate::plot::core::PlotType::Histogram
+		);
+		assert_eq!(sink.x, "bin_start");
+		assert_eq!(sink.interval_end.as_deref(), Some("bin_end"));
+		assert_eq!(sink.y, "count");
+		assert_eq!(sink.category, None);
+
+		for modifier in ["bar_width(0.8)", "category_gap(0.1)"] {
+			let invalid = format!(
+				"workspace.table(\"bins\").views([histogram(\"bin_start\", \"bin_end\", \"count\").{modifier}])"
+			);
+			let error = compile(&invalid).expect_err("histogram register is empty");
+			let RuneEnvelopeError::InvalidView { span, message } = error else {
+				panic!("modifier refusal is attributed");
+			};
+			assert_eq!(
+				&invalid[span.start as usize..span.end as usize],
+				format!(".{modifier}")
+			);
+			assert!(message.contains("available on bar marks"), "{message}");
+		}
+
+		let exhibit = compile(include_str!("../../../uat/test25.rn"))
+			.expect("the versioned histogram exhibit compiles through the production path");
+		assert_eq!(exhibit.executions.len(), 2);
+		assert_eq!(exhibit.presentation_order.len(), 2);
+		assert!(
+			exhibit
+				.executions
+				.iter()
+				.all(|execution| execution.source.contains("FLOOR(revenue / 10.0)"))
+		);
 	}
 
 	#[test]

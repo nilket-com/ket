@@ -101,6 +101,8 @@ pub struct PlotChrome {
 	pub legend_text: PlotRgba,
 	pub legend_swatch_fill: PlotRgba,
 	pub legend_swatch_border: PlotRgba,
+	/// PRODUCT-0079: skin-resolved fill for marks with no authored color identity.
+	pub mark_fill: PlotRgba,
 }
 
 impl PlotChrome {
@@ -122,6 +124,7 @@ impl PlotChrome {
 			legend_text: decoration,
 			legend_swatch_fill: PlotRgba::translucent(1.0, 1.0, 1.0, 0.5),
 			legend_swatch_border: decoration,
+			mark_fill: decoration,
 		}
 	}
 
@@ -146,6 +149,7 @@ impl PlotChrome {
 				..decoration
 			},
 			legend_swatch_border: decoration,
+			mark_fill: decoration,
 		}
 	}
 
@@ -165,7 +169,7 @@ impl PlotChrome {
 		Ok(project_anchors(anchors))
 	}
 
-	pub fn visible_contrast_checks(self) -> [PlotChromeContrast; 8] {
+	pub fn visible_contrast_checks(self) -> [PlotChromeContrast; 9] {
 		let canvas = visible_srgb(self.canvas_background);
 		let legend = composite_over(self.legend_background, canvas);
 		[
@@ -207,6 +211,12 @@ impl PlotChrome {
 				legend,
 				NON_TEXT_CONTRAST_MINIMUM,
 			),
+			contrast(
+				"mark fill",
+				self.mark_fill,
+				canvas,
+				NON_TEXT_CONTRAST_MINIMUM,
+			),
 		]
 	}
 
@@ -216,7 +226,7 @@ impl PlotChrome {
 			.min_by(|left, right| {
 				(left.ratio / left.minimum).total_cmp(&(right.ratio / right.minimum))
 			})
-			.expect("plot chrome has eight contrast checks")
+			.expect("plot chrome has nine contrast checks")
 	}
 
 	pub fn passes_contrast(self) -> bool {
@@ -293,6 +303,7 @@ fn project_anchors(anchors: PlotChromeAnchors) -> PlotChrome {
 		legend_text: ink,
 		legend_swatch_fill: ink,
 		legend_swatch_border: ink,
+		mark_fill: ink,
 	};
 
 	// Choose the quietest alpha that reaches the non-text target when possible.
@@ -455,7 +466,7 @@ mod tests {
 		);
 		assert_eq!(
 			checks.iter().filter(|check| check.minimum == 3.0).count(),
-			3
+			4
 		);
 	}
 
@@ -478,8 +489,10 @@ mod tests {
 			PlotRgba::translucent(1.0, 1.0, 1.0, 0.5)
 		);
 		assert_eq!(chrome.legend_swatch_border, ink);
+		assert_eq!(chrome.mark_fill, ink);
 
 		let reconstructed = PlotChrome::legacy_from_iced(Color::BLACK, Color::WHITE);
+		assert_eq!(reconstructed.mark_fill, ink);
 		assert_eq!(reconstructed.gridline.alpha(), 0.35);
 		assert!(reconstructed.passes_contrast());
 	}
@@ -494,7 +507,7 @@ mod tests {
 			"the corrective ordered base keeps accepted Nord exact"
 		);
 		assert!(chrome.passes_contrast());
-		assert_eq!(chrome.visible_contrast_checks().len(), 8);
+		assert_eq!(chrome.visible_contrast_checks().len(), 9);
 		assert_eq!(chrome.canvas_background, chrome.legend_background);
 		assert_eq!(chrome.title_text, chrome.legend_swatch_border);
 		assert!(chrome.gridline.alpha() >= 0.35);
@@ -526,6 +539,38 @@ mod tests {
 			PlotRgba::opaque_rgb(anchors.paper)
 		);
 		assert_eq!(chrome.title_text, PlotRgba::opaque_rgb(anchors.ink));
+		assert_eq!(chrome.mark_fill, PlotRgba::opaque_rgb(anchors.ink));
+	}
+
+	#[test]
+	fn product_0079_default_mark_fill_passes_but_authored_low_contrast_is_exact() {
+		let default = PlotChrome::DEFAULT
+			.visible_contrast_checks()
+			.into_iter()
+			.find(|check| check.role() == "mark fill")
+			.expect("mark fill contrast role");
+		assert_eq!(default.minimum(), NON_TEXT_CONTRAST_MINIMUM);
+		assert!(
+			default.passes(),
+			"default mark fill: {:.3}",
+			default.ratio()
+		);
+
+		let anchors = PlotChromeAnchors {
+			paper_index: 0,
+			paper: Rgb::new(100, 100, 100),
+			ink_index: 1,
+			ink: Rgb::new(105, 105, 105),
+			contrast_ratio: Rgb::new(100, 100, 100).contrast_ratio(Rgb::new(105, 105, 105)),
+		};
+		let authored = project_anchors(anchors);
+		assert_eq!(authored.mark_fill, PlotRgba::opaque_rgb(anchors.ink));
+		let mark = authored
+			.visible_contrast_checks()
+			.into_iter()
+			.find(|check| check.role() == "mark fill")
+			.expect("authored mark fill contrast role");
+		assert!(!mark.passes(), "authored low contrast remains observable");
 	}
 
 	#[test]

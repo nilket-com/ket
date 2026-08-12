@@ -1546,7 +1546,7 @@ fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary(
 }
 
 #[test]
-fn product_0031_plot_chrome_is_closed_and_mark_ink_stays_separate() {
+fn product_0079_plot_chrome_is_closed_with_one_unencoded_mark_fill() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let chrome =
 		std::fs::read_to_string(root.join("plot/chrome.rs")).expect("read plot chrome model");
@@ -1557,7 +1557,8 @@ fn product_0031_plot_chrome_is_closed_and_mark_ink_stays_separate() {
 		.split('}')
 		.next()
 		.expect("PlotChrome fields");
-	assert_eq!(fields.matches("pub ").count(), 11);
+	assert_eq!(fields.matches("pub ").count(), 12);
+	assert_eq!(fields.matches("pub mark_fill: PlotRgba").count(), 1);
 	for forbidden in [
 		"Option<",
 		"HashMap",
@@ -1605,6 +1606,16 @@ fn product_0031_plot_chrome_is_closed_and_mark_ink_stays_separate() {
 			"{relative} mark drawing acquired plot chrome"
 		);
 	}
+
+	let histogram =
+		std::fs::read_to_string(root.join("plot/kernels/histogram.rs")).expect("histogram kernel");
+	let production = histogram
+		.split("#[cfg(test)]")
+		.next()
+		.expect("histogram production");
+	assert!(production.contains("settings.chrome.mark_fill"));
+	assert!(!production.contains("color_theme.get_color"));
+	assert!(!production.contains("stroke_path"));
 }
 
 #[test]
@@ -2265,7 +2276,7 @@ fn product_0077_facet_tick_containment_does_not_measure_or_resize_layout() {
 }
 
 #[test]
-fn product_0078_histogram_has_one_interval_authority_and_no_production_surface() {
+fn product_0078_histogram_keeps_one_interval_authority_after_the_0079_surface() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let histogram = std::fs::read_to_string(root.join("plot/kernels/histogram.rs"))
 		.expect("read histogram kernel");
@@ -2274,12 +2285,7 @@ fn product_0078_histogram_has_one_interval_authority_and_no_production_surface()
 	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
 	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
 
-	for retired in [
-		"prepare_histogram_data",
-		"bin_counts",
-		"pub max_count:",
-		"ResolvedKernelFields::Histogram",
-	] {
+	for retired in ["bin_counts", "pub max_count:"] {
 		assert!(
 			![
 				histogram.as_str(),
@@ -2300,11 +2306,13 @@ fn product_0078_histogram_has_one_interval_authority_and_no_production_surface()
 	}
 	assert!(
 		spec.contains("Histogram Plot has no producer; explicit interval fields are required"),
-		"automatic histogram resolution must refuse with the typed producerless reason"
+		"PRODUCT-0079 must not reinstate automatic raw-value binning"
 	);
 	assert!(
-		!factory.contains("HistogramPlotKernel") && !factory.contains("histogram::"),
-		"the generic factory must not reconstruct the producer mapping deferred by PRODUCT-0078"
+		histogram.contains("HistogramBins::new(bins)")
+			&& factory.contains("histogram::prepare_histogram_data(")
+			&& factory.contains("df, bin_start, bin_end, count,"),
+		"PRODUCT-0079 must ingest explicit interval fields through PRODUCT-0078's sole authority"
 	);
 
 	let prepared = histogram
@@ -2320,18 +2328,11 @@ fn product_0078_histogram_has_one_interval_authority_and_no_production_surface()
 		"histogram domains must be derived from the validated interval sequence"
 	);
 
-	for surface in [
-		"rune_host.rs",
-		"rune_presentation.rs",
-		"rune_relation_envelope.rs",
-		"rune_view.rs",
-		"rune_view_compiler.rs",
-	] {
-		let source = std::fs::read_to_string(root.join(surface))
-			.unwrap_or_else(|error| panic!("read {surface}: {error}"));
-		assert!(
-			!source.to_ascii_lowercase().contains("histogram"),
-			"PRODUCT-0078 remains substrate-only; {surface} acquired a histogram producer"
-		);
-	}
+	let presentation = std::fs::read_to_string(root.join("rune_presentation.rs"))
+		.expect("read Rune presentation runtime");
+	assert!(
+		presentation.contains("histogram(...) takes bin_start, bin_end, and count strings")
+			&& spec.contains("ResolvedKernelFields::Histogram"),
+		"PRODUCT-0079 must add only the explicit three-field producer"
+	);
 }

@@ -6,6 +6,7 @@
 //! source like an in-memory frame once deferred database relations arrive
 //! (`plans/wip/rune-data-products.md`).
 
+use crate::plot::kernels::histogram::prepare_histogram_data;
 use crate::plot::spec::{
 	AuthoredChannel, AuthoredPlotSpec, CategoricalPaletteSelection, ColorIdentity,
 	OptionalAuthoredChannel, PlotProvenance, ResolvedPlotSpec, StampedResult, resolve_channels,
@@ -80,6 +81,8 @@ pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 			};
 			let (resolved_spec, _) = resolve_domains(binding, &stamped, &ColorIdentity::default())
 				.map_err(|error| format!("{name}: {error}"))?;
+			validate_prepared_contract(&resolved_spec, data.as_ref())
+				.map_err(|error| format!("{name}: {error}"))?;
 			let data = project_named_channels(&request.authored_spec, data, &name)?;
 			Ok(ResolvedPlot {
 				source_name: name,
@@ -112,6 +115,8 @@ pub fn plan_with_categorical_palette(
 			let (resolved_spec, next_identity) =
 				resolve_domains_with_categorical_palette(binding, &stamped, identity, selection)
 					.map_err(|error| format!("{name}: {error}"))?;
+			validate_prepared_contract(&resolved_spec, data.as_ref())
+				.map_err(|error| format!("{name}: {error}"))?;
 			let data = project_named_channels(&request.authored_spec, data, &name)?;
 			Ok((
 				ResolvedPlot {
@@ -124,6 +129,18 @@ pub fn plan_with_categorical_palette(
 			))
 		}
 	}
+}
+
+fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Result<(), String> {
+	if let crate::plot::spec::ResolvedKernelFields::Histogram {
+		bin_start,
+		bin_end,
+		count,
+	} = spec.kernel_fields.as_ref()
+	{
+		prepare_histogram_data(data, bin_start, bin_end, count)?;
+	}
+	Ok(())
 }
 
 fn project_named_channels(
@@ -144,6 +161,11 @@ fn project_named_channels(
 		&& color != y
 	{
 		fields.push(color.as_str());
+	}
+	if let Some(end) = spec.histogram_end()
+		&& !fields.contains(&end)
+	{
+		fields.push(end);
 	}
 	let projected = data
 		.select(fields)
@@ -225,6 +247,52 @@ mod tests {
 				.field,
 			"x"
 		);
+	}
+
+	#[test]
+	fn product_0079_histogram_keeps_a_nonempty_color_identity_unchanged() {
+		let selection = CategoricalPaletteSelection::from_theme_name("viridis").unwrap();
+		let categorical = polars::df!(
+			"category" => ["a", "b"],
+			"value" => [1.0, 2.0],
+		)
+		.unwrap();
+		let (_, identity) = plan_with_categorical_palette(
+			PlotRequest {
+				source: materialized("categorical", categorical),
+				authored_spec: AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::Bar),
+					"category",
+					"value",
+				),
+			},
+			&selection,
+			&ColorIdentity::default(),
+		)
+		.unwrap();
+		assert!(!identity.persistence_snapshot().assignments.is_empty());
+
+		let bins = polars::df!(
+			"bin_start" => [0.0, 2.0],
+			"bin_end" => [1.0, 3.0],
+			"count" => [4_i64, 7_i64],
+		)
+		.unwrap();
+		let (resolved, after) = plan_with_categorical_palette(
+			PlotRequest {
+				source: materialized("bins", bins),
+				authored_spec: AuthoredPlotSpec::histogram("bin_start", "bin_end", "count"),
+			},
+			&selection,
+			&identity,
+		)
+		.unwrap();
+		assert_eq!(after, identity);
+		assert!(resolved.resolved_spec.band_fills.is_empty());
+		assert!(resolved.resolved_spec.channels.iter().all(|channel| {
+			channel.binding.channel != crate::plot::spec::Channel::Color
+				&& channel.colors.is_empty()
+		}));
 	}
 
 	#[test]

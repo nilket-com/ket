@@ -346,6 +346,9 @@ pub struct AuthoredPlotSpec {
 	pub y: AuthoredChannelSpec,
 	pub color: OptionalAuthoredChannelSpec,
 	pub color_job: Override<ColorJob>,
+	/// PRODUCT-0079: the second edge of a histogram interval. The x channel is
+	/// the start and the y channel is count; ordinary Cartesian marks keep None.
+	histogram_end: Option<String>,
 	/// PRODUCT-0064: stacking is authored geometry within the Bar family, not
 	/// a fourth authored plot type. Resolution consumes this only after the
 	/// x/y pair has selected the physical orientation.
@@ -361,6 +364,7 @@ impl AuthoredPlotSpec {
 			y: AuthoredChannelSpec::auto(),
 			color: OptionalAuthoredChannelSpec::auto(),
 			color_job: Override::Inherit,
+			histogram_end: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -373,6 +377,7 @@ impl AuthoredPlotSpec {
 			y: AuthoredChannelSpec::named(y),
 			color: OptionalAuthoredChannelSpec::absent(),
 			color_job: Override::Inherit,
+			histogram_end: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -389,6 +394,24 @@ impl AuthoredPlotSpec {
 			spec.color = OptionalAuthoredChannelSpec::named(color);
 		}
 		spec
+	}
+
+	pub fn histogram(
+		bin_start: impl Into<String>,
+		bin_end: impl Into<String>,
+		count: impl Into<String>,
+	) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::Histogram),
+			bin_start,
+			count,
+		);
+		spec.histogram_end = Some(bin_end.into());
+		spec
+	}
+
+	pub fn histogram_end(&self) -> Option<&str> {
+		self.histogram_end.as_deref()
 	}
 
 	pub fn with_stacked_bar(mut self) -> Self {
@@ -503,6 +526,7 @@ impl LayerEncoding {
 			y: self.y.clone(),
 			color: self.color.clone(),
 			color_job: self.color_job.clone(),
+			histogram_end: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -1019,6 +1043,11 @@ pub enum ResolvedKernelFields {
 		x: String,
 		y: String,
 	},
+	Histogram {
+		bin_start: String,
+		bin_end: String,
+		count: String,
+	},
 	FillBetween {
 		x: String,
 		middle: String,
@@ -1369,6 +1398,9 @@ pub fn resolve_channels(
 			});
 		}
 	}
+	if plot_type == PlotType::Histogram {
+		return resolve_histogram_channels(spec, schema);
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -1528,6 +1560,86 @@ pub fn resolve_channels(
 		color_job,
 		categorical_limit: categorical_limit(plot_type),
 		stack_normalization: spec.stack_normalization,
+	})
+}
+
+fn resolve_histogram_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::Histogram,
+	};
+	let mut used_by_auto = HashSet::new();
+	let bin_start = resolve_required(
+		Channel::X,
+		&spec.x,
+		PlotType::Histogram,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let count = resolve_required(
+		Channel::Y,
+		&spec.y,
+		PlotType::Histogram,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let count_dtype = schema
+		.get(count.field.as_str())
+		.expect("resolved count field");
+	if !matches!(
+		count_dtype,
+		DataType::Int8
+			| DataType::Int16
+			| DataType::Int32
+			| DataType::Int64
+			| DataType::UInt8
+			| DataType::UInt16
+			| DataType::UInt32
+			| DataType::UInt64
+	) {
+		return Err(ChannelError {
+			channel: Channel::Y,
+			field: count.field,
+			reason: format!(
+				"histogram count requires an integer dtype through u64, got {count_dtype:?}"
+			),
+		});
+	}
+	let bin_end = spec.histogram_end().ok_or_else(|| ChannelError {
+		channel: Channel::X,
+		field: "<authored>".to_owned(),
+		reason: "histogram requires an explicit bin_end field".to_owned(),
+	})?;
+	let end_dtype = schema.get(bin_end).ok_or_else(|| ChannelError {
+		channel: Channel::X,
+		field: bin_end.to_owned(),
+		reason: "field is absent from the returned schema".to_owned(),
+	})?;
+	if !matches!(semantic_type(end_dtype), Some(SemanticType::Quantitative)) {
+		return Err(ChannelError {
+			channel: Channel::X,
+			field: bin_end.to_owned(),
+			reason: format!("histogram bin_end requires a quantitative dtype, got {end_dtype:?}"),
+		});
+	}
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![bin_start.clone(), count.clone()],
+		kernel_fields: Box::new(ResolvedKernelFields::Histogram {
+			bin_start: bin_start.field,
+			bin_end: bin_end.to_owned(),
+			count: count.field,
+		}),
+		color_job: None,
+		categorical_limit: 0,
+		stack_normalization: StackNormalization::Absolute,
 	})
 }
 
@@ -2202,6 +2314,7 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 			)
 		}
 		(PlotType::StackedArea, Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::Histogram, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
 		(_, Channel::Color) => true,
 		_ => false,
 	}
