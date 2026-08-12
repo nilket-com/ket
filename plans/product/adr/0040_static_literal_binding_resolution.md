@@ -187,6 +187,12 @@ identity, placement, lifecycle, or any element's semantics.
   is not already a literal in the source. Constant folding is the thin end of it —
   `1 + 1` requires an evaluator, and an evaluator requires deciding what runs
   where.
+  **Overturned by PRODUCT-0076 (2026-08-11).** That record built the evaluator
+  and answered the question this bullet treated as prohibitive: presentation runs
+  in a local bounded Rune VM, the relation closure goes to Toron, and view
+  topology stays static. PRODUCT-0076 supersedes PRODUCT-0016 §4 and this
+  record's §9; this entry is retained as the reasoning of its time and must not
+  be cited as a standing refusal.
 - **Peeling literal bindings:** would require proving a binding is
   presentation-only, which is whole-program analysis the envelope avoids by
   construction.

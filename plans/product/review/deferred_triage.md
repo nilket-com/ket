@@ -15,6 +15,76 @@ promising things this triage has decided.
 
 ---
 
+## Reconciliation pass — 2026-08-11
+
+This triage was seeded 2026-08-06 and **was never ratified**, so the closure
+discipline above never ran and no closure reason was copied into any record.
+That was checked, not assumed: PRODUCT-0040's Consequences carries none of them.
+The staleness below is therefore contained to this file.
+
+ADRs 0041–0077 landed in the intervening five days. The recommendations are
+reconciled against shipped work here rather than rewritten in place, so the
+seeded judgement stays legible beside what actually happened.
+
+**Shipped since seeding — these rows are no longer decisions:**
+
+| item | recommended | shipped in |
+|---|---|---|
+| Guide cluster — legend half only (IG-01, IG-05) | will do | 0043 + 0044. **IG-02 (Interaction) did not ship** and stays open: the 0013 §3 hover half belongs to an unscheduled interaction record, and swatch sizing is residue |
+| Persistence cluster | will do | 0059–0063 + 0071; the saved-session arc is complete. LC-02's in-process close/reopen lifecycle remains open and distinct |
+| Layout persistence | partial | 0059–0063 |
+| Durable identity | partial | 0063 named panels, 0071 status chrome |
+| Default gridline 1.66:1 repair | will do | 0067 |
+| Dashboard's fate | will do | 0075 — retirement, which incidentally repaired `Plot → Export` |
+| `Presence::Hide` repair | will do | 0050 |
+| Register-argument bindings | will do | 0040 / 0058 / 0076. `uat/test21.rn` binds `skin`, `palette`, and `facet`, and binds a whole figure member via `yb` |
+
+**Overturned closure:**
+
+| item | was | now |
+|---|---|---|
+| Computed presentation values | closed — "an evaluator means deciding what runs where" | **done, PRODUCT-0076.** The closure reason was the exact question 0076 answered. 0076 supersedes 0016 §4 and 0040 §9, and 0040's Rejected bullet now carries an overturned-by pointer. This is the one entry where a later record contradicted a triage decision rather than merely completing it |
+
+**Resolved by inspection:**
+
+| item | was | now |
+|---|---|---|
+| `ScatterLinePlotKernel` retirement (DB-14) | will do — "check once, delete or keep" | **keep.** The legacy authored notebook chain `.scatter().line().show()` reaches `plot_line` (`rune_host.rs:350-351`), then `is_scatter_with_line_overlay` (`plot/composition.rs:72`) selects the kernel at `plot/factory.rs:87`. PRODUCT-0075 did not strand it: its caller is not the retired dashboard picker. The newer `layers([...])` surface uses `LayeredPlotKernel` and is not this evidence. The check is spent; the item closes |
+
+**Still open (6, unchanged by this pass):** IG-02 interaction/hover, CI-03
+ColorTheme catalog retirement, CI-06 curated `c`/`C` no-op decision, DB-01
+deferred relations / live-table planning, DB-02 workspace artifact store, and
+LC-02 producer-release reattachment.
+
+LC-02 is not PRODUCT-0062's saved-start reattachment. On actual producer
+release, `release_buffer` removes the saved `DocumentId`
+(`engine/runtime.rs:2002`, `engine/session.rs:846`) and
+`host_panel_group_producer_released` clears the old group's producer
+(`engine/session.rs:5798`). Reopening that path mints a new document identity
+and group. PRODUCT-0062 reattaches only a document that survived into the
+committed session generation across process restart; it does not join this new
+producer to the producerless live group or its continuation bank.
+
+### What PRODUCT-0076 did and did not change here
+
+It was proposed that 0076's lower surface cost would re-bucket a swathe of
+deferrals. Inspection does not support that. These deferrals are gated on
+**appetite** ("nobody has asked", "trigger is the first request"), **design
+coherence** ("a flag surface would be a synonym"), or **dependency** ("needs a
+merge algebra the cascade lacks") — almost never on implementation cost. The
+governing rule is 0008 §6's *spellings are earned by use*, restated at 0011 §1
+and 0014, and cheaper spellings do not manufacture use.
+
+0076's one real effect on this ledger is narrow and worth stating exactly: it
+retires **"that would need an evaluator, and an evaluator means deciding what
+runs where"** as an available refusal anywhere in the corpus. That argument
+closed exactly one entry, which is why exactly one entry is overturned above.
+
+**Derived-scale axis titles** are deliberately untouched by this pass — a
+product decision, not reconciliation.
+
+---
+
 ## Clusters (one decision each)
 
 **GUIDE CLUSTER — recommend: will do, as one arc.** Members: guide policy
@@ -132,6 +202,26 @@ restored libaryon document identity is its now-landed prerequisite.
 ---
 
 ## Tallies (corrected 2026-08-06 after the pre-ratification self-check)
+
+> **Superseded as a current count by the 2026-08-11 reconciliation pass above;
+> retained as the seeded state.** The delta, in stable IDs so an external parse
+> can check it:
+>
+> - **Will do 14 → 7 shipped + 1 resolved + 6 open.** Shipped: IG-01, IG-05
+>   (0043/0044), LI-01, LI-02 (0059–0063, 0071), CI-09 (0067), LI-04
+>   (0075), DB-18 (0050). Resolved by inspection, keep: DB-14. Still open:
+>   **IG-02, CI-03, CI-06, DB-01, DB-02, LC-02**. Note IG-02 (Interaction): 0043/0044
+>   delivered only the *legend* half of the Guide cluster, so "Guide cluster
+>   complete" is true of legends alone — the 0013 §3 hover half is unscheduled
+>   and swatch sizing is residue.
+> - **Closed 26 → 25 + 1 landed.** DB-04 left the closed bucket entirely; it is
+>   landed, not closed (PRODUCT-0076).
+> - **If asked 18** and **held out 1** (IG-03, facets — since answered by
+>   0041/0042) are unchanged by this pass.
+>
+> New arithmetic: 6 open will-do + 7 shipped + 1 resolved + 25 closed +
+> 1 landed + 18 if-asked + 1 held out = 59. Bucket-of-origin check:
+> will-do 14 = 7 + 1 + 6; closed 26 = 25 + 1.
 
 Over the ledger's original 59 open items (IDs now in `deferred_ledger.md`):
 

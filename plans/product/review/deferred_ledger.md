@@ -230,13 +230,19 @@ store remains undecided per PRODUCT-0002. Saved authored specs and durable
 plots cannot ship before that record exists." — 0007 Consequences (and §4's
 live/pinned durability depends on it).
 
-**DB-04 · Computed presentation values.** Computed headings — and by extension any
-non-literal presentation value — are deferred because "the envelope lowers
+**DB-04 · Computed presentation values — landed in PRODUCT-0076.** Computed
+headings — and by extension any non-literal presentation value — were
+deferred because "the envelope lowers
 statically, before dispatch … admitting it is a runtime evaluation and
 value-transport decision, not a spelling." 0040 reaffirms: the deferral
 "stands for anything that is not already a literal in the source"; no constant
 folding, concatenation, arithmetic, or calls. — 0016 §4, §11, §12; 0036 §2,
 §8; 0040 §9, Rejected.
+**LANDED 2026-08-11 — PRODUCT-0076.** No longer deferred. Presentation values
+are executed in a local bounded Rune VM while view topology stays static, which
+answers the runtime-evaluation and value-transport question this entry was
+deferred on. 0076 supersedes 0016 §4 and 0040 §9; 0040's Rejected bullet carries
+an overturned-by pointer. Do not cite this entry as a live deferral.
 
 **DB-05 · Non-top-level bindings.** Block-scoped bindings introduce "a resolution
 question this record does not need to answer." — 0040 §9, Rejected.
@@ -276,9 +282,19 @@ scale composition).
 coexist; "a record that later unifies the two is welcome to exist; it is not
 this one." — 0013 §10, Consequences; 0016 §5, gate 11 (unmigrated); 0030 §2.
 
-**DB-14 · `ScatterLinePlotKernel` retirement.** "Whether it is eventually deleted
-depends on evidence that nothing reaches it, which is a later cleanup rather
+**DB-14 · `ScatterLinePlotKernel` retirement — resolved 2026-08-11, keep.**
+"Whether it is eventually deleted depends on evidence that nothing reaches
+it, which is a later cleanup rather
 than a decision here." — 0013 Consequences.
+**RESOLVED 2026-08-11 — keep; the check is spent.** The evidence exists and runs
+the other way: the legacy authored notebook chain `.scatter().line().show()`
+reaches `plot_line` (`rune_host.rs:350-351`), which adds the line to the scatter
+composition; `is_scatter_with_line_overlay` (`plot/composition.rs:72`) selects
+`ScatterLinePlotKernel` at `plot/factory.rs:87`. PRODUCT-0075 did not strand it
+— its caller was never the retired dashboard picker. The newer
+`layers([scatter(...), line(...)])` surface uses `LayeredPlotKernel` and is not
+the evidence for this decision. Retirement is refused on evidence rather than
+deferred again.
 
 **DB-15 · Cross-origin layering.** One view subscribing to several frames, "with its
 own cross-origin failure, revision, and domain-reconciliation semantics — is a
@@ -370,11 +386,18 @@ host-event record rather than a third local workaround." Eager
 continuation-bank collection is listed deferred. — 0030 §7, §12, Consequences;
 0015 §5 (the libaryon-side half).
 
-**LC-02 · Producer-release reattachment.** After a producer buffer is released,
+**LC-02 · Producer-release reattachment — remains open after PRODUCT-0062.**
+After a producer buffer is released,
 reopening the file creates a new session `BufferId` and a new group;
 "reattaching it to the producerless group would require the durable identity
 and layout persistence that §9 defers." Same for continuation banks. —
 0015 §5; 0030 §7. Dependency: durable identity + layout persistence.
+
+PRODUCT-0062 satisfies that dependency for saved-session restart, not for this
+in-process lifecycle. `release_buffer` removes the old document identity and
+clears the old group's producer; reopening the same path mints a new document
+identity and group. No path currently joins that producer to the retained live
+group or continuation bank.
 
 ---
 
