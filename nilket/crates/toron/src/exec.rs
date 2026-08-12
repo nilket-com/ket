@@ -895,7 +895,17 @@ impl Executor {
 					let mut output = Vec::new();
 					for batch in input_batches {
 						let cols = self.evaluate_bound_program(exprs, &batch)?;
-						output.push(RecordBatch::try_new(output_schema.clone(), cols)?);
+						// A projection preserves cardinality, so carry the input row count
+						// explicitly. An empty projection is legitimate — `COUNT(*)` over a
+						// subquery needs the row count and no column — and a zero-column
+						// batch has no other source of cardinality for Arrow to infer.
+						let options =
+							RecordBatchOptions::new().with_row_count(Some(batch.num_rows()));
+						output.push(RecordBatch::try_new_with_options(
+							output_schema.clone(),
+							cols,
+							&options,
+						)?);
 					}
 					Ok(output)
 				}

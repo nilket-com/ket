@@ -2630,6 +2630,42 @@ fn derived_table_comma_list_keeps_nested_derived_fences() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn count_star_over_a_subquery_carries_the_input_row_count() {
+	// An empty projection is legitimate: `COUNT(*)` over a subquery needs the row
+	// count and no column. A zero-column batch gives Arrow no way to infer
+	// cardinality, so the projection must carry the input row count explicitly.
+	// Before that fix every shape below failed with
+	// "must either specify a row count or at least one column".
+	let direct = run_logical(&plan_sql("SELECT COUNT(*) FROM sales")).await;
+	assert_eq!(scalar_int64_column_rows(&direct, 0), vec![Some(6)]);
+
+	for sql in [
+		"SELECT COUNT(*) FROM (SELECT region FROM sales) s",
+		"SELECT COUNT(*) FROM (SELECT region, amount FROM sales) s",
+		"SELECT COUNT(*) FROM (SELECT region FROM sales WHERE region IS NOT NULL) s",
+		"SELECT COUNT(1) FROM (SELECT region FROM sales) s",
+		"WITH a AS (SELECT region FROM sales) SELECT COUNT(*) FROM a",
+		"SELECT COUNT(*) FROM (SELECT region, COUNT(*) AS n FROM sales GROUP BY region) s",
+	] {
+		let results = run_logical(&plan_sql(sql)).await;
+		let expected = if sql.contains("GROUP BY") { 3 } else { 6 };
+		assert_eq!(
+			scalar_int64_column_rows(&results, 0),
+			vec![Some(expected)],
+			"counting a subquery must agree with its cardinality: {sql}"
+		);
+	}
+
+	// A grouped outer aggregate always projected a group key, so it never hit the
+	// zero-column path; it must keep working.
+	let grouped = run_logical(&plan_sql(
+		"SELECT s.region, COUNT(*) FROM (SELECT region FROM sales) s GROUP BY s.region",
+	))
+	.await;
+	assert_eq!(row_count(&grouped), 3);
+}
+
+#[tokio::test]
 async fn cte_resolves_like_inline_subquery() {
 	// `WITH a AS (q) SELECT … FROM a` resolves identically to the inline derived-table spelling.
 	let cte = run_logical(&plan_sql(
