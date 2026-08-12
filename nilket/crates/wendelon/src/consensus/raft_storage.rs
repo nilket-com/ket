@@ -4165,15 +4165,20 @@ fn apply_table_schema_update(
 					"table schema update rejected because table drop is in progress".to_owned(),
 				);
 			}
+			// Existence is reported before generation. A create always carries
+			// expected_generation ZERO, so an existing table trips the generation
+			// comparison too — and reporting that first tells the caller its
+			// generation is stale when the actual fact is that the table is already
+			// there. Order these so the specific cause wins over the generic one.
+			if envelope.mutation == SchemaMutationKind::Create && current_generation != 0 {
+				return Err("table schema create cannot replace an existing table".to_owned());
+			}
 			if current_generation != envelope.expected_generation.get() {
 				return Err(format!(
 					"schema expected_generation {} does not match current generation {}",
 					envelope.expected_generation.get(),
 					current_generation
 				));
-			}
-			if envelope.mutation == SchemaMutationKind::Create && current_generation != 0 {
-				return Err("table schema create cannot replace an existing table".to_owned());
 			}
 			if envelope.mutation == SchemaMutationKind::Create
 				&& state
@@ -6981,6 +6986,47 @@ mod schema_state_tests {
 				.table_schemas
 				.get(TenantId::new(7), changed_type.table_object_id, 2)
 				.is_none()
+		);
+	}
+
+	#[test]
+	fn schema_update_reports_existence_before_generation_for_a_duplicate_create() {
+		// A create always carries expected_generation ZERO, so an existing table
+		// fails the generation comparison as well. The caller must be told the
+		// table exists, not that its generation is stale: under the previous
+		// ordering this assertion saw
+		// "expected_generation 0 does not match current generation 1".
+		let descriptor = table_descriptor(1);
+		let mut state = SmState::default();
+		apply_schema_update(
+			&mut state,
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKind::Create),
+		)
+		.unwrap();
+
+		let err = apply_schema_update(
+			&mut state,
+			&schema_envelope(&descriptor, 0, 1, SchemaMutationKind::Create),
+		)
+		.unwrap_err();
+		assert!(
+			err.contains("cannot replace an existing table"),
+			"duplicate create must report existence, got: {err}"
+		);
+		assert!(
+			!err.contains("does not match current generation"),
+			"existence must win over the generic generation mismatch, got: {err}"
+		);
+
+		// An alter with a genuinely stale generation still reports the generation.
+		let stale = apply_schema_update(
+			&mut state,
+			&schema_envelope(&descriptor, 0, 2, SchemaMutationKind::Alter),
+		)
+		.unwrap_err();
+		assert!(
+			stale.contains("does not match current generation"),
+			"alter must still surface a stale generation, got: {stale}"
 		);
 	}
 
