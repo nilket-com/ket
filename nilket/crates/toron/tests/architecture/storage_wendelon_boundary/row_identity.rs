@@ -91,7 +91,11 @@ pub(crate) fn adr037_fragment_config_carries_task_context() {
 		.1;
 
 	assert!(config.contains("pub task_context: TaskExecutionContext"));
-	assert!(fragmenter.contains("pub fn with_task_context"));
+	// The context is a required constructor parameter, not a builder step that a
+	// caller can forget. `with_task_context` was removed for that reason, so a
+	// production caller can no longer inherit a placeholder execution seed.
+	assert!(fragmenter.contains("task_context: TaskExecutionContext,"));
+	assert!(!fragmenter.contains("pub fn with_task_context"));
 }
 
 #[test]
