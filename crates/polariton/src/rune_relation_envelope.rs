@@ -2099,7 +2099,7 @@ workspace.table("demo_sales").views([figure([
 				PlotChromeProjection::Ordered,
 			))
 		);
-		assert_eq!(plot.authored_settings.chrome, Override::Inherit);
+		assert_eq!(plot.authored_settings.resolved_skin, Override::Inherit);
 
 		let explicit = only_plot(
 			"workspace.table(\"t\").views([figure([skin(\"nord\").duotone(), bar(\"cat\", \"val\")])])",

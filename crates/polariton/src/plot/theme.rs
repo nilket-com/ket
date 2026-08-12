@@ -1,11 +1,12 @@
 //! Plot-specific theme and five-layer settings cascade.
 //!
 //! Data ramps remain plot vocabulary. `UiPalette` crosses this boundary only
-//! through the four chrome roles PRODUCT-0007 permits.
+//! through PRODUCT-0007's four UI anchors, which resolve both furniture chrome
+//! and PRODUCT-0080's unencoded mark style without changing data meaning.
 
 #![allow(dead_code)] // Public cascade API awaits an accepted plot-editing surface.
 
-use crate::plot::chrome::{PlotChrome, PlotChromeProjection};
+use crate::plot::chrome::{PlotChrome, PlotChromeProjection, PlotMarkStyle, ResolvedPlotSkin};
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode, TickPlacement};
 use crate::plot::spec::{
@@ -191,8 +192,8 @@ pub struct PlotSettingsLayer {
 	/// Authored figure identity and explicit projection intent. The renderer
 	/// never resolves this selection.
 	pub plot_skin: Override<PlotSkinSelection>,
-	/// Prepared complete chrome, populated only after fallible identity resolution.
-	pub chrome: Override<PlotChrome>,
+	/// Prepared complete skin, populated only after fallible identity resolution.
+	pub resolved_skin: Override<ResolvedPlotSkin>,
 	/// Figure-wide categorical palette identity. Resolution remains libaryon-owned;
 	/// this settings layer carries only authored/application/pane intent.
 	pub categorical_palette: Override<Arc<String>>,
@@ -232,7 +233,7 @@ impl Default for PlotSettingsLayer {
 		Self {
 			theme: Override::Inherit,
 			plot_skin: Override::Inherit,
-			chrome: Override::Inherit,
+			resolved_skin: Override::Inherit,
 			categorical_palette: Override::Inherit,
 			typography: Override::Inherit,
 			padding: Override::Inherit,
@@ -337,12 +338,13 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 		let background = theme.chrome.background.iced();
 		let decoration = theme.chrome.label.iced();
 		settings.chrome = PlotChrome::legacy_from_iced(background, decoration);
-		settings.mark_decoration_color = decoration;
+		settings.mark_style = PlotMarkStyle::legacy_from_iced(background, decoration);
 		settings.surrounding_background_color = background;
 		settings.surrounding_decoration_color = decoration;
 	}
-	if let Override::Set(chrome) = layer.chrome {
-		settings.chrome = chrome;
+	if let Override::Set(skin) = layer.resolved_skin {
+		settings.chrome = skin.chrome;
+		settings.mark_style = skin.mark_style;
 	}
 	if let Override::Set(value) = &layer.typography {
 		settings.title_size = value.title_size;
@@ -572,7 +574,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0032_plot_skin_identity_and_prepared_chrome_follow_the_cascade() {
+	fn product_0080_product_0032_plot_skin_identity_and_prepared_skin_follow_the_cascade() {
 		let identity = |value: &str| {
 			Override::Set(PlotSkinSelection::new(
 				value.to_owned(),
@@ -583,6 +585,31 @@ mod tests {
 		assert!(cascade.resolve_plot_skin().is_none());
 		assert_eq!(cascade.resolve().chrome, PlotChrome::DEFAULT);
 
+		let application = PlotThemeSpec {
+			chrome: PlotChromeSpec {
+				background: PlotRgb::new(12, 34, 56),
+				axis: PlotRgb::new(90, 91, 92),
+				gridline: PlotRgb::new(70, 71, 72),
+				label: PlotRgb::new(210, 220, 230),
+			},
+			..PlotThemeSpec::DEFAULT_DARK
+		};
+		let mut application_only = PlotSettings::default();
+		application_only.application_theme.theme = Override::Set(application);
+		let application_resolved = application_only.resolve();
+		assert_eq!(
+			application_resolved.chrome.canvas_background.iced(),
+			application.chrome.background.iced()
+		);
+		assert_eq!(
+			application_resolved.mark_style.fill.iced(),
+			application.chrome.label.iced()
+		);
+		assert_eq!(
+			application_resolved.mark_style.separator.iced(),
+			application.chrome.background.iced()
+		);
+
 		cascade.application_theme.plot_skin = identity("application");
 		cascade.authored_spec.plot_skin = identity("authored");
 		cascade.layer.plot_skin = identity("wrong-layer");
@@ -591,19 +618,21 @@ mod tests {
 			"authored"
 		);
 
-		let nord = PlotChrome::from_theme_name("nord", PlotChromeProjection::Ordered).unwrap();
-		cascade.authored_spec.chrome = Override::Set(nord);
+		let nord =
+			ResolvedPlotSkin::from_theme_name("nord", PlotChromeProjection::Ordered).unwrap();
+		cascade.authored_spec.resolved_skin = Override::Set(nord);
 		let resolved = cascade.resolve();
-		assert_eq!(resolved.chrome, nord);
-		assert_eq!(resolved.mark_decoration_color, Color::WHITE);
+		assert_eq!(resolved.chrome, nord.chrome);
+		assert_eq!(resolved.mark_style, nord.mark_style);
 		assert_eq!(resolved.surrounding_decoration_color, Color::WHITE);
 
 		let viridis =
-			PlotChrome::from_theme_name("viridis", PlotChromeProjection::Ordered).unwrap();
+			ResolvedPlotSkin::from_theme_name("viridis", PlotChromeProjection::Ordered).unwrap();
 		cascade.pane_override.plot_skin = identity("pane");
-		cascade.pane_override.chrome = Override::Set(viridis);
+		cascade.pane_override.resolved_skin = Override::Set(viridis);
 		assert_eq!(cascade.resolve_plot_skin().unwrap().name.as_str(), "pane");
-		assert_eq!(cascade.resolve().chrome, viridis);
+		assert_eq!(cascade.resolve().chrome, viridis.chrome);
+		assert_eq!(cascade.resolve().mark_style, viridis.mark_style);
 	}
 
 	#[test]

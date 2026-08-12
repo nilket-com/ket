@@ -94,7 +94,7 @@ impl PlotKernel for CandlestickPlotKernel {
 					builder.line_to(Point::new(p_close.x + candle_width / 2.0, p_close.y));
 				},
 				Stroke {
-					style: Style::Solid(settings.mark_decoration_color),
+					style: Style::Solid(settings.mark_style.decoration.iced()),
 					width: 2.0,
 					..Default::default()
 				},

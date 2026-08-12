@@ -55,6 +55,8 @@ use plot::composition::PlotComposition;
 use plot::core::PlotType;
 use plot::grid::{GridArrangement, PlotGrid, PlotGridKernel};
 use plot::kernels::bar::{BarPlotKernel, BarPreparedData};
+use plot::kernels::histogram::{HistogramPlotKernel, HistogramPreparedData};
+use plot::kernels::histogram_bins::{HistogramBin, HistogramBins};
 use plot::kernels::line::{LinePlotKernel, LinePreparedData, SeriesData};
 use plot::kernels::scatter::{ScatterPlotKernel, ScatterPreparedData, ScatterSeries};
 use plot::kernels::stacked_area::{StackedAreaPlotKernel, StackedAreaPreparedData};
@@ -650,7 +652,7 @@ fn product_0068_scatter_fixture(color: Color) -> ScatterPlotKernel {
 
 fn product_0068_stacked_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, [[u8; 3]; 2]) {
 	let mut resolved = product_0068_cartesian_settings().resolve();
-	resolved.mark_decoration_color = Color::WHITE;
+	resolved.mark_style.decoration = plot::chrome::PlotRgba::from_iced(Color::WHITE);
 	resolved.y_tick_placement = TickPlacement::count(5).unwrap();
 	let colors = [
 		resolved.color_theme.get_color(0.0),
@@ -838,7 +840,7 @@ fn product_0072_percent_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, 
 		)
 		.collect::<Vec<_>>();
 	let mut resolved = product_0068_cartesian_settings().resolve();
-	resolved.mark_decoration_color = Color::WHITE;
+	resolved.mark_style.decoration = plot::chrome::PlotRgba::from_iced(Color::WHITE);
 	resolved.y_tick_placement = TickPlacement::step(25.0).unwrap();
 	(
 		StackedAreaPlotKernel {
@@ -861,6 +863,80 @@ fn product_0072_percent_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, 
 		PlotSettings::from_resolved(resolved),
 		colors,
 	)
+}
+
+fn product_0080_histogram_fixture(
+	separator: plot::chrome::PlotRgba,
+) -> (HistogramPlotKernel, PlotSettings) {
+	let bins = [
+		(0.0, 10.0, 3),
+		(10.0, 20.0, 25),
+		(20.0, 30.0, 25),
+		(30.0, 40.0, 9),
+		(40.0, 50.0, 2),
+	]
+	.into_iter()
+	.map(|(start, end, count)| HistogramBin { start, end, count })
+	.collect();
+	let kernel = HistogramPlotKernel {
+		prepared_data: Arc::new(HistogramPreparedData {
+			bins: HistogramBins::new(bins).expect("PRODUCT-0080 exact test25 relation"),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+			x_label: String::new(),
+			y_label: String::new(),
+		}),
+	};
+	let mut resolved = product_0068_cartesian_settings().resolve();
+	resolved.mark_style.fill = plot::chrome::PlotRgba::opaque(1.0, 1.0, 1.0);
+	resolved.mark_style.separator = separator;
+	(kernel, PlotSettings::from_resolved(resolved))
+}
+
+fn render_product_0080_histogram(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	separator: plot::chrome::PlotRgba,
+) -> (Capture, f32) {
+	let (kernel, settings) = product_0080_histogram_fixture(separator);
+	let resolved = settings.resolve();
+	let layout = kernel.layout(resolved);
+	let transform = CoordinateTransformer::new(
+		&layout,
+		Rectangle::with_size(Size::new(size.width as f32, size.height as f32)),
+	);
+	let boundary_x = transform.cartesian(20.0, 12.5).x;
+	(
+		render_product_0068_cartesian_mark(renderer, size, &kernel, &settings, false),
+		boundary_x,
+	)
+}
+
+fn product_0080_separator_pixels(
+	capture: &Capture,
+	boundary_x: f32,
+	separator: [u8; 3],
+	fill: [u8; 3],
+) -> usize {
+	let center = boundary_x.round() as i32;
+	let mut count = 0;
+	for y in 4..capture.height.saturating_sub(4) {
+		for x in center - 2..=center + 2 {
+			if x >= 0 {
+				let pixel = capture.pixel(x as u32, y);
+				let between = pixel.into_iter().zip(separator.into_iter().zip(fill)).all(
+					|(value, (separator, fill))| {
+						value >= separator.min(fill).saturating_sub(2)
+							&& value <= separator.max(fill).saturating_add(2)
+					},
+				);
+				if between && color_distance(pixel, fill) >= 30 {
+					count += 1;
+				}
+			}
+		}
+	}
+	count
 }
 
 fn product_0072_percent_bar_fixture(
@@ -1306,6 +1382,42 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 		"PRODUCT_0077 facet_tick_containment disposition=automated banked_vertical/horizontal={PRODUCT_0077_BANKED_VERTICAL_SPILL}/{PRODUCT_0077_BANKED_HORIZONTAL_SPILL} accepted_vertical/horizontal={product_0077_vertical_spill}/{product_0077_horizontal_spill}"
 	);
 
+	let product_0080_size = Size::new(500, 300);
+	let product_0080_style = ResolvedPlotSettings::default().mark_style;
+	let (product_0080_accepted, product_0080_boundary_x) =
+		render_product_0080_histogram(&mut msaa, product_0080_size, product_0080_style.separator);
+	let (product_0080_banked, product_0080_banked_x) =
+		render_product_0080_histogram(&mut msaa, product_0080_size, product_0080_style.fill);
+	assert_eq!(product_0080_boundary_x, product_0080_banked_x);
+	let product_0080_accepted_separator = product_0080_separator_pixels(
+		&product_0080_accepted,
+		product_0080_boundary_x,
+		BACKGROUND,
+		WHITE,
+	);
+	let product_0080_banked_separator = product_0080_separator_pixels(
+		&product_0080_banked,
+		product_0080_banked_x,
+		BACKGROUND,
+		WHITE,
+	);
+	assert_eq!(
+		product_0080_banked_separator, 0,
+		"PRODUCT-0080 banked same-fill control must show no separator ink"
+	);
+	assert!(
+		product_0080_accepted_separator >= 200,
+		"PRODUCT-0080 resolved separator must divide the equal-height bins; got {product_0080_accepted_separator} pixels"
+	);
+	assert!(
+		near(product_0080_accepted.point(0.3, 0.5), WHITE, 12)
+			&& near(product_0080_accepted.point(0.5, 0.5), WHITE, 12),
+		"PRODUCT-0080 both adjacent bodies must retain the resolved fill"
+	);
+	println!(
+		"PRODUCT_0080 histogram_separator disposition=automated banked/accepted={product_0080_banked_separator}/{product_0080_accepted_separator} boundary_x={product_0080_boundary_x:.1}"
+	);
+
 	let percent_size = Size::new(500, 360);
 	let (percent_area, percent_area_settings, percent_area_fills) =
 		product_0072_percent_area_fixture();
@@ -1330,7 +1442,7 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 		percent_area_fills,
 	);
 	let mut no_boundary = percent_area_settings.resolve();
-	no_boundary.mark_decoration_color = Color::TRANSPARENT;
+	no_boundary.mark_style.decoration = plot::chrome::PlotRgba::from_iced(Color::TRANSPARENT);
 	let percent_area_without_boundary = render_product_0068_cartesian_mark(
 		&mut msaa,
 		percent_size,

@@ -1546,7 +1546,7 @@ fn product_0030_surface_default_and_continuation_stay_at_the_rune_head_boundary(
 }
 
 #[test]
-fn product_0079_plot_chrome_is_closed_with_one_unencoded_mark_fill() {
+fn product_0080_plot_chrome_and_mark_style_are_separate_closed_tiers() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let chrome =
 		std::fs::read_to_string(root.join("plot/chrome.rs")).expect("read plot chrome model");
@@ -1557,8 +1557,8 @@ fn product_0079_plot_chrome_is_closed_with_one_unencoded_mark_fill() {
 		.split('}')
 		.next()
 		.expect("PlotChrome fields");
-	assert_eq!(fields.matches("pub ").count(), 12);
-	assert_eq!(fields.matches("pub mark_fill: PlotRgba").count(), 1);
+	assert_eq!(fields.matches("pub ").count(), 11);
+	assert!(!fields.contains("mark_fill"));
 	for forbidden in [
 		"Option<",
 		"HashMap",
@@ -1570,6 +1570,20 @@ fn product_0079_plot_chrome_is_closed_with_one_unencoded_mark_fill() {
 		assert!(
 			!fields.contains(forbidden),
 			"PlotChrome acquired {forbidden}"
+		);
+	}
+	let mark_fields = chrome
+		.split("pub struct PlotMarkStyle {")
+		.nth(1)
+		.expect("PlotMarkStyle declaration")
+		.split('}')
+		.next()
+		.expect("PlotMarkStyle fields");
+	assert_eq!(mark_fields.matches("pub ").count(), 4);
+	for role in ["fill", "decoration", "label_text", "separator"] {
+		assert!(
+			mark_fields.contains(&format!("pub {role}: PlotRgba")),
+			"missing mark-style role {role}"
 		);
 	}
 
@@ -1587,25 +1601,41 @@ fn product_0079_plot_chrome_is_closed_with_one_unencoded_mark_fill() {
 		assert!(!production.contains(retired), "renderer retained {retired}");
 	}
 	assert!(production.contains("pub chrome: PlotChrome"));
-	assert!(production.contains("pub mark_decoration_color: Color"));
+	assert!(production.contains("pub mark_style: PlotMarkStyle"));
+	assert!(!production.contains("mark_decoration_color"));
 
-	for relative in [
-		"plot/kernels/boxplot.rs",
-		"plot/kernels/violin.rs",
-		"plot/kernels/candlestick.rs",
-		"plot/kernels/funnel.rs",
+	for (relative, roles) in [
+		("plot/kernels/boxplot.rs", &["mark_style.decoration"][..]),
+		("plot/kernels/violin.rs", &["mark_style.decoration"][..]),
+		(
+			"plot/kernels/candlestick.rs",
+			&["mark_style.decoration"][..],
+		),
+		(
+			"plot/kernels/funnel.rs",
+			&["mark_style.decoration", "mark_style.label_text"][..],
+		),
 	] {
 		let source = std::fs::read_to_string(root.join(relative)).expect("read mark kernel");
 		let mark_draw = source
 			.split("fn draw_legend(")
 			.next()
 			.expect("mark draw before legend");
-		assert!(mark_draw.contains("mark_decoration_color"));
+		for role in roles {
+			assert!(
+				mark_draw.contains(role),
+				"{relative} did not consume {role}"
+			);
+		}
 		assert!(
 			!mark_draw.contains("settings.chrome"),
 			"{relative} mark drawing acquired plot chrome"
 		);
 	}
+	let area = std::fs::read_to_string(root.join("plot/kernels/stacked_area.rs"))
+		.expect("read reachable stacked-area kernel");
+	let area_draw = area.split("#[cfg(test)]").next().expect("area production");
+	assert!(area_draw.contains("mark_style.decoration"));
 
 	let histogram =
 		std::fs::read_to_string(root.join("plot/kernels/histogram.rs")).expect("histogram kernel");
@@ -1613,9 +1643,11 @@ fn product_0079_plot_chrome_is_closed_with_one_unencoded_mark_fill() {
 		.split("#[cfg(test)]")
 		.next()
 		.expect("histogram production");
-	assert!(production.contains("settings.chrome.mark_fill"));
+	assert!(production.contains("settings.mark_style.fill"));
+	assert!(production.contains("settings.mark_style.separator"));
 	assert!(!production.contains("color_theme.get_color"));
-	assert!(!production.contains("stroke_path"));
+	assert!(production.contains("stroke_path"));
+	assert!(!production.contains("rgba(0, 0, 0, 0.2)"));
 }
 
 #[test]
@@ -1630,14 +1662,23 @@ fn product_0033_plot_skin_projection_choice_is_bounded_and_renderer_free() {
 		.next()
 		.expect("settings fields");
 	assert!(layer.contains("plot_skin: Override<PlotSkinSelection>"));
-	assert!(layer.contains("chrome: Override<PlotChrome>"));
+	assert!(layer.contains("resolved_skin: Override<ResolvedPlotSkin>"));
 
 	let chrome = std::fs::read_to_string(root.join("plot/chrome.rs")).expect("read chrome");
 	let production = chrome
 		.split("#[cfg(test)]")
 		.next()
 		.expect("chrome production");
-	assert_eq!(production.matches("from_theme_name").count(), 1);
+	assert_eq!(
+		production.matches("pub fn from_theme_name(").count(),
+		2,
+		"the atomic skin projection and chrome compatibility projection are the only public entries"
+	);
+	assert!(
+		production.contains(
+			"ResolvedPlotSkin::from_theme_name(name, projection).map(|skin| skin.chrome)"
+		)
+	);
 	assert_eq!(production.matches("Theme::try_new").count(), 1);
 	assert!(!production.contains("TableSkin"));
 	assert!(!production.contains("UiPalette"));

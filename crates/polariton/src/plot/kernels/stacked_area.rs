@@ -123,7 +123,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 			};
 			backend.fill_path(&area_closure, color);
 			let stroke = Stroke {
-				style: Style::Solid(settings.mark_decoration_color),
+				style: Style::Solid(settings.mark_style.decoration.iced()),
 				width: 0.5,
 				..Default::default()
 			};
@@ -505,10 +505,8 @@ mod product_0068_tests {
 			normalization: StackNormalization::Absolute,
 		};
 		let decoration = Color::from_rgb8(12, 34, 56);
-		let settings = ResolvedPlotSettings {
-			mark_decoration_color: decoration,
-			..ResolvedPlotSettings::default()
-		};
+		let mut settings = ResolvedPlotSettings::default();
+		settings.mark_style.decoration = crate::plot::chrome::PlotRgba::from_iced(decoration);
 		let layout = kernel.layout(settings.clone());
 		let bounds = Rectangle::new(iced::Point::ORIGIN, iced::Size::new(200.0, 100.0));
 		let transform = CoordinateTransformer::new(&layout, bounds);

@@ -19,7 +19,6 @@ use crate::gui::{
 	messages::{ExportFormat, Message},
 };
 #[cfg(feature = "toron")]
-use crate::plot::chrome::PlotChrome;
 #[cfg(feature = "toron")]
 use crate::plot::common::{PlotLayout, TickPlacementError};
 #[cfg(feature = "toron")]
@@ -977,9 +976,12 @@ fn resolve_rune_plot_skin(
 		..PlotSettings::default()
 	};
 	if let Some(selection) = settings.resolve_plot_skin() {
-		authored_settings.chrome = Override::Set(
-			PlotChrome::from_theme_name(selection.name.as_str(), selection.projection)
-				.map_err(|error| error.to_string())?,
+		authored_settings.resolved_skin = Override::Set(
+			crate::plot::chrome::ResolvedPlotSkin::from_theme_name(
+				selection.name.as_str(),
+				selection.projection,
+			)
+			.map_err(|error| error.to_string())?,
 		);
 	}
 	Ok(authored_settings)
@@ -8724,7 +8726,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 
 	#[cfg(feature = "toron")]
 	#[test]
-	fn product_0033_ordered_skin_and_explicit_duotone_keep_palette_disjoint() {
+	fn product_0080_product_0033_ordered_skin_installs_chrome_and_mark_style_atomically() {
 		fn completed(
 			skin: Option<&str>,
 			duotone: bool,
@@ -8789,8 +8791,14 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			reversed_duotone.chrome, shifted_duotone.chrome,
 			"explicit Duotone intentionally consumes the unchanged set"
 		);
-		assert_eq!(reversed_settings.mark_decoration_color, iced::Color::WHITE);
-		assert_eq!(shifted_settings.mark_decoration_color, iced::Color::WHITE);
+		assert_ne!(
+			reversed_settings.mark_style, shifted_settings.mark_style,
+			"authored skins now resolve marks with furniture"
+		);
+		assert_eq!(
+			reversed_duotone.mark_style, shifted_duotone.mark_style,
+			"Duotone projects one atomic skin value"
+		);
 
 		let (_, nord_tab20c) = completed(Some("nord"), false, "tab20c");
 		let (yellows, nord_yellows) = completed(Some("nord"), false, "yellows");
@@ -9310,7 +9318,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	#[test]
 	#[cfg(feature = "toron")]
 	fn product_0079_histogram_resolves_values_spans_order_and_skin_without_color_identity() {
-		use crate::plot::chrome::PlotChrome;
+		use crate::plot::chrome::ResolvedPlotSkin;
 		use crate::plot::spec::Channel;
 		use crate::plot::theme::PlotSettings;
 		use polars::frame::DataFrame;
@@ -9356,17 +9364,20 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				.assignments
 				.is_empty()
 		);
-		let chrome = PlotSettings {
+		let settings = PlotSettings {
 			authored_spec: authored.clone(),
 			..PlotSettings::default()
 		}
-		.resolve()
-		.chrome;
+		.resolve();
 		assert_eq!(
-			chrome.mark_fill,
-			PlotChrome::from_theme_name("nord", crate::plot::chrome::PlotChromeProjection::Ordered)
-				.unwrap()
-				.mark_fill
+			settings.mark_style.fill,
+			ResolvedPlotSkin::from_theme_name(
+				"nord",
+				crate::plot::chrome::PlotChromeProjection::Ordered,
+			)
+			.unwrap()
+			.mark_style
+			.fill
 		);
 		let without_palette = source.replace("    palette(\"tab20c\"),\n", "");
 		let no_palette = complete(&without_palette, valid.clone());
@@ -9385,9 +9396,9 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				..PlotSettings::default()
 			}
 			.resolve()
-			.chrome
-			.mark_fill,
-			chrome.mark_fill,
+			.mark_style
+			.fill,
+			settings.mark_style.fill,
 			"palette metadata cannot affect an unencoded histogram fill"
 		);
 

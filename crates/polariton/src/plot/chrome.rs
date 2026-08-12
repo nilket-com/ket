@@ -1,6 +1,6 @@
-//! Complete resolved color treatment for plot-artifact chrome.
+//! Complete resolved color treatment for plot chrome and unencoded mark style.
 //!
-//! Data colors and mark compatibility ink deliberately live elsewhere.
+//! Authored data colors deliberately live elsewhere.
 
 #![allow(dead_code)] // Public substrate lives in the application binary crate.
 
@@ -79,12 +79,88 @@ impl PlotRgba {
 		Self::new(color.r, color.g, color.b, color.a).expect("Iced colors are normalized")
 	}
 
-	const fn opaque_rgb(color: Rgb) -> Self {
+	pub(crate) const fn opaque_rgb(color: Rgb) -> Self {
 		Self::opaque(
 			color.r as f32 / 255.0,
 			color.g as f32 / 255.0,
 			color.b as f32 / 255.0,
 		)
+	}
+}
+
+/// Skin-resolved colors for mark properties that have no authored color identity.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlotMarkStyle {
+	pub fill: PlotRgba,
+	pub decoration: PlotRgba,
+	pub label_text: PlotRgba,
+	pub separator: PlotRgba,
+}
+
+impl PlotMarkStyle {
+	pub const DEFAULT: Self = Self::legacy(0.001, 0.001, 0.001);
+	pub const APPLICATION_DEFAULT: Self = Self::legacy(0.0, 0.0, 0.0);
+
+	pub(crate) const fn legacy(red: f32, green: f32, blue: f32) -> Self {
+		let paper = PlotRgba::opaque(red, green, blue);
+		let ink = PlotRgba::opaque(1.0, 1.0, 1.0);
+		Self {
+			fill: ink,
+			decoration: ink,
+			label_text: ink,
+			separator: paper,
+		}
+	}
+
+	pub(crate) fn legacy_from_iced(background: Color, decoration: Color) -> Self {
+		let paper = PlotRgba::from_iced(background);
+		let ink = PlotRgba::from_iced(decoration);
+		Self {
+			fill: ink,
+			decoration: ink,
+			label_text: ink,
+			separator: paper,
+		}
+	}
+
+	pub fn visible_contrast_checks(self, chrome: PlotChrome) -> [PlotContrastCheck; 2] {
+		let canvas = visible_srgb(chrome.canvas_background);
+		let fill = composite_over(self.fill, canvas);
+		[
+			contrast("mark fill", self.fill, canvas, NON_TEXT_CONTRAST_MINIMUM),
+			contrast(
+				"mark separator",
+				self.separator,
+				fill,
+				NON_TEXT_CONTRAST_MINIMUM,
+			),
+		]
+	}
+}
+
+impl Default for PlotMarkStyle {
+	fn default() -> Self {
+		Self::DEFAULT
+	}
+}
+
+/// One fallible skin projection installed atomically into renderer settings.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ResolvedPlotSkin {
+	pub chrome: PlotChrome,
+	pub mark_style: PlotMarkStyle,
+}
+
+impl ResolvedPlotSkin {
+	pub fn from_theme_name(
+		name: &str,
+		projection: PlotChromeProjection,
+	) -> Result<Self, PlotChromeProjectionError> {
+		let anchors = resolve_anchors(name, projection)?;
+		Ok(Self {
+			chrome: project_anchors(anchors),
+			mark_style: project_mark_style(anchors),
+		})
 	}
 }
 
@@ -101,8 +177,6 @@ pub struct PlotChrome {
 	pub legend_text: PlotRgba,
 	pub legend_swatch_fill: PlotRgba,
 	pub legend_swatch_border: PlotRgba,
-	/// PRODUCT-0079: skin-resolved fill for marks with no authored color identity.
-	pub mark_fill: PlotRgba,
 }
 
 impl PlotChrome {
@@ -124,7 +198,6 @@ impl PlotChrome {
 			legend_text: decoration,
 			legend_swatch_fill: PlotRgba::translucent(1.0, 1.0, 1.0, 0.5),
 			legend_swatch_border: decoration,
-			mark_fill: decoration,
 		}
 	}
 
@@ -149,7 +222,6 @@ impl PlotChrome {
 				..decoration
 			},
 			legend_swatch_border: decoration,
-			mark_fill: decoration,
 		}
 	}
 
@@ -157,19 +229,10 @@ impl PlotChrome {
 		name: &str,
 		projection: PlotChromeProjection,
 	) -> Result<Self, PlotChromeProjectionError> {
-		let theme = Theme::try_new(name).map_err(|_| PlotChromeProjectionError::UnknownTheme {
-			name: name.to_owned(),
-		})?;
-		let anchors = match projection {
-			PlotChromeProjection::Ordered => ordered_anchors(theme.palette().colors()),
-			PlotChromeProjection::Duotone => {
-				PlotChromeAnchors::from(theme.palette().most_contrasting_pair())
-			}
-		};
-		Ok(project_anchors(anchors))
+		ResolvedPlotSkin::from_theme_name(name, projection).map(|skin| skin.chrome)
 	}
 
-	pub fn visible_contrast_checks(self) -> [PlotChromeContrast; 9] {
+	pub fn visible_contrast_checks(self) -> [PlotContrastCheck; 8] {
 		let canvas = visible_srgb(self.canvas_background);
 		let legend = composite_over(self.legend_background, canvas);
 		[
@@ -211,28 +274,22 @@ impl PlotChrome {
 				legend,
 				NON_TEXT_CONTRAST_MINIMUM,
 			),
-			contrast(
-				"mark fill",
-				self.mark_fill,
-				canvas,
-				NON_TEXT_CONTRAST_MINIMUM,
-			),
 		]
 	}
 
-	pub fn weakest_contrast(self) -> PlotChromeContrast {
+	pub fn weakest_contrast(self) -> PlotContrastCheck {
 		self.visible_contrast_checks()
 			.into_iter()
 			.min_by(|left, right| {
 				(left.ratio / left.minimum).total_cmp(&(right.ratio / right.minimum))
 			})
-			.expect("plot chrome has nine contrast checks")
+			.expect("plot chrome has eight contrast checks")
 	}
 
 	pub fn passes_contrast(self) -> bool {
 		self.visible_contrast_checks()
 			.into_iter()
-			.all(PlotChromeContrast::passes)
+			.all(PlotContrastCheck::passes)
 	}
 }
 
@@ -288,6 +345,21 @@ fn ordered_anchors(colors: &[Rgb; 20]) -> PlotChromeAnchors {
 	}
 }
 
+fn resolve_anchors(
+	name: &str,
+	projection: PlotChromeProjection,
+) -> Result<PlotChromeAnchors, PlotChromeProjectionError> {
+	let theme = Theme::try_new(name).map_err(|_| PlotChromeProjectionError::UnknownTheme {
+		name: name.to_owned(),
+	})?;
+	Ok(match projection {
+		PlotChromeProjection::Ordered => ordered_anchors(theme.palette().colors()),
+		PlotChromeProjection::Duotone => {
+			PlotChromeAnchors::from(theme.palette().most_contrasting_pair())
+		}
+	})
+}
+
 fn project_anchors(anchors: PlotChromeAnchors) -> PlotChrome {
 	let paper = PlotRgba::opaque_rgb(anchors.paper);
 	let ink = PlotRgba::opaque_rgb(anchors.ink);
@@ -303,7 +375,6 @@ fn project_anchors(anchors: PlotChromeAnchors) -> PlotChrome {
 		legend_text: ink,
 		legend_swatch_fill: ink,
 		legend_swatch_border: ink,
-		mark_fill: ink,
 	};
 
 	// Choose the quietest alpha that reaches the non-text target when possible.
@@ -322,6 +393,17 @@ fn project_anchors(anchors: PlotChromeAnchors) -> PlotChrome {
 	}
 	chrome.legend_swatch_fill.alpha = chrome.gridline.alpha;
 	chrome
+}
+
+fn project_mark_style(anchors: PlotChromeAnchors) -> PlotMarkStyle {
+	let paper = PlotRgba::opaque_rgb(anchors.paper);
+	let ink = PlotRgba::opaque_rgb(anchors.ink);
+	PlotMarkStyle {
+		fill: ink,
+		decoration: ink,
+		label_text: ink,
+		separator: paper,
+	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -354,13 +436,13 @@ impl Default for PlotChrome {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-pub struct PlotChromeContrast {
+pub struct PlotContrastCheck {
 	role: &'static str,
 	ratio: f64,
 	minimum: f64,
 }
 
-impl PlotChromeContrast {
+impl PlotContrastCheck {
 	pub const fn role(self) -> &'static str {
 		self.role
 	}
@@ -398,8 +480,8 @@ fn contrast(
 	foreground: PlotRgba,
 	background: Srgb,
 	minimum: f64,
-) -> PlotChromeContrast {
-	PlotChromeContrast {
+) -> PlotContrastCheck {
+	PlotContrastCheck {
 		role,
 		ratio: composite_over(foreground, background).contrast_ratio(background),
 		minimum,
@@ -466,7 +548,7 @@ mod tests {
 		);
 		assert_eq!(
 			checks.iter().filter(|check| check.minimum == 3.0).count(),
-			4
+			3
 		);
 	}
 
@@ -489,12 +571,16 @@ mod tests {
 			PlotRgba::translucent(1.0, 1.0, 1.0, 0.5)
 		);
 		assert_eq!(chrome.legend_swatch_border, ink);
-		assert_eq!(chrome.mark_fill, ink);
 
 		let reconstructed = PlotChrome::legacy_from_iced(Color::BLACK, Color::WHITE);
-		assert_eq!(reconstructed.mark_fill, ink);
 		assert_eq!(reconstructed.gridline.alpha(), 0.35);
 		assert!(reconstructed.passes_contrast());
+
+		let style = PlotMarkStyle::DEFAULT;
+		assert_eq!(style.fill, ink);
+		assert_eq!(style.decoration, ink);
+		assert_eq!(style.label_text, ink);
+		assert_eq!(style.separator, paper);
 	}
 
 	#[test]
@@ -507,7 +593,7 @@ mod tests {
 			"the corrective ordered base keeps accepted Nord exact"
 		);
 		assert!(chrome.passes_contrast());
-		assert_eq!(chrome.visible_contrast_checks().len(), 9);
+		assert_eq!(chrome.visible_contrast_checks().len(), 8);
 		assert_eq!(chrome.canvas_background, chrome.legend_background);
 		assert_eq!(chrome.title_text, chrome.legend_swatch_border);
 		assert!(chrome.gridline.alpha() >= 0.35);
@@ -539,13 +625,20 @@ mod tests {
 			PlotRgba::opaque_rgb(anchors.paper)
 		);
 		assert_eq!(chrome.title_text, PlotRgba::opaque_rgb(anchors.ink));
-		assert_eq!(chrome.mark_fill, PlotRgba::opaque_rgb(anchors.ink));
+		let style = project_mark_style(anchors);
+		assert_eq!(style.fill, PlotRgba::opaque_rgb(anchors.ink));
+		assert_eq!(style.separator, PlotRgba::opaque_rgb(anchors.paper));
 	}
 
 	#[test]
-	fn product_0079_default_mark_fill_passes_but_authored_low_contrast_is_exact() {
-		let default = PlotChrome::DEFAULT
-			.visible_contrast_checks()
+	fn product_0080_product_0079_default_mark_pairs_pass_but_authored_low_contrast_is_exact() {
+		let checks = PlotMarkStyle::DEFAULT.visible_contrast_checks(PlotChrome::DEFAULT);
+		assert_eq!(
+			checks.map(PlotContrastCheck::role),
+			["mark fill", "mark separator"],
+			"decoration and label text have no assay"
+		);
+		let default = checks
 			.into_iter()
 			.find(|check| check.role() == "mark fill")
 			.expect("mark fill contrast role");
@@ -555,6 +648,18 @@ mod tests {
 			"default mark fill: {:.3}",
 			default.ratio()
 		);
+		assert!((default.ratio() - 20.968).abs() < 0.001);
+		let separator = checks
+			.into_iter()
+			.find(|check| check.role() == "mark separator")
+			.expect("mark separator contrast role");
+		assert_eq!(separator.minimum(), NON_TEXT_CONTRAST_MINIMUM);
+		assert!(
+			separator.passes(),
+			"default mark separator: {:.3}",
+			separator.ratio()
+		);
+		assert!((separator.ratio() - 20.968).abs() < 0.001);
 
 		let anchors = PlotChromeAnchors {
 			paper_index: 0,
@@ -563,14 +668,92 @@ mod tests {
 			ink: Rgb::new(105, 105, 105),
 			contrast_ratio: Rgb::new(100, 100, 100).contrast_ratio(Rgb::new(105, 105, 105)),
 		};
-		let authored = project_anchors(anchors);
-		assert_eq!(authored.mark_fill, PlotRgba::opaque_rgb(anchors.ink));
-		let mark = authored
-			.visible_contrast_checks()
+		let authored_chrome = project_anchors(anchors);
+		let authored_style = project_mark_style(anchors);
+		assert_eq!(authored_style.fill, PlotRgba::opaque_rgb(anchors.ink));
+		assert_eq!(
+			authored_style.separator,
+			PlotRgba::opaque_rgb(anchors.paper)
+		);
+		let authored_checks = authored_style.visible_contrast_checks(authored_chrome);
+		let mark = authored_checks
 			.into_iter()
 			.find(|check| check.role() == "mark fill")
 			.expect("authored mark fill contrast role");
 		assert!(!mark.passes(), "authored low contrast remains observable");
+		let separator = authored_checks
+			.into_iter()
+			.find(|check| check.role() == "mark separator")
+			.expect("authored mark separator contrast role");
+		assert!(
+			!separator.passes(),
+			"authored low-contrast separator remains observable"
+		);
+	}
+
+	#[test]
+	fn product_0080_all_mark_roles_map_at_every_entry_point_and_remain_opaque() {
+		let paper = PlotRgba::opaque(0.1, 0.2, 0.3);
+		let ink = PlotRgba::opaque(0.8, 0.7, 0.6);
+		let anchors = PlotChromeAnchors {
+			paper_index: 2,
+			paper: Rgb::new(26, 51, 77),
+			ink_index: 7,
+			ink: Rgb::new(204, 179, 153),
+			contrast_ratio: Rgb::new(26, 51, 77).contrast_ratio(Rgb::new(204, 179, 153)),
+		};
+		let projected = project_mark_style(anchors);
+		assert_eq!(projected.fill, PlotRgba::opaque_rgb(anchors.ink));
+		assert_eq!(projected.decoration, PlotRgba::opaque_rgb(anchors.ink));
+		assert_eq!(projected.label_text, PlotRgba::opaque_rgb(anchors.ink));
+		assert_eq!(projected.separator, PlotRgba::opaque_rgb(anchors.paper));
+
+		let legacy = PlotMarkStyle::legacy(0.1, 0.2, 0.3);
+		assert_eq!(legacy.fill, PlotRgba::opaque(1.0, 1.0, 1.0));
+		assert_eq!(legacy.decoration, PlotRgba::opaque(1.0, 1.0, 1.0));
+		assert_eq!(legacy.label_text, PlotRgba::opaque(1.0, 1.0, 1.0));
+		assert_eq!(legacy.separator, paper);
+
+		let reconstructed = PlotMarkStyle::legacy_from_iced(paper.iced(), ink.iced());
+		assert_eq!(reconstructed.fill, ink);
+		assert_eq!(reconstructed.decoration, ink);
+		assert_eq!(reconstructed.label_text, ink);
+		assert_eq!(reconstructed.separator, paper);
+
+		for style in [projected, legacy, reconstructed] {
+			for role in [
+				style.fill,
+				style.decoration,
+				style.label_text,
+				style.separator,
+			] {
+				assert_eq!(role.alpha(), 1.0);
+			}
+		}
+
+		let low_range = PlotChromeAnchors {
+			paper_index: 0,
+			paper: Rgb::new(100, 100, 100),
+			ink_index: 1,
+			ink: Rgb::new(120, 120, 120),
+			contrast_ratio: Rgb::new(100, 100, 100).contrast_ratio(Rgb::new(120, 120, 120)),
+		};
+		assert_eq!(project_anchors(low_range).gridline.alpha(), 1.0);
+		for role in {
+			let style = project_mark_style(low_range);
+			[
+				style.fill,
+				style.decoration,
+				style.label_text,
+				style.separator,
+			]
+		} {
+			assert_eq!(
+				role.alpha(),
+				1.0,
+				"mark roles never enter the grid alpha search"
+			);
+		}
 	}
 
 	#[test]

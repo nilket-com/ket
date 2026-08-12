@@ -87,7 +87,7 @@ impl PlotKernel for ViolinPlotKernel {
 			};
 			backend.fill_path(&violin_path_closure, color);
 			let border_stroke = Stroke {
-				style: Style::Solid(settings.mark_decoration_color),
+				style: Style::Solid(settings.mark_style.decoration.iced()),
 				width: 2.5,
 				..Default::default()
 			};
@@ -108,7 +108,7 @@ impl PlotKernel for ViolinPlotKernel {
 							.line_to(iced::Point::new(median_px.x + line_half_width, median_px.y));
 					},
 					Stroke {
-						style: Style::Solid(settings.mark_decoration_color),
+						style: Style::Solid(settings.mark_style.decoration.iced()),
 						width: 4.0,
 						..Default::default()
 					},

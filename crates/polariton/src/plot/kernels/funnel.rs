@@ -68,7 +68,7 @@ impl PlotKernel for FunnelPlotKernel {
 				Stroke {
 					style: Style::Solid(Color {
 						a: 0.2,
-						..settings.mark_decoration_color
+						..settings.mark_style.decoration.iced()
 					}),
 					width: 1.0,
 					..Default::default()
@@ -77,7 +77,7 @@ impl PlotKernel for FunnelPlotKernel {
 			backend.fill_text(Text {
 				content: format!("{:.0}", val),
 				position: Point::new(center_x, y_top + stage_height / 2.0),
-				color: settings.mark_decoration_color,
+				color: settings.mark_style.label_text.iced(),
 				size: Pixels(16.0),
 				align_x: iced::alignment::Horizontal::Center.into(),
 				align_y: iced::alignment::Vertical::Center,

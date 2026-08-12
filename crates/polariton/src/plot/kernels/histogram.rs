@@ -6,6 +6,7 @@ use crate::plot::kernels::histogram_bins::HistogramBin;
 use crate::plot::kernels::histogram_bins::HistogramBins;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
+use iced::widget::canvas::{Stroke, Style};
 use polars::prelude::{AnyValue, DataFrame, DataType};
 use std::sync::Arc;
 
@@ -57,7 +58,15 @@ impl PlotKernel for HistogramPlotKernel {
 			backend.fill_rectangle(
 				rect.position(),
 				rect.size(),
-				settings.chrome.mark_fill.iced(),
+				settings.mark_style.fill.iced(),
+			);
+			backend.stroke_path(
+				&|builder| builder.rectangle(rect.position(), rect.size()),
+				Stroke {
+					style: Style::Solid(settings.mark_style.separator.iced()),
+					width: 1.0,
+					..Default::default()
+				},
 			);
 		}
 	}
@@ -201,17 +210,39 @@ mod tests {
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size)>,
 		colors: Vec<Color>,
-		strokes: usize,
+		strokes: Vec<(Color, f32, Vec<(Point, Size)>)>,
 		clips: Vec<Rectangle>,
+	}
+
+	#[derive(Default)]
+	struct RectanglePath {
+		rectangles: Vec<(Point, Size)>,
+	}
+
+	impl PathBuilder for RectanglePath {
+		fn move_to(&mut self, _point: Point) {}
+		fn line_to(&mut self, _point: Point) {}
+		fn arc_to(&mut self, _center: Point, _radius: f32, _start_angle: f32, _end_angle: f32) {}
+		fn circle(&mut self, _center: Point, _radius: f32) {}
+		fn rectangle(&mut self, top_left: Point, size: Size) {
+			self.rectangles.push((top_left, size));
+		}
+		fn close(&mut self) {}
 	}
 
 	impl PlotBackend for RectangleBackend {
 		fn stroke_path(
 			&mut self,
-			_f: &dyn Fn(&mut dyn PathBuilder),
-			_stroke: iced::widget::canvas::Stroke,
+			f: &dyn Fn(&mut dyn PathBuilder),
+			stroke: iced::widget::canvas::Stroke,
 		) {
-			self.strokes += 1;
+			let color = match stroke.style {
+				Style::Solid(color) => color,
+				Style::Gradient(_) => panic!("histogram separator must be solid"),
+			};
+			let mut path = RectanglePath::default();
+			f(&mut path);
+			self.strokes.push((color, stroke.width, path.rectangles));
 		}
 
 		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
@@ -440,29 +471,38 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0079_count_is_height_only_and_mark_fill_is_exact() {
+	fn product_0080_product_0079_count_is_height_only_and_mark_style_is_exact() {
 		let histogram = kernel(vec![bin(0.0, 1.0, 4), bin(1.0, 2.0, 11)]);
 		let mut settings = ResolvedPlotSettings::default();
-		settings.chrome.mark_fill = crate::plot::chrome::PlotRgba::opaque(0.2, 0.4, 0.8);
+		settings.mark_style.fill = crate::plot::chrome::PlotRgba::opaque(0.2, 0.4, 0.8);
+		settings.mark_style.separator = crate::plot::chrome::PlotRgba::opaque(0.8, 0.4, 0.2);
 		let rendered = render_rectangles(&histogram, settings.clone());
-		assert_eq!(rendered.colors, vec![settings.chrome.mark_fill.iced(); 2]);
+		assert_eq!(rendered.colors, vec![settings.mark_style.fill.iced(); 2]);
 		assert_ne!(
 			rendered.rectangles[0].1.height,
 			rendered.rectangles[1].1.height
 		);
 		assert_eq!(
-			rendered.strokes, 0,
-			"PRODUCT-0079 ships no histogram outline"
+			rendered.strokes.len(),
+			2,
+			"each bin emits one closed boundary"
 		);
+		for ((color, width, path), rectangle) in rendered.strokes.iter().zip(&rendered.rectangles) {
+			assert_eq!(*color, settings.mark_style.separator.iced());
+			assert_eq!(*width, 1.0);
+			assert_eq!(path, &vec![*rectangle]);
+		}
 		assert_eq!(histogram.legend_content(&settings), None);
 
 		let fills = ["nord", "viridis_r"].map(|name| {
 			let mut settings = ResolvedPlotSettings::default();
-			settings.chrome = crate::plot::chrome::PlotChrome::from_theme_name(
+			let skin = crate::plot::chrome::ResolvedPlotSkin::from_theme_name(
 				name,
 				crate::plot::chrome::PlotChromeProjection::Ordered,
 			)
 			.unwrap();
+			settings.chrome = skin.chrome;
+			settings.mark_style = skin.mark_style;
 			render_rectangles(&histogram, settings).colors[0]
 		});
 		assert_ne!(

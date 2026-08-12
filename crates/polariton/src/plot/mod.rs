@@ -12,3 +12,6 @@ pub mod legend;
 pub mod request;
 pub mod spec;
 pub mod theme;
+
+#[cfg(test)]
+mod mark_style_oracles;

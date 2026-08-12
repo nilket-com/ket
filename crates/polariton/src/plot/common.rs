@@ -1,6 +1,6 @@
 use crate::coordinate::{Plot, Pt, Rect, Widget, Window};
 use crate::gui::messages::PlotMessage;
-use crate::plot::chrome::PlotChrome;
+use crate::plot::chrome::{PlotChrome, PlotMarkStyle};
 use crate::plot::colors::ColorTheme;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
@@ -419,7 +419,7 @@ pub struct ResolvedPlotSettings {
 	pub x_label_offset: f32,
 	pub color_theme: ColorTheme,
 	pub chrome: PlotChrome,
-	pub mark_decoration_color: Color,
+	pub mark_style: PlotMarkStyle,
 	pub surrounding_background_color: Color,
 	pub surrounding_decoration_color: Color,
 	pub x_min: Option<f64>,
@@ -484,7 +484,7 @@ impl Default for ResolvedPlotSettings {
 			x_label_offset: 10.0,
 			color_theme: ColorTheme::default(),
 			chrome: PlotChrome::DEFAULT,
-			mark_decoration_color: Color::WHITE,
+			mark_style: PlotMarkStyle::DEFAULT,
 			surrounding_background_color: Color::from_rgb(0.001, 0.001, 0.001),
 			surrounding_decoration_color: Color::WHITE,
 			x_min: None,

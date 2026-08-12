@@ -49,7 +49,7 @@ impl PlotKernel for BoxPlotKernel {
 			};
 			let color = settings.color_theme.get_color(t);
 			let color_iced = color;
-			let line_color = settings.mark_decoration_color;
+			let line_color = settings.mark_style.decoration.iced();
 			let (q1_px, _) = transform.categorical(shared_index, stats.q1);
 			let (q3_px, _) = transform.categorical(shared_index, stats.q3);
 			let box_rect = Rectangle {
