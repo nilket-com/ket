@@ -176,7 +176,7 @@ async fn end_to_end_two_wave_barrier_enforced() -> Result<(), Box<dyn Error>> {
 	let bound = bind(&join_plan(), &catalog, &PlannerConfig::default()).await?;
 	let enabled = fragment_plan(
 		bound.clone(),
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(query_budget()),
 		)
@@ -185,7 +185,7 @@ async fn end_to_end_two_wave_barrier_enforced() -> Result<(), Box<dyn Error>> {
 	)?;
 	let disabled = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(query_budget()),
 		)
@@ -215,7 +215,7 @@ async fn run_selective_join(
 	let bound = bind(&join_plan(), &catalog, &PlannerConfig::default()).await?;
 	let stages = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(query_budget()),
 		)

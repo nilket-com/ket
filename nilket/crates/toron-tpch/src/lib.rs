@@ -7923,9 +7923,12 @@ async fn fragment_census_outcome_with_metadata(
 
 	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
 	let context = tpch_execution_context(task_telemetry);
-	let config = FragmentPlanConfig::new(context.query_id, context.task_budget)
-		.with_task_context(TaskExecutionContext::from_execution_context(&context))
-		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone());
+	let config = FragmentPlanConfig::new(
+		context.query_id,
+		TaskExecutionContext::from_execution_context(&context),
+		context.task_budget,
+	)
+	.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone());
 	match fragment_plan(bound, config) {
 		Ok(stages) => (
 			Some(plan_fingerprint),
@@ -8265,11 +8268,14 @@ async fn execution_census_preflight(
 	let plan_fingerprint = physical_plan_fingerprint(&bound);
 	let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
 	let context = tpch_execution_context_with_budget(task_telemetry, seed_budget);
-	let fragment_config = FragmentPlanConfig::new(context.query_id, context.task_budget)
-		.with_task_context(TaskExecutionContext::from_execution_context(&context))
-		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
-		.with_max_in_flight_tasks(seed_budget.max_in_flight_tasks)
-		.with_runtime_filters_enabled(planner_config.runtime_filters_enabled);
+	let fragment_config = FragmentPlanConfig::new(
+		context.query_id,
+		TaskExecutionContext::from_execution_context(&context),
+		context.task_budget,
+	)
+	.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
+	.with_max_in_flight_tasks(seed_budget.max_in_flight_tasks)
+	.with_runtime_filters_enabled(planner_config.runtime_filters_enabled);
 	let stages = fragment_plan(bound, fragment_config).map_err(|error| {
 		ExecutionCensusPreflightRejection {
 			phase: Phase::Fragment,
@@ -12874,15 +12880,15 @@ mod adr537_q11_constant_key_join {
 							.expect("bind q11 under the distributed posture");
 					let task_telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
 					let context = tpch_execution_context_with_budget(task_telemetry, seed_budget);
-					let fragment_config =
-						FragmentPlanConfig::new(context.query_id, context.task_budget)
-							.with_task_context(TaskExecutionContext::from_execution_context(
-								&context,
-							))
-							.with_join_runtime_observation_mode(
-								context.join_runtime_observation_mode.clone(),
-							)
-							.with_max_in_flight_tasks(seed_budget.max_in_flight_tasks);
+					let fragment_config = FragmentPlanConfig::new(
+						context.query_id,
+						TaskExecutionContext::from_execution_context(&context),
+						context.task_budget,
+					)
+					.with_join_runtime_observation_mode(
+						context.join_runtime_observation_mode.clone(),
+					)
+					.with_max_in_flight_tasks(seed_budget.max_in_flight_tasks);
 					let stages = fragment_plan(bound, fragment_config).expect("fragment q11");
 
 					// The two join-input producers, by partition count and key type.

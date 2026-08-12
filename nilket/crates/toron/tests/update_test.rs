@@ -850,7 +850,7 @@ async fn fragmenter_rejects_direct_update_fragmentation() {
 
 	let err = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::from_u128(1),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),
@@ -868,7 +868,7 @@ async fn fragmenter_rejects_direct_update_without_where_fragmentation() {
 
 	let err = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::from_u128(1),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),

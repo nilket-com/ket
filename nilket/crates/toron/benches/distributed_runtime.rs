@@ -131,7 +131,7 @@ async fn run_case(worker_count: usize, rows: usize) -> Result<BenchRow, Box<dyn 
 	let bound = bind(&plan, &catalog, &PlannerConfig::default()).await?;
 	let stages = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),

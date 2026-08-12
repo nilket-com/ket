@@ -436,7 +436,7 @@ async fn fragmenter_rejects_delete_defensively() {
 
 	let err = fragment_plan(
 		plan,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::from_u128(1),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),

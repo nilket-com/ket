@@ -2124,7 +2124,7 @@ mod tests {
 		.await
 		.expect("bind hash join");
 		let query_id = QueryId::from_u128(139);
-		let config = FragmentPlanConfig::new(
+		let config = FragmentPlanConfig::new_for_test(
 			query_id,
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		);
@@ -5665,9 +5665,12 @@ mod tests {
 			let bound = bind(&plan, catalog.as_ref(), &planner_config).await?;
 			let stages = fragment_plan(
 				bound,
-				FragmentPlanConfig::new(query_id, TaskBudget::from_query_budget(query_budget))
-					.with_max_in_flight_tasks(query_budget.max_in_flight_tasks)
-					.with_id_namespace(fragment_id_namespace),
+				FragmentPlanConfig::new_for_test(
+					query_id,
+					TaskBudget::from_query_budget(query_budget),
+				)
+				.with_max_in_flight_tasks(query_budget.max_in_flight_tasks)
+				.with_id_namespace(fragment_id_namespace),
 			)
 			.map_err(|error| QueryError::Remote {
 				message: format!("{error:?}"),

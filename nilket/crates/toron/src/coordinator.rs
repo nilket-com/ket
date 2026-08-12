@@ -1397,9 +1397,9 @@ where
 	) -> FragmentPlanConfig {
 		FragmentPlanConfig::new(
 			context.query_id,
+			TaskExecutionContext::from_execution_context(context),
 			TaskBudget::from_query_budget(query_budget),
 		)
-		.with_task_context(TaskExecutionContext::from_execution_context(context))
 		.with_join_runtime_observation_mode(context.join_runtime_observation_mode.clone())
 		.with_max_in_flight_tasks(query_budget.max_in_flight_tasks)
 		// ADR 537: one source for the runtime-filter mode. Both fragmentation paths and
@@ -1471,11 +1471,9 @@ where
 			bound,
 			FragmentPlanConfig::new(
 				execution_context.query_id,
+				TaskExecutionContext::from_execution_context(&execution_context),
 				TaskBudget::from_query_budget(query_budget),
 			)
-			.with_task_context(TaskExecutionContext::from_execution_context(
-				&execution_context,
-			))
 			.with_join_runtime_observation_mode(
 				execution_context.join_runtime_observation_mode.clone(),
 			)

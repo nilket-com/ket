@@ -338,7 +338,7 @@ async fn run_case(
 	let bound = bind(&plan, &catalog, &PlannerConfig::default()).await?;
 	let stages = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(QueryId::new(), TaskBudget::from_query_budget(budget))
+		FragmentPlanConfig::new_for_test(QueryId::new(), TaskBudget::from_query_budget(budget))
 			.with_worker_count(u32::try_from(worker_count)?)
 			.with_runtime_filters_enabled(runtime_filters_enabled),
 	)?;

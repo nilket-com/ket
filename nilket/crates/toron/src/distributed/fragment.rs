@@ -40,10 +40,14 @@ pub struct FragmentPlanConfig {
 }
 
 impl FragmentPlanConfig {
-	pub fn new(query_id: QueryId, task_budget: TaskBudget) -> Self {
+	pub fn new(
+		query_id: QueryId,
+		task_context: TaskExecutionContext,
+		task_budget: TaskBudget,
+	) -> Self {
 		Self {
 			query_id,
-			task_context: TaskExecutionContext::local_test(),
+			task_context,
 			task_budget,
 			worker_count: 1,
 			runtime_filters_enabled: true,
@@ -53,16 +57,17 @@ impl FragmentPlanConfig {
 		}
 	}
 
+	/// Test and benchmark convenience. Production callers must provide the
+	/// execution context explicitly through [`Self::new`].
+	pub fn new_for_test(query_id: QueryId, task_budget: TaskBudget) -> Self {
+		Self::new(query_id, TaskExecutionContext::local_test(), task_budget)
+	}
+
 	/// Mirror the scheduler's admission cap. `None` is unbounded, matching
 	/// `DistributedScheduler::with_max_in_flight_tasks`, which also floors a supplied
 	/// limit at one.
 	pub fn with_max_in_flight_tasks(mut self, max_in_flight_tasks: Option<usize>) -> Self {
 		self.max_in_flight_tasks = max_in_flight_tasks.map(|limit| limit.max(1));
-		self
-	}
-
-	pub fn with_task_context(mut self, task_context: TaskExecutionContext) -> Self {
-		self.task_context = task_context;
 		self
 	}
 
@@ -3508,7 +3513,7 @@ mod tests {
 	}
 
 	fn config() -> FragmentPlanConfig {
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::from_u128(1),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		)

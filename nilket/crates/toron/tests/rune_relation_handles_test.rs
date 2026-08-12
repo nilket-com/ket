@@ -41,7 +41,7 @@ fn sandbox_config() -> RuneSandboxConfig {
 }
 
 fn fragment_config() -> FragmentPlanConfig {
-	FragmentPlanConfig::new(
+	FragmentPlanConfig::new_for_test(
 		QueryId::new(),
 		TaskBudget::from_query_budget(QueryBudget::test_default()),
 	)

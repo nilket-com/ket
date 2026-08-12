@@ -1,4 +1,62 @@
-use super::support::manifest_dir;
+use super::support::{manifest_dir, source_files};
+
+#[test]
+pub(crate) fn adr083_fragment_plan_construction_requires_real_execution_context() {
+	let fragment = std::fs::read_to_string(manifest_dir().join("src/distributed/fragment.rs"))
+		.expect("read fragmenter source");
+	let constructor = fragment
+		.split_once("pub fn new(")
+		.expect("FragmentPlanConfig::new")
+		.1
+		.split_once("\n\t}")
+		.expect("FragmentPlanConfig::new body")
+		.0;
+	assert!(constructor.contains("task_context: TaskExecutionContext"));
+	assert!(!constructor.contains("TaskExecutionContext::local_test()"));
+
+	let test_constructor = fragment
+		.split_once("pub fn new_for_test(")
+		.expect("FragmentPlanConfig::new_for_test")
+		.1
+		.split_once("\n\t}")
+		.expect("FragmentPlanConfig::new_for_test body")
+		.0;
+	assert!(test_constructor.contains("TaskExecutionContext::local_test()"));
+
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator source");
+	let production = coordinator
+		.split_once("#[cfg(test)]")
+		.expect("coordinator test boundary")
+		.0;
+	assert_eq!(production.matches("FragmentPlanConfig::new(").count(), 2);
+	assert!(!production.contains("FragmentPlanConfig::new_for_test("));
+	assert!(!production.contains(".with_task_context("));
+
+	let tpch = std::fs::read_to_string(manifest_dir().join("../toron-tpch/src/lib.rs"))
+		.expect("read TPCH source");
+	assert_eq!(tpch.matches("FragmentPlanConfig::new(").count(), 3);
+	assert!(!tpch.contains("FragmentPlanConfig::new_for_test("));
+	assert!(!tpch.contains(".with_task_context("));
+
+	let test_convenience_calls = source_files(&manifest_dir().join("src"))
+		.into_iter()
+		.flat_map(|path| {
+			std::fs::read_to_string(&path)
+				.expect("read Toron source")
+				.lines()
+				.filter(|line| line.contains("FragmentPlanConfig::new_for_test("))
+				.map(move |_| path.clone())
+				.collect::<Vec<_>>()
+		})
+		.collect::<Vec<_>>();
+	assert_eq!(test_convenience_calls.len(), 3);
+	assert!(
+		test_convenience_calls
+			.iter()
+			.all(|path| path.ends_with("lib.rs") || path.ends_with("distributed/fragment.rs"))
+	);
+}
 
 #[test]
 pub(crate) fn adr546_quantile_has_one_stable_authoritative_execution_path() {

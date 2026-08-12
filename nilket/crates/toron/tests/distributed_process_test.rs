@@ -1207,7 +1207,7 @@ async fn distributed_group_by_has_single_group_keyed_exchange() {
 		.expect("bind group by sql");
 	let stages = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),
@@ -2633,7 +2633,7 @@ async fn run_hash_join_producer_kill_query(
 	.expect("bind hash join");
 	let stages = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),
@@ -2854,7 +2854,7 @@ async fn run_producer_kill_query(worker_id_base: u128) -> ProcessRun {
 	.expect("bind");
 	let stages = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),
@@ -2906,7 +2906,7 @@ async fn broadcast_join_stages() -> Vec<toron::distributed::scheduler::StagePlan
 	.expect("bind broadcast join");
 	fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		)
@@ -2925,7 +2925,7 @@ async fn hash_join_stages(plan: LogicalPlan) -> Vec<toron::distributed::schedule
 	.expect("bind hash join");
 	fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		)
@@ -3456,7 +3456,7 @@ async fn adr260_verify_probe_left_outer_over_grouped_aggregate_fragments() {
 
 	let stages = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),

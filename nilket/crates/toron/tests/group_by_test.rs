@@ -5181,7 +5181,7 @@ async fn grouped_aggregate_bound_plan_fragments_to_single_group_keyed_exchange()
 		.expect("bind");
 	let stages = fragment_plan(
 		bound,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::new(),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),
@@ -7130,7 +7130,7 @@ fn assert_column_node(
 }
 
 fn fragment_config() -> FragmentPlanConfig {
-	FragmentPlanConfig::new(
+	FragmentPlanConfig::new_for_test(
 		QueryId::new(),
 		TaskBudget::from_query_budget(QueryBudget::test_default()),
 	)

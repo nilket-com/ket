@@ -812,7 +812,7 @@ fn descriptor(id: u8, name: &str, schema: &Schema) -> TableSchemaDescriptor {
 }
 
 fn fragment_config() -> FragmentPlanConfig {
-	FragmentPlanConfig::new(
+	FragmentPlanConfig::new_for_test(
 		QueryId::from_u128(1),
 		TaskBudget::from_query_budget(QueryBudget::test_default()),
 	)

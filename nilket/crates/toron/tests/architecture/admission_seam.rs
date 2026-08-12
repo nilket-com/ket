@@ -70,7 +70,7 @@ fn adr536_admission_cap_default_is_unbounded_and_floors_at_one() {
 	use toron::distributed::fragment::FragmentPlanConfig;
 	use toron::ir::QueryId;
 
-	let base = FragmentPlanConfig::new(
+	let base = FragmentPlanConfig::new_for_test(
 		QueryId::new(),
 		TaskBudget::from_query_budget(QueryBudget::test_default()),
 	);

@@ -987,7 +987,7 @@ async fn executor_and_fragmenter_reject_direct_ctas_execution() {
 
 	let err = fragment_plan(
 		plan,
-		FragmentPlanConfig::new(
+		FragmentPlanConfig::new_for_test(
 			QueryId::from_u128(1),
 			TaskBudget::from_query_budget(QueryBudget::test_default()),
 		),
