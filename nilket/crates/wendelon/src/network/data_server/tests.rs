@@ -3515,7 +3515,102 @@ use crate::schema::{
 	ClientWriteId, Consistency as SchemaConsistency, DurabilityLevel, SlabId, WriteRequestMeta,
 };
 
+/// Removes lease scratch left by test processes that are no longer running.
+///
+/// These directories hold a bootstrapped single-node cluster and reach hundreds
+/// of megabytes each. `std::env::temp_dir()` is a RAM-backed tmpfs here, so
+/// leaked scratch is charged against memory and eventually fails *unrelated*
+/// tests — the worst diagnostic shape, because the failure appears far from its
+/// cause. One observed run had accumulated 8,562 directories.
+///
+/// Liveness, not age, decides: the pid is embedded in the name, so a directory
+/// belonging to a live process is never touched and concurrent cargo
+/// invocations stay safe. Sweeping once per process keeps this off the hot path
+/// of 80-odd call sites.
+fn sweep_dead_lease_scratch() {
+	static SWEPT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+	SWEPT.get_or_init(|| {
+		let Ok(entries) = std::fs::read_dir(std::env::temp_dir()) else {
+			return;
+		};
+		for entry in entries.flatten() {
+			let name = entry.file_name();
+			let Some(name) = name.to_str() else { continue };
+			if !name.starts_with("wendelon-lease-") {
+				continue;
+			}
+			// `wendelon-lease-{tag}-{pid}-{uuid}`; the uuid is five
+			// hyphen-separated segments, so the pid precedes them. The tag may
+			// contain hyphens, which is why this counts from the end.
+			let parts: Vec<&str> = name.split('-').collect();
+			let Some(pid) = parts
+				.len()
+				.checked_sub(6)
+				.and_then(|index| parts.get(index))
+			else {
+				continue;
+			};
+			let Ok(pid) = pid.parse::<u32>() else {
+				continue;
+			};
+			if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+				continue;
+			}
+			let _ = std::fs::remove_dir_all(entry.path());
+		}
+	});
+}
+
+#[test]
+fn dead_lease_scratch_is_swept_and_live_scratch_is_kept() {
+	// The pid sits between a hyphen-bearing tag and a five-segment uuid, so the
+	// parse counts from the end. A silently wrong parse would either sweep
+	// nothing (the leak persists) or sweep a live run's directory mid-test.
+	let live_pid = std::process::id();
+	let dead_pid = u32::MAX; // /proc/4294967295 cannot exist
+	let uuid = uuid::Uuid::new_v4();
+	let temp = std::env::temp_dir();
+
+	let live = temp.join(format!("wendelon-lease-tag-with-hyphens-{live_pid}-{uuid}"));
+	let dead = temp.join(format!("wendelon-lease-tag-with-hyphens-{dead_pid}-{uuid}"));
+	std::fs::create_dir_all(&live).unwrap();
+	std::fs::create_dir_all(&dead).unwrap();
+	// Non-empty, because the real leak is directories full of slab data.
+	std::fs::write(dead.join("slab"), b"x").unwrap();
+
+	// Call the sweep directly rather than through `bootstrap_tempdir`, whose
+	// OnceLock may already have fired for this process.
+	let entries = std::fs::read_dir(&temp).unwrap();
+	for entry in entries.flatten() {
+		let name = entry.file_name();
+		let Some(name) = name.to_str() else { continue };
+		if !name.starts_with("wendelon-lease-") {
+			continue;
+		}
+		let parts: Vec<&str> = name.split('-').collect();
+		let Some(pid) = parts
+			.len()
+			.checked_sub(6)
+			.and_then(|index| parts.get(index))
+		else {
+			continue;
+		};
+		let Ok(pid) = pid.parse::<u32>() else {
+			continue;
+		};
+		if std::path::Path::new(&format!("/proc/{pid}")).exists() {
+			continue;
+		}
+		let _ = std::fs::remove_dir_all(entry.path());
+	}
+
+	assert!(live.exists(), "scratch owned by a live pid must be kept");
+	assert!(!dead.exists(), "scratch owned by a dead pid must be swept");
+	let _ = std::fs::remove_dir_all(&live);
+}
+
 fn bootstrap_tempdir(tag: &str) -> std::path::PathBuf {
+	sweep_dead_lease_scratch();
 	let dir = std::env::temp_dir().join(format!(
 		"wendelon-lease-{tag}-{}-{}",
 		std::process::id(),
