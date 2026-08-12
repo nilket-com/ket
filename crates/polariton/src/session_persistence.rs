@@ -979,6 +979,32 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0085_axis_title_stays_in_source_and_not_owner_meanings() {
+		let document = DocumentId::new(85).unwrap();
+		let view = LocalViewIdentity::Named("axis-titled-box".into());
+		let panel = HostPanelId::new(DYNAMIC_PANEL_FLOOR);
+		let mut meanings = empty_meanings();
+		meanings.panels.insert((document, view), panel);
+		meanings
+			.groups
+			.insert(document, HostPanelGroupId::new(GROUP_FLOOR));
+		meanings.next_view_panel_id = panel.get() + 1;
+		meanings.next_view_group_id = GROUP_FLOOR + 1;
+
+		let bytes = meanings.encode().unwrap();
+		let text = String::from_utf8(bytes.clone()).unwrap();
+		assert_eq!(SCHEMA_VERSION, 2);
+		assert!(
+			!text.contains("x_label") && !text.contains("y_label"),
+			"{text}"
+		);
+		assert_eq!(
+			DurableMeanings::decode(SCHEMA_VERSION, &bytes).unwrap(),
+			meanings
+		);
+	}
+
+	#[test]
 	fn product_0062_colour_family_is_closed_and_rotation_independent() {
 		let document = DocumentId::new(1).unwrap();
 		let mut meanings = empty_meanings();

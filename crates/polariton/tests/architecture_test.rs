@@ -2523,3 +2523,44 @@ fn product_0084_keeps_dataframe_at_the_kernel_boundary_only() {
 		"kernel inventory must be substantive"
 	);
 }
+
+#[test]
+fn product_0085_keeps_one_semantic_axis_title_derivation_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let stacked_bar = std::fs::read_to_string(root.join("plot/kernels/stacked_bar.rs"))
+		.expect("read stacked bar");
+	let stacked_area = std::fs::read_to_string(root.join("plot/kernels/stacked_area.rs"))
+		.expect("read stacked area");
+	assert!(common.contains("pub enum AxisTitleTransform"));
+	assert!(common.contains("pub fn derive_axis_title("));
+	for (name, source) in [("stacked bar", stacked_bar), ("stacked area", stacked_area)] {
+		let production = source
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production kernel section");
+		assert!(
+			production.contains("derive_axis_title("),
+			"PRODUCT-0085 {name} must consume the shared derivation authority"
+		);
+		assert!(
+			!production.contains("(% of total)"),
+			"PRODUCT-0085 {name} must not carry a local title formatter"
+		);
+	}
+
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation VM");
+	for label in ["x_label", "y_label"] {
+		assert!(
+			compiler.contains(&format!("\"{label}\",")),
+			"PRODUCT-0085 {label} must participate in presentation partitioning"
+		);
+		assert!(
+			presentation.contains(&format!("\"__{label}\"")),
+			"PRODUCT-0085 {label} must be registered in the local Rune VM"
+		);
+	}
+}

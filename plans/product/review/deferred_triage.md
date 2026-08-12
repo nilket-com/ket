@@ -39,6 +39,11 @@ seeded judgement stays legible beside what actually happened.
 | `Presence::Hide` repair | will do | 0050 |
 | Register-argument bindings | will do | 0040 / 0058 / 0076. `uat/test21.rn` binds `skin`, `palette`, and `facet`, and binds a whole figure member via `yb` |
 
+**Landed after this reconciliation:** DB-19's if-asked trigger fired in
+PRODUCT-0082, and PRODUCT-0085 ships `x_label` / `y_label` authoring plus the
+derived percent-of-total title. Its seeded row remains unchanged below so this
+file continues to show the 2026-08-06 judgement beside the later outcome.
+
 **Overturned closure:**
 
 | item | was | now |

@@ -164,6 +164,8 @@ impl Origin {
 enum FigureElementKind {
 	Title(String),
 	Subtitle(String),
+	XLabel(String),
+	YLabel(String),
 	Facet(String),
 	Palette(String),
 	Legend(Presence<LegendPosition>),
@@ -388,6 +390,8 @@ fn build_context() -> Result<Context, String> {
 		("__box", raw_box as RawFunction),
 		("__title", raw_title as RawFunction),
 		("__subtitle", raw_subtitle as RawFunction),
+		("__x_label", raw_x_label as RawFunction),
+		("__y_label", raw_y_label as RawFunction),
 		("__facet", raw_facet as RawFunction),
 		("__palette", raw_palette as RawFunction),
 		("__skin", raw_skin as RawFunction),
@@ -577,6 +581,8 @@ fn raw_box(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) 
 enum StringConstructor {
 	Title,
 	Subtitle,
+	XLabel,
+	YLabel,
 	Facet,
 	Palette,
 }
@@ -599,6 +605,24 @@ fn raw_subtitle(
 		args,
 		out,
 	)
+}
+
+fn raw_x_label(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_string_element(StringConstructor::XLabel, "x_label", stack, addr, args, out)
+}
+
+fn raw_y_label(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_string_element(StringConstructor::YLabel, "y_label", stack, addr, args, out)
 }
 
 fn raw_facet(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
@@ -633,12 +657,26 @@ fn raw_string_element(
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
 	let value = if values.len() == 3 {
 		match rune::from_value::<Ref<str>>(values[0].clone()) {
-			Ok(value) => Ok(match kind {
-				StringConstructor::Title => FigureElementKind::Title(value.to_owned()),
-				StringConstructor::Subtitle => FigureElementKind::Subtitle(value.to_owned()),
-				StringConstructor::Facet => FigureElementKind::Facet(value.to_owned()),
-				StringConstructor::Palette => FigureElementKind::Palette(value.to_owned()),
-			}),
+			Ok(value) => {
+				let value = value.to_owned();
+				if matches!(kind, StringConstructor::XLabel | StringConstructor::YLabel)
+					&& value.trim().is_empty()
+				{
+					Err(PresentationFailure::new(
+						origin,
+						format!("{name}(...) requires a nonempty string"),
+					))
+				} else {
+					Ok(match kind {
+						StringConstructor::Title => FigureElementKind::Title(value),
+						StringConstructor::Subtitle => FigureElementKind::Subtitle(value),
+						StringConstructor::XLabel => FigureElementKind::XLabel(value),
+						StringConstructor::YLabel => FigureElementKind::YLabel(value),
+						StringConstructor::Facet => FigureElementKind::Facet(value),
+						StringConstructor::Palette => FigureElementKind::Palette(value),
+					})
+				}
+			}
 			Err(_) => Err(PresentationFailure::new(
 				origin,
 				format!("{name}(...) requires one string"),
@@ -1906,6 +1944,8 @@ fn raw_figure(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 struct FigureParts {
 	title: Option<(String, Origin)>,
 	subtitle: Option<(String, Origin)>,
+	x_label: Option<(String, Origin)>,
+	y_label: Option<(String, Origin)>,
 	facet: Option<(String, Origin)>,
 	palette: Option<(String, Origin)>,
 	legend: Option<(Presence<LegendPosition>, Origin)>,
@@ -2028,6 +2068,18 @@ fn merge_element(
 			origin,
 			"a figure has at most one subtitle",
 		),
+		FigureElementKind::XLabel(value) => set_once(
+			&mut parts.x_label,
+			(value, origin),
+			origin,
+			"a figure has at most one x_label element",
+		),
+		FigureElementKind::YLabel(value) => set_once(
+			&mut parts.y_label,
+			(value, origin),
+			origin,
+			"a figure has at most one y_label element",
+		),
 		FigureElementKind::Facet(value) => set_once(
 			&mut parts.facet,
 			(value, origin),
@@ -2093,6 +2145,12 @@ impl FigureParts {
 		}
 		if let Some((subtitle, _)) = &self.subtitle {
 			authored_settings.subtitle = Presence::Show(Arc::new(subtitle.clone()));
+		}
+		if let Some((x_label, _)) = &self.x_label {
+			authored_settings.x_label = Presence::Show(Arc::new(x_label.clone()));
+		}
+		if let Some((y_label, _)) = &self.y_label {
+			authored_settings.y_label = Presence::Show(Arc::new(y_label.clone()));
 		}
 		if let Some((legend, _)) = self.legend {
 			authored_settings.legend = legend;

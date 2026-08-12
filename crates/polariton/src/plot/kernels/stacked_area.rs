@@ -1,6 +1,6 @@
 use crate::plot::common::{
-	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
-	ResolvedPlotSettings, format_label, polars_type_to_axis_type,
+	AxisTitleTransform, AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel,
+	PlotLayout, ResolvedPlotSettings, derive_axis_title, format_label, polars_type_to_axis_type,
 };
 use crate::plot::legend::{
 	LegendProvenance, LegendSample, entries_from_pairs_with_sample_and_provenance,
@@ -217,7 +217,13 @@ impl PlotKernel for StackedAreaPlotKernel {
 	}
 
 	fn y_label(&self) -> String {
-		self.prepared_data.y_label.clone()
+		match self.normalization {
+			StackNormalization::Absolute => self.prepared_data.y_label.clone(),
+			StackNormalization::Percent => derive_axis_title(
+				&self.prepared_data.y_label,
+				AxisTitleTransform::PercentOfTotal,
+			),
+		}
 	}
 }
 
@@ -921,7 +927,7 @@ mod product_0069_tests {
 	}
 
 	#[test]
-	fn product_0072_percent_area_uses_x_local_first_row_totals() {
+	fn product_0085_0072_percent_area_uses_local_totals_and_transform_title_provenance() {
 		let frame = polars::df!(
 			"x" => [0_i64, 0, 1, 1, 0],
 			"series" => ["Atlas", "Beacon", "Atlas", "Beacon", "Atlas"],
@@ -951,6 +957,8 @@ mod product_0069_tests {
 		};
 		assert_eq!(y_range, (0.0, 100.0));
 		assert_eq!(y_axis_type, AxisType::Percent);
+		assert_eq!(kernel.x_label(), "x");
+		assert_eq!(kernel.y_label(), "y (% of total)");
 		let layout = kernel.layout(settings);
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
 		let transform = CoordinateTransformer::new(&layout, bounds);
@@ -967,6 +975,22 @@ mod product_0069_tests {
 			Some("X: 1\nAtlas: 20.00\nShare: 50.0%\nCumulative: 50.0%\nTotal: 40.00"),
 			"each x uses its own denominator rather than a figure-wide total"
 		);
+
+		let mut formatted_only = prepare_stacked_area_data(&frame, "series", "x", "y");
+		formatted_only.y_axis_type = AxisType::Percent;
+		let formatted_only = StackedAreaPlotKernel {
+			prepared_data: Arc::new(formatted_only),
+			series_colors: Vec::new(),
+			normalization: StackNormalization::Absolute,
+		};
+		assert_eq!(formatted_only.y_label(), "y");
+		assert!(matches!(
+			formatted_only.layout(ResolvedPlotSettings::default()),
+			PlotLayout::Cartesian {
+				y_axis_type: AxisType::Percent,
+				..
+			}
+		));
 	}
 
 	#[test]

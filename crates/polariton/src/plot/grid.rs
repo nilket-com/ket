@@ -3515,6 +3515,38 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0085_authored_axis_titles_remain_one_per_shared_side() {
+		let (kernel, _) = rendered_facet(
+			4,
+			GridArrangement::new(2, 2).expect("arrangement"),
+			800.0,
+			600.0,
+		);
+		let mut resolved = ResolvedPlotSettings::default();
+		resolved.x_label = ResolvedPresence::Show(Arc::new("Authored X".to_owned()));
+		resolved.y_label = ResolvedPresence::Show(Arc::new("Authored Y".to_owned()));
+		let model = PlotSettings::from_resolved(resolved.clone());
+		let mut backend = SvgBackend::new(800.0, 600.0);
+		PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: resolved,
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		}
+		.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0)),
+		);
+		let svg = backend.finish();
+		assert_eq!(svg.matches(">Authored X</text>").count(), 1);
+		assert_eq!(svg.matches(">Authored Y</text>").count(), 1);
+	}
+
+	#[test]
 	fn product_0048_partial_row_text_lands_directly_in_the_empty_below_slot() {
 		let (kernel, svg) = rendered_facet(
 			5,

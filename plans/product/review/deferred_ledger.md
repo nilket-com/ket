@@ -319,10 +319,12 @@ is 0016's expected stop-condition trigger — "a renderer and resolution change
 with its own evidence." No later record in the set repairs it. — 0016 §6,
 §11, §12, Rejected, Consequences.
 
-**DB-19 · Axis-label authoring.** "A future record may author axis labels, legends, or
-facet structure. Each extends a stage inside `figure([...])`." Axis labels
-remain unauthored (0036/0038/0039 added bounds and ticks, not labels). —
-0016 §12, Consequences.
+**DB-19 · Axis-label authoring — landed in PRODUCT-0085.** "A future record may
+author axis labels, legends, or facet structure. Each extends a stage inside
+`figure([...])`." PRODUCT-0085 adds `x_label` and `y_label` through that stage
+and repairs percent-of-total derivation. Legend titles and authored facet
+structure remain separate residues under PRODUCT-0044 and their own first-use
+triggers. — 0016 §12, Consequences; 0085.
 
 **DB-20 · Bare-string source sugar.** `viz.plot("joel")` "waits until one namespace
 clearly wins in practice, and may never arrive." — rune-data-products (scope

@@ -39,6 +39,23 @@ pub enum AxisType {
 	Time,
 }
 
+/// Semantic provenance for a derived axis title. This is deliberately
+/// separate from [`AxisType`], which controls tick formatting rather than the
+/// transformation that produced the values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AxisTitleTransform {
+	PercentOfTotal,
+}
+
+pub fn derive_axis_title(base: &str, transform: AxisTitleTransform) -> String {
+	if base.is_empty() {
+		return String::new();
+	}
+	match transform {
+		AxisTitleTransform::PercentOfTotal => format!("{base} (% of total)"),
+	}
+}
+
 /// Closed major-tick placement. Count preserves the legacy interval model;
 /// Step places ticks on a zero-anchored numeric lattice.
 #[allow(dead_code)] // PRODUCT-0038 is the first production Rune caller.
@@ -2731,6 +2748,54 @@ mod product_0067_0068_strata_oracles {
 			)),
 			"the same step on an absolute layout keeps linear labels"
 		);
+	}
+
+	#[test]
+	fn product_0085_axis_title_derivation_is_semantic_and_presence_still_wins() {
+		let derived = derive_axis_title("revenue", AxisTitleTransform::PercentOfTotal);
+		assert_eq!(derived, "revenue (% of total)");
+		assert_eq!(
+			resolve_canvas_text(&ResolvedPresence::Fallback, Some(derived.clone())),
+			Some(derived)
+		);
+		assert_eq!(
+			resolve_canvas_text(
+				&ResolvedPresence::Show(Arc::new(" Share ".to_owned())),
+				Some("revenue (% of total)".to_owned()),
+			),
+			Some(" Share ".to_owned()),
+			"selected cascade text replaces derivation byte-for-byte"
+		);
+		assert_eq!(
+			resolve_canvas_text(
+				&ResolvedPresence::Hide,
+				Some("revenue (% of total)".to_owned()),
+			),
+			None,
+			"resolved Hide remains stronger than a derived fallback"
+		);
+		assert_eq!(
+			derive_axis_title("", AxisTitleTransform::PercentOfTotal),
+			""
+		);
+
+		for (kernel_x, kernel_y) in [("category", "value"), ("value", "category")] {
+			assert_eq!(
+				resolve_canvas_text(
+					&ResolvedPresence::Show(Arc::new("A".to_owned())),
+					Some(kernel_x.to_owned()),
+				),
+				Some("A".to_owned())
+			);
+			assert_eq!(
+				resolve_canvas_text(
+					&ResolvedPresence::Show(Arc::new("B".to_owned())),
+					Some(kernel_y.to_owned()),
+				),
+				Some("B".to_owned()),
+				"authored x/y titles stay on rendered axes when kernel fallbacks swap"
+			);
+		}
 	}
 
 	#[test]

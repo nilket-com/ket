@@ -38,9 +38,11 @@ const PRESENTATION_FREE: &[&str] = &[
 	"table",
 	"title",
 	"x_bounds",
+	"x_label",
 	"x_minor_ticks",
 	"x_tick_step",
 	"y_bounds",
+	"y_label",
 	"y_minor_ticks",
 	"y_tick_step",
 ];
@@ -1737,10 +1739,11 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0082_0083_test26_is_the_real_two_panel_five_case_exhibit() {
+	fn product_0085_0082_0083_test26_is_the_real_box_and_axis_title_exhibit() {
 		let source = include_str!("../../../uat/test26.rn");
 		let compiled = compile(source).expect("the checked-in box exhibit compiles");
-		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 3);
 		assert_eq!(compiled.executions[0].views.len(), 2);
 		for view in &compiled.executions[0].views {
 			let RuneViewIntent::Plot(plot) = &view.intent else {
@@ -1753,12 +1756,74 @@ mod tests {
 				sink.composition.primary_plot_type(),
 				crate::plot::core::PlotType::BoxPlot
 			);
+			assert_eq!(
+				plot.authored_settings.y_label,
+				Presence::Show(Arc::new("Observed value".to_owned()))
+			);
 		}
+		let RuneViewIntent::Plot(percent) = &compiled.executions[1].views[0].intent else {
+			panic!("percent title exhibit produced a table")
+		};
+		assert_eq!(percent.authored_settings.y_label, Presence::Inherit);
+		let RunePlotBody::StyledSingle(percent) = &percent.body else {
+			panic!("percent title exhibit did not retain its styled bar")
+		};
+		assert!(percent.stacked && percent.percent);
 		assert!(source.contains("y_bounds(0, 40)"));
 		assert!(source.contains("y_bounds(-75, 225)"));
 		for case in ["twin", "lowhigh", "none", "flat", "single"] {
 			assert!(source.contains(case), "exhibit omits {case}");
 		}
+		assert!(source.contains("y_label(\"Observed value\")"));
+		assert!(source.contains("Axis title · derived percent-of-total"));
+	}
+
+	#[test]
+	fn product_0085_axis_labels_execute_helpers_preserve_text_and_refuse_precisely() {
+		let helper = r#"
+fn axis() { y_label("Observed value") }
+workspace.table("t").views([figure([
+	x_label(" Sales region "), axis(), box("category", "lo", "q1", "mid", "q3", "hi", "outlier"),
+])])
+"#;
+		let compiled = compile(helper).expect("helper-produced axis titles compile");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("axis-title fixture produced a table")
+		};
+		assert_eq!(
+			plot.authored_settings.x_label,
+			Presence::Show(Arc::new(" Sales region ".to_owned()))
+		);
+		assert_eq!(
+			plot.authored_settings.y_label,
+			Presence::Show(Arc::new("Observed value".to_owned()))
+		);
+
+		for authored in ["", "   "] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([y_label(\"{authored}\"), bar(\"x\", \"y\")])])"
+			);
+			let error = compile(&source).expect_err("blank axis title refuses");
+			let RuneEnvelopeError::InvalidView { span, message } = error else {
+				panic!("blank label refusal retains its origin")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				format!("y_label(\"{authored}\")")
+			);
+			assert!(message.contains("nonempty string"), "{message}");
+		}
+
+		let duplicate = "workspace.table(\"t\").views([figure([y_label(\"first\"), y_label(\"second\"), bar(\"x\", \"y\")])])";
+		let error = compile(duplicate).expect_err("duplicate y labels refuse");
+		let RuneEnvelopeError::InvalidView { span, message } = error else {
+			panic!("duplicate refusal retains its origin")
+		};
+		assert_eq!(
+			&duplicate[span.start as usize..span.end as usize],
+			"y_label(\"second\")"
+		);
+		assert!(message.contains("at most one y_label"), "{message}");
 	}
 
 	#[test]
@@ -1997,7 +2062,8 @@ workspace.table("t").views([bar("region", "revenue")])
 fn pass(value) { value }
 fn twice(value) { pass(value) }
 fn furniture() { [
-	twice(title("Title")), twice(subtitle("Subtitle")), twice(facet("region")),
+	twice(title("Title")), twice(subtitle("Subtitle")),
+	twice(x_label("Horizontal")), twice(y_label("Vertical")), twice(facet("region")),
 	twice(palette("viridis")), twice(skin("nord").duotone()),
 	twice(legend_at(0.2, 0.8)), twice(x_bounds(0, 10)), twice(y_bounds(0, 20)),
 	twice(x_tick_step(2)), twice(y_tick_step(4)),
@@ -2020,7 +2086,8 @@ r.views([
 let r = workspace.table("t");
 r.views([
 	figure([
-		title("Title"), subtitle("Subtitle"), facet("region"), palette("viridis"),
+		title("Title"), subtitle("Subtitle"), x_label("Horizontal"), y_label("Vertical"),
+		facet("region"), palette("viridis"),
 		skin("nord").duotone(), legend_at(0.2, 0.8), x_bounds(0, 10), y_bounds(0, 20),
 		x_tick_step(2), y_tick_step(4), x_minor_ticks(2), y_minor_ticks(3),
 		bar("region", "revenue", "product").bar_width(0.8).category_gap(0.1).stacked().percent(),

@@ -1,5 +1,6 @@
 use crate::plot::common::{
-	CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
+	AxisTitleTransform, CoordinateTransformer, Orientation, PlotBackend, PlotKernel, PlotLayout,
+	ResolvedPlotSettings, derive_axis_title,
 };
 use crate::plot::legend::LegendProvenance;
 use crate::plot::spec::{
@@ -304,14 +305,26 @@ impl PlotKernel for StackedBarPlotKernel {
 	fn x_label(&self) -> String {
 		match self.orientation {
 			Orientation::Vertical => self.prepared_data.x_label.clone(),
-			Orientation::Horizontal => self.prepared_data.y_label.clone(),
+			Orientation::Horizontal => self.value_axis_title(),
 		}
 	}
 
 	fn y_label(&self) -> String {
 		match self.orientation {
-			Orientation::Vertical => self.prepared_data.y_label.clone(),
+			Orientation::Vertical => self.value_axis_title(),
 			Orientation::Horizontal => self.prepared_data.x_label.clone(),
+		}
+	}
+}
+
+impl StackedBarPlotKernel {
+	fn value_axis_title(&self) -> String {
+		match self.normalization {
+			StackNormalization::Absolute => self.prepared_data.y_label.clone(),
+			StackNormalization::Percent => derive_axis_title(
+				&self.prepared_data.y_label,
+				AxisTitleTransform::PercentOfTotal,
+			),
 		}
 	}
 }
@@ -850,7 +863,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0072_percent_uses_first_row_total_and_one_geometry_for_hover() {
+	fn product_0085_0072_percent_uses_one_geometry_and_a_truthful_oriented_title() {
 		let frame = polars::df!(
 			"cat" => ["East", "East", "East"],
 			"group" => ["Atlas", "Beacon", "Atlas"],
@@ -880,6 +893,8 @@ mod tests {
 		};
 		assert_eq!(y_range, (0.0, 100.0));
 		assert_eq!(y_axis_type, crate::plot::common::AxisType::Percent);
+		assert_eq!(kernel.x_label(), "cat");
+		assert_eq!(kernel.y_label(), "val (% of total)");
 		let layout = kernel.layout(settings.clone());
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
 		let transform = CoordinateTransformer::new(&layout, bounds);
@@ -928,6 +943,8 @@ mod tests {
 		};
 		assert_eq!(x_range, (0.0, 100.0));
 		assert_eq!(x_axis_type, crate::plot::common::AxisType::Percent);
+		assert_eq!(horizontal.x_label(), "val (% of total)");
+		assert_eq!(horizontal.y_label(), "cat");
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		let bars = horizontal.stacked_rectangles(
 			&transform,
