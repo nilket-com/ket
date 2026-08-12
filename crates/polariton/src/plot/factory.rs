@@ -1,6 +1,7 @@
 use crate::plot::common::{Orientation, PlotKernel, polars_type_to_axis_type};
 use crate::plot::core::PlotType;
 use crate::plot::kernels::bar::{self, BarPlotKernel};
+use crate::plot::kernels::boxplot::{self, BoxPlotKernel};
 use crate::plot::kernels::bubble::{self, BubblePlotKernel};
 use crate::plot::kernels::candlestick::{self, CandlestickPlotKernel};
 use crate::plot::kernels::fill_between::{self, FillBetweenPlotKernel};
@@ -215,6 +216,31 @@ pub fn create_plot(
 				.expect("resolved histogram was validated during planning"),
 			),
 		}),
+		ResolvedKernelFields::BoxPlot {
+			category,
+			whisker_low,
+			q1,
+			median,
+			q3,
+			whisker_high,
+			outlier,
+		} => {
+			let fields = crate::plot::spec::BoxPlotFields {
+				category: category.clone(),
+				whisker_low: whisker_low.clone(),
+				q1: q1.clone(),
+				median: median.clone(),
+				q3: q3.clone(),
+				whisker_high: whisker_high.clone(),
+				outlier: outlier.clone(),
+			};
+			Arc::new(BoxPlotKernel {
+				prepared_data: Arc::new(
+					boxplot::prepare_box_plot_data(df, &fields)
+						.expect("resolved box plot was validated during planning"),
+				),
+			})
+		}
 		ResolvedKernelFields::FillBetween {
 			x,
 			middle,

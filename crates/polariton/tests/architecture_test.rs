@@ -2379,7 +2379,7 @@ fn product_0078_histogram_keeps_one_interval_authority_after_the_0079_surface() 
 }
 
 #[test]
-fn product_0081_box_plot_keeps_one_tukey_authority_and_no_raw_producer() {
+fn product_0082_box_plot_keeps_one_tukey_authority_and_explicit_producer() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let boxplot = std::fs::read_to_string(root.join("plot/kernels/boxplot.rs"))
 		.expect("read box plot kernel");
@@ -2389,10 +2389,10 @@ fn product_0081_box_plot_keeps_one_tukey_authority_and_no_raw_producer() {
 	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
 
 	assert!(
-		!boxplot.contains("prepare_box_plot_data")
-			&& !factory.contains("ResolvedKernelFields::BoxPlot")
-			&& !factory.contains("prepare_box_plot_data"),
-		"PRODUCT-0081 must remove the renderer's raw-value statistical authority"
+		boxplot.contains("pub fn prepare_box_plot_data(")
+			&& factory.contains("ResolvedKernelFields::BoxPlot")
+			&& factory.contains("boxplot::prepare_box_plot_data(df, &fields)"),
+		"PRODUCT-0082 must ingest explicit Tukey fields through PRODUCT-0081's authority"
 	);
 	let resolved_fields = spec
 		.split("pub enum ResolvedKernelFields")
@@ -2401,13 +2401,10 @@ fn product_0081_box_plot_keeps_one_tukey_authority_and_no_raw_producer() {
 		.split("pub struct ResolvedLayout")
 		.next()
 		.expect("bounded resolved kernel vocabulary");
+	assert!(resolved_fields.contains("BoxPlot {"));
 	assert!(
-		!resolved_fields.contains("BoxPlot"),
-		"producerless BoxPlot must not retain resolved raw fields"
-	);
-	assert!(
-		spec.contains("Box Plot has no producer; explicit Tukey summary fields are required"),
-		"automatic BoxPlot resolution must remain a typed producerless refusal"
+		spec.contains("Box Plot has no producer; seven explicit Tukey fields are required"),
+		"automatic BoxPlot resolution must retain a typed producerless refusal"
 	);
 	for retired in ["pub min:", "pub max:", "stats.min", "stats.max"] {
 		assert!(
@@ -2418,7 +2415,8 @@ fn product_0081_box_plot_keeps_one_tukey_authority_and_no_raw_producer() {
 	assert!(
 		boxplot.contains("settings.mark_style.fill.iced()")
 			&& boxplot.contains("settings.mark_style.decoration.iced()")
+			&& !boxplot.contains("color_theme.get_color")
 			&& tukey.contains("pub fn new(rows: Vec<TukeyBoxRow>)"),
-		"validated Tukey rows and resolved outlier roles must be the surviving substrate"
+		"validated Tukey rows and resolved mark roles must be the surviving substrate"
 	);
 }

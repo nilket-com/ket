@@ -13,7 +13,9 @@ use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 #[cfg(test)]
 use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
-use crate::plot::spec::{LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, Presence};
+use crate::plot::spec::{
+	BoxPlotFields, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, Presence,
+};
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
 use crate::plot::theme::{PlotDomainOverrides, PlotSkinSelection};
@@ -135,7 +137,9 @@ impl StyledRunePlotSink {
 		let mark = match self.sink.composition.primary_plot_type() {
 			PlotType::Line => LayerMark::Line,
 			PlotType::Scatter => LayerMark::Scatter,
-			PlotType::Bar | PlotType::StackedArea | PlotType::Histogram => return Err(self),
+			PlotType::Bar | PlotType::StackedArea | PlotType::Histogram | PlotType::BoxPlot => {
+				return Err(self);
+			}
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
 		};
 		let mut layer = LayerSpec::xy(mark, self.sink.x, self.sink.y);
@@ -171,6 +175,7 @@ pub(crate) enum RuneViewForm {
 	Scatter,
 	Area,
 	Histogram,
+	Box,
 }
 
 #[cfg(test)]
@@ -183,6 +188,7 @@ impl From<RuneViewForm> for ViewPresentation {
 			RuneViewForm::Scatter => (ViewContentKind::Plot, "plot.scatter"),
 			RuneViewForm::Area => (ViewContentKind::Plot, "plot.area"),
 			RuneViewForm::Histogram => (ViewContentKind::Plot, "plot.histogram"),
+			RuneViewForm::Box => (ViewContentKind::Plot, "plot.box"),
 		};
 		Self {
 			content_kind,
@@ -208,6 +214,7 @@ impl RuneViewIntent {
 						PlotType::Scatter => "plot.scatter".to_owned(),
 						PlotType::StackedArea => "plot.area".to_owned(),
 						PlotType::Histogram => "plot.histogram".to_owned(),
+						PlotType::BoxPlot => "plot.box".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -219,6 +226,7 @@ impl RuneViewIntent {
 							PlotType::Scatter => "plot.scatter".to_owned(),
 							PlotType::StackedArea => "plot.area".to_owned(),
 							PlotType::Histogram => "plot.histogram".to_owned(),
+							PlotType::BoxPlot => "plot.box".to_owned(),
 							other => {
 								unreachable!("styled sink admitted unexpected plot type {other:?}")
 							}
@@ -248,6 +256,7 @@ impl RuneViewIntent {
 			(ViewContentKind::Plot, "plot.scatter") => RuneViewForm::Scatter,
 			(ViewContentKind::Plot, "plot.area") => RuneViewForm::Area,
 			(ViewContentKind::Plot, "plot.histogram") => RuneViewForm::Histogram,
+			(ViewContentKind::Plot, "plot.box") => RuneViewForm::Box,
 			_ => panic!("a composite presentation has no legacy RuneViewForm"),
 		}
 	}
@@ -271,6 +280,10 @@ pub(crate) struct DisposableRunePlotSink {
 	pub(crate) category: Option<String>,
 	/// PRODUCT-0079: the second edge of an explicit histogram interval.
 	pub(crate) interval_end: Option<String>,
+	/// PRODUCT-0082: all seven ADR-547 fields, present only for BoxPlot.
+	pub(crate) box_plot_fields: Option<BoxPlotFields>,
+	/// Original use-site spans for each positional box argument.
+	pub(crate) box_plot_origins: Option<BoxPlotFieldOrigins>,
 	/// Original authored mark call, retained for post-query diagnostics.
 	pub(crate) origin: Range<u32>,
 }
@@ -285,10 +298,40 @@ impl PartialEq for DisposableRunePlotSink {
 			&& self.y == other.y
 			&& self.category == other.category
 			&& self.interval_end == other.interval_end
+			&& self.box_plot_fields == other.box_plot_fields
 	}
 }
 
 impl Eq for DisposableRunePlotSink {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct BoxPlotFieldOrigins {
+	pub(crate) category: Range<u32>,
+	pub(crate) whisker_low: Range<u32>,
+	pub(crate) q1: Range<u32>,
+	pub(crate) median: Range<u32>,
+	pub(crate) q3: Range<u32>,
+	pub(crate) whisker_high: Range<u32>,
+	pub(crate) outlier: Range<u32>,
+}
+
+impl BoxPlotFieldOrigins {
+	pub(crate) fn for_role(
+		&self,
+		role: crate::plot::kernels::boxplot::BoxPlotFieldRole,
+	) -> Range<u32> {
+		use crate::plot::kernels::boxplot::BoxPlotFieldRole;
+		match role {
+			BoxPlotFieldRole::Category => self.category.clone(),
+			BoxPlotFieldRole::WhiskerLow => self.whisker_low.clone(),
+			BoxPlotFieldRole::Q1 => self.q1.clone(),
+			BoxPlotFieldRole::Median => self.median.clone(),
+			BoxPlotFieldRole::Q3 => self.q3.clone(),
+			BoxPlotFieldRole::WhiskerHigh => self.whisker_high.clone(),
+			BoxPlotFieldRole::Outlier => self.outlier.clone(),
+		}
+	}
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SourceMapSegment {

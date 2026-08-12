@@ -989,6 +989,13 @@ fn resolve_rune_plot_skin(
 
 #[cfg(feature = "toron")]
 fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
+	if sink.composition.primary_plot_type() == PlotType::BoxPlot {
+		return AuthoredPlotSpec::box_plot(
+			sink.box_plot_fields
+				.clone()
+				.expect("Rune box carries seven explicit Tukey fields"),
+		);
+	}
 	if sink.composition.primary_plot_type() == PlotType::Histogram {
 		return AuthoredPlotSpec::histogram(
 			sink.x.clone(),
@@ -1004,6 +1011,34 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 		sink.y.clone(),
 		sink.category.clone(),
 	)
+}
+
+#[cfg(feature = "toron")]
+fn box_plot_failure_role(
+	data: &DataFrame,
+	fields: &crate::plot::spec::BoxPlotFields,
+) -> Option<crate::plot::kernels::boxplot::BoxPlotFieldRole> {
+	use crate::plot::kernels::boxplot::BoxPlotFieldRole;
+	let authored = AuthoredPlotSpec::box_plot(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		for (role, field) in [
+			(BoxPlotFieldRole::Category, &fields.category),
+			(BoxPlotFieldRole::WhiskerLow, &fields.whisker_low),
+			(BoxPlotFieldRole::Q1, &fields.q1),
+			(BoxPlotFieldRole::Median, &fields.median),
+			(BoxPlotFieldRole::Q3, &fields.q3),
+			(BoxPlotFieldRole::WhiskerHigh, &fields.whisker_high),
+			(BoxPlotFieldRole::Outlier, &fields.outlier),
+		] {
+			if error.field == *field || error.reason.contains(role.name()) {
+				return Some(role);
+			}
+		}
+		return None;
+	}
+	crate::plot::kernels::boxplot::prepare_box_plot_data(data, fields)
+		.err()
+		.and_then(|error| error.field_role())
 }
 
 #[cfg(feature = "toron")]
@@ -1469,6 +1504,23 @@ fn rune_view_outcome_with_palettes(
 				RuneViewIntent::Plot(plot) => (plot.facet.clone(), plot.facet_span.clone()),
 				RuneViewIntent::Table(_) => (None, None),
 			};
+			let box_diagnostic = match &view.intent {
+				RuneViewIntent::Plot(plot) => match &plot.body {
+					RunePlotBody::Single(sink) => sink
+						.box_plot_fields
+						.clone()
+						.zip(sink.box_plot_origins.clone())
+						.map(|(fields, origins)| (fields, origins, sink.origin.clone())),
+					RunePlotBody::StyledSingle(styled) => styled
+						.sink
+						.box_plot_fields
+						.clone()
+						.zip(styled.sink.box_plot_origins.clone())
+						.map(|(fields, origins)| (fields, origins, styled.sink.origin.clone())),
+					RunePlotBody::Layered(_) => None,
+				},
+				RuneViewIntent::Table(_) => None,
+			};
 			let body_output_span = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
 					RunePlotBody::Single(sink)
@@ -1763,10 +1815,18 @@ fn rune_view_outcome_with_palettes(
 						.or_else(|| minor_tick_output_span.y.clone())
 				}
 			});
+			let box_output_span = output.as_ref().err().and_then(|_| {
+				box_diagnostic.as_ref().map(|(fields, origins, mark)| {
+					box_plot_failure_role(result.as_ref(), fields)
+						.map(|role| origins.for_role(role))
+						.unwrap_or_else(|| mark.clone())
+				})
+			});
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
 				span: output_span
+					.or(box_output_span)
 					.or(body_output_span)
 					.or(facet_span)
 					.unwrap_or(view.span),
@@ -9474,6 +9534,128 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert!(error.contains("unordered interval") && error.contains("sort the relation"));
 		let ascending = complete(source, valid);
 		assert!(ascending.sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0082_box_resolves_aliases_values_and_failure_scope() {
+		use crate::plot::common::AxisType;
+		use crate::plot::theme::PlotSettings;
+		use polars::frame::DataFrame;
+		let source = r#"workspace.table("box_probe").views([box("group", "lo", "p25", "mid", "p75", "hi", "point")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("box source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"group" => ["none", "all"],
+			"lo" => [0_i32, 10],
+			"p25" => [1.0_f32, 11.0],
+			"mid" => [2_i64, 12],
+			"p75" => [3.0_f64, 13.0],
+			"hi" => [4_u32, 14],
+			"point" => [None, Some(20_i64)],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid box must resolve");
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::BoxPlot { category, whisker_low, q1, median, q3, whisker_high, outlier }
+				if (category, whisker_low, q1, median, q3, whisker_high, outlier)
+					== (&"group".to_owned(), &"lo".to_owned(), &"p25".to_owned(), &"mid".to_owned(), &"p75".to_owned(), &"hi".to_owned(), &"point".to_owned())
+		));
+		assert!(
+			continuation
+				.identity
+				.persistence_snapshot()
+				.assignments
+				.is_empty()
+		);
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 600, 400);
+		assert_eq!(kernel.x_label(), "group");
+		assert_eq!(kernel.y_label(), "");
+		assert!(matches!(
+			kernel.layout(PlotSettings::default().resolve()),
+			PlotLayout::CategoricalX {
+				y_axis_type: AxisType::Linear,
+				..
+			}
+		));
+
+		let assert_span = |frame: DataFrame, expected: &str, error_fragment: &str| {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid box rendered")
+			};
+			assert!(error.contains(error_fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+
+		assert_span(
+			polars::df!(
+				"group" => ["A"], "lo" => [0.0], "mid" => [2.0], "p75" => [3.0],
+				"hi" => [4.0], "point" => [None::<f64>],
+			)
+			.unwrap(),
+			"\"p25\"",
+			"absent",
+		);
+		assert_span(
+			polars::df!(
+				"group" => ["A"], "lo" => [0.0], "p25" => ["bad"], "mid" => [2.0],
+				"p75" => [3.0], "hi" => [4.0], "point" => [None::<f64>],
+			)
+			.unwrap(),
+			"\"p25\"",
+			"quantitative",
+		);
+		assert_span(
+			polars::df!(
+				"group" => [None::<&str>], "lo" => [0.0], "p25" => [1.0], "mid" => [2.0],
+				"p75" => [3.0], "hi" => [4.0], "point" => [None::<f64>],
+			)
+			.unwrap(),
+			"\"group\"",
+			"non-null",
+		);
+		assert_span(
+			polars::df!(
+				"group" => ["A"], "lo" => [0_i64], "p25" => [1_i64], "mid" => [2_i64],
+				"p75" => [3_i64], "hi" => [4_i64], "point" => [Some(9_007_199_254_740_993_i64)],
+			)
+			.unwrap(),
+			"\"point\"",
+			"9007199254740993",
+		);
+		let mark = "box(\"group\", \"lo\", \"p25\", \"mid\", \"p75\", \"hi\", \"point\")";
+		assert_span(
+			polars::df!(
+				"group" => ["A"], "lo" => [0.0], "p25" => [3.0], "mid" => [2.0],
+				"p75" => [4.0], "hi" => [5.0], "point" => [None::<f64>],
+			)
+			.unwrap(),
+			mark,
+			"does not satisfy",
+		);
+		assert_span(
+			polars::df!(
+				"group" => ["A"], "lo" => [0.0], "p25" => [1.0], "mid" => [2.0],
+				"p75" => [3.0], "hi" => [4.0], "point" => [Some(2.5)],
+			)
+			.unwrap(),
+			mark,
+			"inside the whisker span",
+		);
+		assert!(complete(valid).sinks[0].output.is_ok());
 	}
 
 	#[test]

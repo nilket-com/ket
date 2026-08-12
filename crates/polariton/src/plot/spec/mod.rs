@@ -340,6 +340,31 @@ impl OptionalAuthoredChannelSpec {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BoxPlotFields {
+	pub category: String,
+	pub whisker_low: String,
+	pub q1: String,
+	pub median: String,
+	pub q3: String,
+	pub whisker_high: String,
+	pub outlier: String,
+}
+
+impl BoxPlotFields {
+	pub fn all(&self) -> [&str; 7] {
+		[
+			&self.category,
+			&self.whisker_low,
+			&self.q1,
+			&self.median,
+			&self.q3,
+			&self.whisker_high,
+			&self.outlier,
+		]
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthoredPlotSpec {
 	pub composition: PlotComposition,
 	pub x: AuthoredChannelSpec,
@@ -349,6 +374,8 @@ pub struct AuthoredPlotSpec {
 	/// PRODUCT-0079: the second edge of a histogram interval. The x channel is
 	/// the start and the y channel is count; ordinary Cartesian marks keep None.
 	histogram_end: Option<String>,
+	/// PRODUCT-0082: explicit ADR-547 Tukey summary and outlier columns.
+	box_plot_fields: Option<BoxPlotFields>,
 	/// PRODUCT-0064: stacking is authored geometry within the Bar family, not
 	/// a fourth authored plot type. Resolution consumes this only after the
 	/// x/y pair has selected the physical orientation.
@@ -365,6 +392,7 @@ impl AuthoredPlotSpec {
 			color: OptionalAuthoredChannelSpec::auto(),
 			color_job: Override::Inherit,
 			histogram_end: None,
+			box_plot_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -378,6 +406,7 @@ impl AuthoredPlotSpec {
 			color: OptionalAuthoredChannelSpec::absent(),
 			color_job: Override::Inherit,
 			histogram_end: None,
+			box_plot_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -412,6 +441,20 @@ impl AuthoredPlotSpec {
 
 	pub fn histogram_end(&self) -> Option<&str> {
 		self.histogram_end.as_deref()
+	}
+
+	pub fn box_plot(fields: BoxPlotFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::BoxPlot),
+			fields.category.clone(),
+			fields.median.clone(),
+		);
+		spec.box_plot_fields = Some(fields);
+		spec
+	}
+
+	pub fn box_plot_fields(&self) -> Option<&BoxPlotFields> {
+		self.box_plot_fields.as_ref()
 	}
 
 	pub fn with_stacked_bar(mut self) -> Self {
@@ -527,6 +570,7 @@ impl LayerEncoding {
 			color: self.color.clone(),
 			color_job: self.color_job.clone(),
 			histogram_end: None,
+			box_plot_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -1044,6 +1088,15 @@ pub enum ResolvedKernelFields {
 		bin_end: String,
 		count: String,
 	},
+	BoxPlot {
+		category: String,
+		whisker_low: String,
+		q1: String,
+		median: String,
+		q3: String,
+		whisker_high: String,
+		outlier: String,
+	},
 	FillBetween {
 		x: String,
 		middle: String,
@@ -1397,6 +1450,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::Histogram {
 		return resolve_histogram_channels(spec, schema);
 	}
+	if plot_type == PlotType::BoxPlot {
+		return resolve_box_plot_channels(spec, schema);
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -1632,6 +1688,76 @@ fn resolve_histogram_channels(
 			bin_start: bin_start.field,
 			bin_end: bin_end.to_owned(),
 			count: count.field,
+		}),
+		color_job: None,
+		categorical_limit: 0,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
+fn resolve_box_plot_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.box_plot_fields().ok_or_else(|| ChannelError {
+		channel: Channel::X,
+		field: "<box plot>".to_owned(),
+		reason: "Box Plot has no producer; seven explicit Tukey fields are required".to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::BoxPlot,
+	};
+	let mut used_by_auto = HashSet::new();
+	let category = resolve_required(
+		Channel::X,
+		&spec.x,
+		PlotType::BoxPlot,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let median = resolve_required(
+		Channel::Y,
+		&spec.y,
+		PlotType::BoxPlot,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	for (role, field) in [
+		("whisker_low", &fields.whisker_low),
+		("q1", &fields.q1),
+		("q3", &fields.q3),
+		("whisker_high", &fields.whisker_high),
+		("outlier", &fields.outlier),
+	] {
+		let dtype = schema.get(field.as_str()).ok_or_else(|| ChannelError {
+			channel: Channel::Y,
+			field: field.clone(),
+			reason: format!("box {role} field is absent from the returned schema"),
+		})?;
+		if !matches!(semantic_type(dtype), Some(SemanticType::Quantitative)) {
+			return Err(ChannelError {
+				channel: Channel::Y,
+				field: field.clone(),
+				reason: format!("box {role} requires a quantitative dtype, got {dtype:?}"),
+			});
+		}
+	}
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![category.clone(), median.clone()],
+		kernel_fields: Box::new(ResolvedKernelFields::BoxPlot {
+			category: fields.category.clone(),
+			whisker_low: fields.whisker_low.clone(),
+			q1: fields.q1.clone(),
+			median: fields.median.clone(),
+			q3: fields.q3.clone(),
+			whisker_high: fields.whisker_high.clone(),
+			outlier: fields.outlier.clone(),
 		}),
 		color_job: None,
 		categorical_limit: 0,
@@ -2315,6 +2441,10 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		}
 		(PlotType::StackedArea, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Histogram, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::BoxPlot, Channel::X) => {
+			matches!(semantic, SemanticType::Nominal | SemanticType::Ordinal)
+		}
+		(PlotType::BoxPlot, Channel::Y) => semantic == SemanticType::Quantitative,
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -2328,7 +2458,9 @@ fn default_scale(plot_type: PlotType, channel: Channel, semantic: SemanticType) 
 		};
 	}
 	match semantic {
-		SemanticType::Nominal | SemanticType::Ordinal if plot_type == PlotType::Bar => {
+		SemanticType::Nominal | SemanticType::Ordinal
+			if matches!(plot_type, PlotType::Bar | PlotType::BoxPlot) =>
+		{
 			ScaleFamily::Band
 		}
 		SemanticType::Nominal | SemanticType::Ordinal => ScaleFamily::Point,

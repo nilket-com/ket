@@ -140,6 +140,30 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 	{
 		prepare_histogram_data(data, bin_start, bin_end, count)?;
 	}
+	if let crate::plot::spec::ResolvedKernelFields::BoxPlot {
+		category,
+		whisker_low,
+		q1,
+		median,
+		q3,
+		whisker_high,
+		outlier,
+	} = spec.kernel_fields.as_ref()
+	{
+		crate::plot::kernels::boxplot::prepare_box_plot_data(
+			data,
+			&crate::plot::spec::BoxPlotFields {
+				category: category.clone(),
+				whisker_low: whisker_low.clone(),
+				q1: q1.clone(),
+				median: median.clone(),
+				q3: q3.clone(),
+				whisker_high: whisker_high.clone(),
+				outlier: outlier.clone(),
+			},
+		)
+		.map_err(|error| error.to_string())?;
+	}
 	Ok(())
 }
 
@@ -166,6 +190,13 @@ fn project_named_channels(
 		&& !fields.contains(&end)
 	{
 		fields.push(end);
+	}
+	if let Some(box_fields) = spec.box_plot_fields() {
+		for field in box_fields.all() {
+			if !fields.contains(&field) {
+				fields.push(field);
+			}
+		}
 	}
 	let projected = data
 		.select(fields)
@@ -293,6 +324,66 @@ mod tests {
 			channel.binding.channel != crate::plot::spec::Channel::Color
 				&& channel.colors.is_empty()
 		}));
+	}
+
+	#[test]
+	fn product_0082_box_keeps_identity_and_projects_all_seven_fields() {
+		let selection = CategoricalPaletteSelection::from_theme_name("viridis").unwrap();
+		let categorical = polars::df!("category" => ["a", "b"], "value" => [1.0, 2.0]).unwrap();
+		let (_, identity) = plan_with_categorical_palette(
+			PlotRequest {
+				source: materialized("categorical", categorical),
+				authored_spec: AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::Bar),
+					"category",
+					"value",
+				),
+			},
+			&selection,
+			&ColorIdentity::default(),
+		)
+		.unwrap();
+		let fields = crate::plot::spec::BoxPlotFields {
+			category: "group".into(),
+			whisker_low: "lo".into(),
+			q1: "p25".into(),
+			median: "mid".into(),
+			q3: "p75".into(),
+			whisker_high: "hi".into(),
+			outlier: "point".into(),
+		};
+		let frame = polars::df!(
+			"unused" => [99_i32],
+			"group" => ["A"],
+			"lo" => [0_i32],
+			"p25" => [1.0_f32],
+			"mid" => [2_i64],
+			"p75" => [3.0_f64],
+			"hi" => [4_u32],
+			"point" => [None::<f64>],
+		)
+		.unwrap();
+		let (resolved, after) = plan_with_categorical_palette(
+			PlotRequest {
+				source: materialized("box", frame),
+				authored_spec: AuthoredPlotSpec::box_plot(fields),
+			},
+			&selection,
+			&identity,
+		)
+		.unwrap();
+		assert_eq!(after, identity);
+		assert_eq!(
+			resolved
+				.data
+				.get_column_names()
+				.iter()
+				.map(|name| name.as_str())
+				.collect::<Vec<_>>(),
+			["group", "mid", "lo", "p25", "p75", "hi", "point"]
+		);
+		assert!(resolved.resolved_spec.band_fills.is_empty());
+		assert!(resolved.resolved_spec.channel(Channel::Color).is_none());
 	}
 
 	#[test]

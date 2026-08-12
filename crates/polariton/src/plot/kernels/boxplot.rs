@@ -2,10 +2,12 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label,
 };
-use crate::plot::kernels::boxplot_tukey::{TukeyBox, TukeyBoxes};
+use crate::plot::kernels::boxplot_tukey::{TukeyBox, TukeyBoxRow, TukeyBoxes, TukeyBoxesError};
+use crate::plot::spec::BoxPlotFields;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Point, Rectangle};
+use polars::prelude::{AnyValue, DataFrame};
 use std::sync::Arc;
 
 const OUTLIER_RADIUS: f32 = 3.0;
@@ -79,8 +81,7 @@ impl PlotKernel for BoxPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_cats = self.prepared_data.boxes.categories().len();
-		for (i, (category, stats)) in self.prepared_data.boxes.iter().enumerate() {
+		for (category, stats) in self.prepared_data.boxes.iter() {
 			let Some(shared_index) = transform.category_index(category) else {
 				continue;
 			};
@@ -88,13 +89,7 @@ impl PlotKernel for BoxPlotKernel {
 			let box_width = band_width * 0.6;
 			let left = center.x - box_width / 2.0;
 			let right = center.x + box_width / 2.0;
-			let t = if num_cats > 1 {
-				i as f32 / (num_cats - 1) as f32
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(t);
-			let color_iced = color;
+			let color_iced = settings.mark_style.fill.iced();
 			let line_color = settings.mark_style.decoration.iced();
 			let (q1_px, _) = transform.categorical(shared_index, stats.q1());
 			let (q3_px, _) = transform.categorical(shared_index, stats.q3());
@@ -224,12 +219,9 @@ impl PlotKernel for BoxPlotKernel {
 
 	fn legend_content(
 		&self,
-		settings: &ResolvedPlotSettings,
+		_settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
-			self.prepared_data.boxes.categories().iter().cloned(),
-			settings,
-		)
+		None
 	}
 
 	fn x_label(&self) -> String {
@@ -260,6 +252,210 @@ impl BoxPlotPreparedData {
 			y_label,
 		}
 	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BoxPlotFieldRole {
+	Category,
+	WhiskerLow,
+	Q1,
+	Median,
+	Q3,
+	WhiskerHigh,
+	Outlier,
+}
+
+impl BoxPlotFieldRole {
+	pub const fn name(self) -> &'static str {
+		match self {
+			Self::Category => "category",
+			Self::WhiskerLow => "whisker_low",
+			Self::Q1 => "q1",
+			Self::Median => "median",
+			Self::Q3 => "q3",
+			Self::WhiskerHigh => "whisker_high",
+			Self::Outlier => "outlier",
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BoxPlotPreparationError {
+	Field {
+		role: BoxPlotFieldRole,
+		row: usize,
+		value: String,
+		reason: &'static str,
+	},
+	Shape(TukeyBoxesError),
+}
+
+impl BoxPlotPreparationError {
+	pub fn field_role(&self) -> Option<BoxPlotFieldRole> {
+		match self {
+			Self::Field { role, .. } => Some(*role),
+			Self::Shape(TukeyBoxesError::NonFiniteSummary { field, .. }) => match *field {
+				"whisker_low" => Some(BoxPlotFieldRole::WhiskerLow),
+				"q1" => Some(BoxPlotFieldRole::Q1),
+				"median" => Some(BoxPlotFieldRole::Median),
+				"q3" => Some(BoxPlotFieldRole::Q3),
+				"whisker_high" => Some(BoxPlotFieldRole::WhiskerHigh),
+				_ => None,
+			},
+			Self::Shape(TukeyBoxesError::NonFiniteOutlier { .. }) => {
+				Some(BoxPlotFieldRole::Outlier)
+			}
+			Self::Shape(_) => None,
+		}
+	}
+}
+
+impl std::fmt::Display for BoxPlotPreparationError {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Field {
+				role,
+				row,
+				value,
+				reason,
+			} => write!(
+				formatter,
+				"box {} at row {} has value `{value}`: {reason}",
+				role.name(),
+				row + 1
+			),
+			Self::Shape(error) => error.fmt(formatter),
+		}
+	}
+}
+
+impl std::error::Error for BoxPlotPreparationError {}
+
+pub fn prepare_box_plot_data(
+	df: &DataFrame,
+	fields: &BoxPlotFields,
+) -> Result<BoxPlotPreparedData, BoxPlotPreparationError> {
+	let columns = fields
+		.all()
+		.map(|field| df.column(field).expect("resolved box field is present"));
+	let mut rows = Vec::with_capacity(df.height());
+	for row in 0..df.height() {
+		let category_value = columns[0].get(row).expect("row is in bounds");
+		if matches!(category_value, AnyValue::Null) {
+			return Err(BoxPlotPreparationError::Field {
+				role: BoxPlotFieldRole::Category,
+				row,
+				value: "null".to_owned(),
+				reason: "category must be non-null",
+			});
+		}
+		let category = match category_value {
+			AnyValue::String(value) => value.to_owned(),
+			AnyValue::StringOwned(value) => value.as_str().to_owned(),
+			other => other.to_string(),
+		};
+		let numeric = |index: usize, role: BoxPlotFieldRole| {
+			exact_f64(
+				columns[index].get(row).expect("row is in bounds"),
+				role,
+				row,
+			)
+		};
+		let whisker_low = numeric(1, BoxPlotFieldRole::WhiskerLow)?;
+		let q1 = numeric(2, BoxPlotFieldRole::Q1)?;
+		let median = numeric(3, BoxPlotFieldRole::Median)?;
+		let q3 = numeric(4, BoxPlotFieldRole::Q3)?;
+		let whisker_high = numeric(5, BoxPlotFieldRole::WhiskerHigh)?;
+		let outlier_value = columns[6].get(row).expect("row is in bounds");
+		let outlier = if matches!(outlier_value, AnyValue::Null) {
+			None
+		} else {
+			Some(exact_f64(outlier_value, BoxPlotFieldRole::Outlier, row)?)
+		};
+		rows.push(TukeyBoxRow {
+			category,
+			whisker_low,
+			q1,
+			median,
+			q3,
+			whisker_high,
+			outlier,
+		});
+	}
+	let boxes = TukeyBoxes::new(rows).map_err(BoxPlotPreparationError::Shape)?;
+	Ok(BoxPlotPreparedData::new(
+		boxes,
+		AxisType::Linear,
+		fields.category.clone(),
+		String::new(),
+	))
+}
+
+fn exact_f64(
+	value: AnyValue<'_>,
+	role: BoxPlotFieldRole,
+	row: usize,
+) -> Result<f64, BoxPlotPreparationError> {
+	let original = value.to_string();
+	let converted = match value {
+		AnyValue::Int8(value) => exact_signed(value as i128),
+		AnyValue::Int16(value) => exact_signed(value as i128),
+		AnyValue::Int32(value) => exact_signed(value as i128),
+		AnyValue::Int64(value) => exact_signed(value as i128),
+		AnyValue::Int128(value) => exact_signed(value),
+		AnyValue::UInt8(value) => exact_unsigned(value as u128),
+		AnyValue::UInt16(value) => exact_unsigned(value as u128),
+		AnyValue::UInt32(value) => exact_unsigned(value as u128),
+		AnyValue::UInt64(value) => exact_unsigned(value as u128),
+		AnyValue::UInt128(value) => exact_unsigned(value),
+		AnyValue::Float16(value) => Some(f32::from(value) as f64),
+		AnyValue::Float32(value) => Some(value as f64),
+		AnyValue::Float64(value) => Some(value),
+		AnyValue::Decimal(value, _precision, scale) => exact_decimal(value, scale),
+		AnyValue::Null => None,
+		_ => None,
+	};
+	converted.ok_or(BoxPlotPreparationError::Field {
+		role,
+		row,
+		value: original,
+		reason: if matches!(value, AnyValue::Null) {
+			"summary value must be non-null"
+		} else {
+			"value cannot round-trip through f64 exactly"
+		},
+	})
+}
+
+fn exact_signed(value: i128) -> Option<f64> {
+	let converted = value as f64;
+	(integer_magnitude_is_exact(value.unsigned_abs()) && converted.is_finite()).then_some(converted)
+}
+
+fn exact_unsigned(value: u128) -> Option<f64> {
+	let converted = value as f64;
+	(integer_magnitude_is_exact(value) && converted.is_finite()).then_some(converted)
+}
+
+fn exact_decimal(value: i128, scale: usize) -> Option<f64> {
+	let scale_u32 = u32::try_from(scale).ok()?;
+	let scale_i32 = i32::try_from(scale).ok()?;
+	let five = 5_i128.checked_pow(scale_u32)?;
+	if value % five != 0 {
+		return None;
+	}
+	let numerator = value / five;
+	let converted = numerator as f64 / 2_f64.powi(scale_i32);
+	(integer_magnitude_is_exact(numerator.unsigned_abs()) && converted.is_finite())
+		.then_some(converted)
+}
+
+fn integer_magnitude_is_exact(value: u128) -> bool {
+	if value == 0 {
+		return true;
+	}
+	let significant_bits = u128::BITS - value.leading_zeros() - value.trailing_zeros();
+	significant_bits <= f64::MANTISSA_DIGITS
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -322,6 +518,7 @@ mod tests {
 	use crate::plot::common::PathBuilder;
 	use crate::plot::kernels::boxplot_tukey::TukeyBoxRow;
 	use iced::{Color, Size, Vector};
+	use polars::df;
 
 	const BANKED_PRE_TUKEY_HOVER: &str = "A\nMax: 4\nQ3: 3\nMedian: 2\nQ1: 1\nMin: 0";
 
@@ -686,5 +883,110 @@ mod tests {
 				);
 			}
 		}
+	}
+
+	fn aliased_fields() -> BoxPlotFields {
+		BoxPlotFields {
+			category: "group".to_owned(),
+			whisker_low: "lo".to_owned(),
+			q1: "p25".to_owned(),
+			median: "mid".to_owned(),
+			q3: "p75".to_owned(),
+			whisker_high: "hi".to_owned(),
+			outlier: "point".to_owned(),
+		}
+	}
+
+	#[test]
+	fn product_0082_positional_ingestion_accepts_both_outlier_shapes_and_mixed_dtypes() {
+		let data = df!(
+			"group" => ["none", "all"],
+			"lo" => [0_i32, 10],
+			"p25" => [1.0_f32, 11.0],
+			"mid" => [2_i64, 12],
+			"p75" => [3.0_f64, 13.0],
+			"hi" => [4_u32, 14],
+			"point" => [None, Some(20.0_f64)],
+		)
+		.unwrap();
+		let prepared = prepare_box_plot_data(&data, &aliased_fields()).expect("valid box relation");
+		assert_eq!(prepared.boxes.categories(), ["none", "all"]);
+		assert!(
+			prepared
+				.boxes
+				.iter()
+				.next()
+				.unwrap()
+				.1
+				.outliers()
+				.is_empty()
+		);
+		assert_eq!(prepared.boxes.iter().nth(1).unwrap().1.outliers(), [20.0]);
+		assert_eq!(prepared.x_label, "group");
+		assert_eq!(prepared.y_label, "");
+		assert_eq!(prepared.y_axis_type, AxisType::Linear);
+	}
+
+	#[test]
+	fn product_0082_lossless_integer_boundary_is_representability_not_magnitude() {
+		let make = |value: i64| {
+			df!(
+				"group" => ["exact"],
+				"lo" => [value],
+				"p25" => [value],
+				"mid" => [value],
+				"p75" => [value],
+				"hi" => [value],
+				"point" => [None::<i64>],
+			)
+			.unwrap()
+		};
+		for value in [9_007_199_254_740_992_i64, 9_007_199_254_740_994_i64] {
+			let prepared = prepare_box_plot_data(&make(value), &aliased_fields()).unwrap();
+			assert_eq!(
+				prepared.boxes.iter().next().unwrap().1.median(),
+				value as f64
+			);
+		}
+		let error = match prepare_box_plot_data(&make(9_007_199_254_740_993_i64), &aliased_fields())
+		{
+			Ok(_) => panic!("inexact integer was accepted"),
+			Err(error) => error,
+		};
+		assert!(matches!(
+			error,
+			BoxPlotPreparationError::Field {
+				role: BoxPlotFieldRole::WhiskerLow,
+				row: 0,
+				ref value,
+				..
+			} if value == "9007199254740993"
+		));
+	}
+
+	#[test]
+	fn product_0082_box_fill_is_one_resolved_role_and_legend_is_absent() {
+		let kernel = make_kernel(vec![row("A", None), row("B", None), row("C", None)]);
+		let settings = ResolvedPlotSettings {
+			mark_style: PlotMarkStyle::legacy_from_iced(
+				Color::from_rgb(0.1, 0.2, 0.3),
+				Color::from_rgb(0.7, 0.4, 0.2),
+			),
+			..ResolvedPlotSettings::default()
+		};
+		let expected = settings.mark_style.fill.iced();
+		let rendered = render(
+			&kernel,
+			settings.clone(),
+			Rectangle::new(Point::ORIGIN, Size::new(300.0, 200.0)),
+		);
+		assert_eq!(rendered.filled_rectangles.len(), 3);
+		assert!(
+			rendered
+				.filled_rectangles
+				.iter()
+				.all(|entry| entry.2 == expected)
+		);
+		assert_eq!(kernel.legend_content(&settings), None);
 	}
 }

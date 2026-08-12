@@ -23,6 +23,7 @@ const PRESENTATION_PREFIX: &str = "polariton_presentation";
 const PRESENTATION_FREE: &[&str] = &[
 	"area",
 	"bar",
+	"box",
 	"facet",
 	"figure",
 	"histogram",
@@ -491,6 +492,13 @@ fn static_method_on_relation(
 			},
 		);
 	}
+	if method == "box" {
+		return invalid_view(
+			call.span(),
+			source.len(),
+			"box is a sink inside .views([...]); relation.box(...) sugar is not available",
+		);
+	}
 	if method == "table" && args.is_empty() {
 		return Ok(Some(StaticProvenance::ViewSet {
 			relation,
@@ -610,6 +618,13 @@ fn recognize_legacy_root(
 	};
 	let callee = source_slice(source, call.expr.span())?.trim();
 	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
+	if !shadows.plot && callee == "plot.box" {
+		return invalid_view(
+			call.span(),
+			source.len(),
+			"legacy plot.box(relation, ...) is not available; use relation.views([box(...)])",
+		);
+	}
 	if !shadows.plot
 		&& matches!(
 			callee,
@@ -1249,10 +1264,31 @@ fn rewrite_calls_mapped(
 			replacement,
 			owner: u32_range(&(origin_start..origin_end), "presentation call origin")?,
 		});
-		let insertion = if open.span.end == close.span.start {
-			format!("{origin_start}, {origin_end}")
+		let injected_origins = if !is_method && name == "box" {
+			let arguments =
+				call_argument_ranges(fragment, original_start, &tokens, open_index, close_index)?;
+			if arguments.len() != 7 {
+				String::new()
+			} else {
+				arguments
+					.into_iter()
+					.flat_map(|span| [span.start, span.end])
+					.map(|value| value.to_string())
+					.collect::<Vec<_>>()
+					.join(", ")
+			}
 		} else {
-			format!(", {origin_start}, {origin_end}")
+			String::new()
+		};
+		let mut injected = injected_origins;
+		if !injected.is_empty() {
+			injected.push_str(", ");
+		}
+		injected.push_str(&format!("{origin_start}, {origin_end}"));
+		let insertion = if open.span.end == close.span.start {
+			injected
+		} else {
+			format!(", {injected}")
 		};
 		edits.push(Edit {
 			span: (close.span.start - original_start)..(close.span.start - original_start),
@@ -1286,6 +1322,61 @@ fn rewrite_calls_mapped(
 		source: builder.source,
 		segments: builder.segments,
 	})
+}
+
+fn call_argument_ranges(
+	fragment: &str,
+	original_start: usize,
+	tokens: &[LexToken],
+	open: usize,
+	close: usize,
+) -> Result<Vec<Range<usize>>, RuneEnvelopeError> {
+	let mut ranges = Vec::new();
+	let mut start = tokens[open].span.end;
+	let mut parens = 0usize;
+	let mut brackets = 0usize;
+	let mut braces = 0usize;
+	for token in &tokens[open + 1..close] {
+		match token.kind {
+			LexKind::Punct('(') => parens += 1,
+			LexKind::Punct(')') => parens = parens.saturating_sub(1),
+			LexKind::Punct('[') => brackets += 1,
+			LexKind::Punct(']') => brackets = brackets.saturating_sub(1),
+			LexKind::Punct('{') => braces += 1,
+			LexKind::Punct('}') => braces = braces.saturating_sub(1),
+			LexKind::Punct(',') if parens == 0 && brackets == 0 && braces == 0 => {
+				ranges.push(trim_original_range(
+					fragment,
+					original_start,
+					start..token.span.start,
+				)?);
+				start = token.span.end;
+			}
+			_ => {}
+		}
+	}
+	if start < tokens[close].span.start {
+		ranges.push(trim_original_range(
+			fragment,
+			original_start,
+			start..tokens[close].span.start,
+		)?);
+	}
+	Ok(ranges)
+}
+
+fn trim_original_range(
+	fragment: &str,
+	original_start: usize,
+	span: Range<usize>,
+) -> Result<Range<usize>, RuneEnvelopeError> {
+	let local = span.start.saturating_sub(original_start)..span.end.saturating_sub(original_start);
+	let value = fragment
+		.get(local.clone())
+		.ok_or_else(|| RuneEnvelopeError::Invalid("box argument span is not UTF-8".to_owned()))?;
+	let leading = value.len() - value.trim_start().len();
+	let trailing = value.len() - value.trim_end().len();
+	Ok(span.start + leading..span.end - trailing)
 }
 
 fn matching_paren(tokens: &[LexToken], open: usize) -> Option<usize> {
@@ -1582,6 +1673,88 @@ mod tests {
 			rewritten,
 			"polariton_presentation::__bar(\"x\", \"y\", 100, 113).__stacked(113, 123).__percent(123, 133)"
 		);
+	}
+
+	#[test]
+	fn product_0082_box_rewriter_retains_seven_argument_origins() {
+		let source = "box(\"cat\", \"lo\", \"p25\", \"mid\", \"p75\", \"hi\", \"out\")";
+		let rewritten = rewrite_calls(source, 100).expect("rewrite box call");
+		assert_eq!(
+			rewritten,
+			"polariton_presentation::__box(\"cat\", \"lo\", \"p25\", \"mid\", \"p75\", \"hi\", \"out\", 104, 109, 111, 115, 117, 122, 124, 129, 131, 136, 138, 142, 144, 149, 100, 150)"
+		);
+	}
+
+	#[test]
+	fn product_0082_box_surface_positions_are_closed_and_originated() {
+		let fields = "\"cat\", \"lo\", \"p25\", \"mid\", \"p75\", \"hi\", \"out\"";
+		for slot in [
+			format!("box({fields})"),
+			format!("view(\"named\", box({fields}))"),
+			format!("view(\"named\", figure([box({fields})]))"),
+			format!("figure([box({fields})])"),
+		] {
+			let source = format!(
+				"let relation = workspace.table(\"box_probe\");\nrelation.views([{slot}]);"
+			);
+			let compiled = compile(&source).unwrap_or_else(|error| panic!("{slot}: {error}"));
+			let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+				panic!("box surface produced a table")
+			};
+			let sink = match &plot.body {
+				RunePlotBody::Single(sink) => sink,
+				RunePlotBody::StyledSingle(styled) => &styled.sink,
+				RunePlotBody::Layered(_) => panic!("box surface produced layers"),
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::BoxPlot
+			);
+			assert_eq!(sink.box_plot_fields.as_ref().unwrap().q1, "p25");
+			let origins = sink.box_plot_origins.as_ref().expect("seven origins");
+			assert_eq!(
+				&source[origins.q1.start as usize..origins.q1.end as usize],
+				"\"p25\""
+			);
+		}
+
+		for source in [
+			format!("let r = workspace.table(\"box_probe\"); r.views([layers([box({fields})])]);"),
+			format!("plot.box(workspace.table(\"box_probe\"), {fields});"),
+			format!("workspace.table(\"box_probe\").box({fields});"),
+			format!(
+				"let r = workspace.table(\"box_probe\"); r.views([box({fields}).bar_width(0.8)]);"
+			),
+			format!(
+				"let r = workspace.table(\"box_probe\"); r.views([box({fields}).category_gap(0.1)]);"
+			),
+		] {
+			assert!(
+				compile(&source).is_err(),
+				"accepted forbidden surface: {source}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0082_test26_is_the_real_five_case_exhibit() {
+		let source = include_str!("../../../uat/test26.rn");
+		let compiled = compile(source).expect("the checked-in box exhibit compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(compiled.executions[0].views.len(), 1);
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("box exhibit produced a table")
+		};
+		let RunePlotBody::Single(sink) = &plot.body else {
+			panic!("box exhibit did not retain one standalone mark")
+		};
+		assert_eq!(
+			sink.composition.primary_plot_type(),
+			crate::plot::core::PlotType::BoxPlot
+		);
+		for case in ["twin", "lowhigh", "none", "flat", "single"] {
+			assert!(source.contains(case), "exhibit omits {case}");
+		}
 	}
 
 	#[test]

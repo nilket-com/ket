@@ -78,7 +78,7 @@ fn render(kernel: &dyn PlotKernel) -> Vec<BankOperation> {
 }
 
 #[test]
-fn product_0080_five_kernel_default_operation_bank_is_unchanged_and_roles_are_distinct() {
+fn product_0080_0082_default_operation_bank_changes_only_the_box_body_fill() {
 	let settings = ResolvedPlotSettings::default();
 	let ink = Color::WHITE;
 	let translucent_ink = Color { a: 0.2, ..ink };
@@ -132,7 +132,7 @@ fn product_0080_five_kernel_default_operation_bank_is_unchanged_and_roles_are_di
 	assert_eq!(
 		render(&boxplot),
 		vec![
-			BankOperation::FillRectangle(midpoint),
+			BankOperation::FillRectangle(settings.mark_style.fill.iced()),
 			BankOperation::Stroke(ink, 1.0_f32.to_bits()),
 			BankOperation::Stroke(ink, 3.5_f32.to_bits()),
 			BankOperation::Stroke(ink, 1.0_f32.to_bits()),
