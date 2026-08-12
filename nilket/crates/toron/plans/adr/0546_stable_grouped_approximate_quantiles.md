@@ -1,6 +1,7 @@
 # ADR 546 - Stable grouped approximate quantiles
 
-**Status:** Proposed 2026-08-10.
+**Status:** Accepted and implemented 2026-08-11. Consumes Wendelon ADR 83's
+aggregate quantile core, which landed in the same cut.
 
 `APPROX_QUANTILE` appears to exist throughout Toron: it has an
 `AggregateFunction` variant, SQL lowering, a Rune binding, binder arms, output
@@ -298,8 +299,8 @@ quantile, `MEDIAN` alias, or window-function form enters this record.
 4. **Compaction oracle.** An input much larger than the compaction threshold
    forces compaction. The answer's rank in the exact sorted population is within
    ADR 83's declared bound plus the single-rank discretization allowance. The
-   bound is quoted from ADR 83, not restated here; this item becomes executable
-   when ADR 83 selects ε from its priced Stage 0 table. The test asserts no
+   bound is quoted from ADR 83, not restated here; ADR 83 selected ε = 1% from
+   its priced Stage 0 table, so this item is executable. The test asserts no
    value-distance bound and proves compaction occurred. Ordered inputs are
    included: ascending and descending arrival are the orderings that falsified
    the previous substrate.

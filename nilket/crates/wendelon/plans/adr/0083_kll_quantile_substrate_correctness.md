@@ -1,6 +1,9 @@
 # ADR 83 - Quantile sketch substrate correctness
 
-**Status:** Proposed 2026-08-11. Blocks Toron ADR 546.
+**Status:** Partially implemented 2026-08-11. The aggregate quantile core is
+implemented and in use by Toron ADR 546, which is no longer blocked. The CSB
+storage-migration half — v2 payload, mixed-fleet fence, rebuild driver, and v2's
+own confidence scope — remains open, so this record is not sealed.
 
 ## Evidence that forced the decision
 

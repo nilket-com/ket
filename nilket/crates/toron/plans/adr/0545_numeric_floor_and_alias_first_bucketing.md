@@ -1,6 +1,6 @@
 # ADR 545 - Numeric `FLOOR` and alias-first bucketing
 
-**Status:** Proposed 2026-08-10.
+**Status:** Accepted and implemented 2026-08-11.
 
 Polariton's next plotting candidates exposed a database boundary rather than a
 missing renderer. A histogram is a bar plot over a relation of interval starts,
