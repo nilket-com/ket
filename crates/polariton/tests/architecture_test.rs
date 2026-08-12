@@ -2377,3 +2377,48 @@ fn product_0078_histogram_keeps_one_interval_authority_after_the_0079_surface() 
 		"PRODUCT-0079 must add only the explicit three-field producer"
 	);
 }
+
+#[test]
+fn product_0081_box_plot_keeps_one_tukey_authority_and_no_raw_producer() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let boxplot = std::fs::read_to_string(root.join("plot/kernels/boxplot.rs"))
+		.expect("read box plot kernel");
+	let tukey = std::fs::read_to_string(root.join("plot/kernels/boxplot_tukey.rs"))
+		.expect("read validated Tukey substrate");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+
+	assert!(
+		!boxplot.contains("prepare_box_plot_data")
+			&& !factory.contains("ResolvedKernelFields::BoxPlot")
+			&& !factory.contains("prepare_box_plot_data"),
+		"PRODUCT-0081 must remove the renderer's raw-value statistical authority"
+	);
+	let resolved_fields = spec
+		.split("pub enum ResolvedKernelFields")
+		.nth(1)
+		.expect("resolved kernel vocabulary")
+		.split("pub struct ResolvedLayout")
+		.next()
+		.expect("bounded resolved kernel vocabulary");
+	assert!(
+		!resolved_fields.contains("BoxPlot"),
+		"producerless BoxPlot must not retain resolved raw fields"
+	);
+	assert!(
+		spec.contains("Box Plot has no producer; explicit Tukey summary fields are required"),
+		"automatic BoxPlot resolution must remain a typed producerless refusal"
+	);
+	for retired in ["pub min:", "pub max:", "stats.min", "stats.max"] {
+		assert!(
+			!boxplot.contains(retired) && !tukey.contains(retired),
+			"PRODUCT-0081 retains silently redefined extrema vocabulary: {retired}"
+		);
+	}
+	assert!(
+		boxplot.contains("settings.mark_style.fill.iced()")
+			&& boxplot.contains("settings.mark_style.decoration.iced()")
+			&& tukey.contains("pub fn new(rows: Vec<TukeyBoxRow>)"),
+		"validated Tukey rows and resolved outlier roles must be the surviving substrate"
+	);
+}

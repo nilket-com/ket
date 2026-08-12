@@ -2599,7 +2599,8 @@ mod tests {
 
 	#[test]
 	fn product_0065_box_and_violin_address_shared_slots_by_category_identity() {
-		use crate::plot::kernels::boxplot::{BoxPlotKernel, prepare_box_plot_data};
+		use crate::plot::kernels::boxplot::{BoxPlotKernel, BoxPlotPreparedData};
+		use crate::plot::kernels::boxplot_tukey::{TukeyBoxRow, TukeyBoxes};
 		use crate::plot::kernels::violin::{ViolinPlotKernel, prepare_violin_data};
 
 		let data = df!(
@@ -2611,8 +2612,33 @@ mod tests {
 		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(300.0, 180.0));
 		let settings = ResolvedPlotSettings::default();
 
-		let box_prepared = Arc::new(prepare_box_plot_data(&data, "category", "value"));
-		assert_eq!(box_prepared.categories, ["X", "Z"]);
+		let box_prepared = Arc::new(BoxPlotPreparedData::new(
+			TukeyBoxes::new(vec![
+				TukeyBoxRow {
+					category: "X".to_owned(),
+					whisker_low: 1.0,
+					q1: 2.0,
+					median: 2.5,
+					q3: 3.0,
+					whisker_high: 4.0,
+					outlier: None,
+				},
+				TukeyBoxRow {
+					category: "Z".to_owned(),
+					whisker_low: 5.0,
+					q1: 6.0,
+					median: 6.5,
+					q3: 7.0,
+					whisker_high: 8.0,
+					outlier: None,
+				},
+			])
+			.expect("valid Tukey boxes"),
+			AxisType::Linear,
+			"category".to_owned(),
+			"value".to_owned(),
+		));
+		assert_eq!(box_prepared.boxes.categories(), ["X", "Z"]);
 		let box_layout = PlotLayout::CategoricalX {
 			categories: shared_categories.clone(),
 			y_range: box_prepared.y_range,
@@ -2636,7 +2662,7 @@ mod tests {
 			box_transform.categorical(2, 0.0).0.x,
 			"Z box leaves Y's shared slot empty"
 		);
-		let z_box_center = box_transform.categorical(2, box_prepared.stats[1].median).0;
+		let z_box_center = box_transform.categorical(2, 6.5).0;
 		assert!(
 			box_kernel
 				.hover(&box_transform, Cursor::Available(z_box_center))

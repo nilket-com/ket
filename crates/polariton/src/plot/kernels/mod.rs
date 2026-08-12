@@ -1,5 +1,10 @@
 pub mod bar;
+// PRODUCT-0081 preserves the validated renderer substrate while its authored
+// producer is deliberately absent until the box-plot surface record.
+#[allow(dead_code)]
 pub mod boxplot;
+#[allow(dead_code)]
+pub mod boxplot_tukey;
 pub mod bubble;
 pub mod candlestick;
 pub mod fill_between;

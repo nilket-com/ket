@@ -998,10 +998,6 @@ pub enum ResolvedKernelFields {
 		category: Option<String>,
 		value: String,
 	},
-	BoxPlot {
-		category: Option<String>,
-		value: String,
-	},
 	Bubble {
 		x: String,
 		y: String,
@@ -2065,10 +2061,14 @@ fn resolve_automatic_kernel_fields(
 			category: optional_category(0),
 			value: number(0, "value")?,
 		},
-		PlotType::BoxPlot => ResolvedKernelFields::BoxPlot {
-			category: optional_category(0),
-			value: number(0, "value")?,
-		},
+		PlotType::BoxPlot => {
+			return Err(ChannelError {
+				channel: Channel::Y,
+				field: "<box plot>".to_owned(),
+				reason: "Box Plot has no producer; explicit Tukey summary fields are required"
+					.to_owned(),
+			});
+		}
 		PlotType::Histogram => {
 			return Err(ChannelError {
 				channel: Channel::X,
@@ -2838,6 +2838,24 @@ mod tests {
 			error
 				.reason
 				.contains("explicit interval fields are required")
+		);
+	}
+
+	#[test]
+	fn product_0081_automatic_box_plot_resolution_names_the_missing_producer() {
+		let frame = df!(
+			"category" => ["A", "B"],
+			"value" => [1.0_f64, 2.0]
+		)
+		.expect("box plot schema fixture");
+		let error = resolve_automatic_kernel_fields(PlotType::BoxPlot, frame.schema().as_ref())
+			.expect_err("box plot has no automatic raw-value producer");
+		assert_eq!(error.field, "<box plot>");
+		assert!(error.reason.contains("Box Plot has no producer"));
+		assert!(
+			error
+				.reason
+				.contains("explicit Tukey summary fields are required")
 		);
 	}
 

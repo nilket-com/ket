@@ -1,7 +1,8 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, ResolvedPlotSettings,
 };
-use crate::plot::kernels::boxplot::{BoxPlotKernel, BoxPlotPreparedData, BoxStats};
+use crate::plot::kernels::boxplot::{BoxPlotKernel, BoxPlotPreparedData};
+use crate::plot::kernels::boxplot_tukey::{TukeyBoxRow, TukeyBoxes};
 use crate::plot::kernels::candlestick::{CandlestickPlotKernel, CandlestickPreparedData};
 use crate::plot::kernels::funnel::{FunnelPlotKernel, FunnelPreparedData};
 use crate::plot::kernels::stacked_area::{StackedAreaPlotKernel, StackedAreaPreparedData};
@@ -112,14 +113,16 @@ fn product_0080_five_kernel_default_operation_bank_is_unchanged_and_roles_are_di
 
 	let boxplot = BoxPlotKernel {
 		prepared_data: Arc::new(BoxPlotPreparedData {
-			categories: vec!["A".to_owned()],
-			stats: vec![BoxStats {
-				min: 0.0,
+			boxes: TukeyBoxes::new(vec![TukeyBoxRow {
+				category: "A".to_owned(),
+				whisker_low: 0.0,
 				q1: 1.0,
 				median: 2.0,
 				q3: 3.0,
-				max: 4.0,
-			}],
+				whisker_high: 4.0,
+				outlier: None,
+			}])
+			.expect("valid coincident Tukey box"),
 			y_range: (0.0, 4.0),
 			y_axis_type: AxisType::Linear,
 			x_label: String::new(),

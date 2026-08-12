@@ -1,7 +1,6 @@
 use crate::plot::common::{Orientation, PlotKernel, polars_type_to_axis_type};
 use crate::plot::core::PlotType;
 use crate::plot::kernels::bar::{self, BarPlotKernel};
-use crate::plot::kernels::boxplot::{self, BoxPlotKernel};
 use crate::plot::kernels::bubble::{self, BubblePlotKernel};
 use crate::plot::kernels::candlestick::{self, CandlestickPlotKernel};
 use crate::plot::kernels::fill_between::{self, FillBetweenPlotKernel};
@@ -111,13 +110,6 @@ pub fn create_plot(
 		ResolvedKernelFields::Pie { category, value } => {
 			let prepared = pie::prepare_pie_data(df, category.as_deref().unwrap_or(""), value);
 			Arc::new(PiePlotKernel {
-				prepared_data: Arc::new(prepared),
-			})
-		}
-		ResolvedKernelFields::BoxPlot { category, value } => {
-			let prepared =
-				boxplot::prepare_box_plot_data(df, category.as_deref().unwrap_or(""), value);
-			Arc::new(BoxPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
