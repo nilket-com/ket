@@ -9,8 +9,8 @@
 
 use crate::coordinate::{Cell, Plot, Pt, Rect, Widget};
 use crate::plot::common::{
-	AxisTextVisibility, CoordinateTransformer, PlotBackend, PlotComposite, PlotKernel, PlotLayout,
-	PlotWidget, ResolvedPlotSettings,
+	AxisTextAnchoring, AxisTextVisibility, CoordinateTransformer, PlotBackend, PlotComposite,
+	PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings,
 };
 use crate::plot::factory::{create_plot, create_styled_plot};
 use crate::plot::spec::{
@@ -387,9 +387,24 @@ fn axis_text_visibility(cell: AxisTextCell, cells: &[AxisTextCell]) -> AxisTextV
 			row: cell.position.row,
 			column,
 		});
-	let below = GridPosition {
-		row: cell.position.row.saturating_add(1),
+	let right = cell
+		.position
+		.column
+		.checked_add(1)
+		.map(|column| GridPosition {
+			row: cell.position.row,
+			column,
+		});
+	let above = cell.position.row.checked_sub(1).map(|row| GridPosition {
+		row,
 		column: cell.position.column,
+	});
+	let below = cell.position.row.checked_add(1).map(|row| GridPosition {
+		row,
+		column: cell.position.column,
+	});
+	let occupied = |position: Option<GridPosition>| {
+		position.is_some_and(|position| cells.iter().any(|other| other.position == position))
 	};
 	AxisTextVisibility {
 		y: !cells
@@ -397,7 +412,13 @@ fn axis_text_visibility(cell: AxisTextCell, cells: &[AxisTextCell]) -> AxisTextV
 			.any(|other| Some(other.position) == left && other.y_group == cell.y_group),
 		x: !cells
 			.iter()
-			.any(|other| other.position == below && other.x_group == cell.x_group),
+			.any(|other| Some(other.position) == below && other.x_group == cell.x_group),
+		anchoring: AxisTextAnchoring {
+			x_min: occupied(left),
+			x_max: occupied(right),
+			y_min: occupied(below),
+			y_max: occupied(above),
+		},
 	}
 }
 
@@ -636,10 +657,9 @@ impl PlotComposite for PlotGridKernel {
 				resize_render_suspended: false,
 				layer: crate::plot::common::PlotRenderLayer::Full,
 			};
-			// Edge text deliberately extends out of its occupied slot: into the
-			// shared gutters, or into the vacant below-slot of a partial row.
-			// Keep the backend's composite draw inside a child clip while using
-			// the figure bounds as that clip so the text is not orphaned.
+			// PRODUCT-0077 anchors bound-coincident numeric text inward at an
+			// occupied shared edge. Outer edges and vacant slots deliberately keep
+			// centred text, so use the figure clip rather than orphaning either.
 			backend.with_clip(bounds.into_iced(), &mut |backend| {
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(inner.x(), inner.y()));
@@ -1184,6 +1204,77 @@ mod tests {
 		}
 	}
 
+	#[derive(Clone, Debug)]
+	struct TextOperation {
+		content: String,
+		position: Point,
+		align_x: iced::advanced::text::Alignment,
+		align_y: iced::alignment::Vertical,
+	}
+
+	#[derive(Default)]
+	struct TextBackend {
+		texts: Vec<TextOperation>,
+		translation: iced::Vector,
+	}
+
+	impl PlotBackend for TextBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+
+		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, _color: Color) {}
+
+		fn fill_text(&mut self, text: Text) {
+			self.texts.push(TextOperation {
+				content: text.content,
+				position: text.position + self.translation,
+				align_x: text.align_x,
+				align_y: text.align_y,
+			});
+		}
+
+		fn translate(&mut self, translation: iced::Vector) {
+			self.translation = self.translation + translation;
+		}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			let translation = self.translation;
+			f(self);
+			self.translation = translation;
+		}
+
+		fn with_clip(&mut self, _bounds: IcedRectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
+
+	struct FixedLayoutKernel {
+		layout: PlotLayout,
+	}
+
+	impl PlotKernel for FixedLayoutKernel {
+		fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+			self.layout.clone()
+		}
+
+		fn plot(
+			&self,
+			_backend: &mut dyn PlotBackend,
+			_bounds: IcedRectangle,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+			_settings: ResolvedPlotSettings,
+		) {
+		}
+
+		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+			None
+		}
+	}
+
 	struct Product0068CellKernel {
 		mark: Color,
 	}
@@ -1250,6 +1341,83 @@ mod tests {
 			},
 		};
 		(body, data, stamped)
+	}
+
+	fn product_0077_text_grid(
+		authored_spec: AuthoredPlotSpec,
+		data: Arc<DataFrame>,
+		layout: PlotLayout,
+	) -> TextBackend {
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "PRODUCT-0077 text fixture".to_owned(),
+				data: Arc::clone(&data),
+			},
+			authored_spec,
+		})
+		.expect("PRODUCT-0077 body resolves");
+		let body = Arc::new(resolved.resolved_spec);
+		let mut cells = NonEmpty::new(GridCell {
+			position: GridPosition { row: 0, column: 0 },
+			body: Arc::clone(&body),
+			data: Arc::clone(&data),
+			x_group: 0,
+			y_group: 0,
+			label: None,
+		});
+		for position in [
+			GridPosition { row: 0, column: 1 },
+			GridPosition { row: 1, column: 0 },
+			GridPosition { row: 1, column: 1 },
+		] {
+			cells.push(GridCell {
+				position,
+				body: Arc::clone(&body),
+				data: Arc::clone(&data),
+				x_group: 0,
+				y_group: 0,
+				label: None,
+			});
+		}
+		let grid = PlotGrid::new(cells, GridArrangement::new(2, 2).expect("arrangement"))
+			.expect("PRODUCT-0077 grid");
+		let kernel = PlotGridKernel::from_grid_with_factory(grid, 800, 600, move |_spec, _data| {
+			Ok(Arc::new(FixedLayoutKernel {
+				layout: layout.clone(),
+			}))
+		})
+		.expect("PRODUCT-0077 kernel");
+		let resolved = ResolvedPlotSettings {
+			title: ResolvedPresence::Hide,
+			subtitle: ResolvedPresence::Hide,
+			x_label: ResolvedPresence::Hide,
+			y_label: ResolvedPresence::Hide,
+			legend: ResolvedPresence::Hide,
+			x_tick_placement: TickPlacement::step(25.0).expect("x step"),
+			y_tick_placement: TickPlacement::step(25.0).expect("y step"),
+			show_x_minor_ticks: false,
+			show_y_minor_ticks: false,
+			show_x_minor_grid: false,
+			show_y_minor_grid: false,
+			..ResolvedPlotSettings::default()
+		};
+		let model = PlotSettings::from_resolved(resolved.clone());
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: resolved,
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = TextBackend::default();
+		widget.render(
+			&mut backend,
+			IcedRectangle::new(Point::ORIGIN, Size::new(800.0, 600.0)),
+		);
+		backend
 	}
 
 	fn rendered_facet(
@@ -3400,6 +3568,340 @@ mod tests {
 			!axis_text_visibility(same_group_right, &[left, same_group_right]).y,
 			"the comparison, not column position, suppresses repeated text"
 		);
+	}
+
+	#[test]
+	fn product_0077_occupied_neighbors_choose_only_inward_bound_anchors() {
+		let cell = |row, column| AxisTextCell {
+			position: GridPosition { row, column },
+			x_group: 0,
+			y_group: 0,
+		};
+		let full = (0..3)
+			.flat_map(|row| (0..3).map(move |column| cell(row, column)))
+			.collect::<Vec<_>>();
+		let center = axis_text_visibility(cell(1, 1), &full).anchoring;
+		assert_eq!(
+			center,
+			AxisTextAnchoring {
+				x_min: true,
+				x_max: true,
+				y_min: true,
+				y_max: true,
+			}
+		);
+		assert_eq!(
+			center.x_alignment(0.0, (0.0, 100.0)),
+			iced::alignment::Horizontal::Left
+		);
+		assert_eq!(
+			center.x_alignment(100.0, (0.0, 100.0)),
+			iced::alignment::Horizontal::Right
+		);
+		assert_eq!(
+			center.y_alignment(0.0, (0.0, 100.0)),
+			iced::alignment::Vertical::Bottom
+		);
+		assert_eq!(
+			center.y_alignment(100.0, (0.0, 100.0)),
+			iced::alignment::Vertical::Top
+		);
+		assert_eq!(
+			center.x_alignment(50.0, (0.0, 100.0)),
+			iced::alignment::Horizontal::Center
+		);
+
+		let outer = axis_text_visibility(cell(0, 0), &full).anchoring;
+		assert!(!outer.x_min && !outer.y_max);
+		assert!(outer.x_max && outer.y_min);
+		assert_eq!(
+			outer.x_alignment(0.0, (0.0, 100.0)),
+			iced::alignment::Horizontal::Center,
+			"the grid perimeter remains centred"
+		);
+		assert_eq!(
+			outer.y_alignment(100.0, (0.0, 100.0)),
+			iced::alignment::Vertical::Center,
+			"the grid perimeter remains centred"
+		);
+
+		let partial = [cell(0, 0), cell(0, 1), cell(1, 0)];
+		let top_right = axis_text_visibility(cell(0, 1), &partial).anchoring;
+		assert!(!top_right.y_min, "a vacant below-slot grants no anchor");
+		let bottom_left = axis_text_visibility(cell(1, 0), &partial).anchoring;
+		assert!(!bottom_left.x_max, "a vacant right-slot grants no anchor");
+	}
+
+	#[test]
+	fn product_0077_bound_coincidence_is_shared_and_does_not_mean_last_tick() {
+		let anchors = AxisTextAnchoring {
+			x_min: true,
+			x_max: true,
+			y_min: true,
+			y_max: true,
+		};
+		let exact_range = (0.0, 50.0);
+		let exact = TickPlacement::step(10.0)
+			.expect("step")
+			.positions(exact_range)
+			.expect("positions");
+		assert_eq!(exact.last(), Some(&50.0));
+		assert_eq!(
+			anchors.x_alignment(*exact.last().unwrap(), exact_range),
+			iced::alignment::Horizontal::Right
+		);
+		assert_eq!(
+			anchors.y_alignment(*exact.last().unwrap(), exact_range),
+			iced::alignment::Vertical::Top
+		);
+
+		let omitted_range = (0.0, 42.0);
+		let omitted = TickPlacement::step(10.0)
+			.expect("step")
+			.positions(omitted_range)
+			.expect("positions");
+		assert_eq!(omitted.last(), Some(&40.0));
+		assert_eq!(
+			anchors.x_alignment(*omitted.last().unwrap(), omitted_range),
+			iced::alignment::Horizontal::Center
+		);
+		assert_eq!(
+			anchors.y_alignment(*omitted.last().unwrap(), omitted_range),
+			iced::alignment::Vertical::Center
+		);
+	}
+
+	#[test]
+	fn product_0077_all_numeric_layouts_emit_inward_endpoints_and_keep_categories_centred() {
+		use iced::advanced::text::Alignment;
+		use iced::alignment::Vertical;
+
+		let cartesian_data = Arc::new(
+			df!(
+				"x" => [0.0_f64, 1.0],
+				"y" => [0.0_f64, 1.0],
+			)
+			.expect("cartesian frame"),
+		);
+		let cartesian = product_0077_text_grid(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y"),
+			cartesian_data,
+			PlotLayout::Cartesian {
+				x_range: (0.0, 100.0),
+				y_range: (0.0, 100.0),
+				x_axis_type: AxisType::Percent,
+				y_axis_type: AxisType::Percent,
+			},
+		);
+		assert_eq!(
+			cartesian
+				.texts
+				.iter()
+				.filter(|text| text.content == "0%")
+				.count(),
+			4,
+			"both endpoint labels survive on both visible axes"
+		);
+		assert_eq!(
+			cartesian
+				.texts
+				.iter()
+				.filter(|text| text.content == "100%")
+				.count(),
+			4,
+			"both endpoint labels survive on both visible axes"
+		);
+		for alignment in [Alignment::Left, Alignment::Right] {
+			assert_eq!(
+				cartesian
+					.texts
+					.iter()
+					.filter(|text| text.position.y > 520.0 && text.align_x == alignment)
+					.count(),
+				1,
+				"Cartesian x emits exactly one inward {alignment:?} endpoint"
+			);
+		}
+		for alignment in [Vertical::Top, Vertical::Bottom] {
+			assert_eq!(
+				cartesian
+					.texts
+					.iter()
+					.filter(|text| text.position.x < 100.0 && text.align_y == alignment)
+					.count(),
+				1,
+				"Cartesian y emits exactly one inward {alignment:?} endpoint"
+			);
+		}
+		assert!(
+			cartesian.texts.iter().any(|text| {
+				text.content == "0%"
+					&& text.align_x == Alignment::Center
+					&& text.position.y > 520.0
+					&& text.position.x < 150.0
+			}),
+			"the outer x minimum remains centred"
+		);
+		assert!(
+			cartesian.texts.iter().any(|text| {
+				text.content == "100%"
+					&& text.align_y == Vertical::Center
+					&& text.position.x < 100.0
+					&& text.position.y < 100.0
+			}),
+			"the outer y maximum remains centred"
+		);
+
+		let categorical_data = Arc::new(
+			df!(
+				"category" => ["A", "B"],
+				"value" => [25.0_f64, 75.0],
+			)
+			.expect("categorical frame"),
+		);
+		let categorical_x = product_0077_text_grid(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "category", "value"),
+			Arc::clone(&categorical_data),
+			PlotLayout::CategoricalX {
+				categories: vec!["A".to_owned(), "B".to_owned()],
+				y_range: (0.0, 100.0),
+				y_axis_type: AxisType::Percent,
+			},
+		);
+		assert_eq!(
+			categorical_x
+				.texts
+				.iter()
+				.filter(|text| {
+					text.position.x < 100.0
+						&& matches!(text.align_y, Vertical::Top | Vertical::Bottom)
+				})
+				.count(),
+			2,
+			"CategoricalX routes both numeric-y interior endpoints"
+		);
+		assert!(
+			categorical_x
+				.texts
+				.iter()
+				.filter(|text| {
+					(text.content == "A" || text.content == "B") && text.position.y > 520.0
+				})
+				.all(|text| text.align_x == Alignment::Center),
+			"CategoricalX category labels remain centred"
+		);
+
+		let categorical_y = product_0077_text_grid(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "value", "category"),
+			categorical_data,
+			PlotLayout::CategoricalY {
+				categories: vec!["A".to_owned(), "B".to_owned()],
+				x_range: (0.0, 100.0),
+				x_axis_type: AxisType::Percent,
+			},
+		);
+		assert_eq!(
+			categorical_y
+				.texts
+				.iter()
+				.filter(|text| {
+					text.position.y > 520.0
+						&& matches!(text.align_x, Alignment::Left | Alignment::Right)
+				})
+				.count(),
+			2,
+			"CategoricalY routes both numeric-x interior endpoints"
+		);
+		assert!(
+			categorical_y
+				.texts
+				.iter()
+				.filter(|text| {
+					(text.content == "A" || text.content == "B") && text.position.x < 100.0
+				})
+				.all(|text| text.align_y == Vertical::Center),
+			"CategoricalY category labels remain centred"
+		);
+	}
+
+	#[test]
+	fn product_0077_categorical_xy_ignores_numeric_boundary_anchors() {
+		use iced::advanced::text::Alignment;
+		use iced::alignment::Vertical;
+
+		let layout = PlotLayout::CategoricalXY {
+			x_categories: vec!["left".to_owned(), "right".to_owned()],
+			y_categories: vec!["top".to_owned(), "bottom".to_owned()],
+		};
+		let kernel = FixedLayoutKernel {
+			layout: layout.clone(),
+		};
+		let resolved = ResolvedPlotSettings::default();
+		let model = PlotSettings::from_resolved(resolved.clone());
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings: resolved,
+			settings_model: model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = TextBackend::default();
+		widget.draw_categorical_xy_axes(
+			&mut backend,
+			bounds,
+			&transform,
+			&["left".to_owned(), "right".to_owned()],
+			&["top".to_owned(), "bottom".to_owned()],
+			AxisTextVisibility {
+				x: true,
+				y: true,
+				anchoring: AxisTextAnchoring {
+					x_min: true,
+					x_max: true,
+					y_min: true,
+					y_max: true,
+				},
+			},
+		);
+		assert_eq!(backend.texts.len(), 4);
+		assert!(
+			backend
+				.texts
+				.iter()
+				.filter(|text| text.content == "left" || text.content == "right")
+				.all(|text| text.align_x == Alignment::Center)
+		);
+		assert!(
+			backend
+				.texts
+				.iter()
+				.filter(|text| text.content == "top" || text.content == "bottom")
+				.all(|text| text.align_y == Vertical::Center)
+		);
+	}
+
+	#[test]
+	fn product_0077_grid_geometry_remains_twelve_pixel_congruent() {
+		let arrangement = GridArrangement::new(2, 2).expect("arrangement");
+		let outer = widget_rect(IcedRectangle::new(Point::ORIGIN, Size::new(800.0, 600.0)));
+		let settings = ResolvedPlotSettings {
+			title: ResolvedPresence::Hide,
+			subtitle: ResolvedPresence::Hide,
+			..ResolvedPlotSettings::default()
+		};
+		let tiled = grid_tiled_area(outer, &settings);
+		let left = grid_cell_bounds(tiled, arrangement, GridPosition { row: 0, column: 0 });
+		let right = grid_cell_bounds(tiled, arrangement, GridPosition { row: 0, column: 1 });
+		let below = grid_cell_bounds(tiled, arrangement, GridPosition { row: 1, column: 0 });
+		assert_eq!(right.x() - left.right(), 12.0);
+		assert_eq!(below.y() - left.bottom(), 12.0);
+		assert_eq!(left.size(), right.size());
+		assert_eq!(left.size(), below.size());
 	}
 
 	#[test]

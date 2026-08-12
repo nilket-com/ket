@@ -843,13 +843,60 @@ pub enum PlotRenderLayer {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AxisTextAnchoring {
+	pub x_min: bool,
+	pub x_max: bool,
+	pub y_min: bool,
+	pub y_max: bool,
+}
+
+impl AxisTextAnchoring {
+	pub const NONE: Self = Self {
+		x_min: false,
+		x_max: false,
+		y_min: false,
+		y_max: false,
+	};
+
+	fn bound_coincident(value: f64, bound: f64, range: (f64, f64)) -> bool {
+		let tolerance = (range.1 - range.0).abs().max(1.0) * f64::EPSILON * 16.0;
+		(value - bound).abs() <= tolerance
+	}
+
+	pub fn x_alignment(self, value: f64, range: (f64, f64)) -> alignment::Horizontal {
+		if self.x_min && Self::bound_coincident(value, range.0, range) {
+			alignment::Horizontal::Left
+		} else if self.x_max && Self::bound_coincident(value, range.1, range) {
+			alignment::Horizontal::Right
+		} else {
+			alignment::Horizontal::Center
+		}
+	}
+
+	pub fn y_alignment(self, value: f64, range: (f64, f64)) -> alignment::Vertical {
+		if self.y_min && Self::bound_coincident(value, range.0, range) {
+			alignment::Vertical::Bottom
+		} else if self.y_max && Self::bound_coincident(value, range.1, range) {
+			alignment::Vertical::Top
+		} else {
+			alignment::Vertical::Center
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct AxisTextVisibility {
 	pub x: bool,
 	pub y: bool,
+	pub anchoring: AxisTextAnchoring,
 }
 
 impl AxisTextVisibility {
-	pub const ALL: Self = Self { x: true, y: true };
+	pub const ALL: Self = Self {
+		x: true,
+		y: true,
+		anchoring: AxisTextAnchoring::NONE,
+	};
 }
 
 fn resolve_canvas_text(
@@ -1467,7 +1514,7 @@ impl<'a> PlotWidget<'a> {
 					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.y_tick_size),
 					align_x: alignment::Horizontal::Right.into(),
-					align_y: alignment::Vertical::Center,
+					align_y: text.anchoring.y_alignment(data_y, y_range),
 					..Default::default()
 				});
 			}
@@ -1509,7 +1556,7 @@ impl<'a> PlotWidget<'a> {
 						position: Point::ORIGIN,
 						color: self.settings.chrome.tick_label_text.iced(),
 						size: iced::Pixels(self.settings.x_tick_size),
-						align_x: alignment::Horizontal::Center.into(),
+						align_x: text.anchoring.x_alignment(data_x, x_range).into(),
 						..Default::default()
 					});
 				});
@@ -1658,7 +1705,7 @@ impl<'a> PlotWidget<'a> {
 					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.y_tick_size),
 					align_x: alignment::Horizontal::Right.into(),
-					align_y: alignment::Vertical::Center,
+					align_y: text.anchoring.y_alignment(data_y, y_range),
 					..Default::default()
 				});
 			}
@@ -1819,7 +1866,7 @@ impl<'a> PlotWidget<'a> {
 					position: Point::new(p_bottom.x, p_bottom.y + 10.0),
 					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.x_tick_size),
-					align_x: alignment::Horizontal::Center.into(),
+					align_x: text.anchoring.x_alignment(data_x, x_range).into(),
 					..Default::default()
 				});
 			}

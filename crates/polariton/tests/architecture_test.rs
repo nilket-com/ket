@@ -2226,3 +2226,40 @@ fn product_0076_showcase_and_seed_are_repository_owned() {
 		"the canonical seed is idempotent and makes all four facet quarters observable"
 	);
 }
+
+#[test]
+fn product_0077_facet_tick_containment_does_not_measure_or_resize_layout() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plot");
+	let grid = std::fs::read_to_string(root.join("grid.rs")).expect("read facet-grid layout");
+	let common = std::fs::read_to_string(root.join("common.rs")).expect("read plot chrome");
+
+	assert!(
+		grid.contains("const GRID_GAP: f32 = 12.0;"),
+		"PRODUCT-0077 contains labels without changing facet geometry"
+	);
+	let grid_layout = grid
+		.split("fn axis_text_visibility(")
+		.nth(1)
+		.expect("facet text decision")
+		.split("fn resolved_categories(")
+		.next()
+		.expect("bounded facet text and geometry path");
+	let anchor_decision = common
+		.split("pub(crate) struct AxisTextAnchoring")
+		.nth(1)
+		.expect("numeric endpoint anchor decision")
+		.split("pub(crate) struct AxisTextVisibility")
+		.next()
+		.expect("bounded numeric endpoint anchor decision");
+	for (name, source) in [
+		("facet grid layout", grid_layout),
+		("numeric anchor decision", anchor_decision),
+	] {
+		for forbidden in ["Paragraph", "glyph", "font", "measure_text", "text_extent"] {
+			assert!(
+				!source.contains(forbidden),
+				"PRODUCT-0077 {name} acquired text measurement through {forbidden}"
+			);
+		}
+	}
+}

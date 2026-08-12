@@ -48,18 +48,23 @@ use iced::{Color, Font, Pixels, Point, Rectangle, Size, Vector};
 use iced_wgpu::graphics::{Antialiasing, Shell};
 use iced_wgpu::{Engine, Renderer as WgpuRenderer, wgpu};
 use plot::common::{
-	AxisType, CoordinateTransformer, IcedBackend, Orientation, PlotBackend, PlotKernel,
+	AxisType, CoordinateTransformer, IcedBackend, Orientation, PlotBackend, PlotKernel, PlotLayout,
 	PlotRenderLayer, PlotWidget, ResolvedPlotSettings, TickPlacement,
 };
+use plot::composition::PlotComposition;
+use plot::core::PlotType;
+use plot::grid::{GridArrangement, PlotGrid, PlotGridKernel};
 use plot::kernels::bar::{BarPlotKernel, BarPreparedData};
 use plot::kernels::line::{LinePlotKernel, LinePreparedData, SeriesData};
 use plot::kernels::scatter::{ScatterPlotKernel, ScatterPreparedData, ScatterSeries};
 use plot::kernels::stacked_area::{StackedAreaPlotKernel, StackedAreaPreparedData};
 use plot::kernels::stacked_bar::{StackedBarPlotKernel, StackedBarPreparedData};
 use plot::legend::LegendProvenance;
+use plot::request::{PlotRequest, PlotSource, plan};
 use plot::spec::{
-	BarWidth, CategoryColorAssignment, CategoryGap, LayerSettings, PalettePosition, PointSize,
-	ResolvedColor, ResolvedPresence, StackNormalization, StrokeWidth,
+	AuthoredPlotSpec, BarWidth, CategoryColorAssignment, CategoryGap, LayerSettings,
+	PalettePosition, PlotProvenance, PointSize, ResolvedColor, ResolvedPresence,
+	StackNormalization, StampedResult, StrokeWidth,
 };
 use plot::theme::PlotSettings;
 use polars::prelude::{Float64Chunked, NewChunkedArray};
@@ -70,6 +75,8 @@ const RED: [u8; 3] = [230, 32, 48];
 const BLUE: [u8; 3] = [40, 96, 230];
 const GREEN: [u8; 3] = [32, 220, 96];
 const WHITE: [u8; 3] = [255, 255, 255];
+const PRODUCT_0077_BANKED_VERTICAL_SPILL: usize = 88;
+const PRODUCT_0077_BANKED_HORIZONTAL_SPILL: usize = 111;
 
 struct Gpu {
 	adapter: wgpu::Adapter,
@@ -955,6 +962,153 @@ fn assert_product_0072_occlusion(
 	changed_fill_pixels
 }
 
+struct FixedPercentCellKernel;
+
+impl PlotKernel for FixedPercentCellKernel {
+	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
+		PlotLayout::Cartesian {
+			x_range: (0.0, 100.0),
+			y_range: (0.0, 100.0),
+			x_axis_type: AxisType::Percent,
+			y_axis_type: AxisType::Percent,
+		}
+	}
+
+	fn plot(
+		&self,
+		_backend: &mut dyn PlotBackend,
+		_bounds: Rectangle,
+		_transform: &CoordinateTransformer,
+		_cursor: iced::advanced::mouse::Cursor,
+		_settings: ResolvedPlotSettings,
+	) {
+	}
+
+	fn hover(
+		&self,
+		_transform: &CoordinateTransformer,
+		_cursor: iced::advanced::mouse::Cursor,
+	) -> Option<String> {
+		None
+	}
+}
+
+fn product_0077_percent_grid() -> PlotGridKernel {
+	let data = Arc::new(
+		polars::df!(
+			"facet" => ["A", "B", "C", "D"],
+			"x" => [0.0_f64, 1.0, 2.0, 3.0],
+			"y" => [0.0_f64, 1.0, 2.0, 3.0],
+		)
+		.expect("PRODUCT-0077 percent-facet frame"),
+	);
+	let resolved = plan(PlotRequest {
+		source: PlotSource::Materialized {
+			name: "PRODUCT-0077 percent facets".to_owned(),
+			data: Arc::clone(&data),
+		},
+		authored_spec: AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y"),
+	})
+	.expect("PRODUCT-0077 resolve facet body");
+	let grid = PlotGrid::value_facet(
+		Arc::new(resolved.resolved_spec),
+		&StampedResult {
+			data,
+			provenance: PlotProvenance {
+				source_name: "PRODUCT-0077 percent facets".to_owned(),
+				revision: None,
+			},
+		},
+		"facet",
+		GridArrangement::new(2, 2).expect("PRODUCT-0077 arrangement"),
+	)
+	.expect("PRODUCT-0077 facet grid");
+	PlotGridKernel::from_grid_with_factory(grid, 800, 600, |_spec, _data| {
+		Ok(Arc::new(FixedPercentCellKernel))
+	})
+	.expect("PRODUCT-0077 percent grid kernel")
+}
+
+fn product_0077_settings(tick_label_text: plot::chrome::PlotRgba) -> PlotSettings {
+	let mut resolved = ResolvedPlotSettings {
+		title: ResolvedPresence::Hide,
+		subtitle: ResolvedPresence::Hide,
+		x_label: ResolvedPresence::Hide,
+		y_label: ResolvedPresence::Hide,
+		legend: ResolvedPresence::Hide,
+		x_tick_placement: TickPlacement::step(25.0).expect("PRODUCT-0077 x step"),
+		y_tick_placement: TickPlacement::step(25.0).expect("PRODUCT-0077 y step"),
+		show_x_minor_ticks: false,
+		show_y_minor_ticks: false,
+		show_x_minor_grid: false,
+		show_y_minor_grid: false,
+		..ResolvedPlotSettings::default()
+	};
+	resolved.chrome.tick_label_text = tick_label_text;
+	PlotSettings::from_resolved(resolved)
+}
+
+fn render_product_0077_percent_grid(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	tick_label_text: plot::chrome::PlotRgba,
+) -> Capture {
+	let kernel = product_0077_percent_grid();
+	let settings = product_0077_settings(tick_label_text);
+	let resolved = settings.resolve();
+	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
+	let widget = PlotWidget {
+		kernel: &kernel,
+		title: String::new(),
+		padding: 0.0,
+		settings: resolved,
+		settings_model: settings,
+		render_revision: 0,
+		resize_render_suspended: false,
+		layer: PlotRenderLayer::Full,
+	};
+	render_frame(renderer, size, |frame| {
+		let mut backend = IcedBackend { frame };
+		widget.render_plot_layer(&mut backend, bounds);
+		widget.render_overlay_layer(&mut backend, bounds);
+	})
+}
+
+fn product_0077_gutters(size: Size<u32>) -> (Rectangle, Rectangle) {
+	let resolved = ResolvedPlotSettings::default();
+	let tiled_x = resolved.plot_padding_left;
+	let tiled_y = 0.0;
+	let tiled_width = size.width as f32 - resolved.plot_padding_left;
+	let tiled_height = size.height as f32 - resolved.plot_padding_bottom;
+	let gap = 12.0;
+	let cell_width = (tiled_width - gap) / 2.0;
+	let cell_height = (tiled_height - gap) / 2.0;
+	(
+		Rectangle::new(
+			Point::new(tiled_x + cell_width, 0.0),
+			Size::new(gap, size.height as f32),
+		),
+		Rectangle::new(
+			Point::new(0.0, tiled_y + cell_height),
+			Size::new(size.width as f32, gap),
+		),
+	)
+}
+
+fn product_0077_differing_pixels(left: &Capture, right: &Capture, bounds: Rectangle) -> usize {
+	let x0 = bounds.x.floor().max(0.0) as u32;
+	let y0 = bounds.y.floor().max(0.0) as u32;
+	let x1 = (bounds.x + bounds.width).ceil().max(0.0) as u32;
+	let y1 = (bounds.y + bounds.height).ceil().max(0.0) as u32;
+	let mut count = 0;
+	for y in y0.min(left.height)..y1.min(left.height) {
+		for x in x0.min(left.width)..x1.min(left.width) {
+			count += usize::from(color_distance(left.pixel(x, y), right.pixel(x, y)) >= 12);
+		}
+	}
+	count
+}
+
 fn draw_overlap(frame: &mut canvas::Frame) {
 	let size = frame.size();
 	let mut backend = IcedBackend { frame };
@@ -1119,6 +1273,38 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	let large = Size::new(448, 320);
 	let mut msaa = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
 	let mut no_aa = gpu.renderer(None).await;
+
+	let product_0077_size = Size::new(800, 600);
+	let product_0077_sentinel = plot::chrome::PlotRgba::opaque(1.0, 0.0, 1.0);
+	let product_0077_background = ResolvedPlotSettings::default().chrome.canvas_background;
+	let product_0077_visible =
+		render_product_0077_percent_grid(&mut msaa, product_0077_size, product_0077_sentinel);
+	let product_0077_hidden =
+		render_product_0077_percent_grid(&mut msaa, product_0077_size, product_0077_background);
+	let (product_0077_vertical_gutter, product_0077_horizontal_gutter) =
+		product_0077_gutters(product_0077_size);
+	let product_0077_vertical_spill = product_0077_differing_pixels(
+		&product_0077_visible,
+		&product_0077_hidden,
+		product_0077_vertical_gutter,
+	);
+	let product_0077_horizontal_spill = product_0077_differing_pixels(
+		&product_0077_visible,
+		&product_0077_hidden,
+		product_0077_horizontal_gutter,
+	);
+	assert!(
+		PRODUCT_0077_BANKED_VERTICAL_SPILL > 0 && PRODUCT_0077_BANKED_HORIZONTAL_SPILL > 0,
+		"PRODUCT-0077 Stage 0 must bank a discriminating nonzero control"
+	);
+	assert_eq!(
+		(product_0077_vertical_spill, product_0077_horizontal_spill),
+		(0, 0),
+		"PRODUCT-0077 bound-coincident tick text must contribute no realized glyph ink to either gutter"
+	);
+	println!(
+		"PRODUCT_0077 facet_tick_containment disposition=automated banked_vertical/horizontal={PRODUCT_0077_BANKED_VERTICAL_SPILL}/{PRODUCT_0077_BANKED_HORIZONTAL_SPILL} accepted_vertical/horizontal={product_0077_vertical_spill}/{product_0077_horizontal_spill}"
+	);
 
 	let percent_size = Size::new(500, 360);
 	let (percent_area, percent_area_settings, percent_area_fills) =
