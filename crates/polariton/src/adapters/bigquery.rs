@@ -1,5 +1,6 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
 use crate::adapters::sql_compound::{CompoundTail, plan};
+use crate::result_artifact::{ArrowNullabilityPolicy, ResultArtifact};
 use async_trait::async_trait;
 use gcloud_auth::project::Config as AuthConfig;
 use gcloud_auth::token::DefaultTokenSourceProvider;
@@ -14,11 +15,8 @@ use gcloud_googleapis::cloud::bigquery::storage::v1::{
 	CreateReadSessionRequest, DataFormat, ReadRowsRequest, ReadSession,
 	big_query_read_client::BigQueryReadClient, read_rows_response, read_session,
 };
-use polars::frame::DataFrame;
-use polars::io::SerReader;
-use polars::io::ipc::IpcStreamReader;
 use sqlparser::dialect::BigQueryDialect;
-use std::io::Cursor;
+use std::sync::Arc;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
 	key: "project_id",
@@ -70,10 +68,10 @@ impl DatabaseAdapter for BigQueryAdapter {
 				{
 					return ExecutionResult::Err(error.to_string());
 				}
-				bq_query_to_df(&self.client, &self.project_id, query)
+				bq_query_to_artifact(&self.client, &self.project_id, query)
 					.await
-					.map(|frame| ExecutionResult::Rows {
-						frame,
+					.map(|artifact| ExecutionResult::Rows {
+						artifact,
 						statements: planned.statements,
 					})
 					.unwrap_or_else(|error| ExecutionResult::Err(error.to_string()))
@@ -95,11 +93,11 @@ async fn bq_execute(client: &Client, project_id: &str, sql: &str) -> Result<(), 
 	Ok(())
 }
 
-async fn bq_query_to_df(
+async fn bq_query_to_artifact(
 	client: &Client,
 	project_id: &str,
 	sql: &str,
-) -> Result<DataFrame, BoxError> {
+) -> Result<Arc<ResultArtifact>, BoxError> {
 	let request = QueryRequest {
 		query: sql.to_string(),
 		use_legacy_sql: false,
@@ -127,7 +125,7 @@ async fn bq_query_to_df(
 			.ok_or("No destination table in query job")?,
 		_ => return Err("Not a query job".into()),
 	};
-	storage_read_to_df(project_id, &dest_table).await
+	storage_read_to_artifact(project_id, &dest_table).await
 }
 
 async fn poll_until_complete(client: &Client, job_ref: &JobReference) -> Result<(), BoxError> {
@@ -148,10 +146,10 @@ async fn poll_until_complete(client: &Client, job_ref: &JobReference) -> Result<
 	}
 }
 
-async fn storage_read_to_df(
+async fn storage_read_to_artifact(
 	project_id: &str,
 	table: &TableReference,
-) -> Result<DataFrame, BoxError> {
+) -> Result<Arc<ResultArtifact>, BoxError> {
 	let ts = DefaultTokenSourceProvider::new(
 		AuthConfig::default()
 			.with_audience(STORAGE_AUDIENCE)
@@ -200,5 +198,8 @@ async fn storage_read_to_df(
 			}
 		}
 	}
-	Ok(IpcStreamReader::new(Cursor::new(ipc_bytes)).finish()?)
+	Ok(ResultArtifact::from_arrow_ipc(
+		vec![ipc_bytes],
+		ArrowNullabilityPolicy::Unknown,
+	)?)
 }

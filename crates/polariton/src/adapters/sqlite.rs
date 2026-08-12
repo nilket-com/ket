@@ -1,5 +1,6 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
 use crate::adapters::sql_compound::{CompoundTail, plan};
+use crate::result_artifact::ResultArtifact;
 use async_trait::async_trait;
 use polars::{
 	datatypes::AnyValue,
@@ -68,7 +69,7 @@ impl DatabaseAdapter for SQLiteAdapter {
 					})
 					.await
 					.map(|frame| ExecutionResult::Rows {
-						frame,
+						artifact: ResultArtifact::from_polars(std::sync::Arc::new(frame)),
 						statements: planned.statements,
 					})
 					.unwrap_or_else(|err| ExecutionResult::Err(err.to_string()))
@@ -136,9 +137,14 @@ mod tests {
 			))
 			.await;
 
-		let ExecutionResult::Rows { frame, statements } = result else {
+		let ExecutionResult::Rows {
+			artifact,
+			statements,
+		} = result
+		else {
 			panic!("query tail must return a DataFrame");
 		};
+		let frame = artifact.projection().expect("SQLite projection");
 		assert_eq!(statements, 3);
 		assert_eq!(frame.shape(), (2, 1));
 		let values = frame

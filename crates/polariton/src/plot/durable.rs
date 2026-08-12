@@ -10,7 +10,6 @@ use crate::plot::spec::{
 	AuthoredPlotSpec, ColorIdentity, ResolvedLayout, ResolvedPlotSpec, StampedResult,
 	resolve_channels, resolve_domains,
 };
-use polars::frame::DataFrame;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -41,7 +40,7 @@ pub enum RevisionObservation {
 pub struct DurablePlotSnapshot {
 	pub mode: DurabilityMode,
 	pub resolved_spec: ResolvedPlotSpec,
-	pub data: Arc<DataFrame>,
+	pub data: Arc<crate::result_artifact::ResultArtifact>,
 	pub status: DurablePlotStatus,
 	pub layout: ResolvedLayout,
 }
@@ -197,7 +196,11 @@ fn resolve(
 	result: &StampedResult,
 	identity: &ColorIdentity,
 ) -> Result<(ResolvedPlotSpec, ColorIdentity), String> {
-	let binding = resolve_channels(authored_spec, result.data.schema().as_ref())
+	let frame = result
+		.data
+		.projection()
+		.map_err(|error| error.to_string())?;
+	let binding = resolve_channels(authored_spec, frame.schema().as_ref())
 		.map_err(|error| error.to_string())?;
 	resolve_domains(binding, result, identity).map_err(|error| error.to_string())
 }
@@ -209,6 +212,7 @@ mod tests {
 	use crate::plot::core::PlotType;
 	use crate::plot::spec::{Channel, PlotProvenance, ScaleFamily};
 	use polars::df;
+	use polars::prelude::DataFrame;
 	use std::cell::Cell;
 
 	fn result(revision: u64, x: polars::prelude::Column, y: Vec<i64>) -> StampedResult {
@@ -216,7 +220,7 @@ mod tests {
 		let frame = DataFrame::new(height, vec![x, polars::prelude::Column::new("y".into(), y)])
 			.expect("frame");
 		StampedResult {
-			data: Arc::new(frame),
+			data: crate::result_artifact::ResultArtifact::test_frame(frame),
 			provenance: PlotProvenance {
 				source_name: "durable".to_owned(),
 				revision: Some(revision),

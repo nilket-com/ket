@@ -1,4 +1,5 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
+use crate::result_artifact::ResultArtifact;
 use async_trait::async_trait;
 use polars::sql::SQLContext;
 
@@ -22,7 +23,7 @@ impl DatabaseAdapter for ParquetAdapter {
 		let result = tokio::task::spawn_blocking(move || match ctx.execute(&code) {
 			Ok(lazy_df) => match lazy_df.collect() {
 				Ok(frame) => ExecutionResult::Rows {
-					frame,
+					artifact: ResultArtifact::from_polars(std::sync::Arc::new(frame)),
 					statements: 1,
 				},
 				Err(err) => ExecutionResult::Err(format!("Error: {err}")),

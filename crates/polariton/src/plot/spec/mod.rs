@@ -12,7 +12,6 @@ use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use libaryon::core::Rgb;
 use libaryon::engine::{ResolvedCategoricalPalette, Theme};
-use polars::frame::DataFrame;
 use polars::prelude::{AnyValue, DataType, Schema};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -1143,7 +1142,7 @@ fn padded_range(min: f64, max: f64) -> (f64, f64) {
 
 #[derive(Clone, Debug)]
 pub struct StampedResult {
-	pub data: Arc<DataFrame>,
+	pub data: Arc<crate::result_artifact::ResultArtifact>,
 	pub provenance: PlotProvenance,
 }
 
@@ -1942,14 +1941,16 @@ pub fn resolve_domains(
 	let mut channels = Vec::with_capacity(binding.channels.len());
 	let color_job = binding.color_job;
 	for channel in binding.channels {
-		let column = result
-			.data
-			.column(&channel.field)
-			.map_err(|error| DomainError {
-				channel: channel.channel,
-				field: channel.field.clone(),
-				reason: error.to_string(),
-			})?;
+		let data = result.data.projection().map_err(|error| DomainError {
+			channel: channel.channel,
+			field: channel.field.clone(),
+			reason: error.to_string(),
+		})?;
+		let column = data.column(&channel.field).map_err(|error| DomainError {
+			channel: channel.channel,
+			field: channel.field.clone(),
+			reason: error.to_string(),
+		})?;
 		let domain = resolve_domain(column, &channel)?;
 		let colors =
 			if channel.channel == Channel::Color && color_job == Some(ColorJob::Categorical) {
@@ -2001,7 +2002,14 @@ pub fn resolve_domains_with_categorical_palette(
 	let mut channels = Vec::with_capacity(binding.channels.len());
 	let color_job = binding.color_job;
 	for channel in binding.channels {
-		let column = result.data.column(&channel.field).map_err(|error| {
+		let data = result.data.projection().map_err(|error| {
+			CategoricalResolutionError::Domain(DomainError {
+				channel: channel.channel,
+				field: channel.field.clone(),
+				reason: error.to_string(),
+			})
+		})?;
+		let column = data.column(&channel.field).map_err(|error| {
 			CategoricalResolutionError::Domain(DomainError {
 				channel: channel.channel,
 				field: channel.field.clone(),
@@ -2947,11 +2955,11 @@ fn categorical_color(index: usize) -> ResolvedColor {
 mod tests {
 	use super::*;
 	use polars::df;
-	use polars::prelude::{Column, IntoColumn, NamedFrom};
+	use polars::prelude::{Column, DataFrame, IntoColumn, NamedFrom};
 
 	fn stamped(data: DataFrame) -> StampedResult {
 		StampedResult {
-			data: Arc::new(data),
+			data: crate::result_artifact::ResultArtifact::test_frame(data),
 			provenance: PlotProvenance {
 				source_name: "fixture".to_owned(),
 				revision: Some(7),
@@ -2996,8 +3004,9 @@ mod tests {
 		result: &StampedResult,
 		identity: &ColorIdentity,
 	) -> Result<(ResolvedPlotSpec, ColorIdentity), String> {
-		let binding = resolve_channels(spec, result.data.schema().as_ref())
-			.map_err(|error| error.to_string())?;
+		let frame = result.data.projection().expect("fixture projection");
+		let binding =
+			resolve_channels(spec, frame.schema().as_ref()).map_err(|error| error.to_string())?;
 		resolve_domains(binding, result, identity).map_err(|error| error.to_string())
 	}
 
@@ -3163,7 +3172,8 @@ mod tests {
 		identity: &ColorIdentity,
 		palette: &str,
 	) -> Result<(ResolvedPlotSpec, ColorIdentity), CategoricalResolutionError> {
-		let binding = resolve_channels(spec, result.data.schema().as_ref())
+		let frame = result.data.projection().expect("fixture projection");
+		let binding = resolve_channels(spec, frame.schema().as_ref())
 			.expect("explicit categorical channel binding");
 		let selection = CategoricalPaletteSelection::from_theme_name(palette)
 			.expect("categorical palette selection");
@@ -3666,8 +3676,9 @@ mod tests {
 			LayerSpec::xy(LayerMark::Line, "x", "y"),
 			[LayerSpec::xy(LayerMark::Scatter, "x", "y")],
 		);
-		let binding = resolve_layered_channels(&spec, result.data.schema().as_ref())
-			.expect("channel binding");
+		let frame = result.data.projection().expect("fixture projection");
+		let binding =
+			resolve_layered_channels(&spec, frame.schema().as_ref()).expect("channel binding");
 		let resolved = resolve_layered_domains(binding, &result).expect("domain resolution");
 		assert_eq!(
 			resolved
@@ -4116,7 +4127,8 @@ mod tests {
 
 		for member in [PlotType::StackedBar, PlotType::HorizontalStackedBar] {
 			let direct = AuthoredPlotSpec::xy(PlotComposition::single(member), "category", "value");
-			let error = resolve_channels(&direct, result.data.schema().as_ref())
+			let projected = result.data.projection().expect("fixture projection");
+			let error = resolve_channels(&direct, projected.schema().as_ref())
 				.expect_err("canonical stacked members are resolved output, not authored families");
 			assert!(
 				error
@@ -4277,7 +4289,8 @@ mod tests {
 			"y",
 			Some("series".to_owned()),
 		);
-		let binding = resolve_channels(&area, frame.data.schema().as_ref()).unwrap();
+		let projected = frame.data.projection().expect("fixture projection");
+		let binding = resolve_channels(&area, projected.schema().as_ref()).unwrap();
 		assert_eq!(
 			binding.composition.primary_plot_type(),
 			PlotType::StackedArea
@@ -4413,7 +4426,8 @@ mod tests {
 			.unwrap(),
 		);
 		let automatic = AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::StackedArea));
-		let binding = resolve_channels(&automatic, frame.data.schema().as_ref()).unwrap();
+		let projected = frame.data.projection().expect("fixture projection");
+		let binding = resolve_channels(&automatic, projected.schema().as_ref()).unwrap();
 		assert!(
 			binding.channels().is_empty(),
 			"the dashboard's all-Auto area remains outside authored channel and color resolution"

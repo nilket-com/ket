@@ -427,7 +427,7 @@ pub fn create_layered_plot(
 	let binding =
 		resolve_layered_channels(spec, df.schema().as_ref()).map_err(|e| e.to_string())?;
 	let stamped = StampedResult {
-		data: Arc::new(df.clone()),
+		data: crate::result_artifact::ResultArtifact::from_polars(Arc::new(df.clone())),
 		provenance: PlotProvenance {
 			source_name: "layered plot".to_owned(),
 			revision: None,
@@ -540,7 +540,7 @@ pub fn create_authored_plot(
 	let resolved = plan(PlotRequest {
 		source: PlotSource::Materialized {
 			name: "factory test".to_owned(),
-			data: Arc::new(df.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(df.clone()),
 		},
 		authored_spec,
 	})?;
@@ -739,7 +739,7 @@ mod product_0013_baseline_tests {
 		let authored = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "cat", "val");
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0029".to_owned(),
 				revision: Some(1),
@@ -783,7 +783,7 @@ mod product_0013_baseline_tests {
 		);
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("channels");
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0047".to_owned(),
 				revision: Some(1),
@@ -928,7 +928,7 @@ mod product_0013_baseline_tests {
 		let authored = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bar), "cat", "val");
 		let binding = resolve_channels(&authored, band_frame.schema().as_ref()).expect("channels");
 		let stamped = StampedResult {
-			data: Arc::new(band_frame.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(band_frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0047".to_owned(),
 				revision: Some(1),
@@ -966,7 +966,7 @@ mod product_0013_baseline_tests {
 		);
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0055".to_owned(),
 				revision: Some(1),
@@ -1760,7 +1760,7 @@ mod product_0013_baseline_tests {
 		let authored = AuthoredPlotSpec::xy_color(composition, "x", "y", Some("series".to_owned()));
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("line channels");
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0054".to_owned(),
 				revision: Some(1),
@@ -1830,7 +1830,7 @@ mod product_0013_baseline_tests {
 		);
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("area channels");
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0070".to_owned(),
 				revision: Some(1),
@@ -2007,7 +2007,7 @@ mod product_0013_baseline_tests {
 		.with_stacked_bar();
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0064".to_owned(),
 				revision: Some(1),
@@ -2167,7 +2167,7 @@ mod product_0013_baseline_tests {
 		let stacked_resolved = product_0064_resolved_stacked(&frame, "category", "value", None);
 		let grouped_binding = resolve_channels(&grouped_authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: crate::result_artifact::ResultArtifact::test_frame(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0064 grouped".to_owned(),
 				revision: Some(1),

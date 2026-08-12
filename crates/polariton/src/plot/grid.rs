@@ -279,28 +279,31 @@ impl PlotGrid {
 		arrangement: GridArrangement,
 	) -> Result<Self, GridError> {
 		let field = field.into();
-		if stamped.data.column(&field).is_err() {
+		let data = stamped
+			.data
+			.projection()
+			.map_err(|_| GridError::MissingPartitionField {
+				field: field.clone(),
+			})?;
+		if data.column(&field).is_err() {
 			return Err(GridError::MissingPartitionField { field });
 		}
-		let mut partitions = if stamped.data.height() == 0 {
-			vec![stamped.data.as_ref().clone()]
+		let mut partitions = if data.height() == 0 {
+			vec![data.as_ref().clone()]
 		} else {
-			stamped
-				.data
-				.partition_by([field.as_str()], true)
-				.unwrap_or_else(|_| vec![stamped.data.as_ref().clone()])
+			data.partition_by([field.as_str()], true)
+				.unwrap_or_else(|_| vec![data.as_ref().clone()])
 		};
 		// `partition_by` is free to choose a hash-map order.  A facet is a
 		// display operation, so restore the first-appearance order from the
 		// stamped relation before assigning cell positions.
 		if partitions.len() > 1 {
-			let first_appearance: Vec<String> = stamped
-				.data
+			let first_appearance: Vec<String> = data
 				.column(&field)
 				.ok()
 				.into_iter()
 				.flat_map(|column| {
-					(0..stamped.data.height()).filter_map(move |index| column.get(index).ok())
+					(0..data.height()).filter_map(move |index| column.get(index).ok())
 				})
 				.filter_map(any_value_label)
 				.fold(Vec::<String>::new(), |mut seen, label| {
@@ -1087,6 +1090,14 @@ mod tests {
 	use iced::{Color, Size};
 	use polars::df;
 
+	fn artifact(data: &Arc<DataFrame>) -> Arc<crate::result_artifact::ResultArtifact> {
+		crate::result_artifact::ResultArtifact::test_frame(data.as_ref().clone())
+	}
+
+	fn owned_artifact(data: DataFrame) -> Arc<crate::result_artifact::ResultArtifact> {
+		crate::result_artifact::ResultArtifact::test_frame(data)
+	}
+
 	#[derive(Default)]
 	/// PRODUCT-0057 named oracle `plot::grid::tests::RectangleBackend` records
 	/// rectangle tuples and fill-path points only; its shared short name grants
@@ -1343,14 +1354,14 @@ mod tests {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "grid fixture".to_owned(),
-				data: Arc::clone(&data),
+				data: artifact(&data),
 			},
 			authored_spec: AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y"),
 		})
 		.expect("fixture resolves");
 		let body = Arc::new(resolved.resolved_spec);
 		let stamped = StampedResult {
-			data: Arc::clone(&data),
+			data: artifact(&data),
 			provenance: PlotProvenance {
 				source_name: "grid fixture".to_owned(),
 				revision: None,
@@ -1367,7 +1378,7 @@ mod tests {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "PRODUCT-0077 text fixture".to_owned(),
-				data: Arc::clone(&data),
+				data: artifact(&data),
 			},
 			authored_spec,
 		})
@@ -1449,7 +1460,7 @@ mod tests {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "shared-edge fixture".to_owned(),
-				data: Arc::clone(&data),
+				data: artifact(&data),
 			},
 			authored_spec: AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y"),
 		})
@@ -1457,7 +1468,7 @@ mod tests {
 		let grid = PlotGrid::value_facet(
 			Arc::new(resolved.resolved_spec),
 			&StampedResult {
-				data,
+				data: artifact(&data),
 				provenance: PlotProvenance {
 					source_name: "shared-edge fixture".to_owned(),
 					revision: None,
@@ -1679,7 +1690,7 @@ mod tests {
 		// Mirror test16.rn's four product facets so the placement gate covers
 		// the exhibit that triggered the reserved gutter.
 		let stamped = StampedResult {
-			data: Arc::new(
+			data: owned_artifact(
 				df!(
 					"facet" => ["Atlas", "Beacon", "Cinder", "Delta"],
 					"x" => [0.0_f64, 1.0, 2.0, 3.0],
@@ -1813,7 +1824,7 @@ mod tests {
 		let reordered_grid = PlotGrid::value_facet(
 			Arc::clone(&body),
 			&StampedResult {
-				data: reordered,
+				data: artifact(&reordered),
 				provenance: stamped.provenance.clone(),
 			},
 			"facet",
@@ -1838,7 +1849,7 @@ mod tests {
 		let filtered_grid = PlotGrid::value_facet(
 			body,
 			&StampedResult {
-				data: filtered,
+				data: artifact(&filtered),
 				provenance: stamped.provenance,
 			},
 			"facet",
@@ -1867,7 +1878,7 @@ mod tests {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "colored grid fixture".to_owned(),
-				data: Arc::clone(&data),
+				data: artifact(&data),
 			},
 			authored_spec: AuthoredPlotSpec::xy_color(
 				PlotComposition::single(PlotType::Scatter),
@@ -1896,7 +1907,7 @@ mod tests {
 		let grid = PlotGrid::value_facet(
 			body,
 			&StampedResult {
-				data,
+				data: artifact(&data),
 				provenance: PlotProvenance {
 					source_name: "colored grid fixture".to_owned(),
 					revision: None,
@@ -1929,7 +1940,7 @@ mod tests {
 	#[test]
 	fn empty_relation_is_the_degenerate_one_cell_grid() {
 		let (body, _data, mut stamped) = fixture();
-		stamped.data = Arc::new(
+		stamped.data = owned_artifact(
 			df!(
 				"facet" => Vec::<&str>::new(),
 				"x" => Vec::<f64>::new(),
@@ -1993,7 +2004,7 @@ mod tests {
 			plan(PlotRequest {
 				source: PlotSource::Materialized {
 					name: "other".to_owned(),
-					data: Arc::clone(&data),
+					data: artifact(&data),
 				},
 				authored_spec: AuthoredPlotSpec::xy(
 					PlotComposition::single(PlotType::Scatter),
@@ -2116,7 +2127,7 @@ mod tests {
 		);
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("channels");
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: owned_artifact(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0047".to_owned(),
 				revision: Some(1),
@@ -2198,7 +2209,7 @@ mod tests {
 		);
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: owned_artifact(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0055".to_owned(),
 				revision: Some(1),
@@ -2294,7 +2305,7 @@ mod tests {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "product-0065-x".into(),
-				data: Arc::clone(&data),
+				data: artifact(&data),
 			},
 			authored_spec: AuthoredPlotSpec::xy(
 				PlotComposition::single(PlotType::Bar),
@@ -2312,7 +2323,7 @@ mod tests {
 		let grid = PlotGrid::value_facet(
 			Arc::clone(&body),
 			&StampedResult {
-				data,
+				data: artifact(&data),
 				provenance: PlotProvenance {
 					source_name: "product-0065-x".into(),
 					revision: Some(1),
@@ -2455,7 +2466,7 @@ mod tests {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "product-0065-y".into(),
-				data: Arc::clone(&data),
+				data: artifact(&data),
 			},
 			authored_spec: AuthoredPlotSpec::xy(
 				PlotComposition::single(PlotType::Bar),
@@ -2473,7 +2484,7 @@ mod tests {
 		let grid = PlotGrid::value_facet(
 			Arc::clone(&body),
 			&StampedResult {
-				data,
+				data: artifact(&data),
 				provenance: PlotProvenance {
 					source_name: "product-0065-y".into(),
 					revision: Some(1),
@@ -2721,7 +2732,7 @@ mod tests {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "product-0065-scatter".into(),
-				data: Arc::clone(&data),
+				data: artifact(&data),
 			},
 			authored_spec: AuthoredPlotSpec::xy(
 				PlotComposition::single(PlotType::Scatter),
@@ -2735,7 +2746,7 @@ mod tests {
 		let grid = PlotGrid::value_facet(
 			Arc::clone(&body),
 			&StampedResult {
-				data,
+				data: artifact(&data),
 				provenance: PlotProvenance {
 					source_name: "product-0065-scatter".into(),
 					revision: Some(1),
@@ -2818,7 +2829,7 @@ mod tests {
 		.with_stacked_bar();
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: owned_artifact(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0064".to_owned(),
 				revision: Some(1),
@@ -2935,7 +2946,7 @@ mod tests {
 		.with_percent();
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame),
+			data: owned_artifact(frame),
 			provenance: PlotProvenance {
 				source_name: "product-0072".to_owned(),
 				revision: Some(1),
@@ -2988,7 +2999,7 @@ mod tests {
 		);
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: owned_artifact(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0070".to_owned(),
 				revision: Some(1),
@@ -3106,7 +3117,7 @@ mod tests {
 		);
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).unwrap();
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: owned_artifact(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0056".to_owned(),
 				revision: Some(1),
@@ -3217,7 +3228,7 @@ mod tests {
 		);
 		let binding = resolve_channels(&authored, frame.schema().as_ref()).expect("channels");
 		let stamped = StampedResult {
-			data: Arc::new(frame.clone()),
+			data: owned_artifact(frame.clone()),
 			provenance: PlotProvenance {
 				source_name: "product-0054".to_owned(),
 				revision: Some(1),
@@ -3303,7 +3314,7 @@ mod tests {
 			.expect("four-cell frame"),
 		);
 		let stamped = StampedResult {
-			data,
+			data: artifact(&data),
 			provenance: stamped.provenance,
 		};
 		let grid = PlotGrid::value_facet(
@@ -4102,7 +4113,7 @@ mod tests {
 		let admissible_x: Vec<f64> = (0..128).map(|index| index as f64).collect();
 		let admissible_y = admissible_x.clone();
 		let admissible = StampedResult {
-			data: Arc::new(
+			data: owned_artifact(
 				df!("facet" => admissible_values, "x" => admissible_x, "y" => admissible_y)
 					.expect("admissible frame"),
 			),
@@ -4139,7 +4150,7 @@ mod tests {
 		let y = x.clone();
 		let data = Arc::new(df!("facet" => values, "x" => x, "y" => y).expect("large frame"));
 		let stamped = StampedResult {
-			data,
+			data: artifact(&data),
 			provenance: stamped.provenance,
 		};
 		let arrangement = GridArrangement::new(23, 23).expect("arrangement");
@@ -4281,7 +4292,7 @@ mod tests {
 			.expect("one-value frame"),
 		);
 		let stamped = StampedResult {
-			data: one_value,
+			data: artifact(&one_value),
 			provenance: stamped.provenance,
 		};
 		let grid = PlotGrid::value_facet(
@@ -4398,7 +4409,7 @@ mod tests {
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "bar facet fixture".to_owned(),
-				data: Arc::clone(&data),
+				data: artifact(&data),
 			},
 			authored_spec: AuthoredPlotSpec::xy(
 				PlotComposition::single(PlotType::Bar),
@@ -4408,7 +4419,7 @@ mod tests {
 		})
 		.expect("bar resolves");
 		let stamped = StampedResult {
-			data,
+			data: artifact(&data),
 			provenance: resolved.resolved_spec.provenance.clone(),
 		};
 		let grid =

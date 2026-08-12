@@ -1,5 +1,6 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
 use crate::adapters::sql_compound::{CompoundTail, plan};
+use crate::result_artifact::ResultArtifact;
 use async_trait::async_trait;
 use bytes::{Buf, BytesMut};
 use polars::{
@@ -61,7 +62,7 @@ impl DatabaseAdapter for PostgresAdapter {
 				pg_to_df(&self.client, query)
 					.await
 					.map(|frame| ExecutionResult::Rows {
-						frame,
+						artifact: ResultArtifact::from_polars(std::sync::Arc::new(frame)),
 						statements: planned.statements,
 					})
 					.unwrap_or_else(|error| ExecutionResult::Err(error.to_string()))

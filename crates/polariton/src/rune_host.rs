@@ -360,7 +360,7 @@ fn plot_show(plot: RunePlot) -> VmResult<Result<(), String>> {
 	let request = PlotRequest {
 		source: PlotSource::Materialized {
 			name: plot.cell.name,
-			data: plot.cell.data,
+			data: crate::result_artifact::ResultArtifact::from_polars(plot.cell.data),
 		},
 		authored_spec,
 	};

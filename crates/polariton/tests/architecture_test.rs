@@ -9,6 +9,23 @@ mod manifest_dependency_guard;
 
 use manifest_dependency_guard::{ProductBoundary, assert_product_dependency_boundary};
 
+fn rust_files(root: &Path) -> Vec<std::path::PathBuf> {
+	let mut pending = vec![root.to_path_buf()];
+	let mut files = Vec::new();
+	while let Some(path) = pending.pop() {
+		for entry in std::fs::read_dir(path).expect("read source directory") {
+			let path = entry.expect("read source entry").path();
+			if path.is_dir() {
+				pending.push(path);
+			} else if path.extension().and_then(|value| value.to_str()) == Some("rs") {
+				files.push(path);
+			}
+		}
+	}
+	files.sort();
+	files
+}
+
 fn crate_root_modules(
 	source: &str,
 	end_marker: &str,
@@ -2427,5 +2444,82 @@ fn product_0082_box_plot_keeps_one_tukey_authority_and_explicit_producer() {
 			&& !boxplot.contains("color_theme.get_color")
 			&& tukey.contains("pub fn new(rows: Vec<TukeyBoxRow>)"),
 		"validated Tukey rows and resolved mark roles must be the surviving substrate"
+	);
+}
+
+#[test]
+fn product_0084_result_artifact_is_the_single_truth_boundary() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let artifact =
+		std::fs::read_to_string(root.join("result_artifact.rs")).expect("read result artifact");
+	let common =
+		std::fs::read_to_string(root.join("adapters/common.rs")).expect("read adapter carriers");
+	let registry =
+		std::fs::read_to_string(root.join("result_registry.rs")).expect("read result registry");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+
+	assert!(common.contains("artifact: Arc<ResultArtifact>"));
+	assert!(common.contains("Result<Arc<ResultArtifact>, RuneDispatchFailure>"));
+	assert!(registry.contains("artifact: Arc<ResultArtifact>"));
+	assert!(spec.contains("pub data: Arc<crate::result_artifact::ResultArtifact>"));
+	assert!(artifact.contains("enum ResultBacking"));
+	assert!(artifact.contains("Arrow(ArrowBacking)"));
+	assert!(artifact.contains("Polars(Arc<DataFrame>)"));
+	assert!(artifact.contains("projection: OnceLock<Result<Arc<DataFrame>, String>>"));
+
+	let toron =
+		std::fs::read_to_string(root.join("adapters/toron/mod.rs")).expect("read Toron adapter");
+	let bigquery =
+		std::fs::read_to_string(root.join("adapters/bigquery.rs")).expect("read BigQuery adapter");
+	assert!(toron.contains("ArrowNullabilityPolicy::Preserve"));
+	assert!(bigquery.contains("ArrowNullabilityPolicy::Unknown"));
+	for adapter in ["sqlite.rs", "postgres.rs", "mysql.rs", "parquet.rs"] {
+		let source = std::fs::read_to_string(root.join("adapters").join(adapter))
+			.unwrap_or_else(|error| panic!("read {adapter}: {error}"));
+		assert!(
+			source.contains("ResultArtifact::from_polars("),
+			"PRODUCT-0084 {adapter} must enter through the policy-free Polars constructor"
+		);
+		assert!(!source.contains("from_arrow_ipc"));
+	}
+
+	let mut projection_decode_sites = Vec::new();
+	for path in rust_files(&root) {
+		let source = std::fs::read_to_string(&path).expect("read Rust source");
+		if source.contains("polars::io::ipc") || source.contains("IpcStreamReader") {
+			projection_decode_sites.push(path);
+		}
+	}
+	assert_eq!(projection_decode_sites, [root.join("result_artifact.rs")]);
+}
+
+#[test]
+fn product_0084_keeps_dataframe_at_the_kernel_boundary_only() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let kernels = root.join("plot/kernels");
+	let mut prepare_signatures = 0_usize;
+	for path in rust_files(&kernels) {
+		let source = std::fs::read_to_string(path).expect("read kernel");
+		for line in source
+			.lines()
+			.filter(|line| line.contains("pub fn prepare_"))
+		{
+			prepare_signatures += 1;
+			let tail = source
+				.split_once(line)
+				.expect("located prepare signature")
+				.1
+				.lines()
+				.take(8)
+				.collect::<String>();
+			assert!(
+				line.contains("DataFrame") || tail.contains("&DataFrame"),
+				"PRODUCT-0084 changed a prepared-data consumer: {line}"
+			);
+		}
+	}
+	assert!(
+		prepare_signatures > 10,
+		"kernel inventory must be substantive"
 	);
 }

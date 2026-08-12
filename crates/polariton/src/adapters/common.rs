@@ -1,7 +1,8 @@
+use crate::result_artifact::ResultArtifact;
 use async_trait::async_trait;
-use polars::frame::DataFrame;
 #[cfg(feature = "toron")]
 use std::ops::Range;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub enum AdapterStage {
@@ -48,7 +49,7 @@ pub enum ExecutionResult {
 	CommandCompleted(String),
 	Err(String),
 	Rows {
-		frame: DataFrame,
+		artifact: Arc<ResultArtifact>,
 		statements: usize,
 	},
 }
@@ -74,7 +75,7 @@ pub struct RuneDispatchFailure {
 }
 
 #[cfg(feature = "toron")]
-pub type RuneDispatchResult = Result<DataFrame, RuneDispatchFailure>;
+pub type RuneDispatchResult = Result<Arc<ResultArtifact>, RuneDispatchFailure>;
 
 #[async_trait]
 pub trait DatabaseAdapter: Send + Sync + 'static {

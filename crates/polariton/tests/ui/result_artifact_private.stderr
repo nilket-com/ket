@@ -1,0 +1,11 @@
+error[E0603]: struct `ArrowBacking` is private
+ --> tests/ui/result_artifact_private.rs:4:22
+  |
+4 | use result_artifact::ArrowBacking;
+  |                      ^^^^^^^^^^^^ private struct
+  |
+note: the struct `ArrowBacking` is defined here
+ --> tests/ui/../../src/result_artifact.rs
+  |
+  | struct ArrowBacking {
+  | ^^^^^^^^^^^^^^^^^^^

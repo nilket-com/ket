@@ -1,5 +1,6 @@
 use crate::adapters::common::{AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult};
 use crate::adapters::sql_compound::{CompoundTail, plan};
+use crate::result_artifact::ResultArtifact;
 use async_trait::async_trait;
 use mysql_async::{Pool, Value as MySqlValue, prelude::Queryable};
 use polars::{
@@ -65,7 +66,7 @@ impl DatabaseAdapter for MySQLAdapter {
 				mysql_to_df(conn, query)
 					.await
 					.map(|frame| ExecutionResult::Rows {
-						frame,
+						artifact: ResultArtifact::from_polars(std::sync::Arc::new(frame)),
 						statements: planned.statements,
 					})
 					.unwrap_or_else(|err| ExecutionResult::Err(err.to_string()))

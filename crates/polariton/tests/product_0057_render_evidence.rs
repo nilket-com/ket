@@ -21,6 +21,8 @@ mod gui;
 mod local_workspace;
 #[path = "../src/plot/mod.rs"]
 mod plot;
+#[path = "../src/result_artifact.rs"]
+mod result_artifact;
 #[path = "../src/result_registry.rs"]
 mod result_registry;
 #[path = "../src/rune_host.rs"]
@@ -1144,10 +1146,11 @@ fn product_0077_percent_grid() -> PlotGridKernel {
 		)
 		.expect("PRODUCT-0077 percent-facet frame"),
 	);
+	let artifact = result_artifact::ResultArtifact::from_polars(Arc::clone(&data));
 	let resolved = plan(PlotRequest {
 		source: PlotSource::Materialized {
 			name: "PRODUCT-0077 percent facets".to_owned(),
-			data: Arc::clone(&data),
+			data: Arc::clone(&artifact),
 		},
 		authored_spec: AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Line), "x", "y"),
 	})
@@ -1155,7 +1158,7 @@ fn product_0077_percent_grid() -> PlotGridKernel {
 	let grid = PlotGrid::value_facet(
 		Arc::new(resolved.resolved_spec),
 		&StampedResult {
-			data,
+			data: artifact,
 			provenance: PlotProvenance {
 				source_name: "PRODUCT-0077 percent facets".to_owned(),
 				revision: None,

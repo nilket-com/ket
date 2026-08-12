@@ -920,7 +920,7 @@ mod tests {
 		resolve_domains(
 			binding,
 			&StampedResult {
-				data: frame,
+				data: crate::result_artifact::ResultArtifact::test_frame(frame.as_ref().clone()),
 				provenance: PlotProvenance {
 					source_name: "scatter fixture".to_owned(),
 					revision: None,

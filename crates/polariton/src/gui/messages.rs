@@ -12,6 +12,8 @@ use crate::plot::request::ResolvedPlot;
 use crate::plot::spec::{ColorIdentity, LayerSettings, LayeredPlotSpec, Override};
 #[cfg(feature = "toron")]
 use crate::plot::theme::PlotSettingsLayer;
+#[cfg(feature = "toron")]
+use crate::result_artifact::ResultArtifact;
 use crate::result_registry::PendingPublication;
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
@@ -179,7 +181,7 @@ pub struct RuneBufferOutcome {
 #[cfg(feature = "toron")]
 #[derive(Clone)]
 pub struct RuneRelationViewSetOutcome {
-	pub result: Arc<polars::frame::DataFrame>,
+	pub result: Arc<ResultArtifact>,
 	pub sinks: Vec<RuneRelationSinkOutcome>,
 }
 
@@ -193,7 +195,7 @@ pub struct RuneRelationSinkOutcome {
 	pub facet: Option<String>,
 	/// Every sink holds the same `Arc` as its containing set. This is the
 	/// stamped-result identity proof, not a value-equivalent copy.
-	pub source: Arc<polars::frame::DataFrame>,
+	pub source: Arc<ResultArtifact>,
 	pub output: std::result::Result<RuneRelationSinkOutput, String>,
 }
 

@@ -312,7 +312,7 @@ fn render_plot_export(
 #[cfg(feature = "toron")]
 fn build_facet_resolved_plot_task(
 	resolved: ResolvedPlot,
-	source: Arc<DataFrame>,
+	source: Arc<crate::result_artifact::ResultArtifact>,
 	facet: Option<String>,
 	layer_settings: Option<crate::plot::spec::LayerSettings>,
 	on_ready: impl FnOnce(
@@ -324,16 +324,20 @@ fn build_facet_resolved_plot_task(
 ) -> Task<Message> {
 	Task::perform(
 		async move {
-			let source = crate::plot::spec::StampedResult {
+			let frame = match source.projection() {
+				Ok(frame) => frame,
+				Err(error) => return (resolved, Err(error.to_string())),
+			};
+			let stamped = crate::plot::spec::StampedResult {
 				data: source,
 				provenance: resolved.resolved_spec.provenance.clone(),
 			};
 			let spec = Arc::new(resolved.resolved_spec.clone());
 			let result = tokio::task::spawn_blocking(move || {
 				let grid = match facet {
-					Some(facet) => PlotGrid::value_facet_derived(spec, &source, facet)
+					Some(facet) => PlotGrid::value_facet_derived(spec, &stamped, facet)
 						.map_err(|error| error.to_string())?,
-					None => PlotGrid::single(spec, Arc::clone(&source.data)),
+					None => PlotGrid::single(spec, frame),
 				};
 				match layer_settings {
 					Some(settings) => PlotGridKernel::from_styled_grid(grid, settings, 1200, 720),
@@ -355,7 +359,7 @@ fn build_facet_resolved_plot_task(
 #[cfg(feature = "toron")]
 fn build_facet_layered_plot_task(
 	specification: crate::plot::spec::LayeredPlotSpec,
-	source: Arc<DataFrame>,
+	source: Arc<crate::result_artifact::ResultArtifact>,
 	facet: Option<String>,
 	on_ready: impl FnOnce(
 		std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String>,
@@ -365,24 +369,27 @@ fn build_facet_layered_plot_task(
 ) -> Task<Message> {
 	Task::perform(
 		async move {
+			let frame = match source.projection() {
+				Ok(frame) => frame,
+				Err(error) => return Err(error.to_string()),
+			};
 			tokio::task::spawn_blocking(move || {
 				let stamped = crate::plot::spec::StampedResult {
-					data: Arc::clone(&source),
+					data: source,
 					provenance: crate::plot::spec::PlotProvenance {
 						source_name: "workspace relation".to_owned(),
 						revision: None,
 					},
 				};
-				let binding =
-					resolve_layered_channels(&specification, stamped.data.schema().as_ref())
-						.map_err(|error| error.to_string())?;
+				let binding = resolve_layered_channels(&specification, frame.schema().as_ref())
+					.map_err(|error| error.to_string())?;
 				let resolved = crate::plot::spec::resolve_layered_domains(binding, &stamped)
 					.map_err(|error| error.to_string())?;
 				let body = Arc::new(resolved.layers.first().spec.clone());
 				let grid = match facet {
 					Some(facet) => PlotGrid::value_facet_derived(body, &stamped, facet)
 						.map_err(|error| error.to_string())?,
-					None => PlotGrid::single(body, Arc::clone(&stamped.data)),
+					None => PlotGrid::single(body, Arc::clone(&frame)),
 				};
 				PlotGridKernel::from_grid_with_factory(grid, 1200, 720, |_, data| {
 					create_layered_plot(&specification, data, 1200, 720)
@@ -809,7 +816,13 @@ fn run_plain_rune_code(
 	code: String,
 ) -> Task<Message> {
 	let capabilities = RuneCapabilities {
-		results: app_state.result_registry.snapshot(),
+		results: match app_state.result_registry.snapshot() {
+			Ok(results) => results,
+			Err(error) => {
+				app_state.status_error = error.to_string();
+				return Task::none();
+			}
+		},
 		..RuneCapabilities::default()
 	};
 	app_state.status_msg = "Rune running…".into();
@@ -1401,7 +1414,7 @@ async fn dispatch_rune_relation_with_palettes(
 ) -> std::result::Result<crate::gui::messages::RuneRelationViewSetOutcome, String> {
 	let result = connection.write().await.dispatch_rune(&view.source).await;
 	match result {
-		Ok(frame) => Ok(rune_view_outcome_with_palettes(frame, view.views, palettes)),
+		Ok(artifact) => rune_view_outcome_with_palettes(artifact, view.views, palettes),
 		Err(failure) => {
 			let location = failure
 				.span
@@ -1486,15 +1499,15 @@ fn resolve_rune_table_skin_with(
 
 #[cfg(feature = "toron")]
 fn rune_view_outcome_with_palettes(
-	frame: DataFrame,
+	result: Arc<crate::result_artifact::ResultArtifact>,
 	views: Vec<SpannedRuneViewIntent>,
 	mut palettes: HashMap<LocalViewIdentity, PreparedRuneCategoricalPalette>,
-) -> crate::gui::messages::RuneRelationViewSetOutcome {
+) -> std::result::Result<crate::gui::messages::RuneRelationViewSetOutcome, String> {
 	use crate::gui::messages::{
 		RuneCategoricalContinuation, RuneRelationSinkOutcome, RuneRelationSinkOutput,
 		RuneRelationViewSetOutcome,
 	};
-	let result = std::sync::Arc::new(frame);
+	let frame = result.projection().map_err(|error| error.to_string())?;
 	let sinks = views
 		.into_iter()
 		.map(|view| {
@@ -1572,7 +1585,7 @@ fn rune_view_outcome_with_palettes(
 						&domain_spans,
 						&tick_step_spans,
 						&minor_tick_spans,
-						result.schema().as_ref(),
+						frame.schema().as_ref(),
 					) {
 						return RuneRelationSinkOutcome {
 							identity,
@@ -1678,7 +1691,7 @@ fn rune_view_outcome_with_palettes(
 										authored_settings,
 									))
 								} else {
-									create_layered_plot(&specification, result.as_ref(), 1200, 720)
+									create_layered_plot(&specification, frame.as_ref(), 1200, 720)
 										.map_err(|error| error.to_string())
 										.and_then(|kernel| {
 											validate_rune_tick_capacity(
@@ -1779,7 +1792,7 @@ fn rune_view_outcome_with_palettes(
 									authored_settings,
 								))
 							} else {
-								create_layered_plot(&specification, result.as_ref(), 1200, 720)
+								create_layered_plot(&specification, frame.as_ref(), 1200, 720)
 									.map_err(|error| error.to_string())
 									.and_then(|kernel| {
 										validate_rune_tick_capacity(
@@ -1817,7 +1830,7 @@ fn rune_view_outcome_with_palettes(
 			});
 			let box_output_span = output.as_ref().err().and_then(|_| {
 				box_diagnostic.as_ref().map(|(fields, origins, mark)| {
-					box_plot_failure_role(result.as_ref(), fields)
+					box_plot_failure_role(frame.as_ref(), fields)
 						.map(|role| origins.for_role(role))
 						.unwrap_or_else(|| mark.clone())
 				})
@@ -1836,7 +1849,7 @@ fn rune_view_outcome_with_palettes(
 			}
 		})
 		.collect();
-	RuneRelationViewSetOutcome { result, sinks }
+	Ok(RuneRelationViewSetOutcome { result, sinks })
 }
 
 #[cfg(all(test, feature = "toron"))]
@@ -1845,7 +1858,12 @@ fn rune_view_outcome(
 	views: Vec<SpannedRuneViewIntent>,
 ) -> crate::gui::messages::RuneRelationViewSetOutcome {
 	let palettes = default_rune_categorical_palettes(&views);
-	rune_view_outcome_with_palettes(frame, views, palettes)
+	rune_view_outcome_with_palettes(
+		crate::result_artifact::ResultArtifact::from_polars(Arc::new(frame)),
+		views,
+		palettes,
+	)
+	.expect("test frame projects")
 }
 
 fn queue_plain_run(
@@ -2418,10 +2436,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			if let Some(claim) = publish.as_ref() {
 				match &er {
-					ExecutionResult::Rows { frame, .. } => {
+					ExecutionResult::Rows { artifact, .. } => {
 						let _ = app_state
 							.result_registry
-							.publish(claim, std::sync::Arc::new(frame.clone()));
+							.publish(claim, std::sync::Arc::clone(artifact));
 					}
 					_ => {
 						let _ = app_state.result_registry.conclude_unbound(claim);
@@ -2454,13 +2472,19 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					set_sql_error(app_state, msg, None);
 				}
 				ExecutionResult::Rows {
-					frame: df,
+					artifact,
 					statements,
 				} => {
-					let rows = df.height();
-					let cols = df.width();
+					let (rows, cols) = artifact.shape();
+					let df = match artifact.projection() {
+						Ok(frame) => frame,
+						Err(error) => {
+							set_sql_error(app_state, error.to_string(), None);
+							return Task::none();
+						}
+					};
 					app_state.code_editor.begin_query();
-					app_state.code_editor.set_query_result(df.clone());
+					app_state.code_editor.set_query_result(df.as_ref().clone());
 					app_state.status_df_size = Some((rows, cols));
 					set_sql_status(
 						app_state,
@@ -2634,12 +2658,18 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						let sink_facet = sink.facet.clone();
 						match sink.output {
 							Ok(RuneRelationSinkOutput::Table(presentation)) => {
-								let frame = sink.source.as_ref().clone();
+								let frame = match sink.source.projection() {
+									Ok(frame) => frame,
+									Err(error) => {
+										errors.push(error.to_string());
+										continue;
+									}
+								};
 								let rows = frame.height();
 								let cols = frame.width();
 								app_state.code_editor.set_rune_view_table_with_presentation(
 									panel_id,
-									frame.clone(),
+									frame.as_ref().clone(),
 									presentation.skin,
 									presentation.authored_show_column_types,
 								);
@@ -2945,23 +2975,29 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
 				ExecutionResult::Rows {
-					frame: df,
+					artifact,
 					statements,
 				} => {
-					let rows = df.height();
-					let cols = df.width();
+					let (rows, cols) = artifact.shape();
+					let df = match artifact.projection() {
+						Ok(frame) => frame,
+						Err(error) => {
+							set_sql_error(app_state, error.to_string(), Some(source_start_line));
+							return Task::none();
+						}
+					};
 					// Presentation never decides data availability: a named SQL cell
 					// remains a Rune input even when it renders in a pane or nowhere.
 					app_state
 						.code_editor
-						.retain_markdown_cell_table(identity.clone(), &df);
+						.retain_markdown_cell_table(identity.clone(), df.as_ref());
 					match presentation.output {
 						MarkdownCellOutputTarget::Inline => app_state
 							.code_editor
-							.set_markdown_cell_table(identity, df.clone()),
+							.set_markdown_cell_table(identity, df.as_ref().clone()),
 						MarkdownCellOutputTarget::Pane => {
 							app_state.code_editor.begin_query();
-							app_state.code_editor.set_query_result(df.clone())
+							app_state.code_editor.set_query_result(df.as_ref().clone())
 						}
 						MarkdownCellOutputTarget::None => {}
 					}
@@ -3892,8 +3928,37 @@ mod tests {
 					span: None,
 				});
 			}
-			Ok(polars::df!("x" => [1_i64], "y" => [2_i64]).expect("fixture frame"))
+			Ok(crate::result_artifact::ResultArtifact::test_frame(
+				polars::df!("x" => [1_i64], "y" => [2_i64]).expect("fixture frame"),
+			))
 		}
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0084_rune_transport_preserves_one_artifact_allocation() {
+		let relation =
+			transform_rune_view("workspace.table(\"t\").views([table(), scatter(\"x\", \"y\")])")
+				.expect("Rune relation fixture")
+				.into_relations()
+				.next()
+				.expect("one relation");
+		let artifact = crate::result_artifact::ResultArtifact::test_frame(
+			polars::df!("x" => [1_i64], "y" => [2_i64]).expect("fixture frame"),
+		);
+		let transport: crate::adapters::common::RuneDispatchResult = Ok(Arc::clone(&artifact));
+		let transported = transport.expect("Rune transport accepts the artifact");
+		assert!(Arc::ptr_eq(&artifact, &transported));
+		let palettes = super::default_rune_categorical_palettes(&relation.views);
+		let outcome = super::rune_view_outcome_with_palettes(transported, relation.views, palettes)
+			.expect("views resolve");
+		assert!(Arc::ptr_eq(&artifact, &outcome.result));
+		assert!(
+			outcome
+				.sinks
+				.iter()
+				.all(|sink| Arc::ptr_eq(&artifact, &sink.source))
+		);
 	}
 
 	#[cfg(feature = "toron")]
@@ -3922,7 +3987,7 @@ mod tests {
 				crate::rune_relation_envelope::ViewPresentation,
 				crate::plot::spec::LayeredPlotSpec,
 				crate::plot::theme::PlotSettingsLayer,
-				Arc<polars::frame::DataFrame>,
+				Arc<crate::result_artifact::ResultArtifact>,
 				std::ops::Range<u32>,
 			),
 		}
@@ -3933,7 +3998,12 @@ mod tests {
 			.map(|view| view.identity.clone())
 			.collect::<Vec<_>>();
 		let palettes = super::prepare_rune_categorical_palettes(state, source_buffer, &relation);
-		let outcome = super::rune_view_outcome_with_palettes(frame, relation.views, palettes);
+		let outcome = super::rune_view_outcome_with_palettes(
+			crate::result_artifact::ResultArtifact::test_frame(frame),
+			relation.views,
+			palettes,
+		)
+		.expect("fixture projects");
 		let plots = outcome
 			.sinks
 			.iter()
@@ -4057,7 +4127,12 @@ mod tests {
 					source,
 					span,
 				) => {
-					let result = create_layered_plot(&specification, source.as_ref(), 1200, 720);
+					let result = source
+						.projection()
+						.map_err(|error| error.to_string())
+						.and_then(|frame| {
+							create_layered_plot(&specification, frame.as_ref(), 1200, 720)
+						});
 					drop(update(
 						state,
 						Message::RuneRelationLayeredPlotReady {
@@ -5350,7 +5425,8 @@ ket.table("test2") // Comment Test1.
 		else {
 			panic!("the envelope must hand a layered specification to the head")
 		};
-		let Err(error) = create_layered_plot(specification, sink.source.as_ref(), 1200, 720) else {
+		let projected = sink.source.projection().expect("fixture projection");
+		let Err(error) = create_layered_plot(specification, projected.as_ref(), 1200, 720) else {
 			panic!("PRODUCT-0013 must own incompatible field refusal")
 		};
 		assert!(error.contains("layer 2"));
@@ -7112,7 +7188,6 @@ workspace.table("bad").views([view("bad", table())]);
 		use crate::plot::request::{PlotRequest, PlotSource, plan};
 		use crate::plot::spec::AuthoredPlotSpec;
 		use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
-		use std::sync::Arc;
 
 		let (mut state, startup) = new(StartupData::default(), None);
 		drop(startup);
@@ -7121,7 +7196,7 @@ workspace.table("bad").views([view("bad", table())]);
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
 				name: "plain".to_owned(),
-				data: Arc::new(
+				data: crate::result_artifact::ResultArtifact::test_frame(
 					polars::df!("x" => [1.0_f64, 2.0], "y" => [3.0_f64, 5.0]).expect("plain frame"),
 				),
 			},
@@ -7273,7 +7348,7 @@ workspace.table("bad").views([view("bad", table())]);
 			let resolved = plan(PlotRequest {
 				source: PlotSource::Materialized {
 					name: "markdown".to_owned(),
-					data: Arc::new(
+					data: crate::result_artifact::ResultArtifact::test_frame(
 						polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 3.0])
 							.expect("markdown frame"),
 					),
@@ -8455,9 +8530,11 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			..crate::plot::theme::PlotSettings::default()
 		}
 		.resolve();
-		let kernel =
-			create_layered_plot(specification, outcome.sinks[0].source.as_ref(), 1200, 720)
-				.unwrap();
+		let projected = outcome.sinks[0]
+			.source
+			.projection()
+			.expect("fixture projection");
+		let kernel = create_layered_plot(specification, projected.as_ref(), 1200, 720).unwrap();
 		assert!(matches!(
 			kernel.layout(settings.clone()),
 			PlotLayout::Cartesian { x_range, y_range, .. }
@@ -9155,10 +9232,13 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		let stale_identity = relation.views[0].identity.clone();
 		let palettes = super::prepare_rune_categorical_palettes(&state, source_buffer, &relation);
 		let outcome = super::rune_view_outcome_with_palettes(
-			categorical_bar_frame(&["A", "B", "C", "D"]),
+			crate::result_artifact::ResultArtifact::test_frame(categorical_bar_frame(&[
+				"A", "B", "C", "D",
+			])),
 			relation.views,
 			palettes,
-		);
+		)
+		.expect("fixture projects");
 		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(
 			stale_resolved,
 			stale_settings,
@@ -9360,7 +9440,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			&mut state,
 			Message::RunResult {
 				result: ExecutionResult::Rows {
-					frame,
+					artifact: crate::result_artifact::ResultArtifact::test_frame(frame),
 					statements: 3,
 				},
 				publish: None,

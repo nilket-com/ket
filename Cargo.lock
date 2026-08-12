@@ -6323,6 +6323,10 @@ dependencies = [
 name = "polariton"
 version = "0.1.0"
 dependencies = [
+ "arrow-array",
+ "arrow-buffer",
+ "arrow-ipc",
+ "arrow-schema",
  "async-trait",
  "base64 0.22.1",
  "bytes",

@@ -8,6 +8,7 @@ mod gui;
 #[cfg(feature = "toron")]
 mod local_workspace;
 mod plot;
+mod result_artifact;
 mod result_registry;
 mod rune_host;
 #[cfg(feature = "toron")]

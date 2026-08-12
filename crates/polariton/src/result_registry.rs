@@ -7,7 +7,7 @@
 //! without a tabular final result, leaves the name unbound rather than
 //! restoring stale data (`plans/wip/rune-data-products.md`).
 
-use polars::frame::DataFrame;
+use crate::result_artifact::{ResultArtifact, ResultArtifactError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -46,7 +46,7 @@ pub struct ResultProvenance {
 }
 
 struct PublishedResult {
-	data: Arc<DataFrame>,
+	artifact: Arc<ResultArtifact>,
 	provenance: ResultProvenance,
 }
 
@@ -82,7 +82,7 @@ impl ResultRegistry {
 
 	/// Bind the completed frame, unless a newer dispatch has claimed the name.
 	/// Returns whether the publication took effect.
-	pub fn publish(&mut self, claim: &PendingPublication, data: Arc<DataFrame>) -> bool {
+	pub fn publish(&mut self, claim: &PendingPublication, artifact: Arc<ResultArtifact>) -> bool {
 		if !self.concludes_latest_dispatch(claim) {
 			return false;
 		}
@@ -92,12 +92,17 @@ impl ResultRegistry {
 			revision: claim.revision,
 			connection: claim.connection.clone(),
 			completed_at: SystemTime::now(),
-			rows: data.height(),
-			cols: data.width(),
+			rows: artifact.height(),
+			cols: artifact.width(),
 			data_kind: ResultDataKind::Materialized,
 		};
-		self.bound
-			.insert(claim.name.clone(), PublishedResult { data, provenance });
+		self.bound.insert(
+			claim.name.clone(),
+			PublishedResult {
+				artifact,
+				provenance,
+			},
+		);
 		true
 	}
 
@@ -117,11 +122,23 @@ impl ResultRegistry {
 	}
 
 	/// The immutable workspace a Rune execution receives, cloned at dispatch.
-	pub fn snapshot(&self) -> HashMap<String, Arc<DataFrame>> {
+	pub fn snapshot(
+		&self,
+	) -> Result<HashMap<String, Arc<polars::frame::DataFrame>>, ResultArtifactError> {
 		self.bound
 			.iter()
-			.map(|(name, published)| (name.clone(), published.data.clone()))
+			.map(|(name, published)| {
+				published
+					.artifact
+					.projection()
+					.map(|frame| (name.clone(), frame))
+			})
 			.collect()
+	}
+
+	#[cfg(test)]
+	pub fn artifact(&self, name: &str) -> Option<&Arc<ResultArtifact>> {
+		self.bound.get(name).map(|published| &published.artifact)
 	}
 
 	#[allow(dead_code)] // The plot-surface reader lands with plan step 8.
@@ -187,8 +204,8 @@ mod tests {
 	use libaryon::core::BufferId;
 	use polars::df;
 
-	fn frame(value: i32) -> Arc<DataFrame> {
-		Arc::new(df!("x" => [value]).expect("frame"))
+	fn frame(value: i32) -> Arc<ResultArtifact> {
+		ResultArtifact::test_frame(df!("x" => [value]).expect("frame"))
 	}
 
 	fn begin(registry: &mut ResultRegistry, name: &str) -> PendingPublication {
@@ -200,7 +217,7 @@ mod tests {
 		let mut registry = ResultRegistry::default();
 		let claim = begin(&mut registry, "test");
 		assert!(registry.publish(&claim, frame(1)));
-		assert_eq!(registry.snapshot().len(), 1);
+		assert_eq!(registry.snapshot().expect("snapshot").len(), 1);
 		let provenance = registry.provenance("test").expect("provenance recorded");
 		assert_eq!(provenance.source_buffer, BufferId::new(7));
 		assert_eq!(provenance.rows, 1);
@@ -216,7 +233,7 @@ mod tests {
 		assert!(registry.publish(&claim, frame(1)));
 		let _running = begin(&mut registry, "test");
 		assert!(
-			registry.snapshot().is_empty(),
+			registry.snapshot().expect("snapshot").is_empty(),
 			"stale data must not be observable while a newer query runs"
 		);
 	}
@@ -228,7 +245,7 @@ mod tests {
 		let new = begin(&mut registry, "test");
 		assert!(registry.publish(&new, frame(2)));
 		assert!(!registry.publish(&old, frame(1)));
-		let snapshot = registry.snapshot();
+		let snapshot = registry.snapshot().expect("snapshot");
 		let bound = snapshot.get("test").expect("newer publication bound");
 		assert_eq!(
 			bound.column("x").unwrap().i32().unwrap().get(0),
@@ -244,7 +261,7 @@ mod tests {
 		assert!(registry.publish(&first, frame(1)));
 		let failed = begin(&mut registry, "test");
 		assert!(registry.conclude_unbound(&failed));
-		assert!(registry.snapshot().is_empty());
+		assert!(registry.snapshot().expect("snapshot").is_empty());
 	}
 
 	#[test]

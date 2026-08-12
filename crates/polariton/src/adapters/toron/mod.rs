@@ -1,9 +1,8 @@
-mod polars_compat;
-
 use crate::adapters::common::{
 	AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult, RuneDispatchFailure,
 	RuneDispatchFailureKind, RuneDispatchResult,
 };
+use crate::result_artifact::{ArrowNullabilityPolicy, ResultArtifact};
 use async_trait::async_trait;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
@@ -40,9 +39,9 @@ impl DatabaseAdapter for ToronAdapter {
 				ExecutionResult::Affected(result.row_count)
 			};
 		}
-		match polars_compat::decode_batches(&result.batches) {
-			Ok(frame) => ExecutionResult::Rows {
-				frame,
+		match ResultArtifact::from_arrow_ipc(result.batches, ArrowNullabilityPolicy::Preserve) {
+			Ok(artifact) => ExecutionResult::Rows {
+				artifact,
 				statements: 1,
 			},
 			Err(error) => ExecutionResult::Err(format!("Toron result conversion failed: {error}")),
@@ -76,11 +75,13 @@ impl DatabaseAdapter for ToronAdapter {
 					span: None,
 				},
 			})?;
-		polars_compat::decode_batches(&result.batches).map_err(|message| RuneDispatchFailure {
-			kind: RuneDispatchFailureKind::Execution,
-			message: format!("Toron Rune result conversion failed: {message}"),
-			span: None,
-		})
+		ResultArtifact::from_arrow_ipc(result.batches, ArrowNullabilityPolicy::Preserve).map_err(
+			|error| RuneDispatchFailure {
+				kind: RuneDispatchFailureKind::Execution,
+				message: format!("Toron Rune result conversion failed: {error}"),
+				span: None,
+			},
+		)
 	}
 }
 
@@ -143,7 +144,10 @@ mod tests {
 					return Err(format!("self-seed failed: {error}"));
 				}
 			}
-			let ExecutionResult::Rows { frame, statements } = dispatch_live_fixture(
+			let ExecutionResult::Rows {
+				artifact,
+				statements,
+			} = dispatch_live_fixture(
 				&mut adapter,
 				&format!("SELECT x, y FROM {table} ORDER BY x"),
 			)
@@ -151,6 +155,7 @@ mod tests {
 			else {
 				return Err("Toron SELECT did not return rows".to_owned());
 			};
+			let frame = artifact.projection().map_err(|error| error.to_string())?;
 			if statements != 1 || frame.shape() != (4, 2) {
 				return Err(format!(
 					"self-seeded query returned statements={statements}, shape={:?}",
@@ -198,6 +203,46 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[ignore = "requires a live Toron SQL endpoint"]
+	async fn live_product_0084_nullable_schema_survives_the_toron_transport() {
+		use crate::result_artifact::FieldNullability;
+
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+		let result = adapter
+			.dispatch(concat!(
+				"SELECT COUNT(*) AS required_value, ",
+				"NULLIF(COUNT(*), 9999) AS optional_value ",
+				"FROM demo_sales GROUP BY region LIMIT 1",
+			))
+			.await;
+		let ExecutionResult::Rows { artifact, .. } = result else {
+			panic!("asymmetric query must return rows, got {result:?}")
+		};
+		assert_eq!(
+			artifact
+				.schema()
+				.field("required_value")
+				.unwrap()
+				.nullability(),
+			FieldNullability::Known(false)
+		);
+		assert_eq!(
+			artifact
+				.schema()
+				.field("optional_value")
+				.unwrap()
+				.nullability(),
+			FieldNullability::Known(true)
+		);
+		assert!(!artifact.row_is_null("required_value", 0).unwrap());
+		assert!(!artifact.row_is_null("optional_value", 0).unwrap());
+		assert!(!artifact.projection_is_built());
+	}
+
+	#[tokio::test]
 	#[ignore = "requires the dogfood test2 relation on a live local Toron"]
 	async fn live_rune_relation_reaches_table_bar_and_scatter_surfaces() {
 		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
@@ -207,10 +252,11 @@ mod tests {
 		let source = "let r = workspace.table(\"test2\").sort([col(\"cat\").asc()]); table(r); let marker = 1; plot.bar(r, \"cat\", \"val\"); let tail = marker + 1; plot.scatter(r, \"cat\", \"val\")";
 		let view = transform_rune_view(source).expect("fan-out view envelope");
 		let view = view.into_relations().next().expect("one relation");
-		let frame = adapter
+		let artifact = adapter
 			.dispatch_rune(&view.source)
 			.await
 			.expect("one Rune relation result");
+		let frame = artifact.projection().expect("Toron projection");
 		assert!(frame.height() > 0, "dogfood relation is nonempty");
 		assert_eq!(view.views.len(), 3);
 		for view in view.views {
@@ -273,10 +319,11 @@ mod tests {
 			.into_relations()
 			.next()
 			.expect("one relation");
-		let frame = adapter
+		let artifact = adapter
 			.dispatch_rune(&relation.source)
 			.await
 			.expect("one Rune relation result");
+		let frame = artifact.projection().expect("Toron projection");
 		let [view] = relation.views.as_slice() else {
 			panic!("line fixture must produce exactly one view");
 		};
@@ -328,10 +375,11 @@ mod tests {
 		let source = "ket.table(\"test2\").sort([col(\"cat\").asc()]).views([table(), bar(\"cat\", \"val\"), scatter(\"cat\", \"val\")])";
 		let view = transform_rune_view(source).expect("PRODUCT-0008 view envelope");
 		let view = view.into_relations().next().expect("one relation");
-		let frame = adapter
+		let artifact = adapter
 			.dispatch_rune(&view.source)
 			.await
 			.expect("one Rune relation result");
+		let frame = artifact.projection().expect("Toron projection");
 		assert!(frame.height() > 0, "dogfood relation is nonempty");
 		assert_eq!(view.views.len(), 3);
 		for view in view.views {

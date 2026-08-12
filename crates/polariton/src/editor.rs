@@ -5438,7 +5438,7 @@ mod tests {
 		let resolved = crate::plot::request::plan(crate::plot::request::PlotRequest {
 			source: crate::plot::request::PlotSource::Materialized {
 				name: "PRODUCT-0075 fixture".to_owned(),
-				data: std::sync::Arc::new(
+				data: crate::result_artifact::ResultArtifact::test_frame(
 					polars::df!("x" => [1.0_f64, 2.0], "y" => [2.0_f64, 4.0]).expect("plot frame"),
 				),
 			},
@@ -7237,7 +7237,7 @@ mod tests {
 			"a three-series Area publishes schema v2 and restores every exact palette position"
 		);
 		let frame = crate::plot::spec::StampedResult {
-			data: std::sync::Arc::new(
+			data: crate::result_artifact::ResultArtifact::test_frame(
 				polars::df!(
 					"region" => ["East", "East"],
 					"revenue" => [40.0, 60.0],
@@ -7258,12 +7258,13 @@ mod tests {
 		);
 		let stacked = grouped.clone().with_stacked_bar();
 		let percent = stacked.clone().with_percent();
+		let projected = frame.data.projection().expect("fixture projection");
 		let grouped_binding =
-			crate::plot::spec::resolve_channels(&grouped, frame.data.schema().as_ref()).unwrap();
+			crate::plot::spec::resolve_channels(&grouped, projected.schema().as_ref()).unwrap();
 		let stacked_binding =
-			crate::plot::spec::resolve_channels(&stacked, frame.data.schema().as_ref()).unwrap();
+			crate::plot::spec::resolve_channels(&stacked, projected.schema().as_ref()).unwrap();
 		let percent_binding =
-			crate::plot::spec::resolve_channels(&percent, frame.data.schema().as_ref()).unwrap();
+			crate::plot::spec::resolve_channels(&percent, projected.schema().as_ref()).unwrap();
 		let (grouped_resolved, _) =
 			crate::plot::spec::resolve_domains(grouped_binding, &frame, &restored_grouped_identity)
 				.unwrap();

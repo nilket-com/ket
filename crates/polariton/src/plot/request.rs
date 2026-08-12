@@ -12,6 +12,7 @@ use crate::plot::spec::{
 	OptionalAuthoredChannel, PlotProvenance, ResolvedPlotSpec, StampedResult, resolve_channels,
 	resolve_domains, resolve_domains_with_categorical_palette,
 };
+use crate::result_artifact::ResultArtifact;
 use polars::frame::DataFrame;
 use std::sync::Arc;
 
@@ -22,7 +23,10 @@ use std::sync::Arc;
 /// snapshots from sources that still require planning.
 #[derive(Clone, Debug)]
 pub enum PlotSource {
-	Materialized { name: String, data: Arc<DataFrame> },
+	Materialized {
+		name: String,
+		data: Arc<ResultArtifact>,
+	},
 }
 
 /// A plot published by a Rune execution, not yet validated or fetched.
@@ -39,6 +43,7 @@ pub struct ResolvedPlot {
 	#[allow(dead_code)] // Retained for session durability; no surface is accepted yet.
 	pub authored_spec: Box<AuthoredPlotSpec>,
 	pub data: Arc<DataFrame>,
+	pub artifact: Arc<ResultArtifact>,
 	pub resolved_spec: ResolvedPlotSpec,
 }
 
@@ -46,7 +51,7 @@ pub struct ResolvedPlot {
 impl ResolvedPlot {
 	pub fn into_live_artifact(self) -> Result<crate::plot::durable::DurablePlot, String> {
 		let result = StampedResult {
-			data: self.data,
+			data: self.artifact,
 			provenance: self.resolved_spec.provenance.clone(),
 		};
 		crate::plot::durable::DurablePlot::live(*self.authored_spec, result)
@@ -54,7 +59,7 @@ impl ResolvedPlot {
 
 	pub fn into_pinned_artifact(self) -> Result<crate::plot::durable::DurablePlot, String> {
 		let result = StampedResult {
-			data: self.data,
+			data: self.artifact,
 			provenance: self.resolved_spec.provenance.clone(),
 		};
 		crate::plot::durable::DurablePlot::pinned(*self.authored_spec, self.resolved_spec, result)
@@ -70,7 +75,8 @@ impl ResolvedPlot {
 pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 	match request.source {
 		PlotSource::Materialized { name, data } => {
-			let binding = resolve_channels(&request.authored_spec, data.schema().as_ref())
+			let frame = data.projection().map_err(|error| error.to_string())?;
+			let binding = resolve_channels(&request.authored_spec, frame.schema().as_ref())
 				.map_err(|error| format!("{name}: {error}"))?;
 			let stamped = StampedResult {
 				data: Arc::clone(&data),
@@ -81,13 +87,14 @@ pub fn plan(request: PlotRequest) -> Result<ResolvedPlot, String> {
 			};
 			let (resolved_spec, _) = resolve_domains(binding, &stamped, &ColorIdentity::default())
 				.map_err(|error| format!("{name}: {error}"))?;
-			validate_prepared_contract(&resolved_spec, data.as_ref())
+			validate_prepared_contract(&resolved_spec, frame.as_ref())
 				.map_err(|error| format!("{name}: {error}"))?;
-			let data = project_named_channels(&request.authored_spec, data, &name)?;
+			let projected = project_named_channels(&request.authored_spec, frame, &name)?;
 			Ok(ResolvedPlot {
 				source_name: name,
 				authored_spec: Box::new(request.authored_spec),
-				data,
+				data: projected,
+				artifact: data,
 				resolved_spec,
 			})
 		}
@@ -103,7 +110,8 @@ pub fn plan_with_categorical_palette(
 ) -> Result<(ResolvedPlot, ColorIdentity), String> {
 	match request.source {
 		PlotSource::Materialized { name, data } => {
-			let binding = resolve_channels(&request.authored_spec, data.schema().as_ref())
+			let frame = data.projection().map_err(|error| error.to_string())?;
+			let binding = resolve_channels(&request.authored_spec, frame.schema().as_ref())
 				.map_err(|error| format!("{name}: {error}"))?;
 			let stamped = StampedResult {
 				data: Arc::clone(&data),
@@ -115,14 +123,15 @@ pub fn plan_with_categorical_palette(
 			let (resolved_spec, next_identity) =
 				resolve_domains_with_categorical_palette(binding, &stamped, identity, selection)
 					.map_err(|error| format!("{name}: {error}"))?;
-			validate_prepared_contract(&resolved_spec, data.as_ref())
+			validate_prepared_contract(&resolved_spec, frame.as_ref())
 				.map_err(|error| format!("{name}: {error}"))?;
-			let data = project_named_channels(&request.authored_spec, data, &name)?;
+			let projected = project_named_channels(&request.authored_spec, frame, &name)?;
 			Ok((
 				ResolvedPlot {
 					source_name: name,
 					authored_spec: Box::new(request.authored_spec),
-					data,
+					data: projected,
+					artifact: data,
 					resolved_spec,
 				},
 				next_identity,
@@ -215,7 +224,7 @@ mod tests {
 	fn materialized(name: &str, data: DataFrame) -> PlotSource {
 		PlotSource::Materialized {
 			name: name.to_owned(),
-			data: Arc::new(data),
+			data: ResultArtifact::test_frame(data),
 		}
 	}
 
