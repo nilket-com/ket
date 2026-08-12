@@ -773,9 +773,16 @@ impl KllSketch {
 /// randomness. Deriving its compatibility-only stream from the complete encoded
 /// state keeps decode pure and separates distinct states without a process-global
 /// ordinal. Byte-identical legacy states intentionally resume the same stream;
-/// fresh sketches never use this path. Because the derivation observes retained
-/// data, later compaction of recovered legacy state does not inherit the
-/// fresh-sketch probability guarantee; this is a rolling-compatibility path only.
+/// fresh sketches never use this path.
+///
+/// Because the derivation observes retained data, the seed is by construction not
+/// independent of the data, so a recovered sketch compacting **on its own** does
+/// not inherit the fresh-sketch probability guarantee. The absence is bounded to
+/// that state: `merge` folds both operands' seeds through `merge_randomness`, so
+/// once a recovered sketch merges with a properly seeded one the resulting stream
+/// carries a CSPRNG-derived component again. This is a rolling-compatibility path
+/// only, and the gap closes at the first such merge rather than persisting
+/// downstream.
 fn legacy_randomness_from_content(
 	arrow_type_tag: u8,
 	k: KllK,
