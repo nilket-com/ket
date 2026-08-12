@@ -33,7 +33,7 @@ in none of them.
 | prerequisite | marks blocked |
 |---|---|
 | **A. Categorical colour identity + persistence** | pie, violin, radar, radial dial, parallel, funnel |
-| **B. Continuous colour-scale authoring** (CI-02) | heatmap, bubble |
+| **B. Continuous colour authority** — three records, see below (CI-02) | heatmap, bubble |
 | **C. Relation-side aggregation** | pie, violin |
 | **D. Variadic dimension fields** | radar, parallel |
 | **E. Explicit row / cardinality rules** | radial dial, funnel, heatmap |
@@ -43,6 +43,44 @@ in none of them.
 encode a *quantitative* value as colour with a gradient legend; they need a
 sequential/diverging scale authority and allocate **no** categorical
 `ColorIdentity`. The other six encode categories and do.
+
+### B splits three ways — Stage 0, 2026-08-12
+
+Tracing the ramp inputs and the guide contract found that heatmap and bubble are
+**not** one problem, and that the existing gradient legend is already wrong.
+
+**The gradient legend misrepresents every multi-stop ramp, today.**
+`LegendSection::Gradient` carries exactly two colour stops
+(`plot/legend.rs:38-44`), and the swatch is painted by
+`lerp(*low_color, *high_color, t)` (`:587`) — a straight two-stop interpolation
+— while the marks sample the full ramp. Under viridis the marks run purple →
+blue → teal → green → yellow while the legend runs purple → yellow through
+browns the data never uses. A reader matching a mid-range cell against the
+legend lands in the wrong place. This also violates PRODUCT-0043's own rule that
+a section carries **every value it prints**: this one prints colours it never
+names. It is a shipped misrepresentation, not a missing feature, and it must be
+repaired before any new palette can claim honest guidance.
+
+**Their domains differ.** Bubble already normalizes correctly — `color_range:
+(f64, f64)` (`bubble.rs:22`) with `t = (val − min) / (max − min)` and a
+zero-width guard — so signed and diverging data work. Heatmap is single-ended:
+only `max_val` is retained (`heatmap.rs:117`), `t = val / max_val` (`:36-37`)
+sends negatives out of range, `max_val <= 0` collapses every cell to `t = 0`,
+and its legend asserts `low: 0.0` and a literal `label: "Value"` regardless of
+the data. **Bubble is therefore the parity subject** for the guide repair;
+heatmap owes its own substrate decision.
+
+Hence three records rather than one:
+
+- **B1 — honest gradient content and rendering.** The guide model carries
+  **ordered positioned stops**, not endpoint colours, so nonlinear and diverging
+  ramps stay representable. Bank the current viridis midpoint mismatch first; it
+  is a free banked red state, since the defect is live.
+- **B2 — heatmap substrate.** A two-ended signed domain and an explicit
+  duplicate-cell authority, replacing the silent `values[xi][yi] = val`
+  overwrite (`heatmap.rs:103`).
+- **B3 — sequential/diverging palette authoring** for heatmap and bubble,
+  closing CI-02 over a guide that no longer lies.
 
 ### Why A forces a persistence decision
 
@@ -68,26 +106,31 @@ band-fill path.
 
 ## Sequence
 
-1. **Extensible categorical family identity + v3 persistence.** PRODUCT-0086
+1. **Extensible categorical family identity + v3 persistence — LANDED as
+   PRODUCT-0086** (`ce40c5f5`/`45913cc4`). PRODUCT-0086
    keeps family in the lineage key but makes its durable identifier bounded and
    forward-preservable. It removes the shared persistence block; each of the six
    mark records still earns its own identifier and colour consumer.
-2. **Continuous sequential/diverging scale authority.** Closes **CI-02**, whose
+2. **Honest multi-stop gradient content and rendering (B1).** Leads, because it
+   repairs a shipped misrepresentation and nothing downstream can claim honest
+   guidance until it lands. Parity subject: bubble.
+3. **Heatmap substrate (B2).** Two-ended signed domain and duplicate-cell
+   authority.
+4. **Sequential/diverging palette authoring (B3).** Closes **CI-02**, whose
    if-asked trigger is heatmap and bubble arriving together. Touches **CI-03**,
    since a real sequential authority is what finally displaces the legacy ramp.
-3. **Funnel** — the smallest categorical consumer, *but only after its row-order
+5. **Funnel** — the smallest categorical consumer, *but only after its row-order
    and stage-monotonicity contract is explicit*.
-4. **Radial dial** — needs prerequisite E; its silent first-row selection is the
+6. **Radial dial** — needs prerequisite E; its silent first-row selection is the
    PRODUCT-0078 defect class again.
-5. **Pie** — after removing its aggregation authority, which Toron can now supply
+7. **Pie** — after removing its aggregation authority, which Toron can now supply
    as pre-aggregated category/value rows.
-6. **Radar + parallel together** over one dimension-list substrate. They are the
+8. **Radar + parallel together** over one dimension-list substrate. They are the
    only two needing D, and solving it twice would produce two vocabularies.
-7. **Bubble + heatmap** over the continuous authority from step 2. Heatmap
-   additionally owes a duplicate-cell rule and a signed/diverging domain.
-8. **Violin last**, with the KDE moved out of the renderer. By the box-plot
-   precedent this is likely a Toron capability question rather than a Polariton
-   one.
+9. **Bubble + heatmap surfaces** over the authority from steps 2–4.
+10. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+    precedent this is likely a Toron capability question rather than a Polariton
+    one.
 
 ## What this plan does not decide
 
