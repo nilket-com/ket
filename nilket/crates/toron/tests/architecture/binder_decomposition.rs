@@ -306,6 +306,12 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/tests/cross_join_test.rs",
 				// ADR 409: existing integration fixtures fill the new scan estimate metadata field.
 				"crates/toron/tests/ctas_test.rs",
+				// Destructive OR REPLACE is refused until staged publication exists.
+				// The create and drop batteries assert that refusal and re-reach the
+				// shared drop helper through explicit DROP; neither alters binder
+				// decomposition ownership.
+				"crates/toron/tests/create_table_test.rs",
+				"crates/toron/tests/drop_table_test.rs",
 				"crates/toron/tests/distributed_process_test.rs",
 				"crates/toron/tests/exists_decorrelation_test.rs",
 				"crates/toron/tests/explain_analyze_test.rs",

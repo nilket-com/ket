@@ -670,30 +670,13 @@ async fn create_or_replace_table_creates_when_absent() {
 }
 
 #[tokio::test]
-async fn create_or_replace_table_replaces_existing_schema() {
-	let (catalog, _storage, coordinator, planner) = storage_coordinator();
-
-	for sql in [
-		"CREATE TABLE sales (id INT NOT NULL)",
-		"CREATE OR REPLACE TABLE sales (amount BIGINT, note TEXT)",
-	] {
-		coordinator
-			.execute_query(&planner.plan(sql).expect("plan SQL"), None)
-			.await
-			.expect(sql);
-	}
-
-	let binding = catalog
-		.resolve_table(&TableRef::new("sales"))
-		.await
-		.expect("replacement binding");
-	assert_eq!(binding.schema.fields().len(), 2);
-	assert_field(&binding.schema, 0, "amount", &DataType::Int64, true);
-	assert_field(&binding.schema, 1, "note", &DataType::Utf8, true);
-}
-
-#[tokio::test]
-async fn create_or_replace_table_produces_fresh_object_id() {
+async fn create_or_replace_table_over_an_existing_table_is_refused() {
+	// Withdrawn until staged publication exists. The plain create path shares
+	// `drop_existing_table_with_storage_admin` with CTAS: storage and the catalog
+	// entry are destroyed durably before the replacement is created, so a failure
+	// in the create leaves no table. The exposed window is narrower here than for
+	// CTAS — it spans the catalog create rather than create-plus-write — but a
+	// narrower destructive window is still a destructive window.
 	let (catalog, _storage, coordinator, planner) = storage_coordinator();
 
 	coordinator
@@ -710,23 +693,29 @@ async fn create_or_replace_table_produces_fresh_object_id() {
 		.await
 		.expect("resolve before replace");
 
-	coordinator
+	let error = coordinator
 		.execute_query(
 			&planner
-				.plan("CREATE OR REPLACE TABLE sales (id INT NOT NULL)")
+				.plan("CREATE OR REPLACE TABLE sales (amount BIGINT, note TEXT)")
 				.expect("plan replace"),
 			None,
 		)
 		.await
-		.expect("replace table");
+		.expect_err("replacing an existing table must be refused");
+	let rendered = error.to_string();
+	assert!(
+		rendered.contains("OR REPLACE on existing table sales is refused"),
+		"expected a destructive-replace refusal, got: {rendered}"
+	);
+
+	// Nothing was mutated: the original object id and schema both survive.
 	let after = catalog
 		.resolve_table(&TableRef::new("sales"))
 		.await
-		.expect("resolve after replace");
-
-	assert_ne!(before.local_table_id, after.local_table_id);
-	assert_ne!(before.table, after.table);
-	assert_ne!(before.fingerprint, after.fingerprint);
+		.expect("resolve after refusal");
+	assert_eq!(before.table, after.table);
+	assert_eq!(after.schema.fields().len(), 1);
+	assert_field(&after.schema, 0, "id", &DataType::Int32, false);
 }
 
 #[tokio::test]

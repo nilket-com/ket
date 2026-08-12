@@ -933,7 +933,6 @@ where
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
-				self.admin.as_ref(),
 				&context,
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
@@ -963,7 +962,6 @@ where
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
-				self.admin.as_ref(),
 				&context,
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
@@ -1093,7 +1091,6 @@ where
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
-				self.admin.as_ref(),
 				&context,
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
@@ -1123,7 +1120,6 @@ where
 				catalog.as_ref(),
 				self.writer.as_ref(),
 				self.deleter.as_ref(),
-				self.admin.as_ref(),
 				&context,
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
@@ -2070,7 +2066,13 @@ async fn execute_catalog_plan(
 			or_replace,
 		} => {
 			if *or_replace {
-				drop_existing_table_with_storage_admin(catalog, admin, context, name, true).await?;
+				// Absence is confirmed, and then nothing is dropped. Calling the drop
+				// helper here would reopen the hazard from the other side: a table
+				// created between this check and that call would be resolved and
+				// destroyed, because the helper looks the name up again. A concurrent
+				// create instead surfaces from `create_table_with_outcome` as an
+				// existence error, leaving the other actor's table intact.
+				refuse_destructive_or_replace(catalog, name).await?;
 			}
 			catalog
 				.create_table_with_outcome(
@@ -2114,6 +2116,39 @@ async fn execute_catalog_plan(
 		other => Err(QueryError::Internal {
 			message: format!("execute_catalog_plan called with non-DDL plan: {other:?}"),
 		}),
+	}
+}
+
+/// Refuse a replace that would destroy an existing table.
+///
+/// `drop_existing_table_with_storage_admin` drops storage and then the catalog
+/// entry, both durably, before any replacement is created or populated. Every
+/// failure after it therefore destroys the original and leaves nothing in its
+/// place: for CTAS the exposed window spans create, materialize, validation and
+/// the row write; for a plain create it spans the catalog create. Until staged
+/// publication lands — provisional object, then an atomic name-binding swap —
+/// the safe behaviour is to refuse before mutating rather than to destroy and
+/// hope the rest succeeds.
+///
+/// Replacing a table that does not exist is not destructive and stays allowed.
+async fn refuse_destructive_or_replace(
+	catalog: &dyn Catalog,
+	name: &crate::catalog::TableRef,
+) -> Result<(), QueryError> {
+	match catalog.resolve_table_local(name).await {
+		Err(CatalogError::TableNotFound { .. }) => Ok(()),
+		Err(error) => Err(QueryError::Catalog(error)),
+		Ok(_) => Err(QueryError::Frontend(
+			crate::error::FrontendError::Unsupported {
+				message: format!(
+					"OR REPLACE on existing table {} is refused: the table would be \
+					 dropped before its replacement is created and populated, so a \
+					 later failure would destroy it with no replacement. DROP the \
+					 table explicitly if that is intended.",
+					query_table_name(name)
+				),
+			},
+		)),
 	}
 }
 
@@ -2245,7 +2280,6 @@ async fn execute_write_plan_with_source(
 	catalog: &dyn Catalog,
 	writer: &dyn StorageWrite,
 	deleter: &dyn StorageDeleteRows,
-	admin: &dyn StorageAdmin,
 	context: &ExecutionContext,
 	operation_id: wendelon::schema::ClientWriteId,
 	source_executor: &dyn MutationSourceExecutor,
@@ -2408,11 +2442,14 @@ async fn execute_write_plan_with_source(
 					Err(error) => return Err(error.into()),
 				}
 			}
-			let source_batches = source_executor.execute_read_plan(source).await?;
+			// Refuse before executing the source. An existing target must report the
+			// replacement refusal, not a source error raised after materializing a
+			// potentially expensive query. Nothing is dropped once absence is
+			// confirmed; see the plain create path for why.
 			if *or_replace {
-				drop_existing_table_with_storage_admin(catalog, admin, context, table, true)
-					.await?;
+				refuse_destructive_or_replace(catalog, table).await?;
 			}
+			let source_batches = source_executor.execute_read_plan(source).await?;
 			let outcome = catalog
 				.create_table_with_outcome(
 					table,
@@ -2848,7 +2885,6 @@ impl QueryCoordinator {
 			catalog,
 			self.writer.as_ref(),
 			self.deleter.as_ref(),
-			self.admin.as_ref(),
 			self.executor.context(),
 			operation_id,
 			&source_executor,

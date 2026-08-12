@@ -521,7 +521,11 @@ async fn drop_admin_failure_then_retry_succeeds() {
 }
 
 #[tokio::test]
-async fn or_replace_uses_storage_admin_drop_before_catalog_removal() {
+async fn drop_uses_storage_admin_before_catalog_removal() {
+	// This exercises `drop_existing_table_with_storage_admin`, which OR REPLACE
+	// used to reach as well. Destructive replacement is refused until staged
+	// publication exists, so the ordering is asserted through the explicit DROP
+	// that still reaches the same helper.
 	let catalog = Arc::new(MockCatalog::new());
 	let storage = Arc::new(InMemoryTableStorage::new());
 	let admin = Arc::new(CatalogVisibilityStorageAdmin::new(catalog.clone()));
@@ -546,29 +550,28 @@ async fn or_replace_uses_storage_admin_drop_before_catalog_removal() {
 		.await
 		.expect("create table");
 	coordinator
-		.execute_query(
-			&planner
-				.plan("CREATE OR REPLACE TABLE sales (amount BIGINT)")
-				.expect("plan replace"),
-			None,
-		)
+		.execute_query(&planner.plan("DROP TABLE sales").expect("plan drop"), None)
 		.await
-		.expect("replace table");
+		.expect("drop table");
 
 	assert_eq!(admin.call_count(), 1);
 	assert!(
 		admin.saw_catalog_binding_during_admin(),
 		"catalog binding should still be reachable while storage admin drop runs"
 	);
-	let binding = catalog
-		.resolve_table(&TableRef::new("sales"))
-		.await
-		.expect("replacement binding");
-	assert_field(&binding.schema, 0, "amount", &DataType::Int64, true);
+	assert!(
+		catalog
+			.resolve_table(&TableRef::new("sales"))
+			.await
+			.is_err(),
+		"the dropped table must no longer resolve"
+	);
 }
 
 #[tokio::test]
-async fn wendelon_dependent_index_reject_propagates_through_replace() {
+async fn wendelon_dependent_index_reject_propagates_through_drop() {
+	// Same helper as the withdrawn OR REPLACE path; the rejection and the
+	// table's survival are asserted through the explicit DROP.
 	let catalog = Arc::new(MockCatalog::new());
 	let storage = Arc::new(InMemoryTableStorage::new());
 	let admin = Arc::new(DependentIndexStorageAdmin);
@@ -594,12 +597,7 @@ async fn wendelon_dependent_index_reject_propagates_through_replace() {
 		.expect("create table");
 
 	let err = coordinator
-		.execute_query(
-			&planner
-				.plan("CREATE OR REPLACE TABLE sales (amount BIGINT)")
-				.expect("plan replace"),
-			None,
-		)
+		.execute_query(&planner.plan("DROP TABLE sales").expect("plan drop"), None)
 		.await
 		.expect_err("dependent index rejection should propagate");
 
@@ -888,13 +886,6 @@ fn expect_drop_catalog_err(result: Result<Option<TableBinding>, CatalogError>) -
 		Ok(_) => panic!("expected catalog error"),
 		Err(error) => error,
 	}
-}
-
-fn assert_field(schema: &SchemaRef, idx: usize, name: &str, data_type: &DataType, nullable: bool) {
-	let field = schema.field(idx);
-	assert_eq!(field.name(), name);
-	assert_eq!(field.data_type(), data_type);
-	assert_eq!(field.is_nullable(), nullable);
 }
 
 fn schema(fields: &[Field]) -> SchemaRef {

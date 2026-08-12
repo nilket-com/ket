@@ -304,7 +304,14 @@ async fn create_or_replace_table_as_select_creates_when_absent() {
 }
 
 #[tokio::test]
-async fn create_or_replace_table_as_select_replaces_existing_table() {
+async fn create_or_replace_table_as_select_over_an_existing_table_is_refused() {
+	// Replacement is deliberately withdrawn until staged publication exists.
+	// `drop_existing_table_with_storage_admin` destroys storage and the catalog
+	// entry durably before the replacement is created, materialized, validated or
+	// written, so any failure after it would leave no table at all. Refusing
+	// before mutating is the safe posture; restore replacement — and this test's
+	// original assertions, which are preserved in history — once a provisional
+	// object and an atomic name-binding swap land.
 	let (catalog, storage, coordinator, planner) = coordinator();
 
 	for sql in [
@@ -321,9 +328,9 @@ async fn create_or_replace_table_as_select_replaces_existing_table() {
 	let before = catalog
 		.resolve_table(&TableRef::new("copy"))
 		.await
-		.expect("resolve old copy");
+		.expect("resolve copy");
 
-	coordinator
+	let error = coordinator
 		.execute_query(
 			&planner
 				.plan("CREATE OR REPLACE TABLE copy AS SELECT name FROM people")
@@ -331,28 +338,27 @@ async fn create_or_replace_table_as_select_replaces_existing_table() {
 			None,
 		)
 		.await
-		.expect("replace CTAS");
+		.expect_err("replacing an existing table must be refused");
+	let rendered = error.to_string();
+	assert!(
+		rendered.contains("OR REPLACE on existing table copy is refused"),
+		"expected a destructive-replace refusal, got: {rendered}"
+	);
 
+	// The refusal happens before any mutation: the original binding, its rows and
+	// the storage inventory are all untouched.
 	let after = catalog
 		.resolve_table(&TableRef::new("copy"))
 		.await
-		.expect("resolve new copy");
-	assert_ne!(before.table, after.table);
+		.expect("resolve copy after refusal");
+	assert_eq!(before.table, after.table);
 	assert_eq!(storage.table_count(), 2);
-	assert_field(&after.schema, 0, "name", &DataType::Utf8, true);
-
-	let batch = concat_query(
-		&coordinator,
-		&planner,
-		"SELECT name FROM copy ORDER BY name",
-	)
-	.await;
-	assert_eq!(string_column(&batch, 0).value(0), "Alice");
-	assert_eq!(string_column(&batch, 0).value(1), "Bob");
+	let batch = concat_query(&coordinator, &planner, "SELECT old_id FROM copy").await;
+	assert_eq!(batch.num_rows(), 1);
 }
 
 #[tokio::test]
-async fn ctas_or_replace_source_failure_preserves_existing_table() {
+async fn ctas_or_replace_refuses_before_executing_the_source() {
 	let (catalog, _storage, coordinator, planner) = coordinator();
 
 	for sql in [
@@ -378,10 +384,19 @@ async fn ctas_or_replace_source_failure_preserves_existing_table() {
 			None,
 		)
 		.await
-		.expect_err("source storage failure should reject");
+		.expect_err("replacing an existing table must be refused");
+	// Ordering control: the refusal must precede source execution. The source here
+	// cannot be read at all, so under the previous ordering this assertion saw
+	// "table not found" — the caller paid for a failed source query before learning
+	// the replacement was never going to be allowed.
+	let rendered = err.to_string();
 	assert!(
-		err.to_string().contains("table not found"),
-		"unexpected error: {err}"
+		rendered.contains("OR REPLACE on existing table target is refused"),
+		"expected the replacement refusal, got: {rendered}"
+	);
+	assert!(
+		!rendered.contains("table not found"),
+		"the source must not be executed for a refused replacement, got: {rendered}"
 	);
 
 	let after = catalog
@@ -619,6 +634,119 @@ async fn ctas_if_not_exists_absent_target_creates_and_writes_like_current_ctas()
 	assert_eq!(int32_column(&batch, 0).values(), &[1, 2]);
 	assert_eq!(string_column(&batch, 1).value(0), "Alice");
 	assert_eq!(string_column(&batch, 1).value(1), "Bob");
+}
+
+#[tokio::test]
+async fn or_replace_losing_a_create_race_does_not_destroy_the_winner() {
+	// A preflight absence check is not proof the target is still absent when the
+	// mutation runs. The winner below is real: pre-created, populated, and durable
+	// before the statement starts. The wrapper hides it from the statement's FIRST
+	// local resolution only, which is exactly what losing a create race looks like
+	// from inside the statement.
+	//
+	// Fixed path: the refusal sees the synthetic miss, nothing is dropped, and the
+	// statement loses at the catalog create.
+	//
+	// Withdrawn path, measured by restoring it: the drop helper performed a SECOND
+	// resolution, saw the winner, and destroyed it — and the statement then
+	// returned `Ok`. Losing a create race silently replaced another actor's
+	// committed table with no error at all. This control fails there on
+	// `expect_err`, before it even reaches the survival assertions.
+	let base = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let admin = Arc::new(CountingStorageAdmin::new(storage.clone()));
+	let planner = SqlPlanner::new();
+
+	// Build the winner and the source through the unwrapped catalog.
+	let setup = QueryCoordinator::with_writer(
+		base.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(admin.clone());
+	for sql in [
+		"CREATE TABLE people (id INT NOT NULL)",
+		"INSERT INTO people VALUES (1)",
+		"CREATE TABLE copy (winner_id INT NOT NULL)",
+		"INSERT INTO copy VALUES (99)",
+	] {
+		setup
+			.execute_query(&planner.plan(sql).expect("plan setup"), None)
+			.await
+			.expect(sql);
+	}
+	let winner_before = base
+		.resolve_table(&TableRef::new("copy"))
+		.await
+		.expect("winner exists before the statement");
+	let inventory_before = storage.table_count();
+	let winner_rows_before = concat_query(&setup, &planner, "SELECT winner_id FROM copy").await;
+	assert_eq!(int32_column(&winner_rows_before, 0).values(), &[99]);
+	assert_eq!(admin.drop_count(), 0, "setup must not drop anything");
+
+	// Run the statement through a catalog that hides `copy` from its first lookup.
+	let hiding = Arc::new(HidesTargetOnFirstResolve::new(
+		base.clone(),
+		TableRef::new("copy"),
+	));
+	let racer = QueryCoordinator::with_writer(
+		hiding.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(admin.clone());
+
+	let error = racer
+		.execute_query(
+			&planner
+				.plan("CREATE OR REPLACE TABLE copy AS SELECT id FROM people")
+				.expect("plan replace CTAS"),
+			None,
+		)
+		.await
+		.expect_err("losing the create race must fail the statement");
+	assert!(
+		hiding.hid_once(),
+		"the statement must have crossed the synthetic race window"
+	);
+
+	// The winner is untouched: same binding and object id, same rows, same
+	// storage inventory, and no storage-admin drop ran.
+	let winner_after = base
+		.resolve_table(&TableRef::new("copy"))
+		.await
+		.unwrap_or_else(|error| panic!("the winner must survive, got: {error}"));
+	assert_eq!(winner_before.table, winner_after.table, "object id changed");
+	assert_eq!(
+		winner_before.local_table_id, winner_after.local_table_id,
+		"local binding changed"
+	);
+	assert_eq!(
+		winner_before.fingerprint, winner_after.fingerprint,
+		"descriptor fingerprint changed"
+	);
+	assert_eq!(
+		storage.table_count(),
+		inventory_before,
+		"storage inventory changed"
+	);
+	assert_eq!(
+		admin.drop_count(),
+		0,
+		"no storage-admin drop may run on an OR REPLACE path: {error}"
+	);
+	let winner_rows_after = concat_query(&setup, &planner, "SELECT winner_id FROM copy").await;
+	assert_eq!(int32_column(&winner_rows_after, 0).values(), &[99]);
+
+	// The counter is live: an explicit DROP in this same state increments it, so
+	// the zero above is evidence that no drop ran rather than an unobservable one.
+	setup
+		.execute_query(&planner.plan("DROP TABLE copy").expect("plan drop"), None)
+		.await
+		.expect("explicit drop of the winner");
+	assert_eq!(admin.drop_count(), 1, "the drop counter must be observable");
 }
 
 #[tokio::test]
@@ -1180,6 +1308,97 @@ impl RacingCatalog {
 	}
 }
 
+/// Hides an existing table from the FIRST local resolution only.
+///
+/// That is the shape of a lost create race as the statement experiences it: the
+/// preflight absence check misses, and every later lookup sees the winner. The
+/// winner is real and pre-created, so "did the statement destroy it" is a
+/// question about durable state rather than about the fixture.
+struct HidesTargetOnFirstResolve {
+	inner: Arc<MockCatalog>,
+	target: TableRef,
+	hidden: std::sync::atomic::AtomicBool,
+}
+
+impl HidesTargetOnFirstResolve {
+	fn new(inner: Arc<MockCatalog>, target: TableRef) -> Self {
+		Self {
+			inner,
+			target,
+			hidden: std::sync::atomic::AtomicBool::new(false),
+		}
+	}
+
+	fn hid_once(&self) -> bool {
+		self.hidden.load(std::sync::atomic::Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl Catalog for HidesTargetOnFirstResolve {
+	fn scoped(self: Arc<Self>, _tenant_id: TenantId) -> Arc<dyn Catalog> {
+		self
+	}
+
+	fn descriptor_refresh_metrics(&self) -> Arc<DescriptorRefreshMetrics> {
+		self.inner.descriptor_refresh_metrics()
+	}
+
+	async fn resolve_table(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_table(table).await
+	}
+
+	async fn resolve_table_local(&self, table: &TableRef) -> Result<TableBinding, CatalogError> {
+		if table == &self.target && !self.hidden.swap(true, std::sync::atomic::Ordering::SeqCst) {
+			return Err(CatalogError::TableNotFound {
+				table: table.table.clone(),
+			});
+		}
+		self.inner.resolve_table_local(table).await
+	}
+
+	async fn resolve_table_id(
+		&self,
+		table: toron::ir::TableId,
+	) -> Result<TableBinding, CatalogError> {
+		self.inner.resolve_table_id(table).await
+	}
+
+	async fn resolve_durable_logical_type_by_name(
+		&self,
+		name: &str,
+	) -> Result<toron::ir::LogicalTypeSpec, CatalogError> {
+		self.inner.resolve_durable_logical_type_by_name(name).await
+	}
+
+	async fn invalidate_table_descriptor(
+		&self,
+		table: toron::ir::TableId,
+	) -> Result<Option<InvalidatedDescriptor>, CatalogError> {
+		self.inner.invalidate_table_descriptor(table).await
+	}
+
+	async fn create_table_with_outcome(
+		&self,
+		name: &TableRef,
+		schema: SchemaRef,
+		row_identity: CreateTableRowIdentity,
+		if_not_exists: bool,
+	) -> Result<CreateTableOutcome, CatalogError> {
+		self.inner
+			.create_table_with_outcome(name, schema, row_identity, if_not_exists)
+			.await
+	}
+
+	async fn drop_table(
+		&self,
+		name: &TableRef,
+		if_exists: bool,
+	) -> Result<Option<TableBinding>, CatalogError> {
+		self.inner.drop_table(name, if_exists).await
+	}
+}
+
 #[async_trait]
 impl Catalog for RacingCatalog {
 	fn scoped(self: Arc<Self>, _tenant_id: TenantId) -> Arc<dyn Catalog> {
@@ -1243,6 +1462,35 @@ impl Catalog for RacingCatalog {
 		if_exists: bool,
 	) -> Result<Option<TableBinding>, CatalogError> {
 		self.inner.drop_table(name, if_exists).await
+	}
+}
+
+struct CountingStorageAdmin {
+	inner: Arc<InMemoryTableStorage>,
+	drops: std::sync::atomic::AtomicUsize,
+}
+
+impl CountingStorageAdmin {
+	fn new(inner: Arc<InMemoryTableStorage>) -> Self {
+		Self {
+			inner,
+			drops: std::sync::atomic::AtomicUsize::new(0),
+		}
+	}
+
+	fn drop_count(&self) -> usize {
+		self.drops.load(std::sync::atomic::Ordering::SeqCst)
+	}
+}
+
+#[async_trait]
+impl toron::storage::StorageAdmin for CountingStorageAdmin {
+	async fn drop_table_storage(
+		&self,
+		request: toron::storage::DropTableStorageRequest,
+	) -> Result<toron::storage::DropTableStorageOutcome, toron::error::StorageError> {
+		self.drops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		self.inner.drop_table_storage(request).await
 	}
 }
 

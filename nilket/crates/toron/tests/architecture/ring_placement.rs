@@ -236,7 +236,7 @@ pub(crate) fn adr041_no_wendelon_replace_request() {
 }
 
 #[test]
-pub(crate) fn adr041_replace_reuses_storage_admin_drop() {
+pub(crate) fn adr041_only_explicit_drop_reaches_the_storage_admin_drop() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
 	let helper = brace_blocks_after_marker(
@@ -265,13 +265,19 @@ pub(crate) fn adr041_replace_reuses_storage_admin_drop() {
 
 	assert_eq!(coordinator.matches("DropTableStorageRequest {").count(), 1);
 	assert!(helper.contains("DropTableStorageRequest {"));
-	assert!(create_arm.contains("drop_existing_table_with_storage_admin"));
+	// Destructive OR REPLACE is withdrawn until staged publication exists, so the
+	// create arm no longer reaches the drop helper. Explicit DROP is its only
+	// caller: replacement used to destroy the target before its replacement
+	// existed, and a preflight absence check could not close that window because
+	// the helper resolves the name again.
+	assert!(!create_arm.contains("drop_existing_table_with_storage_admin"));
+	assert!(create_arm.contains("refuse_destructive_or_replace"));
 	assert!(drop_arm.contains("drop_existing_table_with_storage_admin"));
 	assert!(!create_arm.contains("DropTableStorageRequest {"));
 }
 
 #[test]
-pub(crate) fn adr041_ctas_replace_materializes_source_before_drop() {
+pub(crate) fn adr041_ctas_replace_refuses_before_materializing_source() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
 	let shared = brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
@@ -287,15 +293,20 @@ pub(crate) fn adr041_ctas_replace_materializes_source_before_drop() {
 	let source = ctas_arm
 		.find("source_executor.execute_read_plan(source)")
 		.expect("source materialization");
-	let drop = ctas_arm
-		.find("drop_existing_table_with_storage_admin")
-		.expect("replace drop helper");
+	let refuse = ctas_arm
+		.find("refuse_destructive_or_replace")
+		.expect("destructive-replace refusal");
 	let create = ctas_arm
 		.find("create_table_with_outcome")
 		.expect("catalog create");
 
-	assert!(source < drop);
-	assert!(drop < create);
+	// The refusal precedes source execution: an existing target must not pay for
+	// a materialized source query before learning the replacement is refused.
+	assert!(refuse < source);
+	// Source still materializes before the catalog create, so a source failure
+	// cannot leave a created-but-unpopulated table.
+	assert!(source < create);
+	assert!(!ctas_arm.contains("drop_existing_table_with_storage_admin"));
 }
 
 #[test]
@@ -858,7 +869,7 @@ pub(crate) fn adr042_fixture_worker_source_remains_isolated() {
 }
 
 #[test]
-pub(crate) fn adr041_replace_uses_fresh_table_object_id() {
+pub(crate) fn adr041_replace_refuses_before_any_catalog_mutation() {
 	let coordinator =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator.rs")).expect("coordinator");
 	let helper = brace_blocks_after_marker(
@@ -894,10 +905,14 @@ pub(crate) fn adr041_replace_uses_fresh_table_object_id() {
 			.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
 			.expect("CTAS arm"),
 	] {
-		let drop = arm
-			.find("drop_existing_table_with_storage_admin")
-			.expect("replace helper");
+		let refuse = arm
+			.find("refuse_destructive_or_replace")
+			.expect("destructive-replace refusal");
 		let create = arm.find(".create_table").expect("fresh create");
-		assert!(drop < create);
+		// Replacement no longer drops and recreates; the refusal is evaluated
+		// before any catalog mutation, and a concurrent create surfaces from the
+		// create call as an existence error rather than destroying the winner.
+		assert!(refuse < create);
+		assert!(!arm.contains("drop_existing_table_with_storage_admin"));
 	}
 }
