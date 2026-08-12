@@ -24,6 +24,7 @@ Environment overrides:
   CARGO_CGROUP_NICE=19
   CARGO_CGROUP_JOBS=6
   CARGO_CGROUP_RUST_TEST_THREADS=1
+  CARGO_CGROUP_RUST_MIN_STACK=67108864
   CARGO_CGROUP_IMAGE=rust:1
   CARGO_CGROUP_ALLOW_AFFINITY_ONLY=0
 
@@ -57,6 +58,13 @@ io_weight="${CARGO_CGROUP_IO_WEIGHT:-10}"
 nice_level="${CARGO_CGROUP_NICE:-19}"
 jobs="${CARGO_CGROUP_JOBS:-6}"
 test_threads="${CARGO_CGROUP_RUST_TEST_THREADS:-1}"
+# Deep-recursion targets overflow the default 8 MiB test-thread stack and abort
+# the process. An aborted target prints no result line, so a receipt that sums
+# reported failures reads clean while that target's remaining tests silently
+# vanish. The stack is declared here so the canonical invocation is
+# self-contained rather than depending on ambient user-manager environment,
+# which `systemd-run --user` does not inherit from the caller.
+min_stack="${CARGO_CGROUP_RUST_MIN_STACK:-67108864}"
 progress="${CARGO_TERM_PROGRESS_WHEN:-never}"
 image="${CARGO_CGROUP_IMAGE:-rust:1}"
 allow_affinity_only="${CARGO_CGROUP_ALLOW_AFFINITY_ONLY:-0}"
@@ -67,6 +75,7 @@ wrapped_cmd=(
 	env
 	"CARGO_BUILD_JOBS=${jobs}"
 	"RUST_TEST_THREADS=${test_threads}"
+	"RUST_MIN_STACK=${min_stack}"
 	"CARGO_TERM_PROGRESS_WHEN=${progress}"
 	cargo
 	"$@"
@@ -107,6 +116,7 @@ run_nerdctl() {
 		--env CARGO_HOME=/cargo-home \
 		--env "CARGO_BUILD_JOBS=${jobs}" \
 		--env "RUST_TEST_THREADS=${test_threads}" \
+		--env "RUST_MIN_STACK=${min_stack}" \
 		--env "CARGO_TERM_PROGRESS_WHEN=${progress}" \
 		--volume "${repo_dir}:/work" \
 		--volume "${cargo_home}:/cargo-home" \

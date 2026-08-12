@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Behavioural probe for `scripts/cargo-cgroup`.
+#
+# `cargo <name>` dispatches to `cargo-<name>` on PATH, so running
+# `scripts/cargo-cgroup envprobe` with this directory on PATH exec's the real
+# wrapper, through its real backend, and lands here as the child process. It
+# prints what the child actually received — not what the wrapper intended to
+# send — which is the only thing that proves the environment survived the hop
+# into a systemd scope.
+set -euo pipefail
+
+printf 'RUST_MIN_STACK=%s\n' "${RUST_MIN_STACK-<unset>}"
+printf 'RUST_TEST_THREADS=%s\n' "${RUST_TEST_THREADS-<unset>}"
+printf 'CARGO_BUILD_JOBS=%s\n' "${CARGO_BUILD_JOBS-<unset>}"
