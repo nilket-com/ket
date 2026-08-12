@@ -90,15 +90,15 @@ impl PlotKernel for HeatmapPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		Some(crate::plot::legend::LegendContent(
-			crate::plot::spec::NonEmpty::new(crate::plot::legend::LegendSection::Gradient {
-				label: "Value".to_owned(),
-				low: 0.0,
-				high: self.prepared_data.max_val as f64,
-				low_color: settings.color_theme.get_color(0.0),
-				high_color: settings.color_theme.get_color(1.0),
-			}),
-		))
+		crate::plot::legend::gradient_section(
+			"Value".to_owned(),
+			0.0,
+			self.prepared_data.max_val,
+			settings.color_theme,
+		)
+		.map(|section| {
+			crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(section))
+		})
 	}
 
 	fn x_label(&self) -> String {
@@ -329,5 +329,55 @@ mod tests {
 			}
 		}
 		assert!(backend.rectangles[0].0.y < backend.rectangles[1].0.y);
+	}
+
+	#[test]
+	fn product_0087_heatmap_omits_zero_domain_and_banks_signed_clamping_for_b2() {
+		let zero = HeatmapPlotKernel {
+			prepared_data: Arc::new(HeatmapPreparedData {
+				x_categories: vec!["x".to_owned()],
+				y_categories: vec!["y".to_owned()],
+				values: vec![vec![0.0]],
+				max_val: 0.0,
+				x_label: "x".to_owned(),
+				y_label: "y".to_owned(),
+			}),
+		};
+		assert!(
+			zero.legend_content(&ResolvedPlotSettings::default())
+				.is_none()
+		);
+
+		let signed = HeatmapPlotKernel {
+			prepared_data: Arc::new(HeatmapPreparedData {
+				x_categories: vec!["x".to_owned()],
+				y_categories: vec!["y".to_owned()],
+				values: vec![vec![-10.0]],
+				max_val: 10.0,
+				x_label: "x".to_owned(),
+				y_label: "y".to_owned(),
+			}),
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = signed.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = RectangleBackend::default();
+		signed.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		assert_eq!(backend.rectangles[0].2, settings.color_theme.get_color(0.0));
+		let content = signed
+			.legend_content(&settings)
+			.expect("positive max guide");
+		let crate::plot::legend::LegendSection::Gradient { stops, .. } = content.0.first() else {
+			panic!("gradient section")
+		};
+		assert_eq!(stops.first_value(), 0.0);
+		assert!(-10.0 < stops.first_value());
 	}
 }

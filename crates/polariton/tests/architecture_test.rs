@@ -289,6 +289,68 @@ fn product_0086_wire_numbers_do_not_become_session_code_vocabulary() {
 }
 
 #[test]
+fn product_0087_gradient_guides_have_one_stop_and_construction_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plot");
+	let legend = std::fs::read_to_string(root.join("legend.rs")).expect("read legend owner");
+	let production_legend = legend
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production legend region");
+	assert_eq!(production_legend.matches("fn sample_gradient").count(), 1);
+	assert_eq!(
+		production_legend
+			.matches("sample_gradient(stops, t)")
+			.count(),
+		2,
+		"ordinary and paired gradient paths must share one sampler"
+	);
+	assert_eq!(production_legend.matches("fn gradient_section").count(), 1);
+	for retired in ["low_color", "high_color"] {
+		assert!(
+			!production_legend.contains(retired),
+			"retired endpoint authority survives as {retired}"
+		);
+	}
+	assert!(!production_legend.contains("ColorTheme::"));
+
+	let mut producer_calls = 0;
+	for file in [
+		"kernels/bubble.rs",
+		"kernels/heatmap.rs",
+		"kernels/hexbin.rs",
+	] {
+		let source = std::fs::read_to_string(root.join(file)).expect("read gradient producer");
+		let production = source
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production kernel region");
+		let calls = production.matches("legend::gradient_section(").count();
+		assert_eq!(calls, 1, "{file} must use the shared constructor once");
+		assert!(!production.contains("LegendSection::Gradient {"));
+		producer_calls += calls;
+	}
+	assert_eq!(producer_calls, 3);
+
+	let colors = std::fs::read_to_string(root.join("colors.rs")).expect("read ramp authority");
+	let production_colors = colors
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production colour region");
+	assert!(production_colors.contains("self.definition().sample(t)"));
+	assert!(production_colors.contains("pub(crate) fn canonical_stops"));
+
+	let stops = std::fs::read_to_string(root.join("gradient_stops.rs"))
+		.expect("read validated stop sequence");
+	let owner = stops
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production stop region");
+	assert!(owner.contains("pub struct GradientStops"));
+	assert!(owner.contains("stops: Vec<GradientStop>"));
+	assert!(!owner.contains("pub stops:"));
+}
+
+#[test]
 fn product_0001_polariton_reaches_nilket_only_through_the_public_client() {
 	assert_product_dependency_boundary(
 		Path::new(env!("CARGO_MANIFEST_DIR")),

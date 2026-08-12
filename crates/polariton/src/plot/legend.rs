@@ -1,7 +1,9 @@
 //! The closed legend-content model and its single renderer.
 
 use crate::coordinate::{Pt, Rect, Widget};
+use crate::plot::colors::ColorTheme;
 use crate::plot::common::{PlotBackend, ResolvedPlotSettings};
+use crate::plot::gradient_stops::GradientStops;
 use crate::plot::spec::{NonEmpty, ResolvedPresence};
 use iced::widget::canvas::{Stroke, Style, Text};
 use iced::{Color, Point, Size, alignment};
@@ -35,18 +37,8 @@ pub struct LegendEntry {
 #[derive(Clone, Debug, PartialEq)]
 pub enum LegendSection {
 	Entries(NonEmpty<LegendEntry>),
-	Gradient {
-		label: String,
-		low: f64,
-		high: f64,
-		low_color: Color,
-		high_color: Color,
-	},
-	SizeSample {
-		label: String,
-		low: f64,
-		high: f64,
-	},
+	Gradient { label: String, stops: GradientStops },
+	SizeSample { label: String, low: f64, high: f64 },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -66,11 +58,39 @@ impl LegendContent {
 	}
 }
 
+/// Construct one honest continuous guide from a producer's data domain.
+///
+/// Zero-width and non-finite domains say nothing and are omitted. A descending
+/// finite domain violates the ordered-range invariant shared by all current
+/// producers and must not be hidden as an omission.
+pub(crate) fn gradient_section(
+	label: String,
+	low: f64,
+	high: f64,
+	theme: ColorTheme,
+) -> Option<LegendSection> {
+	if !low.is_finite() || !high.is_finite() || low == high {
+		return None;
+	}
+	assert!(
+		low < high,
+		"PRODUCT-0087 requires a finite ascending gradient domain, got {low}..{high}"
+	);
+	let stops = GradientStops::projected(
+		low,
+		high,
+		theme.canonical_stops(),
+		theme.uses_reversed_sampling(),
+	)
+	.expect("PRODUCT-0087 canonical positions project to an ascending domain");
+	Some(LegendSection::Gradient { label, stops })
+}
+
 /// Apply PRODUCT-0044's content policy to one legend.
 ///
 /// A lone synthetic entry describes no data identity, so it does not earn the
-/// chrome required to render it.  Kernels always produce their content; this
-/// is deliberately the only omission decision.
+/// chrome required to render it. PRODUCT-0087 additionally omits gradients at
+/// construction when their domain is zero-width or non-finite.
 pub fn apply_policy(content: LegendContent) -> Option<LegendContent> {
 	let (first, rest) = content.0.into_parts();
 	let mut sections = Vec::with_capacity(1 + rest.len());
@@ -265,13 +285,8 @@ fn draw_text_at(
 	});
 }
 
-fn lerp(a: Color, b: Color, t: f32) -> Color {
-	Color {
-		r: a.r + (b.r - a.r) * t,
-		g: a.g + (b.g - a.g) * t,
-		b: a.b + (b.b - a.b) * t,
-		a: a.a + (b.a - a.a) * t,
-	}
+fn sample_gradient(stops: &GradientStops, t: f32) -> Color {
+	stops.sample_normalized(t)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -400,10 +415,7 @@ pub fn render_legend(
 		&& let [
 			LegendSection::Gradient {
 				label: color_label,
-				low,
-				high,
-				low_color,
-				high_color,
+				stops,
 			},
 			LegendSection::SizeSample {
 				label: size_label,
@@ -431,9 +443,11 @@ pub fn render_legend(
 			backend.fill_rectangle(
 				Point::new(bar_x, bar_y + bar_height - (i as f32 + 1.0) * step_height),
 				Size::new(15.0, step_height + 0.5),
-				lerp(*low_color, *high_color, t),
+				sample_gradient(stops, t),
 			);
 		}
+		let low = stops.first_value();
+		let high = stops.last_value();
 		let label_x = bar_x + 23.0;
 		draw_text_at(
 			backend,
@@ -566,13 +580,7 @@ pub fn render_legend(
 				}
 				offset += entries.len().min(max_rows) as f32 * 25.0 + padding * 2.0;
 			}
-			LegendSection::Gradient {
-				label,
-				low,
-				high,
-				low_color,
-				high_color,
-			} => {
+			LegendSection::Gradient { label, stops } => {
 				let bar_x = x + padding;
 				let bar_y = y + offset + 35.0;
 				let bar_height = 145.0;
@@ -584,9 +592,11 @@ pub fn render_legend(
 							bar_y + bar_height - (i as f32 + 1.0) * bar_height / 50.0,
 						),
 						Size::new(15.0, bar_height / 50.0 + 0.5),
-						lerp(*low_color, *high_color, t),
+						sample_gradient(stops, t),
 					);
 				}
+				let low = stops.first_value();
+				let high = stops.last_value();
 				backend.stroke_path(
 					&|builder| {
 						builder.move_to(Point::new(bar_x, bar_y));
@@ -671,8 +681,63 @@ pub fn render_legend(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::common::{PathBuilder, PlotBackend};
 	use crate::plot::spec::{LegendPosition, ResolvedPresence};
+	use iced::widget::canvas::{Stroke, Text};
 	use iced::{Point, Rectangle};
+
+	#[derive(Default)]
+	struct RectangleBackend {
+		rectangles: Vec<(Point, Size, Color)>,
+	}
+
+	impl PlotBackend for RectangleBackend {
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+
+		fn fill_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {}
+
+		fn fill_rectangle(&mut self, point: Point, size: Size, color: Color) {
+			self.rectangles.push((point, size, color));
+		}
+
+		fn fill_text(&mut self, _text: Text) {}
+
+		fn translate(&mut self, _translation: iced::Vector) {}
+
+		fn rotate(&mut self, _angle: f32) {}
+
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
+
+	fn gradient(theme: ColorTheme) -> LegendSection {
+		gradient_section("Value".to_owned(), 10.0, 50.0, theme)
+			.expect("ascending non-degenerate gradient")
+	}
+
+	fn gradient_stops(section: &LegendSection) -> &GradientStops {
+		let LegendSection::Gradient { stops, .. } = section else {
+			panic!("gradient section")
+		};
+		stops
+	}
+
+	fn rgb8(color: Color) -> [u8; 3] {
+		[
+			(color.r * 255.0).round() as u8,
+			(color.g * 255.0).round() as u8,
+			(color.b * 255.0).round() as u8,
+		]
+	}
+
+	fn ulp_distance(a: f32, b: f32) -> u32 {
+		a.to_bits().abs_diff(b.to_bits())
+	}
 
 	fn entry(label: &str, sample: LegendSample, provenance: LegendProvenance) -> LegendEntry {
 		LegendEntry {
@@ -832,5 +897,117 @@ mod tests {
 		let origin = layout.origin(plot_extent).expect("default gutter");
 		assert_eq!(origin.y(), plot_extent.y());
 		assert!(origin.y() + measure_legend(&content, &settings).height > plot_extent.bottom());
+	}
+
+	#[test]
+	fn product_0087_gradient_constructor_distinguishes_omission_from_invariant_failure() {
+		for (low, high) in [(0.0, 0.0), (f64::NAN, 1.0), (0.0, f64::INFINITY)] {
+			assert!(gradient_section("Value".to_owned(), low, high, ColorTheme::Viridis).is_none());
+		}
+		assert!(gradient_section("Value".to_owned(), 0.0, 1.0, ColorTheme::Viridis).is_some());
+		let panic = std::panic::catch_unwind(|| {
+			gradient_section("Value".to_owned(), 1.0, 0.0, ColorTheme::Viridis)
+		})
+		.expect_err("descending domains violate the producer invariant");
+		let message = panic
+			.downcast_ref::<String>()
+			.map(String::as_str)
+			.or_else(|| panic.downcast_ref::<&str>().copied())
+			.unwrap_or("non-string panic");
+		assert!(message.contains("PRODUCT-0087"), "{message}");
+	}
+
+	#[test]
+	fn product_0087_stops_are_data_values_and_midpoint_sampling_restores_the_ramp() {
+		let green_purples = gradient(ColorTheme::GreenPurples);
+		let stops = gradient_stops(&green_purples);
+		assert_eq!(stops.len(), 3);
+		assert_eq!(stops.values().collect::<Vec<_>>(), [10.0, 30.0, 50.0]);
+		assert_eq!(sample_gradient(stops, 0.5), Color::WHITE);
+
+		let viridis = gradient(ColorTheme::Viridis);
+		let stops = gradient_stops(&viridis);
+		assert_eq!(stops.len(), 5);
+		assert_eq!(
+			stops.values().collect::<Vec<_>>(),
+			[10.0, 20.0, 30.0, 40.0, 50.0]
+		);
+		assert_eq!(
+			sample_gradient(stops, 0.5),
+			Color::from_rgb(0.129, 0.569, 0.553)
+		);
+	}
+
+	#[test]
+	fn product_0087_both_render_paths_use_the_same_fifty_stop_samples() {
+		let section = gradient(ColorTheme::GreenPurples);
+		let stops = gradient_stops(&section);
+		let ordinary = LegendContent(NonEmpty::new(section.clone()));
+		let mut paired = LegendContent(NonEmpty::new(section.clone()));
+		paired.push(LegendSection::SizeSample {
+			label: "Size".to_owned(),
+			low: 1.0,
+			high: 3.0,
+		});
+		let settings = ResolvedPlotSettings::default();
+		let mut paths = Vec::new();
+		for content in [&ordinary, &paired] {
+			let mut backend = RectangleBackend::default();
+			let origin = Rect::<Widget>::from_iced_frame(Rectangle::new(
+				Point::ORIGIN,
+				Size::new(400.0, 300.0),
+			))
+			.origin();
+			render_legend(&mut backend, origin, content, &settings);
+			let colors = backend.rectangles[1..51]
+				.iter()
+				.map(|(_, _, color)| *color)
+				.collect::<Vec<_>>();
+			assert_eq!(colors.len(), 50);
+			assert_eq!(rgb8(colors[24]), [251, 252, 250]);
+			assert_eq!(rgb8(colors[25]), [252, 250, 252]);
+			for (index, color) in colors.iter().enumerate() {
+				let expected = ColorTheme::GreenPurples.get_color(index as f32 / 49.0);
+				for (actual, expected) in [
+					(color.r, expected.r),
+					(color.g, expected.g),
+					(color.b, expected.b),
+					(color.a, expected.a),
+				] {
+					assert!(
+						ulp_distance(actual, expected) <= 4,
+						"index {index}: {actual} != {expected}"
+					);
+				}
+			}
+			paths.push(colors);
+		}
+		assert_eq!(paths[0], paths[1]);
+		assert_eq!(paths[0][0], sample_gradient(stops, 0.0));
+		assert_eq!(paths[0][49], sample_gradient(stops, 1.0));
+	}
+
+	#[test]
+	fn product_0087_every_theme_matches_marks_across_the_realized_non_unit_domain() {
+		for theme in ColorTheme::ALL {
+			let section = gradient(theme);
+			let stops = gradient_stops(&section);
+			for index in 0..50 {
+				let t = index as f32 / 49.0;
+				let actual = sample_gradient(stops, t);
+				let expected = theme.get_color(t);
+				for (actual, expected) in [
+					(actual.r, expected.r),
+					(actual.g, expected.g),
+					(actual.b, expected.b),
+					(actual.a, expected.a),
+				] {
+					assert!(
+						ulp_distance(actual, expected) <= 4,
+						"{theme:?} index {index}: {actual} != {expected}"
+					);
+				}
+			}
+		}
 	}
 }

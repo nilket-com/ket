@@ -1,0 +1,7 @@
+error: cannot construct `GradientStops` with struct literal syntax due to private fields
+ --> tests/ui/gradient_stops_private_literal.rs:7:10
+  |
+7 |     let _ = GradientStops { stops: Vec::new() };
+  |             ^^^^^^^^^^^^^   ----------------- private field
+  |
+  = note: ...and other private field `sampling` that was not provided

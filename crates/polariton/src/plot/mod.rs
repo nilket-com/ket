@@ -6,6 +6,7 @@ pub mod core;
 pub mod durable;
 pub mod export;
 pub mod factory;
+pub mod gradient_stops;
 pub mod grid;
 pub mod kernels;
 pub mod legend;

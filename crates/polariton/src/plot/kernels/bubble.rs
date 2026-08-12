@@ -93,20 +93,24 @@ impl PlotKernel for BubblePlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		let mut content = crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(
-			crate::plot::legend::LegendSection::Gradient {
-				label: self.prepared_data.color_label.clone(),
-				low: self.prepared_data.color_range.0,
-				high: self.prepared_data.color_range.1,
-				low_color: settings.color_theme.get_color(0.0),
-				high_color: settings.color_theme.get_color(1.0),
-			},
-		));
-		content.push(crate::plot::legend::LegendSection::SizeSample {
+		let size = crate::plot::legend::LegendSection::SizeSample {
 			label: self.prepared_data.size_label.clone(),
 			low: self.prepared_data.size_range.0,
 			high: self.prepared_data.size_range.1,
-		});
+		};
+		let content = if let Some(gradient) = crate::plot::legend::gradient_section(
+			self.prepared_data.color_label.clone(),
+			self.prepared_data.color_range.0,
+			self.prepared_data.color_range.1,
+			settings.color_theme,
+		) {
+			let mut content =
+				crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(gradient));
+			content.push(size);
+			content
+		} else {
+			crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(size))
+		};
 		Some(content)
 	}
 
@@ -278,5 +282,67 @@ pub fn prepare_bubble_data(
 		y_label: y_col.to_string(),
 		size_label: size_col.to_string(),
 		color_label: color_col.to_string(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::plot::colors::ColorTheme;
+	use crate::plot::gradient_stops::GradientStops;
+	use crate::plot::legend::LegendSection;
+
+	fn kernel(color_range: (f64, f64)) -> BubblePlotKernel {
+		BubblePlotKernel {
+			prepared_data: Arc::new(BubblePreparedData {
+				points: Vec::new(),
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_axis_type: AxisType::Linear,
+				y_axis_type: AxisType::Linear,
+				size_range: (1.0, 3.0),
+				color_range,
+				x_label: "x".to_owned(),
+				y_label: "y".to_owned(),
+				size_label: "size".to_owned(),
+				color_label: "color".to_owned(),
+			}),
+		}
+	}
+
+	fn stops(section: &LegendSection) -> &GradientStops {
+		let LegendSection::Gradient { stops, .. } = section else {
+			panic!("gradient section")
+		};
+		stops
+	}
+
+	#[test]
+	fn product_0087_bubble_omits_only_degenerate_colour_guides() {
+		for range in [(4.0, 4.0), (f64::NAN, 4.0), (0.0, f64::INFINITY)] {
+			let content = kernel(range)
+				.legend_content(&ResolvedPlotSettings::default())
+				.expect("size guide remains");
+			assert_eq!(content.0.len(), 1);
+			assert!(matches!(
+				content.0.first(),
+				LegendSection::SizeSample { .. }
+			));
+		}
+	}
+
+	#[test]
+	fn product_0087_bubble_asymmetric_diverging_neutral_remains_at_twenty_five() {
+		let settings = ResolvedPlotSettings {
+			color_theme: ColorTheme::GreenPurples,
+			..ResolvedPlotSettings::default()
+		};
+		let content = kernel((-50.0, 100.0))
+			.legend_content(&settings)
+			.expect("gradient and size guides");
+		let stops = stops(content.0.first());
+		assert_eq!(stops.values().collect::<Vec<_>>(), [-50.0, 25.0, 100.0]);
+		assert_eq!(stops.sample_normalized(0.5), Color::WHITE);
+		assert_eq!(settings.color_theme.get_color(0.5), Color::WHITE);
 	}
 }

@@ -80,15 +80,15 @@ impl PlotKernel for HexbinPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		Some(crate::plot::legend::LegendContent(
-			crate::plot::spec::NonEmpty::new(crate::plot::legend::LegendSection::Gradient {
-				label: "Count".to_owned(),
-				low: 0.0,
-				high: self.prepared_data.max_count as f64,
-				low_color: settings.color_theme.get_color(0.0),
-				high_color: settings.color_theme.get_color(1.0),
-			}),
-		))
+		crate::plot::legend::gradient_section(
+			"Count".to_owned(),
+			0.0,
+			f64::from(self.prepared_data.max_count),
+			settings.color_theme,
+		)
+		.map(|section| {
+			crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(section))
+		})
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
@@ -271,5 +271,30 @@ pub fn prepare_hexbin_data(
 		y_range,
 		x_label: x_col.to_string(),
 		y_label: y_col.to_string(),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn product_0087_hexbin_omits_a_zero_count_gradient() {
+		let kernel = HexbinPlotKernel {
+			prepared_data: Arc::new(HexbinPreparedData {
+				bins: std::collections::HashMap::new(),
+				max_count: 0,
+				radius: 0.02,
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_label: "x".to_owned(),
+				y_label: "y".to_owned(),
+			}),
+		};
+		assert!(
+			kernel
+				.legend_content(&ResolvedPlotSettings::default())
+				.is_none()
+		);
 	}
 }

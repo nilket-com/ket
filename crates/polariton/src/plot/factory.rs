@@ -1672,8 +1672,10 @@ mod product_0013_baseline_tests {
 			assert_eq!(content.0.len(), 1);
 			assert!(matches!(
 				content.0.first(),
-				crate::plot::legend::LegendSection::Gradient { low, high, .. }
-					if *low == 0.0 && high.is_finite()
+				crate::plot::legend::LegendSection::Gradient { stops, .. }
+					if stops.len() > 2
+						&& stops.first_value() == 0.0
+						&& stops.last_value().is_finite()
 			));
 			let mut backend = SvgBackend::new(400.0, 300.0);
 			crate::plot::legend::render_legend(
@@ -1700,7 +1702,7 @@ mod product_0013_baseline_tests {
 		assert_eq!(content.0.len(), 2);
 		assert!(matches!(
 			content.0.first(),
-			crate::plot::legend::LegendSection::Gradient { .. }
+			crate::plot::legend::LegendSection::Gradient { stops, .. } if stops.len() > 2
 		));
 		assert!(matches!(
 			content.0.last(),
