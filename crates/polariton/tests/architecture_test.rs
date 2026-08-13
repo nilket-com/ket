@@ -2951,3 +2951,52 @@ fn product_0085_keeps_one_semantic_axis_title_derivation_authority() {
 		);
 	}
 }
+
+#[test]
+fn product_0093_legend_geometry_has_one_authority_without_backend_measurement() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let legend = std::fs::read_to_string(root.join("plot/legend.rs")).expect("read legend");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot backend");
+
+	assert!(legend.contains("fn legend_geometry("));
+	let measure = legend
+		.split("pub(crate) fn measure_legend(")
+		.nth(1)
+		.expect("legend measurement")
+		.split("pub(crate) fn legend_layout(")
+		.next()
+		.expect("bounded legend measurement");
+	assert!(measure.contains("legend_geometry(content, settings).size"));
+	let render = legend
+		.split("pub fn render_legend(")
+		.nth(1)
+		.expect("legend renderer")
+		.split("#[cfg(test)]")
+		.next()
+		.expect("bounded legend renderer");
+	assert!(render.contains("let geometry = legend_geometry(content, settings);"));
+	for retired in [
+		"let width = 250.0",
+		"x + width - 70.0",
+		"let bar_x = x + padding",
+	] {
+		assert!(
+			!render.contains(retired),
+			"PRODUCT-0093 retains a second legend geometry authority: {retired}"
+		);
+	}
+
+	let backend = common
+		.split("pub trait PlotBackend")
+		.nth(1)
+		.expect("plot backend trait")
+		.split("pub struct IcedBackend")
+		.next()
+		.expect("bounded plot backend trait");
+	for forbidden in ["measure_text", "text_extent", "glyph_extent"] {
+		assert!(
+			!backend.contains(forbidden),
+			"PRODUCT-0093 must not add backend glyph measurement: {forbidden}"
+		);
+	}
+}

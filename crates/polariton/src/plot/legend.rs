@@ -278,6 +278,165 @@ fn sample_gradient(stops: &GradientStops, t: f32) -> Color {
 	stops.sample_normalized(t)
 }
 
+const LEGEND_PADDING: f32 = 10.0;
+const GRADIENT_BAR_WIDTH: f32 = 15.0;
+const GRADIENT_TEXT_GAP: f32 = 5.0;
+const NUMERIC_GLYPH_ADVANCE_EM: f32 = 0.75;
+
+#[derive(Clone, Debug, PartialEq)]
+struct GradientLabels {
+	low: String,
+	high: String,
+}
+
+impl GradientLabels {
+	fn new(stops: &GradientStops) -> Self {
+		Self {
+			low: format!("{:.1}", stops.first_value()),
+			high: format!("{:.1}", stops.last_value()),
+		}
+	}
+
+	fn estimated_width(&self, font_size: f32) -> f32 {
+		estimate_legend_text_width(&self.low, font_size)
+			.max(estimate_legend_text_width(&self.high, font_size))
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct GradientGeometry {
+	bar: Point,
+	bar_height: f32,
+	endpoint_x: f32,
+	title: Point,
+	labels: GradientLabels,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PairedLegendGeometry {
+	gradient: GradientGeometry,
+	size_x: f32,
+	size_title: Point,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum LegendGeometryKind {
+	Paired(PairedLegendGeometry),
+	Stacked {
+		section_offsets: Vec<f32>,
+		gradients: Vec<Option<GradientGeometry>>,
+	},
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct LegendGeometry {
+	size: Size,
+	kind: LegendGeometryKind,
+}
+
+/// Conservatively bound the fixed-precision numeric labels used by gradients.
+///
+/// The plot backend deliberately exposes no realized glyph extents. The
+/// endpoint alphabet is limited to digits, sign, and decimal point. A
+/// deliberately conservative three-quarter-em advance bounds those glyphs in
+/// the resolved default font without pretending to measure them.
+fn estimate_legend_text_width(text: &str, font_size: f32) -> f32 {
+	text.chars().count() as f32 * font_size * NUMERIC_GLYPH_ADVANCE_EM
+}
+
+fn gradient_required_width(labels: &GradientLabels, font_size: f32) -> f32 {
+	LEGEND_PADDING
+		+ GRADIENT_BAR_WIDTH
+		+ GRADIENT_TEXT_GAP
+		+ labels.estimated_width(font_size)
+		+ LEGEND_PADDING
+}
+
+fn legend_geometry(content: &LegendContent, settings: &ResolvedPlotSettings) -> LegendGeometry {
+	let sections: Vec<&LegendSection> = content.sections().collect();
+	if let [
+		LegendSection::Gradient { stops, .. },
+		LegendSection::SizeSample { .. },
+	] = sections.as_slice()
+	{
+		let labels = GradientLabels::new(stops);
+		let bar_x = 180.0;
+		let endpoint_x = bar_x + GRADIENT_BAR_WIDTH + 8.0;
+		let width = 250.0_f32
+			.max(endpoint_x + labels.estimated_width(settings.legend_size) + LEGEND_PADDING);
+		return LegendGeometry {
+			size: Size::new(width, 240.0),
+			kind: LegendGeometryKind::Paired(PairedLegendGeometry {
+				gradient: GradientGeometry {
+					bar: Point::new(bar_x, 50.0),
+					bar_height: 160.0,
+					endpoint_x,
+					title: Point::new(bar_x + GRADIENT_BAR_WIDTH / 2.0, 15.0),
+					labels,
+				},
+				size_x: 20.0,
+				size_title: Point::new(60.0, 15.0),
+			}),
+		};
+	}
+
+	let base_width = if sections.len() == 1 {
+		match sections[0] {
+			LegendSection::Entries(entries) => {
+				let max_rows = settings.max_legend_rows.max(1) as usize;
+				entries.len().div_ceil(max_rows) as f32 * 150.0 + LEGEND_PADDING * 2.0
+			}
+			LegendSection::Gradient { .. } => 60.0,
+			LegendSection::SizeSample { .. } => 180.0,
+		}
+	} else {
+		250.0
+	};
+	let gradient_width = sections
+		.iter()
+		.filter_map(|section| match section {
+			LegendSection::Gradient { stops, .. } => Some(gradient_required_width(
+				&GradientLabels::new(stops),
+				settings.legend_size,
+			)),
+			_ => None,
+		})
+		.fold(0.0_f32, f32::max);
+	let width = base_width.max(gradient_width);
+	let mut offset = 0.0;
+	let mut section_offsets = Vec::with_capacity(sections.len());
+	let mut gradients = Vec::with_capacity(sections.len());
+	for section in &sections {
+		section_offsets.push(offset);
+		let gradient = match section {
+			LegendSection::Gradient { stops, .. } => Some(GradientGeometry {
+				bar: Point::new(LEGEND_PADDING, offset + 35.0),
+				bar_height: 145.0,
+				endpoint_x: LEGEND_PADDING + GRADIENT_BAR_WIDTH + GRADIENT_TEXT_GAP,
+				title: Point::new(width / 2.0, offset + 10.0),
+				labels: GradientLabels::new(stops),
+			}),
+			_ => None,
+		};
+		gradients.push(gradient);
+		offset += match section {
+			LegendSection::Entries(entries) => {
+				let max_rows = settings.max_legend_rows.max(1) as usize;
+				entries.len().min(max_rows) as f32 * 25.0 + LEGEND_PADDING * 2.0
+			}
+			LegendSection::Gradient { .. } => 200.0,
+			LegendSection::SizeSample { .. } => 180.0,
+		};
+	}
+	LegendGeometry {
+		size: Size::new(width, offset),
+		kind: LegendGeometryKind::Stacked {
+			section_offsets,
+			gradients,
+		},
+	}
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct LegendLayout {
 	pub(crate) content_bounds: Rect<Widget>,
@@ -302,42 +461,7 @@ impl LegendLayout {
 }
 
 pub(crate) fn measure_legend(content: &LegendContent, settings: &ResolvedPlotSettings) -> Size {
-	let sections: Vec<&LegendSection> = content.sections().collect();
-	if sections.len() == 2
-		&& matches!(
-			sections.as_slice(),
-			[
-				LegendSection::Gradient { .. },
-				LegendSection::SizeSample { .. }
-			]
-		) {
-		return Size::new(250.0, 240.0);
-	}
-	let padding = 10.0;
-	let width = if sections.len() == 1 {
-		match sections[0] {
-			LegendSection::Entries(entries) => {
-				let max_rows = settings.max_legend_rows.max(1) as usize;
-				entries.len().div_ceil(max_rows) as f32 * 150.0 + padding * 2.0
-			}
-			LegendSection::Gradient { .. } => 60.0,
-			LegendSection::SizeSample { .. } => 180.0,
-		}
-	} else {
-		250.0
-	};
-	let height = sections
-		.iter()
-		.map(|section| match section {
-			LegendSection::Entries(entries) => {
-				let max_rows = settings.max_legend_rows.max(1) as usize;
-				entries.len().min(max_rows) as f32 * 25.0 + padding * 2.0
-			}
-			LegendSection::Gradient { .. } => 200.0,
-			LegendSection::SizeSample { .. } => 180.0,
-		})
-		.sum();
-	Size::new(width, height)
+	legend_geometry(content, settings).size
 }
 
 pub(crate) fn legend_layout(
@@ -392,15 +516,15 @@ pub fn render_legend(
 	if sections.is_empty() {
 		return;
 	}
+	let geometry = legend_geometry(content, settings);
 	let section_count = sections.len();
-	let padding = 10.0;
 	let x = origin.x();
 	let y = origin.y();
 	// Bubble's two semantic sections were historically laid out as one
 	// horizontal guide: size samples on the left and the color gradient on the
 	// right. Keep that geometry while representing the content as two ordinary
 	// sections; PRODUCT-0044 may later choose a different policy.
-	if sections.len() == 2
+	if let LegendGeometryKind::Paired(pair) = &geometry.kind
 		&& let [
 			LegendSection::Gradient {
 				label: color_label,
@@ -413,8 +537,8 @@ pub fn render_legend(
 			},
 		] = sections.as_slice()
 	{
-		let width = 250.0;
-		let height = 240.0;
+		let width = geometry.size.width;
+		let height = geometry.size.height;
 		backend.fill_rectangle(
 			Point::new(x, y),
 			Size::new(width, height),
@@ -423,9 +547,10 @@ pub fn render_legend(
 				..settings.chrome.legend_background.iced()
 			},
 		);
-		let bar_x = x + width - 70.0;
-		let bar_y = y + 50.0;
-		let bar_height = height - 80.0;
+		let gradient = &pair.gradient;
+		let bar_x = x + gradient.bar.x;
+		let bar_y = y + gradient.bar.y;
+		let bar_height = gradient.bar_height;
 		for i in 0..50 {
 			let t = i as f32 / 49.0;
 			let step_height = bar_height / 50.0;
@@ -435,12 +560,10 @@ pub fn render_legend(
 				sample_gradient(stops, t),
 			);
 		}
-		let low = stops.first_value();
-		let high = stops.last_value();
-		let label_x = bar_x + 23.0;
+		let label_x = x + gradient.endpoint_x;
 		draw_text_at(
 			backend,
-			format!("{high:.1}"),
+			gradient.labels.high.clone(),
 			Point::new(label_x, bar_y),
 			settings,
 			alignment::Horizontal::Left,
@@ -449,7 +572,7 @@ pub fn render_legend(
 		);
 		draw_text_at(
 			backend,
-			format!("{low:.1}"),
+			gradient.labels.low.clone(),
 			Point::new(label_x, bar_y + bar_height),
 			settings,
 			alignment::Horizontal::Left,
@@ -459,17 +582,17 @@ pub fn render_legend(
 		draw_text_at(
 			backend,
 			color_label.clone(),
-			Point::new(bar_x + 7.5, y + 15.0),
+			Point::new(x + gradient.title.x, y + gradient.title.y),
 			settings,
 			alignment::Horizontal::Center,
 			alignment::Vertical::Top,
 			16.0,
 		);
-		let size_x = x + 20.0;
+		let size_x = x + pair.size_x;
 		draw_text_at(
 			backend,
 			size_label.clone(),
-			Point::new(size_x + 40.0, y + 15.0),
+			Point::new(x + pair.size_title.x, y + pair.size_title.y),
 			settings,
 			alignment::Horizontal::Center,
 			alignment::Vertical::Top,
@@ -506,9 +629,15 @@ pub fn render_legend(
 		}
 		return;
 	}
-	let size = measure_legend(content, settings);
-	let width = size.width;
-	let height = size.height;
+	let LegendGeometryKind::Stacked {
+		section_offsets,
+		gradients,
+	} = &geometry.kind
+	else {
+		unreachable!("PRODUCT-0093 paired content uses paired legend geometry");
+	};
+	let width = geometry.size.width;
+	let height = geometry.size.height;
 	backend.fill_rectangle(
 		Point::new(x, y),
 		Size::new(width, height),
@@ -518,16 +647,19 @@ pub fn render_legend(
 		},
 	);
 
-	let mut offset = 0.0;
-	for section in sections {
+	for ((section, offset), gradient_geometry) in sections
+		.into_iter()
+		.zip(section_offsets.iter().copied())
+		.zip(gradients.iter())
+	{
 		match section {
 			LegendSection::Entries(entries) => {
 				let max_rows = settings.max_legend_rows.max(1) as usize;
 				for (index, entry) in entries.iter().enumerate() {
 					let col = index / max_rows;
 					let row = index % max_rows;
-					let item_x = x + padding + col as f32 * 150.0;
-					let item_y = y + offset + padding + row as f32 * 25.0;
+					let item_x = x + LEGEND_PADDING + col as f32 * 150.0;
+					let item_y = y + offset + LEGEND_PADDING + row as f32 * 25.0;
 					match entry.sample {
 						LegendSample::Swatch => backend.fill_rectangle(
 							Point::new(item_x, item_y + 5.0),
@@ -567,12 +699,14 @@ pub fn render_legend(
 						..Default::default()
 					});
 				}
-				offset += entries.len().min(max_rows) as f32 * 25.0 + padding * 2.0;
 			}
 			LegendSection::Gradient { label, stops } => {
-				let bar_x = x + padding;
-				let bar_y = y + offset + 35.0;
-				let bar_height = 145.0;
+				let gradient = gradient_geometry
+					.as_ref()
+					.expect("PRODUCT-0093 gradient sections carry gradient geometry");
+				let bar_x = x + gradient.bar.x;
+				let bar_y = y + gradient.bar.y;
+				let bar_height = gradient.bar_height;
 				for i in 0..50 {
 					let t = i as f32 / 49.0;
 					backend.fill_rectangle(
@@ -584,8 +718,6 @@ pub fn render_legend(
 						sample_gradient(stops, t),
 					);
 				}
-				let low = stops.first_value();
-				let high = stops.last_value();
 				backend.stroke_path(
 					&|builder| {
 						builder.move_to(Point::new(bar_x, bar_y));
@@ -602,8 +734,8 @@ pub fn render_legend(
 				);
 				draw_text_at(
 					backend,
-					format!("{high:.1}"),
-					Point::new(bar_x + 20.0, bar_y),
+					gradient.labels.high.clone(),
+					Point::new(x + gradient.endpoint_x, bar_y),
 					settings,
 					alignment::Horizontal::Left,
 					alignment::Vertical::Top,
@@ -611,8 +743,8 @@ pub fn render_legend(
 				);
 				draw_text_at(
 					backend,
-					format!("{low:.1}"),
-					Point::new(bar_x + 20.0, bar_y + bar_height),
+					gradient.labels.low.clone(),
+					Point::new(x + gradient.endpoint_x, bar_y + bar_height),
 					settings,
 					alignment::Horizontal::Left,
 					alignment::Vertical::Bottom,
@@ -622,14 +754,13 @@ pub fn render_legend(
 					draw_text_at(
 						backend,
 						label.clone(),
-						Point::new(x + width / 2.0, y + offset + 10.0),
+						Point::new(x + gradient.title.x, y + gradient.title.y),
 						settings,
 						alignment::Horizontal::Center,
 						alignment::Vertical::Top,
 						settings.legend_size,
 					);
 				}
-				offset += 200.0;
 			}
 			LegendSection::SizeSample { label, low, high } => {
 				draw_text(
@@ -661,7 +792,6 @@ pub fn render_legend(
 						settings,
 					);
 				}
-				offset += 180.0;
 			}
 		}
 	}
@@ -680,6 +810,7 @@ mod tests {
 	#[derive(Default)]
 	struct RectangleBackend {
 		rectangles: Vec<(Point, Size, Color)>,
+		texts: Vec<Text>,
 	}
 
 	impl PlotBackend for RectangleBackend {
@@ -691,7 +822,9 @@ mod tests {
 			self.rectangles.push((point, size, color));
 		}
 
-		fn fill_text(&mut self, _text: Text) {}
+		fn fill_text(&mut self, text: Text) {
+			self.texts.push(text);
+		}
 
 		fn translate(&mut self, _translation: iced::Vector) {}
 
@@ -706,9 +839,9 @@ mod tests {
 		}
 	}
 
-	fn gradient(theme: ColorTheme) -> LegendSection {
+	fn gradient_for_domain(theme: ColorTheme, domain: (f64, f64)) -> LegendSection {
 		let scale = ContinuousColorScale::new(
-			(10.0, 50.0),
+			domain,
 			ContinuousScaleIntent::SEQUENTIAL,
 			ContinuousRamps {
 				sequential: theme,
@@ -717,6 +850,22 @@ mod tests {
 		)
 		.expect("ascending non-degenerate scale");
 		gradient_section("Value".to_owned(), &scale).expect("ascending non-degenerate gradient")
+	}
+
+	fn gradient(theme: ColorTheme) -> LegendSection {
+		gradient_for_domain(theme, (10.0, 50.0))
+	}
+
+	fn gradient_contents(domain: (f64, f64)) -> (LegendContent, LegendContent) {
+		let section = gradient_for_domain(ColorTheme::Viridis, domain);
+		let ordinary = LegendContent(NonEmpty::new(section.clone()));
+		let mut paired = LegendContent(NonEmpty::new(section));
+		paired.push(LegendSection::SizeSample {
+			label: "Size".to_owned(),
+			low: 1.0,
+			high: 3.0,
+		});
+		(ordinary, paired)
 	}
 
 	fn gradient_stops(section: &LegendSection) -> &GradientStops {
@@ -1079,5 +1228,129 @@ mod tests {
 			paths.push(colors);
 		}
 		assert_eq!(paths[0], paths[1]);
+	}
+
+	fn assert_gradient_endpoints_fit(content: &LegendContent, settings: &ResolvedPlotSettings) {
+		let geometry = legend_geometry(content, settings);
+		match &geometry.kind {
+			LegendGeometryKind::Paired(pair) => {
+				let gradient = &pair.gradient;
+				assert!(
+					gradient.endpoint_x
+						+ gradient.labels.estimated_width(settings.legend_size)
+						+ LEGEND_PADDING <= geometry.size.width
+				);
+			}
+			LegendGeometryKind::Stacked { gradients, .. } => {
+				for gradient in gradients.iter().flatten() {
+					assert!(
+						gradient.endpoint_x
+							+ gradient.labels.estimated_width(settings.legend_size)
+							+ LEGEND_PADDING <= geometry.size.width
+					);
+				}
+			}
+		}
+	}
+
+	#[test]
+	fn product_0093_gradient_widths_follow_negative_large_and_short_content_on_both_paths() {
+		let settings = ResolvedPlotSettings::default();
+		let negative = gradient_contents((-30.0, 40.0));
+		let large = gradient_contents((5.0, 123_456.0));
+		let short = gradient_contents((5.0, 9.0));
+
+		for content in [
+			&negative.0,
+			&negative.1,
+			&large.0,
+			&large.1,
+			&short.0,
+			&short.1,
+		] {
+			assert_gradient_endpoints_fit(content, &settings);
+		}
+		assert!(measure_legend(&negative.0, &settings).width > 60.0);
+		assert!(measure_legend(&negative.1, &settings).width > 250.0);
+		assert!(
+			measure_legend(&short.0, &settings).width < measure_legend(&large.0, &settings).width
+		);
+		assert!(
+			measure_legend(&short.1, &settings).width < measure_legend(&large.1, &settings).width
+		);
+	}
+
+	#[test]
+	fn product_0093_measurement_and_rendering_share_geometry_on_both_paths() {
+		let settings = ResolvedPlotSettings::default();
+		let (ordinary, paired) = gradient_contents((-30.0, 40.0));
+		for content in [&ordinary, &paired] {
+			let expected = legend_geometry(content, &settings);
+			let mut backend = RectangleBackend::default();
+			render_legend(
+				&mut backend,
+				Rect::<Widget>::from_iced_frame(Rectangle::new(
+					Point::ORIGIN,
+					Size::new(400.0, 300.0),
+				))
+				.origin(),
+				content,
+				&settings,
+			);
+			assert_eq!(measure_legend(content, &settings), expected.size);
+			assert_eq!(backend.rectangles[0].0, Point::ORIGIN);
+			assert_eq!(backend.rectangles[0].1, expected.size);
+			assert!(backend.texts.iter().any(|text| text.content == "-30.0"));
+			assert!(backend.texts.iter().any(|text| text.content == "40.0"));
+		}
+
+		let ordinary_geometry = legend_geometry(&ordinary, &settings);
+		let LegendGeometryKind::Stacked { gradients, .. } = ordinary_geometry.kind else {
+			panic!("ordinary gradient geometry");
+		};
+		let ordinary_gradient = gradients[0].as_ref().unwrap();
+		assert_eq!(ordinary_gradient.bar, Point::new(10.0, 35.0));
+
+		let paired_geometry = legend_geometry(&paired, &settings);
+		let LegendGeometryKind::Paired(pair) = paired_geometry.kind else {
+			panic!("paired gradient geometry");
+		};
+		assert_eq!(pair.gradient.bar, Point::new(180.0, 50.0));
+	}
+
+	#[test]
+	fn product_0093_estimator_honours_legend_size_and_the_declared_advance() {
+		let (ordinary, paired) = gradient_contents((5.0, 123_456.0));
+		let small = ResolvedPlotSettings {
+			legend_size: 7.0,
+			..ResolvedPlotSettings::default()
+		};
+		let normal = ResolvedPlotSettings::default();
+		let large = ResolvedPlotSettings {
+			legend_size: 28.0,
+			..ResolvedPlotSettings::default()
+		};
+		for content in [&ordinary, &paired] {
+			let small_width = measure_legend(content, &small).width;
+			let normal_width = measure_legend(content, &normal).width;
+			let large_width = measure_legend(content, &large).width;
+			assert!(small_width < normal_width);
+			assert!(normal_width < large_width);
+		}
+
+		assert_eq!(estimate_legend_text_width("-30.0", 14.0), 52.5);
+		assert_eq!(estimate_legend_text_width("123456.0", 14.0), 84.0);
+		assert_eq!(estimate_legend_text_width("5.0", 14.0), 31.5);
+	}
+
+	#[test]
+	fn product_0093_fixed_precision_endpoints_bound_every_mixed_domain_label() {
+		let low = -30.0_f64;
+		let high = 40.0_f64;
+		let endpoint_width = format!("{low:.1}").len().max(format!("{high:.1}").len());
+		for index in 0..50 {
+			let value = low + (high - low) * index as f64 / 49.0;
+			assert!(format!("{value:.1}").len() <= endpoint_width);
+		}
 	}
 }
