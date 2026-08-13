@@ -1,3 +1,11 @@
+#[path = "../../src/plot/spec/bubble_fields.rs"]
+mod product_bubble_fields;
+mod plot {
+	pub(crate) mod spec {
+		pub(crate) use crate::product_bubble_fields::{BubbleFieldNames, BubbleNumericField};
+	}
+}
+
 #[path = "../../src/plot/kernels/bubble_observations.rs"]
 mod bubble_observations;
 

@@ -525,19 +525,20 @@ fn product_0092_heatmap_surface_keeps_one_explicit_three_role_pipeline() {
 		.expect("read session persistence");
 
 	assert!(spec.contains("pub struct HeatmapFields"));
-	assert!(spec.contains("pub fn all(&self) -> [&str; 3]"));
+	assert!(spec.contains("pub enum MarkFields"));
+	assert!(spec.contains("Self::Heatmap(fields) => ["));
 	assert!(spec.contains("fn resolve_heatmap_channels("));
 	assert!(spec.contains("(PlotType::Heatmap, Channel::X | Channel::Y)"));
 	assert!(spec.contains("PlotType::Bar | PlotType::BoxPlot | PlotType::Heatmap"));
 	assert!(spec.contains("channel: Channel::Color"));
-	assert!(request.contains("if let Some(heatmap_fields) = spec.heatmap_fields()"));
-	assert!(request.contains("for field in heatmap_fields.all()"));
+	assert!(request.contains("if let Some(mark_fields) = spec.mark_fields()"));
+	assert!(request.contains("for field in mark_fields.all()"));
 	assert!(presentation.contains("(\"__heatmap\", raw_heatmap as RawFunction)"));
 	assert!(presentation.contains("fn raw_heatmap("));
 	assert!(compiler.contains("\"heatmap\","));
 	assert!(compiler.contains("\"heatmap\" => Some(3)"));
-	assert!(envelope.contains("pub(crate) heatmap_fields: Option<"));
-	assert!(envelope.contains("pub(crate) heatmap_origins: Option<HeatmapFieldOrigins>"));
+	assert!(envelope.contains("pub(crate) mark_fields: Option<SpannedMarkFields>"));
+	assert!(envelope.contains("Self::Heatmap { fields, origins }"));
 	assert!(host.contains("fn heatmap_failure_span("));
 	assert!(host.contains("heatmap_output_span"));
 
@@ -2999,4 +3000,122 @@ fn product_0093_legend_geometry_has_one_authority_without_backend_measurement() 
 			"PRODUCT-0093 must not add backend glyph measurement: {forbidden}"
 		);
 	}
+}
+
+#[test]
+fn product_0094_mark_field_transport_is_exhaustive_coupled_and_identity_neutral() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let bubble_fields = std::fs::read_to_string(root.join("plot/spec/bubble_fields.rs"))
+		.expect("read bubble field vocabulary");
+	let observations = std::fs::read_to_string(root.join("plot/kernels/bubble_observations.rs"))
+		.expect("read bubble substrate");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read Rune presentation");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read factory");
+
+	let mark_fields = spec
+		.split("pub enum MarkFields")
+		.nth(1)
+		.expect("semantic mark fields")
+		.split("pub struct AuthoredPlotSpec")
+		.next()
+		.expect("bounded semantic mark fields");
+	for variant in [
+		"BoxPlot(BoxPlotFields)",
+		"Heatmap(HeatmapFields)",
+		"Bubble(BubbleFields)",
+	] {
+		assert!(mark_fields.contains(variant));
+	}
+	assert!(mark_fields.contains("let fields: [Option<&str>; 7] = match self"));
+	assert!(mark_fields.contains("fields.into_iter().flatten()"));
+	assert!(!mark_fields.contains("Vec<") && !mark_fields.contains("vec!["));
+
+	let projection = request
+		.split("fn project_named_channels(")
+		.nth(1)
+		.expect("named-channel projection")
+		.split("#[cfg(test)]")
+		.next()
+		.expect("bounded named-channel projection");
+	assert!(projection.contains("if let Some(mark_fields) = spec.mark_fields()"));
+	assert!(projection.contains("for field in mark_fields.all()"));
+	for retired in [
+		"box_plot_fields",
+		"heatmap_fields",
+		"MarkFields::BoxPlot",
+		"MarkFields::Heatmap",
+	] {
+		assert!(
+			!projection.contains(retired),
+			"PRODUCT-0094 projection retains a per-mark path: {retired}"
+		);
+	}
+
+	let sink = envelope
+		.split("pub(crate) struct DisposableRunePlotSink")
+		.nth(1)
+		.expect("Rune plot sink")
+		.split("impl Eq for DisposableRunePlotSink")
+		.next()
+		.expect("bounded Rune plot sink and equality");
+	assert!(sink.contains("pub(crate) mark_fields: Option<SpannedMarkFields>"));
+	for retired in [
+		"box_plot_fields",
+		"box_plot_origins",
+		"heatmap_fields",
+		"heatmap_origins",
+	] {
+		assert!(!sink.contains(retired));
+	}
+	assert!(sink.contains("left.semantic_eq(right)"));
+
+	let spanned = envelope
+		.split("pub(crate) enum SpannedMarkFields")
+		.nth(1)
+		.expect("spanned mark fields")
+		.split("#[derive(Clone, Debug, PartialEq, Eq)]")
+		.next()
+		.expect("bounded spanned mark fields");
+	assert!(
+		spanned.contains("BoxPlot {")
+			&& spanned.contains("Heatmap {")
+			&& spanned.contains("Bubble {")
+	);
+	let preceding = envelope
+		.split("pub(crate) enum SpannedMarkFields")
+		.next()
+		.expect("spanned prefix")
+		.rsplit('\n')
+		.take(3)
+		.collect::<Vec<_>>()
+		.join("\n");
+	assert!(!preceding.contains("PartialEq"));
+	let semantic_eq = spanned
+		.split("fn semantic_eq(")
+		.nth(1)
+		.expect("borrowed semantic equality")
+		.split("\n\t}")
+		.next()
+		.expect("bounded semantic equality");
+	assert!(!semantic_eq.contains("clone") && !semantic_eq.contains("to_mark_fields"));
+
+	assert!(bubble_fields.contains("pub struct BubbleFieldNames"));
+	assert!(bubble_fields.contains("pub struct BubbleFields"));
+	assert!(bubble_fields.contains("numeric: BubbleFieldNames"));
+	for duplicate in ["x: String", "y: String", "size: String", "color: String"] {
+		assert_eq!(
+			bubble_fields.matches(duplicate).count(),
+			1,
+			"duplicate {duplicate}"
+		);
+		assert!(!observations.contains(duplicate));
+	}
+	assert!(!presentation.contains("SpannedMarkFields::Bubble"));
+	assert!(!presentation.contains("\"__bubble\""));
+	assert!(factory.contains("let fields = crate::plot::spec::BoxPlotFields {"));
 }

@@ -14,7 +14,8 @@ use crate::plot::core::PlotType;
 #[cfg(test)]
 use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
 use crate::plot::spec::{
-	BoxPlotFields, LayerMark, LayerSettings, LayerSpec, LayeredPlotSpec, Override, Presence,
+	BoxPlotFields, BubbleFields, HeatmapFields, LayerMark, LayerSettings, LayerSpec,
+	LayeredPlotSpec, MarkFields, Override, Presence,
 };
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
@@ -286,13 +287,8 @@ pub(crate) struct DisposableRunePlotSink {
 	pub(crate) category: Option<String>,
 	/// PRODUCT-0079: the second edge of an explicit histogram interval.
 	pub(crate) interval_end: Option<String>,
-	/// PRODUCT-0082: all seven ADR-547 fields, present only for BoxPlot.
-	pub(crate) box_plot_fields: Option<BoxPlotFields>,
-	/// Original use-site spans for each positional box argument.
-	pub(crate) box_plot_origins: Option<BoxPlotFieldOrigins>,
-	/// PRODUCT-0092: explicit heatmap keys and value, paired with their origins.
-	pub(crate) heatmap_fields: Option<crate::plot::spec::HeatmapFields>,
-	pub(crate) heatmap_origins: Option<HeatmapFieldOrigins>,
+	/// PRODUCT-0094: mark-specific fields coupled to their diagnostic origins.
+	pub(crate) mark_fields: Option<SpannedMarkFields>,
 	/// Original authored mark call, retained for post-query diagnostics.
 	pub(crate) origin: Range<u32>,
 }
@@ -307,8 +303,11 @@ impl PartialEq for DisposableRunePlotSink {
 			&& self.y == other.y
 			&& self.category == other.category
 			&& self.interval_end == other.interval_end
-			&& self.box_plot_fields == other.box_plot_fields
-			&& self.heatmap_fields == other.heatmap_fields
+			&& match (&self.mark_fields, &other.mark_fields) {
+				(None, None) => true,
+				(Some(left), Some(right)) => left.semantic_eq(right),
+				_ => false,
+			}
 	}
 }
 
@@ -352,6 +351,75 @@ impl BoxPlotFieldOrigins {
 			BoxPlotFieldRole::Q3 => self.q3.clone(),
 			BoxPlotFieldRole::WhiskerHigh => self.whisker_high.clone(),
 			BoxPlotFieldRole::Outlier => self.outlier.clone(),
+		}
+	}
+}
+
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // PRODUCT-0094 stages Bubble for its next surface record.
+pub(crate) struct BubbleFieldOrigins {
+	pub(crate) x: Range<u32>,
+	pub(crate) y: Range<u32>,
+	pub(crate) size: Range<u32>,
+	pub(crate) color: Range<u32>,
+	pub(crate) label: Option<Range<u32>>,
+}
+
+/// Mark-specific fields at the Rune boundary. The variant couples semantic
+/// fields to matching diagnostic provenance; provenance deliberately does not
+/// participate in `DisposableRunePlotSink` equality.
+#[derive(Clone, Debug)]
+#[allow(dead_code)] // PRODUCT-0094 stages Bubble for its next surface record.
+pub(crate) enum SpannedMarkFields {
+	BoxPlot {
+		fields: BoxPlotFields,
+		origins: BoxPlotFieldOrigins,
+	},
+	Heatmap {
+		fields: HeatmapFields,
+		origins: HeatmapFieldOrigins,
+	},
+	Bubble {
+		fields: BubbleFields,
+		origins: BubbleFieldOrigins,
+	},
+}
+
+impl SpannedMarkFields {
+	pub(crate) fn to_mark_fields(&self) -> MarkFields {
+		match self {
+			Self::BoxPlot { fields, .. } => MarkFields::BoxPlot(fields.clone()),
+			Self::Heatmap { fields, .. } => MarkFields::Heatmap(fields.clone()),
+			Self::Bubble { fields, .. } => MarkFields::Bubble(fields.clone()),
+		}
+	}
+
+	pub(crate) fn box_plot(&self) -> Option<(&BoxPlotFields, &BoxPlotFieldOrigins)> {
+		match self {
+			Self::BoxPlot { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
+	pub(crate) fn heatmap(&self) -> Option<(&HeatmapFields, &HeatmapFieldOrigins)> {
+		match self {
+			Self::Heatmap { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
+	fn semantic_eq(&self, other: &Self) -> bool {
+		match (self, other) {
+			(Self::BoxPlot { fields: left, .. }, Self::BoxPlot { fields: right, .. }) => {
+				left == right
+			}
+			(Self::Heatmap { fields: left, .. }, Self::Heatmap { fields: right, .. }) => {
+				left == right
+			}
+			(Self::Bubble { fields: left, .. }, Self::Bubble { fields: right, .. }) => {
+				left == right
+			}
+			_ => false,
 		}
 	}
 }
@@ -677,6 +745,7 @@ pub(crate) fn transform(source: &str) -> Result<TransformedRuneView, RuneEnvelop
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::spec::{BubbleFieldNames, BubbleFields};
 
 	#[derive(Clone, Debug, PartialEq)]
 	struct TestSemantics {
@@ -712,6 +781,69 @@ mod tests {
 
 	fn envelope(source: &str) -> TransformedRuneView {
 		transform(source).expect("execution envelope")
+	}
+
+	fn product_0094_heatmap_sink(value: &str, start: u32) -> DisposableRunePlotSink {
+		DisposableRunePlotSink {
+			composition: PlotComposition::single(PlotType::Heatmap),
+			x: "x".to_owned(),
+			y: "y".to_owned(),
+			category: None,
+			interval_end: None,
+			mark_fields: Some(SpannedMarkFields::Heatmap {
+				fields: HeatmapFields {
+					x: "x".to_owned(),
+					y: "y".to_owned(),
+					value: value.to_owned(),
+				},
+				origins: HeatmapFieldOrigins {
+					x: start..start + 1,
+					y: start + 2..start + 3,
+					value: start + 4..start + 5,
+				},
+			}),
+			origin: start..start + 6,
+		}
+	}
+
+	#[test]
+	fn product_0094_sink_equality_ignores_origins_but_not_semantic_fields() {
+		let first = product_0094_heatmap_sink("value", 10);
+		let relocated = product_0094_heatmap_sink("value", 100);
+		let changed = product_0094_heatmap_sink("other_value", 10);
+		assert_eq!(first, relocated);
+		assert_ne!(first, changed);
+	}
+
+	#[test]
+	fn product_0094_variants_keep_accessors_and_variable_arity() {
+		let heatmap = product_0094_heatmap_sink("value", 10);
+		let (_, origins) = heatmap
+			.mark_fields
+			.as_ref()
+			.and_then(SpannedMarkFields::heatmap)
+			.expect("heatmap fields and origins");
+		assert_eq!(origins.keys(), 10..13);
+
+		for (label, expected) in [
+			(None, vec!["x", "y", "size", "color"]),
+			(
+				Some("label".to_owned()),
+				vec!["x", "y", "size", "color", "label"],
+			),
+		] {
+			let staged = SpannedMarkFields::Bubble {
+				fields: BubbleFields::new(BubbleFieldNames::new("x", "y", "size", "color"), label),
+				origins: BubbleFieldOrigins {
+					x: 1..2,
+					y: 3..4,
+					size: 5..6,
+					color: 7..8,
+					label: None,
+				},
+			};
+			assert_eq!(staged.to_mark_fields().all().collect::<Vec<_>>(), expected);
+		}
 	}
 
 	#[test]

@@ -8,6 +8,11 @@
 
 #![allow(dead_code)] // Stage 1 publishes vocabulary consumed by stages 2 and 3.
 
+mod bubble_fields;
+
+pub(crate) use bubble_fields::BubbleNumericField;
+pub use bubble_fields::{BubbleFieldNames, BubbleFields};
+
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use libaryon::core::Rgb;
@@ -378,6 +383,48 @@ impl HeatmapFields {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MarkFields {
+	BoxPlot(BoxPlotFields),
+	Heatmap(HeatmapFields),
+	Bubble(BubbleFields),
+}
+
+impl MarkFields {
+	pub fn all(&self) -> impl Iterator<Item = &str> {
+		let fields: [Option<&str>; 7] = match self {
+			Self::BoxPlot(fields) => [
+				Some(&fields.category),
+				Some(&fields.whisker_low),
+				Some(&fields.q1),
+				Some(&fields.median),
+				Some(&fields.q3),
+				Some(&fields.whisker_high),
+				Some(&fields.outlier),
+			],
+			Self::Heatmap(fields) => [
+				Some(&fields.x),
+				Some(&fields.y),
+				Some(&fields.value),
+				None,
+				None,
+				None,
+				None,
+			],
+			Self::Bubble(fields) => [
+				Some(fields.numeric.get(BubbleNumericField::X)),
+				Some(fields.numeric.get(BubbleNumericField::Y)),
+				Some(fields.numeric.get(BubbleNumericField::Size)),
+				Some(fields.numeric.get(BubbleNumericField::Color)),
+				fields.label.as_deref(),
+				None,
+				None,
+			],
+		};
+		fields.into_iter().flatten()
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthoredPlotSpec {
 	pub composition: PlotComposition,
 	pub x: AuthoredChannelSpec,
@@ -387,10 +434,8 @@ pub struct AuthoredPlotSpec {
 	/// PRODUCT-0079: the second edge of a histogram interval. The x channel is
 	/// the start and the y channel is count; ordinary Cartesian marks keep None.
 	histogram_end: Option<String>,
-	/// PRODUCT-0082: explicit ADR-547 Tukey summary and outlier columns.
-	box_plot_fields: Option<BoxPlotFields>,
-	/// PRODUCT-0092: two categorical keys and one quantitative cell value.
-	heatmap_fields: Option<HeatmapFields>,
+	/// PRODUCT-0094: explicit fields beyond the generic channel vocabulary.
+	mark_fields: Option<MarkFields>,
 	/// PRODUCT-0064: stacking is authored geometry within the Bar family, not
 	/// a fourth authored plot type. Resolution consumes this only after the
 	/// x/y pair has selected the physical orientation.
@@ -407,8 +452,7 @@ impl AuthoredPlotSpec {
 			color: OptionalAuthoredChannelSpec::auto(),
 			color_job: Override::Inherit,
 			histogram_end: None,
-			box_plot_fields: None,
-			heatmap_fields: None,
+			mark_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -422,8 +466,7 @@ impl AuthoredPlotSpec {
 			color: OptionalAuthoredChannelSpec::absent(),
 			color_job: Override::Inherit,
 			histogram_end: None,
-			box_plot_fields: None,
-			heatmap_fields: None,
+			mark_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -466,12 +509,15 @@ impl AuthoredPlotSpec {
 			fields.category.clone(),
 			fields.median.clone(),
 		);
-		spec.box_plot_fields = Some(fields);
+		spec.mark_fields = Some(MarkFields::BoxPlot(fields));
 		spec
 	}
 
 	pub fn box_plot_fields(&self) -> Option<&BoxPlotFields> {
-		self.box_plot_fields.as_ref()
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::BoxPlot(fields)) => Some(fields),
+			_ => None,
+		}
 	}
 
 	pub fn heatmap(fields: HeatmapFields) -> Self {
@@ -480,12 +526,19 @@ impl AuthoredPlotSpec {
 			fields.x.clone(),
 			fields.y.clone(),
 		);
-		spec.heatmap_fields = Some(fields);
+		spec.mark_fields = Some(MarkFields::Heatmap(fields));
 		spec
 	}
 
 	pub fn heatmap_fields(&self) -> Option<&HeatmapFields> {
-		self.heatmap_fields.as_ref()
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::Heatmap(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn mark_fields(&self) -> Option<&MarkFields> {
+		self.mark_fields.as_ref()
 	}
 
 	pub fn with_stacked_bar(mut self) -> Self {
@@ -601,8 +654,7 @@ impl LayerEncoding {
 			color: self.color.clone(),
 			color_job: self.color_job.clone(),
 			histogram_end: None,
-			box_plot_fields: None,
-			heatmap_fields: None,
+			mark_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -3136,6 +3188,14 @@ fn categorical_color(index: usize) -> ResolvedColor {
 		green,
 		blue,
 		alpha: u8::MAX,
+	}
+}
+
+#[cfg(test)]
+impl AuthoredPlotSpec {
+	pub(crate) fn with_mark_fields_for_test(mut self, fields: MarkFields) -> Self {
+		self.mark_fields = Some(fields);
+		self
 	}
 }
 

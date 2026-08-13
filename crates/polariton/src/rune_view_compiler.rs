@@ -1728,8 +1728,12 @@ mod tests {
 				sink.composition.primary_plot_type(),
 				crate::plot::core::PlotType::Heatmap
 			);
-			assert_eq!(sink.heatmap_fields.as_ref().unwrap().value, "margin");
-			let origins = sink.heatmap_origins.as_ref().expect("three origins");
+			let (fields, origins) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(|fields| fields.heatmap())
+				.expect("heatmap fields and origins");
+			assert_eq!(fields.value, "margin");
 			assert_eq!(
 				&source[origins.value.start as usize..origins.value.end as usize],
 				"\"margin\""
@@ -1775,8 +1779,12 @@ mod tests {
 				sink.composition.primary_plot_type(),
 				crate::plot::core::PlotType::BoxPlot
 			);
-			assert_eq!(sink.box_plot_fields.as_ref().unwrap().q1, "p25");
-			let origins = sink.box_plot_origins.as_ref().expect("seven origins");
+			let (fields, origins) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(|fields| fields.box_plot())
+				.expect("box fields and origins");
+			assert_eq!(fields.q1, "p25");
 			assert_eq!(
 				&source[origins.q1.start as usize..origins.q1.end as usize],
 				"\"p25\""
@@ -1858,7 +1866,12 @@ mod tests {
 				sink.composition.primary_plot_type(),
 				crate::plot::core::PlotType::Heatmap
 			);
-			assert_eq!(sink.heatmap_fields.as_ref().unwrap().value, "margin");
+			let (fields, _) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(|fields| fields.heatmap())
+				.expect("heatmap fields and origins");
+			assert_eq!(fields.value, "margin");
 		}
 		assert!(source.contains("South/Q2 is absent"));
 		assert!(source.contains("aggregate in the relation"));

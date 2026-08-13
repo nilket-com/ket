@@ -1002,19 +1002,14 @@ fn resolve_rune_plot_skin(
 
 #[cfg(feature = "toron")]
 fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
-	if sink.composition.primary_plot_type() == PlotType::BoxPlot {
-		return AuthoredPlotSpec::box_plot(
-			sink.box_plot_fields
-				.clone()
-				.expect("Rune box carries seven explicit Tukey fields"),
-		);
-	}
-	if sink.composition.primary_plot_type() == PlotType::Heatmap {
-		return AuthoredPlotSpec::heatmap(
-			sink.heatmap_fields
-				.clone()
-				.expect("Rune heatmap carries x, y, and value fields"),
-		);
+	if let Some(fields) = sink.mark_fields.as_ref() {
+		return match fields.to_mark_fields() {
+			crate::plot::spec::MarkFields::BoxPlot(fields) => AuthoredPlotSpec::box_plot(fields),
+			crate::plot::spec::MarkFields::Heatmap(fields) => AuthoredPlotSpec::heatmap(fields),
+			crate::plot::spec::MarkFields::Bubble(_) => {
+				unreachable!("PRODUCT-0094 bubble mark fields have no production constructor")
+			}
+		};
 	}
 	if sink.composition.primary_plot_type() == PlotType::Histogram {
 		return AuthoredPlotSpec::histogram(
@@ -1565,40 +1560,22 @@ fn rune_view_outcome_with_palettes(
 				RuneViewIntent::Plot(plot) => (plot.facet.clone(), plot.facet_span.clone()),
 				RuneViewIntent::Table(_) => (None, None),
 			};
-			let box_diagnostic = match &view.intent {
+			let diagnostic_sink = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
-					RunePlotBody::Single(sink) => sink
-						.box_plot_fields
-						.clone()
-						.zip(sink.box_plot_origins.clone())
-						.map(|(fields, origins)| (fields, origins, sink.origin.clone())),
-					RunePlotBody::StyledSingle(styled) => styled
-						.sink
-						.box_plot_fields
-						.clone()
-						.zip(styled.sink.box_plot_origins.clone())
-						.map(|(fields, origins)| (fields, origins, styled.sink.origin.clone())),
+					RunePlotBody::Single(sink) => Some(sink),
+					RunePlotBody::StyledSingle(styled) => Some(&styled.sink),
 					RunePlotBody::Layered(_) => None,
 				},
 				RuneViewIntent::Table(_) => None,
 			};
-			let heatmap_diagnostic = match &view.intent {
-				RuneViewIntent::Plot(plot) => match &plot.body {
-					RunePlotBody::Single(sink) => sink
-						.heatmap_fields
-						.clone()
-						.zip(sink.heatmap_origins.clone())
-						.map(|(fields, origins)| (fields, origins, sink.origin.clone())),
-					RunePlotBody::StyledSingle(styled) => styled
-						.sink
-						.heatmap_fields
-						.clone()
-						.zip(styled.sink.heatmap_origins.clone())
-						.map(|(fields, origins)| (fields, origins, styled.sink.origin.clone())),
-					RunePlotBody::Layered(_) => None,
-				},
-				RuneViewIntent::Table(_) => None,
-			};
+			let box_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.box_plot()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
+			let heatmap_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.heatmap()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let body_output_span = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
 					RunePlotBody::Single(sink)

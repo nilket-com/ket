@@ -244,9 +244,10 @@ that compare equal today must compare equal after.
 **Stage 2 — the boundary.** `rune_presentation.rs` constructs
 `SpannedMarkFields`; the sink carries it; §5's manual `PartialEq`.
 
-**Stage 3 — the consumers.** `spec/mod.rs`, `request.rs`, `gui/state.rs`,
-`boxplot.rs` migrate to `MarkFields`. The four `Option` fields are removed, not
-deprecated.
+**Stage 3 — the mixed-mark consumers.** `spec/mod.rs`, `request.rs`, and
+`gui/state.rs` migrate to `MarkFields`. `boxplot.rs` and `factory.rs` remain on
+the specific `BoxPlotFields` payload under §8's already-known-mark rule. The four
+`Option` fields are removed, not deprecated.
 
 **Stage 4 — the exhaustive `all()`.** Projection consumes it; the per-mark
 `if let Some(..)` arms in `project_named_channels` are deleted.

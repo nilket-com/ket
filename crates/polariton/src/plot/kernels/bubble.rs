@@ -4,8 +4,9 @@ use crate::plot::common::{
 };
 use crate::plot::continuous_color::{ContinuousColorScale, ContinuousScaleIntent};
 use crate::plot::kernels::bubble_observations::{
-	BubbleFieldNames, BubbleObservationRow, BubbleObservations, BubbleObservationsError,
+	BubbleObservationRow, BubbleObservations, BubbleObservationsError,
 };
+use crate::plot::spec::BubbleFieldNames;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Rectangle};
@@ -532,7 +533,7 @@ mod tests {
 			prepare_bubble_data(&null_color, "x", "y", "size", "color", None),
 			Err(BubblePreparationError::Observations(
 				BubbleObservationsError::NullValue {
-					channel: crate::plot::kernels::bubble_observations::BubbleNumericField::Color,
+					channel: crate::plot::spec::BubbleNumericField::Color,
 					field,
 					row: 1,
 				}

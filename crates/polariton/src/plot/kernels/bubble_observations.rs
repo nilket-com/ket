@@ -1,51 +1,5 @@
+use crate::plot::spec::{BubbleFieldNames, BubbleNumericField};
 use std::fmt;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BubbleNumericField {
-	X,
-	Y,
-	Size,
-	Color,
-}
-
-impl fmt::Display for BubbleNumericField {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(match self {
-			Self::X => "x",
-			Self::Y => "y",
-			Self::Size => "size",
-			Self::Color => "color",
-		})
-	}
-}
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct BubbleFieldNames {
-	pub(crate) x: String,
-	pub(crate) y: String,
-	pub(crate) size: String,
-	pub(crate) color: String,
-}
-
-impl BubbleFieldNames {
-	pub(crate) fn new(x: &str, y: &str, size: &str, color: &str) -> Self {
-		Self {
-			x: x.to_owned(),
-			y: y.to_owned(),
-			size: size.to_owned(),
-			color: color.to_owned(),
-		}
-	}
-
-	fn get(&self, field: BubbleNumericField) -> &str {
-		match field {
-			BubbleNumericField::X => &self.x,
-			BubbleNumericField::Y => &self.y,
-			BubbleNumericField::Size => &self.size,
-			BubbleNumericField::Color => &self.color,
-		}
-	}
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BubbleObservationRow {

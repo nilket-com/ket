@@ -244,15 +244,8 @@ fn project_named_channels(
 	{
 		fields.push(end);
 	}
-	if let Some(box_fields) = spec.box_plot_fields() {
-		for field in box_fields.all() {
-			if !fields.contains(&field) {
-				fields.push(field);
-			}
-		}
-	}
-	if let Some(heatmap_fields) = spec.heatmap_fields() {
-		for field in heatmap_fields.all() {
+	if let Some(mark_fields) = spec.mark_fields() {
+		for field in mark_fields.all() {
 			if !fields.contains(&field) {
 				fields.push(field);
 			}
@@ -695,6 +688,46 @@ mod tests {
 		);
 		assert!(resolved.resolved_spec.band_fills.is_empty());
 		assert!(resolved.resolved_spec.channel(Channel::Color).is_none());
+	}
+
+	#[test]
+	fn product_0094_bubble_projection_handles_optional_label_without_a_surface() {
+		let frame = Arc::new(
+			polars::df!(
+				"unused" => [99_i32],
+				"x" => [1.0_f64],
+				"y" => [2.0_f64],
+				"size" => [3.0_f64],
+				"color" => [4.0_f64],
+				"label" => ["point"],
+			)
+			.unwrap(),
+		);
+		for (label, expected) in [
+			(None, vec!["x", "y", "size", "color"]),
+			(
+				Some("label".to_owned()),
+				vec!["x", "y", "size", "color", "label"],
+			),
+		] {
+			let spec = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bubble), "x", "y")
+				.with_mark_fields_for_test(crate::plot::spec::MarkFields::Bubble(
+					crate::plot::spec::BubbleFields::new(
+						crate::plot::spec::BubbleFieldNames::new("x", "y", "size", "color"),
+						label,
+					),
+				));
+			let projected = project_named_channels(&spec, Arc::clone(&frame), "bubble test")
+				.expect("bubble fields project through the staged carrier");
+			assert_eq!(
+				projected
+					.get_column_names()
+					.iter()
+					.map(|name| name.as_str())
+					.collect::<Vec<_>>(),
+				expected
+			);
+		}
 	}
 
 	#[test]
