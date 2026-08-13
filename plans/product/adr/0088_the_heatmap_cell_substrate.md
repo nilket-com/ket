@@ -21,7 +21,7 @@ relation promises an order the mark never asked for.
 **Absent cells are fabricated as zero.** `values` is initialised to
 `vec![vec![0.0f64; num_y]; num_x]`, so any `(x, y)` pair the relation never
 contained renders as a real `0.0` observation. There is no no-data state. This
-grows worse under B3: on a diverging ramp a fabricated zero paints the
+grows worse under PRODUCT-0089: on a diverging ramp a fabricated zero paints the
 **neutral** colour, so missing data will read as a meaningful mid-range
 measurement.
 
@@ -227,10 +227,10 @@ only the shared half would let the two collapse into each other.
 ### 7. What this record does not decide
 
 No Rune word; heatmap stays producerless. No sequential or diverging palette
-authoring — that is **B3**, and §5 only makes a signed domain *representable*,
+authoring — that is **PRODUCT-0089**, and §5 only makes a signed domain *representable*,
 not well-anchored. **A diverging ramp over `-50…100` still places its neutral at
 data value 25**, exactly as PRODUCT-0087 gate 17 banked for bubble; zero
-anchoring remains B3's.
+anchoring remains PRODUCT-0089's.
 
 No change to `x`/`y` category derivation or ordering, no hexbin change despite
 its similar `HashMap` binning, and no guide changes beyond consuming §5's domain
@@ -349,7 +349,7 @@ consumers of §4, and the two-ended domain.
     observed values `-50`, `25`, and `100` under a diverging ramp paints the
     `25` cell with the neutral colour, and its guide carries the same neutral
     stop at `25`. Per §5, anchoring is not fixed here; both halves are asserted
-    so B3 inherits a stated position and this record cannot be read as having
+    so PRODUCT-0089 inherits a stated position and this record cannot be read as having
     solved it.
 
 ## Stop conditions
@@ -371,7 +371,7 @@ consumers of §4, and the two-ended domain.
 
 Supersedes no record. Consumes PRODUCT-0087's gradient omission rule for both
 degenerate cases without amending it. Discharges PRODUCT-0087 gate 16's banked
-signed-clamping limitation. Leaves PRODUCT-0087 gate 17's bubble anchoring to B3.
+signed-clamping limitation. Leaves PRODUCT-0087 gate 17's bubble anchoring to PRODUCT-0089.
 
 ## Rejected
 
@@ -388,7 +388,7 @@ mark decides two observations are one whenever they agree.
 
 **Keep zero-filled absent cells and document it.** Attractive because it needs no
 representation change and heatmaps "look complete". Rejected because a fabricated
-zero is an invented observation, and B3's diverging ramps would paint it the
+zero is an invented observation, and PRODUCT-0089's diverging ramps would paint it the
 **neutral** colour — the most confident-looking possible rendering of data that
 does not exist.
 
@@ -412,7 +412,7 @@ Sparse grids stop lying. Absent cells disappear from the figure, from hover, and
 from the domain, which also makes the domain narrower and therefore the colour
 range more useful on real data.
 
-Signed data becomes representable, which is the prerequisite B3 needs — and B2
+Signed data becomes representable, which is the prerequisite PRODUCT-0089 needs — and B2
 deliberately stops there. A diverging ramp on `-50…100` still puts its neutral at
 25, in heatmap exactly as PRODUCT-0087 banked it for bubble. The two marks now
 share one shape of defect, stated identically, waiting on one decision.

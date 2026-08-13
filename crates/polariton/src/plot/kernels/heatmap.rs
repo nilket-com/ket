@@ -424,7 +424,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0088_asymmetric_diverging_neutral_remains_at_twenty_five_for_b3() {
+	fn product_0088_asymmetric_diverging_neutral_remains_at_twenty_five_for_product_0089() {
 		let frame = polars::df!(
 			"x" => ["a", "b", "c"],
 			"y" => ["u", "u", "u"],
