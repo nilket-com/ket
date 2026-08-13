@@ -233,7 +233,7 @@ band-fill path.
     **no kernel-local compensation**, a typed widget-space hit-geometry helper,
     and selected first/non-origin probes for both marks. Sequenced after step 11
     so it has a validated funnel kernel as a parity subject.
-13. **Funnel surface — ADR 0098, landed.** `funnel("stage", "value")`, no implicit-stage form. A
+13. **Funnel surface — LANDED as PRODUCT-0098.** `funnel("stage", "value")`, no implicit-stage form. A
     `Funnel` variant in the 0094 transport, nominal/quantitative binding with
     field-and-row diagnostics, stage colours shared by geometry and legend, and
     the mark-style tier for fills, separators, silhouette, and labels.
