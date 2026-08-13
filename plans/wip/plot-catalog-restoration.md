@@ -195,7 +195,7 @@ band-fill path.
    Bubble's variant may be **test-only** until step 9. That is substrate staging,
    not an inert public spelling — no Rune word is added, so nothing unobservable
    is authored.
-9. **Bubble surface, sequential-only.** The first new consumer of step 8's
+9. **Bubble surface, sequential-only — ADR 0095, drafted.** The first new consumer of step 8's
    transport. Five roles against heatmap's three, with an **optional label** whose
    absent-versus-selected-null semantics 0090 §9 already decided — and whose
    variable arity is why `all()` returns a slice rather than a fixed array.
