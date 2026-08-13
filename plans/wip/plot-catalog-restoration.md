@@ -36,7 +36,7 @@ in none of them.
 | prerequisite | marks blocked |
 |---|---|
 | **A. Categorical colour identity + persistence** | pie, violin, radar, radial dial, parallel, funnel |
-| **B. Continuous colour authority** — four records, see below; CI-02 follows them | heatmap, bubble, hexbin |
+| **B. Continuous colour authority** — four records, see below; the heatmap and bubble surfaces then CI-02 follow them | heatmap, bubble, hexbin |
 | **C. Relation-side aggregation** | pie, violin |
 | **D. Variadic dimension fields** | radar, parallel |
 | **E. Explicit row / cardinality rules** | radial dial, funnel, heatmap |
@@ -107,10 +107,17 @@ ADR 0089, and CI-02 moved out to a fifth:
   carried through the cascade; piecewise normalization about the anchor.
   Migrates all three producers. — **ADR 0089, landed**
 
-**CI-02 then follows B4** as the authoring surface. An earlier version of this
-plan had B3 close CI-02; 0089 is explicitly substrate-only — it adds no Rune
-spelling and does nothing for status colour — so CI-02 stays open past the whole
-B track.
+**CI-02 follows the heatmap and bubble surfaces**, not B4 directly — see steps
+6–8. 0089 is explicitly substrate-only, adding no Rune spelling, so CI-02 stays
+open past the whole B track; and the authoring words need a mark that can be
+authored before they mean anything.
+
+**CI-02 also shrinks.** It is labelled "sequential / diverging / **status**
+palette authoring," but status has no consumer — no kernel requests
+`ColorJob::Status`, and `spec/mod.rs:2591` already routes it to
+`ScaleFamily::CategoricalColor`. Step 8 closes CI-02 for continuous colour and
+leaves a status residue whose trigger is the first real status consumer. A status
+word today would be unobservable and its gates vacuous.
 
 ### Why A forces a persistence decision
 
@@ -156,21 +163,40 @@ band-fill path.
    heatmap, bubble, and hexbin together. Touches **CI-03**, since a real
    continuous authority is what finally displaces the legacy ramp. Leaves
    **CI-02** open.
-6. **Sequential/diverging/status palette authoring.** Closes **CI-02**, whose
-   if-asked trigger is heatmap and bubble arriving together. The first B-track
-   record with a Rune spelling.
-7. **Funnel** — the smallest categorical consumer, *but only after its row-order
+6. **Heatmap surface, sequential-only.** The first Rune constructor for a
+   quantitative mark. Ships with no job word: colour is `{ Sequential, None }`,
+   exactly as 0089 leaves it.
+7. **Bubble surface, sequential-only.** Same shape. Kept a separate step rather
+   than merged with heatmap — whether shared mechanics justify one record is for
+   the two surface reviews to decide, not for this plan to presume.
+8. **Continuous colour authoring.** Slot words `sequential_palette` /
+   `diverging_palette`, the stable 37-token ramp-name grammar they create, the
+   mark-level diverging job word, and the anchor-provenance carrier from
+   `AuthoredPlotSpec` through planning. Closes **CI-02** for continuous colour;
+   **status splits out** as a residue triggered by its first real consumer.
+
+   **Steps 6 and 7 are prerequisites, not conveniences.** Heatmap, bubble, and
+   hexbin have no Rune constructor at all (`rune_presentation.rs:384-408` lists
+   `__bar`, `__line`, `__scatter`, `__area`, `__histogram`, `__box`), so words
+   added before those surfaces exist would be observationally inert — the same
+   defect that disqualifies a status word. An earlier draft of this plan placed
+   authoring at step 6 and the surfaces at step 11.
+9. **Funnel** — the smallest categorical consumer, *but only after its row-order
    and stage-monotonicity contract is explicit*.
-8. **Radial dial** — needs prerequisite E; its silent first-row selection is the
-   PRODUCT-0078 defect class again.
-9. **Pie** — after removing its aggregation authority, which Toron can now supply
-   as pre-aggregated category/value rows.
-10. **Radar + parallel together** over one dimension-list substrate. They are the
+10. **Radial dial** — needs prerequisite E; its silent first-row selection is the
+    PRODUCT-0078 defect class again.
+11. **Pie** — after removing its aggregation authority, which Toron can now supply
+    as pre-aggregated category/value rows.
+12. **Radar + parallel together** over one dimension-list substrate. They are the
     only two needing D, and solving it twice would produce two vocabularies.
-11. **Bubble + heatmap surfaces** over the authority from steps 2–6.
-12. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+13. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
+
+**Hexbin is not in this sequence.** It consumes the 0089 substrate but stays
+producerless and blocked on viewport-aware planning, and it can never diverge
+(`0..max_count`, counts non-negative by construction), so it takes no job word
+whenever its surface does arrive.
 
 ## What this plan does not decide
 
@@ -186,6 +212,13 @@ graph, rather than rediscovered at each mark.
 - **Silent row-selection is invisible until a fixture has duplicates.** Radial
   dial and heatmap both have it now; the `demo_sales` single-quarter episode is
   the precedent for what a degenerate fixture hides.
+- **A spelling needs a consumer before it needs a word, and the check is
+  symmetric.** The first 0091 draft rejected a status word for being
+  observationally inert, then proposed three words for marks with no Rune
+  constructor at all — the identical defect, in the same record, one section
+  apart. Before adding any word, ask what fixture distinguishes the figure with it
+  from the figure without it; if the answer needs a surface that does not exist
+  yet, the word is premature. Six marks in this plan still have no constructor.
 - **A refused compatibility path is a survey instrument.** B3 exists only because
   0089 declined to keep a decomposed `gradient_section`, which forced an
   enumeration of its call sites and turned up a bubble preparation that renders
