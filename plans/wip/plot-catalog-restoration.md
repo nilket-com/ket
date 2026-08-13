@@ -254,7 +254,7 @@ band-fill path.
     category filter falls back to the whole frame, so every dial can show a value
     belonging to no category it names. Also removes the implicit `1.0` maximum,
     which contradicts the resolver's existing `number(1, "maximum")?`.
-15. **Radial dial surface.** After 0099.
+15. **Radial dial surface — ADR 0100, drafted.** Second consumer of PRODUCT-0086: one family token, one conversion arm.
 16. **Pie** — after removing its aggregation authority, which Toron can now supply
     as pre-aggregated category/value rows.
 17. **Radar + parallel together** over one dimension-list substrate. They are the
