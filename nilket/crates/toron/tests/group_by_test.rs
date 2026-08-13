@@ -2666,6 +2666,135 @@ async fn count_star_over_a_subquery_carries_the_input_row_count() {
 }
 
 #[tokio::test]
+async fn time_bucket_floors_pre_epoch_timestamps_and_refuses_nonpositive_intervals() {
+	// `TIME_BUCKET` truncated toward zero, so every pre-epoch timestamp landed one
+	// bucket late and -1 shared the epoch bucket with +1. It also divided by zero
+	// for a zero interval, aborting the process rather than returning an error.
+	let mut config = PlannerConfig::default();
+	config.allow_experimental_kernels = true;
+	let (catalog, storage) = fixture();
+
+	let bucket = |value: i64, secs: u64| LogicalPlan::Project {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		exprs: vec![Expr::TimeBucket(
+			std::time::Duration::from_secs(secs),
+			Box::new(Expr::Literal(ScalarValue::Int64(Some(value)))),
+		)],
+		output_names: vec![None],
+	};
+
+	// Floor, not truncation. Under `/` these returned -1000, -1000, -1000 and 0.
+	for (input, expected) in [
+		(-1_i64, -1000_i64),
+		(-1000, -1000),
+		(-1001, -2000),
+		(-1500, -2000),
+		// Exact positive boundaries and interiors are unchanged by the fix.
+		(0, 0),
+		(999, 0),
+		(1000, 1000),
+		(1001, 1000),
+		(86_400_000, 86_400_000),
+	] {
+		let bound = bind(&bucket(input, 1), &catalog, &config)
+			.await
+			.expect("bind time bucket");
+		let results = Executor::new(storage.clone())
+			.execute_bound(&bound, None)
+			.await
+			.expect("execute time bucket");
+		let first = scalar_int64_column_rows(&results, 0)
+			.first()
+			.copied()
+			.flatten();
+		assert_eq!(
+			first,
+			Some(expected),
+			"TIME_BUCKET({input}, 1s) must floor to {expected}"
+		);
+	}
+
+	// Nulls pass through rather than bucketing to the epoch.
+	let null_plan = LogicalPlan::Project {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		exprs: vec![Expr::TimeBucket(
+			std::time::Duration::from_secs(60),
+			Box::new(Expr::Literal(ScalarValue::Int64(None))),
+		)],
+		output_names: vec![None],
+	};
+	let bound = bind(&null_plan, &catalog, &config)
+		.await
+		.expect("bind null");
+	let results = Executor::new(storage.clone())
+		.execute_bound(&bound, None)
+		.await
+		.expect("execute null");
+	assert_eq!(
+		scalar_int64_column_rows(&results, 0).first().copied(),
+		Some(None),
+		"a null timestamp must stay null"
+	);
+
+	// A directly constructed zero interval returns a typed error. It previously
+	// panicked with "attempt to divide by zero", which no `Result` could report.
+	let bound = bind(&bucket(1500, 0), &catalog, &config)
+		.await
+		.expect("bind zero interval");
+	let error = Executor::new(storage)
+		.execute_bound(&bound, None)
+		.await
+		.expect_err("a zero interval must be refused, not divided by");
+	assert!(
+		error.to_string().contains("positive interval"),
+		"expected a typed nonpositive-interval refusal, got: {error}"
+	);
+}
+
+#[test]
+fn time_bucket_interval_allowlist_is_shared_by_sql_and_rune() {
+	// SQL rejected unknown intervals while Rune coerced them to a zero duration.
+	// Both now consult one parser, so parity cannot drift back apart.
+	for accepted in ["1m", "1h", "1d"] {
+		assert!(
+			toron::ir::time_bucket_interval_from_literal(accepted).is_some(),
+			"{accepted} must be accepted"
+		);
+		assert!(
+			SqlPlanner::new()
+				.plan(&format!(
+					"SELECT TIME_BUCKET(id, '{accepted}') FROM left_dups"
+				))
+				.is_ok(),
+			"SQL must accept {accepted}"
+		);
+	}
+	for rejected in ["5m", "1s", "", "1 m", "1D", "1w"] {
+		assert!(
+			toron::ir::time_bucket_interval_from_literal(rejected).is_none(),
+			"{rejected} must be rejected"
+		);
+		let error = SqlPlanner::new()
+			.plan(&format!(
+				"SELECT TIME_BUCKET(id, '{rejected}') FROM left_dups"
+			))
+			.expect_err("SQL must reject an unsupported interval");
+		assert!(
+			error
+				.to_string()
+				.contains("unsupported time_bucket interval"),
+			"unexpected SQL error for {rejected}: {error}"
+		);
+	}
+}
+
+#[tokio::test]
 async fn cte_resolves_like_inline_subquery() {
 	// `WITH a AS (q) SELECT … FROM a` resolves identically to the inline derived-table spelling.
 	let cte = run_logical(&plan_sql(

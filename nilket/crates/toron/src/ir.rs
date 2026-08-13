@@ -511,6 +511,21 @@ pub fn calendar_month_interval_data_type() -> DataType {
 	DataType::Interval(IntervalUnit::YearMonth)
 }
 
+/// The closed `TIME_BUCKET` interval allowlist, shared by every frontend.
+///
+/// SQL and Rune previously carried separate copies of this match. They drifted:
+/// SQL rejected an unknown interval, while Rune silently coerced it to a zero
+/// duration, which reached the evaluator and divided by zero. Parity is
+/// structural here rather than a coincidence maintained in two places.
+pub fn time_bucket_interval_from_literal(literal: &str) -> Option<std::time::Duration> {
+	match literal {
+		"1m" => Some(std::time::Duration::from_secs(60)),
+		"1h" => Some(std::time::Duration::from_secs(3600)),
+		"1d" => Some(std::time::Duration::from_secs(86_400)),
+		_ => None,
+	}
+}
+
 pub fn nanos_per_timestamp_unit(unit: TimeUnit) -> Option<i64> {
 	match unit {
 		TimeUnit::Second => Some(1_000_000_000),

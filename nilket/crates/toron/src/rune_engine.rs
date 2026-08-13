@@ -917,16 +917,16 @@ pub fn type_f64() -> RuneDataType {
 	}
 }
 
-pub fn time_bucket(interval_str: String, ts: RuneExpr) -> RuneExpr {
-	let interval = match interval_str.as_str() {
-		"1m" => std::time::Duration::from_secs(60),
-		"1h" => std::time::Duration::from_secs(3600),
-		"1d" => std::time::Duration::from_secs(86400),
-		_ => std::time::Duration::from_secs(0),
+pub fn time_bucket(interval_str: String, ts: RuneExpr) -> VmResult<RuneExpr> {
+	// Rejects at lowering, matching SQL. Coercing an unknown interval to a zero
+	// duration used to defer the failure to the evaluator, where it divided by
+	// zero and aborted the process.
+	let Some(interval) = crate::ir::time_bucket_interval_from_literal(&interval_str) else {
+		return VmResult::panic(format!("unsupported time_bucket interval: {interval_str}"));
 	};
-	RuneExpr {
+	VmResult::Ok(RuneExpr {
 		expr: Expr::TimeBucket(interval, Box::new(ts.expr)),
-	}
+	})
 }
 
 pub fn extract(field: String, expr: RuneExpr) -> VmResult<RuneExpr> {

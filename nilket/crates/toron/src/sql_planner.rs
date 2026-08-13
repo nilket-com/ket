@@ -6805,16 +6805,16 @@ impl SqlPlanner {
 					let interval = match &args[1] {
 						FunctionArg::Unnamed(sqlparser::ast::FunctionArgExpr::Expr(expr)) => {
 							match sql_value(expr) {
-								Some(Value::SingleQuotedString(s)) => match s.as_str() {
-									"1m" => std::time::Duration::from_secs(60),
-									"1h" => std::time::Duration::from_secs(3600),
-									"1d" => std::time::Duration::from_secs(86400),
-									_ => {
-										return Err(unsupported(format!(
-											"unsupported time_bucket interval: {s}"
-										)));
+								Some(Value::SingleQuotedString(s)) => {
+									match crate::ir::time_bucket_interval_from_literal(&s) {
+										Some(interval) => interval,
+										None => {
+											return Err(unsupported(format!(
+												"unsupported time_bucket interval: {s}"
+											)));
+										}
 									}
-								},
+								}
 								_ => {
 									return Err(unsupported(
 										"time_bucket expects a string literal interval",

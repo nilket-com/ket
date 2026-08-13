@@ -926,10 +926,24 @@ fn evaluate_time_bucket(
 	arr: &ArrayRef,
 ) -> Result<ArrayRef, ExecutionError> {
 	if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-		let interval_ms = interval.as_millis() as i64;
+		// Refused here, not only at lowering: an `Expr::TimeBucket` can be built
+		// directly, and a zero interval previously reached this division and
+		// aborted the process rather than returning an error.
+		let interval_ms = i64::try_from(interval.as_millis())
+			.ok()
+			.filter(|millis| *millis > 0)
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: format!(
+					"TIME_BUCKET requires a positive interval within i64 milliseconds, got {interval:?}"
+				),
+			})?;
 		let bucketed: Vec<Option<i64>> = int_arr
 			.iter()
-			.map(|value| value.map(|value| (value / interval_ms) * interval_ms))
+			// `div_euclid` floors toward negative infinity. Plain `/` truncates
+			// toward zero, which put every pre-epoch timestamp one bucket late:
+			// with a 1s bucket, -1500 returned -1000 instead of -2000, and -1
+			// shared the epoch bucket with +1.
+			.map(|value| value.map(|value| value.div_euclid(interval_ms) * interval_ms))
 			.collect();
 		Ok(Arc::new(Int64Array::from(bucketed)) as ArrayRef)
 	} else {
