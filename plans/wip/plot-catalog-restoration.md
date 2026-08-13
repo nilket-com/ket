@@ -12,9 +12,12 @@ let three substrate defects ship as spellings.
 
 ## Census — verified, not inferred
 
-Every row below was read from source on 2026-08-12.
+Every row below was read from source on 2026-08-12, **before ADRs 0087 and 0088
+landed**. It is the initial census and is not updated as records land; the two
+heatmap findings it names were paid by 0088 and the gradient-legend finding by
+0087. Rows are kept as the evidence that chose the sequence.
 
-| mark | kernel aggregates? | colour today | concealed substrate decision |
+| mark | kernel aggregates? | colour at census | concealed substrate decision |
 |---|---|---|---|
 | **pie** | **yes** — `.select([col(val_col).sum()])` (`pie.rs:191`) | ramp-only | owns aggregation Toron can now supply |
 | **violin** | **yes** — `.group_by().agg()` (`violin.rs:279-280`) **+ KDE** | ramp-only | heaviest statistics in any kernel |
@@ -22,8 +25,8 @@ Every row below was read from source on 2026-08-12.
 | **parallel** | no (`:147`) | ramp-only | variable-length dimension list |
 | **radial dial** | no | ramp-only | **silent first-row-per-category** — filters, then `.get(0)` (`radial_dial.rs:192`) |
 | **funnel** | no | ramp-only | row order and stage monotonicity unstated |
-| **heatmap** | no (`.unique()` ×2) | **quantitative** ramp + gradient legend (`:36-37`, `:97`) | **silent duplicate-cell overwrite** — `values[xi][yi] = val` (`:103`); only `max_val` retained (`:117`), so signed/diverging data cannot be represented |
-| **bubble** | no | **quantitative** ramp + gradient legend (`bubble.rs:70`, `:101-102`) | size-scale contract |
+| **heatmap** | no (`.unique()` ×2) | **quantitative** ramp + gradient legend | **silent duplicate-cell overwrite** — `values[xi][yi] = val`; only `max_val` retained, so signed/diverging data cannot be represented — *both paid by 0088* |
+| **bubble** | no | **quantitative** ramp + gradient legend (`bubble.rs:70`, `:101`) | size-scale contract — *and, unfound here, the fabricated null values that became B3* |
 
 **None of the eight has any resolved-colour support** — `resolved_color` appears
 in none of them.
@@ -33,7 +36,7 @@ in none of them.
 | prerequisite | marks blocked |
 |---|---|
 | **A. Categorical colour identity + persistence** | pie, violin, radar, radial dial, parallel, funnel |
-| **B. Continuous colour authority** — three records, see below (CI-02) | heatmap, bubble |
+| **B. Continuous colour authority** — four records, see below; CI-02 follows them | heatmap, bubble, hexbin |
 | **C. Relation-side aggregation** | pie, violin |
 | **D. Variadic dimension fields** | radar, parallel |
 | **E. Explicit row / cardinality rules** | radial dial, funnel, heatmap |
@@ -44,43 +47,69 @@ encode a *quantitative* value as colour with a gradient legend; they need a
 sequential/diverging scale authority and allocate **no** categorical
 `ColorIdentity`. The other six encode categories and do.
 
-### B splits three ways — Stage 0, 2026-08-12
+### B splits four ways — initial census, 2026-08-12
 
-Tracing the ramp inputs and the guide contract found that heatmap and bubble are
-**not** one problem, and that the existing gradient legend is already wrong.
+> **Historical.** This section records the survey that split B, taken **before**
+> ADRs 0087 and 0088 landed. Its findings are stated in the past tense and its
+> code citations describe the pre-0087/pre-0088 source; they are kept because
+> they are why the split happened, not as a description of current code. For
+> today's behaviour read 0087 and 0088. B3 was added later that day while
+> drafting 0089 — see below.
 
-**The gradient legend misrepresents every multi-stop ramp, today.**
-`LegendSection::Gradient` carries exactly two colour stops
-(`plot/legend.rs:38-44`), and the swatch is painted by
-`lerp(*low_color, *high_color, t)` (`:587`) — a straight two-stop interpolation
-— while the marks sample the full ramp. Under viridis the marks run purple →
-blue → teal → green → yellow while the legend runs purple → yellow through
-browns the data never uses. A reader matching a mid-range cell against the
-legend lands in the wrong place. This also violates PRODUCT-0043's own rule that
-a section carries **every value it prints**: this one prints colours it never
-names. It is a shipped misrepresentation, not a missing feature, and it must be
-repaired before any new palette can claim honest guidance.
+Tracing the ramp inputs and the guide contract found that heatmap and bubble were
+**not** one problem, and that the gradient legend was already wrong.
 
-**Their domains differ.** Bubble already normalizes correctly — `color_range:
-(f64, f64)` (`bubble.rs:22`) with `t = (val − min) / (max − min)` and a
-zero-width guard — so signed and diverging data work. Heatmap is single-ended:
-only `max_val` is retained (`heatmap.rs:117`), `t = val / max_val` (`:36-37`)
-sends negatives out of range, `max_val <= 0` collapses every cell to `t = 0`,
-and its legend asserts `low: 0.0` and a literal `label: "Value"` regardless of
-the data. **Bubble is therefore the parity subject** for the guide repair;
-heatmap owes its own substrate decision.
+**The gradient legend misrepresented every multi-stop ramp.**
+`LegendSection::Gradient` carried exactly two colour stops, and the swatch was
+painted by a straight `lerp(low_color, high_color, t)` while the marks sampled
+the full ramp. Under viridis the marks ran purple → blue → teal → green → yellow
+while the legend ran purple → yellow through browns the data never used. A reader
+matching a mid-range cell against the legend landed in the wrong place. It also
+violated PRODUCT-0043's rule that a section carries **every value it prints**:
+that one printed colours it never named. A shipped misrepresentation rather than
+a missing feature, and it had to be repaired before any new palette could claim
+honest guidance. **Repaired by PRODUCT-0087**, which replaced the two-stop model
+with ordered positioned stops.
 
-Hence three records rather than one:
+**Their domains differed.** Bubble already normalized over a two-ended range —
+`color_range: (f64, f64)` (`bubble.rs:22`, still current) with
+`t = (val − min) / (max − min)` and a zero-width guard — so signed data worked.
+Heatmap was single-ended: only `max_val` was retained, `t = val / max_val` sent
+negatives out of range, `max_val <= 0` collapsed every cell to `t = 0`, and its
+legend asserted `low: 0.0` and a literal `label: "Value"` regardless of the data.
+**Bubble was therefore the parity subject** for the guide repair; heatmap owed
+its own substrate decision, **paid by PRODUCT-0088**.
+
+What the census did **not** find, because a colour survey had no reason to look
+at preparation: bubble fabricates values for absent and null inputs. That is B3,
+and 0089's signature change is what surfaced it.
+
+Hence four records rather than one — B3 was added 2026-08-12 while drafting
+ADR 0089, and CI-02 moved out to a fifth:
 
 - **B1 — honest gradient content and rendering.** The guide model carries
   **ordered positioned stops**, not endpoint colours, so nonlinear and diverging
   ramps stay representable. Bank the current viridis midpoint mismatch first; it
-  is a free banked red state, since the defect is live.
+  is a free banked red state, since the defect is live. — **ADR 0087, landed**
 - **B2 — heatmap substrate.** A two-ended signed domain and an explicit
   duplicate-cell authority, replacing the silent `values[xi][yi] = val`
-  overwrite (`heatmap.rs:103`).
-- **B3 — sequential/diverging palette authoring** for heatmap and bubble,
-  closing CI-02 over a guide that no longer lies.
+  overwrite (`heatmap.rs:103`). — **ADR 0088, landed**
+- **B3 — bubble substrate.** Null disposition and finite-value validation for a
+  preparation that is infallible and fabricates: an absent colour column becomes
+  `vec![0.0f64; height]` (`bubble.rs:213`) and every field is taken with
+  `unwrap_or(0.0)` (`bubble.rs:263-266`), so **a null observation renders as a real
+  low-end value**. Unplanned; surfaced by 0089's §8 signature change, which
+  breaks bubble's `gradient_section` call at `bubble.rs:101` and so forces
+  bubble's migration whether or not its preparation is ready.
+- **B4 — the continuous colour substrate.** One `ContinuousColorScale` owning
+  domain, job, resolved ramp, and a provenance-bearing anchor; the colour job
+  carried through the cascade; piecewise normalization about the anchor.
+  Migrates all three producers. — **ADR 0089, drafted**
+
+**CI-02 then follows B4** as the authoring surface. An earlier version of this
+plan had B3 close CI-02; 0089 is explicitly substrate-only — it adds no Rune
+spelling and does nothing for status colour — so CI-02 stays open past the whole
+B track.
 
 ### Why A forces a persistence decision
 
@@ -111,24 +140,33 @@ band-fill path.
    keeps family in the lineage key but makes its durable identifier bounded and
    forward-preservable. It removes the shared persistence block; each of the six
    mark records still earns its own identifier and colour consumer.
-2. **Honest multi-stop gradient content and rendering (B1).** Leads, because it
-   repairs a shipped misrepresentation and nothing downstream can claim honest
-   guidance until it lands. Parity subject: bubble.
-3. **Heatmap substrate (B2).** Two-ended signed domain and duplicate-cell
-   authority.
-4. **Sequential/diverging palette authoring (B3).** Closes **CI-02**, whose
-   if-asked trigger is heatmap and bubble arriving together. Touches **CI-03**,
-   since a real sequential authority is what finally displaces the legacy ramp.
-5. **Funnel** — the smallest categorical consumer, *but only after its row-order
+2. **Honest multi-stop gradient content and rendering (B1) — LANDED as
+   PRODUCT-0087.** Led, because it repaired a shipped misrepresentation and
+   nothing downstream could claim honest guidance until it landed.
+3. **Heatmap substrate (B2) — LANDED as PRODUCT-0088.** Two-ended signed domain
+   and duplicate-cell authority.
+4. **Bubble substrate (B3).** Null disposition and finite-value validation.
+   **Next.** Must precede B4: 0089 §8 breaks `bubble.rs:101`, so bubble migrates
+   regardless, and a bubble that still fabricates `0.0` for nulls cannot uphold
+   0089's non-finite invariant. Re-bank bubble after it, since this record may
+   legitimately move null-bearing figures.
+5. **Continuous colour substrate (B4) — PRODUCT-0089, drafted.** Migrates
+   heatmap, bubble, and hexbin together. Touches **CI-03**, since a real
+   continuous authority is what finally displaces the legacy ramp. Leaves
+   **CI-02** open.
+6. **Sequential/diverging/status palette authoring.** Closes **CI-02**, whose
+   if-asked trigger is heatmap and bubble arriving together. The first B-track
+   record with a Rune spelling.
+7. **Funnel** — the smallest categorical consumer, *but only after its row-order
    and stage-monotonicity contract is explicit*.
-6. **Radial dial** — needs prerequisite E; its silent first-row selection is the
+8. **Radial dial** — needs prerequisite E; its silent first-row selection is the
    PRODUCT-0078 defect class again.
-7. **Pie** — after removing its aggregation authority, which Toron can now supply
+9. **Pie** — after removing its aggregation authority, which Toron can now supply
    as pre-aggregated category/value rows.
-8. **Radar + parallel together** over one dimension-list substrate. They are the
-   only two needing D, and solving it twice would produce two vocabularies.
-9. **Bubble + heatmap surfaces** over the authority from steps 2–4.
-10. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+10. **Radar + parallel together** over one dimension-list substrate. They are the
+    only two needing D, and solving it twice would produce two vocabularies.
+11. **Bubble + heatmap surfaces** over the authority from steps 2–6.
+12. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
 
@@ -146,6 +184,12 @@ graph, rather than rediscovered at each mark.
 - **Silent row-selection is invisible until a fixture has duplicates.** Radial
   dial and heatmap both have it now; the `demo_sales` single-quarter episode is
   the precedent for what a degenerate fixture hides.
+- **A refused compatibility path is a survey instrument.** B3 exists only because
+  0089 declined to keep a decomposed `gradient_section`, which forced an
+  enumeration of its call sites and turned up a bubble preparation that renders
+  nulls as real values. Expect each remaining step's signature changes to find
+  work that has nothing to do with that step's subject — and budget for it rather
+  than folding it into the record that found it.
 - **A substrate defect shipped as a spelling is two records, not one.**
   Histogram and box plot each needed a substrate cut first; pie, violin, radial
   dial, and heatmap are the same shape.
