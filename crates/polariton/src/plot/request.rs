@@ -207,6 +207,16 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		)
 		.map_err(|error| error.to_string())?;
 	}
+	if let crate::plot::spec::ResolvedKernelFields::Funnel { stage, value } =
+		spec.kernel_fields.as_ref()
+	{
+		crate::plot::kernels::funnel::prepare_funnel_data(
+			data,
+			stage.as_deref().unwrap_or(""),
+			value,
+		)
+		.map_err(|error| error.to_string())?;
+	}
 	Ok(())
 }
 
@@ -333,6 +343,36 @@ mod tests {
 				.binding
 				.field,
 			"x"
+		);
+	}
+
+	#[test]
+	fn product_0096_planning_surfaces_funnel_refusals_before_factory_reconstruction() {
+		let malformed = polars::df!(
+			"stage" => ["A", "B", "C"],
+			"value" => [Some(100.0_f64), None, Some(20.0)],
+		)
+		.unwrap();
+		let error = plan(PlotRequest {
+			source: materialized("funnel_probe", malformed),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Funnel)),
+		})
+		.unwrap_err();
+		assert!(error.contains("funnel_probe: funnel value field `value` is null at row 2"));
+
+		let valid = polars::df!(
+			"stage" => ["A", "B", "C"],
+			"value" => [100.0_f64, 50.0, 20.0],
+		)
+		.unwrap();
+		assert!(
+			plan(PlotRequest {
+				source: materialized("funnel_probe", valid),
+				authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+					PlotType::Funnel,
+				)),
+			})
+			.is_ok()
 		);
 	}
 

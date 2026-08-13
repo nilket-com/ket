@@ -188,7 +188,8 @@ pub fn create_plot(
 			})
 		}
 		ResolvedKernelFields::Funnel { stage, value } => {
-			let prepared = funnel::prepare_funnel_data(df, stage.as_deref().unwrap_or(""), value);
+			let prepared = funnel::prepare_funnel_data(df, stage.as_deref().unwrap_or(""), value)
+				.expect("PRODUCT-0096 planning validated this funnel stage collection");
 			Arc::new(FunnelPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})

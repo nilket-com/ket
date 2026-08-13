@@ -5,6 +5,7 @@ pub mod composition;
 pub mod continuous_color;
 pub mod core;
 pub mod durable;
+pub(crate) mod exact_numeric;
 pub mod export;
 pub mod factory;
 pub mod gradient_stops;

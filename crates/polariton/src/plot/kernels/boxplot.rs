@@ -2,6 +2,7 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label,
 };
+use crate::plot::exact_numeric::{ExactF64Error, exact_f64};
 use crate::plot::kernels::boxplot_tukey::{TukeyBox, TukeyBoxRow, TukeyBoxes, TukeyBoxesError};
 use crate::plot::spec::BoxPlotFields;
 use iced::advanced::mouse::Cursor;
@@ -356,7 +357,7 @@ pub fn prepare_box_plot_data(
 			other => other.to_string(),
 		};
 		let numeric = |index: usize, role: BoxPlotFieldRole| {
-			exact_f64(
+			exact_box_value(
 				columns[index].get(row).expect("row is in bounds"),
 				role,
 				row,
@@ -371,7 +372,11 @@ pub fn prepare_box_plot_data(
 		let outlier = if matches!(outlier_value, AnyValue::Null) {
 			None
 		} else {
-			Some(exact_f64(outlier_value, BoxPlotFieldRole::Outlier, row)?)
+			Some(exact_box_value(
+				outlier_value,
+				BoxPlotFieldRole::Outlier,
+				row,
+			)?)
 		};
 		rows.push(TukeyBoxRow {
 			category,
@@ -392,71 +397,21 @@ pub fn prepare_box_plot_data(
 	))
 }
 
-fn exact_f64(
+fn exact_box_value(
 	value: AnyValue<'_>,
 	role: BoxPlotFieldRole,
 	row: usize,
 ) -> Result<f64, BoxPlotPreparationError> {
 	let original = value.to_string();
-	let converted = match value {
-		AnyValue::Int8(value) => exact_signed(value as i128),
-		AnyValue::Int16(value) => exact_signed(value as i128),
-		AnyValue::Int32(value) => exact_signed(value as i128),
-		AnyValue::Int64(value) => exact_signed(value as i128),
-		AnyValue::Int128(value) => exact_signed(value),
-		AnyValue::UInt8(value) => exact_unsigned(value as u128),
-		AnyValue::UInt16(value) => exact_unsigned(value as u128),
-		AnyValue::UInt32(value) => exact_unsigned(value as u128),
-		AnyValue::UInt64(value) => exact_unsigned(value as u128),
-		AnyValue::UInt128(value) => exact_unsigned(value),
-		AnyValue::Float16(value) => Some(f32::from(value) as f64),
-		AnyValue::Float32(value) => Some(value as f64),
-		AnyValue::Float64(value) => Some(value),
-		AnyValue::Decimal(value, _precision, scale) => exact_decimal(value, scale),
-		AnyValue::Null => None,
-		_ => None,
-	};
-	converted.ok_or(BoxPlotPreparationError::Field {
+	exact_f64(value).map_err(|error| BoxPlotPreparationError::Field {
 		role,
 		row,
 		value: original,
-		reason: if matches!(value, AnyValue::Null) {
-			"summary value must be non-null"
-		} else {
-			"value cannot round-trip through f64 exactly"
+		reason: match error {
+			ExactF64Error::Null => "summary value must be non-null",
+			ExactF64Error::Inexact => "value cannot round-trip through f64 exactly",
 		},
 	})
-}
-
-fn exact_signed(value: i128) -> Option<f64> {
-	let converted = value as f64;
-	(integer_magnitude_is_exact(value.unsigned_abs()) && converted.is_finite()).then_some(converted)
-}
-
-fn exact_unsigned(value: u128) -> Option<f64> {
-	let converted = value as f64;
-	(integer_magnitude_is_exact(value) && converted.is_finite()).then_some(converted)
-}
-
-fn exact_decimal(value: i128, scale: usize) -> Option<f64> {
-	let scale_u32 = u32::try_from(scale).ok()?;
-	let scale_i32 = i32::try_from(scale).ok()?;
-	let five = 5_i128.checked_pow(scale_u32)?;
-	if value % five != 0 {
-		return None;
-	}
-	let numerator = value / five;
-	let converted = numerator as f64 / 2_f64.powi(scale_i32);
-	(integer_magnitude_is_exact(numerator.unsigned_abs()) && converted.is_finite())
-		.then_some(converted)
-}
-
-fn integer_magnitude_is_exact(value: u128) -> bool {
-	if value == 0 {
-		return true;
-	}
-	let significant_bits = u128::BITS - value.leading_zeros() - value.trailing_zeros();
-	significant_bits <= f64::MANTISSA_DIGITS
 }
 
 #[derive(Clone, Copy, Debug)]

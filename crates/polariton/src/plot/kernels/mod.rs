@@ -11,6 +11,7 @@ pub mod candlestick;
 pub mod fill_between;
 pub mod fill_between_line;
 pub mod funnel;
+pub mod funnel_stages;
 pub mod heatmap;
 pub mod heatmap_cells;
 pub mod hexbin;

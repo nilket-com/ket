@@ -3274,3 +3274,37 @@ fn product_0091_continuous_authoring_has_only_the_two_recorded_origins_and_no_st
 		assert!(!spanned.contains(forbidden));
 	}
 }
+
+#[test]
+fn product_0096_funnel_has_one_exact_numeric_authority_and_no_legacy_fallbacks() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let funnel =
+		std::fs::read_to_string(root.join("plot/kernels/funnel.rs")).expect("read funnel kernel");
+	let boxplot = std::fs::read_to_string(root.join("plot/kernels/boxplot.rs"))
+		.expect("read box plot kernel");
+	let exact = std::fs::read_to_string(root.join("plot/exact_numeric.rs"))
+		.expect("read exact numeric authority");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read plot request");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+
+	for forbidden in [
+		"total_max",
+		"into_no_null_iter",
+		"Series::new_empty",
+		"format!(\"Stage {}\"",
+		"DataType::Float32",
+	] {
+		assert!(
+			!funnel.contains(forbidden),
+			"legacy funnel path remains: {forbidden}"
+		);
+	}
+	assert_eq!(exact.matches("fn exact_f64(").count(), 1);
+	assert!(!boxplot.contains("fn exact_f64("));
+	assert!(boxplot.contains("use crate::plot::exact_numeric::{ExactF64Error, exact_f64};"));
+	assert!(funnel.contains("use crate::plot::exact_numeric::{ExactF64Error, exact_f64};"));
+	assert!(request.contains("prepare_funnel_data("));
+	assert!(factory.contains("PRODUCT-0096 planning validated this funnel stage collection"));
+	assert_eq!(factory.matches("prepare_funnel_data(").count(), 1);
+	assert!(!funnel.contains("sort"));
+}
