@@ -62,3 +62,16 @@ cargo run -p polariton -- uat/test28.rn
 Both gradient and size-sample legend sections must remain unclipped. The labelled
 figure omits the null label's hover heading; the four-role figure generates
 `Point 0`, `Point 1`, … headings.
+
+With both continuous fixtures seeded, open the PRODUCT-0091 authoring exhibit:
+
+```sh
+nilket toron sql --file uat/heat_probe.sql
+nilket toron sql --file uat/bubble_probe.sql
+cargo run -p polariton -- uat/test29.rn
+```
+
+`test29.rn` separates ramp-slot selection from mark job selection: Magma remains
+sequential, GreenPurples is anchored at zero, and BlueWhiteRed is anchored at an
+authored value of 15. The heatmap's sparse cell and bubble's paired gradient and
+size guide remain visible regression subjects.

@@ -87,6 +87,56 @@ impl ColorTheme {
 		ColorTheme::YellowsR,
 	];
 
+	/// PRODUCT-0091's stable authored ramp-token namespace. These tokens are a
+	/// public language contract; they must survive retirement of this enum.
+	pub const fn ramp_token(self) -> &'static str {
+		match self {
+			Self::Black => "black",
+			Self::BlueGreen => "blue_green",
+			Self::BlueRed => "blue_red",
+			Self::BlueWhiteRed => "blue_white_red",
+			Self::Blues => "blues",
+			Self::BluesR => "blues_r",
+			Self::Cividis => "cividis",
+			Self::CividisR => "cividis_r",
+			Self::GreenBlue => "green_blue",
+			Self::GreenPurples => "green_purples",
+			Self::GreenRed => "green_red",
+			Self::Greens => "greens",
+			Self::GreensR => "greens_r",
+			Self::Grey => "grey",
+			Self::Greys => "greys",
+			Self::GreysR => "greys_r",
+			Self::Inferno => "inferno",
+			Self::InfernoR => "inferno_r",
+			Self::Magma => "magma",
+			Self::MagmaR => "magma_r",
+			Self::Oranges => "oranges",
+			Self::OrangesR => "oranges_r",
+			Self::PurpleGreens => "purple_greens",
+			Self::Purples => "purples",
+			Self::PurplesR => "purples_r",
+			Self::Rainbow => "rainbow",
+			Self::RainbowR => "rainbow_r",
+			Self::RedBlue => "red_blue",
+			Self::RedGreen => "red_green",
+			Self::RedWhiteBlue => "red_white_blue",
+			Self::Reds => "reds",
+			Self::RedsR => "reds_r",
+			Self::Viridis => "viridis",
+			Self::ViridisR => "viridis_r",
+			Self::White => "white",
+			Self::Yellows => "yellows",
+			Self::YellowsR => "yellows_r",
+		}
+	}
+
+	pub fn from_ramp_token(token: &str) -> Option<Self> {
+		Self::ALL
+			.into_iter()
+			.find(|candidate| candidate.ramp_token() == token)
+	}
+
 	pub fn get_color(&self, t: f32) -> Color {
 		self.definition().sample(t)
 	}
@@ -307,6 +357,48 @@ const GREEN_PURPLES: &[(f32, f32, f32)] =
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use std::collections::HashSet;
+
+	#[test]
+	fn product_0091_ramp_tokens_are_complete_injective_and_round_trip() {
+		let tokens = ColorTheme::ALL
+			.into_iter()
+			.map(ColorTheme::ramp_token)
+			.collect::<Vec<_>>();
+		assert_eq!(tokens.len(), 37);
+		assert_eq!(tokens.iter().copied().collect::<HashSet<_>>().len(), 37);
+		let snake_case = |name: &str| {
+			let mut token = String::new();
+			for (index, character) in name.chars().enumerate() {
+				if character.is_ascii_uppercase() && index > 0 {
+					token.push('_');
+				}
+				token.push(character.to_ascii_lowercase());
+			}
+			token
+		};
+		for theme in ColorTheme::ALL {
+			assert_eq!(ColorTheme::from_ramp_token(theme.ramp_token()), Some(theme));
+			assert_eq!(theme.ramp_token(), snake_case(&theme.to_string()));
+		}
+		assert_eq!(ColorTheme::from_ramp_token("definitely_not_a_ramp"), None);
+	}
+
+	#[test]
+	fn product_0091_ramp_tokens_and_categorical_palette_identities_do_not_cross_resolve() {
+		assert!(
+			crate::plot::spec::CategoricalPaletteSelection::from_theme_name("tab20c_s1").is_ok()
+		);
+		assert_eq!(ColorTheme::from_ramp_token("tab20c_s1"), None);
+		assert_eq!(
+			ColorTheme::from_ramp_token("blue_white_red"),
+			Some(ColorTheme::BlueWhiteRed)
+		);
+		assert!(
+			crate::plot::spec::CategoricalPaletteSelection::from_theme_name("blue_white_red")
+				.is_err()
+		);
+	}
 
 	#[test]
 	fn product_0087_every_theme_is_bit_exact_against_the_stage_zero_bank() {

@@ -156,14 +156,20 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		);
 		let prepared = crate::plot::kernels::bubble::prepare_bubble_data(data, &fields)
 			.map_err(|error| error.to_string())?;
-		validate_continuous_scale(prepared.observations.color_range(), prepared.color_intent)?;
+		validate_continuous_scale(
+			prepared.observations.color_range(),
+			spec.continuous_intent.unwrap_or(prepared.color_intent),
+		)?;
 	}
 	if let crate::plot::spec::ResolvedKernelFields::Heatmap { x, y, value } =
 		spec.kernel_fields.as_ref()
 	{
 		let prepared =
 			prepare_heatmap_data(data, x, y, value).map_err(|error| error.to_string())?;
-		validate_continuous_scale(prepared.cells.domain(), prepared.color_intent)?;
+		validate_continuous_scale(
+			prepared.cells.domain(),
+			spec.continuous_intent.unwrap_or(prepared.color_intent),
+		)?;
 	}
 	if let crate::plot::spec::ResolvedKernelFields::Hexbin { x, y } = spec.kernel_fields.as_ref() {
 		let prepared = crate::plot::kernels::hexbin::prepare_hexbin_data(data, x, y, 0.02);

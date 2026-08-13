@@ -424,13 +424,17 @@ impl MarkFields {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct AuthoredPlotSpec {
 	pub composition: PlotComposition,
 	pub x: AuthoredChannelSpec,
 	pub y: AuthoredChannelSpec,
 	pub color: OptionalAuthoredChannelSpec,
 	pub color_job: Override<ColorJob>,
+	/// PRODUCT-0091: authored continuous-colour anchor policy. The job and
+	/// anchor are carried separately here only because `color_job` predates the
+	/// continuous substrate; resolution reunites them as one intent.
+	pub continuous_anchor: crate::plot::continuous_color::ContinuousAnchor,
 	/// PRODUCT-0079: the second edge of a histogram interval. The x channel is
 	/// the start and the y channel is count; ordinary Cartesian marks keep None.
 	histogram_end: Option<String>,
@@ -444,6 +448,15 @@ pub struct AuthoredPlotSpec {
 }
 
 impl AuthoredPlotSpec {
+	pub fn with_continuous_intent(
+		mut self,
+		intent: crate::plot::continuous_color::ContinuousScaleIntent,
+	) -> Self {
+		self.color_job = Override::Set(intent.job);
+		self.continuous_anchor = intent.anchor;
+		self
+	}
+
 	pub fn automatic(composition: PlotComposition) -> Self {
 		Self {
 			composition,
@@ -451,6 +464,7 @@ impl AuthoredPlotSpec {
 			y: AuthoredChannelSpec::auto(),
 			color: OptionalAuthoredChannelSpec::auto(),
 			color_job: Override::Inherit,
+			continuous_anchor: crate::plot::continuous_color::ContinuousAnchor::None,
 			histogram_end: None,
 			mark_fields: None,
 			stacked_bar: false,
@@ -465,6 +479,7 @@ impl AuthoredPlotSpec {
 			y: AuthoredChannelSpec::named(y),
 			color: OptionalAuthoredChannelSpec::absent(),
 			color_job: Override::Inherit,
+			continuous_anchor: crate::plot::continuous_color::ContinuousAnchor::None,
 			histogram_end: None,
 			mark_fields: None,
 			stacked_bar: false,
@@ -670,6 +685,7 @@ impl LayerEncoding {
 			y: self.y.clone(),
 			color: self.color.clone(),
 			color_job: self.color_job.clone(),
+			continuous_anchor: crate::plot::continuous_color::ContinuousAnchor::None,
 			histogram_end: None,
 			mark_fields: None,
 			stacked_bar: false,
@@ -885,17 +901,18 @@ pub struct BoundChannel {
 
 /// Schema-resolved channels. This is intentionally not a specification and is
 /// not accepted by any renderer or kernel.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ChannelBinding {
 	composition: PlotComposition,
 	channels: Vec<BoundChannel>,
 	kernel_fields: Box<ResolvedKernelFields>,
 	color_job: Option<ColorJob>,
+	continuous_anchor: crate::plot::continuous_color::ContinuousAnchor,
 	categorical_limit: usize,
 	stack_normalization: StackNormalization,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayerChannelBinding {
 	pub mark: LayerMark,
 	pub settings: LayerSettings,
@@ -912,7 +929,7 @@ impl LayerChannelBinding {
 	}
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LayeredChannelBinding {
 	pub layers: NonEmpty<LayerChannelBinding>,
 }
@@ -1159,6 +1176,7 @@ pub struct ResolvedPlotSpec {
 	pub band_fills: Vec<BandFillAssignment>,
 	pub kernel_fields: Box<ResolvedKernelFields>,
 	pub color_job: Option<ColorJob>,
+	pub continuous_intent: Option<crate::plot::continuous_color::ContinuousScaleIntent>,
 	pub provenance: PlotProvenance,
 	pub stack_normalization: StackNormalization,
 }
@@ -1662,6 +1680,7 @@ pub fn resolve_channels(
 			channels: Vec::new(),
 			kernel_fields: Box::new(resolve_automatic_kernel_fields(plot_type, schema)?),
 			color_job: None,
+			continuous_anchor: spec.continuous_anchor,
 			categorical_limit: 0,
 			stack_normalization: spec.stack_normalization,
 		});
@@ -1795,6 +1814,7 @@ pub fn resolve_channels(
 		channels,
 		kernel_fields,
 		color_job,
+		continuous_anchor: spec.continuous_anchor,
 		categorical_limit: categorical_limit(plot_type),
 		stack_normalization: spec.stack_normalization,
 	})
@@ -1875,6 +1895,7 @@ fn resolve_histogram_channels(
 			count: count.field,
 		}),
 		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
 		categorical_limit: 0,
 		stack_normalization: StackNormalization::Absolute,
 	})
@@ -1945,6 +1966,7 @@ fn resolve_box_plot_channels(
 			outlier: fields.outlier.clone(),
 		}),
 		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
 		categorical_limit: 0,
 		stack_normalization: StackNormalization::Absolute,
 	})
@@ -2009,7 +2031,11 @@ fn resolve_heatmap_channels(
 			y: fields.y.clone(),
 			value: fields.value.clone(),
 		}),
-		color_job: None,
+		color_job: Some(match spec.color_job {
+			Override::Set(job) => job,
+			Override::Inherit => ColorJob::Sequential,
+		}),
+		continuous_anchor: spec.continuous_anchor,
 		categorical_limit: 0,
 		stack_normalization: StackNormalization::Absolute,
 	})
@@ -2106,7 +2132,11 @@ fn resolve_bubble_channels(
 			color: color.to_owned(),
 			label: fields.label.clone(),
 		}),
-		color_job: None,
+		color_job: Some(match spec.color_job {
+			Override::Set(job) => job,
+			Override::Inherit => ColorJob::Sequential,
+		}),
+		continuous_anchor: spec.continuous_anchor,
 		categorical_limit: 0,
 		stack_normalization: StackNormalization::Absolute,
 	})
@@ -2268,6 +2298,7 @@ pub fn resolve_layered_domains(
 				band_fills: Vec::new(),
 				kernel_fields: binding.kernel_fields,
 				color_job: binding.color_job,
+				continuous_intent: None,
 				provenance: result.provenance.clone(),
 				stack_normalization: binding.stack_normalization,
 			},
@@ -2288,6 +2319,7 @@ pub fn resolve_domains(
 	let mut next_identity = identity.clone();
 	let mut channels = Vec::with_capacity(binding.channels.len());
 	let color_job = binding.color_job;
+	let continuous_intent = continuous_intent(color_job, binding.continuous_anchor);
 	for channel in binding.channels {
 		let data = result.data.projection().map_err(|error| DomainError {
 			channel: channel.channel,
@@ -2331,11 +2363,24 @@ pub fn resolve_domains(
 			band_fills: Vec::new(),
 			kernel_fields: binding.kernel_fields,
 			color_job,
+			continuous_intent,
 			provenance: result.provenance.clone(),
 			stack_normalization: binding.stack_normalization,
 		},
 		next_identity,
 	))
+}
+
+fn continuous_intent(
+	job: Option<ColorJob>,
+	anchor: crate::plot::continuous_color::ContinuousAnchor,
+) -> Option<crate::plot::continuous_color::ContinuousScaleIntent> {
+	match job {
+		Some(job @ (ColorJob::Sequential | ColorJob::Diverging)) => {
+			Some(crate::plot::continuous_color::ContinuousScaleIntent { job, anchor })
+		}
+		Some(ColorJob::Categorical | ColorJob::Status) | None => None,
+	}
 }
 
 /// PRODUCT-0029's explicit categorical palette path. PRODUCT-0030 supplies the
@@ -2349,6 +2394,7 @@ pub fn resolve_domains_with_categorical_palette(
 	let mut next_identity = identity.clone();
 	let mut channels = Vec::with_capacity(binding.channels.len());
 	let color_job = binding.color_job;
+	let continuous_intent = continuous_intent(color_job, binding.continuous_anchor);
 	for channel in binding.channels {
 		let data = result.data.projection().map_err(|error| {
 			CategoricalResolutionError::Domain(DomainError {
@@ -2405,6 +2451,7 @@ pub fn resolve_domains_with_categorical_palette(
 			band_fills,
 			kernel_fields: binding.kernel_fields,
 			color_job,
+			continuous_intent,
 			provenance: result.provenance.clone(),
 			stack_normalization: binding.stack_normalization,
 		},
@@ -3409,7 +3456,11 @@ mod tests {
 			assert!(binding.channels.iter().all(|channel| {
 				channel.semantic_type == SemanticType::Nominal && channel.scale == ScaleFamily::Band
 			}));
-			assert_eq!(binding.color_job, None);
+			assert_eq!(binding.color_job, Some(ColorJob::Sequential));
+			assert_eq!(
+				binding.continuous_anchor,
+				crate::plot::continuous_color::ContinuousAnchor::None
+			);
 			assert!(matches!(
 				binding.kernel_fields.as_ref(),
 				ResolvedKernelFields::Heatmap { x, y, value }
@@ -3536,7 +3587,11 @@ mod tests {
 				channel.semantic_type == SemanticType::Quantitative
 					&& channel.scale == ScaleFamily::Linear
 			}));
-			assert_eq!(binding.color_job, None);
+			assert_eq!(binding.color_job, Some(ColorJob::Sequential));
+			assert_eq!(
+				binding.continuous_anchor,
+				crate::plot::continuous_color::ContinuousAnchor::None
+			);
 			assert!(matches!(
 				binding.kernel_fields.as_ref(),
 				ResolvedKernelFields::Bubble { x, y, size, color, label: actual }

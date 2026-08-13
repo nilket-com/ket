@@ -34,7 +34,6 @@ impl Default for ContinuousRamps {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[allow(dead_code)] // Diverging and authored origins arrive with CI-02; PRODUCT-0089 gates them now.
 pub enum ContinuousAnchor {
 	None,
 	DefaultZero,

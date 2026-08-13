@@ -1027,6 +1027,17 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 }
 
 #[cfg(feature = "toron")]
+fn with_rune_continuous_intent(
+	spec: AuthoredPlotSpec,
+	intent: Option<crate::plot::continuous_color::ContinuousScaleIntent>,
+) -> AuthoredPlotSpec {
+	match intent {
+		Some(intent) => spec.with_continuous_intent(intent),
+		None => spec,
+	}
+}
+
+#[cfg(feature = "toron")]
 fn box_plot_failure_role(
 	data: &DataFrame,
 	fields: &crate::plot::spec::BoxPlotFields,
@@ -1656,11 +1667,17 @@ fn rune_view_outcome_with_palettes(
 				},
 				RuneViewIntent::Table(_) => None,
 			};
-			let (output, tick_step_output_span, minor_tick_output_span) = match view.intent {
+			let (
+				output,
+				tick_step_output_span,
+				minor_tick_output_span,
+				continuous_intent_output_span,
+			) = match view.intent {
 				RuneViewIntent::Table(table) => (
 					resolve_rune_table(table).map(RuneRelationSinkOutput::Table),
 					None,
 					RunePlotMinorTickSpans::default(),
+					None,
 				),
 				RuneViewIntent::Plot(plot) => {
 					let crate::rune_relation_envelope::RunePlotIntent {
@@ -1672,6 +1689,8 @@ fn rune_view_outcome_with_palettes(
 						domain_spans,
 						tick_step_spans,
 						minor_tick_spans,
+						continuous_intent,
+						continuous_intent_span,
 					} = plot;
 					let authored_settings = match resolve_rune_plot_skin(authored_settings) {
 						Ok(settings) => settings,
@@ -1740,7 +1759,10 @@ fn rune_view_outcome_with_palettes(
 						minor_tick_spans.x.is_some() || minor_tick_spans.y.is_some();
 					let output = match body {
 						RunePlotBody::Single(plot) => {
-							let authored_spec = authored_rune_plot_spec(&plot);
+							let authored_spec = with_rune_continuous_intent(
+								authored_rune_plot_spec(&plot),
+								continuous_intent,
+							);
 							plan_with_categorical_palette(
 								PlotRequest {
 									source: PlotSource::Materialized {
@@ -1823,7 +1845,10 @@ fn rune_view_outcome_with_palettes(
 									stacked,
 									percent,
 								} = styled;
-								let authored_spec = authored_rune_plot_spec(&sink);
+								let authored_spec = with_rune_continuous_intent(
+									authored_rune_plot_spec(&sink),
+									continuous_intent,
+								);
 								let authored_spec = if stacked {
 									authored_spec.with_stacked_bar()
 								} else {
@@ -1918,9 +1943,19 @@ fn rune_view_outcome_with_palettes(
 							}
 						}
 					};
-					(output, tick_step_output_span, minor_tick_spans)
+					(
+						output,
+						tick_step_output_span,
+						minor_tick_spans,
+						continuous_intent_span,
+					)
 				}
 			};
+			let continuous_output_span = output.as_ref().err().and_then(|error| {
+				(error.contains("authored continuous colour anchor"))
+					.then(|| continuous_intent_output_span.clone())
+					.flatten()
+			});
 			let output_span = output.as_ref().err().and_then(|error| {
 				if error.contains("_minor_ticks") {
 					minor_tick_output_span
@@ -1954,7 +1989,8 @@ fn rune_view_outcome_with_palettes(
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
-				span: output_span
+				span: continuous_output_span
+					.or(output_span)
 					.or(box_output_span)
 					.or(heatmap_output_span)
 					.or(bubble_output_span)
@@ -10111,6 +10147,115 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			"absent",
 		);
 		assert!(complete(valid).sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0091_rune_continuous_intent_reaches_planning_and_modifier_diagnostics() {
+		use crate::plot::colors::ColorTheme;
+		use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
+		use crate::plot::spec::ColorJob;
+
+		let frame = polars::df!(
+			"x" => ["a", "b"], "y" => ["q", "q"], "value" => [-50.0, 100.0],
+		)
+		.unwrap();
+		let complete = |source: &str| {
+			let relation = transform_rune_view(source)
+				.expect("continuous colour source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame.clone(), relation.views)
+		};
+		let valid = r#"workspace.table("heat_probe").views([figure([
+			diverging_palette("green_purples"),
+			heatmap("x", "y", "value").diverging()
+		])])"#;
+		let outcome = complete(valid);
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(
+			resolved,
+			authored_settings,
+			continuation,
+		)) = &outcome.sinks[0].output
+		else {
+			panic!("diverging heatmap must resolve")
+		};
+		assert_eq!(
+			resolved.resolved_spec.continuous_intent,
+			Some(ContinuousScaleIntent {
+				job: ColorJob::Diverging,
+				anchor: ContinuousAnchor::DefaultZero,
+			})
+		);
+		assert_eq!(
+			authored_settings.diverging_ramp,
+			crate::plot::spec::Override::Set(ColorTheme::GreenPurples)
+		);
+		assert!(
+			continuation
+				.identity
+				.persistence_snapshot()
+				.assignments
+				.is_empty()
+		);
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored_settings.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 800, 480);
+		let legend = kernel.legend_content(&settings).expect("diverging guide");
+		let crate::plot::legend::LegendSection::Gradient { stops, .. } =
+			legend.sections().next().expect("gradient section")
+		else {
+			panic!("heatmap guide is not a gradient")
+		};
+		assert_eq!(stops.values().collect::<Vec<_>>(), [-50.0, 0.0, 100.0]);
+		assert_eq!(stops.sample_normalized(0.5), iced::Color::WHITE);
+
+		for (modifier, fragment) in [
+			("diverging_at(500.0)", "strictly inside"),
+			("diverging_at(-50.0)", "strictly inside"),
+		] {
+			let source = format!(
+				r#"workspace.table("heat_probe").views([heatmap("x", "y", "value").{modifier}])"#
+			);
+			let outcome = complete(&source);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("out-of-domain anchor rendered")
+			};
+			assert!(error.contains(fragment), "{error}");
+			assert!(!error.contains("plot anchor field"), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				format!(".{modifier}")
+			);
+		}
+
+		let constant = polars::df!("x" => ["a"], "y" => ["q"], "value" => [0.0]).unwrap();
+		let complete_constant = |modifier: &str| {
+			let source = format!(
+				r#"workspace.table("heat_probe").views([heatmap("x", "y", "value").{modifier}])"#
+			);
+			let relation = transform_rune_view(&source)
+				.expect("constant source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			(source, rune_view_outcome(constant.clone(), relation.views))
+		};
+		assert!(complete_constant("diverging()").1.sinks[0].output.is_ok());
+		let (source, outcome) = complete_constant("diverging_at(0.0)");
+		let Err(error) = &outcome.sinks[0].output else {
+			panic!("authored anchor on a degenerate domain rendered")
+		};
+		assert!(error.contains("degenerate domain"), "{error}");
+		let span = outcome.sinks[0].span.clone();
+		assert_eq!(
+			&source[span.start as usize..span.end as usize],
+			".diverging_at(0.0)"
+		);
 	}
 
 	#[test]

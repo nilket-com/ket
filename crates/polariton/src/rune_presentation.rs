@@ -5,8 +5,10 @@
 //! origin in the author's original buffer.
 
 use crate::plot::chrome::PlotChromeProjection;
+use crate::plot::colors::ColorTheme;
 use crate::plot::common::TickPlacement;
 use crate::plot::composition::PlotComposition;
+use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, HeatmapFields,
@@ -169,6 +171,8 @@ enum FigureElementKind {
 	YLabel(String),
 	Facet(String),
 	Palette(String),
+	SequentialPalette(ColorTheme),
+	DivergingPalette(ColorTheme),
 	Legend(Presence<LegendPosition>),
 	XBounds(f64, f64),
 	YBounds(f64, f64),
@@ -206,6 +210,8 @@ struct RuneMark {
 	category_gap_origin: Option<Origin>,
 	stacked_origin: Option<Origin>,
 	percent_origin: Option<Origin>,
+	continuous_intent: Option<ContinuousScaleIntent>,
+	continuous_intent_origin: Option<Origin>,
 }
 
 #[derive(Any, Clone, Debug)]
@@ -397,6 +403,11 @@ fn build_context() -> Result<Context, String> {
 		("__y_label", raw_y_label as RawFunction),
 		("__facet", raw_facet as RawFunction),
 		("__palette", raw_palette as RawFunction),
+		(
+			"__sequential_palette",
+			raw_sequential_palette as RawFunction,
+		),
+		("__diverging_palette", raw_diverging_palette as RawFunction),
 		("__skin", raw_skin as RawFunction),
 		("__legend_at", raw_legend_at as RawFunction),
 		("__hide_legend", raw_hide_legend as RawFunction),
@@ -422,6 +433,8 @@ fn build_context() -> Result<Context, String> {
 		("__category_gap", raw_mark_category_gap as RawFunction),
 		("__stacked", raw_mark_stacked as RawFunction),
 		("__percent", raw_mark_percent as RawFunction),
+		("__diverging", raw_mark_diverging as RawFunction),
+		("__diverging_at", raw_mark_diverging_at as RawFunction),
 	] {
 		module
 			.raw_function(name, function)
@@ -578,6 +591,8 @@ fn raw_box(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) 
 			category_gap_origin: None,
 			stacked_origin: None,
 			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
 		},
 	)
 }
@@ -682,6 +697,8 @@ fn raw_bubble(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 			category_gap_origin: None,
 			stacked_origin: None,
 			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
 		},
 	)
 }
@@ -783,6 +800,8 @@ fn raw_heatmap(
 			category_gap_origin: None,
 			stacked_origin: None,
 			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
 		},
 	)
 }
@@ -853,6 +872,61 @@ fn raw_palette(
 		args,
 		out,
 	)
+}
+
+fn raw_sequential_palette(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_ramp_element(true, "sequential_palette", stack, addr, args, out)
+}
+
+fn raw_diverging_palette(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_ramp_element(false, "diverging_palette", stack, addr, args, out)
+}
+
+fn raw_ramp_element(
+	sequential: bool,
+	name: &'static str,
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let value = if values.len() == 3 {
+		match rune::from_value::<Ref<str>>(values[0].clone()) {
+			Ok(token) => match ColorTheme::from_ramp_token(&token) {
+				Some(ramp) => Ok(if sequential {
+					FigureElementKind::SequentialPalette(ramp)
+				} else {
+					FigureElementKind::DivergingPalette(ramp)
+				}),
+				None => Err(PresentationFailure::new(
+					origin,
+					format!("{name}(...) has unknown ramp token `{}`", &*token),
+				)),
+			},
+			Err(_) => Err(PresentationFailure::new(
+				origin,
+				format!("{name}(...) requires one ramp token string"),
+			)),
+		}
+	} else {
+		Err(PresentationFailure::new(
+			origin,
+			format!("{name}(...) requires one ramp token string"),
+		))
+	};
+	store(out, stack, RuneFigureElement { value, origin })
 }
 
 fn raw_string_element(
@@ -1261,6 +1335,8 @@ fn raw_mark(
 			category_gap_origin: None,
 			stacked_origin: None,
 			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
 		},
 	)
 }
@@ -1281,6 +1357,8 @@ impl RuneMark {
 			category_gap_origin: None,
 			stacked_origin: None,
 			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
 		}
 	}
 
@@ -1895,6 +1973,30 @@ fn mark_percent(mut mark: RuneMark, start: i64, end: i64) -> RuneMark {
 	mark
 }
 
+fn mark_diverging(mut mark: RuneMark, anchor: ContinuousAnchor, start: i64, end: i64) -> RuneMark {
+	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
+	if mark.continuous_intent_origin.is_some() {
+		mark.sink = Err(PresentationFailure::new(
+			origin,
+			"diverging() and diverging_at(...) form one modifier family and may appear at most once",
+		));
+		return mark;
+	}
+	mark.continuous_intent_origin = Some(origin);
+	if !matches!(mark.plot_type(), Some(PlotType::Heatmap | PlotType::Bubble)) {
+		mark.sink = Err(PresentationFailure::new(
+			origin,
+			"diverging colour is available on heatmap and bubble marks",
+		));
+		return mark;
+	}
+	mark.continuous_intent = Some(ContinuousScaleIntent {
+		job: crate::plot::spec::ColorJob::Diverging,
+		anchor,
+	});
+	mark
+}
+
 #[derive(Clone, Copy)]
 enum MarkModifier {
 	PointSize,
@@ -1903,6 +2005,8 @@ enum MarkModifier {
 	CategoryGap,
 	Stacked,
 	Percent,
+	Diverging,
+	DivergingAt,
 }
 
 fn raw_mark_point_size(
@@ -2007,6 +2111,40 @@ fn raw_mark_percent(
 	)
 }
 
+fn raw_mark_diverging(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_mark_modifier(
+		MarkModifier::Diverging,
+		"diverging",
+		false,
+		stack,
+		addr,
+		args,
+		out,
+	)
+}
+
+fn raw_mark_diverging_at(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_mark_modifier(
+		MarkModifier::DivergingAt,
+		"diverging_at",
+		true,
+		stack,
+		addr,
+		args,
+		out,
+	)
+}
+
 fn raw_mark_modifier(
 	kind: MarkModifier,
 	name: &'static str,
@@ -2049,6 +2187,14 @@ fn raw_mark_modifier(
 		MarkModifier::CategoryGap => mark_category_gap(mark, values[1].clone(), start, end),
 		MarkModifier::Stacked => mark_stacked(mark, start, end),
 		MarkModifier::Percent => mark_percent(mark, start, end),
+		MarkModifier::Diverging => mark_diverging(mark, ContinuousAnchor::DefaultZero, start, end),
+		MarkModifier::DivergingAt => match rune_number(&values[1]) {
+			Some(anchor) => mark_diverging(mark, ContinuousAnchor::Authored(anchor), start, end),
+			None => RuneMark::failed(PresentationFailure::new(
+				origin,
+				"diverging_at(...) requires a numeric anchor",
+			)),
+		},
 	};
 	store(out, stack, mark)
 }
@@ -2157,6 +2303,10 @@ struct FigureParts {
 	y_label: Option<(String, Origin)>,
 	facet: Option<(String, Origin)>,
 	palette: Option<(String, Origin)>,
+	sequential_palette: Option<(ColorTheme, Origin)>,
+	diverging_palette: Option<(ColorTheme, Origin)>,
+	continuous_intent: Option<ContinuousScaleIntent>,
+	continuous_intent_origin: Option<Origin>,
 	legend: Option<(Presence<LegendPosition>, Origin)>,
 	skin: Option<(PlotSkinSelection, Origin)>,
 	x_bounds: Option<(f64, f64, Origin)>,
@@ -2191,6 +2341,8 @@ fn decode_figure(value: &Value, origin: Origin) -> Result<RunePlotIntent, Presen
 		}
 		if let Ok(mark) = value.borrow_ref::<RuneMark>() {
 			let body = finalize_mark_body(&mark)?;
+			parts.continuous_intent = mark.continuous_intent;
+			parts.continuous_intent_origin = mark.continuous_intent_origin;
 			set_once(
 				&mut parts.body,
 				(body, mark.origin),
@@ -2301,6 +2453,18 @@ fn merge_element(
 			origin,
 			"a figure has at most one categorical palette",
 		),
+		FigureElementKind::SequentialPalette(value) => set_once(
+			&mut parts.sequential_palette,
+			(value, origin),
+			origin,
+			"a figure has at most one sequential_palette",
+		),
+		FigureElementKind::DivergingPalette(value) => set_once(
+			&mut parts.diverging_palette,
+			(value, origin),
+			origin,
+			"a figure has at most one diverging_palette",
+		),
 		FigureElementKind::Legend(value) => set_once(
 			&mut parts.legend,
 			(value, origin),
@@ -2370,6 +2534,12 @@ impl FigureParts {
 		if let Some((palette, _)) = &self.palette {
 			authored_settings.categorical_palette = Override::Set(Arc::new(palette.clone()));
 		}
+		if let Some((ramp, _)) = self.sequential_palette {
+			authored_settings.sequential_ramp = Override::Set(ramp);
+		}
+		if let Some((ramp, _)) = self.diverging_palette {
+			authored_settings.diverging_ramp = Override::Set(ramp);
+		}
 		if self.x_bounds.is_some() || self.y_bounds.is_some() {
 			authored_settings.domains = Override::Set(PlotDomainOverrides {
 				x_min: self.x_bounds.map(|(minimum, _, _)| minimum),
@@ -2402,6 +2572,8 @@ impl FigureParts {
 		}
 		RunePlotIntent {
 			body,
+			continuous_intent: self.continuous_intent,
+			continuous_intent_span: self.continuous_intent_origin.map(Origin::range),
 			facet: self.facet.as_ref().map(|(facet, _)| facet.clone()),
 			authored_settings,
 			plot_skin_span: self.skin.map(|(_, origin)| origin.range()),
@@ -2476,9 +2648,10 @@ fn decode_slot(
 		return presentation.value.clone();
 	}
 	if let Ok(mark) = value.borrow_ref::<RuneMark>() {
-		return Ok(RuneViewIntent::Plot(RunePlotIntent::bare(
-			finalize_mark_body(&mark)?,
-		)));
+		let mut plot = RunePlotIntent::bare(finalize_mark_body(&mark)?);
+		plot.continuous_intent = mark.continuous_intent;
+		plot.continuous_intent_span = mark.continuous_intent_origin.map(Origin::range);
+		return Ok(RuneViewIntent::Plot(plot));
 	}
 	if let Ok(layers) = value.borrow_ref::<RuneLayers>() {
 		return Ok(RuneViewIntent::Plot(RunePlotIntent::bare(

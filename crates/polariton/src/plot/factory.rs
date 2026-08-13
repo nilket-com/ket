@@ -125,15 +125,17 @@ pub fn create_plot(
 				crate::plot::spec::BubbleFieldNames::new(x, y, size, color),
 				label.clone(),
 			);
-			let prepared = bubble::prepare_bubble_data(df, &fields)
+			let mut prepared = bubble::prepare_bubble_data(df, &fields)
 				.expect("PRODUCT-0090 planning validated this bubble snapshot");
+			prepared.color_intent = spec.continuous_intent.unwrap_or(prepared.color_intent);
 			Arc::new(BubblePlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
 		}
 		ResolvedKernelFields::Heatmap { x, y, value } => {
-			let prepared = heatmap::prepare_heatmap_data(df, x, y, value)
+			let mut prepared = heatmap::prepare_heatmap_data(df, x, y, value)
 				.expect("PRODUCT-0088 planning validated this heatmap snapshot");
+			prepared.color_intent = spec.continuous_intent.unwrap_or(prepared.color_intent);
 			Arc::new(HeatmapPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})

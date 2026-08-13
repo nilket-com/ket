@@ -44,6 +44,13 @@ PRODUCT-0082, and PRODUCT-0085 ships `x_label` / `y_label` authoring plus the
 derived percent-of-total title. Its seeded row remains unchanged below so this
 file continues to show the 2026-08-06 judgement beside the later outcome.
 
+CI-02's authored-request trigger subsequently fired during plot-catalog
+restoration. PRODUCT-0091 ships the sequential and diverging ramp slots plus
+the diverging-job and anchor surface. **Status authoring remains if asked**:
+no status consumer exists, so a word would still be observationally inert.
+The seeded cluster row remains unchanged below for the same historical reason;
+the indexed docket at the end records the split outcome.
+
 **Overturned closure:**
 
 | item | was | now |
@@ -273,7 +280,7 @@ arcs (Guide, Persistence) plus debt retirement rather than new surface.
 | AX-09 | Minor visibility flags | closed |
 | AX-10 | Mark-factor bound widening | closed |
 | CI-01 | Layered color | if asked |
-| CI-02 | Sequential / diverging / status authoring | if asked |
+| CI-02 | Sequential / diverging authoring landed; status authoring residue | partial — PRODUCT-0091 / status if asked |
 | CI-03 | `ColorTheme` retirement + legacy resolver | will do |
 | CI-04 | Explicit palette cycling | closed |
 | CI-05 | Recolor / reset affordance | if asked |

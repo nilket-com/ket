@@ -76,6 +76,11 @@ impl Default for RuneTableSink {
 #[derive(Clone, Debug)]
 pub(crate) struct RunePlotIntent {
 	pub(crate) body: RunePlotBody,
+	/// PRODUCT-0091: mark-level continuous mapping semantics, kept outside
+	/// `MarkFields` because it is not field identity.
+	pub(crate) continuous_intent: Option<crate::plot::continuous_color::ContinuousScaleIntent>,
+	/// Diagnostic provenance only; deliberately excluded from equality.
+	pub(crate) continuous_intent_span: Option<Range<u32>>,
 	pub(crate) facet: Option<String>,
 	pub(crate) authored_settings: PlotSettingsLayer,
 	pub(crate) plot_skin_span: Option<Range<u32>>,
@@ -88,6 +93,7 @@ pub(crate) struct RunePlotIntent {
 impl PartialEq for RunePlotIntent {
 	fn eq(&self, other: &Self) -> bool {
 		self.body == other.body
+			&& self.continuous_intent == other.continuous_intent
 			&& self.facet == other.facet
 			&& self.authored_settings == other.authored_settings
 	}
@@ -158,6 +164,8 @@ impl RunePlotIntent {
 	pub(crate) fn bare(body: RunePlotBody) -> Self {
 		Self {
 			body,
+			continuous_intent: None,
+			continuous_intent_span: None,
 			facet: None,
 			authored_settings: PlotSettingsLayer::default(),
 			plot_skin_span: None,

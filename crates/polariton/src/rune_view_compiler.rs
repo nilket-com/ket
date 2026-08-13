@@ -35,8 +35,10 @@ const PRESENTATION_FREE: &[&str] = &[
 	"line",
 	"palette",
 	"scatter",
+	"sequential_palette",
 	"skin",
 	"subtitle",
+	"diverging_palette",
 	"table",
 	"title",
 	"x_bounds",
@@ -52,6 +54,8 @@ const PRESENTATION_FREE: &[&str] = &[
 const PRESENTATION_METHODS: &[&str] = &[
 	"bar_width",
 	"category_gap",
+	"diverging",
+	"diverging_at",
 	"duotone",
 	"percent",
 	"point_size",
@@ -1676,6 +1680,9 @@ fn is_keyword(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::colors::ColorTheme;
+	use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
+	use crate::plot::spec::ColorJob;
 	use crate::plot::spec::{BubbleNumericField, BubblePreparationChannel, Override, Presence};
 	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent};
 	use std::sync::Arc;
@@ -1727,6 +1734,127 @@ mod tests {
 				expected
 			);
 		}
+	}
+
+	#[test]
+	fn product_0091_continuous_words_rewrite_and_retain_modifier_intent_origin() {
+		let source = r#"let relation = workspace.table("heat_probe");
+relation.views([figure([
+    sequential_palette("magma"), diverging_palette("green_purples"),
+    heatmap("region", "quarter", "margin").diverging_at(25.0)
+])]);"#;
+		let compiled = compile(source).expect("continuous colour surface compiles");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("continuous colour figure produced a table")
+		};
+		assert_eq!(
+			plot.authored_settings.sequential_ramp,
+			Override::Set(ColorTheme::Magma)
+		);
+		assert_eq!(
+			plot.authored_settings.diverging_ramp,
+			Override::Set(ColorTheme::GreenPurples)
+		);
+		assert_eq!(
+			plot.continuous_intent,
+			Some(ContinuousScaleIntent {
+				job: ColorJob::Diverging,
+				anchor: ContinuousAnchor::Authored(25.0),
+			})
+		);
+		let span = plot
+			.continuous_intent_span
+			.clone()
+			.expect("modifier origin");
+		assert_eq!(
+			&source[span.start as usize..span.end as usize],
+			".diverging_at(25.0)"
+		);
+	}
+
+	#[test]
+	fn product_0091_modifier_provenance_does_not_change_figure_identity() {
+		let compact = r#"workspace.table("t").views([heatmap("x", "y", "v").diverging_at(0.0)])"#;
+		let spaced = r#"workspace.table("t").views([
+			heatmap("x", "y", "v")
+				.diverging_at(0.0)
+		])"#;
+		let left = compile(compact).expect("compact figure compiles");
+		let right = compile(spaced).expect("spaced figure compiles");
+		assert_eq!(
+			left.executions[0].views[0].intent, right.executions[0].views[0].intent,
+			"modifier provenance is diagnostic metadata, not figure identity"
+		);
+		let RuneViewIntent::Plot(left) = &left.executions[0].views[0].intent else {
+			panic!("compact fixture produced a table")
+		};
+		let RuneViewIntent::Plot(right) = &right.executions[0].views[0].intent else {
+			panic!("spaced fixture produced a table")
+		};
+		assert_ne!(left.continuous_intent_span, right.continuous_intent_span);
+	}
+
+	#[test]
+	fn product_0091_continuous_surface_refuses_unknowns_and_second_spellings_precisely() {
+		for (source, expected, message) in [
+			(
+				r#"workspace.table("heat_probe").views([figure([diverging_palette("viridis"), diverging_palette("magma"), heatmap("x", "y", "v").diverging()])])"#,
+				"diverging_palette(\"magma\")",
+				"at most one diverging_palette",
+			),
+			(
+				r#"workspace.table("heat_probe").views([figure([sequential_palette("magma"), sequential_palette("inferno"), heatmap("x", "y", "v")])])"#,
+				"sequential_palette(\"inferno\")",
+				"at most one sequential_palette",
+			),
+			(
+				r#"workspace.table("heat_probe").views([heatmap("x", "y", "v").diverging().diverging_at(0.0)])"#,
+				".diverging_at(0.0)",
+				"one modifier family",
+			),
+			(
+				r#"workspace.table("t").views([bar("x", "y").diverging()])"#,
+				".diverging()",
+				"available on heatmap and bubble",
+			),
+			(
+				r#"workspace.table("heat_probe").views([figure([sequential_palette("not_a_ramp"), heatmap("x", "y", "v")])])"#,
+				"sequential_palette(\"not_a_ramp\")",
+				"unknown ramp token `not_a_ramp`",
+			),
+		] {
+			let error = compile(source).expect_err("invalid continuous spelling refuses");
+			let RuneEnvelopeError::InvalidView {
+				span,
+				message: actual,
+			} = error
+			else {
+				panic!("continuous refusal retains its authored origin")
+			};
+			assert!(actual.contains(message), "{actual}");
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		}
+		let coexist = r#"workspace.table("heat_probe").views([figure([
+			palette("tab20c"), sequential_palette("blue_white_red"),
+			diverging_palette("viridis"), heatmap("x", "y", "v").diverging()
+		])])"#;
+		let compiled = compile(coexist).expect("three independent palette concepts coexist");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("coexistence fixture produced a table")
+		};
+		assert_eq!(
+			plot.authored_settings.sequential_ramp,
+			Override::Set(ColorTheme::BlueWhiteRed)
+		);
+		assert_eq!(
+			plot.authored_settings.diverging_ramp,
+			Override::Set(ColorTheme::Viridis)
+		);
+		assert_eq!(
+			plot.continuous_intent.map(|intent| intent.job),
+			Some(ColorJob::Diverging),
+			"the token does not infer the job"
+		);
 	}
 
 	#[test]
@@ -2017,6 +2145,49 @@ mod tests {
 		assert!(source.contains("Signed colour −30…40"));
 		assert!(source.contains("null label stays absent in hover"));
 		assert!(source.contains("Point 0, Point 1, …"));
+	}
+
+	#[test]
+	fn product_0091_test29_separates_ramp_slots_jobs_and_anchors() {
+		let source = include_str!("../../../uat/test29.rn");
+		let compiled = compile(source).expect("the continuous colour exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 3);
+		let intents = compiled
+			.executions
+			.iter()
+			.flat_map(|execution| execution.views.iter())
+			.map(|view| match &view.intent {
+				RuneViewIntent::Plot(plot) => plot,
+				RuneViewIntent::Table(_) => panic!("continuous exhibit produced a table"),
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(intents[0].continuous_intent, None);
+		for intent in &intents {
+			assert!(
+				matches!(intent.body, RunePlotBody::Single(_)),
+				"continuous colour intent is mark semantics, not standalone Layer settings"
+			);
+		}
+		assert_eq!(
+			intents[0].authored_settings.sequential_ramp,
+			Override::Set(ColorTheme::Magma)
+		);
+		assert_eq!(
+			intents[1].continuous_intent,
+			Some(ContinuousScaleIntent {
+				job: ColorJob::Diverging,
+				anchor: ContinuousAnchor::DefaultZero,
+			})
+		);
+		assert_eq!(
+			intents[2].continuous_intent,
+			Some(ContinuousScaleIntent {
+				job: ColorJob::Diverging,
+				anchor: ContinuousAnchor::Authored(15.0),
+			})
+		);
+		assert!(!source.contains("status_palette"));
 	}
 
 	#[test]

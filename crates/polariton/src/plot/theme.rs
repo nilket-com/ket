@@ -190,6 +190,10 @@ pub struct ScatterPolicy {
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotSettingsLayer {
 	pub theme: Override<PlotThemeSpec>,
+	/// PRODUCT-0091: figure-level overrides for the two continuous ramp slots.
+	/// These are deliberately partial rather than reconstructed theme specs.
+	pub sequential_ramp: Override<ColorTheme>,
+	pub diverging_ramp: Override<ColorTheme>,
 	/// Authored figure identity and explicit projection intent. The renderer
 	/// never resolves this selection.
 	pub plot_skin: Override<PlotSkinSelection>,
@@ -233,6 +237,8 @@ impl Default for PlotSettingsLayer {
 	fn default() -> Self {
 		Self {
 			theme: Override::Inherit,
+			sequential_ramp: Override::Inherit,
+			diverging_ramp: Override::Inherit,
 			plot_skin: Override::Inherit,
 			resolved_skin: Override::Inherit,
 			categorical_palette: Override::Inherit,
@@ -310,14 +316,10 @@ impl PlotSettings {
 
 	pub fn resolve(&self) -> ResolvedPlotSettings {
 		let mut settings = self.library_defaults.clone();
-		for layer in [
-			&self.application_theme,
-			&self.authored_spec,
-			&self.layer,
-			&self.pane_override,
-		] {
-			apply_layer(&mut settings, layer);
-		}
+		apply_layer(&mut settings, &self.application_theme, true);
+		apply_layer(&mut settings, &self.authored_spec, true);
+		apply_layer(&mut settings, &self.layer, false);
+		apply_layer(&mut settings, &self.pane_override, true);
 		settings
 	}
 
@@ -325,15 +327,19 @@ impl PlotSettings {
 	/// The pane override is deliberately applied afterward.
 	pub fn resolve_for_layer(&self, layer: &LayerSettings) -> ResolvedPlotSettings {
 		let mut settings = self.library_defaults.clone();
-		apply_layer(&mut settings, &self.application_theme);
-		apply_layer(&mut settings, &self.authored_spec);
+		apply_layer(&mut settings, &self.application_theme, true);
+		apply_layer(&mut settings, &self.authored_spec, true);
 		apply_layer_settings(&mut settings, layer);
-		apply_layer(&mut settings, &self.pane_override);
+		apply_layer(&mut settings, &self.pane_override, true);
 		settings
 	}
 }
 
-fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
+fn apply_layer(
+	settings: &mut ResolvedPlotSettings,
+	layer: &PlotSettingsLayer,
+	continuous_slots_apply: bool,
+) {
 	if let Override::Set(theme) = layer.theme {
 		settings.continuous_ramps = ContinuousRamps::from_theme(theme);
 		settings.color_theme = theme.sequential_ramp;
@@ -343,6 +349,17 @@ fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 		settings.mark_style = PlotMarkStyle::legacy_from_iced(background, decoration);
 		settings.surrounding_background_color = background;
 		settings.surrounding_decoration_color = decoration;
+	}
+	// The specific slot wins over the atomic theme within one tier. Graphical
+	// layers cannot author figure-wide continuous ramp slots.
+	if continuous_slots_apply {
+		if let Override::Set(ramp) = layer.sequential_ramp {
+			settings.continuous_ramps.sequential = ramp;
+			settings.color_theme = ramp;
+		}
+		if let Override::Set(ramp) = layer.diverging_ramp {
+			settings.continuous_ramps.diverging = ramp;
+		}
 	}
 	if let Override::Set(skin) = layer.resolved_skin {
 		settings.chrome = skin.chrome;
@@ -459,6 +476,45 @@ const _: () = assert!(default_theme_is_valid(PlotThemeSpec::DEFAULT_DARK));
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn product_0091_continuous_slot_overrides_are_partial_and_follow_figure_tiers() {
+		let mut cascade = PlotSettings::default();
+		let mut atomic = PlotThemeSpec::default();
+		atomic.chrome.background = PlotRgb::new(7, 8, 9);
+		atomic.categorical_ramp = ColorTheme::Reds;
+		atomic.sequential_ramp = ColorTheme::Blues;
+		atomic.diverging_ramp = ColorTheme::RedWhiteBlue;
+		atomic.status_ramp = ColorTheme::RedGreen;
+		cascade.authored_spec.theme = Override::Set(atomic);
+		cascade.authored_spec.sequential_ramp = Override::Set(ColorTheme::Magma);
+		let resolved = cascade.resolve();
+		assert_eq!(resolved.continuous_ramps.sequential, ColorTheme::Magma);
+		assert_eq!(
+			resolved.continuous_ramps.diverging,
+			ColorTheme::RedWhiteBlue
+		);
+		assert_eq!(resolved.color_theme, ColorTheme::Magma);
+		assert_eq!(
+			resolved.surrounding_background_color,
+			atomic.chrome.background.iced()
+		);
+
+		cascade.application_theme.diverging_ramp = Override::Set(ColorTheme::Inferno);
+		cascade.authored_spec.diverging_ramp = Override::Set(ColorTheme::GreenPurples);
+		cascade.layer.diverging_ramp = Override::Set(ColorTheme::Black);
+		cascade.pane_override.diverging_ramp = Override::Set(ColorTheme::PurpleGreens);
+		assert_eq!(
+			cascade.resolve().continuous_ramps.diverging,
+			ColorTheme::PurpleGreens
+		);
+		cascade.pane_override.diverging_ramp = Override::Inherit;
+		assert_eq!(
+			cascade.resolve().continuous_ramps.diverging,
+			ColorTheme::GreenPurples,
+			"the graphical layer is inapplicable to figure-wide ramp slots"
+		);
+	}
 
 	#[test]
 	fn default_theme_passes_contrast_ordering_and_keeps_ramps_plot_local() {

@@ -1,0 +1,30 @@
+let skin = "nord";
+let cells = workspace.table("heat_probe");
+let observations = workspace.table("bubble_probe");
+
+cells.views([
+	view("heatmap-sequential-ramp", figure([
+		title("Continuous colour · sequential slot"),
+		subtitle("Magma changes the slot without changing the job"),
+		skin(skin),
+		sequential_palette("magma"),
+		heatmap("region", "quarter", "margin"),
+	])),
+	view("heatmap-diverging-zero", figure([
+		title("Continuous colour · diverging at zero"),
+		subtitle("GreenPurples neutral is anchored at 0 on −30…40"),
+		skin(skin),
+		diverging_palette("green_purples"),
+		heatmap("region", "quarter", "margin").diverging(),
+	])),
+]);
+
+observations.views([
+	view("bubble-diverging-authored", figure([
+		title("Continuous colour · authored anchor"),
+		subtitle("BlueWhiteRed neutral is anchored at 15 on −30…40"),
+		skin(skin),
+		diverging_palette("blue_white_red"),
+		bubble("x", "y", "size", "color", "label").diverging_at(15.0),
+	])),
+]);

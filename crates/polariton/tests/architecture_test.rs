@@ -3213,3 +3213,64 @@ fn product_0095_bubble_surface_keeps_roles_projection_and_kernel_boundaries_stru
 	assert!(formatter.contains("FieldAttribution::Role(role)"));
 	assert!(formatter.contains("plot {role} field"));
 }
+
+#[test]
+fn product_0091_continuous_authoring_has_only_the_two_recorded_origins_and_no_status_surface() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read Rune presentation");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read Rune envelope");
+	let production = presentation
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production presentation region");
+	let compiler_surface = compiler
+		.split("enum RelationRoot")
+		.next()
+		.expect("presentation vocabulary region");
+
+	for spelling in [
+		"__sequential_palette",
+		"__diverging_palette",
+		"__diverging",
+		"__diverging_at",
+	] {
+		assert!(production.contains(spelling), "missing {spelling}");
+	}
+	assert_eq!(production.matches("ColorJob::Diverging").count(), 1);
+	assert_eq!(production.matches("ContinuousAnchor::Authored").count(), 1);
+	assert!(!production.contains("FieldAttribution::Role(\"anchor\")"));
+	assert!(!compiler_surface.contains("status_palette"));
+	assert!(!production.contains("status_palette"));
+	assert!(compiler_surface.contains("\"diverging\""));
+	assert!(compiler_surface.contains("\"diverging_at\""));
+
+	assert!(theme.contains("pub sequential_ramp: Override<ColorTheme>"));
+	assert!(theme.contains("pub diverging_ramp: Override<ColorTheme>"));
+	assert!(theme.contains("apply_layer(&mut settings, &self.layer, false)"));
+	assert!(spec.contains("pub continuous_anchor:"));
+	assert!(spec.contains("pub continuous_intent:"));
+	for forbidden in ["continuous_intent", "continuous_anchor", "ColorJob"] {
+		let mark_fields = spec
+			.split("pub enum MarkFields")
+			.nth(1)
+			.expect("MarkFields declaration")
+			.split("pub struct AuthoredPlotSpec")
+			.next()
+			.expect("MarkFields region");
+		assert!(!mark_fields.contains(forbidden));
+		let spanned = envelope
+			.split("pub(crate) enum SpannedMarkFields")
+			.nth(1)
+			.expect("SpannedMarkFields declaration")
+			.split("impl SpannedMarkFields")
+			.next()
+			.expect("SpannedMarkFields region");
+		assert!(!spanned.contains(forbidden));
+	}
+}

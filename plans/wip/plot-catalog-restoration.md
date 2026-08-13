@@ -199,25 +199,19 @@ band-fill path.
    transport. Five roles against heatmap's three, with an **optional label** whose
    absent-versus-selected-null semantics 0090 §9 already decided — and whose
    variable arity is why `all()` returns a slice rather than a fixed array.
-10. **Continuous colour authoring — ADR 0091, drafted; needs a reconciliation
-    pass before implementation.** It was written when steps 6–9 were all unbuilt,
-    and four records have landed since that change its assumptions:
+10. **Continuous colour authoring — LANDED as PRODUCT-0091.** Slot words
+    `sequential_palette` / `diverging_palette`, the stable 37-token ramp-name
+    grammar they create, the mark-level diverging job word, and a dedicated
+    modifier-provenance carrier from authoring through planning. Closes
+    **CI-02** for continuous colour; **status splits out** as a residue triggered
+    by its first real consumer.
 
-    - **PRODUCT-0095 §4** added `FieldAttribution { Channel, Role }`, so 0091's
-      `diverging_at` refusals can attribute to a role instead of masquerading as
-      a channel — 0091 §6 predates that type existing.
-    - **PRODUCT-0094** added the `MarkFields` / `SpannedMarkFields` transport, so
-      0091's mark-level job word has a carrier it did not have when drafted.
-    - **PRODUCT-0092 and PRODUCT-0095** both retained argument spans through to
-      planning. 0091 §6 called that carrier "this record's real cost"; it is now
-      established practice with two precedents.
-    - Its two prerequisites — an authorable heatmap and bubble — are met.
-
-    Slot words `sequential_palette` /
-   `diverging_palette`, the stable 37-token ramp-name grammar they create, the
-   mark-level diverging job word, and the anchor-provenance carrier from
-   `AuthoredPlotSpec` through planning. Closes **CI-02** for continuous colour;
-   **status splits out** as a residue triggered by its first real consumer.
+    The reconciliation after steps 6–9 rejected two superficially convenient
+    reuses. `FieldAttribution::Role` describes schema-bound fields and would have
+    produced the false phrase "anchor field"; `MarkFields` carries field identity
+    and participates in figure equality, so continuous mapping intent does not
+    belong there. Field-span retention was established practice, but carrying a
+    **modifier** span to planning was still this record's new join.
 
    **Steps 6 and 7 are prerequisites, not conveniences.** Heatmap, bubble, and
    hexbin have no Rune constructor at all (`rune_presentation.rs:384-408` lists
