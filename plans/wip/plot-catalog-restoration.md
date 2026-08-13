@@ -256,11 +256,18 @@ band-fill path.
     which contradicts the resolver's existing `number(1, "maximum")?`.
 15. **Radial dial surface — LANDED as PRODUCT-0100.** Second consumer of
     PRODUCT-0086: one family token, one conversion arm.
-16. **Pie** — after removing its aggregation authority, which Toron can now supply
+16. **`PathBuilder` arc contract — ADR 0101, drafted.** Not a catalog step but a
+    blocker for one. `arc_to` never said whether it connects or starts a new
+    sub-path, and both adapters guessed "new" — so radial dial's two-arc annuli
+    render as chord-closed arcs. Found by screenshot *after* visual acceptance
+    had been given. Pins the contract at the seam, adds a path-**topology** gate
+    (every existing assertion checks arc operands, none checks how arcs join),
+    and adds a production-canvas oracle.
+17. **Pie** — after removing its aggregation authority, which Toron can now supply
     as pre-aggregated category/value rows.
-17. **Radar + parallel together** over one dimension-list substrate. They are the
+18. **Radar + parallel together** over one dimension-list substrate. They are the
     only two needing D, and solving it twice would produce two vocabularies.
-18. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+19. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
 
