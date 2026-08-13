@@ -2742,18 +2742,66 @@ async fn time_bucket_floors_pre_epoch_timestamps_and_refuses_nonpositive_interva
 		"a null timestamp must stay null"
 	);
 
-	// A directly constructed zero interval returns a typed error. It previously
-	// panicked with "attempt to divide by zero", which no `Result` could report.
+	// A zero interval returns a typed error. It previously panicked with
+	// "attempt to divide by zero", which no `Result` could report.
 	let bound = bind(&bucket(1500, 0), &catalog, &config)
 		.await
 		.expect("bind zero interval");
-	let error = Executor::new(storage)
+	let error = Executor::new(storage.clone())
 		.execute_bound(&bound, None)
 		.await
 		.expect_err("a zero interval must be refused, not divided by");
 	assert!(
 		error.to_string().contains("positive interval"),
 		"expected a typed nonpositive-interval refusal, got: {error}"
+	);
+
+	// Near `i64::MIN` the mathematical bucket start is below the representable
+	// range for every allowed interval: a 1m bucket of i64::MIN would be
+	// -9_223_372_036_854_780_000. Unchecked this panicked in debug and wrapped to
+	// a positive timestamp in release.
+	let bound = bind(&bucket(i64::MIN, 60), &catalog, &config)
+		.await
+		.expect("bind extreme timestamp");
+	let error = Executor::new(storage.clone())
+		.execute_bound(&bound, None)
+		.await
+		.expect_err("an unrepresentable bucket start must be refused");
+	assert!(
+		error.to_string().contains("not representable"),
+		"expected a typed representability refusal, got: {error}"
+	);
+}
+
+#[tokio::test]
+async fn time_bucket_refuses_named_logical_types() {
+	// A named logical type over Int64 carries units that are not Unix
+	// milliseconds. Checking only the physical type accepted, say, a customer id
+	// as a timestamp. FLOOR refuses these for the same reason.
+	let mut config = PlannerConfig::default();
+	config.allow_experimental_kernels = true;
+	let (catalog, _storage) = fixture();
+
+	let plan = LogicalPlan::Project {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		exprs: vec![Expr::TimeBucket(
+			std::time::Duration::from_secs(60),
+			Box::new(Expr::LogicalAscription {
+				expr: Box::new(Expr::column("id")),
+				logical_type: CUSTOMER_ID_LOGICAL_TYPE,
+			}),
+		)],
+		output_names: vec![None],
+	};
+	let error = bind(&plan, &catalog, &config)
+		.await
+		.expect_err("a named logical type must not bind as milliseconds");
+	assert!(
+		matches!(error, BindingError::TypeMismatch { .. }),
+		"expected a typed mismatch, got: {error}"
 	);
 }
 

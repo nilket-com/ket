@@ -321,18 +321,7 @@ impl Executor {
 			}
 			Expr::TimeBucket(interval, inner) => {
 				let arr = self.evaluate_expr(inner, batch)?;
-				if let Some(int_arr) = arr.as_any().downcast_ref::<Int64Array>() {
-					let interval_ms = interval.as_millis() as i64;
-					let bucketed: Vec<Option<i64>> = int_arr
-						.iter()
-						.map(|v| v.map(|v| (v / interval_ms) * interval_ms))
-						.collect();
-					Ok(Arc::new(Int64Array::from(bucketed)) as ArrayRef)
-				} else {
-					Err(ExecutionError::InvalidExpression {
-						message: "TimeBucket expects Int64 (ms) input".to_string(),
-					})
-				}
+				evaluate_time_bucket(*interval, &arr)
 			}
 			Expr::AtTimeZone(inner, zone) => {
 				let arr = self.evaluate_expr(inner, batch)?;
@@ -943,8 +932,27 @@ fn evaluate_time_bucket(
 			// toward zero, which put every pre-epoch timestamp one bucket late:
 			// with a 1s bucket, -1500 returned -1000 instead of -2000, and -1
 			// shared the epoch bucket with +1.
-			.map(|value| value.map(|value| value.div_euclid(interval_ms) * interval_ms))
-			.collect();
+			//
+			// The product is checked because near `i64::MIN` the mathematical
+			// bucket start falls below the representable range for every allowed
+			// interval — a `1m` bucket of `i64::MIN` is -9_223_372_036_854_780_000.
+			// Unchecked, that panics in debug and wraps to a positive timestamp in
+			// release, which is the worse failure.
+			.map(|value| {
+				value
+					.map(|value| {
+						value
+							.div_euclid(interval_ms)
+							.checked_mul(interval_ms)
+							.ok_or_else(|| ExecutionError::InvalidExpression {
+								message: format!(
+									"TIME_BUCKET bucket start for {value} at {interval_ms}ms is not representable in i64"
+								),
+							})
+					})
+					.transpose()
+			})
+			.collect::<Result<Vec<_>, _>>()?;
 		Ok(Arc::new(Int64Array::from(bucketed)) as ArrayRef)
 	} else {
 		Err(ExecutionError::InvalidExpression {
@@ -2402,6 +2410,57 @@ fn as_boolean<'a>(
 
 #[cfg(test)]
 mod tests {
+	use arrow::datatypes::{Field, Schema};
+
+	#[test]
+	fn unbound_time_bucket_matches_the_bound_evaluator() {
+		// `evaluate_expr` is `#[cfg(test)]`, so this arm never ran in production —
+		// but it carried its own copy of the bucket arithmetic, which truncated
+		// toward zero and divided by zero on a zero interval. A test-only
+		// evaluator that disagrees with the shipped one lets a test pass against
+		// semantics the engine does not have. Both now route through
+		// `evaluate_time_bucket`.
+		let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Int64, true)]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(Int64Array::from(vec![
+				Some(-1_i64),
+				Some(-1001),
+				None,
+			]))],
+		)
+		.expect("probe batch");
+		let executor = Executor::new(Arc::new(crate::storage::InMemoryTableStorage::new()));
+
+		let bucketed = executor
+			.evaluate_expr(
+				&Expr::TimeBucket(
+					std::time::Duration::from_secs(1),
+					Box::new(Expr::column("ts")),
+				),
+				&batch,
+			)
+			.expect("unbound time bucket");
+		let values = bucketed
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 output");
+		assert_eq!(values.value(0), -1000, "must floor -1, not truncate to 0");
+		assert_eq!(values.value(1), -2000, "must floor -1001");
+		assert!(values.is_null(2), "null must pass through");
+
+		let zero = executor.evaluate_expr(
+			&Expr::TimeBucket(
+				std::time::Duration::from_secs(0),
+				Box::new(Expr::column("ts")),
+			),
+			&batch,
+		);
+		assert!(
+			zero.is_err(),
+			"a zero interval must be refused, not divided by"
+		);
+	}
 	use super::*;
 	#[test]
 	fn decimal_division_output_type_validates() {

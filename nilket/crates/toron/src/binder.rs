@@ -5029,6 +5029,17 @@ fn bind_expr_into_program(
 				});
 			}
 			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
+			// A named logical type over Int64 carries units that are not Unix
+			// milliseconds; bucketing one would silently reinterpret it. FLOOR
+			// refuses these for the same reason.
+			if !builder
+				.node_logical_type(inner)
+				.is_some_and(LogicalTypeId::is_naked)
+			{
+				return Err(BindingError::TypeMismatch {
+					message: "TimeBucket does not accept named logical types".to_string(),
+				});
+			}
 			if builder.node_type(inner) != Some(&DataType::Int64) {
 				return Err(BindingError::TypeMismatch {
 					message: "TimeBucket expects Int64 (ms) input".to_string(),
