@@ -2760,17 +2760,138 @@ async fn time_bucket_floors_pre_epoch_timestamps_and_refuses_nonpositive_interva
 	// range for every allowed interval: a 1m bucket of i64::MIN would be
 	// -9_223_372_036_854_780_000. Unchecked this panicked in debug and wrapped to
 	// a positive timestamp in release.
-	let bound = bind(&bucket(i64::MIN, 60), &catalog, &config)
-		.await
-		.expect("bind extreme timestamp");
-	let error = Executor::new(storage.clone())
-		.execute_bound(&bound, None)
-		.await
-		.expect_err("an unrepresentable bucket start must be refused");
-	assert!(
-		error.to_string().contains("not representable"),
-		"expected a typed representability refusal, got: {error}"
+	for (label, secs) in [("1m", 60_u64), ("1h", 3_600), ("1d", 86_400)] {
+		let bound = bind(&bucket(i64::MIN, secs), &catalog, &config)
+			.await
+			.expect("bind extreme timestamp");
+		let error = Executor::new(storage.clone())
+			.execute_bound(&bound, None)
+			.await
+			.expect_err("an unrepresentable bucket start must be refused");
+		assert!(
+			error.to_string().contains("not representable"),
+			"{label} at i64::MIN must refuse as unrepresentable, got: {error}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn time_bucket_executes_ungated_from_sql_and_rune() {
+	// Acceptance 1 is about execution under the DEFAULT config from both
+	// frontends. Binding raw IR proves neither: it skips lowering entirely, so a
+	// frontend could still refuse or mis-lower and this would pass.
+	let sql = run_logical(&plan_sql(
+		"SELECT TIME_BUCKET(k, '1m') FROM left_dups ORDER BY 1",
+	))
+	.await;
+	assert_eq!(
+		scalar_int64_column_rows(&sql, 0),
+		vec![Some(0), Some(0), Some(0), Some(0), Some(0)],
+		"SQL must execute TIME_BUCKET without the experimental flag"
 	);
+
+	let rune = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("left_dups")
+               .project([time_bucket("1m", col("k"))])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	// Row count alone would pass on a mis-lowering: `col("k")` returns the same
+	// five rows. Every fixture value is under a minute from the epoch, so a
+	// correctly lowered bucket is five zeros — and the SQL arm above is the
+	// reference, which makes this a frontend-parity assertion rather than a
+	// restatement of the expected constant.
+	assert_eq!(
+		scalar_int64_column_rows(&rune, 0),
+		scalar_int64_column_rows(&sql, 0),
+		"Rune must produce the same buckets as SQL, not merely the same row count"
+	);
+	assert_eq!(
+		scalar_int64_column_rows(&rune, 0),
+		vec![Some(0); 5],
+		"every fixture timestamp belongs to the epoch bucket"
+	);
+}
+
+#[tokio::test]
+async fn time_bucket_refuses_timestamp_and_float_inputs() {
+	// Acceptance 2 names these two explicitly; neither was controlled, so the
+	// "Int64 only" claim rested on the absence of a test rather than a refusal.
+	let (catalog, _storage) = fixture();
+	let config = PlannerConfig::default();
+
+	let over = |expr: Expr| LogicalPlan::Project {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: TableRef::new("sales"),
+			projection: None,
+		}),
+		exprs: vec![Expr::TimeBucket(
+			std::time::Duration::from_secs(60),
+			Box::new(expr),
+		)],
+		output_names: vec![None],
+	};
+
+	for (label, inner) in [
+		(
+			"Timestamp",
+			Expr::Literal(ScalarValue::Timestamp {
+				value: Some(1_600_000_000_000),
+				unit: arrow::datatypes::TimeUnit::Millisecond,
+			}),
+		),
+		("Float64", Expr::column("price")),
+	] {
+		let error = bind(&over(inner), &catalog, &config)
+			.await
+			.err()
+			.unwrap_or_else(|| panic!("{label} input must refuse, but it bound"));
+		assert!(
+			matches!(error, BindingError::TypeMismatch { .. }),
+			"{label} must refuse with a typed mismatch, got: {error}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn rune_refuses_unsupported_time_bucket_intervals_at_lowering() {
+	// Parity is only asserted if Rune is actually invoked. The allowlist control
+	// exercises the shared parser and SQL; this exercises the frontend that used
+	// to coerce an unknown interval to a zero duration and divide by zero.
+	let config = RuneSandboxConfig::v1_default();
+	let engine = RuneEngine::with_config(config).expect("Rune engine");
+	let script = |interval: &str| {
+		format!(
+			r#"pub fn main(ctx) {{ ctx.table("left_dups").project([time_bucket("{interval}", col("k"))]) }}"#
+		)
+	};
+
+	for accepted in ["1m", "1h", "1d"] {
+		engine
+			.execute_script(&script(accepted), &config)
+			.await
+			.unwrap_or_else(|error| panic!("Rune must accept {accepted}: {error}"));
+	}
+
+	for rejected in ["5m", "1s", "", "1 m", "1D", "1w"] {
+		let error = engine
+			.execute_script(&script(rejected), &config)
+			.await
+			.err()
+			.unwrap_or_else(|| panic!("Rune must refuse interval {rejected:?}"));
+		assert!(
+			error
+				.to_string()
+				.contains("unsupported time_bucket interval"),
+			"Rune must name the unsupported interval {rejected:?}, got: {error}"
+		);
+	}
 }
 
 #[tokio::test]

@@ -1,6 +1,6 @@
 # ADR 549 - `TIME_BUCKET` graduation
 
-**Status:** Proposed 2026-08-12.
+**Status:** Accepted and implemented 2026-08-12.
 
 ## Context
 

@@ -18,7 +18,6 @@ pub(crate) enum PushdownDeclineReason {
 	ColumnNotInPbcEligibleCascade { ordinal: ColumnOrdinal },
 	NullLiteralUnrepresentable,
 	NondeterministicExpression,
-	ExperimentalKernelInPredicate,
 	DescriptorMismatchAtPlanning,
 	InternalCompilerError(String),
 }
@@ -162,7 +161,9 @@ impl PbcCompiler {
 					));
 				}
 				BoundExprNode::TimeBucket { .. } => {
-					return Err(PushdownDeclineReason::ExperimentalKernelInPredicate);
+					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
+						"TIME_BUCKET is not PBC-eligible".to_string(),
+					));
 				}
 				BoundExprNode::AtTimeZone { .. }
 				| BoundExprNode::Extract { .. }
@@ -572,7 +573,9 @@ mod tests {
 					let ts = column(builder, "ts", 4, DataType::Int64, true);
 					builder.append_time_bucket(Duration::from_secs(60), ts, DataType::Int64)
 				}),
-				PushdownDeclineReason::ExperimentalKernelInPredicate,
+				PushdownDeclineReason::ExpressionShapeUnsupported(
+					"TIME_BUCKET is not PBC-eligible".to_string(),
+				),
 			),
 		];
 

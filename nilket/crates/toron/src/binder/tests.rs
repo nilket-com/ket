@@ -428,6 +428,47 @@ async fn binder_rejects_unknown_columns() {
 
 #[tokio::test]
 async fn binder_gates_experimental_kernels_by_default() {
+	// ADR 549 graduated `TIME_BUCKET`, leaving `LinearRegress` as the gate's sole
+	// member. Naming a graduated kernel here would have made this a test that the
+	// gate refuses nothing.
+	let catalog = catalog();
+	let gated = LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::Scan {
+			table: TableId(1),
+			projection: None,
+		}),
+		group_expr: vec![],
+		aggr_expr: vec![(
+			AggregateFunction::LinearRegress,
+			vec![Expr::column("ts"), Expr::column("ts")],
+		)],
+	};
+
+	let err = bind(&gated, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("experimental kernel should fail by default");
+	assert!(matches!(
+		err,
+		BindingError::ExperimentalKernel {
+			kernel: "LinearRegress"
+		}
+	));
+
+	bind(
+		&gated,
+		&catalog,
+		&PlannerConfig {
+			allow_experimental_kernels: true,
+			..PlannerConfig::default()
+		},
+	)
+	.await
+	.expect("experimental kernel enabled");
+}
+
+#[tokio::test]
+async fn binder_binds_time_bucket_without_the_experimental_flag() {
+	// The graduation itself: `TIME_BUCKET` binds under the default configuration.
 	let catalog = catalog();
 	let plan = LogicalPlan::Project {
 		input: Box::new(LogicalPlan::Scan {
@@ -441,26 +482,9 @@ async fn binder_gates_experimental_kernels_by_default() {
 		)],
 	};
 
-	let err = bind(&plan, &catalog, &PlannerConfig::default())
+	let plan = bind(&plan, &catalog, &PlannerConfig::default())
 		.await
-		.expect_err("experimental kernel should fail by default");
-	assert!(matches!(
-		err,
-		BindingError::ExperimentalKernel {
-			kernel: "TimeBucket"
-		}
-	));
-
-	let plan = bind(
-		&plan,
-		&catalog,
-		&PlannerConfig {
-			allow_experimental_kernels: true,
-			..PlannerConfig::default()
-		},
-	)
-	.await
-	.expect("experimental kernel enabled");
+		.expect("TIME_BUCKET must bind without the experimental flag");
 	assert!(matches!(plan, ExecutionPlan::Project { .. }));
 }
 

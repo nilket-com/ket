@@ -370,11 +370,14 @@ mod tests {
 
 	#[test]
 	fn binding_error_experimental_kernel_is_constructible() {
+		// `LinearRegress` is the gate's sole remaining member after ADR 549
+		// graduated `TIME_BUCKET`; naming a graduated kernel here would document a
+		// refusal that no longer happens.
 		let err = BindingError::ExperimentalKernel {
-			kernel: "TimeBucket",
+			kernel: "LinearRegress",
 		};
 
-		assert!(err.to_string().contains("TimeBucket"));
+		assert!(err.to_string().contains("LinearRegress"));
 	}
 
 	#[test]

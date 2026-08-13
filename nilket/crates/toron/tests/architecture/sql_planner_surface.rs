@@ -19,16 +19,24 @@ pub(crate) async fn experimental_kernels_are_gated() {
 			projection: None,
 		}),
 		output_names: vec![None],
-		exprs: vec![Expr::TimeBucket(
-			std::time::Duration::from_secs(60),
-			Box::new(Expr::column("ts")),
+		exprs: vec![Expr::column("ts")],
+	};
+
+	// ADR 549 graduated `TIME_BUCKET`; `LinearRegress` is the gate's sole member.
+	let gated = LogicalPlan::Aggregate {
+		input: Box::new(logical.clone()),
+		group_expr: vec![],
+		aggr_expr: vec![(
+			toron::ir::AggregateFunction::LinearRegress,
+			vec![Expr::column("ts"), Expr::column("ts")],
 		)],
 	};
 
-	let err = bind(&logical, &catalog, &PlannerConfig::default())
+	let err = bind(&gated, &catalog, &PlannerConfig::default())
 		.await
 		.expect_err("default planner must reject experimental kernels");
 	assert!(matches!(err, BindingError::ExperimentalKernel { .. }));
+	// Graduated side: `binder::tests::binder_binds_time_bucket_without_the_experimental_flag`.
 }
 
 #[test]

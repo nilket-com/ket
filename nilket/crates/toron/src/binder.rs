@@ -5023,11 +5023,6 @@ fn bind_expr_into_program(
 		}
 		Expr::Floor(inner) => bind_floor(builder, input_schema, ctx, inner),
 		Expr::TimeBucket(interval, inner) => {
-			if !ctx.config.allow_experimental_kernels {
-				return Err(BindingError::ExperimentalKernel {
-					kernel: "TimeBucket",
-				});
-			}
 			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 			// A named logical type over Int64 carries units that are not Unix
 			// milliseconds; bucketing one would silently reinterpret it. FLOOR
