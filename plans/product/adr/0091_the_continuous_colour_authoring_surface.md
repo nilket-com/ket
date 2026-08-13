@@ -11,7 +11,7 @@ It closes ledger item **CI-02** for continuous colour and **splits status out**
 as a residue, for the reason in §10.
 
 **It depends on the heatmap and bubble surfaces** (`plot-catalog-restoration.md`
-steps 6–9), which must land sequential-only first. Without them every word here
+steps 6–9, **all landed 2026-08-12/13**), which had to ship sequential-only first. Without them every word here
 would be observationally inert — the exact defect §10 uses to refuse a status
 word. An earlier draft of this record proposed the words with no consumer, one
 section away from making that argument.
@@ -151,10 +151,13 @@ unreachable rather than merely rejected.
 `diverging_at(v)` inherits 0089 §6's authored-anchor rules and §7's degenerate
 rule unchanged. This record supplies the origin; it does not restate the policy.
 
-### 6. The anchor's provenance is carried, span and all
+### 6. The anchor's provenance is carried, as a modifier span
 
-PRODUCT-0089 §3 deliberately left this path unbuilt, and it is this record's real
-cost rather than a risk to note. The complete path:
+**Reconciled 2026-08-13**, after PRODUCT-0092, 0093, 0094, and 0095 landed. Two
+of those records changed what this section can assume, and two tempting reuses
+are wrong — see the rejections.
+
+The intent path:
 
 - `AuthoredPlotSpec` already has `color_job`; the automatic path discards it
   (`spec/mod.rs:1540`). For heatmap and bubble it stops discarding.
@@ -162,14 +165,40 @@ cost rather than a risk to note. The complete path:
 - `ResolvedPlotSpec` carries both onward as `ContinuousScaleIntent`.
 - Continuous intent travels through the sink that retains mark origin
   (`rune_relation_envelope.rs:276`); the record states what the other sink
-  (`:121`) does with a figure that carries intent, rather than leaving it to
-  whoever hits it first.
+  (`:121`) does with a figure that carries intent.
 
-**The `diverging_at(...)` span is retained to planning.** PRODUCT-0089 §6's
-anchor refusals are **domain-dependent** — out-of-domain, boundary, zero-width —
-so they surface at planning, long after authoring. Without span retention the
-diagnostic points at the whole mark or the whole figure, when the author's error
-is one number in one modifier.
+**Continuous intent does not travel in `MarkFields` or `SpannedMarkFields`.**
+PRODUCT-0094's transport represents *field identity* and *field provenance*. A
+colour job is neither — it is a property of how a mark's values are mapped, not
+of which columns it reads. Putting intent there would make the transport carry
+two unrelated concerns and would give `MarkFields` equality a semantic it was not
+designed for. Intent stays on the authored-spec → resolved-spec path; modifier
+provenance is carried separately, below.
+
+**`diverging_at(...)` attributes to its own modifier span, not to a field.**
+PRODUCT-0089 §6's anchor refusals are **domain-dependent** — out-of-domain,
+boundary, zero-width — so they surface at planning, long after authoring. The
+author's error is one number in one modifier, and the diagnostic must point
+there.
+
+It must **not** use `FieldAttribution::Role("anchor")`. That variant's formatter
+emits ``plot {role} field `{field}` could not resolve`` (`spec/mod.rs:1509-1513`),
+so an anchor refusal would read *"plot anchor field `500` could not resolve"* —
+false twice, since `diverging_at(500.0)` supplies a modifier **value**, not a
+schema-bound field, and `ChannelError.field` would hold a number.
+
+**What the four landed records changed, precisely.** An earlier reconciliation
+note claimed span retention was "now established practice." That is half true and
+the distinction matters:
+
+| capability | status |
+|---|---|
+| a modifier knowing its own span | **exists** — `raw_mark_modifier` takes `raw_origin(values)` (`rune_presentation.rs:2020`) |
+| a **field** span surviving to planning | **proven** — PRODUCT-0092 and PRODUCT-0095 |
+| a **modifier** span surviving to planning | **new** — every existing modifier failure is authoring-time: arity, missing receiver |
+
+So this is smaller than the original draft assumed but not free. Both halves
+exist; nothing has yet joined them.
 
 PRODUCT-0090 §2 declined spans because bubble was producerless and automatic
 resolution keeps only field names. That reasoning does not transfer: an authored
@@ -308,8 +337,12 @@ residue created with its first-consumer trigger.
 15. **An authored-anchor refusal names the modifier, not the mark.**
     `diverging_at(500.0)` on a `-50…100` domain returns 0089 §6's refusal through
     planning with a span covering **`diverging_at(500.0)`**, and no render occurs.
-    The span assertion is the point: a diagnostic naming the whole mark passes a
-    refusal-only gate and still fails the author.
+    The observable contract is unchanged from this record's first draft; only its
+    mechanism is. Two halves are asserted separately because they are separately
+    absent today: that the span reaching planning is the **modifier's**, and that
+    the diagnostic is **not** a `ChannelError` — a refusal routed through
+    `FieldAttribution::Role` would satisfy "names the anchor" while reading
+    "anchor field `500`".
 16. **Zero-width domains discriminate provenance.** `diverging_at(0.0)` on a
     constant heatmap refuses per 0089 §7; `diverging()` on the same data renders.
 17. **Invalid intents are unspellable.** No combination of words produces
@@ -343,9 +376,12 @@ residue created with its first-consumer trigger.
 > cascade already exists; a new tier makes this a cascade record.
 
 > If the `diverging_at` span cannot reach planning, stop and record the carrier
-> gap rather than degrading the diagnostic to mark or figure scope. §6 exists
-> because a domain-dependent refusal is the one case where the author cannot see
-> the fault from the source alone.
+> gap rather than degrading the diagnostic to mark or figure scope — and rather
+> than reaching for `FieldAttribution::Role`, which would produce a well-formed
+> message naming a field that does not exist. §6 exists because a
+> domain-dependent refusal is the one case where the author cannot see the fault
+> from the source alone. This is the record's one genuinely new mechanism: both
+> halves exist, and nothing has joined them.
 
 > If any gate here needs a status fixture to be meaningful, stop — §10 is wrong
 > and status has a consumer nobody surveyed.
@@ -368,6 +404,22 @@ give CI-03 a public contract to preserve.
 concept with a smaller surface. Rejected because it invites the name to carry the
 job in practice: authors write `palette("blue_white_red", diverging)` and then
 omit the second argument, which must then be inferred from the first.
+
+**Attribute anchor refusals with `FieldAttribution::Role("anchor")`.**
+Attractive because PRODUCT-0095 added exactly that variant one record ago, and an
+anchor refusal plainly needs role-shaped attribution. Rejected because the
+formatter says ``plot {role} field `{field}` could not resolve``
+(`spec/mod.rs:1509-1513`) and `diverging_at(500.0)` supplies a value, not a
+field — the message would name a field that does not exist and print a number in
+its place. `Role` is for schema-bound roles; a modifier needs its own span.
+
+**Carry colour job and anchor intent in `MarkFields` / `SpannedMarkFields`.**
+Attractive because PRODUCT-0094 built a carrier that already reaches every
+consumer this record touches. Rejected because that transport models field
+identity and field provenance; a colour job is a property of value mapping, not
+of which columns are read. It would also pull intent into `MarkFields`' derived
+equality, changing figure identity — the hazard 0094 §6 spent its whole design
+avoiding.
 
 **Infer the job from the ramp token.** Attractive because most diverging ramps are
 recognizably diverging. Rejected because the shipped default disproves it —
