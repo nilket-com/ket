@@ -100,11 +100,12 @@ ADR 0089, and CI-02 moved out to a fifth:
   `unwrap_or(0.0)` (`bubble.rs:263-266`), so **a null observation renders as a real
   low-end value**. Unplanned; surfaced by 0089's §8 signature change, which
   breaks bubble's `gradient_section` call at `bubble.rs:101` and so forces
-  bubble's migration whether or not its preparation is ready.
+  bubble's migration whether or not its preparation is ready. — **ADR 0090,
+  landed**
 - **B4 — the continuous colour substrate.** One `ContinuousColorScale` owning
   domain, job, resolved ramp, and a provenance-bearing anchor; the colour job
   carried through the cascade; piecewise normalization about the anchor.
-  Migrates all three producers. — **ADR 0089, drafted**
+  Migrates all three producers. — **ADR 0089, landed**
 
 **CI-02 then follows B4** as the authoring surface. An earlier version of this
 plan had B3 close CI-02; 0089 is explicitly substrate-only — it adds no Rune
@@ -145,12 +146,13 @@ band-fill path.
    nothing downstream could claim honest guidance until it landed.
 3. **Heatmap substrate (B2) — LANDED as PRODUCT-0088.** Two-ended signed domain
    and duplicate-cell authority.
-4. **Bubble substrate (B3).** Null disposition and finite-value validation.
-   **Next.** Must precede B4: 0089 §8 breaks `bubble.rs:101`, so bubble migrates
+4. **Bubble substrate (B3) — LANDED as PRODUCT-0090.** Null disposition and
+   finite-value validation. It had to precede B4: 0089 §8 breaks
+   `bubble.rs:101`, so bubble migrates
    regardless, and a bubble that still fabricates `0.0` for nulls cannot uphold
    0089's non-finite invariant. Re-bank bubble after it, since this record may
    legitimately move null-bearing figures.
-5. **Continuous colour substrate (B4) — PRODUCT-0089, drafted.** Migrates
+5. **Continuous colour substrate (B4) — LANDED as PRODUCT-0089.** Migrates
    heatmap, bubble, and hexbin together. Touches **CI-03**, since a real
    continuous authority is what finally displaces the legacy ramp. Leaves
    **CI-02** open.

@@ -372,7 +372,7 @@ fn product_0088_heatmap_keeps_one_validated_sparse_cell_authority() {
 		1
 	);
 	assert!(production_heatmap.contains("let Some(value) = self.prepared_data.cells.value(i, j)"));
-	assert!(production_heatmap.contains("let (low, high) = self.prepared_data.cells.domain()"));
+	assert!(production_heatmap.contains("self.prepared_data.cells.domain()"));
 	for retired in [
 		"values[xi][yi]",
 		"vec![vec![0.0f64",
@@ -408,6 +408,62 @@ fn product_0088_heatmap_keeps_one_validated_sparse_cell_authority() {
 			.unwrap_or_else(|error| panic!("read {file}: {error}"));
 		assert!(!source.contains("HeatmapCells"));
 		assert!(!source.contains("PRODUCT-0088"));
+	}
+}
+
+#[test]
+fn product_0089_continuous_colour_has_one_scale_and_no_decomposed_guide_path() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/plot");
+	let scale = std::fs::read_to_string(root.join("continuous_color.rs"))
+		.expect("read continuous colour authority");
+	let theme = std::fs::read_to_string(root.join("theme.rs")).expect("read theme cascade");
+	let gradient =
+		std::fs::read_to_string(root.join("gradient_stops.rs")).expect("read gradient projection");
+	let legend = std::fs::read_to_string(root.join("legend.rs")).expect("read guide constructor");
+
+	assert!(scale.contains("pub struct ContinuousColorScale"));
+	assert!(scale.contains("pub fn normalize(&self, value: f64) -> f64"));
+	assert!(scale.contains("pub fn value_at_normalized(&self, t: f64) -> f64"));
+	assert!(scale.contains("value.is_finite()"));
+	assert!(!scale.contains("debug_assert!"));
+	assert!(theme.contains("settings.continuous_ramps = ContinuousRamps::from_theme(theme);"));
+	assert!(theme.contains("settings.color_theme = theme.sequential_ramp;"));
+	assert!(gradient.contains("pub(crate) fn projected(scale: &ContinuousColorScale)"));
+	assert!(legend.contains("scale: &ContinuousColorScale"));
+	for retired in [
+		"projected(\n\t\tlow:",
+		"gradient_section(\n\tlabel: String,\n\tlow:",
+	] {
+		assert!(!gradient.contains(retired) && !legend.contains(retired));
+	}
+
+	for kernel in ["heatmap.rs", "bubble.rs", "hexbin.rs"] {
+		let source = std::fs::read_to_string(root.join("kernels").join(kernel))
+			.unwrap_or_else(|error| panic!("read {kernel}: {error}"));
+		let production = source
+			.split("#[cfg(test)]")
+			.next()
+			.expect("production kernel region");
+		assert_eq!(
+			production.matches("ContinuousColorScale::new(").count(),
+			1,
+			"{kernel} must construct only in its helper"
+		);
+		assert_eq!(
+			production.matches("self.continuous_scale(").count(),
+			2,
+			"{kernel} paint and guide must use the same helper"
+		);
+		assert_eq!(
+			production
+				.matches("PRODUCT-0089 planning validated")
+				.count(),
+			1,
+			"{kernel} must expect only in its helper"
+		);
+		assert!(!production.contains("ColorJob::Diverging"));
+		assert!(!production.contains("ContinuousAnchor::Authored"));
+		assert!(!production.contains("ColorIdentity"));
 	}
 }
 

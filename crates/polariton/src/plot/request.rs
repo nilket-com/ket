@@ -150,7 +150,7 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		label,
 	} = spec.kernel_fields.as_ref()
 	{
-		crate::plot::kernels::bubble::prepare_bubble_data(
+		let prepared = crate::plot::kernels::bubble::prepare_bubble_data(
 			data,
 			x,
 			y,
@@ -159,11 +159,18 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 			label.as_deref(),
 		)
 		.map_err(|error| error.to_string())?;
+		validate_continuous_scale(prepared.observations.color_range(), prepared.color_intent)?;
 	}
 	if let crate::plot::spec::ResolvedKernelFields::Heatmap { x, y, value } =
 		spec.kernel_fields.as_ref()
 	{
-		prepare_heatmap_data(data, x, y, value).map_err(|error| error.to_string())?;
+		let prepared =
+			prepare_heatmap_data(data, x, y, value).map_err(|error| error.to_string())?;
+		validate_continuous_scale(prepared.cells.domain(), prepared.color_intent)?;
+	}
+	if let crate::plot::spec::ResolvedKernelFields::Hexbin { x, y } = spec.kernel_fields.as_ref() {
+		let prepared = crate::plot::kernels::hexbin::prepare_hexbin_data(data, x, y, 0.02);
+		validate_continuous_scale((0.0, f64::from(prepared.max_count)), prepared.color_intent)?;
 	}
 	if let crate::plot::spec::ResolvedKernelFields::Histogram {
 		bin_start,
@@ -198,6 +205,19 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		.map_err(|error| error.to_string())?;
 	}
 	Ok(())
+}
+
+fn validate_continuous_scale(
+	domain: (f64, f64),
+	intent: crate::plot::continuous_color::ContinuousScaleIntent,
+) -> Result<(), String> {
+	crate::plot::continuous_color::ContinuousColorScale::new(
+		domain,
+		intent,
+		crate::plot::continuous_color::ContinuousRamps::default(),
+	)
+	.map(|_| ())
+	.map_err(|error| error.to_string())
 }
 
 fn project_named_channels(
@@ -428,6 +448,90 @@ mod tests {
 			400,
 			300,
 		);
+	}
+
+	#[test]
+	fn product_0089_scale_refusals_stop_before_render_and_continuous_marks_keep_identity() {
+		use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
+		use crate::plot::spec::ColorJob;
+
+		for intent in [
+			ContinuousScaleIntent {
+				job: ColorJob::Categorical,
+				anchor: ContinuousAnchor::None,
+			},
+			ContinuousScaleIntent {
+				job: ColorJob::Sequential,
+				anchor: ContinuousAnchor::DefaultZero,
+			},
+			ContinuousScaleIntent {
+				job: ColorJob::Diverging,
+				anchor: ContinuousAnchor::Authored(2.0),
+			},
+		] {
+			let mut rendered = false;
+			let result = validate_continuous_scale((0.0, 1.0), intent).map(|()| {
+				rendered = true;
+			});
+			assert!(result.is_err());
+			assert!(!rendered, "a refused scale cannot reach rendering");
+		}
+
+		let selection = CategoricalPaletteSelection::from_theme_name("viridis").unwrap();
+		let categorical = polars::df!(
+			"category" => ["a", "b"],
+			"value" => [1.0, 2.0],
+		)
+		.unwrap();
+		let (_, identity) = plan_with_categorical_palette(
+			PlotRequest {
+				source: materialized("categorical", categorical),
+				authored_spec: AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::Bar),
+					"category",
+					"value",
+				),
+			},
+			&selection,
+			&ColorIdentity::default(),
+		)
+		.unwrap();
+		assert!(!identity.persistence_snapshot().assignments.is_empty());
+
+		let fixtures = [
+			(
+				"heatmap",
+				polars::df!("x" => ["a", "b"], "y" => ["u", "v"], "value" => [1.0, 2.0])
+					.unwrap(),
+				PlotType::Heatmap,
+			),
+			(
+				"bubble",
+				polars::df!("x" => [1.0, 2.0], "y" => [2.0, 3.0], "size" => [4.0, 5.0], "color" => [6.0, 7.0])
+					.unwrap(),
+				PlotType::Bubble,
+			),
+			(
+				"hexbin",
+				polars::df!("x" => [1.0, 2.0], "y" => [2.0, 3.0]).unwrap(),
+				PlotType::Hexbin,
+			),
+		];
+		for (name, frame, plot_type) in fixtures {
+			let (_, after) = plan_with_categorical_palette(
+				PlotRequest {
+					source: materialized(name, frame),
+					authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(plot_type)),
+				},
+				&selection,
+				&identity,
+			)
+			.unwrap_or_else(|error| panic!("{plot_type}: {error}"));
+			assert_eq!(
+				after, identity,
+				"{plot_type} allocated categorical identity"
+			);
+		}
 	}
 
 	#[test]

@@ -328,8 +328,9 @@ something.
 counts are non-negative by construction, so it takes a `Sequential` scale with
 `None`. It stays producerless and blocked on viewport-aware planning.
 
-**A bubble substrate record is a prerequisite of this one.** Bubble's preparation
-is infallible and fabricates values: an absent colour column becomes
+**PRODUCT-0090 is a prerequisite of this one, and has landed.** At this record's
+drafting boundary bubble's preparation was infallible and fabricated values: an
+absent colour column became
 `vec![0.0f64; height]` (`bubble.rs:213`), and each field is taken with
 `unwrap_or(0.0)` (`bubble.rs:263-266`, the colour field at `:266`) with no finite
 validation. Two defects follow
@@ -354,8 +355,8 @@ surfaces**, and 0089 migrates all three producers together.
 
 ## Implementation sequence
 
-**Prerequisite — the bubble substrate record**, per §9. 0089 does not begin until
-bubble's null disposition and finite-value validation are decided and landed.
+**Prerequisite — PRODUCT-0090**, per §9. Its null disposition and finite-value
+validation landed before this implementation began.
 
 **Stage 0 — bank.** The two neutral-at-25 states, and every current gradient
 section and mark colour for heatmap, bubble, and hexbin — re-banked after the
@@ -520,7 +521,7 @@ take `&ContinuousColorScale` per §8 and consume `value_at_normalized`.
 > fourth is a continuous producer this record did not survey. §8's guarantee is
 > structural, and one exception restores the decomposed path for everyone.
 
-> If the bubble substrate record has not landed, do not start. Its absence is not
+> If PRODUCT-0090 has not landed, do not start. Its absence is not
 > a scheduling matter: §8 breaks `bubble.rs:101`'s call site, so bubble must
 > migrate, and a bubble that still fabricates `0.0` for nulls (`bubble.rs:213`,
 > `:262`) cannot uphold §5. Attempting 0089 first forces the null disposition to
@@ -528,8 +529,8 @@ take `&ContinuousColorScale` per §8 and consume `value_at_normalized`.
 
 ## Supersession
 
-Supersedes no record. **Depends on the bubble substrate record**, which must land
-first. Discharges PRODUCT-0087 gate 17's and PRODUCT-0088 gate 18's banked
+Supersedes no record. **Depends on PRODUCT-0090**, which landed first. Discharges
+PRODUCT-0087 gate 17's and PRODUCT-0088 gate 18's banked
 positions. **Changes the signatures** of `GradientStops::projected`
 and `gradient_section` per §8, without changing `GradientStops`' own validation
 contract. Adopts PRODUCT-0088 §2's validation-then-reconstruction shape. Leaves
@@ -608,8 +609,8 @@ The record also costs an unplanned predecessor. Following §8's refusal of a
 decomposed compatibility path to its call sites found `bubble.rs:101`, and
 through it a preparation that renders null observations as real low-end values —
 a defect with nothing to do with continuous colour, found only because a
-signature change forced someone to look. The bubble substrate record it demands
-is now the arc's next work, ahead of 0089 itself.
+signature change forced someone to look. PRODUCT-0090 paid that prerequisite
+before this implementation began.
 
 CI-02 remains open and is now well-posed: the substrate exists, so authoring can
 decide spelling and spans without also deciding what a continuous scale *is*.

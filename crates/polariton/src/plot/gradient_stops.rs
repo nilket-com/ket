@@ -1,3 +1,4 @@
+use crate::plot::continuous_color::ContinuousColorScale;
 use iced::Color;
 
 /// Validated positioned colours for a continuous guide.
@@ -40,22 +41,18 @@ impl GradientStops {
 		Self::validate(stops, GradientSampling::Positioned)
 	}
 
-	pub(crate) fn projected(
-		low: f64,
-		high: f64,
-		canonical: Vec<(f32, Color)>,
-		reversed_sampling: bool,
-	) -> Result<Self, GradientStopsError> {
+	pub(crate) fn projected(scale: &ContinuousColorScale) -> Result<Self, GradientStopsError> {
+		let canonical = scale.ramp().canonical_stops();
 		let positions: Vec<f32> = canonical.iter().map(|(position, _)| *position).collect();
 		let stops = canonical
 			.into_iter()
-			.map(|(position, color)| (low + f64::from(position) * (high - low), color))
+			.map(|(position, color)| (scale.value_at_normalized(f64::from(position)), color))
 			.collect();
 		let mut projected = Self::new(stops)?;
 		for (stop, position) in projected.stops.iter_mut().zip(positions) {
 			stop.position = position;
 		}
-		projected.sampling = if reversed_sampling {
+		projected.sampling = if scale.ramp().uses_reversed_sampling() {
 			GradientSampling::EvenReversed
 		} else {
 			GradientSampling::Even

@@ -1,6 +1,7 @@
 use crate::plot::common::{
 	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
+use crate::plot::continuous_color::{ContinuousColorScale, ContinuousScaleIntent};
 use crate::plot::kernels::heatmap_cells::{HeatmapCellRow, HeatmapCells, HeatmapCellsError};
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -10,6 +11,17 @@ use std::sync::Arc;
 
 pub struct HeatmapPlotKernel {
 	pub prepared_data: Arc<HeatmapPreparedData>,
+}
+
+impl HeatmapPlotKernel {
+	fn continuous_scale(&self, settings: &ResolvedPlotSettings) -> ContinuousColorScale {
+		ContinuousColorScale::new(
+			self.prepared_data.cells.domain(),
+			self.prepared_data.color_intent,
+			settings.continuous_ramps,
+		)
+		.expect("PRODUCT-0089 planning validated this heatmap continuous colour scale")
+	}
 }
 
 impl PlotKernel for HeatmapPlotKernel {
@@ -30,19 +42,13 @@ impl PlotKernel for HeatmapPlotKernel {
 	) {
 		let num_x = self.prepared_data.cells.x_categories().len();
 		let num_y = self.prepared_data.cells.y_categories().len();
-		let (low, high) = self.prepared_data.cells.domain();
-		let delta = high - low;
+		let scale = self.continuous_scale(&settings);
 		for i in 0..num_x {
 			for j in 0..num_y {
 				let Some(value) = self.prepared_data.cells.value(i, j) else {
 					continue;
 				};
-				let t = if delta > 0.0 {
-					((value - low) / delta) as f32
-				} else {
-					0.0
-				};
-				let color = settings.color_theme.get_color(t);
+				let color = scale.color(value);
 				let (center, bw, bh) = transform.categorical_2d(i, j);
 				let rect_x = center.x - bw / 2.0;
 				let rect_y = center.y - bh / 2.0;
@@ -96,11 +102,10 @@ impl PlotKernel for HeatmapPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		let (low, high) = self.prepared_data.cells.domain();
-		crate::plot::legend::gradient_section("Value".to_owned(), low, high, settings.color_theme)
-			.map(|section| {
-				crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(section))
-			})
+		let scale = self.continuous_scale(settings);
+		crate::plot::legend::gradient_section("Value".to_owned(), &scale).map(|section| {
+			crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(section))
+		})
 	}
 
 	fn x_label(&self) -> String {
@@ -115,6 +120,7 @@ impl PlotKernel for HeatmapPlotKernel {
 #[derive(Debug)]
 pub struct HeatmapPreparedData {
 	pub cells: HeatmapCells,
+	pub color_intent: ContinuousScaleIntent,
 	pub x_label: String,
 	pub y_label: String,
 }
@@ -149,6 +155,7 @@ pub(crate) fn prepare_heatmap_data(
 	}
 	Ok(HeatmapPreparedData {
 		cells: HeatmapCells::from_rows(rows)?,
+		color_intent: ContinuousScaleIntent::SEQUENTIAL,
 		x_label: x_col.to_owned(),
 		y_label: y_col.to_owned(),
 	})
@@ -424,27 +431,56 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0088_asymmetric_diverging_neutral_remains_at_twenty_five_for_product_0089() {
+	fn product_0089_heatmap_diverging_neutral_moves_from_twenty_five_to_zero() {
 		let frame = polars::df!(
 			"x" => ["a", "b", "c"],
 			"y" => ["u", "u", "u"],
-			"value" => [-50.0, 25.0, 100.0],
+			"value" => [-50.0, 0.0, 100.0],
 		)
 		.unwrap();
-		let kernel = kernel(&frame).unwrap();
-		let settings = ResolvedPlotSettings {
-			color_theme: ColorTheme::GreenPurples,
-			..ResolvedPlotSettings::default()
+		let mut kernel = kernel(&frame).unwrap();
+		Arc::get_mut(&mut kernel.prepared_data)
+			.expect("test owns the prepared heatmap")
+			.color_intent = ContinuousScaleIntent {
+			job: crate::plot::spec::ColorJob::Diverging,
+			anchor: crate::plot::continuous_color::ContinuousAnchor::DefaultZero,
 		};
+		let mut cascade = crate::plot::theme::PlotSettings::default();
+		cascade.application_theme.theme =
+			crate::plot::spec::Override::Set(crate::plot::theme::PlotThemeSpec {
+				sequential_ramp: ColorTheme::Magma,
+				diverging_ramp: ColorTheme::BlueWhiteRed,
+				..crate::plot::theme::PlotThemeSpec::default()
+			});
+		cascade.pane_override.theme =
+			crate::plot::spec::Override::Set(crate::plot::theme::PlotThemeSpec {
+				sequential_ramp: ColorTheme::Inferno,
+				diverging_ramp: ColorTheme::GreenPurples,
+				..crate::plot::theme::PlotThemeSpec::default()
+			});
+		let settings = cascade.resolve();
+		assert_eq!(settings.color_theme, ColorTheme::Inferno);
+		assert_eq!(
+			settings.continuous_ramps.diverging,
+			ColorTheme::GreenPurples
+		);
 		let backend = render(&kernel, settings.clone());
-		assert_eq!(backend.rectangles[1].2, settings.color_theme.get_color(0.5));
+		assert_eq!(
+			backend.rectangles[0].2,
+			ColorTheme::GreenPurples.get_color(0.0)
+		);
+		assert_eq!(backend.rectangles[1].2, Color::WHITE);
+		assert_eq!(
+			backend.rectangles[2].2,
+			ColorTheme::GreenPurples.get_color(1.0)
+		);
 		let guide = kernel
 			.legend_content(&settings)
 			.expect("non-degenerate guide");
 		let LegendSection::Gradient { stops, .. } = guide.0.first() else {
 			panic!("gradient section")
 		};
-		assert!(stops.values().any(|value| value == 25.0));
+		assert!(stops.values().any(|value| value == 0.0));
 		assert_eq!(stops.sample_normalized(0.5), backend.rectangles[1].2);
 	}
 }

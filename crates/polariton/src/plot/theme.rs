@@ -9,6 +9,7 @@
 use crate::plot::chrome::{PlotChrome, PlotChromeProjection, PlotMarkStyle, ResolvedPlotSkin};
 use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode, TickPlacement};
+use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::spec::{
 	BarWidth, CategoryGap, ColorJob, LayerSettings, LegendPosition, Override, PointSize, Presence,
 	ResolvedPresence, StrokeWidth,
@@ -334,6 +335,7 @@ impl PlotSettings {
 
 fn apply_layer(settings: &mut ResolvedPlotSettings, layer: &PlotSettingsLayer) {
 	if let Override::Set(theme) = layer.theme {
+		settings.continuous_ramps = ContinuousRamps::from_theme(theme);
 		settings.color_theme = theme.sequential_ramp;
 		let background = theme.chrome.background.iced();
 		let decoration = theme.chrome.label.iced();
@@ -537,6 +539,36 @@ mod tests {
 			..PlotThemeSpec::default()
 		});
 		assert_eq!(cascade.resolve().color_theme, ColorTheme::Magma);
+	}
+
+	#[test]
+	fn product_0089_continuous_ramps_follow_the_same_theme_tiers_atomically() {
+		let defaults = PlotThemeSpec::default();
+		let resolved = ResolvedPlotSettings::default();
+		assert_eq!(
+			resolved.continuous_ramps.sequential,
+			defaults.sequential_ramp
+		);
+		assert_eq!(resolved.continuous_ramps.diverging, defaults.diverging_ramp);
+
+		let mut cascade = PlotSettings::default();
+		cascade.application_theme.theme = Override::Set(PlotThemeSpec {
+			sequential_ramp: ColorTheme::Magma,
+			diverging_ramp: ColorTheme::BlueWhiteRed,
+			..defaults
+		});
+		cascade.pane_override.theme = Override::Set(PlotThemeSpec {
+			sequential_ramp: ColorTheme::Inferno,
+			diverging_ramp: ColorTheme::GreenPurples,
+			..defaults
+		});
+		let resolved = cascade.resolve();
+		assert_eq!(resolved.color_theme, ColorTheme::Inferno);
+		assert_eq!(resolved.continuous_ramps.sequential, ColorTheme::Inferno);
+		assert_eq!(
+			resolved.continuous_ramps.diverging,
+			ColorTheme::GreenPurples
+		);
 	}
 
 	#[test]

@@ -2,6 +2,7 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label, polars_type_to_axis_type,
 };
+use crate::plot::continuous_color::{ContinuousColorScale, ContinuousScaleIntent};
 use crate::plot::kernels::bubble_observations::{
 	BubbleFieldNames, BubbleObservationRow, BubbleObservations, BubbleObservationsError,
 };
@@ -16,9 +17,21 @@ pub struct BubblePlotKernel {
 	pub prepared_data: Arc<BubblePreparedData>,
 }
 
+impl BubblePlotKernel {
+	fn continuous_scale(&self, settings: &ResolvedPlotSettings) -> ContinuousColorScale {
+		ContinuousColorScale::new(
+			self.prepared_data.observations.color_range(),
+			self.prepared_data.color_intent,
+			settings.continuous_ramps,
+		)
+		.expect("PRODUCT-0089 planning validated this bubble continuous colour scale")
+	}
+}
+
 #[derive(Debug, PartialEq)]
 pub struct BubblePreparedData {
 	pub observations: BubbleObservations,
+	pub color_intent: ContinuousScaleIntent,
 	pub x_axis_type: AxisType,
 	pub y_axis_type: AxisType,
 	pub x_label: String,
@@ -117,16 +130,13 @@ impl PlotKernel for BubblePlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let color_min = self.prepared_data.observations.color_range().0;
-		let color_max = self.prepared_data.observations.color_range().1;
-		let color_delta = (color_max - color_min).max(f64::EPSILON);
+		let scale = self.continuous_scale(&settings);
 		let size_min = self.prepared_data.observations.size_range().0;
 		let size_max = self.prepared_data.observations.size_range().1;
 		let size_delta = (size_max - size_min).max(f64::EPSILON);
 		for point in self.prepared_data.observations.iter() {
 			let p = transform.cartesian(point.x(), point.y());
-			let t_color = ((point.color() - color_min) / color_delta) as f32;
-			let color = settings.color_theme.get_color(t_color);
+			let color = scale.color(point.color());
 			let t_size = ((point.size() - size_min) / size_delta) as f32;
 			let radius = 2.0 + t_size * 28.0;
 			backend.fill_path(
@@ -161,13 +171,10 @@ impl PlotKernel for BubblePlotKernel {
 			low: size_range.0,
 			high: size_range.1,
 		};
-		let color_range = self.prepared_data.observations.color_range();
-		let content = if let Some(gradient) = crate::plot::legend::gradient_section(
-			self.prepared_data.color_label.clone(),
-			color_range.0,
-			color_range.1,
-			settings.color_theme,
-		) {
+		let scale = self.continuous_scale(settings);
+		let content = if let Some(gradient) =
+			crate::plot::legend::gradient_section(self.prepared_data.color_label.clone(), &scale)
+		{
 			let mut content =
 				crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(gradient));
 			content.push(size);
@@ -315,6 +322,7 @@ pub fn prepare_bubble_data(
 	.map_err(BubblePreparationError::Observations)?;
 	Ok(BubblePreparedData {
 		observations,
+		color_intent: ContinuousScaleIntent::SEQUENTIAL,
 		x_axis_type,
 		y_axis_type,
 		x_label: x_col.to_string(),
@@ -741,6 +749,7 @@ mod tests {
 		BubblePlotKernel {
 			prepared_data: Arc::new(BubblePreparedData {
 				observations,
+				color_intent: ContinuousScaleIntent::SEQUENTIAL,
 				x_axis_type: AxisType::Linear,
 				y_axis_type: AxisType::Linear,
 				x_label: "x".to_owned(),
@@ -771,16 +780,31 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0087_bubble_asymmetric_diverging_neutral_remains_at_twenty_five() {
+	fn product_0089_bubble_diverging_neutral_moves_from_twenty_five_to_zero() {
 		let settings = ResolvedPlotSettings {
 			color_theme: ColorTheme::GreenPurples,
+			continuous_ramps: crate::plot::continuous_color::ContinuousRamps {
+				sequential: ColorTheme::Viridis,
+				diverging: ColorTheme::GreenPurples,
+			},
 			..ResolvedPlotSettings::default()
 		};
-		let content = kernel((-50.0, 100.0))
+		let mut kernel = kernel((-50.0, 100.0));
+		Arc::get_mut(&mut kernel.prepared_data)
+			.expect("test owns the prepared bubble")
+			.color_intent = ContinuousScaleIntent {
+			job: crate::plot::spec::ColorJob::Diverging,
+			anchor: crate::plot::continuous_color::ContinuousAnchor::DefaultZero,
+		};
+		let scale = kernel.continuous_scale(&settings);
+		assert_eq!(scale.color(-50.0), ColorTheme::GreenPurples.get_color(0.0));
+		assert_eq!(scale.color(0.0), Color::WHITE);
+		assert_eq!(scale.color(100.0), ColorTheme::GreenPurples.get_color(1.0));
+		let content = kernel
 			.legend_content(&settings)
 			.expect("gradient and size guides");
 		let stops = stops(content.0.first());
-		assert_eq!(stops.values().collect::<Vec<_>>(), [-50.0, 25.0, 100.0]);
+		assert_eq!(stops.values().collect::<Vec<_>>(), [-50.0, 0.0, 100.0]);
 		assert_eq!(stops.sample_normalized(0.5), Color::WHITE);
 		assert_eq!(settings.color_theme.get_color(0.5), Color::WHITE);
 	}

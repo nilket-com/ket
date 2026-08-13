@@ -1,8 +1,8 @@
 //! The closed legend-content model and its single renderer.
 
 use crate::coordinate::{Pt, Rect, Widget};
-use crate::plot::colors::ColorTheme;
 use crate::plot::common::{PlotBackend, ResolvedPlotSettings};
+use crate::plot::continuous_color::ContinuousColorScale;
 use crate::plot::gradient_stops::GradientStops;
 use crate::plot::spec::{NonEmpty, ResolvedPresence};
 use iced::widget::canvas::{Stroke, Style, Text};
@@ -65,24 +65,13 @@ impl LegendContent {
 /// producers and must not be hidden as an omission.
 pub(crate) fn gradient_section(
 	label: String,
-	low: f64,
-	high: f64,
-	theme: ColorTheme,
+	scale: &ContinuousColorScale,
 ) -> Option<LegendSection> {
-	if !low.is_finite() || !high.is_finite() || low == high {
+	if scale.is_degenerate() {
 		return None;
 	}
-	assert!(
-		low < high,
-		"PRODUCT-0087 requires a finite ascending gradient domain, got {low}..{high}"
-	);
-	let stops = GradientStops::projected(
-		low,
-		high,
-		theme.canonical_stops(),
-		theme.uses_reversed_sampling(),
-	)
-	.expect("PRODUCT-0087 canonical positions project to an ascending domain");
+	let stops = GradientStops::projected(scale)
+		.expect("PRODUCT-0087 canonical positions project to an ascending domain");
 	Some(LegendSection::Gradient { label, stops })
 }
 
@@ -681,8 +670,10 @@ pub fn render_legend(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::colors::ColorTheme;
 	use crate::plot::common::{PathBuilder, PlotBackend};
-	use crate::plot::spec::{LegendPosition, ResolvedPresence};
+	use crate::plot::continuous_color::{ContinuousAnchor, ContinuousRamps, ContinuousScaleIntent};
+	use crate::plot::spec::{ColorJob, LegendPosition, ResolvedPresence};
 	use iced::widget::canvas::{Stroke, Text};
 	use iced::{Point, Rectangle};
 
@@ -716,8 +707,16 @@ mod tests {
 	}
 
 	fn gradient(theme: ColorTheme) -> LegendSection {
-		gradient_section("Value".to_owned(), 10.0, 50.0, theme)
-			.expect("ascending non-degenerate gradient")
+		let scale = ContinuousColorScale::new(
+			(10.0, 50.0),
+			ContinuousScaleIntent::SEQUENTIAL,
+			ContinuousRamps {
+				sequential: theme,
+				diverging: ColorTheme::BlueWhiteRed,
+			},
+		)
+		.expect("ascending non-degenerate scale");
+		gradient_section("Value".to_owned(), &scale).expect("ascending non-degenerate gradient")
 	}
 
 	fn gradient_stops(section: &LegendSection) -> &GradientStops {
@@ -901,20 +900,33 @@ mod tests {
 
 	#[test]
 	fn product_0087_gradient_constructor_distinguishes_omission_from_invariant_failure() {
-		for (low, high) in [(0.0, 0.0), (f64::NAN, 1.0), (0.0, f64::INFINITY)] {
-			assert!(gradient_section("Value".to_owned(), low, high, ColorTheme::Viridis).is_none());
+		let degenerate = ContinuousColorScale::new(
+			(0.0, 0.0),
+			ContinuousScaleIntent::SEQUENTIAL,
+			ContinuousRamps::default(),
+		)
+		.unwrap();
+		assert!(gradient_section("Value".to_owned(), &degenerate).is_none());
+		let valid = ContinuousColorScale::new(
+			(0.0, 1.0),
+			ContinuousScaleIntent::SEQUENTIAL,
+			ContinuousRamps::default(),
+		)
+		.unwrap();
+		assert!(gradient_section("Value".to_owned(), &valid).is_some());
+		for domain in [(f64::NAN, 1.0), (0.0, f64::INFINITY), (1.0, 0.0)] {
+			assert!(
+				ContinuousColorScale::new(
+					domain,
+					ContinuousScaleIntent {
+						job: ColorJob::Diverging,
+						anchor: ContinuousAnchor::None,
+					},
+					ContinuousRamps::default(),
+				)
+				.is_err()
+			);
 		}
-		assert!(gradient_section("Value".to_owned(), 0.0, 1.0, ColorTheme::Viridis).is_some());
-		let panic = std::panic::catch_unwind(|| {
-			gradient_section("Value".to_owned(), 1.0, 0.0, ColorTheme::Viridis)
-		})
-		.expect_err("descending domains violate the producer invariant");
-		let message = panic
-			.downcast_ref::<String>()
-			.map(String::as_str)
-			.or_else(|| panic.downcast_ref::<&str>().copied())
-			.unwrap_or("non-string panic");
-		assert!(message.contains("PRODUCT-0087"), "{message}");
 	}
 
 	#[test]
@@ -1009,5 +1021,63 @@ mod tests {
 				}
 			}
 		}
+	}
+
+	#[test]
+	fn product_0089_anchored_guide_uses_the_inverse_and_matches_marks_on_both_paths() {
+		let scale = ContinuousColorScale::new(
+			(-50.0, 100.0),
+			ContinuousScaleIntent {
+				job: ColorJob::Diverging,
+				anchor: ContinuousAnchor::DefaultZero,
+			},
+			ContinuousRamps {
+				sequential: ColorTheme::Magma,
+				diverging: ColorTheme::Viridis,
+			},
+		)
+		.unwrap();
+		let section = gradient_section("Value".to_owned(), &scale).unwrap();
+		let stops = gradient_stops(&section);
+		assert_eq!(
+			stops.values().collect::<Vec<_>>(),
+			[-50.0, -25.0, 0.0, 50.0, 100.0]
+		);
+		let ordinary = LegendContent(NonEmpty::new(section.clone()));
+		let mut paired = ordinary.clone();
+		paired.push(LegendSection::SizeSample {
+			label: "Size".to_owned(),
+			low: 1.0,
+			high: 3.0,
+		});
+		let settings = ResolvedPlotSettings::default();
+		let mut paths = Vec::new();
+		for content in [&ordinary, &paired] {
+			let mut backend = RectangleBackend::default();
+			let origin = Rect::<Widget>::from_iced_frame(Rectangle::new(
+				Point::ORIGIN,
+				Size::new(400.0, 300.0),
+			))
+			.origin();
+			render_legend(&mut backend, origin, content, &settings);
+			let colors = backend.rectangles[1..51]
+				.iter()
+				.map(|(_, _, color)| *color)
+				.collect::<Vec<_>>();
+			for (index, actual) in colors.iter().enumerate() {
+				let t = index as f64 / 49.0;
+				let expected = scale.color(scale.value_at_normalized(t));
+				for (actual, expected) in [
+					(actual.r, expected.r),
+					(actual.g, expected.g),
+					(actual.b, expected.b),
+					(actual.a, expected.a),
+				] {
+					assert!(ulp_distance(actual, expected) <= 4);
+				}
+			}
+			paths.push(colors);
+		}
+		assert_eq!(paths[0], paths[1]);
 	}
 }

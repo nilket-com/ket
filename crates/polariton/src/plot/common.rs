@@ -2,6 +2,7 @@ use crate::coordinate::{Plot, Pt, Rect, Widget, Window};
 use crate::gui::messages::PlotMessage;
 use crate::plot::chrome::{PlotChrome, PlotMarkStyle};
 use crate::plot::colors::ColorTheme;
+use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
 	BarWidth, CategoryGap, LegendPosition, PointSize, ResolvedPresence, StrokeWidth,
@@ -435,6 +436,7 @@ pub struct ResolvedPlotSettings {
 	pub x_label_rotation: f32,
 	pub x_label_offset: f32,
 	pub color_theme: ColorTheme,
+	pub continuous_ramps: ContinuousRamps,
 	pub chrome: PlotChrome,
 	pub mark_style: PlotMarkStyle,
 	pub surrounding_background_color: Color,
@@ -500,6 +502,7 @@ impl Default for ResolvedPlotSettings {
 			x_label_rotation: 0.0,
 			x_label_offset: 10.0,
 			color_theme: ColorTheme::default(),
+			continuous_ramps: ContinuousRamps::default(),
 			chrome: PlotChrome::DEFAULT,
 			mark_style: PlotMarkStyle::DEFAULT,
 			surrounding_background_color: Color::from_rgb(0.001, 0.001, 0.001),

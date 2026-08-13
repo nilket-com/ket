@@ -1,6 +1,7 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
+use crate::plot::continuous_color::{ContinuousColorScale, ContinuousScaleIntent};
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Rectangle};
@@ -10,6 +11,17 @@ use std::sync::Arc;
 
 pub struct HexbinPlotKernel {
 	pub prepared_data: Arc<HexbinPreparedData>,
+}
+
+impl HexbinPlotKernel {
+	fn continuous_scale(&self, settings: &ResolvedPlotSettings) -> ContinuousColorScale {
+		ContinuousColorScale::new(
+			(0.0, f64::from(self.prepared_data.max_count)),
+			self.prepared_data.color_intent,
+			settings.continuous_ramps,
+		)
+		.expect("PRODUCT-0089 planning validated this hexbin continuous colour scale")
+	}
 }
 
 impl PlotKernel for HexbinPlotKernel {
@@ -38,7 +50,7 @@ impl PlotKernel for HexbinPlotKernel {
 	) {
 		let radius = self.prepared_data.radius as f64;
 		let sqrt_3 = 3.0f64.sqrt();
-		let max_count = self.prepared_data.max_count as f64;
+		let scale = self.continuous_scale(&settings);
 		backend.with_clip(bounds, &mut |backend| {
 			for (&(q, r), &count) in &self.prepared_data.bins {
 				if count == 0 {
@@ -61,8 +73,7 @@ impl PlotKernel for HexbinPlotKernel {
 					}
 					builder.close();
 				};
-				let t = count as f32 / max_count as f32;
-				let color = settings.color_theme.get_color(t);
+				let color = scale.color(f64::from(count));
 				backend.fill_path(hex_path, color);
 				backend.stroke_path(
 					hex_path,
@@ -80,13 +91,8 @@ impl PlotKernel for HexbinPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::gradient_section(
-			"Count".to_owned(),
-			0.0,
-			f64::from(self.prepared_data.max_count),
-			settings.color_theme,
-		)
-		.map(|section| {
+		let scale = self.continuous_scale(settings);
+		crate::plot::legend::gradient_section("Count".to_owned(), &scale).map(|section| {
 			crate::plot::legend::LegendContent(crate::plot::spec::NonEmpty::new(section))
 		})
 	}
@@ -132,6 +138,7 @@ impl PlotKernel for HexbinPlotKernel {
 pub struct HexbinPreparedData {
 	pub bins: std::collections::HashMap<(i32, i32), u32>,
 	pub max_count: u32,
+	pub color_intent: ContinuousScaleIntent,
 	pub radius: f32,
 	pub x_range: (f64, f64),
 	pub y_range: (f64, f64),
@@ -203,6 +210,7 @@ pub fn prepare_hexbin_data(
 		return HexbinPreparedData {
 			bins: std::collections::HashMap::new(),
 			max_count: 1,
+			color_intent: ContinuousScaleIntent::SEQUENTIAL,
 			radius,
 			x_range: (0.0, 1.0),
 			y_range: (0.0, 1.0),
@@ -232,6 +240,7 @@ pub fn prepare_hexbin_data(
 			return HexbinPreparedData {
 				bins: std::collections::HashMap::new(),
 				max_count: 1,
+				color_intent: ContinuousScaleIntent::SEQUENTIAL,
 				radius,
 				x_range,
 				y_range,
@@ -266,6 +275,7 @@ pub fn prepare_hexbin_data(
 	HexbinPreparedData {
 		bins,
 		max_count,
+		color_intent: ContinuousScaleIntent::SEQUENTIAL,
 		radius,
 		x_range,
 		y_range,
@@ -284,6 +294,7 @@ mod tests {
 			prepared_data: Arc::new(HexbinPreparedData {
 				bins: std::collections::HashMap::new(),
 				max_count: 0,
+				color_intent: ContinuousScaleIntent::SEQUENTIAL,
 				radius: 0.02,
 				x_range: (0.0, 1.0),
 				y_range: (0.0, 1.0),
@@ -296,5 +307,28 @@ mod tests {
 				.legend_content(&ResolvedPlotSettings::default())
 				.is_none()
 		);
+	}
+
+	#[test]
+	fn product_0089_hexbin_accepts_the_one_ulp_arithmetic_change() {
+		let kernel = HexbinPlotKernel {
+			prepared_data: Arc::new(HexbinPreparedData {
+				bins: std::collections::HashMap::new(),
+				max_count: 1_481_765_933,
+				color_intent: ContinuousScaleIntent::SEQUENTIAL,
+				radius: 0.02,
+				x_range: (0.0, 1.0),
+				y_range: (0.0, 1.0),
+				x_label: "x".to_owned(),
+				y_label: "y".to_owned(),
+			}),
+		};
+		let scale = kernel.continuous_scale(&ResolvedPlotSettings::default());
+		let count = 269_329_525_u32;
+		let old = count as f32 / kernel.prepared_data.max_count as f32;
+		let accepted = scale.normalize(f64::from(count)) as f32;
+		assert_eq!(old.to_bits(), 0x3E3A_1FF6);
+		assert_eq!(accepted.to_bits(), 0x3E3A_1FF5);
+		assert_eq!(old.to_bits().abs_diff(accepted.to_bits()), 1);
 	}
 }

@@ -2,6 +2,7 @@ pub mod chrome;
 pub mod colors;
 pub mod common;
 pub mod composition;
+pub mod continuous_color;
 pub mod core;
 pub mod durable;
 pub mod export;
