@@ -163,19 +163,19 @@ band-fill path.
    heatmap, bubble, and hexbin together. Touches **CI-03**, since a real
    continuous authority is what finally displaces the legacy ramp. Leaves
    **CI-02** open.
-6. **Heatmap surface, sequential-only — ADR 0092, drafted.** The first Rune
+6. **Heatmap surface, sequential-only — LANDED as PRODUCT-0092.** The first Rune
    constructor for a quantitative mark. Ships with no job word: colour is
    `{ Sequential, None }`, exactly as 0089 leaves it. Implemented with **bespoke**
    `HeatmapFields` / `HeatmapFieldOrigins`, all gates green, before step 8
    generalizes them.
-7. **Legend geometry from content — ADR 0093, drafted.** The gradient guide
+7. **Legend geometry from content — LANDED as PRODUCT-0093.** The gradient guide
    reserves a hard-coded 60 px (`legend.rs:323`), so `-30.0` clips. Not a catalog
    step but a blocker for one: 0092's signed domain exposed it, and step 9's
    bubble legend uses the *other* geometry path, which carries the same defect.
    Replaces both hard-coded authorities with one conservative content-aware
    estimate. Repairs a violation of PRODUCT-0087's own rule — a section carries
    every value it prints, and a clipped endpoint does not.
-8. **Mark-field transport — ADR 0094, drafted.** A refactor of the working box-plot and heatmap
+8. **Mark-field transport — LANDED as PRODUCT-0094.** A refactor of the working box-plot and heatmap
    carriers into dedicated variants — **not** a generic field map:
 
    ```text
@@ -195,11 +195,25 @@ band-fill path.
    Bubble's variant may be **test-only** until step 9. That is substrate staging,
    not an inert public spelling — no Rune word is added, so nothing unobservable
    is authored.
-9. **Bubble surface, sequential-only — ADR 0095, drafted.** The first new consumer of step 8's
+9. **Bubble surface, sequential-only — LANDED as PRODUCT-0095.** The first new consumer of step 8's
    transport. Five roles against heatmap's three, with an **optional label** whose
    absent-versus-selected-null semantics 0090 §9 already decided — and whose
    variable arity is why `all()` returns a slice rather than a fixed array.
-10. **Continuous colour authoring.** Slot words `sequential_palette` /
+10. **Continuous colour authoring — ADR 0091, drafted; needs a reconciliation
+    pass before implementation.** It was written when steps 6–9 were all unbuilt,
+    and four records have landed since that change its assumptions:
+
+    - **PRODUCT-0095 §4** added `FieldAttribution { Channel, Role }`, so 0091's
+      `diverging_at` refusals can attribute to a role instead of masquerading as
+      a channel — 0091 §6 predates that type existing.
+    - **PRODUCT-0094** added the `MarkFields` / `SpannedMarkFields` transport, so
+      0091's mark-level job word has a carrier it did not have when drafted.
+    - **PRODUCT-0092 and PRODUCT-0095** both retained argument spans through to
+      planning. 0091 §6 called that carrier "this record's real cost"; it is now
+      established practice with two precedents.
+    - Its two prerequisites — an authorable heatmap and bubble — are met.
+
+    Slot words `sequential_palette` /
    `diverging_palette`, the stable 37-token ramp-name grammar they create, the
    mark-level diverging job word, and the anchor-provenance carrier from
    `AuthoredPlotSpec` through planning. Closes **CI-02** for continuous colour;
