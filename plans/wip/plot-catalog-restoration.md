@@ -219,15 +219,40 @@ band-fill path.
    added before those surfaces exist would be observationally inert — the same
    defect that disqualifies a status word. An earlier draft of this plan placed
    authoring at step 6 and the surfaces at step 11.
-11. **Funnel** — the smallest categorical consumer, *but only after its row-order
-   and stage-monotonicity contract is explicit*.
-12. **Radial dial** — needs prerequisite E; its silent first-row selection is the
+11. **Funnel substrate — ADR 0096, drafted.** Row order, stage uniqueness, value
+    monotonicity, and removal of the injectable `total_max`. Five silent
+    fabrications become refusals — including a dropped null value that renames
+    every stage after it.
+12. **Faceted hover coordinate seam.** `grid.rs:819-820` builds the transformer
+    with the cell's **absolute** bounds and passes a **plot-local** cursor, so
+    `transform.bounds.contains(cursor)` can only succeed in the origin cell.
+    Exactly two kernels check it — `funnel.rs:101` and `radial_dial.rs:84` — and
+    both are steps here. Decides the grid contract centrally (absolute/absolute
+    or local/local), with **no kernel-local compensation**, and gates both marks
+    in a non-origin cell. Sequenced after step 11 so it has a validated funnel
+    kernel as a parity subject.
+13. **Funnel surface.** `funnel("stage", "value")`, no implicit-stage form. A
+    `Funnel` variant in the 0094 transport, nominal/quantitative binding with
+    field-and-row diagnostics, stage colours shared by geometry and legend, and
+    the mark-style tier for fills, separators, silhouette, and labels.
+
+    **The first production exercise of PRODUCT-0086.** Funnel is categorical, so
+    it allocates a `ColorIdentity` and reaches `AuthoredFamilyId::parse`
+    (`session_persistence.rs:714`) and `FamilyAdmissionPolicy::admits` (`:247`) —
+    which heatmap and bubble both avoided. Persistence is a first-of-kind
+    decision, not plumbing: catalogue the funnel token, prove `ExtensibleFamilies`
+    admits and round-trips it, prove the earlier closed policies refuse it,
+    persist and restore category assignments, prove a reordered result under one
+    lineage keeps its stage colours, and prove reattachment restores the same
+    allocation. Prerequisite **A** is finally consumed, and the five remaining
+    categorical marks inherit whatever this establishes.
+14. **Radial dial** — needs prerequisite E; its silent first-row selection is the
     PRODUCT-0078 defect class again.
-13. **Pie** — after removing its aggregation authority, which Toron can now supply
+15. **Pie** — after removing its aggregation authority, which Toron can now supply
     as pre-aggregated category/value rows.
-14. **Radar + parallel together** over one dimension-list substrate. They are the
+16. **Radar + parallel together** over one dimension-list substrate. They are the
     only two needing D, and solving it twice would produce two vocabularies.
-15. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+17. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
 
