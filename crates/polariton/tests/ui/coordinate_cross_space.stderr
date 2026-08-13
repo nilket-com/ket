@@ -1,7 +1,7 @@
 error[E0308]: mismatched types
- --> tests/ui/coordinate_cross_space.rs:7:16
+ --> tests/ui/coordinate_cross_space.rs:8:16
   |
-7 |     rect.contains(cursor)
+8 |     rect.contains(cursor)
   |          -------- ^^^^^^ expected `Pt<Widget>`, found `Pt<Cell>`
   |          |
   |          arguments to this method are incorrect
@@ -15,9 +15,9 @@ note: method defined here
   |                   ^^^^^^^^       ------------
 
 error[E0308]: mismatched types
-  --> tests/ui/coordinate_cross_space.rs:11:16
+  --> tests/ui/coordinate_cross_space.rs:12:16
    |
-11 |     rect.contains(cursor)
+12 |     rect.contains(cursor)
    |          -------- ^^^^^^ expected `Pt<Widget>`, found `Pt<Plot>`
    |          |
    |          arguments to this method are incorrect

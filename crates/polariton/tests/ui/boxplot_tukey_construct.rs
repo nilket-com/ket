@@ -1,3 +1,4 @@
+#![allow(dead_code)] // standalone fixture: compiles a partial module by design
 #[path = "../../src/plot/kernels/boxplot_tukey.rs"]
 mod boxplot_tukey;
 

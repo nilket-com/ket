@@ -1,3 +1,4 @@
+#![allow(dead_code)] // standalone fixture: compiles a partial module by design
 mod plot {
 	pub mod continuous_color {
 		use iced::Color;

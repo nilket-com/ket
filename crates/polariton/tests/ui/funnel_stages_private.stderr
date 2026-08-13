@@ -1,5 +1,5 @@
 error[E0451]: field `stages` of struct `FunnelStages` is private
- --> tests/ui/funnel_stages_private.rs:7:25
+ --> tests/ui/funnel_stages_private.rs:8:25
   |
-7 |     let _ = FunnelStages { stages: Vec::new() };
+8 |     let _ = FunnelStages { stages: Vec::new() };
   |                            ^^^^^^ private field

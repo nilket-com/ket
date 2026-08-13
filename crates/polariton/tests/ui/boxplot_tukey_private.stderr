@@ -1,17 +1,17 @@
 error[E0451]: fields `whisker_low`, `q1`, `median`, `q3`, `whisker_high` and `outliers` of struct `TukeyBox` are private
-  --> tests/ui/boxplot_tukey_private.rs:8:3
+  --> tests/ui/boxplot_tukey_private.rs:9:3
    |
- 7 |     let _ = TukeyBox {
+ 8 |     let _ = TukeyBox {
    |             -------- in this type
- 8 |         whisker_low: 0.0,
+ 9 |         whisker_low: 0.0,
    |         ^^^^^^^^^^^ private field
- 9 |         q1: 1.0,
+10 |         q1: 1.0,
    |         ^^ private field
-10 |         median: 2.0,
+11 |         median: 2.0,
    |         ^^^^^^ private field
-11 |         q3: 3.0,
+12 |         q3: 3.0,
    |         ^^ private field
-12 |         whisker_high: 4.0,
+13 |         whisker_high: 4.0,
    |         ^^^^^^^^^^^^ private field
-13 |         outliers: Vec::new(),
+14 |         outliers: Vec::new(),
    |         ^^^^^^^^ private field

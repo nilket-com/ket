@@ -1,3 +1,4 @@
+#![allow(dead_code)] // standalone fixture: compiles a partial module by design
 #[path = "../../src/plot/spec/bubble_fields.rs"]
 mod product_bubble_fields;
 mod plot {

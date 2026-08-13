@@ -1,5 +1,5 @@
 error[E0616]: field `stops` of struct `GradientStops` is private
-  --> tests/ui/gradient_stops_private_read.rs:28:16
+  --> tests/ui/gradient_stops_private_read.rs:29:16
    |
-28 |     let _ = stops.stops;
+29 |     let _ = stops.stops;
    |                   ^^^^^ private field
