@@ -386,6 +386,27 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0092_integer_and_float_authored_values_keep_identical_operations() {
+		let integer = polars::df!(
+			"x" => ["a", "b", "c"],
+			"y" => ["u", "u", "u"],
+			"value" => [-10_i64, 5_i64, 20_i64],
+		)
+		.unwrap();
+		let float = polars::df!(
+			"x" => ["a", "b", "c"],
+			"y" => ["u", "u", "u"],
+			"value" => [-10.0_f64, 5.0_f64, 20.0_f64],
+		)
+		.unwrap();
+		let settings = ResolvedPlotSettings::default();
+		let integer = render(&kernel(&integer).unwrap(), settings.clone());
+		let float = render(&kernel(&float).unwrap(), settings);
+		assert_eq!(integer.rectangles, float.rectangles);
+		assert_eq!(integer.strokes, float.strokes);
+	}
+
+	#[test]
 	fn product_0088_constant_and_no_data_share_only_gradient_omission() {
 		let constant = polars::df!(
 			"x" => ["a", "b"],

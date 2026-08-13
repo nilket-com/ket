@@ -9,16 +9,17 @@ use crate::plot::common::TickPlacement;
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
-	BarWidth, BoxPlotFields, CategoryGap, LayerSettings, LayeredPlotSpec, LegendPosition, Override,
-	PointSize, Presence, StrokeWidth,
+	BarWidth, BoxPlotFields, CategoryGap, HeatmapFields, LayerSettings, LayeredPlotSpec,
+	LegendPosition, Override, PointSize, Presence, StrokeWidth,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
 };
 use crate::rune_relation_envelope::{
-	BoxPlotFieldOrigins, DisposableRunePlotSink, RunePlotBody, RunePlotDomainSpans, RunePlotIntent,
-	RunePlotMinorTickSpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
-	RuneTableSkinProjection, RuneViewIntent, StyledRunePlotSink,
+	BoxPlotFieldOrigins, DisposableRunePlotSink, HeatmapFieldOrigins, RunePlotBody,
+	RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans, RunePlotTickStepSpans,
+	RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent,
+	StyledRunePlotSink,
 };
 use rune::alloc::limit;
 use rune::ast::Spanned;
@@ -388,6 +389,7 @@ fn build_context() -> Result<Context, String> {
 		("__area", raw_area as RawFunction),
 		("__histogram", raw_histogram as RawFunction),
 		("__box", raw_box as RawFunction),
+		("__heatmap", raw_heatmap as RawFunction),
 		("__title", raw_title as RawFunction),
 		("__subtitle", raw_subtitle as RawFunction),
 		("__x_label", raw_x_label as RawFunction),
@@ -554,6 +556,109 @@ fn raw_box(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) 
 			interval_end: None,
 			box_plot_fields: Some(box_fields),
 			box_plot_origins: Some(spans),
+			heatmap_fields: None,
+			heatmap_origins: None,
+			origin: origin.range(),
+		},
+		settings: LayerSettings::default(),
+		stacked: false,
+		percent: false,
+	};
+	store(
+		out,
+		stack,
+		RuneMark {
+			sink: Ok(sink),
+			origin,
+			modified: false,
+			point_size_origin: None,
+			stroke_width_origin: None,
+			bar_width_origin: None,
+			category_gap_origin: None,
+			stacked_origin: None,
+			percent_origin: None,
+		},
+	)
+}
+
+fn raw_heatmap(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = match raw_origin(values) {
+		Ok(origin) => origin,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	if values.len() != 11 {
+		return store(
+			out,
+			stack,
+			RuneMark::failed(PresentationFailure::new(
+				origin,
+				"heatmap(...) takes x, y, and value strings",
+			)),
+		);
+	}
+	let mut fields = Vec::with_capacity(3);
+	for value in &values[..3] {
+		match rune::from_value::<Ref<str>>(value.clone()) {
+			Ok(field) => fields.push(field.to_owned()),
+			Err(_) => {
+				return store(
+					out,
+					stack,
+					RuneMark::failed(PresentationFailure::new(
+						origin,
+						"heatmap(...) field arguments must evaluate to strings",
+					)),
+				);
+			}
+		}
+	}
+	let decode_span = |index: usize| -> Result<Range<u32>, PresentationFailure> {
+		let start = rune::from_value::<i64>(values[index].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"heatmap(...) has an invalid injected argument origin",
+			)
+		})?;
+		let end = rune::from_value::<i64>(values[index + 1].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"heatmap(...) has an invalid injected argument origin",
+			)
+		})?;
+		Origin::decode(start, end).map(Origin::range)
+	};
+	let origins = match (|| {
+		Ok(HeatmapFieldOrigins {
+			x: decode_span(3)?,
+			y: decode_span(5)?,
+			value: decode_span(7)?,
+		})
+	})() {
+		Ok(origins) => origins,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	let heatmap_fields = HeatmapFields {
+		x: fields[0].clone(),
+		y: fields[1].clone(),
+		value: fields[2].clone(),
+	};
+	let sink = StyledRunePlotSink {
+		sink: DisposableRunePlotSink {
+			composition: PlotComposition::single(PlotType::Heatmap),
+			x: heatmap_fields.x.clone(),
+			y: heatmap_fields.y.clone(),
+			category: None,
+			interval_end: None,
+			box_plot_fields: None,
+			box_plot_origins: None,
+			heatmap_fields: Some(heatmap_fields),
+			heatmap_origins: Some(origins),
 			origin: origin.range(),
 		},
 		settings: LayerSettings::default(),
@@ -1030,6 +1135,8 @@ fn raw_mark(
 				interval_end,
 				box_plot_fields: None,
 				box_plot_origins: None,
+				heatmap_fields: None,
+				heatmap_origins: None,
 				origin: origin.range(),
 			},
 			settings: LayerSettings::default(),

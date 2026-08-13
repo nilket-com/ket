@@ -1,0 +1,21 @@
+let skin = "nord";
+let cells = workspace.table("heat_probe");
+let duplicates = workspace.table("heat_probe_raw");
+
+cells.views([
+	view("heatmap-cells", figure([
+		title("Heatmap · explicit sparse cells"),
+		subtitle("South/Q2 is absent · signed domain −30…40"),
+		skin(skin),
+		heatmap("region", "quarter", "margin"),
+	])),
+]);
+
+duplicates.views([
+	view("heatmap-duplicate-refusal", figure([
+		title("Heatmap · duplicate-cell refusal"),
+		subtitle("North/Q1 appears twice; aggregate in the relation"),
+		skin(skin),
+		heatmap("region", "quarter", "margin"),
+	])),
+]);

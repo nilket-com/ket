@@ -510,6 +510,51 @@ fn product_0090_bubble_keeps_one_validated_observation_authority() {
 }
 
 #[test]
+fn product_0092_heatmap_surface_keeps_one_explicit_three_role_pipeline() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read plot request");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read relation envelope");
+	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read Rune host");
+	let session = std::fs::read_to_string(root.join("session_persistence.rs"))
+		.expect("read session persistence");
+
+	assert!(spec.contains("pub struct HeatmapFields"));
+	assert!(spec.contains("pub fn all(&self) -> [&str; 3]"));
+	assert!(spec.contains("fn resolve_heatmap_channels("));
+	assert!(spec.contains("(PlotType::Heatmap, Channel::X | Channel::Y)"));
+	assert!(spec.contains("PlotType::Bar | PlotType::BoxPlot | PlotType::Heatmap"));
+	assert!(spec.contains("channel: Channel::Color"));
+	assert!(request.contains("if let Some(heatmap_fields) = spec.heatmap_fields()"));
+	assert!(request.contains("for field in heatmap_fields.all()"));
+	assert!(presentation.contains("(\"__heatmap\", raw_heatmap as RawFunction)"));
+	assert!(presentation.contains("fn raw_heatmap("));
+	assert!(compiler.contains("\"heatmap\","));
+	assert!(compiler.contains("\"heatmap\" => Some(3)"));
+	assert!(envelope.contains("pub(crate) heatmap_fields: Option<"));
+	assert!(envelope.contains("pub(crate) heatmap_origins: Option<HeatmapFieldOrigins>"));
+	assert!(host.contains("fn heatmap_failure_span("));
+	assert!(host.contains("heatmap_output_span"));
+
+	let production_heatmap = std::fs::read_to_string(root.join("plot/kernels/heatmap.rs"))
+		.expect("read heatmap kernel")
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production heatmap region")
+		.to_owned();
+	assert!(production_heatmap.contains("ContinuousScaleIntent::SEQUENTIAL"));
+	assert!(!production_heatmap.contains("ColorJob::Diverging"));
+	assert!(!production_heatmap.contains("ContinuousAnchor::Authored"));
+	assert!(!session.contains("PlotType::Heatmap"));
+	assert!(!session.contains("AuthoredFamilyId::HEATMAP"));
+}
+
+#[test]
 fn product_0001_polariton_reaches_nilket_only_through_the_public_client() {
 	assert_product_dependency_boundary(
 		Path::new(env!("CARGO_MANIFEST_DIR")),

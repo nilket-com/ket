@@ -137,7 +137,11 @@ impl StyledRunePlotSink {
 		let mark = match self.sink.composition.primary_plot_type() {
 			PlotType::Line => LayerMark::Line,
 			PlotType::Scatter => LayerMark::Scatter,
-			PlotType::Bar | PlotType::StackedArea | PlotType::Histogram | PlotType::BoxPlot => {
+			PlotType::Bar
+			| PlotType::StackedArea
+			| PlotType::Histogram
+			| PlotType::BoxPlot
+			| PlotType::Heatmap => {
 				return Err(self);
 			}
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
@@ -215,6 +219,7 @@ impl RuneViewIntent {
 						PlotType::StackedArea => "plot.area".to_owned(),
 						PlotType::Histogram => "plot.histogram".to_owned(),
 						PlotType::BoxPlot => "plot.box".to_owned(),
+						PlotType::Heatmap => "plot.heatmap".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -227,6 +232,7 @@ impl RuneViewIntent {
 							PlotType::StackedArea => "plot.area".to_owned(),
 							PlotType::Histogram => "plot.histogram".to_owned(),
 							PlotType::BoxPlot => "plot.box".to_owned(),
+							PlotType::Heatmap => "plot.heatmap".to_owned(),
 							other => {
 								unreachable!("styled sink admitted unexpected plot type {other:?}")
 							}
@@ -284,6 +290,9 @@ pub(crate) struct DisposableRunePlotSink {
 	pub(crate) box_plot_fields: Option<BoxPlotFields>,
 	/// Original use-site spans for each positional box argument.
 	pub(crate) box_plot_origins: Option<BoxPlotFieldOrigins>,
+	/// PRODUCT-0092: explicit heatmap keys and value, paired with their origins.
+	pub(crate) heatmap_fields: Option<crate::plot::spec::HeatmapFields>,
+	pub(crate) heatmap_origins: Option<HeatmapFieldOrigins>,
 	/// Original authored mark call, retained for post-query diagnostics.
 	pub(crate) origin: Range<u32>,
 }
@@ -299,10 +308,24 @@ impl PartialEq for DisposableRunePlotSink {
 			&& self.category == other.category
 			&& self.interval_end == other.interval_end
 			&& self.box_plot_fields == other.box_plot_fields
+			&& self.heatmap_fields == other.heatmap_fields
 	}
 }
 
 impl Eq for DisposableRunePlotSink {}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct HeatmapFieldOrigins {
+	pub(crate) x: Range<u32>,
+	pub(crate) y: Range<u32>,
+	pub(crate) value: Range<u32>,
+}
+
+impl HeatmapFieldOrigins {
+	pub(crate) fn keys(&self) -> Range<u32> {
+		self.x.start.min(self.y.start)..self.x.end.max(self.y.end)
+	}
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct BoxPlotFieldOrigins {

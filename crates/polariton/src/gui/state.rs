@@ -1009,6 +1009,13 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 				.expect("Rune box carries seven explicit Tukey fields"),
 		);
 	}
+	if sink.composition.primary_plot_type() == PlotType::Heatmap {
+		return AuthoredPlotSpec::heatmap(
+			sink.heatmap_fields
+				.clone()
+				.expect("Rune heatmap carries x, y, and value fields"),
+		);
+	}
 	if sink.composition.primary_plot_type() == PlotType::Histogram {
 		return AuthoredPlotSpec::histogram(
 			sink.x.clone(),
@@ -1052,6 +1059,47 @@ fn box_plot_failure_role(
 	crate::plot::kernels::boxplot::prepare_box_plot_data(data, fields)
 		.err()
 		.and_then(|error| error.field_role())
+}
+
+#[cfg(feature = "toron")]
+fn heatmap_failure_span(
+	data: &DataFrame,
+	fields: &crate::plot::spec::HeatmapFields,
+	origins: &crate::rune_relation_envelope::HeatmapFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let authored = AuthoredPlotSpec::heatmap(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return if error.field == fields.x {
+			origins.x.clone()
+		} else if error.field == fields.y {
+			origins.y.clone()
+		} else if error.field == fields.value {
+			origins.value.clone()
+		} else {
+			mark.clone()
+		};
+	}
+	match crate::plot::kernels::heatmap::prepare_heatmap_data(
+		data,
+		&fields.x,
+		&fields.y,
+		&fields.value,
+	) {
+		Err(crate::plot::kernels::heatmap_cells::HeatmapCellsError::NonFiniteValue { .. }) => {
+			origins.value.clone()
+		}
+		Err(crate::plot::kernels::heatmap_cells::HeatmapCellsError::NullX { .. }) => {
+			origins.x.clone()
+		}
+		Err(crate::plot::kernels::heatmap_cells::HeatmapCellsError::NullY { .. }) => {
+			origins.y.clone()
+		}
+		Err(crate::plot::kernels::heatmap_cells::HeatmapCellsError::DuplicateCell { .. }) => {
+			origins.keys()
+		}
+		Ok(_) => mark.clone(),
+	}
 }
 
 #[cfg(feature = "toron")]
@@ -1534,6 +1582,23 @@ fn rune_view_outcome_with_palettes(
 				},
 				RuneViewIntent::Table(_) => None,
 			};
+			let heatmap_diagnostic = match &view.intent {
+				RuneViewIntent::Plot(plot) => match &plot.body {
+					RunePlotBody::Single(sink) => sink
+						.heatmap_fields
+						.clone()
+						.zip(sink.heatmap_origins.clone())
+						.map(|(fields, origins)| (fields, origins, sink.origin.clone())),
+					RunePlotBody::StyledSingle(styled) => styled
+						.sink
+						.heatmap_fields
+						.clone()
+						.zip(styled.sink.heatmap_origins.clone())
+						.map(|(fields, origins)| (fields, origins, styled.sink.origin.clone())),
+					RunePlotBody::Layered(_) => None,
+				},
+				RuneViewIntent::Table(_) => None,
+			};
 			let body_output_span = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
 					RunePlotBody::Single(sink)
@@ -1835,11 +1900,17 @@ fn rune_view_outcome_with_palettes(
 						.unwrap_or_else(|| mark.clone())
 				})
 			});
+			let heatmap_output_span = output.as_ref().err().and_then(|_| {
+				heatmap_diagnostic.as_ref().map(|(fields, origins, mark)| {
+					heatmap_failure_span(frame.as_ref(), fields, origins, mark)
+				})
+			});
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
 				span: output_span
 					.or(box_output_span)
+					.or(heatmap_output_span)
 					.or(body_output_span)
 					.or(facet_span)
 					.unwrap_or(view.span),
@@ -9734,6 +9805,106 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			.unwrap(),
 			mark,
 			"inside the whisker span",
+		);
+		assert!(complete(valid).sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0092_heatmap_resolves_and_attributes_binding_and_cell_refusals() {
+		use polars::frame::DataFrame;
+		let source =
+			r#"workspace.table("heat_probe").views([heatmap("region", "quarter", "margin")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("heatmap source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"region" => ["north", "north", "south"],
+			"quarter" => ["q1", "q2", "q1"],
+			"margin" => [-10_i64, 5_i64, 20_i64],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid heatmap must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::Heatmap { x, y, value }
+				if (x.as_str(), y.as_str(), value.as_str()) == ("region", "quarter", "margin")
+		));
+		assert!(
+			continuation
+				.identity
+				.persistence_snapshot()
+				.assignments
+				.is_empty()
+		);
+
+		let assert_span = |frame: DataFrame, expected: &str, error_fragment: &str| {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid heatmap rendered")
+			};
+			assert!(error.contains(error_fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+
+		assert_span(
+			polars::df!(
+				"region" => [1_i64], "quarter" => ["q1"], "margin" => [1.0],
+			)
+			.unwrap(),
+			"\"region\"",
+			"incompatible with Heatmap",
+		);
+		assert_span(
+			polars::df!(
+				"region" => ["north"], "quarter" => ["q1"], "margin" => ["bad"],
+			)
+			.unwrap(),
+			"\"margin\"",
+			"quantitative",
+		);
+		assert_span(
+			polars::df!(
+				"region" => ["north"], "quarter" => ["q1"], "margin" => [f64::NAN],
+			)
+			.unwrap(),
+			"\"margin\"",
+			"non-finite",
+		);
+		assert_span(
+			polars::df!(
+				"region" => [None::<&str>], "quarter" => ["q1"], "margin" => [1.0],
+			)
+			.unwrap(),
+			"\"region\"",
+			"x key is null",
+		);
+		assert_span(
+			polars::df!(
+				"region" => ["north"], "quarter" => [None::<&str>], "margin" => [1.0],
+			)
+			.unwrap(),
+			"\"quarter\"",
+			"y key is null",
+		);
+		assert_span(
+			polars::df!(
+				"region" => ["north", "north"], "quarter" => ["q1", "q1"],
+				"margin" => [1.0, 2.0],
+			)
+			.unwrap(),
+			"\"region\", \"quarter\"",
+			"duplicated at rows 1 and 2",
 		);
 		assert!(complete(valid).sinks[0].output.is_ok());
 	}

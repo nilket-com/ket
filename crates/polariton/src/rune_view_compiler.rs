@@ -27,6 +27,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"facet",
 	"figure",
 	"histogram",
+	"heatmap",
 	"hide_legend",
 	"layers",
 	"legend_at",
@@ -1266,10 +1267,15 @@ fn rewrite_calls_mapped(
 			replacement,
 			owner: u32_range(&(origin_start..origin_end), "presentation call origin")?,
 		});
-		let injected_origins = if !is_method && name == "box" {
+		let origin_arity = match name.as_str() {
+			"box" => Some(7),
+			"heatmap" => Some(3),
+			_ => None,
+		};
+		let injected_origins = if let Some(origin_arity) = origin_arity.filter(|_| !is_method) {
 			let arguments =
 				call_argument_ranges(fragment, original_start, &tokens, open_index, close_index)?;
-			if arguments.len() != 7 {
+			if arguments.len() != origin_arity {
 				String::new()
 			} else {
 				arguments
@@ -1688,6 +1694,63 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0092_heatmap_rewriter_retains_three_argument_origins() {
+		let source = "heatmap(\"region\", \"quarter\", \"margin\")";
+		let rewritten = rewrite_calls(source, 100).expect("rewrite heatmap call");
+		assert_eq!(
+			rewritten,
+			"polariton_presentation::__heatmap(\"region\", \"quarter\", \"margin\", 108, 116, 118, 127, 129, 137, 100, 138)"
+		);
+	}
+
+	#[test]
+	fn product_0092_heatmap_surface_positions_are_closed_and_originated() {
+		let fields = "\"region\", \"quarter\", \"margin\"";
+		for slot in [
+			format!("heatmap({fields})"),
+			format!("view(\"named\", heatmap({fields}))"),
+			format!("view(\"named\", figure([heatmap({fields})]))"),
+			format!("figure([heatmap({fields})])"),
+		] {
+			let source = format!(
+				"let relation = workspace.table(\"heat_probe\");\nrelation.views([{slot}]);"
+			);
+			let compiled = compile(&source).unwrap_or_else(|error| panic!("{slot}: {error}"));
+			let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+				panic!("heatmap surface produced a table")
+			};
+			let sink = match &plot.body {
+				RunePlotBody::Single(sink) => sink,
+				RunePlotBody::StyledSingle(styled) => &styled.sink,
+				RunePlotBody::Layered(_) => panic!("heatmap surface produced layers"),
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::Heatmap
+			);
+			assert_eq!(sink.heatmap_fields.as_ref().unwrap().value, "margin");
+			let origins = sink.heatmap_origins.as_ref().expect("three origins");
+			assert_eq!(
+				&source[origins.value.start as usize..origins.value.end as usize],
+				"\"margin\""
+			);
+		}
+
+		for source in [
+			format!(
+				"let r = workspace.table(\"heat_probe\"); r.views([layers([heatmap({fields})])]);"
+			),
+			format!("plot.heatmap(workspace.table(\"heat_probe\"), {fields});"),
+			format!("workspace.table(\"heat_probe\").heatmap({fields});"),
+		] {
+			assert!(
+				compile(&source).is_err(),
+				"accepted forbidden surface: {source}"
+			);
+		}
+	}
+
+	#[test]
 	fn product_0082_box_surface_positions_are_closed_and_originated() {
 		let fields = "\"cat\", \"lo\", \"p25\", \"mid\", \"p75\", \"hi\", \"out\"";
 		for slot in [
@@ -1776,6 +1839,29 @@ mod tests {
 		}
 		assert!(source.contains("y_label(\"Observed value\")"));
 		assert!(source.contains("Axis title · derived percent-of-total"));
+	}
+
+	#[test]
+	fn product_0092_test27_is_the_sparse_and_duplicate_heatmap_exhibit() {
+		let source = include_str!("../../../uat/test27.rn");
+		let compiled = compile(source).expect("the checked-in heatmap exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 2);
+		for execution in &compiled.executions {
+			let RuneViewIntent::Plot(plot) = &execution.views[0].intent else {
+				panic!("heatmap exhibit produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("heatmap exhibit did not retain one standalone mark")
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::Heatmap
+			);
+			assert_eq!(sink.heatmap_fields.as_ref().unwrap().value, "margin");
+		}
+		assert!(source.contains("South/Q2 is absent"));
+		assert!(source.contains("aggregate in the relation"));
 	}
 
 	#[test]

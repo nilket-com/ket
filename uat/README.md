@@ -37,3 +37,15 @@ cargo run -p polariton -- uat/test26.rn
 `box_probe.sql` is idempotent and retains duplicate observations deliberately.
 Its five groups cover two-sided outliers, no outliers, coincident duplicate
 outliers, a singleton, and a flat distribution.
+
+Seed the PRODUCT-0092 heatmap relations, then open the sparse-cell exhibit:
+
+```sh
+nilket toron sql --file uat/heat_probe.sql
+cargo run -p polariton -- uat/test27.rn
+```
+
+`heat_probe` is pre-aggregated to one row per observed cell, with one deliberate
+cross-product gap and a signed domain. `heat_probe_raw` retains a duplicate
+North/Q1 key; its companion view must refuse and direct the author to aggregate
+in the relation.

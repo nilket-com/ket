@@ -365,6 +365,19 @@ impl BoxPlotFields {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HeatmapFields {
+	pub x: String,
+	pub y: String,
+	pub value: String,
+}
+
+impl HeatmapFields {
+	pub fn all(&self) -> [&str; 3] {
+		[&self.x, &self.y, &self.value]
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AuthoredPlotSpec {
 	pub composition: PlotComposition,
 	pub x: AuthoredChannelSpec,
@@ -376,6 +389,8 @@ pub struct AuthoredPlotSpec {
 	histogram_end: Option<String>,
 	/// PRODUCT-0082: explicit ADR-547 Tukey summary and outlier columns.
 	box_plot_fields: Option<BoxPlotFields>,
+	/// PRODUCT-0092: two categorical keys and one quantitative cell value.
+	heatmap_fields: Option<HeatmapFields>,
 	/// PRODUCT-0064: stacking is authored geometry within the Bar family, not
 	/// a fourth authored plot type. Resolution consumes this only after the
 	/// x/y pair has selected the physical orientation.
@@ -393,6 +408,7 @@ impl AuthoredPlotSpec {
 			color_job: Override::Inherit,
 			histogram_end: None,
 			box_plot_fields: None,
+			heatmap_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -407,6 +423,7 @@ impl AuthoredPlotSpec {
 			color_job: Override::Inherit,
 			histogram_end: None,
 			box_plot_fields: None,
+			heatmap_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -455,6 +472,20 @@ impl AuthoredPlotSpec {
 
 	pub fn box_plot_fields(&self) -> Option<&BoxPlotFields> {
 		self.box_plot_fields.as_ref()
+	}
+
+	pub fn heatmap(fields: HeatmapFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::Heatmap),
+			fields.x.clone(),
+			fields.y.clone(),
+		);
+		spec.heatmap_fields = Some(fields);
+		spec
+	}
+
+	pub fn heatmap_fields(&self) -> Option<&HeatmapFields> {
+		self.heatmap_fields.as_ref()
 	}
 
 	pub fn with_stacked_bar(mut self) -> Self {
@@ -571,6 +602,7 @@ impl LayerEncoding {
 			color_job: self.color_job.clone(),
 			histogram_end: None,
 			box_plot_fields: None,
+			heatmap_fields: None,
 			stacked_bar: false,
 			stack_normalization: StackNormalization::Absolute,
 		}
@@ -1518,6 +1550,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::BoxPlot {
 		return resolve_box_plot_channels(spec, schema);
 	}
+	if plot_type == PlotType::Heatmap && spec.heatmap_fields().is_some() {
+		return resolve_heatmap_channels(spec, schema);
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -1823,6 +1858,71 @@ fn resolve_box_plot_channels(
 			q3: fields.q3.clone(),
 			whisker_high: fields.whisker_high.clone(),
 			outlier: fields.outlier.clone(),
+		}),
+		color_job: None,
+		categorical_limit: 0,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
+fn resolve_heatmap_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.heatmap_fields().ok_or_else(|| ChannelError {
+		channel: Channel::X,
+		field: "<heatmap>".to_owned(),
+		reason: "Heatmap requires explicit x, y, and value fields".to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::Heatmap,
+	};
+	let mut used_by_auto = HashSet::new();
+	let x = resolve_required(
+		Channel::X,
+		&spec.x,
+		PlotType::Heatmap,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let y = resolve_required(
+		Channel::Y,
+		&spec.y,
+		PlotType::Heatmap,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let value_dtype = schema
+		.get(fields.value.as_str())
+		.ok_or_else(|| ChannelError {
+			channel: Channel::Color,
+			field: fields.value.clone(),
+			reason: "heatmap value field is absent from the returned schema".to_owned(),
+		})?;
+	let value_semantic = semantic_type(value_dtype).ok_or_else(|| ChannelError {
+		channel: Channel::Color,
+		field: fields.value.clone(),
+		reason: format!("dtype {value_dtype:?} has no supported semantic type"),
+	})?;
+	if value_semantic != SemanticType::Quantitative {
+		return Err(ChannelError {
+			channel: Channel::Color,
+			field: fields.value.clone(),
+			reason: format!("heatmap value requires a quantitative dtype, got {value_dtype:?}"),
+		});
+	}
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![x, y],
+		kernel_fields: Box::new(ResolvedKernelFields::Heatmap {
+			x: fields.x.clone(),
+			y: fields.y.clone(),
+			value: fields.value.clone(),
 		}),
 		color_job: None,
 		categorical_limit: 0,
@@ -2519,6 +2619,7 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 			matches!(semantic, SemanticType::Nominal | SemanticType::Ordinal)
 		}
 		(PlotType::BoxPlot, Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::Heatmap, Channel::X | Channel::Y) => semantic == SemanticType::Nominal,
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -2533,7 +2634,10 @@ fn default_scale(plot_type: PlotType, channel: Channel, semantic: SemanticType) 
 	}
 	match semantic {
 		SemanticType::Nominal | SemanticType::Ordinal
-			if matches!(plot_type, PlotType::Bar | PlotType::BoxPlot) =>
+			if matches!(
+				plot_type,
+				PlotType::Bar | PlotType::BoxPlot | PlotType::Heatmap
+			) =>
 		{
 			ScaleFamily::Band
 		}
@@ -3081,6 +3185,129 @@ mod tests {
 				.reason
 				.contains("explicit Tukey summary fields are required")
 		);
+	}
+
+	fn heatmap_spec() -> AuthoredPlotSpec {
+		AuthoredPlotSpec::heatmap(HeatmapFields {
+			x: "region".to_owned(),
+			y: "quarter".to_owned(),
+			value: "margin".to_owned(),
+		})
+	}
+
+	#[test]
+	fn product_0092_heatmap_binds_nominal_bands_and_quantitative_value() {
+		for values in [
+			Column::new("margin".into(), [1_i64, 2_i64])
+				.cast(&DataType::Int64)
+				.unwrap(),
+			Column::new("margin".into(), [1.0_f64, 2.0_f64]),
+		] {
+			let frame = DataFrame::new(
+				2,
+				vec![
+					Column::new("region".into(), ["north", "south"]),
+					Column::new("quarter".into(), ["q1", "q2"]),
+					values,
+				],
+			)
+			.unwrap();
+			let binding = resolve_channels(&heatmap_spec(), frame.schema().as_ref())
+				.expect("authored heatmap binds");
+			assert_eq!(binding.channels.len(), 2);
+			assert!(binding.channels.iter().all(|channel| {
+				channel.semantic_type == SemanticType::Nominal && channel.scale == ScaleFamily::Band
+			}));
+			assert_eq!(binding.color_job, None);
+			assert!(matches!(
+				binding.kernel_fields.as_ref(),
+				ResolvedKernelFields::Heatmap { x, y, value }
+					if (x.as_str(), y.as_str(), value.as_str()) == ("region", "quarter", "margin")
+			));
+		}
+	}
+
+	#[test]
+	fn product_0092_heatmap_compatibility_refuses_axes_values_and_ordinal_precisely() {
+		let categorical = df!(
+			"region" => ["north"],
+			"quarter" => ["q1"],
+			"margin" => [1.0_f64],
+		)
+		.unwrap();
+		let mut ordinal = heatmap_spec();
+		ordinal.x.semantic_type = Override::Set(SemanticType::Ordinal);
+		let error = resolve_channels(&ordinal, categorical.schema().as_ref()).unwrap_err();
+		assert_eq!(error.channel, Channel::X);
+		assert_eq!(error.field, "region");
+		assert!(error.reason.contains("Ordinal") && error.reason.contains("Heatmap"));
+
+		let numeric_axis = df!(
+			"region" => [1_i64],
+			"quarter" => ["q1"],
+			"margin" => [1.0_f64],
+		)
+		.unwrap();
+		let error = resolve_channels(&heatmap_spec(), numeric_axis.schema().as_ref()).unwrap_err();
+		assert_eq!(
+			(error.channel, error.field.as_str()),
+			(Channel::X, "region")
+		);
+
+		for value in [
+			Column::new("margin".into(), ["high"]),
+			Column::new("margin".into(), [true]),
+		] {
+			let frame = DataFrame::new(
+				1,
+				vec![
+					Column::new("region".into(), ["north"]),
+					Column::new("quarter".into(), ["q1"]),
+					value,
+				],
+			)
+			.unwrap();
+			let error = resolve_channels(&heatmap_spec(), frame.schema().as_ref()).unwrap_err();
+			assert_eq!(
+				(error.channel, error.field.as_str()),
+				(Channel::Color, "margin")
+			);
+			assert!(error.reason.contains("quantitative"));
+		}
+
+		let missing = df!("region" => ["north"], "quarter" => ["q1"]).unwrap();
+		let error = resolve_channels(&heatmap_spec(), missing.schema().as_ref()).unwrap_err();
+		assert_eq!(
+			(error.channel, error.field.as_str()),
+			(Channel::Color, "margin")
+		);
+		assert!(error.reason.contains("absent"));
+	}
+
+	#[test]
+	fn product_0092_heatmap_surface_emits_only_inherited_semantic_types() {
+		let spec = heatmap_spec();
+		assert_eq!(spec.x.semantic_type, Override::Inherit);
+		assert_eq!(spec.y.semantic_type, Override::Inherit);
+		assert_eq!(spec.color.semantic_type, Override::Inherit);
+		assert_eq!(spec.color_job, Override::Inherit);
+	}
+
+	#[test]
+	fn product_0092_heatmap_unsupported_dtype_refuses_before_preparation() {
+		let schema: Schema = [
+			("region".into(), DataType::String),
+			("quarter".into(), DataType::String),
+			("margin".into(), DataType::List(Box::new(DataType::Float64))),
+		]
+		.into_iter()
+		.collect();
+		let error = resolve_channels(&heatmap_spec(), &schema).unwrap_err();
+		assert_eq!(
+			(error.channel, error.field.as_str()),
+			(Channel::Color, "margin")
+		);
+		assert!(error.reason.contains("no supported semantic type"));
 	}
 
 	fn resolve(

@@ -251,6 +251,13 @@ fn project_named_channels(
 			}
 		}
 	}
+	if let Some(heatmap_fields) = spec.heatmap_fields() {
+		for field in heatmap_fields.all() {
+			if !fields.contains(&field) {
+				fields.push(field);
+			}
+		}
+	}
 	let projected = data
 		.select(fields)
 		.map_err(|error| format!("Cannot project plot channels from {source_name}: {error}"))?;
@@ -412,6 +419,102 @@ mod tests {
 			400,
 			300,
 		);
+	}
+
+	#[test]
+	fn product_0092_authored_heatmap_projects_all_roles_renders_and_keeps_identity() {
+		let selection = CategoricalPaletteSelection::from_theme_name("viridis").unwrap();
+		let mut identity = ColorIdentity::default();
+		let categorical = polars::df!(
+			"category" => ["a", "b"],
+			"value" => [1.0, 2.0],
+		)
+		.unwrap();
+		let (_, allocated) = plan_with_categorical_palette(
+			PlotRequest {
+				source: materialized("categorical", categorical),
+				authored_spec: AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::Bar),
+					"category",
+					"value",
+				),
+			},
+			&selection,
+			&identity,
+		)
+		.unwrap();
+		identity = allocated;
+
+		let frame = polars::df!(
+			"region" => ["north", "north", "south"],
+			"quarter" => ["q1", "q2", "q1"],
+			"margin" => [-10_i64, 5_i64, 20_i64],
+			"dropped" => [7_i64, 8_i64, 9_i64],
+		)
+		.unwrap();
+		let (resolved, after) = plan_with_categorical_palette(
+			PlotRequest {
+				source: materialized("heat", frame),
+				authored_spec: AuthoredPlotSpec::heatmap(crate::plot::spec::HeatmapFields {
+					x: "region".to_owned(),
+					y: "quarter".to_owned(),
+					value: "margin".to_owned(),
+				}),
+			},
+			&selection,
+			&identity,
+		)
+		.expect("authored heatmap plans");
+		assert_eq!(after, identity);
+		assert_eq!(
+			resolved
+				.data
+				.get_column_names()
+				.into_iter()
+				.map(|name| name.as_str())
+				.collect::<Vec<_>>(),
+			vec!["region", "quarter", "margin"]
+		);
+		assert_eq!(
+			crate::plot::kernels::heatmap::prepare_heatmap_data(
+				resolved.data.as_ref(),
+				"region",
+				"quarter",
+				"margin",
+			)
+			.unwrap()
+			.cells
+			.domain(),
+			(-10.0, 20.0)
+		);
+		let _kernel = crate::plot::factory::create_plot(
+			&resolved.resolved_spec,
+			resolved.data.as_ref(),
+			400,
+			300,
+		);
+	}
+
+	#[test]
+	fn product_0092_authored_duplicate_cells_refuse_before_render() {
+		let duplicate = polars::df!(
+			"region" => ["north", "north"],
+			"quarter" => ["q1", "q1"],
+			"margin" => [1.0, 9.0],
+		)
+		.unwrap();
+		let error = plan(PlotRequest {
+			source: materialized("authored duplicate", duplicate),
+			authored_spec: AuthoredPlotSpec::heatmap(crate::plot::spec::HeatmapFields {
+				x: "region".to_owned(),
+				y: "quarter".to_owned(),
+				value: "margin".to_owned(),
+			}),
+		})
+		.unwrap_err();
+		assert!(error.contains("(`north`, `q1`)"), "{error}");
+		assert!(error.contains("rows 1 and 2"), "{error}");
+		assert!(error.contains("aggregate duplicate cells"), "{error}");
 	}
 
 	#[test]
