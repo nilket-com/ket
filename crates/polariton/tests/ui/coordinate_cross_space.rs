@@ -1,12 +1,17 @@
 #[path = "../../src/coordinate.rs"]
 mod coordinate;
 
-use coordinate::{Pt, Rect, Widget, Window};
+use coordinate::{Cell, Plot, Pt, Rect, Widget};
 
-fn widget_cursor_against_window_rect(rect: Rect<Window>, cursor: Pt<Widget>) -> bool {
+fn cell_cursor_against_widget_rect(rect: Rect<Widget>, cursor: Pt<Cell>) -> bool {
+	rect.contains(cursor)
+}
+
+fn plot_cursor_against_widget_rect(rect: Rect<Widget>, cursor: Pt<Plot>) -> bool {
 	rect.contains(cursor)
 }
 
 fn main() {
-	let _ = widget_cursor_against_window_rect;
+	let _ = cell_cursor_against_widget_rect;
+	let _ = plot_cursor_against_widget_rect;
 }

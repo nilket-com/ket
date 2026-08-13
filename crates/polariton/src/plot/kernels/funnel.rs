@@ -1,3 +1,4 @@
+use crate::coordinate::{Pt, Widget};
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 	format_label,
@@ -166,7 +167,8 @@ impl PlotKernel for FunnelPlotKernel {
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position() {
-			let bounds = transform.bounds;
+			let cursor_pos = Pt::<Widget>::from_plot_kernel_cursor(cursor_pos);
+			let (bounds, cursor_pos) = transform.widget_hit_geometry(cursor_pos);
 			if !bounds.contains(cursor_pos) {
 				return None;
 			}
@@ -174,9 +176,9 @@ impl PlotKernel for FunnelPlotKernel {
 			if num_stages == 0 {
 				return None;
 			}
-			let stage_height = bounds.height / num_stages as f32;
-			let center_x = bounds.x + bounds.width / 2.0;
-			let stage_idx = ((cursor_pos.y - bounds.y) / stage_height).floor() as usize;
+			let stage_height = bounds.height() / num_stages as f32;
+			let center_x = bounds.x() + bounds.width() / 2.0;
+			let stage_idx = ((cursor_pos.y() - bounds.y()) / stage_height).floor() as usize;
 			let stage_idx = stage_idx.min(num_stages - 1);
 			let stage = self
 				.prepared_data
@@ -190,17 +192,17 @@ impl PlotKernel for FunnelPlotKernel {
 				.get(stage_idx + 1)
 				.map_or(val, |next| next.value());
 			let y_within_stage =
-				(cursor_pos.y - (bounds.y + stage_idx as f32 * stage_height)) / stage_height;
+				(cursor_pos.y() - (bounds.y() + stage_idx as f32 * stage_height)) / stage_height;
 			let current_val_at_y = val - (val - next_val) * f64::from(y_within_stage);
 			let first_value = self
 				.prepared_data
 				.stages
 				.first_value()
 				.expect("non-empty validated funnel has a positive first stage");
-			let current_width_at_y = funnel_width(current_val_at_y, first_value, bounds.width);
+			let current_width_at_y = funnel_width(current_val_at_y, first_value, bounds.width());
 			let left_x = center_x - current_width_at_y / 2.0;
 			let right_x = center_x + current_width_at_y / 2.0;
-			if cursor_pos.x >= left_x && cursor_pos.x <= right_x {
+			if cursor_pos.x() >= left_x && cursor_pos.x() <= right_x {
 				let mut hover_text =
 					format!("{}: {}", stage.stage(), format_label(val, AxisType::Linear));
 				if stage_idx > 0 {

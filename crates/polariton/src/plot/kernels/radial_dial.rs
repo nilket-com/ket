@@ -1,3 +1,4 @@
+use crate::coordinate::{Pt, Widget};
 use crate::plot::common::{
 	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
@@ -81,16 +82,17 @@ impl PlotKernel for RadialDialPlotKernel {
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position() {
-			let bounds = transform.bounds;
+			let cursor_pos = Pt::<Widget>::from_plot_kernel_cursor(cursor_pos);
+			let (bounds, cursor_pos) = transform.widget_hit_geometry(cursor_pos);
 			let center = Point::new(
-				bounds.x + bounds.width / 2.0,
-				bounds.y + bounds.height * 0.8,
+				bounds.x() + bounds.width() / 2.0,
+				bounds.y() + bounds.height() * 0.8,
 			);
-			let dx = cursor_pos.x - center.x;
-			let dy = cursor_pos.y - center.y;
+			let dx = cursor_pos.x() - center.x;
+			let dy = cursor_pos.y() - center.y;
 			let dist = (dx * dx + dy * dy).sqrt();
 			let num_cats = self.prepared_data.categories.len();
-			let max_radius = (bounds.width / 2.0).min(bounds.height * 0.7) * 0.9;
+			let max_radius = (bounds.width() / 2.0).min(bounds.height() * 0.7) * 0.9;
 			let ring_spacing = 5.0;
 			let ring_thickness =
 				(max_radius - (num_cats as f32 - 1.0) * ring_spacing) / num_cats as f32;

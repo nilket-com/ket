@@ -3308,3 +3308,57 @@ fn product_0096_funnel_has_one_exact_numeric_authority_and_no_legacy_fallbacks()
 	assert_eq!(factory.matches("prepare_funnel_data(").count(), 1);
 	assert!(!funnel.contains("sort"));
 }
+
+#[test]
+fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let production = rust_files(&root)
+		.into_iter()
+		.map(|path| std::fs::read_to_string(path).expect("read production source"))
+		.collect::<Vec<_>>()
+		.join("\n");
+	let coordinate =
+		std::fs::read_to_string(root.join("coordinate.rs")).expect("read coordinate vocabulary");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read plot grid");
+	let funnel =
+		std::fs::read_to_string(root.join("plot/kernels/funnel.rs")).expect("read funnel kernel");
+	let radial = std::fs::read_to_string(root.join("plot/kernels/radial_dial.rs"))
+		.expect("read radial dial kernel");
+
+	assert!(common.contains(
+		"fn widget_hit_geometry(&self, cursor: Pt<Widget>) -> (Rect<Widget>, Pt<Widget>)"
+	));
+	assert_eq!(coordinate.matches("from_plot_kernel_cursor").count(), 1);
+	assert_eq!(funnel.matches("from_plot_kernel_cursor").count(), 1);
+	assert_eq!(radial.matches("from_plot_kernel_cursor").count(), 1);
+	assert_eq!(coordinate.matches("from_transformer_bounds").count(), 1);
+	assert_eq!(common.matches("from_transformer_bounds").count(), 1);
+	assert_eq!(funnel.matches("widget_hit_geometry").count(), 1);
+	assert_eq!(radial.matches("widget_hit_geometry").count(), 1);
+	assert_eq!(production.matches("from_plot_kernel_cursor").count(), 3);
+	assert_eq!(production.matches("from_transformer_bounds").count(), 2);
+	assert_eq!(production.matches("widget_hit_geometry").count(), 3);
+	assert!(!coordinate.contains("fn from_iced("));
+
+	assert!(!grid.contains("Pt::<Cell>::from_widget"));
+	assert!(!grid.contains("Pt::<Plot>::from_widget"));
+	assert!(!grid.contains("_cell_cursor"));
+	assert!(grid.contains("Cursor::Available(cursor.into_iced())"));
+	assert!(!funnel.contains("transform.bounds"));
+	assert!(!radial.contains("transform.bounds"));
+	for source in [&funnel, &radial] {
+		assert!(!source.contains("cursor_pos.offset("));
+		assert!(!source.contains("bounds.offset("));
+	}
+
+	let trait_region = common
+		.split("pub trait PlotKernel")
+		.nth(1)
+		.expect("PlotKernel trait")
+		.split("pub struct PlotWidget")
+		.next()
+		.expect("bounded PlotKernel trait");
+	assert!(trait_region.contains("cursor: Cursor"));
+	assert!(!trait_region.contains("Pt<Widget>"));
+}

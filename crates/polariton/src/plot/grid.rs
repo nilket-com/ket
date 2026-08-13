@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use crate::coordinate::{Cell, Plot, Pt, Rect, Widget};
+use crate::coordinate::{Pt, Rect, Widget};
 use crate::plot::common::{
 	AxisTextAnchoring, AxisTextVisibility, CoordinateTransformer, PlotBackend, PlotComposite,
 	PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings,
@@ -812,15 +812,11 @@ impl PlotComposite for PlotGridKernel {
 			if !cell_bounds.contains(cursor) {
 				continue;
 			}
-			// Cell localization is explicit even though the legacy kernel seam
-			// below consumes the still-more-local Plot point.
-			let _cell_cursor = Pt::<Cell>::from_widget(cursor, cell_bounds);
 			let inner = grid_plot_area(cell_bounds, &resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
-			let local = Pt::<Plot>::from_widget(cursor, inner);
 			return cell.kernel.hover_with_settings(
 				&transform,
-				Cursor::Available(local.into_iced()),
+				Cursor::Available(cursor.into_iced()),
 				settings,
 			);
 		}
@@ -1084,6 +1080,8 @@ mod tests {
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use crate::plot::export::SvgBackend;
+	use crate::plot::kernels::funnel::{FunnelPlotKernel, prepare_funnel_data};
+	use crate::plot::kernels::radial_dial::{RadialDialPlotKernel, prepare_radial_dial_data};
 	use crate::plot::request::{PlotRequest, PlotSource, plan};
 	use crate::plot::spec::{AuthoredPlotSpec, Channel, PlotProvenance};
 	use iced::widget::canvas::{Stroke, Text};
@@ -1340,6 +1338,78 @@ mod tests {
 		let window =
 			Rect::<Window>::from_iced_layout(IcedRectangle::new(Point::ORIGIN, iced::Size::ZERO));
 		Pt::<Widget>::from_window(Pt::<Window>::from_iced_event(raw), window)
+	}
+
+	fn product_0097_settings() -> PlotSettings {
+		PlotSettings::from_resolved(ResolvedPlotSettings {
+			title: ResolvedPresence::Hide,
+			subtitle: ResolvedPresence::Hide,
+			x_label: ResolvedPresence::Hide,
+			y_label: ResolvedPresence::Hide,
+			legend: ResolvedPresence::Hide,
+			..ResolvedPlotSettings::default()
+		})
+	}
+
+	fn product_0097_grid(
+		frames: [DataFrame; 2],
+		mut factory: impl FnMut(&DataFrame) -> Arc<dyn PlotKernel + Send + Sync>,
+	) -> PlotGridKernel {
+		let (body, _, _) = fixture();
+		let [first, mut second] = frames.map(|data| GridCell {
+			position: GridPosition { row: 0, column: 0 },
+			body: Arc::clone(&body),
+			data: Arc::new(data),
+			x_group: 0,
+			y_group: 0,
+			label: None,
+		});
+		let mut cells = NonEmpty::new(first);
+		second.position.column = 1;
+		cells.push(second);
+		let grid = PlotGrid::new(
+			cells,
+			GridArrangement::new(1, 2).expect("PRODUCT-0097 arrangement"),
+		)
+		.expect("PRODUCT-0097 grid");
+		PlotGridKernel::from_grid_with_factory(grid, 800, 400, |_spec, data| Ok(factory(data)))
+			.expect("PRODUCT-0097 kernels")
+	}
+
+	fn product_0097_inner(
+		kernel: &PlotGridKernel,
+		cell_index: usize,
+		settings: &PlotSettings,
+	) -> Rect<Widget> {
+		let bounds = widget_rect(IcedRectangle::new(
+			Point::ORIGIN,
+			iced::Size::new(800.0, 400.0),
+		));
+		let resolved = settings.resolve();
+		let outer = grid_outer_area(bounds, 0.0);
+		let tiled = grid_tiled_area(outer, &resolved);
+		let (position, _) = &kernel.cell_layouts(resolved.clone())[cell_index];
+		grid_plot_area(
+			grid_cell_bounds(tiled, kernel.arrangement, *position),
+			&resolved,
+		)
+	}
+
+	fn product_0097_hover(
+		kernel: &PlotGridKernel,
+		point: Point,
+		settings: &PlotSettings,
+	) -> Option<String> {
+		PlotComposite::hover(
+			kernel,
+			widget_rect(IcedRectangle::new(
+				Point::ORIGIN,
+				iced::Size::new(800.0, 400.0),
+			)),
+			0.0,
+			widget_point(point),
+			settings,
+		)
 	}
 
 	fn fixture() -> (Arc<ResolvedPlotSpec>, Arc<DataFrame>, StampedResult) {
@@ -4135,6 +4205,76 @@ mod tests {
 		assert!(
 			miss.is_none(),
 			"a cursor outside every cell region must miss"
+		);
+	}
+
+	#[test]
+	fn product_0097_funnel_hover_uses_the_drawn_geometry_in_both_facet_cells() {
+		let frames = [
+			df!("stage" => ["A top", "A bottom"], "value" => [100.0, 50.0]).expect("first funnel"),
+			df!("stage" => ["B top", "B bottom"], "value" => [80.0, 40.0]).expect("second funnel"),
+		];
+		let kernel = product_0097_grid(frames, |data| {
+			Arc::new(FunnelPlotKernel {
+				prepared_data: Arc::new(
+					prepare_funnel_data(data, "stage", "value").expect("valid funnel"),
+				),
+			})
+		});
+		let settings = product_0097_settings();
+		let mut results = Vec::new();
+		for cell_index in 0..2 {
+			let inner = product_0097_inner(&kernel, cell_index, &settings);
+			let point = Point::new(
+				inner.x() + inner.width() / 2.0,
+				inner.y() + inner.height() / 4.0,
+			);
+			results.push(product_0097_hover(&kernel, point, &settings));
+		}
+		assert_eq!(
+			results,
+			[
+				// Stage 0 bank: this first-cell value was already byte-identical.
+				Some("A top: 100\nTotal Rate: 100.0%".to_owned()),
+				// Stage 0 bank: this exact probe returned None before PRODUCT-0097.
+				Some("B top: 80\nTotal Rate: 100.0%".to_owned()),
+			]
+		);
+	}
+
+	#[test]
+	fn product_0097_radial_hover_uses_the_drawn_geometry_in_both_facet_cells() {
+		let frames = [
+			df!("category" => ["A ring"], "value" => [30.0], "maximum" => [60.0])
+				.expect("first radial dial"),
+			df!("category" => ["B ring"], "value" => [40.0], "maximum" => [80.0])
+				.expect("second radial dial"),
+		];
+		let kernel = product_0097_grid(frames, |data| {
+			Arc::new(RadialDialPlotKernel {
+				prepared_data: Arc::new(prepare_radial_dial_data(
+					data, "category", "value", "maximum",
+				)),
+			})
+		});
+		let settings = product_0097_settings();
+		let mut results = Vec::new();
+		for cell_index in 0..2 {
+			let inner = product_0097_inner(&kernel, cell_index, &settings);
+			let max_radius = (inner.width() / 2.0).min(inner.height() * 0.7) * 0.9;
+			let point = Point::new(
+				inner.x() + inner.width() / 2.0,
+				inner.y() + inner.height() * 0.8 - max_radius / 2.0,
+			);
+			results.push(product_0097_hover(&kernel, point, &settings));
+		}
+		assert_eq!(
+			results,
+			[
+				// Stage 0 bank: both exact probes returned None before PRODUCT-0097.
+				Some("A ring: 30.0 / 60.0 (50%)".to_owned()),
+				Some("B ring: 40.0 / 80.0 (50%)".to_owned()),
+			]
 		);
 	}
 

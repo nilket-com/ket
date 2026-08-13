@@ -196,17 +196,27 @@ impl Rect<Widget> {
 	pub(crate) fn from_iced_frame(raw: Rectangle) -> Self {
 		Self::wrap(Rectangle::new(Point::ORIGIN, raw.size()))
 	}
-}
 
-impl Pt<Widget> {
-	pub(crate) fn from_window(point: Pt<Window>, widget: Rect<Window>) -> Self {
-		Self::wrap(Point::new(point.x() - widget.x(), point.y() - widget.y()))
+	/// Assert the raw bounds retained by `CoordinateTransformer` are widget-space.
+	///
+	/// PRODUCT-0097 keeps this trust assertion narrow rather than exposing a
+	/// generic raw-rectangle relabelling constructor.
+	pub(crate) fn from_transformer_bounds(raw: Rectangle) -> Self {
+		Self::wrap(raw)
 	}
 }
 
-impl Pt<Cell> {
-	pub(crate) fn from_widget(point: Pt<Widget>, cell: Rect<Widget>) -> Self {
-		Self::wrap(Point::new(point.x() - cell.x(), point.y() - cell.y()))
+impl Pt<Widget> {
+	/// Assert a raw cursor received by `PlotKernel::hover` is widget-space.
+	///
+	/// PRODUCT-0097 keeps this trust assertion at the two kernels whose hover
+	/// geometry consumes the transformer's widget-space bounds.
+	pub(crate) fn from_plot_kernel_cursor(raw: Point) -> Self {
+		Self::wrap(raw)
+	}
+
+	pub(crate) fn from_window(point: Pt<Window>, widget: Rect<Window>) -> Self {
+		Self::wrap(Point::new(point.x() - widget.x(), point.y() - widget.y()))
 	}
 }
 

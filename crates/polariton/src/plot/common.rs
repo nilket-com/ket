@@ -256,6 +256,15 @@ impl<'a> CoordinateTransformer<'a> {
 		Self { layout, bounds }
 	}
 
+	/// Pair the transformer's bounds with a cursor in their shared widget space.
+	///
+	/// `PlotKernel::hover` remains an untyped iced boundary. PRODUCT-0097 makes
+	/// the space expected after that boundary explicit without changing the
+	/// transformer field or every kernel signature.
+	pub(crate) fn widget_hit_geometry(&self, cursor: Pt<Widget>) -> (Rect<Widget>, Pt<Widget>) {
+		(Rect::<Widget>::from_transformer_bounds(self.bounds), cursor)
+	}
+
 	/// Resolve a prepared category's semantic identity into the slot owned by
 	/// the transform's complete display domain. PRODUCT-0065 requires this
 	/// indirection because a faceted slice may omit categories while its shared
