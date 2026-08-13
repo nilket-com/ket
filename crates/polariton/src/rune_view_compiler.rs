@@ -24,6 +24,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"area",
 	"bar",
 	"box",
+	"bubble",
 	"facet",
 	"figure",
 	"histogram",
@@ -495,11 +496,13 @@ fn static_method_on_relation(
 			},
 		);
 	}
-	if method == "box" {
+	if matches!(method, "box" | "bubble") {
 		return invalid_view(
 			call.span(),
 			source.len(),
-			"box is a sink inside .views([...]); relation.box(...) sugar is not available",
+			format!(
+				"{method} is a sink inside .views([...]); relation.{method}(...) sugar is not available"
+			),
 		);
 	}
 	if method == "table" && args.is_empty() {
@@ -621,11 +624,14 @@ fn recognize_legacy_root(
 	};
 	let callee = source_slice(source, call.expr.span())?.trim();
 	let args = call.args.iter().map(|(arg, _)| arg).collect::<Vec<_>>();
-	if !shadows.plot && callee == "plot.box" {
+	if !shadows.plot && matches!(callee, "plot.box" | "plot.bubble") {
+		let mark = callee.trim_start_matches("plot.");
 		return invalid_view(
 			call.span(),
 			source.len(),
-			"legacy plot.box(relation, ...) is not available; use relation.views([box(...)])",
+			format!(
+				"legacy plot.{mark}(relation, ...) is not available; use relation.views([{mark}(...)])"
+			),
 		);
 	}
 	if !shadows.plot
@@ -1267,15 +1273,16 @@ fn rewrite_calls_mapped(
 			replacement,
 			owner: u32_range(&(origin_start..origin_end), "presentation call origin")?,
 		});
-		let origin_arity = match name.as_str() {
-			"box" => Some(7),
-			"heatmap" => Some(3),
+		let origin_arities: Option<&[usize]> = match name.as_str() {
+			"box" => Some(&[7]),
+			"bubble" => Some(&[4, 5]),
+			"heatmap" => Some(&[3]),
 			_ => None,
 		};
-		let injected_origins = if let Some(origin_arity) = origin_arity.filter(|_| !is_method) {
+		let injected_origins = if let Some(origin_arities) = origin_arities.filter(|_| !is_method) {
 			let arguments =
 				call_argument_ranges(fragment, original_start, &tokens, open_index, close_index)?;
-			if arguments.len() != origin_arity {
+			if !origin_arities.contains(&arguments.len()) {
 				String::new()
 			} else {
 				arguments
@@ -1669,7 +1676,7 @@ fn is_keyword(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use crate::plot::spec::{Override, Presence};
+	use crate::plot::spec::{BubbleNumericField, BubblePreparationChannel, Override, Presence};
 	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent};
 	use std::sync::Arc;
 
@@ -1701,6 +1708,111 @@ mod tests {
 			rewritten,
 			"polariton_presentation::__heatmap(\"region\", \"quarter\", \"margin\", 108, 116, 118, 127, 129, 137, 100, 138)"
 		);
+	}
+
+	#[test]
+	fn product_0095_bubble_rewriter_retains_four_or_five_argument_origins() {
+		for (source, expected) in [
+			(
+				"bubble(\"x\", \"y\", \"size\", \"color\")",
+				"polariton_presentation::__bubble(\"x\", \"y\", \"size\", \"color\", 107, 110, 112, 115, 117, 123, 125, 132, 100, 133)",
+			),
+			(
+				"bubble(\"x\", \"y\", \"size\", \"color\", \"label\")",
+				"polariton_presentation::__bubble(\"x\", \"y\", \"size\", \"color\", \"label\", 107, 110, 112, 115, 117, 123, 125, 132, 134, 141, 100, 142)",
+			),
+		] {
+			assert_eq!(
+				rewrite_calls(source, 100).expect("rewrite bubble call"),
+				expected
+			);
+		}
+	}
+
+	#[test]
+	fn product_0095_bubble_surface_positions_arities_and_origins_are_closed() {
+		for fields in [
+			"\"x\", \"y\", \"size\", \"color\"",
+			"\"x\", \"y\", \"size\", \"color\", \"label\"",
+		] {
+			for slot in [
+				format!("bubble({fields})"),
+				format!("view(\"named\", bubble({fields}))"),
+				format!("view(\"named\", figure([bubble({fields})]))"),
+				format!("figure([bubble({fields})])"),
+			] {
+				let source = format!(
+					"let relation = workspace.table(\"bubble_probe\");\nrelation.views([{slot}]);"
+				);
+				let compiled = compile(&source).unwrap_or_else(|error| panic!("{slot}: {error}"));
+				let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+					panic!("bubble surface produced a table")
+				};
+				let sink = match &plot.body {
+					RunePlotBody::Single(sink) => sink,
+					RunePlotBody::StyledSingle(styled) => &styled.sink,
+					RunePlotBody::Layered(_) => panic!("bubble surface produced layers"),
+				};
+				assert_eq!(
+					sink.composition.primary_plot_type(),
+					crate::plot::core::PlotType::Bubble
+				);
+				let (fields, origins) = sink
+					.mark_fields
+					.as_ref()
+					.and_then(|fields| fields.bubble())
+					.expect("bubble fields and origins");
+				assert_eq!(fields.numeric.get(BubbleNumericField::Color), "color");
+				assert_eq!(
+					fields.label.as_deref(),
+					fields.label.as_ref().map(|_| "label")
+				);
+				for role in [
+					BubblePreparationChannel::X,
+					BubblePreparationChannel::Y,
+					BubblePreparationChannel::Size,
+					BubblePreparationChannel::Color,
+				] {
+					let origin = origins.for_role(role).expect("required bubble origin");
+					assert_eq!(
+						&source[origin.start as usize..origin.end as usize],
+						format!("\"{}\"", role.as_str())
+					);
+				}
+				assert_eq!(
+					origins
+						.for_role(BubblePreparationChannel::Label)
+						.map(|origin| &source[origin.start as usize..origin.end as usize]),
+					fields.label.as_ref().map(|_| "\"label\"")
+				);
+			}
+		}
+
+		let fields = "\"x\", \"y\", \"size\", \"color\"";
+		for source in [
+			format!(
+				"let r = workspace.table(\"bubble_probe\"); r.views([layers([bubble({fields})])]);"
+			),
+			format!("plot.bubble(workspace.table(\"bubble_probe\"), {fields});"),
+			format!("workspace.table(\"bubble_probe\").bubble({fields});"),
+		] {
+			assert!(
+				compile(&source).is_err(),
+				"accepted forbidden surface: {source}"
+			);
+		}
+		for source in [
+			"let r = workspace.table(\"bubble_probe\"); r.views([bubble(\"x\", \"y\", \"size\")]);",
+			"let r = workspace.table(\"bubble_probe\"); r.views([bubble(\"x\", \"y\", \"size\", \"color\", \"label\", \"extra\")]);",
+		] {
+			let error = compile(source).expect_err("invalid bubble arity must refuse");
+			assert!(
+				error.to_string().contains(
+					"bubble(...) takes x, y, size, and color strings, with an optional label string"
+				),
+				"wrong invalid-arity diagnostic for {source}: {error}"
+			);
+		}
 	}
 
 	#[test]
@@ -1875,6 +1987,36 @@ mod tests {
 		}
 		assert!(source.contains("South/Q2 is absent"));
 		assert!(source.contains("aggregate in the relation"));
+	}
+
+	#[test]
+	fn product_0095_test28_is_the_labelled_and_unlabelled_bubble_exhibit() {
+		let source = include_str!("../../../uat/test28.rn");
+		let compiled = compile(source).expect("the checked-in bubble exhibit compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(compiled.presentation_order.len(), 2);
+		assert_eq!(compiled.executions[0].views.len(), 2);
+		for (index, view) in compiled.executions[0].views.iter().enumerate() {
+			let RuneViewIntent::Plot(plot) = &view.intent else {
+				panic!("bubble exhibit produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("bubble exhibit did not retain one standalone mark")
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::Bubble
+			);
+			let (fields, _) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(|fields| fields.bubble())
+				.expect("bubble fields and origins");
+			assert_eq!(fields.label.as_deref(), (index == 0).then_some("label"));
+		}
+		assert!(source.contains("Signed colour −30…40"));
+		assert!(source.contains("null label stays absent in hover"));
+		assert!(source.contains("Point 0, Point 1, …"));
 	}
 
 	#[test]

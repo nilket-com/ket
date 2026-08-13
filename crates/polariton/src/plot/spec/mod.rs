@@ -10,8 +10,8 @@
 
 mod bubble_fields;
 
-pub(crate) use bubble_fields::BubbleNumericField;
 pub use bubble_fields::{BubbleFieldNames, BubbleFields};
+pub(crate) use bubble_fields::{BubbleNumericField, BubblePreparationChannel};
 
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
@@ -533,6 +533,23 @@ impl AuthoredPlotSpec {
 	pub fn heatmap_fields(&self) -> Option<&HeatmapFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::Heatmap(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn bubble(fields: BubbleFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::Bubble),
+			fields.numeric.get(BubbleNumericField::X),
+			fields.numeric.get(BubbleNumericField::Y),
+		);
+		spec.mark_fields = Some(MarkFields::Bubble(fields));
+		spec
+	}
+
+	pub fn bubble_fields(&self) -> Option<&BubbleFields> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::Bubble(fields)) => Some(fields),
 			_ => None,
 		}
 	}
@@ -1470,20 +1487,33 @@ pub(crate) enum AllocationSpaceSnapshot {
 	CategoricalPalette { len: usize },
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FieldAttribution {
+	Channel(Channel),
+	Role(&'static str),
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChannelError {
-	pub channel: Channel,
+	pub attribution: FieldAttribution,
 	pub field: String,
 	pub reason: String,
 }
 
 impl fmt::Display for ChannelError {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		write!(
-			formatter,
-			"plot {} channel `{}` could not resolve: {}",
-			self.channel, self.field, self.reason
-		)
+		match self.attribution {
+			FieldAttribution::Channel(channel) => write!(
+				formatter,
+				"plot {channel} channel `{}` could not resolve: {}",
+				self.field, self.reason
+			),
+			FieldAttribution::Role(role) => write!(
+				formatter,
+				"plot {role} field `{}` could not resolve: {}",
+				self.field, self.reason
+			),
+		}
 	}
 }
 
@@ -1586,7 +1616,7 @@ pub fn resolve_channels(
 			plot_type == PlotType::StackedArea || (plot_type == PlotType::Bar && spec.stacked_bar);
 		if !admitted {
 			return Err(ChannelError {
-				channel: Channel::X,
+				attribution: FieldAttribution::Channel(Channel::X),
 				field: "<authored>".to_owned(),
 				reason: if plot_type == PlotType::Bar {
 					"percent() requires stacked() on bar marks".to_owned()
@@ -1605,6 +1635,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::Heatmap && spec.heatmap_fields().is_some() {
 		return resolve_heatmap_channels(spec, schema);
 	}
+	if plot_type == PlotType::Bubble && spec.bubble_fields().is_some() {
+		return resolve_bubble_channels(spec, schema);
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -1619,7 +1652,7 @@ pub fn resolve_channels(
 			|| !matches!(spec.color.field, OptionalAuthoredChannel::Auto)
 		{
 			return Err(ChannelError {
-				channel: Channel::X,
+				attribution: FieldAttribution::Channel(Channel::X),
 				field: "<authored>".to_owned(),
 				reason: format!("{plot_type} does not yet expose authored channel roles"),
 			});
@@ -1683,7 +1716,7 @@ pub fn resolve_channels(
 			PlotType::HorizontalBar => PlotType::HorizontalStackedBar,
 			_ => {
 				return Err(ChannelError {
-					channel: Channel::X,
+					attribution: FieldAttribution::Channel(Channel::X),
 					field: "<authored>".to_owned(),
 					reason: ".stacked() is available on bar marks".to_owned(),
 				});
@@ -1710,7 +1743,7 @@ pub fn resolve_channels(
 		}) {
 		let color = color.as_ref().expect("checked as present");
 		return Err(ChannelError {
-			channel: Channel::Color,
+			attribution: FieldAttribution::Channel(Channel::Color),
 			field: color.field.clone(),
 			reason: format!(
 				"{} series must be categorical",
@@ -1729,7 +1762,7 @@ pub fn resolve_channels(
 	if let (Some(color), Some(job)) = (color.as_mut(), color_job) {
 		if !color_job_is_compatible(job, color.semantic_type) {
 			return Err(ChannelError {
-				channel: Channel::Color,
+				attribution: FieldAttribution::Channel(Channel::Color),
 				field: color.field.clone(),
 				reason: format!(
 					"color job {job:?} is incompatible with {:?}",
@@ -1742,7 +1775,7 @@ pub fn resolve_channels(
 			Override::Inherit => color.scale = job_scale,
 			Override::Set(_) if color.scale != job_scale => {
 				return Err(ChannelError {
-					channel: Channel::Color,
+					attribution: FieldAttribution::Channel(Channel::Color),
 					field: color.field.clone(),
 					reason: format!("color job {job:?} requires scale {job_scale:?}"),
 				});
@@ -1809,7 +1842,7 @@ fn resolve_histogram_channels(
 			| DataType::UInt64
 	) {
 		return Err(ChannelError {
-			channel: Channel::Y,
+			attribution: FieldAttribution::Channel(Channel::Y),
 			field: count.field,
 			reason: format!(
 				"histogram count requires an integer dtype through u64, got {count_dtype:?}"
@@ -1817,18 +1850,18 @@ fn resolve_histogram_channels(
 		});
 	}
 	let bin_end = spec.histogram_end().ok_or_else(|| ChannelError {
-		channel: Channel::X,
+		attribution: FieldAttribution::Channel(Channel::X),
 		field: "<authored>".to_owned(),
 		reason: "histogram requires an explicit bin_end field".to_owned(),
 	})?;
 	let end_dtype = schema.get(bin_end).ok_or_else(|| ChannelError {
-		channel: Channel::X,
+		attribution: FieldAttribution::Channel(Channel::X),
 		field: bin_end.to_owned(),
 		reason: "field is absent from the returned schema".to_owned(),
 	})?;
 	if !matches!(semantic_type(end_dtype), Some(SemanticType::Quantitative)) {
 		return Err(ChannelError {
-			channel: Channel::X,
+			attribution: FieldAttribution::Channel(Channel::X),
 			field: bin_end.to_owned(),
 			reason: format!("histogram bin_end requires a quantitative dtype, got {end_dtype:?}"),
 		});
@@ -1852,7 +1885,7 @@ fn resolve_box_plot_channels(
 	schema: &Schema,
 ) -> Result<ChannelBinding, ChannelError> {
 	let fields = spec.box_plot_fields().ok_or_else(|| ChannelError {
-		channel: Channel::X,
+		attribution: FieldAttribution::Channel(Channel::X),
 		field: "<box plot>".to_owned(),
 		reason: "Box Plot has no producer; seven explicit Tukey fields are required".to_owned(),
 	})?;
@@ -1887,13 +1920,13 @@ fn resolve_box_plot_channels(
 		("outlier", &fields.outlier),
 	] {
 		let dtype = schema.get(field.as_str()).ok_or_else(|| ChannelError {
-			channel: Channel::Y,
+			attribution: FieldAttribution::Channel(Channel::Y),
 			field: field.clone(),
 			reason: format!("box {role} field is absent from the returned schema"),
 		})?;
 		if !matches!(semantic_type(dtype), Some(SemanticType::Quantitative)) {
 			return Err(ChannelError {
-				channel: Channel::Y,
+				attribution: FieldAttribution::Channel(Channel::Y),
 				field: field.clone(),
 				reason: format!("box {role} requires a quantitative dtype, got {dtype:?}"),
 			});
@@ -1922,7 +1955,7 @@ fn resolve_heatmap_channels(
 	schema: &Schema,
 ) -> Result<ChannelBinding, ChannelError> {
 	let fields = spec.heatmap_fields().ok_or_else(|| ChannelError {
-		channel: Channel::X,
+		attribution: FieldAttribution::Channel(Channel::X),
 		field: "<heatmap>".to_owned(),
 		reason: "Heatmap requires explicit x, y, and value fields".to_owned(),
 	})?;
@@ -1952,18 +1985,18 @@ fn resolve_heatmap_channels(
 	let value_dtype = schema
 		.get(fields.value.as_str())
 		.ok_or_else(|| ChannelError {
-			channel: Channel::Color,
+			attribution: FieldAttribution::Channel(Channel::Color),
 			field: fields.value.clone(),
 			reason: "heatmap value field is absent from the returned schema".to_owned(),
 		})?;
 	let value_semantic = semantic_type(value_dtype).ok_or_else(|| ChannelError {
-		channel: Channel::Color,
+		attribution: FieldAttribution::Channel(Channel::Color),
 		field: fields.value.clone(),
 		reason: format!("dtype {value_dtype:?} has no supported semantic type"),
 	})?;
 	if value_semantic != SemanticType::Quantitative {
 		return Err(ChannelError {
-			channel: Channel::Color,
+			attribution: FieldAttribution::Channel(Channel::Color),
 			field: fields.value.clone(),
 			reason: format!("heatmap value requires a quantitative dtype, got {value_dtype:?}"),
 		});
@@ -1982,6 +2015,103 @@ fn resolve_heatmap_channels(
 	})
 }
 
+fn resolve_bubble_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.bubble_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("bubble"),
+		field: "<bubble>".to_owned(),
+		reason: "Bubble requires explicit x, y, size, and color fields".to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::Bubble,
+	};
+	let mut used_by_auto = HashSet::new();
+	let x = resolve_required(
+		Channel::X,
+		&spec.x,
+		PlotType::Bubble,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let y = resolve_required(
+		Channel::Y,
+		&spec.y,
+		PlotType::Bubble,
+		&layer,
+		false,
+		schema,
+		&mut used_by_auto,
+	)?;
+	let validate_role = |role: BubblePreparationChannel,
+	                     field: &str,
+	                     required: SemanticType|
+	 -> Result<(), ChannelError> {
+		let attribution = FieldAttribution::Role(role.as_str());
+		let dtype = schema.get(field).ok_or_else(|| ChannelError {
+			attribution,
+			field: field.to_owned(),
+			reason: format!(
+				"bubble {} field is absent from the returned schema",
+				role.as_str()
+			),
+		})?;
+		let semantic = semantic_type(dtype).ok_or_else(|| ChannelError {
+			attribution,
+			field: field.to_owned(),
+			reason: format!("dtype {dtype:?} has no supported semantic type"),
+		})?;
+		if semantic != required {
+			return Err(ChannelError {
+				attribution,
+				field: field.to_owned(),
+				reason: format!(
+					"bubble {} requires a {required:?} dtype, got {dtype:?}",
+					role.as_str()
+				),
+			});
+		}
+		Ok(())
+	};
+	let size = fields.numeric.get(BubbleNumericField::Size);
+	let color = fields.numeric.get(BubbleNumericField::Color);
+	validate_role(
+		BubblePreparationChannel::Size,
+		size,
+		SemanticType::Quantitative,
+	)?;
+	validate_role(
+		BubblePreparationChannel::Color,
+		color,
+		SemanticType::Quantitative,
+	)?;
+	if let Some(label) = fields.label.as_deref() {
+		validate_role(
+			BubblePreparationChannel::Label,
+			label,
+			SemanticType::Nominal,
+		)?;
+	}
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![x, y],
+		kernel_fields: Box::new(ResolvedKernelFields::Bubble {
+			x: fields.numeric.get(BubbleNumericField::X).to_owned(),
+			y: fields.numeric.get(BubbleNumericField::Y).to_owned(),
+			size: size.to_owned(),
+			color: color.to_owned(),
+			label: fields.label.clone(),
+		}),
+		color_job: None,
+		categorical_limit: 0,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
 fn resolve_bar_orientation(x: &BoundChannel, y: &BoundChannel) -> Result<PlotType, ChannelError> {
 	match (
 		x.semantic_type == SemanticType::Quantitative,
@@ -1993,7 +2123,7 @@ fn resolve_bar_orientation(x: &BoundChannel, y: &BoundChannel) -> Result<PlotTyp
 			// Resolution failures are attributed to the complete Rune sink. The
 			// existing carrier requires a channel and field, while the reason names
 			// both facts and deliberately assigns blame to neither one alone.
-			channel: Channel::X,
+			attribution: FieldAttribution::Channel(Channel::X),
 			field: x.field.clone(),
 			reason: format!(
 				"bar requires exactly one quantitative value axis and one non-quantitative category axis; x `{}` resolved as {:?}, y `{}` resolved as {:?}",
@@ -2294,7 +2424,7 @@ fn kernel_fields_from_channels(
 	};
 	let required = |channel| {
 		field(channel).ok_or_else(|| ChannelError {
-			channel,
+			attribution: FieldAttribution::Channel(channel),
 			field: "<resolved>".to_owned(),
 			reason: "required channel was not carried into the kernel contract".to_owned(),
 		})
@@ -2364,7 +2494,7 @@ fn resolve_automatic_kernel_fields(
 		.collect::<Vec<_>>();
 	let number = |index: usize, role: &str| {
 		numeric.get(index).cloned().ok_or_else(|| ChannelError {
-			channel: Channel::Y,
+			attribution: FieldAttribution::Channel(Channel::Y),
 			field: format!("<{role}>"),
 			reason: format!(
 				"{plot_type} requires numeric field {} for {role}",
@@ -2374,7 +2504,7 @@ fn resolve_automatic_kernel_fields(
 	};
 	let category = |index: usize, role: &str| {
 		nominal.get(index).cloned().ok_or_else(|| ChannelError {
-			channel: Channel::X,
+			attribution: FieldAttribution::Channel(Channel::X),
 			field: format!("<{role}>"),
 			reason: format!(
 				"{plot_type} requires categorical field {} for {role}",
@@ -2415,7 +2545,7 @@ fn resolve_automatic_kernel_fields(
 		},
 		PlotType::BoxPlot => {
 			return Err(ChannelError {
-				channel: Channel::Y,
+				attribution: FieldAttribution::Channel(Channel::Y),
 				field: "<box plot>".to_owned(),
 				reason: "Box Plot has no producer; explicit Tukey summary fields are required"
 					.to_owned(),
@@ -2423,7 +2553,7 @@ fn resolve_automatic_kernel_fields(
 		}
 		PlotType::Histogram => {
 			return Err(ChannelError {
-				channel: Channel::X,
+				attribution: FieldAttribution::Channel(Channel::X),
 				field: "<histogram>".to_owned(),
 				reason: "Histogram Plot has no producer; explicit interval fields are required"
 					.to_owned(),
@@ -2445,7 +2575,7 @@ fn resolve_automatic_kernel_fields(
 			dimensions: (!numeric.is_empty())
 				.then(|| numeric.clone())
 				.ok_or_else(|| ChannelError {
-					channel: Channel::Y,
+					attribution: FieldAttribution::Channel(Channel::Y),
 					field: "<dimensions>".to_owned(),
 					reason: "Parallel requires at least one numeric dimension".to_owned(),
 				})?,
@@ -2455,7 +2585,7 @@ fn resolve_automatic_kernel_fields(
 			dimensions: (!numeric.is_empty())
 				.then(|| numeric.clone())
 				.ok_or_else(|| ChannelError {
-					channel: Channel::Y,
+					attribution: FieldAttribution::Channel(Channel::Y),
 					field: "<dimensions>".to_owned(),
 					reason: "Radar requires at least one numeric dimension".to_owned(),
 				})?,
@@ -2504,19 +2634,19 @@ fn resolve_required(
 		AuthoredChannel::Named(field) => field.clone(),
 		AuthoredChannel::Auto => {
 			infer_field(channel, plot_type, schema, used_by_auto).ok_or_else(|| ChannelError {
-				channel,
+				attribution: FieldAttribution::Channel(channel),
 				field: "<auto>".to_owned(),
 				reason: "no compatible unused field is available for explicit Auto".to_owned(),
 			})?
 		}
 	};
 	let dtype = schema.get(field.as_str()).ok_or_else(|| ChannelError {
-		channel,
+		attribution: FieldAttribution::Channel(channel),
 		field: field.clone(),
 		reason: "field is absent from the returned schema".to_owned(),
 	})?;
 	let inferred_semantic = semantic_type(dtype).ok_or_else(|| ChannelError {
-		channel,
+		attribution: FieldAttribution::Channel(channel),
 		field: field.clone(),
 		reason: format!("dtype {dtype:?} has no supported semantic type"),
 	})?;
@@ -2529,7 +2659,7 @@ fn resolve_required(
 		&& plot_type == PlotType::Bar;
 	if !pair_candidate && !semantic_is_compatible(plot_type, channel, semantic_type) {
 		return Err(ChannelError {
-			channel,
+			attribution: FieldAttribution::Channel(channel),
 			field,
 			reason: format!("{semantic_type:?} is incompatible with {plot_type:?}"),
 		});
@@ -2541,7 +2671,7 @@ fn resolve_required(
 	};
 	if !scale_is_compatible(channel, semantic_type, scale) {
 		return Err(ChannelError {
-			channel,
+			attribution: FieldAttribution::Channel(channel),
 			field,
 			reason: format!("scale {scale:?} is incompatible with {semantic_type:?}"),
 		});
@@ -2672,6 +2802,7 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		}
 		(PlotType::BoxPlot, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Heatmap, Channel::X | Channel::Y) => semantic == SemanticType::Nominal,
+		(PlotType::Bubble, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -3298,7 +3429,7 @@ mod tests {
 		let mut ordinal = heatmap_spec();
 		ordinal.x.semantic_type = Override::Set(SemanticType::Ordinal);
 		let error = resolve_channels(&ordinal, categorical.schema().as_ref()).unwrap_err();
-		assert_eq!(error.channel, Channel::X);
+		assert_eq!(error.attribution, FieldAttribution::Channel(Channel::X));
 		assert_eq!(error.field, "region");
 		assert!(error.reason.contains("Ordinal") && error.reason.contains("Heatmap"));
 
@@ -3310,8 +3441,8 @@ mod tests {
 		.unwrap();
 		let error = resolve_channels(&heatmap_spec(), numeric_axis.schema().as_ref()).unwrap_err();
 		assert_eq!(
-			(error.channel, error.field.as_str()),
-			(Channel::X, "region")
+			(error.attribution, error.field.as_str()),
+			(FieldAttribution::Channel(Channel::X), "region")
 		);
 
 		for value in [
@@ -3329,8 +3460,8 @@ mod tests {
 			.unwrap();
 			let error = resolve_channels(&heatmap_spec(), frame.schema().as_ref()).unwrap_err();
 			assert_eq!(
-				(error.channel, error.field.as_str()),
-				(Channel::Color, "margin")
+				(error.attribution, error.field.as_str()),
+				(FieldAttribution::Channel(Channel::Color), "margin")
 			);
 			assert!(error.reason.contains("quantitative"));
 		}
@@ -3338,8 +3469,8 @@ mod tests {
 		let missing = df!("region" => ["north"], "quarter" => ["q1"]).unwrap();
 		let error = resolve_channels(&heatmap_spec(), missing.schema().as_ref()).unwrap_err();
 		assert_eq!(
-			(error.channel, error.field.as_str()),
-			(Channel::Color, "margin")
+			(error.attribution, error.field.as_str()),
+			(FieldAttribution::Channel(Channel::Color), "margin")
 		);
 		assert!(error.reason.contains("absent"));
 	}
@@ -3364,10 +3495,158 @@ mod tests {
 		.collect();
 		let error = resolve_channels(&heatmap_spec(), &schema).unwrap_err();
 		assert_eq!(
-			(error.channel, error.field.as_str()),
-			(Channel::Color, "margin")
+			(error.attribution, error.field.as_str()),
+			(FieldAttribution::Channel(Channel::Color), "margin")
 		);
 		assert!(error.reason.contains("no supported semantic type"));
+	}
+
+	fn bubble_spec(label: Option<&str>) -> AuthoredPlotSpec {
+		AuthoredPlotSpec::bubble(BubbleFields::new(
+			BubbleFieldNames::new("x", "y", "size", "color"),
+			label.map(str::to_owned),
+		))
+	}
+
+	fn bubble_frame(label: Column) -> DataFrame {
+		DataFrame::new(
+			2,
+			vec![
+				Column::new("x".into(), [1.0_f64, 2.0]),
+				Column::new("y".into(), [3_i64, 4]),
+				Column::new("size".into(), [10.0_f64, 100.0]),
+				Column::new("color".into(), [-30.0_f64, 40.0]),
+				label,
+			],
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn product_0095_bubble_binds_four_or_five_roles_without_categorical_identity() {
+		let frame = bubble_frame(Column::new("label".into(), ["first", "second"]));
+		for label in [None, Some("label")] {
+			let spec = bubble_spec(label);
+			assert!(matches!(spec.color.field, OptionalAuthoredChannel::Absent));
+			assert_eq!(spec.x.semantic_type, Override::Inherit);
+			assert_eq!(spec.y.semantic_type, Override::Inherit);
+			let binding = resolve_channels(&spec, frame.schema().as_ref())
+				.expect("authored bubble roles bind");
+			assert!(binding.channels.iter().all(|channel| {
+				channel.semantic_type == SemanticType::Quantitative
+					&& channel.scale == ScaleFamily::Linear
+			}));
+			assert_eq!(binding.color_job, None);
+			assert!(matches!(
+				binding.kernel_fields.as_ref(),
+				ResolvedKernelFields::Bubble { x, y, size, color, label: actual }
+					if (x.as_str(), y.as_str(), size.as_str(), color.as_str(), actual.as_deref())
+						== ("x", "y", "size", "color", label)
+			));
+		}
+	}
+
+	#[test]
+	fn product_0095_bubble_resolution_does_not_allocate_colour_identity() {
+		let categories = vec!["alpha".to_owned(), "beta".to_owned()];
+		let (_, seeded) = resolve(
+			&legacy_category_spec(),
+			&legacy_category_frame(&categories),
+			&ColorIdentity::default(),
+		)
+		.expect("categorical fixture seeds identity");
+		let before = seeded.clone();
+		let frame = stamped(bubble_frame(Column::new(
+			"label".into(),
+			["first", "second"],
+		)));
+		let (_, after) = resolve(&bubble_spec(Some("label")), &frame, &seeded)
+			.expect("authored bubble resolves");
+		assert_eq!(after, before);
+	}
+
+	#[test]
+	fn product_0095_bubble_compatibility_is_quantitative_numeric_and_nominal_label() {
+		let valid = bubble_frame(Column::new("label".into(), ["first", "second"]));
+		for axis in ["x", "y"] {
+			let mut columns = valid.columns().to_vec();
+			let index = valid.get_column_index(axis).unwrap();
+			columns[index] = Column::new(axis.into(), ["low", "high"]);
+			let frame = DataFrame::new(2, columns).unwrap();
+			let error =
+				resolve_channels(&bubble_spec(Some("label")), frame.schema().as_ref()).unwrap_err();
+			assert_eq!(
+				error.attribution,
+				FieldAttribution::Channel(if axis == "x" { Channel::X } else { Channel::Y })
+			);
+		}
+		for (role, bad) in [
+			(
+				BubblePreparationChannel::Size,
+				Column::new("size".into(), ["small", "large"]),
+			),
+			(
+				BubblePreparationChannel::Size,
+				Column::new("size".into(), [true, false]),
+			),
+			(
+				BubblePreparationChannel::Color,
+				Column::new("color".into(), ["cold", "hot"]),
+			),
+			(
+				BubblePreparationChannel::Color,
+				Column::new("color".into(), [true, false]),
+			),
+		] {
+			let mut columns = valid.columns().to_vec();
+			let index = valid.get_column_index(role.as_str()).unwrap();
+			columns[index] = bad;
+			let frame = DataFrame::new(2, columns).unwrap();
+			let error =
+				resolve_channels(&bubble_spec(Some("label")), frame.schema().as_ref()).unwrap_err();
+			assert_eq!(error.attribution, FieldAttribution::Role(role.as_str()));
+			assert!(error.reason.contains("Quantitative"));
+		}
+		let numeric_label = bubble_frame(Column::new("label".into(), [1_i64, 2]));
+		let error = resolve_channels(&bubble_spec(Some("label")), numeric_label.schema().as_ref())
+			.unwrap_err();
+		assert_eq!(
+			error.attribution,
+			FieldAttribution::Role(BubblePreparationChannel::Label.as_str())
+		);
+		assert!(error.reason.contains("Nominal"));
+	}
+
+	#[test]
+	fn product_0095_field_attribution_preserves_channels_and_distinguishes_roles() {
+		let channel = ChannelError {
+			attribution: FieldAttribution::Channel(Channel::X),
+			field: "x".to_owned(),
+			reason: "reason".to_owned(),
+		};
+		let role = ChannelError {
+			attribution: FieldAttribution::Role(BubblePreparationChannel::Size.as_str()),
+			field: "size".to_owned(),
+			reason: "reason".to_owned(),
+		};
+		assert_eq!(
+			channel.to_string(),
+			"plot x channel `x` could not resolve: reason"
+		);
+		assert_eq!(
+			role.to_string(),
+			"plot size field `size` could not resolve: reason"
+		);
+		assert_ne!(channel.attribution, role.attribution);
+		for role in [
+			BubblePreparationChannel::X,
+			BubblePreparationChannel::Y,
+			BubblePreparationChannel::Size,
+			BubblePreparationChannel::Color,
+			BubblePreparationChannel::Label,
+		] {
+			assert_eq!(role.to_string(), role.as_str());
+		}
 	}
 
 	fn resolve(

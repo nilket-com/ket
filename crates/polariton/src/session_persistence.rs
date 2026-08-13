@@ -1141,6 +1141,38 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0095_bubble_panel_has_owner_meaning_and_no_colour_footprint() {
+		let document = DocumentId::new(95).unwrap();
+		let view = LocalViewIdentity::Named("bubble".into());
+		let panel = HostPanelId::new(DYNAMIC_PANEL_FLOOR);
+		let mut meanings = empty_meanings();
+		meanings.panels.insert((document, view), panel);
+		meanings
+			.groups
+			.insert(document, HostPanelGroupId::new(GROUP_FLOOR));
+		meanings.next_view_panel_id = panel.get() + 1;
+		meanings.next_view_group_id = GROUP_FLOOR + 1;
+
+		let bytes = meanings.encode().unwrap();
+		let text = String::from_utf8(bytes.clone()).unwrap();
+		assert_eq!(SCHEMA_VERSION, 3);
+		assert!(
+			text.contains("\"name\":\"bubble\"")
+				&& text.contains(&format!("\"panel\":{}", panel.get()))
+		);
+		assert!(text.contains("\"colours\":[]"), "{text}");
+		assert!(
+			!text.contains("plot_type")
+				&& !text.contains("authored_family")
+				&& !text.contains("\"family\":")
+		);
+		assert_eq!(
+			DurableMeanings::decode(SCHEMA_VERSION, &bytes).unwrap(),
+			meanings
+		);
+	}
+
+	#[test]
 	fn product_0085_axis_title_stays_in_source_and_not_owner_meanings() {
 		let document = DocumentId::new(85).unwrap();
 		let view = LocalViewIdentity::Named("axis-titled-box".into());

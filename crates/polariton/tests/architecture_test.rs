@@ -530,13 +530,13 @@ fn product_0092_heatmap_surface_keeps_one_explicit_three_role_pipeline() {
 	assert!(spec.contains("fn resolve_heatmap_channels("));
 	assert!(spec.contains("(PlotType::Heatmap, Channel::X | Channel::Y)"));
 	assert!(spec.contains("PlotType::Bar | PlotType::BoxPlot | PlotType::Heatmap"));
-	assert!(spec.contains("channel: Channel::Color"));
+	assert!(spec.contains("attribution: FieldAttribution::Channel(Channel::Color)"));
 	assert!(request.contains("if let Some(mark_fields) = spec.mark_fields()"));
 	assert!(request.contains("for field in mark_fields.all()"));
 	assert!(presentation.contains("(\"__heatmap\", raw_heatmap as RawFunction)"));
 	assert!(presentation.contains("fn raw_heatmap("));
 	assert!(compiler.contains("\"heatmap\","));
-	assert!(compiler.contains("\"heatmap\" => Some(3)"));
+	assert!(compiler.contains("\"heatmap\" => Some(&[3])"));
 	assert!(envelope.contains("pub(crate) mark_fields: Option<SpannedMarkFields>"));
 	assert!(envelope.contains("Self::Heatmap { fields, origins }"));
 	assert!(host.contains("fn heatmap_failure_span("));
@@ -3115,7 +3115,101 @@ fn product_0094_mark_field_transport_is_exhaustive_coupled_and_identity_neutral(
 		);
 		assert!(!observations.contains(duplicate));
 	}
-	assert!(!presentation.contains("SpannedMarkFields::Bubble"));
-	assert!(!presentation.contains("\"__bubble\""));
+	assert_eq!(presentation.matches("SpannedMarkFields::Bubble").count(), 1);
+	assert!(presentation.contains("(\"__bubble\", raw_bubble as RawFunction)"));
 	assert!(factory.contains("let fields = crate::plot::spec::BoxPlotFields {"));
+}
+
+#[test]
+fn product_0095_bubble_surface_keeps_roles_projection_and_kernel_boundaries_structural() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let bubble_fields = std::fs::read_to_string(root.join("plot/spec/bubble_fields.rs"))
+		.expect("read bubble fields");
+	let bubble =
+		std::fs::read_to_string(root.join("plot/kernels/bubble.rs")).expect("read bubble kernel");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+
+	let raw_bubble = presentation
+		.split("fn raw_bubble(")
+		.nth(1)
+		.expect("bubble Rune constructor")
+		.split("\nfn ")
+		.next()
+		.expect("bounded bubble Rune constructor");
+	assert!(presentation.contains("(\"__bubble\", raw_bubble as RawFunction)"));
+	assert!(compiler.contains("\"bubble\""));
+	assert!(!raw_bubble.contains("OptionalAuthoredChannel::Auto"));
+	assert!(raw_bubble.contains("SpannedMarkFields::Bubble"));
+
+	let resolver = spec
+		.split("fn resolve_bubble_channels(")
+		.nth(1)
+		.expect("bubble channel resolver")
+		.split("\nfn ")
+		.next()
+		.expect("bounded bubble resolver");
+	assert!(resolver.contains("FieldAttribution::Role(role.as_str())"));
+	assert!(!resolver.contains("FieldAttribution::Channel(Channel::Color)"));
+	assert_eq!(
+		bubble_fields
+			.matches("enum BubblePreparationChannel")
+			.count(),
+		1
+	);
+	assert!(!bubble.contains("enum BubblePreparationChannel"));
+	assert!(bubble_fields.contains("formatter.write_str(self.as_str())"));
+	assert!(
+		bubble_fields
+			.contains("formatter.write_str(BubblePreparationChannel::from(*self).as_str())")
+	);
+
+	let projection = request
+		.split("fn project_named_channels(")
+		.nth(1)
+		.expect("named-channel projection")
+		.split("#[cfg(test)]")
+		.next()
+		.expect("bounded named-channel projection");
+	assert!(projection.contains("for field in mark_fields.all()"));
+	assert!(!projection.contains("MarkFields::Bubble"));
+	assert!(!projection.contains("bubble_fields"));
+
+	let preparation = bubble
+		.split("pub fn prepare_bubble_data(")
+		.nth(1)
+		.expect("bubble preparation")
+		.split("#[cfg(test)]")
+		.next()
+		.expect("bounded bubble preparation");
+	assert!(preparation.starts_with("\n\tdf: &DataFrame,\n\tfields: &BubbleFields,"));
+	assert!(!preparation.contains("MarkFields"));
+	let production = bubble
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production bubble kernel");
+	assert_eq!(
+		production
+			.matches("let radius = 2.0 + t_size * 28.0;")
+			.count(),
+		2
+	);
+	assert!(!production.contains("ColorJob::Diverging"));
+	assert!(!production.contains("ContinuousAnchor::Authored"));
+
+	let formatter = spec
+		.split("impl fmt::Display for ChannelError")
+		.nth(1)
+		.expect("channel error formatter")
+		.split("impl std::error::Error")
+		.next()
+		.expect("bounded channel error formatter");
+	assert!(formatter.contains("FieldAttribution::Channel(channel)"));
+	assert!(formatter.contains("plot {channel} channel"));
+	assert!(formatter.contains("FieldAttribution::Role(role)"));
+	assert!(formatter.contains("plot {role} field"));
 }

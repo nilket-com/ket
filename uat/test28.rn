@@ -1,0 +1,17 @@
+let skin = "nord";
+let observations = workspace.table("bubble_probe");
+
+observations.views([
+	view("bubble-labelled", figure([
+		title("Bubble · selected labels"),
+		subtitle("Signed colour −30…40 · null label stays absent in hover"),
+		skin(skin),
+		bubble("x", "y", "size", "color", "label"),
+	])),
+	view("bubble-unlabelled", figure([
+		title("Bubble · generated labels"),
+		subtitle("Four-role form generates Point 0, Point 1, …"),
+		skin(skin),
+		bubble("x", "y", "size", "color"),
+	])),
+]);

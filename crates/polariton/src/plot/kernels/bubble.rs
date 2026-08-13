@@ -6,7 +6,9 @@ use crate::plot::continuous_color::{ContinuousColorScale, ContinuousScaleIntent}
 use crate::plot::kernels::bubble_observations::{
 	BubbleObservationRow, BubbleObservations, BubbleObservationsError,
 };
-use crate::plot::spec::BubbleFieldNames;
+use crate::plot::spec::{
+	BubbleFieldNames, BubbleFields, BubbleNumericField, BubblePreparationChannel,
+};
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Rectangle};
@@ -39,27 +41,6 @@ pub struct BubblePreparedData {
 	pub y_label: String,
 	pub size_label: String,
 	pub color_label: String,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum BubblePreparationChannel {
-	X,
-	Y,
-	Size,
-	Color,
-	Label,
-}
-
-impl fmt::Display for BubblePreparationChannel {
-	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(match self {
-			Self::X => "x",
-			Self::Y => "y",
-			Self::Size => "size",
-			Self::Color => "color",
-			Self::Label => "label",
-		})
-	}
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -237,11 +218,7 @@ impl PlotKernel for BubblePlotKernel {
 
 pub fn prepare_bubble_data(
 	df: &DataFrame,
-	x_col: &str,
-	y_col: &str,
-	size_col: &str,
-	color_col: &str,
-	label_col: Option<&str>,
+	fields: &BubbleFields,
 ) -> Result<BubblePreparedData, BubblePreparationError> {
 	fn quantitative_column(
 		df: &DataFrame,
@@ -278,13 +255,17 @@ pub fn prepare_bubble_data(
 		Ok((values, dtype))
 	}
 
+	let x_col = fields.numeric.get(BubbleNumericField::X);
+	let y_col = fields.numeric.get(BubbleNumericField::Y);
+	let size_col = fields.numeric.get(BubbleNumericField::Size);
+	let color_col = fields.numeric.get(BubbleNumericField::Color);
 	let (x_f64, x_dtype) = quantitative_column(df, BubblePreparationChannel::X, x_col)?;
 	let (y_f64, y_dtype) = quantitative_column(df, BubblePreparationChannel::Y, y_col)?;
 	let (size_f64, _) = quantitative_column(df, BubblePreparationChannel::Size, size_col)?;
 	let (color_f64, _) = quantitative_column(df, BubblePreparationChannel::Color, color_col)?;
 	let x_axis_type = polars_type_to_axis_type(&x_dtype);
 	let y_axis_type = polars_type_to_axis_type(&y_dtype);
-	let labels = match label_col {
+	let labels = match fields.label.as_deref() {
 		Some(field) => {
 			let column = df
 				.column(field)
@@ -438,10 +419,17 @@ mod tests {
 		.expect("banked bubble frame")
 	}
 
+	fn bubble_fields(color: &str, label: Option<&str>) -> BubbleFields {
+		BubbleFields::new(
+			BubbleFieldNames::new("x", "y", "size", color),
+			label.map(str::to_owned),
+		)
+	}
+
 	fn prepared_kernel(frame: &DataFrame, color: &str, label: Option<&str>) -> BubblePlotKernel {
 		BubblePlotKernel {
 			prepared_data: Arc::new(
-				prepare_bubble_data(frame, "x", "y", "size", color, label)
+				prepare_bubble_data(frame, &bubble_fields(color, label))
 					.expect("valid banked bubble preparation"),
 			),
 		}
@@ -530,7 +518,7 @@ mod tests {
 		)
 		.expect("null-colour bank");
 		assert!(matches!(
-			prepare_bubble_data(&null_color, "x", "y", "size", "color", None),
+			prepare_bubble_data(&null_color, &bubble_fields("color", None)),
 			Err(BubblePreparationError::Observations(
 				BubbleObservationsError::NullValue {
 					channel: crate::plot::spec::BubbleNumericField::Color,
@@ -548,7 +536,7 @@ mod tests {
 		)
 		.expect("uncastable-colour bank");
 		assert_eq!(
-			prepare_bubble_data(&uncastable_color, "x", "y", "size", "color", None),
+			prepare_bubble_data(&uncastable_color, &bubble_fields("color", None)),
 			Err(BubblePreparationError::UncastableColumn {
 				channel: BubblePreparationChannel::Color,
 				field: "color".to_owned(),
@@ -565,7 +553,7 @@ mod tests {
 		)
 		.expect("missing-colour bank");
 		assert_eq!(
-			prepare_bubble_data(&missing_color, "x", "y", "size", "color", None),
+			prepare_bubble_data(&missing_color, &bubble_fields("color", None)),
 			Err(BubblePreparationError::MissingColumn {
 				channel: BubblePreparationChannel::Color,
 				field: "color".to_owned(),
@@ -582,7 +570,7 @@ mod tests {
 		)
 		.expect("column-before-row precedence fixture");
 		assert_eq!(
-			prepare_bubble_data(&missing_color_with_null_x, "x", "y", "size", "color", None),
+			prepare_bubble_data(&missing_color_with_null_x, &bubble_fields("color", None),),
 			Err(BubblePreparationError::MissingColumn {
 				channel: BubblePreparationChannel::Color,
 				field: "color".to_owned(),
@@ -596,7 +584,7 @@ mod tests {
 		)
 		.expect("cross-column precedence fixture");
 		assert_eq!(
-			prepare_bubble_data(&uncastable_x_missing_y, "x", "y", "size", "color", None),
+			prepare_bubble_data(&uncastable_x_missing_y, &bubble_fields("color", None)),
 			Err(BubblePreparationError::UncastableColumn {
 				channel: BubblePreparationChannel::X,
 				field: "x".to_owned(),
@@ -631,7 +619,7 @@ mod tests {
 		)
 		.unwrap_err();
 		assert_eq!(
-			prepare_bubble_data(&null_x, "x", "y", "size", "color", None),
+			prepare_bubble_data(&null_x, &bubble_fields("color", None)),
 			Err(BubblePreparationError::Observations(direct))
 		);
 	}
@@ -677,7 +665,7 @@ mod tests {
 			.drop("label")
 			.expect("banked frame drops its label column");
 		assert_eq!(
-			prepare_bubble_data(&frame, "x", "y", "size", "color", Some("label")),
+			prepare_bubble_data(&frame, &bubble_fields("color", Some("label"))),
 			Err(BubblePreparationError::MissingColumn {
 				channel: BubblePreparationChannel::Label,
 				field: "label".to_owned(),
@@ -718,7 +706,7 @@ mod tests {
 		)
 		.expect("schema-invalid empty bank");
 		assert_eq!(
-			prepare_bubble_data(&missing_color_empty, "x", "y", "size", "color", None),
+			prepare_bubble_data(&missing_color_empty, &bubble_fields("color", None)),
 			Err(BubblePreparationError::MissingColumn {
 				channel: BubblePreparationChannel::Color,
 				field: "color".to_owned(),

@@ -49,3 +49,16 @@ cargo run -p polariton -- uat/test27.rn
 cross-product gap and a signed domain. `heat_probe_raw` retains a duplicate
 North/Q1 key; its companion view must refuse and direct the author to aggregate
 in the relation.
+
+Seed the PRODUCT-0095 bubble relation, then open its labelled and unlabelled
+figures:
+
+```sh
+nilket toron sql --file uat/bubble_probe.sql
+cargo run -p polariton -- uat/test28.rn
+```
+
+`bubble_probe` has a signed colour domain, a wide size range, and one null label.
+Both gradient and size-sample legend sections must remain unclipped. The labelled
+figure omits the null label's hover heading; the four-role figure generates
+`Point 0`, `Point 1`, … headings.

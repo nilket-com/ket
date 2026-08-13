@@ -10,12 +10,45 @@ pub(crate) enum BubbleNumericField {
 
 impl fmt::Display for BubbleNumericField {
 	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-		formatter.write_str(match self {
+		formatter.write_str(BubblePreparationChannel::from(*self).as_str())
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BubblePreparationChannel {
+	X,
+	Y,
+	Size,
+	Color,
+	Label,
+}
+
+impl BubblePreparationChannel {
+	pub(crate) const fn as_str(self) -> &'static str {
+		match self {
 			Self::X => "x",
 			Self::Y => "y",
 			Self::Size => "size",
 			Self::Color => "color",
-		})
+			Self::Label => "label",
+		}
+	}
+}
+
+impl From<BubbleNumericField> for BubblePreparationChannel {
+	fn from(field: BubbleNumericField) -> Self {
+		match field {
+			BubbleNumericField::X => Self::X,
+			BubbleNumericField::Y => Self::Y,
+			BubbleNumericField::Size => Self::Size,
+			BubbleNumericField::Color => Self::Color,
+		}
+	}
+}
+
+impl fmt::Display for BubblePreparationChannel {
+	fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+		formatter.write_str(self.as_str())
 	}
 }
 

@@ -9,17 +9,17 @@ use crate::plot::common::TickPlacement;
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
-	BarWidth, BoxPlotFields, CategoryGap, HeatmapFields, LayerSettings, LayeredPlotSpec,
-	LegendPosition, Override, PointSize, Presence, StrokeWidth,
+	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, HeatmapFields,
+	LayerSettings, LayeredPlotSpec, LegendPosition, Override, PointSize, Presence, StrokeWidth,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
 };
 use crate::rune_relation_envelope::{
-	BoxPlotFieldOrigins, DisposableRunePlotSink, HeatmapFieldOrigins, RunePlotBody,
-	RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans, RunePlotTickStepSpans,
-	RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent, SpannedMarkFields,
-	StyledRunePlotSink,
+	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, HeatmapFieldOrigins,
+	RunePlotBody, RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans,
+	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
+	RuneViewIntent, SpannedMarkFields, StyledRunePlotSink,
 };
 use rune::alloc::limit;
 use rune::ast::Spanned;
@@ -389,6 +389,7 @@ fn build_context() -> Result<Context, String> {
 		("__area", raw_area as RawFunction),
 		("__histogram", raw_histogram as RawFunction),
 		("__box", raw_box as RawFunction),
+		("__bubble", raw_bubble as RawFunction),
 		("__heatmap", raw_heatmap as RawFunction),
 		("__title", raw_title as RawFunction),
 		("__subtitle", raw_subtitle as RawFunction),
@@ -557,6 +558,110 @@ fn raw_box(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) 
 			mark_fields: Some(SpannedMarkFields::BoxPlot {
 				fields: box_fields,
 				origins: spans,
+			}),
+			origin: origin.range(),
+		},
+		settings: LayerSettings::default(),
+		stacked: false,
+		percent: false,
+	};
+	store(
+		out,
+		stack,
+		RuneMark {
+			sink: Ok(sink),
+			origin,
+			modified: false,
+			point_size_origin: None,
+			stroke_width_origin: None,
+			bar_width_origin: None,
+			category_gap_origin: None,
+			stacked_origin: None,
+			percent_origin: None,
+		},
+	)
+}
+
+fn raw_bubble(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = match raw_origin(values) {
+		Ok(origin) => origin,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	let field_count = match values.len() {
+		14 => 4,
+		17 => 5,
+		_ => {
+			return store(
+				out,
+				stack,
+				RuneMark::failed(PresentationFailure::new(
+					origin,
+					"bubble(...) takes x, y, size, and color strings, with an optional label string",
+				)),
+			);
+		}
+	};
+	let mut fields = Vec::with_capacity(field_count);
+	for value in &values[..field_count] {
+		match rune::from_value::<Ref<str>>(value.clone()) {
+			Ok(field) => fields.push(field.to_owned()),
+			Err(_) => {
+				return store(
+					out,
+					stack,
+					RuneMark::failed(PresentationFailure::new(
+						origin,
+						"bubble(...) field arguments must evaluate to strings",
+					)),
+				);
+			}
+		}
+	}
+	let decode_span = |index: usize| -> Result<Range<u32>, PresentationFailure> {
+		let start = rune::from_value::<i64>(values[index].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"bubble(...) has an invalid injected argument origin",
+			)
+		})?;
+		let end = rune::from_value::<i64>(values[index + 1].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"bubble(...) has an invalid injected argument origin",
+			)
+		})?;
+		Origin::decode(start, end).map(Origin::range)
+	};
+	let origin_base = field_count;
+	let origins = match (|| {
+		Ok(BubbleFieldOrigins {
+			x: decode_span(origin_base)?,
+			y: decode_span(origin_base + 2)?,
+			size: decode_span(origin_base + 4)?,
+			color: decode_span(origin_base + 6)?,
+			label: (field_count == 5)
+				.then(|| decode_span(origin_base + 8))
+				.transpose()?,
+		})
+	})() {
+		Ok(origins) => origins,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	let bubble_fields = BubbleFields::new(
+		BubbleFieldNames::new(&fields[0], &fields[1], &fields[2], &fields[3]),
+		(field_count == 5).then(|| fields[4].clone()),
+	);
+	let sink = StyledRunePlotSink {
+		sink: DisposableRunePlotSink {
+			composition: PlotComposition::single(PlotType::Bubble),
+			x: fields[0].clone(),
+			y: fields[1].clone(),
+			category: None,
+			interval_end: None,
+			mark_fields: Some(SpannedMarkFields::Bubble {
+				fields: bubble_fields,
+				origins,
 			}),
 			origin: origin.range(),
 		},

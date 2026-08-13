@@ -1006,9 +1006,7 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 		return match fields.to_mark_fields() {
 			crate::plot::spec::MarkFields::BoxPlot(fields) => AuthoredPlotSpec::box_plot(fields),
 			crate::plot::spec::MarkFields::Heatmap(fields) => AuthoredPlotSpec::heatmap(fields),
-			crate::plot::spec::MarkFields::Bubble(_) => {
-				unreachable!("PRODUCT-0094 bubble mark fields have no production constructor")
-			}
+			crate::plot::spec::MarkFields::Bubble(fields) => AuthoredPlotSpec::bubble(fields),
 		};
 	}
 	if sink.composition.primary_plot_type() == PlotType::Histogram {
@@ -1095,6 +1093,68 @@ fn heatmap_failure_span(
 		}
 		Ok(_) => mark.clone(),
 	}
+}
+
+#[cfg(feature = "toron")]
+fn bubble_failure_span(
+	data: &DataFrame,
+	fields: &crate::plot::spec::BubbleFields,
+	origins: &crate::rune_relation_envelope::BubbleFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	use crate::plot::kernels::bubble::BubblePreparationError;
+	use crate::plot::kernels::bubble_observations::BubbleObservationsError;
+	use crate::plot::spec::{BubbleNumericField, BubblePreparationChannel};
+
+	let role_for_field = |field: &str| {
+		[
+			(
+				BubblePreparationChannel::X,
+				fields.numeric.get(BubbleNumericField::X),
+			),
+			(
+				BubblePreparationChannel::Y,
+				fields.numeric.get(BubbleNumericField::Y),
+			),
+			(
+				BubblePreparationChannel::Size,
+				fields.numeric.get(BubbleNumericField::Size),
+			),
+			(
+				BubblePreparationChannel::Color,
+				fields.numeric.get(BubbleNumericField::Color),
+			),
+		]
+		.into_iter()
+		.find_map(|(role, candidate)| (candidate == field).then_some(role))
+		.or_else(|| {
+			fields
+				.label
+				.as_deref()
+				.filter(|candidate| *candidate == field)
+				.map(|_| BubblePreparationChannel::Label)
+		})
+	};
+	let authored = AuthoredPlotSpec::bubble(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return role_for_field(&error.field)
+			.and_then(|role| origins.for_role(role))
+			.unwrap_or_else(|| mark.clone());
+	}
+	let result = crate::plot::kernels::bubble::prepare_bubble_data(data, fields);
+	let role = match result {
+		Err(
+			BubblePreparationError::MissingColumn { channel, .. }
+			| BubblePreparationError::UncastableColumn { channel, .. },
+		) => Some(channel),
+		Err(BubblePreparationError::Observations(
+			BubbleObservationsError::NullValue { channel, .. }
+			| BubbleObservationsError::NonFiniteValue { channel, .. },
+		)) => Some(channel.into()),
+		Ok(_) => None,
+	};
+	role.and_then(|role| origins.for_role(role))
+		.unwrap_or_else(|| mark.clone())
 }
 
 #[cfg(feature = "toron")]
@@ -1576,6 +1636,10 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.heatmap()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let bubble_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.bubble()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let body_output_span = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
 					RunePlotBody::Single(sink)
@@ -1882,12 +1946,18 @@ fn rune_view_outcome_with_palettes(
 					heatmap_failure_span(frame.as_ref(), fields, origins, mark)
 				})
 			});
+			let bubble_output_span = output.as_ref().err().and_then(|_| {
+				bubble_diagnostic.as_ref().map(|(fields, origins, mark)| {
+					bubble_failure_span(frame.as_ref(), fields, origins, mark)
+				})
+			});
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
 				span: output_span
 					.or(box_output_span)
 					.or(heatmap_output_span)
+					.or(bubble_output_span)
 					.or(body_output_span)
 					.or(facet_span)
 					.unwrap_or(view.span),
@@ -9823,7 +9893,6 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				.assignments
 				.is_empty()
 		);
-
 		let assert_span = |frame: DataFrame, expected: &str, error_fragment: &str| {
 			let outcome = complete(frame);
 			let Err(error) = &outcome.sinks[0].output else {
@@ -9882,6 +9951,164 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			.unwrap(),
 			"\"region\", \"quarter\"",
 			"duplicated at rows 1 and 2",
+		);
+		assert!(complete(valid).sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0095_bubble_resolves_and_attributes_all_five_roles() {
+		use polars::frame::DataFrame;
+		let source = r#"workspace.table("bubble_probe").views([bubble("x", "y", "size", "color", "label")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("bubble source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"x" => [1.0, 2.0, 3.0],
+			"y" => [2_i64, 3, 4],
+			"size" => [10.0, 100.0, 50.0],
+			"color" => [-30.0, 40.0, 0.0],
+			"label" => [Some("first"), None, Some("third")],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid bubble must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::Bubble { x, y, size, color, label }
+				if (x.as_str(), y.as_str(), size.as_str(), color.as_str(), label.as_deref())
+					== ("x", "y", "size", "color", Some("label"))
+		));
+		assert!(
+			continuation
+				.identity
+				.persistence_snapshot()
+				.assignments
+				.is_empty()
+		);
+		let kernel =
+			crate::plot::factory::create_plot(&resolved.resolved_spec, &resolved.data, 800, 480);
+		let settings = crate::plot::common::ResolvedPlotSettings::default();
+		let legend = kernel
+			.legend_content(&settings)
+			.expect("authored bubble has its combined legend");
+		let sections = legend.sections().collect::<Vec<_>>();
+		assert!(matches!(
+			sections.as_slice(),
+			[
+				crate::plot::legend::LegendSection::Gradient { stops, .. },
+				crate::plot::legend::LegendSection::SizeSample { low: 10.0, high: 100.0, .. }
+			] if stops.first_value() == -30.0 && stops.last_value() == 40.0
+		));
+		assert!(crate::plot::legend::measure_legend(&legend, &settings).width > 250.0);
+
+		let assert_span = |frame: DataFrame, expected: &str, error_fragment: &str| {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid bubble rendered")
+			};
+			assert!(error.contains(error_fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+
+		assert_span(
+			polars::df!(
+				"x" => ["bad"], "y" => [2.0], "size" => [10.0], "color" => [1.0],
+				"label" => ["first"],
+			)
+			.unwrap(),
+			"\"x\"",
+			"incompatible with Bubble",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "y" => ["bad"], "size" => [10.0], "color" => [1.0],
+				"label" => ["first"],
+			)
+			.unwrap(),
+			"\"y\"",
+			"incompatible with Bubble",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "y" => [2.0], "size" => ["bad"], "color" => [1.0],
+				"label" => ["first"],
+			)
+			.unwrap(),
+			"\"size\"",
+			"plot size field",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "y" => [2.0], "size" => [10.0], "color" => ["bad"],
+				"label" => ["first"],
+			)
+			.unwrap(),
+			"\"color\"",
+			"plot color field",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "y" => [2.0], "size" => [10.0], "color" => [1.0],
+				"label" => [7_i64],
+			)
+			.unwrap(),
+			"\"label\"",
+			"plot label field",
+		);
+
+		assert_span(
+			polars::df!(
+				"x" => [Some(1.0), None], "y" => [2.0, 3.0], "size" => [10.0, 20.0],
+				"color" => [1.0, 2.0], "label" => [Some("first"), None],
+			)
+			.unwrap(),
+			"\"x\"",
+			"null at row 2",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "y" => [f64::NAN], "size" => [10.0], "color" => [1.0],
+				"label" => ["first"],
+			)
+			.unwrap(),
+			"\"y\"",
+			"non-finite at row 1",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "y" => [2.0], "size" => [None::<f64>], "color" => [1.0],
+				"label" => ["first"],
+			)
+			.unwrap(),
+			"\"size\"",
+			"null at row 1",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "y" => [2.0], "size" => [10.0], "color" => [f64::INFINITY],
+				"label" => ["first"],
+			)
+			.unwrap(),
+			"\"color\"",
+			"non-finite at row 1",
+		);
+		assert_span(
+			polars::df!(
+				"x" => [1.0], "y" => [2.0], "size" => [10.0], "color" => [1.0],
+			)
+			.unwrap(),
+			"\"label\"",
+			"absent",
 		);
 		assert!(complete(valid).sinks[0].output.is_ok());
 	}

@@ -14,8 +14,8 @@ use crate::plot::core::PlotType;
 #[cfg(test)]
 use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
 use crate::plot::spec::{
-	BoxPlotFields, BubbleFields, HeatmapFields, LayerMark, LayerSettings, LayerSpec,
-	LayeredPlotSpec, MarkFields, Override, Presence,
+	BoxPlotFields, BubbleFields, BubblePreparationChannel, HeatmapFields, LayerMark, LayerSettings,
+	LayerSpec, LayeredPlotSpec, MarkFields, Override, Presence,
 };
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
@@ -142,7 +142,8 @@ impl StyledRunePlotSink {
 			| PlotType::StackedArea
 			| PlotType::Histogram
 			| PlotType::BoxPlot
-			| PlotType::Heatmap => {
+			| PlotType::Heatmap
+			| PlotType::Bubble => {
 				return Err(self);
 			}
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
@@ -181,6 +182,7 @@ pub(crate) enum RuneViewForm {
 	Area,
 	Histogram,
 	Box,
+	Bubble,
 }
 
 #[cfg(test)]
@@ -194,6 +196,7 @@ impl From<RuneViewForm> for ViewPresentation {
 			RuneViewForm::Area => (ViewContentKind::Plot, "plot.area"),
 			RuneViewForm::Histogram => (ViewContentKind::Plot, "plot.histogram"),
 			RuneViewForm::Box => (ViewContentKind::Plot, "plot.box"),
+			RuneViewForm::Bubble => (ViewContentKind::Plot, "plot.bubble"),
 		};
 		Self {
 			content_kind,
@@ -221,6 +224,7 @@ impl RuneViewIntent {
 						PlotType::Histogram => "plot.histogram".to_owned(),
 						PlotType::BoxPlot => "plot.box".to_owned(),
 						PlotType::Heatmap => "plot.heatmap".to_owned(),
+						PlotType::Bubble => "plot.bubble".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -234,6 +238,7 @@ impl RuneViewIntent {
 							PlotType::Histogram => "plot.histogram".to_owned(),
 							PlotType::BoxPlot => "plot.box".to_owned(),
 							PlotType::Heatmap => "plot.heatmap".to_owned(),
+							PlotType::Bubble => "plot.bubble".to_owned(),
 							other => {
 								unreachable!("styled sink admitted unexpected plot type {other:?}")
 							}
@@ -264,6 +269,7 @@ impl RuneViewIntent {
 			(ViewContentKind::Plot, "plot.area") => RuneViewForm::Area,
 			(ViewContentKind::Plot, "plot.histogram") => RuneViewForm::Histogram,
 			(ViewContentKind::Plot, "plot.box") => RuneViewForm::Box,
+			(ViewContentKind::Plot, "plot.bubble") => RuneViewForm::Bubble,
 			_ => panic!("a composite presentation has no legacy RuneViewForm"),
 		}
 	}
@@ -356,7 +362,6 @@ impl BoxPlotFieldOrigins {
 }
 
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // PRODUCT-0094 stages Bubble for its next surface record.
 pub(crate) struct BubbleFieldOrigins {
 	pub(crate) x: Range<u32>,
 	pub(crate) y: Range<u32>,
@@ -365,11 +370,22 @@ pub(crate) struct BubbleFieldOrigins {
 	pub(crate) label: Option<Range<u32>>,
 }
 
+impl BubbleFieldOrigins {
+	pub(crate) fn for_role(&self, role: BubblePreparationChannel) -> Option<Range<u32>> {
+		match role {
+			BubblePreparationChannel::X => Some(self.x.clone()),
+			BubblePreparationChannel::Y => Some(self.y.clone()),
+			BubblePreparationChannel::Size => Some(self.size.clone()),
+			BubblePreparationChannel::Color => Some(self.color.clone()),
+			BubblePreparationChannel::Label => self.label.clone(),
+		}
+	}
+}
+
 /// Mark-specific fields at the Rune boundary. The variant couples semantic
 /// fields to matching diagnostic provenance; provenance deliberately does not
 /// participate in `DisposableRunePlotSink` equality.
 #[derive(Clone, Debug)]
-#[allow(dead_code)] // PRODUCT-0094 stages Bubble for its next surface record.
 pub(crate) enum SpannedMarkFields {
 	BoxPlot {
 		fields: BoxPlotFields,
@@ -404,6 +420,13 @@ impl SpannedMarkFields {
 	pub(crate) fn heatmap(&self) -> Option<(&HeatmapFields, &HeatmapFieldOrigins)> {
 		match self {
 			Self::Heatmap { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
+	pub(crate) fn bubble(&self) -> Option<(&BubbleFields, &BubbleFieldOrigins)> {
+		match self {
+			Self::Bubble { fields, origins } => Some((fields, origins)),
 			_ => None,
 		}
 	}

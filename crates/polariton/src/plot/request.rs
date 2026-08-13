@@ -150,15 +150,12 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		label,
 	} = spec.kernel_fields.as_ref()
 	{
-		let prepared = crate::plot::kernels::bubble::prepare_bubble_data(
-			data,
-			x,
-			y,
-			size,
-			color,
-			label.as_deref(),
-		)
-		.map_err(|error| error.to_string())?;
+		let fields = crate::plot::spec::BubbleFields::new(
+			crate::plot::spec::BubbleFieldNames::new(x, y, size, color),
+			label.clone(),
+		);
+		let prepared = crate::plot::kernels::bubble::prepare_bubble_data(data, &fields)
+			.map_err(|error| error.to_string())?;
 		validate_continuous_scale(prepared.observations.color_range(), prepared.color_intent)?;
 	}
 	if let crate::plot::spec::ResolvedKernelFields::Heatmap { x, y, value } =
@@ -691,7 +688,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0094_bubble_projection_handles_optional_label_without_a_surface() {
+	fn product_0095_authored_bubble_projection_carries_exactly_four_or_five_roles() {
 		let frame = Arc::new(
 			polars::df!(
 				"unused" => [99_i32],
@@ -710,13 +707,10 @@ mod tests {
 				vec!["x", "y", "size", "color", "label"],
 			),
 		] {
-			let spec = AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Bubble), "x", "y")
-				.with_mark_fields_for_test(crate::plot::spec::MarkFields::Bubble(
-					crate::plot::spec::BubbleFields::new(
-						crate::plot::spec::BubbleFieldNames::new("x", "y", "size", "color"),
-						label,
-					),
-				));
+			let spec = AuthoredPlotSpec::bubble(crate::plot::spec::BubbleFields::new(
+				crate::plot::spec::BubbleFieldNames::new("x", "y", "size", "color"),
+				label,
+			));
 			let projected = project_named_channels(&spec, Arc::clone(&frame), "bubble test")
 				.expect("bubble fields project through the staged carrier");
 			assert_eq!(
