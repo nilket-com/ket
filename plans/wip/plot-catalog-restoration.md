@@ -108,14 +108,14 @@ ADR 0089, and CI-02 moved out to a fifth:
   Migrates all three producers. — **ADR 0089, landed**
 
 **CI-02 follows the heatmap and bubble surfaces**, not B4 directly — see steps
-6–8. 0089 is explicitly substrate-only, adding no Rune spelling, so CI-02 stays
+6–9. 0089 is explicitly substrate-only, adding no Rune spelling, so CI-02 stays
 open past the whole B track; and the authoring words need a mark that can be
 authored before they mean anything.
 
 **CI-02 also shrinks.** It is labelled "sequential / diverging / **status**
 palette authoring," but status has no consumer — no kernel requests
 `ColorJob::Status`, and `spec/mod.rs:2591` already routes it to
-`ScaleFamily::CategoricalColor`. Step 8 closes CI-02 for continuous colour and
+`ScaleFamily::CategoricalColor`. Step 9 closes CI-02 for continuous colour and
 leaves a status residue whose trigger is the first real status consumer. A status
 word today would be unobservable and its gates vacuous.
 
@@ -163,13 +163,36 @@ band-fill path.
    heatmap, bubble, and hexbin together. Touches **CI-03**, since a real
    continuous authority is what finally displaces the legacy ramp. Leaves
    **CI-02** open.
-6. **Heatmap surface, sequential-only.** The first Rune constructor for a
-   quantitative mark. Ships with no job word: colour is `{ Sequential, None }`,
-   exactly as 0089 leaves it.
-7. **Bubble surface, sequential-only.** Same shape. Kept a separate step rather
-   than merged with heatmap — whether shared mechanics justify one record is for
-   the two surface reviews to decide, not for this plan to presume.
-8. **Continuous colour authoring.** Slot words `sequential_palette` /
+6. **Heatmap surface, sequential-only — ADR 0092, drafted.** The first Rune
+   constructor for a quantitative mark. Ships with no job word: colour is
+   `{ Sequential, None }`, exactly as 0089 leaves it. Implemented with **bespoke**
+   `HeatmapFields` / `HeatmapFieldOrigins`, all gates green, before step 7
+   generalizes them.
+7. **Mark-field transport.** A refactor of the working box-plot and heatmap
+   carriers into dedicated variants — **not** a generic field map:
+
+   ```text
+   SpannedMarkFields          MarkFields            (AuthoredPlotSpec, no spans)
+   ├── BoxPlot { fields, origins }   ├── BoxPlot(BoxPlotFields)
+   ├── Heatmap { fields, origins }   ├── Heatmap(HeatmapFields)
+   └── Bubble  { fields, origins }   └── Bubble(BubbleFields)
+   ```
+
+   Fields and origins are **coupled at the Rune boundary** so mismatched variants
+   cannot be zipped into `None`. One exhaustive `all()` authority feeds
+   projection, which is the point: `project_named_channels` (`request.rs:247-253`)
+   currently grows one `if let Some(..)` block per mark, and 0092's review caught
+   a missing block that would have panicked the factory on the first successful
+   authored heatmap. An exhaustive match makes that omission unrepresentable.
+
+   Bubble's variant may be **test-only** until step 8. That is substrate staging,
+   not an inert public spelling — no Rune word is added, so nothing unobservable
+   is authored.
+8. **Bubble surface, sequential-only.** The first new consumer of step 7's
+   transport. Five roles against heatmap's three, with an **optional label** whose
+   absent-versus-selected-null semantics 0090 §9 already decided — and whose
+   variable arity is why `all()` returns a slice rather than a fixed array.
+9. **Continuous colour authoring.** Slot words `sequential_palette` /
    `diverging_palette`, the stable 37-token ramp-name grammar they create, the
    mark-level diverging job word, and the anchor-provenance carrier from
    `AuthoredPlotSpec` through planning. Closes **CI-02** for continuous colour;
@@ -181,15 +204,15 @@ band-fill path.
    added before those surfaces exist would be observationally inert — the same
    defect that disqualifies a status word. An earlier draft of this plan placed
    authoring at step 6 and the surfaces at step 11.
-9. **Funnel** — the smallest categorical consumer, *but only after its row-order
+10. **Funnel** — the smallest categorical consumer, *but only after its row-order
    and stage-monotonicity contract is explicit*.
-10. **Radial dial** — needs prerequisite E; its silent first-row selection is the
+11. **Radial dial** — needs prerequisite E; its silent first-row selection is the
     PRODUCT-0078 defect class again.
-11. **Pie** — after removing its aggregation authority, which Toron can now supply
+12. **Pie** — after removing its aggregation authority, which Toron can now supply
     as pre-aggregated category/value rows.
-12. **Radar + parallel together** over one dimension-list substrate. They are the
+13. **Radar + parallel together** over one dimension-list substrate. They are the
     only two needing D, and solving it twice would produce two vocabularies.
-13. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+14. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
 
@@ -212,6 +235,16 @@ graph, rather than rediscovered at each mark.
 - **Silent row-selection is invisible until a fixture has duplicates.** Radial
   dial and heatmap both have it now; the `demo_sales` single-quarter episode is
   the precedent for what a degenerate fixture hides.
+- **An abstraction needs a green baseline under it.** Step 7 generalizes box
+  plot's and heatmap's field carriers, and it is deliberately sequenced *after*
+  0092 ships bespoke carriers with every gate passing. Rewriting 0092 before its
+  gates have ever run would leave the abstraction with nothing trustworthy to
+  preserve — the same mistake oracle banking exists to prevent, one level up.
+  A refactor's parity subjects must have been green at least once.
+- **Substrate staging is not an inert spelling.** Step 7 may land a `Bubble`
+  variant that only tests construct, and that does *not* violate the hazard below:
+  no Rune word is added, so nothing unobservable is authored. The hazard is about
+  **public spellings**, not about types awaiting their consumer.
 - **A spelling needs a consumer before it needs a word, and the check is
   symmetric.** The first 0091 draft rejected a status word for being
   observationally inert, then proposed three words for marks with no Rune
