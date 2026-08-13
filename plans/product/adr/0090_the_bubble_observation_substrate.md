@@ -1,10 +1,12 @@
 # ADR 0090: the bubble observation substrate
 
 Status: proposed 2026-08-12. Bubble's preparation is infallible and fabricates
-numbers for every kind of missing input: a null in any of its four required
-numeric channels becomes a real observation, a failed cast fabricates an entire
-column, and the domains are derived from the source columns rather than from the
-points, so a fabricated value can land outside the range that colours it. This
+numbers for missing values: a null in any of its four required numeric channels
+becomes a real observation, an invalid string conversion becomes an all-null
+column whose values are fabricated, and a missing numeric column substitutes a
+zero-length column that panics when indexed. The domains are derived from the
+source columns rather than from the points, so a fabricated value can land
+outside the range that colours it. This
 record makes bubble preparation fallible, refuses missingness instead of
 inventing it, and derives every domain from the validated rows.
 
@@ -58,11 +60,15 @@ That is the mechanism behind PRODUCT-0089 gate 16's warning that bubble would
 and its out-of-domain clamp turns the missing observation into **exactly the
 first ramp colour**, indistinguishable from a genuine minimum.
 
-**A failed cast fabricates the whole column.** Every column access falls back to
-`Series::new_empty` on a missing column or failed cast (`bubble.rs:196-222`), so
-every `.get(i)` returns `None` and *every* point takes the channel default — all
-bubbles at `x = 0`, or an entire figure at one colour, with no diagnostic. The
-same shape appears in the domain guards: an all-null column yields `(0.0, 1.0)`.
+**Invalid conversions either fabricate or panic; neither refuses.** Stage 0
+corrected an earlier account of this path. Polars accepts a string column such as
+`["low", "high"]` as an all-null `f64` conversion, so each `.get(i)` returns
+`None` and every point takes the channel default — an entire figure at one colour,
+with no diagnostic. A genuinely missing numeric column takes the
+`Series::new_empty` fallback (`bubble.rs:196-222`); that series has length zero,
+so the first `.get(i)` panics with an out-of-bounds index instead of returning
+`None`. A cast that returns `Err` reaches the same zero-length path. The domain
+guards make the fabricated case `(0.0, 1.0)` before point construction.
 
 **The label is a fifth channel with a fifth failure mode.** `label:
 optional_category(0)` (`spec/mod.rs:2285`) is the only optional binding. Absent,
@@ -299,11 +305,12 @@ figure** to protect and the bank is test-oracle parity, not a promise to anyone'
 screen. Bank the **direct kernel operations**: `plot()`'s draw list and `hover()`'s
 strings, over well-formed fixtures.
 
-The null-bearing, failed-cast, and missing-column fixtures are banked too, but as
-**negative controls** — their banked renders are the red states this record
-converts into diagnostics, so the diff shows fabricated pixels becoming refusals
-rather than the change being asserted only in prose. They are evidence of the
-defect, not a baseline to preserve.
+The null-bearing, invalid-conversion, and missing-column fixtures are banked too,
+but as **negative controls** — fabricated renders for the first two and an
+out-of-bounds panic for the third. Those are the red states this record converts
+into diagnostics, so the diff shows the actual failures becoming refusals rather
+than the change being asserted only in prose. They are evidence of the defect,
+not a baseline to preserve.
 
 **Stage 1 — the collection.** `BubbleObservations`, `BubbleObservationsError`,
 and §5's enumerated refusals, with no consumer migrated.
@@ -344,8 +351,9 @@ consumes.
    row, since no row is at fault.
 6. **An uncastable column refuses rather than emptying.** A `color` column of
    non-numeric strings refuses; it does not produce a figure. The banked Stage 0
-   render of that fixture is the red state — today it draws every bubble at one
-   colour with no diagnostic at all.
+   render of that fixture is the red state — Polars converts the strings to nulls
+   and bubble draws every point at one colour with no diagnostic at all. A
+   genuinely missing column has its separate banked panic in gate 5's fixture.
 7. **Precedence is deterministic across both layers, and per field.** Three pairs,
    per §5's ordering: a relation with a missing column **and** a null row reports
    the **column**; a row with both a null `x` and a non-finite `y` reports the
@@ -476,10 +484,11 @@ exhibits — and 0087 is a landed record this would contradict.
 
 ## Consequences
 
-Bubble preparation becomes fallible, and four kinds of silence become
-diagnostics: null observations, non-finite values, missing columns, and failed
-casts. Some relations that render today will refuse, which is the point — each
-one is currently producing a figure containing values that were never measured.
+Bubble preparation becomes fallible, and four faults become diagnostics: null
+observations, non-finite values, missing columns, and failed conversions. Some
+relations that render today will refuse; a missing-column path that panics today
+will refuse as well. The rendering cases currently produce figures containing
+values that were never measured.
 
 PRODUCT-0089 is unblocked, and its gate 16 becomes true rather than aspirational:
 with no fabricated finite values, "non-finite refuses" and "out-of-domain clamps"

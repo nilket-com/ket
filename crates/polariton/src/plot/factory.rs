@@ -121,7 +121,8 @@ pub fn create_plot(
 			color,
 			label,
 		} => {
-			let prepared = bubble::prepare_bubble_data(df, x, y, size, color, label.as_deref());
+			let prepared = bubble::prepare_bubble_data(df, x, y, size, color, label.as_deref())
+				.expect("PRODUCT-0090 planning validated this bubble snapshot");
 			Arc::new(BubblePlotKernel {
 				prepared_data: Arc::new(prepared),
 			})

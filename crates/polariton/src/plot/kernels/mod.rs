@@ -6,6 +6,7 @@ pub mod boxplot;
 #[allow(dead_code)]
 pub mod boxplot_tukey;
 pub mod bubble;
+pub mod bubble_observations;
 pub mod candlestick;
 pub mod fill_between;
 pub mod fill_between_line;

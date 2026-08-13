@@ -1,0 +1,15 @@
+error[E0451]: fields `observations`, `x_range`, `y_range`, `size_range` and `color_range` of struct `BubbleObservations` are private
+  --> tests/ui/bubble_observations_private.rs:8:3
+   |
+ 7 |     let _ = BubbleObservations {
+   |             ------------------ in this type
+ 8 |         observations: Vec::new(),
+   |         ^^^^^^^^^^^^ private field
+ 9 |         x_range: (0.0, 1.0),
+   |         ^^^^^^^ private field
+10 |         y_range: (0.0, 1.0),
+   |         ^^^^^^^ private field
+11 |         size_range: (0.0, 0.0),
+   |         ^^^^^^^^^^ private field
+12 |         color_range: (0.0, 0.0),
+   |         ^^^^^^^^^^^ private field

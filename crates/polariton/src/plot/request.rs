@@ -142,6 +142,24 @@ pub fn plan_with_categorical_palette(
 }
 
 fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Result<(), String> {
+	if let crate::plot::spec::ResolvedKernelFields::Bubble {
+		x,
+		y,
+		size,
+		color,
+		label,
+	} = spec.kernel_fields.as_ref()
+	{
+		crate::plot::kernels::bubble::prepare_bubble_data(
+			data,
+			x,
+			y,
+			size,
+			color,
+			label.as_deref(),
+		)
+		.map_err(|error| error.to_string())?;
+	}
 	if let crate::plot::spec::ResolvedKernelFields::Heatmap { x, y, value } =
 		spec.kernel_fields.as_ref()
 	{
@@ -368,6 +386,42 @@ mod tests {
 			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Heatmap)),
 		})
 		.expect("planning validates the heatmap snapshot");
+		let _kernel = crate::plot::factory::create_plot(
+			&resolved.resolved_spec,
+			resolved.data.as_ref(),
+			400,
+			300,
+		);
+	}
+
+	#[test]
+	fn product_0090_planning_surfaces_bubble_refusals_before_factory_reconstruction() {
+		let malformed = polars::df!(
+			"x" => [Some(1.0), None],
+			"y" => [2.0, 3.0],
+			"size" => [4.0, 5.0],
+			"color" => [6.0, 7.0],
+		)
+		.unwrap();
+		let error = plan(PlotRequest {
+			source: materialized("malformed bubble", malformed),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Bubble)),
+		})
+		.unwrap_err();
+		assert!(error.contains("malformed bubble: bubble x field `x` is null at row 2"));
+
+		let valid = polars::df!(
+			"x" => [1.0, 2.0],
+			"y" => [2.0, 3.0],
+			"size" => [4.0, 5.0],
+			"color" => [6.0, 7.0],
+		)
+		.unwrap();
+		let resolved = plan(PlotRequest {
+			source: materialized("valid bubble", valid),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Bubble)),
+		})
+		.expect("planning validates the bubble snapshot");
 		let _kernel = crate::plot::factory::create_plot(
 			&resolved.resolved_spec,
 			resolved.data.as_ref(),

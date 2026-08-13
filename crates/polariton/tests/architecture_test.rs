@@ -412,6 +412,48 @@ fn product_0088_heatmap_keeps_one_validated_sparse_cell_authority() {
 }
 
 #[test]
+fn product_0090_bubble_keeps_one_validated_observation_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let bubble =
+		std::fs::read_to_string(root.join("plot/kernels/bubble.rs")).expect("read bubble kernel");
+	let observations = std::fs::read_to_string(root.join("plot/kernels/bubble_observations.rs"))
+		.expect("read bubble observation authority");
+	let request =
+		std::fs::read_to_string(root.join("plot/request.rs")).expect("read plot planning");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let production_bubble = bubble
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production bubble region");
+
+	assert_eq!(
+		production_bubble
+			.matches("BubbleObservations::from_rows(")
+			.count(),
+		1
+	);
+	assert!(production_bubble.contains("pub observations: BubbleObservations"));
+	for retired in ["unwrap_or(0.0)", "unwrap_or(1.0)", "Series::new_empty"] {
+		assert!(
+			!production_bubble.contains(retired),
+			"PRODUCT-0090 retired bubble fabrication survives as {retired}"
+		);
+	}
+	assert!(observations.contains("pub struct BubbleObservations"));
+	assert!(observations.contains("observations: Vec<BubbleObservation>"));
+	assert!(!observations.contains("pub observations:"));
+	assert!(observations.contains("pub(crate) fn from_rows("));
+	assert!(
+		request.contains("prepare_bubble_data(")
+			&& request.contains("map_err(|error| error.to_string())?")
+	);
+	assert!(
+		factory.contains("PRODUCT-0090 planning validated this bubble snapshot"),
+		"factory reconstruction must rely on planning validation of the same snapshot"
+	);
+}
+
+#[test]
 fn product_0001_polariton_reaches_nilket_only_through_the_public_client() {
 	assert_product_dependency_boundary(
 		Path::new(env!("CARGO_MANIFEST_DIR")),
