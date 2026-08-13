@@ -24,3 +24,16 @@ cargo run -p polariton -- uat/test25.rn
 `test25.rn` uses Toron's canonical alias-first `FLOOR` bucketing directly. Its
 second panel deliberately removes one returned interval, making the sparse-bin
 contract visible rather than asking Polariton to synthesize a zero-count bin.
+
+Seed both relations before opening the PRODUCT-0082/0083 box-plot and
+PRODUCT-0085 axis-title exhibit:
+
+```sh
+nilket toron sql --file uat/demo_sales.sql
+nilket toron sql --file uat/box_probe.sql
+cargo run -p polariton -- uat/test26.rn
+```
+
+`box_probe.sql` is idempotent and retains duplicate observations deliberately.
+Its five groups cover two-sided outliers, no outliers, coincident duplicate
+outliers, a singleton, and a flat distribution.
