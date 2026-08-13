@@ -175,7 +175,7 @@ band-fill path.
    Replaces both hard-coded authorities with one conservative content-aware
    estimate. Repairs a violation of PRODUCT-0087's own rule — a section carries
    every value it prints, and a clipped endpoint does not.
-8. **Mark-field transport.** A refactor of the working box-plot and heatmap
+8. **Mark-field transport — ADR 0094, drafted.** A refactor of the working box-plot and heatmap
    carriers into dedicated variants — **not** a generic field map:
 
    ```text
