@@ -223,14 +223,16 @@ band-fill path.
     monotonicity, and removal of the injectable `total_max`. Five silent
     fabrications become refusals — including a dropped null value that renames
     every stage after it.
-12. **Faceted hover coordinate seam — ADR 0097, drafted.** `grid.rs:819-820` builds the transformer
-    with the cell's **absolute** bounds and passes a **plot-local** cursor, so
-    `transform.bounds.contains(cursor)` can only succeed in the origin cell.
-    Exactly two kernels check it — `funnel.rs:101` and `radial_dial.rs:84` — and
-    both are steps here. Decides the grid contract centrally (absolute/absolute
-    or local/local), with **no kernel-local compensation**, and gates both marks
-    in a non-origin cell. Sequenced after step 11 so it has a validated funnel
-    kernel as a parity subject.
+12. **Faceted hover coordinate seam — ADR 0097, drafted.** `grid.rs:819-820`
+    builds the transformer with the cell's **absolute** bounds and passes a
+    **plot-local** cursor. The survey settled the contract: absolute cursor with
+    absolute bounds, matching the non-faceted editor path. Exactly two kernels
+    expose the mismatch: funnel (`funnel.rs:168-170` after PRODUCT-0096) checks
+    bounds containment, while radial dial (`radial_dial.rs:84-93`) derives its
+    ring hit geometry from those bounds. Repairs the grid seam centrally with
+    **no kernel-local compensation**, a typed widget-space hit-geometry helper,
+    and selected first/non-origin probes for both marks. Sequenced after step 11
+    so it has a validated funnel kernel as a parity subject.
 13. **Funnel surface.** `funnel("stage", "value")`, no implicit-stage form. A
     `Funnel` variant in the 0094 transport, nominal/quantitative binding with
     field-and-row diagnostics, stage colours shared by geometry and legend, and

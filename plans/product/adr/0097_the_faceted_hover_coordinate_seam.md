@@ -2,11 +2,13 @@
 
 Status: proposed 2026-08-13. A faceted grid builds each cell's
 `CoordinateTransformer` from **absolute** widget bounds and then hands the kernel
-a **plot-local** cursor, so any kernel that hit-tests against `transform.bounds`
-can only succeed in the origin cell. Two kernels do — funnel and radial dial —
-and both are unhoverable in every other facet. This record makes the grid pass
-the absolute cursor, matching the non-faceted path, and adds one typed hit-test
-that states the transformer's expectation.
+a **plot-local** cursor, so a kernel comparing that cursor with
+`transform.bounds` or geometry derived from those bounds compares values from
+different spaces. Two kernels expose the mismatch — funnel
+through a bounds-containment check and radial dial through geometry derived from
+the bounds — and selected non-origin probes fail or resolve incorrectly. This
+record makes the grid pass the absolute cursor, matching the non-faceted path,
+and adds one typed hit-geometry seam that states the transformer's expectation.
 
 It is step 12 of `plans/wip/plot-catalog-restoration.md`, sequenced after
 PRODUCT-0096 so it has a validated funnel kernel as a parity subject.
@@ -26,8 +28,10 @@ let local = Pt::<Plot>::from_widget(cursor, inner);
 ```
 
 `:819` builds the transformer with absolute `inner`; `:820` localizes the cursor
-to `inner`'s origin. In the origin cell those coincide. Everywhere else
-`bounds.contains(local_cursor)` is false for every position in the cell.
+to `inner`'s origin. The resulting mismatch shifts the hit region by the plot
+area's absolute origin. Whether any numerical overlap survives depends on the
+cell origin, size, and padding; the Stage 0 probes establish the actual failures
+rather than claiming every point in every non-origin cell fails.
 
 The comment names the seam, and `_cell_cursor` is computed and discarded. This
 was observed and left, not overlooked.
@@ -54,9 +58,12 @@ invariant.
 (`coordinate.rs:32-58`), with `into_iced()` documented as the sanctioned unwrap
 "at an iced renderer/backend emission seam."
 
-**Exactly two kernels hit-test.** `funnel.rs:101` and `radial_dial.rs:84`, both
-`transform.bounds.contains(cursor_pos)`. The other nineteen `hover`
-implementations never read `transform.bounds`.
+**Exactly two kernels consume transformer bounds during hover.** Funnel
+(`funnel.rs:168-170` after PRODUCT-0096) calls
+`transform.bounds.contains(cursor_pos)`. Radial dial (`radial_dial.rs:84-93`)
+does not call `contains`: it derives its ring centre and radii from
+`transform.bounds`, then compares the raw cursor against that geometry. The
+other nineteen `hover` implementations never read `transform.bounds`.
 
 **The wide options are large.** 34 production reads of `transform.bounds`, ~83
 `CoordinateTransformer::new` sites across 16 files, and 21 kernel `hover`
@@ -86,11 +93,37 @@ back. That would produce the same number by two conversions that cancel, leaving
 a reader unable to tell whether the space is correct by design or by accident —
 and one later edit to either conversion silently reintroduces the defect.
 
-### 3. One typed hit-test on the transformer
+### 3. One typed hit-geometry seam on the transformer
 
-`CoordinateTransformer` gains a hit-test accepting only `Pt<Widget>`, expressing
-the invariant its derivation chain already guarantees. The two hit-testing
-kernels call it instead of reading `transform.bounds` directly.
+`CoordinateTransformer` gains a helper accepting `Pt<Widget>` and returning the
+paired widget-space hit geometry — `(Rect<Widget>, Pt<Widget>)`, or an opaque
+equivalent. Funnel uses the rectangle's typed `contains`; radial dial uses the
+same rectangle and point for its existing centre/radius arithmetic. This
+preserves both kernels' current hit-test behaviour while making the shared space
+explicit. A Boolean `contains` helper would not serve radial dial and would force
+new hit-test policy into this record.
+
+Two narrowly named trust-boundary wrappers make the helper implementable without
+genericizing the transformer:
+
+- `Pt::<Widget>::from_plot_kernel_cursor(Point)` asserts a raw cursor from
+  `PlotKernel::hover` as widget-space;
+- `Rect::<Widget>::from_transformer_bounds(Rectangle)` asserts the transformer's
+  raw bounds as widget-space.
+
+The transformer method is
+`widget_hit_geometry(Pt<Widget>) -> (Rect<Widget>, Pt<Widget>)`. Naming all three
+surfaces is part of the contract: a generic `from_iced` would turn a narrow trust
+assertion into an unrestricted relabelling door.
+
+Both are zero-arithmetic wraps, not coordinate conversions. Their names state
+the production invariant they trust. `from_plot_kernel_cursor` has exactly two
+production call sites — funnel and radial dial — and
+`from_transformer_bounds` has exactly one, inside `widget_hit_geometry`; gate 8
+closes those sets.
+The existing private `Pt::wrap` / `Rect::wrap` cannot be called from kernels or
+`common.rs`, so leaving these constructors implicit would make §3 impossible to
+implement.
 
 No generics, no typed `bounds` field: the bounds are `Widget` at every production
 site today, so the method states a fact rather than adding a parameter.
@@ -115,8 +148,9 @@ reader believing a guarantee that does not exist.
 Neither funnel nor radial dial gains an offset, a bounds adjustment, or a
 space-detection branch. The defect is at the grid seam and is repaired there.
 
-A kernel that compensated locally would work in both cell positions and be wrong
-in both — and would have to be un-compensated when the seam was eventually fixed.
+A kernel-local offset could mask today's mismatch for selected cells, but it
+would duplicate the grid's coordinate responsibility and become wrong when the
+seam was fixed. Both kernels would then need an un-compensation pass.
 
 ### 6. Dead typed conversions are deleted
 
@@ -139,30 +173,34 @@ condition.
 
 ## Implementation sequence
 
-**Stage 0 — bank the red state.** Funnel and radial dial in a **non-origin**
-facet cell returning `None` from hover at every cursor position, and the same
-kernels in the origin cell hovering correctly. Both, because the pair is what
-identifies the defect as positional.
+**Stage 0 — bank the red state.** For funnel and radial dial, bank one selected
+probe in the first facet cell and one in a **non-origin** cell, including the
+actual returned value. Do not presume the first probe is correct: top padding can
+make even cell one's absolute origin non-zero. The pair identifies the defect as
+positional; the bank says precisely whether each probe currently returns `None`,
+the wrong stage/category, or the intended datum.
 
-**Stage 1 — the typed hit-test.** §3 on `CoordinateTransformer`, with no consumer
-migrated.
+**Stage 1 — the typed hit geometry.** Add §3's two trust-boundary wrappers and
+the `CoordinateTransformer` helper, with no consumer migrated.
 
 **Stage 2 — the grid seam.** §1 and §2: pass the absolute cursor; §6's deletions.
 
-**Stage 3 — the two kernels.** Migrate `funnel.rs:101` and `radial_dial.rs:84` to
-the typed hit-test. No geometry touched.
+**Stage 3 — the two kernels.** Migrate `funnel.rs:168-170` and
+`radial_dial.rs:84-93` to the typed hit geometry. No geometry arithmetic changes.
 
 ## Acceptance gates
 
 1. **Funnel hovers in a non-origin facet cell.** A two-cell faceted funnel returns
-   hover text for a position inside the **second** cell. The banked red state is
-   `None` at every position there.
+   the intended stage text for a selected position inside the **second** cell.
+   The bank records the old result at that exact position.
 2. **Radial dial hovers in a non-origin facet cell.** The same, and asserted
    separately: the two kernels are repaired by one grid change, and a gate
    covering only funnel would pass a fix that special-cased it.
-3. **Origin-cell hover is unchanged.** Both kernels still hover correctly in the
-   first cell, byte-identical to Stage 0. Paired with gates 1–2, since a repair
-   that broke the origin cell would satisfy neither the old behaviour nor the new.
+3. **First-cell hover is correct.** Both kernels return the intended first-cell
+   data at the selected Stage 0 probes. If a probe was already correct, its text
+   remains byte-identical; if the bank exposed a shifted or absent hit, the gate
+   records the deliberate correction. This avoids asserting parity the bank has
+   not established.
 4. **Hover selects the correct cell.** In a two-cell grid, a position in cell two
    returns cell two's data — not cell one's. Without this, a fix that made every
    cell hoverable against the first cell's transformer would pass gates 1 and 2.
@@ -176,9 +214,13 @@ the typed hit-test. No geometry touched.
 7. **Kernel geometry is untouched.** Every banked funnel and radial-dial figure —
    including PRODUCT-0096's post-implementation bank — is byte-identical. This
    record changes hover routing, not marks.
-8. **The typed hit-test accepts only `Pt<Widget>`.** Passing `Pt<Cell>` or
-   `Pt<Plot>` fails to compile — a trybuild case, since §3's whole content is a
-   type restriction.
+8. **The typed hit geometry accepts only `Pt<Widget>`, and assertions stay at
+   their trust boundaries.** Extend the existing coordinate-space compile-fail
+   suite so `Rect<Widget>` rejects `Pt<Cell>` and `Pt<Plot>`. An architecture
+   gate asserts the production helper's `Pt<Widget>` signature and the closed
+   call sites of the raw-point/raw-bounds assertion wrappers. Do not `#[path]`
+   include or copy a miniature `common.rs` helper into trybuild: that would test
+   the fixture rather than production.
 9. **No dead typed conversions remain at the seam.** `_cell_cursor` and the
    discarded plot-local localization are gone; any surviving typed conversion has
    a consumer. Structural, per §6.
@@ -205,7 +247,7 @@ the typed hit-test. No geometry touched.
 > at the seam. §6 removes dead conversions, not live ones, and the distinction is
 > the whole point.
 
-> If the typed hit-test cannot be added without genericizing
+> If the typed hit geometry cannot be added without genericizing
 > `CoordinateTransformer`, typing its `bounds` field, or changing
 > `PlotKernel::hover`, stop and land **absolute/absolute as the contract without
 > the typed method**. The behavioural repair does not depend on §3; the wider
@@ -230,10 +272,10 @@ two transformers with different origins — a paint/hover divergence in place of
 hover defect.
 
 **Fix it in the two kernels by offsetting against the cell origin.** Attractive
-because it touches two files instead of the grid. Rejected because it would make
-both kernels wrong in a consistent way, require un-doing when the seam was
-repaired properly, and leave the seam available to trap the next kernel that
-hit-tests.
+because it touches two files instead of the grid. Rejected because it duplicates
+the grid's coordinate responsibility, requires un-doing when the seam is repaired
+properly, and leaves the mismatch available to trap the next kernel that consumes
+transformer bounds.
 
 **Change `PlotKernel::hover` to take a typed cursor.** Attractive because it is
 the only change that would make the mismatch genuinely unrepresentable. Rejected
@@ -249,14 +291,14 @@ than preventing it.
 
 **Assert the space at runtime inside the transformer.** Attractive because it
 would catch a wrong-space cursor where the type system cannot. Rejected because
-the coordinates are numerically indistinguishable — a local point in the origin
-cell and an absolute point are the same value — so the assertion could only fire
-where the bug is already visible.
+the coordinate values carry no runtime space tag and can be numerically
+identical — for example under a zero-origin layout — so such an assertion could
+only rediscover some visible mismatches, not establish the invariant.
 
 ## Consequences
 
-Two marks become hoverable in faceted grids, and the grid's hover path becomes
-identical to the single-plot path rather than a variant of it.
+Two marks resolve the intended data in faceted grids, and the grid's hover path
+becomes identical to the single-plot path rather than a variant of it.
 
 The type system is left honestly short of the guarantee. `PlotKernel::hover`
 remains a trust boundary, each kernel still asserts its cursor's space, and gates
@@ -266,6 +308,6 @@ the boundary and one who assumes it is closed.
 
 The defect was documented in a comment before it was fixed. `grid.rs:815-816`
 named the seam and `_cell_cursor` marked it, and neither prevented two kernels
-from shipping unhoverable in every non-origin facet — a reminder that a noted
-seam is not a guarded one, and that the note outlived every reader who might have
-acted on it.
+from shipping failed or shifted non-origin hover — a reminder that a noted seam
+is not a guarded one, and that the note outlived every reader who might have acted
+on it.
