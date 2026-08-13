@@ -217,6 +217,20 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		)
 		.map_err(|error| error.to_string())?;
 	}
+	if let crate::plot::spec::ResolvedKernelFields::RadialDial {
+		label,
+		value,
+		maximum,
+	} = spec.kernel_fields.as_ref()
+	{
+		crate::plot::kernels::radial_dial::prepare_radial_dial_data(
+			data,
+			label.as_deref(),
+			value,
+			maximum,
+		)
+		.map_err(|error| error.to_string())?;
+	}
 	Ok(())
 }
 
@@ -374,6 +388,73 @@ mod tests {
 			})
 			.is_ok()
 		);
+	}
+
+	#[test]
+	fn product_0099_planning_surfaces_radial_dial_refusals_before_factory_reconstruction() {
+		let duplicate = polars::df!(
+			"category" => ["A", "A"],
+			"value" => [4.0_f64, 4.0],
+			"maximum" => [8.0_f64, 8.0],
+		)
+		.expect("duplicate radial-dial relation");
+		let error = plan(PlotRequest {
+			source: materialized("duplicate radial dial", duplicate),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+				PlotType::RadialDial,
+			)),
+		})
+		.unwrap_err();
+		assert!(error.contains("duplicate radial dial: radial dial category `A`"));
+		assert!(error.contains("duplicated at rows 1 and 2"));
+
+		let valid = polars::df!(
+			"category" => ["B", "A"],
+			"value" => [4.0_f64, 3.0],
+			"maximum" => [8.0_f64, 10.0],
+		)
+		.expect("valid radial-dial relation");
+		let resolved = plan(PlotRequest {
+			source: materialized("valid radial dial", valid),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+				PlotType::RadialDial,
+			)),
+		})
+		.expect("planning validates the radial-dial snapshot");
+		let _kernel = crate::plot::factory::create_plot(
+			&resolved.resolved_spec,
+			resolved.data.as_ref(),
+			400,
+			300,
+		);
+
+		let ungrouped = polars::df!(
+			"value" => [4.0_f64],
+			"maximum" => [8.0_f64],
+		)
+		.expect("one ungrouped reading");
+		assert!(
+			plan(PlotRequest {
+				source: materialized("one ungrouped radial dial", ungrouped),
+				authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+					PlotType::RadialDial,
+				)),
+			})
+			.is_ok()
+		);
+		let ambiguous = polars::df!(
+			"value" => [4.0_f64, 5.0],
+			"maximum" => [8.0_f64, 8.0],
+		)
+		.expect("ambiguous ungrouped readings");
+		let error = plan(PlotRequest {
+			source: materialized("ambiguous radial dial", ambiguous),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(
+				PlotType::RadialDial,
+			)),
+		})
+		.unwrap_err();
+		assert!(error.contains("ungrouped radial dial has more than one reading at row 2"));
 	}
 
 	#[test]

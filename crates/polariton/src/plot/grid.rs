@@ -4309,9 +4309,10 @@ mod tests {
 		];
 		let kernel = product_0097_grid(frames, |data| {
 			Arc::new(RadialDialPlotKernel {
-				prepared_data: Arc::new(prepare_radial_dial_data(
-					data, "category", "value", "maximum",
-				)),
+				prepared_data: Arc::new(
+					prepare_radial_dial_data(data, Some("category"), "value", "maximum")
+						.expect("valid radial-dial fixture"),
+				),
 			})
 		});
 		let settings = product_0097_settings();

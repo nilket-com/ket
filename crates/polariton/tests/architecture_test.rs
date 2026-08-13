@@ -3436,3 +3436,59 @@ fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
 	assert!(trait_region.contains("cursor: Cursor"));
 	assert!(!trait_region.contains("Pt<Widget>"));
 }
+
+#[test]
+fn product_0099_radial_dial_reads_once_through_one_validated_collection() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let radial = std::fs::read_to_string(root.join("plot/kernels/radial_dial.rs"))
+		.expect("read radial dial kernel");
+	let readings = std::fs::read_to_string(root.join("plot/kernels/radial_dial_readings.rs"))
+		.expect("read radial dial readings");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read plot request");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let exact = std::fs::read_to_string(root.join("plot/exact_numeric.rs"))
+		.expect("read exact numeric authority");
+
+	let preparation = radial
+		.split("pub(crate) fn prepare_radial_dial_data(")
+		.nth(1)
+		.expect("radial-dial preparation")
+		.split("fn radial_category_dtype")
+		.next()
+		.expect("bounded radial-dial preparation");
+	for forbidden in [
+		".filter(",
+		".unique(",
+		".sort(",
+		".get(0)",
+		"unwrap_or",
+		"unwrap_or_else",
+		"df.clone()",
+		"No Data",
+		"All Data",
+	] {
+		assert!(
+			!preparation.contains(forbidden),
+			"legacy radial-dial fabrication remains: {forbidden}"
+		);
+	}
+	assert!(preparation.contains("for row in 0..df.height()"));
+	assert!(preparation.contains("RadialDialReadings::from_rows("));
+	assert!(radial.contains("pub readings: RadialDialReadings"));
+	for parallel in [
+		"pub categories: Vec<String>",
+		"pub values: Vec<f64>",
+		"pub max_values: Vec<f64>",
+	] {
+		assert!(!radial.contains(parallel));
+	}
+	assert!(readings.contains("pub struct RadialDialReadings"));
+	assert!(readings.contains("readings: Vec<RadialDialReading>"));
+	assert_eq!(exact.matches("fn exact_f64(").count(), 1);
+	assert!(radial.contains("use crate::plot::exact_numeric::{ExactF64Error, exact_f64};"));
+	assert!(request.contains("prepare_radial_dial_data("));
+	assert!(
+		factory.contains("PRODUCT-0099 planning validated this radial-dial reading collection")
+	);
+	assert_eq!(factory.matches("prepare_radial_dial_data(").count(), 1);
+}

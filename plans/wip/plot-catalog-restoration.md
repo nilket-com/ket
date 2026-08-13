@@ -248,9 +248,9 @@ band-fill path.
     lineage keeps its stage colours, and prove reattachment restores the same
     allocation. Prerequisite **A** is finally consumed, and the five remaining
     categorical marks inherit whatever this establishes.
-14. **Radial dial substrate — ADR 0099, drafted.** Consumes prerequisite **E**.
+14. **Radial dial substrate — LANDED as PRODUCT-0099.** Consumes prerequisite **E**.
     The census named its silent first-row selection; the survey found that is the
-    fourth of **six** fabrications, and `radial_dial.rs:189` is worse — a failed
+    fourth of **eight** fabrications, and `radial_dial.rs:189` is worse — a failed
     category filter falls back to the whole frame, so every dial can show a value
     belonging to no category it names. Also removes the implicit `1.0` maximum,
     which contradicts the resolver's existing `number(1, "maximum")?`.

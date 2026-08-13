@@ -165,12 +165,9 @@ pub fn create_plot(
 			value,
 			maximum,
 		} => {
-			let prepared = radial_dial::prepare_radial_dial_data(
-				df,
-				label.as_deref().unwrap_or(""),
-				value,
-				maximum,
-			);
+			let prepared =
+				radial_dial::prepare_radial_dial_data(df, label.as_deref(), value, maximum)
+					.expect("PRODUCT-0099 planning validated this radial-dial reading collection");
 			Arc::new(RadialDialPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})

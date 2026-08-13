@@ -27,6 +27,7 @@ pub mod parallel;
 pub mod pie;
 pub mod radar;
 pub mod radial_dial;
+pub mod radial_dial_readings;
 pub mod scatter;
 pub mod scatter_line;
 pub mod stacked_area;

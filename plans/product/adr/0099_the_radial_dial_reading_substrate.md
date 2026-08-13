@@ -225,7 +225,7 @@ Radial dial remains producerless.
 ## Implementation sequence
 
 **Stage 0 — bank.** Every current radial dial figure, as a **refactor oracle,
-not user pixels** — radial dial has no production producer. The six fabricating
+not user pixels** — radial dial has no production producer. The eight fabricating
 fixtures are banked as **negative controls**: their current renders are the red
 states this record converts into refusals.
 
@@ -381,7 +381,7 @@ evidence.
 
 ## Consequences
 
-Radial dial preparation becomes fallible, and six fabrications become
+Radial dial preparation becomes fallible, and eight fabrications become
 diagnostics. The one that matters most is invisible in every current figure: a
 failed filter substituting the whole frame means each dial can display a value
 belonging to no category it names, and nothing in the rendering says so.
