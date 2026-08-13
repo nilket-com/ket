@@ -219,11 +219,11 @@ band-fill path.
    added before those surfaces exist would be observationally inert — the same
    defect that disqualifies a status word. An earlier draft of this plan placed
    authoring at step 6 and the surfaces at step 11.
-11. **Funnel substrate — ADR 0096, drafted.** Row order, stage uniqueness, value
+11. **Funnel substrate — LANDED as PRODUCT-0096.** Row order, stage uniqueness, value
     monotonicity, and removal of the injectable `total_max`. Five silent
     fabrications become refusals — including a dropped null value that renames
     every stage after it.
-12. **Faceted hover coordinate seam.** `grid.rs:819-820` builds the transformer
+12. **Faceted hover coordinate seam — ADR 0097, drafted.** `grid.rs:819-820` builds the transformer
     with the cell's **absolute** bounds and passes a **plot-local** cursor, so
     `transform.bounds.contains(cursor)` can only succeed in the origin cell.
     Exactly two kernels check it — `funnel.rs:101` and `radial_dial.rs:84` — and
