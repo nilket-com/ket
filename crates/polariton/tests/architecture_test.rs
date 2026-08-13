@@ -186,7 +186,10 @@ fn product_0086_live_family_catalog_is_source_complete_and_renderer_free() {
 				.then_some(name)
 		})
 		.collect::<Vec<_>>();
-	assert_eq!(constants, ["SCATTER", "BAR", "LINE", "AREA", "FUNNEL"]);
+	assert_eq!(
+		constants,
+		["SCATTER", "BAR", "LINE", "AREA", "FUNNEL", "RADIAL_DIAL"]
+	);
 	let all = family_impl
 		.split("pub(crate) const ALL:")
 		.nth(1)
@@ -3491,4 +3494,78 @@ fn product_0099_radial_dial_reads_once_through_one_validated_collection() {
 		factory.contains("PRODUCT-0099 planning validated this radial-dial reading collection")
 	);
 	assert_eq!(factory.matches("prepare_radial_dial_data(").count(), 1);
+}
+
+#[test]
+fn product_0100_radial_dial_surface_reuses_transport_identity_and_one_colour_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read factory");
+	let radial = std::fs::read_to_string(root.join("plot/kernels/radial_dial.rs"))
+		.expect("read radial-dial kernel");
+	let readings = std::fs::read_to_string(root.join("plot/kernels/radial_dial_readings.rs"))
+		.expect("read radial-dial readings");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let envelope =
+		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
+	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read host");
+
+	assert!(spec.contains("pub struct RadialDialFields"));
+	assert!(spec.contains("MarkFields::RadialDial"));
+	assert!(spec.contains("Self::RadialDial(fields) => ["));
+	assert!(spec.contains("fn resolve_radial_dial_channels("));
+	for role in ["label", "value", "maximum"] {
+		assert!(spec.contains(&format!("FieldAttribution::Role(\"{role}\")")));
+	}
+	assert!(spec.contains("pub(crate) const RADIAL_DIAL: Self"));
+	assert_eq!(
+		spec.matches("PlotType::RadialDial => AuthoredFamilyId::RADIAL_DIAL")
+			.count(),
+		1,
+		"PRODUCT-0086 persistence costs exactly one conversion arm"
+	);
+	assert!(spec.contains("PRODUCT-0064 requires stacked bar colour lineage"));
+	assert!(spec.contains("no live authored categorical-family conversion"));
+
+	let projection = request
+		.split("fn project_named_channels(")
+		.nth(1)
+		.expect("named projection")
+		.split("#[cfg(test)]")
+		.next()
+		.expect("bounded projection");
+	assert!(projection.contains("for field in mark_fields.all()"));
+	assert!(!projection.contains("MarkFields::RadialDial"));
+	assert!(!projection.contains("radial_dial_fields"));
+
+	let production = radial
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production radial-dial kernel");
+	assert!(production.contains("fn category_color("));
+	assert_eq!(production.matches("self.category_color(").count(), 2);
+	assert!(production.contains("self.category_colors"));
+	assert!(
+		production.contains(
+			"PRODUCT-0100 authored radial-dial categories have complete colour assignments"
+		)
+	);
+	assert!(factory.contains("category_colors: spec"));
+	assert!(!readings.contains("All Data"));
+
+	assert!(presentation.contains("(\"__radial_dial\", raw_radial_dial as RawFunction)"));
+	assert_eq!(
+		presentation
+			.matches("SpannedMarkFields::RadialDial")
+			.count(),
+		1
+	);
+	assert!(compiler.contains("\"radial_dial\" => Some(&[2, 3])"));
+	assert!(envelope.contains("Self::RadialDial { fields, origins }"));
+	assert!(host.contains("fn radial_dial_failure_span("));
+	assert!(host.contains("radial_dial_output_span"));
 }

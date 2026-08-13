@@ -150,7 +150,8 @@ impl StyledRunePlotSink {
 			| PlotType::BoxPlot
 			| PlotType::Heatmap
 			| PlotType::Bubble
-			| PlotType::Funnel => {
+			| PlotType::Funnel
+			| PlotType::RadialDial => {
 				return Err(self);
 			}
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
@@ -193,6 +194,7 @@ pub(crate) enum RuneViewForm {
 	Box,
 	Bubble,
 	Funnel,
+	RadialDial,
 }
 
 #[cfg(test)]
@@ -208,6 +210,7 @@ impl From<RuneViewForm> for ViewPresentation {
 			RuneViewForm::Box => (ViewContentKind::Plot, "plot.box"),
 			RuneViewForm::Bubble => (ViewContentKind::Plot, "plot.bubble"),
 			RuneViewForm::Funnel => (ViewContentKind::Plot, "plot.funnel"),
+			RuneViewForm::RadialDial => (ViewContentKind::Plot, "plot.radial_dial"),
 		};
 		Self {
 			content_kind,
@@ -237,6 +240,7 @@ impl RuneViewIntent {
 						PlotType::Heatmap => "plot.heatmap".to_owned(),
 						PlotType::Bubble => "plot.bubble".to_owned(),
 						PlotType::Funnel => "plot.funnel".to_owned(),
+						PlotType::RadialDial => "plot.radial_dial".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -283,6 +287,7 @@ impl RuneViewIntent {
 			(ViewContentKind::Plot, "plot.box") => RuneViewForm::Box,
 			(ViewContentKind::Plot, "plot.bubble") => RuneViewForm::Bubble,
 			(ViewContentKind::Plot, "plot.funnel") => RuneViewForm::Funnel,
+			(ViewContentKind::Plot, "plot.radial_dial") => RuneViewForm::RadialDial,
 			_ => panic!("a composite presentation has no legacy RuneViewForm"),
 		}
 	}
@@ -343,6 +348,13 @@ pub(crate) struct HeatmapFieldOrigins {
 pub(crate) struct FunnelFieldOrigins {
 	pub(crate) stage: Range<u32>,
 	pub(crate) value: Range<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RadialDialFieldOrigins {
+	pub(crate) value: Range<u32>,
+	pub(crate) maximum: Range<u32>,
+	pub(crate) label: Option<Range<u32>>,
 }
 
 impl HeatmapFieldOrigins {
@@ -422,6 +434,10 @@ pub(crate) enum SpannedMarkFields {
 		fields: crate::plot::spec::FunnelFields,
 		origins: FunnelFieldOrigins,
 	},
+	RadialDial {
+		fields: crate::plot::spec::RadialDialFields,
+		origins: RadialDialFieldOrigins,
+	},
 }
 
 impl SpannedMarkFields {
@@ -431,6 +447,7 @@ impl SpannedMarkFields {
 			Self::Heatmap { fields, .. } => MarkFields::Heatmap(fields.clone()),
 			Self::Bubble { fields, .. } => MarkFields::Bubble(fields.clone()),
 			Self::Funnel { fields, .. } => MarkFields::Funnel(fields.clone()),
+			Self::RadialDial { fields, .. } => MarkFields::RadialDial(fields.clone()),
 		}
 	}
 
@@ -462,6 +479,18 @@ impl SpannedMarkFields {
 		}
 	}
 
+	pub(crate) fn radial_dial(
+		&self,
+	) -> Option<(
+		&crate::plot::spec::RadialDialFields,
+		&RadialDialFieldOrigins,
+	)> {
+		match self {
+			Self::RadialDial { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
 	fn semantic_eq(&self, other: &Self) -> bool {
 		match (self, other) {
 			(Self::BoxPlot { fields: left, .. }, Self::BoxPlot { fields: right, .. }) => {
@@ -474,6 +503,9 @@ impl SpannedMarkFields {
 				left == right
 			}
 			(Self::Funnel { fields: left, .. }, Self::Funnel { fields: right, .. }) => {
+				left == right
+			}
+			(Self::RadialDial { fields: left, .. }, Self::RadialDial { fields: right, .. }) => {
 				left == right
 			}
 			_ => false,

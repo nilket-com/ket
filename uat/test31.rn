@@ -1,0 +1,20 @@
+let grouped = workspace.table("radial_dial_probe");
+let ungrouped = workspace.table("radial_dial_ungrouped");
+
+grouped.views([
+	view("radial-dial-grouped", figure([
+		title("Radial dial · authored grouped readings"),
+		subtitle("Input is West, East, South, North; rings render lexically"),
+		skin("nord"),
+		radial_dial("value", "maximum", "label"),
+	])),
+]);
+
+ungrouped.views([
+	view("radial-dial-ungrouped", figure([
+		title("Radial dial · authored ungrouped reading"),
+		subtitle("No label field is selected; presentation names it All Data"),
+		skin("nord"),
+		radial_dial("value", "maximum"),
+	])),
+]);

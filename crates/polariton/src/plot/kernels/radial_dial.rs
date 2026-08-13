@@ -6,6 +6,7 @@ use crate::plot::exact_numeric::{ExactF64Error, exact_f64};
 use crate::plot::kernels::radial_dial_readings::{
 	RadialDialNumericCell, RadialDialReadingRow, RadialDialReadings, RadialDialReadingsError,
 };
+use crate::plot::spec::CategoryColorAssignment;
 use iced::advanced::mouse::Cursor;
 use iced::{Color, Point, Rectangle};
 use polars::prelude::*;
@@ -14,6 +15,42 @@ use std::sync::Arc;
 
 pub struct RadialDialPlotKernel {
 	pub prepared_data: Arc<RadialDialPreparedData>,
+	/// Authored grouped dials carry one resolved assignment per category.
+	/// `None` is the legacy/automatic positional compatibility path.
+	pub category_colors: Option<Vec<CategoryColorAssignment>>,
+}
+
+impl RadialDialPlotKernel {
+	fn category_color(&self, index: usize, settings: &ResolvedPlotSettings) -> Color {
+		if let Some(assignments) = &self.category_colors {
+			let category = self
+				.prepared_data
+				.readings
+				.iter()
+				.nth(index)
+				.and_then(|reading| reading.category())
+				.expect("PRODUCT-0100 authored radial-dial assignments have named categories");
+			let assignment = assignments
+				.iter()
+				.find(|assignment| assignment.category == category)
+				.expect(
+					"PRODUCT-0100 authored radial-dial categories have complete colour assignments",
+				);
+			return Color::from_rgba8(
+				assignment.color.red,
+				assignment.color.green,
+				assignment.color.blue,
+				assignment.color.alpha as f32 / u8::MAX as f32,
+			);
+		}
+		let total = self.prepared_data.readings.iter().len();
+		let position = if total > 1 {
+			index as f32 / (total - 1) as f32
+		} else {
+			0.5
+		};
+		settings.color_theme.get_color(position)
+	}
 }
 
 impl PlotKernel for RadialDialPlotKernel {
@@ -46,12 +83,7 @@ impl PlotKernel for RadialDialPlotKernel {
 			let ratio = (val / max_val) as f32;
 			let total_sweep = pi;
 			let sweep = ratio * total_sweep;
-			let t = if num_cats > 1 {
-				i as f32 / (num_cats - 1) as f32
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(t);
+			let color = self.category_color(i, &settings);
 			let outer_r = max_radius - i as f32 * (ring_thickness + ring_spacing);
 			let inner_r = outer_r - ring_thickness;
 			backend.fill_path(
@@ -79,12 +111,19 @@ impl PlotKernel for RadialDialPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data
 				.readings
 				.iter()
-				.map(|reading| reading.category().unwrap_or("All Data").to_owned()),
-			settings,
+				.enumerate()
+				.map(|(index, reading)| {
+					(
+						reading.category().unwrap_or("All Data").to_owned(),
+						self.category_color(index, settings),
+					)
+				}),
+			crate::plot::legend::LegendSample::Swatch,
+			crate::plot::legend::LegendProvenance::Named,
 		)
 	}
 
@@ -374,6 +413,103 @@ mod tests {
 			"maximum" => [8.0, 10.0],
 		)
 		.expect("valid radial-dial frame")
+	}
+
+	fn assignment(category: &str, index: usize, color: [u8; 3]) -> CategoryColorAssignment {
+		CategoryColorAssignment {
+			category: category.to_owned(),
+			position: crate::plot::spec::PalettePosition::new(index, 2).unwrap(),
+			color: crate::plot::spec::ResolvedColor {
+				red: color[0],
+				green: color[1],
+				blue: color[2],
+				alpha: u8::MAX,
+			},
+		}
+	}
+
+	#[test]
+	fn product_0100_authored_category_colour_is_one_paint_and_legend_authority() {
+		let prepared =
+			prepare_radial_dial_data(&valid_frame(), Some("category"), "value", "maximum").unwrap();
+		let kernel = RadialDialPlotKernel {
+			prepared_data: Arc::new(prepared),
+			category_colors: Some(vec![
+				assignment("Alpha", 0, [10, 20, 30]),
+				assignment("Zulu", 1, [70, 80, 90]),
+			]),
+		};
+		let settings = ResolvedPlotSettings::default();
+		let expected = (0..2)
+			.map(|index| kernel.category_color(index, &settings))
+			.collect::<Vec<_>>();
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0));
+		let transform = CoordinateTransformer::new(&PlotLayout::Radial, bounds);
+		let mut backend = RadialDialBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		assert_eq!(backend.colors[1], expected[0]);
+		assert_eq!(backend.colors[3], expected[1]);
+		let legend = kernel.legend_content(&settings).unwrap();
+		let crate::plot::legend::LegendSection::Entries(entries) =
+			legend.sections().next().unwrap()
+		else {
+			panic!("radial dial legend is categorical entries")
+		};
+		assert_eq!(
+			entries.iter().map(|entry| entry.swatch).collect::<Vec<_>>(),
+			expected
+		);
+	}
+
+	#[test]
+	fn product_0100_unassigned_radial_dial_fallback_remains_positional() {
+		let settings = ResolvedPlotSettings::default();
+		let first =
+			prepare_radial_dial_data(&valid_frame(), Some("category"), "value", "maximum").unwrap();
+		let kernel = RadialDialPlotKernel {
+			prepared_data: Arc::new(first),
+			category_colors: None,
+		};
+		assert_eq!(
+			kernel.category_color(0, &settings),
+			settings.color_theme.get_color(0.0)
+		);
+		assert_eq!(
+			kernel.category_color(1, &settings),
+			settings.color_theme.get_color(1.0)
+		);
+	}
+
+	#[test]
+	fn product_0100_binding_and_preparation_admit_and_refuse_the_same_role_dtypes() {
+		let fields = crate::plot::spec::RadialDialFields {
+			value: "value".to_owned(),
+			maximum: "maximum".to_owned(),
+			label: Some("label".to_owned()),
+		};
+		let authored = crate::plot::spec::AuthoredPlotSpec::radial_dial(fields);
+		let valid = df!("label" => [true], "value" => [1_i64], "maximum" => [2_i64]).unwrap();
+		crate::plot::spec::resolve_channels(&authored, valid.schema().as_ref())
+			.expect("binding admits the valid role matrix");
+		prepare_radial_dial_data(&valid, Some("label"), "value", "maximum")
+			.expect("preparation admits the same role matrix");
+
+		for invalid in [
+			df!("label" => [1_i64], "value" => [1_i64], "maximum" => [2_i64]).unwrap(),
+			df!("label" => ["A"], "value" => ["bad"], "maximum" => [2_i64]).unwrap(),
+			df!("label" => ["A"], "value" => [1_i64], "maximum" => ["bad"]).unwrap(),
+		] {
+			assert!(
+				crate::plot::spec::resolve_channels(&authored, invalid.schema().as_ref()).is_err()
+			);
+			assert!(prepare_radial_dial_data(&invalid, Some("label"), "value", "maximum").is_err());
+		}
 	}
 
 	#[test]
@@ -751,6 +887,7 @@ mod tests {
 			.expect("valid grouped radial dial");
 		let kernel = RadialDialPlotKernel {
 			prepared_data: Arc::new(prepared),
+			category_colors: None,
 		};
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0));
 		let layout = PlotLayout::Radial;
@@ -851,6 +988,7 @@ mod tests {
 				prepare_radial_dial_data(&empty, None, "value", "maximum")
 					.expect("empty ungrouped relation"),
 			),
+			category_colors: None,
 		};
 		assert!(
 			empty_kernel
@@ -868,6 +1006,7 @@ mod tests {
 				prepare_radial_dial_data(&ungrouped, None, "value", "maximum")
 					.expect("valid ungrouped relation"),
 			),
+			category_colors: None,
 		};
 		let legend = ungrouped_kernel
 			.legend_content(&ResolvedPlotSettings::default())

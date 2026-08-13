@@ -89,3 +89,16 @@ plateau, so reorder-stable categorical assignments can be distinguished without
 violating the non-increasing substrate. `funnel_probe_rising` deliberately rises
 from 60 to 75 and must refuse at the value argument. The faceted view keeps the
 authored funnel on PRODUCT-0097's non-origin hover seam.
+
+Seed the PRODUCT-0100 radial-dial relations, then open the grouped and ungrouped
+surface exhibit:
+
+```sh
+nilket toron sql --file uat/radial_dial_probe.sql
+cargo run -p polariton -- uat/test31.rn
+```
+
+`radial_dial_probe` deliberately arrives as West, East, South, North and must
+render in PRODUCT-0099's lexical category order. `radial_dial_ungrouped` has no
+label field; its one honest `category: None` is displayed as `All Data` only at
+the legend and hover presentation sites.

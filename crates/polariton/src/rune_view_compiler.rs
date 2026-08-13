@@ -28,6 +28,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"facet",
 	"figure",
 	"funnel",
+	"radial_dial",
 	"histogram",
 	"heatmap",
 	"hide_legend",
@@ -501,7 +502,10 @@ fn static_method_on_relation(
 			},
 		);
 	}
-	if matches!(method, "box" | "bubble" | "funnel" | "heatmap") {
+	if matches!(
+		method,
+		"box" | "bubble" | "funnel" | "heatmap" | "radial_dial"
+	) {
 		return invalid_view(
 			call.span(),
 			source.len(),
@@ -1283,6 +1287,7 @@ fn rewrite_calls_mapped(
 			"bubble" => Some(&[4, 5]),
 			"heatmap" => Some(&[3]),
 			"funnel" => Some(&[2]),
+			"radial_dial" => Some(&[2, 3]),
 			_ => None,
 		};
 		let injected_origins = if let Some(origin_arities) = origin_arities.filter(|_| !is_method) {
@@ -2024,6 +2029,92 @@ relation.views([figure([
 	}
 
 	#[test]
+	fn product_0100_radial_dial_surface_positions_arities_and_origins_are_closed() {
+		for (fields, expected_label) in [
+			("\"value\", \"maximum\"", None),
+			("\"value\", \"maximum\", \"label\"", Some("label")),
+		] {
+			for slot in [
+				format!("radial_dial({fields})"),
+				format!("view(\"named\", radial_dial({fields}))"),
+				format!("view(\"named\", figure([radial_dial({fields})]))"),
+				format!("figure([radial_dial({fields})])"),
+			] {
+				let source = format!(
+					"let relation = workspace.table(\"radial_dial_probe\");\nrelation.views([{slot}]);"
+				);
+				let compiled = compile(&source).unwrap_or_else(|error| panic!("{slot}: {error}"));
+				let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+					panic!("radial-dial surface produced a table")
+				};
+				let sink = match &plot.body {
+					RunePlotBody::Single(sink) => sink,
+					RunePlotBody::StyledSingle(styled) => &styled.sink,
+					RunePlotBody::Layered(_) => panic!("radial-dial surface produced layers"),
+				};
+				assert_eq!(
+					sink.composition.primary_plot_type(),
+					crate::plot::core::PlotType::RadialDial
+				);
+				let (actual, origins) = sink
+					.mark_fields
+					.as_ref()
+					.and_then(|fields| fields.radial_dial())
+					.expect("radial-dial fields and origins");
+				assert_eq!(
+					(
+						actual.value.as_str(),
+						actual.maximum.as_str(),
+						actual.label.as_deref()
+					),
+					("value", "maximum", expected_label)
+				);
+				assert_eq!(
+					&source[origins.value.start as usize..origins.value.end as usize],
+					"\"value\""
+				);
+				assert_eq!(
+					&source[origins.maximum.start as usize..origins.maximum.end as usize],
+					"\"maximum\""
+				);
+				assert_eq!(
+					origins
+						.label
+						.as_ref()
+						.map(|span| &source[span.start as usize..span.end as usize]),
+					expected_label.map(|_| "\"label\"")
+				);
+			}
+		}
+
+		let fields = "\"value\", \"maximum\"";
+		for source in [
+			format!(
+				"let r = workspace.table(\"radial_dial_probe\"); r.views([layers([radial_dial({fields})])]);"
+			),
+			format!("plot.radial_dial(workspace.table(\"radial_dial_probe\"), {fields});"),
+			format!("workspace.table(\"radial_dial_probe\").radial_dial({fields});"),
+		] {
+			assert!(
+				compile(&source).is_err(),
+				"accepted forbidden surface: {source}"
+			);
+		}
+		for source in [
+			"let r = workspace.table(\"radial_dial_probe\"); r.views([radial_dial(\"value\")]);",
+			"let r = workspace.table(\"radial_dial_probe\"); r.views([radial_dial(\"value\", \"maximum\", \"label\", \"extra\")]);",
+		] {
+			let error = compile(source).expect_err("invalid radial-dial arity must refuse");
+			assert!(
+				error.to_string().contains(
+					"radial_dial(...) takes value and maximum strings with an optional trailing label string"
+				),
+				"{error}"
+			);
+		}
+	}
+
+	#[test]
 	fn product_0092_heatmap_surface_positions_are_closed_and_originated() {
 		let fields = "\"region\", \"quarter\", \"margin\"";
 		for slot in [
@@ -2255,6 +2346,40 @@ relation.views([figure([
 		}
 		assert!(source.contains("equal-valued plateau"));
 		assert!(source.contains("must refuse"));
+	}
+
+	#[test]
+	fn product_0100_test31_is_the_grouped_and_ungrouped_radial_dial_exhibit() {
+		let source = include_str!("../../../uat/test31.rn");
+		let compiled = compile(source).expect("the checked-in radial-dial exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 2);
+		let labels = compiled
+			.executions
+			.iter()
+			.flat_map(|execution| execution.views.iter())
+			.map(|view| {
+				let RuneViewIntent::Plot(plot) = &view.intent else {
+					panic!("radial-dial exhibit produced a table")
+				};
+				let RunePlotBody::Single(sink) = &plot.body else {
+					panic!("radial-dial exhibit did not retain one standalone mark")
+				};
+				let (fields, _) = sink
+					.mark_fields
+					.as_ref()
+					.and_then(|fields| fields.radial_dial())
+					.expect("radial-dial exhibit fields");
+				assert_eq!(
+					sink.composition.primary_plot_type(),
+					crate::plot::core::PlotType::RadialDial
+				);
+				fields.label.as_deref()
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(labels, [Some("label"), None]);
+		assert!(source.contains("rings render lexically"));
+		assert!(source.contains("presentation names it All Data"));
 	}
 
 	#[test]

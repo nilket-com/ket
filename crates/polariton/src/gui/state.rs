@@ -1008,6 +1008,9 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 			crate::plot::spec::MarkFields::Heatmap(fields) => AuthoredPlotSpec::heatmap(fields),
 			crate::plot::spec::MarkFields::Bubble(fields) => AuthoredPlotSpec::bubble(fields),
 			crate::plot::spec::MarkFields::Funnel(fields) => AuthoredPlotSpec::funnel(fields),
+			crate::plot::spec::MarkFields::RadialDial(fields) => {
+				AuthoredPlotSpec::radial_dial(fields)
+			}
 		};
 	}
 	if sink.composition.primary_plot_type() == PlotType::Histogram {
@@ -1207,6 +1210,89 @@ fn funnel_failure_span(
 			| crate::plot::kernels::funnel::FunnelPreparationError::Stages(_),
 		) => origins.value.clone(),
 		Ok(_) => mark.clone(),
+	}
+}
+
+#[cfg(feature = "toron")]
+fn radial_dial_failure_span(
+	data: &DataFrame,
+	fields: &crate::plot::spec::RadialDialFields,
+	origins: &crate::rune_relation_envelope::RadialDialFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let authored = AuthoredPlotSpec::radial_dial(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return if fields.label.as_deref() == Some(error.field.as_str()) {
+			origins.label.clone().unwrap_or_else(|| mark.clone())
+		} else if error.field == fields.value {
+			origins.value.clone()
+		} else if error.field == fields.maximum {
+			origins.maximum.clone()
+		} else {
+			mark.clone()
+		};
+	}
+	use crate::plot::kernels::radial_dial::{
+		RadialDialPreparationError, RadialDialPreparationField,
+	};
+	use crate::plot::kernels::radial_dial_readings::RadialDialReadingsError;
+	match crate::plot::kernels::radial_dial::prepare_radial_dial_data(
+		data,
+		fields.label.as_deref(),
+		&fields.value,
+		&fields.maximum,
+	) {
+		Err(
+			RadialDialPreparationError::MissingColumn {
+				field_role: RadialDialPreparationField::Category,
+				..
+			}
+			| RadialDialPreparationError::UnsupportedColumn {
+				field_role: RadialDialPreparationField::Category,
+				..
+			}
+			| RadialDialPreparationError::Readings(
+				RadialDialReadingsError::NullCategory { .. }
+				| RadialDialReadingsError::DuplicateCategory { .. },
+			),
+		) => origins.label.clone().unwrap_or_else(|| mark.clone()),
+		Err(
+			RadialDialPreparationError::MissingColumn {
+				field_role: RadialDialPreparationField::Value,
+				..
+			}
+			| RadialDialPreparationError::UnsupportedColumn {
+				field_role: RadialDialPreparationField::Value,
+				..
+			}
+			| RadialDialPreparationError::Readings(
+				RadialDialReadingsError::NullValue { .. }
+				| RadialDialReadingsError::InexactValue { .. }
+				| RadialDialReadingsError::NonFiniteValue { .. }
+				| RadialDialReadingsError::NegativeValue { .. }
+				| RadialDialReadingsError::ValueExceedsMaximum { .. },
+			),
+		) => origins.value.clone(),
+		Err(
+			RadialDialPreparationError::MissingColumn {
+				field_role: RadialDialPreparationField::Maximum,
+				..
+			}
+			| RadialDialPreparationError::UnsupportedColumn {
+				field_role: RadialDialPreparationField::Maximum,
+				..
+			}
+			| RadialDialPreparationError::Readings(
+				RadialDialReadingsError::NullMaximum { .. }
+				| RadialDialReadingsError::InexactMaximum { .. }
+				| RadialDialReadingsError::NonFiniteMaximum { .. }
+				| RadialDialReadingsError::NonPositiveMaximum { .. },
+			),
+		) => origins.maximum.clone(),
+		Err(RadialDialPreparationError::Readings(
+			RadialDialReadingsError::UngroupedMultipleRows { .. },
+		))
+		| Ok(_) => mark.clone(),
 	}
 }
 
@@ -1697,6 +1783,10 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.funnel()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let radial_dial_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.radial_dial()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let body_output_span = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
 					RunePlotBody::Single(sink)
@@ -2037,6 +2127,13 @@ fn rune_view_outcome_with_palettes(
 					funnel_failure_span(frame.as_ref(), fields, origins, mark)
 				})
 			});
+			let radial_dial_output_span = output.as_ref().err().and_then(|_| {
+				radial_dial_diagnostic
+					.as_ref()
+					.map(|(fields, origins, mark)| {
+						radial_dial_failure_span(frame.as_ref(), fields, origins, mark)
+					})
+			});
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
@@ -2046,6 +2143,7 @@ fn rune_view_outcome_with_palettes(
 					.or(heatmap_output_span)
 					.or(bubble_output_span)
 					.or(funnel_output_span)
+					.or(radial_dial_output_span)
 					.or(body_output_span)
 					.or(facet_span)
 					.unwrap_or(view.span),
@@ -10137,6 +10235,169 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			"rises between rows 1 and 2",
 		);
 		assert!(complete(valid).sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0100_radial_dial_resolves_identity_and_attributes_every_refusal() {
+		use polars::frame::DataFrame;
+		let grouped = r#"workspace.table("radial_dial_probe").views([radial_dial("value", "maximum", "label")])"#;
+		let ungrouped =
+			r#"workspace.table("radial_dial_probe").views([radial_dial("value", "maximum")])"#;
+		let complete = |source: &str, frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("radial-dial source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"label" => ["Zulu", "Alpha"],
+			"value" => [4.0_f64, 2.0],
+			"maximum" => [8.0_f64, 10.0],
+		)
+		.unwrap();
+		let outcome = complete(grouped, valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid radial dial must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::RadialDial {
+				label: Some(label), value, maximum
+			} if (label.as_str(), value.as_str(), maximum.as_str()) == ("label", "value", "maximum")
+		));
+		let snapshot = continuation.identity.persistence_snapshot();
+		assert_eq!(snapshot.assignments.len(), 2);
+		assert!(snapshot.assignments.iter().all(|assignment| {
+			assignment.field == "label" && assignment.layer.family.as_str() == "radial_dial"
+		}));
+
+		let assert_span = |source: &str, frame: DataFrame, expected: &str, fragment: &str| {
+			let outcome = complete(source, frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid radial dial rendered")
+			};
+			assert!(error.contains(fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+
+		for (frame, expected, fragment) in [
+			(
+				polars::df!("value" => [1.0], "maximum" => [2.0]).unwrap(),
+				"\"label\"",
+				"absent",
+			),
+			(
+				polars::df!("label" => [1_i64], "value" => [1.0], "maximum" => [2.0]).unwrap(),
+				"\"label\"",
+				"incompatible",
+			),
+			(
+				polars::df!("label" => ["A"], "maximum" => [2.0]).unwrap(),
+				"\"value\"",
+				"absent",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => ["bad"], "maximum" => [2.0]).unwrap(),
+				"\"value\"",
+				"incompatible with RadialDial",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [1.0]).unwrap(),
+				"\"maximum\"",
+				"absent",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [1.0], "maximum" => ["bad"]).unwrap(),
+				"\"maximum\"",
+				"Quantitative",
+			),
+			(
+				polars::df!("label" => [None::<&str>], "value" => [1.0], "maximum" => [2.0])
+					.unwrap(),
+				"\"label\"",
+				"null at row 1",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [None::<f64>], "maximum" => [2.0])
+					.unwrap(),
+				"\"value\"",
+				"null at row 1",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [f64::NAN], "maximum" => [2.0]).unwrap(),
+				"\"value\"",
+				"non-finite",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [-1.0], "maximum" => [2.0]).unwrap(),
+				"\"value\"",
+				"negative",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [1.0], "maximum" => [None::<f64>])
+					.unwrap(),
+				"\"maximum\"",
+				"null at row 1",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [1.0], "maximum" => [f64::INFINITY])
+					.unwrap(),
+				"\"maximum\"",
+				"non-finite",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [1.0], "maximum" => [0.0]).unwrap(),
+				"\"maximum\"",
+				"not positive",
+			),
+			(
+				polars::df!("label" => ["A"], "value" => [3.0], "maximum" => [2.0]).unwrap(),
+				"\"value\"",
+				"exceeds its maximum",
+			),
+			(
+				polars::df!("label" => ["A", "A"], "value" => [1.0, 1.0], "maximum" => [2.0, 2.0])
+					.unwrap(),
+				"\"label\"",
+				"duplicated at rows 1 and 2",
+			),
+		] {
+			assert_span(grouped, frame, expected, fragment);
+		}
+		assert_span(
+			grouped,
+			polars::df!(
+				"label" => ["A"],
+				"value" => [9_007_199_254_740_993_i64],
+				"maximum" => [9_007_199_254_740_994_i64],
+			)
+			.unwrap(),
+			"\"value\"",
+			"exactly as f64",
+		);
+		assert_span(
+			grouped,
+			polars::df!(
+				"label" => ["A"],
+				"value" => [1_i64],
+				"maximum" => [9_007_199_254_740_993_i64],
+			)
+			.unwrap(),
+			"\"maximum\"",
+			"exactly as f64",
+		);
+		assert_span(
+			ungrouped,
+			polars::df!("value" => [1.0, 1.0], "maximum" => [2.0, 2.0]).unwrap(),
+			"radial_dial(\"value\", \"maximum\")",
+			"more than one reading at row 2",
+		);
+		assert!(complete(grouped, valid).sinks[0].output.is_ok());
 	}
 
 	#[test]

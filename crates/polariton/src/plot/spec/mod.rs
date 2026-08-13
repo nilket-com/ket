@@ -388,6 +388,13 @@ impl FunnelFields {
 	}
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RadialDialFields {
+	pub value: String,
+	pub maximum: String,
+	pub label: Option<String>,
+}
+
 impl HeatmapFields {
 	pub fn all(&self) -> [&str; 3] {
 		[&self.x, &self.y, &self.value]
@@ -400,6 +407,7 @@ pub enum MarkFields {
 	Heatmap(HeatmapFields),
 	Bubble(BubbleFields),
 	Funnel(FunnelFields),
+	RadialDial(RadialDialFields),
 }
 
 impl MarkFields {
@@ -436,6 +444,15 @@ impl MarkFields {
 				Some(&fields.stage),
 				Some(&fields.value),
 				None,
+				None,
+				None,
+				None,
+				None,
+			],
+			Self::RadialDial(fields) => [
+				Some(&fields.value),
+				Some(&fields.maximum),
+				fields.label.as_deref(),
 				None,
 				None,
 				None,
@@ -604,6 +621,23 @@ impl AuthoredPlotSpec {
 	pub fn funnel_fields(&self) -> Option<&FunnelFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::Funnel(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn radial_dial(fields: RadialDialFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::RadialDial),
+			fields.value.clone(),
+			fields.maximum.clone(),
+		);
+		spec.mark_fields = Some(MarkFields::RadialDial(fields));
+		spec
+	}
+
+	pub fn radial_dial_fields(&self) -> Option<&RadialDialFields> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::RadialDial(fields)) => Some(fields),
 			_ => None,
 		}
 	}
@@ -878,15 +912,17 @@ impl AuthoredFamilyId {
 	pub(crate) const LINE: Self = Self(Cow::Borrowed("line"));
 	pub(crate) const AREA: Self = Self(Cow::Borrowed("area"));
 	pub(crate) const FUNNEL: Self = Self(Cow::Borrowed("funnel"));
+	pub(crate) const RADIAL_DIAL: Self = Self(Cow::Borrowed("radial_dial"));
 
 	/// Exhaustive catalog of identifiers this binary can originate from authored
 	/// source. It is intentionally narrower than the checked persistence grammar.
-	pub(crate) const ALL: [Self; 5] = [
+	pub(crate) const ALL: [Self; 6] = [
 		Self::SCATTER,
 		Self::BAR,
 		Self::LINE,
 		Self::AREA,
 		Self::FUNNEL,
+		Self::RADIAL_DIAL,
 	];
 
 	pub(crate) fn parse(value: String) -> Result<Self, String> {
@@ -923,6 +959,7 @@ impl ColorLayerIdentity {
 			PlotType::Line => AuthoredFamilyId::LINE,
 			PlotType::StackedArea => AuthoredFamilyId::AREA,
 			PlotType::Funnel => AuthoredFamilyId::FUNNEL,
+			PlotType::RadialDial => AuthoredFamilyId::RADIAL_DIAL,
 			PlotType::StackedBar | PlotType::HorizontalStackedBar => unreachable!(
 				"PRODUCT-0064 requires stacked bar colour lineage to retain authored Bar identity"
 			),
@@ -1706,6 +1743,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::Funnel && spec.funnel_fields().is_some() {
 		return resolve_funnel_channels(spec, schema);
 	}
+	if plot_type == PlotType::RadialDial && spec.radial_dial_fields().is_some() {
+		return resolve_radial_dial_channels(spec, schema);
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -2246,6 +2286,93 @@ fn resolve_funnel_channels(
 	})
 }
 
+fn resolve_radial_dial_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.radial_dial_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("radial dial"),
+		field: "<radial dial>".to_owned(),
+		reason: "Radial dial requires explicit value and maximum fields".to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::RadialDial,
+	};
+	let mut used = HashSet::new();
+	let label = fields
+		.label
+		.as_ref()
+		.map(|label| {
+			resolve_required(
+				Channel::X,
+				&AuthoredChannelSpec::named(label),
+				PlotType::RadialDial,
+				&layer,
+				false,
+				schema,
+				&mut used,
+			)
+			.map_err(|mut error| {
+				error.attribution = FieldAttribution::Role("label");
+				error
+			})
+		})
+		.transpose()?;
+	let value = resolve_required(
+		Channel::Y,
+		&AuthoredChannelSpec::named(&fields.value),
+		PlotType::RadialDial,
+		&layer,
+		false,
+		schema,
+		&mut used,
+	)
+	.map_err(|mut error| {
+		error.attribution = FieldAttribution::Role("value");
+		error
+	})?;
+	let maximum_dtype = schema
+		.get(fields.maximum.as_str())
+		.ok_or_else(|| ChannelError {
+			attribution: FieldAttribution::Role("maximum"),
+			field: fields.maximum.clone(),
+			reason: "field is absent from the returned schema".to_owned(),
+		})?;
+	let maximum_semantic = semantic_type(maximum_dtype).ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("maximum"),
+		field: fields.maximum.clone(),
+		reason: format!("dtype {maximum_dtype:?} has no supported semantic type"),
+	})?;
+	if maximum_semantic != SemanticType::Quantitative {
+		return Err(ChannelError {
+			attribution: FieldAttribution::Role("maximum"),
+			field: fields.maximum.clone(),
+			reason: format!(
+				"radial dial maximum requires a Quantitative dtype, got {maximum_dtype:?}"
+			),
+		});
+	}
+	let mut channels = Vec::with_capacity(usize::from(label.is_some()) + 1);
+	if let Some(label) = label {
+		channels.push(label);
+	}
+	channels.push(value);
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels,
+		kernel_fields: Box::new(ResolvedKernelFields::RadialDial {
+			label: fields.label.clone(),
+			value: fields.value.clone(),
+			maximum: fields.maximum.clone(),
+		}),
+		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
+		categorical_limit: DEFAULT_CATEGORICAL_LIMIT,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
 fn resolve_bar_orientation(x: &BoundChannel, y: &BoundChannel) -> Result<PlotType, ChannelError> {
 	match (
 		x.semantic_type == SemanticType::Quantitative,
@@ -2436,11 +2563,13 @@ pub fn resolve_domains(
 			reason: error.to_string(),
 		})?;
 		let domain = resolve_domain(column, &channel)?;
-		let funnel_stages = binding.composition.primary_plot_type() == PlotType::Funnel
-			&& channel.channel == Channel::X;
+		let authored_categories = matches!(
+			binding.composition.primary_plot_type(),
+			PlotType::Funnel | PlotType::RadialDial
+		) && channel.channel == Channel::X;
 		let colors = if (channel.channel == Channel::Color
 			&& color_job == Some(ColorJob::Categorical))
-			|| funnel_stages
+			|| authored_categories
 		{
 			let ScaleDomain::Categorical(categories) = &domain else {
 				return Err(DomainError {
@@ -2520,11 +2649,13 @@ pub fn resolve_domains_with_categorical_palette(
 		})?;
 		let domain =
 			resolve_domain(column, &channel).map_err(CategoricalResolutionError::Domain)?;
-		let funnel_stages = binding.composition.primary_plot_type() == PlotType::Funnel
-			&& channel.channel == Channel::X;
+		let authored_categories = matches!(
+			binding.composition.primary_plot_type(),
+			PlotType::Funnel | PlotType::RadialDial
+		) && channel.channel == Channel::X;
 		let colors = if (channel.channel == Channel::Color
 			&& color_job == Some(ColorJob::Categorical))
-			|| funnel_stages
+			|| authored_categories
 		{
 			let ScaleDomain::Categorical(categories) = &domain else {
 				return Err(CategoricalResolutionError::Domain(DomainError {
@@ -2964,6 +3095,8 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		(PlotType::Bubble, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Funnel, Channel::X) => semantic == SemanticType::Nominal,
 		(PlotType::Funnel, Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::RadialDial, Channel::X) => semantic == SemanticType::Nominal,
+		(PlotType::RadialDial, Channel::Y) => semantic == SemanticType::Quantitative,
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -3694,6 +3827,129 @@ mod tests {
 		})
 	}
 
+	fn radial_dial_spec(label: Option<&str>) -> AuthoredPlotSpec {
+		AuthoredPlotSpec::radial_dial(RadialDialFields {
+			value: "value".to_owned(),
+			maximum: "maximum".to_owned(),
+			label: label.map(str::to_owned),
+		})
+	}
+
+	#[test]
+	fn product_0100_radial_dial_binds_both_arities_and_allocates_complete_categories() {
+		let grouped = stamped(
+			df!(
+				"label" => ["Zulu", "Alpha"],
+				"value" => [4.0_f64, 2.0],
+				"maximum" => [8.0_f64, 10.0],
+			)
+			.unwrap(),
+		);
+		let projected = grouped.data.projection().unwrap();
+		let binding = resolve_channels(
+			&radial_dial_spec(Some("label")),
+			projected.schema().as_ref(),
+		)
+		.expect("three-role radial dial binds");
+		assert_eq!(binding.channels.len(), 2);
+		assert_eq!(binding.channels[0].semantic_type, SemanticType::Nominal);
+		assert_eq!(
+			binding.channels[1].semantic_type,
+			SemanticType::Quantitative
+		);
+		assert_eq!(binding.channels[0].layer.plot_type, PlotType::RadialDial);
+		let (resolved, identity) = resolve(
+			&radial_dial_spec(Some("label")),
+			&grouped,
+			&ColorIdentity::default(),
+		)
+		.unwrap();
+		let assignments = &resolved.channel(Channel::X).unwrap().colors;
+		assert_eq!(assignments.len(), 2);
+		assert!(identity.assignments.keys().all(|key| {
+			key.layer.family == AuthoredFamilyId::RADIAL_DIAL && key.field == "label"
+		}));
+
+		let ungrouped = stamped(df!("value" => [4.0_f64], "maximum" => [8.0_f64]).unwrap());
+		let (resolved, identity) = resolve(
+			&radial_dial_spec(None),
+			&ungrouped,
+			&ColorIdentity::default(),
+		)
+		.unwrap();
+		assert!(resolved.channel(Channel::X).is_none());
+		assert!(resolved.channel(Channel::Y).is_some());
+		assert!(identity.is_empty());
+	}
+
+	#[test]
+	fn product_0100_radial_dial_binding_owns_the_surface_dtype_matrix() {
+		for (frame, role) in [
+			(
+				df!("label" => [1_i64], "value" => [1.0], "maximum" => [2.0]).unwrap(),
+				"label",
+			),
+			(
+				df!("label" => ["A"], "value" => ["bad"], "maximum" => [2.0]).unwrap(),
+				"value",
+			),
+			(
+				df!("label" => ["A"], "value" => [1.0], "maximum" => ["bad"]).unwrap(),
+				"maximum",
+			),
+		] {
+			let error = resolve_channels(&radial_dial_spec(Some("label")), frame.schema().as_ref())
+				.unwrap_err();
+			assert_eq!(error.attribution, FieldAttribution::Role(role));
+		}
+		let valid = df!("label" => [true], "value" => [1_i64], "maximum" => [2_i64]).unwrap();
+		resolve_channels(&radial_dial_spec(Some("label")), valid.schema().as_ref())
+			.expect("binding admits nominal label and quantitative readings");
+	}
+
+	#[test]
+	fn product_0100_asymmetric_radial_dial_lineage_retains_shared_categories() {
+		let first = stamped(
+			df!(
+				"label" => ["A", "B", "C"],
+				"value" => [1.0, 2.0, 3.0],
+				"maximum" => [10.0, 10.0, 10.0],
+			)
+			.unwrap(),
+		);
+		let (first_resolved, identity) = resolve(
+			&radial_dial_spec(Some("label")),
+			&first,
+			&ColorIdentity::default(),
+		)
+		.unwrap();
+		let second = stamped(
+			df!(
+				"label" => ["B", "C", "D"],
+				"value" => [2.0, 3.0, 4.0],
+				"maximum" => [10.0, 10.0, 10.0],
+			)
+			.unwrap(),
+		);
+		let (second_resolved, next_identity) =
+			resolve(&radial_dial_spec(Some("label")), &second, &identity).unwrap();
+		let mapping = |resolved: &ResolvedPlotSpec| {
+			resolved
+				.channel(Channel::X)
+				.unwrap()
+				.colors
+				.iter()
+				.map(|entry| (entry.category.clone(), entry.position.index()))
+				.collect::<HashMap<_, _>>()
+		};
+		let first = mapping(&first_resolved);
+		let second = mapping(&second_resolved);
+		assert_eq!(first["B"], second["B"]);
+		assert_eq!(first["C"], second["C"]);
+		assert!(second.contains_key("D"));
+		assert_eq!(next_identity.len(), 4, "removed A remains durable");
+	}
+
 	#[test]
 	fn product_0098_funnel_binds_roles_and_allocates_one_complete_stage_assignment() {
 		let frame = stamped(
@@ -4143,7 +4399,10 @@ mod tests {
 			.iter()
 			.map(AuthoredFamilyId::as_str)
 			.collect::<Vec<_>>();
-		assert_eq!(tokens, ["scatter", "bar", "line", "area", "funnel"]);
+		assert_eq!(
+			tokens,
+			["scatter", "bar", "line", "area", "funnel", "radial_dial"]
+		);
 		assert_eq!(
 			tokens.iter().copied().collect::<HashSet<_>>().len(),
 			tokens.len()
@@ -4155,6 +4414,7 @@ mod tests {
 			(PlotType::Line, "line"),
 			(PlotType::StackedArea, "area"),
 			(PlotType::Funnel, "funnel"),
+			(PlotType::RadialDial, "radial_dial"),
 		] {
 			let actual = ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 				ordinal: 7,

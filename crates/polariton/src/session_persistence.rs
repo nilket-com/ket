@@ -1007,6 +1007,67 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0100_radial_dial_family_round_trips_only_under_the_extensible_policy() {
+		let document = DocumentId::new(100).unwrap();
+		let buffer = BufferId::new(100);
+		let view = LocalViewIdentity::Named("radial-dial".into());
+		let identity = colour_identity(PlotType::RadialDial, false);
+		let mut meanings = empty_meanings();
+		meanings
+			.colours
+			.insert((document, view.clone(), 4), identity.clone());
+		let bytes = meanings.encode().unwrap();
+		let text = String::from_utf8(bytes.clone()).unwrap();
+		assert!(text.contains("\"family\":\"radial_dial\""), "{text}");
+		for schema in [INITIAL_CLOSED_SCHEMA, AREA_CLOSED_SCHEMA] {
+			let error = DurableMeanings::decode(schema, &bytes).unwrap_err();
+			assert!(
+				error.to_string().contains(
+					"authored family radial_dial is unsupported by this schema's family policy"
+				),
+				"{error}"
+			);
+		}
+		assert_eq!(
+			DurableMeanings::decode(SCHEMA_VERSION, &bytes).unwrap(),
+			meanings
+		);
+
+		let census = SharedIdentityCensus {
+			documents: [document].into_iter().collect(),
+			host_panels: BTreeSet::new(),
+			host_panel_groups: BTreeSet::new(),
+		};
+		let runtime = meanings
+			.join_runtime(&[(document, buffer)].into_iter().collect(), &census)
+			.unwrap();
+		assert_eq!(
+			runtime.colours.as_map().get(&(buffer, view.clone(), 4)),
+			Some(&identity)
+		);
+		let recaptured = capture_runtime(
+			&HashMap::new(),
+			&HashMap::new(),
+			&runtime.colours,
+			&[(buffer, document)].into_iter().collect(),
+			&census,
+			DYNAMIC_PANEL_FLOOR,
+			GROUP_FLOOR,
+		)
+		.unwrap();
+		assert_eq!(recaptured, meanings);
+	}
+
+	#[test]
+	fn product_0100_existing_session_without_radial_dial_is_byte_identical() {
+		let meanings = empty_meanings();
+		assert_eq!(
+			meanings.encode().unwrap(),
+			br#"{"next_view_panel_id":9223372036854775808,"next_view_group_id":1,"panels":[],"groups":[],"colours":[]}"#
+		);
+	}
+
+	#[test]
 	fn product_0086_family_admission_policies_and_token_validation_are_exact() {
 		let document = DocumentId::new(86).unwrap();
 		let mut meanings = empty_meanings();

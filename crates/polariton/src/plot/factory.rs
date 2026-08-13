@@ -170,6 +170,9 @@ pub fn create_plot(
 					.expect("PRODUCT-0099 planning validated this radial-dial reading collection");
 			Arc::new(RadialDialPlotKernel {
 				prepared_data: Arc::new(prepared),
+				category_colors: spec
+					.channel(Channel::X)
+					.map(|channel| channel.colors.clone()),
 			})
 		}
 		ResolvedKernelFields::Candlestick {

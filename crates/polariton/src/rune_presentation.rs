@@ -13,16 +13,16 @@ use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FunnelFields,
 	HeatmapFields, LayerSettings, LayeredPlotSpec, LegendPosition, Override, PointSize, Presence,
-	StrokeWidth,
+	RadialDialFields, StrokeWidth,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
 };
 use crate::rune_relation_envelope::{
 	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, FunnelFieldOrigins,
-	HeatmapFieldOrigins, RunePlotBody, RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans,
-	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
-	RuneViewIntent, SpannedMarkFields, StyledRunePlotSink,
+	HeatmapFieldOrigins, RadialDialFieldOrigins, RunePlotBody, RunePlotDomainSpans, RunePlotIntent,
+	RunePlotMinorTickSpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
+	RuneTableSkinProjection, RuneViewIntent, SpannedMarkFields, StyledRunePlotSink,
 };
 use rune::alloc::limit;
 use rune::ast::Spanned;
@@ -399,6 +399,7 @@ fn build_context() -> Result<Context, String> {
 		("__bubble", raw_bubble as RawFunction),
 		("__heatmap", raw_heatmap as RawFunction),
 		("__funnel", raw_funnel as RawFunction),
+		("__radial_dial", raw_radial_dial as RawFunction),
 		("__title", raw_title as RawFunction),
 		("__subtitle", raw_subtitle as RawFunction),
 		("__x_label", raw_x_label as RawFunction),
@@ -773,6 +774,110 @@ fn raw_funnel(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 			category: None,
 			interval_end: None,
 			mark_fields: Some(SpannedMarkFields::Funnel { fields, origins }),
+			origin: origin.range(),
+		},
+		settings: LayerSettings::default(),
+		stacked: false,
+		percent: false,
+	};
+	store(
+		out,
+		stack,
+		RuneMark {
+			sink: Ok(sink),
+			origin,
+			modified: false,
+			point_size_origin: None,
+			stroke_width_origin: None,
+			bar_width_origin: None,
+			category_gap_origin: None,
+			stacked_origin: None,
+			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
+		},
+	)
+}
+
+fn raw_radial_dial(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = match raw_origin(values) {
+		Ok(origin) => origin,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	if !matches!(values.len(), 8 | 11) {
+		return store(
+			out,
+			stack,
+			RuneMark::failed(PresentationFailure::new(
+				origin,
+				"radial_dial(...) takes value and maximum strings with an optional trailing label string",
+			)),
+		);
+	}
+	let field_count = (values.len() - 2) / 3;
+	let mut fields = Vec::with_capacity(field_count);
+	for value in &values[..field_count] {
+		match rune::from_value::<Ref<str>>(value.clone()) {
+			Ok(field) => fields.push(field.to_owned()),
+			Err(_) => {
+				return store(
+					out,
+					stack,
+					RuneMark::failed(PresentationFailure::new(
+						origin,
+						"radial_dial(...) field arguments must evaluate to strings",
+					)),
+				);
+			}
+		}
+	}
+	let decode_span = |index: usize| -> Result<Range<u32>, PresentationFailure> {
+		let start = rune::from_value::<i64>(values[index].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"radial_dial(...) has an invalid injected argument origin",
+			)
+		})?;
+		let end = rune::from_value::<i64>(values[index + 1].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"radial_dial(...) has an invalid injected argument origin",
+			)
+		})?;
+		Origin::decode(start, end).map(Origin::range)
+	};
+	let origin_base = field_count;
+	let origins = match (|| {
+		Ok(RadialDialFieldOrigins {
+			value: decode_span(origin_base)?,
+			maximum: decode_span(origin_base + 2)?,
+			label: (field_count == 3)
+				.then(|| decode_span(origin_base + 4))
+				.transpose()?,
+		})
+	})() {
+		Ok(origins) => origins,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	let fields = RadialDialFields {
+		value: fields[0].clone(),
+		maximum: fields[1].clone(),
+		label: (field_count == 3).then(|| fields[2].clone()),
+	};
+	let sink = StyledRunePlotSink {
+		sink: DisposableRunePlotSink {
+			composition: PlotComposition::single(PlotType::RadialDial),
+			x: fields.value.clone(),
+			y: fields.maximum.clone(),
+			category: None,
+			interval_end: None,
+			mark_fields: Some(SpannedMarkFields::RadialDial { fields, origins }),
 			origin: origin.range(),
 		},
 		settings: LayerSettings::default(),

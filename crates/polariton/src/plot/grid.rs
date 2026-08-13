@@ -4313,6 +4313,7 @@ mod tests {
 					prepare_radial_dial_data(data, Some("category"), "value", "maximum")
 						.expect("valid radial-dial fixture"),
 				),
+				category_colors: None,
 			})
 		});
 		let settings = product_0097_settings();
@@ -4334,6 +4335,65 @@ mod tests {
 				Some("B ring: 40.0 / 80.0 (50%)".to_owned()),
 			]
 		);
+	}
+
+	#[test]
+	fn product_0100_authored_radial_dial_hover_uses_the_non_origin_facet_geometry() {
+		let complete = Arc::new(
+			df!(
+				"label" => ["A ring", "B ring"],
+				"value" => [30.0_f64, 40.0],
+				"maximum" => [60.0_f64, 80.0],
+			)
+			.expect("authored radial-dial fixture"),
+		);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "PRODUCT-0100 authored radial dial".to_owned(),
+				data: artifact(&complete),
+			},
+			authored_spec: AuthoredPlotSpec::radial_dial(crate::plot::spec::RadialDialFields {
+				value: "value".to_owned(),
+				maximum: "maximum".to_owned(),
+				label: Some("label".to_owned()),
+			}),
+		})
+		.expect("authored radial dial resolves");
+		let body = Arc::new(resolved.resolved_spec);
+		let mut cells = NonEmpty::new(GridCell {
+			position: GridPosition { row: 0, column: 0 },
+			body: Arc::clone(&body),
+			data: Arc::new(
+				df!("label" => ["A ring"], "value" => [30.0], "maximum" => [60.0]).unwrap(),
+			),
+			x_group: 0,
+			y_group: 0,
+			label: Some("A".to_owned()),
+		});
+		cells.push(GridCell {
+			position: GridPosition { row: 0, column: 1 },
+			body,
+			data: Arc::new(
+				df!("label" => ["B ring"], "value" => [40.0], "maximum" => [80.0]).unwrap(),
+			),
+			x_group: 0,
+			y_group: 0,
+			label: Some("B".to_owned()),
+		});
+		let grid = PlotGrid::new(cells, GridArrangement::new(1, 2).unwrap()).unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let settings = product_0097_settings();
+		let inner = product_0097_inner(&kernel, 1, &settings);
+		let max_radius = (inner.width() / 2.0).min(inner.height() * 0.7) * 0.9;
+		let hover = product_0097_hover(
+			&kernel,
+			Point::new(
+				inner.x() + inner.width() / 2.0,
+				inner.y() + inner.height() * 0.8 - max_radius / 2.0,
+			),
+			&settings,
+		);
+		assert_eq!(hover, Some("B ring: 40.0 / 80.0 (50%)".to_owned()));
 	}
 
 	#[test]
