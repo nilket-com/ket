@@ -149,7 +149,8 @@ impl StyledRunePlotSink {
 			| PlotType::Histogram
 			| PlotType::BoxPlot
 			| PlotType::Heatmap
-			| PlotType::Bubble => {
+			| PlotType::Bubble
+			| PlotType::Funnel => {
 				return Err(self);
 			}
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
@@ -191,6 +192,7 @@ pub(crate) enum RuneViewForm {
 	Histogram,
 	Box,
 	Bubble,
+	Funnel,
 }
 
 #[cfg(test)]
@@ -205,6 +207,7 @@ impl From<RuneViewForm> for ViewPresentation {
 			RuneViewForm::Histogram => (ViewContentKind::Plot, "plot.histogram"),
 			RuneViewForm::Box => (ViewContentKind::Plot, "plot.box"),
 			RuneViewForm::Bubble => (ViewContentKind::Plot, "plot.bubble"),
+			RuneViewForm::Funnel => (ViewContentKind::Plot, "plot.funnel"),
 		};
 		Self {
 			content_kind,
@@ -233,6 +236,7 @@ impl RuneViewIntent {
 						PlotType::BoxPlot => "plot.box".to_owned(),
 						PlotType::Heatmap => "plot.heatmap".to_owned(),
 						PlotType::Bubble => "plot.bubble".to_owned(),
+						PlotType::Funnel => "plot.funnel".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -278,6 +282,7 @@ impl RuneViewIntent {
 			(ViewContentKind::Plot, "plot.histogram") => RuneViewForm::Histogram,
 			(ViewContentKind::Plot, "plot.box") => RuneViewForm::Box,
 			(ViewContentKind::Plot, "plot.bubble") => RuneViewForm::Bubble,
+			(ViewContentKind::Plot, "plot.funnel") => RuneViewForm::Funnel,
 			_ => panic!("a composite presentation has no legacy RuneViewForm"),
 		}
 	}
@@ -331,6 +336,12 @@ impl Eq for DisposableRunePlotSink {}
 pub(crate) struct HeatmapFieldOrigins {
 	pub(crate) x: Range<u32>,
 	pub(crate) y: Range<u32>,
+	pub(crate) value: Range<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FunnelFieldOrigins {
+	pub(crate) stage: Range<u32>,
 	pub(crate) value: Range<u32>,
 }
 
@@ -407,6 +418,10 @@ pub(crate) enum SpannedMarkFields {
 		fields: BubbleFields,
 		origins: BubbleFieldOrigins,
 	},
+	Funnel {
+		fields: crate::plot::spec::FunnelFields,
+		origins: FunnelFieldOrigins,
+	},
 }
 
 impl SpannedMarkFields {
@@ -415,6 +430,7 @@ impl SpannedMarkFields {
 			Self::BoxPlot { fields, .. } => MarkFields::BoxPlot(fields.clone()),
 			Self::Heatmap { fields, .. } => MarkFields::Heatmap(fields.clone()),
 			Self::Bubble { fields, .. } => MarkFields::Bubble(fields.clone()),
+			Self::Funnel { fields, .. } => MarkFields::Funnel(fields.clone()),
 		}
 	}
 
@@ -439,6 +455,13 @@ impl SpannedMarkFields {
 		}
 	}
 
+	pub(crate) fn funnel(&self) -> Option<(&crate::plot::spec::FunnelFields, &FunnelFieldOrigins)> {
+		match self {
+			Self::Funnel { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
 	fn semantic_eq(&self, other: &Self) -> bool {
 		match (self, other) {
 			(Self::BoxPlot { fields: left, .. }, Self::BoxPlot { fields: right, .. }) => {
@@ -448,6 +471,9 @@ impl SpannedMarkFields {
 				left == right
 			}
 			(Self::Bubble { fields: left, .. }, Self::Bubble { fields: right, .. }) => {
+				left == right
+			}
+			(Self::Funnel { fields: left, .. }, Self::Funnel { fields: right, .. }) => {
 				left == right
 			}
 			_ => false,

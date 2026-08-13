@@ -1,0 +1,27 @@
+let stages = workspace.table("funnel_probe");
+let rising = workspace.table("funnel_probe_rising");
+
+stages.views([
+	view("funnel", figure([
+		title("Funnel · authored categorical stages"),
+		subtitle("Paid and Renewed form an equal-valued plateau"),
+		skin("nord"),
+		funnel("stage", "value"),
+	])),
+	view("funnel-faceted", figure([
+		title("Funnel · authored hover seam"),
+		subtitle("Hover every cell, including the non-origin facet"),
+		skin("nord"),
+		facet("stage"),
+		funnel("stage", "value"),
+	])),
+]);
+
+rising.views([
+	view("funnel-rising-refusal", figure([
+		title("Funnel · rising-value refusal"),
+		subtitle("Paid rises from 60 to 75 and must refuse"),
+		skin("nord"),
+		funnel("stage", "value"),
+	])),
+]);

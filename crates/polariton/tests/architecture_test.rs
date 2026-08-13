@@ -186,7 +186,7 @@ fn product_0086_live_family_catalog_is_source_complete_and_renderer_free() {
 				.then_some(name)
 		})
 		.collect::<Vec<_>>();
-	assert_eq!(constants, ["SCATTER", "BAR", "LINE", "AREA"]);
+	assert_eq!(constants, ["SCATTER", "BAR", "LINE", "AREA", "FUNNEL"]);
 	let all = family_impl
 		.split("pub(crate) const ALL:")
 		.nth(1)
@@ -2027,7 +2027,11 @@ fn product_0080_product_0083_plot_chrome_and_mark_style_are_separate_closed_tier
 		),
 		(
 			"plot/kernels/funnel.rs",
-			&["mark_style.decoration", "mark_style.label_text"][..],
+			&[
+				"mark_style.separator",
+				"mark_style.fill_detail",
+				"mark_style.label_text",
+			][..],
 		),
 	] {
 		let source = std::fs::read_to_string(root.join(relative)).expect("read mark kernel");
@@ -3212,6 +3216,76 @@ fn product_0095_bubble_surface_keeps_roles_projection_and_kernel_boundaries_stru
 	assert!(formatter.contains("plot {channel} channel"));
 	assert!(formatter.contains("FieldAttribution::Role(role)"));
 	assert!(formatter.contains("plot {role} field"));
+}
+
+#[test]
+fn product_0098_funnel_surface_has_one_durable_assignment_and_transport_path() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let funnel =
+		std::fs::read_to_string(root.join("plot/kernels/funnel.rs")).expect("read funnel kernel");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let envelope = std::fs::read_to_string(root.join("rune_relation_envelope.rs"))
+		.expect("read relation envelope");
+	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read host");
+	let session = std::fs::read_to_string(root.join("session_persistence.rs"))
+		.expect("read session persistence");
+
+	assert!(spec.contains("pub struct FunnelFields"));
+	assert!(spec.contains("MarkFields::Funnel"));
+	assert!(spec.contains("Self::Funnel(fields) => ["));
+	assert!(spec.contains("Some(&fields.stage),\n\t\t\t\tSome(&fields.value)"));
+	assert!(spec.contains("fn resolve_funnel_channels("));
+	assert!(spec.contains("FieldAttribution::Role(\"stage\")"));
+	assert!(spec.contains("FieldAttribution::Role(\"value\")"));
+	assert!(spec.contains("pub(crate) const FUNNEL: Self"));
+	assert!(spec.contains("PlotType::Funnel => AuthoredFamilyId::FUNNEL"));
+	assert!(spec.contains("PRODUCT-0064 requires stacked bar colour lineage"));
+	assert!(spec.contains("no live authored categorical-family conversion"));
+
+	let projection = request
+		.split("fn project_named_channels(")
+		.nth(1)
+		.expect("named-channel projection")
+		.split("#[cfg(test)]")
+		.next()
+		.expect("bounded projection");
+	assert!(projection.contains("for field in mark_fields.all()"));
+	assert!(!projection.contains("MarkFields::Funnel"));
+	assert!(!projection.contains("funnel_fields"));
+
+	assert!(presentation.contains("(\"__funnel\", raw_funnel as RawFunction)"));
+	assert_eq!(presentation.matches("SpannedMarkFields::Funnel").count(), 1);
+	assert!(compiler.contains("\"funnel\" => Some(&[2])"));
+	assert!(envelope.contains("Self::Funnel { fields, origins }"));
+	assert!(host.contains("fn funnel_failure_span("));
+	assert!(host.contains("funnel_output_span"));
+
+	let production = funnel
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production funnel kernel");
+	assert!(production.contains("fn stage_color("));
+	assert_eq!(production.matches("self.stage_color(").count(), 2);
+	assert!(production.contains("self.stage_colors"));
+	assert!(
+		production.contains("PRODUCT-0098 authored funnel stages have complete colour assignments")
+	);
+	assert!(production.contains("settings.mark_style.separator"));
+	assert!(production.contains("settings.mark_style.fill_detail"));
+	assert!(production.contains("settings.mark_style.label_text"));
+	assert!(factory.contains("spec\n\t\t\t\t.channel(Channel::X)"));
+	assert!(factory.contains("stage_colors,"));
+
+	assert!(session.contains("Self::ExtensibleFamilies => true"));
+	assert!(session.contains("\"scatter\" | \"bar\" | \"line\" | \"area\""));
+	assert!(!session.contains("INITIAL_CLOSED_SCHEMA => Ok(Self::ExtensibleFamilies)"));
+	assert!(!session.contains("AREA_CLOSED_SCHEMA => Ok(Self::ExtensibleFamilies)"));
 }
 
 #[test]

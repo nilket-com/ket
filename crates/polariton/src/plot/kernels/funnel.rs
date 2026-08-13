@@ -7,6 +7,7 @@ use crate::plot::exact_numeric::{ExactF64Error, exact_f64};
 use crate::plot::kernels::funnel_stages::{
 	FunnelStageRow, FunnelStages, FunnelStagesError, FunnelValueCell,
 };
+use crate::plot::spec::CategoryColorAssignment;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style, Text};
 use iced::{Color, Pixels, Point, Rectangle};
@@ -16,6 +17,39 @@ use std::sync::Arc;
 
 pub struct FunnelPlotKernel {
 	pub prepared_data: Arc<FunnelPreparedData>,
+	/// Authored funnels carry one resolved assignment per stage. `None` is the
+	/// legacy/automatic compatibility path and deliberately remains positional.
+	pub stage_colors: Option<Vec<CategoryColorAssignment>>,
+}
+
+impl FunnelPlotKernel {
+	fn stage_color(&self, stage_index: usize, settings: &ResolvedPlotSettings) -> Color {
+		if let Some(assignments) = &self.stage_colors {
+			let stage = self
+				.prepared_data
+				.stages
+				.get(stage_index)
+				.expect("funnel stage colour index is in bounds");
+			let assignment = assignments
+				.iter()
+				.find(|assignment| assignment.category == stage.stage())
+				.expect("PRODUCT-0098 authored funnel stages have complete colour assignments");
+			return Color::from_rgba8(
+				assignment.color.red,
+				assignment.color.green,
+				assignment.color.blue,
+				assignment.color.alpha as f32 / u8::MAX as f32,
+			);
+		}
+
+		let total = self.prepared_data.stages.iter().len();
+		let position = if total > 1 {
+			stage_index as f32 / (total - 1) as f32
+		} else {
+			0.5
+		};
+		settings.color_theme.get_color(position)
+	}
 }
 
 pub struct FunnelPreparedData {
@@ -104,6 +138,7 @@ impl PlotKernel for FunnelPlotKernel {
 			.stages
 			.first_value()
 			.expect("non-empty validated funnel has a positive first stage");
+		let mut widths = Vec::with_capacity(num_stages + 1);
 		for (i, stage) in self.prepared_data.stages.iter().enumerate() {
 			let val = stage.value();
 			let next_val = self
@@ -113,14 +148,13 @@ impl PlotKernel for FunnelPlotKernel {
 				.map_or(val, |next| next.value());
 			let width = funnel_width(val, first_value, bounds.width);
 			let next_width = funnel_width(next_val, first_value, bounds.width);
+			if i == 0 {
+				widths.push(width);
+			}
+			widths.push(next_width);
 			let y_top = i as f32 * stage_height;
 			let y_bottom = y_top + stage_height;
-			let t = if num_stages > 1 {
-				i as f32 / (num_stages - 1) as f32
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(t);
+			let color = self.stage_color(i, &settings);
 			let trapezoid_path = &|builder: &mut dyn crate::plot::common::PathBuilder| {
 				builder.move_to(Point::new(center_x - width / 2.0, y_top));
 				builder.line_to(Point::new(center_x + width / 2.0, y_top));
@@ -129,17 +163,6 @@ impl PlotKernel for FunnelPlotKernel {
 				builder.close();
 			};
 			backend.fill_path(trapezoid_path, color);
-			backend.stroke_path(
-				trapezoid_path,
-				Stroke {
-					style: Style::Solid(Color {
-						a: 0.2,
-						..settings.mark_style.decoration.iced()
-					}),
-					width: 1.0,
-					..Default::default()
-				},
-			);
 			backend.fill_text(Text {
 				content: format_label(val, AxisType::Linear),
 				position: Point::new(center_x, y_top + stage_height / 2.0),
@@ -150,18 +173,62 @@ impl PlotKernel for FunnelPlotKernel {
 				..Default::default()
 			});
 		}
+
+		for (boundary, width) in widths.iter().enumerate().skip(1).take(num_stages - 1) {
+			let y = boundary as f32 * stage_height;
+			backend.stroke_path(
+				&|builder| {
+					builder.move_to(Point::new(center_x - width / 2.0, y));
+					builder.line_to(Point::new(center_x + width / 2.0, y));
+				},
+				Stroke {
+					style: Style::Solid(settings.mark_style.separator.iced()),
+					width: 1.0,
+					..Default::default()
+				},
+			);
+		}
+
+		backend.stroke_path(
+			&|builder| {
+				builder.move_to(Point::new(center_x - widths[0] / 2.0, 0.0));
+				builder.line_to(Point::new(center_x + widths[0] / 2.0, 0.0));
+				for (boundary, width) in widths.iter().enumerate().skip(1) {
+					builder.line_to(Point::new(
+						center_x + width / 2.0,
+						boundary as f32 * stage_height,
+					));
+				}
+				for (boundary, width) in widths.iter().enumerate().rev() {
+					builder.line_to(Point::new(
+						center_x - width / 2.0,
+						boundary as f32 * stage_height,
+					));
+				}
+				builder.close();
+			},
+			Stroke {
+				style: Style::Solid(settings.mark_style.fill_detail.iced()),
+				width: 1.0,
+				..Default::default()
+			},
+		);
 	}
 
 	fn legend_content(
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data
 				.stages
 				.iter()
-				.map(|stage| stage.stage().to_owned()),
-			settings,
+				.enumerate()
+				.map(|(index, stage)| {
+					(stage.stage().to_owned(), self.stage_color(index, settings))
+				}),
+			crate::plot::legend::LegendSample::Swatch,
+			crate::plot::legend::LegendProvenance::Named,
 		)
 	}
 
@@ -325,22 +392,32 @@ mod tests {
 	#[derive(Default)]
 	struct FunnelBackend {
 		fills: Vec<Vec<Point>>,
+		fill_colors: Vec<Color>,
+		strokes: Vec<Color>,
 		texts: Vec<String>,
+		text_colors: Vec<Color>,
 	}
 
 	impl PlotBackend for FunnelBackend {
-		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {}
+		fn stroke_path(&mut self, _f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke) {
+			let Style::Solid(color) = stroke.style else {
+				panic!("funnel test backend expects solid strokes")
+			};
+			self.strokes.push(color);
+		}
 
-		fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {
+		fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color) {
 			let mut path = FunnelPath::default();
 			f(&mut path);
 			self.fills.push(path.points);
+			self.fill_colors.push(color);
 		}
 
 		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, _color: Color) {}
 
 		fn fill_text(&mut self, text: Text) {
 			self.texts.push(text.content);
+			self.text_colors.push(text.color);
 		}
 
 		fn translate(&mut self, _translation: iced::Vector) {}
@@ -369,6 +446,7 @@ mod tests {
 			prepared_data: Arc::new(
 				prepare_funnel_data(frame, "stage", "value").expect("valid funnel"),
 			),
+			stage_colors: None,
 		}
 	}
 
@@ -486,5 +564,129 @@ mod tests {
 		assert!(hover.contains("Conversion: —"));
 		assert!(hover.contains("Total Rate: 0.0%"));
 		assert!(!hover.contains("NaN"));
+	}
+
+	fn assignment(category: &str, index: usize, color: [u8; 3]) -> CategoryColorAssignment {
+		CategoryColorAssignment {
+			category: category.to_owned(),
+			position: crate::plot::spec::PalettePosition::new(index, 3).unwrap(),
+			color: crate::plot::spec::ResolvedColor {
+				red: color[0],
+				green: color[1],
+				blue: color[2],
+				alpha: u8::MAX,
+			},
+		}
+	}
+
+	#[test]
+	fn product_0098_authored_stage_colour_is_one_shared_paint_and_legend_authority() {
+		let data = frame(&["A", "B", "C"], &[100.0, 50.0, 50.0]);
+		let kernel = FunnelPlotKernel {
+			prepared_data: Arc::new(prepare_funnel_data(&data, "stage", "value").unwrap()),
+			stage_colors: Some(vec![
+				assignment("A", 0, [10, 20, 30]),
+				assignment("B", 1, [40, 50, 60]),
+				assignment("C", 2, [70, 80, 90]),
+			]),
+		};
+		let settings = ResolvedPlotSettings::default();
+		let expected = (0..3)
+			.map(|index| kernel.stage_color(index, &settings))
+			.collect::<Vec<_>>();
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 90.0));
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = FunnelBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		assert_eq!(backend.fill_colors, expected);
+		let legend = kernel.legend_content(&settings).unwrap();
+		let crate::plot::legend::LegendSection::Entries(entries) =
+			legend.sections().next().unwrap()
+		else {
+			panic!("funnel legend is categorical entries")
+		};
+		assert_eq!(
+			entries.iter().map(|entry| entry.swatch).collect::<Vec<_>>(),
+			expected
+		);
+	}
+
+	#[test]
+	fn product_0098_unassigned_fallback_remains_positional_not_label_keyed() {
+		let settings = ResolvedPlotSettings::default();
+		let first = kernel(&frame(&["A", "B"], &[10.0, 5.0]));
+		let second = kernel(&frame(&["B", "A"], &[10.0, 5.0]));
+		assert_eq!(
+			first.stage_color(0, &settings),
+			second.stage_color(0, &settings)
+		);
+		assert_eq!(
+			first.stage_color(1, &settings),
+			second.stage_color(1, &settings)
+		);
+		assert_ne!(
+			first.stage_color(0, &settings),
+			first.stage_color(1, &settings)
+		);
+	}
+
+	#[test]
+	fn product_0098_binding_and_preparation_admit_the_same_role_dtypes() {
+		let valid = polars::df!("stage" => [true, false], "value" => [2_i64, 1]).unwrap();
+		let authored =
+			crate::plot::spec::AuthoredPlotSpec::funnel(crate::plot::spec::FunnelFields {
+				stage: "stage".to_owned(),
+				value: "value".to_owned(),
+			});
+		crate::plot::spec::resolve_channels(&authored, valid.schema().as_ref())
+			.expect("binding admits boolean stage and numeric value");
+		prepare_funnel_data(&valid, "stage", "value")
+			.expect("preparation admits the same role dtypes");
+
+		let numeric_stage = polars::df!("stage" => [1_i64], "value" => [1_i64]).unwrap();
+		assert!(
+			crate::plot::spec::resolve_channels(&authored, numeric_stage.schema().as_ref())
+				.is_err()
+		);
+		assert!(prepare_funnel_data(&numeric_stage, "stage", "value").is_err());
+	}
+
+	#[test]
+	fn product_0098_funnel_uses_separator_fill_detail_and_label_text_distinctly() {
+		let data = frame(&["A", "B"], &[10.0, 5.0]);
+		let kernel = kernel(&data);
+		let mut settings = ResolvedPlotSettings::default();
+		settings.mark_style.separator = crate::plot::chrome::PlotRgba::opaque(0.1, 0.2, 0.3);
+		settings.mark_style.fill_detail = crate::plot::chrome::PlotRgba::opaque(0.4, 0.5, 0.6);
+		settings.mark_style.label_text = crate::plot::chrome::PlotRgba::opaque(0.7, 0.8, 0.9);
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = FunnelBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings.clone(),
+		);
+		assert_eq!(
+			backend.strokes,
+			[
+				settings.mark_style.separator.iced(),
+				settings.mark_style.fill_detail.iced(),
+			]
+		);
+		assert_eq!(
+			backend.text_colors,
+			vec![settings.mark_style.label_text.iced(); 2]
+		);
 	}
 }

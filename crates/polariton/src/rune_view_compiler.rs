@@ -27,6 +27,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"bubble",
 	"facet",
 	"figure",
+	"funnel",
 	"histogram",
 	"heatmap",
 	"hide_legend",
@@ -500,7 +501,7 @@ fn static_method_on_relation(
 			},
 		);
 	}
-	if matches!(method, "box" | "bubble") {
+	if matches!(method, "box" | "bubble" | "funnel" | "heatmap") {
 		return invalid_view(
 			call.span(),
 			source.len(),
@@ -1281,6 +1282,7 @@ fn rewrite_calls_mapped(
 			"box" => Some(&[7]),
 			"bubble" => Some(&[4, 5]),
 			"heatmap" => Some(&[3]),
+			"funnel" => Some(&[2]),
 			_ => None,
 		};
 		let injected_origins = if let Some(origin_arities) = origin_arities.filter(|_| !is_method) {
@@ -1737,6 +1739,16 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0098_funnel_rewriter_retains_two_argument_origins() {
+		let source = "funnel(\"stage\", \"value\")";
+		let rewritten = rewrite_calls(source, 100).expect("rewrite funnel call");
+		assert_eq!(
+			rewritten,
+			"polariton_presentation::__funnel(\"stage\", \"value\", 107, 114, 116, 123, 100, 124)"
+		);
+	}
+
+	#[test]
 	fn product_0091_continuous_words_rewrite_and_retain_modifier_intent_origin() {
 		let source = r#"let relation = workspace.table("heat_probe");
 relation.views([figure([
@@ -1944,6 +1956,74 @@ relation.views([figure([
 	}
 
 	#[test]
+	fn product_0098_funnel_surface_positions_arity_and_origins_are_closed() {
+		let fields = "\"stage\", \"value\"";
+		for slot in [
+			format!("funnel({fields})"),
+			format!("view(\"named\", funnel({fields}))"),
+			format!("view(\"named\", figure([funnel({fields})]))"),
+			format!("figure([funnel({fields})])"),
+		] {
+			let source = format!(
+				"let relation = workspace.table(\"funnel_probe\");\nrelation.views([{slot}]);"
+			);
+			let compiled = compile(&source).unwrap_or_else(|error| panic!("{slot}: {error}"));
+			let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+				panic!("funnel surface produced a table")
+			};
+			let sink = match &plot.body {
+				RunePlotBody::Single(sink) => sink,
+				RunePlotBody::StyledSingle(styled) => &styled.sink,
+				RunePlotBody::Layered(_) => panic!("funnel surface produced layers"),
+			};
+			assert_eq!(
+				sink.composition.primary_plot_type(),
+				crate::plot::core::PlotType::Funnel
+			);
+			let (fields, origins) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(|fields| fields.funnel())
+				.expect("funnel fields and origins");
+			assert_eq!(
+				(fields.stage.as_str(), fields.value.as_str()),
+				("stage", "value")
+			);
+			assert_eq!(
+				&source[origins.stage.start as usize..origins.stage.end as usize],
+				"\"stage\""
+			);
+			assert_eq!(
+				&source[origins.value.start as usize..origins.value.end as usize],
+				"\"value\""
+			);
+		}
+
+		for source in [
+			format!(
+				"let r = workspace.table(\"funnel_probe\"); r.views([layers([funnel({fields})])]);"
+			),
+			format!("plot.funnel(workspace.table(\"funnel_probe\"), {fields});"),
+			format!("workspace.table(\"funnel_probe\").funnel({fields});"),
+		] {
+			assert!(
+				compile(&source).is_err(),
+				"accepted forbidden surface: {source}"
+			);
+		}
+
+		let error =
+			compile("let r = workspace.table(\"funnel_probe\"); r.views([funnel(\"value\")]);")
+				.expect_err("one-argument funnel must refuse");
+		assert!(
+			error
+				.to_string()
+				.contains("funnel(...) takes stage and value strings"),
+			"{error}"
+		);
+	}
+
+	#[test]
 	fn product_0092_heatmap_surface_positions_are_closed_and_originated() {
 		let fields = "\"region\", \"quarter\", \"margin\"";
 		for slot in [
@@ -2145,6 +2225,36 @@ relation.views([figure([
 		assert!(source.contains("Signed colour −30…40"));
 		assert!(source.contains("null label stays absent in hover"));
 		assert!(source.contains("Point 0, Point 1, …"));
+	}
+
+	#[test]
+	fn product_0098_test30_is_the_valid_and_refusing_funnel_exhibit() {
+		let source = include_str!("../../../uat/test30.rn");
+		let compiled = compile(source).expect("the checked-in funnel exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 3);
+		for execution in &compiled.executions {
+			for view in &execution.views {
+				let RuneViewIntent::Plot(plot) = &view.intent else {
+					panic!("funnel exhibit produced a table")
+				};
+				let RunePlotBody::Single(sink) = &plot.body else {
+					panic!("funnel exhibit did not retain one standalone mark")
+				};
+				assert_eq!(
+					sink.composition.primary_plot_type(),
+					crate::plot::core::PlotType::Funnel
+				);
+				assert!(
+					sink.mark_fields
+						.as_ref()
+						.and_then(|fields| fields.funnel())
+						.is_some()
+				);
+			}
+		}
+		assert!(source.contains("equal-valued plateau"));
+		assert!(source.contains("must refuse"));
 	}
 
 	#[test]

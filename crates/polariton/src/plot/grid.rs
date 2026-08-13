@@ -4219,6 +4219,7 @@ mod tests {
 				prepared_data: Arc::new(
 					prepare_funnel_data(data, "stage", "value").expect("valid funnel"),
 				),
+				stage_colors: None,
 			})
 		});
 		let settings = product_0097_settings();
@@ -4240,6 +4241,62 @@ mod tests {
 				Some("B top: 80\nTotal Rate: 100.0%".to_owned()),
 			]
 		);
+	}
+
+	#[test]
+	fn product_0098_authored_funnel_hover_uses_the_non_origin_facet_geometry() {
+		let complete = Arc::new(
+			df!(
+				"stage" => ["A top", "A bottom", "B top", "B bottom"],
+				"value" => [100.0_f64, 90.0, 80.0, 70.0],
+			)
+			.expect("authored funnel fixture"),
+		);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "PRODUCT-0098 authored funnel".to_owned(),
+				data: artifact(&complete),
+			},
+			authored_spec: AuthoredPlotSpec::funnel(crate::plot::spec::FunnelFields {
+				stage: "stage".to_owned(),
+				value: "value".to_owned(),
+			}),
+		})
+		.expect("authored funnel resolves");
+		let body = Arc::new(resolved.resolved_spec);
+		let mut cells = NonEmpty::new(GridCell {
+			position: GridPosition { row: 0, column: 0 },
+			body: Arc::clone(&body),
+			data: Arc::new(
+				df!("stage" => ["A top", "A bottom"], "value" => [100.0_f64, 90.0]).unwrap(),
+			),
+			x_group: 0,
+			y_group: 0,
+			label: Some("A".to_owned()),
+		});
+		cells.push(GridCell {
+			position: GridPosition { row: 0, column: 1 },
+			body,
+			data: Arc::new(
+				df!("stage" => ["B top", "B bottom"], "value" => [80.0_f64, 70.0]).unwrap(),
+			),
+			x_group: 0,
+			y_group: 0,
+			label: Some("B".to_owned()),
+		});
+		let grid = PlotGrid::new(cells, GridArrangement::new(1, 2).unwrap()).unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let settings = product_0097_settings();
+		let inner = product_0097_inner(&kernel, 1, &settings);
+		let hover = product_0097_hover(
+			&kernel,
+			Point::new(
+				inner.x() + inner.width() / 2.0,
+				inner.y() + inner.height() / 4.0,
+			),
+			&settings,
+		);
+		assert_eq!(hover, Some("B top: 80\nTotal Rate: 100.0%".to_owned()));
 	}
 
 	#[test]

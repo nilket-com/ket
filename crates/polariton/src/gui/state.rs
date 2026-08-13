@@ -1007,6 +1007,7 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 			crate::plot::spec::MarkFields::BoxPlot(fields) => AuthoredPlotSpec::box_plot(fields),
 			crate::plot::spec::MarkFields::Heatmap(fields) => AuthoredPlotSpec::heatmap(fields),
 			crate::plot::spec::MarkFields::Bubble(fields) => AuthoredPlotSpec::bubble(fields),
+			crate::plot::spec::MarkFields::Funnel(fields) => AuthoredPlotSpec::funnel(fields),
 		};
 	}
 	if sink.composition.primary_plot_type() == PlotType::Histogram {
@@ -1166,6 +1167,47 @@ fn bubble_failure_span(
 	};
 	role.and_then(|role| origins.for_role(role))
 		.unwrap_or_else(|| mark.clone())
+}
+
+#[cfg(feature = "toron")]
+fn funnel_failure_span(
+	data: &DataFrame,
+	fields: &crate::plot::spec::FunnelFields,
+	origins: &crate::rune_relation_envelope::FunnelFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let authored = AuthoredPlotSpec::funnel(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return if error.field == fields.stage {
+			origins.stage.clone()
+		} else if error.field == fields.value {
+			origins.value.clone()
+		} else {
+			mark.clone()
+		};
+	}
+	match crate::plot::kernels::funnel::prepare_funnel_data(data, &fields.stage, &fields.value) {
+		Err(
+			crate::plot::kernels::funnel::FunnelPreparationError::MissingColumn {
+				channel: crate::plot::kernels::funnel::FunnelPreparationChannel::Stage,
+				..
+			}
+			| crate::plot::kernels::funnel::FunnelPreparationError::UncastableColumn {
+				channel: crate::plot::kernels::funnel::FunnelPreparationChannel::Stage,
+				..
+			},
+		) => origins.stage.clone(),
+		Err(crate::plot::kernels::funnel::FunnelPreparationError::Stages(
+			crate::plot::kernels::funnel_stages::FunnelStagesError::NullStage { .. }
+			| crate::plot::kernels::funnel_stages::FunnelStagesError::DuplicateStage { .. },
+		)) => origins.stage.clone(),
+		Err(
+			crate::plot::kernels::funnel::FunnelPreparationError::MissingColumn { .. }
+			| crate::plot::kernels::funnel::FunnelPreparationError::UncastableColumn { .. }
+			| crate::plot::kernels::funnel::FunnelPreparationError::Stages(_),
+		) => origins.value.clone(),
+		Ok(_) => mark.clone(),
+	}
 }
 
 #[cfg(feature = "toron")]
@@ -1651,6 +1693,10 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.bubble()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let funnel_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.funnel()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let body_output_span = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
 					RunePlotBody::Single(sink)
@@ -1986,6 +2032,11 @@ fn rune_view_outcome_with_palettes(
 					bubble_failure_span(frame.as_ref(), fields, origins, mark)
 				})
 			});
+			let funnel_output_span = output.as_ref().err().and_then(|_| {
+				funnel_diagnostic.as_ref().map(|(fields, origins, mark)| {
+					funnel_failure_span(frame.as_ref(), fields, origins, mark)
+				})
+			});
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
@@ -1994,6 +2045,7 @@ fn rune_view_outcome_with_palettes(
 					.or(box_output_span)
 					.or(heatmap_output_span)
 					.or(bubble_output_span)
+					.or(funnel_output_span)
 					.or(body_output_span)
 					.or(facet_span)
 					.unwrap_or(view.span),
@@ -9987,6 +10039,102 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			.unwrap(),
 			"\"region\", \"quarter\"",
 			"duplicated at rows 1 and 2",
+		);
+		assert!(complete(valid).sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0098_funnel_resolves_identity_and_attributes_every_refusal() {
+		use polars::frame::DataFrame;
+		let source = r#"workspace.table("funnel_probe").views([funnel("stage", "value")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("funnel source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"stage" => ["Visited", "Trial", "Paid"],
+			"value" => [100.0_f64, 60.0, 30.0],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid funnel must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::Funnel { stage: Some(stage), value }
+				if stage == "stage" && value == "value"
+		));
+		let snapshot = continuation.identity.persistence_snapshot();
+		assert_eq!(snapshot.assignments.len(), 3);
+		assert!(snapshot.assignments.iter().all(|assignment| {
+			assignment.field == "stage" && assignment.layer.family.as_str() == "funnel"
+		}));
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 600, 400);
+		assert_eq!(
+			kernel
+				.legend_content(&crate::plot::common::ResolvedPlotSettings::default())
+				.unwrap()
+				.sections()
+				.count(),
+			1
+		);
+
+		let assert_span = |frame: DataFrame, expected: &str, error_fragment: &str| {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid funnel rendered")
+			};
+			assert!(error.contains(error_fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+
+		assert_span(
+			polars::df!("stage" => [None::<&str>], "value" => [1.0]).unwrap(),
+			"\"stage\"",
+			"null at row 1",
+		);
+		assert_span(
+			polars::df!("stage" => ["A", "A"], "value" => [2.0, 1.0]).unwrap(),
+			"\"stage\"",
+			"duplicated at rows 1 and 2",
+		);
+		assert_span(
+			polars::df!("stage" => ["A"], "value" => [None::<f64>]).unwrap(),
+			"\"value\"",
+			"null at row 1",
+		);
+		assert_span(
+			polars::df!("stage" => ["A"], "value" => [f64::NAN]).unwrap(),
+			"\"value\"",
+			"non-finite",
+		);
+		assert_span(
+			polars::df!("stage" => ["A"], "value" => [-1.0]).unwrap(),
+			"\"value\"",
+			"negative",
+		);
+		assert_span(
+			polars::df!("stage" => ["A"], "value" => [9_007_199_254_740_993_i64]).unwrap(),
+			"\"value\"",
+			"cannot round-trip",
+		);
+		assert_span(
+			polars::df!("stage" => ["A"], "value" => [0.0]).unwrap(),
+			"\"value\"",
+			"must be positive at row 1",
+		);
+		assert_span(
+			polars::df!("stage" => ["A", "B"], "value" => [1.0, 2.0]).unwrap(),
+			"\"value\"",
+			"rises between rows 1 and 2",
 		);
 		assert!(complete(valid).sinks[0].output.is_ok());
 	}

@@ -81,7 +81,6 @@ fn render(kernel: &dyn PlotKernel) -> Vec<BankOperation> {
 fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 	let settings = ResolvedPlotSettings::default();
 	let ink = Color::WHITE;
-	let translucent_ink = Color { a: 0.2, ..ink };
 	let midpoint = settings.color_theme.get_color(0.5);
 
 	let area = StackedAreaPlotKernel {
@@ -191,16 +190,17 @@ fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 		prepared_data: Arc::new(
 			prepare_funnel_data(&funnel_frame, "stage", "value").expect("valid funnel oracle"),
 		),
+		stage_colors: None,
 	};
 	assert_eq!(
 		render(&funnel),
 		vec![
 			BankOperation::FillPath(settings.color_theme.get_color(0.0)),
-			BankOperation::Stroke(translucent_ink, 1.0_f32.to_bits()),
 			BankOperation::Text(ink),
 			BankOperation::FillPath(settings.color_theme.get_color(1.0)),
-			BankOperation::Stroke(translucent_ink, 1.0_f32.to_bits()),
 			BankOperation::Text(ink),
+			BankOperation::Stroke(settings.mark_style.separator.iced(), 1.0_f32.to_bits()),
+			BankOperation::Stroke(settings.mark_style.fill_detail.iced(), 1.0_f32.to_bits()),
 		]
 	);
 }

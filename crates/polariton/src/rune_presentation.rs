@@ -11,15 +11,16 @@ use crate::plot::composition::PlotComposition;
 use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
-	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, HeatmapFields,
-	LayerSettings, LayeredPlotSpec, LegendPosition, Override, PointSize, Presence, StrokeWidth,
+	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FunnelFields,
+	HeatmapFields, LayerSettings, LayeredPlotSpec, LegendPosition, Override, PointSize, Presence,
+	StrokeWidth,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
 };
 use crate::rune_relation_envelope::{
-	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, HeatmapFieldOrigins,
-	RunePlotBody, RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans,
+	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, FunnelFieldOrigins,
+	HeatmapFieldOrigins, RunePlotBody, RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans,
 	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
 	RuneViewIntent, SpannedMarkFields, StyledRunePlotSink,
 };
@@ -397,6 +398,7 @@ fn build_context() -> Result<Context, String> {
 		("__box", raw_box as RawFunction),
 		("__bubble", raw_bubble as RawFunction),
 		("__heatmap", raw_heatmap as RawFunction),
+		("__funnel", raw_funnel as RawFunction),
 		("__title", raw_title as RawFunction),
 		("__subtitle", raw_subtitle as RawFunction),
 		("__x_label", raw_x_label as RawFunction),
@@ -678,6 +680,99 @@ fn raw_bubble(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 				fields: bubble_fields,
 				origins,
 			}),
+			origin: origin.range(),
+		},
+		settings: LayerSettings::default(),
+		stacked: false,
+		percent: false,
+	};
+	store(
+		out,
+		stack,
+		RuneMark {
+			sink: Ok(sink),
+			origin,
+			modified: false,
+			point_size_origin: None,
+			stroke_width_origin: None,
+			bar_width_origin: None,
+			category_gap_origin: None,
+			stacked_origin: None,
+			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
+		},
+	)
+}
+
+fn raw_funnel(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = match raw_origin(values) {
+		Ok(origin) => origin,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	if values.len() != 8 {
+		return store(
+			out,
+			stack,
+			RuneMark::failed(PresentationFailure::new(
+				origin,
+				"funnel(...) takes stage and value strings",
+			)),
+		);
+	}
+	let mut fields = Vec::with_capacity(2);
+	for value in &values[..2] {
+		match rune::from_value::<Ref<str>>(value.clone()) {
+			Ok(field) => fields.push(field.to_owned()),
+			Err(_) => {
+				return store(
+					out,
+					stack,
+					RuneMark::failed(PresentationFailure::new(
+						origin,
+						"funnel(...) field arguments must evaluate to strings",
+					)),
+				);
+			}
+		}
+	}
+	let decode_span = |index: usize| -> Result<Range<u32>, PresentationFailure> {
+		let start = rune::from_value::<i64>(values[index].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"funnel(...) has an invalid injected argument origin",
+			)
+		})?;
+		let end = rune::from_value::<i64>(values[index + 1].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				"funnel(...) has an invalid injected argument origin",
+			)
+		})?;
+		Origin::decode(start, end).map(Origin::range)
+	};
+	let origins = match (|| {
+		Ok(FunnelFieldOrigins {
+			stage: decode_span(2)?,
+			value: decode_span(4)?,
+		})
+	})() {
+		Ok(origins) => origins,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	let fields = FunnelFields {
+		stage: fields[0].clone(),
+		value: fields[1].clone(),
+	};
+	let sink = StyledRunePlotSink {
+		sink: DisposableRunePlotSink {
+			composition: PlotComposition::single(PlotType::Funnel),
+			x: fields.stage.clone(),
+			y: fields.value.clone(),
+			category: None,
+			interval_end: None,
+			mark_fields: Some(SpannedMarkFields::Funnel { fields, origins }),
 			origin: origin.range(),
 		},
 		settings: LayerSettings::default(),

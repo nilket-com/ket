@@ -75,3 +75,17 @@ cargo run -p polariton -- uat/test29.rn
 sequential, GreenPurples is anchored at zero, and BlueWhiteRed is anchored at an
 authored value of 15. The heatmap's sparse cell and bubble's paired gradient and
 size guide remain visible regression subjects.
+
+Seed the PRODUCT-0098 funnel relations, then open its authored and refusing
+figures:
+
+```sh
+nilket toron sql --file uat/funnel_probe.sql
+cargo run -p polariton -- uat/test30.rn
+```
+
+`funnel_probe` is already ordered and contains an equal-valued Paid/Renewed
+plateau, so reorder-stable categorical assignments can be distinguished without
+violating the non-increasing substrate. `funnel_probe_rising` deliberately rises
+from 60 to 75 and must refuse at the value argument. The faceted view keeps the
+authored funnel on PRODUCT-0097's non-origin hover seam.

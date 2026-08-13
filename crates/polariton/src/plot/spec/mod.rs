@@ -376,6 +376,18 @@ pub struct HeatmapFields {
 	pub value: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FunnelFields {
+	pub stage: String,
+	pub value: String,
+}
+
+impl FunnelFields {
+	pub fn all(&self) -> [&str; 2] {
+		[&self.stage, &self.value]
+	}
+}
+
 impl HeatmapFields {
 	pub fn all(&self) -> [&str; 3] {
 		[&self.x, &self.y, &self.value]
@@ -387,6 +399,7 @@ pub enum MarkFields {
 	BoxPlot(BoxPlotFields),
 	Heatmap(HeatmapFields),
 	Bubble(BubbleFields),
+	Funnel(FunnelFields),
 }
 
 impl MarkFields {
@@ -416,6 +429,15 @@ impl MarkFields {
 				Some(fields.numeric.get(BubbleNumericField::Size)),
 				Some(fields.numeric.get(BubbleNumericField::Color)),
 				fields.label.as_deref(),
+				None,
+				None,
+			],
+			Self::Funnel(fields) => [
+				Some(&fields.stage),
+				Some(&fields.value),
+				None,
+				None,
+				None,
 				None,
 				None,
 			],
@@ -565,6 +587,23 @@ impl AuthoredPlotSpec {
 	pub fn bubble_fields(&self) -> Option<&BubbleFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::Bubble(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn funnel(fields: FunnelFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::Funnel),
+			fields.stage.clone(),
+			fields.value.clone(),
+		);
+		spec.mark_fields = Some(MarkFields::Funnel(fields));
+		spec
+	}
+
+	pub fn funnel_fields(&self) -> Option<&FunnelFields> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::Funnel(fields)) => Some(fields),
 			_ => None,
 		}
 	}
@@ -838,10 +877,17 @@ impl AuthoredFamilyId {
 	pub(crate) const BAR: Self = Self(Cow::Borrowed("bar"));
 	pub(crate) const LINE: Self = Self(Cow::Borrowed("line"));
 	pub(crate) const AREA: Self = Self(Cow::Borrowed("area"));
+	pub(crate) const FUNNEL: Self = Self(Cow::Borrowed("funnel"));
 
 	/// Exhaustive catalog of identifiers this binary can originate from authored
 	/// source. It is intentionally narrower than the checked persistence grammar.
-	pub(crate) const ALL: [Self; 4] = [Self::SCATTER, Self::BAR, Self::LINE, Self::AREA];
+	pub(crate) const ALL: [Self; 5] = [
+		Self::SCATTER,
+		Self::BAR,
+		Self::LINE,
+		Self::AREA,
+		Self::FUNNEL,
+	];
 
 	pub(crate) fn parse(value: String) -> Result<Self, String> {
 		let bytes = value.as_bytes();
@@ -876,6 +922,7 @@ impl ColorLayerIdentity {
 			PlotType::Bar | PlotType::HorizontalBar => AuthoredFamilyId::BAR,
 			PlotType::Line => AuthoredFamilyId::LINE,
 			PlotType::StackedArea => AuthoredFamilyId::AREA,
+			PlotType::Funnel => AuthoredFamilyId::FUNNEL,
 			PlotType::StackedBar | PlotType::HorizontalStackedBar => unreachable!(
 				"PRODUCT-0064 requires stacked bar colour lineage to retain authored Bar identity"
 			),
@@ -1656,6 +1703,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::Bubble && spec.bubble_fields().is_some() {
 		return resolve_bubble_channels(spec, schema);
 	}
+	if plot_type == PlotType::Funnel && spec.funnel_fields().is_some() {
+		return resolve_funnel_channels(spec, schema);
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -2142,6 +2192,60 @@ fn resolve_bubble_channels(
 	})
 }
 
+fn resolve_funnel_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.funnel_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("funnel"),
+		field: "<funnel>".to_owned(),
+		reason: "Funnel requires explicit stage and value fields".to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::Funnel,
+	};
+	let mut used = HashSet::new();
+	let stage = resolve_required(
+		Channel::X,
+		&spec.x,
+		PlotType::Funnel,
+		&layer,
+		false,
+		schema,
+		&mut used,
+	)
+	.map_err(|mut error| {
+		error.attribution = FieldAttribution::Role("stage");
+		error
+	})?;
+	let value = resolve_required(
+		Channel::Y,
+		&spec.y,
+		PlotType::Funnel,
+		&layer,
+		false,
+		schema,
+		&mut used,
+	)
+	.map_err(|mut error| {
+		error.attribution = FieldAttribution::Role("value");
+		error
+	})?;
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![stage, value],
+		kernel_fields: Box::new(ResolvedKernelFields::Funnel {
+			stage: Some(fields.stage.clone()),
+			value: fields.value.clone(),
+		}),
+		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
+		categorical_limit: DEFAULT_CATEGORICAL_LIMIT,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
 fn resolve_bar_orientation(x: &BoundChannel, y: &BoundChannel) -> Result<PlotType, ChannelError> {
 	match (
 		x.semantic_type == SemanticType::Quantitative,
@@ -2332,24 +2436,28 @@ pub fn resolve_domains(
 			reason: error.to_string(),
 		})?;
 		let domain = resolve_domain(column, &channel)?;
-		let colors =
-			if channel.channel == Channel::Color && color_job == Some(ColorJob::Categorical) {
-				let ScaleDomain::Categorical(categories) = &domain else {
-					return Err(DomainError {
-						channel: channel.channel,
-						field: channel.field.clone(),
-						reason: "categorical color requires a categorical domain".to_owned(),
-					});
-				};
-				resolve_category_colors(
-					categories,
-					&channel,
-					binding.categorical_limit,
-					&mut next_identity,
-				)?
-			} else {
-				Vec::new()
+		let funnel_stages = binding.composition.primary_plot_type() == PlotType::Funnel
+			&& channel.channel == Channel::X;
+		let colors = if (channel.channel == Channel::Color
+			&& color_job == Some(ColorJob::Categorical))
+			|| funnel_stages
+		{
+			let ScaleDomain::Categorical(categories) = &domain else {
+				return Err(DomainError {
+					channel: channel.channel,
+					field: channel.field.clone(),
+					reason: "categorical color requires a categorical domain".to_owned(),
+				});
 			};
+			resolve_category_colors(
+				categories,
+				&channel,
+				binding.categorical_limit,
+				&mut next_identity,
+			)?
+		} else {
+			Vec::new()
+		};
 		channels.push(ResolvedChannel {
 			binding: channel,
 			domain,
@@ -2412,25 +2520,29 @@ pub fn resolve_domains_with_categorical_palette(
 		})?;
 		let domain =
 			resolve_domain(column, &channel).map_err(CategoricalResolutionError::Domain)?;
-		let colors =
-			if channel.channel == Channel::Color && color_job == Some(ColorJob::Categorical) {
-				let ScaleDomain::Categorical(categories) = &domain else {
-					return Err(CategoricalResolutionError::Domain(DomainError {
-						channel: channel.channel,
-						field: channel.field.clone(),
-						reason: "categorical color requires a categorical domain".to_owned(),
-					}));
-				};
-				resolve_explicit_category_colors(
-					categories,
-					&channel,
-					binding.categorical_limit,
-					selection,
-					&mut next_identity,
-				)?
-			} else {
-				Vec::new()
+		let funnel_stages = binding.composition.primary_plot_type() == PlotType::Funnel
+			&& channel.channel == Channel::X;
+		let colors = if (channel.channel == Channel::Color
+			&& color_job == Some(ColorJob::Categorical))
+			|| funnel_stages
+		{
+			let ScaleDomain::Categorical(categories) = &domain else {
+				return Err(CategoricalResolutionError::Domain(DomainError {
+					channel: channel.channel,
+					field: channel.field.clone(),
+					reason: "categorical color requires a categorical domain".to_owned(),
+				}));
 			};
+			resolve_explicit_category_colors(
+				categories,
+				&channel,
+				binding.categorical_limit,
+				selection,
+				&mut next_identity,
+			)?
+		} else {
+			Vec::new()
+		};
 		channels.push(ResolvedChannel {
 			binding: channel,
 			domain,
@@ -2850,6 +2962,8 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		(PlotType::BoxPlot, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Heatmap, Channel::X | Channel::Y) => semantic == SemanticType::Nominal,
 		(PlotType::Bubble, Channel::X | Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::Funnel, Channel::X) => semantic == SemanticType::Nominal,
+		(PlotType::Funnel, Channel::Y) => semantic == SemanticType::Quantitative,
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -3573,6 +3687,112 @@ mod tests {
 		.unwrap()
 	}
 
+	fn funnel_spec() -> AuthoredPlotSpec {
+		AuthoredPlotSpec::funnel(FunnelFields {
+			stage: "stage".to_owned(),
+			value: "value".to_owned(),
+		})
+	}
+
+	#[test]
+	fn product_0098_funnel_binds_roles_and_allocates_one_complete_stage_assignment() {
+		let frame = stamped(
+			df!(
+				"stage" => ["Visit", "Trial", "Paid"],
+				"value" => [100.0_f64, 60.0, 20.0],
+			)
+			.unwrap(),
+		);
+		let projected = frame.data.projection().unwrap();
+		let binding = resolve_channels(&funnel_spec(), projected.schema().as_ref()).unwrap();
+		assert_eq!(binding.channels.len(), 2);
+		assert_eq!(binding.channels[0].semantic_type, SemanticType::Nominal);
+		assert_eq!(
+			binding.channels[1].semantic_type,
+			SemanticType::Quantitative
+		);
+		assert_eq!(binding.channels[0].scale, ScaleFamily::Point);
+		assert_eq!(binding.channels[1].scale, ScaleFamily::Linear);
+		assert_eq!(binding.channels[0].layer.plot_type, PlotType::Funnel);
+
+		let (resolved, identity) =
+			resolve(&funnel_spec(), &frame, &ColorIdentity::default()).unwrap();
+		let colors = &resolved.channel(Channel::X).unwrap().colors;
+		assert_eq!(colors.len(), 3);
+		assert_eq!(
+			colors
+				.iter()
+				.map(|entry| entry.category.as_str())
+				.collect::<Vec<_>>(),
+			["Visit", "Trial", "Paid"]
+		);
+		assert!(resolved.channel(Channel::Y).unwrap().colors.is_empty());
+		assert!(
+			identity.assignments.keys().all(|key| {
+				key.layer.family == AuthoredFamilyId::FUNNEL && key.field == "stage"
+			})
+		);
+	}
+
+	#[test]
+	fn product_0098_funnel_binding_refuses_roles_before_preparation_with_role_attribution() {
+		for (frame, role, field) in [
+			(
+				df!("stage" => [1_i64], "value" => [1.0_f64]).unwrap(),
+				"stage",
+				"stage",
+			),
+			(
+				df!("stage" => ["A"], "value" => ["one"]).unwrap(),
+				"value",
+				"value",
+			),
+		] {
+			let error = resolve_channels(&funnel_spec(), frame.schema().as_ref()).unwrap_err();
+			assert_eq!(error.attribution, FieldAttribution::Role(role));
+			assert_eq!(error.field, field);
+		}
+
+		let valid = df!("stage" => [true, false], "value" => [2_i64, 1]).unwrap();
+		let binding = resolve_channels(&funnel_spec(), valid.schema().as_ref()).unwrap();
+		assert!(matches!(
+			binding.kernel_fields.as_ref(),
+			ResolvedKernelFields::Funnel { stage: Some(stage), value }
+				if stage == "stage" && value == "value"
+		));
+	}
+
+	#[test]
+	fn product_0098_plateau_reorder_preserves_label_assignments() {
+		let first = stamped(
+			df!(
+				"stage" => ["Top", "Middle", "Bottom"],
+				"value" => [100.0_f64, 50.0, 50.0],
+			)
+			.unwrap(),
+		);
+		let (first_resolved, identity) =
+			resolve(&funnel_spec(), &first, &ColorIdentity::default()).unwrap();
+		let second = stamped(
+			df!(
+				"stage" => ["Top", "Bottom", "Middle"],
+				"value" => [100.0_f64, 50.0, 50.0],
+			)
+			.unwrap(),
+		);
+		let (second_resolved, _) = resolve(&funnel_spec(), &second, &identity).unwrap();
+		let mapping = |resolved: &ResolvedPlotSpec| {
+			resolved
+				.channel(Channel::X)
+				.unwrap()
+				.colors
+				.iter()
+				.map(|entry| (entry.category.clone(), entry.position.index()))
+				.collect::<HashMap<_, _>>()
+		};
+		assert_eq!(mapping(&first_resolved), mapping(&second_resolved));
+	}
+
 	#[test]
 	fn product_0095_bubble_binds_four_or_five_roles_without_categorical_identity() {
 		let frame = bubble_frame(Column::new("label".into(), ["first", "second"]));
@@ -3923,7 +4143,7 @@ mod tests {
 			.iter()
 			.map(AuthoredFamilyId::as_str)
 			.collect::<Vec<_>>();
-		assert_eq!(tokens, ["scatter", "bar", "line", "area"]);
+		assert_eq!(tokens, ["scatter", "bar", "line", "area", "funnel"]);
 		assert_eq!(
 			tokens.iter().copied().collect::<HashSet<_>>().len(),
 			tokens.len()
@@ -3934,6 +4154,7 @@ mod tests {
 			(PlotType::HorizontalBar, "bar"),
 			(PlotType::Line, "line"),
 			(PlotType::StackedArea, "area"),
+			(PlotType::Funnel, "funnel"),
 		] {
 			let actual = ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 				ordinal: 7,

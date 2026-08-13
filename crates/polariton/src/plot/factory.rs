@@ -190,8 +190,12 @@ pub fn create_plot(
 		ResolvedKernelFields::Funnel { stage, value } => {
 			let prepared = funnel::prepare_funnel_data(df, stage.as_deref().unwrap_or(""), value)
 				.expect("PRODUCT-0096 planning validated this funnel stage collection");
+			let stage_colors = spec
+				.channel(Channel::X)
+				.map(|channel| channel.colors.clone());
 			Arc::new(FunnelPlotKernel {
 				prepared_data: Arc::new(prepared),
+				stage_colors,
 			})
 		}
 		ResolvedKernelFields::StackedArea { series, x, y } => {
