@@ -108,14 +108,14 @@ ADR 0089, and CI-02 moved out to a fifth:
   Migrates all three producers. — **ADR 0089, landed**
 
 **CI-02 follows the heatmap and bubble surfaces**, not B4 directly — see steps
-6–9. 0089 is explicitly substrate-only, adding no Rune spelling, so CI-02 stays
+6–10. 0089 is explicitly substrate-only, adding no Rune spelling, so CI-02 stays
 open past the whole B track; and the authoring words need a mark that can be
 authored before they mean anything.
 
 **CI-02 also shrinks.** It is labelled "sequential / diverging / **status**
 palette authoring," but status has no consumer — no kernel requests
 `ColorJob::Status`, and `spec/mod.rs:2591` already routes it to
-`ScaleFamily::CategoricalColor`. Step 9 closes CI-02 for continuous colour and
+`ScaleFamily::CategoricalColor`. Step 10 closes CI-02 for continuous colour and
 leaves a status residue whose trigger is the first real status consumer. A status
 word today would be unobservable and its gates vacuous.
 
@@ -166,9 +166,16 @@ band-fill path.
 6. **Heatmap surface, sequential-only — ADR 0092, drafted.** The first Rune
    constructor for a quantitative mark. Ships with no job word: colour is
    `{ Sequential, None }`, exactly as 0089 leaves it. Implemented with **bespoke**
-   `HeatmapFields` / `HeatmapFieldOrigins`, all gates green, before step 7
+   `HeatmapFields` / `HeatmapFieldOrigins`, all gates green, before step 8
    generalizes them.
-7. **Mark-field transport.** A refactor of the working box-plot and heatmap
+7. **Legend geometry from content — ADR 0093, drafted.** The gradient guide
+   reserves a hard-coded 60 px (`legend.rs:323`), so `-30.0` clips. Not a catalog
+   step but a blocker for one: 0092's signed domain exposed it, and step 9's
+   bubble legend uses the *other* geometry path, which carries the same defect.
+   Replaces both hard-coded authorities with one conservative content-aware
+   estimate. Repairs a violation of PRODUCT-0087's own rule — a section carries
+   every value it prints, and a clipped endpoint does not.
+8. **Mark-field transport.** A refactor of the working box-plot and heatmap
    carriers into dedicated variants — **not** a generic field map:
 
    ```text
@@ -185,14 +192,14 @@ band-fill path.
    a missing block that would have panicked the factory on the first successful
    authored heatmap. An exhaustive match makes that omission unrepresentable.
 
-   Bubble's variant may be **test-only** until step 8. That is substrate staging,
+   Bubble's variant may be **test-only** until step 9. That is substrate staging,
    not an inert public spelling — no Rune word is added, so nothing unobservable
    is authored.
-8. **Bubble surface, sequential-only.** The first new consumer of step 7's
+9. **Bubble surface, sequential-only.** The first new consumer of step 8's
    transport. Five roles against heatmap's three, with an **optional label** whose
    absent-versus-selected-null semantics 0090 §9 already decided — and whose
    variable arity is why `all()` returns a slice rather than a fixed array.
-9. **Continuous colour authoring.** Slot words `sequential_palette` /
+10. **Continuous colour authoring.** Slot words `sequential_palette` /
    `diverging_palette`, the stable 37-token ramp-name grammar they create, the
    mark-level diverging job word, and the anchor-provenance carrier from
    `AuthoredPlotSpec` through planning. Closes **CI-02** for continuous colour;
@@ -204,15 +211,15 @@ band-fill path.
    added before those surfaces exist would be observationally inert — the same
    defect that disqualifies a status word. An earlier draft of this plan placed
    authoring at step 6 and the surfaces at step 11.
-10. **Funnel** — the smallest categorical consumer, *but only after its row-order
+11. **Funnel** — the smallest categorical consumer, *but only after its row-order
    and stage-monotonicity contract is explicit*.
-11. **Radial dial** — needs prerequisite E; its silent first-row selection is the
+12. **Radial dial** — needs prerequisite E; its silent first-row selection is the
     PRODUCT-0078 defect class again.
-12. **Pie** — after removing its aggregation authority, which Toron can now supply
+13. **Pie** — after removing its aggregation authority, which Toron can now supply
     as pre-aggregated category/value rows.
-13. **Radar + parallel together** over one dimension-list substrate. They are the
+14. **Radar + parallel together** over one dimension-list substrate. They are the
     only two needing D, and solving it twice would produce two vocabularies.
-14. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+15. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
 

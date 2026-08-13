@@ -11,7 +11,7 @@ It closes ledger item **CI-02** for continuous colour and **splits status out**
 as a residue, for the reason in §10.
 
 **It depends on the heatmap and bubble surfaces** (`plot-catalog-restoration.md`
-steps 6–8), which must land sequential-only first. Without them every word here
+steps 6–9), which must land sequential-only first. Without them every word here
 would be observationally inert — the exact defect §10 uses to refuse a status
 word. An earlier draft of this record proposed the words with no consumer, one
 section away from making that argument.
@@ -191,7 +191,7 @@ palette rule (`rune_presentation.rs:2093`).
 
 ### 8. Only heatmap and bubble receive the job word, for two reasons
 
-Hexbin gets no job word because it **has no Rune surface** (steps 6–8 cover
+Hexbin gets no job word because it **has no Rune surface** (steps 6–9 cover
 heatmap and bubble only) and because it **can never diverge** — domain
 `0..max_count`, counts non-negative by construction, settled by PRODUCT-0089 §9.
 
@@ -239,7 +239,7 @@ here. **CI-03** stays open.
 ## Implementation sequence
 
 **Prerequisite — the heatmap and bubble surfaces**, sequential-only
-(`plot-catalog-restoration.md` steps 6–8). 0091 does not begin until both land.
+(`plot-catalog-restoration.md` steps 6–9). 0091 does not begin until both land.
 
 **Stage 0 — bank.** Every heatmap, bubble, and hexbin figure once the surfaces
 exist. All are sequential; all must stay byte-identical when the new words are
