@@ -277,9 +277,18 @@ band-fill path.
     defect: sibling raw and derived executions retained each other's definitions
     and replayed a linear relation initializer, so both panels failed until each
     execution retained only its own dependency branch.
-19. **Radar + parallel together** over one dimension-list substrate. They are the
-    only two needing D, and solving it twice would produce two vocabularies.
-20. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+19. **Multivariate row substrate — ADR 0104, drafted.** Radar and parallel declare
+    the **same six prepared fields with the same names and types**, prepared by
+    near-copy functions — one substrate wearing two names. Shares the data
+    (ordered dimensions, validated rows, optional category, derived ranges),
+    keeps geometry per mark. Removes `row_categories`/`num_categories` and with
+    them an index fallback that silently draws a row as category zero.
+
+    **Does not consume prerequisite D** — the first step in the arc where the
+    substrate does not. Variadic dimension authoring is the surfaces'.
+20. **Radar and parallel surfaces.** Consume **D**. Whether they share one record
+    waits until their grammar and transport are surveyed.
+21. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
 
