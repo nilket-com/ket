@@ -25,6 +25,7 @@ pub mod layered;
 pub mod line;
 pub mod parallel;
 pub mod pie;
+pub mod pie_slices;
 pub mod radar;
 pub mod radial_dial;
 pub mod radial_dial_readings;

@@ -264,11 +264,11 @@ band-fill path.
     been given. Pins the contract at the seam, adds a path-**topology** gate
     (every existing assertion checks arc operands, none checks how arcs join),
     and adds a production-canvas oracle.
-17. **Pie substrate — ADR 0102, drafted.** Consumes prerequisite **C**, which
+17. **Pie substrate — LANDED as PRODUCT-0102.** Consumes prerequisite **C**, which
     Stage 0 found needs only an exhibit and a diagnostic: Toron already has
     `.aggregate([col(...)], [sum(col(...))])`. Removes the mark's `.sum()` —
-    a *correct* answer to one of five defensible questions — plus nine
-    fabrications, four disagreeing truths, five measured hover red states, and a
+    a *correct* answer to one of five defensible questions — plus eleven silent
+    dispositions, four disagreeing truths, four measured hover red states, and a
     doubled paint origin.
 18. **Pie surface.** PRODUCT-0086's third categorical consumer.
 19. **Radar + parallel together** over one dimension-list substrate. They are the

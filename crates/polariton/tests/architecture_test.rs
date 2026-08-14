@@ -3402,6 +3402,7 @@ fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
 		std::fs::read_to_string(root.join("plot/kernels/funnel.rs")).expect("read funnel kernel");
 	let radial = std::fs::read_to_string(root.join("plot/kernels/radial_dial.rs"))
 		.expect("read radial dial kernel");
+	let pie = std::fs::read_to_string(root.join("plot/kernels/pie.rs")).expect("read pie kernel");
 
 	assert!(common.contains(
 		"fn widget_hit_geometry(&self, cursor: Pt<Widget>) -> (Rect<Widget>, Pt<Widget>)"
@@ -3409,13 +3410,15 @@ fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
 	assert_eq!(coordinate.matches("from_plot_kernel_cursor").count(), 1);
 	assert_eq!(funnel.matches("from_plot_kernel_cursor").count(), 1);
 	assert_eq!(radial.matches("from_plot_kernel_cursor").count(), 1);
+	assert_eq!(pie.matches("from_plot_kernel_cursor").count(), 1);
 	assert_eq!(coordinate.matches("from_transformer_bounds").count(), 1);
 	assert_eq!(common.matches("from_transformer_bounds").count(), 1);
 	assert_eq!(funnel.matches("widget_hit_geometry").count(), 1);
 	assert_eq!(radial.matches("widget_hit_geometry").count(), 1);
-	assert_eq!(production.matches("from_plot_kernel_cursor").count(), 3);
+	assert_eq!(pie.matches("widget_hit_geometry").count(), 1);
+	assert_eq!(production.matches("from_plot_kernel_cursor").count(), 4);
 	assert_eq!(production.matches("from_transformer_bounds").count(), 2);
-	assert_eq!(production.matches("widget_hit_geometry").count(), 3);
+	assert_eq!(production.matches("widget_hit_geometry").count(), 4);
 	assert!(!coordinate.contains("fn from_iced("));
 
 	assert!(!grid.contains("Pt::<Cell>::from_widget"));
@@ -3424,7 +3427,8 @@ fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
 	assert!(grid.contains("Cursor::Available(cursor.into_iced())"));
 	assert!(!funnel.contains("transform.bounds"));
 	assert!(!radial.contains("transform.bounds"));
-	for source in [&funnel, &radial] {
+	assert!(!pie.contains("transform.bounds"));
+	for source in [&funnel, &radial, &pie] {
 		assert!(!source.contains("cursor_pos.offset("));
 		assert!(!source.contains("bounds.offset("));
 	}
@@ -3633,8 +3637,8 @@ fn product_0101_path_builder_has_one_connected_arc_contract_and_two_live_callers
 		vec![("pie.rs".to_owned(), 1), ("radial_dial.rs".to_owned(), 4)],
 		"PRODUCT-0101 production arc caller census"
 	);
-	assert!(pie.contains("builder.move_to(center);\n\t\t\t\tbuilder.arc_to("));
-	assert_eq!(pie.matches("builder.line_to(center);").count(), 1);
+	assert!(pie.contains("builder.move_to(geometry.center);\n\t\t\t\tbuilder.arc_to("));
+	assert_eq!(pie.matches("builder.line_to(geometry.center);").count(), 1);
 	assert_eq!(radial.matches("builder.arc_to(").count(), 4);
 	assert!(!radial.contains("builder.line_to("));
 
@@ -3648,4 +3652,68 @@ fn product_0101_path_builder_has_one_connected_arc_contract_and_two_live_callers
 	] {
 		assert!(evidence.contains(pin), "missing render-evidence pin: {pin}");
 	}
+}
+
+#[test]
+fn product_0102_pie_has_one_validated_slice_and_geometry_authority() {
+	let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = manifest.join("src");
+	let pie = std::fs::read_to_string(root.join("plot/kernels/pie.rs")).expect("read pie kernel");
+	let slices = std::fs::read_to_string(root.join("plot/kernels/pie_slices.rs"))
+		.expect("read pie slice authority");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read plot request");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read plot factory");
+	let exact = std::fs::read_to_string(root.join("plot/exact_numeric.rs"))
+		.expect("read exact numeric authority");
+
+	let production = pie
+		.split("#[cfg(test)]")
+		.next()
+		.expect("bounded production pie kernel");
+	let preparation = production
+		.split("pub(crate) fn prepare_pie_data(")
+		.nth(1)
+		.expect("pie preparation")
+		.split("fn pie_category_dtype(")
+		.next()
+		.expect("bounded pie preparation");
+
+	assert!(production.contains("pub slices: PieSlices"));
+	assert!(!production.contains("pub categories: Vec"));
+	assert!(!production.contains("pub values: Vec"));
+	assert!(!production.contains("cumulative_angles"));
+	assert!(!production.contains("total_sum"));
+	assert_eq!(production.matches("PieGeometry::new(").count(), 2);
+	assert!(production.contains("let local = Point::new(cursor.x() - bounds.x()"));
+	assert!(!production.contains("bounds.center()"));
+	assert!(!production.contains("to_radians"));
+	assert!(production.contains("use crate::plot::exact_numeric::{ExactF64Error, exact_f64};"));
+	assert!(exact.contains("pub(crate) fn exact_f64("));
+
+	for forbidden in [
+		"No Data",
+		"Row {}",
+		"unwrap_or(",
+		"unwrap_or_else(",
+		".sum()",
+		".unique()",
+		".sort(",
+		".lazy()",
+		".filter(",
+		".select(",
+	] {
+		assert!(
+			!preparation.contains(forbidden),
+			"PRODUCT-0102 preparation retained `{forbidden}`"
+		);
+	}
+	assert!(!preparation.contains("for category"));
+
+	assert!(slices.contains("pub struct PieSlices"));
+	assert!(slices.contains("fn from_rows("));
+	assert!(slices.contains("boundaries.push(std::f64::consts::TAU)"));
+	assert!(slices.contains(".aggregate([col(\\\"") && slices.contains("sum(col(\\\""));
+	assert!(request.contains("prepare_pie_data(data, category.as_deref(), value)"));
+	assert!(factory.contains("PRODUCT-0102 planning validated this pie slice collection"));
+	assert_eq!(factory.matches("prepare_pie_data(").count(), 1);
 }

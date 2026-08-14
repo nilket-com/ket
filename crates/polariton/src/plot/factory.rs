@@ -109,7 +109,8 @@ pub fn create_plot(
 			)
 		}
 		ResolvedKernelFields::Pie { category, value } => {
-			let prepared = pie::prepare_pie_data(df, category.as_deref().unwrap_or(""), value);
+			let prepared = pie::prepare_pie_data(df, category.as_deref(), value)
+				.expect("PRODUCT-0102 planning validated this pie slice collection");
 			Arc::new(PiePlotKernel {
 				prepared_data: Arc::new(prepared),
 			})

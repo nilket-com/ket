@@ -231,6 +231,12 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		)
 		.map_err(|error| error.to_string())?;
 	}
+	if let crate::plot::spec::ResolvedKernelFields::Pie { category, value } =
+		spec.kernel_fields.as_ref()
+	{
+		crate::plot::kernels::pie::prepare_pie_data(data, category.as_deref(), value)
+			.map_err(|error| error.to_string())?;
+	}
 	Ok(())
 }
 
@@ -455,6 +461,43 @@ mod tests {
 		})
 		.unwrap_err();
 		assert!(error.contains("ungrouped radial dial has more than one reading at row 2"));
+	}
+
+	#[test]
+	fn product_0102_planning_surfaces_pie_refusals_before_factory_reconstruction() {
+		let duplicate = polars::df!(
+			"category" => ["A", "A", "B"],
+			"value" => [2.0_f64, 3.0, 5.0],
+		)
+		.expect("duplicate pie relation");
+		let error = plan(PlotRequest {
+			source: materialized("duplicate pie", duplicate),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Pie)),
+		})
+		.unwrap_err();
+		assert!(error.contains("duplicate pie: pie category `A`"), "{error}");
+		assert!(error.contains("duplicated at rows 1 and 2"), "{error}");
+		assert!(
+			error.contains(".aggregate([col(\"category\")], [sum(col(\"value\"))])"),
+			"{error}"
+		);
+
+		let valid = polars::df!(
+			"category" => ["A", "B"],
+			"value" => [5.0_f64, 5.0],
+		)
+		.expect("pre-aggregated pie relation");
+		let resolved = plan(PlotRequest {
+			source: materialized("pre-aggregated pie", valid),
+			authored_spec: AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Pie)),
+		})
+		.expect("planning validates the pie snapshot");
+		let _kernel = crate::plot::factory::create_plot(
+			&resolved.resolved_spec,
+			resolved.data.as_ref(),
+			400,
+			300,
+		);
 	}
 
 	#[test]

@@ -1,0 +1,11 @@
+error[E0451]: fields `slices`, `total` and `boundaries` of struct `PieSlices` are private
+  --> tests/ui/pie_slices_private.rs:9:3
+   |
+ 8 |     let _ = PieSlices {
+   |             --------- in this type
+ 9 |         slices: Vec::new(),
+   |         ^^^^^^ private field
+10 |         total: None,
+   |         ^^^^^ private field
+11 |         boundaries: Vec::new(),
+   |         ^^^^^^^^^^ private field

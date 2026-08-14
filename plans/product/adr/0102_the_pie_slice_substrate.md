@@ -210,7 +210,7 @@ construction twin. It owns the slices, the total, **and** the boundary angles
 **together** — the four truths become one, and the derived quantities cannot
 disagree with the values they derive from.
 
-Two layers for PRODUCT-0090 §5's reason, with precedence pinned in three phases:
+Two layers for PRODUCT-0090 §5's reason, with precedence pinned in four ordered phases:
 
 | phase | order | error |
 |---|---:|---|
@@ -408,7 +408,7 @@ every fallback, and the four vectors are deleted — not guarded.
 > an independent defect, and patching it here would hide that. The exact centre is
 > not among them — returning `None` there is correct, not a defect.
 
-> If pie's painted geometry changes for **gate 23's parity subject** — unique,
+> If pie's painted geometry changes for **gate 24's parity subject** — unique,
 > positive, already lexically ordered, rendered at the origin — stop.
 > §9 fixes an origin that is only doubled when non-zero, so a figure at the origin
 > must be byte-identical to the PRODUCT-0101 baseline.

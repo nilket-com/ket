@@ -1174,6 +1174,32 @@ async fn rune_project_named_sql_multi_hop_continuation_binds_and_executes() {
 }
 
 #[tokio::test]
+async fn product_0102_rune_aggregate_produces_the_preaggregated_pie_shape() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("pie_input")
+               .aggregate([col("category")], [sum(col("value"))])
+               .project_named([
+                   col("category").named("category"),
+                   col("sum").named("value"),
+               ])
+               .sort([col("category").asc()])
+        }
+    "#,
+	)
+	.await
+	.expect("PRODUCT-0102 aggregate expression is registered in production Rune");
+
+	let batches = run_pie_logical(&logical).await;
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![Some("A".to_owned()), Some("B".to_owned())]
+	);
+	assert_eq!(int64_column_rows(&batches, 1), vec![Some(5), Some(5)]);
+}
+
+#[tokio::test]
 async fn rune_project_named_sets_project_output_names() {
 	let logical = rune_plan(
 		r#"
@@ -3231,6 +3257,25 @@ fn catalog() -> MockCatalog {
 	catalog
 }
 
+async fn run_pie_logical(logical: &LogicalPlan) -> Vec<RecordBatch> {
+	let mut pie_catalog = catalog();
+	pie_catalog
+		.register_descriptor(
+			TableId(3),
+			descriptor(3, "pie_input", pie_input_schema().as_ref(), "id"),
+		)
+		.expect("register pie input");
+	let bound = bind(logical, &pie_catalog, &PlannerConfig::default())
+		.await
+		.expect("bind PRODUCT-0102 aggregate plan");
+	Executor::new(Arc::new(FixtureScan {
+		batches: HashMap::from([(TableId(3), pie_input_batch(pie_input_schema()))]),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute PRODUCT-0102 aggregate plan")
+}
+
 fn catalog_with_sales_id_logical() -> MockCatalog {
 	let mut catalog = MockCatalog::new();
 	catalog
@@ -3385,6 +3430,14 @@ fn sales_schema() -> SchemaRef {
 	]))
 }
 
+fn pie_input_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("category", DataType::Utf8, false),
+		Field::new("value", DataType::Int64, false),
+	]))
+}
+
 fn sales_schema_with_logical_id() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		field_with_logical_type_metadata("id", DataType::Int64, false, CUSTOMER_ID_LOGICAL_TYPE),
@@ -3484,6 +3537,18 @@ fn sales_batch(schema: SchemaRef) -> RecordBatch {
 		],
 	)
 	.expect("sales batch")
+}
+
+fn pie_input_batch(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(vec![1, 2, 3])),
+			Arc::new(StringArray::from(vec!["A", "A", "B"])),
+			Arc::new(Int64Array::from(vec![2, 3, 5])),
+		],
+	)
+	.expect("pie input batch")
 }
 
 fn regions_schema() -> SchemaRef {
