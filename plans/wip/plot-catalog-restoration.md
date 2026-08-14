@@ -270,7 +270,7 @@ band-fill path.
     a *correct* answer to one of five defensible questions — plus eleven silent
     dispositions, four disagreeing truths, four measured hover red states, and a
     doubled paint origin.
-18. **Pie surface.** PRODUCT-0086's third categorical consumer.
+18. **Pie surface — ADR 0103, drafted.** PRODUCT-0086's third categorical consumer: persistence is one token and one arm as claimed, but colour costs **two** `authored_categories` enumerations. Grouped-only authoring; owes 0102's `.aggregate(...)` exhibit.
 19. **Radar + parallel together** over one dimension-list substrate. They are the
     only two needing D, and solving it twice would produce two vocabularies.
 20. **Violin last**, with the KDE moved out of the renderer. By the box-plot
