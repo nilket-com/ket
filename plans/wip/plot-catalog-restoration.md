@@ -287,8 +287,14 @@ band-fill path.
 
     **Does not consume prerequisite D** — the first step in the arc where the
     substrate does not. Variadic dimension authoring is the surfaces'.
-20. **Radar and parallel surfaces.** Consume **D**. Whether they share one record
-    waits until their grammar and transport are surveyed.
+20. **Variadic multivariate surface — ADR 0105, drafted.** Consumes **D**. One
+    record, two words: `radar(...)`/`parallel(...)` purely variadic with a shared
+    `.category(...)` modifier. D turned out to be four coupled boundaries, not one
+    arity check — the rewriter's fixed-arity origin injection, a `3n + 2`
+    constructor, PRODUCT-0094's **seven-slot** `all()` array (a ceiling once a
+    mark is unbounded), and `MultivariateFields` sitting in the wrong layer.
+    Also repairs a live defect: the automatic resolver admits one-dimension
+    radars and parallels, which paint nothing.
 21. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
