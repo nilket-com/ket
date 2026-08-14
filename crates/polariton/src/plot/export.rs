@@ -1,4 +1,4 @@
-use crate::plot::common::{PathBuilder, PlotBackend};
+use crate::plot::common::{ArcJoin, ArcPathState, CircularArc, PathBuilder, PlotBackend};
 use base64::Engine;
 use iced::widget::canvas::{Stroke, Text};
 use iced::{Color, Point, Rectangle, advanced::text::Alignment, alignment::Vertical};
@@ -23,23 +23,25 @@ pub struct SvgBackend {
 struct SvgPathBuilder {
 	path: String,
 	transform: Affine,
+	state: ArcPathState,
 }
 
 impl PathBuilder for SvgPathBuilder {
 	fn move_to(&mut self, point: Point) {
+		self.state.move_to(point);
 		let p = self.transform * kurbo::Point::new(point.x as f64, point.y as f64);
 		self.path.push_str(&format!("M {:.2} {:.2} ", p.x, p.y));
 	}
 	fn line_to(&mut self, point: Point) {
+		self.state.line_to(point);
 		let p = self.transform * kurbo::Point::new(point.x as f64, point.y as f64);
 		self.path.push_str(&format!("L {:.2} {:.2} ", p.x, p.y));
 	}
 	fn arc_to(&mut self, center: Point, radius: f32, start: f32, end: f32) {
-		let p1 = Point::new(
-			center.x + radius * start.cos(),
-			center.y + radius * start.sin(),
-		);
-		let p2 = Point::new(center.x + radius * end.cos(), center.y + radius * end.sin());
+		let arc = CircularArc::new(center, radius, start, end);
+		let join = self.state.begin_arc(arc);
+		let p1 = arc.start();
+		let p2 = arc.end();
 		let p1 = self.transform * kurbo::Point::new(p1.x as f64, p1.y as f64);
 		let p2 = self.transform * kurbo::Point::new(p2.x as f64, p2.y as f64);
 		let large_arc = if (end - start).abs() > std::f32::consts::PI {
@@ -47,9 +49,14 @@ impl PathBuilder for SvgPathBuilder {
 		} else {
 			0
 		};
+		let join = match join {
+			ArcJoin::Move => 'M',
+			ArcJoin::Line => 'L',
+		};
+		let sweep = u8::from(end >= start);
 		self.path.push_str(&format!(
-			"M {:.2} {:.2} A {:.2} {:.2} 0 {} 1 {:.2} {:.2} ",
-			p1.x, p1.y, radius, radius, large_arc, p2.x, p2.y
+			"{} {:.2} {:.2} A {:.2} {:.2} 0 {} {} {:.2} {:.2} ",
+			join, p1.x, p1.y, radius, radius, large_arc, sweep, p2.x, p2.y
 		));
 	}
 	fn circle(&mut self, center: Point, radius: f32) {
@@ -64,6 +71,7 @@ impl PathBuilder for SvgPathBuilder {
 			p.x - r,
 			p.y
 		));
+		self.state.finish_closed_shape();
 		self.path.push_str(&format!(
 			"A {:.2} {:.2} 0 1 1 {:.2} {:.2} Z ",
 			r,
@@ -83,6 +91,7 @@ impl PathBuilder for SvgPathBuilder {
 		self.close();
 	}
 	fn close(&mut self) {
+		self.state.close();
 		self.path.push_str("Z ");
 	}
 }
@@ -121,6 +130,7 @@ impl PlotBackend for SvgBackend {
 		let mut builder = SvgPathBuilder {
 			path: String::new(),
 			transform: self.current_transform,
+			state: ArcPathState::default(),
 		};
 		f(&mut builder);
 		let color = match stroke.style {
@@ -142,6 +152,7 @@ impl PlotBackend for SvgBackend {
 		let mut builder = SvgPathBuilder {
 			path: String::new(),
 			transform: self.current_transform,
+			state: ArcPathState::default(),
 		};
 		f(&mut builder);
 		self.svg.push_str(&format!(
@@ -263,6 +274,120 @@ impl PlotBackend for SvgBackend {
 		f(self);
 		self.svg.push_str("</g>\n");
 		self.current_transform = prev;
+	}
+}
+
+#[cfg(test)]
+fn product_0101_svg_semantic_trace(
+	f: &dyn Fn(&mut dyn PathBuilder),
+) -> (Vec<crate::plot::common::SemanticPathVerb>, String) {
+	let mut builder = SvgPathBuilder {
+		path: String::new(),
+		transform: Affine::IDENTITY,
+		state: ArcPathState::tracing(),
+	};
+	f(&mut builder);
+	let trace = builder.state.finish_trace();
+	(trace, builder.path)
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod product_0101_tests {
+	use super::*;
+	use crate::plot::common::{CircularArc, SemanticPathVerb, product_0101_iced_semantic_trace};
+
+	fn annulus(builder: &mut dyn PathBuilder) {
+		let center = Point::new(40.0, 30.0);
+		builder.arc_to(center, 20.0, 0.0, std::f32::consts::PI);
+		builder.arc_to(center, 12.0, std::f32::consts::PI, 0.0);
+		builder.close();
+	}
+
+	fn pie(builder: &mut dyn PathBuilder) {
+		let center = Point::new(40.0, 30.0);
+		builder.move_to(center);
+		builder.arc_to(center, 20.0, -1.0, 1.2);
+		builder.close();
+	}
+
+	fn radial(center: Point, from: Point, to: Point) -> bool {
+		let left = (from.x - center.x, from.y - center.y);
+		let right = (to.x - center.x, to.y - center.y);
+		(left.0 * right.1 - left.1 * right.0).abs() <= 1e-4
+	}
+
+	#[test]
+	fn product_0101_both_adapters_emit_one_connected_annulus_with_radial_caps() {
+		let iced = product_0101_iced_semantic_trace(&annulus);
+		let (svg, path) = product_0101_svg_semantic_trace(&annulus);
+		assert_eq!(iced, svg, "both adapters share one semantic topology");
+		assert_eq!(svg.len(), 5);
+		let center = Point::new(40.0, 30.0);
+		assert!(matches!(svg[0], SemanticPathVerb::Move { .. }));
+		assert!(matches!(svg[1], SemanticPathVerb::Arc(_)));
+		let SemanticPathVerb::Line { from, to } = svg[2] else {
+			panic!("the inner arc must connect to the outer arc")
+		};
+		assert!(radial(center, from, to));
+		assert!(matches!(svg[3], SemanticPathVerb::Arc(_)));
+		let SemanticPathVerb::Close { from, to } = svg[4] else {
+			panic!("the annulus must close its second radial cap")
+		};
+		assert!(radial(center, from, to));
+		assert_eq!(path.matches("M ").count(), 1);
+		assert_eq!(path.matches("L ").count(), 1);
+		assert_eq!(path.matches(" A ").count(), 2);
+		assert_eq!(path.matches(" 0 0 1 ").count(), 1);
+		assert_eq!(path.matches(" 0 0 0 ").count(), 1);
+		assert!(path.ends_with("Z "));
+	}
+
+	#[test]
+	fn product_0101_pie_connection_lone_arc_and_current_endpoint_are_distinct() {
+		let iced = product_0101_iced_semantic_trace(&pie);
+		let (svg, connected_path) = product_0101_svg_semantic_trace(&pie);
+		assert_eq!(iced, svg);
+		assert!(matches!(
+			svg.as_slice(),
+			[
+				SemanticPathVerb::Move { to },
+				SemanticPathVerb::Line { from, .. },
+				SemanticPathVerb::Arc(_),
+				SemanticPathVerb::Close { to: close_to, .. },
+			] if *to == Point::new(40.0, 30.0)
+				&& *from == Point::new(40.0, 30.0)
+				&& *close_to == Point::new(40.0, 30.0)
+		));
+		assert_eq!(connected_path.matches("M ").count(), 1);
+		assert_eq!(connected_path.matches("L ").count(), 1);
+
+		let lone = |builder: &mut dyn PathBuilder| {
+			builder.arc_to(Point::new(5.0, 7.0), 3.0, 0.25, 1.5);
+			builder.line_to(Point::new(12.0, 13.0));
+		};
+		let lone_trace = product_0101_iced_semantic_trace(&lone);
+		let expected_arc = CircularArc::new(Point::new(5.0, 7.0), 3.0, 0.25, 1.5);
+		assert!(matches!(
+			lone_trace.as_slice(),
+			[
+				SemanticPathVerb::Move { to },
+				SemanticPathVerb::Arc(actual),
+				SemanticPathVerb::Line { from, to: line_to },
+			] if *to == expected_arc.start()
+				&& *actual == expected_arc
+				&& *from == expected_arc.end()
+				&& *line_to == Point::new(12.0, 13.0)
+		));
+
+		let without_center = |builder: &mut dyn PathBuilder| {
+			builder.arc_to(Point::new(40.0, 30.0), 20.0, -1.0, 1.2);
+			builder.close();
+		};
+		let (without_trace, without_path) = product_0101_svg_semantic_trace(&without_center);
+		assert_ne!(svg, without_trace, "pie's move_to(center) is load-bearing");
+		assert_ne!(connected_path, without_path);
+		assert!(!without_path.contains(" L "));
 	}
 }
 

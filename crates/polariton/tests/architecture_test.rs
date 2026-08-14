@@ -3569,3 +3569,83 @@ fn product_0100_radial_dial_surface_reuses_transport_identity_and_one_colour_aut
 	assert!(host.contains("fn radial_dial_failure_span("));
 	assert!(host.contains("radial_dial_output_span"));
 }
+
+#[test]
+fn product_0101_path_builder_has_one_connected_arc_contract_and_two_live_callers() {
+	let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let root = manifest.join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let export = std::fs::read_to_string(root.join("plot/export.rs")).expect("read export");
+	let pie = std::fs::read_to_string(root.join("plot/kernels/pie.rs")).expect("read pie");
+	let radial = std::fs::read_to_string(root.join("plot/kernels/radial_dial.rs"))
+		.expect("read radial dial");
+	let evidence = std::fs::read_to_string(manifest.join("tests/product_0057_render_evidence.rs"))
+		.expect("read render evidence");
+
+	assert!(common.contains("pub(crate) const PATH_ARC_TOLERANCE: f64 = 0.1;"));
+	assert!(common.contains("pub(crate) struct ArcPathState"));
+	assert!(common.contains("pub(crate) fn begin_arc(&mut self, arc: CircularArc) -> ArcJoin"));
+	let iced = common
+		.split("impl<'a> PathBuilder for IcedPathBuilder<'a>")
+		.nth(1)
+		.expect("iced path adapter")
+		.split("impl<'a> PlotBackend for IcedBackend<'a>")
+		.next()
+		.expect("bounded iced path adapter");
+	assert!(iced.contains("self.state.begin_arc(arc)"));
+	assert!(iced.contains("append_iter(PATH_ARC_TOLERANCE)"));
+	assert!(iced.contains("self.builder.bezier_curve_to("));
+	assert!(!iced.contains("self.builder.arc("));
+
+	let svg = export
+		.split("impl PathBuilder for SvgPathBuilder")
+		.nth(1)
+		.expect("svg path adapter")
+		.split("impl SvgBackend")
+		.next()
+		.expect("bounded svg path adapter");
+	assert!(svg.contains("self.state.begin_arc(arc)"));
+	assert!(svg.contains("ArcJoin::Move => 'M'"));
+	assert!(svg.contains("ArcJoin::Line => 'L'"));
+	assert!(svg.contains("let join = match join"));
+
+	let mut callers = Vec::new();
+	for entry in std::fs::read_dir(root.join("plot/kernels")).expect("read kernel directory") {
+		let entry = entry.expect("kernel entry");
+		if entry
+			.path()
+			.extension()
+			.and_then(|extension| extension.to_str())
+			!= Some("rs")
+		{
+			continue;
+		}
+		let source = std::fs::read_to_string(entry.path()).expect("read kernel source");
+		let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+		let count = production.matches("builder.arc_to(").count();
+		if count > 0 {
+			callers.push((entry.file_name().to_string_lossy().into_owned(), count));
+		}
+	}
+	callers.sort();
+	assert_eq!(
+		callers,
+		vec![("pie.rs".to_owned(), 1), ("radial_dial.rs".to_owned(), 4)],
+		"PRODUCT-0101 production arc caller census"
+	);
+	assert!(pie.contains("builder.move_to(center);\n\t\t\t\tbuilder.arc_to("));
+	assert_eq!(pie.matches("builder.line_to(center);").count(), 1);
+	assert_eq!(radial.matches("builder.arc_to(").count(), 4);
+	assert!(!radial.contains("builder.line_to("));
+
+	for pin in [
+		"PRODUCT_0101 arc_contract disposition=automated",
+		"pie_luminous=12336/11191",
+		"joined_diff=1301/1147",
+		"decomposition_diff=76/25",
+		"tolerance=0.1",
+		"annulus=connected",
+	] {
+		assert!(evidence.contains(pin), "missing render-evidence pin: {pin}");
+	}
+}

@@ -569,9 +569,154 @@ impl Default for ResolvedPlotSettings {
 	}
 }
 
+/// Maximum geometric error used when a circular arc is realized as kurbo
+/// cubic Bézier segments for iced's path builder.
+pub(crate) const PATH_ARC_TOLERANCE: f64 = 0.1;
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct CircularArc {
+	pub center: Point,
+	pub radius: f32,
+	pub start_angle: f32,
+	pub end_angle: f32,
+}
+
+impl CircularArc {
+	pub fn new(center: Point, radius: f32, start_angle: f32, end_angle: f32) -> Self {
+		Self {
+			center,
+			radius,
+			start_angle,
+			end_angle,
+		}
+	}
+
+	pub fn start(self) -> Point {
+		Point::new(
+			self.center.x + self.radius * self.start_angle.cos(),
+			self.center.y + self.radius * self.start_angle.sin(),
+		)
+	}
+
+	pub fn end(self) -> Point {
+		Point::new(
+			self.center.x + self.radius * self.end_angle.cos(),
+			self.center.y + self.radius * self.end_angle.sin(),
+		)
+	}
+
+	fn as_kurbo(self) -> kurbo::Arc {
+		kurbo::Arc::new(
+			(self.center.x as f64, self.center.y as f64),
+			(self.radius as f64, self.radius as f64),
+			self.start_angle as f64,
+			(self.end_angle - self.start_angle) as f64,
+			0.0,
+		)
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ArcJoin {
+	Move,
+	Line,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum SemanticPathVerb {
+	Move { to: Point },
+	Line { from: Point, to: Point },
+	Arc(CircularArc),
+	Close { from: Point, to: Point },
+}
+
+#[derive(Default)]
+pub(crate) struct ArcPathState {
+	current: Option<Point>,
+	subpath_start: Option<Point>,
+	#[cfg(test)]
+	trace: Option<Vec<SemanticPathVerb>>,
+}
+
+impl ArcPathState {
+	#[cfg(test)]
+	pub(crate) fn tracing() -> Self {
+		Self {
+			trace: Some(Vec::new()),
+			..Self::default()
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) fn finish_trace(self) -> Vec<SemanticPathVerb> {
+		self.trace.expect("PRODUCT-0101 tracing state")
+	}
+
+	pub(crate) fn move_to(&mut self, point: Point) {
+		self.current = Some(point);
+		self.subpath_start = Some(point);
+		#[cfg(test)]
+		if let Some(trace) = &mut self.trace {
+			trace.push(SemanticPathVerb::Move { to: point });
+		}
+	}
+
+	pub(crate) fn line_to(&mut self, point: Point) {
+		let Some(_from) = self.current else {
+			self.move_to(point);
+			return;
+		};
+		self.current = Some(point);
+		#[cfg(test)]
+		if let Some(trace) = &mut self.trace {
+			trace.push(SemanticPathVerb::Line {
+				from: _from,
+				to: point,
+			});
+		}
+	}
+
+	pub(crate) fn begin_arc(&mut self, arc: CircularArc) -> ArcJoin {
+		let start = arc.start();
+		let join = if self.current.is_some() {
+			self.line_to(start);
+			ArcJoin::Line
+		} else {
+			self.move_to(start);
+			ArcJoin::Move
+		};
+		self.current = Some(arc.end());
+		#[cfg(test)]
+		if let Some(trace) = &mut self.trace {
+			trace.push(SemanticPathVerb::Arc(arc));
+		}
+		join
+	}
+
+	pub(crate) fn close(&mut self) {
+		#[cfg(test)]
+		if let (Some(trace), Some(from), Some(to)) =
+			(&mut self.trace, self.current, self.subpath_start)
+		{
+			trace.push(SemanticPathVerb::Close { from, to });
+		}
+		self.current = None;
+		self.subpath_start = None;
+	}
+
+	pub(crate) fn finish_closed_shape(&mut self) {
+		self.current = None;
+		self.subpath_start = None;
+	}
+}
+
 pub trait PathBuilder {
 	fn move_to(&mut self, point: Point);
 	fn line_to(&mut self, point: Point);
+	/// Appends a circular arc from `start_angle` to `end_angle`. With no open sub-path, moves to the
+	/// arc start; otherwise connects the current point to the arc start with a
+	/// line. The current point becomes the arc end.
 	fn arc_to(&mut self, center: Point, radius: f32, start_angle: f32, end_angle: f32);
 	fn circle(&mut self, center: Point, radius: f32);
 	fn rectangle(&mut self, top_left: Point, size: iced::Size);
@@ -625,45 +770,81 @@ pub struct IcedBackend<'a> {
 
 struct IcedPathBuilder<'a> {
 	builder: &'a mut canvas::path::Builder,
+	state: ArcPathState,
 }
 
 impl<'a> PathBuilder for IcedPathBuilder<'a> {
 	fn move_to(&mut self, point: Point) {
+		self.state.move_to(point);
 		self.builder.move_to(point);
 	}
 	fn line_to(&mut self, point: Point) {
+		self.state.line_to(point);
 		self.builder.line_to(point);
 	}
 	fn arc_to(&mut self, center: Point, radius: f32, start: f32, end: f32) {
-		self.builder.arc(canvas::path::Arc {
-			center,
-			radius,
-			start_angle: iced::Radians(start),
-			end_angle: iced::Radians(end),
-		});
+		let arc = CircularArc::new(center, radius, start, end);
+		match self.state.begin_arc(arc) {
+			ArcJoin::Move => self.builder.move_to(arc.start()),
+			ArcJoin::Line => self.builder.line_to(arc.start()),
+		}
+		for element in arc.as_kurbo().append_iter(PATH_ARC_TOLERANCE) {
+			if let kurbo::PathEl::CurveTo(one, two, end) = element {
+				self.builder.bezier_curve_to(
+					Point::new(one.x as f32, one.y as f32),
+					Point::new(two.x as f32, two.y as f32),
+					Point::new(end.x as f32, end.y as f32),
+				);
+			}
+		}
 	}
 	fn circle(&mut self, center: Point, radius: f32) {
 		self.builder.circle(center, radius);
+		self.state.finish_closed_shape();
 	}
 	fn rectangle(&mut self, top_left: Point, size: iced::Size) {
 		self.builder.rectangle(top_left, size);
+		self.state.finish_closed_shape();
 	}
 	fn close(&mut self) {
+		self.state.close();
 		self.builder.close();
 	}
+}
+
+#[cfg(test)]
+pub(crate) fn product_0101_iced_semantic_trace(
+	f: &dyn Fn(&mut dyn PathBuilder),
+) -> Vec<SemanticPathVerb> {
+	let mut trace = None;
+	let _ = Path::new(|builder| {
+		let mut path = IcedPathBuilder {
+			builder,
+			state: ArcPathState::tracing(),
+		};
+		f(&mut path);
+		trace = Some(path.state.finish_trace());
+	});
+	trace.expect("PRODUCT-0101 iced adapter emitted a semantic trace")
 }
 
 impl<'a> PlotBackend for IcedBackend<'a> {
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke) {
 		let path = Path::new(|builder| {
-			let mut ipb = IcedPathBuilder { builder };
+			let mut ipb = IcedPathBuilder {
+				builder,
+				state: ArcPathState::default(),
+			};
 			f(&mut ipb);
 		});
 		self.frame.stroke(&path, stroke);
 	}
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color) {
 		let path = Path::new(|builder| {
-			let mut ipb = IcedPathBuilder { builder };
+			let mut ipb = IcedPathBuilder {
+				builder,
+				state: ArcPathState::default(),
+			};
 			f(&mut ipb);
 		});
 		self.frame.fill(&path, color);

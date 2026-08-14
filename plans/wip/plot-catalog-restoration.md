@@ -256,11 +256,12 @@ band-fill path.
     which contradicts the resolver's existing `number(1, "maximum")?`.
 15. **Radial dial surface — LANDED as PRODUCT-0100.** Second consumer of
     PRODUCT-0086: one family token, one conversion arm.
-16. **`PathBuilder` arc contract — ADR 0101, drafted.** Not a catalog step but a
-    blocker for one. `arc_to` never said whether it connects or starts a new
+16. **`PathBuilder` arc contract — LANDED as PRODUCT-0101.** Not a catalog step
+    but a blocker for one. `arc_to` never said whether it connects or starts a new
     sub-path, and both adapters guessed "new" — so radial dial's two-arc annuli
-    render as chord-closed arcs. Found by screenshot *after* visual acceptance
-    had been given. Pins the contract at the seam, adds a path-**topology** gate
+    rendered as chord-closed arcs and pie's centre move was dead, leaving slices
+    as chord-bounded segments. Found by screenshot *after* visual acceptance had
+    been given. Pins the contract at the seam, adds a path-**topology** gate
     (every existing assertion checks arc operands, none checks how arcs join),
     and adds a production-canvas oracle.
 17. **Pie** — after removing its aggregation authority, which Toron can now supply

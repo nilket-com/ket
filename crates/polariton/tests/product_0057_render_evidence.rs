@@ -50,8 +50,8 @@ use iced::{Color, Font, Pixels, Point, Rectangle, Size, Vector};
 use iced_wgpu::graphics::{Antialiasing, Shell};
 use iced_wgpu::{Engine, Renderer as WgpuRenderer, wgpu};
 use plot::common::{
-	AxisType, CoordinateTransformer, IcedBackend, Orientation, PlotBackend, PlotKernel, PlotLayout,
-	PlotRenderLayer, PlotWidget, ResolvedPlotSettings, TickPlacement,
+	AxisType, CoordinateTransformer, IcedBackend, Orientation, PathBuilder, PlotBackend,
+	PlotKernel, PlotLayout, PlotRenderLayer, PlotWidget, ResolvedPlotSettings, TickPlacement,
 };
 use plot::composition::PlotComposition;
 use plot::core::PlotType;
@@ -1328,6 +1328,119 @@ fn draw_integer_rectangle(frame: &mut canvas::Frame) {
 	frame.fill_rectangle(Point::new(64.0, 64.0), Size::new(128.0, 96.0), Color::WHITE);
 }
 
+const PRODUCT_0101_SIZE: Size<u32> = Size::new(256, 192);
+const PRODUCT_0101_CENTER: Point = Point::new(128.0, 112.0);
+const PRODUCT_0101_RADIUS: f32 = 80.0;
+const PRODUCT_0101_START: f32 = -2.65;
+const PRODUCT_0101_END: f32 = 0.85;
+
+fn product_0101_old_arc(
+	builder: &mut canvas::path::Builder,
+	center: Point,
+	radius: f32,
+	start: f32,
+	end: f32,
+) {
+	builder.arc(canvas::path::Arc {
+		center,
+		radius,
+		start_angle: iced::Radians(start),
+		end_angle: iced::Radians(end),
+	});
+}
+
+fn draw_product_0101_old_pie(frame: &mut canvas::Frame) {
+	let path = Path::new(|builder| {
+		builder.move_to(PRODUCT_0101_CENTER);
+		product_0101_old_arc(
+			builder,
+			PRODUCT_0101_CENTER,
+			PRODUCT_0101_RADIUS,
+			PRODUCT_0101_START,
+			PRODUCT_0101_END,
+		);
+		builder.close();
+	});
+	frame.fill(&path, Color::WHITE);
+}
+
+fn draw_product_0101_joined_pie(frame: &mut canvas::Frame) {
+	let mut backend = IcedBackend { frame };
+	backend.fill_path(
+		&|builder| {
+			builder.move_to(PRODUCT_0101_CENTER);
+			builder.arc_to(
+				PRODUCT_0101_CENTER,
+				PRODUCT_0101_RADIUS,
+				PRODUCT_0101_START,
+				PRODUCT_0101_END,
+			);
+			builder.close();
+		},
+		Color::WHITE,
+	);
+}
+
+fn draw_product_0101_kurbo_chord_pie(frame: &mut canvas::Frame, tolerance: f64) {
+	let path = Path::new(|builder| {
+		let start = Point::new(
+			PRODUCT_0101_CENTER.x + PRODUCT_0101_RADIUS * PRODUCT_0101_START.cos(),
+			PRODUCT_0101_CENTER.y + PRODUCT_0101_RADIUS * PRODUCT_0101_START.sin(),
+		);
+		builder.move_to(start);
+		let arc = kurbo::Arc::new(
+			(PRODUCT_0101_CENTER.x as f64, PRODUCT_0101_CENTER.y as f64),
+			(PRODUCT_0101_RADIUS as f64, PRODUCT_0101_RADIUS as f64),
+			PRODUCT_0101_START as f64,
+			(PRODUCT_0101_END - PRODUCT_0101_START) as f64,
+			0.0,
+		);
+		for element in arc.append_iter(tolerance) {
+			if let kurbo::PathEl::CurveTo(one, two, end) = element {
+				builder.bezier_curve_to(
+					Point::new(one.x as f32, one.y as f32),
+					Point::new(two.x as f32, two.y as f32),
+					Point::new(end.x as f32, end.y as f32),
+				);
+			}
+		}
+		builder.close();
+	});
+	frame.fill(&path, Color::WHITE);
+}
+
+fn draw_product_0101_annulus(frame: &mut canvas::Frame, connected: bool) {
+	let center = Point::new(128.0, 130.0);
+	let start = std::f32::consts::PI;
+	let end = 1.7 * std::f32::consts::PI;
+	if connected {
+		let mut backend = IcedBackend { frame };
+		backend.fill_path(
+			&|builder| {
+				builder.arc_to(center, 80.0, start, end);
+				builder.arc_to(center, 48.0, end, start);
+				builder.close();
+			},
+			Color::WHITE,
+		);
+	} else {
+		let path = Path::new(|builder| {
+			product_0101_old_arc(builder, center, 80.0, start, end);
+			product_0101_old_arc(builder, center, 48.0, end, start);
+			builder.close();
+		});
+		frame.fill(&path, Color::WHITE);
+	}
+}
+
+fn product_0101_differing_pixels(left: &Capture, right: &Capture) -> usize {
+	left.rgba
+		.chunks_exact(4)
+		.zip(right.rgba.chunks_exact(4))
+		.filter(|(left, right)| left != right)
+		.count()
+}
+
 fn render_table(
 	renderer: &mut iced::Renderer,
 	size: Size<u32>,
@@ -1418,6 +1531,93 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	let large = Size::new(448, 320);
 	let mut msaa = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
 	let mut no_aa = gpu.renderer(None).await;
+
+	let product_0101_old_msaa =
+		render_frame(&mut msaa, PRODUCT_0101_SIZE, draw_product_0101_old_pie);
+	let product_0101_old_none =
+		render_frame(&mut no_aa, PRODUCT_0101_SIZE, draw_product_0101_old_pie);
+	let product_0101_joined_msaa =
+		render_frame(&mut msaa, PRODUCT_0101_SIZE, draw_product_0101_joined_pie);
+	let product_0101_joined_none =
+		render_frame(&mut no_aa, PRODUCT_0101_SIZE, draw_product_0101_joined_pie);
+	let full_bounds = Rectangle::with_size(Size::new(256.0, 192.0));
+	assert_eq!(
+		product_0101_old_none.luminous_pixels(full_bounds),
+		12_336,
+		"PRODUCT-0101 Stage 0 chord-bounded pie bank"
+	);
+	assert_eq!(
+		product_0101_joined_none.luminous_pixels(full_bounds),
+		11_191,
+		"PRODUCT-0101 repaired pie is the smaller centre-bounded sector"
+	);
+	assert_eq!(
+		product_0101_differing_pixels(&product_0101_old_msaa, &product_0101_joined_msaa),
+		1_301
+	);
+	assert_eq!(
+		product_0101_differing_pixels(&product_0101_old_none, &product_0101_joined_none),
+		1_147
+	);
+
+	let mut chord_msaa = Vec::new();
+	let mut chord_none = Vec::new();
+	for tolerance in [1.0, 0.25, 0.1, 0.01, 0.001] {
+		chord_msaa.push(render_frame(&mut msaa, PRODUCT_0101_SIZE, |frame| {
+			draw_product_0101_kurbo_chord_pie(frame, tolerance)
+		}));
+		chord_none.push(render_frame(&mut no_aa, PRODUCT_0101_SIZE, |frame| {
+			draw_product_0101_kurbo_chord_pie(frame, tolerance)
+		}));
+	}
+	assert!(
+		chord_msaa[..4]
+			.windows(2)
+			.all(|pair| pair[0].rgba == pair[1].rgba)
+	);
+	assert!(
+		chord_none[..4]
+			.windows(2)
+			.all(|pair| pair[0].rgba == pair[1].rgba)
+	);
+	assert_ne!(chord_msaa[3].rgba, chord_msaa[4].rgba);
+	assert_ne!(chord_none[3].rgba, chord_none[4].rgba);
+	assert_eq!(
+		product_0101_differing_pixels(&product_0101_old_msaa, &chord_msaa[2]),
+		76
+	);
+	assert_eq!(
+		product_0101_differing_pixels(&product_0101_old_none, &chord_none[2]),
+		25
+	);
+
+	let product_0101_old_annulus = render_frame(&mut msaa, PRODUCT_0101_SIZE, |frame| {
+		draw_product_0101_annulus(frame, false)
+	});
+	let product_0101_joined_annulus = render_frame(&mut msaa, PRODUCT_0101_SIZE, |frame| {
+		draw_product_0101_annulus(frame, true)
+	});
+	assert!(
+		product_0101_differing_pixels(&product_0101_old_annulus, &product_0101_joined_annulus)
+			> 500,
+		"PRODUCT-0101 annular-sector repair must be visually discriminating"
+	);
+	let annulus_center = Point::new(128.0, 130.0);
+	let annulus_mid = 1.35 * std::f32::consts::PI;
+	let point_at = |radius: f32| {
+		product_0101_joined_annulus.pixel(
+			(annulus_center.x + radius * annulus_mid.cos()).round() as u32,
+			(annulus_center.y + radius * annulus_mid.sin()).round() as u32,
+		)
+	};
+	assert!(near(point_at(64.0), WHITE, 12), "annular band interior");
+	assert!(
+		near(point_at(30.0), BACKGROUND, 12),
+		"annular hole remains empty"
+	);
+	println!(
+		"PRODUCT_0101 arc_contract disposition=automated pie_luminous=12336/11191 joined_diff=1301/1147 decomposition_diff=76/25 tolerance=0.1 annulus=connected"
+	);
 
 	let product_0077_size = Size::new(800, 600);
 	let product_0077_sentinel = plot::chrome::PlotRgba::opaque(1.0, 0.0, 1.0);
