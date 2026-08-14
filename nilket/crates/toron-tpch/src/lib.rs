@@ -8409,6 +8409,24 @@ struct ExecutionCensusWorkerHarness {
 	shutdown: tokio::sync::oneshot::Sender<()>,
 	handle: tokio::task::JoinHandle<Result<(), String>>,
 }
+/// Whether a connection error is the ordinary consequence of the coordinator
+/// closing the listener, rather than a worker fault.
+///
+/// Matched on `io::ErrorKind` and never on rendered text: the message is a
+/// presentation of the error, not its identity.
+fn is_expected_peer_close(error: &toron::error::QueryError) -> bool {
+	matches!(
+		error,
+		toron::error::QueryError::Io(io)
+			if matches!(
+				io.kind(),
+				std::io::ErrorKind::BrokenPipe
+					| std::io::ErrorKind::ConnectionReset
+					| std::io::ErrorKind::ConnectionAborted
+					| std::io::ErrorKind::UnexpectedEof
+			)
+	)
+}
 
 async fn spawn_execution_census_worker(
 	worker_index: usize,
@@ -8449,18 +8467,46 @@ async fn spawn_execution_census_worker(
 	let cancellation_cleanup = Arc::new(AtomicBool::new(false));
 	let worker_cleanup = cancellation_cleanup.clone();
 	let observed_worker = worker.clone();
+	// Set the instant the coordinator asks the listener to stop. A connection that
+	// ends after this point ended because we said so.
+	let shutting_down = Arc::new(AtomicBool::new(false));
+	let listener_shutting_down = shutting_down.clone();
 	let handle = tokio::spawn(async move {
 		let mut connections = tokio::task::JoinSet::new();
 		loop {
 			tokio::select! {
-				_ = &mut shutdown_rx => break,
+				_ = &mut shutdown_rx => {
+					listener_shutting_down.store(true, Ordering::SeqCst);
+					break;
+				}
 				accepted = listener.accept() => {
 					let (stream, _) = accepted
 						.map_err(|error| format!("execution census worker accept: {error}"))?;
 					let worker = worker.clone();
+					let shutting_down = listener_shutting_down.clone();
 					connections.spawn(async move {
-						worker.handle_connection(stream).await
-							.map_err(|error| format!("execution census worker connection: {error}"))
+						match worker.handle_connection(stream).await {
+							Ok(()) => Ok(()),
+							// A peer that goes away *because the coordinator initiated
+							// shutdown* is an ordinary close, not a fault. Without this
+							// distinction teardown charges a fully measured cell for its
+							// own shutdown: q01 completed all seven pairs, cleaned up, and
+							// returned to baseline, then failed `cohort_incomplete` on a
+							// broken pipe from a connection that was still draining when
+							// the listener stopped.
+							//
+							// Classified by `io::ErrorKind`, never by error text — the
+							// text is a rendering, not a status.
+							Err(error)
+								if shutting_down.load(Ordering::SeqCst)
+									&& is_expected_peer_close(&error) =>
+							{
+								Ok(())
+							}
+							Err(error) => Err(format!(
+								"execution census worker connection: {error}"
+							)),
+						}
 					});
 				}
 			}
@@ -24972,5 +25018,63 @@ mod adr538_node_partition_veto {
 			protocol_unmodified: true,
 			complete_cohort: true,
 		}));
+	}
+}
+
+#[cfg(test)]
+mod adr551_census_worker_shutdown {
+	use super::*;
+	use toron::error::QueryError;
+
+	fn io(kind: std::io::ErrorKind) -> QueryError {
+		QueryError::Io(std::io::Error::new(kind, "test"))
+	}
+
+	/// A peer that goes away because the coordinator stopped the listener is an
+	/// ordinary close.
+	///
+	/// This is the q01 failure: seven pairs measured, cleanup succeeded, residency
+	/// stable, `retained_bytes: 0` — and then `cohort_incomplete`, because a
+	/// connection still draining at shutdown returned `BrokenPipe` and teardown
+	/// could not tell that from a worker fault.
+	#[test]
+	fn coordinator_initiated_peer_closes_are_not_faults() {
+		for kind in [
+			std::io::ErrorKind::BrokenPipe,
+			std::io::ErrorKind::ConnectionReset,
+			std::io::ErrorKind::ConnectionAborted,
+			std::io::ErrorKind::UnexpectedEof,
+		] {
+			assert!(
+				is_expected_peer_close(&io(kind)),
+				"{kind:?} at shutdown is an expected close"
+			);
+		}
+	}
+
+	/// The tolerance is narrow. A worker that fails for its own reasons still
+	/// fails the cell, so this cannot be used to make teardown unconditionally
+	/// forgiving — which would trade a false `cohort_incomplete` for a silently
+	/// accepted broken worker.
+	#[test]
+	fn unexpected_worker_failures_still_fail() {
+		for kind in [
+			std::io::ErrorKind::PermissionDenied,
+			std::io::ErrorKind::InvalidData,
+			std::io::ErrorKind::OutOfMemory,
+			std::io::ErrorKind::TimedOut,
+		] {
+			assert!(
+				!is_expected_peer_close(&io(kind)),
+				"{kind:?} is a genuine fault, not a shutdown close"
+			);
+		}
+
+		assert!(
+			!is_expected_peer_close(&QueryError::Remote {
+				message: "worker aborted".to_string()
+			}),
+			"a non-IO worker error is never an expected close"
+		);
 	}
 }
