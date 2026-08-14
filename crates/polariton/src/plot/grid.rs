@@ -4397,6 +4397,55 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0103_authored_pie_hover_uses_the_non_origin_facet_geometry() {
+		let complete = Arc::new(
+			df!("category" => ["A slice", "B slice"], "value" => [30.0_f64, 40.0])
+				.expect("authored pie fixture"),
+		);
+		let resolved = plan(PlotRequest {
+			source: PlotSource::Materialized {
+				name: "PRODUCT-0103 authored pie".to_owned(),
+				data: artifact(&complete),
+			},
+			authored_spec: AuthoredPlotSpec::pie(crate::plot::spec::PieFields {
+				category: "category".to_owned(),
+				value: "value".to_owned(),
+			}),
+		})
+		.expect("authored pie resolves");
+		let body = Arc::new(resolved.resolved_spec);
+		let mut cells = NonEmpty::new(GridCell {
+			position: GridPosition { row: 0, column: 0 },
+			body: Arc::clone(&body),
+			data: Arc::new(df!("category" => ["A slice"], "value" => [30.0]).unwrap()),
+			x_group: 0,
+			y_group: 0,
+			label: Some("A".to_owned()),
+		});
+		cells.push(GridCell {
+			position: GridPosition { row: 0, column: 1 },
+			body,
+			data: Arc::new(df!("category" => ["B slice"], "value" => [40.0]).unwrap()),
+			x_group: 0,
+			y_group: 0,
+			label: Some("B".to_owned()),
+		});
+		let grid = PlotGrid::new(cells, GridArrangement::new(1, 2).unwrap()).unwrap();
+		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
+		let settings = product_0097_settings();
+		let inner = product_0097_inner(&kernel, 1, &settings);
+		let hover = product_0097_hover(
+			&kernel,
+			Point::new(
+				inner.x() + inner.width() * 0.7,
+				inner.y() + inner.height() / 2.0,
+			),
+			&settings,
+		);
+		assert_eq!(hover, Some("B slice: 40.00 (100.0%)".to_owned()));
+	}
+
+	#[test]
 	fn value_facet_capacity_is_a_work_bound_with_no_truncation() {
 		let (body, _data, stamped) = fixture();
 		let admissible_values: Vec<String> = (0..128).map(|index| format!("v{index}")).collect();

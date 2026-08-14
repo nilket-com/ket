@@ -102,3 +102,17 @@ cargo run -p polariton -- uat/test31.rn
 render in PRODUCT-0099's lexical category order. `radial_dial_ungrouped` has no
 label field; its one honest `category: None` is displayed as `All Data` only at
 the legend and hover presentation sites.
+
+Seed the PRODUCT-0103 pie relation, then open its aggregated and refusing
+figures:
+
+```sh
+nilket toron sql --file uat/pie_probe.sql
+cargo run -p polariton -- uat/test32.rn
+```
+
+`pie_probe` deliberately contains duplicate categories. The first relation
+explicitly aggregates, restores the `category` / `value` names, and sorts the
+slices clockwise by descending value. The raw companion must refuse at the
+category argument and name `.aggregate(...)`; together they demonstrate that
+Toron, not the pie mark, owns summation.

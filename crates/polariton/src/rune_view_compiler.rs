@@ -29,6 +29,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"figure",
 	"funnel",
 	"radial_dial",
+	"pie",
 	"histogram",
 	"heatmap",
 	"hide_legend",
@@ -411,7 +412,18 @@ fn static_provenance(
 					origin: "workspace".to_owned(),
 				}));
 			}
-			Ok(bindings.get(raw).cloned())
+			Ok(match bindings.get(raw).cloned() {
+				Some(StaticProvenance::Relation { root, origin, .. }) => {
+					// Return the bound name from the rendered Rune program. Replaying
+					// its initializer would execute a linear relation operation twice.
+					Some(StaticProvenance::Relation {
+						span: byte_range(path.span(), source.len())?,
+						root,
+						origin,
+					})
+				}
+				other => other,
+			})
 		}
 		ast::Expr::Group(group) => static_provenance(&group.expr, source, bindings, shadows),
 		ast::Expr::Call(call) => {
@@ -504,7 +516,7 @@ fn static_method_on_relation(
 	}
 	if matches!(
 		method,
-		"box" | "bubble" | "funnel" | "heatmap" | "radial_dial"
+		"box" | "bubble" | "funnel" | "heatmap" | "radial_dial" | "pie"
 	) {
 		return invalid_view(
 			call.span(),
@@ -987,6 +999,20 @@ fn render_relation(
 	relation: &HashSet<Range<usize>>,
 ) -> Result<RenderedRelation, RuneEnvelopeError> {
 	let mut peeled = analysis.output_statements.clone();
+	// Executions are independent relation branches. A sibling definition may
+	// consume a shared ancestor, so retain only this execution's dependencies.
+	let mut execution_relation = HashSet::new();
+	collect_dependencies(
+		source,
+		&execution.relation,
+		&analysis.definitions,
+		&mut execution_relation,
+	)?;
+	for statement in relation {
+		if !execution_relation.contains(statement) {
+			peeled.push(statement.clone());
+		}
+	}
 	for statement in presentation {
 		if !relation.contains(statement) {
 			peeled.push(statement.clone());
@@ -1288,6 +1314,7 @@ fn rewrite_calls_mapped(
 			"heatmap" => Some(&[3]),
 			"funnel" => Some(&[2]),
 			"radial_dial" => Some(&[2, 3]),
+			"pie" => Some(&[2]),
 			_ => None,
 		};
 		let injected_origins = if let Some(origin_arities) = origin_arities.filter(|_| !is_method) {
@@ -2828,5 +2855,113 @@ r.views([bar(category(), "revenue")])
 		};
 		assert_eq!(&source[span.start as usize..span.end as usize], "missing");
 		assert!(message.contains("No local variable `missing`"), "{message}");
+	}
+
+	#[test]
+	fn product_0103_pie_surface_positions_arity_and_origins_are_closed() {
+		let fields = "\"category\", \"value\"";
+		for slot in [
+			format!("pie({fields})"),
+			format!("view(\"named\", pie({fields}))"),
+			format!("view(\"named\", figure([pie({fields})]))"),
+			format!("figure([pie({fields})])"),
+		] {
+			let source = format!(
+				"let relation = workspace.table(\"pie_probe\");\nrelation.views([{slot}]);"
+			);
+			let compiled = compile(&source).unwrap_or_else(|error| panic!("{slot}: {error}"));
+			let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+				panic!("pie surface produced a table")
+			};
+			let sink = match &plot.body {
+				RunePlotBody::Single(sink) => sink,
+				RunePlotBody::StyledSingle(styled) => &styled.sink,
+				RunePlotBody::Layered(_) => panic!("pie surface produced layers"),
+			};
+			let (actual, origins) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(|fields| fields.pie())
+				.expect("pie fields and origins");
+			assert_eq!(
+				(actual.category.as_str(), actual.value.as_str()),
+				("category", "value")
+			);
+			assert_eq!(
+				&source[origins.category.start as usize..origins.category.end as usize],
+				"\"category\""
+			);
+			assert_eq!(
+				&source[origins.value.start as usize..origins.value.end as usize],
+				"\"value\""
+			);
+		}
+
+		for source in [
+			format!("let r = workspace.table(\"pie_probe\"); r.views([layers([pie({fields})])]);"),
+			format!("plot.pie(workspace.table(\"pie_probe\"), {fields});"),
+			format!("workspace.table(\"pie_probe\").pie({fields});"),
+		] {
+			assert!(
+				compile(&source).is_err(),
+				"accepted forbidden surface: {source}"
+			);
+		}
+		for source in [
+			"let r = workspace.table(\"pie_probe\"); r.views([pie(\"value\")]);",
+			"let r = workspace.table(\"pie_probe\"); r.views([pie(\"category\", \"value\", \"extra\")]);",
+		] {
+			let error = compile(source).expect_err("invalid pie arity must refuse");
+			assert!(
+				error
+					.to_string()
+					.contains("pie(...) takes category and value strings"),
+				"{error}"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0103_test32_is_the_aggregated_and_refusing_pie_exhibit() {
+		let source = include_str!("../../../uat/test32.rn");
+		let compiled = compile(source).expect("the checked-in pie exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 2);
+		for execution in &compiled.executions {
+			let RuneViewIntent::Plot(plot) = &execution.views[0].intent else {
+				panic!("pie exhibit produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("pie exhibit did not retain one standalone mark")
+			};
+			assert!(
+				sink.mark_fields
+					.as_ref()
+					.and_then(|fields| fields.pie())
+					.is_some()
+			);
+		}
+		assert!(source.contains(".aggregate([col(\"category\")], [sum(col(\"value\"))])"));
+		assert!(source.contains(".project_named(["));
+		assert!(source.contains(".sort([col(\"value\").desc()])"));
+		assert!(source.contains("must refuse") || source.contains("refusal"));
+	}
+
+	#[test]
+	fn product_0103_each_exhibit_execution_contains_only_its_relation_branch() {
+		let source = include_str!("../../../uat/test32.rn");
+		let compiled = compile(source).expect("the checked-in pie exhibit compiles");
+		let aggregated = compiled
+			.executions
+			.iter()
+			.find(|execution| execution.origin.contains(".aggregate("))
+			.expect("aggregated execution");
+		let raw = compiled
+			.executions
+			.iter()
+			.find(|execution| !execution.origin.contains(".aggregate("))
+			.expect("raw execution");
+		assert_eq!(raw.source.matches(".aggregate(").count(), 0);
+		assert_eq!(aggregated.source.matches(".aggregate(").count(), 1);
 	}
 }

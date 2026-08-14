@@ -1011,6 +1011,7 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 			crate::plot::spec::MarkFields::RadialDial(fields) => {
 				AuthoredPlotSpec::radial_dial(fields)
 			}
+			crate::plot::spec::MarkFields::Pie(fields) => AuthoredPlotSpec::pie(fields),
 		};
 	}
 	if sink.composition.primary_plot_type() == PlotType::Histogram {
@@ -1293,6 +1294,61 @@ fn radial_dial_failure_span(
 			RadialDialReadingsError::UngroupedMultipleRows { .. },
 		))
 		| Ok(_) => mark.clone(),
+	}
+}
+
+#[cfg(feature = "toron")]
+fn pie_failure_span(
+	data: &DataFrame,
+	fields: &crate::plot::spec::PieFields,
+	origins: &crate::rune_relation_envelope::PieFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let authored = AuthoredPlotSpec::pie(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return if error.field == fields.category {
+			origins.category.clone()
+		} else if error.field == fields.value {
+			origins.value.clone()
+		} else {
+			mark.clone()
+		};
+	}
+	use crate::plot::kernels::pie::{PiePreparationError, PiePreparationField};
+	use crate::plot::kernels::pie_slices::PieSlicesError;
+	match crate::plot::kernels::pie::prepare_pie_data(data, Some(&fields.category), &fields.value) {
+		Err(
+			PiePreparationError::MissingColumn {
+				field_role: PiePreparationField::Category,
+				..
+			}
+			| PiePreparationError::UnsupportedColumn {
+				field_role: PiePreparationField::Category,
+				..
+			}
+			| PiePreparationError::Slices(
+				PieSlicesError::NullCategory { .. } | PieSlicesError::DuplicateCategory { .. },
+			),
+		) => origins.category.clone(),
+		Err(
+			PiePreparationError::MissingColumn {
+				field_role: PiePreparationField::Value,
+				..
+			}
+			| PiePreparationError::UnsupportedColumn {
+				field_role: PiePreparationField::Value,
+				..
+			}
+			| PiePreparationError::Slices(
+				PieSlicesError::NullValue { .. }
+				| PieSlicesError::InexactValue { .. }
+				| PieSlicesError::NonFiniteValue { .. }
+				| PieSlicesError::NegativeValue { .. }
+				| PieSlicesError::NonFiniteTotal { .. }
+				| PieSlicesError::NonPositiveTotal { .. },
+			),
+		) => origins.value.clone(),
+		Ok(_) => mark.clone(),
 	}
 }
 
@@ -1787,6 +1843,10 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.radial_dial()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let pie_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.pie()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let body_output_span = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
 					RunePlotBody::Single(sink)
@@ -2134,6 +2194,11 @@ fn rune_view_outcome_with_palettes(
 						radial_dial_failure_span(frame.as_ref(), fields, origins, mark)
 					})
 			});
+			let pie_output_span = output.as_ref().err().and_then(|_| {
+				pie_diagnostic.as_ref().map(|(fields, origins, mark)| {
+					pie_failure_span(frame.as_ref(), fields, origins, mark)
+				})
+			});
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
@@ -2144,6 +2209,7 @@ fn rune_view_outcome_with_palettes(
 					.or(bubble_output_span)
 					.or(funnel_output_span)
 					.or(radial_dial_output_span)
+					.or(pie_output_span)
 					.or(body_output_span)
 					.or(facet_span)
 					.unwrap_or(view.span),
@@ -10398,6 +10464,72 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			"more than one reading at row 2",
 		);
 		assert!(complete(grouped, valid).sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0103_pie_resolves_identity_and_attributes_slice_refusals() {
+		use polars::frame::DataFrame;
+		let source = r#"workspace.table("pie_probe").views([pie("category", "value")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("pie source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"category" => ["Zulu", "Alpha"],
+			"value" => [4.0_f64, 2.0],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid pie must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::Pie { category: Some(category), value }
+				if category == "category" && value == "value"
+		));
+		let snapshot = continuation.identity.persistence_snapshot();
+		assert_eq!(snapshot.assignments.len(), 2);
+		assert!(snapshot.assignments.iter().all(|assignment| {
+			assignment.field == "category" && assignment.layer.family.as_str() == "pie"
+		}));
+
+		let assert_span = |frame: DataFrame, expected: &str, fragment: &str| {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid pie rendered")
+			};
+			assert!(error.contains(fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		};
+		assert_span(
+			polars::df!("category" => [1_i64], "value" => [1.0]).unwrap(),
+			"\"category\"",
+			"incompatible with Pie",
+		);
+		assert_span(
+			polars::df!("category" => ["A", "A"], "value" => [2.0, 1.0]).unwrap(),
+			"\"category\"",
+			".aggregate(",
+		);
+		assert_span(
+			polars::df!("category" => ["A"], "value" => [f64::NAN]).unwrap(),
+			"\"value\"",
+			"non-finite",
+		);
+		assert_span(
+			polars::df!("category" => ["A"], "value" => [0.0]).unwrap(),
+			"\"value\"",
+			"zero total",
+		);
+		assert!(complete(valid).sinks[0].output.is_ok());
 	}
 
 	#[test]

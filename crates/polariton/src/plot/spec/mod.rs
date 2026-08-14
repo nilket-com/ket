@@ -395,6 +395,18 @@ pub struct RadialDialFields {
 	pub label: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PieFields {
+	pub category: String,
+	pub value: String,
+}
+
+impl PieFields {
+	pub fn all(&self) -> [&str; 2] {
+		[&self.category, &self.value]
+	}
+}
+
 impl HeatmapFields {
 	pub fn all(&self) -> [&str; 3] {
 		[&self.x, &self.y, &self.value]
@@ -408,6 +420,7 @@ pub enum MarkFields {
 	Bubble(BubbleFields),
 	Funnel(FunnelFields),
 	RadialDial(RadialDialFields),
+	Pie(PieFields),
 }
 
 impl MarkFields {
@@ -453,6 +466,15 @@ impl MarkFields {
 				Some(&fields.value),
 				Some(&fields.maximum),
 				fields.label.as_deref(),
+				None,
+				None,
+				None,
+				None,
+			],
+			Self::Pie(fields) => [
+				Some(&fields.category),
+				Some(&fields.value),
+				None,
 				None,
 				None,
 				None,
@@ -638,6 +660,23 @@ impl AuthoredPlotSpec {
 	pub fn radial_dial_fields(&self) -> Option<&RadialDialFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::RadialDial(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn pie(fields: PieFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::Pie),
+			fields.category.clone(),
+			fields.value.clone(),
+		);
+		spec.mark_fields = Some(MarkFields::Pie(fields));
+		spec
+	}
+
+	pub fn pie_fields(&self) -> Option<&PieFields> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::Pie(fields)) => Some(fields),
 			_ => None,
 		}
 	}
@@ -913,16 +952,18 @@ impl AuthoredFamilyId {
 	pub(crate) const AREA: Self = Self(Cow::Borrowed("area"));
 	pub(crate) const FUNNEL: Self = Self(Cow::Borrowed("funnel"));
 	pub(crate) const RADIAL_DIAL: Self = Self(Cow::Borrowed("radial_dial"));
+	pub(crate) const PIE: Self = Self(Cow::Borrowed("pie"));
 
 	/// Exhaustive catalog of identifiers this binary can originate from authored
 	/// source. It is intentionally narrower than the checked persistence grammar.
-	pub(crate) const ALL: [Self; 6] = [
+	pub(crate) const ALL: [Self; 7] = [
 		Self::SCATTER,
 		Self::BAR,
 		Self::LINE,
 		Self::AREA,
 		Self::FUNNEL,
 		Self::RADIAL_DIAL,
+		Self::PIE,
 	];
 
 	pub(crate) fn parse(value: String) -> Result<Self, String> {
@@ -960,6 +1001,7 @@ impl ColorLayerIdentity {
 			PlotType::StackedArea => AuthoredFamilyId::AREA,
 			PlotType::Funnel => AuthoredFamilyId::FUNNEL,
 			PlotType::RadialDial => AuthoredFamilyId::RADIAL_DIAL,
+			PlotType::Pie => AuthoredFamilyId::PIE,
 			PlotType::StackedBar | PlotType::HorizontalStackedBar => unreachable!(
 				"PRODUCT-0064 requires stacked bar colour lineage to retain authored Bar identity"
 			),
@@ -1746,6 +1788,9 @@ pub fn resolve_channels(
 	if plot_type == PlotType::RadialDial && spec.radial_dial_fields().is_some() {
 		return resolve_radial_dial_channels(spec, schema);
 	}
+	if plot_type == PlotType::Pie && spec.pie_fields().is_some() {
+		return resolve_pie_channels(spec, schema);
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -2373,6 +2418,60 @@ fn resolve_radial_dial_channels(
 	})
 }
 
+fn resolve_pie_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.pie_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("pie"),
+		field: "<pie>".to_owned(),
+		reason: "Pie requires explicit category and value fields".to_owned(),
+	})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::Pie,
+	};
+	let mut used = HashSet::new();
+	let category = resolve_required(
+		Channel::X,
+		&AuthoredChannelSpec::named(&fields.category),
+		PlotType::Pie,
+		&layer,
+		false,
+		schema,
+		&mut used,
+	)
+	.map_err(|mut error| {
+		error.attribution = FieldAttribution::Role("category");
+		error
+	})?;
+	let value = resolve_required(
+		Channel::Y,
+		&AuthoredChannelSpec::named(&fields.value),
+		PlotType::Pie,
+		&layer,
+		false,
+		schema,
+		&mut used,
+	)
+	.map_err(|mut error| {
+		error.attribution = FieldAttribution::Role("value");
+		error
+	})?;
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![category, value],
+		kernel_fields: Box::new(ResolvedKernelFields::Pie {
+			category: Some(fields.category.clone()),
+			value: fields.value.clone(),
+		}),
+		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
+		categorical_limit: DEFAULT_CATEGORICAL_LIMIT,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
 fn resolve_bar_orientation(x: &BoundChannel, y: &BoundChannel) -> Result<PlotType, ChannelError> {
 	match (
 		x.semantic_type == SemanticType::Quantitative,
@@ -2565,7 +2664,7 @@ pub fn resolve_domains(
 		let domain = resolve_domain(column, &channel)?;
 		let authored_categories = matches!(
 			binding.composition.primary_plot_type(),
-			PlotType::Funnel | PlotType::RadialDial
+			PlotType::Funnel | PlotType::RadialDial | PlotType::Pie
 		) && channel.channel == Channel::X;
 		let colors = if (channel.channel == Channel::Color
 			&& color_job == Some(ColorJob::Categorical))
@@ -2651,7 +2750,7 @@ pub fn resolve_domains_with_categorical_palette(
 			resolve_domain(column, &channel).map_err(CategoricalResolutionError::Domain)?;
 		let authored_categories = matches!(
 			binding.composition.primary_plot_type(),
-			PlotType::Funnel | PlotType::RadialDial
+			PlotType::Funnel | PlotType::RadialDial | PlotType::Pie
 		) && channel.channel == Channel::X;
 		let colors = if (channel.channel == Channel::Color
 			&& color_job == Some(ColorJob::Categorical))
@@ -3097,6 +3196,8 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		(PlotType::Funnel, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::RadialDial, Channel::X) => semantic == SemanticType::Nominal,
 		(PlotType::RadialDial, Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::Pie, Channel::X) => semantic == SemanticType::Nominal,
+		(PlotType::Pie, Channel::Y) => semantic == SemanticType::Quantitative,
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -3835,6 +3936,86 @@ mod tests {
 		})
 	}
 
+	fn pie_spec() -> AuthoredPlotSpec {
+		AuthoredPlotSpec::pie(PieFields {
+			category: "category".to_owned(),
+			value: "value".to_owned(),
+		})
+	}
+
+	#[test]
+	fn product_0103_pie_binds_grouped_roles_and_allocates_complete_categories() {
+		let grouped = stamped(
+			df!(
+				"category" => ["Zulu", "Alpha", "Middle"],
+				"value" => [3.0_f64, 2.0, 1.0],
+			)
+			.unwrap(),
+		);
+		let projected = grouped.data.projection().unwrap();
+		let binding =
+			resolve_channels(&pie_spec(), projected.schema().as_ref()).expect("authored pie binds");
+		assert_eq!(binding.channels.len(), 2);
+		assert_eq!(binding.channels[0].semantic_type, SemanticType::Nominal);
+		assert_eq!(
+			binding.channels[1].semantic_type,
+			SemanticType::Quantitative
+		);
+		assert_eq!(binding.categorical_limit, DEFAULT_CATEGORICAL_LIMIT);
+		let (resolved, identity) =
+			resolve(&pie_spec(), &grouped, &ColorIdentity::default()).unwrap();
+		assert_eq!(resolved.channel(Channel::X).unwrap().colors.len(), 3);
+		assert!(
+			identity.assignments.keys().all(|key| {
+				key.layer.family == AuthoredFamilyId::PIE && key.field == "category"
+			})
+		);
+
+		let automatic = AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Pie));
+		let (resolved, identity) =
+			resolve(&automatic, &grouped, &ColorIdentity::default()).unwrap();
+		assert!(resolved.channel(Channel::X).is_none());
+		assert!(identity.is_empty());
+	}
+
+	#[test]
+	fn product_0103_pie_binding_owns_roles_and_asymmetric_lineage() {
+		for (frame, role) in [
+			(
+				df!("category" => [1_i64], "value" => [1.0]).unwrap(),
+				"category",
+			),
+			(
+				df!("category" => ["A"], "value" => ["bad"]).unwrap(),
+				"value",
+			),
+		] {
+			let error = resolve_channels(&pie_spec(), frame.schema().as_ref()).unwrap_err();
+			assert_eq!(error.attribution, FieldAttribution::Role(role));
+		}
+		let first =
+			stamped(df!("category" => ["A", "B", "C"], "value" => [3.0, 2.0, 1.0]).unwrap());
+		let (first_resolved, identity) =
+			resolve(&pie_spec(), &first, &ColorIdentity::default()).unwrap();
+		let second =
+			stamped(df!("category" => ["B", "C", "D"], "value" => [2.0, 1.0, 4.0]).unwrap());
+		let (second_resolved, next_identity) = resolve(&pie_spec(), &second, &identity).unwrap();
+		let mapping = |resolved: &ResolvedPlotSpec| {
+			resolved
+				.channel(Channel::X)
+				.unwrap()
+				.colors
+				.iter()
+				.map(|entry| (entry.category.clone(), entry.position.index()))
+				.collect::<HashMap<_, _>>()
+		};
+		let first = mapping(&first_resolved);
+		let second = mapping(&second_resolved);
+		assert_eq!(first["B"], second["B"]);
+		assert_eq!(first["C"], second["C"]);
+		assert_eq!(next_identity.len(), 4);
+	}
+
 	#[test]
 	fn product_0100_radial_dial_binds_both_arities_and_allocates_complete_categories() {
 		let grouped = stamped(
@@ -4401,7 +4582,15 @@ mod tests {
 			.collect::<Vec<_>>();
 		assert_eq!(
 			tokens,
-			["scatter", "bar", "line", "area", "funnel", "radial_dial"]
+			[
+				"scatter",
+				"bar",
+				"line",
+				"area",
+				"funnel",
+				"radial_dial",
+				"pie"
+			]
 		);
 		assert_eq!(
 			tokens.iter().copied().collect::<HashSet<_>>().len(),
@@ -4415,6 +4604,7 @@ mod tests {
 			(PlotType::StackedArea, "area"),
 			(PlotType::Funnel, "funnel"),
 			(PlotType::RadialDial, "radial_dial"),
+			(PlotType::Pie, "pie"),
 		] {
 			let actual = ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 				ordinal: 7,
@@ -4473,7 +4663,7 @@ mod tests {
 		let unregistered = std::panic::catch_unwind(|| {
 			ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 				ordinal: 0,
-				plot_type: PlotType::Pie,
+				plot_type: PlotType::Radar,
 			})
 		})
 		.expect_err("unregistered authored family must expose the missing conversion");

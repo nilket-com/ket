@@ -1,0 +1,26 @@
+let raw = workspace.table("pie_probe");
+let aggregated = raw
+	.aggregate([col("category")], [sum(col("value"))])
+	.project_named([
+		col("category").named("category"),
+		col("sum").named("value"),
+	])
+	.sort([col("value").desc()]);
+
+aggregated.views([
+	view("pie-aggregated", figure([
+		title("Pie · explicit relation aggregation"),
+		subtitle("Clockwise order follows the authored descending-value sort"),
+		skin("nord"),
+		pie("category", "value"),
+	])),
+]);
+
+raw.views([
+	view("pie-raw-refusal", figure([
+		title("Pie · duplicate-category refusal"),
+		subtitle("The category argument directs the author to .aggregate(...)"),
+		skin("nord"),
+		pie("category", "value"),
+	])),
+]);

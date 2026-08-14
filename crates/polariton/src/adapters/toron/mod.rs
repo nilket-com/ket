@@ -307,6 +307,37 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[ignore = "requires the PRODUCT-0103 pie_probe relation on a live local Toron"]
+	async fn live_product_0103_aggregate_and_raw_handles_remain_distinct() {
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+		let source = include_str!("../../../../../uat/test32.rn");
+		let view = transform_rune_view(source).expect("PRODUCT-0103 live exhibit envelope");
+		let relations = view.into_relations().collect::<Vec<_>>();
+		assert_eq!(relations.len(), 2);
+
+		for relation in relations {
+			let artifact = adapter
+				.dispatch_rune(&relation.source)
+				.await
+				.unwrap_or_else(|error| {
+					panic!(
+						"PRODUCT-0103 relation failed for origin {}: {error:?}\n{}",
+						relation.origin, relation.source
+					)
+				});
+			let frame = artifact.projection().expect("Toron projection");
+			if relation.origin.contains(".aggregate(") {
+				assert_eq!(frame.height(), 3, "aggregated pie relation");
+			} else {
+				assert_eq!(frame.height(), 6, "raw pie relation");
+			}
+		}
+	}
+
+	#[tokio::test]
 	#[ignore = "requires the dogfood test1 relation on a live local Toron"]
 	async fn live_product_0012_line_view_reaches_the_existing_kernel() {
 		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;

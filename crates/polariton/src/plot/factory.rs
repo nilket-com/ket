@@ -113,6 +113,9 @@ pub fn create_plot(
 				.expect("PRODUCT-0102 planning validated this pie slice collection");
 			Arc::new(PiePlotKernel {
 				prepared_data: Arc::new(prepared),
+				category_colors: spec
+					.channel(Channel::X)
+					.map(|channel| channel.colors.clone()),
 			})
 		}
 		ResolvedKernelFields::Bubble {

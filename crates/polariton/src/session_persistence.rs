@@ -1068,6 +1068,58 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0103_pie_family_round_trips_only_under_the_extensible_policy() {
+		let document = DocumentId::new(103).unwrap();
+		let buffer = BufferId::new(103);
+		let view = LocalViewIdentity::Named("pie".into());
+		let identity = colour_identity(PlotType::Pie, false);
+		let mut meanings = empty_meanings();
+		meanings
+			.colours
+			.insert((document, view.clone(), 4), identity.clone());
+		let bytes = meanings.encode().unwrap();
+		let text = String::from_utf8(bytes.clone()).unwrap();
+		assert!(text.contains("\"family\":\"pie\""), "{text}");
+		for schema in [INITIAL_CLOSED_SCHEMA, AREA_CLOSED_SCHEMA] {
+			let error = DurableMeanings::decode(schema, &bytes).unwrap_err();
+			assert!(
+				error
+					.to_string()
+					.contains("authored family pie is unsupported by this schema's family policy"),
+				"{error}"
+			);
+		}
+		assert_eq!(
+			DurableMeanings::decode(SCHEMA_VERSION, &bytes).unwrap(),
+			meanings
+		);
+
+		let census = SharedIdentityCensus {
+			documents: [document].into_iter().collect(),
+			host_panels: BTreeSet::new(),
+			host_panel_groups: BTreeSet::new(),
+		};
+		let runtime = meanings
+			.join_runtime(&[(document, buffer)].into_iter().collect(), &census)
+			.unwrap();
+		assert_eq!(
+			runtime.colours.as_map().get(&(buffer, view.clone(), 4)),
+			Some(&identity)
+		);
+		let recaptured = capture_runtime(
+			&HashMap::new(),
+			&HashMap::new(),
+			&runtime.colours,
+			&[(buffer, document)].into_iter().collect(),
+			&census,
+			DYNAMIC_PANEL_FLOOR,
+			GROUP_FLOOR,
+		)
+		.unwrap();
+		assert_eq!(recaptured, meanings);
+	}
+
+	#[test]
 	fn product_0086_family_admission_policies_and_token_validation_are_exact() {
 		let document = DocumentId::new(86).unwrap();
 		let mut meanings = empty_meanings();

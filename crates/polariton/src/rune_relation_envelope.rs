@@ -15,7 +15,7 @@ use crate::plot::core::PlotType;
 use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
 use crate::plot::spec::{
 	BoxPlotFields, BubbleFields, BubblePreparationChannel, HeatmapFields, LayerMark, LayerSettings,
-	LayerSpec, LayeredPlotSpec, MarkFields, Override, Presence,
+	LayerSpec, LayeredPlotSpec, MarkFields, Override, PieFields, Presence,
 };
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
@@ -151,7 +151,8 @@ impl StyledRunePlotSink {
 			| PlotType::Heatmap
 			| PlotType::Bubble
 			| PlotType::Funnel
-			| PlotType::RadialDial => {
+			| PlotType::RadialDial
+			| PlotType::Pie => {
 				return Err(self);
 			}
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
@@ -241,6 +242,7 @@ impl RuneViewIntent {
 						PlotType::Bubble => "plot.bubble".to_owned(),
 						PlotType::Funnel => "plot.funnel".to_owned(),
 						PlotType::RadialDial => "plot.radial_dial".to_owned(),
+						PlotType::Pie => "plot.pie".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -255,6 +257,7 @@ impl RuneViewIntent {
 							PlotType::BoxPlot => "plot.box".to_owned(),
 							PlotType::Heatmap => "plot.heatmap".to_owned(),
 							PlotType::Bubble => "plot.bubble".to_owned(),
+							PlotType::Pie => "plot.pie".to_owned(),
 							other => {
 								unreachable!("styled sink admitted unexpected plot type {other:?}")
 							}
@@ -357,6 +360,12 @@ pub(crate) struct RadialDialFieldOrigins {
 	pub(crate) label: Option<Range<u32>>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PieFieldOrigins {
+	pub(crate) category: Range<u32>,
+	pub(crate) value: Range<u32>,
+}
+
 impl HeatmapFieldOrigins {
 	pub(crate) fn keys(&self) -> Range<u32> {
 		self.x.start.min(self.y.start)..self.x.end.max(self.y.end)
@@ -438,6 +447,10 @@ pub(crate) enum SpannedMarkFields {
 		fields: crate::plot::spec::RadialDialFields,
 		origins: RadialDialFieldOrigins,
 	},
+	Pie {
+		fields: PieFields,
+		origins: PieFieldOrigins,
+	},
 }
 
 impl SpannedMarkFields {
@@ -448,6 +461,7 @@ impl SpannedMarkFields {
 			Self::Bubble { fields, .. } => MarkFields::Bubble(fields.clone()),
 			Self::Funnel { fields, .. } => MarkFields::Funnel(fields.clone()),
 			Self::RadialDial { fields, .. } => MarkFields::RadialDial(fields.clone()),
+			Self::Pie { fields, .. } => MarkFields::Pie(fields.clone()),
 		}
 	}
 
@@ -491,6 +505,13 @@ impl SpannedMarkFields {
 		}
 	}
 
+	pub(crate) fn pie(&self) -> Option<(&PieFields, &PieFieldOrigins)> {
+		match self {
+			Self::Pie { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
 	fn semantic_eq(&self, other: &Self) -> bool {
 		match (self, other) {
 			(Self::BoxPlot { fields: left, .. }, Self::BoxPlot { fields: right, .. }) => {
@@ -508,6 +529,7 @@ impl SpannedMarkFields {
 			(Self::RadialDial { fields: left, .. }, Self::RadialDial { fields: right, .. }) => {
 				left == right
 			}
+			(Self::Pie { fields: left, .. }, Self::Pie { fields: right, .. }) => left == right,
 			_ => false,
 		}
 	}

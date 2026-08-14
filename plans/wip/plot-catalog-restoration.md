@@ -270,7 +270,13 @@ band-fill path.
     a *correct* answer to one of five defensible questions — plus eleven silent
     dispositions, four disagreeing truths, four measured hover red states, and a
     doubled paint origin.
-18. **Pie surface — ADR 0103, drafted.** PRODUCT-0086's third categorical consumer: persistence is one token and one arm as claimed, but colour costs **two** `authored_categories` enumerations. Grouped-only authoring; owes 0102's `.aggregate(...)` exhibit.
+18. **Pie surface — LANDED as PRODUCT-0103.** PRODUCT-0086's third categorical
+    consumer: persistence is one token and one arm as claimed, but colour costs
+    **two** `authored_categories` enumerations. Grouped-only authoring; pays
+    0102's `.aggregate(...)` exhibit. That exhibit found a relation-compiler
+    defect: sibling raw and derived executions retained each other's definitions
+    and replayed a linear relation initializer, so both panels failed until each
+    execution retained only its own dependency branch.
 19. **Radar + parallel together** over one dimension-list substrate. They are the
     only two needing D, and solving it twice would produce two vocabularies.
 20. **Violin last**, with the KDE moved out of the renderer. By the box-plot
@@ -319,6 +325,12 @@ graph, rather than rediscovered at each mark.
   nulls as real values. Expect each remaining step's signature changes to find
   work that has nothing to do with that step's subject — and budget for it rather
   than folding it into the record that found it.
+- **A cross-seam exhibit must execute the compiled composition, not prove its
+  halves separately.** PRODUCT-0103 had a Toron gate proving `.aggregate(...)`
+  and a compiler gate proving two executions existed; both passed while the
+  compiler emitted the aggregate twice in one branch and leaked it into the raw
+  branch. Only the live two-panel exhibit exercised the composition and exposed
+  the linear-handle replay.
 - **A substrate defect shipped as a spelling is two records, not one.**
   Histogram and box plot each needed a substrate cut first; pie, violin, radial
   dial, and heatmap are the same shape.

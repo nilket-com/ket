@@ -1175,8 +1175,7 @@ async fn rune_project_named_sql_multi_hop_continuation_binds_and_executes() {
 
 #[tokio::test]
 async fn product_0102_rune_aggregate_produces_the_preaggregated_pie_shape() {
-	let logical = rune_plan(
-		r#"
+	let source = r#"
         pub fn main(ctx) {
             ctx.table("pie_input")
                .aggregate([col("category")], [sum(col("value"))])
@@ -1184,19 +1183,30 @@ async fn product_0102_rune_aggregate_produces_the_preaggregated_pie_shape() {
                    col("category").named("category"),
                    col("sum").named("value"),
                ])
-               .sort([col("category").asc()])
+               .sort([col("category").DIRECTION()])
         }
-    "#,
-	)
-	.await
-	.expect("PRODUCT-0102 aggregate expression is registered in production Rune");
+	"#;
+	let ascending_source = source.replace("DIRECTION", "asc");
+	let descending_source = source.replace("DIRECTION", "desc");
+	let ascending = rune_plan(&ascending_source)
+		.await
+		.expect("PRODUCT-0102 aggregate expression is registered in production Rune");
+	let descending = rune_plan(&descending_source)
+		.await
+		.expect("PRODUCT-0103 opposite sort is registered in production Rune");
 
-	let batches = run_pie_logical(&logical).await;
+	let batches = run_pie_logical(&ascending).await;
 	assert_eq!(
 		string_column_rows(&batches, 0),
 		vec![Some("A".to_owned()), Some("B".to_owned())]
 	);
-	assert_eq!(int64_column_rows(&batches, 1), vec![Some(5), Some(5)]);
+	assert_eq!(int64_column_rows(&batches, 1), vec![Some(5), Some(4)]);
+	let batches = run_pie_logical(&descending).await;
+	assert_eq!(
+		string_column_rows(&batches, 0),
+		vec![Some("B".to_owned()), Some("A".to_owned())]
+	);
+	assert_eq!(int64_column_rows(&batches, 1), vec![Some(4), Some(5)]);
 }
 
 #[tokio::test]
@@ -3545,7 +3555,7 @@ fn pie_input_batch(schema: SchemaRef) -> RecordBatch {
 		vec![
 			Arc::new(Int64Array::from(vec![1, 2, 3])),
 			Arc::new(StringArray::from(vec!["A", "A", "B"])),
-			Arc::new(Int64Array::from(vec![2, 3, 5])),
+			Arc::new(Int64Array::from(vec![2, 3, 4])),
 		],
 	)
 	.expect("pie input batch")

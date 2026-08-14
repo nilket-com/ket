@@ -4,15 +4,19 @@ use crate::plot::common::{
 };
 use crate::plot::exact_numeric::{ExactF64Error, exact_f64};
 use crate::plot::kernels::pie_slices::{PieSliceRow, PieSlices, PieSlicesError, PieValueCell};
+use crate::plot::spec::CategoryColorAssignment;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
-use iced::{Point, Rectangle, Size};
+use iced::{Color, Point, Rectangle, Size};
 use polars::prelude::*;
 use std::fmt;
 use std::sync::Arc;
 
 pub struct PiePlotKernel {
 	pub prepared_data: Arc<PiePreparedData>,
+	/// Authored grouped pies carry one resolved assignment per category. `None`
+	/// is the legacy/automatic positional compatibility path.
+	pub category_colors: Option<Vec<CategoryColorAssignment>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -67,6 +71,34 @@ impl PiePlotKernel {
 			.map(str::to_owned)
 			.unwrap_or_else(|| format!("Row {}", index + 1))
 	}
+
+	fn slice_color(&self, index: usize, settings: &ResolvedPlotSettings) -> Color {
+		if let Some(assignments) = &self.category_colors {
+			let category = self
+				.prepared_data
+				.slices
+				.get(index)
+				.and_then(|slice| slice.category())
+				.expect("PRODUCT-0103 authored pie assignments have named categories");
+			let assignment = assignments
+				.iter()
+				.find(|assignment| assignment.category == category)
+				.expect("PRODUCT-0103 authored pie categories have complete colour assignments");
+			return Color::from_rgba8(
+				assignment.color.red,
+				assignment.color.green,
+				assignment.color.blue,
+				assignment.color.alpha as f32 / u8::MAX as f32,
+			);
+		}
+		let total = self.prepared_data.slices.iter().len();
+		let position = if total > 1 {
+			index as f32 / (total - 1) as f32
+		} else {
+			0.5
+		};
+		settings.color_theme.get_color(position)
+	}
 }
 
 impl PlotKernel for PiePlotKernel {
@@ -86,19 +118,13 @@ impl PlotKernel for PiePlotKernel {
 			return;
 		}
 		let geometry = PieGeometry::new(bounds.size(), &self.prepared_data.slices);
-		let slice_count = self.prepared_data.slices.iter().len();
 		for (index, _) in self.prepared_data.slices.iter().enumerate() {
 			let start_angle = geometry.boundaries[index] as f32;
 			let end_angle = geometry.boundaries[index + 1] as f32;
 			if start_angle == end_angle {
 				continue;
 			}
-			let position = if slice_count > 1 {
-				index as f32 / (slice_count - 1) as f32
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(position);
+			let color = self.slice_color(index, &settings);
 			let path = &|builder: &mut dyn crate::plot::common::PathBuilder| {
 				builder.move_to(geometry.center);
 				builder.arc_to(geometry.center, geometry.radius, start_angle, end_angle);
@@ -109,7 +135,7 @@ impl PlotKernel for PiePlotKernel {
 			backend.stroke_path(
 				path,
 				Stroke {
-					style: Style::Solid(settings.chrome.canvas_background.iced()),
+					style: Style::Solid(settings.mark_style.separator.iced()),
 					width: 1.0,
 					..Default::default()
 				},
@@ -121,13 +147,25 @@ impl PlotKernel for PiePlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
+		let provenance = if self
+			.prepared_data
+			.slices
+			.get(0)
+			.and_then(|slice| slice.category())
+			.is_some()
+		{
+			crate::plot::legend::LegendProvenance::Named
+		} else {
+			crate::plot::legend::LegendProvenance::Synthetic
+		};
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data
 				.slices
 				.iter()
 				.enumerate()
-				.map(|(index, _)| self.display_label(index)),
-			settings,
+				.map(|(index, _)| (self.display_label(index), self.slice_color(index, settings))),
+			crate::plot::legend::LegendSample::Swatch,
+			provenance,
 		)
 	}
 
@@ -405,6 +443,7 @@ mod tests {
 			prepared_data: Arc::new(
 				prepare_pie_data(data, category, "value").expect("valid pie data"),
 			),
+			category_colors: None,
 		}
 	}
 
@@ -428,6 +467,129 @@ mod tests {
 		let layout = kernel.layout(settings);
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		kernel.hover(&transform, Cursor::Available(point))
+	}
+
+	#[test]
+	fn product_0103_authored_category_colour_is_one_paint_and_legend_authority() {
+		let mut kernel = kernel(&frame(&["A", "B"], &[2.0, 1.0]), Some("category"));
+		kernel.category_colors = Some(vec![
+			CategoryColorAssignment {
+				category: "A".to_owned(),
+				position: crate::plot::spec::PalettePosition::new(0, 2).unwrap(),
+				color: crate::plot::spec::ResolvedColor {
+					red: 1,
+					green: 2,
+					blue: 3,
+					alpha: 255,
+				},
+			},
+			CategoryColorAssignment {
+				category: "B".to_owned(),
+				position: crate::plot::spec::PalettePosition::new(1, 2).unwrap(),
+				color: crate::plot::spec::ResolvedColor {
+					red: 9,
+					green: 8,
+					blue: 7,
+					alpha: 255,
+				},
+			},
+		]);
+		let backend = render(
+			&kernel,
+			Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0)),
+		);
+		let legend = kernel
+			.legend_content(&ResolvedPlotSettings::default())
+			.expect("authored pie legend");
+		let crate::plot::legend::LegendSection::Entries(entries) =
+			legend.sections().next().unwrap()
+		else {
+			panic!("pie entries")
+		};
+		assert_eq!(
+			backend.colors,
+			entries.iter().map(|entry| entry.swatch).collect::<Vec<_>>()
+		);
+		assert!(
+			entries
+				.iter()
+				.all(|entry| { entry.provenance == crate::plot::legend::LegendProvenance::Named })
+		);
+	}
+
+	#[test]
+	fn product_0103_synthetic_rows_are_emitted_then_shared_policy_decides_omission() {
+		let one = kernel(&frame(&["ignored"], &[1.0]), None);
+		let content = one
+			.legend_content(&ResolvedPlotSettings::default())
+			.expect("kernel emits lone synthetic entry");
+		let crate::plot::legend::LegendSection::Entries(entries) =
+			content.sections().next().unwrap()
+		else {
+			panic!("pie entries")
+		};
+		assert_eq!(entries.first().label, "Row 1");
+		assert_eq!(
+			entries.first().provenance,
+			crate::plot::legend::LegendProvenance::Synthetic
+		);
+		assert!(crate::plot::legend::apply_policy(content).is_none());
+
+		let two = kernel(&frame(&["ignored", "ignored"], &[2.0, 1.0]), None);
+		let content = two
+			.legend_content(&ResolvedPlotSettings::default())
+			.expect("kernel emits two synthetic entries");
+		let crate::plot::legend::LegendSection::Entries(entries) =
+			content.sections().next().unwrap()
+		else {
+			panic!("pie entries")
+		};
+		assert_eq!(entries.iter().count(), 2);
+		assert!(
+			entries.iter().all(|entry| {
+				entry.provenance == crate::plot::legend::LegendProvenance::Synthetic
+			})
+		);
+		assert!(crate::plot::legend::apply_policy(content).is_some());
+	}
+
+	#[test]
+	fn product_0103_opposite_relation_sorts_reverse_the_rendered_slice_order() {
+		let assignments = [
+			("A", [10, 11, 12]),
+			("B", [20, 21, 22]),
+			("C", [30, 31, 32]),
+		]
+		.into_iter()
+		.enumerate()
+		.map(
+			|(index, (category, [red, green, blue]))| CategoryColorAssignment {
+				category: category.to_owned(),
+				position: crate::plot::spec::PalettePosition::new(index, 3).unwrap(),
+				color: crate::plot::spec::ResolvedColor {
+					red,
+					green,
+					blue,
+					alpha: 255,
+				},
+			},
+		)
+		.collect::<Vec<_>>();
+		let rendered = |categories: &[&str], values: &[f64]| {
+			let mut kernel = kernel(&frame(categories, values), Some("category"));
+			kernel.category_colors = Some(assignments.clone());
+			render(
+				&kernel,
+				Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0)),
+			)
+			.colors
+		};
+		let ascending = rendered(&["A", "B", "C"], &[1.0, 2.0, 3.0]);
+		let descending = rendered(&["C", "B", "A"], &[3.0, 2.0, 1.0]);
+		assert_eq!(
+			ascending.iter().copied().rev().collect::<Vec<_>>(),
+			descending
+		);
 	}
 
 	#[test]
@@ -633,6 +795,7 @@ mod tests {
 		assert!(prepared.slices.is_empty());
 		let kernel = PiePlotKernel {
 			prepared_data: Arc::new(prepared),
+			category_colors: None,
 		};
 		assert!(
 			render(

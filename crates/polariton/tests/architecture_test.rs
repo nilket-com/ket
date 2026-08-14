@@ -188,7 +188,15 @@ fn product_0086_live_family_catalog_is_source_complete_and_renderer_free() {
 		.collect::<Vec<_>>();
 	assert_eq!(
 		constants,
-		["SCATTER", "BAR", "LINE", "AREA", "FUNNEL", "RADIAL_DIAL"]
+		[
+			"SCATTER",
+			"BAR",
+			"LINE",
+			"AREA",
+			"FUNNEL",
+			"RADIAL_DIAL",
+			"PIE"
+		]
 	);
 	let all = family_impl
 		.split("pub(crate) const ALL:")
@@ -3716,4 +3724,71 @@ fn product_0102_pie_has_one_validated_slice_and_geometry_authority() {
 	assert!(request.contains("prepare_pie_data(data, category.as_deref(), value)"));
 	assert!(factory.contains("PRODUCT-0102 planning validated this pie slice collection"));
 	assert_eq!(factory.matches("prepare_pie_data(").count(), 1);
+}
+
+#[test]
+fn product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read factory");
+	let pie = std::fs::read_to_string(root.join("plot/kernels/pie.rs")).expect("read pie kernel");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let envelope =
+		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
+	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read host");
+
+	assert!(spec.contains("pub struct PieFields"));
+	assert!(spec.contains("MarkFields::Pie"));
+	assert!(spec.contains("Self::Pie(fields) => ["));
+	assert!(spec.contains("fn resolve_pie_channels("));
+	assert!(spec.contains("FieldAttribution::Role(\"category\")"));
+	assert!(spec.contains("FieldAttribution::Role(\"value\")"));
+	assert!(spec.contains("pub(crate) const PIE: Self"));
+	assert_eq!(
+		spec.matches("PlotType::Pie => AuthoredFamilyId::PIE")
+			.count(),
+		1,
+		"PRODUCT-0086 persistence costs exactly one conversion arm"
+	);
+	assert_eq!(
+		spec.matches("PlotType::Funnel | PlotType::RadialDial | PlotType::Pie")
+			.count(),
+		2,
+		"both authored category-domain enumerations must move together"
+	);
+
+	let projection = request
+		.split("fn project_named_channels(")
+		.nth(1)
+		.expect("named projection")
+		.split("#[cfg(test)]")
+		.next()
+		.expect("bounded projection");
+	assert!(projection.contains("for field in mark_fields.all()"));
+	assert!(!projection.contains("MarkFields::Pie"));
+	assert!(!projection.contains("pie_fields"));
+
+	let production = pie
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production pie kernel");
+	assert!(production.contains("fn slice_color("));
+	assert_eq!(production.matches("self.slice_color(").count(), 2);
+	assert!(production.contains("self.category_colors"));
+	assert!(production.contains("settings.mark_style.separator.iced()"));
+	assert!(!production.contains("settings.chrome.canvas_background.iced()"));
+	assert!(production.contains("LegendProvenance::Synthetic"));
+	assert!(!production.contains("apply_policy("));
+	assert!(factory.contains("category_colors: spec"));
+
+	assert!(presentation.contains("(\"__pie\", raw_pie as RawFunction)"));
+	assert_eq!(presentation.matches("SpannedMarkFields::Pie").count(), 1);
+	assert!(compiler.contains("\"pie\" => Some(&[2])"));
+	assert!(envelope.contains("Self::Pie { fields, origins }"));
+	assert!(host.contains("fn pie_failure_span("));
+	assert!(host.contains("pie_output_span"));
 }
