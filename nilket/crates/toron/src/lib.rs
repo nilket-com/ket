@@ -14,9 +14,11 @@ pub mod exec;
 pub mod ir;
 pub mod network;
 pub mod pbc;
+pub mod phase_ledger;
 pub mod planner;
 pub mod quic;
 pub mod rune_engine;
+pub mod scan_metering;
 pub mod server;
 pub mod sql_planner;
 pub mod sql_wire;
@@ -6125,6 +6127,7 @@ mod tests {
 				batch.schema(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::BaseRelation,
 				vec![batch],
 			))
 		}

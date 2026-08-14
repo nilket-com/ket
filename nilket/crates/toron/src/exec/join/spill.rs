@@ -5725,7 +5725,7 @@ mod tests {
 			None,
 			false,
 			test_task_budget_with_memory(80_000),
-			None,
+			JoinTiming::disabled(None),
 			Arc::new(BlockingFileOps),
 			spill_dir.clone(),
 		)

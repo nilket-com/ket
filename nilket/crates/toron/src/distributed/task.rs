@@ -9,6 +9,7 @@ use crate::distributed::identity::{
 };
 use crate::distributed::worker_registry::WorkerEndpoint;
 use crate::ir::{BoundExprProgram, ExecutionPlan, JoinReplayId, JoinStrategy, TableId};
+use crate::phase_ledger::LedgerFaults;
 use crate::server::spill::SpillId;
 use wendelon::schema::{
 	PhysicalDescriptorFingerprint, RuntimeFilterDescriptor, RuntimeFilterKeyType, RuntimeFilterKind,
@@ -82,6 +83,11 @@ pub struct TaskTelemetry {
 	pub labels: TaskTelemetryLabels,
 	pub counters: TaskTelemetryCounters,
 	pub phases: TaskTelemetryPhases,
+	/// Whether ADR 551's exclusive phase ledger produced an authoritative
+	/// partition for this task. A withheld receipt carries its typed cause; its
+	/// zero phase counters must never be interpreted as observed absence.
+	#[serde(default)]
+	pub phase_receipt: TaskPhaseReceipt,
 	pub join_observations: Vec<JoinRuntimeObservation>,
 	#[serde(default)]
 	pub join_build_profiles: Vec<JoinBuildProfile>,
@@ -109,6 +115,19 @@ pub struct TaskTelemetry {
 	/// exist so a divergence can be localized to a seam instead of inferred from a plan.
 	#[serde(default)]
 	pub shuffle_routing_observations: Vec<ShuffleRoutingObservation>,
+}
+
+/// Publication state for ADR 551's task-local phase partition.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhaseReceipt {
+	/// No phase ledger was enabled. This is not a zero-valued receipt.
+	#[default]
+	NotCollected,
+	/// The ledger identity and acquisition reconciliation both held.
+	Sealed,
+	/// Instrumentation ran, but a named fault vetoed numeric attribution.
+	Withheld(LedgerFaults),
 }
 
 /// A runtime filter's probe target, proven at fragmentation rather than reconstructed.

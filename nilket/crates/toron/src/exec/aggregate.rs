@@ -765,9 +765,7 @@ impl Executor {
 			.bound_scan_request(streaming_input.scan, morsel)
 			.expect("streaming scan global aggregate input should build a ScanRequest");
 		let row_limit = req.row_limit;
-		let span = crate::telemetry::storage_scan_span(&req);
-		let stream = self.storage.scan(req).instrument(span).await?;
-		let mut stream = stream.into_batches();
+		let mut stream = self.open_scan(req).await?;
 		let mut rows = 0usize;
 		let mut state = init_global_aggregate_state_for_executor(&self.context, aggr_expr)?;
 
@@ -898,9 +896,7 @@ impl Executor {
 			.bound_scan_request(streaming_input.scan_input.scan, morsel)
 			.expect("streaming scan grouped aggregate input should build a ScanRequest");
 		let row_limit = req.row_limit;
-		let span = crate::telemetry::storage_scan_span(&req);
-		let stream = self.storage.scan(req).instrument(span).await?;
-		let mut stream = stream.into_batches();
+		let mut stream = self.open_scan(req).await?;
 		let mut rows = 0usize;
 		let mut groups = BoundGroupedAggregateGroups::new();
 		// ADR 508 step 2: the sampled component estimator that splits the exact `row_lookup_update`
@@ -1095,9 +1091,7 @@ impl Executor {
 				message: "primitive Int64 grouped SUM lost its scan request".to_string(),
 			})?;
 		let row_limit = req.row_limit;
-		let span = crate::telemetry::storage_scan_span(&req);
-		let stream = self.storage.scan(req).instrument(span).await?;
-		let mut stream = stream.into_batches();
+		let mut stream = self.open_scan(req).await?;
 		let cap = super::join::join_spill_retained_footprint_memory_cap(
 			self.context.task_budget.memory.get(),
 		);
@@ -1187,9 +1181,7 @@ impl Executor {
 				message: "primitive Int64 grouped COUNT lost its scan request".to_string(),
 			})?;
 		let row_limit = req.row_limit;
-		let span = crate::telemetry::storage_scan_span(&req);
-		let stream = self.storage.scan(req).instrument(span).await?;
-		let mut stream = stream.into_batches();
+		let mut stream = self.open_scan(req).await?;
 		let cap = self.context.task_budget.memory.get();
 		let started = Instant::now();
 		let mut rows = 0usize;
@@ -1595,6 +1587,24 @@ fn record_primitive_int64_sum_profile(
 	if std::fs::write(&temporary, contents).is_ok() {
 		let _ = std::fs::rename(temporary, path);
 	}
+}
+
+/// Whether this plan fuses its base-relation read into a global aggregate.
+///
+/// ADR 551: the route a control asserts on directly, rather than inferring it
+/// from SQL text or output shape.
+#[cfg(test)]
+pub(in crate::exec) fn fuses_scan_into_global_aggregate(plan: &ExecutionPlan) -> bool {
+	// The decomposer answers a question about an aggregate's *input* — a bare
+	// `Scan` is a fusable input, not a fused plan — so the aggregate itself has to
+	// be matched first.
+	let ExecutionPlan::Aggregate {
+		input, group_expr, ..
+	} = plan
+	else {
+		return false;
+	};
+	group_expr.root_count() == 0 && decompose_scan_global_aggregate_input(input.as_ref()).is_some()
 }
 
 fn decompose_scan_global_aggregate_input(

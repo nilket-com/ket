@@ -390,6 +390,7 @@ impl StorageScan for MultiTableScan {
 			batch.schema(),
 			request.session_id,
 			request.query_id,
+			toron::storage::ScanOrigin::BaseRelation,
 			vec![batch],
 		))
 	}

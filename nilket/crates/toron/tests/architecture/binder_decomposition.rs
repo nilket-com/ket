@@ -374,6 +374,15 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/error/distributed.rs",
 				"crates/toron/src/wire.rs",
 				"crates/toron-tpch/src/lib.rs",
+				// ADR 551 meters scan-stream consumption so base-relation time is
+				// attributed the same whether a read is bare or fused; it owns no
+				// binder surface.
+				"crates/toron/src/scan_metering.rs",
+				"crates/toron/src/exec/scan_open.rs",
+				"crates/toron/src/exec/phase_receipt.rs",
+				"crates/toron/src/exec/join/spilled_hash.rs",
+				"crates/toron/src/exec/join/streamed_spill.rs",
+				"crates/toron/src/phase_ledger.rs",
 				// ADR 521: proof-gated outer-count structural and equivalence battery.
 				"crates/toron/tests/outer_count_preaggregation_test.rs",
 				// Plan filenames are zero-padded to four digits; this README documents a

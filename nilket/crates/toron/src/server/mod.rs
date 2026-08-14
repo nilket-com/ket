@@ -348,6 +348,7 @@ impl ToronWorker {
 							base,
 							partition_store: self.partition_store.clone(),
 							live_overrides: live_scan_overrides(spec),
+							scan_meter: task_context.scan_meter.clone(),
 						});
 						let executor = Executor::with_context(storage, task_context);
 						drive_streamable_plan(&spec.plan, &executor, morsel, sink).await?;
@@ -400,6 +401,7 @@ impl ToronWorker {
 							base,
 							partition_store: self.partition_store.clone(),
 							live_overrides: live_scan_overrides(spec),
+							scan_meter: task_context.scan_meter.clone(),
 						});
 						let executor = Executor::with_context(storage, task_context);
 						(executor.execute_bound(&spec.plan, morsel).await?, None)
@@ -693,6 +695,7 @@ impl ToronWorker {
 			base: self.storage.clone(),
 			partition_store: self.partition_store.clone(),
 			live_overrides: live_scan_overrides(spec),
+			scan_meter: task_context.scan_meter.clone(),
 		});
 		let executor = Executor::with_context(storage, task_context);
 		let mut results = Vec::new();
@@ -2916,6 +2919,7 @@ mod tests {
 				self.schema.clone(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::BaseRelation,
 				stream,
 			))
 		}
@@ -2946,6 +2950,7 @@ mod tests {
 				self.schema.clone(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::BaseRelation,
 				stream,
 			))
 		}
@@ -3189,6 +3194,7 @@ mod tests {
 				self.schema.clone(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::BaseRelation,
 				stream,
 			))
 		}
@@ -4364,8 +4370,8 @@ fn drive_streamable_plan<'a>(
 					downstream_cancellation: context.downstream_cancellation.clone(),
 					deadline: context.deadline,
 				};
-				let stream = executor.storage_arc().scan(req).await?;
-				let mut stream = stream.into_batches();
+				let stream = executor.open_scan(req).await?;
+				let mut stream = stream;
 				let mut rows = 0usize;
 				while let Some(batch) = stream.next().await {
 					let mut batch = batch?;
@@ -4504,6 +4510,10 @@ struct TaskInputStorageScan {
 }
 
 struct LiveInputStorageScan {
+	/// ADR 551: splits a live poll into pull/wait (`shuffle`) and decode
+	/// (`transport`). Once the poll returns, the two are one interval that
+	/// belongs to neither component.
+	scan_meter: crate::scan_metering::ScanMeter,
 	base: Arc<dyn StorageScan>,
 	partition_store: Arc<dyn PartitionStore>,
 	live_overrides: HashMap<TableId, LiveScanOverride>,
@@ -4517,6 +4527,7 @@ impl StorageScan for TaskInputStorageScan {
 				override_entry.schema.clone(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::MaterializedExchangeInput,
 				override_entry.batches.clone(),
 			));
 		}
@@ -4525,6 +4536,7 @@ impl StorageScan for TaskInputStorageScan {
 				override_entry.schema.clone(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::MaterializedExchangeInput,
 				override_entry.batches.clone(),
 			));
 		}
@@ -4549,6 +4561,7 @@ impl StorageScan for LiveInputStorageScan {
 					next_partition: 0,
 					current: None,
 					pending: VecDeque::new(),
+					meter: self.scan_meter.clone(),
 				},
 				|mut state| async move {
 					loop {
@@ -4558,10 +4571,13 @@ impl StorageScan for LiveInputStorageScan {
 						if state.current.is_none() {
 							let partition = state.partitions.get(state.next_partition)?.clone();
 							state.next_partition += 1;
-							match state
+							// Acquiring the producer stream is waiting on the exchange.
+							let opened = state.meter.interval_opened();
+							let pulled = state
 								.partition_store
-								.pull_live(partition.address, partition.address.attempt_id)
-							{
+								.pull_live(partition.address, partition.address.attempt_id);
+							state.meter.close_live_pull_wait(opened);
+							match pulled {
 								Ok(stream) => state.current = Some(stream),
 								Err(reason) => {
 									return Some((
@@ -4572,16 +4588,27 @@ impl StorageScan for LiveInputStorageScan {
 							}
 						}
 						let current = state.current.as_mut().expect("current live stream");
-						match current.next().await {
-							Some(Ok(payload)) => match decode_record_batches(&payload.bytes) {
-								Ok(batches) => state.pending.extend(batches),
-								Err(error) => {
-									return Some((
-										Err(storage_error_from_query_error(error.into())),
-										state,
-									));
+						// Waiting for the next payload is `shuffle`; turning its bytes
+						// into batches is `transport`. Timed separately here because
+						// this is the last point at which they are separable.
+						let wait_opened = state.meter.interval_opened();
+						let delivered = current.next().await;
+						state.meter.close_live_pull_wait(wait_opened);
+						match delivered {
+							Some(Ok(payload)) => {
+								let decode_opened = state.meter.interval_opened();
+								let decoded = decode_record_batches(&payload.bytes);
+								state.meter.close_live_decode(decode_opened);
+								match decoded {
+									Ok(batches) => state.pending.extend(batches),
+									Err(error) => {
+										return Some((
+											Err(storage_error_from_query_error(error.into())),
+											state,
+										));
+									}
 								}
-							},
+							}
 							Some(Err(reason)) => {
 								return Some((
 									Err(storage_error_from_partition_missing(reason)),
@@ -4594,7 +4621,13 @@ impl StorageScan for LiveInputStorageScan {
 				},
 			)
 			.boxed();
-			return Ok(ScanStream::new(schema, session_id, query_id, stream));
+			return Ok(ScanStream::new(
+				schema,
+				session_id,
+				query_id,
+				crate::storage::ScanOrigin::LiveExchangeInput,
+				stream,
+			));
 		}
 		self.base.scan(request).await
 	}
@@ -4606,6 +4639,7 @@ struct LiveScanState {
 	next_partition: usize,
 	current: Option<crate::distributed::partition_store::LivePartitionStream>,
 	pending: VecDeque<RecordBatch>,
+	meter: crate::scan_metering::ScanMeter,
 }
 
 fn live_scan_overrides(spec: &TaskSpec) -> HashMap<TableId, LiveScanOverride> {

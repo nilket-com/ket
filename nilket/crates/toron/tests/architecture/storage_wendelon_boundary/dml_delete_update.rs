@@ -1255,7 +1255,7 @@ pub(crate) fn adr036_filter_helper_preserves_execution_plan_filter() {
 			.next()
 			.expect("filter_batches_with_bound_predicate body")
 			.1;
-	let execute_bound = brace_blocks_after_marker(&exec, "pub fn execute_bound")
+	let execute_bound = brace_blocks_after_marker(&exec, "fn execute_bound_node")
 		.into_iter()
 		.next()
 		.expect("execute_bound body")

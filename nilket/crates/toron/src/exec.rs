@@ -20,9 +20,7 @@ use crate::ir::{
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};
-use crate::storage::{
-	HlcBound, ScanRequest, ScanStream, ScanTablePin, StorageScan, TenantId, TraceContext,
-};
+use crate::storage::{HlcBound, ScanRequest, ScanTablePin, StorageScan, TenantId, TraceContext};
 use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
 	DurationNanosecondArray, DurationNanosecondBuilder, Float32Array, Float32Builder, Float64Array,
@@ -57,7 +55,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
-use tracing::Instrument;
 #[cfg(test)]
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
@@ -76,6 +73,8 @@ mod aggregate;
 mod expr;
 mod join;
 mod node_attribution;
+mod phase_receipt;
+mod scan_open;
 
 pub(in crate::exec) use self::aggregate::{
 	AggState, BoundGroupedAggregateGroups, add_avg_value, add_sum_value, avg_state_array,
@@ -87,7 +86,7 @@ pub(in crate::exec) use self::aggregate::{
 pub(in crate::exec) use self::aggregate::{aggregate_state_keyword, aggregate_state_output_name};
 pub(crate) use self::expr::evaluate_cast;
 pub(crate) use self::join::partition_bucket;
-use self::join::{execute_hash_join, partition_bucket_with_scratch};
+use self::join::{JoinTiming, execute_hash_join, partition_bucket_with_scratch};
 
 pub(crate) mod runtime_filter;
 
@@ -107,6 +106,9 @@ pub struct ExecutionContext {
 	pub legacy_table_pins: HashMap<TableId, ScanTablePin>,
 	pub task_budget: TaskBudget,
 	pub task_telemetry: Option<Arc<Mutex<TaskTelemetry>>>,
+	/// ADR 551: where base-relation acquisition is attributed, by stream origin.
+	/// Disabled unless this task collects a receipt.
+	pub scan_meter: crate::scan_metering::ScanMeter,
 	/// ADR 0083/0546: one data-independent seed shared by every fragment of this execution.
 	pub quantile_execution_seed: [u8; 32],
 	/// This terminal task's share of the execution-wide quantile-state allowance.
@@ -170,6 +172,7 @@ impl ExecutionContext {
 			legacy_table_pins: HashMap::new(),
 			task_budget: TaskBudget::from_query_budget(QueryBudget::test_default()),
 			task_telemetry: None,
+			scan_meter: crate::scan_metering::ScanMeter::disabled(),
 			quantile_execution_seed,
 			quantile_state_allowance: self::aggregate::MAX_QUANTILE_STATES_PER_EXECUTION,
 			quantile_states_admitted: Arc::new(AtomicUsize::new(0)),
@@ -196,8 +199,18 @@ impl ExecutionContext {
 		self
 	}
 
+	/// Collect a task receipt — and, with it, meter scan acquisition. ADR 551 ties
+	/// the two together here so there is no way to collect a receipt whose scan
+	/// attribution was never measured.
+	/// Override the scan meter, so a control can inject a clock schedule.
+	pub fn with_scan_meter(mut self, meter: crate::scan_metering::ScanMeter) -> Self {
+		self.scan_meter = meter;
+		self
+	}
+
 	pub fn with_task_telemetry(mut self, telemetry: Arc<Mutex<TaskTelemetry>>) -> Self {
 		self.task_telemetry = Some(telemetry);
+		self.scan_meter = crate::scan_metering::ScanMeter::system();
 		self
 	}
 
@@ -321,54 +334,6 @@ impl Executor {
 			deadline: self.context.deadline,
 		})
 	}
-
-	async fn materialize_scan_stream_with_budget(
-		&self,
-		stream: ScanStream,
-		row_limit: Option<usize>,
-	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		let task_memory_cap = self.context.task_budget.memory.get();
-		let memory_cap = (task_memory_cap >= 64 * 1024 * 1024)
-			.then(|| join::join_output_materialization_memory_cap(task_memory_cap));
-		let schema = stream.schema.clone();
-		let mut stream = stream.into_batches();
-		let mut rows = 0usize;
-		let mut output_bytes = 0u64;
-		let mut batches = Vec::new();
-		while row_limit.map(|limit| rows < limit).unwrap_or(true) {
-			let Some(batch) = stream.next().await else {
-				break;
-			};
-			let batch = batch?;
-			let batch = if let Some(limit) = row_limit {
-				let remaining = limit - rows;
-				if batch.num_rows() > remaining {
-					batch.slice(0, remaining)
-				} else {
-					batch
-				}
-			} else {
-				batch
-			};
-			rows = rows.saturating_add(batch.num_rows());
-			output_bytes = output_bytes.saturating_add(batch.get_array_memory_size() as u64);
-			if let Some(memory_cap) = memory_cap
-				&& output_bytes > memory_cap
-			{
-				return Err(join::budget_exhausted(
-					BudgetDimension::Memory,
-					"scan output accumulator",
-					output_bytes,
-					memory_cap,
-				));
-			}
-			batches.push(batch);
-		}
-		if batches.is_empty() {
-			batches.push(RecordBatch::new_empty(schema));
-		}
-		Ok(batches)
-	}
 	#[cfg(test)]
 	fn legacy_scan_table_pin(&self, table: TableId) -> Result<ScanTablePin, ExecutionError> {
 		self.context
@@ -414,8 +379,7 @@ impl Executor {
 						downstream_cancellation: self.context.downstream_cancellation.clone(),
 						deadline: self.context.deadline,
 					};
-					let span = crate::telemetry::storage_scan_span(&req);
-					let stream = self.storage.scan(req).instrument(span).await?;
+					let stream = self.open_scan(req).await?;
 					Ok(crate::coordinator::materialize_scan_stream(stream).await?)
 				}
 				LogicalPlan::ScanNamed { .. } => Err(ExecutionError::NotImplemented {
@@ -828,6 +792,22 @@ impl Executor {
 		Box<dyn std::future::Future<Output = Result<Vec<RecordBatch>, ExecutionError>> + Send + 'b>,
 	> {
 		Box::pin(async move {
+			let result = self.execute_bound_node(plan, morsel).await;
+			if result.is_ok() {
+				self.publish_task_phase_receipt();
+			}
+			result
+		})
+	}
+
+	fn execute_bound_node<'b>(
+		&'b self,
+		plan: &'b ExecutionPlan,
+		morsel: Option<(MorselId, u32)>,
+	) -> std::pin::Pin<
+		Box<dyn std::future::Future<Output = Result<Vec<RecordBatch>, ExecutionError>> + Send + 'b>,
+	> {
+		Box::pin(async move {
 			// ADR 507: attribute this plan node's exclusive time and spill across the executor tree.
 			// A Drop-guard held for the whole body records on every exit (including an arm's early
 			// `return`), so the node match below is untouched — same shape, same indentation. Zero
@@ -848,21 +828,9 @@ impl Executor {
 						.bound_scan_request(plan, morsel)
 						.expect("ExecutionPlan::Scan should build a ScanRequest");
 					let row_limit = req.row_limit;
-					let span = crate::telemetry::storage_scan_span(&req);
-					// One interval, recorded once after materialization: sequential within
-					// this task, so it partitions the wall, never a sibling phase.
-					let scan_started = Instant::now();
-					let stream = self.storage.scan(req).instrument(span).await?;
-					let batches = self
-						.materialize_scan_stream_with_budget(stream, row_limit)
-						.await;
-					join::record_task_telemetry(&self.context.task_telemetry, |task| {
-						task.phases.scan_micros = task
-							.phases
-							.scan_micros
-							.saturating_add(join::duration_micros(scan_started));
-					});
-					batches
+					let stream = self.open_scan(req).await?;
+					self.materialize_scan_stream_with_budget(stream, row_limit)
+						.await
 				}
 				ExecutionPlan::Filter {
 					input,
@@ -875,7 +843,7 @@ impl Executor {
 					{
 						return Ok(output);
 					}
-					let input_batches = self.execute_bound(input, morsel).await?;
+					let input_batches = self.execute_bound_node(input, morsel).await?;
 					if *disposition == FilterDisposition::FullyPushed {
 						return Ok(input_batches);
 					}
@@ -891,7 +859,7 @@ impl Executor {
 					exprs,
 					output_schema,
 				} => {
-					let input_batches = self.execute_bound(input, morsel).await?;
+					let input_batches = self.execute_bound_node(input, morsel).await?;
 					let mut output = Vec::new();
 					for batch in input_batches {
 						let cols = self.evaluate_bound_program(exprs, &batch)?;
@@ -914,8 +882,8 @@ impl Executor {
 					right,
 					output_schema,
 				} => {
-					let mut output = self.execute_bound(left, morsel).await?;
-					output.extend(self.execute_bound(right, morsel).await?);
+					let mut output = self.execute_bound_node(left, morsel).await?;
+					output.extend(self.execute_bound_node(right, morsel).await?);
 					if output.is_empty() {
 						return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
 					}
@@ -943,7 +911,7 @@ impl Executor {
 					count_column,
 					output_schema,
 				} => {
-					let input_batches = self.execute_bound(input, morsel).await?;
+					let input_batches = self.execute_bound_node(input, morsel).await?;
 					execute_repeat(
 						&input_batches,
 						*count_column,
@@ -964,7 +932,7 @@ impl Executor {
 						{
 							return Ok(output);
 						}
-						let input_batches = self.execute_bound(input, morsel).await?;
+						let input_batches = self.execute_bound_node(input, morsel).await?;
 						self.bound_global_aggregate(&input_batches, aggr_expr, output_schema)
 					} else {
 						if let Some(output) = self
@@ -979,7 +947,7 @@ impl Executor {
 						{
 							return Ok(output);
 						}
-						let input_batches = self.execute_bound(input, morsel).await?;
+						let input_batches = self.execute_bound_node(input, morsel).await?;
 						self.bound_grouped_aggregate(
 							&input_batches,
 							group_expr,
@@ -1026,7 +994,7 @@ impl Executor {
 					functions,
 					output_schema,
 				} => {
-					let input_batches = self.execute_bound(input, morsel).await?;
+					let input_batches = self.execute_bound_node(input, morsel).await?;
 					execute_window(
 						input.schema(),
 						&input_batches,
@@ -1045,7 +1013,7 @@ impl Executor {
 					if *limit == 0 {
 						return Ok(vec![RecordBatch::new_empty(output_schema.clone())]);
 					}
-					let input_batches = self.execute_bound(input, morsel).await?;
+					let input_batches = self.execute_bound_node(input, morsel).await?;
 					Ok(take_batches(input_batches, *limit))
 				}
 				ExecutionPlan::Join {
@@ -1061,8 +1029,8 @@ impl Executor {
 					output_schema,
 					..
 				} => {
-					let left_batches = self.execute_bound(left, morsel).await?;
-					let right_batches = self.execute_bound(right, morsel).await?;
+					let left_batches = self.execute_bound_node(left, morsel).await?;
+					let right_batches = self.execute_bound_node(right, morsel).await?;
 					execute_hash_join(
 						left.schema(),
 						right.schema(),
@@ -1077,7 +1045,7 @@ impl Executor {
 						*strategy,
 						output_schema,
 						self.context.task_budget,
-						self.context.task_telemetry.clone(),
+						JoinTiming::from_context(&self.context),
 						self.context.join_runtime_observation_mode.clone(),
 						self.context.join_spill_file_ops.clone(),
 						self.context.join_spill_dir.clone(),
@@ -1123,7 +1091,7 @@ impl Executor {
 		output_schema: &SchemaRef,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, ExecutionError> {
-		let mut working = self.execute_bound(seed, morsel).await?;
+		let mut working = self.execute_bound_node(seed, morsel).await?;
 		let mut result = working.clone();
 		for _ in 0..RECURSIVE_CTE_MAX_ITERATIONS {
 			if batches_total_rows(&working) == 0 {
@@ -1131,7 +1099,7 @@ impl Executor {
 			}
 			let working_rows = batches_to_scalar_rows(&working, output_schema)?;
 			let injected = substitute_recursive_ref(recursive, &working_rows, output_schema);
-			let next = self.execute_bound(&injected, morsel).await?;
+			let next = self.execute_bound_node(&injected, morsel).await?;
 			if batches_total_rows(&next) == 0 {
 				return Ok(finalize_recursive_result(result, output_schema));
 			}
@@ -1160,7 +1128,7 @@ impl Executor {
 			});
 		}
 
-		let input_batches = self.execute_bound(input, morsel).await?;
+		let input_batches = self.execute_bound_node(input, morsel).await?;
 		let schema = input.schema();
 		let partition_count_usize =
 			usize::try_from(partition_count).expect("partition count fits usize");
@@ -4303,7 +4271,7 @@ mod tests {
 			JoinStrategy::HashPartitioned,
 			&output_schema,
 			low_budget,
-			None,
+			JoinTiming::disabled(None),
 			JoinRuntimeObservationMode::Disabled,
 			context.join_spill_file_ops,
 			context.join_spill_dir,
@@ -4330,7 +4298,7 @@ mod tests {
 			JoinStrategy::HashPartitioned,
 			&output_schema,
 			high_test_budget(),
-			None,
+			JoinTiming::disabled(None),
 			JoinRuntimeObservationMode::Disabled,
 			ExecutionContext::local_test().join_spill_file_ops,
 			ExecutionContext::local_test().join_spill_dir,
@@ -5976,6 +5944,7 @@ mod tests {
 				batch.schema(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::BaseRelation,
 				vec![batch],
 			))
 		}
@@ -5997,6 +5966,7 @@ mod tests {
 				batch.schema(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::BaseRelation,
 				vec![batch],
 			))
 		}
@@ -6022,6 +5992,7 @@ mod tests {
 				schema,
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::BaseRelation,
 				batches,
 			))
 		}

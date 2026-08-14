@@ -1,6 +1,7 @@
 # ADR 551 - Fusion-invariant base-relation attribution
 
-**Status:** Proposed 2026-08-13. Accepting this record discharges Stage 0.
+**Status:** Accepted 2026-08-14. Stage 0 and Stage 1 are implemented; Stage 2
+(the fresh timing run) remains explicitly unrun.
 
 ## Context
 
@@ -151,7 +152,12 @@ that scans call sites is weaker than a structure that cannot express the error.
 interval nested inside it. `operator` and `scan` must not overlap on any timeline.
 The ledger identity that must hold exactly is
 
-    inclusive operator = exclusive operator + nested scan
+    inclusive operator = exclusive operator + nested base scan
+        + nested shuffle + nested transport
+
+The fused live diagnostic interval is deliberately excluded from this identity:
+it overlaps the split live-input intervals and is retained only as a diagnostic
+bound on the acquisition ledger.
 
 ### 6. Phases stay a partition of the task wall
 
@@ -182,8 +188,10 @@ passes the controls below.
 ## Acceptance
 
 **Accepting this plan discharges Stage 0.** Its output is the taxonomy above and
-the control specification below. **Stage 1 implements** the instrumentation and
-these discriminating controls; Stage 2 is the fresh run and is not authorized here.
+the control specification below. Stage 1 now implements the instrumentation and
+these discriminating controls; the implementation evidence is recorded in
+`plans/impl/0551_fusion_invariant_base_relation_attribution_evidence.md`. Stage 2
+is the fresh run and is not authorized by this record.
 
 Every control is **exact by construction** — no cost-model plan selection, no real
 storage, no undeclared tolerance:
@@ -259,11 +267,12 @@ that cannot fail against the current engine is not evidence.
 
 ## Forward
 
-**Stage 1** implements the origin-carrying `ScanStream`, the metered consumption
-API, the ledger or subtraction, and the eight controls — each recorded
-fail-on-`bd3c8e59` then pass-on-implementation. **Stage 2** is a fresh
-matched-envelope run under the rules predeclared above. Only then does a component
-verdict — including a reinstated no-work — become available.
+**Stage 1** is implemented: the origin-carrying `ScanStream`, unbypassable
+metered consumption API, nested ledger, typed seal/veto path, all 63 wrapped
+envelopes, and the eight discriminating controls are recorded in the
+implementation evidence. **Stage 2** remains a fresh matched-envelope run under
+the rules predeclared above. Only then does a component verdict — including a
+reinstated no-work — become available.
 
 ADR 538's correctness identities, paired elapsed measurements and 21-cell board
 remain authoritative throughout, and nothing here reopens them.

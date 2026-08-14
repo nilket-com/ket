@@ -407,7 +407,7 @@ pub(crate) fn adr037_binder_default_scans_use_no_row_identity() {
 #[test]
 pub(crate) fn adr037_executor_threads_scan_row_identity_to_storage() {
 	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("exec");
-	let execute_bound = brace_blocks_after_marker(&exec, "pub fn execute_bound")
+	let execute_bound = brace_blocks_after_marker(&exec, "fn execute_bound_node")
 		.into_iter()
 		.next()
 		.expect("execute_bound body")

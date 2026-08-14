@@ -30,7 +30,12 @@ pub(crate) async fn materialize_delete_candidate_batches(
 			message: "delete candidate materializer requires row_identity=Append".to_string(),
 		});
 	}
-	super::materialize_scan_stream(storage.scan(scan_request).await?).await
+	// Delete-candidate materialization is an admin read, not a timed child, so it
+	// carries no receipt and meters nothing (ADR 551).
+	super::materialize_scan_stream(crate::scan_metering::MeteredScanStream::unmetered(
+		storage.scan(scan_request).await?,
+	))
+	.await
 }
 
 pub(crate) fn extract_delete_row_key_ids(

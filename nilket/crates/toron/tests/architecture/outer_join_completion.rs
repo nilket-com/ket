@@ -56,7 +56,7 @@ pub(crate) fn adr434_decoded_page_pin_stays_inside_projected_grouped_left_outer_
 		.find(".visit_streaming_spilled_left_outer_scan_probe_chunks(")
 		.expect("projected grouped probe call");
 	let off_shape_fallback = grouped
-		.find("let left_batches = self.execute_bound(left, morsel).await?")
+		.find("let left_batches = self.execute_bound_node(left, morsel).await?")
 		.expect("off-shape materialized fallback");
 	assert!(shape_fence < probe_started);
 	assert!(probe_started < pin);

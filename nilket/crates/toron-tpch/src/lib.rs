@@ -60,7 +60,7 @@ use toron::distributed::partition_store::InMemoryPartitionStore;
 use toron::distributed::scheduler::{StagePlan, live_publication_report};
 use toron::distributed::task::{
 	JoinBuildProfile, JoinSpillObservation, PartitionWorkConcurrencyObservation, RowCount,
-	TaskOutputBinding, TaskTelemetry, TaskTelemetryPhases,
+	TaskOutputBinding, TaskPhaseReceipt, TaskTelemetry, TaskTelemetryPhases,
 };
 use toron::distributed::worker_registry::{
 	ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
@@ -1582,6 +1582,7 @@ impl StorageScan for HarnessScan {
 			batch.schema(),
 			request.session_id,
 			request.query_id,
+			toron::storage::ScanOrigin::BaseRelation,
 			vec![batch],
 		))
 	}
@@ -1988,6 +1989,7 @@ impl StorageScan for ParquetHarnessScan {
 				output_schema,
 				request.session_id,
 				request.query_id,
+				toron::storage::ScanOrigin::BaseRelation,
 				stream::iter(batches.into_iter().map(Ok)).boxed(),
 			));
 		}
@@ -2109,6 +2111,7 @@ impl StorageScan for ParquetHarnessScan {
 			output_schema,
 			request.session_id,
 			request.query_id,
+			toron::storage::ScanOrigin::BaseRelation,
 			stream,
 		))
 	}
@@ -4207,6 +4210,8 @@ struct QueryExecution {
 	/// The executor's phase counters for this run. `Copy`, read once after the elapsed
 	/// boundary — the local arm's raw material for ADR 538 component receipts.
 	task_phases: TaskTelemetryPhases,
+	/// The counters above are authoritative only when the task ledger sealed.
+	phase_receipt: TaskPhaseReceipt,
 }
 
 /// The shared Load→Plan→Bind→Execute substrate for both the reachability and correctness rails: register
@@ -4424,6 +4429,7 @@ async fn execute_logical_with_catalog_timed(
 	let partition_work_concurrency_observations =
 		telemetry.partition_work_concurrency_observations.clone();
 	let task_phases = telemetry.phases;
+	let phase_receipt = telemetry.phase_receipt;
 	drop(telemetry);
 
 	Ok(QueryExecution {
@@ -4438,6 +4444,7 @@ async fn execute_logical_with_catalog_timed(
 		join_spill_observations,
 		partition_work_concurrency_observations,
 		task_phases,
+		phase_receipt,
 	})
 }
 
@@ -5736,7 +5743,7 @@ pub struct CensusTimingAtlasHarness {
 	telemetry_retention: toron::coordinator::TaskTelemetryRetention,
 	/// The local arm's executor window and phase counters, captured in `execute_child` (the
 	/// copy is `Copy`-cheap) and consumed in `reduce_child` after the boundary.
-	last_local_execution: Option<(f64, TaskTelemetryPhases)>,
+	last_local_execution: Option<(f64, TaskTelemetryPhases, TaskPhaseReceipt)>,
 }
 
 impl CensusTimingAtlasHarness {
@@ -5862,8 +5869,11 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 				})?;
 				// A `Copy` of the counters and one float: the only attribution work inside
 				// the boundary. Node building and path derivation wait for `reduce_child`.
-				self.last_local_execution =
-					Some((execution.timings.execute_ms, execution.task_phases));
+				self.last_local_execution = Some((
+					execution.timings.execute_ms,
+					execution.task_phases,
+					execution.phase_receipt,
+				));
 				execution.batches
 			}
 			TimingArm::Distributed => {
@@ -5923,11 +5933,11 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 		// the cell publish receipts it cannot back.
 		let nodes = match plan.arm {
 			TimingArm::Local => {
-				let (execute_ms, phases) = self
+				let (execute_ms, phases, receipt) = self
 					.last_local_execution
 					.take()
 					.ok_or_else(|| "local child completed without executor phases".to_string())?;
-				vec![timing_atlas_local_task_node(execute_ms, &phases)]
+				vec![timing_atlas_local_task_node(execute_ms, &phases, receipt)?]
 			}
 			TimingArm::Distributed => {
 				let report = self
@@ -5938,7 +5948,7 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 					.ok_or_else(|| {
 						"distributed child completed without a task telemetry report".to_string()
 					})?;
-				timing_atlas_nodes_from_report(&report)
+				timing_atlas_nodes_from_report(&report)?
 			}
 		};
 		let attribution = timing_atlas_child_attribution(nodes);
@@ -7593,7 +7603,7 @@ impl TimingAtlasChildAttribution {
 /// wins — it is the attempt whose output was accepted.
 pub fn timing_atlas_nodes_from_report(
 	report: &toron::coordinator::QueryTaskTelemetryReport,
-) -> Vec<TimingAtlasTaskNode> {
+) -> Result<Vec<TimingAtlasTaskNode>, String> {
 	use std::collections::btree_map::Entry;
 	let mut latest: BTreeMap<(u32, u32), &toron::distributed::scheduler::TaskTelemetryRecord> =
 		BTreeMap::new();
@@ -7627,6 +7637,12 @@ pub fn timing_atlas_nodes_from_report(
 	latest
 		.iter()
 		.map(|((stage, task), record)| {
+			if record.telemetry.phase_receipt != TaskPhaseReceipt::Sealed {
+				return Err(format!(
+					"task {stage}/{task} phase receipt is not sealed: {:?}",
+					record.telemetry.phase_receipt
+				));
+			}
 			let mut upstream = Vec::new();
 			if let Some(upstreams) = upstream_stages.get(stage) {
 				for upstream_stage in upstreams {
@@ -7637,13 +7653,13 @@ pub fn timing_atlas_nodes_from_report(
 					}
 				}
 			}
-			TimingAtlasTaskNode {
+			Ok(TimingAtlasTaskNode {
 				stage_id: *stage,
 				task_id: *task,
 				wall_ms: record.telemetry.phases.task_wall_micros as f64 / 1000.0,
 				components: timing_atlas_component_portions_ms(&record.telemetry.phases),
 				upstream,
-			}
+			})
 		})
 		.collect()
 }
@@ -7654,14 +7670,18 @@ pub fn timing_atlas_nodes_from_report(
 pub fn timing_atlas_local_task_node(
 	execute_wall_ms: f64,
 	phases: &TaskTelemetryPhases,
-) -> TimingAtlasTaskNode {
-	TimingAtlasTaskNode {
+	receipt: TaskPhaseReceipt,
+) -> Result<TimingAtlasTaskNode, String> {
+	if receipt != TaskPhaseReceipt::Sealed {
+		return Err(format!("local phase receipt is not sealed: {receipt:?}"));
+	}
+	Ok(TimingAtlasTaskNode {
 		stage_id: 0,
 		task_id: 0,
 		wall_ms: execute_wall_ms,
 		components: timing_atlas_component_portions_ms(phases),
 		upstream: Vec::new(),
-	}
+	})
 }
 
 /// Derive one child's attribution from its task nodes. `None` when the child produced no
@@ -24419,6 +24439,7 @@ mod adr538_phase_component_wiring {
 	fn record(stage: u32, task: u32, attempt: u32, wall_micros: u64) -> TaskTelemetryRecord {
 		let mut telemetry = TaskTelemetry::default();
 		telemetry.phases.task_wall_micros = wall_micros;
+		telemetry.phase_receipt = TaskPhaseReceipt::Sealed;
 		TaskTelemetryRecord {
 			identity: TaskIdentity::new(
 				QueryId::from_u128(538),
@@ -24448,7 +24469,7 @@ mod adr538_phase_component_wiring {
 				record(1, 0, 1, 12_000),
 			],
 		};
-		let nodes = timing_atlas_nodes_from_report(&report);
+		let nodes = timing_atlas_nodes_from_report(&report).expect("sealed receipts");
 		assert_eq!(nodes.len(), 3, "one node per task, not per attempt");
 		let consumer = nodes
 			.iter()
@@ -24475,13 +24496,49 @@ mod adr538_phase_component_wiring {
 		let mut phases = TaskTelemetryPhases::default();
 		phases.exchange_repartition_micros = 4_200;
 		phases.scan_micros = 1_800;
-		let node = timing_atlas_local_task_node(25.0, &phases);
+		let node = timing_atlas_local_task_node(25.0, &phases, TaskPhaseReceipt::Sealed)
+			.expect("sealed receipt");
 		let attribution = timing_atlas_child_attribution(vec![node]).expect("local attributes");
 		assert_eq!(attribution.path, vec![(0, 0)]);
 		assert_eq!(attribution.path_wall_ms, 25.0);
 		assert_eq!(attribution.path_components["shuffle"], 4.2);
 		assert_eq!(attribution.path_components["scan"], 1.8);
 		assert_eq!(attribution.path_components["transport"], 0.0);
+	}
+
+	/// A numeric zero is evidence only after ADR 551's ledger seals. Both arms
+	/// reject an absent/vetoed receipt before component rows are constructed.
+	#[test]
+	fn timing_atlas_refuses_unsealed_phase_receipts_on_both_arms() {
+		let local = timing_atlas_local_task_node(
+			25.0,
+			&TaskTelemetryPhases::default(),
+			TaskPhaseReceipt::NotCollected,
+		);
+		assert!(
+			local
+				.expect_err("an uncollected local receipt is not zero")
+				.contains("not sealed")
+		);
+
+		let report = QueryTaskTelemetryReport {
+			query_id: QueryId::from_u128(538),
+			stage_upstreams: vec![(StageId::new(0), vec![])],
+			tasks: vec![TaskTelemetryRecord {
+				identity: TaskIdentity::new(
+					QueryId::from_u128(538),
+					StageId::new(0),
+					TaskId::new(0),
+					AttemptId::new(0),
+				),
+				telemetry: TaskTelemetry::default(),
+			}],
+		};
+		assert!(
+			timing_atlas_nodes_from_report(&report)
+				.expect_err("an uncollected distributed receipt is not zero")
+				.contains("not sealed")
+		);
 	}
 }
 

@@ -51,7 +51,7 @@ use crate::server::{
 };
 use crate::storage::{
 	CreateLogicalTypeRequest, DeleteRowsOutcome, DeleteRowsRequest, DropTableStorageRequest,
-	MutationResolution, ResolvedMutationOutcome, RowIdentityProjection, ScanStream, StorageAdmin,
+	MutationResolution, ResolvedMutationOutcome, RowIdentityProjection, StorageAdmin,
 	StorageDeleteRows, StorageWrite, TenantId, UnsupportedStorageAdmin, WriteOutcome, WriteRequest,
 };
 use tokio::sync::Semaphore;
@@ -114,9 +114,9 @@ fn retain_task_telemetry_report(
 }
 
 pub(crate) async fn materialize_scan_stream(
-	stream: ScanStream,
+	stream: crate::scan_metering::MeteredScanStream,
 ) -> Result<Vec<RecordBatch>, StorageError> {
-	stream.into_batches().try_collect().await
+	stream.try_collect().await
 }
 
 pub struct DistributedResultStream {
@@ -5207,6 +5207,7 @@ mod tests {
 				self.table_data.schema(),
 				request.session_id,
 				request.query_id,
+				crate::storage::ScanOrigin::BaseRelation,
 				vec![self.table_data.clone()],
 			))
 		}

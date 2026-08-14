@@ -188,10 +188,28 @@ impl DropTableStorageOutcome {
 	}
 }
 
+/// Where a `ScanStream`'s rows actually come from.
+///
+/// ADR 551: attribution follows this, not the storage decorator that produced the
+/// stream. `TaskInputStorageScan` and `LiveInputStorageScan` both delegate to base
+/// storage when they miss, so the installed wrapper does not determine what a
+/// stream carries. Only `BaseRelation` time is `scan`; exchange input belongs to
+/// `shuffle`/`transport`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScanOrigin {
+	/// Rows read from a stored base relation.
+	BaseRelation,
+	/// Rows replayed from an exchange partition already materialized into memory.
+	MaterializedExchangeInput,
+	/// Rows pulled from a live producer partition as it is published.
+	LiveExchangeInput,
+}
+
 pub struct ScanStream {
 	pub schema: SchemaRef,
 	pub session_id: SessionId,
 	pub query_id: QueryId,
+	origin: ScanOrigin,
 	batches: BoxStream<'static, Result<RecordBatch, StorageError>>,
 }
 
@@ -200,12 +218,14 @@ impl ScanStream {
 		schema: SchemaRef,
 		session_id: SessionId,
 		query_id: QueryId,
+		origin: ScanOrigin,
 		batches: BoxStream<'static, Result<RecordBatch, StorageError>>,
 	) -> Self {
 		Self {
 			schema,
 			session_id,
 			query_id,
+			origin,
 			batches,
 		}
 	}
@@ -214,18 +234,38 @@ impl ScanStream {
 		schema: SchemaRef,
 		session_id: SessionId,
 		query_id: QueryId,
+		origin: ScanOrigin,
 		batches: Vec<RecordBatch>,
 	) -> Self {
 		Self::new(
 			schema,
 			session_id,
 			query_id,
+			origin,
 			stream::iter(batches.into_iter().map(Ok)).boxed(),
 		)
 	}
 
-	pub(crate) fn into_batches(self) -> BoxStream<'static, Result<RecordBatch, StorageError>> {
-		self.batches
+	pub fn origin(&self) -> ScanOrigin {
+		self.origin
+	}
+
+	/// The single transition out of a `ScanStream`, into the metered stream.
+	///
+	/// ADR 551: this is deliberately the **only** raw-stream extractor, and
+	/// `MeteredScanStream` is deliberately its only caller — an architecture guard
+	/// proves both. The previous `into_batches` returned a bare `BoxStream` to
+	/// thirty-three call sites, which is how provenance was erased exactly where
+	/// it was needed and how thirty read routes went unattributed. Coverage is a
+	/// property of there being one door, not of a list of callers being kept up to
+	/// date.
+	pub(crate) fn into_metered_parts(
+		self,
+	) -> (
+		ScanOrigin,
+		BoxStream<'static, Result<RecordBatch, StorageError>>,
+	) {
+		(self.origin, self.batches)
 	}
 }
 
@@ -762,6 +802,7 @@ fn scan_in_memory_batch(
 		batch.schema(),
 		request.session_id,
 		request.query_id,
+		ScanOrigin::BaseRelation,
 		vec![batch],
 	))
 }
@@ -1072,6 +1113,7 @@ impl StorageScan for WendelonStorageScan {
 			schema,
 			request.session_id,
 			request.query_id,
+			ScanOrigin::BaseRelation,
 			batches,
 		))
 	}
@@ -1474,9 +1516,10 @@ mod tests {
 			schema,
 			SessionId(1),
 			QueryId::from_u128(2),
+			crate::storage::ScanOrigin::BaseRelation,
 			stream::iter(vec![Ok(batch), Err(StorageError::Cancelled)]).boxed(),
 		);
-		let mut items = stream.into_batches();
+		let mut items = crate::scan_metering::MeteredScanStream::unmetered(stream);
 		let first = items.next().await.expect("first item present");
 		assert!(
 			first.is_ok(),
@@ -1676,7 +1719,7 @@ mod tests {
 
 	async fn collect_test_batches(stream: ScanStream) -> Vec<RecordBatch> {
 		let mut batches = Vec::new();
-		let mut stream = stream.into_batches();
+		let mut stream = crate::scan_metering::MeteredScanStream::unmetered(stream);
 		while let Some(batch) = stream.next().await {
 			batches.push(batch.expect("scan batch"));
 		}

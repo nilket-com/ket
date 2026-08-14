@@ -655,8 +655,14 @@ pub(crate) fn adr068_storage_scan_spans_do_not_change_storage_results() {
 		std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec source");
 	let telemetry = std::fs::read_to_string(manifest_dir().join("src/telemetry.rs"))
 		.expect("read telemetry source");
-	assert!(exec.contains("let span = crate::telemetry::storage_scan_span(&req);"));
-	assert!(exec.contains("self.storage.scan(req).instrument(span).await?"));
+	// ADR 551 carved the metered open into `exec/scan_open.rs`, so the span is
+	// applied there. The invariant is unchanged: the span still wraps the storage
+	// call and still returns its result untouched.
+	let scan_open = std::fs::read_to_string(manifest_dir().join("src/exec/scan_open.rs"))
+		.expect("read scan_open source");
+	assert!(scan_open.contains("let span = crate::telemetry::storage_scan_span(&req);"));
+	assert!(scan_open.contains("self.storage.scan(req).instrument(span)"));
+	let _ = &exec;
 	assert!(telemetry.contains("\"toron.storage.scan\""));
 	assert!(!telemetry.contains("projected_columns"));
 	assert!(!telemetry.contains("pbc_predicate"));

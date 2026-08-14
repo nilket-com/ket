@@ -1048,6 +1048,7 @@ impl StorageScan for CrossFixtureScan {
 			batch.schema(),
 			request.session_id,
 			request.query_id,
+			toron::storage::ScanOrigin::BaseRelation,
 			vec![batch],
 		))
 	}
