@@ -116,3 +116,17 @@ explicitly aggregates, restores the `category` / `value` names, and sorts the
 slices clockwise by descending value. The raw companion must refuse at the
 category argument and name `.aggregate(...)`; together they demonstrate that
 Toron, not the pie mark, owns summation.
+
+Seed both PRODUCT-0105 multivariate relations, then open the radar and parallel
+surface exhibit:
+
+```sh
+nilket toron sql --file uat/radar_probe.sql
+nilket toron sql --file uat/parallel_probe.sql
+cargo run -p polariton -- uat/test33.rn
+```
+
+The radar relation is interleaved by category while the authored axes use a
+deliberately different order from the table schema. The parallel relation uses
+eight dimensions, proving projection exceeds PRODUCT-0094's former seven-field
+ceiling; its faceted companion keeps parallel hover live in a non-origin cell.

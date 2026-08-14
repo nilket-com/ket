@@ -12,24 +12,25 @@ use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FunnelFields,
-	HeatmapFields, LayerSettings, LayeredPlotSpec, LegendPosition, Override, PieFields, PointSize,
-	Presence, RadialDialFields, StrokeWidth,
+	HeatmapFields, LayerSettings, LayeredPlotSpec, LegendPosition, MultivariateFields, Override,
+	PieFields, PointSize, Presence, RadialDialFields, StrokeWidth,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
 };
 use crate::rune_relation_envelope::{
 	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, FunnelFieldOrigins,
-	HeatmapFieldOrigins, PieFieldOrigins, RadialDialFieldOrigins, RunePlotBody,
-	RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans, RunePlotTickStepSpans,
-	RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent, SpannedMarkFields,
-	StyledRunePlotSink,
+	HeatmapFieldOrigins, MultivariateFieldOrigins, PieFieldOrigins, RadialDialFieldOrigins,
+	RunePlotBody, RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans,
+	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
+	RuneViewIntent, SpannedMarkFields, StyledRunePlotSink,
 };
 use rune::alloc::limit;
 use rune::ast::Spanned;
 use rune::diagnostics::{Diagnostic, FatalDiagnosticKind};
 use rune::runtime::{InstAddress, Memory, Output, Value, VmResult, budget};
 use rune::{Any, Context, Diagnostics, Module, Ref, Source, Sources, Vm};
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -402,6 +403,8 @@ fn build_context() -> Result<Context, String> {
 		("__funnel", raw_funnel as RawFunction),
 		("__radial_dial", raw_radial_dial as RawFunction),
 		("__pie", raw_pie as RawFunction),
+		("__radar", raw_radar as RawFunction),
+		("__parallel", raw_parallel as RawFunction),
 		("__title", raw_title as RawFunction),
 		("__subtitle", raw_subtitle as RawFunction),
 		("__x_label", raw_x_label as RawFunction),
@@ -436,6 +439,7 @@ fn build_context() -> Result<Context, String> {
 		("__stroke_width", raw_mark_stroke_width as RawFunction),
 		("__bar_width", raw_mark_bar_width as RawFunction),
 		("__category_gap", raw_mark_category_gap as RawFunction),
+		("__category", raw_mark_category as RawFunction),
 		("__stacked", raw_mark_stacked as RawFunction),
 		("__percent", raw_mark_percent as RawFunction),
 		("__diverging", raw_mark_diverging as RawFunction),
@@ -499,6 +503,154 @@ fn raw_histogram(
 	out: Output,
 ) -> VmResult<()> {
 	raw_mark(PlotType::Histogram, "histogram", stack, addr, args, out)
+}
+
+fn raw_radar(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
+	raw_multivariate_mark(PlotType::Radar, "radar", stack, addr, args, out)
+}
+
+fn raw_parallel(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_multivariate_mark(PlotType::Parallel, "parallel", stack, addr, args, out)
+}
+
+fn raw_multivariate_mark(
+	plot_type: PlotType,
+	name: &'static str,
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = match raw_origin(values) {
+		Ok(origin) => origin,
+		Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+	};
+	if values.len() < 2 || (values.len() - 2) % 3 != 0 {
+		return store(
+			out,
+			stack,
+			RuneMark::failed(PresentationFailure::new(
+				origin,
+				format!(
+					"{name}(...) requires n dimension strings, two injected origins per dimension, and the mark origin (3n + 2 values)"
+				),
+			)),
+		);
+	}
+	let field_count = (values.len() - 2) / 3;
+	if let Err(reason) = plot_type.validate_multivariate_dimension_count(field_count) {
+		return store(
+			out,
+			stack,
+			RuneMark::failed(PresentationFailure::new(origin, reason)),
+		);
+	}
+	let mut dimensions = Vec::with_capacity(field_count);
+	for value in &values[..field_count] {
+		match rune::from_value::<Ref<str>>(value.clone()) {
+			Ok(field) => dimensions.push(field.to_owned()),
+			Err(_) => {
+				return store(
+					out,
+					stack,
+					RuneMark::failed(PresentationFailure::new(
+						origin,
+						format!("{name}(...) dimension arguments must evaluate to strings"),
+					)),
+				);
+			}
+		}
+	}
+	let decode_span = |index: usize| -> Result<Range<u32>, PresentationFailure> {
+		let start = rune::from_value::<i64>(values[index].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				format!("{name}(...) has an invalid injected dimension origin"),
+			)
+		})?;
+		let end = rune::from_value::<i64>(values[index + 1].clone()).map_err(|_| {
+			PresentationFailure::new(
+				origin,
+				format!("{name}(...) has an invalid injected dimension origin"),
+			)
+		})?;
+		Origin::decode(start, end).map(Origin::range)
+	};
+	let mut dimension_origins = Vec::with_capacity(field_count);
+	for index in 0..field_count {
+		match decode_span(field_count + index * 2) {
+			Ok(span) => dimension_origins.push(span),
+			Err(failure) => return store(out, stack, RuneMark::failed(failure)),
+		}
+	}
+	let mut seen = HashSet::new();
+	for (index, dimension) in dimensions.iter().enumerate() {
+		if !seen.insert(dimension.as_str()) {
+			return store(
+				out,
+				stack,
+				RuneMark::failed(PresentationFailure {
+					span: dimension_origins[index].clone(),
+					message: format!(
+						"{name}(...) dimension `{dimension}` is duplicated; each dimension field must be unique"
+					),
+				}),
+			);
+		}
+	}
+	let fields = MultivariateFields::new(dimensions, None);
+	let origins = MultivariateFieldOrigins {
+		dimensions: dimension_origins,
+		category: None,
+	};
+	let spanned = match plot_type {
+		PlotType::Radar => SpannedMarkFields::Radar {
+			fields: fields.clone(),
+			origins,
+		},
+		PlotType::Parallel => SpannedMarkFields::Parallel {
+			fields: fields.clone(),
+			origins,
+		},
+		_ => unreachable!("multivariate Rune constructor admitted {plot_type:?}"),
+	};
+	let sink = StyledRunePlotSink {
+		sink: DisposableRunePlotSink {
+			composition: PlotComposition::single(plot_type),
+			x: fields.dimensions()[0].clone(),
+			y: fields.dimensions()[1].clone(),
+			category: None,
+			interval_end: None,
+			mark_fields: Some(spanned),
+			origin: origin.range(),
+		},
+		settings: LayerSettings::default(),
+		stacked: false,
+		percent: false,
+	};
+	store(
+		out,
+		stack,
+		RuneMark {
+			sink: Ok(sink),
+			origin,
+			modified: false,
+			point_size_origin: None,
+			stroke_width_origin: None,
+			bar_width_origin: None,
+			category_gap_origin: None,
+			stacked_origin: None,
+			percent_origin: None,
+			continuous_intent: None,
+			continuous_intent_origin: None,
+		},
+	)
 }
 
 fn raw_box(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
@@ -2286,6 +2438,38 @@ fn mark_diverging(mut mark: RuneMark, anchor: ContinuousAnchor, start: i64, end:
 	mark
 }
 
+fn mark_category(mut mark: RuneMark, category: String, start: i64, end: i64) -> RuneMark {
+	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
+	if !matches!(mark.plot_type(), Some(PlotType::Radar | PlotType::Parallel)) {
+		mark.sink = Err(PresentationFailure::new(
+			origin,
+			"category(...) is available on radar and parallel marks",
+		));
+		return mark;
+	}
+	let Ok(styled) = &mut mark.sink else {
+		return mark;
+	};
+	let Some(spanned) = &mut styled.sink.mark_fields else {
+		unreachable!("authored multivariate mark carries its fields")
+	};
+	let (fields, origins) = match spanned {
+		SpannedMarkFields::Radar { fields, origins }
+		| SpannedMarkFields::Parallel { fields, origins } => (fields, origins),
+		_ => unreachable!("multivariate mark carries matching field transport"),
+	};
+	if fields.category().is_some() {
+		mark.sink = Err(PresentationFailure::new(
+			origin,
+			"category(...) may appear at most once on a radar or parallel mark",
+		));
+		return mark;
+	}
+	fields.set_category(category);
+	origins.category = Some(origin.range());
+	mark
+}
+
 #[derive(Clone, Copy)]
 enum MarkModifier {
 	PointSize,
@@ -2296,6 +2480,7 @@ enum MarkModifier {
 	Percent,
 	Diverging,
 	DivergingAt,
+	Category,
 }
 
 fn raw_mark_point_size(
@@ -2358,6 +2543,23 @@ fn raw_mark_category_gap(
 	raw_mark_modifier(
 		MarkModifier::CategoryGap,
 		"category_gap",
+		true,
+		stack,
+		addr,
+		args,
+		out,
+	)
+}
+
+fn raw_mark_category(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_mark_modifier(
+		MarkModifier::Category,
+		"category",
 		true,
 		stack,
 		addr,
@@ -2482,6 +2684,13 @@ fn raw_mark_modifier(
 			None => RuneMark::failed(PresentationFailure::new(
 				origin,
 				"diverging_at(...) requires a numeric anchor",
+			)),
+		},
+		MarkModifier::Category => match rune::from_value::<Ref<str>>(values[1].clone()) {
+			Ok(category) => mark_category(mark, category.to_owned(), start, end),
+			Err(_) => RuneMark::failed(PresentationFailure::new(
+				origin,
+				"category(...) requires a field string",
 			)),
 		},
 	};

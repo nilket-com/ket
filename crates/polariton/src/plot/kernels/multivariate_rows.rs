@@ -1,26 +1,8 @@
 use crate::plot::exact_numeric::{ExactF64Error, exact_f64};
+use crate::plot::spec::MultivariateFields;
 use polars::prelude::*;
 use std::collections::BTreeSet;
 use std::fmt;
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct MultivariateFields {
-	dimensions: Vec<String>,
-	category: Option<String>,
-}
-
-impl MultivariateFields {
-	pub(crate) fn new(dimensions: &[String], category: Option<&str>) -> Self {
-		Self {
-			dimensions: dimensions.to_vec(),
-			category: category.map(str::to_owned),
-		}
-	}
-
-	pub(crate) fn category(&self) -> Option<&str> {
-		self.category.as_deref()
-	}
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) enum MultivariateValueCell {
@@ -93,7 +75,7 @@ impl MultivariateRows {
 		for (index, row) in rows.iter().enumerate() {
 			assert_eq!(
 				row.values.len(),
-				fields.dimensions.len(),
+				fields.dimensions().len(),
 				"PRODUCT-0104 multivariate input row must match its dimension list"
 			);
 			let one_based = index + 1;
@@ -105,7 +87,7 @@ impl MultivariateRows {
 					row: one_based,
 				});
 			}
-			for (dimension, value) in fields.dimensions.iter().zip(&row.values) {
+			for (dimension, value) in fields.dimensions().iter().zip(&row.values) {
 				match value {
 					MultivariateValueCell::Null => {
 						return Err(MultivariateRowsError::NullValue {
@@ -152,7 +134,7 @@ impl MultivariateRows {
 		let extrema = if rows.is_empty() {
 			None
 		} else {
-			let mut extrema = vec![(f64::INFINITY, f64::NEG_INFINITY); fields.dimensions.len()];
+			let mut extrema = vec![(f64::INFINITY, f64::NEG_INFINITY); fields.dimensions().len()];
 			for row in &rows {
 				for ((low, high), value) in extrema.iter_mut().zip(&row.values) {
 					let MultivariateValueCell::Exact(value) = value else {
@@ -166,7 +148,7 @@ impl MultivariateRows {
 		};
 
 		Ok(Self {
-			dimensions: fields.dimensions.clone(),
+			dimensions: fields.dimensions().to_vec(),
 			rows: rows
 				.into_iter()
 				.map(|row| MultivariateRow {
@@ -225,7 +207,7 @@ pub(crate) fn prepare_multivariate_rows(
 	dimensions: &[String],
 	category: Option<&str>,
 ) -> Result<MultivariateRows, MultivariatePreparationError> {
-	let fields = MultivariateFields::new(dimensions, category);
+	let fields = MultivariateFields::new(dimensions.to_vec(), category.map(str::to_owned));
 	let mut dimension_columns = Vec::with_capacity(dimensions.len());
 	for dimension in dimensions {
 		let column =
@@ -366,11 +348,11 @@ mod tests {
 
 	fn fields(dimensions: &[&str], category: Option<&str>) -> MultivariateFields {
 		MultivariateFields::new(
-			&dimensions
+			dimensions
 				.iter()
 				.map(|dimension| (*dimension).to_owned())
 				.collect::<Vec<_>>(),
-			category,
+			category.map(str::to_owned),
 		)
 	}
 

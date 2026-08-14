@@ -287,7 +287,7 @@ band-fill path.
 
     **Does not consume prerequisite D** — the first step in the arc where the
     substrate does not. Variadic dimension authoring is the surfaces'.
-20. **Variadic multivariate surface — ADR 0105, drafted.** Consumes **D**. One
+20. **Variadic multivariate surface — LANDED as PRODUCT-0105.** Consumes **D**. One
     record, two words: `radar(...)`/`parallel(...)` purely variadic with a shared
     `.category(...)` modifier. D turned out to be four coupled boundaries, not one
     arity check — the rewriter's fixed-arity origin injection, a `3n + 2`

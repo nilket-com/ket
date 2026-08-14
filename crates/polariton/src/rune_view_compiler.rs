@@ -28,7 +28,9 @@ const PRESENTATION_FREE: &[&str] = &[
 	"facet",
 	"figure",
 	"funnel",
+	"parallel",
 	"radial_dial",
+	"radar",
 	"pie",
 	"histogram",
 	"heatmap",
@@ -56,6 +58,7 @@ const PRESENTATION_FREE: &[&str] = &[
 
 const PRESENTATION_METHODS: &[&str] = &[
 	"bar_width",
+	"category",
 	"category_gap",
 	"diverging",
 	"diverging_at",
@@ -516,7 +519,7 @@ fn static_method_on_relation(
 	}
 	if matches!(
 		method,
-		"box" | "bubble" | "funnel" | "heatmap" | "radial_dial" | "pie"
+		"box" | "bubble" | "funnel" | "heatmap" | "radial_dial" | "pie" | "radar" | "parallel"
 	) {
 		return invalid_view(
 			call.span(),
@@ -1317,10 +1320,15 @@ fn rewrite_calls_mapped(
 			"pie" => Some(&[2]),
 			_ => None,
 		};
-		let injected_origins = if let Some(origin_arities) = origin_arities.filter(|_| !is_method) {
+		let variadic_origins = !is_method && matches!(name.as_str(), "radar" | "parallel");
+		let injected_origins = if !is_method && (origin_arities.is_some() || variadic_origins) {
 			let arguments =
 				call_argument_ranges(fragment, original_start, &tokens, open_index, close_index)?;
-			if !origin_arities.contains(&arguments.len()) {
+			if !variadic_origins
+				&& !origin_arities
+					.expect("fixed origin arities are present")
+					.contains(&arguments.len())
+			{
 				String::new()
 			} else {
 				arguments
@@ -1749,6 +1757,83 @@ mod tests {
 			rewritten,
 			"polariton_presentation::__heatmap(\"region\", \"quarter\", \"margin\", 108, 116, 118, 127, 129, 137, 100, 138)"
 		);
+	}
+
+	#[test]
+	fn product_0105_variadic_multivariate_words_retain_origins_and_single_routing() {
+		let rewritten =
+			rewrite_calls("radar(\"a\", \"b\", \"c\")", 100).expect("rewrite variadic radar call");
+		assert_eq!(
+			rewritten,
+			"polariton_presentation::__radar(\"a\", \"b\", \"c\", 106, 109, 111, 114, 116, 119, 100, 120)"
+		);
+
+		for (word, dimensions) in [("radar", 3_usize), ("parallel", 2_usize)] {
+			let arguments = if word == "radar" {
+				"\"third\", \"first\", \"second\""
+			} else {
+				"\"third\", \"first\""
+			};
+			let source = format!(
+				"let r = workspace.table(\"multivariate_probe\"); r.views([{word}({arguments}).category(\"group\")]);"
+			);
+			let compiled = compile(&source).unwrap_or_else(|error| panic!("{word}: {error}"));
+			let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+				panic!("multivariate word produced a table")
+			};
+			let RunePlotBody::Single(sink) = &plot.body else {
+				panic!("category(...) incorrectly routed {word} through LayerSettings")
+			};
+			let (plot_type, fields, origins) = sink
+				.mark_fields
+				.as_ref()
+				.and_then(|fields| fields.multivariate())
+				.expect("multivariate fields and origins");
+			assert_eq!(plot_type.to_string().to_lowercase().contains(word), true);
+			assert_eq!(fields.dimensions().len(), dimensions);
+			for (field, span) in fields.dimensions().iter().zip(&origins.dimensions) {
+				assert_eq!(
+					&source[span.start as usize..span.end as usize],
+					format!("\"{field}\"")
+				);
+			}
+			let category = origins.category.as_ref().expect("category modifier origin");
+			assert_eq!(
+				&source[category.start as usize..category.end as usize],
+				".category(\"group\")"
+			);
+		}
+
+		let duplicate = "let r = workspace.table(\"multivariate_probe\"); r.views([radar(\"a\", \"a\", \"b\")]);";
+		let error = compile(duplicate).expect_err("duplicate dimension must refuse");
+		let RuneEnvelopeError::InvalidView { span, message } = error else {
+			panic!("duplicate dimension returned wrong error: {error}")
+		};
+		assert_eq!(&duplicate[span.start as usize..span.end as usize], "\"a\"");
+		assert!(message.contains("dimension `a` is duplicated"), "{message}");
+
+		for (source, expected_span, expected_message) in [
+			(
+				"let r = workspace.table(\"multivariate_probe\"); r.views([radar(\"a\", \"b\", \"c\").category(\"group\").category(\"other\")]);",
+				".category(\"other\")",
+				"category(...) may appear at most once",
+			),
+			(
+				"let r = workspace.table(\"multivariate_probe\"); r.views([pie(\"group\", \"a\").category(\"other\")]);",
+				".category(\"other\")",
+				"category(...) is available on radar and parallel marks",
+			),
+		] {
+			let error = compile(source).expect_err("invalid category modifier must refuse");
+			let RuneEnvelopeError::InvalidView { span, message } = error else {
+				panic!("category modifier returned wrong error: {error}")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				expected_span
+			);
+			assert!(message.contains(expected_message), "{message}");
+		}
 	}
 
 	#[test]
@@ -2963,5 +3048,46 @@ r.views([bar(category(), "revenue")])
 			.expect("raw execution");
 		assert_eq!(raw.source.matches(".aggregate(").count(), 0);
 		assert_eq!(aggregated.source.matches(".aggregate(").count(), 1);
+	}
+
+	#[test]
+	fn product_0105_test33_is_the_variadic_radar_and_parallel_exhibit() {
+		let source = include_str!("../../../uat/test33.rn");
+		let compiled = compile(source).expect("the checked-in multivariate exhibit compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.presentation_order.len(), 3);
+		let mut saw_radar = false;
+		let mut saw_parallel = 0;
+		for execution in &compiled.executions {
+			for view in &execution.views {
+				let RuneViewIntent::Plot(plot) = &view.intent else {
+					panic!("multivariate exhibit produced a table")
+				};
+				let sink = match &plot.body {
+					RunePlotBody::Single(sink) => sink,
+					RunePlotBody::StyledSingle(styled) => &styled.sink,
+					RunePlotBody::Layered(_) => panic!("multivariate exhibit produced layers"),
+				};
+				let (plot_type, fields, origins) = sink
+					.mark_fields
+					.as_ref()
+					.and_then(|fields| fields.multivariate())
+					.expect("multivariate fields and origins");
+				match plot_type {
+					crate::plot::core::PlotType::Radar => saw_radar = true,
+					crate::plot::core::PlotType::Parallel => saw_parallel += 1,
+					other => panic!("unexpected exhibit mark: {other:?}"),
+				}
+				assert_eq!(origins.dimensions.len(), fields.dimensions().len());
+			}
+		}
+		assert!(saw_radar);
+		assert_eq!(saw_parallel, 2);
+		assert!(
+			source.contains(
+				"parallel(\"d8\", \"d1\", \"d6\", \"d3\", \"d7\", \"d2\", \"d5\", \"d4\")"
+			)
+		);
+		assert!(source.contains("facet(\"cohort\")"));
 	}
 }

@@ -4,17 +4,19 @@ mod plot {
 	pub(crate) mod exact_numeric {
 		include!("../../src/plot/exact_numeric.rs");
 	}
+	pub(crate) mod spec {
+		include!("../../src/plot/spec/multivariate_fields.rs");
+	}
 }
 
 #[path = "../../src/plot/kernels/multivariate_rows.rs"]
 mod multivariate_rows;
 
-use multivariate_rows::{
-	MultivariateFields, MultivariateInputRow, MultivariateRows, MultivariateValueCell,
-};
+use multivariate_rows::{MultivariateInputRow, MultivariateRows, MultivariateValueCell};
+use plot::spec::MultivariateFields;
 
 fn main() {
-	let fields = MultivariateFields::new(&["value".to_owned()], Some("group"));
+	let fields = MultivariateFields::new(vec!["value".to_owned()], Some("group".to_owned()));
 	let rows = MultivariateRows::from_rows(
 		&fields,
 		vec![MultivariateInputRow {

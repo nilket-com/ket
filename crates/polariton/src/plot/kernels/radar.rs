@@ -3,6 +3,7 @@ use crate::plot::common::{
 	ResolvedPlotSettings, format_label,
 };
 use crate::plot::kernels::multivariate_rows::MultivariateRows;
+use crate::plot::spec::CategoryColorAssignment;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Point, Rectangle};
@@ -10,6 +11,7 @@ use std::sync::Arc;
 
 pub struct RadarPlotKernel {
 	pub prepared_data: Arc<MultivariateRows>,
+	pub category_colors: Option<Vec<CategoryColorAssignment>>,
 }
 
 impl RadarPlotKernel {
@@ -26,6 +28,34 @@ impl RadarPlotKernel {
 					.collect()
 			})
 			.unwrap_or_else(|| vec![(0.0, 1.0); self.prepared_data.dimensions().len()])
+	}
+
+	fn category_color(&self, category: Option<&str>, settings: &ResolvedPlotSettings) -> Color {
+		if let Some(assignments) = &self.category_colors {
+			let category = category
+				.expect("PRODUCT-0105 authored multivariate assignments have named categories");
+			let assignment = assignments
+				.iter()
+				.find(|assignment| assignment.category == category)
+				.expect("PRODUCT-0105 authored radar categories have complete assignments");
+			return Color::from_rgba8(
+				assignment.color.red,
+				assignment.color.green,
+				assignment.color.blue,
+				assignment.color.alpha as f32 / u8::MAX as f32,
+			);
+		}
+		let count = self.prepared_data.categories().len();
+		let index = self
+			.prepared_data
+			.category_position(category)
+			.expect("PRODUCT-0104 validated every row category against its catalog");
+		let position = if count > 1 {
+			(index as f32 / (count - 1) as f32).clamp(0.1, 0.9)
+		} else {
+			0.5
+		};
+		settings.color_theme.get_color(position)
 	}
 }
 
@@ -143,18 +173,8 @@ impl PlotKernel for RadarPlotKernel {
 				}
 			}
 		}
-		let category_count = self.prepared_data.categories().len();
 		for row in self.prepared_data.iter() {
-			let cat_idx = self
-				.prepared_data
-				.category_position(row.category())
-				.expect("PRODUCT-0104 validated every row category against its catalog");
-			let t = if category_count > 1 {
-				(cat_idx as f32 / (category_count - 1) as f32).clamp(0.1, 0.9)
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(t);
+			let color = self.category_color(row.category(), &settings);
 			let mut fill_color = color;
 			fill_color.a = 0.3;
 			let path_closure = |builder: &mut dyn PathBuilder| {
@@ -192,12 +212,15 @@ impl PlotKernel for RadarPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
-			self.prepared_data
-				.categories()
-				.iter()
-				.map(|category| category.as_deref().unwrap_or("All Data").to_owned()),
-			settings,
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+			self.prepared_data.categories().iter().map(|category| {
+				(
+					category.as_deref().unwrap_or("All Data").to_owned(),
+					self.category_color(category.as_deref(), settings),
+				)
+			}),
+			crate::plot::legend::LegendSample::Swatch,
+			crate::plot::legend::LegendProvenance::Named,
 		)
 	}
 
@@ -211,9 +234,8 @@ mod tests {
 	use super::*;
 	use crate::plot::common::TickPlacement;
 	use crate::plot::export::SvgBackend;
-	use crate::plot::kernels::multivariate_rows::{
-		MultivariateFields, MultivariateRows, prepare_multivariate_rows,
-	};
+	use crate::plot::kernels::multivariate_rows::{MultivariateRows, prepare_multivariate_rows};
+	use crate::plot::spec::MultivariateFields;
 	use iced::Size;
 	use polars::df;
 
@@ -232,6 +254,7 @@ mod tests {
 				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
 					.expect("valid radar oracle"),
 			),
+			category_colors: None,
 		};
 		assert_eq!(
 			kernel.display_ranges(),
@@ -277,11 +300,12 @@ mod tests {
 	#[test]
 	fn product_0104_radar_empty_keeps_padded_axis_substrate_without_series() {
 		let fields =
-			MultivariateFields::new(&["a".to_owned(), "b".to_owned(), "c".to_owned()], None);
+			MultivariateFields::new(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()], None);
 		let kernel = RadarPlotKernel {
 			prepared_data: Arc::new(
 				MultivariateRows::from_rows(&fields, Vec::new()).expect("empty rows"),
 			),
+			category_colors: None,
 		};
 		assert_eq!(kernel.display_ranges(), [(0.0, 1.0); 3]);
 		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 300.0));
@@ -298,5 +322,36 @@ mod tests {
 			settings,
 		);
 		assert_eq!(backend.finish().matches("<path ").count(), 4);
+	}
+
+	#[test]
+	fn product_0105_radar_hover_remains_absent_in_a_non_origin_cell() {
+		let fields =
+			MultivariateFields::new(vec!["a".to_owned(), "b".to_owned(), "c".to_owned()], None);
+		let kernel = RadarPlotKernel {
+			prepared_data: Arc::new(
+				MultivariateRows::from_rows(
+					&fields,
+					vec![
+						crate::plot::kernels::multivariate_rows::MultivariateInputRow {
+							category: None,
+							values: vec![
+							crate::plot::kernels::multivariate_rows::MultivariateValueCell::Exact(1.0),
+							crate::plot::kernels::multivariate_rows::MultivariateValueCell::Exact(2.0),
+							crate::plot::kernels::multivariate_rows::MultivariateValueCell::Exact(3.0),
+						],
+						},
+					],
+				)
+				.expect("radar hover rows"),
+			),
+			category_colors: None,
+		};
+		let bounds = Rectangle::new(Point::new(240.0, 130.0), Size::new(200.0, 200.0));
+		let transform = CoordinateTransformer::new(&PlotLayout::Radial, bounds);
+		assert_eq!(
+			kernel.hover(&transform, Cursor::Available(Point::new(340.0, 230.0))),
+			None
+		);
 	}
 }

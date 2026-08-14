@@ -908,6 +908,40 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0105_eight_dimensions_and_category_project_without_a_transport_ceiling() {
+		let frame = Arc::new(
+			polars::df!(
+				"unused" => [99_i32],
+				"d8" => [8.0_f64],
+				"d1" => [1.0_f64],
+				"d6" => [6.0_f64],
+				"d3" => [3.0_f64],
+				"d7" => [7.0_f64],
+				"d2" => [2.0_f64],
+				"d5" => [5.0_f64],
+				"d4" => [4.0_f64],
+				"cohort" => ["West"],
+			)
+			.unwrap(),
+		);
+		let dimensions = ["d8", "d1", "d6", "d3", "d7", "d2", "d5", "d4"];
+		let spec = AuthoredPlotSpec::parallel(crate::plot::spec::MultivariateFields::new(
+			dimensions.iter().map(|field| (*field).to_owned()).collect(),
+			Some("cohort".to_owned()),
+		));
+		let projected = project_named_channels(&spec, frame, "eight-dimension parallel")
+			.expect("unbounded field iterator reaches projection");
+		assert_eq!(
+			projected
+				.get_column_names()
+				.iter()
+				.map(|name| name.as_str())
+				.collect::<Vec<_>>(),
+			["d8", "d1", "d6", "d3", "d7", "d2", "d5", "d4", "cohort"]
+		);
+	}
+
+	#[test]
 	fn plan_reports_a_missing_projection_column() {
 		let frame = df!("x" => [1_i32]).expect("frame");
 		let error = plan(PlotRequest {

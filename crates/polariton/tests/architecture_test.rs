@@ -195,7 +195,9 @@ fn product_0086_live_family_catalog_is_source_complete_and_renderer_free() {
 			"AREA",
 			"FUNNEL",
 			"RADIAL_DIAL",
-			"PIE"
+			"PIE",
+			"RADAR",
+			"PARALLEL"
 		]
 	);
 	let all = family_impl
@@ -537,7 +539,7 @@ fn product_0092_heatmap_surface_keeps_one_explicit_three_role_pipeline() {
 
 	assert!(spec.contains("pub struct HeatmapFields"));
 	assert!(spec.contains("pub enum MarkFields"));
-	assert!(spec.contains("Self::Heatmap(fields) => ["));
+	assert!(spec.contains("Self::Heatmap(fields) => fields.all().get(index).copied()"));
 	assert!(spec.contains("fn resolve_heatmap_channels("));
 	assert!(spec.contains("(PlotType::Heatmap, Channel::X | Channel::Y)"));
 	assert!(spec.contains("PlotType::Bar | PlotType::BoxPlot | PlotType::Heatmap"));
@@ -3046,9 +3048,9 @@ fn product_0094_mark_field_transport_is_exhaustive_coupled_and_identity_neutral(
 	] {
 		assert!(mark_fields.contains(variant));
 	}
-	assert!(mark_fields.contains("let fields: [Option<&str>; 7] = match self"));
-	assert!(mark_fields.contains("fields.into_iter().flatten()"));
-	assert!(!mark_fields.contains("Vec<") && !mark_fields.contains("vec!["));
+	assert!(mark_fields.contains("pub struct MarkFieldIter<'a>"));
+	assert!(mark_fields.contains("fields: &'a MarkFields"));
+	assert!(!mark_fields.contains("Box<dyn Iterator>"));
 
 	let projection = request
 		.split("fn project_named_channels(")
@@ -3249,8 +3251,7 @@ fn product_0098_funnel_surface_has_one_durable_assignment_and_transport_path() {
 
 	assert!(spec.contains("pub struct FunnelFields"));
 	assert!(spec.contains("MarkFields::Funnel"));
-	assert!(spec.contains("Self::Funnel(fields) => ["));
-	assert!(spec.contains("Some(&fields.stage),\n\t\t\t\tSome(&fields.value)"));
+	assert!(spec.contains("Self::Funnel(fields) => fields.all().get(index).copied()"));
 	assert!(spec.contains("fn resolve_funnel_channels("));
 	assert!(spec.contains("FieldAttribution::Role(\"stage\")"));
 	assert!(spec.contains("FieldAttribution::Role(\"value\")"));
@@ -3528,7 +3529,7 @@ fn product_0100_radial_dial_surface_reuses_transport_identity_and_one_colour_aut
 
 	assert!(spec.contains("pub struct RadialDialFields"));
 	assert!(spec.contains("MarkFields::RadialDial"));
-	assert!(spec.contains("Self::RadialDial(fields) => ["));
+	assert!(spec.contains("Self::RadialDial(fields) => match index"));
 	assert!(spec.contains("fn resolve_radial_dial_channels("));
 	for role in ["label", "value", "maximum"] {
 		assert!(spec.contains(&format!("FieldAttribution::Role(\"{role}\")")));
@@ -3743,7 +3744,7 @@ fn product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_author
 
 	assert!(spec.contains("pub struct PieFields"));
 	assert!(spec.contains("MarkFields::Pie"));
-	assert!(spec.contains("Self::Pie(fields) => ["));
+	assert!(spec.contains("Self::Pie(fields) => fields.all().get(index).copied()"));
 	assert!(spec.contains("fn resolve_pie_channels("));
 	assert!(spec.contains("FieldAttribution::Role(\"category\")"));
 	assert!(spec.contains("FieldAttribution::Role(\"value\")"));
@@ -3754,12 +3755,16 @@ fn product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_author
 		1,
 		"PRODUCT-0086 persistence costs exactly one conversion arm"
 	);
-	assert_eq!(
-		spec.matches("PlotType::Funnel | PlotType::RadialDial | PlotType::Pie")
-			.count(),
-		2,
-		"both authored category-domain enumerations must move together"
-	);
+	let authored_category_sites = spec
+		.match_indices("let authored_categories = matches!(")
+		.map(|(start, _)| &spec[start..(start + 420).min(spec.len())])
+		.collect::<Vec<_>>();
+	assert_eq!(authored_category_sites.len(), 2);
+	for site in authored_category_sites {
+		for plot_type in ["Funnel", "RadialDial", "Pie", "Radar", "Parallel"] {
+			assert!(site.contains(&format!("PlotType::{plot_type}")));
+		}
+	}
 
 	let projection = request
 		.split("fn project_named_channels(")
@@ -3868,6 +3873,100 @@ fn product_0104_radar_and_parallel_share_one_honest_multivariate_row_authority()
 	assert_eq!(
 		factory
 			.matches("PRODUCT-0104 planning validated this multivariate row collection")
+			.count(),
+		2
+	);
+}
+
+#[test]
+fn product_0105_variadic_multivariate_surface_has_one_transport_admission_and_colour_path() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let fields = std::fs::read_to_string(root.join("plot/spec/multivariate_fields.rs"))
+		.expect("read multivariate field carrier");
+	let rows = std::fs::read_to_string(root.join("plot/kernels/multivariate_rows.rs"))
+		.expect("read multivariate rows");
+	let radar =
+		std::fs::read_to_string(root.join("plot/kernels/radar.rs")).expect("read radar kernel");
+	let parallel = std::fs::read_to_string(root.join("plot/kernels/parallel.rs"))
+		.expect("read parallel kernel");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read factory");
+
+	assert!(spec.contains("pub struct MarkFieldIter<'a>"));
+	let iterator = spec
+		.split("pub struct MarkFieldIter<'a>")
+		.nth(1)
+		.and_then(|rest| rest.split("impl MarkFields").next())
+		.expect("concrete iterator block");
+	assert!(!iterator.contains("Vec<"));
+	assert!(!iterator.contains("Box<dyn Iterator"));
+	assert!(!spec.contains("[Option<&str>; 7]"));
+	assert!(spec.contains("Self::Radar(fields) | Self::Parallel(fields)"));
+	assert!(fields.contains("pub struct MultivariateFields"));
+	assert!(rows.contains("use crate::plot::spec::MultivariateFields;"));
+	assert!(!rows.contains("pub struct MultivariateFields"));
+
+	assert!(presentation.contains("(\"__radar\", raw_radar as RawFunction)"));
+	assert!(presentation.contains("(\"__parallel\", raw_parallel as RawFunction)"));
+	assert!(presentation.contains("(\"__category\", raw_mark_category as RawFunction)"));
+	assert!(presentation.contains("(values.len() - 2) % 3 != 0"));
+	assert!(presentation.contains("(3n + 2 values)"));
+	assert!(presentation.contains("validate_multivariate_dimension_count(field_count)"));
+	let category = presentation
+		.split("fn mark_category(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn ").next())
+		.expect("category modifier");
+	assert!(category.contains("SpannedMarkFields::Radar"));
+	assert!(category.contains("SpannedMarkFields::Parallel"));
+	assert!(!category.contains("mark.modified = true"));
+	assert!(compiler.contains("matches!(name.as_str(), \"radar\" | \"parallel\")"));
+
+	assert_eq!(
+		spec.matches("validate_multivariate_dimension_count(")
+			.count(),
+		3
+	);
+	assert_eq!(
+		spec.matches("PlotType::Radar => AuthoredFamilyId::RADAR")
+			.count(),
+		1
+	);
+	assert_eq!(
+		spec.matches("PlotType::Parallel => AuthoredFamilyId::PARALLEL")
+			.count(),
+		1
+	);
+	assert!(spec.contains("pub(crate) const ALL: [Self; 9]"));
+	let authored_blocks = spec.matches("let authored_categories = matches!(").count();
+	assert_eq!(authored_blocks, 2);
+	for plot_type in ["PlotType::Radar", "PlotType::Parallel"] {
+		assert_eq!(spec.matches(plot_type).filter(|_| true).count() > 0, true);
+		for block in spec.split("let authored_categories = matches!(").skip(1) {
+			let block = block.split(';').next().expect("authored category block");
+			assert!(
+				block.contains(plot_type),
+				"missing {plot_type} from authored categories"
+			);
+		}
+	}
+
+	for kernel in [&radar, &parallel] {
+		let production = kernel
+			.split("#[cfg(test)]")
+			.next()
+			.expect("kernel production");
+		assert!(production.contains("fn category_color("));
+		assert_eq!(production.matches("self.category_color(").count(), 2);
+		assert!(production.contains("self.category_colors"));
+	}
+	assert_eq!(
+		factory
+			.matches("category_colors: category.as_ref().and_then")
 			.count(),
 		2
 	);

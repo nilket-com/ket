@@ -15,7 +15,7 @@ use crate::plot::core::PlotType;
 use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
 use crate::plot::spec::{
 	BoxPlotFields, BubbleFields, BubblePreparationChannel, HeatmapFields, LayerMark, LayerSettings,
-	LayerSpec, LayeredPlotSpec, MarkFields, Override, PieFields, Presence,
+	LayerSpec, LayeredPlotSpec, MarkFields, MultivariateFields, Override, PieFields, Presence,
 };
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
@@ -152,7 +152,9 @@ impl StyledRunePlotSink {
 			| PlotType::Bubble
 			| PlotType::Funnel
 			| PlotType::RadialDial
-			| PlotType::Pie => {
+			| PlotType::Pie
+			| PlotType::Radar
+			| PlotType::Parallel => {
 				return Err(self);
 			}
 			other => unreachable!("styled Rune sink admitted unexpected plot type {other:?}"),
@@ -243,6 +245,8 @@ impl RuneViewIntent {
 						PlotType::Funnel => "plot.funnel".to_owned(),
 						PlotType::RadialDial => "plot.radial_dial".to_owned(),
 						PlotType::Pie => "plot.pie".to_owned(),
+						PlotType::Radar => "plot.radar".to_owned(),
+						PlotType::Parallel => "plot.parallel".to_owned(),
 						other => unreachable!(
 							"first-contact sink admitted unexpected plot type {other:?}"
 						),
@@ -366,6 +370,22 @@ pub(crate) struct PieFieldOrigins {
 	pub(crate) value: Range<u32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct MultivariateFieldOrigins {
+	pub(crate) dimensions: Vec<Range<u32>>,
+	pub(crate) category: Option<Range<u32>>,
+}
+
+impl MultivariateFieldOrigins {
+	pub(crate) fn dimension(&self, fields: &MultivariateFields, field: &str) -> Option<Range<u32>> {
+		fields
+			.dimensions()
+			.iter()
+			.position(|candidate| candidate == field)
+			.and_then(|index| self.dimensions.get(index).cloned())
+	}
+}
+
 impl HeatmapFieldOrigins {
 	pub(crate) fn keys(&self) -> Range<u32> {
 		self.x.start.min(self.y.start)..self.x.end.max(self.y.end)
@@ -451,6 +471,14 @@ pub(crate) enum SpannedMarkFields {
 		fields: PieFields,
 		origins: PieFieldOrigins,
 	},
+	Radar {
+		fields: MultivariateFields,
+		origins: MultivariateFieldOrigins,
+	},
+	Parallel {
+		fields: MultivariateFields,
+		origins: MultivariateFieldOrigins,
+	},
 }
 
 impl SpannedMarkFields {
@@ -462,6 +490,8 @@ impl SpannedMarkFields {
 			Self::Funnel { fields, .. } => MarkFields::Funnel(fields.clone()),
 			Self::RadialDial { fields, .. } => MarkFields::RadialDial(fields.clone()),
 			Self::Pie { fields, .. } => MarkFields::Pie(fields.clone()),
+			Self::Radar { fields, .. } => MarkFields::Radar(fields.clone()),
+			Self::Parallel { fields, .. } => MarkFields::Parallel(fields.clone()),
 		}
 	}
 
@@ -512,6 +542,16 @@ impl SpannedMarkFields {
 		}
 	}
 
+	pub(crate) fn multivariate(
+		&self,
+	) -> Option<(PlotType, &MultivariateFields, &MultivariateFieldOrigins)> {
+		match self {
+			Self::Radar { fields, origins } => Some((PlotType::Radar, fields, origins)),
+			Self::Parallel { fields, origins } => Some((PlotType::Parallel, fields, origins)),
+			_ => None,
+		}
+	}
+
 	fn semantic_eq(&self, other: &Self) -> bool {
 		match (self, other) {
 			(Self::BoxPlot { fields: left, .. }, Self::BoxPlot { fields: right, .. }) => {
@@ -530,6 +570,8 @@ impl SpannedMarkFields {
 				left == right
 			}
 			(Self::Pie { fields: left, .. }, Self::Pie { fields: right, .. }) => left == right,
+			(Self::Radar { fields: left, .. }, Self::Radar { fields: right, .. })
+			| (Self::Parallel { fields: left, .. }, Self::Parallel { fields: right, .. }) => left == right,
 			_ => false,
 		}
 	}

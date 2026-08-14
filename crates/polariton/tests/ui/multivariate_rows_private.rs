@@ -4,6 +4,9 @@ mod plot {
 	pub(crate) mod exact_numeric {
 		include!("../../src/plot/exact_numeric.rs");
 	}
+	pub(crate) mod spec {
+		include!("../../src/plot/spec/multivariate_fields.rs");
+	}
 }
 
 #[path = "../../src/plot/kernels/multivariate_rows.rs"]

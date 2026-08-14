@@ -1,0 +1,28 @@
+let radar_rows = workspace.table("radar_probe");
+let parallel_rows = workspace.table("parallel_probe");
+
+radar_rows.views([
+	view("radar-authored", figure([
+		title("Radar · authored dimension order"),
+		subtitle("Axes follow quality, speed, reliability, reach; categories are lexical"),
+		skin("nord"),
+		radar("quality", "speed", "reliability", "reach").category("team"),
+	])),
+]);
+
+parallel_rows.views([
+	view("parallel-eight-dimensions", figure([
+		title("Parallel · eight authored dimensions"),
+		subtitle("Projection exceeds PRODUCT-0094's former seven-field ceiling"),
+		skin("nord"),
+		parallel("d8", "d1", "d6", "d3", "d7", "d2", "d5", "d4")
+			.category("cohort"),
+	])),
+	view("parallel-faceted-hover", figure([
+		title("Parallel · non-origin facet hover"),
+		subtitle("Hover axes in both cells; the second cell has a non-zero origin"),
+		skin("nord"),
+		facet("cohort"),
+		parallel("d8", "d1", "d6", "d3", "d7", "d2", "d5", "d4"),
+	])),
+]);

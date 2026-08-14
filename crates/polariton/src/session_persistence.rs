@@ -1120,6 +1120,52 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0105_multivariate_families_round_trip_only_under_the_extensible_policy() {
+		for (raw_id, raw_buffer, plot_type, token) in [
+			(105_u64, 105_u64, PlotType::Radar, "radar"),
+			(106_u64, 106_u64, PlotType::Parallel, "parallel"),
+		] {
+			let document = DocumentId::new(raw_id).unwrap();
+			let buffer = BufferId::new(raw_buffer);
+			let view = LocalViewIdentity::Named(token.into());
+			let identity = colour_identity(plot_type, false);
+			let mut meanings = empty_meanings();
+			meanings
+				.colours
+				.insert((document, view.clone(), 4), identity.clone());
+			let bytes = meanings.encode().unwrap();
+			let text = String::from_utf8(bytes.clone()).unwrap();
+			assert!(text.contains(&format!("\"family\":\"{token}\"")), "{text}");
+			for schema in [INITIAL_CLOSED_SCHEMA, AREA_CLOSED_SCHEMA] {
+				let error = DurableMeanings::decode(schema, &bytes).unwrap_err();
+				assert!(
+					error.to_string().contains(&format!(
+						"authored family {token} is unsupported by this schema's family policy"
+					)),
+					"{error}"
+				);
+			}
+			assert_eq!(
+				DurableMeanings::decode(SCHEMA_VERSION, &bytes).unwrap(),
+				meanings
+			);
+
+			let census = SharedIdentityCensus {
+				documents: [document].into_iter().collect(),
+				host_panels: BTreeSet::new(),
+				host_panel_groups: BTreeSet::new(),
+			};
+			let runtime = meanings
+				.join_runtime(&[(document, buffer)].into_iter().collect(), &census)
+				.unwrap();
+			assert_eq!(
+				runtime.colours.as_map().get(&(buffer, view.clone(), 4)),
+				Some(&identity)
+			);
+		}
+	}
+
+	#[test]
 	fn product_0086_family_admission_policies_and_token_validation_are_exact() {
 		let document = DocumentId::new(86).unwrap();
 		let mut meanings = empty_meanings();

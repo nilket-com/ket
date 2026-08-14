@@ -9,9 +9,11 @@
 #![allow(dead_code)] // Stage 1 publishes vocabulary consumed by stages 2 and 3.
 
 mod bubble_fields;
+mod multivariate_fields;
 
 pub use bubble_fields::{BubbleFieldNames, BubbleFields};
 pub(crate) use bubble_fields::{BubbleNumericField, BubblePreparationChannel};
+pub use multivariate_fields::MultivariateFields;
 
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
@@ -421,67 +423,84 @@ pub enum MarkFields {
 	Funnel(FunnelFields),
 	RadialDial(RadialDialFields),
 	Pie(PieFields),
+	Radar(MultivariateFields),
+	Parallel(MultivariateFields),
 }
 
+/// Allocation-free borrowed traversal over every field selected by a mark.
+pub struct MarkFieldIter<'a> {
+	fields: &'a MarkFields,
+	index: usize,
+}
+
+impl<'a> Iterator for MarkFieldIter<'a> {
+	type Item = &'a str;
+
+	fn next(&mut self) -> Option<Self::Item> {
+		let field = self.fields.field_at(self.index)?;
+		self.index += 1;
+		Some(field)
+	}
+
+	fn size_hint(&self) -> (usize, Option<usize>) {
+		let remaining = self.fields.field_count().saturating_sub(self.index);
+		(remaining, Some(remaining))
+	}
+}
+
+impl ExactSizeIterator for MarkFieldIter<'_> {}
+
 impl MarkFields {
-	pub fn all(&self) -> impl Iterator<Item = &str> {
-		let fields: [Option<&str>; 7] = match self {
-			Self::BoxPlot(fields) => [
-				Some(&fields.category),
-				Some(&fields.whisker_low),
-				Some(&fields.q1),
-				Some(&fields.median),
-				Some(&fields.q3),
-				Some(&fields.whisker_high),
-				Some(&fields.outlier),
-			],
-			Self::Heatmap(fields) => [
-				Some(&fields.x),
-				Some(&fields.y),
-				Some(&fields.value),
-				None,
-				None,
-				None,
-				None,
-			],
-			Self::Bubble(fields) => [
-				Some(fields.numeric.get(BubbleNumericField::X)),
-				Some(fields.numeric.get(BubbleNumericField::Y)),
-				Some(fields.numeric.get(BubbleNumericField::Size)),
-				Some(fields.numeric.get(BubbleNumericField::Color)),
-				fields.label.as_deref(),
-				None,
-				None,
-			],
-			Self::Funnel(fields) => [
-				Some(&fields.stage),
-				Some(&fields.value),
-				None,
-				None,
-				None,
-				None,
-				None,
-			],
-			Self::RadialDial(fields) => [
-				Some(&fields.value),
-				Some(&fields.maximum),
-				fields.label.as_deref(),
-				None,
-				None,
-				None,
-				None,
-			],
-			Self::Pie(fields) => [
-				Some(&fields.category),
-				Some(&fields.value),
-				None,
-				None,
-				None,
-				None,
-				None,
-			],
-		};
-		fields.into_iter().flatten()
+	pub fn all(&self) -> MarkFieldIter<'_> {
+		MarkFieldIter {
+			fields: self,
+			index: 0,
+		}
+	}
+
+	fn field_count(&self) -> usize {
+		match self {
+			Self::BoxPlot(_) => 7,
+			Self::Heatmap(_) => 3,
+			Self::Bubble(fields) => 4 + usize::from(fields.label.is_some()),
+			Self::Funnel(_) | Self::Pie(_) => 2,
+			Self::RadialDial(fields) => 2 + usize::from(fields.label.is_some()),
+			Self::Radar(fields) | Self::Parallel(fields) => {
+				fields.dimensions().len() + usize::from(fields.category().is_some())
+			}
+		}
+	}
+
+	fn field_at(&self, index: usize) -> Option<&str> {
+		match self {
+			Self::BoxPlot(fields) => fields.all().get(index).copied(),
+			Self::Heatmap(fields) => fields.all().get(index).copied(),
+			Self::Bubble(fields) => match index {
+				0 => Some(fields.numeric.get(BubbleNumericField::X)),
+				1 => Some(fields.numeric.get(BubbleNumericField::Y)),
+				2 => Some(fields.numeric.get(BubbleNumericField::Size)),
+				3 => Some(fields.numeric.get(BubbleNumericField::Color)),
+				4 => fields.label.as_deref(),
+				_ => None,
+			},
+			Self::Funnel(fields) => fields.all().get(index).copied(),
+			Self::RadialDial(fields) => match index {
+				0 => Some(&fields.value),
+				1 => Some(&fields.maximum),
+				2 => fields.label.as_deref(),
+				_ => None,
+			},
+			Self::Pie(fields) => fields.all().get(index).copied(),
+			Self::Radar(fields) | Self::Parallel(fields) => fields
+				.dimensions()
+				.get(index)
+				.map(String::as_str)
+				.or_else(|| {
+					(index == fields.dimensions().len())
+						.then_some(fields.category())
+						.flatten()
+				}),
+		}
 	}
 }
 
@@ -677,6 +696,38 @@ impl AuthoredPlotSpec {
 	pub fn pie_fields(&self) -> Option<&PieFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::Pie(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn radar(fields: MultivariateFields) -> Self {
+		Self::multivariate(PlotType::Radar, MarkFields::Radar(fields))
+	}
+
+	pub fn parallel(fields: MultivariateFields) -> Self {
+		Self::multivariate(PlotType::Parallel, MarkFields::Parallel(fields))
+	}
+
+	fn multivariate(plot_type: PlotType, mark_fields: MarkFields) -> Self {
+		let fields = match &mark_fields {
+			MarkFields::Radar(fields) | MarkFields::Parallel(fields) => fields,
+			_ => unreachable!("multivariate constructor requires multivariate fields"),
+		};
+		let first = fields.dimensions().first().cloned().unwrap_or_default();
+		let second = fields
+			.dimensions()
+			.get(1)
+			.cloned()
+			.unwrap_or_else(|| first.clone());
+		let mut spec = Self::xy(PlotComposition::single(plot_type), first, second);
+		spec.mark_fields = Some(mark_fields);
+		spec
+	}
+
+	pub fn multivariate_fields(&self) -> Option<(PlotType, &MultivariateFields)> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::Radar(fields)) => Some((PlotType::Radar, fields)),
+			Some(MarkFields::Parallel(fields)) => Some((PlotType::Parallel, fields)),
 			_ => None,
 		}
 	}
@@ -953,10 +1004,12 @@ impl AuthoredFamilyId {
 	pub(crate) const FUNNEL: Self = Self(Cow::Borrowed("funnel"));
 	pub(crate) const RADIAL_DIAL: Self = Self(Cow::Borrowed("radial_dial"));
 	pub(crate) const PIE: Self = Self(Cow::Borrowed("pie"));
+	pub(crate) const RADAR: Self = Self(Cow::Borrowed("radar"));
+	pub(crate) const PARALLEL: Self = Self(Cow::Borrowed("parallel"));
 
 	/// Exhaustive catalog of identifiers this binary can originate from authored
 	/// source. It is intentionally narrower than the checked persistence grammar.
-	pub(crate) const ALL: [Self; 7] = [
+	pub(crate) const ALL: [Self; 9] = [
 		Self::SCATTER,
 		Self::BAR,
 		Self::LINE,
@@ -964,6 +1017,8 @@ impl AuthoredFamilyId {
 		Self::FUNNEL,
 		Self::RADIAL_DIAL,
 		Self::PIE,
+		Self::RADAR,
+		Self::PARALLEL,
 	];
 
 	pub(crate) fn parse(value: String) -> Result<Self, String> {
@@ -1002,6 +1057,8 @@ impl ColorLayerIdentity {
 			PlotType::Funnel => AuthoredFamilyId::FUNNEL,
 			PlotType::RadialDial => AuthoredFamilyId::RADIAL_DIAL,
 			PlotType::Pie => AuthoredFamilyId::PIE,
+			PlotType::Radar => AuthoredFamilyId::RADAR,
+			PlotType::Parallel => AuthoredFamilyId::PARALLEL,
 			PlotType::StackedBar | PlotType::HorizontalStackedBar => unreachable!(
 				"PRODUCT-0064 requires stacked bar colour lineage to retain authored Bar identity"
 			),
@@ -1791,6 +1848,11 @@ pub fn resolve_channels(
 	if plot_type == PlotType::Pie && spec.pie_fields().is_some() {
 		return resolve_pie_channels(spec, schema);
 	}
+	if matches!(plot_type, PlotType::Radar | PlotType::Parallel)
+		&& spec.multivariate_fields().is_some()
+	{
+		return resolve_multivariate_channels(spec, schema);
+	}
 	let legacy_automatic_area = plot_type == PlotType::StackedArea
 		&& matches!(spec.x.field, AuthoredChannel::Auto)
 		&& matches!(spec.y.field, AuthoredChannel::Auto)
@@ -2472,6 +2534,92 @@ fn resolve_pie_channels(
 	})
 }
 
+fn resolve_multivariate_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let (plot_type, fields) = spec.multivariate_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("dimension"),
+		field: "<dimensions>".to_owned(),
+		reason: "Radar and parallel require explicit dimension fields".to_owned(),
+	})?;
+	plot_type
+		.validate_multivariate_dimension_count(fields.dimensions().len())
+		.map_err(|reason| ChannelError {
+			attribution: FieldAttribution::Role("dimension"),
+			field: "<dimensions>".to_owned(),
+			reason,
+		})?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type,
+	};
+	let mut used = HashSet::new();
+	let category = fields
+		.category()
+		.map(|category| {
+			resolve_required(
+				Channel::X,
+				&AuthoredChannelSpec::named(category),
+				plot_type,
+				&layer,
+				false,
+				schema,
+				&mut used,
+			)
+			.map_err(|mut error| {
+				error.attribution = FieldAttribution::Role("category");
+				error
+			})
+		})
+		.transpose()?;
+	let mut dimensions = Vec::with_capacity(fields.dimensions().len());
+	for dimension in fields.dimensions() {
+		let resolved = resolve_required(
+			Channel::Y,
+			&AuthoredChannelSpec::named(dimension),
+			plot_type,
+			&layer,
+			false,
+			schema,
+			&mut used,
+		)
+		.map_err(|mut error| {
+			error.attribution = FieldAttribution::Role("dimension");
+			error
+		})?;
+		dimensions.push(resolved);
+	}
+	let mut channels = Vec::with_capacity(dimensions.len() + usize::from(category.is_some()));
+	if let Some(category) = category {
+		channels.push(category);
+	}
+	channels.extend(dimensions);
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels,
+		kernel_fields: Box::new(match plot_type {
+			PlotType::Radar => ResolvedKernelFields::Radar {
+				dimensions: fields.dimensions().to_vec(),
+				category: fields.category().map(str::to_owned),
+			},
+			PlotType::Parallel => ResolvedKernelFields::Parallel {
+				dimensions: fields.dimensions().to_vec(),
+				category: fields.category().map(str::to_owned),
+			},
+			_ => unreachable!("multivariate resolver admitted {plot_type:?}"),
+		}),
+		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
+		categorical_limit: if fields.category().is_some() {
+			DEFAULT_CATEGORICAL_LIMIT
+		} else {
+			0
+		},
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
 fn resolve_bar_orientation(x: &BoundChannel, y: &BoundChannel) -> Result<PlotType, ChannelError> {
 	match (
 		x.semantic_type == SemanticType::Quantitative,
@@ -2664,7 +2812,11 @@ pub fn resolve_domains(
 		let domain = resolve_domain(column, &channel)?;
 		let authored_categories = matches!(
 			binding.composition.primary_plot_type(),
-			PlotType::Funnel | PlotType::RadialDial | PlotType::Pie
+			PlotType::Funnel
+				| PlotType::RadialDial
+				| PlotType::Pie
+				| PlotType::Radar
+				| PlotType::Parallel
 		) && channel.channel == Channel::X;
 		let colors = if (channel.channel == Channel::Color
 			&& color_job == Some(ColorJob::Categorical))
@@ -2750,7 +2902,11 @@ pub fn resolve_domains_with_categorical_palette(
 			resolve_domain(column, &channel).map_err(CategoricalResolutionError::Domain)?;
 		let authored_categories = matches!(
 			binding.composition.primary_plot_type(),
-			PlotType::Funnel | PlotType::RadialDial | PlotType::Pie
+			PlotType::Funnel
+				| PlotType::RadialDial
+				| PlotType::Pie
+				| PlotType::Radar
+				| PlotType::Parallel
 		) && channel.channel == Channel::X;
 		let colors = if (channel.channel == Channel::Color
 			&& color_job == Some(ColorJob::Categorical))
@@ -2961,22 +3117,24 @@ fn resolve_automatic_kernel_fields(
 			value: number(0, "value")?,
 		},
 		PlotType::Parallel => ResolvedKernelFields::Parallel {
-			dimensions: (!numeric.is_empty())
-				.then(|| numeric.clone())
-				.ok_or_else(|| ChannelError {
+			dimensions: plot_type
+				.validate_multivariate_dimension_count(numeric.len())
+				.map(|()| numeric.clone())
+				.map_err(|reason| ChannelError {
 					attribution: FieldAttribution::Channel(Channel::Y),
 					field: "<dimensions>".to_owned(),
-					reason: "Parallel requires at least one numeric dimension".to_owned(),
+					reason,
 				})?,
 			category: optional_category(0),
 		},
 		PlotType::Radar => ResolvedKernelFields::Radar {
-			dimensions: (!numeric.is_empty())
-				.then(|| numeric.clone())
-				.ok_or_else(|| ChannelError {
+			dimensions: plot_type
+				.validate_multivariate_dimension_count(numeric.len())
+				.map(|()| numeric.clone())
+				.map_err(|reason| ChannelError {
 					attribution: FieldAttribution::Channel(Channel::Y),
 					field: "<dimensions>".to_owned(),
-					reason: "Radar requires at least one numeric dimension".to_owned(),
+					reason,
 				})?,
 			category: optional_category(0),
 		},
@@ -3198,6 +3356,10 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		(PlotType::RadialDial, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Pie, Channel::X) => semantic == SemanticType::Nominal,
 		(PlotType::Pie, Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::Radar | PlotType::Parallel, Channel::X) => semantic == SemanticType::Nominal,
+		(PlotType::Radar | PlotType::Parallel, Channel::Y) => {
+			semantic == SemanticType::Quantitative
+		}
 		(_, Channel::Color) => true,
 		_ => false,
 	}
@@ -3943,6 +4105,169 @@ mod tests {
 		})
 	}
 
+	fn multivariate_spec(
+		plot_type: PlotType,
+		dimensions: &[&str],
+		category: Option<&str>,
+	) -> AuthoredPlotSpec {
+		let fields = MultivariateFields::new(
+			dimensions.iter().map(|field| (*field).to_owned()).collect(),
+			category.map(str::to_owned),
+		);
+		match plot_type {
+			PlotType::Radar => AuthoredPlotSpec::radar(fields),
+			PlotType::Parallel => AuthoredPlotSpec::parallel(fields),
+			_ => panic!("multivariate fixture requires radar or parallel"),
+		}
+	}
+
+	#[test]
+	fn product_0105_multivariate_surfaces_share_admission_and_preserve_authored_dimensions() {
+		let frame = df!(
+			"group" => ["Zulu", "Alpha"],
+			"fourth" => [40.0_f64, 41.0],
+			"first" => [1_i64, 2],
+			"third" => [30.0_f64, 31.0],
+			"second" => [20_i64, 21],
+		)
+		.unwrap();
+		for (plot_type, dimensions) in [
+			(PlotType::Radar, &["fourth", "first", "third"][..]),
+			(PlotType::Parallel, &["second", "fourth"][..]),
+		] {
+			let spec = multivariate_spec(plot_type, dimensions, Some("group"));
+			let binding = resolve_channels(&spec, frame.schema().as_ref())
+				.expect("authored multivariate fields bind");
+			assert_eq!(binding.channels[0].semantic_type, SemanticType::Nominal);
+			assert!(
+				binding.channels[1..]
+					.iter()
+					.all(|channel| channel.semantic_type == SemanticType::Quantitative)
+			);
+			let (actual_dimensions, category) = match binding.kernel_fields.as_ref() {
+				ResolvedKernelFields::Radar {
+					dimensions,
+					category,
+				}
+				| ResolvedKernelFields::Parallel {
+					dimensions,
+					category,
+				} => (dimensions, category),
+				other => panic!("unexpected fields: {other:?}"),
+			};
+			assert_eq!(actual_dimensions, dimensions);
+			assert_eq!(category.as_deref(), Some("group"));
+		}
+
+		for (plot_type, too_few, exact) in [
+			(
+				PlotType::Radar,
+				&["first", "second"][..],
+				&["first", "second", "third"][..],
+			),
+			(PlotType::Parallel, &["first"][..], &["first", "second"][..]),
+		] {
+			let error = resolve_channels(
+				&multivariate_spec(plot_type, too_few, None),
+				frame.schema().as_ref(),
+			)
+			.unwrap_err();
+			assert!(error.reason.contains("requires at least"), "{error}");
+			resolve_channels(
+				&multivariate_spec(plot_type, exact, None),
+				frame.schema().as_ref(),
+			)
+			.expect("exact geometry minimum binds");
+		}
+	}
+
+	#[test]
+	fn product_0105_automatic_minimums_and_surface_dtype_matrix_are_closed() {
+		let one_numeric = df!("only" => [1.0_f64]).unwrap();
+		for plot_type in [PlotType::Radar, PlotType::Parallel] {
+			let error = resolve_automatic_kernel_fields(plot_type, one_numeric.schema().as_ref())
+				.unwrap_err();
+			assert!(error.reason.contains("requires at least"), "{error}");
+		}
+
+		let radar_min = df!("a" => [1.0], "b" => [2.0], "c" => [3.0]).unwrap();
+		resolve_automatic_kernel_fields(PlotType::Radar, radar_min.schema().as_ref())
+			.expect("automatic radar exact minimum");
+		let parallel_min = df!("a" => [1.0], "b" => [2.0]).unwrap();
+		resolve_automatic_kernel_fields(PlotType::Parallel, parallel_min.schema().as_ref())
+			.expect("automatic parallel exact minimum");
+
+		let categorical_dimension = df!(
+			"a" => ["bad"], "b" => [2.0], "c" => [3.0], "group" => ["A"]
+		)
+		.unwrap();
+		let error = resolve_channels(
+			&multivariate_spec(PlotType::Radar, &["a", "b", "c"], Some("group")),
+			categorical_dimension.schema().as_ref(),
+		)
+		.unwrap_err();
+		assert_eq!(error.attribution, FieldAttribution::Role("dimension"));
+
+		let numeric_category = df!(
+			"a" => [1.0], "b" => [2.0], "c" => [3.0], "group" => [4.0]
+		)
+		.unwrap();
+		let error = resolve_channels(
+			&multivariate_spec(PlotType::Radar, &["a", "b", "c"], Some("group")),
+			numeric_category.schema().as_ref(),
+		)
+		.unwrap_err();
+		assert_eq!(error.attribution, FieldAttribution::Role("category"));
+	}
+
+	#[test]
+	fn product_0105_grouped_ungrouped_and_automatic_colour_origins_are_distinct() {
+		let grouped = stamped(
+			df!(
+				"group" => ["B", "A"], "a" => [1.0, 2.0], "b" => [2.0, 3.0], "c" => [3.0, 4.0]
+			)
+			.unwrap(),
+		);
+		let grouped_spec = multivariate_spec(PlotType::Radar, &["a", "b", "c"], Some("group"));
+		let (resolved, identity) = resolve(&grouped_spec, &grouped, &ColorIdentity::default())
+			.expect("grouped radar resolves complete identity");
+		let assignments = &resolved.channel(Channel::X).unwrap().colors;
+		assert_eq!(assignments.len(), 2);
+		let mut assigned = assignments
+			.iter()
+			.map(|entry| entry.category.as_str())
+			.collect::<Vec<_>>();
+		assigned.sort_unstable();
+		assert_eq!(assigned, ["A", "B"]);
+		assert!(
+			identity
+				.assignments
+				.keys()
+				.all(|key| { key.layer.family == AuthoredFamilyId::RADAR && key.field == "group" })
+		);
+
+		let ungrouped = stamped(
+			df!(
+				"a" => [1.0], "b" => [2.0], "c" => [3.0]
+			)
+			.unwrap(),
+		);
+		let (resolved, identity) = resolve(
+			&multivariate_spec(PlotType::Radar, &["a", "b", "c"], None),
+			&ungrouped,
+			&ColorIdentity::default(),
+		)
+		.unwrap();
+		assert!(resolved.channel(Channel::X).is_none());
+		assert!(identity.is_empty());
+
+		let automatic = AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Radar));
+		let (resolved, identity) =
+			resolve(&automatic, &ungrouped, &ColorIdentity::default()).unwrap();
+		assert!(resolved.channel(Channel::X).is_none());
+		assert!(identity.is_empty());
+	}
+
 	#[test]
 	fn product_0103_pie_binds_grouped_roles_and_allocates_complete_categories() {
 		let grouped = stamped(
@@ -4589,7 +4914,9 @@ mod tests {
 				"area",
 				"funnel",
 				"radial_dial",
-				"pie"
+				"pie",
+				"radar",
+				"parallel",
 			]
 		);
 		assert_eq!(
@@ -4605,6 +4932,8 @@ mod tests {
 			(PlotType::Funnel, "funnel"),
 			(PlotType::RadialDial, "radial_dial"),
 			(PlotType::Pie, "pie"),
+			(PlotType::Radar, "radar"),
+			(PlotType::Parallel, "parallel"),
 		] {
 			let actual = ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 				ordinal: 7,
@@ -4663,7 +4992,7 @@ mod tests {
 		let unregistered = std::panic::catch_unwind(|| {
 			ColorLayerIdentity::from_authored_layer(&LayerIdentity {
 				ordinal: 0,
-				plot_type: PlotType::Radar,
+				plot_type: PlotType::Violin,
 			})
 		})
 		.expect_err("unregistered authored family must expose the missing conversion");

@@ -2,6 +2,7 @@ use crate::plot::common::{
 	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
 use crate::plot::kernels::multivariate_rows::MultivariateRows;
+use crate::plot::spec::CategoryColorAssignment;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -9,6 +10,9 @@ use std::sync::Arc;
 
 pub struct ParallelPlotKernel {
 	pub prepared_data: Arc<MultivariateRows>,
+	/// Present only for grouped authored figures; ungrouped and automatic
+	/// figures deliberately retain the positional compatibility path.
+	pub category_colors: Option<Vec<CategoryColorAssignment>>,
 }
 
 impl ParallelPlotKernel {
@@ -17,6 +21,38 @@ impl ParallelPlotKernel {
 			.extrema()
 			.map(<[(f64, f64)]>::to_vec)
 			.unwrap_or_else(|| vec![(0.0, 1.0); self.prepared_data.dimensions().len()])
+	}
+
+	fn category_color(
+		&self,
+		category: Option<&str>,
+		settings: &ResolvedPlotSettings,
+	) -> iced::Color {
+		if let Some(assignments) = &self.category_colors {
+			let category = category
+				.expect("PRODUCT-0105 authored multivariate assignments have named categories");
+			let assignment = assignments
+				.iter()
+				.find(|assignment| assignment.category == category)
+				.expect("PRODUCT-0105 authored parallel categories have complete assignments");
+			return iced::Color::from_rgba8(
+				assignment.color.red,
+				assignment.color.green,
+				assignment.color.blue,
+				assignment.color.alpha as f32 / u8::MAX as f32,
+			);
+		}
+		let count = self.prepared_data.categories().len();
+		let index = self
+			.prepared_data
+			.category_position(category)
+			.expect("PRODUCT-0104 validated every row category against its catalog");
+		let position = if count > 1 {
+			index as f32 / (count - 1) as f32
+		} else {
+			0.5
+		};
+		settings.color_theme.get_color(position)
 	}
 }
 
@@ -40,18 +76,8 @@ impl PlotKernel for ParallelPlotKernel {
 		if num_dims < 2 {
 			return;
 		}
-		let category_count = self.prepared_data.categories().len();
 		for row in self.prepared_data.iter() {
-			let cat_idx = self
-				.prepared_data
-				.category_position(row.category())
-				.expect("PRODUCT-0104 validated every row category against its catalog");
-			let t = if category_count > 1 {
-				cat_idx as f32 / (category_count - 1) as f32
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(t);
+			let color = self.category_color(row.category(), &settings);
 			let stroke = Stroke {
 				style: Style::Solid(color),
 				width: 1.5,
@@ -77,12 +103,15 @@ impl PlotKernel for ParallelPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
-			self.prepared_data
-				.categories()
-				.iter()
-				.map(|category| category.as_deref().unwrap_or("All Data").to_owned()),
-			settings,
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
+			self.prepared_data.categories().iter().map(|category| {
+				(
+					category.as_deref().unwrap_or("All Data").to_owned(),
+					self.category_color(category.as_deref(), settings),
+				)
+			}),
+			crate::plot::legend::LegendSample::Swatch,
+			crate::plot::legend::LegendProvenance::Named,
 		)
 	}
 
@@ -141,6 +170,7 @@ mod tests {
 				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
 					.expect("valid parallel oracle"),
 			),
+			category_colors: None,
 		};
 		let settings = ResolvedPlotSettings::default();
 		let layout = kernel.layout(settings.clone());
@@ -178,14 +208,15 @@ mod tests {
 
 	#[test]
 	fn product_0104_parallel_empty_keeps_axis_ranges_without_series() {
-		let fields = crate::plot::kernels::multivariate_rows::MultivariateFields::new(
-			&["left".to_owned(), "right".to_owned()],
+		let fields = crate::plot::spec::MultivariateFields::new(
+			vec!["left".to_owned(), "right".to_owned()],
 			None,
 		);
 		let kernel = ParallelPlotKernel {
 			prepared_data: Arc::new(
 				MultivariateRows::from_rows(&fields, Vec::new()).expect("empty rows"),
 			),
+			category_colors: None,
 		};
 		let layout = kernel.layout(ResolvedPlotSettings::default());
 		let PlotLayout::Parallel { dimensions, ranges } = layout else {
@@ -209,6 +240,7 @@ mod tests {
 				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
 					.expect("all repeated-category observations remain valid"),
 			),
+			category_colors: None,
 		};
 		let settings = ResolvedPlotSettings::default();
 		let layout = kernel.layout(settings.clone());
@@ -223,5 +255,38 @@ mod tests {
 			settings,
 		);
 		assert_eq!(backend.finish().matches("<path ").count(), 3);
+	}
+
+	#[test]
+	fn product_0105_parallel_hover_uses_non_origin_widget_bounds() {
+		let fields = crate::plot::spec::MultivariateFields::new(
+			vec!["left".to_owned(), "right".to_owned()],
+			None,
+		);
+		let kernel = ParallelPlotKernel {
+			prepared_data: Arc::new(
+				MultivariateRows::from_rows(
+					&fields,
+					vec![
+						crate::plot::kernels::multivariate_rows::MultivariateInputRow {
+							category: None,
+							values: vec![
+							crate::plot::kernels::multivariate_rows::MultivariateValueCell::Exact(0.0),
+							crate::plot::kernels::multivariate_rows::MultivariateValueCell::Exact(100.0),
+						],
+						},
+					],
+				)
+				.expect("parallel hover rows"),
+			),
+			category_colors: None,
+		};
+		let layout = kernel.layout(ResolvedPlotSettings::default());
+		let bounds = Rectangle::new(Point::new(240.0, 130.0), Size::new(200.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		assert_eq!(
+			kernel.hover(&transform, Cursor::Available(Point::new(440.0, 130.0))),
+			Some("right: 100.00".to_owned())
+		);
 	}
 }

@@ -1012,6 +1012,8 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 				AuthoredPlotSpec::radial_dial(fields)
 			}
 			crate::plot::spec::MarkFields::Pie(fields) => AuthoredPlotSpec::pie(fields),
+			crate::plot::spec::MarkFields::Radar(fields) => AuthoredPlotSpec::radar(fields),
+			crate::plot::spec::MarkFields::Parallel(fields) => AuthoredPlotSpec::parallel(fields),
 		};
 	}
 	if sink.composition.primary_plot_type() == PlotType::Histogram {
@@ -1348,6 +1350,53 @@ fn pie_failure_span(
 				| PieSlicesError::NonPositiveTotal { .. },
 			),
 		) => origins.value.clone(),
+		Ok(_) => mark.clone(),
+	}
+}
+
+#[cfg(feature = "toron")]
+fn multivariate_failure_span(
+	data: &DataFrame,
+	plot_type: PlotType,
+	fields: &crate::plot::spec::MultivariateFields,
+	origins: &crate::rune_relation_envelope::MultivariateFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let authored = match plot_type {
+		PlotType::Radar => AuthoredPlotSpec::radar(fields.clone()),
+		PlotType::Parallel => AuthoredPlotSpec::parallel(fields.clone()),
+		_ => unreachable!("multivariate diagnostic admitted {plot_type:?}"),
+	};
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return origins
+			.dimension(fields, &error.field)
+			.or_else(|| {
+				(fields.category() == Some(error.field.as_str()))
+					.then(|| origins.category.clone())
+					.flatten()
+			})
+			.unwrap_or_else(|| mark.clone());
+	}
+	use crate::plot::kernels::multivariate_rows::{
+		MultivariatePreparationError, MultivariateRowsError, prepare_multivariate_rows,
+	};
+	match prepare_multivariate_rows(data, fields.dimensions(), fields.category()) {
+		Err(
+			MultivariatePreparationError::MissingDimension { field }
+			| MultivariatePreparationError::UnsupportedDimension { field }
+			| MultivariatePreparationError::Rows(
+				MultivariateRowsError::NullValue { field, .. }
+				| MultivariateRowsError::InexactValue { field, .. }
+				| MultivariateRowsError::NonFiniteValue { field, .. },
+			),
+		) => origins
+			.dimension(fields, &field)
+			.unwrap_or_else(|| mark.clone()),
+		Err(
+			MultivariatePreparationError::MissingCategory { .. }
+			| MultivariatePreparationError::UnsupportedCategory { .. }
+			| MultivariatePreparationError::Rows(MultivariateRowsError::NullCategory { .. }),
+		) => origins.category.clone().unwrap_or_else(|| mark.clone()),
 		Ok(_) => mark.clone(),
 	}
 }
@@ -1847,6 +1896,15 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.pie()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let multivariate_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (plot_type, fields, origins) = sink.mark_fields.as_ref()?.multivariate()?;
+				Some((
+					plot_type,
+					fields.clone(),
+					origins.clone(),
+					sink.origin.clone(),
+				))
+			});
 			let body_output_span = match &view.intent {
 				RuneViewIntent::Plot(plot) => match &plot.body {
 					RunePlotBody::Single(sink)
@@ -2199,6 +2257,13 @@ fn rune_view_outcome_with_palettes(
 					pie_failure_span(frame.as_ref(), fields, origins, mark)
 				})
 			});
+			let multivariate_output_span = output.as_ref().err().and_then(|_| {
+				multivariate_diagnostic
+					.as_ref()
+					.map(|(plot_type, fields, origins, mark)| {
+						multivariate_failure_span(frame.as_ref(), *plot_type, fields, origins, mark)
+					})
+			});
 			RuneRelationSinkOutcome {
 				identity,
 				presentation,
@@ -2210,6 +2275,7 @@ fn rune_view_outcome_with_palettes(
 					.or(funnel_output_span)
 					.or(radial_dial_output_span)
 					.or(pie_output_span)
+					.or(multivariate_output_span)
 					.or(body_output_span)
 					.or(facet_span)
 					.unwrap_or(view.span),
@@ -10529,6 +10595,72 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			"\"value\"",
 			"zero total",
 		);
+		assert!(complete(valid).sinks[0].output.is_ok());
+	}
+
+	#[test]
+	fn product_0105_multivariate_resolution_keeps_dimension_and_modifier_attribution() {
+		use polars::frame::DataFrame;
+		let source =
+			r#"workspace.table("radar_probe").views([radar("a", "b", "c").category("group")])"#;
+		let complete = |frame: DataFrame| {
+			let relation = transform_rune_view(source)
+				.expect("radar source compiles")
+				.into_relations()
+				.next()
+				.unwrap();
+			rune_view_outcome(frame, relation.views)
+		};
+		let valid = polars::df!(
+			"group" => ["B", "A"],
+			"a" => [1.0_f64, 2.0],
+			"b" => [2.0_f64, 3.0],
+			"c" => [3.0_f64, 4.0],
+		)
+		.unwrap();
+		let outcome = complete(valid.clone());
+		let Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, _, continuation)) =
+			&outcome.sinks[0].output
+		else {
+			panic!("valid radar must resolve")
+		};
+		assert!(matches!(
+			resolved.resolved_spec.kernel_fields.as_ref(),
+			crate::plot::spec::ResolvedKernelFields::Radar { dimensions, category }
+				if dimensions == &["a", "b", "c"] && category.as_deref() == Some("group")
+		));
+		let snapshot = continuation.identity.persistence_snapshot();
+		assert_eq!(snapshot.assignments.len(), 2);
+		assert!(snapshot.assignments.iter().all(|assignment| {
+			assignment.field == "group" && assignment.layer.family.as_str() == "radar"
+		}));
+
+		for (frame, expected, fragment) in [
+			(
+				polars::df!(
+					"group" => ["A"], "a" => [1.0], "b" => [2.0], "c" => [None::<f64>]
+				)
+				.unwrap(),
+				"\"c\"",
+				"field `c` is null at row 1",
+			),
+			(
+				polars::df!(
+					"group" => [None::<&str>], "a" => [1.0], "b" => [2.0], "c" => [3.0]
+				)
+				.unwrap(),
+				".category(\"group\")",
+				"category field `group` is null at row 1",
+			),
+		] {
+			let outcome = complete(frame);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid radar rendered")
+			};
+			assert!(error.contains(fragment), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		}
 		assert!(complete(valid).sinks[0].output.is_ok());
 	}
 

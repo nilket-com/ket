@@ -51,6 +51,25 @@ impl PlotType {
 		PlotType::StackedBar,
 		PlotType::Violin,
 	];
+
+	/// Minimum field count required for the mark to possess drawable geometry.
+	/// Shared by authored and automatic multivariate resolution (PRODUCT-0105).
+	pub(crate) const fn minimum_multivariate_dimensions(self) -> Option<usize> {
+		match self {
+			Self::Radar => Some(3),
+			Self::Parallel => Some(2),
+			_ => None,
+		}
+	}
+
+	pub(crate) fn validate_multivariate_dimension_count(self, count: usize) -> Result<(), String> {
+		let Some(minimum) = self.minimum_multivariate_dimensions() else {
+			return Err(format!("{self} is not a multivariate mark"));
+		};
+		(count >= minimum).then_some(()).ok_or_else(|| {
+			format!("{self} requires at least {minimum} numeric dimensions; found {count}")
+		})
+	}
 }
 
 impl std::fmt::Display for PlotType {

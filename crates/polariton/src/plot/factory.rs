@@ -153,6 +153,10 @@ pub fn create_plot(
 				.expect("PRODUCT-0104 planning validated this multivariate row collection");
 			Arc::new(ParallelPlotKernel {
 				prepared_data: Arc::new(prepared),
+				category_colors: category.as_ref().and_then(|_| {
+					spec.channel(Channel::X)
+						.map(|channel| channel.colors.clone())
+				}),
 			})
 		}
 		ResolvedKernelFields::Radar {
@@ -163,6 +167,10 @@ pub fn create_plot(
 				.expect("PRODUCT-0104 planning validated this multivariate row collection");
 			Arc::new(RadarPlotKernel {
 				prepared_data: Arc::new(prepared),
+				category_colors: category.as_ref().and_then(|_| {
+					spec.channel(Channel::X)
+						.map(|channel| channel.colors.clone())
+				}),
 			})
 		}
 		ResolvedKernelFields::RadialDial {

@@ -1,13 +1,13 @@
 error[E0451]: fields `dimensions`, `rows`, `categories` and `extrema` of struct `MultivariateRows` are private
-  --> tests/ui/multivariate_rows_private.rs:16:3
+  --> tests/ui/multivariate_rows_private.rs:19:3
    |
-15 |     let _ = MultivariateRows {
+18 |     let _ = MultivariateRows {
    |             ---------------- in this type
-16 |         dimensions: Vec::new(),
+19 |         dimensions: Vec::new(),
    |         ^^^^^^^^^^ private field
-17 |         rows: Vec::new(),
+20 |         rows: Vec::new(),
    |         ^^^^ private field
-18 |         categories: Vec::new(),
+21 |         categories: Vec::new(),
    |         ^^^^^^^^^^ private field
-19 |         extrema: None,
+22 |         extrema: None,
    |         ^^^^^^^ private field
