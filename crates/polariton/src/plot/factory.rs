@@ -11,9 +11,10 @@ use crate::plot::kernels::heatmap::{self, HeatmapPlotKernel};
 use crate::plot::kernels::hexbin::{self, HexbinPlotKernel};
 use crate::plot::kernels::layered::{LayerRenderer, LayeredPlotKernel};
 use crate::plot::kernels::line::{self, LinePlotKernel};
-use crate::plot::kernels::parallel::{self, ParallelPlotKernel};
+use crate::plot::kernels::multivariate_rows::prepare_multivariate_rows;
+use crate::plot::kernels::parallel::ParallelPlotKernel;
 use crate::plot::kernels::pie::{self, PiePlotKernel};
-use crate::plot::kernels::radar::{self, RadarPlotKernel};
+use crate::plot::kernels::radar::RadarPlotKernel;
 use crate::plot::kernels::radial_dial::{self, RadialDialPlotKernel};
 use crate::plot::kernels::scatter::{self, ScatterPlotKernel};
 use crate::plot::kernels::scatter_line::ScatterLinePlotKernel;
@@ -148,8 +149,8 @@ pub fn create_plot(
 			dimensions,
 			category,
 		} => {
-			let prepared =
-				parallel::prepare_parallel_data(df, dimensions, category.as_deref().unwrap_or(""));
+			let prepared = prepare_multivariate_rows(df, dimensions, category.as_deref())
+				.expect("PRODUCT-0104 planning validated this multivariate row collection");
 			Arc::new(ParallelPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})
@@ -158,8 +159,8 @@ pub fn create_plot(
 			dimensions,
 			category,
 		} => {
-			let prepared =
-				radar::prepare_radar_data(df, dimensions, category.as_deref().unwrap_or(""));
+			let prepared = prepare_multivariate_rows(df, dimensions, category.as_deref())
+				.expect("PRODUCT-0104 planning validated this multivariate row collection");
 			Arc::new(RadarPlotKernel {
 				prepared_data: Arc::new(prepared),
 			})

@@ -8,6 +8,7 @@
 
 use crate::plot::kernels::heatmap::prepare_heatmap_data;
 use crate::plot::kernels::histogram::prepare_histogram_data;
+use crate::plot::kernels::multivariate_rows::prepare_multivariate_rows;
 use crate::plot::spec::{
 	AuthoredChannel, AuthoredPlotSpec, CategoricalPaletteSelection, ColorIdentity,
 	OptionalAuthoredChannel, PlotProvenance, ResolvedPlotSpec, StampedResult, resolve_channels,
@@ -235,6 +236,18 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		spec.kernel_fields.as_ref()
 	{
 		crate::plot::kernels::pie::prepare_pie_data(data, category.as_deref(), value)
+			.map_err(|error| error.to_string())?;
+	}
+	if let crate::plot::spec::ResolvedKernelFields::Parallel {
+		dimensions,
+		category,
+	}
+	| crate::plot::spec::ResolvedKernelFields::Radar {
+		dimensions,
+		category,
+	} = spec.kernel_fields.as_ref()
+	{
+		prepare_multivariate_rows(data, dimensions, category.as_deref())
 			.map_err(|error| error.to_string())?;
 	}
 	Ok(())

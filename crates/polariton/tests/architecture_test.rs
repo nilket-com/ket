@@ -3792,3 +3792,83 @@ fn product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_author
 	assert!(host.contains("fn pie_failure_span("));
 	assert!(host.contains("pie_output_span"));
 }
+
+#[test]
+fn product_0104_radar_and_parallel_share_one_honest_multivariate_row_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let rows = std::fs::read_to_string(root.join("plot/kernels/multivariate_rows.rs"))
+		.expect("read multivariate row authority");
+	let radar =
+		std::fs::read_to_string(root.join("plot/kernels/radar.rs")).expect("read radar kernel");
+	let parallel = std::fs::read_to_string(root.join("plot/kernels/parallel.rs"))
+		.expect("read parallel kernel");
+	let request = std::fs::read_to_string(root.join("plot/request.rs")).expect("read request");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read factory");
+
+	let radar_production = radar
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production radar");
+	let parallel_production = parallel
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production parallel");
+	let row_production = rows
+		.split("#[cfg(test)]")
+		.next()
+		.expect("production multivariate rows");
+
+	for kernel in [radar_production, parallel_production] {
+		assert!(kernel.contains("Arc<MultivariateRows>"));
+		assert!(kernel.contains("fn display_ranges(&self)"));
+		for removed in [
+			"PreparedData",
+			"row_categories",
+			"num_categories",
+			"cat_to_idx",
+			"unwrap_or(&0)",
+		] {
+			assert!(!kernel.contains(removed), "kernel retained `{removed}`");
+		}
+	}
+	assert!(radar_production.contains("difference * 0.1"));
+	assert!(parallel_production.contains(".map(<[(f64, f64)]>::to_vec)"));
+	assert!(radar_production.contains("builder.close()"));
+	assert!(parallel_production.contains("builder.line_to(p)"));
+
+	assert!(row_production.contains("pub struct MultivariateRows"));
+	assert!(row_production.contains("category: Option<String>"));
+	assert!(row_production.contains("BTreeSet"));
+	assert!(row_production.contains("exact_f64(value)"));
+	for forbidden in [
+		"No Data",
+		"All Data",
+		"Series::new_empty",
+		".unique()",
+		".sort(",
+		"unwrap_or(&0)",
+		"iced::Point",
+		"PathBuilder",
+	] {
+		assert!(
+			!row_production.contains(forbidden),
+			"PRODUCT-0104 shared authority retained `{forbidden}`"
+		);
+	}
+
+	assert!(request.contains(
+		"ResolvedKernelFields::Parallel {\n\t\tdimensions,\n\t\tcategory,\n\t}\n\t| crate::plot::spec::ResolvedKernelFields::Radar"
+	));
+	assert_eq!(
+		factory
+			.matches("prepare_multivariate_rows(df, dimensions, category.as_deref())")
+			.count(),
+		2
+	);
+	assert_eq!(
+		factory
+			.matches("PRODUCT-0104 planning validated this multivariate row collection")
+			.count(),
+		2
+	);
+}

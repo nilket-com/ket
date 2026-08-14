@@ -277,12 +277,13 @@ band-fill path.
     defect: sibling raw and derived executions retained each other's definitions
     and replayed a linear relation initializer, so both panels failed until each
     execution retained only its own dependency branch.
-19. **Multivariate row substrate — ADR 0104, drafted.** Radar and parallel declare
+19. **Multivariate row substrate — LANDED as PRODUCT-0104.** Radar and parallel declare
     the **same six prepared fields with the same names and types**, prepared by
     near-copy functions — one substrate wearing two names. Shares the data
-    (ordered dimensions, validated rows, optional category, derived ranges),
-    keeps geometry per mark. Removes `row_categories`/`num_categories` and with
-    them an index fallback that silently draws a row as category zero.
+    (ordered dimensions, validated rows, optional category, observed extrema),
+    while each kernel keeps its own display-range rule and geometry. Removes
+    `row_categories`/`num_categories` and with them an index fallback that
+    silently draws a row as category zero.
 
     **Does not consume prerequisite D** — the first step in the arc where the
     substrate does not. Variadic dimension authoring is the surfaces'.

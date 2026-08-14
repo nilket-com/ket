@@ -2,14 +2,31 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings, format_label,
 };
+use crate::plot::kernels::multivariate_rows::MultivariateRows;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Point, Rectangle};
-use polars::prelude::*;
 use std::sync::Arc;
 
 pub struct RadarPlotKernel {
-	pub prepared_data: Arc<RadarPreparedData>,
+	pub prepared_data: Arc<MultivariateRows>,
+}
+
+impl RadarPlotKernel {
+	fn display_ranges(&self) -> Vec<(f64, f64)> {
+		self.prepared_data
+			.extrema()
+			.map(|extrema| {
+				extrema
+					.iter()
+					.map(|&(min, max)| {
+						let difference = (max - min).max(1e-6);
+						(min - difference * 0.1, max + difference * 0.1)
+					})
+					.collect()
+			})
+			.unwrap_or_else(|| vec![(0.0, 1.0); self.prepared_data.dimensions().len()])
+	}
 }
 
 impl PlotKernel for RadarPlotKernel {
@@ -25,7 +42,7 @@ impl PlotKernel for RadarPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_dims = self.prepared_data.dimensions.len();
+		let num_dims = self.prepared_data.dimensions().len();
 		if num_dims < 3 {
 			return;
 		}
@@ -63,6 +80,7 @@ impl PlotKernel for RadarPlotKernel {
 			width: 1.5,
 			..Default::default()
 		};
+		let display_ranges = self.display_ranges();
 		for i in 0..num_dims {
 			let angle = (i as f32 / num_dims as f32) * 2.0 * std::f32::consts::PI
 				- std::f32::consts::FRAC_PI_2;
@@ -78,7 +96,7 @@ impl PlotKernel for RadarPlotKernel {
 				axis_stroke,
 			);
 			backend.fill_text(iced::widget::canvas::Text {
-				content: self.prepared_data.dimensions[i].clone(),
+				content: self.prepared_data.dimensions()[i].clone(),
 				position: Point::new(
 					center.x + (max_radius + 15.0) * angle.cos(),
 					center.y + (max_radius + 15.0) * angle.sin(),
@@ -102,7 +120,7 @@ impl PlotKernel for RadarPlotKernel {
 				..Default::default()
 			});
 			if num_circles > 0 {
-				let range = self.prepared_data.ranges[i];
+				let range = display_ranges[i];
 				for c in 1..=num_circles {
 					let radius = max_radius * (c as f32 / num_circles as f32);
 					let val = range.0 + (range.1 - range.0) * (c as f64 / num_circles as f64);
@@ -125,10 +143,14 @@ impl PlotKernel for RadarPlotKernel {
 				}
 			}
 		}
-		for (i, row_data) in self.prepared_data.data_matrix.iter().enumerate() {
-			let cat_idx = self.prepared_data.row_categories[i];
-			let t = if self.prepared_data.num_categories > 1 {
-				(cat_idx as f32 / (self.prepared_data.num_categories - 1) as f32).clamp(0.1, 0.9)
+		let category_count = self.prepared_data.categories().len();
+		for row in self.prepared_data.iter() {
+			let cat_idx = self
+				.prepared_data
+				.category_position(row.category())
+				.expect("PRODUCT-0104 validated every row category against its catalog");
+			let t = if category_count > 1 {
+				(cat_idx as f32 / (category_count - 1) as f32).clamp(0.1, 0.9)
 			} else {
 				0.5
 			};
@@ -136,10 +158,10 @@ impl PlotKernel for RadarPlotKernel {
 			let mut fill_color = color;
 			fill_color.a = 0.3;
 			let path_closure = |builder: &mut dyn PathBuilder| {
-				for (d, &val) in row_data.iter().enumerate() {
+				for (d, &val) in row.values().iter().enumerate() {
 					let angle = (d as f32 / num_dims as f32) * 2.0 * std::f32::consts::PI
 						- std::f32::consts::FRAC_PI_2;
-					let range = self.prepared_data.ranges[d];
+					let range = display_ranges[d];
 					let norm_val = ((val - range.0) / (range.1 - range.0).max(1e-6)) as f32;
 					let radius = max_radius * (0.15 + norm_val * 0.8);
 					let p = Point::new(
@@ -171,7 +193,10 @@ impl PlotKernel for RadarPlotKernel {
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
 		crate::plot::legend::entries_from_labels(
-			self.prepared_data.category_names.iter().cloned(),
+			self.prepared_data
+				.categories()
+				.iter()
+				.map(|category| category.as_deref().unwrap_or("All Data").to_owned()),
 			settings,
 		)
 	}
@@ -181,102 +206,97 @@ impl PlotKernel for RadarPlotKernel {
 	}
 }
 
-pub struct RadarPreparedData {
-	pub dimensions: Vec<String>,
-	pub ranges: Vec<(f64, f64)>,
-	pub data_matrix: Vec<Vec<f64>>,
-	pub row_categories: Vec<usize>,
-	pub category_names: Vec<String>,
-	pub num_categories: usize,
-}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::plot::common::TickPlacement;
+	use crate::plot::export::SvgBackend;
+	use crate::plot::kernels::multivariate_rows::{
+		MultivariateFields, MultivariateRows, prepare_multivariate_rows,
+	};
+	use iced::Size;
+	use polars::df;
 
-pub fn prepare_radar_data(df: &DataFrame, dims: &[String], cat_col: &str) -> RadarPreparedData {
-	if df.height() == 0 || dims.is_empty() {
-		return RadarPreparedData {
-			dimensions: dims.to_vec(),
-			ranges: vec![(0.0, 1.0); dims.len()],
-			data_matrix: vec![],
-			row_categories: vec![],
-			category_names: vec!["No Data".to_string()],
-			num_categories: 1,
+	#[test]
+	fn product_0104_radar_valid_nonempty_render_matches_the_stage_zero_oracle() {
+		let frame = df!(
+			"group" => ["B", "A"],
+			"third" => [100.0, 200.0],
+			"first" => [1.0, 3.0],
+			"second" => [10.0, 20.0],
+		)
+		.expect("radar oracle frame");
+		let dimensions = vec!["third".to_owned(), "first".to_owned(), "second".to_owned()];
+		let kernel = RadarPlotKernel {
+			prepared_data: Arc::new(
+				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
+					.expect("valid radar oracle"),
+			),
 		};
+		assert_eq!(
+			kernel.display_ranges(),
+			[(90.0, 210.0), (0.8, 3.2), (9.0, 21.0)]
+		);
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 300.0));
+		let layout = PlotLayout::Radial;
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut settings = ResolvedPlotSettings::default();
+		settings.x_tick_placement = TickPlacement::count(1).expect("one radar interval");
+		let mut backend = SvgBackend::new(300.0, 300.0);
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		let svg = backend.finish();
+		assert_eq!(
+			svg,
+			concat!(
+				"<svg width=\"300\" height=\"300\" viewBox=\"0 0 300 300\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+				"<path d=\"M 150.00 80.00 L 210.62 185.00 L 89.38 185.00 L 150.00 80.00 \" stroke=\"rgb(127, 127, 127)\" stroke-width=\"1\" stroke-opacity=\"0.20\" fill=\"none\" />\n",
+				"<path d=\"M 150.00 150.00 L 150.00 80.00 \" stroke=\"rgb(255, 255, 255)\" stroke-width=\"1.5\" stroke-opacity=\"0.40\" fill=\"none\" />\n",
+				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"150\" y=\"65\" fill=\"rgb(255, 255, 255)\" font-size=\"20\" text-anchor=\"middle\" dominant-baseline=\"alphabetic\">third</text>\n",
+				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"160\" y=\"82\" fill=\"rgb(255, 255, 255)\" font-size=\"18\" text-anchor=\"start\" dominant-baseline=\"central\">210</text>\n",
+				"<path d=\"M 150.00 150.00 L 210.62 185.00 \" stroke=\"rgb(255, 255, 255)\" stroke-width=\"1.5\" stroke-opacity=\"0.40\" fill=\"none\" />\n",
+				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"223.61215\" y=\"192.5\" fill=\"rgb(255, 255, 255)\" font-size=\"20\" text-anchor=\"start\" dominant-baseline=\"hanging\">first</text>\n",
+				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"220.62178\" y=\"187\" fill=\"rgb(255, 255, 255)\" font-size=\"18\" text-anchor=\"start\" dominant-baseline=\"central\">3.2</text>\n",
+				"<path d=\"M 150.00 150.00 L 89.38 185.00 \" stroke=\"rgb(255, 255, 255)\" stroke-width=\"1.5\" stroke-opacity=\"0.40\" fill=\"none\" />\n",
+				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"76.38784\" y=\"192.5\" fill=\"rgb(255, 255, 255)\" font-size=\"20\" text-anchor=\"end\" dominant-baseline=\"hanging\">second</text>\n",
+				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"99.37822\" y=\"187\" fill=\"rgb(255, 255, 255)\" font-size=\"18\" text-anchor=\"start\" dominant-baseline=\"central\">21</text>\n",
+				"<path d=\"M 150.00 134.83 L 163.13 157.58 L 136.87 157.58 Z \" fill=\"rgb(189, 219, 61)\" fill-opacity=\"0.30\" />\n",
+				"<path d=\"M 150.00 134.83 L 163.13 157.58 L 136.87 157.58 Z \" stroke=\"rgb(189, 219, 61)\" stroke-width=\"2\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
+				"<path d=\"M 150.00 88.17 L 203.55 180.92 L 96.45 180.92 Z \" fill=\"rgb(64, 33, 105)\" fill-opacity=\"0.30\" />\n",
+				"<path d=\"M 150.00 88.17 L 203.55 180.92 L 96.45 180.92 Z \" stroke=\"rgb(64, 33, 105)\" stroke-width=\"2\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
+				"</svg>",
+			)
+		);
 	}
-	let num_dims = dims.len();
-	let mut ranges = Vec::with_capacity(num_dims);
-	let mut dim_columns = Vec::with_capacity(num_dims);
-	for dim in dims {
-		let col = match df.column(dim) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
-				Column::from(Series::new_empty(dim.into(), &DataType::Float64))
-			}),
-			Err(_) => Column::from(Series::new_empty(dim.into(), &DataType::Float64)),
+
+	#[test]
+	fn product_0104_radar_empty_keeps_padded_axis_substrate_without_series() {
+		let fields =
+			MultivariateFields::new(&["a".to_owned(), "b".to_owned(), "c".to_owned()], None);
+		let kernel = RadarPlotKernel {
+			prepared_data: Arc::new(
+				MultivariateRows::from_rows(&fields, Vec::new()).expect("empty rows"),
+			),
 		};
-		let series = col.f64().unwrap().clone();
-		let min = series.min().unwrap_or(0.0);
-		let max = series.max().unwrap_or(1.0);
-		let diff = (max - min).max(1e-6);
-		let padded_min = min - diff * 0.1;
-		let padded_max = max + diff * 0.1;
-		ranges.push((padded_min, padded_max));
-		dim_columns.push(series);
-	}
-	let categories_series = if cat_col.is_empty() {
-		Series::new("dummy_cat".into(), &["All Data"])
-	} else {
-		match df.column(cat_col) {
-			Ok(c) => c
-				.unique()
-				.unwrap_or_else(|_| c.clone())
-				.sort(Default::default())
-				.unwrap_or_else(|_| c.clone())
-				.as_materialized_series()
-				.clone(),
-			Err(_) => Series::new("dummy_cat".into(), &["All Data"]),
-		}
-	};
-	let num_cats = categories_series.len();
-	let mut category_names = Vec::with_capacity(num_cats);
-	let mut cat_to_idx = std::collections::HashMap::new();
-	for (i, v) in categories_series.iter().enumerate() {
-		let s = if let AnyValue::String(s) = v {
-			s.to_string()
-		} else {
-			v.to_string().replace("\"", "")
-		};
-		category_names.push(s.clone());
-		cat_to_idx.insert(s, i);
-	}
-	let cat_vals = if cat_col.is_empty() {
-		Series::new("dummy_cat".into(), vec!["All Data"; df.height()])
-	} else {
-		match df.column(cat_col) {
-			Ok(c) => c.as_materialized_series().clone(),
-			Err(_) => Series::new("dummy_cat".into(), vec!["All Data"; df.height()]),
-		}
-	};
-	let num_rows = df.height();
-	let mut data_matrix = Vec::with_capacity(num_rows);
-	let mut row_categories = Vec::with_capacity(num_rows);
-	for i in 0..num_rows {
-		let mut row = Vec::with_capacity(num_dims);
-		for dim_col in dim_columns.iter() {
-			row.push(dim_col.get(i).unwrap_or(0.0));
-		}
-		data_matrix.push(row);
-		let cat_val_raw = cat_vals.get(i).unwrap_or(AnyValue::Null);
-		let cat_val_str = if let AnyValue::String(s) = cat_val_raw {
-			s.to_string()
-		} else {
-			cat_val_raw.to_string().replace("\"", "")
-		};
-		row_categories.push(*cat_to_idx.get(&cat_val_str).unwrap_or(&0));
-	}
-	RadarPreparedData {
-		dimensions: dims.to_vec(),
-		ranges,
-		data_matrix,
-		row_categories,
-		category_names,
-		num_categories: num_cats,
+		assert_eq!(kernel.display_ranges(), [(0.0, 1.0); 3]);
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 300.0));
+		let layout = PlotLayout::Radial;
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut settings = ResolvedPlotSettings::default();
+		settings.x_tick_placement = TickPlacement::count(1).expect("one radar interval");
+		let mut backend = SvgBackend::new(300.0, 300.0);
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		assert_eq!(backend.finish().matches("<path ").count(), 4);
 	}
 }

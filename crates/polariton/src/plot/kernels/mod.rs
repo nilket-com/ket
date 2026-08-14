@@ -23,6 +23,7 @@ pub mod histogram;
 pub mod histogram_bins;
 pub mod layered;
 pub mod line;
+pub mod multivariate_rows;
 pub mod parallel;
 pub mod pie;
 pub mod pie_slices;

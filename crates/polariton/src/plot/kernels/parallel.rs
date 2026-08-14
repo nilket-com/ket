@@ -1,21 +1,30 @@
 use crate::plot::common::{
 	CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
 };
+use crate::plot::kernels::multivariate_rows::MultivariateRows;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
-use polars::prelude::*;
 use std::sync::Arc;
 
 pub struct ParallelPlotKernel {
-	pub prepared_data: Arc<ParallelPreparedData>,
+	pub prepared_data: Arc<MultivariateRows>,
+}
+
+impl ParallelPlotKernel {
+	fn display_ranges(&self) -> Vec<(f64, f64)> {
+		self.prepared_data
+			.extrema()
+			.map(<[(f64, f64)]>::to_vec)
+			.unwrap_or_else(|| vec![(0.0, 1.0); self.prepared_data.dimensions().len()])
+	}
 }
 
 impl PlotKernel for ParallelPlotKernel {
 	fn layout(&self, _settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::Parallel {
-			dimensions: self.prepared_data.dimensions.clone(),
-			ranges: self.prepared_data.ranges.clone(),
+			dimensions: self.prepared_data.dimensions().to_vec(),
+			ranges: self.display_ranges(),
 		}
 	}
 
@@ -27,14 +36,18 @@ impl PlotKernel for ParallelPlotKernel {
 		_cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_dims = self.prepared_data.dimensions.len();
+		let num_dims = self.prepared_data.dimensions().len();
 		if num_dims < 2 {
 			return;
 		}
-		for (i, row_data) in self.prepared_data.data_matrix.iter().enumerate() {
-			let cat_idx = self.prepared_data.row_categories[i];
-			let t = if self.prepared_data.num_categories > 1 {
-				cat_idx as f32 / (self.prepared_data.num_categories - 1) as f32
+		let category_count = self.prepared_data.categories().len();
+		for row in self.prepared_data.iter() {
+			let cat_idx = self
+				.prepared_data
+				.category_position(row.category())
+				.expect("PRODUCT-0104 validated every row category against its catalog");
+			let t = if category_count > 1 {
+				cat_idx as f32 / (category_count - 1) as f32
 			} else {
 				0.5
 			};
@@ -46,7 +59,7 @@ impl PlotKernel for ParallelPlotKernel {
 			};
 			backend.stroke_path(
 				&|builder| {
-					for (d, &val) in row_data.iter().enumerate() {
+					for (d, &val) in row.values().iter().enumerate() {
 						let (p, _) = transform.categorical(d, val);
 						if d == 0 {
 							builder.move_to(p);
@@ -65,14 +78,17 @@ impl PlotKernel for ParallelPlotKernel {
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
 		crate::plot::legend::entries_from_labels(
-			self.prepared_data.category_names.iter().cloned(),
+			self.prepared_data
+				.categories()
+				.iter()
+				.map(|category| category.as_deref().unwrap_or("All Data").to_owned()),
 			settings,
 		)
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
 		if let Some(cursor_pos) = cursor.position() {
-			let num_dims = self.prepared_data.dimensions.len();
+			let num_dims = self.prepared_data.dimensions().len();
 			if num_dims < 2 {
 				return None;
 			}
@@ -81,10 +97,14 @@ impl PlotKernel for ParallelPlotKernel {
 				((cursor_pos.x - transform.bounds.x + spacing / 2.0) / spacing).floor() as i32;
 			if axis_idx >= 0 && (axis_idx as usize) < num_dims {
 				let i = axis_idx as usize;
-				let range = self.prepared_data.ranges[i];
+				let range = self.display_ranges()[i];
 				let y_scale = (range.1 - range.0) / transform.bounds.height as f64;
 				let val = range.1 - (cursor_pos.y - transform.bounds.y) as f64 * y_scale;
-				return Some(format!("{}: {:.2}", self.prepared_data.dimensions[i], val));
+				return Some(format!(
+					"{}: {:.2}",
+					self.prepared_data.dimensions()[i],
+					val
+				));
 			}
 		}
 		None
@@ -99,103 +119,109 @@ impl PlotKernel for ParallelPlotKernel {
 	}
 }
 
-pub struct ParallelPreparedData {
-	pub dimensions: Vec<String>,
-	pub ranges: Vec<(f64, f64)>,
-	pub data_matrix: Vec<Vec<f64>>,
-	pub row_categories: Vec<usize>,
-	pub category_names: Vec<String>,
-	pub num_categories: usize,
-}
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::plot::export::SvgBackend;
+	use crate::plot::kernels::multivariate_rows::prepare_multivariate_rows;
+	use iced::{Point, Size};
+	use polars::df;
 
-pub fn prepare_parallel_data(
-	df: &DataFrame,
-	dims: &[String],
-	cat_col: &str,
-) -> ParallelPreparedData {
-	if df.height() == 0 || dims.is_empty() {
-		return ParallelPreparedData {
-			dimensions: dims.to_vec(),
-			ranges: vec![(0.0, 1.0); dims.len()],
-			data_matrix: vec![],
-			row_categories: vec![],
-			category_names: vec!["No Data".to_string()],
-			num_categories: 1,
+	#[test]
+	fn product_0104_parallel_valid_nonempty_render_matches_the_stage_zero_oracle() {
+		let frame = df!(
+			"group" => ["B", "A", "B"],
+			"second" => [10.0, 20.0, 15.0],
+			"first" => [1.0, 3.0, 2.0],
+		)
+		.expect("parallel oracle frame");
+		let dimensions = vec!["second".to_owned(), "first".to_owned()];
+		let kernel = ParallelPlotKernel {
+			prepared_data: Arc::new(
+				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
+					.expect("valid parallel oracle"),
+			),
 		};
-	}
-	let num_dims = dims.len();
-	let mut ranges = Vec::with_capacity(num_dims);
-	let mut dim_columns = Vec::with_capacity(num_dims);
-	for dim in dims {
-		let col = match df.column(dim) {
-			Ok(c) => c.cast(&DataType::Float64).unwrap_or_else(|_| {
-				Column::from(Series::new_empty(dim.into(), &DataType::Float64))
-			}),
-			Err(_) => Column::from(Series::new_empty(dim.into(), &DataType::Float64)),
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let PlotLayout::Parallel {
+			dimensions: actual_dimensions,
+			ranges,
+		} = &layout
+		else {
+			panic!("parallel kernel must retain parallel layout")
 		};
-		let series = col.f64().unwrap().clone();
-		let min = series.min().unwrap_or(0.0);
-		let max = series.max().unwrap_or(1.0);
-		ranges.push((min, max));
-		dim_columns.push(series);
+		assert_eq!(actual_dimensions, &dimensions);
+		assert_eq!(ranges, &[(10.0, 20.0), (1.0, 3.0)]);
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = SvgBackend::new(200.0, 100.0);
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		let svg = backend.finish();
+		assert_eq!(
+			svg,
+			concat!(
+				"<svg width=\"200\" height=\"100\" viewBox=\"0 0 200 100\" xmlns=\"http://www.w3.org/2000/svg\">\n",
+				"<path d=\"M 0.00 100.00 L 200.00 100.00 \" stroke=\"rgb(253, 231, 36)\" stroke-width=\"1.5\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
+				"<path d=\"M 0.00 0.00 L 200.00 0.00 \" stroke=\"rgb(68, 1, 83)\" stroke-width=\"1.5\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
+				"<path d=\"M 0.00 50.00 L 200.00 50.00 \" stroke=\"rgb(253, 231, 36)\" stroke-width=\"1.5\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
+				"</svg>",
+			)
+		);
 	}
-	let categories_series = if cat_col.is_empty() {
-		Series::new("dummy_cat".into(), &["All Data"])
-	} else {
-		match df.column(cat_col) {
-			Ok(c) => c
-				.unique()
-				.unwrap_or_else(|_| c.clone())
-				.sort(Default::default())
-				.unwrap_or_else(|_| c.clone())
-				.as_materialized_series()
-				.clone(),
-			Err(_) => Series::new("dummy_cat".into(), &["All Data"]),
-		}
-	};
-	let num_cats = categories_series.len();
-	let mut category_names = Vec::with_capacity(num_cats);
-	let mut cat_to_idx = std::collections::HashMap::new();
-	for (i, v) in categories_series.iter().enumerate() {
-		let s = if let AnyValue::String(s) = v {
-			s.to_string()
-		} else {
-			v.to_string().replace("\"", "")
+
+	#[test]
+	fn product_0104_parallel_empty_keeps_axis_ranges_without_series() {
+		let fields = crate::plot::kernels::multivariate_rows::MultivariateFields::new(
+			&["left".to_owned(), "right".to_owned()],
+			None,
+		);
+		let kernel = ParallelPlotKernel {
+			prepared_data: Arc::new(
+				MultivariateRows::from_rows(&fields, Vec::new()).expect("empty rows"),
+			),
 		};
-		category_names.push(s.clone());
-		cat_to_idx.insert(s, i);
-	}
-	let cat_vals = if cat_col.is_empty() {
-		Series::new("dummy_cat".into(), vec!["All Data"; df.height()])
-	} else {
-		match df.column(cat_col) {
-			Ok(c) => c.as_materialized_series().clone(),
-			Err(_) => Series::new("dummy_cat".into(), vec!["All Data"; df.height()]),
-		}
-	};
-	let num_rows = df.height();
-	let mut data_matrix = Vec::with_capacity(num_rows);
-	let mut row_categories = Vec::with_capacity(num_rows);
-	for i in 0..num_rows {
-		let mut row = Vec::with_capacity(num_dims);
-		for dim_col in dim_columns.iter() {
-			row.push(dim_col.get(i).unwrap_or(0.0));
-		}
-		data_matrix.push(row);
-		let cat_val_raw = cat_vals.get(i).unwrap_or(AnyValue::Null);
-		let cat_val_str = if let AnyValue::String(s) = cat_val_raw {
-			s.to_string()
-		} else {
-			cat_val_raw.to_string().replace("\"", "")
+		let layout = kernel.layout(ResolvedPlotSettings::default());
+		let PlotLayout::Parallel { dimensions, ranges } = layout else {
+			panic!("parallel kernel must retain parallel layout")
 		};
-		row_categories.push(*cat_to_idx.get(&cat_val_str).unwrap_or(&0));
+		assert_eq!(dimensions, ["left", "right"]);
+		assert_eq!(ranges, [(0.0, 1.0), (0.0, 1.0)]);
 	}
-	ParallelPreparedData {
-		dimensions: dims.to_vec(),
-		ranges,
-		data_matrix,
-		row_categories,
-		category_names,
-		num_categories: num_cats,
+
+	#[test]
+	fn product_0104_parallel_renders_every_row_in_a_repeated_category() {
+		let frame = df!(
+			"group" => ["A", "A", "A"],
+			"left" => [1.0, 2.0, 3.0],
+			"right" => [3.0, 2.0, 1.0],
+		)
+		.expect("repeated-category frame");
+		let dimensions = vec!["left".to_owned(), "right".to_owned()];
+		let kernel = ParallelPlotKernel {
+			prepared_data: Arc::new(
+				prepare_multivariate_rows(&frame, &dimensions, Some("group"))
+					.expect("all repeated-category observations remain valid"),
+			),
+		};
+		let settings = ResolvedPlotSettings::default();
+		let layout = kernel.layout(settings.clone());
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(200.0, 100.0));
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = SvgBackend::new(200.0, 100.0);
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		assert_eq!(backend.finish().matches("<path ").count(), 3);
 	}
 }
