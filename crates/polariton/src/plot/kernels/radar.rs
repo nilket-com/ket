@@ -149,7 +149,7 @@ impl PlotKernel for RadarPlotKernel {
 				},
 				..Default::default()
 			});
-			if num_circles > 0 {
+			if i == 0 && num_circles > 0 {
 				let range = display_ranges[i];
 				for c in 1..=num_circles {
 					let radius = max_radius * (c as f32 / num_circles as f32);
@@ -284,10 +284,8 @@ mod tests {
 				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"160\" y=\"82\" fill=\"rgb(255, 255, 255)\" font-size=\"18\" text-anchor=\"start\" dominant-baseline=\"central\">210</text>\n",
 				"<path d=\"M 150.00 150.00 L 210.62 185.00 \" stroke=\"rgb(255, 255, 255)\" stroke-width=\"1.5\" stroke-opacity=\"0.40\" fill=\"none\" />\n",
 				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"223.61215\" y=\"192.5\" fill=\"rgb(255, 255, 255)\" font-size=\"20\" text-anchor=\"start\" dominant-baseline=\"hanging\">first</text>\n",
-				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"220.62178\" y=\"187\" fill=\"rgb(255, 255, 255)\" font-size=\"18\" text-anchor=\"start\" dominant-baseline=\"central\">3.2</text>\n",
 				"<path d=\"M 150.00 150.00 L 89.38 185.00 \" stroke=\"rgb(255, 255, 255)\" stroke-width=\"1.5\" stroke-opacity=\"0.40\" fill=\"none\" />\n",
 				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"76.38784\" y=\"192.5\" fill=\"rgb(255, 255, 255)\" font-size=\"20\" text-anchor=\"end\" dominant-baseline=\"hanging\">second</text>\n",
-				"<text transform=\"matrix(1.0000 0.0000 0.0000 1.0000 0.0000 0.0000)\" x=\"99.37822\" y=\"187\" fill=\"rgb(255, 255, 255)\" font-size=\"18\" text-anchor=\"start\" dominant-baseline=\"central\">21</text>\n",
 				"<path d=\"M 150.00 134.83 L 163.13 157.58 L 136.87 157.58 Z \" fill=\"rgb(189, 219, 61)\" fill-opacity=\"0.30\" />\n",
 				"<path d=\"M 150.00 134.83 L 163.13 157.58 L 136.87 157.58 Z \" stroke=\"rgb(189, 219, 61)\" stroke-width=\"2\" stroke-opacity=\"1.00\" fill=\"none\" />\n",
 				"<path d=\"M 150.00 88.17 L 203.55 180.92 L 96.45 180.92 Z \" fill=\"rgb(64, 33, 105)\" fill-opacity=\"0.30\" />\n",
@@ -295,6 +293,50 @@ mod tests {
 				"</svg>",
 			)
 		);
+	}
+
+	#[test]
+	fn product_0106_radar_tick_ladder_follows_the_first_authored_dimension() {
+		fn render(dimensions: [&str; 3]) -> String {
+			let frame = df!(
+				"third" => [100.0, 200.0],
+				"first" => [1.0, 3.0],
+				"second" => [10.0, 20.0],
+			)
+			.expect("radar tick fixture");
+			let dimensions = dimensions.map(str::to_owned).to_vec();
+			let kernel = RadarPlotKernel {
+				prepared_data: Arc::new(
+					prepare_multivariate_rows(&frame, &dimensions, None)
+						.expect("valid radar tick fixture"),
+				),
+				category_colors: None,
+			};
+			let bounds = Rectangle::new(Point::ORIGIN, Size::new(300.0, 300.0));
+			let layout = PlotLayout::Radial;
+			let transform = CoordinateTransformer::new(&layout, bounds);
+			let mut settings = ResolvedPlotSettings::default();
+			settings.x_tick_placement = TickPlacement::count(1).expect("one radar interval");
+			let mut backend = SvgBackend::new(300.0, 300.0);
+			kernel.plot(
+				&mut backend,
+				bounds,
+				&transform,
+				Cursor::Unavailable,
+				settings,
+			);
+			backend.finish()
+		}
+
+		let third_first = render(["third", "first", "second"]);
+		assert!(third_first.contains(">210</text>"));
+		assert!(!third_first.contains(">3.2</text>"));
+		assert!(!third_first.contains(">21</text>"));
+
+		let first_first = render(["first", "third", "second"]);
+		assert!(first_first.contains(">3.2</text>"));
+		assert!(!first_first.contains(">210</text>"));
+		assert!(!first_first.contains(">21</text>"));
 	}
 
 	#[test]

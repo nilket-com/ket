@@ -3971,3 +3971,77 @@ fn product_0105_variadic_multivariate_surface_has_one_transport_admission_and_co
 		2
 	);
 }
+
+#[test]
+fn product_0106_vertical_guides_have_one_reservation_authority_and_no_measurement_seam() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read plot grid");
+	let radar =
+		std::fs::read_to_string(root.join("plot/kernels/radar.rs")).expect("read radar kernel");
+	let parallel = std::fs::read_to_string(root.join("plot/kernels/parallel.rs"))
+		.expect("read parallel kernel");
+
+	assert_eq!(common.matches("struct VerticalGuideBands").count(), 1);
+	let authority = common
+		.split("struct VerticalGuideBands")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct PlotCanvasState").next())
+		.expect("PRODUCT-0106 vertical guide authority");
+	for required in [
+		"settings.title_offset + settings.title_size",
+		"settings.subtitle_offset + settings.subtitle_size",
+		"Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings)",
+		"fn grid_tiled_area(",
+		"fn grid_cell_plot_area(",
+	] {
+		assert!(
+			authority.contains(required),
+			"missing `{required}` from authority"
+		);
+	}
+	assert!(
+		common
+			.contains("VerticalGuideBands::resolve(&self.title, None, &self.settings).plot_area(")
+	);
+
+	let grid_production = grid
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("grid production");
+	assert_eq!(
+		grid_production
+			.matches("VerticalGuideBands::resolve(")
+			.count(),
+		2
+	);
+	assert!(grid_production.contains(".grid_tiled_area(outer, settings)"));
+	assert!(grid_production.contains(".grid_cell_plot_area(cell_bounds, settings)"));
+	assert!(!grid_production.contains("PANEL_LABEL_TOP_INSET"));
+	assert!(!grid_production.contains("grid_heading_band"));
+
+	let backend = common
+		.split("pub trait PlotBackend")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct IcedBackend").next())
+		.expect("PlotBackend trait");
+	for forbidden in ["measure_text", "glyph_extent", "text_extent"] {
+		assert!(
+			!backend.contains(forbidden),
+			"PRODUCT-0106 added `{forbidden}`"
+		);
+	}
+
+	let radar_production = radar
+		.split("#[cfg(test)]")
+		.next()
+		.expect("radar production");
+	assert_eq!(
+		radar_production
+			.matches("if i == 0 && num_circles > 0")
+			.count(),
+		1
+	);
+	assert_eq!(radar_production.matches("let angle =").count(), 3);
+	assert!(!parallel.contains("VerticalGuideBands"));
+}

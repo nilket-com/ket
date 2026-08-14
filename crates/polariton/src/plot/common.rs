@@ -949,6 +949,7 @@ pub trait PlotComposite: Send + Sync {
 		&self,
 		bounds: Rect<Widget>,
 		padding: f32,
+		title: &str,
 		cursor: Pt<Widget>,
 		settings: &PlotSettings,
 	) -> Option<String>;
@@ -1131,6 +1132,117 @@ fn resolve_canvas_text(
 	}
 }
 
+/// PRODUCT-0106's single authority for vertical guide reservations.
+///
+/// `plot_padding_top` remains the mark/axis guide allowance. The heading and
+/// facet bands are semantic rows above it, so they compose by addition rather
+/// than competing for the same pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct VerticalGuideBands {
+	heading: f32,
+	facet: f32,
+}
+
+impl VerticalGuideBands {
+	pub(crate) const FACET_LABEL_TOP_INSET: f32 = 8.0;
+
+	pub(crate) fn resolve(
+		fallback_title: &str,
+		facet_label: Option<&str>,
+		settings: &ResolvedPlotSettings,
+	) -> Self {
+		let title_visible = match &settings.title {
+			ResolvedPresence::Fallback => !fallback_title.is_empty(),
+			ResolvedPresence::Show(title) => !title.is_empty(),
+			ResolvedPresence::Hide => false,
+		};
+		let subtitle_visible = match &settings.subtitle {
+			ResolvedPresence::Show(subtitle) => !subtitle.is_empty(),
+			ResolvedPresence::Fallback | ResolvedPresence::Hide => false,
+		};
+		let title = if title_visible {
+			settings.title_offset + settings.title_size
+		} else {
+			0.0
+		};
+		let subtitle = if subtitle_visible {
+			settings.subtitle_offset + settings.subtitle_size
+		} else {
+			0.0
+		};
+		let facet = facet_label
+			.filter(|label| !label.is_empty())
+			.map(|_| Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings))
+			.unwrap_or(0.0);
+		Self {
+			heading: title.max(subtitle),
+			facet,
+		}
+	}
+
+	#[cfg(test)]
+	pub(crate) const fn heading_height(self) -> f32 {
+		self.heading
+	}
+
+	pub(crate) fn plot_top(self, settings: &ResolvedPlotSettings) -> f32 {
+		self.heading + self.facet + settings.plot_padding_top
+	}
+
+	pub(crate) fn facet_label_size(settings: &ResolvedPlotSettings) -> f32 {
+		(settings.legend_size + 2.0).max(10.0)
+	}
+
+	pub(crate) fn plot_area(
+		self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		settings: &ResolvedPlotSettings,
+	) -> Rect<Widget> {
+		let left = padding + settings.plot_padding_left;
+		let right = padding + settings.plot_padding_right;
+		let top = padding + self.plot_top(settings);
+		let bottom = padding + settings.plot_padding_bottom;
+		bounds.region(
+			bounds.x() + left,
+			bounds.y() + top,
+			(bounds.width() - left - right).max(0.0),
+			(bounds.height() - top - bottom).max(0.0),
+		)
+	}
+
+	pub(crate) fn grid_tiled_area(
+		self,
+		outer: Rect<Widget>,
+		settings: &ResolvedPlotSettings,
+	) -> Rect<Widget> {
+		let left = settings.plot_padding_left.min(outer.width());
+		let bottom = settings.plot_padding_bottom.min(outer.height());
+		let top = self.heading.min((outer.height() - bottom).max(0.0));
+		outer.region(
+			outer.x() + left,
+			outer.y() + top,
+			(outer.width() - left).max(0.0),
+			(outer.height() - top - bottom).max(0.0),
+		)
+	}
+
+	pub(crate) fn grid_cell_plot_area(
+		self,
+		cell_bounds: Rect<Widget>,
+		settings: &ResolvedPlotSettings,
+	) -> Rect<Widget> {
+		let top = (self.facet + settings.plot_padding_top).min(cell_bounds.height());
+		let right = settings.plot_padding_right.min(cell_bounds.width());
+		cell_bounds.region(
+			cell_bounds.x(),
+			cell_bounds.y() + top,
+			(cell_bounds.width() - right).max(0.0),
+			(cell_bounds.height() - top).max(0.0),
+		)
+	}
+}
+
 #[derive(Default)]
 pub struct PlotCanvasState {
 	last_hover: Option<String>,
@@ -1158,15 +1270,10 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	fn plot_area(&self, bounds: Rect<Widget>) -> Rect<Widget> {
-		let padding_top = self.padding + self.settings.plot_padding_top;
-		let padding_bottom = self.padding + self.settings.plot_padding_bottom;
-		let padding_left = self.padding + self.settings.plot_padding_left;
-		let padding_right = self.padding + self.settings.plot_padding_right;
-		bounds.region(
-			padding_left,
-			padding_top,
-			bounds.width() - padding_left - padding_right,
-			bounds.height() - padding_top - padding_bottom,
+		VerticalGuideBands::resolve(&self.title, None, &self.settings).plot_area(
+			bounds,
+			self.padding,
+			&self.settings,
 		)
 	}
 
@@ -1528,7 +1635,13 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 				});
 				if let Some(composite) = self.kernel.composite() {
 					let hover = widget_cursor.and_then(|cursor| {
-						composite.hover(widget_bounds, self.padding, cursor, &self.settings_model)
+						composite.hover(
+							widget_bounds,
+							self.padding,
+							&self.title,
+							cursor,
+							&self.settings_model,
+						)
 					});
 					if hover != state.last_hover {
 						state.last_hover = hover.clone();
@@ -2379,6 +2492,95 @@ pub fn format_label(value: f64, axis_type: AxisType) -> String {
 }
 
 #[cfg(test)]
+mod product_0106_vertical_guide_band_oracles {
+	use super::*;
+	use std::sync::Arc;
+
+	fn bounds() -> Rect<Widget> {
+		Rect::<Widget>::from_iced_frame(Rectangle::new(
+			Point::new(40.0, 30.0),
+			iced::Size::new(600.0, 400.0),
+		))
+	}
+
+	#[test]
+	fn product_0106_zero_title_and_facet_cases_preserve_the_previous_plot_area() {
+		let settings = ResolvedPlotSettings::default();
+		let area =
+			VerticalGuideBands::resolve("", None, &settings).plot_area(bounds(), 6.0, &settings);
+		assert_eq!(area.x(), 6.0 + settings.plot_padding_left);
+		assert_eq!(area.y(), 6.0 + settings.plot_padding_top);
+		assert_eq!(
+			area.width(),
+			600.0 - 12.0 - settings.plot_padding_left - settings.plot_padding_right
+		);
+		assert_eq!(
+			area.height(),
+			400.0 - 12.0 - settings.plot_padding_top - settings.plot_padding_bottom
+		);
+	}
+
+	#[test]
+	fn product_0106_title_subtitle_and_facet_reservations_are_resolved_once() {
+		let mut title = ResolvedPlotSettings {
+			title: ResolvedPresence::Show(Arc::new("Title".to_owned())),
+			subtitle: ResolvedPresence::Hide,
+			..ResolvedPlotSettings::default()
+		};
+		let title_bands = VerticalGuideBands::resolve("", None, &title);
+		assert_eq!(
+			title_bands.heading_height(),
+			title.title_offset + title.title_size
+		);
+
+		title.subtitle = ResolvedPresence::Show(Arc::new("Subtitle".to_owned()));
+		let subtitle_bands = VerticalGuideBands::resolve("", None, &title);
+		assert_eq!(
+			subtitle_bands.heading_height(),
+			title.subtitle_offset + title.subtitle_size
+		);
+		assert_ne!(
+			title_bands.heading_height(),
+			subtitle_bands.heading_height()
+		);
+
+		let faceted = VerticalGuideBands::resolve("", Some("East"), &title);
+		let plain = subtitle_bands.plot_area(bounds(), 0.0, &title);
+		let facet = faceted.plot_area(bounds(), 0.0, &title);
+		assert_eq!(
+			facet.y() - plain.y(),
+			VerticalGuideBands::FACET_LABEL_TOP_INSET
+				+ VerticalGuideBands::facet_label_size(&title)
+		);
+		assert_eq!(plain.bottom(), facet.bottom());
+	}
+
+	#[test]
+	fn product_0106_reserved_bounds_keep_the_data_mapping_proportional() {
+		let settings = ResolvedPlotSettings {
+			title: ResolvedPresence::Show(Arc::new("Title".to_owned())),
+			subtitle: ResolvedPresence::Show(Arc::new("Subtitle".to_owned())),
+			..ResolvedPlotSettings::default()
+		};
+		let area = VerticalGuideBands::resolve("", Some("East"), &settings).plot_area(
+			bounds(),
+			0.0,
+			&settings,
+		);
+		let layout = PlotLayout::Cartesian {
+			x_range: (0.0, 100.0),
+			y_range: (0.0, 200.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Linear,
+		};
+		let transform = CoordinateTransformer::new(&layout, area.into_iced());
+		let quarter = transform.cartesian(25.0, 50.0);
+		assert_eq!(quarter.x / area.width(), 0.25);
+		assert_eq!(quarter.y / area.height(), 0.75);
+	}
+}
+
+#[cfg(test)]
 mod product_0031_pre_extraction_oracle {
 	use super::*;
 	use crate::plot::export::SvgBackend;
@@ -2558,7 +2760,8 @@ mod product_0031_pre_extraction_oracle {
 				title_and_subtitle.clone(),
 				neither.clone(),
 			] {
-				let expected_y = settings.plot_padding_top;
+				let expected_y = VerticalGuideBands::resolve("fallback title", None, &settings)
+					.plot_top(&settings);
 				let svg = oracle_svg_at(settings, true, width, height);
 				let (legend_x, legend_y) = legend_background_origin(&svg);
 				assert_eq!(legend_x, width - 170.0);
