@@ -295,7 +295,14 @@ band-fill path.
     mark is unbounded), and `MultivariateFields` sitting in the wrong layer.
     Also repairs a live defect: the automatic resolver admits one-dimension
     radars and parallels, which paint nothing.
-21. **Violin last**, with the KDE moved out of the renderer. By the box-plot
+21. **Vertical guide band reservation — ADR 0106, drafted.** Not a catalog step
+    but a blocker for presentation-readiness. The plot area has never reserved a
+    title band — it works only because most marks don't draw at the top, and
+    parallel's dimension headers do. Reserves three bands from resolved offsets
+    and font sizes: title/subtitle, a facet-label row, and radar ticks on one
+    authored-first spoke. **Horizontal** header fitting is explicitly deferred to
+    PRODUCT-0093 §7's measurement trigger.
+22. **Violin last**, with the KDE moved out of the renderer. By the box-plot
     precedent this is likely a Toron capability question rather than a Polariton
     one.
 
