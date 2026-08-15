@@ -3032,6 +3032,70 @@ r.views([bar(category(), "revenue")])
 		assert!(source.contains("must refuse") || source.contains("refusal"));
 	}
 
+	/// PRODUCT-0107 §2's only provenance gate, and it speaks about authored
+	/// source rather than delivered rows.
+	///
+	/// Nothing at runtime can establish that the median and the density came
+	/// from one execution — two independent executions over unchanged input
+	/// would deliver coherent rows and be accepted. The contract is therefore
+	/// locked here, in the checked-in spelling, which is why this test asserts
+	/// on the source text and not on a compiled result.
+	/// Strip line comments before counting calls.
+	///
+	/// An exhibit's prose necessarily names the calls it explains, so a gate that
+	/// counted raw text would be measuring the comments — it flagged this very
+	/// file twice while being written. String literals containing `//` would fool
+	/// this, and none of the gated exhibits carry one.
+	fn code_only(source: &str) -> String {
+		source
+			.lines()
+			.map(|line| match line.find("//") {
+				Some(index) => &line[..index],
+				None => line,
+			})
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	#[test]
+	fn product_0107_test34_composes_density_and_median_in_one_invocation() {
+		let raw = include_str!("../../../uat/test34.rn");
+		let compiled = compile(raw).expect("the checked-in violin exhibit compiles");
+		let source = code_only(raw);
+		let source = source.as_str();
+		assert_eq!(
+			compiled.executions.len(),
+			1,
+			"one execution is the contract: a second would be a second quantile draw"
+		);
+
+		assert_eq!(
+			source.matches(".kernel_density(").count(),
+			1,
+			"exactly one density invocation"
+		);
+		assert_eq!(
+			source.matches("approx_quantile(").count(),
+			1,
+			"exactly one median aggregate"
+		);
+		assert!(
+			source.contains(".join("),
+			"the median is joined to the density inside the same plan"
+		);
+		// `approx_quantile` names its output `quantile`, not after the function.
+		// Reading it as `approx_quantile` compiles as authored Rune and fails at
+		// bind, so the spelling is pinned here rather than left to a guess.
+		assert!(
+			source.contains("qcol(\"m\", \"quantile\").named(\"median\")"),
+			"the median column is projected from the aggregate's real output name"
+		);
+		assert!(
+			!source.contains("workspace.sql("),
+			"ADR 552 has no SQL surface, so this composition must stay in the Rune DSL"
+		);
+	}
+
 	#[test]
 	fn product_0103_each_exhibit_execution_contains_only_its_relation_branch() {
 		let source = include_str!("../../../uat/test32.rn");

@@ -1,0 +1,39 @@
+// PRODUCT-0107 §2: the canonical violin composition.
+//
+// Density and median are produced by ONE invocation. Both statistics live in a
+// single plan — two scans of the same relation, joined — so they come from one
+// execution, which is what ADR 547's within-execution quantile stability
+// requires and what keeps a median stroke from disagreeing with the shape drawn
+// around it.
+//
+// Each relation handle is bound and consumed exactly once. Rune moves a handle
+// into a relation method, so re-using one after `.kernel_density(...)` fails at
+// runtime rather than at compile time.
+//
+// This is authored Rune on purpose. Polariton compiles relations, it does not
+// synthesize them, so this spelling is the contract rather than something the
+// frontend builds. Toron ADR 552 has no SQL surface at all, which makes violin
+// the first exhibit whose statistics must be composed in the Rune relation DSL
+// rather than handed over as a SQL string.
+let density = workspace
+	.table("violin_probe")
+	.kernel_density(col("region"), col("measure"), 96)
+	.alias("d");
+
+let medians = workspace
+	.table("violin_probe")
+	.aggregate([col("region")], [approx_quantile(col("measure"), 0.5)])
+	.alias("m");
+
+let prepared = density
+	.join(medians, qcol("d", "group").eq(qcol("m", "region")))
+	.project_named([
+		qcol("d", "group").named("group"),
+		qcol("d", "evaluation_value").named("evaluation_value"),
+		qcol("d", "density").named("density"),
+		qcol("m", "quantile").named("median"),
+	]);
+
+prepared.views([
+	view("violin-prepared", table()),
+]);

@@ -35,3 +35,4 @@ pub mod scatter_line;
 pub mod stacked_area;
 pub mod stacked_bar;
 pub mod violin;
+pub mod violin_density;

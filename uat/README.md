@@ -130,3 +130,24 @@ The radar relation is interleaved by category while the authored axes use a
 deliberately different order from the table schema. The parallel relation uses
 eight dimensions, proving projection exceeds PRODUCT-0094's former seven-field
 ceiling; its faceted companion keeps parallel hover live in a non-origin cell.
+
+Seed the violin relation before opening the PRODUCT-0107 composition exhibit:
+
+```sh
+nilket toron sql --file uat/violin_probe.sql
+cargo run -p polariton -- uat/test34.rn
+```
+
+`test34.rn` is the canonical PRODUCT-0107 §2 composition: Toron ADR 552's
+`kernel_density` joined to a grouped `approx_quantile` median inside **one**
+invocation. Polariton compiles relations and never synthesizes them, so this
+authored spelling is the contract — a source-level control pins it, because
+nothing at runtime can prove two statistics shared an execution.
+
+It renders as a table rather than a violin. The mark still consumes raw rows
+until PRODUCT-0107's kernel migration lands, so this exhibit proves the relation
+half of the path and gains its violin panel with the surface.
+
+The `lonely` group is deliberate. It holds one observation, ADR 552 emits no
+rows for it, and the prepared relation must simply not carry it — absence is not
+a zero-density category.
