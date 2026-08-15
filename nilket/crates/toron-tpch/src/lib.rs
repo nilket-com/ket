@@ -25,7 +25,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use arrow::array::{
@@ -5122,6 +5122,9 @@ pub struct TimingAtlasCellOutcome {
 	/// Whether any reclamation actually failed, distinct from the cell failing for some
 	/// other reason.
 	pub cleanup_failed: bool,
+	/// Peer closes tolerated across this cell's workers. Reported so the count is
+	/// visible in the artifact rather than absorbed by the tolerance.
+	pub peer_closes: usize,
 	pub failure: Option<String>,
 }
 
@@ -5301,6 +5304,13 @@ pub trait TimingAtlasHarness {
 	async fn cleanup_child(&mut self, plan: &TimingAtlasChildPlan) -> Result<(), String>;
 	/// Tear down workers. Exactly once per cell, after the last measured child.
 	async fn teardown_cell(&mut self, query: &str) -> Result<(), String>;
+	/// Peer closes tolerated across this cell, read after `teardown_cell`.
+	///
+	/// Defaults to zero for harnesses with no network peers, where zero is the
+	/// true count rather than a stand-in for an unwired counter.
+	fn peer_closes(&self) -> usize {
+		0
+	}
 	/// Elapsed source, in milliseconds.
 	fn now_ms(&mut self) -> f64;
 }
@@ -5321,6 +5331,7 @@ pub async fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 		invalid_attempts: Vec::new(),
 		cleanup_ms: 0.0,
 		cleanup_failed: false,
+		peer_closes: 0,
 		failure: None,
 	};
 
@@ -5387,6 +5398,7 @@ pub async fn run_timing_atlas_cell_with<H: TimingAtlasHarness>(
 			.get_or_insert_with(|| format!("teardown: {error}"));
 	}
 	outcome.teardown_ms = harness.now_ms() - teardown_start;
+	outcome.peer_closes = harness.peer_closes();
 	outcome
 }
 
@@ -5737,6 +5749,9 @@ pub struct CensusTimingAtlasHarness {
 	/// Retained bytes observed at teardown, before the workers are dropped — reading after
 	/// teardown would always be zero and prove nothing.
 	final_retained_bytes: Option<u64>,
+	/// Peer closes tolerated across this cell's workers, summed at teardown. Zero
+	/// until teardown runs, and zero is a real observation, not a missing one.
+	peer_closes: usize,
 	pub residency: TimingAtlasResidencyLog,
 	/// Opt-in retention the coordinator fills with each distributed child's per-task
 	/// telemetry report. Drained in `reduce_child`, so it never accumulates across children.
@@ -5780,6 +5795,7 @@ impl CensusTimingAtlasHarness {
 			last_batches: None,
 			baseline_bytes: None,
 			final_retained_bytes: None,
+			peer_closes: 0,
 			residency: TimingAtlasResidencyLog::default(),
 			telemetry_retention: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
 			last_local_execution: None,
@@ -5976,16 +5992,14 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 
 	async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
 		self.final_retained_bytes = Some(self.resident_partition_bytes());
-		// Raise the marker *before* dropping the coordinator. Dropping it closes the
-		// worker's peer, so a close observed from here on is one we caused. Setting
-		// this when the listener stops instead is one step too late: the worker has
-		// already seen the pipe break and failed the cell.
-		for worker in &self.workers {
-			worker.teardown_started.store(true, Ordering::SeqCst);
-		}
 		self.coordinator = None;
 		let workers = std::mem::take(&mut self.workers);
-		shutdown_execution_census_workers(workers).await
+		self.peer_closes = shutdown_execution_census_workers(workers).await?;
+		Ok(())
+	}
+
+	fn peer_closes(&self) -> usize {
+		self.peer_closes
 	}
 
 	fn now_ms(&mut self) -> f64 {
@@ -6139,6 +6153,7 @@ pub fn timing_atlas_cell_summary_row(outcome: &TimingAtlasCellOutcome) -> serde_
 		"teardown_ms": outcome.teardown_ms,
 		"verification_ms": outcome.verification_ms,
 		"cleanup_ms": outcome.cleanup_ms,
+		"peer_closes": outcome.peer_closes,
 		"failure": outcome.failure,
 	})
 }
@@ -8414,18 +8429,21 @@ struct ExecutionCensusWorkerHarness {
 	partition_store: Arc<InMemoryPartitionStore>,
 	cancellation_cleanup: Arc<AtomicBool>,
 	shutdown: tokio::sync::oneshot::Sender<()>,
-	/// Raised when *teardown begins*, not when the listener stops.
-	///
-	/// `teardown_cell` drops the coordinator before signalling shutdown, so a
-	/// worker sees its peer vanish while the accept loop is still running. Keying
-	/// the tolerance off the listener's own shutdown made it unreachable — q01
-	/// failed identically twice, at 35 minutes a run, because the flag was set one
-	/// step too late.
-	teardown_started: Arc<AtomicBool>,
+	/// Peer closes tolerated on this worker's connections, reported rather than
+	/// charged. Always published, including zero — a cell that saw none must be
+	/// distinguishable from one whose counter was never wired.
+	peer_closes: Arc<AtomicUsize>,
 	handle: tokio::task::JoinHandle<Result<(), String>>,
 }
-/// Whether a connection error is the ordinary consequence of the coordinator
-/// closing the listener, rather than a worker fault.
+/// Whether a connection error is the ordinary end of a peer's session rather
+/// than a worker fault.
+///
+/// A census worker cannot tell "the coordinator finished with me" from "the
+/// coordinator died" — both arrive as a broken pipe on the worker's side. That
+/// makes this signal non-discriminating by construction, so it is counted and
+/// never charged. What actually guards against a truncated query is the
+/// coordinator's own error path and the cell's result verification, both of
+/// which observe the query rather than the socket.
 ///
 /// Matched on `io::ErrorKind` and never on rendered text: the message is a
 /// presentation of the error, not its identity.
@@ -8441,6 +8459,33 @@ fn is_expected_peer_close(error: &toron::error::QueryError) -> bool {
 					| std::io::ErrorKind::UnexpectedEof
 			)
 	)
+}
+
+/// Decide whether a finished census connection failed the cell, counting the
+/// closes it tolerates.
+///
+/// Deliberately free of any notion of *when* in the cell's life the connection
+/// ended. Measured, not assumed: instrumenting the moment each connection ends
+/// showed q01 taking a broken pipe at the close of *every* distributed attempt —
+/// seven of eight with teardown not yet begun — while all seven pairs measured
+/// cleanly and no attempt was invalid. The close is how a finished query ends,
+/// not how one fails; charging it failed a complete cell as `cohort_incomplete`.
+///
+/// Two earlier fixes gated this on a teardown flag because the failure text
+/// carried a `teardown:` prefix. That prefix marks where the error surfaced —
+/// the JoinSet holds each result until join — not where it occurred.
+fn classify_census_connection_outcome(
+	outcome: Result<(), toron::error::QueryError>,
+	peer_closes: &AtomicUsize,
+) -> Result<(), String> {
+	match outcome {
+		Ok(()) => Ok(()),
+		Err(error) if is_expected_peer_close(&error) => {
+			peer_closes.fetch_add(1, Ordering::Relaxed);
+			Ok(())
+		}
+		Err(error) => Err(format!("execution census worker connection: {error}")),
+	}
 }
 
 async fn spawn_execution_census_worker(
@@ -8482,48 +8527,21 @@ async fn spawn_execution_census_worker(
 	let cancellation_cleanup = Arc::new(AtomicBool::new(false));
 	let worker_cleanup = cancellation_cleanup.clone();
 	let observed_worker = worker.clone();
-	// Set the instant the coordinator asks the listener to stop. A connection that
-	// ends after this point ended because we said so.
-	let teardown_started = Arc::new(AtomicBool::new(false));
-	let listener_teardown_started = teardown_started.clone();
+	let peer_closes = Arc::new(AtomicUsize::new(0));
+	let listener_peer_closes = peer_closes.clone();
 	let handle = tokio::spawn(async move {
 		let mut connections = tokio::task::JoinSet::new();
 		loop {
 			tokio::select! {
-				_ = &mut shutdown_rx => {
-					// The listener stopping is a second, later signal; teardown_cell raises the
-					// flag before it drops the coordinator.
-					listener_teardown_started.store(true, Ordering::SeqCst);
-					break;
-				}
+				_ = &mut shutdown_rx => break,
 				accepted = listener.accept() => {
 					let (stream, _) = accepted
 						.map_err(|error| format!("execution census worker accept: {error}"))?;
 					let worker = worker.clone();
-					let teardown_started = listener_teardown_started.clone();
+					let peer_closes = listener_peer_closes.clone();
 					connections.spawn(async move {
-						match worker.handle_connection(stream).await {
-							Ok(()) => Ok(()),
-							// A peer that goes away *because the coordinator initiated
-							// shutdown* is an ordinary close, not a fault. Without this
-							// distinction teardown charges a fully measured cell for its
-							// own shutdown: q01 completed all seven pairs, cleaned up, and
-							// returned to baseline, then failed `cohort_incomplete` on a
-							// broken pipe from a connection that was still draining when
-							// the listener stopped.
-							//
-							// Classified by `io::ErrorKind`, never by error text — the
-							// text is a rendering, not a status.
-							Err(error)
-								if teardown_started.load(Ordering::SeqCst)
-									&& is_expected_peer_close(&error) =>
-							{
-								Ok(())
-							}
-							Err(error) => Err(format!(
-								"execution census worker connection: {error}"
-							)),
-						}
+						let outcome = worker.handle_connection(stream).await;
+						classify_census_connection_outcome(outcome, &peer_closes)
 					});
 				}
 			}
@@ -8538,7 +8556,7 @@ async fn spawn_execution_census_worker(
 		Ok(())
 	});
 	Ok(ExecutionCensusWorkerHarness {
-		teardown_started,
+		peer_closes,
 		worker: observed_worker,
 		entry: WorkerEntry {
 			worker_id,
@@ -8637,12 +8655,16 @@ async fn execute_census_distributed_attempt(
 	}
 }
 
+/// Returns the number of peer closes tolerated across every worker, so a cell
+/// can report the count it observed instead of it vanishing into a tolerance.
 async fn shutdown_execution_census_workers(
 	workers: Vec<ExecutionCensusWorkerHarness>,
-) -> Result<(), String> {
+) -> Result<usize, String> {
 	let mut handles = Vec::with_capacity(workers.len());
+	let mut counters = Vec::with_capacity(workers.len());
 	for worker in workers {
 		let _ = worker.shutdown.send(());
+		counters.push(worker.peer_closes);
 		handles.push(worker.handle);
 	}
 	for handle in handles {
@@ -8650,7 +8672,12 @@ async fn shutdown_execution_census_workers(
 			.await
 			.map_err(|error| format!("execution census worker server join: {error}"))??;
 	}
-	Ok(())
+	// Read after every listener has joined: a connection still draining at the
+	// call would otherwise be counted as zero.
+	Ok(counters
+		.iter()
+		.map(|counter| counter.load(Ordering::Relaxed))
+		.sum())
 }
 
 struct ExecutionCensusInput {
@@ -21934,6 +21961,7 @@ mod adr538_timing_atlas_failure_paths {
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
 			cleanup_failed: false,
+			peer_closes: 0,
 			failure: None,
 		};
 		assert!(!outcome.finalized());
@@ -22124,6 +22152,7 @@ mod adr538_timing_atlas_execution {
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
 			cleanup_failed: false,
+			peer_closes: 0,
 			failure: None,
 		};
 		assert!(base.finalized());
@@ -22189,6 +22218,7 @@ mod adr538_timing_atlas_execution {
 			invalid_attempts: Vec::new(),
 			cleanup_ms: 0.0,
 			cleanup_failed: false,
+			peer_closes: 0,
 			failure: None,
 		};
 		assert!(outcome.setup_ms > 0.0 && outcome.teardown_ms > 0.0);
@@ -25048,13 +25078,12 @@ mod adr551_census_worker_shutdown {
 		QueryError::Io(std::io::Error::new(kind, "test"))
 	}
 
-	/// A peer that goes away because the coordinator stopped the listener is an
-	/// ordinary close.
+	/// A peer that goes away when it is done with the worker is an ordinary close.
 	///
 	/// This is the q01 failure: seven pairs measured, cleanup succeeded, residency
 	/// stable, `retained_bytes: 0` — and then `cohort_incomplete`, because a
-	/// connection still draining at shutdown returned `BrokenPipe` and teardown
-	/// could not tell that from a worker fault.
+	/// connection returned `BrokenPipe` and teardown could not tell that from a
+	/// worker fault.
 	#[test]
 	fn coordinator_initiated_peer_closes_are_not_faults() {
 		for kind in [
@@ -25097,59 +25126,84 @@ mod adr551_census_worker_shutdown {
 	}
 }
 
+/// Where in a cell's life a peer close may be tolerated.
+///
+/// The measured answer is "anywhere". Instrumenting the moment each connection
+/// ends showed q01 taking a `BrokenPipe` at the close of every distributed
+/// attempt — seven of eight with teardown not yet begun — while all seven pairs
+/// measured cleanly and no attempt was invalid.
 #[cfg(test)]
-mod adr551_census_teardown_ordering {
+mod adr551_census_peer_close_lifetime {
 	use super::*;
-	use std::sync::atomic::{AtomicBool, Ordering};
+	use std::sync::atomic::{AtomicUsize, Ordering};
 
-	/// Model of the teardown sequence, exercising *order* rather than the
-	/// classifier.
-	///
-	/// `teardown_cell` drops the coordinator before signalling the listener, so
-	/// there is a window in which the worker's peer is already gone but the
-	/// listener has not stopped. A close observed in that window must be
-	/// attributed to teardown.
-	fn cell_finalizes(raise_marker_before_dropping_coordinator: bool) -> bool {
-		let teardown_started = AtomicBool::new(false);
-
-		// --- teardown_cell begins ---
-		if raise_marker_before_dropping_coordinator {
-			teardown_started.store(true, Ordering::SeqCst);
-		}
-		// Dropping the coordinator closes the worker's peer. The worker observes
-		// the broken pipe *here*, while the listener is still accepting.
-		let observed = std::io::ErrorKind::BrokenPipe;
-		let tolerated = teardown_started.load(Ordering::SeqCst)
-			&& is_expected_peer_close(&toron::error::QueryError::Io(std::io::Error::new(
-				observed,
+	/// Drives the production classifier itself, not a restatement of it — a
+	/// second copy of the rule could pass while the connection task disagreed.
+	fn classify(kind: std::io::ErrorKind, peer_closes: &AtomicUsize) -> Result<(), String> {
+		classify_census_connection_outcome(
+			Err(toron::error::QueryError::Io(std::io::Error::new(
+				kind,
 				"peer closed",
-			)));
-		// The listener only stops after this point, which is why keying the
-		// tolerance off it cannot help.
-		teardown_started.store(true, Ordering::SeqCst);
-
-		tolerated
+			))),
+			peer_closes,
+		)
 	}
 
-	/// The fix: the marker is raised before the coordinator is dropped, so the
-	/// close falls inside teardown and the cell finalizes.
+	/// The discriminating control. Under the rejected design — tolerance gated on
+	/// a `teardown_started` flag — this case is the one that fails, because the
+	/// flag is false for the close that ends each measured attempt. It is the
+	/// case that actually occurred, seven times per q01 cell.
 	#[test]
-	fn raising_the_marker_before_dropping_the_coordinator_finalizes_the_cell() {
+	fn a_close_during_measurement_is_tolerated_and_counted() {
+		let peer_closes = AtomicUsize::new(0);
 		assert!(
-			cell_finalizes(true),
-			"a close caused by teardown must not fail the cell"
+			classify(std::io::ErrorKind::BrokenPipe, &peer_closes).is_ok(),
+			"a close at the end of a measured attempt must not fail the cell"
+		);
+		assert_eq!(
+			peer_closes.load(Ordering::Relaxed),
+			1,
+			"a tolerated close is counted, never silently absorbed"
 		);
 	}
 
-	/// The regression: this is exactly the earlier attempt, which set the marker
-	/// when the listener stopped. It compiles, its classifier controls pass, and
-	/// the cell still fails — q01 failed identically twice before this ordering
-	/// was tested rather than assumed.
+	/// The same close during teardown. Both positions are tolerated, so the
+	/// classification no longer depends on knowing which one it is — which is the
+	/// point, because the worker cannot tell.
 	#[test]
-	fn raising_the_marker_only_at_listener_shutdown_still_fails_the_cell() {
+	fn a_close_at_teardown_is_tolerated_and_counted() {
+		let peer_closes = AtomicUsize::new(0);
+		assert!(classify(std::io::ErrorKind::BrokenPipe, &peer_closes).is_ok());
+		assert_eq!(peer_closes.load(Ordering::Relaxed), 1);
+	}
+
+	/// The tolerance stays narrow: a worker failing for its own reasons fails the
+	/// cell wherever it happens, and never inflates the peer-close count.
+	#[test]
+	fn a_genuine_fault_fails_the_cell_and_is_not_counted() {
+		let peer_closes = AtomicUsize::new(0);
 		assert!(
-			!cell_finalizes(false),
-			"setting the marker after the coordinator is dropped leaves the window uncovered"
+			classify(std::io::ErrorKind::OutOfMemory, &peer_closes).is_err(),
+			"a genuine worker fault must still fail the cell"
+		);
+		assert_eq!(
+			peer_closes.load(Ordering::Relaxed),
+			0,
+			"a fault is not a peer close"
+		);
+	}
+
+	/// Zero is an observation. A connection that ends cleanly must leave the
+	/// counter at zero, so a reported `0` means "none seen" rather than "never
+	/// counted".
+	#[test]
+	fn a_clean_connection_leaves_the_count_at_zero() {
+		let peer_closes = AtomicUsize::new(0);
+		assert!(classify_census_connection_outcome(Ok(()), &peer_closes).is_ok());
+		assert_eq!(
+			peer_closes.load(Ordering::Relaxed),
+			0,
+			"a clean close is not a peer close"
 		);
 	}
 }
