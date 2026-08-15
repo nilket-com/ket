@@ -5,6 +5,20 @@
 Proposed 2026-08-14. Decisions 1–4 implemented; decision 5 remains
 unimplemented.
 
+**The originating incident is not closed.** A binary carrying decisions 1–4 was
+installed and the affected profile restarted without reset on 2026-08-15. Slab
+recovery completed — `SlabManager::open` precedes `WendelonLogStore::open` in
+node bootstrap, and the run reached the latter in about one second against the
+roughly ten seconds and 8.4 GiB of the original failure. Bootstrap then failed
+on an unrelated durable-format gap now recorded as ADR 0085.
+
+That run is **real-directory non-regression evidence, not verification of the
+bound**. The directory holds 38,929 slab files, so recovery would have stayed
+under the 524,288 descriptor limit on the prior code as well; nothing in the run
+exercised the refusal in decision 3. The bound's evidence remains the unit
+controls, and the profile that would have tested it is not available — see the
+current-observation note in `plans/wip/toron-local-wendelon-slab-exhaustion.md`.
+
 ## Context
 
 A local Nilket workspace at `/home/me/.local/share/nilket/local` can no longer

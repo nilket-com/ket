@@ -41,6 +41,37 @@ therefore not explained by normal 64 MiB append rotation. The directory has a
 regular high-ID sequence of mostly empty `slab_<id>.wnd` files, consistent with
 repeated maintenance lifecycle activity rather than user data volume.
 
+### Current observation, 2026-08-15
+
+The figures above are retained as the original 2026-08-14 report. They no longer
+describe the directory on disk, and the difference is large enough to state
+plainly rather than silently supersede:
+
+| measure | as reported 2026-08-14 | observed 2026-08-15 |
+| --- | ---: | ---: |
+| slab files | 668,700 | 38,929 |
+| zero-byte slab files | 668,693 | 38,223 |
+| non-empty slab files | 7 | 706 |
+| slab mtime range | 08-12 22:38 → 08-14 04:13 | 08-07 15:13 → 08-08 00:45 |
+
+Every artifact in the profile — `snapshot.wnd`, the control WAL segment,
+`audit.ndjson`, `pending_finalizations.redb`, and the newest slab — carries the
+same 2026-08-08 00:45 mtime, so nothing has written to this profile since then
+and it cannot have produced the 08-12 → 08-14 activity above. It is also the only
+large slab directory under `~/.local/share/nilket`; the sibling profiles hold one
+to five slab files each. Whether the original report measured a different profile
+or a state since replaced is not established, and this note does not guess.
+
+The empty-slab producer is nonetheless corroborated here: 38,223 of 38,929 files
+are zero-byte, and the tail ids advance by exactly two (`0x1301d`, `0x1301f`,
+`0x13021`, `0x13023`), which is the reserve-an-output-then-advance-the-active
+signature the Wendelon-side record identifies.
+
+**The profile is preserved, not reset.** It is retained as the evidence for
+Wendelon ADR 0085 — its snapshot is intact but shaped for a pre-ADR-0548 state
+machine, and resetting would destroy the only artifact of that format gap. The
+service is stopped.
+
 ## Why startup fails
 
 `SlabManager::open` currently scans every `slab_<hex>.wnd` file, opens every one,
