@@ -18,7 +18,17 @@ fn main() {
 		println!("cargo:rerun-if-changed={git_dir}/index");
 	}
 	let commit = git(&["rev-parse", "--short=12", "HEAD"]).unwrap_or_else(|| "unknown".to_string());
-	let dirty = git(&["status", "--porcelain"]).map(|s| !s.is_empty());
+	// Tracked modifications only. The stamp answers "can this binary be attributed
+	// to a commit someone can check out?", and an untracked file cannot change what
+	// was compiled — a scratch log or a draft plan sitting in the tree does not make
+	// the build unattributable.
+	//
+	// Counting untracked files here cost a complete 35-minute timing-atlas run:
+	// every cell measured cleanly, replay violations were empty, and authority was
+	// still withheld as `build_not_clean` because a log file and two draft notes
+	// were present. A guard that voids good evidence over repo hygiene is charging
+	// the wrong thing.
+	let dirty = git(&["status", "--porcelain", "--untracked-files=no"]).map(|s| !s.is_empty());
 	let stamp = match dirty {
 		Some(true) => format!("{commit}-dirty"),
 		Some(false) => commit,

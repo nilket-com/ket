@@ -1,7 +1,10 @@
 # ADR 551 - Fusion-invariant base-relation attribution
 
-**Status:** Accepted 2026-08-14. Stage 0 and Stage 1 are implemented; Stage 2
-(the fresh timing run) remains explicitly unrun.
+**Status:** Accepted 2026-08-14. All three stages are complete. Stage 2's run is
+certified (`timing_authority: true`, 21/21 finalized, no typed veto) and its
+component verdict, applying the rule predeclared in §7, is **no component
+dominates**. Evidence and the refusal of any stronger reading are recorded in
+`plans/impl/0551_fusion_invariant_base_relation_attribution_evidence.md`.
 
 ## Context
 

@@ -1442,3 +1442,89 @@ The focused authority-flip controls are green:
 - phase-ledger controls: green;
 - scan-metering controls: green;
 - exact manifest/source set and zero-legacy-writer guards: green.
+
+# Stage 2 — the fresh run and the component verdict
+
+## The artifact
+
+A single SF=8 strict run on the protocol ADR 538 fixed and ADR 551 retained: seven
+measured pairs, one discarded warmup, 21 cells with q15 excluded, parity-fixed arm
+order, median paired delta and ratio as the estimators.
+
+Held outside the repository at `/home/me/atlas-stage2/timing_atlas_2818603a.jsonl`
+(970 rows, sha256 `6ed3bd28ffb60894...`), built from `2818603ab579` with no tracked
+modifications, dataset manifest `fnv1a64:b9b384385fad4af5`, tcp loopback, two
+workers, 35m24s wall.
+
+## Certification gates
+
+`timing_authority: true`, `withheld_reasons: []`, `replay_violations: []`,
+`finalized_cells: 21`. Every cell: seven pairs, zero invalid attempts, no recorded
+failure, residency stable, cleanup returned to baseline. The host is quiescent in
+both the opening header and the closing record. No typed veto — identity violation,
+reconciliation mismatch, unresolved operator scope, measurement-boundary miss,
+invalid transition, finished-child outstanding, clock regression, underflow,
+overflow — appears anywhere in the artifact.
+
+**The instrumentation's target is met: no cell reports a zero local scan.** The
+legacy partition reported five such cells, because a base-relation read inside a
+fused operator loop was written to the operator's own bracket. Local scan medians
+now span 61.8 ms to 1,969.1 ms, and distributed scan is non-zero in every cell.
+All five components are present for all 21 cells, with `dispatch` alone marked
+`eligible: false, additive: false` on scheduler scope — it has no local counterpart
+to pair against, so it cannot enter an additive decomposition.
+
+## The component verdict: no component dominates
+
+Applying the rule predeclared in ADR 551 §7, which retains ADR 538's definitions
+unchanged and was fixed before these numbers existed:
+
+- **S** is the set of cells classified `distinguished` with a median paired delta
+  greater than zero. Here |S| = **18**, which the seal independently reports as
+  `distinguished_slower_cells`. |S| >= 5 is satisfied.
+- Threshold = ceil(2/3 * 18) = **12**.
+- Cells led at >= 50% of the cell's median paired delta, additive components only:
+  `operator` **6**, `shuffle` **6**, `scan` **3**, `transport` **3**.
+
+No component reaches 12, so **no component dominates and the no-work branch wins**.
+
+This reinstates the branch ADR 538 originally reported, but it does not restore
+ADR 538's reasoning: the earlier board is not reweighted and no cell of it is
+treated as comparable, per ADR 551 §8. The verdict stands on this artifact alone,
+measured under one fusion-invariant scope.
+
+**Recorded as "no component dominates."** It is not a finding that the components
+are balanced, and it is not a mechanistic account of where distributed time goes.
+
+## Why the stronger reading is refused
+
+The four additive components do not reconcile to the cell delta. The shortfall is
+`remainder_ms` — envelope time attributed to no component — confirmed by pairing
+remainders directly, which reproduces the shortfall (q09 4,811.6 against 4,707;
+q08 3,726.7 against 3,758.8).
+
+In four cells of S no component leads at all — q06, q13, q14, q19 — and there the
+paired remainder is 41%, 120%, 50% and 76% of the delta. In those cells the
+no-work outcome reports unattributed cost rather than balanced components, which is
+why the verdict is recorded in the weaker form.
+
+The remainder bound was **not** predeclared and is **not** added now; retrofitting
+it would be the post-hoc weakening this arc exists to avoid. It was used only as a
+sensitivity check, which the branch survives: restricting S to the nine cells whose
+paired remainder is within 50% of the delta gives a threshold of 6 against a best
+count of 4 (`operator`), so the branch is unchanged. The check tests the verdict's
+robustness; it does not become part of the rule.
+
+## Forward
+
+`remainder_ms` is the next attribution question, not a threshold to tune. It is
+large, it sits inside the measured envelope, and the current taxonomy does not name
+it. Any future component verdict that wants a mechanistic reading needs it
+accounted for first.
+
+A second finding rides this run. The `peer_closes` counter, added after
+instrumenting when census connections actually end, reports **4 on q01 and 0 on
+every other cell**; the diagnostic run before it saw seven. So the close is
+specific to q01 and varies run to run — a real race in how its attempts finish with
+the workers, now counted and tolerated rather than failing a fully measured cell as
+`cohort_incomplete`. It costs nothing and is observable in every future artifact.
