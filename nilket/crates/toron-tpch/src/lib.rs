@@ -5759,6 +5759,12 @@ pub struct CensusTimingAtlasHarness {
 	/// The local arm's executor window and phase counters, captured in `execute_child` (the
 	/// copy is `Copy`-cheap) and consumed in `reduce_child` after the boundary.
 	last_local_execution: Option<(f64, TaskTelemetryPhases, TaskPhaseReceipt)>,
+	/// ADR 554 §3 B2: SQL planning is **harness-owned**. It happens before the
+	/// coordinator is called at all, so no coordinator span can see it, and the
+	/// two arms declare different boundaries — the local arm's `execute_ms` starts
+	/// after binding, the distributed envelope contains it. Kept separate from
+	/// `pre_dispatch_ms` for exactly that reason.
+	last_sql_planning_ms: Option<f64>,
 }
 
 impl CensusTimingAtlasHarness {
@@ -5799,6 +5805,7 @@ impl CensusTimingAtlasHarness {
 			residency: TimingAtlasResidencyLog::default(),
 			telemetry_retention: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
 			last_local_execution: None,
+			last_sql_planning_ms: None,
 		})
 	}
 
@@ -5897,9 +5904,11 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 					.coordinator
 					.as_ref()
 					.ok_or_else(|| "timing atlas coordinator absent".to_string())?;
+				let planning_started = std::time::Instant::now();
 				let logical = SqlPlanner::new()
 					.plan(&self.sql)
 					.map_err(|error| format!("distributed arm plan: {error}"))?;
+				self.last_sql_planning_ms = Some(planning_started.elapsed().as_secs_f64() * 1000.0);
 				// The plan's identity is the child's identity. Letting the coordinator mint
 				// its own would collide in the resident partition store, because workers
 				// persist across all sixteen children of a cell.
@@ -5947,12 +5956,18 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 		// child actually recorded. A completed child whose receipts are missing is an
 		// apparatus defect and fails loudly — substituting an empty attribution would let
 		// the cell publish receipts it cannot back.
+		// The local arm reports no lifecycle spans: its declared boundary starts after
+		// binding and it never dispatches, so there is nothing for these clocks to
+		// measure. Absent, not zero — a zero would read as "measured and found none".
+		let mut sql_planning_ms = None;
+		let mut lifecycle = toron::coordinator::QueryLifecycleSpans::default();
 		let nodes = match plan.arm {
 			TimingArm::Local => {
 				let (execute_ms, phases, receipt) = self
 					.last_local_execution
 					.take()
 					.ok_or_else(|| "local child completed without executor phases".to_string())?;
+				self.last_sql_planning_ms = None;
 				vec![timing_atlas_local_task_node(execute_ms, &phases, receipt)?]
 			}
 			TimingArm::Distributed => {
@@ -5964,10 +5979,13 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 					.ok_or_else(|| {
 						"distributed child completed without a task telemetry report".to_string()
 					})?;
+				lifecycle = report.lifecycle;
+				sql_planning_ms = self.last_sql_planning_ms.take();
 				timing_atlas_nodes_from_report(&report)?
 			}
 		};
-		let attribution = timing_atlas_child_attribution(nodes);
+		let attribution =
+			timing_atlas_child_attribution_with_lifecycle(nodes, sql_planning_ms, lifecycle);
 		if attribution.is_none() {
 			return Err("child receipts yielded no attributable task nodes".to_string());
 		}
@@ -6394,6 +6412,48 @@ fn timing_atlas_replay_attribution_path(
 			"path bookkeeping {claimed_bookkeeping} disagrees with recomputed {}",
 			recomputed.in_task_unattributed_ms
 		));
+	}
+
+	// ADR 554 §3 B2: the three lifecycle spans are caller-owned clocks, not derived
+	// from nodes, so replay cannot recompute them. What it can and must check is the
+	// arithmetic that binds them — that the declared residual is exactly what the
+	// spans leave over. A receipt whose residual does not follow from its own spans
+	// is asserting coverage it has not shown.
+	if let Some(claimed_residual) = row
+		.get("lifecycle_residual_ms")
+		.and_then(|value| value.as_f64())
+	{
+		let spans = [
+			"sql_planning_ms",
+			"pre_dispatch_ms",
+			"post_completion_drain_ms",
+		]
+		.iter()
+		.filter_map(|key| row.get(*key).and_then(|value| value.as_f64()))
+		.sum::<f64>();
+		let claimed_unnamed = row
+			.get("unnamed_residual_ms")
+			.and_then(|value| value.as_f64())
+			.unwrap_or(f64::NAN);
+		if !claimed_unnamed.is_finite()
+			|| ((claimed_unnamed - spans) - claimed_residual).abs() > 1e-6
+		{
+			problems.push(format!(
+				"lifecycle residual {claimed_residual} does not follow from unnamed \
+				 residual {claimed_unnamed} less spans {spans}"
+			));
+		}
+		// Arithmetic consistency is not enough. The spans decompose the unnamed gap,
+		// so they cannot exceed it: a negative residual means a span is measuring
+		// something outside the interval it claims to subdivide. The first B2 run
+		// reported drain spans larger than the whole query envelope — arithmetically
+		// consistent, semantically nonsense — and only the sign caught it.
+		if claimed_residual < -1e-6 {
+			problems.push(format!(
+				"lifecycle residual {claimed_residual} is negative: spans {spans} exceed \
+				 the unnamed residual {claimed_unnamed} they decompose"
+			));
+		}
 	}
 
 	// Reconciliation: eligible portions plus the remainder must cover measured elapsed,
@@ -7639,6 +7699,13 @@ pub struct TimingAtlasChildAttribution {
 	/// In-task unattributed time along the path. Reporting only: it is not a
 	/// component, is not eligible, and never enters `attributed_ms`.
 	pub in_task_unattributed_ms: f64,
+	/// ADR 554 §3 B2 lifecycle spans. Reporting only, never components, and never
+	/// summed into one number: a single lifecycle figure is the opaque bucket that
+	/// record exists to avoid. `sql_planning_ms` is `None` on an arm whose caller
+	/// did not time it — absent, not zero.
+	pub sql_planning_ms: Option<f64>,
+	pub pre_dispatch_ms: f64,
+	pub post_completion_drain_ms: f64,
 }
 
 impl TimingAtlasChildAttribution {
@@ -7760,6 +7827,15 @@ pub fn timing_atlas_local_task_node(
 pub fn timing_atlas_child_attribution(
 	nodes: Vec<TimingAtlasTaskNode>,
 ) -> Option<TimingAtlasChildAttribution> {
+	timing_atlas_child_attribution_with_lifecycle(nodes, None, Default::default())
+}
+
+/// As above, carrying the ADR 554 §3 B2 lifecycle spans measured outside the tasks.
+pub fn timing_atlas_child_attribution_with_lifecycle(
+	nodes: Vec<TimingAtlasTaskNode>,
+	sql_planning_ms: Option<f64>,
+	lifecycle: toron::coordinator::QueryLifecycleSpans,
+) -> Option<TimingAtlasChildAttribution> {
 	let selected = timing_atlas_critical_path(&nodes)?;
 	Some(TimingAtlasChildAttribution {
 		nodes,
@@ -7767,6 +7843,9 @@ pub fn timing_atlas_child_attribution(
 		path_wall_ms: selected.total_wall_ms,
 		path_components: selected.components,
 		in_task_unattributed_ms: selected.in_task_unattributed_ms,
+		sql_planning_ms,
+		pre_dispatch_ms: lifecycle.pre_dispatch_micros as f64 / 1000.0,
+		post_completion_drain_ms: lifecycle.post_completion_drain_micros as f64 / 1000.0,
 	})
 }
 
@@ -7804,6 +7883,7 @@ pub fn timing_atlas_attribution_path_row(
 		})
 		.collect();
 	let remainder_ms = measured_elapsed_ms - attribution.attributed_ms();
+	let unnamed_residual_ms = remainder_ms - attribution.in_task_unattributed_ms;
 	let telemetry_lock_ms: f64 = attribution
 		.path
 		.iter()
@@ -7835,7 +7915,18 @@ pub fn timing_atlas_attribution_path_row(
 		"telemetry_lock_ms": telemetry_lock_ms,
 		"framework_overhead_ms": framework_overhead_ms,
 		"in_task_unattributed_ms": attribution.in_task_unattributed_ms,
-		"unnamed_residual_ms": remainder_ms - attribution.in_task_unattributed_ms,
+		"unnamed_residual_ms": unnamed_residual_ms,
+		// ADR 554 §3 B2: three sequential spans with distinct owners, plus what
+		// they do not cover. The residual is carried even when small — dropping it
+		// once three plausible timers exist would replace one opaque number with
+		// three confident-looking but incomplete ones.
+		"sql_planning_ms": attribution.sql_planning_ms,
+		"pre_dispatch_ms": attribution.pre_dispatch_ms,
+		"post_completion_drain_ms": attribution.post_completion_drain_ms,
+		"lifecycle_residual_ms": unnamed_residual_ms
+			- attribution.sql_planning_ms.unwrap_or(0.0)
+			- attribution.pre_dispatch_ms
+			- attribution.post_completion_drain_ms,
 	})
 }
 
@@ -23003,6 +23094,129 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 mod adr538_timing_atlas_journal_replay {
 	use super::*;
 
+	/// ADR 554 §3 B2: the three spans are reported separately, and the residual is
+	/// exactly what they leave over. One combined lifecycle number would fail this.
+	#[test]
+	fn adr554_lifecycle_spans_are_reported_separately_with_an_explicit_residual() {
+		let attribution = timing_atlas_child_attribution_with_lifecycle(
+			vec![decomposition_node(0.0, 0.0, 100.0)],
+			Some(4.0),
+			toron::coordinator::QueryLifecycleSpans {
+				pre_dispatch_micros: 6_000,
+				post_completion_drain_micros: 2_000,
+			},
+		)
+		.expect("fixture attributes");
+
+		let row = timing_atlas_attribution_path_row("q19", "distributed", 0, 1, 50.0, &attribution);
+		assert_eq!(row["sql_planning_ms"], 4.0);
+		assert_eq!(row["pre_dispatch_ms"], 6.0);
+		assert_eq!(row["post_completion_drain_ms"], 2.0);
+		// attributed = 5; remainder = 45; in-task = 0; unnamed = 45; spans = 12.
+		assert_eq!(row["unnamed_residual_ms"], 45.0);
+		assert_eq!(row["lifecycle_residual_ms"], 33.0);
+	}
+
+	/// The residual is carried even when the spans nearly cover the gap. A receipt
+	/// that dropped it once three plausible timers existed would have stopped
+	/// measuring coverage and started assuming it.
+	#[test]
+	fn adr554_lifecycle_residual_is_present_even_when_near_zero() {
+		let attribution = timing_atlas_child_attribution_with_lifecycle(
+			vec![decomposition_node(0.0, 0.0, 100.0)],
+			Some(5.0),
+			toron::coordinator::QueryLifecycleSpans {
+				pre_dispatch_micros: 30_000,
+				post_completion_drain_micros: 10_000,
+			},
+		)
+		.expect("fixture attributes");
+
+		let row = timing_atlas_attribution_path_row("q19", "distributed", 0, 1, 50.0, &attribution);
+		assert!(
+			row.get("lifecycle_residual_ms").is_some(),
+			"the residual is reported, not elided when it looks small"
+		);
+		assert_eq!(row["lifecycle_residual_ms"], 0.0);
+	}
+
+	/// A local child reports **no** planning figure. Absent is not zero: a zero
+	/// would read as "measured and found none", and the local arm's declared
+	/// boundary starts after binding, so no clock ever ran.
+	#[test]
+	fn adr554_an_unmeasured_arm_reports_absent_planning_not_zero() {
+		let attribution = timing_atlas_child_attribution(vec![decomposition_node(0.0, 0.0, 100.0)])
+			.expect("fixture attributes");
+		let row = timing_atlas_attribution_path_row("q19", "local", 0, 1, 50.0, &attribution);
+		assert!(row["sql_planning_ms"].is_null());
+		assert_eq!(
+			row["lifecycle_residual_ms"], row["unnamed_residual_ms"],
+			"with no spans measured the residual is the whole unnamed gap"
+		);
+	}
+
+	/// A span that measures more than the gap it decomposes is refused by sign.
+	///
+	/// This is the control the first B2 run lacked. Its drain clock opened before
+	/// `dispatch_loop` rather than after, so the span covered the entire query and
+	/// the residual went to -2,138 ms on q19. Replay checked the arithmetic, which
+	/// held, and passed it. Sign is the check that does not.
+	#[test]
+	fn adr554_replay_rejects_spans_larger_than_the_gap_they_decompose() {
+		let attribution = timing_atlas_child_attribution_with_lifecycle(
+			vec![decomposition_node(0.0, 0.0, 100.0)],
+			Some(1.0),
+			toron::coordinator::QueryLifecycleSpans {
+				// A drain that swallowed the dispatch loop, as the first run's did.
+				pre_dispatch_micros: 1_000,
+				post_completion_drain_micros: 90_000,
+			},
+		)
+		.expect("fixture attributes");
+		let row = timing_atlas_attribution_path_row("q19", "distributed", 0, 1, 50.0, &attribution);
+		assert!(
+			row["lifecycle_residual_ms"]
+				.as_f64()
+				.is_some_and(|ms| ms < 0.0),
+			"the fixture must reproduce the defect it guards against"
+		);
+
+		let problems = timing_atlas_replay_attribution_path(&row)
+			.expect_err("a negative residual must be refused");
+		assert!(
+			problems
+				.iter()
+				.any(|problem| problem.contains("is negative")),
+			"{problems:?}"
+		);
+	}
+
+	/// Replay refuses a receipt whose residual does not follow from its own spans.
+	#[test]
+	fn adr554_replay_rejects_a_residual_that_does_not_follow_from_its_spans() {
+		let attribution = timing_atlas_child_attribution_with_lifecycle(
+			vec![decomposition_node(0.0, 0.0, 100.0)],
+			Some(4.0),
+			toron::coordinator::QueryLifecycleSpans {
+				pre_dispatch_micros: 6_000,
+				post_completion_drain_micros: 2_000,
+			},
+		)
+		.expect("fixture attributes");
+		let mut row =
+			timing_atlas_attribution_path_row("q19", "distributed", 0, 1, 50.0, &attribution);
+		row["lifecycle_residual_ms"] = serde_json::json!(1.0);
+
+		let problems = timing_atlas_replay_attribution_path(&row)
+			.expect_err("a residual that does not follow must be refused");
+		assert!(
+			problems
+				.iter()
+				.any(|problem| problem.contains("lifecycle residual")),
+			"{problems:?}"
+		);
+	}
+
 	/// One node carrying components, bookkeeping, and a wall far larger than either.
 	fn decomposition_node(
 		telemetry_lock_ms: f64,
@@ -24732,6 +24946,7 @@ mod adr538_phase_component_wiring {
 	#[test]
 	fn nodes_expand_stage_edges_from_actual_tasks_and_last_attempt_wins() {
 		let report = QueryTaskTelemetryReport {
+			lifecycle: Default::default(),
 			query_id: QueryId::from_u128(538),
 			stage_upstreams: vec![
 				(StageId::new(0), vec![]),
@@ -24798,6 +25013,7 @@ mod adr538_phase_component_wiring {
 		);
 
 		let report = QueryTaskTelemetryReport {
+			lifecycle: Default::default(),
 			query_id: QueryId::from_u128(538),
 			stage_upstreams: vec![(StageId::new(0), vec![])],
 			tasks: vec![TaskTelemetryRecord {
