@@ -1,0 +1,27 @@
+# Suite runtime policy.
+#
+# nextest runs test *binaries* concurrently. The cargo-test path never did — it
+# set RUST_TEST_THREADS=1, which only serializes *within* a binary — so switching
+# runners exposed a contention that had always been latent.
+#
+# `distributed_process_test` spawns fixture-worker processes and coordinates over
+# loopback. Two of its tests running at once park every process in a futex wait at
+# 0% CPU, and with no outer timeout the run waits forever: a suite that took
+# minutes appears to take hours while computing nothing. Measured in isolation the
+# same tests finish in 0.28s and 0.93s.
+#
+# Serialize that one binary. Everything else stays parallel — single-threading is
+# for the cold path that needs it, not a blanket ritual.
+
+[test-groups]
+distributed-fixtures = { max-threads = 1 }
+
+[[profile.default.overrides]]
+filter = 'binary(distributed_process_test)'
+test-group = 'distributed-fixtures'
+
+[profile.default]
+# Bound a hang instead of waiting on it. A stuck test is terminated after
+# 20 x 60s and reported as a failure, which is information; an unbounded wait is
+# not. Generous enough that genuinely slow tests are unaffected.
+slow-timeout = { period = "60s", terminate-after = 20 }
