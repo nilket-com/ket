@@ -32,7 +32,7 @@ use crate::distributed::identity::QueryId;
 use crate::distributed::identity::StageId;
 use crate::distributed::namespace_lifecycle::QueryTerminalCause;
 use crate::distributed::scheduler::{
-	DistributedScheduler, SchedulerError, StagePlan, TaskTelemetryRecord,
+	DistributedScheduler, SchedulerError, StagePlan, TaskTelemetryRecord, duration_micros,
 };
 use crate::distributed::task::{JoinRuntimeObservation, JoinRuntimeObservationMode, TaskTelemetry};
 use crate::distributed::task_state::TaskKey;
@@ -80,10 +80,38 @@ struct DistributedAttemptOutput {
 #[derive(Debug, Clone)]
 pub struct QueryTaskTelemetryReport {
 	pub query_id: QueryId,
+	/// ADR 554 Branch B2: coordinator-owned lifecycle spans, reported separately.
+	/// Neither is an ADR 538 component, and they are deliberately not summed here
+	/// — a single lifecycle number is the opaque bucket that record exists to
+	/// avoid.
+	pub lifecycle: QueryLifecycleSpans,
 	/// `(stage, its upstream stages)` for every stage in the fragmented plan, control
 	/// dependencies included — any edge that orders execution belongs in a wall-clock path.
 	pub stage_upstreams: Vec<(StageId, Vec<StageId>)>,
 	pub tasks: Vec<TaskTelemetryRecord>,
+}
+
+/// Coordinator-owned lifecycle spans around the dispatch window (ADR 554 §3).
+///
+/// `pre_dispatch` covers bind, fragment, and scheduler construction — everything
+/// between the driver receiving a logical plan and the first dispatcher call.
+/// None of these include SQL planning, which happens before the coordinator is
+/// called, nor consumer drain, which continues after the producer finishes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QueryLifecycleSpans {
+	pub pre_dispatch_micros: u64,
+	/// Wall duration of `dispatch_loop` itself. **Contains** every task's dispatch
+	/// window, so it is an envelope over them, not a term beside them. Subtracting
+	/// the path's dispatch sum from it yields in-loop coordination only when those
+	/// windows are contained and non-overlapping — which the consumer must check
+	/// rather than assume.
+	pub dispatch_loop_wall_micros: u64,
+	/// From `dispatch_loop` returning to the end of the driver's post-loop work.
+	///
+	/// **This is producer finalization, not drain.** It ends when the coordinator
+	/// stops producing; buffered batches may still be consumed afterwards, so a
+	/// consumer-exhaustion boundary cannot live here and is measured by the caller.
+	pub post_dispatch_finalization_micros: u64,
 }
 
 /// Opt-in retention slot for [`QueryTaskTelemetryReport`]s. Reports accumulate keyed by
@@ -96,12 +124,14 @@ fn retain_task_telemetry_report(
 	query_id: QueryId,
 	stages: &[StagePlan],
 	tasks: &[TaskTelemetryRecord],
+	lifecycle: QueryLifecycleSpans,
 ) {
 	let Some(retention) = retention.as_ref() else {
 		return;
 	};
 	let report = QueryTaskTelemetryReport {
 		query_id,
+		lifecycle,
 		stage_upstreams: stages
 			.iter()
 			.map(|stage| (stage.stage_id, stage.upstream_stages.clone()))
@@ -1359,6 +1389,11 @@ where
 		active_query: Option<ActiveQueryHandle>,
 		fragment_id_namespace: u32,
 	) -> Result<DistributedAttemptOutput, DistributedAttemptError> {
+		// This attempt receives an already-bound plan, so its pre-dispatch span covers
+		// fragment and scheduler construction only — narrower than the streaming
+		// driver's, which also owns binding. The receipt names the owner, so a
+		// consumer can tell the two apart rather than assuming one boundary.
+		let pre_dispatch_started = std::time::Instant::now();
 		let stages = fragment_plan(
 			bound,
 			self.fragment_config(context, query_budget)
@@ -1370,6 +1405,8 @@ where
 		let mut dispatcher =
 			NetworkTaskDispatcher::new(self.memory.clone(), self.transport.clone())
 				.with_active_query(active_query.clone());
+		let pre_dispatch_micros = duration_micros(pre_dispatch_started);
+		let dispatch_loop_started = std::time::Instant::now();
 		let run = match scheduler.dispatch_loop(&stages, &mut dispatcher).await {
 			Ok(run) => run,
 			Err(error) => {
@@ -1382,11 +1419,20 @@ where
 				return Err(DistributedAttemptError::Scheduler { error, stages });
 			}
 		};
+		// Opened after the loop returns — not before the await. A clock started before
+		// `dispatch_loop` measures the loop itself, which is the whole query.
+		let dispatch_loop_wall_micros = duration_micros(dispatch_loop_started);
+		let dispatch_returned = std::time::Instant::now();
 		retain_task_telemetry_report(
 			&self.task_telemetry_retention,
 			context.query_id,
 			&stages,
 			&run.telemetry.task_telemetry,
+			QueryLifecycleSpans {
+				pre_dispatch_micros,
+				dispatch_loop_wall_micros,
+				post_dispatch_finalization_micros: duration_micros(dispatch_returned),
+			},
 		);
 		Ok(DistributedAttemptOutput {
 			final_results: run.final_results,
@@ -1460,6 +1506,11 @@ where
 	let mut retried_descriptor_evolution = false;
 	let mut invalidated = Vec::new();
 	loop {
+		// ADR 554 §3 B2: the pre-dispatch span opens at the start of the attempt and
+		// closes at the dispatcher call below. A retry re-binds and re-fragments, so
+		// the clock is per-attempt rather than per-query — the figure describes the
+		// work that actually preceded the dispatch that ran.
+		let pre_dispatch_started = std::time::Instant::now();
 		let measured_binding = if measure_runtime_verdict {
 			Some(
 				bind_explain_analyze(&plan, catalog.as_ref(), &config)
@@ -1508,14 +1559,25 @@ where
 		let dispatcher = NetworkTaskDispatcher::new(memory.clone(), transport.clone())
 			.with_active_query(Some(active_query.clone()))
 			.with_final_result_sender(Some(sender.clone()), Some(batch_sent.clone()));
+		let pre_dispatch_micros = duration_micros(pre_dispatch_started);
+		let dispatch_loop_started = std::time::Instant::now();
 		match scheduler.dispatch_loop(&stages, &dispatcher).await {
 			Ok(run) => {
-				retain_task_telemetry_report(
-					&telemetry_retention,
-					execution_context.query_id,
-					&stages,
-					&run.telemetry.task_telemetry,
-				);
+				let dispatch_loop_wall_micros = duration_micros(dispatch_loop_started);
+				let dispatch_returned = std::time::Instant::now();
+				let retain_report = |post_dispatch_finalization_micros: u64| {
+					retain_task_telemetry_report(
+						&telemetry_retention,
+						execution_context.query_id,
+						&stages,
+						&run.telemetry.task_telemetry,
+						QueryLifecycleSpans {
+							pre_dispatch_micros,
+							dispatch_loop_wall_micros,
+							post_dispatch_finalization_micros,
+						},
+					);
+				};
 				if let Some(binding) = measured_binding.as_ref() {
 					let observations =
 						join_observations_from_task_telemetry(&run.telemetry.task_telemetry);
@@ -1531,6 +1593,11 @@ where
 					}
 					config.runtime_evidence.flush_keys(touched).await;
 				}
+				// Retained after the post-loop work, so the finalization span covers it.
+				// A verdict error above now short-circuits before retention; the query
+				// fails in that case regardless, so the caller sees the error rather
+				// than a missing report.
+				retain_report(duration_micros(dispatch_returned));
 				return Ok(());
 			}
 			Err(error) => {
