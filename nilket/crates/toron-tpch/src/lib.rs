@@ -5976,6 +5976,13 @@ impl TimingAtlasHarness for CensusTimingAtlasHarness {
 
 	async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
 		self.final_retained_bytes = Some(self.resident_partition_bytes());
+		// Raise the marker *before* dropping the coordinator. Dropping it closes the
+		// worker's peer, so a close observed from here on is one we caused. Setting
+		// this when the listener stops instead is one step too late: the worker has
+		// already seen the pipe break and failed the cell.
+		for worker in &self.workers {
+			worker.teardown_started.store(true, Ordering::SeqCst);
+		}
 		self.coordinator = None;
 		let workers = std::mem::take(&mut self.workers);
 		shutdown_execution_census_workers(workers).await
@@ -8407,6 +8414,14 @@ struct ExecutionCensusWorkerHarness {
 	partition_store: Arc<InMemoryPartitionStore>,
 	cancellation_cleanup: Arc<AtomicBool>,
 	shutdown: tokio::sync::oneshot::Sender<()>,
+	/// Raised when *teardown begins*, not when the listener stops.
+	///
+	/// `teardown_cell` drops the coordinator before signalling shutdown, so a
+	/// worker sees its peer vanish while the accept loop is still running. Keying
+	/// the tolerance off the listener's own shutdown made it unreachable — q01
+	/// failed identically twice, at 35 minutes a run, because the flag was set one
+	/// step too late.
+	teardown_started: Arc<AtomicBool>,
 	handle: tokio::task::JoinHandle<Result<(), String>>,
 }
 /// Whether a connection error is the ordinary consequence of the coordinator
@@ -8469,21 +8484,23 @@ async fn spawn_execution_census_worker(
 	let observed_worker = worker.clone();
 	// Set the instant the coordinator asks the listener to stop. A connection that
 	// ends after this point ended because we said so.
-	let shutting_down = Arc::new(AtomicBool::new(false));
-	let listener_shutting_down = shutting_down.clone();
+	let teardown_started = Arc::new(AtomicBool::new(false));
+	let listener_teardown_started = teardown_started.clone();
 	let handle = tokio::spawn(async move {
 		let mut connections = tokio::task::JoinSet::new();
 		loop {
 			tokio::select! {
 				_ = &mut shutdown_rx => {
-					listener_shutting_down.store(true, Ordering::SeqCst);
+					// The listener stopping is a second, later signal; teardown_cell raises the
+					// flag before it drops the coordinator.
+					listener_teardown_started.store(true, Ordering::SeqCst);
 					break;
 				}
 				accepted = listener.accept() => {
 					let (stream, _) = accepted
 						.map_err(|error| format!("execution census worker accept: {error}"))?;
 					let worker = worker.clone();
-					let shutting_down = listener_shutting_down.clone();
+					let teardown_started = listener_teardown_started.clone();
 					connections.spawn(async move {
 						match worker.handle_connection(stream).await {
 							Ok(()) => Ok(()),
@@ -8498,7 +8515,7 @@ async fn spawn_execution_census_worker(
 							// Classified by `io::ErrorKind`, never by error text — the
 							// text is a rendering, not a status.
 							Err(error)
-								if shutting_down.load(Ordering::SeqCst)
+								if teardown_started.load(Ordering::SeqCst)
 									&& is_expected_peer_close(&error) =>
 							{
 								Ok(())
@@ -8521,6 +8538,7 @@ async fn spawn_execution_census_worker(
 		Ok(())
 	});
 	Ok(ExecutionCensusWorkerHarness {
+		teardown_started,
 		worker: observed_worker,
 		entry: WorkerEntry {
 			worker_id,
@@ -25075,6 +25093,63 @@ mod adr551_census_worker_shutdown {
 				message: "worker aborted".to_string()
 			}),
 			"a non-IO worker error is never an expected close"
+		);
+	}
+}
+
+#[cfg(test)]
+mod adr551_census_teardown_ordering {
+	use super::*;
+	use std::sync::atomic::{AtomicBool, Ordering};
+
+	/// Model of the teardown sequence, exercising *order* rather than the
+	/// classifier.
+	///
+	/// `teardown_cell` drops the coordinator before signalling the listener, so
+	/// there is a window in which the worker's peer is already gone but the
+	/// listener has not stopped. A close observed in that window must be
+	/// attributed to teardown.
+	fn cell_finalizes(raise_marker_before_dropping_coordinator: bool) -> bool {
+		let teardown_started = AtomicBool::new(false);
+
+		// --- teardown_cell begins ---
+		if raise_marker_before_dropping_coordinator {
+			teardown_started.store(true, Ordering::SeqCst);
+		}
+		// Dropping the coordinator closes the worker's peer. The worker observes
+		// the broken pipe *here*, while the listener is still accepting.
+		let observed = std::io::ErrorKind::BrokenPipe;
+		let tolerated = teardown_started.load(Ordering::SeqCst)
+			&& is_expected_peer_close(&toron::error::QueryError::Io(std::io::Error::new(
+				observed,
+				"peer closed",
+			)));
+		// The listener only stops after this point, which is why keying the
+		// tolerance off it cannot help.
+		teardown_started.store(true, Ordering::SeqCst);
+
+		tolerated
+	}
+
+	/// The fix: the marker is raised before the coordinator is dropped, so the
+	/// close falls inside teardown and the cell finalizes.
+	#[test]
+	fn raising_the_marker_before_dropping_the_coordinator_finalizes_the_cell() {
+		assert!(
+			cell_finalizes(true),
+			"a close caused by teardown must not fail the cell"
+		);
+	}
+
+	/// The regression: this is exactly the earlier attempt, which set the marker
+	/// when the listener stopped. It compiles, its classifier controls pass, and
+	/// the cell still fails — q01 failed identically twice before this ordering
+	/// was tested rather than assumed.
+	#[test]
+	fn raising_the_marker_only_at_listener_shutdown_still_fails_the_cell() {
+		assert!(
+			!cell_finalizes(false),
+			"setting the marker after the coordinator is dropped leaves the window uncovered"
 		);
 	}
 }
