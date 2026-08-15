@@ -2088,7 +2088,16 @@ pub struct RaftLogEntryFixed {
 pub struct WALRecordHeader {
 	/// 0 = LogEntry, 1 = SnapshotMarker, 2 = SnapshotInstall, 3 = Checkpoint
 	pub record_type: u8, //  1
-	pub _pad1: [u8; 7], //  7
+	/// Shape of the body that follows this header (ADR 85), carved from the
+	/// reserved padding so the record keeps its thirty-two bytes. The record
+	/// checksum spans this header, so an older record still verifies against
+	/// its own zeroed byte and a new one against its declared version.
+	///
+	/// [`PRE_VERSIONING_FORMAT`] here means the same as it does for a snapshot:
+	/// shape unverifiable, decoded as before, and explained rather than
+	/// reported as damage if it does not fit.
+	pub format_version: u8, //  1
+	pub _pad1: [u8; 6], //  6
 	/// Bytes of body following this header, excluding the trailing CRC.
 	pub body_len: u64, //  8
 	/// Raft log index this record pertains to (0 for non-log records).
@@ -2122,8 +2131,30 @@ pub struct SnapshotHeader {
 	/// Byte length of the idempotency cache checkpoint that
 	/// follows the state-machine blob. Zero until that path lands.
 	pub cache_checkpoint_len: u32, //  4
-	pub _pad: [u8; 4],                 //  4
+	/// Shape of the postcard body that follows this header (ADR 85).
+	/// Carved from the reserved padding, so the header keeps its
+	/// eighty bytes and no reader's framing moves.
+	///
+	/// [`PRE_VERSIONING_FORMAT`] is what every artifact written before
+	/// ADR 85 reports, because that padding was zeroed. Such an artifact
+	/// is decoded as before — its shape simply cannot be checked, and a
+	/// failure says so instead of reporting a bare decoder error.
+	pub format_version: u8, //  1
+	pub _pad: [u8; 3],                 //  3
 }
+
+/// Format version reported by any durable artifact written before ADR 85
+/// carved a version out of reserved padding. It means "shape unverifiable",
+/// not "shape known to be old": the bytes are simply from a build that had
+/// nothing to declare.
+pub const PRE_VERSIONING_FORMAT: u8 = 0;
+
+/// Shape of the `postcard(SmState)` body this build writes.
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 1;
+
+/// Shape of the Control Ring WAL record bodies this build writes, including the
+/// `postcard(Entry<..>)` payload of a log record.
+pub const WAL_FORMAT_VERSION: u8 = 1;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

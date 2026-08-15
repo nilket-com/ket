@@ -73,11 +73,12 @@ use crate::schema::{
 use crate::schema::{
 	CtasExpectedBinding, CtasSagaCatalog, CtasSagaEntry, CtasSagaMutation, CtasSagaPhase,
 	CtasSagaReject, CtasSagaResponse, FinalizationMarker, HybridTimestamp, IndexObjectId, Locality,
-	LogEntryKind, NodeId as SchemaNodeId, RaftLogEntryFixed, RowIdentityPolicy,
-	SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SecondaryIndexCatalog, SecondaryIndexDescriptor,
-	SecondaryIndexState, SlabId, SnapshotHeader, TableDropFenceCatalog, TableLifecycleCatalog,
-	TableRetentionPolicy, TableSchemaCatalog, TableSchemaDescriptor, TenantId, TenantKekId,
-	WALRecordHeader, decode_secondary_index_descriptor, decode_secondary_index_drop_request,
+	LogEntryKind, NodeId as SchemaNodeId, PRE_VERSIONING_FORMAT, RaftLogEntryFixed,
+	RowIdentityPolicy, SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SNAPSHOT_FORMAT_VERSION,
+	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, SlabId, SnapshotHeader,
+	TableDropFenceCatalog, TableLifecycleCatalog, TableRetentionPolicy, TableSchemaCatalog,
+	TableSchemaDescriptor, TenantId, TenantKekId, WAL_FORMAT_VERSION, WALRecordHeader,
+	decode_secondary_index_descriptor, decode_secondary_index_drop_request,
 	decode_secondary_index_lifecycle_complete, decode_table_schema_descriptor_v1,
 	validate_table_schema_evolution,
 };
@@ -5861,6 +5862,24 @@ async fn replay_wal_segment(
 		}
 
 		let header: WALRecordHeader = *bytemuck::from_bytes(&bytes[offset..offset + header_size]);
+		// Before `body_len` is trusted for anything. A record shaped by a build
+		// this one does not know is not a torn tail and not damage, and treating
+		// it as either would be a guess presented as a diagnosis.
+		if header.format_version > WAL_FORMAT_VERSION {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"wal {} record at offset {} declares format version {}, newer than this \
+					 build accepts (supported: {}..={}); the segment is intact but written by \
+					 a different build, not corrupt",
+					segment.path.display(),
+					offset,
+					header.format_version,
+					PRE_VERSIONING_FORMAT,
+					WAL_FORMAT_VERSION
+				),
+			));
+		}
 		if first_record_index.is_none() && header.log_index != 0 {
 			first_record_index = Some(header.log_index);
 		}
@@ -6080,12 +6099,21 @@ fn decode_log_record(
 			"log record payload hash mismatch".to_string(),
 		));
 	}
+	// The payload hash matched just above, so these bytes are exactly what their
+	// writer produced. A decode failure is therefore a shape mismatch, and for a
+	// pre-versioning record that is the likeliest reading — the same sentence the
+	// snapshot path owes its operator.
 	let entry: Entry<WendelonTypeConfig> = postcard::from_bytes(payload).map_err(|err| {
-		interior_corruption(
-			wal_path,
-			offset,
-			format!("log entry postcard decode failed: {err}"),
-		)
+		let detail = if header.format_version == PRE_VERSIONING_FORMAT {
+			format!(
+				"log entry postcard decode failed: {err}; the payload hash matched, so this \
+				 record is intact, and it predates format versioning — it was very likely \
+				 written by a build with a different log-entry shape"
+			)
+		} else {
+			format!("log entry postcard decode failed: {err}")
+		};
+		interior_corruption(wal_path, offset, detail)
 	})?;
 	if entry.log_id.index != fixed.index
 		|| entry.log_id.leader_id.term != fixed.term
@@ -6205,7 +6233,8 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 
 	let header = WALRecordHeader {
 		record_type: REC_LOG_ENTRY,
-		_pad1: [0; 7],
+		format_version: WAL_FORMAT_VERSION,
+		_pad1: [0; 6],
 		body_len: body_len as u64,
 		log_index: entry.log_id.index,
 		term: entry.log_id.leader_id.term,
@@ -6250,7 +6279,8 @@ fn serialize_checkpoint_page(
 	};
 	let header = WALRecordHeader {
 		record_type: REC_CHECKPOINT,
-		_pad1: [0; 7],
+		format_version: WAL_FORMAT_VERSION,
+		_pad1: [0; 6],
 		body_len: body_size as u64,
 		log_index,
 		term,
@@ -6295,7 +6325,8 @@ fn snapshot_header_template(state: &SmState) -> SnapshotHeader {
 		},
 		state_sha256: [0; 32],
 		cache_checkpoint_len: 0,
-		_pad: [0; 4],
+		format_version: SNAPSHOT_FORMAT_VERSION,
+		_pad: [0; 3],
 	}
 }
 
@@ -6391,6 +6422,16 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 		.read_exact(&mut header_bytes)
 		.map_err(|err| format!("snapshot header read: {err}"))?;
 	let header: SnapshotHeader = *bytemuck::from_bytes(&header_bytes);
+	// Ahead of the digest check on purpose. A version this build does not know
+	// describes a body whose shape it cannot reason about, and a digest computed
+	// over bytes it cannot interpret would only dress up the confusion.
+	if header.format_version > SNAPSHOT_FORMAT_VERSION {
+		return Err(format!(
+			"snapshot format version {} is newer than this build accepts (supported: {}..={}); \
+			 the artifact is intact but written by a different build, not corrupt",
+			header.format_version, PRE_VERSIONING_FORMAT, SNAPSHOT_FORMAT_VERSION
+		));
+	}
 	if header.cache_checkpoint_len != 0 {
 		return Err(format!(
 			"snapshot cache checkpoint len {} is not supported yet",
@@ -6409,7 +6450,21 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 			header.state_sha256, blake3_hash, sha256_hash
 		));
 	}
-	let state = decode_snapshot_state_bytes(&body)?;
+	// The digest matched, so the body is exactly what its writer produced. A
+	// decode failure here is therefore a shape mismatch, never damage — and for a
+	// pre-versioning artifact that is the likeliest reading by far, since it is
+	// the case ADR 85 exists to explain.
+	let state = decode_snapshot_state_bytes(&body).map_err(|err| {
+		if header.format_version == PRE_VERSIONING_FORMAT {
+			format!(
+				"{err}; the body's digest matched, so this artifact is intact, and it \
+				 predates format versioning — it was very likely written by a build with \
+				 a different state-machine shape"
+			)
+		} else {
+			err
+		}
+	})?;
 	Ok((header, state))
 }
 
@@ -9037,6 +9092,80 @@ mod recovery_tests {
 		assert!(snapshot.leases.contains_key(&0));
 	}
 
+	/// Restamp an encoded page's declared format version and repair its
+	/// checksum, so the record stays byte-valid and only its declared shape
+	/// changes — the condition the gate has to judge.
+	fn wal_page_with_format_version(mut page: AlignedBuf, version: u8) -> AlignedBuf {
+		let header_size = std::mem::size_of::<WALRecordHeader>();
+		let mut header: WALRecordHeader = *bytemuck::from_bytes(&page.as_slice()[..header_size]);
+		header.format_version = version;
+		let body_end = header_size + header.body_len as usize;
+		let dst = page.as_mut_slice();
+		dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+		let checksum = control_artifact_checksum_u32(&dst[..body_end]);
+		dst[body_end..body_end + 4].copy_from_slice(&checksum.to_le_bytes());
+		page
+	}
+
+	#[tokio::test]
+	async fn adr0085_wal_record_from_a_newer_build_is_refused_by_name() {
+		let dir = tempdir("wal-newer-format");
+		let (wal, vote, snapshot) = artifact_paths(&dir);
+		let page = wal_page_with_format_version(
+			serialize_entry_page(&lease_entry(1, 0, 9, 1)).unwrap(),
+			9,
+		);
+		write_wal_pages(&wal, &[page]);
+
+		let io = crate::storage::io_uring::spawn_io_thread(64).unwrap();
+		let error = match WendelonLogStore::open(&wal, &vote, &snapshot, io).await {
+			Ok(_) => panic!("a record version this build does not know must be refused"),
+			Err(error) => error.to_string(),
+		};
+		assert!(
+			error.contains('9'),
+			"the refusal names the version: {error}"
+		);
+		assert!(
+			error.contains("not corrupt"),
+			"an intact segment is not reported as damage: {error}"
+		);
+	}
+
+	#[tokio::test]
+	async fn adr0085_pre_versioning_wal_record_still_replays() {
+		// The guarantee that keeps existing control rings starting: a record
+		// whose version byte is zero is read exactly as before.
+		let dir = tempdir("wal-legacy-format");
+		let (wal, vote, _snapshot) = artifact_paths(&dir);
+		write_vote_file(&vote, Vote::new_committed(3, 7));
+		// Entry plus checkpoint, both stamped version zero: a checkpoint is what
+		// lets replay reach the state machine, so this exercises the record all
+		// the way through rather than stopping at a successful open.
+		write_wal_pages(
+			&wal,
+			&[
+				wal_page_with_format_version(
+					serialize_entry_page(&lease_entry(1, 0, 99, 7)).unwrap(),
+					PRE_VERSIONING_FORMAT,
+				),
+				wal_page_with_format_version(
+					serialize_checkpoint_page(1, 0, 1, 1),
+					PRE_VERSIONING_FORMAT,
+				),
+			],
+		);
+
+		let store = open_store(&dir).await;
+		let recovered = store.recovered_state_machine().await.unwrap();
+		let snapshot = recovered.state_snapshot().await;
+		assert_eq!(snapshot.last_applied_log_id, Some(log_id(1, 1)));
+		assert!(
+			snapshot.leases.contains_key(&0),
+			"a pre-versioning record is recognized and replayed, not refused"
+		);
+	}
+
 	#[tokio::test]
 	async fn restart_without_checkpoint_defers_tail_state_machine_replay() {
 		let dir = tempdir("no-checkpoint");
@@ -11357,5 +11486,105 @@ mod tenant_kek_tests {
 		assert_eq!(keyset.active_tenant_kek_id, Some(active_id));
 		assert!(!keyset.keys.contains_key(&historical_id));
 		assert!(keyset.keys.contains_key(&active_id));
+	}
+
+	/// Rewrite an encoded snapshot's format version, leaving the body and its
+	/// digest untouched. The artifact stays byte-valid; only its declared shape
+	/// changes, which is exactly the condition the gate must judge.
+	fn snapshot_bytes_with_format_version(state: &SmState, version: u8) -> Vec<u8> {
+		let mut bytes = encode_snapshot(state).unwrap();
+		let header_len = std::mem::size_of::<SnapshotHeader>();
+		let mut header = *bytemuck::from_bytes::<SnapshotHeader>(&bytes[..header_len]);
+		header.format_version = version;
+		bytes[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
+		bytes
+	}
+
+	#[test]
+	fn adr0085_wal_records_written_by_this_build_declare_their_format_version() {
+		let checkpoint = serialize_checkpoint_page(7, 7, 7, 1);
+		let header: WALRecordHeader =
+			*bytemuck::from_bytes(&checkpoint.as_slice()[..std::mem::size_of::<WALRecordHeader>()]);
+		assert_eq!(header.format_version, WAL_FORMAT_VERSION);
+		assert_ne!(
+			header.format_version, PRE_VERSIONING_FORMAT,
+			"a build carrying the gate must not write records it would call unverifiable"
+		);
+	}
+
+	#[test]
+	fn adr0085_wal_header_keeps_its_pinned_size_after_carving_a_version() {
+		// The version came out of reserved padding precisely so that every
+		// reader's framing arithmetic stays put. If this ever moves, records
+		// written either side of the change stop lining up.
+		assert_eq!(std::mem::size_of::<WALRecordHeader>(), 32);
+		assert_eq!(std::mem::size_of::<SnapshotHeader>(), 80);
+	}
+
+	#[test]
+	fn adr0085_snapshot_written_by_this_build_declares_its_format_version() {
+		let bytes = encode_snapshot(&SmState::default()).unwrap();
+		let header: SnapshotHeader =
+			*bytemuck::from_bytes(&bytes[..std::mem::size_of::<SnapshotHeader>()]);
+		assert_eq!(header.format_version, SNAPSHOT_FORMAT_VERSION);
+		assert_ne!(
+			header.format_version, PRE_VERSIONING_FORMAT,
+			"a build carrying the gate must not write artifacts it would call unverifiable"
+		);
+	}
+
+	#[test]
+	fn adr0085_snapshot_from_a_newer_build_is_refused_by_name() {
+		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 9);
+		let error = decode_snapshot_reader(bytes.as_slice())
+			.expect_err("a version this build does not know must be refused");
+		assert!(
+			error.contains('9'),
+			"the refusal names the version: {error}"
+		);
+		assert!(
+			error.contains("not corrupt"),
+			"the refusal separates a shape mismatch from damage: {error}"
+		);
+		assert!(
+			!error.contains("hash mismatch"),
+			"an intact artifact must never be reported as damaged: {error}"
+		);
+	}
+
+	#[test]
+	fn adr0085_pre_versioning_snapshot_still_decodes_and_is_not_refused() {
+		// The guarantee that keeps every existing profile starting: a
+		// version-zero artifact whose shape happens to match is read as before.
+		let state = SmState::default();
+		let bytes = snapshot_bytes_with_format_version(&state, PRE_VERSIONING_FORMAT);
+		let (header, decoded) = decode_snapshot_reader(bytes.as_slice())
+			.expect("version zero is recognized, not refused");
+		assert_eq!(header.format_version, PRE_VERSIONING_FORMAT);
+		assert_eq!(decoded.last_applied_log_id, state.last_applied_log_id);
+	}
+
+	#[test]
+	fn adr0085_pre_versioning_snapshot_shape_mismatch_names_the_format_not_damage() {
+		// The incident's exact shape: digest matches, body is intact, and the
+		// decoder runs off the end because the writer had different fields.
+		let mut bytes =
+			snapshot_bytes_with_format_version(&SmState::default(), PRE_VERSIONING_FORMAT);
+		let header_len = std::mem::size_of::<SnapshotHeader>();
+		bytes.truncate(bytes.len() - 1);
+		let mut header = *bytemuck::from_bytes::<SnapshotHeader>(&bytes[..header_len]);
+		header.state_sha256 = control_artifact_digest_32(&bytes[header_len..]);
+		bytes[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
+
+		let error = decode_snapshot_reader(bytes.as_slice())
+			.expect_err("a truncated-shape body must not decode");
+		assert!(
+			error.contains("predates format versioning"),
+			"a pre-versioning shape failure explains itself: {error}"
+		);
+		assert!(
+			error.contains("intact"),
+			"the operator is told the bytes are sound: {error}"
+		);
 	}
 }

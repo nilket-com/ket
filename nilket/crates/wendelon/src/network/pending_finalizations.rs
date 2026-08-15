@@ -1,5 +1,5 @@
 use crate::consensus::TenantFinalization;
-use crate::schema::ClientWriteId;
+use crate::schema::{ClientWriteId, PRE_VERSIONING_FORMAT};
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -19,6 +19,16 @@ const PENDING_FINALIZATIONS_BY_WRITE_ID_TABLE: TableDefinition<&[u8], &[u8]> =
 // three exact row-count outcomes in little-endian order.
 const PENDING_FINALIZATION_DELETE_COUNTS_TABLE: TableDefinition<&[u8], &[u8]> =
 	TableDefinition::new("pending_finalization_delete_counts_v1");
+// ADR 85 store-level shape marker. This store has no header to carve a version
+// out of, so the marker is durable metadata of its own, read before any record
+// body is decoded. An **absent** marker is legacy version zero — every store
+// written before this gate reports it, and refusing them would strand working
+// deployments to explain a failure they have not had.
+const PENDING_FINALIZATION_META_TABLE: TableDefinition<&str, u8> =
+	TableDefinition::new("pending_finalization_meta_v1");
+const PENDING_FINALIZATION_FORMAT_KEY: &str = "format_version";
+/// Shape of the `postcard(PendingFinalizationRecord)` values this build writes.
+const PENDING_FINALIZATION_FORMAT_VERSION: u8 = 1;
 // Secondary-index key shape: canonical idempotency bytes only
 // (`client_uuid` + `sequence_no`), per the contract documented at
 // `src/schema/core.rs`. `idempotency_ttl_ms` and `_pad` are not
@@ -92,6 +102,9 @@ impl PendingFinalizationRecord {
 
 pub struct PendingFinalizationStore {
 	db: Arc<Database>,
+	/// Shape this store's record values are known to carry.
+	/// [`PRE_VERSIONING_FORMAT`] means unverifiable, not old.
+	format_version: u8,
 	write_lock: Mutex<()>,
 	count: AtomicU64,
 	#[cfg(test)]
@@ -127,6 +140,35 @@ impl PendingFinalizationStore {
 				.open_table(PENDING_FINALIZATION_DELETE_COUNTS_TABLE)
 				.map_err(redb_to_io)?;
 		}
+		// Resolved before the self-heal loop below, which decodes every primary
+		// value. A store whose shape this build cannot read must be refused
+		// before its records are interpreted, not after.
+		let format_version = {
+			let meta = write_txn
+				.open_table(PENDING_FINALIZATION_META_TABLE)
+				.map_err(redb_to_io)?;
+			let declared = meta
+				.get(PENDING_FINALIZATION_FORMAT_KEY)
+				.map_err(redb_to_io)?
+				.map(|value| value.value());
+			match declared {
+				Some(version) if version > PENDING_FINALIZATION_FORMAT_VERSION => {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"pending finalization store {} declares format version {version}, \
+							 newer than this build accepts (supported: {}..={}); the store is \
+							 intact but written by a different build, not corrupt",
+							path.display(),
+							PRE_VERSIONING_FORMAT,
+							PENDING_FINALIZATION_FORMAT_VERSION
+						),
+					));
+				}
+				Some(version) => version,
+				None => PRE_VERSIONING_FORMAT,
+			}
+		};
 		let mut initial_count = 0u64;
 		{
 			let primary = write_txn
@@ -141,7 +183,7 @@ impl PendingFinalizationStore {
 			by_write_id.retain(|_, _| false).map_err(redb_to_io)?;
 			for entry in primary.iter().map_err(redb_to_io)? {
 				let (_key, value) = entry.map_err(redb_to_io)?;
-				let record = decode_pending_finalization_record(value.value())?;
+				let record = decode_pending_finalization_record(value.value(), format_version)?;
 				initial_count = initial_count.saturating_add(1);
 				let write_key = encode_write_id_key(record.write_id);
 				by_write_id
@@ -149,9 +191,27 @@ impl PendingFinalizationStore {
 					.map_err(redb_to_io)?;
 			}
 		}
+		// Stamp only a store that holds nothing. Marking a populated legacy store
+		// would assert that records written by an older build match this one's
+		// shape — a claim nothing here can support, and exactly the false
+		// assurance this record exists to remove. A legacy store stays legacy.
+		let format_version = if format_version == PRE_VERSIONING_FORMAT && initial_count == 0 {
+			let mut meta = write_txn
+				.open_table(PENDING_FINALIZATION_META_TABLE)
+				.map_err(redb_to_io)?;
+			meta.insert(
+				PENDING_FINALIZATION_FORMAT_KEY,
+				PENDING_FINALIZATION_FORMAT_VERSION,
+			)
+			.map_err(redb_to_io)?;
+			PENDING_FINALIZATION_FORMAT_VERSION
+		} else {
+			format_version
+		};
 		write_txn.commit().map_err(redb_to_io)?;
 		let store = Arc::new(Self {
 			db,
+			format_version,
 			write_lock: Mutex::new(()),
 			count: AtomicU64::new(initial_count),
 			#[cfg(test)]
@@ -166,6 +226,7 @@ impl PendingFinalizationStore {
 
 	pub async fn load_all(&self) -> std::io::Result<Vec<PendingFinalizationRecord>> {
 		let db = self.db.clone();
+		let format_version = self.format_version;
 		spawn_blocking_io(move || {
 			let read_txn = db.begin_read().map_err(redb_to_io)?;
 			let table = read_txn
@@ -174,12 +235,10 @@ impl PendingFinalizationStore {
 			let mut out = Vec::new();
 			for entry in table.iter().map_err(redb_to_io)? {
 				let (_key, value) = entry.map_err(redb_to_io)?;
-				out.push(postcard::from_bytes(value.value()).map_err(|err| {
-					Error::new(
-						ErrorKind::InvalidData,
-						format!("decode pending finalization: {err}"),
-					)
-				})?);
+				out.push(decode_pending_finalization_record(
+					value.value(),
+					format_version,
+				)?);
 			}
 			Ok(out)
 		})
@@ -191,6 +250,7 @@ impl PendingFinalizationStore {
 		id: PendingFinalizationId,
 	) -> std::io::Result<Option<PendingFinalizationRecord>> {
 		let db = self.db.clone();
+		let format_version = self.format_version;
 		spawn_blocking_io(move || {
 			let read_txn = db.begin_read().map_err(redb_to_io)?;
 			let table = read_txn
@@ -199,7 +259,7 @@ impl PendingFinalizationStore {
 			let Some(value) = table.get(&id.as_bytes()[..]).map_err(redb_to_io)? else {
 				return Ok(None);
 			};
-			let record = decode_pending_finalization_record(value.value())?;
+			let record = decode_pending_finalization_record(value.value(), format_version)?;
 			Ok(Some(record))
 		})
 		.await
@@ -210,6 +270,7 @@ impl PendingFinalizationStore {
 		write_id: ClientWriteId,
 	) -> std::io::Result<Option<PendingFinalizationRecord>> {
 		let db = self.db.clone();
+		let format_version = self.format_version;
 		spawn_blocking_io(move || {
 			let read_txn = db.begin_read().map_err(redb_to_io)?;
 			let by_write_id = read_txn
@@ -229,7 +290,7 @@ impl PendingFinalizationStore {
 			else {
 				return Ok(None);
 			};
-			let record = decode_pending_finalization_record(value.value())?;
+			let record = decode_pending_finalization_record(value.value(), format_version)?;
 			// Defensive consistency check: secondary index value
 			// must point at a record whose `write_id` shares the
 			// canonical idempotency identity. TTL / pad may drift
@@ -334,6 +395,7 @@ impl PendingFinalizationStore {
 	pub async fn remove(&self, id: PendingFinalizationId) -> std::io::Result<()> {
 		let _guard = self.write_lock.lock().await;
 		let db = self.db.clone();
+		let format_version = self.format_version;
 		let removed = spawn_blocking_io(move || {
 			let write_txn = db.begin_write().map_err(redb_to_io)?;
 			let removed_any = {
@@ -341,7 +403,10 @@ impl PendingFinalizationStore {
 					.open_table(PENDING_FINALIZATIONS_TABLE)
 					.map_err(redb_to_io)?;
 				let removed_record = match table.get(&id.as_bytes()[..]).map_err(redb_to_io)? {
-					Some(value) => Some(decode_pending_finalization_record(value.value())?),
+					Some(value) => Some(decode_pending_finalization_record(
+						value.value(),
+						format_version,
+					)?),
 					None => None,
 				};
 				let removed_any = table
@@ -353,7 +418,8 @@ impl PendingFinalizationStore {
 					let mut replacement = None;
 					for entry in table.iter().map_err(redb_to_io)? {
 						let (_key, value) = entry.map_err(redb_to_io)?;
-						let candidate = decode_pending_finalization_record(value.value())?;
+						let candidate =
+							decode_pending_finalization_record(value.value(), format_version)?;
 						if candidate.write_id.canonical_idempotency_bytes() == canonical {
 							replacement = Some(candidate.id);
 							break;
@@ -435,12 +501,24 @@ fn redb_to_io(err: impl std::fmt::Display) -> std::io::Error {
 	Error::other(format!("redb error: {err}"))
 }
 
-fn decode_pending_finalization_record(bytes: &[u8]) -> std::io::Result<PendingFinalizationRecord> {
+fn decode_pending_finalization_record(
+	bytes: &[u8],
+	format_version: u8,
+) -> std::io::Result<PendingFinalizationRecord> {
 	postcard::from_bytes(bytes).map_err(|err| {
-		Error::new(
-			ErrorKind::InvalidData,
-			format!("decode pending finalization: {err}"),
-		)
+		// Postcard encodes this record positionally, so a widened writer makes an
+		// intact value undecodable. For an unmarked store that is the likeliest
+		// reading, and saying so is the whole point of the marker.
+		let detail = if format_version == PRE_VERSIONING_FORMAT {
+			format!(
+				"decode pending finalization: {err}; this store carries no format marker, \
+				 so its records predate format versioning — they were very likely written \
+				 by a build with a different record shape, and the value itself is intact"
+			)
+		} else {
+			format!("decode pending finalization: {err}")
+		};
+		Error::new(ErrorKind::InvalidData, detail)
 	})
 }
 
@@ -692,6 +770,111 @@ mod tests {
 			store.find_by_write_id(first.write_id).await.unwrap(),
 			Some(first),
 			"removing the indexed row must fall back to an older row with the same write_id"
+		);
+	}
+
+	/// Open a store, then drop the process-wide registry entry so the next open
+	/// genuinely re-reads the file rather than returning the cached handle.
+	async fn reopen_store(path: &PathBuf) -> std::io::Result<Arc<PendingFinalizationStore>> {
+		pending_store_registry()
+			.lock()
+			.expect("pending finalization registry poisoned")
+			.remove(path);
+		PendingFinalizationStore::open(path.clone())
+	}
+
+	#[tokio::test]
+	async fn adr0085_fresh_pending_store_declares_its_format_version() {
+		let path = temp_path("format-fresh");
+		let store = PendingFinalizationStore::open(path.clone()).unwrap();
+		assert_eq!(store.format_version, PENDING_FINALIZATION_FORMAT_VERSION);
+		assert_ne!(
+			store.format_version, PRE_VERSIONING_FORMAT,
+			"a store this build created is not legacy"
+		);
+		drop(store);
+		let _ = std::fs::remove_file(&path);
+	}
+
+	#[tokio::test]
+	async fn adr0085_populated_legacy_store_is_not_stamped_as_current() {
+		// A store with records but no marker predates the gate. Stamping it would
+		// assert its records match this build's shape — the exact false assurance
+		// ADR 85 exists to remove.
+		let path = temp_path("format-legacy");
+		let store = PendingFinalizationStore::open(path.clone()).unwrap();
+		store.upsert(record()).await.unwrap();
+		{
+			let write_txn = store.db.begin_write().unwrap();
+			{
+				let mut meta = write_txn
+					.open_table(PENDING_FINALIZATION_META_TABLE)
+					.unwrap();
+				meta.remove(PENDING_FINALIZATION_FORMAT_KEY).unwrap();
+			}
+			write_txn.commit().unwrap();
+		}
+		drop(store);
+
+		let reopened = reopen_store(&path).await.unwrap();
+		assert_eq!(
+			reopened.format_version, PRE_VERSIONING_FORMAT,
+			"a populated store without a marker stays legacy"
+		);
+		assert_eq!(reopened.load_all().await.unwrap().len(), 1);
+		drop(reopened);
+		let _ = std::fs::remove_file(&path);
+	}
+
+	#[tokio::test]
+	async fn adr0085_pending_store_from_a_newer_build_is_refused_by_name() {
+		let path = temp_path("format-newer");
+		let store = PendingFinalizationStore::open(path.clone()).unwrap();
+		store.upsert(record()).await.unwrap();
+		{
+			let write_txn = store.db.begin_write().unwrap();
+			{
+				let mut meta = write_txn
+					.open_table(PENDING_FINALIZATION_META_TABLE)
+					.unwrap();
+				meta.insert(PENDING_FINALIZATION_FORMAT_KEY, 9u8).unwrap();
+			}
+			write_txn.commit().unwrap();
+		}
+		drop(store);
+
+		let text = match reopen_store(&path).await {
+			Ok(_) => panic!("a store version this build does not know must be refused"),
+			Err(error) => error.to_string(),
+		};
+		assert!(text.contains('9'), "the refusal names the version: {text}");
+		assert!(
+			text.contains("not corrupt"),
+			"an intact store is not reported as damage: {text}"
+		);
+		let _ = std::fs::remove_file(&path);
+	}
+
+	#[test]
+	fn adr0085_unmarked_store_explains_a_shape_mismatch_rather_than_reporting_damage() {
+		let error = decode_pending_finalization_record(&[0x01, 0x02], PRE_VERSIONING_FORMAT)
+			.expect_err("a truncated positional value must not decode");
+		let text = error.to_string();
+		assert!(
+			text.contains("predate format versioning"),
+			"an unmarked store explains itself: {text}"
+		);
+		assert!(
+			text.contains("intact"),
+			"the operator is told the value is sound: {text}"
+		);
+
+		let marked =
+			decode_pending_finalization_record(&[0x01, 0x02], PENDING_FINALIZATION_FORMAT_VERSION)
+				.expect_err("the same bytes still fail under a marked store");
+		assert!(
+			!marked.to_string().contains("predate format versioning"),
+			"a marked store must not blame a format it has already declared: {marked}"
 		);
 	}
 }

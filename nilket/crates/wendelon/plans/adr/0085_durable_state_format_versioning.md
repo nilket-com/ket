@@ -2,7 +2,7 @@
 
 ## Status
 
-Proposed 2026-08-15. No implementation.
+Proposed 2026-08-15. All three gates implemented. No migrations, by decision 5.
 
 ## Context
 
@@ -72,6 +72,20 @@ during node bootstrap, and slab recovery had already completed when this fired.
    range the binary accepts, and that the artifact is intact but shaped for a
    different build. An opaque decoder message is the defect this record exists
    to remove.
+
+   **Version zero is recognized, not unrecognized.** Every artifact ever written
+   reports it, including one written minutes ago by a healthy deployment, because
+   the padding this gate occupies was zeroed. Refusing it would take down every
+   profile in existence the moment the gate landed — manufacturing a new outage
+   in the name of explaining an old one. A version-zero artifact is decoded
+   exactly as before; what changes is that a decode failure now reports an intact
+   artifact of pre-versioning shape, likely written by a build with different
+   fields, which is precisely the sentence this incident lacked.
+
+   The corollary is stated rather than glossed: the **strict** gate protects only
+   artifacts written after it lands. Versioning added late cannot retroactively
+   describe what came before, and pretending otherwise would be the same
+   false-assurance failure in a new place.
 
 3. **Format mismatch and corruption are distinct errors.** A digest mismatch and a
    version mismatch get separate text, because they call for opposite operator
