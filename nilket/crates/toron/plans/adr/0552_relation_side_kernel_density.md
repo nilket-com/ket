@@ -136,13 +136,17 @@ ADR 547, not a function returning an opaque blob.
 
 ## Acceptance
 
-- Bandwidth responds to the data: two groups with materially different spread,
-  evaluated in one invocation, produce different bandwidths. This is the control
-  that would fail against today's constant, and it is the record's point.
-- Adding an outlier to one group leaves every other group's density unchanged.
-  The current implementation fails this by construction.
+- Bandwidth responds to the data: equal-cardinality groups with materially
+  different spread produce peak heights in the ratio implied by their separate
+  bandwidths. This control fails against today's figure-global constant, and is
+  the record's point.
+- Adding an outlier to one group leaves every other group's bandwidth unchanged.
+  Because the evaluation grid is shared, the observable regression compares
+  those groups at common evaluation points; an outlier that extends the union
+  extent may add grid points but must not change the other group's common rows.
 - The zero-IQR fallback engages: a group with over half its values identical and
-  genuine tail spread produces a positive bandwidth and non-empty rows.
+  genuine tail spread receives a data-dependent bandwidth and non-empty rows;
+  its peak must distinguish that fallback from today's figure-global constant.
 - Degenerate groups emit **no rows**, asserted as absence, not as zeros.
 - The grid is shared: every emitted group carries an identical set of
   `evaluation_value`s.

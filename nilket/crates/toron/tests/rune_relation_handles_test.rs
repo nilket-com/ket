@@ -242,7 +242,29 @@ async fn adr552_kernel_density_uses_group_spread_and_shared_grid() {
 		*sums.entry(group).or_default() += densities.value(row);
 	}
 	assert_eq!(grids["east"], grids["west"]);
-	assert_ne!(sums["east"], sums["west"], "bandwidth is not a constant");
+	assert!(sums.values().all(|sum| sum.is_finite()));
+}
+
+#[tokio::test]
+async fn adr552_bandwidth_responds_to_group_spread() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("density_spread").kernel_density(col("group"), col("value"), 401)
+        }
+    "#,
+	)
+	.await
+	.expect("group-spread density plan");
+	let batches = execute_density_spread_fixture(&logical)
+		.await
+		.expect("group-spread density execution");
+	let narrow_peak = peak_density(&density_group_rows(&batches, "narrow"));
+	let wide_peak = peak_density(&density_group_rows(&batches, "wide"));
+	assert!(
+		narrow_peak > wide_peak * 10.0,
+		"equal-cardinality groups with different spread need different bandwidths: narrow peak {narrow_peak}, wide peak {wide_peak}"
+	);
 }
 
 #[tokio::test]
@@ -280,7 +302,7 @@ async fn adr552_kernel_density_fragments_through_global_exchange() {
 async fn adr552_outlier_in_one_group_leaves_other_group_density_unchanged() {
 	let script = r#"
         pub fn main(ctx) {
-            ctx.table("density_input").kernel_density(col("group"), col("value"), 8)
+            ctx.table("density_input").kernel_density(col("group"), col("value"), 51)
         }
     "#;
 	let base = execute_density_fixture(&rune_plan(script).await.expect("base density plan"), false)
@@ -294,9 +316,11 @@ async fn adr552_outlier_in_one_group_leaves_other_group_density_unchanged() {
 	.expect("outlier density execution");
 	let base_b = density_group_rows(&base, "B");
 	let outlier_b = density_group_rows(&with_outlier, "B");
+	let base_common = common_extent_rows(&base_b);
+	let outlier_common = common_extent_rows(&outlier_b);
 	assert_eq!(
-		base_b, outlier_b,
-		"a group owns its bandwidth and observations"
+		base_common, outlier_common,
+		"an outlier may extend the shared grid, but must not change another group's density at common evaluation points"
 	);
 }
 
@@ -305,7 +329,7 @@ async fn adr552_zero_iqr_falls_back_and_degenerate_group_is_absent() {
 	let logical = rune_plan(
 		r#"
         pub fn main(ctx) {
-            ctx.table("density_input").kernel_density(col("group"), col("value"), 8)
+            ctx.table("density_input").kernel_density(col("group"), col("value"), 101)
         }
     "#,
 	)
@@ -315,11 +339,15 @@ async fn adr552_zero_iqr_falls_back_and_degenerate_group_is_absent() {
 		.await
 		.expect("zero-IQR density execution");
 	let c_rows = density_group_rows(&batches, "C");
-	assert_eq!(c_rows.len(), 8);
+	assert_eq!(c_rows.len(), 101);
 	assert!(
-		c_rows.iter().all(|(_, density)| density.is_finite())
-			&& c_rows.iter().any(|(_, density)| *density > 0.0),
-		"the p90-p10 fallback must produce a positive density"
+		c_rows.iter().all(|(_, density)| density.is_finite()),
+		"the p90-p10 fallback must produce finite density"
+	);
+	let c_peak = peak_density(&c_rows);
+	assert!(
+		c_peak > 0.15,
+		"the zero-IQR group must receive its tail-spread bandwidth, not the figure-global constant: peak {c_peak}"
 	);
 	assert!(
 		density_group_rows(&batches, "D").is_empty(),
@@ -3422,6 +3450,25 @@ async fn execute_density_fixture(
 	.await
 }
 
+async fn execute_density_spread_fixture(
+	logical: &LogicalPlan,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let bound = bind(
+		logical,
+		&density_spread_catalog(),
+		&PlannerConfig::default(),
+	)
+	.await
+	.map_err(|error| ExecutionError::InvalidExpression {
+		message: format!("bind density spread fixture: {error}"),
+	})?;
+	Executor::new(Arc::new(FixtureScan {
+		batches: HashMap::from([(TableId(4), density_spread_batch(density_spread_schema()))]),
+	}))
+	.execute_bound(&bound, None)
+	.await
+}
+
 fn density_group_rows(batches: &[RecordBatch], wanted: &str) -> Vec<(f64, f64)> {
 	let batch = &batches[0];
 	let groups = batch
@@ -3445,6 +3492,22 @@ fn density_group_rows(batches: &[RecordBatch], wanted: &str) -> Vec<(f64, f64)> 
 		.collect()
 }
 
+fn peak_density(rows: &[(f64, f64)]) -> f64 {
+	rows.iter()
+		.map(|(_, density)| *density)
+		.fold(f64::NEG_INFINITY, f64::max)
+}
+
+fn common_extent_rows(rows: &[(f64, f64)]) -> Vec<(f64, f64)> {
+	rows.iter()
+		.filter(|(evaluation, _)| {
+			*evaluation <= 100.0 + f64::EPSILON
+				&& ((*evaluation / 4.0).round() * 4.0 - *evaluation).abs() < 1e-9
+		})
+		.copied()
+		.collect()
+}
+
 fn density_catalog() -> MockCatalog {
 	let mut catalog = catalog();
 	catalog
@@ -3456,12 +3519,27 @@ fn density_catalog() -> MockCatalog {
 	catalog
 }
 
+fn density_spread_catalog() -> MockCatalog {
+	let mut catalog = catalog();
+	catalog
+		.register_descriptor(
+			TableId(4),
+			descriptor(4, "density_spread", density_spread_schema().as_ref(), "id"),
+		)
+		.expect("register density spread input");
+	catalog
+}
+
 fn density_schema() -> SchemaRef {
 	Arc::new(Schema::new(vec![
 		Field::new("id", DataType::Int64, false),
 		Field::new("group", DataType::Utf8, false),
 		Field::new("value", DataType::Float64, false),
 	]))
+}
+
+fn density_spread_schema() -> SchemaRef {
+	density_schema()
 }
 
 fn density_batch(schema: SchemaRef, with_outlier: bool) -> RecordBatch {
@@ -3473,7 +3551,7 @@ fn density_batch(schema: SchemaRef, with_outlier: bool) -> RecordBatch {
 	if with_outlier {
 		ids.push(7);
 		groups.push("A");
-		values.push(20.0);
+		values.push(200.0);
 	}
 	RecordBatch::try_new(
 		schema,
@@ -3484,6 +3562,22 @@ fn density_batch(schema: SchemaRef, with_outlier: bool) -> RecordBatch {
 		],
 	)
 	.expect("density input batch")
+}
+
+fn density_spread_batch(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 6, 7, 8])),
+			Arc::new(StringArray::from(vec![
+				"narrow", "narrow", "narrow", "narrow", "wide", "wide", "wide", "wide",
+			])),
+			Arc::new(Float64Array::from(vec![
+				0.0, 0.1, 0.2, 0.3, 10.0, 20.0, 30.0, 40.0,
+			])),
+		],
+	)
+	.expect("density spread input batch")
 }
 
 fn density_batch_with_non_finite(schema: SchemaRef) -> RecordBatch {
