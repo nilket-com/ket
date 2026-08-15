@@ -2661,13 +2661,11 @@ mod tests {
 	fn product_0065_box_and_violin_address_shared_slots_by_category_identity() {
 		use crate::plot::kernels::boxplot::{BoxPlotKernel, BoxPlotPreparedData};
 		use crate::plot::kernels::boxplot_tukey::{TukeyBoxRow, TukeyBoxes};
-		use crate::plot::kernels::violin::{ViolinPlotKernel, prepare_violin_data};
+		use crate::plot::kernels::violin::ViolinPlotKernel;
+		use crate::plot::kernels::violin_density::{
+			ViolinDensity, ViolinDensityCell, ViolinDensityInputRow,
+		};
 
-		let data = df!(
-			"category" => ["X", "X", "X", "X", "X", "Z", "Z", "Z", "Z", "Z"],
-			"value" => [1.0_f64, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 6.5, 7.0, 8.0],
-		)
-		.unwrap();
 		let shared_categories = vec!["X".to_owned(), "Y".to_owned(), "Z".to_owned()];
 		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(300.0, 180.0));
 		let settings = ResolvedPlotSettings::default();
@@ -2731,16 +2729,54 @@ mod tests {
 			"box hover joins the shared Z band to Z's local statistics"
 		);
 
-		let violin_prepared = Arc::new(prepare_violin_data(&data, "category", "value", None));
-		assert_eq!(violin_prepared.categories, ["X", "Z"]);
+		let violin_prepared = Arc::new(
+			ViolinDensity::from_rows(
+				vec![
+					("X", 1.0, 0.2, 2.5),
+					("X", 2.0, 0.8, 2.5),
+					("X", 3.0, 0.2, 2.5),
+					("X", 4.0, 0.0, 2.5),
+					("X", 5.0, 0.0, 2.5),
+					("X", 6.0, 0.0, 2.5),
+					("X", 7.0, 0.0, 2.5),
+					("Z", 1.0, 0.0, 6.5),
+					("Z", 2.0, 0.0, 6.5),
+					("Z", 3.0, 0.0, 6.5),
+					("Z", 4.0, 0.0, 6.5),
+					("Z", 5.0, 0.2, 6.5),
+					("Z", 6.0, 0.8, 6.5),
+					("Z", 7.0, 0.2, 6.5),
+				]
+				.into_iter()
+				.map(
+					|(group, evaluation_value, density, median)| ViolinDensityInputRow {
+						group: Some(group.to_owned()),
+						evaluation_value: ViolinDensityCell::Exact(evaluation_value),
+						density: ViolinDensityCell::Exact(density),
+						median: ViolinDensityCell::Exact(median),
+					},
+				)
+				.collect(),
+			)
+			.expect("valid shared-grid violin density"),
+		);
+		assert_eq!(
+			violin_prepared
+				.curves()
+				.map(|curve| curve.label())
+				.collect::<Vec<_>>(),
+			["X", "Z"]
+		);
 		let violin_layout = PlotLayout::CategoricalX {
 			categories: shared_categories,
-			y_range: violin_prepared.y_range,
+			y_range: (1.0, 7.0),
 			y_axis_type: AxisType::Linear,
 		};
 		let violin_transform = CoordinateTransformer::new(&violin_layout, bounds);
 		let violin_kernel = ViolinPlotKernel {
 			prepared_data: Arc::clone(&violin_prepared),
+			x_label: "category".to_owned(),
+			y_label: "value".to_owned(),
 		};
 		let mut violin_backend = RectangleBackend::default();
 		violin_kernel.plot(

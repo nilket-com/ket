@@ -16,6 +16,7 @@ use crate::plot::spec::{BarWidth, CategoryGap, PointSize, StrokeWidth};
 use crate::plot::spec::{
 	BoxPlotFields, BubbleFields, BubblePreparationChannel, HeatmapFields, LayerMark, LayerSettings,
 	LayerSpec, LayeredPlotSpec, MarkFields, MultivariateFields, Override, PieFields, Presence,
+	ViolinFields,
 };
 use crate::plot::theme::PlotSettingsLayer;
 #[cfg(test)]
@@ -245,6 +246,7 @@ impl RuneViewIntent {
 						PlotType::Funnel => "plot.funnel".to_owned(),
 						PlotType::RadialDial => "plot.radial_dial".to_owned(),
 						PlotType::Pie => "plot.pie".to_owned(),
+						PlotType::Violin => "plot.violin".to_owned(),
 						PlotType::Radar => "plot.radar".to_owned(),
 						PlotType::Parallel => "plot.parallel".to_owned(),
 						other => unreachable!(
@@ -371,6 +373,14 @@ pub(crate) struct PieFieldOrigins {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ViolinFieldOrigins {
+	pub(crate) group: Range<u32>,
+	pub(crate) evaluation_value: Range<u32>,
+	pub(crate) density: Range<u32>,
+	pub(crate) median: Range<u32>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MultivariateFieldOrigins {
 	pub(crate) dimensions: Vec<Range<u32>>,
 	pub(crate) category: Option<Range<u32>>,
@@ -471,6 +481,10 @@ pub(crate) enum SpannedMarkFields {
 		fields: PieFields,
 		origins: PieFieldOrigins,
 	},
+	Violin {
+		fields: ViolinFields,
+		origins: ViolinFieldOrigins,
+	},
 	Radar {
 		fields: MultivariateFields,
 		origins: MultivariateFieldOrigins,
@@ -490,6 +504,7 @@ impl SpannedMarkFields {
 			Self::Funnel { fields, .. } => MarkFields::Funnel(fields.clone()),
 			Self::RadialDial { fields, .. } => MarkFields::RadialDial(fields.clone()),
 			Self::Pie { fields, .. } => MarkFields::Pie(fields.clone()),
+			Self::Violin { fields, .. } => MarkFields::Violin(fields.clone()),
 			Self::Radar { fields, .. } => MarkFields::Radar(fields.clone()),
 			Self::Parallel { fields, .. } => MarkFields::Parallel(fields.clone()),
 		}
@@ -542,6 +557,13 @@ impl SpannedMarkFields {
 		}
 	}
 
+	pub(crate) fn violin(&self) -> Option<(&ViolinFields, &ViolinFieldOrigins)> {
+		match self {
+			Self::Violin { fields, origins } => Some((fields, origins)),
+			_ => None,
+		}
+	}
+
 	pub(crate) fn multivariate(
 		&self,
 	) -> Option<(PlotType, &MultivariateFields, &MultivariateFieldOrigins)> {
@@ -570,6 +592,9 @@ impl SpannedMarkFields {
 				left == right
 			}
 			(Self::Pie { fields: left, .. }, Self::Pie { fields: right, .. }) => left == right,
+			(Self::Violin { fields: left, .. }, Self::Violin { fields: right, .. }) => {
+				left == right
+			}
 			(Self::Radar { fields: left, .. }, Self::Radar { fields: right, .. })
 			| (Self::Parallel { fields: left, .. }, Self::Parallel { fields: right, .. }) => left == right,
 			_ => false,

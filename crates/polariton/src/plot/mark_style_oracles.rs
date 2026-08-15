@@ -6,7 +6,10 @@ use crate::plot::kernels::boxplot_tukey::{TukeyBoxRow, TukeyBoxes};
 use crate::plot::kernels::candlestick::{CandlestickPlotKernel, CandlestickPreparedData};
 use crate::plot::kernels::funnel::{FunnelPlotKernel, prepare_funnel_data};
 use crate::plot::kernels::stacked_area::{StackedAreaPlotKernel, StackedAreaPreparedData};
-use crate::plot::kernels::violin::{ViolinPlotKernel, ViolinPreparedData};
+use crate::plot::kernels::violin::ViolinPlotKernel;
+use crate::plot::kernels::violin_density::{
+	ViolinDensity, ViolinDensityCell, ViolinDensityInputRow,
+};
 use crate::plot::legend::LegendProvenance;
 use crate::plot::spec::StackNormalization;
 use iced::advanced::mouse::Cursor;
@@ -140,15 +143,31 @@ fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 	);
 
 	let violin = ViolinPlotKernel {
-		prepared_data: Arc::new(ViolinPreparedData {
-			categories: vec!["A".to_owned()],
-			y_range: (0.0, 2.0),
-			medians: vec![1.0],
-			kde_data: vec![0.5, 1.0, 0.5],
-			tex_height_bins: 3,
-			x_label: String::new(),
-			y_label: String::new(),
-		}),
+		prepared_data: Arc::new(
+			ViolinDensity::from_rows(vec![
+				ViolinDensityInputRow {
+					group: Some("A".to_owned()),
+					evaluation_value: ViolinDensityCell::Exact(0.0),
+					density: ViolinDensityCell::Exact(0.5),
+					median: ViolinDensityCell::Exact(1.0),
+				},
+				ViolinDensityInputRow {
+					group: Some("A".to_owned()),
+					evaluation_value: ViolinDensityCell::Exact(1.0),
+					density: ViolinDensityCell::Exact(1.0),
+					median: ViolinDensityCell::Exact(1.0),
+				},
+				ViolinDensityInputRow {
+					group: Some("A".to_owned()),
+					evaluation_value: ViolinDensityCell::Exact(2.0),
+					density: ViolinDensityCell::Exact(0.5),
+					median: ViolinDensityCell::Exact(1.0),
+				},
+			])
+			.expect("valid violin density fixture"),
+		),
+		x_label: String::new(),
+		y_label: String::new(),
 	};
 	assert_eq!(
 		render(&violin),

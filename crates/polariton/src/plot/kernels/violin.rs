@@ -2,24 +2,43 @@ use crate::plot::common::{
 	AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel, PlotLayout,
 	ResolvedPlotSettings,
 };
+use crate::plot::exact_numeric::{ExactF64Error, exact_f64};
+use crate::plot::kernels::violin_density::{
+	ViolinDensity, ViolinDensityCell, ViolinDensityError, ViolinDensityInputRow,
+	ViolinWidthNormalization,
+};
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Rectangle};
-use polars::prelude::*;
+use polars::prelude::{AnyValue, DataFrame};
 use std::sync::Arc;
 
+/// The final rendering projection of PRODUCT-0107's validated density
+/// relation. Statistics are deliberately absent: Toron produces them before
+/// this kernel sees a row (PRODUCT-0108 §7).
 pub struct ViolinPlotKernel {
-	pub prepared_data: Arc<ViolinPreparedData>,
+	pub prepared_data: Arc<ViolinDensity>,
+	pub x_label: String,
+	pub y_label: String,
 }
 
 impl PlotKernel for ViolinPlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
+		let grid = self.prepared_data.grid();
+		let y_range = match (grid.first(), grid.last()) {
+			(Some(minimum), Some(maximum)) => (*minimum, *maximum),
+			_ => (0.0, 1.0),
+		};
 		PlotLayout::CategoricalX {
-			categories: self.prepared_data.categories.clone(),
+			categories: self
+				.prepared_data
+				.curves()
+				.map(|curve| curve.label().to_owned())
+				.collect(),
 			y_axis_type: AxisType::Linear,
 			y_range: (
-				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
-				settings.y_max.unwrap_or(self.prepared_data.y_range.1),
+				settings.y_min.unwrap_or(y_range.0),
+				settings.y_max.unwrap_or(y_range.1),
 			),
 		}
 	}
@@ -32,113 +51,93 @@ impl PlotKernel for ViolinPlotKernel {
 		cursor: Cursor,
 		settings: ResolvedPlotSettings,
 	) {
-		let num_violins = self.prepared_data.categories.len();
-		let tex_height_bins = self.prepared_data.tex_height_bins;
-		let (y_min, y_max) = self.prepared_data.y_range;
-		let y_step = (y_max - y_min) / (tex_height_bins as f64 - 1.0);
-		for i in 0..num_violins {
-			let Some(shared_index) = transform.category_index(&self.prepared_data.categories[i])
-			else {
+		if self.prepared_data.peak_density() <= 0.0 {
+			return;
+		}
+		let widths = self
+			.prepared_data
+			.normalized_widths(ViolinWidthNormalization::Figure);
+		let curves = self.prepared_data.curves().collect::<Vec<_>>();
+		let grid = self.prepared_data.grid();
+		for (index, curve) in curves.iter().enumerate() {
+			let Some(shared_index) = transform.category_index(curve.label()) else {
 				continue;
 			};
-			let (_center, band_width) = transform.categorical(shared_index, 0.0);
+			let Some(widths) = widths.get(index) else {
+				continue;
+			};
+			let Some((first, last)) = visible_extent(widths) else {
+				continue;
+			};
+			let (_, band_width) = transform.categorical(shared_index, 0.0);
 			let width_scale = band_width * 0.4;
-			let t = if num_violins > 1 {
-				i as f32 / (num_violins - 1) as f32
+			let t = if curves.len() > 1 {
+				index as f32 / (curves.len() - 1) as f32
 			} else {
 				0.5
 			};
 			let color = settings.color_theme.get_color(t);
-			let mut first_bin = 0;
-			for bin in 0..tex_height_bins {
-				if self.prepared_data.kde_data[i * tex_height_bins + bin] > 0.01 {
-					first_bin = bin;
-					break;
-				}
-			}
-			let mut last_bin = tex_height_bins - 1;
-			for bin in (0..tex_height_bins).rev() {
-				if self.prepared_data.kde_data[i * tex_height_bins + bin] > 0.01 {
-					last_bin = bin;
-					break;
-				}
-			}
-			if first_bin >= last_bin {
-				continue;
-			}
-			let violin_path_closure = |builder: &mut dyn PathBuilder| {
-				for bin in first_bin..=last_bin {
-					let data_y = y_min + bin as f64 * y_step;
-					let density = self.prepared_data.kde_data[i * tex_height_bins + bin];
-					let (p, _) = transform.categorical(shared_index, data_y);
-					if bin == first_bin {
-						builder.move_to(iced::Point::new(p.x - density * width_scale, p.y));
+			let violin_path = |builder: &mut dyn PathBuilder| {
+				for point in first..=last {
+					let (position, _) = transform.categorical(shared_index, grid[point]);
+					let x = position.x - widths[point] as f32 * width_scale;
+					if point == first {
+						builder.move_to(iced::Point::new(x, position.y));
 					} else {
-						builder.line_to(iced::Point::new(p.x - density * width_scale, p.y));
+						builder.line_to(iced::Point::new(x, position.y));
 					}
 				}
-				for bin in (first_bin..=last_bin).rev() {
-					let data_y = y_min + bin as f64 * y_step;
-					let density = self.prepared_data.kde_data[i * tex_height_bins + bin];
-					let (p, _) = transform.categorical(shared_index, data_y);
-					builder.line_to(iced::Point::new(p.x + density * width_scale, p.y));
+				for point in (first..=last).rev() {
+					let (position, _) = transform.categorical(shared_index, grid[point]);
+					builder.line_to(iced::Point::new(
+						position.x + widths[point] as f32 * width_scale,
+						position.y,
+					));
 				}
 				builder.close();
 			};
-			backend.fill_path(&violin_path_closure, color);
-			let border_stroke = Stroke {
-				style: Style::Solid(settings.mark_style.decoration.iced()),
-				width: 2.5,
-				..Default::default()
-			};
-			backend.stroke_path(&violin_path_closure, border_stroke);
-			if let Some(&median_val) = self.prepared_data.medians.get(i) {
-				let (median_px, _) = transform.categorical(shared_index, median_val);
-				let bin_idx = (((median_val - y_min) / (y_max - y_min))
-					* (tex_height_bins as f64 - 1.0))
-					.floor() as usize;
-				let bin_idx = bin_idx.min(tex_height_bins - 1);
-				let density = self.prepared_data.kde_data[i * tex_height_bins + bin_idx];
-				let line_half_width = density * width_scale;
-				backend.stroke_path(
-					&|builder| {
-						builder
-							.move_to(iced::Point::new(median_px.x - line_half_width, median_px.y));
-						builder
-							.line_to(iced::Point::new(median_px.x + line_half_width, median_px.y));
-					},
-					Stroke {
-						style: Style::Solid(settings.mark_style.decoration.iced()),
-						width: 4.0,
-						..Default::default()
-					},
-				);
-			}
+			backend.fill_path(&violin_path, color);
+			backend.stroke_path(
+				&violin_path,
+				Stroke {
+					style: Style::Solid(settings.mark_style.decoration.iced()),
+					width: 2.5,
+					..Default::default()
+				},
+			);
+			let median_index = nearest_grid_index(grid, curve.median());
+			let (median, _) = transform.categorical(shared_index, curve.median());
+			let half_width = widths[median_index] as f32 * width_scale;
+			backend.stroke_path(
+				&|builder| {
+					builder.move_to(iced::Point::new(median.x - half_width, median.y));
+					builder.line_to(iced::Point::new(median.x + half_width, median.y));
+				},
+				Stroke {
+					style: Style::Solid(settings.mark_style.decoration.iced()),
+					width: 4.0,
+					..Default::default()
+				},
+			);
 		}
-		if let Some(cursor_pos) = cursor.position() {
-			for i in 0..num_violins {
-				let Some(shared_index) =
-					transform.category_index(&self.prepared_data.categories[i])
-				else {
+		if let Some(cursor) = cursor.position() {
+			for curve in curves {
+				let Some(index) = transform.category_index(curve.label()) else {
 					continue;
 				};
-				let (center, band_width) = transform.categorical(shared_index, 0.0);
-				let left_edge = center.x - (band_width / 2.0);
-				let right_edge = center.x + (band_width / 2.0);
-				if cursor_pos.x >= left_edge && cursor_pos.x <= right_edge {
-					if let Some(&median_val) = self.prepared_data.medians.get(i) {
-						let (median_px, _) = transform.categorical(shared_index, median_val);
-						backend.stroke_path(
-							&|builder| {
-								builder.circle(median_px, 5.0);
-							},
-							Stroke {
-								style: Style::Solid(Color::from_rgb(1.0, 0.2, 0.2)),
-								width: 2.0,
-								..Default::default()
-							},
-						);
-					}
+				let (center, band_width) = transform.categorical(index, 0.0);
+				if cursor.x >= center.x - band_width / 2.0
+					&& cursor.x <= center.x + band_width / 2.0
+				{
+					let (median, _) = transform.categorical(index, curve.median());
+					backend.stroke_path(
+						&|builder| builder.circle(median, 5.0),
+						Stroke {
+							style: Style::Solid(Color::from_rgb(1.0, 0.2, 0.2)),
+							width: 2.0,
+							..Default::default()
+						},
+					);
 					break;
 				}
 			}
@@ -150,230 +149,98 @@ impl PlotKernel for ViolinPlotKernel {
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
 		crate::plot::legend::entries_from_labels(
-			self.prepared_data.categories.iter().cloned(),
+			self.prepared_data
+				.curves()
+				.map(|curve| curve.label().to_owned()),
 			settings,
 		)
 	}
 
 	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		if let Some(cursor_pos) = cursor.position()
-			&& let PlotLayout::CategoricalX { categories, .. } = transform.layout
-		{
-			for (i, cat) in self.prepared_data.categories.iter().enumerate() {
-				let Some(shared_index) = categories.iter().position(|candidate| candidate == cat)
-				else {
-					continue;
-				};
-				let (center_point, band_width) = transform.categorical(shared_index, 0.0);
-				let left_edge = center_point.x - (band_width / 2.0);
-				let right_edge = center_point.x + (band_width / 2.0);
-				if cursor_pos.x >= left_edge
-					&& cursor_pos.x <= right_edge
-					&& let Some(&median_val) = self.prepared_data.medians.get(i)
-				{
-					return Some(format!("{}: Median {:.2}", cat, median_val));
-				}
+		let cursor = cursor.position()?;
+		for curve in self.prepared_data.curves() {
+			let index = transform.category_index(curve.label())?;
+			let (center, band_width) = transform.categorical(index, 0.0);
+			if cursor.x >= center.x - band_width / 2.0 && cursor.x <= center.x + band_width / 2.0 {
+				return Some(format!("{}: Median {:.2}", curve.label(), curve.median()));
 			}
 		}
 		None
 	}
 
 	fn x_label(&self) -> String {
-		self.prepared_data.x_label.clone()
+		self.x_label.clone()
 	}
 
 	fn y_label(&self) -> String {
-		self.prepared_data.y_label.clone()
+		self.y_label.clone()
 	}
 }
 
-pub struct ViolinPreparedData {
-	pub categories: Vec<String>,
-	pub y_range: (f64, f64),
-	pub medians: Vec<f64>,
-	pub kde_data: Vec<f32>,
-	pub tex_height_bins: usize,
-	pub x_label: String,
-	pub y_label: String,
+fn visible_extent(widths: &[f64]) -> Option<(usize, usize)> {
+	let first = widths.iter().position(|width| *width > 0.0)?;
+	let last = widths.iter().rposition(|width| *width > 0.0)?;
+	(first < last).then_some((first, last))
 }
 
-fn compute_kde(
-	y_vals: &[f64],
-	num_bins: usize,
-	y_min: f64,
-	y_max: f64,
-	bandwidth: f64,
-) -> Vec<f32> {
-	let mut density = vec![0.0; num_bins];
-	let step = (y_max - y_min) / (num_bins as f64 - 1.0);
-	let inv_bw = 1.0 / bandwidth;
-	let norm_factor = 1.0 / (y_vals.len() as f64 * bandwidth * (2.0 * std::f64::consts::PI).sqrt());
-	for (i, d) in density.iter_mut().enumerate() {
-		let y = y_min + (i as f64) * step;
-		let mut sum = 0.0;
-		for &val in y_vals {
-			let diff = (y - val) * inv_bw;
-			sum += (-0.5 * diff * diff).exp();
-		}
-		*d = (sum * norm_factor) as f32;
-	}
-	let max_d = density.iter().cloned().fold(f32::MIN, f32::max);
-	if max_d > 0.0 {
-		for d in density.iter_mut() {
-			*d /= max_d;
-		}
-	}
-	density
-}
-
-pub fn prepare_violin_data(
-	df: &DataFrame,
-	cat_col: &str,
-	val_col: &str,
-	manual_range: Option<(f64, f64)>,
-) -> ViolinPreparedData {
-	if df.height() == 0 || val_col.is_empty() {
-		return ViolinPreparedData {
-			categories: vec!["No Data".to_string()],
-			y_range: (0.0, 1.0),
-			medians: vec![0.5],
-			kde_data: vec![0.0; 256],
-			tex_height_bins: 256,
-			x_label: cat_col.to_string(),
-			y_label: val_col.to_string(),
-		};
-	}
-	let (y_min, y_max) = match manual_range {
-		Some(r) => r,
-		None => {
-			let col_res = df.column(val_col).map(|c| {
-				c.as_materialized_series()
-					.cast(&DataType::Float64)
-					.unwrap_or_else(|_| Series::new_empty(val_col.into(), &DataType::Float64))
-			});
-
-			match col_res {
-				Ok(col) => {
-					let col_f64 = col.f64().unwrap();
-					let (y_min, y_max) =
-						(col_f64.min().unwrap_or(0.0), col_f64.max().unwrap_or(1.0));
-					let pad = (y_max - y_min).max(0.001) * 0.1;
-					(y_min - pad, y_max + pad)
-				}
-				Err(_) => (0.0, 1.0),
-			}
-		}
-	};
-	let group_data_res = if cat_col.is_empty() {
-		df.clone()
-			.lazy()
-			.select([
-				lit("All Data").alias("dummy_cat"),
-				col(val_col).median().alias("median"),
-				col(val_col).alias("values"),
-			])
-			.collect()
-	} else {
-		df.clone()
-			.lazy()
-			.group_by([col(cat_col)])
-			.agg([
-				col(val_col).median().alias("median"),
-				col(val_col).alias("values"),
-			])
-			.sort([cat_col], Default::default())
-			.collect()
-	};
-	let group_data = match group_data_res {
-		Ok(df) => df,
-		Err(_) => {
-			return ViolinPreparedData {
-				categories: vec!["No Data".to_string()],
-				y_range: (y_min, y_max),
-				medians: vec![0.5],
-				kde_data: vec![0.0; 256],
-				tex_height_bins: 256,
-				x_label: cat_col.to_string(),
-				y_label: val_col.to_string(),
-			};
-		}
-	};
-	let actual_cat_col = if cat_col.is_empty()
-		|| !group_data
-			.get_column_names()
-			.iter()
-			.any(|name| name.as_str() == cat_col)
-	{
-		"dummy_cat"
-	} else {
-		cat_col
-	};
-	let num_violins = group_data.height();
-	let medians_series = group_data
-		.column("median")
-		.map(|c| {
-			c.as_materialized_series()
-				.cast(&DataType::Float64)
-				.unwrap_or_else(|_| Series::new_empty("median".into(), &DataType::Float64))
+fn nearest_grid_index(grid: &[f64], value: f64) -> usize {
+	grid.iter()
+		.enumerate()
+		.min_by(|(_, left), (_, right)| {
+			(value - **left)
+				.abs()
+				.partial_cmp(&(value - **right).abs())
+				.expect("validated violin grid is finite")
 		})
-		.unwrap_or_else(|_| Series::new_empty("median".into(), &DataType::Float64));
-	let medians_f64 = medians_series.f64().unwrap();
-	let values_list_series = group_data
-		.column("values")
-		.map(|c| c.as_materialized_series().clone())
-		.unwrap_or_else(|_| {
-			Series::new_empty(
-				"values".into(),
-				&DataType::List(Box::new(DataType::Float64)),
-			)
-		});
-	let values_list = values_list_series.list().unwrap();
-	let categories_series = group_data
-		.column(actual_cat_col)
-		.map(|c| c.as_materialized_series().clone())
-		.unwrap_or_else(|_| Series::new("dummy_cat".into(), &["All Data"]));
-	let categories: Vec<String> = if let Ok(ca) = categories_series.i32() {
-		ca.into_no_null_iter().map(|i| i.to_string()).collect()
-	} else {
-		categories_series
-			.iter()
-			.map(|v| {
-				if let AnyValue::String(s) = v {
-					s.to_string()
-				} else {
-					v.to_string().replace("\"", "")
-				}
-			})
-			.collect()
-	};
-	let tex_height_bins = 256;
-	let mut kde_data = vec![0.0f32; num_violins * tex_height_bins];
-	let mut medians = Vec::with_capacity(num_violins);
-	for i in 0..num_violins {
-		medians.push(medians_f64.get(i).unwrap_or(0.0));
-		let series_opt = values_list.get_as_series(i);
-		if let Some(series) = series_opt {
-			let y_slice: Vec<f64> = series
-				.cast(&DataType::Float64)
-				.unwrap_or_else(|_| Series::new_empty("values".into(), &DataType::Float64))
-				.f64()
-				.unwrap()
-				.into_no_null_iter()
-				.collect();
-			let bandwidth = (y_max - y_min).max(0.001) * 0.03;
-			let density = compute_kde(&y_slice, tex_height_bins, y_min, y_max, bandwidth);
-			for bin in 0..tex_height_bins {
-				kde_data[i * tex_height_bins + bin] = density[bin];
-			}
-		}
+		.map(|(index, _)| index)
+		.expect("rendered violin has a non-empty grid")
+}
+
+pub(crate) fn prepare_violin_density_data(
+	df: &DataFrame,
+	group_field: &str,
+	evaluation_field: &str,
+	density_field: &str,
+	median_field: &str,
+) -> Result<ViolinDensity, ViolinDensityError> {
+	let group = df
+		.column(group_field)
+		.expect("PRODUCT-0108 resolution validated the group field");
+	let evaluation = df
+		.column(evaluation_field)
+		.expect("PRODUCT-0108 resolution validated the evaluation field");
+	let density = df
+		.column(density_field)
+		.expect("PRODUCT-0108 resolution validated the density field");
+	let median = df
+		.column(median_field)
+		.expect("PRODUCT-0108 resolution validated the median field");
+	let rows = (0..df.height())
+		.map(|index| ViolinDensityInputRow {
+			group: group_label(group.get(index).expect("row is in bounds")),
+			evaluation_value: numeric_cell(evaluation.get(index).expect("row is in bounds")),
+			density: numeric_cell(density.get(index).expect("row is in bounds")),
+			median: numeric_cell(median.get(index).expect("row is in bounds")),
+		})
+		.collect();
+	ViolinDensity::from_rows(rows)
+}
+
+fn group_label(value: AnyValue<'_>) -> Option<String> {
+	match value {
+		AnyValue::Null => None,
+		AnyValue::String(value) => Some(value.to_owned()),
+		AnyValue::StringOwned(value) => Some(value.as_str().to_owned()),
+		AnyValue::Boolean(value) => Some(value.to_string()),
+		other => Some(other.to_string().replace('"', "")),
 	}
-	ViolinPreparedData {
-		categories,
-		y_range: (y_min, y_max),
-		medians,
-		kde_data,
-		tex_height_bins,
-		x_label: cat_col.to_string(),
-		y_label: val_col.to_string(),
+}
+
+fn numeric_cell(value: AnyValue<'_>) -> ViolinDensityCell {
+	let original = value.to_string();
+	match exact_f64(value) {
+		Ok(value) => ViolinDensityCell::Exact(value),
+		Err(ExactF64Error::Null) => ViolinDensityCell::Null,
+		Err(ExactF64Error::Inexact) => ViolinDensityCell::Inexact(original),
 	}
 }

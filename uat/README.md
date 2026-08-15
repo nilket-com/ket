@@ -144,9 +144,9 @@ invocation. Polariton compiles relations and never synthesizes them, so this
 authored spelling is the contract — a source-level control pins it, because
 nothing at runtime can prove two statistics shared an execution.
 
-It renders as a table rather than a violin. The mark still consumes raw rows
-until PRODUCT-0107's kernel migration lands, so this exhibit proves the relation
-half of the path and gains its violin panel with the surface.
+It renders both the prepared relation table and its violin panel. The table
+keeps the relation-side grid and median inspectable; the violin consumes those
+same four delivered fields without recomputing a density or median.
 
 The `lonely` group is deliberate. It holds one observation, ADR 552 emits no
 rows for it, and the prepared relation must simply not carry it — absence is not

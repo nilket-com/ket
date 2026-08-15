@@ -1,9 +1,3 @@
-// Step 1 of PRODUCT-0107's sequence lands the substrate with its controls while
-// `violin.rs` keeps its existing raw-data path, so nothing calls this yet. The
-// allow goes away in step 3, when the kernel migrates onto it; if it outlives
-// that step, the migration did not happen.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 use std::fmt;
 
@@ -30,7 +24,7 @@ pub(crate) struct ViolinDensityInputRow {
 
 /// How a density becomes a rendered half-width (PRODUCT-0107 §3).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) enum ViolinWidthNormalization {
+pub enum ViolinWidthNormalization {
 	/// One scale for the whole figure, so widths are comparable across groups.
 	#[default]
 	Figure,
@@ -38,23 +32,24 @@ pub(crate) enum ViolinWidthNormalization {
 	/// deliberately by a caller — PRODUCT-0108 §6 gives it no authored spelling —
 	/// because it discards the cross-group comparison the shared evaluation
 	/// extent exists to support.
+	#[allow(dead_code)] // Supported for callers; PRODUCT-0108 deliberately adds no Rune token.
 	PerViolin,
 }
 
 /// One group's validated curve.
 #[derive(Clone, Debug, PartialEq)]
-pub(crate) struct ViolinCurve {
+pub struct ViolinCurve {
 	label: String,
 	median: f64,
 	densities: Vec<f64>,
 }
 
 impl ViolinCurve {
-	pub(crate) fn label(&self) -> &str {
+	pub fn label(&self) -> &str {
 		&self.label
 	}
 
-	pub(crate) fn median(&self) -> f64 {
+	pub fn median(&self) -> f64 {
 		self.median
 	}
 
@@ -62,6 +57,7 @@ impl ViolinCurve {
 	/// [`ViolinDensity::grid`]. Unnormalized, exactly as Toron ADR 552 emits
 	/// them: converting these to a width is the kernel's decision, not this
 	/// substrate's.
+	#[cfg(test)]
 	pub(crate) fn densities(&self) -> &[f64] {
 		&self.densities
 	}
@@ -229,15 +225,16 @@ impl ViolinDensity {
 
 	/// The shared evaluation grid, ascending. One grid for the whole figure, per
 	/// Toron ADR 552's shared extent.
-	pub(crate) fn grid(&self) -> &[f64] {
+	pub fn grid(&self) -> &[f64] {
 		&self.grid
 	}
 
 	/// Curves in the substrate's declared category order.
-	pub(crate) fn curves(&self) -> impl ExactSizeIterator<Item = &ViolinCurve> {
+	pub fn curves(&self) -> impl ExactSizeIterator<Item = &ViolinCurve> {
 		self.curves.iter()
 	}
 
+	#[cfg(test)]
 	pub(crate) fn category_position(&self, label: &str) -> Option<usize> {
 		self.curves.iter().position(|curve| curve.label == label)
 	}
@@ -247,7 +244,7 @@ impl ViolinDensity {
 	/// This is what a figure-wide normalization divides by (PRODUCT-0107 §3).
 	/// It is derived here, with the curves, so a kernel cannot normalize against
 	/// a peak that came from somewhere else.
-	pub(crate) fn peak_density(&self) -> f64 {
+	pub fn peak_density(&self) -> f64 {
 		self.peak_density
 	}
 
@@ -258,7 +255,7 @@ impl ViolinDensity {
 	/// on the value axis by sharing one evaluation extent. `PerViolin` restores
 	/// the older convention where every violin reaches full width; it is a real
 	/// convention and stays available, but it is asked for rather than assumed.
-	pub(crate) fn normalized_widths(&self, mode: ViolinWidthNormalization) -> Vec<Vec<f64>> {
+	pub fn normalized_widths(&self, mode: ViolinWidthNormalization) -> Vec<Vec<f64>> {
 		self.curves
 			.iter()
 			.map(|curve| {
@@ -287,6 +284,7 @@ impl ViolinDensity {
 	///
 	/// Absence is not zero: a caller that needs to tell "declined" from "never
 	/// present" reads this rather than inferring it from a missing curve.
+	#[cfg(test)]
 	pub(crate) fn refused_groups(&self) -> &[String] {
 		&self.refused_groups
 	}

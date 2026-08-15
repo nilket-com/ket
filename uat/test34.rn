@@ -36,4 +36,8 @@ let prepared = density
 
 prepared.views([
 	view("violin-prepared", table()),
+	view(
+		"violin",
+		violin("group", "evaluation_value", "density", "median"),
+	),
 ]);

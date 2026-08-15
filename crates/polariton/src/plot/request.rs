@@ -9,6 +9,7 @@
 use crate::plot::kernels::heatmap::prepare_heatmap_data;
 use crate::plot::kernels::histogram::prepare_histogram_data;
 use crate::plot::kernels::multivariate_rows::prepare_multivariate_rows;
+use crate::plot::kernels::violin::prepare_violin_density_data;
 use crate::plot::spec::{
 	AuthoredChannel, AuthoredPlotSpec, CategoricalPaletteSelection, ColorIdentity,
 	OptionalAuthoredChannel, PlotProvenance, ResolvedPlotSpec, StampedResult, resolve_channels,
@@ -236,6 +237,16 @@ fn validate_prepared_contract(spec: &ResolvedPlotSpec, data: &DataFrame) -> Resu
 		spec.kernel_fields.as_ref()
 	{
 		crate::plot::kernels::pie::prepare_pie_data(data, category.as_deref(), value)
+			.map_err(|error| error.to_string())?;
+	}
+	if let crate::plot::spec::ResolvedKernelFields::Violin {
+		group,
+		evaluation_value,
+		density,
+		median,
+	} = spec.kernel_fields.as_ref()
+	{
+		prepare_violin_density_data(data, group, evaluation_value, density, median)
 			.map_err(|error| error.to_string())?;
 	}
 	if let crate::plot::spec::ResolvedKernelFields::Parallel {
@@ -510,6 +521,53 @@ mod tests {
 			resolved.data.as_ref(),
 			400,
 			300,
+		);
+	}
+
+	#[test]
+	fn product_0108_planning_validates_the_delivered_density_relation_before_factory() {
+		let fields = crate::plot::spec::ViolinFields {
+			group: "group".to_owned(),
+			evaluation_value: "evaluation_value".to_owned(),
+			density: "density".to_owned(),
+			median: "median".to_owned(),
+		};
+		let valid = polars::df!(
+			"group" => ["east", "east", "west", "west"],
+			"evaluation_value" => [0.0_f64, 1.0, 0.0, 1.0],
+			"density" => [0.8_f64, 0.2, 0.4, 0.1],
+			"median" => [0.5_f64, 0.5, 0.5, 0.5],
+		)
+		.expect("valid violin relation");
+		let resolved = plan(PlotRequest {
+			source: materialized("valid violin", valid),
+			authored_spec: AuthoredPlotSpec::violin(fields.clone()),
+		})
+		.expect("planning validates the relation-side violin density");
+		let kernel = crate::plot::factory::create_plot(
+			&resolved.resolved_spec,
+			resolved.data.as_ref(),
+			400,
+			300,
+		);
+		assert_eq!(kernel.x_label(), "group");
+		assert_eq!(kernel.y_label(), "evaluation_value");
+
+		let incoherent = polars::df!(
+			"group" => ["east", "east", "west", "west"],
+			"evaluation_value" => [0.0_f64, 1.0, 0.0, 2.0],
+			"density" => [0.8_f64, 0.2, 0.4, 0.1],
+			"median" => [0.5_f64, 0.5, 0.5, 0.5],
+		)
+		.expect("incoherent violin relation");
+		let error = plan(PlotRequest {
+			source: materialized("incoherent violin", incoherent),
+			authored_spec: AuthoredPlotSpec::violin(fields),
+		})
+		.expect_err("every group must carry the shared grid");
+		assert!(
+			error.contains("every group shares one evaluation grid"),
+			"{error}"
 		);
 	}
 

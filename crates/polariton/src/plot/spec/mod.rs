@@ -409,6 +409,27 @@ impl PieFields {
 	}
 }
 
+/// PRODUCT-0108's fully prepared relation contract. Violin deliberately has
+/// no automatic/raw form: density and median are relation-side statistics.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ViolinFields {
+	pub group: String,
+	pub evaluation_value: String,
+	pub density: String,
+	pub median: String,
+}
+
+impl ViolinFields {
+	pub fn all(&self) -> [&str; 4] {
+		[
+			&self.group,
+			&self.evaluation_value,
+			&self.density,
+			&self.median,
+		]
+	}
+}
+
 impl HeatmapFields {
 	pub fn all(&self) -> [&str; 3] {
 		[&self.x, &self.y, &self.value]
@@ -423,6 +444,7 @@ pub enum MarkFields {
 	Funnel(FunnelFields),
 	RadialDial(RadialDialFields),
 	Pie(PieFields),
+	Violin(ViolinFields),
 	Radar(MultivariateFields),
 	Parallel(MultivariateFields),
 }
@@ -464,6 +486,7 @@ impl MarkFields {
 			Self::Heatmap(_) => 3,
 			Self::Bubble(fields) => 4 + usize::from(fields.label.is_some()),
 			Self::Funnel(_) | Self::Pie(_) => 2,
+			Self::Violin(_) => 4,
 			Self::RadialDial(fields) => 2 + usize::from(fields.label.is_some()),
 			Self::Radar(fields) | Self::Parallel(fields) => {
 				fields.dimensions().len() + usize::from(fields.category().is_some())
@@ -491,6 +514,7 @@ impl MarkFields {
 				_ => None,
 			},
 			Self::Pie(fields) => fields.all().get(index).copied(),
+			Self::Violin(fields) => fields.all().get(index).copied(),
 			Self::Radar(fields) | Self::Parallel(fields) => fields
 				.dimensions()
 				.get(index)
@@ -696,6 +720,23 @@ impl AuthoredPlotSpec {
 	pub fn pie_fields(&self) -> Option<&PieFields> {
 		match self.mark_fields.as_ref() {
 			Some(MarkFields::Pie(fields)) => Some(fields),
+			_ => None,
+		}
+	}
+
+	pub fn violin(fields: ViolinFields) -> Self {
+		let mut spec = Self::xy(
+			PlotComposition::single(PlotType::Violin),
+			fields.group.clone(),
+			fields.evaluation_value.clone(),
+		);
+		spec.mark_fields = Some(MarkFields::Violin(fields));
+		spec
+	}
+
+	pub fn violin_fields(&self) -> Option<&ViolinFields> {
+		match self.mark_fields.as_ref() {
+			Some(MarkFields::Violin(fields)) => Some(fields),
 			_ => None,
 		}
 	}
@@ -1378,8 +1419,10 @@ impl ResolvedPlotSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ResolvedKernelFields {
 	Violin {
-		category: Option<String>,
-		value: String,
+		group: String,
+		evaluation_value: String,
+		density: String,
+		median: String,
 	},
 	Hexbin {
 		x: String,
@@ -1847,6 +1890,18 @@ pub fn resolve_channels(
 	}
 	if plot_type == PlotType::Pie && spec.pie_fields().is_some() {
 		return resolve_pie_channels(spec, schema);
+	}
+	if plot_type == PlotType::Violin {
+		return spec.violin_fields().map_or_else(
+			|| {
+				Err(ChannelError {
+					attribution: FieldAttribution::Role("violin"),
+					field: "<violin>".to_owned(),
+					reason: "violin cannot be resolved from a schema: author a relation with kernel_density(...) joined to grouped approx_quantile(...), then call violin(group, evaluation_value, density, median)".to_owned(),
+				})
+			},
+			|_| resolve_violin_channels(spec, schema),
+		);
 	}
 	if matches!(plot_type, PlotType::Radar | PlotType::Parallel)
 		&& spec.multivariate_fields().is_some()
@@ -2534,6 +2589,116 @@ fn resolve_pie_channels(
 	})
 }
 
+fn resolve_violin_channels(
+	spec: &AuthoredPlotSpec,
+	schema: &Schema,
+) -> Result<ChannelBinding, ChannelError> {
+	let fields = spec.violin_fields().ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role("violin"),
+		field: "<violin>".to_owned(),
+		reason: "violin requires group, evaluation_value, density, and median fields".to_owned(),
+	})?;
+	validate_violin_field(schema, &fields.group, "group", SemanticType::Nominal)?;
+	validate_violin_field(
+		schema,
+		&fields.evaluation_value,
+		"evaluation_value",
+		SemanticType::Quantitative,
+	)?;
+	validate_violin_field(
+		schema,
+		&fields.density,
+		"density",
+		SemanticType::Quantitative,
+	)?;
+	validate_violin_field(schema, &fields.median, "median", SemanticType::Quantitative)?;
+	let layer = LayerIdentity {
+		ordinal: 0,
+		plot_type: PlotType::Violin,
+	};
+	let mut used = HashSet::new();
+	let group = resolve_required(
+		Channel::X,
+		&AuthoredChannelSpec::named(&fields.group),
+		PlotType::Violin,
+		&layer,
+		false,
+		schema,
+		&mut used,
+	)
+	.map_err(|mut error| {
+		error.attribution = FieldAttribution::Role("group");
+		error
+	})?;
+	let evaluation_value = resolve_required(
+		Channel::Y,
+		&AuthoredChannelSpec::named(&fields.evaluation_value),
+		PlotType::Violin,
+		&layer,
+		false,
+		schema,
+		&mut used,
+	)
+	.map_err(|mut error| {
+		error.attribution = FieldAttribution::Role("evaluation_value");
+		error
+	})?;
+	Ok(ChannelBinding {
+		composition: spec.composition.clone(),
+		channels: vec![group, evaluation_value],
+		kernel_fields: Box::new(ResolvedKernelFields::Violin {
+			group: fields.group.clone(),
+			evaluation_value: fields.evaluation_value.clone(),
+			density: fields.density.clone(),
+			median: fields.median.clone(),
+		}),
+		color_job: None,
+		continuous_anchor: spec.continuous_anchor,
+		categorical_limit: 0,
+		stack_normalization: StackNormalization::Absolute,
+	})
+}
+
+fn validate_violin_field(
+	schema: &Schema,
+	field: &str,
+	role: &'static str,
+	expected: SemanticType,
+) -> Result<(), ChannelError> {
+	let dtype = schema.get(field).ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role(role),
+		field: field.to_owned(),
+		reason: "field is absent from the returned schema".to_owned(),
+	})?;
+	let actual = semantic_type(dtype).ok_or_else(|| ChannelError {
+		attribution: FieldAttribution::Role(role),
+		field: field.to_owned(),
+		reason: format!("dtype {dtype:?} has no supported semantic type"),
+	})?;
+	if role == "group" && !matches!(dtype, DataType::String | DataType::Boolean) {
+		return Err(ChannelError {
+			attribution: FieldAttribution::Role(role),
+			field: field.to_owned(),
+			reason: format!(
+				"violin group requires a text or boolean (Nominal) dtype, got {dtype:?}"
+			),
+		});
+	}
+	if actual != expected {
+		let expected = if role == "group" {
+			"a text or boolean (Nominal) dtype"
+		} else {
+			"a Quantitative dtype"
+		};
+		return Err(ChannelError {
+			attribution: FieldAttribution::Role(role),
+			field: field.to_owned(),
+			reason: format!("violin {role} requires {expected}, got {dtype:?}"),
+		});
+	}
+	Ok(())
+}
+
 fn resolve_multivariate_channels(
 	spec: &AuthoredPlotSpec,
 	schema: &Schema,
@@ -3060,10 +3225,13 @@ fn resolve_automatic_kernel_fields(
 	let optional_category = |index: usize| nominal.get(index).cloned();
 
 	Ok(match plot_type {
-		PlotType::Violin => ResolvedKernelFields::Violin {
-			category: optional_category(0),
-			value: number(0, "value")?,
-		},
+		PlotType::Violin => {
+			return Err(ChannelError {
+				attribution: FieldAttribution::Role("violin"),
+				field: "<violin>".to_owned(),
+				reason: "violin cannot be resolved from a schema: author a relation with kernel_density(...) joined to grouped approx_quantile(...), then call violin(group, evaluation_value, density, median)".to_owned(),
+			})
+		}
 		PlotType::Hexbin => ResolvedKernelFields::Hexbin {
 			x: number(0, "x")?,
 			y: number(1, "y")?,
@@ -3356,6 +3524,8 @@ fn semantic_is_compatible(plot_type: PlotType, channel: Channel, semantic: Seman
 		(PlotType::RadialDial, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Pie, Channel::X) => semantic == SemanticType::Nominal,
 		(PlotType::Pie, Channel::Y) => semantic == SemanticType::Quantitative,
+		(PlotType::Violin, Channel::X) => semantic == SemanticType::Nominal,
+		(PlotType::Violin, Channel::Y) => semantic == SemanticType::Quantitative,
 		(PlotType::Radar | PlotType::Parallel, Channel::X) => semantic == SemanticType::Nominal,
 		(PlotType::Radar | PlotType::Parallel, Channel::Y) => {
 			semantic == SemanticType::Quantitative
@@ -3933,6 +4103,134 @@ mod tests {
 				.reason
 				.contains("explicit Tukey summary fields are required")
 		);
+	}
+
+	#[test]
+	fn product_0108_violin_requires_the_relation_side_density_contract() {
+		let frame = df!(
+			"group" => ["east", "west"],
+			"evaluation_value" => [1.0_f64, 2.0],
+			"density" => [0.2_f64, 0.4],
+			"median" => [1.5_f64, 1.5],
+		)
+		.expect("violin schema fixture");
+		let automatic = AuthoredPlotSpec::automatic(PlotComposition::single(PlotType::Violin));
+		let error = resolve_channels(&automatic, frame.schema().as_ref())
+			.expect_err("violin has no raw automatic path");
+		assert_eq!(error.attribution, FieldAttribution::Role("violin"));
+		assert_eq!(error.field, "<violin>");
+		assert!(error.reason.contains("kernel_density(...)"), "{error}");
+		assert!(error.reason.contains("approx_quantile(...)"), "{error}");
+
+		let fields = ViolinFields {
+			group: "group".to_owned(),
+			evaluation_value: "evaluation_value".to_owned(),
+			density: "density".to_owned(),
+			median: "median".to_owned(),
+		};
+		let resolved = resolve_channels(&AuthoredPlotSpec::violin(fields), frame.schema().as_ref())
+			.expect("the explicit density relation resolves");
+		assert!(matches!(
+			resolved.kernel_fields.as_ref(),
+			ResolvedKernelFields::Violin {
+				group,
+				evaluation_value,
+				density,
+				median,
+			} if group == "group" && evaluation_value == "evaluation_value" && density == "density" && median == "median"
+		));
+	}
+
+	#[test]
+	fn product_0108_violin_group_is_text_or_boolean_not_lexically_rendered_numbers() {
+		let numeric = df!(
+			"group" => [9_i64, 10_i64],
+			"evaluation_value" => [1.0_f64, 2.0],
+			"density" => [0.2_f64, 0.4],
+			"median" => [1.5_f64, 1.5],
+		)
+		.expect("numeric group fixture");
+		let fields = ViolinFields {
+			group: "group".to_owned(),
+			evaluation_value: "evaluation_value".to_owned(),
+			density: "density".to_owned(),
+			median: "median".to_owned(),
+		};
+		let error = resolve_channels(
+			&AuthoredPlotSpec::violin(fields.clone()),
+			numeric.schema().as_ref(),
+		)
+		.expect_err("numeric groups would be sorted by rendered label");
+		assert_eq!(error.attribution, FieldAttribution::Role("group"));
+		assert!(error.reason.contains("text or boolean"), "{error}");
+
+		// Float64 shares the numeric branch of `semantic_type` with Int64, but
+		// Date and Datetime reach Temporal through a different arm. Covering only
+		// one numeric type would leave a later widening to `Nominal | Temporal` —
+		// a plausible change, since other marks accept temporal bands — silently
+		// admitting date groups ordered by their spelling, which is exactly the
+		// defect PRODUCT-0108 §2 refuses.
+		for group in [
+			Column::new("group".into(), [9.0_f64, 10.0]),
+			Column::new("group".into(), [1_i32, 2_i32])
+				.cast(&DataType::Date)
+				.expect("date group"),
+			Column::new("group".into(), [1_i64, 2_i64])
+				.cast(&DataType::Datetime(
+					polars::prelude::TimeUnit::Milliseconds,
+					None,
+				))
+				.expect("datetime group"),
+		] {
+			let frame = DataFrame::new(
+				2,
+				vec![
+					group.clone(),
+					Column::new("evaluation_value".into(), [1.0_f64, 2.0]),
+					Column::new("density".into(), [0.2_f64, 0.4]),
+					Column::new("median".into(), [1.5_f64, 1.5]),
+				],
+			)
+			.expect("violin fixture");
+			let dtype = group.dtype().clone();
+			let error = resolve_channels(
+				&AuthoredPlotSpec::violin(fields.clone()),
+				frame.schema().as_ref(),
+			)
+			.expect_err("a group with no lexical order must be refused");
+			assert_eq!(
+				error.attribution,
+				FieldAttribution::Role("group"),
+				"{dtype:?} refusal belongs to the group argument"
+			);
+			assert!(
+				error.reason.contains("text or boolean"),
+				"{dtype:?}: {error}"
+			);
+		}
+
+		let boolean = df!(
+			"group" => [true, false],
+			"evaluation_value" => [1.0_f64, 2.0],
+			"density" => [0.2_f64, 0.4],
+			"median" => [1.5_f64, 1.5],
+		)
+		.expect("boolean group fixture");
+		resolve_channels(
+			&AuthoredPlotSpec::violin(fields.clone()),
+			boolean.schema().as_ref(),
+		)
+		.expect("boolean is Ket nominal and remains a valid group");
+
+		let text = df!(
+			"group" => ["east", "west"],
+			"evaluation_value" => [1.0_f64, 2.0],
+			"density" => [0.2_f64, 0.4],
+			"median" => [1.5_f64, 1.5],
+		)
+		.expect("text group fixture");
+		resolve_channels(&AuthoredPlotSpec::violin(fields), text.schema().as_ref())
+			.expect("utf8 is the ordinary group key and must stay accepted");
 	}
 
 	fn heatmap_spec() -> AuthoredPlotSpec {

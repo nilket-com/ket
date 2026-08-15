@@ -1,11 +1,10 @@
 # ADR 0108: the violin surface
 
-Status: proposed 2026-08-15. Violin has a validated density substrate
-(PRODUCT-0107), a figure-wide width normalization with its controls, a canonical
-authored composition in `uat/test34.rn`, and **no way to author the mark**. This
-record adds `violin(...)` over the four prepared fields, decides the fate of
-automatic and raw violin, and carries the removal of the in-kernel statistics in
-the same cut because they cannot be separated.
+Status: implemented 2026-08-15. Violin now has its validated density substrate
+(PRODUCT-0107), a figure-wide width normalization with its controls, and the
+four-field `violin(...)` surface over the canonical composition in `uat/test34.rn`.
+Automatic and raw violin refuse by decision, while the in-kernel statistics are
+gone in the same cut because they could not be separated from the surface switch.
 
 It completes step 22 of `plans/wip/plot-catalog-restoration.md`, the last
 unauthorable mark in the catalog.

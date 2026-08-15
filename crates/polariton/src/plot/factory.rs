@@ -41,11 +41,19 @@ pub fn create_plot(
 ) -> Arc<dyn PlotKernel + Send + Sync> {
 	let plot_type = spec.composition.primary_plot_type();
 	match spec.kernel_fields.as_ref() {
-		ResolvedKernelFields::Violin { category, value } => {
+		ResolvedKernelFields::Violin {
+			group,
+			evaluation_value,
+			density,
+			median,
+		} => {
 			let prepared =
-				violin::prepare_violin_data(df, category.as_deref().unwrap_or(""), value, None);
+				violin::prepare_violin_density_data(df, group, evaluation_value, density, median)
+					.expect("PRODUCT-0108 planning validated this violin density relation");
 			Arc::new(ViolinPlotKernel {
 				prepared_data: Arc::new(prepared),
+				x_label: group.clone(),
+				y_label: evaluation_value.clone(),
 			})
 		}
 		ResolvedKernelFields::Hexbin { x, y } => {

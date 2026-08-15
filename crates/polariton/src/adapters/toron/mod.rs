@@ -338,6 +338,87 @@ mod tests {
 	}
 
 	#[tokio::test]
+	#[ignore = "requires the PRODUCT-0108 violin_probe relation on a live local Toron"]
+	async fn live_product_0108_relation_side_violin_renders_without_the_lonely_group() {
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+		let source = include_str!("../../../../../uat/test34.rn");
+		let relation = transform_rune_view(source)
+			.expect("PRODUCT-0108 live exhibit envelope")
+			.into_relations()
+			.next()
+			.expect("one violin relation");
+		let artifact = adapter
+			.dispatch_rune(&relation.source)
+			.await
+			.unwrap_or_else(|error| {
+				panic!(
+					"PRODUCT-0108 relation failed for origin {}: {error:?}\n{}",
+					relation.origin, relation.source
+				)
+			});
+		let frame = artifact.projection().expect("Toron violin projection");
+		assert_eq!(
+			frame.height(),
+			288,
+			"three groups times 96 evaluation points"
+		);
+		let groups = frame
+			.column("group")
+			.expect("density relation carries group")
+			.as_materialized_series()
+			.str()
+			.expect("group is text")
+			.into_no_null_iter()
+			.collect::<std::collections::BTreeSet<_>>();
+		assert_eq!(
+			groups,
+			std::collections::BTreeSet::from(["diffuse", "plateau", "tight"])
+		);
+		assert!(!groups.contains("lonely"));
+
+		let violin = relation
+			.views
+			.iter()
+			.find_map(|view| match &view.intent {
+				RuneViewIntent::Plot(plot) => match &plot.body {
+					RunePlotBody::Single(sink) => sink.mark_fields.as_ref()?.violin(),
+					RunePlotBody::StyledSingle(styled) => {
+						styled.sink.mark_fields.as_ref()?.violin()
+					}
+					RunePlotBody::Layered(_) => None,
+				},
+				RuneViewIntent::Table(_) => None,
+			})
+			.expect("the exhibit carries one violin sink");
+		let kernel =
+			create_authored_plot(AuthoredPlotSpec::violin(violin.0.clone()), &frame, 800, 480)
+				.expect("the delivered density relation resolves into a violin kernel");
+		let widget = PlotWidget {
+			kernel: kernel.as_ref(),
+			title: "PRODUCT-0108 violin".to_owned(),
+			padding: 0.0,
+			settings: ResolvedPlotSettings::default(),
+			settings_model: crate::plot::theme::PlotSettings::default(),
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = SvgBackend::new(800.0, 480.0);
+		widget.render(
+			&mut backend,
+			Rectangle::new([0.0, 0.0].into(), [800.0, 480.0].into()),
+		);
+		let svg = backend.finish();
+		assert!(
+			svg.contains("<path"),
+			"violin geometry reached the SVG backend"
+		);
+	}
+
+	#[tokio::test]
 	#[ignore = "requires the dogfood test1 relation on a live local Toron"]
 	async fn live_product_0012_line_view_reaches_the_existing_kernel() {
 		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;

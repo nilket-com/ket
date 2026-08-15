@@ -1012,6 +1012,7 @@ fn authored_rune_plot_spec(sink: &DisposableRunePlotSink) -> AuthoredPlotSpec {
 				AuthoredPlotSpec::radial_dial(fields)
 			}
 			crate::plot::spec::MarkFields::Pie(fields) => AuthoredPlotSpec::pie(fields),
+			crate::plot::spec::MarkFields::Violin(fields) => AuthoredPlotSpec::violin(fields),
 			crate::plot::spec::MarkFields::Radar(fields) => AuthoredPlotSpec::radar(fields),
 			crate::plot::spec::MarkFields::Parallel(fields) => AuthoredPlotSpec::parallel(fields),
 		};
@@ -1350,6 +1351,51 @@ fn pie_failure_span(
 				| PieSlicesError::NonPositiveTotal { .. },
 			),
 		) => origins.value.clone(),
+		Ok(_) => mark.clone(),
+	}
+}
+
+#[cfg(feature = "toron")]
+fn violin_failure_span(
+	data: &DataFrame,
+	fields: &crate::plot::spec::ViolinFields,
+	origins: &crate::rune_relation_envelope::ViolinFieldOrigins,
+	mark: &std::ops::Range<u32>,
+) -> std::ops::Range<u32> {
+	let authored = AuthoredPlotSpec::violin(fields.clone());
+	if let Err(error) = resolve_channels(&authored, data.schema().as_ref()) {
+		return match error.attribution {
+			crate::plot::spec::FieldAttribution::Role("group") => origins.group.clone(),
+			crate::plot::spec::FieldAttribution::Role("evaluation_value") => {
+				origins.evaluation_value.clone()
+			}
+			crate::plot::spec::FieldAttribution::Role("density") => origins.density.clone(),
+			crate::plot::spec::FieldAttribution::Role("median") => origins.median.clone(),
+			_ => mark.clone(),
+		};
+	}
+	use crate::plot::kernels::violin_density::ViolinDensityError;
+	match crate::plot::kernels::violin::prepare_violin_density_data(
+		data,
+		&fields.group,
+		&fields.evaluation_value,
+		&fields.density,
+		&fields.median,
+	) {
+		Err(ViolinDensityError::NullGroup { .. }) => origins.group.clone(),
+		Err(
+			ViolinDensityError::NullValue { field, .. }
+			| ViolinDensityError::InexactValue { field, .. },
+		) => match field.as_str() {
+			"evaluation_value" => origins.evaluation_value.clone(),
+			"density" => origins.density.clone(),
+			"median" => origins.median.clone(),
+			_ => mark.clone(),
+		},
+		Err(ViolinDensityError::GridMismatch { .. } | ViolinDensityError::TooFewPoints { .. }) => {
+			origins.evaluation_value.clone()
+		}
+		Err(ViolinDensityError::MedianDisagreement { .. }) => origins.median.clone(),
 		Ok(_) => mark.clone(),
 	}
 }
@@ -1896,6 +1942,10 @@ fn rune_view_outcome_with_palettes(
 				let (fields, origins) = sink.mark_fields.as_ref()?.pie()?;
 				Some((fields.clone(), origins.clone(), sink.origin.clone()))
 			});
+			let violin_diagnostic = diagnostic_sink.and_then(|sink| {
+				let (fields, origins) = sink.mark_fields.as_ref()?.violin()?;
+				Some((fields.clone(), origins.clone(), sink.origin.clone()))
+			});
 			let multivariate_diagnostic = diagnostic_sink.and_then(|sink| {
 				let (plot_type, fields, origins) = sink.mark_fields.as_ref()?.multivariate()?;
 				Some((
@@ -2257,6 +2307,11 @@ fn rune_view_outcome_with_palettes(
 					pie_failure_span(frame.as_ref(), fields, origins, mark)
 				})
 			});
+			let violin_output_span = output.as_ref().err().and_then(|_| {
+				violin_diagnostic.as_ref().map(|(fields, origins, mark)| {
+					violin_failure_span(frame.as_ref(), fields, origins, mark)
+				})
+			});
 			let multivariate_output_span = output.as_ref().err().and_then(|_| {
 				multivariate_diagnostic
 					.as_ref()
@@ -2275,6 +2330,7 @@ fn rune_view_outcome_with_palettes(
 					.or(funnel_output_span)
 					.or(radial_dial_output_span)
 					.or(pie_output_span)
+					.or(violin_output_span)
 					.or(multivariate_output_span)
 					.or(body_output_span)
 					.or(facet_span)

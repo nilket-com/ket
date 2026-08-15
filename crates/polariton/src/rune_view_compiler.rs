@@ -32,6 +32,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"radial_dial",
 	"radar",
 	"pie",
+	"violin",
 	"histogram",
 	"heatmap",
 	"hide_legend",
@@ -497,7 +498,8 @@ fn static_method_on_relation(
 		}));
 	}
 	if let Some(constructor) = mark_constructor(method)
-		&& matches!(args.len(), 2 | 3)
+		&& ((method == "violin" && args.len() == 4)
+			|| (method != "violin" && matches!(args.len(), 2 | 3)))
 	{
 		return Ok(Some(StaticProvenance::ViewSet {
 			relation,
@@ -519,7 +521,13 @@ fn static_method_on_relation(
 	}
 	if matches!(
 		method,
-		"box" | "bubble" | "funnel" | "heatmap" | "radial_dial" | "pie" | "radar" | "parallel"
+		"box"
+			| "bubble"
+			| "funnel"
+			| "heatmap"
+			| "radial_dial"
+			| "pie" | "violin"
+			| "radar" | "parallel"
 	) {
 		return invalid_view(
 			call.span(),
@@ -758,6 +766,7 @@ fn mark_constructor(method: &str) -> Option<&'static str> {
 		"scatter" => Some("scatter"),
 		"area" => Some("area"),
 		"histogram" => Some("histogram"),
+		"violin" => Some("violin"),
 		_ => None,
 	}
 }
@@ -1318,6 +1327,7 @@ fn rewrite_calls_mapped(
 			"funnel" => Some(&[2]),
 			"radial_dial" => Some(&[2, 3]),
 			"pie" => Some(&[2]),
+			"violin" => Some(&[4]),
 			_ => None,
 		};
 		let variadic_origins = !is_method && matches!(name.as_str(), "radar" | "parallel");
@@ -3093,6 +3103,55 @@ r.views([bar(category(), "revenue")])
 		assert!(
 			!source.contains("workspace.sql("),
 			"ADR 552 has no SQL surface, so this composition must stay in the Rune DSL"
+		);
+	}
+
+	#[test]
+	fn product_0108_violin_surface_has_four_fields_and_refuses_raw_arity() {
+		let source = include_str!("../../../uat/test34.rn");
+		let compiled = compile(source).expect("the checked-in violin exhibit compiles");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[1].intent else {
+			panic!("the second violin exhibit view is a plot")
+		};
+		let sink = match &plot.body {
+			RunePlotBody::Single(sink) => sink,
+			RunePlotBody::StyledSingle(styled) => &styled.sink,
+			RunePlotBody::Layered(_) => panic!("violin surface produced layers"),
+		};
+		let (fields, origins) = sink
+			.mark_fields
+			.as_ref()
+			.and_then(|fields| fields.violin())
+			.expect("violin fields and origins");
+		assert_eq!(
+			(
+				fields.group.as_str(),
+				fields.evaluation_value.as_str(),
+				fields.density.as_str(),
+				fields.median.as_str(),
+			),
+			("group", "evaluation_value", "density", "median")
+		);
+		for (origin, expected) in [
+			(&origins.group, "\"group\""),
+			(&origins.evaluation_value, "\"evaluation_value\""),
+			(&origins.density, "\"density\""),
+			(&origins.median, "\"median\""),
+		] {
+			assert_eq!(
+				&source[origin.start as usize..origin.end as usize],
+				expected
+			);
+		}
+
+		let raw =
+			"let r = workspace.table(\"violin_probe\"); r.views([violin(\"group\", \"value\")]);";
+		let error = compile(raw).expect_err("raw violin arity must refuse");
+		assert!(
+			error
+				.to_string()
+				.contains("violin(...) takes group, evaluation_value, density, and median strings"),
+			"{error}"
 		);
 	}
 

@@ -3799,6 +3799,47 @@ fn product_0103_pie_surface_reuses_transport_and_has_one_colour_and_guide_author
 }
 
 #[test]
+fn product_0108_violin_surface_consumes_one_relation_side_density_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	let factory = std::fs::read_to_string(root.join("plot/factory.rs")).expect("read factory");
+	let kernel =
+		std::fs::read_to_string(root.join("plot/kernels/violin.rs")).expect("read violin kernel");
+	let density = std::fs::read_to_string(root.join("plot/kernels/violin_density.rs"))
+		.expect("read violin density substrate");
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let envelope =
+		std::fs::read_to_string(root.join("rune_relation_envelope.rs")).expect("read envelope");
+	let host = std::fs::read_to_string(root.join("gui/state.rs")).expect("read host");
+
+	assert!(spec.contains("pub struct ViolinFields"));
+	assert!(spec.contains("MarkFields::Violin"));
+	assert!(spec.contains("fn resolve_violin_channels("));
+	assert!(spec.contains("violin cannot be resolved from a schema"));
+	assert!(spec.contains("kernel_density(...) joined to grouped approx_quantile(...)"));
+	assert!(spec.contains("a text or boolean (Nominal) dtype"));
+	assert!(presentation.contains("(\"__violin\", raw_violin as RawFunction)"));
+	assert!(compiler.contains("\"violin\" => Some(&[4])"));
+	assert!(envelope.contains("Self::Violin { fields, origins }"));
+	assert!(host.contains("fn violin_failure_span("));
+
+	assert!(factory.contains("prepare_violin_density_data("));
+	assert!(factory.contains("PRODUCT-0108 planning validated this violin density relation"));
+	assert!(kernel.contains("Arc<ViolinDensity>"));
+	assert!(kernel.contains("normalized_widths(ViolinWidthNormalization::Figure)"));
+	for forbidden in ["compute_kde", ".group_by(", ".lazy()", "DataType"] {
+		assert!(
+			!kernel.contains(forbidden),
+			"PRODUCT-0108 violin kernel retained renderer-side statistic `{forbidden}`"
+		);
+	}
+	assert!(!density.contains("#![allow(dead_code)]"));
+}
+
+#[test]
 fn product_0104_radar_and_parallel_share_one_honest_multivariate_row_authority() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let rows = std::fs::read_to_string(root.join("plot/kernels/multivariate_rows.rs"))
