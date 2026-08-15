@@ -1388,7 +1388,7 @@ fn failure_retryable(kind: &TaskFailureKind) -> bool {
 	}
 }
 
-fn duration_micros(started: Instant) -> u64 {
+pub(crate) fn duration_micros(started: Instant) -> u64 {
 	u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
