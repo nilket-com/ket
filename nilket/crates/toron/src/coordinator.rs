@@ -553,6 +553,8 @@ where
 				}
 			}
 			active_query_handle.mark_terminal();
+			drop(_active_query);
+			drop(_admitted);
 			drop(sender);
 			retire_remote(query_id, cause, active_query_handle.remote_workers());
 		});
@@ -818,6 +820,8 @@ where
 				}
 			}
 			active_query_handle.mark_terminal();
+			drop(_active_query);
+			drop(_admitted);
 			drop(sender);
 			retire_remote(query_id, cause, active_query_handle.remote_workers());
 		});
@@ -3840,6 +3844,7 @@ mod tests {
 			Arc::new(ScriptedDescriptorTransport {
 				attempts: Arc::clone(&attempts),
 				success_batch: batch(),
+				completion: None,
 			}),
 			PlannerConfig::default(),
 			QueryBudget::test_default(),
@@ -3865,6 +3870,68 @@ mod tests {
 		assert_eq!(results[0].num_rows(), 3);
 		assert_eq!(coordinator.tenant_memory_used(TenantId(7)), ByteCount::ZERO);
 		assert_eq!(coordinator.tenant_concurrency_active(TenantId(7)), 0);
+	}
+
+	#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+	async fn distributed_stream_eof_releases_admission_before_the_next_query() {
+		let attempts = Arc::new(AtomicUsize::new(1));
+		let completion = Arc::new(ScriptedWorkerCompletion::default());
+		let coordinator = DistributedQueryCoordinator::new(
+			Arc::new(RefreshingCatalog::new(
+				descriptor_with_identity(TableId(1), TableObjectId::new([1; 16]), 1),
+				RefreshOutcome::Binding(descriptor_with_identity(
+					TableId(1),
+					TableObjectId::new([1; 16]),
+					1,
+				)),
+			)),
+			Arc::new(StaticWorkerRegistry::new([scripted_worker()])),
+			Arc::new(MemoryManager::new(1, 1024 * 1024)),
+			Arc::new(ScriptedDescriptorTransport {
+				attempts: Arc::clone(&attempts),
+				success_batch: batch(),
+				completion: Some(Arc::clone(&completion)),
+			}),
+			PlannerConfig::default(),
+			QueryBudget::test_default(),
+		)
+		.with_tenant_budget_policy(one_query_tenant_policy());
+		let first = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(70),
+			TenantId(7),
+			HlcBound(1),
+		);
+		let second = ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(71),
+			TenantId(7),
+			HlcBound(1),
+		);
+
+		let mut stream = coordinator
+			.execute_query_stream_with_context(&named_scan_plan(), first)
+			.await
+			.expect("first distributed query starts");
+		while let Some(batch) = stream.next().await {
+			batch.expect("first distributed query batch");
+		}
+
+		assert_eq!(
+			coordinator.tenant_concurrency_active(TenantId(7)),
+			0,
+			"EOF must publish only after the first query releases its tenant slot"
+		);
+		let admitted = coordinator
+			.admit_query(&second)
+			.await
+			.expect("the next query is admitted immediately after EOF");
+		drop(admitted);
+		wait_for_scripted_workers(&completion, 2).await;
+		assert!(
+			!completion.failed.load(Ordering::SeqCst),
+			"the query and its retirement exchange both complete cleanly"
+		);
 	}
 
 	#[test]
@@ -4558,6 +4625,22 @@ mod tests {
 		)
 	}
 
+	fn one_query_tenant_policy() -> TenantBudgetPolicy {
+		let mut per_tenant = std::collections::HashMap::new();
+		per_tenant.insert(
+			TenantId(7),
+			TenantBudget::with_max_concurrent_queries(
+				ByteCount::new(64),
+				ByteCount::new(64),
+				NonZeroU32::new(1).expect("one is nonzero"),
+			),
+		);
+		TenantBudgetPolicy::new(
+			TenantBudget::new(ByteCount::new(64), ByteCount::new(64)),
+			per_tenant,
+		)
+	}
+
 	fn rate_policy(max_queries_per_second: u32, query_burst_capacity: u32) -> TenantBudgetPolicy {
 		let mut per_tenant = std::collections::HashMap::new();
 		per_tenant.insert(
@@ -4891,6 +4974,14 @@ mod tests {
 	struct ScriptedDescriptorTransport {
 		attempts: Arc<AtomicUsize>,
 		success_batch: RecordBatch,
+		completion: Option<Arc<ScriptedWorkerCompletion>>,
+	}
+
+	#[derive(Default)]
+	struct ScriptedWorkerCompletion {
+		completed: AtomicUsize,
+		failed: AtomicBool,
+		notify: Notify,
 	}
 
 	#[async_trait::async_trait]
@@ -4898,16 +4989,30 @@ mod tests {
 		async fn connect(&self, _address: &str) -> Result<Box<dyn ToronStream>, QueryError> {
 			let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
 			let success_batch = self.success_batch.clone();
+			let completion = self.completion.clone();
 			let (client, server) = test_duplex(1024 * 1024);
 			tokio::spawn(async move {
-				if let Err(error) =
-					run_scripted_descriptor_worker(server, attempt, success_batch).await
-				{
+				let result = run_scripted_descriptor_worker(server, attempt, success_batch).await;
+				if let Some(completion) = completion {
+					completion.failed.store(result.is_err(), Ordering::SeqCst);
+					completion.completed.fetch_add(1, Ordering::SeqCst);
+					completion.notify.notify_waiters();
+				} else if let Err(error) = result {
 					panic!("scripted descriptor worker failed: {error:?}");
 				}
 			});
 			Ok(Box::new(client))
 		}
+	}
+
+	async fn wait_for_scripted_workers(completion: &ScriptedWorkerCompletion, expected: usize) {
+		tokio::time::timeout(Duration::from_secs(1), async {
+			while completion.completed.load(Ordering::SeqCst) < expected {
+				completion.notify.notified().await;
+			}
+		})
+		.await
+		.expect("scripted query and retirement workers complete");
 	}
 
 	async fn run_scripted_descriptor_worker(
