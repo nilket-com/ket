@@ -34,7 +34,7 @@ use crate::storage::stats::{
 	decode_column_stats_payload, encode_float64_stat_value, encode_length_prefixed_bytes,
 	encode_signed_stat_value, parse_column_stats_block,
 };
-use crate::storage::{IndexQuery, SecondaryIndexEntry, SecondaryIndexIdentity};
+use crate::storage::{IndexQuery, LsmConfig, SecondaryIndexEntry, SecondaryIndexIdentity};
 use arrow::array::{
 	Array, BooleanArray, FixedSizeBinaryBuilder, Float64Array, Int64Array, LargeBinaryBuilder,
 	LargeStringArray, StringArray, UInt8Array, UInt64Array, UInt64Builder,
@@ -10513,6 +10513,219 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 		.lookup(tenant(), survivor_key)
 		.expect("survivor should still be indexed after reopen");
 	assert_eq!(reopened.read(survivor).await.unwrap(), b"keep-me");
+}
+
+#[tokio::test]
+async fn lsm_compaction_does_not_retain_empty_active_slabs() {
+	let dir = fresh_dir("lsm-empty-active");
+	let io = spawn_io_thread(16).unwrap();
+	let manager = Arc::new(
+		SlabManager::open(SlabManagerConfig {
+			dir: dir.clone(),
+			max_slab_bytes: 1,
+			io: io.clone(),
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
+	);
+
+	let worker = LsmCompactionWorker::new(LsmConfig::default(), manager.slab_pin_table()).unwrap();
+	let slab_lengths = || {
+		std::fs::read_dir(&dir)
+			.unwrap()
+			.filter_map(Result::ok)
+			.filter_map(|entry| {
+				let slab_id = parse_slab_filename(&entry.file_name().to_string_lossy())?;
+				Some((slab_id, std::fs::metadata(entry.path()).unwrap().len()))
+			})
+			.collect::<Vec<_>>()
+	};
+
+	const ROUNDS: u64 = 6;
+	for round in 0..ROUNDS {
+		for n in 0..5 {
+			manager
+				.append(
+					tenant(),
+					id(0x7000 + round * 0x100 + n),
+					hlc(round * 100 + n + 1),
+					b"row",
+				)
+				.await
+				.unwrap();
+		}
+		// Leave one empty active slab for the compaction path to cross. The
+		// loop makes the old defect's empty-file count grow once per round.
+		manager.force_seal_active_for_test().await;
+		let empty_active_id = manager.active_slab_id().await;
+		let empty_active_path = slab_path(&dir, empty_active_id);
+		assert!(empty_active_path.exists());
+
+		let before_files = slab_lengths();
+		let outcome = manager
+			.run_lsm_compaction_tick(&worker, hlc(20_000 + round * 100))
+			.await
+			.unwrap()
+			.expect("five fresh L0 slabs should produce a compaction");
+		assert!(outcome.rows_out > 0);
+
+		assert!(
+			!empty_active_path.exists(),
+			"round {round}: an empty active slab must be unlinked when LSM output advancement crosses it"
+		);
+		let after_files = slab_lengths();
+		let zero_length = after_files.iter().filter(|(_, len)| *len == 0).count();
+		assert_eq!(
+			zero_length, 1,
+			"round {round}: only the current active slab may be empty; empty slabs must not accumulate"
+		);
+		assert!(
+			after_files.len() <= before_files.len() + 1,
+			"round {round}: compaction may add its output and successor after removing the empty slab: before={}, after={}",
+			before_files.len(),
+			after_files.len()
+		);
+	}
+
+	drop(manager);
+	let reopened = SlabManager::open(SlabManagerConfig {
+		dir,
+		max_slab_bytes: 1,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
+	assert!(
+		reopened.lookup(tenant(), id(0x7000)).is_some(),
+		"restart must retain rows after empty-slab retirement"
+	);
+}
+
+#[tokio::test]
+async fn recovery_skips_zero_length_sealed_slabs_but_preserves_records_and_active_tail() {
+	let dir = fresh_dir("recovery-empty-sealed");
+	let io = spawn_io_thread(16).unwrap();
+	let manager = Arc::new(
+		SlabManager::open(SlabManagerConfig {
+			dir: dir.clone(),
+			max_slab_bytes: 1,
+			io: io.clone(),
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
+	);
+	let key = id(0x7A00);
+	manager
+		.append(tenant(), key, hlc(1), b"record-survives")
+		.await
+		.unwrap();
+	manager.force_seal_active_for_test().await;
+	drop(manager);
+
+	// Slab 0 is non-empty, slab 1 was the empty active tail, and the rest are
+	// historical empty files. Slab 32 must remain the active tail after reopen.
+	for slab_id in 2..=32 {
+		std::fs::File::create(slab_path(&dir, SlabId::new(slab_id))).unwrap();
+	}
+
+	let reopened = SlabManager::open(SlabManagerConfig {
+		dir,
+		max_slab_bytes: 1,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	.unwrap();
+
+	assert_eq!(reopened.active_slab_id().await, SlabId::new(32));
+	assert_eq!(reopened.sealed_count().await, 1);
+	let location = reopened
+		.lookup(tenant(), key)
+		.expect("non-empty sealed slab must remain discoverable");
+	assert_eq!(reopened.read(location).await.unwrap(), b"record-survives");
+}
+
+#[tokio::test]
+async fn recovery_refuses_before_opening_more_than_the_slab_bound() {
+	let dir = fresh_dir("recovery-open-bound");
+	let io = spawn_io_thread(16).unwrap();
+	for slab_id in 0..=(MAX_RECOVERY_OPEN_SLABS as u64) {
+		// The preflight must refuse on metadata counts before it attempts to
+		// parse these deliberately invalid non-empty slab bodies.
+		std::fs::write(slab_path(&dir, SlabId::new(slab_id)), [0xA5]).unwrap();
+	}
+
+	let error = match SlabManager::open(SlabManagerConfig {
+		dir,
+		max_slab_bytes: 1,
+		io,
+		l2: None,
+		rehydration: RehydrationPolicy::default(),
+		l2_column_fetch: Default::default(),
+		row_group_writer: Default::default(),
+		l2_row_group_fetch: Default::default(),
+		encoding_writer: Default::default(),
+		l2_chunk_layout: Default::default(),
+		l2_encoding_fetch: Default::default(),
+		encoding_compute: Default::default(),
+		group_commit: GroupCommitConfig::default(),
+		crypto: test_crypto(),
+	})
+	.await
+	{
+		Ok(_) => panic!("recovery must refuse an over-bound slab directory"),
+		Err(error) => error,
+	};
+
+	assert_eq!(error.kind(), std::io::ErrorKind::Other);
+	let message = error.to_string();
+	assert!(message.contains("total slab files=4097"), "{message}");
+	assert!(message.contains("non-empty slab files=4097"), "{message}");
+	assert!(message.contains("slabs to open=4097"), "{message}");
+	assert!(message.contains("bound=4096"), "{message}");
 }
 
 #[tokio::test]

@@ -231,6 +231,10 @@ type TenantLocalityMembers = BTreeMap<TenantId, BTreeSet<(Locality, Identity)>>;
 const DEFAULT_L2_TAIL_READ_WINDOW_BYTES: u64 = 64 * 1024;
 const MIN_L2_TAIL_READ_WINDOW_BYTES: u64 = 256 + 16;
 const IDENTITY_MAX: Identity = Identity::new([0xFF; 32]);
+/// Maximum number of slab stores recovery will retain at once. Directory
+/// metadata is scanned without descriptors first, so a large population of
+/// empty historical slabs does not consume this budget.
+const MAX_RECOVERY_OPEN_SLABS: usize = 4096;
 
 fn recover_rwlock_read<'a, T>(
 	lock: &'a RwLock<T>,
@@ -1194,10 +1198,10 @@ impl SlabManager {
 	/// Scans `config.dir` for `slab_<hex>.wnd` files:
 	///
 	/// * **Empty directory**: starts fresh with slab `0` as active.
-	/// * **One or more existing slabs**: opens all of them
-	///   (recovering each slab's on-disk records into its local
-	///   index), treats the highest-numbered slab as active, seals
-	///   the rest, and sets `next_slab_id` to `max_id + 1`.
+	/// * **One or more existing slabs**: treats the highest-numbered slab as
+	///   active, skips zero-length sealed files, opens the non-empty sealed files
+	///   (recovering each slab's on-disk records into its local index), and sets
+	///   `next_slab_id` to `max_id + 1`.
 	///
 	/// All recovered records are folded into the manager's
 	/// aggregated `key_index`. Last-write-wins across slabs, ordered
@@ -1268,10 +1272,51 @@ impl SlabManager {
 			(slab, id.saturating_add(1))
 		} else {
 			// Split: everything except the max becomes sealed, the
-			// max becomes active. Drain into key_index in ascending
-			// id order so later writes shadow earlier ones.
+			// max becomes active. Zero-length sealed files are not opened:
+			// they cannot contain records, and retaining them would recreate
+			// the descriptor exhaustion that this recovery path bounds.
 			let (&active_id, sealed_ids) = existing_ids.split_last().expect("non-empty");
+			let active_path = slab_path(&config.dir, active_id);
+			let active_len = file_ops.file_len(&active_path).await?.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					format!(
+						"active slab disappeared during recovery: {}",
+						active_path.display()
+					),
+				)
+			})?;
+			let mut non_empty_sealed_ids = Vec::with_capacity(sealed_ids.len());
 			for &id in sealed_ids {
+				let path = slab_path(&config.dir, id);
+				match file_ops.file_len(&path).await? {
+					Some(0) => continue,
+					Some(_) => non_empty_sealed_ids.push(id),
+					None => {
+						return Err(Error::new(
+							ErrorKind::NotFound,
+							format!("slab disappeared during recovery: {}", path.display()),
+						));
+					}
+				}
+			}
+			let non_empty_count = non_empty_sealed_ids.len() + usize::from(active_len > 0);
+			let open_count = non_empty_sealed_ids.len() + 1;
+			if open_count > MAX_RECOVERY_OPEN_SLABS {
+				return Err(Error::new(
+					ErrorKind::Other,
+					format!(
+						"bounded slab recovery refused: total slab files={}, non-empty slab files={}, slabs to open={}, bound={}; preserve the active slab and use the documented recovery path",
+						existing_ids.len(),
+						non_empty_count,
+						open_count,
+						MAX_RECOVERY_OPEN_SLABS,
+					),
+				));
+			}
+			// Drain into key_index in ascending id order so later writes
+			// shadow earlier ones.
+			for &id in &non_empty_sealed_ids {
 				let slab = Arc::new(
 					LocalSlabStore::open(
 						slab_path(&config.dir, id),
@@ -1286,7 +1331,7 @@ impl SlabManager {
 			}
 			let active = Arc::new(
 				LocalSlabStore::open(
-					slab_path(&config.dir, active_id),
+					active_path,
 					active_id,
 					file_ops.clone(),
 					config.group_commit.clone(),

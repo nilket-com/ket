@@ -1028,9 +1028,31 @@ impl SlabManager {
 		let sealed_slab = std::mem::replace(&mut state.active, next_slab);
 		let sealed_id = sealed_slab.slab_id();
 		let sealed_size = sealed_slab.write_cursor();
-		state.sealed.insert(sealed_id, sealed_slab);
+		if sealed_size == 0 {
+			// LSM output installation can advance past an active slab that has
+			// never received a write. It is not a manifest run and therefore
+			// cannot be retired by LSM GC; remove the file at the producer so
+			// empty maintenance rounds do not accumulate forever.
+			if let Err(error) = unlink_local_file(
+				self.file_ops.as_ref(),
+				&slab_path(&self.config.dir, sealed_id),
+			)
+			.await
+			{
+				// Keep the state coherent after the active replacement if the
+				// producer cannot remove the orphan. The caller sees the error and
+				// cleans up newly installed output files, but does not retry this
+				// unlink; retaining the slab keeps it visible to this process's
+				// recovery state and leaves the old one-file leak explicit.
+				state.sealed.insert(sealed_id, sealed_slab);
+				state.next_slab_id = next_id.saturating_add(1);
+				return Err(error);
+			}
+		} else {
+			state.sealed.insert(sealed_id, sealed_slab);
+			self.record_l0_compaction_run(sealed_id, sealed_size);
+		}
 		state.next_slab_id = next_id.saturating_add(1);
-		self.record_l0_compaction_run(sealed_id, sealed_size);
 		Ok(())
 	}
 

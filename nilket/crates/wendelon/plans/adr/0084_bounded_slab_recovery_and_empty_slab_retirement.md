@@ -2,7 +2,8 @@
 
 ## Status
 
-Proposed 2026-08-14. No implementation.
+Proposed 2026-08-14. Decisions 1–4 implemented; decision 5 remains
+unimplemented.
 
 ## Context
 
@@ -55,28 +56,41 @@ install an empty active slab and the next round seals it.
 
 1. **Do not seal and retain an empty active slab.** `advance_active_after_lsm_outputs`
    gains the guard its own `sealed_size` read implies: an outgoing active slab
-   with a zero write cursor and no installed output is not admitted to the sealed
-   set, and does not leave a file behind. No maintenance path may leave an
-   unbounded sequence of empty slabs.
+   with a zero write cursor is not admitted to the sealed set, and its file is
+   unlinked. No maintenance path may leave an unbounded sequence of empty slabs.
 
-2. **Bootstrap recovery is bounded by the persistent index, not by a directory
-   scan.** `PersistentLocalIndex` already exists and `load_snapshot()` already
-   returns the authoritative record, tiered, and secondary-index picture — but
-   `SlabManager::open` opens it *after* the loop that exhausts descriptors.
-   Recovery consults the index first and opens only the slabs it references. This
-   is a reordering of machinery that exists, not new machinery.
+2. **Bootstrap recovery is bounded by on-disk slab length, with the persistent
+   index as corroboration rather than record authority.** `AsyncFileOps::file_len`
+   reads metadata without retaining a descriptor, and a zero-length slab cannot
+   contain a record. Recovery therefore discovers ids, always preserves and opens
+   the highest id as the active slab, skips zero-length sealed slabs, and opens
+   every non-empty sealed slab so a record whose index upsert was lost is not
+   silently dropped. `PersistentLocalIndex::load_snapshot()` still supplies
+   durable tiered, secondary-index, and record metadata and is compared with the
+   slab recovery, but it cannot be the sole source of slab selection while
+   `persist_record_row` may swallow an index-write failure.
 
-3. **Where recovery cannot be index-bounded, it fails early with a diagnostic.**
-   A bootstrap that would open more slabs than a stated bound stops and reports
-   the slab count and a safe recovery path, rather than consuming every descriptor
-   and 8.4 GiB before dying with `os error 24`. The current failure names the
-   symptom and not the cause.
+3. **Where recovery cannot be length-bounded, it fails early with a diagnostic.**
+   A bootstrap that would open more non-empty slabs than a stated bound stops and
+   reports the total, the non-empty count, and a safe recovery path, rather than
+   consuming every descriptor and 8.4 GiB before dying with `os error 24`. The
+   current failure names the symptom and not the cause. A metadata scan may still
+   enumerate the directory; the bound is on retained/opened slab state, not on
+   descriptor use during discovery. This cut fixes the retained/opened slab bound
+   at **4,096** and reports the total file count, non-empty count, attempted open
+   count, and bound in the refusal diagnostic.
 
 4. **A regression proves the bound.** Compaction runs over a small local workload
    for enough ticks that the defect would reproduce, and asserts slab-file count
    stays bounded and restart still succeeds. A test that merely runs compaction
    without asserting a file-count ceiling would pass against the defect and is not
    the control.
+
+   The recovery controls are equally explicit: a directory containing many
+   zero-length sealed files must reopen with its non-empty records available while
+   retaining only the highest-numbered file as active, and a directory exceeding
+   the 4,096-store bound must refuse before opening slab stores with a diagnostic
+   naming all four counts.
 
 5. **Repair for an affected non-development profile is defined before it is
    needed**, and is not "delete the zero-byte files". See the hazard below.
@@ -87,10 +101,11 @@ The empty-slab guard is the root fix; everything else limits blast radius. Fixin
 only the producer leaves every already-affected profile unstartable, and fixing
 only recovery leaves the directory growing at six files a second.
 
-Bounding recovery by the index is worth doing on its own merits. Descriptor use
-proportional to historical file count is a property no bootstrap wants, whatever
-produced the files — a future defect, or an operator restoring a large directory,
-would hit the same wall.
+Bounding recovery by non-empty slab count is worth doing on its own merits.
+Descriptor use proportional to historical file count is a property no bootstrap
+wants, whatever produced the files — a future defect, or an operator restoring a
+large directory, would hit the same wall. The length filter is the safe first
+bound because it does not depend on the durability of the secondary index.
 
 **Framing GC as eligibility, not absence.** The incident report suspected that no
 GC path retires these slabs. That is not what the code shows: `run_lsm_gc_tick`
@@ -102,14 +117,15 @@ should test eligibility and candidate admission; an implementation that adds a
 second retirement path without first establishing why the existing one does not
 apply is likely building around a defect rather than fixing it.
 
-The instrumentation the incident report asks for stands, with item 4 read as an
-eligibility question:
+Static inspection closes the incident report's fourth instrumentation item. A
+zero-row `record_l0_compaction_run` returns before `manifest.insert_live_run`,
+and `plan_sweep` iterates manifest runs, so an empty slab cannot become a GC
+candidate. The remaining lifecycle instrumentation is:
 
 1. active-slab creation and sealing;
 2. LSM output reservation and install;
 3. manifest admission of the resulting ids;
-4. **whether zero-byte sealed slabs become GC-eligible candidates**, and if not,
-   where they are excluded.
+4. manifest admission and GC candidate counts for non-empty slabs.
 
 ## Consequences (The "Negatives")
 
@@ -118,10 +134,12 @@ rounds. Anything that infers round count or ordering from id sequence loses that
 inference; ids remain strictly increasing and unique, which is what they are
 guaranteed to be.
 
-Index-bounded recovery makes the persistent index load-bearing for startup. When
-it is missing or unreadable the current code already warns and continues with
-in-memory recovery; that path still needs a bound of its own, which is decision 3
-rather than an assumption that the index is always present.
+Length-bounded recovery keeps record discovery lossless across a missing, stale,
+or partially persisted index. The persistent index remains important for durable
+metadata and corroboration, but it is not load-bearing for finding records in
+non-empty local slabs. When it is missing or unreadable the current code already
+warns and continues with in-memory recovery; the same non-empty count bound still
+applies.
 
 An early-failure bound converts one class of slow crash-loop into a refusal to
 start. That is the intended trade — a diagnostic naming the slab count is more
