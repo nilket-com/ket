@@ -135,11 +135,15 @@ decision belongs here.
 **The default normalizes across the figure, not per violin.** One scale derived
 from the maximum density across every rendered group, so a group's width is
 comparable to its neighbour's — the same comparability ADR 552 bought on the
-value axis. Per-violin peak normalization remains available as an **explicitly
-authored** choice, because equal-width violins are a real and sometimes wanted
-convention.
+value axis.
 
-The invariant, whichever mode is authored: normalization scales a group's curve,
+Per-violin peak normalization is **supported by this substrate and has no surface
+spelling**. It is implemented and controlled here, because equal-width violins
+are a real and sometimes wanted convention, but no authored token exposes it —
+PRODUCT-0108 §6 declines to add one until there is demonstrated demand. "Chosen"
+means chosen by a caller of this substrate, not by an author of Rune.
+
+The invariant, whichever mode is selected: normalization scales a group's curve,
 never reshapes it. Any operation that changes the *relative* densities within one
 group is a statistic wearing a renderer's clothes, and belongs in a Toron record.
 
@@ -202,17 +206,24 @@ through the engine boundary.
    today's path rather than replacing it. Nothing is deleted here and
    `ResolvedKernelFields::Violin` is untouched, so the existing mark keeps
    rendering while the new path earns its controls.
-4. **Surface switch and deletions, as one attributable cut** — the authored
-   spelling moves to the four prepared fields, the field declaration follows,
-   and `compute_kde`, the `0.03` bandwidth, and the in-kernel Polars median
-   leave `violin.rs` together. The violin panel joins the exhibit here.
+4. **The surface, the switch, and the deletions — owned by PRODUCT-0108.**
 
-   **Steps 3 and 4 split here because the kernel's input shape and the authored
-   spelling are one declaration.** `violin("category", "value")` produces the
-   fields the factory hands the kernel, so consuming a four-column relation is a
-   surface change by construction. Landing new normalization geometry and that
-   switch in one commit would leave any regression in the rendered output
-   unattributable to either.
+   This step was drafted as "move the authored spelling onto four fields". There
+   is no spelling to move: `violin` is in neither the Rune constructor list, the
+   arity table, nor the sink gate. What exists is
+   `ResolvedKernelFields::Violin { category, value }`, fed by **automatic
+   resolution**, and it is the only path that constructs violin fields at all.
+
+   A removal-only cut is therefore impossible. Replacing those two fields with
+   four relation fields, with no constructor to produce them, would leave nothing
+   able to construct the kernel's input and would break automatic resolution in
+   the same stroke. The surface is the precondition for the switch, not an
+   addition on top of it.
+
+   Every sibling mark already splits this way — 0102 then 0103 for pie, 0104 then
+   0105 for radar and parallel — so the surface gets its own record and the
+   implementation lands atomically inside it. PRODUCT-0108 owns the constructor,
+   the resolver, the fate of automatic violin, the switch, and the deletions.
 
 ## Acceptance gates
 

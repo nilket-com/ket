@@ -306,6 +306,18 @@ band-fill path.
     precedent this is likely a Toron capability question rather than a Polariton
     one.
 
+    **It was.** Toron ADR 552 landed relation-side kernel density, and violin
+    then split the way every other mark in this sequence did: **PRODUCT-0107**
+    for the density substrate — prepared fields, per-group refusal, declared
+    category order, figure-wide width normalization — and **PRODUCT-0108** for
+    the surface, which owns the constructor, the resolver, the fate of automatic
+    violin, and the switch off the raw path.
+
+    The one asymmetry worth recording here: violin is the only mark in the
+    catalog that **cannot be resolved from a schema**, because the density it
+    needs does not exist in the data. Automatic violin is refused rather than
+    served, which is a break no other mark in this sequence took.
+
 **Hexbin is not in this sequence.** It consumes the 0089 substrate but stays
 producerless and blocked on viewport-aware planning, and it can never diverge
 (`0..max_count`, counts non-negative by construction), so it takes no job word

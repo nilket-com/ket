@@ -34,9 +34,10 @@ pub(crate) enum ViolinWidthNormalization {
 	/// One scale for the whole figure, so widths are comparable across groups.
 	#[default]
 	Figure,
-	/// Each violin reaches full width regardless of its neighbours. Authored
-	/// explicitly, because it discards the cross-group comparison the shared
-	/// evaluation extent exists to support.
+	/// Each violin reaches full width regardless of its neighbours. Selected
+	/// deliberately by a caller — PRODUCT-0108 §6 gives it no authored spelling —
+	/// because it discards the cross-group comparison the shared evaluation
+	/// extent exists to support.
 	PerViolin,
 }
 
@@ -552,12 +553,12 @@ mod tests {
 		assert_eq!(east_peak, 1.0);
 		assert_eq!(
 			west_peak, 1.0,
-			"every violin reaches full width when this mode is authored"
+			"every violin reaches full width when this mode is selected"
 		);
 	}
 
 	#[test]
-	fn normalization_preserves_a_group_s_shape_whichever_mode_is_authored() {
+	fn normalization_preserves_a_group_s_shape_whichever_mode_is_selected() {
 		// §3's invariant: normalization scales a curve, it never reshapes one.
 		// An operation that changed relative densities inside a group would be a
 		// statistic wearing a renderer's clothes.
