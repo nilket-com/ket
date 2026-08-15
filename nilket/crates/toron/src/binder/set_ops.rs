@@ -191,6 +191,9 @@ pub(super) fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&
 			.or_else(|| distinct_input_unsupported_message(right)),
 		LogicalPlan::Repeat { input, .. } => distinct_input_unsupported_message(input),
 		LogicalPlan::Aggregate { .. } => Some("DISTINCT over aggregate inputs is not supported"),
+		LogicalPlan::KernelDensity { .. } => {
+			Some("DISTINCT over KERNEL_DENSITY inputs is not supported")
+		}
 		LogicalPlan::Alias { input, .. }
 		| LogicalPlan::Filter { input, .. }
 		| LogicalPlan::Project { input, .. }

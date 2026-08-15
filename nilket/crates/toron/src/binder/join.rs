@@ -1319,6 +1319,9 @@ pub(super) fn broadcast_probe_linearity(plan: &ExecutionPlan) -> ProbeLinearity 
 			broadcast_probe_linearity(right)
 		}
 		ExecutionPlan::Aggregate { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::Aggregate),
+		ExecutionPlan::KernelDensity { .. } => {
+			ProbeLinearity::Blocked(ProbeLinearityFence::NonScanLeaf)
+		}
 		ExecutionPlan::Exchange { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::Exchange),
 		ExecutionPlan::Sort { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::Sort),
 		ExecutionPlan::Take { .. } => ProbeLinearity::Blocked(ProbeLinearityFence::Take),
@@ -1716,6 +1719,7 @@ pub(super) fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExpr
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }

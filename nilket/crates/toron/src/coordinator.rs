@@ -1909,6 +1909,7 @@ fn collect_replayable_broadcast_join_ids(plan: &ExecutionPlan, ids: &mut BTreeSe
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }

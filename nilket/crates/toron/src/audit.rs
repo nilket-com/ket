@@ -322,6 +322,7 @@ impl StatementClass {
 			| LogicalPlan::SetOpAll { .. }
 			| LogicalPlan::Repeat { .. }
 			| LogicalPlan::Aggregate { .. }
+			| LogicalPlan::KernelDensity { .. }
 			| LogicalPlan::Exchange { .. }
 			| LogicalPlan::Sort { .. }
 			| LogicalPlan::Window { .. }

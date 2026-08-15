@@ -1,6 +1,6 @@
 # ADR 552 - Relation-side kernel density
 
-**Status:** Proposed 2026-08-14. No implementation.
+**Status:** Implemented 2026-08-15. The σ/variance follow-on remains open.
 
 ## Context
 
@@ -26,6 +26,18 @@ substantive content of this record is the bandwidth rule, not the relocation.
 The precedent is ADR 547's Tukey summary: a summary *relation* the mark consumes,
 not a function returning an opaque value. ADR 546's stable grouped approximate
 quantiles are the statistic this record builds on.
+
+ADR 547 also establishes a composition preference: its canonical query is ordinary
+SQL composition and it deliberately adds no box-plot function, array aggregate,
+renderer, or plot-specific server type. That preference does not make density a
+composition cut. Toron currently has neither the math scalars a Gaussian kernel
+needs (`exp` and a fifth-root/power operation, among others) nor a series/grid
+generator for the shared evaluation points. ADR 547 could compose because its
+summary used primitives already present; composing this capability would first
+require several unrelated primitive families and would force each caller to
+re-author the bandwidth rule. A Rust-side relation kernel is therefore the
+smaller, more enforceable capability: it keeps the single bandwidth expression
+owned here while adding no new SQL surface.
 
 ## Decision
 
@@ -93,9 +105,9 @@ categories, and per-group extents make the comparison misleading by giving each
 violin its own axis. This grants the request's stated preference, on its stated
 reasoning.
 
-The grid point count is authored, with a default. It is a property of the
-relation, not of any texture: the current renderer's 256 bins are a rendering
-constant and must not become the engine's.
+The grid point count is authored, with a default of 128 in the Rune convenience
+form. It is a property of the relation, not of any texture: the current
+renderer's 256 bins are a rendering constant and must not become the engine's.
 
 ### 5. The kernel is Gaussian and fixed
 

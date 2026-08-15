@@ -316,6 +316,7 @@ fn plan_contains_quantile_aggregate(plan: &ExecutionPlan) -> bool {
 				)
 			}) || plan_contains_quantile_aggregate(input)
 		}
+		ExecutionPlan::KernelDensity { input, .. } => plan_contains_quantile_aggregate(input),
 		ExecutionPlan::Join { left, right, .. } | ExecutionPlan::Union { left, right, .. } => {
 			plan_contains_quantile_aggregate(left) || plan_contains_quantile_aggregate(right)
 		}
@@ -1346,6 +1347,7 @@ fn rewrite_broadcast_star_probe_inner(
 		| ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Aggregate { .. }
+		| ExecutionPlan::KernelDensity { .. }
 		| ExecutionPlan::Exchange { .. }
 		| ExecutionPlan::Sort { .. }
 		| ExecutionPlan::Window { .. }
@@ -1689,6 +1691,7 @@ fn reject_undecomposable_aggregate_in_join_consumer(
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
+		| ExecutionPlan::KernelDensity { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
@@ -1791,6 +1794,7 @@ fn leading_exchange_before_join(plan: &ExecutionPlan) -> Option<ExchangeBoundary
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
@@ -1849,6 +1853,7 @@ fn first_join(plan: &ExecutionPlan) -> Option<JoinBoundary> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
@@ -1901,6 +1906,7 @@ fn find_exchange(plan: &ExecutionPlan) -> Option<ExchangeBoundary> {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
@@ -1935,6 +1941,7 @@ fn count_exchanges(plan: &ExecutionPlan) -> usize {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
@@ -1976,6 +1983,7 @@ fn global_sort_barrier_count(plan: &ExecutionPlan) -> usize {
 		| ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. } => global_sort_barrier_count(input),
@@ -2021,6 +2029,7 @@ fn first_scan_metadata(plan: &ExecutionPlan) -> Option<ScanMetadata> {
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
@@ -2114,6 +2123,10 @@ fn replace_exchange_with_scan(plan: ExecutionPlan, scan: &ExecutionPlan) -> Exec
 			group_expr,
 			aggr_expr,
 			output_schema,
+		},
+		ExecutionPlan::KernelDensity { input, spec } => ExecutionPlan::KernelDensity {
+			input: Box::new(replace_exchange_with_scan(*input, scan)),
+			spec,
 		},
 		ExecutionPlan::Sort {
 			input,
@@ -2222,6 +2235,10 @@ fn replace_first_join(plan: ExecutionPlan, replacement: ExecutionPlan) -> Execut
 			input: Box::new(replace_first_join(*input, replacement)),
 			exprs,
 			output_schema,
+		},
+		ExecutionPlan::KernelDensity { input, spec } => ExecutionPlan::KernelDensity {
+			input: Box::new(replace_first_join(*input, replacement)),
+			spec,
 		},
 		ExecutionPlan::Repeat {
 			input,

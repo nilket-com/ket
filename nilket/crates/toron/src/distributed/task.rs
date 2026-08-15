@@ -501,6 +501,7 @@ fn streamable_unary_plan(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Sort { .. }
 		| ExecutionPlan::Window { .. }
 		| ExecutionPlan::Aggregate { .. }
+		| ExecutionPlan::KernelDensity { .. }
 		| ExecutionPlan::Join { .. }
 		// ADR 255: opaque-local — a recursive CTE is a self-contained local fixpoint, not a
 		// streamable unary scan chain, and its self-reference leaf is not a streamable source.

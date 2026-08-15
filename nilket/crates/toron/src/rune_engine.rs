@@ -3,9 +3,10 @@ use crate::date32::parse_date_ymd;
 use crate::error::{FrontendError, RuneDiagnosticSpan};
 use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy,
-	JoinStrategyIntent, JoinStrategyPinSource, LogicalPlan, LogicalTypeId, PRODUCT_ID_LOGICAL_TYPE,
-	ScalarValue, SortExpr, TemporalExtractField, TemporalTruncField, ValueFunction, WindowFrame,
-	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, WindowFunctionCall,
+	JoinStrategyIntent, JoinStrategyPinSource, KernelDensitySpec, LogicalPlan, LogicalTypeId,
+	PRODUCT_ID_LOGICAL_TYPE, ScalarValue, SortExpr, TemporalExtractField, TemporalTruncField,
+	ValueFunction, WindowFrame, WindowFrameBound, WindowFrameDelta, WindowFrameUnit,
+	WindowFunction, WindowFunctionCall,
 };
 use crate::sql_planner::{
 	SqlPlanner, build_join_plan, expr_to_join_keys, window_function_default_name,
@@ -402,6 +403,37 @@ impl RuneDataFrame {
 				aggr_expr: aggr_expr.into_iter().map(|a| (a.func, a.args)).collect(),
 			},
 		}
+	}
+
+	/// ADR 552: compute a shared-grid Gaussian density relation. `points` is authored by the
+	/// caller; the engine owns the bandwidth and degenerate-group policy.
+	pub fn kernel_density_default(
+		self,
+		group_expr: RuneExpr,
+		value_expr: RuneExpr,
+	) -> VmResult<Self> {
+		self.kernel_density(group_expr, value_expr, 128)
+	}
+
+	pub fn kernel_density(
+		self,
+		group_expr: RuneExpr,
+		value_expr: RuneExpr,
+		points: i64,
+	) -> VmResult<Self> {
+		let Some(points) = non_negative_usize_arg(points).filter(|points| *points >= 2) else {
+			return VmResult::panic("kernel_density points must be at least 2");
+		};
+		VmResult::Ok(Self {
+			plan: LogicalPlan::KernelDensity {
+				input: Box::new(self.plan),
+				spec: Box::new(KernelDensitySpec {
+					group_expr: group_expr.expr,
+					value_expr: value_expr.expr,
+					points,
+				}),
+			},
+		})
 	}
 
 	pub fn sort(self, order_by: Vec<RuneSortKey>) -> VmResult<Self> {
@@ -1597,6 +1629,11 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("project_named", RuneDataFrame::project_named)?;
 	m.associated_function("distinct", RuneDataFrame::distinct)?;
 	m.associated_function("aggregate", RuneDataFrame::aggregate)?;
+	m.associated_function(
+		"kernel_density_default",
+		RuneDataFrame::kernel_density_default,
+	)?;
+	m.associated_function("kernel_density", RuneDataFrame::kernel_density)?;
 	m.associated_function("sort", RuneDataFrame::sort)?;
 	m.associated_function("limit", RuneDataFrame::limit)?;
 	m.associated_function("take", RuneDataFrame::take)?;

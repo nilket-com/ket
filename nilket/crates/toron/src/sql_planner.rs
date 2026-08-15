@@ -10729,6 +10729,7 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		| LogicalPlan::Project { input, .. }
 		| LogicalPlan::Distinct { input }
 		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::KernelDensity { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
 		| LogicalPlan::Window { input, .. }
@@ -11809,6 +11810,7 @@ mod tests {
 			| LogicalPlan::Window { input, .. }
 			| LogicalPlan::Take { input, .. }
 			| LogicalPlan::Repeat { input, .. }
+			| LogicalPlan::KernelDensity { input, .. }
 			| LogicalPlan::Explain { input }
 			| LogicalPlan::ExplainAnalyze { input } => filter_count(input),
 			LogicalPlan::Join { left, right, .. } => filter_count(left) + filter_count(right),

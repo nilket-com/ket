@@ -158,6 +158,16 @@ pub struct BoundAggregateCall {
 	pub args: BoundExprProgram,
 }
 
+/// ADR 552: bound density expressions live behind a box so the terminal operator does not enlarge
+/// every recursively nested execution-plan frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundKernelDensitySpec {
+	pub group_expr: BoundExprProgram,
+	pub value_expr: BoundExprProgram,
+	pub points: usize,
+	pub output_schema: SchemaRef,
+}
+
 /// ADR 242/243: a bound window function call in an `ExecutionPlan::Window`. `function` is the ranking or
 /// `Aggregate` kind; `arg` is the bound aggregate argument (`Some` for `COUNT(x)/SUM/MIN/MAX/AVG`,
 /// `None` for ranking and `COUNT(*)`); `frame` is the explicit `ROWS` frame (ADR 243; `None` = the 242
@@ -304,6 +314,12 @@ pub enum ExecutionPlan {
 		aggr_expr: Vec<BoundAggregateCall>,
 		output_schema: SchemaRef,
 	},
+	/// ADR 552: terminal relation-side Gaussian density. The child is globally partitioned by the
+	/// binder so one task owns the shared extent and every group's observations.
+	KernelDensity {
+		input: Box<ExecutionPlan>,
+		spec: Box<BoundKernelDensitySpec>,
+	},
 	Exchange {
 		input: Box<ExecutionPlan>,
 		partition_count: u32,
@@ -438,6 +454,7 @@ impl ExecutionPlan {
 			Self::Union { output_schema, .. } => output_schema.clone(),
 			Self::Repeat { output_schema, .. } => output_schema.clone(),
 			Self::Aggregate { output_schema, .. } => output_schema.clone(),
+			Self::KernelDensity { spec, .. } => spec.output_schema.clone(),
 			Self::Exchange { input, .. } => input.schema(),
 			Self::Sort { output_schema, .. } => output_schema.clone(),
 			Self::Window { output_schema, .. } => output_schema.clone(),

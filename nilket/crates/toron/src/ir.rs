@@ -1182,6 +1182,12 @@ pub enum LogicalPlan {
 		group_expr: Vec<Expr>,
 		aggr_expr: Vec<(AggregateFunction, Vec<Expr>)>,
 	},
+	/// ADR 552: a Rune-owned relation kernel. The binder makes the input globally visible so the
+	/// shared extent and per-group statistics have one authority; SQL has no spelling for this node.
+	KernelDensity {
+		input: Box<LogicalPlan>,
+		spec: Box<KernelDensitySpec>,
+	},
 	Exchange {
 		input: Box<LogicalPlan>,
 		partition_count: u32,
@@ -1311,6 +1317,15 @@ pub enum LogicalPlan {
 		name: String,
 		column_names: Vec<String>,
 	},
+}
+
+/// ADR 552: the density operator's authored expressions and grid size live behind a box so adding
+/// the terminal operator does not enlarge every recursively nested logical plan frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KernelDensitySpec {
+	pub group_expr: Expr,
+	pub value_expr: Expr,
+	pub points: usize,
 }
 
 pub fn project_plan(

@@ -25,16 +25,17 @@ use crate::error::BindingError;
 use crate::exec::Executor;
 use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
-	BoundExprProgram, BoundExprProgramBuilder, BoundReturningProjection, BoundUnaryOp,
-	BoundWindowCall, BroadcastBuildSide, BroadcastReplayEligibility, ColumnName, ColumnOrdinal,
-	ColumnRef, CreateTableColumnType, CreateTableSchema, ExecutionPlan, ExecutionSortKey, Expr,
-	FilterDisposition, InsertLiteral, JoinKind, JoinReplayId, JoinStrategy, JoinStrategyIntent,
-	JoinStrategyPinSource, LogicalPlan, LogicalTypeId, LogicalTypeRegistry, LogicalTypeResolver,
-	LogicalTypeSpec, PbcProgram, QueryProfileHint, ResolvedColumn, ReturningProjection,
-	ScalarLiteralKey, ScalarLiteralKeyClassification, ScalarValue, SetOpAllKind, SortExpr,
-	SystemTableKind, TableId, TemporalExtractField, TemporalTruncField, WindowFrame,
-	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, arithmetic_output_type,
-	calendar_month_interval_data_type, decimal_division_output_type, decode_column_logical_type,
+	BoundExprProgram, BoundExprProgramBuilder, BoundKernelDensitySpec, BoundReturningProjection,
+	BoundUnaryOp, BoundWindowCall, BroadcastBuildSide, BroadcastReplayEligibility, ColumnName,
+	ColumnOrdinal, ColumnRef, CreateTableColumnType, CreateTableSchema, ExecutionPlan,
+	ExecutionSortKey, Expr, FilterDisposition, InsertLiteral, JoinKind, JoinReplayId, JoinStrategy,
+	JoinStrategyIntent, JoinStrategyPinSource, KernelDensitySpec, LogicalPlan, LogicalTypeId,
+	LogicalTypeRegistry, LogicalTypeResolver, LogicalTypeSpec, PbcProgram, QueryProfileHint,
+	ResolvedColumn, ReturningProjection, ScalarLiteralKey, ScalarLiteralKeyClassification,
+	ScalarValue, SetOpAllKind, SortExpr, SystemTableKind, TableId, TemporalExtractField,
+	TemporalTruncField, WindowFrame, WindowFrameBound, WindowFrameDelta, WindowFrameUnit,
+	WindowFunction, arithmetic_output_type, calendar_month_interval_data_type,
+	decimal_division_output_type, decode_column_logical_type,
 	decode_column_logical_type_with_resolver, field_with_logical_type_metadata, interval_data_type,
 	logical_type_name, nanos_per_timestamp_unit, scalar_literal_key, schema_for_exprs,
 };
@@ -1451,6 +1452,98 @@ impl<'a> Binder<'a> {
 						);
 					}
 					self.bind_bound_aggregate(input, group_expr, bound_aggr_expr)
+				}
+				LogicalPlan::KernelDensity { input, spec } => {
+					let KernelDensitySpec {
+						group_expr,
+						value_expr,
+						points,
+					} = spec.as_ref();
+					let input = self
+						.bind_plan_with_trace(
+							input,
+							trace,
+							render_trace,
+							join_order_source_capture,
+							recursive_ctx.clone(),
+						)
+						.await?;
+					let input_schema = input.schema();
+					let group_program = self
+						.bind_expr_program_scoped(
+							std::slice::from_ref(group_expr),
+							&input_schema,
+							&input.scope,
+						)
+						.await?;
+					let value_program = self
+						.bind_expr_program_scoped(
+							std::slice::from_ref(value_expr),
+							&input_schema,
+							&input.scope,
+						)
+						.await?;
+					let group_type = group_program.root_type(0).cloned().ok_or_else(|| {
+						BindingError::UnsupportedExpression {
+							message: "KERNEL_DENSITY group expression has no output".to_string(),
+						}
+					})?;
+					let value_type = value_program.root_type(0).ok_or_else(|| {
+						BindingError::UnsupportedExpression {
+							message: "KERNEL_DENSITY value expression has no output".to_string(),
+						}
+					})?;
+					if !matches!(
+						value_type,
+						DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
+					) {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!(
+								"KERNEL_DENSITY value must be Int32, Int64, Float32, or Float64, got {value_type:?}"
+							),
+						});
+					}
+					if !is_supported_density_group_type(&group_type) {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!(
+								"KERNEL_DENSITY group must be a supported scalar key type, got {group_type:?}"
+							),
+						});
+					}
+					let group_logical_type = group_program
+						.root_logical_type(0)
+						.unwrap_or(LogicalTypeId::NAKED);
+					let output_schema = Arc::new(Schema::new(vec![
+						field_with_logical_type_metadata(
+							"group",
+							group_type,
+							true,
+							group_logical_type,
+						),
+						Field::new("evaluation_value", DataType::Float64, false),
+						Field::new("density", DataType::Float64, false),
+					]));
+					let input_scope = input.scope.with_schema(output_schema.clone());
+					let join_order_sources = input.join_order_sources.clone();
+					let child_plan = ExecutionPlan::Exchange {
+						input: Box::new(input.plan),
+						partition_count: 1,
+						key: BoundExprProgram::empty(),
+					};
+					Ok(ScopedExecutionPlan::new_with_facts_and_join_order_sources(
+						ExecutionPlan::KernelDensity {
+							input: Box::new(child_plan),
+							spec: Box::new(BoundKernelDensitySpec {
+								group_expr: group_program,
+								value_expr: value_program,
+								points: *points,
+								output_schema,
+							}),
+						},
+						input_scope,
+						PlanOptimizerFacts::composite_unknown(),
+						join_order_sources,
+					))
 				}
 				LogicalPlan::Exchange {
 					input,
@@ -3784,6 +3877,20 @@ fn is_supported_ctas_column_type(data_type: &DataType) -> bool {
 	) || crate::timestamp::is_supported_utc_timestamp(data_type)
 }
 
+fn is_supported_density_group_type(data_type: &DataType) -> bool {
+	match data_type {
+		DataType::Boolean
+		| DataType::Int32
+		| DataType::Int64
+		| DataType::Date32
+		| DataType::Float32
+		| DataType::Float64
+		| DataType::Utf8 => true,
+		DataType::Timestamp(_, Some(timezone)) => timezone.as_ref() == "UTC",
+		_ => false,
+	}
+}
+
 fn bind_sort_keys(
 	order_by: &[SortExpr],
 	output_schema: &SchemaRef,
@@ -4344,6 +4451,22 @@ fn optimize_for_required(
 					group_expr,
 					aggr_expr,
 					output_schema,
+				},
+				output_remap,
+			))
+		}
+		ExecutionPlan::KernelDensity { input, spec } => {
+			let (input, _) = optimize_for_required(*input, None, logical_types)?;
+			let output_remap = ordinal_remap(
+				&output_columns(spec.output_schema.fields().len())
+					.iter()
+					.copied()
+					.collect::<Vec<_>>(),
+			);
+			Ok((
+				ExecutionPlan::KernelDensity {
+					input: Box::new(input),
+					spec,
 				},
 				output_remap,
 			))

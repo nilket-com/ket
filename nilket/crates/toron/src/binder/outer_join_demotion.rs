@@ -393,6 +393,7 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Explain { .. }
 				| LogicalPlan::ExplainAnalyze { .. }
+				| LogicalPlan::KernelDensity { .. }
 				| LogicalPlan::CreateTable { .. }
 				| LogicalPlan::CreateLogicalType { .. }
 				| LogicalPlan::DropTable { .. }
@@ -662,6 +663,7 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Explain { .. }
 				| LogicalPlan::ExplainAnalyze { .. }
+				| LogicalPlan::KernelDensity { .. }
 				| LogicalPlan::CreateTable { .. }
 				| LogicalPlan::CreateLogicalType { .. }
 				| LogicalPlan::DropTable { .. }
@@ -1048,6 +1050,7 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Distinct { input }
 				| LogicalPlan::Alias { input, .. }
 				| LogicalPlan::Aggregate { input, .. }
+				| LogicalPlan::KernelDensity { input, .. }
 				| LogicalPlan::Explain { input }
 				| LogicalPlan::ExplainAnalyze { input } => {
 					self.contains_nested_cross_equi(input, conjuncts).await
@@ -1585,6 +1588,7 @@ impl<'a> Binder<'a> {
 				// ADR 279: opaque for outer-demotion column routing — demotion does not cross a deferred
 				// EXISTS (it is resolved to a real Join afterward).
 				| LogicalPlan::DeferredExists { .. }
+				| LogicalPlan::KernelDensity { .. }
 				| LogicalPlan::DeferredScalarSubquery { .. } => Ok(None),
 			}
 		})
@@ -1974,6 +1978,7 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::InsertSelect { .. }
 					// ADR 279: conjuncts don't route through a deferred EXISTS; keep them as a residual above.
 					| LogicalPlan::DeferredExists { .. }
+					| LogicalPlan::KernelDensity { .. }
 					| LogicalPlan::DeferredScalarSubquery { .. }) => Ok(RoutedConjuncts {
 					input: stopped,
 					residual: routed_originals(conjuncts),

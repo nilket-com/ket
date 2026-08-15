@@ -203,6 +203,162 @@ async fn rune_sql_filter_then_rune_aggregate_composes_single_logical_plan() {
 }
 
 #[tokio::test]
+async fn adr552_kernel_density_uses_group_spread_and_shared_grid() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").kernel_density_default(col("region"), col("price"))
+        }
+    "#,
+	)
+	.await
+	.expect("plan ADR 552 density relation");
+	let batches = run_logical(&logical).await;
+	let batch = &batches[0];
+	assert_eq!(batch.num_rows(), 256, "the null/singleton group is absent");
+	let groups = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("density group");
+	let evaluations = batch
+		.column(1)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("density evaluation grid");
+	let densities = batch
+		.column(2)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("density values");
+	let mut grids = HashMap::<String, Vec<f64>>::new();
+	let mut sums = HashMap::<String, f64>::new();
+	for row in 0..batch.num_rows() {
+		let group = groups.value(row).to_owned();
+		grids
+			.entry(group.clone())
+			.or_default()
+			.push(evaluations.value(row));
+		*sums.entry(group).or_default() += densities.value(row);
+	}
+	assert_eq!(grids["east"], grids["west"]);
+	assert_ne!(sums["east"], sums["west"], "bandwidth is not a constant");
+}
+
+#[tokio::test]
+async fn adr552_kernel_density_fragments_through_global_exchange() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").kernel_density(col("region"), col("price"), 8)
+        }
+    "#,
+	)
+	.await
+	.expect("plan fragmentable ADR 552 density relation");
+	let bound = bind(&logical, &catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind fragmentable ADR 552 density relation");
+	let stages =
+		fragment_plan(bound, fragment_config()).expect("fragment ADR 552 density relation");
+	assert_eq!(stages.len(), 2);
+	assert!(matches!(
+		stages[0].tasks[0].spec.output,
+		toron::distributed::task::TaskOutputBinding::ShuffleProducer { .. }
+	));
+	assert!(matches!(
+		stages[1].tasks[0].spec.plan,
+		ExecutionPlan::KernelDensity { .. }
+	));
+	assert!(matches!(
+		stages[1].tasks[0].spec.output,
+		toron::distributed::task::TaskOutputBinding::FinalResult
+	));
+}
+
+#[tokio::test]
+async fn adr552_outlier_in_one_group_leaves_other_group_density_unchanged() {
+	let script = r#"
+        pub fn main(ctx) {
+            ctx.table("density_input").kernel_density(col("group"), col("value"), 8)
+        }
+    "#;
+	let base = execute_density_fixture(&rune_plan(script).await.expect("base density plan"), false)
+		.await
+		.expect("base density execution");
+	let with_outlier = execute_density_fixture(
+		&rune_plan(script).await.expect("outlier density plan"),
+		true,
+	)
+	.await
+	.expect("outlier density execution");
+	let base_b = density_group_rows(&base, "B");
+	let outlier_b = density_group_rows(&with_outlier, "B");
+	assert_eq!(
+		base_b, outlier_b,
+		"a group owns its bandwidth and observations"
+	);
+}
+
+#[tokio::test]
+async fn adr552_zero_iqr_falls_back_and_degenerate_group_is_absent() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("density_input").kernel_density(col("group"), col("value"), 8)
+        }
+    "#,
+	)
+	.await
+	.expect("zero-IQR density plan");
+	let batches = execute_density_fixture(&logical, false)
+		.await
+		.expect("zero-IQR density execution");
+	let c_rows = density_group_rows(&batches, "C");
+	assert_eq!(c_rows.len(), 8);
+	assert!(
+		c_rows.iter().all(|(_, density)| density.is_finite())
+			&& c_rows.iter().any(|(_, density)| *density > 0.0),
+		"the p90-p10 fallback must produce a positive density"
+	);
+	assert!(
+		density_group_rows(&batches, "D").is_empty(),
+		"an all-identical group must be absent, not zero-filled"
+	);
+}
+
+#[tokio::test]
+async fn adr552_non_finite_group_is_sticky_without_poisoning_other_groups() {
+	let logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("density_input").kernel_density(col("group"), col("value"), 8)
+        }
+    "#,
+	)
+	.await
+	.expect("sticky-NaN density plan");
+	let bound = bind(&logical, &density_catalog(), &PlannerConfig::default())
+		.await
+		.expect("bind sticky-NaN density");
+	let batches = Executor::new(Arc::new(FixtureScan {
+		batches: HashMap::from([(TableId(3), density_batch_with_non_finite(density_schema()))]),
+	}))
+	.execute_bound(&bound, None)
+	.await
+	.expect("execute sticky-NaN density");
+	let nan_rows = density_group_rows(&batches, "E");
+	assert_eq!(nan_rows.len(), 8);
+	assert!(nan_rows.iter().all(|(_, density)| density.is_nan()));
+	assert!(
+		density_group_rows(&batches, "B")
+			.iter()
+			.all(|(_, density)| density.is_finite()),
+		"one dirty group must not poison other groups"
+	);
+}
+
+#[tokio::test]
 async fn rune_sql_composition_preserves_existing_pushdown_path() {
 	let logical = rune_plan(
 		r#"
@@ -3248,6 +3404,118 @@ async fn execute_logical(logical: &LogicalPlan) -> Result<Vec<RecordBatch>, Exec
 	}))
 	.execute_bound(&bound, None)
 	.await
+}
+
+async fn execute_density_fixture(
+	logical: &LogicalPlan,
+	with_outlier: bool,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	let bound = bind(logical, &density_catalog(), &PlannerConfig::default())
+		.await
+		.map_err(|error| ExecutionError::InvalidExpression {
+			message: format!("bind density fixture: {error}"),
+		})?;
+	Executor::new(Arc::new(FixtureScan {
+		batches: HashMap::from([(TableId(3), density_batch(density_schema(), with_outlier))]),
+	}))
+	.execute_bound(&bound, None)
+	.await
+}
+
+fn density_group_rows(batches: &[RecordBatch], wanted: &str) -> Vec<(f64, f64)> {
+	let batch = &batches[0];
+	let groups = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("density group");
+	let evaluations = batch
+		.column(1)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("density grid");
+	let densities = batch
+		.column(2)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("density values");
+	(0..batch.num_rows())
+		.filter(|row| groups.value(*row) == wanted)
+		.map(|row| (evaluations.value(row), densities.value(row)))
+		.collect()
+}
+
+fn density_catalog() -> MockCatalog {
+	let mut catalog = catalog();
+	catalog
+		.register_descriptor(
+			TableId(3),
+			descriptor(3, "density_input", density_schema().as_ref(), "id"),
+		)
+		.expect("register density input");
+	catalog
+}
+
+fn density_schema() -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("id", DataType::Int64, false),
+		Field::new("group", DataType::Utf8, false),
+		Field::new("value", DataType::Float64, false),
+	]))
+}
+
+fn density_batch(schema: SchemaRef, with_outlier: bool) -> RecordBatch {
+	let mut ids = vec![1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13];
+	let mut groups = vec!["A", "A", "A", "B", "B", "B", "C", "C", "C", "C", "D", "D"];
+	let mut values = vec![
+		10.0, 11.0, 12.0, 0.0, 50.0, 100.0, 5.0, 5.0, 5.0, 10.0, 7.0, 7.0,
+	];
+	if with_outlier {
+		ids.push(7);
+		groups.push("A");
+		values.push(20.0);
+	}
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(ids)),
+			Arc::new(StringArray::from(groups)),
+			Arc::new(Float64Array::from(values)),
+		],
+	)
+	.expect("density input batch")
+}
+
+fn density_batch_with_non_finite(schema: SchemaRef) -> RecordBatch {
+	RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Int64Array::from(vec![
+				1, 2, 3, 4, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16,
+			])),
+			Arc::new(StringArray::from(vec![
+				"A", "A", "A", "B", "B", "B", "C", "C", "C", "C", "D", "D", "E", "E", "E",
+			])),
+			Arc::new(Float64Array::from(vec![
+				10.0,
+				11.0,
+				12.0,
+				0.0,
+				50.0,
+				100.0,
+				5.0,
+				5.0,
+				5.0,
+				10.0,
+				7.0,
+				7.0,
+				30.0,
+				31.0,
+				f64::NAN,
+			])),
+		],
+	)
+	.expect("non-finite density input batch")
 }
 
 fn catalog() -> MockCatalog {

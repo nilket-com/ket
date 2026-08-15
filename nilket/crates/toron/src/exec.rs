@@ -70,6 +70,7 @@ use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
 
 mod aggregate;
+mod density;
 mod expr;
 mod join;
 mod node_attribution;
@@ -743,6 +744,9 @@ impl Executor {
 				LogicalPlan::Repeat { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound logical repeat execution",
 				}),
+				LogicalPlan::KernelDensity { .. } => Err(ExecutionError::NotImplemented {
+					feature: "unbound logical kernel density execution",
+				}),
 				// ADR 255: recursive CTEs execute only via the bound fixpoint path (`execute_bound`).
 				LogicalPlan::RecursiveCte { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound recursive CTE execution",
@@ -955,6 +959,16 @@ impl Executor {
 							output_schema,
 						)
 					}
+				}
+				ExecutionPlan::KernelDensity { input, spec } => {
+					let input_batches = self.execute_bound_node(input, morsel).await?;
+					self.execute_kernel_density(
+						&input_batches,
+						&spec.group_expr,
+						&spec.value_expr,
+						spec.points,
+						&spec.output_schema,
+					)
 				}
 				ExecutionPlan::Exchange {
 					input,

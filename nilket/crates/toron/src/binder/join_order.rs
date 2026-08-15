@@ -2213,6 +2213,7 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Distinct { input }
 		| LogicalPlan::Repeat { input, .. }
 		| LogicalPlan::Aggregate { input, .. }
+		| LogicalPlan::KernelDensity { input, .. }
 		| LogicalPlan::Exchange { input, .. }
 		| LogicalPlan::Sort { input, .. }
 		| LogicalPlan::Window { input, .. }

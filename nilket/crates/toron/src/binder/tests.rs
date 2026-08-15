@@ -22295,7 +22295,8 @@ fn collect_join_strategies(plan: &ExecutionPlan, strategies: &mut Vec<JoinStrate
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
-		| ExecutionPlan::Repeat { input, .. } => collect_join_strategies(input, strategies),
+		| ExecutionPlan::Repeat { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. } => collect_join_strategies(input, strategies),
 		ExecutionPlan::Union { left, right, .. } => {
 			collect_join_strategies(left, strategies);
 			collect_join_strategies(right, strategies);
@@ -22340,7 +22341,8 @@ fn collect_execution_join_kinds(plan: &ExecutionPlan, kinds: &mut Vec<JoinKind>)
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
-		| ExecutionPlan::Repeat { input, .. } => collect_execution_join_kinds(input, kinds),
+		| ExecutionPlan::Repeat { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. } => collect_execution_join_kinds(input, kinds),
 		ExecutionPlan::Union { left, right, .. } => {
 			collect_execution_join_kinds(left, kinds);
 			collect_execution_join_kinds(right, kinds);
@@ -22382,7 +22384,8 @@ fn collect_join_replay_ids(plan: &ExecutionPlan, ids: &mut Vec<JoinReplayId>) {
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
-		| ExecutionPlan::Repeat { input, .. } => collect_join_replay_ids(input, ids),
+		| ExecutionPlan::Repeat { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. } => collect_join_replay_ids(input, ids),
 		ExecutionPlan::Union { left, right, .. } => {
 			collect_join_replay_ids(left, ids);
 			collect_join_replay_ids(right, ids);
@@ -22429,7 +22432,10 @@ fn collect_join_replay_metadata(
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
-		| ExecutionPlan::Repeat { input, .. } => collect_join_replay_metadata(input, metadata),
+		| ExecutionPlan::Repeat { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. } => {
+			collect_join_replay_metadata(input, metadata)
+		},
 		ExecutionPlan::Union { left, right, .. } => {
 			collect_join_replay_metadata(left, metadata);
 			collect_join_replay_metadata(right, metadata);
@@ -22498,6 +22504,7 @@ fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
 		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. }
 		| LogicalPlan::Repeat { input, .. }
+		| LogicalPlan::KernelDensity { input, .. }
 		| LogicalPlan::Explain { input }
 		| LogicalPlan::ExplainAnalyze { input } => collect_logical_join_kinds(input, kinds),
 		LogicalPlan::CreateTableAsSelect { source, .. }

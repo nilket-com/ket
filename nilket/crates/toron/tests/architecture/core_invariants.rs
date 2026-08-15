@@ -95,13 +95,14 @@ pub(crate) fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub fn project_plan").next())
 		.expect("LogicalPlan enum");
-	assert_eq!(enum_variant_count(logical_plan), 29);
+	assert_eq!(enum_variant_count(logical_plan), 30);
 	assert!(logical_plan.contains("Sort {"));
 	assert!(logical_plan.contains("Take {"));
 	assert!(logical_plan.contains("Distinct {"));
 	assert!(logical_plan.contains("Union {"));
 	assert!(logical_plan.contains("SetOpAll {"));
 	assert!(logical_plan.contains("Repeat {"));
+	assert!(logical_plan.contains("KernelDensity {"));
 	assert!(logical_plan.contains("Explain {"));
 	assert!(logical_plan.contains("ExplainAnalyze {"));
 	assert!(logical_plan.contains("CreateTable {"));
@@ -122,11 +123,12 @@ pub(crate) fn architecture_guards_unchanged_plus_sort_variant() {
 		.nth(1)
 		.and_then(|rest| rest.split("impl ExecutionPlan").next())
 		.expect("ExecutionPlan enum");
-	assert_eq!(enum_variant_count(execution_plan), 23);
+	assert_eq!(enum_variant_count(execution_plan), 24);
 	assert!(execution_plan.contains("EmptyRelation {"));
 	assert!(execution_plan.contains("SystemTable {"));
 	assert!(execution_plan.contains("Union {"));
 	assert!(execution_plan.contains("Repeat {"));
+	assert!(execution_plan.contains("KernelDensity {"));
 	assert!(execution_plan.contains("Sort {"));
 	assert!(execution_plan.contains("Take {"));
 	assert!(execution_plan.contains("CreateTable {"));

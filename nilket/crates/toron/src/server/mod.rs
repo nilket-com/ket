@@ -1390,6 +1390,7 @@ fn join_strategy_label(plan: &ExecutionPlan) -> Option<&'static str> {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
@@ -1421,6 +1422,7 @@ fn contains_join(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Repeat { input, .. }
 		| ExecutionPlan::Sort { input, .. }
@@ -1455,6 +1457,7 @@ fn operator_kind_label(plan: &ExecutionPlan) -> &'static str {
 			ExecutionPlan::Union { .. } => "union",
 			ExecutionPlan::Repeat { .. } => "repeat",
 			ExecutionPlan::Aggregate { .. } => "aggregate",
+			ExecutionPlan::KernelDensity { .. } => "kernel_density",
 			ExecutionPlan::Sort { .. } => "sort",
 			ExecutionPlan::Window { .. } => "window",
 			ExecutionPlan::Take { .. } => "take",
@@ -1628,6 +1631,7 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
@@ -4438,9 +4442,10 @@ fn drive_streamable_plan<'a>(
 			ExecutionPlan::Exchange { .. }
 			| ExecutionPlan::Union { .. }
 			| ExecutionPlan::Sort { .. }
-			| ExecutionPlan::Window { .. }
-			| ExecutionPlan::Aggregate { .. }
-			| ExecutionPlan::Join { .. }
+		| ExecutionPlan::Window { .. }
+		| ExecutionPlan::Aggregate { .. }
+		| ExecutionPlan::KernelDensity { .. }
+		| ExecutionPlan::Join { .. }
 			| ExecutionPlan::Repeat { .. }
 			| ExecutionPlan::EmptyRelation { .. }
 			| ExecutionPlan::SystemTable { .. }
@@ -4697,6 +4702,7 @@ fn scan_schema_for_table_id(plan: &ExecutionPlan, table_id: TableId) -> Option<S
 		ExecutionPlan::Filter { input, .. }
 		| ExecutionPlan::Project { input, .. }
 		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. }
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }

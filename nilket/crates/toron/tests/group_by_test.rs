@@ -6604,7 +6604,8 @@ fn contains_execution_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Sort { input, .. }
 		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
-		| ExecutionPlan::Repeat { input, .. } => contains_execution_join(input),
+		| ExecutionPlan::Repeat { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. } => contains_execution_join(input),
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }
@@ -6636,7 +6637,8 @@ fn contains_logical_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Sort { input, .. }
 		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. }
-		| LogicalPlan::Repeat { input, .. } => contains_logical_join(input),
+		| LogicalPlan::Repeat { input, .. }
+		| LogicalPlan::KernelDensity { input, .. } => contains_logical_join(input),
 		LogicalPlan::SetOpAll { left, right, .. } => {
 			contains_logical_join(left) || contains_logical_join(right)
 		}
@@ -6670,7 +6672,8 @@ fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::Sort { input, .. }
 		| LogicalPlan::Window { input, .. }
 		| LogicalPlan::Take { input, .. }
-		| LogicalPlan::Repeat { input, .. } => contains_logical_distinct(input),
+		| LogicalPlan::Repeat { input, .. }
+		| LogicalPlan::KernelDensity { input, .. } => contains_logical_distinct(input),
 		LogicalPlan::Join { left, right, .. } => {
 			contains_logical_distinct(left) || contains_logical_distinct(right)
 		}
@@ -6708,7 +6711,8 @@ fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Exchange { input, .. }
 		| ExecutionPlan::Window { input, .. }
 		| ExecutionPlan::Take { input, .. }
-		| ExecutionPlan::Repeat { input, .. } => contains_execution_sort(input),
+		| ExecutionPlan::Repeat { input, .. }
+		| ExecutionPlan::KernelDensity { input, .. } => contains_execution_sort(input),
 		ExecutionPlan::Join { left, right, .. } => {
 			contains_execution_sort(left) || contains_execution_sort(right)
 		}

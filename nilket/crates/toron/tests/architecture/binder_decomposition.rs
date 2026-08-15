@@ -192,9 +192,10 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// ADR 537 adds three lines: one `PlannerConfig` switch, its default, and one doc line. It is
 	// a configuration field, not a new pass or IR node — the lineage tracer it governs lives in
 	// distributed/fragment.rs. Bumped by exactly its cost, not rounded up.
+	// ADR 552 adds the terminal density bind arm and its globally-gathered child exchange.
 	assert!(
-		lines <= 6_278,
-		"binder root has {lines} lines; expected <= 6,278 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_327,
+		"binder root has {lines} lines; expected <= 6,327 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 
@@ -242,6 +243,8 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/exec.rs",
 				// ADR 350: semantic executor decomposition moves join substrate out of exec.rs.
 				"crates/toron/src/exec/join.rs",
+				// ADR 552: relation-side Gaussian density is a terminal executor module.
+				"crates/toron/src/exec/density.rs",
 				// ADR 396: join build row storage and env-gated build profiling live under the
 				// existing join executor substrate.
 				"crates/toron/src/exec/join/build_profile.rs",

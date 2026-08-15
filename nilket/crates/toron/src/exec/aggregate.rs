@@ -13,7 +13,7 @@ const BORROW_SINGLE_UTF8_GROUP_KEY_ENV: &str = "TORON_TPCH_BORROW_SINGLE_UTF8_GR
 const PRIMITIVE_INT64_COUNT_ENV: &str = "TORON_EXEC_PRIMITIVE_INT64_COUNT";
 const GROUPED_FOLD_RECEIPT_PATH_ENV: &str = "TORON_GROUPED_FOLD_RECEIPT_PATH";
 pub(in crate::exec) const MAX_QUANTILE_STATES_PER_EXECUTION: usize = 1_024;
-const QUANTILE_K: wendelon::schema::KllK = wendelon::schema::KllK::new(800);
+pub(in crate::exec) const QUANTILE_K: wendelon::schema::KllK = wendelon::schema::KllK::new(800);
 
 #[derive(Default)]
 struct GroupedFoldReceipt {
