@@ -25,19 +25,12 @@ let medians = workspace
 	.aggregate([col("region")], [approx_quantile(col("measure"), 0.5)])
 	.alias("m");
 
-let prepared = density
-	.join(medians, qcol("d", "group").eq(qcol("m", "region")))
-	.project_named([
-		qcol("d", "group").named("group"),
-		qcol("d", "evaluation_value").named("evaluation_value"),
-		qcol("d", "density").named("density"),
-		qcol("m", "quantile").named("median"),
-	]);
+let prepared = density.join(medians, qcol("d", "group").eq(qcol("m", "region")));
 
 prepared.views([
 	view("violin-prepared", table()),
 	view(
 		"violin",
-		violin("group", "evaluation_value", "density", "median"),
+		violin("group", "evaluation_value", "density", "quantile"),
 	),
 ]);
