@@ -6290,6 +6290,17 @@ fn timing_atlas_replay_attribution_path(
 			task_id: task_id as u32,
 			wall_ms,
 			components,
+			// Read back, never defaulted: replay re-derives every figure from the
+			// nodes, so a zero here would recompute a residual that silently
+			// equalled the remainder no matter what the run measured.
+			telemetry_lock_ms: node
+				.get("telemetry_lock_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
+			framework_overhead_ms: node
+				.get("framework_overhead_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
 			upstream,
 		});
 	}
@@ -6372,6 +6383,15 @@ fn timing_atlas_replay_attribution_path(
 				));
 			}
 		}
+	}
+
+	if let Some(claimed_bookkeeping) = row.get("bookkeeping_ms").and_then(|value| value.as_f64())
+		&& (claimed_bookkeeping - recomputed.bookkeeping_ms).abs() > 1e-6
+	{
+		problems.push(format!(
+			"path bookkeeping {claimed_bookkeeping} disagrees with recomputed {}",
+			recomputed.bookkeeping_ms
+		));
 	}
 
 	// Reconciliation: eligible portions plus the remainder must cover measured elapsed,
@@ -7212,8 +7232,16 @@ pub fn timing_atlas_leading_component(
 pub struct TimingAtlasTaskNode {
 	pub stage_id: u32,
 	pub task_id: u32,
+	/// The task's own wall. A **non-additive envelope**: it contains the
+	/// components and the bookkeeping below, so it never enters a subtraction
+	/// against `remainder_ms` (ADR 551 follow-up).
 	pub wall_ms: f64,
 	pub components: Vec<(TimingAtlasComponent, f64)>,
+	/// Measured-but-unattributed bookkeeping, kept as two counters rather than
+	/// one so a reader can see which moved. `task_wall_micros` is deliberately
+	/// absent: it is the envelope, not a term.
+	pub telemetry_lock_ms: f64,
+	pub framework_overhead_ms: f64,
 	/// Immediate predecessors, as (stage, task).
 	pub upstream: Vec<(u32, u32)>,
 }
@@ -7231,6 +7259,10 @@ pub struct TimingAtlasCriticalPath {
 	pub path: Vec<(u32, u32)>,
 	pub total_wall_ms: f64,
 	pub components: BTreeMap<String, f64>,
+	/// Bookkeeping summed over **the same path nodes** the components are summed
+	/// over. Summing it over a different node set would make the residual
+	/// incoherent with the components it is subtracted alongside.
+	pub bookkeeping_ms: f64,
 }
 
 /// Derive a per-cell figure by critical path through the stage DAG.
@@ -7298,6 +7330,7 @@ pub fn timing_atlas_critical_path(
 
 	// Components come only from nodes on the selected path.
 	let mut components: BTreeMap<String, f64> = BTreeMap::new();
+	let mut bookkeeping_ms = 0.0_f64;
 	for key in &path {
 		let Some(node) = index.get(key) else { continue };
 		for (component, portion) in &node.components {
@@ -7305,11 +7338,13 @@ pub fn timing_atlas_critical_path(
 				.entry(component.label().to_string())
 				.or_insert(0.0) += portion;
 		}
+		bookkeeping_ms += node.telemetry_lock_ms + node.framework_overhead_ms;
 	}
 	Some(TimingAtlasCriticalPath {
 		path,
 		total_wall_ms,
 		components,
+		bookkeeping_ms,
 	})
 }
 
@@ -7596,6 +7631,9 @@ pub struct TimingAtlasChildAttribution {
 	pub path: Vec<(u32, u32)>,
 	pub path_wall_ms: f64,
 	pub path_components: BTreeMap<String, f64>,
+	/// Measured bookkeeping along the path. Reporting only: it is not a
+	/// component, is not eligible, and never enters `attributed_ms`.
+	pub bookkeeping_ms: f64,
 }
 
 impl TimingAtlasChildAttribution {
@@ -7680,6 +7718,9 @@ pub fn timing_atlas_nodes_from_report(
 				task_id: *task,
 				wall_ms: record.telemetry.phases.task_wall_micros as f64 / 1000.0,
 				components: timing_atlas_component_portions_ms(&record.telemetry.phases),
+				telemetry_lock_ms: record.telemetry.phases.telemetry_lock_micros as f64 / 1000.0,
+				framework_overhead_ms: record.telemetry.phases.framework_overhead_micros as f64
+					/ 1000.0,
 				upstream,
 			})
 		})
@@ -7702,6 +7743,8 @@ pub fn timing_atlas_local_task_node(
 		task_id: 0,
 		wall_ms: execute_wall_ms,
 		components: timing_atlas_component_portions_ms(phases),
+		telemetry_lock_ms: phases.telemetry_lock_micros as f64 / 1000.0,
+		framework_overhead_ms: phases.framework_overhead_micros as f64 / 1000.0,
 		upstream: Vec::new(),
 	})
 }
@@ -7718,6 +7761,7 @@ pub fn timing_atlas_child_attribution(
 		path: selected.path,
 		path_wall_ms: selected.total_wall_ms,
 		path_components: selected.components,
+		bookkeeping_ms: selected.bookkeeping_ms,
 	})
 }
 
@@ -7748,10 +7792,25 @@ pub fn timing_atlas_attribution_path_row(
 				"task": node.task_id,
 				"wall_ms": node.wall_ms,
 				"components": components,
+				"telemetry_lock_ms": node.telemetry_lock_ms,
+				"framework_overhead_ms": node.framework_overhead_ms,
 				"upstream": node.upstream,
 			})
 		})
 		.collect();
+	let remainder_ms = measured_elapsed_ms - attribution.attributed_ms();
+	let telemetry_lock_ms: f64 = attribution
+		.path
+		.iter()
+		.filter_map(|key| attribution.nodes.iter().find(|node| node.key() == *key))
+		.map(|node| node.telemetry_lock_ms)
+		.sum();
+	let framework_overhead_ms: f64 = attribution
+		.path
+		.iter()
+		.filter_map(|key| attribution.nodes.iter().find(|node| node.key() == *key))
+		.map(|node| node.framework_overhead_ms)
+		.sum();
 	serde_json::json!({
 		"kind": TIMING_ATLAS_KIND_ATTRIBUTION_PATH,
 		"query": query,
@@ -7763,7 +7822,15 @@ pub fn timing_atlas_attribution_path_row(
 		"path": attribution.path,
 		"path_wall_ms": attribution.path_wall_ms,
 		"path_components": attribution.path_components,
-		"remainder_ms": measured_elapsed_ms - attribution.attributed_ms(),
+		"remainder_ms": remainder_ms,
+		// ADR 551 follow-up: remainder split into what is measured and what is
+		// not. `bookkeeping_ms` is exactly the two counters above; the residual
+		// is what no counter names at all. `path_wall_ms` above is the envelope
+		// and is deliberately absent from this subtraction.
+		"telemetry_lock_ms": telemetry_lock_ms,
+		"framework_overhead_ms": framework_overhead_ms,
+		"bookkeeping_ms": attribution.bookkeeping_ms,
+		"residual_unattributed_ms": remainder_ms - attribution.bookkeeping_ms,
 	})
 }
 
@@ -22931,6 +22998,89 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 mod adr538_timing_atlas_journal_replay {
 	use super::*;
 
+	/// One node carrying components, bookkeeping, and a wall far larger than either.
+	fn decomposition_node(
+		telemetry_lock_ms: f64,
+		framework_overhead_ms: f64,
+		wall_ms: f64,
+	) -> TimingAtlasTaskNode {
+		TimingAtlasTaskNode {
+			stage_id: 0,
+			task_id: 0,
+			wall_ms,
+			components: vec![
+				(TimingAtlasComponent::Scan, 2.0),
+				(TimingAtlasComponent::Operator, 3.0),
+				(TimingAtlasComponent::Shuffle, 0.0),
+				(TimingAtlasComponent::Dispatch, 0.0),
+				(TimingAtlasComponent::Transport, 0.0),
+			],
+			telemetry_lock_ms,
+			framework_overhead_ms,
+			upstream: Vec::new(),
+		}
+	}
+
+	/// ADR 551 follow-up: the residual is the remainder minus **only** the two measured
+	/// bookkeeping counters.
+	#[test]
+	fn adr551_residual_is_remainder_less_bookkeeping() {
+		let attribution = timing_atlas_child_attribution(vec![decomposition_node(0.5, 1.5, 100.0)])
+			.expect("fixture attributes");
+		assert_eq!(attribution.bookkeeping_ms, 2.0);
+
+		let row = timing_atlas_attribution_path_row("q01", "distributed", 0, 1, 50.0, &attribution);
+		assert_eq!(row["telemetry_lock_ms"], 0.5);
+		assert_eq!(row["framework_overhead_ms"], 1.5);
+		assert_eq!(row["bookkeeping_ms"], 2.0);
+		// attributed = scan 2 + operator 3; remainder = 50 - 5 = 45; residual = 45 - 2.
+		assert_eq!(row["remainder_ms"], 45.0);
+		assert_eq!(row["residual_unattributed_ms"], 43.0);
+	}
+
+	/// The envelope exclusion, stated as a control because it is the one substitution that
+	/// would look reasonable and be wrong: `task_wall` **contains** the components and the
+	/// bookkeeping, so folding it into either would collapse the residual to nonsense.
+	#[test]
+	fn adr551_task_wall_never_enters_the_subtraction() {
+		let narrow = timing_atlas_child_attribution(vec![decomposition_node(0.5, 1.5, 10.0)])
+			.expect("narrow wall attributes");
+		let wide = timing_atlas_child_attribution(vec![decomposition_node(0.5, 1.5, 10_000.0)])
+			.expect("wide wall attributes");
+
+		assert_eq!(narrow.bookkeeping_ms, wide.bookkeeping_ms);
+		let narrow_row =
+			timing_atlas_attribution_path_row("q01", "distributed", 0, 1, 50.0, &narrow);
+		let wide_row = timing_atlas_attribution_path_row("q01", "distributed", 0, 1, 50.0, &wide);
+		assert_eq!(
+			narrow_row["residual_unattributed_ms"], wide_row["residual_unattributed_ms"],
+			"a thousandfold wall must not move the residual"
+		);
+		assert_ne!(
+			wide_row["path_wall_ms"], wide_row["bookkeeping_ms"],
+			"the envelope is reported, and reported separately"
+		);
+	}
+
+	/// Bookkeeping sums over the selected path only, exactly as components do. A node off
+	/// the path contributing bookkeeping would make the residual incoherent with the
+	/// components it is subtracted alongside.
+	#[test]
+	fn adr551_bookkeeping_sums_over_the_selected_path_only() {
+		let mut on_path = decomposition_node(1.0, 1.0, 100.0);
+		on_path.stage_id = 0;
+		let mut off_path = decomposition_node(50.0, 50.0, 1.0);
+		off_path.stage_id = 1;
+		off_path.task_id = 1;
+
+		let attribution = timing_atlas_child_attribution(vec![on_path, off_path])
+			.expect("two disconnected nodes attribute");
+		assert_eq!(
+			attribution.bookkeeping_ms, 2.0,
+			"the unselected node's 100ms of bookkeeping is not on the path"
+		);
+	}
+
 	/// The fixture's local arm: one node whose portions include an observed shuffle and no
 	/// transport, exactly the shape a real local plan with an in-memory exchange produces.
 	fn fixture_local_attribution() -> TimingAtlasChildAttribution {
@@ -22945,6 +23095,8 @@ mod adr538_timing_atlas_journal_replay {
 				(TimingAtlasComponent::Dispatch, 0.0),
 				(TimingAtlasComponent::Transport, 0.0),
 			],
+			telemetry_lock_ms: 0.0,
+			framework_overhead_ms: 0.0,
 			upstream: Vec::new(),
 		}])
 		.expect("local fixture attributes")
@@ -22965,6 +23117,8 @@ mod adr538_timing_atlas_journal_replay {
 					(TimingAtlasComponent::Dispatch, 1.0),
 					(TimingAtlasComponent::Transport, 0.5),
 				],
+				telemetry_lock_ms: 0.0,
+				framework_overhead_ms: 0.0,
 				upstream: Vec::new(),
 			},
 			TimingAtlasTaskNode {
@@ -22978,6 +23132,8 @@ mod adr538_timing_atlas_journal_replay {
 					(TimingAtlasComponent::Dispatch, 0.5),
 					(TimingAtlasComponent::Transport, 1.0),
 				],
+				telemetry_lock_ms: 0.0,
+				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
 			},
 		])
@@ -23945,6 +24101,8 @@ mod adr538_timing_atlas_critical_path {
 			task_id: task,
 			wall_ms: wall,
 			components,
+			telemetry_lock_ms: 0.0,
+			framework_overhead_ms: 0.0,
 			upstream,
 		}
 	}
@@ -24159,6 +24317,8 @@ mod adr538_path_bound_validation {
 				task_id: 0,
 				wall_ms: 100.0,
 				components: vec![],
+				telemetry_lock_ms: 0.0,
+				framework_overhead_ms: 0.0,
 				upstream: vec![],
 			},
 			TimingAtlasTaskNode {
@@ -24166,6 +24326,8 @@ mod adr538_path_bound_validation {
 				task_id: 0,
 				wall_ms: 400.0,
 				components: vec![],
+				telemetry_lock_ms: 0.0,
+				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
 			},
 			// Concurrent sibling: never on the selected path.
@@ -24174,6 +24336,8 @@ mod adr538_path_bound_validation {
 				task_id: 1,
 				wall_ms: 200.0,
 				components: vec![],
+				telemetry_lock_ms: 0.0,
+				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
 			},
 		]
