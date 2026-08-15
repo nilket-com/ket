@@ -2775,6 +2775,7 @@ mod tests {
 		let violin_transform = CoordinateTransformer::new(&violin_layout, bounds);
 		let violin_kernel = ViolinPlotKernel {
 			prepared_data: Arc::clone(&violin_prepared),
+			category_colors: None,
 			x_label: "category".to_owned(),
 			y_label: "value".to_owned(),
 		};

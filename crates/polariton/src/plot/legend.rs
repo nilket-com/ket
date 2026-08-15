@@ -155,6 +155,7 @@ where
 	apply_policy(content)
 }
 
+#[allow(dead_code)] // Retained for fixed-position compatibility tests.
 pub fn entries_from_labels<I, S>(
 	labels: I,
 	settings: &ResolvedPlotSettings,
@@ -171,6 +172,7 @@ where
 	)
 }
 
+#[allow(dead_code)] // Retained for fixed-position compatibility tests.
 pub fn entries_from_labels_with_sample_and_provenance<I, S>(
 	labels: I,
 	settings: &ResolvedPlotSettings,

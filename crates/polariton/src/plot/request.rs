@@ -572,7 +572,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0079_histogram_keeps_a_nonempty_color_identity_unchanged() {
+	fn product_0079_histogram_keeps_a_continuous_color_identity_empty() {
 		let selection = CategoricalPaletteSelection::from_theme_name("viridis").unwrap();
 		let categorical = polars::df!(
 			"category" => ["a", "b"],
@@ -592,7 +592,7 @@ mod tests {
 			&ColorIdentity::default(),
 		)
 		.unwrap();
-		assert!(!identity.persistence_snapshot().assignments.is_empty());
+		assert!(identity.persistence_snapshot().assignments.is_empty());
 
 		let bins = polars::df!(
 			"bin_start" => [0.0, 2.0],
@@ -830,7 +830,7 @@ mod tests {
 			&ColorIdentity::default(),
 		)
 		.unwrap();
-		assert!(!identity.persistence_snapshot().assignments.is_empty());
+		assert!(identity.persistence_snapshot().assignments.is_empty());
 
 		let fixtures = [
 			(

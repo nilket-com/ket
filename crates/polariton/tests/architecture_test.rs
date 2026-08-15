@@ -197,7 +197,8 @@ fn product_0086_live_family_catalog_is_source_complete_and_renderer_free() {
 			"RADIAL_DIAL",
 			"PIE",
 			"RADAR",
-			"PARALLEL"
+			"PARALLEL",
+			"VIOLIN"
 		]
 	);
 	let all = family_impl
@@ -3982,7 +3983,7 @@ fn product_0105_variadic_multivariate_surface_has_one_transport_admission_and_co
 			.count(),
 		1
 	);
-	assert!(spec.contains("pub(crate) const ALL: [Self; 9]"));
+	assert!(spec.contains("pub(crate) const ALL: [Self; 10]"));
 	let authored_blocks = spec.matches("let authored_categories = matches!(").count();
 	assert_eq!(authored_blocks, 2);
 	for plot_type in ["PlotType::Radar", "PlotType::Parallel"] {
@@ -4085,4 +4086,58 @@ fn product_0106_vertical_guides_have_one_reservation_authority_and_no_measuremen
 	);
 	assert_eq!(radar_production.matches("let angle =").count(), 3);
 	assert!(!parallel.contains("VerticalGuideBands"));
+}
+
+#[test]
+fn product_0109_palette_kind_is_carried_and_continuous_allocation_is_stateless() {
+	let polariton = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let spec =
+		std::fs::read_to_string(polariton.join("src/plot/spec/mod.rs")).expect("read plot spec");
+	let theme = std::fs::read_to_string(polariton.join("../libaryon/src/engine/theme.rs"))
+		.expect("read libaryon theme catalogue");
+
+	let resolved_theme = theme
+		.split("pub struct Theme")
+		.nth(1)
+		.and_then(|rest| rest.split("impl Theme").next())
+		.expect("resolved theme payload");
+	assert!(resolved_theme.contains("family: ThemeFamily"));
+	let theme_impl = theme
+		.split("impl Theme")
+		.nth(1)
+		.and_then(|rest| rest.split("fn fill_gruvbox").next())
+		.expect("resolved theme implementation");
+	assert!(theme_impl.contains("pub const fn family(&self) -> ThemeFamily"));
+
+	let selection = spec
+		.split("pub struct CategoricalPaletteSelection")
+		.nth(1)
+		.and_then(|rest| {
+			rest.split("pub enum CategoricalPaletteSelectionError")
+				.next()
+		})
+		.expect("categorical palette selection");
+	assert!(selection.contains("allocation_kind: CategoricalAllocationKind"));
+	assert!(
+		selection
+			.contains("ThemeFamily::Continuous => CategoricalAllocationKind::ContinuousDerived")
+	);
+	assert!(selection.contains("ThemeFamily::Curated => CategoricalAllocationKind::Curated"));
+	assert!(!selection.contains("identity =="));
+
+	let resolver = spec
+		.split("fn resolve_explicit_positions(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn resolve_explicit_category_colors(").next())
+		.expect("categorical position resolver");
+	assert!(resolver.contains("CategoricalAllocationKind::ContinuousDerived"));
+	assert!(resolver.contains("clear_color_lineage(identity, &lineage)"));
+	assert!(resolver.contains("zip(evenly_spread_positions(categories.len(), selection.len()))"));
+	let clear = spec
+		.split("fn clear_color_lineage(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn resolve_explicit_positions(").next())
+		.expect("continuous lineage deletion");
+	assert!(clear.contains(".assignments"));
+	assert!(clear.contains("identity.spaces.remove(lineage)"));
 }

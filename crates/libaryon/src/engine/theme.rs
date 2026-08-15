@@ -444,6 +444,7 @@ pub struct Theme {
 	pub syntax_colors: [Option<Rgb>; CATEGORY_COUNT],
 	palette: ResolvedThemePalette,
 	categorical_palette: Option<ResolvedCategoricalPalette>,
+	family: ThemeFamily,
 }
 
 impl Theme {
@@ -453,6 +454,12 @@ impl Theme {
 
 	pub const fn categorical_palette(&self) -> Option<&ResolvedCategoricalPalette> {
 		self.categorical_palette.as_ref()
+	}
+
+	/// The catalogue family that produced this resolved theme. This remains true
+	/// after expression modifiers such as reverse, clips, and shifts are applied.
+	pub const fn family(&self) -> ThemeFamily {
+		self.family
 	}
 
 	pub fn try_new(name: &str) -> Result<Self, String> {
@@ -498,6 +505,7 @@ impl Theme {
 						shift,
 					)
 				}),
+				family: spec.family(),
 			});
 		}
 
@@ -537,6 +545,7 @@ impl Theme {
 			syntax_colors: colors,
 			palette: ResolvedThemePalette(sampled_colors),
 			categorical_palette: Some(categorical_palette),
+			family: spec.family(),
 		})
 	}
 
@@ -2131,6 +2140,19 @@ mod tests {
 					.categorical_palette()
 					.is_none()
 			);
+		}
+	}
+
+	#[test]
+	fn product_0109_resolved_theme_carries_catalog_family_through_modifiers() {
+		for expression in ["blues", "blues_rcs1", "gray", "dark2_s1"] {
+			let theme = Theme::try_new(expression).expect("catalogue theme expression");
+			let expected = if expression.starts_with("dark2") {
+				super::ThemeFamily::Curated
+			} else {
+				super::ThemeFamily::Continuous
+			};
+			assert_eq!(theme.family(), expected, "{expression}");
 		}
 	}
 

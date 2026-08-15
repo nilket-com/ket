@@ -151,3 +151,17 @@ same four delivered fields without recomputing a density or median.
 The `lonely` group is deliberate. It holds one observation, ADR 552 emits no
 rows for it, and the prepared relation must simply not carry it — absence is not
 a zero-density category.
+
+For a presentation-focused seven-cohort violin showcase, seed its separate
+fixture and open `test35.rn`:
+
+```sh
+nilket toron sql --file uat/violin_showcase.sql
+cargo run -p polariton -- uat/test35.rn
+```
+
+`test35.rn` keeps the same one-plan relation-side density/median composition as
+the canonical probe, but its seven healthy cohorts are shaped for legibility:
+compact bell, bimodal, two opposite tails, plateau, narrow peak, and an upper
+shoulder. It deliberately shares the density-width scale, so width communicates
+relative concentration rather than making every violin equally wide.

@@ -4,7 +4,7 @@ Status: proposed 2026-08-15, **redrafted the same day**. A first draft proposed 
 opt-in ordered mode with a Rune spelling. That was wrong: reading the allocator
 showed the ordered behaviour **already exists**, and only lineage retention
 overrides it. This record instead keys allocation on the **kind of palette named**
-— continuous-derived palettes recompute in current domain order and hold no
+— continuous-derived palettes recompute in the mark's visible category order and hold no
 durable assignments, curated categorical palettes keep separation-first
 durability.
 
@@ -15,18 +15,22 @@ No new Rune word, no author-facing mode, no opt-in trade.
 ### The allocator already increments; retention overrides it
 
 Bar and violin call the **same allocator**, and on a fresh lineage it assigns in
-domain order, evenly spread across the palette:
+the category sequence it receives, evenly spread across the palette:
 
 | categories | assigned positions (20-swatch ramp) |
 |---|---|
 | 4 | `0, 6, 13, 19` |
 | 7 | `0, 3, 6, 10, 13, 16, 19` |
 
-Both monotonic. That **is** "increment across the theme."
+Both monotonic. That **is** "increment across the theme" only if the allocator
+receives the sequence the mark will show.
 
-The shuffled seven-cohort violin in `uat/test35.rn` can only come from **retained
-`ColorIdentity` assignments**: once a lineage exists, a new category fills the
-most-separated vacant position so prior categories keep their colours.
+The first `uat/test35.rn` repair exposed a second cause of a shuffled violin:
+the categorical resolver preserved the post-join physical row order, while
+PRODUCT-0107/0108's density collection renders group labels lexically. The
+allocator walked the ramp correctly in an invisible order and the kernel showed
+those assignments in another. Retained `ColorIdentity` assignments are one
+possible cause of disorder; mismatched category authorities are another.
 
 ### The screenshots were evidence of state, not of policy
 
@@ -60,10 +64,10 @@ needs authoring.
 
 | palette kind | fresh allocation | continued allocation | durable assignments |
 |---|---|---|---|
-| **continuous-derived** (`blues`, `reds`, `greys`) | even, in domain order | **recomputed** — always fresh | **none** |
-| **curated categorical** (`dark2`, `tab20`) | even, in domain order | **maximin into vacant positions**, preserving prior categories | **retained** |
+| **continuous-derived** (`blues`, `reds`, `greys`) | even, in visible category order | **recomputed** — always fresh | **none** |
+| **curated categorical** (`dark2`, `tab20`) | even, in visible category order | **maximin into vacant positions**, preserving prior categories | **retained** |
 
-**Fresh allocation is identical for both kinds** — even, in domain order. An
+**Fresh allocation is identical for both kinds** — even, in visible category order. An
 earlier draft described curated as "separation-first," which overstates: maximin
 applies only when *adding to a retained lineage*. The distinction this record
 makes is entirely about **continuation**, and the promise that fresh behaviour is
@@ -94,7 +98,7 @@ aliases such as `greys`/`grays`.
 ### 3. Continuous-derived figures recolour on membership change, inherently
 
 Drop a category and later ones shift. This is not a trade an author opts into —
-it follows from §1: if allocation is a function of the current domain, a changed
+it follows from §1: if allocation is a function of the current visible category domain, a changed
 domain changes the allocation.
 
 Stated so it is not later mistaken for a regression.
@@ -103,8 +107,8 @@ Stated so it is not later mistaken for a regression.
 
 | switch | behaviour |
 |---|---|
-| curated → continuous | **discard** that lineage's persisted assignments; recompute from current domain order |
-| continuous → curated | begin a **fresh** durable allocation from the current domain |
+| curated → continuous | **discard** that lineage's persisted assignments; recompute from current visible category order |
+| continuous → curated | begin a **fresh** durable allocation from the current visible category order |
 
 **Never retain inactive assignments beside a recomputing resolver.**
 
@@ -128,15 +132,16 @@ would have asked authors to declare something the theme already declares.
 
 ### 6. What this record does not do
 
-No change to the allocator's *fresh-lineage* behaviour — it already increments.
+No change to the allocator's *fresh-lineage* spacing — it already increments.
 No new palettes or theme kinds. No change to PRODUCT-0086's family tokens: a
 continuous-derived figure still has a lineage and still allocates a family, it
-simply persists no assignments. No mark-specific behaviour — this applies
-wherever `palette(...)` does, which is why bar and violin stop differing.
+simply persists no assignments. Each mark provides its declared display sequence
+before allocation; violin supplies its PRODUCT-0108 lexical group order instead
+of a relation join's incidental row order.
 
 ## Acceptance gates
 
-1. **A fresh continuous-derived figure increments.** Seven cohorts on `blues`
+1. **A fresh continuous-derived figure increments in visible order.** Seven cohorts on `blues`
    render `0, 3, 6, 10, 13, 16, 19` — monotonic, matching the allocator's existing
    fresh-lineage behaviour.
 2. **An established continuous-derived lineage still increments.** The
@@ -176,6 +181,11 @@ wherever `palette(...)` does, which is why bar and violin stop differing.
     string match would classify wrongly.
 12. **Family tokens are unaffected.** A continuous-derived figure still allocates a
     `AuthoredFamilyId`; only its assignments are absent.
+13. **A scrambled violin relation still walks its visible lexical order.** Given
+    post-join rows in `Ember, Fjord, Cascade, Grove, Aurora, Drift, Boreal`,
+    `yellows` assigns `Aurora … Grove` positions `0, 3, 6, 10, 13, 16, 19`.
+    This distinguishes the mark's category authority from the relation's
+    incidental row order.
 
 ## Stop conditions
 
@@ -221,11 +231,13 @@ changes, both plausible on screen.
 ## Consequences
 
 Bar and violin stop disagreeing, and the fix is a deletion rather than a feature —
-continuous-derived palettes stop retaining what they should recompute.
+continuous-derived palettes stop retaining what they should recompute. Violin
+also now allocates from the category order it renders, not whichever order an
+upstream join happened to emit.
 
 The record's own first draft is the useful artifact here. It proposed a mode,
 because the screenshots showed shuffled colours and a mode would have produced
-ordered ones. The behaviour was already correct on a fresh lineage, and only
-reading the allocator revealed it. **A figure can show a true fact and support a
+ordered ones. The behaviour was already correct on a fresh lineage only when its
+domain and display order agreed. **A figure can show a true fact and support a
 false inference**, and this arc's habit of trusting figures is exactly what made
 that trap available.

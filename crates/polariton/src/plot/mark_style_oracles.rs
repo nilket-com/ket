@@ -166,6 +166,7 @@ fn product_0080_0082_0083_default_operation_bank_tracks_the_box_role_split() {
 			])
 			.expect("valid violin density fixture"),
 		),
+		category_colors: None,
 		x_label: String::new(),
 		y_label: String::new(),
 	};

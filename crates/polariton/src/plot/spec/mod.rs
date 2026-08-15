@@ -18,7 +18,7 @@ pub use multivariate_fields::MultivariateFields;
 use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use libaryon::core::Rgb;
-use libaryon::engine::{ResolvedCategoricalPalette, Theme};
+use libaryon::engine::{ResolvedCategoricalPalette, Theme, ThemeFamily};
 use polars::prelude::{AnyValue, DataType, Schema};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -1047,10 +1047,11 @@ impl AuthoredFamilyId {
 	pub(crate) const PIE: Self = Self(Cow::Borrowed("pie"));
 	pub(crate) const RADAR: Self = Self(Cow::Borrowed("radar"));
 	pub(crate) const PARALLEL: Self = Self(Cow::Borrowed("parallel"));
+	pub(crate) const VIOLIN: Self = Self(Cow::Borrowed("violin"));
 
 	/// Exhaustive catalog of identifiers this binary can originate from authored
 	/// source. It is intentionally narrower than the checked persistence grammar.
-	pub(crate) const ALL: [Self; 9] = [
+	pub(crate) const ALL: [Self; 10] = [
 		Self::SCATTER,
 		Self::BAR,
 		Self::LINE,
@@ -1060,6 +1061,7 @@ impl AuthoredFamilyId {
 		Self::PIE,
 		Self::RADAR,
 		Self::PARALLEL,
+		Self::VIOLIN,
 	];
 
 	pub(crate) fn parse(value: String) -> Result<Self, String> {
@@ -1100,6 +1102,7 @@ impl ColorLayerIdentity {
 			PlotType::Pie => AuthoredFamilyId::PIE,
 			PlotType::Radar => AuthoredFamilyId::RADAR,
 			PlotType::Parallel => AuthoredFamilyId::PARALLEL,
+			PlotType::Violin => AuthoredFamilyId::VIOLIN,
 			PlotType::StackedBar | PlotType::HorizontalStackedBar => unreachable!(
 				"PRODUCT-0064 requires stacked bar colour lineage to retain authored Bar identity"
 			),
@@ -1256,6 +1259,16 @@ pub struct BandFillAssignment {
 pub struct CategoricalPaletteSelection {
 	identity: String,
 	palette: ResolvedCategoricalPalette,
+	allocation_kind: CategoricalAllocationKind,
+}
+
+/// The categorical allocation semantics carried by libaryon's theme catalogue.
+/// The selection has already refused curated themes without a categorical
+/// palette, so `Curated` here means a curated categorical palette specifically.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CategoricalAllocationKind {
+	ContinuousDerived,
+	Curated,
 }
 
 impl CategoricalPaletteSelection {
@@ -1274,6 +1287,10 @@ impl CategoricalPaletteSelection {
 		Ok(Self {
 			identity: identity.to_owned(),
 			palette,
+			allocation_kind: match theme.family() {
+				ThemeFamily::Continuous => CategoricalAllocationKind::ContinuousDerived,
+				ThemeFamily::Curated => CategoricalAllocationKind::Curated,
+			},
 		})
 	}
 
@@ -1283,6 +1300,10 @@ impl CategoricalPaletteSelection {
 
 	pub fn len(&self) -> usize {
 		self.palette.len()
+	}
+
+	pub const fn allocation_kind(&self) -> CategoricalAllocationKind {
+		self.allocation_kind
 	}
 
 	fn color(&self, position: PalettePosition) -> ResolvedColor {
@@ -2654,7 +2675,7 @@ fn resolve_violin_channels(
 		}),
 		color_job: None,
 		continuous_anchor: spec.continuous_anchor,
-		categorical_limit: 0,
+		categorical_limit: DEFAULT_CATEGORICAL_LIMIT,
 		stack_normalization: StackNormalization::Absolute,
 	})
 }
@@ -2974,7 +2995,8 @@ pub fn resolve_domains(
 			field: channel.field.clone(),
 			reason: error.to_string(),
 		})?;
-		let domain = resolve_domain(column, &channel)?;
+		let domain =
+			resolve_plot_domain(binding.composition.primary_plot_type(), column, &channel)?;
 		let authored_categories = matches!(
 			binding.composition.primary_plot_type(),
 			PlotType::Funnel
@@ -2982,6 +3004,7 @@ pub fn resolve_domains(
 				| PlotType::Pie
 				| PlotType::Radar
 				| PlotType::Parallel
+				| PlotType::Violin
 		) && channel.channel == Channel::X;
 		let colors = if (channel.channel == Channel::Color
 			&& color_job == Some(ColorJob::Categorical))
@@ -3063,8 +3086,8 @@ pub fn resolve_domains_with_categorical_palette(
 				reason: error.to_string(),
 			})
 		})?;
-		let domain =
-			resolve_domain(column, &channel).map_err(CategoricalResolutionError::Domain)?;
+		let domain = resolve_plot_domain(binding.composition.primary_plot_type(), column, &channel)
+			.map_err(CategoricalResolutionError::Domain)?;
 		let authored_categories = matches!(
 			binding.composition.primary_plot_type(),
 			PlotType::Funnel
@@ -3072,6 +3095,7 @@ pub fn resolve_domains_with_categorical_palette(
 				| PlotType::Pie
 				| PlotType::Radar
 				| PlotType::Parallel
+				| PlotType::Violin
 		) && channel.channel == Channel::X;
 		let colors = if (channel.channel == Channel::Color
 			&& color_job == Some(ColorJob::Categorical))
@@ -3675,6 +3699,24 @@ fn resolve_domain(
 	}
 }
 
+/// Resolve categorical values in the sequence the mark declares it will render.
+/// Most marks preserve first-seen relation order. PRODUCT-0107/0108 establish
+/// lexical group order for violin, so assigning a continuous ramp from a
+/// post-join physical row order would make the displayed ramp appear shuffled.
+fn resolve_plot_domain(
+	plot_type: PlotType,
+	column: &polars::prelude::Column,
+	channel: &BoundChannel,
+) -> Result<ScaleDomain, DomainError> {
+	let mut domain = resolve_domain(column, channel)?;
+	if plot_type == PlotType::Violin && channel.channel == Channel::X {
+		if let ScaleDomain::Categorical(categories) = &mut domain {
+			categories.sort_unstable();
+		}
+	}
+	Ok(domain)
+}
+
 fn category_value(value: AnyValue<'_>) -> Option<String> {
 	match value {
 		AnyValue::Null => None,
@@ -3758,6 +3800,16 @@ fn assign_fresh_positions(
 	}
 }
 
+/// Continuous-derived palettes are a function of the present categorical
+/// domain. Remove every persisted fact for this field/layer before deriving the
+/// ordered positions, so continuation cannot compete with the palette's order.
+fn clear_color_lineage(identity: &mut ColorIdentity, lineage: &ColorLineageKey) {
+	identity
+		.assignments
+		.retain(|key, _| key.field != lineage.field || key.layer != lineage.layer);
+	identity.spaces.remove(lineage);
+}
+
 fn resolve_explicit_positions(
 	categories: &[String],
 	channel: &BoundChannel,
@@ -3771,6 +3823,33 @@ fn resolve_explicit_positions(
 		field: channel.field.clone(),
 		layer: color_layer.clone(),
 	};
+	if selection.allocation_kind() == CategoricalAllocationKind::ContinuousDerived {
+		clear_color_lineage(identity, &lineage);
+		let geometry_exceeded = categories.len() > geometry_limit;
+		let palette_exceeded = categories.len() > selection.len();
+		if geometry_exceeded || palette_exceeded {
+			return Err(CategoricalResolutionError::Capacity(
+				CategoricalCapacityFailure {
+					channel: channel.channel,
+					field: channel.field.clone(),
+					layer: channel.layer.clone(),
+					role,
+					retained: 0,
+					requested: categories.len(),
+					geometry_limit,
+					palette_identity: selection.identity.clone(),
+					palette_limit: selection.len(),
+					geometry_exceeded,
+					palette_exceeded,
+				},
+			));
+		}
+		return Ok(categories
+			.iter()
+			.cloned()
+			.zip(evenly_spread_positions(categories.len(), selection.len()))
+			.collect());
+	}
 	let selected_space = ColorAllocationSpace::CategoricalPalette {
 		len: selection.len(),
 	};
@@ -5215,6 +5294,7 @@ mod tests {
 				"pie",
 				"radar",
 				"parallel",
+				"violin",
 			]
 		);
 		assert_eq!(
@@ -5287,19 +5367,11 @@ mod tests {
 				.unwrap_or("non-string panic");
 			assert!(message.contains("PRODUCT-0064"), "{message}");
 		}
-		let unregistered = std::panic::catch_unwind(|| {
-			ColorLayerIdentity::from_authored_layer(&LayerIdentity {
-				ordinal: 0,
-				plot_type: PlotType::Violin,
-			})
-		})
-		.expect_err("unregistered authored family must expose the missing conversion");
-		let message = unregistered
-			.downcast_ref::<&str>()
-			.copied()
-			.or_else(|| unregistered.downcast_ref::<String>().map(String::as_str))
-			.unwrap_or("non-string panic");
-		assert!(message.contains("no live authored categorical-family conversion"));
+		let violin = ColorLayerIdentity::from_authored_layer(&LayerIdentity {
+			ordinal: 0,
+			plot_type: PlotType::Violin,
+		});
+		assert_eq!(violin.family, AuthoredFamilyId::VIOLIN);
 	}
 
 	fn resolve_explicit(
@@ -5508,6 +5580,182 @@ mod tests {
 				.map(|(_, position, _)| position)
 				.collect::<Vec<_>>(),
 			[0, 10, 19]
+		);
+	}
+
+	#[test]
+	fn product_0109_continuous_palettes_recompute_and_leave_no_durable_lineage() {
+		let spec = legacy_category_spec();
+		let initial = ["A", "B", "C", "D", "E", "F", "G"]
+			.into_iter()
+			.map(str::to_owned)
+			.collect::<Vec<_>>();
+		let (_, established) = resolve_explicit(
+			&spec,
+			&legacy_category_frame(&initial),
+			&ColorIdentity::default(),
+			"tab20c",
+		)
+		.expect("curated control establishes durable assignments");
+		assert!(!established.is_empty());
+
+		let current = ["A", "C", "D", "F", "G"]
+			.into_iter()
+			.map(str::to_owned)
+			.collect::<Vec<_>>();
+		let (resolved, next) = resolve_explicit(
+			&spec,
+			&legacy_category_frame(&current),
+			&established,
+			"blues_r",
+		)
+		.expect("continuous palette replaces the curated lineage");
+		assert_eq!(
+			position_color_mapping(&resolved)
+				.into_iter()
+				.map(|(category, position, _)| (category, position))
+				.collect::<Vec<_>>(),
+			[("A", 0), ("C", 5), ("D", 10), ("F", 14), ("G", 19)]
+				.into_iter()
+				.map(|(category, position)| (category.to_owned(), position))
+				.collect::<Vec<_>>()
+		);
+		assert!(
+			next.is_empty(),
+			"continuous allocation stores no assignments"
+		);
+		let snapshot = next.persistence_snapshot();
+		assert!(snapshot.assignments.is_empty());
+		assert!(snapshot.spaces.is_empty());
+	}
+
+	#[test]
+	fn product_0109_violin_allocates_continuous_swatches_in_its_visible_lexical_order() {
+		// A relation-side join need not preserve Toron's key order. PRODUCT-0108
+		// nevertheless renders violin groups lexically, so palette allocation must
+		// consume that sequence rather than this physical row order.
+		let frame = df!(
+			"group" => ["Ember", "Fjord", "Cascade", "Grove", "Aurora", "Drift", "Boreal"],
+			"evaluation_value" => [1.0_f64; 7],
+			"density" => [0.2_f64; 7],
+			"median" => [1.0_f64; 7],
+		)
+		.expect("scrambled violin group fixture");
+		let result = stamped(frame);
+		let fields = ViolinFields {
+			group: "group".to_owned(),
+			evaluation_value: "evaluation_value".to_owned(),
+			density: "density".to_owned(),
+			median: "median".to_owned(),
+		};
+		let binding = resolve_channels(
+			&AuthoredPlotSpec::violin(fields),
+			result
+				.data
+				.projection()
+				.expect("fixture projection")
+				.schema()
+				.as_ref(),
+		)
+		.expect("violin density relation binds");
+		let selection = CategoricalPaletteSelection::from_theme_name("yellows")
+			.expect("continuous categorical palette");
+		let (resolved, identity) = resolve_domains_with_categorical_palette(
+			binding,
+			&result,
+			&ColorIdentity::default(),
+			&selection,
+		)
+		.expect("continuous violin palette resolves");
+		assert_eq!(
+			resolved
+				.channel(Channel::X)
+				.expect("violin group channel")
+				.colors
+				.iter()
+				.map(|assignment| (assignment.category.as_str(), assignment.position.index()))
+				.collect::<Vec<_>>(),
+			[
+				("Aurora", 0),
+				("Boreal", 3),
+				("Cascade", 6),
+				("Drift", 10),
+				("Ember", 13),
+				("Fjord", 16),
+				("Grove", 19),
+			],
+			"the visible lexical order, not physical join order, owns ramp position"
+		);
+		assert!(
+			identity.is_empty(),
+			"continuous allocation retains no lineage"
+		);
+	}
+
+	#[test]
+	fn product_0109_curated_continuation_survives_while_continuous_to_curated_is_fresh() {
+		let spec = legacy_category_spec();
+		let initial = ["A", "B"]
+			.into_iter()
+			.map(str::to_owned)
+			.collect::<Vec<_>>();
+		let (first, curated) = resolve_explicit(
+			&spec,
+			&legacy_category_frame(&initial),
+			&ColorIdentity::default(),
+			"dark2",
+		)
+		.expect("curated initial allocation");
+		let a_before = position_color_mapping(&first)[0].1;
+		let changed = ["A", "C"]
+			.into_iter()
+			.map(str::to_owned)
+			.collect::<Vec<_>>();
+		let (continued, curated) =
+			resolve_explicit(&spec, &legacy_category_frame(&changed), &curated, "dark2")
+				.expect("curated continuation");
+		assert_eq!(position_color_mapping(&continued)[0].1, a_before);
+
+		let (_, continuous) =
+			resolve_explicit(&spec, &legacy_category_frame(&changed), &curated, "blues")
+				.expect("switch to continuous");
+		assert!(continuous.is_empty());
+		let (fresh_curated, restored) = resolve_explicit(
+			&spec,
+			&legacy_category_frame(&changed),
+			&continuous,
+			"dark2",
+		)
+		.expect("switching back starts a fresh curated lineage");
+		assert_eq!(
+			position_color_mapping(&fresh_curated)
+				.into_iter()
+				.map(|(_, position, _)| position)
+				.collect::<Vec<_>>(),
+			[0, 7]
+		);
+		assert!(!restored.is_empty());
+	}
+
+	#[test]
+	fn product_0109_selection_carries_theme_kind_without_identity_matching() {
+		assert_eq!(
+			CategoricalPaletteSelection::from_theme_name("blues_r")
+				.expect("modified continuous palette")
+				.allocation_kind(),
+			CategoricalAllocationKind::ContinuousDerived
+		);
+		assert_eq!(
+			CategoricalPaletteSelection::from_theme_name("gray")
+				.expect("continuous alias")
+				.allocation_kind(),
+			CategoricalAllocationKind::ContinuousDerived
+		);
+		assert_eq!(
+			CategoricalPaletteSelection::from_theme_name("dark2_s1")
+				.expect("modified curated palette")
+				.allocation_kind(),
+			CategoricalAllocationKind::Curated
 		);
 	}
 

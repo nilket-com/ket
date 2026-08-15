@@ -1,0 +1,34 @@
+// Presentation-focused violin showcase.
+//
+// The density and median remain relation-side and share one invocation: this
+// is the same ADR 552 composition as test34, with seven healthy cohorts chosen
+// for distinct, readable violin shapes rather than substrate edge cases.
+let density = workspace
+	.table("violin_showcase")
+	.kernel_density(col("cohort"), col("value"), 128)
+	.alias("d");
+
+let medians = workspace
+	.table("violin_showcase")
+	.aggregate([col("cohort")], [approx_quantile(col("value"), 0.5)])
+	.alias("m");
+
+let prepared = density
+	.join(medians, qcol("d", "group").eq(qcol("m", "cohort")))
+	.project_named([
+		qcol("d", "group").named("group"),
+		qcol("d", "evaluation_value").named("evaluation_value"),
+		qcol("d", "density").named("density"),
+		qcol("m", "quantile").named("median"),
+	]);
+
+prepared.views([
+	view("violin-showcase", figure([
+		title("Distribution showcase · seven cohorts"),
+		subtitle("Relation-side density and medians · one shared concentration scale"),
+		skin("greys_rs2"),
+		palette("yellows"),
+		y_bounds(20, 80),
+		violin("group", "evaluation_value", "density", "median"),
+	])),
+]);

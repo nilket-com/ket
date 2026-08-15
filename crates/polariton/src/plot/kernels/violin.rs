@@ -7,6 +7,7 @@ use crate::plot::kernels::violin_density::{
 	ViolinDensity, ViolinDensityCell, ViolinDensityError, ViolinDensityInputRow,
 	ViolinWidthNormalization,
 };
+use crate::plot::spec::CategoryColorAssignment;
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
 use iced::{Color, Rectangle};
@@ -18,8 +19,41 @@ use std::sync::Arc;
 /// this kernel sees a row (PRODUCT-0108 §7).
 pub struct ViolinPlotKernel {
 	pub prepared_data: Arc<ViolinDensity>,
+	/// Authored violins carry one resolved assignment per group. `None` is kept
+	/// only for direct legacy/test construction; production violin is authored.
+	pub category_colors: Option<Vec<CategoryColorAssignment>>,
 	pub x_label: String,
 	pub y_label: String,
+}
+
+impl ViolinPlotKernel {
+	fn curve_color(&self, index: usize, settings: &ResolvedPlotSettings) -> Color {
+		if let Some(assignments) = &self.category_colors {
+			let category = self
+				.prepared_data
+				.curves()
+				.nth(index)
+				.expect("PRODUCT-0108 rendered violin index is a curve")
+				.label();
+			let assignment = assignments
+				.iter()
+				.find(|assignment| assignment.category == category)
+				.expect("PRODUCT-0108 authored violin groups have complete colour assignments");
+			return Color::from_rgba8(
+				assignment.color.red,
+				assignment.color.green,
+				assignment.color.blue,
+				assignment.color.alpha as f32 / u8::MAX as f32,
+			);
+		}
+		let total = self.prepared_data.curves().count();
+		let position = if total > 1 {
+			index as f32 / (total - 1) as f32
+		} else {
+			0.5
+		};
+		settings.color_theme.get_color(position)
+	}
 }
 
 impl PlotKernel for ViolinPlotKernel {
@@ -71,12 +105,7 @@ impl PlotKernel for ViolinPlotKernel {
 			};
 			let (_, band_width) = transform.categorical(shared_index, 0.0);
 			let width_scale = band_width * 0.4;
-			let t = if curves.len() > 1 {
-				index as f32 / (curves.len() - 1) as f32
-			} else {
-				0.5
-			};
-			let color = settings.color_theme.get_color(t);
+			let color = self.curve_color(index, &settings);
 			let violin_path = |builder: &mut dyn PathBuilder| {
 				for point in first..=last {
 					let (position, _) = transform.categorical(shared_index, grid[point]);
@@ -148,11 +177,15 @@ impl PlotKernel for ViolinPlotKernel {
 		&self,
 		settings: &ResolvedPlotSettings,
 	) -> Option<crate::plot::legend::LegendContent> {
-		crate::plot::legend::entries_from_labels(
+		crate::plot::legend::entries_from_pairs_with_sample_and_provenance(
 			self.prepared_data
 				.curves()
-				.map(|curve| curve.label().to_owned()),
-			settings,
+				.enumerate()
+				.map(|(index, curve)| {
+					(curve.label().to_owned(), self.curve_color(index, settings))
+				}),
+			crate::plot::legend::LegendSample::Swatch,
+			crate::plot::legend::LegendProvenance::Named,
 		)
 	}
 
@@ -242,5 +275,72 @@ fn numeric_cell(value: AnyValue<'_>) -> ViolinDensityCell {
 		Ok(value) => ViolinDensityCell::Exact(value),
 		Err(ExactF64Error::Null) => ViolinDensityCell::Null,
 		Err(ExactF64Error::Inexact) => ViolinDensityCell::Inexact(original),
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use crate::plot::legend::LegendSection;
+	use crate::plot::spec::{PalettePosition, ResolvedColor};
+
+	fn row(group: &str, evaluation_value: f64, density: f64, median: f64) -> ViolinDensityInputRow {
+		ViolinDensityInputRow {
+			group: Some(group.to_owned()),
+			evaluation_value: ViolinDensityCell::Exact(evaluation_value),
+			density: ViolinDensityCell::Exact(density),
+			median: ViolinDensityCell::Exact(median),
+		}
+	}
+
+	fn assignment(group: &str, index: usize, rgb: (u8, u8, u8)) -> CategoryColorAssignment {
+		CategoryColorAssignment {
+			category: group.to_owned(),
+			position: PalettePosition::new(index, 2).expect("two-color palette position"),
+			color: ResolvedColor {
+				red: rgb.0,
+				green: rgb.1,
+				blue: rgb.2,
+				alpha: u8::MAX,
+			},
+		}
+	}
+
+	#[test]
+	fn product_0108_authored_palette_is_the_one_violin_and_legend_authority() {
+		let kernel = ViolinPlotKernel {
+			prepared_data: Arc::new(
+				ViolinDensity::from_rows(vec![
+					row("Aurora", 0.0, 0.2, 0.5),
+					row("Aurora", 1.0, 0.2, 0.5),
+					row("Boreal", 0.0, 0.2, 0.5),
+					row("Boreal", 1.0, 0.2, 0.5),
+				])
+				.expect("shared-grid violin fixture"),
+			),
+			category_colors: Some(vec![
+				assignment("Aurora", 0, (229, 57, 53)),
+				assignment("Boreal", 1, (30, 136, 229)),
+			]),
+			x_label: "group".to_owned(),
+			y_label: "value".to_owned(),
+		};
+		let settings = ResolvedPlotSettings::default();
+		let aurora = Color::from_rgb8(229, 57, 53);
+		let boreal = Color::from_rgb8(30, 136, 229);
+
+		assert_eq!(kernel.curve_color(0, &settings), aurora);
+		assert_eq!(kernel.curve_color(1, &settings), boreal);
+
+		let content = kernel
+			.legend_content(&settings)
+			.expect("named groups earn a legend");
+		let LegendSection::Entries(entries) = content.sections().next().expect("entry section")
+		else {
+			panic!("violin legend is categorical entries");
+		};
+		assert_eq!(entries.first().label, "Aurora");
+		assert_eq!(entries.first().swatch, aurora);
+		assert_eq!(entries.iter().nth(1).expect("second entry").swatch, boreal);
 	}
 }

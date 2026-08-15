@@ -52,6 +52,9 @@ pub fn create_plot(
 					.expect("PRODUCT-0108 planning validated this violin density relation");
 			Arc::new(ViolinPlotKernel {
 				prepared_data: Arc::new(prepared),
+				category_colors: spec
+					.channel(Channel::X)
+					.map(|channel| channel.colors.clone()),
 				x_label: group.clone(),
 				y_label: evaluation_value.clone(),
 			})

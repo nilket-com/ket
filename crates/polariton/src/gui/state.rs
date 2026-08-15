@@ -9620,18 +9620,26 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		);
 		assert_eq!(band_mapping(&returned[0].1)[0].1, 19);
 
-		for (revision, palette, expected_colors) in [
+		for (revision, palette, expected) in [
 			(
 				6,
 				"tab20c_r",
-				[(150, 150, 150), (49, 130, 189), (161, 217, 155)],
+				[
+					(0, (150, 150, 150)),
+					(19, (49, 130, 189)),
+					(9, (161, 217, 155)),
+				],
 			),
 			(
 				7,
 				"tab20c_s1",
-				[(150, 150, 150), (63, 0, 125), (49, 163, 84)],
+				[(0, (150, 150, 150)), (19, (63, 0, 125)), (9, (49, 163, 84))],
 			),
-			(8, "viridis", [(68, 1, 83), (253, 231, 36), (35, 138, 140)]),
+			(
+				8,
+				"viridis",
+				[(0, (68, 1, 83)), (10, (39, 151, 136)), (19, (253, 231, 36))],
+			),
 		] {
 			let plots = run_one_relation_program(
 				&mut state,
@@ -9643,9 +9651,9 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			assert_eq!(
 				band_mapping(&plots[0].1),
 				[
-					("A".to_owned(), 0, expected_colors[0]),
-					("B".to_owned(), 19, expected_colors[1]),
-					("C".to_owned(), 9, expected_colors[2]),
+					("A".to_owned(), expected[0].0, expected[0].1),
+					("B".to_owned(), expected[1].0, expected[1].1),
+					("C".to_owned(), expected[2].0, expected[2].1),
 				]
 			);
 		}
@@ -9691,8 +9699,8 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				.collect::<Vec<_>>(),
 			[
 				("A".to_owned(), 0),
-				("B".to_owned(), 19),
-				("C".to_owned(), 9)
+				("B".to_owned(), 10),
+				("C".to_owned(), 19)
 			]
 		);
 
@@ -9788,9 +9796,9 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				.collect::<Vec<_>>(),
 			[
 				("A".to_owned(), 0),
-				("B".to_owned(), 19),
-				("C".to_owned(), 9),
-				("E".to_owned(), 14),
+				("B".to_owned(), 10),
+				("C".to_owned(), 19),
+				("E".to_owned(), 5),
 			]
 		);
 		state.code_editor.shutdown();
@@ -10358,10 +10366,8 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				if stage == "stage" && value == "value"
 		));
 		let snapshot = continuation.identity.persistence_snapshot();
-		assert_eq!(snapshot.assignments.len(), 3);
-		assert!(snapshot.assignments.iter().all(|assignment| {
-			assignment.field == "stage" && assignment.layer.family.as_str() == "funnel"
-		}));
+		assert!(snapshot.assignments.is_empty());
+		assert!(snapshot.spaces.is_empty());
 		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 600, 400);
 		assert_eq!(
 			kernel
@@ -10458,10 +10464,8 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			} if (label.as_str(), value.as_str(), maximum.as_str()) == ("label", "value", "maximum")
 		));
 		let snapshot = continuation.identity.persistence_snapshot();
-		assert_eq!(snapshot.assignments.len(), 2);
-		assert!(snapshot.assignments.iter().all(|assignment| {
-			assignment.field == "label" && assignment.layer.family.as_str() == "radial_dial"
-		}));
+		assert!(snapshot.assignments.is_empty());
+		assert!(snapshot.spaces.is_empty());
 
 		let assert_span = |source: &str, frame: DataFrame, expected: &str, fragment: &str| {
 			let outcome = complete(source, frame);
@@ -10617,10 +10621,8 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				if category == "category" && value == "value"
 		));
 		let snapshot = continuation.identity.persistence_snapshot();
-		assert_eq!(snapshot.assignments.len(), 2);
-		assert!(snapshot.assignments.iter().all(|assignment| {
-			assignment.field == "category" && assignment.layer.family.as_str() == "pie"
-		}));
+		assert!(snapshot.assignments.is_empty());
+		assert!(snapshot.spaces.is_empty());
 
 		let assert_span = |frame: DataFrame, expected: &str, fragment: &str| {
 			let outcome = complete(frame);
@@ -10686,10 +10688,8 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				if dimensions == &["a", "b", "c"] && category.as_deref() == Some("group")
 		));
 		let snapshot = continuation.identity.persistence_snapshot();
-		assert_eq!(snapshot.assignments.len(), 2);
-		assert!(snapshot.assignments.iter().all(|assignment| {
-			assignment.field == "group" && assignment.layer.family.as_str() == "radar"
-		}));
+		assert!(snapshot.assignments.is_empty());
+		assert!(snapshot.spaces.is_empty());
 
 		for (frame, expected, fragment) in [
 			(
