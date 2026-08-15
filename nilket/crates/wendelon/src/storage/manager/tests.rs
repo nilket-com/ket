@@ -11675,3 +11675,189 @@ async fn backfill_candidacy_survives_failures_until_the_budget_spends() {
 			.is_err()
 	);
 }
+
+async fn repair_fixture_manager(dir: &std::path::Path, io: IoRingHandle) -> Arc<SlabManager> {
+	Arc::new(
+		SlabManager::open(SlabManagerConfig {
+			dir: dir.to_path_buf(),
+			max_slab_bytes: 1,
+			io,
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
+	)
+}
+
+fn slab_files_on_disk(dir: &std::path::Path) -> Vec<(SlabId, u64)> {
+	let mut found = std::fs::read_dir(dir)
+		.unwrap()
+		.filter_map(Result::ok)
+		.filter_map(|entry| {
+			let slab_id = parse_slab_filename(&entry.file_name().to_string_lossy())?;
+			Some((slab_id, std::fs::metadata(entry.path()).unwrap().len()))
+		})
+		.collect::<Vec<_>>();
+	found.sort_unstable();
+	found
+}
+
+#[tokio::test]
+async fn adr0084_repair_preserves_a_zero_length_active_slab() {
+	let dir = fresh_dir("repair-active");
+	let io = spawn_io_thread(16).unwrap();
+	let manager = repair_fixture_manager(&dir, io.clone()).await;
+	for n in 0..4 {
+		manager
+			.append(tenant(), id(0x9000 + n), hlc(n + 1), b"row")
+			.await
+			.unwrap();
+	}
+	// Seal so the active slab is a fresh, empty file — the state an affected
+	// profile is left in, and the one `split_last` will promote on next open.
+	manager.force_seal_active_for_test().await;
+	let active_id = manager.active_slab_id().await;
+	drop(manager);
+
+	let active_path = slab_path(&dir, active_id);
+	assert_eq!(
+		std::fs::metadata(&active_path).unwrap().len(),
+		0,
+		"the fixture needs an empty active slab for this control to mean anything"
+	);
+
+	let report = SlabManager::repair_empty_slabs(&dir, io.clone())
+		.await
+		.expect("repair runs against a profile with a durable index");
+
+	assert_eq!(report.preserved_active, Some(active_id));
+	assert!(!report.removed.contains(&active_id));
+	assert!(
+		active_path.exists(),
+		"split_last promotes the highest id to active, so an empty highest slab must survive"
+	);
+
+	let reopened = repair_fixture_manager(&dir, io).await;
+	assert!(
+		reopened.lookup(tenant(), id(0x9000)).is_some(),
+		"a repaired profile still opens and keeps its rows"
+	);
+}
+
+#[tokio::test]
+async fn adr0084_repair_refuses_an_empty_slab_the_index_still_references() {
+	let dir = fresh_dir("repair-referenced");
+	let io = spawn_io_thread(16).unwrap();
+	let manager = repair_fixture_manager(&dir, io.clone()).await;
+	for n in 0..4 {
+		manager
+			.append(tenant(), id(0xa000 + n), hlc(n + 1), b"row")
+			.await
+			.unwrap();
+	}
+	let active_id = manager.active_slab_id().await;
+	drop(manager);
+
+	// Truncate a sealed slab that carries data. That is exactly the shape the
+	// repair must decline: zero length on disk, but still named by the index.
+	let victim = slab_files_on_disk(&dir)
+		.into_iter()
+		.find(|(slab_id, len)| *slab_id != active_id && *len > 0)
+		.expect("a sealed slab with data")
+		.0;
+	std::fs::OpenOptions::new()
+		.write(true)
+		.open(slab_path(&dir, victim))
+		.unwrap()
+		.set_len(0)
+		.unwrap();
+
+	let report = SlabManager::repair_empty_slabs(&dir, io).await.unwrap();
+
+	assert!(
+		report.referenced_refused.contains(&victim),
+		"an empty file the index still names is reported, not swept"
+	);
+	assert!(!report.removed.contains(&victim));
+	assert!(slab_path(&dir, victim).exists());
+}
+
+#[tokio::test]
+async fn adr0084_repair_removes_unreferenced_empties_and_is_idempotent() {
+	let dir = fresh_dir("repair-idempotent");
+	let io = spawn_io_thread(16).unwrap();
+	let manager = repair_fixture_manager(&dir, io.clone()).await;
+	manager
+		.append(tenant(), id(0xb000), hlc(1), b"row")
+		.await
+		.unwrap();
+	drop(manager);
+
+	// Two empty slabs above every real one: the higher becomes active and is
+	// preserved, the lower is unreferenced litter and must go.
+	let litter = SlabId::new(0x100);
+	let higher_active = SlabId::new(0x101);
+	std::fs::File::create(slab_path(&dir, litter)).unwrap();
+	std::fs::File::create(slab_path(&dir, higher_active)).unwrap();
+
+	let first = SlabManager::repair_empty_slabs(&dir, io.clone())
+		.await
+		.unwrap();
+	assert_eq!(first.preserved_active, Some(higher_active));
+	assert_eq!(first.removed, vec![litter]);
+	assert!(!slab_path(&dir, litter).exists());
+
+	let second = SlabManager::repair_empty_slabs(&dir, io).await.unwrap();
+	assert!(
+		second.removed.is_empty(),
+		"a second run has nothing left to remove"
+	);
+	assert_eq!(second.slab_files, first.slab_files - first.removed.len());
+}
+
+#[tokio::test]
+async fn adr0084_repair_refuses_without_a_durable_index() {
+	let dir = fresh_dir("repair-no-index");
+	let io = spawn_io_thread(16).unwrap();
+	let manager = repair_fixture_manager(&dir, io.clone()).await;
+	manager
+		.append(tenant(), id(0xc000), hlc(1), b"row")
+		.await
+		.unwrap();
+	drop(manager);
+	std::fs::File::create(slab_path(&dir, SlabId::new(0x200))).unwrap();
+	std::fs::File::create(slab_path(&dir, SlabId::new(0x201))).unwrap();
+
+	let index_path = dir.join("storage_index.redb");
+	std::fs::remove_file(&index_path).unwrap();
+	let before = slab_files_on_disk(&dir);
+
+	let error = SlabManager::repair_empty_slabs(&dir, io)
+		.await
+		.expect_err("an absent index must refuse rather than assume nothing is referenced");
+
+	assert_eq!(error.kind(), ErrorKind::NotFound);
+	assert!(
+		error.to_string().contains("refuses to run without"),
+		"the refusal names the missing index: {error}"
+	);
+	assert_eq!(
+		slab_files_on_disk(&dir),
+		before,
+		"a refused repair removes nothing"
+	);
+	assert!(
+		!index_path.exists(),
+		"the refusal must not create the index it declined to read"
+	);
+}

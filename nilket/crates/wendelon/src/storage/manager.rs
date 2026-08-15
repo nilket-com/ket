@@ -1742,6 +1742,77 @@ impl SlabManager {
 		self.state.lock().await.sealed.len()
 	}
 
+	/// Reclaim the empty slab files a profile accumulated before ADR 84's
+	/// producer guard landed. Runs against a **stopped** profile's directory.
+	///
+	/// Three conditions make a file safe to unlink, and all three are checked
+	/// rather than assumed:
+	///
+	/// 1. it is zero length, so it cannot hold a record;
+	/// 2. it is not the highest-numbered slab, which [`SlabManager::open`]
+	///    promotes to active via `split_last` **regardless of length** — in an
+	///    affected profile that file is very likely empty, and deleting it
+	///    destroys the active slab;
+	/// 3. the durable index does not name it.
+	///
+	/// A candidate failing (3) is reported, not removed. An empty file carrying
+	/// a live reference is an inconsistency worth investigating, and deleting it
+	/// would erase the evidence of whatever produced it.
+	///
+	/// Since bootstrap already skips empty slabs, this reclaims disk rather than
+	/// restoring startup. It is idempotent: a second run removes nothing.
+	pub async fn repair_empty_slabs(
+		dir: &Path,
+		io: IoRingHandle,
+	) -> std::io::Result<EmptySlabRepairReport> {
+		if !dir.is_dir() {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				format!("slab directory does not exist: {}", dir.display()),
+			));
+		}
+		let file_ops: Arc<dyn AsyncFileOps> = Arc::new(IoUringFileOps::with_isolated_blocking(
+			io,
+			"wendelon-fs-meta-repair",
+			BlockingIoClass::SlabMetadata,
+		)?);
+		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), dir).await?;
+		existing_ids.sort_unstable();
+		let mut report = EmptySlabRepairReport {
+			slab_files: existing_ids.len(),
+			..Default::default()
+		};
+		let Some((&active_id, sealed_ids)) = existing_ids.split_last() else {
+			return Ok(report);
+		};
+		// Recorded and then never acted on. The active slab is preserved
+		// whatever its length, which is the whole point of naming it here.
+		report.preserved_active = Some(active_id);
+		if file_ops.file_len(&slab_path(dir, active_id)).await? == Some(0) {
+			report.empty_slab_files += 1;
+		}
+		let mut candidates = Vec::new();
+		for &id in sealed_ids {
+			if file_ops.file_len(&slab_path(dir, id)).await? == Some(0) {
+				report.empty_slab_files += 1;
+				candidates.push(id);
+			}
+		}
+		if candidates.is_empty() {
+			return Ok(report);
+		}
+		let referenced = referenced_slab_ids(dir).await?;
+		for id in candidates {
+			if referenced.contains(&id) {
+				report.referenced_refused.push(id);
+				continue;
+			}
+			unlink_local_file(file_ops.as_ref(), &slab_path(dir, id)).await?;
+			report.removed.push(id);
+		}
+		Ok(report)
+	}
+
 	fn record_l0_compaction_run(&self, slab_id: SlabId, size_bytes: u64) {
 		let mut manifest = recover_rwlock_write(&self.compaction_manifest, "compaction_manifest");
 		let summary = lsm_run_summary_from_index(
@@ -4185,6 +4256,92 @@ fn parse_slab_filename(name: &str) -> Option<SlabId> {
 
 /// Enumerate every `slab_<hex>.wnd` file in `dir` and return their
 /// ids. Non-matching entries are ignored; I/O errors propagate.
+/// Outcome of an offline empty-slab repair.
+///
+/// Refusals are reported separately from removals on purpose: an operator
+/// deciding whether a profile is healthy needs to see what the repair declined
+/// to touch, and a single "cleaned N files" number would hide exactly the case
+/// worth looking at.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct EmptySlabRepairReport {
+	/// Every `slab_<id>.wnd` file discovered.
+	pub slab_files: usize,
+	/// Files of zero length, counting the active slab if it is empty.
+	pub empty_slab_files: usize,
+	/// The highest-numbered slab, preserved unconditionally.
+	pub preserved_active: Option<SlabId>,
+	/// Empty slabs the durable index still names. These are kept.
+	pub referenced_refused: Vec<SlabId>,
+	/// Empty, non-active, unreferenced slabs that were unlinked.
+	pub removed: Vec<SlabId>,
+}
+
+/// Every slab id the durable index still names, across every table that can
+/// carry one.
+///
+/// Deliberately a superset of the three tables `can_retire_local_slab` consults.
+/// That function decides retirement inside a running manager that knows its own
+/// state; this one runs offline against an operator's profile with no such
+/// context, where refusing one slab too many costs an empty file and deleting
+/// one slab too few costs a reference.
+async fn referenced_slab_ids(dir: &Path) -> std::io::Result<HashSet<SlabId>> {
+	let index_path = persistent_index_path(dir);
+	// `PersistentLocalIndex::open` goes through `Database::create`, which would
+	// happily conjure an empty index here. That would report every candidate as
+	// unreferenced and delete them all — not because nothing referenced them,
+	// but because nothing could be asked. An absent index is a refusal, and it
+	// must be caught before the open that would paper over it.
+	if !index_path.exists() {
+		return Err(Error::new(
+			ErrorKind::NotFound,
+			format!(
+				"empty-slab repair refuses to run without the durable index at {}: \
+				 an absent index cannot distinguish 'nothing is referenced' from \
+				 'nothing could be asked'",
+				index_path.display()
+			),
+		));
+	}
+	let index = PersistentLocalIndex::open(index_path.clone())
+		.await
+		.map_err(|err| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"empty-slab repair refuses to run without the durable index at {}: {err}",
+					index_path.display()
+				),
+			)
+		})?;
+	let snapshot = index.load_snapshot().await.map_err(|err| {
+		Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"empty-slab repair refuses to run without a readable index snapshot at {}: {err}",
+				index_path.display()
+			),
+		)
+	})?;
+	let mut referenced = HashSet::new();
+	for row in snapshot
+		.record_rows
+		.iter()
+		.chain(snapshot.tiered_records.iter())
+	{
+		referenced.insert(row.location.slab_id);
+	}
+	for pointer in &snapshot.tiered_slabs {
+		referenced.insert(pointer.slab_id);
+	}
+	for row in &snapshot.secondary_index_segments {
+		referenced.insert(row.key.source_slab_id);
+	}
+	for run in &snapshot.lsm_runs {
+		referenced.insert(run.slab_id);
+	}
+	Ok(referenced)
+}
+
 async fn discover_slab_ids(
 	file_ops: &dyn AsyncFileOps,
 	dir: &Path,

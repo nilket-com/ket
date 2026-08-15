@@ -2,8 +2,7 @@
 
 ## Status
 
-Proposed 2026-08-14. Decisions 1–4 implemented; decision 5 remains
-unimplemented.
+Proposed 2026-08-14. Decisions 1–5 implemented.
 
 **The originating incident is not closed.** A binary carrying decisions 1–4 was
 installed and the affected profile restarted without reset on 2026-08-15. Slab
@@ -107,7 +106,24 @@ install an empty active slab and the next round seals it.
    naming all four counts.
 
 5. **Repair for an affected non-development profile is defined before it is
-   needed**, and is not "delete the zero-byte files". See the hazard below.
+   needed**, and is not "delete the zero-byte files". `repair_empty_slabs` runs
+   against a stopped profile's directory and unlinks a file only when three
+   conditions all hold: it is zero length, so it cannot carry a record; it is not
+   the highest-numbered slab, which `open` promotes to active by `split_last`
+   whatever its length; and the durable index does not name it. A candidate
+   failing the third test is **reported, not removed** — an empty file with a
+   live reference is an inconsistency to investigate, and deleting it destroys
+   the evidence of whatever produced it.
+
+   The repair **refuses to run at all** when the durable index is absent.
+   `PersistentLocalIndex::open` goes through `Database::create` and would
+   fabricate an empty index, which reports every candidate as unreferenced —
+   not because nothing references them, but because nothing could be asked. The
+   refusal is checked before that open, and does not leave the index it declined
+   to read.
+
+   Since decision 2 already lets an affected profile start, this reclaims disk
+   rather than restoring startup. It is idempotent.
 
 ## Rationale
 
@@ -162,12 +178,14 @@ profile that would eventually have opened now stops sooner.
 
 ## Open Questions
 
-**Repair hazard, to be closed before any repair is published.** Deleting zero-byte
-slab files is **not** safe as stated. `SlabManager::open` takes
-`existing_ids.split_last()`, so the **highest-numbered file becomes the active
-slab** — and in an affected profile that file is almost certainly zero-byte.
-Deleting it destroys the active slab. Any repair must establish the
-manifest/index relationship first and preserve the active slab explicitly.
+**Repair hazard — CLOSED by decision 5.** Deleting zero-byte slab files is not
+safe as stated. `SlabManager::open` takes `existing_ids.split_last()`, so the
+highest-numbered file becomes the active slab, and in an affected profile that
+file is almost certainly zero-byte; deleting it destroys the active slab. The
+published repair preserves the highest id unconditionally and consults the
+durable index before removing anything, and each of those two gates plus the
+absent-index refusal has a control that fails against the naive
+delete-every-empty-file repair this hazard warns about.
 
 For the disposable local development profile in the incident, the practical
 recovery is a reset, which is appropriate only because its few tables are
