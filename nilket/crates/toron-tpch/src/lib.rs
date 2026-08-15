@@ -9306,6 +9306,12 @@ fn compact_execution_plan_shape(plan: &ExecutionPlan) -> String {
 			schema_field_names(output_schema),
 			compact_execution_plan_shape(input)
 		),
+		ExecutionPlan::KernelDensity { input, spec } => format!(
+			"KernelDensity(points={},cols=[{}],input={})",
+			spec.points,
+			schema_field_names(&spec.output_schema),
+			compact_execution_plan_shape(input)
+		),
 		ExecutionPlan::Exchange {
 			input,
 			partition_count,
@@ -20920,7 +20926,8 @@ mod adr331_q08_scale_probe {
 			| ExecutionPlan::Sort { input, .. }
 			| ExecutionPlan::Window { input, .. }
 			| ExecutionPlan::Take { input, .. }
-			| ExecutionPlan::Repeat { input, .. } => join_kinds(input, kinds),
+			| ExecutionPlan::Repeat { input, .. }
+			| ExecutionPlan::KernelDensity { input, .. } => join_kinds(input, kinds),
 			ExecutionPlan::Union { left, right, .. } => {
 				join_kinds(left, kinds);
 				join_kinds(right, kinds);
@@ -20965,6 +20972,9 @@ mod adr331_q08_scale_probe {
 			ExecutionPlan::Window { input, .. } => format!("Window({})", plan_shape(input)),
 			ExecutionPlan::Take { input, .. } => format!("Take({})", plan_shape(input)),
 			ExecutionPlan::Repeat { input, .. } => format!("Repeat({})", plan_shape(input)),
+			ExecutionPlan::KernelDensity { input, .. } => {
+				format!("KernelDensity({})", plan_shape(input))
+			}
 			ExecutionPlan::Union { left, right, .. } => {
 				format!(
 					"Union(left={},right={})",
