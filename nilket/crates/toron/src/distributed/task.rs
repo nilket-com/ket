@@ -315,6 +315,30 @@ pub struct TaskTelemetryPhases {
 	pub batch_decode_micros: u64,
 	pub dispatch_wait_micros: u64,
 	pub telemetry_lock_micros: u64,
+	/// ADR 554 Branch A: per-batch **aggregate accumulation** inside a fused
+	/// streaming aggregate loop.
+	///
+	/// The boundary is semantic, not positional: it opens at the **first
+	/// aggregate-accumulation instruction after input processing** and closes at
+	/// the end of the loop body. That is not always the line immediately after
+	/// `apply_streaming_scan_input_ops` — in the grouped scan path, closing the
+	/// projection span and its receipt belongs to input processing, and charging
+	/// it here would make the counter lie about what it measures.
+	///
+	/// It excludes scan acquisition (already metered), input processing, and
+	/// **post-loop finalization** — `groups.finish(..)` and
+	/// `finalize_global_aggregate_state(..)` remain in the residual by decision,
+	/// because they are aggregate work but not accumulation.
+	///
+	/// This counter participates in `framework_overhead = task_wall - accounted`,
+	/// so naming this time shrinks the residual by the same amount. It is **not**
+	/// an ADR 538 component and must never enter that frozen mapping.
+	///
+	/// `scan_grouped` also opens a receipt-level `"fold"` stage span over the same
+	/// region. The two intentionally overlap: that span is a batch-local
+	/// diagnostic, and only this counter affects the task-wall partition.
+	#[serde(default)]
+	pub aggregate_accumulation_micros: u64,
 	/// Time spent partitioning batches across an exchange boundary. Written by the executor,
 	/// so it is produced on both arms: locally as in-memory repartitioning, and inside a
 	/// distributed producer task. That symmetry is what makes it a paired component.

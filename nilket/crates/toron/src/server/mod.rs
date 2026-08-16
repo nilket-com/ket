@@ -1353,7 +1353,11 @@ fn recompute_framework_overhead(telemetry: &mut TaskTelemetry) {
 		.saturating_add(telemetry.phases.telemetry_lock_micros)
 		.saturating_add(telemetry.phases.exchange_repartition_micros)
 		.saturating_add(telemetry.phases.scan_micros)
-		.saturating_add(telemetry.phases.batch_decode_micros);
+		.saturating_add(telemetry.phases.batch_decode_micros)
+		// ADR 554 Branch A: naming accumulation must shrink the residual by the
+		// same amount, or the counter double-counts against a bucket that never
+		// moves.
+		.saturating_add(telemetry.phases.aggregate_accumulation_micros);
 	telemetry.phases.framework_overhead_micros =
 		telemetry.phases.task_wall_micros.saturating_sub(accounted);
 }
@@ -1660,6 +1664,38 @@ fn contains_broadcast_join(plan: &ExecutionPlan) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	/// ADR 554 Branch A: naming accumulation must shrink the in-task residual by
+	/// exactly the same amount.
+	///
+	/// `framework_overhead` is `task_wall - accounted`. If the new counter were
+	/// reported without joining `accounted`, it would double-count against a
+	/// residual that never moved — the counter would look like an explanation
+	/// while explaining nothing.
+	#[test]
+	fn adr554_aggregate_accumulation_shrinks_the_in_task_residual() {
+		let mut without = TaskTelemetry::default();
+		without.phases.task_wall_micros = 10_000;
+		without.phases.scan_micros = 1_000;
+		recompute_framework_overhead(&mut without);
+		assert_eq!(without.phases.framework_overhead_micros, 9_000);
+
+		let mut with = TaskTelemetry::default();
+		with.phases.task_wall_micros = 10_000;
+		with.phases.scan_micros = 1_000;
+		with.phases.aggregate_accumulation_micros = 4_000;
+		recompute_framework_overhead(&mut with);
+
+		assert_eq!(
+			with.phases.framework_overhead_micros, 5_000,
+			"the residual falls by exactly the accumulation named"
+		);
+		assert_eq!(
+			without.phases.framework_overhead_micros - with.phases.framework_overhead_micros,
+			with.phases.aggregate_accumulation_micros,
+			"a counter that does not join `accounted` would leave this difference at zero"
+		);
+	}
 	use crate::audit::{
 		ToronAuditDropReason, ToronAuditEventClass, ToronAuditMetrics, ToronAuditOperation,
 	};
