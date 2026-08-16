@@ -143,16 +143,45 @@ loop wall of ~2,749 ms against ~2,873 ms measured — much nearer that than eith
 fully parallel (~2,565 ms) or serial (~2,968 ms). `max_in_flight_tasks` is set to
 the maximum stage width, so the scheduler cap is not the constraint.
 
-**This is consistency, not confirmation.** `worker_id` is known to the scheduler
-at completion (`TaskAttemptCompletion`) but is **not carried into
-`TaskTelemetryRecord`**, so no artifact can show which worker ran which task. The
-mechanism is therefore unproven, and this is an explicit evidence limit rather
-than a reason to instrument the scheduler.
+**Superseded by measurement — and the two-worker reading was wrong.** `worker_id`
+was known to the scheduler at completion but discarded before
+`TaskTelemetryRecord`. Retaining it (`237fb575`) let a further authoritative SF=8
+run answer the question directly, and the answer rejects the round-structure
+explanation above rather than confirming it.
 
-If the mechanism holds, a consequence follows for the method rather than the
-engine: work done by off-path siblings is real execution that critical-path
-attribution cannot see, so part of the "unattributed remainder" is a property of
-the attribution model, not an engine defect.
+**Observed in that run, and stated no wider than observed:**
+
+- Every distributed cell's tasks were assigned to **one real worker**. Across all
+  21 cells and 7 attempts each, no single attempt used more than one worker.
+- Placement was **stable across all seven attempts** of a given cell — a query
+  kept the same worker on every repetition rather than rotating.
+- **No nil identity appeared.** Every distributed task carried a real worker, so
+  no default value leaked into the classification.
+- Both workers were in use across the cohort, so the pool was live; the
+  single-worker result is about placement within a query, not a dead worker.
+- Cells with 11 and 15 tasks were affected equally, so this is not a small-plan
+  effect.
+
+**This is one authoritative run, not a scheduler guarantee.** The placement policy
+has not been audited, so "every query lands on one worker" is an observation about
+this artifact and must not be restated as engine behaviour until that audit
+exists.
+
+**Within that scope, `loop_non_path_ms` is explained.** Stage siblings assigned to
+a single worker cannot have executed concurrently, so the figure is **serialized
+off-path sibling execution** — real work the critical path cannot see — and not a
+two-worker scheduling artefact. q19's seven task dispatch windows sum to
+~3,013 ms against a ~2,972 ms loop wall: essentially serial.
+
+Note what this did **not** require. Task telemetry carries durations only, with no
+start or end instants, so temporal ordering is unobservable. Assignment alone was
+sufficient here: siblings sharing one worker cannot overlap. Had the tasks been
+spread across both workers, round structure would have remained undecidable on
+this evidence.
+
+The consequence is about method rather than engine: work done by off-path siblings
+is real execution that critical-path attribution cannot see, so part of the
+"unattributed remainder" is a property of the attribution model.
 
 **q14 and q19 are B2's evidence cells** — 51% and 70% outside dispatch. The
 original framing named q19 alone; q14 belongs with it. Both are now measured
@@ -216,11 +245,14 @@ source, without adding a timer. That ordering is the point: an instrument built
 before the audit would have measured B1 all over again, since B1 is where q06 and
 q13 put almost all of their residue.
 
-The B2 instrument is built, run, and reported above. What remains for B2 is one
-question with a known answer path: **carry `worker_id` into `TaskTelemetryRecord`**
-so an artifact can show which worker ran which task. That is plumbing an existing
-fact through, not new instrumentation, and it is the only thing standing between
-"consistent with off-path sibling execution" and a mechanism.
+The B2 instrument is built, run, and reported above; `worker_id` retention landed
+in `237fb575` and settled the mechanism. B2 is closed as an attribution question.
+
+What it opened is a placement question, and that is the next cut: **a read-only
+audit of why a scheduler reporting two-worker capacity places every query's tasks
+on a single worker.** Read-only first — the residency and placement path is
+unaudited, and an instrument built before that audit would repeat this branch's
+own mistake of measuring before understanding what is being measured.
 
 Branch A follows independently, on its own cells.
 
@@ -289,9 +321,9 @@ separability gate in Acceptance exists to detect exactly that.
 
 ## Forward
 
-Branch B is measured and reconciled in §3. Its open item is `worker_id`
-retention, which would settle the mechanism behind `loop_non_path_ms`. Branch A
-follows.
+Branch B is measured, reconciled, and mechanistically explained in §3. Its
+successor is not an attribution question but a placement one: why two-worker
+capacity yields single-worker query placement. Branch A follows.
 
 Neither is a perf change. Both are attribution work, and a perf claim built on
 either needs the pairing discipline ADR 538 and ADR 551 already established.
