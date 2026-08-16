@@ -814,7 +814,7 @@ mod tests {
 			self.rectangles.push((point, size, color));
 		}
 
-		fn fill_text(&mut self, text: Text) {
+		fn fill_text_raw(&mut self, text: Text) {
 			self.texts.push(text);
 		}
 

@@ -537,7 +537,7 @@ mod tests {
 			self.filled_rectangles.push((top_left, size, color));
 		}
 
-		fn fill_text(&mut self, _text: iced::widget::canvas::Text) {}
+		fn fill_text_raw(&mut self, _text: iced::widget::canvas::Text) {}
 		fn translate(&mut self, _translation: Vector) {}
 		fn rotate(&mut self, _angle: f32) {}
 		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {

@@ -476,7 +476,7 @@ mod product_0068_tests {
 
 		fn fill_rectangle(&mut self, _top_left: iced::Point, _size: iced::Size, _color: Color) {}
 
-		fn fill_text(&mut self, _text: Text) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
 
 		fn translate(&mut self, _translation: iced::Vector) {}
 
@@ -665,7 +665,7 @@ mod product_0069_tests {
 
 		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, _color: Color) {}
 
-		fn fill_text(&mut self, _text: Text) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
 
 		fn translate(&mut self, _translation: iced::Vector) {}
 

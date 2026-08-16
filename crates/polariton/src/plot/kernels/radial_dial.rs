@@ -395,7 +395,7 @@ mod tests {
 		}
 
 		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, _color: Color) {}
-		fn fill_text(&mut self, _text: Text) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
 		fn translate(&mut self, _translation: iced::Vector) {}
 		fn rotate(&mut self, _angle: f32) {}
 		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {

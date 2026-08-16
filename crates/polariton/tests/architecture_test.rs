@@ -4421,10 +4421,8 @@ fn product_0114_estimates_are_declared_without_measurement() {
 		std::fs::read_to_string(root.join("plot/text_estimate.rs")).expect("read text estimates");
 	for declaration in [
 		"FORMATTED_LABEL_ADVANCE_EM",
-		"ASCII_LABEL_ADVANCE_EM",
+		"OUT_OF_PARTITION_LABEL_ADVANCE_EM",
 		"scientific `e`",
-		"Labels outside this alphabet remain renderable",
-		"reservation. PRODUCT-0114 names per-character-class budgeting",
 		"per-character-class budgeting",
 	] {
 		assert!(
@@ -4445,6 +4443,70 @@ fn product_0114_estimates_are_declared_without_measurement() {
 			"PRODUCT-0114 added backend text measurement: {forbidden}"
 		);
 	}
+}
+
+#[test]
+fn product_0117_declares_one_plot_text_face_and_a_total_static_ascii_budget() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let fonts = std::fs::read_to_string(root.join("fonts/mod.rs")).expect("read plot fonts");
+	for declaration in [
+		"POLARITON_PLOT_SANS_REGULAR",
+		"PolaritonPlotSans-Regular.ttf",
+		"PLOT_TEXT_FONT",
+		"Font::with_name(\"Polariton Plot Sans\")",
+		"NotoSans-OFL-1.1.txt",
+	] {
+		assert!(
+			fonts.contains(declaration),
+			"PRODUCT-0117 plot face declaration must retain {declaration}"
+		);
+	}
+
+	let text_estimate =
+		std::fs::read_to_string(root.join("plot/text_estimate.rs")).expect("read text estimates");
+	for declaration in [
+		"OUT_OF_PARTITION_LABEL_ADVANCE_EM",
+		"fn ascii_label_advance_em",
+		"' '..='~'",
+		"PRODUCT-0117 censused every",
+	] {
+		assert!(
+			text_estimate.contains(declaration),
+			"PRODUCT-0117 static estimate contract must retain {declaration}"
+		);
+	}
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot backend");
+	let backend = common
+		.split("pub trait PlotBackend")
+		.nth(1)
+		.and_then(|rest| rest.split("pub trait PlotKernel").next())
+		.expect("bounded plot backend contract");
+	assert!(backend.contains("text.font = PLOT_TEXT_FONT;"));
+	assert!(backend.contains("self.fill_text_raw(text);"));
+
+	let plot_root = root.join("plot");
+	let direct_overrides = rust_files(&plot_root)
+		.into_iter()
+		.filter_map(|path| std::fs::read_to_string(path).ok())
+		.map(|source| {
+			source
+				.lines()
+				.filter(|line| line.contains("fn fill_text(&mut self"))
+				.count()
+		})
+		.sum::<usize>();
+	assert_eq!(
+		direct_overrides, 1,
+		"PRODUCT-0117 permits only PlotBackend's central font-stamping method; an implementation override would bypass the declared face"
+	);
+
+	let state = std::fs::read_to_string(root.join("gui/state.rs")).expect("read gui state");
+	assert!(state.contains(".font(POLARITON_PLOT_SANS_REGULAR)"));
+	assert!(
+		!state.contains(".default_font(PLOT_TEXT_FONT)"),
+		"PRODUCT-0117 must not make plot text the application default"
+	);
 }
 
 #[test]

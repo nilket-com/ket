@@ -173,7 +173,7 @@ impl PlotBackend for SvgBackend {
 		);
 	}
 
-	fn fill_text(&mut self, text: Text) {
+	fn fill_text_raw(&mut self, text: Text) {
 		let anchor = match text.align_x {
 			Alignment::Left | Alignment::Default | Alignment::Justified => "start",
 			Alignment::Center => "middle",
@@ -510,7 +510,7 @@ impl PlotBackend for AvifBackend {
 		self.svg_backend.fill_rectangle(top_left, size, color);
 	}
 
-	fn fill_text(&mut self, text: Text) {
+	fn fill_text_raw(&mut self, text: Text) {
 		self.svg_backend.fill_text(text);
 	}
 
@@ -562,7 +562,7 @@ impl PlotBackend for PngBackend {
 		self.svg_backend.fill_rectangle(top_left, size, color);
 	}
 
-	fn fill_text(&mut self, text: Text) {
+	fn fill_text_raw(&mut self, text: Text) {
 		self.svg_backend.fill_text(text);
 	}
 

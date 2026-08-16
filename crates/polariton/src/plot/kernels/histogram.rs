@@ -252,7 +252,7 @@ mod tests {
 			self.colors.push(color);
 		}
 
-		fn fill_text(&mut self, _text: iced::widget::canvas::Text) {}
+		fn fill_text_raw(&mut self, _text: iced::widget::canvas::Text) {}
 
 		fn translate(&mut self, _translation: Vector) {}
 

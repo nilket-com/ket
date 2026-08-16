@@ -416,7 +416,7 @@ mod tests {
 
 		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, _color: Color) {}
 
-		fn fill_text(&mut self, text: Text) {
+		fn fill_text_raw(&mut self, text: Text) {
 			self.texts.push(text.content);
 			self.text_sizes.push(text.size);
 			self.text_colors.push(text.color);

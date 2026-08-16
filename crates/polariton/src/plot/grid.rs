@@ -1313,7 +1313,7 @@ mod tests {
 			self.rectangles.push((top_left, size, color));
 		}
 
-		fn fill_text(&mut self, _text: Text) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
 
 		fn translate(&mut self, _translation: iced::Vector) {}
 
@@ -1374,7 +1374,7 @@ mod tests {
 			self.record(StrataOperationKind::Fill(color));
 		}
 
-		fn fill_text(&mut self, _text: Text) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
 
 		fn translate(&mut self, _translation: iced::Vector) {}
 
@@ -1412,7 +1412,7 @@ mod tests {
 
 		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, _color: Color) {}
 
-		fn fill_text(&mut self, text: Text) {
+		fn fill_text_raw(&mut self, text: Text) {
 			self.texts.push(TextOperation {
 				content: text.content,
 				position: text.position + self.translation,

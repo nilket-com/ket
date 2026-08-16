@@ -6,7 +6,7 @@ use crate::adapters::{
 };
 use crate::configuration::{self, StartupData};
 use crate::editor::{CodeEditor, MarkdownCellExecution};
-use crate::fonts::DEJAVU_SANS_MONO;
+use crate::fonts::{DEJAVU_SANS_MONO, POLARITON_PLOT_SANS_REGULAR};
 #[cfg(all(test, feature = "toron"))]
 use crate::gui::table_skin::TableSkin;
 #[cfg(all(test, feature = "toron"))]
@@ -468,6 +468,10 @@ pub fn run(startup_data: StartupData, target: StartupTarget) -> Result {
 		// hard enough to read as rasterization. Text is unaffected either way.
 		.antialiasing(true)
 		.font(DEJAVU_SANS_MONO)
+		// PRODUCT-0117: plot canvas text names this bundled proportional face
+		// explicitly. Loading it here makes that operation portable without
+		// changing Iced's application default for editor and GUI text.
+		.font(POLARITON_PLOT_SANS_REGULAR)
 		.window(window::Settings {
 			decorations: false,
 			maximized: false,

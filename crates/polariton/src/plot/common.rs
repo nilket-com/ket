@@ -1,4 +1,5 @@
 use crate::coordinate::{Plot, Pt, Rect, Widget, Window};
+use crate::fonts::PLOT_TEXT_FONT;
 use crate::gui::messages::PlotMessage;
 use crate::plot::chrome::{PlotChrome, PlotMarkStyle};
 use crate::plot::colors::ColorTheme;
@@ -894,7 +895,14 @@ pub trait PlotBackend {
 	fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), stroke: Stroke);
 	fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), color: Color);
 	fn fill_rectangle(&mut self, top_left: Point, size: iced::Size, color: Color);
-	fn fill_text(&mut self, text: Text);
+	/// Emits plot text through the one declared face PRODUCT-0117 binds to the
+	/// static ASCII budget. Backends receive the already-resolved operation so
+	/// operation traces and production pixels share the same font authority.
+	fn fill_text(&mut self, mut text: Text) {
+		text.font = PLOT_TEXT_FONT;
+		self.fill_text_raw(text);
+	}
+	fn fill_text_raw(&mut self, text: Text);
 	fn supports_embedded_raster(&self) -> bool {
 		false
 	}
@@ -1018,7 +1026,7 @@ impl<'a> PlotBackend for IcedBackend<'a> {
 			color,
 		);
 	}
-	fn fill_text(&mut self, text: Text) {
+	fn fill_text_raw(&mut self, text: Text) {
 		self.frame.fill_text(text);
 	}
 	fn supports_embedded_raster(&self) -> bool {
@@ -3010,14 +3018,14 @@ mod product_0106_vertical_guide_band_oracles {
 			])],
 			y: Vec::new(),
 		};
-		let width = 10.0 * 18.0;
+		let width = estimate_ascii_label_width("abcdefghij", 18.0);
 		for (rotation, expected) in [
 			(0.0, 28.0),
 			(
 				45.0,
 				10.0 + (width + 18.0) * std::f32::consts::FRAC_1_SQRT_2,
 			),
-			(90.0, 190.0),
+			(90.0, 10.0 + width),
 		] {
 			let settings = ResolvedPlotSettings {
 				x_tick_rotation: TickRotation::new(rotation).unwrap(),
@@ -3035,6 +3043,37 @@ mod product_0106_vertical_guide_band_oracles {
 				"{rotation} degrees reserves the rotated tick extent"
 			);
 		}
+	}
+
+	#[test]
+	fn product_0117_class_budget_moves_only_the_derived_category_band_delta() {
+		let label = "International partner enablement and certification";
+		let settings = ResolvedPlotSettings {
+			x_tick_rotation: TickRotation::new(45.0).unwrap(),
+			..ResolvedPlotSettings::default()
+		};
+		let requirements = BandRequirements {
+			x: vec![AxisBandRequirement::Categories(vec![label.to_owned()])],
+			y: Vec::new(),
+		};
+		let old_width = label.chars().count() as f32 * settings.x_tick_size;
+		let new_width = estimate_ascii_label_width(label, settings.x_tick_size);
+		assert!(new_width < old_width, "PRODUCT-0117 prose class budget improves the flat bound");
+		let guides = VerticalGuideBands::x_axis_guides(&requirements, true, &settings);
+		let old_tick_end = settings.x_label_offset
+			+ old_width * settings.x_tick_rotation.radians().sin().abs()
+			+ settings.x_tick_size * settings.x_tick_rotation.radians().cos().abs();
+		let old_title_top = settings
+			.x_label_padding
+			.max(old_tick_end + VerticalGuideBands::x_axis_title_gap(&settings));
+		let old_bottom = old_title_top + settings.x_label_size;
+		assert!(
+			(guides.bottom - old_bottom
+				+ (old_width - new_width) * settings.x_tick_rotation.radians().sin().abs())
+				.abs()
+				< 0.001,
+			"PRODUCT-0117 guide geometry moves by exactly the rotated estimate delta"
+		);
 	}
 
 	#[test]
@@ -3518,7 +3557,7 @@ mod product_0067_0068_strata_oracles {
 			self.operations.push(Operation::Fill(color));
 		}
 
-		fn fill_text(&mut self, text: Text) {
+		fn fill_text_raw(&mut self, text: Text) {
 			self.operations.push(Operation::Text(text.content));
 		}
 
@@ -4287,7 +4326,7 @@ mod product_0056_categorical_y_oracles {
 
 		fn fill_rectangle(&mut self, _top_left: Point, _size: Size, _color: Color) {}
 
-		fn fill_text(&mut self, mut text: Text) {
+		fn fill_text_raw(&mut self, mut text: Text) {
 			text.position.x += self.translation.x;
 			text.position.y += self.translation.y;
 			self.texts.push(text);

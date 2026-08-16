@@ -48,7 +48,7 @@ impl PlotBackend for BankBackend {
 		self.operations.push(BankOperation::FillRectangle(color));
 	}
 
-	fn fill_text(&mut self, text: Text) {
+	fn fill_text_raw(&mut self, text: Text) {
 		self.operations.push(BankOperation::Text(text.color));
 	}
 

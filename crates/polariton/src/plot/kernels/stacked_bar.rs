@@ -530,7 +530,7 @@ mod tests {
 			self.rectangles.push((top_left, size, color));
 		}
 
-		fn fill_text(&mut self, _text: Text) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
 
 		fn translate(&mut self, _translation: iced::Vector) {}
 

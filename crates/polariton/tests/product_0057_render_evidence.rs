@@ -76,6 +76,7 @@ use plot::spec::{
 };
 use plot::theme::PlotSettings;
 use polars::prelude::{Float64Chunked, NewChunkedArray};
+use std::borrow::Cow;
 use std::sync::Arc;
 
 const BACKGROUND: [u8; 3] = [0, 0, 0];
@@ -112,6 +113,10 @@ impl Gpu {
 	}
 
 	async fn renderer(&self, antialiasing: Option<Antialiasing>) -> iced::Renderer {
+		iced::advanced::graphics::text::font_system()
+			.write()
+			.expect("PRODUCT-0117 global font system lock")
+			.load_font(Cow::Borrowed(fonts::POLARITON_PLOT_SANS_REGULAR));
 		let (device, queue) = self
 			.adapter
 			.request_device(&wgpu::DeviceDescriptor {
@@ -254,6 +259,23 @@ fn render_frame(
 	draw(&mut frame);
 	renderer.draw_geometry(frame.into_geometry());
 	screenshot(renderer, size)
+}
+
+fn render_product_0117_font_probe(
+	renderer: &mut iced::Renderer,
+	font: Font,
+	text: &str,
+) -> Capture {
+	render_frame(renderer, Size::new(640, 160), |frame| {
+		frame.fill_text(Text {
+			content: text.to_owned(),
+			position: Point::new(24.0, 48.0),
+			color: Color::WHITE,
+			size: Pixels(28.0),
+			font,
+			..Text::default()
+		});
+	})
 }
 
 #[derive(Clone, Copy)]
@@ -1719,6 +1741,24 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	let large = Size::new(448, 320);
 	let mut msaa = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
 	let mut no_aa = gpu.renderer(None).await;
+	let product_0117_sample = "International partner enablement";
+	let product_0117_generic =
+		render_product_0117_font_probe(&mut msaa, Font::DEFAULT, product_0117_sample);
+	let product_0117_pinned =
+		render_product_0117_font_probe(&mut msaa, fonts::PLOT_TEXT_FONT, product_0117_sample);
+	assert_eq!(
+		product_0117_generic.rgba, product_0117_pinned.rgba,
+		"PRODUCT-0117 development host's generic sans must bank as the same Noto glyph capture as Polariton Plot Sans"
+	);
+	let product_0117_cjk = render_product_0117_font_probe(&mut msaa, fonts::PLOT_TEXT_FONT, "雪");
+	assert!(
+		product_0117_cjk.luminous_pixels(Rectangle::with_size(Size::new(640.0, 160.0))) > 40,
+		"PRODUCT-0117 pinned plot font must render the CJK fallback probe"
+	);
+	println!(
+		"PRODUCT_0117 plot_font disposition=production generic_noto_parity=exact cjk_fallback_luminous={}",
+		product_0117_cjk.luminous_pixels(Rectangle::with_size(Size::new(640.0, 160.0)))
+	);
 	let product_0101_old_msaa =
 		render_frame(&mut msaa, PRODUCT_0101_SIZE, draw_product_0101_old_pie);
 	let product_0101_old_none =
