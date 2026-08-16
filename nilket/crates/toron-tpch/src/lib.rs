@@ -6333,6 +6333,11 @@ fn timing_atlas_replay_attribution_path(
 			// Read back, never defaulted: replay re-derives every figure from the
 			// nodes, so a zero here would recompute a residual that silently
 			// equalled the remainder no matter what the run measured.
+			worker_id: node
+				.get("worker_id")
+				.and_then(|value| value.as_str())
+				.unwrap_or_default()
+				.to_owned(),
 			telemetry_lock_ms: node
 				.get("telemetry_lock_ms")
 				.and_then(|value| value.as_f64())
@@ -7331,6 +7336,11 @@ pub struct TimingAtlasTaskNode {
 	/// `task_wall_micros` is deliberately absent: it is the envelope, not a term.
 	pub telemetry_lock_ms: f64,
 	pub framework_overhead_ms: f64,
+	/// The worker this task ran on, as its UUID string. Present so an artifact can
+	/// answer whether concurrent stage siblings actually landed on different
+	/// workers — the question ADR 554 Branch B could only answer "consistent
+	/// with" until now. Empty on an arm that runs no distributed task.
+	pub worker_id: String,
 	/// Immediate predecessors, as (stage, task).
 	pub upstream: Vec<(u32, u32)>,
 }
@@ -7821,6 +7831,7 @@ pub fn timing_atlas_nodes_from_report(
 				task_id: *task,
 				wall_ms: record.telemetry.phases.task_wall_micros as f64 / 1000.0,
 				components: timing_atlas_component_portions_ms(&record.telemetry.phases),
+				worker_id: record.worker_id.get().to_string(),
 				telemetry_lock_ms: record.telemetry.phases.telemetry_lock_micros as f64 / 1000.0,
 				framework_overhead_ms: record.telemetry.phases.framework_overhead_micros as f64
 					/ 1000.0,
@@ -7846,6 +7857,9 @@ pub fn timing_atlas_local_task_node(
 		task_id: 0,
 		wall_ms: execute_wall_ms,
 		components: timing_atlas_component_portions_ms(phases),
+		// The local arm runs no distributed task, so it has no worker. Empty is the
+		// declared absence — not a fabricated id that would join against nothing.
+		worker_id: String::new(),
 		telemetry_lock_ms: phases.telemetry_lock_micros as f64 / 1000.0,
 		framework_overhead_ms: phases.framework_overhead_micros as f64 / 1000.0,
 		upstream: Vec::new(),
@@ -7910,6 +7924,7 @@ pub fn timing_atlas_attribution_path_row(
 				"task": node.task_id,
 				"wall_ms": node.wall_ms,
 				"components": components,
+				"worker_id": node.worker_id,
 				"telemetry_lock_ms": node.telemetry_lock_ms,
 				"framework_overhead_ms": node.framework_overhead_ms,
 				"upstream": node.upstream,
@@ -23158,6 +23173,43 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 mod adr538_timing_atlas_journal_replay {
 	use super::*;
 
+	/// Task-to-worker identity survives from the scheduler to the artifact and back
+	/// through replay.
+	///
+	/// The scheduler always knew which worker ran an attempt; it was dropped before
+	/// the telemetry record, so no artifact could test whether concurrent stage
+	/// siblings landed on different workers. This control fails if that identity is
+	/// dropped again anywhere along the path.
+	#[test]
+	fn adr554_task_to_worker_identity_survives_into_the_artifact() {
+		let mut left = decomposition_node(0.0, 0.0, 10.0);
+		left.worker_id = "worker-a".to_owned();
+		let mut right = decomposition_node(0.0, 0.0, 10.0);
+		right.stage_id = 1;
+		right.worker_id = "worker-b".to_owned();
+		right.upstream = vec![(0, 0)];
+
+		let attribution =
+			timing_atlas_child_attribution(vec![left, right]).expect("two-worker fixture");
+		let row = timing_atlas_attribution_path_row("q19", "distributed", 0, 1, 50.0, &attribution);
+
+		let workers: Vec<&str> = row["nodes"]
+			.as_array()
+			.expect("nodes array")
+			.iter()
+			.map(|node| node["worker_id"].as_str().expect("worker id present"))
+			.collect();
+		assert_eq!(
+			workers,
+			vec!["worker-a", "worker-b"],
+			"each task carries the worker that actually ran it"
+		);
+
+		// And it round-trips: replay rebuilds nodes from the row, so an analyst
+		// re-deriving from the artifact sees the same assignment.
+		timing_atlas_replay_attribution_path(&row).expect("row replays");
+	}
+
 	/// ADR 554 §3 B2: each span is reported under its own owner, and the residual is
 	/// exactly what they leave over. One combined lifecycle number would fail this.
 	#[test]
@@ -23404,6 +23456,7 @@ mod adr538_timing_atlas_journal_replay {
 				(TimingAtlasComponent::Dispatch, 0.0),
 				(TimingAtlasComponent::Transport, 0.0),
 			],
+			worker_id: String::new(),
 			telemetry_lock_ms,
 			framework_overhead_ms,
 			upstream: Vec::new(),
@@ -23487,6 +23540,7 @@ mod adr538_timing_atlas_journal_replay {
 				(TimingAtlasComponent::Dispatch, 0.0),
 				(TimingAtlasComponent::Transport, 0.0),
 			],
+			worker_id: String::new(),
 			telemetry_lock_ms: 0.0,
 			framework_overhead_ms: 0.0,
 			upstream: Vec::new(),
@@ -23509,6 +23563,7 @@ mod adr538_timing_atlas_journal_replay {
 					(TimingAtlasComponent::Dispatch, 1.0),
 					(TimingAtlasComponent::Transport, 0.5),
 				],
+				worker_id: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: Vec::new(),
@@ -23524,6 +23579,7 @@ mod adr538_timing_atlas_journal_replay {
 					(TimingAtlasComponent::Dispatch, 0.5),
 					(TimingAtlasComponent::Transport, 1.0),
 				],
+				worker_id: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -24493,6 +24549,7 @@ mod adr538_timing_atlas_critical_path {
 			task_id: task,
 			wall_ms: wall,
 			components,
+			worker_id: String::new(),
 			telemetry_lock_ms: 0.0,
 			framework_overhead_ms: 0.0,
 			upstream,
@@ -24709,6 +24766,7 @@ mod adr538_path_bound_validation {
 				task_id: 0,
 				wall_ms: 100.0,
 				components: vec![],
+				worker_id: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![],
@@ -24718,6 +24776,7 @@ mod adr538_path_bound_validation {
 				task_id: 0,
 				wall_ms: 400.0,
 				components: vec![],
+				worker_id: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -24728,6 +24787,7 @@ mod adr538_path_bound_validation {
 				task_id: 1,
 				wall_ms: 200.0,
 				components: vec![],
+				worker_id: String::new(),
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -25107,6 +25167,7 @@ mod adr538_phase_component_wiring {
 				TaskId::new(task),
 				AttemptId::new(attempt),
 			),
+			worker_id: Default::default(),
 			telemetry,
 		}
 	}
@@ -25193,6 +25254,7 @@ mod adr538_phase_component_wiring {
 					TaskId::new(0),
 					AttemptId::new(0),
 				),
+				worker_id: Default::default(),
 				telemetry: TaskTelemetry::default(),
 			}],
 		};

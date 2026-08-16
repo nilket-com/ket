@@ -90,6 +90,14 @@ pub struct SchedulerRun {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TaskTelemetryRecord {
 	pub identity: TaskIdentity,
+	/// The worker this attempt actually ran on.
+	///
+	/// The scheduler has always known this at completion; it was simply not
+	/// retained, so no artifact could say which worker ran which task. Carried
+	/// through for ADR 554 Branch B, where the residual is consistent with
+	/// off-path sibling execution under a limited worker pool — a claim that
+	/// cannot be tested without task-to-worker identity.
+	pub worker_id: WorkerId,
 	pub telemetry: TaskTelemetry,
 }
 
@@ -475,6 +483,7 @@ where
 					.saturating_add(completion.dispatch_wait_micros);
 				self.telemetry.task_telemetry.push(TaskTelemetryRecord {
 					identity: completion.identity,
+					worker_id: completion.worker_id,
 					telemetry,
 				});
 				self.accept_dispatch_completion(
@@ -509,6 +518,7 @@ where
 					.saturating_add(completion.dispatch_wait_micros);
 				self.telemetry.task_telemetry.push(TaskTelemetryRecord {
 					identity: completion.identity,
+					worker_id: completion.worker_id,
 					telemetry,
 				});
 				self.accept_dispatch_failure(
