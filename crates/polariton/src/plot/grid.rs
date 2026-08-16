@@ -9,8 +9,8 @@
 
 use crate::coordinate::{Pt, Rect, Widget};
 use crate::plot::common::{
-	AxisTextAnchoring, AxisTextVisibility, CoordinateTransformer, PlotBackend, PlotComposite,
-	PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, VerticalGuideBands,
+	AxisTextAnchoring, AxisTextVisibility, BandRequirements, CoordinateTransformer, PlotBackend,
+	PlotComposite, PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, VerticalGuideBands,
 };
 use crate::plot::factory::{create_plot, create_styled_plot};
 #[cfg(test)]
@@ -659,8 +659,10 @@ impl PlotComposite for PlotGridKernel {
 		);
 		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
 		let outer = grid_outer_area(legend.content_bounds, padding);
-		let tiled = grid_tiled_area(outer, title, &resolved);
 		let layouts = self.cell_layouts(resolved.clone());
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+		let tiled = grid_tiled_area_with_requirements(outer, title, &requirements, &resolved);
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
 			let cell_bounds = grid_cell_bounds_with_settings(
@@ -749,8 +751,10 @@ impl PlotComposite for PlotGridKernel {
 		);
 		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
 		let outer = grid_outer_area(legend.content_bounds, padding);
-		let tiled = grid_tiled_area(outer, title, &resolved);
 		let layouts = self.cell_layouts(resolved.clone());
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+		let tiled = grid_tiled_area_with_requirements(outer, title, &requirements, &resolved);
 		let axis_cells = self.axis_text_cells();
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
@@ -908,8 +912,10 @@ impl PlotComposite for PlotGridKernel {
 		);
 		let legend = crate::plot::legend::legend_layout(bounds, figure_legend.as_ref(), &resolved);
 		let outer = grid_outer_area(legend.content_bounds, padding);
-		let tiled = grid_tiled_area(outer, title, &resolved);
 		let layouts = self.cell_layouts(resolved.clone());
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+		let tiled = grid_tiled_area_with_requirements(outer, title, &requirements, &resolved);
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
 			let cell_bounds = grid_cell_bounds_with_settings(
@@ -942,12 +948,23 @@ fn grid_outer_area(bounds: Rect<Widget>, padding: f32) -> Rect<Widget> {
 	)
 }
 
+#[cfg(test)]
 fn grid_tiled_area(
 	outer: Rect<Widget>,
 	title: &str,
 	settings: &ResolvedPlotSettings,
 ) -> Rect<Widget> {
 	VerticalGuideBands::resolve(title, None, settings).grid_tiled_area(outer, settings)
+}
+
+fn grid_tiled_area_with_requirements(
+	outer: Rect<Widget>,
+	title: &str,
+	requirements: &BandRequirements,
+	settings: &ResolvedPlotSettings,
+) -> Rect<Widget> {
+	VerticalGuideBands::resolve_with_requirements(title, None, requirements, settings)
+		.grid_tiled_area(outer, settings)
 }
 
 fn grid_plot_area(
@@ -1489,7 +1506,7 @@ mod tests {
 		));
 		let resolved = settings.resolve();
 		let outer = grid_outer_area(bounds, 0.0);
-		let tiled = grid_tiled_area(outer, "", &resolved);
+		let tiled = grid_tiled_area_for_kernel(kernel, outer, "", &resolved);
 		let (position, _) = &kernel.cell_layouts(resolved.clone())[cell_index];
 		grid_plot_area(
 			grid_cell_bounds(tiled, kernel.arrangement, *position),
@@ -1670,6 +1687,18 @@ mod tests {
 			IcedRectangle::new(Point::ORIGIN, iced::Size::new(width, height)),
 		);
 		(kernel, backend.finish())
+	}
+
+	fn grid_tiled_area_for_kernel(
+		kernel: &PlotGridKernel,
+		outer: Rect<Widget>,
+		title: &str,
+		settings: &ResolvedPlotSettings,
+	) -> Rect<Widget> {
+		let layouts = kernel.cell_layouts(settings.clone());
+		let requirements =
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+		grid_tiled_area_with_requirements(outer, title, &requirements, settings)
 	}
 
 	fn rendered_tick_paths(svg: &str, clip_id: usize, origin: Point) -> Vec<[f32; 4]> {
@@ -1947,7 +1976,12 @@ mod tests {
 			iced::Size::new(400.0, 300.0),
 		));
 		let legend = crate::plot::legend::legend_layout(bounds, Some(&content), &resolved);
-		let tiled = grid_tiled_area(grid_outer_area(legend.content_bounds, 0.0), "", &resolved);
+		let tiled = grid_tiled_area_for_kernel(
+			&kernel,
+			grid_outer_area(legend.content_bounds, 0.0),
+			"",
+			&resolved,
+		);
 		let shared_extent = grid_plot_extent(
 			tiled,
 			kernel.arrangement,
@@ -3623,7 +3657,7 @@ mod tests {
 			)),
 			0.0,
 		);
-		let tiled = grid_tiled_area(outer, "", &resolved);
+		let tiled = grid_tiled_area_for_kernel(&kernel, outer, "", &resolved);
 		let origins = layouts
 			.iter()
 			.map(|(position, _)| {
@@ -3728,7 +3762,7 @@ mod tests {
 		assert_eq!(y("East"), y("West"));
 
 		let outer = widget_rect(IcedRectangle::new(Point::ORIGIN, Size::new(800.0, 260.0)));
-		let tiled = grid_tiled_area(outer, "", &resolved);
+		let tiled = grid_tiled_area_for_kernel(&kernel, outer, "", &resolved);
 		let cell = grid_cell_bounds(
 			tiled,
 			kernel.arrangement,
@@ -3873,7 +3907,12 @@ mod tests {
 
 		let resolved = ResolvedPlotSettings::default();
 		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
-		let tiled = grid_tiled_area(grid_outer_area(widget_rect(bounds), 0.0), "", &resolved);
+		let tiled = grid_tiled_area_for_kernel(
+			&kernel,
+			grid_outer_area(widget_rect(bounds), 0.0),
+			"",
+			&resolved,
+		);
 		let shared = grid_plot_extent(
 			tiled,
 			kernel.arrangement,
@@ -3948,7 +3987,12 @@ mod tests {
 
 		let resolved = ResolvedPlotSettings::default();
 		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(900.0, 600.0));
-		let tiled = grid_tiled_area(grid_outer_area(widget_rect(bounds), 0.0), "", &resolved);
+		let tiled = grid_tiled_area_for_kernel(
+			&kernel,
+			grid_outer_area(widget_rect(bounds), 0.0),
+			"",
+			&resolved,
+		);
 		let top_right = grid_cell_bounds(
 			tiled,
 			kernel.arrangement,
@@ -4171,12 +4215,19 @@ mod tests {
 			4,
 			"both endpoint labels survive on both visible axes"
 		);
+		let bottom_tick_y = cartesian
+			.texts
+			.iter()
+			.map(|text| text.position.y)
+			.fold(f32::NEG_INFINITY, f32::max);
 		for alignment in [Alignment::Left, Alignment::Right] {
 			assert_eq!(
 				cartesian
 					.texts
 					.iter()
-					.filter(|text| text.position.y > 520.0 && text.align_x == alignment)
+					.filter(|text| {
+						(text.position.y - bottom_tick_y).abs() < 0.01 && text.align_x == alignment
+					})
 					.count(),
 				1,
 				"Cartesian x emits exactly one inward {alignment:?} endpoint"
@@ -4197,7 +4248,7 @@ mod tests {
 			cartesian.texts.iter().any(|text| {
 				text.content == "0%"
 					&& text.align_x == Alignment::Center
-					&& text.position.y > 520.0
+					&& (text.position.y - bottom_tick_y).abs() < 0.01
 					&& text.position.x < 150.0
 			}),
 			"the outer x minimum remains centred"
@@ -4244,9 +4295,7 @@ mod tests {
 			categorical_x
 				.texts
 				.iter()
-				.filter(|text| {
-					(text.content == "A" || text.content == "B") && text.position.y > 520.0
-				})
+				.filter(|text| { text.content == "A" || text.content == "B" })
 				.all(|text| text.align_x == Alignment::Center),
 			"CategoricalX category labels remain centred"
 		);
@@ -4260,12 +4309,17 @@ mod tests {
 				x_axis_type: AxisType::Percent,
 			},
 		);
+		let categorical_y_tick_y = categorical_y
+			.texts
+			.iter()
+			.map(|text| text.position.y)
+			.fold(f32::NEG_INFINITY, f32::max);
 		assert_eq!(
 			categorical_y
 				.texts
 				.iter()
 				.filter(|text| {
-					text.position.y > 520.0
+					(text.position.y - categorical_y_tick_y).abs() < 0.01
 						&& matches!(text.align_x, Alignment::Left | Alignment::Right)
 				})
 				.count(),
@@ -4474,7 +4528,7 @@ mod tests {
 		let layouts = kernel.cell_layouts(resolved.clone());
 		let local = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 400.0));
 		let outer = grid_outer_area(widget_rect(local), 0.0);
-		let tiled = grid_tiled_area(outer, "", &resolved);
+		let tiled = grid_tiled_area_for_kernel(&kernel, outer, "", &resolved);
 		let (position, layout) = &layouts[0];
 		let cell_bounds = grid_cell_bounds(tiled, arrangement, *position);
 		let inner = grid_plot_area(cell_bounds, Some("facet"), &resolved);

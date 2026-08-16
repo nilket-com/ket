@@ -4068,20 +4068,32 @@ fn product_0106_vertical_guides_have_one_reservation_authority_and_no_measuremen
 			"missing `{required}` from authority"
 		);
 	}
-	assert!(
-		common
-			.contains("VerticalGuideBands::resolve(&self.title, None, &self.settings).plot_area(")
-	);
+	assert!(common.contains("VerticalGuideBands::resolve_with_requirements("));
 
 	let grid_production = grid
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("grid production");
+	assert!(
+		grid.contains("#[cfg(test)]\nfn grid_tiled_area("),
+		"the legacy tiled-area helper is test-only; production must receive requirements"
+	);
+	let cell_local = grid_production
+		.split("fn grid_plot_area(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn grid_plot_extent(").next())
+		.expect("bounded cell-local geometry");
+	assert_eq!(
+		cell_local.matches("VerticalGuideBands::resolve(").count(),
+		1,
+		"cell-local facet reservations remain the sole production legacy resolve call"
+	);
 	assert_eq!(
 		grid_production
-			.matches("VerticalGuideBands::resolve(")
+			.matches("VerticalGuideBands::resolve_with_requirements(")
 			.count(),
-		2
+		1,
+		"the figure-wide tiled area receives requirements before cell geometry"
 	);
 	assert!(grid_production.contains(".grid_tiled_area(outer, settings)"));
 	assert!(grid_production.contains(".grid_cell_plot_area(cell_bounds, settings)"));
@@ -4328,6 +4340,117 @@ fn product_0113_only_title_and_subtitle_font_sizes_cross_the_canvas_boundary() {
 		assert!(
 			!free.contains(&format!("\"{blocked}\"")),
 			"{blocked} is not a new top-level spelling"
+		);
+	}
+}
+
+#[test]
+fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	assert!(common.contains("pub(crate) struct BandRequirements"));
+	assert!(common.contains("pub(crate) enum AxisBandRequirement"));
+	assert!(common.contains("from a realized tick set"));
+	assert!(common.contains("requirements: &BandRequirements"));
+	assert!(common.contains("requirements.estimated_x_width"));
+	assert!(common.contains("requirements.estimated_y_width"));
+
+	for entrypoint in [
+		"fn render_plot_layer_in_widget",
+		"fn render_overlay_layer_in_widget",
+		"Event::Mouse(iced::mouse::Event::CursorMoved",
+	] {
+		let section = common
+			.split(entrypoint)
+			.nth(1)
+			.expect("single-plot entrypoint")
+			.split("let transform")
+			.next()
+			.expect("bounded single-plot geometry setup");
+		let layout = section
+			.find("let layout = self.kernel.layout")
+			.expect("layout first");
+		let requirements = section
+			.find("let requirements = BandRequirements::from_layout")
+			.expect("requirements after layout");
+		let area = section
+			.find(".plot_area(")
+			.expect("plot area after requirements");
+		assert!(layout < requirements && requirements < area);
+	}
+
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read plot grid");
+	assert!(grid.contains("fn grid_tiled_area_with_requirements"));
+	let composite = grid
+		.split("impl PlotComposite for PlotGridKernel")
+		.nth(1)
+		.expect("grid composite implementation");
+	for entrypoint in [
+		"fn render_plot_layer(",
+		"fn render_overlay_layer(",
+		"fn hover(",
+	] {
+		let section = composite
+			.split(entrypoint)
+			.nth(1)
+			.expect("grid entrypoint")
+			.split("for (index, cell)")
+			.next()
+			.expect("bounded grid geometry setup");
+		let layouts = section
+			.find("let layouts = self.cell_layouts")
+			.expect("layouts first");
+		let requirements = section
+			.find("BandRequirements::across_layouts")
+			.expect("grid aggregates requirements");
+		let tiled = section
+			.find("grid_tiled_area_with_requirements")
+			.expect("tiled geometry reads aggregated requirements");
+		assert!(layouts < requirements && requirements < tiled);
+	}
+}
+
+#[test]
+fn product_0114_estimates_are_declared_without_measurement_or_rotation_surface() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let estimates =
+		std::fs::read_to_string(root.join("plot/text_estimate.rs")).expect("read text estimates");
+	for declaration in [
+		"FORMATTED_LABEL_ADVANCE_EM",
+		"ASCII_LABEL_ADVANCE_EM",
+		"scientific `e`",
+		"Labels outside this alphabet remain renderable",
+		"reservation. PRODUCT-0114 names per-character-class budgeting",
+		"per-character-class budgeting",
+	] {
+		assert!(
+			estimates.contains(declaration),
+			"PRODUCT-0114 estimate contract must declare {declaration}"
+		);
+	}
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot backend");
+	let backend = common
+		.split("pub trait PlotBackend")
+		.nth(1)
+		.and_then(|rest| rest.split("pub trait PlotKernel").next())
+		.expect("bounded plot backend contract");
+	for forbidden in ["measure_text", "text_extent", "glyph_extent"] {
+		assert!(
+			!backend.contains(forbidden),
+			"PRODUCT-0114 added backend text measurement: {forbidden}"
+		);
+	}
+
+	for source in rust_files(&root) {
+		if source.ends_with("plot/common.rs") {
+			continue;
+		}
+		let contents = std::fs::read_to_string(&source).expect("read Polariton source");
+		assert!(
+			!contents.contains("x_label_rotation"),
+			"PRODUCT-0114 must not give rotation a second surface in {}",
+			source.display()
 		);
 	}
 }

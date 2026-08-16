@@ -1,0 +1,16 @@
+// PRODUCT-0114 Stage 0: long categorical axis labels.
+//
+// This is intentionally a geometry probe rather than a polished figure. The
+// default, unrotated labels establish whether current fixed bands already
+// collide; the unequal facet domains make grid-wide reservation observable.
+let axis_labels = workspace.table("axis_labels_probe");
+
+axis_labels.views([
+	view("long-axis-labels", figure([
+		title("Long categorical labels · default rotation"),
+		subtitle("Stage 0 probe for shared bottom and left-band reservations"),
+		skin("greys_rs2"),
+		facet("facet"),
+		bar("label", "value"),
+	])),
+]);

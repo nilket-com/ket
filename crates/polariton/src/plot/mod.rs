@@ -14,6 +14,7 @@ pub mod kernels;
 pub mod legend;
 pub mod request;
 pub mod spec;
+pub(crate) mod text_estimate;
 pub mod theme;
 
 #[cfg(test)]

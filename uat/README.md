@@ -165,3 +165,16 @@ the canonical probe, but its seven healthy cohorts are shaped for legibility:
 compact bell, bimodal, two opposite tails, plateau, narrow peak, and an upper
 shoulder. It deliberately shares the density-width scale, so width communicates
 relative concentration rather than making every violin equally wide.
+
+Seed the PRODUCT-0114 long-label probe before opening the bottom/left-band
+exhibit:
+
+```sh
+nilket toron sql --file uat/axis_labels_probe.sql
+cargo run -p polariton -- uat/test37.rn
+```
+
+`test37.rn` is a deliberately asymmetric faceted bar figure. Its compact and
+verbose facets carry different categorical label lengths, so the default capture
+can show current crowding and later prove that one figure-wide reservation keeps
+facet cells congruent.

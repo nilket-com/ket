@@ -5,6 +5,7 @@ use crate::plot::common::{PlotBackend, ResolvedPlotSettings};
 use crate::plot::continuous_color::ContinuousColorScale;
 use crate::plot::gradient_stops::GradientStops;
 use crate::plot::spec::{NonEmpty, ResolvedPresence};
+use crate::plot::text_estimate::estimate_formatted_label_width;
 use iced::widget::canvas::{Stroke, Style, Text};
 use iced::{Color, Point, Size, alignment};
 
@@ -283,7 +284,6 @@ fn sample_gradient(stops: &GradientStops, t: f32) -> Color {
 const LEGEND_PADDING: f32 = 10.0;
 const GRADIENT_BAR_WIDTH: f32 = 15.0;
 const GRADIENT_TEXT_GAP: f32 = 5.0;
-const NUMERIC_GLYPH_ADVANCE_EM: f32 = 0.75;
 
 #[derive(Clone, Debug, PartialEq)]
 struct GradientLabels {
@@ -300,8 +300,8 @@ impl GradientLabels {
 	}
 
 	fn estimated_width(&self, font_size: f32) -> f32 {
-		estimate_legend_text_width(&self.low, font_size)
-			.max(estimate_legend_text_width(&self.high, font_size))
+		estimate_formatted_label_width(&self.low, font_size)
+			.max(estimate_formatted_label_width(&self.high, font_size))
 	}
 }
 
@@ -334,16 +334,6 @@ enum LegendGeometryKind {
 struct LegendGeometry {
 	size: Size,
 	kind: LegendGeometryKind,
-}
-
-/// Conservatively bound the fixed-precision numeric labels used by gradients.
-///
-/// The plot backend deliberately exposes no realized glyph extents. The
-/// endpoint alphabet is limited to digits, sign, and decimal point. A
-/// deliberately conservative three-quarter-em advance bounds those glyphs in
-/// the resolved default font without pretending to measure them.
-fn estimate_legend_text_width(text: &str, font_size: f32) -> f32 {
-	text.chars().count() as f32 * font_size * NUMERIC_GLYPH_ADVANCE_EM
 }
 
 fn gradient_required_width(labels: &GradientLabels, font_size: f32) -> f32 {
@@ -1340,9 +1330,9 @@ mod tests {
 			assert!(normal_width < large_width);
 		}
 
-		assert_eq!(estimate_legend_text_width("-30.0", 14.0), 52.5);
-		assert_eq!(estimate_legend_text_width("123456.0", 14.0), 84.0);
-		assert_eq!(estimate_legend_text_width("5.0", 14.0), 31.5);
+		assert_eq!(estimate_formatted_label_width("-30.0", 14.0), 52.5);
+		assert_eq!(estimate_formatted_label_width("123456.0", 14.0), 84.0);
+		assert_eq!(estimate_formatted_label_width("5.0", 14.0), 31.5);
 	}
 
 	#[test]

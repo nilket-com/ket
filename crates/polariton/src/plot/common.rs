@@ -8,6 +8,7 @@ use crate::plot::spec::{
 	BarWidth, CategoryGap, HoverTextSize, LegendPosition, PointSize, ResolvedPresence, StrokeWidth,
 	SubtitleTextSize, TitleTextSize,
 };
+use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
 use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
 use iced::advanced::mouse::Cursor;
@@ -245,6 +246,163 @@ pub enum PlotLayout {
 		ranges: Vec<(f64, f64)>,
 	},
 	Radial,
+}
+
+/// Layout-derived inputs for the bottom and left plot bands.
+///
+/// PRODUCT-0114 derives these before plot geometry, from the label producer
+/// and its complete domain rather than from a realized tick set. The latter
+/// would form a cycle: tick placement depends on the plot extent that the band
+/// itself determines. The requirements carry no realized tick information;
+/// the shared band authority is their sole estimator consumer.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BandRequirements {
+	pub x: Vec<AxisBandRequirement>,
+	pub y: Vec<AxisBandRequirement>,
+}
+
+impl BandRequirements {
+	pub(crate) const EMPTY: Self = Self {
+		x: Vec::new(),
+		y: Vec::new(),
+	};
+
+	pub(crate) fn from_layout(layout: &PlotLayout) -> Self {
+		let (x, y) = match layout {
+			PlotLayout::Cartesian {
+				x_range,
+				y_range,
+				x_axis_type,
+				y_axis_type,
+			} => (
+				Some(AxisBandRequirement::Formatted {
+					domain: *x_range,
+					axis_type: *x_axis_type,
+				}),
+				Some(AxisBandRequirement::Formatted {
+					domain: *y_range,
+					axis_type: *y_axis_type,
+				}),
+			),
+			PlotLayout::CategoricalX {
+				categories,
+				y_range,
+				y_axis_type,
+			} => (
+				Some(AxisBandRequirement::Categories(categories.clone())),
+				Some(AxisBandRequirement::Formatted {
+					domain: *y_range,
+					axis_type: *y_axis_type,
+				}),
+			),
+			PlotLayout::CategoricalY {
+				categories,
+				x_range,
+				x_axis_type,
+			} => (
+				Some(AxisBandRequirement::Formatted {
+					domain: *x_range,
+					axis_type: *x_axis_type,
+				}),
+				Some(AxisBandRequirement::Categories(categories.clone())),
+			),
+			PlotLayout::CategoricalXY {
+				x_categories,
+				y_categories,
+			} => (
+				Some(AxisBandRequirement::Categories(x_categories.clone())),
+				Some(AxisBandRequirement::Categories(y_categories.clone())),
+			),
+			PlotLayout::Parallel { .. } | PlotLayout::Radial => (None, None),
+		};
+		Self {
+			x: x.into_iter().collect(),
+			y: y.into_iter().collect(),
+		}
+	}
+
+	pub(crate) fn across_layouts<'a>(layouts: impl IntoIterator<Item = &'a PlotLayout>) -> Self {
+		let mut requirements = Self::EMPTY;
+		for layout in layouts {
+			let local = Self::from_layout(layout);
+			requirements.x.extend(local.x);
+			requirements.y.extend(local.y);
+		}
+		requirements
+	}
+
+	fn estimated_x_width(&self, font_size: f32) -> f32 {
+		self.x
+			.iter()
+			.map(|requirement| requirement.estimated_width(font_size))
+			.fold(0.0, f32::max)
+	}
+
+	fn estimated_y_width(&self, font_size: f32) -> f32 {
+		self.y
+			.iter()
+			.map(|requirement| requirement.estimated_width(font_size))
+			.fold(0.0, f32::max)
+	}
+}
+
+/// The producer-side inputs from which PRODUCT-0114 later derives a longest
+/// possible tick label. Requirements retain complete category domains and
+/// formatted-axis domains so the eventual estimator is the sole authority that
+/// decides which candidate is widest.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) enum AxisBandRequirement {
+	Formatted {
+		domain: (f64, f64),
+		axis_type: AxisType,
+	},
+	Categories(Vec<String>),
+}
+
+impl AxisBandRequirement {
+	fn estimated_width(&self, font_size: f32) -> f32 {
+		match self {
+			Self::Formatted { domain, axis_type } => formatted_label_candidates(*domain)
+				.into_iter()
+				.map(|value| {
+					estimate_formatted_label_width(&format_label(value, *axis_type), font_size)
+				})
+				.fold(0.0, f32::max),
+			Self::Categories(labels) => labels
+				.iter()
+				.map(|label| estimate_ascii_label_width(label, font_size))
+				.fold(0.0, f32::max),
+		}
+	}
+}
+
+/// Candidate values at every `format_label` branch boundary and widest
+/// fixed-precision value that can occur in a domain. These are domain facts,
+/// not realized ticks: sampling ticks here would reintroduce the
+/// geometry/tick-placement cycle PRODUCT-0114 removes.
+fn formatted_label_candidates(domain: (f64, f64)) -> Vec<f64> {
+	let (start, end) = if domain.0 <= domain.1 {
+		domain
+	} else {
+		(domain.1, domain.0)
+	};
+	let mut candidates = vec![start, end];
+	for value in [
+		0.0,
+		-1_000_000.0,
+		-999_999.9,
+		-999_999.0,
+		-0.000_999,
+		0.000_999,
+		999_999.0,
+		999_999.9,
+		1_000_000.0,
+	] {
+		if start <= value && value <= end {
+			candidates.push(value);
+		}
+	}
+	candidates
 }
 
 pub struct CoordinateTransformer<'a> {
@@ -1144,6 +1302,8 @@ fn resolve_canvas_text(
 pub(crate) struct VerticalGuideBands {
 	heading: f32,
 	facet: f32,
+	left: f32,
+	bottom: f32,
 }
 
 impl VerticalGuideBands {
@@ -1152,6 +1312,26 @@ impl VerticalGuideBands {
 	pub(crate) fn resolve(
 		fallback_title: &str,
 		facet_label: Option<&str>,
+		settings: &ResolvedPlotSettings,
+	) -> Self {
+		let mut bands = Self::resolve_with_requirements(
+			fallback_title,
+			facet_label,
+			&BandRequirements::EMPTY,
+			settings,
+		);
+		// Legacy callers do not yet have a layout-derived requirement. They are
+		// limited to grid-cell facet placement and direct geometry tests; preserve
+		// their historical constants until every producer reaches Stage 1.
+		bands.left = settings.plot_padding_left;
+		bands.bottom = settings.plot_padding_bottom;
+		bands
+	}
+
+	pub(crate) fn resolve_with_requirements(
+		fallback_title: &str,
+		facet_label: Option<&str>,
+		requirements: &BandRequirements,
 		settings: &ResolvedPlotSettings,
 	) -> Self {
 		let title_visible = match &settings.title {
@@ -1177,9 +1357,31 @@ impl VerticalGuideBands {
 			.filter(|label| !label.is_empty())
 			.map(|_| Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings))
 			.unwrap_or(0.0);
+		let rotation = settings.x_label_rotation.to_radians();
+		let rotated_tick_height = requirements.estimated_x_width(settings.x_tick_size)
+			* rotation.sin().abs()
+			+ settings.x_tick_size * rotation.cos().abs();
+		let bottom = if requirements.x.is_empty() {
+			0.0
+		} else {
+			let title = (!matches!(&settings.x_label, ResolvedPresence::Hide))
+				.then_some(settings.x_label_padding + settings.x_label_size)
+				.unwrap_or(0.0);
+			(settings.x_label_offset + rotated_tick_height).max(title)
+		};
+		let left = if requirements.y.is_empty() {
+			0.0
+		} else {
+			let title = (!matches!(&settings.y_label, ResolvedPresence::Hide))
+				.then_some(settings.y_label_padding + settings.y_label_size)
+				.unwrap_or(0.0);
+			(10.0 + requirements.estimated_y_width(settings.y_tick_size)).max(title)
+		};
 		Self {
 			heading: title.max(subtitle),
 			facet,
+			left,
+			bottom,
 		}
 	}
 
@@ -1202,10 +1404,10 @@ impl VerticalGuideBands {
 		padding: f32,
 		settings: &ResolvedPlotSettings,
 	) -> Rect<Widget> {
-		let left = padding + settings.plot_padding_left;
+		let left = padding + self.left;
 		let right = padding + settings.plot_padding_right;
 		let top = padding + self.plot_top(settings);
-		let bottom = padding + settings.plot_padding_bottom;
+		let bottom = padding + self.bottom;
 		bounds.region(
 			bounds.x() + left,
 			bounds.y() + top,
@@ -1217,10 +1419,10 @@ impl VerticalGuideBands {
 	pub(crate) fn grid_tiled_area(
 		self,
 		outer: Rect<Widget>,
-		settings: &ResolvedPlotSettings,
+		_settings: &ResolvedPlotSettings,
 	) -> Rect<Widget> {
-		let left = settings.plot_padding_left.min(outer.width());
-		let bottom = settings.plot_padding_bottom.min(outer.height());
+		let left = self.left.min(outer.width());
+		let bottom = self.bottom.min(outer.height());
 		let top = self.heading.min((outer.height() - bottom).max(0.0));
 		outer.region(
 			outer.x() + left,
@@ -1272,12 +1474,14 @@ impl<'a> PlotWidget<'a> {
 			.unwrap_or_default()
 	}
 
-	fn plot_area(&self, bounds: Rect<Widget>) -> Rect<Widget> {
-		VerticalGuideBands::resolve(&self.title, None, &self.settings).plot_area(
-			bounds,
-			self.padding,
+	fn plot_area(&self, bounds: Rect<Widget>, requirements: &BandRequirements) -> Rect<Widget> {
+		VerticalGuideBands::resolve_with_requirements(
+			&self.title,
+			None,
+			requirements,
 			&self.settings,
 		)
+		.plot_area(bounds, self.padding, &self.settings)
 	}
 
 	pub fn render(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
@@ -1321,8 +1525,11 @@ impl<'a> PlotWidget<'a> {
 			.legend_content(&self.settings)
 			.and_then(crate::plot::legend::apply_policy);
 		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
-		let plot_area = self.plot_area(legend.content_bounds).into_iced();
 		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout);
+		let plot_area = self
+			.plot_area(legend.content_bounds, &requirements)
+			.into_iced();
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		let draw_plot = &mut |backend: &mut dyn PlotBackend| {
 			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
@@ -1365,10 +1572,11 @@ impl<'a> PlotWidget<'a> {
 			.legend_content(&self.settings)
 			.and_then(crate::plot::legend::apply_policy);
 		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
-		let plot_extent = self.plot_area(legend.content_bounds);
+		let layout = self.kernel.layout(self.settings.clone());
+		let requirements = BandRequirements::from_layout(&layout);
+		let plot_extent = self.plot_area(legend.content_bounds, &requirements);
 		let plot_area = plot_extent.into_iced();
 		let bounds = bounds.into_iced();
-		let layout = self.kernel.layout(self.settings.clone());
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		let bg = self.settings.chrome.canvas_background.iced();
 		let canvas_w = bounds.width;
@@ -1657,8 +1865,9 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					.legend_content(&self.settings)
 					.and_then(crate::plot::legend::apply_policy);
 				let legend = legend_layout(widget_bounds, legend_content.as_ref(), &self.settings);
-				let plot_area = self.plot_area(legend.content_bounds);
 				let layout = self.kernel.layout(self.settings.clone());
+				let requirements = BandRequirements::from_layout(&layout);
+				let plot_area = self.plot_area(legend.content_bounds, &requirements);
 				let transform = CoordinateTransformer::new(&layout, plot_area.into_iced());
 				let plot_cursor = widget_cursor
 					.map(|cursor| Pt::<Plot>::from_widget(cursor, plot_area))
@@ -2507,6 +2716,200 @@ mod product_0106_vertical_guide_band_oracles {
 	}
 
 	#[test]
+	fn product_0114_band_requirements_are_layout_derived_and_move_only_their_bands() {
+		let temporal_y = PlotLayout::Cartesian {
+			x_range: (0.0, 1.0),
+			y_range: (20_000.0, 20_010.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Date,
+		};
+		let categorical_x = PlotLayout::CategoricalX {
+			categories: vec!["short".to_owned(), "a deliberately longer label".to_owned()],
+			y_range: (0.0, 1.0),
+			y_axis_type: AxisType::Linear,
+		};
+		let temporal = BandRequirements::from_layout(&temporal_y);
+		assert_eq!(
+			temporal.y,
+			vec![AxisBandRequirement::Formatted {
+				domain: (20_000.0, 20_010.0),
+				axis_type: AxisType::Date,
+			}]
+		);
+		let categorical = BandRequirements::from_layout(&categorical_x);
+		assert_eq!(
+			categorical.x,
+			vec![AxisBandRequirement::Categories(vec![
+				"short".to_owned(),
+				"a deliberately longer label".to_owned(),
+			])]
+		);
+
+		let grid = BandRequirements::across_layouts([&temporal_y, &categorical_x]);
+		assert_eq!(grid.x.len(), 2, "grid requirements retain both producers");
+		assert_eq!(grid.y.len(), 2, "the later estimator owns the maximum");
+
+		let settings = ResolvedPlotSettings::default();
+		let legacy =
+			VerticalGuideBands::resolve("", None, &settings).plot_area(bounds(), 6.0, &settings);
+		let staged = VerticalGuideBands::resolve_with_requirements("", None, &grid, &settings)
+			.plot_area(bounds(), 6.0, &settings);
+		assert_eq!(staged.x() - legacy.x(), 45.0);
+		assert_eq!(legacy.width() - staged.width(), 45.0);
+		assert_eq!(staged.height() - legacy.height(), 15.0);
+		assert_eq!(staged.y(), legacy.y());
+	}
+
+	#[test]
+	fn product_0114_bottom_band_uses_the_larger_overlapping_occupant() {
+		let requirement = BandRequirements {
+			x: vec![AxisBandRequirement::Categories(vec!["wide".to_owned()])],
+			y: Vec::new(),
+		};
+
+		let title_larger = ResolvedPlotSettings::default();
+		let title_band =
+			VerticalGuideBands::resolve_with_requirements("", None, &requirement, &title_larger);
+		assert_eq!(title_band.bottom, 65.0, "title term wins at zero rotation");
+
+		let tick_larger = ResolvedPlotSettings {
+			x_label_rotation: 90.0,
+			..ResolvedPlotSettings::default()
+		};
+		let tick_band =
+			VerticalGuideBands::resolve_with_requirements("", None, &requirement, &tick_larger);
+		assert_eq!(
+			tick_band.bottom, 82.0,
+			"tick term wins without summing the title"
+		);
+
+		let equal = ResolvedPlotSettings {
+			x_label_rotation: 90.0,
+			x_label_size: 19.0,
+			..ResolvedPlotSettings::default()
+		};
+		let equal_requirement = BandRequirements {
+			x: vec![AxisBandRequirement::Categories(vec!["abc".to_owned()])],
+			y: Vec::new(),
+		};
+		let equal_band =
+			VerticalGuideBands::resolve_with_requirements("", None, &equal_requirement, &equal);
+		assert_eq!(equal_band.bottom, 64.0, "equal occupants share one band");
+	}
+
+	#[test]
+	fn product_0114_bottom_band_tracks_direct_rotation_without_a_surface() {
+		let requirement = BandRequirements {
+			x: vec![AxisBandRequirement::Categories(vec![
+				"abcdefghij".to_owned(),
+			])],
+			y: Vec::new(),
+		};
+		let width = 10.0 * 18.0;
+		for (rotation, expected) in [
+			(0.0, 65.0),
+			(
+				45.0,
+				10.0 + (width + 18.0) * std::f32::consts::FRAC_1_SQRT_2,
+			),
+			(90.0, 190.0),
+		] {
+			let settings = ResolvedPlotSettings {
+				x_label_rotation: rotation,
+				..ResolvedPlotSettings::default()
+			};
+			let bands =
+				VerticalGuideBands::resolve_with_requirements("", None, &requirement, &settings);
+			assert!(
+				(bands.bottom - expected).abs() < 0.001,
+				"{rotation} degrees reserves the rotated tick extent"
+			);
+		}
+	}
+
+	#[test]
+	fn product_0114_requirements_follow_label_producers_and_the_longest_candidate() {
+		let temporal_y = PlotLayout::Cartesian {
+			x_range: (0.0, 1.0),
+			y_range: (20_000.0, 20_010.0),
+			x_axis_type: AxisType::Linear,
+			y_axis_type: AxisType::Date,
+		};
+		let categorical_y = PlotLayout::CategoricalY {
+			categories: vec!["longest category".to_owned()],
+			x_range: (20_000.0, 20_010.0),
+			x_axis_type: AxisType::Date,
+		};
+		assert!(matches!(
+			BandRequirements::from_layout(&temporal_y).y.as_slice(),
+			[AxisBandRequirement::Formatted {
+				axis_type: AxisType::Date,
+				..
+			}]
+		));
+		assert!(matches!(
+			BandRequirements::from_layout(&categorical_y).x.as_slice(),
+			[AxisBandRequirement::Formatted {
+				axis_type: AxisType::Date,
+				..
+			}]
+		));
+		assert!(matches!(
+			BandRequirements::from_layout(&categorical_y).y.as_slice(),
+			[AxisBandRequirement::Categories(_)]
+		));
+
+		let formatted = AxisBandRequirement::Formatted {
+			domain: (-1_000_001.0, 1_000_001.0),
+			axis_type: AxisType::Linear,
+		};
+		let boundary =
+			estimate_formatted_label_width(&format_label(-999_999.9, AxisType::Linear), 18.0);
+		assert!(
+			formatted.estimated_width(18.0) >= boundary,
+			"format-branch candidates, not realized ticks, include the widest fixed fractional label"
+		);
+
+		let short = AxisBandRequirement::Categories(vec!["aaaa".to_owned()]);
+		let many_short = AxisBandRequirement::Categories(vec!["aaaa".to_owned(); 20]);
+		let longer = AxisBandRequirement::Categories(vec!["aaaaa".to_owned()]);
+		assert_eq!(
+			short.estimated_width(18.0),
+			many_short.estimated_width(18.0)
+		);
+		assert!(longer.estimated_width(18.0) > short.estimated_width(18.0));
+	}
+
+	#[test]
+	fn product_0114_grid_cells_do_not_apply_a_second_shared_edge_inset() {
+		let settings = ResolvedPlotSettings::default();
+		let cell = Rect::<Widget>::from_iced_frame(Rectangle::new(
+			Point::new(200.0, 100.0),
+			iced::Size::new(300.0, 200.0),
+		));
+		let bands = VerticalGuideBands::resolve_with_requirements(
+			"",
+			Some("facet"),
+			&BandRequirements {
+				x: vec![AxisBandRequirement::Categories(vec!["long x".to_owned()])],
+				y: vec![AxisBandRequirement::Categories(vec!["long y".to_owned()])],
+			},
+			&settings,
+		);
+		let local = bands.grid_cell_plot_area(cell, &settings);
+		assert_eq!(
+			local.x(),
+			cell.x(),
+			"the shared left band is not repeated per cell"
+		);
+		assert_eq!(
+			local.bottom(),
+			cell.bottom(),
+			"the shared bottom band is not repeated per cell"
+		);
+	}
+
+	#[test]
 	fn product_0106_zero_title_and_facet_cases_preserve_the_previous_plot_area() {
 		let settings = ResolvedPlotSettings::default();
 		let area =
@@ -3005,8 +3408,11 @@ mod product_0067_0068_strata_oracles {
 			layer: PlotRenderLayer::Full,
 		};
 		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 120.0));
-		let plot_area = widget.plot_area(Rect::from_iced_frame(bounds)).into_iced();
 		let layout = kernel.layout(settings.clone());
+		let requirements = BandRequirements::from_layout(&layout);
+		let plot_area = widget
+			.plot_area(Rect::from_iced_frame(bounds), &requirements)
+			.into_iced();
 		let transform = CoordinateTransformer::new(&layout, plot_area);
 		let mut backend = OperationBackend::default();
 		backend.fill_rectangle(
