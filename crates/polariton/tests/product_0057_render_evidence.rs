@@ -42,6 +42,7 @@ mod rune_view_compiler;
 #[path = "../src/session_persistence.rs"]
 mod session_persistence;
 
+use coordinate::Rect;
 use gui::table::{Product0057TableEvidenceGeometry, draw_product_0057_table_evidence};
 use iced::advanced::graphics::geometry::Renderer as _;
 use iced::advanced::renderer::{Headless as _, Renderer as _};
@@ -50,8 +51,9 @@ use iced::{Color, Font, Pixels, Point, Rectangle, Size, Vector};
 use iced_wgpu::graphics::{Antialiasing, Shell};
 use iced_wgpu::{Engine, Renderer as WgpuRenderer, wgpu};
 use plot::common::{
-	AxisType, CoordinateTransformer, IcedBackend, Orientation, PathBuilder, PlotBackend,
-	PlotKernel, PlotLayout, PlotRenderLayer, PlotWidget, ResolvedPlotSettings, TickPlacement,
+	AxisType, BandRequirements, CoordinateTransformer, IcedBackend, Orientation, PathBuilder,
+	PlotBackend, PlotKernel, PlotLayout, PlotRenderLayer, PlotWidget, ResolvedPlotSettings,
+	TickPlacement, VerticalGuideBands,
 };
 use plot::composition::PlotComposition;
 use plot::core::PlotType;
@@ -593,16 +595,19 @@ fn render_product_0068_bar(
 	})
 }
 
-fn product_0115_rotation_fixture(rotation: f32) -> (BarPlotKernel, PlotSettings) {
+fn product_rotation_fixture(
+	rotation: f32,
+	categories: &[&str],
+	values: &[f64],
+) -> (BarPlotKernel, PlotSettings) {
 	let (mut kernel, _) = product_0068_bar_fixture();
 	kernel.prepared_data = Arc::new(BarPreparedData {
-		categories: vec![
-			"International partner enablement and certification".to_owned(),
-			"North American enterprise renewal commitments".to_owned(),
-			"Regulated migration and governance readiness".to_owned(),
-		],
+		categories: categories
+			.iter()
+			.map(|category| (*category).to_owned())
+			.collect(),
 		group_names: vec!["Series".to_owned()],
-		values: vec![vec![62.0], vec![74.0], vec![58.0]],
+		values: values.iter().map(|value| vec![*value]).collect(),
 		y_range: (0.0, 90.0),
 		x_label: String::new(),
 		y_label: String::new(),
@@ -625,12 +630,47 @@ fn product_0115_rotation_fixture(rotation: f32) -> (BarPlotKernel, PlotSettings)
 	(kernel, PlotSettings::from_resolved(resolved))
 }
 
+fn product_0115_rotation_fixture(rotation: f32) -> (BarPlotKernel, PlotSettings) {
+	product_rotation_fixture(
+		rotation,
+		&[
+			"International partner enablement and certification",
+			"North American enterprise renewal commitments",
+			"Regulated migration and governance readiness",
+		],
+		&[62.0, 74.0, 58.0],
+	)
+}
+
+fn product_0116_rotation_fixture(rotation: f32) -> (BarPlotKernel, PlotSettings) {
+	product_rotation_fixture(
+		rotation,
+		&["Edge", "Ship", "Ship delivery commitment", "Edge"],
+		&[62.0, 74.0, 58.0, 66.0],
+	)
+}
+
 fn render_product_0115_rotation(
 	renderer: &mut iced::Renderer,
 	size: Size<u32>,
 	rotation: f32,
 ) -> (Capture, Rectangle) {
-	let (kernel, settings) = product_0115_rotation_fixture(rotation);
+	render_product_rotation(renderer, size, product_0115_rotation_fixture(rotation))
+}
+
+fn render_product_0116_rotation(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	rotation: f32,
+) -> (Capture, Rectangle) {
+	render_product_rotation(renderer, size, product_0116_rotation_fixture(rotation))
+}
+
+fn render_product_rotation(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	(kernel, settings): (BarPlotKernel, PlotSettings),
+) -> (Capture, Rectangle) {
 	let resolved = settings.resolve();
 	// Render a figure smaller than the target, anchored at the target origin.
 	// Pixels in the unused frame prove whether an axis overlay escaped its own
@@ -682,6 +722,63 @@ fn exterior_luminous_pixels(capture: &Capture, bounds: Rectangle) -> usize {
 		}
 	}
 	count
+}
+
+/// PRODUCT-0116's production corroboration deliberately compares labels with
+/// the same leading glyphs but radically different lengths. The operation
+/// trace proves their logical origins exactly; this only checks that iced/wgpu
+/// does not turn the removed estimate-driven vertical term into a visible
+/// length-proportional cascade.
+fn product_0116_tick_run_top(
+	capture: &Capture,
+	figure_bounds: Rectangle,
+	category_index: usize,
+) -> u32 {
+	let (kernel, settings) = product_0116_rotation_fixture(90.0);
+	let resolved = settings.resolve();
+	let layout = kernel.layout(resolved.clone());
+	let requirements = BandRequirements::from_layout(&layout);
+	let plot_area =
+		VerticalGuideBands::resolve_with_requirements("", None, &requirements, &resolved)
+			.plot_area(Rect::from_iced_frame(figure_bounds), 0.0, &resolved)
+			.into_iced();
+	let (categories, y_range) = match &layout {
+		PlotLayout::CategoricalX {
+			categories,
+			y_range,
+			..
+		} => (categories, *y_range),
+		_ => unreachable!("PRODUCT-0116 fixture stays categorical on x"),
+	};
+	let transform = CoordinateTransformer::new(&layout, plot_area);
+	let (tick, _) = transform.categorical(category_index, y_range.0);
+	let first_y = (tick.y + resolved.x_label_offset - 2.0).max(0.0).floor() as u32;
+	let left = (tick.x - resolved.x_tick_size - 4.0).max(0.0).floor() as u32;
+	let right = (tick.x + resolved.x_tick_size + 4.0)
+		.min(capture.width as f32)
+		.ceil() as u32;
+	assert!(
+		category_index < categories.len(),
+		"PRODUCT-0116 probe selects an existing interior category"
+	);
+	for y in first_y
+		..capture
+			.height
+			.min((figure_bounds.y + figure_bounds.height).ceil() as u32)
+	{
+		if (left..right).any(|x| {
+			capture
+				.pixel(x, y)
+				.iter()
+				.copied()
+				.max()
+				.unwrap_or_default()
+				> 120
+		}) {
+			return y;
+		}
+	}
+	panic!("PRODUCT-0116 probe must realize tick-label ink below the axis");
 }
 
 fn product_0068_cartesian_settings() -> PlotSettings {
@@ -1737,6 +1834,19 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	}
 	println!(
 		"PRODUCT_0115 x_tick_rotation disposition=automated zero/positive/negative=contained/contained/contained"
+	);
+	let (product_0116_vertical, product_0116_bounds) =
+		render_product_0116_rotation(&mut msaa, product_0115_size, 90.0);
+	let product_0116_short_top =
+		product_0116_tick_run_top(&product_0116_vertical, product_0116_bounds, 1);
+	let product_0116_long_top =
+		product_0116_tick_run_top(&product_0116_vertical, product_0116_bounds, 2);
+	assert!(
+		product_0116_short_top.abs_diff(product_0116_long_top) <= 4,
+		"PRODUCT-0116 production rotation must not turn label length into a vertical cascade: short={product_0116_short_top}, long={product_0116_long_top}"
+	);
+	println!(
+		"PRODUCT_0116 estimation_never_moves_ink disposition=production short_top={product_0116_short_top} long_top={product_0116_long_top}"
 	);
 
 	let product_0077_size = Size::new(800, 600);

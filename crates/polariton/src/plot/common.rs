@@ -1290,17 +1290,17 @@ enum XTickEndpoint {
 	Max,
 }
 
-/// PRODUCT-0115's one authority for rotated x-tick endpoint correction.
+/// PRODUCT-0116's one authority for rotated x-tick placement.
 ///
-/// A rotated run always receives the translation needed to keep its upper edge
-/// below the tick baseline. At an outer endpoint, the same authority also
-/// chooses the inward pivot: changing that pivot alone swings the run upward,
-/// while translating alone leaves the endpoint centred. Width is a
-/// producer-keyed estimate supplied by PRODUCT-0114's text-estimate authority.
+/// A nonzero rotation chooses its leading pivot from the transformed run, so
+/// every text run begins at the tick baseline without a width-derived vertical
+/// correction. Only the outer endpoint that would otherwise overhang receives
+/// an estimated, figure-space horizontal pull. PRODUCT-0114's estimate may
+/// reserve space and pull inward; it never determines vertical ink placement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct XTickTextPlacement {
 	alignment: alignment::Horizontal,
-	y_offset: f32,
+	x_offset: f32,
 }
 
 impl XTickTextPlacement {
@@ -1313,32 +1313,48 @@ impl XTickTextPlacement {
 		if rotation == TickRotation::ZERO {
 			return Self {
 				alignment: legacy_alignment,
-				y_offset: 0.0,
+				x_offset: 0.0,
 			};
 		}
 		let radians = rotation.radians();
-		let alignment = match (radians.is_sign_positive(), endpoint, legacy_alignment) {
-			// Positive canvas rotation carries a left-aligned run down/right, so
-			// correct only the right endpoint by pivoting it from its right edge.
-			(true, XTickEndpoint::Max, alignment::Horizontal::Center) => {
-				alignment::Horizontal::Right
-			}
-			// Negative rotation mirrors the policy at the left endpoint.
-			(false, XTickEndpoint::Min, alignment::Horizontal::Center) => {
-				alignment::Horizontal::Left
-			}
-			_ => legacy_alignment,
+		let alignment = Self::leading_alignment(radians);
+		let (run_start, run_end) = Self::run(alignment, estimated_width);
+		let (run_min_x, run_max_x) = (
+			(run_start * radians.cos()).min(run_end * radians.cos()),
+			(run_start * radians.cos()).max(run_end * radians.cos()),
+		);
+		let x_offset = match endpoint {
+			XTickEndpoint::Min => (-run_min_x).max(0.0),
+			XTickEndpoint::Max => (-run_max_x).min(0.0),
+			XTickEndpoint::None => 0.0,
 		};
-		let (run_start, run_end) = match alignment {
-			alignment::Horizontal::Left => (0.0, estimated_width),
-			alignment::Horizontal::Center => (-estimated_width / 2.0, estimated_width / 2.0),
-			alignment::Horizontal::Right => (-estimated_width, 0.0),
-		};
-		let min_y = (run_start * radians.sin()).min(run_end * radians.sin());
 		Self {
 			alignment,
-			y_offset: (-min_y).max(0.0),
+			x_offset,
 		}
+	}
+
+	fn leading_alignment(radians: f32) -> alignment::Horizontal {
+		let left_min_y = Self::minimum_vertical_extent(radians, alignment::Horizontal::Left, 1.0);
+		let right_min_y = Self::minimum_vertical_extent(radians, alignment::Horizontal::Right, 1.0);
+		if left_min_y >= right_min_y {
+			alignment::Horizontal::Left
+		} else {
+			alignment::Horizontal::Right
+		}
+	}
+
+	fn run(alignment: alignment::Horizontal, width: f32) -> (f32, f32) {
+		match alignment {
+			alignment::Horizontal::Left => (0.0, width),
+			alignment::Horizontal::Center => (-width / 2.0, width / 2.0),
+			alignment::Horizontal::Right => (-width, 0.0),
+		}
+	}
+
+	fn minimum_vertical_extent(radians: f32, alignment: alignment::Horizontal, width: f32) -> f32 {
+		let (run_start, run_end) = Self::run(alignment, width);
+		(run_start * radians.sin()).min(run_end * radians.sin())
 	}
 }
 
@@ -2270,8 +2286,8 @@ impl<'a> PlotWidget<'a> {
 				);
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(
-						p_bottom.x,
-						p_bottom.y + self.settings.x_label_offset + placement.y_offset,
+						p_bottom.x + placement.x_offset,
+						p_bottom.y + self.settings.x_label_offset,
 					));
 					backend.rotate(self.settings.x_tick_rotation.radians());
 					backend.fill_text(Text {
@@ -2458,8 +2474,8 @@ impl<'a> PlotWidget<'a> {
 				);
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(
-						center_px.x,
-						center_px.y + self.settings.x_label_offset + placement.y_offset,
+						center_px.x + placement.x_offset,
+						center_px.y + self.settings.x_label_offset,
 					));
 					backend.rotate(self.settings.x_tick_rotation.radians());
 					backend.fill_text(Text {
@@ -2687,8 +2703,8 @@ impl<'a> PlotWidget<'a> {
 				);
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(
-						tick_x,
-						tick_y + self.settings.x_label_offset + placement.y_offset,
+						tick_x + placement.x_offset,
+						tick_y + self.settings.x_label_offset,
 					));
 					backend.rotate(self.settings.x_tick_rotation.radians());
 					backend.fill_text(Text {
@@ -3022,7 +3038,7 @@ mod product_0106_vertical_guide_band_oracles {
 	}
 
 	#[test]
-	fn product_0115_rotated_x_tick_endpoint_placement_is_signed_and_coupled() {
+	fn product_0116_estimation_never_moves_rotated_tick_ink() {
 		let width = 120.0;
 		let zero = XTickTextPlacement::resolve(
 			TickRotation::ZERO,
@@ -3031,65 +3047,84 @@ mod product_0106_vertical_guide_band_oracles {
 			width,
 		);
 		assert_eq!(zero.alignment, alignment::Horizontal::Center);
-		assert_eq!(zero.y_offset, 0.0, "zero keeps legacy placement");
+		assert_eq!(zero.x_offset, 0.0, "zero keeps legacy placement");
 
-		let positive = XTickTextPlacement::resolve(
-			TickRotation::new(45.0).unwrap(),
-			alignment::Horizontal::Center,
-			XTickEndpoint::Max,
-			width,
-		);
-		assert_eq!(positive.alignment, alignment::Horizontal::Right);
-		assert!(
-			(positive.y_offset - width * std::f32::consts::FRAC_1_SQRT_2).abs() < 0.001,
-			"the inward pivot and its vertical compensation are one decision"
-		);
-
-		let negative = XTickTextPlacement::resolve(
-			TickRotation::new(-45.0).unwrap(),
-			alignment::Horizontal::Center,
-			XTickEndpoint::Min,
-			width,
-		);
-		assert_eq!(negative.alignment, alignment::Horizontal::Left);
-		assert!((negative.y_offset - positive.y_offset).abs() < 0.001);
-
-		for (rotation, endpoint) in [
-			(TickRotation::new(45.0).unwrap(), XTickEndpoint::Min),
-			(TickRotation::new(-45.0).unwrap(), XTickEndpoint::Max),
+		for (rotation, expected_alignment, corrected_endpoint) in [
+			(
+				TickRotation::new(45.0).unwrap(),
+				alignment::Horizontal::Left,
+				XTickEndpoint::Max,
+			),
+			(
+				TickRotation::new(-45.0).unwrap(),
+				alignment::Horizontal::Right,
+				XTickEndpoint::Min,
+			),
+			(
+				TickRotation::new(90.0).unwrap(),
+				alignment::Horizontal::Left,
+				XTickEndpoint::Max,
+			),
+			(
+				TickRotation::new(-90.0).unwrap(),
+				alignment::Horizontal::Right,
+				XTickEndpoint::Min,
+			),
 		] {
-			let unchanged = XTickTextPlacement::resolve(
+			let radians = rotation.radians();
+			for endpoint in [XTickEndpoint::None, XTickEndpoint::Min, XTickEndpoint::Max] {
+				let placement = XTickTextPlacement::resolve(
+					rotation,
+					alignment::Horizontal::Center,
+					endpoint,
+					width,
+				);
+				assert_eq!(
+					placement.alignment, expected_alignment,
+					"the pivot is selected from the transformed run, never from endpoint policy"
+				);
+				for realized_width in [1.0, 37.5, width] {
+					assert!(
+						XTickTextPlacement::minimum_vertical_extent(
+							radians,
+							placement.alignment,
+							realized_width,
+						)
+						.abs() < 0.001,
+						"the chosen pivot has no negative vertical extent for any positive run width"
+					);
+				}
+				if endpoint == XTickEndpoint::None {
+					assert_eq!(
+						placement.x_offset, 0.0,
+						"interior labels originate at their ticks without estimated centring"
+					);
+				}
+			}
+
+			let corrected = XTickTextPlacement::resolve(
 				rotation,
 				alignment::Horizontal::Center,
-				endpoint,
+				corrected_endpoint,
 				width,
 			);
-			assert_eq!(unchanged.alignment, alignment::Horizontal::Center);
-			assert!(
-				(unchanged.y_offset - width * std::f32::consts::FRAC_1_SQRT_2 / 2.0).abs() < 0.001,
-				"a centred interior run is translated below the baseline without changing its pivot"
-			);
+			let (run_start, run_end) = XTickTextPlacement::run(corrected.alignment, width);
+			let corrected_min_x =
+				corrected.x_offset + (run_start * radians.cos()).min(run_end * radians.cos());
+			let corrected_max_x =
+				corrected.x_offset + (run_start * radians.cos()).max(run_end * radians.cos());
+			match corrected_endpoint {
+				XTickEndpoint::Min => assert!(
+					corrected_min_x >= -0.001,
+					"the minimum endpoint's conservative run extent remains inside its figure edge"
+				),
+				XTickEndpoint::Max => assert!(
+					corrected_max_x <= 0.001,
+					"the maximum endpoint's conservative run extent remains inside its figure edge"
+				),
+				XTickEndpoint::None => unreachable!("the signed fixture selects an outer endpoint"),
+			}
 		}
-
-		let shared_edge = XTickTextPlacement::resolve(
-			TickRotation::new(45.0).unwrap(),
-			alignment::Horizontal::Left,
-			XTickEndpoint::Max,
-			width,
-		);
-		assert_eq!(shared_edge.alignment, alignment::Horizontal::Left);
-		assert_eq!(
-			shared_edge.y_offset, 0.0,
-			"PRODUCT-0077 anchor remains its own policy"
-		);
-
-		let vertical = XTickTextPlacement::resolve(
-			TickRotation::new(90.0).unwrap(),
-			alignment::Horizontal::Center,
-			XTickEndpoint::Max,
-			width,
-		);
-		assert!((vertical.y_offset - width).abs() < 0.001);
 	}
 
 	#[test]

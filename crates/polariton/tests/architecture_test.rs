@@ -4556,3 +4556,65 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 	assert!(!free.contains("\"x_label_rotation\""));
 	assert!(!free.contains("\"y_tick_rotation\""));
 }
+
+#[test]
+fn product_0116_estimates_only_reserve_or_pull_rotated_tick_runs_inward() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let placement = common
+		.split("struct XTickTextPlacement")
+		.nth(1)
+		.and_then(|rest| rest.split("pub(crate) struct AxisTextVisibility").next())
+		.expect("bounded rotated tick placement authority");
+	for declaration in [
+		"x_offset: f32",
+		"fn leading_alignment",
+		"fn minimum_vertical_extent",
+		"XTickEndpoint::Min => (-run_min_x).max(0.0)",
+		"XTickEndpoint::Max => (-run_max_x).min(0.0)",
+	] {
+		assert!(
+			placement.contains(declaration),
+			"PRODUCT-0116 keeps rotated tick placement in its one authority: {declaration}"
+		);
+	}
+	assert!(
+		!placement.contains("y_offset"),
+		"PRODUCT-0116 forbids estimated vertical tick displacement"
+	);
+
+	for (entrypoint, next, x_origin, y_origin) in [
+		(
+			"pub(crate) fn draw_cartesian_axes",
+			"pub(crate) fn draw_categorical_grid",
+			"p_bottom.x + placement.x_offset",
+			"p_bottom.y + self.settings.x_label_offset",
+		),
+		(
+			"pub(crate) fn draw_categorical_axes",
+			"pub(crate) fn draw_categorical_y_grid",
+			"center_px.x + placement.x_offset",
+			"center_px.y + self.settings.x_label_offset",
+		),
+		(
+			"pub(crate) fn draw_categorical_xy_axes",
+			"pub(crate) fn draw_parallel_axes",
+			"tick_x + placement.x_offset",
+			"tick_y + self.settings.x_label_offset",
+		),
+	] {
+		let section = common
+			.split(entrypoint)
+			.nth(1)
+			.and_then(|rest| rest.split(next).next())
+			.expect("bounded rotated x-axis draw site");
+		assert!(
+			section.contains(x_origin) && section.contains(y_origin),
+			"PRODUCT-0116 emits a figure-space x correction and shared baseline y from {entrypoint}"
+		);
+		assert!(
+			!section.contains("placement.y_offset"),
+			"PRODUCT-0116 does not restore vertical correction from {entrypoint}"
+		);
+	}
+}
