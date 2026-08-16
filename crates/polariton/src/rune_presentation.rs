@@ -14,7 +14,7 @@ use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FunnelFields,
 	HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
 	MultivariateFields, Override, PieFields, PointSize, Presence, RadialDialFields, StrokeWidth,
-	SubtitleTextSize, TitleTextSize, ViolinFields,
+	SubtitleTextSize, TickRotation, TitleTextSize, ViolinFields,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -186,6 +186,7 @@ enum FigureElementKind {
 	XMinorTicks(u32),
 	YMinorTicks(u32),
 	HoverSize(HoverTextSize),
+	XTickRotation(TickRotation),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -450,6 +451,7 @@ fn build_context() -> Result<Context, String> {
 		("__x_minor_ticks", raw_x_minor_ticks as RawFunction),
 		("__y_minor_ticks", raw_y_minor_ticks as RawFunction),
 		("__hover_size", raw_hover_size as RawFunction),
+		("__x_tick_rotation", raw_x_tick_rotation as RawFunction),
 		("__table", raw_table as RawFunction),
 		("__layers", raw_layers as RawFunction),
 		("__figure", raw_figure as RawFunction),
@@ -1725,6 +1727,7 @@ enum NumericScalarConstructor {
 	XMinorTicks,
 	YMinorTicks,
 	HoverSize,
+	XTickRotation,
 }
 
 fn raw_x_tick_step(
@@ -1807,6 +1810,22 @@ fn raw_hover_size(
 	)
 }
 
+fn raw_x_tick_rotation(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_numeric_scalar(
+		NumericScalarConstructor::XTickRotation,
+		"x_tick_rotation",
+		stack,
+		addr,
+		args,
+		out,
+	)
+}
+
 fn raw_numeric_scalar(
 	kind: NumericScalarConstructor,
 	name: &'static str,
@@ -1846,6 +1865,11 @@ fn raw_numeric_scalar(
 			NumericScalarConstructor::HoverSize => {
 				presentation_hover_size(values[0].clone(), origin.start.into(), origin.end.into())
 			}
+			NumericScalarConstructor::XTickRotation => presentation_x_tick_rotation(
+				values[0].clone(),
+				origin.start.into(),
+				origin.end.into(),
+			),
 		}
 	};
 	store(out, stack, element)
@@ -2117,6 +2141,20 @@ fn presentation_hover_size(value: Value, start: i64, end: i64) -> RuneFigureElem
 		.and_then(|value| {
 			HoverTextSize::new(value as f32)
 				.map(FigureElementKind::HoverSize)
+				.map_err(|error| PresentationFailure::new(origin, error.to_string()))
+		});
+	RuneFigureElement::new(value, origin)
+}
+
+fn presentation_x_tick_rotation(value: Value, start: i64, end: i64) -> RuneFigureElement {
+	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
+	let value = rune_number(&value)
+		.ok_or_else(|| {
+			PresentationFailure::new(origin, "x_tick_rotation(...) requires a number".to_owned())
+		})
+		.and_then(|value| {
+			TickRotation::new(value as f32)
+				.map(FigureElementKind::XTickRotation)
 				.map_err(|error| PresentationFailure::new(origin, error.to_string()))
 		});
 	RuneFigureElement::new(value, origin)
@@ -3070,6 +3108,7 @@ struct FigureParts {
 	x_minor_ticks: Option<(u32, Origin)>,
 	y_minor_ticks: Option<(u32, Origin)>,
 	hover_size: Option<(HoverTextSize, Origin)>,
+	x_tick_rotation: Option<(TickRotation, Origin)>,
 	body: Option<(RunePlotBody, Origin)>,
 }
 
@@ -3293,6 +3332,12 @@ fn merge_element(
 			origin,
 			"a figure has at most one hover_size element",
 		),
+		FigureElementKind::XTickRotation(value) => set_once(
+			&mut parts.x_tick_rotation,
+			(value, origin),
+			origin,
+			"a figure has at most one x_tick_rotation element",
+		),
 	}
 }
 
@@ -3330,6 +3375,9 @@ impl FigureParts {
 		}
 		if let Some((hover_size, _)) = self.hover_size {
 			authored_settings.hover_size = Override::Set(hover_size);
+		}
+		if let Some((rotation, _)) = self.x_tick_rotation {
+			authored_settings.x_tick_rotation = Override::Set(rotation);
 		}
 		if let Some((skin, _)) = &self.skin {
 			authored_settings.plot_skin = Override::Set(skin.clone());

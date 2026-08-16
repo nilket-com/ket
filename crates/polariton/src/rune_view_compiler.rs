@@ -53,6 +53,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"x_label",
 	"x_minor_ticks",
 	"x_tick_step",
+	"x_tick_rotation",
 	"y_bounds",
 	"y_label",
 	"y_minor_ticks",
@@ -2637,6 +2638,54 @@ workspace.table("t").views([figure([
 			);
 			assert!(message.contains("hover size") || message.contains("requires a number"));
 		}
+	}
+
+	#[test]
+	fn product_0115_x_tick_rotation_is_a_typed_generated_text_word() {
+		let source = r#"workspace.table("t").views([figure([
+x_tick_rotation(-45),
+bar("x", "y"),
+])])"#;
+		let compiled = compile(source).expect("x-tick rotation compiles");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("rotation fixture produced a table")
+		};
+		assert_eq!(
+			plot.authored_settings.x_tick_rotation,
+			crate::plot::spec::Override::Set(crate::plot::spec::TickRotation::new(-45.0).unwrap())
+		);
+
+		for accepted in ["-90", "0", "90"] {
+			compile(&format!(
+				"workspace.table(\"t\").views([figure([x_tick_rotation({accepted}), bar(\"x\", \"y\")])])"
+			))
+			.expect("inclusive degree endpoint compiles");
+		}
+		for rejected in ["-90.1", "90.1", "\"diagonal\""] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([x_tick_rotation({rejected}), bar(\"x\", \"y\")])])"
+			);
+			let error = compile(&source).expect_err("invalid rotation refuses");
+			let RuneEnvelopeError::InvalidView { span, message } = error else {
+				panic!("rotation refusal retains its word origin")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				format!("x_tick_rotation({rejected})")
+			);
+			assert!(message.contains("x-tick rotation") || message.contains("requires a number"));
+		}
+		let legacy = compile(
+			r#"workspace.table("t").views([figure([x_label_rotation(45), bar("x", "y")])])"#,
+		)
+		.expect_err("historical internal name is not public Rune vocabulary");
+		let RuneEnvelopeError::InvalidView { message, .. } = legacy else {
+			panic!("unknown legacy spelling remains an invalid view")
+		};
+		assert!(
+			message.contains("Missing item x_label_rotation"),
+			"{message}"
+		);
 	}
 
 	#[test]

@@ -11,6 +11,7 @@ use crate::coordinate::{Pt, Rect, Widget};
 use crate::plot::common::{
 	AxisTextAnchoring, AxisTextVisibility, BandRequirements, CoordinateTransformer, PlotBackend,
 	PlotComposite, PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, VerticalGuideBands,
+	resolve_canvas_text,
 };
 use crate::plot::factory::{create_plot, create_styled_plot};
 #[cfg(test)]
@@ -454,6 +455,12 @@ fn axis_text_visibility(cell: AxisTextCell, cells: &[AxisTextCell]) -> AxisTextV
 			x_max: occupied(right),
 			y_min: occupied(below),
 			y_max: occupied(above),
+			figure_x_min: !cells
+				.iter()
+				.any(|other| other.position.column < cell.position.column),
+			figure_x_max: !cells
+				.iter()
+				.any(|other| other.position.column > cell.position.column),
 		},
 	}
 }
@@ -662,7 +669,14 @@ impl PlotComposite for PlotGridKernel {
 		let layouts = self.cell_layouts(resolved.clone());
 		let requirements =
 			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
-		let tiled = grid_tiled_area_with_requirements(outer, title, &requirements, &resolved);
+		let x_label_visible = grid_x_label_visible(self, &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			x_label_visible,
+			&resolved,
+		);
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
 			let cell_bounds = grid_cell_bounds_with_settings(
@@ -754,7 +768,14 @@ impl PlotComposite for PlotGridKernel {
 		let layouts = self.cell_layouts(resolved.clone());
 		let requirements =
 			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
-		let tiled = grid_tiled_area_with_requirements(outer, title, &requirements, &resolved);
+		let x_label_visible = grid_x_label_visible(self, &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			x_label_visible,
+			&resolved,
+		);
 		let axis_cells = self.axis_text_cells();
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
@@ -888,7 +909,7 @@ impl PlotComposite for PlotGridKernel {
 			resize_render_suspended: false,
 			layer: crate::plot::common::PlotRenderLayer::Full,
 		};
-		helper.draw_axis_labels(backend, shared_extent.into_iced());
+		helper.draw_axis_labels(backend, shared_extent.into_iced(), &requirements);
 		if let (Some(content), Some(origin)) =
 			(figure_legend.as_ref(), legend.origin(shared_extent))
 		{
@@ -915,7 +936,14 @@ impl PlotComposite for PlotGridKernel {
 		let layouts = self.cell_layouts(resolved.clone());
 		let requirements =
 			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
-		let tiled = grid_tiled_area_with_requirements(outer, title, &requirements, &resolved);
+		let x_label_visible = grid_x_label_visible(self, &resolved);
+		let tiled = grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			x_label_visible,
+			&resolved,
+		);
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
 			let cell_bounds = grid_cell_bounds_with_settings(
@@ -961,10 +989,25 @@ fn grid_tiled_area_with_requirements(
 	outer: Rect<Widget>,
 	title: &str,
 	requirements: &BandRequirements,
+	x_label_visible: bool,
 	settings: &ResolvedPlotSettings,
 ) -> Rect<Widget> {
-	VerticalGuideBands::resolve_with_requirements(title, None, requirements, settings)
-		.grid_tiled_area(outer, settings)
+	VerticalGuideBands::resolve_with_requirements_and_x_label(
+		title,
+		None,
+		requirements,
+		x_label_visible,
+		settings,
+	)
+	.grid_tiled_area(outer, settings)
+}
+
+fn grid_x_label_visible(kernel: &PlotGridKernel, settings: &ResolvedPlotSettings) -> bool {
+	resolve_canvas_text(
+		&settings.x_label,
+		Some(kernel.cells.first().kernel.x_label()),
+	)
+	.is_some_and(|label| !label.is_empty())
 }
 
 fn grid_plot_area(
@@ -1698,7 +1741,13 @@ mod tests {
 		let layouts = kernel.cell_layouts(settings.clone());
 		let requirements =
 			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
-		grid_tiled_area_with_requirements(outer, title, &requirements, settings)
+		grid_tiled_area_with_requirements(
+			outer,
+			title,
+			&requirements,
+			grid_x_label_visible(kernel, settings),
+			settings,
+		)
 	}
 
 	fn rendered_tick_paths(svg: &str, clip_id: usize, origin: Point) -> Vec<[f32; 4]> {
@@ -4092,6 +4141,8 @@ mod tests {
 				x_max: true,
 				y_min: true,
 				y_max: true,
+				figure_x_min: false,
+				figure_x_max: false,
 			}
 		);
 		assert_eq!(
@@ -4143,6 +4194,8 @@ mod tests {
 			x_max: true,
 			y_min: true,
 			y_max: true,
+			figure_x_min: false,
+			figure_x_max: false,
 		};
 		let exact_range = (0.0, 50.0);
 		let exact = TickPlacement::step(10.0)
@@ -4379,6 +4432,8 @@ mod tests {
 					x_max: true,
 					y_min: true,
 					y_max: true,
+					figure_x_min: false,
+					figure_x_max: false,
 				},
 			},
 		);

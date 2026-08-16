@@ -12,7 +12,8 @@ use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::spec::{
 	BarWidth, CategoryGap, ColorJob, HoverTextSize, LayerSettings, LegendPosition, Override,
-	PointSize, Presence, ResolvedPresence, StrokeWidth, SubtitleTextSize, TitleTextSize,
+	PointSize, Presence, ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation,
+	TitleTextSize,
 };
 use iced::Color;
 use libaryon::engine::UiPalette;
@@ -109,6 +110,7 @@ pub struct PlotTypography {
 	pub y_tick_size: f32,
 	pub legend_size: f32,
 	pub hover_size: HoverTextSize,
+	pub x_tick_rotation: TickRotation,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -210,6 +212,9 @@ pub struct PlotSettingsLayer {
 	/// PRODUCT-0112: a partial hover-size override avoids reconstructing the
 	/// whole typography carrier merely to size generated hover text.
 	pub hover_size: Override<HoverTextSize>,
+	/// PRODUCT-0115: specific generated x-tick orientation avoids rebuilding
+	/// the complete typography carrier.
+	pub x_tick_rotation: Override<TickRotation>,
 	pub padding: Override<PlotPadding>,
 	pub guides: Override<PlotGuideSettings>,
 	pub domains: Override<PlotDomainOverrides>,
@@ -253,6 +258,7 @@ impl Default for PlotSettingsLayer {
 			title_size: Override::Inherit,
 			subtitle_size: Override::Inherit,
 			hover_size: Override::Inherit,
+			x_tick_rotation: Override::Inherit,
 			padding: Override::Inherit,
 			guides: Override::Inherit,
 			domains: Override::Inherit,
@@ -384,6 +390,7 @@ fn apply_layer(
 		settings.y_tick_size = value.y_tick_size;
 		settings.legend_size = value.legend_size;
 		settings.hover_size = value.hover_size;
+		settings.x_tick_rotation = value.x_tick_rotation;
 	}
 	// PRODUCT-0113: specific typography slots follow PRODUCT-0091's partial
 	// override rule and win over the atomic carrier within one tier.
@@ -397,6 +404,9 @@ fn apply_layer(
 	// within a tier, just as PRODUCT-0091's partial continuous-ramp slots do.
 	if let Override::Set(value) = layer.hover_size {
 		settings.hover_size = value;
+	}
+	if let Override::Set(value) = layer.x_tick_rotation {
+		settings.x_tick_rotation = value;
 	}
 	if let Override::Set(value) = &layer.padding {
 		settings.plot_padding_top = value.top;
@@ -511,6 +521,7 @@ mod tests {
 			y_tick_size: 18.0,
 			legend_size: 14.0,
 			hover_size,
+			x_tick_rotation: TickRotation::ZERO,
 		}
 	}
 
@@ -547,6 +558,40 @@ mod tests {
 			size(24.0),
 			"atomic typography still delivers hover size when the partial slot is absent"
 		);
+	}
+
+	#[test]
+	fn product_0115_tick_rotation_is_partial_and_follows_all_five_tiers() {
+		let rotation = |degrees| TickRotation::new(degrees).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.x_tick_rotation = rotation(-90.0);
+		cascade.application_theme.x_tick_rotation = Override::Set(rotation(-45.0));
+		cascade.authored_spec.x_tick_rotation = Override::Set(rotation(0.0));
+		cascade.layer.x_tick_rotation = Override::Set(rotation(45.0));
+		cascade.pane_override.x_tick_rotation = Override::Set(rotation(90.0));
+		assert_eq!(cascade.resolve().x_tick_rotation, rotation(90.0));
+
+		cascade.pane_override.x_tick_rotation = Override::Inherit;
+		assert_eq!(cascade.resolve().x_tick_rotation, rotation(45.0));
+		cascade.layer.x_tick_rotation = Override::Inherit;
+		assert_eq!(cascade.resolve().x_tick_rotation, rotation(0.0));
+		cascade.authored_spec.x_tick_rotation = Override::Inherit;
+		assert_eq!(cascade.resolve().x_tick_rotation, rotation(-45.0));
+		cascade.application_theme.x_tick_rotation = Override::Inherit;
+		assert_eq!(cascade.resolve().x_tick_rotation, rotation(-90.0));
+
+		cascade.authored_spec.typography = Override::Set(PlotTypography {
+			x_tick_rotation: rotation(-45.0),
+			..typography(HoverTextSize::DEFAULT)
+		});
+		cascade.authored_spec.x_tick_rotation = Override::Set(rotation(45.0));
+		assert_eq!(
+			cascade.resolve().x_tick_rotation,
+			rotation(45.0),
+			"the partial slot wins over atomic typography within one tier"
+		);
+		cascade.authored_spec.x_tick_rotation = Override::Inherit;
+		assert_eq!(cascade.resolve().x_tick_rotation, rotation(-45.0));
 	}
 
 	#[test]

@@ -6,7 +6,7 @@ use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
 	BarWidth, CategoryGap, HoverTextSize, LegendPosition, PointSize, ResolvedPresence, StrokeWidth,
-	SubtitleTextSize, TitleTextSize,
+	SubtitleTextSize, TickRotation, TitleTextSize,
 };
 use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
 use crate::plot::theme::PlotSettings;
@@ -601,7 +601,7 @@ pub struct ResolvedPlotSettings {
 	pub legend_x: f32,
 	pub legend_y: f32,
 	pub legend: ResolvedPresence<LegendPosition>,
-	pub x_label_rotation: f32,
+	pub x_tick_rotation: TickRotation,
 	pub x_label_offset: f32,
 	pub color_theme: ColorTheme,
 	pub continuous_ramps: ContinuousRamps,
@@ -668,7 +668,7 @@ impl Default for ResolvedPlotSettings {
 			legend_x: 0.95,
 			legend_y: 0.05,
 			legend: ResolvedPresence::Fallback,
-			x_label_rotation: 0.0,
+			x_tick_rotation: TickRotation::ZERO,
 			x_label_offset: 10.0,
 			color_theme: ColorTheme::default(),
 			continuous_ramps: ContinuousRamps::default(),
@@ -1231,6 +1231,10 @@ pub(crate) struct AxisTextAnchoring {
 	pub x_max: bool,
 	pub y_min: bool,
 	pub y_max: bool,
+	/// Outer figure edges are distinct from PRODUCT-0077's occupied shared
+	/// edges. PRODUCT-0115 alone uses these for rotated x-tick containment.
+	pub figure_x_min: bool,
+	pub figure_x_max: bool,
 }
 
 impl AxisTextAnchoring {
@@ -1239,6 +1243,8 @@ impl AxisTextAnchoring {
 		x_max: false,
 		y_min: false,
 		y_max: false,
+		figure_x_min: true,
+		figure_x_max: true,
 	};
 
 	fn bound_coincident(value: f64, bound: f64, range: (f64, f64)) -> bool {
@@ -1265,6 +1271,75 @@ impl AxisTextAnchoring {
 			alignment::Vertical::Center
 		}
 	}
+
+	fn x_figure_endpoint(self, value: f64, range: (f64, f64)) -> XTickEndpoint {
+		if self.figure_x_min && Self::bound_coincident(value, range.0, range) {
+			XTickEndpoint::Min
+		} else if self.figure_x_max && Self::bound_coincident(value, range.1, range) {
+			XTickEndpoint::Max
+		} else {
+			XTickEndpoint::None
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum XTickEndpoint {
+	None,
+	Min,
+	Max,
+}
+
+/// PRODUCT-0115's one authority for rotated x-tick endpoint correction.
+///
+/// A rotated run always receives the translation needed to keep its upper edge
+/// below the tick baseline. At an outer endpoint, the same authority also
+/// chooses the inward pivot: changing that pivot alone swings the run upward,
+/// while translating alone leaves the endpoint centred. Width is a
+/// producer-keyed estimate supplied by PRODUCT-0114's text-estimate authority.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct XTickTextPlacement {
+	alignment: alignment::Horizontal,
+	y_offset: f32,
+}
+
+impl XTickTextPlacement {
+	fn resolve(
+		rotation: TickRotation,
+		legacy_alignment: alignment::Horizontal,
+		endpoint: XTickEndpoint,
+		estimated_width: f32,
+	) -> Self {
+		if rotation == TickRotation::ZERO {
+			return Self {
+				alignment: legacy_alignment,
+				y_offset: 0.0,
+			};
+		}
+		let radians = rotation.radians();
+		let alignment = match (radians.is_sign_positive(), endpoint, legacy_alignment) {
+			// Positive canvas rotation carries a left-aligned run down/right, so
+			// correct only the right endpoint by pivoting it from its right edge.
+			(true, XTickEndpoint::Max, alignment::Horizontal::Center) => {
+				alignment::Horizontal::Right
+			}
+			// Negative rotation mirrors the policy at the left endpoint.
+			(false, XTickEndpoint::Min, alignment::Horizontal::Center) => {
+				alignment::Horizontal::Left
+			}
+			_ => legacy_alignment,
+		};
+		let (run_start, run_end) = match alignment {
+			alignment::Horizontal::Left => (0.0, estimated_width),
+			alignment::Horizontal::Center => (-estimated_width / 2.0, estimated_width / 2.0),
+			alignment::Horizontal::Right => (-estimated_width, 0.0),
+		};
+		let min_y = (run_start * radians.sin()).min(run_end * radians.sin());
+		Self {
+			alignment,
+			y_offset: (-min_y).max(0.0),
+		}
+	}
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1282,7 +1357,7 @@ impl AxisTextVisibility {
 	};
 }
 
-fn resolve_canvas_text(
+pub(crate) fn resolve_canvas_text(
 	presence: &ResolvedPresence<Arc<String>>,
 	fallback: Option<String>,
 ) -> Option<String> {
@@ -1304,6 +1379,20 @@ pub(crate) struct VerticalGuideBands {
 	facet: f32,
 	left: f32,
 	bottom: f32,
+}
+
+/// PRODUCT-0115's shared bottom-guide derivation.
+///
+/// The x-tick run and the optional axis title share a band but do not always
+/// share a position. At zero rotation their legacy offsets are already
+/// disjoint; once ticks rotate, the title must begin after the tick run rather
+/// than merely compete with it for the band maximum. Keeping the title top and
+/// final bottom here makes reservation and placement one authority.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct XAxisGuideLayout {
+	pub(crate) tick_end: f32,
+	pub(crate) title_top: Option<f32>,
+	pub(crate) bottom: f32,
 }
 
 impl VerticalGuideBands {
@@ -1334,6 +1423,22 @@ impl VerticalGuideBands {
 		requirements: &BandRequirements,
 		settings: &ResolvedPlotSettings,
 	) -> Self {
+		Self::resolve_with_requirements_and_x_label(
+			fallback_title,
+			facet_label,
+			requirements,
+			!matches!(&settings.x_label, ResolvedPresence::Hide),
+			settings,
+		)
+	}
+
+	pub(crate) fn resolve_with_requirements_and_x_label(
+		fallback_title: &str,
+		facet_label: Option<&str>,
+		requirements: &BandRequirements,
+		x_label_visible: bool,
+		settings: &ResolvedPlotSettings,
+	) -> Self {
 		let title_visible = match &settings.title {
 			ResolvedPresence::Fallback => !fallback_title.is_empty(),
 			ResolvedPresence::Show(title) => !title.is_empty(),
@@ -1357,18 +1462,7 @@ impl VerticalGuideBands {
 			.filter(|label| !label.is_empty())
 			.map(|_| Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings))
 			.unwrap_or(0.0);
-		let rotation = settings.x_label_rotation.to_radians();
-		let rotated_tick_height = requirements.estimated_x_width(settings.x_tick_size)
-			* rotation.sin().abs()
-			+ settings.x_tick_size * rotation.cos().abs();
-		let bottom = if requirements.x.is_empty() {
-			0.0
-		} else {
-			let title = (!matches!(&settings.x_label, ResolvedPresence::Hide))
-				.then_some(settings.x_label_padding + settings.x_label_size)
-				.unwrap_or(0.0);
-			(settings.x_label_offset + rotated_tick_height).max(title)
-		};
+		let bottom = Self::x_axis_guides(requirements, x_label_visible, settings).bottom;
 		let left = if requirements.y.is_empty() {
 			0.0
 		} else {
@@ -1383,6 +1477,47 @@ impl VerticalGuideBands {
 			left,
 			bottom,
 		}
+	}
+
+	pub(crate) fn x_axis_guides(
+		requirements: &BandRequirements,
+		x_label_visible: bool,
+		settings: &ResolvedPlotSettings,
+	) -> XAxisGuideLayout {
+		if requirements.x.is_empty() {
+			return XAxisGuideLayout {
+				tick_end: 0.0,
+				title_top: None,
+				bottom: 0.0,
+			};
+		}
+		let rotation = settings.x_tick_rotation.radians();
+		let rotated_tick_height = requirements.estimated_x_width(settings.x_tick_size)
+			* rotation.sin().abs()
+			+ settings.x_tick_size * rotation.cos().abs();
+		let tick_end = settings.x_label_offset + rotated_tick_height;
+		let title_top = x_label_visible.then(|| {
+			// At zero degrees this preserves the historical 45 px title top.
+			// Once ticks extend farther, the title follows their run with the
+			// same legacy clearance instead of occupying it.
+			settings
+				.x_label_padding
+				.max(tick_end + Self::x_axis_title_gap(settings))
+		});
+		let bottom = title_top
+			.map(|top| top + settings.x_label_size)
+			.unwrap_or(tick_end);
+		XAxisGuideLayout {
+			tick_end,
+			title_top,
+			bottom,
+		}
+	}
+
+	fn x_axis_title_gap(settings: &ResolvedPlotSettings) -> f32 {
+		// Preserve the existing zero-degree title placement: ticks ended at
+		// x_label_offset + x_tick_size, and the title began at x_label_padding.
+		(settings.x_label_padding - (settings.x_label_offset + settings.x_tick_size)).max(0.0)
 	}
 
 	#[cfg(test)]
@@ -1458,6 +1593,11 @@ pub struct PlotCanvasState {
 }
 
 impl<'a> PlotWidget<'a> {
+	fn resolved_x_label(&self) -> Option<String> {
+		resolve_canvas_text(&self.settings.x_label, Some(self.kernel.x_label()))
+			.filter(|label| !label.is_empty())
+	}
+
 	fn major_tick_positions(&self, placement: TickPlacement, range: (f64, f64)) -> Vec<f64> {
 		placement.positions(range).unwrap_or_default()
 	}
@@ -1475,10 +1615,11 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	fn plot_area(&self, bounds: Rect<Widget>, requirements: &BandRequirements) -> Rect<Widget> {
-		VerticalGuideBands::resolve_with_requirements(
+		VerticalGuideBands::resolve_with_requirements_and_x_label(
 			&self.title,
 			None,
 			requirements,
+			self.resolved_x_label().is_some(),
 			&self.settings,
 		)
 		.plot_area(bounds, self.padding, &self.settings)
@@ -1597,74 +1738,78 @@ impl<'a> PlotWidget<'a> {
 			iced::Size::new(canvas_w - plot_area.x - plot_area.width, plot_area.height),
 			bg,
 		);
-		backend.with_save(&mut |backend| {
-			backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
-			match &layout {
-				PlotLayout::Cartesian {
-					x_range, y_range, ..
-				} => {
-					self.draw_cartesian_axes(
-						backend,
-						plot_area,
-						&transform,
-						*x_range,
-						*y_range,
-						AxisTextVisibility::ALL,
-					);
-				}
-				PlotLayout::CategoricalX {
-					categories,
-					y_range,
-					..
-				} => {
-					self.draw_categorical_axes(
-						backend,
-						plot_area,
-						&transform,
+		// PRODUCT-0115: axis text may cross facet-cell edges but never the figure
+		// edge. This mirrors the composite overlay's figure-wide clip.
+		backend.with_clip(bounds, &mut |backend| {
+			backend.with_save(&mut |backend| {
+				backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
+				match &layout {
+					PlotLayout::Cartesian {
+						x_range, y_range, ..
+					} => {
+						self.draw_cartesian_axes(
+							backend,
+							plot_area,
+							&transform,
+							*x_range,
+							*y_range,
+							AxisTextVisibility::ALL,
+						);
+					}
+					PlotLayout::CategoricalX {
 						categories,
-						*y_range,
-						AxisTextVisibility::ALL,
-					);
-				}
-				PlotLayout::CategoricalY {
-					categories,
-					x_range,
-					..
-				} => {
-					self.draw_categorical_y_axes(
-						backend,
-						plot_area,
-						&transform,
+						y_range,
+						..
+					} => {
+						self.draw_categorical_axes(
+							backend,
+							plot_area,
+							&transform,
+							categories,
+							*y_range,
+							AxisTextVisibility::ALL,
+						);
+					}
+					PlotLayout::CategoricalY {
 						categories,
-						*x_range,
-						AxisTextVisibility::ALL,
-					);
-				}
-				PlotLayout::CategoricalXY {
-					x_categories,
-					y_categories,
-				} => {
-					self.draw_categorical_xy_axes(
-						backend,
-						plot_area,
-						&transform,
+						x_range,
+						..
+					} => {
+						self.draw_categorical_y_axes(
+							backend,
+							plot_area,
+							&transform,
+							categories,
+							*x_range,
+							AxisTextVisibility::ALL,
+						);
+					}
+					PlotLayout::CategoricalXY {
 						x_categories,
 						y_categories,
-						AxisTextVisibility::ALL,
-					);
+					} => {
+						self.draw_categorical_xy_axes(
+							backend,
+							plot_area,
+							&transform,
+							x_categories,
+							y_categories,
+							AxisTextVisibility::ALL,
+						);
+					}
+					PlotLayout::Parallel { dimensions, ranges } => {
+						self.draw_parallel_axes(
+							backend,
+							plot_area,
+							&transform,
+							dimensions,
+							ranges,
+							AxisTextVisibility::ALL,
+						);
+					}
+					PlotLayout::Radial => {}
 				}
-				PlotLayout::Parallel { dimensions, ranges } => {
-					self.draw_parallel_axes(
-						backend,
-						plot_area,
-						&transform,
-						dimensions,
-						ranges,
-						AxisTextVisibility::ALL,
-					);
-				}
-				PlotLayout::Radial => {}
-			}
+			});
 		});
 		let size_only_bounds = Rectangle::new(Point::ORIGIN, bounds.size());
 		if let (Some(content), Some(origin)) = (legend_content.as_ref(), legend.origin(plot_extent))
@@ -1695,7 +1840,7 @@ impl<'a> PlotWidget<'a> {
 				..Default::default()
 			});
 		}
-		self.draw_axis_labels(backend, plot_area);
+		self.draw_axis_labels(backend, plot_area, &requirements);
 	}
 
 	fn render_global_headings(&self, backend: &mut dyn PlotBackend, bounds: Rectangle) {
@@ -1723,15 +1868,24 @@ impl<'a> PlotWidget<'a> {
 		}
 	}
 
-	pub(crate) fn draw_axis_labels(&self, backend: &mut dyn PlotBackend, plot_area: Rectangle) {
-		let x_label = resolve_canvas_text(&self.settings.x_label, Some(self.kernel.x_label()));
+	pub(crate) fn draw_axis_labels(
+		&self,
+		backend: &mut dyn PlotBackend,
+		plot_area: Rectangle,
+		requirements: &BandRequirements,
+	) {
+		let x_label = self.resolved_x_label();
 		let y_label = resolve_canvas_text(&self.settings.y_label, Some(self.kernel.y_label()));
-		if let Some(x_label) = x_label.filter(|label| !label.is_empty()) {
+		if let Some(x_label) = x_label {
+			let guides = VerticalGuideBands::x_axis_guides(requirements, true, &self.settings);
+			let title_top = guides
+				.title_top
+				.expect("visible x-axis title has a shared guide placement");
 			backend.fill_text(Text {
 				content: x_label,
 				position: Point::new(
 					plot_area.x + plot_area.width / 2.0,
-					plot_area.y + plot_area.height + self.settings.x_label_padding,
+					plot_area.y + plot_area.height + title_top,
 				),
 				color: self.settings.chrome.axis_label_text.iced(),
 				size: iced::Pixels(self.settings.x_label_size),
@@ -2107,18 +2261,25 @@ impl<'a> PlotWidget<'a> {
 				axis_stroke,
 			);
 			if text.x {
+				let label = format_label(data_x, x_axis_type);
+				let placement = XTickTextPlacement::resolve(
+					self.settings.x_tick_rotation,
+					text.anchoring.x_alignment(data_x, x_range),
+					text.anchoring.x_figure_endpoint(data_x, x_range),
+					estimate_formatted_label_width(&label, self.settings.x_tick_size),
+				);
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(
 						p_bottom.x,
-						p_bottom.y + self.settings.x_label_offset,
+						p_bottom.y + self.settings.x_label_offset + placement.y_offset,
 					));
-					backend.rotate(self.settings.x_label_rotation.to_radians());
+					backend.rotate(self.settings.x_tick_rotation.radians());
 					backend.fill_text(Text {
-						content: format_label(data_x, x_axis_type),
+						content: label.clone(),
 						position: Point::ORIGIN,
 						color: self.settings.chrome.tick_label_text.iced(),
 						size: iced::Pixels(self.settings.x_tick_size),
-						align_x: text.anchoring.x_alignment(data_x, x_range).into(),
+						align_x: placement.alignment.into(),
 						..Default::default()
 					});
 				});
@@ -2282,18 +2443,31 @@ impl<'a> PlotWidget<'a> {
 				axis_stroke,
 			);
 			if text.x {
+				let endpoint = if i == 0 && text.anchoring.figure_x_min {
+					XTickEndpoint::Min
+				} else if i + 1 == categories.len() && text.anchoring.figure_x_max {
+					XTickEndpoint::Max
+				} else {
+					XTickEndpoint::None
+				};
+				let placement = XTickTextPlacement::resolve(
+					self.settings.x_tick_rotation,
+					alignment::Horizontal::Center,
+					endpoint,
+					estimate_ascii_label_width(cat, self.settings.x_tick_size),
+				);
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(
 						center_px.x,
-						center_px.y + self.settings.x_label_offset,
+						center_px.y + self.settings.x_label_offset + placement.y_offset,
 					));
-					backend.rotate(self.settings.x_label_rotation.to_radians());
+					backend.rotate(self.settings.x_tick_rotation.radians());
 					backend.fill_text(Text {
 						content: cat.clone(),
 						position: Point::ORIGIN,
 						color: self.settings.chrome.tick_label_text.iced(),
 						size: iced::Pixels(self.settings.x_tick_size),
-						align_x: alignment::Horizontal::Center.into(),
+						align_x: placement.alignment.into(),
 						..Default::default()
 					});
 				});
@@ -2498,18 +2672,31 @@ impl<'a> PlotWidget<'a> {
 				axis_stroke,
 			);
 			if text.x {
+				let endpoint = if i == 0 && text.anchoring.figure_x_min {
+					XTickEndpoint::Min
+				} else if i + 1 == x_categories.len() && text.anchoring.figure_x_max {
+					XTickEndpoint::Max
+				} else {
+					XTickEndpoint::None
+				};
+				let placement = XTickTextPlacement::resolve(
+					self.settings.x_tick_rotation,
+					alignment::Horizontal::Center,
+					endpoint,
+					estimate_ascii_label_width(cat, self.settings.x_tick_size),
+				);
 				backend.with_save(&mut |backend| {
 					backend.translate(iced::Vector::new(
 						tick_x,
-						tick_y + self.settings.x_label_offset,
+						tick_y + self.settings.x_label_offset + placement.y_offset,
 					));
-					backend.rotate(self.settings.x_label_rotation.to_radians());
+					backend.rotate(self.settings.x_tick_rotation.radians());
 					backend.fill_text(Text {
 						content: cat.clone(),
 						position: Point::ORIGIN,
 						color: self.settings.chrome.tick_label_text.iced(),
 						size: iced::Pixels(self.settings.x_tick_size),
-						align_x: alignment::Horizontal::Center.into(),
+						align_x: placement.alignment.into(),
 						..Default::default()
 					});
 				});
@@ -2761,40 +2948,42 @@ mod product_0106_vertical_guide_band_oracles {
 	}
 
 	#[test]
-	fn product_0114_bottom_band_uses_the_larger_overlapping_occupant() {
+	fn product_0115_bottom_guides_sequence_the_title_after_rotated_ticks() {
 		let requirement = BandRequirements {
 			x: vec![AxisBandRequirement::Categories(vec!["wide".to_owned()])],
 			y: Vec::new(),
 		};
 
-		let title_larger = ResolvedPlotSettings::default();
-		let title_band =
-			VerticalGuideBands::resolve_with_requirements("", None, &requirement, &title_larger);
-		assert_eq!(title_band.bottom, 65.0, "title term wins at zero rotation");
-
-		let tick_larger = ResolvedPlotSettings {
-			x_label_rotation: 90.0,
-			..ResolvedPlotSettings::default()
-		};
-		let tick_band =
-			VerticalGuideBands::resolve_with_requirements("", None, &requirement, &tick_larger);
+		let zero = ResolvedPlotSettings::default();
+		let zero_guides = VerticalGuideBands::x_axis_guides(&requirement, true, &zero);
+		let banked_0114_max =
+			(zero.x_label_offset + zero.x_tick_size).max(zero.x_label_padding + zero.x_label_size);
 		assert_eq!(
-			tick_band.bottom, 82.0,
-			"tick term wins without summing the title"
+			zero_guides.bottom, banked_0114_max,
+			"the sequenced guides reduce to PRODUCT-0114's banked maximum at zero degrees"
 		);
+		assert_eq!(zero_guides.title_top, Some(zero.x_label_padding));
 
-		let equal = ResolvedPlotSettings {
-			x_label_rotation: 90.0,
-			x_label_size: 19.0,
-			..ResolvedPlotSettings::default()
-		};
-		let equal_requirement = BandRequirements {
-			x: vec![AxisBandRequirement::Categories(vec!["abc".to_owned()])],
-			y: Vec::new(),
-		};
-		let equal_band =
-			VerticalGuideBands::resolve_with_requirements("", None, &equal_requirement, &equal);
-		assert_eq!(equal_band.bottom, 64.0, "equal occupants share one band");
+		for rotation in [-90.0, -45.0, 45.0, 90.0] {
+			let settings = ResolvedPlotSettings {
+				x_tick_rotation: TickRotation::new(rotation).unwrap(),
+				..ResolvedPlotSettings::default()
+			};
+			let guides = VerticalGuideBands::x_axis_guides(&requirement, true, &settings);
+			let title_top = guides.title_top.expect("visible title has a placement");
+			assert!(
+				title_top >= guides.tick_end + VerticalGuideBands::x_axis_title_gap(&settings),
+				"{rotation} degree title starts after the rotated tick run"
+			);
+			assert_eq!(guides.bottom, title_top + settings.x_label_size);
+		}
+
+		let no_title = VerticalGuideBands::x_axis_guides(&requirement, false, &zero);
+		assert_eq!(no_title.title_top, None);
+		assert_eq!(
+			no_title.bottom, no_title.tick_end,
+			"an absent title consumes neither title clearance nor title height"
+		);
 	}
 
 	#[test]
@@ -2807,7 +2996,7 @@ mod product_0106_vertical_guide_band_oracles {
 		};
 		let width = 10.0 * 18.0;
 		for (rotation, expected) in [
-			(0.0, 65.0),
+			(0.0, 28.0),
 			(
 				45.0,
 				10.0 + (width + 18.0) * std::f32::consts::FRAC_1_SQRT_2,
@@ -2815,16 +3004,92 @@ mod product_0106_vertical_guide_band_oracles {
 			(90.0, 190.0),
 		] {
 			let settings = ResolvedPlotSettings {
-				x_label_rotation: rotation,
+				x_tick_rotation: TickRotation::new(rotation).unwrap(),
 				..ResolvedPlotSettings::default()
 			};
-			let bands =
-				VerticalGuideBands::resolve_with_requirements("", None, &requirement, &settings);
+			let bands = VerticalGuideBands::resolve_with_requirements_and_x_label(
+				"",
+				None,
+				&requirement,
+				false,
+				&settings,
+			);
 			assert!(
 				(bands.bottom - expected).abs() < 0.001,
 				"{rotation} degrees reserves the rotated tick extent"
 			);
 		}
+	}
+
+	#[test]
+	fn product_0115_rotated_x_tick_endpoint_placement_is_signed_and_coupled() {
+		let width = 120.0;
+		let zero = XTickTextPlacement::resolve(
+			TickRotation::ZERO,
+			alignment::Horizontal::Center,
+			XTickEndpoint::Max,
+			width,
+		);
+		assert_eq!(zero.alignment, alignment::Horizontal::Center);
+		assert_eq!(zero.y_offset, 0.0, "zero keeps legacy placement");
+
+		let positive = XTickTextPlacement::resolve(
+			TickRotation::new(45.0).unwrap(),
+			alignment::Horizontal::Center,
+			XTickEndpoint::Max,
+			width,
+		);
+		assert_eq!(positive.alignment, alignment::Horizontal::Right);
+		assert!(
+			(positive.y_offset - width * std::f32::consts::FRAC_1_SQRT_2).abs() < 0.001,
+			"the inward pivot and its vertical compensation are one decision"
+		);
+
+		let negative = XTickTextPlacement::resolve(
+			TickRotation::new(-45.0).unwrap(),
+			alignment::Horizontal::Center,
+			XTickEndpoint::Min,
+			width,
+		);
+		assert_eq!(negative.alignment, alignment::Horizontal::Left);
+		assert!((negative.y_offset - positive.y_offset).abs() < 0.001);
+
+		for (rotation, endpoint) in [
+			(TickRotation::new(45.0).unwrap(), XTickEndpoint::Min),
+			(TickRotation::new(-45.0).unwrap(), XTickEndpoint::Max),
+		] {
+			let unchanged = XTickTextPlacement::resolve(
+				rotation,
+				alignment::Horizontal::Center,
+				endpoint,
+				width,
+			);
+			assert_eq!(unchanged.alignment, alignment::Horizontal::Center);
+			assert!(
+				(unchanged.y_offset - width * std::f32::consts::FRAC_1_SQRT_2 / 2.0).abs() < 0.001,
+				"a centred interior run is translated below the baseline without changing its pivot"
+			);
+		}
+
+		let shared_edge = XTickTextPlacement::resolve(
+			TickRotation::new(45.0).unwrap(),
+			alignment::Horizontal::Left,
+			XTickEndpoint::Max,
+			width,
+		);
+		assert_eq!(shared_edge.alignment, alignment::Horizontal::Left);
+		assert_eq!(
+			shared_edge.y_offset, 0.0,
+			"PRODUCT-0077 anchor remains its own policy"
+		);
+
+		let vertical = XTickTextPlacement::resolve(
+			TickRotation::new(90.0).unwrap(),
+			alignment::Horizontal::Center,
+			XTickEndpoint::Max,
+			width,
+		);
+		assert!((vertical.y_offset - width).abs() < 0.001);
 	}
 
 	#[test]

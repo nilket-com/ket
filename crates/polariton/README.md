@@ -113,6 +113,17 @@ workspace.table("events").views([
 
 #### Rune bar presentation:
 
+Generated x-axis tick labels can rotate in degrees when long labels need more
+horizontal separation. The angle is bounded from `-90` through `90`; it does
+not rotate the authored `x_label(...)` axis title:
+
+```rune
+figure([
+    x_tick_rotation(45),
+    bar("product", "value"),
+])
+```
+
 Grouped bars can reserve normalized space between category clusters without
 changing the spacing model inside each series slot:
 

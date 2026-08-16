@@ -189,6 +189,56 @@ impl fmt::Display for HoverTextSizeError {
 
 impl std::error::Error for HoverTextSizeError {}
 
+/// PRODUCT-0115's authored x-tick angle, in degrees.
+///
+/// Rune, themes, panes, and persistence carry degrees; only the canvas
+/// boundary asks for radians.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TickRotation(f32);
+
+impl Eq for TickRotation {}
+
+impl TickRotation {
+	pub const MIN_DEGREES: f32 = -90.0;
+	pub const MAX_DEGREES: f32 = 90.0;
+	pub const ZERO: Self = Self(0.0);
+
+	pub fn new(degrees: f32) -> Result<Self, TickRotationError> {
+		if degrees.is_finite() && (Self::MIN_DEGREES..=Self::MAX_DEGREES).contains(&degrees) {
+			Ok(Self(degrees))
+		} else {
+			Err(TickRotationError { degrees })
+		}
+	}
+
+	pub const fn degrees(self) -> f32 {
+		self.0
+	}
+
+	pub fn radians(self) -> f32 {
+		self.0.to_radians()
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TickRotationError {
+	degrees: f32,
+}
+
+impl fmt::Display for TickRotationError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"x-tick rotation must be finite and between {} and {} degrees, got {}",
+			TickRotation::MIN_DEGREES,
+			TickRotation::MAX_DEGREES,
+			self.degrees
+		)
+	}
+}
+
+impl std::error::Error for TickRotationError {}
+
 /// PRODUCT-0113's logical-pixel size for an authored figure title.
 ///
 /// This remains distinct from every other text role: its type crosses the
@@ -4302,6 +4352,24 @@ mod tests {
 			assert!(TitleTextSize::new(rejected).is_err());
 			assert!(SubtitleTextSize::new(rejected).is_err());
 		}
+	}
+
+	#[test]
+	fn product_0115_tick_rotation_pins_inclusive_degree_bounds() {
+		for accepted in [-90.0, 0.0, 90.0] {
+			assert_eq!(TickRotation::new(accepted).unwrap().degrees(), accepted);
+		}
+		for rejected in [-90.1, 90.1, f32::NAN, f32::INFINITY] {
+			assert!(
+				TickRotation::new(rejected).is_err(),
+				"{rejected} must refuse"
+			);
+		}
+		assert_eq!(TickRotation::ZERO.radians(), 0.0);
+		assert!(
+			(TickRotation::new(90.0).unwrap().radians() - std::f32::consts::FRAC_PI_2).abs()
+				< 0.001
+		);
 	}
 
 	fn stamped(data: DataFrame) -> StampedResult {

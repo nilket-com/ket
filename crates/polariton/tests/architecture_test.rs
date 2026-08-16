@@ -4068,7 +4068,7 @@ fn product_0106_vertical_guides_have_one_reservation_authority_and_no_measuremen
 			"missing `{required}` from authority"
 		);
 	}
-	assert!(common.contains("VerticalGuideBands::resolve_with_requirements("));
+	assert!(common.contains("VerticalGuideBands::resolve_with_requirements_and_x_label("));
 
 	let grid_production = grid
 		.split("#[cfg(test)]\nmod tests")
@@ -4090,10 +4090,14 @@ fn product_0106_vertical_guides_have_one_reservation_authority_and_no_measuremen
 	);
 	assert_eq!(
 		grid_production
-			.matches("VerticalGuideBands::resolve_with_requirements(")
+			.matches("VerticalGuideBands::resolve_with_requirements_and_x_label(")
 			.count(),
 		1,
-		"the figure-wide tiled area receives requirements before cell geometry"
+		"the figure-wide tiled area receives requirements and its actual axis-title presence before cell geometry"
+	);
+	assert!(
+		grid_production.contains("fn grid_x_label_visible("),
+		"grid-wide bottom geometry derives title presence from the same rendered axis title"
 	);
 	assert!(grid_production.contains(".grid_tiled_area(outer, settings)"));
 	assert!(grid_production.contains(".grid_cell_plot_area(cell_bounds, settings)"));
@@ -4411,7 +4415,7 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 }
 
 #[test]
-fn product_0114_estimates_are_declared_without_measurement_or_rotation_surface() {
+fn product_0114_estimates_are_declared_without_measurement() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let estimates =
 		std::fs::read_to_string(root.join("plot/text_estimate.rs")).expect("read text estimates");
@@ -4441,16 +4445,114 @@ fn product_0114_estimates_are_declared_without_measurement_or_rotation_surface()
 			"PRODUCT-0114 added backend text measurement: {forbidden}"
 		);
 	}
+}
 
-	for source in rust_files(&root) {
-		if source.ends_with("plot/common.rs") {
-			continue;
-		}
-		let contents = std::fs::read_to_string(&source).expect("read Polariton source");
+#[test]
+fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	assert!(spec.contains("pub struct TickRotation(f32)"));
+	assert!(spec.contains("pub const MIN_DEGREES: f32 = -90.0"));
+	assert!(spec.contains("pub const MAX_DEGREES: f32 = 90.0"));
+	assert!(spec.contains("pub fn radians(self) -> f32"));
+
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
+	assert!(theme.contains("pub x_tick_rotation: TickRotation"));
+	assert!(theme.contains("pub x_tick_rotation: Override<TickRotation>"));
+	assert!(theme.contains("settings.x_tick_rotation = value.x_tick_rotation"));
+	assert!(theme.contains("settings.x_tick_rotation = value;"));
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let rotation = common
+		.split("pub(crate) struct AxisTextAnchoring")
+		.nth(1)
+		.and_then(|rest| rest.split("fn resolve_canvas_text").next())
+		.expect("production x-tick placement section");
+	assert!(rotation.contains("struct XTickTextPlacement"));
+	assert!(rotation.contains("fn resolve("));
+	assert!(common.contains("pub(crate) struct XAxisGuideLayout"));
+	let guides = common
+		.split("pub(crate) struct XAxisGuideLayout")
+		.nth(1)
+		.and_then(|rest| rest.split("pub(crate) fn facet_label_size").next())
+		.expect("bounded shared x-axis guide authority");
+	for declaration in [
+		"pub(crate) tick_end: f32",
+		"pub(crate) title_top: Option<f32>",
+		"pub(crate) fn x_axis_guides(",
+		"tick_end + Self::x_axis_title_gap(settings)",
+		"map(|top| top + settings.x_label_size)",
+		"unwrap_or(tick_end)",
+	] {
 		assert!(
-			!contents.contains("x_label_rotation"),
-			"PRODUCT-0114 must not give rotation a second surface in {}",
-			source.display()
+			guides.contains(declaration),
+			"PRODUCT-0115 keeps x-axis title reservation and placement in one guide authority: {declaration}"
 		);
 	}
+	let axis_labels = common
+		.split("pub(crate) fn draw_axis_labels")
+		.nth(1)
+		.and_then(|rest| rest.split("impl<'a> Program<PlotMessage>").next())
+		.expect("bounded axis-title drawing authority");
+	assert!(axis_labels.contains("VerticalGuideBands::x_axis_guides(requirements, true"));
+	assert!(axis_labels.contains("+ title_top,"));
+	assert!(
+		!axis_labels.contains("+ self.settings.x_label_padding,"),
+		"PRODUCT-0115 does not place a rotated figure's title from an independent constant"
+	);
+	assert!(common.contains("estimate_formatted_label_width(&label, self.settings.x_tick_size)"));
+	assert!(common.contains("estimate_ascii_label_width(cat, self.settings.x_tick_size)"));
+	for (entrypoint, next) in [
+		(
+			"pub(crate) fn draw_cartesian_axes",
+			"pub(crate) fn draw_categorical_grid",
+		),
+		(
+			"pub(crate) fn draw_categorical_axes",
+			"pub(crate) fn draw_categorical_y_grid",
+		),
+		(
+			"pub(crate) fn draw_categorical_xy_axes",
+			"pub(crate) fn draw_parallel_axes",
+		),
+	] {
+		let section = common
+			.split(entrypoint)
+			.nth(1)
+			.and_then(|rest| rest.split(next).next())
+			.expect("bounded x-axis draw site");
+		assert_eq!(
+			section.matches("XTickTextPlacement::resolve(").count(),
+			1,
+			"{entrypoint} consumes the one placement authority"
+		);
+	}
+	let overlay = common
+		.split("fn render_overlay_layer_in_widget")
+		.nth(1)
+		.and_then(|rest| rest.split("fn render_global_headings").next())
+		.expect("bounded ordinary overlay");
+	assert_eq!(
+		overlay.matches("backend.with_clip(bounds").count(),
+		1,
+		"the ordinary overlay receives the explicit figure clip once"
+	);
+	let backend = common
+		.split("pub trait PlotBackend")
+		.nth(1)
+		.and_then(|rest| rest.split("pub trait PlotKernel").next())
+		.expect("bounded plot backend contract");
+	assert!(!backend.contains("measure_text"));
+	assert!(!backend.contains("text_extent"));
+
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
+	let free = compiler
+		.split("const PRESENTATION_FREE")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation free vocabulary");
+	assert!(free.contains("\"x_tick_rotation\""));
+	assert!(!free.contains("\"x_label_rotation\""));
+	assert!(!free.contains("\"y_tick_rotation\""));
 }

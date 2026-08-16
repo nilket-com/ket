@@ -70,7 +70,7 @@ use plot::request::{PlotRequest, PlotSource, plan};
 use plot::spec::{
 	AuthoredPlotSpec, BarWidth, CategoryColorAssignment, CategoryGap, LayerSettings,
 	PalettePosition, PlotProvenance, PointSize, ResolvedColor, ResolvedPresence,
-	StackNormalization, StampedResult, StrokeWidth,
+	StackNormalization, StampedResult, StrokeWidth, TickRotation,
 };
 use plot::theme::PlotSettings;
 use polars::prelude::{Float64Chunked, NewChunkedArray};
@@ -591,6 +591,97 @@ fn render_product_0068_bar(
 			widget.render_overlay_layer(&mut backend, bounds);
 		}
 	})
+}
+
+fn product_0115_rotation_fixture(rotation: f32) -> (BarPlotKernel, PlotSettings) {
+	let (mut kernel, _) = product_0068_bar_fixture();
+	kernel.prepared_data = Arc::new(BarPreparedData {
+		categories: vec![
+			"International partner enablement and certification".to_owned(),
+			"North American enterprise renewal commitments".to_owned(),
+			"Regulated migration and governance readiness".to_owned(),
+		],
+		group_names: vec!["Series".to_owned()],
+		values: vec![vec![62.0], vec![74.0], vec![58.0]],
+		y_range: (0.0, 90.0),
+		x_label: String::new(),
+		y_label: String::new(),
+		group_provenance: LegendProvenance::Named,
+	});
+	kernel.group_colors.truncate(1);
+	let mut resolved = ResolvedPlotSettings {
+		title: ResolvedPresence::Hide,
+		subtitle: ResolvedPresence::Hide,
+		x_label: ResolvedPresence::Hide,
+		y_label: ResolvedPresence::Hide,
+		legend: ResolvedPresence::Hide,
+		show_x_minor_ticks: false,
+		show_y_minor_ticks: false,
+		show_x_minor_grid: false,
+		show_y_minor_grid: false,
+		..ResolvedPlotSettings::default()
+	};
+	resolved.x_tick_rotation = TickRotation::new(rotation).expect("PRODUCT-0115 probe angle");
+	(kernel, PlotSettings::from_resolved(resolved))
+}
+
+fn render_product_0115_rotation(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	rotation: f32,
+) -> (Capture, Rectangle) {
+	let (kernel, settings) = product_0115_rotation_fixture(rotation);
+	let resolved = settings.resolve();
+	// Render a figure smaller than the target, anchored at the target origin.
+	// Pixels in the unused frame prove whether an axis overlay escaped its own
+	// explicit figure clip.
+	let figure_bounds = Rectangle::with_size(Size::new(
+		size.width as f32 - 160.0,
+		size.height as f32 - 80.0,
+	));
+	let widget = PlotWidget {
+		kernel: &kernel,
+		title: String::new(),
+		padding: 0.0,
+		settings: resolved,
+		settings_model: settings,
+		render_revision: 0,
+		resize_render_suspended: false,
+		layer: PlotRenderLayer::Full,
+	};
+	let capture = render_frame(renderer, size, |frame| {
+		let mut backend = IcedBackend { frame };
+		widget.render_plot_layer(&mut backend, figure_bounds);
+		widget.render_overlay_layer(&mut backend, figure_bounds);
+	});
+	(capture, figure_bounds)
+}
+
+fn exterior_luminous_pixels(capture: &Capture, bounds: Rectangle) -> usize {
+	// Iced/wgpu antialiases the clip boundary itself. Count only pixels beyond
+	// that two-pixel fringe; an escaped label is hundreds of pixels wide.
+	const CLIP_EDGE_FRINGE: f32 = 2.0;
+	let mut count = 0;
+	for y in 0..capture.height {
+		for x in 0..capture.width {
+			let inside = (x as f32) >= bounds.x - CLIP_EDGE_FRINGE
+				&& (x as f32) < bounds.x + bounds.width + CLIP_EDGE_FRINGE
+				&& (y as f32) >= bounds.y - CLIP_EDGE_FRINGE
+				&& (y as f32) < bounds.y + bounds.height + CLIP_EDGE_FRINGE;
+			if !inside {
+				count += usize::from(
+					capture
+						.pixel(x, y)
+						.iter()
+						.copied()
+						.max()
+						.unwrap_or_default()
+						> 120,
+				);
+			}
+		}
+	}
+	count
 }
 
 fn product_0068_cartesian_settings() -> PlotSettings {
@@ -1531,7 +1622,6 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	let large = Size::new(448, 320);
 	let mut msaa = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
 	let mut no_aa = gpu.renderer(None).await;
-
 	let product_0101_old_msaa =
 		render_frame(&mut msaa, PRODUCT_0101_SIZE, draw_product_0101_old_pie);
 	let product_0101_old_none =
@@ -1617,6 +1707,36 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	);
 	println!(
 		"PRODUCT_0101 arc_contract disposition=automated pie_luminous=12336/11191 joined_diff=1301/1147 decomposition_diff=76/25 tolerance=0.1 annulus=connected"
+	);
+
+	let product_0115_size = Size::new(960, 900);
+	let (product_0115_zero, product_0115_bounds) =
+		render_product_0115_rotation(&mut msaa, product_0115_size, 0.0);
+	let (product_0115_positive, _) =
+		render_product_0115_rotation(&mut msaa, product_0115_size, 45.0);
+	let (product_0115_negative, _) =
+		render_product_0115_rotation(&mut msaa, product_0115_size, -45.0);
+	assert_ne!(
+		product_0115_zero.rgba, product_0115_positive.rgba,
+		"PRODUCT-0115 positive rotation must reach the production renderer"
+	);
+	assert_ne!(
+		product_0115_zero.rgba, product_0115_negative.rgba,
+		"PRODUCT-0115 negative rotation must reach the production renderer"
+	);
+	for (name, capture) in [
+		("zero", &product_0115_zero),
+		("positive", &product_0115_positive),
+		("negative", &product_0115_negative),
+	] {
+		assert_eq!(
+			exterior_luminous_pixels(capture, product_0115_bounds),
+			0,
+			"PRODUCT-0115 {name} figure clip must contain the axis overlay"
+		);
+	}
+	println!(
+		"PRODUCT_0115 x_tick_rotation disposition=automated zero/positive/negative=contained/contained/contained"
 	);
 
 	let product_0077_size = Size::new(800, 600);
