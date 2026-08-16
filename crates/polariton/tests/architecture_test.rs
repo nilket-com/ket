@@ -4248,12 +4248,86 @@ fn product_0112_hover_typography_stays_typed_and_off_canvas() {
 
 	let compiler =
 		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
-	assert!(compiler.contains("\"hover_size\""));
-	assert!(!compiler.contains("\"font_size\""));
+	let free = compiler
+		.split("const PRESENTATION_FREE")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation free vocabulary");
+	assert!(free.contains("\"hover_size\""));
+	assert!(
+		!free.contains("\"font_size\""),
+		"hover_size remains the standalone spelling because hover has no receiver"
+	);
 
 	let session = std::fs::read_to_string(root.join("session_persistence.rs"))
 		.expect("read session persistence");
 	assert!(session.contains("struct DurableLayer"));
 	assert!(!session.contains("HoverTextSize"));
 	assert!(!session.contains("hover_size"));
+}
+
+#[test]
+fn product_0113_only_title_and_subtitle_font_sizes_cross_the_canvas_boundary() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	for text_size in ["TitleTextSize", "SubtitleTextSize"] {
+		assert!(
+			spec.contains(&format!("pub struct {text_size}(f32)")),
+			"{text_size} stays a private bounded scalar"
+		);
+	}
+
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
+	assert!(theme.contains("pub title_size: TitleTextSize"));
+	assert!(theme.contains("pub subtitle_size: SubtitleTextSize"));
+	assert!(theme.contains("pub title_size: Override<TitleTextSize>"));
+	assert!(theme.contains("pub subtitle_size: Override<SubtitleTextSize>"));
+	for blocked in [
+		"pub x_label_size: f32",
+		"pub y_label_size: f32",
+		"pub x_tick_size: f32",
+		"pub y_tick_size: f32",
+		"pub legend_size: f32",
+	] {
+		assert!(
+			theme.contains(blocked),
+			"blocked typography role remains raw: {blocked}"
+		);
+	}
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	assert!(common.contains("settings.title_size.pixels()"));
+	assert!(common.contains("settings.subtitle_size.pixels()"));
+	assert!(common.contains("top_px.y - self.settings.x_label_size"));
+	assert!(common.contains("size: iced::Pixels(self.settings.x_label_size)"));
+	assert!(!common.contains("size: iced::Pixels(22.0)"));
+	assert!(common.contains("facet_label_size(settings: &ResolvedPlotSettings) -> f32"));
+	assert!(common.contains("(settings.legend_size + 2.0).max(10.0)"));
+	let backend = common
+		.split("pub trait PlotBackend")
+		.nth(1)
+		.and_then(|rest| rest.split("pub trait PlotKernel").next())
+		.expect("bounded plot backend contract");
+	assert!(!backend.contains("TextSize"));
+	assert!(!backend.contains("text_extent"));
+
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
+	let methods = compiler
+		.split("const PRESENTATION_METHODS")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation method vocabulary");
+	assert!(methods.contains("\"font_size\""));
+	let free = compiler
+		.split("const PRESENTATION_FREE")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation free vocabulary");
+	for blocked in ["font_size", "legend_size", "x_tick_size", "y_tick_size"] {
+		assert!(
+			!free.contains(&format!("\"{blocked}\"")),
+			"{blocked} is not a new top-level spelling"
+		);
+	}
 }

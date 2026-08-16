@@ -14,7 +14,7 @@ use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FunnelFields,
 	HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
 	MultivariateFields, Override, PieFields, PointSize, Presence, RadialDialFields, StrokeWidth,
-	ViolinFields,
+	SubtitleTextSize, TitleTextSize, ViolinFields,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -188,11 +188,30 @@ enum FigureElementKind {
 	HoverSize(HoverTextSize),
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FigureTextSize {
+	Title(TitleTextSize),
+	Subtitle(SubtitleTextSize),
+}
+
 #[derive(Any, Clone, Debug)]
 #[rune(item = ::polariton_presentation, name = FigureElement)]
 struct RuneFigureElement {
 	value: Result<FigureElementKind, PresentationFailure>,
 	origin: Origin,
+	font_size: Option<FigureTextSize>,
+	font_size_origin: Option<Origin>,
+}
+
+impl RuneFigureElement {
+	fn new(value: Result<FigureElementKind, PresentationFailure>, origin: Origin) -> Self {
+		Self {
+			value,
+			origin,
+			font_size: None,
+			font_size_origin: None,
+		}
+	}
 }
 
 #[derive(Any, Clone, Debug)]
@@ -440,6 +459,14 @@ fn build_context() -> Result<Context, String> {
 			.build()
 			.map_err(module_error)?;
 	}
+	module
+		.raw_function("__font_size", raw_figure_font_size as RawFunction)
+		.build_associated::<RuneFigureElement>()
+		.map_err(module_error)?;
+	module
+		.raw_function("__font_size", raw_figure_font_size as RawFunction)
+		.build_associated::<RuneSkin>()
+		.map_err(module_error)?;
 	for (name, function) in [
 		("__point_size", raw_mark_point_size as RawFunction),
 		("__stroke_width", raw_mark_stroke_width as RawFunction),
@@ -1426,7 +1453,7 @@ fn raw_facet_gutter(
 			)),
 		}
 	};
-	store(out, stack, RuneFigureElement { value, origin })
+	store(out, stack, RuneFigureElement::new(value, origin))
 }
 
 fn raw_palette(
@@ -1497,7 +1524,7 @@ fn raw_ramp_element(
 			format!("{name}(...) requires one ramp token string"),
 		))
 	};
-	store(out, stack, RuneFigureElement { value, origin })
+	store(out, stack, RuneFigureElement::new(value, origin))
 }
 
 fn raw_string_element(
@@ -1543,7 +1570,7 @@ fn raw_string_element(
 			format!("{name}(...) requires one string"),
 		))
 	};
-	store(out, stack, RuneFigureElement { value, origin })
+	store(out, stack, RuneFigureElement::new(value, origin))
 }
 
 fn raw_skin(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
@@ -1637,13 +1664,13 @@ fn raw_numeric_pair(
 	let values = rune::vm_try!(stack.slice_at(addr, args));
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
 	let element = if values.len() != 4 {
-		RuneFigureElement {
-			value: Err(PresentationFailure::new(
+		RuneFigureElement::new(
+			Err(PresentationFailure::new(
 				origin,
 				format!("{name}(...) requires exactly two numeric values"),
 			)),
 			origin,
-		}
+		)
 	} else {
 		match kind {
 			NumericPairConstructor::Legend => presentation_legend_at(
@@ -1680,13 +1707,13 @@ fn raw_hide_legend(
 	let element = if values.len() == 2 {
 		presentation_hide_legend(origin.start.into(), origin.end.into())
 	} else {
-		RuneFigureElement {
-			value: Err(PresentationFailure::new(
+		RuneFigureElement::new(
+			Err(PresentationFailure::new(
 				origin,
 				"hide_legend() takes no arguments",
 			)),
 			origin,
-		}
+		)
 	};
 	store(out, stack, element)
 }
@@ -1791,13 +1818,13 @@ fn raw_numeric_scalar(
 	let values = rune::vm_try!(stack.slice_at(addr, args));
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
 	let element = if values.len() != 3 {
-		RuneFigureElement {
-			value: Err(PresentationFailure::new(
+		RuneFigureElement::new(
+			Err(PresentationFailure::new(
 				origin,
 				format!("{name}(...) requires exactly one numeric value"),
 			)),
 			origin,
-		}
+		)
 	} else {
 		match kind {
 			NumericScalarConstructor::XTickStep => {
@@ -1994,10 +2021,7 @@ fn presentation_legend_at(x: Value, y: Value, start: i64, end: i64) -> RuneFigur
 
 fn presentation_hide_legend(start: i64, end: i64) -> RuneFigureElement {
 	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
-	RuneFigureElement {
-		value: Ok(FigureElementKind::Legend(Presence::Hide)),
-		origin,
-	}
+	RuneFigureElement::new(Ok(FigureElementKind::Legend(Presence::Hide)), origin)
 }
 
 fn presentation_x_bounds(
@@ -2073,7 +2097,7 @@ fn numeric_pair_element(
 		})?;
 		make(first, second).map_err(|message| PresentationFailure::new(origin, message))
 	})();
-	RuneFigureElement { value, origin }
+	RuneFigureElement::new(value, origin)
 }
 
 fn presentation_x_tick_step(value: Value, start: i64, end: i64) -> RuneFigureElement {
@@ -2095,7 +2119,7 @@ fn presentation_hover_size(value: Value, start: i64, end: i64) -> RuneFigureElem
 				.map(FigureElementKind::HoverSize)
 				.map_err(|error| PresentationFailure::new(origin, error.to_string()))
 		});
-	RuneFigureElement { value, origin }
+	RuneFigureElement::new(value, origin)
 }
 
 fn numeric_scalar_element(
@@ -2127,7 +2151,7 @@ fn numeric_scalar_element(
 				})
 			}
 		});
-	RuneFigureElement { value, origin }
+	RuneFigureElement::new(value, origin)
 }
 
 fn presentation_x_minor_ticks(value: Value, start: i64, end: i64) -> RuneFigureElement {
@@ -2167,7 +2191,7 @@ fn minor_ticks_element(
 				})
 			}
 		});
-	RuneFigureElement { value, origin }
+	RuneFigureElement::new(value, origin)
 }
 
 fn rune_number(value: &Value) -> Option<f64> {
@@ -2800,6 +2824,73 @@ fn raw_mark_diverging_at(
 	)
 }
 
+fn raw_figure_font_size(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let mut element = match values
+		.first()
+		.cloned()
+		.map(rune::from_value::<RuneFigureElement>)
+	{
+		Some(Ok(element)) => element,
+		_ => RuneFigureElement::new(
+			Err(PresentationFailure::new(
+				origin,
+				"font_size(...) requires a figure text member",
+			)),
+			origin,
+		),
+	};
+	if element.value.is_err() {
+		return store(out, stack, element);
+	}
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"font_size(...) takes exactly one numeric value",
+		));
+		return store(out, stack, element);
+	}
+	if element.font_size_origin.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"font_size(...) may appear at most once on a figure text member",
+		));
+		return store(out, stack, element);
+	}
+	element.font_size_origin = Some(origin);
+	let Some(points) = rune_number(&values[1]) else {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"font_size(...) requires a numeric value",
+		));
+		return store(out, stack, element);
+	};
+	let text_size = match element.value.as_ref().expect("checked above") {
+		FigureElementKind::Title(_) => TitleTextSize::new(points as f32)
+			.map(FigureTextSize::Title)
+			.map_err(|error| error.to_string()),
+		FigureElementKind::Subtitle(_) => SubtitleTextSize::new(points as f32)
+			.map(FigureTextSize::Subtitle)
+			.map_err(|error| error.to_string()),
+		FigureElementKind::XLabel(_) | FigureElementKind::YLabel(_) => Err(
+			"font_size(...) is not available on x_label or y_label until their text bands reserve space"
+				.to_owned(),
+		),
+		_ => Err("font_size(...) is available on title and subtitle members".to_owned()),
+	};
+	match text_size {
+		Ok(text_size) => element.font_size = Some(text_size),
+		Err(message) => element.value = Err(PresentationFailure::new(origin, message)),
+	}
+	store(out, stack, element)
+}
+
 fn raw_mark_modifier(
 	kind: MarkModifier,
 	name: &'static str,
@@ -2959,8 +3050,8 @@ fn raw_figure(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 
 #[derive(Default)]
 struct FigureParts {
-	title: Option<(String, Origin)>,
-	subtitle: Option<(String, Origin)>,
+	title: Option<(String, Option<TitleTextSize>, Origin)>,
+	subtitle: Option<(String, Option<SubtitleTextSize>, Origin)>,
 	x_label: Option<(String, Origin)>,
 	y_label: Option<(String, Origin)>,
 	facet: Option<(String, Origin)>,
@@ -2990,7 +3081,7 @@ fn decode_figure(value: &Value, origin: Origin) -> Result<RunePlotIntent, Presen
 	for value in values.iter() {
 		if let Ok(element) = value.borrow_ref::<RuneFigureElement>() {
 			let kind = element.value.clone()?;
-			merge_element(&mut parts, kind, element.origin)?;
+			merge_element(&mut parts, kind, element.font_size, element.origin)?;
 			continue;
 		}
 		if let Ok(skin) = value.borrow_ref::<RuneSkin>() {
@@ -3078,18 +3169,37 @@ fn set_once<T>(
 fn merge_element(
 	parts: &mut FigureParts,
 	element: FigureElementKind,
+	font_size: Option<FigureTextSize>,
 	origin: Origin,
 ) -> Result<(), PresentationFailure> {
 	match element {
 		FigureElementKind::Title(value) => set_once(
 			&mut parts.title,
-			(value, origin),
+			(
+				value,
+				match font_size {
+					Some(FigureTextSize::Title(size)) => Some(size),
+					None => None,
+					Some(FigureTextSize::Subtitle(_)) => unreachable!("title size matches title"),
+				},
+				origin,
+			),
 			origin,
 			"a figure has at most one title",
 		),
 		FigureElementKind::Subtitle(value) => set_once(
 			&mut parts.subtitle,
-			(value, origin),
+			(
+				value,
+				match font_size {
+					Some(FigureTextSize::Subtitle(size)) => Some(size),
+					None => None,
+					Some(FigureTextSize::Title(_)) => {
+						unreachable!("subtitle size matches subtitle")
+					}
+				},
+				origin,
+			),
 			origin,
 			"a figure has at most one subtitle",
 		),
@@ -3197,11 +3307,17 @@ impl FigureParts {
 			}
 		}
 		let mut authored_settings = PlotSettingsLayer::default();
-		if let Some((title, _)) = &self.title {
+		if let Some((title, font_size, _)) = &self.title {
 			authored_settings.title = Presence::Show(Arc::new(title.clone()));
+			if let Some(font_size) = font_size {
+				authored_settings.title_size = Override::Set(*font_size);
+			}
 		}
-		if let Some((subtitle, _)) = &self.subtitle {
+		if let Some((subtitle, font_size, _)) = &self.subtitle {
 			authored_settings.subtitle = Presence::Show(Arc::new(subtitle.clone()));
+			if let Some(font_size) = font_size {
+				authored_settings.subtitle_size = Override::Set(*font_size);
+			}
 		}
 		if let Some((x_label, _)) = &self.x_label {
 			authored_settings.x_label = Presence::Show(Arc::new(x_label.clone()));

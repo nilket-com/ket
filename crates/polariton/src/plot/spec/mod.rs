@@ -189,6 +189,95 @@ impl fmt::Display for HoverTextSizeError {
 
 impl std::error::Error for HoverTextSizeError {}
 
+/// PRODUCT-0113's logical-pixel size for an authored figure title.
+///
+/// This remains distinct from every other text role: its type crosses the
+/// settings cascade and reaches the title-band reservation together.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TitleTextSize(f32);
+
+impl Eq for TitleTextSize {}
+
+impl TitleTextSize {
+	pub const MIN_PX: f32 = 6.0;
+	pub const MAX_PX: f32 = 96.0;
+	pub const DEFAULT: Self = Self(28.0);
+
+	pub fn new(points: f32) -> Result<Self, TitleTextSizeError> {
+		if points.is_finite() && (Self::MIN_PX..=Self::MAX_PX).contains(&points) {
+			Ok(Self(points))
+		} else {
+			Err(TitleTextSizeError { points })
+		}
+	}
+
+	pub const fn pixels(self) -> f32 {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TitleTextSizeError {
+	points: f32,
+}
+
+impl fmt::Display for TitleTextSizeError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"title font size must be finite and between {} and {}, got {}",
+			TitleTextSize::MIN_PX,
+			TitleTextSize::MAX_PX,
+			self.points
+		)
+	}
+}
+
+impl std::error::Error for TitleTextSizeError {}
+
+/// PRODUCT-0113's logical-pixel size for an authored figure subtitle.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubtitleTextSize(f32);
+
+impl Eq for SubtitleTextSize {}
+
+impl SubtitleTextSize {
+	pub const MIN_PX: f32 = 6.0;
+	pub const MAX_PX: f32 = 96.0;
+	pub const DEFAULT: Self = Self(20.0);
+
+	pub fn new(points: f32) -> Result<Self, SubtitleTextSizeError> {
+		if points.is_finite() && (Self::MIN_PX..=Self::MAX_PX).contains(&points) {
+			Ok(Self(points))
+		} else {
+			Err(SubtitleTextSizeError { points })
+		}
+	}
+
+	pub const fn pixels(self) -> f32 {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SubtitleTextSizeError {
+	points: f32,
+}
+
+impl fmt::Display for SubtitleTextSizeError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"subtitle font size must be finite and between {} and {}, got {}",
+			SubtitleTextSize::MIN_PX,
+			SubtitleTextSize::MAX_PX,
+			self.points
+		)
+	}
+}
+
+impl std::error::Error for SubtitleTextSizeError {}
+
 /// PRODUCT-0019's unitless, linear line-stroke factor. Keep this distinct from
 /// `PointSize` until a third relative setting establishes a shared abstraction.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4200,6 +4289,18 @@ mod tests {
 				HoverTextSize::new(rejected).is_err(),
 				"{rejected} must refuse"
 			);
+		}
+	}
+
+	#[test]
+	fn product_0113_title_and_subtitle_text_sizes_pin_inclusive_work_bounds() {
+		for accepted in [6.0, 96.0] {
+			assert!(TitleTextSize::new(accepted).is_ok());
+			assert!(SubtitleTextSize::new(accepted).is_ok());
+		}
+		for rejected in [5.9, 96.1, f32::NAN, f32::INFINITY] {
+			assert!(TitleTextSize::new(rejected).is_err());
+			assert!(SubtitleTextSize::new(rejected).is_err());
 		}
 	}
 

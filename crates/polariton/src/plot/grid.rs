@@ -3720,7 +3720,7 @@ mod tests {
 				.position
 				.y
 		};
-		let subtitle_bottom = y("Resolved subtitle") + resolved.subtitle_size;
+		let subtitle_bottom = y("Resolved subtitle") + resolved.subtitle_size.pixels();
 		let facet_bottom = y("East") + VerticalGuideBands::facet_label_size(&resolved);
 		assert!(y("d3") >= subtitle_bottom);
 		assert!(y("d3") >= facet_bottom);
@@ -3735,7 +3735,10 @@ mod tests {
 			GridPosition { row: 0, column: 0 },
 		);
 		let plot = grid_plot_area(cell, Some("East"), &resolved);
-		assert_eq!(tiled.y(), resolved.subtitle_offset + resolved.subtitle_size);
+		assert_eq!(
+			tiled.y(),
+			resolved.subtitle_offset + resolved.subtitle_size.pixels()
+		);
 		assert_eq!(
 			plot.y() - cell.y(),
 			VerticalGuideBands::FACET_LABEL_TOP_INSET
@@ -3775,7 +3778,7 @@ mod tests {
 				"the existing global title position must not move"
 			);
 			assert!(
-				panel_y >= title_y + resolved.title_size,
+				panel_y >= title_y + resolved.title_size.pixels(),
 				"the first facet label must begin below the global title at every viewport: {panel_y} vs {title_y}"
 			);
 
@@ -3787,7 +3790,10 @@ mod tests {
 				"",
 				&resolved,
 			);
-			assert_eq!(tiled.y(), resolved.title_offset + resolved.title_size);
+			assert_eq!(
+				tiled.y(),
+				resolved.title_offset + resolved.title_size.pixels()
+			);
 			let mut cells = Vec::new();
 			for row in 0..2 {
 				for column in 0..2 {
@@ -3809,7 +3815,7 @@ mod tests {
 			crate::plot::spec::ResolvedPresence::Show(Arc::new("Subtitle".to_owned()));
 		assert_eq!(
 			VerticalGuideBands::resolve("", None, &subtitle).heading_height(),
-			subtitle.subtitle_offset + subtitle.subtitle_size
+			subtitle.subtitle_offset + subtitle.subtitle_size.pixels()
 		);
 		subtitle.subtitle = crate::plot::spec::ResolvedPresence::Hide;
 		assert_eq!(

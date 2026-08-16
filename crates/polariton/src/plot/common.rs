@@ -6,6 +6,7 @@ use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
 	BarWidth, CategoryGap, HoverTextSize, LegendPosition, PointSize, ResolvedPresence, StrokeWidth,
+	SubtitleTextSize, TitleTextSize,
 };
 use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
@@ -466,8 +467,8 @@ pub struct ResolvedPlotSettings {
 	pub plot_padding_bottom: f32,
 	pub plot_padding_left: f32,
 	pub plot_padding_right: f32,
-	pub title_size: f32,
-	pub subtitle_size: f32,
+	pub title_size: TitleTextSize,
+	pub subtitle_size: SubtitleTextSize,
 	pub x_label_size: f32,
 	pub y_label_size: f32,
 	pub x_tick_size: f32,
@@ -533,8 +534,8 @@ impl Default for ResolvedPlotSettings {
 			plot_padding_bottom: 80.0,
 			plot_padding_left: 100.0,
 			plot_padding_right: 20.0,
-			title_size: 28.0,
-			subtitle_size: 20.0,
+			title_size: TitleTextSize::DEFAULT,
+			subtitle_size: SubtitleTextSize::DEFAULT,
 			x_label_size: 20.0,
 			y_label_size: 20.0,
 			x_tick_size: 18.0,
@@ -1163,12 +1164,12 @@ impl VerticalGuideBands {
 			ResolvedPresence::Fallback | ResolvedPresence::Hide => false,
 		};
 		let title = if title_visible {
-			settings.title_offset + settings.title_size
+			settings.title_offset + settings.title_size.pixels()
 		} else {
 			0.0
 		};
 		let subtitle = if subtitle_visible {
-			settings.subtitle_offset + settings.subtitle_size
+			settings.subtitle_offset + settings.subtitle_size.pixels()
 		} else {
 			0.0
 		};
@@ -1469,7 +1470,7 @@ impl<'a> PlotWidget<'a> {
 				content: title,
 				position: Point::new(size_only_bounds.width / 2.0, self.settings.title_offset),
 				color: self.settings.chrome.title_text.iced(),
-				size: iced::Pixels(self.settings.title_size),
+				size: iced::Pixels(self.settings.title_size.pixels()),
 				align_x: alignment::Horizontal::Center.into(),
 				align_y: alignment::Vertical::Top,
 				..Default::default()
@@ -1480,7 +1481,7 @@ impl<'a> PlotWidget<'a> {
 				content: st,
 				position: Point::new(size_only_bounds.width / 2.0, self.settings.subtitle_offset),
 				color: self.settings.chrome.subtitle_text.iced(),
-				size: iced::Pixels(self.settings.subtitle_size),
+				size: iced::Pixels(self.settings.subtitle_size.pixels()),
 				align_x: alignment::Horizontal::Center.into(),
 				align_y: alignment::Vertical::Top,
 				..Default::default()
@@ -1495,7 +1496,7 @@ impl<'a> PlotWidget<'a> {
 				content: title,
 				position: Point::new(bounds.width / 2.0, self.settings.title_offset),
 				color: self.settings.chrome.title_text.iced(),
-				size: iced::Pixels(self.settings.title_size),
+				size: iced::Pixels(self.settings.title_size.pixels()),
 				align_x: alignment::Horizontal::Center.into(),
 				align_y: alignment::Vertical::Top,
 				..Default::default()
@@ -1506,7 +1507,7 @@ impl<'a> PlotWidget<'a> {
 				content: subtitle,
 				position: Point::new(bounds.width / 2.0, self.settings.subtitle_offset),
 				color: self.settings.chrome.subtitle_text.iced(),
-				size: iced::Pixels(self.settings.subtitle_size),
+				size: iced::Pixels(self.settings.subtitle_size.pixels()),
 				align_x: alignment::Horizontal::Center.into(),
 				align_y: alignment::Vertical::Top,
 				..Default::default()
@@ -2407,9 +2408,9 @@ impl<'a> PlotWidget<'a> {
 			if text.x {
 				backend.fill_text(Text {
 					content: dim.clone(),
-					position: Point::new(top_px.x, top_px.y - 20.0),
+					position: Point::new(top_px.x, top_px.y - self.settings.x_label_size),
 					color: self.settings.chrome.axis_label_text.iced(),
-					size: iced::Pixels(22.0),
+					size: iced::Pixels(self.settings.x_label_size),
 					align_x: alignment::Horizontal::Center.into(),
 					align_y: alignment::Vertical::Bottom,
 					..Default::default()
@@ -2532,14 +2533,14 @@ mod product_0106_vertical_guide_band_oracles {
 		let title_bands = VerticalGuideBands::resolve("", None, &title);
 		assert_eq!(
 			title_bands.heading_height(),
-			title.title_offset + title.title_size
+			title.title_offset + title.title_size.pixels()
 		);
 
 		title.subtitle = ResolvedPresence::Show(Arc::new("Subtitle".to_owned()));
 		let subtitle_bands = VerticalGuideBands::resolve("", None, &title);
 		assert_eq!(
 			subtitle_bands.heading_height(),
-			title.subtitle_offset + title.subtitle_size
+			title.subtitle_offset + title.subtitle_size.pixels()
 		);
 		assert_ne!(
 			title_bands.heading_height(),
@@ -2945,6 +2946,45 @@ mod product_0067_0068_strata_oracles {
 			render(layouts()[0].clone(), default, true),
 			render(layouts()[0].clone(), enlarged, true),
 			"hover is an iced overlay, so its size cannot alter canvas operations"
+		);
+	}
+
+	#[test]
+	fn product_0113_heading_band_is_the_maximum_of_typed_title_and_subtitle_contributions() {
+		let title = |pixels| TitleTextSize::new(pixels).unwrap();
+		let subtitle = |pixels| SubtitleTextSize::new(pixels).unwrap();
+		let mut settings = ResolvedPlotSettings::default();
+
+		settings.title = ResolvedPresence::Show(Arc::new("title".to_owned()));
+		settings.subtitle = ResolvedPresence::Hide;
+		settings.title_size = title(48.0);
+		assert_eq!(
+			VerticalGuideBands::resolve("", None, &settings).heading_height(),
+			settings.title_offset + title(48.0).pixels()
+		);
+
+		settings.title = ResolvedPresence::Hide;
+		settings.subtitle = ResolvedPresence::Show(Arc::new("subtitle".to_owned()));
+		settings.subtitle_size = subtitle(36.0);
+		assert_eq!(
+			VerticalGuideBands::resolve("", None, &settings).heading_height(),
+			settings.subtitle_offset + subtitle(36.0).pixels()
+		);
+
+		settings.title = ResolvedPresence::Show(Arc::new("title".to_owned()));
+		settings.title_size = title(96.0);
+		assert_eq!(
+			VerticalGuideBands::resolve("", None, &settings).heading_height(),
+			(settings.title_offset + title(96.0).pixels())
+				.max(settings.subtitle_offset + subtitle(36.0).pixels())
+		);
+
+		settings.title_size = title(36.0);
+		settings.subtitle_size = subtitle(96.0);
+		assert_eq!(
+			VerticalGuideBands::resolve("", None, &settings).heading_height(),
+			settings.subtitle_offset + subtitle(96.0).pixels(),
+			"a visible subtitle must win when its contribution exceeds the visible title"
 		);
 	}
 
@@ -3577,6 +3617,104 @@ mod product_0056_categorical_y_oracles {
 			resize_render_suspended: false,
 			layer: PlotRenderLayer::Full,
 		}
+	}
+
+	#[test]
+	fn product_0113_typed_title_and_subtitle_sizes_reach_canvas_text() {
+		let kernel = FrameKernel;
+		let default_settings = ResolvedPlotSettings::default();
+		assert_eq!(default_settings.title_size, TitleTextSize::DEFAULT);
+		assert_eq!(default_settings.subtitle_size, SubtitleTextSize::DEFAULT);
+		let mut settings = ResolvedPlotSettings::default();
+		settings.title = ResolvedPresence::Show(Arc::new("Title".to_owned()));
+		settings.subtitle = ResolvedPresence::Show(Arc::new("Subtitle".to_owned()));
+		settings.title_size = TitleTextSize::new(48.0).unwrap();
+		settings.subtitle_size = SubtitleTextSize::new(36.0).unwrap();
+		let settings_model = PlotSettings::from_resolved(settings.clone());
+		let widget = PlotWidget {
+			kernel: &kernel,
+			title: String::new(),
+			padding: 0.0,
+			settings,
+			settings_model,
+			render_revision: 0,
+			resize_render_suspended: false,
+			layer: PlotRenderLayer::Full,
+		};
+		let mut backend = RecordingBackend::default();
+		widget.render(
+			&mut backend,
+			Rectangle::new(Point::ORIGIN, Size::new(400.0, 300.0)),
+		);
+		let title = backend
+			.texts
+			.iter()
+			.find(|text| text.content == "Title")
+			.expect("title text");
+		let subtitle = backend
+			.texts
+			.iter()
+			.find(|text| text.content == "Subtitle")
+			.expect("subtitle text");
+		assert_eq!(title.size, iced::Pixels(48.0));
+		assert_eq!(subtitle.size, iced::Pixels(36.0));
+	}
+
+	#[test]
+	fn product_0113_parallel_header_uses_x_label_size_for_its_size_and_clearance() {
+		let kernel = FrameKernel;
+		let layout = PlotLayout::Parallel {
+			dimensions: vec!["dimension".to_owned()],
+			ranges: vec![(0.0, 1.0)],
+		};
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(240.0, 160.0));
+		let header = |size| {
+			let mut settings = ResolvedPlotSettings::default();
+			settings.x_label_size = size;
+			let settings_model = PlotSettings::from_resolved(settings.clone());
+			let widget = PlotWidget {
+				kernel: &kernel,
+				title: String::new(),
+				padding: 0.0,
+				settings,
+				settings_model,
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: PlotRenderLayer::Full,
+			};
+			let transform = CoordinateTransformer::new(&layout, bounds);
+			let mut backend = RecordingBackend::default();
+			widget.draw_parallel_axes(
+				&mut backend,
+				bounds,
+				&transform,
+				&["dimension".to_owned()],
+				&[(0.0, 1.0)],
+				AxisTextVisibility::ALL,
+			);
+			backend
+				.texts
+				.into_iter()
+				.find(|text| text.content == "dimension")
+				.expect("parallel dimension header")
+		};
+
+		let default = header(20.0);
+		let enlarged = header(24.0);
+		assert_eq!(default.size, iced::Pixels(20.0));
+		assert_eq!(enlarged.size, iced::Pixels(24.0));
+		assert_eq!(default.position.y - enlarged.position.y, 4.0);
+
+		let mut titled = ResolvedPlotSettings::default();
+		titled.title = ResolvedPresence::Show(Arc::new("Title".to_owned()));
+		titled.title_size = TitleTextSize::new(48.0).unwrap();
+		let bands = VerticalGuideBands::resolve("", None, &titled);
+		let plot_top = bands.plot_top(&titled);
+		let header_top = plot_top - 2.0 * enlarged.size.0;
+		assert!(
+			header_top >= bands.heading_height(),
+			"the enlarged header clears the title band instead of reclaiming it"
+		);
 	}
 
 	fn assert_frame_path(path: &[Point], width: f32, height: f32) {

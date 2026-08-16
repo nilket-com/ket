@@ -12,7 +12,7 @@ use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::spec::{
 	BarWidth, CategoryGap, ColorJob, HoverTextSize, LayerSettings, LegendPosition, Override,
-	PointSize, Presence, ResolvedPresence, StrokeWidth,
+	PointSize, Presence, ResolvedPresence, StrokeWidth, SubtitleTextSize, TitleTextSize,
 };
 use iced::Color;
 use libaryon::engine::UiPalette;
@@ -101,8 +101,8 @@ pub fn chrome_from_ui_palette(palette: UiPalette) -> PlotChromeSpec {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct PlotTypography {
-	pub title_size: f32,
-	pub subtitle_size: f32,
+	pub title_size: TitleTextSize,
+	pub subtitle_size: SubtitleTextSize,
 	pub x_label_size: f32,
 	pub y_label_size: f32,
 	pub x_tick_size: f32,
@@ -204,6 +204,9 @@ pub struct PlotSettingsLayer {
 	/// this settings layer carries only authored/application/pane intent.
 	pub categorical_palette: Override<Arc<String>>,
 	pub typography: Override<PlotTypography>,
+	/// PRODUCT-0113: typed partial overrides for the two top-band roles.
+	pub title_size: Override<TitleTextSize>,
+	pub subtitle_size: Override<SubtitleTextSize>,
 	/// PRODUCT-0112: a partial hover-size override avoids reconstructing the
 	/// whole typography carrier merely to size generated hover text.
 	pub hover_size: Override<HoverTextSize>,
@@ -247,6 +250,8 @@ impl Default for PlotSettingsLayer {
 			resolved_skin: Override::Inherit,
 			categorical_palette: Override::Inherit,
 			typography: Override::Inherit,
+			title_size: Override::Inherit,
+			subtitle_size: Override::Inherit,
 			hover_size: Override::Inherit,
 			padding: Override::Inherit,
 			guides: Override::Inherit,
@@ -380,6 +385,14 @@ fn apply_layer(
 		settings.legend_size = value.legend_size;
 		settings.hover_size = value.hover_size;
 	}
+	// PRODUCT-0113: specific typography slots follow PRODUCT-0091's partial
+	// override rule and win over the atomic carrier within one tier.
+	if let Override::Set(value) = layer.title_size {
+		settings.title_size = value;
+	}
+	if let Override::Set(value) = layer.subtitle_size {
+		settings.subtitle_size = value;
+	}
 	// PRODUCT-0112: the specific slot wins over the atomic typography carrier
 	// within a tier, just as PRODUCT-0091's partial continuous-ramp slots do.
 	if let Override::Set(value) = layer.hover_size {
@@ -490,8 +503,8 @@ mod tests {
 
 	fn typography(hover_size: HoverTextSize) -> PlotTypography {
 		PlotTypography {
-			title_size: 28.0,
-			subtitle_size: 20.0,
+			title_size: TitleTextSize::DEFAULT,
+			subtitle_size: SubtitleTextSize::DEFAULT,
 			x_label_size: 20.0,
 			y_label_size: 20.0,
 			x_tick_size: 18.0,
@@ -534,6 +547,56 @@ mod tests {
 			size(24.0),
 			"atomic typography still delivers hover size when the partial slot is absent"
 		);
+	}
+
+	#[test]
+	fn product_0113_title_and_subtitle_slots_are_typed_partial_and_follow_all_five_tiers() {
+		let title = |pixels| TitleTextSize::new(pixels).unwrap();
+		let subtitle = |pixels| SubtitleTextSize::new(pixels).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.title_size = title(6.0);
+		cascade.library_defaults.subtitle_size = subtitle(6.0);
+		cascade.application_theme.title_size = Override::Set(title(12.0));
+		cascade.application_theme.subtitle_size = Override::Set(subtitle(12.0));
+		cascade.authored_spec.title_size = Override::Set(title(20.0));
+		cascade.authored_spec.subtitle_size = Override::Set(subtitle(20.0));
+		cascade.layer.title_size = Override::Set(title(32.0));
+		cascade.layer.subtitle_size = Override::Set(subtitle(32.0));
+		cascade.pane_override.title_size = Override::Set(title(48.0));
+		cascade.pane_override.subtitle_size = Override::Set(subtitle(48.0));
+		assert_eq!(cascade.resolve().title_size, title(48.0));
+		assert_eq!(cascade.resolve().subtitle_size, subtitle(48.0));
+
+		cascade.pane_override.title_size = Override::Inherit;
+		cascade.pane_override.subtitle_size = Override::Inherit;
+		assert_eq!(cascade.resolve().title_size, title(32.0));
+		assert_eq!(cascade.resolve().subtitle_size, subtitle(32.0));
+		cascade.layer.title_size = Override::Inherit;
+		cascade.layer.subtitle_size = Override::Inherit;
+		assert_eq!(cascade.resolve().title_size, title(20.0));
+		assert_eq!(cascade.resolve().subtitle_size, subtitle(20.0));
+		cascade.authored_spec.title_size = Override::Inherit;
+		cascade.authored_spec.subtitle_size = Override::Inherit;
+		assert_eq!(cascade.resolve().title_size, title(12.0));
+		assert_eq!(cascade.resolve().subtitle_size, subtitle(12.0));
+		cascade.application_theme.title_size = Override::Inherit;
+		cascade.application_theme.subtitle_size = Override::Inherit;
+		assert_eq!(cascade.resolve().title_size, title(6.0));
+		assert_eq!(cascade.resolve().subtitle_size, subtitle(6.0));
+
+		cascade.authored_spec.typography = Override::Set(PlotTypography {
+			title_size: title(24.0),
+			subtitle_size: subtitle(24.0),
+			..typography(HoverTextSize::DEFAULT)
+		});
+		cascade.authored_spec.title_size = Override::Set(title(36.0));
+		cascade.authored_spec.subtitle_size = Override::Set(subtitle(40.0));
+		assert_eq!(cascade.resolve().title_size, title(36.0));
+		assert_eq!(cascade.resolve().subtitle_size, subtitle(40.0));
+		cascade.authored_spec.title_size = Override::Inherit;
+		cascade.authored_spec.subtitle_size = Override::Inherit;
+		assert_eq!(cascade.resolve().title_size, title(24.0));
+		assert_eq!(cascade.resolve().subtitle_size, subtitle(24.0));
 	}
 
 	#[test]

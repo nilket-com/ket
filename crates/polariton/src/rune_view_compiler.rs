@@ -66,6 +66,7 @@ const PRESENTATION_METHODS: &[&str] = &[
 	"diverging",
 	"diverging_at",
 	"duotone",
+	"font_size",
 	"percent",
 	"point_size",
 	"show_types",
@@ -2635,6 +2636,83 @@ workspace.table("t").views([figure([
 				format!("hover_size({rejected})")
 			);
 			assert!(message.contains("hover size") || message.contains("requires a number"));
+		}
+	}
+
+	#[test]
+	fn product_0113_title_and_subtitle_font_size_are_member_modifiers() {
+		let source = r#"workspace.table("t").views([figure([
+title("T").font_size(48),
+subtitle("S").font_size(36),
+bar("x", "y"),
+])])"#;
+		let compiled = compile(source).expect("title and subtitle font sizes compile");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("font-size fixture produced a table")
+		};
+		assert_eq!(
+			plot.authored_settings.title_size,
+			crate::plot::spec::Override::Set(crate::plot::spec::TitleTextSize::new(48.0).unwrap())
+		);
+		assert_eq!(
+			plot.authored_settings.subtitle_size,
+			crate::plot::spec::Override::Set(
+				crate::plot::spec::SubtitleTextSize::new(36.0).unwrap()
+			)
+		);
+
+		for accepted in ["6", "96"] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([title(\"T\").font_size({accepted}), bar(\"x\", \"y\")])])"
+			);
+			compile(&source).expect("inclusive title font-size endpoint compiles");
+		}
+		for rejected in ["5.9", "96.1", "\"large\""] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([subtitle(\"S\").font_size({rejected}), bar(\"x\", \"y\")])])"
+			);
+			let error = compile(&source).expect_err("invalid subtitle font size refuses");
+			let RuneEnvelopeError::InvalidView { span, .. } = error else {
+				panic!("font-size refusal retains its modifier origin")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				format!(".font_size({rejected})")
+			);
+		}
+
+		for (source, expected) in [
+			(
+				r#"workspace.table("t").views([figure([x_label("x").font_size(20), bar("x", "y")])])"#,
+				".font_size(20)",
+			),
+			(
+				r#"workspace.table("t").views([figure([skin("greys_rs2").font_size(20), bar("x", "y")])])"#,
+				".font_size(20)",
+			),
+			(
+				r#"workspace.table("t").views([figure([title("T").font_size(20).font_size(24), bar("x", "y")])])"#,
+				".font_size(24)",
+			),
+		] {
+			let error = compile(source).expect_err("invalid font-size form refuses");
+			let RuneEnvelopeError::InvalidView { span, .. } = error else {
+				panic!("font-size refusal retains a presentation span")
+			};
+			assert_eq!(&source[span.start as usize..span.end as usize], expected);
+		}
+
+		for unknown in ["x_tick_size(20)", "y_tick_size(20)"] {
+			let source =
+				format!("workspace.table(\"t\").views([figure([{unknown}, bar(\"x\", \"y\")])])");
+			let error = compile(&source).expect_err("blocked tick-size word stays unknown");
+			let RuneEnvelopeError::InvalidView { span, .. } = error else {
+				panic!("unknown spelling produces a presentation error")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				unknown.split('(').next().expect("unknown identifier")
+			);
 		}
 	}
 

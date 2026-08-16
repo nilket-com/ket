@@ -395,6 +395,7 @@ mod tests {
 		fill_colors: Vec<Color>,
 		strokes: Vec<Color>,
 		texts: Vec<String>,
+		text_sizes: Vec<Pixels>,
 		text_colors: Vec<Color>,
 	}
 
@@ -417,6 +418,7 @@ mod tests {
 
 		fn fill_text(&mut self, text: Text) {
 			self.texts.push(text.content);
+			self.text_sizes.push(text.size);
 			self.text_colors.push(text.color);
 		}
 
@@ -549,6 +551,27 @@ mod tests {
 
 		let labels = render(&frame(&["A", "B"], &[0.5, 0.2]), 100.0, 100.0).texts;
 		assert_eq!(labels, ["0.5", "0.2"]);
+	}
+
+	#[test]
+	fn product_0113_funnel_value_labels_ignore_figure_heading_sizes() {
+		let data = frame(&["A", "B"], &[10.0, 5.0]);
+		let kernel = kernel(&data);
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+		let mut settings = ResolvedPlotSettings::default();
+		settings.title_size = crate::plot::spec::TitleTextSize::new(96.0).unwrap();
+		settings.subtitle_size = crate::plot::spec::SubtitleTextSize::new(96.0).unwrap();
+		let layout = kernel.layout(settings.clone());
+		let transform = CoordinateTransformer::new(&layout, bounds);
+		let mut backend = FunnelBackend::default();
+		kernel.plot(
+			&mut backend,
+			bounds,
+			&transform,
+			Cursor::Unavailable,
+			settings,
+		);
+		assert_eq!(backend.text_sizes, vec![Pixels(16.0), Pixels(16.0)]);
 	}
 
 	#[test]
