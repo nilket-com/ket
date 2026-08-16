@@ -6338,6 +6338,10 @@ fn timing_atlas_replay_attribution_path(
 				.and_then(|value| value.as_str())
 				.unwrap_or_default()
 				.to_owned(),
+			aggregate_accumulation_ms: node
+				.get("aggregate_accumulation_ms")
+				.and_then(|value| value.as_f64())
+				.unwrap_or(0.0),
 			telemetry_lock_ms: node
 				.get("telemetry_lock_ms")
 				.and_then(|value| value.as_f64())
@@ -6427,6 +6431,28 @@ fn timing_atlas_replay_attribution_path(
 					 {recomputed_portion}"
 				));
 			}
+		}
+	}
+
+	// ADR 554 Branch A: the path-level accumulation must equal the sum over the
+	// nodes the path actually selected. A path total emitted without node detail
+	// cannot be audited — the first fully-wired run reported a correct total with
+	// no per-node breakdown, which left one cell's coverage undecidable.
+	if let Some(claimed_accumulation) = row
+		.get("aggregate_accumulation_ms")
+		.and_then(|value| value.as_f64())
+	{
+		let node_sum: f64 = recomputed
+			.path
+			.iter()
+			.filter_map(|key| nodes.iter().find(|node| node.key() == *key))
+			.map(|node| node.aggregate_accumulation_ms)
+			.sum();
+		if (claimed_accumulation - node_sum).abs() > 1e-6 {
+			problems.push(format!(
+				"path aggregate accumulation {claimed_accumulation} disagrees with the \
+				 selected nodes' sum {node_sum}"
+			));
 		}
 	}
 
@@ -7336,6 +7362,13 @@ pub struct TimingAtlasTaskNode {
 	/// `task_wall_micros` is deliberately absent: it is the envelope, not a term.
 	pub telemetry_lock_ms: f64,
 	pub framework_overhead_ms: f64,
+	/// ADR 554 Branch A: in-task time **named** as aggregate accumulation.
+	///
+	/// Reported beside the unnamed in-task terms, never inside them. The engine
+	/// already subtracts it from `framework_overhead`, so omitting it here does
+	/// not hide it — it relocates it into the unnamed residual, which is worse
+	/// than leaving it unnamed. The first Branch A run did exactly that.
+	pub aggregate_accumulation_ms: f64,
 	/// The worker this task ran on, as its UUID string. Present so an artifact can
 	/// answer whether concurrent stage siblings actually landed on different
 	/// workers — the question ADR 554 Branch B could only answer "consistent
@@ -7358,6 +7391,8 @@ pub struct TimingAtlasCriticalPath {
 	pub path: Vec<(u32, u32)>,
 	pub total_wall_ms: f64,
 	pub components: BTreeMap<String, f64>,
+	/// Named aggregate accumulation summed over the same path nodes.
+	pub aggregate_accumulation_ms: f64,
 	/// In-task unattributed time summed over **the same path nodes** the
 	/// components are summed over. Summing it over a different node set would
 	/// make the residual incoherent with the components it sits beside.
@@ -7430,6 +7465,7 @@ pub fn timing_atlas_critical_path(
 	// Components come only from nodes on the selected path.
 	let mut components: BTreeMap<String, f64> = BTreeMap::new();
 	let mut in_task_unattributed_ms = 0.0_f64;
+	let mut aggregate_accumulation_ms = 0.0_f64;
 	for key in &path {
 		let Some(node) = index.get(key) else { continue };
 		for (component, portion) in &node.components {
@@ -7438,12 +7474,14 @@ pub fn timing_atlas_critical_path(
 				.or_insert(0.0) += portion;
 		}
 		in_task_unattributed_ms += node.telemetry_lock_ms + node.framework_overhead_ms;
+		aggregate_accumulation_ms += node.aggregate_accumulation_ms;
 	}
 	Some(TimingAtlasCriticalPath {
 		path,
 		total_wall_ms,
 		components,
 		in_task_unattributed_ms,
+		aggregate_accumulation_ms,
 	})
 }
 
@@ -7730,6 +7768,9 @@ pub struct TimingAtlasChildAttribution {
 	pub path: Vec<(u32, u32)>,
 	pub path_wall_ms: f64,
 	pub path_components: BTreeMap<String, f64>,
+	/// Named aggregate accumulation along the path. Reporting only: a remainder
+	/// subterm, never an ADR 538 component (§2).
+	pub aggregate_accumulation_ms: f64,
 	/// In-task unattributed time along the path. Reporting only: it is not a
 	/// component, is not eligible, and never enters `attributed_ms`.
 	pub in_task_unattributed_ms: f64,
@@ -7832,6 +7873,8 @@ pub fn timing_atlas_nodes_from_report(
 				wall_ms: record.telemetry.phases.task_wall_micros as f64 / 1000.0,
 				components: timing_atlas_component_portions_ms(&record.telemetry.phases),
 				worker_id: record.worker_id.get().to_string(),
+				aggregate_accumulation_ms: record.telemetry.phases.aggregate_accumulation_micros
+					as f64 / 1000.0,
 				telemetry_lock_ms: record.telemetry.phases.telemetry_lock_micros as f64 / 1000.0,
 				framework_overhead_ms: record.telemetry.phases.framework_overhead_micros as f64
 					/ 1000.0,
@@ -7860,6 +7903,7 @@ pub fn timing_atlas_local_task_node(
 		// The local arm runs no distributed task, so it has no worker. Empty is the
 		// declared absence — not a fabricated id that would join against nothing.
 		worker_id: String::new(),
+		aggregate_accumulation_ms: phases.aggregate_accumulation_micros as f64 / 1000.0,
 		telemetry_lock_ms: phases.telemetry_lock_micros as f64 / 1000.0,
 		framework_overhead_ms: phases.framework_overhead_micros as f64 / 1000.0,
 		upstream: Vec::new(),
@@ -7889,6 +7933,7 @@ pub fn timing_atlas_child_attribution_with_lifecycle(
 		path_wall_ms: selected.total_wall_ms,
 		path_components: selected.components,
 		in_task_unattributed_ms: selected.in_task_unattributed_ms,
+		aggregate_accumulation_ms: selected.aggregate_accumulation_ms,
 		sql_planning_ms,
 		pre_dispatch_ms: lifecycle.pre_dispatch_micros as f64 / 1000.0,
 		dispatch_loop_wall_ms: lifecycle.dispatch_loop_wall_micros as f64 / 1000.0,
@@ -7925,6 +7970,7 @@ pub fn timing_atlas_attribution_path_row(
 				"wall_ms": node.wall_ms,
 				"components": components,
 				"worker_id": node.worker_id,
+				"aggregate_accumulation_ms": node.aggregate_accumulation_ms,
 				"telemetry_lock_ms": node.telemetry_lock_ms,
 				"framework_overhead_ms": node.framework_overhead_ms,
 				"upstream": node.upstream,
@@ -7932,7 +7978,12 @@ pub fn timing_atlas_attribution_path_row(
 		})
 		.collect();
 	let remainder_ms = measured_elapsed_ms - attribution.attributed_ms();
-	let unnamed_residual_ms = remainder_ms - attribution.in_task_unattributed_ms;
+	// Accumulation is in-task time that is now **named**, so it leaves the unnamed
+	// residual alongside the unnamed in-task terms. Omitting it here would not hide
+	// it — the engine already removed it from `framework_overhead`, so it would
+	// silently reappear as unnamed. The first Branch A run did exactly that.
+	let unnamed_residual_ms =
+		remainder_ms - attribution.in_task_unattributed_ms - attribution.aggregate_accumulation_ms;
 	let path_dispatch_sum_ms = attribution
 		.path_components
 		.get("dispatch")
@@ -7980,6 +8031,7 @@ pub fn timing_atlas_attribution_path_row(
 		"telemetry_lock_ms": telemetry_lock_ms,
 		"framework_overhead_ms": framework_overhead_ms,
 		"in_task_unattributed_ms": attribution.in_task_unattributed_ms,
+		"aggregate_accumulation_ms": attribution.aggregate_accumulation_ms,
 		"unnamed_residual_ms": unnamed_residual_ms,
 		// ADR 554 §3 B2: three sequential spans with distinct owners, plus what
 		// they do not cover. The residual is carried even when small — dropping it
@@ -23173,6 +23225,69 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 mod adr538_timing_atlas_journal_replay {
 	use super::*;
 
+	/// Per-node accumulation survives to the artifact and its sum over the selected
+	/// path equals the path-level total.
+	///
+	/// The first fully-wired Branch A run emitted a correct path total with no node
+	/// detail, which left one cell's coverage undecidable: a near-zero total could
+	/// not be told apart from an uninstrumented path. Replay now refuses that.
+	#[test]
+	fn adr554_per_node_accumulation_sums_to_the_path_total() {
+		let mut left = decomposition_node(0.0, 0.0, 10.0);
+		left.aggregate_accumulation_ms = 3.0;
+		let mut right = decomposition_node(0.0, 0.0, 10.0);
+		right.stage_id = 1;
+		right.upstream = vec![(0, 0)];
+		right.aggregate_accumulation_ms = 4.0;
+
+		let attribution =
+			timing_atlas_child_attribution(vec![left, right]).expect("two-node fixture");
+		let row = timing_atlas_attribution_path_row("q13", "distributed", 0, 1, 50.0, &attribution);
+
+		let per_node: Vec<f64> = row["nodes"]
+			.as_array()
+			.expect("nodes array")
+			.iter()
+			.map(|node| {
+				node["aggregate_accumulation_ms"]
+					.as_f64()
+					.expect("per-node accumulation present")
+			})
+			.collect();
+		assert_eq!(
+			per_node,
+			vec![3.0, 4.0],
+			"each node carries its own accumulation"
+		);
+		assert_eq!(row["aggregate_accumulation_ms"], 7.0);
+
+		timing_atlas_replay_attribution_path(&row).expect("node sum agrees with the path total");
+	}
+
+	/// ADR 554 Branch A: naming accumulation must **reduce** the unnamed residual,
+	/// not relocate time into it.
+	///
+	/// The first Branch A run wired the engine side only: the counter left
+	/// `framework_overhead`, the harness never carried it, and the time surfaced
+	/// as unnamed residual instead. q13's in-task figure fell 2,592 to 783 ms
+	/// while its unnamed residual rose 296 to 2,528 ms. Both halves must move
+	/// together, and this control is what fails if only one is wired.
+	#[test]
+	fn adr554_naming_accumulation_reduces_the_unnamed_residual() {
+		let mut node = decomposition_node(0.0, 0.0, 100.0);
+		node.aggregate_accumulation_ms = 12.0;
+		let attribution = timing_atlas_child_attribution(vec![node]).expect("fixture attributes");
+		assert_eq!(attribution.aggregate_accumulation_ms, 12.0);
+
+		let row = timing_atlas_attribution_path_row("q13", "distributed", 0, 1, 50.0, &attribution);
+		assert_eq!(row["aggregate_accumulation_ms"], 12.0);
+		// attributed = 5; remainder = 45; in-task unnamed = 0; named accumulation = 12.
+		assert_eq!(
+			row["unnamed_residual_ms"], 33.0,
+			"named accumulation leaves the unnamed residual rather than inflating it"
+		);
+	}
+
 	/// ADR 554 §2: accumulation is a **remainder subterm**, never an ADR 538
 	/// component. The frozen phase-to-component mapping must not have grown.
 	#[test]
@@ -23468,6 +23583,7 @@ mod adr538_timing_atlas_journal_replay {
 		wall_ms: f64,
 	) -> TimingAtlasTaskNode {
 		TimingAtlasTaskNode {
+			aggregate_accumulation_ms: 0.0,
 			stage_id: 0,
 			task_id: 0,
 			wall_ms,
@@ -23563,6 +23679,7 @@ mod adr538_timing_atlas_journal_replay {
 				(TimingAtlasComponent::Transport, 0.0),
 			],
 			worker_id: String::new(),
+			aggregate_accumulation_ms: 0.0,
 			telemetry_lock_ms: 0.0,
 			framework_overhead_ms: 0.0,
 			upstream: Vec::new(),
@@ -23586,6 +23703,7 @@ mod adr538_timing_atlas_journal_replay {
 					(TimingAtlasComponent::Transport, 0.5),
 				],
 				worker_id: String::new(),
+				aggregate_accumulation_ms: 0.0,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: Vec::new(),
@@ -23602,6 +23720,7 @@ mod adr538_timing_atlas_journal_replay {
 					(TimingAtlasComponent::Transport, 1.0),
 				],
 				worker_id: String::new(),
+				aggregate_accumulation_ms: 0.0,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -24572,6 +24691,7 @@ mod adr538_timing_atlas_critical_path {
 			wall_ms: wall,
 			components,
 			worker_id: String::new(),
+			aggregate_accumulation_ms: 0.0,
 			telemetry_lock_ms: 0.0,
 			framework_overhead_ms: 0.0,
 			upstream,
@@ -24789,6 +24909,7 @@ mod adr538_path_bound_validation {
 				wall_ms: 100.0,
 				components: vec![],
 				worker_id: String::new(),
+				aggregate_accumulation_ms: 0.0,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![],
@@ -24799,6 +24920,7 @@ mod adr538_path_bound_validation {
 				wall_ms: 400.0,
 				components: vec![],
 				worker_id: String::new(),
+				aggregate_accumulation_ms: 0.0,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
@@ -24810,6 +24932,7 @@ mod adr538_path_bound_validation {
 				wall_ms: 200.0,
 				components: vec![],
 				worker_id: String::new(),
+				aggregate_accumulation_ms: 0.0,
 				telemetry_lock_ms: 0.0,
 				framework_overhead_ms: 0.0,
 				upstream: vec![(0, 0)],
