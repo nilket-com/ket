@@ -193,6 +193,9 @@ pub struct RuneRelationSinkOutcome {
 	pub span: std::ops::Range<u32>,
 	/// Structural facet intent retained beside the resolved sink output.
 	pub facet: Option<String>,
+	/// Resolved once from the application default and authored facet setting;
+	/// paint, hover, clipping, and extent share this one grid input.
+	pub figure_grid: crate::plot::grid::FigureGridLayoutSettings,
 	/// Every sink holds the same `Arc` as its containing set. This is the
 	/// stamped-result identity proof, not a value-equivalent copy.
 	pub source: Arc<ResultArtifact>,

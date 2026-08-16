@@ -83,6 +83,9 @@ pub(crate) struct RunePlotIntent {
 	/// Diagnostic provenance only; deliberately excluded from equality.
 	pub(crate) continuous_intent_span: Option<Range<u32>>,
 	pub(crate) facet: Option<String>,
+	/// PRODUCT-0110: figure-grid layout is intentionally outside the plot
+	/// settings cascade because it reserves space between facets.
+	pub(crate) facet_gutter: Option<f32>,
 	pub(crate) authored_settings: PlotSettingsLayer,
 	pub(crate) plot_skin_span: Option<Range<u32>>,
 	pub(crate) facet_span: Option<Range<u32>>,
@@ -96,6 +99,7 @@ impl PartialEq for RunePlotIntent {
 		self.body == other.body
 			&& self.continuous_intent == other.continuous_intent
 			&& self.facet == other.facet
+			&& self.facet_gutter == other.facet_gutter
 			&& self.authored_settings == other.authored_settings
 	}
 }
@@ -173,6 +177,7 @@ impl RunePlotIntent {
 			continuous_intent: None,
 			continuous_intent_span: None,
 			facet: None,
+			facet_gutter: None,
 			authored_settings: PlotSettingsLayer::default(),
 			plot_skin_span: None,
 			facet_span: None,

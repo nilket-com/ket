@@ -27,7 +27,39 @@ use std::fmt;
 use std::sync::Arc;
 
 pub const MAX_GRID_CELLS: usize = 512;
-const GRID_GAP: f32 = 12.0;
+pub const DEFAULT_FACET_GUTTER: f32 = 12.0;
+
+/// Resolved figure-grid layout. This is deliberately separate from
+/// `PlotSettings`: a facet gutter belongs between grid cells, not inside a
+/// plot's padding or chrome cascade.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct FigureGridLayoutSettings {
+	facet_gutter: f32,
+}
+
+impl Default for FigureGridLayoutSettings {
+	fn default() -> Self {
+		Self {
+			facet_gutter: DEFAULT_FACET_GUTTER,
+		}
+	}
+}
+
+impl FigureGridLayoutSettings {
+	pub fn resolve(authored_facet_gutter: Option<f32>) -> Self {
+		authored_facet_gutter
+			.map(Self::authored)
+			.unwrap_or_default()
+	}
+
+	pub fn authored(facet_gutter: f32) -> Self {
+		Self { facet_gutter }
+	}
+
+	pub fn facet_gutter(self) -> f32 {
+		self.facet_gutter
+	}
+}
 
 pub type DomainGroupId = u32;
 
@@ -429,18 +461,51 @@ fn axis_text_visibility(cell: AxisTextCell, cells: &[AxisTextCell]) -> AxisTextV
 pub struct PlotGridKernel {
 	cells: NonEmpty<PreparedGridCell>,
 	arrangement: GridArrangement,
+	figure_grid: FigureGridLayoutSettings,
 }
 
 impl PlotGridKernel {
 	pub fn from_grid(grid: PlotGrid, width: u32, height: u32) -> Self {
-		Self::from_grid_with_factory(grid, width, height, |spec, data| {
-			Ok(create_plot(spec, data, width, height))
-		})
+		Self::from_grid_with_figure_grid(grid, FigureGridLayoutSettings::default(), width, height)
+	}
+
+	pub fn from_grid_with_figure_grid(
+		grid: PlotGrid,
+		figure_grid: FigureGridLayoutSettings,
+		width: u32,
+		height: u32,
+	) -> Self {
+		Self::from_grid_with_factory_and_figure_grid(
+			grid,
+			figure_grid,
+			width,
+			height,
+			|spec, data| Ok(create_plot(spec, data, width, height)),
+		)
 		.expect("plain plot grid kernels are infallible")
 	}
 
 	pub fn from_grid_with_factory(
 		grid: PlotGrid,
+		_width: u32,
+		_height: u32,
+		factory: impl FnMut(
+			&ResolvedPlotSpec,
+			&DataFrame,
+		) -> Result<Arc<dyn PlotKernel + Send + Sync>, String>,
+	) -> Result<Self, String> {
+		Self::from_grid_with_factory_and_figure_grid(
+			grid,
+			FigureGridLayoutSettings::default(),
+			_width,
+			_height,
+			factory,
+		)
+	}
+
+	pub fn from_grid_with_factory_and_figure_grid(
+		grid: PlotGrid,
+		figure_grid: FigureGridLayoutSettings,
 		_width: u32,
 		_height: u32,
 		mut factory: impl FnMut(
@@ -460,6 +525,7 @@ impl PlotGridKernel {
 		Ok(Self {
 			cells,
 			arrangement: grid.arrangement,
+			figure_grid,
 		})
 	}
 
@@ -469,9 +535,29 @@ impl PlotGridKernel {
 		width: u32,
 		height: u32,
 	) -> Result<Self, String> {
-		Self::from_grid_with_factory(grid, width, height, |spec, data| {
-			create_styled_plot(spec, data, layer_settings.clone())
-		})
+		Self::from_styled_grid_with_figure_grid(
+			grid,
+			FigureGridLayoutSettings::default(),
+			layer_settings,
+			width,
+			height,
+		)
+	}
+
+	pub fn from_styled_grid_with_figure_grid(
+		grid: PlotGrid,
+		figure_grid: FigureGridLayoutSettings,
+		layer_settings: LayerSettings,
+		width: u32,
+		height: u32,
+	) -> Result<Self, String> {
+		Self::from_grid_with_factory_and_figure_grid(
+			grid,
+			figure_grid,
+			width,
+			height,
+			|spec, data| create_styled_plot(spec, data, layer_settings.clone()),
+		)
 	}
 
 	fn cell_layouts(&self, settings: ResolvedPlotSettings) -> Vec<(GridPosition, PlotLayout)> {
@@ -577,7 +663,12 @@ impl PlotComposite for PlotGridKernel {
 		let layouts = self.cell_layouts(resolved.clone());
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
-			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
 			let helper = PlotWidget {
@@ -663,7 +754,12 @@ impl PlotComposite for PlotGridKernel {
 		let axis_cells = self.axis_text_cells();
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
-			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
 			let axis_text = axis_text_visibility(axis_cells[index], &axis_cells);
@@ -773,6 +869,7 @@ impl PlotComposite for PlotGridKernel {
 		let shared_extent = grid_plot_extent(
 			tiled,
 			self.arrangement,
+			self.figure_grid,
 			self.cells.iter().any(|cell| cell.cell.label.is_some()),
 			&resolved,
 		);
@@ -815,7 +912,12 @@ impl PlotComposite for PlotGridKernel {
 		let layouts = self.cell_layouts(resolved.clone());
 		for (index, cell) in self.cells.iter().enumerate() {
 			let (position, layout) = &layouts[index];
-			let cell_bounds = grid_cell_bounds(tiled, self.arrangement, *position);
+			let cell_bounds = grid_cell_bounds_with_settings(
+				tiled,
+				self.arrangement,
+				*position,
+				self.figure_grid,
+			);
 			if !cell_bounds.contains(cursor) {
 				continue;
 			}
@@ -860,23 +962,30 @@ fn grid_plot_area(
 fn grid_plot_extent(
 	tiled: Rect<Widget>,
 	arrangement: GridArrangement,
+	figure_grid: FigureGridLayoutSettings,
 	has_facet_labels: bool,
 	settings: &ResolvedPlotSettings,
 ) -> Rect<Widget> {
 	let facet_label = has_facet_labels.then_some("facet");
 	let first = grid_plot_area(
-		grid_cell_bounds(tiled, arrangement, GridPosition { row: 0, column: 0 }),
+		grid_cell_bounds_with_settings(
+			tiled,
+			arrangement,
+			GridPosition { row: 0, column: 0 },
+			figure_grid,
+		),
 		facet_label,
 		settings,
 	);
 	let last = grid_plot_area(
-		grid_cell_bounds(
+		grid_cell_bounds_with_settings(
 			tiled,
 			arrangement,
 			GridPosition {
 				row: arrangement.rows.saturating_sub(1),
 				column: arrangement.columns.saturating_sub(1),
 			},
+			figure_grid,
 		),
 		facet_label,
 		settings,
@@ -894,10 +1003,27 @@ pub(crate) fn grid_cell_bounds(
 	arrangement: GridArrangement,
 	position: GridPosition,
 ) -> Rect<Widget> {
+	grid_cell_bounds_with_settings(
+		outer,
+		arrangement,
+		position,
+		FigureGridLayoutSettings::default(),
+	)
+}
+
+pub(crate) fn grid_cell_bounds_with_settings(
+	outer: Rect<Widget>,
+	arrangement: GridArrangement,
+	position: GridPosition,
+	figure_grid: FigureGridLayoutSettings,
+) -> Rect<Widget> {
 	let columns = arrangement.columns.max(1) as f32;
 	let rows = arrangement.rows.max(1) as f32;
-	let gap_x = GRID_GAP.min(outer.width() / columns.max(1.0));
-	let gap_y = GRID_GAP.min(outer.height() / rows.max(1.0));
+	// A safety clamp protects impossible live geometry only. It never changes
+	// the authored request carried by the Rune figure.
+	let requested = figure_grid.facet_gutter();
+	let gap_x = requested.min(outer.width() / columns.max(1.0));
+	let gap_y = requested.min(outer.height() / rows.max(1.0));
 	let width = (outer.width() - gap_x * (columns - 1.0)).max(0.0) / columns;
 	let height = (outer.height() - gap_y * (rows - 1.0)).max(0.0) / rows;
 	outer.region(
@@ -1822,7 +1948,13 @@ mod tests {
 		));
 		let legend = crate::plot::legend::legend_layout(bounds, Some(&content), &resolved);
 		let tiled = grid_tiled_area(grid_outer_area(legend.content_bounds, 0.0), "", &resolved);
-		let shared_extent = grid_plot_extent(tiled, kernel.arrangement, true, &resolved);
+		let shared_extent = grid_plot_extent(
+			tiled,
+			kernel.arrangement,
+			kernel.figure_grid,
+			true,
+			&resolved,
+		);
 		let legend_origin = legend.origin(shared_extent).expect("default gutter origin");
 		let cell_plots = kernel
 			.cells
@@ -2148,6 +2280,56 @@ mod tests {
 		let svg = backend.finish();
 		assert_eq!(svg.matches("<clipPath").count(), 5);
 		assert!(svg.matches("<path").count() >= 2);
+	}
+
+	#[test]
+	fn product_0110_facet_gutter_is_one_shared_boundary_and_clamps_only_geometry() {
+		let outer = widget_rect(IcedRectangle::new(
+			Point::ORIGIN,
+			iced::Size::new(224.0, 120.0),
+		));
+		let arrangement = GridArrangement::new(2, 2).expect("two by two grid");
+		let authored = FigureGridLayoutSettings::authored(24.0);
+		let top_left = grid_cell_bounds_with_settings(
+			outer,
+			arrangement,
+			GridPosition { row: 0, column: 0 },
+			authored,
+		);
+		let top_right = grid_cell_bounds_with_settings(
+			outer,
+			arrangement,
+			GridPosition { row: 0, column: 1 },
+			authored,
+		);
+		let bottom_left = grid_cell_bounds_with_settings(
+			outer,
+			arrangement,
+			GridPosition { row: 1, column: 0 },
+			authored,
+		);
+		assert_eq!(top_left.width(), 100.0);
+		assert_eq!(top_left.right() + 24.0, top_right.x());
+		assert_eq!(top_left.bottom() + 24.0, bottom_left.y());
+		assert_eq!(top_left.x(), outer.x());
+		assert_eq!(top_right.right(), outer.right());
+
+		let oversized = FigureGridLayoutSettings::authored(10_000.0);
+		let left = grid_cell_bounds_with_settings(
+			outer,
+			arrangement,
+			GridPosition { row: 0, column: 0 },
+			oversized,
+		);
+		let right = grid_cell_bounds_with_settings(
+			outer,
+			arrangement,
+			GridPosition { row: 0, column: 1 },
+			oversized,
+		);
+		assert!(left.width() >= 0.0 && left.height() >= 0.0);
+		assert!(left.right() <= right.x());
+		assert_eq!(oversized.facet_gutter(), 10_000.0);
 	}
 
 	#[test]
@@ -3686,7 +3868,13 @@ mod tests {
 		let resolved = ResolvedPlotSettings::default();
 		let bounds = IcedRectangle::new(Point::ORIGIN, iced::Size::new(800.0, 600.0));
 		let tiled = grid_tiled_area(grid_outer_area(widget_rect(bounds), 0.0), "", &resolved);
-		let shared = grid_plot_extent(tiled, kernel.arrangement, true, &resolved);
+		let shared = grid_plot_extent(
+			tiled,
+			kernel.arrangement,
+			kernel.figure_grid,
+			true,
+			&resolved,
+		);
 		let x_title = text_element(&svg, "x");
 		assert!((text_coordinate(x_title, 'x') - (shared.x() + shared.width() / 2.0)).abs() < 0.01);
 		let y_title = text_element(&svg, "y");

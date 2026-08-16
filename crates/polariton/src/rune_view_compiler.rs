@@ -40,6 +40,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"legend_at",
 	"line",
 	"palette",
+	"facet_gutter",
 	"scatter",
 	"sequential_palette",
 	"skin",
@@ -3093,13 +3094,14 @@ r.views([bar(category(), "revenue")])
 			source.contains(".join("),
 			"the median is joined to the density inside the same plan"
 		);
-		// `approx_quantile` names its output `quantile`, not after the function.
-		// Reading it as `approx_quantile` compiles as authored Rune and fails at
-		// bind, so the spelling is pinned here rather than left to a guess.
+		// `approx_quantile` names its output `quantile`; joining leaves that
+		// unambiguous output available directly to the mark, so a cosmetic
+		// projection must not become the reference composition pattern.
 		assert!(
-			source.contains("qcol(\"m\", \"quantile\").named(\"median\")"),
-			"the median column is projected from the aggregate's real output name"
+			source.contains("violin(\"group\", \"evaluation_value\", \"density\", \"quantile\")"),
+			"the violin consumes the aggregate's real output name directly"
 		);
+		assert!(!source.contains(".project_named("));
 		assert!(
 			!source.contains("workspace.sql("),
 			"ADR 552 has no SQL surface, so this composition must stay in the Rune DSL"
@@ -3130,13 +3132,13 @@ r.views([bar(category(), "revenue")])
 				fields.density.as_str(),
 				fields.median.as_str(),
 			),
-			("group", "evaluation_value", "density", "median")
+			("group", "evaluation_value", "density", "quantile")
 		);
 		for (origin, expected) in [
 			(&origins.group, "\"group\""),
 			(&origins.evaluation_value, "\"evaluation_value\""),
 			(&origins.density, "\"density\""),
-			(&origins.median, "\"median\""),
+			(&origins.median, "\"quantile\""),
 		] {
 			assert_eq!(
 				&source[origin.start as usize..origin.end as usize],
@@ -3212,5 +3214,18 @@ r.views([bar(category(), "revenue")])
 			)
 		);
 		assert!(source.contains("facet(\"cohort\")"));
+	}
+
+	#[test]
+	fn product_0110_test36_is_the_authored_facet_gutter_exhibit() {
+		let source = include_str!("../../../uat/test36.rn");
+		let compiled = compile(source).expect("the checked-in gutter exhibit compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("gutter exhibit produced a table");
+		};
+		assert_eq!(plot.facet.as_deref(), Some("cohort"));
+		assert_eq!(plot.facet_gutter, Some(24.0));
+		assert!(matches!(plot.body, RunePlotBody::Single(_)));
 	}
 }

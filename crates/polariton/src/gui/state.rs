@@ -314,6 +314,7 @@ fn build_facet_resolved_plot_task(
 	resolved: ResolvedPlot,
 	source: Arc<crate::result_artifact::ResultArtifact>,
 	facet: Option<String>,
+	figure_grid: crate::plot::grid::FigureGridLayoutSettings,
 	layer_settings: Option<crate::plot::spec::LayerSettings>,
 	on_ready: impl FnOnce(
 		ResolvedPlot,
@@ -340,8 +341,19 @@ fn build_facet_resolved_plot_task(
 					None => PlotGrid::single(spec, frame),
 				};
 				match layer_settings {
-					Some(settings) => PlotGridKernel::from_styled_grid(grid, settings, 1200, 720),
-					None => Ok(PlotGridKernel::from_grid(grid, 1200, 720)),
+					Some(settings) => PlotGridKernel::from_styled_grid_with_figure_grid(
+						grid,
+						figure_grid,
+						settings,
+						1200,
+						720,
+					),
+					None => Ok(PlotGridKernel::from_grid_with_figure_grid(
+						grid,
+						figure_grid,
+						1200,
+						720,
+					)),
 				}
 			})
 			.await
@@ -361,6 +373,7 @@ fn build_facet_layered_plot_task(
 	specification: crate::plot::spec::LayeredPlotSpec,
 	source: Arc<crate::result_artifact::ResultArtifact>,
 	facet: Option<String>,
+	figure_grid: crate::plot::grid::FigureGridLayoutSettings,
 	on_ready: impl FnOnce(
 		std::result::Result<Arc<dyn crate::plot::common::PlotKernel + Send + Sync>, String>,
 	) -> Message
@@ -391,9 +404,13 @@ fn build_facet_layered_plot_task(
 						.map_err(|error| error.to_string())?,
 					None => PlotGrid::single(body, Arc::clone(&frame)),
 				};
-				PlotGridKernel::from_grid_with_factory(grid, 1200, 720, |_, data| {
-					create_layered_plot(&specification, data, 1200, 720)
-				})
+				PlotGridKernel::from_grid_with_factory_and_figure_grid(
+					grid,
+					figure_grid,
+					1200,
+					720,
+					|_, data| create_layered_plot(&specification, data, 1200, 720),
+				)
 				.map(|kernel| {
 					Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>
 				})
@@ -1906,6 +1923,12 @@ fn rune_view_outcome_with_palettes(
 		.map(|view| {
 			let presentation = view.intent.presentation();
 			let identity = view.identity;
+			let figure_grid = match &view.intent {
+				RuneViewIntent::Plot(plot) => {
+					crate::plot::grid::FigureGridLayoutSettings::resolve(plot.facet_gutter)
+				}
+				RuneViewIntent::Table(_) => crate::plot::grid::FigureGridLayoutSettings::default(),
+			};
 			let (facet, facet_span) = match &view.intent {
 				RuneViewIntent::Plot(plot) => (plot.facet.clone(), plot.facet_span.clone()),
 				RuneViewIntent::Table(_) => (None, None),
@@ -1987,6 +2010,7 @@ fn rune_view_outcome_with_palettes(
 					let crate::rune_relation_envelope::RunePlotIntent {
 						body,
 						facet: plot_facet,
+						facet_gutter: _,
 						authored_settings,
 						plot_skin_span,
 						facet_span: _,
@@ -2004,6 +2028,7 @@ fn rune_view_outcome_with_palettes(
 								presentation,
 								span: plot_skin_span.unwrap_or(view.span),
 								facet: plot_facet.clone(),
+								figure_grid,
 								source: std::sync::Arc::clone(&result),
 								output: Err(error),
 							};
@@ -2021,6 +2046,7 @@ fn rune_view_outcome_with_palettes(
 							presentation,
 							span,
 							facet: plot_facet.clone(),
+							figure_grid,
 							source: std::sync::Arc::clone(&result),
 							output: Err(error),
 						};
@@ -2043,6 +2069,7 @@ fn rune_view_outcome_with_palettes(
 							presentation,
 							span: view.span,
 							facet: plot_facet.clone(),
+							figure_grid,
 							source: std::sync::Arc::clone(&result),
 							output: Err(error),
 						};
@@ -2336,6 +2363,7 @@ fn rune_view_outcome_with_palettes(
 					.or(facet_span)
 					.unwrap_or(view.span),
 				facet,
+				figure_grid,
 				source: std::sync::Arc::clone(&result),
 				output,
 			}
@@ -3148,6 +3176,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							.rune_view_panel_id(source_buffer, &sink.identity)
 							.expect("a dispatched view has a prepared host panel");
 						let sink_facet = sink.facet.clone();
+						let figure_grid = sink.figure_grid;
 						match sink.output {
 							Ok(RuneRelationSinkOutput::Table(presentation)) => {
 								let frame = match sink.source.projection() {
@@ -3180,6 +3209,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										resolved,
 										Arc::clone(&sink.source),
 										Some(facet),
+										figure_grid,
 										None,
 										move |resolved, result| match result {
 											Ok(kernel) => Message::RuneRelationPlotReady {
@@ -3209,6 +3239,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										resolved,
 										Arc::clone(&sink.source),
 										None,
+										figure_grid,
 										None,
 										move |resolved, result| match result {
 											Ok(kernel) => Message::RuneRelationPlotReady {
@@ -3249,6 +3280,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										resolved,
 										Arc::clone(&sink.source),
 										Some(facet),
+										figure_grid,
 										Some(layer_settings),
 										move |resolved, result| match result {
 											Ok(kernel) => Message::RuneRelationPlotReady {
@@ -3278,6 +3310,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										resolved,
 										Arc::clone(&sink.source),
 										None,
+										figure_grid,
 										Some(layer_settings),
 										move |resolved, result| match result {
 											Ok(kernel) => Message::RuneRelationPlotReady {
@@ -3315,6 +3348,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										specification,
 										sink.source,
 										Some(facet),
+										figure_grid,
 										move |result| Message::RuneRelationLayeredPlotReady {
 											source_buffer,
 											revision,
@@ -3330,6 +3364,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 										specification,
 										sink.source,
 										None,
+										figure_grid,
 										move |result| Message::RuneRelationLayeredPlotReady {
 											source_buffer,
 											revision,

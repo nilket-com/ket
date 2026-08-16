@@ -2718,8 +2718,8 @@ fn product_0077_facet_tick_containment_does_not_measure_or_resize_layout() {
 	let common = std::fs::read_to_string(root.join("common.rs")).expect("read plot chrome");
 
 	assert!(
-		grid.contains("const GRID_GAP: f32 = 12.0;"),
-		"PRODUCT-0077 contains labels without changing facet geometry"
+		grid.contains("pub const DEFAULT_FACET_GUTTER: f32 = 12.0;"),
+		"PRODUCT-0110 preserves PRODUCT-0077's default facet geometry while making the divider a figure-grid input"
 	);
 	let grid_layout = grid
 		.split("fn axis_text_visibility(")
@@ -4140,4 +4140,34 @@ fn product_0109_palette_kind_is_carried_and_continuous_allocation_is_stateless()
 		.expect("continuous lineage deletion");
 	assert!(clear.contains(".assignments"));
 	assert!(clear.contains("identity.spaces.remove(lineage)"));
+}
+
+#[test]
+fn product_0110_facet_gutter_stays_a_figure_grid_authority() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read grid layout");
+	let production_grid = grid
+		.split("#[cfg(test)]\nmod tests")
+		.next()
+		.expect("production grid layout");
+	assert!(!production_grid.contains("GRID_GAP"));
+	assert!(production_grid.contains("pub struct FigureGridLayoutSettings"));
+	assert!(production_grid.contains("requested.min(outer.width() / columns.max(1.0))"));
+	assert!(production_grid.contains("requested.min(outer.height() / rows.max(1.0))"));
+	assert!(
+		production_grid
+			.matches("grid_cell_bounds_with_settings(")
+			.count() >= 5,
+		"paint, overlay, hover, and shared extent must consume one resolved gutter"
+	);
+
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot settings");
+	assert!(
+		!theme.contains("facet_gutter"),
+		"a shared inter-facet divider must not become plot padding or a plot settings field"
+	);
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read Rune surface");
+	assert!(presentation.contains("__facet_gutter"));
+	assert!(presentation.contains("facet_gutter(...) requires facet(...)"));
 }

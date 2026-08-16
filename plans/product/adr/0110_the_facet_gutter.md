@@ -1,4 +1,4 @@
-# ADR 0110: the figure pane gutter
+# ADR 0110: the facet gutter
 
 Status: proposed 2026-08-15. Faceted figures presently use an unowned
 `GRID_GAP = 12.0`: a useful hairline separation, but not an authored layout
@@ -8,7 +8,7 @@ for plot padding, a border, or a per-pane margin.
 
 It follows PRODUCT-0106's vertical-guide reservation and precedes typography.
 0106 established that title, facet, and plot-area reservations have one ordered
-authority. A pane gutter is another layout reservation with a different owner:
+authority. A facet gutter is another layout reservation with a different owner:
 it exists **between** cells.
 
 ## Context
@@ -35,21 +35,21 @@ divider consume 48 px.
 
 ## Decision
 
-### 1. `pane_gutter(px)` is a figure element for faceted grids
+### 1. `facet_gutter(px)` is a figure element for faceted grids
 
 Rune adds one figure element:
 
 ```rune
 figure([
 	facet("region"),
-	pane_gutter(24),
+	facet_gutter(24),
 	bar("quarter", "sales"),
 ])
 ```
 
 It accepts one finite, non-negative numeric literal, at most once. A duplicate
 refuses at the second call's span. It is meaningful only to a faceted grid;
-using it in a figure with no `facet(...)` refuses at `pane_gutter(...)` rather
+using it in a figure with no `facet(...)` refuses at `facet_gutter(...)` rather
 than silently authoring a setting no rendered figure can consume.
 
 The unit is physical canvas pixels, matching `plot_padding_*`, title offsets,
@@ -58,7 +58,7 @@ or a responsive unit.
 
 ### 2. Figure-grid layout has its own two-tier cascade
 
-`FigureGridLayoutSettings` carries `pane_gutter`, separately from
+`FigureGridLayoutSettings` carries `facet_gutter`, separately from
 `PlotSettingsLayer`:
 
 ```text
@@ -66,9 +66,9 @@ application grid default → authored figure override
 ```
 
 The application default is 12.0, reproducing the current geometry. A future GUI
-preference may write that first tier; `pane_gutter(...)` writes only the authored
+preference may write that first tier; `facet_gutter(...)` writes only the authored
 figure tier. There is deliberately no graphical-layer tier and no pane-local
-override: a divider has two neighbouring panes, so no single pane owns it.
+override: a divider has two neighbouring facets, so no single facet owns it.
 
 The authored value persists as Rune source with its figure. The application
 default is a user preference, not document meaning, and does not enter the
@@ -110,14 +110,14 @@ The order is fixed:
 ```text
 legend / outer padding
 → figure heading band
-→ tiled grid with pane gutters
+→ tiled grid with facet gutters
 → per-cell facet band + plot padding
 → plot area
 ```
 
 Thus a gutter changes cell rectangles and consequently the available plot area,
 but does not change the title, subtitle, facet-label, or plot-padding formulas.
-`pane_gutter(0)` removes only the inter-cell reservation; it does not remove a
+`facet_gutter(0)` removes only the inter-cell reservation; it does not remove a
 facet row or merge the cells' independent coordinate transforms.
 
 ### 6. This is not a border or a typography setting
@@ -125,18 +125,18 @@ facet row or merge the cells' independent coordinate transforms.
 No stroke is drawn and no plot chrome changes. The visible gap is the existing
 canvas background between distinct clipped cells. Typography remains the next
 track: it can change guide reservations inside a cell, but it must not acquire a
-second way to alter inter-pane geometry.
+second way to alter inter-facet geometry.
 
 ## Acceptance gates
 
 1. **Default parity.** A legacy faceted figure with no authored gutter retains
    its exact 12 px horizontal and vertical internal dividers.
-2. **One gutter, once.** A two-column figure with `pane_gutter(24)` has cell
+2. **One gutter, once.** A two-column figure with `facet_gutter(24)` has cell
    width `(outer_width - 24) / 2` and an inter-cell distance of exactly 24 px;
    it is not 48 px.
 3. **Two axes.** A 2×3 grid uses exactly one 24 px divider between every adjacent
    row and column, with no outer gutter invented at the tiled bounds.
-4. **Zero is local.** `pane_gutter(0)` makes adjacent cell bounds meet while
+4. **Zero is local.** `facet_gutter(0)` makes adjacent cell bounds meet while
    retaining their separate clip regions, transforms, facet labels, and plot
    areas.
 5. **Paint and hover agree.** A point inside a non-origin cell is painted and
@@ -154,13 +154,13 @@ second way to alter inter-pane geometry.
    overlapping bounds; its effective gap follows §4's per-axis clamp. The
    resolved figure-grid setting still holds the authored requested value, not
    that effective value.
-9. **Figure-only Rune surface.** `pane_gutter(24)` appears once in a valid
+9. **Figure-only Rune surface.** `facet_gutter(24)` appears once in a valid
    faceted figure, reaches the authored figure-grid tier, and never sets a
    `PlotSettingsLayer` padding or border field.
 10. **Invalid authoring refuses precisely.** Negative, non-finite, duplicate,
-    and non-faceted uses refuse at the offending `pane_gutter(...)` call.
+    and non-faceted uses refuse at the offending `facet_gutter(...)` call.
 11. **Clamp round-trips as a request, not a result.** Reopening
-    `pane_gutter(10000)` after it rendered in a small window preserves 10000;
+    `facet_gutter(10000)` after it rendered in a small window preserves 10000;
     rendering it in a larger window applies 10000 rather than the former
     small-window effective gap. Changing the GUI default likewise does not
     rewrite an authored value.
@@ -192,10 +192,10 @@ second way to alter inter-pane geometry.
 ## Rejected
 
 **Put the gutter in `PlotPadding`.** Attractive because padding already changes
-space. Rejected because it is owned by each plot area; two adjacent panes would
+space. Rejected because it is owned by each plot area; two adjacent facets would
 apply the same divider twice and a single-cell plot would gain unrelated margin.
 
-**Use a plot border width.** Attractive because a line can make panes look
+**Use a plot border width.** Attractive because a line can make facets look
 separated. Rejected because a border is chrome around one cell, while this is
 empty shared layout space. It cannot supply a 24 px breathing room without
 inventing strokes and changing plot appearance.
@@ -209,7 +209,7 @@ impossible to persist honestly.
 window size. Rejected because dashboard spacing is authored composition. A GUI
 default is useful, but it cannot replace an explicit figure override.
 
-**Add responsive or percentage units now.** Attractive because panes resize.
+**Add responsive or percentage units now.** Attractive because facets resize.
 Rejected because the existing layout language is pixel-based and §4 already
 handles safety. Relative spacing is a separate visual-design decision.
 
@@ -221,5 +221,5 @@ gutter reduces every cell's available rectangle, so data marks move and scale
 only through their existing transforms.
 
 The record also gives typography a clean boundary. Font-size changes reserve
-space within cells; pane gutters reserve space between them. Neither may become
+space within cells; facet gutters reserve space between them. Neither may become
 the other's escape hatch.
