@@ -11,8 +11,8 @@ use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode, TickPlacement};
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::spec::{
-	BarWidth, CategoryGap, ColorJob, LayerSettings, LegendPosition, Override, PointSize, Presence,
-	ResolvedPresence, StrokeWidth,
+	BarWidth, CategoryGap, ColorJob, HoverTextSize, LayerSettings, LegendPosition, Override,
+	PointSize, Presence, ResolvedPresence, StrokeWidth,
 };
 use iced::Color;
 use libaryon::engine::UiPalette;
@@ -108,6 +108,7 @@ pub struct PlotTypography {
 	pub x_tick_size: f32,
 	pub y_tick_size: f32,
 	pub legend_size: f32,
+	pub hover_size: HoverTextSize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -203,6 +204,9 @@ pub struct PlotSettingsLayer {
 	/// this settings layer carries only authored/application/pane intent.
 	pub categorical_palette: Override<Arc<String>>,
 	pub typography: Override<PlotTypography>,
+	/// PRODUCT-0112: a partial hover-size override avoids reconstructing the
+	/// whole typography carrier merely to size generated hover text.
+	pub hover_size: Override<HoverTextSize>,
 	pub padding: Override<PlotPadding>,
 	pub guides: Override<PlotGuideSettings>,
 	pub domains: Override<PlotDomainOverrides>,
@@ -243,6 +247,7 @@ impl Default for PlotSettingsLayer {
 			resolved_skin: Override::Inherit,
 			categorical_palette: Override::Inherit,
 			typography: Override::Inherit,
+			hover_size: Override::Inherit,
 			padding: Override::Inherit,
 			guides: Override::Inherit,
 			domains: Override::Inherit,
@@ -373,6 +378,12 @@ fn apply_layer(
 		settings.x_tick_size = value.x_tick_size;
 		settings.y_tick_size = value.y_tick_size;
 		settings.legend_size = value.legend_size;
+		settings.hover_size = value.hover_size;
+	}
+	// PRODUCT-0112: the specific slot wins over the atomic typography carrier
+	// within a tier, just as PRODUCT-0091's partial continuous-ramp slots do.
+	if let Override::Set(value) = layer.hover_size {
+		settings.hover_size = value;
 	}
 	if let Override::Set(value) = &layer.padding {
 		settings.plot_padding_top = value.top;
@@ -476,6 +487,54 @@ const _: () = assert!(default_theme_is_valid(PlotThemeSpec::DEFAULT_DARK));
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn typography(hover_size: HoverTextSize) -> PlotTypography {
+		PlotTypography {
+			title_size: 28.0,
+			subtitle_size: 20.0,
+			x_label_size: 20.0,
+			y_label_size: 20.0,
+			x_tick_size: 18.0,
+			y_tick_size: 18.0,
+			legend_size: 14.0,
+			hover_size,
+		}
+	}
+
+	#[test]
+	fn product_0112_hover_size_is_partial_and_follows_all_five_tiers() {
+		let size = |points| HoverTextSize::new(points).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.hover_size = size(6.0);
+		cascade.application_theme.hover_size = Override::Set(size(12.0));
+		cascade.authored_spec.hover_size = Override::Set(size(20.0));
+		cascade.layer.hover_size = Override::Set(size(32.0));
+		cascade.pane_override.hover_size = Override::Set(size(48.0));
+		assert_eq!(cascade.resolve().hover_size, size(48.0));
+
+		cascade.pane_override.hover_size = Override::Inherit;
+		assert_eq!(cascade.resolve().hover_size, size(32.0));
+		cascade.layer.hover_size = Override::Inherit;
+		assert_eq!(cascade.resolve().hover_size, size(20.0));
+		cascade.authored_spec.hover_size = Override::Inherit;
+		assert_eq!(cascade.resolve().hover_size, size(12.0));
+		cascade.application_theme.hover_size = Override::Inherit;
+		assert_eq!(cascade.resolve().hover_size, size(6.0));
+
+		cascade.authored_spec.typography = Override::Set(typography(size(24.0)));
+		cascade.authored_spec.hover_size = Override::Set(size(36.0));
+		assert_eq!(
+			cascade.resolve().hover_size,
+			size(36.0),
+			"the partial slot wins over atomic typography within one tier"
+		);
+		cascade.authored_spec.hover_size = Override::Inherit;
+		assert_eq!(
+			cascade.resolve().hover_size,
+			size(24.0),
+			"atomic typography still delivers hover size when the partial slot is absent"
+		);
+	}
 
 	#[test]
 	fn product_0091_continuous_slot_overrides_are_partial_and_follow_figure_tiers() {

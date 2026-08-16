@@ -5,7 +5,7 @@ use crate::plot::colors::ColorTheme;
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
-	BarWidth, CategoryGap, LegendPosition, PointSize, ResolvedPresence, StrokeWidth,
+	BarWidth, CategoryGap, HoverTextSize, LegendPosition, PointSize, ResolvedPresence, StrokeWidth,
 };
 use crate::plot::theme::PlotSettings;
 use iced::advanced::image;
@@ -473,6 +473,7 @@ pub struct ResolvedPlotSettings {
 	pub x_tick_size: f32,
 	pub y_tick_size: f32,
 	pub legend_size: f32,
+	pub hover_size: HoverTextSize,
 	pub x_tick_placement: TickPlacement,
 	pub y_tick_placement: TickPlacement,
 	pub x_minor_ticks: u32,
@@ -539,6 +540,7 @@ impl Default for ResolvedPlotSettings {
 			x_tick_size: 18.0,
 			y_tick_size: 18.0,
 			legend_size: 14.0,
+			hover_size: HoverTextSize::DEFAULT,
 			x_tick_placement: TickPlacement::DEFAULT,
 			y_tick_placement: TickPlacement::DEFAULT,
 			x_minor_ticks: 4,
@@ -2931,6 +2933,19 @@ mod product_0067_0068_strata_oracles {
 			Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 120.0)),
 		);
 		backend.operations
+	}
+
+	#[test]
+	fn product_0112_hover_size_leaves_the_canvas_draw_list_unchanged() {
+		let default = settings();
+		let mut enlarged = default.clone();
+		enlarged.hover_size = HoverTextSize::new(72.0).expect("in-range hover size");
+
+		assert_eq!(
+			render(layouts()[0].clone(), default, true),
+			render(layouts()[0].clone(), enlarged, true),
+			"hover is an iced overlay, so its size cannot alter canvas operations"
+		);
 	}
 
 	fn render_without_plot_layer_grid_dispatch(

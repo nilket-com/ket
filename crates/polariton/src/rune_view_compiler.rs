@@ -36,6 +36,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"histogram",
 	"heatmap",
 	"hide_legend",
+	"hover_size",
 	"layers",
 	"legend_at",
 	"line",
@@ -2594,6 +2595,47 @@ workspace.table("t").views([figure([
 			"y_label(\"second\")"
 		);
 		assert!(message.contains("at most one y_label"), "{message}");
+	}
+
+	#[test]
+	fn product_0112_hover_size_is_a_generated_text_word_with_precise_refusals() {
+		let source = r#"workspace.table("t").views([figure([hover_size(20), bar("x", "y")])])"#;
+		for compiled in [
+			compile(source).expect("hover_size figure compiles"),
+			compile(source).expect("re-executing the source reproduces hover_size"),
+		] {
+			let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+				panic!("hover fixture produced a table")
+			};
+			assert_eq!(
+				plot.authored_settings.hover_size,
+				crate::plot::spec::Override::Set(
+					crate::plot::spec::HoverTextSize::new(20.0).unwrap()
+				)
+			);
+		}
+
+		for accepted in ["6", "96"] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([hover_size({accepted}), bar(\"x\", \"y\")])])"
+			);
+			compile(&source).expect("inclusive hover-size endpoint compiles");
+		}
+
+		for rejected in ["5.9", "96.1", "\"large\""] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([hover_size({rejected}), bar(\"x\", \"y\")])])"
+			);
+			let error = compile(&source).expect_err("invalid hover size refuses");
+			let RuneEnvelopeError::InvalidView { span, message } = error else {
+				panic!("hover-size refusal retains its origin")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				format!("hover_size({rejected})")
+			);
+			assert!(message.contains("hover size") || message.contains("requires a number"));
+		}
 	}
 
 	#[test]

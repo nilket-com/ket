@@ -12,8 +12,9 @@ use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FunnelFields,
-	HeatmapFields, LayerSettings, LayeredPlotSpec, LegendPosition, MultivariateFields, Override,
-	PieFields, PointSize, Presence, RadialDialFields, StrokeWidth, ViolinFields,
+	HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
+	MultivariateFields, Override, PieFields, PointSize, Presence, RadialDialFields, StrokeWidth,
+	ViolinFields,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -184,6 +185,7 @@ enum FigureElementKind {
 	YTickStep(f64),
 	XMinorTicks(u32),
 	YMinorTicks(u32),
+	HoverSize(HoverTextSize),
 }
 
 #[derive(Any, Clone, Debug)]
@@ -428,6 +430,7 @@ fn build_context() -> Result<Context, String> {
 		("__y_tick_step", raw_y_tick_step as RawFunction),
 		("__x_minor_ticks", raw_x_minor_ticks as RawFunction),
 		("__y_minor_ticks", raw_y_minor_ticks as RawFunction),
+		("__hover_size", raw_hover_size as RawFunction),
 		("__table", raw_table as RawFunction),
 		("__layers", raw_layers as RawFunction),
 		("__figure", raw_figure as RawFunction),
@@ -1694,6 +1697,7 @@ enum NumericScalarConstructor {
 	YTickStep,
 	XMinorTicks,
 	YMinorTicks,
+	HoverSize,
 }
 
 fn raw_x_tick_step(
@@ -1760,6 +1764,22 @@ fn raw_y_minor_ticks(
 	)
 }
 
+fn raw_hover_size(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_numeric_scalar(
+		NumericScalarConstructor::HoverSize,
+		"hover_size",
+		stack,
+		addr,
+		args,
+		out,
+	)
+}
+
 fn raw_numeric_scalar(
 	kind: NumericScalarConstructor,
 	name: &'static str,
@@ -1796,6 +1816,9 @@ fn raw_numeric_scalar(
 				origin.start.into(),
 				origin.end.into(),
 			),
+			NumericScalarConstructor::HoverSize => {
+				presentation_hover_size(values[0].clone(), origin.start.into(), origin.end.into())
+			}
 		}
 	};
 	store(out, stack, element)
@@ -2059,6 +2082,20 @@ fn presentation_x_tick_step(value: Value, start: i64, end: i64) -> RuneFigureEle
 
 fn presentation_y_tick_step(value: Value, start: i64, end: i64) -> RuneFigureElement {
 	numeric_scalar_element(value, start, end, "y_tick_step", false)
+}
+
+fn presentation_hover_size(value: Value, start: i64, end: i64) -> RuneFigureElement {
+	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
+	let value = rune_number(&value)
+		.ok_or_else(|| {
+			PresentationFailure::new(origin, "hover_size(...) requires a number".to_owned())
+		})
+		.and_then(|value| {
+			HoverTextSize::new(value as f32)
+				.map(FigureElementKind::HoverSize)
+				.map_err(|error| PresentationFailure::new(origin, error.to_string()))
+		});
+	RuneFigureElement { value, origin }
 }
 
 fn numeric_scalar_element(
@@ -2941,6 +2978,7 @@ struct FigureParts {
 	y_tick_step: Option<(f64, Origin)>,
 	x_minor_ticks: Option<(u32, Origin)>,
 	y_minor_ticks: Option<(u32, Origin)>,
+	hover_size: Option<(HoverTextSize, Origin)>,
 	body: Option<(RunePlotBody, Origin)>,
 }
 
@@ -3139,6 +3177,12 @@ fn merge_element(
 			origin,
 			"a figure has at most one y_minor_ticks element",
 		),
+		FigureElementKind::HoverSize(value) => set_once(
+			&mut parts.hover_size,
+			(value, origin),
+			origin,
+			"a figure has at most one hover_size element",
+		),
 	}
 }
 
@@ -3167,6 +3211,9 @@ impl FigureParts {
 		}
 		if let Some((legend, _)) = self.legend {
 			authored_settings.legend = legend;
+		}
+		if let Some((hover_size, _)) = self.hover_size {
+			authored_settings.hover_size = Override::Set(hover_size);
 		}
 		if let Some((skin, _)) = &self.skin {
 			authored_settings.plot_skin = Override::Set(skin.clone());

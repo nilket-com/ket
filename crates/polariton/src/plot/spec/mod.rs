@@ -140,6 +140,55 @@ impl fmt::Display for PointSizeError {
 
 impl std::error::Error for PointSizeError {}
 
+/// PRODUCT-0112's logical-pixel size for generated plot-hover text.
+///
+/// This stays distinct from `PointSize`: it controls an iced text widget, not
+/// mark geometry, and its bounded range is expressed in logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HoverTextSize(f32);
+
+// `HoverTextSize::new` excludes NaN, so equality is reflexive for every value
+// the private representation can contain.
+impl Eq for HoverTextSize {}
+
+impl HoverTextSize {
+	pub const MIN_PX: f32 = 6.0;
+	pub const MAX_PX: f32 = 96.0;
+	/// Iced's existing default text size, banked by PRODUCT-0112 Stage 0.
+	pub const DEFAULT: Self = Self(16.0);
+
+	pub fn new(points: f32) -> Result<Self, HoverTextSizeError> {
+		if points.is_finite() && (Self::MIN_PX..=Self::MAX_PX).contains(&points) {
+			Ok(Self(points))
+		} else {
+			Err(HoverTextSizeError { points })
+		}
+	}
+
+	pub const fn points(self) -> f32 {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HoverTextSizeError {
+	points: f32,
+}
+
+impl fmt::Display for HoverTextSizeError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"hover size must be finite and between {} and {}, got {}",
+			HoverTextSize::MIN_PX,
+			HoverTextSize::MAX_PX,
+			self.points
+		)
+	}
+}
+
+impl std::error::Error for HoverTextSizeError {}
+
 /// PRODUCT-0019's unitless, linear line-stroke factor. Keep this distinct from
 /// `PointSize` until a third relative setting establishes a shared abstraction.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4141,6 +4190,18 @@ mod tests {
 	use super::*;
 	use polars::df;
 	use polars::prelude::{Column, DataFrame, IntoColumn, NamedFrom};
+
+	#[test]
+	fn product_0112_hover_text_size_pins_inclusive_work_bounds() {
+		assert_eq!(HoverTextSize::new(6.0).unwrap().points(), 6.0);
+		assert_eq!(HoverTextSize::new(96.0).unwrap().points(), 96.0);
+		for rejected in [5.9, 96.1, f32::NAN, f32::INFINITY] {
+			assert!(
+				HoverTextSize::new(rejected).is_err(),
+				"{rejected} must refuse"
+			);
+		}
+	}
 
 	fn stamped(data: DataFrame) -> StampedResult {
 		StampedResult {

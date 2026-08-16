@@ -4197,3 +4197,63 @@ fn product_0110_facet_gutter_stays_a_figure_grid_authority() {
 	assert!(presentation.contains("__facet_gutter"));
 	assert!(presentation.contains("facet_gutter(...) requires facet(...)"));
 }
+
+#[test]
+fn product_0112_hover_typography_stays_typed_and_off_canvas() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	assert!(spec.contains("pub struct HoverTextSize(f32)"));
+	assert!(spec.contains("pub const MIN_PX: f32 = 6.0"));
+	assert!(spec.contains("pub const MAX_PX: f32 = 96.0"));
+
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
+	assert!(theme.contains("pub hover_size: HoverTextSize"));
+	assert!(theme.contains("pub hover_size: Override<HoverTextSize>"));
+	assert!(theme.contains("settings.hover_size = value.hover_size"));
+	assert!(theme.contains("settings.hover_size = value;"));
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let backend = common
+		.split("pub trait PlotBackend")
+		.nth(1)
+		.and_then(|rest| rest.split("pub trait PlotKernel").next())
+		.expect("bounded plot backend contract");
+	// Existing backend documentation and kernel APIs legitimately mention
+	// hover. PRODUCT-0112 forbids only this new, widget-owned setting from
+	// crossing that seam.
+	assert!(!backend.contains("HoverTextSize"));
+	assert!(!backend.contains("hover_size"));
+	assert!(common.contains("pub hover_size: HoverTextSize"));
+	let kernel_dir = root.join("plot/kernels");
+	for entry in std::fs::read_dir(&kernel_dir).expect("read plot kernels") {
+		let entry = entry.expect("read kernel directory entry");
+		let path = entry.path();
+		if path.extension().is_some_and(|extension| extension == "rs") {
+			let source = std::fs::read_to_string(&path).expect("read kernel source");
+			assert!(
+				!source.contains("hover_size"),
+				"{} must not consume the widget-owned hover size",
+				path.display()
+			);
+		}
+	}
+
+	let view =
+		std::fs::read_to_string(root.join("gui/plot_pane/view.rs")).expect("read plot pane view");
+	let production_view = view
+		.split("\n#[cfg(test)]")
+		.next()
+		.expect("production plot-pane view section");
+	assert!(production_view.contains("text(info).size(hover_text_pixels(&state.plot_settings))"));
+
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
+	assert!(compiler.contains("\"hover_size\""));
+	assert!(!compiler.contains("\"font_size\""));
+
+	let session = std::fs::read_to_string(root.join("session_persistence.rs"))
+		.expect("read session persistence");
+	assert!(session.contains("struct DurableLayer"));
+	assert!(!session.contains("HoverTextSize"));
+	assert!(!session.contains("hover_size"));
+}
