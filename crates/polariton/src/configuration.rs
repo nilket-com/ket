@@ -5,6 +5,7 @@
 //! opening: compiled defaults remain in force, with any operations completed
 //! before a runtime error retained for the session.
 
+use libaryon::engine::PaneDividerReservation;
 use rune::alloc::limit;
 use rune::runtime::budget;
 use rune::runtime::{Value, VmResult};
@@ -25,6 +26,7 @@ const DEFAULT_WINDOW_SIZE: (f32, f32) = (1920.0, 1080.0);
 pub struct StartupData {
 	pub window_size: (f32, f32),
 	pub show_column_types: bool,
+	pub pane_divider_reservation: PaneDividerReservation,
 	pub init_error: Option<String>,
 }
 
@@ -33,6 +35,9 @@ impl Default for StartupData {
 		Self {
 			window_size: DEFAULT_WINDOW_SIZE,
 			show_column_types: false,
+			// `PaneDividerReservation::default()` is TERMINAL. Polariton's
+			// compact profile must name its own zero reservation explicitly.
+			pane_divider_reservation: PaneDividerReservation::NONE,
 			init_error: None,
 		}
 	}
@@ -168,6 +173,9 @@ fn build_context() -> Result<Context, String> {
 	module
 		.associated_function("window_size", config_window_size)
 		.map_err(|error| format!("Rune module error: {error}"))?;
+	module
+		.associated_function("pane_divider_gutter", config_pane_divider_gutter)
+		.map_err(|error| format!("Rune module error: {error}"))?;
 	context
 		.install(module)
 		.map_err(|error| format!("Rune context error: {error}"))?;
@@ -204,6 +212,24 @@ fn config_window_size(
 	}))
 }
 
+fn config_pane_divider_gutter(
+	config: &RuneConfig,
+	columns: Value,
+	rows: Value,
+) -> VmResult<Result<(), String>> {
+	let columns = match non_negative_u32(&columns, "pane divider columns") {
+		Ok(columns) => columns,
+		Err(error) => return VmResult::Ok(Err(error)),
+	};
+	let rows = match non_negative_u32(&rows, "pane divider rows") {
+		Ok(rows) => rows,
+		Err(error) => return VmResult::Ok(Err(error)),
+	};
+	VmResult::Ok(with_startup(config, |startup| {
+		startup.pane_divider_reservation = PaneDividerReservation::new(columns, rows);
+	}))
+}
+
 fn dimension(value: &Value, name: &str) -> Result<f32, String> {
 	let value = value
 		.as_signed()
@@ -218,6 +244,20 @@ fn dimension(value: &Value, name: &str) -> Result<f32, String> {
 		.filter(|value| *value > 0)
 		.ok_or_else(|| format!("{name} expects a positive integer"))?;
 	Ok(value as f32)
+}
+
+fn non_negative_u32(value: &Value, name: &str) -> Result<u32, String> {
+	value
+		.as_signed()
+		.ok()
+		.and_then(|value| u32::try_from(value).ok())
+		.or_else(|| {
+			value
+				.as_unsigned()
+				.ok()
+				.and_then(|value| u32::try_from(value).ok())
+		})
+		.ok_or_else(|| format!("{name} expects a non-negative integer"))
 }
 
 fn with_startup(config: &RuneConfig, update: impl FnOnce(&mut StartupData)) -> Result<(), String> {
@@ -285,7 +325,7 @@ fn non_empty_path(value: Option<OsString>) -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-	use super::{SettingsPathEnv, StartupData, config_dir, load_from_path};
+	use super::{PaneDividerReservation, SettingsPathEnv, StartupData, config_dir, load_from_path};
 	use std::ffi::OsString;
 	use std::path::PathBuf;
 	use std::sync::atomic::{AtomicU64, Ordering};
@@ -330,6 +370,7 @@ pub fn main(config) {
         900,
     )?;
     config.show_column_types(true)?;
+    config.pane_divider_gutter(4, 1)?;
 }
 "#,
 		)
@@ -338,8 +379,57 @@ pub fn main(config) {
 		let startup = load_from_path(&path);
 		assert_eq!(startup.window_size, (1600.0, 900.0));
 		assert!(startup.show_column_types);
+		assert_eq!(
+			startup.pane_divider_reservation,
+			PaneDividerReservation::new(4, 1)
+		);
 		assert_eq!(startup.init_error, None);
 		let _ = std::fs::remove_file(path);
+	}
+
+	#[test]
+	fn pane_divider_gutter_accepts_zero_and_refuses_non_cell_values() {
+		let accepted = temp_path("divider-gutter-zero");
+		std::fs::write(
+			&accepted,
+			r#"
+pub fn main(config) {
+    config.pane_divider_gutter(0, 0)?;
+}
+"#,
+		)
+		.expect("write zero divider fixture");
+		let startup = load_from_path(&accepted);
+		assert_eq!(
+			startup.pane_divider_reservation,
+			PaneDividerReservation::NONE
+		);
+		assert_eq!(startup.init_error, None);
+		let _ = std::fs::remove_file(accepted);
+
+		for (name, source) in [
+			("negative", "config.pane_divider_gutter(-1, 0)?;"),
+			("fractional", "config.pane_divider_gutter(1.5, 0)?;"),
+			("overflow", "config.pane_divider_gutter(4294967296, 0)?;"),
+			("wrong-type", "config.pane_divider_gutter(\"4\", 1)?;"),
+		] {
+			let path = temp_path(&format!("divider-gutter-{name}"));
+			std::fs::write(&path, format!("pub fn main(config) {{ {source} }}"))
+				.expect("write invalid divider fixture");
+			let startup = load_from_path(&path);
+			assert_eq!(
+				startup.pane_divider_reservation,
+				PaneDividerReservation::NONE
+			);
+			assert!(
+				startup
+					.init_error
+					.as_deref()
+					.is_some_and(|error| error.contains("non-negative integer")),
+				"{name} must refuse as a cell count"
+			);
+			let _ = std::fs::remove_file(path);
+		}
 	}
 
 	#[test]

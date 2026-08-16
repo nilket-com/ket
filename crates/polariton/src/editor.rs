@@ -650,18 +650,30 @@ struct PaneDrag {
 impl CodeEditor {
 	#[cfg(test)]
 	pub fn new(text: &str) -> Self {
-		Self::spawn(EngineConfig::default(), Some(text))
+		Self::spawn(
+			EngineConfig {
+				divider_reservation: PaneDividerReservation::NONE,
+				..EngineConfig::default()
+			},
+			Some(text),
+		)
 	}
 
 	/// Start an embedded editor whose durable settings live alongside the
 	/// Polariton application configuration.
 	pub fn new_with_init(
 		text: &str,
+		divider_reservation: PaneDividerReservation,
 		init_script: Option<std::path::PathBuf>,
 		viewport: iced::Size,
 	) -> Self {
 		Self::spawn(
-			polariton_engine_config(None, init_script, Some(viewport_cells(viewport))),
+			polariton_engine_config(
+				None,
+				divider_reservation,
+				init_script,
+				Some(viewport_cells(viewport)),
+			),
 			Some(text),
 		)
 	}
@@ -674,6 +686,7 @@ impl CodeEditor {
 		Self::spawn(
 			EngineConfig {
 				initial_file: Some(path),
+				divider_reservation: PaneDividerReservation::NONE,
 				..EngineConfig::default()
 			},
 			None,
@@ -682,11 +695,17 @@ impl CodeEditor {
 
 	pub fn open_initial_file_with_init(
 		path: String,
+		divider_reservation: PaneDividerReservation,
 		init_script: Option<std::path::PathBuf>,
 		viewport: iced::Size,
 	) -> Self {
 		Self::spawn(
-			polariton_engine_config(Some(path), init_script, Some(viewport_cells(viewport))),
+			polariton_engine_config(
+				Some(path),
+				divider_reservation,
+				init_script,
+				Some(viewport_cells(viewport)),
+			),
 			None,
 		)
 	}
@@ -705,10 +724,16 @@ impl CodeEditor {
 	#[cfg(feature = "toron")]
 	pub fn open_saved_with_init(
 		saved: SavedSession<Writable>,
+		divider_reservation: PaneDividerReservation,
 		init_script: Option<std::path::PathBuf>,
 		viewport: iced::Size,
 	) -> Result<Self, String> {
-		let config = polariton_engine_config(None, init_script, Some(viewport_cells(viewport)));
+		let config = polariton_engine_config(
+			None,
+			divider_reservation,
+			init_script,
+			Some(viewport_cells(viewport)),
+		);
 		let owner = ApplicationOwnerId::new(session_persistence::OWNER_NAME)
 			.map_err(|error| error.to_string())?;
 		let meanings = match saved.owner_payload(owner.owner_id()) {
@@ -2607,6 +2632,7 @@ impl CodeEditor {
 
 fn polariton_engine_config(
 	initial_file: Option<String>,
+	divider_reservation: PaneDividerReservation,
 	init_script: Option<std::path::PathBuf>,
 	initial_viewport: Option<(u16, u16)>,
 ) -> EngineConfig {
@@ -2615,7 +2641,7 @@ fn polariton_engine_config(
 		initial_viewport,
 		init_script,
 		init_entrypoint: "editor".to_string(),
-		divider_reservation: PaneDividerReservation::NONE,
+		divider_reservation,
 		..EngineConfig::default()
 	}
 }
@@ -5417,8 +5443,8 @@ mod tests {
 		BUSY_SPINNER_INTERVAL, BusySpinner, CodeEditor, DIVIDER_GRAB_PROXIMITY_PX,
 		DRAG_ACTIVATION_DEADBAND_PX, EditorCommand, EditorMsg, HostPanelPlacement, INITIAL_ROWS,
 		InputEvent, KeyCode, LanguageId, MarkdownBlock, MarkdownPreviewColors, Modifiers,
-		PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneTabAction, PanelContent, PanelStatus, Rgb,
-		SplitDirection, UiPalette, command_bar_fragments, divider_candidate_at,
+		PANE_HEADER_HEIGHT, PREVIEW_ROW_GAP, PaneDividerReservation, PaneTabAction, PanelContent,
+		PanelStatus, Rgb, SplitDirection, UiPalette, command_bar_fragments, divider_candidate_at,
 		divider_candidate_rect_px, divider_press_is_candidate, drag_activation_reached,
 		fence_body_start, highlight_span_at, host_panel_content_frame, host_panel_content_style,
 		markdown_code_fragments, metrics, pane_content_stack, pane_gutter_width, pane_title,
@@ -5490,7 +5516,14 @@ mod tests {
 
 	fn product_0074_compact_editor(text: &str) -> CodeEditor {
 		CodeEditor::spawn(
-			polariton_engine_config(None, None, Some((120, 40))),
+			polariton_engine_config(None, PaneDividerReservation::NONE, None, Some((120, 40))),
+			Some(text),
+		)
+	}
+
+	fn product_0111_editor(reservation: PaneDividerReservation, text: &str) -> CodeEditor {
+		CodeEditor::spawn(
+			polariton_engine_config(None, reservation, None, Some((120, 40))),
 			Some(text),
 		)
 	}
@@ -6998,8 +7031,13 @@ mod tests {
 		let store = SessionStore::platform_default().unwrap();
 		let saved = store.create().unwrap();
 		let session_id = saved.snapshot().session_id();
-		let mut editor =
-			CodeEditor::open_saved_with_init(saved, None, iced::Size::new(900.0, 600.0)).unwrap();
+		let mut editor = CodeEditor::open_saved_with_init(
+			saved,
+			PaneDividerReservation::NONE,
+			None,
+			iced::Size::new(900.0, 600.0),
+		)
+		.unwrap();
 		wait_for_saved_projection(&mut editor);
 		assert!(
 			editor.engine.as_ref().unwrap().checkpoint().is_err(),
@@ -7146,8 +7184,13 @@ mod tests {
 		editor.shutdown();
 
 		let saved = store.open_writable(session_id).unwrap();
-		let mut reopened =
-			CodeEditor::open_saved_with_init(saved, None, iced::Size::new(900.0, 600.0)).unwrap();
+		let mut reopened = CodeEditor::open_saved_with_init(
+			saved,
+			PaneDividerReservation::NONE,
+			None,
+			iced::Size::new(900.0, 600.0),
+		)
+		.unwrap();
 		wait_for_saved_projection(&mut reopened);
 		let reopened_buffer = reopened.active_buffer_id().unwrap();
 		// BufferId is runtime-only and may coincidentally reuse the same integer;
@@ -7764,7 +7807,7 @@ mod tests {
 	}
 
 	#[test]
-	fn horizontal_divider_grab_band_spans_beyond_its_one_row_gap() {
+	fn horizontal_divider_grab_band_keeps_one_preceding_row_at_zero_reservation() {
 		use libaryon::engine::SplitDirection;
 
 		let mut editor = CodeEditor::new("select 1;");
@@ -7792,25 +7835,18 @@ mod tests {
 			.expect("a horizontal split projects a horizontal divider")
 			.to_owned();
 
-		// The one-row visual gap would be a ~22px grab target. The engine widens
-		// it upward, while leaving the lower pane's title bar exclusively for
-		// pane reordering.
-		assert_eq!(divider.visual_rect.height.get(), 1);
-		assert!(
-			divider.hit_rect.height.get() >= 2,
-			"horizontal grab band must extend past its single-row gap, got {}",
-			divider.hit_rect.height.get()
-		);
+		// The compact profile has no visual row. The engine nevertheless retains
+		// one preceding row as its horizontal hit band, leaving the lower pane's
+		// title bar exclusively for pane reordering.
+		assert_eq!(divider.visual_rect.height.get(), 0);
+		assert_eq!(divider.hit_rect.height.get(), 1);
 		assert!(divider.hit_rect.screen_row.get() < divider.visual_rect.screen_row.get());
 		assert_eq!(divider.hit_rect.bottom(), divider.visual_rect.bottom());
 
-		// The painted gap stays eligible at every point, while only the nearest
-		// eight pixels of overlapped live content are ambiguous.
+		// Only the nearest eight pixels of preceding live content are ambiguous.
 		let boundary_y = divider.visual_rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
 		for y in [
-			boundary_y + 1.0,
-			boundary_y + metrics::LINE_HEIGHT / 2.0,
-			boundary_y + metrics::LINE_HEIGHT - 1.0,
+			boundary_y - 1.0,
 			boundary_y - DIVIDER_GRAB_PROXIMITY_PX / 2.0,
 		] {
 			editor.last_pointer = Some(iced::Point::new(300.0, y));
@@ -7890,8 +7926,8 @@ mod tests {
 				.expect("horizontal divider");
 			assert_eq!(
 				divider.visual_rect.height.get(),
-				1,
-				"gate 2 runs before the compact profile"
+				0,
+				"test convenience constructors match Polariton's compact profile"
 			);
 			let pane = viewport.pane(divider.before).expect("pane above divider");
 			let boundary_y = divider.visual_rect.screen_row.get() as f32 * metrics::LINE_HEIGHT;
@@ -8246,6 +8282,112 @@ mod tests {
 			);
 			let _ = editor.update(EditorMsg::Release);
 		}
+	}
+
+	#[test]
+	fn product_0111_configured_reservation_couples_panes_visuals_and_hits() {
+		let reservation = PaneDividerReservation::new(4, 1);
+		let mut editor = product_0111_editor(reservation, "one\ntwo\nthree\n");
+		wait_for_content(&mut editor, "one\ntwo\nthree\n");
+		editor.resize(1200.0, 800.0);
+		editor.send(EditorCommand::SplitPane(SplitDirection::Vertical));
+		editor.send(EditorCommand::SplitPane(SplitDirection::Horizontal));
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			![SplitDirection::Vertical, SplitDirection::Horizontal]
+				.into_iter()
+				.all(|axis| viewport.dividers.iter().any(|divider| divider.axis == axis))
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("configured split viewport");
+
+		let vertical = viewport
+			.dividers
+			.iter()
+			.find(|divider| divider.axis == SplitDirection::Vertical)
+			.expect("vertical divider");
+		let vertical_before = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == vertical.before)
+			.expect("vertical preceding pane");
+		let vertical_after = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == vertical.after)
+			.expect("vertical following pane");
+		assert_eq!(vertical.visual_rect.width.get(), 4);
+		assert_eq!(vertical.hit_rect, vertical.visual_rect);
+		assert_eq!(
+			vertical_after.rect.screen_col.get() - vertical_before.rect.right().get(),
+			4,
+			"one configured reservation separates panes, visual divider, and vertical hit"
+		);
+
+		let horizontal = viewport
+			.dividers
+			.iter()
+			.find(|divider| divider.axis == SplitDirection::Horizontal)
+			.expect("horizontal divider");
+		let horizontal_before = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == horizontal.before)
+			.expect("horizontal preceding pane");
+		let horizontal_after = viewport
+			.panes
+			.iter()
+			.find(|pane| pane.pane_id == horizontal.after)
+			.expect("horizontal following pane");
+		assert_eq!(horizontal.visual_rect.height.get(), 1);
+		assert_eq!(horizontal.hit_rect.height.get(), 2);
+		assert_eq!(
+			horizontal.hit_rect.screen_row.get() + 1,
+			horizontal.visual_rect.screen_row.get(),
+			"the pre-existing horizontal hit row precedes its visual reservation"
+		);
+		assert_eq!(
+			horizontal_after.rect.screen_row.get() - horizontal_before.rect.bottom().get(),
+			1,
+			"one configured row separates the horizontal panes"
+		);
+	}
+
+	#[test]
+	fn product_0111_columns_and_rows_remain_independent() {
+		let mut editor = product_0111_editor(PaneDividerReservation::new(7, 2), "one\ntwo\n");
+		wait_for_content(&mut editor, "one\ntwo\n");
+		editor.resize(1200.0, 800.0);
+		editor.send(EditorCommand::SplitPane(SplitDirection::Vertical));
+		editor.send(EditorCommand::SplitPane(SplitDirection::Horizontal));
+		let deadline = Instant::now() + Duration::from_secs(5);
+		while editor.viewport.as_ref().is_none_or(|viewport| {
+			![SplitDirection::Vertical, SplitDirection::Horizontal]
+				.into_iter()
+				.all(|axis| viewport.dividers.iter().any(|divider| divider.axis == axis))
+		}) && Instant::now() < deadline
+		{
+			editor.poll();
+			thread::sleep(Duration::from_millis(5));
+		}
+		let viewport = editor.viewport.as_ref().expect("independent-axis viewport");
+		let vertical = viewport
+			.dividers
+			.iter()
+			.find(|divider| divider.axis == SplitDirection::Vertical)
+			.expect("vertical divider");
+		let horizontal = viewport
+			.dividers
+			.iter()
+			.find(|divider| divider.axis == SplitDirection::Horizontal)
+			.expect("horizontal divider");
+		assert_eq!(vertical.visual_rect.width.get(), 7);
+		assert_eq!(vertical.hit_rect.width.get(), 7);
+		assert_eq!(horizontal.visual_rect.height.get(), 2);
+		assert_eq!(horizontal.hit_rect.height.get(), 3);
 	}
 
 	#[test]

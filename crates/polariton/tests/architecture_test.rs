@@ -2523,9 +2523,16 @@ fn product_0073_discovery_is_a_terminal_read_only_store_census() {
 
 #[test]
 fn product_0074_polariton_selects_zero_divider_reservation() {
-	let editor =
-		std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/editor.rs"))
-			.expect("read Polariton editor configuration");
+	let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let configuration = std::fs::read_to_string(manifest.join("src/configuration.rs"))
+		.expect("read Polariton startup configuration");
+	assert!(configuration.contains("pane_divider_reservation: PaneDividerReservation::NONE"));
+	assert!(
+		!configuration.contains("pane_divider_reservation: PaneDividerReservation::default()"),
+		"Polariton's missing-config fallback must not inherit the terminal default"
+	);
+	let editor = std::fs::read_to_string(manifest.join("src/editor.rs"))
+		.expect("read Polariton editor configuration");
 	let config = editor
 		.split("fn polariton_engine_config(")
 		.nth(1)
@@ -2533,10 +2540,29 @@ fn product_0074_polariton_selects_zero_divider_reservation() {
 		.split("impl Drop for CodeEditor")
 		.next()
 		.expect("bounded engine configuration");
-	assert!(config.contains("divider_reservation: PaneDividerReservation::NONE"));
+	assert!(config.contains("divider_reservation,"));
 	assert!(
 		!config.contains("SPLIT_DIVIDER_COLS") && !config.contains("SPLIT_DIVIDER_ROWS"),
 		"the GUI head must not inherit terminal reservation constants"
+	);
+	let divider_interaction = editor
+		.split("fn divider_visual_distance_px(")
+		.nth(1)
+		.expect("divider interaction helpers")
+		.split("fn drag_activation_reached(")
+		.next()
+		.expect("bounded divider interaction helpers");
+	assert!(
+		!divider_interaction.contains("divider_reservation"),
+		"Polariton may consume projected divider rectangles but must not derive geometry from reservation fields"
+	);
+	assert!(
+		divider_interaction.contains("pane_pixel_rect(divider.hit_rect)"),
+		"the graphical head narrows only the engine-published hit rectangle"
+	);
+	assert!(
+		!editor.contains("SetDividerReservation"),
+		"the startup preference must not grow an inert live editor command"
 	);
 }
 

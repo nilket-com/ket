@@ -35,6 +35,9 @@ pub fn main(config) {
         1080,
     )?;
     config.show_column_types(true)?;
+    // Reserve four editor columns at vertical splits and one row at horizontal splits.
+    // Omit this to retain Polariton's compact, zero-gutter default.
+    config.pane_divider_gutter(4, 1)?;
 }
 ```
 

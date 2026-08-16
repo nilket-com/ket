@@ -500,21 +500,35 @@ fn new_with_authority(
 		.unwrap_or_default();
 	let init_detail = init_error.map(|error| StatusDetail::new(init_summary.clone(), error));
 	let init_script = configuration::default_init_path();
+	let pane_divider_reservation = startup_data.pane_divider_reservation;
 	let workspace_size = workspace_bounds(window_size).size();
 	let (mut code_editor, session_id) = match authority {
 		StartupAuthority::Ephemeral { initial_file } => (
 			match initial_file {
-				Some(path) => {
-					CodeEditor::open_initial_file_with_init(path, init_script, workspace_size)
-				}
-				None => CodeEditor::new_with_init("", init_script, workspace_size),
+				Some(path) => CodeEditor::open_initial_file_with_init(
+					path,
+					pane_divider_reservation,
+					init_script,
+					workspace_size,
+				),
+				None => CodeEditor::new_with_init(
+					"",
+					pane_divider_reservation,
+					init_script,
+					workspace_size,
+				),
 			},
 			None,
 		),
 		#[cfg(feature = "toron")]
 		StartupAuthority::Saved { session_id, saved } => (
-			CodeEditor::open_saved_with_init(saved, init_script, workspace_size)
-				.map_err(|error| format!("cannot restore saved session {session_id}: {error}"))?,
+			CodeEditor::open_saved_with_init(
+				saved,
+				pane_divider_reservation,
+				init_script,
+				workspace_size,
+			)
+			.map_err(|error| format!("cannot restore saved session {session_id}: {error}"))?,
 			Some(session_id),
 		),
 	};
