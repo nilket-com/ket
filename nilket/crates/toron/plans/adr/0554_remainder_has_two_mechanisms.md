@@ -1,6 +1,10 @@
 # ADR 554 - The remainder has two mechanisms, not one
 
-**Status:** Proposed 2026-08-15. No implementation.
+**Status:** Proposed 2026-08-15. **Branch B implemented and closed**
+(`6ba18ade`, `ab09c804`, `237fb575`, `9d1c1c36`); its placement successor is
+ADR 555. **Branch A not started** — fused aggregate compute is still unbracketed,
+so the in-task residual remains unnamed, and the two Acceptance gates that depend
+on it are unmet.
 
 ## Context
 
