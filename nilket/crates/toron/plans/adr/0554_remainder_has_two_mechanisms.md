@@ -95,17 +95,68 @@ aggregation, not missing, and the receipt now exposes it.
 is coordinator slack that already has a name, so they are not evidence cells for
 new instrumentation.
 
-**B2 — the uncounted outer lifecycle: before first dispatch and after final
-completion and drain.** This is the real instrumentation target. The measured
-envelope brackets `SqlPlanner::plan(...)` **and** `execute_query_with_context(...)`,
-so logical planning, binding, fragmentation, scheduling, and the result-stream
-drain are all inside it — while `dispatch_started` opens at the dispatcher call,
-leaving everything before the first dispatch and after the last completion
-outside every existing window. No timer covers it: all ten `Instant::now()` uses
-in `coordinator.rs` are deadlines and intervals, none durations.
+**B2 — measured, and it is not the outer lifecycle.** This section originally
+named the outer lifecycle — before first dispatch, after final completion — as
+the instrumentation target. **That was wrong, and the instrument disproved it.**
+
+Three sequential spans were added and run at SF=8 on a clean build
+(`5af71d0c0f26`, authoritative, no replay violations). Medians over 7 pairs:
+
+| cell | sql planning | pre-dispatch | producer finalization |
+|---|---:|---:|---:|
+| q06 | 0.09 ms | 0.22 ms | ~0 |
+| q13 | 0.10 ms | 0.39 ms | ~0 |
+| q14 | 0.12 ms | 0.35 ms | ~0 |
+| q19 | 0.21 ms | 0.43 ms | ~0 |
+
+**The outer lifecycle is negligible** — bind, fragment, schedule and SQL planning
+together total under 1 ms against q19's ~590 ms gap. Any instinct to optimise the
+planner or scheduler setup would have been chasing 0.15% of the cost.
+
+**The missing time is inside the dispatch loop, outside the selected path's task
+windows.** Adding a `dispatch_loop_wall_ms` envelope and differencing it against
+the path's dispatch sum accounts for the residual almost exactly:
+
+| cell | unnamed gap | B1 per-task slack | `loop_non_path_ms` | unexplained |
+|---|---:|---:|---:|---:|
+| q06 | 92.5 | 91.9 (99%) | 0.1 | 0.54 |
+| q13 | 295.7 | 276.8 (94%) | 17.3 | 0.88 |
+| q14 | 322.9 | 125.8 (39%) | **196.1 (61%)** | 0.89 |
+| q19 | 592.9 | 166.8 (28%) | **425.4 (72%)** | 1.05 |
+
+Reconciliation to within **0.5–1.1 ms** on every cell, computed within one
+artifact. The B1 cells show near-zero `loop_non_path_ms`, so the figure is
+specific to the B2 cells rather than a general artefact.
+
+**The name is deliberately neutral.** `loop_non_path_ms` is
+`dispatch_loop_wall - Σ(selected-path dispatch)`. That subtraction **cannot
+distinguish** scheduler or dependency-release cost from off-path sibling tasks
+doing real work, because the critical path carries one task per stage and a stage
+may have many. An earlier draft called it in-loop coordination; that asserted a
+mechanism the arithmetic cannot see.
+
+**q14 and q19 are consistent with off-path sibling execution under two workers,
+and that is as far as the evidence goes.** q19's path is
+`(0,0)→(1,0)→(2,3)→(3,0)` while stage 2 holds four sibling tasks at ~184 ms
+each; the artifact reports `worker_count: 2`. Two rounds of stage 2 predicts a
+loop wall of ~2,749 ms against ~2,873 ms measured — much nearer that than either
+fully parallel (~2,565 ms) or serial (~2,968 ms). `max_in_flight_tasks` is set to
+the maximum stage width, so the scheduler cap is not the constraint.
+
+**This is consistency, not confirmation.** `worker_id` is known to the scheduler
+at completion (`TaskAttemptCompletion`) but is **not carried into
+`TaskTelemetryRecord`**, so no artifact can show which worker ran which task. The
+mechanism is therefore unproven, and this is an explicit evidence limit rather
+than a reason to instrument the scheduler.
+
+If the mechanism holds, a consequence follows for the method rather than the
+engine: work done by off-path siblings is real execution that critical-path
+attribution cannot see, so part of the "unattributed remainder" is a property of
+the attribution model, not an engine defect.
 
 **q14 and q19 are B2's evidence cells** — 51% and 70% outside dispatch. The
-original framing named q19 alone; q14 belongs with it.
+original framing named q19 alone; q14 belongs with it. Both are now measured
+above, and the outside-dispatch time is `loop_non_path_ms`, not outer lifecycle.
 
 **Dispatch slack identifies waiting, not its cause.** `dispatch_wait - task_wall`
 mixes queueing, transport, and worker-start latency into one figure. It says the
@@ -165,8 +216,13 @@ source, without adding a timer. That ordering is the point: an instrument built
 before the audit would have measured B1 all over again, since B1 is where q06 and
 q13 put almost all of their residue.
 
-Next is a B2 instrument on q14 and q19, split per §3. Branch A follows
-independently, on its own cells.
+The B2 instrument is built, run, and reported above. What remains for B2 is one
+question with a known answer path: **carry `worker_id` into `TaskTelemetryRecord`**
+so an artifact can show which worker ran which task. That is plumbing an existing
+fact through, not new instrumentation, and it is the only thing standing between
+"consistent with off-path sibling execution" and a mechanism.
+
+Branch A follows independently, on its own cells.
 
 ## Acceptance
 
@@ -181,6 +237,10 @@ independently, on its own cells.
 - **Branch B accounts for q14 and q19 in the artifact**, not in an argument: the
   B1 slack already reported plus the B2 intervals a new instrument names sum,
   within the declared tolerance, to each cell's `unnamed_residual_ms`.
+- **A derived loop-minus-path figure is emitted only when the path's dispatch
+  windows are contained in the loop wall.** Otherwise both raw figures stand and
+  the subtraction is refused — never clamped to zero, which would read as a
+  measurement.
 - **A B2 instrument reports its three spans separately**, with
   `sql_planning_ms` distinct from `pre_dispatch_ms`. The control asserts distinct
   figures; one combined lifecycle number fails it, because that is the
@@ -229,9 +289,9 @@ separability gate in Acceptance exists to detect exactly that.
 
 ## Forward
 
-Branch B's audit is done and recorded in §3. A B2 instrument on q14 and q19 —
-`sql_planning_ms`, `pre_dispatch_ms`, `post_completion_drain_ms`, and an explicit
-`lifecycle_residual_ms` — is the next cut. Branch A follows.
+Branch B is measured and reconciled in §3. Its open item is `worker_id`
+retention, which would settle the mechanism behind `loop_non_path_ms`. Branch A
+follows.
 
 Neither is a perf change. Both are attribution work, and a perf claim built on
 either needs the pairing discipline ADR 538 and ADR 551 already established.
