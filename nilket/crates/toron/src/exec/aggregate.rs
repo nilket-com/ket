@@ -576,6 +576,35 @@ fn primitive_capacity_bytes<T>(capacity: usize) -> u64 {
 }
 
 impl Executor {
+	/// Time one batch's aggregate accumulation and add it to the task phase
+	/// counter (ADR 554 Branch A).
+	///
+	/// One helper for all four fused sites so the boundary cannot drift between
+	/// them. The contract is semantic: callers open it at the **first
+	/// aggregate-accumulation instruction after input processing** — which is not
+	/// always the line following `apply_streaming_scan_input_ops` — and close it
+	/// at the end of the loop body. Scan acquisition is already metered, input
+	/// processing is not accumulation, and post-loop finalization is excluded by
+	/// decision.
+	fn accumulate_aggregate_batch<T>(
+		&self,
+		body: impl FnOnce() -> Result<T, ExecutionError>,
+	) -> Result<T, ExecutionError> {
+		let started = Instant::now();
+		let outcome = body();
+		let elapsed = super::join::duration_micros(started);
+		// Charged even when the body failed: the time was spent inside the task
+		// wall either way, and dropping it on the error path would silently move
+		// it back into the residual this counter exists to reduce.
+		super::join::record_task_telemetry(&self.context.task_telemetry, |task| {
+			task.phases.aggregate_accumulation_micros = task
+				.phases
+				.aggregate_accumulation_micros
+				.saturating_add(elapsed);
+		});
+		outcome
+	}
+
 	pub(in crate::exec) async fn try_streaming_grouped_aggregate(
 		&self,
 		input: &ExecutionPlan,
@@ -788,7 +817,9 @@ impl Executor {
 
 			batch = self.apply_streaming_scan_input_ops(&streaming_input, batch)?;
 
-			self.fold_global_aggregate_state(&mut state, aggr_expr, &batch)?;
+			self.accumulate_aggregate_batch(|| {
+				self.fold_global_aggregate_state(&mut state, aggr_expr, &batch)
+			})?;
 		}
 
 		finalize_global_aggregate_state(&state, aggr_expr, output_schema).map(Some)
@@ -978,24 +1009,31 @@ impl Executor {
 				}
 				receipt.record_source_batch();
 			}
-			let fold_stage = vocabulary
-				.as_ref()
-				.and_then(|v| node_attribution::open_stage(v, "fold", &telemetry));
-			let fold_result = self.fold_streaming_grouped_scan_batch(
-				&fold_streaming_input,
-				batch,
-				group_expr,
-				aggr_expr,
-				&mut groups,
-				&mut group_types,
-				&mut folded_input,
-				fold_receipt.as_mut(),
-				exchange_receipt.as_mut(),
-			);
-			if let Some(stage) = fold_stage {
-				node_attribution::close_stage(stage, &telemetry);
-			}
-			fold_result?;
+			// Scope opens at the fold, not at the input-ops return: the two statements
+			// above close the projection span and its receipt, which belong to input
+			// ops. The nested `fold` stage span inside is a batch-local diagnostic and
+			// deliberately overlaps this counter; only this counter feeds `accounted`.
+			self.accumulate_aggregate_batch(|| {
+				let fold_stage = vocabulary
+					.as_ref()
+					.and_then(|v| node_attribution::open_stage(v, "fold", &telemetry));
+				let fold_result = self.fold_streaming_grouped_scan_batch(
+					&fold_streaming_input,
+					batch,
+					group_expr,
+					aggr_expr,
+					&mut groups,
+					&mut group_types,
+					&mut folded_input,
+					fold_receipt.as_mut(),
+					exchange_receipt.as_mut(),
+				);
+				if let Some(stage) = fold_stage {
+					node_attribution::close_stage(stage, &telemetry);
+				}
+				fold_result?;
+				Ok(())
+			})?;
 		}
 
 		if !folded_input {
@@ -1115,54 +1153,58 @@ impl Executor {
 			};
 			rows = rows.saturating_add(batch.num_rows());
 			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
-			let keys = batch
-				.column(spec.group_column.0 as usize)
-				.as_any()
-				.downcast_ref::<Int64Array>()
-				.ok_or_else(|| ExecutionError::InvalidExpression {
-					message: "primitive grouped SUM key must be Int64".to_string(),
-				})?;
-			if keys.null_count() != 0 {
-				return Err(ExecutionError::InvalidExpression {
-					message: "primitive grouped SUM received a null key".to_string(),
-				});
-			}
-			match spec.input {
-				PrimitiveInt64SumInput::Int64 => {
-					let values = batch
-						.column(spec.value_column.0 as usize)
-						.as_any()
-						.downcast_ref::<Int64Array>()
-						.ok_or_else(|| ExecutionError::InvalidExpression {
-							message: "primitive grouped SUM input must be Int64".to_string(),
-						})?;
-					if values.null_count() != 0 {
-						return Err(ExecutionError::InvalidExpression {
-							message: "primitive grouped SUM received a null input".to_string(),
-						});
+			self.accumulate_aggregate_batch(|| {
+				let keys = batch
+					.column(spec.group_column.0 as usize)
+					.as_any()
+					.downcast_ref::<Int64Array>()
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: "primitive grouped SUM key must be Int64".to_string(),
+					})?;
+				if keys.null_count() != 0 {
+					return Err(ExecutionError::InvalidExpression {
+						message: "primitive grouped SUM received a null key".to_string(),
+					});
+				}
+				match spec.input {
+					PrimitiveInt64SumInput::Int64 => {
+						let values = batch
+							.column(spec.value_column.0 as usize)
+							.as_any()
+							.downcast_ref::<Int64Array>()
+							.ok_or_else(|| ExecutionError::InvalidExpression {
+								message: "primitive grouped SUM input must be Int64".to_string(),
+							})?;
+						if values.null_count() != 0 {
+							return Err(ExecutionError::InvalidExpression {
+								message: "primitive grouped SUM received a null input".to_string(),
+							});
+						}
+						for row in 0..batch.num_rows() {
+							groups.insert(keys.value(row), i128::from(values.value(row)), cap)?;
+						}
 					}
-					for row in 0..batch.num_rows() {
-						groups.insert(keys.value(row), i128::from(values.value(row)), cap)?;
+					PrimitiveInt64SumInput::Decimal128 => {
+						let values = batch
+							.column(spec.value_column.0 as usize)
+							.as_any()
+							.downcast_ref::<Decimal128Array>()
+							.ok_or_else(|| ExecutionError::InvalidExpression {
+								message: "primitive grouped SUM input must be Decimal128"
+									.to_string(),
+							})?;
+						if values.null_count() != 0 {
+							return Err(ExecutionError::InvalidExpression {
+								message: "primitive grouped SUM received a null input".to_string(),
+							});
+						}
+						for row in 0..batch.num_rows() {
+							groups.insert(keys.value(row), values.value(row), cap)?;
+						}
 					}
 				}
-				PrimitiveInt64SumInput::Decimal128 => {
-					let values = batch
-						.column(spec.value_column.0 as usize)
-						.as_any()
-						.downcast_ref::<Decimal128Array>()
-						.ok_or_else(|| ExecutionError::InvalidExpression {
-							message: "primitive grouped SUM input must be Decimal128".to_string(),
-						})?;
-					if values.null_count() != 0 {
-						return Err(ExecutionError::InvalidExpression {
-							message: "primitive grouped SUM received a null input".to_string(),
-						});
-					}
-					for row in 0..batch.num_rows() {
-						groups.insert(keys.value(row), values.value(row), cap)?;
-					}
-				}
-			}
+				Ok(())
+			})?;
 		}
 		record_primitive_int64_sum_profile(&groups, cap, started.elapsed());
 		groups.finish(output_schema, self.context.task_budget.memory.get())
@@ -1203,21 +1245,24 @@ impl Executor {
 			};
 			rows = rows.saturating_add(batch.num_rows());
 			let batch = self.apply_streaming_scan_input_ops(&streaming_input.scan_input, batch)?;
-			let keys = batch
-				.column(spec.group_column.0 as usize)
-				.as_any()
-				.downcast_ref::<Int64Array>()
-				.ok_or_else(|| ExecutionError::InvalidExpression {
-					message: "primitive grouped COUNT key must be Int64".to_string(),
-				})?;
-			if keys.null_count() != 0 {
-				return Err(ExecutionError::InvalidExpression {
-					message: "primitive grouped COUNT received a null key".to_string(),
-				});
-			}
-			for row in 0..batch.num_rows() {
-				groups.insert(keys.value(row), 1, cap)?;
-			}
+			self.accumulate_aggregate_batch(|| {
+				let keys = batch
+					.column(spec.group_column.0 as usize)
+					.as_any()
+					.downcast_ref::<Int64Array>()
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: "primitive grouped COUNT key must be Int64".to_string(),
+					})?;
+				if keys.null_count() != 0 {
+					return Err(ExecutionError::InvalidExpression {
+						message: "primitive grouped COUNT received a null key".to_string(),
+					});
+				}
+				for row in 0..batch.num_rows() {
+					groups.insert(keys.value(row), 1, cap)?;
+				}
+				Ok(())
+			})?;
 		}
 		record_primitive_int64_sum_profile(&groups, cap, started.elapsed());
 		groups.finish_with_retained_cap(output_schema, self.context.task_budget.memory.get(), cap)

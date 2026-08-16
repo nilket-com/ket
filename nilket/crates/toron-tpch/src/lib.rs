@@ -23173,6 +23173,28 @@ mod adr538_timing_atlas_retry_and_reclamation_controls {
 mod adr538_timing_atlas_journal_replay {
 	use super::*;
 
+	/// ADR 554 §2: accumulation is a **remainder subterm**, never an ADR 538
+	/// component. The frozen phase-to-component mapping must not have grown.
+	#[test]
+	fn adr554_aggregate_accumulation_is_not_an_adr538_component() {
+		let mut phases = TaskTelemetryPhases::default();
+		phases.aggregate_accumulation_micros = 7_000;
+		let portions = timing_atlas_component_portions_ms(&phases);
+
+		assert!(
+			portions.iter().all(|(_, ms)| *ms == 0.0),
+			"accumulation must not surface as any component portion: {portions:?}"
+		);
+		let labels: Vec<&str> = portions
+			.iter()
+			.map(|(component, _)| component.label())
+			.collect();
+		assert!(
+			!labels.iter().any(|label| label.contains("aggregate")),
+			"no aggregate component may exist in the frozen mapping: {labels:?}"
+		);
+	}
+
 	/// Task-to-worker identity survives from the scheduler to the artifact and back
 	/// through replay.
 	///
@@ -25101,6 +25123,7 @@ mod adr538_phase_component_wiring {
 	#[test]
 	fn every_phase_counter_is_mapped_once_or_named_as_remainder() {
 		let phases = TaskTelemetryPhases {
+			aggregate_accumulation_micros: 0,
 			task_wall_micros: 104_729,
 			shuffle_pull_decode_micros: 2,
 			build_micros: 3,
