@@ -4632,8 +4632,6 @@ fn product_0116_estimates_only_reserve_or_pull_rotated_tick_runs_inward() {
 		"x_offset: f32",
 		"fn leading_alignment",
 		"fn minimum_vertical_extent",
-		"XTickEndpoint::Min => (-run_min_x).max(0.0)",
-		"XTickEndpoint::Max => (-run_max_x).min(0.0)",
 	] {
 		assert!(
 			placement.contains(declaration),
@@ -4677,6 +4675,104 @@ fn product_0116_estimates_only_reserve_or_pull_rotated_tick_runs_inward() {
 		assert!(
 			!section.contains("placement.y_offset"),
 			"PRODUCT-0116 does not restore vertical correction from {entrypoint}"
+		);
+	}
+}
+
+#[test]
+fn product_0118_endpoint_correction_is_typed_and_minimal() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let coordinate =
+		std::fs::read_to_string(root.join("coordinate.rs")).expect("read coordinate vocabulary");
+	for declaration in [
+		"impl Pt<Plot>",
+		"pub(crate) fn from_transformer_point(raw: Point) -> Self",
+		"impl Rect<Plot>",
+		"pub(crate) fn from_widget(figure: Rect<Widget>, plot_area: Rect<Widget>) -> Self",
+	] {
+		assert!(
+			coordinate.contains(declaration),
+			"PRODUCT-0118 keeps figure containment and transformed ticks in typed spaces: {declaration}"
+		);
+	}
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let placement = common
+		.split("struct XTickTextPlacement")
+		.nth(1)
+		.and_then(|rest| rest.split("pub(crate) struct AxisTextVisibility").next())
+		.expect("bounded x-tick placement authority");
+	for declaration in [
+		"tick: Pt<Plot>",
+		"containment: Rect<Plot>",
+		"XTickEndpoint::Min => (containment.x() - (tick.x() + run_min_x)).max(0.0)",
+		"XTickEndpoint::Max => (containment.right() - (tick.x() + run_max_x)).min(0.0)",
+	] {
+		assert!(
+			placement.contains(declaration),
+			"PRODUCT-0118 corrects only conservative overflow at the figure boundary: {declaration}"
+		);
+	}
+	for legacy in [
+		"XTickEndpoint::Min => (-run_min_x).max(0.0)",
+		"XTickEndpoint::Max => (-run_max_x).min(0.0)",
+	] {
+		assert!(
+			!placement.contains(legacy),
+			"PRODUCT-0118 removes PRODUCT-0116's full-run retraction: {legacy}"
+		);
+	}
+
+	let overlay = common
+		.split("fn render_overlay_layer_in_widget")
+		.nth(1)
+		.and_then(|rest| rest.split("fn render_global_headings").next())
+		.expect("bounded ordinary overlay");
+	assert!(
+		overlay.contains("Rect::<Plot>::from_widget(bounds, plot_extent)"),
+		"the ordinary overlay converts its figure clip once at the plot-local seam"
+	);
+	for draw in [
+		"self.draw_cartesian_axes(",
+		"self.draw_categorical_axes(",
+		"self.draw_categorical_xy_axes(",
+	] {
+		let section = overlay
+			.split(draw)
+			.nth(1)
+			.expect("ordinary x-axis draw path");
+		assert!(
+			section.contains("containment,"),
+			"{draw} consumes the one typed figure containment"
+		);
+	}
+
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read grid");
+	let grid_overlay = grid
+		.split("fn render_overlay_layer(")
+		.nth(1)
+		.and_then(|rest| rest.split("fn render_global_headings").next())
+		.expect("bounded grid overlay");
+	assert!(
+		grid_overlay.contains("Rect::<Plot>::from_widget(bounds, inner)"),
+		"PRODUCT-0118 keeps grid endpoint containment at the figure edge, never a cell edge"
+	);
+	assert!(
+		!grid_overlay.contains("from_widget(cell_bounds, inner)"),
+		"PRODUCT-0048 permits labels to cross facet boundaries before the figure clip stops them"
+	);
+	for draw in [
+		"helper.draw_cartesian_axes(",
+		"helper.draw_categorical_axes(",
+		"helper.draw_categorical_xy_axes(",
+	] {
+		let section = grid_overlay
+			.split(draw)
+			.nth(1)
+			.expect("grid x-axis draw path");
+		assert!(
+			section.contains("containment,"),
+			"{draw} consumes the grid-wide typed containment authority"
 		);
 	}
 }

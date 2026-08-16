@@ -221,10 +221,32 @@ impl Pt<Widget> {
 }
 
 impl Pt<Plot> {
+	/// Assert that a point emitted by `CoordinateTransformer` is plot-local.
+	///
+	/// PRODUCT-0118 keeps this relabelling at the transform seam so figure
+	/// containment cannot be combined with an untyped local tick coordinate.
+	pub(crate) fn from_transformer_point(raw: Point) -> Self {
+		Self::wrap(raw)
+	}
+
 	pub(crate) fn from_widget(point: Pt<Widget>, plot_area: Rect<Widget>) -> Self {
 		Self::wrap(Point::new(
 			point.x() - plot_area.x(),
 			point.y() - plot_area.y(),
+		))
+	}
+}
+
+impl Rect<Plot> {
+	/// Express a widget figure rectangle in the local coordinates of its plot.
+	///
+	/// PRODUCT-0118 performs this conversion at the overlay translation seam:
+	/// the clip stays a `Rect<Widget>` until the draw path has established the
+	/// plot-local coordinate system which consumes it.
+	pub(crate) fn from_widget(figure: Rect<Widget>, plot_area: Rect<Widget>) -> Self {
+		Self::wrap(Rectangle::new(
+			Point::new(figure.x() - plot_area.x(), figure.y() - plot_area.y()),
+			figure.size(),
 		))
 	}
 }

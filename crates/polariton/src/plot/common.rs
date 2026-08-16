@@ -1316,6 +1316,8 @@ impl XTickTextPlacement {
 		rotation: TickRotation,
 		legacy_alignment: alignment::Horizontal,
 		endpoint: XTickEndpoint,
+		tick: Pt<Plot>,
+		containment: Rect<Plot>,
 		estimated_width: f32,
 	) -> Self {
 		if rotation == TickRotation::ZERO {
@@ -1332,8 +1334,8 @@ impl XTickTextPlacement {
 			(run_start * radians.cos()).max(run_end * radians.cos()),
 		);
 		let x_offset = match endpoint {
-			XTickEndpoint::Min => (-run_min_x).max(0.0),
-			XTickEndpoint::Max => (-run_max_x).min(0.0),
+			XTickEndpoint::Min => (containment.x() - (tick.x() + run_min_x)).max(0.0),
+			XTickEndpoint::Max => (containment.right() - (tick.x() + run_max_x)).min(0.0),
 			XTickEndpoint::None => 0.0,
 		};
 		Self {
@@ -1740,6 +1742,7 @@ impl<'a> PlotWidget<'a> {
 		let layout = self.kernel.layout(self.settings.clone());
 		let requirements = BandRequirements::from_layout(&layout);
 		let plot_extent = self.plot_area(legend.content_bounds, &requirements);
+		let containment = Rect::<Plot>::from_widget(bounds, plot_extent);
 		let plot_area = plot_extent.into_iced();
 		let bounds = bounds.into_iced();
 		let transform = CoordinateTransformer::new(&layout, plot_area);
@@ -1778,6 +1781,7 @@ impl<'a> PlotWidget<'a> {
 							*x_range,
 							*y_range,
 							AxisTextVisibility::ALL,
+							containment,
 						);
 					}
 					PlotLayout::CategoricalX {
@@ -1792,6 +1796,7 @@ impl<'a> PlotWidget<'a> {
 							categories,
 							*y_range,
 							AxisTextVisibility::ALL,
+							containment,
 						);
 					}
 					PlotLayout::CategoricalY {
@@ -1819,6 +1824,7 @@ impl<'a> PlotWidget<'a> {
 							x_categories,
 							y_categories,
 							AxisTextVisibility::ALL,
+							containment,
 						);
 					}
 					PlotLayout::Parallel { dimensions, ranges } => {
@@ -2207,6 +2213,7 @@ impl<'a> PlotWidget<'a> {
 		x_range: (f64, f64),
 		y_range: (f64, f64),
 		text: AxisTextVisibility,
+		containment: Rect<Plot>,
 	) {
 		let x_axis_type = if let PlotLayout::Cartesian { x_axis_type, .. } = transform.layout {
 			*x_axis_type
@@ -2290,6 +2297,8 @@ impl<'a> PlotWidget<'a> {
 					self.settings.x_tick_rotation,
 					text.anchoring.x_alignment(data_x, x_range),
 					text.anchoring.x_figure_endpoint(data_x, x_range),
+					Pt::from_transformer_point(p_bottom),
+					containment,
 					estimate_formatted_label_width(&label, self.settings.x_tick_size),
 				);
 				backend.with_save(&mut |backend| {
@@ -2407,6 +2416,7 @@ impl<'a> PlotWidget<'a> {
 		categories: &[String],
 		y_range: (f64, f64),
 		text: AxisTextVisibility,
+		containment: Rect<Plot>,
 	) {
 		let PlotLayout::CategoricalX { y_axis_type, .. } = transform.layout else {
 			unreachable!("categorical-x chrome requires a categorical-x transform")
@@ -2478,6 +2488,8 @@ impl<'a> PlotWidget<'a> {
 					self.settings.x_tick_rotation,
 					alignment::Horizontal::Center,
 					endpoint,
+					Pt::from_transformer_point(center_px),
+					containment,
 					estimate_ascii_label_width(cat, self.settings.x_tick_size),
 				);
 				backend.with_save(&mut |backend| {
@@ -2662,6 +2674,7 @@ impl<'a> PlotWidget<'a> {
 		x_categories: &[String],
 		y_categories: &[String],
 		text: AxisTextVisibility,
+		containment: Rect<Plot>,
 	) {
 		let halo_stroke = Stroke {
 			style: Style::Solid(self.settings.chrome.canvas_background.iced()),
@@ -2707,6 +2720,8 @@ impl<'a> PlotWidget<'a> {
 					self.settings.x_tick_rotation,
 					alignment::Horizontal::Center,
 					endpoint,
+					Pt::from_transformer_point(Point::new(tick_x, tick_y)),
+					containment,
 					estimate_ascii_label_width(cat, self.settings.x_tick_size),
 				);
 				backend.with_save(&mut |backend| {
@@ -3058,7 +3073,10 @@ mod product_0106_vertical_guide_band_oracles {
 		};
 		let old_width = label.chars().count() as f32 * settings.x_tick_size;
 		let new_width = estimate_ascii_label_width(label, settings.x_tick_size);
-		assert!(new_width < old_width, "PRODUCT-0117 prose class budget improves the flat bound");
+		assert!(
+			new_width < old_width,
+			"PRODUCT-0117 prose class budget improves the flat bound"
+		);
 		let guides = VerticalGuideBands::x_axis_guides(&requirements, true, &settings);
 		let old_tick_end = settings.x_label_offset
 			+ old_width * settings.x_tick_rotation.radians().sin().abs()
@@ -3070,8 +3088,7 @@ mod product_0106_vertical_guide_band_oracles {
 		assert!(
 			(guides.bottom - old_bottom
 				+ (old_width - new_width) * settings.x_tick_rotation.radians().sin().abs())
-				.abs()
-				< 0.001,
+			.abs() < 0.001,
 			"PRODUCT-0117 guide geometry moves by exactly the rotated estimate delta"
 		);
 	}
@@ -3079,10 +3096,17 @@ mod product_0106_vertical_guide_band_oracles {
 	#[test]
 	fn product_0116_estimation_never_moves_rotated_tick_ink() {
 		let width = 120.0;
+		let figure = Rect::<Widget>::from_iced_frame(Rectangle::new(
+			Point::ORIGIN,
+			iced::Size::new(400.0, 300.0),
+		));
+		let containment = Rect::<Plot>::from_widget(figure, figure);
 		let zero = XTickTextPlacement::resolve(
 			TickRotation::ZERO,
 			alignment::Horizontal::Center,
 			XTickEndpoint::Max,
+			Pt::from_transformer_point(Point::new(400.0, 0.0)),
+			containment,
 			width,
 		);
 		assert_eq!(zero.alignment, alignment::Horizontal::Center);
@@ -3112,10 +3136,17 @@ mod product_0106_vertical_guide_band_oracles {
 		] {
 			let radians = rotation.radians();
 			for endpoint in [XTickEndpoint::None, XTickEndpoint::Min, XTickEndpoint::Max] {
+				let tick_x = match endpoint {
+					XTickEndpoint::Min => 0.0,
+					XTickEndpoint::Max => 400.0,
+					XTickEndpoint::None => 200.0,
+				};
 				let placement = XTickTextPlacement::resolve(
 					rotation,
 					alignment::Horizontal::Center,
 					endpoint,
+					Pt::from_transformer_point(Point::new(tick_x, 0.0)),
+					containment,
 					width,
 				);
 				assert_eq!(
@@ -3145,25 +3176,165 @@ mod product_0106_vertical_guide_band_oracles {
 				rotation,
 				alignment::Horizontal::Center,
 				corrected_endpoint,
+				Pt::from_transformer_point(Point::new(
+					if corrected_endpoint == XTickEndpoint::Min {
+						0.0
+					} else {
+						400.0
+					},
+					0.0,
+				)),
+				containment,
 				width,
 			);
 			let (run_start, run_end) = XTickTextPlacement::run(corrected.alignment, width);
-			let corrected_min_x =
-				corrected.x_offset + (run_start * radians.cos()).min(run_end * radians.cos());
-			let corrected_max_x =
-				corrected.x_offset + (run_start * radians.cos()).max(run_end * radians.cos());
+			let corrected_min_x = (if corrected_endpoint == XTickEndpoint::Min {
+				0.0
+			} else {
+				400.0
+			}) + corrected.x_offset
+				+ (run_start * radians.cos()).min(run_end * radians.cos());
+			let corrected_max_x = (if corrected_endpoint == XTickEndpoint::Min {
+				0.0
+			} else {
+				400.0
+			}) + corrected.x_offset
+				+ (run_start * radians.cos()).max(run_end * radians.cos());
 			match corrected_endpoint {
 				XTickEndpoint::Min => assert!(
-					corrected_min_x >= -0.001,
+					corrected_min_x >= containment.x() - 0.001,
 					"the minimum endpoint's conservative run extent remains inside its figure edge"
 				),
 				XTickEndpoint::Max => assert!(
-					corrected_max_x <= 0.001,
+					corrected_max_x <= containment.right() + 0.001,
 					"the maximum endpoint's conservative run extent remains inside its figure edge"
 				),
 				XTickEndpoint::None => unreachable!("the signed fixture selects an outer endpoint"),
 			}
 		}
+	}
+
+	#[test]
+	fn product_0118_endpoint_correction_is_exactly_the_overflow() {
+		let figure = Rect::<Widget>::from_iced_frame(Rectangle::new(
+			Point::ORIGIN,
+			iced::Size::new(400.0, 300.0),
+		));
+		let plot = figure.region(100.0, 0.0, 200.0, 300.0);
+		let containment = Rect::<Plot>::from_widget(figure, plot);
+		assert_eq!((containment.x(), containment.right()), (-100.0, 300.0));
+
+		let rotation = TickRotation::new(45.0).unwrap();
+		let width = 120.0;
+		let projected = width * rotation.radians().cos();
+		let fitting_tick = Pt::from_transformer_point(Point::new(300.0 - projected - 1.0, 0.0));
+		let fitting = XTickTextPlacement::resolve(
+			rotation,
+			alignment::Horizontal::Center,
+			XTickEndpoint::Max,
+			fitting_tick,
+			containment,
+			width,
+		);
+		assert_eq!(
+			fitting.x_offset, 0.0,
+			"a categorical endpoint already inside the figure stays on its tick"
+		);
+
+		let overflowing_tick =
+			Pt::from_transformer_point(Point::new(300.0 - projected + 25.0, 0.0));
+		let overflowing = XTickTextPlacement::resolve(
+			rotation,
+			alignment::Horizontal::Center,
+			XTickEndpoint::Max,
+			overflowing_tick,
+			containment,
+			width,
+		);
+		assert!(
+			(overflowing.x_offset + 25.0).abs() < 0.001,
+			"an endpoint moves only by its conservative overflow, not the full projected run"
+		);
+		assert!(
+			(overflowing_tick.x() + overflowing.x_offset + projected - containment.right()).abs()
+				< 0.001,
+			"the corrected outer extent lands exactly on the figure boundary"
+		);
+
+		let grid_label_width = 220.0;
+		let grid_projected = grid_label_width * rotation.radians().cos();
+		let mut offsets = Vec::new();
+		for figure_width in [1600.0, 400.0] {
+			let figure = Rect::<Widget>::from_iced_frame(Rectangle::new(
+				Point::ORIGIN,
+				iced::Size::new(figure_width, 300.0),
+			));
+			let plot = figure.region(80.0, 0.0, figure_width - 160.0, 300.0);
+			let containment = Rect::<Plot>::from_widget(figure, plot);
+			let last_categorical_tick =
+				Pt::from_transformer_point(Point::new(plot.width() * 15.0 / 16.0, 0.0));
+			let placement = XTickTextPlacement::resolve(
+				rotation,
+				alignment::Horizontal::Center,
+				XTickEndpoint::Max,
+				last_categorical_tick,
+				containment,
+				grid_label_width,
+			);
+			let overflow =
+				(last_categorical_tick.x() + grid_projected - containment.right()).max(0.0);
+			assert!(
+				(placement.x_offset + overflow).abs() < 0.001,
+				"at {figure_width}px, the endpoint moves by its current figure overflow"
+			);
+			offsets.push(placement.x_offset);
+		}
+		assert_eq!(
+			offsets[0], 0.0,
+			"the wide grid leaves a fitting outer categorical label on its tick"
+		);
+		assert!(
+			offsets[1] < 0.0 && offsets[1] > -grid_projected,
+			"the narrow grid corrects only its reduced overflow, never the full label width"
+		);
+
+		let left_rotation = TickRotation::new(-45.0).unwrap();
+		let left_projected = width * left_rotation.radians().cos();
+		let fitting_left_tick =
+			Pt::from_transformer_point(Point::new(containment.x() + left_projected + 1.0, 0.0));
+		let fitting_left = XTickTextPlacement::resolve(
+			left_rotation,
+			alignment::Horizontal::Center,
+			XTickEndpoint::Min,
+			fitting_left_tick,
+			containment,
+			width,
+		);
+		assert_eq!(
+			fitting_left.x_offset, 0.0,
+			"a minimum endpoint already inside the figure stays on its tick"
+		);
+
+		let overflowing_left_tick =
+			Pt::from_transformer_point(Point::new(containment.x() + left_projected - 25.0, 0.0));
+		let overflowing_left = XTickTextPlacement::resolve(
+			left_rotation,
+			alignment::Horizontal::Center,
+			XTickEndpoint::Min,
+			overflowing_left_tick,
+			containment,
+			width,
+		);
+		assert!(
+			(overflowing_left.x_offset - 25.0).abs() < 0.001,
+			"the minimum endpoint moves only by its conservative overflow"
+		);
+		assert!(
+			(containment.x()
+				- (overflowing_left_tick.x() + overflowing_left.x_offset - left_projected))
+				.abs() < 0.001,
+			"the corrected minimum extent lands exactly on the figure boundary"
+		);
 	}
 
 	#[test]
@@ -4516,6 +4687,8 @@ mod product_0056_categorical_y_oracles {
 						categories.reverse();
 					}
 					let bounds = Rectangle::new(Point::ORIGIN, Size::new(width, height));
+					let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
+					let containment = Rect::<Plot>::from_widget(widget_bounds, widget_bounds);
 					let y_layout = PlotLayout::CategoricalY {
 						categories: categories.clone(),
 						x_range: (0.0, 10.0),
@@ -4569,6 +4742,7 @@ mod product_0056_categorical_y_oracles {
 						&["x0".to_owned(), "x1".to_owned()],
 						&categories,
 						AxisTextVisibility::ALL,
+						containment,
 					);
 					assert_frame_path(&xy_axes.strokes[0], width, height);
 					for category in &categories {
