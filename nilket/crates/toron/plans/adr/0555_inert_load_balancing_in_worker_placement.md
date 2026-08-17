@@ -71,27 +71,56 @@ nothing *chose* it: a policy that intends to balance is silently deciding by has
 order. This record makes the choice real and measurable; it does not presume its
 outcome.
 
-### 2. Load state is released on every terminal outcome
+### 2. The effective key is `(active_tasks, worker_id)`; byte `in_flight` is not consulted
 
-Completion, failure, and cancellation all release what dispatch acquired. A
-counter that only increments converts an inert balancer into a steadily
-worsening one, which is worse than the current state because it looks like it is
-working.
+`WorkerResourceState` carries two fields with different standing. `active_tasks`
+is a task count with an obvious reservation point. `in_flight` is a **ByteCount**
+with no producer anywhere: the scheduler's own capacity check reads the length of
+its pending-futures collection, which is a task count and unrelated to this field.
 
-### 3. Shuffle-local affinity keeps precedence
+Byte `in_flight` is therefore **dropped from the key** for this cut. A
+permanently-zero term is not forward compatibility — it is a misleading claim
+that byte load is being considered, which is this record's own defect moved one
+position down the tuple.
+
+The field is left untouched, and byte-based load becomes a separate decision once
+a trustworthy estimate exists. Nothing here computes one.
+
+`worker_id` is the final, deterministic tie-break, replacing `HashMap` iteration
+order (§6) and making equal-load selection reproducible across processes.
+
+### 3. Reservation is an owned token, not paired increment and decrement
+
+Selection — or affinity acquisition — reserves under the registry's **write
+lock** and yields an owned reservation. Completion, failure, and cancellation
+consume that same reservation.
+
+**Paired increment/decrement calls are rejected.** A cancel racing a completion
+can decrement twice and underflow the counter, after which a worker looks
+permanently idle and attracts every task — a balancer worse than the inert one it
+replaced, and silent. An owned, exactly-once token makes double release
+unrepresentable rather than merely tested for.
+
+### 4. Load state is released on every terminal outcome
+
+Completion, failure, and cancellation all consume the reservation. A counter that
+only increments converts an inert balancer into a steadily worsening one, which
+is worse than the current state because it looks like it is working.
+
+### 5. Shuffle-local affinity keeps precedence
 
 When `live_input_worker_for_all_shuffle_inputs` yields a worker and that worker
 resolves live, it still wins. Load observation changes only what happens when
 affinity declines — which is precisely the leaf-task case that pins each query
 today.
 
-### 4. No tied placement may be decided by map iteration order
+### 6. No tied placement may be decided by map iteration order
 
 Whatever tie-break exists must be explicit and stable. Iteration order over a
 `HashMap` is neither, and a placement that depends on it is unreproducible across
 processes for reasons unrelated to the workload.
 
-### 5. Measure before claiming an improvement
+### 7. Measure before claiming an improvement
 
 The worker-identity artifact path added in `237fb575` already reports which worker
 ran each task. The locality-versus-parallelism trade-off is measured through it on
@@ -103,6 +132,14 @@ as such rather than treated as a regression to be tuned away.
 
 ## Acceptance
 
+- **Selection and reservation are atomic from the next selector's perspective.**
+  Reserving after dispatch leaves a window in which two selectors observe
+  identical load and recreate the tie. Asserted by selecting twice with no
+  intervening completion.
+- **A reservation cannot be released twice.** The type makes it unrepresentable;
+  the control asserts a cancel racing a completion cannot underflow the counter.
+- **Byte `in_flight` is not consulted.** Asserted as absence: two workers
+  differing only in that field select identically.
 - **Sequential leaf-task selection spreads across equal workers once the first
   assignment is live.** Two live workers, two successive tasks with no shuffle
   inputs: the second must not select the worker already running the first. This
