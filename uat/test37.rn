@@ -4,7 +4,9 @@
 // pre-0115 capture is the unrotated baseline. This version is the rotation
 // acceptance figure: the unequal facet domains make grid-wide reservation and
 // outer-edge containment observable.
-let axis_labels = workspace.table("axis_labels_probe");
+let axis_labels = workspace
+	.table("axis_labels_probe")
+	.sort([asc(col("axis_order"))]);
 
 axis_labels.views([
 	view("long-axis-labels", figure([
