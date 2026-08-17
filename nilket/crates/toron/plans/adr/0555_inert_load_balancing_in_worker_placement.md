@@ -122,6 +122,50 @@ processes for reasons unrelated to the workload.
 
 ### 7. Measure before claiming an improvement
 
+**Placement measured 2026-08-17.** The engine half (`bf5717e0`) was run at SF=8
+from a clean worktree (`bf5717e0604c`, authoritative, no replay violations)
+against the baseline this record was written from (`237fb57518e4`). Both runs
+carry identical plan structure, so the classes below are directly comparable.
+
+Tasks are separated into the two classes the placement path actually
+distinguishes, because a single combined figure would credit this change for
+structure it never touched.
+
+**Fallback-eligible sibling groups** — multi-task stages, where affinity declines
+because a producer stage has more than one task, so `select_and_reserve` decides:
+
+| | baseline | after |
+|---|---:|---:|
+| sibling groups | 224 | 224 |
+| groups that spread across workers | **0 / 224** | **224 / 224** |
+
+**Single-producer affinity links** — a lone consumer following its single
+producer, where §5 requires locality to keep winning:
+
+| | baseline | after |
+|---|---:|---:|
+| chain links | 77 | 77 |
+| co-located | **77 / 77** | **77 / 77** |
+
+The fallback class moves from no spreading to complete spreading; the affinity
+class is untouched at 100% co-location. Had the second number moved, the cut
+would have traded locality for balancing and exceeded this record.
+
+Illustratively, q19's four stage-2 siblings — which have no affinity reason to
+share a worker — split evenly across both workers, where the baseline placed all
+four on one. q06 remains the one cell that never spreads, and that now reads
+correctly: two tasks joined by a single-producer shuffle edge, so it is entirely
+in the affinity class with no fallback-eligible siblings at all.
+
+**This is placement evidence only. No speedup or regression is claimed.** No
+timing figure was read from this run, and ADR 554's attribution values are not a
+valid before/after across this change — `loop_non_path_ms` was *defined* by
+serialized off-path siblings, so it has changed meaning rather than merely value.
+The locality-versus-parallelism measurement this section requires is still owed,
+as a separately paired comparison.
+
+
+
 The worker-identity artifact path added in `237fb575` already reports which worker
 ran each task. The locality-versus-parallelism trade-off is measured through it on
 a matched SF=8 pair before any performance claim.
@@ -155,7 +199,8 @@ as such rather than treated as a regression to be tuned away.
   registry constructions.
 - **The measured effect is reported from the worker-identity artifact**, showing
   distinct workers per query where placement changed, before any speedup is
-  claimed.
+  claimed. **Met** for the fallback class (0/224 → 224/224) with the affinity
+  class held at 77/77; the speedup measurement itself remains owed.
 
 ## Guardrails
 
