@@ -253,7 +253,7 @@ fn draw_text(
 		settings,
 		alignment::Horizontal::Center,
 		alignment::Vertical::Center,
-		settings.legend_size,
+		settings.legend_size.pixels(),
 	);
 }
 
@@ -354,8 +354,9 @@ fn legend_geometry(content: &LegendContent, settings: &ResolvedPlotSettings) -> 
 		let labels = GradientLabels::new(stops);
 		let bar_x = 180.0;
 		let endpoint_x = bar_x + GRADIENT_BAR_WIDTH + 8.0;
-		let width = 250.0_f32
-			.max(endpoint_x + labels.estimated_width(settings.legend_size) + LEGEND_PADDING);
+		let width = 250.0_f32.max(
+			endpoint_x + labels.estimated_width(settings.legend_size.pixels()) + LEGEND_PADDING,
+		);
 		return LegendGeometry {
 			size: Size::new(width, 240.0),
 			kind: LegendGeometryKind::Paired(PairedLegendGeometry {
@@ -389,7 +390,7 @@ fn legend_geometry(content: &LegendContent, settings: &ResolvedPlotSettings) -> 
 		.filter_map(|section| match section {
 			LegendSection::Gradient { stops, .. } => Some(gradient_required_width(
 				&GradientLabels::new(stops),
-				settings.legend_size,
+				settings.legend_size.pixels(),
 			)),
 			_ => None,
 		})
@@ -560,7 +561,7 @@ pub fn render_legend(
 			settings,
 			alignment::Horizontal::Left,
 			alignment::Vertical::Top,
-			settings.legend_size,
+			settings.legend_size.pixels(),
 		);
 		draw_text_at(
 			backend,
@@ -569,7 +570,7 @@ pub fn render_legend(
 			settings,
 			alignment::Horizontal::Left,
 			alignment::Vertical::Bottom,
-			settings.legend_size,
+			settings.legend_size.pixels(),
 		);
 		draw_text_at(
 			backend,
@@ -578,7 +579,7 @@ pub fn render_legend(
 			settings,
 			alignment::Horizontal::Center,
 			alignment::Vertical::Top,
-			16.0,
+			settings.legend_size.pixels(),
 		);
 		let size_x = x + pair.size_x;
 		draw_text_at(
@@ -588,7 +589,7 @@ pub fn render_legend(
 			settings,
 			alignment::Horizontal::Center,
 			alignment::Vertical::Top,
-			16.0,
+			settings.legend_size.pixels(),
 		);
 		for i in 0..3 {
 			let t = i as f32 / 2.0;
@@ -616,7 +617,7 @@ pub fn render_legend(
 				settings,
 				alignment::Horizontal::Left,
 				alignment::Vertical::Center,
-				settings.legend_size,
+				settings.legend_size.pixels(),
 			);
 		}
 		return;
@@ -685,7 +686,7 @@ pub fn render_legend(
 						content: entry.label.clone(),
 						position: Point::new(item_x + text_offset, item_y + 12.5),
 						color: settings.chrome.legend_text.iced(),
-						size: iced::Pixels(settings.legend_size),
+						size: iced::Pixels(settings.legend_size.pixels()),
 						align_x: alignment::Horizontal::Left.into(),
 						align_y: alignment::Vertical::Center,
 						..Default::default()
@@ -731,7 +732,7 @@ pub fn render_legend(
 					settings,
 					alignment::Horizontal::Left,
 					alignment::Vertical::Top,
-					settings.legend_size,
+					settings.legend_size.pixels(),
 				);
 				draw_text_at(
 					backend,
@@ -740,7 +741,7 @@ pub fn render_legend(
 					settings,
 					alignment::Horizontal::Left,
 					alignment::Vertical::Bottom,
-					settings.legend_size,
+					settings.legend_size.pixels(),
 				);
 				if section_count > 1 || label != "Value" {
 					draw_text_at(
@@ -750,7 +751,7 @@ pub fn render_legend(
 						settings,
 						alignment::Horizontal::Center,
 						alignment::Vertical::Top,
-						settings.legend_size,
+						settings.legend_size.pixels(),
 					);
 				}
 			}
@@ -1229,7 +1230,9 @@ mod tests {
 				let gradient = &pair.gradient;
 				assert!(
 					gradient.endpoint_x
-						+ gradient.labels.estimated_width(settings.legend_size)
+						+ gradient
+							.labels
+							.estimated_width(settings.legend_size.pixels())
 						+ LEGEND_PADDING <= geometry.size.width
 				);
 			}
@@ -1237,7 +1240,9 @@ mod tests {
 				for gradient in gradients.iter().flatten() {
 					assert!(
 						gradient.endpoint_x
-							+ gradient.labels.estimated_width(settings.legend_size)
+							+ gradient
+								.labels
+								.estimated_width(settings.legend_size.pixels())
 							+ LEGEND_PADDING <= geometry.size.width
 					);
 				}
@@ -1314,12 +1319,12 @@ mod tests {
 	fn product_0093_estimator_honours_legend_size_and_the_declared_advance() {
 		let (ordinary, paired) = gradient_contents((5.0, 123_456.0));
 		let small = ResolvedPlotSettings {
-			legend_size: 7.0,
+			legend_size: crate::plot::spec::LegendTextSize::new(7.0).unwrap(),
 			..ResolvedPlotSettings::default()
 		};
 		let normal = ResolvedPlotSettings::default();
 		let large = ResolvedPlotSettings {
-			legend_size: 28.0,
+			legend_size: crate::plot::spec::LegendTextSize::new(28.0).unwrap(),
 			..ResolvedPlotSettings::default()
 		};
 		for content in [&ordinary, &paired] {

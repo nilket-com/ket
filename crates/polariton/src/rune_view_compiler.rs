@@ -35,10 +35,9 @@ const PRESENTATION_FREE: &[&str] = &[
 	"violin",
 	"histogram",
 	"heatmap",
-	"hide_legend",
 	"hover_size",
+	"legend",
 	"layers",
-	"legend_at",
 	"line",
 	"palette",
 	"padding",
@@ -61,6 +60,8 @@ const PRESENTATION_METHODS: &[&str] = &[
 	"diverging_at",
 	"duotone",
 	"font_size",
+	"at",
+	"hide",
 	"gutter",
 	"percent",
 	"point_size",
@@ -1744,8 +1745,8 @@ mod tests {
 	use crate::plot::colors::ColorTheme;
 	use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 	use crate::plot::spec::ColorJob;
-	use crate::plot::spec::FacetLabelTextSize;
 	use crate::plot::spec::{BubbleNumericField, BubblePreparationChannel, Override, Presence};
+	use crate::plot::spec::{FacetLabelTextSize, LegendTextSize};
 	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent};
 	use std::sync::Arc;
 
@@ -3227,7 +3228,7 @@ fn furniture() { [
 	twice(title("Title")), twice(subtitle("Subtitle")),
 	twice(x_axis().label("Horizontal")), twice(y_axis().label("Vertical")), twice(facet("region")),
 	twice(palette("viridis")), twice(skin("nord").duotone()),
-	twice(legend_at(0.2, 0.8)), twice(x_axis().bounds(0, 10)), twice(y_axis().bounds(0, 20)),
+	twice(legend().at(0.2, 0.8)), twice(x_axis().bounds(0, 10)), twice(y_axis().bounds(0, 20)),
 	twice(x_axis().tick_step(2)), twice(y_axis().tick_step(4)),
 	twice(x_axis().minor_ticks(2)), twice(y_axis().minor_ticks(3)),
 	twice(bar("region", "revenue", "product")
@@ -3250,7 +3251,7 @@ r.views([
 	figure([
 		title("Title"), subtitle("Subtitle"), x_axis().label("Horizontal"), y_axis().label("Vertical"),
 		facet("region"), palette("viridis"),
-		skin("nord").duotone(), legend_at(0.2, 0.8), x_axis().bounds(0, 10), y_axis().bounds(0, 20),
+		skin("nord").duotone(), legend().at(0.2, 0.8), x_axis().bounds(0, 10), y_axis().bounds(0, 20),
 		x_axis().tick_step(2), y_axis().tick_step(4), x_axis().minor_ticks(2), y_axis().minor_ticks(3),
 		bar("region", "revenue", "product").bar_width(0.8).category_gap(0.1).stacked().percent(),
 	]),
@@ -3656,5 +3657,25 @@ r.views([bar(category(), "revenue")])
 			plot.authored_settings.facet_label_size,
 			Override::Set(FacetLabelTextSize::new(24.0).unwrap())
 		);
+	}
+
+	#[test]
+	fn product_0125_test40_is_the_legend_member_reference_exhibit() {
+		let source = include_str!("../../../uat/test40.rn");
+		let compiled = compile(source).expect("the checked-in legend exhibit compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(compiled.executions[0].views.len(), 2);
+		assert!(source.contains("legend().at(0.62, 0.08).font_size(18)"));
+		assert!(source.contains("legend().at(0.62, 0.08),\n\t\tlegend().font_size(18)"));
+		for view in &compiled.executions[0].views {
+			let RuneViewIntent::Plot(plot) = &view.intent else {
+				panic!("legend exhibit produced a table");
+			};
+			assert!(matches!(plot.authored_settings.legend, Presence::Show(_)));
+			assert_eq!(
+				plot.authored_settings.legend_size,
+				Override::Set(LegendTextSize::new(18.0).unwrap())
+			);
+		}
 	}
 }

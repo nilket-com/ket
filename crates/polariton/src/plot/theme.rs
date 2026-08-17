@@ -12,9 +12,9 @@ use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::spec::{
 	BarWidth, CategoryGap, ColorJob, FacetLabelTextSize, HoverTextSize, LayerSettings,
-	LegendPosition, Override, PlotPaddingPixels, PointSize, Presence, ResolvedPresence,
-	StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, XLabelTextSize, XTickTextSize,
-	YLabelTextSize, YTickTextSize,
+	LegendPosition, LegendTextSize, Override, PlotPaddingPixels, PointSize, Presence,
+	ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, XLabelTextSize,
+	XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use iced::Color;
 use libaryon::engine::UiPalette;
@@ -110,7 +110,7 @@ pub struct PlotTypography {
 	pub x_tick_size: XTickTextSize,
 	pub y_tick_size: YTickTextSize,
 	pub facet_label_size: FacetLabelTextSize,
-	pub legend_size: f32,
+	pub legend_size: LegendTextSize,
 	pub hover_size: HoverTextSize,
 	pub x_tick_rotation: TickRotation,
 }
@@ -220,6 +220,9 @@ pub struct PlotSettingsLayer {
 	/// PRODUCT-0124: the facet-owned header size is partial so it never
 	/// reconstructs the complete typography carrier.
 	pub facet_label_size: Override<FacetLabelTextSize>,
+	/// PRODUCT-0125: the legend-owned text size is partial so it never
+	/// reconstructs the complete typography carrier.
+	pub legend_size: Override<LegendTextSize>,
 	/// PRODUCT-0112: a partial hover-size override avoids reconstructing the
 	/// whole typography carrier merely to size generated hover text.
 	pub hover_size: Override<HoverTextSize>,
@@ -279,6 +282,7 @@ impl Default for PlotSettingsLayer {
 			x_tick_size: Override::Inherit,
 			y_tick_size: Override::Inherit,
 			facet_label_size: Override::Inherit,
+			legend_size: Override::Inherit,
 			hover_size: Override::Inherit,
 			x_tick_rotation: Override::Inherit,
 			plot_padding_top: Override::Inherit,
@@ -442,6 +446,9 @@ fn apply_layer(
 	if let Override::Set(value) = layer.facet_label_size {
 		settings.facet_label_size = value;
 	}
+	if let Override::Set(value) = layer.legend_size {
+		settings.legend_size = value;
+	}
 	// PRODUCT-0112: the specific slot wins over the atomic typography carrier
 	// within a tier, just as PRODUCT-0091's partial continuous-ramp slots do.
 	if let Override::Set(value) = layer.hover_size {
@@ -585,7 +592,7 @@ mod tests {
 			x_tick_size: XTickTextSize::DEFAULT,
 			y_tick_size: YTickTextSize::DEFAULT,
 			facet_label_size: FacetLabelTextSize::DEFAULT,
-			legend_size: 14.0,
+			legend_size: LegendTextSize::DEFAULT,
 			hover_size,
 			x_tick_rotation: TickRotation::ZERO,
 		}
@@ -658,6 +665,40 @@ mod tests {
 		);
 		cascade.authored_spec.facet_label_size = Override::Inherit;
 		assert_eq!(cascade.resolve().facet_label_size, size(24.0));
+	}
+
+	#[test]
+	fn product_0125_legend_size_is_typed_partial_and_follows_all_five_tiers() {
+		let size = |pixels| LegendTextSize::new(pixels).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.legend_size = size(6.0);
+		cascade.application_theme.legend_size = Override::Set(size(12.0));
+		cascade.authored_spec.legend_size = Override::Set(size(20.0));
+		cascade.layer.legend_size = Override::Set(size(32.0));
+		cascade.pane_override.legend_size = Override::Set(size(48.0));
+		assert_eq!(cascade.resolve().legend_size, size(48.0));
+
+		cascade.pane_override.legend_size = Override::Inherit;
+		assert_eq!(cascade.resolve().legend_size, size(32.0));
+		cascade.layer.legend_size = Override::Inherit;
+		assert_eq!(cascade.resolve().legend_size, size(20.0));
+		cascade.authored_spec.legend_size = Override::Inherit;
+		assert_eq!(cascade.resolve().legend_size, size(12.0));
+		cascade.application_theme.legend_size = Override::Inherit;
+		assert_eq!(cascade.resolve().legend_size, size(6.0));
+
+		cascade.authored_spec.typography = Override::Set(PlotTypography {
+			legend_size: size(24.0),
+			..typography(HoverTextSize::DEFAULT)
+		});
+		cascade.authored_spec.legend_size = Override::Set(size(36.0));
+		assert_eq!(
+			cascade.resolve().legend_size,
+			size(36.0),
+			"the partial legend slot wins over atomic typography within one tier"
+		);
+		cascade.authored_spec.legend_size = Override::Inherit;
+		assert_eq!(cascade.resolve().legend_size, size(24.0));
 	}
 
 	#[test]

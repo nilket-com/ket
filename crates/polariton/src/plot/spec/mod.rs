@@ -440,6 +440,12 @@ axis_text_size!(
 	"facet label size",
 	16.0
 );
+axis_text_size!(
+	LegendTextSize,
+	LegendTextSizeError,
+	"legend text size",
+	14.0
+);
 
 /// PRODUCT-0019's unitless, linear line-stroke factor. Keep this distinct from
 /// `PointSize` until a third relative setting establishes a shared abstraction.

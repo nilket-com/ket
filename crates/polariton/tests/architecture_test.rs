@@ -4321,10 +4321,6 @@ fn product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_block
 			"each exposed role keeps its own partial slot: {slot}"
 		);
 	}
-	assert!(
-		theme.contains("pub legend_size: f32"),
-		"legend remains the unsplit raw field"
-	);
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
 	assert!(common.contains("settings.title_size.pixels()"));
@@ -4332,7 +4328,6 @@ fn product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_block
 	assert!(common.contains("top_px.y - self.settings.x_label_size.pixels()"));
 	assert!(common.contains("size: iced::Pixels(self.settings.x_label_size.pixels())"));
 	assert!(!common.contains("size: iced::Pixels(22.0)"));
-	assert!(common.contains("pub legend_size: f32"));
 	assert!(!common.contains("(settings.legend_size + 2.0).max(10.0)"));
 	let backend = common
 		.split("pub trait PlotBackend")
@@ -4393,7 +4388,7 @@ fn product_0124_facet_label_typography_is_typed_member_owned_and_independent_fro
 	assert!(theme.contains("pub facet_label_size: Override<FacetLabelTextSize>"));
 	assert!(theme.contains("settings.facet_label_size = value.facet_label_size"));
 	assert!(theme.contains("settings.facet_label_size = value;"));
-	assert!(theme.contains("pub legend_size: f32"));
+	assert!(theme.contains("pub legend_size: LegendTextSize"));
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot geometry");
 	assert!(common.contains("pub facet_label_size: FacetLabelTextSize"));
@@ -4430,6 +4425,62 @@ fn product_0124_facet_label_typography_is_typed_member_owned_and_independent_fro
 		.and_then(|rest| rest.split("];\\n").next())
 		.expect("presentation method vocabulary");
 	assert!(methods.contains("\"label_size\""));
+}
+
+#[test]
+fn product_0125_legend_member_owns_typed_legend_text_without_measurement() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	assert!(spec.contains("LegendTextSize"));
+	assert!(spec.contains("\"legend text size\""));
+
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
+	assert!(theme.contains("pub legend_size: LegendTextSize"));
+	assert!(theme.contains("pub legend_size: Override<LegendTextSize>"));
+	assert!(theme.contains("settings.legend_size = value.legend_size"));
+	assert!(theme.contains("settings.legend_size = value;"));
+	assert!(theme.contains("pub facet_label_size: FacetLabelTextSize"));
+
+	let legend =
+		std::fs::read_to_string(root.join("plot/legend.rs")).expect("read legend renderer");
+	assert!(legend.contains("settings.legend_size.pixels()"));
+	assert!(!legend.contains("iced::Pixels(16.0)"));
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let backend = common
+		.split("pub trait PlotBackend")
+		.nth(1)
+		.and_then(|rest| rest.split("pub trait PlotKernel").next())
+		.expect("bounded plot backend contract");
+	assert!(!backend.contains("text_extent"));
+
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
+	let free = compiler
+		.split("const PRESENTATION_FREE")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation free vocabulary");
+	assert!(free.contains("\"legend\""));
+	for retired in ["legend_at", "hide_legend"] {
+		assert!(!free.contains(&format!("\"{retired}\"")));
+	}
+	let methods = compiler
+		.split("const PRESENTATION_METHODS")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation method vocabulary");
+	for method in ["at", "hide", "font_size"] {
+		assert!(methods.contains(&format!("\"{method}\"")));
+	}
+
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read Rune surface");
+	assert!(presentation.contains("fn raw_legend("));
+	assert!(presentation.contains("fn raw_legend_at("));
+	assert!(presentation.contains("fn raw_legend_hide("));
+	assert!(presentation.contains("legend() requires .at(...), .hide(), or .font_size(...)"));
+	assert!(presentation.contains("authored_settings.legend_size = Override::Set(size);"));
+	assert!(!presentation.contains("fn raw_hide_legend("));
 }
 
 #[test]

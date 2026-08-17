@@ -1761,12 +1761,12 @@ workspace.table("t").views([table()])
 	}
 
 	#[test]
-	fn product_0050_legend_presence_lowers_static_bindings_and_unbounded_fractions() {
+	fn product_0125_legend_member_preserves_presence_and_composes_with_size() {
 		let source = r#"
 let legend_x = 1.5;
 let legend_y = -0.5;
 workspace.table("t").views([figure([
-	legend_at(legend_x, legend_y),
+	legend().at(legend_x, legend_y).font_size(24),
 	line("x", "y"),
 ])])
 "#;
@@ -1775,12 +1775,16 @@ workspace.table("t").views([figure([
 			panic!("expected plot");
 		};
 		let Presence::Show(position) = plot.authored_settings.legend else {
-			panic!("legend_at must lower to Show");
+			panic!("legend().at must lower to Show");
 		};
 		assert_eq!((position.x(), position.y()), (1.5, -0.5));
+		assert_eq!(
+			plot.authored_settings.legend_size,
+			Override::Set(crate::plot::spec::LegendTextSize::new(24.0).unwrap())
+		);
 
 		let hidden = transform(
-			"workspace.table(\"t\").views([figure([hide_legend(), line(\"x\", \"y\")])])",
+			"workspace.table(\"t\").views([figure([legend().hide(), line(\"x\", \"y\")])])",
 		)
 		.expect("hidden legend");
 		let RuneViewIntent::Plot(hidden) = &hidden.views[0].intent else {
@@ -1790,23 +1794,27 @@ workspace.table("t").views([figure([
 	}
 
 	#[test]
-	fn product_0050_legend_members_refuse_ambiguity_and_undefined_values_at_source() {
+	fn product_0125_legend_members_refuse_ambiguity_and_undefined_values_at_source() {
 		for (source, rejected) in [
 			(
-				"workspace.table(\"t\").views([figure([legend_at(0.1, 0.2), hide_legend(), line(\"x\", \"y\")])])",
-				"hide_legend()",
+				"workspace.table(\"t\").views([figure([legend().at(0.1, 0.2), legend().hide(), line(\"x\", \"y\")])])",
+				".hide()",
 			),
 			(
-				"workspace.table(\"t\").views([figure([hide_legend(), legend_at(0.1, 0.2), line(\"x\", \"y\")])])",
-				"legend_at(0.1, 0.2)",
+				"workspace.table(\"t\").views([figure([legend().hide(), legend().at(0.1, 0.2), line(\"x\", \"y\")])])",
+				".at(0.1, 0.2)",
 			),
 			(
-				"workspace.table(\"t\").views([figure([legend_at(0.1, 0.2), legend_at(0.3, 0.4), line(\"x\", \"y\")])])",
-				"legend_at(0.3, 0.4)",
+				"workspace.table(\"t\").views([figure([legend().at(0.1, 0.2), legend().at(0.3, 0.4), line(\"x\", \"y\")])])",
+				".at(0.3, 0.4)",
 			),
 			(
-				"workspace.table(\"t\").views([figure([hide_legend(), hide_legend(), line(\"x\", \"y\")])])",
-				"hide_legend()",
+				"workspace.table(\"t\").views([figure([legend().hide(), legend().hide(), line(\"x\", \"y\")])])",
+				".hide()",
+			),
+			(
+				"workspace.table(\"t\").views([figure([legend().font_size(12), legend().font_size(18), line(\"x\", \"y\")])])",
+				".font_size(18)",
 			),
 		] {
 			let RuneEnvelopeError::InvalidView { span, message } =
@@ -1815,14 +1823,16 @@ workspace.table("t").views([figure([
 				panic!("expected attributed legend refusal");
 			};
 			assert_eq!(&source[span.start as usize..span.end as usize], rejected);
-			assert!(message.contains("at most one legend placement or visibility"));
+			assert!(message.contains("may appear at most once"));
 		}
 
 		for (member, expected) in [
-			("hide_legend(1)", "takes no arguments"),
-			("legend_at(0.5)", "requires exactly two numeric values"),
-			("legend_at(1e999, 0.5)", "requires finite positions"),
-			("legend_at(value, 0.5)", "No local variable"),
+			("legend()", "requires .at(...), .hide(), or .font_size(...)"),
+			("legend().hide(1)", "takes no arguments"),
+			("legend().at(0.5)", "requires exactly two numeric values"),
+			("legend().at(1e999, 0.5)", "requires finite positions"),
+			("legend().at(value, 0.5)", "No local variable"),
+			("title(\"T\").at(0.5, 0.2)", "requires a legend() receiver"),
 		] {
 			let source =
 				format!("workspace.table(\"t\").views([figure([{member}, line(\"x\", \"y\")])])");
@@ -1836,11 +1846,11 @@ workspace.table("t").views([figure([
 	}
 
 	#[test]
-	fn product_0050_legend_spellings_are_ordinary_rune_outside_a_figure_member() {
+	fn product_0125_legend_member_is_ordinary_rune_outside_a_figure_member() {
 		let source = r#"
-legend_at(0.98, 0.02);
-let hidden = hide_legend();
-consume(legend_at(1.5, -0.5));
+legend().at(0.98, 0.02);
+let hidden = legend().hide();
+consume(legend().at(1.5, -0.5));
 workspace.table("t").views([table()])
 "#;
 		let error = transform(source).expect_err("presentation calls cannot leak through consume");

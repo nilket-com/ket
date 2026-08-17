@@ -6,9 +6,9 @@ use crate::plot::colors::ColorTheme;
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
-	BarWidth, CategoryGap, FacetLabelTextSize, HoverTextSize, LegendPosition, PlotPaddingPixels,
-	PointSize, ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize,
-	XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
+	BarWidth, CategoryGap, FacetLabelTextSize, HoverTextSize, LegendPosition, LegendTextSize,
+	PlotPaddingPixels, PointSize, ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation,
+	TitleTextSize, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
 use crate::plot::theme::PlotSettings;
@@ -640,7 +640,7 @@ pub struct ResolvedPlotSettings {
 	pub x_tick_size: XTickTextSize,
 	pub y_tick_size: YTickTextSize,
 	pub facet_label_size: FacetLabelTextSize,
-	pub legend_size: f32,
+	pub legend_size: LegendTextSize,
 	pub hover_size: HoverTextSize,
 	pub x_tick_placement: TickPlacement,
 	pub y_tick_placement: TickPlacement,
@@ -736,7 +736,7 @@ impl Default for ResolvedPlotSettings {
 			x_tick_size: XTickTextSize::DEFAULT,
 			y_tick_size: YTickTextSize::DEFAULT,
 			facet_label_size: FacetLabelTextSize::DEFAULT,
-			legend_size: 14.0,
+			legend_size: LegendTextSize::DEFAULT,
 			hover_size: HoverTextSize::DEFAULT,
 			x_tick_placement: TickPlacement::DEFAULT,
 			y_tick_placement: TickPlacement::DEFAULT,

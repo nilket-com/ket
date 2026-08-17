@@ -36,6 +36,16 @@ cargo run -p polariton -- uat/test39.rn
 `test39.rn` is the compact member-ownership reference: `facet("region")`
 owns both its inter-cell gutter and its category-header `label_size`.
 
+Open the PRODUCT-0125 legend-member exhibit after seeding the same sales
+relation:
+
+```sh
+cargo run -p polariton -- uat/test40.rn
+```
+
+`test40.rn` shows both legal legend forms: one chained `legend()` member and
+separate members whose placement and typography compose.
+
 Open the PRODUCT-0079 histogram exhibit after seeding the same sales relation:
 
 ```sh

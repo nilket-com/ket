@@ -1,0 +1,20 @@
+// PRODUCT-0125: legend-owned placement, visibility, and typography.
+let sales = ket.table("demo_sales");
+
+sales.views([
+	view("legend-member-chained", figure([
+		title("Legend member · chained"),
+		subtitle("One member owns overlay placement and its one text-size role"),
+		skin("greys_rs2"),
+		legend().at(0.62, 0.08).font_size(18),
+		bar("quarter", "revenue", "product").bar_width(0.9),
+	])),
+	view("legend-member-composed", figure([
+		title("Legend member · separate composition"),
+		subtitle("Disjoint legend members compose without creating a second authority"),
+		skin("greys_rs2"),
+		legend().at(0.62, 0.08),
+		legend().font_size(18),
+		bar("quarter", "revenue", "product").bar_width(0.9),
+	])),
+]);

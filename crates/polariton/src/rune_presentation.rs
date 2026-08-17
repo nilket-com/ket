@@ -13,9 +13,9 @@ use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FacetLabelTextSize,
 	FunnelFields, HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
-	MultivariateFields, Override, PieFields, PlotPaddingPixels, PointSize, Presence,
-	RadialDialFields, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, ViolinFields,
-	XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
+	LegendTextSize, MultivariateFields, Override, PieFields, PlotPaddingPixels, PointSize,
+	Presence, RadialDialFields, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize,
+	ViolinFields, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -178,7 +178,7 @@ enum FigureElementKind {
 	Palette(String),
 	SequentialPalette(ColorTheme),
 	DivergingPalette(ColorTheme),
-	Legend(Presence<LegendPosition>),
+	Legend,
 	HoverSize(HoverTextSize),
 	Padding,
 }
@@ -282,6 +282,7 @@ impl PaddingEdge {
 enum FigureTextSize {
 	Title(TitleTextSize),
 	Subtitle(SubtitleTextSize),
+	Legend(LegendTextSize),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -301,6 +302,8 @@ struct RuneFigureElement {
 	facet_gutter_origin: Option<Origin>,
 	facet_label_size: Option<FacetLabelTextSize>,
 	facet_label_size_origin: Option<Origin>,
+	legend_presence: Option<Presence<LegendPosition>>,
+	legend_presence_origin: Option<Origin>,
 	padding: FigurePadding,
 	padding_edge_origins: [Option<Origin>; 4],
 	axis: AxisProperties,
@@ -317,6 +320,8 @@ impl RuneFigureElement {
 			facet_gutter_origin: None,
 			facet_label_size: None,
 			facet_label_size_origin: None,
+			legend_presence: None,
+			legend_presence_origin: None,
 			padding: FigurePadding::default(),
 			padding_edge_origins: [None; 4],
 			axis: AxisProperties::default(),
@@ -550,8 +555,7 @@ fn build_context() -> Result<Context, String> {
 		),
 		("__diverging_palette", raw_diverging_palette as RawFunction),
 		("__skin", raw_skin as RawFunction),
-		("__legend_at", raw_legend_at as RawFunction),
-		("__hide_legend", raw_hide_legend as RawFunction),
+		("__legend", raw_legend as RawFunction),
 		("__hover_size", raw_hover_size as RawFunction),
 		("__padding", raw_padding as RawFunction),
 		("__table", raw_table as RawFunction),
@@ -584,6 +588,8 @@ fn build_context() -> Result<Context, String> {
 		("__minor_ticks", raw_axis_minor_ticks as RawFunction),
 		("__tick_size", raw_axis_tick_size as RawFunction),
 		("__tick_rotation", raw_axis_tick_rotation as RawFunction),
+		("__at", raw_legend_at as RawFunction),
+		("__hide", raw_legend_hide as RawFunction),
 	] {
 		module
 			.raw_function(name, function)
@@ -1767,9 +1773,51 @@ fn raw_skin(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output)
 	)
 }
 
-#[derive(Clone, Copy)]
-enum NumericPairConstructor {
-	Legend,
+fn raw_legend(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let value = if values.len() == 2 {
+		Ok(FigureElementKind::Legend)
+	} else {
+		Err(PresentationFailure::new(
+			origin,
+			"legend() takes no arguments",
+		))
+	};
+	store(out, stack, RuneFigureElement::new(value, origin))
+}
+
+fn legend_receiver(
+	values: &[Value],
+	origin: Origin,
+	modifier: &str,
+) -> Result<RuneFigureElement, RuneFigureElement> {
+	let mut element = match values
+		.first()
+		.cloned()
+		.map(rune::from_value::<RuneFigureElement>)
+	{
+		Some(Ok(element)) => element,
+		_ => RuneFigureElement::new(
+			Err(PresentationFailure::new(
+				origin,
+				format!("{modifier}(...) requires a legend() receiver"),
+			)),
+			origin,
+		),
+	};
+	if element.value.is_err() {
+		return Err(element);
+	}
+	if !matches!(element.value.as_ref(), Ok(FigureElementKind::Legend)) {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{modifier}(...) requires a legend() receiver"),
+		));
+		Err(element)
+	} else {
+		Ok(element)
+	}
 }
 
 fn raw_legend_at(
@@ -1778,48 +1826,41 @@ fn raw_legend_at(
 	args: usize,
 	out: Output,
 ) -> VmResult<()> {
-	raw_numeric_pair(
-		NumericPairConstructor::Legend,
-		"legend_at",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_numeric_pair(
-	kind: NumericPairConstructor,
-	name: &'static str,
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
 	let values = rune::vm_try!(stack.slice_at(addr, args));
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
-	let element = if values.len() != 4 {
-		RuneFigureElement::new(
-			Err(PresentationFailure::new(
-				origin,
-				format!("{name}(...) requires exactly two numeric values"),
-			)),
-			origin,
-		)
-	} else {
-		match kind {
-			NumericPairConstructor::Legend => presentation_legend_at(
-				values[0].clone(),
-				values[1].clone(),
-				origin.start.into(),
-				origin.end.into(),
-			),
-		}
+	let mut element = match legend_receiver(values, origin, "at") {
+		Ok(element) => element,
+		Err(element) => return store(out, stack, element),
 	};
+	if values.len() != 5 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"at(...) requires exactly two numeric values",
+		));
+	} else if element.legend_presence_origin.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"legend().at(...) or .hide() may appear at most once",
+		));
+	} else {
+		let position = rune_number(&values[1])
+			.zip(rune_number(&values[2]))
+			.and_then(|(x, y)| LegendPosition::new(x, y))
+			.ok_or_else(|| {
+				PresentationFailure::new(origin, "at(...) requires finite positions".to_owned())
+			});
+		match position {
+			Ok(position) => {
+				element.legend_presence = Some(Presence::Show(position));
+				element.legend_presence_origin = Some(origin);
+			}
+			Err(error) => element.value = Err(error),
+		}
+	}
 	store(out, stack, element)
 }
 
-fn raw_hide_legend(
+fn raw_legend_hide(
 	stack: &mut dyn Memory,
 	addr: InstAddress,
 	args: usize,
@@ -1827,17 +1868,24 @@ fn raw_hide_legend(
 ) -> VmResult<()> {
 	let values = rune::vm_try!(stack.slice_at(addr, args));
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
-	let element = if values.len() == 2 {
-		presentation_hide_legend(origin.start.into(), origin.end.into())
-	} else {
-		RuneFigureElement::new(
-			Err(PresentationFailure::new(
-				origin,
-				"hide_legend() takes no arguments",
-			)),
-			origin,
-		)
+	let mut element = match legend_receiver(values, origin, "hide") {
+		Ok(element) => element,
+		Err(element) => return store(out, stack, element),
 	};
+	if values.len() != 3 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"hide() takes no arguments",
+		));
+	} else if element.legend_presence_origin.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"legend().at(...) or .hide() may appear at most once",
+		));
+	} else {
+		element.legend_presence = Some(Presence::Hide);
+		element.legend_presence_origin = Some(origin);
+	}
 	store(out, stack, element)
 }
 
@@ -2605,40 +2653,6 @@ fn store<T: rune::ToValue>(out: Output, stack: &mut dyn Memory, value: T) -> VmR
 	VmResult::Ok(())
 }
 
-fn presentation_legend_at(x: Value, y: Value, start: i64, end: i64) -> RuneFigureElement {
-	numeric_pair_element(x, y, start, end, "legend_at", |x, y| {
-		LegendPosition::new(x, y)
-			.map(|position| FigureElementKind::Legend(Presence::Show(position)))
-			.ok_or_else(|| "legend_at(...) requires finite positions".to_owned())
-	})
-}
-
-fn presentation_hide_legend(start: i64, end: i64) -> RuneFigureElement {
-	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
-	RuneFigureElement::new(Ok(FigureElementKind::Legend(Presence::Hide)), origin)
-}
-
-fn numeric_pair_element(
-	first: Value,
-	second: Value,
-	start: i64,
-	end: i64,
-	name: &'static str,
-	make: impl FnOnce(f64, f64) -> Result<FigureElementKind, String>,
-) -> RuneFigureElement {
-	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
-	let value = (|| {
-		let first = rune_number(&first).ok_or_else(|| {
-			PresentationFailure::new(origin, format!("{name}(...) requires numeric values"))
-		})?;
-		let second = rune_number(&second).ok_or_else(|| {
-			PresentationFailure::new(origin, format!("{name}(...) requires numeric values"))
-		})?;
-		make(first, second).map_err(|message| PresentationFailure::new(origin, message))
-	})();
-	RuneFigureElement::new(value, origin)
-}
-
 fn presentation_hover_size(value: Value, start: i64, end: i64) -> RuneFigureElement {
 	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
 	let value = rune_number(&value)
@@ -3340,7 +3354,10 @@ fn raw_figure_font_size(
 		| FigureElementKind::TextHandle(TextHandleKind::Subtitle) => SubtitleTextSize::new(points as f32)
 			.map(FigureTextSize::Subtitle)
 			.map_err(|error| error.to_string()),
-		_ => Err("font_size(...) is available on title and subtitle members".to_owned()),
+		FigureElementKind::Legend => LegendTextSize::new(points as f32)
+			.map(FigureTextSize::Legend)
+			.map_err(|error| error.to_string()),
+		_ => Err("font_size(...) is available on title, subtitle, and legend members".to_owned()),
 	};
 	match text_size {
 		Ok(text_size) => element.font_size = Some(text_size),
@@ -3525,6 +3542,7 @@ struct FigureParts {
 	continuous_intent: Option<ContinuousScaleIntent>,
 	continuous_intent_origin: Option<Origin>,
 	legend: Option<(Presence<LegendPosition>, Origin)>,
+	legend_size: Option<(LegendTextSize, Origin)>,
 	skin: Option<(PlotSkinSelection, Origin)>,
 	x_bounds: Option<(f64, f64, Origin)>,
 	y_bounds: Option<(f64, f64, Origin)>,
@@ -3552,6 +3570,9 @@ fn decode_figure(value: &Value, origin: Origin) -> Result<RunePlotIntent, Presen
 				&mut parts,
 				kind,
 				element.font_size,
+				element.font_size_origin,
+				element.legend_presence.clone(),
+				element.legend_presence_origin,
 				element.facet_gutter,
 				element.facet_label_size,
 				element.padding,
@@ -3646,6 +3667,9 @@ fn merge_element(
 	parts: &mut FigureParts,
 	element: FigureElementKind,
 	font_size: Option<FigureTextSize>,
+	font_size_origin: Option<Origin>,
+	legend_presence: Option<Presence<LegendPosition>>,
+	legend_presence_origin: Option<Origin>,
 	facet_gutter: Option<f32>,
 	facet_label_size: Option<FacetLabelTextSize>,
 	padding: FigurePadding,
@@ -3756,12 +3780,36 @@ fn merge_element(
 			origin,
 			"a figure has at most one diverging_palette",
 		),
-		FigureElementKind::Legend(value) => set_once(
-			&mut parts.legend,
-			(value, origin),
-			origin,
-			"a figure has at most one legend placement or visibility element",
-		),
+		FigureElementKind::Legend => {
+			if legend_presence.is_none() && font_size.is_none() {
+				return Err(PresentationFailure::new(
+					origin,
+					"legend() requires .at(...), .hide(), or .font_size(...)",
+				));
+			}
+			if let Some(value) = legend_presence {
+				let property_origin = legend_presence_origin.unwrap_or(origin);
+				set_once(
+					&mut parts.legend,
+					(value, property_origin),
+					property_origin,
+					"legend().at(...) or .hide() may appear at most once in a figure",
+				)?;
+			}
+			if let Some(size) = font_size {
+				let property_origin = font_size_origin.unwrap_or(origin);
+				let FigureTextSize::Legend(size) = size else {
+					unreachable!("legend size matches legend")
+				};
+				set_once(
+					&mut parts.legend_size,
+					(size, property_origin),
+					property_origin,
+					"legend().font_size(...) may appear at most once in a figure",
+				)?;
+			}
+			Ok(())
+		}
 		FigureElementKind::HoverSize(value) => set_once(
 			&mut parts.hover_size,
 			(value, origin),
@@ -3953,6 +4001,9 @@ impl FigureParts {
 		}
 		if let Some((legend, _)) = self.legend {
 			authored_settings.legend = legend;
+		}
+		if let Some((size, _)) = self.legend_size {
+			authored_settings.legend_size = Override::Set(size);
 		}
 		if let Some((hover_size, _)) = self.hover_size {
 			authored_settings.hover_size = Override::Set(hover_size);
