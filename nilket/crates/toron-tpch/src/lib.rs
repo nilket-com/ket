@@ -7890,6 +7890,146 @@ impl PlacementArm {
 	}
 }
 
+impl PlacementArm {
+	pub fn other(self) -> Self {
+		match self {
+			Self::AffinityOnly => Self::LoadObserving,
+			Self::LoadObserving => Self::AffinityOnly,
+		}
+	}
+}
+
+/// Which arm leads a given pair.
+///
+/// Alternating by pair index gives every cell the 4/3 split §7 seals. Which
+/// policy receives the extra leading slot is derived from the query, so the
+/// residual bias is spread across the cohort rather than always favouring one
+/// policy — mirroring `timing_atlas_pair_order`'s starting-arm rule.
+pub fn placement_pair_order(query: &str, pair_index: usize) -> (PlacementArm, PlacementArm) {
+	let start = if query.bytes().map(u64::from).sum::<u64>() % 2 == 0 {
+		PlacementArm::AffinityOnly
+	} else {
+		PlacementArm::LoadObserving
+	};
+	let first = if pair_index % 2 == 0 {
+		start
+	} else {
+		start.other()
+	};
+	(first, first.other())
+}
+
+/// One arm's measured attempt, retained raw so the artifact stays auditable even
+/// when the seal withholds its verdicts.
+#[derive(Debug, Clone)]
+pub struct PlacementAttempt {
+	pub query: String,
+	pub pair_index: usize,
+	pub position_in_pair: usize,
+	pub arm: PlacementArm,
+	pub elapsed_ms: f64,
+	pub facts: PlacementFacts,
+	pub workers: BTreeSet<String>,
+	pub live_reservations_after: u32,
+}
+
+/// Drives one cell: seven pairs, two adjacent arms each, in the recorded order.
+pub trait PlacementHarness {
+	fn setup_cell(&mut self, query: &str) -> Result<(), String>;
+	fn execute_arm(
+		&mut self,
+		query: &str,
+		pair_index: usize,
+		position_in_pair: usize,
+		arm: PlacementArm,
+	) -> Result<PlacementAttempt, String>;
+	fn teardown_cell(&mut self, query: &str) -> Result<(), String>;
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct PlacementCellOutcome {
+	pub query: String,
+	pub attempts: Vec<PlacementAttempt>,
+	pub problems: Vec<String>,
+}
+
+/// Run one cell's seven pairs.
+///
+/// **Both arms of a pair run adjacent, before the next pair begins.** That
+/// adjacency is the entire drift control: the two policies are compared seconds
+/// apart rather than runs apart, which is what makes the comparison paired at
+/// all. Attempts are retained whatever the gates say, so a withheld artifact is
+/// still auditable.
+pub fn run_placement_cell_with<H: PlacementHarness>(
+	harness: &mut H,
+	query: &str,
+) -> PlacementCellOutcome {
+	let mut outcome = PlacementCellOutcome {
+		query: query.to_string(),
+		..Default::default()
+	};
+	if let Err(error) = harness.setup_cell(query) {
+		outcome.problems.push(format!("{query} setup: {error}"));
+		return outcome;
+	}
+	let mut first_arms = Vec::new();
+	for pair_index in 0..TIMING_ATLAS_MEASURED_PAIRS {
+		let (first, second) = placement_pair_order(query, pair_index);
+		first_arms.push(first);
+		let mut pair: Vec<PlacementAttempt> = Vec::new();
+		for (position, arm) in [first, second].into_iter().enumerate() {
+			match harness.execute_arm(query, pair_index, position, arm) {
+				Ok(attempt) => {
+					outcome
+						.problems
+						.extend(placement_reservation_drain_problems(
+							query,
+							pair_index,
+							arm,
+							attempt.live_reservations_after,
+						));
+					pair.push(attempt);
+				}
+				Err(error) => {
+					outcome.problems.push(format!(
+						"{query} pair {pair_index} {}: {error}",
+						arm.label()
+					));
+				}
+			}
+		}
+		if pair.len() == 2 {
+			let by_arm = |wanted: PlacementArm| {
+				pair.iter()
+					.find(|attempt| attempt.arm == wanted)
+					.expect("both arms present")
+			};
+			let affinity = by_arm(PlacementArm::AffinityOnly);
+			let observing = by_arm(PlacementArm::LoadObserving);
+			outcome.problems.extend(placement_gate_problems(
+				query,
+				pair_index,
+				affinity.facts,
+				observing.facts,
+			));
+			outcome.problems.extend(placement_worker_set_problems(
+				query,
+				pair_index,
+				&affinity.workers,
+				&observing.workers,
+			));
+		}
+		outcome.attempts.extend(pair);
+	}
+	outcome
+		.problems
+		.extend(placement_pair_order_problems(query, &first_arms));
+	if let Err(error) = harness.teardown_cell(query) {
+		outcome.problems.push(format!("{query} teardown: {error}"));
+	}
+	outcome
+}
+
 /// Per-cell first-arm order must be balanced, not merely balanced across the run.
 ///
 /// With seven pairs the only balanced split is 4/3. A globally even run can still
@@ -23473,6 +23613,120 @@ mod adr538_timing_atlas_journal_replay {
 			placement_node(2, 0, sibling_a, vec![(1, 0)]),
 			placement_node(2, 1, sibling_b, vec![(1, 0)]),
 		]
+	}
+
+	/// Records every arm execution in order, so adjacency is asserted from the
+	/// driver's actual behaviour rather than read off its source.
+	struct ScriptedPlacementHarness {
+		calls: Vec<(usize, usize, PlacementArm)>,
+		spread_siblings_for: Option<PlacementArm>,
+		live_after: u32,
+	}
+
+	impl ScriptedPlacementHarness {
+		fn healthy() -> Self {
+			Self {
+				calls: Vec::new(),
+				spread_siblings_for: Some(PlacementArm::LoadObserving),
+				live_after: 0,
+			}
+		}
+	}
+
+	impl PlacementHarness for ScriptedPlacementHarness {
+		fn setup_cell(&mut self, _query: &str) -> Result<(), String> {
+			Ok(())
+		}
+
+		fn execute_arm(
+			&mut self,
+			query: &str,
+			pair_index: usize,
+			position_in_pair: usize,
+			arm: PlacementArm,
+		) -> Result<PlacementAttempt, String> {
+			self.calls.push((pair_index, position_in_pair, arm));
+			let spread = self.spread_siblings_for == Some(arm);
+			let nodes = placement_shape("w1", if spread { "w2" } else { "w1" });
+			Ok(PlacementAttempt {
+				query: query.to_string(),
+				pair_index,
+				position_in_pair,
+				arm,
+				elapsed_ms: 10.0,
+				facts: placement_facts_from_nodes(&nodes),
+				workers: ["w1", "w2"].iter().map(|w| w.to_string()).collect(),
+				live_reservations_after: self.live_after,
+			})
+		}
+
+		fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
+			Ok(())
+		}
+	}
+
+	/// ADR 555 §7: each pair runs exactly its two policy arms, adjacent, in the
+	/// recorded order, before the next pair begins. Adjacency is the whole drift
+	/// control — arms compared runs apart are not paired at all.
+	#[test]
+	fn adr555_each_pair_runs_both_arms_adjacent_before_the_next_pair() {
+		let mut harness = ScriptedPlacementHarness::healthy();
+		let outcome = run_placement_cell_with(&mut harness, "q19");
+
+		assert_eq!(
+			harness.calls.len(),
+			TIMING_ATLAS_MEASURED_PAIRS * 2,
+			"seven pairs, two arms each"
+		);
+		for (pair_index, chunk) in harness.calls.chunks(2).enumerate() {
+			let (first, second) = placement_pair_order("q19", pair_index);
+			assert_eq!(
+				chunk,
+				&[(pair_index, 0, first), (pair_index, 1, second)],
+				"pair {pair_index} must run its two arms adjacent and in the recorded order"
+			);
+		}
+		assert!(outcome.problems.is_empty(), "{:?}", outcome.problems);
+		assert_eq!(outcome.attempts.len(), TIMING_ATLAS_MEASURED_PAIRS * 2);
+	}
+
+	/// Attempts survive a failing seal: a withheld artifact must stay auditable.
+	#[test]
+	fn adr555_attempts_are_retained_when_the_seal_withholds() {
+		let mut harness = ScriptedPlacementHarness::healthy();
+		// Neither arm spreads, so the treatment arm fails its placement gate.
+		harness.spread_siblings_for = None;
+		let outcome = run_placement_cell_with(&mut harness, "q19");
+
+		assert!(
+			outcome
+				.problems
+				.iter()
+				.any(|p| p.contains("treatment must spread")),
+			"{:?}",
+			outcome.problems
+		);
+		assert_eq!(
+			outcome.attempts.len(),
+			TIMING_ATLAS_MEASURED_PAIRS * 2,
+			"raw attempts are retained even when the seal refuses the artifact"
+		);
+	}
+
+	/// A leaked reservation is caught by the driver between arms.
+	#[test]
+	fn adr555_driver_refuses_an_arm_that_leaks_reservations() {
+		let mut harness = ScriptedPlacementHarness::healthy();
+		harness.live_after = 2;
+		let outcome = run_placement_cell_with(&mut harness, "q19");
+		assert!(
+			outcome
+				.problems
+				.iter()
+				.any(|p| p.contains("live reservations")),
+			"{:?}",
+			outcome.problems
+		);
 	}
 
 	/// Per-cell balance, not merely global. A run can be even overall while one
