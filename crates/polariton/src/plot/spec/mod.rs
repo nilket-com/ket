@@ -370,6 +370,71 @@ impl fmt::Display for SubtitleTextSizeError {
 
 impl std::error::Error for SubtitleTextSizeError {}
 
+macro_rules! axis_text_size {
+	($name:ident, $error:ident, $description:literal, $default:expr) => {
+		/// PRODUCT-0122's logical-pixel size for one axis text role.
+		#[derive(Clone, Copy, Debug, PartialEq)]
+		pub struct $name(f32);
+
+		impl Eq for $name {}
+
+		impl $name {
+			pub const MIN_PX: f32 = 6.0;
+			pub const MAX_PX: f32 = 96.0;
+			pub const DEFAULT: Self = Self($default);
+
+			pub fn new(pixels: f32) -> Result<Self, $error> {
+				if pixels.is_finite() && (Self::MIN_PX..=Self::MAX_PX).contains(&pixels) {
+					Ok(Self(pixels))
+				} else {
+					Err($error { pixels })
+				}
+			}
+
+			pub const fn pixels(self) -> f32 {
+				self.0
+			}
+		}
+
+		#[derive(Clone, Copy, Debug, PartialEq)]
+		pub struct $error {
+			pixels: f32,
+		}
+
+		impl fmt::Display for $error {
+			fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+				write!(
+					f,
+					concat!(
+						$description,
+						" must be finite and between {} and {}, got {}"
+					),
+					$name::MIN_PX,
+					$name::MAX_PX,
+					self.pixels
+				)
+			}
+		}
+
+		impl std::error::Error for $error {}
+	};
+}
+
+axis_text_size!(
+	XLabelTextSize,
+	XLabelTextSizeError,
+	"x-axis label size",
+	20.0
+);
+axis_text_size!(
+	YLabelTextSize,
+	YLabelTextSizeError,
+	"y-axis label size",
+	20.0
+);
+axis_text_size!(XTickTextSize, XTickTextSizeError, "x-tick label size", 18.0);
+axis_text_size!(YTickTextSize, YTickTextSizeError, "y-tick label size", 18.0);
+
 /// PRODUCT-0019's unitless, linear line-stroke factor. Keep this distinct from
 /// `PointSize` until a third relative setting establishes a shared abstraction.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -4393,6 +4458,22 @@ mod tests {
 		for rejected in [5.9, 96.1, f32::NAN, f32::INFINITY] {
 			assert!(TitleTextSize::new(rejected).is_err());
 			assert!(SubtitleTextSize::new(rejected).is_err());
+		}
+	}
+
+	#[test]
+	fn product_0122_axis_and_tick_text_sizes_pin_inclusive_work_bounds() {
+		for accepted in [6.0, 96.0] {
+			assert!(XLabelTextSize::new(accepted).is_ok());
+			assert!(YLabelTextSize::new(accepted).is_ok());
+			assert!(XTickTextSize::new(accepted).is_ok());
+			assert!(YTickTextSize::new(accepted).is_ok());
+		}
+		for rejected in [5.9, 96.1, f32::NAN, f32::INFINITY] {
+			assert!(XLabelTextSize::new(rejected).is_err());
+			assert!(YLabelTextSize::new(rejected).is_err());
+			assert!(XTickTextSize::new(rejected).is_err());
+			assert!(YTickTextSize::new(rejected).is_err());
 		}
 	}
 

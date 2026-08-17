@@ -13,7 +13,7 @@ use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::spec::{
 	BarWidth, CategoryGap, ColorJob, HoverTextSize, LayerSettings, LegendPosition, Override,
 	PlotPaddingPixels, PointSize, Presence, ResolvedPresence, StrokeWidth, SubtitleTextSize,
-	TickRotation, TitleTextSize,
+	TickRotation, TitleTextSize, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use iced::Color;
 use libaryon::engine::UiPalette;
@@ -104,10 +104,10 @@ pub fn chrome_from_ui_palette(palette: UiPalette) -> PlotChromeSpec {
 pub struct PlotTypography {
 	pub title_size: TitleTextSize,
 	pub subtitle_size: SubtitleTextSize,
-	pub x_label_size: f32,
-	pub y_label_size: f32,
-	pub x_tick_size: f32,
-	pub y_tick_size: f32,
+	pub x_label_size: XLabelTextSize,
+	pub y_label_size: YLabelTextSize,
+	pub x_tick_size: XTickTextSize,
+	pub y_tick_size: YTickTextSize,
 	pub legend_size: f32,
 	pub hover_size: HoverTextSize,
 	pub x_tick_rotation: TickRotation,
@@ -209,6 +209,12 @@ pub struct PlotSettingsLayer {
 	/// PRODUCT-0113: typed partial overrides for the two top-band roles.
 	pub title_size: Override<TitleTextSize>,
 	pub subtitle_size: Override<SubtitleTextSize>,
+	/// PRODUCT-0122: partial slots expose the four axis and generated-tick
+	/// roles without rebuilding the complete typography carrier.
+	pub x_label_size: Override<XLabelTextSize>,
+	pub y_label_size: Override<YLabelTextSize>,
+	pub x_tick_size: Override<XTickTextSize>,
+	pub y_tick_size: Override<YTickTextSize>,
 	/// PRODUCT-0112: a partial hover-size override avoids reconstructing the
 	/// whole typography carrier merely to size generated hover text.
 	pub hover_size: Override<HoverTextSize>,
@@ -263,6 +269,10 @@ impl Default for PlotSettingsLayer {
 			typography: Override::Inherit,
 			title_size: Override::Inherit,
 			subtitle_size: Override::Inherit,
+			x_label_size: Override::Inherit,
+			y_label_size: Override::Inherit,
+			x_tick_size: Override::Inherit,
+			y_tick_size: Override::Inherit,
 			hover_size: Override::Inherit,
 			x_tick_rotation: Override::Inherit,
 			plot_padding_top: Override::Inherit,
@@ -410,6 +420,18 @@ fn apply_layer(
 	if let Override::Set(value) = layer.subtitle_size {
 		settings.subtitle_size = value;
 	}
+	if let Override::Set(value) = layer.x_label_size {
+		settings.x_label_size = value;
+	}
+	if let Override::Set(value) = layer.y_label_size {
+		settings.y_label_size = value;
+	}
+	if let Override::Set(value) = layer.x_tick_size {
+		settings.x_tick_size = value;
+	}
+	if let Override::Set(value) = layer.y_tick_size {
+		settings.y_tick_size = value;
+	}
 	// PRODUCT-0112: the specific slot wins over the atomic typography carrier
 	// within a tier, just as PRODUCT-0091's partial continuous-ramp slots do.
 	if let Override::Set(value) = layer.hover_size {
@@ -548,10 +570,10 @@ mod tests {
 		PlotTypography {
 			title_size: TitleTextSize::DEFAULT,
 			subtitle_size: SubtitleTextSize::DEFAULT,
-			x_label_size: 20.0,
-			y_label_size: 20.0,
-			x_tick_size: 18.0,
-			y_tick_size: 18.0,
+			x_label_size: XLabelTextSize::DEFAULT,
+			y_label_size: YLabelTextSize::DEFAULT,
+			x_tick_size: XTickTextSize::DEFAULT,
+			y_tick_size: YTickTextSize::DEFAULT,
 			legend_size: 14.0,
 			hover_size,
 			x_tick_rotation: TickRotation::ZERO,
@@ -721,6 +743,90 @@ mod tests {
 		cascade.authored_spec.subtitle_size = Override::Inherit;
 		assert_eq!(cascade.resolve().title_size, title(24.0));
 		assert_eq!(cascade.resolve().subtitle_size, subtitle(24.0));
+	}
+
+	#[test]
+	fn product_0122_axis_and_tick_sizes_are_typed_partial_and_follow_all_five_tiers() {
+		let x_label = |pixels| XLabelTextSize::new(pixels).unwrap();
+		let y_label = |pixels| YLabelTextSize::new(pixels).unwrap();
+		let x_tick = |pixels| XTickTextSize::new(pixels).unwrap();
+		let y_tick = |pixels| YTickTextSize::new(pixels).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.x_label_size = x_label(6.0);
+		cascade.library_defaults.y_label_size = y_label(6.0);
+		cascade.library_defaults.x_tick_size = x_tick(6.0);
+		cascade.library_defaults.y_tick_size = y_tick(6.0);
+		cascade.application_theme.x_label_size = Override::Set(x_label(12.0));
+		cascade.application_theme.y_label_size = Override::Set(y_label(12.0));
+		cascade.application_theme.x_tick_size = Override::Set(x_tick(12.0));
+		cascade.application_theme.y_tick_size = Override::Set(y_tick(12.0));
+		cascade.authored_spec.x_label_size = Override::Set(x_label(20.0));
+		cascade.authored_spec.y_label_size = Override::Set(y_label(20.0));
+		cascade.authored_spec.x_tick_size = Override::Set(x_tick(20.0));
+		cascade.authored_spec.y_tick_size = Override::Set(y_tick(20.0));
+		cascade.layer.x_label_size = Override::Set(x_label(32.0));
+		cascade.layer.y_label_size = Override::Set(y_label(32.0));
+		cascade.layer.x_tick_size = Override::Set(x_tick(32.0));
+		cascade.layer.y_tick_size = Override::Set(y_tick(32.0));
+		cascade.pane_override.x_label_size = Override::Set(x_label(48.0));
+		cascade.pane_override.y_label_size = Override::Set(y_label(48.0));
+		cascade.pane_override.x_tick_size = Override::Set(x_tick(48.0));
+		cascade.pane_override.y_tick_size = Override::Set(y_tick(48.0));
+		let resolved = cascade.resolve();
+		assert_eq!(resolved.x_label_size, x_label(48.0));
+		assert_eq!(resolved.y_label_size, y_label(48.0));
+		assert_eq!(resolved.x_tick_size, x_tick(48.0));
+		assert_eq!(resolved.y_tick_size, y_tick(48.0));
+
+		cascade.authored_spec.typography = Override::Set(PlotTypography {
+			x_label_size: x_label(24.0),
+			y_label_size: y_label(24.0),
+			x_tick_size: x_tick(24.0),
+			y_tick_size: y_tick(24.0),
+			..typography(HoverTextSize::DEFAULT)
+		});
+		cascade.authored_spec.x_label_size = Override::Set(x_label(36.0));
+		cascade.authored_spec.y_label_size = Override::Set(y_label(36.0));
+		cascade.authored_spec.x_tick_size = Override::Set(x_tick(36.0));
+		cascade.authored_spec.y_tick_size = Override::Set(y_tick(36.0));
+		let resolved = cascade.resolve();
+		assert_eq!(
+			resolved.x_label_size,
+			x_label(48.0),
+			"the higher pane tier still wins"
+		);
+		assert_eq!(
+			resolved.y_label_size,
+			y_label(48.0),
+			"the higher pane tier still wins"
+		);
+		cascade.pane_override.x_label_size = Override::Inherit;
+		cascade.pane_override.y_label_size = Override::Inherit;
+		cascade.pane_override.x_tick_size = Override::Inherit;
+		cascade.pane_override.y_tick_size = Override::Inherit;
+		let resolved = cascade.resolve();
+		assert_eq!(resolved.x_label_size, x_label(32.0));
+		assert_eq!(resolved.y_label_size, y_label(32.0));
+		assert_eq!(resolved.x_tick_size, x_tick(32.0));
+		assert_eq!(resolved.y_tick_size, y_tick(32.0));
+		cascade.layer.x_label_size = Override::Inherit;
+		cascade.layer.y_label_size = Override::Inherit;
+		cascade.layer.x_tick_size = Override::Inherit;
+		cascade.layer.y_tick_size = Override::Inherit;
+		let resolved = cascade.resolve();
+		assert_eq!(resolved.x_label_size, x_label(36.0));
+		assert_eq!(resolved.y_label_size, y_label(36.0));
+		assert_eq!(resolved.x_tick_size, x_tick(36.0));
+		assert_eq!(resolved.y_tick_size, y_tick(36.0));
+		cascade.authored_spec.x_label_size = Override::Inherit;
+		cascade.authored_spec.y_label_size = Override::Inherit;
+		cascade.authored_spec.x_tick_size = Override::Inherit;
+		cascade.authored_spec.y_tick_size = Override::Inherit;
+		let resolved = cascade.resolve();
+		assert_eq!(resolved.x_label_size, x_label(24.0));
+		assert_eq!(resolved.y_label_size, y_label(24.0));
+		assert_eq!(resolved.x_tick_size, x_tick(24.0));
+		assert_eq!(resolved.y_tick_size, y_tick(24.0));
 	}
 
 	#[test]

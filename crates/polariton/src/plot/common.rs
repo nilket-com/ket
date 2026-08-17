@@ -7,7 +7,8 @@ use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
 	BarWidth, CategoryGap, HoverTextSize, LegendPosition, PlotPaddingPixels, PointSize,
-	ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize,
+	ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, XLabelTextSize,
+	XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
 use crate::plot::theme::PlotSettings;
@@ -634,10 +635,10 @@ pub struct ResolvedPlotSettings {
 	pub authored_plot_padding_right: Option<PlotPaddingPixels>,
 	pub title_size: TitleTextSize,
 	pub subtitle_size: SubtitleTextSize,
-	pub x_label_size: f32,
-	pub y_label_size: f32,
-	pub x_tick_size: f32,
-	pub y_tick_size: f32,
+	pub x_label_size: XLabelTextSize,
+	pub y_label_size: YLabelTextSize,
+	pub x_tick_size: XTickTextSize,
+	pub y_tick_size: YTickTextSize,
 	pub legend_size: f32,
 	pub hover_size: HoverTextSize,
 	pub x_tick_placement: TickPlacement,
@@ -729,10 +730,10 @@ impl Default for ResolvedPlotSettings {
 			authored_plot_padding_right: None,
 			title_size: TitleTextSize::DEFAULT,
 			subtitle_size: SubtitleTextSize::DEFAULT,
-			x_label_size: 20.0,
-			y_label_size: 20.0,
-			x_tick_size: 18.0,
-			y_tick_size: 18.0,
+			x_label_size: XLabelTextSize::DEFAULT,
+			y_label_size: YLabelTextSize::DEFAULT,
+			x_tick_size: XTickTextSize::DEFAULT,
+			y_tick_size: YTickTextSize::DEFAULT,
 			legend_size: 14.0,
 			hover_size: HoverTextSize::DEFAULT,
 			x_tick_placement: TickPlacement::DEFAULT,
@@ -1492,9 +1493,9 @@ impl VerticalGuideBands {
 			0.0
 		} else {
 			let title = (!matches!(&settings.y_label, ResolvedPresence::Hide))
-				.then_some(settings.y_label_padding + settings.y_label_size)
+				.then_some(settings.y_label_padding + settings.y_label_size.pixels())
 				.unwrap_or(0.0);
-			(10.0 + requirements.estimated_y_width(settings.y_tick_size)).max(title)
+			(10.0 + requirements.estimated_y_width(settings.y_tick_size.pixels())).max(title)
 		};
 		let left = settings
 			.authored_plot_padding_left
@@ -1522,9 +1523,9 @@ impl VerticalGuideBands {
 			};
 		}
 		let rotation = settings.x_tick_rotation.radians();
-		let rotated_tick_height = requirements.estimated_x_width(settings.x_tick_size)
+		let rotated_tick_height = requirements.estimated_x_width(settings.x_tick_size.pixels())
 			* rotation.sin().abs()
-			+ settings.x_tick_size * rotation.cos().abs();
+			+ settings.x_tick_size.pixels() * rotation.cos().abs();
 		let tick_end = settings.x_label_offset + rotated_tick_height;
 		let title_top = x_label_visible.then(|| {
 			// At zero degrees this preserves the historical 45 px title top.
@@ -1535,7 +1536,7 @@ impl VerticalGuideBands {
 				.max(tick_end + Self::x_axis_title_gap(settings))
 		});
 		let bottom = title_top
-			.map(|top| top + settings.x_label_size)
+			.map(|top| top + settings.x_label_size.pixels())
 			.unwrap_or(tick_end);
 		XAxisGuideLayout {
 			tick_end,
@@ -1547,7 +1548,8 @@ impl VerticalGuideBands {
 	fn x_axis_title_gap(settings: &ResolvedPlotSettings) -> f32 {
 		// Preserve the existing zero-degree title placement: ticks ended at
 		// x_label_offset + x_tick_size, and the title began at x_label_padding.
-		(settings.x_label_padding - (settings.x_label_offset + settings.x_tick_size)).max(0.0)
+		(settings.x_label_padding - (settings.x_label_offset + settings.x_tick_size.pixels()))
+			.max(0.0)
 	}
 
 	#[cfg(test)]
@@ -1930,7 +1932,7 @@ impl<'a> PlotWidget<'a> {
 					plot_area.y + plot_area.height + title_top,
 				),
 				color: self.settings.chrome.axis_label_text.iced(),
-				size: iced::Pixels(self.settings.x_label_size),
+				size: iced::Pixels(self.settings.x_label_size.pixels()),
 				align_x: alignment::Horizontal::Center.into(),
 				align_y: alignment::Vertical::Top,
 				..Default::default()
@@ -1947,7 +1949,7 @@ impl<'a> PlotWidget<'a> {
 					content: y_label.clone(),
 					position: Point::ORIGIN,
 					color: self.settings.chrome.axis_label_text.iced(),
-					size: iced::Pixels(self.settings.y_label_size),
+					size: iced::Pixels(self.settings.y_label_size.pixels()),
 					align_x: alignment::Horizontal::Center.into(),
 					align_y: alignment::Vertical::Bottom,
 					..Default::default()
@@ -2270,7 +2272,7 @@ impl<'a> PlotWidget<'a> {
 					content: format_label(data_y, y_axis_type),
 					position: Point::new(p_left.x - 10.0, p_left.y),
 					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.y_tick_size),
+					size: iced::Pixels(self.settings.y_tick_size.pixels()),
 					align_x: alignment::Horizontal::Right.into(),
 					align_y: text.anchoring.y_alignment(data_y, y_range),
 					..Default::default()
@@ -2318,7 +2320,7 @@ impl<'a> PlotWidget<'a> {
 						content: label.clone(),
 						position: Point::ORIGIN,
 						color: self.settings.chrome.tick_label_text.iced(),
-						size: iced::Pixels(self.settings.x_tick_size),
+						size: iced::Pixels(self.settings.x_tick_size.pixels()),
 						align_x: placement.alignment.into(),
 						..Default::default()
 					});
@@ -2466,7 +2468,7 @@ impl<'a> PlotWidget<'a> {
 					content: format_label(data_y, *y_axis_type),
 					position: Point::new(p_left.x - 10.0, p_left.y),
 					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.y_tick_size),
+					size: iced::Pixels(self.settings.y_tick_size.pixels()),
 					align_x: alignment::Horizontal::Right.into(),
 					align_y: text.anchoring.y_alignment(data_y, y_range),
 					..Default::default()
@@ -2497,7 +2499,7 @@ impl<'a> PlotWidget<'a> {
 						content: cat.clone(),
 						position: Point::ORIGIN,
 						color: self.settings.chrome.tick_label_text.iced(),
-						size: iced::Pixels(self.settings.x_tick_size),
+						size: iced::Pixels(self.settings.x_tick_size.pixels()),
 						align_x: placement.alignment.into(),
 						..Default::default()
 					});
@@ -2632,7 +2634,7 @@ impl<'a> PlotWidget<'a> {
 					content: format_label(data_x, *x_axis_type),
 					position: Point::new(p_bottom.x, p_bottom.y + 10.0),
 					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.x_tick_size),
+					size: iced::Pixels(self.settings.x_tick_size.pixels()),
 					align_x: text.anchoring.x_alignment(data_x, x_range).into(),
 					..Default::default()
 				});
@@ -2652,7 +2654,7 @@ impl<'a> PlotWidget<'a> {
 					content: cat.clone(),
 					position: Point::new(center_px.x - 10.0, center_px.y),
 					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.y_tick_size),
+					size: iced::Pixels(self.settings.y_tick_size.pixels()),
 					align_x: alignment::Horizontal::Right.into(),
 					align_y: alignment::Vertical::Center,
 					..Default::default()
@@ -2717,7 +2719,7 @@ impl<'a> PlotWidget<'a> {
 						content: cat.clone(),
 						position: Point::ORIGIN,
 						color: self.settings.chrome.tick_label_text.iced(),
-						size: iced::Pixels(self.settings.x_tick_size),
+						size: iced::Pixels(self.settings.x_tick_size.pixels()),
 						align_x: placement.alignment.into(),
 						..Default::default()
 					});
@@ -2740,7 +2742,7 @@ impl<'a> PlotWidget<'a> {
 					content: cat.clone(),
 					position: Point::new(tick_x - 10.0, tick_y),
 					color: self.settings.chrome.tick_label_text.iced(),
-					size: iced::Pixels(self.settings.y_tick_size),
+					size: iced::Pixels(self.settings.y_tick_size.pixels()),
 					align_x: alignment::Horizontal::Right.into(),
 					align_y: alignment::Vertical::Center,
 					..Default::default()
@@ -2800,7 +2802,7 @@ impl<'a> PlotWidget<'a> {
 						content: format_label(data_y, AxisType::Linear),
 						position: Point::new(p.x - 14.0, p.y),
 						color: self.settings.chrome.tick_label_text.iced(),
-						size: iced::Pixels(self.settings.y_tick_size),
+						size: iced::Pixels(self.settings.y_tick_size.pixels()),
 						align_x: alignment::Horizontal::Right.into(),
 						align_y: alignment::Vertical::Center,
 						..Default::default()
@@ -2826,9 +2828,9 @@ impl<'a> PlotWidget<'a> {
 			if text.x {
 				backend.fill_text(Text {
 					content: dim.clone(),
-					position: Point::new(top_px.x, top_px.y - self.settings.x_label_size),
+					position: Point::new(top_px.x, top_px.y - self.settings.x_label_size.pixels()),
 					color: self.settings.chrome.axis_label_text.iced(),
-					size: iced::Pixels(self.settings.x_label_size),
+					size: iced::Pixels(self.settings.x_label_size.pixels()),
 					align_x: alignment::Horizontal::Center.into(),
 					align_y: alignment::Vertical::Bottom,
 					..Default::default()
@@ -2978,8 +2980,8 @@ mod product_0106_vertical_guide_band_oracles {
 
 		let zero = ResolvedPlotSettings::default();
 		let zero_guides = VerticalGuideBands::x_axis_guides(&requirement, true, &zero);
-		let banked_0114_max =
-			(zero.x_label_offset + zero.x_tick_size).max(zero.x_label_padding + zero.x_label_size);
+		let banked_0114_max = (zero.x_label_offset + zero.x_tick_size.pixels())
+			.max(zero.x_label_padding + zero.x_label_size.pixels());
 		assert_eq!(
 			zero_guides.bottom, banked_0114_max,
 			"the sequenced guides reduce to PRODUCT-0114's banked maximum at zero degrees"
@@ -2997,7 +2999,7 @@ mod product_0106_vertical_guide_band_oracles {
 				title_top >= guides.tick_end + VerticalGuideBands::x_axis_title_gap(&settings),
 				"{rotation} degree title starts after the rotated tick run"
 			);
-			assert_eq!(guides.bottom, title_top + settings.x_label_size);
+			assert_eq!(guides.bottom, title_top + settings.x_label_size.pixels());
 		}
 
 		let no_title = VerticalGuideBands::x_axis_guides(&requirement, false, &zero);
@@ -3005,6 +3007,72 @@ mod product_0106_vertical_guide_band_oracles {
 		assert_eq!(
 			no_title.bottom, no_title.tick_end,
 			"an absent title consumes neither title clearance nor title height"
+		);
+	}
+
+	#[test]
+	fn product_0122_each_axis_and_tick_size_moves_only_its_reserved_band() {
+		let x_requirement = BandRequirements {
+			x: vec![AxisBandRequirement::Categories(vec!["x".to_owned()])],
+			y: Vec::new(),
+		};
+		let y_requirement = BandRequirements {
+			x: Vec::new(),
+			y: vec![AxisBandRequirement::Formatted {
+				domain: (0.0, 1.0),
+				axis_type: AxisType::Linear,
+			}],
+		};
+		let base = ResolvedPlotSettings::default();
+
+		let base_x_label = VerticalGuideBands::x_axis_guides(&x_requirement, true, &base).bottom;
+		let mut x_label = base.clone();
+		x_label.x_label_size = XLabelTextSize::new(48.0).unwrap();
+		assert_eq!(
+			VerticalGuideBands::x_axis_guides(&x_requirement, true, &x_label).bottom - base_x_label,
+			28.0,
+			"x-axis title size changes only the title arm of the bottom band"
+		);
+
+		let base_x_tick = VerticalGuideBands::x_axis_guides(&x_requirement, false, &base).bottom;
+		let mut x_tick = base.clone();
+		x_tick.x_tick_size = XTickTextSize::new(48.0).unwrap();
+		assert_eq!(
+			VerticalGuideBands::x_axis_guides(&x_requirement, false, &x_tick).bottom - base_x_tick,
+			30.0,
+			"x-tick size changes only the generated-tick arm of the bottom band"
+		);
+
+		let base_y_label =
+			VerticalGuideBands::resolve_with_requirements("", None, &y_requirement, &base).left;
+		let mut y_label = base.clone();
+		y_label.y_label_size = YLabelTextSize::new(48.0).unwrap();
+		assert_eq!(
+			VerticalGuideBands::resolve_with_requirements("", None, &y_requirement, &y_label).left
+				- base_y_label,
+			28.0,
+			"y-axis title size changes only the title arm of the left band"
+		);
+
+		let numeric = BandRequirements {
+			x: Vec::new(),
+			y: vec![AxisBandRequirement::Formatted {
+				domain: (-999_999.9, 999_999.9),
+				axis_type: AxisType::Linear,
+			}],
+		};
+		let mut y_tick_base = base.clone();
+		y_tick_base.y_label = ResolvedPresence::Hide;
+		let before =
+			VerticalGuideBands::resolve_with_requirements("", None, &numeric, &y_tick_base).left;
+		let mut y_tick = y_tick_base.clone();
+		y_tick.y_tick_size = YTickTextSize::new(48.0).unwrap();
+		let after = VerticalGuideBands::resolve_with_requirements("", None, &numeric, &y_tick).left;
+		assert_eq!(
+			after - before,
+			numeric.estimated_y_width(y_tick.y_tick_size.pixels())
+				- numeric.estimated_y_width(y_tick_base.y_tick_size.pixels()),
+			"y-tick size changes only the generated-tick arm of the left band"
 		);
 	}
 
@@ -3054,8 +3122,8 @@ mod product_0106_vertical_guide_band_oracles {
 			x: vec![AxisBandRequirement::Categories(vec![label.to_owned()])],
 			y: Vec::new(),
 		};
-		let old_width = label.chars().count() as f32 * settings.x_tick_size;
-		let new_width = estimate_ascii_label_width(label, settings.x_tick_size);
+		let old_width = label.chars().count() as f32 * settings.x_tick_size.pixels();
+		let new_width = estimate_ascii_label_width(label, settings.x_tick_size.pixels());
 		assert!(
 			new_width < old_width,
 			"PRODUCT-0117 prose class budget improves the flat bound"
@@ -3063,11 +3131,11 @@ mod product_0106_vertical_guide_band_oracles {
 		let guides = VerticalGuideBands::x_axis_guides(&requirements, true, &settings);
 		let old_tick_end = settings.x_label_offset
 			+ old_width * settings.x_tick_rotation.radians().sin().abs()
-			+ settings.x_tick_size * settings.x_tick_rotation.radians().cos().abs();
+			+ settings.x_tick_size.pixels() * settings.x_tick_rotation.radians().cos().abs();
 		let old_title_top = settings
 			.x_label_padding
 			.max(old_tick_end + VerticalGuideBands::x_axis_title_gap(&settings));
-		let old_bottom = old_title_top + settings.x_label_size;
+		let old_bottom = old_title_top + settings.x_label_size.pixels();
 		assert!(
 			(guides.bottom - old_bottom
 				+ (old_width - new_width) * settings.x_tick_rotation.radians().sin().abs())
@@ -4506,8 +4574,8 @@ mod product_0056_categorical_y_oracles {
 				.expect("parallel dimension header")
 		};
 
-		let default = header(20.0);
-		let enlarged = header(24.0);
+		let default = header(XLabelTextSize::new(20.0).unwrap());
+		let enlarged = header(XLabelTextSize::new(24.0).unwrap());
 		assert_eq!(default.size, iced::Pixels(20.0));
 		assert_eq!(enlarged.size, iced::Pixels(24.0));
 		assert_eq!(default.position.y - enlarged.position.y, 4.0);

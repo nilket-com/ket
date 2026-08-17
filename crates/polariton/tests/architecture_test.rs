@@ -4285,7 +4285,7 @@ fn product_0112_hover_typography_stays_typed_and_off_canvas() {
 }
 
 #[test]
-fn product_0113_only_title_and_subtitle_font_sizes_cross_the_canvas_boundary() {
+fn product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_blocked() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
 	for text_size in ["TitleTextSize", "SubtitleTextSize"] {
@@ -4294,30 +4294,44 @@ fn product_0113_only_title_and_subtitle_font_sizes_cross_the_canvas_boundary() {
 			"{text_size} stays a private bounded scalar"
 		);
 	}
+	for text_size in [
+		"XLabelTextSize",
+		"YLabelTextSize",
+		"XTickTextSize",
+		"YTickTextSize",
+	] {
+		assert!(
+			spec.contains(text_size) && spec.contains("macro_rules! axis_text_size"),
+			"{text_size} is generated only by the private bounded-newtype template"
+		);
+	}
 
 	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
 	assert!(theme.contains("pub title_size: TitleTextSize"));
 	assert!(theme.contains("pub subtitle_size: SubtitleTextSize"));
 	assert!(theme.contains("pub title_size: Override<TitleTextSize>"));
 	assert!(theme.contains("pub subtitle_size: Override<SubtitleTextSize>"));
-	for blocked in [
-		"pub x_label_size: f32",
-		"pub y_label_size: f32",
-		"pub x_tick_size: f32",
-		"pub y_tick_size: f32",
-		"pub legend_size: f32",
+	for slot in [
+		"pub x_label_size: Override<XLabelTextSize>",
+		"pub y_label_size: Override<YLabelTextSize>",
+		"pub x_tick_size: Override<XTickTextSize>",
+		"pub y_tick_size: Override<YTickTextSize>",
 	] {
 		assert!(
-			theme.contains(blocked),
-			"blocked typography role remains raw: {blocked}"
+			theme.contains(slot),
+			"each exposed role keeps its own partial slot: {slot}"
 		);
 	}
+	assert!(
+		theme.contains("pub legend_size: f32"),
+		"legend remains the unsplit raw field"
+	);
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
 	assert!(common.contains("settings.title_size.pixels()"));
 	assert!(common.contains("settings.subtitle_size.pixels()"));
-	assert!(common.contains("top_px.y - self.settings.x_label_size"));
-	assert!(common.contains("size: iced::Pixels(self.settings.x_label_size)"));
+	assert!(common.contains("top_px.y - self.settings.x_label_size.pixels()"));
+	assert!(common.contains("size: iced::Pixels(self.settings.x_label_size.pixels())"));
 	assert!(!common.contains("size: iced::Pixels(22.0)"));
 	assert!(common.contains("facet_label_size(settings: &ResolvedPlotSettings) -> f32"));
 	assert!(common.contains("(settings.legend_size + 2.0).max(10.0)"));
@@ -4342,12 +4356,26 @@ fn product_0113_only_title_and_subtitle_font_sizes_cross_the_canvas_boundary() {
 		.nth(1)
 		.and_then(|rest| rest.split("];\n").next())
 		.expect("presentation free vocabulary");
-	for blocked in ["font_size", "legend_size", "x_tick_size", "y_tick_size"] {
+	for blocked in ["font_size", "legend_size"] {
 		assert!(
 			!free.contains(&format!("\"{blocked}\"")),
 			"{blocked} is not a new top-level spelling"
 		);
 	}
+	for generated in ["x_tick_size", "y_tick_size"] {
+		assert!(
+			free.contains(&format!("\"{generated}\"")),
+			"generated tick text owns a word"
+		);
+	}
+
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	assert!(presentation.contains("TextHandle(TextHandleKind)"));
+	assert!(presentation.contains("a bare text member requires text or .font_size(...)"));
+	assert!(presentation.contains("padding() requires at least one edge modifier"));
+	assert!(presentation.contains("authored_settings.y_label_size = Override::Set(size);"));
+	assert!(presentation.contains("authored_settings.x_tick_size = Override::Set(size);"));
 }
 
 #[test]
@@ -4545,7 +4573,7 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 		"pub(crate) title_top: Option<f32>",
 		"pub(crate) fn x_axis_guides(",
 		"tick_end + Self::x_axis_title_gap(settings)",
-		"map(|top| top + settings.x_label_size)",
+		"map(|top| top + settings.x_label_size.pixels())",
 		"unwrap_or(tick_end)",
 	] {
 		assert!(

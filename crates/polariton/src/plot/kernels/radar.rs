@@ -132,7 +132,7 @@ impl PlotKernel for RadarPlotKernel {
 					center.y + (max_radius + 15.0) * angle.sin(),
 				),
 				color: settings.chrome.axis_label_text.iced(),
-				size: iced::Pixels(settings.x_label_size),
+				size: iced::Pixels(settings.x_label_size.pixels()),
 				align_x: if angle.cos().abs() < 0.01 {
 					iced::alignment::Horizontal::Center.into()
 				} else if angle.cos() > 0.0 {
@@ -165,7 +165,7 @@ impl PlotKernel for RadarPlotKernel {
 							a: 0.7,
 							..settings.chrome.tick_label_text.iced()
 						},
-						size: iced::Pixels(settings.x_tick_size),
+						size: iced::Pixels(settings.x_tick_size.pixels()),
 						align_x: iced::alignment::Horizontal::Left.into(),
 						align_y: iced::alignment::Vertical::Center,
 						..Default::default()

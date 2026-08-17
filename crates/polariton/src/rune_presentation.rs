@@ -15,6 +15,7 @@ use crate::plot::spec::{
 	HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
 	MultivariateFields, Override, PieFields, PlotPaddingPixels, PointSize, Presence,
 	RadialDialFields, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, ViolinFields,
+	XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -173,6 +174,7 @@ enum FigureElementKind {
 	Subtitle(String),
 	XLabel(String),
 	YLabel(String),
+	TextHandle(TextHandleKind),
 	Facet(String),
 	Palette(String),
 	SequentialPalette(ColorTheme),
@@ -186,6 +188,8 @@ enum FigureElementKind {
 	YMinorTicks(u32),
 	HoverSize(HoverTextSize),
 	XTickRotation(TickRotation),
+	XTickSize(XTickTextSize),
+	YTickSize(YTickTextSize),
 	Padding,
 }
 
@@ -238,6 +242,16 @@ impl PaddingEdge {
 enum FigureTextSize {
 	Title(TitleTextSize),
 	Subtitle(SubtitleTextSize),
+	XLabel(XLabelTextSize),
+	YLabel(YLabelTextSize),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum TextHandleKind {
+	Title,
+	Subtitle,
+	XLabel,
+	YLabel,
 }
 
 #[derive(Any, Clone, Debug)]
@@ -504,6 +518,8 @@ fn build_context() -> Result<Context, String> {
 		("__y_minor_ticks", raw_y_minor_ticks as RawFunction),
 		("__hover_size", raw_hover_size as RawFunction),
 		("__x_tick_rotation", raw_x_tick_rotation as RawFunction),
+		("__x_tick_size", raw_x_tick_size as RawFunction),
+		("__y_tick_size", raw_y_tick_size as RawFunction),
 		("__padding", raw_padding as RawFunction),
 		("__table", raw_table as RawFunction),
 		("__layers", raw_layers as RawFunction),
@@ -1642,7 +1658,20 @@ fn raw_string_element(
 ) -> VmResult<()> {
 	let values = rune::vm_try!(stack.slice_at(addr, args));
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
-	let value = if values.len() == 3 {
+	let value = if values.len() == 2 {
+		match kind {
+			StringConstructor::Title => Ok(FigureElementKind::TextHandle(TextHandleKind::Title)),
+			StringConstructor::Subtitle => {
+				Ok(FigureElementKind::TextHandle(TextHandleKind::Subtitle))
+			}
+			StringConstructor::XLabel => Ok(FigureElementKind::TextHandle(TextHandleKind::XLabel)),
+			StringConstructor::YLabel => Ok(FigureElementKind::TextHandle(TextHandleKind::YLabel)),
+			_ => Err(PresentationFailure::new(
+				origin,
+				format!("{name}(...) requires one string"),
+			)),
+		}
+	} else if values.len() == 3 {
 		match rune::from_value::<Ref<str>>(values[0].clone()) {
 			Ok(value) => {
 				let value = value.to_owned();
@@ -1831,6 +1860,8 @@ enum NumericScalarConstructor {
 	YMinorTicks,
 	HoverSize,
 	XTickRotation,
+	XTickSize,
+	YTickSize,
 }
 
 fn raw_x_tick_step(
@@ -1922,6 +1953,38 @@ fn raw_x_tick_rotation(
 	raw_numeric_scalar(
 		NumericScalarConstructor::XTickRotation,
 		"x_tick_rotation",
+		stack,
+		addr,
+		args,
+		out,
+	)
+}
+
+fn raw_x_tick_size(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_numeric_scalar(
+		NumericScalarConstructor::XTickSize,
+		"x_tick_size",
+		stack,
+		addr,
+		args,
+		out,
+	)
+}
+
+fn raw_y_tick_size(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_numeric_scalar(
+		NumericScalarConstructor::YTickSize,
+		"y_tick_size",
 		stack,
 		addr,
 		args,
@@ -2098,6 +2161,12 @@ fn raw_numeric_scalar(
 				origin.start.into(),
 				origin.end.into(),
 			),
+			NumericScalarConstructor::XTickSize => {
+				presentation_x_tick_size(values[0].clone(), origin.start.into(), origin.end.into())
+			}
+			NumericScalarConstructor::YTickSize => {
+				presentation_y_tick_size(values[0].clone(), origin.start.into(), origin.end.into())
+			}
 		}
 	};
 	store(out, stack, element)
@@ -2384,6 +2453,34 @@ fn presentation_x_tick_rotation(value: Value, start: i64, end: i64) -> RuneFigur
 			TickRotation::new(value as f32)
 				.map(FigureElementKind::XTickRotation)
 				.map_err(|error| PresentationFailure::new(origin, error.to_string()))
+		});
+	RuneFigureElement::new(value, origin)
+}
+
+fn presentation_x_tick_size(value: Value, start: i64, end: i64) -> RuneFigureElement {
+	presentation_axis_text_size(value, start, end, "x_tick_size", |pixels| {
+		XTickTextSize::new(pixels).map(FigureElementKind::XTickSize)
+	})
+}
+
+fn presentation_y_tick_size(value: Value, start: i64, end: i64) -> RuneFigureElement {
+	presentation_axis_text_size(value, start, end, "y_tick_size", |pixels| {
+		YTickTextSize::new(pixels).map(FigureElementKind::YTickSize)
+	})
+}
+
+fn presentation_axis_text_size<E: std::error::Error>(
+	value: Value,
+	start: i64,
+	end: i64,
+	name: &'static str,
+	make: impl FnOnce(f32) -> Result<FigureElementKind, E>,
+) -> RuneFigureElement {
+	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
+	let value = rune_number(&value)
+		.ok_or_else(|| PresentationFailure::new(origin, format!("{name}(...) requires a number")))
+		.and_then(|value| {
+			make(value as f32).map_err(|error| PresentationFailure::new(origin, error.to_string()))
 		});
 	RuneFigureElement::new(value, origin)
 }
@@ -3138,17 +3235,29 @@ fn raw_figure_font_size(
 		return store(out, stack, element);
 	};
 	let text_size = match element.value.as_ref().expect("checked above") {
-		FigureElementKind::Title(_) => TitleTextSize::new(points as f32)
-			.map(FigureTextSize::Title)
-			.map_err(|error| error.to_string()),
-		FigureElementKind::Subtitle(_) => SubtitleTextSize::new(points as f32)
+		FigureElementKind::Title(_) | FigureElementKind::TextHandle(TextHandleKind::Title) => {
+			TitleTextSize::new(points as f32)
+				.map(FigureTextSize::Title)
+				.map_err(|error| error.to_string())
+		}
+		FigureElementKind::Subtitle(_)
+		| FigureElementKind::TextHandle(TextHandleKind::Subtitle) => SubtitleTextSize::new(points as f32)
 			.map(FigureTextSize::Subtitle)
 			.map_err(|error| error.to_string()),
-		FigureElementKind::XLabel(_) | FigureElementKind::YLabel(_) => Err(
-			"font_size(...) is not available on x_label or y_label until their text bands reserve space"
+		FigureElementKind::XLabel(_) | FigureElementKind::TextHandle(TextHandleKind::XLabel) => {
+			XLabelTextSize::new(points as f32)
+				.map(FigureTextSize::XLabel)
+				.map_err(|error| error.to_string())
+		}
+		FigureElementKind::YLabel(_) | FigureElementKind::TextHandle(TextHandleKind::YLabel) => {
+			YLabelTextSize::new(points as f32)
+				.map(FigureTextSize::YLabel)
+				.map_err(|error| error.to_string())
+		}
+		_ => Err(
+			"font_size(...) is available on title, subtitle, x_label, and y_label members"
 				.to_owned(),
 		),
-		_ => Err("font_size(...) is available on title and subtitle members".to_owned()),
 	};
 	match text_size {
 		Ok(text_size) => element.font_size = Some(text_size),
@@ -3316,10 +3425,14 @@ fn raw_figure(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Outpu
 
 #[derive(Default)]
 struct FigureParts {
-	title: Option<(String, Option<TitleTextSize>, Origin)>,
-	subtitle: Option<(String, Option<SubtitleTextSize>, Origin)>,
+	title: Option<(String, Origin)>,
+	subtitle: Option<(String, Origin)>,
 	x_label: Option<(String, Origin)>,
 	y_label: Option<(String, Origin)>,
+	title_size: Option<(TitleTextSize, Origin)>,
+	subtitle_size: Option<(SubtitleTextSize, Origin)>,
+	x_label_size: Option<(XLabelTextSize, Origin)>,
+	y_label_size: Option<(YLabelTextSize, Origin)>,
 	facet: Option<(String, Origin)>,
 	facet_gutter: Option<(f32, Origin)>,
 	palette: Option<(String, Origin)>,
@@ -3337,6 +3450,8 @@ struct FigureParts {
 	y_minor_ticks: Option<(u32, Origin)>,
 	hover_size: Option<(HoverTextSize, Origin)>,
 	x_tick_rotation: Option<(TickRotation, Origin)>,
+	x_tick_size: Option<(XTickTextSize, Origin)>,
+	y_tick_size: Option<(YTickTextSize, Origin)>,
 	padding: Option<(FigurePadding, Origin)>,
 	body: Option<(RunePlotBody, Origin)>,
 }
@@ -3450,48 +3565,117 @@ fn merge_element(
 	origin: Origin,
 ) -> Result<(), PresentationFailure> {
 	match element {
-		FigureElementKind::Title(value) => set_once(
-			&mut parts.title,
-			(
-				value,
-				match font_size {
-					Some(FigureTextSize::Title(size)) => Some(size),
-					None => None,
-					Some(FigureTextSize::Subtitle(_)) => unreachable!("title size matches title"),
-				},
+		FigureElementKind::Title(value) => {
+			set_once(
+				&mut parts.title,
+				(value, origin),
 				origin,
-			),
-			origin,
-			"a figure has at most one title",
-		),
-		FigureElementKind::Subtitle(value) => set_once(
-			&mut parts.subtitle,
-			(
-				value,
-				match font_size {
-					Some(FigureTextSize::Subtitle(size)) => Some(size),
-					None => None,
-					Some(FigureTextSize::Title(_)) => {
-						unreachable!("subtitle size matches subtitle")
-					}
-				},
+				"a figure has at most one title",
+			)?;
+			if let Some(size) = font_size {
+				let FigureTextSize::Title(size) = size else {
+					unreachable!("title size matches title")
+				};
+				set_once(
+					&mut parts.title_size,
+					(size, origin),
+					origin,
+					"a figure has at most one title font size",
+				)?;
+			}
+			Ok(())
+		}
+		FigureElementKind::Subtitle(value) => {
+			set_once(
+				&mut parts.subtitle,
+				(value, origin),
 				origin,
+				"a figure has at most one subtitle",
+			)?;
+			if let Some(size) = font_size {
+				let FigureTextSize::Subtitle(size) = size else {
+					unreachable!("subtitle size matches subtitle")
+				};
+				set_once(
+					&mut parts.subtitle_size,
+					(size, origin),
+					origin,
+					"a figure has at most one subtitle font size",
+				)?;
+			}
+			Ok(())
+		}
+		FigureElementKind::XLabel(value) => {
+			set_once(
+				&mut parts.x_label,
+				(value, origin),
+				origin,
+				"a figure has at most one x_label element",
+			)?;
+			if let Some(size) = font_size {
+				let FigureTextSize::XLabel(size) = size else {
+					unreachable!("x-label size matches x_label")
+				};
+				set_once(
+					&mut parts.x_label_size,
+					(size, origin),
+					origin,
+					"a figure has at most one x_label font size",
+				)?;
+			}
+			Ok(())
+		}
+		FigureElementKind::YLabel(value) => {
+			set_once(
+				&mut parts.y_label,
+				(value, origin),
+				origin,
+				"a figure has at most one y_label element",
+			)?;
+			if let Some(size) = font_size {
+				let FigureTextSize::YLabel(size) = size else {
+					unreachable!("y-label size matches y_label")
+				};
+				set_once(
+					&mut parts.y_label_size,
+					(size, origin),
+					origin,
+					"a figure has at most one y_label font size",
+				)?;
+			}
+			Ok(())
+		}
+		FigureElementKind::TextHandle(handle) => match (handle, font_size) {
+			(TextHandleKind::Title, Some(FigureTextSize::Title(size))) => set_once(
+				&mut parts.title_size,
+				(size, origin),
+				origin,
+				"a figure has at most one title font size",
 			),
-			origin,
-			"a figure has at most one subtitle",
-		),
-		FigureElementKind::XLabel(value) => set_once(
-			&mut parts.x_label,
-			(value, origin),
-			origin,
-			"a figure has at most one x_label element",
-		),
-		FigureElementKind::YLabel(value) => set_once(
-			&mut parts.y_label,
-			(value, origin),
-			origin,
-			"a figure has at most one y_label element",
-		),
+			(TextHandleKind::Subtitle, Some(FigureTextSize::Subtitle(size))) => set_once(
+				&mut parts.subtitle_size,
+				(size, origin),
+				origin,
+				"a figure has at most one subtitle font size",
+			),
+			(TextHandleKind::XLabel, Some(FigureTextSize::XLabel(size))) => set_once(
+				&mut parts.x_label_size,
+				(size, origin),
+				origin,
+				"a figure has at most one x_label font size",
+			),
+			(TextHandleKind::YLabel, Some(FigureTextSize::YLabel(size))) => set_once(
+				&mut parts.y_label_size,
+				(size, origin),
+				origin,
+				"a figure has at most one y_label font size",
+			),
+			(_, None) => Err(PresentationFailure::new(
+				origin,
+				"a bare text member requires text or .font_size(...)",
+			)),
+			_ => unreachable!("text handle and font-size variant match"),
+		},
 		FigureElementKind::Facet(value) => {
 			set_once(
 				&mut parts.facet,
@@ -3581,35 +3765,71 @@ fn merge_element(
 			origin,
 			"a figure has at most one x_tick_rotation element",
 		),
-		FigureElementKind::Padding => set_once(
-			&mut parts.padding,
-			(padding, origin),
+		FigureElementKind::XTickSize(value) => set_once(
+			&mut parts.x_tick_size,
+			(value, origin),
 			origin,
-			"a figure has at most one padding element",
+			"a figure has at most one x_tick_size element",
 		),
+		FigureElementKind::YTickSize(value) => set_once(
+			&mut parts.y_tick_size,
+			(value, origin),
+			origin,
+			"a figure has at most one y_tick_size element",
+		),
+		FigureElementKind::Padding => {
+			if padding.top.is_none()
+				&& padding.right.is_none()
+				&& padding.bottom.is_none()
+				&& padding.left.is_none()
+			{
+				return Err(PresentationFailure::new(
+					origin,
+					"padding() requires at least one edge modifier",
+				));
+			}
+			set_once(
+				&mut parts.padding,
+				(padding, origin),
+				origin,
+				"a figure has at most one padding element",
+			)
+		}
 	}
 }
 
 impl FigureParts {
 	fn finish(self, body: RunePlotBody) -> Result<RunePlotIntent, PresentationFailure> {
 		let mut authored_settings = PlotSettingsLayer::default();
-		if let Some((title, font_size, _)) = &self.title {
+		if let Some((title, _)) = &self.title {
 			authored_settings.title = Presence::Show(Arc::new(title.clone()));
-			if let Some(font_size) = font_size {
-				authored_settings.title_size = Override::Set(*font_size);
-			}
 		}
-		if let Some((subtitle, font_size, _)) = &self.subtitle {
+		if let Some((subtitle, _)) = &self.subtitle {
 			authored_settings.subtitle = Presence::Show(Arc::new(subtitle.clone()));
-			if let Some(font_size) = font_size {
-				authored_settings.subtitle_size = Override::Set(*font_size);
-			}
 		}
 		if let Some((x_label, _)) = &self.x_label {
 			authored_settings.x_label = Presence::Show(Arc::new(x_label.clone()));
 		}
 		if let Some((y_label, _)) = &self.y_label {
 			authored_settings.y_label = Presence::Show(Arc::new(y_label.clone()));
+		}
+		if let Some((size, _)) = self.title_size {
+			authored_settings.title_size = Override::Set(size);
+		}
+		if let Some((size, _)) = self.subtitle_size {
+			authored_settings.subtitle_size = Override::Set(size);
+		}
+		if let Some((size, _)) = self.x_label_size {
+			authored_settings.x_label_size = Override::Set(size);
+		}
+		if let Some((size, _)) = self.y_label_size {
+			authored_settings.y_label_size = Override::Set(size);
+		}
+		if let Some((size, _)) = self.x_tick_size {
+			authored_settings.x_tick_size = Override::Set(size);
+		}
+		if let Some((size, _)) = self.y_tick_size {
+			authored_settings.y_tick_size = Override::Set(size);
 		}
 		if let Some((legend, _)) = self.legend {
 			authored_settings.legend = legend;

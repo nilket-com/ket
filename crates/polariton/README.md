@@ -113,6 +113,20 @@ workspace.table("events").views([
 
 #### Rune bar presentation:
 
+Axis titles are text members, so their size attaches to the title. The
+no-argument form preserves a kernel-derived label while changing only its
+typography. Generated tick labels have no member, so they use dedicated words:
+
+```rune
+figure([
+    y_label().font_size(20),       // keeps the derived y-axis title
+    x_label("Quarter").font_size(18),
+    x_tick_size(12),
+    y_tick_size(14),
+    bar("product", "value"),
+])
+```
+
 Generated x-axis tick labels can rotate in degrees when long labels need more
 horizontal separation. The angle is bounded from `-90` through `90`; it does
 not rotate the authored `x_label(...)` axis title:

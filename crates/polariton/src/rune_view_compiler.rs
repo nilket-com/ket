@@ -54,10 +54,12 @@ const PRESENTATION_FREE: &[&str] = &[
 	"x_minor_ticks",
 	"x_tick_step",
 	"x_tick_rotation",
+	"x_tick_size",
 	"y_bounds",
 	"y_label",
 	"y_minor_ticks",
 	"y_tick_step",
+	"y_tick_size",
 ];
 
 const PRESENTATION_METHODS: &[&str] = &[
@@ -2807,10 +2809,6 @@ bar("x", "y"),
 
 		for (source, expected) in [
 			(
-				r#"workspace.table("t").views([figure([x_label("x").font_size(20), bar("x", "y")])])"#,
-				".font_size(20)",
-			),
-			(
 				r#"workspace.table("t").views([figure([skin("greys_rs2").font_size(20), bar("x", "y")])])"#,
 				".font_size(20)",
 			),
@@ -2825,17 +2823,110 @@ bar("x", "y"),
 			};
 			assert_eq!(&source[span.start as usize..span.end as usize], expected);
 		}
+	}
 
-		for unknown in ["x_tick_size(20)", "y_tick_size(20)"] {
-			let source =
-				format!("workspace.table(\"t\").views([figure([{unknown}, bar(\"x\", \"y\")])])");
-			let error = compile(&source).expect_err("blocked tick-size word stays unknown");
-			let RuneEnvelopeError::InvalidView { span, .. } = error else {
-				panic!("unknown spelling produces a presentation error")
+	#[test]
+	fn product_0122_axis_and_tick_typography_preserves_presence_and_exposes_all_four_roles() {
+		let source = r#"workspace.table("t").views([figure([
+x_label().font_size(22),
+y_label().font_size(20),
+title().font_size(24),
+subtitle().font_size(16),
+x_tick_size(14),
+y_tick_size(16),
+bar("x", "y"),
+])])"#;
+		let compiled = compile(source).expect("axis and tick typography compiles");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("axis typography fixture produced a table")
+		};
+		use crate::plot::spec::{
+			Override, Presence, SubtitleTextSize, TitleTextSize, XLabelTextSize, XTickTextSize,
+			YLabelTextSize, YTickTextSize,
+		};
+		assert!(matches!(plot.authored_settings.title, Presence::Inherit));
+		assert!(matches!(plot.authored_settings.subtitle, Presence::Inherit));
+		assert!(matches!(plot.authored_settings.x_label, Presence::Inherit));
+		assert!(matches!(plot.authored_settings.y_label, Presence::Inherit));
+		assert_eq!(
+			plot.authored_settings.title_size,
+			Override::Set(TitleTextSize::new(24.0).unwrap())
+		);
+		assert_eq!(
+			plot.authored_settings.subtitle_size,
+			Override::Set(SubtitleTextSize::new(16.0).unwrap())
+		);
+		assert_eq!(
+			plot.authored_settings.x_label_size,
+			Override::Set(XLabelTextSize::new(22.0).unwrap())
+		);
+		assert_eq!(
+			plot.authored_settings.y_label_size,
+			Override::Set(YLabelTextSize::new(20.0).unwrap())
+		);
+		assert_eq!(
+			plot.authored_settings.x_tick_size,
+			Override::Set(XTickTextSize::new(14.0).unwrap())
+		);
+		assert_eq!(
+			plot.authored_settings.y_tick_size,
+			Override::Set(YTickTextSize::new(16.0).unwrap())
+		);
+
+		let authored = compile(
+			r#"workspace.table("t").views([figure([y_label("Revenue").font_size(20), bar("x", "y")])])"#,
+		)
+		.expect("authored label and size compile");
+		let RuneViewIntent::Plot(authored) = &authored.executions[0].views[0].intent else {
+			panic!("authored label fixture produced a table")
+		};
+		assert!(
+			matches!(&authored.authored_settings.y_label, Presence::Show(value) if value.as_ref() == "Revenue")
+		);
+		assert_eq!(
+			authored.authored_settings.y_label_size,
+			Override::Set(YLabelTextSize::new(20.0).unwrap())
+		);
+
+		for spelling in ["x_tick_size", "y_tick_size"] {
+			for accepted in ["6", "96"] {
+				compile(&format!(
+					"workspace.table(\"t\").views([figure([{spelling}({accepted}), bar(\"x\", \"y\")])])"
+				))
+				.expect("inclusive endpoint compiles");
+			}
+			for rejected in ["5.9", "96.1", "\"large\""] {
+				let source = format!(
+					"workspace.table(\"t\").views([figure([{spelling}({rejected}), bar(\"x\", \"y\")])])"
+				);
+				let RuneEnvelopeError::InvalidView { span, .. } =
+					compile(&source).expect_err("invalid tick size refuses")
+				else {
+					panic!("invalid tick size produces a presentation error")
+				};
+				assert_eq!(
+					&source[span.start as usize..span.end as usize],
+					format!("{spelling}({rejected})")
+				);
+			}
+		}
+
+		for source in [
+			r#"workspace.table("t").views([figure([padding(), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([title(), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([subtitle(), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([x_label(), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([y_label(), bar("x", "y")])])"#,
+		] {
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				compile(source).expect_err("bare no-effect member refuses")
+			else {
+				panic!("bare member produces a presentation error")
 			};
-			assert_eq!(
-				&source[span.start as usize..span.end as usize],
-				unknown.split('(').next().expect("unknown identifier")
+			let refused = &source[span.start as usize..span.end as usize];
+			assert!(
+				refused.ends_with("()"),
+				"the member call owns the refusal: {refused}"
 			);
 		}
 	}
@@ -3472,10 +3563,9 @@ r.views([bar(category(), "revenue")])
 		assert_eq!(plot.facet_gutter, Some(24.0));
 		assert!(matches!(plot.body, RunePlotBody::Single(_)));
 
-		let legacy = compile(
-			r#"workspace.table("t").views([figure([facet_gutter(24), bar("x", "y")])])"#,
-		)
-		.expect_err("the retired free word is not an alias");
+		let legacy =
+			compile(r#"workspace.table("t").views([figure([facet_gutter(24), bar("x", "y")])])"#)
+				.expect_err("the retired free word is not an alias");
 		let RuneEnvelopeError::InvalidView { message, .. } = legacy else {
 			panic!("retired gutter spelling remains an invalid view")
 		};
