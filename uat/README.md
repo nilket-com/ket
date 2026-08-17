@@ -15,6 +15,17 @@ so the faceted panels can expose a quarter-assignment defect.
 input. Keep this repository copy authoritative; files in a neighboring `uat`
 directory are local conveniences and are not build inputs.
 
+Open the PRODUCT-0123 axis-member reference exhibit after seeding the same
+sales relation:
+
+```sh
+cargo run -p polariton -- uat/test38.rn
+```
+
+`test38.rn` demonstrates both legal composition forms: a chained `x_axis()`
+and separate `y_axis()` members whose distinct properties compose. It is a
+surface reference, while `test37.rn` remains the long-label geometry probe.
+
 Open the PRODUCT-0079 histogram exhibit after seeding the same sales relation:
 
 ```sh

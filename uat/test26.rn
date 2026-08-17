@@ -7,18 +7,18 @@ boxes.views([
 		title("Box plot · Tukey detail"),
 		subtitle("Medians, box outlines, whiskers, and caps"),
 		skin(skin),
-		y_label("Observed value"),
-		y_bounds(0, 40),
-		y_tick_step(5),
+		y_axis().label("Observed value"),
+		y_axis().bounds(0, 40),
+		y_axis().tick_step(5),
 		box("category", "whisker_low", "q1", "median", "q3", "whisker_high", "outlier"),
 	])),
     view("box-outliers", figure([
 		title("Box plot · Tukey outliers"),
 		subtitle("Groups: twin · lowhigh · none · flat · single"),
 		skin(skin),
-		y_label("Observed value"),
-		y_bounds(-75, 225),
-        y_tick_step(25),
+		y_axis().label("Observed value"),
+		y_axis().bounds(-75, 225),
+        y_axis().tick_step(25),
         box("category", "whisker_low", "q1", "median", "q3", "whisker_high", "outlier"),
 	])),
 ]);
@@ -28,7 +28,7 @@ percent.views([
 		title("Axis title · derived percent-of-total"),
 		subtitle("No authored y_label: the transform supplies truthful prose"),
 		skin(skin),
-		y_tick_step(25),
+		y_axis().tick_step(25),
 		bar("region", "revenue", "product")
 			.stacked()
 			.percent(),

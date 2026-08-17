@@ -1879,9 +1879,9 @@ workspace.table("t").views([figure([
 	#[test]
 	fn product_0036_figure_bounds_lower_once_as_one_domain_override() {
 		let source = r#"workspace.table("t").views([figure([
-			y_bounds(-1.0, 10.0),
+			y_axis().bounds(-1.0, 10.0),
 			title("Bounded"),
-			x_bounds(0.0, 20.0),
+			x_axis().bounds(0.0, 20.0),
 			layers([line("x", "y"), scatter("x", "y")]),
 		])])"#;
 		let transformed = transform(source).expect("bounded figure envelope");
@@ -1900,12 +1900,12 @@ workspace.table("t").views([figure([
 		assert_eq!(
 			&source[plot.domain_spans.x.clone().unwrap().start as usize
 				..plot.domain_spans.x.clone().unwrap().end as usize],
-			"x_bounds(0.0, 20.0)"
+			".bounds(0.0, 20.0)"
 		);
 		assert_eq!(
 			&source[plot.domain_spans.y.clone().unwrap().start as usize
 				..plot.domain_spans.y.clone().unwrap().end as usize],
-			"y_bounds(-1.0, 10.0)"
+			".bounds(-1.0, 10.0)"
 		);
 		let RunePlotBody::Layered(specification) = &plot.body else {
 			panic!("bounds must not change the layered body");
@@ -1922,7 +1922,7 @@ workspace.table("t").views([figure([
 	#[test]
 	fn product_0036_negative_bounds_and_omission_are_exact() {
 		let negative = transform(
-			"workspace.table(\"t\").views([figure([y_bounds(-1.0, 1.0), bar(\"cat\", \"val\")])])",
+			"workspace.table(\"t\").views([figure([y_axis().bounds(-1.0, 1.0), bar(\"cat\", \"val\")])])",
 		)
 		.expect("unary-negated bound");
 		let RuneViewIntent::Plot(negative) = &negative.views[0].intent else {
@@ -1950,14 +1950,15 @@ workspace.table("t").views([figure([
 	#[test]
 	fn product_0036_undefined_bounds_refuse_at_the_exact_constructor() {
 		for (bounds, expected) in [
-			("x_bounds(1e999, 2.0)", "requires finite bounds"),
-			("x_bounds(10.0, 0.0)", "cannot reverse an axis"),
-			("x_bounds(5.0, 5.0)", "cannot form a collapsed axis"),
-			("x_bounds(value, 2.0)", "No local variable"),
-			("x_bounds(0.0)", "requires exactly two numeric values"),
+			(".bounds(1e999, 2.0)", "requires finite bounds"),
+			(".bounds(10.0, 0.0)", "cannot reverse an axis"),
+			(".bounds(5.0, 5.0)", "cannot form a collapsed axis"),
+			(".bounds(value, 2.0)", "No local variable"),
+			(".bounds(0.0)", "requires exactly two numeric values"),
 		] {
-			let source =
-				format!("workspace.table(\"t\").views([figure([{bounds}, line(\"x\", \"y\")])])");
+			let source = format!(
+				"workspace.table(\"t\").views([figure([x_axis(){bounds}, line(\"x\", \"y\")])])"
+			);
 			let RuneEnvelopeError::InvalidView { span, message } =
 				transform(&source).expect_err("undefined bounds must refuse")
 			else {
@@ -1974,7 +1975,7 @@ workspace.table("t").views([figure([
 			assert!(message.contains(expected), "{message}");
 		}
 
-		let duplicate = "workspace.table(\"t\").views([figure([y_bounds(0.0, 1.0), y_bounds(2.0, 3.0), line(\"x\", \"y\")])])";
+		let duplicate = "workspace.table(\"t\").views([figure([y_axis().bounds(0.0, 1.0), y_axis().bounds(2.0, 3.0), line(\"x\", \"y\")])])";
 		let RuneEnvelopeError::InvalidView { span, message } =
 			transform(duplicate).expect_err("duplicate bounds must refuse")
 		else {
@@ -1982,16 +1983,16 @@ workspace.table("t").views([figure([
 		};
 		assert_eq!(
 			&duplicate[span.start as usize..span.end as usize],
-			"y_bounds(2.0, 3.0)"
+			".bounds(2.0, 3.0)"
 		);
-		assert!(message.contains("at most one y_bounds"));
+		assert!(message.contains("y_axis().bounds(...) may appear at most once"));
 	}
 
 	#[test]
 	fn product_0038_tick_steps_lower_once_and_keep_axes_independent() {
 		for (literal, expected) in [("1", 1.0), ("1.0", 1.0)] {
 			let source = format!(
-				"workspace.table(\"t\").views([figure([y_bounds(0, 7), y_tick_step({literal}), bar(\"cat\", \"val\")])])"
+				"workspace.table(\"t\").views([figure([y_axis().bounds(0, 7), y_axis().tick_step({literal}), bar(\"cat\", \"val\")])])"
 			);
 			let transformed = transform(&source).expect("tick step figure");
 			let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
@@ -2008,12 +2009,12 @@ workspace.table("t").views([figure([
 			assert_eq!(
 				&source[plot.tick_step_spans.y.clone().unwrap().start as usize
 					..plot.tick_step_spans.y.clone().unwrap().end as usize],
-				format!("y_tick_step({literal})")
+				format!(".tick_step({literal})")
 			);
 		}
 
 		let no_bounds = transform(
-			"workspace.table(\"t\").views([figure([y_tick_step(1), line(\"x\", \"y\")])])",
+			"workspace.table(\"t\").views([figure([y_axis().tick_step(1), line(\"x\", \"y\")])])",
 		)
 		.expect("data-derived step figure");
 		let RuneViewIntent::Plot(plot) = &no_bounds.views[0].intent else {
@@ -2027,14 +2028,14 @@ workspace.table("t").views([figure([
 	#[test]
 	fn product_0038_tick_step_refusals_are_value_and_span_attributed() {
 		for (constructor, expected) in [
-			("y_tick_step(0)", "step must be strictly positive"),
-			("y_tick_step(-1)", "step must be strictly positive"),
-			("y_tick_step(1e999)", "requires a finite step"),
-			("y_tick_step(value)", "No local variable"),
-			("y_tick_step()", "requires exactly one numeric value"),
+			(".tick_step(0)", "step must be strictly positive"),
+			(".tick_step(-1)", "step must be strictly positive"),
+			(".tick_step(1e999)", "requires a finite step"),
+			(".tick_step(value)", "No local variable"),
+			(".tick_step()", "requires exactly one numeric value"),
 		] {
 			let source = format!(
-				"workspace.table(\"t\").views([figure([{constructor}, line(\"x\", \"y\")])])"
+				"workspace.table(\"t\").views([figure([y_axis(){constructor}, line(\"x\", \"y\")])])"
 			);
 			let RuneEnvelopeError::InvalidView { span, message } =
 				transform(&source).expect_err("invalid tick step")
@@ -2051,7 +2052,7 @@ workspace.table("t").views([figure([
 			);
 			assert!(message.contains(expected), "{message}");
 		}
-		let duplicate = "workspace.table(\"t\").views([figure([y_tick_step(1), y_tick_step(2), line(\"x\", \"y\")])])";
+		let duplicate = "workspace.table(\"t\").views([figure([y_axis().tick_step(1), y_axis().tick_step(2), line(\"x\", \"y\")])])";
 		let RuneEnvelopeError::InvalidView { span, message } =
 			transform(duplicate).expect_err("duplicate tick step")
 		else {
@@ -2059,16 +2060,16 @@ workspace.table("t").views([figure([
 		};
 		assert_eq!(
 			&duplicate[span.start as usize..span.end as usize],
-			"y_tick_step(2)"
+			".tick_step(2)"
 		);
-		assert!(message.contains("at most one y_tick_step"));
+		assert!(message.contains("y_axis().tick_step(...) may appear at most once"));
 	}
 
 	#[test]
 	fn product_0039_minor_ticks_lower_as_independent_counts() {
 		for (literal, expected) in [("0", 0), ("1", 1), ("1.0", 1), ("4294967295", u32::MAX)] {
 			let source = format!(
-				"workspace.table(\"t\").views([figure([x_minor_ticks({literal}), y_minor_ticks({literal}), bar(\"cat\", \"val\")])])"
+				"workspace.table(\"t\").views([figure([x_axis().minor_ticks({literal}), y_axis().minor_ticks({literal}), bar(\"cat\", \"val\")])])"
 			);
 			let transformed = transform(&source).expect("minor tick figure");
 			let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
@@ -2081,8 +2082,7 @@ workspace.table("t").views([figure([
 			assert_eq!(guides.y_minor_ticks, expected);
 		}
 
-		let source =
-			"workspace.table(\"t\").views([figure([y_minor_ticks(1), bar(\"cat\", \"val\")])])";
+		let source = "workspace.table(\"t\").views([figure([y_axis().minor_ticks(1), bar(\"cat\", \"val\")])])";
 		let transformed = transform(source).expect("single minor axis");
 		let RuneViewIntent::Plot(plot) = &transformed.views[0].intent else {
 			panic!("expected plot");
@@ -2091,21 +2091,21 @@ workspace.table("t").views([figure([
 		assert_eq!(
 			&source[plot.minor_tick_spans.y.clone().unwrap().start as usize
 				..plot.minor_tick_spans.y.clone().unwrap().end as usize],
-			"y_minor_ticks(1)"
+			".minor_ticks(1)"
 		);
 	}
 
 	#[test]
 	fn product_0039_minor_tick_value_refusals_are_attributed() {
 		for (constructor, expected) in [
-			("y_minor_ticks(-1)", "count must be a non-negative integer"),
-			("y_minor_ticks(2.5)", "count must be a non-negative integer"),
-			("y_minor_ticks(1e999)", "requires a finite count"),
-			("y_minor_ticks(value)", "No local variable"),
-			("y_minor_ticks()", "requires exactly one numeric value"),
+			(".minor_ticks(-1)", "count must be a non-negative integer"),
+			(".minor_ticks(2.5)", "count must be a non-negative integer"),
+			(".minor_ticks(1e999)", "requires a finite count"),
+			(".minor_ticks(value)", "No local variable"),
+			(".minor_ticks()", "requires exactly one numeric value"),
 		] {
 			let source = format!(
-				"workspace.table(\"t\").views([figure([{constructor}, line(\"x\", \"y\")])])"
+				"workspace.table(\"t\").views([figure([y_axis(){constructor}, line(\"x\", \"y\")])])"
 			);
 			let RuneEnvelopeError::InvalidView { span, message } =
 				transform(&source).expect_err("invalid minor count must refuse")
@@ -2123,7 +2123,7 @@ workspace.table("t").views([figure([
 			assert!(message.contains(expected), "{message}");
 		}
 
-		let duplicate = "workspace.table(\"t\").views([figure([y_minor_ticks(1), y_minor_ticks(2), line(\"x\", \"y\")])])";
+		let duplicate = "workspace.table(\"t\").views([figure([y_axis().minor_ticks(1), y_axis().minor_ticks(2), line(\"x\", \"y\")])])";
 		let RuneEnvelopeError::InvalidView { span, message } =
 			transform(duplicate).expect_err("duplicate minor count must refuse")
 		else {
@@ -2131,9 +2131,9 @@ workspace.table("t").views([figure([
 		};
 		assert_eq!(
 			&duplicate[span.start as usize..span.end as usize],
-			"y_minor_ticks(2)"
+			".minor_ticks(2)"
 		);
-		assert!(message.contains("at most one y_minor_ticks"));
+		assert!(message.contains("y_axis().minor_ticks(...) may appear at most once"));
 	}
 
 	#[test]
@@ -2153,9 +2153,9 @@ workspace.table("t").views([figure([
     subtitle(subtitle_text),
     skin(skin_name),
     palette(palette_name),
-    y_bounds(minimum, maximum),
-    y_tick_step(major_step),
-    y_minor_ticks(minor_count),
+    y_axis().bounds(minimum, maximum),
+    y_axis().tick_step(major_step),
+    y_axis().minor_ticks(minor_count),
     bar("cat", "val"),
 ])])
 "#;
@@ -2203,11 +2203,11 @@ workspace.table("t").views([figure([
 				"Missing item make_title",
 			),
 			(
-				"let step = -1; workspace.table(\"t\").views([figure([y_tick_step(step), line(\"x\", \"y\")])])",
+				"let step = -1; workspace.table(\"t\").views([figure([y_axis().tick_step(step), line(\"x\", \"y\")])])",
 				"step must be strictly positive",
 			),
 			(
-				"let maximum = 0; workspace.table(\"t\").views([figure([y_bounds(1, maximum), line(\"x\", \"y\")])])",
+				"let maximum = 0; workspace.table(\"t\").views([figure([y_axis().bounds(1, maximum), line(\"x\", \"y\")])])",
 				"cannot reverse an axis",
 			),
 		] {
@@ -2222,7 +2222,7 @@ workspace.table("t").views([figure([
 
 	#[test]
 	fn product_0076_stage0_computed_figure_element_is_the_banked_red_boundary() {
-		let source = r#"let yb = y_bounds(0, 160);
+		let source = r#"let yb = y_axis().bounds(0, 160);
 workspace.table("demo_sales").views([figure([
     title("Grouped bars"),
     yb,

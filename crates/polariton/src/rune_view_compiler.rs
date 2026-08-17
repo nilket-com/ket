@@ -49,17 +49,8 @@ const PRESENTATION_FREE: &[&str] = &[
 	"diverging_palette",
 	"table",
 	"title",
-	"x_bounds",
-	"x_label",
-	"x_minor_ticks",
-	"x_tick_step",
-	"x_tick_rotation",
-	"x_tick_size",
-	"y_bounds",
-	"y_label",
-	"y_minor_ticks",
-	"y_tick_step",
-	"y_tick_size",
+	"x_axis",
+	"y_axis",
 ];
 
 const PRESENTATION_METHODS: &[&str] = &[
@@ -77,6 +68,13 @@ const PRESENTATION_METHODS: &[&str] = &[
 	"right",
 	"bottom",
 	"left",
+	"label",
+	"label_size",
+	"bounds",
+	"tick_step",
+	"minor_ticks",
+	"tick_size",
+	"tick_rotation",
 	"show_types",
 	"skin",
 	"stacked",
@@ -2384,12 +2382,12 @@ relation.views([figure([
 			panic!("percent title exhibit did not retain its styled bar")
 		};
 		assert!(percent.stacked && percent.percent);
-		assert!(source.contains("y_bounds(0, 40)"));
-		assert!(source.contains("y_bounds(-75, 225)"));
+		assert!(source.contains(".bounds(0, 40)"));
+		assert!(source.contains(".bounds(-75, 225)"));
 		for case in ["twin", "lowhigh", "none", "flat", "single"] {
 			assert!(source.contains(case), "exhibit omits {case}");
 		}
-		assert!(source.contains("y_label(\"Observed value\")"));
+		assert!(source.contains("y_axis().label(\"Observed value\")"));
 		assert!(source.contains("Axis title · derived percent-of-total"));
 	}
 
@@ -2561,9 +2559,9 @@ relation.views([figure([
 	#[test]
 	fn product_0085_axis_labels_execute_helpers_preserve_text_and_refuse_precisely() {
 		let helper = r#"
-fn axis() { y_label("Observed value") }
+fn axis() { y_axis().label("Observed value") }
 workspace.table("t").views([figure([
-	x_label(" Sales region "), axis(), box("category", "lo", "q1", "mid", "q3", "hi", "outlier"),
+	x_axis().label(" Sales region "), axis(), box("category", "lo", "q1", "mid", "q3", "hi", "outlier"),
 ])])
 "#;
 		let compiled = compile(helper).expect("helper-produced axis titles compile");
@@ -2581,7 +2579,7 @@ workspace.table("t").views([figure([
 
 		for authored in ["", "   "] {
 			let source = format!(
-				"workspace.table(\"t\").views([figure([y_label(\"{authored}\"), bar(\"x\", \"y\")])])"
+				"workspace.table(\"t\").views([figure([y_axis().label(\"{authored}\"), bar(\"x\", \"y\")])])"
 			);
 			let error = compile(&source).expect_err("blank axis title refuses");
 			let RuneEnvelopeError::InvalidView { span, message } = error else {
@@ -2589,21 +2587,24 @@ workspace.table("t").views([figure([
 			};
 			assert_eq!(
 				&source[span.start as usize..span.end as usize],
-				format!("y_label(\"{authored}\")")
+				format!(".label(\"{authored}\")")
 			);
 			assert!(message.contains("nonempty string"), "{message}");
 		}
 
-		let duplicate = "workspace.table(\"t\").views([figure([y_label(\"first\"), y_label(\"second\"), bar(\"x\", \"y\")])])";
+		let duplicate = "workspace.table(\"t\").views([figure([y_axis().label(\"first\"), y_axis().label(\"second\"), bar(\"x\", \"y\")])])";
 		let error = compile(duplicate).expect_err("duplicate y labels refuse");
 		let RuneEnvelopeError::InvalidView { span, message } = error else {
 			panic!("duplicate refusal retains its origin")
 		};
 		assert_eq!(
 			&duplicate[span.start as usize..span.end as usize],
-			"y_label(\"second\")"
+			".label(\"second\")"
 		);
-		assert!(message.contains("at most one y_label"), "{message}");
+		assert!(
+			message.contains("y_axis().label(...) may appear at most once"),
+			"{message}"
+		);
 	}
 
 	#[test]
@@ -2650,7 +2651,7 @@ workspace.table("t").views([figure([
 	#[test]
 	fn product_0115_x_tick_rotation_is_a_typed_generated_text_word() {
 		let source = r#"workspace.table("t").views([figure([
-x_tick_rotation(-45),
+x_axis().tick_rotation(-45),
 bar("x", "y"),
 ])])"#;
 		let compiled = compile(source).expect("x-tick rotation compiles");
@@ -2664,13 +2665,13 @@ bar("x", "y"),
 
 		for accepted in ["-90", "0", "90"] {
 			compile(&format!(
-				"workspace.table(\"t\").views([figure([x_tick_rotation({accepted}), bar(\"x\", \"y\")])])"
+				"workspace.table(\"t\").views([figure([x_axis().tick_rotation({accepted}), bar(\"x\", \"y\")])])"
 			))
 			.expect("inclusive degree endpoint compiles");
 		}
 		for rejected in ["-90.1", "90.1", "\"diagonal\""] {
 			let source = format!(
-				"workspace.table(\"t\").views([figure([x_tick_rotation({rejected}), bar(\"x\", \"y\")])])"
+				"workspace.table(\"t\").views([figure([x_axis().tick_rotation({rejected}), bar(\"x\", \"y\")])])"
 			);
 			let error = compile(&source).expect_err("invalid rotation refuses");
 			let RuneEnvelopeError::InvalidView { span, message } = error else {
@@ -2678,7 +2679,7 @@ bar("x", "y"),
 			};
 			assert_eq!(
 				&source[span.start as usize..span.end as usize],
-				format!("x_tick_rotation({rejected})")
+				format!(".tick_rotation({rejected})")
 			);
 			assert!(message.contains("x-tick rotation") || message.contains("requires a number"));
 		}
@@ -2826,14 +2827,14 @@ bar("x", "y"),
 	}
 
 	#[test]
-	fn product_0122_axis_and_tick_typography_preserves_presence_and_exposes_all_four_roles() {
+	fn product_0123_axis_members_preserve_axis_authority_and_compose() {
 		let source = r#"workspace.table("t").views([figure([
-x_label().font_size(22),
-y_label().font_size(20),
+x_axis().label_size(22),
+y_axis().label_size(20),
 title().font_size(24),
 subtitle().font_size(16),
-x_tick_size(14),
-y_tick_size(16),
+x_axis().tick_size(14),
+y_axis().tick_size(16),
 bar("x", "y"),
 ])])"#;
 		let compiled = compile(source).expect("axis and tick typography compiles");
@@ -2874,7 +2875,7 @@ bar("x", "y"),
 		);
 
 		let authored = compile(
-			r#"workspace.table("t").views([figure([y_label("Revenue").font_size(20), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([y_axis().label("Revenue").label_size(20), bar("x", "y")])])"#,
 		)
 		.expect("authored label and size compile");
 		let RuneViewIntent::Plot(authored) = &authored.executions[0].views[0].intent else {
@@ -2888,7 +2889,7 @@ bar("x", "y"),
 			Override::Set(YLabelTextSize::new(20.0).unwrap())
 		);
 
-		for spelling in ["x_tick_size", "y_tick_size"] {
+		for spelling in ["x_axis().tick_size", "y_axis().tick_size"] {
 			for accepted in ["6", "96"] {
 				compile(&format!(
 					"workspace.table(\"t\").views([figure([{spelling}({accepted}), bar(\"x\", \"y\")])])"
@@ -2906,17 +2907,14 @@ bar("x", "y"),
 				};
 				assert_eq!(
 					&source[span.start as usize..span.end as usize],
-					format!("{spelling}({rejected})")
+					format!(".tick_size({rejected})")
 				);
 			}
 		}
 
 		for source in [
-			r#"workspace.table("t").views([figure([padding(), bar("x", "y")])])"#,
-			r#"workspace.table("t").views([figure([title(), bar("x", "y")])])"#,
-			r#"workspace.table("t").views([figure([subtitle(), bar("x", "y")])])"#,
-			r#"workspace.table("t").views([figure([x_label(), bar("x", "y")])])"#,
-			r#"workspace.table("t").views([figure([y_label(), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([x_axis(), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([y_axis(), bar("x", "y")])])"#,
 		] {
 			let RuneEnvelopeError::InvalidView { span, .. } =
 				compile(source).expect_err("bare no-effect member refuses")
@@ -2929,21 +2927,78 @@ bar("x", "y"),
 				"the member call owns the refusal: {refused}"
 			);
 		}
+
+		let separate = compile(
+			r#"workspace.table("t").views([figure([x_axis().bounds(0, 10), x_axis().tick_step(2), line("x", "y")])])"#,
+		)
+		.expect("disjoint axis members compose");
+		let chained = compile(
+			r#"workspace.table("t").views([figure([x_axis().bounds(0, 10).tick_step(2), line("x", "y")])])"#,
+		)
+		.expect("chained axis members compile");
+		assert_eq!(
+			separate.executions[0].views[0].intent,
+			chained.executions[0].views[0].intent
+		);
+
+		let duplicate = r#"workspace.table("t").views([figure([x_axis().bounds(0, 10), x_axis().bounds(2, 8), line("x", "y")])])"#;
+		let RuneEnvelopeError::InvalidView { span, .. } =
+			compile(duplicate).expect_err("duplicate axis property refuses")
+		else {
+			panic!("duplicate axis property retains a presentation span")
+		};
+		assert_eq!(
+			&duplicate[span.start as usize..span.end as usize],
+			".bounds(2, 8)"
+		);
+
+		for retired in [
+			"x_label",
+			"y_label",
+			"x_bounds",
+			"y_bounds",
+			"x_tick_step",
+			"y_tick_step",
+			"x_minor_ticks",
+			"y_minor_ticks",
+			"x_tick_rotation",
+			"x_tick_size",
+			"y_tick_size",
+		] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([{retired}(1), bar(\"x\", \"y\")])])"
+			);
+			let error = compile(&source).expect_err("retired axis word is unknown");
+			assert!(error.to_string().contains(retired), "{error}");
+		}
+
+		for source in [
+			r#"workspace.table("t").views([figure([skin("greys_rs2").bounds(0, 1), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([x_axis().gutter(4), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([y_axis().tick_rotation(45), bar("x", "y")])])"#,
+		] {
+			let RuneEnvelopeError::InvalidView { span, .. } =
+				compile(source).expect_err("wrong axis modifier receiver refuses")
+			else {
+				panic!("wrong axis modifier retains a presentation span")
+			};
+			assert!(source[span.start as usize..span.end as usize].starts_with('.'));
+		}
 	}
 
 	#[test]
 	fn product_0076_lexer_does_not_rewrite_strings_or_comments() {
-		let source = "// bar(\"x\", \"y\")\nlet text = \"y_bounds(0, 1)\"; title(text)";
+		let source = "// bar(\"x\", \"y\")\nlet text = \"y_axis().bounds(0, 1)\"; title(text)";
 		let rewritten = rewrite_calls(source, 0).expect("rewrite live constructor only");
 		assert!(rewritten.contains("// bar(\"x\", \"y\")"));
-		assert!(rewritten.contains("\"y_bounds(0, 1)\""));
+		assert!(rewritten.contains("\"y_axis().bounds(0, 1)\""));
 		assert!(rewritten.contains("polariton_presentation::__title(text"));
 	}
 
 	#[test]
 	fn product_0076_compiler_executes_computed_presentation_with_static_topology() {
 		let source = r#"
-let yb = y_bounds(0, 160);
+let yb = y_axis().bounds(0, 160);
 let category = "region";
 let value = "revenue";
 let standard = || figure([
@@ -3044,7 +3099,7 @@ workspace.table("bins").views([
 	#[test]
 	fn product_0076_helper_failures_keep_the_helper_body_origin() {
 		let source = r#"
-fn bad() { y_bounds(9, 2) }
+fn bad() { y_axis().bounds(9, 2) }
 fn middle() { bad() }
 fn outer() { middle() }
 workspace.table("t").views([figure([outer(), line("x", "y")])])
@@ -3055,7 +3110,7 @@ workspace.table("t").views([figure([outer(), line("x", "y")])])
 		};
 		assert_eq!(
 			&source[span.start as usize..span.end as usize],
-			"y_bounds(9, 2)"
+			".bounds(9, 2)"
 		);
 		assert!(message.contains("cannot reverse an axis"), "{message}");
 	}
@@ -3064,7 +3119,7 @@ workspace.table("t").views([figure([outer(), line("x", "y")])])
 	fn product_0076_partition_separates_vocabularies_and_keeps_literal_dual_use() {
 		let source = r#"
 let category = "region";
-let yb = y_bounds(0, 10);
+let yb = y_axis().bounds(0, 10);
 let r = workspace.table("t").sort([col(category).asc()]);
 r.views([figure([yb, bar(category, "revenue")])])
 "#;
@@ -3089,7 +3144,8 @@ r.views([figure([yb, bar(category, "revenue")])])
 		assert!(relation.source.contains("col(category)"));
 		assert!(!relation.source.contains("y_bounds"));
 		assert!(!relation.source.contains("bar(category"));
-		assert!(presentation.source.contains("__y_bounds"));
+		assert!(presentation.source.contains("__y_axis"));
+		assert!(presentation.source.contains(".__bounds"));
 		assert!(presentation.source.contains("__bar(category"));
 		assert!(!presentation.source.contains("workspace.table"));
 		assert!(
@@ -3113,7 +3169,7 @@ r.views([bar(category(), "revenue")])
 		);
 
 		let mixed = r#"
-fn impossible() { [col("region"), y_bounds(0, 10)] }
+fn impossible() { [col("region"), y_axis().bounds(0, 10)] }
 workspace.table("t").views([figure([impossible(), bar("region", "revenue")])])
 "#;
 		let error = compile(mixed).expect_err("mixed helper refuses");
@@ -3128,7 +3184,7 @@ workspace.table("t").views([figure([impossible(), bar("region", "revenue")])])
 	fn product_0076_unclaimed_effects_stay_relation_side_but_presentation_does_not_leak() {
 		let source = r#"
 observe("kept");
-let unused = y_bounds(0, 10);
+let unused = y_axis().bounds(0, 10);
 workspace.table("t").views([bar("region", "revenue")])
 "#;
 		let analysis = analyze_static(source).expect("static shell");
@@ -3168,11 +3224,11 @@ fn pass(value) { value }
 fn twice(value) { pass(value) }
 fn furniture() { [
 	twice(title("Title")), twice(subtitle("Subtitle")),
-	twice(x_label("Horizontal")), twice(y_label("Vertical")), twice(facet("region")),
+	twice(x_axis().label("Horizontal")), twice(y_axis().label("Vertical")), twice(facet("region")),
 	twice(palette("viridis")), twice(skin("nord").duotone()),
-	twice(legend_at(0.2, 0.8)), twice(x_bounds(0, 10)), twice(y_bounds(0, 20)),
-	twice(x_tick_step(2)), twice(y_tick_step(4)),
-	twice(x_minor_ticks(2)), twice(y_minor_ticks(3)),
+	twice(legend_at(0.2, 0.8)), twice(x_axis().bounds(0, 10)), twice(y_axis().bounds(0, 20)),
+	twice(x_axis().tick_step(2)), twice(y_axis().tick_step(4)),
+	twice(x_axis().minor_ticks(2)), twice(y_axis().minor_ticks(3)),
 	twice(bar("region", "revenue", "product")
 		.bar_width(0.8).category_gap(0.1).stacked().percent()),
 ] }
@@ -3191,10 +3247,10 @@ r.views([
 let r = workspace.table("t");
 r.views([
 	figure([
-		title("Title"), subtitle("Subtitle"), x_label("Horizontal"), y_label("Vertical"),
+		title("Title"), subtitle("Subtitle"), x_axis().label("Horizontal"), y_axis().label("Vertical"),
 		facet("region"), palette("viridis"),
-		skin("nord").duotone(), legend_at(0.2, 0.8), x_bounds(0, 10), y_bounds(0, 20),
-		x_tick_step(2), y_tick_step(4), x_minor_ticks(2), y_minor_ticks(3),
+		skin("nord").duotone(), legend_at(0.2, 0.8), x_axis().bounds(0, 10), y_axis().bounds(0, 20),
+		x_axis().tick_step(2), y_axis().tick_step(4), x_axis().minor_ticks(2), y_axis().minor_ticks(3),
 		bar("region", "revenue", "product").bar_width(0.8).category_gap(0.1).stacked().percent(),
 	]),
 	table().skin("nord").duotone().show_types(),
@@ -3221,7 +3277,7 @@ r.views([
 	fn product_0076_partition_tracks_shadowed_occurrences_by_position() {
 		let source = r#"
 let value = "first";
-let before = y_bounds(0, 1);
+let before = y_axis().bounds(0, 1);
 let value = "region";
 let r = workspace.table("t").sort([col(value).asc()]);
 let value = "revenue";
@@ -3570,5 +3626,18 @@ r.views([bar(category(), "revenue")])
 			panic!("retired gutter spelling remains an invalid view")
 		};
 		assert!(message.contains("Missing item facet_gutter"), "{message}");
+	}
+
+	#[test]
+	fn product_0123_test38_is_the_axis_member_reference_exhibit() {
+		let source = include_str!("../../../uat/test38.rn");
+		let compiled = compile(source).expect("the checked-in axis-member exhibit compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(compiled.executions[0].views.len(), 2);
+		assert!(source.contains("x_axis()\n\t\t\t.label(\"Units sold\")"));
+		assert!(source.contains("y_axis().label(\"Revenue · $k\").label_size(18)"));
+		assert!(
+			source.contains("y_axis().bounds(0, 50).tick_step(10).minor_ticks(1).tick_size(12)")
+		);
 	}
 }

@@ -17,9 +17,9 @@ ket.table("demo_sales")
 			title("Vertical · Grouped"),
 			skin(skin),
 			palette(palette),
-			y_bounds(0, 40),
-			y_tick_step(10),
-			y_minor_ticks(1),
+			y_axis().bounds(0, 40),
+			y_axis().tick_step(10),
+			y_axis().minor_ticks(1),
 			bar(category, value, series)
 				.bar_width(0.88)
 				.category_gap(0.24),
@@ -28,9 +28,9 @@ ket.table("demo_sales")
 			title("Vertical · Stacked"),
 			skin(skin),
 			palette(palette),
-			y_bounds(0, 100),
-			y_tick_step(10),
-			y_minor_ticks(1),
+			y_axis().bounds(0, 100),
+			y_axis().tick_step(10),
+			y_axis().minor_ticks(1),
 			bar(category, value, series)
 				.stacked()
 				.bar_width(0.88)
@@ -40,7 +40,7 @@ ket.table("demo_sales")
 			title("Vertical · 100% Stacked"),
 			skin(skin),
 			palette(palette),
-			y_tick_step(25),
+			y_axis().tick_step(25),
 			bar(category, value, series)
 				.stacked()
 				.percent()
@@ -51,9 +51,9 @@ ket.table("demo_sales")
 			title("Horizontal · Grouped"),
 			skin(skin),
 			palette(palette),
-			x_bounds(0, 40),
-			x_tick_step(10),
-			x_minor_ticks(1),
+			x_axis().bounds(0, 40),
+			x_axis().tick_step(10),
+			x_axis().minor_ticks(1),
 			bar(value, category, series)
 				.bar_width(0.88)
 				.category_gap(0.24),
@@ -62,9 +62,9 @@ ket.table("demo_sales")
 			title("Horizontal · Stacked"),
 			skin(skin),
 			palette(palette),
-			x_bounds(0, 100),
-			x_tick_step(10),
-			x_minor_ticks(1),
+			x_axis().bounds(0, 100),
+			x_axis().tick_step(10),
+			x_axis().minor_ticks(1),
 			bar(value, category, series)
 				.stacked()
 				.bar_width(0.88)
@@ -74,7 +74,7 @@ ket.table("demo_sales")
 			title("Horizontal · 100% Stacked"),
 			skin(skin),
 			palette(palette),
-			x_tick_step(25),
+			x_axis().tick_step(25),
 			bar(value, category, series)
 				.stacked()
 				.percent()
@@ -86,9 +86,9 @@ ket.table("demo_sales")
 			facet(facet_field),
 			skin(skin),
 			palette(palette),
-			y_bounds(0, 50),
-			y_tick_step(10),
-			y_minor_ticks(1),
+			y_axis().bounds(0, 50),
+			y_axis().tick_step(10),
+			y_axis().minor_ticks(1),
 			bar(facet_category, value, series)
 				.bar_width(0.88)
 				.category_gap(0.24),
@@ -98,9 +98,9 @@ ket.table("demo_sales")
 			facet(facet_field),
 			skin(skin),
 			palette(palette),
-			y_bounds(0, 150),
-			y_tick_step(50),
-			y_minor_ticks(1),
+			y_axis().bounds(0, 150),
+			y_axis().tick_step(50),
+			y_axis().minor_ticks(1),
 			bar(facet_category, value, series)
 				.stacked()
 				.bar_width(0.88)
@@ -111,7 +111,7 @@ ket.table("demo_sales")
 			facet(facet_field),
 			skin(skin),
 			palette(palette),
-			y_tick_step(25),
+			y_axis().tick_step(25),
 			bar(facet_category, value, series)
 				.stacked()
 				.percent()
@@ -123,9 +123,9 @@ ket.table("demo_sales")
 			facet(facet_field),
 			skin(skin),
 			palette(palette),
-			x_bounds(0, 40),
-			x_tick_step(10),
-			x_minor_ticks(1),
+			x_axis().bounds(0, 40),
+			x_axis().tick_step(10),
+			x_axis().minor_ticks(1),
 			bar(value, facet_category, series)
 				.bar_width(0.88)
 				.category_gap(0.24),
@@ -135,9 +135,9 @@ ket.table("demo_sales")
 			facet(facet_field),
 			skin(skin),
 			palette(palette),
-			x_bounds(0, 150),
-			x_tick_step(50),
-			x_minor_ticks(1),
+			x_axis().bounds(0, 150),
+			x_axis().tick_step(50),
+			x_axis().minor_ticks(1),
 			bar(value, facet_category, series)
 				.stacked()
 				.bar_width(0.88)
@@ -148,7 +148,7 @@ ket.table("demo_sales")
 			facet(facet_field),
 			skin(skin),
 			palette(palette),
-			x_tick_step(25),
+			x_axis().tick_step(25),
 			bar(value, facet_category, series)
 				.stacked()
 				.percent()

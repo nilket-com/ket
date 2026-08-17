@@ -172,25 +172,65 @@ impl Origin {
 enum FigureElementKind {
 	Title(String),
 	Subtitle(String),
-	XLabel(String),
-	YLabel(String),
 	TextHandle(TextHandleKind),
+	Axis(Axis),
 	Facet(String),
 	Palette(String),
 	SequentialPalette(ColorTheme),
 	DivergingPalette(ColorTheme),
 	Legend(Presence<LegendPosition>),
-	XBounds(f64, f64),
-	YBounds(f64, f64),
-	XTickStep(f64),
-	YTickStep(f64),
-	XMinorTicks(u32),
-	YMinorTicks(u32),
 	HoverSize(HoverTextSize),
-	XTickRotation(TickRotation),
-	XTickSize(XTickTextSize),
-	YTickSize(YTickTextSize),
 	Padding,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Axis {
+	X,
+	Y,
+}
+
+impl Axis {
+	fn name(self) -> &'static str {
+		match self {
+			Self::X => "x_axis",
+			Self::Y => "y_axis",
+		}
+	}
+}
+
+#[derive(Clone, Debug, Default)]
+struct AxisProperties {
+	label: Option<(String, Origin)>,
+	label_size: Option<(AxisLabelSize, Origin)>,
+	bounds: Option<(f64, f64, Origin)>,
+	tick_step: Option<(f64, Origin)>,
+	minor_ticks: Option<(u32, Origin)>,
+	tick_size: Option<(AxisTickSize, Origin)>,
+	tick_rotation: Option<(TickRotation, Origin)>,
+}
+
+impl AxisProperties {
+	fn is_empty(&self) -> bool {
+		self.label.is_none()
+			&& self.label_size.is_none()
+			&& self.bounds.is_none()
+			&& self.tick_step.is_none()
+			&& self.minor_ticks.is_none()
+			&& self.tick_size.is_none()
+			&& self.tick_rotation.is_none()
+	}
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AxisLabelSize {
+	X(XLabelTextSize),
+	Y(YLabelTextSize),
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AxisTickSize {
+	X(XTickTextSize),
+	Y(YTickTextSize),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -242,16 +282,12 @@ impl PaddingEdge {
 enum FigureTextSize {
 	Title(TitleTextSize),
 	Subtitle(SubtitleTextSize),
-	XLabel(XLabelTextSize),
-	YLabel(YLabelTextSize),
 }
 
 #[derive(Clone, Copy, Debug)]
 enum TextHandleKind {
 	Title,
 	Subtitle,
-	XLabel,
-	YLabel,
 }
 
 #[derive(Any, Clone, Debug)]
@@ -265,6 +301,7 @@ struct RuneFigureElement {
 	facet_gutter_origin: Option<Origin>,
 	padding: FigurePadding,
 	padding_edge_origins: [Option<Origin>; 4],
+	axis: AxisProperties,
 }
 
 impl RuneFigureElement {
@@ -278,6 +315,7 @@ impl RuneFigureElement {
 			facet_gutter_origin: None,
 			padding: FigurePadding::default(),
 			padding_edge_origins: [None; 4],
+			axis: AxisProperties::default(),
 		}
 	}
 }
@@ -498,8 +536,8 @@ fn build_context() -> Result<Context, String> {
 		("__parallel", raw_parallel as RawFunction),
 		("__title", raw_title as RawFunction),
 		("__subtitle", raw_subtitle as RawFunction),
-		("__x_label", raw_x_label as RawFunction),
-		("__y_label", raw_y_label as RawFunction),
+		("__x_axis", raw_x_axis as RawFunction),
+		("__y_axis", raw_y_axis as RawFunction),
 		("__facet", raw_facet as RawFunction),
 		("__palette", raw_palette as RawFunction),
 		(
@@ -510,16 +548,7 @@ fn build_context() -> Result<Context, String> {
 		("__skin", raw_skin as RawFunction),
 		("__legend_at", raw_legend_at as RawFunction),
 		("__hide_legend", raw_hide_legend as RawFunction),
-		("__x_bounds", raw_x_bounds as RawFunction),
-		("__y_bounds", raw_y_bounds as RawFunction),
-		("__x_tick_step", raw_x_tick_step as RawFunction),
-		("__y_tick_step", raw_y_tick_step as RawFunction),
-		("__x_minor_ticks", raw_x_minor_ticks as RawFunction),
-		("__y_minor_ticks", raw_y_minor_ticks as RawFunction),
 		("__hover_size", raw_hover_size as RawFunction),
-		("__x_tick_rotation", raw_x_tick_rotation as RawFunction),
-		("__x_tick_size", raw_x_tick_size as RawFunction),
-		("__y_tick_size", raw_y_tick_size as RawFunction),
 		("__padding", raw_padding as RawFunction),
 		("__table", raw_table as RawFunction),
 		("__layers", raw_layers as RawFunction),
@@ -544,6 +573,13 @@ fn build_context() -> Result<Context, String> {
 		("__right", raw_figure_padding_right as RawFunction),
 		("__bottom", raw_figure_padding_bottom as RawFunction),
 		("__left", raw_figure_padding_left as RawFunction),
+		("__label", raw_axis_label as RawFunction),
+		("__label_size", raw_axis_label_size as RawFunction),
+		("__bounds", raw_axis_bounds as RawFunction),
+		("__tick_step", raw_axis_tick_step as RawFunction),
+		("__minor_ticks", raw_axis_minor_ticks as RawFunction),
+		("__tick_size", raw_axis_tick_size as RawFunction),
+		("__tick_rotation", raw_axis_tick_rotation as RawFunction),
 	] {
 		module
 			.raw_function(name, function)
@@ -1468,8 +1504,6 @@ fn raw_heatmap(
 enum StringConstructor {
 	Title,
 	Subtitle,
-	XLabel,
-	YLabel,
 	Facet,
 	Palette,
 }
@@ -1494,22 +1528,32 @@ fn raw_subtitle(
 	)
 }
 
-fn raw_x_label(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_string_element(StringConstructor::XLabel, "x_label", stack, addr, args, out)
+fn raw_x_axis(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
+	raw_axis(Axis::X, stack, addr, args, out)
 }
 
-fn raw_y_label(
+fn raw_y_axis(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
+	raw_axis(Axis::Y, stack, addr, args, out)
+}
+
+fn raw_axis(
+	axis: Axis,
 	stack: &mut dyn Memory,
 	addr: InstAddress,
 	args: usize,
 	out: Output,
 ) -> VmResult<()> {
-	raw_string_element(StringConstructor::YLabel, "y_label", stack, addr, args, out)
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let value = if values.len() == 2 {
+		Ok(FigureElementKind::Axis(axis))
+	} else {
+		Err(PresentationFailure::new(
+			origin,
+			format!("{}() takes no arguments", axis.name()),
+		))
+	};
+	store(out, stack, RuneFigureElement::new(value, origin))
 }
 
 fn raw_facet(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output) -> VmResult<()> {
@@ -1664,8 +1708,6 @@ fn raw_string_element(
 			StringConstructor::Subtitle => {
 				Ok(FigureElementKind::TextHandle(TextHandleKind::Subtitle))
 			}
-			StringConstructor::XLabel => Ok(FigureElementKind::TextHandle(TextHandleKind::XLabel)),
-			StringConstructor::YLabel => Ok(FigureElementKind::TextHandle(TextHandleKind::YLabel)),
 			_ => Err(PresentationFailure::new(
 				origin,
 				format!("{name}(...) requires one string"),
@@ -1675,23 +1717,12 @@ fn raw_string_element(
 		match rune::from_value::<Ref<str>>(values[0].clone()) {
 			Ok(value) => {
 				let value = value.to_owned();
-				if matches!(kind, StringConstructor::XLabel | StringConstructor::YLabel)
-					&& value.trim().is_empty()
-				{
-					Err(PresentationFailure::new(
-						origin,
-						format!("{name}(...) requires a nonempty string"),
-					))
-				} else {
-					Ok(match kind {
-						StringConstructor::Title => FigureElementKind::Title(value),
-						StringConstructor::Subtitle => FigureElementKind::Subtitle(value),
-						StringConstructor::XLabel => FigureElementKind::XLabel(value),
-						StringConstructor::YLabel => FigureElementKind::YLabel(value),
-						StringConstructor::Facet => FigureElementKind::Facet(value),
-						StringConstructor::Palette => FigureElementKind::Palette(value),
-					})
-				}
+				Ok(match kind {
+					StringConstructor::Title => FigureElementKind::Title(value),
+					StringConstructor::Subtitle => FigureElementKind::Subtitle(value),
+					StringConstructor::Facet => FigureElementKind::Facet(value),
+					StringConstructor::Palette => FigureElementKind::Palette(value),
+				})
 			}
 			Err(_) => Err(PresentationFailure::new(
 				origin,
@@ -1735,8 +1766,6 @@ fn raw_skin(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output)
 #[derive(Clone, Copy)]
 enum NumericPairConstructor {
 	Legend,
-	XBounds,
-	YBounds,
 }
 
 fn raw_legend_at(
@@ -1748,38 +1777,6 @@ fn raw_legend_at(
 	raw_numeric_pair(
 		NumericPairConstructor::Legend,
 		"legend_at",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_x_bounds(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_pair(
-		NumericPairConstructor::XBounds,
-		"x_bounds",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_y_bounds(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_pair(
-		NumericPairConstructor::YBounds,
-		"y_bounds",
 		stack,
 		addr,
 		args,
@@ -1808,18 +1805,6 @@ fn raw_numeric_pair(
 	} else {
 		match kind {
 			NumericPairConstructor::Legend => presentation_legend_at(
-				values[0].clone(),
-				values[1].clone(),
-				origin.start.into(),
-				origin.end.into(),
-			),
-			NumericPairConstructor::XBounds => presentation_x_bounds(
-				values[0].clone(),
-				values[1].clone(),
-				origin.start.into(),
-				origin.end.into(),
-			),
-			NumericPairConstructor::YBounds => presentation_y_bounds(
 				values[0].clone(),
 				values[1].clone(),
 				origin.start.into(),
@@ -1854,78 +1839,7 @@ fn raw_hide_legend(
 
 #[derive(Clone, Copy)]
 enum NumericScalarConstructor {
-	XTickStep,
-	YTickStep,
-	XMinorTicks,
-	YMinorTicks,
 	HoverSize,
-	XTickRotation,
-	XTickSize,
-	YTickSize,
-}
-
-fn raw_x_tick_step(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_scalar(
-		NumericScalarConstructor::XTickStep,
-		"x_tick_step",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_y_tick_step(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_scalar(
-		NumericScalarConstructor::YTickStep,
-		"y_tick_step",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_x_minor_ticks(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_scalar(
-		NumericScalarConstructor::XMinorTicks,
-		"x_minor_ticks",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_y_minor_ticks(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_scalar(
-		NumericScalarConstructor::YMinorTicks,
-		"y_minor_ticks",
-		stack,
-		addr,
-		args,
-		out,
-	)
 }
 
 fn raw_hover_size(
@@ -1937,54 +1851,6 @@ fn raw_hover_size(
 	raw_numeric_scalar(
 		NumericScalarConstructor::HoverSize,
 		"hover_size",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_x_tick_rotation(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_scalar(
-		NumericScalarConstructor::XTickRotation,
-		"x_tick_rotation",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_x_tick_size(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_scalar(
-		NumericScalarConstructor::XTickSize,
-		"x_tick_size",
-		stack,
-		addr,
-		args,
-		out,
-	)
-}
-
-fn raw_y_tick_size(
-	stack: &mut dyn Memory,
-	addr: InstAddress,
-	args: usize,
-	out: Output,
-) -> VmResult<()> {
-	raw_numeric_scalar(
-		NumericScalarConstructor::YTickSize,
-		"y_tick_size",
 		stack,
 		addr,
 		args,
@@ -2117,6 +1983,384 @@ fn raw_figure_padding_edge(
 	store(out, stack, element)
 }
 
+fn axis_receiver(
+	values: &[Value],
+	origin: Origin,
+	name: &'static str,
+) -> Result<(RuneFigureElement, Axis), RuneFigureElement> {
+	let element = match values
+		.first()
+		.cloned()
+		.map(rune::from_value::<RuneFigureElement>)
+	{
+		Some(Ok(element)) => element,
+		_ => {
+			return Err(RuneFigureElement::new(
+				Err(PresentationFailure::new(
+					origin,
+					format!("{name}(...) requires an axis receiver"),
+				)),
+				origin,
+			));
+		}
+	};
+	let axis = match &element.value {
+		Err(_) => return Err(element),
+		Ok(FigureElementKind::Axis(axis)) => *axis,
+		Ok(_) => {
+			return Err(RuneFigureElement::new(
+				Err(PresentationFailure::new(
+					origin,
+					format!("{name}(...) requires an axis receiver"),
+				)),
+				origin,
+			));
+		}
+	};
+	Ok((element, axis))
+}
+
+fn raw_axis_label(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let (mut element, axis) = match axis_receiver(values, origin, "label") {
+		Ok(receiver) => receiver,
+		Err(element) => return store(out, stack, element),
+	};
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"label(...) requires one nonempty string",
+		));
+	} else if element.axis.label.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}().label(...) may appear at most once", axis.name()),
+		));
+	} else {
+		match rune::from_value::<Ref<str>>(values[1].clone()) {
+			Ok(label) if !label.trim().is_empty() => {
+				element.axis.label = Some((label.to_owned(), origin));
+			}
+			_ => {
+				element.value = Err(PresentationFailure::new(
+					origin,
+					"label(...) requires one nonempty string",
+				));
+			}
+		}
+	}
+	store(out, stack, element)
+}
+
+fn raw_axis_label_size(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let (mut element, axis) = match axis_receiver(values, origin, "label_size") {
+		Ok(receiver) => receiver,
+		Err(element) => return store(out, stack, element),
+	};
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"label_size(...) takes exactly one numeric value",
+		));
+	} else if element.axis.label_size.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}().label_size(...) may appear at most once", axis.name()),
+		));
+	} else {
+		let size = rune_number(&values[1])
+			.ok_or_else(|| {
+				PresentationFailure::new(origin, "label_size(...) requires a number".to_owned())
+			})
+			.and_then(|value| match axis {
+				Axis::X => XLabelTextSize::new(value as f32)
+					.map(AxisLabelSize::X)
+					.map_err(|error| PresentationFailure::new(origin, error.to_string())),
+				Axis::Y => YLabelTextSize::new(value as f32)
+					.map(AxisLabelSize::Y)
+					.map_err(|error| PresentationFailure::new(origin, error.to_string())),
+			});
+		match size {
+			Ok(size) => element.axis.label_size = Some((size, origin)),
+			Err(error) => element.value = Err(error),
+		}
+	}
+	store(out, stack, element)
+}
+
+fn raw_axis_bounds(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let (mut element, axis) = match axis_receiver(values, origin, "bounds") {
+		Ok(receiver) => receiver,
+		Err(element) => return store(out, stack, element),
+	};
+	if values.len() != 5 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"bounds(...) requires exactly two numeric values",
+		));
+	} else if element.axis.bounds.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}().bounds(...) may appear at most once", axis.name()),
+		));
+	} else {
+		let bounds = (|| {
+			let minimum = rune_number(&values[1]).ok_or_else(|| {
+				PresentationFailure::new(origin, "bounds(...) requires numeric values")
+			})?;
+			let maximum = rune_number(&values[2]).ok_or_else(|| {
+				PresentationFailure::new(origin, "bounds(...) requires numeric values")
+			})?;
+			if !minimum.is_finite() || !maximum.is_finite() {
+				Err(PresentationFailure::new(
+					origin,
+					"bounds(...) requires finite bounds",
+				))
+			} else if minimum == maximum {
+				Err(PresentationFailure::new(
+					origin,
+					"bounds(...) cannot form a collapsed axis; min must be less than max",
+				))
+			} else if minimum > maximum {
+				Err(PresentationFailure::new(
+					origin,
+					"bounds(...) cannot reverse an axis; min must be less than max",
+				))
+			} else {
+				Ok((minimum, maximum))
+			}
+		})();
+		match bounds {
+			Ok((minimum, maximum)) => element.axis.bounds = Some((minimum, maximum, origin)),
+			Err(error) => element.value = Err(error),
+		}
+	}
+	store(out, stack, element)
+}
+
+fn raw_axis_tick_step(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_axis_positive_scalar(
+		"tick_step",
+		|properties| &mut properties.tick_step,
+		stack,
+		addr,
+		args,
+		out,
+	)
+}
+
+fn raw_axis_positive_scalar(
+	name: &'static str,
+	slot: impl Fn(&mut AxisProperties) -> &mut Option<(f64, Origin)>,
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let (mut element, axis) = match axis_receiver(values, origin, name) {
+		Ok(receiver) => receiver,
+		Err(element) => return store(out, stack, element),
+	};
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{name}(...) requires exactly one numeric value"),
+		));
+	} else if slot(&mut element.axis).is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}().{name}(...) may appear at most once", axis.name()),
+		));
+	} else {
+		let value = rune_number(&values[1])
+			.ok_or_else(|| {
+				PresentationFailure::new(origin, format!("{name}(...) requires a number"))
+			})
+			.and_then(|value| {
+				if !value.is_finite() {
+					Err(PresentationFailure::new(
+						origin,
+						format!("{name}(...) requires a finite step"),
+					))
+				} else if value <= 0.0 {
+					Err(PresentationFailure::new(
+						origin,
+						format!("{name}(...) step must be strictly positive"),
+					))
+				} else {
+					Ok(value)
+				}
+			});
+		match value {
+			Ok(value) => *slot(&mut element.axis) = Some((value, origin)),
+			Err(error) => element.value = Err(error),
+		}
+	}
+	store(out, stack, element)
+}
+
+fn raw_axis_minor_ticks(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let (mut element, axis) = match axis_receiver(values, origin, "minor_ticks") {
+		Ok(receiver) => receiver,
+		Err(element) => return store(out, stack, element),
+	};
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"minor_ticks(...) requires exactly one numeric value",
+		));
+	} else if element.axis.minor_ticks.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}().minor_ticks(...) may appear at most once", axis.name()),
+		));
+	} else {
+		let count = rune_number(&values[1])
+			.ok_or_else(|| PresentationFailure::new(origin, "minor_ticks(...) requires a number"))
+			.and_then(|value| {
+				if !value.is_finite() {
+					Err(PresentationFailure::new(
+						origin,
+						"minor_ticks(...) requires a finite count",
+					))
+				} else if value < 0.0 || value.fract() != 0.0 || value > u32::MAX as f64 {
+					Err(PresentationFailure::new(
+						origin,
+						"minor_ticks(...) count must be a non-negative integer",
+					))
+				} else {
+					Ok(value as u32)
+				}
+			});
+		match count {
+			Ok(count) => element.axis.minor_ticks = Some((count, origin)),
+			Err(error) => element.value = Err(error),
+		}
+	}
+	store(out, stack, element)
+}
+
+fn raw_axis_tick_size(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let (mut element, axis) = match axis_receiver(values, origin, "tick_size") {
+		Ok(receiver) => receiver,
+		Err(element) => return store(out, stack, element),
+	};
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"tick_size(...) takes exactly one numeric value",
+		));
+	} else if element.axis.tick_size.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}().tick_size(...) may appear at most once", axis.name()),
+		));
+	} else {
+		let size = rune_number(&values[1])
+			.ok_or_else(|| {
+				PresentationFailure::new(origin, "tick_size(...) requires a number".to_owned())
+			})
+			.and_then(|value| match axis {
+				Axis::X => XTickTextSize::new(value as f32)
+					.map(AxisTickSize::X)
+					.map_err(|error| PresentationFailure::new(origin, error.to_string())),
+				Axis::Y => YTickTextSize::new(value as f32)
+					.map(AxisTickSize::Y)
+					.map_err(|error| PresentationFailure::new(origin, error.to_string())),
+			});
+		match size {
+			Ok(size) => element.axis.tick_size = Some((size, origin)),
+			Err(error) => element.value = Err(error),
+		}
+	}
+	store(out, stack, element)
+}
+
+fn raw_axis_tick_rotation(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let (mut element, axis) = match axis_receiver(values, origin, "tick_rotation") {
+		Ok(receiver) => receiver,
+		Err(element) => return store(out, stack, element),
+	};
+	if axis != Axis::X {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"tick_rotation(...) is available on x_axis(), not y_axis()",
+		));
+	} else if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"tick_rotation(...) takes exactly one numeric value",
+		));
+	} else if element.axis.tick_rotation.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"x_axis().tick_rotation(...) may appear at most once",
+		));
+	} else {
+		let rotation = rune_number(&values[1])
+			.ok_or_else(|| {
+				PresentationFailure::new(origin, "tick_rotation(...) requires a number".to_owned())
+			})
+			.and_then(|value| {
+				TickRotation::new(value as f32)
+					.map_err(|error| PresentationFailure::new(origin, error.to_string()))
+			});
+		match rotation {
+			Ok(rotation) => element.axis.tick_rotation = Some((rotation, origin)),
+			Err(error) => element.value = Err(error),
+		}
+	}
+	store(out, stack, element)
+}
+
 fn raw_numeric_scalar(
 	kind: NumericScalarConstructor,
 	name: &'static str,
@@ -2137,35 +2381,8 @@ fn raw_numeric_scalar(
 		)
 	} else {
 		match kind {
-			NumericScalarConstructor::XTickStep => {
-				presentation_x_tick_step(values[0].clone(), origin.start.into(), origin.end.into())
-			}
-			NumericScalarConstructor::YTickStep => {
-				presentation_y_tick_step(values[0].clone(), origin.start.into(), origin.end.into())
-			}
-			NumericScalarConstructor::XMinorTicks => presentation_x_minor_ticks(
-				values[0].clone(),
-				origin.start.into(),
-				origin.end.into(),
-			),
-			NumericScalarConstructor::YMinorTicks => presentation_y_minor_ticks(
-				values[0].clone(),
-				origin.start.into(),
-				origin.end.into(),
-			),
 			NumericScalarConstructor::HoverSize => {
 				presentation_hover_size(values[0].clone(), origin.start.into(), origin.end.into())
-			}
-			NumericScalarConstructor::XTickRotation => presentation_x_tick_rotation(
-				values[0].clone(),
-				origin.start.into(),
-				origin.end.into(),
-			),
-			NumericScalarConstructor::XTickSize => {
-				presentation_x_tick_size(values[0].clone(), origin.start.into(), origin.end.into())
-			}
-			NumericScalarConstructor::YTickSize => {
-				presentation_y_tick_size(values[0].clone(), origin.start.into(), origin.end.into())
 			}
 		}
 	};
@@ -2345,61 +2562,6 @@ fn presentation_hide_legend(start: i64, end: i64) -> RuneFigureElement {
 	RuneFigureElement::new(Ok(FigureElementKind::Legend(Presence::Hide)), origin)
 }
 
-fn presentation_x_bounds(
-	minimum: Value,
-	maximum: Value,
-	start: i64,
-	end: i64,
-) -> RuneFigureElement {
-	bounds_element(minimum, maximum, start, end, "x_bounds", true)
-}
-
-fn presentation_y_bounds(
-	minimum: Value,
-	maximum: Value,
-	start: i64,
-	end: i64,
-) -> RuneFigureElement {
-	bounds_element(minimum, maximum, start, end, "y_bounds", false)
-}
-
-fn bounds_element(
-	minimum: Value,
-	maximum: Value,
-	start: i64,
-	end: i64,
-	name: &'static str,
-	x_axis: bool,
-) -> RuneFigureElement {
-	numeric_pair_element(
-		minimum,
-		maximum,
-		start,
-		end,
-		name,
-		move |minimum, maximum| {
-			if !minimum.is_finite() || !maximum.is_finite() {
-				return Err(format!("{name}(...) requires finite bounds"));
-			}
-			if minimum == maximum {
-				return Err(format!(
-					"{name}(...) cannot form a collapsed axis; min must be less than max"
-				));
-			}
-			if minimum > maximum {
-				return Err(format!(
-					"{name}(...) cannot reverse an axis; min must be less than max"
-				));
-			}
-			Ok(if x_axis {
-				FigureElementKind::XBounds(minimum, maximum)
-			} else {
-				FigureElementKind::YBounds(minimum, maximum)
-			})
-		},
-	)
-}
-
 fn numeric_pair_element(
 	first: Value,
 	second: Value,
@@ -2421,14 +2583,6 @@ fn numeric_pair_element(
 	RuneFigureElement::new(value, origin)
 }
 
-fn presentation_x_tick_step(value: Value, start: i64, end: i64) -> RuneFigureElement {
-	numeric_scalar_element(value, start, end, "x_tick_step", true)
-}
-
-fn presentation_y_tick_step(value: Value, start: i64, end: i64) -> RuneFigureElement {
-	numeric_scalar_element(value, start, end, "y_tick_step", false)
-}
-
 fn presentation_hover_size(value: Value, start: i64, end: i64) -> RuneFigureElement {
 	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
 	let value = rune_number(&value)
@@ -2439,120 +2593,6 @@ fn presentation_hover_size(value: Value, start: i64, end: i64) -> RuneFigureElem
 			HoverTextSize::new(value as f32)
 				.map(FigureElementKind::HoverSize)
 				.map_err(|error| PresentationFailure::new(origin, error.to_string()))
-		});
-	RuneFigureElement::new(value, origin)
-}
-
-fn presentation_x_tick_rotation(value: Value, start: i64, end: i64) -> RuneFigureElement {
-	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
-	let value = rune_number(&value)
-		.ok_or_else(|| {
-			PresentationFailure::new(origin, "x_tick_rotation(...) requires a number".to_owned())
-		})
-		.and_then(|value| {
-			TickRotation::new(value as f32)
-				.map(FigureElementKind::XTickRotation)
-				.map_err(|error| PresentationFailure::new(origin, error.to_string()))
-		});
-	RuneFigureElement::new(value, origin)
-}
-
-fn presentation_x_tick_size(value: Value, start: i64, end: i64) -> RuneFigureElement {
-	presentation_axis_text_size(value, start, end, "x_tick_size", |pixels| {
-		XTickTextSize::new(pixels).map(FigureElementKind::XTickSize)
-	})
-}
-
-fn presentation_y_tick_size(value: Value, start: i64, end: i64) -> RuneFigureElement {
-	presentation_axis_text_size(value, start, end, "y_tick_size", |pixels| {
-		YTickTextSize::new(pixels).map(FigureElementKind::YTickSize)
-	})
-}
-
-fn presentation_axis_text_size<E: std::error::Error>(
-	value: Value,
-	start: i64,
-	end: i64,
-	name: &'static str,
-	make: impl FnOnce(f32) -> Result<FigureElementKind, E>,
-) -> RuneFigureElement {
-	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
-	let value = rune_number(&value)
-		.ok_or_else(|| PresentationFailure::new(origin, format!("{name}(...) requires a number")))
-		.and_then(|value| {
-			make(value as f32).map_err(|error| PresentationFailure::new(origin, error.to_string()))
-		});
-	RuneFigureElement::new(value, origin)
-}
-
-fn numeric_scalar_element(
-	value: Value,
-	start: i64,
-	end: i64,
-	name: &'static str,
-	x_axis: bool,
-) -> RuneFigureElement {
-	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
-	let value = rune_number(&value)
-		.ok_or_else(|| PresentationFailure::new(origin, format!("{name}(...) requires a number")))
-		.and_then(|value| {
-			if !value.is_finite() {
-				Err(PresentationFailure::new(
-					origin,
-					format!("{name}(...) requires a finite step"),
-				))
-			} else if value <= 0.0 {
-				Err(PresentationFailure::new(
-					origin,
-					format!("{name}(...) step must be strictly positive"),
-				))
-			} else {
-				Ok(if x_axis {
-					FigureElementKind::XTickStep(value)
-				} else {
-					FigureElementKind::YTickStep(value)
-				})
-			}
-		});
-	RuneFigureElement::new(value, origin)
-}
-
-fn presentation_x_minor_ticks(value: Value, start: i64, end: i64) -> RuneFigureElement {
-	minor_ticks_element(value, start, end, "x_minor_ticks", true)
-}
-
-fn presentation_y_minor_ticks(value: Value, start: i64, end: i64) -> RuneFigureElement {
-	minor_ticks_element(value, start, end, "y_minor_ticks", false)
-}
-
-fn minor_ticks_element(
-	value: Value,
-	start: i64,
-	end: i64,
-	name: &'static str,
-	x_axis: bool,
-) -> RuneFigureElement {
-	let origin = Origin::decode(start, end).unwrap_or(Origin { start: 0, end: 0 });
-	let value = rune_number(&value)
-		.ok_or_else(|| PresentationFailure::new(origin, format!("{name}(...) requires a number")))
-		.and_then(|value| {
-			if !value.is_finite() {
-				Err(PresentationFailure::new(
-					origin,
-					format!("{name}(...) requires a finite count"),
-				))
-			} else if value < 0.0 || value.fract() != 0.0 || value > u32::MAX as f64 {
-				Err(PresentationFailure::new(
-					origin,
-					format!("{name}(...) count must be a non-negative integer"),
-				))
-			} else {
-				Ok(if x_axis {
-					FigureElementKind::XMinorTicks(value as u32)
-				} else {
-					FigureElementKind::YMinorTicks(value as u32)
-				})
-			}
 		});
 	RuneFigureElement::new(value, origin)
 }
@@ -3244,20 +3284,7 @@ fn raw_figure_font_size(
 		| FigureElementKind::TextHandle(TextHandleKind::Subtitle) => SubtitleTextSize::new(points as f32)
 			.map(FigureTextSize::Subtitle)
 			.map_err(|error| error.to_string()),
-		FigureElementKind::XLabel(_) | FigureElementKind::TextHandle(TextHandleKind::XLabel) => {
-			XLabelTextSize::new(points as f32)
-				.map(FigureTextSize::XLabel)
-				.map_err(|error| error.to_string())
-		}
-		FigureElementKind::YLabel(_) | FigureElementKind::TextHandle(TextHandleKind::YLabel) => {
-			YLabelTextSize::new(points as f32)
-				.map(FigureTextSize::YLabel)
-				.map_err(|error| error.to_string())
-		}
-		_ => Err(
-			"font_size(...) is available on title, subtitle, x_label, and y_label members"
-				.to_owned(),
-		),
+		_ => Err("font_size(...) is available on title and subtitle members".to_owned()),
 	};
 	match text_size {
 		Ok(text_size) => element.font_size = Some(text_size),
@@ -3470,6 +3497,7 @@ fn decode_figure(value: &Value, origin: Origin) -> Result<RunePlotIntent, Presen
 				element.font_size,
 				element.facet_gutter,
 				element.padding,
+				element.axis.clone(),
 				element.origin,
 			)?;
 			continue;
@@ -3562,6 +3590,7 @@ fn merge_element(
 	font_size: Option<FigureTextSize>,
 	facet_gutter: Option<f32>,
 	padding: FigurePadding,
+	axis_properties: AxisProperties,
 	origin: Origin,
 ) -> Result<(), PresentationFailure> {
 	match element {
@@ -3605,46 +3634,6 @@ fn merge_element(
 			}
 			Ok(())
 		}
-		FigureElementKind::XLabel(value) => {
-			set_once(
-				&mut parts.x_label,
-				(value, origin),
-				origin,
-				"a figure has at most one x_label element",
-			)?;
-			if let Some(size) = font_size {
-				let FigureTextSize::XLabel(size) = size else {
-					unreachable!("x-label size matches x_label")
-				};
-				set_once(
-					&mut parts.x_label_size,
-					(size, origin),
-					origin,
-					"a figure has at most one x_label font size",
-				)?;
-			}
-			Ok(())
-		}
-		FigureElementKind::YLabel(value) => {
-			set_once(
-				&mut parts.y_label,
-				(value, origin),
-				origin,
-				"a figure has at most one y_label element",
-			)?;
-			if let Some(size) = font_size {
-				let FigureTextSize::YLabel(size) = size else {
-					unreachable!("y-label size matches y_label")
-				};
-				set_once(
-					&mut parts.y_label_size,
-					(size, origin),
-					origin,
-					"a figure has at most one y_label font size",
-				)?;
-			}
-			Ok(())
-		}
 		FigureElementKind::TextHandle(handle) => match (handle, font_size) {
 			(TextHandleKind::Title, Some(FigureTextSize::Title(size))) => set_once(
 				&mut parts.title_size,
@@ -3658,24 +3647,13 @@ fn merge_element(
 				origin,
 				"a figure has at most one subtitle font size",
 			),
-			(TextHandleKind::XLabel, Some(FigureTextSize::XLabel(size))) => set_once(
-				&mut parts.x_label_size,
-				(size, origin),
-				origin,
-				"a figure has at most one x_label font size",
-			),
-			(TextHandleKind::YLabel, Some(FigureTextSize::YLabel(size))) => set_once(
-				&mut parts.y_label_size,
-				(size, origin),
-				origin,
-				"a figure has at most one y_label font size",
-			),
 			(_, None) => Err(PresentationFailure::new(
 				origin,
 				"a bare text member requires text or .font_size(...)",
 			)),
 			_ => unreachable!("text handle and font-size variant match"),
 		},
+		FigureElementKind::Axis(axis) => merge_axis(parts, axis, axis_properties, origin),
 		FigureElementKind::Facet(value) => {
 			set_once(
 				&mut parts.facet,
@@ -3717,65 +3695,11 @@ fn merge_element(
 			origin,
 			"a figure has at most one legend placement or visibility element",
 		),
-		FigureElementKind::XBounds(minimum, maximum) => set_once(
-			&mut parts.x_bounds,
-			(minimum, maximum, origin),
-			origin,
-			"a figure has at most one x_bounds element",
-		),
-		FigureElementKind::YBounds(minimum, maximum) => set_once(
-			&mut parts.y_bounds,
-			(minimum, maximum, origin),
-			origin,
-			"a figure has at most one y_bounds element",
-		),
-		FigureElementKind::XTickStep(value) => set_once(
-			&mut parts.x_tick_step,
-			(value, origin),
-			origin,
-			"a figure has at most one x_tick_step element",
-		),
-		FigureElementKind::YTickStep(value) => set_once(
-			&mut parts.y_tick_step,
-			(value, origin),
-			origin,
-			"a figure has at most one y_tick_step element",
-		),
-		FigureElementKind::XMinorTicks(value) => set_once(
-			&mut parts.x_minor_ticks,
-			(value, origin),
-			origin,
-			"a figure has at most one x_minor_ticks element",
-		),
-		FigureElementKind::YMinorTicks(value) => set_once(
-			&mut parts.y_minor_ticks,
-			(value, origin),
-			origin,
-			"a figure has at most one y_minor_ticks element",
-		),
 		FigureElementKind::HoverSize(value) => set_once(
 			&mut parts.hover_size,
 			(value, origin),
 			origin,
 			"a figure has at most one hover_size element",
-		),
-		FigureElementKind::XTickRotation(value) => set_once(
-			&mut parts.x_tick_rotation,
-			(value, origin),
-			origin,
-			"a figure has at most one x_tick_rotation element",
-		),
-		FigureElementKind::XTickSize(value) => set_once(
-			&mut parts.x_tick_size,
-			(value, origin),
-			origin,
-			"a figure has at most one x_tick_size element",
-		),
-		FigureElementKind::YTickSize(value) => set_once(
-			&mut parts.y_tick_size,
-			(value, origin),
-			origin,
-			"a figure has at most one y_tick_size element",
 		),
 		FigureElementKind::Padding => {
 			if padding.top.is_none()
@@ -3796,6 +3720,132 @@ fn merge_element(
 			)
 		}
 	}
+}
+
+fn merge_axis(
+	parts: &mut FigureParts,
+	axis: Axis,
+	properties: AxisProperties,
+	origin: Origin,
+) -> Result<(), PresentationFailure> {
+	if properties.is_empty() {
+		return Err(PresentationFailure::new(
+			origin,
+			format!("{}() requires at least one modifier", axis.name()),
+		));
+	}
+	match axis {
+		Axis::X => {
+			if let Some((label, property_origin)) = properties.label {
+				set_once(
+					&mut parts.x_label,
+					(label, property_origin),
+					property_origin,
+					"x_axis().label(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((AxisLabelSize::X(size), property_origin)) = properties.label_size {
+				set_once(
+					&mut parts.x_label_size,
+					(size, property_origin),
+					property_origin,
+					"x_axis().label_size(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((minimum, maximum, property_origin)) = properties.bounds {
+				set_once(
+					&mut parts.x_bounds,
+					(minimum, maximum, property_origin),
+					property_origin,
+					"x_axis().bounds(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((step, property_origin)) = properties.tick_step {
+				set_once(
+					&mut parts.x_tick_step,
+					(step, property_origin),
+					property_origin,
+					"x_axis().tick_step(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((count, property_origin)) = properties.minor_ticks {
+				set_once(
+					&mut parts.x_minor_ticks,
+					(count, property_origin),
+					property_origin,
+					"x_axis().minor_ticks(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((AxisTickSize::X(size), property_origin)) = properties.tick_size {
+				set_once(
+					&mut parts.x_tick_size,
+					(size, property_origin),
+					property_origin,
+					"x_axis().tick_size(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((rotation, property_origin)) = properties.tick_rotation {
+				set_once(
+					&mut parts.x_tick_rotation,
+					(rotation, property_origin),
+					property_origin,
+					"x_axis().tick_rotation(...) may appear at most once in a figure",
+				)?;
+			}
+		}
+		Axis::Y => {
+			if let Some((label, property_origin)) = properties.label {
+				set_once(
+					&mut parts.y_label,
+					(label, property_origin),
+					property_origin,
+					"y_axis().label(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((AxisLabelSize::Y(size), property_origin)) = properties.label_size {
+				set_once(
+					&mut parts.y_label_size,
+					(size, property_origin),
+					property_origin,
+					"y_axis().label_size(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((minimum, maximum, property_origin)) = properties.bounds {
+				set_once(
+					&mut parts.y_bounds,
+					(minimum, maximum, property_origin),
+					property_origin,
+					"y_axis().bounds(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((step, property_origin)) = properties.tick_step {
+				set_once(
+					&mut parts.y_tick_step,
+					(step, property_origin),
+					property_origin,
+					"y_axis().tick_step(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((count, property_origin)) = properties.minor_ticks {
+				set_once(
+					&mut parts.y_minor_ticks,
+					(count, property_origin),
+					property_origin,
+					"y_axis().minor_ticks(...) may appear at most once in a figure",
+				)?;
+			}
+			if let Some((AxisTickSize::Y(size), property_origin)) = properties.tick_size {
+				set_once(
+					&mut parts.y_tick_size,
+					(size, property_origin),
+					property_origin,
+					"y_axis().tick_size(...) may appear at most once in a figure",
+				)?;
+			}
+			debug_assert!(properties.tick_rotation.is_none());
+		}
+	}
+	Ok(())
 }
 
 impl FigureParts {
@@ -4015,7 +4065,7 @@ mod tests {
 	#[test]
 	fn product_0076_typed_values_execute_helpers_arrays_and_real_modifiers() {
 		let source = r#"
-fn bounds() { polariton_presentation::__y_bounds(0, 160, 13, 28) }
+fn bounds() { polariton_presentation::__y_axis(13, 28).__bounds(0, 160, 13, 28) }
 fn elements() {
     [
         polariton_presentation::__title("Computed", 31, 48),

@@ -1565,7 +1565,7 @@ fn validate_rune_numeric_domain_applicability(
 	{
 		return Err((
 			span.clone(),
-			"x_bounds(...) cannot override the fixed 0..100 percent domain".to_owned(),
+			"x_axis().bounds(...) cannot override the fixed 0..100 percent domain".to_owned(),
 		));
 	}
 	if percent_value_axis == Some("y")
@@ -1573,7 +1573,7 @@ fn validate_rune_numeric_domain_applicability(
 	{
 		return Err((
 			span.clone(),
-			"y_bounds(...) cannot override the fixed 0..100 percent domain".to_owned(),
+			"y_axis().bounds(...) cannot override the fixed 0..100 percent domain".to_owned(),
 		));
 	}
 	let numeric = |scale| matches!(scale, ScaleFamily::Linear | ScaleFamily::Log);
@@ -1582,7 +1582,7 @@ fn validate_rune_numeric_domain_applicability(
 			return Err((
 				span.clone(),
 				format!(
-					"x_bounds(...) requires a numeric x axis; this figure resolves x as {x_scale:?}"
+					"x_axis().bounds(...) requires a numeric x axis; this figure resolves x as {x_scale:?}"
 				),
 			));
 		}
@@ -1592,7 +1592,7 @@ fn validate_rune_numeric_domain_applicability(
 			return Err((
 				span.clone(),
 				format!(
-					"x_tick_step(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
+					"x_axis().tick_step(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
 				),
 			));
 		}
@@ -1602,7 +1602,7 @@ fn validate_rune_numeric_domain_applicability(
 			return Err((
 				span.clone(),
 				format!(
-					"y_bounds(...) requires a numeric y axis; this figure resolves y as {y_scale:?}"
+					"y_axis().bounds(...) requires a numeric y axis; this figure resolves y as {y_scale:?}"
 				),
 			));
 		}
@@ -1612,7 +1612,7 @@ fn validate_rune_numeric_domain_applicability(
 			return Err((
 				span.clone(),
 				format!(
-					"y_tick_step(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
+					"y_axis().tick_step(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
 				),
 			));
 		}
@@ -1622,7 +1622,7 @@ fn validate_rune_numeric_domain_applicability(
 			return Err((
 				span.clone(),
 				format!(
-					"x_minor_ticks(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
+					"x_axis().minor_ticks(...) requires a linear numeric x axis; this figure resolves x as {x_scale:?}"
 				),
 			));
 		}
@@ -1632,7 +1632,7 @@ fn validate_rune_numeric_domain_applicability(
 			return Err((
 				span.clone(),
 				format!(
-					"y_minor_ticks(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
+					"y_axis().minor_ticks(...) requires a linear numeric y axis; this figure resolves y as {y_scale:?}"
 				),
 			));
 		}
@@ -1671,13 +1671,13 @@ fn validate_rune_tick_capacity(
 					requested,
 					limit,
 				} => format!(
-					"{axis}_tick_step({step}) over {range:?} generates {requested} positions, exceeding the {limit}-position capacity"
+					"{axis}_axis().tick_step({step}) over {range:?} generates {requested} positions, exceeding the {limit}-position capacity"
 				),
 				TickPlacementError::InvalidDomain { range } => {
-					format!("{axis}_tick_step has no valid resolved domain {range:?}")
+					format!("{axis}_axis().tick_step(...) has no valid resolved domain {range:?}")
 				}
 				TickPlacementError::UnsupportedAxis { axis_type } => {
-					format!("{axis}_tick_step does not apply to {axis_type:?} axes")
+					format!("{axis}_axis().tick_step(...) does not apply to {axis_type:?} axes")
 				}
 				TickPlacementError::MinorCapacity { .. } => unreachable!(),
 			};
@@ -1702,13 +1702,13 @@ fn validate_rune_tick_capacity(
 					requested,
 					limit,
 				} => format!(
-					"{axis}_minor_ticks({minor_ticks}) with {placement:?} over {range:?} generates {requested} major positions, exceeding the {limit}-position capacity"
+					"{axis}_axis().minor_ticks({minor_ticks}) with {placement:?} over {range:?} generates {requested} major positions, exceeding the {limit}-position capacity"
 				),
 				TickPlacementError::InvalidDomain { range } => {
-					format!("{axis}_minor_ticks({minor_ticks}) has no valid resolved domain {range:?}")
+					format!("{axis}_axis().minor_ticks({minor_ticks}) has no valid resolved domain {range:?}")
 				}
 				TickPlacementError::UnsupportedAxis { axis_type } => {
-					format!("{axis}_minor_ticks({minor_ticks}) does not apply to {axis_type:?} axes")
+					format!("{axis}_axis().minor_ticks({minor_ticks}) does not apply to {axis_type:?} axes")
 				}
 				TickPlacementError::MinorCapacity { .. } => unreachable!(),
 			};
@@ -1730,7 +1730,7 @@ fn validate_rune_tick_capacity(
 				(
 					span.clone(),
 					format!(
-						"{axis}_minor_ticks({minor_ticks}) with {placement:?} over {range:?} generates {requested} total positions, exceeding the {limit}-position capacity"
+						"{axis}_axis().minor_ticks({minor_ticks}) with {placement:?} over {range:?} generates {requested} total positions, exceeding the {limit}-position capacity"
 					),
 				)
 			})
@@ -2306,7 +2306,7 @@ fn rune_view_outcome_with_palettes(
 					.flatten()
 			});
 			let output_span = output.as_ref().err().and_then(|error| {
-				if error.contains("_minor_ticks") {
+				if error.contains(".minor_ticks") {
 					minor_tick_output_span
 						.x
 						.clone()
@@ -8274,8 +8274,7 @@ workspace.table("bad").views([view("bad", table())]);
 	#[cfg(feature = "toron")]
 	#[test]
 	fn product_0036_numeric_bounds_apply_per_axis_and_discrete_bounds_never_disappear() {
-		let y_source =
-			"workspace.table(\"t\").views([figure([y_bounds(-1.0, 1.0), bar(\"cat\", \"val\")])])";
+		let y_source = "workspace.table(\"t\").views([figure([y_axis().bounds(-1.0, 1.0), bar(\"cat\", \"val\")])])";
 		let relation = transform_rune_view(y_source)
 			.expect("numeric y bound")
 			.into_relations()
@@ -8302,8 +8301,7 @@ workspace.table("bad").views([view("bad", table())]);
 		));
 		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
 
-		let x_source =
-			"workspace.table(\"t\").views([figure([x_bounds(0.0, 1.0), bar(\"cat\", \"val\")])])";
+		let x_source = "workspace.table(\"t\").views([figure([x_axis().bounds(0.0, 1.0), bar(\"cat\", \"val\")])])";
 		let relation = transform_rune_view(x_source)
 			.expect("structurally valid x bound")
 			.into_relations()
@@ -8318,7 +8316,7 @@ workspace.table("bad").views([view("bad", table())]);
 		let span = outcome.sinks[0].span.clone();
 		assert_eq!(
 			&x_source[span.start as usize..span.end as usize],
-			"x_bounds(0.0, 1.0)"
+			".bounds(0.0, 1.0)"
 		);
 	}
 
@@ -8326,7 +8324,7 @@ workspace.table("bad").views([view("bad", table())]);
 	#[test]
 	fn product_0055_horizontal_bar_keeps_physical_axes_and_family_label_through_completion() {
 		let source = r#"workspace.table("t").views([figure([
-			x_bounds(0, 10), x_tick_step(1), x_minor_ticks(2),
+			x_axis().bounds(0, 10), x_axis().tick_step(1), x_axis().minor_ticks(2),
 			bar("value", "category", "series")
 		])])"#;
 		let relation = transform_rune_view(source)
@@ -8380,9 +8378,9 @@ workspace.table("bad").views([view("bad", table())]);
 		));
 		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
 
-		for modifier in ["y_bounds(0, 10)", "y_tick_step(1)", "y_minor_ticks(2)"] {
+		for modifier in [".bounds(0, 10)", ".tick_step(1)", ".minor_ticks(2)"] {
 			let refusing = format!(
-				"workspace.table(\"t\").views([figure([{modifier}, bar(\"value\", \"category\")])])"
+				"workspace.table(\"t\").views([figure([y_axis(){modifier}, bar(\"value\", \"category\")])])"
 			);
 			let relation = transform_rune_view(&refusing)
 				.unwrap()
@@ -8414,7 +8412,7 @@ workspace.table("bad").views([view("bad", table())]);
 		for (source, expected, title, expected_layout) in [
 			(
 				r#"workspace.table("t").views([figure([
-					y_bounds(0, 20), y_tick_step(2), y_minor_ticks(2),
+					y_axis().bounds(0, 20), y_axis().tick_step(2), y_axis().minor_ticks(2),
 					bar("category", "value", "series").stacked()
 				])])"#,
 				PlotType::StackedBar,
@@ -8423,7 +8421,7 @@ workspace.table("bad").views([view("bad", table())]);
 			),
 			(
 				r#"workspace.table("t").views([figure([
-					x_bounds(0, 20), x_tick_step(2), x_minor_ticks(2),
+					x_axis().bounds(0, 20), x_axis().tick_step(2), x_axis().minor_ticks(2),
 					bar("value", "category", "series").stacked()
 				])])"#,
 				PlotType::HorizontalStackedBar,
@@ -8492,8 +8490,14 @@ workspace.table("bad").views([view("bad", table())]);
 		}
 
 		for (modifier, bar) in [
-			("x_bounds(0, 20)", "bar(\"category\", \"value\").stacked()"),
-			("y_bounds(0, 20)", "bar(\"value\", \"category\").stacked()"),
+			(
+				"x_axis().bounds(0, 20)",
+				"bar(\"category\", \"value\").stacked()",
+			),
+			(
+				"y_axis().bounds(0, 20)",
+				"bar(\"value\", \"category\").stacked()",
+			),
 		] {
 			let source = format!("workspace.table(\"t\").views([figure([{modifier}, {bar}])])");
 			let relation = transform_rune_view(&source)
@@ -8507,7 +8511,13 @@ workspace.table("bad").views([view("bad", table())]);
 			};
 			assert!(error.contains("Band"), "{error}");
 			let span = outcome.sinks[0].span.clone();
-			assert_eq!(&source[span.start as usize..span.end as usize], modifier);
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				modifier
+					.strip_prefix("x_axis()")
+					.or_else(|| modifier.strip_prefix("y_axis()"))
+					.unwrap()
+			);
 		}
 	}
 
@@ -8524,21 +8534,21 @@ workspace.table("bad").views([view("bad", table())]);
 		for (source, expected, axis) in [
 			(
 				r#"workspace.table("t").views([figure([
-					y_tick_step(25), bar("category", "value", "series").stacked().percent()
+					y_axis().tick_step(25), bar("category", "value", "series").stacked().percent()
 				])])"#,
 				PlotType::StackedBar,
 				"y",
 			),
 			(
 				r#"workspace.table("t").views([figure([
-					x_tick_step(25), bar("value", "category", "series").percent().stacked()
+					x_axis().tick_step(25), bar("value", "category", "series").percent().stacked()
 				])])"#,
 				PlotType::HorizontalStackedBar,
 				"x",
 			),
 			(
 				r#"workspace.table("t").views([figure([
-					y_tick_step(25), area("x", "value", "series").percent()
+					y_axis().tick_step(25), area("x", "value", "series").percent()
 				])])"#,
 				PlotType::StackedArea,
 				"y",
@@ -8614,15 +8624,15 @@ workspace.table("bad").views([view("bad", table())]);
 
 		for (modifier, mark) in [
 			(
-				"y_bounds(0, 100)",
+				"y_axis().bounds(0, 100)",
 				"bar(\"category\", \"value\", \"series\").stacked().percent()",
 			),
 			(
-				"x_bounds(0, 100)",
+				"x_axis().bounds(0, 100)",
 				"bar(\"value\", \"category\", \"series\").stacked().percent()",
 			),
 			(
-				"y_bounds(0, 100)",
+				"y_axis().bounds(0, 100)",
 				"area(\"x\", \"value\", \"series\").percent()",
 			),
 		] {
@@ -8638,7 +8648,13 @@ workspace.table("bad").views([view("bad", table())]);
 			};
 			assert!(error.contains("fixed 0..100 percent domain"), "{error}");
 			let span = outcome.sinks[0].span.clone();
-			assert_eq!(&source[span.start as usize..span.end as usize], modifier);
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				modifier
+					.strip_prefix("x_axis()")
+					.or_else(|| modifier.strip_prefix("y_axis()"))
+					.unwrap()
+			);
 		}
 	}
 
@@ -8646,7 +8662,7 @@ workspace.table("bad").views([view("bad", table())]);
 	#[test]
 	fn product_0070_area_reaches_completion_with_cartesian_guides_and_fixed_orientation() {
 		let source = r#"workspace.table("t").views([figure([
-			y_bounds(0, 20), y_tick_step(2), y_minor_ticks(2),
+			y_axis().bounds(0, 20), y_axis().tick_step(2), y_axis().minor_ticks(2),
 			area("x", "value", "series")
 		])])"#;
 		let relation = transform_rune_view(source)
@@ -9014,7 +9030,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	fn product_0036_exclusion_and_arbitrarily_small_positive_spans_render_exactly() {
 		for (minimum, maximum) in [(100.0, 200.0), (0.0, 1e-300)] {
 			let source = format!(
-				"workspace.table(\"t\").views([figure([x_bounds({minimum}, {maximum}), line(\"x\", \"y\")])])"
+				"workspace.table(\"t\").views([figure([x_axis().bounds({minimum}, {maximum}), line(\"x\", \"y\")])])"
 			);
 			let relation = transform_rune_view(&source)
 				.expect("strictly ordered finite bounds")
@@ -9053,7 +9069,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	#[test]
 	fn product_0036_layered_bounds_reach_one_shared_cartesian_domain() {
 		let source = r#"workspace.table("t").views([figure([
-			x_bounds(-2.0, 2.0), y_bounds(0.0, 8.0),
+			x_axis().bounds(-2.0, 2.0), y_axis().bounds(0.0, 8.0),
 			layers([line("x", "y"), scatter("x", "y")])
 		])])"#;
 		let relation = transform_rune_view(source)
@@ -9091,7 +9107,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	#[cfg(feature = "toron")]
 	#[test]
 	fn product_0038_tick_step_reaches_the_existing_renderer_with_and_without_bounds() {
-		let bounded_source = "workspace.table(\"t\").views([figure([y_bounds(0, 7), y_tick_step(1), bar(\"cat\", \"val\")])])";
+		let bounded_source = "workspace.table(\"t\").views([figure([y_axis().bounds(0, 7), y_axis().tick_step(1), bar(\"cat\", \"val\")])])";
 		let relation = transform_rune_view(bounded_source)
 			.unwrap()
 			.into_relations()
@@ -9124,7 +9140,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert!(render_marks_with_settings(kernel.as_ref(), settings).contains("<svg"));
 
 		let unbounded_source =
-			"workspace.table(\"t\").views([figure([y_tick_step(1), line(\"x\", \"y\")])])";
+			"workspace.table(\"t\").views([figure([y_axis().tick_step(1), line(\"x\", \"y\")])])";
 		let relation = transform_rune_view(unbounded_source)
 			.unwrap()
 			.into_relations()
@@ -9155,8 +9171,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	fn product_0038_tick_step_refuses_discrete_and_dense_requests_at_their_spans() {
 		use polars::prelude::{IntoColumn, NamedFrom};
 
-		let discrete_source =
-			"workspace.table(\"t\").views([figure([x_tick_step(1), bar(\"cat\", \"val\")])])";
+		let discrete_source = "workspace.table(\"t\").views([figure([x_axis().tick_step(1), bar(\"cat\", \"val\")])])";
 		let relation = transform_rune_view(discrete_source)
 			.unwrap()
 			.into_relations()
@@ -9167,17 +9182,16 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			panic!("categorical tick step must refuse");
 		};
 		assert!(
-			error.contains("x_tick_step(...)") && error.contains("Band"),
+			error.contains(".tick_step(...)") && error.contains("Band"),
 			"{error}"
 		);
 		let span = outcome.sinks[0].span.clone();
 		assert_eq!(
 			&discrete_source[span.start as usize..span.end as usize],
-			"x_tick_step(1)"
+			".tick_step(1)"
 		);
 
-		let dense_source =
-			"workspace.table(\"t\").views([figure([y_tick_step(1e-9), line(\"x\", \"y\")])])";
+		let dense_source = "workspace.table(\"t\").views([figure([y_axis().tick_step(1e-9), line(\"x\", \"y\")])])";
 		let relation = transform_rune_view(dense_source)
 			.unwrap()
 			.into_relations()
@@ -9197,11 +9211,11 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		let span = outcome.sinks[0].span.clone();
 		assert_eq!(
 			&dense_source[span.start as usize..span.end as usize],
-			"y_tick_step(1e-9)"
+			".tick_step(1e-9)"
 		);
 
 		let temporal_source =
-			"workspace.table(\"t\").views([figure([x_tick_step(1), line(\"x\", \"y\")])])";
+			"workspace.table(\"t\").views([figure([x_axis().tick_step(1), line(\"x\", \"y\")])])";
 		let relation = transform_rune_view(temporal_source)
 			.unwrap()
 			.into_relations()
@@ -9223,13 +9237,13 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			panic!("temporal tick step must refuse");
 		};
 		assert!(
-			error.contains("x_tick_step(...)") && error.contains("Time"),
+			error.contains(".tick_step(...)") && error.contains("Time"),
 			"{error}"
 		);
 		let span = outcome.sinks[0].span.clone();
 		assert_eq!(
 			&temporal_source[span.start as usize..span.end as usize],
-			"x_tick_step(1)"
+			".tick_step(1)"
 		);
 	}
 
@@ -9238,8 +9252,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 	fn product_0039_minor_ticks_toggle_and_combined_capacity_are_attributed() {
 		use polars::prelude::{IntoColumn, NamedFrom};
 
-		let off_source =
-			"workspace.table(\"t\").views([figure([y_minor_ticks(0), bar(\"cat\", \"val\")])])";
+		let off_source = "workspace.table(\"t\").views([figure([y_axis().minor_ticks(0), bar(\"cat\", \"val\")])])";
 		let relation = transform_rune_view(off_source)
 			.unwrap()
 			.into_relations()
@@ -9259,8 +9272,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert_eq!(settings.y_minor_ticks, 0);
 		assert_eq!(settings.x_minor_ticks, 4);
 
-		let discrete_source =
-			"workspace.table(\"t\").views([figure([x_minor_ticks(1), bar(\"cat\", \"val\")])])";
+		let discrete_source = "workspace.table(\"t\").views([figure([x_axis().minor_ticks(1), bar(\"cat\", \"val\")])])";
 		let relation = transform_rune_view(discrete_source)
 			.unwrap()
 			.into_relations()
@@ -9270,15 +9282,15 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		let Err(error) = &outcome.sinks[0].output else {
 			panic!("categorical minor ticks must refuse");
 		};
-		assert!(error.contains("x_minor_ticks(...)") && error.contains("Band"));
+		assert!(error.contains(".minor_ticks(...)") && error.contains("Band"));
 		let span = outcome.sinks[0].span.clone();
 		assert_eq!(
 			&discrete_source[span.start as usize..span.end as usize],
-			"x_minor_ticks(1)"
+			".minor_ticks(1)"
 		);
 
 		let temporal_source =
-			"workspace.table(\"t\").views([figure([x_minor_ticks(1), line(\"x\", \"y\")])])";
+			"workspace.table(\"t\").views([figure([x_axis().minor_ticks(1), line(\"x\", \"y\")])])";
 		let relation = transform_rune_view(temporal_source)
 			.unwrap()
 			.into_relations()
@@ -9299,9 +9311,9 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		let Err(error) = &outcome.sinks[0].output else {
 			panic!("temporal minor ticks must refuse");
 		};
-		assert!(error.contains("x_minor_ticks(...)") && error.contains("Time"));
+		assert!(error.contains(".minor_ticks(...)") && error.contains("Time"));
 
-		let major_alone = "workspace.table(\"t\").views([figure([y_bounds(0, 7), y_tick_step(0.001), line(\"x\", \"y\")])])";
+		let major_alone = "workspace.table(\"t\").views([figure([y_axis().bounds(0, 7), y_axis().tick_step(0.001), line(\"x\", \"y\")])])";
 		let relation = transform_rune_view(major_alone)
 			.unwrap()
 			.into_relations()
@@ -9313,7 +9325,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		);
 		assert!(outcome.sinks[0].output.is_ok());
 
-		let minor_alone = "workspace.table(\"t\").views([figure([y_bounds(0, 7), y_minor_ticks(9), line(\"x\", \"y\")])])";
+		let minor_alone = "workspace.table(\"t\").views([figure([y_axis().bounds(0, 7), y_axis().minor_ticks(9), line(\"x\", \"y\")])])";
 		let relation = transform_rune_view(minor_alone)
 			.unwrap()
 			.into_relations()
@@ -9325,7 +9337,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		);
 		assert!(outcome.sinks[0].output.is_ok());
 
-		let combined = "workspace.table(\"t\").views([figure([y_bounds(0, 7), y_tick_step(0.001), y_minor_ticks(9), line(\"x\", \"y\")])])";
+		let combined = "workspace.table(\"t\").views([figure([y_axis().bounds(0, 7), y_axis().tick_step(0.001), y_axis().minor_ticks(9), line(\"x\", \"y\")])])";
 		let relation = transform_rune_view(combined)
 			.unwrap()
 			.into_relations()
@@ -9339,7 +9351,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			panic!("combined minor lattice must refuse");
 		};
 		assert!(
-			error.contains("y_minor_ticks(9)")
+			error.contains(".minor_ticks(9)")
 				&& error.contains("Step")
 				&& error.contains("70001")
 				&& error.contains("capacity"),
@@ -9348,10 +9360,10 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		let span = outcome.sinks[0].span.clone();
 		assert_eq!(
 			&combined[span.start as usize..span.end as usize],
-			"y_minor_ticks(9)"
+			".minor_ticks(9)"
 		);
 
-		let huge = "workspace.table(\"t\").views([figure([y_minor_ticks(4294967295), line(\"x\", \"y\")])])";
+		let huge = "workspace.table(\"t\").views([figure([y_axis().minor_ticks(4294967295), line(\"x\", \"y\")])])";
 		let relation = transform_rune_view(huge)
 			.unwrap()
 			.into_relations()

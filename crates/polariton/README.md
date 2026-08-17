@@ -113,27 +113,26 @@ workspace.table("events").views([
 
 #### Rune bar presentation:
 
-Axis titles are text members, so their size attaches to the title. The
-no-argument form preserves a kernel-derived label while changing only its
-typography. Generated tick labels have no member, so they use dedicated words:
+Axes own their titles and generated tick labels, so their distinct typography
+properties are named directly on the axis:
 
 ```rune
 figure([
-    y_label().font_size(20),       // keeps the derived y-axis title
-    x_label("Quarter").font_size(18),
-    x_tick_size(12),
-    y_tick_size(14),
+    y_axis().label_size(20),       // keeps the derived y-axis title
+    x_axis().label("Quarter").label_size(18),
+    x_axis().tick_size(12),
+    y_axis().tick_size(14),
     bar("product", "value"),
 ])
 ```
 
 Generated x-axis tick labels can rotate in degrees when long labels need more
 horizontal separation. The angle is bounded from `-90` through `90`; it does
-not rotate the authored `x_label(...)` axis title:
+not rotate the authored `x_axis().label(...)` axis title:
 
 ```rune
 figure([
-    x_tick_rotation(45),
+    x_axis().tick_rotation(45),
     bar("product", "value"),
 ])
 ```
@@ -160,7 +159,7 @@ bar; the same grouped colors and bar register apply:
 ```rune
 workspace.table("sales").views([
     figure([
-        x_bounds(0, 150),
+        x_axis().bounds(0, 150),
         bar("revenue", "region", "product")
             .bar_width(0.9)
             .category_gap(0.2),
@@ -211,13 +210,13 @@ Add `.percent()` to project either stacked family onto a fixed `0..100` scale:
 ```rune
 workspace.table("sales").views([
     figure([
-        y_tick_step(25),
+        y_axis().tick_step(25),
         bar("region", "revenue", "product")
             .stacked()
             .percent(),
     ]),
     figure([
-        x_tick_step(25),
+        x_axis().tick_step(25),
         bar("revenue", "region", "product")
             .percent()
             .stacked(),

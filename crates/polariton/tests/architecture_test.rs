@@ -1539,14 +1539,14 @@ fn product_0036_numeric_bounds_have_one_figure_producer_and_no_magnitude_gate() 
 		.next()
 		.expect("production presentation source");
 	let bounds = production
-		.split("fn bounds_element(")
+		.split("fn raw_axis_bounds(")
 		.nth(1)
-		.expect("bounds constructor")
-		.split("fn numeric_pair_element(")
+		.expect("axis bounds constructor")
+		.split("fn raw_axis_tick_step(")
 		.next()
-		.expect("bounded bounds constructor");
-	assert!(production.contains("raw_x_bounds"));
-	assert!(production.contains("raw_y_bounds"));
+		.expect("bounded axis bounds constructor");
+	assert!(production.contains("raw_axis_bounds"));
+	assert!(production.contains("FigureElementKind::Axis(axis)"));
 	assert_eq!(
 		production
 			.matches("authored_settings.domains = Override::Set")
@@ -1641,15 +1641,14 @@ fn product_0038_tick_step_is_the_only_surface_producer_of_step_placement() {
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("typed presentation production");
-	assert!(production.contains("raw_x_tick_step"));
-	assert!(production.contains("raw_y_tick_step"));
+	assert!(production.contains("raw_axis_tick_step"));
 	assert_eq!(
 		production
 			.matches("authored_settings.guides = Override::Set")
 			.count(),
 		1
 	);
-	assert!(production.contains("fn numeric_scalar_element("));
+	assert!(production.contains("fn raw_axis_positive_scalar("));
 	assert!(production.contains("step must be strictly positive"));
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
@@ -1669,9 +1668,7 @@ fn product_0039_minor_ticks_have_one_surface_producer_and_checked_total_capacity
 		.split("#[cfg(test)]\nmod tests")
 		.next()
 		.expect("typed presentation production");
-	assert!(production.contains("raw_x_minor_ticks"));
-	assert!(production.contains("raw_y_minor_ticks"));
-	assert!(production.contains("fn minor_ticks_element("));
+	assert!(production.contains("raw_axis_minor_ticks"));
 	assert!(production.contains("count must be a non-negative integer"));
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
@@ -2985,16 +2982,18 @@ fn product_0085_keeps_one_semantic_axis_title_derivation_authority() {
 		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read compiler");
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation VM");
-	for label in ["x_label", "y_label"] {
+	for axis in ["x_axis", "y_axis"] {
 		assert!(
-			compiler.contains(&format!("\"{label}\",")),
-			"PRODUCT-0085 {label} must participate in presentation partitioning"
+			compiler.contains(&format!("\"{axis}\",")),
+			"PRODUCT-0085 {axis} must participate in presentation partitioning"
 		);
 		assert!(
-			presentation.contains(&format!("\"__{label}\"")),
-			"PRODUCT-0085 {label} must be registered in the local Rune VM"
+			presentation.contains(&format!("\"__{axis}\"")),
+			"PRODUCT-0085 {axis} must be registered in the local Rune VM"
 		);
 	}
+	assert!(compiler.contains("\"label\""));
+	assert!(presentation.contains("raw_axis_label"));
 }
 
 #[test]
@@ -4362,11 +4361,14 @@ fn product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_block
 			"{blocked} is not a new top-level spelling"
 		);
 	}
-	for generated in ["x_tick_size", "y_tick_size"] {
-		assert!(
-			free.contains(&format!("\"{generated}\"")),
-			"generated tick text owns a word"
-		);
+	for member in ["x_axis", "y_axis"] {
+		assert!(free.contains(&format!("\"{member}\"")));
+	}
+	for modifier in ["label", "label_size", "tick_size"] {
+		assert!(methods.contains(&format!("\"{modifier}\"")));
+	}
+	for retired in ["x_tick_size", "y_tick_size", "x_label", "y_label"] {
+		assert!(!free.contains(&format!("\"{retired}\"")));
 	}
 
 	let presentation =
@@ -4376,6 +4378,108 @@ fn product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_block
 	assert!(presentation.contains("padding() requires at least one edge modifier"));
 	assert!(presentation.contains("authored_settings.y_label_size = Override::Set(size);"));
 	assert!(presentation.contains("authored_settings.x_tick_size = Override::Set(size);"));
+}
+
+#[test]
+fn product_0123_axis_members_are_the_only_axis_surface_and_merge_fieldwise() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
+	let free = compiler
+		.split("const PRESENTATION_FREE")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation free vocabulary");
+	let methods = compiler
+		.split("const PRESENTATION_METHODS")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation method vocabulary");
+	for member in ["x_axis", "y_axis"] {
+		assert!(free.contains(&format!("\"{member}\"")));
+	}
+	for modifier in [
+		"label",
+		"label_size",
+		"bounds",
+		"tick_step",
+		"minor_ticks",
+		"tick_size",
+		"tick_rotation",
+	] {
+		assert!(methods.contains(&format!("\"{modifier}\"")));
+	}
+	for retired in [
+		"x_bounds",
+		"y_bounds",
+		"x_tick_step",
+		"y_tick_step",
+		"x_minor_ticks",
+		"y_minor_ticks",
+		"x_label",
+		"y_label",
+		"x_tick_rotation",
+		"x_tick_size",
+		"y_tick_size",
+	] {
+		assert!(
+			!free.contains(&format!("\"{retired}\"")),
+			"retired axis spelling remains in the free vocabulary: {retired}"
+		);
+	}
+
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read presentation");
+	let production = presentation
+		.split("\n#[cfg(test)]\nmod tests {")
+		.next()
+		.expect("production Rune presentation");
+	for raw in [
+		"fn raw_x_axis(",
+		"fn raw_y_axis(",
+		"fn raw_axis_label(",
+		"fn raw_axis_label_size(",
+		"fn raw_axis_bounds(",
+		"fn raw_axis_tick_step(",
+		"fn raw_axis_minor_ticks(",
+		"fn raw_axis_tick_size(",
+		"fn raw_axis_tick_rotation(",
+		"fn merge_axis(",
+	] {
+		assert!(
+			production.contains(raw),
+			"missing axis-member authority: {raw}"
+		);
+	}
+	for retired in [
+		"fn raw_x_bounds(",
+		"fn raw_y_bounds(",
+		"fn raw_x_tick_step(",
+		"fn raw_y_tick_step(",
+		"fn raw_x_minor_ticks(",
+		"fn raw_y_minor_ticks(",
+		"fn raw_x_label(",
+		"fn raw_y_label(",
+		"fn raw_x_tick_rotation(",
+		"fn raw_x_tick_size(",
+		"fn raw_y_tick_size(",
+	] {
+		assert!(
+			!production.contains(retired),
+			"retired axis producer remains: {retired}"
+		);
+	}
+	assert!(production.contains("AxisProperties"));
+	assert!(production.contains("properties.is_empty()"));
+	assert!(production.contains("&mut parts.x_bounds,"));
+	assert!(production.contains("&mut parts.y_bounds,"));
+	assert!(production.contains("tick_rotation(...) is available on x_axis(), not y_axis()"));
+
+	let exhibit = std::fs::read_to_string(root.join("../../../uat/test38.rn"))
+		.expect("read PRODUCT-0123 axis exhibit");
+	assert!(exhibit.contains("x_axis()"));
+	assert!(exhibit.contains("y_axis().label(\"Revenue · $k\").label_size(18)"));
+	assert!(exhibit.contains("y_axis().bounds(0, 50).tick_step(10).minor_ticks(1).tick_size(12)"));
 }
 
 #[test]
@@ -4653,7 +4757,14 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 		.nth(1)
 		.and_then(|rest| rest.split("];\n").next())
 		.expect("presentation free vocabulary");
-	assert!(free.contains("\"x_tick_rotation\""));
+	assert!(free.contains("\"x_axis\""));
+	let methods = compiler
+		.split("const PRESENTATION_METHODS")
+		.nth(1)
+		.and_then(|rest| rest.split("];\n").next())
+		.expect("presentation method vocabulary");
+	assert!(methods.contains("\"tick_rotation\""));
+	assert!(!free.contains("\"x_tick_rotation\""));
 	assert!(!free.contains("\"x_label_rotation\""));
 	assert!(!free.contains("\"y_tick_rotation\""));
 }

@@ -1,0 +1,37 @@
+// PRODUCT-0123: axis members.
+//
+// This is the readable reference exhibit for axis ownership. test37 remains
+// the long-label geometry probe; this file shows both legal composition forms:
+// a chained x_axis() and disjoint y_axis() calls in the same figure.
+let sales = ket.table("demo_sales");
+
+sales.views([
+	view("numeric-axis-members", figure([
+		title("Axis members · numeric controls"),
+		subtitle("Chained x-axis properties; separate y-axis calls compose"),
+		skin("greys_rs2"),
+		x_axis()
+			.label("Units sold")
+			.label_size(18)
+			.bounds(0, 16)
+			.tick_step(2)
+			.minor_ticks(1)
+			.tick_size(12),
+		y_axis().label("Revenue · $k").label_size(18),
+		y_axis().bounds(0, 50).tick_step(10).minor_ticks(1).tick_size(12),
+		scatter("units", "revenue", "product"),
+	])),
+	view("categorical-axis-members", figure([
+		title("Axis members · categorical labels"),
+		subtitle("Tick rotation and text sizing stay with the x axis"),
+		skin("greys_rs2"),
+		x_axis()
+			.label("Quarter")
+			.label_size(18)
+			.tick_size(12)
+			.tick_rotation(45),
+		y_axis().label_size(18),
+		y_axis().bounds(0, 50).tick_step(10).minor_ticks(1).tick_size(12),
+		bar("quarter", "revenue", "product").bar_width(0.9),
+	])),
+]);

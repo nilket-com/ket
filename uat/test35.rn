@@ -21,7 +21,7 @@ prepared.views([
 		subtitle("Relation-side density and medians · one shared concentration scale"),
 		skin("greys_rs2"),
 		palette("yellows"),
-		y_bounds(20, 80),
+		y_axis().bounds(20, 80),
 		violin("group", "evaluation_value", "density", "quantile"),
 	])),
 ]);
