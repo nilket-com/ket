@@ -7869,6 +7869,86 @@ pub fn placement_facts_from_nodes(nodes: &[TimingAtlasTaskNode]) -> PlacementFac
 	facts
 }
 
+/// The two placement policies compared by ADR 555 §7.
+///
+/// Both arms run **sequentially against the same worker processes**, each with
+/// its own registry. Independent reservation state is correct precisely because
+/// they do not overlap in time: an arm's load view describes only its own
+/// placement, and §7 seals that it drains to zero before its peer begins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementArm {
+	AffinityOnly,
+	LoadObserving,
+}
+
+impl PlacementArm {
+	pub fn label(self) -> &'static str {
+		match self {
+			Self::AffinityOnly => "affinity_only",
+			Self::LoadObserving => "load_observing",
+		}
+	}
+}
+
+/// Per-cell first-arm order must be balanced, not merely balanced across the run.
+///
+/// With seven pairs the only balanced split is 4/3. A globally even run can still
+/// put one cell entirely on one policy first, and order effects are per-cell:
+/// caches, resident partitions and worker state all carry within a cell.
+pub fn placement_pair_order_problems(query: &str, first_arms: &[PlacementArm]) -> Vec<String> {
+	let mut problems = Vec::new();
+	if first_arms.len() != TIMING_ATLAS_MEASURED_PAIRS {
+		problems.push(format!(
+			"{query} recorded {} pairs against the frozen {TIMING_ATLAS_MEASURED_PAIRS}",
+			first_arms.len()
+		));
+		return problems;
+	}
+	let affinity_first = first_arms
+		.iter()
+		.filter(|arm| **arm == PlacementArm::AffinityOnly)
+		.count();
+	let load_first = first_arms.len() - affinity_first;
+	if affinity_first.abs_diff(load_first) != 1 {
+		problems.push(format!(
+			"{query} first-arm order is {affinity_first}/{load_first}; seven pairs must split 4/3 so neither policy is systematically first"
+		));
+	}
+	problems
+}
+
+/// Both arms must have observed the same worker set, or their placement figures
+/// describe different machines and no comparison between them is meaningful.
+pub fn placement_worker_set_problems(
+	query: &str,
+	pair_index: usize,
+	affinity_only: &BTreeSet<String>,
+	load_observing: &BTreeSet<String>,
+) -> Vec<String> {
+	if affinity_only == load_observing {
+		return Vec::new();
+	}
+	vec![format!(
+		"{query} pair {pair_index} arms observed different worker sets: affinity-only {affinity_only:?} vs load-observing {load_observing:?}"
+	)]
+}
+
+/// An arm must drain its reservations before its peer runs.
+pub fn placement_reservation_drain_problems(
+	query: &str,
+	pair_index: usize,
+	arm: PlacementArm,
+	live_reservations: u32,
+) -> Vec<String> {
+	if live_reservations == 0 {
+		return Vec::new();
+	}
+	vec![format!(
+		"{query} pair {pair_index} {} arm left {live_reservations} live reservations; phantom load would bias its peer",
+		arm.label()
+	)]
+}
+
 /// Reject an attempt whose placement does not match the arm that produced it
 /// (ADR 555 §7).
 ///
@@ -23393,6 +23473,64 @@ mod adr538_timing_atlas_journal_replay {
 			placement_node(2, 0, sibling_a, vec![(1, 0)]),
 			placement_node(2, 1, sibling_b, vec![(1, 0)]),
 		]
+	}
+
+	/// Per-cell balance, not merely global. A run can be even overall while one
+	/// cell runs entirely on one policy first, and order effects are per-cell.
+	#[test]
+	fn adr555_pair_order_must_balance_within_each_cell() {
+		use PlacementArm::{AffinityOnly as A, LoadObserving as L};
+
+		assert!(placement_pair_order_problems("q19", &[A, L, A, L, A, L, A]).is_empty());
+		assert!(placement_pair_order_problems("q19", &[L, A, L, A, L, A, L]).is_empty());
+
+		let skewed = placement_pair_order_problems("q19", &[A, A, A, A, A, A, A]);
+		assert!(
+			skewed.iter().any(|p| p.contains("must split 4/3")),
+			"{skewed:?}"
+		);
+		// 5/2 is still unbalanced even though both policies appear.
+		let nearly = placement_pair_order_problems("q19", &[A, A, A, A, A, L, L]);
+		assert!(
+			nearly.iter().any(|p| p.contains("must split 4/3")),
+			"{nearly:?}"
+		);
+
+		let short = placement_pair_order_problems("q19", &[A, L]);
+		assert!(short.iter().any(|p| p.contains("frozen")), "{short:?}");
+	}
+
+	#[test]
+	fn adr555_both_arms_must_observe_the_same_worker_set() {
+		let both: BTreeSet<String> = ["w1", "w2"].iter().map(|w| w.to_string()).collect();
+		let one: BTreeSet<String> = ["w1"].iter().map(|w| w.to_string()).collect();
+
+		assert!(placement_worker_set_problems("q19", 0, &both, &both).is_empty());
+		let problems = placement_worker_set_problems("q19", 0, &both, &one);
+		assert!(
+			problems.iter().any(|p| p.contains("different worker sets")),
+			"{problems:?}"
+		);
+	}
+
+	/// A leaked reservation carries phantom load into the peer arm and biases the
+	/// very comparison the pairing protects.
+	#[test]
+	fn adr555_an_arm_must_drain_its_reservations_before_its_peer() {
+		assert!(
+			placement_reservation_drain_problems("q19", 0, PlacementArm::AffinityOnly, 0)
+				.is_empty()
+		);
+		let problems =
+			placement_reservation_drain_problems("q19", 0, PlacementArm::LoadObserving, 3);
+		assert!(
+			problems.iter().any(|p| p.contains("live reservations")),
+			"{problems:?}"
+		);
+		assert!(
+			problems.iter().any(|p| p.contains("load_observing")),
+			"the failure names the arm that leaked: {problems:?}"
+		);
 	}
 
 	#[test]

@@ -316,6 +316,21 @@ impl StaticWorkerRegistry {
 		})
 	}
 
+	/// Total outstanding reservations across every worker.
+	///
+	/// ADR 555 §7 seals that an arm finishes with **zero** live reservations
+	/// before its paired peer begins: a leaked reservation would carry phantom
+	/// load into the next arm and bias its placement, which is exactly the
+	/// comparison the pairing exists to protect.
+	pub fn live_reservations(&self) -> u32 {
+		self.workers
+			.read()
+			.expect("worker registry poisoned")
+			.values()
+			.map(|worker| worker.resources.active_tasks.get())
+			.sum()
+	}
+
 	/// Select the fallback policy explicitly. Construction-time only, so a
 	/// production coordinator cannot acquire the baseline arm by configuration.
 	pub fn with_fallback_placement_policy(mut self, fallback: FallbackPlacementPolicy) -> Self {
