@@ -1,0 +1,47 @@
+// Trends & relationships — one coherent relation, four authorable marks.
+let trends = workspace
+	.table("trend_showcase")
+	.sort([asc(col("period")), asc(col("series"))]);
+let categorical_palette = "blues_C";
+let sequential_ramp = "blues";
+trends.views([
+	view("trend-lines", figure([
+		title("Product momentum").font_size(24),
+		subtitle("Eight-week activation trend by product line"),
+		skin("greys_rs2"),
+		palette(categorical_palette),
+		x_axis().label("Week").label_size(16).tick_step(1),
+		y_axis().label("Activated accounts").label_size(16),
+		legend().at(0.70, 0.08).font_size(14),
+		line("period", "value", "series").stroke_width(2),
+	])),
+	view("trend-area", figure([
+		title("Portfolio growth").font_size(24),
+		subtitle("The same weekly activity, accumulated across product lines"),
+		skin("greys_rs2"),
+		palette(categorical_palette),
+		x_axis().label("Week").label_size(16).tick_step(1),
+		y_axis().label("Activated accounts").label_size(16),
+		legend().at(0.70, 0.08).font_size(14),
+		area("period", "value", "series"),
+	])),
+	view("trend-scatter", figure([
+		title("Momentum checkpoints").font_size(24),
+		subtitle("Each observation stays discrete while the series identity remains visible"),
+		skin("greys_rs2"),
+		palette(categorical_palette),
+		x_axis().label("Week").label_size(16).tick_step(1),
+		y_axis().label("Activated accounts").label_size(16),
+		legend().at(0.70, 0.08).font_size(14),
+		scatter("period", "value", "series").point_size(2.0),
+	])),
+	view("trend-bubbles", figure([
+		title("Momentum and reach").font_size(24),
+		subtitle("Bubble area adds engaged accounts; colour retains the activation measure"),
+		skin("greys_rs2"),
+		sequential_palette(sequential_ramp),
+		x_axis().label("Week").label_size(16).tick_step(1),
+		y_axis().label("Activated accounts").label_size(16),
+		bubble("period", "value", "magnitude", "value", "series"),
+	])),
+]);

@@ -1,0 +1,32 @@
+// Composition & progress — one conversion relation, read two ways.
+let conversion = workspace
+	.table("conversion_showcase")
+	.sort([asc(col("stage_order"))]);
+let readiness = workspace.table("readiness_showcase");
+
+conversion.views([
+	view("composition-pie", figure([
+		title("Where the conversion population sits").font_size(24),
+		subtitle("The funnel's stage volumes, read as parts of one total"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		pie("stage", "value"),
+	])),
+	view("composition-funnel", figure([
+		title("How the conversion population narrows").font_size(24),
+		subtitle("The same ordered stage volumes, read as a progression"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		funnel("stage", "value"),
+	])),
+]);
+
+readiness.views([
+	view("composition-readiness", figure([
+		title("Launch-readiness scorecard").font_size(24),
+		subtitle("Four named readings against one explicit maximum"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		radial_dial("value", "maximum", "label"),
+	])),
+]);

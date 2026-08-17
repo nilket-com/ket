@@ -1,0 +1,220 @@
+// Distribution & variation — four prepared views from one raw observation table.
+// Rune relation handles are linear, so each independent preparation reacquires
+// the same source rather than reusing a consumed handle.
+
+let cohort_averages = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [avg(col("score"))])
+	.project_named([
+		col("cohort").named("cohort"),
+		col("avg").named("average_score"),
+	])
+	.sort([asc(col("cohort"))]);
+
+let histogram_bins = workspace
+	.table("distribution_observations")
+	.project_named([
+		col("score")
+			.sub(lit_f64(20.0))
+			.div(lit_f64(10.0))
+			.cast(type_i64())
+			.named("bin_index"),
+	])
+	.aggregate([col("bin_index")], [count_all()])
+	.project_named([
+		col("bin_index")
+			.cast(type_f64())
+			.mul(lit_f64(10.0))
+			.add(lit_f64(20.0))
+			.named("bin_start"),
+		col("bin_index")
+			.cast(type_f64())
+			.mul(lit_f64(10.0))
+			.add(lit_f64(30.0))
+			.named("bin_end"),
+		col("count").named("bin_count"),
+	])
+	.sort([asc(col("bin_start"))]);
+
+let summary_q1 = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [approx_quantile(col("score"), 0.25)])
+	.alias("q1");
+let summary_median = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [approx_quantile(col("score"), 0.5)])
+	.alias("median");
+let summary_q3 = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [approx_quantile(col("score"), 0.75)])
+	.alias("q3");
+let summary_quartiles = summary_q1
+	.join(
+		summary_median,
+		qcol("q1", "cohort").eq(qcol("median", "cohort")),
+	)
+	.join(summary_q3, qcol("q1", "cohort").eq(qcol("q3", "cohort")))
+	.project_named([
+		qcol("q1", "cohort").named("cohort"),
+		qcol("q1", "quantile").named("q1"),
+		qcol("median", "quantile").named("median"),
+		qcol("q3", "quantile").named("q3"),
+		qcol("q1", "quantile")
+			.sub(qcol("q3", "quantile").sub(qcol("q1", "quantile")).mul(lit_f64(1.5)))
+			.named("lower_fence"),
+		qcol("q3", "quantile")
+			.add(qcol("q3", "quantile").sub(qcol("q1", "quantile")).mul(lit_f64(1.5)))
+			.named("upper_fence"),
+	])
+	.alias("summary_quartiles");
+let box_summaries = workspace
+	.table("distribution_observations")
+	.alias("observations")
+	.join(
+		summary_quartiles,
+		qcol("observations", "cohort").eq(qcol("summary_quartiles", "cohort")),
+	)
+	.project_named([
+		qcol("observations", "cohort").named("cohort"),
+		qcol("observations", "score").named("score"),
+		qcol("summary_quartiles", "q1").named("q1"),
+		qcol("summary_quartiles", "median").named("median"),
+		qcol("summary_quartiles", "q3").named("q3"),
+		qcol("summary_quartiles", "lower_fence").named("lower_fence"),
+		qcol("summary_quartiles", "upper_fence").named("upper_fence"),
+	])
+	.filter(
+		col("score")
+			.gte(col("lower_fence"))
+			.and(col("score").lte(col("upper_fence"))),
+	)
+	.aggregate(
+		[col("cohort"), col("q1"), col("median"), col("q3")],
+		[min(col("score")), max(col("score"))],
+	)
+	.alias("box_summaries");
+
+let outlier_q1 = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [approx_quantile(col("score"), 0.25)])
+	.alias("q1");
+let outlier_median = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [approx_quantile(col("score"), 0.5)])
+	.alias("median");
+let outlier_q3 = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [approx_quantile(col("score"), 0.75)])
+	.alias("q3");
+let outlier_quartiles = outlier_q1
+	.join(
+		outlier_median,
+		qcol("q1", "cohort").eq(qcol("median", "cohort")),
+	)
+	.join(outlier_q3, qcol("q1", "cohort").eq(qcol("q3", "cohort")))
+	.project_named([
+		qcol("q1", "cohort").named("cohort"),
+		qcol("q1", "quantile")
+			.sub(qcol("q3", "quantile").sub(qcol("q1", "quantile")).mul(lit_f64(1.5)))
+			.named("lower_fence"),
+		qcol("q3", "quantile")
+			.add(qcol("q3", "quantile").sub(qcol("q1", "quantile")).mul(lit_f64(1.5)))
+			.named("upper_fence"),
+	])
+	.alias("outlier_quartiles");
+let outliers = workspace
+	.table("distribution_observations")
+	.alias("observations")
+	.join(
+		outlier_quartiles,
+		qcol("observations", "cohort").eq(qcol("outlier_quartiles", "cohort")),
+	)
+	.project_named([
+		qcol("observations", "cohort").named("cohort"),
+		qcol("observations", "score").named("score"),
+		qcol("outlier_quartiles", "lower_fence").named("lower_fence"),
+		qcol("outlier_quartiles", "upper_fence").named("upper_fence"),
+	])
+	.filter(
+		col("score")
+			.lt(col("lower_fence"))
+			.or(col("score").gt(col("upper_fence"))),
+	)
+	.project_named([
+		col("cohort").named("cohort"),
+		col("score").named("outlier"),
+	])
+	.alias("outliers");
+let box_inputs = box_summaries.left_join(
+	outliers,
+	qcol("box_summaries", "cohort").eq(qcol("outliers", "cohort")),
+)
+	.project_named([
+		qcol("box_summaries", "cohort").named("cohort"),
+		qcol("box_summaries", "min").named("whisker_low"),
+		qcol("box_summaries", "q1").named("q1"),
+		qcol("box_summaries", "median").named("median"),
+		qcol("box_summaries", "q3").named("q3"),
+		qcol("box_summaries", "max").named("whisker_high"),
+		qcol("outliers", "outlier").named("outlier"),
+	])
+	.sort([asc(col("cohort")), asc(col("outlier"))]);
+
+let density = workspace
+	.table("distribution_observations")
+	.kernel_density(col("cohort"), col("score"), 128)
+	.alias("density");
+let density_medians = workspace
+	.table("distribution_observations")
+	.aggregate([col("cohort")], [approx_quantile(col("score"), 0.5)])
+	.alias("medians");
+let violin_inputs = density.join(
+	density_medians,
+	qcol("density", "group").eq(qcol("medians", "cohort")),
+);
+
+cohort_averages.views([
+	view("distribution-bars", figure([
+		title("Average score by cohort").font_size(24),
+		subtitle("The same observations, reduced to one comparison per cohort"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		x_axis().label("Cohort").label_size(16),
+		y_axis().label("Average score").label_size(16),
+		bar("cohort", "average_score").bar_width(0.82),
+	])),
+]);
+
+histogram_bins.views([
+	view("distribution-histogram", figure([
+		title("All observations in fixed bins").font_size(24),
+		subtitle("Counted numeric bins; aggregation stays in the relation"),
+		skin("greys_rs2"),
+		x_axis().label("Score").label_size(16).tick_step(10),
+		y_axis().label("Observations").label_size(16),
+		histogram("bin_start", "bin_end", "bin_count"),
+	])),
+]);
+
+box_inputs.views([
+	view("distribution-box", figure([
+		title("Cohort spread and outliers").font_size(24),
+		subtitle("Quartiles, fences, whiskers, and exceptions are all relation-side"),
+		skin("greys_rs2"),
+		x_axis().label("Cohort").label_size(16),
+		y_axis().label("Score").label_size(16),
+		box("cohort", "whisker_low", "q1", "median", "q3", "whisker_high", "outlier"),
+	])),
+]);
+
+violin_inputs.views([
+	view("distribution-violin", figure([
+		title("Cohort density and median").font_size(24),
+		subtitle("One shared density grid, joined to each cohort's median"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		x_axis().label("Cohort").label_size(16),
+		y_axis().label("Score").label_size(16),
+		violin("group", "evaluation_value", "density", "quantile"),
+	])),
+]);

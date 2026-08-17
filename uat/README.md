@@ -1,5 +1,11 @@
 # Polariton UAT exhibits
 
+`testNN.rn` files are historical regression probes, named by birth order and
+cited by product records as provenance. Do not rename them merely to tidy the
+directory: a record may honestly cite a probe that was later deleted, but a
+rename makes a live exhibit appear missing. New purposeful, presentation-ready
+exhibits use semantic names that describe what they show.
+
 Seed the four-quarter sales fixture, then open the twelve-panel bar showcase:
 
 ```sh
@@ -14,6 +20,54 @@ so the faceted panels can expose a quarter-assignment defect.
 `test21.rn` is both a runnable product exhibit and a PRODUCT-0076 regression
 input. Keep this repository copy authoritative; files in a neighboring `uat`
 directory are local conveniences and are not build inputs.
+
+Open the semantic Trends & relationships showcase with its purpose-built seed:
+
+```sh
+nilket toron sql --file uat/plot_trends_showcase.sql
+cargo run -p polariton -- uat/plot_trends_showcase.rn
+```
+
+One relation drives its line, area, scatter, and bubble views. The four fields
+are intentionally direct mark inputs: `period`, `series`, `value`, and
+`magnitude`.
+
+Open the semantic Distribution & variation showcase with its raw-observation
+seed:
+
+```sh
+nilket toron sql --file uat/plot_distribution_showcase.sql
+cargo run -p polariton -- uat/plot_distribution_showcase.rn
+```
+
+One relation drives four different statistical preparations: grouped averages
+for bars, fixed numeric bins for the histogram, Tukey summaries for the box
+plot, and density plus median for violins. The aggregation stays visible in
+Rune; marks receive only their prepared inputs.
+
+Open the semantic Composition & progress showcase with its two purpose-built
+relations:
+
+```sh
+nilket toron sql --file uat/plot_composition_showcase.sql
+cargo run -p polariton -- uat/plot_composition_showcase.rn
+```
+
+The ordered conversion table drives both pie and funnel views: one renders
+parts of a total, the other renders the same values as a declining progression.
+The separate readiness table supplies named radial-dial readings.
+
+Open the semantic Multivariate & matrix showcase with its long- and wide-form
+relations:
+
+```sh
+nilket toron sql --file uat/plot_multivariate_showcase.sql
+cargo run -p polariton -- uat/plot_multivariate_showcase.rn
+```
+
+The heatmap reads an explicit long-form capability matrix. Radar and parallel
+read the same wide operating profiles, making their difference one of visual
+question rather than data preparation.
 
 Open the PRODUCT-0123 axis-member reference exhibit after seeding the same
 sales relation:

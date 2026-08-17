@@ -3678,4 +3678,55 @@ r.views([bar(category(), "revenue")])
 			);
 		}
 	}
+
+	#[test]
+	fn semantic_trends_showcase_compiles_all_four_cartesian_marks() {
+		let source = include_str!("../../../uat/plot_trends_showcase.rn");
+		let compiled = compile(source).expect("the Trends showcase compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(compiled.executions[0].views.len(), 4);
+		for mark in ["line", "area", "scatter", "bubble"] {
+			assert!(
+				source.contains(&format!("{mark}(\"period\"")),
+				"missing {mark}"
+			);
+		}
+	}
+
+	#[test]
+	fn semantic_distribution_showcase_compiles_relation_native_mark_inputs() {
+		let source = include_str!("../../../uat/plot_distribution_showcase.rn");
+		let compiled = compile(source).expect("the Distribution showcase compiles");
+		assert_eq!(compiled.executions.len(), 4);
+		assert!(source.contains("kernel_density(col(\"cohort\"), col(\"score\"), 128)"));
+		assert!(source.contains("approx_quantile(col(\"score\"), 0.25)"));
+		for mark in ["bar", "histogram", "box", "violin"] {
+			assert!(source.contains(&format!("{mark}(\"")), "missing {mark}");
+		}
+	}
+
+	#[test]
+	fn semantic_composition_showcase_compiles_all_three_radial_marks() {
+		let source = include_str!("../../../uat/plot_composition_showcase.rn");
+		let compiled = compile(source).expect("the Composition showcase compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.executions[0].views.len(), 2);
+		assert_eq!(compiled.executions[1].views.len(), 1);
+		for mark in ["pie", "funnel", "radial_dial"] {
+			assert!(source.contains(&format!("{mark}(\"")), "missing {mark}");
+		}
+	}
+
+	#[test]
+	fn semantic_multivariate_showcase_compiles_long_and_wide_mark_inputs() {
+		let source = include_str!("../../../uat/plot_multivariate_showcase.rn");
+		let compiled = compile(source).expect("the Multivariate showcase compiles");
+		assert_eq!(compiled.executions.len(), 2);
+		assert_eq!(compiled.executions[0].views.len(), 1);
+		assert_eq!(compiled.executions[1].views.len(), 2);
+		for mark in ["heatmap", "radar", "parallel"] {
+			assert!(source.contains(&format!("{mark}(\"")), "missing {mark}");
+		}
+		assert!(source.contains("padding().left(96)"));
+	}
 }

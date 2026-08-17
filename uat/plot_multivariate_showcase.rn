@@ -1,0 +1,31 @@
+// Multivariate & matrix — one long-form matrix and one wide-form scorecard.
+let matrix = workspace.table("capability_matrix_showcase");
+let profiles = workspace.table("operating_profiles_showcase");
+
+matrix.views([
+	view("multivariate-heatmap", figure([
+		title("Capability delta across the customer journey").font_size(24),
+		subtitle("A long-form matrix centred on the target baseline"),
+		skin("greys_rs2"),
+		diverging_palette("blue_white_red"),
+		heatmap("journey", "capability", "delta").diverging_at(0.0),
+	])),
+]);
+
+profiles.views([
+	view("multivariate-radar", figure([
+		title("Operating profiles at a glance").font_size(24),
+		subtitle("The same five named dimensions, compared as outlines"),
+		skin("greys_rs2"),
+		palette("blues_C"),
+		radar("quality", "speed", "reliability", "reach", "support").category("team"),
+	])),
+	view("multivariate-parallel", figure([
+		title("Operating-profile trade-offs").font_size(24),
+		subtitle("The same dimensions, read as connected values instead of areas"),
+		skin("greys_rs2"),
+		padding().left(96),
+		palette("blues_C"),
+		parallel("quality", "speed", "reliability", "reach", "support").category("team"),
+	])),
+]);
