@@ -5,8 +5,7 @@ parallel_rows.views([
 		title("Parallel · deliberate facet gutters"),
 		subtitle("24 px shared space between independently clipped facet cells"),
 		skin("nord"),
-		facet("cohort"),
-		facet_gutter(24),
+		facet("cohort").gutter(24),
 		parallel("d8", "d1", "d6", "d3", "d7", "d2", "d5", "d4"),
 	])),
 ]);

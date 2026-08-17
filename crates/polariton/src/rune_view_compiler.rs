@@ -42,7 +42,6 @@ const PRESENTATION_FREE: &[&str] = &[
 	"line",
 	"palette",
 	"padding",
-	"facet_gutter",
 	"scatter",
 	"sequential_palette",
 	"skin",
@@ -69,6 +68,7 @@ const PRESENTATION_METHODS: &[&str] = &[
 	"diverging_at",
 	"duotone",
 	"font_size",
+	"gutter",
 	"percent",
 	"point_size",
 	"top",
@@ -3461,7 +3461,7 @@ r.views([bar(category(), "revenue")])
 	}
 
 	#[test]
-	fn product_0110_test36_is_the_authored_facet_gutter_exhibit() {
+	fn product_0121_test36_is_the_authored_facet_gutter_member_exhibit() {
 		let source = include_str!("../../../uat/test36.rn");
 		let compiled = compile(source).expect("the checked-in gutter exhibit compiles");
 		assert_eq!(compiled.executions.len(), 1);
@@ -3471,5 +3471,14 @@ r.views([bar(category(), "revenue")])
 		assert_eq!(plot.facet.as_deref(), Some("cohort"));
 		assert_eq!(plot.facet_gutter, Some(24.0));
 		assert!(matches!(plot.body, RunePlotBody::Single(_)));
+
+		let legacy = compile(
+			r#"workspace.table("t").views([figure([facet_gutter(24), bar("x", "y")])])"#,
+		)
+		.expect_err("the retired free word is not an alias");
+		let RuneEnvelopeError::InvalidView { message, .. } = legacy else {
+			panic!("retired gutter spelling remains an invalid view")
+		};
+		assert!(message.contains("Missing item facet_gutter"), "{message}");
 	}
 }

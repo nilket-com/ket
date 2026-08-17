@@ -13,6 +13,7 @@ axis_labels.views([
 		title("Long categorical labels · 45° x-tick rotation"),
 		subtitle("Shared bottom-band reservation · inward endpoint anchoring"),
 		skin("greys_rs2"),
+		padding().top(100).left(200).right(220),
 		x_tick_rotation(45),
 		facet("facet"),
 		bar("label", "value"),

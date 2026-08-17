@@ -4185,7 +4185,7 @@ fn product_0109_palette_kind_is_carried_and_continuous_allocation_is_stateless()
 }
 
 #[test]
-fn product_0110_facet_gutter_stays_a_figure_grid_authority() {
+fn product_0121_facet_gutter_member_reuses_the_existing_figure_grid_authority() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read grid layout");
 	let production_grid = grid
@@ -4210,8 +4210,10 @@ fn product_0110_facet_gutter_stays_a_figure_grid_authority() {
 	);
 	let presentation =
 		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read Rune surface");
-	assert!(presentation.contains("__facet_gutter"));
-	assert!(presentation.contains("facet_gutter(...) requires facet(...)"));
+	assert!(!presentation.contains("__facet_gutter"));
+	assert!(presentation.contains("__gutter"));
+	assert!(presentation.contains("gutter(...) requires a facet(...) receiver"));
+	assert!(presentation.contains("element.facet_gutter = Some(value as f32)"));
 }
 
 #[test]

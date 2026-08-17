@@ -174,7 +174,6 @@ enum FigureElementKind {
 	XLabel(String),
 	YLabel(String),
 	Facet(String),
-	FacetGutter(f32),
 	Palette(String),
 	SequentialPalette(ColorTheme),
 	DivergingPalette(ColorTheme),
@@ -248,6 +247,8 @@ struct RuneFigureElement {
 	origin: Origin,
 	font_size: Option<FigureTextSize>,
 	font_size_origin: Option<Origin>,
+	facet_gutter: Option<f32>,
+	facet_gutter_origin: Option<Origin>,
 	padding: FigurePadding,
 	padding_edge_origins: [Option<Origin>; 4],
 }
@@ -259,6 +260,8 @@ impl RuneFigureElement {
 			origin,
 			font_size: None,
 			font_size_origin: None,
+			facet_gutter: None,
+			facet_gutter_origin: None,
 			padding: FigurePadding::default(),
 			padding_edge_origins: [None; 4],
 		}
@@ -484,7 +487,6 @@ fn build_context() -> Result<Context, String> {
 		("__x_label", raw_x_label as RawFunction),
 		("__y_label", raw_y_label as RawFunction),
 		("__facet", raw_facet as RawFunction),
-		("__facet_gutter", raw_facet_gutter as RawFunction),
 		("__palette", raw_palette as RawFunction),
 		(
 			"__sequential_palette",
@@ -521,6 +523,7 @@ fn build_context() -> Result<Context, String> {
 		.build_associated::<RuneSkin>()
 		.map_err(module_error)?;
 	for (name, function) in [
+		("__gutter", raw_figure_facet_gutter as RawFunction),
 		("__top", raw_figure_padding_top as RawFunction),
 		("__right", raw_figure_padding_right as RawFunction),
 		("__bottom", raw_figure_padding_bottom as RawFunction),
@@ -1497,7 +1500,7 @@ fn raw_facet(stack: &mut dyn Memory, addr: InstAddress, args: usize, out: Output
 	raw_string_element(StringConstructor::Facet, "facet", stack, addr, args, out)
 }
 
-fn raw_facet_gutter(
+fn raw_figure_facet_gutter(
 	stack: &mut dyn Memory,
 	addr: InstAddress,
 	args: usize,
@@ -1505,23 +1508,57 @@ fn raw_facet_gutter(
 ) -> VmResult<()> {
 	let values = rune::vm_try!(stack.slice_at(addr, args));
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
-	let value = if values.len() != 3 {
-		Err(PresentationFailure::new(
-			origin,
-			"facet_gutter(...) requires exactly one finite nonnegative number",
-		))
-	} else {
-		match rune_number(&values[0]) {
-			Some(value) if value.is_finite() && value >= 0.0 => {
-				Ok(FigureElementKind::FacetGutter(value as f32))
-			}
-			_ => Err(PresentationFailure::new(
+	let mut element = match values
+		.first()
+		.cloned()
+		.map(rune::from_value::<RuneFigureElement>)
+	{
+		Some(Ok(element)) => element,
+		_ => RuneFigureElement::new(
+			Err(PresentationFailure::new(
 				origin,
-				"facet_gutter(...) requires exactly one finite nonnegative number",
+				"gutter(...) requires a facet(...) receiver",
 			)),
-		}
+			origin,
+		),
 	};
-	store(out, stack, RuneFigureElement::new(value, origin))
+	if element.value.is_err() {
+		return store(out, stack, element);
+	}
+	if !matches!(element.value.as_ref(), Ok(FigureElementKind::Facet(_))) {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"gutter(...) requires a facet(...) receiver",
+		));
+		return store(out, stack, element);
+	}
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"gutter(...) requires exactly one finite nonnegative number",
+		));
+		return store(out, stack, element);
+	}
+	if element.facet_gutter_origin.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"facet(...).gutter(...) may appear at most once",
+		));
+		return store(out, stack, element);
+	}
+	match rune_number(&values[1]) {
+		Some(value) if value.is_finite() && value >= 0.0 => {
+			element.facet_gutter = Some(value as f32);
+			element.facet_gutter_origin = Some(origin);
+		}
+		_ => {
+			element.value = Err(PresentationFailure::new(
+				origin,
+				"gutter(...) requires exactly one finite nonnegative number",
+			));
+		}
+	}
+	store(out, stack, element)
 }
 
 fn raw_palette(
@@ -3316,6 +3353,7 @@ fn decode_figure(value: &Value, origin: Origin) -> Result<RunePlotIntent, Presen
 				&mut parts,
 				kind,
 				element.font_size,
+				element.facet_gutter,
 				element.padding,
 				element.origin,
 			)?;
@@ -3407,6 +3445,7 @@ fn merge_element(
 	parts: &mut FigureParts,
 	element: FigureElementKind,
 	font_size: Option<FigureTextSize>,
+	facet_gutter: Option<f32>,
 	padding: FigurePadding,
 	origin: Origin,
 ) -> Result<(), PresentationFailure> {
@@ -3453,18 +3492,23 @@ fn merge_element(
 			origin,
 			"a figure has at most one y_label element",
 		),
-		FigureElementKind::Facet(value) => set_once(
-			&mut parts.facet,
-			(value, origin),
-			origin,
-			"a figure has at most one facet element",
-		),
-		FigureElementKind::FacetGutter(value) => set_once(
-			&mut parts.facet_gutter,
-			(value, origin),
-			origin,
-			"a figure has at most one facet_gutter element",
-		),
+		FigureElementKind::Facet(value) => {
+			set_once(
+				&mut parts.facet,
+				(value, origin),
+				origin,
+				"a figure has at most one facet element",
+			)?;
+			if let Some(value) = facet_gutter {
+				set_once(
+					&mut parts.facet_gutter,
+					(value, origin),
+					origin,
+					"facet(...).gutter(...) may appear at most once",
+				)?;
+			}
+			Ok(())
+		}
 		FigureElementKind::Palette(value) => set_once(
 			&mut parts.palette,
 			(value, origin),
@@ -3548,14 +3592,6 @@ fn merge_element(
 
 impl FigureParts {
 	fn finish(self, body: RunePlotBody) -> Result<RunePlotIntent, PresentationFailure> {
-		if let Some((_, origin)) = self.facet_gutter {
-			if self.facet.is_none() {
-				return Err(PresentationFailure::new(
-					origin,
-					"facet_gutter(...) requires facet(...)",
-				));
-			}
-		}
 		let mut authored_settings = PlotSettingsLayer::default();
 		if let Some((title, font_size, _)) = &self.title {
 			authored_settings.title = Presence::Show(Arc::new(title.clone()));
@@ -3822,10 +3858,9 @@ polariton_presentation::__line("x", "y", 50, 62)
 	}
 
 	#[test]
-	fn product_0110_facet_gutter_is_faceted_figure_furniture() {
+	fn product_0121_facet_gutter_is_a_facet_member_with_local_refusals() {
 		let valid = r#"pub fn main() { [polariton_presentation::__figure([
-polariton_presentation::__facet("region", 10, 25),
-polariton_presentation::__facet_gutter(24, 26, 41),
+polariton_presentation::__facet("region", 10, 25).__gutter(24, 26, 41),
 polariton_presentation::__bar("quarter", "sales", 42, 66)
 ], 0, 67)] }"#;
 		let views = execute(valid, &[0..67]).expect("faceted gutter figure");
@@ -3836,29 +3871,34 @@ polariton_presentation::__bar("quarter", "sales", 42, 66)
 		assert_eq!(plot.facet_gutter, Some(24.0));
 		assert_eq!(plot.authored_settings, PlotSettingsLayer::default());
 
-		let nonfaceted = r#"pub fn main() { [polariton_presentation::__figure([
-polariton_presentation::__facet_gutter(24, 10, 25),
-polariton_presentation::__bar("quarter", "sales", 26, 50)
-], 0, 51)] }"#;
-		assert_eq!(
-			execute(nonfaceted, &[0..51]),
-			Err(PresentationFailure {
-				span: 10..25,
-				message: "facet_gutter(...) requires facet(...)".to_owned(),
-			})
-		);
+		for wrong_receiver in [
+			r#"pub fn main() { [polariton_presentation::__figure([
+polariton_presentation::__title("title", 10, 25).__gutter(4, 26, 41),
+polariton_presentation::__bar("quarter", "sales", 42, 66)
+], 0, 67)] }"#,
+			r#"pub fn main() { [polariton_presentation::__figure([
+polariton_presentation::__skin("greys_rs2", 10, 25).__gutter(4, 26, 41),
+polariton_presentation::__bar("quarter", "sales", 42, 66)
+], 0, 67)] }"#,
+		] {
+			assert_eq!(
+				execute(wrong_receiver, &[0..67]),
+				Err(PresentationFailure {
+					span: 26..41,
+					message: "gutter(...) requires a facet(...) receiver".to_owned(),
+				})
+			);
+		}
 
 		let duplicate = r#"pub fn main() { [polariton_presentation::__figure([
-polariton_presentation::__facet("region", 10, 25),
-polariton_presentation::__facet_gutter(12, 26, 41),
-polariton_presentation::__facet_gutter(24, 42, 57),
+polariton_presentation::__facet("region", 10, 25).__gutter(12, 26, 41).__gutter(24, 42, 57),
 polariton_presentation::__bar("quarter", "sales", 58, 82)
 ], 0, 83)] }"#;
 		assert_eq!(
 			execute(duplicate, &[0..83]),
 			Err(PresentationFailure {
 				span: 42..57,
-				message: "a figure has at most one facet_gutter element".to_owned(),
+				message: "facet(...).gutter(...) may appear at most once".to_owned(),
 			})
 		);
 	}
