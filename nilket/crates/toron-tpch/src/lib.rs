@@ -6077,6 +6077,317 @@ impl CensusTimingAtlasHarness {
 	}
 }
 
+/// The live ADR 555 harness. One cell owns one set of resident workers and two coordinators
+/// over them: the deterministic affinity-only baseline and the load-observing treatment.
+///
+/// The coordinators intentionally have independent registries. Their arms run sequentially,
+/// and the placement driver seals each registry at zero before the peer starts; sharing a
+/// registry would instead leak one policy's load history into the other policy's choice.
+pub struct CensusPlacementHarness {
+	sql: String,
+	storage: Arc<dyn StorageScan>,
+	catalog: Option<MockCatalog>,
+	width: usize,
+	workers: Vec<ExecutionCensusWorkerHarness>,
+	affinity_coordinator: Option<DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport>>,
+	load_coordinator: Option<DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport>>,
+	affinity_registry: Option<Arc<StaticWorkerRegistry>>,
+	load_registry: Option<Arc<StaticWorkerRegistry>>,
+	affinity_telemetry: toron::coordinator::TaskTelemetryRetention,
+	load_telemetry: toron::coordinator::TaskTelemetryRetention,
+	reference_identity: Option<ExecutionIdentityFacts>,
+	baseline_bytes: Option<u64>,
+	final_retained_bytes: Option<u64>,
+	peer_closes: usize,
+	pub residency: TimingAtlasResidencyLog,
+}
+
+impl CensusPlacementHarness {
+	/// Build the shared specification before either policy enters a timed execution.
+	pub async fn prepare(
+		query: &str,
+		mode: &str,
+		scale_factor: f64,
+		data_root: &Path,
+	) -> Result<Self, String> {
+		let spec = build_persisted_perf_query_spec(query, mode, scale_factor, data_root)?;
+		let storage: Arc<dyn StorageScan> = spec.storage;
+		let preflight = execution_census_preflight(&spec.sql, spec.tables.clone())
+			.await
+			.map_err(|rejection| {
+				format!(
+					"placement A/B preflight rejected {query} at {}: {} ({})",
+					rejection.phase.as_str(),
+					rejection.reason,
+					rejection.message
+				)
+			})?;
+		Ok(Self {
+			sql: spec.sql.into_owned(),
+			storage,
+			catalog: Some(preflight.catalog),
+			width: preflight.shape.max_stage_width.max(1),
+			workers: Vec::new(),
+			affinity_coordinator: None,
+			load_coordinator: None,
+			affinity_registry: None,
+			load_registry: None,
+			affinity_telemetry: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+			load_telemetry: Arc::new(std::sync::Mutex::new(BTreeMap::new())),
+			reference_identity: None,
+			baseline_bytes: None,
+			final_retained_bytes: None,
+			peer_closes: 0,
+			residency: TimingAtlasResidencyLog::default(),
+		})
+	}
+
+	fn observed_residency(&self) -> TimingAtlasResidency {
+		TimingAtlasResidency {
+			worker_ids: self
+				.workers
+				.iter()
+				.map(|worker| worker.entry.worker_id.get().as_u128())
+				.collect(),
+			endpoints: self
+				.workers
+				.iter()
+				.map(|worker| worker.entry.endpoint.as_str().to_string())
+				.collect(),
+		}
+	}
+
+	fn worker_set(&self) -> BTreeSet<String> {
+		self.workers
+			.iter()
+			.map(|worker| worker.entry.worker_id.get().to_string())
+			.collect()
+	}
+
+	fn registry_for(&self, arm: PlacementArm) -> Result<Arc<StaticWorkerRegistry>, String> {
+		match arm {
+			PlacementArm::AffinityOnly => self
+				.affinity_registry
+				.clone()
+				.ok_or_else(|| "placement A/B affinity registry absent".to_string()),
+			PlacementArm::LoadObserving => self
+				.load_registry
+				.clone()
+				.ok_or_else(|| "placement A/B load-observing registry absent".to_string()),
+		}
+	}
+
+	fn remove_query(&self, query_id: QueryId) {
+		for worker in &self.workers {
+			toron::distributed::partition_store::PartitionStore::remove_query(
+				worker.partition_store.as_ref(),
+				query_id,
+			);
+		}
+	}
+
+	pub fn baseline_bytes(&self) -> u64 {
+		self.baseline_bytes.unwrap_or(0)
+	}
+
+	pub fn final_retained_bytes(&self) -> u64 {
+		self.final_retained_bytes.unwrap_or(0)
+	}
+
+	pub fn resident_partition_bytes(&self) -> u64 {
+		self.workers
+			.iter()
+			.map(|worker| {
+				worker
+					.partition_store
+					.budget_used(toron::distributed::budget::BudgetDimension::ShuffleBytes)
+					.get()
+			})
+			.sum()
+	}
+}
+
+impl PlacementHarness for CensusPlacementHarness {
+	async fn setup_cell(&mut self, query: &str) -> Result<(), String> {
+		let distributed_budget = execution_census_distributed_budget(self.width);
+		let memory_pool_max_buffer_capacity_bytes =
+			usize::try_from(distributed_budget.memory_per_task.get()).unwrap_or(usize::MAX);
+		for worker_index in 0..EXECUTION_CENSUS_WORKER_COUNT {
+			match spawn_execution_census_worker(
+				worker_index,
+				self.storage.clone(),
+				distributed_budget,
+				memory_pool_max_buffer_capacity_bytes,
+			)
+			.await
+			{
+				Ok(worker) => self.workers.push(worker),
+				Err(error) => {
+					let workers = std::mem::take(&mut self.workers);
+					shutdown_execution_census_workers(workers).await?;
+					return Err(format!("placement A/B setup {query}: {error}"));
+				}
+			}
+		}
+		let catalog: Arc<dyn Catalog> = Arc::new(
+			self.catalog
+				.take()
+				.ok_or_else(|| "placement A/B catalog already consumed".to_string())?,
+		);
+		let (affinity, affinity_registry) =
+			build_execution_census_coordinator_with_placement_and_registry(
+				catalog.clone(),
+				&self.workers,
+				memory_pool_max_buffer_capacity_bytes,
+				distributed_budget,
+				FallbackPlacementPolicy::AffinityOnly,
+			);
+		let (load, load_registry) = build_execution_census_coordinator_with_placement_and_registry(
+			catalog,
+			&self.workers,
+			memory_pool_max_buffer_capacity_bytes,
+			distributed_budget,
+			FallbackPlacementPolicy::LoadObserving,
+		);
+		self.affinity_coordinator =
+			Some(affinity.with_task_telemetry_retention(self.affinity_telemetry.clone()));
+		self.load_coordinator =
+			Some(load.with_task_telemetry_retention(self.load_telemetry.clone()));
+		self.affinity_registry = Some(affinity_registry);
+		self.load_registry = Some(load_registry);
+		self.baseline_bytes = Some(self.resident_partition_bytes());
+		Ok(())
+	}
+
+	async fn execute_arm(
+		&mut self,
+		query: &str,
+		pair_index: usize,
+		position_in_pair: usize,
+		arm: PlacementArm,
+	) -> Result<PlacementAttempt, String> {
+		// The same resident workers must back both policy arms. This observation is taken
+		// from the live entries, never from the setup inputs, so rebuilding under either
+		// arm is visible to the artifact rather than assumed away.
+		self.residency.observe(self.observed_residency());
+		let query_id = QueryId::new();
+		let registry = self.registry_for(arm)?;
+		let retention = match arm {
+			PlacementArm::AffinityOnly => self.affinity_telemetry.clone(),
+			PlacementArm::LoadObserving => self.load_telemetry.clone(),
+		};
+		let coordinator = match arm {
+			PlacementArm::AffinityOnly => self
+				.affinity_coordinator
+				.as_ref()
+				.ok_or_else(|| "placement A/B affinity coordinator absent".to_string())?,
+			PlacementArm::LoadObserving => self
+				.load_coordinator
+				.as_ref()
+				.ok_or_else(|| "placement A/B load-observing coordinator absent".to_string())?,
+		};
+
+		// The policy comparison times the same distributed envelope for both arms: SQL
+		// planning, coordinator execution and consumer exhaustion. Identity, telemetry
+		// reduction and namespace reclamation all happen strictly afterwards.
+		let started = std::time::Instant::now();
+		let execution = async {
+			let logical = SqlPlanner::new()
+				.plan(&self.sql)
+				.map_err(|error| format!("placement A/B {} plan: {error}", arm.label()))?;
+			let budget = execution_census_distributed_budget(self.width);
+			let context = ExecutionContext::new(
+				toron::ir::SessionId(555),
+				query_id,
+				toron::storage::TenantId(1),
+				toron::storage::HlcBound(1),
+			)
+			.with_task_budget(TaskBudget::from_query_budget(budget));
+			let mut stream = coordinator
+				.execute_query_stream_with_context(&logical, context)
+				.await
+				.map_err(|error| format!("placement A/B {}: {error:?}", arm.label()))?;
+			let mut batches = Vec::new();
+			while let Some(batch) = stream.next().await {
+				batches.push(
+					batch.map_err(|error| format!("placement A/B {}: {error:?}", arm.label()))?,
+				);
+			}
+			Ok::<_, String>(batches)
+		}
+		.await;
+		let elapsed_ms = started.elapsed().as_secs_f64() * 1000.0;
+
+		let batches = match execution {
+			Ok(batches) => batches,
+			Err(error) => {
+				let _ = retention
+					.lock()
+					.map(|mut reports| reports.remove(&query_id));
+				self.remove_query(query_id);
+				return Err(error);
+			}
+		};
+		// Reclamation is unconditional once execution has started. A missing report or a
+		// digest error is an apparatus failure, but it must not leave published shuffle
+		// state behind for the peer arm to inherit.
+		let reduced = (|| {
+			let identity = execution_identity_facts(&batches)?;
+			let report = retention
+				.lock()
+				.map_err(|_| "placement A/B telemetry retention poisoned".to_string())?
+				.remove(&query_id)
+				.ok_or_else(|| {
+					format!("placement A/B {} completed without telemetry", arm.label())
+				})?;
+			let nodes = timing_atlas_nodes_from_report(&report)?;
+			Ok::<_, String>((identity, nodes))
+		})();
+		self.remove_query(query_id);
+		let (identity, nodes) = reduced?;
+		let identity_matches = self.reference_identity.as_ref().is_none_or(|reference| {
+			reference.digest == identity.digest
+				&& reference.row_count == identity.row_count
+				&& reference.schema_fingerprint == identity.schema_fingerprint
+		});
+		if self.reference_identity.is_none() {
+			self.reference_identity = Some(identity.clone());
+		}
+		if !identity_matches {
+			return Err(format!("placement A/B {} identity mismatch", arm.label()));
+		}
+		if nodes.is_empty() {
+			return Err(format!(
+				"placement A/B {} reported no task nodes",
+				arm.label()
+			));
+		}
+		Ok(PlacementAttempt {
+			query: query.to_string(),
+			pair_index,
+			position_in_pair,
+			arm,
+			elapsed_ms,
+			identity,
+			facts: placement_facts_from_nodes(&nodes),
+			nodes,
+			workers: self.worker_set(),
+			live_reservations_after: registry.live_reservations(),
+		})
+	}
+
+	async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
+		self.final_retained_bytes = Some(self.resident_partition_bytes());
+		self.affinity_coordinator = None;
+		self.load_coordinator = None;
+		self.affinity_registry = None;
+		self.load_registry = None;
+		let workers = std::mem::take(&mut self.workers);
+		self.peer_closes = shutdown_execution_census_workers(workers).await?;
+		Ok(())
+	}
+}
+
 // ===== ADR 538: the journal =====
 //
 // Rows are a replayable evidence journal, not formatted output: every verdict the atlas
@@ -7114,6 +7425,178 @@ pub async fn run_timing_atlas(
 	artifact.publish()
 }
 
+/// Result of the ADR 555 paired comparison. A sealed artifact is published even when its
+/// timing verdict is withheld: the first integration run is expected to exercise gates, and
+/// its raw attempts are evidence for whichever guard refused authority.
+#[derive(Debug, Clone)]
+pub struct PlacementAbRun {
+	pub path: PathBuf,
+	pub paired_timing_authority: bool,
+	pub withheld_reasons: Vec<String>,
+}
+
+/// Run ADR 555's paired placement comparison. This is intentionally separate from
+/// `timing-atlas`: its seven-pair cohort and adjacency discipline are reused, but its
+/// independent variable is fallback placement policy rather than local versus distributed.
+pub async fn run_placement_ab(
+	mode: &str,
+	scale_factor: f64,
+	data_root: &Path,
+	canonical_path: &Path,
+) -> Result<PlacementAbRun, String> {
+	let mut artifact = TimingAtlasArtifact::create(canonical_path)?;
+	let host_start = observe_host_quiescence();
+	if !host_start.quiescent() {
+		artifact.append_row(&serde_json::json!({
+			"kind": PLACEMENT_AB_KIND_HEADER,
+			"aborted": "host_not_quiescent",
+			"host_start_service_inactive": host_start.service_inactive,
+			"host_start_sql_port_free": host_start.sql_port_free,
+		}))?;
+		artifact.append_seal(&serde_json::json!({
+			"kind": PLACEMENT_AB_SEAL_KIND,
+			"paired_timing_authority": false,
+			"withheld_reasons": ["host_not_quiescent"],
+			"replay_violations": [],
+		}))?;
+		let path = artifact.publish()?;
+		return Ok(PlacementAbRun {
+			path,
+			paired_timing_authority: false,
+			withheld_reasons: vec!["host_not_quiescent".to_string()],
+		});
+	}
+	let dataset_fingerprint = build_persisted_perf_query_spec("q01", mode, scale_factor, data_root)
+		.map(|spec| spec.export.manifest_fingerprint.clone())
+		.unwrap_or_else(|_| "unknown".to_string());
+	artifact.append_row(&serde_json::json!({
+		"kind": PLACEMENT_AB_KIND_HEADER,
+		"suite": "tpch_placement_ab",
+		"build_commit": crate::telemetry::build_commit(),
+		"binary_modified_unix": crate::telemetry::binary_modified_unix(),
+		"scale_factor": scale_factor,
+		"mode": mode,
+		"dataset_manifest_fingerprint": dataset_fingerprint,
+		"measured_pairs": TIMING_ATLAS_MEASURED_PAIRS,
+		"cohort": timing_atlas_cells(),
+		"worker_count": EXECUTION_CENSUS_WORKER_COUNT,
+		"transport": "tcp_loopback",
+		"host_start_service_inactive": host_start.service_inactive,
+		"host_start_sql_port_free": host_start.sql_port_free,
+	}))?;
+	for excluded in TIMING_ATLAS_EXCLUDED_CELLS {
+		artifact.append_row(&serde_json::json!({
+			"kind": PLACEMENT_AB_KIND_EXCLUSION,
+			"query": excluded,
+			"reason": "fragment_broadcast_probe_not_star_linear",
+		}))?;
+	}
+
+	let mut finalized = 0usize;
+	for query in timing_atlas_cells() {
+		let _ = std::fs::remove_dir_all(data_root.parent().unwrap_or(data_root).join("join_spill"));
+		artifact.append_row(&serde_json::json!({
+			"kind": PLACEMENT_AB_KIND_CELL_SETUP,
+			"query": query,
+		}))?;
+		let mut harness =
+			CensusPlacementHarness::prepare(query, mode, scale_factor, data_root).await?;
+		let outcome = Box::pin(run_placement_cell_with(&mut harness, query)).await;
+		let baseline = harness.baseline_bytes();
+		let retained = harness.final_retained_bytes();
+		for attempt in &outcome.attempts {
+			artifact.append_row(&placement_ab_attempt_row(attempt))?;
+		}
+		let mut pairs: BTreeMap<usize, BTreeMap<PlacementArm, &PlacementAttempt>> = BTreeMap::new();
+		for attempt in &outcome.attempts {
+			pairs
+				.entry(attempt.pair_index)
+				.or_default()
+				.insert(attempt.arm, attempt);
+		}
+		for (pair_index, arms) in pairs {
+			if let (Some(affinity), Some(load)) = (
+				arms.get(&PlacementArm::AffinityOnly),
+				arms.get(&PlacementArm::LoadObserving),
+			) {
+				artifact.append_row(&serde_json::json!({
+					"kind": PLACEMENT_AB_KIND_PAIR,
+					"query": query,
+					"pair_index": pair_index,
+					"affinity_only_elapsed_ms": affinity.elapsed_ms,
+					"load_observing_elapsed_ms": load.elapsed_ms,
+					"delta_ms": load.elapsed_ms - affinity.elapsed_ms,
+				}))?;
+			}
+		}
+		for problem in &outcome.problems {
+			artifact.append_row(&serde_json::json!({
+				"kind": PLACEMENT_AB_KIND_CELL_PROBLEM,
+				"query": query,
+				"problem": problem,
+			}))?;
+		}
+		artifact.append_row(&serde_json::json!({
+			"kind": PLACEMENT_AB_KIND_RESIDENCY,
+			"query": query,
+			"observations": harness.residency.len(),
+			"stable": harness.residency.stable(),
+		}))?;
+		artifact.append_row(&serde_json::json!({
+			"kind": PLACEMENT_AB_KIND_CLEANUP,
+			"query": query,
+			"returned_to_baseline": baseline == retained,
+			"baseline_bytes": baseline,
+			"retained_bytes": retained,
+			"peer_closes": harness.peer_closes,
+		}))?;
+		let finalized_cell = placement_cell_finalized(&outcome);
+		let mut deltas = placement_paired_deltas(&outcome.attempts);
+		artifact.append_row(&serde_json::json!({
+			"kind": PLACEMENT_AB_KIND_CELL_SUMMARY,
+			"query": query,
+			"finalized": finalized_cell,
+			"pairs": deltas.len(),
+			"median_paired_delta_ms": timing_atlas_median(&mut deltas),
+			"problems": outcome.problems.len(),
+		}))?;
+		if finalized_cell {
+			finalized += 1;
+		}
+	}
+	let host_end = observe_host_quiescence();
+	artifact.append_row(&serde_json::json!({
+		"kind": PLACEMENT_AB_KIND_HOST_END,
+		"service_inactive": host_end.service_inactive,
+		"sql_port_free": host_end.sql_port_free,
+	}))?;
+	let conditions = TimingAuthorityConditions {
+		clean_build: !crate::telemetry::build_commit().contains("dirty"),
+		full_hash_dataset: dataset_fingerprint != "unknown",
+		quiescent_host: timing_atlas_quiescent_throughout(&host_start, &host_end),
+		protocol_unmodified: true,
+		complete_cohort: finalized == timing_atlas_cells().len(),
+	};
+	let journal = std::fs::read_to_string(artifact.partial_path())
+		.map_err(|error| format!("placement A/B reread: {error}"))?;
+	let replay = placement_ab_replay(&journal);
+	let authority = replay.supports_authority(&conditions);
+	let withheld_reasons = replay.withheld_reasons(&conditions);
+	artifact.append_seal(&serde_json::json!({
+		"kind": PLACEMENT_AB_SEAL_KIND,
+		"paired_timing_authority": authority,
+		"withheld_reasons": withheld_reasons,
+		"replay_violations": replay.violations,
+		"finalized_cells": replay.finalized_cells.len(),
+	}))?;
+	let path = artifact.publish()?;
+	Ok(PlacementAbRun {
+		path,
+		paired_timing_authority: authority,
+		withheld_reasons,
+	})
+}
+
 /// The frozen component taxonomy. Shared by both arms so a contribution always compares
 /// like with like, and kept deliberately granular: a `stage` component bracketing several
 /// concurrent operators would bound where cost sits, not what it is.
@@ -7876,7 +8359,7 @@ pub fn placement_facts_from_nodes(nodes: &[TimingAtlasTaskNode]) -> PlacementFac
 /// its own registry. Independent reservation state is correct precisely because
 /// they do not overlap in time: an arm's load view describes only its own
 /// placement, and §7 seals that it drains to zero before its peer begins.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PlacementArm {
 	AffinityOnly,
 	LoadObserving,
@@ -7929,22 +8412,36 @@ pub struct PlacementAttempt {
 	pub position_in_pair: usize,
 	pub arm: PlacementArm,
 	pub elapsed_ms: f64,
+	/// Output identity, captured outside the elapsed boundary. Replay compares both arms
+	/// from the persisted values, so a placement result cannot be published for different
+	/// answers that merely happened to have valid-looking task telemetry.
+	pub identity: ExecutionIdentityFacts,
+	/// Raw task placement, retained so artifact replay re-derives `facts` instead of
+	/// trusting a summary emitted by the live harness.
+	pub nodes: Vec<TimingAtlasTaskNode>,
 	pub facts: PlacementFacts,
 	pub workers: BTreeSet<String>,
 	pub live_reservations_after: u32,
 }
 
 /// Drives one cell: seven pairs, two adjacent arms each, in the recorded order.
+// Consumed only through generics inside this crate and never as `dyn`, so the auto-trait
+// bounds this lint protects cannot be needed here.
+#[allow(async_fn_in_trait)]
 pub trait PlacementHarness {
-	fn setup_cell(&mut self, query: &str) -> Result<(), String>;
-	fn execute_arm(
+	/// Construct the shared workers and the two arm coordinators exactly once for a cell.
+	async fn setup_cell(&mut self, query: &str) -> Result<(), String>;
+	/// Execute one arm. The implementation owns the elapsed boundary; reduction, telemetry
+	/// extraction and namespace reclamation must happen after it.
+	async fn execute_arm(
 		&mut self,
 		query: &str,
 		pair_index: usize,
 		position_in_pair: usize,
 		arm: PlacementArm,
 	) -> Result<PlacementAttempt, String>;
-	fn teardown_cell(&mut self, query: &str) -> Result<(), String>;
+	/// Drop both coordinators, then the shared workers, exactly once after the last pair.
+	async fn teardown_cell(&mut self, query: &str) -> Result<(), String>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -7961,7 +8458,7 @@ pub struct PlacementCellOutcome {
 /// apart rather than runs apart, which is what makes the comparison paired at
 /// all. Attempts are retained whatever the gates say, so a withheld artifact is
 /// still auditable.
-pub fn run_placement_cell_with<H: PlacementHarness>(
+pub async fn run_placement_cell_with<H: PlacementHarness>(
 	harness: &mut H,
 	query: &str,
 ) -> PlacementCellOutcome {
@@ -7969,7 +8466,7 @@ pub fn run_placement_cell_with<H: PlacementHarness>(
 		query: query.to_string(),
 		..Default::default()
 	};
-	if let Err(error) = harness.setup_cell(query) {
+	if let Err(error) = harness.setup_cell(query).await {
 		outcome.problems.push(format!("{query} setup: {error}"));
 		return outcome;
 	}
@@ -7979,7 +8476,7 @@ pub fn run_placement_cell_with<H: PlacementHarness>(
 		first_arms.push(first);
 		let mut pair: Vec<PlacementAttempt> = Vec::new();
 		for (position, arm) in [first, second].into_iter().enumerate() {
-			match harness.execute_arm(query, pair_index, position, arm) {
+			match harness.execute_arm(query, pair_index, position, arm).await {
 				Ok(attempt) => {
 					outcome
 						.problems
@@ -8025,7 +8522,7 @@ pub fn run_placement_cell_with<H: PlacementHarness>(
 	outcome
 		.problems
 		.extend(placement_pair_order_problems(query, &first_arms));
-	if let Err(error) = harness.teardown_cell(query) {
+	if let Err(error) = harness.teardown_cell(query).await {
 		outcome.problems.push(format!("{query} teardown: {error}"));
 	}
 	outcome
@@ -8088,6 +8585,526 @@ pub fn placement_reservation_drain_problems(
 		"{query} pair {pair_index} {} arm left {live_reservations} live reservations; phantom load would bias its peer",
 		arm.label()
 	)]
+}
+
+// ===== ADR 555: paired placement A/B journal =====
+
+pub const PLACEMENT_AB_SEAL_KIND: &str = "placement_ab_seal";
+pub const PLACEMENT_AB_KIND_HEADER: &str = "placement_ab_header";
+pub const PLACEMENT_AB_KIND_EXCLUSION: &str = "placement_ab_exclusion";
+pub const PLACEMENT_AB_KIND_CELL_SETUP: &str = "placement_ab_cell_setup";
+pub const PLACEMENT_AB_KIND_ATTEMPT: &str = "placement_ab_attempt";
+pub const PLACEMENT_AB_KIND_PAIR: &str = "placement_ab_pair";
+pub const PLACEMENT_AB_KIND_CELL_PROBLEM: &str = "placement_ab_cell_problem";
+pub const PLACEMENT_AB_KIND_RESIDENCY: &str = "placement_ab_residency";
+pub const PLACEMENT_AB_KIND_CLEANUP: &str = "placement_ab_cleanup";
+pub const PLACEMENT_AB_KIND_CELL_SUMMARY: &str = "placement_ab_cell_summary";
+pub const PLACEMENT_AB_KIND_HOST_END: &str = "placement_ab_host_end";
+
+fn placement_cell_finalized(outcome: &PlacementCellOutcome) -> bool {
+	outcome.problems.is_empty() && outcome.attempts.len() == TIMING_ATLAS_MEASURED_PAIRS * 2
+}
+
+fn placement_paired_deltas(attempts: &[PlacementAttempt]) -> Vec<f64> {
+	let mut pairs: BTreeMap<usize, BTreeMap<PlacementArm, &PlacementAttempt>> = BTreeMap::new();
+	for attempt in attempts {
+		pairs
+			.entry(attempt.pair_index)
+			.or_default()
+			.insert(attempt.arm, attempt);
+	}
+	pairs
+		.values()
+		.filter_map(|arms| {
+			Some(
+				arms.get(&PlacementArm::LoadObserving)?.elapsed_ms
+					- arms.get(&PlacementArm::AffinityOnly)?.elapsed_ms,
+			)
+		})
+		.collect()
+}
+
+pub fn placement_ab_attempt_row(attempt: &PlacementAttempt) -> serde_json::Value {
+	let nodes: Vec<serde_json::Value> = attempt
+		.nodes
+		.iter()
+		.map(|node| {
+			serde_json::json!({
+				"stage": node.stage_id,
+				"task": node.task_id,
+				"worker_id": node.worker_id,
+				"upstream": node.upstream,
+			})
+		})
+		.collect();
+	serde_json::json!({
+		"kind": PLACEMENT_AB_KIND_ATTEMPT,
+		"query": attempt.query,
+		"pair_index": attempt.pair_index,
+		"position_in_pair": attempt.position_in_pair,
+		"arm": attempt.arm.label(),
+		"elapsed_ms": attempt.elapsed_ms,
+		"identity": {
+			"digest": attempt.identity.digest,
+			"row_count": attempt.identity.row_count,
+			"schema_fingerprint": attempt.identity.schema_fingerprint,
+		},
+		"nodes": nodes,
+		"facts": {
+			"sibling_groups": attempt.facts.sibling_groups,
+			"sibling_groups_spread": attempt.facts.sibling_groups_spread,
+			"affinity_links": attempt.facts.affinity_links,
+			"affinity_links_colocated": attempt.facts.affinity_links_colocated,
+		},
+		"workers": attempt.workers,
+		"live_reservations_after": attempt.live_reservations_after,
+	})
+}
+
+#[derive(Debug, Default)]
+pub struct PlacementAbReplay {
+	pub headers: usize,
+	pub exclusions: Vec<String>,
+	pub finalized_cells: BTreeSet<String>,
+	pub host_end_quiescent: Option<bool>,
+	pub terminal_seal: bool,
+	pub violations: Vec<String>,
+}
+
+impl PlacementAbReplay {
+	fn supports_authority(&self, conditions: &TimingAuthorityConditions) -> bool {
+		self.violations.is_empty()
+			&& self.headers == 1
+			&& self.exclusions == vec!["q15".to_string()]
+			&& self.finalized_cells.len() == timing_atlas_cells().len()
+			&& self.host_end_quiescent == Some(true)
+			&& conditions.granted()
+	}
+
+	pub fn withheld_reasons(&self, conditions: &TimingAuthorityConditions) -> Vec<String> {
+		let mut reasons: Vec<String> = conditions
+			.withheld_reasons()
+			.into_iter()
+			.map(str::to_string)
+			.collect();
+		if self.headers != 1 {
+			reasons.push("header_count".to_string());
+		}
+		if self.exclusions != vec!["q15".to_string()] {
+			reasons.push("exclusion_mismatch".to_string());
+		}
+		if self.finalized_cells.len() != timing_atlas_cells().len() {
+			reasons.push("cohort_incomplete".to_string());
+		}
+		if self.host_end_quiescent != Some(true) {
+			reasons.push("host_not_quiescent_at_seal".to_string());
+		}
+		if !self.violations.is_empty() {
+			reasons.push("replay_violations".to_string());
+		}
+		reasons
+	}
+}
+
+fn placement_arm_from_label(label: &str) -> Option<PlacementArm> {
+	match label {
+		"affinity_only" => Some(PlacementArm::AffinityOnly),
+		"load_observing" => Some(PlacementArm::LoadObserving),
+		_ => None,
+	}
+}
+
+fn placement_attempt_from_row(row: &serde_json::Value) -> Result<PlacementAttempt, String> {
+	let query = row
+		.get("query")
+		.and_then(|value| value.as_str())
+		.ok_or_else(|| "attempt lacks query".to_string())?
+		.to_string();
+	let pair_index = row
+		.get("pair_index")
+		.and_then(|value| value.as_u64())
+		.ok_or_else(|| format!("{query} attempt lacks pair index"))? as usize;
+	let position_in_pair =
+		row.get("position_in_pair")
+			.and_then(|value| value.as_u64())
+			.ok_or_else(|| format!("{query} pair {pair_index} lacks position"))? as usize;
+	let arm = placement_arm_from_label(
+		row.get("arm")
+			.and_then(|value| value.as_str())
+			.ok_or_else(|| format!("{query} pair {pair_index} lacks arm"))?,
+	)
+	.ok_or_else(|| format!("{query} pair {pair_index} names an unknown arm"))?;
+	let elapsed_ms = row
+		.get("elapsed_ms")
+		.and_then(|value| value.as_f64())
+		.filter(|value| value.is_finite() && *value >= 0.0)
+		.ok_or_else(|| format!("{query} pair {pair_index} has invalid elapsed"))?;
+	let identity = row
+		.get("identity")
+		.and_then(|value| value.as_object())
+		.ok_or_else(|| format!("{query} pair {pair_index} lacks identity"))?;
+	let digest = identity
+		.get("digest")
+		.and_then(|value| value.as_str())
+		.ok_or_else(|| format!("{query} pair {pair_index} identity lacks digest"))?
+		.to_string();
+	let row_count = identity
+		.get("row_count")
+		.and_then(|value| value.as_u64())
+		.ok_or_else(|| format!("{query} pair {pair_index} identity lacks row count"))?;
+	let schema_fingerprint = identity
+		.get("schema_fingerprint")
+		.and_then(|value| value.as_str())
+		.map(ToOwned::to_owned);
+	let mut nodes = Vec::new();
+	for node in row
+		.get("nodes")
+		.and_then(|value| value.as_array())
+		.ok_or_else(|| format!("{query} pair {pair_index} lacks nodes"))?
+	{
+		let stage_id =
+			node.get("stage")
+				.and_then(|value| value.as_u64())
+				.ok_or_else(|| format!("{query} pair {pair_index} node lacks stage"))? as u32;
+		let task_id =
+			node.get("task")
+				.and_then(|value| value.as_u64())
+				.ok_or_else(|| format!("{query} pair {pair_index} node lacks task"))? as u32;
+		let worker_id = node
+			.get("worker_id")
+			.and_then(|value| value.as_str())
+			.ok_or_else(|| format!("{query} pair {pair_index} node lacks worker"))?
+			.to_string();
+		let upstream = node
+			.get("upstream")
+			.and_then(|value| value.as_array())
+			.ok_or_else(|| format!("{query} pair {pair_index} node lacks upstream"))?
+			.iter()
+			.map(|edge| {
+				let values = edge
+					.as_array()
+					.ok_or_else(|| "upstream edge is not a pair".to_string())?;
+				let stage = values
+					.first()
+					.and_then(|value| value.as_u64())
+					.ok_or_else(|| "upstream stage missing".to_string())? as u32;
+				let task = values
+					.get(1)
+					.and_then(|value| value.as_u64())
+					.ok_or_else(|| "upstream task missing".to_string())? as u32;
+				Ok((stage, task))
+			})
+			.collect::<Result<Vec<_>, String>>()?;
+		nodes.push(TimingAtlasTaskNode {
+			stage_id,
+			task_id,
+			wall_ms: 0.0,
+			components: Vec::new(),
+			telemetry_lock_ms: 0.0,
+			framework_overhead_ms: 0.0,
+			aggregate_accumulation_ms: 0.0,
+			worker_id,
+			upstream,
+		});
+	}
+	let facts = row
+		.get("facts")
+		.and_then(|value| value.as_object())
+		.ok_or_else(|| format!("{query} pair {pair_index} lacks facts"))?;
+	let read_fact = |name: &str| {
+		facts
+			.get(name)
+			.and_then(|value| value.as_u64())
+			.map(|value| value as usize)
+			.ok_or_else(|| format!("{query} pair {pair_index} facts lack {name}"))
+	};
+	let claimed = PlacementFacts {
+		sibling_groups: read_fact("sibling_groups")?,
+		sibling_groups_spread: read_fact("sibling_groups_spread")?,
+		affinity_links: read_fact("affinity_links")?,
+		affinity_links_colocated: read_fact("affinity_links_colocated")?,
+	};
+	let derived = placement_facts_from_nodes(&nodes);
+	if claimed != derived {
+		return Err(format!(
+			"{query} pair {pair_index} placement facts {claimed:?} disagree with nodes {derived:?}"
+		));
+	}
+	let workers = row
+		.get("workers")
+		.and_then(|value| value.as_array())
+		.ok_or_else(|| format!("{query} pair {pair_index} lacks worker set"))?
+		.iter()
+		.map(|value| value.as_str().map(ToOwned::to_owned))
+		.collect::<Option<BTreeSet<_>>>()
+		.ok_or_else(|| format!("{query} pair {pair_index} has malformed worker set"))?;
+	let live_reservations_after =
+		row.get("live_reservations_after")
+			.and_then(|value| value.as_u64())
+			.ok_or_else(|| format!("{query} pair {pair_index} lacks drain count"))? as u32;
+	Ok(PlacementAttempt {
+		query,
+		pair_index,
+		position_in_pair,
+		arm,
+		elapsed_ms,
+		identity: ExecutionIdentityFacts {
+			digest,
+			row_count,
+			schema_fingerprint,
+		},
+		nodes,
+		facts: claimed,
+		workers,
+		live_reservations_after,
+	})
+}
+
+/// Replays the A/B journal from raw attempts. A placement/timing claim only survives when
+/// both policies, their task placement, their identities and their pair order are all
+/// reproducible from the persisted rows.
+pub fn placement_ab_replay(journal: &str) -> PlacementAbReplay {
+	let mut replay = PlacementAbReplay::default();
+	let mut attempts: BTreeMap<(String, usize), Vec<PlacementAttempt>> = BTreeMap::new();
+	let mut summaries: BTreeSet<String> = BTreeSet::new();
+	let mut residency: BTreeMap<String, bool> = BTreeMap::new();
+	let mut cleanup: BTreeMap<String, bool> = BTreeMap::new();
+	let mut problems: BTreeMap<String, Vec<String>> = BTreeMap::new();
+	let mut pair_claims: BTreeMap<(String, usize), (f64, f64, f64)> = BTreeMap::new();
+	let mut sealed = false;
+	for (index, line) in journal
+		.lines()
+		.filter(|line| !line.trim().is_empty())
+		.enumerate()
+	{
+		let Ok(row) = serde_json::from_str::<serde_json::Value>(line) else {
+			replay
+				.violations
+				.push(format!("row {index} is not valid json"));
+			continue;
+		};
+		if sealed {
+			replay
+				.violations
+				.push(format!("row {index} follows terminal seal"));
+		}
+		match row
+			.get("kind")
+			.and_then(|value| value.as_str())
+			.unwrap_or("")
+		{
+			PLACEMENT_AB_KIND_HEADER => replay.headers += 1,
+			PLACEMENT_AB_KIND_EXCLUSION => {
+				if let Some(query) = row.get("query").and_then(|value| value.as_str()) {
+					replay.exclusions.push(query.to_string());
+				}
+			}
+			PLACEMENT_AB_KIND_ATTEMPT => match placement_attempt_from_row(&row) {
+				Ok(attempt) => attempts
+					.entry((attempt.query.clone(), attempt.pair_index))
+					.or_default()
+					.push(attempt),
+				Err(error) => replay.violations.push(error),
+			},
+			PLACEMENT_AB_KIND_CELL_PROBLEM => {
+				if let (Some(query), Some(problem)) = (
+					row.get("query").and_then(|value| value.as_str()),
+					row.get("problem").and_then(|value| value.as_str()),
+				) {
+					problems
+						.entry(query.to_string())
+						.or_default()
+						.push(problem.to_string());
+				}
+			}
+			PLACEMENT_AB_KIND_RESIDENCY => {
+				if let Some(query) = row.get("query").and_then(|value| value.as_str()) {
+					residency.insert(
+						query.to_string(),
+						row.get("stable").and_then(|value| value.as_bool()) == Some(true),
+					);
+				}
+			}
+			PLACEMENT_AB_KIND_CLEANUP => {
+				if let Some(query) = row.get("query").and_then(|value| value.as_str()) {
+					cleanup.insert(
+						query.to_string(),
+						row.get("returned_to_baseline")
+							.and_then(|value| value.as_bool())
+							== Some(true),
+					);
+				}
+			}
+			PLACEMENT_AB_KIND_PAIR => {
+				let parsed = (|| {
+					let query = row.get("query")?.as_str()?.to_string();
+					let index = row.get("pair_index")?.as_u64()? as usize;
+					let affinity = row.get("affinity_only_elapsed_ms")?.as_f64()?;
+					let load = row.get("load_observing_elapsed_ms")?.as_f64()?;
+					let delta = row.get("delta_ms")?.as_f64()?;
+					Some((query, index, affinity, load, delta))
+				})();
+				match parsed {
+					Some((query, pair_index, affinity, load, delta))
+						if affinity.is_finite() && load.is_finite() && delta.is_finite() =>
+					{
+						if pair_claims
+							.insert((query.clone(), pair_index), (affinity, load, delta))
+							.is_some()
+						{
+							replay.violations.push(format!(
+								"{query} pair {pair_index} has more than one pair summary"
+							));
+						}
+					}
+					_ => replay
+						.violations
+						.push(format!("row {index} has malformed pair summary")),
+				}
+			}
+			PLACEMENT_AB_KIND_CELL_SUMMARY => {
+				if let Some(query) = row.get("query").and_then(|value| value.as_str()) {
+					if row.get("finalized") == Some(&serde_json::Value::Bool(true)) {
+						summaries.insert(query.to_string());
+					}
+				}
+			}
+			PLACEMENT_AB_KIND_HOST_END => {
+				replay.host_end_quiescent = Some(
+					row.get("service_inactive")
+						.and_then(|value| value.as_bool())
+						== Some(true) && row.get("sql_port_free").and_then(|value| value.as_bool())
+						== Some(true),
+				);
+			}
+			PLACEMENT_AB_SEAL_KIND => {
+				replay.terminal_seal = true;
+				sealed = true;
+			}
+			PLACEMENT_AB_KIND_CELL_SETUP => {}
+			other => replay
+				.violations
+				.push(format!("row {index} has unknown kind {other}")),
+		}
+	}
+	for query in timing_atlas_cells() {
+		let mut first_arms = Vec::new();
+		let mut complete = true;
+		let mut reference_identity: Option<&ExecutionIdentityFacts> = None;
+		for pair_index in 0..TIMING_ATLAS_MEASURED_PAIRS {
+			let Some(pair) = attempts.get(&(query.to_string(), pair_index)) else {
+				replay
+					.violations
+					.push(format!("{query} pair {pair_index} is missing"));
+				complete = false;
+				continue;
+			};
+			if pair.len() != 2 {
+				replay.violations.push(format!(
+					"{query} pair {pair_index} has {} attempts",
+					pair.len()
+				));
+				complete = false;
+				continue;
+			}
+			let (first, second) = (&pair[0], &pair[1]);
+			let (expected_first, expected_second) = placement_pair_order(query, pair_index);
+			if (
+				first.position_in_pair,
+				first.arm,
+				second.position_in_pair,
+				second.arm,
+			) != (0, expected_first, 1, expected_second)
+			{
+				replay.violations.push(format!(
+					"{query} pair {pair_index} is not adjacent in recorded order"
+				));
+			}
+			first_arms.push(first.arm);
+			let by_arm = |arm| pair.iter().find(|attempt| attempt.arm == arm);
+			let (Some(affinity), Some(load)) = (
+				by_arm(PlacementArm::AffinityOnly),
+				by_arm(PlacementArm::LoadObserving),
+			) else {
+				replay.violations.push(format!(
+					"{query} pair {pair_index} does not contain both arms"
+				));
+				complete = false;
+				continue;
+			};
+			match pair_claims.get(&(query.to_string(), pair_index)) {
+				Some((claimed_affinity, claimed_load, claimed_delta))
+					if (*claimed_affinity - affinity.elapsed_ms).abs() <= 1e-9
+						&& (*claimed_load - load.elapsed_ms).abs() <= 1e-9
+						&& (*claimed_delta - (load.elapsed_ms - affinity.elapsed_ms)).abs()
+							<= 1e-9 => {}
+				Some(_) => replay.violations.push(format!(
+					"{query} pair {pair_index} summary disagrees with its raw attempts"
+				)),
+				None => replay
+					.violations
+					.push(format!("{query} pair {pair_index} lacks pair summary")),
+			}
+			replay.violations.extend(placement_gate_problems(
+				query,
+				pair_index,
+				affinity.facts,
+				load.facts,
+			));
+			replay.violations.extend(placement_worker_set_problems(
+				query,
+				pair_index,
+				&affinity.workers,
+				&load.workers,
+			));
+			for attempt in pair {
+				replay
+					.violations
+					.extend(placement_reservation_drain_problems(
+						query,
+						pair_index,
+						attempt.arm,
+						attempt.live_reservations_after,
+					));
+				if let Some(reference) = reference_identity {
+					if reference.digest != attempt.identity.digest
+						|| reference.row_count != attempt.identity.row_count
+						|| reference.schema_fingerprint != attempt.identity.schema_fingerprint
+					{
+						replay.violations.push(format!(
+							"{query} pair {pair_index} answer identity differs between arms"
+						));
+					}
+				} else {
+					reference_identity = Some(&attempt.identity);
+				}
+			}
+		}
+		replay
+			.violations
+			.extend(placement_pair_order_problems(query, &first_arms));
+		if !residency.get(query).copied().unwrap_or(false) {
+			replay
+				.violations
+				.push(format!("{query} worker residency was not stable"));
+		}
+		if !cleanup.get(query).copied().unwrap_or(false) {
+			replay
+				.violations
+				.push(format!("{query} did not return retained bytes to baseline"));
+		}
+		if !problems.get(query).cloned().unwrap_or_default().is_empty() {
+			complete = false;
+		}
+		if complete && summaries.contains(query) {
+			replay.finalized_cells.insert(query.to_string());
+		} else if summaries.contains(query) {
+			replay
+				.violations
+				.push(format!("{query} claims finalized despite failed gates"));
+		}
+	}
+	replay
 }
 
 /// Reject an attempt whose placement does not match the arm that produced it
@@ -8883,6 +9900,31 @@ fn build_execution_census_coordinator_with_placement(
 	distributed_budget: QueryBudget,
 	fallback: FallbackPlacementPolicy,
 ) -> DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport> {
+	build_execution_census_coordinator_with_placement_and_registry(
+		catalog,
+		workers,
+		memory_pool_max_buffer_capacity_bytes,
+		distributed_budget,
+		fallback,
+	)
+	.0
+}
+
+/// As above, retaining the exact registry passed to the coordinator.
+///
+/// ADR 555's paired harness needs this only to seal that an arm drained every reservation
+/// before its peer starts. Returning the same `Arc` is essential: reconstructing a registry
+/// merely to inspect it would inspect an empty look-alike rather than the coordinator's load.
+fn build_execution_census_coordinator_with_placement_and_registry(
+	catalog: Arc<dyn Catalog>,
+	workers: &[ExecutionCensusWorkerHarness],
+	memory_pool_max_buffer_capacity_bytes: usize,
+	distributed_budget: QueryBudget,
+	fallback: FallbackPlacementPolicy,
+) -> (
+	DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport>,
+	Arc<StaticWorkerRegistry>,
+) {
 	let entries = workers
 		.iter()
 		.map(|worker| worker.entry.clone())
@@ -8893,14 +9935,15 @@ fn build_execution_census_coordinator_with_placement(
 		EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
 		memory_pool_max_buffer_capacity_bytes,
 	));
-	DistributedQueryCoordinator::new(
+	let coordinator = DistributedQueryCoordinator::new(
 		catalog,
-		registry,
+		registry.clone(),
 		coordinator_memory,
 		Arc::new(TcpTransport::new()),
 		execution_census_distributed_planner_config(distributed_budget.memory_per_task),
 		distributed_budget,
-	)
+	);
+	(coordinator, registry)
 }
 
 struct ExecutionCensusPreflight {
@@ -8979,11 +10022,15 @@ async fn execution_census_preflight(
 	})
 }
 
-#[derive(Debug)]
-struct ExecutionIdentityFacts {
-	digest: String,
-	row_count: u64,
-	schema_fingerprint: Option<String>,
+/// Canonical output identity captured outside a timing boundary.
+///
+/// The paired placement harness persists this value for both arms, so replay can refuse a
+/// timing comparison whose policies produced different answers.
+#[derive(Debug, Clone)]
+pub struct ExecutionIdentityFacts {
+	pub digest: String,
+	pub row_count: u64,
+	pub schema_fingerprint: Option<String>,
 }
 
 fn execution_identity_facts(batches: &[RecordBatch]) -> Result<ExecutionIdentityFacts, String> {
@@ -23659,11 +24706,11 @@ mod adr538_timing_atlas_journal_replay {
 	}
 
 	impl PlacementHarness for ScriptedPlacementHarness {
-		fn setup_cell(&mut self, _query: &str) -> Result<(), String> {
+		async fn setup_cell(&mut self, _query: &str) -> Result<(), String> {
 			Ok(())
 		}
 
-		fn execute_arm(
+		async fn execute_arm(
 			&mut self,
 			query: &str,
 			pair_index: usize,
@@ -23679,13 +24726,19 @@ mod adr538_timing_atlas_journal_replay {
 				position_in_pair,
 				arm,
 				elapsed_ms: 10.0,
+				identity: ExecutionIdentityFacts {
+					digest: "fixture".to_string(),
+					row_count: 4,
+					schema_fingerprint: Some("fixture".to_string()),
+				},
 				facts: placement_facts_from_nodes(&nodes),
+				nodes,
 				workers: ["w1", "w2"].iter().map(|w| w.to_string()).collect(),
 				live_reservations_after: self.live_after,
 			})
 		}
 
-		fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
+		async fn teardown_cell(&mut self, _query: &str) -> Result<(), String> {
 			Ok(())
 		}
 	}
@@ -23693,10 +24746,10 @@ mod adr538_timing_atlas_journal_replay {
 	/// ADR 555 §7: each pair runs exactly its two policy arms, adjacent, in the
 	/// recorded order, before the next pair begins. Adjacency is the whole drift
 	/// control — arms compared runs apart are not paired at all.
-	#[test]
-	fn adr555_each_pair_runs_both_arms_adjacent_before_the_next_pair() {
+	#[tokio::test]
+	async fn adr555_each_pair_runs_both_arms_adjacent_before_the_next_pair() {
 		let mut harness = ScriptedPlacementHarness::healthy();
-		let outcome = run_placement_cell_with(&mut harness, "q19");
+		let outcome = run_placement_cell_with(&mut harness, "q19").await;
 
 		assert_eq!(
 			harness.calls.len(),
@@ -23716,12 +24769,12 @@ mod adr538_timing_atlas_journal_replay {
 	}
 
 	/// Attempts survive a failing seal: a withheld artifact must stay auditable.
-	#[test]
-	fn adr555_attempts_are_retained_when_the_seal_withholds() {
+	#[tokio::test]
+	async fn adr555_attempts_are_retained_when_the_seal_withholds() {
 		let mut harness = ScriptedPlacementHarness::healthy();
 		// Neither arm spreads, so the treatment arm fails its placement gate.
 		harness.spread_siblings_for = None;
-		let outcome = run_placement_cell_with(&mut harness, "q19");
+		let outcome = run_placement_cell_with(&mut harness, "q19").await;
 
 		assert!(
 			outcome
@@ -23739,11 +24792,11 @@ mod adr538_timing_atlas_journal_replay {
 	}
 
 	/// A leaked reservation is caught by the driver between arms.
-	#[test]
-	fn adr555_driver_refuses_an_arm_that_leaks_reservations() {
+	#[tokio::test]
+	async fn adr555_driver_refuses_an_arm_that_leaks_reservations() {
 		let mut harness = ScriptedPlacementHarness::healthy();
 		harness.live_after = 2;
-		let outcome = run_placement_cell_with(&mut harness, "q19");
+		let outcome = run_placement_cell_with(&mut harness, "q19").await;
 		assert!(
 			outcome
 				.problems
@@ -23751,6 +24804,108 @@ mod adr538_timing_atlas_journal_replay {
 				.any(|p| p.contains("live reservations")),
 			"{:?}",
 			outcome.problems
+		);
+	}
+
+	async fn healthy_placement_ab_journal() -> String {
+		let mut rows = vec![serde_json::json!({ "kind": PLACEMENT_AB_KIND_HEADER })];
+		rows.push(serde_json::json!({
+			"kind": PLACEMENT_AB_KIND_EXCLUSION,
+			"query": "q15",
+		}));
+		for query in timing_atlas_cells() {
+			rows.push(serde_json::json!({
+				"kind": PLACEMENT_AB_KIND_CELL_SETUP,
+				"query": query,
+			}));
+			let mut harness = ScriptedPlacementHarness::healthy();
+			let outcome = run_placement_cell_with(&mut harness, query).await;
+			for attempt in &outcome.attempts {
+				rows.push(placement_ab_attempt_row(attempt));
+			}
+			for pair_index in 0..TIMING_ATLAS_MEASURED_PAIRS {
+				let attempts = outcome
+					.attempts
+					.iter()
+					.filter(|attempt| attempt.pair_index == pair_index)
+					.collect::<Vec<_>>();
+				let affinity = attempts
+					.iter()
+					.find(|attempt| attempt.arm == PlacementArm::AffinityOnly)
+					.expect("affinity arm");
+				let load = attempts
+					.iter()
+					.find(|attempt| attempt.arm == PlacementArm::LoadObserving)
+					.expect("load arm");
+				rows.push(serde_json::json!({
+					"kind": PLACEMENT_AB_KIND_PAIR,
+					"query": query,
+					"pair_index": pair_index,
+					"affinity_only_elapsed_ms": affinity.elapsed_ms,
+					"load_observing_elapsed_ms": load.elapsed_ms,
+					"delta_ms": load.elapsed_ms - affinity.elapsed_ms,
+				}));
+			}
+			rows.push(serde_json::json!({
+				"kind": PLACEMENT_AB_KIND_RESIDENCY,
+				"query": query,
+				"stable": true,
+			}));
+			rows.push(serde_json::json!({
+				"kind": PLACEMENT_AB_KIND_CLEANUP,
+				"query": query,
+				"returned_to_baseline": true,
+			}));
+			rows.push(serde_json::json!({
+				"kind": PLACEMENT_AB_KIND_CELL_SUMMARY,
+				"query": query,
+				"finalized": placement_cell_finalized(&outcome),
+			}));
+		}
+		rows.push(serde_json::json!({
+			"kind": PLACEMENT_AB_KIND_HOST_END,
+			"service_inactive": true,
+			"sql_port_free": true,
+		}));
+		rows.iter()
+			.map(serde_json::Value::to_string)
+			.collect::<Vec<_>>()
+			.join("\n")
+	}
+
+	/// The sealed result is replayed from node assignment and answer identity. A claimed
+	/// placement count cannot paper over a node-level regression in either arm.
+	#[tokio::test]
+	async fn adr555_placement_ab_replay_rederives_the_per_pair_gate() {
+		let journal = healthy_placement_ab_journal().await;
+		let replay = placement_ab_replay(&journal);
+		assert!(replay.violations.is_empty(), "{:?}", replay.violations);
+		assert_eq!(replay.finalized_cells.len(), timing_atlas_cells().len());
+		assert!(replay.supports_authority(&TimingAuthorityConditions {
+			clean_build: true,
+			full_hash_dataset: true,
+			quiescent_host: true,
+			protocol_unmodified: true,
+			complete_cohort: true,
+		}));
+
+		let broken = journal.replacen(
+			"\"sibling_groups_spread\":1",
+			"\"sibling_groups_spread\":0",
+			1,
+		);
+		assert_ne!(
+			broken, journal,
+			"the probe must change the persisted attempt"
+		);
+		let replay = placement_ab_replay(&broken);
+		assert!(
+			replay
+				.violations
+				.iter()
+				.any(|problem| problem.contains("disagree with nodes")),
+			"{:?}",
+			replay.violations
 		);
 	}
 
