@@ -1,7 +1,8 @@
 # ADR 555 - Inert load balancing in worker placement
 
 **Status:** Proposed 2026-08-16. **Implemented and measured.** The engine half
-landed, the paired `placement-ab` comparison was built (`31a18639`) and run, and
+landed, the paired `placement-ab` comparison was built at
+`artifact/31a18639fed1` and run, and
 §7 records its result: placement changed completely, affinity survived, and
 SF=8 with two workers showed **no material timing effect**. A materiality/verdict
 field in the artifact is the named follow-on.
@@ -126,8 +127,8 @@ processes for reasons unrelated to the workload.
 
 ### 7. Measure before claiming an improvement
 
-**Placement measured 2026-08-17.** The engine half (`bf5717e0`) was run at SF=8
-from a clean worktree (`bf5717e0604c`, authoritative, no replay violations)
+**Placement measured 2026-08-17.** The engine half was run at SF=8 from a clean
+worktree built at `artifact/bf5717e0604c` (authoritative, no replay violations)
 against the baseline this record was written from (`237fb57518e4`). Both runs
 carry identical plan structure, so the classes below are directly comparable.
 
@@ -219,7 +220,7 @@ refused elsewhere.
 
 
 
-The worker-identity artifact path added in `237fb575` already reports which worker
+The worker-identity artifact path added in `c3b50385` already reports which worker
 ran each task. The locality-versus-parallelism trade-off is measured through it on
 a matched SF=8 pair before any performance claim.
 

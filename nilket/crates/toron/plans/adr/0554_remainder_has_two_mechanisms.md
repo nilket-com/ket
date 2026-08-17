@@ -12,7 +12,7 @@ shortfall `remainder_ms`: *"large, it sits inside the measured envelope, and the
 current taxonomy does not name it. Any future component verdict that wants a
 mechanistic reading needs it accounted for first."*
 
-The decomposition receipt (`a16ab3e6`) split that scalar by **where the time was**,
+The decomposition receipt (`7e8d0bc3`) split that scalar by **where the time was**,
 using counters the engine already produced and the artifact previously collapsed:
 
 - `telemetry_lock_ms` — a measured activity.
@@ -187,7 +187,7 @@ the maximum stage width, so the scheduler cap is not the constraint.
 
 **Superseded by measurement — and the two-worker reading was wrong.** `worker_id`
 was known to the scheduler at completion but discarded before
-`TaskTelemetryRecord`. Retaining it (`237fb575`) let a further authoritative SF=8
+`TaskTelemetryRecord`. Retaining it (`c3b50385`) let a further authoritative SF=8
 run answer the question directly, and the answer rejects the round-structure
 explanation above rather than confirming it.
 
@@ -288,7 +288,7 @@ before the audit would have measured B1 all over again, since B1 is where q06 an
 q13 put almost all of their residue.
 
 The B2 instrument is built, run, and reported above; `worker_id` retention landed
-in `237fb575` and settled the mechanism. B2 is closed as an attribution question.
+in `c3b50385` and settled the mechanism. B2 is closed as an attribution question.
 
 What it opened is a placement question, and that is the next cut: **a read-only
 audit of why a scheduler reporting two-worker capacity places every query's tasks
