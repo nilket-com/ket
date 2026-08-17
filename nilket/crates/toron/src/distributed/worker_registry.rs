@@ -244,9 +244,30 @@ where
 	}
 }
 
+/// How a registry places tasks that shuffle affinity declined (ADR 555 §7).
+///
+/// Chosen at **construction**, never from the environment: this is a harness
+/// instrument for the paired locality-versus-parallelism comparison, not a
+/// production runtime knob.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FallbackPlacementPolicy {
+	/// Least-loaded by `(active_tasks, worker_id)` — the landed behaviour.
+	#[default]
+	LoadObserving,
+	/// Send every fallback-eligible task to one stable worker, chosen by the same
+	/// deterministic `worker_id` tie-break.
+	///
+	/// A **controlled serialization baseline**, not a revival of the old
+	/// nondeterminism: the pre-ADR-555 engine resolved ties by `HashMap`
+	/// iteration order, which varied per construction. This arm is reproducible,
+	/// so a paired comparison measures serialization rather than hash noise.
+	AffinityOnly,
+}
+
 #[derive(Debug)]
 pub struct StaticWorkerRegistry {
 	workers: Arc<RwLock<HashMap<WorkerId, WorkerEntry>>>,
+	fallback: FallbackPlacementPolicy,
 }
 
 impl StaticWorkerRegistry {
@@ -295,8 +316,16 @@ impl StaticWorkerRegistry {
 		})
 	}
 
+	/// Select the fallback policy explicitly. Construction-time only, so a
+	/// production coordinator cannot acquire the baseline arm by configuration.
+	pub fn with_fallback_placement_policy(mut self, fallback: FallbackPlacementPolicy) -> Self {
+		self.fallback = fallback;
+		self
+	}
+
 	pub fn new(workers: impl IntoIterator<Item = WorkerEntry>) -> Self {
 		Self {
+			fallback: FallbackPlacementPolicy::default(),
 			workers: Arc::new(RwLock::new(
 				workers
 					.into_iter()
@@ -340,11 +369,16 @@ impl WorkerRegistry for StaticWorkerRegistry {
 		// visible to the next selector, or two selectors observe identical load
 		// and recreate the tie this record exists to remove (ADR 555 §3).
 		let mut workers = self.workers.write().expect("worker registry poisoned");
-		let worker_id = workers
+		let live = workers
 			.values()
-			.filter(|worker| worker.status == WorkerStatus::Live)
-			.min_by_key(Self::placement_key)
-			.map(|worker| worker.worker_id)?;
+			.filter(|worker| worker.status == WorkerStatus::Live);
+		// Both arms reserve, so the token lifecycle is identical and the only
+		// difference between them is the ordering key.
+		let worker_id = match self.fallback {
+			FallbackPlacementPolicy::LoadObserving => live.min_by_key(Self::placement_key),
+			FallbackPlacementPolicy::AffinityOnly => live.min_by_key(|worker| worker.worker_id),
+		}
+		.map(|worker| worker.worker_id)?;
 		Self::acquire_locked(&mut workers, worker_id)?;
 		drop(workers);
 		Some(self.reservation_for(worker_id))
@@ -459,6 +493,78 @@ mod tests {
 				WorkerStatus::Live,
 			),
 		])
+	}
+
+	fn two_equal_live_workers_with(policy: FallbackPlacementPolicy) -> StaticWorkerRegistry {
+		two_equal_live_workers().with_fallback_placement_policy(policy)
+	}
+
+	/// ADR 555 §7 baseline arm: fallback-eligible tasks all land on one worker,
+	/// so the arm serializes them exactly as pre-555 placement did.
+	#[test]
+	fn adr555_affinity_only_arm_sends_every_fallback_task_to_one_worker() {
+		let registry = two_equal_live_workers_with(FallbackPlacementPolicy::AffinityOnly);
+		let picked: Vec<_> = (0..8)
+			.map(|_| {
+				registry
+					.select_and_reserve(&PlacementHints)
+					.expect("selection")
+			})
+			.collect();
+		let distinct: std::collections::BTreeSet<_> = picked
+			.iter()
+			.map(|reservation| reservation.worker_id())
+			.collect();
+		assert_eq!(
+			distinct.len(),
+			1,
+			"the baseline arm must serialize onto one worker even as load accumulates"
+		);
+	}
+
+	/// And it is a **controlled** baseline: deterministic across constructions,
+	/// not the `HashMap` iteration order the pre-555 engine actually used. A
+	/// paired comparison against hash noise would measure the noise.
+	#[test]
+	fn adr555_affinity_only_arm_is_deterministic_across_constructions() {
+		let picked: Vec<u128> = (0..16)
+			.map(|_| {
+				two_equal_live_workers_with(FallbackPlacementPolicy::AffinityOnly)
+					.select_and_reserve(&PlacementHints)
+					.expect("selection")
+					.worker_id()
+					.get()
+					.as_u128()
+			})
+			.collect();
+		assert!(
+			picked.windows(2).all(|pair| pair[0] == pair[1]),
+			"the baseline arm must be reproducible, not hash-ordered: {picked:?}"
+		);
+	}
+
+	/// The two arms must actually differ, or the comparison measures nothing.
+	#[test]
+	fn adr555_the_two_arms_place_differently_under_load() {
+		let baseline = two_equal_live_workers_with(FallbackPlacementPolicy::AffinityOnly);
+		let first = baseline.select_and_reserve(&PlacementHints).expect("first");
+		let second = baseline
+			.select_and_reserve(&PlacementHints)
+			.expect("second");
+		assert_eq!(first.worker_id(), second.worker_id(), "baseline serializes");
+
+		let observing = two_equal_live_workers_with(FallbackPlacementPolicy::LoadObserving);
+		let first = observing
+			.select_and_reserve(&PlacementHints)
+			.expect("first");
+		let second = observing
+			.select_and_reserve(&PlacementHints)
+			.expect("second");
+		assert_ne!(
+			first.worker_id(),
+			second.worker_id(),
+			"load-observing spreads"
+		);
 	}
 
 	/// ADR 555 §3: the reservation must be visible to the **next** selector.
