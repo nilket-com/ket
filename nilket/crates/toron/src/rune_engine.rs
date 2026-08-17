@@ -1057,6 +1057,15 @@ pub fn ceil(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn floor(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Floor,
+			args: vec![expr.expr],
+		},
+	}
+}
+
 pub fn sign(expr: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1638,6 +1647,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["ln"], ln).build()?;
 	m.function(["round"], round).build()?;
 	m.function(["ceil"], ceil).build()?;
+	m.function(["floor"], floor).build()?;
 	m.function(["sign"], sign).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;

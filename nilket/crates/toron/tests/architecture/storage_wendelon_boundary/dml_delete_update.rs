@@ -57,7 +57,7 @@ pub(crate) fn adr031_bound_expr_node_has_no_boxes() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("BoundExprNode enum");
-	assert_eq!(enum_variant_count(node), 17);
+	assert_eq!(enum_variant_count(node), 16);
 	for variant in [
 		"Column",
 		"Literal",
@@ -71,7 +71,6 @@ pub(crate) fn adr031_bound_expr_node_has_no_boxes() {
 		"Substring",
 		"Case",
 		"ScalarFunction",
-		"Floor",
 		"TimeBucket",
 		"AtTimeZone",
 		"Extract",

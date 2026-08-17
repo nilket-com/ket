@@ -18,7 +18,8 @@ use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram,
 	CUSTOMER_ID_LOGICAL_TYPE, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategyIntent, LogicalPlan, ScalarValue, SortExpr, SystemTableKind, TableId,
+	JoinStrategyIntent, LogicalPlan, ScalarFunctionId, ScalarValue, SortExpr, SystemTableKind,
+	TableId,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -2067,23 +2068,54 @@ async fn adr553_sql_and_rune_ceil_share_a_bound_plan_and_digest() {
 	);
 }
 
-/// `FLOOR` stays a grandfathered `Expr` variant while `CEIL` is a registration.
-/// The asymmetry is deliberate, and this pins it so a future migration is a
-/// decision rather than a surprise.
+#[tokio::test]
+async fn adr553_sql_and_rune_floor_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT FLOOR(price) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([floor(col("price"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL FLOOR");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune floor");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL FLOOR digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune floor digest")
+	);
+}
+
 #[test]
-fn adr553_floor_pre_migration_lowers_to_a_direct_expr_variant() {
+fn adr553_floor_lowers_through_the_registry_after_migration() {
 	let floor = plan_sql("SELECT FLOOR(price) FROM sales");
 	let LogicalPlan::Project { exprs, .. } = floor else {
 		panic!("expected FLOOR projection");
 	};
 	assert!(
-		matches!(exprs.as_slice(), [Expr::Floor(_)]),
-		"pre-migration FLOOR must use its dedicated Expr variant"
+		matches!(
+			exprs.as_slice(),
+			[Expr::ScalarFunction {
+				id: ScalarFunctionId::Floor,
+				args,
+			}] if matches!(args.as_slice(), [Expr::Column(column)] if column.name.0 == "price")
+		),
+		"FLOOR must lower through the typed scalar-function registry"
 	);
 }
 
 #[tokio::test]
-async fn adr553_ceil_is_a_registration_while_floor_remains_a_variant() {
+async fn adr553_ceil_and_floor_are_both_registry_registrations() {
 	let ceil = plan_sql("SELECT CEIL(price) FROM sales");
 	let floor = plan_sql("SELECT FLOOR(price) FROM sales");
 	assert!(
@@ -2091,8 +2123,8 @@ async fn adr553_ceil_is_a_registration_while_floor_remains_a_variant() {
 		"CEIL must lower through the registry"
 	);
 	assert!(
-		format!("{floor:?}").contains("Floor") && !format!("{floor:?}").contains("ScalarFunction"),
-		"FLOOR is still a grandfathered variant"
+		format!("{floor:?}").contains("ScalarFunction"),
+		"FLOOR must lower through the registry"
 	);
 }
 
@@ -4358,10 +4390,13 @@ async fn floor_preserves_the_closed_numeric_type_matrix_and_nulls() {
 			table: TableRef::new("sales"),
 			projection: None,
 		}),
-		exprs: vec![Expr::Floor(Box::new(Expr::LogicalAscription {
-			expr: Box::new(Expr::column("id")),
-			logical_type: CUSTOMER_ID_LOGICAL_TYPE,
-		}))],
+		exprs: vec![Expr::ScalarFunction {
+			id: ScalarFunctionId::Floor,
+			args: vec![Expr::LogicalAscription {
+				expr: Box::new(Expr::column("id")),
+				logical_type: CUSTOMER_ID_LOGICAL_TYPE,
+			}],
+		}],
 		output_names: vec![None],
 	};
 	let err = bind(&logical, &catalog, &PlannerConfig::default())

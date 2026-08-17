@@ -4953,7 +4953,6 @@ fn collect_program_node_columns(
 		| Some(BoundExprNode::Unary { input, .. })
 		| Some(BoundExprNode::Like { expr: input, .. })
 		| Some(BoundExprNode::Substring { input, .. })
-		| Some(BoundExprNode::Floor { input })
 		| Some(BoundExprNode::TimeBucket { input, .. })
 		| Some(BoundExprNode::AtTimeZone { input, .. })
 		| Some(BoundExprNode::Extract { input, .. })
@@ -5154,7 +5153,6 @@ fn bind_expr_into_program(
 		Expr::ScalarFunction { id, args } => {
 			bind_scalar_function(builder, input_schema, ctx, *id, args)
 		}
-		Expr::Floor(inner) => bind_floor(builder, input_schema, ctx, inner),
 		Expr::TimeBucket(interval, inner) => {
 			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
 			// A named logical type over Int64 carries units that are not Unix

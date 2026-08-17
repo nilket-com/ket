@@ -513,7 +513,6 @@ fn expression_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
 		| BoundExprNode::Substring { input, .. }
-		| BoundExprNode::Floor { input }
 		| BoundExprNode::TimeBucket { input, .. }
 		| BoundExprNode::AtTimeZone { input, .. }
 		| BoundExprNode::Extract { input, .. }
@@ -556,7 +555,6 @@ fn expression_node_kind(node: &BoundExprNode) -> &'static str {
 		BoundExprNode::Substring { .. } => "substring",
 		BoundExprNode::Case { .. } => "case",
 		BoundExprNode::ScalarFunction { .. } => "scalar_function",
-		BoundExprNode::Floor { .. } => "floor",
 		BoundExprNode::TimeBucket { .. } => "time_bucket",
 		BoundExprNode::AtTimeZone { .. } => "at_time_zone",
 		BoundExprNode::Extract { .. } => "extract",

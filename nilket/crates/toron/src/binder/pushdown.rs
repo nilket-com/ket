@@ -2150,10 +2150,6 @@ pub(super) fn clone_bound_subgraph(
 				.collect::<Option<Vec<_>>>()?;
 			builder.append_scalar_function(*id, args, output_type)
 		}
-		BoundExprNode::Floor { input } => {
-			let input = clone_bound_subgraph(source, *input, builder, remap)?;
-			builder.append_floor(input, output_type)
-		}
 		BoundExprNode::TimeBucket { interval, input } => {
 			let input = clone_bound_subgraph(source, *input, builder, remap)?;
 			builder.append_time_bucket(*interval, input, output_type)
@@ -2448,7 +2444,6 @@ pub(super) fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
 		| BoundExprNode::Substring { input, .. }
-		| BoundExprNode::Floor { input }
 		| BoundExprNode::TimeBucket { input, .. }
 		| BoundExprNode::AtTimeZone { input, .. }
 		| BoundExprNode::Extract { input, .. }

@@ -322,10 +322,6 @@ impl Executor {
 					.collect::<Result<Vec<_>, ExecutionError>>()?;
 				evaluate_scalar_function(*id, &args)
 			}
-			Expr::Floor(inner) => {
-				let arr = self.evaluate_expr(inner, batch)?;
-				evaluate_floor(&arr)
-			}
 			Expr::TimeBucket(interval, inner) => {
 				let arr = self.evaluate_expr(inner, batch)?;
 				evaluate_time_bucket(*interval, &arr)
@@ -470,10 +466,6 @@ impl Executor {
 						.map(|arg| evaluated_child(&outputs, *arg))
 						.collect::<Result<Vec<_>, ExecutionError>>()?;
 					evaluate_scalar_function(*id, &args)?
-				}
-				BoundExprNode::Floor { input } => {
-					let arr = evaluated_child(&outputs, *input)?;
-					evaluate_floor(&arr)?
 				}
 				BoundExprNode::TimeBucket { interval, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -733,6 +725,11 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_unary_float(&args[0], "CEIL", f32::ceil, f64::ceil),
 		(
+			ScalarFunctionEvaluator::Floor,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Rejects,
+		) => evaluate_floor(&args[0]),
+		(
 			ScalarFunctionEvaluator::Sign,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -742,6 +739,29 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_mod(&args[0], &args[1]),
+		(
+			ScalarFunctionEvaluator::Floor,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		)
+		| (
+			ScalarFunctionEvaluator::Abs
+			| ScalarFunctionEvaluator::Ceil
+			| ScalarFunctionEvaluator::Exp
+			| ScalarFunctionEvaluator::Ln
+			| ScalarFunctionEvaluator::Mod
+			| ScalarFunctionEvaluator::Pow
+			| ScalarFunctionEvaluator::Round
+			| ScalarFunctionEvaluator::Sign
+			| ScalarFunctionEvaluator::Sqrt,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Rejects,
+		) => Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"internal: {} has an unsupported scalar-function behavior tuple",
+				metadata.sql_name
+			),
+		}),
 	}
 }
 

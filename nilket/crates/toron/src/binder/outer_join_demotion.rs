@@ -2007,7 +2007,6 @@ fn guard_filter_pushdown_safe(expr: &Expr) -> bool {
 		Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Not(inner)
-		| Expr::Floor(inner)
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -2331,7 +2330,6 @@ where
 				args: remapped_args,
 			}
 		}
-		Expr::Floor(inner) => Expr::Floor(Box::new(child!(inner))),
 		Expr::TimeBucket(duration, inner) => Expr::TimeBucket(*duration, Box::new(child!(inner))),
 		Expr::AtTimeZone(inner, timezone) => {
 			Expr::AtTimeZone(Box::new(child!(inner)), timezone.clone())
@@ -2579,7 +2577,6 @@ fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> boo
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::Floor(inner)
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -2640,7 +2637,6 @@ fn expr_column_resolution_in_scope(expr: &Expr, scope: &RelationScope) -> (bool,
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::Floor(inner)
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -2787,7 +2783,6 @@ fn null_rejecting_sides(
 		| Expr::Substring { .. }
 		| Expr::Case { .. }
 		| Expr::IsNull(_)
-		| Expr::Floor(_)
 		| Expr::TimeBucket(_, _)
 		| Expr::AtTimeZone(_, _)
 		| Expr::Extract(_, _)
@@ -2946,7 +2941,6 @@ fn conjunct_column_sides(
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::Floor(inner)
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)

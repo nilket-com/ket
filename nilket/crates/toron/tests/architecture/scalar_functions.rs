@@ -5,7 +5,6 @@ use std::collections::BTreeSet;
 use super::support::*;
 
 const GRANDFATHERED_SCALAR_VARIANTS: &[&str] = &[
-	"Floor",
 	"TimeBucket",
 	"AtTimeZone",
 	"Extract",
@@ -151,6 +150,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Abs".to_string(),
 			"Ceil".to_string(),
 			"Exp".to_string(),
+			"Floor".to_string(),
 			"Ln".to_string(),
 			"Mod".to_string(),
 			"Pow".to_string(),

@@ -1,38 +1,5 @@
 use super::*;
 
-pub(super) fn bind_floor(
-	builder: &mut BoundExprProgramBuilder,
-	input_schema: &SchemaRef,
-	ctx: &ExprBindContext<'_>,
-	inner: &Expr,
-) -> Result<BoundExprId, BindingError> {
-	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
-	if !builder
-		.node_logical_type(inner)
-		.is_some_and(LogicalTypeId::is_naked)
-	{
-		return Err(BindingError::TypeMismatch {
-			message: "FLOOR does not accept named logical types".to_string(),
-		});
-	}
-	let data_type =
-		builder
-			.node_type(inner)
-			.cloned()
-			.ok_or_else(|| BindingError::UnsupportedExpression {
-				message: "FLOOR input is malformed".to_string(),
-			})?;
-	if !matches!(
-		data_type,
-		DataType::Int32 | DataType::Int64 | DataType::Float32 | DataType::Float64
-	) {
-		return Err(BindingError::TypeMismatch {
-			message: format!("FLOOR expects Int32, Int64, Float32, or Float64; got {data_type}"),
-		});
-	}
-	Ok(builder.append_floor(inner, data_type))
-}
-
 pub(super) fn bind_at_time_zone(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,

@@ -168,11 +168,6 @@ impl PbcCompiler {
 						metadata.sql_name
 					)));
 				}
-				BoundExprNode::Floor { .. } => {
-					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
-						"FLOOR is not PBC-eligible".to_string(),
-					));
-				}
 				BoundExprNode::TimeBucket { .. } => {
 					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 						"TIME_BUCKET is not PBC-eligible".to_string(),
@@ -253,7 +248,6 @@ impl PbcCompiler {
 			| BoundExprNode::Substring { .. }
 			| BoundExprNode::Case { .. }
 			| BoundExprNode::ScalarFunction { .. }
-			| BoundExprNode::Floor { .. }
 			| BoundExprNode::TimeBucket { .. }
 			| BoundExprNode::AtTimeZone { .. }
 			| BoundExprNode::Extract { .. }

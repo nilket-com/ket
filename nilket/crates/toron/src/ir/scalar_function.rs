@@ -16,6 +16,7 @@ pub enum ScalarFunctionId {
 	Abs,
 	Ceil,
 	Exp,
+	Floor,
 	Ln,
 	Mod,
 	Pow,
@@ -67,6 +68,10 @@ pub enum ScalarFunctionSignature {
 	/// Output type equals input type across the numeric set. Integers and
 	/// decimals stay themselves rather than becoming floats.
 	UnaryNumericPreserving,
+	/// Output type equals input type for the closed integer-or-float set.
+	/// Decimals are deliberately excluded: admitting them changes a pre-existing
+	/// FLOOR contract and must be its own decision.
+	UnaryIntegerOrFloatPreserving,
 	/// A float value, optionally followed by an integer digit count. The value's
 	/// own type is the output type; the digit count does not widen it.
 	FloatWithOptionalIntegerDigits,
@@ -86,6 +91,9 @@ pub enum ScalarFunctionNullBehavior {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunctionNonFiniteBehavior {
 	Propagates,
+	/// Reject NaN and infinity when evaluation reaches a floating value.
+	/// This is intentionally evaluation-time behavior, not binder validation.
+	Rejects,
 }
 
 /// The only function-specific choice the executor makes.
@@ -94,6 +102,7 @@ pub enum ScalarFunctionEvaluator {
 	Abs,
 	Ceil,
 	Exp,
+	Floor,
 	Ln,
 	Mod,
 	Pow,
@@ -208,6 +217,19 @@ const CEIL: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Ceil,
 };
 
+const FLOOR: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Floor,
+	sql_name: "FLOOR",
+	rune_name: "floor",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryIntegerOrFloatPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Rejects,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Floor,
+};
+
 const SIGN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Sign,
 	sql_name: "SIGN",
@@ -239,7 +261,7 @@ const MOD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 
 /// The complete scalar-function registry.
 pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] =
-	&[ABS, CEIL, EXP, LN, MOD, POW, ROUND, SIGN, SQRT];
+	&[ABS, CEIL, EXP, FLOOR, LN, MOD, POW, ROUND, SIGN, SQRT];
 
 pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunctionMetadata {
 	SCALAR_FUNCTIONS
@@ -328,5 +350,18 @@ mod tests {
 		assert!(!metadata.arity.accepts(1));
 		assert!(metadata.arity.accepts(2));
 		assert_eq!(metadata.arity.description(), "exactly two arguments");
+	}
+
+	#[test]
+	fn floor_preserves_its_narrow_domain_and_rejects_non_finite_values() {
+		let metadata = scalar_function_metadata(ScalarFunctionId::Floor);
+		assert_eq!(
+			metadata.signature,
+			ScalarFunctionSignature::UnaryIntegerOrFloatPreserving
+		);
+		assert_eq!(
+			metadata.non_finite_behavior,
+			ScalarFunctionNonFiniteBehavior::Rejects
+		);
 	}
 }

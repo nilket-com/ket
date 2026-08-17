@@ -1,20 +1,23 @@
 # ADR 553 - Typed scalar function registry
 
 **Status:** Proposed 2026-08-15. **Implemented and measured 2026-08-17.** The
-mechanism landed with `EXP` as its reference function; `SQRT`, `POW`, and `ABS`
-followed as the cut that measures it. §Forward records what they cost.
+mechanism landed with `EXP` as its reference function; the following registrations
+and the contract-preserving `FLOOR` migration measured it. §Forward records what
+they cost.
 
 ## Context
 
-Toron has no scalar-function mechanism. Every function is its own `Expr` variant:
-`Floor`, `TimeBucket`, `AtTimeZone`, `Extract`, `DateTrunc`, `Substring`. There is
-no `ScalarFunction { .. }`, so there is no such thing as *registering* a function.
+At proposal time, Toron had no scalar-function mechanism. Every function was its
+own `Expr` variant: `Floor`, `TimeBucket`, `AtTimeZone`, `Extract`, `DateTrunc`,
+`Substring`. There was no `ScalarFunction { .. }`, so there was no such thing as
+*registering* a function.
 
-`FLOOR` is the proof rather than an exception. ADR 545 needed histogram bucketing,
-and the answer was a sqlparser grammar form wired to a dedicated IR variant. There
-is still no `ABS`, `ROUND`, `CEIL`, `MOD`, `SIGN`, `EXP`, `POW`, `SQRT`, or `LN`
-anywhere in the SQL surface — not because they were considered and declined, but
-because nothing has been willing to pay for them.
+`FLOOR` was the proof rather than an exception. ADR 545 needed histogram
+bucketing, and the answer was a sqlparser grammar form wired to a dedicated IR
+variant. At proposal time there was no `ABS`, `ROUND`, `CEIL`, `MOD`, `SIGN`,
+`EXP`, `POW`, `SQRT`, or `LN` anywhere in the SQL surface — not because they
+were considered and declined, but because nothing had been willing to pay for
+them.
 
 **The cost is not in the evaluator.** Computing `exp` is trivial. The cost is in
 every match that does *not* care which function it is: `Expr::is_pbc_pushdown_eligible`
@@ -70,15 +73,17 @@ about what kind of thing it is, not about which surface may spell it.
 
 ### 4. Grandfathered variants are a closed, enumerated set
 
-`Floor`, `TimeBucket`, `AtTimeZone`, `Extract`, `DateTrunc`, and `Substring`
-remain expression variants, **by name**. `Case`, `IsNull`, and `IsNotNull` are
-control and predicate forms rather than functions and are not registry
-candidates.
+`TimeBucket`, `AtTimeZone`, `Extract`, `DateTrunc`, and `Substring` remain
+expression variants, **by name**. `FLOOR` migrated to the registry on
+2026-08-17, preserving its narrower integer-or-float domain and evaluation-time
+non-finite rejection; the closed list therefore shrank from six to five. `Case`,
+`IsNull`, and `IsNotNull` are control and predicate forms rather than functions
+and are not registry candidates.
 
 The list is names, never a predicate. "Temporal functions may remain variants" is
-a loophole that readmits the pattern under a rule; a finite list of six either
-shrinks over time or stays honestly six. Migration is optional and may never
-happen — those six work, and rewriting them buys nothing a user can see.
+a loophole that readmits the pattern under a rule; a finite list of five either
+shrinks over time or stays honestly five. Migration remains optional — the
+remaining five work, and rewriting them buys nothing a user can see.
 
 ### 5. A guard that fails, or the mechanism is optional
 
@@ -134,8 +139,8 @@ first handful all want a property the registry does not model, the shape is
 wrong — which is why acceptance names `exp` specifically, so the shape is tested
 on function two rather than function twenty.
 
-Migrating the six grandfathered variants touches working code for no user-visible
-gain. Left optional deliberately; the guard does not require it.
+Migrating grandfathered variants touches working code for no user-visible gain.
+Left optional deliberately; the guard does not require it.
 
 A mechanism that makes functions cheap invites a wider surface than anyone
 decided to support. That is a governance cost this record accepts in exchange for
@@ -207,10 +212,21 @@ identifier. The registry cannot make a function reachable that the parser routes
 elsewhere, and that limit belongs on the record: a bespoke grammar is a per-name
 cost the mechanism does not remove.
 
-This also sharpens the `FLOOR` question. `CEIL` is now a registration while
-`FLOOR` remains a grandfathered variant, so one concept has two implementations.
-§4 permits migrating `FLOOR` — the list shrinks or stays — and a test pins the
-current asymmetry so that migration stays a decision rather than a surprise.
+**`FLOOR` then collected the back debt without moving its contract.** Before the
+migration, tests characterized its direct-variant path: `Int32`, `Int64`,
+`Float32`, and `Float64` are accepted and preserve type; `Decimal128` and named
+logical types are rejected at bind time; NaN and infinity are rejected only at
+evaluation. The migration carries that exact domain through
+`UnaryIntegerOrFloatPreserving`, not the broader decimal-accepting numeric rule,
+and makes `ScalarFunctionNonFiniteBehavior::Rejects` discriminate for the first
+time. It remains evaluation-time behavior.
+
+The direct `Expr::Floor` and `BoundExprNode::Floor` forms, their bespoke binder,
+and their planner-wide arms are gone. SQL's dedicated sqlparser grammar form and
+Rune's `floor` spelling both now lower to `ScalarFunctionId::Floor`; a digest test
+asserts the shared bound plan and result. The grandfathered list shrank from six
+to five, so the registry now demonstrates removal of pre-existing planner-wide
+cost as well as avoidance of new cost.
 
 `MOD` falsified an assumption this record made about naming. §3 says one semantic
 definition, two spellings; the implementation had read that as *the same*
