@@ -63,8 +63,9 @@ use toron::distributed::task::{
 	TaskOutputBinding, TaskPhaseReceipt, TaskTelemetry, TaskTelemetryPhases,
 };
 use toron::distributed::worker_registry::{
-	ActiveTaskCount, SimdLaneCount, StaticWorkerRegistry, UnixMillis, WorkerCapabilities,
-	WorkerEndpoint, WorkerEntry, WorkerLease, WorkerResourceState, WorkerStatus,
+	ActiveTaskCount, FallbackPlacementPolicy, SimdLaneCount, StaticWorkerRegistry, UnixMillis,
+	WorkerCapabilities, WorkerEndpoint, WorkerEntry, WorkerLease, WorkerResourceState,
+	WorkerStatus,
 };
 use toron::error::{ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind};
 use toron::exec::{ExecutionContext, Executor};
@@ -8859,11 +8860,35 @@ fn build_execution_census_coordinator(
 	memory_pool_max_buffer_capacity_bytes: usize,
 	distributed_budget: QueryBudget,
 ) -> DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport> {
+	build_execution_census_coordinator_with_placement(
+		catalog,
+		workers,
+		memory_pool_max_buffer_capacity_bytes,
+		distributed_budget,
+		FallbackPlacementPolicy::default(),
+	)
+}
+
+/// As above, with an explicit fallback placement policy (ADR 555 §7).
+///
+/// Two coordinators built this way over the **same** `workers` slice share the
+/// worker processes while holding independent registries. That is correct
+/// because the arms run sequentially: each registry's reservation state
+/// describes only its own arm's placement, and the driver seals that an arm
+/// drains to zero before its peer begins.
+fn build_execution_census_coordinator_with_placement(
+	catalog: Arc<dyn Catalog>,
+	workers: &[ExecutionCensusWorkerHarness],
+	memory_pool_max_buffer_capacity_bytes: usize,
+	distributed_budget: QueryBudget,
+	fallback: FallbackPlacementPolicy,
+) -> DistributedQueryCoordinator<StaticWorkerRegistry, TcpTransport> {
 	let entries = workers
 		.iter()
 		.map(|worker| worker.entry.clone())
 		.collect::<Vec<_>>();
-	let registry = Arc::new(StaticWorkerRegistry::new(entries));
+	let registry =
+		Arc::new(StaticWorkerRegistry::new(entries).with_fallback_placement_policy(fallback));
 	let coordinator_memory = Arc::new(MemoryManager::new(
 		EXECUTION_CENSUS_MEMORY_POOL_RETAINED_BUFFERS,
 		memory_pool_max_buffer_capacity_bytes,
