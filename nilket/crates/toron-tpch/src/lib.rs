@@ -7815,6 +7815,112 @@ impl TimingAtlasChildAttribution {
 /// tasks that actually completed; stage-level upstream edges expand to task-level edges
 /// against the tasks the report actually contains. Where a task retried, the last attempt
 /// wins — it is the attempt whose output was accepted.
+/// Placement facts for one measured attempt, split into the two classes the
+/// placement path actually distinguishes (ADR 555 §7).
+///
+/// A single combined figure would credit a placement change for structure it
+/// never touched: shuffle affinity co-locates a lone consumer with its single
+/// producer by design, and that is correct in **both** arms.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PlacementFacts {
+	/// Multi-task stages. Affinity declines for these because a producer stage
+	/// has more than one task, so the fallback policy decides.
+	pub sibling_groups: usize,
+	pub sibling_groups_spread: usize,
+	/// A lone consumer with exactly one upstream task: affinity's own case.
+	pub affinity_links: usize,
+	pub affinity_links_colocated: usize,
+}
+
+/// Classify one attempt's task graph. Pure, so the gate below is testable
+/// without a run.
+pub fn placement_facts_from_nodes(nodes: &[TimingAtlasTaskNode]) -> PlacementFacts {
+	let mut facts = PlacementFacts::default();
+	let mut by_stage: BTreeMap<u32, Vec<&TimingAtlasTaskNode>> = BTreeMap::new();
+	for node in nodes {
+		by_stage.entry(node.stage_id).or_default().push(node);
+	}
+	for stage_nodes in by_stage.values() {
+		if stage_nodes.len() > 1 {
+			facts.sibling_groups += 1;
+			let distinct: BTreeSet<&str> = stage_nodes
+				.iter()
+				.map(|node| node.worker_id.as_str())
+				.collect();
+			if distinct.len() > 1 {
+				facts.sibling_groups_spread += 1;
+			}
+			continue;
+		}
+		let node = stage_nodes[0];
+		if node.upstream.len() != 1 {
+			continue;
+		}
+		facts.affinity_links += 1;
+		let (stage, task) = node.upstream[0];
+		if nodes
+			.iter()
+			.find(|candidate| candidate.stage_id == stage && candidate.task_id == task)
+			.is_some_and(|producer| producer.worker_id == node.worker_id)
+		{
+			facts.affinity_links_colocated += 1;
+		}
+	}
+	facts
+}
+
+/// Reject an attempt whose placement does not match the arm that produced it
+/// (ADR 555 §7).
+///
+/// The seal consumes this: an artifact exposes **no** paired timing verdict
+/// unless every relevant pair passes. A timing comparison between two arms that
+/// did not actually place differently would measure noise and read as a result.
+pub fn placement_gate_problems(
+	query: &str,
+	pair_index: usize,
+	affinity_only: PlacementFacts,
+	load_observing: PlacementFacts,
+) -> Vec<String> {
+	let mut problems = Vec::new();
+	let cell = format!("{query} pair {pair_index}");
+
+	// The baseline arm must serialize every fallback-eligible group.
+	if affinity_only.sibling_groups_spread != 0 {
+		problems.push(format!(
+			"{cell} affinity-only arm spread {} of {} sibling groups; the baseline must co-locate them",
+			affinity_only.sibling_groups_spread, affinity_only.sibling_groups
+		));
+	}
+	// The treatment arm must spread every one of them, or the arms did not differ.
+	if load_observing.sibling_groups_spread != load_observing.sibling_groups {
+		problems.push(format!(
+			"{cell} load-observing arm spread {} of {} sibling groups; the treatment must spread them",
+			load_observing.sibling_groups_spread, load_observing.sibling_groups
+		));
+	}
+	// Locality is preserved in both arms, or the change traded it for balancing.
+	for (arm, facts) in [
+		("affinity-only", affinity_only),
+		("load-observing", load_observing),
+	] {
+		if facts.affinity_links_colocated != facts.affinity_links {
+			problems.push(format!(
+				"{cell} {arm} arm co-located {} of {} single-producer links; affinity must keep winning",
+				facts.affinity_links_colocated, facts.affinity_links
+			));
+		}
+	}
+	// Identical plan structure, or the arms are not comparable at all.
+	if affinity_only.sibling_groups != load_observing.sibling_groups
+		|| affinity_only.affinity_links != load_observing.affinity_links
+	{
+		problems.push(format!(
+			"{cell} arms saw different plan structure: affinity-only {affinity_only:?} vs load-observing {load_observing:?}"
+		));
+	}
+	problems
+}
+
 pub fn timing_atlas_nodes_from_report(
 	report: &toron::coordinator::QueryTaskTelemetryReport,
 ) -> Result<Vec<TimingAtlasTaskNode>, String> {
@@ -23262,6 +23368,95 @@ mod adr538_timing_atlas_journal_replay {
 		assert_eq!(row["aggregate_accumulation_ms"], 7.0);
 
 		timing_atlas_replay_attribution_path(&row).expect("node sum agrees with the path total");
+	}
+
+	fn placement_node(
+		stage: u32,
+		task: u32,
+		worker: &str,
+		upstream: Vec<(u32, u32)>,
+	) -> TimingAtlasTaskNode {
+		let mut node = decomposition_node(0.0, 0.0, 1.0);
+		node.stage_id = stage;
+		node.task_id = task;
+		node.worker_id = worker.to_owned();
+		node.upstream = upstream;
+		node
+	}
+
+	/// One producer feeding a two-task sibling stage: one affinity link, one
+	/// fallback-eligible group.
+	fn placement_shape(sibling_a: &str, sibling_b: &str) -> Vec<TimingAtlasTaskNode> {
+		vec![
+			placement_node(0, 0, "w1", vec![]),
+			placement_node(1, 0, "w1", vec![(0, 0)]),
+			placement_node(2, 0, sibling_a, vec![(1, 0)]),
+			placement_node(2, 1, sibling_b, vec![(1, 0)]),
+		]
+	}
+
+	#[test]
+	fn adr555_placement_facts_split_siblings_from_affinity_links() {
+		let facts = placement_facts_from_nodes(&placement_shape("w1", "w2"));
+		assert_eq!(facts.sibling_groups, 1);
+		assert_eq!(facts.sibling_groups_spread, 1);
+		assert_eq!(facts.affinity_links, 1);
+		assert_eq!(facts.affinity_links_colocated, 1);
+	}
+
+	/// The gate passes only when each arm shows its own placement signature.
+	#[test]
+	fn adr555_placement_gate_accepts_arms_that_actually_differ() {
+		let baseline = placement_facts_from_nodes(&placement_shape("w1", "w1"));
+		let treatment = placement_facts_from_nodes(&placement_shape("w1", "w2"));
+		assert!(placement_gate_problems("q13", 0, baseline, treatment).is_empty());
+	}
+
+	/// Every failure mode is refused, and each is refused for its own reason —
+	/// a single combined assertion would let two of them rot.
+	#[test]
+	fn adr555_placement_gate_rejects_each_failure_mode() {
+		let spread = placement_facts_from_nodes(&placement_shape("w1", "w2"));
+		let colocated = placement_facts_from_nodes(&placement_shape("w1", "w1"));
+
+		// Baseline arm spread when it should have serialized.
+		let problems = placement_gate_problems("q13", 0, spread, spread);
+		assert!(
+			problems
+				.iter()
+				.any(|p| p.contains("baseline must co-locate")),
+			"{problems:?}"
+		);
+
+		// Treatment arm serialized when it should have spread.
+		let problems = placement_gate_problems("q13", 0, colocated, colocated);
+		assert!(
+			problems.iter().any(|p| p.contains("treatment must spread")),
+			"{problems:?}"
+		);
+
+		// Affinity broken in one arm: locality traded for balancing.
+		let mut broken = placement_shape("w1", "w2");
+		broken[1].worker_id = "w2".to_owned();
+		let problems =
+			placement_gate_problems("q13", 0, colocated, placement_facts_from_nodes(&broken));
+		assert!(
+			problems
+				.iter()
+				.any(|p| p.contains("affinity must keep winning")),
+			"{problems:?}"
+		);
+
+		// Arms that saw different plans are not comparable.
+		let mut smaller = colocated;
+		smaller.sibling_groups = 2;
+		let problems = placement_gate_problems("q13", 0, smaller, spread);
+		assert!(
+			problems
+				.iter()
+				.any(|p| p.contains("different plan structure")),
+			"{problems:?}"
+		);
 	}
 
 	/// ADR 554 Branch A: naming accumulation must **reduce** the unnamed residual,
