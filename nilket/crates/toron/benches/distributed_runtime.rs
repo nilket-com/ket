@@ -23,7 +23,7 @@ use toron::distributed::identity::{LeaseEpoch, QueryId, WorkerId};
 use toron::distributed::scheduler::DistributedScheduler;
 use toron::distributed::worker_registry::{
 	ActiveTaskCount, PlacementHints, SimdLaneCount, UnixMillis, WorkerCapabilities, WorkerEndpoint,
-	WorkerEntry, WorkerLease, WorkerRegistry, WorkerResourceState, WorkerStatus,
+	WorkerEntry, WorkerLease, WorkerRegistry, WorkerReservation, WorkerResourceState, WorkerStatus,
 };
 use toron::ir::{AggregateFunction, Expr, LogicalPlan, TableId};
 use toron::server::{
@@ -288,6 +288,19 @@ impl WorkerRegistry for RoundRobinRegistry {
 			.cloned()
 	}
 
+	/// ADR 555: this registry rotates by construction, so its placement does not
+	/// depend on observed load. The choice is stated explicitly rather than
+	/// inherited — the trait has no default precisely so a load-sensitive
+	/// registry cannot acquire inert behaviour by omission.
+	fn select_and_reserve(&self, hints: &PlacementHints) -> Option<WorkerReservation> {
+		self.select_for_attempt(hints)
+			.map(WorkerReservation::unreserved)
+	}
+
+	fn reserve(&self, worker_id: WorkerId) -> Option<WorkerReservation> {
+		self.resolve(worker_id)
+			.map(|worker| WorkerReservation::unreserved(worker.worker_id))
+	}
 	fn select_for_attempt(&self, _hints: &PlacementHints) -> Option<WorkerId> {
 		let workers = self.workers.read().expect("worker registry poisoned");
 		for _attempt in 0..self.order.len() {

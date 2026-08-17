@@ -1,6 +1,10 @@
 # ADR 555 - Inert load balancing in worker placement
 
-**Status:** Proposed 2026-08-16. No implementation.
+**Status:** Proposed 2026-08-16. **Implemented and measured.** The engine half
+landed, the paired `placement-ab` comparison was built (`31a18639`) and run, and
+§7 records its result: placement changed completely, affinity survived, and
+SF=8 with two workers showed **no material timing effect**. A materiality/verdict
+field in the artifact is the named follow-on.
 
 ## Context
 
@@ -122,6 +126,99 @@ processes for reasons unrelated to the workload.
 
 ### 7. Measure before claiming an improvement
 
+**Placement measured 2026-08-17.** The engine half (`bf5717e0`) was run at SF=8
+from a clean worktree (`bf5717e0604c`, authoritative, no replay violations)
+against the baseline this record was written from (`237fb57518e4`). Both runs
+carry identical plan structure, so the classes below are directly comparable.
+
+Tasks are separated into the two classes the placement path actually
+distinguishes, because a single combined figure would credit this change for
+structure it never touched.
+
+**Fallback-eligible sibling groups** — multi-task stages, where affinity declines
+because a producer stage has more than one task, so `select_and_reserve` decides:
+
+| | baseline | after |
+|---|---:|---:|
+| sibling groups | 224 | 224 |
+| groups that spread across workers | **0 / 224** | **224 / 224** |
+
+**Single-producer affinity links** — a lone consumer following its single
+producer, where §5 requires locality to keep winning:
+
+| | baseline | after |
+|---|---:|---:|
+| chain links | 77 | 77 |
+| co-located | **77 / 77** | **77 / 77** |
+
+The fallback class moves from no spreading to complete spreading; the affinity
+class is untouched at 100% co-location. Had the second number moved, the cut
+would have traded locality for balancing and exceeded this record.
+
+Illustratively, q19's four stage-2 siblings — which have no affinity reason to
+share a worker — split evenly across both workers, where the baseline placed all
+four on one. q06 remains the one cell that never spreads, and that now reads
+correctly: two tasks joined by a single-producer shuffle edge, so it is entirely
+in the affinity class with no fallback-eligible siblings at all.
+
+**That earlier run was placement evidence only.** The paired comparison this
+section requires has since been run, and is recorded below.
+
+### The paired result: placement changed completely, timing did not move
+
+An authoritative `placement-ab` run at SF=8 (`31a18639fed1`, 21 cells, two
+workers, `paired_timing_authority: true`, no replay violations, no withheld
+reasons) executed both arms adjacent within each pair, seven pairs per cell.
+
+**Placement gates, over 147 attempts per arm:**
+
+| arm | sibling groups | spread | affinity links | co-located | live reservations left |
+|---|---:|---:|---:|---:|---:|
+| affinity-only | 224 | **0** | 77 | **77** | 0 |
+| load-observing | 224 | **224** | 77 | **77** | 0 |
+
+The two arms placed as intended and locality survived in both, reproducing the
+earlier unpaired comparison from a paired design.
+
+**Timing: no material effect.** With `delta = load_observing - affinity_only`, so
+that a negative value means spreading was faster:
+
+- 11 of 21 cells negative, 10 positive — no directional tendency.
+- **2 of 21** cells exceed ±1% of their own baseline: q02 at +1.3% and q21 at
+  +1.6%, both *slower* when spreading.
+- **0 of 21** cells have a median paired delta larger than that cell's own
+  pair-to-pair spread.
+- **1 of 21** cells holds a consistent sign across all seven pairs.
+
+**The analysis rule, stated because the artifact does not encode one.** Each
+cell's effect was taken as the median paired delta, expressed as a percentage of
+that cell's median affinity-only elapsed, and compared against the range of its
+own seven paired deltas. A cell whose median is smaller than its own spread is
+not distinguishable from run-to-run variation by this rule. Every cell failed
+that test.
+
+**Conclusion: at SF=8 with two workers, making the fallback observe load changed
+placement completely and moved wall time not at all.** Neither outcome §7
+anticipated — a speedup, or spreading proving slower and thereby vindicating
+co-location — is supported. The parallelism gained appears to be offset by the
+shuffle locality given up, which is precisely the trade this section named; that
+balance is a property of *two* workers and this scale, and says nothing about
+wider pools.
+
+**No materiality gate exists in the artifact.** `placement_ab_cell_summary`
+carries `median_paired_delta_ms` with no verdict or distinguished field, so the
+null reading above is the analyst's, not the artifact's. A reader could take
+q21's +377.6 ms as a finding; against a 24-second baseline with a 1,075 ms spread
+across its own pairs, it is not one.
+
+**A materiality/verdict field is a named follow-on, and must not be retrofitted
+to reinterpret this run.** The raw paired results stand as measured. A later
+artifact may encode a floor and a verdict; re-deriving this run's conclusion
+through a rule invented afterwards would be the post-hoc weakening this arc has
+refused elsewhere.
+
+
+
 The worker-identity artifact path added in `237fb575` already reports which worker
 ran each task. The locality-versus-parallelism trade-off is measured through it on
 a matched SF=8 pair before any performance claim.
@@ -155,7 +252,8 @@ as such rather than treated as a regression to be tuned away.
   registry constructions.
 - **The measured effect is reported from the worker-identity artifact**, showing
   distinct workers per query where placement changed, before any speedup is
-  claimed.
+  claimed. **Met** for the fallback class (0/224 → 224/224) with the affinity
+  class held at 77/77; the speedup measurement itself remains owed.
 
 ## Guardrails
 
@@ -181,6 +279,25 @@ transfers. That may be slower, which is why §5 measures rather than claims.
 Load counters can drift if a release path is missed. The three-outcome control in
 Acceptance exists because the failure mode — a worker that looks permanently busy
 and stops receiving work — is silent and looks like placement preference.
+
+## Follow-on
+
+**A materiality/verdict field for the paired artifact.** `placement_ab_cell_summary`
+reports a median paired delta and nothing about whether it means anything, so the
+null reading in §7 depends on the analyst rather than the artifact. A floor and a
+verdict — as ADR 538's board carries — would make a null result explicit and
+survive a reader who takes a large absolute number at face value.
+
+It applies to future runs only. The `31a18639fed1` artifact and its raw paired
+results are preserved as measured.
+
+**Whether the trade holds at wider worker pools.** §7's result is a property of
+two workers at SF=8: the parallelism gained by spreading appears to be offset by
+the shuffle locality given up. Nothing here establishes where that balance sits
+with more workers, and this record does not speculate.
+
+**Byte-based load**, per §2, once a trustworthy estimate exists. Nothing computes
+one today.
 
 ## Forward
 

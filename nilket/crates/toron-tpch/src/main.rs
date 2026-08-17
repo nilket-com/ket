@@ -28,7 +28,7 @@ use toron_tpch::{
 	run_dev_q04, run_dev_q05, run_dev_q6, run_dev_q07, run_dev_q08, run_dev_q09, run_dev_q10,
 	run_dev_q11, run_dev_q12, run_dev_q13, run_dev_q14, run_dev_q15, run_dev_q16, run_dev_q17,
 	run_dev_q18, run_dev_q19, run_dev_q20, run_dev_q21, run_dev_q22, run_execution_census_query,
-	run_fragment_census_query, run_perf_query_with_data_source,
+	run_fragment_census_query, run_perf_query_with_data_source, run_placement_ab,
 	run_q17_boundary_census_with_data_source, run_rune_perf_query_with_data_source,
 	run_rune_q03_profile_loop_with_data_source, run_strict_q1, run_strict_q02, run_strict_q3,
 	run_strict_q04, run_strict_q05, run_strict_q6, run_strict_q07, run_strict_q08, run_strict_q09,
@@ -116,6 +116,8 @@ async fn run() -> ExitCode {
 		"execution-census" => execution_census_command(&args).await,
 		// ADR 538: the only entry point that can produce timing authority.
 		"timing-atlas" => timing_atlas_command(&args).await,
+		// ADR 555: paired fallback-placement comparison over the same distributed workers.
+		"placement-ab" => placement_ab_command(&args).await,
 		"q17-census" => q17_census_command(&args).await,
 		"q03-plan-proof" => q03_plan_proof_command(&args).await,
 		"polars-q03-value-gate" => polars_q03_value_gate_command(&args),
@@ -158,6 +160,40 @@ async fn timing_atlas_command(args: &[String]) -> ExitCode {
 			println!(
 				"tpch_timing_atlas published={} timing_authority=true",
 				path.display()
+			);
+			ExitCode::SUCCESS
+		}
+		Err(message) => harness_error(&message),
+	}
+}
+
+/// ADR 555: compare controlled affinity-only serialization with load-observing placement.
+/// This is deliberately distinct from `timing-atlas`: placement policy is its independent
+/// variable, and a failed gate publishes a sealed withheld artifact instead of a verdict.
+async fn placement_ab_command(args: &[String]) -> ExitCode {
+	let scale_factor = match resolved_sf(args) {
+		Ok(scale_factor) => scale_factor,
+		Err(message) => return harness_error(&message),
+	};
+	let mode = flag_value(args, "--mode").unwrap_or("strict");
+	let data_root = data_dir_from_args(args);
+	let output = PathBuf::from(
+		flag_value(args, "--output").unwrap_or("target/tpch/placement_ab/placement_ab.jsonl"),
+	);
+	for rejected in ["--pairs", "--warmups", "--runs", "--query"] {
+		if flag_value(args, rejected).is_some() {
+			return harness_error(&format!(
+				"placement A/B takes no {rejected}: ADR 555 fixes the paired cohort and order before measurement"
+			));
+		}
+	}
+	match run_placement_ab(mode, scale_factor, &data_root, &output).await {
+		Ok(run) => {
+			println!(
+				"tpch_placement_ab published={} paired_timing_authority={} withheld_reasons={:?}",
+				run.path.display(),
+				run.paired_timing_authority,
+				run.withheld_reasons,
 			);
 			ExitCode::SUCCESS
 		}
@@ -5305,7 +5341,7 @@ fn harness_error(message: &str) -> ExitCode {
 
 fn usage() -> ExitCode {
 	eprintln!(
-		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
+		"usage: toron-tpch <status|prepare|run|matrix|correctness|correctness-matrix|perf|adr449-gate-zero|q03-plan-proof|q17-census|fragment-census|execution-census|timing-atlas|placement-ab> [--query q06|all] [--mode dev|strict] [--sf 0.01] [--allow-blocked] [--runs 7] [--warmup 1] [--paired-ablation] [--engines toron|rune|duckdb|polars_sql|toron,duckdb] [--data-source memory|parquet] [--data-dir target/tpch/data] [--output-dir target/tpch/perf]"
 	);
 	ExitCode::from(2)
 }

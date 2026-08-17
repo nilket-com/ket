@@ -20,7 +20,7 @@ use crate::distributed::task_state::{
 	AcceptanceState, AttemptState, CancelledTaskCount, InvalidatedTask, TaskKey, TaskStateStore,
 };
 use crate::distributed::worker_registry::{
-	PlacementHints, UnixMillis, WorkerEntry, WorkerRegistry,
+	PlacementHints, UnixMillis, WorkerEntry, WorkerRegistry, WorkerReservation,
 };
 use crate::error::TaskFailureKind;
 use crate::exec::runtime_filter::{
@@ -128,6 +128,10 @@ struct TaskAttemptCompletion {
 	key: TaskKey,
 	identity: TaskIdentity,
 	worker_id: WorkerId,
+	/// Released on drop, so completion, failure, and cancellation are all covered
+	/// without four manually synchronised decrements (ADR 555 §3, §4).
+	#[allow(dead_code)]
+	reservation: WorkerReservation,
 	spec: TaskSpec,
 	dispatch_wait_micros: u64,
 	outcome: DispatchOutcome,
@@ -301,11 +305,16 @@ where
 						continue;
 					}
 
-					let worker_id = self
+					// ADR 555 §3: acquisition yields an owned reservation, and the
+					// increment happens under the registry's write lock so the next
+					// selector sees it. Affinity still wins when its worker is live
+					// (§5); only the fallback consults load.
+					let reservation = self
 						.preferred_live_consumer_worker(stage, task, stages)
-						.filter(|worker_id| self.registry.resolve(*worker_id).is_some())
-						.or_else(|| self.registry.select_for_attempt(&PlacementHints))
+						.and_then(|worker_id| self.registry.reserve(worker_id))
+						.or_else(|| self.registry.select_and_reserve(&PlacementHints))
 						.ok_or(SchedulerError::NoLiveWorker)?;
+					let worker_id = reservation.worker_id();
 					let worker = self
 						.registry
 						.resolve(worker_id)
@@ -337,6 +346,10 @@ where
 						spec.context.trace_context = Some(trace_context);
 					}
 					in_flight.push(Box::pin(async move {
+						// The future is the reservation's single owner. An early `?`
+						// from this loop drops `in_flight`, dropping pending futures
+						// and releasing their reservations — no manual path needed.
+						let reservation = reservation;
 						let dispatch_started = Instant::now();
 						let outcome = dispatcher
 							.dispatch(&worker, &spec)
@@ -346,6 +359,10 @@ where
 							key,
 							identity: spec.identity,
 							worker_id,
+							// Carried out so the reservation is released when the
+							// completion is handled or dropped, whichever happens —
+							// covering every terminal outcome by ownership.
+							reservation,
 							spec,
 							dispatch_wait_micros: duration_micros(dispatch_started),
 							outcome,
