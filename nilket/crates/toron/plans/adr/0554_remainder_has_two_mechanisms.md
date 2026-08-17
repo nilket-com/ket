@@ -1,10 +1,8 @@
 # ADR 554 - The remainder has two mechanisms, not one
 
-**Status:** Proposed 2026-08-15. **Branch B implemented and closed**
-(`6ba18ade`, `ab09c804`, `237fb575`, `9d1c1c36`); its placement successor is
-ADR 555. **Branch A not started** — fused aggregate compute is still unbracketed,
-so the in-task residual remains unnamed, and the two Acceptance gates that depend
-on it are unmet.
+**Status:** **Closed as measured, 2026-08-16.** Both branches instrumented,
+run, and reconciled. Branch B's placement successor is ADR 555; Branch A's
+q06 follow-on is named below as a hypothesis, not a measurement.
 
 ## Context
 
@@ -56,6 +54,46 @@ evidence, and its own record. Neither result licenses a conclusion about the
 other.
 
 ### 2. Branch A — in-task unbracketed work, as a named remainder subterm
+
+**Measured 2026-08-16** on an authoritative SF=8 run (`845a9c9b118f`, no replay
+violations, so the node-sum invariant held on live data). The result **splits**,
+and both halves are recorded with equal standing.
+
+Medians over 7 pairs:
+
+| cell | accumulation | in-task unnamed | unnamed residual | remainder |
+|---|---:|---:|---:|---:|
+| q06 | 4.4 | 541.5 | 95.4 | 641.4 |
+| q13 | **1,992.2** | 724.2 | 297.7 | 3,008.5 |
+| q14 | 17.5 | 157.7 | 287.7 | 462.3 |
+| q19 | 0 | 2.3 | 569.5 | 571.8 |
+
+**q13 — confirmed, and node-auditable.** Accumulation names ~66% of the cell's
+remainder, and per-node detail shows it concentrated in a single task
+(stage 1 task 0 at ~1,967 ms), not smeared across the plan. Replay checks the
+path total against the sum over the selected path's nodes, so the figure is
+auditable rather than asserted. This is the largest single attribution in the
+arc.
+
+**q06 — falsified for this cell, and not a coverage gap.** Its two tasks separate
+the question: the **aggregate** task recorded 5.6 ms of accumulation — so the
+counter fired and the path is instrumented — while the **scan** task carried
+535.4 ms of `framework_overhead` and performs no aggregation at all. Aggregate
+accumulation is genuinely cheap here; the material in-task cost is elsewhere.
+
+That distinction was only decidable with per-node emission. An earlier run
+reported a correct path-level total with no node breakdown, and a near-zero total
+could not be told apart from an uninstrumented path.
+
+**The q06 follow-on is a hypothesis, not a measurement.** The residual sits on a
+task that does no aggregation, and the bracket deliberately excludes
+`apply_streaming_scan_input_ops` — filter and projection. A filter-dominated
+query is consistent with that being the cost. **Nothing here measures input
+processing**, and no claim about it is made; locating a residual on a task is not
+the same as attributing it. A separate term for scan input processing is the
+candidate follow-on, ahead of the post-loop finalization term this record
+deferred.
+
 
 Test fused aggregate compute by bracketing it, and report the result as a
 **named subterm of the remainder**. Never as an ADR 538 component.
@@ -262,14 +300,17 @@ Branch A follows independently, on its own cells.
 
 ## Acceptance
 
-- **The two branches are separable in evidence.** A cell's in-task and
-  outside-task figures move independently across the branches' instruments;
-  if one instrument moves both, the split in §1 was wrong and the record is
-  falsified rather than adjusted.
-- **Branch A attributes by bracket, not by residue.** The aggregate subterm is
-  the bracketed measurement; the control asserts that the residual bucket
-  shrinks by what the bracket claims, so an unbracketed activity cannot be
-  silently credited to aggregates.
+- **The two branches are separable in evidence.** **Met.** q13 carries 1,992 ms of
+  in-task accumulation against 298 ms outside-task; q19 carries 2 ms in-task
+  against 570 ms outside. The instruments move different cells, and neither
+  branch's instrument moved the other's figure.
+- **Branch A attributes by bracket, not by residue.** **Met.** The counter joins
+  `accounted`, so naming shrinks `framework_overhead` by the same amount; a
+  control fails if that wiring is removed. A second control fails if the harness
+  reports the figure without removing it from the unnamed residual — the failure
+  an earlier run actually shipped, which relocated time rather than naming it.
+  A third requires the path total to equal the sum over the selected path's
+  nodes, so a total cannot outrun its evidence.
 - **Branch B accounts for q14 and q19 in the artifact**, not in an argument: the
   B1 slack already reported plus the B2 intervals a new instrument names sum,
   within the declared tolerance, to each cell's `unnamed_residual_ms`.
@@ -322,6 +363,23 @@ instrument is its own decision.
 The two branches may interact through the critical path: time that moves from
 outside a task to inside one, or the reverse, changes both figures. The
 separability gate in Acceptance exists to detect exactly that.
+
+## Outcome
+
+**Branch A splits.** Aggregate accumulation is a major named subterm for q13 and
+is falsified for q06, where the aggregate stage is covered and cheap and the
+material residual sits on the scan task.
+
+**Branch B is fully reconciled.** Its outside-task residual is per-task
+coordinator slack plus `loop_non_path_ms`, and the latter is **serialized
+off-path sibling execution** under single-worker placement — real work that
+selected-path attribution cannot see by construction. That is a property of the
+attribution model, not an engine defect; the placement question it raised is
+ADR 555.
+
+Both branches are therefore accounted for, and the record closes. What remains
+open are two named successors — ADR 555 for placement, and a scan input
+processing term as q06's hypothesis — neither of which this record measures.
 
 ## Forward
 
