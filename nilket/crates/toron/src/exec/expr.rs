@@ -702,7 +702,151 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_exp(&args[0]),
+		(
+			ScalarFunctionEvaluator::Sqrt,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_unary_float(&args[0], "SQRT", f32::sqrt, f64::sqrt),
+		(
+			ScalarFunctionEvaluator::Pow,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_pow(&args[0], &args[1]),
+		(
+			ScalarFunctionEvaluator::Abs,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_abs(&args[0]),
 	}
+}
+
+fn evaluate_unary_float(
+	input: &ArrayRef,
+	name: &'static str,
+	float32: fn(f32) -> f32,
+	float64: fn(f64) -> f64,
+) -> Result<ArrayRef, ExecutionError> {
+	if let Some(input) = input.as_any().downcast_ref::<Float32Array>() {
+		return Ok(Arc::new(Float32Array::from_iter(
+			input.iter().map(|value| value.map(float32)),
+		)) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Float64Array>() {
+		return Ok(Arc::new(Float64Array::from_iter(
+			input.iter().map(|value| value.map(float64)),
+		)) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"{name} expects Float32 or Float64 input, got {:?}",
+			input.data_type()
+		),
+	})
+}
+
+fn evaluate_pow(base: &ArrayRef, exponent: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	if let (Some(base), Some(exponent)) = (
+		base.as_any().downcast_ref::<Float32Array>(),
+		exponent.as_any().downcast_ref::<Float32Array>(),
+	) {
+		return Ok(Arc::new(Float32Array::from_iter(
+			base.iter()
+				.zip(exponent.iter())
+				.map(|(base, exponent)| Some(base?.powf(exponent?))),
+		)) as ArrayRef);
+	}
+	if let (Some(base), Some(exponent)) = (
+		base.as_any().downcast_ref::<Float64Array>(),
+		exponent.as_any().downcast_ref::<Float64Array>(),
+	) {
+		return Ok(Arc::new(Float64Array::from_iter(
+			base.iter()
+				.zip(exponent.iter())
+				.map(|(base, exponent)| Some(base?.powf(exponent?))),
+		)) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"POW expects two arguments of the same float type, got {:?} and {:?}",
+			base.data_type(),
+			exponent.data_type()
+		),
+	})
+}
+
+/// `ABS` preserves its input type, so the magnitude of the most negative
+/// two's-complement value has no representation. That is an overflow, reported
+/// the way every other checked integer path here reports one, never a silent
+/// wrap back to the negative input.
+fn evaluate_abs(input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let overflow = |data_type: &DataType| ExecutionError::InvalidExpression {
+		message: format!("ABS overflows {data_type:?} for its most negative value"),
+	};
+	if let Some(input) = input.as_any().downcast_ref::<Int32Array>() {
+		let mut values = Vec::with_capacity(input.len());
+		for value in input.iter() {
+			values.push(match value {
+				Some(value) => Some(
+					value
+						.checked_abs()
+						.ok_or_else(|| overflow(input.data_type()))?,
+				),
+				None => None,
+			});
+		}
+		return Ok(Arc::new(Int32Array::from_iter(values)) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Int64Array>() {
+		let mut values = Vec::with_capacity(input.len());
+		for value in input.iter() {
+			values.push(match value {
+				Some(value) => Some(
+					value
+						.checked_abs()
+						.ok_or_else(|| overflow(input.data_type()))?,
+				),
+				None => None,
+			});
+		}
+		return Ok(Arc::new(Int64Array::from_iter(values)) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Float32Array>() {
+		return Ok(Arc::new(Float32Array::from_iter(
+			input.iter().map(|value| value.map(f32::abs)),
+		)) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Float64Array>() {
+		return Ok(Arc::new(Float64Array::from_iter(
+			input.iter().map(|value| value.map(f64::abs)),
+		)) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Decimal128Array>() {
+		let (precision, scale) = match input.data_type() {
+			DataType::Decimal128(precision, scale) => (*precision, *scale),
+			other => {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!("ABS expects a numeric input, got {other:?}"),
+				});
+			}
+		};
+		let mut values = Vec::with_capacity(input.len());
+		for value in input.iter() {
+			values.push(match value {
+				Some(value) => Some(
+					value
+						.checked_abs()
+						.ok_or_else(|| overflow(input.data_type()))?,
+				),
+				None => None,
+			});
+		}
+		return Ok(Arc::new(
+			Decimal128Array::from_iter(values).with_precision_and_scale(precision, scale)?,
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!("ABS expects a numeric input, got {:?}", input.data_type()),
+	})
 }
 
 fn evaluate_exp(input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
@@ -2668,5 +2812,44 @@ mod tests {
 			),
 			other => panic!("expected kernel error, got {other:?}"),
 		}
+	}
+
+	/// `|i32::MIN|` has no `i32`, and wrapping would return the negative input
+	/// as though it were a magnitude. The row-level failure has to surface.
+	#[test]
+	fn abs_reports_overflow_rather_than_wrapping() {
+		let input = Arc::new(Int32Array::from(vec![Some(i32::MIN)])) as ArrayRef;
+		let err = super::evaluate_abs(&input).expect_err("i32::MIN has no absolute value");
+		match err {
+			ExecutionError::InvalidExpression { message } => assert!(
+				message.contains("ABS overflows"),
+				"expected an overflow report, got {message:?}"
+			),
+			other => panic!("expected an invalid-expression error, got {other:?}"),
+		}
+
+		let wrapping = i32::MIN.wrapping_abs();
+		assert_eq!(
+			wrapping,
+			i32::MIN,
+			"wrapping_abs returns the input unchanged, which is the value this must never produce"
+		);
+	}
+
+	#[test]
+	fn abs_preserves_decimal_precision_and_scale() {
+		let input = Arc::new(
+			Decimal128Array::from(vec![Some(-12_345_i128), None])
+				.with_precision_and_scale(15, 2)
+				.expect("decimal fixture"),
+		) as ArrayRef;
+		let output = super::evaluate_abs(&input).expect("decimal ABS");
+		assert_eq!(output.data_type(), &DataType::Decimal128(15, 2));
+		let values = output
+			.as_any()
+			.downcast_ref::<Decimal128Array>()
+			.expect("decimal output");
+		assert_eq!(values.value(0), 12_345);
+		assert!(values.is_null(1), "NULL must propagate");
 	}
 }

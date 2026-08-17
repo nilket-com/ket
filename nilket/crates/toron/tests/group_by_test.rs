@@ -1816,6 +1816,126 @@ async fn adr553_sql_and_rune_exp_share_a_bound_plan_and_digest() {
 }
 
 #[tokio::test]
+async fn adr553_sql_and_rune_pow_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT POW(price, score) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([pow(col("price"), col("score"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL POW");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune pow");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL POW digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune pow digest")
+	);
+}
+
+#[tokio::test]
+async fn adr553_sql_and_rune_sqrt_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT SQRT(price) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([sqrt(col("price"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL SQRT");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune sqrt");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL SQRT digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune sqrt digest")
+	);
+}
+
+/// `ABS` keeps the input's own type. Under a float-only signature every one of
+/// these but `price` would be rejected, so this is what separates
+/// `UnaryNumericPreserving` from reusing `EXP`'s rule.
+#[tokio::test]
+async fn adr553_abs_preserves_each_numeric_input_type() {
+	let (catalog, _) = fixture();
+	for (column, expected) in [
+		("amount", DataType::Int32),
+		("id", DataType::Int64),
+		("rating32", DataType::Float32),
+		("price", DataType::Float64),
+		("decimal_price", DataType::Decimal128(15, 2)),
+	] {
+		let logical = plan_sql(&format!("SELECT ABS({column}) FROM sales"));
+		let bound = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|error| panic!("bind ABS({column}): {error:?}"));
+		assert_eq!(
+			bound.schema().field(0).data_type(),
+			&expected,
+			"ABS({column}) must preserve its input type"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr553_abs_rejects_a_non_numeric_input() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT ABS(region) FROM sales");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("ABS of a string should not bind");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("ABS expects a numeric input")),
+		"expected a numeric-domain rejection, got {err:?}"
+	);
+}
+
+/// Mixed float widths are refused rather than promoted. Promotion would be a
+/// decision about the engine's coercion rules, and this locks that it has not
+/// been made silently inside one function's binder arm.
+#[tokio::test]
+async fn adr553_pow_rejects_mixed_float_widths() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT POW(price, rating32) FROM sales");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("POW across float widths should not bind");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("same float type")),
+		"expected a mixed-width rejection, got {err:?}"
+	);
+}
+
+/// Registry arity is enforced at SQL lowering, before binding ever sees the
+/// call, so the rejection is a frontend error rather than a type mismatch.
+#[tokio::test]
+async fn adr553_pow_rejects_a_single_argument() {
+	assert_unsupported_message(
+		"SELECT POW(price) FROM sales",
+		"POW expects exactly two arguments, got 1",
+	);
+}
+
+#[tokio::test]
 async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");
 	let rune_logical = rune_plan(

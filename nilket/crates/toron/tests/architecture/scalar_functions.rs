@@ -66,6 +66,16 @@ fn enum_variant_names(enum_body: &str) -> BTreeSet<String> {
 		.collect()
 }
 
+/// The `SCALAR_FUNCTIONS` slice body — a bracket list rather than a brace block.
+fn scalar_functions_list(registry: &str) -> String {
+	registry
+		.split_once("pub const SCALAR_FUNCTIONS")
+		.and_then(|(_, rest)| rest.split_once(';'))
+		.expect("SCALAR_FUNCTIONS declaration")
+		.0
+		.to_string()
+}
+
 fn scalar_function_variant_problems(expr_body: &str) -> Vec<String> {
 	let observed = enum_variant_names(expr_body)
 		.into_iter()
@@ -110,11 +120,6 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 		.next()
 		.expect("Expr enum body")
 		.1;
-	let exp_metadata = brace_blocks_after_marker(&registry, "const EXP: ScalarFunctionMetadata")
-		.into_iter()
-		.next()
-		.expect("EXP metadata body")
-		.1;
 	let bound_expr_nodes = brace_blocks_after_marker(&execution_ir, "pub enum BoundExprNode")
 		.into_iter()
 		.next()
@@ -133,34 +138,69 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 	);
 	assert!(bound_scalar_function.contains("id: ScalarFunctionId"));
 	assert!(bound_scalar_function.contains("args: Vec<BoundExprId>"));
-	assert_eq!(
-		enum_variant_names(
-			&brace_blocks_after_marker(&registry, "pub enum ScalarFunctionId")
-				.into_iter()
-				.next()
-				.expect("ScalarFunctionId enum body")
-				.1
-		),
-		BTreeSet::from(["Exp".to_string()])
+	let registered_ids = enum_variant_names(
+		&brace_blocks_after_marker(&registry, "pub enum ScalarFunctionId")
+			.into_iter()
+			.next()
+			.expect("ScalarFunctionId enum body")
+			.1,
 	);
-	for property in [
-		"id: ScalarFunctionId::Exp",
-		"sql_name: \"EXP\"",
-		"rune_name: \"exp\"",
-		"pbc_pushdown_eligible: false",
-		"non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates",
-		"evaluator: ScalarFunctionEvaluator::Exp",
-	] {
+	assert_eq!(
+		registered_ids,
+		BTreeSet::from([
+			"Abs".to_string(),
+			"Exp".to_string(),
+			"Pow".to_string(),
+			"Sqrt".to_string(),
+		]),
+		"admitting a function is a review decision; update this set deliberately"
+	);
+
+	// Every identifier must carry a complete registration. An id without
+	// metadata compiles and only fails when a query reaches the lookup.
+	for id in &registered_ids {
+		let metadata = brace_blocks_after_marker(
+			&registry,
+			&format!("const {}: ScalarFunctionMetadata", id.to_uppercase()),
+		)
+		.into_iter()
+		.next()
+		.unwrap_or_else(|| panic!("{id} has no ScalarFunctionMetadata const"))
+		.1;
+		for property in [
+			format!("id: ScalarFunctionId::{id}"),
+			format!("evaluator: ScalarFunctionEvaluator::{id}"),
+			"sql_name: \"".to_string(),
+			"rune_name: \"".to_string(),
+			"arity: ScalarFunctionArity::".to_string(),
+			"signature: ScalarFunctionSignature::".to_string(),
+			"null_behavior: ScalarFunctionNullBehavior::".to_string(),
+			"non_finite_behavior: ScalarFunctionNonFiniteBehavior::".to_string(),
+			"pbc_pushdown_eligible: ".to_string(),
+		] {
+			assert!(
+				metadata.contains(&property),
+				"{id} metadata missing {property}"
+			);
+		}
+		let rune_name = metadata
+			.split_once("rune_name: \"")
+			.and_then(|(_, rest)| rest.split_once('"'))
+			.expect("rune_name literal")
+			.0
+			.to_string();
 		assert!(
-			exp_metadata.contains(property),
-			"EXP metadata missing {property}"
+			rune.contains(&format!("m.function([\"{rune_name}\"], {rune_name})")),
+			"{id} is registered but not reachable from Rune as {rune_name}"
+		);
+		assert!(
+			scalar_functions_list(&registry).contains(&id.to_uppercase()),
+			"{id} has metadata but is absent from SCALAR_FUNCTIONS, so lookups panic"
 		);
 	}
-	assert!(registry.contains("pub const SCALAR_FUNCTIONS"));
 	assert!(binder.contains("fn bind_scalar_function"));
 	assert!(evaluator.contains("fn evaluate_scalar_function"));
 	assert!(planner.contains("fn lower_scalar_function"));
-	assert!(rune.contains("m.function([\"exp\"], exp)"));
 }
 
 #[test]

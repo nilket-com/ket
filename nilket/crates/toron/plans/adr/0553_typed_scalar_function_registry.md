@@ -1,6 +1,8 @@
 # ADR 553 - Typed scalar function registry
 
-**Status:** Proposed 2026-08-15. No implementation.
+**Status:** Proposed 2026-08-15. **Implemented and measured 2026-08-17.** The
+mechanism landed with `EXP` as its reference function; `SQRT`, `POW`, and `ABS`
+followed as the cut that measures it. §Forward records what they cost.
 
 ## Context
 
@@ -143,6 +145,40 @@ not accumulating special-purpose plan nodes.
 
 `exp`, `pow`, `sqrt`, `abs` and their neighbours are the following cut and the
 measure of whether this worked.
+
+**Measured 2026-08-17.** `SQRT`, `POW`, and `ABS` landed together and touched four
+source files: the registry, the binder's signature module, the evaluator, and the
+Rune surface. Nothing planner-wide changed — `sql_planner.rs`, `pbc.rs`,
+`binder.rs`, `expression_walk.rs`, `outer_join_demotion.rs`, `ir.rs`, and
+`ir/execution.rs` are all untouched by the three additions, and the `Expr` variant
+count is unchanged at six grandfathered plus the generic one. Under the old
+pattern each of the three would have been a variant and a planner-wide edit.
+
+`SQRT` is the cheapest case and the clearest evidence: it reuses `EXP`'s type rule
+verbatim, so it is a registration, an evaluator arm, and a Rune line.
+
+**The metadata shape held, with two additions the record anticipated.** `POW` is
+binary, which `ScalarFunctionArity::Exact` already expressed, and `ABS` preserves
+integers and decimals rather than producing floats. Each needed a
+`ScalarFunctionSignature` variant and a matching binder arm — one enum and one
+`match` in a single file, which is what a type rule genuinely differing is
+supposed to cost. No property had to be added to `ScalarFunctionMetadata` and no
+consumer of it changed, so the Risks section's "the metadata set is a guess"
+survived contact with function two.
+
+Two decisions inside those rules are deliberately narrow and locked by tests that
+fail against the alternative. `POW` refuses mixed float widths rather than
+promoting, because promotion is a decision about the engine's coercion rules and
+does not belong inside one function's binder arm. `ABS` reports overflow for the
+most negative two's-complement value, matching the checked-arithmetic convention
+the engine already uses, rather than wrapping and returning the negative input as
+a magnitude.
+
+**Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
+registry has no field saying so. Nothing consumes such a field today, so adding
+one now would be speculative. It becomes real the moment a rule wants to know
+whether a function may be evaluated speculatively — constant folding is the likely
+first caller.
 
 **Series and grid generation is explicitly not this record.** It produces rows, so
 it is a cardinality and costing decision with its own benchmarks, not a scalar

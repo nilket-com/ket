@@ -1012,6 +1012,33 @@ pub fn exp(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn sqrt(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Sqrt,
+			args: vec![expr.expr],
+		},
+	}
+}
+
+pub fn pow(base: RuneExpr, exponent: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Pow,
+			args: vec![base.expr, exponent.expr],
+		},
+	}
+}
+
+pub fn abs(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Abs,
+			args: vec![expr.expr],
+		},
+	}
+}
+
 pub fn count_all() -> RuneAggr {
 	RuneAggr {
 		func: AggregateFunction::CountAll,
@@ -1556,6 +1583,9 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["date_trunc"], date_trunc).build()?;
 	m.function(["at_time_zone"], at_time_zone).build()?;
 	m.function(["exp"], exp).build()?;
+	m.function(["sqrt"], sqrt).build()?;
+	m.function(["pow"], pow).build()?;
+	m.function(["abs"], abs).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
 	m.function(["count_all"], count_all).build()?;
