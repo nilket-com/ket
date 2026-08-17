@@ -5015,3 +5015,57 @@ fn product_0119_x_tick_labels_follow_their_ticks_and_keep_figure_clips() {
 		);
 	}
 }
+
+/// PRODUCT-0126 gate 4: the left band and the y-axis title are one authority.
+///
+/// This is a direct-shape source guard in the PRODUCT-0077 idiom: it proves the
+/// title draw path names the shared guide and not the raw offset, not that no
+/// helper it calls could reintroduce one. That limit is the instrument's, and
+/// the behavioural sequence gates in `plot/common.rs` carry the geometry claim.
+#[test]
+fn product_0126_the_y_axis_title_draw_path_reads_only_the_shared_left_guide() {
+	let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read common");
+	let draw_axis_labels = common
+		.split("fn draw_axis_labels(")
+		.nth(1)
+		.and_then(|rest| rest.split("\nimpl<'a> Program<PlotMessage>").next())
+		.expect("bounded draw_axis_labels body");
+
+	// The positive control: without this the absence assertion below would pass
+	// for a body that had simply stopped drawing the title at all.
+	assert!(
+		draw_axis_labels.contains("VerticalGuideBands::y_axis_guides("),
+		"the title draw path must derive its placement from the shared left guide"
+	);
+	assert!(
+		!draw_axis_labels.contains("y_label_padding"),
+		"PRODUCT-0126 leaves no independent y_label_padding placement authority"
+	);
+
+	// The reservation is the only production consumer of the raw offset, and it
+	// reads it inside the guide that also places the title. Every other
+	// production mention must be the field's own declaration or default.
+	// Bound on the test *modules*, not on `#[cfg(test)]`: the latter also marks
+	// inline test-only helpers far above them and would truncate production.
+	let production = common
+		.split("\n#[cfg(test)]\nmod ")
+		.next()
+		.expect("bounded production source");
+	let reads: Vec<&str> = production
+		.lines()
+		.map(str::trim)
+		.filter(|line| line.contains("y_label_padding"))
+		.filter(|line| {
+			!line.starts_with("//")
+				&& !line.starts_with("///")
+				&& *line != "pub y_label_padding: f32,"
+				&& *line != "y_label_padding: 85.0,"
+		})
+		.collect();
+	assert_eq!(
+		reads,
+		vec![".y_label_padding"],
+		"y_label_padding survives as exactly one guide-owned floor"
+	);
+}

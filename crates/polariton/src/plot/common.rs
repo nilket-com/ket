@@ -1418,6 +1418,21 @@ pub(crate) struct XAxisGuideLayout {
 	pub(crate) bottom: f32,
 }
 
+/// PRODUCT-0126's shared left-guide derivation.
+///
+/// The left edge has the same two-occupant shape as the bottom: a tick run and
+/// an optional axis title that must clear it. PRODUCT-0114 treated them as
+/// alternatives, so a long y-tick label and the rotated title competed for one
+/// maximum and drew through each other. This mirrors [`XAxisGuideLayout`]
+/// deliberately: two parallel types make an asymmetry between the edges a
+/// visible diff rather than a silent omission.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct YAxisGuideLayout {
+	pub(crate) tick_end: f32,
+	pub(crate) title_x: Option<f32>,
+	pub(crate) left: f32,
+}
+
 impl VerticalGuideBands {
 	pub(crate) const FACET_LABEL_TOP_INSET: f32 = 8.0;
 
@@ -1491,14 +1506,12 @@ impl VerticalGuideBands {
 			.map(PlotPaddingPixels::pixels)
 			.map(|authored| derived_bottom.max(authored))
 			.unwrap_or(derived_bottom);
-		let derived_left = if requirements.y.is_empty() {
-			0.0
-		} else {
-			let title = (!matches!(&settings.y_label, ResolvedPresence::Hide))
-				.then_some(settings.y_label_padding + settings.y_label_size.pixels())
-				.unwrap_or(0.0);
-			(10.0 + requirements.estimated_y_width(settings.y_tick_size.pixels())).max(title)
-		};
+		let derived_left = Self::y_axis_guides(
+			requirements,
+			!matches!(&settings.y_label, ResolvedPresence::Hide),
+			settings,
+		)
+		.left;
 		let left = settings
 			.authored_plot_padding_left
 			.map(PlotPaddingPixels::pixels)
@@ -1544,6 +1557,57 @@ impl VerticalGuideBands {
 			tick_end,
 			title_top,
 			bottom,
+		}
+	}
+
+	/// The gap between a tick's axis line and the right edge of its label ink.
+	///
+	/// Every shared-band y-tick draw site anchors right-aligned text at
+	/// `tick.x - 10.0`; this is that same constant read by the reservation.
+	pub(crate) const Y_TICK_LABEL_OFFSET: f32 = 10.0;
+
+	/// Clearance between the y-tick run and the y-axis title.
+	///
+	/// Unlike the bottom edge, the left edge has no data-independent legacy
+	/// tick extent to subtract from `y_label_padding`: a tick reaches into the
+	/// bottom band by its font height but into the left band by its *width*.
+	/// So this is banked rather than derived, and
+	/// `product_0126_stage_0_banks_a_gap_the_legacy_short_label_geometry_affords`
+	/// pins it below the clearance the accepted short-numeric geometry already
+	/// leaves. It is a single guide-layout constant, not an authored setting:
+	/// `y_label_padding` remains the floor, so an author who moves the title
+	/// still moves it.
+	pub(crate) const Y_AXIS_TITLE_GAP: f32 = 6.0;
+
+	pub(crate) fn y_axis_guides(
+		requirements: &BandRequirements,
+		y_label_visible: bool,
+		settings: &ResolvedPlotSettings,
+	) -> YAxisGuideLayout {
+		if requirements.y.is_empty() {
+			return YAxisGuideLayout {
+				tick_end: 0.0,
+				title_x: None,
+				left: 0.0,
+			};
+		}
+		let tick_end = Self::Y_TICK_LABEL_OFFSET
+			+ requirements.estimated_y_width(settings.y_tick_size.pixels());
+		let title_x = y_label_visible.then(|| {
+			// Below the legacy offset this preserves the historical 85 px title
+			// position. Once the tick run reaches farther, the title follows it
+			// outward instead of being drawn inside it.
+			settings
+				.y_label_padding
+				.max(tick_end + Self::Y_AXIS_TITLE_GAP)
+		});
+		let left = title_x
+			.map(|x| x + settings.y_label_size.pixels())
+			.unwrap_or(tick_end);
+		YAxisGuideLayout {
+			tick_end,
+			title_x,
+			left,
 		}
 	}
 
@@ -1920,6 +1984,12 @@ impl<'a> PlotWidget<'a> {
 		plot_area: Rectangle,
 		requirements: &BandRequirements,
 	) {
+		// Radial and parallel layouts have no Cartesian axis band. Their kernels
+		// may still expose field names for diagnostics or hover, but drawing those
+		// names as axis titles has neither a placement nor a reservation.
+		if requirements.x.is_empty() && requirements.y.is_empty() {
+			return;
+		}
 		let x_label = self.resolved_x_label();
 		let y_label = resolve_canvas_text(&self.settings.y_label, Some(self.kernel.y_label()));
 		if let Some(x_label) = x_label {
@@ -1941,9 +2011,13 @@ impl<'a> PlotWidget<'a> {
 			});
 		}
 		if let Some(y_label) = y_label.filter(|label| !label.is_empty()) {
+			let guides = VerticalGuideBands::y_axis_guides(requirements, true, &self.settings);
+			let title_x = guides
+				.title_x
+				.expect("visible y-axis title has a shared guide placement");
 			backend.with_save(&mut |backend| {
 				backend.translate(iced::Vector::new(
-					plot_area.x - self.settings.y_label_padding,
+					plot_area.x - title_x,
 					plot_area.y + plot_area.height / 2.0,
 				));
 				backend.rotate(-std::f32::consts::FRAC_PI_2);
@@ -2967,8 +3041,12 @@ mod product_0106_vertical_guide_band_oracles {
 			VerticalGuideBands::resolve("", None, &settings).plot_area(bounds(), 6.0, &settings);
 		let staged = VerticalGuideBands::resolve_with_requirements("", None, &grid, &settings)
 			.plot_area(bounds(), 6.0, &settings);
-		assert_eq!(staged.x() - legacy.x(), 45.0);
-		assert_eq!(legacy.width() - staged.width(), 45.0);
+		// PRODUCT-0126 moved this fixture: its 135 px y-tick run overran the
+		// legacy 85 px title offset, so the former 45 px delta was the width of
+		// a band whose title drew inside its own ticks. The left edge now
+		// sequences them, and the exact growth is banked rather than waived.
+		assert_eq!(staged.x() - legacy.x(), 71.0);
+		assert_eq!(legacy.width() - staged.width(), 71.0);
 		assert_eq!(staged.height() - legacy.height(), 15.0);
 		assert_eq!(staged.y(), legacy.y());
 	}
@@ -3010,6 +3088,153 @@ mod product_0106_vertical_guide_band_oracles {
 			no_title.bottom, no_title.tick_end,
 			"an absent title consumes neither title clearance nor title height"
 		);
+	}
+
+	/// A short numeric axis whose tick run ends inside the legacy title offset.
+	///
+	/// The domain deliberately excludes zero. `formatted_label_candidates` adds
+	/// the `+/-0.000_999` branch boundary to any domain spanning it, and that
+	/// candidate formats as `1.0e-3` -- six characters, wider than the `100`
+	/// this axis will actually draw. A zero-based domain therefore already
+	/// reserves more left band than the legacy 85 px title offset. Every gate
+	/// below that claims "short labels do not move" depends on this fixture
+	/// really being short, so the banking test asserts it rather than assuming.
+	fn short_numeric_y() -> BandRequirements {
+		BandRequirements {
+			x: Vec::new(),
+			y: vec![AxisBandRequirement::Formatted {
+				domain: (1.0, 100.0),
+				axis_type: AxisType::Linear,
+			}],
+		}
+	}
+
+	#[test]
+	fn product_0126_stage_0_banks_a_gap_the_legacy_short_label_geometry_affords() {
+		let settings = ResolvedPlotSettings::default();
+		let guides = VerticalGuideBands::y_axis_guides(&short_numeric_y(), true, &settings);
+		let legacy_clearance = settings.y_label_padding - guides.tick_end;
+		assert!(
+			legacy_clearance > 0.0,
+			"the banked short-label fixture must be one the legacy geometry \
+			 actually placed without overlap, or every parity gate below is vacuous"
+		);
+		assert!(
+			VerticalGuideBands::Y_AXIS_TITLE_GAP <= legacy_clearance,
+			"a gap wider than {legacy_clearance} px would move short labels the \
+			 record promises not to move"
+		);
+	}
+
+	#[test]
+	fn product_0126_left_guides_sequence_the_title_after_a_long_tick_run() {
+		let settings = ResolvedPlotSettings::default();
+
+		// Short labels reduce to the legacy geometry exactly.
+		let short = VerticalGuideBands::y_axis_guides(&short_numeric_y(), true, &settings);
+		assert_eq!(
+			short.title_x,
+			Some(settings.y_label_padding),
+			"below the legacy offset the title keeps its accepted placement"
+		);
+		assert_eq!(
+			short.left,
+			settings.y_label_padding + settings.y_label_size.pixels()
+		);
+
+		// A tick run past the legacy offset pushes the title outside it. This is
+		// the Multivariate heatmap's shape: a long categorical y label.
+		let long = BandRequirements {
+			x: Vec::new(),
+			y: vec![AxisBandRequirement::Categories(vec![
+				"Reliability".to_owned(),
+			])],
+		};
+		let guides = VerticalGuideBands::y_axis_guides(&long, true, &settings);
+		let title_x = guides.title_x.expect("a visible title has a placement");
+		assert!(
+			guides.tick_end > settings.y_label_padding,
+			"the exhibit's tick run must actually overrun the legacy offset"
+		);
+		assert_eq!(
+			title_x,
+			guides.tick_end + VerticalGuideBands::Y_AXIS_TITLE_GAP,
+			"the left edge is a sequence: a maximum of the old arms cannot pass"
+		);
+		assert!(
+			title_x - guides.tick_end >= VerticalGuideBands::Y_AXIS_TITLE_GAP,
+			"the tick run and the title are disjoint by at least the banked gap"
+		);
+		assert_eq!(guides.left, title_x + settings.y_label_size.pixels());
+
+		// A hidden title spends no clearance on absent ink.
+		let hidden = VerticalGuideBands::y_axis_guides(&long, false, &settings);
+		assert_eq!(hidden.title_x, None);
+		assert_eq!(
+			hidden.left, hidden.tick_end,
+			"an absent title consumes neither title clearance nor title width"
+		);
+	}
+
+	#[test]
+	fn product_0126_reservation_and_placement_read_one_left_guide() {
+		let settings = ResolvedPlotSettings::default();
+		let long = BandRequirements {
+			x: Vec::new(),
+			y: vec![AxisBandRequirement::Categories(vec![
+				"Reliability".to_owned(),
+			])],
+		};
+		let guides = VerticalGuideBands::y_axis_guides(&long, true, &settings);
+		let reserved = VerticalGuideBands::resolve_with_requirements("", None, &long, &settings);
+		assert_eq!(
+			reserved.left, guides.left,
+			"the band and the title placement derive from one value"
+		);
+		// The title's ink starts at `title_x` left of the plot and extends
+		// `y_label_size` further out; the band must contain all of it.
+		assert!(
+			guides.title_x.expect("visible") + settings.y_label_size.pixels() <= reserved.left,
+			"the reserved band contains the placement it authorized"
+		);
+	}
+
+	#[test]
+	fn product_0126_the_y_tick_estimate_reserves_the_band_without_placing_ink() {
+		let settings = ResolvedPlotSettings::default();
+		let short = VerticalGuideBands::y_axis_guides(&short_numeric_y(), true, &settings);
+		let long = VerticalGuideBands::y_axis_guides(
+			&BandRequirements {
+				x: Vec::new(),
+				y: vec![AxisBandRequirement::Categories(vec![
+					"Reliability".to_owned(),
+				])],
+			},
+			true,
+			&settings,
+		);
+		assert!(long.left > short.left, "a longer run reserves a wider band");
+		// The estimate enters the guide only through `tick_end`, and `tick_end`
+		// is the fixed tick-relative offset plus the estimate. Nothing in the
+		// guide scales or repositions an individual label.
+		for (guides, requirements) in [
+			(short, short_numeric_y()),
+			(
+				long,
+				BandRequirements {
+					x: Vec::new(),
+					y: vec![AxisBandRequirement::Categories(vec![
+						"Reliability".to_owned(),
+					])],
+				},
+			),
+		] {
+			assert_eq!(
+				guides.tick_end - requirements.estimated_y_width(settings.y_tick_size.pixels()),
+				VerticalGuideBands::Y_TICK_LABEL_OFFSET,
+				"a longer estimate grows the band and never the tick-relative offset"
+			);
+		}
 	}
 
 	#[test]
@@ -3842,6 +4067,21 @@ mod product_0067_0068_strata_oracles {
 			render(layouts()[0].clone(), default, true),
 			render(layouts()[0].clone(), enlarged, true),
 			"hover is an iced overlay, so its size cannot alter canvas operations"
+		);
+	}
+
+	#[test]
+	fn radial_layouts_never_attempt_to_draw_cartesian_axis_titles() {
+		let mut radial_settings = settings();
+		radial_settings.x_label = ResolvedPresence::Show(Arc::new("stage".to_owned()));
+		radial_settings.y_label = ResolvedPresence::Show(Arc::new("value".to_owned()));
+
+		let operations = render(PlotLayout::Radial, radial_settings, true);
+		assert!(
+			!operations
+				.iter()
+				.any(|operation| matches!(operation, Operation::Text(_))),
+			"a radial layout has no shared Cartesian axis placement"
 		);
 	}
 
