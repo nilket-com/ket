@@ -11,9 +11,10 @@ use crate::plot::colors::ColorTheme;
 use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode, TickPlacement};
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::spec::{
-	BarWidth, CategoryGap, ColorJob, HoverTextSize, LayerSettings, LegendPosition, Override,
-	PlotPaddingPixels, PointSize, Presence, ResolvedPresence, StrokeWidth, SubtitleTextSize,
-	TickRotation, TitleTextSize, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
+	BarWidth, CategoryGap, ColorJob, FacetLabelTextSize, HoverTextSize, LayerSettings,
+	LegendPosition, Override, PlotPaddingPixels, PointSize, Presence, ResolvedPresence,
+	StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, XLabelTextSize, XTickTextSize,
+	YLabelTextSize, YTickTextSize,
 };
 use iced::Color;
 use libaryon::engine::UiPalette;
@@ -108,6 +109,7 @@ pub struct PlotTypography {
 	pub y_label_size: YLabelTextSize,
 	pub x_tick_size: XTickTextSize,
 	pub y_tick_size: YTickTextSize,
+	pub facet_label_size: FacetLabelTextSize,
 	pub legend_size: f32,
 	pub hover_size: HoverTextSize,
 	pub x_tick_rotation: TickRotation,
@@ -215,6 +217,9 @@ pub struct PlotSettingsLayer {
 	pub y_label_size: Override<YLabelTextSize>,
 	pub x_tick_size: Override<XTickTextSize>,
 	pub y_tick_size: Override<YTickTextSize>,
+	/// PRODUCT-0124: the facet-owned header size is partial so it never
+	/// reconstructs the complete typography carrier.
+	pub facet_label_size: Override<FacetLabelTextSize>,
 	/// PRODUCT-0112: a partial hover-size override avoids reconstructing the
 	/// whole typography carrier merely to size generated hover text.
 	pub hover_size: Override<HoverTextSize>,
@@ -273,6 +278,7 @@ impl Default for PlotSettingsLayer {
 			y_label_size: Override::Inherit,
 			x_tick_size: Override::Inherit,
 			y_tick_size: Override::Inherit,
+			facet_label_size: Override::Inherit,
 			hover_size: Override::Inherit,
 			x_tick_rotation: Override::Inherit,
 			plot_padding_top: Override::Inherit,
@@ -408,6 +414,7 @@ fn apply_layer(
 		settings.y_label_size = value.y_label_size;
 		settings.x_tick_size = value.x_tick_size;
 		settings.y_tick_size = value.y_tick_size;
+		settings.facet_label_size = value.facet_label_size;
 		settings.legend_size = value.legend_size;
 		settings.hover_size = value.hover_size;
 		settings.x_tick_rotation = value.x_tick_rotation;
@@ -431,6 +438,9 @@ fn apply_layer(
 	}
 	if let Override::Set(value) = layer.y_tick_size {
 		settings.y_tick_size = value;
+	}
+	if let Override::Set(value) = layer.facet_label_size {
+		settings.facet_label_size = value;
 	}
 	// PRODUCT-0112: the specific slot wins over the atomic typography carrier
 	// within a tier, just as PRODUCT-0091's partial continuous-ramp slots do.
@@ -574,6 +584,7 @@ mod tests {
 			y_label_size: YLabelTextSize::DEFAULT,
 			x_tick_size: XTickTextSize::DEFAULT,
 			y_tick_size: YTickTextSize::DEFAULT,
+			facet_label_size: FacetLabelTextSize::DEFAULT,
 			legend_size: 14.0,
 			hover_size,
 			x_tick_rotation: TickRotation::ZERO,
@@ -613,6 +624,40 @@ mod tests {
 			size(24.0),
 			"atomic typography still delivers hover size when the partial slot is absent"
 		);
+	}
+
+	#[test]
+	fn product_0124_facet_label_size_is_typed_partial_and_follows_all_five_tiers() {
+		let size = |pixels| FacetLabelTextSize::new(pixels).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.facet_label_size = size(6.0);
+		cascade.application_theme.facet_label_size = Override::Set(size(12.0));
+		cascade.authored_spec.facet_label_size = Override::Set(size(20.0));
+		cascade.layer.facet_label_size = Override::Set(size(32.0));
+		cascade.pane_override.facet_label_size = Override::Set(size(48.0));
+		assert_eq!(cascade.resolve().facet_label_size, size(48.0));
+
+		cascade.pane_override.facet_label_size = Override::Inherit;
+		assert_eq!(cascade.resolve().facet_label_size, size(32.0));
+		cascade.layer.facet_label_size = Override::Inherit;
+		assert_eq!(cascade.resolve().facet_label_size, size(20.0));
+		cascade.authored_spec.facet_label_size = Override::Inherit;
+		assert_eq!(cascade.resolve().facet_label_size, size(12.0));
+		cascade.application_theme.facet_label_size = Override::Inherit;
+		assert_eq!(cascade.resolve().facet_label_size, size(6.0));
+
+		cascade.authored_spec.typography = Override::Set(PlotTypography {
+			facet_label_size: size(24.0),
+			..typography(HoverTextSize::DEFAULT)
+		});
+		cascade.authored_spec.facet_label_size = Override::Set(size(36.0));
+		assert_eq!(
+			cascade.resolve().facet_label_size,
+			size(36.0),
+			"the partial facet slot wins over atomic typography within one tier"
+		);
+		cascade.authored_spec.facet_label_size = Override::Inherit;
+		assert_eq!(cascade.resolve().facet_label_size, size(24.0));
 	}
 
 	#[test]

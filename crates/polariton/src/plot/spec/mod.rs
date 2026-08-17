@@ -372,7 +372,7 @@ impl std::error::Error for SubtitleTextSizeError {}
 
 macro_rules! axis_text_size {
 	($name:ident, $error:ident, $description:literal, $default:expr) => {
-		/// PRODUCT-0122's logical-pixel size for one axis text role.
+		/// Logical-pixel size for one authorable canvas text role.
 		#[derive(Clone, Copy, Debug, PartialEq)]
 		pub struct $name(f32);
 
@@ -434,6 +434,12 @@ axis_text_size!(
 );
 axis_text_size!(XTickTextSize, XTickTextSizeError, "x-tick label size", 18.0);
 axis_text_size!(YTickTextSize, YTickTextSizeError, "y-tick label size", 18.0);
+axis_text_size!(
+	FacetLabelTextSize,
+	FacetLabelTextSizeError,
+	"facet label size",
+	16.0
+);
 
 /// PRODUCT-0019's unitless, linear line-stroke factor. Keep this distinct from
 /// `PointSize` until a third relative setting establishes a shared abstraction.

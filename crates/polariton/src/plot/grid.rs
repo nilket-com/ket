@@ -883,7 +883,9 @@ impl PlotComposite for PlotGridKernel {
 							cell_bounds.y() + VerticalGuideBands::FACET_LABEL_TOP_INSET,
 						),
 						color: resolved.chrome.title_text.iced(),
-						size: iced::Pixels(VerticalGuideBands::facet_label_size(&resolved)),
+						size: iced::Pixels(
+							VerticalGuideBands::facet_label_size(&resolved).pixels(),
+						),
 						align_x: iced::alignment::Horizontal::Center.into(),
 						align_y: iced::alignment::Vertical::Top,
 						..Default::default()
@@ -1395,6 +1397,7 @@ mod tests {
 	struct TextOperation {
 		content: String,
 		position: Point,
+		size: iced::Pixels,
 		align_x: iced::advanced::text::Alignment,
 		align_y: iced::alignment::Vertical,
 	}
@@ -1416,6 +1419,7 @@ mod tests {
 			self.texts.push(TextOperation {
 				content: text.content,
 				position: text.position + self.translation,
+				size: text.size,
 				align_x: text.align_x,
 				align_y: text.align_y,
 			});
@@ -1654,6 +1658,7 @@ mod tests {
 			x_label: ResolvedPresence::Hide,
 			y_label: ResolvedPresence::Hide,
 			legend: ResolvedPresence::Hide,
+			facet_label_size: crate::plot::spec::FacetLabelTextSize::new(24.0).unwrap(),
 			x_tick_placement: TickPlacement::step(25.0).expect("x step"),
 			y_tick_placement: TickPlacement::step(25.0).expect("y step"),
 			show_x_minor_ticks: false,
@@ -3924,7 +3929,17 @@ mod tests {
 				.y
 		};
 		let subtitle_bottom = y("Resolved subtitle") + resolved.subtitle_size.pixels();
-		let facet_bottom = y("East") + VerticalGuideBands::facet_label_size(&resolved);
+		let facet_bottom = y("East") + VerticalGuideBands::facet_label_size(&resolved).pixels();
+		assert_eq!(
+			backend
+				.texts
+				.iter()
+				.find(|text| text.content == "East")
+				.expect("facet label draw")
+				.size,
+			iced::Pixels(resolved.facet_label_size.pixels()),
+			"the facet header draw shares the resolved size with its reservation"
+		);
 		assert!(y("d3") >= subtitle_bottom);
 		assert!(y("d3") >= facet_bottom);
 		assert!(y("d7") >= facet_bottom);
@@ -3945,7 +3960,7 @@ mod tests {
 		assert_eq!(
 			plot.y() - cell.y(),
 			VerticalGuideBands::FACET_LABEL_TOP_INSET
-				+ VerticalGuideBands::facet_label_size(&resolved)
+				+ VerticalGuideBands::facet_label_size(&resolved).pixels()
 				+ resolved.plot_padding_top
 		);
 	}

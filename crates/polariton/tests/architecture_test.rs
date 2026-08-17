@@ -4058,7 +4058,7 @@ fn product_0106_vertical_guides_have_one_reservation_authority_and_no_measuremen
 	for required in [
 		"settings.title_offset + settings.title_size",
 		"settings.subtitle_offset + settings.subtitle_size",
-		"Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings)",
+		"Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings).pixels()",
 		"fn grid_tiled_area(",
 		"fn grid_cell_plot_area(",
 	] {
@@ -4332,8 +4332,8 @@ fn product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_block
 	assert!(common.contains("top_px.y - self.settings.x_label_size.pixels()"));
 	assert!(common.contains("size: iced::Pixels(self.settings.x_label_size.pixels())"));
 	assert!(!common.contains("size: iced::Pixels(22.0)"));
-	assert!(common.contains("facet_label_size(settings: &ResolvedPlotSettings) -> f32"));
-	assert!(common.contains("(settings.legend_size + 2.0).max(10.0)"));
+	assert!(common.contains("pub legend_size: f32"));
+	assert!(!common.contains("(settings.legend_size + 2.0).max(10.0)"));
 	let backend = common
 		.split("pub trait PlotBackend")
 		.nth(1)
@@ -4378,6 +4378,58 @@ fn product_0122_axis_and_tick_typography_is_typed_partial_and_keeps_legend_block
 	assert!(presentation.contains("padding() requires at least one edge modifier"));
 	assert!(presentation.contains("authored_settings.y_label_size = Override::Set(size);"));
 	assert!(presentation.contains("authored_settings.x_tick_size = Override::Set(size);"));
+}
+
+#[test]
+fn product_0124_facet_label_typography_is_typed_member_owned_and_independent_from_legend() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
+	assert!(spec.contains("FacetLabelTextSize"));
+	assert!(spec.contains("\"facet label size\""));
+	assert!(spec.contains("FacetLabelTextSizeError"));
+
+	let theme = std::fs::read_to_string(root.join("plot/theme.rs")).expect("read plot theme");
+	assert!(theme.contains("pub facet_label_size: FacetLabelTextSize"));
+	assert!(theme.contains("pub facet_label_size: Override<FacetLabelTextSize>"));
+	assert!(theme.contains("settings.facet_label_size = value.facet_label_size"));
+	assert!(theme.contains("settings.facet_label_size = value;"));
+	assert!(theme.contains("pub legend_size: f32"));
+
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot geometry");
+	assert!(common.contains("pub facet_label_size: FacetLabelTextSize"));
+	assert!(common.contains("Self::facet_label_size(settings).pixels()"));
+	assert!(common.contains("settings.facet_label_size"));
+	assert!(!common.contains("(settings.legend_size + 2.0).max(10.0)"));
+
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read plot grid");
+	assert!(grid.contains("VerticalGuideBands::facet_label_size(&resolved).pixels()"));
+	assert!(!grid.contains("legend_size"));
+
+	let presentation =
+		std::fs::read_to_string(root.join("rune_presentation.rs")).expect("read Rune surface");
+	assert!(presentation.contains("fn raw_figure_label_size("));
+	assert!(presentation.contains("FacetLabelTextSize::new"));
+	assert!(presentation.contains("facet(...).label_size(...) may appear at most once"));
+	assert!(presentation.contains("authored_settings.facet_label_size = Override::Set(size);"));
+	assert!(
+		presentation
+			.contains("label_size(...) requires an x_axis(), y_axis(), or facet(...) receiver")
+	);
+
+	let compiler =
+		std::fs::read_to_string(root.join("rune_view_compiler.rs")).expect("read view compiler");
+	let free = compiler
+		.split("const PRESENTATION_FREE")
+		.nth(1)
+		.and_then(|rest| rest.split("];\\n").next())
+		.expect("presentation free vocabulary");
+	assert!(!free.contains("\"facet_label_size\""));
+	let methods = compiler
+		.split("const PRESENTATION_METHODS")
+		.nth(1)
+		.and_then(|rest| rest.split("];\\n").next())
+		.expect("presentation method vocabulary");
+	assert!(methods.contains("\"label_size\""));
 }
 
 #[test]
@@ -4438,7 +4490,7 @@ fn product_0123_axis_members_are_the_only_axis_surface_and_merge_fieldwise() {
 		"fn raw_x_axis(",
 		"fn raw_y_axis(",
 		"fn raw_axis_label(",
-		"fn raw_axis_label_size(",
+		"fn raw_figure_label_size(",
 		"fn raw_axis_bounds(",
 		"fn raw_axis_tick_step(",
 		"fn raw_axis_minor_ticks(",

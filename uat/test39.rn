@@ -1,0 +1,15 @@
+// PRODUCT-0124: facet-owned header typography.
+//
+// test37 remains the long-label geometry probe. This compact exhibit shows
+// that the member which creates the grid owns both its gutter and header text.
+let sales = ket.table("demo_sales");
+
+sales.views([
+	view("facet-label-typography", figure([
+		title("Facet labels · their own typography"),
+		subtitle("The facet member owns both grid spacing and its category heading"),
+		skin("greys_rs2"),
+		facet("region").gutter(18).label_size(24),
+		bar("quarter", "revenue", "product").bar_width(0.9),
+	])),
+]);

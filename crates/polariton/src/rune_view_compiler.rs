@@ -1744,6 +1744,7 @@ mod tests {
 	use crate::plot::colors::ColorTheme;
 	use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 	use crate::plot::spec::ColorJob;
+	use crate::plot::spec::FacetLabelTextSize;
 	use crate::plot::spec::{BubbleNumericField, BubblePreparationChannel, Override, Presence};
 	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent};
 	use std::sync::Arc;
@@ -3638,6 +3639,22 @@ r.views([bar(category(), "revenue")])
 		assert!(source.contains("y_axis().label(\"Revenue · $k\").label_size(18)"));
 		assert!(
 			source.contains("y_axis().bounds(0, 50).tick_step(10).minor_ticks(1).tick_size(12)")
+		);
+	}
+
+	#[test]
+	fn product_0124_test39_is_the_facet_label_typography_reference_exhibit() {
+		let source = include_str!("../../../uat/test39.rn");
+		let compiled = compile(source).expect("the checked-in facet label exhibit compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("facet label exhibit produced a table");
+		};
+		assert_eq!(plot.facet.as_deref(), Some("region"));
+		assert_eq!(plot.facet_gutter, Some(18.0));
+		assert_eq!(
+			plot.authored_settings.facet_label_size,
+			Override::Set(FacetLabelTextSize::new(24.0).unwrap())
 		);
 	}
 }

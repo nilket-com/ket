@@ -11,8 +11,8 @@ use crate::plot::composition::PlotComposition;
 use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 use crate::plot::core::PlotType;
 use crate::plot::spec::{
-	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FunnelFields,
-	HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
+	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FacetLabelTextSize,
+	FunnelFields, HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
 	MultivariateFields, Override, PieFields, PlotPaddingPixels, PointSize, Presence,
 	RadialDialFields, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, ViolinFields,
 	XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
@@ -299,6 +299,8 @@ struct RuneFigureElement {
 	font_size_origin: Option<Origin>,
 	facet_gutter: Option<f32>,
 	facet_gutter_origin: Option<Origin>,
+	facet_label_size: Option<FacetLabelTextSize>,
+	facet_label_size_origin: Option<Origin>,
 	padding: FigurePadding,
 	padding_edge_origins: [Option<Origin>; 4],
 	axis: AxisProperties,
@@ -313,6 +315,8 @@ impl RuneFigureElement {
 			font_size_origin: None,
 			facet_gutter: None,
 			facet_gutter_origin: None,
+			facet_label_size: None,
+			facet_label_size_origin: None,
 			padding: FigurePadding::default(),
 			padding_edge_origins: [None; 4],
 			axis: AxisProperties::default(),
@@ -574,7 +578,7 @@ fn build_context() -> Result<Context, String> {
 		("__bottom", raw_figure_padding_bottom as RawFunction),
 		("__left", raw_figure_padding_left as RawFunction),
 		("__label", raw_axis_label as RawFunction),
-		("__label_size", raw_axis_label_size as RawFunction),
+		("__label_size", raw_figure_label_size as RawFunction),
 		("__bounds", raw_axis_bounds as RawFunction),
 		("__tick_step", raw_axis_tick_step as RawFunction),
 		("__minor_ticks", raw_axis_minor_ticks as RawFunction),
@@ -2058,7 +2062,7 @@ fn raw_axis_label(
 	store(out, stack, element)
 }
 
-fn raw_axis_label_size(
+fn raw_figure_label_size(
 	stack: &mut dyn Memory,
 	addr: InstAddress,
 	args: usize,
@@ -2066,36 +2070,88 @@ fn raw_axis_label_size(
 ) -> VmResult<()> {
 	let values = rune::vm_try!(stack.slice_at(addr, args));
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
-	let (mut element, axis) = match axis_receiver(values, origin, "label_size") {
-		Ok(receiver) => receiver,
-		Err(element) => return store(out, stack, element),
+	let mut element = match values
+		.first()
+		.cloned()
+		.map(rune::from_value::<RuneFigureElement>)
+	{
+		Some(Ok(element)) => element,
+		_ => RuneFigureElement::new(
+			Err(PresentationFailure::new(
+				origin,
+				"label_size(...) requires an x_axis(), y_axis(), or facet(...) receiver",
+			)),
+			origin,
+		),
+	};
+	if element.value.is_err() {
+		return store(out, stack, element);
+	}
+	let receiver = match element.value.as_ref() {
+		Ok(FigureElementKind::Axis(axis)) => Some(*axis),
+		Ok(FigureElementKind::Facet(_)) => None,
+		_ => {
+			element.value = Err(PresentationFailure::new(
+				origin,
+				"label_size(...) requires an x_axis(), y_axis(), or facet(...) receiver",
+			));
+			return store(out, stack, element);
+		}
 	};
 	if values.len() != 4 {
 		element.value = Err(PresentationFailure::new(
 			origin,
 			"label_size(...) takes exactly one numeric value",
 		));
-	} else if element.axis.label_size.is_some() {
-		element.value = Err(PresentationFailure::new(
-			origin,
-			format!("{}().label_size(...) may appear at most once", axis.name()),
-		));
 	} else {
-		let size = rune_number(&values[1])
-			.ok_or_else(|| {
-				PresentationFailure::new(origin, "label_size(...) requires a number".to_owned())
-			})
-			.and_then(|value| match axis {
-				Axis::X => XLabelTextSize::new(value as f32)
-					.map(AxisLabelSize::X)
-					.map_err(|error| PresentationFailure::new(origin, error.to_string())),
-				Axis::Y => YLabelTextSize::new(value as f32)
-					.map(AxisLabelSize::Y)
-					.map_err(|error| PresentationFailure::new(origin, error.to_string())),
-			});
-		match size {
-			Ok(size) => element.axis.label_size = Some((size, origin)),
-			Err(error) => element.value = Err(error),
+		match receiver {
+			Some(axis) if element.axis.label_size.is_some() => {
+				element.value = Err(PresentationFailure::new(
+					origin,
+					format!("{}().label_size(...) may appear at most once", axis.name()),
+				));
+			}
+			None if element.facet_label_size_origin.is_some() => {
+				element.value = Err(PresentationFailure::new(
+					origin,
+					"facet(...).label_size(...) may appear at most once",
+				));
+			}
+			Some(axis) => {
+				let size = rune_number(&values[1])
+					.ok_or_else(|| {
+						PresentationFailure::new(
+							origin,
+							"label_size(...) requires a number".to_owned(),
+						)
+					})
+					.and_then(|value| match axis {
+						Axis::X => XLabelTextSize::new(value as f32)
+							.map(AxisLabelSize::X)
+							.map_err(|error| PresentationFailure::new(origin, error.to_string())),
+						Axis::Y => YLabelTextSize::new(value as f32)
+							.map(AxisLabelSize::Y)
+							.map_err(|error| PresentationFailure::new(origin, error.to_string())),
+					});
+				match size {
+					Ok(size) => element.axis.label_size = Some((size, origin)),
+					Err(error) => element.value = Err(error),
+				}
+			}
+			None => match rune_number(&values[1])
+				.ok_or_else(|| {
+					PresentationFailure::new(origin, "label_size(...) requires a number".to_owned())
+				})
+				.and_then(|value| {
+					FacetLabelTextSize::new(value as f32)
+						.map_err(|error| PresentationFailure::new(origin, error.to_string()))
+				}) {
+				Ok(size) => {
+					element.facet_label_size = Some(size);
+					element.facet_label_size_origin = Some(origin);
+				}
+				Err(error) => element.value = Err(error),
+			},
 		}
 	}
 	store(out, stack, element)
@@ -3462,6 +3518,7 @@ struct FigureParts {
 	y_label_size: Option<(YLabelTextSize, Origin)>,
 	facet: Option<(String, Origin)>,
 	facet_gutter: Option<(f32, Origin)>,
+	facet_label_size: Option<(FacetLabelTextSize, Origin)>,
 	palette: Option<(String, Origin)>,
 	sequential_palette: Option<(ColorTheme, Origin)>,
 	diverging_palette: Option<(ColorTheme, Origin)>,
@@ -3496,6 +3553,7 @@ fn decode_figure(value: &Value, origin: Origin) -> Result<RunePlotIntent, Presen
 				kind,
 				element.font_size,
 				element.facet_gutter,
+				element.facet_label_size,
 				element.padding,
 				element.axis.clone(),
 				element.origin,
@@ -3589,6 +3647,7 @@ fn merge_element(
 	element: FigureElementKind,
 	font_size: Option<FigureTextSize>,
 	facet_gutter: Option<f32>,
+	facet_label_size: Option<FacetLabelTextSize>,
 	padding: FigurePadding,
 	axis_properties: AxisProperties,
 	origin: Origin,
@@ -3667,6 +3726,14 @@ fn merge_element(
 					(value, origin),
 					origin,
 					"facet(...).gutter(...) may appear at most once",
+				)?;
+			}
+			if let Some(value) = facet_label_size {
+				set_once(
+					&mut parts.facet_label_size,
+					(value, origin),
+					origin,
+					"facet(...).label_size(...) may appear at most once",
 				)?;
 			}
 			Ok(())
@@ -3880,6 +3947,9 @@ impl FigureParts {
 		}
 		if let Some((size, _)) = self.y_tick_size {
 			authored_settings.y_tick_size = Override::Set(size);
+		}
+		if let Some((size, _)) = self.facet_label_size {
+			authored_settings.facet_label_size = Override::Set(size);
 		}
 		if let Some((legend, _)) = self.legend {
 			authored_settings.legend = legend;
@@ -4169,6 +4239,57 @@ polariton_presentation::__bar("quarter", "sales", 58, 82)
 			Err(PresentationFailure {
 				span: 42..57,
 				message: "facet(...).gutter(...) may appear at most once".to_owned(),
+			})
+		);
+	}
+
+	#[test]
+	fn product_0124_facet_label_size_is_typed_and_owned_by_the_facet_member() {
+		let valid = r#"pub fn main() { [polariton_presentation::__figure([
+polariton_presentation::__facet("region", 10, 25).__gutter(24, 26, 41).__label_size(18, 42, 57),
+polariton_presentation::__bar("quarter", "sales", 58, 82)
+], 0, 83)] }"#;
+		let views = execute(valid, &[0..83]).expect("faceted label-size figure");
+		let RuneViewIntent::Plot(plot) = &views[0] else {
+			panic!("expected plot");
+		};
+		assert_eq!(plot.facet.as_deref(), Some("region"));
+		assert_eq!(plot.facet_gutter, Some(24.0));
+		assert_eq!(
+			plot.authored_settings.facet_label_size,
+			Override::Set(FacetLabelTextSize::new(18.0).unwrap())
+		);
+
+		for source in [
+			r#"pub fn main() { [polariton_presentation::__figure([
+polariton_presentation::__title("title", 10, 25).__label_size(16, 26, 41),
+polariton_presentation::__bar("quarter", "sales", 42, 66)
+], 0, 67)] }"#,
+			r#"pub fn main() { [polariton_presentation::__figure([
+polariton_presentation::__skin("greys_rs2", 10, 25).__label_size(16, 26, 41),
+polariton_presentation::__bar("quarter", "sales", 42, 66)
+], 0, 67)] }"#,
+		] {
+			assert_eq!(
+				execute(source, &[0..67]),
+				Err(PresentationFailure {
+					span: 26..41,
+					message:
+						"label_size(...) requires an x_axis(), y_axis(), or facet(...) receiver"
+							.to_owned(),
+				})
+			);
+		}
+
+		let duplicate = r#"pub fn main() { [polariton_presentation::__figure([
+polariton_presentation::__facet("region", 10, 25).__label_size(12, 26, 41).__label_size(18, 42, 57),
+polariton_presentation::__bar("quarter", "sales", 58, 82)
+], 0, 83)] }"#;
+		assert_eq!(
+			execute(duplicate, &[0..83]),
+			Err(PresentationFailure {
+				span: 42..57,
+				message: "facet(...).label_size(...) may appear at most once".to_owned(),
 			})
 		);
 	}

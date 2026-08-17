@@ -6,9 +6,9 @@ use crate::plot::colors::ColorTheme;
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
-	BarWidth, CategoryGap, HoverTextSize, LegendPosition, PlotPaddingPixels, PointSize,
-	ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, XLabelTextSize,
-	XTickTextSize, YLabelTextSize, YTickTextSize,
+	BarWidth, CategoryGap, FacetLabelTextSize, HoverTextSize, LegendPosition, PlotPaddingPixels,
+	PointSize, ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize,
+	XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
 use crate::plot::theme::PlotSettings;
@@ -639,6 +639,7 @@ pub struct ResolvedPlotSettings {
 	pub y_label_size: YLabelTextSize,
 	pub x_tick_size: XTickTextSize,
 	pub y_tick_size: YTickTextSize,
+	pub facet_label_size: FacetLabelTextSize,
 	pub legend_size: f32,
 	pub hover_size: HoverTextSize,
 	pub x_tick_placement: TickPlacement,
@@ -734,6 +735,7 @@ impl Default for ResolvedPlotSettings {
 			y_label_size: YLabelTextSize::DEFAULT,
 			x_tick_size: XTickTextSize::DEFAULT,
 			y_tick_size: YTickTextSize::DEFAULT,
+			facet_label_size: FacetLabelTextSize::DEFAULT,
 			legend_size: 14.0,
 			hover_size: HoverTextSize::DEFAULT,
 			x_tick_placement: TickPlacement::DEFAULT,
@@ -1481,7 +1483,7 @@ impl VerticalGuideBands {
 		};
 		let facet = facet_label
 			.filter(|label| !label.is_empty())
-			.map(|_| Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings))
+			.map(|_| Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings).pixels())
 			.unwrap_or(0.0);
 		let derived_bottom = Self::x_axis_guides(requirements, x_label_visible, settings).bottom;
 		let bottom = settings
@@ -1562,8 +1564,8 @@ impl VerticalGuideBands {
 		self.heading + self.facet + settings.plot_padding_top
 	}
 
-	pub(crate) fn facet_label_size(settings: &ResolvedPlotSettings) -> f32 {
-		(settings.legend_size + 2.0).max(10.0)
+	pub(crate) fn facet_label_size(settings: &ResolvedPlotSettings) -> FacetLabelTextSize {
+		settings.facet_label_size
 	}
 
 	pub(crate) fn plot_area(
@@ -3425,9 +3427,31 @@ mod product_0106_vertical_guide_band_oracles {
 		assert_eq!(
 			facet.y() - plain.y(),
 			VerticalGuideBands::FACET_LABEL_TOP_INSET
-				+ VerticalGuideBands::facet_label_size(&title)
+				+ VerticalGuideBands::facet_label_size(&title).pixels()
 		);
 		assert_eq!(plain.bottom(), facet.bottom());
+	}
+
+	#[test]
+	fn product_0124_facet_label_reservation_tracks_its_own_typed_size() {
+		let base = ResolvedPlotSettings::default();
+		let enlarged = ResolvedPlotSettings {
+			facet_label_size: FacetLabelTextSize::new(40.0).unwrap(),
+			..base.clone()
+		};
+		let base_area =
+			VerticalGuideBands::resolve("", Some("East"), &base).plot_area(bounds(), 0.0, &base);
+		let enlarged_area = VerticalGuideBands::resolve("", Some("East"), &enlarged).plot_area(
+			bounds(),
+			0.0,
+			&enlarged,
+		);
+		assert_eq!(
+			enlarged_area.y() - base_area.y(),
+			enlarged.facet_label_size.pixels() - base.facet_label_size.pixels(),
+			"the facet row reservation follows the resolved facet-label value exactly"
+		);
+		assert_eq!(base.legend_size, enlarged.legend_size);
 	}
 
 	#[test]
