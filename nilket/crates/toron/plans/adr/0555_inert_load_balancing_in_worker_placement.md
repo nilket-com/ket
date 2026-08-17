@@ -1,6 +1,9 @@
 # ADR 555 - Inert load balancing in worker placement
 
-**Status:** Proposed 2026-08-16. No implementation.
+**Status:** Proposed 2026-08-16. **Engine half implemented and its placement
+effect measured** (§7). The §7 paired comparison is **partially built**: its
+foundation is committed and controlled, its live integration is not. See
+*Handoff* at the end of this record.
 
 ## Context
 
@@ -226,6 +229,39 @@ transfers. That may be slower, which is why §5 measures rather than claims.
 Load counters can drift if a release path is missed. The three-outcome control in
 Acceptance exists because the failure mode — a worker that looks permanently busy
 and stops receiving work — is silent and looks like placement preference.
+
+## Handoff
+
+Committed and controlled, each with a test that fails against its own failure
+mode:
+
+- `FallbackPlacementPolicy`, chosen at **construction** — no runtime knob, so a
+  production coordinator cannot acquire the baseline arm by configuration. The
+  `AffinityOnly` arm ties on `worker_id` alone: a *controlled* serialization
+  baseline, deterministic across constructions, not a revival of the pre-555
+  `HashMap` ordering.
+- `WorkerReservation` — `#[must_use]`, non-`Clone`, non-`Copy`, released on drop,
+  acquired only under the registry write lock.
+- `placement_facts_from_nodes` and `placement_gate_problems` — the four per-pair
+  conditions, each refused with its own message.
+- `placement_pair_order_problems` (per-cell 4/3), `placement_worker_set_problems`,
+  `placement_reservation_drain_problems`.
+- `run_placement_cell_with` — seven pairs, two adjacent arms each, with a control
+  that fails if the second arms are deferred past the first, which is how a
+  paired design silently degrades into two sequential runs.
+- `build_execution_census_coordinator_with_placement` — two coordinators over the
+  same worker processes with independent registries.
+
+**Not built:** the live cell harness (workers once, both coordinators, seeding,
+`execute_arm` against the right coordinator, placement facts from telemetry
+retention, drain read between arms, teardown); worker-set verification before the
+first pair; the artifact writer and its seal; the `placement-ab` command; and the
+authoritative run.
+
+**Resume there.** The gates exist first deliberately, so the integration has
+something to fail against rather than being trusted on inspection — this arc
+spent four of nine SF=8 runs on wiring defects that guards caught and review did
+not.
 
 ## Forward
 
