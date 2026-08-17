@@ -7,7 +7,7 @@
 
 #![allow(dead_code)]
 
-use crate::coordinate::{Plot, Pt, Rect, Widget};
+use crate::coordinate::{Pt, Rect, Widget};
 use crate::plot::common::{
 	AxisTextAnchoring, AxisTextVisibility, BandRequirements, CoordinateTransformer, PlotBackend,
 	PlotComposite, PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, VerticalGuideBands,
@@ -787,7 +787,6 @@ impl PlotComposite for PlotGridKernel {
 			);
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
-			let containment = Rect::<Plot>::from_widget(bounds, inner);
 			let axis_text = axis_text_visibility(axis_cells[index], &axis_cells);
 			let helper = PlotWidget {
 				kernel: cell.kernel.as_ref(),
@@ -816,7 +815,6 @@ impl PlotComposite for PlotGridKernel {
 								*x_range,
 								*y_range,
 								axis_text,
-								containment,
 							);
 						}
 						PlotLayout::CategoricalX {
@@ -831,7 +829,6 @@ impl PlotComposite for PlotGridKernel {
 								categories,
 								*y_range,
 								axis_text,
-								containment,
 							);
 						}
 						PlotLayout::CategoricalY {
@@ -859,7 +856,6 @@ impl PlotComposite for PlotGridKernel {
 								x_categories,
 								y_categories,
 								axis_text,
-								containment,
 							);
 						}
 						PlotLayout::Parallel { dimensions, ranges } => {
@@ -2772,7 +2768,7 @@ mod tests {
 	}
 
 	#[test]
-	fn product_0118_grid_endpoint_offset_tracks_its_figure_overflow_at_two_widths() {
+	fn product_0119_grid_tick_labels_remain_attached_at_two_widths() {
 		let endpoint = "North American enterprise renewal commitments";
 		let data = Arc::new(
 			df!(
@@ -2783,17 +2779,17 @@ mod tests {
 				"label" => [
 					"Ship",
 					"International partner enablement and certification",
-					"Self-service adoption among distributed teams",
 					"Regulated migration and governance readiness",
+					"Self-service adoption among distributed teams",
 					"Build", "Learn", "Plan", endpoint,
 				],
-				"value" => [58.0_f64, 77.0, 72.0, 54.0, 74.0, 81.0, 62.0, 68.0],
+				"value" => [58.0_f64, 77.0, 54.0, 72.0, 74.0, 81.0, 62.0, 68.0],
 			)
-			.expect("PRODUCT-0118 categorical grid frame"),
+			.expect("PRODUCT-0119 categorical grid frame"),
 		);
 		let resolved = plan(PlotRequest {
 			source: PlotSource::Materialized {
-				name: "PRODUCT-0118 endpoint grid".to_owned(),
+				name: "PRODUCT-0119 endpoint grid".to_owned(),
 				data: artifact(&data),
 			},
 			authored_spec: AuthoredPlotSpec::xy(
@@ -2802,21 +2798,21 @@ mod tests {
 				"value",
 			),
 		})
-		.expect("PRODUCT-0118 categorical specification resolves");
+		.expect("PRODUCT-0119 categorical specification resolves");
 		let body = Arc::new(resolved.resolved_spec);
 		let grid = PlotGrid::value_facet(
 			Arc::clone(&body),
 			&StampedResult {
 				data: artifact(&data),
 				provenance: PlotProvenance {
-					source_name: "PRODUCT-0118 endpoint grid".to_owned(),
+					source_name: "PRODUCT-0119 endpoint grid".to_owned(),
 					revision: Some(1),
 				},
 			},
 			"facet",
 			GridArrangement::new(1, 2).expect("PRODUCT-0118 arrangement"),
 		)
-		.expect("PRODUCT-0118 facet grid");
+		.expect("PRODUCT-0119 facet grid");
 		let kernel = PlotGridKernel::from_grid(grid, 1600, 400);
 		let resolved = ResolvedPlotSettings {
 			title: ResolvedPresence::Hide,
@@ -2824,7 +2820,7 @@ mod tests {
 			x_label: ResolvedPresence::Hide,
 			y_label: ResolvedPresence::Hide,
 			legend: ResolvedPresence::Hide,
-			x_tick_rotation: TickRotation::new(45.0).expect("PRODUCT-0118 rotation"),
+			x_tick_rotation: TickRotation::new(45.0).expect("PRODUCT-0119 rotation"),
 			..ResolvedPlotSettings::default()
 		};
 		let settings = PlotSettings::from_resolved(resolved.clone());
@@ -2860,7 +2856,7 @@ mod tests {
 				..
 			} = right_layout
 			else {
-				unreachable!("PRODUCT-0118 bar grid has categorical x")
+				unreachable!("PRODUCT-0119 bar grid has categorical x")
 			};
 			let index = categories
 				.iter()
@@ -2872,59 +2868,23 @@ mod tests {
 				"fixture places the long endpoint last: {categories:?}"
 			);
 			let transform = CoordinateTransformer::new(right_layout, right_inner.into_iced());
-			let (tick, _) = transform.categorical(index, y_range.0);
-			let containment = Rect::<Plot>::from_widget(bounds, right_inner);
-			let projected = crate::plot::text_estimate::estimate_ascii_label_width(
-				endpoint,
-				resolved.x_tick_size,
-			) * resolved.x_tick_rotation.radians().cos();
-			let overflow = (tick.x + projected - containment.right()).max(0.0);
-			let endpoint_positions = backend
-				.texts
-				.iter()
-				.filter(|text| text.content == endpoint)
-				.map(|text| text.position.x)
-				.collect::<Vec<_>>();
-			assert_eq!(
-				endpoint_positions.len(),
-				2,
-				"both congruent cells draw the shared endpoint"
-			);
-			let compact_position = endpoint_positions
-				.iter()
-				.copied()
-				.fold(f32::INFINITY, f32::min);
-			let verbose_position = endpoint_positions
-				.iter()
-				.copied()
-				.fold(f32::NEG_INFINITY, f32::max);
-			let expected = right_inner.x() + tick.x - overflow;
-			assert!(
-				(verbose_position - expected).abs() < 0.001,
-				"the outer cell moves by exactly its current figure overflow"
-			);
-			assert!(
-				compact_position < verbose_position,
-				"the compact control keeps its identical endpoint under the non-outer rule"
-			);
-			(
-				verbose_position - (right_inner.x() + tick.x),
-				overflow,
-				projected,
-			)
+			for (index, category) in categories.iter().enumerate() {
+				let (tick, _) = transform.categorical(index, y_range.0);
+				let right_position = backend
+					.texts
+					.iter()
+					.filter(|text| text.content == *category)
+					.map(|text| text.position.x)
+					.fold(f32::NEG_INFINITY, f32::max);
+				assert!(
+					(right_position - (right_inner.x() + tick.x)).abs() < 0.001,
+					"{category} follows its own right-cell tick at {width}px, including the outer endpoint"
+				);
+			}
 		};
 
-		let (wide_offset, wide_overflow, projected) = capture(16_000.0);
-		let (narrow_offset, narrow_overflow, _) = capture(800.0);
-		assert!(
-			(wide_offset + wide_overflow).abs() < 0.001
-				&& (narrow_offset + narrow_overflow).abs() < 0.001,
-			"each width derives offset from current overflow rather than a stale label-width rule"
-		);
-		assert!(
-			narrow_offset < wide_offset && narrow_offset > -projected,
-			"narrowing the pane increases only the required overflow correction, never to full retraction"
-		);
+		capture(16_000.0);
+		capture(800.0);
 	}
 
 	#[test]
@@ -4576,9 +4536,6 @@ mod tests {
 			layer: PlotRenderLayer::Full,
 		};
 		let bounds = IcedRectangle::new(Point::ORIGIN, Size::new(400.0, 300.0));
-		let widget_bounds = Rect::<Widget>::from_iced_frame(bounds);
-		let containment =
-			Rect::<crate::coordinate::Plot>::from_widget(widget_bounds, widget_bounds);
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		let mut backend = TextBackend::default();
 		widget.draw_categorical_xy_axes(
@@ -4599,7 +4556,6 @@ mod tests {
 					figure_x_max: false,
 				},
 			},
-			containment,
 		);
 		assert_eq!(backend.texts.len(), 4);
 		assert!(

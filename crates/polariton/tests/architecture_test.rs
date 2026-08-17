@@ -4562,8 +4562,17 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 		!axis_labels.contains("+ self.settings.x_label_padding,"),
 		"PRODUCT-0115 does not place a rotated figure's title from an independent constant"
 	);
-	assert!(common.contains("estimate_formatted_label_width(&label, self.settings.x_tick_size)"));
-	assert!(common.contains("estimate_ascii_label_width(cat, self.settings.x_tick_size)"));
+	let requirements = common
+		.split("impl AxisBandRequirement")
+		.nth(1)
+		.and_then(|rest| rest.split("fn formatted_label_candidates").next())
+		.expect("PRODUCT-0114's bounded reservation estimator");
+	assert!(
+		requirements.contains(
+			"estimate_formatted_label_width(&format_label(value, *axis_type), font_size)"
+		)
+	);
+	assert!(requirements.contains("estimate_ascii_label_width(label, font_size)"));
 	for (entrypoint, next) in [
 		(
 			"pub(crate) fn draw_cartesian_axes",
@@ -4620,7 +4629,7 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 }
 
 #[test]
-fn product_0116_estimates_only_reserve_or_pull_rotated_tick_runs_inward() {
+fn product_0119_estimates_reserve_space_without_moving_x_tick_ink() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
 	let placement = common
@@ -4628,38 +4637,38 @@ fn product_0116_estimates_only_reserve_or_pull_rotated_tick_runs_inward() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub(crate) struct AxisTextVisibility").next())
 		.expect("bounded rotated tick placement authority");
-	for declaration in [
-		"x_offset: f32",
-		"fn leading_alignment",
-		"fn minimum_vertical_extent",
-	] {
+	for declaration in ["fn leading_alignment", "fn minimum_vertical_extent"] {
 		assert!(
 			placement.contains(declaration),
-			"PRODUCT-0116 keeps rotated tick placement in its one authority: {declaration}"
+			"PRODUCT-0119 keeps PRODUCT-0116's rotated pivot authority: {declaration}"
 		);
 	}
 	assert!(
 		!placement.contains("y_offset"),
-		"PRODUCT-0116 forbids estimated vertical tick displacement"
+		"PRODUCT-0119 forbids estimated vertical tick displacement"
+	);
+	assert!(
+		!placement.contains("x_offset"),
+		"PRODUCT-0119 deletes estimate-derived horizontal tick displacement"
 	);
 
 	for (entrypoint, next, x_origin, y_origin) in [
 		(
 			"pub(crate) fn draw_cartesian_axes",
 			"pub(crate) fn draw_categorical_grid",
-			"p_bottom.x + placement.x_offset",
+			"p_bottom.x,",
 			"p_bottom.y + self.settings.x_label_offset",
 		),
 		(
 			"pub(crate) fn draw_categorical_axes",
 			"pub(crate) fn draw_categorical_y_grid",
-			"center_px.x + placement.x_offset",
+			"center_px.x,",
 			"center_px.y + self.settings.x_label_offset",
 		),
 		(
 			"pub(crate) fn draw_categorical_xy_axes",
 			"pub(crate) fn draw_parallel_axes",
-			"tick_x + placement.x_offset",
+			"tick_x,",
 			"tick_y + self.settings.x_label_offset",
 		),
 	] {
@@ -4670,7 +4679,7 @@ fn product_0116_estimates_only_reserve_or_pull_rotated_tick_runs_inward() {
 			.expect("bounded rotated x-axis draw site");
 		assert!(
 			section.contains(x_origin) && section.contains(y_origin),
-			"PRODUCT-0116 emits a figure-space x correction and shared baseline y from {entrypoint}"
+			"PRODUCT-0119 emits the raw tick x and shared baseline y from {entrypoint}"
 		);
 		assert!(
 			!section.contains("placement.y_offset"),
@@ -4680,19 +4689,17 @@ fn product_0116_estimates_only_reserve_or_pull_rotated_tick_runs_inward() {
 }
 
 #[test]
-fn product_0118_endpoint_correction_is_typed_and_minimal() {
+fn product_0119_x_tick_labels_follow_their_ticks_and_keep_figure_clips() {
 	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 	let coordinate =
 		std::fs::read_to_string(root.join("coordinate.rs")).expect("read coordinate vocabulary");
-	for declaration in [
-		"impl Pt<Plot>",
-		"pub(crate) fn from_transformer_point(raw: Point) -> Self",
-		"impl Rect<Plot>",
-		"pub(crate) fn from_widget(figure: Rect<Widget>, plot_area: Rect<Widget>) -> Self",
+	for removed in [
+		"from_transformer_point(raw: Point)",
+		"from_widget(figure: Rect<Widget>, plot_area: Rect<Widget>)",
 	] {
 		assert!(
-			coordinate.contains(declaration),
-			"PRODUCT-0118 keeps figure containment and transformed ticks in typed spaces: {declaration}"
+			!coordinate.contains(removed),
+			"PRODUCT-0119 deletes PRODUCT-0118's now-unused containment transport: {removed}"
 		);
 	}
 
@@ -4702,24 +4709,15 @@ fn product_0118_endpoint_correction_is_typed_and_minimal() {
 		.nth(1)
 		.and_then(|rest| rest.split("pub(crate) struct AxisTextVisibility").next())
 		.expect("bounded x-tick placement authority");
-	for declaration in [
-		"tick: Pt<Plot>",
-		"containment: Rect<Plot>",
-		"XTickEndpoint::Min => (containment.x() - (tick.x() + run_min_x)).max(0.0)",
-		"XTickEndpoint::Max => (containment.right() - (tick.x() + run_max_x)).min(0.0)",
+	for removed in [
+		"XTickEndpoint",
+		"containment",
+		"x_offset",
+		"estimated_width",
 	] {
 		assert!(
-			placement.contains(declaration),
-			"PRODUCT-0118 corrects only conservative overflow at the figure boundary: {declaration}"
-		);
-	}
-	for legacy in [
-		"XTickEndpoint::Min => (-run_min_x).max(0.0)",
-		"XTickEndpoint::Max => (-run_max_x).min(0.0)",
-	] {
-		assert!(
-			!placement.contains(legacy),
-			"PRODUCT-0118 removes PRODUCT-0116's full-run retraction: {legacy}"
+			!placement.contains(removed),
+			"PRODUCT-0119 keeps no dormant endpoint placement authority: {removed}"
 		);
 	}
 
@@ -4728,9 +4726,10 @@ fn product_0118_endpoint_correction_is_typed_and_minimal() {
 		.nth(1)
 		.and_then(|rest| rest.split("fn render_global_headings").next())
 		.expect("bounded ordinary overlay");
-	assert!(
-		overlay.contains("Rect::<Plot>::from_widget(bounds, plot_extent)"),
-		"the ordinary overlay converts its figure clip once at the plot-local seam"
+	assert_eq!(
+		overlay.matches("backend.with_clip(bounds").count(),
+		1,
+		"the single-plot overlay keeps its unconditional figure-edge clip"
 	);
 	for draw in [
 		"self.draw_cartesian_axes(",
@@ -4742,8 +4741,8 @@ fn product_0118_endpoint_correction_is_typed_and_minimal() {
 			.nth(1)
 			.expect("ordinary x-axis draw path");
 		assert!(
-			section.contains("containment,"),
-			"{draw} consumes the one typed figure containment"
+			!section.contains("containment,"),
+			"{draw} has no endpoint-bound transport to make one label free-moving"
 		);
 	}
 
@@ -4754,12 +4753,8 @@ fn product_0118_endpoint_correction_is_typed_and_minimal() {
 		.and_then(|rest| rest.split("fn render_global_headings").next())
 		.expect("bounded grid overlay");
 	assert!(
-		grid_overlay.contains("Rect::<Plot>::from_widget(bounds, inner)"),
-		"PRODUCT-0118 keeps grid endpoint containment at the figure edge, never a cell edge"
-	);
-	assert!(
-		!grid_overlay.contains("from_widget(cell_bounds, inner)"),
-		"PRODUCT-0048 permits labels to cross facet boundaries before the figure clip stops them"
+		grid_overlay.contains("backend.with_clip(bounds.into_iced()"),
+		"PRODUCT-0119 retains PRODUCT-0048's figure-wide grid clip"
 	);
 	for draw in [
 		"helper.draw_cartesian_axes(",
@@ -4771,8 +4766,8 @@ fn product_0118_endpoint_correction_is_typed_and_minimal() {
 			.nth(1)
 			.expect("grid x-axis draw path");
 		assert!(
-			section.contains("containment,"),
-			"{draw} consumes the grid-wide typed containment authority"
+			!section.contains("containment,"),
+			"{draw} cannot substitute a cell edge for a label's tick"
 		);
 	}
 }
