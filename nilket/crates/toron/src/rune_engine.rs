@@ -1039,6 +1039,26 @@ pub fn abs(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn ln(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Ln,
+			args: vec![expr.expr],
+		},
+	}
+}
+
+/// Rune spells the digit count explicitly, the way `lag` spells its offset.
+/// SQL's `ROUND(value)` is `round(value, lit(0))` here.
+pub fn round(value: RuneExpr, digits: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Round,
+			args: vec![value.expr, digits.expr],
+		},
+	}
+}
+
 pub fn count_all() -> RuneAggr {
 	RuneAggr {
 		func: AggregateFunction::CountAll,
@@ -1586,6 +1606,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["sqrt"], sqrt).build()?;
 	m.function(["pow"], pow).build()?;
 	m.function(["abs"], abs).build()?;
+	m.function(["ln"], ln).build()?;
+	m.function(["round"], round).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
 	m.function(["count_all"], count_all).build()?;

@@ -174,6 +174,25 @@ most negative two's-complement value, matching the checked-arithmetic convention
 the engine already uses, rather than wrapping and returning the negative input as
 a magnitude.
 
+**`LN` and `ROUND` followed, and `ROUND` is where the arity model moved.** `LN`
+is the freebie case again — `EXP`'s rule, one registration, one evaluator arm.
+`ROUND` has an optional digit count, which `ScalarFunctionArity::Exact` could not
+express, so arity gained `Between(min, max)`. That is the first change to a
+metadata *type* rather than an addition to the table, and it was confined to the
+registry: no consumer of `arity` changed, because both the SQL lowering and the
+binder already asked `accepts(count)` rather than reading a number.
+
+The digit count is read per row rather than required to be a literal, so a column
+of scales works. It is checked as an integer and deliberately excluded from the
+output type — `ROUND(rating32, 1)` stays `Float32`, and a test fails if the count
+ever widens the value.
+
+**Rune spells the optional argument explicitly**, as `lag` already spells its
+offset: SQL's `ROUND(value)` is `round(value, lit(0))`. That keeps one identifier
+and one canonical spelling per function while leaving the defaulting to the SQL
+surface, which is where the dialect convention lives. A digest test pins the two
+forms to the same result.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know

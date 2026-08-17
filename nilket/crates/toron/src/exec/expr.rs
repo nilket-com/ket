@@ -717,7 +717,98 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_abs(&args[0]),
+		(
+			ScalarFunctionEvaluator::Ln,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_unary_float(&args[0], "LN", f32::ln, f64::ln),
+		(
+			ScalarFunctionEvaluator::Round,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_round(&args[0], args.get(1)),
 	}
+}
+
+/// `ROUND` without a digit count is `ROUND(value, 0)`. The digit count is read
+/// per row rather than required to be a literal, so a column of scales works;
+/// a NULL count propagates like any other NULL input.
+fn evaluate_round(value: &ArrayRef, digits: Option<&ArrayRef>) -> Result<ArrayRef, ExecutionError> {
+	let digits = match digits {
+		Some(digits) => Some(integer_digit_counts(digits)?),
+		None => None,
+	};
+	let digit_at = |row: usize| -> Option<i32> {
+		match &digits {
+			Some(counts) => counts[row],
+			None => Some(0),
+		}
+	};
+	if let Some(value) = value.as_any().downcast_ref::<Float32Array>() {
+		let rounded = (0..value.len())
+			.map(
+				|row| match (value.is_valid(row).then(|| value.value(row)), digit_at(row)) {
+					(Some(value), Some(digits)) => {
+						Some(round_to_digits(f64::from(value), digits) as f32)
+					}
+					_ => None,
+				},
+			)
+			.collect::<Float32Array>();
+		return Ok(Arc::new(rounded) as ArrayRef);
+	}
+	if let Some(value) = value.as_any().downcast_ref::<Float64Array>() {
+		let rounded = (0..value.len())
+			.map(
+				|row| match (value.is_valid(row).then(|| value.value(row)), digit_at(row)) {
+					(Some(value), Some(digits)) => Some(round_to_digits(value, digits)),
+					_ => None,
+				},
+			)
+			.collect::<Float64Array>();
+		return Ok(Arc::new(rounded) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"ROUND expects Float32 or Float64 input, got {:?}",
+			value.data_type()
+		),
+	})
+}
+
+fn integer_digit_counts(digits: &ArrayRef) -> Result<Vec<Option<i32>>, ExecutionError> {
+	if let Some(digits) = digits.as_any().downcast_ref::<Int32Array>() {
+		return Ok(digits.iter().collect());
+	}
+	if let Some(digits) = digits.as_any().downcast_ref::<Int64Array>() {
+		return Ok(digits
+			.iter()
+			.map(|value| {
+				value.map(|value| value.clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32)
+			})
+			.collect());
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"ROUND expects an integer digit count, got {:?}",
+			digits.data_type()
+		),
+	})
+}
+
+/// Scaling by `10^digits` is what makes a digit count meaningful, but the scale
+/// itself overflows to infinity well before the digit count does. Falling back
+/// to the unscaled value keeps a large count from turning finite data into NaN.
+fn round_to_digits(value: f64, digits: i32) -> f64 {
+	let factor = 10f64.powi(digits);
+	if !factor.is_finite() || factor == 0.0 {
+		return value;
+	}
+	let scaled = value * factor;
+	if !scaled.is_finite() {
+		return value;
+	}
+	scaled.round() / factor
 }
 
 fn evaluate_unary_float(

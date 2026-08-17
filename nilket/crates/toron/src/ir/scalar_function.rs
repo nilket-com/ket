@@ -15,7 +15,9 @@ use serde::{Deserialize, Serialize};
 pub enum ScalarFunctionId {
 	Abs,
 	Exp,
+	Ln,
 	Pow,
+	Round,
 	Sqrt,
 }
 
@@ -23,12 +25,15 @@ pub enum ScalarFunctionId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunctionArity {
 	Exact(usize),
+	/// An inclusive range, for a function whose trailing arguments are optional.
+	Between(usize, usize),
 }
 
 impl ScalarFunctionArity {
 	pub const fn accepts(self, count: usize) -> bool {
 		match self {
 			Self::Exact(expected) => count == expected,
+			Self::Between(min, max) => min <= count && count <= max,
 		}
 	}
 
@@ -37,6 +42,8 @@ impl ScalarFunctionArity {
 			Self::Exact(1) => "exactly one argument",
 			Self::Exact(2) => "exactly two arguments",
 			Self::Exact(_) => "the registered argument count",
+			Self::Between(1, 2) => "one or two arguments",
+			Self::Between(_, _) => "the registered argument range",
 		}
 	}
 }
@@ -57,6 +64,9 @@ pub enum ScalarFunctionSignature {
 	/// Output type equals input type across the numeric set. Integers and
 	/// decimals stay themselves rather than becoming floats.
 	UnaryNumericPreserving,
+	/// A float value, optionally followed by an integer digit count. The value's
+	/// own type is the output type; the digit count does not widen it.
+	FloatWithOptionalIntegerDigits,
 }
 
 /// How NULL inputs affect the output.
@@ -76,7 +86,9 @@ pub enum ScalarFunctionNonFiniteBehavior {
 pub enum ScalarFunctionEvaluator {
 	Abs,
 	Exp,
+	Ln,
 	Pow,
+	Round,
 	Sqrt,
 }
 
@@ -147,8 +159,34 @@ const ABS: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Abs,
 };
 
+const LN: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Ln,
+	sql_name: "LN",
+	rune_name: "ln",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryFloatPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Ln,
+};
+
+const ROUND: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Round,
+	sql_name: "ROUND",
+	rune_name: "round",
+	arity: ScalarFunctionArity::Between(1, 2),
+	signature: ScalarFunctionSignature::FloatWithOptionalIntegerDigits,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Round,
+};
+
 /// The complete scalar-function registry.
-pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[ABS, EXP, POW, SQRT];
+pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[ABS, EXP, LN, POW, ROUND, SQRT];
 
 pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunctionMetadata {
 	SCALAR_FUNCTIONS

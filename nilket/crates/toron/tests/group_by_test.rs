@@ -1936,6 +1936,108 @@ async fn adr553_pow_rejects_a_single_argument() {
 }
 
 #[tokio::test]
+async fn adr553_sql_and_rune_ln_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT LN(price) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([ln(col("price"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL LN");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune ln");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL LN digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune ln digest")
+	);
+}
+
+/// SQL's optional digit count is Rune's explicit one, the way `lag` spells its
+/// offset. `ROUND(x)` and `round(x, lit(0))` must therefore agree exactly.
+#[tokio::test]
+async fn adr553_sql_round_default_matches_rune_explicit_zero_digits() {
+	let sql_logical = plan_sql("SELECT ROUND(price) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([round(col("price"), lit(0))])
+        }
+    "#,
+	)
+	.await;
+
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL ROUND digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune round digest")
+	);
+}
+
+/// The optional argument is the point of `Between(1, 2)`: both spellings must
+/// bind, and the digit count must not widen the output type.
+#[tokio::test]
+async fn adr553_round_accepts_both_arities_without_changing_output_type() {
+	let (catalog, _) = fixture();
+	for sql in [
+		"SELECT ROUND(price) FROM sales",
+		"SELECT ROUND(price, 2) FROM sales",
+	] {
+		let logical = plan_sql(sql);
+		let bound = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|error| panic!("bind {sql}: {error:?}"));
+		assert_eq!(
+			bound.schema().field(0).data_type(),
+			&DataType::Float64,
+			"{sql} must keep the value's own type"
+		);
+	}
+
+	let narrow = plan_sql("SELECT ROUND(rating32, 1) FROM sales");
+	let bound = bind(&narrow, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind ROUND over Float32");
+	assert_eq!(
+		bound.schema().field(0).data_type(),
+		&DataType::Float32,
+		"an Int32 digit count must not widen a Float32 value"
+	);
+}
+
+#[tokio::test]
+async fn adr553_round_rejects_a_non_integer_digit_count() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT ROUND(price, score) FROM sales");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("a float digit count should not bind");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("integer digit count")),
+		"expected a digit-count rejection, got {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr553_round_rejects_a_third_argument() {
+	assert_unsupported_message(
+		"SELECT ROUND(price, 2, 3) FROM sales",
+		"ROUND expects one or two arguments, got 3",
+	);
+}
+
+#[tokio::test]
 async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");
 	let rune_logical = rune_plan(
