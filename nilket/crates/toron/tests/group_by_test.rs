@@ -2037,6 +2037,148 @@ async fn adr553_round_rejects_a_third_argument() {
 	);
 }
 
+/// `CEIL` has its own sqlparser grammar form, so it never reaches the registry's
+/// function path. Both spellings must still land on the one registry identifier.
+#[tokio::test]
+async fn adr553_sql_and_rune_ceil_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT CEIL(price) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([ceil(col("price"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL CEIL");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune ceil");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL CEIL digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune ceil digest")
+	);
+}
+
+/// `FLOOR` stays a grandfathered `Expr` variant while `CEIL` is a registration.
+/// The asymmetry is deliberate, and this pins it so a future migration is a
+/// decision rather than a surprise.
+#[tokio::test]
+async fn adr553_ceil_is_a_registration_while_floor_remains_a_variant() {
+	let ceil = plan_sql("SELECT CEIL(price) FROM sales");
+	let floor = plan_sql("SELECT FLOOR(price) FROM sales");
+	assert!(
+		format!("{ceil:?}").contains("ScalarFunction"),
+		"CEIL must lower through the registry"
+	);
+	assert!(
+		format!("{floor:?}").contains("Floor") && !format!("{floor:?}").contains("ScalarFunction"),
+		"FLOOR is still a grandfathered variant"
+	);
+}
+
+#[tokio::test]
+async fn adr553_sql_and_rune_sign_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT SIGN(amount) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([sign(col("amount"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL SIGN");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune sign");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL SIGN digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune sign digest")
+	);
+}
+
+/// `SIGN` reuses `ABS`'s rule rather than returning a fixed integer, so a
+/// decimal's sign is that decimal's own `1`.
+#[tokio::test]
+async fn adr553_sign_preserves_each_numeric_input_type() {
+	let (catalog, _) = fixture();
+	for (column, expected) in [
+		("amount", DataType::Int32),
+		("id", DataType::Int64),
+		("rating32", DataType::Float32),
+		("price", DataType::Float64),
+		("decimal_price", DataType::Decimal128(15, 2)),
+	] {
+		let logical = plan_sql(&format!("SELECT SIGN({column}) FROM sales"));
+		let bound = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|error| panic!("bind SIGN({column}): {error:?}"));
+		assert_eq!(
+			bound.schema().field(0).data_type(),
+			&expected,
+			"SIGN({column}) must preserve its input type"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr553_sql_and_rune_mod_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT MOD(amount, amount) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([modulo(col("amount"), col("amount"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL MOD");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune mod");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL MOD digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune mod digest")
+	);
+}
+
+/// The float case is absent on purpose: a floating remainder is its own
+/// admission decision, not an implied consequence of admitting `MOD`.
+#[tokio::test]
+async fn adr553_mod_rejects_float_operands() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT MOD(price, price) FROM sales");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("a floating remainder should not bind");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("same integer type")),
+		"expected an integer-domain rejection, got {err:?}"
+	);
+}
+
 #[tokio::test]
 async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");

@@ -14,10 +14,13 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarFunctionId {
 	Abs,
+	Ceil,
 	Exp,
 	Ln,
+	Mod,
 	Pow,
 	Round,
+	Sign,
 	Sqrt,
 }
 
@@ -67,6 +70,10 @@ pub enum ScalarFunctionSignature {
 	/// A float value, optionally followed by an integer digit count. The value's
 	/// own type is the output type; the digit count does not widen it.
 	FloatWithOptionalIntegerDigits,
+	/// Both operands must be the same integer width, which is also the output.
+	/// The float case is deliberately absent: a floating remainder is a separate
+	/// admission decision, not an implied consequence of this one.
+	BinaryIntegerPreserving,
 }
 
 /// How NULL inputs affect the output.
@@ -85,10 +92,13 @@ pub enum ScalarFunctionNonFiniteBehavior {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunctionEvaluator {
 	Abs,
+	Ceil,
 	Exp,
 	Ln,
+	Mod,
 	Pow,
 	Round,
+	Sign,
 	Sqrt,
 }
 
@@ -185,8 +195,51 @@ const ROUND: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Round,
 };
 
+const CEIL: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Ceil,
+	sql_name: "CEIL",
+	rune_name: "ceil",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryFloatPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Ceil,
+};
+
+const SIGN: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Sign,
+	sql_name: "SIGN",
+	rune_name: "sign",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryNumericPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Sign,
+};
+
+const MOD: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Mod,
+	sql_name: "MOD",
+	// `mod` is a keyword in Rune, so the canonical name cannot be spelled there.
+	// The identifier is still one; only the spelling differs, which is what §3
+	// of the record allows.
+	rune_name: "modulo",
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::BinaryIntegerPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Mod,
+};
+
 /// The complete scalar-function registry.
-pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[ABS, EXP, LN, POW, ROUND, SQRT];
+pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] =
+	&[ABS, CEIL, EXP, LN, MOD, POW, ROUND, SIGN, SQRT];
 
 pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunctionMetadata {
 	SCALAR_FUNCTIONS
@@ -225,10 +278,21 @@ mod tests {
 				"{} must resolve from its own SQL name",
 				metadata.sql_name
 			);
+			// The two surfaces share one identifier, not necessarily one
+			// spelling. A divergence is allowed only where the canonical name
+			// is unusable, and it is listed here so it stays a decision.
+			const SPELLING_EXCEPTIONS: &[(&str, &str)] = &[("MOD", "modulo")];
+			let expected = SPELLING_EXCEPTIONS
+				.iter()
+				.find(|(sql, _)| *sql == metadata.sql_name)
+				.map_or_else(
+					|| metadata.sql_name.to_ascii_lowercase(),
+					|(_, rune)| (*rune).to_string(),
+				);
 			assert_eq!(
-				metadata.sql_name.to_ascii_lowercase(),
-				metadata.rune_name,
-				"the two surfaces must spell one function the same way"
+				metadata.rune_name, expected,
+				"{} must use its canonical Rune spelling",
+				metadata.sql_name
 			);
 			assert_eq!(scalar_function_metadata(metadata.id), metadata);
 		}

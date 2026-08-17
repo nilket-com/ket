@@ -193,6 +193,34 @@ and one canonical spelling per function while leaving the defaulting to the SQL
 surface, which is where the dialect convention lives. A digest test pins the two
 forms to the same result.
 
+**`CEIL`, `SIGN`, and `MOD` closed the named set, and two of them cost something
+the mechanism could not absorb.**
+
+`SIGN` reuses `ABS`'s rule outright, so a decimal's sign is that decimal's own
+`1` rather than an integer. That is the Postgres reading and it keeps the rule
+count from growing.
+
+`CEIL` needed a **frontend grammar arm**. sqlparser gives `CEIL` and `FLOOR`
+dedicated AST variants, so `CEIL(x)` never reaches the registry's function path —
+`sql_planner.rs` gained one arm mapping the grammar form onto the registry
+identifier. The registry cannot make a function reachable that the parser routes
+elsewhere, and that limit belongs on the record: a bespoke grammar is a per-name
+cost the mechanism does not remove.
+
+This also sharpens the `FLOOR` question. `CEIL` is now a registration while
+`FLOOR` remains a grandfathered variant, so one concept has two implementations.
+§4 permits migrating `FLOOR` — the list shrinks or stays — and a test pins the
+current asymmetry so that migration stays a decision rather than a surprise.
+
+`MOD` falsified an assumption this record made about naming. §3 says one semantic
+definition, two spellings; the implementation had read that as *the same*
+spelling, asserted as `sql_name.to_lowercase() == rune_name`. `mod` is a keyword
+in Rune, so `mod(a, b)` cannot parse there at all. The Rune spelling is `modulo`,
+the SQL spelling is `MOD`, the identifier is one, and the equality test became an
+explicit exception list so a divergence stays visible instead of becoming a habit.
+Its integer-only domain is deliberate: a floating remainder is its own admission
+decision.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know

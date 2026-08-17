@@ -92,6 +92,42 @@ pub(super) fn bind_scalar_function(
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
 		}
+		ScalarFunctionSignature::BinaryIntegerPreserving => {
+			let [left, right] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			for operand in [left, right] {
+				if !builder
+					.node_logical_type(*operand)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			let output_type = match (builder.node_type(*left), builder.node_type(*right)) {
+				(Some(DataType::Int32), Some(DataType::Int32)) => DataType::Int32,
+				(Some(DataType::Int64), Some(DataType::Int64)) => DataType::Int64,
+				(Some(left_type), Some(right_type)) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects two arguments of the same integer type, got {left_type:?} and {right_type:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				_ => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} input is not a bound expression", metadata.sql_name),
+					});
+				}
+			};
+			Ok(builder.append_scalar_function(id, bound_args, output_type))
+		}
 		ScalarFunctionSignature::FloatWithOptionalIntegerDigits => {
 			let (value, digits) = match bound_args.as_slice() {
 				[value] => (value, None),

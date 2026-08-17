@@ -6755,6 +6755,22 @@ impl SqlPlanner {
 				}
 				Ok(Expr::Floor(Box::new(self.lower_expr(expr)?)))
 			}
+			// CEIL has its own grammar form, so it never reaches the registry's
+			// function path. The identifier is still the registry's.
+			SqlExpr::Ceil { expr, field } => {
+				if !matches!(
+					field,
+					sqlparser::ast::CeilFloorKind::DateTimeField(
+						sqlparser::ast::DateTimeField::NoDateTime
+					)
+				) {
+					return Err(unsupported("datetime CEIL is not supported"));
+				}
+				Ok(Expr::ScalarFunction {
+					id: crate::ir::ScalarFunctionId::Ceil,
+					args: vec![self.lower_expr(expr)?],
+				})
+			}
 			SqlExpr::Nested(expr) => self.lower_expr(expr),
 			SqlExpr::Function(f) => match conditional_sugar_function_name(&f.name) {
 				Some(ConditionalSugarFunction::Coalesce) => self.lower_coalesce(f),

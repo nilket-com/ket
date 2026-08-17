@@ -1048,6 +1048,35 @@ pub fn ln(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn ceil(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Ceil,
+			args: vec![expr.expr],
+		},
+	}
+}
+
+pub fn sign(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Sign,
+			args: vec![expr.expr],
+		},
+	}
+}
+
+/// `mod` is a keyword in both Rust and Rune, so this is `modulo` on the Rune
+/// surface. SQL keeps `MOD`; the registry identifier is the same either way.
+pub fn modulo(left: RuneExpr, right: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Mod,
+			args: vec![left.expr, right.expr],
+		},
+	}
+}
+
 /// Rune spells the digit count explicitly, the way `lag` spells its offset.
 /// SQL's `ROUND(value)` is `round(value, lit(0))` here.
 pub fn round(value: RuneExpr, digits: RuneExpr) -> RuneExpr {
@@ -1608,6 +1637,9 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["abs"], abs).build()?;
 	m.function(["ln"], ln).build()?;
 	m.function(["round"], round).build()?;
+	m.function(["ceil"], ceil).build()?;
+	m.function(["sign"], sign).build()?;
+	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
 	m.function(["count_all"], count_all).build()?;

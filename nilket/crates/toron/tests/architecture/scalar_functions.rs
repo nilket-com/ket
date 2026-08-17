@@ -149,10 +149,13 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 		registered_ids,
 		BTreeSet::from([
 			"Abs".to_string(),
+			"Ceil".to_string(),
 			"Exp".to_string(),
 			"Ln".to_string(),
+			"Mod".to_string(),
 			"Pow".to_string(),
 			"Round".to_string(),
+			"Sign".to_string(),
 			"Sqrt".to_string(),
 		]),
 		"admitting a function is a review decision; update this set deliberately"

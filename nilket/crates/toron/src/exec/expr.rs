@@ -727,7 +727,113 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_round(&args[0], args.get(1)),
+		(
+			ScalarFunctionEvaluator::Ceil,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_unary_float(&args[0], "CEIL", f32::ceil, f64::ceil),
+		(
+			ScalarFunctionEvaluator::Sign,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_sign(&args[0]),
+		(
+			ScalarFunctionEvaluator::Mod,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_mod(&args[0], &args[1]),
 	}
+}
+
+/// `SIGN` preserves its input type, so a decimal's sign is `1` at that decimal's
+/// own scale rather than an integer. `f64::signum` returns ±1 for zero, which is
+/// not what SQL means by sign, so zero is handled before it.
+fn evaluate_sign(input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	if let Some(input) = input.as_any().downcast_ref::<Int32Array>() {
+		return Ok(Arc::new(Int32Array::from_iter(
+			input.iter().map(|value| value.map(i32::signum)),
+		)) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Int64Array>() {
+		return Ok(Arc::new(Int64Array::from_iter(
+			input.iter().map(|value| value.map(i64::signum)),
+		)) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Float32Array>() {
+		return Ok(Arc::new(Float32Array::from_iter(input.iter().map(|value| {
+			value.map(|value| if value == 0.0 { 0.0 } else { value.signum() })
+		}))) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Float64Array>() {
+		return Ok(Arc::new(Float64Array::from_iter(input.iter().map(|value| {
+			value.map(|value| if value == 0.0 { 0.0 } else { value.signum() })
+		}))) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Decimal128Array>() {
+		let (precision, scale) = match input.data_type() {
+			DataType::Decimal128(precision, scale) => (*precision, *scale),
+			other => {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!("SIGN expects a numeric input, got {other:?}"),
+				});
+			}
+		};
+		// One unit at this scale, so the result is 1, 0, or -1 as that decimal
+		// reads it rather than as a raw integer.
+		let unit = 10i128.pow(u32::from(scale.max(0) as u8));
+		return Ok(Arc::new(
+			Decimal128Array::from_iter(
+				input
+					.iter()
+					.map(|value| value.map(|value| i128::from(value.signum()) * unit)),
+			)
+			.with_precision_and_scale(precision, scale)?,
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!("SIGN expects a numeric input, got {:?}", input.data_type()),
+	})
+}
+
+/// A zero divisor has no remainder to report, so the row fails rather than
+/// producing a value. `checked_rem` also covers `MIN % -1`, which overflows.
+fn evaluate_mod(left: &ArrayRef, right: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let undefined = || ExecutionError::InvalidExpression {
+		message: "MOD by zero is undefined".to_string(),
+	};
+	if let (Some(left), Some(right)) = (
+		left.as_any().downcast_ref::<Int32Array>(),
+		right.as_any().downcast_ref::<Int32Array>(),
+	) {
+		let mut values = Vec::with_capacity(left.len());
+		for (left, right) in left.iter().zip(right.iter()) {
+			values.push(match (left, right) {
+				(Some(left), Some(right)) => Some(left.checked_rem(right).ok_or_else(undefined)?),
+				_ => None,
+			});
+		}
+		return Ok(Arc::new(Int32Array::from_iter(values)) as ArrayRef);
+	}
+	if let (Some(left), Some(right)) = (
+		left.as_any().downcast_ref::<Int64Array>(),
+		right.as_any().downcast_ref::<Int64Array>(),
+	) {
+		let mut values = Vec::with_capacity(left.len());
+		for (left, right) in left.iter().zip(right.iter()) {
+			values.push(match (left, right) {
+				(Some(left), Some(right)) => Some(left.checked_rem(right).ok_or_else(undefined)?),
+				_ => None,
+			});
+		}
+		return Ok(Arc::new(Int64Array::from_iter(values)) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"MOD expects two arguments of the same integer type, got {:?} and {:?}",
+			left.data_type(),
+			right.data_type()
+		),
+	})
 }
 
 /// `ROUND` without a digit count is `ROUND(value, 0)`. The digit count is read
