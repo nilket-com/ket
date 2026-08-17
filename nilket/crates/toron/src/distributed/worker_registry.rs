@@ -81,6 +81,63 @@ pub struct WorkerCapabilities {
 	pub spill_capacity_reserved: ByteCount,
 }
 
+/// An owned, exactly-once claim on one worker's task slot (ADR 555 §3).
+///
+/// Acquired only through `select_and_reserve` or `reserve`, both of which
+/// increment `active_tasks` under the registry write lock so the reservation is
+/// visible to the *next* selector. Released by drop, so normal completion,
+/// failure, cancellation, and early `?` exits are all covered by ownership
+/// rather than by four manually synchronised decrements.
+///
+/// Deliberately neither `Clone` nor `Copy`: a double release would underflow the
+/// counter, after which a worker looks permanently idle and attracts every task
+/// — a balancer worse than the inert one it replaces, and silent. The type makes
+/// that unrepresentable rather than merely tested for.
+#[must_use = "a worker reservation must be held until its attempt reaches a terminal outcome"]
+pub struct WorkerReservation {
+	worker_id: WorkerId,
+	release: Option<Box<dyn FnOnce(WorkerId) + Send + Sync>>,
+}
+
+impl WorkerReservation {
+	fn new(worker_id: WorkerId, release: impl FnOnce(WorkerId) + Send + Sync + 'static) -> Self {
+		Self {
+			worker_id,
+			release: Some(Box::new(release)),
+		}
+	}
+
+	/// A token that tracks nothing, for registries whose placement does not
+	/// depend on observed load. Public so an implementor can select it
+	/// **explicitly**, with a reason, rather than inheriting it from a default.
+	pub fn unreserved(worker_id: WorkerId) -> Self {
+		Self {
+			worker_id,
+			release: None,
+		}
+	}
+
+	pub fn worker_id(&self) -> WorkerId {
+		self.worker_id
+	}
+}
+
+impl std::fmt::Debug for WorkerReservation {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		f.debug_struct("WorkerReservation")
+			.field("worker_id", &self.worker_id)
+			.finish_non_exhaustive()
+	}
+}
+
+impl Drop for WorkerReservation {
+	fn drop(&mut self) {
+		if let Some(release) = self.release.take() {
+			release(self.worker_id);
+		}
+	}
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct WorkerResourceState {
 	pub in_flight: ByteCount,
@@ -117,6 +174,23 @@ pub trait WorkerRegistry: Send + Sync {
 	fn list(&self) -> Vec<WorkerEntry>;
 	fn resolve(&self, worker_id: WorkerId) -> Option<WorkerEntry>;
 	fn select_for_attempt(&self, hints: &PlacementHints) -> Option<WorkerId>;
+	/// Select the least-loaded live worker **and reserve it under one write
+	/// lock**, so the reservation is visible to the next selector (ADR 555 §3).
+	/// Reserving after dispatch would leave a window in which two selectors
+	/// observe identical load and recreate the tie.
+	///
+	/// **Deliberately has no default.** An implementor must choose either an
+	/// observed-load reservation or [`WorkerReservation::unreserved`] with its own
+	/// stated reason. A default would let a future load-sensitive registry
+	/// silently inherit the inert behaviour ADR 555 exists to remove, and the
+	/// compile error is what forces the decision.
+	fn select_and_reserve(&self, hints: &PlacementHints) -> Option<WorkerReservation>;
+
+	/// Reserve a specific worker chosen by shuffle affinity. Returns `None` when
+	/// that worker is no longer live, so the caller falls back to selection.
+	///
+	/// No default, on the same terms as above.
+	fn reserve(&self, worker_id: WorkerId) -> Option<WorkerReservation>;
 	fn mark_lost(&self, worker_id: WorkerId);
 	fn heartbeat(&self, worker_id: WorkerId, lease: WorkerLease);
 	fn expire_heartbeats(
@@ -143,6 +217,14 @@ where
 		self.as_ref().select_for_attempt(hints)
 	}
 
+	fn select_and_reserve(&self, hints: &PlacementHints) -> Option<WorkerReservation> {
+		self.as_ref().select_and_reserve(hints)
+	}
+
+	fn reserve(&self, worker_id: WorkerId) -> Option<WorkerReservation> {
+		self.as_ref().reserve(worker_id)
+	}
+
 	fn mark_lost(&self, worker_id: WorkerId) {
 		self.as_ref().mark_lost(worker_id);
 	}
@@ -164,18 +246,63 @@ where
 
 #[derive(Debug)]
 pub struct StaticWorkerRegistry {
-	workers: RwLock<HashMap<WorkerId, WorkerEntry>>,
+	workers: Arc<RwLock<HashMap<WorkerId, WorkerEntry>>>,
 }
 
 impl StaticWorkerRegistry {
+	/// ADR 555 §2: `(active_tasks, worker_id)`. Byte `in_flight` is deliberately
+	/// **not** consulted — it has no producer, and a permanently-zero term would
+	/// claim byte load is considered when it is not. `worker_id` is the final,
+	/// deterministic tie-break, replacing `HashMap` iteration order.
+	fn placement_key(worker: &&WorkerEntry) -> (ActiveTaskCount, WorkerId) {
+		(worker.resources.active_tasks, worker.worker_id)
+	}
+
+	fn acquire_locked(
+		workers: &mut HashMap<WorkerId, WorkerEntry>,
+		worker_id: WorkerId,
+	) -> Option<()> {
+		let worker = workers.get_mut(&worker_id)?;
+		if worker.status != WorkerStatus::Live {
+			return None;
+		}
+		worker.resources.active_tasks =
+			ActiveTaskCount::new(worker.resources.active_tasks.get().saturating_add(1));
+		Some(())
+	}
+
+	fn reservation_for(&self, worker_id: WorkerId) -> WorkerReservation {
+		let workers = Arc::clone(&self.workers);
+		WorkerReservation::new(worker_id, move |worker_id| {
+			let Ok(mut workers) = workers.write() else {
+				return;
+			};
+			let Some(worker) = workers.get_mut(&worker_id) else {
+				return;
+			};
+			// Never saturate: a zero count here is an ownership bug, not a
+			// tolerable edge, and hiding it would leave the balancer quietly wrong.
+			match worker.resources.active_tasks.get().checked_sub(1) {
+				Some(next) => worker.resources.active_tasks = ActiveTaskCount::new(next),
+				None => {
+					debug_assert!(false, "worker reservation released more than once");
+					tracing::error!(
+						worker_id = ?worker_id,
+						"worker reservation released below zero; load balancing is unreliable"
+					);
+				}
+			}
+		})
+	}
+
 	pub fn new(workers: impl IntoIterator<Item = WorkerEntry>) -> Self {
 		Self {
-			workers: RwLock::new(
+			workers: Arc::new(RwLock::new(
 				workers
 					.into_iter()
 					.map(|worker| (worker.worker_id, worker))
 					.collect(),
-			),
+			)),
 		}
 	}
 }
@@ -204,8 +331,30 @@ impl WorkerRegistry for StaticWorkerRegistry {
 			.expect("worker registry poisoned")
 			.values()
 			.filter(|worker| worker.status == WorkerStatus::Live)
-			.min_by_key(|worker| (worker.resources.active_tasks, worker.resources.in_flight))
+			.min_by_key(Self::placement_key)
 			.map(|worker| worker.worker_id)
+	}
+
+	fn select_and_reserve(&self, _hints: &PlacementHints) -> Option<WorkerReservation> {
+		// Selection and reservation share one write lock: the increment must be
+		// visible to the next selector, or two selectors observe identical load
+		// and recreate the tie this record exists to remove (ADR 555 §3).
+		let mut workers = self.workers.write().expect("worker registry poisoned");
+		let worker_id = workers
+			.values()
+			.filter(|worker| worker.status == WorkerStatus::Live)
+			.min_by_key(Self::placement_key)
+			.map(|worker| worker.worker_id)?;
+		Self::acquire_locked(&mut workers, worker_id)?;
+		drop(workers);
+		Some(self.reservation_for(worker_id))
+	}
+
+	fn reserve(&self, worker_id: WorkerId) -> Option<WorkerReservation> {
+		let mut workers = self.workers.write().expect("worker registry poisoned");
+		Self::acquire_locked(&mut workers, worker_id)?;
+		drop(workers);
+		Some(self.reservation_for(worker_id))
 	}
 
 	fn mark_lost(&self, worker_id: WorkerId) {
@@ -293,6 +442,106 @@ mod tests {
 			},
 			status,
 		}
+	}
+
+	fn two_equal_live_workers() -> StaticWorkerRegistry {
+		StaticWorkerRegistry::new([
+			worker(
+				WorkerId::from_u128(2),
+				ActiveTaskCount::new(0),
+				ByteCount::ZERO,
+				WorkerStatus::Live,
+			),
+			worker(
+				WorkerId::from_u128(1),
+				ActiveTaskCount::new(0),
+				ByteCount::ZERO,
+				WorkerStatus::Live,
+			),
+		])
+	}
+
+	/// ADR 555 §3: the reservation must be visible to the **next** selector.
+	/// Reserving after dispatch would leave both selections seeing zero load.
+	#[test]
+	fn adr555_selection_and_reservation_are_atomic_for_the_next_selector() {
+		let registry = two_equal_live_workers();
+		let first = registry
+			.select_and_reserve(&PlacementHints)
+			.expect("first selection");
+		let second = registry
+			.select_and_reserve(&PlacementHints)
+			.expect("second selection");
+		assert_ne!(
+			first.worker_id(),
+			second.worker_id(),
+			"the second selector must observe the first reservation"
+		);
+	}
+
+	/// Releasing returns the slot, so a third selection reuses the freed worker.
+	#[test]
+	fn adr555_dropping_a_reservation_returns_the_slot() {
+		let registry = two_equal_live_workers();
+		let first = registry.select_and_reserve(&PlacementHints).expect("first");
+		let freed = first.worker_id();
+		drop(first);
+
+		let again = registry.select_and_reserve(&PlacementHints).expect("again");
+		assert_eq!(
+			again.worker_id(),
+			freed,
+			"a released slot is available to the next selection"
+		);
+	}
+
+	/// ADR 555 §2: byte `in_flight` is not consulted. Two workers differing only
+	/// in that field must select identically, or the key is claiming to consider
+	/// byte load that nothing produces.
+	#[test]
+	fn adr555_byte_in_flight_does_not_influence_selection() {
+		let loaded_bytes = StaticWorkerRegistry::new([
+			worker(
+				WorkerId::from_u128(1),
+				ActiveTaskCount::new(0),
+				ByteCount::new(1 << 30),
+				WorkerStatus::Live,
+			),
+			worker(
+				WorkerId::from_u128(2),
+				ActiveTaskCount::new(0),
+				ByteCount::ZERO,
+				WorkerStatus::Live,
+			),
+		]);
+		let picked = loaded_bytes
+			.select_and_reserve(&PlacementHints)
+			.expect("selection");
+		assert_eq!(
+			picked.worker_id(),
+			WorkerId::from_u128(1),
+			"selection follows (active_tasks, worker_id); bytes are ignored"
+		);
+	}
+
+	/// §6: equal load must not be resolved by map iteration order. Repeated
+	/// registry constructions over the same set must select identically.
+	#[test]
+	fn adr555_equal_load_selection_is_stable_across_constructions() {
+		let picked: Vec<u128> = (0..16)
+			.map(|_| {
+				two_equal_live_workers()
+					.select_and_reserve(&PlacementHints)
+					.expect("selection")
+					.worker_id()
+					.get()
+					.as_u128()
+			})
+			.collect();
+		assert!(
+			picked.windows(2).all(|pair| pair[0] == pair[1]),
+			"iteration order must not decide a tie: {picked:?}"
+		);
 	}
 
 	#[test]
