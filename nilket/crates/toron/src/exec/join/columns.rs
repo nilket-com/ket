@@ -53,6 +53,11 @@ fn collect_program_node_column_ordinals(
 			}
 			collect_program_node_column_ordinals(program, *else_input, columns);
 		}
+		Some(BoundExprNode::ScalarFunction { args, .. }) => {
+			for arg in args {
+				collect_program_node_column_ordinals(program, *arg, columns);
+			}
+		}
 	}
 }
 

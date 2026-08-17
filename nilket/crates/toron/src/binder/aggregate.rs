@@ -192,6 +192,10 @@ pub(super) fn offset_bound_node(
 				.collect(),
 			else_input: offset_id(else_input),
 		},
+		BoundExprNode::ScalarFunction { id, args } => BoundExprNode::ScalarFunction {
+			id,
+			args: args.into_iter().map(offset_id).collect(),
+		},
 		BoundExprNode::Floor { input } => BoundExprNode::Floor {
 			input: offset_id(input),
 		},

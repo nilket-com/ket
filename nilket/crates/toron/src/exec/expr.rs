@@ -315,6 +315,13 @@ impl Executor {
 				let res = is_not_null(&arr)?;
 				Ok(Arc::new(res))
 			}
+			Expr::ScalarFunction { id, args } => {
+				let args = args
+					.iter()
+					.map(|arg| self.evaluate_expr(arg, batch))
+					.collect::<Result<Vec<_>, ExecutionError>>()?;
+				evaluate_scalar_function(*id, &args)
+			}
 			Expr::Floor(inner) => {
 				let arr = self.evaluate_expr(inner, batch)?;
 				evaluate_floor(&arr)
@@ -456,6 +463,13 @@ impl Executor {
 						.collect::<Result<Vec<_>, ExecutionError>>()?;
 					let else_array = evaluated_child(&outputs, *else_input)?;
 					evaluate_case(&when_then, else_array)?
+				}
+				BoundExprNode::ScalarFunction { id, args } => {
+					let args = args
+						.iter()
+						.map(|arg| evaluated_child(&outputs, *arg))
+						.collect::<Result<Vec<_>, ExecutionError>>()?;
+					evaluate_scalar_function(*id, &args)?
 				}
 				BoundExprNode::Floor { input } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -662,6 +676,52 @@ fn evaluate_bound_unary(op: &BoundUnaryOp, arr: &ArrayRef) -> Result<ArrayRef, E
 		BoundUnaryOp::IsNull => Ok(Arc::new(is_null(arr)?)),
 		BoundUnaryOp::IsNotNull => Ok(Arc::new(is_not_null(arr)?)),
 	}
+}
+
+fn evaluate_scalar_function(
+	id: ScalarFunctionId,
+	args: &[ArrayRef],
+) -> Result<ArrayRef, ExecutionError> {
+	let metadata = crate::ir::scalar_function_metadata(id);
+	if !metadata.arity.accepts(args.len()) {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"internal: {} received {} arguments after binding",
+				metadata.sql_name,
+				args.len()
+			),
+		});
+	}
+	match (
+		metadata.evaluator,
+		metadata.null_behavior,
+		metadata.non_finite_behavior,
+	) {
+		(
+			ScalarFunctionEvaluator::Exp,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_exp(&args[0]),
+	}
+}
+
+fn evaluate_exp(input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	if let Some(input) = input.as_any().downcast_ref::<Float32Array>() {
+		return Ok(Arc::new(Float32Array::from_iter(
+			input.iter().map(|value| value.map(|value| value.exp())),
+		)) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Float64Array>() {
+		return Ok(Arc::new(Float64Array::from_iter(
+			input.iter().map(|value| value.map(|value| value.exp())),
+		)) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"EXP expects Float32 or Float64 input, got {:?}",
+			input.data_type()
+		),
+	})
 }
 
 fn evaluate_in_list(
@@ -2460,6 +2520,28 @@ mod tests {
 			zero.is_err(),
 			"a zero interval must be refused, not divided by"
 		);
+	}
+
+	#[test]
+	fn exp_propagates_null_and_non_finite_inputs_from_registry_metadata() {
+		let input = Arc::new(Float64Array::from(vec![
+			Some(0.0),
+			Some(f64::NAN),
+			Some(f64::INFINITY),
+			Some(f64::NEG_INFINITY),
+			None,
+		])) as ArrayRef;
+		let output = evaluate_scalar_function(ScalarFunctionId::Exp, &[input])
+			.expect("registered EXP evaluator");
+		let values = output
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("Float64 output");
+		assert_eq!(values.value(0), 1.0);
+		assert!(values.value(1).is_nan());
+		assert!(values.value(2).is_infinite() && values.value(2).is_sign_positive());
+		assert_eq!(values.value(3), 0.0);
+		assert!(values.is_null(4));
 	}
 	use super::*;
 	#[test]

@@ -38,6 +38,7 @@ pub(crate) mod recursive_cte;
 pub(crate) mod ring_placement;
 pub(crate) mod rune_frontend;
 pub(crate) mod rune_optimizer_readouts;
+pub(crate) mod scalar_functions;
 pub(crate) mod scalar_subquery;
 pub(crate) mod scan_attribution;
 pub(crate) mod select_distinct;

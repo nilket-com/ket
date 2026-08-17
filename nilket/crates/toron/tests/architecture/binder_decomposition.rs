@@ -1,6 +1,6 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 15] = [
+const BINDER_MODULES: [&str; 16] = [
 	"aggregate",
 	"aggregate_exchange",
 	"arithmetic",
@@ -13,6 +13,7 @@ const BINDER_MODULES: [&str; 15] = [
 	"outer_join_demotion",
 	"pushdown",
 	"runtime_evidence",
+	"scalar_function",
 	"scalar_reduction",
 	"selectivity",
 	"set_ops",
@@ -35,6 +36,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/outer_join_demotion.rs",
 		"src/binder/pushdown.rs",
 		"src/binder/runtime_evidence.rs",
+		"src/binder/scalar_function.rs",
 		"src/binder/scalar_reduction.rs",
 		"src/binder/selectivity.rs",
 		"src/binder/set_ops.rs",
@@ -193,9 +195,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// a configuration field, not a new pass or IR node — the lineage tracer it governs lives in
 	// distributed/fragment.rs. Bumped by exactly its cost, not rounded up.
 	// ADR 552 adds the terminal density bind arm and its globally-gathered child exchange.
+	// ADR 553 adds the ScalarFunction bind arm; function-specific type binding lives in
+	// binder/scalar_function.rs.
 	assert!(
-		lines <= 6_327,
-		"binder root has {lines} lines; expected <= 6,327 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_331,
+		"binder root has {lines} lines; expected <= 6,331 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

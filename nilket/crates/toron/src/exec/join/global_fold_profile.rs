@@ -538,6 +538,7 @@ fn expression_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 			children.push(*else_input);
 			children
 		}
+		BoundExprNode::ScalarFunction { args, .. } => args.clone(),
 	}
 }
 
@@ -554,6 +555,7 @@ fn expression_node_kind(node: &BoundExprNode) -> &'static str {
 		BoundExprNode::Like { .. } => "like",
 		BoundExprNode::Substring { .. } => "substring",
 		BoundExprNode::Case { .. } => "case",
+		BoundExprNode::ScalarFunction { .. } => "scalar_function",
 		BoundExprNode::Floor { .. } => "floor",
 		BoundExprNode::TimeBucket { .. } => "time_bucket",
 		BoundExprNode::AtTimeZone { .. } => "at_time_zone",

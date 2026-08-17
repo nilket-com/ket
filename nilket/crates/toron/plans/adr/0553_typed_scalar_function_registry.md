@@ -87,10 +87,13 @@ Without it, the registry is the thing people use when convenient, and the next
 capability under deadline adds a variant exactly as every previous one did. A
 foundation with no guard is a suggestion.
 
-### 6. No functions in this record
+### 6. One reference function, not a shopping list
 
-This adds the mechanism. `exp`, `pow`, `sqrt`, `abs` are the following cut, and
-their cost is this record's success measure rather than its content.
+`exp` is in this record because the acceptance gates already depend on it: it is
+the executable proof that registration, SQL, Rune, binding, metadata, and
+evaluation share one canonical identifier. `pow`, `sqrt`, `abs`, and their
+neighbours remain the following cut, and their cost is this record's success
+measure rather than its content.
 
 ## Acceptance
 

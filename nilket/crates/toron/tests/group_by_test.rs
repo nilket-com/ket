@@ -1788,6 +1788,34 @@ async fn select_distinct_order_by_non_projected_column_rejects() {
 }
 
 #[tokio::test]
+async fn adr553_sql_and_rune_exp_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT EXP(price) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([exp(col("price"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL EXP");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune exp");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL EXP digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune exp digest")
+	);
+}
+
+#[tokio::test]
 async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");
 	let rune_logical = rune_plan(

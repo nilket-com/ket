@@ -9,9 +9,9 @@ use crate::catalog::{
 };
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{
-	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId, ScalarValue,
-	TemporalExtractField, TemporalTruncField, WindowFrame, WindowFunction,
-	field_with_logical_type_metadata,
+	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId,
+	ScalarFunctionId, ScalarValue, TemporalExtractField, TemporalTruncField, WindowFrame,
+	WindowFunction, field_with_logical_type_metadata,
 };
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
@@ -119,6 +119,10 @@ pub enum BoundExprNode {
 	Case {
 		when_then: Vec<(BoundExprId, BoundExprId)>,
 		else_input: BoundExprId,
+	},
+	ScalarFunction {
+		id: ScalarFunctionId,
+		args: Vec<BoundExprId>,
 	},
 	Floor {
 		input: BoundExprId,
@@ -652,6 +656,18 @@ impl BoundExprProgramBuilder {
 		)
 	}
 
+	pub fn append_scalar_function(
+		&mut self,
+		id: ScalarFunctionId,
+		args: Vec<BoundExprId>,
+		output_type: DataType,
+	) -> BoundExprId {
+		for arg in &args {
+			self.assert_existing_child(*arg);
+		}
+		self.append_node(BoundExprNode::ScalarFunction { id, args }, output_type)
+	}
+
 	pub fn append_time_bucket(
 		&mut self,
 		interval: std::time::Duration,
@@ -888,6 +904,15 @@ impl BoundExprProgram {
 				}
 				Some(nullable)
 			}
+			BoundExprNode::ScalarFunction { id, args } => {
+				match crate::ir::scalar_function_metadata(*id).null_behavior {
+					crate::ir::ScalarFunctionNullBehavior::Propagates => args
+						.iter()
+						.map(|arg| self.node_nullable(*arg))
+						.collect::<Option<Vec<_>>>()
+						.map(|nullability| nullability.into_iter().any(|nullable| nullable)),
+				}
+			}
 			BoundExprNode::Floor { input }
 			| BoundExprNode::TimeBucket { input, .. }
 			| BoundExprNode::AtTimeZone { input, .. }
@@ -1055,6 +1080,14 @@ impl BoundExprProgram {
 				parts.push("END".to_string());
 				parts.join(" ")
 			}
+			BoundExprNode::ScalarFunction { id, args } => format!(
+				"{}({})",
+				crate::ir::scalar_function_metadata(*id).sql_name,
+				args.iter()
+					.map(|arg| self.pretty_node(*arg))
+					.collect::<Vec<_>>()
+					.join(", ")
+			),
 			BoundExprNode::TimeBucket { interval, input } => {
 				format!("TIME_BUCKET({interval:?}, {})", self.pretty_node(*input))
 			}
@@ -1102,6 +1135,7 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::AtTimeZone { input, .. }
 		| BoundExprNode::Extract { input, .. }
 		| BoundExprNode::DateTrunc { input, .. } => vec![*input],
+		BoundExprNode::ScalarFunction { args, .. } => args.clone(),
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {
 			let mut children = Vec::with_capacity(list.len() + 1);

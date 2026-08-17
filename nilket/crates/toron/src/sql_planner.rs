@@ -6830,10 +6830,33 @@ impl SqlPlanner {
 					};
 					Ok(Expr::TimeBucket(interval, Box::new(ts)))
 				}
-				None => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
+				None => self
+					.lower_scalar_function(f)?
+					.ok_or_else(|| unsupported(format!("unsupported expression: {sql_expr:?}"))),
 			},
 			_ => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
 		}
+	}
+
+	fn lower_scalar_function(&self, function: &Function) -> Result<Option<Expr>, FrontendError> {
+		let Some(id) = crate::ir::scalar_function_from_sql_name(&function.name.to_string()) else {
+			return Ok(None);
+		};
+		let metadata = crate::ir::scalar_function_metadata(id);
+		let args = function_positional_args(function, metadata.sql_name)?;
+		if !metadata.arity.accepts(args.len()) {
+			return Err(unsupported(format!(
+				"{} expects {}, got {}",
+				metadata.sql_name,
+				metadata.arity.description(),
+				args.len()
+			)));
+		}
+		let args = args
+			.into_iter()
+			.map(|arg| self.lower_expr(arg))
+			.collect::<Result<Vec<_>, _>>()?;
+		Ok(Some(Expr::ScalarFunction { id, args }))
 	}
 
 	fn lower_if(&self, function: &Function) -> Result<Expr, FrontendError> {
@@ -7310,6 +7333,12 @@ fn validate_hidden_sort_key_refs(
 			}
 			if let Some(else_expr) = else_expr {
 				validate_hidden_sort_key_refs(else_expr, visible_names)?;
+			}
+			Ok(())
+		}
+		Expr::ScalarFunction { args, .. } => {
+			for arg in args {
+				validate_hidden_sort_key_refs(arg, visible_names)?;
 			}
 			Ok(())
 		}
@@ -8221,6 +8250,14 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			field.hash(state);
 			hash_expr_structural(inner, state);
 		}
+		Expr::ScalarFunction { id, args } => {
+			32u8.hash(state);
+			id.hash(state);
+			args.len().hash(state);
+			for arg in args {
+				hash_expr_structural(arg, state);
+			}
+		}
 	}
 }
 
@@ -8299,6 +8336,23 @@ pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 		}
 		(Expr::DateTrunc(left_field, left), Expr::DateTrunc(right_field, right)) => {
 			left_field == right_field && expr_structural_eq(left, right)
+		}
+		(
+			Expr::ScalarFunction {
+				id: left_id,
+				args: left_args,
+			},
+			Expr::ScalarFunction {
+				id: right_id,
+				args: right_args,
+			},
+		) => {
+			left_id == right_id
+				&& left_args.len() == right_args.len()
+				&& left_args
+					.iter()
+					.zip(right_args)
+					.all(|(left, right)| expr_structural_eq(left, right))
 		}
 		(
 			Expr::Like {
@@ -8665,6 +8719,7 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 	match expr {
 		Expr::Column(column) => column.qualifier.is_some(),
 		Expr::Literal(_) | Expr::UntypedNull => false,
+		Expr::ScalarFunction { args, .. } => args.iter().any(expr_contains_qualified_column),
 		Expr::LogicalAscription { expr: inner, .. }
 		| Expr::SqlLogicalCast { expr: inner, .. }
 		| Expr::SqlConvert { expr: inner, .. }
@@ -9725,6 +9780,13 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 		Expr::IsNotNull(inner) => {
 			Expr::IsNotNull(Box::new(canonical_aggregate_signature_expr(inner)))
 		}
+		Expr::ScalarFunction { id, args } => Expr::ScalarFunction {
+			id: *id,
+			args: args
+				.iter()
+				.map(canonical_aggregate_signature_expr)
+				.collect(),
+		},
 		Expr::Floor(inner) => Expr::Floor(Box::new(canonical_aggregate_signature_expr(inner))),
 		Expr::TimeBucket(interval, inner) => Expr::TimeBucket(
 			*interval,
@@ -11784,6 +11846,9 @@ mod tests {
 						.any(|expr| expr_references(expr, qualifier, name))
 			}
 			Expr::Like { expr, .. } => expr_references(expr, qualifier, name),
+			Expr::ScalarFunction { args, .. } => {
+				args.iter().any(|arg| expr_references(arg, qualifier, name))
+			}
 			Expr::Case {
 				when_then,
 				else_expr,
@@ -11796,6 +11861,23 @@ mod tests {
 			}
 			Expr::Literal(_) | Expr::UntypedNull => false,
 		}
+	}
+
+	#[test]
+	fn sql_exp_lowers_to_the_registered_scalar_identifier() {
+		let plan = SqlPlanner::new()
+			.plan("SELECT EXP(price) FROM sales")
+			.expect("plan EXP");
+		let LogicalPlan::Project { exprs, .. } = plan else {
+			panic!("EXP projection must lower to Project");
+		};
+		assert!(matches!(
+			exprs.as_slice(),
+			[Expr::ScalarFunction {
+				id: crate::ir::ScalarFunctionId::Exp,
+				args,
+			}] if matches!(args.as_slice(), [Expr::Column(column)] if column.name.0 == "price")
+		));
 	}
 
 	fn filter_count(plan: &LogicalPlan) -> usize {

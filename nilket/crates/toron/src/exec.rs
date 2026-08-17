@@ -14,9 +14,9 @@ use crate::ir::{
 	AggregateFunction, BoundAggregateCall, BoundBinaryOp, BoundExprId, BoundExprNode,
 	BoundExprProgram, BoundUnaryOp, BoundWindowCall, ColumnOrdinal, ExecutionPlan,
 	ExecutionSortKey, FilterDisposition, JoinKind, JoinReplayId, JoinStrategy, MorselId, QueryId,
-	QueryProfileHint, ScalarValue, SessionId, SystemTableKind, TableId, TemporalExtractField,
-	TemporalTruncField, ValueFunction, WindowFrame, WindowFrameBound, WindowFrameDelta,
-	WindowFrameUnit, WindowFunction, nanos_per_timestamp_unit,
+	QueryProfileHint, ScalarFunctionEvaluator, ScalarFunctionId, ScalarValue, SessionId,
+	SystemTableKind, TableId, TemporalExtractField, TemporalTruncField, ValueFunction, WindowFrame,
+	WindowFrameBound, WindowFrameDelta, WindowFrameUnit, WindowFunction, nanos_per_timestamp_unit,
 };
 #[cfg(test)]
 use crate::ir::{Expr, LogicalPlan};

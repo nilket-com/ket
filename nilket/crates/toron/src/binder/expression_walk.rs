@@ -30,6 +30,12 @@ pub(super) fn reject_storage_synthetic_returning_reference(
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner) => reject_storage_synthetic_returning_reference(inner),
+		Expr::ScalarFunction { args, .. } => {
+			for arg in args {
+				reject_storage_synthetic_returning_reference(arg)?;
+			}
+			Ok(())
+		}
 		Expr::InList { expr, list, .. } => {
 			reject_storage_synthetic_returning_reference(expr)?;
 			for item in list {
@@ -102,6 +108,12 @@ pub(super) fn collect_logical_cast_names(
 		| Expr::AtTimeZone(expr, _)
 		| Expr::Extract(_, expr)
 		| Expr::DateTrunc(_, expr) => collect_logical_cast_names(expr, names),
+		Expr::ScalarFunction { args, .. } => {
+			for arg in args {
+				collect_logical_cast_names(arg, names)?;
+			}
+			Ok(())
+		}
 		Expr::InList { expr, list, .. } => {
 			collect_logical_cast_names(expr, names)?;
 			for item in list {

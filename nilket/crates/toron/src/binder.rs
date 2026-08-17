@@ -67,6 +67,7 @@ mod outer_count_preaggregation;
 mod outer_join_demotion;
 mod pushdown;
 mod runtime_evidence;
+mod scalar_function;
 mod scalar_reduction;
 mod selectivity;
 mod set_ops;
@@ -82,6 +83,7 @@ use self::join_order::*;
 use self::outer_count_preaggregation::*;
 use self::outer_join_demotion::*;
 use self::pushdown::*;
+use self::scalar_function::*;
 use self::selectivity::*;
 use self::set_ops::{
 	all_output_columns_program, bind_union, distinct_input_unsupported_message,
@@ -4978,6 +4980,11 @@ fn collect_program_node_columns(
 			}
 			collect_program_node_columns(program, *else_input, columns);
 		}
+		Some(BoundExprNode::ScalarFunction { args, .. }) => {
+			for arg in args {
+				collect_program_node_columns(program, *arg, columns);
+			}
+		}
 	}
 }
 
@@ -5143,6 +5150,9 @@ fn bind_expr_into_program(
 		Expr::IsNotNull(inner) => {
 			let inner = bind_null_test_input(builder, input_schema, ctx, inner)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNotNull, inner, DataType::Boolean))
+		}
+		Expr::ScalarFunction { id, args } => {
+			bind_scalar_function(builder, input_schema, ctx, *id, args)
 		}
 		Expr::Floor(inner) => bind_floor(builder, input_schema, ctx, inner),
 		Expr::TimeBucket(interval, inner) => {

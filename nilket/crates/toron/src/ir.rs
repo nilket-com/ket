@@ -13,7 +13,11 @@ use wendelon_client::{
 #[path = "ir/execution.rs"]
 pub mod execution;
 
+#[path = "ir/scalar_function.rs"]
+pub mod scalar_function;
+
 pub use execution::*;
+pub use scalar_function::*;
 
 /// Fixed hash-table bookkeeping charged by the direct in-memory join guard for each
 /// build row. Keep this estimate in IR: both binder admission and execution must use
@@ -887,6 +891,10 @@ pub enum Expr {
 	},
 	IsNull(Box<Expr>),
 	IsNotNull(Box<Expr>),
+	ScalarFunction {
+		id: ScalarFunctionId,
+		args: Vec<Expr>,
+	},
 	Floor(Box<Expr>),
 	TimeBucket(std::time::Duration, Box<Expr>),
 	AtTimeZone(Box<Expr>, String),
@@ -904,7 +912,13 @@ impl Expr {
 	}
 
 	pub fn is_deterministic(&self) -> bool {
-		true
+		match self {
+			Self::ScalarFunction { id, args } => {
+				scalar_function_metadata(*id).deterministic
+					&& args.iter().all(Self::is_deterministic)
+			}
+			_ => true,
+		}
 	}
 
 	pub fn is_pbc_pushdown_eligible(&self) -> bool {
@@ -928,6 +942,10 @@ impl Expr {
 			| Self::AtTimeZone(_, _)
 			| Self::Extract(_, _)
 			| Self::DateTrunc(_, _) => false,
+			Self::ScalarFunction { id, args } => {
+				scalar_function_metadata(*id).pbc_pushdown_eligible
+					&& args.iter().all(Self::is_pbc_pushdown_eligible)
+			}
 			Self::Eq(left, right)
 			| Self::Neq(left, right)
 			| Self::Lt(left, right)

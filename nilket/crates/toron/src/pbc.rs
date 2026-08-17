@@ -155,6 +155,19 @@ impl PbcCompiler {
 						"CASE is not PBC-eligible".to_string(),
 					));
 				}
+				BoundExprNode::ScalarFunction { id, .. } => {
+					let metadata = crate::ir::scalar_function_metadata(*id);
+					if !metadata.pbc_pushdown_eligible {
+						return Err(PushdownDeclineReason::ExpressionShapeUnsupported(format!(
+							"{} is not PBC-eligible",
+							metadata.sql_name
+						)));
+					}
+					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(format!(
+						"{} has no PBC opcode",
+						metadata.sql_name
+					)));
+				}
 				BoundExprNode::Floor { .. } => {
 					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 						"FLOOR is not PBC-eligible".to_string(),
@@ -239,6 +252,7 @@ impl PbcCompiler {
 			| BoundExprNode::Like { .. }
 			| BoundExprNode::Substring { .. }
 			| BoundExprNode::Case { .. }
+			| BoundExprNode::ScalarFunction { .. }
 			| BoundExprNode::Floor { .. }
 			| BoundExprNode::TimeBucket { .. }
 			| BoundExprNode::AtTimeZone { .. }

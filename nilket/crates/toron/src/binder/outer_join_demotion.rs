@@ -2035,6 +2035,10 @@ fn guard_filter_pushdown_safe(expr: &Expr) -> bool {
 				.as_ref()
 				.map_or(true, |else_expr| guard_filter_pushdown_safe(else_expr))
 		}
+		Expr::ScalarFunction { id, args } => {
+			crate::ir::scalar_function_metadata(*id).pbc_pushdown_eligible
+				&& args.iter().all(guard_filter_pushdown_safe)
+		}
 		Expr::SqlConvert { .. }
 		| Expr::Cast(_, _)
 		| Expr::Add(_, _)
@@ -2317,6 +2321,16 @@ where
 		}
 		Expr::IsNull(inner) => Expr::IsNull(Box::new(child!(inner))),
 		Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(child!(inner))),
+		Expr::ScalarFunction { id, args } => {
+			let mut remapped_args = Vec::with_capacity(args.len());
+			for arg in args {
+				remapped_args.push(child!(arg));
+			}
+			Expr::ScalarFunction {
+				id: *id,
+				args: remapped_args,
+			}
+		}
 		Expr::Floor(inner) => Expr::Floor(Box::new(child!(inner))),
 		Expr::TimeBucket(duration, inner) => Expr::TimeBucket(*duration, Box::new(child!(inner))),
 		Expr::AtTimeZone(inner, timezone) => {
@@ -2588,6 +2602,7 @@ fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> boo
 				|| list.iter().any(|item| expr_any_column(item, predicate))
 		}
 		Expr::Like { expr, .. } => expr_any_column(expr, predicate),
+		Expr::ScalarFunction { args, .. } => args.iter().any(|arg| expr_any_column(arg, predicate)),
 		Expr::Case {
 			when_then,
 			else_expr,
@@ -2657,6 +2672,15 @@ fn expr_column_resolution_in_scope(expr: &Expr, scope: &RelationScope) -> (bool,
 			result
 		}
 		Expr::Like { expr, .. } => expr_column_resolution_in_scope(expr, scope),
+		Expr::ScalarFunction { args, .. } => {
+			let mut result = (false, true);
+			for arg in args {
+				let arg = expr_column_resolution_in_scope(arg, scope);
+				result.0 |= arg.0;
+				result.1 &= arg.1;
+			}
+			result
+		}
 		Expr::Case {
 			when_then,
 			else_expr,
@@ -2768,6 +2792,7 @@ fn null_rejecting_sides(
 		| Expr::AtTimeZone(_, _)
 		| Expr::Extract(_, _)
 		| Expr::DateTrunc(_, _) => NullRejectedSides::default(),
+		Expr::ScalarFunction { .. } => NullRejectedSides::default(),
 	}
 }
 
@@ -2951,6 +2976,13 @@ fn conjunct_column_sides(
 			sides
 		}
 		Expr::Like { expr, .. } => conjunct_column_sides(expr, left_scope, right_scope),
+		Expr::ScalarFunction { args, .. } => {
+			let mut sides = ConjunctColumnSides::default();
+			for arg in args {
+				sides.merge(conjunct_column_sides(arg, left_scope, right_scope));
+			}
+			sides
+		}
 		Expr::Case {
 			when_then,
 			else_expr,

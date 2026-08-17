@@ -4,9 +4,9 @@ use crate::error::{FrontendError, RuneDiagnosticSpan};
 use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, KernelDensitySpec, LogicalPlan, LogicalTypeId,
-	PRODUCT_ID_LOGICAL_TYPE, ScalarValue, SortExpr, TemporalExtractField, TemporalTruncField,
-	ValueFunction, WindowFrame, WindowFrameBound, WindowFrameDelta, WindowFrameUnit,
-	WindowFunction, WindowFunctionCall,
+	PRODUCT_ID_LOGICAL_TYPE, ScalarFunctionId, ScalarValue, SortExpr, TemporalExtractField,
+	TemporalTruncField, ValueFunction, WindowFrame, WindowFrameBound, WindowFrameDelta,
+	WindowFrameUnit, WindowFunction, WindowFunctionCall,
 };
 use crate::sql_planner::{
 	SqlPlanner, build_join_plan, expr_to_join_keys, window_function_default_name,
@@ -1003,6 +1003,15 @@ pub fn approx_quantile(val: RuneExpr, q: f64) -> RuneAggr {
 	}
 }
 
+pub fn exp(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Exp,
+			args: vec![expr.expr],
+		},
+	}
+}
+
 pub fn count_all() -> RuneAggr {
 	RuneAggr {
 		func: AggregateFunction::CountAll,
@@ -1546,6 +1555,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["date_part"], date_part).build()?;
 	m.function(["date_trunc"], date_trunc).build()?;
 	m.function(["at_time_zone"], at_time_zone).build()?;
+	m.function(["exp"], exp).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
 	m.function(["count_all"], count_all).build()?;
@@ -1978,6 +1988,18 @@ fn looks_like_memory_error(message: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn rune_exp_uses_the_registered_scalar_identifier() {
+		let expr = exp(lit_f64(1.0)).expr;
+		assert!(matches!(
+			expr,
+			Expr::ScalarFunction {
+				id: ScalarFunctionId::Exp,
+				args,
+			} if matches!(args.as_slice(), [Expr::Literal(ScalarValue::Float64(Some(value)))] if *value == 1.0)
+		));
+	}
 
 	#[tokio::test]
 	async fn wall_timeout_fires_as_typed_timeout_on_yielding_script() {

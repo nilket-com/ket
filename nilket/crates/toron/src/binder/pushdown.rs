@@ -2143,6 +2143,13 @@ pub(super) fn clone_bound_subgraph(
 			let else_input = clone_bound_subgraph(source, *else_input, builder, remap)?;
 			builder.append_case(when_then, else_input, output_type)
 		}
+		BoundExprNode::ScalarFunction { id, args } => {
+			let args = args
+				.iter()
+				.map(|arg| clone_bound_subgraph(source, *arg, builder, remap))
+				.collect::<Option<Vec<_>>>()?;
+			builder.append_scalar_function(*id, args, output_type)
+		}
 		BoundExprNode::Floor { input } => {
 			let input = clone_bound_subgraph(source, *input, builder, remap)?;
 			builder.append_floor(input, output_type)
@@ -2465,5 +2472,6 @@ pub(super) fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 			children.push(*else_input);
 			children
 		}
+		BoundExprNode::ScalarFunction { args, .. } => args.clone(),
 	}
 }
