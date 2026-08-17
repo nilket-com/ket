@@ -13,8 +13,8 @@ use crate::plot::core::PlotType;
 use crate::plot::spec::{
 	BarWidth, BoxPlotFields, BubbleFieldNames, BubbleFields, CategoryGap, FunnelFields,
 	HeatmapFields, HoverTextSize, LayerSettings, LayeredPlotSpec, LegendPosition,
-	MultivariateFields, Override, PieFields, PointSize, Presence, RadialDialFields, StrokeWidth,
-	SubtitleTextSize, TickRotation, TitleTextSize, ViolinFields,
+	MultivariateFields, Override, PieFields, PlotPaddingPixels, PointSize, Presence,
+	RadialDialFields, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize, ViolinFields,
 };
 use crate::plot::theme::{
 	PlotDomainOverrides, PlotGuideSettings, PlotSettingsLayer, PlotSkinSelection,
@@ -187,6 +187,52 @@ enum FigureElementKind {
 	YMinorTicks(u32),
 	HoverSize(HoverTextSize),
 	XTickRotation(TickRotation),
+	Padding,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct FigurePadding {
+	top: Option<PlotPaddingPixels>,
+	right: Option<PlotPaddingPixels>,
+	bottom: Option<PlotPaddingPixels>,
+	left: Option<PlotPaddingPixels>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PaddingEdge {
+	Top,
+	Right,
+	Bottom,
+	Left,
+}
+
+impl PaddingEdge {
+	fn index(self) -> usize {
+		match self {
+			Self::Top => 0,
+			Self::Right => 1,
+			Self::Bottom => 2,
+			Self::Left => 3,
+		}
+	}
+
+	fn name(self) -> &'static str {
+		match self {
+			Self::Top => "top",
+			Self::Right => "right",
+			Self::Bottom => "bottom",
+			Self::Left => "left",
+		}
+	}
+
+	fn slot(self, padding: &mut FigurePadding) -> &mut Option<PlotPaddingPixels> {
+		match self {
+			Self::Top => &mut padding.top,
+			Self::Right => &mut padding.right,
+			Self::Bottom => &mut padding.bottom,
+			Self::Left => &mut padding.left,
+		}
+	}
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -202,6 +248,8 @@ struct RuneFigureElement {
 	origin: Origin,
 	font_size: Option<FigureTextSize>,
 	font_size_origin: Option<Origin>,
+	padding: FigurePadding,
+	padding_edge_origins: [Option<Origin>; 4],
 }
 
 impl RuneFigureElement {
@@ -211,6 +259,8 @@ impl RuneFigureElement {
 			origin,
 			font_size: None,
 			font_size_origin: None,
+			padding: FigurePadding::default(),
+			padding_edge_origins: [None; 4],
 		}
 	}
 }
@@ -452,6 +502,7 @@ fn build_context() -> Result<Context, String> {
 		("__y_minor_ticks", raw_y_minor_ticks as RawFunction),
 		("__hover_size", raw_hover_size as RawFunction),
 		("__x_tick_rotation", raw_x_tick_rotation as RawFunction),
+		("__padding", raw_padding as RawFunction),
 		("__table", raw_table as RawFunction),
 		("__layers", raw_layers as RawFunction),
 		("__figure", raw_figure as RawFunction),
@@ -469,6 +520,21 @@ fn build_context() -> Result<Context, String> {
 		.raw_function("__font_size", raw_figure_font_size as RawFunction)
 		.build_associated::<RuneSkin>()
 		.map_err(module_error)?;
+	for (name, function) in [
+		("__top", raw_figure_padding_top as RawFunction),
+		("__right", raw_figure_padding_right as RawFunction),
+		("__bottom", raw_figure_padding_bottom as RawFunction),
+		("__left", raw_figure_padding_left as RawFunction),
+	] {
+		module
+			.raw_function(name, function)
+			.build_associated::<RuneFigureElement>()
+			.map_err(module_error)?;
+		module
+			.raw_function(name, function)
+			.build_associated::<RuneSkin>()
+			.map_err(module_error)?;
+	}
 	for (name, function) in [
 		("__point_size", raw_mark_point_size as RawFunction),
 		("__stroke_width", raw_mark_stroke_width as RawFunction),
@@ -1826,6 +1892,131 @@ fn raw_x_tick_rotation(
 	)
 }
 
+fn raw_padding(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let element = if values.len() == 2 {
+		RuneFigureElement::new(Ok(FigureElementKind::Padding), origin)
+	} else {
+		RuneFigureElement::new(
+			Err(PresentationFailure::new(
+				origin,
+				"padding() takes no arguments",
+			)),
+			origin,
+		)
+	};
+	store(out, stack, element)
+}
+
+fn raw_figure_padding_top(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_figure_padding_edge(PaddingEdge::Top, stack, addr, args, out)
+}
+
+fn raw_figure_padding_right(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_figure_padding_edge(PaddingEdge::Right, stack, addr, args, out)
+}
+
+fn raw_figure_padding_bottom(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_figure_padding_edge(PaddingEdge::Bottom, stack, addr, args, out)
+}
+
+fn raw_figure_padding_left(
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	raw_figure_padding_edge(PaddingEdge::Left, stack, addr, args, out)
+}
+
+fn raw_figure_padding_edge(
+	edge: PaddingEdge,
+	stack: &mut dyn Memory,
+	addr: InstAddress,
+	args: usize,
+	out: Output,
+) -> VmResult<()> {
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let mut element = match values
+		.first()
+		.cloned()
+		.map(rune::from_value::<RuneFigureElement>)
+	{
+		Some(Ok(element)) => element,
+		_ => RuneFigureElement::new(
+			Err(PresentationFailure::new(
+				origin,
+				format!("{}(...) requires padding()", edge.name()),
+			)),
+			origin,
+		),
+	};
+	if element.value.is_err() {
+		return store(out, stack, element);
+	}
+	if !matches!(element.value.as_ref(), Ok(FigureElementKind::Padding)) {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}(...) requires padding()", edge.name()),
+		));
+		return store(out, stack, element);
+	}
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}(...) takes exactly one numeric value", edge.name()),
+		));
+		return store(out, stack, element);
+	}
+	let index = edge.index();
+	if element.padding_edge_origins[index].is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("padding().{}(...) may appear at most once", edge.name()),
+		));
+		return store(out, stack, element);
+	}
+	let Some(pixels) = rune_number(&values[1]) else {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!("{}(...) requires a numeric value", edge.name()),
+		));
+		return store(out, stack, element);
+	};
+	let value = match PlotPaddingPixels::new(pixels as f32) {
+		Ok(value) => value,
+		Err(error) => {
+			element.value = Err(PresentationFailure::new(origin, error.to_string()));
+			return store(out, stack, element);
+		}
+	};
+	*edge.slot(&mut element.padding) = Some(value);
+	element.padding_edge_origins[index] = Some(origin);
+	store(out, stack, element)
+}
+
 fn raw_numeric_scalar(
 	kind: NumericScalarConstructor,
 	name: &'static str,
@@ -3109,6 +3300,7 @@ struct FigureParts {
 	y_minor_ticks: Option<(u32, Origin)>,
 	hover_size: Option<(HoverTextSize, Origin)>,
 	x_tick_rotation: Option<(TickRotation, Origin)>,
+	padding: Option<(FigurePadding, Origin)>,
 	body: Option<(RunePlotBody, Origin)>,
 }
 
@@ -3120,7 +3312,13 @@ fn decode_figure(value: &Value, origin: Origin) -> Result<RunePlotIntent, Presen
 	for value in values.iter() {
 		if let Ok(element) = value.borrow_ref::<RuneFigureElement>() {
 			let kind = element.value.clone()?;
-			merge_element(&mut parts, kind, element.font_size, element.origin)?;
+			merge_element(
+				&mut parts,
+				kind,
+				element.font_size,
+				element.padding,
+				element.origin,
+			)?;
 			continue;
 		}
 		if let Ok(skin) = value.borrow_ref::<RuneSkin>() {
@@ -3209,6 +3407,7 @@ fn merge_element(
 	parts: &mut FigureParts,
 	element: FigureElementKind,
 	font_size: Option<FigureTextSize>,
+	padding: FigurePadding,
 	origin: Origin,
 ) -> Result<(), PresentationFailure> {
 	match element {
@@ -3338,6 +3537,12 @@ fn merge_element(
 			origin,
 			"a figure has at most one x_tick_rotation element",
 		),
+		FigureElementKind::Padding => set_once(
+			&mut parts.padding,
+			(padding, origin),
+			origin,
+			"a figure has at most one padding element",
+		),
 	}
 }
 
@@ -3378,6 +3583,20 @@ impl FigureParts {
 		}
 		if let Some((rotation, _)) = self.x_tick_rotation {
 			authored_settings.x_tick_rotation = Override::Set(rotation);
+		}
+		if let Some((padding, _)) = self.padding {
+			if let Some(value) = padding.top {
+				authored_settings.plot_padding_top = Override::Set(value);
+			}
+			if let Some(value) = padding.right {
+				authored_settings.plot_padding_right = Override::Set(value);
+			}
+			if let Some(value) = padding.bottom {
+				authored_settings.plot_padding_bottom = Override::Set(value);
+			}
+			if let Some(value) = padding.left {
+				authored_settings.plot_padding_left = Override::Set(value);
+			}
 		}
 		if let Some((skin, _)) = &self.skin {
 			authored_settings.plot_skin = Override::Set(skin.clone());

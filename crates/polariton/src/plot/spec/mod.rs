@@ -189,6 +189,48 @@ impl fmt::Display for HoverTextSizeError {
 
 impl std::error::Error for HoverTextSizeError {}
 
+/// PRODUCT-0120's authored non-negative reservation at one plot edge.
+///
+/// The value is an author request, not a live-widget extent. Geometry clamps a
+/// too-small realized plot separately, while this value persists unchanged.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlotPaddingPixels(f32);
+
+impl Eq for PlotPaddingPixels {}
+
+impl PlotPaddingPixels {
+	pub const ZERO: Self = Self(0.0);
+
+	pub fn new(pixels: f32) -> Result<Self, PlotPaddingPixelsError> {
+		if pixels.is_finite() && pixels >= 0.0 {
+			Ok(Self(pixels))
+		} else {
+			Err(PlotPaddingPixelsError { pixels })
+		}
+	}
+
+	pub const fn pixels(self) -> f32 {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PlotPaddingPixelsError {
+	pixels: f32,
+}
+
+impl fmt::Display for PlotPaddingPixelsError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		write!(
+			f,
+			"plot padding must be finite and nonnegative, got {}",
+			self.pixels
+		)
+	}
+}
+
+impl std::error::Error for PlotPaddingPixelsError {}
+
 /// PRODUCT-0115's authored x-tick angle, in degrees.
 ///
 /// Rune, themes, panes, and persistence carry degrees; only the canvas

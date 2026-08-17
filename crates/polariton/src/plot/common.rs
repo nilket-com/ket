@@ -6,8 +6,8 @@ use crate::plot::colors::ColorTheme;
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
-	BarWidth, CategoryGap, HoverTextSize, LegendPosition, PointSize, ResolvedPresence, StrokeWidth,
-	SubtitleTextSize, TickRotation, TitleTextSize,
+	BarWidth, CategoryGap, HoverTextSize, LegendPosition, PlotPaddingPixels, PointSize,
+	ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation, TitleTextSize,
 };
 use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
 use crate::plot::theme::PlotSettings;
@@ -626,6 +626,12 @@ pub struct ResolvedPlotSettings {
 	pub plot_padding_bottom: f32,
 	pub plot_padding_left: f32,
 	pub plot_padding_right: f32,
+	/// PRODUCT-0120 tracks only explicit edge modifiers separately so derived
+	/// guides can floor them without changing legacy atomic-padding geometry.
+	pub authored_plot_padding_top: Option<PlotPaddingPixels>,
+	pub authored_plot_padding_bottom: Option<PlotPaddingPixels>,
+	pub authored_plot_padding_left: Option<PlotPaddingPixels>,
+	pub authored_plot_padding_right: Option<PlotPaddingPixels>,
 	pub title_size: TitleTextSize,
 	pub subtitle_size: SubtitleTextSize,
 	pub x_label_size: f32,
@@ -662,6 +668,30 @@ pub struct ResolvedPlotSettings {
 	pub category_gap: CategoryGap,
 }
 
+impl ResolvedPlotSettings {
+	/// PRODUCT-0120: zero is an explicit, round-trippable request but remains a
+	/// geometry no-op, preserving the legacy edge when an author asks for none.
+	pub(crate) fn effective_plot_padding_top(&self) -> f32 {
+		self.authored_plot_padding_top
+			.map(PlotPaddingPixels::pixels)
+			.filter(|pixels| *pixels > 0.0)
+			.unwrap_or(self.plot_padding_top)
+	}
+
+	pub(crate) fn effective_plot_padding_right(&self) -> f32 {
+		self.authored_plot_padding_right
+			.map(PlotPaddingPixels::pixels)
+			.filter(|pixels| *pixels > 0.0)
+			.unwrap_or(self.plot_padding_right)
+	}
+
+	pub(crate) fn explicit_plot_padding_right(&self) -> Option<f32> {
+		self.authored_plot_padding_right
+			.map(PlotPaddingPixels::pixels)
+			.filter(|pixels| *pixels > 0.0)
+	}
+}
+
 impl Default for ResolvedPlotSettings {
 	fn default() -> Self {
 		Self {
@@ -693,6 +723,10 @@ impl Default for ResolvedPlotSettings {
 			plot_padding_bottom: 80.0,
 			plot_padding_left: 100.0,
 			plot_padding_right: 20.0,
+			authored_plot_padding_top: None,
+			authored_plot_padding_bottom: None,
+			authored_plot_padding_left: None,
+			authored_plot_padding_right: None,
 			title_size: TitleTextSize::DEFAULT,
 			subtitle_size: SubtitleTextSize::DEFAULT,
 			x_label_size: 20.0,
@@ -1448,8 +1482,13 @@ impl VerticalGuideBands {
 			.filter(|label| !label.is_empty())
 			.map(|_| Self::FACET_LABEL_TOP_INSET + Self::facet_label_size(settings))
 			.unwrap_or(0.0);
-		let bottom = Self::x_axis_guides(requirements, x_label_visible, settings).bottom;
-		let left = if requirements.y.is_empty() {
+		let derived_bottom = Self::x_axis_guides(requirements, x_label_visible, settings).bottom;
+		let bottom = settings
+			.authored_plot_padding_bottom
+			.map(PlotPaddingPixels::pixels)
+			.map(|authored| derived_bottom.max(authored))
+			.unwrap_or(derived_bottom);
+		let derived_left = if requirements.y.is_empty() {
 			0.0
 		} else {
 			let title = (!matches!(&settings.y_label, ResolvedPresence::Hide))
@@ -1457,6 +1496,11 @@ impl VerticalGuideBands {
 				.unwrap_or(0.0);
 			(10.0 + requirements.estimated_y_width(settings.y_tick_size)).max(title)
 		};
+		let left = settings
+			.authored_plot_padding_left
+			.map(PlotPaddingPixels::pixels)
+			.map(|authored| derived_left.max(authored))
+			.unwrap_or(derived_left);
 		Self {
 			heading: title.max(subtitle),
 			facet,
@@ -1511,6 +1555,7 @@ impl VerticalGuideBands {
 		self.heading
 	}
 
+	#[cfg(test)]
 	pub(crate) fn plot_top(self, settings: &ResolvedPlotSettings) -> f32 {
 		self.heading + self.facet + settings.plot_padding_top
 	}
@@ -1526,8 +1571,8 @@ impl VerticalGuideBands {
 		settings: &ResolvedPlotSettings,
 	) -> Rect<Widget> {
 		let left = padding + self.left;
-		let right = padding + settings.plot_padding_right;
-		let top = padding + self.plot_top(settings);
+		let right = padding + settings.effective_plot_padding_right();
+		let top = padding + self.heading + self.facet + settings.effective_plot_padding_top();
 		let bottom = padding + self.bottom;
 		bounds.region(
 			bounds.x() + left,
@@ -1540,15 +1585,22 @@ impl VerticalGuideBands {
 	pub(crate) fn grid_tiled_area(
 		self,
 		outer: Rect<Widget>,
-		_settings: &ResolvedPlotSettings,
+		settings: &ResolvedPlotSettings,
 	) -> Rect<Widget> {
 		let left = self.left.min(outer.width());
 		let bottom = self.bottom.min(outer.height());
 		let top = self.heading.min((outer.height() - bottom).max(0.0));
+		// An explicit right edge belongs to the composed figure, so a grid
+		// reserves it once before cells divide. Legacy right padding stays local
+		// to preserve existing grid geometry when no edge is authored.
+		let right = settings
+			.explicit_plot_padding_right()
+			.unwrap_or(0.0)
+			.min((outer.width() - left).max(0.0));
 		outer.region(
 			outer.x() + left,
 			outer.y() + top,
-			(outer.width() - left).max(0.0),
+			(outer.width() - left - right).max(0.0),
 			(outer.height() - top - bottom).max(0.0),
 		)
 	}
@@ -1558,8 +1610,12 @@ impl VerticalGuideBands {
 		cell_bounds: Rect<Widget>,
 		settings: &ResolvedPlotSettings,
 	) -> Rect<Widget> {
-		let top = (self.facet + settings.plot_padding_top).min(cell_bounds.height());
-		let right = settings.plot_padding_right.min(cell_bounds.width());
+		let top = (self.facet + settings.effective_plot_padding_top()).min(cell_bounds.height());
+		let right = settings
+			.explicit_plot_padding_right()
+			.map(|_| 0.0)
+			.unwrap_or(settings.plot_padding_right)
+			.min(cell_bounds.width());
 		cell_bounds.region(
 			cell_bounds.x(),
 			cell_bounds.y() + top,
@@ -3181,6 +3237,93 @@ mod product_0106_vertical_guide_band_oracles {
 		assert_eq!(
 			area.height(),
 			400.0 - 12.0 - settings.plot_padding_top - settings.plot_padding_bottom
+		);
+	}
+
+	#[test]
+	fn product_0120_padding_edges_floor_guides_and_move_only_their_boundaries() {
+		let requirements = BandRequirements {
+			x: vec![AxisBandRequirement::Categories(vec![
+				"a deliberately long x label".to_owned(),
+			])],
+			y: vec![AxisBandRequirement::Categories(vec![
+				"a deliberately long y label".to_owned(),
+			])],
+		};
+		let pixels = |value| PlotPaddingPixels::new(value).unwrap();
+		let base = ResolvedPlotSettings::default();
+		let derived = VerticalGuideBands::resolve_with_requirements_and_x_label(
+			"",
+			None,
+			&requirements,
+			false,
+			&base,
+		);
+
+		let low_floor = ResolvedPlotSettings {
+			authored_plot_padding_left: Some(pixels(1.0)),
+			authored_plot_padding_bottom: Some(pixels(1.0)),
+			..base.clone()
+		};
+		let low = VerticalGuideBands::resolve_with_requirements_and_x_label(
+			"",
+			None,
+			&requirements,
+			false,
+			&low_floor,
+		);
+		assert_eq!(low.left, derived.left);
+		assert_eq!(low.bottom, derived.bottom);
+
+		let high_floor = ResolvedPlotSettings {
+			authored_plot_padding_left: Some(pixels(300.0)),
+			authored_plot_padding_bottom: Some(pixels(300.0)),
+			..base.clone()
+		};
+		let high = VerticalGuideBands::resolve_with_requirements_and_x_label(
+			"",
+			None,
+			&requirements,
+			false,
+			&high_floor,
+		);
+		assert_eq!(high.left, 300.0);
+		assert_eq!(high.bottom, 300.0);
+
+		let no_padding = derived.plot_area(bounds(), 0.0, &base);
+		let right_padding = ResolvedPlotSettings {
+			authored_plot_padding_right: Some(pixels(120.0)),
+			..base.clone()
+		};
+		let padded = derived.plot_area(bounds(), 0.0, &right_padding);
+		assert_eq!(no_padding.right() - padded.right(), 100.0);
+		assert_eq!(no_padding.x(), padded.x());
+		assert_eq!(no_padding.y(), padded.y());
+		assert_eq!(no_padding.bottom(), padded.bottom());
+		let tiled_without = derived.grid_tiled_area(bounds(), &base);
+		let tiled_with = derived.grid_tiled_area(bounds(), &right_padding);
+		assert_eq!(
+			tiled_without.width() - tiled_with.width(),
+			120.0,
+			"an authored grid edge is reserved once before its cells divide"
+		);
+
+		let zero = ResolvedPlotSettings {
+			authored_plot_padding_right: Some(PlotPaddingPixels::ZERO),
+			..base.clone()
+		};
+		assert_eq!(derived.plot_area(bounds(), 0.0, &zero), no_padding);
+		assert_eq!(derived.grid_tiled_area(bounds(), &zero), tiled_without);
+
+		let oversized = ResolvedPlotSettings {
+			authored_plot_padding_right: Some(pixels(100_000.0)),
+			..base
+		};
+		assert_eq!(derived.plot_area(bounds(), 0.0, &oversized).width(), 0.0);
+		assert_eq!(
+			oversized.authored_plot_padding_right,
+			Some(pixels(100_000.0)),
+			"the safety clamp never replaces the authored request"
 		);
 	}
 

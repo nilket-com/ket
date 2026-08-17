@@ -12,8 +12,8 @@ use crate::plot::common::{GridLineStyle, ResolvedPlotSettings, ScatterRenderMode
 use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::spec::{
 	BarWidth, CategoryGap, ColorJob, HoverTextSize, LayerSettings, LegendPosition, Override,
-	PointSize, Presence, ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation,
-	TitleTextSize,
+	PlotPaddingPixels, PointSize, Presence, ResolvedPresence, StrokeWidth, SubtitleTextSize,
+	TickRotation, TitleTextSize,
 };
 use iced::Color;
 use libaryon::engine::UiPalette;
@@ -215,6 +215,12 @@ pub struct PlotSettingsLayer {
 	/// PRODUCT-0115: specific generated x-tick orientation avoids rebuilding
 	/// the complete typography carrier.
 	pub x_tick_rotation: Override<TickRotation>,
+	/// PRODUCT-0120: edge-specific authored reservations avoid reconstructing
+	/// the atomic padding-and-offset carrier.
+	pub plot_padding_top: Override<PlotPaddingPixels>,
+	pub plot_padding_bottom: Override<PlotPaddingPixels>,
+	pub plot_padding_left: Override<PlotPaddingPixels>,
+	pub plot_padding_right: Override<PlotPaddingPixels>,
 	pub padding: Override<PlotPadding>,
 	pub guides: Override<PlotGuideSettings>,
 	pub domains: Override<PlotDomainOverrides>,
@@ -259,6 +265,10 @@ impl Default for PlotSettingsLayer {
 			subtitle_size: Override::Inherit,
 			hover_size: Override::Inherit,
 			x_tick_rotation: Override::Inherit,
+			plot_padding_top: Override::Inherit,
+			plot_padding_bottom: Override::Inherit,
+			plot_padding_left: Override::Inherit,
+			plot_padding_right: Override::Inherit,
 			padding: Override::Inherit,
 			guides: Override::Inherit,
 			domains: Override::Inherit,
@@ -417,6 +427,29 @@ fn apply_layer(
 		settings.subtitle_offset = value.subtitle_offset;
 		settings.x_label_padding = value.x_label_padding;
 		settings.y_label_padding = value.y_label_padding;
+		// An atomic carrier at a higher cascade tier replaces any lower-tier
+		// partial edge. A partial edge in this same tier is applied below.
+		settings.authored_plot_padding_top = None;
+		settings.authored_plot_padding_bottom = None;
+		settings.authored_plot_padding_left = None;
+		settings.authored_plot_padding_right = None;
+	}
+	// PRODUCT-0120: an edge slot wins over the atomic carrier within one tier.
+	// The `authored_*` marker is intentionally separate from the resolved raw
+	// padding: PRODUCT-0114's derived left/bottom guides use only an explicit
+	// authored edge as a floor, preserving legacy geometry when no Rune edge is
+	// present.
+	if let Override::Set(value) = layer.plot_padding_top {
+		settings.authored_plot_padding_top = Some(value);
+	}
+	if let Override::Set(value) = layer.plot_padding_bottom {
+		settings.authored_plot_padding_bottom = Some(value);
+	}
+	if let Override::Set(value) = layer.plot_padding_left {
+		settings.authored_plot_padding_left = Some(value);
+	}
+	if let Override::Set(value) = layer.plot_padding_right {
+		settings.authored_plot_padding_right = Some(value);
 	}
 	if let Override::Set(value) = &layer.guides {
 		settings.max_legend_rows = value.max_legend_rows;
@@ -558,6 +591,52 @@ mod tests {
 			size(24.0),
 			"atomic typography still delivers hover size when the partial slot is absent"
 		);
+	}
+
+	#[test]
+	fn product_0120_padding_edges_are_partial_across_the_cascade() {
+		let pixels = |value| PlotPaddingPixels::new(value).unwrap();
+		let mut cascade = PlotSettings::default();
+		cascade.library_defaults.authored_plot_padding_right = Some(pixels(8.0));
+		cascade.application_theme.plot_padding_right = Override::Set(pixels(12.0));
+		cascade.authored_spec.plot_padding_right = Override::Set(pixels(20.0));
+		cascade.layer.plot_padding_right = Override::Set(pixels(32.0));
+		cascade.pane_override.plot_padding_right = Override::Set(pixels(48.0));
+		assert_eq!(
+			cascade.resolve().authored_plot_padding_right,
+			Some(pixels(48.0))
+		);
+
+		cascade.pane_override.plot_padding_right = Override::Inherit;
+		cascade.layer.plot_padding_right = Override::Inherit;
+		cascade.authored_spec.plot_padding_right = Override::Inherit;
+		cascade.application_theme.plot_padding_right = Override::Inherit;
+		assert_eq!(
+			cascade.resolve().authored_plot_padding_right,
+			Some(pixels(8.0))
+		);
+
+		let atomic = PlotPadding {
+			top: 11.0,
+			bottom: 22.0,
+			left: 33.0,
+			right: 44.0,
+			title_offset: 55.0,
+			subtitle_offset: 66.0,
+			x_label_padding: 77.0,
+			y_label_padding: 88.0,
+		};
+		cascade.authored_spec.padding = Override::Set(atomic.clone());
+		cascade.authored_spec.plot_padding_right = Override::Set(pixels(120.0));
+		let resolved = cascade.resolve();
+		assert_eq!(resolved.authored_plot_padding_right, Some(pixels(120.0)));
+		assert_eq!(resolved.plot_padding_top, atomic.top);
+		assert_eq!(resolved.plot_padding_bottom, atomic.bottom);
+		assert_eq!(resolved.plot_padding_left, atomic.left);
+		assert_eq!(resolved.title_offset, atomic.title_offset);
+		assert_eq!(resolved.subtitle_offset, atomic.subtitle_offset);
+		assert_eq!(resolved.x_label_padding, atomic.x_label_padding);
+		assert_eq!(resolved.y_label_padding, atomic.y_label_padding);
 	}
 
 	#[test]

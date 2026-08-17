@@ -41,6 +41,7 @@ const PRESENTATION_FREE: &[&str] = &[
 	"legend_at",
 	"line",
 	"palette",
+	"padding",
 	"facet_gutter",
 	"scatter",
 	"sequential_palette",
@@ -70,6 +71,10 @@ const PRESENTATION_METHODS: &[&str] = &[
 	"font_size",
 	"percent",
 	"point_size",
+	"top",
+	"right",
+	"bottom",
+	"left",
 	"show_types",
 	"skin",
 	"stacked",
@@ -2686,6 +2691,76 @@ bar("x", "y"),
 			message.contains("Missing item x_label_rotation"),
 			"{message}"
 		);
+	}
+
+	#[test]
+	fn product_0120_padding_edges_are_typed_partial_members_with_precise_refusals() {
+		let source = r#"workspace.table("t").views([figure([
+padding().right(120).bottom(24),
+bar("x", "y"),
+])])"#;
+		let compiled = compile(source).expect("padding edges compile");
+		let RuneViewIntent::Plot(plot) = &compiled.executions[0].views[0].intent else {
+			panic!("padding fixture produced a table")
+		};
+		let pixels = |value| crate::plot::spec::PlotPaddingPixels::new(value).unwrap();
+		assert_eq!(
+			plot.authored_settings.plot_padding_right,
+			crate::plot::spec::Override::Set(pixels(120.0))
+		);
+		assert_eq!(
+			plot.authored_settings.plot_padding_bottom,
+			crate::plot::spec::Override::Set(pixels(24.0))
+		);
+		assert!(matches!(
+			plot.authored_settings.plot_padding_top,
+			crate::plot::spec::Override::Inherit
+		));
+		assert!(matches!(
+			plot.authored_settings.plot_padding_left,
+			crate::plot::spec::Override::Inherit
+		));
+
+		for accepted in ["0", "100000"] {
+			compile(&format!(
+				"workspace.table(\"t\").views([figure([padding().right({accepted}), bar(\"x\", \"y\")])])"
+			))
+			.expect("finite non-negative padding accepts");
+		}
+		for rejected in ["-1", "\"wide\""] {
+			let source = format!(
+				"workspace.table(\"t\").views([figure([padding().right({rejected}), bar(\"x\", \"y\")])])"
+			);
+			let error = compile(&source).expect_err("invalid padding refuses");
+			let RuneEnvelopeError::InvalidView { span, .. } = error else {
+				panic!("padding refusal retains its modifier origin")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				format!(".right({rejected})")
+			);
+		}
+		assert!(
+			crate::plot::spec::PlotPaddingPixels::new(f32::NAN).is_err()
+				&& crate::plot::spec::PlotPaddingPixels::new(f32::INFINITY).is_err(),
+			"the typed carrier rejects non-finite values before they reach geometry"
+		);
+
+		for source in [
+			r#"workspace.table("t").views([figure([padding().right(1).right(2), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([title("T").right(2), bar("x", "y")])])"#,
+			r#"workspace.table("t").views([figure([skin("dark").right(2), bar("x", "y")])])"#,
+		] {
+			let error = compile(source).expect_err("padding-only modifiers refuse elsewhere");
+			let RuneEnvelopeError::InvalidView { span, .. } = error else {
+				panic!("padding modifier preserves its own span")
+			};
+			let refused = &source[span.start as usize..span.end as usize];
+			assert!(
+				refused == ".right(2)" || refused == ".right(1)",
+				"the refusal points at the modifier, not its receiver: {refused}"
+			);
+		}
 	}
 
 	#[test]
