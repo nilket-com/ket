@@ -2070,6 +2070,18 @@ async fn adr553_sql_and_rune_ceil_share_a_bound_plan_and_digest() {
 /// `FLOOR` stays a grandfathered `Expr` variant while `CEIL` is a registration.
 /// The asymmetry is deliberate, and this pins it so a future migration is a
 /// decision rather than a surprise.
+#[test]
+fn adr553_floor_pre_migration_lowers_to_a_direct_expr_variant() {
+	let floor = plan_sql("SELECT FLOOR(price) FROM sales");
+	let LogicalPlan::Project { exprs, .. } = floor else {
+		panic!("expected FLOOR projection");
+	};
+	assert!(
+		matches!(exprs.as_slice(), [Expr::Floor(_)]),
+		"pre-migration FLOOR must use its dedicated Expr variant"
+	);
+}
+
 #[tokio::test]
 async fn adr553_ceil_is_a_registration_while_floor_remains_a_variant() {
 	let ceil = plan_sql("SELECT CEIL(price) FROM sales");
