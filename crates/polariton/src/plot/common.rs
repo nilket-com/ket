@@ -1797,6 +1797,23 @@ pub(crate) struct YAxisGuideLayout {
 
 impl VerticalGuideBands {
 	pub(crate) const FACET_LABEL_TOP_INSET: f32 = 8.0;
+	pub(crate) const PLOT_MIN_SHARE: f32 = 0.15;
+
+	/// Allocate the leading band first and let the trailing band take the
+	/// remainder. The demand remains independent of the container; only this
+	/// final allocation step is bounded so a positive figure retains a plot.
+	fn allocate_bands(extent: f32, leading: f32, trailing: f32) -> (f32, f32) {
+		let reserved = (extent * (1.0 - Self::PLOT_MIN_SHARE)).max(0.0);
+		let leading = leading.min(reserved);
+		let trailing = trailing.min((reserved - leading).max(0.0));
+		debug_assert!(
+			extent <= 0.0
+				|| extent - leading - trailing + 0.001
+					>= extent * Self::PLOT_MIN_SHARE,
+			"PRODUCT-0131 allocation must preserve the minimum plot share"
+		);
+		(leading, trailing)
+	}
 
 	pub(crate) fn resolve(
 		fallback_title: &str,
@@ -2000,16 +2017,33 @@ impl VerticalGuideBands {
 		padding: f32,
 		settings: &ResolvedPlotSettings,
 	) -> Rect<Widget> {
-		let left = padding + self.left;
-		let right = padding + settings.effective_plot_padding_right();
-		let top = padding + self.heading + self.facet + settings.effective_plot_padding_top();
-		let bottom = padding + self.bottom;
-		bounds.region(
+		let (left, right) = Self::allocate_bands(
+			bounds.width(),
+			padding + self.left,
+			padding + settings.effective_plot_padding_right(),
+		);
+		let (top, bottom) = Self::allocate_bands(
+			bounds.height(),
+			padding + self.heading + self.facet + settings.effective_plot_padding_top(),
+			padding + self.bottom,
+		);
+		let plot = bounds.region(
 			bounds.x() + left,
 			bounds.y() + top,
 			(bounds.width() - left - right).max(0.0),
 			(bounds.height() - top - bottom).max(0.0),
-		)
+		);
+		debug_assert!(
+			bounds.width() <= 0.0
+				|| plot.width() + 0.001 >= bounds.width() * Self::PLOT_MIN_SHARE,
+			"PRODUCT-0131 plot allocation must preserve the minimum width share"
+		);
+		debug_assert!(
+			bounds.height() <= 0.0
+				|| plot.height() + 0.001 >= bounds.height() * Self::PLOT_MIN_SHARE,
+			"PRODUCT-0131 plot allocation must preserve the minimum height share"
+		);
+		plot
 	}
 
 	pub(crate) fn grid_tiled_area(
@@ -2017,22 +2051,32 @@ impl VerticalGuideBands {
 		outer: Rect<Widget>,
 		settings: &ResolvedPlotSettings,
 	) -> Rect<Widget> {
-		let left = self.left.min(outer.width());
-		let bottom = self.bottom.min(outer.height());
-		let top = self.heading.min((outer.height() - bottom).max(0.0));
+		let (left, right) = Self::allocate_bands(
+			outer.width(),
+			self.left,
+			settings.explicit_plot_padding_right().unwrap_or(0.0),
+		);
+		let (top, bottom) = Self::allocate_bands(outer.height(), self.heading, self.bottom);
 		// An explicit right edge belongs to the composed figure, so a grid
 		// reserves it once before cells divide. Legacy right padding stays local
 		// to preserve existing grid geometry when no edge is authored.
-		let right = settings
-			.explicit_plot_padding_right()
-			.unwrap_or(0.0)
-			.min((outer.width() - left).max(0.0));
-		outer.region(
+		let tiled = outer.region(
 			outer.x() + left,
 			outer.y() + top,
 			(outer.width() - left - right).max(0.0),
 			(outer.height() - top - bottom).max(0.0),
-		)
+		);
+		debug_assert!(
+			outer.width() <= 0.0
+				|| tiled.width() + 0.001 >= outer.width() * Self::PLOT_MIN_SHARE,
+			"PRODUCT-0131 grid allocation must preserve the minimum width share"
+		);
+		debug_assert!(
+			outer.height() <= 0.0
+				|| tiled.height() + 0.001 >= outer.height() * Self::PLOT_MIN_SHARE,
+			"PRODUCT-0131 grid allocation must preserve the minimum height share"
+		);
+		tiled
 	}
 
 	pub(crate) fn grid_cell_plot_area(
@@ -4329,12 +4373,54 @@ mod product_0106_vertical_guide_band_oracles {
 			authored_plot_padding_right: Some(pixels(100_000.0)),
 			..base
 		};
-		assert_eq!(derived.plot_area(bounds(), 0.0, &oversized).width(), 0.0);
+		assert_eq!(
+			derived.plot_area(bounds(), 0.0, &oversized).width(),
+			bounds().width() * VerticalGuideBands::PLOT_MIN_SHARE,
+		);
 		assert_eq!(
 			oversized.authored_plot_padding_right,
 			Some(pixels(100_000.0)),
 			"the safety clamp never replaces the authored request"
 		);
+	}
+
+	#[test]
+	fn product_0131_allocation_preserves_the_minimum_share_and_leads_first() {
+		assert_eq!(VerticalGuideBands::PLOT_MIN_SHARE, 0.15);
+		let (leading, trailing) = VerticalGuideBands::allocate_bands(100.0, 20.0, 100.0);
+		assert_eq!(leading, 20.0);
+		assert_eq!(trailing, 65.0);
+
+		let (leading, trailing) = VerticalGuideBands::allocate_bands(100.0, 90.0, 20.0);
+		assert_eq!(leading, 85.0);
+		assert_eq!(trailing, 0.0);
+
+		let bounds = Rect::<Widget>::from_iced_frame(Rectangle::new(
+			Point::ORIGIN,
+			iced::Size::new(100.0, 100.0),
+		));
+		let settings = ResolvedPlotSettings {
+			authored_plot_padding_right: Some(PlotPaddingPixels::new(100.0).unwrap()),
+			..ResolvedPlotSettings::default()
+		};
+		let plot = VerticalGuideBands {
+			heading: 90.0,
+			facet: 0.0,
+			left: 0.0,
+			bottom: 20.0,
+		}
+		.plot_area(bounds, 0.0, &settings);
+		assert_eq!(plot.width(), 15.0);
+		assert_eq!(plot.height(), 15.0);
+		let tiled = VerticalGuideBands {
+			heading: 90.0,
+			facet: 0.0,
+			left: 0.0,
+			bottom: 20.0,
+		}
+		.grid_tiled_area(bounds, &settings);
+		assert_eq!(tiled.width(), 15.0);
+		assert_eq!(tiled.height(), 15.0);
 	}
 
 	#[test]

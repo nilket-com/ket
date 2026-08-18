@@ -87,7 +87,10 @@ const WHITE: [u8; 3] = [255, 255, 255];
 const PRODUCT_0077_BANKED_VERTICAL_SPILL: usize = 88;
 const PRODUCT_0077_BANKED_HORIZONTAL_SPILL: usize = 111;
 const PRODUCT_0083_BANKED_MEDIAN_DETAIL: usize = 0;
-const PRODUCT_0131_BANKED_LIVE_PLOT_HEIGHT: f32 = 34.7;
+// PRODUCT-0131's pre-bound negative control. These values are retained as
+// evidence even after Stage 1 makes every corresponding plot positive.
+const PRODUCT_0131_PRE_BOUND_HEIGHTS: [[f32; 3]; 2] =
+	[[34.7, 5.9, 0.0], [0.0, 0.0, 0.0]];
 
 struct Gpu {
 	adapter: wgpu::Adapter,
@@ -2113,14 +2116,17 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	// The 480x360 / 36-degree row is the discriminating nonzero control: without
 	// it the collapse rows would read zero in both the present and any repaired
 	// state, and prove nothing.
-	for (size, expected) in [
-		(Size::new(480, 360), [34.7_f32, 5.9, 0.0]),
-		(Size::new(320, 240), [0.0_f32, 0.0, 0.0]),
-	] {
-		for (rotation, expected_height) in [36.0, 45.0, 90.0].into_iter().zip(expected) {
+	for (size_index, size) in [Size::new(480, 360), Size::new(320, 240)]
+		.into_iter()
+		.enumerate()
+	{
+		for (rotation_index, rotation) in [36.0, 45.0, 90.0].into_iter().enumerate() {
 			let (kernel, settings) = product_temporal_count_fixture(rotation);
 			let (capture, figure_bounds, plot_area) =
 				render_product_kernel_rotation(&mut msaa, size, &kernel, settings);
+			let expected_height =
+				figure_bounds.height * VerticalGuideBands::PLOT_MIN_SHARE;
+			let pre_bound_height = PRODUCT_0131_PRE_BOUND_HEIGHTS[size_index][rotation_index];
 			let bottom_band = Rectangle::new(
 				Point::new(figure_bounds.x, plot_area.y + plot_area.height),
 				Size::new(
@@ -2132,8 +2138,12 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 			);
 			let bottom_ink = capture.luminous_pixels(bottom_band);
 			assert!(
+				expected_height + 0.001 >= pre_bound_height,
+				"PRODUCT-0131 bounded plot must not lose extent: pre-bound={pre_bound_height:.1}, bounded={expected_height:.1}",
+			);
+			assert!(
 				(plot_area.height - expected_height).abs() < 0.1,
-				"PRODUCT-0131 {}x{} at {rotation} degrees banks a {expected_height} px plot, got {:.1}",
+				"PRODUCT-0131 {}x{} at {rotation} degrees banks a {expected_height} px plot, got {:.1}; pre-bound baseline was {pre_bound_height:.1} px",
 				size.width,
 				size.height,
 				plot_area.height,
@@ -2153,10 +2163,6 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 			);
 		}
 	}
-	assert!(
-		PRODUCT_0131_BANKED_LIVE_PLOT_HEIGHT > 0.0,
-		"Stage 0 must bank a discriminating nonzero plot height"
-	);
 	let (product_0116_vertical, product_0116_bounds) =
 		render_product_0116_rotation(&mut msaa, product_0115_size, 90.0);
 	let product_0116_short_top =
