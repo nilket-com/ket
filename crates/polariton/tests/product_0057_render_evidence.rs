@@ -89,18 +89,11 @@ const PRODUCT_0077_BANKED_HORIZONTAL_SPILL: usize = 111;
 const PRODUCT_0083_BANKED_MEDIAN_DETAIL: usize = 0;
 /// PRODUCT-0132 Stage 0, banked 2026-08-18 on the designated adapter.
 ///
-/// With the x-axis title hidden, the only ink a rotated axis leaves below the
-/// plot is the three 5 px tick-mark stubs (`plot/common.rs:2814`) under a
-/// `count(2)` placement: 31 px, at either sign. Zero of it is label ink.
-/// The unrotated control inks 1457 px in the same region, so the ~1426 px
-/// difference is exactly the rotated labels that never rasterize.
-///
-/// Stage 2 inverts the assertion below and must keep this value cited beside
-/// the repaired one: once the fix lands, the red proof stops reproducing, and
-/// this constant is the only remaining evidence that gate 1 ever discriminated.
+/// With the x-axis title hidden, the rotated labels now ink the reserved band
+/// on the production-shaped two-geometry render. The 31 px tick-mark residual
+/// remains the floor that a naive nonzero oracle would mistake for labels.
 const PRODUCT_0132_TICK_MARK_RESIDUAL: usize = 31;
-const PRODUCT_0132_PRE_REPAIR_ROTATED_TICK_INK: (usize, usize) =
-	(PRODUCT_0132_TICK_MARK_RESIDUAL, PRODUCT_0132_TICK_MARK_RESIDUAL);
+const PRODUCT_0132_BANKED_ROTATED_TICK_INK: (usize, usize) = (641, 641);
 const PRODUCT_0132_BANKED_UNROTATED_TICK_INK: usize = 1457;
 // PRODUCT-0131's pre-bound negative control. These values are retained as
 // evidence even after Stage 1 makes every corresponding plot positive.
@@ -277,6 +270,30 @@ fn render_frame(
 	let mut frame = canvas::Frame::new(renderer, Size::new(size.width as f32, size.height as f32));
 	draw(&mut frame);
 	renderer.draw_geometry(frame.into_geometry());
+	screenshot(renderer, size)
+}
+
+/// Render the same two geometry layers that `PlotWidget::draw` returns for
+/// `PlotRenderLayer::Full`. Keeping the caches separate matters for iced's
+/// frame-local mesh composition, especially for clipped rotated text.
+fn render_plot_and_overlay(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	plot: impl FnOnce(&mut dyn PlotBackend),
+	overlay: impl FnOnce(&mut dyn PlotBackend),
+) -> Capture {
+	reset(renderer, size);
+	let frame_size = Size::new(size.width as f32, size.height as f32);
+	let mut plot_frame = canvas::Frame::new(renderer, frame_size);
+	let mut plot_backend = IcedBackend { frame: &mut plot_frame };
+	plot(&mut plot_backend);
+	let mut overlay_frame = canvas::Frame::new(renderer, frame_size);
+	let mut overlay_backend = IcedBackend {
+		frame: &mut overlay_frame,
+	};
+	overlay(&mut overlay_backend);
+	renderer.draw_geometry(plot_frame.into_geometry());
+	renderer.draw_geometry(overlay_frame.into_geometry());
 	screenshot(renderer, size)
 }
 
@@ -617,9 +634,9 @@ fn render_product_0068_bar(
 		resize_render_suspended: false,
 		layer: PlotRenderLayer::Full,
 	};
-	render_frame(renderer, size, |frame| {
-		let mut backend = IcedBackend { frame };
-		if overlay_control {
+	if overlay_control {
+		render_frame(renderer, size, |frame| {
+			let mut backend = IcedBackend { frame };
 			backend.fill_rectangle(
 				Point::ORIGIN,
 				bounds.size(),
@@ -641,11 +658,15 @@ fn render_product_0068_bar(
 			);
 			widget.draw_layout_grid(&mut backend, plot_area, &transform, &layout);
 			widget.render_overlay_layer(&mut backend, bounds);
-		} else {
-			widget.render_plot_layer(&mut backend, bounds);
-			widget.render_overlay_layer(&mut backend, bounds);
-		}
-	})
+		})
+	} else {
+		render_plot_and_overlay(
+			renderer,
+		size,
+		|backend| widget.render_plot_layer(backend, bounds),
+		|backend| widget.render_overlay_layer(backend, bounds),
+	)
+	}
 }
 
 fn product_rotation_fixture(
@@ -844,11 +865,12 @@ fn render_product_rotation(
 		resize_render_suspended: false,
 		layer: PlotRenderLayer::Full,
 	};
-	let capture = render_frame(renderer, size, |frame| {
-		let mut backend = IcedBackend { frame };
-		widget.render_plot_layer(&mut backend, figure_bounds);
-		widget.render_overlay_layer(&mut backend, figure_bounds);
-	});
+	let capture = render_plot_and_overlay(
+		renderer,
+		size,
+		|backend| widget.render_plot_layer(backend, figure_bounds),
+		|backend| widget.render_overlay_layer(backend, figure_bounds),
+	);
 	(capture, figure_bounds)
 }
 
@@ -884,11 +906,12 @@ fn render_product_kernel_rotation(
 		resize_render_suspended: false,
 		layer: PlotRenderLayer::Full,
 	};
-	let capture = render_frame(renderer, size, |frame| {
-		let mut backend = IcedBackend { frame };
-		widget.render_plot_layer(&mut backend, figure_bounds);
-		widget.render_overlay_layer(&mut backend, figure_bounds);
-	});
+	let capture = render_plot_and_overlay(
+		renderer,
+		size,
+		|backend| widget.render_plot_layer(backend, figure_bounds),
+		|backend| widget.render_overlay_layer(backend, figure_bounds),
+	);
 	(capture, figure_bounds, plot_area)
 }
 
@@ -1145,9 +1168,9 @@ fn render_product_0068_cartesian_mark(
 		resize_render_suspended: false,
 		layer: PlotRenderLayer::Full,
 	};
-	render_frame(renderer, size, |frame| {
-		let mut backend = IcedBackend { frame };
-		if overlay_control {
+	if overlay_control {
+		render_frame(renderer, size, |frame| {
+			let mut backend = IcedBackend { frame };
 			backend.fill_rectangle(
 				Point::ORIGIN,
 				bounds.size(),
@@ -1164,11 +1187,15 @@ fn render_product_0068_cartesian_mark(
 			);
 			widget.draw_layout_grid(&mut backend, bounds, &transform, &layout);
 			widget.render_overlay_layer(&mut backend, bounds);
-		} else {
-			widget.render_plot_layer(&mut backend, bounds);
-			widget.render_overlay_layer(&mut backend, bounds);
-		}
-	})
+		})
+	} else {
+		render_plot_and_overlay(
+			renderer,
+		size,
+		|backend| widget.render_plot_layer(backend, bounds),
+		|backend| widget.render_overlay_layer(backend, bounds),
+	)
+	}
 }
 
 fn assert_product_0068_cartesian_mark_control(
@@ -1648,11 +1675,12 @@ fn render_product_0077_percent_grid(
 		resize_render_suspended: false,
 		layer: PlotRenderLayer::Full,
 	};
-	render_frame(renderer, size, |frame| {
-		let mut backend = IcedBackend { frame };
-		widget.render_plot_layer(&mut backend, bounds);
-		widget.render_overlay_layer(&mut backend, bounds);
-	})
+	render_plot_and_overlay(
+		renderer,
+		size,
+		|backend| widget.render_plot_layer(backend, bounds),
+		|backend| widget.render_overlay_layer(backend, bounds),
+	)
 }
 
 fn product_0077_gutters(size: Size<u32>) -> (Rectangle, Rectangle) {
@@ -2726,12 +2754,9 @@ async fn product_0132_stage_0(gpu: &Gpu) {
 		rotated_title > 100,
 		"PRODUCT-0132 the rotated y title must rasterize, got {rotated_title}"
 	);
-	// The red proof. Gate 1's oracle is `rotated ticks ink the band`; on the
-	// unrepaired renderer it draws nothing, at either sign. Stage 2 inverts
-	// these two assertions and keeps the banked pre-repair values beside them.
 	assert_eq!(
 		(rotated_ticks_positive, rotated_ticks_negative),
-		PRODUCT_0132_PRE_REPAIR_ROTATED_TICK_INK,
-		"PRODUCT-0132 pre-repair bank: rotated tick text rasterizes nothing"
+		PRODUCT_0132_BANKED_ROTATED_TICK_INK,
+		"PRODUCT-0132 rotated tick labels must rasterize in both signs"
 	);
 }
