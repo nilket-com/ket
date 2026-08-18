@@ -1648,7 +1648,7 @@ fn product_0038_tick_step_is_the_only_surface_producer_of_step_placement() {
 			.count(),
 		1
 	);
-	assert!(production.contains("fn raw_axis_positive_scalar("));
+	assert!(production.contains("fn raw_axis_tick_step("));
 	assert!(production.contains("step must be strictly positive"));
 
 	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
@@ -4806,7 +4806,7 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 		.expect("bounded formatted-axis reservation estimator");
 	assert!(
 		requirements.contains(
-			"estimate_formatted_label_width(&format_label(value, *axis_type), font_size)"
+			"estimate_formatted_label_width(&format_label(value, axis_type), font_size)"
 		)
 	);
 	assert!(requirements.contains("estimate_ascii_label_width(label, font_size)"));
@@ -4886,7 +4886,7 @@ fn product_0127_formatted_requirements_carry_selected_pre_layout_ticks() {
 		"placement: TickPlacement",
 		".positions(*domain)",
 		"unwrap_or_default()",
-		"estimate_formatted_label_width(&format_label(value, *axis_type), font_size)",
+		"estimate_formatted_label_width(&format_label(value, axis_type), font_size)",
 	] {
 		assert!(
 			requirement.contains(declaration),

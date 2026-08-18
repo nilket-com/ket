@@ -6,7 +6,7 @@
 
 use crate::plot::chrome::PlotChromeProjection;
 use crate::plot::colors::ColorTheme;
-use crate::plot::common::TickPlacement;
+use crate::plot::common::{PositiveTemporalInterval, TickPlacement};
 use crate::plot::composition::PlotComposition;
 use crate::plot::continuous_color::{ContinuousAnchor, ContinuousScaleIntent};
 use crate::plot::core::PlotType;
@@ -24,8 +24,9 @@ use crate::rune_relation_envelope::{
 	BoxPlotFieldOrigins, BubbleFieldOrigins, DisposableRunePlotSink, FunnelFieldOrigins,
 	HeatmapFieldOrigins, MultivariateFieldOrigins, PieFieldOrigins, RadialDialFieldOrigins,
 	RunePlotBody, RunePlotDomainSpans, RunePlotIntent, RunePlotMinorTickSpans,
-	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
-	RuneViewIntent, SpannedMarkFields, StyledRunePlotSink, ViolinFieldOrigins,
+	RunePlotTickEverySpans, RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent,
+	RuneTableSkinProjection, RuneViewIntent, SpannedMarkFields, StyledRunePlotSink,
+	ViolinFieldOrigins,
 };
 use rune::alloc::limit;
 use rune::ast::Spanned;
@@ -35,6 +36,7 @@ use rune::{Any, Context, Diagnostics, Module, Ref, Source, Sources, Vm};
 use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
+use toron_client::TemporalInterval;
 
 pub(crate) const PRESENTATION_COMPILE_ALLOCATION_CAP: usize = 256 * 1024 * 1024;
 pub(crate) const PRESENTATION_RUNTIME_ALLOCATION_CAP: usize = 256 * 1024 * 1024;
@@ -204,6 +206,7 @@ struct AxisProperties {
 	label_size: Option<(AxisLabelSize, Origin)>,
 	bounds: Option<(f64, f64, Origin)>,
 	tick_step: Option<(f64, Origin)>,
+	tick_every: Option<(PositiveTemporalInterval, Origin)>,
 	minor_ticks: Option<(u32, Origin)>,
 	tick_size: Option<(AxisTickSize, Origin)>,
 	tick_rotation: Option<(TickRotation, Origin)>,
@@ -215,6 +218,7 @@ impl AxisProperties {
 			&& self.label_size.is_none()
 			&& self.bounds.is_none()
 			&& self.tick_step.is_none()
+			&& self.tick_every.is_none()
 			&& self.minor_ticks.is_none()
 			&& self.tick_size.is_none()
 			&& self.tick_rotation.is_none()
@@ -585,6 +589,7 @@ fn build_context() -> Result<Context, String> {
 		("__label_size", raw_figure_label_size as RawFunction),
 		("__bounds", raw_axis_bounds as RawFunction),
 		("__tick_step", raw_axis_tick_step as RawFunction),
+		("__tick_every", raw_axis_tick_every as RawFunction),
 		("__minor_ticks", raw_axis_minor_ticks as RawFunction),
 		("__tick_size", raw_axis_tick_size as RawFunction),
 		("__tick_rotation", raw_axis_tick_rotation as RawFunction),
@@ -2268,19 +2273,52 @@ fn raw_axis_tick_step(
 	args: usize,
 	out: Output,
 ) -> VmResult<()> {
-	raw_axis_positive_scalar(
-		"tick_step",
-		|properties| &mut properties.tick_step,
-		stack,
-		addr,
-		args,
-		out,
-	)
+	let values = rune::vm_try!(stack.slice_at(addr, args));
+	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
+	let (mut element, axis) = match axis_receiver(values, origin, "tick_step") {
+		Ok(receiver) => receiver,
+		Err(element) => return store(out, stack, element),
+	};
+	if values.len() != 4 {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			"tick_step(...) requires exactly one numeric value",
+		));
+	} else if element.axis.tick_step.is_some() || element.axis.tick_every.is_some() {
+		element.value = Err(PresentationFailure::new(
+			origin,
+			format!(
+				"{}().tick_step(...) cannot combine with another tick placement",
+				axis.name()
+			),
+		));
+	} else {
+		let value = rune_number(&values[1])
+			.ok_or_else(|| PresentationFailure::new(origin, "tick_step(...) requires a number"))
+			.and_then(|value| {
+				if !value.is_finite() {
+					Err(PresentationFailure::new(
+						origin,
+						"tick_step(...) requires a finite step",
+					))
+				} else if value <= 0.0 {
+					Err(PresentationFailure::new(
+						origin,
+						"tick_step(...) step must be strictly positive",
+					))
+				} else {
+					Ok(value)
+				}
+			});
+		match value {
+			Ok(value) => element.axis.tick_step = Some((value, origin)),
+			Err(error) => element.value = Err(error),
+		}
+	}
+	store(out, stack, element)
 }
 
-fn raw_axis_positive_scalar(
-	name: &'static str,
-	slot: impl Fn(&mut AxisProperties) -> &mut Option<(f64, Origin)>,
+fn raw_axis_tick_every(
 	stack: &mut dyn Memory,
 	addr: InstAddress,
 	args: usize,
@@ -2288,42 +2326,42 @@ fn raw_axis_positive_scalar(
 ) -> VmResult<()> {
 	let values = rune::vm_try!(stack.slice_at(addr, args));
 	let origin = raw_origin(values).unwrap_or(Origin { start: 0, end: 0 });
-	let (mut element, axis) = match axis_receiver(values, origin, name) {
+	let (mut element, axis) = match axis_receiver(values, origin, "tick_every") {
 		Ok(receiver) => receiver,
 		Err(element) => return store(out, stack, element),
 	};
 	if values.len() != 4 {
 		element.value = Err(PresentationFailure::new(
 			origin,
-			format!("{name}(...) requires exactly one numeric value"),
+			"tick_every(...) requires exactly one interval string",
 		));
-	} else if slot(&mut element.axis).is_some() {
+	} else if element.axis.tick_every.is_some() || element.axis.tick_step.is_some() {
 		element.value = Err(PresentationFailure::new(
 			origin,
-			format!("{}().{name}(...) may appear at most once", axis.name()),
+			format!(
+				"{}().tick_every(...) cannot combine with another tick placement",
+				axis.name()
+			),
 		));
 	} else {
-		let value = rune_number(&values[1])
-			.ok_or_else(|| {
-				PresentationFailure::new(origin, format!("{name}(...) requires a number"))
+		let interval = rune::from_value::<Ref<str>>(values[1].clone())
+			.map_err(|_| {
+				PresentationFailure::new(origin, "tick_every(...) requires an interval string")
 			})
 			.and_then(|value| {
-				if !value.is_finite() {
-					Err(PresentationFailure::new(
+				TemporalInterval::parse(&value)
+					.map_err(|error| PresentationFailure::new(origin, error.to_string()))
+			})
+			.and_then(|interval| {
+				PositiveTemporalInterval::try_from_interval(interval).map_err(|_| {
+					PresentationFailure::new(
 						origin,
-						format!("{name}(...) requires a finite step"),
-					))
-				} else if value <= 0.0 {
-					Err(PresentationFailure::new(
-						origin,
-						format!("{name}(...) step must be strictly positive"),
-					))
-				} else {
-					Ok(value)
-				}
+						"tick_every(...) requires a strictly positive interval",
+					)
+				})
 			});
-		match value {
-			Ok(value) => *slot(&mut element.axis) = Some((value, origin)),
+		match interval {
+			Ok(interval) => element.axis.tick_every = Some((interval, origin)),
 			Err(error) => element.value = Err(error),
 		}
 	}
@@ -2347,10 +2385,13 @@ fn raw_axis_minor_ticks(
 			origin,
 			"minor_ticks(...) requires exactly one numeric value",
 		));
-	} else if element.axis.minor_ticks.is_some() {
+	} else if element.axis.minor_ticks.is_some() || element.axis.tick_every.is_some() {
 		element.value = Err(PresentationFailure::new(
 			origin,
-			format!("{}().minor_ticks(...) may appear at most once", axis.name()),
+			format!(
+				"{}().minor_ticks(...) cannot combine with .tick_every(...)",
+				axis.name()
+			),
 		));
 	} else {
 		let count = rune_number(&values[1])
@@ -3548,6 +3589,8 @@ struct FigureParts {
 	y_bounds: Option<(f64, f64, Origin)>,
 	x_tick_step: Option<(f64, Origin)>,
 	y_tick_step: Option<(f64, Origin)>,
+	x_tick_every: Option<(PositiveTemporalInterval, Origin)>,
+	y_tick_every: Option<(PositiveTemporalInterval, Origin)>,
 	x_minor_ticks: Option<(u32, Origin)>,
 	y_minor_ticks: Option<(u32, Origin)>,
 	hover_size: Option<(HoverTextSize, Origin)>,
@@ -3876,6 +3919,12 @@ fn merge_axis(
 				)?;
 			}
 			if let Some((step, property_origin)) = properties.tick_step {
+				if parts.x_tick_every.is_some() {
+					return Err(PresentationFailure::new(
+						property_origin,
+						"x_axis().tick_step(...) and .tick_every(...) cannot be combined",
+					));
+				}
 				set_once(
 					&mut parts.x_tick_step,
 					(step, property_origin),
@@ -3883,7 +3932,27 @@ fn merge_axis(
 					"x_axis().tick_step(...) may appear at most once in a figure",
 				)?;
 			}
+			if let Some((interval, property_origin)) = properties.tick_every {
+				if parts.x_tick_step.is_some() || parts.x_minor_ticks.is_some() {
+					return Err(PresentationFailure::new(
+						property_origin,
+						"x_axis().tick_every(...) cannot be combined with .tick_step(...) or .minor_ticks(...)",
+					));
+				}
+				set_once(
+					&mut parts.x_tick_every,
+					(interval, property_origin),
+					property_origin,
+					"x_axis().tick_every(...) may appear at most once in a figure",
+				)?;
+			}
 			if let Some((count, property_origin)) = properties.minor_ticks {
+				if parts.x_tick_every.is_some() {
+					return Err(PresentationFailure::new(
+						property_origin,
+						"x_axis().minor_ticks(...) cannot be combined with .tick_every(...)",
+					));
+				}
 				set_once(
 					&mut parts.x_minor_ticks,
 					(count, property_origin),
@@ -3934,6 +4003,12 @@ fn merge_axis(
 				)?;
 			}
 			if let Some((step, property_origin)) = properties.tick_step {
+				if parts.y_tick_every.is_some() {
+					return Err(PresentationFailure::new(
+						property_origin,
+						"y_axis().tick_step(...) and .tick_every(...) cannot be combined",
+					));
+				}
 				set_once(
 					&mut parts.y_tick_step,
 					(step, property_origin),
@@ -3941,7 +4016,27 @@ fn merge_axis(
 					"y_axis().tick_step(...) may appear at most once in a figure",
 				)?;
 			}
+			if let Some((interval, property_origin)) = properties.tick_every {
+				if parts.y_tick_step.is_some() || parts.y_minor_ticks.is_some() {
+					return Err(PresentationFailure::new(
+						property_origin,
+						"y_axis().tick_every(...) cannot be combined with .tick_step(...) or .minor_ticks(...)",
+					));
+				}
+				set_once(
+					&mut parts.y_tick_every,
+					(interval, property_origin),
+					property_origin,
+					"y_axis().tick_every(...) may appear at most once in a figure",
+				)?;
+			}
 			if let Some((count, property_origin)) = properties.minor_ticks {
+				if parts.y_tick_every.is_some() {
+					return Err(PresentationFailure::new(
+						property_origin,
+						"y_axis().minor_ticks(...) cannot be combined with .tick_every(...)",
+					));
+				}
 				set_once(
 					&mut parts.y_minor_ticks,
 					(count, property_origin),
@@ -4047,6 +4142,8 @@ impl FigureParts {
 		}
 		if self.x_tick_step.is_some()
 			|| self.y_tick_step.is_some()
+			|| self.x_tick_every.is_some()
+			|| self.y_tick_every.is_some()
 			|| self.x_minor_ticks.is_some()
 			|| self.y_minor_ticks.is_some()
 		{
@@ -4054,10 +4151,18 @@ impl FigureParts {
 			guides.x_tick_placement = self
 				.x_tick_step
 				.map(|(step, _)| TickPlacement::step(step).expect("validated tick step"))
+				.or_else(|| {
+					self.x_tick_every
+						.map(|(interval, _)| TickPlacement::Temporal(interval))
+				})
 				.unwrap_or(TickPlacement::DEFAULT);
 			guides.y_tick_placement = self
 				.y_tick_step
 				.map(|(step, _)| TickPlacement::step(step).expect("validated tick step"))
+				.or_else(|| {
+					self.y_tick_every
+						.map(|(interval, _)| TickPlacement::Temporal(interval))
+				})
 				.unwrap_or(TickPlacement::DEFAULT);
 			if let Some((count, _)) = self.x_minor_ticks {
 				guides.x_minor_ticks = count;
@@ -4083,6 +4188,10 @@ impl FigureParts {
 			tick_step_spans: RunePlotTickStepSpans {
 				x: self.x_tick_step.map(|(_, origin)| origin.range()),
 				y: self.y_tick_step.map(|(_, origin)| origin.range()),
+			},
+			tick_every_spans: RunePlotTickEverySpans {
+				x: self.x_tick_every.map(|(_, origin)| origin.range()),
+				y: self.y_tick_every.map(|(_, origin)| origin.range()),
 			},
 			minor_tick_spans: RunePlotMinorTickSpans {
 				x: self.x_minor_ticks.map(|(_, origin)| origin.range()),

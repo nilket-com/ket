@@ -639,16 +639,20 @@ impl BandRequirements {
 				y_range,
 				x_axis_type,
 				y_axis_type,
+				x_temporal_domain,
+				y_temporal_domain,
 				..
 			} => (
 				Some(AxisBandRequirement::Formatted {
 					domain: *x_range,
 					axis_type: x_axis_type.clone(),
+					temporal_domain: x_temporal_domain.clone(),
 					placement: settings.x_tick_placement,
 				}),
 				Some(AxisBandRequirement::Formatted {
 					domain: *y_range,
 					axis_type: y_axis_type.clone(),
+					temporal_domain: y_temporal_domain.clone(),
 					placement: settings.y_tick_placement,
 				}),
 			),
@@ -661,6 +665,7 @@ impl BandRequirements {
 				Some(AxisBandRequirement::Formatted {
 					domain: *y_range,
 					axis_type: y_axis_type.clone(),
+					temporal_domain: None,
 					placement: settings.y_tick_placement,
 				}),
 			),
@@ -672,6 +677,7 @@ impl BandRequirements {
 				Some(AxisBandRequirement::Formatted {
 					domain: *x_range,
 					axis_type: x_axis_type.clone(),
+					temporal_domain: None,
 					placement: settings.x_tick_placement,
 				}),
 				Some(AxisBandRequirement::Categories(categories.clone())),
@@ -728,6 +734,7 @@ pub(crate) enum AxisBandRequirement {
 	Formatted {
 		domain: (f64, f64),
 		axis_type: AxisType,
+		temporal_domain: Option<TemporalAxisDomain>,
 		placement: TickPlacement,
 	},
 	Categories(Vec<String>),
@@ -739,15 +746,21 @@ impl AxisBandRequirement {
 			Self::Formatted {
 				domain,
 				axis_type,
+				temporal_domain,
 				placement,
-			} => placement
-				.positions(*domain)
-				.unwrap_or_default()
-				.into_iter()
-				.map(|value| {
-					estimate_formatted_label_width(&format_label(value, axis_type), font_size)
-				})
-				.fold(0.0, f32::max),
+			} => match placement {
+				TickPlacement::Temporal(stride) => temporal_domain
+					.as_ref()
+					.and_then(|domain| select_temporal_ticks(domain, *stride).ok())
+					.unwrap_or_default()
+					.into_iter()
+					.map(|value| value as f64)
+					.collect(),
+				_ => placement.positions(*domain).unwrap_or_default(),
+			}
+			.into_iter()
+			.map(|value| estimate_formatted_label_width(&format_label(value, axis_type), font_size))
+			.fold(0.0, f32::max),
 			Self::Categories(labels) => labels
 				.iter()
 				.map(|label| estimate_ascii_label_width(label, font_size))
@@ -2058,7 +2071,36 @@ impl<'a> PlotWidget<'a> {
 	}
 
 	fn major_tick_positions(&self, placement: TickPlacement, range: (f64, f64)) -> Vec<f64> {
-		placement.positions(range).unwrap_or_default()
+		match placement {
+			TickPlacement::Temporal(stride) => {
+				let layout = self.kernel.layout(self.settings.clone());
+				let domain = match layout {
+					PlotLayout::Cartesian {
+						x_range,
+						y_range: _,
+						x_temporal_domain,
+						y_temporal_domain: _,
+						..
+					} if placement == self.settings.x_tick_placement && range == x_range => x_temporal_domain,
+					PlotLayout::Cartesian {
+						x_range: _,
+						y_range,
+						x_temporal_domain: _,
+						y_temporal_domain,
+						..
+					} if placement == self.settings.y_tick_placement && range == y_range => y_temporal_domain,
+					_ => None,
+				};
+				domain
+					.as_ref()
+					.and_then(|domain| select_temporal_ticks(domain, stride).ok())
+					.unwrap_or_default()
+					.into_iter()
+					.map(|value| value as f64)
+					.collect()
+			}
+			_ => placement.positions(range).unwrap_or_default(),
+		}
 	}
 
 	fn minor_tick_positions(
@@ -3436,6 +3478,7 @@ mod product_0106_vertical_guide_band_oracles {
 			vec![AxisBandRequirement::Formatted {
 				domain: (20_000.0, 20_010.0),
 				axis_type: AxisType::Date,
+				temporal_domain: None,
 				placement: settings.y_tick_placement,
 			}]
 		);
@@ -3514,6 +3557,7 @@ mod product_0106_vertical_guide_band_oracles {
 			y: vec![AxisBandRequirement::Formatted {
 				domain: (1.0, 100.0),
 				axis_type: AxisType::Linear,
+				temporal_domain: None,
 				placement: TickPlacement::DEFAULT,
 			}],
 		}
@@ -3658,6 +3702,7 @@ mod product_0106_vertical_guide_band_oracles {
 			y: vec![AxisBandRequirement::Formatted {
 				domain: (0.0, 1.0),
 				axis_type: AxisType::Linear,
+				temporal_domain: None,
 				placement: TickPlacement::DEFAULT,
 			}],
 		};
@@ -3697,6 +3742,7 @@ mod product_0106_vertical_guide_band_oracles {
 			y: vec![AxisBandRequirement::Formatted {
 				domain: (-999_999.9, 999_999.9),
 				axis_type: AxisType::Linear,
+				temporal_domain: None,
 				placement: TickPlacement::DEFAULT,
 			}],
 		};
@@ -3870,6 +3916,7 @@ mod product_0106_vertical_guide_band_oracles {
 				.as_slice(),
 			[AxisBandRequirement::Formatted {
 				axis_type: AxisType::Date,
+				temporal_domain: None,
 				placement: TickPlacement::DEFAULT,
 				..
 			}]
@@ -3880,6 +3927,7 @@ mod product_0106_vertical_guide_band_oracles {
 				.as_slice(),
 			[AxisBandRequirement::Formatted {
 				axis_type: AxisType::Date,
+				temporal_domain: None,
 				placement: TickPlacement::DEFAULT,
 				..
 			}]
@@ -3894,6 +3942,7 @@ mod product_0106_vertical_guide_band_oracles {
 		let selected = AxisBandRequirement::Formatted {
 			domain: (0.0, 100.0),
 			axis_type: AxisType::Linear,
+			temporal_domain: None,
 			placement: TickPlacement::DEFAULT,
 		};
 		assert_eq!(
@@ -3905,6 +3954,7 @@ mod product_0106_vertical_guide_band_oracles {
 		let stepped = AxisBandRequirement::Formatted {
 			domain: (0.0, 100.0),
 			axis_type: AxisType::Linear,
+			temporal_domain: None,
 			placement: TickPlacement::Step(PositiveFinite(25.0)),
 		};
 		assert_eq!(
@@ -3918,6 +3968,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (1.0, 24.0),
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement: TickPlacement::Step(PositiveFinite(25.0)),
 				},
 				"a valid empty step selection has no tick-label requirement",
@@ -3926,6 +3977,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (0.0, 100.0),
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement: TickPlacement::Step(PositiveFinite(0.000_001)),
 				},
 				"a refused over-capacity step selection has no tick-label requirement",
@@ -3968,6 +4020,7 @@ mod product_0106_vertical_guide_band_oracles {
 				y: vec![AxisBandRequirement::Formatted {
 					domain,
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement,
 				}],
 			};
@@ -4036,6 +4089,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (0.0, 100.0),
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement: TickPlacement::DEFAULT,
 				},
 				81.0,
@@ -4046,6 +4100,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (-50.0, 50.0),
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement: TickPlacement::DEFAULT,
 				},
 				94.5,
@@ -4056,6 +4111,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (0.0, 5_000_000.0),
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement: TickPlacement::DEFAULT,
 				},
 				108.0,
@@ -4066,6 +4122,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (0.0, 100.0),
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement: TickPlacement::Step(PositiveFinite(25.0)),
 				},
 				81.0,
@@ -4076,6 +4133,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (0.0, 1.0),
 					axis_type: AxisType::Percent,
+					temporal_domain: None,
 					placement: TickPlacement::DEFAULT,
 				},
 				94.5,
@@ -4092,6 +4150,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (0.0, 100.0),
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement: TickPlacement::Step(PositiveFinite(0.000_001)),
 				},
 				81.0,
@@ -4102,6 +4161,7 @@ mod product_0106_vertical_guide_band_oracles {
 				AxisBandRequirement::Formatted {
 					domain: (1.0, 24.0),
 					axis_type: AxisType::Linear,
+					temporal_domain: None,
 					placement: TickPlacement::Step(PositiveFinite(25.0)),
 				},
 				27.0,
@@ -4732,6 +4792,45 @@ mod product_0067_0068_strata_oracles {
 	}
 
 	#[test]
+	fn product_0130_temporal_tick_placement_drives_the_same_render_and_band_selection() {
+		let stride = PositiveTemporalInterval::try_from_interval(
+			TemporalInterval::parse("1 month").expect("shared calendar literal"),
+		)
+		.expect("positive tick stride");
+		let mut settings = settings();
+		settings.x_tick_placement = TickPlacement::Temporal(stride);
+		let layout = PlotLayout::Cartesian {
+			x_range: (19_723.0, 19_783.0),
+			y_range: (0.0, 1.0),
+			x_axis_type: AxisType::Date,
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: Some(TemporalAxisDomain::Date {
+				first_day: 19_723,
+				last_day: 19_783,
+			}),
+			y_temporal_domain: None,
+		};
+		let requirement = BandRequirements::from_layout(&layout, &settings);
+		assert_eq!(requirement.estimated_x_width(18.0), 135.0);
+		let emitted = render(layout, settings, false)
+			.into_iter()
+			.filter_map(|operation| match operation {
+				Operation::Text(text) if text.starts_with("2024-") => Some(text),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+		assert_eq!(
+			emitted,
+			vec![
+				"2024-01-01".to_owned(),
+				"2024-02-01".to_owned(),
+				"2024-03-01".to_owned(),
+			],
+			"the operation list and band both use the exact selected calendar labels"
+		);
+	}
+
+	#[test]
 	fn radial_layouts_never_attempt_to_draw_cartesian_axis_titles() {
 		let mut radial_settings = settings();
 		radial_settings.x_label = ResolvedPresence::Show(Arc::new("stage".to_owned()));
@@ -4760,6 +4859,7 @@ mod product_0067_0068_strata_oracles {
 			domain,
 			axis_type,
 			placement,
+			..
 		} = requirements
 			.y
 			.as_slice()
@@ -4988,6 +5088,7 @@ mod product_0067_0068_strata_oracles {
 			let requirement = AxisBandRequirement::Formatted {
 				domain,
 				axis_type: axis_type.clone(),
+				temporal_domain: None,
 				placement: TickPlacement::DEFAULT,
 			};
 			assert_eq!(
@@ -5036,6 +5137,7 @@ mod product_0067_0068_strata_oracles {
 			let requirement = AxisBandRequirement::Formatted {
 				domain,
 				axis_type: axis_type.clone(),
+				temporal_domain: None,
 				placement,
 			};
 			assert_eq!(

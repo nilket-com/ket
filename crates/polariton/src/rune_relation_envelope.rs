@@ -91,6 +91,7 @@ pub(crate) struct RunePlotIntent {
 	pub(crate) facet_span: Option<Range<u32>>,
 	pub(crate) domain_spans: RunePlotDomainSpans,
 	pub(crate) tick_step_spans: RunePlotTickStepSpans,
+	pub(crate) tick_every_spans: RunePlotTickEverySpans,
 	pub(crate) minor_tick_spans: RunePlotMinorTickSpans,
 }
 
@@ -112,6 +113,12 @@ pub(crate) struct RunePlotDomainSpans {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RunePlotTickStepSpans {
+	pub(crate) x: Option<Range<u32>>,
+	pub(crate) y: Option<Range<u32>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub(crate) struct RunePlotTickEverySpans {
 	pub(crate) x: Option<Range<u32>>,
 	pub(crate) y: Option<Range<u32>>,
 }
@@ -183,6 +190,7 @@ impl RunePlotIntent {
 			facet_span: None,
 			domain_spans: RunePlotDomainSpans::default(),
 			tick_step_spans: RunePlotTickStepSpans::default(),
+			tick_every_spans: RunePlotTickEverySpans::default(),
 			minor_tick_spans: RunePlotMinorTickSpans::default(),
 		}
 	}

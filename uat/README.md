@@ -100,6 +100,17 @@ cargo run -p polariton -- uat/test40.rn
 `test40.rn` shows both legal legend forms: one chained `legend()` member and
 separate members whose placement and typography compose.
 
+Open the semantic temporal-tick exhibit with its DATE seed:
+
+```sh
+nilket toron sql --file uat/temporal_tick_intervals.sql
+cargo run -p polariton -- uat/temporal_tick_intervals.rn
+```
+
+`tick_every("1 month")` is calendar placement, not numeric stepping. The
+exhibit keeps the source as a DATE column so month-length semantics are visible
+in the workbook rather than implied by an epoch number.
+
 Open the PRODUCT-0079 histogram exhibit after seeding the same sales relation:
 
 ```sh

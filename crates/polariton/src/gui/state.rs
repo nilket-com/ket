@@ -49,9 +49,10 @@ use crate::rune_host::{self, RuneCapabilities};
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
 	DisposableRunePlotSink, PendingRunePresentation, PendingRuneView, RuneEnvelopeError,
-	RunePlotBody, RunePlotDomainSpans, RunePlotMinorTickSpans, RunePlotTickStepSpans,
-	RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection, RuneViewIntent, RuneViewScheduler,
-	SpannedRuneViewIntent, StyledRunePlotSink, TransformedRuneRelation, TransformedRuneView,
+	RunePlotBody, RunePlotDomainSpans, RunePlotMinorTickSpans, RunePlotTickEverySpans,
+	RunePlotTickStepSpans, RuneTableSink, RuneTableSkinIntent, RuneTableSkinProjection,
+	RuneViewIntent, RuneViewScheduler, SpannedRuneViewIntent, StyledRunePlotSink,
+	TransformedRuneRelation, TransformedRuneView,
 };
 use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 use iced::{Element, Size, Subscription, Task, application, event, keyboard, window};
@@ -67,6 +68,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 #[cfg(feature = "toron")]
 use tokio::sync::RwLock;
+#[cfg(feature = "toron")]
+use toron_client::TemporalInterval;
 
 struct AppState {
 	menu_state: MenuState,
@@ -1483,16 +1486,16 @@ fn multivariate_failure_span(
 }
 
 #[cfg(feature = "toron")]
-fn resolved_rune_axis_scales(
+fn resolved_rune_axis_channels(
 	body: &RunePlotBody,
 	schema: &polars::prelude::Schema,
-) -> std::result::Result<(ScaleFamily, ScaleFamily), String> {
-	let scales = |channels: &[crate::plot::spec::BoundChannel]| {
+) -> std::result::Result<[crate::plot::spec::BoundChannel; 2], String> {
+	let select = |channels: &[crate::plot::spec::BoundChannel]| {
 		[Channel::X, Channel::Y].map(|channel| {
 			channels
 				.iter()
 				.find(|binding| binding.channel == channel)
-				.map(|binding| binding.scale)
+				.cloned()
 				.ok_or_else(|| format!("plot has no resolved {channel} axis"))
 		})
 	};
@@ -1500,7 +1503,7 @@ fn resolved_rune_axis_scales(
 		RunePlotBody::Single(sink) => {
 			let authored = authored_rune_plot_spec(sink);
 			let binding = resolve_channels(&authored, schema).map_err(|error| error.to_string())?;
-			scales(binding.channels())
+			select(binding.channels())
 		}
 		RunePlotBody::StyledSingle(styled) => {
 			let sink = &styled.sink;
@@ -1516,22 +1519,48 @@ fn resolved_rune_axis_scales(
 				authored
 			};
 			let binding = resolve_channels(&authored, schema).map_err(|error| error.to_string())?;
-			scales(binding.channels())
+			select(binding.channels())
 		}
 		RunePlotBody::Layered(specification) => {
 			let binding = resolve_layered_channels(specification, schema)
 				.map_err(|error| error.to_string())?;
-			scales(binding.layers.first().channels())
+			select(binding.layers.first().channels())
 		}
 	};
-	Ok((resolved[0].clone()?, resolved[1].clone()?))
+	Ok([resolved[0].clone()?, resolved[1].clone()?])
+}
+
+#[cfg(feature = "toron")]
+fn resolved_rune_axis_scales(
+	body: &RunePlotBody,
+	schema: &polars::prelude::Schema,
+) -> std::result::Result<(ScaleFamily, ScaleFamily), String> {
+	let [x, y] = resolved_rune_axis_channels(body, schema)?;
+	Ok((x.scale, y.scale))
+}
+
+#[cfg(feature = "toron")]
+fn resolved_rune_axis_data_types(
+	body: &RunePlotBody,
+	schema: &polars::prelude::Schema,
+) -> std::result::Result<(polars::prelude::DataType, polars::prelude::DataType), String> {
+	let [x, y] = resolved_rune_axis_channels(body, schema)?;
+	let data_type = |field: &str| {
+		schema
+			.get(field)
+			.cloned()
+			.ok_or_else(|| format!("plot field `{field}` is absent from the schema"))
+	};
+	Ok((data_type(&x.field)?, data_type(&y.field)?))
 }
 
 #[cfg(feature = "toron")]
 fn validate_rune_numeric_domain_applicability(
 	body: &RunePlotBody,
+	authored_settings: &PlotSettingsLayer,
 	domain_spans: &RunePlotDomainSpans,
 	tick_step_spans: &RunePlotTickStepSpans,
+	tick_every_spans: &RunePlotTickEverySpans,
 	minor_tick_spans: &RunePlotMinorTickSpans,
 	schema: &polars::prelude::Schema,
 ) -> std::result::Result<(), (std::ops::Range<u32>, String)> {
@@ -1539,6 +1568,8 @@ fn validate_rune_numeric_domain_applicability(
 		&& domain_spans.y.is_none()
 		&& tick_step_spans.x.is_none()
 		&& tick_step_spans.y.is_none()
+		&& tick_every_spans.x.is_none()
+		&& tick_every_spans.y.is_none()
 		&& minor_tick_spans.x.is_none()
 		&& minor_tick_spans.y.is_none()
 	{
@@ -1617,6 +1648,63 @@ fn validate_rune_numeric_domain_applicability(
 			));
 		}
 	}
+	if tick_every_spans.x.is_some() || tick_every_spans.y.is_some() {
+		let Ok((x_type, y_type)) = resolved_rune_axis_data_types(body, schema) else {
+			return Ok(());
+		};
+		let guides = match &authored_settings.guides {
+			Override::Set(guides) => guides,
+			Override::Inherit => unreachable!("tick_every always authors guide settings"),
+		};
+		let validate = |axis: &str,
+		                span: &Option<std::ops::Range<u32>>,
+		                data_type: &polars::prelude::DataType,
+		                placement: crate::plot::common::TickPlacement|
+		 -> std::result::Result<(), (std::ops::Range<u32>, String)> {
+			let Some(span) = span else {
+				return Ok(());
+			};
+			let scale = if axis == "x" { x_scale } else { y_scale };
+			if !matches!(scale, ScaleFamily::Time) {
+				return Err((
+					span.clone(),
+					format!(
+						"{axis}_axis().tick_every(...) requires a temporal {axis} axis; this figure resolves {axis} as {scale:?}"
+					),
+				));
+			}
+			let crate::plot::common::TickPlacement::Temporal(stride) = placement else {
+				unreachable!("tick_every span always selects temporal placement")
+			};
+			let supported = matches!(
+				(data_type, stride.interval()),
+				(
+					polars::prelude::DataType::Date,
+					TemporalInterval::CalendarMonths(_)
+				) | (
+					polars::prelude::DataType::Datetime(_, _),
+					TemporalInterval::FixedNanos(_)
+				) | (
+					polars::prelude::DataType::Datetime(_, _),
+					TemporalInterval::CalendarMonths(_)
+				) | (
+					polars::prelude::DataType::Time,
+					TemporalInterval::FixedNanos(_)
+				)
+			);
+			if !supported {
+				return Err((
+					span.clone(),
+					format!(
+						"{axis}_axis().tick_every(...) interval does not apply to this {data_type:?} axis"
+					),
+				));
+			}
+			Ok(())
+		};
+		validate("x", &tick_every_spans.x, &x_type, guides.x_tick_placement)?;
+		validate("y", &tick_every_spans.y, &y_type, guides.y_tick_placement)?;
+	}
 	if let Some(span) = minor_tick_spans.x.as_ref() {
 		if !matches!(x_scale, ScaleFamily::Linear) {
 			return Err((
@@ -1645,16 +1733,76 @@ fn validate_rune_tick_capacity(
 	kernel: &dyn crate::plot::common::PlotKernel,
 	settings: &crate::plot::common::ResolvedPlotSettings,
 	tick_step_spans: &RunePlotTickStepSpans,
+	tick_every_spans: &RunePlotTickEverySpans,
 	minor_tick_spans: &RunePlotMinorTickSpans,
 ) -> std::result::Result<(), (std::ops::Range<u32>, String)> {
 	if tick_step_spans.x.is_none()
 		&& tick_step_spans.y.is_none()
+		&& tick_every_spans.x.is_none()
+		&& tick_every_spans.y.is_none()
 		&& minor_tick_spans.x.is_none()
 		&& minor_tick_spans.y.is_none()
 	{
 		return Ok(());
 	}
 	let layout = kernel.layout(settings.clone());
+	let check_temporal = |placement: crate::plot::common::TickPlacement,
+	                      axis: &str,
+	                      domain: Option<&crate::plot::common::TemporalAxisDomain>,
+	                      span: &Option<std::ops::Range<u32>>|
+	 -> std::result::Result<(), (std::ops::Range<u32>, String)> {
+		let Some(span) = span else {
+			return Ok(());
+		};
+		let crate::plot::common::TickPlacement::Temporal(stride) = placement else {
+			unreachable!("tick_every span always selects temporal placement")
+		};
+		let Some(domain) = domain else {
+			return Err((
+				span.clone(),
+				format!("{axis}_axis().tick_every(...) requires an exact temporal axis domain"),
+			));
+		};
+		crate::plot::common::select_temporal_ticks(domain, stride).map_err(|error| {
+			(
+				span.clone(),
+				format!("{axis}_axis().tick_every(...) cannot select temporal ticks: {error:?}"),
+			)
+		})?;
+		Ok(())
+	};
+	match &layout {
+		PlotLayout::Cartesian {
+			x_temporal_domain,
+			y_temporal_domain,
+			..
+		} => {
+			check_temporal(
+				settings.x_tick_placement,
+				"x",
+				x_temporal_domain.as_ref(),
+				&tick_every_spans.x,
+			)?;
+			check_temporal(
+				settings.y_tick_placement,
+				"y",
+				y_temporal_domain.as_ref(),
+				&tick_every_spans.y,
+			)?;
+		}
+		_ if tick_every_spans.x.is_some() || tick_every_spans.y.is_some() => {
+			let span = tick_every_spans
+				.x
+				.clone()
+				.or_else(|| tick_every_spans.y.clone())
+				.expect("authored tick_every has a span");
+			return Err((
+				span,
+				"tick_every(...) requires a Cartesian temporal axis layout".to_owned(),
+			));
+		}
+		_ => {}
+	}
 	let check = |placement: crate::plot::common::TickPlacement,
 	             axis: &str,
 	             range: (f64, f64),
@@ -2036,6 +2184,7 @@ fn rune_view_outcome_with_palettes(
 						facet_span: _,
 						domain_spans,
 						tick_step_spans,
+						tick_every_spans,
 						minor_tick_spans,
 						continuous_intent,
 						continuous_intent_span,
@@ -2056,8 +2205,10 @@ fn rune_view_outcome_with_palettes(
 					};
 					if let Err((span, error)) = validate_rune_numeric_domain_applicability(
 						&body,
+						&authored_settings,
 						&domain_spans,
 						&tick_step_spans,
+						&tick_every_spans,
 						&minor_tick_spans,
 						frame.schema().as_ref(),
 					) {
@@ -2104,6 +2255,8 @@ fn rune_view_outcome_with_palettes(
 						.x
 						.clone()
 						.or_else(|| tick_step_spans.y.clone())
+						.or_else(|| tick_every_spans.x.clone())
+						.or_else(|| tick_every_spans.y.clone())
 						.or_else(|| minor_tick_spans.x.clone())
 						.or_else(|| minor_tick_spans.y.clone());
 					let has_authored_minor_ticks =
@@ -2128,6 +2281,8 @@ fn rune_view_outcome_with_palettes(
 							.and_then(|(resolved, next_identity)| {
 								if tick_step_spans.x.is_none()
 									&& tick_step_spans.y.is_none()
+									&& tick_every_spans.x.is_none()
+									&& tick_every_spans.y.is_none()
 									&& !has_authored_minor_ticks
 								{
 									return Ok(RuneRelationSinkOutput::Plot(
@@ -2145,6 +2300,7 @@ fn rune_view_outcome_with_palettes(
 									kernel.as_ref(),
 									&resolved_tick_settings,
 									&tick_step_spans,
+									&tick_every_spans,
 									&minor_tick_spans,
 								)
 								.map_err(|(_, error)| error)?;
@@ -2163,6 +2319,8 @@ fn rune_view_outcome_with_palettes(
 								let specification = LayeredPlotSpec::new(layer);
 								if tick_step_spans.x.is_none()
 									&& tick_step_spans.y.is_none()
+									&& tick_every_spans.x.is_none()
+									&& tick_every_spans.y.is_none()
 									&& !has_authored_minor_ticks
 								{
 									Ok(RuneRelationSinkOutput::LayeredPlot(
@@ -2177,6 +2335,7 @@ fn rune_view_outcome_with_palettes(
 												kernel.as_ref(),
 												&resolved_tick_settings,
 												&tick_step_spans,
+												&tick_every_spans,
 												&minor_tick_spans,
 											)
 											.map_err(|(_, error)| error)
@@ -2223,7 +2382,10 @@ fn rune_view_outcome_with_palettes(
 								)
 								.and_then(|(resolved, next_identity)| {
 									if tick_step_spans.x.is_none()
-										&& tick_step_spans.y.is_none() && !has_authored_minor_ticks
+										&& tick_step_spans.y.is_none() && tick_every_spans
+										.x
+										.is_none() && tick_every_spans.y.is_none()
+										&& !has_authored_minor_ticks
 									{
 										return Ok(RuneRelationSinkOutput::StyledPlot(
 											resolved,
@@ -2246,6 +2408,7 @@ fn rune_view_outcome_with_palettes(
 											kernel.as_ref(),
 											&resolved_tick_settings,
 											&tick_step_spans,
+											&tick_every_spans,
 											&minor_tick_spans,
 										)
 										.map_err(|(_, error)| error)
@@ -2267,6 +2430,8 @@ fn rune_view_outcome_with_palettes(
 						RunePlotBody::Layered(specification) => {
 							if tick_step_spans.x.is_none()
 								&& tick_step_spans.y.is_none()
+								&& tick_every_spans.x.is_none()
+								&& tick_every_spans.y.is_none()
 								&& !has_authored_minor_ticks
 							{
 								Ok(RuneRelationSinkOutput::LayeredPlot(
@@ -2281,6 +2446,7 @@ fn rune_view_outcome_with_palettes(
 											kernel.as_ref(),
 											&resolved_tick_settings,
 											&tick_step_spans,
+											&tick_every_spans,
 											&minor_tick_spans,
 										)
 										.map_err(|(_, error)| error)
@@ -9247,6 +9413,84 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			&temporal_source[span.start as usize..span.end as usize],
 			".tick_step(1)"
 		);
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0130_tick_every_reaches_temporal_axes_and_refuses_invalid_destinations() {
+		use polars::prelude::{IntoColumn, NamedFrom};
+
+		let source = "workspace.table(\"t\").views([figure([x_axis().tick_every(\"1 month\"), line(\"day\", \"value\")])])";
+		let relation = transform_rune_view(source)
+			.expect("temporal tick spelling parses")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let days = polars::prelude::Series::new("day".into(), &[19_723_i32, 19_754, 19_783])
+			.cast(&polars::prelude::DataType::Date)
+			.expect("date source");
+		let frame = polars::prelude::DataFrame::new(
+			3,
+			vec![
+				days.into_column(),
+				polars::prelude::Series::new("value".into(), &[1.0_f64, 2.0, 3.0]).into_column(),
+			],
+		)
+		.expect("frame");
+		let outcome = rune_view_outcome(frame.clone(), relation.views);
+		let (resolved, authored) = match &outcome.sinks[0].output {
+			Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(resolved, authored, _)) => {
+				(resolved, authored)
+			}
+			Err(error) => panic!("calendar tick_every must reach a Date axis: {error}"),
+			_ => panic!("calendar tick_every must produce a Cartesian plot"),
+		};
+		let settings = crate::plot::theme::PlotSettings {
+			authored_spec: authored.clone(),
+			..crate::plot::theme::PlotSettings::default()
+		}
+		.resolve();
+		assert!(matches!(
+			settings.x_tick_placement,
+			crate::plot::common::TickPlacement::Temporal(_)
+		));
+		let kernel = create_plot(&resolved.resolved_spec, &resolved.data, 1200, 720);
+		assert!(matches!(
+			kernel.layout(settings),
+			PlotLayout::Cartesian {
+				x_temporal_domain: Some(crate::plot::common::TemporalAxisDomain::Date { .. }),
+				..
+			}
+		));
+
+		for (source, frame, expected) in [
+			(
+				"workspace.table(\"t\").views([figure([x_axis().tick_every(\"1 day\"), line(\"x\", \"value\")])])",
+				polars::df!("x" => [0.0_f64, 1.0], "value" => [1.0_f64, 2.0]).unwrap(),
+				"requires a temporal",
+			),
+			(
+				"workspace.table(\"t\").views([figure([x_axis().tick_every(\"1 hour\"), line(\"day\", \"value\")])])",
+				frame,
+				"does not apply",
+			),
+		] {
+			let relation = transform_rune_view(source)
+				.expect("surface spelling parses")
+				.into_relations()
+				.next()
+				.expect("one relation");
+			let outcome = rune_view_outcome(frame, relation.views);
+			let Err(error) = &outcome.sinks[0].output else {
+				panic!("invalid temporal tick_every must refuse")
+			};
+			assert!(error.contains(expected), "{error}");
+			let span = outcome.sinks[0].span.clone();
+			assert!(
+				&source[span.start as usize..span.end as usize].starts_with(".tick_every"),
+				"the modifier owns the refusal"
+			);
+		}
 	}
 
 	#[cfg(feature = "toron")]

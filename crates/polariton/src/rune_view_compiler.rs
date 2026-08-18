@@ -73,6 +73,7 @@ const PRESENTATION_METHODS: &[&str] = &[
 	"label_size",
 	"bounds",
 	"tick_step",
+	"tick_every",
 	"minor_ticks",
 	"tick_size",
 	"tick_rotation",
@@ -3728,5 +3729,44 @@ r.views([bar(category(), "revenue")])
 			assert!(source.contains(&format!("{mark}(\"")), "missing {mark}");
 		}
 		assert!(source.contains("padding().left(96)"));
+	}
+
+	#[test]
+	fn product_0130_temporal_tick_interval_exhibit_compiles_calendar_surface() {
+		let source = include_str!("../../../uat/temporal_tick_intervals.rn");
+		let compiled = compile(source).expect("the temporal tick exhibit compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert_eq!(compiled.executions[0].views.len(), 4);
+		assert!(
+			source.contains("x_axis().label(\"Month\").label_size(16).tick_every(\"1 month\")")
+		);
+
+		for (source, expected_span, expected_message) in [
+			(
+				"workspace.table(\"t\").views([figure([x_axis().tick_every(\"0 day\"), line(\"x\", \"y\")])])",
+				".tick_every(\"0 day\")",
+				"strictly positive",
+			),
+			(
+				"workspace.table(\"t\").views([figure([x_axis().tick_every(\"1 day\").tick_step(1), line(\"x\", \"y\")])])",
+				".tick_step(1)",
+				"cannot combine",
+			),
+			(
+				"workspace.table(\"t\").views([figure([x_axis().tick_every(\"1 day\").minor_ticks(1), line(\"x\", \"y\")])])",
+				".minor_ticks(1)",
+				"cannot combine",
+			),
+		] {
+			let error = compile(source).expect_err("invalid temporal placement refuses");
+			let RuneEnvelopeError::InvalidView { span, message } = error else {
+				panic!("temporal placement refusal retains its origin")
+			};
+			assert_eq!(
+				&source[span.start as usize..span.end as usize],
+				expected_span
+			);
+			assert!(message.contains(expected_message), "{message}");
+		}
 	}
 }
