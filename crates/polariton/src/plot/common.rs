@@ -26,22 +26,104 @@ pub enum Orientation {
 	Horizontal,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TimeUnit {
 	Nanoseconds,
 	Microseconds,
 	Milliseconds,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[derive(Debug, Clone, PartialEq, Default)]
 pub enum AxisType {
 	#[default]
 	Linear,
 	/// PRODUCT-0072: a linear value scale expressed in percentage points.
 	Percent,
 	Date,
-	Datetime(TimeUnit),
+	Datetime {
+		unit: TimeUnit,
+		/// The named civil frame attached to the source datetime dtype. `None`
+		/// preserves the legacy UTC interpretation for an unzoned dtype.
+		zone: Option<Arc<str>>,
+	},
 	Time,
+}
+
+/// Exact temporal bounds retained beside the legacy floating-point plotting
+/// range. The renderer still projects to `f64` at the coordinate-transform
+/// boundary; tick selection and formatting must not recover these values from
+/// that lossy projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TemporalAxisDomain {
+	Date {
+		first_day: i32,
+		last_day: i32,
+	},
+	Datetime {
+		first_tick: i64,
+		last_tick: i64,
+		unit: TimeUnit,
+		zone: Option<Arc<str>>,
+	},
+	Time {
+		first_nanos: i64,
+		last_nanos: i64,
+	},
+}
+
+pub fn union_temporal_axis_domains(
+	left: Option<TemporalAxisDomain>,
+	right: Option<TemporalAxisDomain>,
+) -> Option<TemporalAxisDomain> {
+	match (left, right) {
+		(None, right) | (right, None) => right,
+		(
+			Some(TemporalAxisDomain::Date {
+				first_day: left_first,
+				last_day: left_last,
+			}),
+			Some(TemporalAxisDomain::Date {
+				first_day: right_first,
+				last_day: right_last,
+			}),
+		) => Some(TemporalAxisDomain::Date {
+			first_day: left_first.min(right_first),
+			last_day: left_last.max(right_last),
+		}),
+		(
+			Some(TemporalAxisDomain::Datetime {
+				first_tick: left_first,
+				last_tick: left_last,
+				unit,
+				zone,
+			}),
+			Some(TemporalAxisDomain::Datetime {
+				first_tick: right_first,
+				last_tick: right_last,
+				unit: right_unit,
+				zone: right_zone,
+			}),
+		) if unit == right_unit && zone == right_zone => Some(TemporalAxisDomain::Datetime {
+			first_tick: left_first.min(right_first),
+			last_tick: left_last.max(right_last),
+			unit,
+			zone,
+		}),
+		(
+			Some(TemporalAxisDomain::Time {
+				first_nanos: left_first,
+				last_nanos: left_last,
+			}),
+			Some(TemporalAxisDomain::Time {
+				first_nanos: right_first,
+				last_nanos: right_last,
+			}),
+		) => Some(TemporalAxisDomain::Time {
+			first_nanos: left_first.min(right_first),
+			last_nanos: left_last.max(right_last),
+		}),
+		_ => panic!("PRODUCT-0128 cannot combine temporal domains with different units or zones"),
+	}
 }
 
 /// Semantic provenance for a derived axis title. This is deliberately
@@ -197,7 +279,7 @@ impl TickPlacement {
 
 pub const MAX_GENERATED_TICK_POSITIONS: usize = 10_000;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub enum TickPlacementError {
 	InvalidDomain {
 		range: (f64, f64),
@@ -228,6 +310,8 @@ pub enum PlotLayout {
 		y_range: (f64, f64),
 		x_axis_type: AxisType,
 		y_axis_type: AxisType,
+		x_temporal_domain: Option<TemporalAxisDomain>,
+		y_temporal_domain: Option<TemporalAxisDomain>,
 	},
 	CategoricalX {
 		categories: Vec<String>,
@@ -277,15 +361,16 @@ impl BandRequirements {
 				y_range,
 				x_axis_type,
 				y_axis_type,
+				..
 			} => (
 				Some(AxisBandRequirement::Formatted {
 					domain: *x_range,
-					axis_type: *x_axis_type,
+					axis_type: x_axis_type.clone(),
 					placement: settings.x_tick_placement,
 				}),
 				Some(AxisBandRequirement::Formatted {
 					domain: *y_range,
-					axis_type: *y_axis_type,
+					axis_type: y_axis_type.clone(),
 					placement: settings.y_tick_placement,
 				}),
 			),
@@ -297,7 +382,7 @@ impl BandRequirements {
 				Some(AxisBandRequirement::Categories(categories.clone())),
 				Some(AxisBandRequirement::Formatted {
 					domain: *y_range,
-					axis_type: *y_axis_type,
+					axis_type: y_axis_type.clone(),
 					placement: settings.y_tick_placement,
 				}),
 			),
@@ -308,7 +393,7 @@ impl BandRequirements {
 			} => (
 				Some(AxisBandRequirement::Formatted {
 					domain: *x_range,
-					axis_type: *x_axis_type,
+					axis_type: x_axis_type.clone(),
 					placement: settings.x_tick_placement,
 				}),
 				Some(AxisBandRequirement::Categories(categories.clone())),
@@ -382,7 +467,7 @@ impl AxisBandRequirement {
 				.unwrap_or_default()
 				.into_iter()
 				.map(|value| {
-					estimate_formatted_label_width(&format_label(value, *axis_type), font_size)
+					estimate_formatted_label_width(&format_label(value, axis_type), font_size)
 				})
 				.fold(0.0, f32::max),
 			Self::Categories(labels) => labels
@@ -2291,12 +2376,12 @@ impl<'a> PlotWidget<'a> {
 		text: AxisTextVisibility,
 	) {
 		let x_axis_type = if let PlotLayout::Cartesian { x_axis_type, .. } = transform.layout {
-			*x_axis_type
+			x_axis_type.clone()
 		} else {
 			AxisType::Linear
 		};
 		let y_axis_type = if let PlotLayout::Cartesian { y_axis_type, .. } = transform.layout {
-			*y_axis_type
+			y_axis_type.clone()
 		} else {
 			AxisType::Linear
 		};
@@ -2331,7 +2416,7 @@ impl<'a> PlotWidget<'a> {
 			);
 			if text.y {
 				backend.fill_text(Text {
-					content: format_label(data_y, y_axis_type),
+					content: format_label(data_y, &y_axis_type),
 					position: Point::new(p_left.x - 10.0, p_left.y),
 					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.y_tick_size.pixels()),
@@ -2367,7 +2452,7 @@ impl<'a> PlotWidget<'a> {
 				axis_stroke,
 			);
 			if text.x {
-				let label = format_label(data_x, x_axis_type);
+				let label = format_label(data_x, &x_axis_type);
 				let placement = XTickTextPlacement::resolve(
 					self.settings.x_tick_rotation,
 					text.anchoring.x_alignment(data_x, x_range),
@@ -2527,7 +2612,7 @@ impl<'a> PlotWidget<'a> {
 			);
 			if text.y {
 				backend.fill_text(Text {
-					content: format_label(data_y, *y_axis_type),
+					content: format_label(data_y, y_axis_type),
 					position: Point::new(p_left.x - 10.0, p_left.y),
 					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.y_tick_size.pixels()),
@@ -2693,7 +2778,7 @@ impl<'a> PlotWidget<'a> {
 			);
 			if text.x {
 				backend.fill_text(Text {
-					content: format_label(data_x, *x_axis_type),
+					content: format_label(data_x, x_axis_type),
 					position: Point::new(p_bottom.x, p_bottom.y + 10.0),
 					color: self.settings.chrome.tick_label_text.iced(),
 					size: iced::Pixels(self.settings.x_tick_size.pixels()),
@@ -2861,7 +2946,7 @@ impl<'a> PlotWidget<'a> {
 				);
 				if text.y {
 					backend.fill_text(Text {
-						content: format_label(data_y, AxisType::Linear),
+						content: format_label(data_y, &AxisType::Linear),
 						position: Point::new(p.x - 14.0, p.y),
 						color: self.settings.chrome.tick_label_text.iced(),
 						size: iced::Pixels(self.settings.y_tick_size.pixels()),
@@ -2905,20 +2990,73 @@ impl<'a> PlotWidget<'a> {
 pub fn polars_type_to_axis_type(dt: &polars::prelude::DataType) -> AxisType {
 	match dt {
 		polars::prelude::DataType::Date => AxisType::Date,
-		polars::prelude::DataType::Datetime(unit, _) => {
+		polars::prelude::DataType::Datetime(unit, zone) => {
 			let tu = match unit {
 				polars::prelude::TimeUnit::Nanoseconds => TimeUnit::Nanoseconds,
 				polars::prelude::TimeUnit::Microseconds => TimeUnit::Microseconds,
 				polars::prelude::TimeUnit::Milliseconds => TimeUnit::Milliseconds,
 			};
-			AxisType::Datetime(tu)
+			AxisType::Datetime {
+				unit: tu,
+				zone: zone.as_ref().map(|zone| Arc::<str>::from(zone.as_str())),
+			}
 		}
 		polars::prelude::DataType::Time => AxisType::Time,
 		_ => AxisType::Linear,
 	}
 }
 
-pub fn format_label(value: f64, axis_type: AxisType) -> String {
+/// Preserve temporal bounds from the source column before plot preparation
+/// projects the values into the renderer's legacy `f64` coordinate range.
+pub fn temporal_axis_domain(
+	column: &polars::prelude::Column,
+	axis_type: &AxisType,
+) -> Option<TemporalAxisDomain> {
+	use polars::prelude::{DataType, TimeUnit as PolarsTimeUnit};
+
+	match (column.dtype(), axis_type) {
+		(DataType::Date, AxisType::Date) => {
+			let cast = column.cast(&DataType::Int32).ok()?;
+			let values = cast.i32().ok()?;
+			Some(TemporalAxisDomain::Date {
+				first_day: values.into_iter().flatten().min()?,
+				last_day: values.into_iter().flatten().max()?,
+			})
+		}
+		(
+			DataType::Datetime(unit, zone),
+			AxisType::Datetime {
+				unit: axis_unit, ..
+			},
+		) => {
+			let cast = column.cast(&DataType::Int64).ok()?;
+			let values = cast.i64().ok()?;
+			let unit = match unit {
+				PolarsTimeUnit::Nanoseconds => TimeUnit::Nanoseconds,
+				PolarsTimeUnit::Microseconds => TimeUnit::Microseconds,
+				PolarsTimeUnit::Milliseconds => TimeUnit::Milliseconds,
+			};
+			debug_assert_eq!(&unit, axis_unit);
+			Some(TemporalAxisDomain::Datetime {
+				first_tick: values.into_iter().flatten().min()?,
+				last_tick: values.into_iter().flatten().max()?,
+				unit,
+				zone: zone.as_ref().map(|zone| Arc::<str>::from(zone.as_str())),
+			})
+		}
+		(DataType::Time, AxisType::Time) => {
+			let cast = column.cast(&DataType::Int64).ok()?;
+			let values = cast.i64().ok()?;
+			Some(TemporalAxisDomain::Time {
+				first_nanos: values.into_iter().flatten().min()?,
+				last_nanos: values.into_iter().flatten().max()?,
+			})
+		}
+		_ => None,
+	}
+}
+
+pub fn format_label(value: f64, axis_type: &AxisType) -> String {
 	match axis_type {
 		AxisType::Linear => {
 			if value.abs() >= 1e6 || (value.abs() < 1e-3 && value != 0.0) {
@@ -2929,7 +3067,7 @@ pub fn format_label(value: f64, axis_type: AxisType) -> String {
 				format!("{:.1}", value)
 			}
 		}
-		AxisType::Percent => format!("{}%", format_label(value, AxisType::Linear)),
+		AxisType::Percent => format!("{}%", format_label(value, &AxisType::Linear)),
 		AxisType::Date => {
 			let days = value as i64;
 			if let Some(date) = chrono::NaiveDate::from_num_days_from_ce_opt(days as i32 + 719163) {
@@ -2938,7 +3076,7 @@ pub fn format_label(value: f64, axis_type: AxisType) -> String {
 				format!("{:.1}", value)
 			}
 		}
-		AxisType::Datetime(unit) => {
+		AxisType::Datetime { unit, zone } => {
 			let timestamp = value as i64;
 			let naive = match unit {
 				TimeUnit::Milliseconds => chrono::DateTime::from_timestamp(
@@ -2955,7 +3093,17 @@ pub fn format_label(value: f64, axis_type: AxisType) -> String {
 				),
 			};
 			naive
-				.map(|dt: chrono::DateTime<chrono::Utc>| dt.format("%Y-%m-%d %H:%M:%S").to_string())
+				.map(|dt: chrono::DateTime<chrono::Utc>| {
+					let zone = zone
+						.as_deref()
+						.map(str::parse::<chrono_tz::Tz>)
+						.transpose()
+						.expect("Polars datetime timezone must be an IANA zone")
+						.unwrap_or(chrono_tz::UTC);
+					dt.with_timezone(&zone)
+						.format("%Y-%m-%d %H:%M:%S")
+						.to_string()
+				})
 				.unwrap_or_else(|| format!("{:.1}", value))
 		}
 		AxisType::Time => {
@@ -2996,6 +3144,8 @@ mod product_0106_vertical_guide_band_oracles {
 			y_range: (20_000.0, 20_010.0),
 			x_axis_type: AxisType::Linear,
 			y_axis_type: AxisType::Date,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 		};
 		let categorical_x = PlotLayout::CategoricalX {
 			categories: vec!["short".to_owned(), "a deliberately longer label".to_owned()],
@@ -3428,6 +3578,8 @@ mod product_0106_vertical_guide_band_oracles {
 			y_range: (20_000.0, 20_010.0),
 			x_axis_type: AxisType::Linear,
 			y_axis_type: AxisType::Date,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 		};
 		let categorical_y = PlotLayout::CategoricalY {
 			categories: vec!["longest category".to_owned()],
@@ -3556,7 +3708,7 @@ mod product_0106_vertical_guide_band_oracles {
 			);
 			assert_eq!(
 				estimate_formatted_label_width(
-					&format_label(legacy_candidate, AxisType::Linear),
+					&format_label(legacy_candidate, &AxisType::Linear),
 					settings.y_tick_size.pixels(),
 				),
 				expected_legacy_width,
@@ -3921,6 +4073,8 @@ mod product_0106_vertical_guide_band_oracles {
 			y_range: (0.0, 200.0),
 			x_axis_type: AxisType::Linear,
 			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 		};
 		let transform = CoordinateTransformer::new(&layout, area.into_iced());
 		let quarter = transform.cartesian(25.0, 50.0);
@@ -3948,6 +4102,8 @@ mod product_0031_pre_extraction_oracle {
 				y_range: (0.0, 1.0),
 				x_axis_type: AxisType::Linear,
 				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 			}
 		}
 
@@ -4189,6 +4345,8 @@ mod product_0067_0068_strata_oracles {
 				y_range: (0.0, 1.0),
 				x_axis_type: AxisType::Linear,
 				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 			}
 		}
 
@@ -4336,7 +4494,7 @@ mod product_0067_0068_strata_oracles {
 			.positions(*domain)
 			.expect("default count selection")
 			.into_iter()
-			.map(|value| format_label(value, *axis_type))
+			.map(|value| format_label(value, axis_type))
 			.collect::<Vec<_>>();
 		let emitted = render(layout, settings, false)
 			.into_iter()
@@ -4454,7 +4612,10 @@ mod product_0067_0068_strata_oracles {
 			(
 				"millisecond DateTime",
 				(1_700_000_000_000.0, 1_700_000_010_000.0),
-				AxisType::Datetime(TimeUnit::Milliseconds),
+				AxisType::Datetime {
+					unit: TimeUnit::Milliseconds,
+					zone: None,
+				},
 				256.5,
 				&[
 					"2023-11-14 22:13:20",
@@ -4471,7 +4632,10 @@ mod product_0067_0068_strata_oracles {
 			(
 				"epoch millisecond DateTime",
 				(0.0, 10_000.0),
-				AxisType::Datetime(TimeUnit::Milliseconds),
+				AxisType::Datetime {
+					unit: TimeUnit::Milliseconds,
+					zone: None,
+				},
 				256.5,
 				&[
 					"1970-01-01 00:00:00",
@@ -4488,7 +4652,10 @@ mod product_0067_0068_strata_oracles {
 			(
 				"microsecond DateTime",
 				(0.0, 10_000_000.0),
-				AxisType::Datetime(TimeUnit::Microseconds),
+				AxisType::Datetime {
+					unit: TimeUnit::Microseconds,
+					zone: None,
+				},
 				256.5,
 				&[
 					"1970-01-01 00:00:00",
@@ -4505,7 +4672,10 @@ mod product_0067_0068_strata_oracles {
 			(
 				"nanosecond DateTime",
 				(0.0, 10_000_000_000.0),
-				AxisType::Datetime(TimeUnit::Nanoseconds),
+				AxisType::Datetime {
+					unit: TimeUnit::Nanoseconds,
+					zone: None,
+				},
 				256.5,
 				&[
 					"1970-01-01 00:00:00",
@@ -4539,7 +4709,7 @@ mod product_0067_0068_strata_oracles {
 		] {
 			let requirement = AxisBandRequirement::Formatted {
 				domain,
-				axis_type,
+				axis_type: axis_type.clone(),
 				placement: TickPlacement::DEFAULT,
 			};
 			assert_eq!(
@@ -4548,7 +4718,7 @@ mod product_0067_0068_strata_oracles {
 				"{name} preserves its separately banked Count width"
 			);
 			assert_eq!(
-				product_0127_y_tick_trace(domain, axis_type, TickPlacement::DEFAULT),
+				product_0127_y_tick_trace(domain, axis_type.clone(), TickPlacement::DEFAULT),
 				expected_trace
 					.iter()
 					.map(|label| (*label).to_owned())
@@ -4570,7 +4740,10 @@ mod product_0067_0068_strata_oracles {
 			(
 				"past-chrono millisecond DateTime Step",
 				(0.0, 1_000_000_000_000_000_000.0),
-				AxisType::Datetime(TimeUnit::Milliseconds),
+				AxisType::Datetime {
+					unit: TimeUnit::Milliseconds,
+					zone: None,
+				},
 				TickPlacement::Step(PositiveFinite(300_000_000_000_000_000.0)),
 				283.5,
 				270.0,
@@ -4584,7 +4757,7 @@ mod product_0067_0068_strata_oracles {
 		] {
 			let requirement = AxisBandRequirement::Formatted {
 				domain,
-				axis_type,
+				axis_type: axis_type.clone(),
 				placement,
 			};
 			assert_eq!(
@@ -4598,7 +4771,7 @@ mod product_0067_0068_strata_oracles {
 				"{name} preserves its separately banked Step delta"
 			);
 			assert_eq!(
-				product_0127_y_tick_trace(domain, axis_type, placement),
+				product_0127_y_tick_trace(domain, axis_type.clone(), placement),
 				expected_trace
 					.iter()
 					.map(|label| (*label).to_owned())
@@ -4710,6 +4883,8 @@ mod product_0067_0068_strata_oracles {
 				y_range: (0.0, 1.0),
 				x_axis_type: AxisType::Linear,
 				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 			},
 			PlotLayout::CategoricalX {
 				categories: vec!["A".to_owned(), "B".to_owned()],
@@ -4833,9 +5008,9 @@ mod product_0067_0068_strata_oracles {
 
 	#[test]
 	fn product_0072_percent_axis_formats_percentage_points_and_admits_steps() {
-		assert_eq!(format_label(0.0, AxisType::Percent), "0%");
-		assert_eq!(format_label(12.5, AxisType::Percent), "12.5%");
-		assert_eq!(format_label(100.0, AxisType::Percent), "100%");
+		assert_eq!(format_label(0.0, &AxisType::Percent), "0%");
+		assert_eq!(format_label(12.5, &AxisType::Percent), "12.5%");
+		assert_eq!(format_label(100.0, &AxisType::Percent), "100%");
 		assert_eq!(
 			TickPlacement::step(25.0)
 				.unwrap()
@@ -4879,6 +5054,69 @@ mod product_0067_0068_strata_oracles {
 				Operation::Text(text) if text.ends_with('%')
 			)),
 			"the same step on an absolute layout keeps linear labels"
+		);
+	}
+
+	#[test]
+	fn product_0128_zoned_datetime_keeps_its_declared_display_frame() {
+		let zone = polars::prelude::TimeZone::opt_try_new(Some("America/Chicago"))
+			.expect("IANA zone")
+			.expect("named zone");
+		let dtype = polars::prelude::DataType::Datetime(
+			polars::prelude::TimeUnit::Milliseconds,
+			Some(zone),
+		);
+		let axis_type = polars_type_to_axis_type(&dtype);
+		assert_eq!(
+			axis_type,
+			AxisType::Datetime {
+				unit: TimeUnit::Milliseconds,
+				zone: Some(Arc::from("America/Chicago")),
+			}
+		);
+
+		// 2024-01-01T00:00:00Z is the previous civil evening in Chicago.
+		assert_eq!(
+			format_label(1_704_067_200_000.0, &axis_type),
+			"2023-12-31 18:00:00",
+			"PRODUCT-0128 corrects the prior UTC-only Count label"
+		);
+		assert_eq!(
+			format_label(
+				1_704_067_200_000.0,
+				&AxisType::Datetime {
+					unit: TimeUnit::Milliseconds,
+					zone: None,
+				}
+			),
+			"2024-01-01 00:00:00",
+			"an unzoned dtype preserves its legacy UTC display"
+		);
+	}
+
+	#[test]
+	fn product_0128_temporal_domain_retains_exact_nanosecond_endpoints_before_float() {
+		use polars::prelude::NamedFrom;
+		let zone = polars::prelude::TimeZone::opt_try_new(Some("America/New_York"))
+			.expect("IANA zone")
+			.expect("named zone");
+		let dtype =
+			polars::prelude::DataType::Datetime(polars::prelude::TimeUnit::Nanoseconds, Some(zone));
+		let source = polars::prelude::Series::new(
+			"instant".into(),
+			[1_704_067_200_000_000_000_i64, 1_704_067_200_000_000_001_i64],
+		)
+		.cast(&dtype)
+		.expect("datetime source");
+		let column = polars::prelude::Column::from(source);
+		assert_eq!(
+			temporal_axis_domain(&column, &polars_type_to_axis_type(&dtype)),
+			Some(TemporalAxisDomain::Datetime {
+				first_tick: 1_704_067_200_000_000_000,
+				last_tick: 1_704_067_200_000_000_001,
+				unit: TimeUnit::Nanoseconds,
+				zone: Some(Arc::from("America/New_York")),
+			})
 		);
 	}
 

@@ -1,5 +1,6 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
+	TemporalAxisDomain,
 };
 use crate::plot::kernels::line::{LinePlotKernel, LinePreparedData};
 use crate::plot::kernels::scatter::{ScatterPlotKernel, ScatterPreparedData};
@@ -14,6 +15,8 @@ pub struct ScatterLinePlotKernel {
 	y_range: (f64, f64),
 	x_axis_type: AxisType,
 	y_axis_type: AxisType,
+	x_temporal_domain: Option<TemporalAxisDomain>,
+	y_temporal_domain: Option<TemporalAxisDomain>,
 	x_label: String,
 	y_label: String,
 }
@@ -31,8 +34,10 @@ impl ScatterLinePlotKernel {
 		Self {
 			x_range,
 			y_range,
-			x_axis_type: scatter_data.x_axis_type,
-			y_axis_type: scatter_data.y_axis_type,
+			x_axis_type: scatter_data.x_axis_type.clone(),
+			y_axis_type: scatter_data.y_axis_type.clone(),
+			x_temporal_domain: scatter_data.x_temporal_domain.clone(),
+			y_temporal_domain: scatter_data.y_temporal_domain.clone(),
 			x_label: scatter_data.x_label.clone(),
 			y_label: scatter_data.y_label.clone(),
 			scatter: ScatterPlotKernel::new(scatter_data),
@@ -52,8 +57,10 @@ impl PlotKernel for ScatterLinePlotKernel {
 				settings.y_min.unwrap_or(self.y_range.0),
 				settings.y_max.unwrap_or(self.y_range.1),
 			),
-			x_axis_type: self.x_axis_type,
-			y_axis_type: self.y_axis_type,
+			x_axis_type: self.x_axis_type.clone(),
+			y_axis_type: self.y_axis_type.clone(),
+			x_temporal_domain: self.x_temporal_domain.clone(),
+			y_temporal_domain: self.y_temporal_domain.clone(),
 		}
 	}
 

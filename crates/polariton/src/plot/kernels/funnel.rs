@@ -164,7 +164,7 @@ impl PlotKernel for FunnelPlotKernel {
 			};
 			backend.fill_path(trapezoid_path, color);
 			backend.fill_text(Text {
-				content: format_label(val, AxisType::Linear),
+				content: format_label(val, &AxisType::Linear),
 				position: Point::new(center_x, y_top + stage_height / 2.0),
 				color: settings.mark_style.label_text.iced(),
 				size: Pixels(16.0),
@@ -270,8 +270,11 @@ impl PlotKernel for FunnelPlotKernel {
 			let left_x = center_x - current_width_at_y / 2.0;
 			let right_x = center_x + current_width_at_y / 2.0;
 			if cursor_pos.x() >= left_x && cursor_pos.x() <= right_x {
-				let mut hover_text =
-					format!("{}: {}", stage.stage(), format_label(val, AxisType::Linear));
+				let mut hover_text = format!(
+					"{}: {}",
+					stage.stage(),
+					format_label(val, &AxisType::Linear)
+				);
 				if stage_idx > 0 {
 					let prev_val = self
 						.prepared_data

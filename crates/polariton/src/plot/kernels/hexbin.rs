@@ -37,6 +37,8 @@ impl PlotKernel for HexbinPlotKernel {
 			),
 			x_axis_type: AxisType::Linear,
 			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 		}
 	}
 

@@ -6331,6 +6331,7 @@ dependencies = [
  "base64 0.22.1",
  "bytes",
  "chrono",
+ "chrono-tz",
  "fontdb",
  "gcloud-auth",
  "gcloud-bigquery",

@@ -935,14 +935,14 @@ mod tests {
 		let layout = horizontal.layout(settings.clone());
 		let PlotLayout::CategoricalY {
 			x_range,
-			x_axis_type,
+			ref x_axis_type,
 			..
 		} = layout
 		else {
 			panic!("horizontal percent stack uses categorical y")
 		};
 		assert_eq!(x_range, (0.0, 100.0));
-		assert_eq!(x_axis_type, crate::plot::common::AxisType::Percent);
+		assert_eq!(*x_axis_type, crate::plot::common::AxisType::Percent);
 		assert_eq!(horizontal.x_label(), "val (% of total)");
 		assert_eq!(horizontal.y_label(), "cat");
 		let transform = CoordinateTransformer::new(&layout, bounds);

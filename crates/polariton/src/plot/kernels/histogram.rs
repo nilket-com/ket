@@ -30,8 +30,10 @@ impl PlotKernel for HistogramPlotKernel {
 				settings.y_min.unwrap_or(y_range.0),
 				settings.y_max.unwrap_or(y_range.1),
 			),
-			x_axis_type: self.prepared_data.x_axis_type,
-			y_axis_type: self.prepared_data.y_axis_type,
+			x_axis_type: self.prepared_data.x_axis_type.clone(),
+			y_axis_type: self.prepared_data.y_axis_type.clone(),
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 		}
 	}
 
@@ -84,8 +86,8 @@ impl PlotKernel for HistogramPlotKernel {
 		let bin = self.prepared_data.bins.find(x)?;
 		Some(format!(
 			"Range: [{}, {})\nCount: {}\nY-Value: {:.2}",
-			format_label(bin.start, self.prepared_data.x_axis_type),
-			format_label(bin.end, self.prepared_data.x_axis_type),
+			format_label(bin.start, &self.prepared_data.x_axis_type),
+			format_label(bin.end, &self.prepared_data.x_axis_type),
 			bin.count,
 			y
 		))

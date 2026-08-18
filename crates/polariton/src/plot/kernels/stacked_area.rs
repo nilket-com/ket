@@ -1,6 +1,7 @@
 use crate::plot::common::{
 	AxisTitleTransform, AxisType, CoordinateTransformer, PathBuilder, PlotBackend, PlotKernel,
-	PlotLayout, ResolvedPlotSettings, derive_axis_title, format_label, polars_type_to_axis_type,
+	PlotLayout, ResolvedPlotSettings, TemporalAxisDomain, derive_axis_title, format_label,
+	polars_type_to_axis_type, temporal_axis_domain,
 };
 use crate::plot::legend::{
 	LegendProvenance, LegendSample, entries_from_pairs_with_sample_and_provenance,
@@ -64,12 +65,16 @@ impl PlotKernel for StackedAreaPlotKernel {
 					settings.y_max.unwrap_or(self.prepared_data.y_range.1),
 				)
 			},
-			x_axis_type: self.prepared_data.x_axis_type,
+			x_axis_type: self.prepared_data.x_axis_type.clone(),
 			y_axis_type: if percent {
 				AxisType::Percent
 			} else {
-				self.prepared_data.y_axis_type
+				self.prepared_data.y_axis_type.clone()
 			},
+			x_temporal_domain: self.prepared_data.x_temporal_domain.clone(),
+			y_temporal_domain: (!percent)
+				.then(|| self.prepared_data.y_temporal_domain.clone())
+				.flatten(),
 		}
 	}
 
@@ -170,14 +175,14 @@ impl PlotKernel for StackedAreaPlotKernel {
 					return match self.normalization {
 						StackNormalization::Absolute => Some(format!(
 							"X: {}\n{}: {:.2}\nTotal: {:.2}",
-							format_label(actual_x, self.prepared_data.x_axis_type),
+							format_label(actual_x, &self.prepared_data.x_axis_type),
 							self.prepared_data.categories[j],
 							val,
 							next_stack_value
 						)),
 						StackNormalization::Percent => Some(format!(
 							"X: {}\n{}: {:.2}\nShare: {:.1}%\nCumulative: {:.1}%\nTotal: {:.2}",
-							format_label(actual_x, self.prepared_data.x_axis_type),
+							format_label(actual_x, &self.prepared_data.x_axis_type),
 							self.prepared_data.categories[j],
 							val,
 							self.normalization.project(val, total),
@@ -190,7 +195,7 @@ impl PlotKernel for StackedAreaPlotKernel {
 			}
 			return Some(format!(
 				"X: {}, Total Sum: {:.2}",
-				format_label(actual_x, self.prepared_data.x_axis_type),
+				format_label(actual_x, &self.prepared_data.x_axis_type),
 				current_stack_value
 			));
 		}
@@ -236,6 +241,8 @@ pub struct StackedAreaPreparedData {
 	pub y_range: (f64, f64),
 	pub x_axis_type: AxisType,
 	pub y_axis_type: AxisType,
+	pub x_temporal_domain: Option<TemporalAxisDomain>,
+	pub y_temporal_domain: Option<TemporalAxisDomain>,
 	pub x_label: String,
 	pub y_label: String,
 	pub series_provenance: LegendProvenance,
@@ -290,6 +297,8 @@ fn prepare_stacked_area_data_inner(
 			y_range: (0.0, 1.0),
 			x_axis_type: AxisType::Linear,
 			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 			x_label: x_col.to_string(),
 			y_label: y_col.to_string(),
 			series_provenance: if cat_col.is_empty() {
@@ -309,6 +318,14 @@ fn prepare_stacked_area_data_inner(
 		.unwrap_or(DataType::Float64);
 	let x_axis_type = polars_type_to_axis_type(&x_dtype);
 	let y_axis_type = polars_type_to_axis_type(&y_dtype);
+	let x_temporal_domain = df
+		.column(x_col)
+		.ok()
+		.and_then(|column| temporal_axis_domain(column, &x_axis_type));
+	let y_temporal_domain = df
+		.column(y_col)
+		.ok()
+		.and_then(|column| temporal_axis_domain(column, &y_axis_type));
 	let categories = if cat_col.is_empty() {
 		vec!["All Data".to_string()]
 	} else if let Some(assignments) = assignments {
@@ -356,6 +373,8 @@ fn prepare_stacked_area_data_inner(
 			y_range: (0.0, 1.0),
 			x_axis_type,
 			y_axis_type,
+			x_temporal_domain,
+			y_temporal_domain,
 			x_label: x_col.to_string(),
 			y_label: y_col.to_string(),
 			series_provenance: if cat_col.is_empty() {
@@ -439,6 +458,8 @@ fn prepare_stacked_area_data_inner(
 		y_range,
 		x_axis_type,
 		y_axis_type,
+		x_temporal_domain,
+		y_temporal_domain,
 		x_label: x_col.to_string(),
 		y_label: y_col.to_string(),
 		series_provenance: if cat_col.is_empty() {
@@ -503,6 +524,8 @@ mod product_0068_tests {
 				y_range: (0.0, 5.0),
 				x_axis_type: AxisType::Linear,
 				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 				x_label: "x".to_owned(),
 				y_label: "y".to_owned(),
 				series_provenance: LegendProvenance::Named,
@@ -784,6 +807,8 @@ mod product_0069_tests {
 			y_range: (0.0, 9.0 * 1.05),
 			x_axis_type: AxisType::Linear,
 			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 			x_label: "x".to_owned(),
 			y_label: "y".to_owned(),
 			series_provenance: LegendProvenance::Named,

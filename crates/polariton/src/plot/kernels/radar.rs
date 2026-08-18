@@ -159,7 +159,7 @@ impl PlotKernel for RadarPlotKernel {
 						center.y + radius * angle.sin() + 2.0,
 					);
 					backend.fill_text(iced::widget::canvas::Text {
-						content: format_label(val, AxisType::Linear),
+						content: format_label(val, &AxisType::Linear),
 						position: label_pos,
 						color: Color {
 							a: 0.7,

@@ -1,6 +1,6 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, PlotBackend, PlotKernel, PlotLayout, ResolvedPlotSettings,
-	format_label, polars_type_to_axis_type,
+	TemporalAxisDomain, format_label, polars_type_to_axis_type, temporal_axis_domain,
 };
 use iced::advanced::mouse::Cursor;
 use iced::widget::canvas::{Stroke, Style};
@@ -23,8 +23,10 @@ impl PlotKernel for CandlestickPlotKernel {
 				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
 				settings.y_max.unwrap_or(self.prepared_data.y_range.1),
 			),
-			x_axis_type: self.prepared_data.x_axis_type,
-			y_axis_type: self.prepared_data.y_axis_type,
+			x_axis_type: self.prepared_data.x_axis_type.clone(),
+			y_axis_type: self.prepared_data.y_axis_type.clone(),
+			x_temporal_domain: self.prepared_data.x_temporal_domain.clone(),
+			y_temporal_domain: self.prepared_data.y_temporal_domain.clone(),
 		}
 	}
 
@@ -132,7 +134,7 @@ impl PlotKernel for CandlestickPlotKernel {
 			}
 			return Some(format!(
 				"X: {}\nOpen: {:.2}\nHigh: {:.2}\nLow: {:.2}\nClose: {:.2}",
-				format_label(xs[idx], self.prepared_data.x_axis_type),
+				format_label(xs[idx], &self.prepared_data.x_axis_type),
 				self.prepared_data.open[idx],
 				self.prepared_data.high[idx],
 				self.prepared_data.low[idx],
@@ -161,6 +163,8 @@ pub struct CandlestickPreparedData {
 	pub y_range: (f64, f64),
 	pub x_axis_type: AxisType,
 	pub y_axis_type: AxisType,
+	pub x_temporal_domain: Option<TemporalAxisDomain>,
+	pub y_temporal_domain: Option<TemporalAxisDomain>,
 	pub x_label: String,
 	pub y_label: String,
 }
@@ -184,6 +188,8 @@ pub fn prepare_candlestick_data(
 			y_range: (0.0, 1.0),
 			x_axis_type: AxisType::Linear,
 			y_axis_type: AxisType::Linear,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 			x_label: x_col.to_string(),
 			y_label: "Value".to_string(),
 		};
@@ -194,6 +200,10 @@ pub fn prepare_candlestick_data(
 		.unwrap_or(DataType::Float64);
 	let x_axis_type = polars_type_to_axis_type(&x_dtype);
 	let y_axis_type = AxisType::Linear;
+	let x_temporal_domain = df
+		.column(x_col)
+		.ok()
+		.and_then(|column| temporal_axis_domain(column, &x_axis_type));
 	let x = match df.column(x_col) {
 		Ok(c) => c
 			.cast(&DataType::Float64)
@@ -299,6 +309,8 @@ pub fn prepare_candlestick_data(
 		y_range: (y_min - y_pad, y_max + y_pad),
 		x_axis_type,
 		y_axis_type,
+		x_temporal_domain,
+		y_temporal_domain: None,
 		x_label: x_col.to_string(),
 		y_label: "Value".to_string(),
 	}

@@ -66,7 +66,7 @@ impl PlotKernel for BoxPlotKernel {
 	fn layout(&self, settings: ResolvedPlotSettings) -> PlotLayout {
 		PlotLayout::CategoricalX {
 			categories: self.prepared_data.boxes.categories().to_vec(),
-			y_axis_type: self.prepared_data.y_axis_type,
+			y_axis_type: self.prepared_data.y_axis_type.clone(),
 			y_range: (
 				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
 				settings.y_max.unwrap_or(self.prepared_data.y_range.1),
@@ -182,7 +182,7 @@ impl PlotKernel for BoxPlotKernel {
 				return Some(format!(
 					"{}\nOutlier: {}",
 					hit.category,
-					format_label(hit.value, self.prepared_data.y_axis_type)
+					format_label(hit.value, &self.prepared_data.y_axis_type)
 				));
 			}
 			for (category, stats) in self.prepared_data.boxes.iter() {
@@ -202,15 +202,15 @@ impl PlotKernel for BoxPlotKernel {
 						.0
 						.y;
 					if cursor_pos.y >= low.min(high) && cursor_pos.y <= low.max(high) {
-						let yt = self.prepared_data.y_axis_type;
+						let yt = self.prepared_data.y_axis_type.clone();
 						return Some(format!(
 							"{}\nWhisker high: {}\nQ3: {}\nMedian: {}\nQ1: {}\nWhisker low: {}",
 							category,
-							format_label(stats.whisker_high(), yt),
-							format_label(stats.q3(), yt),
-							format_label(stats.median(), yt),
-							format_label(stats.q1(), yt),
-							format_label(stats.whisker_low(), yt)
+							format_label(stats.whisker_high(), &yt),
+							format_label(stats.q3(), &yt),
+							format_label(stats.median(), &yt),
+							format_label(stats.q1(), &yt),
+							format_label(stats.whisker_low(), &yt)
 						));
 					}
 				}

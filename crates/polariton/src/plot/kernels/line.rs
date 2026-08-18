@@ -1,6 +1,7 @@
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
-	ResolvedPlotSettings, format_label, polars_type_to_axis_type,
+	ResolvedPlotSettings, TemporalAxisDomain, format_label, polars_type_to_axis_type,
+	temporal_axis_domain,
 };
 use crate::plot::legend::LegendProvenance;
 use crate::plot::spec::{CategoryColorAssignment, LayerSettings, ResolvedColor};
@@ -156,8 +157,10 @@ impl PlotKernel for LinePlotKernel {
 				settings.y_min.unwrap_or(self.prepared_data.y_range.0),
 				settings.y_max.unwrap_or(self.prepared_data.y_range.1),
 			),
-			x_axis_type: self.prepared_data.x_axis_type,
-			y_axis_type: self.prepared_data.y_axis_type,
+			x_axis_type: self.prepared_data.x_axis_type.clone(),
+			y_axis_type: self.prepared_data.y_axis_type.clone(),
+			x_temporal_domain: self.prepared_data.x_temporal_domain.clone(),
+			y_temporal_domain: self.prepared_data.y_temporal_domain.clone(),
 		}
 	}
 
@@ -195,8 +198,8 @@ impl PlotKernel for LinePlotKernel {
 		{
 			return Some(format!(
 				"X: {}, Y: {}",
-				format_label(x, self.prepared_data.x_axis_type),
-				format_label(y, self.prepared_data.y_axis_type)
+				format_label(x, &self.prepared_data.x_axis_type),
+				format_label(y, &self.prepared_data.y_axis_type)
 			));
 		}
 		None
@@ -216,8 +219,8 @@ impl PlotKernel for LinePlotKernel {
 			.hit_test(transform, cursor, &resolved)?;
 		Some(format!(
 			"X: {}, Y: {}",
-			format_label(hit.data_x, self.prepared_data.x_axis_type),
-			format_label(hit.data_y, self.prepared_data.y_axis_type)
+			format_label(hit.data_x, &self.prepared_data.x_axis_type),
+			format_label(hit.data_y, &self.prepared_data.y_axis_type)
 		))
 	}
 
@@ -262,6 +265,8 @@ pub struct LinePreparedData {
 	pub y_range: (f64, f64),
 	pub x_axis_type: AxisType,
 	pub y_axis_type: AxisType,
+	pub x_temporal_domain: Option<TemporalAxisDomain>,
+	pub y_temporal_domain: Option<TemporalAxisDomain>,
 	pub x_label: String,
 	pub y_label: String,
 }
@@ -314,6 +319,14 @@ fn prepare_line_data_inner(
 		.unwrap_or(DataType::Float64);
 	let x_axis_type = polars_type_to_axis_type(&x_dtype);
 	let y_axis_type = polars_type_to_axis_type(&y_dtype);
+	let x_temporal_domain = df
+		.column(x_col)
+		.ok()
+		.and_then(|column| temporal_axis_domain(column, &x_axis_type));
+	let y_temporal_domain = df
+		.column(y_col)
+		.ok()
+		.and_then(|column| temporal_axis_domain(column, &y_axis_type));
 	let x_series = x_col_series.f64().unwrap();
 	let y_series = y_col_series.f64().unwrap();
 	let x_range = (x_series.min().unwrap_or(0.0), x_series.max().unwrap_or(1.0));
@@ -331,6 +344,8 @@ fn prepare_line_data_inner(
 			y_range,
 			x_axis_type,
 			y_axis_type,
+			x_temporal_domain,
+			y_temporal_domain,
 			x_label: x_col.to_string(),
 			y_label: y_col.to_string(),
 		};
@@ -458,6 +473,8 @@ fn prepare_line_data_inner(
 		y_range,
 		x_axis_type,
 		y_axis_type,
+		x_temporal_domain,
+		y_temporal_domain,
 		x_label: x_col.to_string(),
 		y_label: y_col.to_string(),
 	}

@@ -11,7 +11,7 @@ use crate::coordinate::{Pt, Rect, Widget};
 use crate::plot::common::{
 	AxisTextAnchoring, AxisTextVisibility, BandRequirements, CoordinateTransformer, PlotBackend,
 	PlotComposite, PlotKernel, PlotLayout, PlotWidget, ResolvedPlotSettings, VerticalGuideBands,
-	resolve_canvas_text,
+	resolve_canvas_text, union_temporal_axis_domains,
 };
 use crate::plot::factory::{create_plot, create_styled_plot};
 #[cfg(test)]
@@ -1115,19 +1115,35 @@ fn shared_layout(
 		PlotLayout::Cartesian {
 			x_axis_type,
 			y_axis_type,
+			x_temporal_domain,
+			y_temporal_domain,
 			..
 		} => {
 			let mut x = (f64::INFINITY, f64::NEG_INFINITY);
 			let mut y = (f64::INFINITY, f64::NEG_INFINITY);
+			let mut x_temporal_domain = x_temporal_domain;
+			let mut y_temporal_domain = y_temporal_domain;
 			for (_, layout) in local {
 				if let PlotLayout::Cartesian {
-					x_range, y_range, ..
+					x_range,
+					y_range,
+					x_temporal_domain: cell_x_temporal_domain,
+					y_temporal_domain: cell_y_temporal_domain,
+					..
 				} = layout
 				{
 					x.0 = x.0.min(x_range.0);
 					x.1 = x.1.max(x_range.1);
 					y.0 = y.0.min(y_range.0);
 					y.1 = y.1.max(y_range.1);
+					x_temporal_domain = union_temporal_axis_domains(
+						x_temporal_domain,
+						cell_x_temporal_domain.clone(),
+					);
+					y_temporal_domain = union_temporal_axis_domains(
+						y_temporal_domain,
+						cell_y_temporal_domain.clone(),
+					);
 				}
 			}
 			Some(PlotLayout::Cartesian {
@@ -1135,11 +1151,13 @@ fn shared_layout(
 				y_range: y,
 				x_axis_type,
 				y_axis_type,
+				x_temporal_domain,
+				y_temporal_domain,
 			})
 		}
 		PlotLayout::CategoricalX { .. } => {
 			let y_axis_type = match &first {
-				PlotLayout::CategoricalX { y_axis_type, .. } => *y_axis_type,
+				PlotLayout::CategoricalX { y_axis_type, .. } => y_axis_type.clone(),
 				_ => unreachable!("matched categorical-x layout"),
 			};
 			let mut y = (f64::INFINITY, f64::NEG_INFINITY);
@@ -1163,7 +1181,7 @@ fn shared_layout(
 		}
 		PlotLayout::CategoricalY { .. } => {
 			let x_axis_type = match &first {
-				PlotLayout::CategoricalY { x_axis_type, .. } => *x_axis_type,
+				PlotLayout::CategoricalY { x_axis_type, .. } => x_axis_type.clone(),
 				_ => unreachable!("matched categorical-y layout"),
 			};
 			let mut x = (f64::INFINITY, f64::NEG_INFINITY);
@@ -1195,6 +1213,8 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 			PlotLayout::Cartesian {
 				x_axis_type,
 				y_axis_type,
+				x_temporal_domain,
+				y_temporal_domain,
 				..
 			},
 			Some(PlotLayout::Cartesian {
@@ -1205,6 +1225,8 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 			y_range: *y_range,
 			x_axis_type,
 			y_axis_type,
+			x_temporal_domain,
+			y_temporal_domain,
 		},
 		(
 			PlotLayout::CategoricalX { .. },
@@ -1216,7 +1238,7 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 		) => PlotLayout::CategoricalX {
 			categories: categories.clone(),
 			y_range: *y_range,
-			y_axis_type: *y_axis_type,
+			y_axis_type: y_axis_type.clone(),
 		},
 		(
 			PlotLayout::CategoricalY { .. },
@@ -1228,7 +1250,7 @@ fn merge_layout(layout: PlotLayout, shared: &Option<PlotLayout>) -> PlotLayout {
 		) => PlotLayout::CategoricalY {
 			categories: categories.clone(),
 			x_range: *x_range,
-			x_axis_type: *x_axis_type,
+			x_axis_type: x_axis_type.clone(),
 		},
 		(layout, _) => layout,
 	}
@@ -1477,6 +1499,8 @@ mod tests {
 				y_range: (0.0, 1.0),
 				x_axis_type: AxisType::Linear,
 				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 			}
 		}
 
@@ -1875,6 +1899,8 @@ mod tests {
 				y_range: (0.0, 1.0),
 				x_axis_type: crate::plot::common::AxisType::Linear,
 				y_axis_type: crate::plot::common::AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 			}
 		}
 
@@ -3511,7 +3537,8 @@ mod tests {
 					y_range,
 					x_axis_type,
 					y_axis_type,
-				} => (*x_range, *y_range, *x_axis_type, *y_axis_type),
+					..
+				} => (*x_range, *y_range, x_axis_type.clone(), y_axis_type.clone()),
 				_ => panic!("area facets remain Cartesian"),
 			})
 			.collect::<Vec<_>>();
@@ -4455,6 +4482,8 @@ mod tests {
 				y_range: (0.0, 100.0),
 				x_axis_type: AxisType::Percent,
 				y_axis_type: AxisType::Percent,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 			},
 		);
 		assert_eq!(

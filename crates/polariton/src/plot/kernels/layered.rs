@@ -166,8 +166,10 @@ impl PlotKernel for LayeredPlotKernel {
 				settings.y_min.unwrap_or(self.shared_layout.y_range.0),
 				settings.y_max.unwrap_or(self.shared_layout.y_range.1),
 			),
-			x_axis_type: self.x_axis_type,
-			y_axis_type: self.y_axis_type,
+			x_axis_type: self.x_axis_type.clone(),
+			y_axis_type: self.y_axis_type.clone(),
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 		}
 	}
 
@@ -219,8 +221,8 @@ impl PlotKernel for LayeredPlotKernel {
 			if let Some(hit) = layer.hit_test(transform, cursor, &resolved) {
 				return Some(format!(
 					"X: {}, Y: {}",
-					format_label(hit.data_x, self.x_axis_type),
-					format_label(hit.data_y, self.y_axis_type)
+					format_label(hit.data_x, &self.x_axis_type),
+					format_label(hit.data_y, &self.y_axis_type)
 				));
 			}
 		}
