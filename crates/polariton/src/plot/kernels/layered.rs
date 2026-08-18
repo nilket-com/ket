@@ -2,7 +2,7 @@
 
 use crate::plot::common::{
 	AxisType, CoordinateTransformer, MarkHit, MarkRenderer, PlotBackend, PlotKernel, PlotLayout,
-	ResolvedPlotSettings, format_label,
+	ResolvedPlotSettings, TemporalAxisDomain, format_label,
 };
 use crate::plot::kernels::line::{LineMarkRenderer, LinePreparedData, series_color};
 use crate::plot::kernels::scatter::{ScatterMarkRenderer, ScatterPreparedData};
@@ -131,6 +131,8 @@ pub struct LayeredPlotKernel {
 	shared_layout: ResolvedLayout,
 	x_axis_type: AxisType,
 	y_axis_type: AxisType,
+	x_temporal_domain: Option<TemporalAxisDomain>,
+	y_temporal_domain: Option<TemporalAxisDomain>,
 	x_label: String,
 	y_label: String,
 }
@@ -141,6 +143,8 @@ impl LayeredPlotKernel {
 		shared_layout: ResolvedLayout,
 		x_axis_type: AxisType,
 		y_axis_type: AxisType,
+		x_temporal_domain: Option<TemporalAxisDomain>,
+		y_temporal_domain: Option<TemporalAxisDomain>,
 		x_label: String,
 		y_label: String,
 	) -> Self {
@@ -149,6 +153,8 @@ impl LayeredPlotKernel {
 			shared_layout,
 			x_axis_type,
 			y_axis_type,
+			x_temporal_domain,
+			y_temporal_domain,
 			x_label,
 			y_label,
 		}
@@ -168,8 +174,8 @@ impl PlotKernel for LayeredPlotKernel {
 			),
 			x_axis_type: self.x_axis_type.clone(),
 			y_axis_type: self.y_axis_type.clone(),
-			x_temporal_domain: None,
-			y_temporal_domain: None,
+			x_temporal_domain: self.x_temporal_domain.clone(),
+			y_temporal_domain: self.y_temporal_domain.clone(),
 		}
 	}
 

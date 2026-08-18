@@ -9495,6 +9495,42 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 
 	#[cfg(feature = "toron")]
 	#[test]
+	fn product_0130_tick_every_reaches_a_styled_single_temporal_layer() {
+		use polars::prelude::{IntoColumn, NamedFrom};
+
+		let source = "workspace.table(\"t\").views([figure([x_axis().tick_every(\"1 month\"), line(\"day\", \"value\").stroke_width(2)])])";
+		let relation = transform_rune_view(source)
+			.expect("styled temporal spelling parses")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let days = polars::prelude::Series::new("day".into(), &[19_723_i32, 19_754, 19_783])
+			.cast(&polars::prelude::DataType::Date)
+			.expect("date source");
+		let frame = polars::prelude::DataFrame::new(
+			3,
+			vec![
+				days.into_column(),
+				polars::prelude::Series::new("value".into(), &[1.0_f64, 2.0, 3.0]).into_column(),
+			],
+		)
+		.expect("frame");
+		let outcome = rune_view_outcome(frame, relation.views);
+		if let Err(error) = &outcome.sinks[0].output {
+			panic!("styled single temporal layers must pass tick_every admission: {error}");
+		}
+		assert!(matches!(
+			&outcome.sinks[0].output,
+			Ok(
+				crate::gui::messages::RuneRelationSinkOutput::Plot(..)
+					| crate::gui::messages::RuneRelationSinkOutput::StyledPlot(..)
+					| crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(..)
+			)
+		));
+	}
+
+	#[cfg(feature = "toron")]
+	#[test]
 	fn product_0039_minor_ticks_toggle_and_combined_capacity_are_attributed() {
 		use polars::prelude::{IntoColumn, NamedFrom};
 

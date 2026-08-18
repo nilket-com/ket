@@ -203,3 +203,10 @@ PRODUCT-0128 is an independently useful substrate repair: a zoned datetime
 plot finally labels the instants in its declared frame. It also gives the next
 record a production-proven exact temporal domain and removes the temptation to
 teach an interval selector to recover facts that preparation discarded.
+
+The first production census passed before it included the layered wrapper. A
+styled single layer then exposed that wrapper's missing domain propagation;
+the fix carries the one unambiguous source domain through that path and adds an
+end-to-end admission regression. Genuine multi-layer temporal reconciliation
+remains covered by stop condition 3 rather than acquiring an implicit dominant
+frame.

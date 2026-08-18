@@ -1,4 +1,6 @@
-use crate::plot::common::{Orientation, PlotKernel, polars_type_to_axis_type};
+use crate::plot::common::{
+	Orientation, PlotKernel, polars_type_to_axis_type, temporal_axis_domain,
+};
 use crate::plot::core::PlotType;
 use crate::plot::kernels::bar::{self, BarPlotKernel};
 use crate::plot::kernels::boxplot::{self, BoxPlotKernel};
@@ -502,6 +504,23 @@ pub fn create_layered_plot(
 			.expect("resolved y field remains present")
 			.dtype(),
 	);
+	// A styled single layer uses the composite wrapper, but it still has one
+	// unambiguous prepared source whose exact temporal domains can be carried
+	// through. Multi-layer temporal reconciliation remains a separate policy.
+	let (x_temporal_domain, y_temporal_domain) = if is_single_layer {
+		(
+			temporal_axis_domain(
+				df.column(&x_label).expect("resolved x field remains present"),
+				&x_axis_type,
+			),
+			temporal_axis_domain(
+				df.column(&y_label).expect("resolved y field remains present"),
+				&y_axis_type,
+			),
+		)
+	} else {
+		(None, None)
+	};
 	let first = prepare_layer_renderer(first, df, width, height);
 	// A modifier changes presentation, not scale. Preserve the established
 	// mark-specific prepared range for a styled one-layer plot; only a genuine
@@ -520,6 +539,8 @@ pub fn create_layered_plot(
 		shared_layout,
 		x_axis_type,
 		y_axis_type,
+		x_temporal_domain,
+		y_temporal_domain,
 		x_label,
 		y_label,
 	)))
@@ -593,7 +614,9 @@ pub fn create_authored_plot(
 mod product_0013_baseline_tests {
 	use super::*;
 	use crate::coordinate::{Pt, Rect, Widget};
-	use crate::plot::common::{CoordinateTransformer, PlotLayout, ResolvedPlotSettings};
+	use crate::plot::common::{
+		CoordinateTransformer, PlotLayout, ResolvedPlotSettings, TemporalAxisDomain,
+	};
 	use crate::plot::common::{PathBuilder, PlotBackend};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::export::SvgBackend;
@@ -1301,6 +1324,66 @@ mod product_0013_baseline_tests {
 		)
 		.expect("layered scatter kernel");
 		assert_eq!(render_marks(kernel.as_ref()), SCATTER_SVG);
+	}
+
+	#[test]
+	fn product_0130_styled_single_temporal_layer_retains_exact_domains() {
+		use polars::prelude::{DataType, IntoColumn, NamedFrom, TimeUnit as PolarsTimeUnit, TimeZone};
+
+		let x = polars::prelude::Series::new(
+			"x".into(),
+			&[1_700_000_000_000_i64, 1_700_360_000_000_i64],
+		)
+		.cast(&DataType::Datetime(
+			PolarsTimeUnit::Milliseconds,
+			Some(
+				TimeZone::opt_try_new(Some("UTC"))
+					.expect("UTC zone")
+					.expect("named zone"),
+			),
+		))
+		.expect("temporal x");
+		let frame = DataFrame::new(
+			2,
+			vec![
+				x.into_column(),
+				polars::prelude::Series::new("y".into(), &[1.0_f64, 2.0]).into_column(),
+			],
+		)
+		.expect("frame");
+		let mut layer = LayerSpec::xy(LayerMark::Line, "x", "y");
+		layer.settings.stroke_width =
+			Override::Set(crate::plot::spec::StrokeWidth::new(2.0).expect("stroke width"));
+		let kernel = create_layered_plot(&LayeredPlotSpec::new(layer), &frame, 100, 100)
+			.expect("styled temporal layer");
+		let PlotLayout::Cartesian { x_temporal_domain, .. } =
+			kernel.layout(ResolvedPlotSettings::default())
+		else {
+			panic!("styled temporal layer must remain Cartesian");
+		};
+		assert_eq!(
+			x_temporal_domain,
+			Some(TemporalAxisDomain::Datetime {
+				first_tick: 1_700_000_000_000,
+				last_tick: 1_700_360_000_000,
+				unit: crate::plot::common::TimeUnit::Milliseconds,
+				zone: Some(Arc::<str>::from("UTC")),
+			})
+		);
+
+		let mut multi = LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y"));
+		multi.push(LayerSpec::xy(LayerMark::Line, "x", "y"));
+		let multi_kernel =
+			create_layered_plot(&multi, &frame, 100, 100).expect("multi-layer temporal plot");
+		let PlotLayout::Cartesian { x_temporal_domain, .. } =
+			multi_kernel.layout(ResolvedPlotSettings::default())
+		else {
+			panic!("multi-layer temporal plot must remain Cartesian");
+		};
+		assert!(
+			x_temporal_domain.is_none(),
+			"multi-layer temporal reconciliation remains deliberately unowned"
+		);
 	}
 
 	#[test]
