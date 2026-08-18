@@ -95,10 +95,24 @@ wrong declared frame.
 
 ### 4. Exactness ends only at the existing pixel projection
 
-Temporal selection and formatting operate on the exact domain value. The
-existing transformer receives the corresponding `f64` projection only after a
-typed tick has been selected. This record does not change its projection or
-claim nanosecond-perfect pixels.
+Temporal **selection** operates on the exact domain value: `TemporalAxisDomain`
+retains its `i64`/`i32` endpoints, and two instants one nanosecond apart remain
+distinguishable where `f64` cannot tell them apart. The existing transformer
+receives the corresponding `f64` projection only after a typed tick has been
+selected. This record does not change that projection or claim
+nanosecond-perfect pixels.
+
+**Formatting is exact to the current displayed resolution, not to the domain.**
+`format_label` still takes an `f64`, so a label is rendered from a projected
+value carrying roughly 256 ns of error at contemporary epoch nanoseconds. That
+is sound only because no temporal formatter displays finer than milliseconds --
+`Datetime` renders `%Y-%m-%d %H:%M:%S` and `Time` renders three fractional
+digits -- so the projection error is many orders of magnitude below the finest
+digit any label prints.
+
+This is a stated dependency, not an incidental one. An exact formatting path is
+deliberately not built here: it would widen the carrier past the pixel boundary
+this record is drawing, for no visible difference at today's resolution.
 
 The future interval selector must prove adjacent selected ticks have distinct
 projected coordinates. That refusal belongs to the selector record because no
@@ -162,6 +176,15 @@ never independently established.
 4. If the zoned Count exhibit reveals a different formatter defect (such as
    DST-gap construction rather than display), stop and name it rather than
    calling the expected label delta complete.
+5. If a temporal label is ever to display finer than milliseconds -- sub-second
+   `Datetime` digits, or `Time` beyond its three fractional digits -- stop.
+   §4's soundness rests on displayed resolution staying coarser than the `f64`
+   projection error, and that change inverts the relationship: labels would then
+   be rendered from a value that cannot represent the digit they print. It needs
+   an exact formatting path carried from `TemporalAxisDomain`, which is a
+   carrier decision, not a formatter tweak. PRODUCT-0129's projection refusal
+   does not cover it -- that gate guards adjacent ticks collapsing, not the
+   precision of a single label.
 
 ## Rejected
 
