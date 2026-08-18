@@ -3741,7 +3741,7 @@ r.views([bar(category(), "revenue")])
 			source.contains("x_axis().label(\"Month\").label_size(16).tick_every(\"1 month\")")
 		);
 		assert!(source.contains(
-			"x_axis().label(\"Observed at\").label_size(16).tick_size(10).tick_rotation(24)"
+			"x_axis().label(\"Observed at\").label_size(16).tick_size(12).tick_rotation(36)"
 		));
 
 		for (source, expected_span, expected_message) in [
