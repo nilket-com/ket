@@ -2481,6 +2481,9 @@ pub struct MetricsRegistry {
 	pub data_ring_lease_denials_total: Counter,
 	pub data_ring_lease_errors_total: Counter,
 	pub data_ring_lease_cache_entries: Gauge,
+	/// Orphan-witness recovery barrier evaluations that could not confirm local
+	/// Raft leadership.
+	pub data_ring_orphan_witness_recovery_leadership_unconfirmed_total: Counter,
 	pub data_ring_pending_finalization_backlog: Gauge,
 	data_ring_pending_finalization_replay: PendingFinalizationReplayCounters,
 	data_ring_migration_proxy_reads: MigrationProxyReadCounters,
@@ -2756,6 +2759,7 @@ impl Default for MetricsRegistry {
 			data_ring_lease_denials_total: Counter::default(),
 			data_ring_lease_errors_total: Counter::default(),
 			data_ring_lease_cache_entries: Gauge::default(),
+			data_ring_orphan_witness_recovery_leadership_unconfirmed_total: Counter::default(),
 			data_ring_pending_finalization_backlog: Gauge::default(),
 			data_ring_pending_finalization_replay: PendingFinalizationReplayCounters::default(),
 			data_ring_migration_proxy_reads: MigrationProxyReadCounters::default(),
@@ -3035,6 +3039,11 @@ impl MetricsRegistry {
 
 	pub fn set_pending_finalization_backlog(&self, value: u64) {
 		self.data_ring_pending_finalization_backlog.set(value);
+	}
+
+	pub fn observe_orphan_witness_recovery_leadership_unconfirmed(&self) {
+		self.data_ring_orphan_witness_recovery_leadership_unconfirmed_total
+			.inc();
 	}
 
 	pub fn observe_pending_finalization_replay(
@@ -4511,6 +4520,13 @@ impl MetricsRegistry {
 			"wendelon_data_ring_pending_finalization_backlog",
 			"Durably persisted pending-finalization records currently awaiting reconciliation.",
 			self.data_ring_pending_finalization_backlog.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_data_ring_orphan_witness_recovery_leadership_unconfirmed_total",
+			"Orphan-witness recovery barrier evaluations that could not confirm local Raft leadership.",
+			self.data_ring_orphan_witness_recovery_leadership_unconfirmed_total
+				.get(),
 		);
 		self.data_ring_pending_finalization_replay.render(&mut out);
 		self.data_ring_migration_proxy_reads.render(&mut out);

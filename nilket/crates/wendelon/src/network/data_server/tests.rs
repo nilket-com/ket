@@ -9425,10 +9425,12 @@ async fn leader_recovers_orphan_witnesses_from_peer_before_reconciliation() {
 	});
 
 	assert_eq!(fx.leader.pending_finalization_count_for_test().await, 0);
-	fx.leader
-		.ensure_orphan_witnesses_recovered_for_leadership()
-		.await
-		.unwrap();
+	assert!(
+		fx.leader
+			.ensure_orphan_witnesses_recovered_for_leadership()
+			.await
+			.unwrap()
+	);
 	assert_eq!(fx.leader.pending_finalization_count_for_test().await, 1);
 
 	let reconciled = fx
@@ -9454,6 +9456,30 @@ async fn leader_recovers_orphan_witnesses_from_peer_before_reconciliation() {
 	assert!(
 		marker.is_some(),
 		"leader must finalize the imported orphan witness"
+	);
+
+	fx.leader_node.handles.abort();
+	fx.follower_node.handles.abort();
+}
+
+#[tokio::test]
+async fn orphan_witness_recovery_barrier_rejects_without_leadership() {
+	let fx = build_orphan_witness_fixture("orphan-witness-no-leader").await;
+	fx.leader
+		.set_orphan_witness_recovery_leadership_for_test(false);
+	let meta = simple_write_meta(1);
+	let (response, trailing) = fx.leader.write(meta, single_kv_batch()).await.unwrap();
+	assert_eq!(
+		response.status,
+		WriteStatus::NOT_LEADER,
+		"got resp={response:?}"
+	);
+	assert!(trailing.is_none());
+	assert!(
+		!fx.leader
+			.ensure_orphan_witnesses_recovered_for_leadership()
+			.await
+			.unwrap()
 	);
 
 	fx.leader_node.handles.abort();
@@ -9495,11 +9521,20 @@ async fn fresh_leader_recovers_peer_witness_before_duplicate_write_replays() {
 		.unwrap();
 
 	let before_bytes = fx.leader_node.slab.local_l1_bytes().await;
+	let unconfirmed_before = crate::metrics::global()
+		.data_ring_orphan_witness_recovery_leadership_unconfirmed_total
+		.get();
 	let (response, trailing) = fx.leader.write(meta, batch).await.unwrap();
+	// This delta is meaningful only when the harness serializes tests within
+	// this binary, as cargo-cgroup does. Under nextest, concurrent tests share
+	// the process-global counter and the delta is not attributable.
+	let unconfirmed = crate::metrics::global()
+		.data_ring_orphan_witness_recovery_leadership_unconfirmed_total
+		.get() - unconfirmed_before;
 	assert_eq!(
 		response.status,
 		WriteStatus::DUPLICATE,
-		"got resp={response:?}"
+		"got resp={response:?} leadership_unconfirmed_delta={unconfirmed}"
 	);
 	assert_eq!(
 		fx.leader_node.slab.local_l1_bytes().await,

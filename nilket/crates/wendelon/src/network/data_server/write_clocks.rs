@@ -9,9 +9,28 @@ use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tokio::time::Instant;
 
 use super::caller_deadline_from_remaining_millis;
-use crate::schema::{MutationStopReason, WriteStatus};
+use crate::schema::{MutationStopReason, NodeId, WriteStatus};
 
 pub(crate) const DEFAULT_WRITE_STALL_BOUND: Duration = Duration::from_secs(30);
+// This deliberately shares the local mutation stall bound: changing that
+// policy also changes how long fresh-leader admission waits on a peer pull.
+pub(crate) const ORPHAN_WITNESS_PULL_TIMEOUT: Duration = DEFAULT_WRITE_STALL_BOUND;
+
+pub(crate) async fn bound_orphan_witness_pull<T>(
+	peer: NodeId,
+	pull: impl std::future::Future<Output = std::io::Result<T>>,
+) -> std::io::Result<T> {
+	match tokio::time::timeout(ORPHAN_WITNESS_PULL_TIMEOUT, pull).await {
+		Ok(result) => result,
+		Err(_) => Err(std::io::Error::new(
+			std::io::ErrorKind::TimedOut,
+			format!(
+				"orphan-witness pull from peer {peer:?} timed out after {}s",
+				ORPHAN_WITNESS_PULL_TIMEOUT.as_secs()
+			),
+		)),
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct WriteExpiry {
@@ -155,5 +174,23 @@ mod tests {
 		assert_eq!(slots.available_permits(), 0);
 		drop(recovered);
 		assert_eq!(slots.available_permits(), 1);
+	}
+
+	#[tokio::test(start_paused = true)]
+	async fn orphan_witness_pull_timeout_is_bounded_and_named() {
+		let stalled = bound_orphan_witness_pull(
+			NodeId {
+				id: 7,
+				_reserved: 0,
+			},
+			std::future::pending::<std::io::Result<()>>(),
+		);
+		tokio::pin!(stalled);
+		tokio::task::yield_now().await;
+		tokio::time::advance(ORPHAN_WITNESS_PULL_TIMEOUT).await;
+		let error = stalled.await.unwrap_err();
+		assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+		assert!(error.to_string().contains("peer"));
+		assert!(error.to_string().contains("30s"));
 	}
 }

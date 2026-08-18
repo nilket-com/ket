@@ -200,7 +200,7 @@ use query_clocks::{
 mod query_encode;
 use query_encode::encode_query_stream_batches_with_deadline;
 mod write_clocks;
-use write_clocks::{WriteClocks, acquire_mutation_work_permit};
+use write_clocks::{WriteClocks, acquire_mutation_work_permit, bound_orphan_witness_pull};
 mod mutation_protocol;
 use mutation_protocol::mutation_expiry_response;
 mod streaming;
@@ -717,6 +717,8 @@ pub struct WendelonDataServer {
 	fail_next_local_durable_append: Arc<StdMutex<Option<(ErrorKind, String)>>>,
 	#[cfg(test)]
 	delay_next_local_durable_append: Arc<StdMutex<Option<Duration>>>,
+	#[cfg(test)]
+	orphan_witness_recovery_leadership_override: Arc<StdMutex<Option<bool>>>,
 	/// Shared node-wide HLC driver. The leader merges client HLCs
 	/// into this monotonic authority before stamping writes.
 	hlc: Arc<HybridLogicalClockDriver>,
@@ -1108,6 +1110,10 @@ impl Clone for WendelonDataServer {
 			fail_next_local_durable_append: self.fail_next_local_durable_append.clone(),
 			#[cfg(test)]
 			delay_next_local_durable_append: self.delay_next_local_durable_append.clone(),
+			#[cfg(test)]
+			orphan_witness_recovery_leadership_override: self
+				.orphan_witness_recovery_leadership_override
+				.clone(),
 			hlc: self.hlc.clone(),
 			tracker: self.tracker.clone(),
 			leases: self.leases.clone(),
@@ -1891,6 +1897,8 @@ impl WendelonDataServer {
 			fail_next_local_durable_append: Arc::new(StdMutex::new(None)),
 			#[cfg(test)]
 			delay_next_local_durable_append: Arc::new(StdMutex::new(None)),
+			#[cfg(test)]
+			orphan_witness_recovery_leadership_override: Arc::new(StdMutex::new(None)),
 			hlc,
 			tracker: None,
 			leases: Arc::new(RwLock::new(Vec::new())),
@@ -2780,15 +2788,21 @@ impl WendelonDataServer {
 	}
 
 	async fn reconcile_pending_finalizations_once(&self) -> std::io::Result<usize> {
-		if let Err(err) = self
+		match self
 			.ensure_orphan_witnesses_recovered_for_leadership()
 			.await
 		{
-			tracing::warn!(
-				node_id = self.local_node.id,
-				error = %err,
-				"orphan-witness recovery sweep failed before pending-finalization reconciliation"
-			);
+			Ok(true) => {}
+			// Leadership is unavailable, so reconciliation is deferred; zero here
+			// does not mean that the pending-finalization backlog was drained.
+			Ok(false) => return Ok(0),
+			Err(err) => {
+				tracing::warn!(
+					node_id = self.local_node.id,
+					error = %err,
+					"orphan-witness recovery sweep failed before pending-finalization reconciliation"
+				);
+			}
 		}
 		let mut records = self.pending_finalizations.load_all().await?;
 		records.sort_by_key(|record| {
@@ -3157,9 +3171,11 @@ impl WendelonDataServer {
 		request_epoch: u64,
 	) -> std::io::Result<usize> {
 		let started = Instant::now();
-		let records = self
-			.pull_pending_witnesses_from_peer(peer, request_epoch)
-			.await?;
+		let records = bound_orphan_witness_pull(
+			peer,
+			self.pull_pending_witnesses_from_peer(peer, request_epoch),
+		)
+		.await?;
 		let mut imported = 0usize;
 		for record in records {
 			if self.pending_finalizations.get(record.id).await?.is_none() {
@@ -3178,9 +3194,20 @@ impl WendelonDataServer {
 	}
 
 	fn current_orphan_witness_recovery_stamp(&self) -> Option<OrphanWitnessRecoveryStamp> {
-		let metrics = self.raft.metrics();
-		let borrowed = metrics.borrow();
+		#[cfg(test)]
+		if *self
+			.orphan_witness_recovery_leadership_override
+			.lock()
+			.expect("orphan witness leadership override poisoned")
+			== Some(false)
+		{
+			metrics().observe_orphan_witness_recovery_leadership_unconfirmed();
+			return None;
+		}
+		let raft_metrics = self.raft.metrics();
+		let borrowed = raft_metrics.borrow();
 		if borrowed.current_leader != Some(self.local_node.id) {
+			metrics().observe_orphan_witness_recovery_leadership_unconfirmed();
 			return None;
 		}
 		Some(OrphanWitnessRecoveryStamp {
@@ -3189,9 +3216,17 @@ impl WendelonDataServer {
 		})
 	}
 
-	async fn ensure_orphan_witnesses_recovered_for_leadership(&self) -> std::io::Result<()> {
+	#[cfg(test)]
+	pub(crate) fn set_orphan_witness_recovery_leadership_for_test(&self, confirmed: bool) {
+		*self
+			.orphan_witness_recovery_leadership_override
+			.lock()
+			.expect("orphan witness leadership override poisoned") = Some(confirmed);
+	}
+
+	async fn ensure_orphan_witnesses_recovered_for_leadership(&self) -> std::io::Result<bool> {
 		let Some(target) = self.current_orphan_witness_recovery_stamp() else {
-			return Ok(());
+			return Ok(false);
 		};
 
 		if *recover_rwlock_read(
@@ -3199,19 +3234,19 @@ impl WendelonDataServer {
 			"orphan_witness_recovery_stamp",
 		) == Some(target)
 		{
-			return Ok(());
+			return Ok(true);
 		}
 
 		let _guard = self.orphan_witness_recovery_lock.lock().await;
 		let Some(target) = self.current_orphan_witness_recovery_stamp() else {
-			return Ok(());
+			return Ok(false);
 		};
 		if *recover_rwlock_read(
 			&self.orphan_witness_recovery_stamp,
 			"orphan_witness_recovery_stamp",
 		) == Some(target)
 		{
-			return Ok(());
+			return Ok(true);
 		}
 
 		let membership = self.factory.membership_snapshot();
@@ -3227,7 +3262,7 @@ impl WendelonDataServer {
 			&self.orphan_witness_recovery_stamp,
 			"orphan_witness_recovery_stamp",
 		) = Some(target);
-		Ok(())
+		Ok(true)
 	}
 
 	/// Single pass of the lease manager (plan 018):
@@ -7910,8 +7945,15 @@ impl WendelonDataServer {
 		// node; the barrier exists to close the duplicate-retry window
 		// before consulting durable pending witnesses or admitting a
 		// fresh primary-owned write across the bifurcation boundary.
-		self.ensure_orphan_witnesses_recovered_for_leadership()
-			.await?;
+		if !self
+			.ensure_orphan_witnesses_recovered_for_leadership()
+			.await?
+		{
+			return Ok(self.counted_write_result(
+				error_response(&meta, WriteStatus::NOT_LEADER, self.local_node),
+				None,
+			));
+		}
 
 		// Restart-safe pending replay path. A recovered server starts
 		// with an empty idempotency cache, so consult the durable
@@ -8274,8 +8316,15 @@ impl WendelonDataServer {
 			));
 		}
 
-		self.ensure_orphan_witnesses_recovered_for_leadership()
-			.await?;
+		if !self
+			.ensure_orphan_witnesses_recovered_for_leadership()
+			.await?
+		{
+			return Ok(self.counted_write_result(
+				error_response(&synthetic, WriteStatus::NOT_LEADER, self.local_node),
+				None,
+			));
+		}
 
 		if let Some(record) = self
 			.pending_finalizations

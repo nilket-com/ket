@@ -8917,15 +8917,19 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// The root is bounded. Set from the post-carve size plus modest headroom;
 /// ratchet DOWN as domain helper methods are relocated in follow-on cuts
 /// (see plans/conventions/module-decomposition.md). It must never regrow toward
-/// the pre-carve monolith.
+/// the pre-carve monolith. The 15_250 cap deliberately accounts for the
+/// root-level fail-closed orphan-witness admission barrier and its two write
+/// call sites, which must remain beside MsgType dispatch for ADR 077, plus
+/// the deterministic `#[cfg(test)]` leadership-override plumbing required to
+/// exercise the unavailable-leadership branch.
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 15_200,
-		"data_server.rs root is {lines} lines (cap 15_200); carve more or justify a deliberate cap bump"
+		lines <= 15_250,
+		"data_server.rs root is {lines} lines (cap 15_250); carve more or justify a deliberate cap bump"
 	);
 }
 
