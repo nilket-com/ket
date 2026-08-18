@@ -610,18 +610,25 @@ pub(crate) fn adr305_substring_is_literal_bounded_and_residual_only() {
 	let pbc = std::fs::read_to_string(manifest_dir().join("src/pbc.rs")).expect("read pbc");
 	let exec = exec_source();
 
-	assert!(ir.contains("Substring {"));
-	assert!(ir.contains("| Self::Substring { .. }"));
-	assert!(execution_ir.contains("BoundExprNode::Substring"));
-	assert!(execution_ir.contains("pub fn append_substring"));
+	// ADR 553 migrated SUBSTRING into the scalar-function registry. The
+	// invariant this guard protects is unchanged — literal-bounded, residual
+	// only, never a PBC opcode — but it now lives in the registration and its
+	// signature rule rather than in a dedicated Expr variant.
+	let registry = std::fs::read_to_string(manifest_dir().join("src/ir/scalar_function.rs"))
+		.expect("read registry");
+	assert!(!ir.contains("Substring {"), "SUBSTRING is no longer an Expr variant");
+	assert!(!execution_ir.contains("BoundExprNode::Substring"));
+	assert!(registry.contains("const SUBSTRING: ScalarFunctionMetadata"));
+	assert!(registry.contains("StringWithConstantBounds"));
+	assert!(binder.contains("must be an integer literal"));
 	assert!(planner.contains("SqlExpr::Substring {"));
 	assert!(planner.contains("SUBSTR shorthand is not supported"));
 	assert!(planner.contains("SUBSTRING FROM must be >= 1"));
 	assert!(planner.contains("SUBSTRING FOR must be >= 0"));
-	assert!(binder.contains("fn bind_substring"));
-	assert!(binder.contains("SUBSTRING expects Utf8 input"));
-	assert!(pbc.contains("BoundExprNode::Substring { .. }"));
-	assert!(pbc.contains("SUBSTRING is not PBC-eligible"));
+	assert!(binder.contains("expects Utf8 input"));
+	// A registered function is PBC-ineligible through its metadata rather than
+	// through a named arm.
+	assert!(registry.contains("pbc_pushdown_eligible: false"));
 	assert!(exec.contains("substring_by_char"));
 	assert!(exec.contains("let start = from - 1"));
 	assert!(!pbc.contains("OP_SUBSTRING"));

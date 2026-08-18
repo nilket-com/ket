@@ -145,11 +145,6 @@ impl PbcCompiler {
 						"LIKE is not PBC-eligible".to_string(),
 					));
 				}
-				BoundExprNode::Substring { .. } => {
-					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
-						"SUBSTRING is not PBC-eligible".to_string(),
-					));
-				}
 				BoundExprNode::Case { .. } => {
 					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 						"CASE is not PBC-eligible".to_string(),
@@ -245,7 +240,6 @@ impl PbcCompiler {
 			BoundExprNode::Cast { .. }
 			| BoundExprNode::TryCast { .. }
 			| BoundExprNode::Like { .. }
-			| BoundExprNode::Substring { .. }
 			| BoundExprNode::Case { .. }
 			| BoundExprNode::ScalarFunction { .. }
 			| BoundExprNode::TimeBucket { .. }

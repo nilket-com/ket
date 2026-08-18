@@ -28,6 +28,7 @@ pub enum ScalarFunctionId {
 	Round,
 	Sign,
 	Sqrt,
+	Substring,
 	Trim,
 	Upper,
 	WidthBucket,
@@ -114,6 +115,16 @@ pub enum ScalarFunctionSignature {
 	/// batch rather than from an operand, which is what makes a niladic
 	/// function different in kind from every rule above.
 	NiladicFloat,
+	/// A `Utf8` string, a 1-based start, and an optional length. The bounds are
+	/// **constant** argument positions: they must bind to integer literals, and
+	/// the binder reads their values rather than evaluating them per row.
+	///
+	/// This is the registry's answer to a non-expression parameter. Rather than
+	/// widening `ScalarFunction` with a second payload, the parameter travels as
+	/// an ordinary literal argument that a signature rule validates. Every
+	/// remaining grandfathered variant carries a constant of some kind, so this
+	/// choice is the one that decides whether they can migrate at all.
+	StringWithConstantBounds,
 }
 
 /// How NULL inputs affect the output.
@@ -149,6 +160,7 @@ pub enum ScalarFunctionEvaluator {
 	Round,
 	Sign,
 	Sqrt,
+	Substring,
 	Trim,
 	Upper,
 	WidthBucket,
@@ -442,6 +454,20 @@ const RANDOM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Random,
 };
 
+const SUBSTRING: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Substring,
+	sql_name: "SUBSTRING",
+	sql_aliases: &[],
+	rune_name: "substring",
+	arity: ScalarFunctionArity::Between(2, 3),
+	signature: ScalarFunctionSignature::StringWithConstantBounds,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Substring,
+};
+
 /// The complete scalar-function registry.
 pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	ABS,
@@ -459,6 +485,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	ROUND,
 	SIGN,
 	SQRT,
+	SUBSTRING,
 	TRIM,
 	UPPER,
 	WIDTH_BUCKET,

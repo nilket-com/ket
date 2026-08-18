@@ -24,7 +24,6 @@ pub(super) fn reject_storage_synthetic_returning_reference(
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::Substring { input: inner, .. }
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -101,7 +100,6 @@ pub(super) fn collect_logical_cast_names(
 		| Expr::IsNull(expr)
 		| Expr::IsNotNull(expr)
 		| Expr::Like { expr, .. }
-		| Expr::Substring { input: expr, .. }
 		| Expr::TimeBucket(_, expr)
 		| Expr::AtTimeZone(expr, _)
 		| Expr::Extract(_, expr)

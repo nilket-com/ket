@@ -880,11 +880,6 @@ pub enum Expr {
 		negated: bool,
 		case_insensitive: bool,
 	},
-	Substring {
-		input: Box<Expr>,
-		from: i64,
-		length: Option<u64>,
-	},
 	Case {
 		when_then: Vec<(Box<Expr>, Box<Expr>)>,
 		else_expr: Option<Box<Expr>>,
@@ -935,7 +930,6 @@ impl Expr {
 			| Self::IsNull(inner)
 			| Self::IsNotNull(inner)
 			| Self::Like { expr: inner, .. }
-			| Self::Substring { input: inner, .. }
 			| Self::TimeBucket(_, inner)
 			| Self::AtTimeZone(inner, _)
 			| Self::Extract(_, inner)
@@ -982,7 +976,6 @@ impl Expr {
 			| Self::Mul(_, _)
 			| Self::Div(_, _)
 			| Self::Like { .. }
-			| Self::Substring { .. }
 			| Self::Case { .. }
 			| Self::TimeBucket(_, _)
 			| Self::AtTimeZone(_, _)

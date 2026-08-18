@@ -365,6 +365,34 @@ been reported as a reached-for capability wherever a script appeared in an error
 message. The pattern is now `rand::` and `std::random` — a foreign *path*, never
 a bare call — with a test that `rand::random()` is still denied.
 
+**`SUBSTRING` migrated, and it answers the question that gates the rest.** All
+five variants left after `FLOOR` carry a **non-expression parameter** — a zone, a
+unit, a field, an offset — which `ScalarFunction { id, args: Vec<Expr> }` cannot
+hold. That, not effort, is why the grandfathered list had stopped shrinking.
+
+The answer here is that **a constant parameter travels as an ordinary literal
+argument, and a signature rule proves it constant at bind time.** No second
+payload on the node, no widening of the IR. `StringWithConstantBounds` reads the
+bounds out of the literal arguments; a column in a bound position binds
+structurally and is then refused, with a test for exactly that, because the
+executor reads a bound once rather than per row.
+
+This unblocks `AtTimeZone` (a string) and `TimeBucket` (a duration) by the same
+route. `EXTRACT` and `DATE_TRUNC` carry *keyword* fields rather than values, so
+they may still need something else — 86 of the remaining 175 sites are theirs,
+and this record does not claim to have decided them.
+
+**Contract preserved, with one deliberate widening.** The five `SUBSTRING`
+behaviour tests predate the migration and pass unchanged apart from how they
+construct the expression. Two near-misses were caught by reading rather than by
+running: the old binder accepted **`Utf8` only**, so the new rule was narrowed
+back from `Utf8 | LargeUtf8` before it shipped, and its error text still reads
+`SUBSTRING expects Utf8 input` because a test pins that string. The widening is
+that `SUBSTRING` gains a **Rune spelling** it never had — required by the
+one-identifier-two-spellings rule, and a standing §3 defect until now.
+
+The grandfathered list is four.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know

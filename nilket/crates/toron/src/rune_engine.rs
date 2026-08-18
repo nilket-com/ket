@@ -1050,6 +1050,18 @@ pub fn ln(expr: RuneExpr) -> RuneExpr {
 
 /// Rune spells a variadic call as a list, the way `project` and `case` already
 /// do. SQL's `GREATEST(a, b, c)` is `greatest([a, b, c])` here.
+/// SUBSTRING had no Rune spelling before it entered the registry, which the
+/// one-identifier-two-spellings rule treats as a defect. Rune states the length
+/// explicitly, as it does for `lag` and `round`.
+pub fn substring(input: RuneExpr, from: RuneExpr, length: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Substring,
+			args: vec![input.expr, from.expr, length.expr],
+		},
+	}
+}
+
 pub fn random() -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1731,6 +1743,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["greatest"], greatest).build()?;
 	m.function(["least"], least).build()?;
 	m.function(["random"], random).build()?;
+	m.function(["substring"], substring).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;

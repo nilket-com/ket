@@ -130,6 +130,65 @@ pub(super) fn bind_scalar_function(
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
 		}
+		ScalarFunctionSignature::StringWithConstantBounds => {
+			let (input, from, length) = match bound_args.as_slice() {
+				[input, from] => (input, from, None),
+				[input, from, length] => (input, from, Some(length)),
+				_ => unreachable!("the registry arity was checked before binding"),
+			};
+			if !builder
+				.node_logical_type(*input)
+				.is_some_and(LogicalTypeId::is_naked)
+			{
+				return Err(BindingError::TypeMismatch {
+					message: format!("{} does not accept named logical types", metadata.sql_name),
+				});
+			}
+			// A bound is a shape parameter, not a value the rows carry. Requiring
+			// a literal is what lets the executor read it once instead of per row,
+			// and it preserves the contract the frontend has always enforced.
+			let constant_bound = |id: BoundExprId, role: &str| -> Result<i64, BindingError> {
+				match builder.literal(id) {
+					Some(ScalarValue::Int32(Some(value))) => Ok(i64::from(*value)),
+					Some(ScalarValue::Int64(Some(value))) => Ok(*value),
+					_ => Err(BindingError::TypeMismatch {
+						message: format!("{} {role} must be an integer literal", metadata.sql_name),
+					}),
+				}
+			};
+			if constant_bound(*from, "FROM")? < 1 {
+				return Err(BindingError::TypeMismatch {
+					message: format!("{} FROM must be >= 1", metadata.sql_name),
+				});
+			}
+			if let Some(length) = length
+				&& constant_bound(*length, "FOR")? < 0
+			{
+				return Err(BindingError::TypeMismatch {
+					message: format!("{} FOR must be >= 0", metadata.sql_name),
+				});
+			}
+			// Utf8 only, deliberately. The pre-registry binder accepted no other
+			// string type, and widening to LargeUtf8 is a capability decision
+			// that must not ride along inside a migration.
+			let output_type = match builder.node_type(*input) {
+				Some(DataType::Utf8) => DataType::Utf8,
+				Some(actual) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects Utf8 input, got {actual:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				None => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} input is not a bound expression", metadata.sql_name),
+					});
+				}
+			};
+			Ok(builder.append_scalar_function(id, bound_args, output_type))
+		}
 		ScalarFunctionSignature::NiladicFloat => {
 			// Nothing to type-check: the arity gate already proved there are no
 			// arguments, and the output type is the registration's own.

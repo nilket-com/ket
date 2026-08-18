@@ -4952,7 +4952,6 @@ fn collect_program_node_columns(
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
 		| Some(BoundExprNode::Like { expr: input, .. })
-		| Some(BoundExprNode::Substring { input, .. })
 		| Some(BoundExprNode::TimeBucket { input, .. })
 		| Some(BoundExprNode::AtTimeZone { input, .. })
 		| Some(BoundExprNode::Extract { input, .. })
@@ -5133,11 +5132,6 @@ fn bind_expr_into_program(
 			*negated,
 			*case_insensitive,
 		),
-		Expr::Substring {
-			input,
-			from,
-			length,
-		} => bind_substring(builder, input_schema, ctx, input, *from, *length),
 		Expr::Case {
 			when_then,
 			else_expr,
@@ -5915,32 +5909,6 @@ fn bind_like(
 		});
 	}
 	Ok(builder.append_like(expr, pattern.to_string(), negated, case_insensitive))
-}
-
-fn bind_substring(
-	builder: &mut BoundExprProgramBuilder,
-	input_schema: &SchemaRef,
-	ctx: &ExprBindContext<'_>,
-	input: &Expr,
-	from: i64,
-	length: Option<u64>,
-) -> Result<BoundExprId, BindingError> {
-	if from <= 0 {
-		return Err(BindingError::TypeMismatch {
-			message: "SUBSTRING FROM must be >= 1".to_string(),
-		});
-	}
-	let input = bind_expr_into_program(builder, input, input_schema, ctx)?;
-	let input_type = builder
-		.node_type(input)
-		.cloned()
-		.expect("builder returns typed SUBSTRING input");
-	if input_type != DataType::Utf8 {
-		return Err(BindingError::TypeMismatch {
-			message: format!("SUBSTRING expects Utf8 input, got {input_type:?}"),
-		});
-	}
-	Ok(builder.append_substring(input, from, length))
 }
 
 fn coerce_literal_value(

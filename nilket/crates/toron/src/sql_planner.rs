@@ -6728,10 +6728,20 @@ impl SqlPlanner {
 				if length.is_some_and(|length| length < 0) {
 					return Err(unsupported("SUBSTRING FOR must be >= 0"));
 				}
-				Ok(Expr::Substring {
-					input: Box::new(self.lower_expr(expr)?),
-					from,
-					length: length.map(|length| length as u64),
+				// The bounds travel as literal arguments rather than as a payload
+				// on the node. The frontend still resolves and range-checks them
+				// exactly as before; the registry's signature rule re-proves they
+				// are constant at bind time.
+				let mut args = vec![
+					self.lower_expr(expr)?,
+					Expr::Literal(crate::ir::ScalarValue::Int64(Some(from))),
+				];
+				if let Some(length) = length {
+					args.push(Expr::Literal(crate::ir::ScalarValue::Int64(Some(length))));
+				}
+				Ok(Expr::ScalarFunction {
+					id: crate::ir::ScalarFunctionId::Substring,
+					args,
 				})
 			}
 			SqlExpr::AtTimeZone {
@@ -7348,7 +7358,6 @@ fn validate_hidden_sort_key_refs(
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::Substring { input: inner, .. }
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -8220,16 +8229,6 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			negated.hash(state);
 			case_insensitive.hash(state);
 		}
-		Expr::Substring {
-			input,
-			from,
-			length,
-		} => {
-			29u8.hash(state);
-			hash_expr_structural(input, state);
-			from.hash(state);
-			length.hash(state);
-		}
 		Expr::LogicalAscription { expr, logical_type } => {
 			22u8.hash(state);
 			logical_type.hash(state);
@@ -8404,22 +8403,6 @@ pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 				&& left_negated == right_negated
 				&& left_case_insensitive == right_case_insensitive
 				&& expr_structural_eq(left_expr, right_expr)
-		}
-		(
-			Expr::Substring {
-				input: left_input,
-				from: left_from,
-				length: left_length,
-			},
-			Expr::Substring {
-				input: right_input,
-				from: right_from,
-				length: right_length,
-			},
-		) => {
-			left_from == right_from
-				&& left_length == right_length
-				&& expr_structural_eq(left_input, right_input)
 		}
 		(
 			Expr::InList {
@@ -8761,7 +8744,6 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::Substring { input: inner, .. }
 		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
@@ -9780,15 +9762,6 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 			pattern: pattern.clone(),
 			negated: *negated,
 			case_insensitive: *case_insensitive,
-		},
-		Expr::Substring {
-			input,
-			from,
-			length,
-		} => Expr::Substring {
-			input: Box::new(canonical_aggregate_signature_expr(input)),
-			from: *from,
-			length: *length,
 		},
 		Expr::Case {
 			when_then,
@@ -11851,7 +11824,6 @@ mod tests {
 			| Expr::AtTimeZone(expr, _)
 			| Expr::Extract(_, expr)
 			| Expr::DateTrunc(_, expr)
-			| Expr::Substring { input: expr, .. }
 			| Expr::Cast(expr, _)
 			| Expr::TryCast(expr, _) => expr_references(expr, qualifier, name),
 			Expr::Add(left, right)

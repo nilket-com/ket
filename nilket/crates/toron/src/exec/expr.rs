@@ -266,14 +266,6 @@ impl Executor {
 				let expr_arr = self.evaluate_expr(expr, batch)?;
 				evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)
 			}
-			Expr::Substring {
-				input,
-				from,
-				length,
-			} => {
-				let input_arr = self.evaluate_expr(input, batch)?;
-				evaluate_substring(&input_arr, *from, *length)
-			}
 			Expr::Case {
 				when_then,
 				else_expr,
@@ -435,14 +427,6 @@ impl Executor {
 				} => {
 					let expr_arr = evaluated_child(&outputs, *expr)?;
 					evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)?
-				}
-				BoundExprNode::Substring {
-					input,
-					from,
-					length,
-				} => {
-					let input_arr = evaluated_child(&outputs, *input)?;
-					evaluate_substring(&input_arr, *from, *length)?
 				}
 				BoundExprNode::Case {
 					when_then,
@@ -761,6 +745,31 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_char_length(&args[0]),
 		(
+			ScalarFunctionEvaluator::Substring,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => {
+			// The binder proved both bounds are integer literals, so the constant
+			// array carries one repeated value and row 0 is the parameter. An
+			// empty batch has no row 0 and no output either, so it never reads
+			// them.
+			if args[0].is_empty() {
+				return evaluate_substring(&args[0], 1, None);
+			}
+			let from = constant_integer_argument(&args[1], "SUBSTRING FROM")?;
+			let length = match args.get(2) {
+				Some(length) => Some(
+					u64::try_from(constant_integer_argument(length, "SUBSTRING FOR")?).map_err(
+						|_| ExecutionError::InvalidExpression {
+							message: "SUBSTRING FOR must be >= 0".to_string(),
+						},
+					)?,
+				),
+				None => None,
+			};
+			evaluate_substring(&args[0], from, length)
+		}
+		(
 			ScalarFunctionEvaluator::WidthBucket,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -801,6 +810,7 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Round
 			| ScalarFunctionEvaluator::Sign
 			| ScalarFunctionEvaluator::Sqrt
+			| ScalarFunctionEvaluator::Substring
 			| ScalarFunctionEvaluator::Trim
 			| ScalarFunctionEvaluator::Upper
 			| ScalarFunctionEvaluator::Greatest
@@ -1473,6 +1483,27 @@ fn evaluate_like(
 		(true, true) => arrow_nilike(expr_arr, &pattern)?,
 	};
 	Ok(Arc::new(result) as ArrayRef)
+}
+
+/// Reads a bound that the binder already proved constant. Callers must handle
+/// the empty batch first: there is no row 0 to read.
+fn constant_integer_argument(
+	argument: &ArrayRef,
+	role: &'static str,
+) -> Result<i64, ExecutionError> {
+	if let Some(values) = argument.as_any().downcast_ref::<Int64Array>()
+		&& values.is_valid(0)
+	{
+		return Ok(values.value(0));
+	}
+	if let Some(values) = argument.as_any().downcast_ref::<Int32Array>()
+		&& values.is_valid(0)
+	{
+		return Ok(i64::from(values.value(0)));
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!("internal: {role} is not a constant integer after binding"),
+	})
 }
 
 fn evaluate_substring(

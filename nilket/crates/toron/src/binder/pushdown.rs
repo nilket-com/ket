@@ -2119,14 +2119,6 @@ pub(super) fn clone_bound_subgraph(
 			let expr = clone_bound_subgraph(source, *expr, builder, remap)?;
 			builder.append_like(expr, pattern.clone(), *negated, *case_insensitive)
 		}
-		BoundExprNode::Substring {
-			input,
-			from,
-			length,
-		} => {
-			let input = clone_bound_subgraph(source, *input, builder, remap)?;
-			builder.append_substring(input, *from, *length)
-		}
 		BoundExprNode::Case {
 			when_then,
 			else_input,
@@ -2303,22 +2295,6 @@ pub(super) fn bound_subgraphs_structurally_equal_inner(
 				&& bound_subgraphs_structurally_equal_inner(source, *left_expr, *right_expr, seen)
 		}
 		(
-			Some(BoundExprNode::Substring {
-				input: left_input,
-				from: left_from,
-				length: left_length,
-			}),
-			Some(BoundExprNode::Substring {
-				input: right_input,
-				from: right_from,
-				length: right_length,
-			}),
-		) => {
-			left_from == right_from
-				&& left_length == right_length
-				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
-		}
-		(
 			Some(BoundExprNode::Case {
 				when_then: left_when_then,
 				else_input: left_else,
@@ -2443,7 +2419,6 @@ pub(super) fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
-		| BoundExprNode::Substring { input, .. }
 		| BoundExprNode::TimeBucket { input, .. }
 		| BoundExprNode::AtTimeZone { input, .. }
 		| BoundExprNode::Extract { input, .. }

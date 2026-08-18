@@ -21063,10 +21063,19 @@ fn bind_substring_expr(expr: Expr) -> Result<BoundExprProgram, BindingError> {
 }
 
 fn substring_expr(from: i64, length: Option<u64>) -> Expr {
-	Expr::Substring {
-		input: Box::new(Expr::column("name")),
-		from,
-		length,
+	substring_of(Expr::column("name"), from, length)
+}
+
+/// ADR 553: the bounds are literal arguments now, not a payload on the node.
+/// Only the construction moved; every assertion about behaviour is unchanged.
+fn substring_of(input: Expr, from: i64, length: Option<u64>) -> Expr {
+	let mut args = vec![input, Expr::Literal(ScalarValue::Int64(Some(from)))];
+	if let Some(length) = length {
+		args.push(Expr::Literal(ScalarValue::Int64(Some(length as i64))));
+	}
+	Expr::ScalarFunction {
+		id: crate::ir::ScalarFunctionId::Substring,
+		args,
 	}
 }
 
@@ -21110,16 +21119,24 @@ fn substring_sql_lowers_from_for_and_comma_forms() {
 		let LogicalPlan::Project { exprs, .. } = plan else {
 			panic!("expected project for {sql}");
 		};
-		let Expr::Substring {
-			input,
-			from,
-			length,
+		let Expr::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::Substring,
+			args,
 		} = &exprs[0]
 		else {
 			panic!("expected substring expression for {sql}: {:?}", exprs[0]);
 		};
-		assert!(matches!(input.as_ref(), Expr::Column(column) if column.name.0 == "c_phone"));
-		assert_eq!((*from, *length), expected, "{sql}");
+		let input = &args[0];
+		let from = match &args[1] {
+			Expr::Literal(ScalarValue::Int64(Some(from))) => *from,
+			other => panic!("expected a constant FROM for {sql}: {other:?}"),
+		};
+		let length = args.get(2).map(|arg| match arg {
+			Expr::Literal(ScalarValue::Int64(Some(length))) => *length as u64,
+			other => panic!("expected a constant FOR for {sql}: {other:?}"),
+		});
+		assert!(matches!(input, Expr::Column(column) if column.name.0 == "c_phone"));
+		assert_eq!((from, length), expected, "{sql}");
 	}
 }
 
@@ -21199,12 +21216,8 @@ fn substring_without_for_returns_rest_and_for_zero_returns_empty() {
 
 #[test]
 fn substring_bind_rejects_non_utf8_input() {
-	let error = bind_substring_expr(Expr::Substring {
-		input: Box::new(Expr::column("amount")),
-		from: 1,
-		length: Some(2),
-	})
-	.expect_err("non-Utf8 substring input should reject");
+	let error = bind_substring_expr(substring_of(Expr::column("amount"), 1, Some(2)))
+		.expect_err("non-Utf8 substring input should reject");
 
 	assert!(error.to_string().contains("SUBSTRING expects Utf8 input"));
 }

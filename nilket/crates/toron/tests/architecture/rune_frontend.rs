@@ -839,10 +839,12 @@ pub(crate) fn adr084_rune_arithmetic_methods_lower_to_existing_expr_variants() {
 	let rune = rune_engine_source();
 
 	for (function, variant) in [
-		("pub fn add", "Expr::Add"),
-		("pub fn sub", "Expr::Sub"),
-		("pub fn mul", "Expr::Mul"),
-		("pub fn div", "Expr::Div"),
+		// The open paren matters: `pub fn sub` is a prefix of `pub fn substring`,
+		// and a bare-name scan silently inspects the wrong function.
+		("pub fn add(", "Expr::Add"),
+		("pub fn sub(", "Expr::Sub"),
+		("pub fn mul(", "Expr::Mul"),
+		("pub fn div(", "Expr::Div"),
 	] {
 		let body = source_block(&rune, function);
 		assert!(body.contains(variant), "{function} missing {variant}");

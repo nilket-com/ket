@@ -2612,6 +2612,63 @@ async fn adr553_non_determinism_survives_every_expression_form() {
 	}
 }
 
+/// SUBSTRING had no Rune spelling before the migration. Registering it closes
+/// that gap, and the two surfaces must agree on the bound plan and the rows.
+#[tokio::test]
+async fn adr553_sql_and_rune_substring_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT SUBSTRING(region FROM 2 FOR 3) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([substring(col("region"), lit_i64(2), lit_i64(3))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL SUBSTRING");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune substring");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL SUBSTRING digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune substring digest")
+	);
+}
+
+/// The bounds are constant argument positions. A column in a bound position
+/// binds structurally but must be refused, because the executor reads the bound
+/// once rather than per row — this is the rule that makes the parameter model
+/// safe, and nothing else in the registry has one.
+#[tokio::test]
+async fn adr553_substring_rejects_a_non_constant_bound() {
+	let (catalog, _) = fixture();
+	let logical = LogicalPlan::Project {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: toron::catalog::TableRef::new("sales"),
+			projection: None,
+		}),
+		exprs: vec![Expr::ScalarFunction {
+			id: ScalarFunctionId::Substring,
+			args: vec![Expr::column("region"), Expr::column("amount")],
+		}],
+		output_names: vec![None],
+	};
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("a column bound should not bind");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("must be an integer literal")),
+		"expected a constant-bound rejection, got {err:?}"
+	);
+}
+
 #[tokio::test]
 async fn adr553_random_rejects_arguments() {
 	assert_unsupported_message(
