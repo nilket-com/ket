@@ -25,7 +25,7 @@ use arrow::array::{
 	Array, ArrayRef, BooleanArray, BooleanBuilder, Date32Array, Date32Builder, Decimal128Array,
 	DurationNanosecondArray, DurationNanosecondBuilder, Float32Array, Float32Builder, Float64Array,
 	Float64Builder, Int8Array, Int16Array, Int32Array, Int32Builder, Int64Array, Int64Builder,
-	IntervalYearMonthArray, IntervalYearMonthBuilder, StringArray, StringBuilder,
+	IntervalYearMonthArray, IntervalYearMonthBuilder, LargeStringArray, StringArray, StringBuilder,
 	TimestampMicrosecondArray, TimestampMicrosecondBuilder, TimestampMillisecondArray,
 	TimestampMillisecondBuilder, TimestampNanosecondArray, TimestampNanosecondBuilder, UInt8Array,
 	UInt16Array, UInt32Array, UInt64Array,

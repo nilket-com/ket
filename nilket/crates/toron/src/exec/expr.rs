@@ -740,6 +740,26 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_mod(&args[0], &args[1]),
 		(
+			ScalarFunctionEvaluator::Upper,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_unary_string(&args[0], "UPPER", str::to_uppercase),
+		(
+			ScalarFunctionEvaluator::Lower,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_unary_string(&args[0], "LOWER", str::to_lowercase),
+		(
+			ScalarFunctionEvaluator::Trim,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_unary_string(&args[0], "TRIM", |value| value.trim().to_string()),
+		(
+			ScalarFunctionEvaluator::CharLength,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_char_length(&args[0]),
+		(
 			ScalarFunctionEvaluator::Floor,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -747,13 +767,17 @@ fn evaluate_scalar_function(
 		| (
 			ScalarFunctionEvaluator::Abs
 			| ScalarFunctionEvaluator::Ceil
+			| ScalarFunctionEvaluator::CharLength
 			| ScalarFunctionEvaluator::Exp
 			| ScalarFunctionEvaluator::Ln
+			| ScalarFunctionEvaluator::Lower
 			| ScalarFunctionEvaluator::Mod
 			| ScalarFunctionEvaluator::Pow
 			| ScalarFunctionEvaluator::Round
 			| ScalarFunctionEvaluator::Sign
-			| ScalarFunctionEvaluator::Sqrt,
+			| ScalarFunctionEvaluator::Sqrt
+			| ScalarFunctionEvaluator::Trim
+			| ScalarFunctionEvaluator::Upper,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Rejects,
 		) => Err(ExecutionError::InvalidExpression {
@@ -763,6 +787,63 @@ fn evaluate_scalar_function(
 			),
 		}),
 	}
+}
+
+/// The output keeps the input's offset width, so a `LargeUtf8` column stays
+/// `LargeUtf8` rather than being silently narrowed by passing through a function.
+fn evaluate_unary_string(
+	input: &ArrayRef,
+	name: &'static str,
+	transform: impl Fn(&str) -> String,
+) -> Result<ArrayRef, ExecutionError> {
+	if let Some(input) = input.as_any().downcast_ref::<StringArray>() {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.map(|value| value.map(&transform))
+				.collect::<StringArray>(),
+		) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<LargeStringArray>() {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.map(|value| value.map(&transform))
+				.collect::<LargeStringArray>(),
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!("{name} expects a string input, got {:?}", input.data_type()),
+	})
+}
+
+/// `CHAR_LENGTH` counts characters, not bytes — `OCTET_LENGTH` is the byte
+/// measure and is not admitted here. `str::len` would answer in bytes and be
+/// wrong for every non-ASCII value.
+fn evaluate_char_length(input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let count = |value: &str| i64::try_from(value.chars().count()).unwrap_or(i64::MAX);
+	if let Some(input) = input.as_any().downcast_ref::<StringArray>() {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.map(|value| value.map(count))
+				.collect::<Int64Array>(),
+		) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<LargeStringArray>() {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.map(|value| value.map(count))
+				.collect::<Int64Array>(),
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"CHAR_LENGTH expects a string input, got {:?}",
+			input.data_type()
+		),
+	})
 }
 
 /// `SIGN` preserves its input type, so a decimal's sign is `1` at that decimal's
@@ -3050,6 +3131,54 @@ mod tests {
 			wrapping,
 			i32::MIN,
 			"wrapping_abs returns the input unchanged, which is the value this must never produce"
+		);
+	}
+
+	/// `CHAR_LENGTH` is a character count. `str::len` would answer in bytes and
+	/// agree with it only for ASCII, so the probe uses values where the two
+	/// measures differ.
+	#[test]
+	fn char_length_counts_characters_not_bytes() {
+		let input = Arc::new(StringArray::from(vec![
+			Some("naïve"),
+			Some("日本語"),
+			Some("ascii"),
+			None,
+		])) as ArrayRef;
+		let output = super::evaluate_char_length(&input).expect("CHAR_LENGTH");
+		assert_eq!(output.data_type(), &DataType::Int64);
+		let values = output
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 output");
+		assert_eq!(values.value(0), 5, "naïve is five characters, six bytes");
+		assert_eq!(values.value(1), 3, "three characters, nine bytes");
+		assert_eq!(values.value(2), 5);
+		assert!(values.is_null(3), "NULL must propagate");
+	}
+
+	/// A `LargeUtf8` column must not be narrowed to `Utf8` merely by passing
+	/// through a function.
+	#[test]
+	fn unary_string_preserves_the_input_offset_width() {
+		let large = Arc::new(LargeStringArray::from(vec![Some("  hi  ")])) as ArrayRef;
+		let trimmed =
+			super::evaluate_unary_string(&large, "TRIM", |value| value.trim().to_string())
+				.expect("TRIM over LargeUtf8");
+		assert_eq!(trimmed.data_type(), &DataType::LargeUtf8);
+
+		let narrow = Arc::new(StringArray::from(vec![Some("  hi  ")])) as ArrayRef;
+		let trimmed =
+			super::evaluate_unary_string(&narrow, "TRIM", |value| value.trim().to_string())
+				.expect("TRIM over Utf8");
+		assert_eq!(trimmed.data_type(), &DataType::Utf8);
+		assert_eq!(
+			trimmed
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.expect("Utf8 output")
+				.value(0),
+			"hi"
 		);
 	}
 

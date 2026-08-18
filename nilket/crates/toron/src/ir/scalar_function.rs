@@ -15,14 +15,18 @@ use serde::{Deserialize, Serialize};
 pub enum ScalarFunctionId {
 	Abs,
 	Ceil,
+	CharLength,
 	Exp,
 	Floor,
 	Ln,
+	Lower,
 	Mod,
 	Pow,
 	Round,
 	Sign,
 	Sqrt,
+	Trim,
+	Upper,
 }
 
 /// The accepted argument count for a scalar function.
@@ -79,6 +83,13 @@ pub enum ScalarFunctionSignature {
 	/// The float case is deliberately absent: a floating remainder is a separate
 	/// admission decision, not an implied consequence of this one.
 	BinaryIntegerPreserving,
+	/// Output type equals input type across the string set, so a `LargeUtf8`
+	/// column does not silently narrow to `Utf8`.
+	UnaryStringPreserving,
+	/// A string in, an integer out. The first rule whose output type is drawn
+	/// from neither the input nor the argument list, which is why the string
+	/// family is the real test of this metadata model.
+	StringToInteger,
 }
 
 /// How NULL inputs affect the output.
@@ -101,14 +112,18 @@ pub enum ScalarFunctionNonFiniteBehavior {
 pub enum ScalarFunctionEvaluator {
 	Abs,
 	Ceil,
+	CharLength,
 	Exp,
 	Floor,
 	Ln,
+	Lower,
 	Mod,
 	Pow,
 	Round,
 	Sign,
 	Sqrt,
+	Trim,
+	Upper,
 }
 
 /// Planner and execution metadata for one scalar capability.
@@ -277,9 +292,80 @@ const MOD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Mod,
 };
 
+const UPPER: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Upper,
+	sql_name: "UPPER",
+	sql_aliases: &[],
+	rune_name: "upper",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryStringPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Upper,
+};
+
+const LOWER: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Lower,
+	sql_name: "LOWER",
+	sql_aliases: &[],
+	rune_name: "lower",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryStringPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Lower,
+};
+
+const TRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Trim,
+	sql_name: "TRIM",
+	sql_aliases: &[],
+	rune_name: "trim",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryStringPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Trim,
+};
+
+const CHAR_LENGTH: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::CharLength,
+	sql_name: "CHAR_LENGTH",
+	// The standard admits both spellings for the same function.
+	sql_aliases: &["CHARACTER_LENGTH"],
+	rune_name: "char_length",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::StringToInteger,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::CharLength,
+};
+
 /// The complete scalar-function registry.
-pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] =
-	&[ABS, CEIL, EXP, FLOOR, LN, MOD, POW, ROUND, SIGN, SQRT];
+pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
+	ABS,
+	CEIL,
+	CHAR_LENGTH,
+	EXP,
+	FLOOR,
+	LN,
+	LOWER,
+	MOD,
+	POW,
+	ROUND,
+	SIGN,
+	SQRT,
+	TRIM,
+	UPPER,
+];
 
 pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunctionMetadata {
 	SCALAR_FUNCTIONS

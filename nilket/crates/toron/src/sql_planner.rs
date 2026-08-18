@@ -6758,6 +6758,25 @@ impl SqlPlanner {
 					args: vec![self.lower_expr(expr)?],
 				})
 			}
+			// TRIM's specification forms select a side and a trim character set.
+			// Only the plain form is admitted; the rest are rejected by name so a
+			// query asking for them fails rather than quietly getting BOTH-space.
+			SqlExpr::Trim {
+				trim_where,
+				trim_what,
+				expr,
+				trim_characters,
+			} => {
+				if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
+					return Err(unsupported(
+						"TRIM with a specification or trim characters is not supported",
+					));
+				}
+				Ok(Expr::ScalarFunction {
+					id: crate::ir::ScalarFunctionId::Trim,
+					args: vec![self.lower_expr(expr)?],
+				})
+			}
 			// CEIL has its own grammar form, so it never reaches the registry's
 			// function path. The identifier is still the registry's.
 			SqlExpr::Ceil { expr, field } => {

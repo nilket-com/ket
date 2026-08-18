@@ -259,6 +259,27 @@ The Rune surface follows the canonical name — `pow` became `power` — rather 
 taking a spelling exception. The exception list stays at one entry, `MOD`, where
 the canonical name is unusable because it is a Rune keyword.
 
+**The string family is where the metadata model stopped being numeric-shaped.**
+`UPPER`, `LOWER`, `TRIM`, and `CHAR_LENGTH` landed together because they test one
+thing as a group: until now every rule produced an output type drawn from an
+input. `StringToInteger` is the first that does not — a string in, an `Int64`
+out — and it needed no change to `ScalarFunctionMetadata`, only a rule.
+
+`CHAR_LENGTH` returns `Int64` for both `Utf8` and `LargeUtf8` inputs, so the
+result type does not leak how a column happens to be stored, and it counts
+**characters**: `str::len` answers in bytes and agrees only for ASCII.
+`OCTET_LENGTH` is the byte measure and is not admitted here. `UnaryStringPreserving`
+keeps the input's offset width, so a `LargeUtf8` column is not narrowed by passing
+through a function. `CHARACTER_LENGTH` is registered as an alias, which is the
+alias mechanism earning its keep on a new function rather than only in retrofit.
+
+`TRIM` needed a grammar arm like `CEIL` did, and its specification forms
+(`TRIM(LEADING 'x' FROM s)`) are **rejected by name** rather than quietly treated
+as plain `TRIM` — answering a different question than the one asked is worse than
+refusing. The bare `TRIM(LEADING FROM s)` form does not parse in this dialect at
+all, so the engine never sees it; a test pins that too, because "we reject it"
+and "it never arrives" are different facts.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know

@@ -1048,6 +1048,42 @@ pub fn ln(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn upper(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Upper,
+			args: vec![expr.expr],
+		},
+	}
+}
+
+pub fn lower(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Lower,
+			args: vec![expr.expr],
+		},
+	}
+}
+
+pub fn trim(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Trim,
+			args: vec![expr.expr],
+		},
+	}
+}
+
+pub fn char_length(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::CharLength,
+			args: vec![expr.expr],
+		},
+	}
+}
+
 pub fn ceil(expr: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1649,6 +1685,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["ceil"], ceil).build()?;
 	m.function(["floor"], floor).build()?;
 	m.function(["sign"], sign).build()?;
+	m.function(["upper"], upper).build()?;
+	m.function(["lower"], lower).build()?;
+	m.function(["trim"], trim).build()?;
+	m.function(["char_length"], char_length).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;

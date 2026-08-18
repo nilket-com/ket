@@ -2263,6 +2263,105 @@ async fn adr553_ceiling_and_ceil_produce_the_same_bound_plan() {
 }
 
 #[tokio::test]
+async fn adr553_sql_and_rune_upper_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT UPPER(region) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([upper(col("region"))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL UPPER");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune upper");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL UPPER digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune upper digest")
+	);
+}
+
+/// `UPPER`, `LOWER`, and `TRIM` return a string; `CHAR_LENGTH` returns an
+/// integer drawn from neither the input nor the arguments. That asymmetry is
+/// the whole point of the string cut and it is what `StringToInteger` encodes.
+#[tokio::test]
+async fn adr553_string_functions_type_their_outputs_independently_of_their_inputs() {
+	let (catalog, _) = fixture();
+	for (sql, expected) in [
+		("SELECT UPPER(region) FROM sales", DataType::Utf8),
+		("SELECT LOWER(region) FROM sales", DataType::Utf8),
+		("SELECT TRIM(region) FROM sales", DataType::Utf8),
+		("SELECT CHAR_LENGTH(region) FROM sales", DataType::Int64),
+		(
+			"SELECT CHARACTER_LENGTH(region) FROM sales",
+			DataType::Int64,
+		),
+	] {
+		let logical = plan_sql(sql);
+		let bound = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|error| panic!("bind {sql}: {error:?}"));
+		assert_eq!(
+			bound.schema().field(0).data_type(),
+			&expected,
+			"{sql} produced the wrong output type"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr553_string_functions_reject_a_numeric_input() {
+	let (catalog, _) = fixture();
+	for sql in [
+		"SELECT UPPER(price) FROM sales",
+		"SELECT CHAR_LENGTH(amount) FROM sales",
+	] {
+		let logical = plan_sql(sql);
+		let err = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_err();
+		assert!(
+			matches!(err, BindingError::TypeMismatch { ref message } if message.contains("expects a string input")),
+			"{sql}: expected a string-domain rejection, got {err:?}"
+		);
+	}
+}
+
+/// The specification forms select a side and a character set. Accepting them
+/// silently as plain `TRIM` would answer a different question than was asked.
+#[tokio::test]
+async fn adr553_trim_rejects_its_specification_forms() {
+	for sql in [
+		"SELECT TRIM(LEADING 'x' FROM region) FROM sales",
+		"SELECT TRIM(TRAILING 'x' FROM region) FROM sales",
+		"SELECT TRIM(BOTH 'x' FROM region) FROM sales",
+		"SELECT TRIM('x' FROM region) FROM sales",
+	] {
+		assert_unsupported_message(
+			sql,
+			"TRIM with a specification or trim characters is not supported",
+		);
+	}
+	// The bare specification without a trim character does not parse in this
+	// dialect at all, so it never reaches the engine's rejection.
+	assert!(
+		SqlPlanner::new()
+			.plan("SELECT TRIM(LEADING FROM region) FROM sales")
+			.is_err(),
+		"a bare TRIM specification must not plan"
+	);
+}
+
+#[tokio::test]
 async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");
 	let rune_logical = rune_plan(

@@ -65,6 +65,20 @@ fn enum_variant_names(enum_body: &str) -> BTreeSet<String> {
 		.collect()
 }
 
+/// A registration's const is the SCREAMING_SNAKE_CASE of its identifier, so
+/// `CharLength` is `CHAR_LENGTH`. Uppercasing alone silently looks for
+/// `CHARLENGTH` and reports a missing registration that is really present.
+fn const_name(id: &str) -> String {
+	let mut name = String::new();
+	for (index, character) in id.char_indices() {
+		if character.is_ascii_uppercase() && index > 0 {
+			name.push('_');
+		}
+		name.push(character.to_ascii_uppercase());
+	}
+	name
+}
+
 /// The `SCALAR_FUNCTIONS` slice body — a bracket list rather than a brace block.
 fn scalar_functions_list(registry: &str) -> String {
 	registry
@@ -149,14 +163,18 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 		BTreeSet::from([
 			"Abs".to_string(),
 			"Ceil".to_string(),
+			"CharLength".to_string(),
 			"Exp".to_string(),
 			"Floor".to_string(),
 			"Ln".to_string(),
 			"Mod".to_string(),
 			"Pow".to_string(),
 			"Round".to_string(),
+			"Lower".to_string(),
 			"Sign".to_string(),
 			"Sqrt".to_string(),
+			"Trim".to_string(),
+			"Upper".to_string(),
 		]),
 		"admitting a function is a review decision; update this set deliberately"
 	);
@@ -166,7 +184,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 	for id in &registered_ids {
 		let metadata = brace_blocks_after_marker(
 			&registry,
-			&format!("const {}: ScalarFunctionMetadata", id.to_uppercase()),
+			&format!("const {}: ScalarFunctionMetadata", const_name(id)),
 		)
 		.into_iter()
 		.next()
@@ -200,7 +218,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"{id} is registered but not reachable from Rune as {rune_name}"
 		);
 		assert!(
-			scalar_functions_list(&registry).contains(&id.to_uppercase()),
+			scalar_functions_list(&registry).contains(&const_name(id)),
 			"{id} has metadata but is absent from SCALAR_FUNCTIONS, so lookups panic"
 		);
 	}
