@@ -53,7 +53,7 @@ use iced_wgpu::{Engine, Renderer as WgpuRenderer, wgpu};
 use plot::common::{
 	AxisType, BandRequirements, CoordinateTransformer, IcedBackend, Orientation, PathBuilder,
 	PlotBackend, PlotKernel, PlotLayout, PlotRenderLayer, PlotWidget, ResolvedPlotSettings,
-	TickPlacement, VerticalGuideBands,
+	TemporalAxisDomain, TickPlacement, TimeUnit, VerticalGuideBands,
 };
 use plot::composition::PlotComposition;
 use plot::core::PlotType;
@@ -87,6 +87,7 @@ const WHITE: [u8; 3] = [255, 255, 255];
 const PRODUCT_0077_BANKED_VERTICAL_SPILL: usize = 88;
 const PRODUCT_0077_BANKED_HORIZONTAL_SPILL: usize = 111;
 const PRODUCT_0083_BANKED_MEDIAN_DETAIL: usize = 0;
+const PRODUCT_0131_BANKED_LIVE_PLOT_HEIGHT: f32 = 34.7;
 
 struct Gpu {
 	adapter: wgpu::Adapter,
@@ -831,6 +832,88 @@ fn render_product_rotation(
 		widget.render_overlay_layer(&mut backend, figure_bounds);
 	});
 	(capture, figure_bounds)
+}
+
+fn render_product_kernel_rotation(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+	kernel: &dyn PlotKernel,
+	settings: PlotSettings,
+) -> (Capture, Rectangle, Rectangle) {
+	let resolved = settings.resolve();
+	let figure_bounds = Rectangle::with_size(Size::new(
+		size.width as f32 - 160.0,
+		size.height as f32 - 80.0,
+	));
+	let layout = kernel.layout(resolved.clone());
+	let requirements = BandRequirements::from_layout(&layout, &resolved);
+	let plot_area = VerticalGuideBands::resolve_with_requirements(
+		"Count control",
+		None,
+		&requirements,
+		&resolved,
+	)
+		.plot_area(Rect::from_iced_frame(figure_bounds), 0.0, &resolved)
+		.into_iced();
+	let settings_model = settings;
+	let widget = PlotWidget {
+		kernel,
+		title: "Count control".to_owned(),
+		padding: 0.0,
+		settings: resolved,
+		settings_model,
+		render_revision: 0,
+		resize_render_suspended: false,
+		layer: PlotRenderLayer::Full,
+	};
+	let capture = render_frame(renderer, size, |frame| {
+		let mut backend = IcedBackend { frame };
+		widget.render_plot_layer(&mut backend, figure_bounds);
+		widget.render_overlay_layer(&mut backend, figure_bounds);
+	});
+	(capture, figure_bounds, plot_area)
+}
+
+fn product_temporal_count_fixture(rotation: f32) -> (LinePlotKernel, PlotSettings) {
+	let first = 1_709_164_800_000_i64;
+	let last = 1_710_054_400_000_i64;
+	let mut resolved = product_0068_cartesian_settings().resolve();
+	resolved.title = ResolvedPresence::Show("Count control".to_owned().into());
+	resolved.subtitle = ResolvedPresence::Show(
+		"No tick_every: existing Count placement remains available"
+			.to_owned()
+			.into(),
+	);
+	resolved.x_tick_rotation = TickRotation::new(rotation).expect("temporal probe angle");
+	let settings = PlotSettings::from_resolved(resolved);
+	(
+		LinePlotKernel::new(Arc::new(LinePreparedData {
+			series: vec![SeriesData {
+				name: "activity".to_owned(),
+				points: vec![[first as f64, 40.0], [last as f64, 70.0]],
+				color_t: 0.0,
+				resolved_color: Some(Color::WHITE),
+				provenance: LegendProvenance::Named,
+			}],
+			x_range: (first as f64, last as f64),
+			y_range: (0.0, 100.0),
+			x_axis_type: AxisType::Datetime {
+				unit: TimeUnit::Milliseconds,
+				zone: Some(Arc::<str>::from("UTC")),
+			},
+			y_axis_type: AxisType::Linear,
+			x_temporal_domain: Some(TemporalAxisDomain::Datetime {
+				first_tick: first,
+				last_tick: last,
+				unit: TimeUnit::Milliseconds,
+				zone: Some(Arc::<str>::from("UTC")),
+			}),
+			y_temporal_domain: None,
+			x_label: String::new(),
+			y_label: String::new(),
+		})),
+		settings,
+	)
 }
 
 fn exterior_luminous_pixels(capture: &Capture, bounds: Rectangle) -> usize {
@@ -2023,6 +2106,56 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	}
 	println!(
 		"PRODUCT_0115 x_tick_rotation disposition=automated zero/positive/negative=contained/contained/contained"
+	);
+	// PRODUCT-0131 Stage 0: a 19-character timestamp label reserves a bottom band
+	// that outgrows its own figure. `plot_area` clamps the remainder at zero, so
+	// the plot silently disappears while ink still reaches the reserved band.
+	// The 480x360 / 36-degree row is the discriminating nonzero control: without
+	// it the collapse rows would read zero in both the present and any repaired
+	// state, and prove nothing.
+	for (size, expected) in [
+		(Size::new(480, 360), [34.7_f32, 5.9, 0.0]),
+		(Size::new(320, 240), [0.0_f32, 0.0, 0.0]),
+	] {
+		for (rotation, expected_height) in [36.0, 45.0, 90.0].into_iter().zip(expected) {
+			let (kernel, settings) = product_temporal_count_fixture(rotation);
+			let (capture, figure_bounds, plot_area) =
+				render_product_kernel_rotation(&mut msaa, size, &kernel, settings);
+			let bottom_band = Rectangle::new(
+				Point::new(figure_bounds.x, plot_area.y + plot_area.height),
+				Size::new(
+					figure_bounds.width,
+					(figure_bounds.y + figure_bounds.height
+						- (plot_area.y + plot_area.height))
+						.max(0.0),
+				),
+			);
+			let bottom_ink = capture.luminous_pixels(bottom_band);
+			assert!(
+				(plot_area.height - expected_height).abs() < 0.1,
+				"PRODUCT-0131 {}x{} at {rotation} degrees banks a {expected_height} px plot, got {:.1}",
+				size.width,
+				size.height,
+				plot_area.height,
+			);
+			assert!(
+				bottom_ink > 0,
+				"PRODUCT-0131 {}x{} at {rotation} degrees must still draw tick ink into the reserved band; \
+				 a zero reading would make the collapse rows vacuous",
+				size.width,
+				size.height,
+			);
+			println!(
+				"PRODUCT_0130 temporal_count_rotation size={}x{} rotation={rotation} plot_height={:.1} bottom_ink={bottom_ink}",
+				size.width,
+				size.height,
+				plot_area.height,
+			);
+		}
+	}
+	assert!(
+		PRODUCT_0131_BANKED_LIVE_PLOT_HEIGHT > 0.0,
+		"Stage 0 must bank a discriminating nonzero plot height"
 	);
 	let (product_0116_vertical, product_0116_bounds) =
 		render_product_0116_rotation(&mut msaa, product_0115_size, 90.0);
