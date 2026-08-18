@@ -119,9 +119,20 @@ The requirement itself is untouched. Nothing upstream of `plot_area` learns the
 container size, so PRODUCT-0114's cycle prohibition and PRODUCT-0127 §2 hold
 exactly as written.
 
-`PLOT_MIN_SHARE` is a single banked layout constant, in the form
-PRODUCT-0126 used for `Y_AXIS_TITLE_GAP`: a number justified by Stage 0's
-measurements rather than derived from a formula that does not exist.
+**`PLOT_MIN_SHARE` is 0.15**, banked from a corpus measurement rather than
+chosen. Stage 0's sweep instrumented `plot_area` and `grid_tiled_area` and ran
+the whole suite plus the render-evidence harness -- 275 samples, every figure the
+tree draws, enumerated by instrumentation rather than by hand.
+
+Among figures that currently fit, the maximum band fraction is 0.8873 vertically
+and 0.8600 horizontally, so a share above 0.1127 necessarily moves something.
+The distribution then has a wide gap: the 0.8873 ceiling is three samples of one
+faceted grid, and the next ceiling is 0.6167. A 0.15 share therefore clears the
+strict ceiling by the smallest amount that lands inside that gap, moving those
+three samples and nothing else.
+
+Both synthetic candidates are excluded by the same measurement: 0.33 and 0.50
+would move figures across the entire 0.54--0.62 cluster.
 
 ### 2. A plot area is never zero when the figure is not
 
@@ -129,6 +140,14 @@ If the figure has positive extent, the plot has positive extent. The
 `.max(0.0)` clamp remains as a floor against degenerate figures, but it stops
 being reachable from an ordinary band computation. A collapsed plot is a
 rendering outcome no author can request and no label length can force.
+
+**The guarantee is a positive minimum share, not a usable plot.** At the banked
+share the 320x240 collapse row rises from 0 px to 24 px, which is a plot that
+exists and can be seen to exist; whether 15% is enough to read is a question no
+capture in this record answers. The record deliberately does not claim it. If a
+later exhibit shows that 15% is unreadable at common pane sizes, the response is
+a re-banked constant or a legibility record, not a reinterpretation of this
+promise.
 
 ### 3. The overflow clips, and that is the visible signal
 
@@ -164,9 +183,11 @@ keeps its own reservation order, and only the bound becomes shared.
 
 ## Implementation sequence
 
-**Stage 0 -- bank the collapse.** Complete, `f6ee81ad`. Six rendered rows with a
-discriminating nonzero control, plus the nonzero bottom-band ink proving label
-content still draws into the reserved region.
+**Stage 0 -- bank the collapse and the corpus ceiling.** Complete. Six rendered
+rows with a discriminating nonzero control (`f6ee81ad`), plus the nonzero
+bottom-band ink proving label content still draws into the reserved region; and
+the 275-sample band-fraction sweep from which `PLOT_MIN_SHARE` is banked. Stage 1
+re-runs the sweep rather than trusting these numbers if the corpus has moved.
 
 **Stage 1 -- bound the allocation.** Introduce `PLOT_MIN_SHARE` and the bounded
 subtraction in `plot_area`, leaving every figure whose bands already fit
@@ -198,9 +219,19 @@ bounded values and assert the zero rows are now unreachable.
 4. **Requirements consult no geometry.** The requirement computation still takes
    domain, axis type, placement, and font size only. Structural, over the
    production signature, as PRODUCT-0127 gate 9 established.
-5. **Figures that already fit do not move.** Every existing UAT capture, oracle,
-   and banked geometry is byte-identical. The bound is reachable only by a
-   figure that would otherwise have collapsed.
+5. **Movement is bounded, enumerated, and one-directional.** Four parts, all
+   required:
+
+   - every figure whose bands fit under the bound is byte-identical;
+   - every figure that moves is **enumerated** in the record -- at banking time
+     that is exactly the three `grid_tiled` samples at 0.8873;
+   - every movement **increases** the plot extent, never decreases it;
+   - no figure ends below the 15% share.
+
+   The one-directional clause is what makes the enumeration principled rather
+   than a carve-out: the bound can only ever subtract from a band, so any figure
+   it touches gains plot area. A moved figure that lost extent would mean the
+   bound was applied to the wrong quantity.
 6. **Overflow clips rather than relocates.** No label acquires a translation,
    scale, or alignment it did not have before, and none is dropped to make it
    fit. Each label keeps the same origin *relative to its own tick*, and each
@@ -217,8 +248,10 @@ bounded values and assert the zero rows are now unreachable.
 8. **Grid cells remain congruent.** A faceted figure whose shared band would
    exceed the grid bounds once, not per cell; cell geometry stays equal.
 9. **The bound is a banked constant with a stated basis.** `PLOT_MIN_SHARE` is
-   justified by a Stage 0 measurement, and a test pins the share it guarantees
-   at the banked figure sizes.
+   0.15, and a test pins both the share it guarantees at the banked figure sizes
+   and the corpus ceiling it was derived from. If a future figure legitimately
+   needs more than 85% of an axis in bands, that ceiling assertion fails and the
+   constant is re-banked deliberately rather than drifting.
 
 ## Stop conditions
 
@@ -276,6 +309,13 @@ member two opposite meanings.
 Long labels stop being able to erase a plot. On a small pane they will be
 clipped instead, which is worse-looking and strictly more informative: the
 figure still shows its marks, and the truncated text names its own cause.
+
+What the reader gets back is small. The worst banked case rises from nothing to
+24 px, and the three moved grid samples gain about four percentage points of
+height each. That modesty is the measurement talking: the corpus tolerates a
+0.1127 ceiling before anything moves at all, and 0.15 is the least that clears
+it. A larger share is available whenever the arc decides those existing figures
+should move too -- the sweep is repeatable, and the next gap is at 0.38.
 
 The durable change is the distinction. Every band record so far has reasoned
 about what labels *need*, and the code has silently equated that with what they
