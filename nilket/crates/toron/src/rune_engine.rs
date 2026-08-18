@@ -957,7 +957,7 @@ pub fn time_bucket(interval_str: String, ts: RuneExpr) -> VmResult<RuneExpr> {
 		return VmResult::panic(format!("unsupported time_bucket interval: {interval_str}"));
 	};
 	VmResult::Ok(RuneExpr {
-		expr: Expr::TimeBucket(interval, Box::new(ts.expr)),
+		expr: crate::ir::time_bucket_scalar_function(interval, ts.expr),
 	})
 }
 

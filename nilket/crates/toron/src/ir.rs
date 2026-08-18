@@ -530,6 +530,22 @@ pub fn time_bucket_interval_from_literal(literal: &str) -> Option<std::time::Dur
 	}
 }
 
+/// Builds the registry form of `TIME_BUCKET`. Both surfaces resolve the
+/// interval through [`time_bucket_interval_from_literal`] first, so the
+/// allowlist stays in one place and the constant reaches the executor already
+/// parsed.
+pub fn time_bucket_scalar_function(interval: std::time::Duration, input: Expr) -> Expr {
+	Expr::ScalarFunction {
+		id: ScalarFunctionId::TimeBucket,
+		args: vec![
+			Expr::Literal(ScalarValue::Interval(
+				i64::try_from(interval.as_nanos()).ok(),
+			)),
+			input,
+		],
+	}
+}
+
 pub fn nanos_per_timestamp_unit(unit: TimeUnit) -> Option<i64> {
 	match unit {
 		TimeUnit::Second => Some(1_000_000_000),
@@ -890,7 +906,6 @@ pub enum Expr {
 		id: ScalarFunctionId,
 		args: Vec<Expr>,
 	},
-	TimeBucket(std::time::Duration, Box<Expr>),
 	AtTimeZone(Box<Expr>, String),
 	Extract(TemporalExtractField, Box<Expr>),
 	DateTrunc(TemporalTruncField, Box<Expr>),
@@ -930,7 +945,6 @@ impl Expr {
 			| Self::IsNull(inner)
 			| Self::IsNotNull(inner)
 			| Self::Like { expr: inner, .. }
-			| Self::TimeBucket(_, inner)
 			| Self::AtTimeZone(inner, _)
 			| Self::Extract(_, inner)
 			| Self::DateTrunc(_, inner) => inner.is_deterministic(),
@@ -977,7 +991,6 @@ impl Expr {
 			| Self::Div(_, _)
 			| Self::Like { .. }
 			| Self::Case { .. }
-			| Self::TimeBucket(_, _)
 			| Self::AtTimeZone(_, _)
 			| Self::Extract(_, _)
 			| Self::DateTrunc(_, _) => false,

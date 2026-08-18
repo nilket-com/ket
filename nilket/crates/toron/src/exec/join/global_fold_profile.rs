@@ -512,7 +512,6 @@ fn expression_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
-		| BoundExprNode::TimeBucket { input, .. }
 		| BoundExprNode::AtTimeZone { input, .. }
 		| BoundExprNode::Extract { input, .. }
 		| BoundExprNode::DateTrunc { input, .. } => vec![*input],
@@ -553,7 +552,6 @@ fn expression_node_kind(node: &BoundExprNode) -> &'static str {
 		BoundExprNode::Like { .. } => "like",
 		BoundExprNode::Case { .. } => "case",
 		BoundExprNode::ScalarFunction { .. } => "scalar_function",
-		BoundExprNode::TimeBucket { .. } => "time_bucket",
 		BoundExprNode::AtTimeZone { .. } => "at_time_zone",
 		BoundExprNode::Extract { .. } => "extract",
 		BoundExprNode::DateTrunc { .. } => "date_trunc",

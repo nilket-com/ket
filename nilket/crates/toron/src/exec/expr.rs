@@ -314,10 +314,6 @@ impl Executor {
 					.collect::<Result<Vec<_>, ExecutionError>>()?;
 				evaluate_scalar_function(*id, &args, batch.num_rows())
 			}
-			Expr::TimeBucket(interval, inner) => {
-				let arr = self.evaluate_expr(inner, batch)?;
-				evaluate_time_bucket(*interval, &arr)
-			}
 			Expr::AtTimeZone(inner, zone) => {
 				let arr = self.evaluate_expr(inner, batch)?;
 				evaluate_at_time_zone(&arr, zone)
@@ -450,10 +446,6 @@ impl Executor {
 						.map(|arg| evaluated_child(&outputs, *arg))
 						.collect::<Result<Vec<_>, ExecutionError>>()?;
 					evaluate_scalar_function(*id, &args, batch.num_rows())?
-				}
-				BoundExprNode::TimeBucket { interval, input } => {
-					let arr = evaluated_child(&outputs, *input)?;
-					evaluate_time_bucket(*interval, &arr)?
 				}
 				BoundExprNode::AtTimeZone { input, zone } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -745,6 +737,20 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_char_length(&args[0]),
 		(
+			ScalarFunctionEvaluator::TimeBucket,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => {
+			if args[1].is_empty() {
+				return evaluate_time_bucket(std::time::Duration::from_millis(1), &args[1]);
+			}
+			// The binder proved the interval is a positive interval literal, so
+			// the constant array repeats one value. `evaluate_time_bucket` stays
+			// the single implementation of the bucket arithmetic.
+			let nanos = constant_interval_nanos(&args[0])?;
+			evaluate_time_bucket(std::time::Duration::from_nanos(nanos), &args[1])
+		}
+		(
 			ScalarFunctionEvaluator::Substring,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -811,6 +817,7 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Sign
 			| ScalarFunctionEvaluator::Sqrt
 			| ScalarFunctionEvaluator::Substring
+			| ScalarFunctionEvaluator::TimeBucket
 			| ScalarFunctionEvaluator::Trim
 			| ScalarFunctionEvaluator::Upper
 			| ScalarFunctionEvaluator::Greatest
@@ -1487,6 +1494,25 @@ fn evaluate_like(
 
 /// Reads a bound that the binder already proved constant. Callers must handle
 /// the empty batch first: there is no row 0 to read.
+/// An interval literal materialises as a duration array, not an integer one.
+/// Reading it as an integer would fail at run time for every bucket.
+fn constant_interval_nanos(argument: &ArrayRef) -> Result<u64, ExecutionError> {
+	let nanos = argument
+		.as_any()
+		.downcast_ref::<DurationNanosecondArray>()
+		.filter(|values| values.is_valid(0))
+		.map(|values| values.value(0))
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!(
+				"internal: TIME_BUCKET interval is not a constant interval after binding, got {:?}",
+				argument.data_type()
+			),
+		})?;
+	u64::try_from(nanos).map_err(|_| ExecutionError::InvalidExpression {
+		message: format!("TIME_BUCKET requires a positive interval, got {nanos}"),
+	})
+}
+
 fn constant_integer_argument(
 	argument: &ArrayRef,
 	role: &'static str,
@@ -3216,9 +3242,9 @@ mod tests {
 
 		let bucketed = executor
 			.evaluate_expr(
-				&Expr::TimeBucket(
+				&crate::ir::time_bucket_scalar_function(
 					std::time::Duration::from_secs(1),
-					Box::new(Expr::column("ts")),
+					Expr::column("ts"),
 				),
 				&batch,
 			)
@@ -3232,9 +3258,9 @@ mod tests {
 		assert!(values.is_null(2), "null must pass through");
 
 		let zero = executor.evaluate_expr(
-			&Expr::TimeBucket(
+			&crate::ir::time_bucket_scalar_function(
 				std::time::Duration::from_secs(0),
-				Box::new(Expr::column("ts")),
+				Expr::column("ts"),
 			),
 			&batch,
 		);

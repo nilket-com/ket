@@ -119,10 +119,6 @@ pub enum BoundExprNode {
 		id: ScalarFunctionId,
 		args: Vec<BoundExprId>,
 	},
-	TimeBucket {
-		interval: std::time::Duration,
-		input: BoundExprId,
-	},
 	AtTimeZone {
 		input: BoundExprId,
 		zone: String,
@@ -643,16 +639,6 @@ impl BoundExprProgramBuilder {
 		self.append_node(BoundExprNode::ScalarFunction { id, args }, output_type)
 	}
 
-	pub fn append_time_bucket(
-		&mut self,
-		interval: std::time::Duration,
-		input: BoundExprId,
-		output_type: DataType,
-	) -> BoundExprId {
-		self.assert_existing_child(input);
-		self.append_node(BoundExprNode::TimeBucket { interval, input }, output_type)
-	}
-
 	pub fn append_at_time_zone(
 		&mut self,
 		input: BoundExprId,
@@ -882,8 +868,7 @@ impl BoundExprProgram {
 						.map(|nullability| nullability.into_iter().any(|nullable| nullable)),
 				}
 			}
-			BoundExprNode::TimeBucket { input, .. }
-			| BoundExprNode::AtTimeZone { input, .. }
+			BoundExprNode::AtTimeZone { input, .. }
 			| BoundExprNode::Extract { input, .. }
 			| BoundExprNode::DateTrunc { input, .. } => self.node_nullable(*input),
 		}
@@ -1043,9 +1028,6 @@ impl BoundExprProgram {
 					.collect::<Vec<_>>()
 					.join(", ")
 			),
-			BoundExprNode::TimeBucket { interval, input } => {
-				format!("TIME_BUCKET({interval:?}, {})", self.pretty_node(*input))
-			}
 			BoundExprNode::AtTimeZone { input, zone } => {
 				format!("AT_TIME_ZONE({}, {zone:?})", self.pretty_node(*input))
 			}
@@ -1081,7 +1063,6 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
-		| BoundExprNode::TimeBucket { input, .. }
 		| BoundExprNode::AtTimeZone { input, .. }
 		| BoundExprNode::Extract { input, .. }
 		| BoundExprNode::DateTrunc { input, .. } => vec![*input],

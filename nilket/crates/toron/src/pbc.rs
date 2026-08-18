@@ -163,11 +163,6 @@ impl PbcCompiler {
 						metadata.sql_name
 					)));
 				}
-				BoundExprNode::TimeBucket { .. } => {
-					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
-						"TIME_BUCKET is not PBC-eligible".to_string(),
-					));
-				}
 				BoundExprNode::AtTimeZone { .. }
 				| BoundExprNode::Extract { .. }
 				| BoundExprNode::DateTrunc { .. } => {
@@ -242,7 +237,6 @@ impl PbcCompiler {
 			| BoundExprNode::Like { .. }
 			| BoundExprNode::Case { .. }
 			| BoundExprNode::ScalarFunction { .. }
-			| BoundExprNode::TimeBucket { .. }
 			| BoundExprNode::AtTimeZone { .. }
 			| BoundExprNode::Extract { .. }
 			| BoundExprNode::DateTrunc { .. } => {
@@ -573,7 +567,14 @@ mod tests {
 			(
 				program(|builder| {
 					let ts = column(builder, "ts", 4, DataType::Int64, true);
-					builder.append_time_bucket(Duration::from_secs(60), ts, DataType::Int64)
+					let interval = builder.append_literal(ScalarValue::Interval(Some(
+						Duration::from_secs(60).as_nanos() as i64,
+					)));
+					builder.append_scalar_function(
+						crate::ir::ScalarFunctionId::TimeBucket,
+						vec![interval, ts],
+						DataType::Int64,
+					)
 				}),
 				PushdownDeclineReason::ExpressionShapeUnsupported(
 					"TIME_BUCKET is not PBC-eligible".to_string(),

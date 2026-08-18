@@ -4952,7 +4952,6 @@ fn collect_program_node_columns(
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
 		| Some(BoundExprNode::Like { expr: input, .. })
-		| Some(BoundExprNode::TimeBucket { input, .. })
 		| Some(BoundExprNode::AtTimeZone { input, .. })
 		| Some(BoundExprNode::Extract { input, .. })
 		| Some(BoundExprNode::DateTrunc { input, .. }) => {
@@ -5146,26 +5145,6 @@ fn bind_expr_into_program(
 		}
 		Expr::ScalarFunction { id, args } => {
 			bind_scalar_function(builder, input_schema, ctx, *id, args)
-		}
-		Expr::TimeBucket(interval, inner) => {
-			let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
-			// A named logical type over Int64 carries units that are not Unix
-			// milliseconds; bucketing one would silently reinterpret it. FLOOR
-			// refuses these for the same reason.
-			if !builder
-				.node_logical_type(inner)
-				.is_some_and(LogicalTypeId::is_naked)
-			{
-				return Err(BindingError::TypeMismatch {
-					message: "TimeBucket does not accept named logical types".to_string(),
-				});
-			}
-			if builder.node_type(inner) != Some(&DataType::Int64) {
-				return Err(BindingError::TypeMismatch {
-					message: "TimeBucket expects Int64 (ms) input".to_string(),
-				});
-			}
-			Ok(builder.append_time_bucket(*interval, inner, DataType::Int64))
 		}
 		Expr::AtTimeZone(inner, zone) => bind_at_time_zone(builder, input_schema, ctx, inner, zone),
 		Expr::Extract(field, inner) => {

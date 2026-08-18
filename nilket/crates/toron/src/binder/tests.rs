@@ -476,9 +476,9 @@ async fn binder_binds_time_bucket_without_the_experimental_flag() {
 			projection: None,
 		}),
 		output_names: vec![None],
-		exprs: vec![Expr::TimeBucket(
+		exprs: vec![crate::ir::time_bucket_scalar_function(
 			std::time::Duration::from_secs(60),
-			Box::new(Expr::column("ts")),
+			Expr::column("ts"),
 		)],
 	};
 

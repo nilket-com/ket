@@ -189,6 +189,36 @@ pub(super) fn bind_scalar_function(
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
 		}
+		ScalarFunctionSignature::Int64MillisWithConstantInterval => {
+			let [interval, input] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			// A named logical type over Int64 carries units that are not Unix
+			// milliseconds; bucketing one would silently reinterpret it.
+			if !builder
+				.node_logical_type(*input)
+				.is_some_and(LogicalTypeId::is_naked)
+			{
+				return Err(BindingError::TypeMismatch {
+					message: "TimeBucket does not accept named logical types".to_string(),
+				});
+			}
+			if builder.node_type(*input) != Some(&DataType::Int64) {
+				return Err(BindingError::TypeMismatch {
+					message: "TimeBucket expects Int64 (ms) input".to_string(),
+				});
+			}
+			// The interval must be constant so the executor can read it once.
+			// Positivity is deliberately *not* checked here: it has always been
+			// an evaluation-time refusal, and moving it earlier would change the
+			// contract inside a migration.
+			if !matches!(builder.literal(*interval), Some(ScalarValue::Interval(_))) {
+				return Err(BindingError::TypeMismatch {
+					message: "TIME_BUCKET interval must be an interval literal".to_string(),
+				});
+			}
+			Ok(builder.append_scalar_function(id, bound_args, DataType::Int64))
+		}
 		ScalarFunctionSignature::NiladicFloat => {
 			// Nothing to type-check: the arity gate already proved there are no
 			// arguments, and the output type is the registration's own.

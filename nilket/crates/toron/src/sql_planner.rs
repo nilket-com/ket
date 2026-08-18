@@ -6876,7 +6876,7 @@ impl SqlPlanner {
 							));
 						}
 					};
-					Ok(Expr::TimeBucket(interval, Box::new(ts)))
+					Ok(crate::ir::time_bucket_scalar_function(interval, ts))
 				}
 				None => self
 					.lower_scalar_function(f)?
@@ -7358,7 +7358,6 @@ fn validate_hidden_sort_key_refs(
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner) => validate_hidden_sort_key_refs(inner, visible_names),
@@ -8199,11 +8198,6 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			18u8.hash(state);
 			hash_expr_structural(inner, state);
 		}
-		Expr::TimeBucket(interval, inner) => {
-			19u8.hash(state);
-			interval.hash(state);
-			hash_expr_structural(inner, state);
-		}
 		Expr::InList {
 			expr,
 			list,
@@ -8356,9 +8350,6 @@ pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 		(Expr::Not(left), Expr::Not(right))
 		| (Expr::IsNull(left), Expr::IsNull(right))
 		| (Expr::IsNotNull(left), Expr::IsNotNull(right)) => expr_structural_eq(left, right),
-		(Expr::TimeBucket(left_interval, left), Expr::TimeBucket(right_interval, right)) => {
-			left_interval == right_interval && expr_structural_eq(left, right)
-		}
 		(Expr::AtTimeZone(left, left_zone), Expr::AtTimeZone(right, right_zone)) => {
 			left_zone == right_zone && expr_structural_eq(left, right)
 		}
@@ -8744,7 +8735,6 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::TimeBucket(_, inner)
 		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner) => expr_contains_qualified_column(inner),
@@ -9791,10 +9781,6 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 				.map(canonical_aggregate_signature_expr)
 				.collect(),
 		},
-		Expr::TimeBucket(interval, inner) => Expr::TimeBucket(
-			*interval,
-			Box::new(canonical_aggregate_signature_expr(inner)),
-		),
 		Expr::AtTimeZone(inner, zone) => Expr::AtTimeZone(
 			Box::new(canonical_aggregate_signature_expr(inner)),
 			zone.clone(),
@@ -11820,7 +11806,6 @@ mod tests {
 			| Expr::Not(expr)
 			| Expr::IsNull(expr)
 			| Expr::IsNotNull(expr)
-			| Expr::TimeBucket(_, expr)
 			| Expr::AtTimeZone(expr, _)
 			| Expr::Extract(_, expr)
 			| Expr::DateTrunc(_, expr)

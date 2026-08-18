@@ -616,7 +616,10 @@ pub(crate) fn adr305_substring_is_literal_bounded_and_residual_only() {
 	// signature rule rather than in a dedicated Expr variant.
 	let registry = std::fs::read_to_string(manifest_dir().join("src/ir/scalar_function.rs"))
 		.expect("read registry");
-	assert!(!ir.contains("Substring {"), "SUBSTRING is no longer an Expr variant");
+	assert!(
+		!ir.contains("Substring {"),
+		"SUBSTRING is no longer an Expr variant"
+	);
 	assert!(!execution_ir.contains("BoundExprNode::Substring"));
 	assert!(registry.contains("const SUBSTRING: ScalarFunctionMetadata"));
 	assert!(registry.contains("StringWithConstantBounds"));

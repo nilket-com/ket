@@ -3569,9 +3569,9 @@ async fn time_bucket_floors_pre_epoch_timestamps_and_refuses_nonpositive_interva
 			table: TableRef::new("sales"),
 			projection: None,
 		}),
-		exprs: vec![Expr::TimeBucket(
+		exprs: vec![toron::ir::time_bucket_scalar_function(
 			std::time::Duration::from_secs(secs),
-			Box::new(Expr::Literal(ScalarValue::Int64(Some(value)))),
+			Expr::Literal(ScalarValue::Int64(Some(value))),
 		)],
 		output_names: vec![None],
 	};
@@ -3613,9 +3613,9 @@ async fn time_bucket_floors_pre_epoch_timestamps_and_refuses_nonpositive_interva
 			table: TableRef::new("sales"),
 			projection: None,
 		}),
-		exprs: vec![Expr::TimeBucket(
+		exprs: vec![toron::ir::time_bucket_scalar_function(
 			std::time::Duration::from_secs(60),
-			Box::new(Expr::Literal(ScalarValue::Int64(None))),
+			Expr::Literal(ScalarValue::Int64(None)),
 		)],
 		output_names: vec![None],
 	};
@@ -3721,9 +3721,9 @@ async fn time_bucket_refuses_timestamp_and_float_inputs() {
 			table: TableRef::new("sales"),
 			projection: None,
 		}),
-		exprs: vec![Expr::TimeBucket(
+		exprs: vec![toron::ir::time_bucket_scalar_function(
 			std::time::Duration::from_secs(60),
-			Box::new(expr),
+			expr,
 		)],
 		output_names: vec![None],
 	};
@@ -3798,12 +3798,12 @@ async fn time_bucket_refuses_named_logical_types() {
 			table: TableRef::new("sales"),
 			projection: None,
 		}),
-		exprs: vec![Expr::TimeBucket(
+		exprs: vec![toron::ir::time_bucket_scalar_function(
 			std::time::Duration::from_secs(60),
-			Box::new(Expr::LogicalAscription {
+			Expr::LogicalAscription {
 				expr: Box::new(Expr::column("id")),
 				logical_type: CUSTOMER_ID_LOGICAL_TYPE,
-			}),
+			},
 		)],
 		output_names: vec![None],
 	};

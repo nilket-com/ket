@@ -129,11 +129,23 @@ fn valid_time_bucket_still_lowers() {
 		panic!("expected project");
 	};
 	assert_eq!(exprs.len(), 1);
-	let Expr::TimeBucket(interval, inner) = &exprs[0] else {
+	// ADR 553: TIME_BUCKET lowers through the registry, carrying its interval
+	// as a constant argument. Only the reading moved; the contract asserted —
+	// a 1h bucket over `ts` — is unchanged.
+	let Expr::ScalarFunction { id, args } = &exprs[0] else {
 		panic!("expected time bucket");
 	};
-	assert_eq!(*interval, Duration::from_secs(3600));
-	assert_column(inner, "ts");
+	assert_eq!(*id, toron::ir::ScalarFunctionId::TimeBucket);
+	assert!(
+		matches!(
+			&args[0],
+			Expr::Literal(ScalarValue::Interval(Some(nanos)))
+				if *nanos == Duration::from_secs(3600).as_nanos() as i64
+		),
+		"expected a 1h constant interval, got {:?}",
+		args[0]
+	);
+	assert_column(&args[1], "ts");
 }
 
 #[test]

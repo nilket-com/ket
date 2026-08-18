@@ -29,6 +29,7 @@ pub enum ScalarFunctionId {
 	Sign,
 	Sqrt,
 	Substring,
+	TimeBucket,
 	Trim,
 	Upper,
 	WidthBucket,
@@ -125,6 +126,17 @@ pub enum ScalarFunctionSignature {
 	/// remaining grandfathered variant carries a constant of some kind, so this
 	/// choice is the one that decides whether they can migrate at all.
 	StringWithConstantBounds,
+	/// A constant interval followed by `Int64` Unix milliseconds, producing
+	/// `Int64`. The interval is a constant argument like SUBSTRING's bounds but
+	/// carries a value rather than a count, which is what this registration
+	/// proves the model handles.
+	///
+	/// The input is deliberately not a timestamp type: `TIME_BUCKET` has always
+	/// refused those, and a named logical type over `Int64` is refused too
+	/// because its units are not Unix milliseconds. The output type does not
+	/// depend on the constant's value — `AT TIME ZONE` is the case that would,
+	/// and it is a separate decision.
+	Int64MillisWithConstantInterval,
 }
 
 /// How NULL inputs affect the output.
@@ -161,6 +173,7 @@ pub enum ScalarFunctionEvaluator {
 	Sign,
 	Sqrt,
 	Substring,
+	TimeBucket,
 	Trim,
 	Upper,
 	WidthBucket,
@@ -468,6 +481,20 @@ const SUBSTRING: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Substring,
 };
 
+const TIME_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::TimeBucket,
+	sql_name: "TIME_BUCKET",
+	sql_aliases: &[],
+	rune_name: "time_bucket",
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::Int64MillisWithConstantInterval,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::TimeBucket,
+};
+
 /// The complete scalar-function registry.
 pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	ABS,
@@ -486,6 +513,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	SIGN,
 	SQRT,
 	SUBSTRING,
+	TIME_BUCKET,
 	TRIM,
 	UPPER,
 	WIDTH_BUCKET,

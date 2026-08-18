@@ -4,8 +4,7 @@ use std::collections::BTreeSet;
 
 use super::support::*;
 
-const GRANDFATHERED_SCALAR_VARIANTS: &[&str] =
-	&["TimeBucket", "AtTimeZone", "Extract", "DateTrunc"];
+const GRANDFATHERED_SCALAR_VARIANTS: &[&str] = &["AtTimeZone", "Extract", "DateTrunc"];
 
 // Every other Expr form is explicitly classified here. A new variant must be
 // classified in review; it cannot silently enlarge the scalar-function set.
@@ -172,6 +171,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Sign".to_string(),
 			"Sqrt".to_string(),
 			"Substring".to_string(),
+			"TimeBucket".to_string(),
 			"Trim".to_string(),
 			"Upper".to_string(),
 			"WidthBucket".to_string(),

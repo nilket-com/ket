@@ -1069,7 +1069,6 @@ pub(crate) fn adr027_hidden_sort_key_refs_are_visible_outputs() {
 	for op in ["Not", "IsNull", "IsNotNull"] {
 		assert!(validator.contains(&format!("Expr::{op}(inner)")));
 	}
-	assert!(validator.contains("Expr::TimeBucket(_, inner)"));
 	assert!(validator.contains("| Expr::AtTimeZone(inner, _)"));
 	assert!(validator.contains("| Expr::Extract(_, inner)"));
 	assert!(validator.contains("| Expr::DateTrunc(_, inner)"));
@@ -1179,7 +1178,6 @@ pub(crate) fn adr028_aggregate_signature_visitors_are_exhaustive() {
 		"Expr::Not",
 		"Expr::IsNull",
 		"Expr::IsNotNull",
-		"Expr::TimeBucket",
 		"Expr::AtTimeZone",
 		"Expr::Extract",
 		"Expr::DateTrunc",

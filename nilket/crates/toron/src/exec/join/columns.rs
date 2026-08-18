@@ -25,7 +25,6 @@ fn collect_program_node_column_ordinals(
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
 		| Some(BoundExprNode::Like { expr: input, .. })
-		| Some(BoundExprNode::TimeBucket { input, .. })
 		| Some(BoundExprNode::AtTimeZone { input, .. })
 		| Some(BoundExprNode::Extract { input, .. })
 		| Some(BoundExprNode::DateTrunc { input, .. }) => {

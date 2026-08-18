@@ -187,10 +187,6 @@ pub(super) fn offset_bound_node(
 			id,
 			args: args.into_iter().map(offset_id).collect(),
 		},
-		BoundExprNode::TimeBucket { interval, input } => BoundExprNode::TimeBucket {
-			interval,
-			input: offset_id(input),
-		},
 		BoundExprNode::AtTimeZone { input, zone } => BoundExprNode::AtTimeZone {
 			input: offset_id(input),
 			zone,

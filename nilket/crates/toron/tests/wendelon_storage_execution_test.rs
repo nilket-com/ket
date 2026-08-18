@@ -329,9 +329,9 @@ async fn wendelon_declined_time_bucket_filter_matches_in_memory_baseline() {
 				projection: None,
 			}),
 			predicate: Expr::Eq(
-				Box::new(Expr::TimeBucket(
+				Box::new(toron::ir::time_bucket_scalar_function(
 					Duration::from_millis(HOUR_MS as u64),
-					Box::new(Expr::column("ts")),
+					Expr::column("ts"),
 				)),
 				Box::new(Expr::Literal(ScalarValue::Int64(Some(BASE_TS)))),
 			),

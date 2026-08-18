@@ -6294,9 +6294,9 @@ mod tests {
 		});
 		let executor = Executor::new(storage);
 
-		let expr = Expr::TimeBucket(
+		let expr = crate::ir::time_bucket_scalar_function(
 			std::time::Duration::from_secs(3600),
-			Box::new(Expr::column("ts")),
+			Expr::column("ts"),
 		);
 		let result_arr = executor.evaluate_expr(&expr, &batch).unwrap();
 		let bucketed = result_arr.as_any().downcast_ref::<Int64Array>().unwrap();
