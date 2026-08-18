@@ -486,3 +486,89 @@ impl StorageScan for FixtureScan {
 		))
 	}
 }
+
+/// ADR 553: `deterministic` has gated this rewrite since ADR 521, but until
+/// `RANDOM()` was registered every expression in the engine reported itself
+/// pure, so the declining branch had never run. The pair is the evidence: the
+/// same plan shape rewrites with a pure right-side projection and declines with
+/// a non-deterministic one. A decline alone would not distinguish this guard
+/// from any other reason the rewrite might refuse.
+#[tokio::test]
+async fn adr553_non_deterministic_right_chain_declines_while_the_pure_shape_rewrites() {
+	let (mut catalog, _) = fixture(false);
+	catalog
+		.seed_unique_key_evidence(
+			&toron::catalog::TableRef::new("oc_customer"),
+			vec![
+				UniqueKeyProof::verified_snapshot(vec![ColumnOrdinal(0)])
+					.expect("single-column proof"),
+			],
+		)
+		.expect("seed proof");
+
+	let mut config = PlannerConfig::default();
+	config.outer_count_preaggregation = true;
+
+	let pure_predicate = Expr::Gt(
+		Box::new(Expr::column("o_id")),
+		Box::new(Expr::Literal(toron::ir::ScalarValue::Int64(Some(0)))),
+	);
+	let pure = bind(&right_filtered_plan(pure_predicate), &catalog, &config)
+		.await
+		.expect("bind pure");
+	assert!(
+		!matches!(pure, ExecutionPlan::Aggregate { .. }),
+		"a pure right-side filter must still allow the rewrite, or the \
+		 non-deterministic case below proves nothing"
+	);
+
+	let impure_predicate = Expr::Lt(
+		Box::new(Expr::ScalarFunction {
+			id: toron::ir::ScalarFunctionId::Random,
+			args: Vec::new(),
+		}),
+		Box::new(Expr::Literal(toron::ir::ScalarValue::Float64(Some(0.5)))),
+	);
+	let impure = bind(&right_filtered_plan(impure_predicate), &catalog, &config)
+		.await
+		.expect("bind impure");
+	assert!(
+		matches!(impure, ExecutionPlan::Aggregate { .. }),
+		"a non-deterministic right-side filter must decline the rewrite"
+	);
+}
+
+/// The `outer_count_plan` shape with a filter on the right branch, so one
+/// predicate can be swapped between the two arms of the pair. A filter leaves
+/// the right schema intact, which an extra projection would not.
+fn right_filtered_plan(predicate: Expr) -> LogicalPlan {
+	let customer = LogicalPlan::ScanNamed {
+		table: toron::catalog::TableRef::new("oc_customer"),
+		projection: None,
+	};
+	let orders = LogicalPlan::Filter {
+		input: Box::new(LogicalPlan::ScanNamed {
+			table: toron::catalog::TableRef::new("oc_orders"),
+			projection: None,
+		}),
+		predicate,
+	};
+	let joined = LogicalPlan::Join {
+		left: Box::new(customer),
+		right: Box::new(orders),
+		kind: JoinKind::LeftOuter,
+		on: vec![(Expr::column("c_id"), Expr::column("o_cid"))],
+		on_filter: None,
+		null_safe_keys: false,
+		strategy_intent: JoinStrategyIntent::Auto,
+	};
+	LogicalPlan::Aggregate {
+		input: Box::new(LogicalPlan::Exchange {
+			input: Box::new(joined),
+			partition_count: 4,
+			key: vec![Expr::column("c_id")],
+		}),
+		group_expr: vec![Expr::column("c_id")],
+		aggr_expr: vec![(AggregateFunction::Count, vec![Expr::column("o_id")])],
+	}
+}

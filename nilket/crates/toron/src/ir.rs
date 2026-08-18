@@ -910,13 +910,61 @@ impl Expr {
 		Self::Column(ColumnRef::qualified(qualifier, name))
 	}
 
+	/// Whether re-evaluating this expression must produce the same answer.
+	///
+	/// Every child is inspected. A `_ => true` arm here would report
+	/// `RANDOM() < 0.5` as pure, because the non-determinism sits under a
+	/// comparison rather than at the root — and the rules that gate filter
+	/// pushdown, scalar reduction, and outer-count preaggregation on this
+	/// answer would then duplicate or relocate a value that changes each time
+	/// it is read. The match stays exhaustive so a new variant has to state
+	/// which side it is on.
 	pub fn is_deterministic(&self) -> bool {
 		match self {
+			Self::Column(_) | Self::Literal(_) | Self::UntypedNull => true,
 			Self::ScalarFunction { id, args } => {
 				scalar_function_metadata(*id).deterministic
 					&& args.iter().all(Self::is_deterministic)
 			}
-			_ => true,
+			Self::LogicalAscription { expr: inner, .. }
+			| Self::SqlLogicalCast { expr: inner, .. }
+			| Self::SqlConvert { expr: inner, .. }
+			| Self::Cast(inner, _)
+			| Self::TryCast(inner, _)
+			| Self::Not(inner)
+			| Self::IsNull(inner)
+			| Self::IsNotNull(inner)
+			| Self::Like { expr: inner, .. }
+			| Self::Substring { input: inner, .. }
+			| Self::TimeBucket(_, inner)
+			| Self::AtTimeZone(inner, _)
+			| Self::Extract(_, inner)
+			| Self::DateTrunc(_, inner) => inner.is_deterministic(),
+			Self::Add(left, right)
+			| Self::Sub(left, right)
+			| Self::Mul(left, right)
+			| Self::Div(left, right)
+			| Self::Eq(left, right)
+			| Self::Neq(left, right)
+			| Self::Lt(left, right)
+			| Self::Lte(left, right)
+			| Self::Gt(left, right)
+			| Self::Gte(left, right)
+			| Self::And(left, right)
+			| Self::Or(left, right) => left.is_deterministic() && right.is_deterministic(),
+			Self::InList { expr, list, .. } => {
+				expr.is_deterministic() && list.iter().all(Self::is_deterministic)
+			}
+			Self::Case {
+				when_then,
+				else_expr,
+			} => {
+				when_then.iter().all(|(condition, result)| {
+					condition.is_deterministic() && result.is_deterministic()
+				}) && else_expr
+					.as_ref()
+					.is_none_or(|expr| expr.is_deterministic())
+			}
 		}
 	}
 

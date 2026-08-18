@@ -171,6 +171,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Ln".to_string(),
 			"Mod".to_string(),
 			"Pow".to_string(),
+			"Random".to_string(),
 			"Round".to_string(),
 			"Lower".to_string(),
 			"Sign".to_string(),

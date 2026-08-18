@@ -2505,6 +2505,121 @@ async fn adr553_greatest_rejects_mixed_argument_types() {
 	);
 }
 
+/// `RANDOM()` is the registry's first non-deterministic entry. Its rows cannot
+/// be digest-compared across surfaces — that is the whole point — so the
+/// equivalence assertion is on the bound plan alone.
+#[tokio::test]
+async fn adr553_sql_and_rune_random_share_a_bound_plan() {
+	let sql_logical = plan_sql("SELECT RANDOM() FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([random()])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL RANDOM");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune random");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(sql_bound.schema().field(0).data_type(), &DataType::Float64);
+}
+
+#[tokio::test]
+async fn adr553_random_is_the_registry_s_first_non_deterministic_entry() {
+	let non_deterministic = Expr::ScalarFunction {
+		id: ScalarFunctionId::Random,
+		args: Vec::new(),
+	};
+	assert!(
+		!non_deterministic.is_deterministic(),
+		"RANDOM must report itself non-deterministic"
+	);
+	// Non-determinism is infectious through argument position: an otherwise
+	// pure function carrying RANDOM cannot be treated as pure either.
+	let carrier = Expr::ScalarFunction {
+		id: ScalarFunctionId::Abs,
+		args: vec![non_deterministic],
+	};
+	assert!(!carrier.is_deterministic(), "ABS(RANDOM()) is not pure");
+	assert!(
+		Expr::ScalarFunction {
+			id: ScalarFunctionId::Abs,
+			args: vec![Expr::column("amount")],
+		}
+		.is_deterministic(),
+		"an ordinary registration stays deterministic"
+	);
+}
+
+/// Non-determinism has to survive nesting. Before `RANDOM()` existed nothing
+/// could reach these paths, and `is_deterministic` answered `true` for every
+/// form but a bare call — so `RANDOM() < 0.5` read as pure and the rules that
+/// gate on it would have pushed or duplicated it.
+#[tokio::test]
+async fn adr553_non_determinism_survives_every_expression_form() {
+	let random = Expr::ScalarFunction {
+		id: ScalarFunctionId::Random,
+		args: Vec::new(),
+	};
+	let column = || Box::new(Expr::column("amount"));
+	let impure = [
+		Expr::Lt(Box::new(random.clone()), column()),
+		Expr::Add(Box::new(random.clone()), column()),
+		Expr::And(Box::new(random.clone()), column()),
+		Expr::Not(Box::new(random.clone())),
+		Expr::IsNull(Box::new(random.clone())),
+		Expr::Cast(Box::new(random.clone()), DataType::Float32),
+		Expr::InList {
+			expr: column(),
+			list: vec![random.clone()],
+			negated: false,
+		},
+		Expr::Case {
+			when_then: vec![(Box::new(random.clone()), column())],
+			else_expr: None,
+		},
+		Expr::Case {
+			when_then: vec![(column(), column())],
+			else_expr: Some(Box::new(random.clone())),
+		},
+	];
+	for expr in impure {
+		assert!(
+			!expr.is_deterministic(),
+			"non-determinism must not be hidden by nesting: {expr:?}"
+		);
+	}
+
+	// The same shapes without RANDOM stay pure, so the assertions above are
+	// detecting the nested call rather than the wrapper.
+	let pure = [
+		Expr::Lt(column(), column()),
+		Expr::Not(column()),
+		Expr::Case {
+			when_then: vec![(column(), column())],
+			else_expr: Some(column()),
+		},
+	];
+	for expr in pure {
+		assert!(expr.is_deterministic(), "{expr:?} has nothing impure in it");
+	}
+}
+
+#[tokio::test]
+async fn adr553_random_rejects_arguments() {
+	assert_unsupported_message(
+		"SELECT RANDOM(price) FROM sales",
+		"RANDOM expects no arguments, got 1",
+	);
+}
+
 #[tokio::test]
 async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");

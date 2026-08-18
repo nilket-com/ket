@@ -130,6 +130,11 @@ pub(super) fn bind_scalar_function(
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
 		}
+		ScalarFunctionSignature::NiladicFloat => {
+			// Nothing to type-check: the arity gate already proved there are no
+			// arguments, and the output type is the registration's own.
+			Ok(builder.append_scalar_function(id, bound_args, DataType::Float64))
+		}
 		ScalarFunctionSignature::VariadicOrderedSameType => {
 			let [first, rest @ ..] = bound_args.as_slice() else {
 				unreachable!("the registry arity was checked before binding")

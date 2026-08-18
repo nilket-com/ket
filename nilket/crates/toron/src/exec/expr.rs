@@ -320,7 +320,7 @@ impl Executor {
 					.iter()
 					.map(|arg| self.evaluate_expr(arg, batch))
 					.collect::<Result<Vec<_>, ExecutionError>>()?;
-				evaluate_scalar_function(*id, &args)
+				evaluate_scalar_function(*id, &args, batch.num_rows())
 			}
 			Expr::TimeBucket(interval, inner) => {
 				let arr = self.evaluate_expr(inner, batch)?;
@@ -465,7 +465,7 @@ impl Executor {
 						.iter()
 						.map(|arg| evaluated_child(&outputs, *arg))
 						.collect::<Result<Vec<_>, ExecutionError>>()?;
-					evaluate_scalar_function(*id, &args)?
+					evaluate_scalar_function(*id, &args, batch.num_rows())?
 				}
 				BoundExprNode::TimeBucket { interval, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -673,6 +673,7 @@ fn evaluate_bound_unary(op: &BoundUnaryOp, arr: &ArrayRef) -> Result<ArrayRef, E
 fn evaluate_scalar_function(
 	id: ScalarFunctionId,
 	args: &[ArrayRef],
+	num_rows: usize,
 ) -> Result<ArrayRef, ExecutionError> {
 	let metadata = crate::ir::scalar_function_metadata(id);
 	if !metadata.arity.accepts(args.len()) {
@@ -775,6 +776,15 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_ordered_extreme(args, OrderedExtreme::Least, "LEAST"),
 		(
+			ScalarFunctionEvaluator::Random,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => Ok(Arc::new(
+			(0..num_rows)
+				.map(|_| Some(rand::random::<f64>()))
+				.collect::<Float64Array>(),
+		) as ArrayRef),
+		(
 			ScalarFunctionEvaluator::Floor,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -795,6 +805,7 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Upper
 			| ScalarFunctionEvaluator::Greatest
 			| ScalarFunctionEvaluator::Least
+			| ScalarFunctionEvaluator::Random
 			| ScalarFunctionEvaluator::WidthBucket,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Rejects,
@@ -3211,7 +3222,7 @@ mod tests {
 			Some(f64::NEG_INFINITY),
 			None,
 		])) as ArrayRef;
-		let output = evaluate_scalar_function(ScalarFunctionId::Exp, &[input])
+		let output = evaluate_scalar_function(ScalarFunctionId::Exp, &[input], 1)
 			.expect("registered EXP evaluator");
 		let values = output
 			.as_any()

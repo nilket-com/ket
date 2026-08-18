@@ -1050,6 +1050,15 @@ pub fn ln(expr: RuneExpr) -> RuneExpr {
 
 /// Rune spells a variadic call as a list, the way `project` and `case` already
 /// do. SQL's `GREATEST(a, b, c)` is `greatest([a, b, c])` here.
+pub fn random() -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Random,
+			args: Vec::new(),
+		},
+	}
+}
+
 pub fn greatest(args: Vec<RuneExpr>) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1721,6 +1730,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["width_bucket"], width_bucket).build()?;
 	m.function(["greatest"], greatest).build()?;
 	m.function(["least"], least).build()?;
+	m.function(["random"], random).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
@@ -2077,7 +2087,11 @@ fn classify_denied_capability(source: &str) -> Option<CapabilityCategory> {
 		),
 		(
 			CapabilityCategory::Random,
-			&["std::random", "rand::", "random("],
+			// `random(` alone would match this engine's own `random()` scalar
+			// function wherever a script's source appears in an error message,
+			// turning a supported call into a reported security breach. The
+			// denial signal is a foreign *path*, never a bare call.
+			&["std::random", "rand::"],
 		),
 		(CapabilityCategory::Threading, &["std::thread", "thread::"]),
 	];

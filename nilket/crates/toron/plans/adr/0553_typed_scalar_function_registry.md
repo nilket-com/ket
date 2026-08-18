@@ -332,6 +332,39 @@ now — they carry a unit and a zone, which is its own admission decision — an
 Rune spells the variadic call as a list, `greatest([a, b, c])`, as `project` and
 `case` already do.
 
+**`RANDOM()` is the registry's first `deterministic: false`, and admitting it
+exposed a live defect.** It is not ANSI; it is here as the reference
+non-deterministic function, chosen over `CURRENT_TIMESTAMP` because it needs no
+statement clock. It is also the first zero-arity registration, which meant
+threading the batch row count into the evaluator — a niladic function has no
+operand to take its length from.
+
+`deterministic` was never a vacuous field: `Expr::is_deterministic` reads it, and
+seven sites across scalar reduction, outer-count preaggregation, and outer-join
+demotion gate real rewrites on the answer. What was missing was any registration
+that returned `false`, so the declining branch had never executed.
+
+**The first test written against it failed, and the guard was not the problem.**
+`is_deterministic` matched `ScalarFunction` and answered `_ => true` for
+everything else, so it only saw non-determinism at the *root* of an expression.
+`RANDOM() < 0.5` is an `Expr::Lt` and reported itself pure — as would
+`RANDOM() + 1`, `NOT RANDOM()`, `CAST(RANDOM() AS REAL)`, and a `CASE` with
+`RANDOM()` in any branch. Every realistic use is nested, so in practice the
+guards protected nothing. The match is now exhaustive over every `Expr` form with
+no catch-all, so a new variant has to state which side it is on.
+
+The evidence is a pair, not a decline: the same plan shape rewrites with a pure
+right-side filter and declines with a non-deterministic one. A decline on its own
+would not distinguish this guard from any other reason the rewrite might refuse.
+Both the nesting regression and the pair were re-run against the previous
+implementation and both fail there.
+
+**It also collided with the sandbox.** The Rune capability classifier listed
+`random(` as a denial pattern, so this engine's own supported call would have
+been reported as a reached-for capability wherever a script appeared in an error
+message. The pattern is now `rand::` and `std::random` — a foreign *path*, never
+a bare call — with a test that `rand::random()` is still denied.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know

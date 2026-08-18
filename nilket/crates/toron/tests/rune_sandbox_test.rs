@@ -253,6 +253,48 @@ async fn an_ordinary_type_error_is_not_a_capability_denial() {
 	}
 }
 
+/// ADR 553 registered a `random()` scalar function, which collides with the
+/// classifier's old `random(` denial pattern: a supported call appearing in any
+/// error message would have been reported as a reached-for capability. The
+/// signal is a foreign path, and `rand::random()` must still be denied.
+#[tokio::test]
+async fn the_engine_s_own_random_function_is_not_a_denied_capability() {
+	let config = sandbox_config();
+	let engine = RuneEngine::with_config(config).expect("engine");
+
+	let error = engine
+		.execute_script(
+			r#"pub fn main(ctx) { ctx.table("sales").project([random(7)]) }"#,
+			&config,
+		)
+		.await
+		.expect_err("a wrong-arity call should still fail");
+	assert!(
+		!matches!(
+			error,
+			FrontendError::RuneSandbox {
+				kind: RuneSandboxViolation::CapabilityDenied { .. },
+				..
+			}
+		),
+		"calling the engine's own random() wrongly is a type error: {error:?}"
+	);
+
+	let denied = engine
+		.execute_script(
+			r#"pub fn main(ctx) { rand::random(); ctx.table("sales").count() }"#,
+			&config,
+		)
+		.await
+		.expect_err("reaching for the rand crate must still be denied");
+	assert!(matches!(
+		sandbox_error(denied),
+		RuneSandboxViolation::CapabilityDenied {
+			capability: CapabilityCategory::Random
+		}
+	));
+}
+
 #[tokio::test]
 async fn invalid_entrypoint_returns_typed_error() {
 	let config = sandbox_config();

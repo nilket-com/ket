@@ -24,6 +24,7 @@ pub enum ScalarFunctionId {
 	Lower,
 	Mod,
 	Pow,
+	Random,
 	Round,
 	Sign,
 	Sqrt,
@@ -53,6 +54,7 @@ impl ScalarFunctionArity {
 
 	pub const fn description(self) -> &'static str {
 		match self {
+			Self::Exact(0) => "no arguments",
 			Self::Exact(1) => "exactly one argument",
 			Self::Exact(2) => "exactly two arguments",
 			Self::Exact(4) => "exactly four arguments",
@@ -108,6 +110,10 @@ pub enum ScalarFunctionSignature {
 	/// comparison is defined for the engine's ordered value types; temporal
 	/// forms are a separate admission because they carry a unit and a zone.
 	VariadicOrderedSameType,
+	/// No arguments at all, producing a float. The row count comes from the
+	/// batch rather than from an operand, which is what makes a niladic
+	/// function different in kind from every rule above.
+	NiladicFloat,
 }
 
 /// How NULL inputs affect the output.
@@ -139,6 +145,7 @@ pub enum ScalarFunctionEvaluator {
 	Lower,
 	Mod,
 	Pow,
+	Random,
 	Round,
 	Sign,
 	Sqrt,
@@ -416,6 +423,25 @@ const LEAST: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Least,
 };
 
+const RANDOM: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Random,
+	// Not ANSI. `RANDOM` is a vendor spelling admitted here as the reference
+	// non-deterministic function, not as a standards-completeness claim.
+	sql_name: "RANDOM",
+	sql_aliases: &[],
+	rune_name: "random",
+	arity: ScalarFunctionArity::Exact(0),
+	signature: ScalarFunctionSignature::NiladicFloat,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	// The first `false` in the registry. Five planner rules already read this
+	// through `Expr::is_deterministic`; until now none of them had a case that
+	// exercised the declining branch.
+	deterministic: false,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Random,
+};
+
 /// The complete scalar-function registry.
 pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	ABS,
@@ -429,6 +455,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	LOWER,
 	MOD,
 	POW,
+	RANDOM,
 	ROUND,
 	SIGN,
 	SQRT,
