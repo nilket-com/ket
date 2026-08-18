@@ -87,6 +87,21 @@ const WHITE: [u8; 3] = [255, 255, 255];
 const PRODUCT_0077_BANKED_VERTICAL_SPILL: usize = 88;
 const PRODUCT_0077_BANKED_HORIZONTAL_SPILL: usize = 111;
 const PRODUCT_0083_BANKED_MEDIAN_DETAIL: usize = 0;
+/// PRODUCT-0132 Stage 0, banked 2026-08-18 on the designated adapter.
+///
+/// With the x-axis title hidden, the only ink a rotated axis leaves below the
+/// plot is the three 5 px tick-mark stubs (`plot/common.rs:2814`) under a
+/// `count(2)` placement: 31 px, at either sign. Zero of it is label ink.
+/// The unrotated control inks 1457 px in the same region, so the ~1426 px
+/// difference is exactly the rotated labels that never rasterize.
+///
+/// Stage 2 inverts the assertion below and must keep this value cited beside
+/// the repaired one: once the fix lands, the red proof stops reproducing, and
+/// this constant is the only remaining evidence that gate 1 ever discriminated.
+const PRODUCT_0132_TICK_MARK_RESIDUAL: usize = 31;
+const PRODUCT_0132_PRE_REPAIR_ROTATED_TICK_INK: (usize, usize) =
+	(PRODUCT_0132_TICK_MARK_RESIDUAL, PRODUCT_0132_TICK_MARK_RESIDUAL);
+const PRODUCT_0132_BANKED_UNROTATED_TICK_INK: usize = 1457;
 // PRODUCT-0131's pre-bound negative control. These values are retained as
 // evidence even after Stage 1 makes every corresponding plot positive.
 const PRODUCT_0131_PRE_BOUND_HEIGHTS: [[f32; 3]; 2] =
@@ -1943,6 +1958,8 @@ fn main() {
 }
 
 async fn product_0057_renderer_oracle_licenses_are_discriminating() {
+	product_0132_stage_0(&Gpu::acquire().await).await;
+
 	let host = std::fs::read_to_string("/etc/hostname")
 		.expect("PRODUCT-0057: read render-evidence host identity")
 		.trim()
@@ -2626,5 +2643,95 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 		"PRODUCT_0057 text disposition=automated repeat_bytes={} scale_stable=true accepted_ink={accepted_ink}/{repeated_ink}/{large_ink} narrow_ink={narrow_ink} measured_width={:.2}",
 		text.rgba == text_repeat.rgba,
 		text_geometry.column_width,
+	);
+}
+
+/// PRODUCT-0132 Stage 0. A rotated x-tick label is drawn two transforms deep
+/// inside a clip; a rotated y-axis title is drawn once, unnested and unclipped.
+/// This fixture renders both in one figure so the difference is a measurement
+/// rather than an argument. The x-axis title is hidden so that bottom-band ink
+/// is tick ink and nothing else -- its residual is what would let a naive
+/// nonzero check pass.
+fn product_0132_fixture(rotation: f32, y_title: bool) -> (LinePlotKernel, PlotSettings) {
+	let (kernel, model) = product_temporal_count_fixture(rotation);
+	let mut resolved = model.resolve();
+	resolved.title = ResolvedPresence::Hide;
+	resolved.subtitle = ResolvedPresence::Hide;
+	resolved.x_label = ResolvedPresence::Hide;
+	resolved.y_label = if y_title {
+		ResolvedPresence::Show(std::sync::Arc::new("Active accounts".to_owned()))
+	} else {
+		ResolvedPresence::Hide
+	};
+	resolved.x_tick_rotation = TickRotation::new(rotation).expect("stage 0 angle");
+	(kernel, PlotSettings::from_resolved(resolved))
+}
+
+/// Ink below the plot area: with the x-axis title hidden, this is rotated tick
+/// text or nothing.
+fn product_0132_tick_ink(renderer: &mut iced::Renderer, rotation: f32) -> usize {
+	let (kernel, settings) = product_0132_fixture(rotation, false);
+	let (capture, figure, plot) =
+		render_product_kernel_rotation(renderer, Size::new(820, 520), &kernel, settings);
+	capture.luminous_pixels(Rectangle::new(
+		Point::new(figure.x, plot.y + plot.height),
+		Size::new(
+			figure.width,
+			(figure.y + figure.height - (plot.y + plot.height)).max(0.0),
+		),
+	))
+}
+
+/// Ink left of the plot area, with and without the rotated y title. The
+/// difference is the title's own ink, isolated without any geometry reasoning.
+fn product_0132_y_title_ink(renderer: &mut iced::Renderer, rotation: f32) -> usize {
+	let mut measured = [0usize; 2];
+	for (index, y_title) in [true, false].into_iter().enumerate() {
+		let (kernel, settings) = product_0132_fixture(rotation, y_title);
+		let (capture, figure, plot) =
+			render_product_kernel_rotation(renderer, Size::new(820, 520), &kernel, settings);
+		measured[index] = capture.luminous_pixels(Rectangle::new(
+			Point::new(figure.x, figure.y),
+			Size::new((plot.x - figure.x).max(0.0), figure.height),
+		));
+	}
+	measured[0].saturating_sub(measured[1])
+}
+
+async fn product_0132_stage_0(gpu: &Gpu) {
+	let mut r = gpu.renderer(Some(Antialiasing::MSAAx4)).await;
+	let unrotated_ticks = product_0132_tick_ink(&mut r, 0.0);
+	let rotated_ticks_positive = product_0132_tick_ink(&mut r, 45.0);
+	let rotated_ticks_negative = product_0132_tick_ink(&mut r, -45.0);
+	let rotated_title = product_0132_y_title_ink(&mut r, 45.0);
+	println!(
+		"PRODUCT_0132 stage_0 disposition=production unrotated_ticks={unrotated_ticks} \
+		 rotated_ticks=+45:{rotated_ticks_positive}/-45:{rotated_ticks_negative} \
+		 rotated_y_title={rotated_title}"
+	);
+
+	// Positive control 1: unrotated tick text rasterizes, so the measurement
+	// region and the threshold are both pointed at something real.
+	assert_eq!(
+		unrotated_ticks, PRODUCT_0132_BANKED_UNROTATED_TICK_INK,
+		"PRODUCT-0132 the unrotated control must ink the band it measures"
+	);
+	assert!(
+		unrotated_ticks > PRODUCT_0132_TICK_MARK_RESIDUAL * 10,
+		"PRODUCT-0132 gate 1's threshold must sit far above the tick-mark residual"
+	);
+	// Positive control 2: rotated text rasterizes elsewhere in the same figure,
+	// so the defect is the nested clipped path and not rotation as such.
+	assert!(
+		rotated_title > 100,
+		"PRODUCT-0132 the rotated y title must rasterize, got {rotated_title}"
+	);
+	// The red proof. Gate 1's oracle is `rotated ticks ink the band`; on the
+	// unrepaired renderer it draws nothing, at either sign. Stage 2 inverts
+	// these two assertions and keeps the banked pre-repair values beside them.
+	assert_eq!(
+		(rotated_ticks_positive, rotated_ticks_negative),
+		PRODUCT_0132_PRE_REPAIR_ROTATED_TICK_INK,
+		"PRODUCT-0132 pre-repair bank: rotated tick text rasterizes nothing"
 	);
 }
