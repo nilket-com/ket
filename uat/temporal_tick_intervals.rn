@@ -31,9 +31,9 @@ temporal_activity.views([
 	])),
 	view("count-control", figure([
 		title("Count control").font_size(24),
-		subtitle("Count placement with compact 36° tick labels"),
+		subtitle("No tick_every: existing Count placement remains available"),
 		skin("greys_rs2"),
-		x_axis().label("Observed at").label_size(16).tick_size(12).tick_rotation(36),
+		x_axis().label("Observed at").label_size(16),
 		y_axis().label("Active accounts").label_size(16),
 		line("elapsed_at", "hourly_active").stroke_width(2),
 	])),
