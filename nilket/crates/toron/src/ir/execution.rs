@@ -1009,6 +1009,9 @@ impl BoundExprProgram {
 					ScalarFunctionParameter::DateTrunc(payload) => {
 						format!("<{}>", payload.field.as_str())
 					}
+					ScalarFunctionParameter::Trim(payload) => {
+						format!("<{:?}>", payload.where_field)
+					}
 				},
 				args.iter()
 					.map(|arg| self.pretty_node(*arg))

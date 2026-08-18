@@ -685,6 +685,9 @@ fn evaluate_scalar_function(
 				})
 				.and_then(|zone| evaluate_date_trunc(payload.field, zone, &args[0]));
 		}
+		(ScalarFunctionId::Trim, crate::ir::ScalarFunctionParameter::Trim(payload)) => {
+			return evaluate_trim(args, payload.where_field);
+		}
 		_ => {}
 	}
 	if !matches!(parameter, crate::ir::ScalarFunctionParameter::None) {
@@ -1135,6 +1138,82 @@ fn evaluate_unary_string(
 	Err(ExecutionError::InvalidExpression {
 		message: format!("{name} expects a string input, got {:?}", input.data_type()),
 	})
+}
+
+fn evaluate_trim(
+	args: &[ArrayRef],
+	where_field: crate::ir::TrimWhere,
+) -> Result<ArrayRef, ExecutionError> {
+	if let [input] = args {
+		return evaluate_unary_string(input, "TRIM", |value| trim_string(value, None, where_field));
+	}
+	let [input, characters] = args else {
+		return Err(ExecutionError::InvalidExpression {
+			message: "TRIM expects one or two string arguments".to_string(),
+		});
+	};
+	if let (Some(input), Some(characters)) = (
+		input.as_any().downcast_ref::<StringArray>(),
+		characters.as_any().downcast_ref::<StringArray>(),
+	) {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.zip(characters.iter())
+				.map(|(value, chars)| match (value, chars) {
+					(Some(value), Some(chars)) => {
+						Some(trim_string(value, Some(chars), where_field))
+					}
+					_ => None,
+				})
+				.collect::<StringArray>(),
+		) as ArrayRef);
+	}
+	if let (Some(input), Some(characters)) = (
+		input.as_any().downcast_ref::<LargeStringArray>(),
+		characters.as_any().downcast_ref::<LargeStringArray>(),
+	) {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.zip(characters.iter())
+				.map(|(value, chars)| match (value, chars) {
+					(Some(value), Some(chars)) => {
+						Some(trim_string(value, Some(chars), where_field))
+					}
+					_ => None,
+				})
+				.collect::<LargeStringArray>(),
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"TRIM expects its character set to match the input string type, got {:?} and {:?}",
+			input.data_type(),
+			characters.data_type()
+		),
+	})
+}
+
+fn trim_string(value: &str, characters: Option<&str>, where_field: crate::ir::TrimWhere) -> String {
+	match characters {
+		None => match where_field {
+			crate::ir::TrimWhere::Both => value.trim().to_string(),
+			crate::ir::TrimWhere::Leading => value.trim_start().to_string(),
+			crate::ir::TrimWhere::Trailing => value.trim_end().to_string(),
+		},
+		Some(characters) => match where_field {
+			crate::ir::TrimWhere::Both => value
+				.trim_matches(|character| characters.contains(character))
+				.to_string(),
+			crate::ir::TrimWhere::Leading => value
+				.trim_start_matches(|character| characters.contains(character))
+				.to_string(),
+			crate::ir::TrimWhere::Trailing => value
+				.trim_end_matches(|character| characters.contains(character))
+				.to_string(),
+		},
+	}
 }
 
 /// `CHAR_LENGTH` counts characters, not bytes — `OCTET_LENGTH` is the byte
@@ -3700,6 +3779,43 @@ mod tests {
 				.value(0),
 			"hi"
 		);
+	}
+
+	/// The specification form trims a character set from the selected edge;
+	/// treating it as plain whitespace trim would leave the `x` sentinels in
+	/// place and would make LEADING and TRAILING indistinguishable.
+	#[test]
+	fn specification_trim_applies_its_character_set_and_side() {
+		let input = Arc::new(StringArray::from(vec![
+			Some("xxxalpha xxx"),
+			Some("  beta  "),
+			None,
+		])) as ArrayRef;
+		let characters =
+			Arc::new(StringArray::from(vec![Some("x"), Some(" "), Some("x")])) as ArrayRef;
+
+		let leading = super::evaluate_trim(
+			&[input.clone(), characters.clone()],
+			crate::ir::TrimWhere::Leading,
+		)
+		.expect("TRIM LEADING");
+		let leading = leading
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("Utf8 output");
+		assert_eq!(leading.value(0), "alpha xxx");
+		assert_eq!(leading.value(1), "beta  ");
+		assert!(leading.is_null(2), "TRIM must propagate NULL input");
+
+		let trailing = super::evaluate_trim(&[input, characters], crate::ir::TrimWhere::Trailing)
+			.expect("TRIM TRAILING");
+		let trailing = trailing
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("Utf8 output");
+		assert_eq!(trailing.value(0), "xxxalpha ");
+		assert_eq!(trailing.value(1), "  beta");
+		assert!(trailing.is_null(2), "TRIM must propagate NULL input");
 	}
 
 	#[test]

@@ -59,13 +59,22 @@ pub(super) fn bind_scalar_function(
 		}
 		_ => {}
 	}
-	if !matches!(parameter, ScalarFunctionParameter::None) {
-		return Err(BindingError::TypeMismatch {
-			message: format!(
-				"{} does not accept a scalar-function parameter",
-				metadata.sql_name
-			),
-		});
+	match (id, parameter) {
+		(_, ScalarFunctionParameter::None)
+		| (ScalarFunctionId::Trim, ScalarFunctionParameter::Trim(_)) => {}
+		(ScalarFunctionId::Trim, _) => {
+			return Err(BindingError::TypeMismatch {
+				message: "TRIM requires a TRIM specification parameter".to_string(),
+			});
+		}
+		(_, _) => {
+			return Err(BindingError::TypeMismatch {
+				message: format!(
+					"{} does not accept a scalar-function parameter",
+					metadata.sql_name
+				),
+			});
+		}
 	}
 
 	let bound_args = args
@@ -177,6 +186,81 @@ pub(super) fn bind_scalar_function(
 				_ => input_type,
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
+		}
+		ScalarFunctionSignature::StringWithOptionalString => {
+			let (input, characters) = match bound_args.as_slice() {
+				[input] => (input, None),
+				[input, characters] => (input, Some(characters)),
+				_ => unreachable!("the registry arity was checked before binding"),
+			};
+			for operand in std::iter::once(input).chain(characters) {
+				if !builder
+					.node_logical_type(*operand)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			let input_type = match builder.node_type(*input) {
+				Some(data_type @ (DataType::Utf8 | DataType::LargeUtf8)) => data_type.clone(),
+				Some(actual) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects a string input, got {actual:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				None => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} input is not a bound expression", metadata.sql_name),
+					});
+				}
+			};
+			if let Some(characters) = characters {
+				match builder.node_type(*characters) {
+					Some(actual) if *actual == input_type => {}
+					Some(actual) => {
+						return Err(BindingError::TypeMismatch {
+							message: format!(
+								"{} expects its character set to share the input string type, got {input_type:?} and {actual:?}",
+								metadata.sql_name
+							),
+						});
+					}
+					None => {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!(
+								"{} character set is not a bound expression",
+								metadata.sql_name
+							),
+						});
+					}
+				}
+			}
+			match parameter {
+				ScalarFunctionParameter::None => {
+					Ok(builder.append_scalar_function(id, bound_args, input_type))
+				}
+				ScalarFunctionParameter::Trim(_) => Ok(builder
+					.append_parameterized_scalar_function(
+						id,
+						bound_args,
+						parameter.clone(),
+						input_type,
+					)),
+				_ => Err(BindingError::TypeMismatch {
+					message: format!(
+						"{} requires a TRIM specification parameter",
+						metadata.sql_name
+					),
+				}),
+			}
 		}
 		ScalarFunctionSignature::StringWithConstantBounds => {
 			let (input, from, length) = match bound_args.as_slice() {

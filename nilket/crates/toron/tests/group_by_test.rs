@@ -2337,21 +2337,61 @@ async fn adr553_string_functions_reject_a_numeric_input() {
 	}
 }
 
-/// The specification forms select a side and a character set. Accepting them
-/// silently as plain `TRIM` would answer a different question than was asked.
+/// The specification forms select a side and a character set. The side is
+/// non-child metadata, so the two plans must remain structurally distinct all
+/// the way through binding rather than collapsing to plain BOTH-space trim.
 #[tokio::test]
-async fn adr553_trim_rejects_its_specification_forms() {
+async fn adr553_trim_specifications_preserve_their_side_in_bound_identity() {
+	let (catalog, _) = fixture();
+	let leading = bind(
+		&plan_sql("SELECT TRIM(LEADING 'x' FROM region) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind TRIM LEADING");
+	let trailing = bind(
+		&plan_sql("SELECT TRIM(TRAILING 'x' FROM region) FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect("bind TRIM TRAILING");
+	assert_ne!(
+		format!("{leading:?}"),
+		format!("{trailing:?}"),
+		"TRIM side metadata must not collapse during binding"
+	);
+	assert_eq!(leading.schema().field(0).data_type(), &DataType::Utf8);
+	assert_eq!(trailing.schema().field(0).data_type(), &DataType::Utf8);
+
 	for sql in [
-		"SELECT TRIM(LEADING 'x' FROM region) FROM sales",
-		"SELECT TRIM(TRAILING 'x' FROM region) FROM sales",
 		"SELECT TRIM(BOTH 'x' FROM region) FROM sales",
 		"SELECT TRIM('x' FROM region) FROM sales",
 	] {
-		assert_unsupported_message(
-			sql,
-			"TRIM with a specification or trim characters is not supported",
-		);
+		bind(&plan_sql(sql), &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|error| panic!("bind {sql}: {error:?}"));
 	}
+	assert_unsupported_message(
+		"SELECT TRIM(region, 'xyz') FROM sales",
+		"TRIM with a character list is not supported",
+	);
+	assert_eq!(
+		utf8_column_rows(
+			&run_logical(&plan_sql("SELECT TRIM(LEADING 'e' FROM region) FROM sales")).await,
+			0,
+		),
+		vec![
+			Some("ast".to_string()),
+			Some("west".to_string()),
+			Some("ast".to_string()),
+			Some("ast".to_string()),
+			Some("west".to_string()),
+			None,
+		],
+		"the specification character set must reach the public SQL execution path"
+	);
 	// The bare specification without a trim character does not parse in this
 	// dialect at all, so it never reaches the engine's rejection.
 	assert!(

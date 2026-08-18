@@ -26,8 +26,8 @@ use sqlparser::ast::{
 	JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr, NullTreatment, ObjectName,
 	ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query,
 	Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableAlias,
-	TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo, TypedString,
-	UnaryOperator, Value, WindowSpec, WindowType,
+	TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo, TrimWhereField,
+	TypedString, UnaryOperator, Value, WindowSpec, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -6466,6 +6466,43 @@ impl SqlPlanner {
 		}
 	}
 
+	/// Lowers SQL's specification-form TRIM outside the recursive expression
+	/// dispatcher. This keeps the keyword payload and optional child together
+	/// without enlarging `lower_expr`'s recursive stack frame.
+	fn lower_trim(
+		&self,
+		trim_where: Option<TrimWhereField>,
+		trim_what: Option<&SqlExpr>,
+		expr: &SqlExpr,
+		has_character_list: bool,
+	) -> Result<Expr, FrontendError> {
+		if has_character_list {
+			return Err(unsupported("TRIM with a character list is not supported"));
+		}
+		let has_specification = trim_where.is_some() || trim_what.is_some();
+		let where_field = match trim_where.unwrap_or(TrimWhereField::Both) {
+			TrimWhereField::Both => crate::ir::TrimWhere::Both,
+			TrimWhereField::Leading => crate::ir::TrimWhere::Leading,
+			TrimWhereField::Trailing => crate::ir::TrimWhere::Trailing,
+		};
+		let mut args = vec![self.lower_expr(expr)?];
+		if let Some(trim_what) = trim_what {
+			args.push(self.lower_expr(trim_what)?);
+		}
+		let parameter = if has_specification {
+			crate::ir::ScalarFunctionParameter::Trim(Box::new(
+				crate::ir::TrimScalarFunctionParameter { where_field },
+			))
+		} else {
+			crate::ir::ScalarFunctionParameter::None
+		};
+		Ok(Expr::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::Trim,
+			args,
+			parameter,
+		})
+	}
+
 	fn lower_expr(&self, sql_expr: &SqlExpr) -> Result<Expr, FrontendError> {
 		match sql_expr {
 			SqlExpr::Identifier(ident) => Ok(Expr::column(ident.value.clone())),
@@ -6702,26 +6739,17 @@ impl SqlPlanner {
 					parameter: crate::ir::ScalarFunctionParameter::None,
 				})
 			}
-			// TRIM's specification forms select a side and a trim character set.
-			// Only the plain form is admitted; the rest are rejected by name so a
-			// query asking for them fails rather than quietly getting BOTH-space.
 			SqlExpr::Trim {
 				trim_where,
 				trim_what,
 				expr,
 				trim_characters,
-			} => {
-				if trim_where.is_some() || trim_what.is_some() || trim_characters.is_some() {
-					return Err(unsupported(
-						"TRIM with a specification or trim characters is not supported",
-					));
-				}
-				Ok(Expr::ScalarFunction {
-					id: crate::ir::ScalarFunctionId::Trim,
-					args: vec![self.lower_expr(expr)?],
-					parameter: crate::ir::ScalarFunctionParameter::None,
-				})
-			}
+			} => self.lower_trim(
+				*trim_where,
+				trim_what.as_deref(),
+				expr,
+				trim_characters.is_some(),
+			),
 			// CEIL has its own grammar form, so it never reaches the registry's
 			// function path. The identifier is still the registry's.
 			SqlExpr::Ceil { expr, field } => {

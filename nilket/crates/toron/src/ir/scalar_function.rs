@@ -49,6 +49,7 @@ pub enum ScalarFunctionParameter {
 	None,
 	Extract(Box<ExtractScalarFunctionParameter>),
 	DateTrunc(Box<DateTruncScalarFunctionParameter>),
+	Trim(Box<TrimScalarFunctionParameter>),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -61,6 +62,23 @@ pub struct ExtractScalarFunctionParameter {
 pub struct DateTruncScalarFunctionParameter {
 	pub field: crate::ir::TemporalTruncField,
 	pub zone: Option<Box<str>>,
+}
+
+/// Which edge(s) a specification-form `TRIM` removes characters from.
+///
+/// The trim character set remains an ordinary child expression so it can be
+/// constant or row-dependent; this payload carries only the non-child grammar
+/// choice that would otherwise be lost between planning and execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TrimWhere {
+	Both,
+	Leading,
+	Trailing,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TrimScalarFunctionParameter {
+	pub where_field: TrimWhere,
 }
 
 /// The accepted argument count for a scalar function.
@@ -172,6 +190,10 @@ pub enum ScalarFunctionSignature {
 	/// value** rather than only on argument types — the zone string becomes part
 	/// of `DataType::Timestamp`.
 	TimestampWithConstantZone,
+	/// One or two strings, producing the first string's type. The optional second
+	/// string is TRIM's character set; it is an expression rather than a
+	/// parameter because SQL permits it to vary by row.
+	StringWithOptionalString,
 }
 
 /// How NULL inputs affect the output.
@@ -432,8 +454,8 @@ const TRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	sql_name: "TRIM",
 	sql_aliases: &[],
 	rune_name: "trim",
-	arity: ScalarFunctionArity::Exact(1),
-	signature: ScalarFunctionSignature::UnaryStringPreserving,
+	arity: ScalarFunctionArity::Between(1, 2),
+	signature: ScalarFunctionSignature::StringWithOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	deterministic: true,
