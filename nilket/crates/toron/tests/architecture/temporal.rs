@@ -457,8 +457,20 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 	assert!(lower_expr.contains("SqlExpr::Interval(interval) => lower_interval_literal(interval)"));
 	assert!(planner.contains("fn lower_interval_literal"));
 	assert!(planner.contains("DateTimeField::Day | DateTimeField::Days"));
-	assert!(planner.contains("24 * 60 * 60 * 1_000_000_000"));
 	assert!(planner.contains("calendar INTERVAL unit"));
+	// ADR 0129 moved interval arithmetic out of this planner's local helpers.
+	// Pin the public lowering behavior rather than the spelling/location of the
+	// conversion constant so a correct relocation does not create a false red.
+	let LogicalPlan::Project { exprs, .. } = toron::sql_planner::SqlPlanner::new()
+		.plan("SELECT INTERVAL '1 day' FROM sales")
+		.expect("plan fixed-duration interval")
+	else {
+		panic!("expected project");
+	};
+	assert!(matches!(
+		&exprs[0],
+		Expr::Literal(ScalarValue::Interval(Some(value))) if *value == 86_400_000_000_000
+	));
 	assert!(reject_nested.contains("SqlExpr::Interval(SqlInterval { value: expr, .. })"));
 	assert!(contains_aggregate.contains("SqlExpr::Interval(SqlInterval { value, .. })"));
 	assert!(contains_subquery.contains("SqlExpr::Interval(SqlInterval { value, .. })"));
@@ -543,7 +555,24 @@ pub(crate) fn adr153_calendar_month_year_interval_arithmetic_is_session_framed()
 	assert!(planner.contains("ScalarValue::CalendarMonthInterval(Some(months))"));
 	assert!(planner.contains("DateTimeField::Month | DateTimeField::Months"));
 	assert!(planner.contains("DateTimeField::Year | DateTimeField::Years"));
-	assert!(planner.contains("checked_interval_months(amount, 12)"));
+	// The calendar-unit conversion now lives in toron-client. Verify the
+	// planner's public result instead of pinning that implementation detail.
+	for (sql, expected_months) in [
+		("SELECT INTERVAL '1 month' FROM sales", 1),
+		("SELECT INTERVAL '1 year' FROM sales", 12),
+	] {
+		let LogicalPlan::Project { exprs, .. } = toron::sql_planner::SqlPlanner::new()
+			.plan(sql)
+			.unwrap_or_else(|error| panic!("plan calendar interval {sql:?}: {error}"))
+		else {
+			panic!("expected project for {sql:?}");
+		};
+		assert!(matches!(
+			&exprs[0],
+			Expr::Literal(ScalarValue::CalendarMonthInterval(Some(value)))
+				if *value == expected_months
+		));
+	}
 	assert!(rune.contains("fn calendar_interval_literal"));
 	assert!(rune.contains("ScalarValue::CalendarMonthInterval(Some(months))"));
 	assert!(rune.contains("pub fn months(value: i64)"));
