@@ -21447,7 +21447,12 @@ async fn bind_optimizer_readout(
 }
 
 fn optimizer_readout_seeded_config() -> PlannerConfig {
-	let config = PlannerConfig::default();
+	let config = PlannerConfig {
+		runtime_evidence: std::sync::Arc::new(OptimizerRuntimeEvidence::local_only_with_window_id(
+			10,
+		)),
+		..PlannerConfig::default()
+	};
 	record_conflicted_decisions(
 		config.runtime_evidence.as_ref(),
 		OptimizerDecisionKind::FlatStar,
