@@ -955,6 +955,8 @@ fn product_0068_line_fixture(color: Color) -> LinePlotKernel {
 		y_range: (0.0, 1.0),
 		x_axis_type: AxisType::Linear,
 		y_axis_type: AxisType::Linear,
+		x_temporal_domain: None,
+		y_temporal_domain: None,
 		x_label: String::new(),
 		y_label: String::new(),
 	}))
@@ -975,6 +977,8 @@ fn product_0068_scatter_fixture(color: Color) -> ScatterPlotKernel {
 		y_range: (0.0, 1.0),
 		x_axis_type: AxisType::Linear,
 		y_axis_type: AxisType::Linear,
+		x_temporal_domain: None,
+		y_temporal_domain: None,
 		x_label: String::new(),
 		y_label: String::new(),
 		total_points: 1,
@@ -1007,6 +1011,8 @@ fn product_0068_stacked_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, 
 				y_range: (0.0, 10.0),
 				x_axis_type: AxisType::Linear,
 				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 				x_label: String::new(),
 				y_label: String::new(),
 				series_provenance: plot::legend::LegendProvenance::Named,
@@ -1184,6 +1190,8 @@ fn product_0072_percent_area_fixture() -> (StackedAreaPlotKernel, PlotSettings, 
 				y_range: (0.0, 105.0),
 				x_axis_type: AxisType::Linear,
 				y_axis_type: AxisType::Linear,
+				x_temporal_domain: None,
+				y_temporal_domain: None,
 				x_label: String::new(),
 				y_label: String::new(),
 				series_provenance: LegendProvenance::Named,
@@ -1440,6 +1448,8 @@ impl PlotKernel for FixedPercentCellKernel {
 			y_range: (0.0, 100.0),
 			x_axis_type: AxisType::Percent,
 			y_axis_type: AxisType::Percent,
+			x_temporal_domain: None,
+			y_temporal_domain: None,
 		}
 	}
 
@@ -1552,6 +1562,8 @@ fn product_0077_gutters(size: Size<u32>) -> (Rectangle, Rectangle) {
 		y_range: (0.0, 100.0),
 		x_axis_type: AxisType::Percent,
 		y_axis_type: AxisType::Percent,
+		x_temporal_domain: None,
+		y_temporal_domain: None,
 	};
 	let requirements = BandRequirements::from_layout(&layout, &resolved);
 	let tiled = VerticalGuideBands::resolve_with_requirements_and_x_label(
