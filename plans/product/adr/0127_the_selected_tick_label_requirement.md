@@ -83,30 +83,19 @@ loops stroke only.
 `Count` and `Step`. There is no space-adaptive variant, so no present policy can
 reintroduce the cycle.
 
-### An adjacent defect this record does not fix
+### Temporal `Step` is refused before layout
 
-Scoping §5 to `Count` required establishing whether a temporal `Step` is
-reachable. It is, and the guard that appears to prevent it does not run.
+PRODUCT-0038 already refuses `x_axis().tick_step(...)` and
+`y_axis().tick_step(...)` unless the corresponding resolved scale is
+`Linear`. Temporal columns resolve to `ScaleFamily::Time`, so a Rune figure
+cannot reach a temporal `Step` placement. The refusal is source-attributed at
+the modifier span in `gui/state.rs`.
 
-`TickPlacement::positions_for_axis` (`common.rs:99`) refuses `Step` on any
-non-`Linear`/`Percent` axis and is the sole producer of
-`TickPlacementError::UnsupportedAxis`. It is annotated `#[allow(dead_code)]` and
-has no production caller. The production validator (`state.rs:1666`, `:1697`)
-calls `positions` instead, which never returns that error -- and its `check`
-closure does not receive an axis type, so it could not refuse on one. The two
-`UnsupportedAxis` diagnostics at `state.rs:1680` and `:1711` are therefore
-unreachable, and `x_axis().tick_step(...)` on a temporal axis is accepted and
-drawn rather than refused.
-
-Verified by running both paths: `positions_for_axis(Date, Step(3))` returns
-`Err(UnsupportedAxis)`, while `positions((20_000, 20_010))` under the same
-`Step` returns `Ok` with four positions.
-
-**This record does not repair it.** A refusal the language intends but does not
-deliver is an applicability decision owned by PRODUCT-0038, and fixing it here
-would change which programs compile under cover of a layout record. It is named
-because §5's scope depends on it: if that refusal is later delivered, temporal
-`Step` becomes unreachable and §5's `Count` qualifier may be retired.
+`TickPlacement::positions_for_axis` still contains a redundant, unused
+`UnsupportedAxis` guard. Its direct unit-level result is not evidence of a
+production authoring path: the admission layer rejects the form before any
+layout or tick generation. The `Step` rows below therefore bank the pure
+generator's behavior only; they do not describe renderable Rune figures.
 
 ### The banked matrix
 
@@ -138,7 +127,8 @@ Every `AxisType` temporal variant, banked separately per §5:
 | datetime ns | 256.5 | 256.5 | 0.0 | `1970-01-01 00:00:00` |
 | time | 162.0 | 162.0 | 0.0 | `00:00:00.000` |
 
-Temporal under `Step`, where the equality does **not** hold (§5):
+The pure generator under unsupported temporal `Step`, where the equality does
+**not** hold (§5):
 
 | case | current | selected | delta | widest selected label |
 |---|---|---|---|---|
@@ -242,29 +232,28 @@ sole source of conservatism**, named in one place instead of compounding with a
 phantom candidate. Measured against the default `Count(8)` capture: `12.5` and
 `87.5` ink about 34–35 px against a 54 px budget.
 
-### 5. The Categories arm is unchanged; temporal parity is claimed only under `Count`
+### 5. The Categories arm is unchanged; temporal parity holds under the admitted `Count` policy
 
 `AxisBandRequirement::Categories` already carries the exact drawn strings and is
 untouched.
 
 Temporal parity is claimed **per `AxisType` variant, each with its own banked
-row, and only for `Count` placement**. Under `Count`, `Date`,
+row, under the only temporal placement Rune admits: `Count`**. Under `Count`, `Date`,
 `Datetime(Milliseconds)`, `Datetime(Microseconds)`, `Datetime(Nanoseconds)`, and
 `Time` each reach an identical width by both routes, because `Count` includes
 both domain endpoints -- the same values the old candidate set was built from.
 The negative-year case is the one that could have broken this and does not: a
 Date domain spanning `-999_999` yields `"-0768-02-05"` from *both* routes.
 
-**A temporal `Step` breaks that equality, and it is reachable.** Selected values
-under `Step` need not include either endpoint, so the requirement can shrink
-where the endpoints were the widest labels. Two banked cases do exactly that: a
-Date domain `(-900_000, 900_000)` at step 700_000 goes 148.5 -> 135.0, and a
-`Datetime(Milliseconds)` domain whose endpoint exceeds chrono's range, so that
-`format_label` falls back to `{:.1}`, goes 283.5 -> 270.0.
-
-This is correct behaviour, not a defect: those endpoint labels are not drawn.
-But it means the parity claim must be scoped to the policy, not to the variant,
-and gate 4 is written accordingly.
+The pure `TickPlacement::positions` function can produce a different result for
+temporal `Step`: selected values need not include either endpoint, so the
+requirement can shrink where the endpoints were the widest labels. The two
+banked generator cases do exactly that: a Date domain `(-900_000, 900_000)` at
+step 700_000 goes 148.5 -> 135.0, and a `Datetime(Milliseconds)` domain whose
+endpoint exceeds chrono's range, so that `format_label` falls back to `{:.1}`,
+goes 283.5 -> 270.0. Those are lower-level generator facts, not an exception to
+the production parity claim: PRODUCT-0038 refuses temporal `Step` before a
+figure can draw either set.
 
 The safety direction is unaffected in every temporal case, because the old
 candidate set always contained both domain endpoints while every selected value
@@ -357,12 +346,11 @@ this record does not make one for it.
    operation trace, including the negative-year date. A single Date fixture
    standing for the others fails this gate: the claim is per variant because the
    formatting is per variant.
-   The gate is **scoped to `Count`**. A temporal `Step` must instead assert its
-   banked non-zero delta -- 148.5 -> 135.0 for the wide Date domain, 283.5 ->
-   270.0 past chrono's range -- so the two policies are distinguished rather
-   than averaged. A gate asserting temporal parity irrespective of placement
-   fails against correct code, and would be the second time this record's
-   subject matter was stated over a variant when it belonged to a policy.
+   The generator test additionally banks temporal `Step`'s non-zero deltas --
+   148.5 -> 135.0 for the wide Date domain, 283.5 -> 270.0 past chrono's range
+   -- as lower-level behavior only. PRODUCT-0038 refuses those spellings before
+   a figure reaches the generator, so they do not qualify the render parity
+   claim.
 5. **An empty selection yields zero by both routes.** Both a capacity refusal
    and a valid `Ok(empty)` step reserve a zero label requirement, and the band
    equals its tick-offset floor. Each route gets its own case. The gate must
@@ -412,10 +400,6 @@ this record does not make one for it.
 
 > If honoring the empty-selection zero requires the draw path to emit different
 > operations, stop. This record changes a reservation, never what is drawn.
-
-> If the implementation is tempted to deliver the unreachable `UnsupportedAxis`
-> refusal while scoping §5, stop. That is PRODUCT-0038's applicability decision
-> and it changes which programs compile; this record only reserves space.
 
 > If threading `placement` into the requirement forces a decision about
 > per-cell or per-axis placement divergence, stop. Today one resolved settings
