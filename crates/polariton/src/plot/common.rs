@@ -19,6 +19,7 @@ use iced::widget::canvas::{self, Frame, Geometry, Path, Program, Stroke, Style, 
 use iced::{Color, Event, Point, Rectangle, Renderer, Theme};
 use std::num::NonZeroU32;
 use std::sync::Arc;
+use toron_client::TemporalInterval;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Orientation {
@@ -69,6 +70,248 @@ pub enum TemporalAxisDomain {
 		first_nanos: i64,
 		last_nanos: i64,
 	},
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum TemporalTickSelectionError {
+	Inapplicable {
+		domain: &'static str,
+		interval: TemporalInterval,
+	},
+	UnrepresentableUnit {
+		interval: TemporalInterval,
+		unit: TimeUnit,
+	},
+	Capacity {
+		requested: usize,
+		limit: usize,
+	},
+	CollapsedProjection,
+	OutOfRange,
+}
+
+/// Select exact temporal ticks without consulting plot geometry. The returned
+/// values remain in the source axis's physical unit; only the existing draw
+/// boundary projects them to `f64`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) fn select_temporal_ticks(
+	domain: &TemporalAxisDomain,
+	stride: PositiveTemporalInterval,
+) -> Result<Vec<i64>, TemporalTickSelectionError> {
+	let interval = stride.interval();
+	let fixed = |first: i64, last: i64, unit_nanos: i64, nanos: i64| {
+		if nanos % unit_nanos != 0 {
+			return Err(TemporalTickSelectionError::UnrepresentableUnit {
+				interval,
+				unit: match unit_nanos {
+					1 => TimeUnit::Nanoseconds,
+					1_000 => TimeUnit::Microseconds,
+					_ => TimeUnit::Milliseconds,
+				},
+			});
+		}
+		let step = nanos / unit_nanos;
+		let mut value = first.div_euclid(step) * step;
+		if value < first {
+			value = value
+				.checked_add(step)
+				.ok_or(TemporalTickSelectionError::OutOfRange)?;
+		}
+		let count = ((last - value).div_euclid(step) + 1).max(0) as usize;
+		if count > MAX_GENERATED_TICK_POSITIONS {
+			return Err(TemporalTickSelectionError::Capacity {
+				requested: count,
+				limit: MAX_GENERATED_TICK_POSITIONS,
+			});
+		}
+		let selected = (0..count)
+			.map(|offset| {
+				value
+					.checked_add(step * offset as i64)
+					.ok_or(TemporalTickSelectionError::OutOfRange)
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		if selected
+			.windows(2)
+			.any(|pair| pair[0] as f64 == pair[1] as f64)
+		{
+			return Err(TemporalTickSelectionError::CollapsedProjection);
+		}
+		Ok(selected)
+	};
+
+	match (domain, interval) {
+		(TemporalAxisDomain::Date { .. }, TemporalInterval::FixedNanos(_)) => {
+			Err(TemporalTickSelectionError::Inapplicable {
+				domain: "Date",
+				interval,
+			})
+		}
+		(TemporalAxisDomain::Time { .. }, TemporalInterval::CalendarMonths(_)) => {
+			Err(TemporalTickSelectionError::Inapplicable {
+				domain: "Time",
+				interval,
+			})
+		}
+		(
+			TemporalAxisDomain::Datetime {
+				first_tick,
+				last_tick,
+				unit,
+				..
+			},
+			TemporalInterval::FixedNanos(nanos),
+		) => {
+			let unit_nanos = match unit {
+				TimeUnit::Nanoseconds => 1,
+				TimeUnit::Microseconds => 1_000,
+				TimeUnit::Milliseconds => 1_000_000,
+			};
+			fixed(*first_tick, *last_tick, unit_nanos, nanos)
+		}
+		(
+			TemporalAxisDomain::Time {
+				first_nanos,
+				last_nanos,
+			},
+			TemporalInterval::FixedNanos(nanos),
+		) => fixed(*first_nanos, *last_nanos, 1, nanos),
+		(
+			TemporalAxisDomain::Date {
+				first_day,
+				last_day,
+			},
+			TemporalInterval::CalendarMonths(months),
+		) => select_calendar_date_ticks(*first_day, *last_day, months),
+		(
+			TemporalAxisDomain::Datetime {
+				first_tick,
+				last_tick,
+				unit,
+				zone,
+			},
+			TemporalInterval::CalendarMonths(months),
+		) => select_calendar_datetime_ticks(*first_tick, *last_tick, *unit, zone.as_deref(), months),
+	}
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn select_calendar_date_ticks(
+	first_day: i32,
+	last_day: i32,
+	months: i32,
+) -> Result<Vec<i64>, TemporalTickSelectionError> {
+	use chrono::Datelike;
+	let epoch_days = 719_163_i32;
+	let first = chrono::NaiveDate::from_num_days_from_ce_opt(first_day + epoch_days)
+		.ok_or(TemporalTickSelectionError::OutOfRange)?;
+	let last = chrono::NaiveDate::from_num_days_from_ce_opt(last_day + epoch_days)
+		.ok_or(TemporalTickSelectionError::OutOfRange)?;
+	let mut month = first.year() * 12 + first.month0() as i32;
+	month = month.div_euclid(months) * months;
+	if chrono::NaiveDate::from_ymd_opt(month.div_euclid(12), month.rem_euclid(12) as u32 + 1, 1)
+		.ok_or(TemporalTickSelectionError::OutOfRange)?
+		< first
+	{
+		month += months;
+	}
+	let mut selected = Vec::new();
+	loop {
+		if selected.len() >= MAX_GENERATED_TICK_POSITIONS {
+			return Err(TemporalTickSelectionError::Capacity {
+				requested: selected.len() + 1,
+				limit: MAX_GENERATED_TICK_POSITIONS,
+			});
+		}
+		let date = chrono::NaiveDate::from_ymd_opt(
+			month.div_euclid(12),
+			month.rem_euclid(12) as u32 + 1,
+			1,
+		)
+		.ok_or(TemporalTickSelectionError::OutOfRange)?;
+		if date > last {
+			break;
+		}
+		selected.push((date.num_days_from_ce() - epoch_days) as i64);
+		month = month
+			.checked_add(months)
+			.ok_or(TemporalTickSelectionError::OutOfRange)?;
+	}
+	Ok(selected)
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn select_calendar_datetime_ticks(
+	first_tick: i64,
+	last_tick: i64,
+	unit: TimeUnit,
+	zone: Option<&str>,
+	months: i32,
+) -> Result<Vec<i64>, TemporalTickSelectionError> {
+	use chrono::{Datelike, TimeZone};
+	let nanos_per_unit = match unit {
+		TimeUnit::Nanoseconds => 1,
+		TimeUnit::Microseconds => 1_000,
+		TimeUnit::Milliseconds => 1_000_000,
+	};
+	let first_nanos = first_tick
+		.checked_mul(nanos_per_unit)
+		.ok_or(TemporalTickSelectionError::OutOfRange)?;
+	let last_nanos = last_tick
+		.checked_mul(nanos_per_unit)
+		.ok_or(TemporalTickSelectionError::OutOfRange)?;
+	let first_utc = chrono::DateTime::from_timestamp(
+		first_nanos.div_euclid(1_000_000_000),
+		first_nanos.rem_euclid(1_000_000_000) as u32,
+	)
+	.ok_or(TemporalTickSelectionError::OutOfRange)?;
+	let last_utc = chrono::DateTime::from_timestamp(
+		last_nanos.div_euclid(1_000_000_000),
+		last_nanos.rem_euclid(1_000_000_000) as u32,
+	)
+	.ok_or(TemporalTickSelectionError::OutOfRange)?;
+	let tz = zone
+		.unwrap_or("UTC")
+		.parse::<chrono_tz::Tz>()
+		.map_err(|_| TemporalTickSelectionError::OutOfRange)?;
+	let first = first_utc.with_timezone(&tz);
+	let last = last_utc.with_timezone(&tz);
+	let mut month = first.year() * 12 + first.month0() as i32;
+	month = month.div_euclid(months) * months;
+	let local_start = |month: i32| {
+		chrono::NaiveDate::from_ymd_opt(month.div_euclid(12), month.rem_euclid(12) as u32 + 1, 1)
+			.and_then(|date| date.and_hms_opt(0, 0, 0))
+	};
+	if local_start(month).ok_or(TemporalTickSelectionError::OutOfRange)? < first.naive_local() {
+		month += months;
+	}
+	let mut selected = Vec::new();
+	loop {
+		if selected.len() >= MAX_GENERATED_TICK_POSITIONS {
+			return Err(TemporalTickSelectionError::Capacity {
+				requested: selected.len() + 1,
+				limit: MAX_GENERATED_TICK_POSITIONS,
+			});
+		}
+		let local = local_start(month).ok_or(TemporalTickSelectionError::OutOfRange)?;
+		let instant = tz
+			.from_local_datetime(&local)
+			.earliest()
+			.ok_or(TemporalTickSelectionError::OutOfRange)?;
+		if instant > last {
+			break;
+		}
+		let nanos = instant
+			.with_timezone(&chrono::Utc)
+			.timestamp_nanos_opt()
+			.ok_or(TemporalTickSelectionError::OutOfRange)?;
+		selected.push(nanos.div_euclid(nanos_per_unit));
+		month = month
+			.checked_add(months)
+			.ok_or(TemporalTickSelectionError::OutOfRange)?;
+	}
+	Ok(selected)
 }
 
 pub fn union_temporal_axis_domains(
@@ -150,10 +393,42 @@ pub fn derive_axis_title(base: &str, transform: AxisTitleTransform) -> String {
 pub enum TickPlacement {
 	Count(NonZeroU32),
 	Step(PositiveFinite),
+	Temporal(PositiveTemporalInterval),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct PositiveFinite(f64);
+
+/// A strictly-positive interval used only as a tick stride. The shared Toron
+/// literal remains signed because zero and negative values are meaningful
+/// timestamp deltas; neither is meaningful for repeated tick placement.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PositiveTemporalInterval(TemporalInterval);
+
+#[cfg_attr(not(test), allow(dead_code))]
+impl PositiveTemporalInterval {
+	pub(crate) fn try_from_interval(
+		interval: TemporalInterval,
+	) -> Result<Self, TemporalStrideError> {
+		match interval {
+			TemporalInterval::FixedNanos(value) if value > 0 => Ok(Self(interval)),
+			TemporalInterval::CalendarMonths(value) if value > 0 => Ok(Self(interval)),
+			TemporalInterval::FixedNanos(_) | TemporalInterval::CalendarMonths(_) => {
+				Err(TemporalStrideError::NonPositive(interval))
+			}
+		}
+	}
+
+	pub(crate) fn interval(self) -> TemporalInterval {
+		self.0
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(test), allow(dead_code))]
+pub(crate) enum TemporalStrideError {
+	NonPositive(TemporalInterval),
+}
 
 impl TickPlacement {
 	pub const DEFAULT: Self = Self::Count(NonZeroU32::new(8).unwrap());
@@ -168,7 +443,7 @@ impl TickPlacement {
 	pub fn count_value(self) -> Option<u32> {
 		match self {
 			Self::Count(intervals) => Some(intervals.get()),
-			Self::Step(_) => None,
+			Self::Step(_) | Self::Temporal(_) => None,
 		}
 	}
 
@@ -218,6 +493,7 @@ impl TickPlacement {
 					.map(|offset| (first + offset as f64) * step)
 					.collect())
 			}
+			Self::Temporal(_) => Err(TickPlacementError::TemporalRequiresExactDomain),
 		}
 	}
 
@@ -273,6 +549,7 @@ impl TickPlacement {
 					})
 				})
 				.collect()),
+			Self::Temporal(_) => Ok(Vec::new()),
 		}
 	}
 }
@@ -300,6 +577,7 @@ pub enum TickPlacementError {
 	UnsupportedAxis {
 		axis_type: AxisType,
 	},
+	TemporalRequiresExactDomain,
 }
 
 #[allow(dead_code)]
@@ -5118,6 +5396,90 @@ mod product_0067_0068_strata_oracles {
 				zone: Some(Arc::from("America/New_York")),
 			})
 		);
+	}
+
+	#[test]
+	fn product_0129_temporal_stride_is_positive_only_after_shared_literal_parsing() {
+		assert_eq!(
+			PositiveTemporalInterval::try_from_interval(TemporalInterval::FixedNanos(0)),
+			Err(TemporalStrideError::NonPositive(
+				TemporalInterval::FixedNanos(0)
+			))
+		);
+		assert_eq!(
+			PositiveTemporalInterval::try_from_interval(TemporalInterval::CalendarMonths(-1)),
+			Err(TemporalStrideError::NonPositive(
+				TemporalInterval::CalendarMonths(-1)
+			))
+		);
+		assert!(
+			PositiveTemporalInterval::try_from_interval(TemporalInterval::FixedNanos(1)).is_ok()
+		);
+	}
+
+	#[test]
+	fn product_0129_temporal_selector_preserves_fixed_calendar_matrix_and_boundaries() {
+		let day = PositiveTemporalInterval::try_from_interval(TemporalInterval::FixedNanos(
+			86_400_000_000_000,
+		))
+		.expect("positive fixed day");
+		let month =
+			PositiveTemporalInterval::try_from_interval(TemporalInterval::CalendarMonths(1))
+				.expect("positive calendar month");
+		let date = TemporalAxisDomain::Date {
+			first_day: 19_753, // 2024-01-31
+			last_day: 19_845,  // 2024-05-01
+		};
+		assert_eq!(
+			select_temporal_ticks(&date, day),
+			Err(TemporalTickSelectionError::Inapplicable {
+				domain: "Date",
+				interval: TemporalInterval::FixedNanos(86_400_000_000_000),
+			})
+		);
+		assert_eq!(
+			select_temporal_ticks(&date, month).expect("calendar dates"),
+			vec![19_754, 19_783, 19_814, 19_844],
+			"calendar ticks use month starts instead of stepping from 31 January"
+		);
+
+		let datetime = TemporalAxisDomain::Datetime {
+			first_tick: 1_710_050_400_000,
+			last_tick: 1_710_064_800_000,
+			unit: TimeUnit::Milliseconds,
+			zone: Some(Arc::from("America/Chicago")),
+		};
+		let hourly = PositiveTemporalInterval::try_from_interval(TemporalInterval::FixedNanos(
+			3_600_000_000_000,
+		))
+		.expect("positive hour");
+		let selected = select_temporal_ticks(&datetime, hourly).expect("fixed datetime ticks");
+		assert!(
+			selected
+				.windows(2)
+				.all(|pair| pair[1] - pair[0] == 3_600_000)
+		);
+		assert!(
+			selected.iter().any(|value| {
+				format_label(
+					*value as f64,
+					&AxisType::Datetime {
+						unit: TimeUnit::Milliseconds,
+						zone: Some(Arc::from("America/Chicago")),
+					},
+				) == "2024-03-10 03:00:00"
+			}),
+			"fixed elapsed ticks cross spring-forward without inventing 02:00"
+		);
+
+		let time = TemporalAxisDomain::Time {
+			first_nanos: 0,
+			last_nanos: 3_600_000_000_000,
+		};
+		assert!(matches!(
+			select_temporal_ticks(&time, month),
+			Err(TemporalTickSelectionError::Inapplicable { domain: "Time", .. })
+		));
 	}
 
 	#[test]

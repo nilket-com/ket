@@ -34,6 +34,7 @@ use sqlparser::parser::Parser;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
+use toron_client::TemporalInterval as LoweredIntervalLiteral;
 use wendelon::schema::{
 	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
 	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN,
@@ -482,11 +483,6 @@ fn lower_interval_literal(interval: &SqlInterval) -> Result<Expr, FrontendError>
 	}))
 }
 
-enum LoweredIntervalLiteral {
-	FixedNanos(i64),
-	CalendarMonths(i32),
-}
-
 fn interval_literal_integer(expr: &SqlExpr) -> Result<i64, FrontendError> {
 	match strip_nested_sql_expr(expr) {
 		SqlExpr::Value(value) => match &value.value {
@@ -554,14 +550,7 @@ fn interval_literal_string(expr: &SqlExpr) -> Result<String, FrontendError> {
 }
 
 fn parse_simple_interval_string(value: &str) -> Result<LoweredIntervalLiteral, FrontendError> {
-	let parts = value.split_whitespace().collect::<Vec<_>>();
-	if parts.len() != 2 {
-		return Err(unsupported(
-			"INTERVAL string must be a single amount and unit",
-		));
-	}
-	let amount = parse_interval_i64(parts[0])?;
-	interval_word_value(amount, parts[1])
+	LoweredIntervalLiteral::parse(value).map_err(|error| unsupported(error.to_string()))
 }
 
 fn parse_interval_i64(value: &str) -> Result<i64, FrontendError> {
@@ -570,50 +559,26 @@ fn parse_interval_i64(value: &str) -> Result<i64, FrontendError> {
 		.map_err(|_| unsupported("INTERVAL value must be an integer literal within i64 range"))
 }
 
-fn checked_interval_nanos(amount: i64, nanos_per_unit: i64) -> Result<i64, FrontendError> {
-	(i128::from(amount) * i128::from(nanos_per_unit))
-		.try_into()
-		.map_err(|_| unsupported("INTERVAL literal overflows i64 nanoseconds"))
-}
-
-fn checked_interval_months(amount: i64, months_per_unit: i64) -> Result<i32, FrontendError> {
-	(i128::from(amount) * i128::from(months_per_unit))
-		.try_into()
-		.map_err(|_| unsupported("INTERVAL literal overflows i32 calendar months"))
-}
-
 fn interval_field_value(
 	amount: i64,
 	field: &DateTimeField,
 ) -> Result<LoweredIntervalLiteral, FrontendError> {
 	match field {
-		DateTimeField::Nanosecond | DateTimeField::Nanoseconds => Ok(
-			LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(amount, 1)?),
-		),
-		DateTimeField::Microsecond | DateTimeField::Microseconds => Ok(
-			LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(amount, 1_000)?),
-		),
-		DateTimeField::Millisecond | DateTimeField::Milliseconds => Ok(
-			LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(amount, 1_000_000)?),
-		),
-		DateTimeField::Second | DateTimeField::Seconds => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 1_000_000_000)?,
-		)),
-		DateTimeField::Minute | DateTimeField::Minutes => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 60 * 1_000_000_000)?,
-		)),
-		DateTimeField::Hour | DateTimeField::Hours => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 60 * 60 * 1_000_000_000)?,
-		)),
-		DateTimeField::Day | DateTimeField::Days => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 24 * 60 * 60 * 1_000_000_000)?,
-		)),
-		DateTimeField::Month | DateTimeField::Months => Ok(LoweredIntervalLiteral::CalendarMonths(
-			checked_interval_months(amount, 1)?,
-		)),
-		DateTimeField::Year | DateTimeField::Years => Ok(LoweredIntervalLiteral::CalendarMonths(
-			checked_interval_months(amount, 12)?,
-		)),
+		DateTimeField::Nanosecond | DateTimeField::Nanoseconds => {
+			interval_word_value(amount, "nanoseconds")
+		}
+		DateTimeField::Microsecond | DateTimeField::Microseconds => {
+			interval_word_value(amount, "microseconds")
+		}
+		DateTimeField::Millisecond | DateTimeField::Milliseconds => {
+			interval_word_value(amount, "milliseconds")
+		}
+		DateTimeField::Second | DateTimeField::Seconds => interval_word_value(amount, "seconds"),
+		DateTimeField::Minute | DateTimeField::Minutes => interval_word_value(amount, "minutes"),
+		DateTimeField::Hour | DateTimeField::Hours => interval_word_value(amount, "hours"),
+		DateTimeField::Day | DateTimeField::Days => interval_word_value(amount, "days"),
+		DateTimeField::Month | DateTimeField::Months => interval_word_value(amount, "months"),
+		DateTimeField::Year | DateTimeField::Years => interval_word_value(amount, "years"),
 		DateTimeField::Week(_) | DateTimeField::Weeks | DateTimeField::Quarter => {
 			Err(unsupported(format!(
 				"calendar INTERVAL unit {field} is not supported; use month/year or day-and-smaller fixed intervals"
@@ -624,41 +589,8 @@ fn interval_field_value(
 }
 
 fn interval_word_value(amount: i64, unit: &str) -> Result<LoweredIntervalLiteral, FrontendError> {
-	match unit.to_ascii_lowercase().as_str() {
-		"nanosecond" | "nanoseconds" | "ns" => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 1)?,
-		)),
-		"microsecond" | "microseconds" | "us" => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 1_000)?,
-		)),
-		"millisecond" | "milliseconds" | "ms" => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 1_000_000)?,
-		)),
-		"second" | "seconds" | "s" => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 1_000_000_000)?,
-		)),
-		"minute" | "minutes" | "min" | "mins" => Ok(LoweredIntervalLiteral::FixedNanos(
-			checked_interval_nanos(amount, 60 * 1_000_000_000)?,
-		)),
-		"hour" | "hours" | "h" => Ok(LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(
-			amount,
-			60 * 60 * 1_000_000_000,
-		)?)),
-		"day" | "days" | "d" => Ok(LoweredIntervalLiteral::FixedNanos(checked_interval_nanos(
-			amount,
-			24 * 60 * 60 * 1_000_000_000,
-		)?)),
-		"month" | "months" => Ok(LoweredIntervalLiteral::CalendarMonths(
-			checked_interval_months(amount, 1)?,
-		)),
-		"year" | "years" => Ok(LoweredIntervalLiteral::CalendarMonths(
-			checked_interval_months(amount, 12)?,
-		)),
-		"week" | "weeks" | "quarter" | "quarters" => Err(unsupported(format!(
-			"calendar INTERVAL unit {unit} is not supported; use month/year or day-and-smaller fixed intervals"
-		))),
-		_ => Err(unsupported(format!("unsupported INTERVAL unit: {unit}"))),
-	}
+	LoweredIntervalLiteral::from_amount_and_unit(amount, unit)
+		.map_err(|error| unsupported(error.to_string()))
 }
 
 fn take_sql_word(input: &str) -> Option<(&str, &str)> {

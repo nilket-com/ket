@@ -1680,6 +1680,7 @@ fn validate_rune_tick_capacity(
 					format!("{axis}_axis().tick_step(...) does not apply to {axis_type:?} axes")
 				}
 				TickPlacementError::MinorCapacity { .. } => unreachable!(),
+				TickPlacementError::TemporalRequiresExactDomain => unreachable!(),
 			};
 			return Err((span.clone().unwrap(), message));
 		}
@@ -1711,6 +1712,7 @@ fn validate_rune_tick_capacity(
 					format!("{axis}_axis().minor_ticks({minor_ticks}) does not apply to {axis_type:?} axes")
 				}
 				TickPlacementError::MinorCapacity { .. } => unreachable!(),
+				TickPlacementError::TemporalRequiresExactDomain => unreachable!(),
 			};
 			(span.clone(), message)
 		})?;

@@ -8,6 +8,7 @@
 
 mod client;
 mod protocol;
+mod temporal_interval;
 
 pub use client::{
 	ClientError, ClientOperation, QueryResult, ToronClient, ToronClientTls,
@@ -26,3 +27,4 @@ pub use protocol::{
 	SqlError, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion, read_frame,
 	read_request_frame_bounded, write_frame,
 };
+pub use temporal_interval::{TemporalInterval, TemporalIntervalError};
