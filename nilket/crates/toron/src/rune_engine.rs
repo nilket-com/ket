@@ -1048,6 +1048,26 @@ pub fn ln(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+/// Rune spells a variadic call as a list, the way `project` and `case` already
+/// do. SQL's `GREATEST(a, b, c)` is `greatest([a, b, c])` here.
+pub fn greatest(args: Vec<RuneExpr>) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Greatest,
+			args: args.into_iter().map(|arg| arg.expr).collect(),
+		},
+	}
+}
+
+pub fn least(args: Vec<RuneExpr>) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Least,
+			args: args.into_iter().map(|arg| arg.expr).collect(),
+		},
+	}
+}
+
 pub fn width_bucket(operand: RuneExpr, low: RuneExpr, high: RuneExpr, count: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1699,6 +1719,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["trim"], trim).build()?;
 	m.function(["char_length"], char_length).build()?;
 	m.function(["width_bucket"], width_bucket).build()?;
+	m.function(["greatest"], greatest).build()?;
+	m.function(["least"], least).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;

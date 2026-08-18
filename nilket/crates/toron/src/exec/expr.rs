@@ -765,6 +765,16 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_width_bucket(&args[0], &args[1], &args[2], &args[3]),
 		(
+			ScalarFunctionEvaluator::Greatest,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_ordered_extreme(args, OrderedExtreme::Greatest, "GREATEST"),
+		(
+			ScalarFunctionEvaluator::Least,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_ordered_extreme(args, OrderedExtreme::Least, "LEAST"),
+		(
 			ScalarFunctionEvaluator::Floor,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -783,6 +793,8 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Sqrt
 			| ScalarFunctionEvaluator::Trim
 			| ScalarFunctionEvaluator::Upper
+			| ScalarFunctionEvaluator::Greatest
+			| ScalarFunctionEvaluator::Least
 			| ScalarFunctionEvaluator::WidthBucket,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Rejects,
@@ -793,6 +805,142 @@ fn evaluate_scalar_function(
 			),
 		}),
 	}
+}
+
+/// Which end of the ordering `GREATEST` and `LEAST` keep.
+#[derive(Clone, Copy)]
+enum OrderedExtreme {
+	Greatest,
+	Least,
+}
+
+impl OrderedExtreme {
+	fn keeps<T: PartialOrd>(self, candidate: &T, incumbent: &T) -> bool {
+		match self {
+			Self::Greatest => candidate > incumbent,
+			Self::Least => candidate < incumbent,
+		}
+	}
+}
+
+/// `GREATEST` and `LEAST` are not ANSI, and the dialects disagree about NULL.
+/// This engine propagates — the registry says so, and this reads it rather than
+/// deciding again here, so the two cannot drift apart.
+fn evaluate_ordered_extreme(
+	args: &[ArrayRef],
+	extreme: OrderedExtreme,
+	name: &'static str,
+) -> Result<ArrayRef, ExecutionError> {
+	macro_rules! fold_primitive {
+		($array:ty, $builder:expr) => {
+			if args[0].as_any().downcast_ref::<$array>().is_some() {
+				let columns = args
+					.iter()
+					.map(|arg| {
+						arg.as_any().downcast_ref::<$array>().ok_or_else(|| {
+							ExecutionError::InvalidExpression {
+								message: format!(
+									"{name} expects every argument to share one type, got {:?}",
+									arg.data_type()
+								),
+							}
+						})
+					})
+					.collect::<Result<Vec<_>, _>>()?;
+				let rows = columns[0].len();
+				let mut values = Vec::with_capacity(rows);
+				for row in 0..rows {
+					let mut best = None;
+					for column in &columns {
+						if !column.is_valid(row) {
+							best = None;
+							break;
+						}
+						let candidate = column.value(row);
+						best = match best {
+							Some(incumbent) if !extreme.keeps(&candidate, &incumbent) => {
+								Some(incumbent)
+							}
+							_ => Some(candidate),
+						};
+					}
+					values.push(best);
+				}
+				return Ok($builder(values));
+			}
+		};
+	}
+
+	fold_primitive!(Int32Array, |values| Arc::new(Int32Array::from_iter(values))
+		as ArrayRef);
+	fold_primitive!(Int64Array, |values| Arc::new(Int64Array::from_iter(values))
+		as ArrayRef);
+	fold_primitive!(
+		Float32Array,
+		|values| Arc::new(Float32Array::from_iter(values)) as ArrayRef
+	);
+	fold_primitive!(
+		Float64Array,
+		|values| Arc::new(Float64Array::from_iter(values)) as ArrayRef
+	);
+	fold_primitive!(StringArray, |values: Vec<Option<&str>>| Arc::new(
+		values.into_iter().collect::<StringArray>()
+	) as ArrayRef);
+	fold_primitive!(LargeStringArray, |values: Vec<Option<&str>>| Arc::new(
+		values.into_iter().collect::<LargeStringArray>()
+	) as ArrayRef);
+
+	if let Some(first) = args[0].as_any().downcast_ref::<Decimal128Array>() {
+		let (precision, scale) = match first.data_type() {
+			DataType::Decimal128(precision, scale) => (*precision, *scale),
+			other => {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!("{name} expects an ordered type, got {other:?}"),
+				});
+			}
+		};
+		let columns = args
+			.iter()
+			.map(|arg| {
+				arg.as_any()
+					.downcast_ref::<Decimal128Array>()
+					.filter(|column| column.data_type() == first.data_type())
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: format!(
+							"{name} expects every argument to share one type, got {:?}",
+							arg.data_type()
+						),
+					})
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		let rows = columns[0].len();
+		let mut values = Vec::with_capacity(rows);
+		for row in 0..rows {
+			let mut best = None;
+			for column in &columns {
+				if !column.is_valid(row) {
+					best = None;
+					break;
+				}
+				let candidate = column.value(row);
+				best = match best {
+					Some(incumbent) if !extreme.keeps(&candidate, &incumbent) => Some(incumbent),
+					_ => Some(candidate),
+				};
+			}
+			values.push(best);
+		}
+		return Ok(Arc::new(
+			Decimal128Array::from_iter(values).with_precision_and_scale(precision, scale)?,
+		) as ArrayRef);
+	}
+
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"{name} expects an ordered numeric or string type, got {:?}",
+			args[0].data_type()
+		),
+	})
 }
 
 /// `WIDTH_BUCKET(operand, low, high, count)` answers the ANSI question: which of
@@ -3221,6 +3369,66 @@ mod tests {
 			wrapping,
 			i32::MIN,
 			"wrapping_abs returns the input unchanged, which is the value this must never produce"
+		);
+	}
+
+	/// `GREATEST`/`LEAST` are not ANSI and the dialects disagree: Oracle, MySQL,
+	/// and SQLite propagate NULL, PostgreSQL skips it and calls that a
+	/// deviation. This engine propagates, so one NULL anywhere in the row
+	/// answers NULL — a test that only used non-null rows could not tell the two
+	/// dialects apart.
+	#[test]
+	fn greatest_and_least_propagate_nulls_rather_than_skipping_them() {
+		let left = Arc::new(Int64Array::from(vec![Some(3), Some(7), None, Some(1)])) as ArrayRef;
+		let middle = Arc::new(Int64Array::from(vec![Some(9), None, None, Some(4)])) as ArrayRef;
+		let right =
+			Arc::new(Int64Array::from(vec![Some(5), Some(2), Some(8), Some(2)])) as ArrayRef;
+		let args = [left, middle, right];
+
+		let greatest =
+			super::evaluate_ordered_extreme(&args, super::OrderedExtreme::Greatest, "GREATEST")
+				.expect("GREATEST");
+		let values = greatest
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 output");
+		assert_eq!(values.value(0), 9);
+		assert!(
+			values.is_null(1),
+			"a NULL in any argument answers NULL, not the largest non-null"
+		);
+		assert!(values.is_null(2));
+		assert_eq!(values.value(3), 4);
+
+		let least = super::evaluate_ordered_extreme(&args, super::OrderedExtreme::Least, "LEAST")
+			.expect("LEAST");
+		let values = least
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 output");
+		assert_eq!(values.value(0), 3);
+		assert!(values.is_null(1));
+		assert_eq!(values.value(3), 1);
+	}
+
+	#[test]
+	fn greatest_orders_strings_lexicographically_and_takes_more_than_two_arguments() {
+		let args = [
+			Arc::new(StringArray::from(vec![Some("pear")])) as ArrayRef,
+			Arc::new(StringArray::from(vec![Some("apple")])) as ArrayRef,
+			Arc::new(StringArray::from(vec![Some("quince")])) as ArrayRef,
+			Arc::new(StringArray::from(vec![Some("banana")])) as ArrayRef,
+		];
+		let greatest =
+			super::evaluate_ordered_extreme(&args, super::OrderedExtreme::Greatest, "GREATEST")
+				.expect("GREATEST over four strings");
+		assert_eq!(
+			greatest
+				.as_any()
+				.downcast_ref::<StringArray>()
+				.expect("Utf8 output")
+				.value(0),
+			"quince"
 		);
 	}
 

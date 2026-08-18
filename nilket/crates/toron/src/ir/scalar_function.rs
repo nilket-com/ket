@@ -18,6 +18,8 @@ pub enum ScalarFunctionId {
 	CharLength,
 	Exp,
 	Floor,
+	Greatest,
+	Least,
 	Ln,
 	Lower,
 	Mod,
@@ -36,6 +38,8 @@ pub enum ScalarFunctionArity {
 	Exact(usize),
 	/// An inclusive range, for a function whose trailing arguments are optional.
 	Between(usize, usize),
+	/// An open-ended minimum, for a genuinely variadic function.
+	AtLeast(usize),
 }
 
 impl ScalarFunctionArity {
@@ -43,6 +47,7 @@ impl ScalarFunctionArity {
 		match self {
 			Self::Exact(expected) => count == expected,
 			Self::Between(min, max) => min <= count && count <= max,
+			Self::AtLeast(min) => min <= count,
 		}
 	}
 
@@ -54,6 +59,8 @@ impl ScalarFunctionArity {
 			Self::Exact(_) => "the registered argument count",
 			Self::Between(1, 2) => "one or two arguments",
 			Self::Between(_, _) => "the registered argument range",
+			Self::AtLeast(2) => "at least two arguments",
+			Self::AtLeast(_) => "the registered minimum argument count",
 		}
 	}
 }
@@ -97,6 +104,10 @@ pub enum ScalarFunctionSignature {
 	/// parameter rather than a value, so it does not participate in the output
 	/// type any more than ROUND's digit count does.
 	NumericBucketing,
+	/// Every argument shares one comparable type, which is also the output. The
+	/// comparison is defined for the engine's ordered value types; temporal
+	/// forms are a separate admission because they carry a unit and a zone.
+	VariadicOrderedSameType,
 }
 
 /// How NULL inputs affect the output.
@@ -122,6 +133,8 @@ pub enum ScalarFunctionEvaluator {
 	CharLength,
 	Exp,
 	Floor,
+	Greatest,
+	Least,
 	Ln,
 	Lower,
 	Mod,
@@ -371,6 +384,38 @@ const WIDTH_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::WidthBucket,
 };
 
+const GREATEST: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Greatest,
+	sql_name: "GREATEST",
+	sql_aliases: &[],
+	rune_name: "greatest",
+	arity: ScalarFunctionArity::AtLeast(2),
+	signature: ScalarFunctionSignature::VariadicOrderedSameType,
+	// Not ANSI, so there is no canonical NULL rule to inherit. Oracle, MySQL,
+	// and SQLite all propagate; PostgreSQL skips NULLs and documents that as a
+	// deviation. Propagating is the compatibility default, and skipping would
+	// be its own explicit PostgreSQL-compatibility decision.
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Greatest,
+};
+
+const LEAST: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Least,
+	sql_name: "LEAST",
+	sql_aliases: &[],
+	rune_name: "least",
+	arity: ScalarFunctionArity::AtLeast(2),
+	signature: ScalarFunctionSignature::VariadicOrderedSameType,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::Least,
+};
+
 /// The complete scalar-function registry.
 pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	ABS,
@@ -378,6 +423,8 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	CHAR_LENGTH,
 	EXP,
 	FLOOR,
+	GREATEST,
+	LEAST,
 	LN,
 	LOWER,
 	MOD,

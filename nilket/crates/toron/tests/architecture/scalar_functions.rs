@@ -166,6 +166,8 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"CharLength".to_string(),
 			"Exp".to_string(),
 			"Floor".to_string(),
+			"Greatest".to_string(),
+			"Least".to_string(),
 			"Ln".to_string(),
 			"Mod".to_string(),
 			"Pow".to_string(),

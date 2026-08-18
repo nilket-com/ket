@@ -307,6 +307,31 @@ existing rule that a **literal** adapts to an adjacent float while a **column**
 never does. Mixed-width *columns* are still rejected, and a test uses two columns
 precisely so literal coercion cannot mask it.
 
+**`GREATEST`/`LEAST` moved the arity model a second time, and settled a dialect
+question the standard cannot.** `ScalarFunctionArity` gained `AtLeast(min)`
+beside `Exact` and `Between`. As with `Between`, no consumer changed: the SQL
+lowering and the binder ask `accepts(count)` rather than reading a number, so a
+genuinely variadic function cost one enum variant.
+
+These two are **not ANSI** — they appear in no revision — so unlike `POWER` there
+was no canonical spelling or semantics to inherit, and NULL handling had to be
+chosen. Oracle, MySQL, and SQLite propagate; PostgreSQL skips NULLs and its own
+documentation calls that a deviation from the standard's comparison semantics.
+This engine **propagates**, as the compatibility default rather than the
+convenient one. Skipping would be a separate, explicit PostgreSQL-compatibility
+decision, and it would then be the first registration to need
+`ScalarFunctionNullBehavior::IgnoresNulls` — that field stays honestly vacuous
+until something varies on it, the way `non_finite_behavior` did before `FLOOR`.
+
+The test uses rows where one argument is NULL and another is larger, because a
+test over fully populated rows cannot tell the two dialects apart.
+
+Arguments must already share one type; comparing across types would make the
+answer depend on a promotion nobody asked for. Temporal forms are excluded for
+now — they carry a unit and a zone, which is its own admission decision — and
+Rune spells the variadic call as a list, `greatest([a, b, c])`, as `project` and
+`case` already do.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know

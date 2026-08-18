@@ -2433,6 +2433,78 @@ async fn adr553_width_bucket_rejects_a_wrong_argument_count() {
 	);
 }
 
+/// Rune spells a variadic call as a list, as `project` and `case` already do,
+/// so SQL's `GREATEST(a, b, c)` is `greatest([a, b, c])`.
+#[tokio::test]
+async fn adr553_sql_and_rune_greatest_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT GREATEST(amount, all_null_amount) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([greatest([col("amount"), col("all_null_amount")])])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL GREATEST");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune greatest");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL GREATEST digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune greatest digest")
+	);
+}
+
+/// `AtLeast(2)` is the point of this cut: two arguments and five must both
+/// bind, and the output keeps the shared argument type.
+#[tokio::test]
+async fn adr553_greatest_accepts_any_count_above_its_minimum() {
+	let (catalog, _) = fixture();
+	for sql in [
+		"SELECT LEAST(amount, all_null_amount) FROM sales",
+		"SELECT GREATEST(amount, all_null_amount, amount, all_null_amount, amount) FROM sales",
+	] {
+		let logical = plan_sql(sql);
+		let bound = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|error| panic!("bind {sql}: {error:?}"));
+		assert_eq!(
+			bound.schema().field(0).data_type(),
+			&DataType::Int32,
+			"{sql} must keep the shared argument type"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr553_greatest_rejects_a_single_argument() {
+	assert_unsupported_message(
+		"SELECT GREATEST(amount) FROM sales",
+		"GREATEST expects at least two arguments, got 1",
+	);
+}
+
+#[tokio::test]
+async fn adr553_greatest_rejects_mixed_argument_types() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT GREATEST(amount, price) FROM sales");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("comparing Int32 against Float64 should not bind");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("share one type")),
+		"expected a mixed-type rejection, got {err:?}"
+	);
+}
+
 #[tokio::test]
 async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");

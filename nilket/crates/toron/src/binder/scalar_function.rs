@@ -130,6 +130,88 @@ pub(super) fn bind_scalar_function(
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
 		}
+		ScalarFunctionSignature::VariadicOrderedSameType => {
+			let [first, rest @ ..] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			for argument in bound_args.iter() {
+				if !builder
+					.node_logical_type(*argument)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			// Same literal rule the rest of the engine uses: a decimal literal
+			// adapts to an adjacent float, a column never does.
+			for argument in rest {
+				let (Some(first_type), Some(argument_type)) =
+					(builder.node_type(*first), builder.node_type(*argument))
+				else {
+					continue;
+				};
+				let (first_type, argument_type) = (first_type.clone(), argument_type.clone());
+				super::arithmetic::coerce_decimal_arithmetic_literal(
+					builder,
+					ctx,
+					*first,
+					*argument,
+					&first_type,
+					&argument_type,
+				)?;
+			}
+			let Some(output_type) = builder.node_type(*first).cloned() else {
+				return Err(BindingError::UnsupportedExpression {
+					message: format!("{} input is not a bound expression", metadata.sql_name),
+				});
+			};
+			if !matches!(
+				output_type,
+				DataType::Int32
+					| DataType::Int64
+					| DataType::Float32
+					| DataType::Float64
+					| DataType::Decimal128(_, _)
+					| DataType::Utf8
+					| DataType::LargeUtf8
+			) {
+				return Err(BindingError::TypeMismatch {
+					message: format!(
+						"{} expects an ordered numeric or string type, got {output_type:?}",
+						metadata.sql_name
+					),
+				});
+			}
+			// Comparing across types would make the answer depend on a promotion
+			// nobody asked for, so every argument must already agree.
+			for argument in rest {
+				match builder.node_type(*argument) {
+					Some(argument_type) if *argument_type == output_type => {}
+					Some(argument_type) => {
+						return Err(BindingError::TypeMismatch {
+							message: format!(
+								"{} expects every argument to share one type, got {output_type:?} and {argument_type:?}",
+								metadata.sql_name
+							),
+						});
+					}
+					None => {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!(
+								"{} input is not a bound expression",
+								metadata.sql_name
+							),
+						});
+					}
+				}
+			}
+			Ok(builder.append_scalar_function(id, bound_args, output_type))
+		}
 		ScalarFunctionSignature::NumericBucketing => {
 			let [operand, low, high, count] = bound_args.as_slice() else {
 				unreachable!("the registry arity was checked before binding")
