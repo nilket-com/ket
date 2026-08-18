@@ -393,6 +393,36 @@ one-identifier-two-spellings rule, and a standing §3 defect until now.
 
 The grandfathered list is four.
 
+**Decided, not yet built: keyword parameters get a typed payload.** Four
+migrations established that a constant parameter travels as a literal argument
+when the parameter **is a value** — integer bounds (`SUBSTRING`), an interval
+(`TIME_BUCKET`), and a zone string whose value determines the result type
+(`AT TIME ZONE`). `EXTRACT` and `DATE_TRUNC` are the first case where it is not:
+their fields are *keywords*, and there is no `ScalarValue` for them.
+
+Three options were weighed. A **string literal the binder re-parses** is cheapest
+and reintroduces the two-parse defect that
+`time_bucket_interval_allowlist_is_shared_by_sql_and_rune` exists to prevent.
+**Extending `ScalarValue`** keeps the model uniform but conflates a field keyword
+with a runtime value, in a type deliberately closed to six ordered kinds. The
+decision is the third: `ScalarFunction { id, args, parameter }`, a **typed**
+payload rather than an unstructured one.
+
+**The payload is part of node identity, and that is the load-bearing clause.**
+It must participate in structural equality, hashing, canonical aggregate
+signatures, bound-subgraph cloning, and pushdown deduplication. The dangerous
+failure mode is not a crash: it is valid execution against the wrong dedup
+identity, where `EXTRACT(HOUR FROM x)` and `EXTRACT(DAY FROM x)` compare equal and
+one silently answers for the other. A regression test comparing exactly those two
+and requiring them to differ is a condition of the cut, not a follow-up.
+
+**Its cost is known and should not be rediscovered.** `ScalarFunction` stops
+being uniform — "an id plus a list of children" — so every site that walks,
+compares, hashes, or rebuilds it gains a second component to handle. Those are the
+same 40–50 sites each migration has touched, except that this time they grow
+rather than collapse. That is the price of the honest representation, and it is
+worth paying once for both remaining functions rather than twice.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know
