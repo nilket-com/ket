@@ -4802,8 +4802,8 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 	let requirements = common
 		.split("impl AxisBandRequirement")
 		.nth(1)
-		.and_then(|rest| rest.split("fn formatted_label_candidates").next())
-		.expect("PRODUCT-0114's bounded reservation estimator");
+		.and_then(|rest| rest.split("pub struct CoordinateTransformer").next())
+		.expect("bounded formatted-axis reservation estimator");
 	assert!(
 		requirements.contains(
 			"estimate_formatted_label_width(&format_label(value, *axis_type), font_size)"
@@ -4835,6 +4835,7 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 			"{entrypoint} consumes the one placement authority"
 		);
 	}
+
 	let overlay = common
 		.split("fn render_overlay_layer_in_widget")
 		.nth(1)
@@ -4870,6 +4871,57 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 	assert!(!free.contains("\"x_tick_rotation\""));
 	assert!(!free.contains("\"x_label_rotation\""));
 	assert!(!free.contains("\"y_tick_rotation\""));
+}
+
+#[test]
+fn product_0127_formatted_requirements_carry_selected_pre_layout_ticks() {
+	let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+	let common = std::fs::read_to_string(root.join("plot/common.rs")).expect("read plot common");
+	let requirement = common
+		.split("pub(crate) enum AxisBandRequirement")
+		.nth(1)
+		.and_then(|rest| rest.split("pub struct CoordinateTransformer").next())
+		.expect("bounded axis-band requirement authority");
+	for declaration in [
+		"placement: TickPlacement",
+		".positions(*domain)",
+		"unwrap_or_default()",
+		"estimate_formatted_label_width(&format_label(value, *axis_type), font_size)",
+	] {
+		assert!(
+			requirement.contains(declaration),
+			"PRODUCT-0127 formatted requirements retain {declaration}"
+		);
+	}
+	assert!(
+		!common.contains("fn formatted_label_candidates"),
+		"PRODUCT-0127 retires branch-boundary sampling instead of keeping it as a second requirement authority"
+	);
+
+	for entrypoint in [
+		"fn render_plot_layer_in_widget",
+		"fn render_overlay_layer_in_widget",
+		"Event::Mouse(iced::mouse::Event::CursorMoved",
+	] {
+		let section = common
+			.split(entrypoint)
+			.nth(1)
+			.expect("single-plot entrypoint")
+			.split("let transform")
+			.next()
+			.expect("bounded single-plot geometry setup");
+		assert!(
+			section.contains("BandRequirements::from_layout(&layout, &self.settings)"),
+			"{entrypoint} pairs the layout with its resolved tick placement before geometry"
+		);
+	}
+
+	let grid = std::fs::read_to_string(root.join("plot/grid.rs")).expect("read plot grid");
+	assert!(
+		grid.matches("BandRequirements::across_layouts(").count() >= 5
+			&& grid.matches("&resolved,").count() >= 4,
+		"PRODUCT-0127 passes one resolved placement policy into every production grid requirement aggregation"
+	);
 }
 
 #[test]

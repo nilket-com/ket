@@ -577,8 +577,15 @@ fn render_product_0068_bar(
 	renderer: &mut iced::Renderer,
 	size: Size<u32>,
 	overlay_control: bool,
+	show_grid: bool,
 ) -> Capture {
-	let (kernel, settings) = product_0068_bar_fixture();
+	let (kernel, mut settings) = product_0068_bar_fixture();
+	if !show_grid {
+		let mut resolved = settings.resolve();
+		resolved.show_x_major_grid = false;
+		resolved.show_y_major_grid = false;
+		settings = PlotSettings::from_resolved(resolved);
+	}
 	let resolved = settings.resolve();
 	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
 	let widget = PlotWidget {
@@ -600,15 +607,20 @@ fn render_product_0068_bar(
 				resolved.chrome.canvas_background.iced(),
 			);
 			let layout = kernel.layout(resolved.clone());
-			let transform = CoordinateTransformer::new(&layout, bounds);
+			let requirements = BandRequirements::from_layout(&layout, &resolved);
+			let plot_area =
+				VerticalGuideBands::resolve_with_requirements("", None, &requirements, &resolved)
+					.plot_area(Rect::from_iced_frame(bounds), 0.0, &resolved)
+					.into_iced();
+			let transform = CoordinateTransformer::new(&layout, plot_area);
 			kernel.plot_with_settings(
 				&mut backend,
-				bounds,
+				plot_area,
 				&transform,
 				iced::advanced::mouse::Cursor::Unavailable,
 				&settings,
 			);
-			widget.draw_layout_grid(&mut backend, bounds, &transform, &layout);
+			widget.draw_layout_grid(&mut backend, plot_area, &transform, &layout);
 			widget.render_overlay_layer(&mut backend, bounds);
 		} else {
 			widget.render_plot_layer(&mut backend, bounds);
@@ -669,6 +681,108 @@ fn product_0116_rotation_fixture(rotation: f32) -> (BarPlotKernel, PlotSettings)
 		rotation,
 		&["Edge", "Ship", "Ship delivery commitment", "Edge"],
 		&[62.0, 74.0, 58.0, 66.0],
+	)
+}
+
+fn product_0127_selected_tick_fixture() -> (BarPlotKernel, PlotSettings) {
+	let (mut kernel, _) = product_0068_bar_fixture();
+	kernel.prepared_data = Arc::new(BarPreparedData {
+		categories: vec!["East".to_owned(), "North".to_owned(), "South".to_owned()],
+		group_names: vec!["Value".to_owned()],
+		values: vec![vec![82.0], vec![47.0], vec![61.0]],
+		y_range: (0.0, 100.0),
+		x_label: String::new(),
+		y_label: "Revenue".to_owned(),
+		group_provenance: LegendProvenance::Named,
+	});
+	kernel.group_colors.truncate(1);
+	let resolved = ResolvedPlotSettings {
+		title: ResolvedPresence::Hide,
+		subtitle: ResolvedPresence::Hide,
+		x_label: ResolvedPresence::Hide,
+		y_label: ResolvedPresence::Show(Arc::new("Revenue".to_owned())),
+		legend: ResolvedPresence::Hide,
+		show_x_minor_ticks: false,
+		show_y_minor_ticks: false,
+		show_x_minor_grid: false,
+		show_y_minor_grid: false,
+		plot_padding_top: 0.0,
+		plot_padding_bottom: 0.0,
+		plot_padding_left: 0.0,
+		plot_padding_right: 0.0,
+		..ResolvedPlotSettings::default()
+	};
+	(kernel, PlotSettings::from_resolved(resolved))
+}
+
+fn render_product_0127_selected_ticks(
+	renderer: &mut iced::Renderer,
+	size: Size<u32>,
+) -> (Capture, Rectangle, f32, f32) {
+	let (kernel, settings_model) = product_0127_selected_tick_fixture();
+	let settings = settings_model.resolve();
+	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
+	let layout = kernel.layout(settings.clone());
+	let requirements = BandRequirements::from_layout(&layout, &settings);
+	let guides = VerticalGuideBands::y_axis_guides(&requirements, true, &settings);
+	let plot_area = VerticalGuideBands::resolve_with_requirements_and_x_label(
+		"",
+		None,
+		&requirements,
+		false,
+		&settings,
+	)
+	.plot_area(Rect::from_iced_frame(bounds), 0.0, &settings)
+	.into_iced();
+	let widget = PlotWidget {
+		kernel: &kernel,
+		title: String::new(),
+		padding: 0.0,
+		settings,
+		settings_model,
+		render_revision: 0,
+		resize_render_suspended: false,
+		layer: PlotRenderLayer::Full,
+	};
+	let capture = render_frame(renderer, size, |frame| {
+		let mut backend = IcedBackend { frame };
+		widget.render(&mut backend, bounds);
+	});
+	(
+		capture,
+		plot_area,
+		guides.left,
+		guides.title_x.expect("visible y title"),
+	)
+}
+
+fn product_0127_y_tick_ink_distances(capture: &Capture, plot_area: Rectangle) -> (u32, u32) {
+	let mut distances = Vec::new();
+	for distance in 9..=60 {
+		let x = (plot_area.x - distance as f32).round() as u32;
+		for y in plot_area.y.max(0.0).ceil() as u32
+			..(plot_area.y + plot_area.height * 0.35).ceil() as u32
+		{
+			if capture
+				.pixel(x, y)
+				.iter()
+				.copied()
+				.max()
+				.unwrap_or_default()
+				> 120
+			{
+				distances.push(distance);
+				break;
+			}
+		}
+	}
+	(
+		*distances
+			.first()
+			.expect("PRODUCT-0127 y tick ink begins in the left band"),
+		*distances
+			.last()
+			.expect("PRODUCT-0127 y tick ink ends in the left band"),
 	)
 }
 
@@ -759,7 +873,7 @@ fn product_0116_tick_run_top(
 	let (kernel, settings) = product_0116_rotation_fixture(90.0);
 	let resolved = settings.resolve();
 	let layout = kernel.layout(resolved.clone());
-	let requirements = BandRequirements::from_layout(&layout);
+	let requirements = BandRequirements::from_layout(&layout, &resolved);
 	let plot_area =
 		VerticalGuideBands::resolve_with_requirements("", None, &requirements, &resolved)
 			.plot_area(Rect::from_iced_frame(figure_bounds), 0.0, &resolved)
@@ -775,8 +889,10 @@ fn product_0116_tick_run_top(
 	let transform = CoordinateTransformer::new(&layout, plot_area);
 	let (tick, _) = transform.categorical(category_index, y_range.0);
 	let first_y = (tick.y + resolved.x_label_offset - 2.0).max(0.0).floor() as u32;
-	let left = (tick.x - resolved.x_tick_size - 4.0).max(0.0).floor() as u32;
-	let right = (tick.x + resolved.x_tick_size + 4.0)
+	let left = (tick.x - resolved.x_tick_size.pixels() - 4.0)
+		.max(0.0)
+		.floor() as u32;
+	let right = (tick.x + resolved.x_tick_size.pixels() + 4.0)
 		.min(capture.width as f32)
 		.ceil() as u32;
 	assert!(
@@ -1112,46 +1228,35 @@ fn render_product_0080_histogram(
 	renderer: &mut iced::Renderer,
 	size: Size<u32>,
 	separator: plot::chrome::PlotRgba,
-) -> (Capture, f32) {
+) -> Capture {
 	let (kernel, settings) = product_0080_histogram_fixture(separator);
-	let resolved = settings.resolve();
-	let layout = kernel.layout(resolved);
-	let transform = CoordinateTransformer::new(
-		&layout,
-		Rectangle::with_size(Size::new(size.width as f32, size.height as f32)),
-	);
-	let boundary_x = transform.cartesian(20.0, 12.5).x;
-	(
-		render_product_0068_cartesian_mark(renderer, size, &kernel, &settings, false),
-		boundary_x,
-	)
+	render_product_0068_cartesian_mark(renderer, size, &kernel, &settings, false)
 }
 
-fn product_0080_separator_pixels(
-	capture: &Capture,
-	boundary_x: f32,
-	separator: [u8; 3],
-	fill: [u8; 3],
-) -> usize {
-	let center = boundary_x.round() as i32;
-	let mut count = 0;
-	for y in 4..capture.height.saturating_sub(4) {
-		for x in center - 2..=center + 2 {
-			if x >= 0 {
-				let pixel = capture.pixel(x as u32, y);
-				let between = pixel.into_iter().zip(separator.into_iter().zip(fill)).all(
-					|(value, (separator, fill))| {
-						value >= separator.min(fill).saturating_sub(2)
-							&& value <= separator.max(fill).saturating_add(2)
-					},
-				);
-				if between && color_distance(pixel, fill) >= 30 {
-					count += 1;
-				}
-			}
-		}
-	}
-	count
+fn product_0080_separator_difference_pixels(accepted: &Capture, banked: &Capture) -> usize {
+	assert_eq!(
+		(accepted.width, accepted.height),
+		(banked.width, banked.height),
+		"PRODUCT-0080 controls must share one capture extent"
+	);
+	(0..accepted.height)
+		.flat_map(|y| (0..accepted.width).map(move |x| (x, y)))
+		.filter(|&(x, y)| {
+			near(accepted.pixel(x, y), BACKGROUND, 12) && near(banked.pixel(x, y), WHITE, 12)
+		})
+		.count()
+}
+
+fn product_0080_filled_pixels_beside_separator(accepted: &Capture, banked: &Capture) -> usize {
+	(3..accepted.height.saturating_sub(3))
+		.flat_map(|y| (3..accepted.width.saturating_sub(3)).map(move |x| (x, y)))
+		.filter(|&(x, y)| {
+			near(accepted.pixel(x, y), BACKGROUND, 12)
+				&& near(banked.pixel(x, y), WHITE, 12)
+				&& near(accepted.pixel(x - 3, y), WHITE, 12)
+				&& near(accepted.pixel(x + 3, y), WHITE, 12)
+		})
+		.count()
 }
 
 fn product_0083_box_fixture(fill_detail: plot::chrome::PlotRgba) -> (BoxPlotKernel, PlotSettings) {
@@ -1188,8 +1293,18 @@ fn render_product_0083_box(
 	let (kernel, settings) = product_0083_box_fixture(fill_detail);
 	let resolved = settings.resolve();
 	let bounds = Rectangle::with_size(Size::new(size.width as f32, size.height as f32));
-	let layout = kernel.layout(resolved);
-	let transform = CoordinateTransformer::new(&layout, bounds);
+	let layout = kernel.layout(resolved.clone());
+	let requirements = BandRequirements::from_layout(&layout, &resolved);
+	let plot_area = VerticalGuideBands::resolve_with_requirements_and_x_label(
+		"",
+		None,
+		&requirements,
+		false,
+		&resolved,
+	)
+	.plot_area(Rect::from_iced_frame(bounds), 0.0, &resolved)
+	.into_iced();
+	let transform = CoordinateTransformer::new(&layout, plot_area);
 	let (center, band_width) = transform.categorical(0, 0.0);
 	let median_y = transform.categorical(0, 23.0).0.y;
 	let box_width = band_width * 0.6;
@@ -1430,11 +1545,33 @@ fn render_product_0077_percent_grid(
 }
 
 fn product_0077_gutters(size: Size<u32>) -> (Rectangle, Rectangle) {
-	let resolved = ResolvedPlotSettings::default();
-	let tiled_x = resolved.plot_padding_left;
-	let tiled_y = 0.0;
-	let tiled_width = size.width as f32 - resolved.plot_padding_left;
-	let tiled_height = size.height as f32 - resolved.plot_padding_bottom;
+	let resolved =
+		product_0077_settings(ResolvedPlotSettings::default().chrome.tick_label_text).resolve();
+	let layout = PlotLayout::Cartesian {
+		x_range: (0.0, 100.0),
+		y_range: (0.0, 100.0),
+		x_axis_type: AxisType::Percent,
+		y_axis_type: AxisType::Percent,
+	};
+	let requirements = BandRequirements::from_layout(&layout, &resolved);
+	let tiled = VerticalGuideBands::resolve_with_requirements_and_x_label(
+		"",
+		None,
+		&requirements,
+		false,
+		&resolved,
+	)
+	.grid_tiled_area(
+		Rect::from_iced_frame(Rectangle::with_size(Size::new(
+			size.width as f32,
+			size.height as f32,
+		))),
+		&resolved,
+	);
+	let tiled_x = tiled.x();
+	let tiled_y = tiled.y();
+	let tiled_width = tiled.width();
+	let tiled_height = tiled.height();
 	let gap = 12.0;
 	let cell_width = (tiled_width - gap) / 2.0;
 	let cell_height = (tiled_height - gap) / 2.0;
@@ -1888,6 +2025,26 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	println!(
 		"PRODUCT_0116 estimation_never_moves_ink disposition=production short_top={product_0116_short_top} long_top={product_0116_long_top}"
 	);
+	let product_0127_size = Size::new(900, 480);
+	let (product_0127_capture, product_0127_plot_area, product_0127_left, product_0127_title_x) =
+		render_product_0127_selected_ticks(&mut msaa, product_0127_size);
+	assert_eq!(
+		(
+			product_0127_left,
+			product_0127_title_x,
+			product_0127_plot_area.x
+		),
+		(105.0, 85.0, 105.0),
+		"PRODUCT-0127 selected (0, 100) ticks restore the banked 105 px left band and 85 px title placement"
+	);
+	assert_eq!(
+		product_0127_y_tick_ink_distances(&product_0127_capture, product_0127_plot_area),
+		(12, 45),
+		"PRODUCT-0127 changes the reservation only; realized y-tick ink remains at its banked 12..45 px distances from the plot edge"
+	);
+	println!(
+		"PRODUCT_0127 selected_tick_requirement disposition=production left/title/tick_ink=105/85/12..45"
+	);
 
 	let product_0077_size = Size::new(800, 600);
 	let product_0077_sentinel = plot::chrome::PlotRgba::opaque(1.0, 0.0, 1.0);
@@ -1923,38 +2080,24 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 
 	let product_0080_size = Size::new(500, 300);
 	let product_0080_style = ResolvedPlotSettings::default().mark_style;
-	let (product_0080_accepted, product_0080_boundary_x) =
+	let product_0080_accepted =
 		render_product_0080_histogram(&mut msaa, product_0080_size, product_0080_style.separator);
-	let (product_0080_banked, product_0080_banked_x) =
+	let product_0080_banked =
 		render_product_0080_histogram(&mut msaa, product_0080_size, product_0080_style.fill);
-	assert_eq!(product_0080_boundary_x, product_0080_banked_x);
-	let product_0080_accepted_separator = product_0080_separator_pixels(
-		&product_0080_accepted,
-		product_0080_boundary_x,
-		BACKGROUND,
-		WHITE,
-	);
-	let product_0080_banked_separator = product_0080_separator_pixels(
-		&product_0080_banked,
-		product_0080_banked_x,
-		BACKGROUND,
-		WHITE,
-	);
-	assert_eq!(
-		product_0080_banked_separator, 0,
-		"PRODUCT-0080 banked same-fill control must show no separator ink"
-	);
+	let product_0080_accepted_separator =
+		product_0080_separator_difference_pixels(&product_0080_accepted, &product_0080_banked);
 	assert!(
 		product_0080_accepted_separator >= 200,
-		"PRODUCT-0080 resolved separator must divide the equal-height bins; got {product_0080_accepted_separator} pixels"
+		"PRODUCT-0080 resolved separator must replace same-fill control pixels; got {product_0080_accepted_separator} pixels"
 	);
+	let product_0080_adjacent_fill =
+		product_0080_filled_pixels_beside_separator(&product_0080_accepted, &product_0080_banked);
 	assert!(
-		near(product_0080_accepted.point(0.3, 0.5), WHITE, 12)
-			&& near(product_0080_accepted.point(0.5, 0.5), WHITE, 12),
-		"PRODUCT-0080 both adjacent bodies must retain the resolved fill"
+		product_0080_adjacent_fill >= 100,
+		"PRODUCT-0080 separator must divide two retained fill bodies; got {product_0080_adjacent_fill} shared neighbors"
 	);
 	println!(
-		"PRODUCT_0080 histogram_separator disposition=automated banked/accepted={product_0080_banked_separator}/{product_0080_accepted_separator} boundary_x={product_0080_boundary_x:.1}"
+		"PRODUCT_0080 histogram_separator disposition=automated same_fill_replaced={product_0080_accepted_separator} adjacent_fill={product_0080_adjacent_fill}"
 	);
 
 	let product_0083_size = Size::new(500, 300);
@@ -2088,15 +2231,19 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 	);
 
 	let bar_size = Size::new(600, 400);
-	let bar_under = render_product_0068_bar(&mut msaa, bar_size, false);
-	let bar_overlay = render_product_0068_bar(&mut msaa, bar_size, true);
+	let bar_under = render_product_0068_bar(&mut msaa, bar_size, false, true);
+	let bar_overlay = render_product_0068_bar(&mut msaa, bar_size, true, true);
+	let bar_without_grid = render_product_0068_bar(&mut msaa, bar_size, false, false);
 	let cyan = [1, 205, 254];
-	let crossing_row = [319, 320]
-		.into_iter()
-		.max_by_key(|row| color_distance(bar_overlay.pixel(40, *row), cyan))
-		.expect("PRODUCT-0068 grid crossing row");
-	let under_mark = bar_under.pixel(40, crossing_row);
-	let overlay_mark = bar_overlay.pixel(40, crossing_row);
+	let (crossing_x, crossing_y) = (0..bar_under.height)
+		.flat_map(|y| (0..bar_under.width).map(move |x| (x, y)))
+		.find(|&(x, y)| {
+			near(bar_under.pixel(x, y), cyan, 12)
+				&& color_distance(bar_overlay.pixel(x, y), cyan) >= 20
+		})
+		.expect("PRODUCT-0068 grid must cross a resolved cyan bar");
+	let under_mark = bar_under.pixel(crossing_x, crossing_y);
+	let overlay_mark = bar_overlay.pixel(crossing_x, crossing_y);
 	assert!(
 		near(under_mark, cyan, 12),
 		"PRODUCT-0068 grid-under must preserve the exact resolved bar colour: {under_mark:?}"
@@ -2105,8 +2252,15 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 		color_distance(overlay_mark, cyan) >= 20,
 		"PRODUCT-0068 overlay control must visibly tint the same bar pixel: {overlay_mark:?}"
 	);
-	let gap_grid = bar_under.pixel(195, crossing_row);
-	let gap_canvas = bar_under.pixel(195, 300);
+	let (gap_grid, gap_canvas) = (0..bar_under.height)
+		.flat_map(|y| (0..bar_under.width).map(move |x| (x, y)))
+		.find_map(|(x, y)| {
+			let grid = bar_under.pixel(x, y);
+			let canvas = bar_without_grid.pixel(x, y);
+			(near(canvas, BACKGROUND, 12) && color_distance(grid, canvas) >= 20)
+				.then_some((grid, canvas))
+		})
+		.expect("PRODUCT-0068 category gaps must expose a grid pixel over canvas");
 	assert!(
 		color_distance(gap_grid, gap_canvas) >= 20,
 		"PRODUCT-0068 category gap must retain a real gridline: grid={gap_grid:?} canvas={gap_canvas:?}"
@@ -2122,7 +2276,7 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 		);
 	}
 	println!(
-		"PRODUCT_0068 bar_strata disposition=automated crossing_row={crossing_row} under_mark={under_mark:?} overlay_mark={overlay_mark:?} gap_grid={gap_grid:?} gap_canvas={gap_canvas:?}"
+		"PRODUCT_0068 bar_strata disposition=automated crossing=({crossing_x},{crossing_y}) under_mark={under_mark:?} overlay_mark={overlay_mark:?} gap_grid={gap_grid:?} gap_canvas={gap_canvas:?}"
 	);
 	let cartesian_size = Size::new(400, 300);
 	let cartesian_settings = product_0068_cartesian_settings();

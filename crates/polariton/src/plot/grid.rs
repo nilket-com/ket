@@ -668,7 +668,7 @@ impl PlotComposite for PlotGridKernel {
 		let outer = grid_outer_area(legend.content_bounds, padding);
 		let layouts = self.cell_layouts(resolved.clone());
 		let requirements =
-			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
 		let x_label_visible = grid_x_label_visible(self, &resolved);
 		let tiled = grid_tiled_area_with_requirements(
 			outer,
@@ -767,7 +767,7 @@ impl PlotComposite for PlotGridKernel {
 		let outer = grid_outer_area(legend.content_bounds, padding);
 		let layouts = self.cell_layouts(resolved.clone());
 		let requirements =
-			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
 		let x_label_visible = grid_x_label_visible(self, &resolved);
 		let tiled = grid_tiled_area_with_requirements(
 			outer,
@@ -937,7 +937,7 @@ impl PlotComposite for PlotGridKernel {
 		let outer = grid_outer_area(legend.content_bounds, padding);
 		let layouts = self.cell_layouts(resolved.clone());
 		let requirements =
-			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), &resolved);
 		let x_label_visible = grid_x_label_visible(self, &resolved);
 		let tiled = grid_tiled_area_with_requirements(
 			outer,
@@ -1745,7 +1745,7 @@ mod tests {
 	) -> Rect<Widget> {
 		let layouts = kernel.cell_layouts(settings.clone());
 		let requirements =
-			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+			BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout), settings);
 		grid_tiled_area_with_requirements(
 			outer,
 			title,
@@ -2836,8 +2836,10 @@ mod tests {
 			PlotComposite::render_overlay_layer(&kernel, &mut backend, bounds, 0.0, "", &settings);
 
 			let layouts = kernel.cell_layouts(resolved.clone());
-			let requirements =
-				BandRequirements::across_layouts(layouts.iter().map(|(_, layout)| layout));
+			let requirements = BandRequirements::across_layouts(
+				layouts.iter().map(|(_, layout)| layout),
+				&resolved,
+			);
 			let tiled = grid_tiled_area_with_requirements(
 				grid_outer_area(bounds, 0.0),
 				"",
@@ -4323,6 +4325,76 @@ mod tests {
 	}
 
 	#[test]
+	fn product_0127_unequal_domains_share_one_selected_requirement_before_tiling() {
+		let settings = ResolvedPlotSettings::default();
+		let layouts = [
+			PlotLayout::CategoricalX {
+				categories: vec!["compact".to_owned()],
+				y_range: (0.0, 100.0),
+				y_axis_type: AxisType::Linear,
+			},
+			PlotLayout::CategoricalX {
+				categories: vec!["verbose".to_owned()],
+				y_range: (0.0, 5_000_000.0),
+				y_axis_type: AxisType::Linear,
+			},
+		];
+		let compact = BandRequirements::from_layout(&layouts[0], &settings);
+		let verbose = BandRequirements::from_layout(&layouts[1], &settings);
+		let selected_y_width = |requirements: &BandRequirements| {
+			VerticalGuideBands::y_axis_guides(requirements, false, &settings).tick_end
+				- VerticalGuideBands::Y_TICK_LABEL_OFFSET
+		};
+		assert_eq!(
+			selected_y_width(&compact),
+			54.0,
+			"the compact cell selects its own short labels"
+		);
+		assert_eq!(
+			selected_y_width(&verbose),
+			81.0,
+			"the verbose cell selects its own longer labels"
+		);
+
+		let requirements = BandRequirements::across_layouts(layouts.iter(), &settings);
+		assert_eq!(
+			selected_y_width(&requirements),
+			81.0,
+			"the grid takes the maximum selected requirement once, before cells divide"
+		);
+		let guides = VerticalGuideBands::y_axis_guides(&requirements, true, &settings);
+		assert_eq!(guides.title_x, Some(97.0));
+		let tiled = grid_tiled_area_with_requirements(
+			widget_rect(IcedRectangle::new(Point::ORIGIN, Size::new(800.0, 400.0))),
+			"",
+			&requirements,
+			false,
+			&settings,
+		);
+		let arrangement = GridArrangement::new(1, 2).expect("two equal cells");
+		let compact_plot = grid_plot_area(
+			grid_cell_bounds(tiled, arrangement, GridPosition { row: 0, column: 0 }),
+			None,
+			&settings,
+		);
+		let verbose_plot = grid_plot_area(
+			grid_cell_bounds(tiled, arrangement, GridPosition { row: 0, column: 1 }),
+			None,
+			&settings,
+		);
+		assert_eq!(
+			compact_plot.width(),
+			verbose_plot.width(),
+			"one figure-wide selected requirement keeps unequal-domain cell widths congruent"
+		);
+		assert_eq!(
+			compact_plot.y(),
+			verbose_plot.y(),
+			"one shared guide also keeps the y-axis title placement congruent"
+		);
+	}
+
+	#[test]
 	fn product_0077_bound_coincidence_is_shared_and_does_not_mean_last_tick() {
 		let anchors = AxisTextAnchoring {
 			x_min: true,
@@ -4408,6 +4480,11 @@ mod tests {
 			.iter()
 			.map(|text| text.position.y)
 			.fold(f32::NEG_INFINITY, f32::max);
+		let left_tick_x = cartesian
+			.texts
+			.iter()
+			.map(|text| text.position.x)
+			.fold(f32::INFINITY, f32::min);
 		for alignment in [Alignment::Left, Alignment::Right] {
 			assert_eq!(
 				cartesian
@@ -4426,7 +4503,9 @@ mod tests {
 				cartesian
 					.texts
 					.iter()
-					.filter(|text| text.position.x < 100.0 && text.align_y == alignment)
+					.filter(|text| {
+						(text.position.x - left_tick_x).abs() < 0.01 && text.align_y == alignment
+					})
 					.count(),
 				1,
 				"Cartesian y emits exactly one inward {alignment:?} endpoint"
@@ -4445,7 +4524,7 @@ mod tests {
 			cartesian.texts.iter().any(|text| {
 				text.content == "100%"
 					&& text.align_y == Vertical::Center
-					&& text.position.x < 100.0
+					&& (text.position.x - left_tick_x).abs() < 0.01
 					&& text.position.y < 100.0
 			}),
 			"the outer y maximum remains centred"

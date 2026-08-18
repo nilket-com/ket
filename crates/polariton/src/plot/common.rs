@@ -255,8 +255,9 @@ pub enum PlotLayout {
 /// PRODUCT-0114 derives these before plot geometry, from the label producer
 /// and its complete domain rather than from a realized tick set. The latter
 /// would form a cycle: tick placement depends on the plot extent that the band
-/// itself determines. The requirements carry no realized tick information;
-/// the shared band authority is their sole estimator consumer.
+/// itself determines. PRODUCT-0127 carries each formatted axis's placement
+/// alongside its domain, so the shared band authority never pairs a domain
+/// with a policy from another layout.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct BandRequirements {
 	pub x: Vec<AxisBandRequirement>,
@@ -269,7 +270,7 @@ impl BandRequirements {
 		y: Vec::new(),
 	};
 
-	pub(crate) fn from_layout(layout: &PlotLayout) -> Self {
+	pub(crate) fn from_layout(layout: &PlotLayout, settings: &ResolvedPlotSettings) -> Self {
 		let (x, y) = match layout {
 			PlotLayout::Cartesian {
 				x_range,
@@ -280,10 +281,12 @@ impl BandRequirements {
 				Some(AxisBandRequirement::Formatted {
 					domain: *x_range,
 					axis_type: *x_axis_type,
+					placement: settings.x_tick_placement,
 				}),
 				Some(AxisBandRequirement::Formatted {
 					domain: *y_range,
 					axis_type: *y_axis_type,
+					placement: settings.y_tick_placement,
 				}),
 			),
 			PlotLayout::CategoricalX {
@@ -295,6 +298,7 @@ impl BandRequirements {
 				Some(AxisBandRequirement::Formatted {
 					domain: *y_range,
 					axis_type: *y_axis_type,
+					placement: settings.y_tick_placement,
 				}),
 			),
 			PlotLayout::CategoricalY {
@@ -305,6 +309,7 @@ impl BandRequirements {
 				Some(AxisBandRequirement::Formatted {
 					domain: *x_range,
 					axis_type: *x_axis_type,
+					placement: settings.x_tick_placement,
 				}),
 				Some(AxisBandRequirement::Categories(categories.clone())),
 			),
@@ -323,10 +328,13 @@ impl BandRequirements {
 		}
 	}
 
-	pub(crate) fn across_layouts<'a>(layouts: impl IntoIterator<Item = &'a PlotLayout>) -> Self {
+	pub(crate) fn across_layouts<'a>(
+		layouts: impl IntoIterator<Item = &'a PlotLayout>,
+		settings: &ResolvedPlotSettings,
+	) -> Self {
 		let mut requirements = Self::EMPTY;
 		for layout in layouts {
-			let local = Self::from_layout(layout);
+			let local = Self::from_layout(layout, settings);
 			requirements.x.extend(local.x);
 			requirements.y.extend(local.y);
 		}
@@ -357,6 +365,7 @@ pub(crate) enum AxisBandRequirement {
 	Formatted {
 		domain: (f64, f64),
 		axis_type: AxisType,
+		placement: TickPlacement,
 	},
 	Categories(Vec<String>),
 }
@@ -364,7 +373,13 @@ pub(crate) enum AxisBandRequirement {
 impl AxisBandRequirement {
 	fn estimated_width(&self, font_size: f32) -> f32 {
 		match self {
-			Self::Formatted { domain, axis_type } => formatted_label_candidates(*domain)
+			Self::Formatted {
+				domain,
+				axis_type,
+				placement,
+			} => placement
+				.positions(*domain)
+				.unwrap_or_default()
 				.into_iter()
 				.map(|value| {
 					estimate_formatted_label_width(&format_label(value, *axis_type), font_size)
@@ -376,35 +391,6 @@ impl AxisBandRequirement {
 				.fold(0.0, f32::max),
 		}
 	}
-}
-
-/// Candidate values at every `format_label` branch boundary and widest
-/// fixed-precision value that can occur in a domain. These are domain facts,
-/// not realized ticks: sampling ticks here would reintroduce the
-/// geometry/tick-placement cycle PRODUCT-0114 removes.
-fn formatted_label_candidates(domain: (f64, f64)) -> Vec<f64> {
-	let (start, end) = if domain.0 <= domain.1 {
-		domain
-	} else {
-		(domain.1, domain.0)
-	};
-	let mut candidates = vec![start, end];
-	for value in [
-		0.0,
-		-1_000_000.0,
-		-999_999.9,
-		-999_999.0,
-		-0.000_999,
-		0.000_999,
-		999_999.0,
-		999_999.9,
-		1_000_000.0,
-	] {
-		if start <= value && value <= end {
-			candidates.push(value);
-		}
-	}
-	candidates
 }
 
 pub struct CoordinateTransformer<'a> {
@@ -1777,7 +1763,7 @@ impl<'a> PlotWidget<'a> {
 			.and_then(crate::plot::legend::apply_policy);
 		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
 		let layout = self.kernel.layout(self.settings.clone());
-		let requirements = BandRequirements::from_layout(&layout);
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
 		let plot_area = self
 			.plot_area(legend.content_bounds, &requirements)
 			.into_iced();
@@ -1824,7 +1810,7 @@ impl<'a> PlotWidget<'a> {
 			.and_then(crate::plot::legend::apply_policy);
 		let legend = legend_layout(bounds, legend_content.as_ref(), &self.settings);
 		let layout = self.kernel.layout(self.settings.clone());
-		let requirements = BandRequirements::from_layout(&layout);
+		let requirements = BandRequirements::from_layout(&layout, &self.settings);
 		let plot_extent = self.plot_area(legend.content_bounds, &requirements);
 		let plot_area = plot_extent.into_iced();
 		let bounds = bounds.into_iced();
@@ -2140,7 +2126,7 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					.and_then(crate::plot::legend::apply_policy);
 				let legend = legend_layout(widget_bounds, legend_content.as_ref(), &self.settings);
 				let layout = self.kernel.layout(self.settings.clone());
-				let requirements = BandRequirements::from_layout(&layout);
+				let requirements = BandRequirements::from_layout(&layout, &self.settings);
 				let plot_area = self.plot_area(legend.content_bounds, &requirements);
 				let transform = CoordinateTransformer::new(&layout, plot_area.into_iced());
 				let plot_cursor = widget_cursor
@@ -3004,6 +2990,7 @@ mod product_0106_vertical_guide_band_oracles {
 
 	#[test]
 	fn product_0114_band_requirements_are_layout_derived_and_move_only_their_bands() {
+		let settings = ResolvedPlotSettings::default();
 		let temporal_y = PlotLayout::Cartesian {
 			x_range: (0.0, 1.0),
 			y_range: (20_000.0, 20_010.0),
@@ -3015,15 +3002,16 @@ mod product_0106_vertical_guide_band_oracles {
 			y_range: (0.0, 1.0),
 			y_axis_type: AxisType::Linear,
 		};
-		let temporal = BandRequirements::from_layout(&temporal_y);
+		let temporal = BandRequirements::from_layout(&temporal_y, &settings);
 		assert_eq!(
 			temporal.y,
 			vec![AxisBandRequirement::Formatted {
 				domain: (20_000.0, 20_010.0),
 				axis_type: AxisType::Date,
+				placement: settings.y_tick_placement,
 			}]
 		);
-		let categorical = BandRequirements::from_layout(&categorical_x);
+		let categorical = BandRequirements::from_layout(&categorical_x, &settings);
 		assert_eq!(
 			categorical.x,
 			vec![AxisBandRequirement::Categories(vec![
@@ -3032,11 +3020,10 @@ mod product_0106_vertical_guide_band_oracles {
 			])]
 		);
 
-		let grid = BandRequirements::across_layouts([&temporal_y, &categorical_x]);
+		let grid = BandRequirements::across_layouts([&temporal_y, &categorical_x], &settings);
 		assert_eq!(grid.x.len(), 2, "grid requirements retain both producers");
 		assert_eq!(grid.y.len(), 2, "the later estimator owns the maximum");
 
-		let settings = ResolvedPlotSettings::default();
 		let legacy =
 			VerticalGuideBands::resolve("", None, &settings).plot_area(bounds(), 6.0, &settings);
 		let staged = VerticalGuideBands::resolve_with_requirements("", None, &grid, &settings)
@@ -3090,21 +3077,16 @@ mod product_0106_vertical_guide_band_oracles {
 		);
 	}
 
-	/// A short numeric axis whose tick run ends inside the legacy title offset.
-	///
-	/// The domain deliberately excludes zero. `formatted_label_candidates` adds
-	/// the `+/-0.000_999` branch boundary to any domain spanning it, and that
-	/// candidate formats as `1.0e-3` -- six characters, wider than the `100`
-	/// this axis will actually draw. A zero-based domain therefore already
-	/// reserves more left band than the legacy 85 px title offset. Every gate
-	/// below that claims "short labels do not move" depends on this fixture
-	/// really being short, so the banking test asserts it rather than assuming.
+	/// A short numeric axis whose selected tick run ends inside the legacy title
+	/// offset. PRODUCT-0127 now derives this from the actual Count(8) labels,
+	/// rather than from an unrelated format-label branch boundary.
 	fn short_numeric_y() -> BandRequirements {
 		BandRequirements {
 			x: Vec::new(),
 			y: vec![AxisBandRequirement::Formatted {
 				domain: (1.0, 100.0),
 				axis_type: AxisType::Linear,
+				placement: TickPlacement::DEFAULT,
 			}],
 		}
 	}
@@ -3248,6 +3230,7 @@ mod product_0106_vertical_guide_band_oracles {
 			y: vec![AxisBandRequirement::Formatted {
 				domain: (0.0, 1.0),
 				axis_type: AxisType::Linear,
+				placement: TickPlacement::DEFAULT,
 			}],
 		};
 		let base = ResolvedPlotSettings::default();
@@ -3286,6 +3269,7 @@ mod product_0106_vertical_guide_band_oracles {
 			y: vec![AxisBandRequirement::Formatted {
 				domain: (-999_999.9, 999_999.9),
 				axis_type: AxisType::Linear,
+				placement: TickPlacement::DEFAULT,
 			}],
 		};
 		let mut y_tick_base = base.clone();
@@ -3437,7 +3421,8 @@ mod product_0106_vertical_guide_band_oracles {
 	}
 
 	#[test]
-	fn product_0114_requirements_follow_label_producers_and_the_longest_candidate() {
+	fn product_0127_requirements_carry_placement_and_measure_selected_labels() {
+		let settings = ResolvedPlotSettings::default();
 		let temporal_y = PlotLayout::Cartesian {
 			x_range: (0.0, 1.0),
 			y_range: (20_000.0, 20_010.0),
@@ -3450,34 +3435,74 @@ mod product_0106_vertical_guide_band_oracles {
 			x_axis_type: AxisType::Date,
 		};
 		assert!(matches!(
-			BandRequirements::from_layout(&temporal_y).y.as_slice(),
+			BandRequirements::from_layout(&temporal_y, &settings)
+				.y
+				.as_slice(),
 			[AxisBandRequirement::Formatted {
 				axis_type: AxisType::Date,
+				placement: TickPlacement::DEFAULT,
 				..
 			}]
 		));
 		assert!(matches!(
-			BandRequirements::from_layout(&categorical_y).x.as_slice(),
+			BandRequirements::from_layout(&categorical_y, &settings)
+				.x
+				.as_slice(),
 			[AxisBandRequirement::Formatted {
 				axis_type: AxisType::Date,
+				placement: TickPlacement::DEFAULT,
 				..
 			}]
 		));
 		assert!(matches!(
-			BandRequirements::from_layout(&categorical_y).y.as_slice(),
+			BandRequirements::from_layout(&categorical_y, &settings)
+				.y
+				.as_slice(),
 			[AxisBandRequirement::Categories(_)]
 		));
 
-		let formatted = AxisBandRequirement::Formatted {
-			domain: (-1_000_001.0, 1_000_001.0),
+		let selected = AxisBandRequirement::Formatted {
+			domain: (0.0, 100.0),
 			axis_type: AxisType::Linear,
+			placement: TickPlacement::DEFAULT,
 		};
-		let boundary =
-			estimate_formatted_label_width(&format_label(-999_999.9, AxisType::Linear), 18.0);
-		assert!(
-			formatted.estimated_width(18.0) >= boundary,
-			"format-branch candidates, not realized ticks, include the widest fixed fractional label"
+		assert_eq!(
+			selected.estimated_width(18.0),
+			54.0,
+			"Count(8) selects 0, 12.5, ..., 100; its widest label is 12.5, not an unselected scientific branch boundary"
 		);
+
+		let stepped = AxisBandRequirement::Formatted {
+			domain: (0.0, 100.0),
+			axis_type: AxisType::Linear,
+			placement: TickPlacement::Step(PositiveFinite(25.0)),
+		};
+		assert_eq!(
+			stepped.estimated_width(18.0),
+			40.5,
+			"the requirement follows the step-selected 0, 25, ..., 100 labels"
+		);
+
+		for (requirement, message) in [
+			(
+				AxisBandRequirement::Formatted {
+					domain: (1.0, 24.0),
+					axis_type: AxisType::Linear,
+					placement: TickPlacement::Step(PositiveFinite(25.0)),
+				},
+				"a valid empty step selection has no tick-label requirement",
+			),
+			(
+				AxisBandRequirement::Formatted {
+					domain: (0.0, 100.0),
+					axis_type: AxisType::Linear,
+					placement: TickPlacement::Step(PositiveFinite(0.000_001)),
+				},
+				"a refused over-capacity step selection has no tick-label requirement",
+			),
+		] {
+			assert_eq!(requirement.estimated_width(18.0), 0.0, "{message}");
+		}
 
 		let short = AxisBandRequirement::Categories(vec!["aaaa".to_owned()]);
 		let many_short = AxisBandRequirement::Categories(vec!["aaaa".to_owned(); 20]);
@@ -3487,6 +3512,206 @@ mod product_0106_vertical_guide_band_oracles {
 			many_short.estimated_width(18.0)
 		);
 		assert!(longer.estimated_width(18.0) > short.estimated_width(18.0));
+	}
+
+	#[test]
+	fn product_0127_empty_selected_ticks_reserve_no_left_clearance() {
+		let settings = ResolvedPlotSettings::default();
+		for (domain, placement, legacy_candidate, expected_legacy_width, message) in [
+			(
+				(1.0, 24.0),
+				TickPlacement::Step(PositiveFinite(25.0)),
+				24.0,
+				27.0,
+				"a valid empty selection",
+			),
+			(
+				(0.0, 100.0),
+				TickPlacement::Step(PositiveFinite(0.000_001)),
+				0.000_999,
+				81.0,
+				"a refused selection",
+			),
+		] {
+			let requirement = BandRequirements {
+				x: Vec::new(),
+				y: vec![AxisBandRequirement::Formatted {
+					domain,
+					axis_type: AxisType::Linear,
+					placement,
+				}],
+			};
+			assert_eq!(
+				requirement.estimated_y_width(settings.y_tick_size.pixels()),
+				0.0,
+				"{message} has no label requirement"
+			);
+			let guides = VerticalGuideBands::y_axis_guides(&requirement, true, &settings);
+			assert_eq!(guides.tick_end, VerticalGuideBands::Y_TICK_LABEL_OFFSET);
+			assert_eq!(guides.title_x, Some(settings.y_label_padding));
+			assert_eq!(
+				guides.left,
+				settings.y_label_padding + settings.y_label_size.pixels(),
+				"{message} spends no tick-derived title clearance"
+			);
+			assert_eq!(
+				estimate_formatted_label_width(
+					&format_label(legacy_candidate, AxisType::Linear),
+					settings.y_tick_size.pixels(),
+				),
+				expected_legacy_width,
+				"{message} previously reserved for a candidate the draw path did not emit"
+			);
+		}
+	}
+
+	fn assert_product_0127_matrix_entry(
+		name: &str,
+		requirement: AxisBandRequirement,
+		legacy_width: f32,
+		selected_width: f32,
+		settings: &ResolvedPlotSettings,
+	) {
+		let actual = requirement.estimated_width(settings.y_tick_size.pixels());
+		assert!(
+			(actual - selected_width).abs() < 0.001,
+			"{name} selected-label width: expected {selected_width}, got {actual}"
+		);
+		assert!(
+			actual <= legacy_width + 0.001,
+			"{name} never reserves less than the retired candidate requirement"
+		);
+		assert!(
+			((actual - legacy_width) - (selected_width - legacy_width)).abs() < 0.001,
+			"{name} keeps its banked direction and exact delta"
+		);
+		let requirements = BandRequirements {
+			x: Vec::new(),
+			y: vec![requirement],
+		};
+		let guides = VerticalGuideBands::y_axis_guides(&requirements, true, settings);
+		assert_eq!(
+			guides.tick_end - VerticalGuideBands::Y_TICK_LABEL_OFFSET,
+			actual,
+			"{name} reserves every selected label before it places the y-axis title"
+		);
+	}
+
+	#[test]
+	fn product_0127_banks_the_complete_selected_label_matrix() {
+		let settings = ResolvedPlotSettings::default();
+		for (name, requirement, legacy_width, selected_width) in [
+			(
+				"zero-based linear",
+				AxisBandRequirement::Formatted {
+					domain: (0.0, 100.0),
+					axis_type: AxisType::Linear,
+					placement: TickPlacement::DEFAULT,
+				},
+				81.0,
+				54.0,
+			),
+			(
+				"negative-crossing linear",
+				AxisBandRequirement::Formatted {
+					domain: (-50.0, 50.0),
+					axis_type: AxisType::Linear,
+					placement: TickPlacement::DEFAULT,
+				},
+				94.5,
+				67.5,
+			),
+			(
+				"scientific linear",
+				AxisBandRequirement::Formatted {
+					domain: (0.0, 5_000_000.0),
+					axis_type: AxisType::Linear,
+					placement: TickPlacement::DEFAULT,
+				},
+				108.0,
+				81.0,
+			),
+			(
+				"step linear",
+				AxisBandRequirement::Formatted {
+					domain: (0.0, 100.0),
+					axis_type: AxisType::Linear,
+					placement: TickPlacement::Step(PositiveFinite(25.0)),
+				},
+				81.0,
+				40.5,
+			),
+			(
+				"percent",
+				AxisBandRequirement::Formatted {
+					domain: (0.0, 1.0),
+					axis_type: AxisType::Percent,
+					placement: TickPlacement::DEFAULT,
+				},
+				94.5,
+				54.0,
+			),
+			(
+				"categorical y",
+				AxisBandRequirement::Categories(vec!["YYYYYYYYYY".to_owned()]),
+				108.0,
+				108.0,
+			),
+			(
+				"step capacity refusal",
+				AxisBandRequirement::Formatted {
+					domain: (0.0, 100.0),
+					axis_type: AxisType::Linear,
+					placement: TickPlacement::Step(PositiveFinite(0.000_001)),
+				},
+				81.0,
+				0.0,
+			),
+			(
+				"step valid empty",
+				AxisBandRequirement::Formatted {
+					domain: (1.0, 24.0),
+					axis_type: AxisType::Linear,
+					placement: TickPlacement::Step(PositiveFinite(25.0)),
+				},
+				27.0,
+				0.0,
+			),
+		] {
+			assert_product_0127_matrix_entry(
+				name,
+				requirement,
+				legacy_width,
+				selected_width,
+				&settings,
+			);
+		}
+
+		let layouts = [
+			PlotLayout::CategoricalX {
+				categories: vec!["A".to_owned()],
+				y_range: (0.0, 100.0),
+				y_axis_type: AxisType::Linear,
+			},
+			PlotLayout::CategoricalX {
+				categories: vec!["B".to_owned()],
+				y_range: (0.0, 5_000_000.0),
+				y_axis_type: AxisType::Linear,
+			},
+		];
+		let union = BandRequirements::across_layouts(layouts.iter(), &settings);
+		assert_product_0127_matrix_entry(
+			"faceted union",
+			union.y[1].clone(),
+			108.0,
+			81.0,
+			&settings,
+		);
+		assert_eq!(
+			union.estimated_y_width(settings.y_tick_size.pixels()),
+			81.0,
+			"the grid requirement takes the maximum selected cell label once"
+		);
 	}
 
 	#[test]
@@ -4086,6 +4311,323 @@ mod product_0067_0068_strata_oracles {
 	}
 
 	#[test]
+	fn product_0127_selected_requirement_matches_the_emitted_tick_text() {
+		let mut settings = settings();
+		settings.y_tick_placement = TickPlacement::DEFAULT;
+		let layout = PlotLayout::CategoricalX {
+			categories: vec!["A".to_owned(), "B".to_owned()],
+			y_range: (0.0, 100.0),
+			y_axis_type: AxisType::Linear,
+		};
+		let requirements = BandRequirements::from_layout(&layout, &settings);
+		let AxisBandRequirement::Formatted {
+			domain,
+			axis_type,
+			placement,
+		} = requirements
+			.y
+			.as_slice()
+			.first()
+			.expect("numeric y requirement")
+		else {
+			panic!("categorical x owns one formatted y requirement")
+		};
+		let selected = placement
+			.positions(*domain)
+			.expect("default count selection")
+			.into_iter()
+			.map(|value| format_label(value, *axis_type))
+			.collect::<Vec<_>>();
+		let emitted = render(layout, settings, false)
+			.into_iter()
+			.filter_map(|operation| match operation {
+				Operation::Text(text) if text.parse::<f64>().is_ok() => Some(text),
+				_ => None,
+			})
+			.collect::<Vec<_>>();
+
+		assert_eq!(
+			emitted, selected,
+			"the requirement measures exactly the pre-layout values the draw path emits"
+		);
+	}
+
+	#[test]
+	fn product_0127_empty_selections_change_only_the_requirement() {
+		for (y_range, placement, message) in [
+			(
+				(1.0, 24.0),
+				TickPlacement::step(25.0).expect("valid empty step"),
+				"valid empty selection",
+			),
+			(
+				(0.0, 100.0),
+				TickPlacement::step(0.000_001).expect("over-capacity step"),
+				"refused selection",
+			),
+		] {
+			let mut settings = settings();
+			settings.y_tick_placement = placement;
+			let layout = PlotLayout::CategoricalX {
+				categories: vec!["A".to_owned(), "B".to_owned()],
+				y_range,
+				y_axis_type: AxisType::Linear,
+			};
+			let requirements = BandRequirements::from_layout(&layout, &settings);
+			assert_eq!(
+				requirements.estimated_y_width(settings.y_tick_size.pixels()),
+				0.0,
+				"{message} reserves no tick-label width"
+			);
+			assert!(
+				!render(layout, settings, false)
+					.into_iter()
+					.any(|operation| {
+						matches!(operation, Operation::Text(text) if text.parse::<f64>().is_ok())
+					}),
+				"{message} already emitted no numeric tick labels; PRODUCT-0127 changes only its band requirement"
+			);
+		}
+	}
+
+	fn product_0127_y_tick_trace(
+		domain: (f64, f64),
+		axis_type: AxisType,
+		placement: TickPlacement,
+	) -> Vec<String> {
+		let mut settings = settings();
+		settings.y_tick_placement = placement;
+		render(
+			PlotLayout::CategoricalX {
+				categories: vec!["PRODUCT-0127 category sentinel".to_owned()],
+				y_range: domain,
+				y_axis_type: axis_type,
+			},
+			settings,
+			false,
+		)
+		.into_iter()
+		.filter_map(|operation| match operation {
+			Operation::Text(text) if text != "PRODUCT-0127 category sentinel" => Some(text),
+			_ => None,
+		})
+		.collect()
+	}
+
+	#[test]
+	fn product_0127_banks_each_temporal_variant_by_placement_policy() {
+		for (name, domain, axis_type, selected_width, expected_trace) in [
+			(
+				"Date",
+				(20_000.0, 20_010.0),
+				AxisType::Date,
+				135.0,
+				&[
+					"2024-10-04",
+					"2024-10-05",
+					"2024-10-06",
+					"2024-10-07",
+					"2024-10-09",
+					"2024-10-10",
+					"2024-10-11",
+					"2024-10-12",
+					"2024-10-14",
+				][..],
+			),
+			(
+				"negative-year Date",
+				(-999_999.0, 20_000.0),
+				AxisType::Date,
+				148.5,
+				&[
+					"-0768-02-05",
+					"-0419-03-07",
+					"-0070-04-07",
+					"0279-05-07",
+					"0628-06-06",
+					"0977-07-06",
+					"1326-08-06",
+					"1675-09-05",
+					"2024-10-04",
+				][..],
+			),
+			(
+				"millisecond DateTime",
+				(1_700_000_000_000.0, 1_700_000_010_000.0),
+				AxisType::Datetime(TimeUnit::Milliseconds),
+				256.5,
+				&[
+					"2023-11-14 22:13:20",
+					"2023-11-14 22:13:21",
+					"2023-11-14 22:13:22",
+					"2023-11-14 22:13:23",
+					"2023-11-14 22:13:25",
+					"2023-11-14 22:13:26",
+					"2023-11-14 22:13:27",
+					"2023-11-14 22:13:28",
+					"2023-11-14 22:13:30",
+				][..],
+			),
+			(
+				"epoch millisecond DateTime",
+				(0.0, 10_000.0),
+				AxisType::Datetime(TimeUnit::Milliseconds),
+				256.5,
+				&[
+					"1970-01-01 00:00:00",
+					"1970-01-01 00:00:01",
+					"1970-01-01 00:00:02",
+					"1970-01-01 00:00:03",
+					"1970-01-01 00:00:05",
+					"1970-01-01 00:00:06",
+					"1970-01-01 00:00:07",
+					"1970-01-01 00:00:08",
+					"1970-01-01 00:00:10",
+				][..],
+			),
+			(
+				"microsecond DateTime",
+				(0.0, 10_000_000.0),
+				AxisType::Datetime(TimeUnit::Microseconds),
+				256.5,
+				&[
+					"1970-01-01 00:00:00",
+					"1970-01-01 00:00:01",
+					"1970-01-01 00:00:02",
+					"1970-01-01 00:00:03",
+					"1970-01-01 00:00:05",
+					"1970-01-01 00:00:06",
+					"1970-01-01 00:00:07",
+					"1970-01-01 00:00:08",
+					"1970-01-01 00:00:10",
+				][..],
+			),
+			(
+				"nanosecond DateTime",
+				(0.0, 10_000_000_000.0),
+				AxisType::Datetime(TimeUnit::Nanoseconds),
+				256.5,
+				&[
+					"1970-01-01 00:00:00",
+					"1970-01-01 00:00:01",
+					"1970-01-01 00:00:02",
+					"1970-01-01 00:00:03",
+					"1970-01-01 00:00:05",
+					"1970-01-01 00:00:06",
+					"1970-01-01 00:00:07",
+					"1970-01-01 00:00:08",
+					"1970-01-01 00:00:10",
+				][..],
+			),
+			(
+				"Time",
+				(0.0, 1_000_000_000.0),
+				AxisType::Time,
+				162.0,
+				&[
+					"00:00:00.000",
+					"00:00:00.125",
+					"00:00:00.250",
+					"00:00:00.375",
+					"00:00:00.500",
+					"00:00:00.625",
+					"00:00:00.750",
+					"00:00:00.875",
+					"00:00:01.000",
+				][..],
+			),
+		] {
+			let requirement = AxisBandRequirement::Formatted {
+				domain,
+				axis_type,
+				placement: TickPlacement::DEFAULT,
+			};
+			assert_eq!(
+				requirement.estimated_width(18.0),
+				selected_width,
+				"{name} preserves its separately banked Count width"
+			);
+			assert_eq!(
+				product_0127_y_tick_trace(domain, axis_type, TickPlacement::DEFAULT),
+				expected_trace
+					.iter()
+					.map(|label| (*label).to_owned())
+					.collect::<Vec<_>>(),
+				"{name} preserves its separately banked Count operation trace"
+			);
+		}
+
+		for (name, domain, axis_type, placement, previous_width, selected_width, expected_trace) in [
+			(
+				"wide Date Step",
+				(-900_000.0, 900_000.0),
+				AxisType::Date,
+				TickPlacement::Step(PositiveFinite(700_000.0)),
+				148.5,
+				135.0,
+				&["0053-06-19", "1970-01-01", "3886-07-15"][..],
+			),
+			(
+				"past-chrono millisecond DateTime Step",
+				(0.0, 1_000_000_000_000_000_000.0),
+				AxisType::Datetime(TimeUnit::Milliseconds),
+				TickPlacement::Step(PositiveFinite(300_000_000_000_000_000.0)),
+				283.5,
+				270.0,
+				&[
+					"1970-01-01 00:00:00",
+					"300000000000000000.0",
+					"600000000000000000.0",
+					"900000000000000000.0",
+				][..],
+			),
+		] {
+			let requirement = AxisBandRequirement::Formatted {
+				domain,
+				axis_type,
+				placement,
+			};
+			assert_eq!(
+				requirement.estimated_width(18.0),
+				selected_width,
+				"{name} selected width"
+			);
+			assert_eq!(
+				selected_width - previous_width,
+				-13.5,
+				"{name} preserves its separately banked Step delta"
+			);
+			assert_eq!(
+				product_0127_y_tick_trace(domain, axis_type, placement),
+				expected_trace
+					.iter()
+					.map(|label| (*label).to_owned())
+					.collect::<Vec<_>>(),
+				"{name} preserves its separately banked Step operation trace"
+			);
+		}
+
+		assert_eq!(
+			render(
+				PlotLayout::CategoricalXY {
+					x_categories: vec!["Quarter".to_owned()],
+					y_categories: vec!["North".to_owned(), "South".to_owned()],
+				},
+				settings(),
+				false,
+			)
+			.into_iter()
+			.filter_map(|operation| match operation {
+				Operation::Text(text) => Some(text),
+				_ => None,
+			})
+			.collect::<Vec<_>>(),
+			["Quarter", "North", "South"],
+			"categorical labels retain their exact operation trace without a formatted requirement"
+		);
+	}
+
+	#[test]
 	fn product_0113_heading_band_is_the_maximum_of_typed_title_and_subtitle_contributions() {
 		let title = |pixels| TitleTextSize::new(pixels).unwrap();
 		let subtitle = |pixels| SubtitleTextSize::new(pixels).unwrap();
@@ -4142,7 +4684,7 @@ mod product_0067_0068_strata_oracles {
 		};
 		let bounds = Rectangle::new(Point::ORIGIN, iced::Size::new(200.0, 120.0));
 		let layout = kernel.layout(settings.clone());
-		let requirements = BandRequirements::from_layout(&layout);
+		let requirements = BandRequirements::from_layout(&layout, &settings);
 		let plot_area = widget
 			.plot_area(Rect::from_iced_frame(bounds), &requirements)
 			.into_iced();
