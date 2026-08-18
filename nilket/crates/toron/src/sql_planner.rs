@@ -6700,9 +6700,9 @@ impl SqlPlanner {
 			}
 			SqlExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.lower_expr(expr)?))),
 			SqlExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.lower_expr(expr)?))),
-			SqlExpr::Extract { field, expr, .. } => Ok(Expr::Extract(
+			SqlExpr::Extract { field, expr, .. } => Ok(crate::ir::extract_scalar_function(
 				lower_extract_datetime_field(field)?,
-				Box::new(self.lower_expr(expr)?),
+				self.lower_expr(expr)?,
 			)),
 			SqlExpr::Substring {
 				expr,
@@ -6742,6 +6742,7 @@ impl SqlPlanner {
 				Ok(Expr::ScalarFunction {
 					id: crate::ir::ScalarFunctionId::Substring,
 					args,
+					parameter: crate::ir::ScalarFunctionParameter::None,
 				})
 			}
 			SqlExpr::AtTimeZone {
@@ -6766,6 +6767,7 @@ impl SqlPlanner {
 				Ok(Expr::ScalarFunction {
 					id: crate::ir::ScalarFunctionId::Floor,
 					args: vec![self.lower_expr(expr)?],
+					parameter: crate::ir::ScalarFunctionParameter::None,
 				})
 			}
 			// TRIM's specification forms select a side and a trim character set.
@@ -6785,6 +6787,7 @@ impl SqlPlanner {
 				Ok(Expr::ScalarFunction {
 					id: crate::ir::ScalarFunctionId::Trim,
 					args: vec![self.lower_expr(expr)?],
+					parameter: crate::ir::ScalarFunctionParameter::None,
 				})
 			}
 			// CEIL has its own grammar form, so it never reaches the registry's
@@ -6801,6 +6804,7 @@ impl SqlPlanner {
 				Ok(Expr::ScalarFunction {
 					id: crate::ir::ScalarFunctionId::Ceil,
 					args: vec![self.lower_expr(expr)?],
+					parameter: crate::ir::ScalarFunctionParameter::None,
 				})
 			}
 			SqlExpr::Nested(expr) => self.lower_expr(expr),
@@ -6826,7 +6830,7 @@ impl SqlPlanner {
 					)?;
 					let field = lower_temporal_extract_name(&field)?;
 					let expr = self.lower_arg(&args[1])?;
-					Ok(Expr::Extract(field, Box::new(expr)))
+					Ok(crate::ir::extract_scalar_function(field, expr))
 				}
 				None if function_name_eq(&f.name, "DATE_TRUNC") => {
 					let args = function_arg_list(&f.args, "date_trunc expects arguments")?;
@@ -6839,7 +6843,7 @@ impl SqlPlanner {
 					)?;
 					let field = lower_temporal_trunc_name(&field)?;
 					let expr = self.lower_arg(&args[1])?;
-					Ok(Expr::DateTrunc(field, Box::new(expr)))
+					Ok(crate::ir::date_trunc_scalar_function(field, expr))
 				}
 				None if function_name_eq(&f.name, "TIME_BUCKET") => {
 					let args = match &f.args {
@@ -6904,7 +6908,11 @@ impl SqlPlanner {
 			.into_iter()
 			.map(|arg| self.lower_expr(arg))
 			.collect::<Result<Vec<_>, _>>()?;
-		Ok(Some(Expr::ScalarFunction { id, args }))
+		Ok(Some(Expr::ScalarFunction {
+			id,
+			args,
+			parameter: crate::ir::ScalarFunctionParameter::None,
+		}))
 	}
 
 	fn lower_if(&self, function: &Function) -> Result<Expr, FrontendError> {
@@ -7357,9 +7365,7 @@ fn validate_hidden_sort_key_refs(
 		Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::Like { expr: inner, .. }
-		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner) => validate_hidden_sort_key_refs(inner, visible_names),
+		| Expr::Like { expr: inner, .. } => validate_hidden_sort_key_refs(inner, visible_names),
 		Expr::InList { expr, list, .. } => {
 			validate_hidden_sort_key_refs(expr, visible_names)?;
 			for item in list {
@@ -8102,7 +8108,7 @@ impl Hash for GroupedAggregateSignature {
 	}
 }
 
-fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
+pub(crate) fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 	match expr {
 		Expr::Column(column) => {
 			0u8.hash(state);
@@ -8260,19 +8266,14 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 				hash_expr_structural(else_expr, state);
 			}
 		}
-		Expr::Extract(field, inner) => {
-			26u8.hash(state);
-			field.hash(state);
-			hash_expr_structural(inner, state);
-		}
-		Expr::DateTrunc(field, inner) => {
-			27u8.hash(state);
-			field.hash(state);
-			hash_expr_structural(inner, state);
-		}
-		Expr::ScalarFunction { id, args } => {
+		Expr::ScalarFunction {
+			id,
+			args,
+			parameter,
+		} => {
 			32u8.hash(state);
 			id.hash(state);
+			parameter.hash(state);
 			args.len().hash(state);
 			for arg in args {
 				hash_expr_structural(arg, state);
@@ -8344,23 +8345,20 @@ pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 		(Expr::Not(left), Expr::Not(right))
 		| (Expr::IsNull(left), Expr::IsNull(right))
 		| (Expr::IsNotNull(left), Expr::IsNotNull(right)) => expr_structural_eq(left, right),
-		(Expr::Extract(left_field, left), Expr::Extract(right_field, right)) => {
-			left_field == right_field && expr_structural_eq(left, right)
-		}
-		(Expr::DateTrunc(left_field, left), Expr::DateTrunc(right_field, right)) => {
-			left_field == right_field && expr_structural_eq(left, right)
-		}
 		(
 			Expr::ScalarFunction {
 				id: left_id,
 				args: left_args,
+				parameter: left_parameter,
 			},
 			Expr::ScalarFunction {
 				id: right_id,
 				args: right_args,
+				parameter: right_parameter,
 			},
 		) => {
 			left_id == right_id
+				&& left_parameter == right_parameter
 				&& left_args.len() == right_args.len()
 				&& left_args
 					.iter()
@@ -8725,9 +8723,7 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::Like { expr: inner, .. }
-		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner) => expr_contains_qualified_column(inner),
+		| Expr::Like { expr: inner, .. } => expr_contains_qualified_column(inner),
 		Expr::InList { expr, list, .. } => {
 			expr_contains_qualified_column(expr) || list.iter().any(expr_contains_qualified_column)
 		}
@@ -9675,7 +9671,7 @@ fn grouped_aggregate_signature(
 	}
 }
 
-fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
+pub(crate) fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 	match expr {
 		Expr::Column(column) => Expr::column(column.name.0.clone()),
 		Expr::Literal(_) | Expr::UntypedNull => expr.clone(),
@@ -9764,19 +9760,18 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 		Expr::IsNotNull(inner) => {
 			Expr::IsNotNull(Box::new(canonical_aggregate_signature_expr(inner)))
 		}
-		Expr::ScalarFunction { id, args } => Expr::ScalarFunction {
+		Expr::ScalarFunction {
+			id,
+			args,
+			parameter,
+		} => Expr::ScalarFunction {
 			id: *id,
 			args: args
 				.iter()
 				.map(canonical_aggregate_signature_expr)
 				.collect(),
+			parameter: parameter.clone(),
 		},
-		Expr::Extract(field, inner) => {
-			Expr::Extract(*field, Box::new(canonical_aggregate_signature_expr(inner)))
-		}
-		Expr::DateTrunc(field, inner) => {
-			Expr::DateTrunc(*field, Box::new(canonical_aggregate_signature_expr(inner)))
-		}
 	}
 }
 
@@ -11792,8 +11787,6 @@ mod tests {
 			| Expr::Not(expr)
 			| Expr::IsNull(expr)
 			| Expr::IsNotNull(expr)
-			| Expr::Extract(_, expr)
-			| Expr::DateTrunc(_, expr)
 			| Expr::Cast(expr, _)
 			| Expr::TryCast(expr, _) => expr_references(expr, qualifier, name),
 			Expr::Add(left, right)
@@ -11847,6 +11840,7 @@ mod tests {
 			[Expr::ScalarFunction {
 				id: crate::ir::ScalarFunctionId::Exp,
 				args,
+				..
 			}] if matches!(args.as_slice(), [Expr::Column(column)] if column.name.0 == "price")
 		));
 	}

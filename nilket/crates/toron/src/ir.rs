@@ -543,6 +543,7 @@ pub fn time_bucket_scalar_function(interval: std::time::Duration, input: Expr) -
 			)),
 			input,
 		],
+		parameter: ScalarFunctionParameter::None,
 	}
 }
 
@@ -553,6 +554,29 @@ pub fn at_time_zone_scalar_function(input: Expr, zone: String) -> Expr {
 	Expr::ScalarFunction {
 		id: ScalarFunctionId::AtTimeZone,
 		args: vec![input, Expr::Literal(ScalarValue::Utf8(Some(zone)))],
+		parameter: ScalarFunctionParameter::None,
+	}
+}
+
+pub fn extract_scalar_function(field: TemporalExtractField, input: Expr) -> Expr {
+	Expr::ScalarFunction {
+		id: ScalarFunctionId::Extract,
+		args: vec![input],
+		parameter: ScalarFunctionParameter::Extract(Box::new(ExtractScalarFunctionParameter {
+			field,
+			zone: None,
+		})),
+	}
+}
+
+pub fn date_trunc_scalar_function(field: TemporalTruncField, input: Expr) -> Expr {
+	Expr::ScalarFunction {
+		id: ScalarFunctionId::DateTrunc,
+		args: vec![input],
+		parameter: ScalarFunctionParameter::DateTrunc(Box::new(DateTruncScalarFunctionParameter {
+			field,
+			zone: None,
+		})),
 	}
 }
 
@@ -564,10 +588,14 @@ pub fn as_at_time_zone(expr: &Expr) -> Option<(&Expr, &str)> {
 	let Expr::ScalarFunction {
 		id: ScalarFunctionId::AtTimeZone,
 		args,
+		parameter,
 	} = expr
 	else {
 		return None;
 	};
+	if !matches!(parameter, ScalarFunctionParameter::None) {
+		return None;
+	}
 	match args.as_slice() {
 		[input, Expr::Literal(ScalarValue::Utf8(Some(zone)))] => Some((input, zone.as_str())),
 		_ => None,
@@ -933,9 +961,8 @@ pub enum Expr {
 	ScalarFunction {
 		id: ScalarFunctionId,
 		args: Vec<Expr>,
+		parameter: ScalarFunctionParameter,
 	},
-	Extract(TemporalExtractField, Box<Expr>),
-	DateTrunc(TemporalTruncField, Box<Expr>),
 }
 
 impl Expr {
@@ -959,7 +986,7 @@ impl Expr {
 	pub fn is_deterministic(&self) -> bool {
 		match self {
 			Self::Column(_) | Self::Literal(_) | Self::UntypedNull => true,
-			Self::ScalarFunction { id, args } => {
+			Self::ScalarFunction { id, args, .. } => {
 				scalar_function_metadata(*id).deterministic
 					&& args.iter().all(Self::is_deterministic)
 			}
@@ -971,9 +998,7 @@ impl Expr {
 			| Self::Not(inner)
 			| Self::IsNull(inner)
 			| Self::IsNotNull(inner)
-			| Self::Like { expr: inner, .. }
-			| Self::Extract(_, inner)
-			| Self::DateTrunc(_, inner) => inner.is_deterministic(),
+			| Self::Like { expr: inner, .. } => inner.is_deterministic(),
 			Self::Add(left, right)
 			| Self::Sub(left, right)
 			| Self::Mul(left, right)
@@ -1016,10 +1041,8 @@ impl Expr {
 			| Self::Mul(_, _)
 			| Self::Div(_, _)
 			| Self::Like { .. }
-			| Self::Case { .. }
-			| Self::Extract(_, _)
-			| Self::DateTrunc(_, _) => false,
-			Self::ScalarFunction { id, args } => {
+			| Self::Case { .. } => false,
+			Self::ScalarFunction { id, args, .. } => {
 				scalar_function_metadata(*id).pbc_pushdown_eligible
 					&& args.iter().all(Self::is_pbc_pushdown_eligible)
 			}

@@ -518,8 +518,7 @@ pub(crate) fn adr025_order_by_cast_uses_hidden_sort_projection() {
 	assert!(validator.contains("Expr::SqlLogicalCast { expr: inner, .. }"));
 	assert!(validator.contains("| Expr::Cast(inner, _)"));
 	assert!(validator.contains("| Expr::TryCast(inner, _)"));
-	assert!(validator.contains("| Expr::Extract(_, inner)"));
-	assert!(validator.contains("| Expr::DateTrunc(_, inner)"));
+	assert!(validator.contains("Expr::ScalarFunction { args, .. }"));
 	assert!(!planner.contains("fn expr_contains_cast_family"));
 
 	let hidden_projection = brace_blocks_after_marker(&planner, "fn add_hidden_sort_projection")
@@ -1068,8 +1067,7 @@ pub(crate) fn adr027_hidden_sort_key_refs_are_visible_outputs() {
 	for op in ["Not", "IsNull", "IsNotNull"] {
 		assert!(validator.contains(&format!("Expr::{op}(inner)")));
 	}
-	assert!(validator.contains("| Expr::Extract(_, inner)"));
-	assert!(validator.contains("| Expr::DateTrunc(_, inner)"));
+	assert!(validator.contains("Expr::ScalarFunction { args, .. }"));
 }
 
 #[test]
@@ -1176,8 +1174,6 @@ pub(crate) fn adr028_aggregate_signature_visitors_are_exhaustive() {
 		"Expr::Not",
 		"Expr::IsNull",
 		"Expr::IsNotNull",
-		"Expr::Extract",
-		"Expr::DateTrunc",
 		"Expr::ScalarFunction",
 	] {
 		assert!(

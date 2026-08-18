@@ -10,8 +10,8 @@ use crate::catalog::{
 pub use crate::distributed::identity::QueryId;
 use crate::ir::{
 	AggregateFunction, CreateTableRowIdentity, JoinKind, JoinStrategy, LogicalTypeId,
-	ScalarFunctionId, ScalarValue, TemporalExtractField, TemporalTruncField, WindowFrame,
-	WindowFunction, field_with_logical_type_metadata,
+	ScalarFunctionId, ScalarFunctionParameter, ScalarValue, WindowFrame, WindowFunction,
+	field_with_logical_type_metadata,
 };
 use crate::ir::{QueryProfileHint, TableId};
 use crate::storage::RowIdentityProjection;
@@ -118,16 +118,7 @@ pub enum BoundExprNode {
 	ScalarFunction {
 		id: ScalarFunctionId,
 		args: Vec<BoundExprId>,
-	},
-	Extract {
-		field: TemporalExtractField,
-		zone: Option<String>,
-		input: BoundExprId,
-	},
-	DateTrunc {
-		field: TemporalTruncField,
-		zone: String,
-		input: BoundExprId,
+		parameter: ScalarFunctionParameter,
 	},
 }
 
@@ -629,32 +620,32 @@ impl BoundExprProgramBuilder {
 		args: Vec<BoundExprId>,
 		output_type: DataType,
 	) -> BoundExprId {
+		self.append_parameterized_scalar_function(
+			id,
+			args,
+			ScalarFunctionParameter::None,
+			output_type,
+		)
+	}
+
+	pub fn append_parameterized_scalar_function(
+		&mut self,
+		id: ScalarFunctionId,
+		args: Vec<BoundExprId>,
+		parameter: ScalarFunctionParameter,
+		output_type: DataType,
+	) -> BoundExprId {
 		for arg in &args {
 			self.assert_existing_child(*arg);
 		}
-		self.append_node(BoundExprNode::ScalarFunction { id, args }, output_type)
-	}
-
-	pub fn append_extract(
-		&mut self,
-		field: TemporalExtractField,
-		zone: Option<String>,
-		input: BoundExprId,
-		output_type: DataType,
-	) -> BoundExprId {
-		self.assert_existing_child(input);
-		self.append_node(BoundExprNode::Extract { field, zone, input }, output_type)
-	}
-
-	pub fn append_date_trunc(
-		&mut self,
-		field: TemporalTruncField,
-		zone: String,
-		input: BoundExprId,
-		output_type: DataType,
-	) -> BoundExprId {
-		self.assert_existing_child(input);
-		self.append_node(BoundExprNode::DateTrunc { field, zone, input }, output_type)
+		self.append_node(
+			BoundExprNode::ScalarFunction {
+				id,
+				args,
+				parameter,
+			},
+			output_type,
+		)
 	}
 
 	pub fn push_root(&mut self, id: BoundExprId) {
@@ -845,7 +836,7 @@ impl BoundExprProgram {
 				}
 				Some(nullable)
 			}
-			BoundExprNode::ScalarFunction { id, args } => {
+			BoundExprNode::ScalarFunction { id, args, .. } => {
 				match crate::ir::scalar_function_metadata(*id).null_behavior {
 					crate::ir::ScalarFunctionNullBehavior::Propagates => args
 						.iter()
@@ -853,9 +844,6 @@ impl BoundExprProgram {
 						.collect::<Option<Vec<_>>>()
 						.map(|nullability| nullability.into_iter().any(|nullable| nullable)),
 				}
-			}
-			BoundExprNode::Extract { input, .. } | BoundExprNode::DateTrunc { input, .. } => {
-				self.node_nullable(*input)
 			}
 		}
 	}
@@ -1006,33 +994,27 @@ impl BoundExprProgram {
 				parts.push("END".to_string());
 				parts.join(" ")
 			}
-			BoundExprNode::ScalarFunction { id, args } => format!(
-				"{}({})",
+			BoundExprNode::ScalarFunction {
+				id,
+				args,
+				parameter,
+			} => format!(
+				"{}{}({})",
 				crate::ir::scalar_function_metadata(*id).sql_name,
+				match parameter {
+					ScalarFunctionParameter::None => "".to_string(),
+					ScalarFunctionParameter::Extract(payload) => {
+						format!("<{}>", payload.field.as_str())
+					}
+					ScalarFunctionParameter::DateTrunc(payload) => {
+						format!("<{}>", payload.field.as_str())
+					}
+				},
 				args.iter()
 					.map(|arg| self.pretty_node(*arg))
 					.collect::<Vec<_>>()
 					.join(", ")
 			),
-			BoundExprNode::Extract { field, zone, input } => match zone {
-				Some(zone) => format!(
-					"EXTRACT({} FROM {} AT {zone:?})",
-					field.as_str(),
-					self.pretty_node(*input)
-				),
-				None => format!(
-					"EXTRACT({} FROM {})",
-					field.as_str(),
-					self.pretty_node(*input)
-				),
-			},
-			BoundExprNode::DateTrunc { field, zone, input } => {
-				format!(
-					"DATE_TRUNC({}, {} AT {zone:?})",
-					field.as_str(),
-					self.pretty_node(*input)
-				)
-			}
 		}
 	}
 }
@@ -1045,9 +1027,7 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		BoundExprNode::Cast { input, .. }
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
-		| BoundExprNode::Like { expr: input, .. }
-		| BoundExprNode::Extract { input, .. }
-		| BoundExprNode::DateTrunc { input, .. } => vec![*input],
+		| BoundExprNode::Like { expr: input, .. } => vec![*input],
 		BoundExprNode::ScalarFunction { args, .. } => args.clone(),
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {

@@ -4951,9 +4951,7 @@ fn collect_program_node_columns(
 		Some(BoundExprNode::Cast { input, .. })
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
-		| Some(BoundExprNode::Like { expr: input, .. })
-		| Some(BoundExprNode::Extract { input, .. })
-		| Some(BoundExprNode::DateTrunc { input, .. }) => {
+		| Some(BoundExprNode::Like { expr: input, .. }) => {
 			collect_program_node_columns(program, *input, columns);
 		}
 		Some(BoundExprNode::Binary { left, right, .. }) => {
@@ -5142,13 +5140,11 @@ fn bind_expr_into_program(
 			let inner = bind_null_test_input(builder, input_schema, ctx, inner)?;
 			Ok(builder.append_unary(BoundUnaryOp::IsNotNull, inner, DataType::Boolean))
 		}
-		Expr::ScalarFunction { id, args } => {
-			bind_scalar_function(builder, input_schema, ctx, *id, args)
-		}
-		Expr::Extract(field, inner) => {
-			bind_temporal_extract(builder, input_schema, ctx, *field, inner)
-		}
-		Expr::DateTrunc(field, inner) => bind_date_trunc(builder, input_schema, ctx, *field, inner),
+		Expr::ScalarFunction {
+			id,
+			args,
+			parameter,
+		} => bind_scalar_function(builder, input_schema, ctx, *id, args, parameter),
 	}
 }
 

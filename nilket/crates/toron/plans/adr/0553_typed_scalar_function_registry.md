@@ -73,12 +73,13 @@ about what kind of thing it is, not about which surface may spell it.
 
 ### 4. Grandfathered variants are a closed, enumerated set
 
-`TimeBucket`, `AtTimeZone`, `Extract`, `DateTrunc`, and `Substring` remain
-expression variants, **by name**. `FLOOR` migrated to the registry on
-2026-08-17, preserving its narrower integer-or-float domain and evaluation-time
-non-finite rejection; the closed list therefore shrank from six to five. `Case`,
-`IsNull`, and `IsNotNull` are control and predicate forms rather than functions
-and are not registry candidates.
+Before the final temporal cut, `TimeBucket`, `AtTimeZone`, `Extract`,
+`DateTrunc`, and `Substring` were the remaining expression variants, **by name**.
+`FLOOR` migrated to the registry on 2026-08-17, and the other grandfathered
+variants migrated in the preceding cuts. `EXTRACT` and `DATE_TRUNC` now complete
+that work, so the closed list is empty: every scalar function is represented by
+`Expr::ScalarFunction`. `Case`, `IsNull`, and `IsNotNull` are control and
+predicate forms rather than functions and are not registry candidates.
 
 The list is names, never a predicate. "Temporal functions may remain variants" is
 a loophole that readmits the pattern under a rule; a finite list of five either
@@ -391,9 +392,9 @@ back from `Utf8 | LargeUtf8` before it shipped, and its error text still reads
 that `SUBSTRING` gains a **Rune spelling** it never had — required by the
 one-identifier-two-spellings rule, and a standing §3 defect until now.
 
-The grandfathered list is four.
+The grandfathered list was two before the final temporal cut.
 
-**Decided, not yet built: keyword parameters get a typed payload.** Four
+**Implemented: keyword parameters get a typed payload.** Four
 migrations established that a constant parameter travels as a literal argument
 when the parameter **is a value** — integer bounds (`SUBSTRING`), an interval
 (`TIME_BUCKET`), and a zone string whose value determines the result type
@@ -406,7 +407,11 @@ and reintroduces the two-parse defect that
 **Extending `ScalarValue`** keeps the model uniform but conflates a field keyword
 with a runtime value, in a type deliberately closed to six ordered kinds. The
 decision is the third: `ScalarFunction { id, args, parameter }`, a **typed**
-payload rather than an unstructured one.
+payload rather than an unstructured one. The field is non-optional and has an
+explicit `None` variant, so “no parameter” is not conflated with an absent wire
+field or an optional member inside a temporal payload. The temporal payload
+itself is boxed to keep ordinary recursive scalar expressions compact; the outer
+parameter is stored inline so the common `None` case allocates nothing.
 
 **The payload is part of node identity, and that is the load-bearing clause.**
 It must participate in structural equality, hashing, canonical aggregate
@@ -422,6 +427,20 @@ compares, hashes, or rebuilds it gains a second component to handle. Those are t
 same 40–50 sites each migration has touched, except that this time they grow
 rather than collapse. That is the price of the honest representation, and it is
 worth paying once for both remaining functions rather than twice.
+
+**Implemented 2026-08-18.** `EXTRACT` and `DATE_TRUNC` now use the registry
+identifier and typed payload on both unbound and bound scalar nodes. SQL and Rune
+construct the same identifiers; binding uses the shared `as_at_time_zone`
+recognizer and records the resolved zone in the bound payload. Structural equality,
+hashing, canonical aggregate signatures, subgraph cloning, and temporal pushdown
+deduplication all include the payload. Non-temporal identifiers reject temporal
+payloads, and bound structural comparison is generic across registry identifiers.
+The outer-join guard reads its independent `guard_filter_pushdown_safe` registry
+property rather than treating PBC eligibility as a proxy; it remains true for
+the five established transparent functions (`SUBSTRING`, `TIME_BUCKET`,
+`AT_TIME_ZONE`, `DATE_TRUNC`, and `EXTRACT`). The acceptance gate
+`EXTRACT(HOUR FROM x) != EXTRACT(DAY FROM x)` is covered directly, and the
+grandfathered list is now empty.
 
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding

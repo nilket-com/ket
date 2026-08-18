@@ -15,6 +15,8 @@ use arrow::array::{
 	LargeStringArray, StringArray, TimestampMillisecondArray,
 };
 use arrow::datatypes::{DataType, Field, Schema};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::Hasher;
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor,
@@ -5968,12 +5970,12 @@ async fn timestamp_string_dst_fold_chooses_earlier_instant() {
 #[test]
 fn extract_hour_from_timestamp_at_time_zone_uses_named_zone() {
 	let program = bind_temporal_expr(
-		Expr::Extract(
+		crate::ir::extract_scalar_function(
 			TemporalExtractField::Hour,
-			Box::new(crate::ir::at_time_zone_scalar_function(
+			crate::ir::at_time_zone_scalar_function(
 				Expr::column("event_time"),
 				"America/Chicago".to_string(),
-			)),
+			),
 		),
 		"America/New_York",
 	);
@@ -5991,19 +5993,52 @@ fn extract_hour_from_timestamp_at_time_zone_uses_named_zone() {
 }
 
 #[test]
+fn temporal_keyword_parameter_is_part_of_expression_identity() {
+	let hour =
+		crate::ir::extract_scalar_function(TemporalExtractField::Hour, Expr::column("event_time"));
+	let day =
+		crate::ir::extract_scalar_function(TemporalExtractField::Day, Expr::column("event_time"));
+	assert!(!crate::sql_planner::expr_structural_eq(&hour, &day));
+	let mut hour_hasher = DefaultHasher::new();
+	crate::sql_planner::hash_expr_structural(&hour, &mut hour_hasher);
+	let mut day_hasher = DefaultHasher::new();
+	crate::sql_planner::hash_expr_structural(&day, &mut day_hasher);
+	assert_ne!(hour_hasher.finish(), day_hasher.finish());
+	let canonical_hour = crate::sql_planner::canonical_aggregate_signature_expr(&hour);
+	let canonical_day = crate::sql_planner::canonical_aggregate_signature_expr(&day);
+	assert!(!crate::sql_planner::expr_structural_eq(
+		&canonical_hour,
+		&canonical_day
+	));
+}
+
+#[test]
+fn binder_rejects_a_scalar_parameter_on_a_non_temporal_function() {
+	let error = try_bind_temporal_expr(
+		Expr::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::Abs,
+			args: vec![Expr::column("event_time")],
+			parameter: crate::ir::ScalarFunctionParameter::Extract(Box::new(
+				crate::ir::ExtractScalarFunctionParameter {
+					field: TemporalExtractField::Hour,
+					zone: None,
+				},
+			)),
+		},
+		"UTC",
+	)
+	.expect_err("ABS must reject a temporal parameter");
+	assert!(matches!(error, BindingError::TypeMismatch { .. }));
+}
+
+#[test]
 fn extract_utc_column_without_at_time_zone_uses_session_zone() {
 	let central = bind_temporal_expr(
-		Expr::Extract(
-			TemporalExtractField::Hour,
-			Box::new(Expr::column("event_time")),
-		),
+		crate::ir::extract_scalar_function(TemporalExtractField::Hour, Expr::column("event_time")),
 		"America/Chicago",
 	);
 	let eastern = bind_temporal_expr(
-		Expr::Extract(
-			TemporalExtractField::Hour,
-			Box::new(Expr::column("event_time")),
-		),
+		crate::ir::extract_scalar_function(TemporalExtractField::Hour, Expr::column("event_time")),
 		"America/New_York",
 	);
 	let batch = temporal_batch(timestamp_ms("2024-01-01T06:30:00Z"), 0);
@@ -6033,12 +6068,9 @@ fn extract_utc_column_without_at_time_zone_uses_session_zone() {
 #[test]
 fn extract_at_time_zone_utc_uses_utc_not_session_zone() {
 	let program = bind_temporal_expr(
-		Expr::Extract(
+		crate::ir::extract_scalar_function(
 			TemporalExtractField::Hour,
-			Box::new(crate::ir::at_time_zone_scalar_function(
-				Expr::column("event_time"),
-				"UTC".to_string(),
-			)),
+			crate::ir::at_time_zone_scalar_function(Expr::column("event_time"), "UTC".to_string()),
 		),
 		"America/Chicago",
 	);
@@ -6061,10 +6093,7 @@ fn extract_at_time_zone_utc_uses_utc_not_session_zone() {
 #[test]
 fn date_trunc_day_returns_utc_instant_for_session_local_midnight() {
 	let program = bind_temporal_expr(
-		Expr::DateTrunc(
-			TemporalTruncField::Day,
-			Box::new(Expr::column("event_time")),
-		),
+		crate::ir::date_trunc_scalar_function(TemporalTruncField::Day, Expr::column("event_time")),
 		"America/Chicago",
 	);
 	let outputs = Executor::evaluate_bound_program_without_storage(
@@ -6087,12 +6116,12 @@ fn date_trunc_day_returns_utc_instant_for_session_local_midnight() {
 #[test]
 fn date_trunc_day_at_time_zone_returns_utc_instant_for_local_midnight() {
 	let program = bind_temporal_expr(
-		Expr::DateTrunc(
+		crate::ir::date_trunc_scalar_function(
 			TemporalTruncField::Day,
-			Box::new(crate::ir::at_time_zone_scalar_function(
+			crate::ir::at_time_zone_scalar_function(
 				Expr::column("event_time"),
 				"America/New_York".to_string(),
-			)),
+			),
 		),
 		"America/Chicago",
 	);
@@ -6112,10 +6141,7 @@ fn date_trunc_day_at_time_zone_returns_utc_instant_for_local_midnight() {
 #[test]
 fn date_trunc_day_across_dst_reuses_adr150_gap_fold_policy() {
 	let program = bind_temporal_expr(
-		Expr::DateTrunc(
-			TemporalTruncField::Day,
-			Box::new(Expr::column("event_time")),
-		),
+		crate::ir::date_trunc_scalar_function(TemporalTruncField::Day, Expr::column("event_time")),
 		"America/Chicago",
 	);
 	let outputs = Executor::evaluate_bound_program_without_storage(
@@ -6136,9 +6162,9 @@ fn date_trunc_day_across_dst_reuses_adr150_gap_fold_policy() {
 fn date32_extract_is_civil_and_zone_free() {
 	let days = parse_date_ymd("2024-02-29").expect("date");
 	let program = bind_temporal_expr(
-		Expr::Extract(
+		crate::ir::extract_scalar_function(
 			TemporalExtractField::DayOfYear,
-			Box::new(Expr::column("signup_date")),
+			Expr::column("signup_date"),
 		),
 		"America/Chicago",
 	);
@@ -6172,12 +6198,9 @@ fn at_time_zone_rejects_date32_operand() {
 		relation_scope: None,
 	};
 	let err = bind_expr_program(
-		&[Expr::Extract(
+		&[crate::ir::extract_scalar_function(
 			TemporalExtractField::Day,
-			Box::new(crate::ir::at_time_zone_scalar_function(
-				Expr::column("signup_date"),
-				"UTC".to_string(),
-			)),
+			crate::ir::at_time_zone_scalar_function(Expr::column("signup_date"), "UTC".to_string()),
 		)],
 		&schema,
 		&ctx,
@@ -6225,9 +6248,13 @@ async fn rune_date_trunc_day_groups_event_time_in_session_zone() {
 	let root = exprs.single_root().expect("single root");
 
 	match exprs.node(root) {
-		Some(BoundExprNode::DateTrunc { field, zone, .. }) => {
-			assert_eq!(*field, TemporalTruncField::Day);
-			assert_eq!(zone, "America/Chicago");
+		Some(BoundExprNode::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::DateTrunc,
+			parameter: crate::ir::ScalarFunctionParameter::DateTrunc(payload),
+			..
+		}) => {
+			assert_eq!(payload.field, TemporalTruncField::Day);
+			assert_eq!(payload.zone.as_deref(), Some("America/Chicago"));
 		}
 		other => panic!("expected DateTrunc node, got {other:?}"),
 	}
@@ -21072,6 +21099,7 @@ fn bound_at_time_zone_zone(program: &BoundExprProgram, id: BoundExprId) -> Optio
 	let Some(BoundExprNode::ScalarFunction {
 		id: crate::ir::ScalarFunctionId::AtTimeZone,
 		args,
+		..
 	}) = program.node(id)
 	else {
 		return None;
@@ -21099,6 +21127,7 @@ fn substring_of(input: Expr, from: i64, length: Option<u64>) -> Expr {
 	Expr::ScalarFunction {
 		id: crate::ir::ScalarFunctionId::Substring,
 		args,
+		parameter: crate::ir::ScalarFunctionParameter::None,
 	}
 }
 
@@ -21145,6 +21174,7 @@ fn substring_sql_lowers_from_for_and_comma_forms() {
 		let Expr::ScalarFunction {
 			id: crate::ir::ScalarFunctionId::Substring,
 			args,
+			..
 		} = &exprs[0]
 		else {
 			panic!("expected substring expression for {sql}: {:?}", exprs[0]);

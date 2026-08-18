@@ -132,7 +132,7 @@ fn valid_time_bucket_still_lowers() {
 	// ADR 553: TIME_BUCKET lowers through the registry, carrying its interval
 	// as a constant argument. Only the reading moved; the contract asserted —
 	// a 1h bucket over `ts` — is unchanged.
-	let Expr::ScalarFunction { id, args } = &exprs[0] else {
+	let Expr::ScalarFunction { id, args, .. } = &exprs[0] else {
 		panic!("expected time bucket");
 	};
 	assert_eq!(*id, toron::ir::ScalarFunctionId::TimeBucket);
@@ -155,13 +155,21 @@ fn extract_at_time_zone_lowers() {
 	let LogicalPlan::Project { exprs, .. } = plan else {
 		panic!("expected project");
 	};
-	let Expr::Extract(field, inner) = &exprs[0] else {
+	let Expr::ScalarFunction {
+		id: toron::ir::ScalarFunctionId::Extract,
+		args,
+		parameter: payload,
+	} = &exprs[0]
+	else {
 		panic!("expected extract");
 	};
-	assert_eq!(*field, TemporalExtractField::Hour);
+	let toron::ir::ScalarFunctionParameter::Extract(payload) = payload else {
+		panic!("expected extract payload");
+	};
+	assert_eq!(payload.field, TemporalExtractField::Hour);
 	// ADR 553: AT TIME ZONE lowers through the registry, carrying its zone as a
 	// constant argument. The contract asserted is unchanged.
-	let Some((inner, zone)) = toron::ir::as_at_time_zone(inner) else {
+	let Some((inner, zone)) = toron::ir::as_at_time_zone(&args[0]) else {
 		panic!("expected AT TIME ZONE operand");
 	};
 	assert_eq!(zone, "America/Chicago");
@@ -175,11 +183,19 @@ fn date_part_alias_lowers_to_extract() {
 	let LogicalPlan::Project { exprs, .. } = plan else {
 		panic!("expected project");
 	};
-	let Expr::Extract(field, inner) = &exprs[0] else {
+	let Expr::ScalarFunction {
+		id: toron::ir::ScalarFunctionId::Extract,
+		args,
+		parameter: payload,
+	} = &exprs[0]
+	else {
 		panic!("expected extract");
 	};
-	assert_eq!(*field, TemporalExtractField::DayOfYear);
-	assert_column(inner, "signup_date");
+	let toron::ir::ScalarFunctionParameter::Extract(payload) = payload else {
+		panic!("expected extract payload");
+	};
+	assert_eq!(payload.field, TemporalExtractField::DayOfYear);
+	assert_column(&args[0], "signup_date");
 }
 
 #[test]
@@ -189,11 +205,19 @@ fn date_trunc_lowers() {
 	let LogicalPlan::Project { exprs, .. } = plan else {
 		panic!("expected project");
 	};
-	let Expr::DateTrunc(field, inner) = &exprs[0] else {
+	let Expr::ScalarFunction {
+		id: toron::ir::ScalarFunctionId::DateTrunc,
+		args,
+		parameter: payload,
+	} = &exprs[0]
+	else {
 		panic!("expected date_trunc");
 	};
-	assert_eq!(*field, TemporalTruncField::Day);
-	assert_column(inner, "ts");
+	let toron::ir::ScalarFunctionParameter::DateTrunc(payload) = payload else {
+		panic!("expected date_trunc payload");
+	};
+	assert_eq!(payload.field, TemporalTruncField::Day);
+	assert_column(&args[0], "ts");
 }
 
 #[test]

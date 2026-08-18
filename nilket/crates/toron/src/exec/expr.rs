@@ -307,39 +307,61 @@ impl Executor {
 				let res = is_not_null(&arr)?;
 				Ok(Arc::new(res))
 			}
-			Expr::ScalarFunction { id, args } => {
+			Expr::ScalarFunction {
+				id,
+				args,
+				parameter,
+			} => {
+				if matches!(id, ScalarFunctionId::Extract | ScalarFunctionId::DateTrunc) {
+					let [inner] = args.as_slice() else {
+						return Err(ExecutionError::InvalidExpression {
+							message: "temporal scalar function expects one operand".to_string(),
+						});
+					};
+					let (timestamp, zone) = match crate::ir::as_at_time_zone(inner) {
+						Some((timestamp, zone)) => (timestamp, Some(zone.to_string())),
+						None => (inner, None),
+					};
+					if *id == ScalarFunctionId::DateTrunc && zone.is_none() {
+						return Err(ExecutionError::InvalidExpression {
+							message: "unbound date_trunc requires explicit AT TIME ZONE"
+								.to_string(),
+						});
+					}
+					let arr = self.evaluate_expr(timestamp, batch)?;
+					if *id == ScalarFunctionId::Extract
+						&& zone.is_none() && arr.data_type() != &DataType::Date32
+					{
+						return Err(ExecutionError::InvalidExpression {
+							message: "unbound EXTRACT on Timestamp requires explicit AT TIME ZONE"
+								.to_string(),
+						});
+					}
+					return match (id, parameter) {
+						(
+							ScalarFunctionId::Extract,
+							crate::ir::ScalarFunctionParameter::Extract(payload),
+						) => evaluate_extract(payload.field, zone.as_deref(), &arr),
+						(
+							ScalarFunctionId::DateTrunc,
+							crate::ir::ScalarFunctionParameter::DateTrunc(payload),
+						) => evaluate_date_trunc(
+							payload.field,
+							zone.as_deref()
+								.expect("unbound date_trunc zone checked above"),
+							&arr,
+						),
+						_ => Err(ExecutionError::InvalidExpression {
+							message: "temporal scalar function has the wrong parameter".to_string(),
+						}),
+					};
+				}
 				let args = args
 					.iter()
 					.map(|arg| self.evaluate_expr(arg, batch))
 					.collect::<Result<Vec<_>, ExecutionError>>()?;
-				evaluate_scalar_function(*id, &args, batch.num_rows())
+				evaluate_scalar_function(*id, &args, parameter, batch.num_rows())
 			}
-			Expr::Extract(field, inner) => match crate::ir::as_at_time_zone(inner) {
-				Some((timestamp, zone)) => {
-					let arr = self.evaluate_expr(timestamp, batch)?;
-					evaluate_extract(*field, Some(&zone.to_string()), &arr)
-				}
-				_ => {
-					let arr = self.evaluate_expr(inner, batch)?;
-					if arr.data_type() == &DataType::Date32 {
-						evaluate_extract(*field, None, &arr)
-					} else {
-						Err(ExecutionError::InvalidExpression {
-							message: "unbound EXTRACT on Timestamp requires explicit AT TIME ZONE"
-								.to_string(),
-						})
-					}
-				}
-			},
-			Expr::DateTrunc(field, inner) => match crate::ir::as_at_time_zone(inner) {
-				Some((timestamp, zone)) => {
-					let arr = self.evaluate_expr(timestamp, batch)?;
-					evaluate_date_trunc(*field, zone, &arr)
-				}
-				_ => Err(ExecutionError::InvalidExpression {
-					message: "unbound date_trunc requires explicit AT TIME ZONE".to_string(),
-				}),
-			},
 		}
 	}
 
@@ -436,20 +458,16 @@ impl Executor {
 					let else_array = evaluated_child(&outputs, *else_input)?;
 					evaluate_case(&when_then, else_array)?
 				}
-				BoundExprNode::ScalarFunction { id, args } => {
+				BoundExprNode::ScalarFunction {
+					id,
+					args,
+					parameter,
+				} => {
 					let args = args
 						.iter()
 						.map(|arg| evaluated_child(&outputs, *arg))
 						.collect::<Result<Vec<_>, ExecutionError>>()?;
-					evaluate_scalar_function(*id, &args, batch.num_rows())?
-				}
-				BoundExprNode::Extract { field, zone, input } => {
-					let arr = evaluated_child(&outputs, *input)?;
-					evaluate_extract(*field, zone.as_ref(), &arr)?
-				}
-				BoundExprNode::DateTrunc { field, zone, input } => {
-					let arr = evaluated_child(&outputs, *input)?;
-					evaluate_date_trunc(*field, zone, &arr)?
+					evaluate_scalar_function(*id, &args, parameter, batch.num_rows())?
 				}
 			};
 			outputs[idx] = Some(output);
@@ -641,6 +659,7 @@ fn evaluate_bound_unary(op: &BoundUnaryOp, arr: &ArrayRef) -> Result<ArrayRef, E
 fn evaluate_scalar_function(
 	id: ScalarFunctionId,
 	args: &[ArrayRef],
+	parameter: &crate::ir::ScalarFunctionParameter,
 	num_rows: usize,
 ) -> Result<ArrayRef, ExecutionError> {
 	let metadata = crate::ir::scalar_function_metadata(id);
@@ -651,6 +670,26 @@ fn evaluate_scalar_function(
 				metadata.sql_name,
 				args.len()
 			),
+		});
+	}
+	match (id, parameter) {
+		(ScalarFunctionId::Extract, crate::ir::ScalarFunctionParameter::Extract(payload)) => {
+			return evaluate_extract(payload.field, payload.zone.as_deref(), &args[0]);
+		}
+		(ScalarFunctionId::DateTrunc, crate::ir::ScalarFunctionParameter::DateTrunc(payload)) => {
+			return payload
+				.zone
+				.as_deref()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "bound date_trunc is missing its timezone".to_string(),
+				})
+				.and_then(|zone| evaluate_date_trunc(payload.field, zone, &args[0]));
+		}
+		_ => {}
+	}
+	if !matches!(parameter, crate::ir::ScalarFunctionParameter::None) {
+		return Err(ExecutionError::InvalidExpression {
+			message: "scalar function has the wrong parameter".to_string(),
 		});
 	}
 	match (
@@ -802,6 +841,16 @@ fn evaluate_scalar_function(
 				.collect::<Float64Array>(),
 		) as ArrayRef),
 		(
+			ScalarFunctionEvaluator::Extract | ScalarFunctionEvaluator::DateTrunc,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"internal: {} has an invalid temporal parameter",
+				metadata.sql_name
+			),
+		}),
+		(
 			ScalarFunctionEvaluator::Floor,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -811,7 +860,9 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::AtTimeZone
 			| ScalarFunctionEvaluator::Ceil
 			| ScalarFunctionEvaluator::CharLength
+			| ScalarFunctionEvaluator::DateTrunc
 			| ScalarFunctionEvaluator::Exp
+			| ScalarFunctionEvaluator::Extract
 			| ScalarFunctionEvaluator::Ln
 			| ScalarFunctionEvaluator::Lower
 			| ScalarFunctionEvaluator::Mod
@@ -1595,7 +1646,7 @@ fn evaluate_at_time_zone(arr: &ArrayRef, zone: &str) -> Result<ArrayRef, Executi
 
 fn evaluate_extract(
 	field: TemporalExtractField,
-	zone: Option<&String>,
+	zone: Option<&str>,
 	arr: &ArrayRef,
 ) -> Result<ArrayRef, ExecutionError> {
 	if let Some(zone) = zone {
@@ -3298,8 +3349,13 @@ mod tests {
 			Some(f64::NEG_INFINITY),
 			None,
 		])) as ArrayRef;
-		let output = evaluate_scalar_function(ScalarFunctionId::Exp, &[input], 1)
-			.expect("registered EXP evaluator");
+		let output = evaluate_scalar_function(
+			ScalarFunctionId::Exp,
+			&[input],
+			&crate::ir::ScalarFunctionParameter::None,
+			1,
+		)
+		.expect("registered EXP evaluator");
 		let values = output
 			.as_any()
 			.downcast_ref::<Float64Array>()
@@ -3309,6 +3365,28 @@ mod tests {
 		assert!(values.value(2).is_infinite() && values.value(2).is_sign_positive());
 		assert_eq!(values.value(3), 0.0);
 		assert!(values.is_null(4));
+	}
+
+	#[test]
+	fn executor_rejects_a_scalar_parameter_on_a_non_temporal_function() {
+		let input = Arc::new(Int32Array::from(vec![Some(1)])) as ArrayRef;
+		let error = evaluate_scalar_function(
+			ScalarFunctionId::Abs,
+			&[input],
+			&crate::ir::ScalarFunctionParameter::Extract(Box::new(
+				crate::ir::ExtractScalarFunctionParameter {
+					field: crate::ir::TemporalExtractField::Hour,
+					zone: None,
+				},
+			)),
+			1,
+		)
+		.expect_err("ABS must reject a temporal parameter");
+		assert!(matches!(
+			error,
+			ExecutionError::InvalidExpression { message }
+				if message == "scalar function has the wrong parameter"
+		));
 	}
 	use super::*;
 	#[test]

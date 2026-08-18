@@ -4,7 +4,9 @@ use std::collections::BTreeSet;
 
 use super::support::*;
 
-const GRANDFATHERED_SCALAR_VARIANTS: &[&str] = &["Extract", "DateTrunc"];
+// EXTRACT and DATE_TRUNC were the final grandfathered variants before ADR 553;
+// both now use the generic Expr::ScalarFunction representation.
+const GRANDFATHERED_SCALAR_VARIANTS: &[&str] = &[];
 
 // Every other Expr form is explicitly classified here. A new variant must be
 // classified in review; it cannot silently enlarge the scalar-function set.
@@ -159,7 +161,9 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"AtTimeZone".to_string(),
 			"Ceil".to_string(),
 			"CharLength".to_string(),
+			"DateTrunc".to_string(),
 			"Exp".to_string(),
+			"Extract".to_string(),
 			"Floor".to_string(),
 			"Greatest".to_string(),
 			"Least".to_string(),

@@ -183,19 +183,14 @@ pub(super) fn offset_bound_node(
 				.collect(),
 			else_input: offset_id(else_input),
 		},
-		BoundExprNode::ScalarFunction { id, args } => BoundExprNode::ScalarFunction {
+		BoundExprNode::ScalarFunction {
+			id,
+			args,
+			parameter,
+		} => BoundExprNode::ScalarFunction {
 			id,
 			args: args.into_iter().map(offset_id).collect(),
-		},
-		BoundExprNode::Extract { field, zone, input } => BoundExprNode::Extract {
-			field,
-			zone,
-			input: offset_id(input),
-		},
-		BoundExprNode::DateTrunc { field, zone, input } => BoundExprNode::DateTrunc {
-			field,
-			zone,
-			input: offset_id(input),
+			parameter,
 		},
 	}
 }

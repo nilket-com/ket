@@ -18,8 +18,8 @@ use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram,
 	CUSTOMER_ID_LOGICAL_TYPE, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategyIntent, LogicalPlan, ScalarFunctionId, ScalarValue, SortExpr, SystemTableKind,
-	TableId,
+	JoinStrategyIntent, LogicalPlan, ScalarFunctionId, ScalarFunctionParameter, ScalarValue,
+	SortExpr, SystemTableKind, TableId,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -2114,6 +2114,7 @@ fn adr553_floor_lowers_through_the_registry_after_migration() {
 			[Expr::ScalarFunction {
 				id: ScalarFunctionId::Floor,
 				args,
+				..
 			}] if matches!(args.as_slice(), [Expr::Column(column)] if column.name.0 == "price")
 		),
 		"FLOOR must lower through the typed scalar-function registry"
@@ -2536,6 +2537,7 @@ async fn adr553_random_is_the_registry_s_first_non_deterministic_entry() {
 	let non_deterministic = Expr::ScalarFunction {
 		id: ScalarFunctionId::Random,
 		args: Vec::new(),
+		parameter: ScalarFunctionParameter::None,
 	};
 	assert!(
 		!non_deterministic.is_deterministic(),
@@ -2546,12 +2548,14 @@ async fn adr553_random_is_the_registry_s_first_non_deterministic_entry() {
 	let carrier = Expr::ScalarFunction {
 		id: ScalarFunctionId::Abs,
 		args: vec![non_deterministic],
+		parameter: ScalarFunctionParameter::None,
 	};
 	assert!(!carrier.is_deterministic(), "ABS(RANDOM()) is not pure");
 	assert!(
 		Expr::ScalarFunction {
 			id: ScalarFunctionId::Abs,
 			args: vec![Expr::column("amount")],
+			parameter: ScalarFunctionParameter::None,
 		}
 		.is_deterministic(),
 		"an ordinary registration stays deterministic"
@@ -2567,6 +2571,7 @@ async fn adr553_non_determinism_survives_every_expression_form() {
 	let random = Expr::ScalarFunction {
 		id: ScalarFunctionId::Random,
 		args: Vec::new(),
+		parameter: ScalarFunctionParameter::None,
 	};
 	let column = || Box::new(Expr::column("amount"));
 	let impure = [
@@ -2657,6 +2662,7 @@ async fn adr553_substring_rejects_a_non_constant_bound() {
 		exprs: vec![Expr::ScalarFunction {
 			id: ScalarFunctionId::Substring,
 			args: vec![Expr::column("region"), Expr::column("amount")],
+			parameter: ScalarFunctionParameter::None,
 		}],
 		output_names: vec![None],
 	};
@@ -4850,6 +4856,7 @@ async fn floor_preserves_the_closed_numeric_type_matrix_and_nulls() {
 				expr: Box::new(Expr::column("id")),
 				logical_type: CUSTOMER_ID_LOGICAL_TYPE,
 			}],
+			parameter: ScalarFunctionParameter::None,
 		}],
 		output_names: vec![None],
 	};

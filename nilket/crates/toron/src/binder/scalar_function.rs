@@ -1,5 +1,5 @@
 use super::*;
-use crate::ir::{ScalarFunctionId, ScalarFunctionSignature};
+use crate::ir::{ScalarFunctionId, ScalarFunctionParameter, ScalarFunctionSignature};
 
 pub(super) fn bind_scalar_function(
 	builder: &mut BoundExprProgramBuilder,
@@ -7,6 +7,7 @@ pub(super) fn bind_scalar_function(
 	ctx: &ExprBindContext<'_>,
 	id: ScalarFunctionId,
 	args: &[Expr],
+	parameter: &ScalarFunctionParameter,
 ) -> Result<BoundExprId, BindingError> {
 	let metadata = crate::ir::scalar_function_metadata(id);
 	if !metadata.arity.accepts(args.len()) {
@@ -16,6 +17,53 @@ pub(super) fn bind_scalar_function(
 				metadata.sql_name,
 				metadata.arity.description(),
 				args.len()
+			),
+		});
+	}
+	match metadata.signature {
+		ScalarFunctionSignature::TemporalExtract => {
+			let [inner] = args else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			let ScalarFunctionParameter::Extract(payload) = parameter else {
+				return Err(BindingError::TypeMismatch {
+					message: "EXTRACT requires an extract field parameter".to_string(),
+				});
+			};
+			return super::arithmetic::bind_temporal_extract(
+				builder,
+				input_schema,
+				ctx,
+				id,
+				payload.field,
+				inner,
+			);
+		}
+		ScalarFunctionSignature::TemporalTrunc => {
+			let [inner] = args else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			let ScalarFunctionParameter::DateTrunc(payload) = parameter else {
+				return Err(BindingError::TypeMismatch {
+					message: "DATE_TRUNC requires a date_trunc field parameter".to_string(),
+				});
+			};
+			return super::arithmetic::bind_date_trunc(
+				builder,
+				input_schema,
+				ctx,
+				id,
+				payload.field,
+				inner,
+			);
+		}
+		_ => {}
+	}
+	if !matches!(parameter, ScalarFunctionParameter::None) {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"{} does not accept a scalar-function parameter",
+				metadata.sql_name
 			),
 		});
 	}
@@ -581,6 +629,9 @@ pub(super) fn bind_scalar_function(
 				}
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
+		}
+		ScalarFunctionSignature::TemporalExtract | ScalarFunctionSignature::TemporalTrunc => {
+			unreachable!("temporal signatures return through the parameterized binding path")
 		}
 	}
 }

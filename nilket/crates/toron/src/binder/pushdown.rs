@@ -2135,20 +2135,16 @@ pub(super) fn clone_bound_subgraph(
 			let else_input = clone_bound_subgraph(source, *else_input, builder, remap)?;
 			builder.append_case(when_then, else_input, output_type)
 		}
-		BoundExprNode::ScalarFunction { id, args } => {
+		BoundExprNode::ScalarFunction {
+			id,
+			args,
+			parameter,
+		} => {
 			let args = args
 				.iter()
 				.map(|arg| clone_bound_subgraph(source, *arg, builder, remap))
 				.collect::<Option<Vec<_>>>()?;
-			builder.append_scalar_function(*id, args, output_type)
-		}
-		BoundExprNode::Extract { field, zone, input } => {
-			let input = clone_bound_subgraph(source, *input, builder, remap)?;
-			builder.append_extract(*field, zone.clone(), input, output_type)
-		}
-		BoundExprNode::DateTrunc { field, zone, input } => {
-			let input = clone_bound_subgraph(source, *input, builder, remap)?;
-			builder.append_date_trunc(*field, zone.clone(), input, output_type)
+			builder.append_parameterized_scalar_function(*id, args, parameter.clone(), output_type)
 		}
 	};
 	if let Some(logical_type) = source.node_logical_type(id) {
@@ -2314,36 +2310,23 @@ pub(super) fn bound_subgraphs_structurally_equal_inner(
 				) && bound_subgraphs_structurally_equal_inner(source, *left_else, *right_else, seen)
 		}
 		(
-			Some(BoundExprNode::Extract {
-				field: left_field,
-				zone: left_zone,
-				input: left_input,
+			Some(BoundExprNode::ScalarFunction {
+				id: left_id,
+				args: left_args,
+				parameter: left_parameter,
 			}),
-			Some(BoundExprNode::Extract {
-				field: right_field,
-				zone: right_zone,
-				input: right_input,
-			}),
-		) => {
-			left_field == right_field
-				&& left_zone == right_zone
-				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
-		}
-		(
-			Some(BoundExprNode::DateTrunc {
-				field: left_field,
-				zone: left_zone,
-				input: left_input,
-			}),
-			Some(BoundExprNode::DateTrunc {
-				field: right_field,
-				zone: right_zone,
-				input: right_input,
+			Some(BoundExprNode::ScalarFunction {
+				id: right_id,
+				args: right_args,
+				parameter: right_parameter,
 			}),
 		) => {
-			left_field == right_field
-				&& left_zone == right_zone
-				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
+			left_id == right_id
+				&& left_parameter == right_parameter
+				&& left_args.len() == right_args.len()
+				&& left_args.iter().zip(right_args).all(|(left, right)| {
+					bound_subgraphs_structurally_equal_inner(source, *left, *right, seen)
+				})
 		}
 		_ => false,
 	}
@@ -2384,9 +2367,7 @@ pub(super) fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		BoundExprNode::Cast { input, .. }
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
-		| BoundExprNode::Like { expr: input, .. }
-		| BoundExprNode::Extract { input, .. }
-		| BoundExprNode::DateTrunc { input, .. } => vec![*input],
+		| BoundExprNode::Like { expr: input, .. } => vec![*input],
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {
 			let mut children = Vec::with_capacity(list.len() + 1);

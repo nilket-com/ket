@@ -526,6 +526,7 @@ async fn adr553_non_deterministic_right_chain_declines_while_the_pure_shape_rewr
 		Box::new(Expr::ScalarFunction {
 			id: toron::ir::ScalarFunctionId::Random,
 			args: Vec::new(),
+			parameter: toron::ir::ScalarFunctionParameter::None,
 		}),
 		Box::new(Expr::Literal(toron::ir::ScalarValue::Float64(Some(0.5)))),
 	);

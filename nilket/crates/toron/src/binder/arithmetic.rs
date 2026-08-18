@@ -1,9 +1,14 @@
 use super::*;
+use crate::ir::{
+	DateTruncScalarFunctionParameter, ExtractScalarFunctionParameter, ScalarFunctionId,
+	ScalarFunctionParameter,
+};
 
 pub(super) fn bind_temporal_extract(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
 	ctx: &ExprBindContext<'_>,
+	id: ScalarFunctionId,
 	field: TemporalExtractField,
 	inner: &Expr,
 ) -> Result<BoundExprId, BindingError> {
@@ -26,14 +31,30 @@ pub(super) fn bind_temporal_extract(
 					message: format!("EXTRACT {} is not supported for Date32", field.as_str()),
 				});
 			}
-			Ok(builder.append_extract(field, None, input, DataType::Int32))
+			Ok(builder.append_parameterized_scalar_function(
+				id,
+				vec![input],
+				ScalarFunctionParameter::Extract(Box::new(ExtractScalarFunctionParameter {
+					field,
+					zone: None,
+				})),
+				DataType::Int32,
+			))
 		}
 		DataType::Date64 => Err(BindingError::TypeMismatch {
 			message: "EXTRACT is not supported for Date64".to_string(),
 		}),
 		data_type @ DataType::Timestamp(_, _) => {
 			supported_timestamp_unit(&data_type, "EXTRACT")?;
-			Ok(builder.append_extract(field, Some(zone), input, DataType::Int32))
+			Ok(builder.append_parameterized_scalar_function(
+				id,
+				vec![input],
+				ScalarFunctionParameter::Extract(Box::new(ExtractScalarFunctionParameter {
+					field,
+					zone: Some(zone.into_boxed_str()),
+				})),
+				DataType::Int32,
+			))
 		}
 		other => Err(BindingError::TypeMismatch {
 			message: format!("EXTRACT expects Timestamp or Date32 input, got {other:?}"),
@@ -45,6 +66,7 @@ pub(super) fn bind_date_trunc(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
 	ctx: &ExprBindContext<'_>,
+	id: ScalarFunctionId,
 	field: TemporalTruncField,
 	inner: &Expr,
 ) -> Result<BoundExprId, BindingError> {
@@ -69,10 +91,13 @@ pub(super) fn bind_date_trunc(
 		}),
 		data_type @ DataType::Timestamp(_, _) => {
 			let unit = supported_timestamp_unit(&data_type, "date_trunc")?;
-			Ok(builder.append_date_trunc(
-				field,
-				zone,
-				input,
+			Ok(builder.append_parameterized_scalar_function(
+				id,
+				vec![input],
+				ScalarFunctionParameter::DateTrunc(Box::new(DateTruncScalarFunctionParameter {
+					field,
+					zone: Some(zone.into_boxed_str()),
+				})),
 				DataType::Timestamp(unit, Some("UTC".into())),
 			))
 		}

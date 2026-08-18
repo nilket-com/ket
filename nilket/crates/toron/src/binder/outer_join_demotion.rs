@@ -2007,8 +2007,6 @@ fn guard_filter_pushdown_safe(expr: &Expr) -> bool {
 		Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Not(inner)
-		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner)
 		| Expr::Like { expr: inner, .. } => guard_filter_pushdown_safe(inner),
 		Expr::Eq(left, right)
 		| Expr::Neq(left, right)
@@ -2031,8 +2029,8 @@ fn guard_filter_pushdown_safe(expr: &Expr) -> bool {
 				.as_ref()
 				.map_or(true, |else_expr| guard_filter_pushdown_safe(else_expr))
 		}
-		Expr::ScalarFunction { id, args } => {
-			crate::ir::scalar_function_metadata(*id).pbc_pushdown_eligible
+		Expr::ScalarFunction { id, args, .. } => {
+			crate::ir::scalar_function_metadata(*id).guard_filter_pushdown_safe
 				&& args.iter().all(guard_filter_pushdown_safe)
 		}
 		Expr::SqlConvert { .. }
@@ -2308,7 +2306,11 @@ where
 		}
 		Expr::IsNull(inner) => Expr::IsNull(Box::new(child!(inner))),
 		Expr::IsNotNull(inner) => Expr::IsNotNull(Box::new(child!(inner))),
-		Expr::ScalarFunction { id, args } => {
+		Expr::ScalarFunction {
+			id,
+			args,
+			parameter,
+		} => {
 			let mut remapped_args = Vec::with_capacity(args.len());
 			for arg in args {
 				remapped_args.push(child!(arg));
@@ -2316,10 +2318,9 @@ where
 			Expr::ScalarFunction {
 				id: *id,
 				args: remapped_args,
+				parameter: parameter.clone(),
 			}
 		}
-		Expr::Extract(field, inner) => Expr::Extract(*field, Box::new(child!(inner))),
-		Expr::DateTrunc(field, inner) => Expr::DateTrunc(*field, Box::new(child!(inner))),
 	}))
 }
 
@@ -2560,9 +2561,7 @@ fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> boo
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
-		| Expr::IsNotNull(inner)
-		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner) => expr_any_column(inner, predicate),
+		| Expr::IsNotNull(inner) => expr_any_column(inner, predicate),
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -2617,9 +2616,7 @@ fn expr_column_resolution_in_scope(expr: &Expr, scope: &RelationScope) -> (bool,
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
-		| Expr::IsNotNull(inner)
-		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner) => expr_column_resolution_in_scope(inner, scope),
+		| Expr::IsNotNull(inner) => expr_column_resolution_in_scope(inner, scope),
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -2759,9 +2756,7 @@ fn null_rejecting_sides(
 		| Expr::InList { .. }
 		| Expr::Like { .. }
 		| Expr::Case { .. }
-		| Expr::IsNull(_)
-		| Expr::Extract(_, _)
-		| Expr::DateTrunc(_, _) => NullRejectedSides::default(),
+		| Expr::IsNull(_) => NullRejectedSides::default(),
 		Expr::ScalarFunction { .. } => NullRejectedSides::default(),
 	}
 }
@@ -2915,9 +2910,7 @@ fn conjunct_column_sides(
 		| Expr::TryCast(inner, _)
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
-		| Expr::IsNotNull(inner)
-		| Expr::Extract(_, inner)
-		| Expr::DateTrunc(_, inner) => conjunct_column_sides(inner, left_scope, right_scope),
+		| Expr::IsNotNull(inner) => conjunct_column_sides(inner, left_scope, right_scope),
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)

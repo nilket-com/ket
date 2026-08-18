@@ -4,9 +4,9 @@ use crate::error::{FrontendError, RuneDiagnosticSpan};
 use crate::ir::{
 	AggregateFunction, BroadcastBuildSide, CUSTOMER_ID_LOGICAL_TYPE, Expr, JoinKind, JoinStrategy,
 	JoinStrategyIntent, JoinStrategyPinSource, KernelDensitySpec, LogicalPlan, LogicalTypeId,
-	PRODUCT_ID_LOGICAL_TYPE, ScalarFunctionId, ScalarValue, SortExpr, TemporalExtractField,
-	TemporalTruncField, ValueFunction, WindowFrame, WindowFrameBound, WindowFrameDelta,
-	WindowFrameUnit, WindowFunction, WindowFunctionCall,
+	PRODUCT_ID_LOGICAL_TYPE, ScalarFunctionId, ScalarFunctionParameter, ScalarValue, SortExpr,
+	TemporalExtractField, TemporalTruncField, ValueFunction, WindowFrame, WindowFrameBound,
+	WindowFrameDelta, WindowFrameUnit, WindowFunction, WindowFunctionCall,
 };
 use crate::sql_planner::{
 	SqlPlanner, build_join_plan, expr_to_join_keys, window_function_default_name,
@@ -966,7 +966,7 @@ pub fn extract(field: String, expr: RuneExpr) -> VmResult<RuneExpr> {
 		return VmResult::panic(format!("unsupported EXTRACT field: {field}"));
 	};
 	VmResult::Ok(RuneExpr {
-		expr: Expr::Extract(field, Box::new(expr.expr)),
+		expr: crate::ir::extract_scalar_function(field, expr.expr),
 	})
 }
 
@@ -979,7 +979,7 @@ pub fn date_trunc(field: String, expr: RuneExpr) -> VmResult<RuneExpr> {
 		return VmResult::panic(format!("unsupported date_trunc field: {field}"));
 	};
 	VmResult::Ok(RuneExpr {
-		expr: Expr::DateTrunc(field, Box::new(expr.expr)),
+		expr: crate::ir::date_trunc_scalar_function(field, expr.expr),
 	})
 }
 
@@ -1008,6 +1008,7 @@ pub fn exp(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Exp,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1017,6 +1018,7 @@ pub fn sqrt(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Sqrt,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1026,6 +1028,7 @@ pub fn power(base: RuneExpr, exponent: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Pow,
 			args: vec![base.expr, exponent.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1035,6 +1038,7 @@ pub fn abs(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Abs,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1044,6 +1048,7 @@ pub fn ln(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Ln,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1058,6 +1063,7 @@ pub fn substring(input: RuneExpr, from: RuneExpr, length: RuneExpr) -> RuneExpr 
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Substring,
 			args: vec![input.expr, from.expr, length.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1067,6 +1073,7 @@ pub fn random() -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Random,
 			args: Vec::new(),
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1076,6 +1083,7 @@ pub fn greatest(args: Vec<RuneExpr>) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Greatest,
 			args: args.into_iter().map(|arg| arg.expr).collect(),
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1085,6 +1093,7 @@ pub fn least(args: Vec<RuneExpr>) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Least,
 			args: args.into_iter().map(|arg| arg.expr).collect(),
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1094,6 +1103,7 @@ pub fn width_bucket(operand: RuneExpr, low: RuneExpr, high: RuneExpr, count: Run
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::WidthBucket,
 			args: vec![operand.expr, low.expr, high.expr, count.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1103,6 +1113,7 @@ pub fn upper(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Upper,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1112,6 +1123,7 @@ pub fn lower(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Lower,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1121,6 +1133,7 @@ pub fn trim(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Trim,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1130,6 +1143,7 @@ pub fn char_length(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::CharLength,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1139,6 +1153,7 @@ pub fn ceil(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Ceil,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1148,6 +1163,7 @@ pub fn floor(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Floor,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1157,6 +1173,7 @@ pub fn sign(expr: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Sign,
 			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1168,6 +1185,7 @@ pub fn modulo(left: RuneExpr, right: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Mod,
 			args: vec![left.expr, right.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -1179,6 +1197,7 @@ pub fn round(value: RuneExpr, digits: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Round,
 			args: vec![value.expr, digits.expr],
+			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
@@ -2211,6 +2230,7 @@ mod tests {
 			Expr::ScalarFunction {
 				id: ScalarFunctionId::Exp,
 				args,
+				..
 			} if matches!(args.as_slice(), [Expr::Literal(ScalarValue::Float64(Some(value)))] if *value == 1.0)
 		));
 	}

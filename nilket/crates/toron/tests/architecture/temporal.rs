@@ -1,4 +1,5 @@
 use super::support::*;
+use std::collections::BTreeSet;
 
 fn source(path: &str) -> String {
 	std::fs::read_to_string(manifest_dir().join(path)).unwrap_or_else(|_| panic!("read {path}"))
@@ -307,27 +308,24 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 	for required in [
 		"pub enum TemporalExtractField",
 		"pub enum TemporalTruncField",
-		"Extract(TemporalExtractField, Box<Expr>)",
-		"DateTrunc(TemporalTruncField, Box<Expr>)",
-		"Self::Extract(_, _)",
-		"Self::DateTrunc(_, _)",
+		"ScalarFunction {",
+		"parameter: ScalarFunctionParameter",
 	] {
 		assert!(ir.contains(required), "IR missing {required}");
 	}
 	for required in [
-		"Extract {",
-		"zone: Option<String>",
-		"DateTrunc {",
-		"append_extract",
-		"append_date_trunc",
+		"ScalarFunction {",
+		"parameter: ScalarFunctionParameter",
+		"append_parameterized_scalar_function",
 	] {
 		assert!(
 			execution_ir.contains(required),
 			"bound IR missing {required}"
 		);
 	}
-	assert!(bound_node.contains("field: TemporalExtractField"));
-	assert!(bound_node.contains("field: TemporalTruncField"));
+	assert!(bound_node.contains("parameter: ScalarFunctionParameter"));
+	assert!(registry.contains("ExtractScalarFunctionParameter"));
+	assert!(registry.contains("DateTruncScalarFunctionParameter"));
 	assert!(lower_expr.contains("SqlExpr::Extract { field, expr, .. }"));
 	assert!(lower_expr.contains("SqlExpr::AtTimeZone"));
 	assert!(lower_expr.contains("function_name_eq(&f.name, \"DATE_PART\")"));
@@ -336,14 +334,13 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 	assert!(planner.contains("unsupported EXTRACT field"));
 	assert!(planner.contains("unsupported date_trunc field"));
 	assert!(binder.contains("ScalarFunctionSignature::TimestampWithConstantZone"));
-	assert!(bind_expr.contains("Expr::Extract(field, inner)"));
-	assert!(bind_expr.contains("Expr::DateTrunc(field, inner)"));
+	assert!(bind_expr.contains("parameter,\n\t\t} => bind_scalar_function"));
 	assert!(operand_zone.contains("as_at_time_zone"));
 	assert!(operand_zone.contains("ctx.session_timezone.to_string()"));
 	assert!(!operand_zone.contains("DataType::Timestamp"));
 	assert!(bind_extract.contains("field.is_date32_supported()"));
-	assert!(bind_extract.contains("builder.append_extract(field, None"));
-	assert!(bind_extract.contains("builder.append_extract(field, Some(zone)"));
+	assert!(bind_extract.contains("append_parameterized_scalar_function"));
+	assert!(bind_extract.contains("ScalarFunctionParameter::Extract"));
 	assert!(bind_extract.contains("AT TIME ZONE requires Timestamp"));
 	assert!(bind_trunc.contains("Date32 date_trunc is deferred in ADR 151"));
 	assert!(bind_trunc.contains("DataType::Timestamp(unit, Some(\"UTC\".into()))"));
@@ -357,15 +354,47 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 	assert!(exec.contains("fn evaluate_extract"));
 	assert!(exec.contains("fn evaluate_date_trunc"));
 	assert!(exec.contains("ScalarFunctionEvaluator::AtTimeZone"));
-	assert!(exec.contains("BoundExprNode::Extract"));
-	assert!(exec.contains("BoundExprNode::DateTrunc"));
+	assert!(exec.contains("ScalarFunctionEvaluator::Extract"));
+	assert!(exec.contains("ScalarFunctionId::DateTrunc"));
 	assert!(restamp_field.contains("timezone.as_ref() == \"UTC\""));
 	assert!(restamp_field.contains("other => other.clone()"));
 	assert!(restamp_array.contains("timezone.as_ref() == \"UTC\""));
 	assert!(pbc.contains("metadata.pbc_pushdown_eligible"));
-	assert!(pbc.contains("BoundExprNode::Extract"));
-	assert!(pbc.contains("BoundExprNode::DateTrunc"));
-	assert!(pbc.contains("session-zoned temporal operations are not PBC-eligible"));
+	assert!(pbc.contains("BoundExprNode::ScalarFunction { id, .. }"));
+	for (name, id) in [("EXTRACT", "Extract"), ("DATE_TRUNC", "DateTrunc")] {
+		let metadata =
+			brace_blocks_after_marker(&registry, &format!("const {name}: ScalarFunctionMetadata"))
+				.into_iter()
+				.next()
+				.expect("temporal scalar metadata")
+				.1;
+		assert!(metadata.contains(&format!("id: ScalarFunctionId::{id}")));
+		assert!(metadata.contains("pbc_pushdown_eligible: false"));
+		assert!(metadata.contains("guard_filter_pushdown_safe: true"));
+	}
+	let transparent_ids = brace_blocks_after_marker(&registry, "const ")
+		.into_iter()
+		.filter_map(|(_, block)| {
+			if !block.contains(": ScalarFunctionMetadata = ScalarFunctionMetadata")
+				|| !block.contains("guard_filter_pushdown_safe: true")
+			{
+				return None;
+			}
+			block
+				.split_once("id: ScalarFunctionId::")
+				.and_then(|(_, rest)| rest.split_once(',').map(|(id, _)| id.to_string()))
+		})
+		.collect::<BTreeSet<_>>();
+	assert_eq!(
+		transparent_ids,
+		BTreeSet::from([
+			"AtTimeZone".to_string(),
+			"DateTrunc".to_string(),
+			"Extract".to_string(),
+			"Substring".to_string(),
+			"TimeBucket".to_string(),
+		])
+	);
 	assert!(rune.contains("pub fn extract(field: String, expr: RuneExpr)"));
 	assert!(rune.contains("pub fn date_trunc(field: String, expr: RuneExpr)"));
 	assert!(rune.contains("pub fn at_time_zone(expr: RuneExpr, zone: String)"));
