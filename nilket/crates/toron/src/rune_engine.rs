@@ -1021,7 +1021,7 @@ pub fn sqrt(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
-pub fn pow(base: RuneExpr, exponent: RuneExpr) -> RuneExpr {
+pub fn power(base: RuneExpr, exponent: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Pow,
@@ -1642,7 +1642,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["at_time_zone"], at_time_zone).build()?;
 	m.function(["exp"], exp).build()?;
 	m.function(["sqrt"], sqrt).build()?;
-	m.function(["pow"], pow).build()?;
+	m.function(["power"], power).build()?;
 	m.function(["abs"], abs).build()?;
 	m.function(["ln"], ln).build()?;
 	m.function(["round"], round).build()?;

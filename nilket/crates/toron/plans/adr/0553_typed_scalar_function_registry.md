@@ -237,6 +237,28 @@ explicit exception list so a divergence stays visible instead of becoming a habi
 Its integer-only domain is deliberate: a floating remainder is its own admission
 decision.
 
+**`POW` was the wrong name, and finding that added the second field with a real
+consumer.** ANSI spells it `POWER`; `POW` appears in no revision. It shipped here
+first because the registration was written from Rust's `powf` rather than from
+the standard, and nothing could catch it — the registry held one `sql_name` per
+function and resolved it with a single comparison.
+
+`sql_aliases` fixes that and is read immediately by name resolution, unlike the
+still-deferred fallibility property. `POWER` is canonical, `POW` stays resolvable
+so an existing query keeps working, and `CEILING` joins `CEIL` — both are standard
+spellings of the ceiling function. Diagnostics name the canonical function
+regardless of which spelling was typed, so an arity error on `POW(x)` reads
+`POWER expects exactly two arguments`.
+
+The two spellings of the ceiling function also travel different routes: `CEIL`
+arrives through sqlparser's dedicated grammar form and `CEILING` as an ordinary
+function call. A test asserts they converge on the same bound plan, because
+"both resolve" is weaker than "both produce the same plan".
+
+The Rune surface follows the canonical name — `pow` became `power` — rather than
+taking a spelling exception. The exception list stays at one entry, `MOD`, where
+the canonical name is unusable because it is a Rune keyword.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know

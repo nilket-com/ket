@@ -1822,7 +1822,7 @@ async fn adr553_sql_and_rune_pow_share_a_bound_plan_and_digest() {
 	let rune_logical = rune_plan(
 		r#"
         pub fn main(ctx) {
-            ctx.table("sales").project([pow(col("price"), col("score"))])
+            ctx.table("sales").project([power(col("price"), col("score"))])
         }
     "#,
 	)
@@ -1930,9 +1930,15 @@ async fn adr553_pow_rejects_mixed_float_widths() {
 /// call, so the rejection is a frontend error rather than a type mismatch.
 #[tokio::test]
 async fn adr553_pow_rejects_a_single_argument() {
+	// The alias resolves, but the diagnostic names the canonical function, so a
+	// reader is pointed at the ANSI spelling rather than the one they typed.
 	assert_unsupported_message(
 		"SELECT POW(price) FROM sales",
-		"POW expects exactly two arguments, got 1",
+		"POWER expects exactly two arguments, got 1",
+	);
+	assert_unsupported_message(
+		"SELECT POWER(price) FROM sales",
+		"POWER expects exactly two arguments, got 1",
 	);
 }
 
@@ -2221,6 +2227,39 @@ async fn adr553_mod_rejects_float_operands() {
 		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("same integer type")),
 		"expected an integer-domain rejection, got {err:?}"
 	);
+}
+
+/// The ANSI spelling and the vendor spelling this engine shipped first must
+/// produce the same plan, not merely both resolve.
+#[tokio::test]
+async fn adr553_power_and_pow_produce_the_same_bound_plan() {
+	let (catalog, _) = fixture();
+	let ansi = plan_sql("SELECT POWER(price, score) FROM sales");
+	let vendor = plan_sql("SELECT POW(price, score) FROM sales");
+	let ansi_bound = bind(&ansi, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind POWER");
+	let vendor_bound = bind(&vendor, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind POW");
+	assert_eq!(format!("{ansi_bound:?}"), format!("{vendor_bound:?}"));
+}
+
+/// `CEIL` reaches the engine through sqlparser's dedicated grammar form while
+/// `CEILING` arrives as an ordinary function call, so the two spellings travel
+/// different routes and must still converge on one identifier.
+#[tokio::test]
+async fn adr553_ceiling_and_ceil_produce_the_same_bound_plan() {
+	let (catalog, _) = fixture();
+	let short = plan_sql("SELECT CEIL(price) FROM sales");
+	let long = plan_sql("SELECT CEILING(price) FROM sales");
+	let short_bound = bind(&short, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind CEIL");
+	let long_bound = bind(&long, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind CEILING");
+	assert_eq!(format!("{short_bound:?}"), format!("{long_bound:?}"));
 }
 
 #[tokio::test]

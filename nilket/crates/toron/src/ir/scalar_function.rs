@@ -115,7 +115,13 @@ pub enum ScalarFunctionEvaluator {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScalarFunctionMetadata {
 	pub id: ScalarFunctionId,
+	/// The ANSI spelling where the standard has one. Vendor spellings belong in
+	/// [`ScalarFunctionMetadata::sql_aliases`], never here.
 	pub sql_name: &'static str,
+	/// Additional accepted SQL spellings. The standard admits two names for the
+	/// ceiling function, and a vendor spelling already in use has to keep
+	/// resolving once the canonical name is adopted.
+	pub sql_aliases: &'static [&'static str],
 	pub rune_name: &'static str,
 	pub arity: ScalarFunctionArity,
 	pub signature: ScalarFunctionSignature,
@@ -129,6 +135,7 @@ pub struct ScalarFunctionMetadata {
 const EXP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Exp,
 	sql_name: "EXP",
+	sql_aliases: &[],
 	rune_name: "exp",
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
@@ -142,6 +149,7 @@ const EXP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 const SQRT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Sqrt,
 	sql_name: "SQRT",
+	sql_aliases: &[],
 	rune_name: "sqrt",
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
@@ -154,8 +162,11 @@ const SQRT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 
 const POW: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Pow,
-	sql_name: "POW",
-	rune_name: "pow",
+	sql_name: "POWER",
+	// `POW` is not an ANSI spelling. It shipped first here, so it stays
+	// resolvable rather than breaking a query that already uses it.
+	sql_aliases: &["POW"],
+	rune_name: "power",
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::BinaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
@@ -168,6 +179,7 @@ const POW: ScalarFunctionMetadata = ScalarFunctionMetadata {
 const ABS: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Abs,
 	sql_name: "ABS",
+	sql_aliases: &[],
 	rune_name: "abs",
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryNumericPreserving,
@@ -181,6 +193,7 @@ const ABS: ScalarFunctionMetadata = ScalarFunctionMetadata {
 const LN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Ln,
 	sql_name: "LN",
+	sql_aliases: &[],
 	rune_name: "ln",
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
@@ -194,6 +207,7 @@ const LN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 const ROUND: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Round,
 	sql_name: "ROUND",
+	sql_aliases: &[],
 	rune_name: "round",
 	arity: ScalarFunctionArity::Between(1, 2),
 	signature: ScalarFunctionSignature::FloatWithOptionalIntegerDigits,
@@ -207,6 +221,7 @@ const ROUND: ScalarFunctionMetadata = ScalarFunctionMetadata {
 const CEIL: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Ceil,
 	sql_name: "CEIL",
+	sql_aliases: &["CEILING"],
 	rune_name: "ceil",
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
@@ -220,6 +235,7 @@ const CEIL: ScalarFunctionMetadata = ScalarFunctionMetadata {
 const FLOOR: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Floor,
 	sql_name: "FLOOR",
+	sql_aliases: &[],
 	rune_name: "floor",
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryIntegerOrFloatPreserving,
@@ -233,6 +249,7 @@ const FLOOR: ScalarFunctionMetadata = ScalarFunctionMetadata {
 const SIGN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Sign,
 	sql_name: "SIGN",
+	sql_aliases: &[],
 	rune_name: "sign",
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryNumericPreserving,
@@ -246,6 +263,7 @@ const SIGN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 const MOD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Mod,
 	sql_name: "MOD",
+	sql_aliases: &[],
 	// `mod` is a keyword in Rune, so the canonical name cannot be spelled there.
 	// The identifier is still one; only the spelling differs, which is what §3
 	// of the record allows.
@@ -273,7 +291,13 @@ pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunction
 pub fn scalar_function_from_sql_name(name: &str) -> Option<ScalarFunctionId> {
 	SCALAR_FUNCTIONS
 		.iter()
-		.find(|metadata| metadata.sql_name.eq_ignore_ascii_case(name))
+		.find(|metadata| {
+			metadata.sql_name.eq_ignore_ascii_case(name)
+				|| metadata
+					.sql_aliases
+					.iter()
+					.any(|alias| alias.eq_ignore_ascii_case(name))
+		})
 		.map(|metadata| metadata.id)
 }
 
@@ -342,6 +366,56 @@ mod tests {
 		names.sort_unstable();
 		names.dedup();
 		assert_eq!(names.len(), registered, "duplicate SQL name registered");
+	}
+
+	/// An alias that collides with another function's name would silently
+	/// resolve to whichever registration the scan reached first.
+	#[test]
+	fn every_sql_spelling_resolves_to_exactly_one_function() {
+		let mut spellings = std::collections::HashMap::new();
+		for metadata in SCALAR_FUNCTIONS {
+			for spelling in std::iter::once(&metadata.sql_name).chain(metadata.sql_aliases) {
+				let upper = spelling.to_ascii_uppercase();
+				assert!(
+					spellings.insert(upper.clone(), metadata.id).is_none(),
+					"{upper} is claimed by more than one registration"
+				);
+				assert_eq!(
+					scalar_function_from_sql_name(&upper.to_ascii_lowercase()),
+					Some(metadata.id),
+					"{upper} must resolve case-insensitively to its own function"
+				);
+			}
+		}
+	}
+
+	/// The vendor spelling this engine shipped first still resolves, and the
+	/// ANSI spelling is the canonical one.
+	#[test]
+	fn power_is_canonical_and_pow_remains_an_alias() {
+		let metadata = scalar_function_metadata(ScalarFunctionId::Pow);
+		assert_eq!(metadata.sql_name, "POWER");
+		assert_eq!(metadata.sql_aliases, &["POW"]);
+		assert_eq!(
+			scalar_function_from_sql_name("pow"),
+			Some(ScalarFunctionId::Pow)
+		);
+		assert_eq!(
+			scalar_function_from_sql_name("POWER"),
+			Some(ScalarFunctionId::Pow)
+		);
+	}
+
+	#[test]
+	fn ceiling_is_accepted_alongside_ceil() {
+		assert_eq!(
+			scalar_function_from_sql_name("CEILING"),
+			Some(ScalarFunctionId::Ceil)
+		);
+		assert_eq!(
+			scalar_function_from_sql_name("ceil"),
+			Some(ScalarFunctionId::Ceil)
+		);
 	}
 
 	#[test]

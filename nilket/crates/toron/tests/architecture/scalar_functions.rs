@@ -176,6 +176,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			format!("id: ScalarFunctionId::{id}"),
 			format!("evaluator: ScalarFunctionEvaluator::{id}"),
 			"sql_name: \"".to_string(),
+			"sql_aliases: &[".to_string(),
 			"rune_name: \"".to_string(),
 			"arity: ScalarFunctionArity::".to_string(),
 			"signature: ScalarFunctionSignature::".to_string(),
