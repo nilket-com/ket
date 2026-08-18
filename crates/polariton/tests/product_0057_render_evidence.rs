@@ -93,8 +93,8 @@ const PRODUCT_0083_BANKED_MEDIAN_DETAIL: usize = 0;
 /// on the production-shaped two-geometry render. The 31 px tick-mark residual
 /// remains the floor that a naive nonzero oracle would mistake for labels.
 const PRODUCT_0132_TICK_MARK_RESIDUAL: usize = 31;
-const PRODUCT_0132_BANKED_ROTATED_TICK_INK: (usize, usize) = (641, 641);
-const PRODUCT_0132_BANKED_UNROTATED_TICK_INK: usize = 1457;
+const PRODUCT_0132_BANKED_ROTATED_TICK_INK: (usize, usize) = (2831, 3086);
+const PRODUCT_0132_BANKED_UNROTATED_TICK_INK: usize = 2096;
 // PRODUCT-0131's pre-bound negative control. These values are retained as
 // evidence even after Stage 1 makes every corresponding plot positive.
 const PRODUCT_0131_PRE_BOUND_HEIGHTS: [[f32; 3]; 2] =
@@ -2731,11 +2731,15 @@ async fn product_0132_stage_0(gpu: &Gpu) {
 	let unrotated_ticks = product_0132_tick_ink(&mut r, 0.0);
 	let rotated_ticks_positive = product_0132_tick_ink(&mut r, 45.0);
 	let rotated_ticks_negative = product_0132_tick_ink(&mut r, -45.0);
+	let intermediate = [1.0_f32, 5.0, 24.0]
+		.into_iter()
+		.map(|angle| (angle, product_0132_tick_ink(&mut r, angle)))
+		.collect::<Vec<_>>();
 	let rotated_title = product_0132_y_title_ink(&mut r, 45.0);
 	println!(
 		"PRODUCT_0132 stage_0 disposition=production unrotated_ticks={unrotated_ticks} \
 		 rotated_ticks=+45:{rotated_ticks_positive}/-45:{rotated_ticks_negative} \
-		 rotated_y_title={rotated_title}"
+			 rotated_y_title={rotated_title} intermediate={intermediate:?}"
 	);
 
 	// Positive control 1: unrotated tick text rasterizes, so the measurement

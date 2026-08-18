@@ -2267,25 +2267,28 @@ impl<'a> PlotWidget<'a> {
 		let bg = self.settings.chrome.canvas_background.iced();
 		let canvas_w = bounds.width;
 		let canvas_h = bounds.height;
-		backend.fill_rectangle(Point::ORIGIN, iced::Size::new(canvas_w, plot_area.y), bg);
-		backend.fill_rectangle(
-			Point::new(0.0, plot_area.y + plot_area.height),
-			iced::Size::new(canvas_w, canvas_h - plot_area.y - plot_area.height),
-			bg,
-		);
-		backend.fill_rectangle(
-			Point::new(0.0, plot_area.y),
-			iced::Size::new(plot_area.x, plot_area.height),
-			bg,
-		);
-		backend.fill_rectangle(
-			Point::new(plot_area.x + plot_area.width, plot_area.y),
-			iced::Size::new(canvas_w - plot_area.x - plot_area.width, plot_area.height),
-			bg,
-		);
-		// PRODUCT-0115: axis text may cross facet-cell edges but never the figure
-		// edge. This mirrors the composite overlay's figure-wide clip.
+		// Keep the fills and axes in one clipped child. iced_wgpu finalizes direct
+		// frame fills after clipped children, so parent-level fills can reorder
+		// above the axis text and erase rotated glyphs at some angles.
 		backend.with_clip(bounds, &mut |backend| {
+			backend.fill_rectangle(Point::ORIGIN, iced::Size::new(canvas_w, plot_area.y), bg);
+			backend.fill_rectangle(
+				Point::new(0.0, plot_area.y + plot_area.height),
+				iced::Size::new(canvas_w, canvas_h - plot_area.y - plot_area.height),
+				bg,
+			);
+			backend.fill_rectangle(
+				Point::new(0.0, plot_area.y),
+				iced::Size::new(plot_area.x, plot_area.height),
+				bg,
+			);
+			backend.fill_rectangle(
+				Point::new(plot_area.x + plot_area.width, plot_area.y),
+				iced::Size::new(canvas_w - plot_area.x - plot_area.width, plot_area.height),
+				bg,
+			);
+			// PRODUCT-0115: axis text may cross facet-cell edges but never the
+			// figure edge. This is the composite overlay's figure-wide clip.
 			backend.with_save(&mut |backend| {
 				backend.translate(iced::Vector::new(plot_area.x, plot_area.y));
 				match &layout {
