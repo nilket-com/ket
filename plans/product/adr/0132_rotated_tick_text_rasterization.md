@@ -1,38 +1,61 @@
 # ADR 0132: rotated tick-text rasterization
 
-Status: withdrawn 2026-08-18. The original Stage 0 diagnosis was invalid: its
-evidence harness rendered the plot and overlay into one `iced::Frame`, while
-production `PlotRenderLayer::Full` returns two geometries and draws them
-separately. The single-frame composition loses rotated text during iced's frame
-mesh assembly; it is not the production renderer's behavior.
+Status: implemented 2026-08-18. The first Stage 0 diagnosis was invalid because
+its harness rendered the plot and overlay into one `iced::Frame`. A second
+production-shaped probe exposed the actual defect: the overlay still mixed
+parent-level background fills with a clipped axis child in the same frame.
+iced_wgpu finalizes those direct fills after clipped children, so the fill could
+z-order above rotated glyphs at some angles.
 
 ## Correction
 
 The harness was corrected in `85b7c3f5` to render the production-shaped plot and
-overlay geometries separately. Re-running the differential on that path gives:
+overlay geometries separately. That correction produced the pre-repair control
+of `+45:641/-45:641`; it ruled out the false single-frame diagnosis but did not
+yet fix the GUI symptom. The decisive angle sweep then reproduced the symptom
+in isolation and identified the overlay fill ordering:
 
 ```text
 PRODUCT_0132 stage_0 disposition=production
-  unrotated_ticks=1457 rotated_ticks=+45:641/-45:641 rotated_y_title=374
+  pre-repair: 0°=4457, 1°=716, 5°=716, 24°=27, 45°=641..721
+  post-repair: 1°=2760, 5°=2800, 24°=2251, 45°=2831, -45°=3086
 ```
 
-The positive rotated counts prove that rotated tick labels do rasterize in the
-production-shaped renderer. The prior `31`-pixel result was only the three
-5-pixel tick-mark stubs, and the claim that PRODUCT-0115's fixture never drew
-rotated labels was made from the same invalid composition. No Polariton draw
-code is changed by this record, and no rasterization repair is authorized by
-it.
+The repair in `d9760d46` moves the four overlay background fills inside the
+existing figure-wide clip, preserving the one-clip architecture while ensuring
+the fills and axis text are children of the same clipped composition. The grid
+renderer already uses this ordering rule. No band arithmetic, tick selection,
+rotation policy, or text measurement is involved.
 
-The harness correction is the durable fix. The remaining GUI symptom — an
-author's styled temporal exhibit showing an empty rotated-label band — must be
-reproduced through the actual styled/layered production path before a new
-record or implementation is proposed. This record does not claim that symptom
-is resolved.
+The positive-ink gate now passes across the non-monotonic angles, and the full
+Polariton and architecture suites remain green. The earlier single-frame
+analysis is retained below as superseded provenance, not as the explanation.
 
-This withdrawn draft was scoped to **rasterization of rotated tick text**. It did not
+This record remains scoped to **rasterization of rotated tick text**. It does not
 revisit rotation policy, band derivation, tick selection, or the allocation
 bound; each of those remains settled, and the corrected evidence harness confirms
 that the production-shaped path reaches rotated text.
+
+## Corrected decision
+
+1. Keep the production two-geometry composition from `85b7c3f5`.
+2. Keep the ordinary overlay's single figure-wide clip; it is the containment
+   authority from PRODUCT-0115.
+3. Emit the overlay background fills inside that existing clip, before the axis
+   draw, so iced_wgpu cannot reorder a parent-level fill above clipped text.
+4. Prove the result with positive in-band ink at both signs and at small,
+   intermediate, and representative rotations. A changed raster or successful
+   containment alone is insufficient.
+
+## Corrected gates
+
+1. The angle sweep has positive label ink at 1°, 5°, 24°, 45°, and −45°.
+2. The existing single figure clip remains the only ordinary overlay clip;
+   architecture gates for PRODUCT-0115 and PRODUCT-0119 stay green.
+3. The 0° control and operation stream remain unchanged apart from the
+   compositor ordering; no geometry or text emission changes.
+4. The production evidence harness renders plot and overlay as separate
+   geometries, and the full unit, architecture, and evidence suites pass.
 
 ## Historical context (superseded)
 
@@ -231,14 +254,14 @@ banked counts.
 
 ## Supersession
 
-This correction supersedes the original diagnosis and all proposed gates above.
-The invalid single-frame evidence does not supersede PRODUCT-0115: rotation is
-authored, the band tracks the angle, and the figure clip contains the overlay.
-`85b7c3f5` corrects the evidence path; it is not a renderer implementation for
-0132. A future record about the remaining styled/layered GUI symptom must begin
-with a production-shaped capture and a new Stage 0.
+The corrected decision supersedes the original single-frame diagnosis and its
+claim that the production renderer never rasterized rotated text. `85b7c3f5`
+superseded the invalid evidence path; `d9760d46` is the production repair.
+PRODUCT-0115 remains authoritative for authored rotation, angle-derived band
+reservation, and figure-edge containment. Its positive-ink evidence is
+strengthened here rather than replaced.
 
-## Rejected
+## Historical rejected options (superseded)
 
 **Retire `tick_rotation`.** It would remove a non-functional feature and its
 misleading gate in one step. But the surface, the cascade, the band derivation,
@@ -259,11 +282,11 @@ through the back door.
 **Assert only that the raster changed with rotation.** This is what
 PRODUCT-0115 does, and it is precisely what deletion satisfies.
 
-## Historical consequences (superseded)
+## Consequences
 
-A shipped, spelled, cascaded, band-derived feature turns out never to have drawn
-a pixel, and the gate that was supposed to prove it reported success at three
-angles for the entire time. The repair is likely small; the lesson is not.
+The shipped feature was present but angle-dependent: the same rotated operation
+could be erased by a reordered overlay fill at one angle and survive at another.
+The repair is small, but the evidence lesson is not.
 
 The durable finding is about the shape of the evidence. PRODUCT-0115's probe
 asked two questions that a working implementation answers yes to -- *did the
