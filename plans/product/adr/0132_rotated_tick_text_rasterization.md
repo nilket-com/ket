@@ -1,16 +1,44 @@
 # ADR 0132: rotated tick-text rasterization
 
-Status: proposed 2026-08-18. `x_axis().tick_rotation(n)` has never drawn a
-label. The operations are emitted, the band is reserved for them, and the
-production renderer rasterizes nothing. PRODUCT-0115 shipped the surface and its
-acceptance probe has reported success at every angle since.
+Status: withdrawn 2026-08-18. The original Stage 0 diagnosis was invalid: its
+evidence harness rendered the plot and overlay into one `iced::Frame`, while
+production `PlotRenderLayer::Full` returns two geometries and draws them
+separately. The single-frame composition loses rotated text during iced's frame
+mesh assembly; it is not the production renderer's behavior.
 
-This record is scoped to **rasterization of rotated tick text**. It does not
+## Correction
+
+The harness was corrected in `85b7c3f5` to render the production-shaped plot and
+overlay geometries separately. Re-running the differential on that path gives:
+
+```text
+PRODUCT_0132 stage_0 disposition=production
+  unrotated_ticks=1457 rotated_ticks=+45:641/-45:641 rotated_y_title=374
+```
+
+The positive rotated counts prove that rotated tick labels do rasterize in the
+production-shaped renderer. The prior `31`-pixel result was only the three
+5-pixel tick-mark stubs, and the claim that PRODUCT-0115's fixture never drew
+rotated labels was made from the same invalid composition. No Polariton draw
+code is changed by this record, and no rasterization repair is authorized by
+it.
+
+The harness correction is the durable fix. The remaining GUI symptom — an
+author's styled temporal exhibit showing an empty rotated-label band — must be
+reproduced through the actual styled/layered production path before a new
+record or implementation is proposed. This record does not claim that symptom
+is resolved.
+
+This withdrawn draft was scoped to **rasterization of rotated tick text**. It did not
 revisit rotation policy, band derivation, tick selection, or the allocation
-bound; each of those is settled and each is confirmed working by the same
-measurements that expose this.
+bound; each of those remains settled, and the corrected evidence harness confirms
+that the production-shaped path reaches rotated text.
 
-## Context
+## Historical context (superseded)
+
+Everything in this section and the decisions and gates below records the
+hypothesis that was investigated before the harness composition was checked.
+It is retained as provenance, not as a statement about production behavior.
 
 ### The labels are emitted and never appear
 
@@ -104,7 +132,7 @@ from `XTickTextPlacement`. The nesting is the most suspicious because it is the
 one difference that changes the *matrix* rather than the region or the anchor,
 but Stage 0 must establish which, and not assume. A fourth cause is possible.
 
-## Decision
+## Historical decision (not adopted)
 
 ### 1. The acceptance oracle is positive in-band ink
 
@@ -136,7 +164,7 @@ positive in-band count per angle, so the pair can no longer be satisfied by
 deletion. The record does not delete a gate that was pointed at a real property;
 it supplies the control the property always needed.
 
-## Implementation sequence
+## Historical implementation sequence (not adopted)
 
 **Stage 0 -- locate the loss.** Determine where rotated tick ink goes, by
 differential comparison against the y-axis title, which rotates and renders.
@@ -152,7 +180,7 @@ vacuity it exists to remove.
 **Stage 2 -- the repair.** Make rotated tick text rasterize, and restate the
 banked counts.
 
-## Acceptance gates
+## Historical acceptance gates (not adopted)
 
 1. **Positive in-band ink per angle.** At 0, +45, and -45 degrees, tick-label
    ink inside the reserved band exceeds a banked threshold, asserted separately
@@ -182,7 +210,7 @@ banked counts.
    `uat/temporal_tick_intervals.rn`, the Count-control pane draws visible rotated
    timestamps at a normal pane size -- the observation that started this record.
 
-## Stop conditions
+## Historical stop conditions (not adopted)
 
 > If the repair requires changing band geometry, tick selection, or the
 > allocation bound, stop. Those are settled by PRODUCT-0115, PRODUCT-0127, and
@@ -203,10 +231,12 @@ banked counts.
 
 ## Supersession
 
-Supersedes nothing. PRODUCT-0115's decisions stand: rotation is authored, the
-band tracks the angle, and the figure clip contains the overlay. Only its
-acceptance evidence was insufficient, and this record supplies what was missing
-rather than reopening what was decided.
+This correction supersedes the original diagnosis and all proposed gates above.
+The invalid single-frame evidence does not supersede PRODUCT-0115: rotation is
+authored, the band tracks the angle, and the figure clip contains the overlay.
+`85b7c3f5` corrects the evidence path; it is not a renderer implementation for
+0132. A future record about the remaining styled/layered GUI symptom must begin
+with a production-shaped capture and a new Stage 0.
 
 ## Rejected
 
@@ -229,7 +259,7 @@ through the back door.
 **Assert only that the raster changed with rotation.** This is what
 PRODUCT-0115 does, and it is precisely what deletion satisfies.
 
-## Consequences
+## Historical consequences (superseded)
 
 A shipped, spelled, cascaded, band-derived feature turns out never to have drawn
 a pixel, and the gate that was supposed to prove it reported success at three
