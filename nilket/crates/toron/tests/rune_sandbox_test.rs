@@ -221,6 +221,38 @@ async fn forbidden_capabilities_return_typed_denials() {
 	}
 }
 
+/// A type mistake is not a security event. `lit` takes an `i32`, so passing a
+/// float produces `Expected number type, but found ::std::f64` — a message that
+/// names a std path without the script having reached for any capability.
+/// Reporting that as a denial tells an author to look for a sandbox problem
+/// they do not have, and buries a real one in noise.
+#[tokio::test]
+async fn an_ordinary_type_error_is_not_a_capability_denial() {
+	let config = sandbox_config();
+	let engine = RuneEngine::with_config(config).expect("engine");
+	let cases = [
+		r#"pub fn main(ctx) { ctx.table("sales").project([round(col("price"), lit(0.0))]) }"#,
+		r#"pub fn main(ctx) { ctx.table("sales").project([lit_str(7)]) }"#,
+	];
+
+	for script in cases {
+		let error = engine
+			.execute_script(script, &config)
+			.await
+			.expect_err("a type mistake should still fail");
+		assert!(
+			!matches!(
+				error,
+				FrontendError::RuneSandbox {
+					kind: RuneSandboxViolation::CapabilityDenied { .. },
+					..
+				}
+			),
+			"{script} is a type error, not a denied capability: {error:?}"
+		);
+	}
+}
+
 #[tokio::test]
 async fn invalid_entrypoint_returns_typed_error() {
 	let config = sandbox_config();

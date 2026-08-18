@@ -2066,7 +2066,28 @@ fn classify_denied_capability(source: &str) -> Option<CapabilityCategory> {
 		}
 	}
 
-	if lower.contains("std::") {
+	// A std path alone is not a capability signal. Rune reports type mismatches
+	// with paths like `::std::f64` and `::std::string::String`, and treating
+	// those as denials turns an ordinary mistake into a security report — which
+	// misdirects the author and hides real denials in noise.
+	//
+	// What distinguishes a reach for a capability is a *module* path: an unknown
+	// `std::<module>::<item>` call, the shape the specific lists above already
+	// match. Value types under `std` are the sandbox's own supported surface, so
+	// naming one says nothing about what the script tried to do.
+	const STD_VALUE_TYPES: &[&str] = &[
+		"bool", "bytes", "char", "f32", "f64", "float", "i8", "i16", "i32", "i64", "i128", "int",
+		"isize", "object", "option", "result", "str", "string", "tuple", "u8", "u16", "u32", "u64",
+		"u128", "usize", "vec",
+	];
+	let names_an_unknown_std_module = lower
+		.split("std::")
+		.skip(1)
+		// A trailing segment with no further `::` is a type, not a module.
+		.filter(|rest| rest.contains("::"))
+		.filter_map(|rest| rest.split("::").next())
+		.any(|module| !STD_VALUE_TYPES.contains(&module));
+	if names_an_unknown_std_module {
 		return Some(CapabilityCategory::Unknown);
 	}
 
