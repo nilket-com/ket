@@ -314,14 +314,10 @@ impl Executor {
 					.collect::<Result<Vec<_>, ExecutionError>>()?;
 				evaluate_scalar_function(*id, &args, batch.num_rows())
 			}
-			Expr::AtTimeZone(inner, zone) => {
-				let arr = self.evaluate_expr(inner, batch)?;
-				evaluate_at_time_zone(&arr, zone)
-			}
-			Expr::Extract(field, inner) => match inner.as_ref() {
-				Expr::AtTimeZone(timestamp, zone) => {
+			Expr::Extract(field, inner) => match crate::ir::as_at_time_zone(inner) {
+				Some((timestamp, zone)) => {
 					let arr = self.evaluate_expr(timestamp, batch)?;
-					evaluate_extract(*field, Some(zone), &arr)
+					evaluate_extract(*field, Some(&zone.to_string()), &arr)
 				}
 				_ => {
 					let arr = self.evaluate_expr(inner, batch)?;
@@ -335,8 +331,8 @@ impl Executor {
 					}
 				}
 			},
-			Expr::DateTrunc(field, inner) => match inner.as_ref() {
-				Expr::AtTimeZone(timestamp, zone) => {
+			Expr::DateTrunc(field, inner) => match crate::ir::as_at_time_zone(inner) {
+				Some((timestamp, zone)) => {
 					let arr = self.evaluate_expr(timestamp, batch)?;
 					evaluate_date_trunc(*field, zone, &arr)
 				}
@@ -446,10 +442,6 @@ impl Executor {
 						.map(|arg| evaluated_child(&outputs, *arg))
 						.collect::<Result<Vec<_>, ExecutionError>>()?;
 					evaluate_scalar_function(*id, &args, batch.num_rows())?
-				}
-				BoundExprNode::AtTimeZone { input, zone } => {
-					let arr = evaluated_child(&outputs, *input)?;
-					evaluate_at_time_zone(&arr, zone)?
 				}
 				BoundExprNode::Extract { field, zone, input } => {
 					let arr = evaluated_child(&outputs, *input)?;
@@ -737,6 +729,16 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_char_length(&args[0]),
 		(
+			ScalarFunctionEvaluator::AtTimeZone,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => {
+			// The zone reaches the executor as a constant string argument; the
+			// binder already proved it a literal and a valid IANA name.
+			let zone = constant_string_argument(&args[1], "AT TIME ZONE")?;
+			evaluate_at_time_zone(&args[0], &zone)
+		}
+		(
 			ScalarFunctionEvaluator::TimeBucket,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -806,6 +808,7 @@ fn evaluate_scalar_function(
 		)
 		| (
 			ScalarFunctionEvaluator::Abs
+			| ScalarFunctionEvaluator::AtTimeZone
 			| ScalarFunctionEvaluator::Ceil
 			| ScalarFunctionEvaluator::CharLength
 			| ScalarFunctionEvaluator::Exp
@@ -1496,6 +1499,22 @@ fn evaluate_like(
 /// the empty batch first: there is no row 0 to read.
 /// An interval literal materialises as a duration array, not an integer one.
 /// Reading it as an integer would fail at run time for every bucket.
+/// A constant string argument the binder already validated. An empty batch is
+/// handled by the caller: there is no row 0 to read.
+fn constant_string_argument(
+	argument: &ArrayRef,
+	role: &'static str,
+) -> Result<String, ExecutionError> {
+	argument
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.filter(|values| !values.is_empty() && values.is_valid(0))
+		.map(|values| values.value(0).to_string())
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!("internal: {role} is not a constant string after binding"),
+		})
+}
+
 fn constant_interval_nanos(argument: &ArrayRef) -> Result<u64, ExecutionError> {
 	let nanos = argument
 		.as_any()

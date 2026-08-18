@@ -163,9 +163,7 @@ impl PbcCompiler {
 						metadata.sql_name
 					)));
 				}
-				BoundExprNode::AtTimeZone { .. }
-				| BoundExprNode::Extract { .. }
-				| BoundExprNode::DateTrunc { .. } => {
+				BoundExprNode::Extract { .. } | BoundExprNode::DateTrunc { .. } => {
 					return Err(PushdownDeclineReason::ExpressionShapeUnsupported(
 						"session-zoned temporal operations are not PBC-eligible".to_string(),
 					));
@@ -237,7 +235,6 @@ impl PbcCompiler {
 			| BoundExprNode::Like { .. }
 			| BoundExprNode::Case { .. }
 			| BoundExprNode::ScalarFunction { .. }
-			| BoundExprNode::AtTimeZone { .. }
 			| BoundExprNode::Extract { .. }
 			| BoundExprNode::DateTrunc { .. } => {
 				return Err(PushdownDeclineReason::ExpressionShapeUnsupported(

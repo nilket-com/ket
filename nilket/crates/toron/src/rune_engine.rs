@@ -985,7 +985,7 @@ pub fn date_trunc(field: String, expr: RuneExpr) -> VmResult<RuneExpr> {
 
 pub fn at_time_zone(expr: RuneExpr, zone: String) -> RuneExpr {
 	RuneExpr {
-		expr: Expr::AtTimeZone(Box::new(expr.expr), zone),
+		expr: crate::ir::at_time_zone_scalar_function(expr.expr, zone),
 	}
 }
 

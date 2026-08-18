@@ -5970,8 +5970,8 @@ fn extract_hour_from_timestamp_at_time_zone_uses_named_zone() {
 	let program = bind_temporal_expr(
 		Expr::Extract(
 			TemporalExtractField::Hour,
-			Box::new(Expr::AtTimeZone(
-				Box::new(Expr::column("event_time")),
+			Box::new(crate::ir::at_time_zone_scalar_function(
+				Expr::column("event_time"),
 				"America/Chicago".to_string(),
 			)),
 		),
@@ -6035,8 +6035,8 @@ fn extract_at_time_zone_utc_uses_utc_not_session_zone() {
 	let program = bind_temporal_expr(
 		Expr::Extract(
 			TemporalExtractField::Hour,
-			Box::new(Expr::AtTimeZone(
-				Box::new(Expr::column("event_time")),
+			Box::new(crate::ir::at_time_zone_scalar_function(
+				Expr::column("event_time"),
 				"UTC".to_string(),
 			)),
 		),
@@ -6089,8 +6089,8 @@ fn date_trunc_day_at_time_zone_returns_utc_instant_for_local_midnight() {
 	let program = bind_temporal_expr(
 		Expr::DateTrunc(
 			TemporalTruncField::Day,
-			Box::new(Expr::AtTimeZone(
-				Box::new(Expr::column("event_time")),
+			Box::new(crate::ir::at_time_zone_scalar_function(
+				Expr::column("event_time"),
 				"America/New_York".to_string(),
 			)),
 		),
@@ -6174,8 +6174,8 @@ fn at_time_zone_rejects_date32_operand() {
 	let err = bind_expr_program(
 		&[Expr::Extract(
 			TemporalExtractField::Day,
-			Box::new(Expr::AtTimeZone(
-				Box::new(Expr::column("signup_date")),
+			Box::new(crate::ir::at_time_zone_scalar_function(
+				Expr::column("signup_date"),
 				"UTC".to_string(),
 			)),
 		)],
@@ -6487,9 +6487,12 @@ fn timestamp_plus_calendar_interval_uses_session_zone_and_eom_clamp() {
 	let Some(BoundExprNode::Binary { left, right, .. }) = program.node(root) else {
 		panic!("expected calendar arithmetic binary");
 	};
-	match program.node(*left) {
-		Some(BoundExprNode::AtTimeZone { zone, .. }) => assert_eq!(zone, "America/Chicago"),
-		other => panic!("expected session-zone timestamp operand, got {other:?}"),
+	match bound_at_time_zone_zone(&program, *left) {
+		Some(zone) => assert_eq!(zone, "America/Chicago"),
+		None => panic!(
+			"expected session-zone timestamp operand, got {:?}",
+			program.node(*left)
+		),
 	}
 	assert_eq!(
 		program.node_type(*right),
@@ -6767,11 +6770,12 @@ async fn rune_calendar_interval_arithmetic_matches_sql() {
 			exprs.node_type(*right),
 			Some(&DataType::Interval(IntervalUnit::YearMonth))
 		);
-		match exprs.node(*left) {
-			Some(BoundExprNode::AtTimeZone { zone, .. }) => {
-				assert_eq!(zone, "America/Chicago")
-			}
-			other => panic!("expected session-zone timestamp operand, got {other:?}"),
+		match bound_at_time_zone_zone(&exprs, *left) {
+			Some(zone) => assert_eq!(zone, "America/Chicago"),
+			None => panic!(
+				"expected session-zone timestamp operand, got {:?}",
+				exprs.node(*left)
+			),
 		}
 	}
 }
@@ -21060,6 +21064,25 @@ fn bind_substring_expr(expr: Expr) -> Result<BoundExprProgram, BindingError> {
 		relation_scope: None,
 	};
 	bind_expr_program(&[expr], &substring_schema(), &ctx)
+}
+
+/// ADR 553: the bound zone now lives in a literal argument rather than on the
+/// node. Reading it needs one helper instead of a destructuring per assertion.
+fn bound_at_time_zone_zone(program: &BoundExprProgram, id: BoundExprId) -> Option<String> {
+	let Some(BoundExprNode::ScalarFunction {
+		id: crate::ir::ScalarFunctionId::AtTimeZone,
+		args,
+	}) = program.node(id)
+	else {
+		return None;
+	};
+	let Some(BoundExprNode::Literal(slot)) = program.node(*args.get(1)?) else {
+		return None;
+	};
+	match program.literals.get(*slot as usize)? {
+		ScalarValue::Utf8(Some(zone)) => Some(zone.clone()),
+		_ => None,
+	}
 }
 
 fn substring_expr(from: i64, length: Option<u64>) -> Expr {

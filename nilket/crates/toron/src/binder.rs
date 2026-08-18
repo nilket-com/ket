@@ -4952,7 +4952,6 @@ fn collect_program_node_columns(
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
 		| Some(BoundExprNode::Like { expr: input, .. })
-		| Some(BoundExprNode::AtTimeZone { input, .. })
 		| Some(BoundExprNode::Extract { input, .. })
 		| Some(BoundExprNode::DateTrunc { input, .. }) => {
 			collect_program_node_columns(program, *input, columns);
@@ -5146,7 +5145,6 @@ fn bind_expr_into_program(
 		Expr::ScalarFunction { id, args } => {
 			bind_scalar_function(builder, input_schema, ctx, *id, args)
 		}
-		Expr::AtTimeZone(inner, zone) => bind_at_time_zone(builder, input_schema, ctx, inner, zone),
 		Expr::Extract(field, inner) => {
 			bind_temporal_extract(builder, input_schema, ctx, *field, inner)
 		}

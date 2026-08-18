@@ -296,24 +296,28 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 	let restamp_array = source_block(&daemon, "fn restamp_sql_result_array");
 	let bound_node = source_block(&execution_ir, "pub enum BoundExprNode");
 
+	// ADR 553: AT TIME ZONE became a registration. Its zone is still a
+	// validated constant reaching the binder, and it is still Toron-executed —
+	// the invariant this guard protects — but it now lives in the registry.
+	let registry = source("src/ir/scalar_function.rs");
+	assert!(registry.contains("const AT_TIME_ZONE: ScalarFunctionMetadata"));
+	assert!(registry.contains("TimestampWithConstantZone"));
+	assert!(binder.contains("validate_temporal_zone"));
+
 	for required in [
 		"pub enum TemporalExtractField",
 		"pub enum TemporalTruncField",
-		"AtTimeZone(Box<Expr>, String)",
 		"Extract(TemporalExtractField, Box<Expr>)",
 		"DateTrunc(TemporalTruncField, Box<Expr>)",
-		"Self::AtTimeZone(_, _)",
 		"Self::Extract(_, _)",
 		"Self::DateTrunc(_, _)",
 	] {
 		assert!(ir.contains(required), "IR missing {required}");
 	}
 	for required in [
-		"AtTimeZone {",
 		"Extract {",
 		"zone: Option<String>",
 		"DateTrunc {",
-		"append_at_time_zone",
 		"append_extract",
 		"append_date_trunc",
 	] {
@@ -331,10 +335,10 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 	assert!(planner.contains("lower_extract_datetime_field"));
 	assert!(planner.contains("unsupported EXTRACT field"));
 	assert!(planner.contains("unsupported date_trunc field"));
-	assert!(bind_expr.contains("Expr::AtTimeZone(inner, zone)"));
+	assert!(binder.contains("ScalarFunctionSignature::TimestampWithConstantZone"));
 	assert!(bind_expr.contains("Expr::Extract(field, inner)"));
 	assert!(bind_expr.contains("Expr::DateTrunc(field, inner)"));
-	assert!(operand_zone.contains("Expr::AtTimeZone(timestamp, zone)"));
+	assert!(operand_zone.contains("as_at_time_zone"));
 	assert!(operand_zone.contains("ctx.session_timezone.to_string()"));
 	assert!(!operand_zone.contains("DataType::Timestamp"));
 	assert!(bind_extract.contains("field.is_date32_supported()"));
@@ -352,13 +356,13 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 	assert!(exec.contains("fn evaluate_at_time_zone"));
 	assert!(exec.contains("fn evaluate_extract"));
 	assert!(exec.contains("fn evaluate_date_trunc"));
-	assert!(exec.contains("BoundExprNode::AtTimeZone"));
+	assert!(exec.contains("ScalarFunctionEvaluator::AtTimeZone"));
 	assert!(exec.contains("BoundExprNode::Extract"));
 	assert!(exec.contains("BoundExprNode::DateTrunc"));
 	assert!(restamp_field.contains("timezone.as_ref() == \"UTC\""));
 	assert!(restamp_field.contains("other => other.clone()"));
 	assert!(restamp_array.contains("timezone.as_ref() == \"UTC\""));
-	assert!(pbc.contains("BoundExprNode::AtTimeZone"));
+	assert!(pbc.contains("metadata.pbc_pushdown_eligible"));
 	assert!(pbc.contains("BoundExprNode::Extract"));
 	assert!(pbc.contains("BoundExprNode::DateTrunc"));
 	assert!(pbc.contains("session-zoned temporal operations are not PBC-eligible"));
@@ -531,7 +535,7 @@ pub(crate) fn adr153_calendar_month_year_interval_arithmetic_is_session_framed()
 	assert!(calendar_output.contains("CalendarMonthInterval - Timestamp is not supported"));
 	assert!(binder.contains("fn bind_calendar_arithmetic_operands"));
 	assert!(binder.contains("fn bind_calendar_timestamp_operand"));
-	assert!(binder.contains("builder.append_at_time_zone"));
+	assert!(binder.contains("crate::ir::ScalarFunctionId::AtTimeZone"));
 	assert!(binder.contains("CalendarMonthInterval comparison is deferred"));
 	assert!(calendar_fold.contains("add_calendar_months_for_bind"));
 	assert!(calendar_fold.contains("add_date32_calendar_months_for_bind"));

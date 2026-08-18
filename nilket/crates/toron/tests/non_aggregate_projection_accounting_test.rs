@@ -159,7 +159,9 @@ fn extract_at_time_zone_lowers() {
 		panic!("expected extract");
 	};
 	assert_eq!(*field, TemporalExtractField::Hour);
-	let Expr::AtTimeZone(inner, zone) = inner.as_ref() else {
+	// ADR 553: AT TIME ZONE lowers through the registry, carrying its zone as a
+	// constant argument. The contract asserted is unchanged.
+	let Some((inner, zone)) = toron::ir::as_at_time_zone(inner) else {
 		panic!("expected AT TIME ZONE operand");
 	};
 	assert_eq!(zone, "America/Chicago");

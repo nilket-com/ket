@@ -2142,10 +2142,6 @@ pub(super) fn clone_bound_subgraph(
 				.collect::<Option<Vec<_>>>()?;
 			builder.append_scalar_function(*id, args, output_type)
 		}
-		BoundExprNode::AtTimeZone { input, zone } => {
-			let input = clone_bound_subgraph(source, *input, builder, remap)?;
-			builder.append_at_time_zone(input, zone.clone(), output_type)
-		}
 		BoundExprNode::Extract { field, zone, input } => {
 			let input = clone_bound_subgraph(source, *input, builder, remap)?;
 			builder.append_extract(*field, zone.clone(), input, output_type)
@@ -2318,19 +2314,6 @@ pub(super) fn bound_subgraphs_structurally_equal_inner(
 				) && bound_subgraphs_structurally_equal_inner(source, *left_else, *right_else, seen)
 		}
 		(
-			Some(BoundExprNode::AtTimeZone {
-				input: left_input,
-				zone: left_zone,
-			}),
-			Some(BoundExprNode::AtTimeZone {
-				input: right_input,
-				zone: right_zone,
-			}),
-		) => {
-			left_zone == right_zone
-				&& bound_subgraphs_structurally_equal_inner(source, *left_input, *right_input, seen)
-		}
-		(
 			Some(BoundExprNode::Extract {
 				field: left_field,
 				zone: left_zone,
@@ -2402,7 +2385,6 @@ pub(super) fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
 		| BoundExprNode::Like { expr: input, .. }
-		| BoundExprNode::AtTimeZone { input, .. }
 		| BoundExprNode::Extract { input, .. }
 		| BoundExprNode::DateTrunc { input, .. } => vec![*input],
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],

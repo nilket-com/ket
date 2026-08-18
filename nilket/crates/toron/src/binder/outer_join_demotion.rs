@@ -2007,7 +2007,6 @@ fn guard_filter_pushdown_safe(expr: &Expr) -> bool {
 		Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Not(inner)
-		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner)
 		| Expr::Like { expr: inner, .. } => guard_filter_pushdown_safe(inner),
@@ -2319,9 +2318,6 @@ where
 				args: remapped_args,
 			}
 		}
-		Expr::AtTimeZone(inner, timezone) => {
-			Expr::AtTimeZone(Box::new(child!(inner)), timezone.clone())
-		}
 		Expr::Extract(field, inner) => Expr::Extract(*field, Box::new(child!(inner))),
 		Expr::DateTrunc(field, inner) => Expr::DateTrunc(*field, Box::new(child!(inner))),
 	}))
@@ -2565,7 +2561,6 @@ fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> boo
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner) => expr_any_column(inner, predicate),
 		Expr::Add(left, right)
@@ -2623,7 +2618,6 @@ fn expr_column_resolution_in_scope(expr: &Expr, scope: &RelationScope) -> (bool,
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner) => expr_column_resolution_in_scope(inner, scope),
 		Expr::Add(left, right)
@@ -2766,7 +2760,6 @@ fn null_rejecting_sides(
 		| Expr::Like { .. }
 		| Expr::Case { .. }
 		| Expr::IsNull(_)
-		| Expr::AtTimeZone(_, _)
 		| Expr::Extract(_, _)
 		| Expr::DateTrunc(_, _) => NullRejectedSides::default(),
 		Expr::ScalarFunction { .. } => NullRejectedSides::default(),
@@ -2923,7 +2916,6 @@ fn conjunct_column_sides(
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner) => conjunct_column_sides(inner, left_scope, right_scope),
 		Expr::Add(left, right)

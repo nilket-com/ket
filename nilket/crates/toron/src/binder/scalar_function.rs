@@ -219,6 +219,31 @@ pub(super) fn bind_scalar_function(
 			}
 			Ok(builder.append_scalar_function(id, bound_args, DataType::Int64))
 		}
+		ScalarFunctionSignature::TimestampWithConstantZone => {
+			let [input, zone] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			let Some(ScalarValue::Utf8(Some(zone))) = builder.literal(*zone).cloned() else {
+				return Err(BindingError::TypeMismatch {
+					message: "AT TIME ZONE expects a string literal timezone".to_string(),
+				});
+			};
+			let zone = super::arithmetic::validate_temporal_zone(&zone)?;
+			let input_type = builder.node_type(*input).cloned().ok_or_else(|| {
+				BindingError::UnsupportedExpression {
+					message: "AT TIME ZONE input is malformed".to_string(),
+				}
+			})?;
+			let unit = super::arithmetic::supported_timestamp_unit(&input_type, "AT TIME ZONE")?;
+			// The zone's *value* becomes part of the result type. Every other rule
+			// derives its output from argument types alone; this one reads the
+			// constant, which is what this migration set out to test.
+			Ok(builder.append_scalar_function(
+				id,
+				bound_args,
+				DataType::Timestamp(unit, Some(zone.into())),
+			))
+		}
 		ScalarFunctionSignature::NiladicFloat => {
 			// Nothing to type-check: the arity gate already proved there are no
 			// arguments, and the output type is the registration's own.

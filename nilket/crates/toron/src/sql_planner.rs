@@ -6747,8 +6747,8 @@ impl SqlPlanner {
 			SqlExpr::AtTimeZone {
 				timestamp,
 				time_zone,
-			} => Ok(Expr::AtTimeZone(
-				Box::new(self.lower_expr(timestamp)?),
+			} => Ok(crate::ir::at_time_zone_scalar_function(
+				self.lower_expr(timestamp)?,
 				sql_string_literal_expr(
 					time_zone,
 					"AT TIME ZONE expects a string literal timezone",
@@ -7358,7 +7358,6 @@ fn validate_hidden_sort_key_refs(
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner) => validate_hidden_sort_key_refs(inner, visible_names),
 		Expr::InList { expr, list, .. } => {
@@ -8261,11 +8260,6 @@ fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 				hash_expr_structural(else_expr, state);
 			}
 		}
-		Expr::AtTimeZone(inner, zone) => {
-			25u8.hash(state);
-			zone.hash(state);
-			hash_expr_structural(inner, state);
-		}
 		Expr::Extract(field, inner) => {
 			26u8.hash(state);
 			field.hash(state);
@@ -8350,9 +8344,6 @@ pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 		(Expr::Not(left), Expr::Not(right))
 		| (Expr::IsNull(left), Expr::IsNull(right))
 		| (Expr::IsNotNull(left), Expr::IsNotNull(right)) => expr_structural_eq(left, right),
-		(Expr::AtTimeZone(left, left_zone), Expr::AtTimeZone(right, right_zone)) => {
-			left_zone == right_zone && expr_structural_eq(left, right)
-		}
 		(Expr::Extract(left_field, left), Expr::Extract(right_field, right)) => {
 			left_field == right_field && expr_structural_eq(left, right)
 		}
@@ -8735,7 +8726,6 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::AtTimeZone(inner, _)
 		| Expr::Extract(_, inner)
 		| Expr::DateTrunc(_, inner) => expr_contains_qualified_column(inner),
 		Expr::InList { expr, list, .. } => {
@@ -9781,10 +9771,6 @@ fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 				.map(canonical_aggregate_signature_expr)
 				.collect(),
 		},
-		Expr::AtTimeZone(inner, zone) => Expr::AtTimeZone(
-			Box::new(canonical_aggregate_signature_expr(inner)),
-			zone.clone(),
-		),
 		Expr::Extract(field, inner) => {
 			Expr::Extract(*field, Box::new(canonical_aggregate_signature_expr(inner)))
 		}
@@ -11806,7 +11792,6 @@ mod tests {
 			| Expr::Not(expr)
 			| Expr::IsNull(expr)
 			| Expr::IsNotNull(expr)
-			| Expr::AtTimeZone(expr, _)
 			| Expr::Extract(_, expr)
 			| Expr::DateTrunc(_, expr)
 			| Expr::Cast(expr, _)

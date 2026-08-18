@@ -1,29 +1,5 @@
 use super::*;
 
-pub(super) fn bind_at_time_zone(
-	builder: &mut BoundExprProgramBuilder,
-	input_schema: &SchemaRef,
-	ctx: &ExprBindContext<'_>,
-	inner: &Expr,
-	zone: &str,
-) -> Result<BoundExprId, BindingError> {
-	let zone = validate_temporal_zone(zone)?;
-	let input = bind_expr_into_program(builder, inner, input_schema, ctx)?;
-	let input_type =
-		builder
-			.node_type(input)
-			.cloned()
-			.ok_or_else(|| BindingError::UnsupportedExpression {
-				message: "AT TIME ZONE input is malformed".to_string(),
-			})?;
-	let unit = supported_timestamp_unit(&input_type, "AT TIME ZONE")?;
-	Ok(builder.append_at_time_zone(
-		input,
-		zone.clone(),
-		DataType::Timestamp(unit, Some(zone.into())),
-	))
-}
-
 pub(super) fn bind_temporal_extract(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
@@ -111,7 +87,11 @@ pub(super) fn temporal_operand_zone<'a>(
 	inner: &'a Expr,
 ) -> Result<(String, &'a Expr, bool), BindingError> {
 	match inner {
-		Expr::AtTimeZone(timestamp, zone) => Ok((validate_temporal_zone(zone)?, timestamp, true)),
+		_ if crate::ir::as_at_time_zone(inner).is_some() => {
+			let (timestamp, zone) =
+				crate::ir::as_at_time_zone(inner).expect("checked immediately above");
+			Ok((validate_temporal_zone(zone)?, timestamp, true))
+		}
 		_ => Ok((ctx.session_timezone.to_string(), inner, false)),
 	}
 }
@@ -165,9 +145,10 @@ pub(super) fn bind_calendar_timestamp_operand(
 	if explicit_zone {
 		return Ok(bound);
 	}
-	Ok(builder.append_at_time_zone(
-		bound,
-		zone.clone(),
+	let zone_literal = builder.append_literal(ScalarValue::Utf8(Some(zone.clone())));
+	Ok(builder.append_scalar_function(
+		crate::ir::ScalarFunctionId::AtTimeZone,
+		vec![bound, zone_literal],
 		DataType::Timestamp(unit, Some(zone.into())),
 	))
 }

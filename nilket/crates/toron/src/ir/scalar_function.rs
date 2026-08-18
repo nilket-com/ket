@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ScalarFunctionId {
 	Abs,
+	AtTimeZone,
 	Ceil,
 	CharLength,
 	Exp,
@@ -137,6 +138,11 @@ pub enum ScalarFunctionSignature {
 	/// depend on the constant's value — `AT TIME ZONE` is the case that would,
 	/// and it is a separate decision.
 	Int64MillisWithConstantInterval,
+	/// A timestamp and a constant IANA zone, producing a timestamp carrying that
+	/// zone. This is the first rule whose **output type depends on a constant's
+	/// value** rather than only on argument types — the zone string becomes part
+	/// of `DataType::Timestamp`.
+	TimestampWithConstantZone,
 }
 
 /// How NULL inputs affect the output.
@@ -158,6 +164,7 @@ pub enum ScalarFunctionNonFiniteBehavior {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunctionEvaluator {
 	Abs,
+	AtTimeZone,
 	Ceil,
 	CharLength,
 	Exp,
@@ -495,9 +502,24 @@ const TIME_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::TimeBucket,
 };
 
+const AT_TIME_ZONE: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::AtTimeZone,
+	sql_name: "AT_TIME_ZONE",
+	sql_aliases: &[],
+	rune_name: "at_time_zone",
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::TimestampWithConstantZone,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::AtTimeZone,
+};
+
 /// The complete scalar-function registry.
 pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	ABS,
+	AT_TIME_ZONE,
 	CEIL,
 	CHAR_LENGTH,
 	EXP,

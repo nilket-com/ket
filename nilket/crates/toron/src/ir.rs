@@ -546,6 +546,34 @@ pub fn time_bucket_scalar_function(interval: std::time::Duration, input: Expr) -
 	}
 }
 
+/// Builds the registry form of `AT TIME ZONE`. The zone travels as a string
+/// literal argument, which the binder validates and then reads to construct the
+/// result type.
+pub fn at_time_zone_scalar_function(input: Expr, zone: String) -> Expr {
+	Expr::ScalarFunction {
+		id: ScalarFunctionId::AtTimeZone,
+		args: vec![input, Expr::Literal(ScalarValue::Utf8(Some(zone)))],
+	}
+}
+
+/// Recognises the registry form of `AT TIME ZONE`, returning its operand and
+/// zone. `EXTRACT` and `DATE_TRUNC` inspect their operand to decide which zone
+/// to resolve in, so that recognition needs exactly one definition — three
+/// hand-written destructurings would be three chances to disagree.
+pub fn as_at_time_zone(expr: &Expr) -> Option<(&Expr, &str)> {
+	let Expr::ScalarFunction {
+		id: ScalarFunctionId::AtTimeZone,
+		args,
+	} = expr
+	else {
+		return None;
+	};
+	match args.as_slice() {
+		[input, Expr::Literal(ScalarValue::Utf8(Some(zone)))] => Some((input, zone.as_str())),
+		_ => None,
+	}
+}
+
 pub fn nanos_per_timestamp_unit(unit: TimeUnit) -> Option<i64> {
 	match unit {
 		TimeUnit::Second => Some(1_000_000_000),
@@ -906,7 +934,6 @@ pub enum Expr {
 		id: ScalarFunctionId,
 		args: Vec<Expr>,
 	},
-	AtTimeZone(Box<Expr>, String),
 	Extract(TemporalExtractField, Box<Expr>),
 	DateTrunc(TemporalTruncField, Box<Expr>),
 }
@@ -945,7 +972,6 @@ impl Expr {
 			| Self::IsNull(inner)
 			| Self::IsNotNull(inner)
 			| Self::Like { expr: inner, .. }
-			| Self::AtTimeZone(inner, _)
 			| Self::Extract(_, inner)
 			| Self::DateTrunc(_, inner) => inner.is_deterministic(),
 			Self::Add(left, right)
@@ -991,7 +1017,6 @@ impl Expr {
 			| Self::Div(_, _)
 			| Self::Like { .. }
 			| Self::Case { .. }
-			| Self::AtTimeZone(_, _)
 			| Self::Extract(_, _)
 			| Self::DateTrunc(_, _) => false,
 			Self::ScalarFunction { id, args } => {
