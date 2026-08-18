@@ -760,6 +760,11 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_char_length(&args[0]),
 		(
+			ScalarFunctionEvaluator::WidthBucket,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_width_bucket(&args[0], &args[1], &args[2], &args[3]),
+		(
 			ScalarFunctionEvaluator::Floor,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -777,7 +782,8 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Sign
 			| ScalarFunctionEvaluator::Sqrt
 			| ScalarFunctionEvaluator::Trim
-			| ScalarFunctionEvaluator::Upper,
+			| ScalarFunctionEvaluator::Upper
+			| ScalarFunctionEvaluator::WidthBucket,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Rejects,
 		) => Err(ExecutionError::InvalidExpression {
@@ -787,6 +793,90 @@ fn evaluate_scalar_function(
 			),
 		}),
 	}
+}
+
+/// `WIDTH_BUCKET(operand, low, high, count)` answers the ANSI question: which of
+/// `count` equal-width buckets spanning `[low, high)` contains `operand`. The
+/// indexing convention is 1-based, `0` is the underflow bucket, and `count + 1`
+/// is the overflow bucket — those are the standard's answers, not choices made
+/// here.
+///
+/// Every operand is read per row, so an invalid range is a row-level failure
+/// rather than something the binder could have caught.
+fn evaluate_width_bucket(
+	operand: &ArrayRef,
+	low: &ArrayRef,
+	high: &ArrayRef,
+	count: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let operands = float_operands(operand, "operand")?;
+	let lows = float_operands(low, "low")?;
+	let highs = float_operands(high, "high")?;
+	let counts = integer_bucket_counts(count)?;
+
+	let mut buckets = Vec::with_capacity(operands.len());
+	for row in 0..operands.len() {
+		let (Some(operand), Some(low), Some(high), Some(count)) =
+			(operands[row], lows[row], highs[row], counts[row])
+		else {
+			buckets.push(None);
+			continue;
+		};
+		if count <= 0 {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!("WIDTH_BUCKET expects a positive bucket count, got {count}"),
+			});
+		}
+		// Reversed ranges are a Postgres extension, not ANSI. Refusing keeps the
+		// direction convention from being decided by accident here.
+		if !(low < high) {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!("WIDTH_BUCKET expects low < high, got low {low} and high {high}"),
+			});
+		}
+		buckets.push(Some(if operand < low {
+			0
+		} else if operand >= high {
+			count.saturating_add(1)
+		} else {
+			let width = (high - low) / count as f64;
+			let offset = ((operand - low) / width).floor();
+			// Clamp guards the boundary case where floating division lands one
+			// past the last bucket for an operand that is strictly below `high`.
+			1 + (offset as i64).clamp(0, count - 1)
+		}));
+	}
+	Ok(Arc::new(Int64Array::from_iter(buckets)) as ArrayRef)
+}
+
+fn float_operands(input: &ArrayRef, role: &str) -> Result<Vec<Option<f64>>, ExecutionError> {
+	if let Some(input) = input.as_any().downcast_ref::<Float32Array>() {
+		return Ok(input.iter().map(|value| value.map(f64::from)).collect());
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Float64Array>() {
+		return Ok(input.iter().collect());
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"WIDTH_BUCKET expects a float {role}, got {:?}",
+			input.data_type()
+		),
+	})
+}
+
+fn integer_bucket_counts(input: &ArrayRef) -> Result<Vec<Option<i64>>, ExecutionError> {
+	if let Some(input) = input.as_any().downcast_ref::<Int32Array>() {
+		return Ok(input.iter().map(|value| value.map(i64::from)).collect());
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Int64Array>() {
+		return Ok(input.iter().collect());
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"WIDTH_BUCKET expects an integer bucket count, got {:?}",
+			input.data_type()
+		),
+	})
 }
 
 /// The output keeps the input's offset width, so a `LargeUtf8` column stays
@@ -3132,6 +3222,63 @@ mod tests {
 			i32::MIN,
 			"wrapping_abs returns the input unchanged, which is the value this must never produce"
 		);
+	}
+
+	/// The bucket conventions are the standard's: 1-based interior buckets, `0`
+	/// for underflow, `count + 1` for overflow, `low` inclusive, `high`
+	/// exclusive. Each of those is a place an implementation can silently
+	/// disagree with every other database, so each is pinned.
+	#[test]
+	fn width_bucket_follows_the_ansi_indexing_and_overflow_conventions() {
+		let operands = Arc::new(Float64Array::from(vec![
+			Some(-1.0),  // below low
+			Some(0.0),   // exactly low, first interior bucket
+			Some(2.5),   // interior
+			Some(9.999), // just below high
+			Some(10.0),  // exactly high, overflow
+			Some(11.0),  // above high
+			None,
+		])) as ArrayRef;
+		let rows = 7;
+		let low = Arc::new(Float64Array::from(vec![Some(0.0); rows])) as ArrayRef;
+		let high = Arc::new(Float64Array::from(vec![Some(10.0); rows])) as ArrayRef;
+		let count = Arc::new(Int64Array::from(vec![Some(5_i64); rows])) as ArrayRef;
+
+		let output =
+			super::evaluate_width_bucket(&operands, &low, &high, &count).expect("WIDTH_BUCKET");
+		assert_eq!(output.data_type(), &DataType::Int64);
+		let buckets = output
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("Int64 output");
+		assert_eq!(buckets.value(0), 0, "below low is the underflow bucket");
+		assert_eq!(buckets.value(1), 1, "low is inclusive and 1-based");
+		assert_eq!(
+			buckets.value(2),
+			2,
+			"2.5 falls in the second of five buckets"
+		);
+		assert_eq!(buckets.value(3), 5, "just below high is the last bucket");
+		assert_eq!(buckets.value(4), 6, "high is exclusive: count + 1");
+		assert_eq!(buckets.value(5), 6, "above high is the overflow bucket");
+		assert!(buckets.is_null(6), "NULL must propagate");
+	}
+
+	#[test]
+	fn width_bucket_refuses_a_nonpositive_count_and_a_reversed_range() {
+		let operand = Arc::new(Float64Array::from(vec![Some(1.0)])) as ArrayRef;
+		let low = Arc::new(Float64Array::from(vec![Some(0.0)])) as ArrayRef;
+		let high = Arc::new(Float64Array::from(vec![Some(10.0)])) as ArrayRef;
+
+		let zero = Arc::new(Int64Array::from(vec![Some(0_i64)])) as ArrayRef;
+		let err = super::evaluate_width_bucket(&operand, &low, &high, &zero)
+			.expect_err("a zero bucket count has no buckets to answer with");
+		assert!(format!("{err:?}").contains("positive bucket count"));
+
+		let count = Arc::new(Int64Array::from(vec![Some(5_i64)])) as ArrayRef;
+		let err = super::evaluate_width_bucket(&operand, &high, &low, &count)
+			.expect_err("a reversed range is not ANSI and must not be guessed at");
+		assert!(format!("{err:?}").contains("low < high"));
 	}
 
 	/// `CHAR_LENGTH` is a character count. `str::len` would answer in bytes and

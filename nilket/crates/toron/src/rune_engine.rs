@@ -1048,6 +1048,15 @@ pub fn ln(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn width_bucket(operand: RuneExpr, low: RuneExpr, high: RuneExpr, count: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::WidthBucket,
+			args: vec![operand.expr, low.expr, high.expr, count.expr],
+		},
+	}
+}
+
 pub fn upper(expr: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1689,6 +1698,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lower"], lower).build()?;
 	m.function(["trim"], trim).build()?;
 	m.function(["char_length"], char_length).build()?;
+	m.function(["width_bucket"], width_bucket).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;

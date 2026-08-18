@@ -1250,7 +1250,7 @@ fn integer_as_decimal_type(data_type: &DataType) -> Option<DataType> {
 /// ADR 266/325: coerce literal arithmetic operands without opening general casts. Int/Float literals
 /// beside Decimal128 rewrite toward Decimal; Decimal128 literals beside Float rewrite toward Float so dev
 /// Float queries survive exact decimal-point literal lowering.
-fn coerce_decimal_arithmetic_literal(
+pub(super) fn coerce_decimal_arithmetic_literal(
 	builder: &mut BoundExprProgramBuilder,
 	ctx: &ExprBindContext<'_>,
 	left: BoundExprId,

@@ -27,6 +27,7 @@ pub enum ScalarFunctionId {
 	Sqrt,
 	Trim,
 	Upper,
+	WidthBucket,
 }
 
 /// The accepted argument count for a scalar function.
@@ -49,6 +50,7 @@ impl ScalarFunctionArity {
 		match self {
 			Self::Exact(1) => "exactly one argument",
 			Self::Exact(2) => "exactly two arguments",
+			Self::Exact(4) => "exactly four arguments",
 			Self::Exact(_) => "the registered argument count",
 			Self::Between(1, 2) => "one or two arguments",
 			Self::Between(_, _) => "the registered argument range",
@@ -90,6 +92,11 @@ pub enum ScalarFunctionSignature {
 	/// from neither the input nor the argument list, which is why the string
 	/// family is the real test of this metadata model.
 	StringToInteger,
+	/// `WIDTH_BUCKET(operand, low, high, count)`: three same-typed floats and an
+	/// integer bucket count, producing a bucket ordinal. The count is a shape
+	/// parameter rather than a value, so it does not participate in the output
+	/// type any more than ROUND's digit count does.
+	NumericBucketing,
 }
 
 /// How NULL inputs affect the output.
@@ -124,6 +131,7 @@ pub enum ScalarFunctionEvaluator {
 	Sqrt,
 	Trim,
 	Upper,
+	WidthBucket,
 }
 
 /// Planner and execution metadata for one scalar capability.
@@ -349,6 +357,20 @@ const CHAR_LENGTH: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::CharLength,
 };
 
+const WIDTH_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::WidthBucket,
+	sql_name: "WIDTH_BUCKET",
+	sql_aliases: &[],
+	rune_name: "width_bucket",
+	arity: ScalarFunctionArity::Exact(4),
+	signature: ScalarFunctionSignature::NumericBucketing,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	evaluator: ScalarFunctionEvaluator::WidthBucket,
+};
+
 /// The complete scalar-function registry.
 pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	ABS,
@@ -365,6 +387,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	SQRT,
 	TRIM,
 	UPPER,
+	WIDTH_BUCKET,
 ];
 
 pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunctionMetadata {

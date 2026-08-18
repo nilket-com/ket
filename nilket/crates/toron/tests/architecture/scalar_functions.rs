@@ -175,6 +175,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Sqrt".to_string(),
 			"Trim".to_string(),
 			"Upper".to_string(),
+			"WidthBucket".to_string(),
 		]),
 		"admitting a function is a review decision; update this set deliberately"
 	);

@@ -130,6 +130,89 @@ pub(super) fn bind_scalar_function(
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
 		}
+		ScalarFunctionSignature::NumericBucketing => {
+			let [operand, low, high, count] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			for argument in bound_args.iter() {
+				if !builder
+					.node_logical_type(*argument)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			// `WIDTH_BUCKET(price, 0.0, 100.0, 4)` is the natural spelling, and a
+			// SQL decimal literal binds as Decimal128. Reuse the engine's existing
+			// rule — a literal adapts to an adjacent float, a column never does —
+			// rather than making this function demand casts nothing else demands.
+			for bound in [low, high] {
+				let (Some(operand_type), Some(bound_type)) =
+					(builder.node_type(*operand), builder.node_type(*bound))
+				else {
+					continue;
+				};
+				let (operand_type, bound_type) = (operand_type.clone(), bound_type.clone());
+				super::arithmetic::coerce_decimal_arithmetic_literal(
+					builder,
+					ctx,
+					*operand,
+					*bound,
+					&operand_type,
+					&bound_type,
+				)?;
+			}
+			// The three range operands must agree; a mixed-width range would make
+			// the bucket width depend on which operand won a promotion.
+			match (
+				builder.node_type(*operand),
+				builder.node_type(*low),
+				builder.node_type(*high),
+			) {
+				(Some(DataType::Float32), Some(DataType::Float32), Some(DataType::Float32))
+				| (Some(DataType::Float64), Some(DataType::Float64), Some(DataType::Float64)) => {}
+				(Some(operand_type), Some(low_type), Some(high_type)) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects operand, low, and high to share one float type, got {operand_type:?}, {low_type:?}, and {high_type:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				_ => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} input is not a bound expression", metadata.sql_name),
+					});
+				}
+			}
+			match builder.node_type(*count) {
+				Some(DataType::Int32 | DataType::Int64) => {}
+				Some(actual) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects an integer bucket count, got {actual:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				None => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!(
+							"{} bucket count is not a bound expression",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			// A bucket ordinal is a count, not a measurement in the operand's
+			// units, so it is Int64 whatever the range's width.
+			Ok(builder.append_scalar_function(id, bound_args, DataType::Int64))
+		}
 		ScalarFunctionSignature::BinaryIntegerPreserving => {
 			let [left, right] = bound_args.as_slice() else {
 				unreachable!("the registry arity was checked before binding")

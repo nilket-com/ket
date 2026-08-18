@@ -2362,6 +2362,78 @@ async fn adr553_trim_rejects_its_specification_forms() {
 }
 
 #[tokio::test]
+async fn adr553_sql_and_rune_width_bucket_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql("SELECT WIDTH_BUCKET(price, 0.0, 100.0, 4) FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([width_bucket(col("price"), lit_f64(0.0), lit_f64(100.0), lit(4))])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL WIDTH_BUCKET");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune width_bucket");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL WIDTH_BUCKET digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune width_bucket digest")
+	);
+}
+
+/// The bucket ordinal is a count, so it is `Int64` regardless of whether the
+/// range is measured in `Float32` or `Float64`.
+#[tokio::test]
+async fn adr553_width_bucket_returns_an_ordinal_not_a_measurement() {
+	let (catalog, _) = fixture();
+	for sql in [
+		"SELECT WIDTH_BUCKET(price, 0.0, 100.0, 4) FROM sales",
+		"SELECT WIDTH_BUCKET(rating32, 0.0, 9.0, 3) FROM sales",
+	] {
+		let logical = plan_sql(sql);
+		let bound = bind(&logical, &catalog, &PlannerConfig::default())
+			.await
+			.unwrap_or_else(|error| panic!("bind {sql}: {error:?}"));
+		assert_eq!(
+			bound.schema().field(0).data_type(),
+			&DataType::Int64,
+			"{sql} must produce a bucket ordinal"
+		);
+	}
+}
+
+/// A mixed-width range would let the bucket width depend on which operand won a
+/// promotion, so the three range operands must agree.
+#[tokio::test]
+async fn adr553_width_bucket_rejects_a_mixed_width_range() {
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT WIDTH_BUCKET(rating32, price, price, 4) FROM sales");
+	let err = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("a Float32 operand against Float64 bounds should not bind");
+	assert!(
+		matches!(err, BindingError::TypeMismatch { ref message } if message.contains("share one float type")),
+		"expected a mixed-width rejection, got {err:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr553_width_bucket_rejects_a_wrong_argument_count() {
+	assert_unsupported_message(
+		"SELECT WIDTH_BUCKET(price, 0.0, 100.0) FROM sales",
+		"WIDTH_BUCKET expects exactly four arguments, got 3",
+	);
+}
+
+#[tokio::test]
 async fn rune_distinct_matches_sql_distinct_plan_and_rows() {
 	let sql_logical = plan_sql("SELECT DISTINCT region, status FROM sales");
 	let rune_logical = rune_plan(

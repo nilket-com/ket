@@ -280,6 +280,33 @@ refusing. The bare `TRIM(LEADING FROM s)` form does not parse in this dialect at
 all, so the engine never sees it; a test pins that too, because "we reject it"
 and "it never arrives" are different facts.
 
+**`WIDTH_BUCKET` reverses an ADR 545 rejection, deliberately.** That record
+declined it because it "would also decide range endpoints, overflow buckets, bin
+count, and indexing convention" — materially larger semantics than the `FLOOR`
+primitive it needed. The objection was about semantics, not cost, so a cheap
+registration mechanism does not by itself answer it.
+
+What answers it is that **the standard already decided those questions.**
+`WIDTH_BUCKET(operand, low, high, count)` has one specified reading: `low`
+inclusive, `high` exclusive, interior buckets numbered from 1, `0` for underflow,
+`count + 1` for overflow. ADR 545 was weighing a bespoke operator whose
+conventions this project would have had to invent; adopting the ANSI function
+means inheriting them instead. Each convention is pinned by a test, because each
+is a place an implementation can silently disagree with every other database.
+
+Reversed ranges are refused rather than supported. Postgres accepts `low > high`
+and counts downward; ANSI does not specify it. Refusing keeps the direction
+convention from being settled by accident, and it can widen later.
+
+**It also forced a coercion decision, and the answer was to reuse the engine's.**
+`WIDTH_BUCKET(price, 0.0, 100.0, 4)` is the natural spelling, but a SQL decimal
+literal binds as `Decimal128` against a `Float64` column, so the strict
+same-type rule rejected it. Rather than demanding casts that no other expression
+demands, the binder now applies `coerce_decimal_arithmetic_literal` — the engine's
+existing rule that a **literal** adapts to an adjacent float while a **column**
+never does. Mixed-width *columns* are still rejected, and a test uses two columns
+precisely so literal coercion cannot mask it.
+
 **Not yet paid for: a fallibility property.** `ABS` can fail at run time, and the
 registry has no field saying so. Nothing consumes such a field today, so adding
 one now would be speculative. It becomes real the moment a rule wants to know
