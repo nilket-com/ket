@@ -57,6 +57,7 @@ tiny-skia = "0.12.0"
 tokio = { version = "1.50.0", features = ["full"] }
 mysql_async = { version = "0.37", default-features = false, features = ["default-rustls-ring"] }
 tokio-postgres = "0.7.16"
+tokio-postgres-rustls = { version = "0.14.0", default-features = false, features = ["ring", "webpki-roots"] }
 tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 tokio-stream = "0.1.18"
 unicode-segmentation = "1.13.2"

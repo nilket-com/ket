@@ -282,8 +282,9 @@ impl AdapterState {
 				Ok(Arc::new(RwLock::new(parquet::ParquetAdapter { context })))
 			}
 			AdapterConfiguration::Postgres { connection_string } => {
+				let tls = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
 				let (client, connection) =
-					tokio_postgres::connect(&connection_string, tokio_postgres::NoTls)
+					tokio_postgres::connect(&connection_string, tls)
 						.await
 						.map_err(|error| format!("Postgres connection: {error}"))?;
 				tokio::spawn(async move {
