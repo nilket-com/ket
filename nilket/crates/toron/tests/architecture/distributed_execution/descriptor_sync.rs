@@ -612,7 +612,7 @@ pub(crate) fn adr053_descriptor_evolved_does_not_add_direct_sync_path() {
 
 	assert!(storage.contains("StorageError::DescriptorEvolved"));
 	assert!(select_loop.contains("invalidate_descriptor_evolution(catalog.as_ref(), &error)"));
-	assert!(select_loop.contains("bind(plan, catalog.as_ref(), &self.config).await?"));
+	assert!(select_loop.contains("bind_with_statement_timestamp("));
 	assert!(write_helper.contains("invalidate_descriptor_evolution_on_error"));
 	assert!(!write_helper.contains("loop"));
 	assert!(!coordinator.contains("get_table_schema_descriptor"));
@@ -754,7 +754,7 @@ pub(crate) fn adr054_select_retry_reuses_adr053_bind_miss_sync() {
 		std::fs::read_to_string(manifest_dir().join("src/catalog.rs")).expect("read catalog");
 
 	assert!(coordinator.contains("invalidate_descriptor_evolution(catalog.as_ref(), &error)"));
-	assert!(coordinator.contains("let bound = bind(plan, catalog.as_ref(), &self.config).await?;"));
+	assert!(coordinator.contains("let bound = bind_with_statement_timestamp("));
 	assert!(catalog.contains("resolve_table_after_local_miss"));
 	assert!(catalog.contains("DescriptorSyncParticipant::Owner"));
 	assert!(

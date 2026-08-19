@@ -339,8 +339,8 @@ pub(crate) fn decision_record_is_latency_identical_no_per_query_flush() {
 #[test]
 pub(crate) fn adr216_decision_provenance_is_bind_entry_not_posthoc() {
 	let binder = binder_root_source();
-	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
-	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_with_trace = first_block(&binder, "async fn bind_with_trace_at");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace_at");
 	let provenance = first_block(&binder, "fn decision_provenance_for_outer_join_demotions");
 	let runtime_recorder = source("src/binder/runtime_evidence.rs");
 	let recorder = first_block(&runtime_recorder, "impl OptimizerRuntimeDecisionRecorder");
@@ -564,7 +564,7 @@ pub(crate) fn adr188_default_off_zero_overhead() {
 	assert!(gate.contains("return false"));
 	assert!(gate.contains("fetch_add(1, Ordering::Relaxed).saturating_add(1)"));
 	assert!(streaming.contains("if measure_runtime_verdict"));
-	assert!(streaming.contains("None => bind(&plan"));
+	assert!(streaming.contains("None => bind_with_statement_timestamp("));
 }
 
 #[test]
@@ -840,13 +840,13 @@ pub(crate) fn adr190_applied_margin_recorded_in_ranking_and_evidence() {
 #[test]
 pub(crate) fn adr190_observed_paths_receive_configured_margin() {
 	let binder = binder_root_source();
-	let bind_explain = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_explain = first_block(&binder, "async fn bind_with_explain_trace_at");
 	let default = first_block(&binder, "impl Default for PlannerConfig");
 
 	// ADR 208: observed tree paths receive the resolved tree step captured once at bind entry, not
 	// a fresh `config` read. Default Manual makes that resolved step equal to the configured step,
 	// preserving the ADR 190 behavior.
-	assert!(bind_explain.contains("let binder = Binder::new(catalog, config)"));
+	assert!(bind_explain.contains("let binder = Binder::new_at(catalog, config"));
 	assert!(
 		bind_explain
 			.contains("let tree_join_order_soft_margin_step = binder.join_order_policy.tree_step")

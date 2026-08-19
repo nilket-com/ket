@@ -6860,7 +6860,13 @@ impl SqlPlanner {
 			return Ok(None);
 		};
 		let metadata = crate::ir::scalar_function_metadata(id);
-		let mut args = function_positional_args(function, metadata.sql_name)?;
+		let mut args = if id == crate::ir::ScalarFunctionId::Now
+			&& matches!(function.args, FunctionArguments::None)
+		{
+			Vec::new()
+		} else {
+			function_positional_args(function, metadata.sql_name)?
+		};
 		if !metadata.arity.accepts(args.len()) {
 			return Err(unsupported(format!(
 				"{} expects {}, got {}",
@@ -11824,6 +11830,27 @@ mod tests {
 				..
 			}] if matches!(args.as_slice(), [Expr::Column(column)] if column.name.0 == "price")
 		));
+	}
+
+	#[test]
+	fn sql_now_and_current_timestamp_share_the_statement_stable_identifier() {
+		let plan = SqlPlanner::new()
+			.plan("SELECT NOW(), CURRENT_TIMESTAMP, CURRENT_TIMESTAMP() FROM sales")
+			.expect("plan current timestamp forms");
+		let LogicalPlan::Project { exprs, .. } = plan else {
+			panic!("current timestamp projection must lower to Project");
+		};
+		assert_eq!(exprs.len(), 3);
+		for expr in exprs {
+			assert!(matches!(
+				expr,
+				Expr::ScalarFunction {
+					id: crate::ir::ScalarFunctionId::Now,
+					args,
+					parameter: crate::ir::ScalarFunctionParameter::None,
+				} if args.is_empty()
+			));
+		}
 	}
 
 	fn filter_count(plan: &LogicalPlan) -> usize {

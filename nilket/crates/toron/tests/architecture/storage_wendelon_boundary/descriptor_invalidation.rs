@@ -90,9 +90,8 @@ pub(crate) fn adr029_select_retry_loop_is_preserved() {
 		.expect("descriptor-evolution retry loop body");
 
 	assert!(loop_body.contains("let measured_binding = if measure_runtime_verdict"));
-	assert!(
-		loop_body
-			.contains("Some(bind_explain_analyze(plan, catalog.as_ref(), &self.config).await?)")
-	);
-	assert!(loop_body.contains("None => bind(plan, catalog.as_ref(), &self.config).await?"));
+	assert!(loop_body.contains("Some("));
+	assert!(loop_body.contains("bind_explain_analyze_with_statement_timestamp("));
+	assert!(loop_body.contains("None => {"));
+	assert!(loop_body.contains("bind_with_statement_timestamp("));
 }

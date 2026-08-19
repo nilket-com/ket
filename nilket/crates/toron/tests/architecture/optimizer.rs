@@ -286,9 +286,9 @@ pub(crate) fn adr133_trace_types_are_crate_private_not_public() {
 pub(crate) fn adr133_bind_is_wrapper_over_bind_with_trace() {
 	let binder = binder_source();
 	let bind_entry = source_block(&binder, "pub async fn bind");
-	let bind_with_trace = source_block(&binder, "pub(crate) async fn bind_with_trace");
+	let bind_with_trace = source_block(&binder, "async fn bind_with_trace_at");
 
-	assert!(bind_entry.contains("bind_with_trace(plan, catalog, config).await?"));
+	assert!(bind_entry.contains("bind_with_statement_timestamp("));
 	assert!(!bind_entry.contains("Binder { catalog, config }"));
 	assert!(!bind_entry.contains("bind_plan_with_trace"));
 	assert!(bind_with_trace.contains("let mut trace = OptimizerTrace::default()"));

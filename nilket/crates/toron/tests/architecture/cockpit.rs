@@ -214,8 +214,8 @@ pub(crate) fn adr174_cockpit_is_frontend_shared() {
 #[test]
 pub(crate) fn adr175_render_trace_is_explain_only() {
 	let binder = binder_source();
-	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
-	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_with_trace = first_block(&binder, "async fn bind_with_trace_at");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace_at");
 	let bind_explain = first_block(&binder, "async fn bind_explain(&self");
 
 	assert!(binder.contains("struct OptimizerExplainRenderTrace"));

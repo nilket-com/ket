@@ -6196,6 +6196,7 @@ fn at_time_zone_rejects_date32_operand() {
 		logical_type_specs: &logical_casts,
 		logical_type_registry: &logical_type_registry,
 		relation_scope: None,
+		statement_timestamp_nanos: 0,
 	};
 	let err = bind_expr_program(
 		&[crate::ir::extract_scalar_function(
@@ -6208,6 +6209,43 @@ fn at_time_zone_rejects_date32_operand() {
 	.expect_err("Date32 AT TIME ZONE should reject");
 
 	assert!(err.to_string().contains("AT TIME ZONE requires Timestamp"));
+}
+
+#[test]
+fn now_binding_bakes_the_statement_timestamp_into_the_bound_node() {
+	let config = PlannerConfig::default();
+	let logical_casts = HashMap::new();
+	let logical_type_registry = LogicalTypeRegistry::default();
+	let ctx = ExprBindContext {
+		config: &config,
+		session_timezone: config
+			.resolved_session_timezone()
+			.expect("session timezone"),
+		statement_timestamp_nanos: 42,
+		logical_type_specs: &logical_casts,
+		logical_type_registry: &logical_type_registry,
+		relation_scope: None,
+	};
+	let program = bind_expr_program(
+		&[Expr::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::Now,
+			args: Vec::new(),
+			parameter: crate::ir::ScalarFunctionParameter::None,
+		}],
+		&Arc::new(Schema::empty()),
+		&ctx,
+	)
+	.expect("bind NOW");
+	assert!(matches!(
+		program.nodes.as_slice(),
+		[BoundExprNode::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::Now,
+			parameter: crate::ir::ScalarFunctionParameter::CurrentTimestamp {
+				timestamp_nanos: 42
+			},
+			..
+		}]
+	));
 }
 
 #[tokio::test]
@@ -21089,6 +21127,7 @@ fn bind_substring_expr(expr: Expr) -> Result<BoundExprProgram, BindingError> {
 		logical_type_specs: &logical_casts,
 		logical_type_registry: &logical_type_registry,
 		relation_scope: None,
+		statement_timestamp_nanos: 0,
 	};
 	bind_expr_program(&[expr], &substring_schema(), &ctx)
 }
@@ -21150,6 +21189,7 @@ fn try_bind_temporal_expr(
 		logical_type_specs: &logical_casts,
 		logical_type_registry: &logical_type_registry,
 		relation_scope: None,
+		statement_timestamp_nanos: 0,
 	};
 	bind_expr_program(&[expr], &temporal_schema(), &ctx)
 }

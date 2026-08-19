@@ -31,6 +31,7 @@ pub enum ScalarFunctionId {
 	Ltrim,
 	Lpad,
 	Mod,
+	Now,
 	Position,
 	Pow,
 	Random,
@@ -63,6 +64,7 @@ pub enum ScalarFunctionParameter {
 	Extract(Box<ExtractScalarFunctionParameter>),
 	DateTrunc(Box<DateTruncScalarFunctionParameter>),
 	Trim(Box<TrimScalarFunctionParameter>),
+	CurrentTimestamp { timestamp_nanos: i64 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -182,6 +184,8 @@ pub enum ScalarFunctionSignature {
 	/// batch rather than from an operand, which is what makes a niladic
 	/// function different in kind from every rule above.
 	NiladicFloat,
+	/// No arguments at all, producing the execution's one statement timestamp.
+	NiladicTimestamp,
 	/// A `Utf8` string, a 1-based start, and an optional length. The bounds are
 	/// **constant** argument positions: they must bind to integer literals, and
 	/// the binder reads their values rather than evaluating them per row.
@@ -238,6 +242,14 @@ pub enum ScalarFunctionNonFiniteBehavior {
 	Rejects,
 }
 
+/// How often a scalar function is allowed to change its result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunctionEvaluation {
+	Deterministic,
+	PerCall,
+	PerStatement,
+}
+
 /// The only function-specific choice the executor makes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunctionEvaluator {
@@ -259,6 +271,7 @@ pub enum ScalarFunctionEvaluator {
 	Lower,
 	Position,
 	Mod,
+	Now,
 	Pow,
 	Random,
 	Replace,
@@ -294,7 +307,7 @@ pub struct ScalarFunctionMetadata {
 	pub signature: ScalarFunctionSignature,
 	pub null_behavior: ScalarFunctionNullBehavior,
 	pub non_finite_behavior: ScalarFunctionNonFiniteBehavior,
-	pub deterministic: bool,
+	pub evaluation: ScalarFunctionEvaluation,
 	pub pbc_pushdown_eligible: bool,
 	/// Whether guard-filter pushdown may recurse through this function's operands.
 	/// This is deliberately independent from PBC eligibility: a function can be
@@ -312,7 +325,7 @@ const EXP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Exp,
@@ -327,7 +340,7 @@ const SQRT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Sqrt,
@@ -344,7 +357,7 @@ const POW: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::BinaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Pow,
@@ -359,7 +372,7 @@ const ABS: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryNumericPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Abs,
@@ -374,7 +387,7 @@ const LN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Ln,
@@ -392,7 +405,7 @@ const LOG: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::BinaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Log,
@@ -407,7 +420,7 @@ const ROUND: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::FloatWithOptionalIntegerDigits,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Round,
@@ -422,7 +435,7 @@ const CEIL: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Ceil,
@@ -437,7 +450,7 @@ const FLOOR: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryIntegerOrFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Rejects,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Floor,
@@ -454,7 +467,7 @@ const TRUNC: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryIntegerOrFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Trunc,
@@ -469,7 +482,7 @@ const SIGN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryNumericPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Sign,
@@ -487,7 +500,7 @@ const MOD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::BinaryIntegerPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Mod,
@@ -502,7 +515,7 @@ const UPPER: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Upper,
@@ -517,7 +530,7 @@ const LOWER: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Lower,
@@ -532,7 +545,7 @@ const INITCAP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Initcap,
@@ -547,7 +560,7 @@ const REVERSE: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::UnaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Reverse,
@@ -562,7 +575,7 @@ const TRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::StringWithOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Trim,
@@ -579,7 +592,7 @@ const CONCAT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::VariadicStringConcatenating,
 	null_behavior: ScalarFunctionNullBehavior::Ignores,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Concat,
@@ -594,7 +607,7 @@ const LTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::StringWithOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Trim,
@@ -609,7 +622,7 @@ const LPAD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::StringWithIntegerAndOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Lpad,
@@ -626,7 +639,7 @@ const POSITION: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::BinaryStringToInteger,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Position,
@@ -641,7 +654,7 @@ const STRPOS: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::BinaryStringToInteger,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Position,
@@ -656,7 +669,7 @@ const REPLACE: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::TernaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Replace,
@@ -671,7 +684,7 @@ const RTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::StringWithOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Trim,
@@ -686,7 +699,7 @@ const RPAD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::StringWithIntegerAndOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Rpad,
@@ -702,7 +715,7 @@ const CHAR_LENGTH: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::StringToInteger,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::CharLength,
@@ -717,7 +730,7 @@ const WIDTH_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::NumericBucketing,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::WidthBucket,
@@ -736,7 +749,7 @@ const GREATEST: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	// be its own explicit PostgreSQL-compatibility decision.
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Greatest,
@@ -751,7 +764,7 @@ const LEAST: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::VariadicOrderedSameType,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Least,
@@ -771,10 +784,27 @@ const RANDOM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	// The first `false` in the registry. Five planner rules already read this
 	// through `Expr::is_deterministic`; until now none of them had a case that
 	// exercised the declining branch.
-	deterministic: false,
+	evaluation: ScalarFunctionEvaluation::PerCall,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Random,
+};
+
+const NOW: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Now,
+	sql_name: "NOW",
+	// CURRENT_TIMESTAMP is the SQL value-function spelling of the same
+	// statement-stable instant. It is an alias, not a second clock source.
+	sql_aliases: &["CURRENT_TIMESTAMP"],
+	rune_name: "now",
+	arity: ScalarFunctionArity::Exact(0),
+	signature: ScalarFunctionSignature::NiladicTimestamp,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::PerStatement,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Now,
 };
 
 const SUBSTRING: ScalarFunctionMetadata = ScalarFunctionMetadata {
@@ -786,7 +816,7 @@ const SUBSTRING: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::StringWithConstantBounds,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: true,
 	evaluator: ScalarFunctionEvaluator::Substring,
@@ -801,7 +831,7 @@ const SPLIT_PART: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::StringStringInteger,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::SplitPart,
@@ -816,7 +846,7 @@ const TIME_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::Int64MillisWithConstantInterval,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: true,
 	evaluator: ScalarFunctionEvaluator::TimeBucket,
@@ -831,7 +861,7 @@ const AT_TIME_ZONE: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::TimestampWithConstantZone,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: true,
 	evaluator: ScalarFunctionEvaluator::AtTimeZone,
@@ -846,7 +876,7 @@ const DATE_TRUNC: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::TemporalTrunc,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: true,
 	evaluator: ScalarFunctionEvaluator::DateTrunc,
@@ -861,7 +891,7 @@ const EXTRACT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	signature: ScalarFunctionSignature::TemporalExtract,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
-	deterministic: true,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: true,
 	evaluator: ScalarFunctionEvaluator::Extract,
@@ -887,6 +917,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	LOWER,
 	LTRIM,
 	MOD,
+	NOW,
 	POSITION,
 	POW,
 	RANDOM,
@@ -1041,6 +1072,17 @@ mod tests {
 		assert_eq!(
 			scalar_function_from_sql_name("ceil"),
 			Some(ScalarFunctionId::Ceil)
+		);
+	}
+
+	#[test]
+	fn current_timestamp_is_a_statement_stable_alias_of_now() {
+		let metadata = scalar_function_metadata(ScalarFunctionId::Now);
+		assert_eq!(metadata.sql_aliases, &["CURRENT_TIMESTAMP"]);
+		assert_eq!(metadata.evaluation, ScalarFunctionEvaluation::PerStatement);
+		assert_eq!(
+			scalar_function_from_sql_name("current_timestamp"),
+			Some(ScalarFunctionId::Now)
 		);
 	}
 

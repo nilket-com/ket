@@ -1013,6 +1013,9 @@ impl BoundExprProgram {
 					ScalarFunctionParameter::Trim(payload) => {
 						format!("<{:?}>", payload.where_field)
 					}
+					ScalarFunctionParameter::CurrentTimestamp { timestamp_nanos } => {
+						format!("<{timestamp_nanos}>")
+					}
 				},
 				args.iter()
 					.map(|arg| self.pretty_node(*arg))

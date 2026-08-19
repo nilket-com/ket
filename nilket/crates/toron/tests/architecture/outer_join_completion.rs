@@ -118,8 +118,8 @@ pub(crate) fn adr209_null_rejection_classifier_is_default_deny_allowlist() {
 pub(crate) fn adr209_outer_demotion_runs_before_join_strategy_choice() {
 	let binder_root = binder_root_source();
 	let binder = binder_source();
-	let bind_with_trace = source_block(&binder_root, "pub(crate) async fn bind_with_trace");
-	let bind_with_explain = source_block(&binder_root, "async fn bind_with_explain_trace");
+	let bind_with_trace = source_block(&binder_root, "async fn bind_with_trace_at");
+	let bind_with_explain = source_block(&binder_root, "async fn bind_with_explain_trace_at");
 	let bind_scoped_join = source_block(&binder_root, "fn bind_scoped_join");
 
 	assert!(

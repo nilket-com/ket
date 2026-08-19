@@ -309,6 +309,7 @@ impl ToronWorker {
 				spec.context.tenant_id,
 				spec.context.read_bound,
 			)
+			.with_statement_timestamp_nanos(spec.context.statement_timestamp_nanos)
 			.with_task_budget(spec.budget)
 			.with_task_telemetry(telemetry.clone())
 			.with_join_runtime_observation_mode(spec.join_runtime_observation_mode.clone())

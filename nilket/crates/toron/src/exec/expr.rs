@@ -697,6 +697,16 @@ fn evaluate_scalar_function(
 		(ScalarFunctionId::Rtrim, crate::ir::ScalarFunctionParameter::None) => {
 			return evaluate_trim(args, crate::ir::TrimWhere::Trailing);
 		}
+		(
+			ScalarFunctionId::Now,
+			crate::ir::ScalarFunctionParameter::CurrentTimestamp { timestamp_nanos },
+		) => {
+			return Ok(timestamp_literal_array(
+				&Some(*timestamp_nanos),
+				TimeUnit::Nanosecond,
+				num_rows,
+			));
+		}
 		_ => {}
 	}
 	if !matches!(parameter, crate::ir::ScalarFunctionParameter::None) {
@@ -932,6 +942,7 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Lpad
 			| ScalarFunctionEvaluator::Lower
 			| ScalarFunctionEvaluator::Mod
+			| ScalarFunctionEvaluator::Now
 			| ScalarFunctionEvaluator::Position
 			| ScalarFunctionEvaluator::Pow
 			| ScalarFunctionEvaluator::Rpad
@@ -3978,6 +3989,27 @@ mod tests {
 		assert!(values.value(2).is_infinite() && values.value(2).is_sign_positive());
 		assert_eq!(values.value(3), 0.0);
 		assert!(values.is_null(4));
+	}
+
+	#[test]
+	fn now_evaluator_repeats_one_bound_instant_for_every_row() {
+		let timestamp_nanos = 1_725_000_000_123_456_789_i64;
+		let output = evaluate_scalar_function(
+			ScalarFunctionId::Now,
+			&[],
+			&crate::ir::ScalarFunctionParameter::CurrentTimestamp { timestamp_nanos },
+			3,
+		)
+		.expect("registered NOW evaluator");
+		assert_eq!(
+			output.data_type(),
+			&DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()))
+		);
+		let values = output
+			.as_any()
+			.downcast_ref::<TimestampNanosecondArray>()
+			.expect("timestamp output");
+		assert_eq!(values.values(), &[timestamp_nanos; 3]);
 	}
 
 	#[test]

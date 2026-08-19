@@ -4018,6 +4018,7 @@ impl<'a> Binder<'a> {
 			config: self.config,
 			join_order_policy,
 			decision_recorder: Arc::clone(&self.decision_recorder),
+			statement_timestamp_nanos: self.statement_timestamp_nanos,
 		}
 	}
 

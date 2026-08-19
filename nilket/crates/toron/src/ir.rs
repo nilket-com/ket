@@ -987,8 +987,10 @@ impl Expr {
 		match self {
 			Self::Column(_) | Self::Literal(_) | Self::UntypedNull => true,
 			Self::ScalarFunction { id, args, .. } => {
-				scalar_function_metadata(*id).deterministic
-					&& args.iter().all(Self::is_deterministic)
+				matches!(
+					scalar_function_metadata(*id).evaluation,
+					crate::ir::ScalarFunctionEvaluation::Deterministic
+				) && args.iter().all(Self::is_deterministic)
 			}
 			Self::LogicalAscription { expr: inner, .. }
 			| Self::SqlLogicalCast { expr: inner, .. }

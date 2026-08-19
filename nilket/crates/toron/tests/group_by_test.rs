@@ -18,8 +18,9 @@ use toron::exec::Executor;
 use toron::ir::{
 	AggregateFunction, BoundBinaryOp, BoundExprId, BoundExprNode, BoundExprProgram,
 	CUSTOMER_ID_LOGICAL_TYPE, ColumnOrdinal, ExecutionPlan, Expr, FilterDisposition, JoinKind,
-	JoinStrategyIntent, LogicalPlan, ScalarFunctionId, ScalarFunctionParameter, ScalarValue,
-	SortExpr, SystemTableKind, TableId,
+	JoinStrategyIntent, LogicalPlan, ScalarFunctionEvaluation, ScalarFunctionId,
+	ScalarFunctionParameter, ScalarValue, SortExpr, SystemTableKind, TableId,
+	scalar_function_metadata,
 };
 use toron::rune_engine::{RuneEngine, RuneSandboxConfig};
 use toron::sql_planner::SqlPlanner;
@@ -2804,7 +2805,7 @@ async fn adr553_greatest_rejects_mixed_argument_types() {
 	);
 }
 
-/// `RANDOM()` is the registry's first non-deterministic entry. Its rows cannot
+/// `RANDOM()` is the registry's per-call non-deterministic entry. Its rows cannot
 /// be digest-compared across surfaces — that is the whole point — so the
 /// equivalence assertion is on the bound plan alone.
 #[tokio::test]
@@ -2857,6 +2858,23 @@ async fn adr553_random_is_the_registry_s_first_non_deterministic_entry() {
 		}
 		.is_deterministic(),
 		"an ordinary registration stays deterministic"
+	);
+}
+
+#[tokio::test]
+async fn adr556_now_is_statement_scoped_but_not_deterministic() {
+	let now = Expr::ScalarFunction {
+		id: ScalarFunctionId::Now,
+		args: Vec::new(),
+		parameter: ScalarFunctionParameter::None,
+	};
+	assert!(
+		!now.is_deterministic(),
+		"NOW must not be treated as a pure expression"
+	);
+	assert_eq!(
+		scalar_function_metadata(ScalarFunctionId::Now).evaluation,
+		ScalarFunctionEvaluation::PerStatement
 	);
 }
 

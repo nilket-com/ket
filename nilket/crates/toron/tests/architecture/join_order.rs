@@ -27,7 +27,7 @@ fn source_lines_for_path(path: &Path) -> Vec<(PathBuf, usize, String)> {
 #[test]
 pub(crate) fn adr178_star_order_actuation_is_planning_time_not_explain_rendered() {
 	let binder = binder_source();
-	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace_at");
 	let bind_plan = first_block(&binder, "fn bind_plan_with_trace");
 	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
 	let join_order = source("src/binder/join_order.rs");
@@ -104,8 +104,8 @@ pub(crate) fn adr178_broadcast_star_only_respects_scan_linear_probe_fence() {
 #[test]
 pub(crate) fn adr178_source_capture_is_split_from_explain_rendering() {
 	let binder = binder_source();
-	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
-	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_with_trace = first_block(&binder, "async fn bind_with_trace_at");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace_at");
 	let bind_scoped_join = first_block(&binder, "fn bind_scoped_join");
 
 	assert!(bind_with_trace.contains("let mut render_trace = None;"));
@@ -232,12 +232,12 @@ pub(crate) fn adr179_explain_analyze_is_implemented_not_rejected() {
 
 	assert!(lower_explain.contains("LogicalPlan::ExplainAnalyze"));
 	assert!(!planner.contains("EXPLAIN ANALYZE is not supported"));
-	assert!(local.contains("bind_explain_analyze(input, catalog, &self.config).await?"));
+	assert!(local.contains("bind_explain_analyze_with_statement_timestamp("));
 	assert!(
 		distributed
 			.contains("let planner_config = distributed_planner_config(planner_config.clone());")
 	);
-	assert!(distributed.contains("bind_explain_analyze(input, catalog, &planner_config).await?"));
+	assert!(distributed.contains("bind_explain_analyze_with_statement_timestamp("));
 	assert!(exec.contains("unbound EXPLAIN ANALYZE execution"));
 }
 
@@ -785,7 +785,7 @@ pub(crate) fn adr181_strict_star_leaf_shape_still_defers_snowflake_and_bushy_ord
 pub(crate) fn adr182_snowflake_recognition_is_observational() {
 	let binder = binder_source();
 	let join_order = source("src/binder/join_order.rs");
-	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace_at");
 	let bind_join = first_block(&binder, "async fn bind_join");
 	let bind_scoped_join = first_block(&binder, "fn bind_scoped_join");
 	let choose = first_block(&binder, "fn choose_join_strategy");
@@ -888,7 +888,7 @@ pub(crate) fn adr182_snowflake_records_strategy_as_evidence_not_gate() {
 pub(crate) fn adr182_snowflake_supersedes_decline_without_gating_runtime() {
 	let binder = binder_source();
 	let explain = source("src/binder/explain.rs");
-	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace_at");
 	let runtime = first_block(&binder, "fn star_order_runtime_replay_ids");
 	let analyze_rows = first_block(&explain, "fn optimizer_analyze_rows");
 
@@ -1256,7 +1256,7 @@ pub(crate) fn adr185_branch_built_declared_without_actuator() {
 #[test]
 pub(crate) fn adr185_actuated_root_reports_as_star() {
 	let binder = binder_source();
-	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace");
+	let bind_with_explain_trace = first_block(&binder, "async fn bind_with_explain_trace_at");
 	let actuator = first_block(&binder, "async fn try_bind_star_order_actuation");
 	let local_actuator = first_block(&binder, "fn bind_local_star_actuation");
 

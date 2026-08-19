@@ -9,6 +9,9 @@ pub struct TaskExecutionContext {
 	pub session_id: SessionId,
 	pub tenant_id: TenantId,
 	pub read_bound: HlcBound,
+	/// ADR 556: the coordinator's statement timestamp; workers must not mint
+	/// their own clock value for current-timestamp expressions.
+	pub statement_timestamp_nanos: i64,
 	pub trace_context: Option<TraceContext>,
 	pub quantile_execution_seed: [u8; 32],
 	pub quantile_state_allowance: usize,
@@ -30,6 +33,7 @@ impl TaskExecutionContext {
 		session_id: SessionId,
 		tenant_id: TenantId,
 		read_bound: HlcBound,
+		statement_timestamp_nanos: i64,
 		trace_context: Option<TraceContext>,
 		quantile_execution_seed: [u8; 32],
 		quantile_state_allowance: usize,
@@ -38,6 +42,7 @@ impl TaskExecutionContext {
 			session_id,
 			tenant_id,
 			read_bound,
+			statement_timestamp_nanos,
 			trace_context,
 			quantile_execution_seed,
 			quantile_state_allowance,
@@ -49,6 +54,7 @@ impl TaskExecutionContext {
 			SessionId(1),
 			TenantId(1),
 			HlcBound(1),
+			0,
 			None,
 			LOCAL_TEST_QUANTILE_SEED,
 			default_quantile_state_allowance(),
@@ -60,6 +66,7 @@ impl TaskExecutionContext {
 			context.session_id,
 			context.tenant_id,
 			context.read_bound,
+			context.statement_timestamp_nanos,
 			context.trace_context,
 			context.quantile_execution_seed,
 			context.quantile_state_allowance,
@@ -70,5 +77,17 @@ impl TaskExecutionContext {
 		self.quantile_execution_seed = seed;
 		self.quantile_state_allowance = state_allowance;
 		self
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn statement_timestamp_survives_the_coordinator_worker_context_boundary() {
+		let context = ExecutionContext::local_test().with_statement_timestamp_nanos(42);
+		let task = TaskExecutionContext::from_execution_context(&context);
+		assert_eq!(task.statement_timestamp_nanos, 42);
 	}
 }

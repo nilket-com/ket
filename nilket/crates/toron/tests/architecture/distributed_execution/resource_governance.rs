@@ -132,7 +132,7 @@ pub(crate) fn adr050_aggregate_admission_rejects_before_bind_or_execution() {
 		helper.contains("let planner_config = distributed_planner_config(self.config.clone());"),
 		"distributed admission derives its binding config after admission"
 	);
-	assert!(helper.contains("bind(plan, catalog.as_ref(), &planner_config).await?"));
+	assert!(helper.contains("bind_with_statement_timestamp("));
 }
 
 #[test]
@@ -595,7 +595,7 @@ pub(crate) fn adr055_queue_lives_at_admit_query_before_bind() {
 		.find("execute_query_with_admission")
 		.expect("execute with admission");
 	assert!(admit_pos < execute_pos);
-	assert!(coordinator.contains("let bound = bind(plan, catalog.as_ref(), &self.config).await?"));
+	assert!(coordinator.contains("let bound = bind_with_statement_timestamp("));
 }
 
 #[test]

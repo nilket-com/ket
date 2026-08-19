@@ -158,7 +158,7 @@ pub(crate) fn adr049_coordinator_scopes_catalog_before_binding() {
 	let scoped_pos = body
 		.find("Arc::clone(&self.catalog).scoped(context.tenant_id)")
 		.expect("scoped catalog");
-	let bind_pos = body.find("bind(plan, catalog.as_ref()").expect("bind");
+	let bind_pos = body.find("bind_with_statement_timestamp(").expect("bind");
 	assert!(scoped_pos < bind_pos);
 	assert!(!body.contains("bind(plan, self.catalog.as_ref()"));
 }

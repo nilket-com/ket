@@ -526,6 +526,15 @@ pub(super) fn bind_scalar_function(
 			// arguments, and the output type is the registration's own.
 			Ok(builder.append_scalar_function(id, bound_args, DataType::Float64))
 		}
+		ScalarFunctionSignature::NiladicTimestamp => Ok(builder
+			.append_parameterized_scalar_function(
+				id,
+				bound_args,
+				ScalarFunctionParameter::CurrentTimestamp {
+					timestamp_nanos: ctx.statement_timestamp_nanos,
+				},
+				DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+			)),
 		ScalarFunctionSignature::VariadicOrderedSameType => {
 			let [first, rest @ ..] = bound_args.as_slice() else {
 				unreachable!("the registry arity was checked before binding")

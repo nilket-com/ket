@@ -1863,10 +1863,10 @@ pub(crate) fn adr100_eager_error_fence_policy_unchanged() {
 pub(crate) fn adr100_no_projected_scan_receipt_until_elision_has_a_consumer() {
 	let binder = binder_source();
 	let bind_entry = first_block(&binder, "pub async fn bind");
-	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
+	let bind_with_trace = first_block(&binder, "async fn bind_with_trace_at");
 	let receipt = first_block(&binder, "fn stored_refinement_receipt");
 
-	assert!(bind_entry.contains("bind_with_trace(plan, catalog, config).await?"));
+	assert!(bind_entry.contains("bind_with_statement_timestamp("));
 	assert!(bind_with_trace.contains("bind_plan_with_trace("));
 	assert!(bind_with_trace.contains("JoinOrderSourceCapture::Off"));
 	assert!(bind_with_trace.contains("let logical_types = catalog.logical_type_registry()"));
@@ -2069,10 +2069,10 @@ pub(crate) fn adr103_alias_column_guards_retarget_to_104_unified_path() {
 pub(crate) fn adr105_project_coalescing_lives_in_existing_post_bind_optimizer() {
 	let binder = binder_source();
 	let bind_entry = first_block(&binder, "pub async fn bind");
-	let bind_with_trace = first_block(&binder, "pub(crate) async fn bind_with_trace");
+	let bind_with_trace = first_block(&binder, "async fn bind_with_trace_at");
 	let optimizer = first_block(&binder, "fn optimize_for_required");
 
-	assert!(bind_entry.contains("bind_with_trace(plan, catalog, config).await?"));
+	assert!(bind_entry.contains("bind_with_statement_timestamp("));
 	assert!(bind_with_trace.contains("push_down_scan_projection(plan.plan, &logical_types)?"));
 	assert!(optimizer.contains("collapse_adjacent_identity_project(input, exprs, output_schema)"));
 }

@@ -54,7 +54,7 @@ use std::io::{Cursor, ErrorKind};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 #[cfg(test)]
 use twox_hash::XxHash3_64;
 use wendelon::schema::{
@@ -68,6 +68,15 @@ use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 /// (the recursive term self-limits via its `WHERE`); this is the hard net so an unbounded recursion
 /// errors instead of hanging.
 const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
+
+pub(crate) fn current_statement_timestamp_nanos() -> i64 {
+	SystemTime::now()
+		.duration_since(UNIX_EPOCH)
+		.expect("system clock must be after the Unix epoch")
+		.as_nanos()
+		.try_into()
+		.expect("current timestamp must fit Arrow nanoseconds")
+}
 
 mod aggregate;
 mod density;
@@ -102,6 +111,9 @@ pub struct ExecutionContext {
 	pub query_id: QueryId,
 	pub tenant_id: TenantId,
 	pub read_bound: HlcBound,
+	/// ADR 556: one UTC instant captured at statement execution entry and reused
+	/// by every bind, retry, and distributed fragment.
+	pub statement_timestamp_nanos: i64,
 	pub profile_hint: Option<QueryProfileHint>,
 	pub trace_context: Option<TraceContext>,
 	pub legacy_table_pins: HashMap<TableId, ScanTablePin>,
@@ -133,6 +145,7 @@ impl fmt::Debug for ExecutionContext {
 			.field("query_id", &self.query_id)
 			.field("tenant_id", &self.tenant_id)
 			.field("read_bound", &self.read_bound)
+			.field("statement_timestamp_nanos", &self.statement_timestamp_nanos)
 			.field("profile_hint", &self.profile_hint)
 			.field("trace_context", &self.trace_context)
 			.field("legacy_table_pins", &self.legacy_table_pins)
@@ -168,6 +181,7 @@ impl ExecutionContext {
 			query_id,
 			tenant_id,
 			read_bound,
+			statement_timestamp_nanos: current_statement_timestamp_nanos(),
 			profile_hint: None,
 			trace_context: None,
 			legacy_table_pins: HashMap::new(),
@@ -185,6 +199,11 @@ impl ExecutionContext {
 			join_spill_file_ops: Arc::new(BlockingFileOps),
 			join_spill_dir: crate::exec::join::default_join_spill_dir(),
 		}
+	}
+
+	pub fn with_statement_timestamp_nanos(mut self, timestamp_nanos: i64) -> Self {
+		self.statement_timestamp_nanos = timestamp_nanos;
+		self
 	}
 
 	pub fn with_quantile_execution(mut self, seed: [u8; 32], state_allowance: usize) -> Self {

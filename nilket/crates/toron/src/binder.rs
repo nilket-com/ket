@@ -291,7 +291,22 @@ pub async fn bind(
 	catalog: &dyn Catalog,
 	config: &PlannerConfig,
 ) -> Result<ExecutionPlan, BindingError> {
-	let (plan, _) = bind_with_trace(plan, catalog, config).await?;
+	bind_with_statement_timestamp(
+		plan,
+		catalog,
+		config,
+		crate::exec::current_statement_timestamp_nanos(),
+	)
+	.await
+}
+
+pub(crate) async fn bind_with_statement_timestamp(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+	statement_timestamp_nanos: i64,
+) -> Result<ExecutionPlan, BindingError> {
+	let (plan, _) = bind_with_trace_at(plan, catalog, config, statement_timestamp_nanos).await?;
 	Ok(plan)
 }
 
@@ -300,9 +315,24 @@ pub(crate) async fn bind_with_trace(
 	catalog: &dyn Catalog,
 	config: &PlannerConfig,
 ) -> Result<(ExecutionPlan, OptimizerTrace), BindingError> {
+	bind_with_trace_at(
+		plan,
+		catalog,
+		config,
+		crate::exec::current_statement_timestamp_nanos(),
+	)
+	.await
+}
+
+async fn bind_with_trace_at(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+	statement_timestamp_nanos: i64,
+) -> Result<(ExecutionPlan, OptimizerTrace), BindingError> {
 	let mut trace = OptimizerTrace::default();
 	let mut render_trace = None;
-	let binder = Binder::new(catalog, config);
+	let binder = Binder::new_at(catalog, config, statement_timestamp_nanos);
 	let (normalized_plan, outer_join_demotions) = match plan {
 		LogicalPlan::Explain { .. } => (plan.clone(), Vec::new()),
 		_ => binder.demote_null_rejected_outer_joins(plan).await?,
@@ -334,9 +364,24 @@ async fn bind_with_explain_trace(
 	catalog: &dyn Catalog,
 	config: &PlannerConfig,
 ) -> Result<(ExecutionPlan, OptimizerTrace, OptimizerExplainRenderTrace), BindingError> {
+	bind_with_explain_trace_at(
+		plan,
+		catalog,
+		config,
+		crate::exec::current_statement_timestamp_nanos(),
+	)
+	.await
+}
+
+async fn bind_with_explain_trace_at(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+	statement_timestamp_nanos: i64,
+) -> Result<(ExecutionPlan, OptimizerTrace, OptimizerExplainRenderTrace), BindingError> {
 	let mut trace = OptimizerTrace::default();
 	let mut render_trace = Some(OptimizerExplainRenderTrace::default());
-	let binder = Binder::new(catalog, config);
+	let binder = Binder::new_at(catalog, config, statement_timestamp_nanos);
 	// ADR 208: capture the bind-entry tree step before the binder is consumed so observed
 	// star/snowflake receipts render on the same margin that actuation used earlier in this bind.
 	let tree_join_order_soft_margin_step = binder.join_order_policy.tree_step;
@@ -420,12 +465,29 @@ pub(crate) struct ExplainAnalyzeBinding {
 	render_trace: OptimizerExplainRenderTrace,
 }
 
+#[allow(dead_code)]
 pub(crate) async fn bind_explain_analyze(
 	plan: &LogicalPlan,
 	catalog: &dyn Catalog,
 	config: &PlannerConfig,
 ) -> Result<ExplainAnalyzeBinding, BindingError> {
-	let (plan, trace, render_trace) = bind_with_explain_trace(plan, catalog, config).await?;
+	bind_explain_analyze_with_statement_timestamp(
+		plan,
+		catalog,
+		config,
+		crate::exec::current_statement_timestamp_nanos(),
+	)
+	.await
+}
+
+pub(crate) async fn bind_explain_analyze_with_statement_timestamp(
+	plan: &LogicalPlan,
+	catalog: &dyn Catalog,
+	config: &PlannerConfig,
+	statement_timestamp_nanos: i64,
+) -> Result<ExplainAnalyzeBinding, BindingError> {
+	let (plan, trace, render_trace) =
+		bind_with_explain_trace_at(plan, catalog, config, statement_timestamp_nanos).await?;
 	let replay_ids = star_order_runtime_replay_ids(&render_trace)?;
 	Ok(ExplainAnalyzeBinding {
 		plan,
@@ -568,14 +630,29 @@ struct Binder<'a> {
 	// bind / declined-actuation re-bind carries a zero-size `NoOpDecisionRecorder` instead, so it cannot
 	// pollute the shared log — a structural fact, not a runtime flag.
 	decision_recorder: Arc<dyn OptimizerDecisionRecorder + Send + Sync>,
+	statement_timestamp_nanos: i64,
 }
 
 impl<'a> Binder<'a> {
+	#[cfg(test)]
 	fn new(catalog: &'a dyn Catalog, config: &'a PlannerConfig) -> Self {
+		Self::new_at(
+			catalog,
+			config,
+			crate::exec::current_statement_timestamp_nanos(),
+		)
+	}
+
+	fn new_at(
+		catalog: &'a dyn Catalog,
+		config: &'a PlannerConfig,
+		statement_timestamp_nanos: i64,
+	) -> Self {
 		Self::new_with_decision_provenance(
 			catalog,
 			config,
 			OptimizerRuntimeVerdictProvenance::Native,
+			statement_timestamp_nanos,
 		)
 	}
 
@@ -583,6 +660,7 @@ impl<'a> Binder<'a> {
 		catalog: &'a dyn Catalog,
 		config: &'a PlannerConfig,
 		decision_provenance: OptimizerRuntimeVerdictProvenance,
+		statement_timestamp_nanos: i64,
 	) -> Self {
 		let join_order_policy = effective_join_order_policy(config);
 		Self {
@@ -593,6 +671,7 @@ impl<'a> Binder<'a> {
 				Arc::clone(&config.runtime_evidence),
 				decision_provenance,
 			)),
+			statement_timestamp_nanos,
 		}
 	}
 
@@ -608,6 +687,7 @@ impl<'a> Binder<'a> {
 				Arc::clone(&self.config.runtime_evidence),
 				decision_provenance,
 			)),
+			statement_timestamp_nanos: self.statement_timestamp_nanos,
 		}
 	}
 
@@ -619,6 +699,7 @@ impl<'a> Binder<'a> {
 			config: self.config,
 			join_order_policy: self.join_order_policy,
 			decision_recorder: Arc::new(NoOpDecisionRecorder),
+			statement_timestamp_nanos: self.statement_timestamp_nanos,
 		}
 	}
 }
@@ -976,6 +1057,7 @@ fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
 struct ExprBindContext<'a> {
 	config: &'a PlannerConfig,
 	session_timezone: Tz,
+	statement_timestamp_nanos: i64,
 	logical_type_specs: &'a HashMap<String, LogicalTypeSpec>,
 	logical_type_registry: &'a LogicalTypeRegistry,
 	relation_scope: Option<&'a RelationScope>,
@@ -2306,6 +2388,7 @@ impl<'a> Binder<'a> {
 		let ctx = ExprBindContext {
 			config: self.config,
 			session_timezone: self.config.resolved_session_timezone()?,
+			statement_timestamp_nanos: self.statement_timestamp_nanos,
 			logical_type_specs: &logical_casts,
 			logical_type_registry: &logical_type_registry,
 			relation_scope,
@@ -2343,6 +2426,7 @@ impl<'a> Binder<'a> {
 		let ctx = ExprBindContext {
 			config: self.config,
 			session_timezone: self.config.resolved_session_timezone()?,
+			statement_timestamp_nanos: self.statement_timestamp_nanos,
 			logical_type_specs: &logical_casts,
 			logical_type_registry: &logical_type_registry,
 			relation_scope,
@@ -2378,6 +2462,7 @@ impl<'a> Binder<'a> {
 		let ctx = ExprBindContext {
 			config: self.config,
 			session_timezone: self.config.resolved_session_timezone()?,
+			statement_timestamp_nanos: self.statement_timestamp_nanos,
 			logical_type_specs: &logical_casts,
 			logical_type_registry: &logical_type_registry,
 			relation_scope,
@@ -3499,6 +3584,7 @@ impl<'a> Binder<'a> {
 				let ctx = ExprBindContext {
 					config: self.config,
 					session_timezone: self.config.resolved_session_timezone()?,
+					statement_timestamp_nanos: self.statement_timestamp_nanos,
 					logical_type_specs: &logical_type_specs,
 					logical_type_registry: &logical_type_registry,
 					relation_scope: Some(&match_scope),

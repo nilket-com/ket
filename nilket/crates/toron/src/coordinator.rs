@@ -12,8 +12,8 @@ mod delete;
 mod write;
 
 use crate::binder::{
-	PlannerConfig, bind, bind_explain_analyze, measured_explain_analyze_verdicts,
-	render_explain_analyze,
+	PlannerConfig, bind_explain_analyze_with_statement_timestamp, bind_with_statement_timestamp,
+	measured_explain_analyze_verdicts, render_explain_analyze,
 };
 use crate::catalog::{Catalog, CtasProvisionRequest, InvalidatedDescriptor};
 use crate::distributed::budget::{
@@ -40,7 +40,9 @@ use crate::distributed::worker_registry::{WorkerEntry, WorkerRegistry};
 use crate::error::{
 	CatalogError, ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind,
 };
-use crate::exec::{ExecutionContext, Executor, materialize_scalar_rows};
+use crate::exec::{
+	ExecutionContext, Executor, current_statement_timestamp_nanos, materialize_scalar_rows,
+};
 use crate::ir::{
 	BoundReturningProjection, BroadcastReplayEligibility, ColumnOrdinal, CreateTableRowIdentity,
 	ExecutionPlan, FilterDisposition, JoinReplayId, JoinStrategy, LogicalPlan, MorselId, TableId,
@@ -920,7 +922,13 @@ where
 		planner_config: &PlannerConfig,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let planner_config = distributed_planner_config(planner_config.clone());
-		let binding = bind_explain_analyze(input, catalog, &planner_config).await?;
+		let binding = bind_explain_analyze_with_statement_timestamp(
+			input,
+			catalog,
+			&planner_config,
+			context.statement_timestamp_nanos,
+		)
+		.await?;
 		let context = context
 			.clone()
 			.with_join_runtime_observation_mode(analyze_observation_mode(
@@ -968,12 +976,24 @@ where
 				| LogicalPlan::CreateLogicalType { .. }
 				| LogicalPlan::DropTable { .. }
 		) {
-			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&planner_config,
+				context.statement_timestamp_nanos,
+			)
+			.await?;
 			return execute_catalog_plan(catalog.as_ref(), self.admin.as_ref(), &context, &bound)
 				.await;
 		}
 		if matches!(plan, LogicalPlan::Insert { .. }) {
-			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&planner_config,
+				context.statement_timestamp_nanos,
+			)
+			.await?;
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
@@ -1003,7 +1023,13 @@ where
 				| LogicalPlan::Delete { .. }
 				| LogicalPlan::Update { .. }
 		) {
-			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&planner_config,
+				context.statement_timestamp_nanos,
+			)
+			.await?;
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
@@ -1033,7 +1059,13 @@ where
 		let mut retried_descriptor_evolution = false;
 		let mut invalidated = Vec::new();
 		loop {
-			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&planner_config,
+				context.statement_timestamp_nanos,
+			)
+			.await?;
 			if !invalidated.is_empty() {
 				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
 			}
@@ -1128,12 +1160,24 @@ where
 				| LogicalPlan::CreateLogicalType { .. }
 				| LogicalPlan::DropTable { .. }
 		) {
-			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&planner_config,
+				context.statement_timestamp_nanos,
+			)
+			.await?;
 			return execute_catalog_plan(catalog.as_ref(), self.admin.as_ref(), &context, &bound)
 				.await;
 		}
 		if matches!(plan, LogicalPlan::Insert { .. }) {
-			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&planner_config,
+				context.statement_timestamp_nanos,
+			)
+			.await?;
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
@@ -1163,7 +1207,13 @@ where
 				| LogicalPlan::Delete { .. }
 				| LogicalPlan::Update { .. }
 		) {
-			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&planner_config,
+				context.statement_timestamp_nanos,
+			)
+			.await?;
 			let source_executor = DistributedMutationSourceExecutor {
 				coordinator: self,
 				context: &context,
@@ -1193,7 +1243,13 @@ where
 		let mut retried_descriptor_evolution = false;
 		let mut invalidated = Vec::new();
 		loop {
-			let bound = bind(plan, catalog.as_ref(), &planner_config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&planner_config,
+				context.statement_timestamp_nanos,
+			)
+			.await?;
 			if !invalidated.is_empty() {
 				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
 			}
@@ -1513,18 +1569,28 @@ where
 		let pre_dispatch_started = std::time::Instant::now();
 		let measured_binding = if measure_runtime_verdict {
 			Some(
-				bind_explain_analyze(&plan, catalog.as_ref(), &config)
-					.await
-					.map_err(QueryError::Binding)?,
+				bind_explain_analyze_with_statement_timestamp(
+					&plan,
+					catalog.as_ref(),
+					&config,
+					context.statement_timestamp_nanos,
+				)
+				.await
+				.map_err(QueryError::Binding)?,
 			)
 		} else {
 			None
 		};
 		let bound = match &measured_binding {
 			Some(binding) => binding.plan.clone(),
-			None => bind(&plan, catalog.as_ref(), &config)
-				.await
-				.map_err(QueryError::Binding)?,
+			None => bind_with_statement_timestamp(
+				&plan,
+				catalog.as_ref(),
+				&config,
+				context.statement_timestamp_nanos,
+			)
+			.await
+			.map_err(QueryError::Binding)?,
 		};
 		if !invalidated.is_empty() {
 			reject_replacement_object(catalog.as_ref(), &invalidated).await?;
@@ -3393,6 +3459,7 @@ impl QueryCoordinator {
 		plan: &LogicalPlan,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
+		let statement_timestamp_nanos = current_statement_timestamp_nanos();
 		let catalog = Arc::clone(&self.catalog).scoped(self.executor.context().tenant_id);
 		if let LogicalPlan::ExplainAnalyze { input } = plan {
 			return self
@@ -3405,7 +3472,13 @@ impl QueryCoordinator {
 				| LogicalPlan::CreateLogicalType { .. }
 				| LogicalPlan::DropTable { .. }
 		) {
-			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&self.config,
+				statement_timestamp_nanos,
+			)
+			.await?;
 			return execute_catalog_plan(
 				catalog.as_ref(),
 				self.admin.as_ref(),
@@ -3422,7 +3495,13 @@ impl QueryCoordinator {
 				| LogicalPlan::Delete { .. }
 				| LogicalPlan::Update { .. }
 		) {
-			let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+			let bound = bind_with_statement_timestamp(
+				plan,
+				catalog.as_ref(),
+				&self.config,
+				statement_timestamp_nanos,
+			)
+			.await?;
 			return self.execute_write_plan(catalog.as_ref(), &bound).await;
 		}
 
@@ -3434,13 +3513,29 @@ impl QueryCoordinator {
 		let mut invalidated = Vec::new();
 		loop {
 			let measured_binding = if measure_runtime_verdict {
-				Some(bind_explain_analyze(plan, catalog.as_ref(), &self.config).await?)
+				Some(
+					bind_explain_analyze_with_statement_timestamp(
+						plan,
+						catalog.as_ref(),
+						&self.config,
+						statement_timestamp_nanos,
+					)
+					.await?,
+				)
 			} else {
 				None
 			};
 			let bound = match &measured_binding {
 				Some(binding) => binding.plan.clone(),
-				None => bind(plan, catalog.as_ref(), &self.config).await?,
+				None => {
+					bind_with_statement_timestamp(
+						plan,
+						catalog.as_ref(),
+						&self.config,
+						statement_timestamp_nanos,
+					)
+					.await?
+				}
 			};
 			if !invalidated.is_empty() {
 				reject_replacement_object(catalog.as_ref(), &invalidated).await?;
@@ -3525,7 +3620,14 @@ impl QueryCoordinator {
 			});
 		}
 		let catalog = Arc::clone(&self.catalog).scoped(self.executor.context().tenant_id);
-		let bound = bind(plan, catalog.as_ref(), &self.config).await?;
+		let statement_timestamp_nanos = current_statement_timestamp_nanos();
+		let bound = bind_with_statement_timestamp(
+			plan,
+			catalog.as_ref(),
+			&self.config,
+			statement_timestamp_nanos,
+		)
+		.await?;
 		self.execute_write_plan_with_operation_id(
 			catalog.as_ref(),
 			&bound,
@@ -3580,7 +3682,14 @@ impl QueryCoordinator {
 		input: &LogicalPlan,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let binding = bind_explain_analyze(input, catalog, &self.config).await?;
+		let statement_timestamp_nanos = current_statement_timestamp_nanos();
+		let binding = bind_explain_analyze_with_statement_timestamp(
+			input,
+			catalog,
+			&self.config,
+			statement_timestamp_nanos,
+		)
+		.await?;
 		let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
 		let context = self
 			.executor

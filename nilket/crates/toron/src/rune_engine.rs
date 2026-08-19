@@ -1088,6 +1088,16 @@ pub fn random() -> RuneExpr {
 	}
 }
 
+pub fn now() -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Now,
+			args: Vec::new(),
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 pub fn greatest(args: Vec<RuneExpr>) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1913,6 +1923,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["greatest"], greatest).build()?;
 	m.function(["least"], least).build()?;
 	m.function(["random"], random).build()?;
+	m.function(["now"], now).build()?;
 	m.function(["substring"], substring).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
@@ -2383,6 +2394,19 @@ mod tests {
 				args,
 				..
 			} if matches!(args.as_slice(), [Expr::Literal(ScalarValue::Float64(Some(value)))] if *value == 1.0)
+		));
+	}
+
+	#[test]
+	fn rune_now_uses_the_statement_stable_scalar_identifier() {
+		let expr = now().expr;
+		assert!(matches!(
+			expr,
+			Expr::ScalarFunction {
+				id: ScalarFunctionId::Now,
+				args,
+				parameter: ScalarFunctionParameter::None,
+			} if args.is_empty()
 		));
 	}
 

@@ -174,6 +174,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Ltrim".to_string(),
 			"Lpad".to_string(),
 			"Mod".to_string(),
+			"Now".to_string(),
 			"Position".to_string(),
 			"Pow".to_string(),
 			"Random".to_string(),
@@ -228,6 +229,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"signature: ScalarFunctionSignature::".to_string(),
 			"null_behavior: ScalarFunctionNullBehavior::".to_string(),
 			"non_finite_behavior: ScalarFunctionNonFiniteBehavior::".to_string(),
+			"evaluation: ScalarFunctionEvaluation::".to_string(),
 			"pbc_pushdown_eligible: ".to_string(),
 		] {
 			assert!(
