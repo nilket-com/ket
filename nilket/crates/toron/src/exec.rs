@@ -672,6 +672,16 @@ impl Executor {
 									true,
 								));
 							}
+							// ADR 560: the spread family reaches execution through the
+							// bound aggregate path, which the planner always produces.
+							AggregateFunction::VarPop
+							| AggregateFunction::VarSamp
+							| AggregateFunction::StddevPop
+							| AggregateFunction::StddevSamp => {
+								return Err(ExecutionError::NotImplemented {
+									feature: "unbound global spread aggregate",
+								});
+							}
 							AggregateFunction::LinearRegress => {
 								// Accumulate OLS state: n, sum_x, sum_y, sum_x2, sum_xy
 								let mut n = 0u64;
@@ -2587,7 +2597,12 @@ fn window_agg_add(
 				update_max_state(state, arg, row)?;
 			}
 		}
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+		AggregateFunction::LinearRegress
+		| AggregateFunction::ApproxQuantile(_)
+		| AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => {
 			return Err(ExecutionError::NotImplemented {
 				feature: "window experimental aggregate execution",
 			});
@@ -2616,7 +2631,12 @@ fn window_agg_finalize(
 		AggregateFunction::Min | AggregateFunction::Max => {
 			min_max_state_array(state.as_ref().expect("min/max window state"), output_type)?
 		}
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+		AggregateFunction::LinearRegress
+		| AggregateFunction::ApproxQuantile(_)
+		| AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => {
 			return Err(ExecutionError::NotImplemented {
 				feature: "window experimental aggregate execution",
 			});
@@ -2969,7 +2989,12 @@ fn fresh_window_agg_state(
 		AggregateFunction::Avg => Some(avg_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
 		AggregateFunction::Min => Some(min_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
 		AggregateFunction::Max => Some(max_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => None,
+		AggregateFunction::LinearRegress
+		| AggregateFunction::ApproxQuantile(_)
+		| AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => None,
 	})
 }
 

@@ -1410,6 +1410,29 @@ impl Executor {
 						}
 					}
 				}
+				AggregateFunction::VarPop
+				| AggregateFunction::VarSamp
+				| AggregateFunction::StddevPop
+				| AggregateFunction::StddevSamp => {
+					let arr =
+						self.evaluate_bound_single_root(&call.args, batch, "spread aggregate arg")?;
+					let reader = numeric_array_reader(&arr)?;
+					let AggState::Spread { count, mean, m2 } = state else {
+						return Err(ExecutionError::InvalidExpression {
+							message: "spread aggregate reached non-spread accumulator".to_string(),
+						});
+					};
+					for row in 0..batch.num_rows() {
+						if let Some(value) = reader.value(row) {
+							spread_accumulate(
+								count,
+								mean,
+								m2,
+								spread_input_value(value, arr.data_type()),
+							);
+						}
+					}
+				}
 				AggregateFunction::Min => {
 					let arr = self.evaluate_bound_single_root(&call.args, batch, "MIN arg")?;
 					for row in 0..batch.num_rows() {
@@ -1843,6 +1866,21 @@ pub(in crate::exec) fn finalize_global_aggregate_state(
 					output_schema.field(results_cols.len()).data_type(),
 				)?);
 			}
+			AggregateFunction::VarPop
+			| AggregateFunction::VarSamp
+			| AggregateFunction::StddevPop
+			| AggregateFunction::StddevSamp => {
+				let AggState::Spread { count, m2, .. } = state else {
+					return Err(ExecutionError::InvalidExpression {
+						message: "spread aggregate reached non-spread accumulator".to_string(),
+					});
+				};
+				results_cols.push(Arc::new(Float64Array::from(vec![spread_finalize(
+					&call.function,
+					*count,
+					*m2,
+				)])) as ArrayRef);
+			}
 			AggregateFunction::Min => {
 				results_cols.push(min_max_state_array(
 					&state,
@@ -1925,11 +1963,15 @@ impl Executor {
 					| AggregateFunction::Min
 					| AggregateFunction::Max
 					| AggregateFunction::Avg => Ok(Some(self.evaluate_expr(&args[0], batch)?)),
-					AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-						Err(ExecutionError::NotImplemented {
-							feature: "grouped experimental aggregate",
-						})
-					}
+					// ADR 560: the spread family binds through the bound path only.
+					AggregateFunction::VarPop
+					| AggregateFunction::VarSamp
+					| AggregateFunction::StddevPop
+					| AggregateFunction::StddevSamp
+					| AggregateFunction::LinearRegress
+					| AggregateFunction::ApproxQuantile(_) => Err(ExecutionError::NotImplemented {
+						feature: "grouped experimental aggregate",
+					}),
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			for (agg_idx, ((function, _), input)) in
@@ -2035,6 +2077,11 @@ impl Executor {
 							AggState::Quantile(_) => {
 								update_quantile_state(state, array, row)?;
 							}
+							AggState::Spread { .. } => {
+								return Err(ExecutionError::NotImplemented {
+									feature: "unbound grouped spread aggregate",
+								});
+							}
 						},
 					}
 				}
@@ -2080,7 +2127,8 @@ impl Executor {
 							| AggState::AvgInt { .. }
 							| AggState::AvgFloat { .. }
 							| AggState::AvgDecimal { .. }
-							| AggState::Quantile(_) => 0,
+							| AggState::Quantile(_)
+							| AggState::Spread { .. } => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -2103,7 +2151,12 @@ impl Executor {
 						.unwrap_or(DataType::Float64);
 					columns.push(avg_column_from_groups(&entries, agg_idx, &output_type)?);
 				}
-				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+				AggregateFunction::VarPop
+				| AggregateFunction::VarSamp
+				| AggregateFunction::StddevPop
+				| AggregateFunction::StddevSamp
+				| AggregateFunction::LinearRegress
+				| AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
 						feature: "grouped experimental aggregate",
 					});
@@ -2216,6 +2269,10 @@ impl Executor {
 				| AggregateFunction::Min
 				| AggregateFunction::Max
 				| AggregateFunction::Avg
+				| AggregateFunction::VarPop
+				| AggregateFunction::VarSamp
+				| AggregateFunction::StddevPop
+				| AggregateFunction::StddevSamp
 				| AggregateFunction::ApproxQuantile(_) => Ok(Some(self.evaluate_bound_single_root(
 					&call.args,
 					batch,
@@ -2302,6 +2359,20 @@ impl Executor {
 								add_sum_value(state, value)?;
 							}
 						}
+						AggState::Spread { count, mean, m2 } => {
+							let value = match reader {
+								Some(reader) => reader.value(row),
+								None => numeric_value(array, row)?,
+							};
+							if let Some(value) = value {
+								spread_accumulate(
+									count,
+									mean,
+									m2,
+									spread_input_value(value, array.data_type()),
+								);
+							}
+						}
 						AggState::AvgInt { .. }
 						| AggState::AvgFloat { .. }
 						| AggState::AvgDecimal { .. } => {
@@ -2386,7 +2457,8 @@ impl Executor {
 								| AggState::AvgInt { .. }
 								| AggState::AvgFloat { .. }
 								| AggState::AvgDecimal { .. }
-								| AggState::Quantile(_) => 0,
+								| AggState::Quantile(_)
+								| AggState::Spread { .. } => 0,
 							})
 							.collect::<Vec<_>>();
 						columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -2408,6 +2480,24 @@ impl Executor {
 							.iter()
 							.map(|entry| finalize_quantile_state(&entry.states[agg_idx]))
 							.collect::<Result<Vec<_>, _>>()?;
+						columns.push(Arc::new(Float64Array::from(values)) as ArrayRef);
+					}
+					AggregateFunction::VarPop
+					| AggregateFunction::VarSamp
+					| AggregateFunction::StddevPop
+					| AggregateFunction::StddevSamp => {
+						let values = entries
+							.iter()
+							.map(|entry| match entry.states[agg_idx] {
+								AggState::Spread { count, m2, .. } => {
+									Ok(spread_finalize(&call.function, count, m2))
+								}
+								_ => Err(ExecutionError::InvalidExpression {
+									message: "spread aggregate reached non-spread accumulator"
+										.to_string(),
+								}),
+							})
+							.collect::<Result<Vec<_>, ExecutionError>>()?;
 						columns.push(Arc::new(Float64Array::from(values)) as ArrayRef);
 					}
 					AggregateFunction::LinearRegress => {
@@ -2486,9 +2576,52 @@ pub(in crate::exec) struct QuantileState {
 	owner: bool,
 }
 
+/// ADR 560: one Welford step, used by every path that accumulates a spread.
+///
+/// The naive `sum(x²) − n·mean²` form is accurate on small synthetic data and
+/// catastrophically wrong on large-magnitude, low-variance columns, which is
+/// what this engine actually serves. Keeping the update in one function means
+/// the global and grouped paths cannot diverge into different algorithms.
+pub(in crate::exec) fn spread_accumulate(
+	count: &mut u64,
+	mean: &mut f64,
+	m2: &mut f64,
+	value: f64,
+) {
+	*count += 1;
+	let delta = value - *mean;
+	*mean += delta / (*count as f64);
+	*m2 += delta * (value - *mean);
+}
+
+/// Reads the accumulator for one spelling. `None` is the NULL answer: the
+/// sample forms have no meaning below two observations, and neither form has
+/// one below one.
+pub(in crate::exec) fn spread_finalize(
+	function: &AggregateFunction,
+	count: u64,
+	m2: f64,
+) -> Option<f64> {
+	match function {
+		AggregateFunction::VarPop => (count >= 1).then(|| m2 / count as f64),
+		AggregateFunction::StddevPop => (count >= 1).then(|| (m2 / count as f64).sqrt()),
+		AggregateFunction::VarSamp => (count >= 2).then(|| m2 / (count - 1) as f64),
+		AggregateFunction::StddevSamp => (count >= 2).then(|| (m2 / (count - 1) as f64).sqrt()),
+		_ => None,
+	}
+}
+
 #[derive(Debug, Clone)]
 pub(in crate::exec) enum AggState {
 	Count(i64),
+	/// ADR 560: Welford's running moments, shared by all four spread spellings.
+	/// They differ only in how the finalizer reads `count` and `m2`, so one
+	/// accumulator serves them and cannot drift between them.
+	Spread {
+		count: u64,
+		mean: f64,
+		m2: f64,
+	},
 	SumInt {
 		total: i128,
 		seen: bool,
@@ -2551,6 +2684,24 @@ pub(in crate::exec) enum NumericValue {
 	Float(f64),
 }
 
+/// ADR 560: narrows an aggregate input to the `Float64` the spread accumulator
+/// works in.
+///
+/// A `Decimal128` reader yields its **unscaled** integer, so the scale has to be
+/// applied here or a variance comes out wrong by `10^(2·scale)`. This is the only
+/// conversion the spread family uses, so the global and grouped paths cannot
+/// disagree about it.
+pub(in crate::exec) fn spread_input_value(value: NumericValue, input_type: &DataType) -> f64 {
+	let raw = match value {
+		NumericValue::Int(value) => value as f64,
+		NumericValue::Float(value) => value,
+	};
+	match input_type {
+		DataType::Decimal128(_, scale) => raw / 10f64.powi(i32::from(*scale)),
+		_ => raw,
+	}
+}
+
 #[cfg(test)]
 fn init_states(
 	aggr_expr: &[(AggregateFunction, Vec<Expr>)],
@@ -2584,12 +2735,15 @@ fn init_states(
 					message: "AVG requires one argument".to_string(),
 				})
 				.and_then(|array| avg_state_for_data_type(array.data_type())),
-			AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-				Ok(AggState::SumInt {
-					total: 0,
-					seen: false,
-				})
-			}
+			AggregateFunction::VarPop
+			| AggregateFunction::VarSamp
+			| AggregateFunction::StddevPop
+			| AggregateFunction::StddevSamp
+			| AggregateFunction::LinearRegress
+			| AggregateFunction::ApproxQuantile(_) => Ok(AggState::SumInt {
+				total: 0,
+				seen: false,
+			}),
 		})
 		.collect()
 }
@@ -2608,9 +2762,12 @@ fn legacy_aggregate_output_type(function: &AggregateFunction, input_type: &DataT
 			aggregate_kernel::stable_output_data_type(function, Some(input_type))
 				.unwrap_or(DataType::Float64)
 		}
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
-			DataType::Float64
-		}
+		AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp
+		| AggregateFunction::LinearRegress
+		| AggregateFunction::ApproxQuantile(_) => DataType::Float64,
 	}
 }
 
@@ -2722,6 +2879,14 @@ fn group_identity_bytes(key: &[GroupValue]) -> Vec<u8> {
 fn init_bound_state_for_call(call: &BoundAggregateCall) -> Result<AggState, ExecutionError> {
 	match call.function {
 		AggregateFunction::CountAll | AggregateFunction::Count => Ok(AggState::Count(0)),
+		AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => Ok(AggState::Spread {
+			count: 0,
+			mean: 0.0,
+			m2: 0.0,
+		}),
 		AggregateFunction::Sum => Ok(call
 			.args
 			.root_type(0)
@@ -3220,6 +3385,7 @@ pub(in crate::exec) fn add_sum_value(
 		| (AggState::AvgInt { .. }, _)
 		| (AggState::AvgFloat { .. }, _)
 		| (AggState::AvgDecimal { .. }, _)
+		| (AggState::Spread { .. }, _)
 		| (AggState::Quantile(_), _) => Err(ExecutionError::InvalidExpression {
 			message: "SUM value reached non-SUM accumulator".to_string(),
 		}),
@@ -3291,6 +3457,7 @@ pub(in crate::exec) fn add_avg_value(
 		| (AggState::MaxFloat32 { .. }, _)
 		| (AggState::MaxFloat64 { .. }, _)
 		| (AggState::MaxDecimal128 { .. }, _)
+		| (AggState::Spread { .. }, _)
 		| (AggState::Quantile(_), _) => Err(ExecutionError::InvalidExpression {
 			message: "AVG value reached non-AVG accumulator".to_string(),
 		}),
@@ -3601,7 +3768,8 @@ fn sum_column_from_groups(
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. }
-					| AggState::Quantile(_) => Ok(None),
+					| AggState::Quantile(_)
+					| AggState::Spread { .. } => Ok(None),
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
@@ -3626,7 +3794,8 @@ fn sum_column_from_groups(
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. }
-					| AggState::Quantile(_) => None,
+					| AggState::Quantile(_)
+					| AggState::Spread { .. } => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
@@ -3654,7 +3823,8 @@ fn sum_column_from_groups(
 					| AggState::AvgInt { .. }
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. }
-					| AggState::Quantile(_) => None,
+					| AggState::Quantile(_)
+					| AggState::Spread { .. } => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(
@@ -3872,7 +4042,11 @@ pub(in crate::exec) fn aggregate_state_output_name(function: &AggregateFunction)
 		| AggregateFunction::Sum
 		| AggregateFunction::Min
 		| AggregateFunction::Max
-		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
+		| AggregateFunction::Avg
+		| AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => unreachable!("stable aggregate metadata missing"),
 	}
 }
 
@@ -5048,4 +5222,105 @@ fn adr499_local_grouped_exchange_bypass_defaults_on_with_faithful_control() {
 	assert!(local_grouped_exchange_bypass_enabled_from_env(None));
 	assert!(local_grouped_exchange_bypass_enabled_from_env(Some("1")));
 	assert!(!local_grouped_exchange_bypass_enabled_from_env(Some("0")));
+}
+
+#[cfg(test)]
+mod adr560_spread_tests {
+	use super::*;
+
+	fn accumulate(values: &[f64]) -> (u64, f64) {
+		let (mut count, mut mean, mut m2) = (0u64, 0.0f64, 0.0f64);
+		for value in values {
+			spread_accumulate(&mut count, &mut mean, &mut m2, *value);
+		}
+		(count, m2)
+	}
+
+	/// The naive form is what this decision exists to avoid, so the control
+	/// computes it too and asserts it visibly fails on the same data. A test
+	/// that only checked Welford would pass under either algorithm.
+	#[test]
+	fn welford_is_exact_where_the_naive_sum_of_squares_collapses() {
+		let base = 1.0e9_f64;
+		let values = [base + 4.0, base + 7.0, base + 13.0, base + 16.0];
+		let (count, m2) = accumulate(&values);
+		let welford = spread_finalize(&AggregateFunction::VarPop, count, m2).expect("var_pop");
+		assert!(
+			(welford - 22.5).abs() < 1e-9,
+			"Welford must be exact, got {welford}"
+		);
+
+		let n = values.len() as f64;
+		let sum: f64 = values.iter().sum();
+		let sum_squares: f64 = values.iter().map(|value| value * value).sum();
+		let naive = sum_squares / n - (sum / n) * (sum / n);
+		assert!(
+			(naive - 22.5).abs() > 1.0,
+			"the naive form must visibly fail here, or this control proves nothing; got {naive}"
+		);
+	}
+
+	#[test]
+	fn sample_forms_are_null_below_two_observations_and_population_is_zero_at_one() {
+		let (count, m2) = accumulate(&[5.0]);
+		assert_eq!(
+			spread_finalize(&AggregateFunction::VarSamp, count, m2),
+			None,
+			"one observation carries no sample spread"
+		);
+		assert_eq!(
+			spread_finalize(&AggregateFunction::StddevSamp, count, m2),
+			None
+		);
+		assert_eq!(
+			spread_finalize(&AggregateFunction::VarPop, count, m2),
+			Some(0.0),
+			"a single observation is a population with no spread"
+		);
+		assert_eq!(
+			spread_finalize(&AggregateFunction::StddevPop, count, m2),
+			Some(0.0)
+		);
+
+		let (empty_count, empty_m2) = accumulate(&[]);
+		for function in [
+			AggregateFunction::VarPop,
+			AggregateFunction::VarSamp,
+			AggregateFunction::StddevPop,
+			AggregateFunction::StddevSamp,
+		] {
+			assert_eq!(
+				spread_finalize(&function, empty_count, empty_m2),
+				None,
+				"an empty group has no spread of any kind"
+			);
+		}
+	}
+
+	#[test]
+	fn standard_deviation_is_the_square_root_of_its_variance() {
+		let (count, m2) = accumulate(&[2.0, 4.0, 4.0, 4.0, 5.0, 5.0, 7.0, 9.0]);
+		let var_pop = spread_finalize(&AggregateFunction::VarPop, count, m2).expect("var_pop");
+		let stddev_pop =
+			spread_finalize(&AggregateFunction::StddevPop, count, m2).expect("stddev_pop");
+		assert!((stddev_pop - var_pop.sqrt()).abs() < 1e-12);
+		assert!((var_pop - 4.0).abs() < 1e-12, "got {var_pop}");
+
+		let var_samp = spread_finalize(&AggregateFunction::VarSamp, count, m2).expect("var_samp");
+		let stddev_samp =
+			spread_finalize(&AggregateFunction::StddevSamp, count, m2).expect("stddev_samp");
+		assert!((stddev_samp - var_samp.sqrt()).abs() < 1e-12);
+		assert!(
+			var_samp > var_pop,
+			"the sample form divides by a smaller denominator"
+		);
+	}
+
+	#[test]
+	fn a_non_finite_input_propagates_rather_than_erroring_or_being_skipped() {
+		let (count, m2) = accumulate(&[1.0, f64::NAN, 3.0]);
+		assert_eq!(count, 3, "a NaN is an observation, unlike a NULL");
+		let value = spread_finalize(&AggregateFunction::VarPop, count, m2).expect("var_pop");
+		assert!(value.is_nan(), "a non-finite input propagates, got {value}");
+	}
 }

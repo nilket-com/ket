@@ -12,6 +12,10 @@ pub(crate) enum StableAggregateKernel {
 	Max = 4,
 	Avg = 5,
 	ApproxQuantile = 6,
+	VarPop = 7,
+	VarSamp = 8,
+	StddevPop = 9,
+	StddevSamp = 10,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,10 +127,75 @@ pub(crate) const STABLE_AGGREGATE_KERNELS: &[AggregateKernelSpec] = &[
 		nullable: true,
 		grouped_supported: true,
 	},
+	// ADR 560: the spread family accumulates in Float64 and answers Float64,
+	// unlike AVG's input-preserving rule. A variance divides and takes a square
+	// root, so no decimal scale is the honest one.
+	AggregateKernelSpec {
+		kind: StableAggregateKernel::VarPop,
+		sql_name: "VAR_POP",
+		output_name: "var_pop",
+		arity: AggregateArity::One,
+		input_domain: AggregateInputDomain::AvgNumeric,
+		output_rule: AggregateOutputRule::Float64,
+		nullable: true,
+		grouped_supported: true,
+	},
+	AggregateKernelSpec {
+		kind: StableAggregateKernel::VarSamp,
+		sql_name: "VAR_SAMP",
+		output_name: "var_samp",
+		arity: AggregateArity::One,
+		input_domain: AggregateInputDomain::AvgNumeric,
+		output_rule: AggregateOutputRule::Float64,
+		nullable: true,
+		grouped_supported: true,
+	},
+	AggregateKernelSpec {
+		kind: StableAggregateKernel::StddevPop,
+		sql_name: "STDDEV_POP",
+		output_name: "stddev_pop",
+		arity: AggregateArity::One,
+		input_domain: AggregateInputDomain::AvgNumeric,
+		output_rule: AggregateOutputRule::Float64,
+		nullable: true,
+		grouped_supported: true,
+	},
+	AggregateKernelSpec {
+		kind: StableAggregateKernel::StddevSamp,
+		sql_name: "STDDEV_SAMP",
+		output_name: "stddev_samp",
+		arity: AggregateArity::One,
+		input_domain: AggregateInputDomain::AvgNumeric,
+		output_rule: AggregateOutputRule::Float64,
+		nullable: true,
+		grouped_supported: true,
+	},
 ];
 
-pub(crate) const STABLE_AGGREGATE_SQL_NAMES: &[&str] =
-	&["COUNT", "SUM", "MIN", "MAX", "AVG", "APPROX_QUANTILE"];
+pub(crate) const STABLE_AGGREGATE_SQL_NAMES: &[&str] = &[
+	"COUNT",
+	"SUM",
+	"MIN",
+	"MAX",
+	"AVG",
+	"APPROX_QUANTILE",
+	"VAR_POP",
+	"VAR_SAMP",
+	"STDDEV_POP",
+	"STDDEV_SAMP",
+];
+
+/// ADR 560: the standard defines only the four suffixed spread spellings. The
+/// bare names are a cross-engine convention meaning the sample form, mapped here
+/// so the planner resolves one canonical name rather than carrying the
+/// convention in its own match.
+pub(crate) fn stable_aggregate_sql_alias(upper: &str) -> Option<&'static str> {
+	match upper {
+		"VARIANCE" => Some("VAR_SAMP"),
+		"STDDEV" => Some("STDDEV_SAMP"),
+		_ => None,
+	}
+}
 
 pub(crate) fn stable_kernel_for_function(
 	function: &AggregateFunction,
@@ -139,6 +208,10 @@ pub(crate) fn stable_kernel_for_function(
 		AggregateFunction::Max => Some(StableAggregateKernel::Max),
 		AggregateFunction::Avg => Some(StableAggregateKernel::Avg),
 		AggregateFunction::ApproxQuantile(_) => Some(StableAggregateKernel::ApproxQuantile),
+		AggregateFunction::VarPop => Some(StableAggregateKernel::VarPop),
+		AggregateFunction::VarSamp => Some(StableAggregateKernel::VarSamp),
+		AggregateFunction::StddevPop => Some(StableAggregateKernel::StddevPop),
+		AggregateFunction::StddevSamp => Some(StableAggregateKernel::StddevSamp),
 		AggregateFunction::LinearRegress => None,
 	}
 }
@@ -164,6 +237,7 @@ pub(crate) fn stable_aggregate_sql_name(upper: &str) -> Option<&'static str> {
 		.iter()
 		.copied()
 		.find(|name| *name == upper)
+		.or_else(|| stable_aggregate_sql_alias(upper))
 }
 
 pub(crate) fn experimental_aggregate_sql_name(upper: &str) -> Option<&'static str> {

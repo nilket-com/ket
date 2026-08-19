@@ -9249,3 +9249,103 @@ impl StorageScan for FixtureScan {
 		))
 	}
 }
+
+#[tokio::test]
+async fn adr560_spread_spellings_and_aliases_agree_through_sql() {
+	let rows = run_logical(&plan_sql(
+		"SELECT VAR_POP(amount), VAR_SAMP(amount), STDDEV_POP(amount), STDDEV_SAMP(amount), \
+		 VARIANCE(amount), STDDEV(amount) FROM sales",
+	))
+	.await;
+	let read = |idx: usize| {
+		rows[0]
+			.column(idx)
+			.as_any()
+			.downcast_ref::<arrow::array::Float64Array>()
+			.expect("Float64 spread output")
+			.value(0)
+	};
+	// The bare names are documented aliases of the sample forms, so the
+	// mapping is asserted rather than left to folklore.
+	assert!(
+		(read(4) - read(1)).abs() < 1e-12,
+		"VARIANCE must equal VAR_SAMP"
+	);
+	assert!(
+		(read(5) - read(3)).abs() < 1e-12,
+		"STDDEV must equal STDDEV_SAMP"
+	);
+	assert!(
+		read(1) > read(0),
+		"the sample form divides by a smaller denominator, so it must exceed the population form"
+	);
+	assert!((read(2) - read(0).sqrt()).abs() < 1e-12);
+	assert!((read(3) - read(1).sqrt()).abs() < 1e-12);
+}
+
+#[tokio::test]
+async fn adr560_decimal_input_narrows_to_float64_at_its_declared_scale() {
+	// decimal_price is Decimal128(15, 2) holding 12.34, -5.00, NULL, 10.00,
+	// 99.99, 2.50. The reader yields the unscaled i128, so a spread that ignored
+	// the scale would be wrong by a factor of 10^4 — large enough to look like a
+	// different column rather than a rounding difference.
+	let (catalog, _) = fixture();
+	let logical = plan_sql("SELECT VAR_POP(decimal_price) FROM sales");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind VAR_POP over Decimal128");
+	assert_eq!(
+		bound.schema().field(0).data_type(),
+		&DataType::Float64,
+		"a spread narrows a decimal rather than pretending to a scale"
+	);
+
+	let rows = run_logical(&logical).await;
+	let observed = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("Float64 spread output")
+		.value(0);
+	let values = [12.34_f64, -5.00, 10.00, 99.99, 2.50];
+	let mean = values.iter().sum::<f64>() / values.len() as f64;
+	let expected = values
+		.iter()
+		.map(|value| (value - mean).powi(2))
+		.sum::<f64>()
+		/ values.len() as f64;
+	assert!(
+		(observed - expected).abs() < 1e-6,
+		"expected {expected}, got {observed}"
+	);
+}
+
+#[tokio::test]
+async fn adr560_grouped_spread_skips_nulls_rather_than_counting_them() {
+	// A NULL must not reach the accumulator at all, so a group containing one
+	// answers exactly as the same group without it. Comparing against a
+	// NULL-free filter makes the claim falsifiable rather than assumed.
+	let with_nulls = run_logical(&plan_sql(
+		"SELECT region, VAR_SAMP(amount) FROM sales GROUP BY region ORDER BY region",
+	))
+	.await;
+	let without_nulls = run_logical(&plan_sql(
+		"SELECT region, VAR_SAMP(amount) FROM sales WHERE amount IS NOT NULL \
+		 GROUP BY region ORDER BY region",
+	))
+	.await;
+	let read = |batches: &Vec<RecordBatch>| {
+		batches[0]
+			.column(1)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("Float64 spread output")
+			.iter()
+			.collect::<Vec<_>>()
+	};
+	assert_eq!(
+		read(&with_nulls),
+		read(&without_nulls),
+		"a skipped NULL must leave the spread unchanged"
+	);
+}

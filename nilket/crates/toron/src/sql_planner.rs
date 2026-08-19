@@ -4247,7 +4247,15 @@ impl SqlPlanner {
 				| AggregateFunction::Min
 				| AggregateFunction::Max
 				| AggregateFunction::Avg => (WindowFunction::Aggregate(lowered.function), lowered.args),
-				AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => {
+				// ADR 560 registers the spread family as grouped aggregates only.
+				// Admitting them as window functions needs the window executor to
+				// carry the Welford accumulator, which is its own cut.
+				AggregateFunction::LinearRegress
+				| AggregateFunction::ApproxQuantile(_)
+				| AggregateFunction::VarPop
+				| AggregateFunction::VarSamp
+				| AggregateFunction::StddevPop
+				| AggregateFunction::StddevSamp => {
 					return Err(unsupported(
 						"only COUNT, SUM, MIN, MAX, and AVG window aggregate functions are supported",
 					));
@@ -5200,6 +5208,14 @@ impl SqlPlanner {
 			"MIN" => self.lower_min_aggregate(args),
 			"MAX" => self.lower_max_aggregate(args),
 			"AVG" => self.lower_avg_aggregate(args),
+			"VAR_POP" => self.lower_spread_aggregate(AggregateFunction::VarPop, "VAR_POP", args),
+			"VAR_SAMP" => self.lower_spread_aggregate(AggregateFunction::VarSamp, "VAR_SAMP", args),
+			"STDDEV_POP" => {
+				self.lower_spread_aggregate(AggregateFunction::StddevPop, "STDDEV_POP", args)
+			}
+			"STDDEV_SAMP" => {
+				self.lower_spread_aggregate(AggregateFunction::StddevSamp, "STDDEV_SAMP", args)
+			}
 			"LINEAR_REGRESS" => {
 				if matches!(mode, AggregateSqlMode::Grouped) {
 					return Err(unsupported(
@@ -5279,6 +5295,22 @@ impl SqlPlanner {
 		}
 		validate_simple_aggregate_arg(&args[0])?;
 		Ok((AggregateFunction::Avg, vec![self.lower_arg(&args[0])?]))
+	}
+
+	/// ADR 560: all four spread spellings lower identically apart from which
+	/// function they name, so one path serves them and they cannot drift into
+	/// different argument rules.
+	fn lower_spread_aggregate(
+		&self,
+		function: AggregateFunction,
+		sql_name: &str,
+		args: &[FunctionArg],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 1 {
+			return Err(unsupported(format!("{sql_name} requires one argument")));
+		}
+		validate_simple_aggregate_arg(&args[0])?;
+		Ok((function, vec![self.lower_arg(&args[0])?]))
 	}
 
 	fn lower_linear_regress_aggregate(
@@ -9632,7 +9664,11 @@ fn aggregate_output_name(function: &AggregateFunction) -> &'static str {
 		| AggregateFunction::Sum
 		| AggregateFunction::Min
 		| AggregateFunction::Max
-		| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
+		| AggregateFunction::Avg
+		| AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => unreachable!("stable aggregate metadata missing"),
 	}
 }
 

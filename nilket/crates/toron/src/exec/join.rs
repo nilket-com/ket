@@ -108,7 +108,15 @@ pub(super) fn grouped_aggregate_is_order_insensitive(aggr_expr: &[BoundAggregate
 		| AggregateFunction::Min
 		| AggregateFunction::Max => true,
 
-		AggregateFunction::LinearRegress | AggregateFunction::ApproxQuantile(_) => false,
+		AggregateFunction::LinearRegress
+		| AggregateFunction::ApproxQuantile(_)
+		// ADR 560: Welford accumulates in Float64 whatever the input type, so
+		// the spread family is order-sensitive even over integer columns —
+		// unlike SUM and AVG, which are safe until a float appears.
+		| AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => false,
 	})
 }
 

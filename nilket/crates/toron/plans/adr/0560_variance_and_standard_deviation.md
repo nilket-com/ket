@@ -109,8 +109,10 @@ NULL by the rule above.
 - All four spellings work grouped and ungrouped, and through the distributed
   posture where the group's rows arrive after an exchange.
 - The integer case yields a fractional result rather than truncating.
-- A `Decimal128` input yields a `Float64` result, and the same values as the
-  equivalent `Float64` column.
+- A `Decimal128` input yields a `Float64` result computed at the column's
+  declared scale. The reader hands the accumulator an unscaled integer, so a
+  spread that ignored the scale is wrong by `10^(2·scale)` — the control asserts
+  the scaled value rather than merely the output type.
 - A NaN or infinite input yields a non-finite result rather than an error or a
   silently skipped row, and a NULL in the same group is still skipped — the two
   are distinct.
@@ -133,6 +135,14 @@ If a later cut introduces partial aggregation, these four aggregates need a merg
 step, and the answer is already known: combine `(count, mean, m2)` triples with
 Chan's parallel formula rather than re-deriving from sums. That is recorded here
 so the future cut discovers it in the ADR rather than in a wrong result.
+
+**The unbound executor paths reject rather than compute, deliberately.** The
+global and grouped unbound aggregate paths answer `NotImplemented` for all four
+spellings. The planner always produces bound aggregate calls, so those paths are
+unreachable for a query; rejecting keeps them from acquiring a second, untested
+Welford implementation that could drift from the bound one. If a caller is ever
+found reaching them, that is a planner defect to fix rather than a reason to
+duplicate the accumulator.
 
 `COVAR_POP`, `COVAR_SAMP`, `CORR`, and `REGR_*` are deferred. They share the
 moment-accumulator shape and would reuse this decision, but each adds a second

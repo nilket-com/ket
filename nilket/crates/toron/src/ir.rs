@@ -1074,6 +1074,12 @@ pub enum AggregateFunction {
 	Min,
 	Max,
 	Avg,
+	/// ADR 560: the four standard spread spellings. Bare `VARIANCE` and
+	/// `STDDEV` are SQL aliases of the sample forms, resolved before binding.
+	VarPop,
+	VarSamp,
+	StddevPop,
+	StddevSamp,
 	LinearRegress,
 	ApproxQuantile(f64),
 }

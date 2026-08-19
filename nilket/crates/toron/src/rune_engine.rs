@@ -1342,6 +1342,34 @@ pub fn avg(expr: RuneExpr) -> RuneAggr {
 	}
 }
 
+pub fn var_pop(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::VarPop,
+		args: vec![expr.expr],
+	}
+}
+
+pub fn var_samp(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::VarSamp,
+		args: vec![expr.expr],
+	}
+}
+
+pub fn stddev_pop(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::StddevPop,
+		args: vec![expr.expr],
+	}
+}
+
+pub fn stddev_samp(expr: RuneExpr) -> RuneAggr {
+	RuneAggr {
+		func: AggregateFunction::StddevSamp,
+		args: vec![expr.expr],
+	}
+}
+
 pub fn min(expr: RuneExpr) -> RuneAggr {
 	RuneAggr {
 		func: AggregateFunction::Min,
@@ -2011,6 +2039,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["count"], count).build()?;
 	m.function(["sum"], sum).build()?;
 	m.function(["avg"], avg).build()?;
+	m.function(["var_pop"], var_pop).build()?;
+	m.function(["var_samp"], var_samp).build()?;
+	m.function(["stddev_pop"], stddev_pop).build()?;
+	m.function(["stddev_samp"], stddev_samp).build()?;
 	m.function(["min"], min).build()?;
 	m.function(["max"], max).build()?;
 	m.function(["rank"], rank).build()?;

@@ -135,21 +135,29 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		"Min",
 		"Max",
 		"Avg",
+		"VarPop",
+		"VarSamp",
+		"StddevPop",
+		"StddevSamp",
 		"ApproxQuantile",
+		"VarPop",
+		"VarSamp",
+		"StddevPop",
+		"StddevSamp",
 	] {
 		assert!(
 			stable_kernel_enum.contains(variant),
 			"stable aggregate kernel missing {variant}"
 		);
 	}
-	assert_eq!(enum_variant_count(stable_kernel_enum), 7);
+	assert_eq!(enum_variant_count(stable_kernel_enum), 11);
 
 	let stable_rows = catalog
 		.split("STABLE_AGGREGATE_KERNELS")
 		.nth(1)
 		.and_then(|rest| rest.split("];").next())
 		.expect("stable aggregate kernel rows");
-	assert_eq!(stable_rows.matches("AggregateKernelSpec {").count(), 7);
+	assert_eq!(stable_rows.matches("AggregateKernelSpec {").count(), 11);
 	for marker in [
 		"kind: StableAggregateKernel::CountAll",
 		"kind: StableAggregateKernel::Count",
@@ -158,6 +166,10 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		"kind: StableAggregateKernel::Max",
 		"kind: StableAggregateKernel::Avg",
 		"kind: StableAggregateKernel::ApproxQuantile",
+		"kind: StableAggregateKernel::VarPop",
+		"kind: StableAggregateKernel::VarSamp",
+		"kind: StableAggregateKernel::StddevPop",
+		"kind: StableAggregateKernel::StddevSamp",
 		"arity: AggregateArity::Zero",
 		"arity: AggregateArity::One",
 		"input_domain: AggregateInputDomain::Any",
@@ -216,9 +228,9 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		.nth(1)
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("AggState enum");
-	// ADR 268 added `AvgDecimal`; ADR 284 added Decimal MIN/MAX for strict q02;
-	// ADR 546 added the heap-owning shared quantile state.
-	assert_eq!(enum_variant_count(agg_state_enum), 17);
+	// ADR 268 `AvgDecimal`; ADR 284 Decimal MIN/MAX; ADR 546 the shared quantile
+	// state; ADR 560 the one `Spread` state all four spread spellings share.
+	assert_eq!(enum_variant_count(agg_state_enum), 18);
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
 	assert!(derives_above.contains("Clone"));

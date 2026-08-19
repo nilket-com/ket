@@ -37,7 +37,11 @@ pub(super) fn bind_aggregate_call(
 		| AggregateFunction::Min
 		| AggregateFunction::Max
 		| AggregateFunction::Avg
-		| AggregateFunction::ApproxQuantile(_) => unreachable!("stable aggregate metadata missing"),
+		| AggregateFunction::ApproxQuantile(_)
+		| AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => unreachable!("stable aggregate metadata missing"),
 	}
 }
 
@@ -222,6 +226,15 @@ pub(super) fn aggregate_type_mismatch_message(
 		StableAggregateKernel::ApproxQuantile => format!(
 			"APPROX_QUANTILE expects naked Int32, Int64, Float32, or Float64 input, got {data_type:?}"
 		),
+		StableAggregateKernel::VarPop
+		| StableAggregateKernel::VarSamp
+		| StableAggregateKernel::StddevPop
+		| StableAggregateKernel::StddevSamp => {
+			format!(
+				"{} expects numeric input, got {data_type:?}",
+				aggregate_kernel::stable_spec(kernel).sql_name
+			)
+		}
 		StableAggregateKernel::CountAll | StableAggregateKernel::Count => {
 			unreachable!("COUNT accepts any input type")
 		}
@@ -330,7 +343,11 @@ pub(super) fn aggregate_field(
 			| AggregateFunction::Sum
 			| AggregateFunction::Min
 			| AggregateFunction::Max
-			| AggregateFunction::Avg => unreachable!("stable aggregate metadata missing"),
+			| AggregateFunction::Avg
+			| AggregateFunction::VarPop
+			| AggregateFunction::VarSamp
+			| AggregateFunction::StddevPop
+			| AggregateFunction::StddevSamp => unreachable!("stable aggregate metadata missing"),
 		});
 	let logical_type = aggregate_output_logical_type(call, field.data_type(), logical_types)?;
 	if logical_type.is_naked() {
@@ -370,7 +387,13 @@ pub(super) fn aggregate_output_logical_type(
 		AggregateFunction::CountAll
 		| AggregateFunction::Count
 		| AggregateFunction::LinearRegress
-		| AggregateFunction::ApproxQuantile(_) => Ok(LogicalTypeId::NAKED),
+		| AggregateFunction::ApproxQuantile(_)
+		// A spread is a Float64 magnitude, not a value in the input's unit, so
+		// it carries no logical type forward.
+		| AggregateFunction::VarPop
+		| AggregateFunction::VarSamp
+		| AggregateFunction::StddevPop
+		| AggregateFunction::StddevSamp => Ok(LogicalTypeId::NAKED),
 	}
 }
 

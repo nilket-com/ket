@@ -613,7 +613,11 @@ fn logical_aggregate_output_names(aggr_expr: &[(AggregateFunction, Vec<Expr>)]) 
 					| AggregateFunction::Sum
 					| AggregateFunction::Min
 					| AggregateFunction::Max
-					| AggregateFunction::Avg => {
+					| AggregateFunction::Avg
+					| AggregateFunction::VarPop
+					| AggregateFunction::VarSamp
+					| AggregateFunction::StddevPop
+					| AggregateFunction::StddevSamp => {
 						unreachable!("stable aggregate metadata missing")
 					}
 				})
