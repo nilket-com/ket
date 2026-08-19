@@ -735,6 +735,11 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_unary_float(&args[0], "LN", f32::ln, f64::ln),
 		(
+			ScalarFunctionEvaluator::Log,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_log(&args[0], &args[1]),
+		(
 			ScalarFunctionEvaluator::Round,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -749,6 +754,11 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Rejects,
 		) => evaluate_floor(&args[0]),
+		(
+			ScalarFunctionEvaluator::Trunc,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_trunc(&args[0]),
 		(
 			ScalarFunctionEvaluator::Sign,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
@@ -769,6 +779,16 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_unary_string(&args[0], "LOWER", str::to_lowercase),
+		(
+			ScalarFunctionEvaluator::Initcap,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_unary_string(&args[0], "INITCAP", initcap),
+		(
+			ScalarFunctionEvaluator::Reverse,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_unary_string(&args[0], "REVERSE", reverse),
 		(
 			ScalarFunctionEvaluator::Trim,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
@@ -891,7 +911,9 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::DateTrunc
 			| ScalarFunctionEvaluator::Exp
 			| ScalarFunctionEvaluator::Extract
+			| ScalarFunctionEvaluator::Initcap
 			| ScalarFunctionEvaluator::Ln
+			| ScalarFunctionEvaluator::Log
 			| ScalarFunctionEvaluator::Lower
 			| ScalarFunctionEvaluator::Mod
 			| ScalarFunctionEvaluator::Position
@@ -1171,6 +1193,29 @@ fn evaluate_unary_string(
 	Err(ExecutionError::InvalidExpression {
 		message: format!("{name} expects a string input, got {:?}", input.data_type()),
 	})
+}
+
+fn reverse(value: &str) -> String {
+	value.chars().rev().collect()
+}
+
+fn initcap(value: &str) -> String {
+	let mut capitalize = true;
+	let mut output = String::with_capacity(value.len());
+	for character in value.chars() {
+		if character.is_alphanumeric() {
+			if capitalize {
+				output.extend(character.to_uppercase());
+			} else {
+				output.extend(character.to_lowercase());
+			}
+			capitalize = false;
+		} else {
+			output.push(character);
+			capitalize = true;
+		}
+	}
+	output
 }
 
 fn evaluate_trim(
@@ -1663,6 +1708,44 @@ fn evaluate_pow(base: &ArrayRef, exponent: &ArrayRef) -> Result<ArrayRef, Execut
 	})
 }
 
+fn evaluate_log(base: &ArrayRef, input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	if let (Some(base), Some(input)) = (
+		base.as_any().downcast_ref::<Float32Array>(),
+		input.as_any().downcast_ref::<Float32Array>(),
+	) {
+		return Ok(Arc::new(
+			base.iter()
+				.zip(input.iter())
+				.map(|(base, input)| match (base, input) {
+					(Some(base), Some(input)) => Some(input.log(base)),
+					_ => None,
+				})
+				.collect::<Float32Array>(),
+		) as ArrayRef);
+	}
+	if let (Some(base), Some(input)) = (
+		base.as_any().downcast_ref::<Float64Array>(),
+		input.as_any().downcast_ref::<Float64Array>(),
+	) {
+		return Ok(Arc::new(
+			base.iter()
+				.zip(input.iter())
+				.map(|(base, input)| match (base, input) {
+					(Some(base), Some(input)) => Some(input.log(base)),
+					_ => None,
+				})
+				.collect::<Float64Array>(),
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"LOG expects two arguments of the same float type, got {:?} and {:?}",
+			base.data_type(),
+			input.data_type()
+		),
+	})
+}
+
 /// `ABS` preserves its input type, so the magnitude of the most negative
 /// two's-complement value has no representation. That is an overflow, reported
 /// the way every other checked integer path here reports one, never a silent
@@ -2147,6 +2230,35 @@ fn evaluate_floor(arr: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 		}
 		data_type => Err(ExecutionError::InvalidExpression {
 			message: format!("FLOOR expects numeric input, got {data_type}"),
+		}),
+	}
+}
+
+fn evaluate_trunc(arr: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	match arr.data_type() {
+		DataType::Int32 | DataType::Int64 => Ok(arr.clone()),
+		DataType::Float32 => {
+			let values = arr
+				.as_any()
+				.downcast_ref::<Float32Array>()
+				.expect("Float32 data type must have Float32Array storage")
+				.iter()
+				.map(|value| value.map(f32::trunc))
+				.collect::<Float32Array>();
+			Ok(Arc::new(values) as ArrayRef)
+		}
+		DataType::Float64 => {
+			let values = arr
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.expect("Float64 data type must have Float64Array storage")
+				.iter()
+				.map(|value| value.map(f64::trunc))
+				.collect::<Float64Array>();
+			Ok(Arc::new(values) as ArrayRef)
+		}
+		data_type => Err(ExecutionError::InvalidExpression {
+			message: format!("TRUNC expects numeric input, got {data_type}"),
 		}),
 	}
 }

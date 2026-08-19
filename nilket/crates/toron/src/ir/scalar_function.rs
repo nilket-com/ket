@@ -23,8 +23,10 @@ pub enum ScalarFunctionId {
 	Extract,
 	Floor,
 	Greatest,
+	Initcap,
 	Least,
 	Ln,
+	Log,
 	Lower,
 	Ltrim,
 	Mod,
@@ -32,6 +34,7 @@ pub enum ScalarFunctionId {
 	Pow,
 	Random,
 	Replace,
+	Reverse,
 	Round,
 	Rtrim,
 	Sign,
@@ -40,6 +43,7 @@ pub enum ScalarFunctionId {
 	Substring,
 	TimeBucket,
 	Trim,
+	Trunc,
 	Upper,
 	WidthBucket,
 }
@@ -239,20 +243,24 @@ pub enum ScalarFunctionEvaluator {
 	Extract,
 	Floor,
 	Greatest,
+	Initcap,
 	Least,
 	Ln,
+	Log,
 	Lower,
 	Position,
 	Mod,
 	Pow,
 	Random,
 	Replace,
+	Reverse,
 	Round,
 	Sign,
 	Sqrt,
 	Substring,
 	TimeBucket,
 	Trim,
+	Trunc,
 	Upper,
 	WidthBucket,
 }
@@ -361,6 +369,24 @@ const LN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Ln,
 };
 
+const LOG: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Log,
+	sql_name: "LOG",
+	sql_aliases: &[],
+	rune_name: "log",
+	// This first cut admits LOG(base, value). The common one-argument
+	// LOG(value) form means base 10 and is a separate semantics decision; it
+	// must not be silently treated as LN(value).
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::BinaryFloatPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Log,
+};
+
 const ROUND: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Round,
 	sql_name: "ROUND",
@@ -404,6 +430,23 @@ const FLOOR: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Floor,
+};
+
+const TRUNC: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Trunc,
+	sql_name: "TRUNC",
+	sql_aliases: &[],
+	rune_name: "trunc",
+	// The decimal-place form is deliberately deferred; this registration is
+	// the one-argument truncation-toward-zero operation.
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryIntegerOrFloatPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Trunc,
 };
 
 const SIGN: ScalarFunctionMetadata = ScalarFunctionMetadata {
@@ -467,6 +510,36 @@ const LOWER: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Lower,
+};
+
+const INITCAP: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Initcap,
+	sql_name: "INITCAP",
+	sql_aliases: &[],
+	rune_name: "initcap",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryStringPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Initcap,
+};
+
+const REVERSE: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Reverse,
+	sql_name: "REVERSE",
+	sql_aliases: &[],
+	rune_name: "reverse",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::UnaryStringPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Reverse,
 };
 
 const TRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
@@ -750,8 +823,10 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	EXTRACT,
 	FLOOR,
 	GREATEST,
+	INITCAP,
 	LEAST,
 	LN,
+	LOG,
 	LOWER,
 	LTRIM,
 	MOD,
@@ -759,6 +834,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	POW,
 	RANDOM,
 	REPLACE,
+	REVERSE,
 	ROUND,
 	RTRIM,
 	SIGN,
@@ -767,6 +843,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	SUBSTRING,
 	TIME_BUCKET,
 	TRIM,
+	TRUNC,
 	UPPER,
 	WIDTH_BUCKET,
 ];

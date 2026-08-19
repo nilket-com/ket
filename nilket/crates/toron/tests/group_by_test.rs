@@ -2389,6 +2389,65 @@ async fn adr553_first_string_batch_uses_the_predicted_registry_shapes() {
 }
 
 #[tokio::test]
+async fn adr553_second_batch_uses_the_predicted_existing_signatures() {
+	let reverse = run_logical(&plan_sql("SELECT REVERSE(region) FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&reverse, 0),
+		vec![
+			Some("tsae".to_string()),
+			Some("tsew".to_string()),
+			Some("tsae".to_string()),
+			Some("tsae".to_string()),
+			Some("tsew".to_string()),
+			None,
+		]
+	);
+
+	let initcap = run_logical(&plan_sql("SELECT INITCAP('hELLO, wORLD') FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&initcap, 0)[0..1],
+		[Some("Hello, World".to_string())]
+	);
+
+	let trunc = run_logical(&plan_sql("SELECT TRUNC(0.0 - price) FROM sales")).await;
+	let trunc_values = trunc[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("TRUNC Float64 output");
+	assert_eq!(
+		(0..trunc_values.len())
+			.map(|row| (!trunc_values.is_null(row)).then(|| trunc_values.value(row)))
+			.collect::<Vec<_>>(),
+		vec![
+			Some(-10.0),
+			Some(-20.0),
+			None,
+			Some(-30.0),
+			None,
+			Some(-7.0)
+		]
+	);
+
+	let log = run_logical(&plan_sql(
+		"SELECT LOG(CAST(10.0 AS DOUBLE), CAST(1000.0 AS DOUBLE)) FROM sales",
+	))
+	.await;
+	let log_values = log[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("LOG Float64 output");
+	assert!((log_values.value(0) - 3.0).abs() < 1e-12);
+
+	// These arities remain deliberately unadmitted until their semantics have
+	// an explicit registry shape: LOG(value) is base-10, while TRUNC(value,
+	// digits) is decimal-place truncation rather than a second float operand.
+	assert_unsupported("SELECT LOG(1000.0) FROM sales");
+	assert_unsupported("SELECT TRUNC(price, 2) FROM sales");
+}
+
+#[tokio::test]
 async fn adr553_string_functions_reject_a_numeric_input() {
 	let (catalog, _) = fixture();
 	for sql in [

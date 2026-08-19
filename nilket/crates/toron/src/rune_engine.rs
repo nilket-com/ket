@@ -1053,6 +1053,16 @@ pub fn ln(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn log(base: RuneExpr, input: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Log,
+			args: vec![base.expr, input.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 /// Rune spells a variadic call as a list, the way `project` and `case` already
 /// do. SQL's `GREATEST(a, b, c)` is `greatest([a, b, c])` here.
 /// SUBSTRING had no Rune spelling before it entered the registry, which the
@@ -1128,6 +1138,26 @@ pub fn lower(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn initcap(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Initcap,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn reverse(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Reverse,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 pub fn trim(expr: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1162,6 +1192,16 @@ pub fn floor(expr: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Floor,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn trunc(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Trunc,
 			args: vec![expr.expr],
 			parameter: ScalarFunctionParameter::None,
 		},
@@ -1818,12 +1858,16 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["power"], power).build()?;
 	m.function(["abs"], abs).build()?;
 	m.function(["ln"], ln).build()?;
+	m.function(["log"], log).build()?;
 	m.function(["round"], round).build()?;
 	m.function(["ceil"], ceil).build()?;
 	m.function(["floor"], floor).build()?;
+	m.function(["trunc"], trunc).build()?;
 	m.function(["sign"], sign).build()?;
 	m.function(["upper"], upper).build()?;
 	m.function(["lower"], lower).build()?;
+	m.function(["initcap"], initcap).build()?;
+	m.function(["reverse"], reverse).build()?;
 	m.function(["trim"], trim).build()?;
 	m.function(["ltrim"], ltrim).build()?;
 	m.function(["rtrim"], rtrim).build()?;
