@@ -296,6 +296,13 @@ host panel, and it is bounded by that section's own terms.
 
 ## Consequences and sequencing
 
+- **The interaction deferral closes (ledger IG-02, 2026-08-19).** §11's
+  deferral of interaction alongside guides is discharged by PRODUCT-0133, which
+  decides hit ranking, sibling preference, and hover wording. The guide half of
+  §11 is unaffected and remains open. Closed as decision-complete, not as
+  implemented. Ratified in
+  `plans/product/review/deferred_triage.md` § Ratification — 2026-08-19.
+
 - PRODUCT-0013's substrate acquires its first production caller, and the arc that
   began with two panes showing the same points in two panels ends with one view
   that overlays them.

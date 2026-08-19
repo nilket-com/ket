@@ -84,7 +84,10 @@ selection is authorable; "general sequential, diverging, or status palette
 authoring" is explicitly not added, and non-categorical jobs do not consume the
 figure palette. — 0030 §5, §12; 0029 §8.
 
-**CI-03 · `ColorTheme` catalog retirement / legacy resolver retirement.** "Retiring
+**CI-03 · `ColorTheme` catalog retirement / legacy resolver retirement — CLOSED
+2026-08-19.** Won't do; the compatibility path is preserved. Reason recorded in
+PRODUCT-0030's Rejected section and in `deferred_triage.md` § Ratification —
+2026-08-19. The original deferral text follows unchanged. "Retiring
 the rest of Polariton's duplicated plot-ramp catalog requires its own record
 and parity evidence"; the unselected compatibility resolver is a temporary dual
 entrypoint whose retirement is "a later cleanup"; non-Rune legacy plot callers
@@ -102,7 +105,10 @@ require an authored spelling plus collision and guide rules of its own." —
 affordance" for live categorical identity remains deferred. — 0029 §10;
 0030 §12.
 
-**CI-06 · Curated `c`/`C` clipping no-op.** Curated themes ignore clipping modifiers;
+**CI-06 · Curated `c`/`C` clipping no-op — CLOSED 2026-08-19.** Won't do; the
+no-op is now accepted as correct rather than merely preserved. Reason recorded in
+PRODUCT-0024's Rejected section and in `deferred_triage.md` § Ratification —
+2026-08-19. The original deferral text follows unchanged. Curated themes ignore clipping modifiers;
 this is "observed and preserved, not accepted as correct. … Whether
 inapplicable clipping should instead refuse is undecided" and changing it
 "requires its own record." — 0024 §3, Rejected, stop condition; 0028 §5
@@ -217,7 +223,11 @@ not-authorized; no record promises it.) — 0015 §6.
 
 ## Data & bindings
 
-**DB-01 · Deferred relations and live-table planning.** "Materialized sources are v1;
+**DB-01 · Deferred relations and live-table planning — PARTIALLY SCHEDULED
+2026-08-19.** Cancellation only is scheduled as the next bounded arc; every other
+item below stays open and unscheduled. A cancellation record must not acquire the
+live-table planning surface. See `deferred_triage.md` § Ratification —
+2026-08-19. The original deferral text follows unchanged. "Materialized sources are v1;
 deferred relations join later without changing this contract." The WIP plan's
 steps 7–8 remain open: deferred `db.table(...)` with default `Auto` policy,
 adapter planning, dry-run cost gates, cancellation, provenance display, and
@@ -225,7 +235,10 @@ density pushdown — named "launch gates for live-table plotting, not
 niceties." — 0007 §12; rune-data-products (status note, "Live relations and
 the 20 TiB table", Sequence steps 7–8).
 
-**DB-02 · Workspace artifact store / durable saved plots.** "The workspace artifact
+**DB-02 · Workspace artifact store / durable saved plots — IF ASKED 2026-08-19.**
+Trigger: a concrete sharing or persistence requirement that durable saved plots
+alone would satisfy. Do nothing until it fires. See `deferred_triage.md`
+§ Ratification — 2026-08-19. The original deferral text follows unchanged. "The workspace artifact
 store remains undecided per PRODUCT-0002. Saved authored specs and durable
 plots cannot ship before that record exists." — 0007 Consequences (and §4's
 live/pinned durability depends on it).
@@ -355,7 +368,12 @@ surface. — 0013 §3, §5, Consequences; 0014 §11, Consequences; 0016 §12,
 Consequences; 0017 §7, §10; 0019 §5, Rejected; 0021 §4; 0029 §10; 0031 §7,
 Rejected; 0032 §8, Rejected.
 
-**IG-02 · Interaction.** Interaction policy is deferred with guides: hover ranking
+**IG-02 · Interaction — CLOSED 2026-08-19.** Decided by PRODUCT-0133: hit ranking
+and sibling preference by §1, hover wording by §2. Closed as decision-complete,
+not as implemented — PRODUCT-0133 stages 3–4 remain unbuilt. Recorded in
+PRODUCT-0013's and PRODUCT-0014's Consequences and in `deferred_triage.md`
+§ Ratification — 2026-08-19. The original deferral text follows unchanged.
+Interaction policy is deferred with guides: hover ranking
 beyond back-to-front paint order, hit preference between siblings, and "how
 any content is worded for a reader" belong to a later record; 0013's hover
 bridge is provisional; hover wording remains that bridge under stroke-width
@@ -388,7 +406,12 @@ host-event record rather than a third local workaround." Eager
 continuation-bank collection is listed deferred. — 0030 §7, §12, Consequences;
 0015 §5 (the libaryon-side half).
 
-**LC-02 · Producer-release reattachment — remains open after PRODUCT-0062.**
+**LC-02 · Producer-release reattachment — IF ASKED 2026-08-19.** Trigger: a
+concrete requirement for in-process lifecycle continuity across producer release
+and reopen. See `deferred_triage.md` § Ratification — 2026-08-19. The original
+deferral text follows unchanged.
+
+**Remains open after PRODUCT-0062.**
 After a producer buffer is released,
 reopening the file creates a new session `BufferId` and a new group;
 "reattaching it to the producerless group would require the durable identity

@@ -294,6 +294,15 @@ triggered §9.
 
 ## Consequences and sequencing
 
+- **The interaction deferral closes (ledger IG-02, 2026-08-19).** PRODUCT-0133
+  decides hit ranking and sibling preference (§1) and hover wording (§2), and
+  retires §3's hover bridge. The bridge's "no compatibility guarantee" held:
+  ranking is now dimensional before paint order, and prose became a
+  presentation of a structured hit rather than a kernel's private sentence.
+  Closed as decision-complete, not as implemented — PRODUCT-0133 stages 3–4
+  remain unbuilt. Ratified in
+  `plans/product/review/deferred_triage.md` § Ratification — 2026-08-19.
+
 - The arc is three records, in order: this one; then PRODUCT-0014, the Rune
   surface (`layers([...])`, positional constructor roles, depth-one nesting, one
   sink and one panel and one identity, cross-origin refusal); then scale

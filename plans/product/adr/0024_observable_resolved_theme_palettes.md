@@ -256,6 +256,15 @@ policy enters libaryon. No palette value crosses the host-panel protocol.
 
 ## Rejected
 
+- **Refusal semantics for inapplicable `c`/`C` clipping on curated themes
+  (ledger CI-06, closed 2026-08-19):** the no-op is now accepted as correct
+  rather than merely observed and preserved. Refusal would convert a silently
+  harmless authoring habit into an error that no user has asked to be
+  diagnosed, and would change behavior for both projections PRODUCT-0028 §5
+  preserves. Reopens only on a concrete report of a user misled by the no-op.
+  Ratified in `plans/product/review/deferred_triage.md` § Ratification —
+  2026-08-19.
+
 - **Expose the continuous sampler:** makes continuous families privileged and
   lets callers produce colors that do not reflect the post-`sN` twenty-swatch
   identity used by syntax highlighting.

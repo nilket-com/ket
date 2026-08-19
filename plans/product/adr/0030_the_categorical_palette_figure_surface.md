@@ -555,6 +555,15 @@ live-artifact lifecycle record, not a shortcut this surface may hide.
 
 ## Rejected
 
+- **Retiring the duplicated plot-ramp catalog and the unselected compatibility
+  resolver (ledger CI-03, closed 2026-08-19):** a broad renderer-theme migration
+  whose cost is the parity census it demands, not the deletion it performs. The
+  unselected resolver is a dual entrypoint that is inert for authored work, and
+  non-Rune legacy callers keep current behavior. The duplication is a
+  maintenance fact, not something users can observe, and no record has produced a
+  reason to pay for the census. The compatibility path is preserved. Ratified in
+  `plans/product/review/deferred_triage.md` § Ratification — 2026-08-19.
+
 - **`bar(...).skin(name)` or another mark method:** conflates artifact skin with
   data palette, puts a figure-wide setting in a mark register, and makes future
   multi-mark palette sharing receiver-dependent.

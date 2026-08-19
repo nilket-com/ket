@@ -328,3 +328,111 @@ arcs (Guide, Persistence) plus debt retirement rather than new surface.
 | IG-05 | Categorical legend for band fill | will do (cluster) |
 | LC-01 | `BufferReleased` event | closed |
 | LC-02 | Producer-release reattachment | will do (cluster) |
+
+---
+
+## Ratification — 2026-08-19
+
+The closure discipline stated at the head of this file **has now run**. The
+seeded 2026-08-06 recommendations above are left unedited so the original
+judgement stays legible; where a disposition below differs, this section wins.
+
+Six items were open after the 2026-08-11 reconciliation. All six are disposed of
+here. Each closed item's reason is copied into its owning record, and its ledger
+entry is marked closed with a pointer to this section.
+
+| item | seeded | ratified disposition |
+|---|---|---|
+| IG-02 · Interaction | will do (cluster) | **closed** — decided by PRODUCT-0133 |
+| CI-03 · `ColorTheme` catalog / legacy resolver retirement | will do | **closed** |
+| CI-06 · Curated `c`/`C` clipping no-op | will do | **closed** |
+| DB-01 · Deferred relations / live-table planning | will do | **will do** — cancellation only |
+| DB-02 · Workspace artifact store / durable saved plots | will do | **if asked** |
+| LC-02 · Producer-release reattachment | will do (cluster) | **if asked** |
+
+### IG-02 · Interaction — closed
+
+PRODUCT-0133 decides all three deferred questions: hit ranking (§1,
+dimensionality then paint order then sibling ordinal), hit preference between
+siblings (§1, same rule), and how content is worded (§2, prose becomes a
+presentation of a structured hit). PRODUCT-0013 §3's hover bridge retires there
+and PRODUCT-0044's pending clause is discharged.
+
+Closed as **decision-complete**, not as implemented: PRODUCT-0133 stages 3–4
+remain unbuilt and are held below. The ledger tracks decisions, not delivery.
+
+### CI-03 · `ColorTheme` catalog / legacy resolver retirement — closed
+
+> **Retiring the duplicated plot-ramp catalog and the compatibility resolver:**
+> a broad renderer-theme migration whose cost is the parity census it demands,
+> not the deletion it performs. The unselected resolver is a dual entrypoint
+> that is inert for authored work; non-Rune legacy callers keep current
+> behavior. The duplication is a maintenance fact, not a defect users can
+> observe, and no record has produced a reason to pay for the census.
+
+The compatibility path is **preserved**. This closure is independent of the
+separate product decision to drop the SQL schema browser; the two share no
+mechanism and neither implies the other.
+
+### CI-06 · Curated `c`/`C` clipping no-op — closed
+
+> **Refusal semantics for inapplicable clipping modifiers on curated themes:**
+> the current no-op is observed, preserved, and now accepted as correct. Adding
+> refusal would convert a silently harmless authoring habit into an error
+> without any user having asked for the diagnosis, and would change behavior for
+> both projections PRODUCT-0028 §5 preserves.
+
+Reopens only on a concrete report of a user misled by the no-op.
+
+### DB-01 · Deferred relations / live-table planning — will do, scoped
+
+Only **cancellation** is scheduled. It is the next bounded arc after the process
+reset, and PRODUCT-0007 §12 already names it a launch gate rather than a nicety.
+
+The rest of DB-01 — deferred `db.table(...)`, `Auto` policy, adapter planning,
+dry-run cost gates, provenance display, density pushdown — stays open and
+unscheduled. Scheduling cancellation does not schedule live-table planning, and
+a cancellation record must not quietly acquire the planning surface.
+
+### DB-02 · Workspace artifact store / durable saved plots — if asked
+
+**Trigger:** a concrete sharing or persistence requirement that durable saved
+plots alone would satisfy. Until it fires, do nothing. PRODUCT-0007's
+Consequences and §4's live/pinned durability continue to depend on a record that
+does not exist, and that dependency is honest rather than blocking: no shipped
+surface promises durable saved plots.
+
+### LC-02 · Producer-release reattachment — if asked
+
+**Trigger:** a concrete requirement for in-process lifecycle continuity across
+producer release and reopen. PRODUCT-0062 satisfies the durable-identity
+dependency for saved-session restart only; the in-process case remains distinct
+and unbuilt, as the 2026-08-11 reconciliation established.
+
+### The typography pause
+
+**No new typography or layout-refinement ADR, and no implementation work in that
+arc, after PRODUCT-0132** — until the selected priority arcs are complete or the
+priority is explicitly revised.
+
+PRODUCT-0110 through PRODUCT-0132 are twenty-three consecutive records of
+typography, band reservation, tick placement, and glyph rasterization. The arc
+is not wrong and its records are not in question. It is paused because it is
+refining rendering fidelity while connection management, cancellation, and data
+egress remain the actual adoption blockers, and because a cadence with that much
+momentum does not stop merely because a priority list was written.
+
+This pause binds the arc, not the codebase: an accepted record already in
+implementation may finish, and a defect in shipped typography remains a defect.
+
+### Selected arcs, in order
+
+1. This ratification and the typography pause.
+2. Saved encrypted connection profiles and unlock UX.
+3. Query cancellation (the scoped half of DB-01).
+4. CSV import and export.
+
+**Held:** the catalog/schema browser (dropped outright — it serves the SQL-IDE
+lane the product is not competing in), result-grid polish, export hardening, and
+PRODUCT-0133 stages 3–4. No further interaction implementation accrues until
+this reset is complete.
