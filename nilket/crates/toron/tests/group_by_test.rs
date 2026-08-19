@@ -2321,6 +2321,52 @@ async fn adr553_string_functions_type_their_outputs_independently_of_their_input
 }
 
 #[tokio::test]
+async fn adr558_temporal_parsers_reach_sql_and_rune_through_the_registry() {
+	let strict = run_logical(&plan_sql("SELECT TO_DATE('2024-01-01') FROM sales")).await;
+	let dates = strict[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<arrow::array::Date32Array>()
+		.expect("TO_DATE Date32 output");
+	assert!(!dates.is_null(0));
+
+	// The TRY spelling answers NULL where the strict one ends the statement,
+	// which is the whole reason they are separate registrations.
+	let lenient = run_logical(&plan_sql("SELECT TRY_TO_DATE('not a date') FROM sales")).await;
+	assert!(
+		lenient[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Date32Array>()
+			.expect("TRY_TO_DATE Date32 output")
+			.is_null(0),
+		"TRY_TO_DATE must answer NULL rather than fail"
+	);
+	let strict_error = execute_sql_err("SELECT TO_DATE('not a date') FROM sales").await;
+	assert!(
+		strict_error.to_string().contains("not a date"),
+		"the strict failure must name the offending value, got {strict_error}"
+	);
+
+	let rune = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([to_date(lit_str("2024-01-01"))])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&strict, SortPolicy::FullRowLex).expect("SQL TO_DATE digest"),
+		canonical_arrow_ipc_digest(&rune, SortPolicy::FullRowLex).expect("Rune to_date digest"),
+		"SQL and Rune must reach one registry identifier"
+	);
+}
+
+#[tokio::test]
 async fn adr553_first_string_batch_uses_the_predicted_registry_shapes() {
 	let ltrim = run_logical(&plan_sql("SELECT LTRIM('xxeast', 'x') FROM sales")).await;
 	assert_eq!(

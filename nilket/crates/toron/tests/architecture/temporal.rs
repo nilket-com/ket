@@ -435,7 +435,11 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 	let contains_column = source_block(&planner, "fn expr_contains_nonaggregate_column_reference");
 
 	assert!(ir.contains("Interval(Option<i64>)"));
-	assert!(scalar.contains("CurrentDate { days: i32 }"));
+	// Matched as two stable tokens rather than one braced form: the parameter
+	// enum reflows to multi-line whenever it grows, so pinning the single-line
+	// spelling breaks on an unrelated variant rather than on a real change.
+	assert!(scalar.contains("CurrentDate {"));
+	assert!(scalar.contains("days: i32"));
 	assert!(scalar.contains("sql_name: \"CURRENT_DATE\""));
 	assert!(scalar.contains("signature: ScalarFunctionSignature::NiladicDate"));
 	assert!(ir.contains("pub fn interval_data_type() -> DataType"));

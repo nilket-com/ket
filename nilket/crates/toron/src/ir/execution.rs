@@ -837,7 +837,17 @@ impl BoundExprProgram {
 				Some(nullable)
 			}
 			BoundExprNode::ScalarFunction { id, args, .. } => {
-				match crate::ir::scalar_function_metadata(*id).null_behavior {
+				let metadata = crate::ir::scalar_function_metadata(*id);
+				// Failure-induced nullability outranks the input-null rule: a
+				// function that answers NULL for a value it cannot process is
+				// nullable even when every operand is non-nullable.
+				if matches!(
+					metadata.failure,
+					crate::ir::ScalarFunctionFailure::YieldsNull
+				) {
+					return Some(true);
+				}
+				match metadata.null_behavior {
 					crate::ir::ScalarFunctionNullBehavior::Propagates => args
 						.iter()
 						.map(|arg| self.node_nullable(*arg))
@@ -1017,6 +1027,7 @@ impl BoundExprProgram {
 						format!("<{timestamp_nanos}>")
 					}
 					ScalarFunctionParameter::CurrentDate { days } => format!("<{days}>"),
+					ScalarFunctionParameter::ToTimestamp { zone } => format!("<{zone}>"),
 				},
 				args.iter()
 					.map(|arg| self.pretty_node(*arg))

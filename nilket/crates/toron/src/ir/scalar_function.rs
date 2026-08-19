@@ -48,7 +48,11 @@ pub enum ScalarFunctionId {
 	Substring,
 	SplitPart,
 	TimeBucket,
+	ToDate,
+	ToTimestamp,
 	Trim,
+	TryToDate,
+	TryToTimestamp,
 	Trunc,
 	Upper,
 	WidthBucket,
@@ -66,8 +70,17 @@ pub enum ScalarFunctionParameter {
 	Extract(Box<ExtractScalarFunctionParameter>),
 	DateTrunc(Box<DateTruncScalarFunctionParameter>),
 	Trim(Box<TrimScalarFunctionParameter>),
-	CurrentTimestamp { timestamp_nanos: i64 },
-	CurrentDate { days: i32 },
+	CurrentTimestamp {
+		timestamp_nanos: i64,
+	},
+	CurrentDate {
+		days: i32,
+	},
+	/// The session zone a row-wise timestamp parse resolves zone-less text
+	/// against, captured at bind time so every fragment parses identically.
+	ToTimestamp {
+		zone: Box<str>,
+	},
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -191,6 +204,14 @@ pub enum ScalarFunctionSignature {
 	NiladicTimestamp,
 	/// No arguments at all, producing the statement's session-zone calendar date.
 	NiladicDate,
+	/// A string parsed per row into a UTC instant. Zone-less text resolves
+	/// against the session zone the binder captured into the node's parameter,
+	/// so the evaluator never consults planner configuration.
+	StringToTimestamp,
+	/// A string parsed per row into a calendar date. No zone participates: a
+	/// date is zone-independent, and resolving one against a session zone would
+	/// make the same text parse differently in different sessions.
+	StringToDate,
 	/// A `Utf8` string, a 1-based start, and an optional length. The bounds are
 	/// **constant** argument positions: they must bind to integer literals, and
 	/// the binder reads their values rather than evaluating them per row.
@@ -236,6 +257,24 @@ pub enum ScalarFunctionSignature {
 pub enum ScalarFunctionNullBehavior {
 	Propagates,
 	Ignores,
+}
+
+/// What a function does when an individual input value cannot be processed.
+///
+/// This is deliberately orthogonal to [`ScalarFunctionNullBehavior`]: that
+/// property answers what a NULL *input* does, while this one answers whether a
+/// non-NULL input the function cannot handle becomes an error or a NULL. Folding
+/// the two together would distort `Propagates` and `Ignores` for every function
+/// that cannot fail at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScalarFunctionFailure {
+	/// The function either cannot fail, or surfaces failure as an execution
+	/// error that ends the statement. Its nullability follows
+	/// [`ScalarFunctionNullBehavior`] alone.
+	Raises,
+	/// A value the function cannot process yields NULL instead of an error, so
+	/// the output is nullable regardless of whether any input is.
+	YieldsNull,
 }
 
 /// How non-finite floating inputs affect the output.
@@ -290,6 +329,8 @@ pub enum ScalarFunctionEvaluator {
 	StringConcat,
 	Substring,
 	TimeBucket,
+	ToDate,
+	ToTimestamp,
 	Trim,
 	Trunc,
 	Upper,
@@ -313,6 +354,10 @@ pub struct ScalarFunctionMetadata {
 	pub arity: ScalarFunctionArity,
 	pub signature: ScalarFunctionSignature,
 	pub null_behavior: ScalarFunctionNullBehavior,
+	/// Whether an unprocessable value becomes an error or a NULL. Read by
+	/// bound-program nullability before the null-behavior derivation, so a
+	/// `YieldsNull` function is nullable even over non-nullable inputs.
+	pub failure: ScalarFunctionFailure,
 	pub non_finite_behavior: ScalarFunctionNonFiniteBehavior,
 	pub evaluation: ScalarFunctionEvaluation,
 	pub pbc_pushdown_eligible: bool,
@@ -331,6 +376,7 @@ const EXP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -346,6 +392,7 @@ const SQRT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -363,6 +410,7 @@ const POW: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::BinaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -378,6 +426,7 @@ const ABS: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryNumericPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -393,6 +442,7 @@ const LN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -411,6 +461,7 @@ const LOG: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::BinaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -426,6 +477,7 @@ const ROUND: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Between(1, 2),
 	signature: ScalarFunctionSignature::FloatWithOptionalIntegerDigits,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -441,6 +493,7 @@ const CEIL: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -456,6 +509,7 @@ const FLOOR: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryIntegerOrFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Rejects,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -473,6 +527,7 @@ const TRUNC: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryIntegerOrFloatPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -488,6 +543,7 @@ const SIGN: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryNumericPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -506,6 +562,7 @@ const MOD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::BinaryIntegerPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -521,6 +578,7 @@ const UPPER: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -536,6 +594,7 @@ const LOWER: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -551,6 +610,7 @@ const INITCAP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -566,6 +626,7 @@ const REVERSE: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::UnaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -581,6 +642,7 @@ const TRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Between(1, 2),
 	signature: ScalarFunctionSignature::StringWithOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -598,6 +660,7 @@ const CONCAT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::AtLeast(1),
 	signature: ScalarFunctionSignature::VariadicStringConcatenating,
 	null_behavior: ScalarFunctionNullBehavior::Ignores,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -616,6 +679,7 @@ const STRING_CONCAT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::VariadicStringConcatenating,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -631,6 +695,7 @@ const LTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Between(1, 2),
 	signature: ScalarFunctionSignature::StringWithOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -646,6 +711,7 @@ const LPAD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Between(2, 3),
 	signature: ScalarFunctionSignature::StringWithIntegerAndOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -663,6 +729,7 @@ const POSITION: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::BinaryStringToInteger,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -678,6 +745,7 @@ const STRPOS: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::BinaryStringToInteger,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -693,6 +761,7 @@ const REPLACE: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(3),
 	signature: ScalarFunctionSignature::TernaryStringPreserving,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -708,6 +777,7 @@ const RTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Between(1, 2),
 	signature: ScalarFunctionSignature::StringWithOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -723,6 +793,7 @@ const RPAD: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Between(2, 3),
 	signature: ScalarFunctionSignature::StringWithIntegerAndOptionalString,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -739,6 +810,7 @@ const CHAR_LENGTH: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::StringToInteger,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -754,6 +826,7 @@ const WIDTH_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(4),
 	signature: ScalarFunctionSignature::NumericBucketing,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -773,6 +846,7 @@ const GREATEST: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	// deviation. Propagating is the compatibility default, and skipping would
 	// be its own explicit PostgreSQL-compatibility decision.
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -788,6 +862,7 @@ const LEAST: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::AtLeast(2),
 	signature: ScalarFunctionSignature::VariadicOrderedSameType,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -805,6 +880,7 @@ const RANDOM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(0),
 	signature: ScalarFunctionSignature::NiladicFloat,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	// The first `false` in the registry. Five planner rules already read this
 	// through `Expr::is_deterministic`; until now none of them had a case that
@@ -825,6 +901,7 @@ const NOW: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(0),
 	signature: ScalarFunctionSignature::NiladicTimestamp,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::PerStatement,
 	pbc_pushdown_eligible: false,
@@ -840,6 +917,7 @@ const CURRENT_DATE: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(0),
 	signature: ScalarFunctionSignature::NiladicDate,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::PerStatement,
 	pbc_pushdown_eligible: false,
@@ -855,6 +933,7 @@ const SUBSTRING: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Between(2, 3),
 	signature: ScalarFunctionSignature::StringWithConstantBounds,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -870,11 +949,76 @@ const SPLIT_PART: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(3),
 	signature: ScalarFunctionSignature::StringStringInteger,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::SplitPart,
+};
+
+const TO_TIMESTAMP: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::ToTimestamp,
+	sql_name: "TO_TIMESTAMP",
+	sql_aliases: &[],
+	rune_name: "to_timestamp",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::StringToTimestamp,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::ToTimestamp,
+};
+
+const TRY_TO_TIMESTAMP: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::TryToTimestamp,
+	sql_name: "TRY_TO_TIMESTAMP",
+	sql_aliases: &[],
+	rune_name: "try_to_timestamp",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::StringToTimestamp,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::YieldsNull,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::ToTimestamp,
+};
+
+const TO_DATE: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::ToDate,
+	sql_name: "TO_DATE",
+	sql_aliases: &[],
+	rune_name: "to_date",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::StringToDate,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::ToDate,
+};
+
+const TRY_TO_DATE: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::TryToDate,
+	sql_name: "TRY_TO_DATE",
+	sql_aliases: &[],
+	rune_name: "try_to_date",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::StringToDate,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::YieldsNull,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::ToDate,
 };
 
 const TIME_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
@@ -885,6 +1029,7 @@ const TIME_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::Int64MillisWithConstantInterval,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -900,6 +1045,7 @@ const AT_TIME_ZONE: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(2),
 	signature: ScalarFunctionSignature::TimestampWithConstantZone,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -915,6 +1061,7 @@ const DATE_TRUNC: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::TemporalTrunc,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -930,6 +1077,7 @@ const EXTRACT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::TemporalExtract,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
 	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
 	evaluation: ScalarFunctionEvaluation::Deterministic,
 	pbc_pushdown_eligible: false,
@@ -973,8 +1121,12 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	STRPOS,
 	SUBSTRING,
 	TIME_BUCKET,
+	TO_DATE,
+	TO_TIMESTAMP,
 	TRIM,
 	TRUNC,
+	TRY_TO_DATE,
+	TRY_TO_TIMESTAMP,
 	UPPER,
 	WIDTH_BUCKET,
 	SPLIT_PART,

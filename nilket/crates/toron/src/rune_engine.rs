@@ -1098,6 +1098,46 @@ pub fn now() -> RuneExpr {
 	}
 }
 
+pub fn to_timestamp(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::ToTimestamp,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn try_to_timestamp(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::TryToTimestamp,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn to_date(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::ToDate,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn try_to_date(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::TryToDate,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 pub fn current_date() -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1946,6 +1986,10 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["random"], random).build()?;
 	m.function(["now"], now).build()?;
 	m.function(["current_date"], current_date).build()?;
+	m.function(["to_timestamp"], to_timestamp).build()?;
+	m.function(["try_to_timestamp"], try_to_timestamp).build()?;
+	m.function(["to_date"], to_date).build()?;
+	m.function(["try_to_date"], try_to_date).build()?;
 	m.function(["substring"], substring).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;

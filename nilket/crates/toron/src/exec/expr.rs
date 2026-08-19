@@ -691,6 +691,18 @@ fn evaluate_scalar_function(
 		) => {
 			return evaluate_trim(args, payload.where_field);
 		}
+		(
+			ScalarFunctionId::ToTimestamp | ScalarFunctionId::TryToTimestamp,
+			crate::ir::ScalarFunctionParameter::ToTimestamp { zone },
+		) => {
+			return evaluate_to_timestamp(&args[0], zone, metadata.failure);
+		}
+		(
+			ScalarFunctionId::ToDate | ScalarFunctionId::TryToDate,
+			crate::ir::ScalarFunctionParameter::None,
+		) => {
+			return evaluate_to_date(&args[0], metadata.failure);
+		}
 		(ScalarFunctionId::Ltrim, crate::ir::ScalarFunctionParameter::None) => {
 			return evaluate_trim(args, crate::ir::TrimWhere::Leading);
 		}
@@ -2289,6 +2301,79 @@ fn evaluate_at_time_zone(arr: &ArrayRef, zone: &str) -> Result<ArrayRef, Executi
 			arr.data_type()
 		),
 	})
+}
+
+/// Applies a fallible parse to every element of either string width.
+///
+/// The registration's failure property decides what an unparseable element
+/// becomes, and it is the only thing that decides: a `YieldsNull` function
+/// answers NULL for that row, a `Raises` function ends the statement. The value
+/// itself never selects the behaviour, so a strict call cannot silently degrade
+/// into a permissive one on unusual data.
+fn parse_string_elements<T>(
+	array: &ArrayRef,
+	name: &str,
+	failure: crate::ir::ScalarFunctionFailure,
+	parse: impl Fn(&str) -> Result<T, String>,
+) -> Result<Vec<Option<T>>, ExecutionError> {
+	fn collect<'a, T>(
+		values: impl Iterator<Item = Option<&'a str>>,
+		name: &str,
+		failure: crate::ir::ScalarFunctionFailure,
+		parse: impl Fn(&str) -> Result<T, String>,
+	) -> Result<Vec<Option<T>>, ExecutionError> {
+		let mut parsed = Vec::new();
+		for value in values {
+			match value {
+				None => parsed.push(None),
+				Some(text) => match parse(text) {
+					Ok(value) => parsed.push(Some(value)),
+					Err(message) => match failure {
+						crate::ir::ScalarFunctionFailure::YieldsNull => parsed.push(None),
+						crate::ir::ScalarFunctionFailure::Raises => {
+							return Err(ExecutionError::InvalidExpression {
+								message: format!("{name}: {message}"),
+							});
+						}
+					},
+				},
+			}
+		}
+		Ok(parsed)
+	}
+
+	if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
+		return collect(array.iter(), name, failure, parse);
+	}
+	if let Some(array) = array.as_any().downcast_ref::<LargeStringArray>() {
+		return collect(array.iter(), name, failure, parse);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!("{name} expects a string input, got {:?}", array.data_type()),
+	})
+}
+
+fn evaluate_to_timestamp(
+	array: &ArrayRef,
+	zone: &str,
+	failure: crate::ir::ScalarFunctionFailure,
+) -> Result<ArrayRef, ExecutionError> {
+	let timezone = parse_temporal_execution_zone(zone)?;
+	let parsed = parse_string_elements(array, "TO_TIMESTAMP", failure, |text| {
+		crate::timestamp::parse_timestamp_text(text, timezone, TimeUnit::Nanosecond)
+			.map_err(|error| error.to_string())
+	})?;
+	Ok(Arc::new(TimestampNanosecondArray::from(parsed).with_timezone("UTC")) as ArrayRef)
+}
+
+fn evaluate_to_date(
+	array: &ArrayRef,
+	failure: crate::ir::ScalarFunctionFailure,
+) -> Result<ArrayRef, ExecutionError> {
+	let parsed = parse_string_elements(array, "TO_DATE", failure, |text| {
+		crate::date32::parse_date_ymd(text).map_err(|error| error.to_string())
+	})?;
+	Ok(Arc::new(Date32Array::from(parsed)) as ArrayRef)
 }
 
 fn evaluate_extract(

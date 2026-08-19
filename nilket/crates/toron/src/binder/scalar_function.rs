@@ -550,6 +550,49 @@ pub(super) fn bind_scalar_function(
 				DataType::Date32,
 			))
 		}
+		ScalarFunctionSignature::StringToTimestamp | ScalarFunctionSignature::StringToDate => {
+			let [input] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			if !builder
+				.node_logical_type(*input)
+				.is_some_and(LogicalTypeId::is_naked)
+			{
+				return Err(BindingError::TypeMismatch {
+					message: format!("{} does not accept named logical types", metadata.sql_name),
+				});
+			}
+			match builder.node_type(*input) {
+				Some(DataType::Utf8 | DataType::LargeUtf8) => {}
+				Some(actual) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects a string input, got {actual:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				None => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} input is not a bound expression", metadata.sql_name),
+					});
+				}
+			}
+			if matches!(metadata.signature, ScalarFunctionSignature::StringToDate) {
+				return Ok(builder.append_scalar_function(id, bound_args, DataType::Date32));
+			}
+			// The session zone is bind-time data. Capturing it here keeps the
+			// evaluator from reading planner configuration, so every fragment,
+			// worker, and retry resolves zone-less text identically.
+			Ok(builder.append_parameterized_scalar_function(
+				id,
+				bound_args,
+				ScalarFunctionParameter::ToTimestamp {
+					zone: ctx.session_timezone.name().into(),
+				},
+				DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+			))
+		}
 		ScalarFunctionSignature::VariadicOrderedSameType => {
 			let [first, rest @ ..] = bound_args.as_slice() else {
 				unreachable!("the registry arity was checked before binding")

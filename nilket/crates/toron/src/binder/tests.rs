@@ -21529,6 +21529,267 @@ fn try_bind_temporal_expr(
 	bind_expr_program(&[expr], &temporal_schema(), &ctx)
 }
 
+fn parse_text_schema(nullable: bool) -> SchemaRef {
+	Arc::new(Schema::new(vec![
+		Field::new("moment", DataType::Utf8, nullable),
+		Field::new("moment_large", DataType::LargeUtf8, nullable),
+	]))
+}
+
+fn parse_text_batch(values: &[Option<&str>]) -> RecordBatch {
+	RecordBatch::try_new(
+		parse_text_schema(true),
+		vec![
+			Arc::new(values.iter().copied().collect::<StringArray>()) as ArrayRef,
+			Arc::new(values.iter().copied().collect::<LargeStringArray>()) as ArrayRef,
+		],
+	)
+	.expect("parse text batch")
+}
+
+fn parse_call(id: crate::ir::ScalarFunctionId, column: &str) -> Expr {
+	Expr::ScalarFunction {
+		id,
+		args: vec![Expr::column(column)],
+		parameter: crate::ir::ScalarFunctionParameter::None,
+	}
+}
+
+fn bind_parse_expr(
+	expr: Expr,
+	session_timezone: &str,
+	nullable: bool,
+) -> Result<BoundExprProgram, BindingError> {
+	let config = PlannerConfig::default().with_session_timezone(session_timezone);
+	let logical_casts = HashMap::new();
+	let logical_type_registry = LogicalTypeRegistry::default();
+	let ctx = ExprBindContext {
+		config: &config,
+		session_timezone: config
+			.resolved_session_timezone()
+			.expect("session timezone"),
+		logical_type_specs: &logical_casts,
+		logical_type_registry: &logical_type_registry,
+		relation_scope: None,
+		statement_timestamp_nanos: 0,
+	};
+	bind_expr_program(&[expr], &parse_text_schema(nullable), &ctx)
+}
+
+fn parsed_timestamp_value(program: &BoundExprProgram, batch: &RecordBatch, row: usize) -> i64 {
+	let output = Executor::evaluate_bound_program_without_storage(program, batch)
+		.expect("evaluate parsed timestamp");
+	output[0]
+		.as_any()
+		.downcast_ref::<arrow::array::TimestampNanosecondArray>()
+		.expect("TO_TIMESTAMP nanosecond output")
+		.value(row)
+}
+
+#[test]
+fn to_timestamp_strict_raises_where_try_yields_null_for_the_same_element() {
+	let batch = parse_text_batch(&[Some("2024-01-01 00:30:00"), Some("not a timestamp"), None]);
+
+	let strict = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::ToTimestamp, "moment"),
+		"UTC",
+		true,
+	)
+	.expect("bind strict TO_TIMESTAMP");
+	let error = Executor::evaluate_bound_program_without_storage(&strict, &batch)
+		.expect_err("an unparseable value must fail the statement");
+	assert!(
+		error.to_string().contains("not a timestamp"),
+		"the strict error must name the offending value, got {error}"
+	);
+
+	// The same batch mixes parseable, unparseable, and NULL rows, so a
+	// whole-array fallback cannot be mistaken for per-element NULL.
+	let lenient = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::TryToTimestamp, "moment"),
+		"UTC",
+		true,
+	)
+	.expect("bind TRY_TO_TIMESTAMP");
+	let output = Executor::evaluate_bound_program_without_storage(&lenient, &batch)
+		.expect("TRY_TO_TIMESTAMP must not fail");
+	let values = output[0]
+		.as_any()
+		.downcast_ref::<arrow::array::TimestampNanosecondArray>()
+		.expect("TRY_TO_TIMESTAMP nanosecond output");
+	assert!(!values.is_null(0), "a parseable row keeps its value");
+	assert!(values.is_null(1), "an unparseable row becomes NULL");
+	assert!(values.is_null(2), "a NULL input stays NULL");
+}
+
+#[test]
+fn try_parsers_are_nullable_over_a_non_nullable_input_and_strict_ones_are_not() {
+	for (strict_id, lenient_id) in [
+		(
+			crate::ir::ScalarFunctionId::ToTimestamp,
+			crate::ir::ScalarFunctionId::TryToTimestamp,
+		),
+		(
+			crate::ir::ScalarFunctionId::ToDate,
+			crate::ir::ScalarFunctionId::TryToDate,
+		),
+	] {
+		let strict = bind_parse_expr(parse_call(strict_id, "moment"), "UTC", false)
+			.expect("bind strict parser over a non-nullable column");
+		let lenient = bind_parse_expr(parse_call(lenient_id, "moment"), "UTC", false)
+			.expect("bind TRY parser over a non-nullable column");
+		assert_eq!(
+			strict.node_nullable(strict.single_root().unwrap()),
+			Some(false),
+			"a strict parser fails the statement rather than answering NULL"
+		);
+		assert_eq!(
+			lenient.node_nullable(lenient.single_root().unwrap()),
+			Some(true),
+			"a TRY parser is nullable even over a non-nullable input"
+		);
+	}
+}
+
+#[test]
+fn to_timestamp_resolves_zone_less_text_against_the_captured_session_zone() {
+	let zone_less = parse_text_batch(&[Some("2024-01-01 00:30:00")]);
+	let chicago = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::ToTimestamp, "moment"),
+		"America/Chicago",
+		true,
+	)
+	.expect("bind Chicago TO_TIMESTAMP");
+	let tokyo = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::ToTimestamp, "moment"),
+		"Asia/Tokyo",
+		true,
+	)
+	.expect("bind Tokyo TO_TIMESTAMP");
+	assert_ne!(
+		parsed_timestamp_value(&chicago, &zone_less, 0),
+		parsed_timestamp_value(&tokyo, &zone_less, 0),
+		"zone-less text must resolve against the session zone"
+	);
+
+	// An explicit offset is self-describing, so the session zone must not move it.
+	let explicit = parse_text_batch(&[Some("2024-01-01T00:30:00+00:00")]);
+	assert_eq!(
+		parsed_timestamp_value(&chicago, &explicit, 0),
+		parsed_timestamp_value(&tokyo, &explicit, 0),
+		"an explicit offset must win over the session zone"
+	);
+
+	// The zone travels in the bound node, which is what makes every fragment,
+	// worker, and retry parse identically without reading planner config.
+	assert!(matches!(
+		chicago.node(chicago.single_root().unwrap()),
+		Some(BoundExprNode::ScalarFunction {
+			parameter: crate::ir::ScalarFunctionParameter::ToTimestamp { zone },
+			..
+		}) if zone.as_ref() == "America/Chicago"
+	));
+}
+
+#[test]
+fn temporal_parsers_accept_both_string_widths_identically() {
+	let batch = parse_text_batch(&[Some("2024-01-01 00:30:00")]);
+	let narrow = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::ToTimestamp, "moment"),
+		"America/Chicago",
+		true,
+	)
+	.expect("bind Utf8 TO_TIMESTAMP");
+	let wide = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::ToTimestamp, "moment_large"),
+		"America/Chicago",
+		true,
+	)
+	.expect("bind LargeUtf8 TO_TIMESTAMP");
+	assert_eq!(
+		parsed_timestamp_value(&narrow, &batch, 0),
+		parsed_timestamp_value(&wide, &batch, 0)
+	);
+}
+
+#[test]
+fn to_date_is_independent_of_the_session_zone() {
+	let batch = parse_text_batch(&[Some("2024-01-01"), Some("not a date")]);
+	let mut parsed = Vec::new();
+	for zone in ["America/Chicago", "Asia/Tokyo"] {
+		let program = bind_parse_expr(
+			parse_call(crate::ir::ScalarFunctionId::ToDate, "moment"),
+			zone,
+			true,
+		)
+		.expect("bind TO_DATE");
+		assert!(
+			matches!(
+				program.node(program.single_root().unwrap()),
+				Some(BoundExprNode::ScalarFunction {
+					parameter: crate::ir::ScalarFunctionParameter::None,
+					..
+				})
+			),
+			"TO_DATE must not capture a zone"
+		);
+		let output = Executor::evaluate_bound_program_without_storage(
+			&program,
+			&parse_text_batch(&[Some("2024-01-01")]),
+		)
+		.expect("evaluate TO_DATE");
+		parsed.push(
+			output[0]
+				.as_any()
+				.downcast_ref::<Date32Array>()
+				.expect("TO_DATE Date32 output")
+				.value(0),
+		);
+	}
+	assert_eq!(parsed[0], parsed[1], "a calendar date carries no zone");
+	assert_eq!(parsed[0], parse_date_ymd("2024-01-01").unwrap());
+
+	let strict = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::ToDate, "moment"),
+		"UTC",
+		true,
+	)
+	.expect("bind strict TO_DATE");
+	Executor::evaluate_bound_program_without_storage(&strict, &batch)
+		.expect_err("an unparseable date must fail the statement");
+}
+
+#[test]
+fn row_wise_parsing_keeps_the_daylight_saving_gap_error() {
+	// 2024-03-10 02:30:00 does not exist in America/Chicago.
+	let batch = parse_text_batch(&[Some("2024-03-10 02:30:00")]);
+	let strict = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::ToTimestamp, "moment"),
+		"America/Chicago",
+		true,
+	)
+	.expect("bind TO_TIMESTAMP");
+	Executor::evaluate_bound_program_without_storage(&strict, &batch)
+		.expect_err("a daylight-saving gap must fail rather than guess an instant");
+
+	let lenient = bind_parse_expr(
+		parse_call(crate::ir::ScalarFunctionId::TryToTimestamp, "moment"),
+		"America/Chicago",
+		true,
+	)
+	.expect("bind TRY_TO_TIMESTAMP");
+	let output = Executor::evaluate_bound_program_without_storage(&lenient, &batch)
+		.expect("TRY_TO_TIMESTAMP must not fail");
+	assert!(
+		output[0]
+			.as_any()
+			.downcast_ref::<arrow::array::TimestampNanosecondArray>()
+			.expect("TRY_TO_TIMESTAMP output")
+			.is_null(0),
+		"the TRY spelling answers NULL for a gap rather than an instant"
+	);
+}
+
 #[test]
 fn substring_sql_lowers_from_for_and_comma_forms() {
 	for (sql, expected) in [

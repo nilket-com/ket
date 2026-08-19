@@ -192,7 +192,11 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Substring".to_string(),
 			"SplitPart".to_string(),
 			"TimeBucket".to_string(),
+			"ToDate".to_string(),
+			"ToTimestamp".to_string(),
 			"Trim".to_string(),
+			"TryToDate".to_string(),
+			"TryToTimestamp".to_string(),
 			"Trunc".to_string(),
 			"Upper".to_string(),
 			"WidthBucket".to_string(),
@@ -214,6 +218,10 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 		let evaluator_id = match id.as_str() {
 			"Ltrim" | "Rtrim" => "Trim",
 			"Strpos" => "Position",
+			// A strict and a TRY spelling share one computation; only their
+			// failure metadata differs, which is the point of ADR 558.
+			"TryToTimestamp" => "ToTimestamp",
+			"TryToDate" => "ToDate",
 			_ => id.as_str(),
 		};
 		assert!(
