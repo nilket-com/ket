@@ -69,13 +69,43 @@ use wendelon::storage::{AsyncFileOps, BlockingFileOps, FileHandle, OpenFlags};
 /// errors instead of hanging.
 const RECURSIVE_CTE_MAX_ITERATIONS: usize = 1000;
 
-pub(crate) fn current_statement_timestamp_nanos() -> i64 {
+pub(crate) fn capture_wall_clock_nanos() -> i64 {
 	SystemTime::now()
 		.duration_since(UNIX_EPOCH)
 		.expect("system clock must be after the Unix epoch")
 		.as_nanos()
 		.try_into()
 		.expect("current timestamp must fit Arrow nanoseconds")
+}
+
+pub(crate) trait StatementClock: Send + Sync {
+	fn now_nanos(&self) -> i64;
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct SystemStatementClock;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct StatementContext {
+	pub timestamp_nanos: i64,
+}
+
+impl StatementContext {
+	pub(crate) fn capture_system() -> Self {
+		Self::capture(&SystemStatementClock)
+	}
+
+	pub(crate) fn capture(clock: &dyn StatementClock) -> Self {
+		Self {
+			timestamp_nanos: clock.now_nanos(),
+		}
+	}
+}
+
+impl StatementClock for SystemStatementClock {
+	fn now_nanos(&self) -> i64 {
+		capture_wall_clock_nanos()
+	}
 }
 
 mod aggregate;
@@ -173,6 +203,22 @@ impl ExecutionContext {
 		tenant_id: TenantId,
 		read_bound: HlcBound,
 	) -> Self {
+		Self::new_with_statement_clock(
+			session_id,
+			query_id,
+			tenant_id,
+			read_bound,
+			&SystemStatementClock,
+		)
+	}
+
+	pub(crate) fn new_with_statement_clock(
+		session_id: SessionId,
+		query_id: QueryId,
+		tenant_id: TenantId,
+		read_bound: HlcBound,
+		clock: &dyn StatementClock,
+	) -> Self {
 		let mut quantile_execution_seed = [0_u8; 32];
 		aws_lc_rs::rand::fill(&mut quantile_execution_seed)
 			.expect("system CSPRNG must be available for query execution");
@@ -181,7 +227,7 @@ impl ExecutionContext {
 			query_id,
 			tenant_id,
 			read_bound,
-			statement_timestamp_nanos: current_statement_timestamp_nanos(),
+			statement_timestamp_nanos: StatementContext::capture(clock).timestamp_nanos,
 			profile_hint: None,
 			trace_context: None,
 			legacy_table_pins: HashMap::new(),
@@ -199,6 +245,11 @@ impl ExecutionContext {
 			join_spill_file_ops: Arc::new(BlockingFileOps),
 			join_spill_dir: crate::exec::join::default_join_spill_dir(),
 		}
+	}
+
+	pub(crate) fn for_statement_with_clock(&self, clock: &dyn StatementClock) -> Self {
+		self.clone()
+			.with_statement_timestamp_nanos(StatementContext::capture(clock).timestamp_nanos)
 	}
 
 	pub fn with_statement_timestamp_nanos(mut self, timestamp_nanos: i64) -> Self {

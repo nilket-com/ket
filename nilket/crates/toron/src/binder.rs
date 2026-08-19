@@ -295,7 +295,7 @@ pub async fn bind(
 		plan,
 		catalog,
 		config,
-		crate::exec::current_statement_timestamp_nanos(),
+		crate::exec::StatementContext::capture_system().timestamp_nanos,
 	)
 	.await
 }
@@ -319,7 +319,7 @@ pub(crate) async fn bind_with_trace(
 		plan,
 		catalog,
 		config,
-		crate::exec::current_statement_timestamp_nanos(),
+		crate::exec::StatementContext::capture_system().timestamp_nanos,
 	)
 	.await
 }
@@ -368,7 +368,7 @@ async fn bind_with_explain_trace(
 		plan,
 		catalog,
 		config,
-		crate::exec::current_statement_timestamp_nanos(),
+		crate::exec::StatementContext::capture_system().timestamp_nanos,
 	)
 	.await
 }
@@ -475,7 +475,7 @@ pub(crate) async fn bind_explain_analyze(
 		plan,
 		catalog,
 		config,
-		crate::exec::current_statement_timestamp_nanos(),
+		crate::exec::StatementContext::capture_system().timestamp_nanos,
 	)
 	.await
 }
@@ -639,7 +639,7 @@ impl<'a> Binder<'a> {
 		Self::new_at(
 			catalog,
 			config,
-			crate::exec::current_statement_timestamp_nanos(),
+			crate::exec::StatementContext::capture_system().timestamp_nanos,
 		)
 	}
 

@@ -37,9 +37,9 @@ to duplicate a per-statement expression across independent statements.
 
 ### 2. Capture once at execution entry and bind it into the plan
 
-`ExecutionContext` captures one UTC epoch-nanosecond timestamp when the query
-execution context is created. The coordinator passes that value to the binder
-for every bind and retry belonging to that execution. Binding `NOW` or
+The statement-context boundary captures one UTC epoch-nanosecond timestamp
+through the injectable statement clock. The coordinator passes that value to
+the binder for every bind and retry belonging to that execution. Binding `NOW` or
 `CURRENT_TIMESTAMP` creates a `PerStatement` scalar node carrying that value as
 non-child parameter data.
 
@@ -59,7 +59,7 @@ SQL alias, including the parser's no-parentheses value-function form. Rune
 exposes `now()` through the same registry identifier. Both spellings have
 niladic arity and the same timestamp output type.
 
-The v1 cut does not add `CURRENT_DATE`, `CURRENT_TIME`, precision arguments, or
+This cut does not add `CURRENT_DATE`, `CURRENT_TIME`, precision arguments, or
 interval arithmetic. Those require separate type and calendar decisions.
 
 ## Acceptance
@@ -68,8 +68,11 @@ interval arithmetic. Those require separate type and calendar decisions.
   `CURRENT_TIMESTAMP` and `CURRENT_TIMESTAMP()` are both accepted.
 - Two NOW occurrences in one projection return the same timestamp, including
   when the projection is evaluated in multiple batches.
-- A new execution context receives a new capture, while a fixed test context
+- A new statement context receives a new capture, while a fixed test context
   makes the result exact and reproducible.
+- An advancing injected clock proves that a descriptor-evolution rebind keeps
+  the serialized bound `NOW` parameter byte-identical; a fresh capture would
+  produce a visibly different bound program.
 - A distributed task context/plan preserves the captured value; no worker or
   retry reads its own clock.
 - `Expr::is_deterministic` rejects NOW and accepts ordinary deterministic
@@ -85,7 +88,9 @@ be added outside those typed seams without a corresponding architecture test.
 
 The statement timestamp is execution data, not `PlannerConfig`: planner policy
 must not mint a second clock value, and a retry must not silently change the
-meaning of an already-started statement.
+meaning of an already-started statement. Wall-clock capture is centralized in
+the statement-context clock implementation and architecture-guarded; binders
+and coordinators may only consume the captured value.
 
 ## Risks and deferrals
 

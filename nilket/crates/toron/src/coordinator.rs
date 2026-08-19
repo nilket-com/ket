@@ -41,7 +41,7 @@ use crate::error::{
 	CatalogError, ExecutionError, QueryError, RuntimeError, StorageError, TaskFailureKind,
 };
 use crate::exec::{
-	ExecutionContext, Executor, current_statement_timestamp_nanos, materialize_scalar_rows,
+	ExecutionContext, Executor, StatementClock, SystemStatementClock, materialize_scalar_rows,
 };
 use crate::ir::{
 	BoundReturningProjection, BroadcastReplayEligibility, ColumnOrdinal, CreateTableRowIdentity,
@@ -3384,6 +3384,7 @@ pub struct QueryCoordinator {
 	writer: Arc<dyn StorageWrite>,
 	deleter: Arc<dyn StorageDeleteRows>,
 	admin: Arc<dyn StorageAdmin>,
+	statement_clock: Arc<dyn StatementClock>,
 }
 
 impl QueryCoordinator {
@@ -3436,6 +3437,12 @@ impl QueryCoordinator {
 		self
 	}
 
+	#[cfg(test)]
+	fn with_statement_clock(mut self, statement_clock: Arc<dyn StatementClock>) -> Self {
+		self.statement_clock = statement_clock;
+		self
+	}
+
 	pub fn with_writer_deleter_and_admin(
 		catalog: Arc<dyn Catalog>,
 		executor: Executor,
@@ -3451,6 +3458,7 @@ impl QueryCoordinator {
 			writer,
 			deleter,
 			admin,
+			statement_clock: Arc::new(SystemStatementClock),
 		}
 	}
 
@@ -3459,11 +3467,15 @@ impl QueryCoordinator {
 		plan: &LogicalPlan,
 		morsel: Option<(MorselId, u32)>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let statement_timestamp_nanos = current_statement_timestamp_nanos();
-		let catalog = Arc::clone(&self.catalog).scoped(self.executor.context().tenant_id);
+		let statement_context = self
+			.executor
+			.context()
+			.for_statement_with_clock(self.statement_clock.as_ref());
+		let statement_timestamp_nanos = statement_context.statement_timestamp_nanos;
+		let catalog = Arc::clone(&self.catalog).scoped(statement_context.tenant_id);
 		if let LogicalPlan::ExplainAnalyze { input } = plan {
 			return self
-				.execute_explain_analyze(catalog.as_ref(), input, morsel)
+				.execute_explain_analyze(catalog.as_ref(), input, morsel, &statement_context)
 				.await;
 		}
 		if matches!(
@@ -3482,7 +3494,7 @@ impl QueryCoordinator {
 			return execute_catalog_plan(
 				catalog.as_ref(),
 				self.admin.as_ref(),
-				self.executor.context(),
+				&statement_context,
 				&bound,
 			)
 			.await;
@@ -3544,9 +3556,7 @@ impl QueryCoordinator {
 				.as_ref()
 				.map(|_| Arc::new(Mutex::new(TaskTelemetry::default())));
 			let result = if let Some(binding) = measured_binding.as_ref() {
-				let context = self
-					.executor
-					.context()
+				let context = statement_context
 					.clone()
 					.with_task_telemetry(telemetry.as_ref().expect("telemetry").clone())
 					.with_join_runtime_observation_mode(analyze_observation_mode(
@@ -3556,7 +3566,9 @@ impl QueryCoordinator {
 					.execute_bound(&bound, morsel)
 					.await
 			} else {
-				self.executor.execute_bound(&bound, morsel).await
+				Executor::with_context(self.executor.storage_arc(), statement_context.clone())
+					.execute_bound(&bound, morsel)
+					.await
 			};
 			match result {
 				Ok(results) => {
@@ -3619,8 +3631,12 @@ impl QueryCoordinator {
 				message: "execute_mutation_with_query_id requires a mutation plan".to_string(),
 			});
 		}
-		let catalog = Arc::clone(&self.catalog).scoped(self.executor.context().tenant_id);
-		let statement_timestamp_nanos = current_statement_timestamp_nanos();
+		let statement_context = self
+			.executor
+			.context()
+			.for_statement_with_clock(self.statement_clock.as_ref());
+		let catalog = Arc::clone(&self.catalog).scoped(statement_context.tenant_id);
+		let statement_timestamp_nanos = statement_context.statement_timestamp_nanos;
 		let bound = bind_with_statement_timestamp(
 			plan,
 			catalog.as_ref(),
@@ -3681,19 +3697,17 @@ impl QueryCoordinator {
 		catalog: &dyn Catalog,
 		input: &LogicalPlan,
 		morsel: Option<(MorselId, u32)>,
+		statement_context: &ExecutionContext,
 	) -> Result<Vec<RecordBatch>, QueryError> {
-		let statement_timestamp_nanos = current_statement_timestamp_nanos();
 		let binding = bind_explain_analyze_with_statement_timestamp(
 			input,
 			catalog,
 			&self.config,
-			statement_timestamp_nanos,
+			statement_context.statement_timestamp_nanos,
 		)
 		.await?;
 		let telemetry = Arc::new(Mutex::new(TaskTelemetry::default()));
-		let context = self
-			.executor
-			.context()
+		let context = statement_context
 			.clone()
 			.with_task_telemetry(telemetry.clone())
 			.with_join_runtime_observation_mode(analyze_observation_mode(
@@ -3787,13 +3801,34 @@ mod tests {
 	use arrow::ipc::writer::StreamWriter;
 	use std::num::NonZeroU32;
 	use std::sync::Mutex as StdMutex;
-	use std::sync::atomic::{AtomicUsize, Ordering};
+	use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 	use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream, duplex as test_duplex};
 	use tokio::sync::Notify;
 	use wendelon::schema::{
 		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
 		TableObjectId, TableSchemaDescriptor,
 	};
+
+	struct AdvancingStatementClock {
+		value: AtomicI64,
+		captures: AtomicUsize,
+	}
+
+	impl AdvancingStatementClock {
+		fn new(value: i64) -> Self {
+			Self {
+				value: AtomicI64::new(value),
+				captures: AtomicUsize::new(0),
+			}
+		}
+	}
+
+	impl StatementClock for AdvancingStatementClock {
+		fn now_nanos(&self) -> i64 {
+			self.captures.fetch_add(1, Ordering::Relaxed);
+			self.value.fetch_add(1, Ordering::Relaxed)
+		}
+	}
 
 	#[tokio::test]
 	async fn coordinator_retries_once_on_descriptor_evolved() {
@@ -3803,7 +3838,8 @@ mod tests {
 			vec![Arc::new(Int64Array::from(vec![1, 2, 3]))],
 		)
 		.expect("batch");
-		let coordinator = coordinator(batch, 1);
+		let clock = Arc::new(AdvancingStatementClock::new(100));
+		let coordinator = coordinator(batch, 1).with_statement_clock(clock.clone());
 		let plan = named_count_plan();
 
 		let results = coordinator
@@ -3819,6 +3855,11 @@ mod tests {
 				.expect("count")
 				.value(0),
 			3
+		);
+		assert_eq!(
+			clock.captures.load(Ordering::Relaxed),
+			1,
+			"descriptor retry must reuse the original statement capture"
 		);
 	}
 

@@ -317,7 +317,9 @@ pub(crate) fn adr216_decision_flush_is_periodic_not_per_query() {
 	let local = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
 		.into_iter()
 		.map(|(_, block)| block)
-		.find(|block| block.contains("self.executor.execute_bound"))
+		.find(|block| {
+			block.contains("statement_context.clone()") && block.contains("execute_bound")
+		})
 		.expect("local QueryCoordinator execute_query block");
 
 	assert!(daemon.contains("flush_decision_deltas().await"));
@@ -481,7 +483,9 @@ pub(crate) fn adr188_sampled_path_returns_user_data() {
 	let local = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
 		.into_iter()
 		.map(|(_, block)| block)
-		.find(|block| block.contains("self.executor.execute_bound"))
+		.find(|block| {
+			block.contains("statement_context.clone()") && block.contains("execute_bound")
+		})
 		.expect("local QueryCoordinator execute_query block");
 
 	assert!(streaming.contains("with_final_result_sender"));
@@ -1894,7 +1898,9 @@ pub(crate) fn adr207_flush_is_awaited_post_success_not_background_queue() {
 	let local = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
 		.into_iter()
 		.map(|(_, block)| block)
-		.find(|block| block.contains("self.executor.execute_bound"))
+		.find(|block| {
+			block.contains("statement_context.clone()") && block.contains("execute_bound")
+		})
 		.expect("local QueryCoordinator execute_query block");
 
 	for block in [&streaming, &local] {
@@ -2380,7 +2386,9 @@ pub(crate) fn adr207_evidence_failure_never_fails_queries() {
 	let local = brace_blocks_after_marker(&coordinator, "pub async fn execute_query")
 		.into_iter()
 		.map(|(_, block)| block)
-		.find(|block| block.contains("self.executor.execute_bound"))
+		.find(|block| {
+			block.contains("statement_context.clone()") && block.contains("execute_bound")
+		})
 		.expect("local QueryCoordinator execute_query block");
 
 	for block in [&streaming, &local] {

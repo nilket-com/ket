@@ -17,6 +17,7 @@ use arrow::array::{
 use arrow::datatypes::{DataType, Field, Schema};
 use std::collections::hash_map::DefaultHasher;
 use std::hash::Hasher;
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use wendelon::schema::{
 	LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
 	TableSchemaDescriptor,
@@ -6246,6 +6247,84 @@ fn now_binding_bakes_the_statement_timestamp_into_the_bound_node() {
 			..
 		}]
 	));
+}
+
+struct AdvancingStatementClock {
+	value: AtomicI64,
+	captures: AtomicUsize,
+}
+
+impl AdvancingStatementClock {
+	fn new(value: i64) -> Self {
+		Self {
+			value: AtomicI64::new(value),
+			captures: AtomicUsize::new(0),
+		}
+	}
+
+	fn set(&self, value: i64) {
+		self.value.store(value, Ordering::Relaxed);
+	}
+}
+
+impl crate::exec::StatementClock for AdvancingStatementClock {
+	fn now_nanos(&self) -> i64 {
+		self.captures.fetch_add(1, Ordering::Relaxed);
+		self.value.load(Ordering::Relaxed)
+	}
+}
+
+#[test]
+fn now_rebind_reuses_one_injected_statement_capture() {
+	fn bind_now_program(timestamp_nanos: i64) -> crate::ir::BoundExprProgram {
+		let config = PlannerConfig::default();
+		let logical_casts = HashMap::new();
+		let logical_type_registry = LogicalTypeRegistry::default();
+		let ctx = ExprBindContext {
+			config: &config,
+			session_timezone: config
+				.resolved_session_timezone()
+				.expect("session timezone"),
+			statement_timestamp_nanos: timestamp_nanos,
+			logical_type_specs: &logical_casts,
+			logical_type_registry: &logical_type_registry,
+			relation_scope: None,
+		};
+		bind_expr_program(
+			&[Expr::ScalarFunction {
+				id: crate::ir::ScalarFunctionId::Now,
+				args: Vec::new(),
+				parameter: crate::ir::ScalarFunctionParameter::None,
+			}],
+			&Arc::new(Schema::empty()),
+			&ctx,
+		)
+		.expect("bind NOW")
+	}
+
+	let clock = AdvancingStatementClock::new(100);
+	let statement = crate::exec::ExecutionContext::local_test().for_statement_with_clock(&clock);
+	let first = bind_now_program(statement.statement_timestamp_nanos);
+
+	// A recapture would now be observably different; the statement context must
+	// keep the original value when descriptor evolution causes a rebind.
+	clock.set(200);
+	let rebound = bind_now_program(statement.statement_timestamp_nanos);
+	let recaptured = bind_now_program(
+		statement
+			.for_statement_with_clock(&clock)
+			.statement_timestamp_nanos,
+	);
+
+	assert_eq!(clock.captures.load(Ordering::Relaxed), 2);
+	assert_eq!(
+		postcard::to_stdvec(&first).expect("serialize first bound program"),
+		postcard::to_stdvec(&rebound).expect("serialize rebound bound program"),
+	);
+	assert_ne!(
+		postcard::to_stdvec(&first).expect("serialize first bound program"),
+		postcard::to_stdvec(&recaptured).expect("serialize recaptured bound program"),
+	);
 }
 
 #[tokio::test]

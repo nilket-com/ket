@@ -105,6 +105,25 @@ pub(crate) fn adr176_no_scattered_binder_file_reads() {
 }
 
 #[test]
+pub(crate) fn adr556_statement_clock_capture_is_centralized() {
+	let binder = binder_root_source();
+	let exec = std::fs::read_to_string(manifest_dir().join("src/exec.rs")).expect("read exec");
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+
+	assert_eq!(
+		exec.matches("SystemTime::now()").count(),
+		1,
+		"the system wall clock belongs to the statement-clock implementation"
+	);
+	assert!(exec.contains("impl StatementClock for SystemStatementClock"));
+	assert!(binder.contains("StatementContext::capture_system()"));
+	assert!(coordinator.contains("for_statement_with_clock(self.statement_clock.as_ref())"));
+	assert!(!binder.contains("capture_wall_clock_nanos()"));
+	assert!(!coordinator.contains("capture_wall_clock_nanos()"));
+}
+
+#[test]
 pub(crate) fn adr176_binder_root_excludes_carved_clusters() {
 	let root = binder_root_source();
 	assert!(root.contains("struct Binder"));

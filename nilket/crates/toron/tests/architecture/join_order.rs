@@ -317,7 +317,7 @@ pub(crate) fn adr179_reuses_178_estimate_no_second_estimator() {
 pub(crate) fn adr179_capture_is_cheap_and_analyze_gated() {
 	let exec = exec_source();
 	let coordinator = source("src/coordinator.rs");
-	let context_new = first_block(&exec, "pub fn new(");
+	let context_new = first_block(&exec, "pub(crate) fn new_with_statement_clock(");
 	let recorder = first_block(&exec, "fn record_join_runtime_observation");
 	let local = first_block(&coordinator, "async fn execute_explain_analyze(");
 	let distributed = first_block(&coordinator, "async fn execute_explain_analyze_distributed");
