@@ -21,7 +21,6 @@ use crate::session_persistence::{
 };
 use iced::keyboard::{self, Key};
 use iced::mouse;
-use iced::widget::tooltip;
 use iced::widget::{
 	Space, button, canvas, column, container, mouse_area, rich_text, row, span, stack, text,
 };
@@ -170,9 +169,6 @@ pub enum EditorMsg {
 	PaneTabAction {
 		pane_id: libaryon::core::PaneId,
 		action: PaneTabAction,
-	},
-	RetileOutputs {
-		pane_id: libaryon::core::PaneId,
 	},
 	HostPlot {
 		panel_id: HostPanelId,
@@ -1332,27 +1328,6 @@ impl CodeEditor {
 		group_id
 	}
 
-	fn rune_view_group_for_pane(
-		&self,
-		pane_id: libaryon::core::PaneId,
-	) -> Option<HostPanelGroupId> {
-		let pane = self
-			.viewport
-			.as_ref()?
-			.panes
-			.iter()
-			.find(|pane| pane.pane_id == pane_id)?;
-		if let Some(group_id) = self.view_group_ids.get(&pane.buffer_id) {
-			return Some(*group_id);
-		}
-		let panel_id = pane.host_panel.as_ref()?.panel_id;
-		let producer = self
-			.view_panel_ids
-			.iter()
-			.find_map(|((producer, _), candidate)| (*candidate == panel_id).then_some(*producer))?;
-		self.view_group_ids.get(&producer).copied()
-	}
-
 	fn resolve_rune_view_panel(
 		&mut self,
 		producer: libaryon::core::BufferId,
@@ -2107,12 +2082,6 @@ impl CodeEditor {
 				});
 				self.request_content();
 			}
-			EditorMsg::RetileOutputs { pane_id } => {
-				if let Some(group_id) = self.rune_view_group_for_pane(pane_id) {
-					self.send(EditorCommand::ResetHostPanelGroup { group_id });
-					self.request_content();
-				}
-			}
 			EditorMsg::HostPlot { panel_id, message } => {
 				self.panels.update_plot(panel_id, message);
 			}
@@ -2272,8 +2241,7 @@ impl CodeEditor {
 					}
 				}
 			};
-			let retile_outputs = self.rune_view_group_for_pane(pane.pane_id).is_some();
-			let content = pane_surface(pane, focused, palette, content, retile_outputs);
+			let content = pane_surface(pane, focused, palette, content);
 			layers.push(positioned(
 				pane.rect.screen_col.get() as f32 * metrics::CELL_WIDTH,
 				pane.rect.screen_row.get() as f32 * metrics::LINE_HEIGHT,
@@ -3522,7 +3490,6 @@ fn pane_tab_bar<'a>(
 	pane: &'a libaryon::uast::projection::PaneViewport,
 	focused: bool,
 	palette: UiPalette,
-	retile_outputs: bool,
 ) -> Element<'a, EditorMsg> {
 	let header_background = color(if focused {
 		palette.tab_surface
@@ -3610,20 +3577,6 @@ fn pane_tab_bar<'a>(
 		.spacing(0);
 		tabs = tabs.push(row![title, controls].spacing(0));
 	}
-	if retile_outputs {
-		let retile = button(text("▦").font(EDITOR_FONT).size(13.0))
-			.padding([2, 6])
-			.height(Length::Fixed(PANE_HEADER_HEIGHT))
-			.style(move |_theme: &Theme, status| tab_button_style(false, focused, palette, status))
-			.on_press(EditorMsg::RetileOutputs {
-				pane_id: pane.pane_id,
-			});
-		tabs = tabs.push(tooltip(
-			retile,
-			text("Retile outputs").font(EDITOR_FONT).size(13.0),
-			tooltip::Position::Bottom,
-		));
-	}
 	tabs = tabs.push(
 		mouse_area(Space::new().width(Length::Fill).height(Length::Fill))
 			.on_press(EditorMsg::PaneDragStarted(pane.pane_id))
@@ -3647,22 +3600,13 @@ fn pane_surface<'a>(
 	focused: bool,
 	palette: UiPalette,
 	content: Element<'a, EditorMsg>,
-	retile_outputs: bool,
 ) -> Element<'a, EditorMsg> {
 	let surface: Element<'a, EditorMsg> = container(pane_content_stack(
-		pane_tab_bar(pane, focused, palette, retile_outputs),
+		pane_tab_bar(pane, focused, palette),
 		content,
 	))
 	.width(Length::Fill)
 	.height(Length::Fill)
-	.style(move |_| container::Style {
-		border: iced::Border {
-			color: color(palette.divider_surface),
-			width: 1.0,
-			radius: 0.0.into(),
-		},
-		..Default::default()
-	})
 	.into();
 	pane_focus_frame(surface, focused, palette)
 }
@@ -6873,10 +6817,7 @@ mod tests {
 			})
 			.collect::<Vec<_>>();
 		assert!(editor.view_group_ids.contains_key(&producer));
-		assert_eq!(
-			editor.rune_view_group_for_pane(source_pane),
-			editor.view_group_ids.get(&producer).copied()
-		);
+		assert!(editor.view_group_ids.contains_key(&producer));
 		let first_panel = editor
 			.rune_view_panel_id(producer, &views[0].0)
 			.expect("first view panel");
@@ -6900,32 +6841,6 @@ mod tests {
 			first_projection,
 			"failure and stale completion state emit no placement"
 		);
-		let _ = editor.update(EditorMsg::RetileOutputs {
-			pane_id: source_pane,
-		});
-		for _ in 0..20 {
-			editor.poll();
-			thread::sleep(Duration::from_millis(2));
-		}
-		assert_eq!(
-			editor
-				.viewport
-				.as_ref()
-				.expect("retile no-op projection")
-				.panes
-				.iter()
-				.filter(|pane| pane.host_panel.is_some())
-				.map(|pane| (
-					pane.pane_id,
-					pane.rect,
-					pane.tabs.iter().map(|tab| tab.view_id).collect::<Vec<_>>(),
-					pane.active_doctab_index,
-				))
-				.collect::<Vec<_>>(),
-			first_projection,
-			"Retile outputs is exact on an already-current Automatic group"
-		);
-
 		editor.prepare_rune_view_panels(producer, &views, 2);
 		let deadline = Instant::now() + Duration::from_secs(10);
 		while Instant::now() < deadline {

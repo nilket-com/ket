@@ -170,15 +170,7 @@ pub fn main_screen<'a>(
 	let main_content = container(code_editor.view().map(Message::CodeEditEvent))
 		.padding(4)
 		.width(Fill)
-		.height(Fill)
-		.style(|_| container::Style {
-			border: border::Border {
-				color: colors::BORDER_PRIMARY,
-				width: 1.0,
-				radius: 5.0.into(),
-			},
-			..Default::default()
-		});
+		.height(Fill);
 	let status_bar: Element<'a, Message> = app_status_bar(
 		status_msg,
 		status_error,
