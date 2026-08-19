@@ -698,6 +698,23 @@ fn evaluate_scalar_function(
 			return evaluate_to_timestamp(&args[0], zone, metadata.failure);
 		}
 		(
+			ScalarFunctionId::ToTimestamp | ScalarFunctionId::TryToTimestamp,
+			crate::ir::ScalarFunctionParameter::TemporalFormat { pattern, zone },
+		) => {
+			let zone = zone
+				.as_deref()
+				.ok_or_else(|| ExecutionError::InvalidExpression {
+					message: "bound TO_TIMESTAMP is missing its timezone".to_string(),
+				})?;
+			return evaluate_to_timestamp_with_pattern(&args[0], pattern, zone, metadata.failure);
+		}
+		(
+			ScalarFunctionId::ToChar,
+			crate::ir::ScalarFunctionParameter::TemporalFormat { pattern, zone },
+		) => {
+			return evaluate_to_char(&args[0], pattern, zone.as_deref());
+		}
+		(
 			ScalarFunctionId::ToDate | ScalarFunctionId::TryToDate,
 			crate::ir::ScalarFunctionParameter::None,
 		) => {
@@ -2351,6 +2368,82 @@ fn parse_string_elements<T>(
 	Err(ExecutionError::InvalidExpression {
 		message: format!("{name} expects a string input, got {:?}", array.data_type()),
 	})
+}
+
+fn evaluate_to_timestamp_with_pattern(
+	array: &ArrayRef,
+	pattern: &crate::ir::TemporalFormatPattern,
+	zone: &str,
+	failure: crate::ir::ScalarFunctionFailure,
+) -> Result<ArrayRef, ExecutionError> {
+	let timezone = parse_temporal_execution_zone(zone)?;
+	let parsed = parse_string_elements(array, "TO_TIMESTAMP", failure, |text| {
+		let fields = crate::temporal_format::parse_fields(text, pattern)?;
+		crate::temporal_format::fields_to_utc_nanos(&fields, timezone)
+	})?;
+	Ok(Arc::new(TimestampNanosecondArray::from(parsed).with_timezone("UTC")) as ArrayRef)
+}
+
+fn evaluate_to_char(
+	array: &ArrayRef,
+	pattern: &crate::ir::TemporalFormatPattern,
+	zone: Option<&str>,
+) -> Result<ArrayRef, ExecutionError> {
+	if let Some(dates) = array.as_any().downcast_ref::<Date32Array>() {
+		let rendered = dates
+			.iter()
+			.map(|value| {
+				value.map(|days| {
+					crate::temporal_format::render_fields(
+						&crate::temporal_format::date32_to_fields(days),
+						pattern,
+					)
+				})
+			})
+			.collect::<StringArray>();
+		return Ok(Arc::new(rendered) as ArrayRef);
+	}
+	let zone = zone.ok_or_else(|| ExecutionError::InvalidExpression {
+		message: "bound TO_CHAR over a timestamp is missing its timezone".to_string(),
+	})?;
+	let timezone = parse_temporal_execution_zone(zone)?;
+	let (values, scale): (Vec<Option<i64>>, i64) =
+		if let Some(array) = array.as_any().downcast_ref::<TimestampMillisecondArray>() {
+			(array.iter().collect(), 1_000_000)
+		} else if let Some(array) = array.as_any().downcast_ref::<TimestampMicrosecondArray>() {
+			(array.iter().collect(), 1_000)
+		} else if let Some(array) = array.as_any().downcast_ref::<TimestampNanosecondArray>() {
+			(array.iter().collect(), 1)
+		} else {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"TO_CHAR expects a Timestamp or Date32 input, got {:?}",
+					array.data_type()
+				),
+			});
+		};
+	let mut rows: Vec<Option<String>> = Vec::with_capacity(values.len());
+	for value in values {
+		let Some(ticks) = value else {
+			rows.push(None);
+			continue;
+		};
+		// Checked, not saturating. Clamping would render a different instant
+		// than the value holds, which is a wrong answer rather than a failure.
+		let nanos = ticks
+			.checked_mul(scale)
+			.ok_or_else(|| ExecutionError::InvalidExpression {
+				message: format!(
+					"TO_CHAR: timestamp {ticks} is outside the representable nanosecond range"
+				),
+			})?;
+		let fields = crate::temporal_format::utc_nanos_to_fields(nanos, timezone);
+		rows.push(Some(crate::temporal_format::render_fields(
+			&fields, pattern,
+		)));
+	}
+	let rendered = rows.into_iter().collect::<StringArray>();
+	Ok(Arc::new(rendered) as ArrayRef)
 }
 
 fn evaluate_to_timestamp(

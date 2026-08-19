@@ -1,6 +1,26 @@
 use super::*;
 use crate::ir::{ScalarFunctionId, ScalarFunctionParameter, ScalarFunctionSignature};
 
+/// Reads and compiles a constant format pattern.
+///
+/// The pattern is a constant argument position, following `SUBSTRING`'s bounds:
+/// it must bind to a string literal so a malformed pattern fails here rather
+/// than once per row, and so every fragment walks one already-compiled program.
+fn constant_temporal_pattern(
+	builder: &BoundExprProgramBuilder,
+	format: BoundExprId,
+	sql_name: &str,
+) -> Result<crate::ir::TemporalFormatPattern, BindingError> {
+	let Some(ScalarValue::Utf8(Some(text))) = builder.literal(format) else {
+		return Err(BindingError::TypeMismatch {
+			message: format!("{sql_name} format pattern must be a string literal"),
+		});
+	};
+	crate::temporal_format::compile_pattern(text).map_err(|message| BindingError::TypeMismatch {
+		message: format!("{sql_name} {message}"),
+	})
+}
+
 pub(super) fn bind_scalar_function(
 	builder: &mut BoundExprProgramBuilder,
 	input_schema: &SchemaRef,
@@ -551,8 +571,10 @@ pub(super) fn bind_scalar_function(
 			))
 		}
 		ScalarFunctionSignature::StringToTimestamp | ScalarFunctionSignature::StringToDate => {
-			let [input] = bound_args.as_slice() else {
-				unreachable!("the registry arity was checked before binding")
+			let (input, format) = match bound_args.as_slice() {
+				[input] => (input, None),
+				[input, format] => (input, Some(*format)),
+				_ => unreachable!("the registry arity was checked before binding"),
 			};
 			if !builder
 				.node_logical_type(*input)
@@ -581,16 +603,98 @@ pub(super) fn bind_scalar_function(
 			if matches!(metadata.signature, ScalarFunctionSignature::StringToDate) {
 				return Ok(builder.append_scalar_function(id, bound_args, DataType::Date32));
 			}
-			// The session zone is bind-time data. Capturing it here keeps the
-			// evaluator from reading planner configuration, so every fragment,
-			// worker, and retry resolves zone-less text identically.
+			let output_type = DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into()));
+			let Some(format) = format else {
+				// The session zone is bind-time data. Capturing it here keeps the
+				// evaluator from reading planner configuration, so every fragment,
+				// worker, and retry resolves zone-less text identically.
+				return Ok(builder.append_parameterized_scalar_function(
+					id,
+					bound_args.clone(),
+					ScalarFunctionParameter::ToTimestamp {
+						zone: ctx.session_timezone.name().into(),
+					},
+					output_type,
+				));
+			};
+			let pattern = constant_temporal_pattern(builder, format, metadata.sql_name)?;
+			// Parsing has to construct a whole value, so a pattern that cannot
+			// determine a calendar date is rejected rather than defaulted. An
+			// epoch default would invent a date the caller never wrote.
+			if !pattern.has_date_fields() {
+				return Err(BindingError::TypeMismatch {
+					message: format!(
+						"{} requires a format pattern carrying YYYY, MM, and DD",
+						metadata.sql_name
+					),
+				});
+			}
 			Ok(builder.append_parameterized_scalar_function(
 				id,
 				bound_args,
-				ScalarFunctionParameter::ToTimestamp {
-					zone: ctx.session_timezone.name().into(),
+				ScalarFunctionParameter::TemporalFormat {
+					pattern: Box::new(pattern),
+					zone: Some(ctx.session_timezone.name().into()),
 				},
-				DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+				output_type,
+			))
+		}
+		ScalarFunctionSignature::TemporalWithConstantFormat => {
+			let [value, format] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			for operand in [value, format] {
+				if !builder
+					.node_logical_type(*operand)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			let pattern = constant_temporal_pattern(builder, *format, metadata.sql_name)?;
+			let zone = match builder.node_type(*value) {
+				Some(DataType::Timestamp(_, _)) => Some(ctx.session_timezone.name().into()),
+				Some(DataType::Date32) => {
+					// A date carries no clock. Rendering one would manufacture
+					// precision the value never had, which is worse than the
+					// truncation ADR 557 already refused.
+					if pattern.has_time_fields() {
+						return Err(BindingError::TypeMismatch {
+							message: format!(
+								"{} cannot render a time field from a Date32 value",
+								metadata.sql_name
+							),
+						});
+					}
+					None
+				}
+				Some(actual) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects a Timestamp or Date32 value, got {actual:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				None => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} input is not a bound expression", metadata.sql_name),
+					});
+				}
+			};
+			Ok(builder.append_parameterized_scalar_function(
+				id,
+				bound_args,
+				ScalarFunctionParameter::TemporalFormat {
+					pattern: Box::new(pattern),
+					zone,
+				},
+				DataType::Utf8,
 			))
 		}
 		ScalarFunctionSignature::VariadicOrderedSameType => {

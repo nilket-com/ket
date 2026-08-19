@@ -413,6 +413,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				"crates/toron/src/phase_ledger.rs",
 				// ADR 521: proof-gated outer-count structural and equivalence battery.
 				"crates/toron/tests/outer_count_preaggregation_test.rs",
+				// ADR 559: one temporal format compiler serves rendering and
+				// parsing; it is bind-time vocabulary, not binder decomposition.
+				"crates/toron/src/temporal_format.rs",
 				// ADR 553: EXTRACT and DATE_TRUNC moved into the typed scalar registry,
 				// including their shared identity-bearing regression fixture.
 				"crates/toron/src/ir/scalar_function.rs",

@@ -21586,6 +21586,325 @@ fn parsed_timestamp_value(program: &BoundExprProgram, batch: &RecordBatch, row: 
 		.value(row)
 }
 
+fn format_literal(pattern: &str) -> Expr {
+	Expr::Literal(ScalarValue::Utf8(Some(pattern.to_string())))
+}
+
+fn to_char_call(column: &str, pattern: Expr) -> Expr {
+	Expr::ScalarFunction {
+		id: crate::ir::ScalarFunctionId::ToChar,
+		args: vec![Expr::column(column), pattern],
+		parameter: crate::ir::ScalarFunctionParameter::None,
+	}
+}
+
+fn to_timestamp_call(column: &str, pattern: Option<Expr>) -> Expr {
+	let mut args = vec![Expr::column(column)];
+	args.extend(pattern);
+	Expr::ScalarFunction {
+		id: crate::ir::ScalarFunctionId::ToTimestamp,
+		args,
+		parameter: crate::ir::ScalarFunctionParameter::None,
+	}
+}
+
+fn rendered_rows(program: &BoundExprProgram, batch: &RecordBatch) -> Vec<Option<String>> {
+	let output =
+		Executor::evaluate_bound_program_without_storage(program, batch).expect("render TO_CHAR");
+	let values = output[0]
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("TO_CHAR Utf8 output");
+	(0..values.len())
+		.map(|row| (!values.is_null(row)).then(|| values.value(row).to_string()))
+		.collect()
+}
+
+#[test]
+fn temporal_format_round_trips_every_token_including_nanoseconds() {
+	let pattern = "YYYY-MM-DD HH24:MI:SS.FF9";
+	let instant = timestamp_ms("2024-03-01T12:34:56Z");
+	let rendered = bind_temporal_expr(
+		to_char_call("event_time", format_literal(pattern)),
+		"America/Chicago",
+	);
+	let rows = rendered_rows(&rendered, &temporal_batch(instant, 0));
+	let text = rows[0].clone().expect("a rendered instant");
+	// Nine digits always, so the rendered width does not depend on the value.
+	assert!(text.ends_with(".000000000"), "got {text}");
+
+	let batch = parse_text_batch(&[Some(text.as_str())]);
+	let parsed = bind_parse_expr(
+		to_timestamp_call("moment", Some(format_literal(pattern))),
+		"America/Chicago",
+		true,
+	)
+	.expect("bind TO_TIMESTAMP with a pattern");
+	assert_eq!(
+		parsed_timestamp_value(&parsed, &batch, 0),
+		instant * 1_000_000,
+		"a pattern carrying every field must round-trip exactly"
+	);
+}
+
+#[test]
+fn temporal_format_fraction_parses_one_three_six_and_nine_digits() {
+	for (fraction, expected_nanos) in [
+		("5", 500_000_000i64),
+		("500", 500_000_000),
+		("500000", 500_000_000),
+		("500000000", 500_000_000),
+	] {
+		let text = format!("2024-01-01 00:00:00.{fraction}");
+		let batch = parse_text_batch(&[Some(text.as_str())]);
+		let parsed = bind_parse_expr(
+			to_timestamp_call("moment", Some(format_literal("YYYY-MM-DD HH24:MI:SS.FF9"))),
+			"UTC",
+			true,
+		)
+		.expect("bind fractional TO_TIMESTAMP");
+		assert_eq!(
+			parsed_timestamp_value(&parsed, &batch, 0) % 1_000_000_000,
+			expected_nanos,
+			"a fraction is a decimal fraction of a second, not a digit count"
+		);
+	}
+}
+
+#[test]
+fn temporal_format_rejects_unknown_tokens_and_non_literal_patterns_at_bind() {
+	// An unknown run must name itself, so a typo is distinguishable from a
+	// rejected escape.
+	let render_error = try_bind_temporal_expr(
+		to_char_call("event_time", format_literal("YYYY-MM-XX")),
+		"UTC",
+	)
+	.expect_err("an unknown token must fail binding");
+	assert!(
+		render_error.to_string().contains("XX"),
+		"got {render_error}"
+	);
+	let parse_error = bind_parse_expr(
+		to_timestamp_call("moment", Some(format_literal("YYYY-MM-XX"))),
+		"UTC",
+		true,
+	)
+	.expect_err("an unknown token must fail binding for parsing too");
+	assert!(parse_error.to_string().contains("XX"), "got {parse_error}");
+
+	// A trailing character after a greedy match is reported as itself rather
+	// than as the whole run: `DD` is valid, so naming `DDD` would misdirect.
+	let trailing = try_bind_temporal_expr(
+		to_char_call("event_time", format_literal("YYYY-MM-DDD")),
+		"UTC",
+	)
+	.expect_err("a stray character must fail binding");
+	assert!(trailing.to_string().contains("\"D\""), "got {trailing}");
+
+	// A pattern chosen by data would defer a knowable error to execution.
+	try_bind_temporal_expr(
+		to_char_call("event_time", Expr::column("event_time")),
+		"UTC",
+	)
+	.expect_err("a non-literal pattern must fail binding");
+
+	try_bind_temporal_expr(
+		to_char_call("event_time", format_literal("YYYY-\"unclosed")),
+		"UTC",
+	)
+	.expect_err("an unterminated escape must fail binding");
+}
+
+#[test]
+fn temporal_format_rejects_trailing_text_strictly_and_yields_null_from_try() {
+	// Trailing text is not a special case: it is text the pattern does not
+	// match, so it takes the same path as any unparseable value.
+	let batch = parse_text_batch(&[Some("2024-01-01"), Some("2024-01-01 xyz")]);
+	let strict = bind_parse_expr(
+		to_timestamp_call("moment", Some(format_literal("YYYY-MM-DD"))),
+		"UTC",
+		true,
+	)
+	.expect("bind strict patterned TO_TIMESTAMP");
+	let error = Executor::evaluate_bound_program_without_storage(&strict, &batch)
+		.expect_err("trailing text must fail the statement");
+	assert!(error.to_string().contains("xyz"), "got {error}");
+
+	let lenient = bind_parse_expr(
+		Expr::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::TryToTimestamp,
+			args: vec![Expr::column("moment"), format_literal("YYYY-MM-DD")],
+			parameter: crate::ir::ScalarFunctionParameter::None,
+		},
+		"UTC",
+		true,
+	)
+	.expect("bind TRY patterned TO_TIMESTAMP");
+	let output = Executor::evaluate_bound_program_without_storage(&lenient, &batch)
+		.expect("TRY must not fail");
+	let values = output[0]
+		.as_any()
+		.downcast_ref::<arrow::array::TimestampNanosecondArray>()
+		.expect("TRY output");
+	assert!(!values.is_null(0), "the clean row keeps its value");
+	assert!(values.is_null(1), "the trailing-text row becomes NULL");
+}
+
+#[test]
+fn to_char_raises_rather_than_clamping_an_unrepresentable_instant() {
+	// Milliseconds beyond i64::MAX / 1_000_000 cannot widen to nanoseconds.
+	// Saturating here would render a different instant than the value holds.
+	let program = bind_temporal_expr(
+		to_char_call("event_time", format_literal("YYYY-MM-DD")),
+		"UTC",
+	);
+	let error = Executor::evaluate_bound_program_without_storage(
+		&program,
+		&temporal_batch(9_300_000_000_000, 0),
+	)
+	.expect_err("an unrepresentable instant must fail rather than clamp");
+	assert!(
+		error.to_string().contains("nanosecond range"),
+		"got {error}"
+	);
+}
+
+#[test]
+fn temporal_format_escape_is_verbatim_even_for_a_valid_token() {
+	let pattern = "YYYY \"MM\" MM";
+	let rendered = bind_temporal_expr(to_char_call("event_time", format_literal(pattern)), "UTC");
+	let rows = rendered_rows(
+		&rendered,
+		&temporal_batch(timestamp_ms("2024-03-01T00:00:00Z"), 0),
+	);
+	assert_eq!(
+		rows[0].clone().expect("rendered"),
+		"2024 MM 03",
+		"an escaped run must survive even when it spells a token"
+	);
+}
+
+#[test]
+fn to_char_renders_in_the_session_zone_and_carries_it_in_the_payload() {
+	let instant = timestamp_ms("2024-01-01T00:30:00Z");
+	let pattern = "YYYY-MM-DD HH24";
+	let chicago = bind_temporal_expr(
+		to_char_call("event_time", format_literal(pattern)),
+		"America/Chicago",
+	);
+	let tokyo = bind_temporal_expr(
+		to_char_call("event_time", format_literal(pattern)),
+		"Asia/Tokyo",
+	);
+	let batch = temporal_batch(instant, 0);
+	assert_ne!(
+		rendered_rows(&chicago, &batch)[0],
+		rendered_rows(&tokyo, &batch)[0],
+		"one instant must render differently under two session zones"
+	);
+	assert!(matches!(
+		chicago.node(chicago.single_root().unwrap()),
+		Some(BoundExprNode::ScalarFunction {
+			parameter: crate::ir::ScalarFunctionParameter::TemporalFormat { zone: Some(zone), .. },
+			..
+		}) if zone.as_ref() == "America/Chicago"
+	));
+}
+
+#[test]
+fn to_char_over_a_date_carries_no_zone_and_refuses_to_invent_a_clock() {
+	let program = bind_temporal_expr(
+		to_char_call("signup_date", format_literal("YYYY-MM-DD")),
+		"Asia/Tokyo",
+	);
+	assert!(
+		matches!(
+			program.node(program.single_root().unwrap()),
+			Some(BoundExprNode::ScalarFunction {
+				parameter: crate::ir::ScalarFunctionParameter::TemporalFormat { zone: None, .. },
+				..
+			})
+		),
+		"a date carries no zone"
+	);
+	assert_eq!(
+		rendered_rows(
+			&program,
+			&temporal_batch(0, parse_date_ymd("2024-01-01").unwrap())
+		)[0]
+		.clone()
+		.expect("rendered date"),
+		"2024-01-01"
+	);
+
+	// Rendering a clock from a date would manufacture precision the value
+	// never had, so it is rejected — while the same pattern over a timestamp
+	// binds happily.
+	try_bind_temporal_expr(
+		to_char_call("signup_date", format_literal("YYYY-MM-DD HH24:MI")),
+		"UTC",
+	)
+	.expect_err("a time token over a Date32 must fail binding");
+	bind_temporal_expr(
+		to_char_call("event_time", format_literal("YYYY-MM-DD HH24:MI")),
+		"UTC",
+	);
+}
+
+#[test]
+fn omitted_fields_default_when_parsing_and_are_required_for_a_date() {
+	// Omitted time fields default to zero, stated rather than implied.
+	let batch = parse_text_batch(&[Some("2024-01-01")]);
+	let parsed = bind_parse_expr(
+		to_timestamp_call("moment", Some(format_literal("YYYY-MM-DD"))),
+		"UTC",
+		true,
+	)
+	.expect("bind date-only TO_TIMESTAMP");
+	assert_eq!(
+		parsed_timestamp_value(&parsed, &batch, 0),
+		timestamp_ms("2024-01-01T00:00:00Z") * 1_000_000,
+		"a date-only pattern parses to midnight in the session zone"
+	);
+
+	// An omitting pattern loses exactly what it does not name, rather than
+	// failing or rounding: a mid-day instant returns as that day's midnight.
+	let rendered = bind_temporal_expr(
+		to_char_call("event_time", format_literal("YYYY-MM-DD")),
+		"UTC",
+	);
+	let text = rendered_rows(
+		&rendered,
+		&temporal_batch(timestamp_ms("2024-01-01T13:45:00Z"), 0),
+	)[0]
+	.clone()
+	.expect("rendered date");
+	let narrowed = bind_parse_expr(
+		to_timestamp_call("moment", Some(format_literal("YYYY-MM-DD"))),
+		"UTC",
+		true,
+	)
+	.expect("bind date-only TO_TIMESTAMP");
+	assert_eq!(
+		parsed_timestamp_value(&narrowed, &parse_text_batch(&[Some(text.as_str())]), 0),
+		timestamp_ms("2024-01-01T00:00:00Z") * 1_000_000,
+		"the round trip loses the time and nothing else"
+	);
+
+	// The requirement is directional: parsing must construct a date, rendering
+	// merely discards what the pattern does not name.
+	bind_parse_expr(
+		to_timestamp_call("moment", Some(format_literal("HH24:MI:SS"))),
+		"UTC",
+		true,
+	)
+	.expect_err("a time-only pattern cannot determine a date");
+	bind_temporal_expr(
+		to_char_call("event_time", format_literal("HH24:MI:SS")),
+		"UTC",
+	);
+}
+
 #[test]
 fn to_timestamp_strict_raises_where_try_yields_null_for_the_same_element() {
 	let batch = parse_text_batch(&[Some("2024-01-01 00:30:00"), Some("not a timestamp"), None]);

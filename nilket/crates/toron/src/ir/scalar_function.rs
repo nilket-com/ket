@@ -48,6 +48,7 @@ pub enum ScalarFunctionId {
 	Substring,
 	SplitPart,
 	TimeBucket,
+	ToChar,
 	ToDate,
 	ToTimestamp,
 	Trim,
@@ -81,6 +82,107 @@ pub enum ScalarFunctionParameter {
 	ToTimestamp {
 		zone: Box<str>,
 	},
+	/// A pattern compiled at bind time, shared by rendering and parsing. The
+	/// zone is absent when no zone participates, as for a `Date32` argument.
+	TemporalFormat {
+		pattern: Box<TemporalFormatPattern>,
+		zone: Option<Box<str>>,
+	},
+}
+
+/// One field of a temporal format pattern.
+///
+/// The set is closed. A token means the same thing in both directions — what
+/// `YYYY` writes, `YYYY` reads — which is the property that keeps rendering and
+/// parsing from drifting apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TemporalFormatToken {
+	Year4,
+	Month2,
+	Day2,
+	Hour24,
+	Minute2,
+	Second2,
+	Fraction9,
+}
+
+impl TemporalFormatToken {
+	/// The pattern spelling, and the only place it is written down.
+	pub const fn spelling(self) -> &'static str {
+		match self {
+			Self::Year4 => "YYYY",
+			Self::Month2 => "MM",
+			Self::Day2 => "DD",
+			Self::Hour24 => "HH24",
+			Self::Minute2 => "MI",
+			Self::Second2 => "SS",
+			Self::Fraction9 => "FF9",
+		}
+	}
+
+	/// Whether the token names a time-of-day field rather than a calendar field.
+	pub const fn is_time_field(self) -> bool {
+		match self {
+			Self::Hour24 | Self::Minute2 | Self::Second2 | Self::Fraction9 => true,
+			Self::Year4 | Self::Month2 | Self::Day2 => false,
+		}
+	}
+
+	/// Every token, longest spelling first so a compiler scanning left to right
+	/// matches `HH24` before it could match a shorter prefix.
+	pub const ALL: &'static [Self] = &[
+		Self::Hour24,
+		Self::Year4,
+		Self::Fraction9,
+		Self::Month2,
+		Self::Day2,
+		Self::Minute2,
+		Self::Second2,
+	];
+}
+
+/// A compiled pattern piece: a field to substitute, or text to emit and match
+/// verbatim.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TemporalFormatPiece {
+	Token(TemporalFormatToken),
+	Literal(Box<str>),
+}
+
+/// A pattern compiled once at bind time and carried in the scalar parameter.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TemporalFormatPattern {
+	pub pieces: Vec<TemporalFormatPiece>,
+}
+
+impl TemporalFormatPattern {
+	pub fn tokens(&self) -> impl Iterator<Item = TemporalFormatToken> + '_ {
+		self.pieces.iter().filter_map(|piece| match piece {
+			TemporalFormatPiece::Token(token) => Some(*token),
+			TemporalFormatPiece::Literal(_) => None,
+		})
+	}
+
+	/// Whether the pattern determines a calendar date, which parsing requires
+	/// and rendering does not.
+	pub fn has_date_fields(&self) -> bool {
+		let mut year = false;
+		let mut month = false;
+		let mut day = false;
+		for token in self.tokens() {
+			match token {
+				TemporalFormatToken::Year4 => year = true,
+				TemporalFormatToken::Month2 => month = true,
+				TemporalFormatToken::Day2 => day = true,
+				_ => {}
+			}
+		}
+		year && month && day
+	}
+
+	pub fn has_time_fields(&self) -> bool {
+		self.tokens().any(TemporalFormatToken::is_time_field)
+	}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -212,6 +314,10 @@ pub enum ScalarFunctionSignature {
 	/// date is zone-independent, and resolving one against a session zone would
 	/// make the same text parse differently in different sessions.
 	StringToDate,
+	/// A timestamp or date plus a constant format pattern, producing a string.
+	/// The pattern is a constant argument position: it must bind to a string
+	/// literal, which the binder compiles once rather than per row.
+	TemporalWithConstantFormat,
 	/// A `Utf8` string, a 1-based start, and an optional length. The bounds are
 	/// **constant** argument positions: they must bind to integer literals, and
 	/// the binder reads their values rather than evaluating them per row.
@@ -329,6 +435,7 @@ pub enum ScalarFunctionEvaluator {
 	StringConcat,
 	Substring,
 	TimeBucket,
+	ToChar,
 	ToDate,
 	ToTimestamp,
 	Trim,
@@ -962,7 +1069,7 @@ const TO_TIMESTAMP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	sql_name: "TO_TIMESTAMP",
 	sql_aliases: &[],
 	rune_name: "to_timestamp",
-	arity: ScalarFunctionArity::Exact(1),
+	arity: ScalarFunctionArity::Between(1, 2),
 	signature: ScalarFunctionSignature::StringToTimestamp,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	failure: ScalarFunctionFailure::Raises,
@@ -978,7 +1085,7 @@ const TRY_TO_TIMESTAMP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	sql_name: "TRY_TO_TIMESTAMP",
 	sql_aliases: &[],
 	rune_name: "try_to_timestamp",
-	arity: ScalarFunctionArity::Exact(1),
+	arity: ScalarFunctionArity::Between(1, 2),
 	signature: ScalarFunctionSignature::StringToTimestamp,
 	null_behavior: ScalarFunctionNullBehavior::Propagates,
 	failure: ScalarFunctionFailure::YieldsNull,
@@ -987,6 +1094,22 @@ const TRY_TO_TIMESTAMP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::ToTimestamp,
+};
+
+const TO_CHAR: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::ToChar,
+	sql_name: "TO_CHAR",
+	sql_aliases: &[],
+	rune_name: "to_char",
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::TemporalWithConstantFormat,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::ToChar,
 };
 
 const TO_DATE: ScalarFunctionMetadata = ScalarFunctionMetadata {
@@ -1121,6 +1244,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	STRPOS,
 	SUBSTRING,
 	TIME_BUCKET,
+	TO_CHAR,
 	TO_DATE,
 	TO_TIMESTAMP,
 	TRIM,

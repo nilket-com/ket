@@ -1098,21 +1098,33 @@ pub fn now() -> RuneExpr {
 	}
 }
 
-pub fn to_timestamp(expr: RuneExpr) -> RuneExpr {
+/// Variadic so both the bare and the format-bearing arity are reachable,
+/// following the shape `greatest` already uses for an argument list.
+pub fn to_timestamp(args: Vec<RuneExpr>) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::ToTimestamp,
-			args: vec![expr.expr],
+			args: args.into_iter().map(|arg| arg.expr).collect(),
 			parameter: ScalarFunctionParameter::None,
 		},
 	}
 }
 
-pub fn try_to_timestamp(expr: RuneExpr) -> RuneExpr {
+pub fn try_to_timestamp(args: Vec<RuneExpr>) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::TryToTimestamp,
-			args: vec![expr.expr],
+			args: args.into_iter().map(|arg| arg.expr).collect(),
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn to_char(value: RuneExpr, format: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::ToChar,
+			args: vec![value.expr, format.expr],
 			parameter: ScalarFunctionParameter::None,
 		},
 	}
@@ -1990,6 +2002,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["try_to_timestamp"], try_to_timestamp).build()?;
 	m.function(["to_date"], to_date).build()?;
 	m.function(["try_to_date"], try_to_date).build()?;
+	m.function(["to_char"], to_char).build()?;
 	m.function(["substring"], substring).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;

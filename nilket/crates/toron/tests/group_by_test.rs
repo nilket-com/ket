@@ -2321,6 +2321,32 @@ async fn adr553_string_functions_type_their_outputs_independently_of_their_input
 }
 
 #[tokio::test]
+async fn adr559_rune_to_timestamp_keeps_its_bare_arity_after_becoming_variadic() {
+	// Making the Rune spelling variadic must not drop the bare arity ADR 558
+	// shipped, so the one-argument call keeps binding and evaluating.
+	let sql = run_logical(&plan_sql(
+		"SELECT TO_TIMESTAMP('2024-01-01 00:00:00') FROM sales",
+	))
+	.await;
+	let rune = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([to_timestamp([lit_str("2024-01-01 00:00:00")])])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql, SortPolicy::FullRowLex).expect("SQL digest"),
+		canonical_arrow_ipc_digest(&rune, SortPolicy::FullRowLex).expect("Rune digest"),
+		"the bare arity must survive the variadic spelling"
+	);
+}
+
+#[tokio::test]
 async fn adr558_temporal_parsers_reach_sql_and_rune_through_the_registry() {
 	let strict = run_logical(&plan_sql("SELECT TO_DATE('2024-01-01') FROM sales")).await;
 	let dates = strict[0]

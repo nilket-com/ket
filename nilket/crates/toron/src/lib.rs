@@ -24,6 +24,7 @@ pub mod sql_planner;
 pub mod sql_wire;
 pub mod storage;
 pub mod telemetry;
+mod temporal_format;
 mod timestamp;
 pub mod wire;
 

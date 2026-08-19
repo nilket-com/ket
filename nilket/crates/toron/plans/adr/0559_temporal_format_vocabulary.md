@@ -116,7 +116,16 @@ The asymmetry is deliberate and preserves the round trip: rendering's nine-digit
 output lies inside the range parsing accepts. Requiring exactly nine on the way
 in would reject the three- and six-digit fractions real data carries, for no gain.
 
-### 8. Round trips are guaranteed only where the pattern carries the fields
+### 8. Parsing consumes the whole input
+
+A pattern must account for every character of the value. Text left over after
+the last piece is an error rather than a silent prefix match, so
+`TO_TIMESTAMP('2024-01-01 xyz', 'YYYY-MM-DD')` fails instead of quietly reading
+the part it recognises. The strict spelling raises and the `TRY_` spelling
+yields NULL, exactly as for any other unparseable value — trailing text is not a
+special case, it is simply text the pattern does not match.
+
+### 9. Round trips are guaranteed only where the pattern carries the fields
 
 For a pattern containing every field a value needs — year, month, and day for a
 date; those plus hour, minute, second, and fractional second for a timestamp —
@@ -152,6 +161,12 @@ to lose exactly what the pattern does not name rather than to fail confusingly.
   pattern over a timestamp succeeds.
 - `FF9` renders exactly nine digits, and parses one, three, six, and nine digit
   fractions to the values a decimal fraction implies.
+- Text left over after the last pattern piece fails the strict spelling and
+  yields NULL from the `TRY_` spelling.
+- A timestamp whose tick count cannot widen to nanoseconds is an execution
+  error, never a clamped instant rendered as a different time.
+- Rune's one-argument `to_timestamp` keeps working alongside the two-argument
+  form, so making the spelling variadic did not drop the bare arity.
 
 ## Guardrails
 
@@ -178,6 +193,15 @@ caught regression.
 Row-valued patterns, `HH12` with meridiem, era and ordinal forms, localized month
 and day names, and timezone tokens are deferred. Localized names in particular
 carry a locale decision this engine has not made anywhere else.
+
+**A patterned `TO_DATE` is deferred and named here rather than left implicit.**
+This cut gives `TO_CHAR` a pattern in both temporal directions and gives
+`TO_TIMESTAMP` a patterned parse, but `TO_DATE` keeps its single-argument form.
+The asymmetry is real: a caller who can pattern-parse a timestamp will expect to
+pattern-parse a date. It is deferred only because the compiled pattern and its
+date-field requirement are the same machinery, so adding the arity later is a
+registration rather than a decision — and doing it here would widen a cut that
+already introduces a vocabulary.
 
 Compiling at bind time means a pattern's cost is paid once per statement rather
 than once per row, which is the intended trade. It also means a pattern cannot be

@@ -1028,6 +1028,25 @@ impl BoundExprProgram {
 					}
 					ScalarFunctionParameter::CurrentDate { days } => format!("<{days}>"),
 					ScalarFunctionParameter::ToTimestamp { zone } => format!("<{zone}>"),
+					ScalarFunctionParameter::TemporalFormat { pattern, zone } => {
+						let spelled = pattern
+							.pieces
+							.iter()
+							.map(|piece| match piece {
+								crate::ir::TemporalFormatPiece::Token(token) => {
+									token.spelling().to_string()
+								}
+								crate::ir::TemporalFormatPiece::Literal(text) => {
+									format!("{text:?}")
+								}
+							})
+							.collect::<Vec<_>>()
+							.join("");
+						match zone {
+							Some(zone) => format!("<{spelled}@{zone}>"),
+							None => format!("<{spelled}>"),
+						}
+					}
 				},
 				args.iter()
 					.map(|arg| self.pretty_node(*arg))
