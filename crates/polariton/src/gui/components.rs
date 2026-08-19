@@ -655,6 +655,26 @@ mod tests {
 		assert!(failed_close.contains(&"session:close-without-checkpoint".to_owned()));
 	}
 
+	/// PRODUCT-0134 stage 0 census: before the saved-profile surface exists,
+	/// the Connect menu offers exactly one action.
+	#[test]
+	fn product_0134_census_connect_menu_offers_only_new() {
+		let roots = build_menu_roots(false, false);
+		let connect = roots
+			.iter()
+			.find(|root| root.id == "connect")
+			.expect("Connect menu exists");
+		let ids: Vec<&str> = connect
+			.items
+			.iter()
+			.filter_map(|item| match item {
+				MenuItem::Action { id, .. } => Some(id.as_str()),
+				MenuItem::Submenu { .. } | MenuItem::Separator => None,
+			})
+			.collect();
+		assert_eq!(ids, ["connect:new"]);
+	}
+
 	#[test]
 	fn product_0075_plot_menu_retains_only_the_three_export_actions() {
 		fn collect(items: &[MenuItem], ids: &mut Vec<String>) {
