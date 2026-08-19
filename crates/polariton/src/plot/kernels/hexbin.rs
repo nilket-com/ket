@@ -99,7 +99,11 @@ impl PlotKernel for HexbinPlotKernel {
 		})
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position()
 			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
 		{
@@ -119,10 +123,38 @@ impl PlotKernel for HexbinPlotKernel {
 				r = -q - s;
 			}
 			if let Some(&count) = self.prepared_data.bins.get(&(q as i32, r as i32)) {
-				return Some(format!(
-					"Bin: ({}, {})\nCount: {}\nPos: ({:.2}, {:.2})",
-					q, r, count, x, y
-				));
+				return Some(
+					crate::plot::common::PlotHit::new(
+						crate::plot::common::MarkFamily::HEXBIN,
+						crate::plot::common::HitDimensionality::Area,
+						count as usize,
+					)
+					.labeled(
+						"Q",
+						crate::plot::spec::SemanticType::Ordinal,
+						crate::plot::common::HitValue::ordinal(q.to_string()),
+					)
+					.labeled(
+						"R",
+						crate::plot::spec::SemanticType::Ordinal,
+						crate::plot::common::HitValue::ordinal(r.to_string()),
+					)
+					.labeled(
+						"Count",
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::HitValue::Count(count as usize),
+					)
+					.labeled(
+						"X",
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::HitValue::quantitative(x, format!("{x:.2}")),
+					)
+					.labeled(
+						"Y",
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::HitValue::quantitative(y, format!("{y:.2}")),
+					),
+				);
 			}
 		}
 		None

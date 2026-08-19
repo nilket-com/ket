@@ -232,7 +232,11 @@ impl PlotKernel for FunnelPlotKernel {
 		)
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position() {
 			let cursor_pos = Pt::<Widget>::from_plot_kernel_cursor(cursor_pos);
 			let (bounds, cursor_pos) = transform.widget_hit_geometry(cursor_pos);
@@ -270,10 +274,23 @@ impl PlotKernel for FunnelPlotKernel {
 			let left_x = center_x - current_width_at_y / 2.0;
 			let right_x = center_x + current_width_at_y / 2.0;
 			if cursor_pos.x() >= left_x && cursor_pos.x() <= right_x {
-				let mut hover_text = format!(
-					"{}: {}",
-					stage.stage(),
-					format_label(val, &AxisType::Linear)
+				let mut hit = crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::FUNNEL,
+					crate::plot::common::HitDimensionality::Area,
+					stage_idx,
+				)
+				.labeled(
+					"Stage",
+					crate::plot::spec::SemanticType::Nominal,
+					crate::plot::common::HitValue::nominal(stage.stage()),
+				)
+				.labeled(
+					"Value",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						val,
+						format_label(val, &AxisType::Linear),
+					),
 				);
 				if stage_idx > 0 {
 					let prev_val = self
@@ -283,15 +300,32 @@ impl PlotKernel for FunnelPlotKernel {
 						.expect("previous hover stage is in bounds")
 						.value();
 					if prev_val == 0.0 {
-						hover_text.push_str("\nConversion: —");
+						hit = hit.labeled(
+							"Conversion",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::nominal("—"),
+						);
 					} else {
 						let conversion = (val / prev_val) * 100.0;
-						hover_text.push_str(&format!("\nConversion: {:.1}%", conversion));
+						hit = hit.labeled(
+							"Conversion",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::percentage(
+								conversion,
+								format!("{conversion:.1}%"),
+							),
+						);
 					}
 				}
 				let total_conversion = (val / first_value) * 100.0;
-				hover_text.push_str(&format!("\nTotal Rate: {:.1}%", total_conversion));
-				return Some(hover_text);
+				return Some(hit.labeled(
+					"Total Rate",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::percentage(
+						total_conversion,
+						format!("{total_conversion:.1}%"),
+					),
+				));
 			}
 		}
 		None

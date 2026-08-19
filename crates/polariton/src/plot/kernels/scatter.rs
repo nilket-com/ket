@@ -130,15 +130,39 @@ impl PlotKernel for ScatterPlotKernel {
 		)
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position()
 			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
 		{
-			return Some(format!(
-				"X: {}, Y: {}",
-				format_label(x, &self.prepared_data.x_axis_type),
-				format_label(y, &self.prepared_data.y_axis_type)
-			));
+			return Some(
+				crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::SCATTER,
+					crate::plot::common::HitDimensionality::Point,
+					0,
+				)
+				.labeled(
+					"X",
+					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+					crate::plot::common::axis_hit_value(
+						x,
+						&self.prepared_data.x_axis_type,
+						format_label(x, &self.prepared_data.x_axis_type),
+					),
+				)
+				.labeled(
+					"Y",
+					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.y_axis_type),
+					crate::plot::common::axis_hit_value(
+						y,
+						&self.prepared_data.y_axis_type,
+						format_label(y, &self.prepared_data.y_axis_type),
+					),
+				),
+			);
 		}
 		None
 	}

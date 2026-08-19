@@ -149,12 +149,12 @@ impl BarPlotKernel {
 		bars
 	}
 
-	fn hover_resolved(
+	fn hit_resolved(
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 		settings: &ResolvedPlotSettings,
-	) -> Option<String> {
+	) -> Option<crate::plot::common::PlotHit> {
 		let cursor_pos = cursor.position()?;
 		let hit = self
 			.bar_rectangles(
@@ -177,10 +177,31 @@ impl BarPlotKernel {
 			}
 			_ => return None,
 		};
-		Some(format!(
-			"{}: {} (Value: ~{:.2})",
-			category, group, approximate_value
-		))
+		Some(
+			crate::plot::common::PlotHit::new(
+				crate::plot::common::MarkFamily::BAR,
+				crate::plot::common::HitDimensionality::Area,
+				hit.category_index * self.prepared_data.group_names.len() + hit.group_index,
+			)
+			.labeled(
+				"Category",
+				crate::plot::spec::SemanticType::Nominal,
+				crate::plot::common::HitValue::nominal(category),
+			)
+			.labeled(
+				"Group",
+				crate::plot::spec::SemanticType::Nominal,
+				crate::plot::common::HitValue::nominal(group),
+			)
+			.labeled(
+				"Value",
+				crate::plot::spec::SemanticType::Quantitative,
+				crate::plot::common::HitValue::quantitative(
+					approximate_value,
+					format!("~{approximate_value:.2}"),
+				),
+			),
+		)
 	}
 }
 
@@ -263,17 +284,21 @@ impl PlotKernel for BarPlotKernel {
 		);
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		self.hover_resolved(transform, cursor, &ResolvedPlotSettings::default())
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
+		self.hit_resolved(transform, cursor, &ResolvedPlotSettings::default())
 	}
 
-	fn hover_with_settings(
+	fn hit_with_settings(
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 		settings: &PlotSettings,
-	) -> Option<String> {
-		self.hover_resolved(
+	) -> Option<crate::plot::common::PlotHit> {
+		self.hit_resolved(
 			transform,
 			cursor,
 			&settings.resolve_for_layer(&self.layer_settings),
@@ -702,7 +727,7 @@ mod tests {
 			let visible = rectangles[0].rect.center();
 			assert!(
 				kernel
-					.hover_resolved(&transform, Cursor::Available(visible), &settings)
+					.hit_resolved(&transform, Cursor::Available(visible), &settings)
 					.is_some()
 			);
 			let reserve = match orientation {
@@ -710,7 +735,7 @@ mod tests {
 				Orientation::Horizontal => Point::new(visible.x, 51.0),
 			};
 			assert_eq!(
-				kernel.hover_resolved(&transform, Cursor::Available(reserve), &settings),
+				kernel.hit_resolved(&transform, Cursor::Available(reserve), &settings),
 				None
 			);
 		}
@@ -762,8 +787,9 @@ mod tests {
 				assert_close(bar.rect.width, value as f32 * 10.0);
 				assert!(
 					kernel
-						.hover_resolved(&transform, Cursor::Available(bar.rect.center()), &settings)
+						.hit_resolved(&transform, Cursor::Available(bar.rect.center()), &settings)
 						.unwrap()
+						.legacy_presentation()
 						.starts_with(&format!("{category}: {group}"))
 				);
 				(category.as_str(), group.as_str(), value, color)

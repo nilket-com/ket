@@ -469,6 +469,7 @@ pub struct PlotGridKernel {
 	cells: NonEmpty<PreparedGridCell>,
 	arrangement: GridArrangement,
 	figure_grid: FigureGridLayoutSettings,
+	partition_field: Option<String>,
 }
 
 impl PlotGridKernel {
@@ -520,6 +521,7 @@ impl PlotGridKernel {
 			&DataFrame,
 		) -> Result<Arc<dyn PlotKernel + Send + Sync>, String>,
 	) -> Result<Self, String> {
+		let partition_field = grid.partition_field.clone();
 		let (first, rest) = grid.cells.into_parts();
 		let mut prepare = |cell: GridCell| -> Result<PreparedGridCell, String> {
 			let kernel = factory(&cell.body, &cell.data)?;
@@ -533,6 +535,7 @@ impl PlotGridKernel {
 			cells,
 			arrangement: grid.arrangement,
 			figure_grid,
+			partition_field,
 		})
 	}
 
@@ -608,7 +611,11 @@ impl PlotKernel for PlotGridKernel {
 		// PlotWidget dispatches the composite seam instead of this ordinary path.
 	}
 
-	fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		_transform: &CoordinateTransformer,
+		_cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		None
 	}
 
@@ -919,14 +926,14 @@ impl PlotComposite for PlotGridKernel {
 		}
 	}
 
-	fn hover(
+	fn hit(
 		&self,
 		bounds: Rect<Widget>,
 		padding: f32,
 		title: &str,
 		cursor: Pt<Widget>,
 		settings: &PlotSettings,
-	) -> Option<String> {
+	) -> Option<crate::plot::common::PlotHit> {
 		let resolved = settings.resolve();
 		let figure_legend = crate::plot::legend::union(
 			self.cells
@@ -959,11 +966,18 @@ impl PlotComposite for PlotGridKernel {
 			}
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved);
 			let transform = CoordinateTransformer::new(layout, inner.into_iced());
-			return cell.kernel.hover_with_settings(
+			let hit = cell.kernel.hit_with_settings(
 				&transform,
 				Cursor::Available(cursor.into_iced()),
 				settings,
 			);
+			return hit.map(|hit| match (&self.partition_field, &cell.cell.label) {
+				(Some(field), Some(value)) => hit.with_facet(crate::plot::common::HitFacet {
+					field: field.clone(),
+					value: value.clone(),
+				}),
+				_ => hit,
+			});
 		}
 		None
 	}
@@ -1261,7 +1275,7 @@ mod tests {
 	use super::*;
 	use crate::coordinate::Window;
 	use crate::plot::common::{
-		AxisType, PathBuilder, PlotBackend, PlotRenderLayer, PlotWidget, TickPlacement,
+		AxisType, HitFacet, PathBuilder, PlotBackend, PlotRenderLayer, PlotWidget, TickPlacement,
 	};
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
@@ -1483,7 +1497,11 @@ mod tests {
 		) {
 		}
 
-		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+		fn hit(
+			&self,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+		) -> Option<crate::plot::common::PlotHit> {
 			None
 		}
 	}
@@ -1515,7 +1533,11 @@ mod tests {
 			backend.fill_rectangle(Point::new(10.0, 10.0), Size::new(20.0, 20.0), self.mark);
 		}
 
-		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+		fn hit(
+			&self,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+		) -> Option<crate::plot::common::PlotHit> {
 			None
 		}
 	}
@@ -1921,7 +1943,11 @@ mod tests {
 			Some(self.content.clone())
 		}
 
-		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+		fn hit(
+			&self,
+			_transform: &CoordinateTransformer,
+			_cursor: Cursor,
+		) -> Option<crate::plot::common::PlotHit> {
 			None
 		}
 
@@ -4849,6 +4875,22 @@ mod tests {
 		assert!(
 			hover.is_some(),
 			"a widget-local cursor over cell A's line must hit regardless of panel origin"
+		);
+		let hit = PlotComposite::hit(
+			&kernel,
+			Rect::<Widget>::from_iced_frame(panel),
+			0.0,
+			"",
+			widget_point(cursor),
+			&model,
+		)
+		.expect("structured hit for cell A");
+		assert_eq!(
+			hit.facet,
+			Some(HitFacet {
+				field: "facet".to_owned(),
+				value: "A".to_owned(),
+			})
 		);
 		// Cell kernels keep their legacy hover semantics (x-nearest for a
 		// line), so the composite's own miss case is a cursor outside every

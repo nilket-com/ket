@@ -104,7 +104,11 @@ impl PlotKernel for CandlestickPlotKernel {
 		}
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position()
 			&& let Some((x, _y)) = transform.pixel_to_cartesian(cursor_pos)
 		{
@@ -132,14 +136,54 @@ impl PlotKernel for CandlestickPlotKernel {
 			if dist_px > 10.0 {
 				return None;
 			}
-			return Some(format!(
-				"X: {}\nOpen: {:.2}\nHigh: {:.2}\nLow: {:.2}\nClose: {:.2}",
-				format_label(xs[idx], &self.prepared_data.x_axis_type),
-				self.prepared_data.open[idx],
-				self.prepared_data.high[idx],
-				self.prepared_data.low[idx],
-				self.prepared_data.close[idx]
-			));
+			return Some(
+				crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::CANDLESTICK,
+					crate::plot::common::HitDimensionality::Area,
+					idx,
+				)
+				.labeled(
+					"X",
+					crate::plot::spec::SemanticType::Temporal,
+					crate::plot::common::axis_hit_value(
+						xs[idx],
+						&self.prepared_data.x_axis_type,
+						format_label(xs[idx], &self.prepared_data.x_axis_type),
+					),
+				)
+				.labeled(
+					"Open",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						self.prepared_data.open[idx],
+						format!("{:.2}", self.prepared_data.open[idx]),
+					),
+				)
+				.labeled(
+					"High",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						self.prepared_data.high[idx],
+						format!("{:.2}", self.prepared_data.high[idx]),
+					),
+				)
+				.labeled(
+					"Low",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						self.prepared_data.low[idx],
+						format!("{:.2}", self.prepared_data.low[idx]),
+					),
+				)
+				.labeled(
+					"Close",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						self.prepared_data.close[idx],
+						format!("{:.2}", self.prepared_data.close[idx]),
+					),
+				),
+			);
 		}
 		None
 	}

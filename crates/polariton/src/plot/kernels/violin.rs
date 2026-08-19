@@ -189,13 +189,36 @@ impl PlotKernel for ViolinPlotKernel {
 		)
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		let cursor = cursor.position()?;
 		for curve in self.prepared_data.curves() {
 			let index = transform.category_index(curve.label())?;
 			let (center, band_width) = transform.categorical(index, 0.0);
 			if cursor.x >= center.x - band_width / 2.0 && cursor.x <= center.x + band_width / 2.0 {
-				return Some(format!("{}: Median {:.2}", curve.label(), curve.median()));
+				return Some(
+					crate::plot::common::PlotHit::new(
+						crate::plot::common::MarkFamily::VIOLIN,
+						crate::plot::common::HitDimensionality::Area,
+						index,
+					)
+					.labeled(
+						"Category",
+						crate::plot::spec::SemanticType::Nominal,
+						crate::plot::common::HitValue::nominal(curve.label()),
+					)
+					.labeled(
+						"Median",
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::HitValue::quantitative(
+							curve.median(),
+							format!("{:.2}", curve.median()),
+						),
+					),
+				);
 			}
 		}
 		None

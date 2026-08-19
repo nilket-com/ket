@@ -171,7 +171,11 @@ impl PlotKernel for BubblePlotKernel {
 		Some(content)
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position() {
 			let size_min = self.prepared_data.observations.size_range().0;
 			let size_max = self.prepared_data.observations.size_range().1;
@@ -204,7 +208,53 @@ impl PlotKernel for BubblePlotKernel {
 						self.prepared_data.color_label,
 						point.color()
 					));
-					return Some(lines.join("\n"));
+					let mut hit = crate::plot::common::PlotHit::new(
+						crate::plot::common::MarkFamily::BUBBLE,
+						crate::plot::common::HitDimensionality::Point,
+						0,
+					);
+					if let Some(label) = point.label() {
+						hit = hit.labeled(
+							"Label",
+							crate::plot::spec::SemanticType::Nominal,
+							crate::plot::common::HitValue::nominal(label),
+						);
+					}
+					return Some(
+						hit.labeled(
+							"X",
+							crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+							crate::plot::common::axis_hit_value(
+								point.x(),
+								&self.prepared_data.x_axis_type,
+								format_label(point.x(), &self.prepared_data.x_axis_type),
+							),
+						)
+						.labeled(
+							"Y",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::quantitative(
+								point.y(),
+								format!("{:.2}", point.y()),
+							),
+						)
+						.labeled(
+							"Size",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::quantitative(
+								point.size(),
+								format!("{:.2}", point.size()),
+							),
+						)
+						.labeled(
+							"Color",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::quantitative(
+								point.color(),
+								format!("{:.2}", point.color()),
+							),
+						),
+					);
 				}
 			}
 		}

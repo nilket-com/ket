@@ -137,7 +137,11 @@ impl PlotKernel for StackedAreaPlotKernel {
 		}
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position()
 			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
 		{
@@ -172,32 +176,93 @@ impl PlotKernel for StackedAreaPlotKernel {
 				let lower = self.normalization.project(current_stack_value, total);
 				let upper = self.normalization.project(next_stack_value, total);
 				if val > 0.0 && y >= lower && y <= upper {
+					let result = crate::plot::common::PlotHit::new(
+						crate::plot::common::MarkFamily::STACKED_AREA,
+						crate::plot::common::HitDimensionality::Area,
+						idx,
+					)
+					.labeled(
+						"X",
+						crate::plot::common::axis_hit_semantic_type(
+							&self.prepared_data.x_axis_type,
+						),
+						crate::plot::common::axis_hit_value(
+							actual_x,
+							&self.prepared_data.x_axis_type,
+							format_label(actual_x, &self.prepared_data.x_axis_type),
+						),
+					)
+					.labeled(
+						&self.prepared_data.categories[j],
+						crate::plot::spec::SemanticType::Nominal,
+						crate::plot::common::HitValue::quantitative(val, format!("{val:.2}")),
+					)
+					.labeled(
+						"Total",
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::HitValue::quantitative(
+							match self.normalization {
+								StackNormalization::Absolute => next_stack_value,
+								StackNormalization::Percent => total,
+							},
+							format!(
+								"{:.2}",
+								match self.normalization {
+									StackNormalization::Absolute => next_stack_value,
+									StackNormalization::Percent => total,
+								}
+							),
+						),
+					);
 					return match self.normalization {
-						StackNormalization::Absolute => Some(format!(
-							"X: {}\n{}: {:.2}\nTotal: {:.2}",
-							format_label(actual_x, &self.prepared_data.x_axis_type),
-							self.prepared_data.categories[j],
-							val,
-							next_stack_value
-						)),
-						StackNormalization::Percent => Some(format!(
-							"X: {}\n{}: {:.2}\nShare: {:.1}%\nCumulative: {:.1}%\nTotal: {:.2}",
-							format_label(actual_x, &self.prepared_data.x_axis_type),
-							self.prepared_data.categories[j],
-							val,
-							self.normalization.project(val, total),
-							upper,
-							total
-						)),
+						StackNormalization::Absolute => Some(result),
+						StackNormalization::Percent => Some(
+							result
+								.labeled(
+									"Share",
+									crate::plot::spec::SemanticType::Quantitative,
+									crate::plot::common::HitValue::percentage(
+										self.normalization.project(val, total),
+										format!("{:.1}%", self.normalization.project(val, total)),
+									),
+								)
+								.labeled(
+									"Cumulative",
+									crate::plot::spec::SemanticType::Quantitative,
+									crate::plot::common::HitValue::percentage(
+										upper,
+										format!("{upper:.1}%"),
+									),
+								),
+						),
 					};
 				}
 				current_stack_value = next_stack_value;
 			}
-			return Some(format!(
-				"X: {}, Total Sum: {:.2}",
-				format_label(actual_x, &self.prepared_data.x_axis_type),
-				current_stack_value
-			));
+			return Some(
+				crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::STACKED_AREA,
+					crate::plot::common::HitDimensionality::Area,
+					idx,
+				)
+				.labeled(
+					"X",
+					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+					crate::plot::common::axis_hit_value(
+						actual_x,
+						&self.prepared_data.x_axis_type,
+						format_label(actual_x, &self.prepared_data.x_axis_type),
+					),
+				)
+				.labeled(
+					"Total Sum",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						current_stack_value,
+						format!("{current_stack_value:.2}"),
+					),
+				),
+			);
 		}
 		None
 	}

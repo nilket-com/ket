@@ -174,16 +174,36 @@ impl PlotKernel for BoxPlotKernel {
 		}
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position()
 			&& let PlotLayout::CategoricalX { categories, .. } = transform.layout
 		{
 			if let Some(hit) = self.hit_outlier(transform, cursor_pos) {
-				return Some(format!(
-					"{}\nOutlier: {}",
-					hit.category,
-					format_label(hit.value, &self.prepared_data.y_axis_type)
-				));
+				return Some(
+					crate::plot::common::PlotHit::new(
+						crate::plot::common::MarkFamily::BOXPLOT,
+						crate::plot::common::HitDimensionality::Point,
+						0,
+					)
+					.labeled(
+						"Category",
+						crate::plot::spec::SemanticType::Nominal,
+						crate::plot::common::HitValue::nominal(hit.category),
+					)
+					.labeled(
+						"Outlier",
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::axis_hit_value(
+							hit.value,
+							&self.prepared_data.y_axis_type,
+							format_label(hit.value, &self.prepared_data.y_axis_type),
+						),
+					),
+				);
 			}
 			for (category, stats) in self.prepared_data.boxes.iter() {
 				let Some(shared_index) = categories
@@ -203,15 +223,63 @@ impl PlotKernel for BoxPlotKernel {
 						.y;
 					if cursor_pos.y >= low.min(high) && cursor_pos.y <= low.max(high) {
 						let yt = self.prepared_data.y_axis_type.clone();
-						return Some(format!(
-							"{}\nWhisker high: {}\nQ3: {}\nMedian: {}\nQ1: {}\nWhisker low: {}",
-							category,
-							format_label(stats.whisker_high(), &yt),
-							format_label(stats.q3(), &yt),
-							format_label(stats.median(), &yt),
-							format_label(stats.q1(), &yt),
-							format_label(stats.whisker_low(), &yt)
-						));
+						return Some(
+							crate::plot::common::PlotHit::new(
+								crate::plot::common::MarkFamily::BOXPLOT,
+								crate::plot::common::HitDimensionality::Area,
+								shared_index,
+							)
+							.labeled(
+								"Category",
+								crate::plot::spec::SemanticType::Nominal,
+								crate::plot::common::HitValue::nominal(category),
+							)
+							.labeled(
+								"Whisker high",
+								crate::plot::spec::SemanticType::Quantitative,
+								crate::plot::common::axis_hit_value(
+									stats.whisker_high(),
+									&yt,
+									format_label(stats.whisker_high(), &yt),
+								),
+							)
+							.labeled(
+								"Q3",
+								crate::plot::spec::SemanticType::Quantitative,
+								crate::plot::common::axis_hit_value(
+									stats.q3(),
+									&yt,
+									format_label(stats.q3(), &yt),
+								),
+							)
+							.labeled(
+								"Median",
+								crate::plot::spec::SemanticType::Quantitative,
+								crate::plot::common::axis_hit_value(
+									stats.median(),
+									&yt,
+									format_label(stats.median(), &yt),
+								),
+							)
+							.labeled(
+								"Q1",
+								crate::plot::spec::SemanticType::Quantitative,
+								crate::plot::common::axis_hit_value(
+									stats.q1(),
+									&yt,
+									format_label(stats.q1(), &yt),
+								),
+							)
+							.labeled(
+								"Whisker low",
+								crate::plot::spec::SemanticType::Quantitative,
+								crate::plot::common::axis_hit_value(
+									stats.whisker_low(),
+									&yt,
+									format_label(stats.whisker_low(), &yt),
+								),
+							),
+						);
 					}
 				}
 			}

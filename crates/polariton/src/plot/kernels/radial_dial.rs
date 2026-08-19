@@ -127,7 +127,11 @@ impl PlotKernel for RadialDialPlotKernel {
 		)
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position() {
 			let cursor_pos = Pt::<Widget>::from_plot_kernel_cursor(cursor_pos);
 			let (bounds, cursor_pos) = transform.widget_hit_geometry(cursor_pos);
@@ -162,13 +166,39 @@ impl PlotKernel for RadialDialPlotKernel {
 					let cat = reading.category().unwrap_or("All Data");
 					let val = reading.value();
 					let max_val = reading.maximum();
-					return Some(format!(
-						"{}: {:.1} / {:.1} ({:.0}%)",
-						cat,
-						val,
-						max_val,
-						(val / max_val * 100.0)
-					));
+					return Some(
+						crate::plot::common::PlotHit::new(
+							crate::plot::common::MarkFamily::RADIAL_DIAL,
+							crate::plot::common::HitDimensionality::Point,
+							i,
+						)
+						.labeled(
+							"Category",
+							crate::plot::spec::SemanticType::Nominal,
+							crate::plot::common::HitValue::nominal(cat),
+						)
+						.labeled(
+							"Value",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::quantitative(val, format!("{val:.1}")),
+						)
+						.labeled(
+							"Maximum",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::quantitative(
+								max_val,
+								format!("{max_val:.1}"),
+							),
+						)
+						.labeled(
+							"Share",
+							crate::plot::spec::SemanticType::Quantitative,
+							crate::plot::common::HitValue::percentage(
+								val / max_val * 100.0,
+								format!("{:.0}%", val / max_val * 100.0),
+							),
+						),
+					);
 				}
 			}
 		}

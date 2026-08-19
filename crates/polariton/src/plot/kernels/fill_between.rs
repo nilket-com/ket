@@ -85,7 +85,11 @@ impl PlotKernel for FillBetweenPlotKernel {
 		);
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position()
 			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
 		{
@@ -107,14 +111,50 @@ impl PlotKernel for FillBetweenPlotKernel {
 					}
 				}
 			};
-			return Some(format!(
-				"X: {}\nMid: {:.2}\nRange: [{:.2}, {:.2}]\nCursor Y: {:.2}",
-				format_label(xs[idx], &self.prepared_data.x_axis_type),
-				self.prepared_data.y_mid[idx],
-				self.prepared_data.y_lower[idx],
-				self.prepared_data.y_upper[idx],
-				y
-			));
+			return Some(
+				crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::FILL_BETWEEN,
+					crate::plot::common::HitDimensionality::Area,
+					idx,
+				)
+				.labeled(
+					"X",
+					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+					crate::plot::common::axis_hit_value(
+						xs[idx],
+						&self.prepared_data.x_axis_type,
+						format_label(xs[idx], &self.prepared_data.x_axis_type),
+					),
+				)
+				.labeled(
+					"Mid",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(
+						self.prepared_data.y_mid[idx],
+						format!("{:.2}", self.prepared_data.y_mid[idx]),
+					),
+				)
+				.labeled(
+					"Range",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::Interval {
+						start: Box::new(crate::plot::common::HitValue::quantitative(
+							self.prepared_data.y_lower[idx],
+							format!("{:.2}", self.prepared_data.y_lower[idx]),
+						)),
+						end: Box::new(crate::plot::common::HitValue::quantitative(
+							self.prepared_data.y_upper[idx],
+							format!("{:.2}", self.prepared_data.y_upper[idx]),
+						)),
+						end_inclusive: true,
+					},
+				)
+				.labeled(
+					"Cursor Y",
+					crate::plot::spec::SemanticType::Quantitative,
+					crate::plot::common::HitValue::quantitative(y, format!("{y:.2}")),
+				),
+			);
 		}
 		None
 	}

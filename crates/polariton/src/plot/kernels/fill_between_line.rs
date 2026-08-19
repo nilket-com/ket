@@ -82,8 +82,12 @@ impl PlotKernel for FillBetweenLinePlotKernel {
 		self.line.plot(backend, bounds, transform, cursor, settings);
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		self.fill_between.hover(transform, cursor)
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
+		self.fill_between.hit(transform, cursor)
 	}
 
 	fn x_label(&self) -> String {

@@ -55,6 +55,20 @@ impl LayerRenderer {
 		}
 	}
 
+	fn mark_family(&self) -> crate::plot::common::MarkFamily {
+		match self {
+			Self::Line(_, _) => crate::plot::common::MarkFamily::LINE,
+			Self::Scatter(_, _) => crate::plot::common::MarkFamily::SCATTER,
+		}
+	}
+
+	fn dimensionality(&self) -> crate::plot::common::HitDimensionality {
+		match self {
+			Self::Line(_, _) => crate::plot::common::HitDimensionality::Line,
+			Self::Scatter(_, _) => crate::plot::common::HitDimensionality::Point,
+		}
+	}
+
 	fn draw(
 		&self,
 		backend: &mut dyn PlotBackend,
@@ -211,25 +225,50 @@ impl PlotKernel for LayeredPlotKernel {
 
 	/// PRODUCT-0013 bridge: topmost painted geometric hit wins, and this
 	/// composite supplies the existing coordinate wording.
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		self.hover_with_settings(transform, cursor, &PlotSettings::default())
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
+		self.hit_with_settings(transform, cursor, &PlotSettings::default())
 	}
 
-	fn hover_with_settings(
+	fn hit_with_settings(
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 		settings: &PlotSettings,
-	) -> Option<String> {
+	) -> Option<crate::plot::common::PlotHit> {
 		let layers = self.layers.iter().collect::<Vec<_>>();
-		for layer in layers.into_iter().rev() {
+		for (paint_order, layer) in layers.into_iter().enumerate().rev() {
 			let resolved = settings.resolve_for_layer(layer.settings());
 			if let Some(hit) = layer.hit_test(transform, cursor, &resolved) {
-				return Some(format!(
-					"X: {}, Y: {}",
-					format_label(hit.data_x, &self.x_axis_type),
-					format_label(hit.data_y, &self.y_axis_type)
-				));
+				return Some(
+					crate::plot::common::PlotHit::new(
+						layer.mark_family(),
+						layer.dimensionality(),
+						hit.mark_index,
+					)
+					.with_paint_order(paint_order)
+					.labeled(
+						"X",
+						crate::plot::common::axis_hit_semantic_type(&self.x_axis_type),
+						crate::plot::common::axis_hit_value(
+							hit.data_x,
+							&self.x_axis_type,
+							format_label(hit.data_x, &self.x_axis_type),
+						),
+					)
+					.labeled(
+						"Y",
+						crate::plot::common::axis_hit_semantic_type(&self.y_axis_type),
+						crate::plot::common::axis_hit_value(
+							hit.data_y,
+							&self.y_axis_type,
+							format_label(hit.data_y, &self.y_axis_type),
+						),
+					),
+				);
 			}
 		}
 		None

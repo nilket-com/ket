@@ -224,7 +224,11 @@ impl PlotKernel for RadarPlotKernel {
 		)
 	}
 
-	fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		_transform: &CoordinateTransformer,
+		_cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		None
 	}
 }

@@ -129,12 +129,12 @@ impl StackedBarPlotKernel {
 		bars
 	}
 
-	fn hover_resolved(
+	fn hit_resolved(
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 		settings: &ResolvedPlotSettings,
-	) -> Option<String> {
+	) -> Option<crate::plot::common::PlotHit> {
 		let cursor = cursor.position()?;
 		let hit = self
 			.stacked_rectangles(
@@ -144,23 +144,71 @@ impl StackedBarPlotKernel {
 			)
 			.into_iter()
 			.find(|bar| bar.rect.contains(cursor))?;
+		let result = crate::plot::common::PlotHit::new(
+			crate::plot::common::MarkFamily::STACKED_BAR,
+			crate::plot::common::HitDimensionality::Area,
+			hit.category_index * self.prepared_data.group_names.len() + hit.group_index,
+		)
+		.labeled(
+			"Category",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(
+				&self.prepared_data.categories[hit.category_index],
+			),
+		)
+		.labeled(
+			"Group",
+			crate::plot::spec::SemanticType::Nominal,
+			crate::plot::common::HitValue::nominal(
+				&self.prepared_data.group_names[hit.group_index],
+			),
+		)
+		.labeled(
+			"Value",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(hit.value, format!("{:.2}", hit.value)),
+		)
+		.labeled(
+			"Total",
+			crate::plot::spec::SemanticType::Quantitative,
+			crate::plot::common::HitValue::quantitative(
+				match self.normalization {
+					StackNormalization::Absolute => hit.running_total,
+					StackNormalization::Percent => hit.total,
+				},
+				format!(
+					"{:.2}",
+					match self.normalization {
+						StackNormalization::Absolute => hit.running_total,
+						StackNormalization::Percent => hit.total,
+					}
+				),
+			),
+		);
 		match self.normalization {
-			StackNormalization::Absolute => Some(format!(
-				"{}: {} (Value: {:.2}, Total: {:.2})",
-				self.prepared_data.categories[hit.category_index],
-				self.prepared_data.group_names[hit.group_index],
-				hit.value,
-				hit.running_total,
-			)),
-			StackNormalization::Percent => Some(format!(
-				"{}: {} (Value: {:.2}, Share: {:.1}%, Cumulative: {:.1}%, Total: {:.2})",
-				self.prepared_data.categories[hit.category_index],
-				self.prepared_data.group_names[hit.group_index],
-				hit.value,
-				self.normalization.project(hit.value, hit.total),
-				self.normalization.project(hit.running_total, hit.total),
-				hit.total,
-			)),
+			StackNormalization::Absolute => Some(result),
+			StackNormalization::Percent => Some(
+				result
+					.labeled(
+						"Share",
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::HitValue::percentage(
+							self.normalization.project(hit.value, hit.total),
+							format!("{:.1}%", self.normalization.project(hit.value, hit.total)),
+						),
+					)
+					.labeled(
+						"Cumulative",
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::HitValue::percentage(
+							self.normalization.project(hit.running_total, hit.total),
+							format!(
+								"{:.1}%",
+								self.normalization.project(hit.running_total, hit.total)
+							),
+						),
+					),
+			),
 		}
 	}
 }
@@ -258,17 +306,21 @@ impl PlotKernel for StackedBarPlotKernel {
 		);
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		self.hover_resolved(transform, cursor, &ResolvedPlotSettings::default())
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
+		self.hit_resolved(transform, cursor, &ResolvedPlotSettings::default())
 	}
 
-	fn hover_with_settings(
+	fn hit_with_settings(
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 		settings: &PlotSettings,
-	) -> Option<String> {
-		self.hover_resolved(
+	) -> Option<crate::plot::common::PlotHit> {
+		self.hit_resolved(
 			transform,
 			cursor,
 			&settings.resolve_for_layer(&self.layer_settings),
@@ -854,7 +906,8 @@ mod tests {
 			assert!(visible.rect.contains(data_point));
 			assert_eq!(
 				kernel
-					.hover_resolved(&transform, Cursor::Available(data_point), &settings)
+					.hit_resolved(&transform, Cursor::Available(data_point), &settings)
+					.map(|hit| hit.legacy_presentation())
 					.as_deref(),
 				Some("A: second (Value: 30.00, Total: 40.00)"),
 				"paint and hover agree inside the visible portion of a clipped stack"

@@ -71,7 +71,11 @@ impl PlotKernel for HeatmapPlotKernel {
 		}
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position() {
 			let num_x = self.prepared_data.cells.x_categories().len();
 			let num_y = self.prepared_data.cells.y_categories().len();
@@ -90,7 +94,31 @@ impl PlotKernel for HeatmapPlotKernel {
 					if rect.contains(cursor_pos) {
 						let x_cat = &self.prepared_data.cells.x_categories()[i];
 						let y_cat = &self.prepared_data.cells.y_categories()[j];
-						return Some(format!("X: {}\nY: {}\nValue: {:.2}", x_cat, y_cat, value));
+						return Some(
+							crate::plot::common::PlotHit::new(
+								crate::plot::common::MarkFamily::HEATMAP,
+								crate::plot::common::HitDimensionality::Area,
+								i * num_y + j,
+							)
+							.labeled(
+								"X",
+								crate::plot::spec::SemanticType::Nominal,
+								crate::plot::common::HitValue::nominal(x_cat),
+							)
+							.labeled(
+								"Y",
+								crate::plot::spec::SemanticType::Nominal,
+								crate::plot::common::HitValue::nominal(y_cat),
+							)
+							.labeled(
+								"Value",
+								crate::plot::spec::SemanticType::Quantitative,
+								crate::plot::common::HitValue::quantitative(
+									value,
+									format!("{value:.2}"),
+								),
+							),
+						);
 					}
 				}
 			}

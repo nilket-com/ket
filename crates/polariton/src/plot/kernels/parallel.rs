@@ -115,7 +115,11 @@ impl PlotKernel for ParallelPlotKernel {
 		)
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position() {
 			let num_dims = self.prepared_data.dimensions().len();
 			if num_dims < 2 {
@@ -129,11 +133,18 @@ impl PlotKernel for ParallelPlotKernel {
 				let range = self.display_ranges()[i];
 				let y_scale = (range.1 - range.0) / transform.bounds.height as f64;
 				let val = range.1 - (cursor_pos.y - transform.bounds.y) as f64 * y_scale;
-				return Some(format!(
-					"{}: {:.2}",
-					self.prepared_data.dimensions()[i],
-					val
-				));
+				return Some(
+					crate::plot::common::PlotHit::new(
+						crate::plot::common::MarkFamily::PARALLEL,
+						crate::plot::common::HitDimensionality::Line,
+						i,
+					)
+					.labeled(
+						self.prepared_data.dimensions()[i].clone(),
+						crate::plot::spec::SemanticType::Quantitative,
+						crate::plot::common::HitValue::quantitative(val, format!("{val:.2}")),
+					),
+				);
 			}
 		}
 		None

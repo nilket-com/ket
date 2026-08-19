@@ -7,8 +7,8 @@ use crate::plot::continuous_color::ContinuousRamps;
 use crate::plot::legend::{LegendContent, legend_layout, render_legend};
 use crate::plot::spec::{
 	BarWidth, CategoryGap, FacetLabelTextSize, HoverTextSize, LegendPosition, LegendTextSize,
-	PlotPaddingPixels, PointSize, ResolvedPresence, StrokeWidth, SubtitleTextSize, TickRotation,
-	TitleTextSize, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
+	PlotPaddingPixels, PointSize, ResolvedPresence, SemanticType, StrokeWidth, SubtitleTextSize,
+	TickRotation, TitleTextSize, XLabelTextSize, XTickTextSize, YLabelTextSize, YTickTextSize,
 };
 use crate::plot::text_estimate::{estimate_ascii_label_width, estimate_formatted_label_width};
 use crate::plot::theme::PlotSettings;
@@ -1513,6 +1513,16 @@ pub trait PlotComposite: Send + Sync {
 		settings: &PlotSettings,
 	);
 
+	fn hit(
+		&self,
+		bounds: Rect<Widget>,
+		padding: f32,
+		title: &str,
+		cursor: Pt<Widget>,
+		settings: &PlotSettings,
+	) -> Option<PlotHit>;
+
+	#[cfg(test)]
 	fn hover(
 		&self,
 		bounds: Rect<Widget>,
@@ -1520,7 +1530,10 @@ pub trait PlotComposite: Send + Sync {
 		title: &str,
 		cursor: Pt<Widget>,
 		settings: &PlotSettings,
-	) -> Option<String>;
+	) -> Option<String> {
+		self.hit(bounds, padding, title, cursor, settings)
+			.map(|hit| hit.legacy_presentation())
+	}
 }
 
 pub trait PlotKernel: Send + Sync {
@@ -1560,15 +1573,32 @@ pub trait PlotKernel: Send + Sync {
 		None
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String>;
+	fn hit(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<PlotHit>;
 
-	fn hover_with_settings(
+	fn hit_with_settings(
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 		_settings: &PlotSettings,
+	) -> Option<PlotHit> {
+		self.hit(transform, cursor)
+	}
+
+	#[cfg(test)]
+	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+		self.hit(transform, cursor)
+			.map(|hit| hit.legacy_presentation())
+	}
+
+	#[cfg(test)]
+	fn hover_with_settings(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
 	) -> Option<String> {
-		self.hover(transform, cursor)
+		self.hit_with_settings(transform, cursor, settings)
+			.map(|hit| hit.legacy_presentation())
 	}
 
 	fn composite(&self) -> Option<&dyn PlotComposite> {
@@ -1585,13 +1615,399 @@ pub trait PlotKernel: Send + Sync {
 }
 
 /// Geometry returned by a mark renderer. This is deliberately not hover prose:
-/// PRODUCT-0013's temporary interaction bridge decides how a hit is presented.
+/// PRODUCT-0133's structured hit contract decides how a hit is presented.
 #[derive(Clone, Copy, Debug, PartialEq)]
 #[allow(dead_code)] // The first production caller is PRODUCT-0014.
 pub struct MarkHit {
 	pub data_x: f64,
 	pub data_y: f64,
 	pub mark_index: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HitDimensionality {
+	Point,
+	Line,
+	Area,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkFamily(&'static str);
+
+#[allow(dead_code)]
+impl MarkFamily {
+	pub const BAR: Self = Self("bar");
+	pub const BOXPLOT: Self = Self("boxplot");
+	pub const BUBBLE: Self = Self("bubble");
+	pub const CANDLESTICK: Self = Self("candlestick");
+	pub const FILL_BETWEEN: Self = Self("fill_between");
+	pub const FUNNEL: Self = Self("funnel");
+	pub const HEATMAP: Self = Self("heatmap");
+	pub const HEXBIN: Self = Self("hexbin");
+	pub const HISTOGRAM: Self = Self("histogram");
+	pub const LINE: Self = Self("line");
+	pub const PARALLEL: Self = Self("parallel");
+	pub const PIE: Self = Self("pie");
+	pub const RADAR: Self = Self("radar");
+	pub const RADIAL_DIAL: Self = Self("radial_dial");
+	pub const SCATTER: Self = Self("scatter");
+	pub const STACKED_AREA: Self = Self("stacked_area");
+	pub const STACKED_BAR: Self = Self("stacked_bar");
+	pub const VIOLIN: Self = Self("violin");
+
+	pub fn as_str(self) -> &'static str {
+		self.0
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum HitValue {
+	Nominal(String),
+	Ordinal(String),
+	Quantitative {
+		value: f64,
+		display: String,
+	},
+	Temporal {
+		value: f64,
+		display: String,
+	},
+	Count(usize),
+	Percentage {
+		value: f64,
+		display: String,
+	},
+	Interval {
+		start: Box<Self>,
+		end: Box<Self>,
+		end_inclusive: bool,
+	},
+}
+
+impl HitValue {
+	pub fn nominal(value: impl Into<String>) -> Self {
+		Self::Nominal(value.into())
+	}
+
+	pub fn ordinal(value: impl Into<String>) -> Self {
+		Self::Ordinal(value.into())
+	}
+
+	pub fn quantitative(value: f64, display: impl Into<String>) -> Self {
+		Self::Quantitative {
+			value,
+			display: display.into(),
+		}
+	}
+
+	pub fn temporal(value: f64, display: impl Into<String>) -> Self {
+		Self::Temporal {
+			value,
+			display: display.into(),
+		}
+	}
+
+	pub fn percentage(value: f64, display: impl Into<String>) -> Self {
+		Self::Percentage {
+			value,
+			display: display.into(),
+		}
+	}
+}
+
+pub fn axis_hit_value(value: f64, axis: &AxisType, display: impl Into<String>) -> HitValue {
+	let display = display.into();
+	match axis {
+		AxisType::Date | AxisType::Datetime { .. } | AxisType::Time => {
+			HitValue::temporal(value, display)
+		}
+		AxisType::Linear | AxisType::Percent => HitValue::quantitative(value, display),
+	}
+}
+
+pub fn axis_hit_semantic_type(axis: &AxisType) -> SemanticType {
+	match axis {
+		AxisType::Date | AxisType::Datetime { .. } | AxisType::Time => SemanticType::Temporal,
+		AxisType::Linear | AxisType::Percent => SemanticType::Quantitative,
+	}
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct HitField {
+	pub label: String,
+	pub semantic_type: SemanticType,
+	pub value: HitValue,
+}
+
+impl HitField {
+	pub fn new(label: impl Into<String>, semantic_type: SemanticType, value: HitValue) -> Self {
+		Self {
+			label: label.into(),
+			semantic_type,
+			value,
+		}
+	}
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HitFacet {
+	pub field: String,
+	pub value: String,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlotHit {
+	pub mark_family: MarkFamily,
+	pub dimensionality: HitDimensionality,
+	pub fields: Vec<HitField>,
+	pub facet: Option<HitFacet>,
+	pub paint_order: usize,
+	pub sibling_ordinal: usize,
+	presentation: String,
+}
+
+impl PlotHit {
+	pub fn new(
+		mark_family: MarkFamily,
+		dimensionality: HitDimensionality,
+		sibling_ordinal: usize,
+	) -> Self {
+		Self {
+			mark_family,
+			dimensionality,
+			fields: Vec::new(),
+			facet: None,
+			paint_order: 0,
+			sibling_ordinal,
+			presentation: String::new(),
+		}
+	}
+
+	pub fn field(mut self, field: HitField) -> Self {
+		self.fields.push(field);
+		self.presentation = self
+			.fields
+			.iter()
+			.map(|field| {
+				let value = format_hit_value(&field.value);
+				if field.label.is_empty() {
+					value
+				} else {
+					format!("{}: {value}", field.label)
+				}
+			})
+			.collect::<Vec<_>>()
+			.join("\n");
+		self
+	}
+
+	pub fn labeled(
+		self,
+		label: impl Into<String>,
+		semantic_type: SemanticType,
+		value: HitValue,
+	) -> Self {
+		self.field(HitField::new(label, semantic_type, value))
+	}
+
+	pub fn with_facet(mut self, facet: HitFacet) -> Self {
+		self.facet = Some(facet);
+		self
+	}
+
+	pub fn with_paint_order(mut self, paint_order: usize) -> Self {
+		self.paint_order = paint_order;
+		self
+	}
+
+	#[cfg(test)]
+	pub(crate) fn legacy_presentation(&self) -> String {
+		let value = |label: &str| {
+			self.fields
+				.iter()
+				.find(|field| field.label == label)
+				.map(|field| format_hit_value(&field.value))
+		};
+		let values = |labels: &[&str]| {
+			labels
+				.iter()
+				.filter_map(|label| value(label).map(|value| ((*label).to_owned(), value)))
+				.collect::<Vec<_>>()
+		};
+		match self.mark_family.as_str() {
+			"line" | "scatter" => match (value("X"), value("Y")) {
+				(Some(x), Some(y)) => format!("X: {x}, Y: {y}"),
+				_ => self.presentation.clone(),
+			},
+			"bar" => match (value("Category"), value("Group"), value("Value")) {
+				(Some(category), Some(group), Some(value)) => {
+					format!("{category}: {group} (Value: {value})")
+				}
+				_ => self.presentation.clone(),
+			},
+			"stacked_bar" => match (value("Category"), value("Group")) {
+				(Some(category), Some(group)) => {
+					let detail = values(&["Value", "Share", "Cumulative", "Total"])
+						.into_iter()
+						.map(|(label, value)| format!("{label}: {value}"))
+						.collect::<Vec<_>>()
+						.join(", ");
+					format!("{category}: {group} ({detail})")
+				}
+				_ => self.presentation.clone(),
+			},
+			"boxplot" => {
+				let category = value("Category");
+				let detail = self
+					.fields
+					.iter()
+					.filter(|field| field.label != "Category")
+					.map(|field| format!("{}: {}", field.label, format_hit_value(&field.value)))
+					.collect::<Vec<_>>()
+					.join("\n");
+				match category {
+					Some(category) if !detail.is_empty() => format!("{category}\n{detail}"),
+					Some(category) => category,
+					None => self.presentation.clone(),
+				}
+			}
+			"bubble" => {
+				let mut lines = Vec::new();
+				if let Some(label) = value("Label") {
+					lines.push(label);
+				}
+				for label in ["X", "Y", "Size", "Color"] {
+					if let Some(value) = value(label) {
+						lines.push(format!("{}: {value}", label.to_lowercase()));
+					}
+				}
+				if lines.is_empty() {
+					self.presentation.clone()
+				} else {
+					lines.join("\n")
+				}
+			}
+			"pie" => match (value("Category"), value("Value"), value("Share")) {
+				(Some(category), Some(value), Some(share)) => {
+					format!("{category}: {value} ({share})")
+				}
+				_ => self.presentation.clone(),
+			},
+			"radial_dial" => match (
+				value("Category"),
+				value("Value"),
+				value("Maximum"),
+				value("Share"),
+			) {
+				(Some(category), Some(value), Some(maximum), Some(share)) => {
+					format!("{category}: {value} / {maximum} ({share})")
+				}
+				_ => self.presentation.clone(),
+			},
+			"funnel" => {
+				let stage = value("Stage");
+				let details = self
+					.fields
+					.iter()
+					.filter(|field| field.label != "Stage")
+					.map(|field| (field.label.clone(), format_hit_value(&field.value)))
+					.collect::<Vec<_>>();
+				match stage {
+					Some(stage) if !details.is_empty() => {
+						let first = format!("{stage}: {}", details[0].1);
+						if details.len() == 1 {
+							first
+						} else {
+							let remaining = details[1..]
+								.iter()
+								.map(|(label, value)| format!("{label}: {value}"))
+								.collect::<Vec<_>>()
+								.join("\n");
+							format!("{first}\n{remaining}")
+						}
+					}
+					Some(stage) => stage,
+					None => self.presentation.clone(),
+				}
+			}
+			"violin" => match (value("Category"), value("Median")) {
+				(Some(category), Some(median)) => format!("{category}: Median {median}"),
+				_ => self.presentation.clone(),
+			},
+			"stacked_area" => {
+				let x = value("X");
+				let category = self
+					.fields
+					.iter()
+					.find(|field| {
+						field.label != "X"
+							&& field.label != "Total"
+							&& field.label != "Total Sum"
+							&& field.label != "Share"
+							&& field.label != "Cumulative"
+					})
+					.map(|field| (field.label.clone(), format_hit_value(&field.value)));
+				let mut lines = Vec::new();
+				if let Some(x) = x {
+					lines.push(format!("X: {x}"));
+				}
+				if let Some((label, value)) = category {
+					lines.push(format!("{label}: {value}"));
+				}
+				for label in ["Share", "Cumulative", "Total Sum", "Total"] {
+					if let Some(value) = value(label) {
+						lines.push(format!("{label}: {value}"));
+					}
+				}
+				if let (Some(x), Some(total)) = (value("X"), value("Total Sum")) {
+					if self.fields.len() == 2 {
+						format!("X: {x}, Total Sum: {total}")
+					} else {
+						lines.join("\n")
+					}
+				} else if lines.is_empty() {
+					self.presentation.clone()
+				} else {
+					lines.join("\n")
+				}
+			}
+			_ => self.presentation.clone(),
+		}
+	}
+}
+
+fn format_hit_value(value: &HitValue) -> String {
+	match value {
+		HitValue::Nominal(value) | HitValue::Ordinal(value) => value.clone(),
+		HitValue::Quantitative { display, .. }
+		| HitValue::Temporal { display, .. }
+		| HitValue::Percentage { display, .. } => display.clone(),
+		HitValue::Count(value) => value.to_string(),
+		HitValue::Interval {
+			start,
+			end,
+			end_inclusive,
+		} => format!(
+			"[{}, {}{}",
+			format_hit_value(start),
+			format_hit_value(end),
+			if *end_inclusive { "]" } else { ")" }
+		),
+	}
+}
+
+impl std::fmt::Display for PlotHit {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		formatter.write_str(&self.presentation)
+	}
+}
+
+impl std::ops::Deref for PlotHit {
+	type Target = str;
+
+	fn deref(&self) -> &Self::Target {
+		&self.presentation
+	}
 }
 
 /// A plot layer's mark-only rendering boundary. It owns neither layout nor
@@ -2558,13 +2974,15 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 				});
 				if let Some(composite) = self.kernel.composite() {
 					let hover = widget_cursor.and_then(|cursor| {
-						composite.hover(
-							widget_bounds,
-							self.padding,
-							&self.title,
-							cursor,
-							&self.settings_model,
-						)
+						composite
+							.hit(
+								widget_bounds,
+								self.padding,
+								&self.title,
+								cursor,
+								&self.settings_model,
+							)
+							.map(|hit| hit.to_string())
 					});
 					if hover != state.last_hover {
 						state.last_hover = hover.clone();
@@ -2586,9 +3004,10 @@ impl<'a> Program<PlotMessage> for PlotWidget<'a> {
 					.map_or(Cursor::Unavailable, |cursor| {
 						Cursor::Available(cursor.into_iced())
 					});
-				let hover =
-					self.kernel
-						.hover_with_settings(&transform, plot_cursor, &self.settings_model);
+				let hover = self
+					.kernel
+					.hit_with_settings(&transform, plot_cursor, &self.settings_model)
+					.map(|hit| hit.to_string());
 				if hover != state.last_hover {
 					state.last_hover = hover.clone();
 					Some(canvas::Action::publish(PlotMessage::UpdateHover(hover)))
@@ -4573,7 +4992,7 @@ mod product_0031_pre_extraction_oracle {
 			Some(crate::plot::legend::LegendContent::entries(entries))
 		}
 
-		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+		fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
 			None
 		}
 
@@ -4792,7 +5211,7 @@ mod product_0067_0068_strata_oracles {
 			backend.fill_rectangle(Point::new(20.0, 20.0), iced::Size::new(40.0, 40.0), MARK);
 		}
 
-		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+		fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
 			None
 		}
 	}
@@ -4820,7 +5239,7 @@ mod product_0067_0068_strata_oracles {
 			}
 		}
 
-		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+		fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
 			None
 		}
 	}
@@ -5982,7 +6401,7 @@ mod product_0056_categorical_y_oracles {
 		) {
 		}
 
-		fn hover(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<String> {
+		fn hit(&self, _transform: &CoordinateTransformer, _cursor: Cursor) -> Option<PlotHit> {
 			None
 		}
 	}
@@ -6310,5 +6729,58 @@ mod product_0056_categorical_y_oracles {
 				}
 			}
 		}
+	}
+}
+
+#[cfg(test)]
+mod product_0133_structured_hit_tests {
+	use super::*;
+
+	#[test]
+	fn typed_hit_preserves_dimension_order_and_temporal_values() {
+		let hit = PlotHit::new(MarkFamily::SCATTER, HitDimensionality::Point, 7)
+			.labeled(
+				"when",
+				SemanticType::Temporal,
+				HitValue::temporal(1_725_000_000.0, "2024-08-01T00:00:00Z"),
+			)
+			.labeled(
+				"value",
+				SemanticType::Quantitative,
+				HitValue::quantitative(42.0, "42"),
+			)
+			.with_facet(HitFacet {
+				field: "region".to_owned(),
+				value: "west".to_owned(),
+			})
+			.with_paint_order(3);
+
+		assert_eq!(hit.mark_family, MarkFamily::SCATTER);
+		assert_eq!(hit.dimensionality, HitDimensionality::Point);
+		assert_eq!(hit.sibling_ordinal, 7);
+		assert_eq!(hit.paint_order, 3);
+		assert_eq!(hit.fields[0].semantic_type, SemanticType::Temporal);
+		assert!(matches!(hit.fields[0].value, HitValue::Temporal { .. }));
+		assert_eq!(hit.facet.as_ref().unwrap().value, "west");
+		assert_eq!(hit.to_string(), "when: 2024-08-01T00:00:00Z\nvalue: 42");
+	}
+
+	#[test]
+	fn axis_hit_value_is_temporal_only_for_temporal_axes() {
+		assert!(matches!(
+			axis_hit_value(
+				1.0,
+				&AxisType::Datetime {
+					unit: TimeUnit::Milliseconds,
+					zone: None,
+				},
+				"date",
+			),
+			HitValue::Temporal { .. }
+		));
+		assert!(matches!(
+			axis_hit_value(1.0, &AxisType::Linear, "number"),
+			HitValue::Quantitative { .. }
+		));
 	}
 }

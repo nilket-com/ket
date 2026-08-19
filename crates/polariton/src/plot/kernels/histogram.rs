@@ -80,17 +80,48 @@ impl PlotKernel for HistogramPlotKernel {
 		None
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		let cursor_pos = cursor.position()?;
 		let (x, y) = transform.pixel_to_cartesian(cursor_pos)?;
 		let bin = self.prepared_data.bins.find(x)?;
-		Some(format!(
-			"Range: [{}, {})\nCount: {}\nY-Value: {:.2}",
-			format_label(bin.start, &self.prepared_data.x_axis_type),
-			format_label(bin.end, &self.prepared_data.x_axis_type),
-			bin.count,
-			y
-		))
+		Some(
+			crate::plot::common::PlotHit::new(
+				crate::plot::common::MarkFamily::HISTOGRAM,
+				crate::plot::common::HitDimensionality::Area,
+				bin.count as usize,
+			)
+			.labeled(
+				"Range",
+				crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+				crate::plot::common::HitValue::Interval {
+					start: Box::new(crate::plot::common::axis_hit_value(
+						bin.start,
+						&self.prepared_data.x_axis_type,
+						format_label(bin.start, &self.prepared_data.x_axis_type),
+					)),
+					end: Box::new(crate::plot::common::axis_hit_value(
+						bin.end,
+						&self.prepared_data.x_axis_type,
+						format_label(bin.end, &self.prepared_data.x_axis_type),
+					)),
+					end_inclusive: false,
+				},
+			)
+			.labeled(
+				"Count",
+				crate::plot::spec::SemanticType::Quantitative,
+				crate::plot::common::HitValue::Count(bin.count as usize),
+			)
+			.labeled(
+				"Y-Value",
+				crate::plot::spec::SemanticType::Quantitative,
+				crate::plot::common::HitValue::quantitative(y, format!("{y:.2}")),
+			),
+		)
 	}
 
 	fn x_label(&self) -> String {

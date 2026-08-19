@@ -169,7 +169,11 @@ impl PlotKernel for PiePlotKernel {
 		)
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		let cursor = Pt::<Widget>::from_plot_kernel_cursor(cursor.position()?);
 		let (bounds, cursor) = transform.widget_hit_geometry(cursor);
 		if !bounds.contains(cursor) {
@@ -191,12 +195,38 @@ impl PlotKernel for PiePlotKernel {
 			.slices
 			.total()
 			.expect("hovered pie is non-empty");
-		Some(format!(
-			"{}: {:.2} ({:.1}%)",
-			self.display_label(index),
-			slice.value(),
-			slice.value() / total * 100.0
-		))
+		Some(
+			crate::plot::common::PlotHit::new(
+				crate::plot::common::MarkFamily::PIE,
+				crate::plot::common::HitDimensionality::Area,
+				index,
+			)
+			.labeled(
+				self.prepared_data
+					.slices
+					.get(index)
+					.and_then(|slice| slice.category())
+					.map_or("Category", |_| "Category"),
+				crate::plot::spec::SemanticType::Nominal,
+				crate::plot::common::HitValue::nominal(self.display_label(index)),
+			)
+			.labeled(
+				"Value",
+				crate::plot::spec::SemanticType::Quantitative,
+				crate::plot::common::HitValue::quantitative(
+					slice.value(),
+					format!("{:.2}", slice.value()),
+				),
+			)
+			.labeled(
+				"Share",
+				crate::plot::spec::SemanticType::Quantitative,
+				crate::plot::common::HitValue::percentage(
+					slice.value() / total * 100.0,
+					format!("{:.1}%", slice.value() / total * 100.0),
+				),
+			),
+		)
 	}
 }
 

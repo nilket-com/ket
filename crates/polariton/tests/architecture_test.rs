@@ -4629,7 +4629,7 @@ fn product_0114_band_requirements_precede_and_feed_shared_geometry() {
 	for entrypoint in [
 		"fn render_plot_layer(",
 		"fn render_overlay_layer(",
-		"fn hover(",
+		"fn hit(",
 	] {
 		let section = composite
 			.split(entrypoint)

@@ -192,36 +192,80 @@ impl PlotKernel for LinePlotKernel {
 			.draw(backend, bounds, transform, resolved);
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
 		if let Some(cursor_pos) = cursor.position()
 			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
 		{
-			return Some(format!(
-				"X: {}, Y: {}",
-				format_label(x, &self.prepared_data.x_axis_type),
-				format_label(y, &self.prepared_data.y_axis_type)
-			));
+			return Some(
+				crate::plot::common::PlotHit::new(
+					crate::plot::common::MarkFamily::LINE,
+					crate::plot::common::HitDimensionality::Line,
+					0,
+				)
+				.labeled(
+					"X",
+					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+					crate::plot::common::axis_hit_value(
+						x,
+						&self.prepared_data.x_axis_type,
+						format_label(x, &self.prepared_data.x_axis_type),
+					),
+				)
+				.labeled(
+					"Y",
+					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.y_axis_type),
+					crate::plot::common::axis_hit_value(
+						y,
+						&self.prepared_data.y_axis_type,
+						format_label(y, &self.prepared_data.y_axis_type),
+					),
+				),
+			);
 		}
 		None
 	}
 
-	fn hover_with_settings(
+	fn hit_with_settings(
 		&self,
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 		settings: &PlotSettings,
-	) -> Option<String> {
+	) -> Option<crate::plot::common::PlotHit> {
 		let Some(layer) = self.layer_settings.as_ref() else {
-			return self.hover(transform, cursor);
+			return self.hit(transform, cursor);
 		};
 		let resolved = settings.resolve_for_layer(layer);
 		let hit = LineMarkRenderer::new(Arc::clone(&self.prepared_data))
 			.hit_test(transform, cursor, &resolved)?;
-		Some(format!(
-			"X: {}, Y: {}",
-			format_label(hit.data_x, &self.prepared_data.x_axis_type),
-			format_label(hit.data_y, &self.prepared_data.y_axis_type)
-		))
+		Some(
+			crate::plot::common::PlotHit::new(
+				crate::plot::common::MarkFamily::LINE,
+				crate::plot::common::HitDimensionality::Line,
+				hit.mark_index,
+			)
+			.labeled(
+				"X",
+				crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+				crate::plot::common::axis_hit_value(
+					hit.data_x,
+					&self.prepared_data.x_axis_type,
+					format_label(hit.data_x, &self.prepared_data.x_axis_type),
+				),
+			)
+			.labeled(
+				"Y",
+				crate::plot::common::axis_hit_semantic_type(&self.prepared_data.y_axis_type),
+				crate::plot::common::axis_hit_value(
+					hit.data_y,
+					&self.prepared_data.y_axis_type,
+					format_label(hit.data_y, &self.prepared_data.y_axis_type),
+				),
+			),
+		)
 	}
 
 	fn legend_content(

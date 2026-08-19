@@ -84,8 +84,12 @@ impl PlotKernel for ScatterLinePlotKernel {
 		self.scatter.legend_content(settings)
 	}
 
-	fn hover(&self, transform: &CoordinateTransformer, cursor: Cursor) -> Option<String> {
-		self.scatter.hover(transform, cursor)
+	fn hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+	) -> Option<crate::plot::common::PlotHit> {
+		self.scatter.hit(transform, cursor)
 	}
 
 	fn x_label(&self) -> String {
