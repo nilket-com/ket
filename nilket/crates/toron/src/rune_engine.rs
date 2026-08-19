@@ -1765,6 +1765,16 @@ pub fn concat(args: Vec<RuneExpr>) -> RuneExpr {
 	}
 }
 
+pub fn concat_strict(args: Vec<RuneExpr>) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::StringConcat,
+			args: args.into_iter().map(|arg| arg.expr).collect(),
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 pub fn position(needle: RuneExpr, input: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1914,6 +1924,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["lpad"], lpad).build()?;
 	m.function(["rpad"], rpad).build()?;
 	m.function(["concat"], concat).build()?;
+	m.function(["concat_strict"], concat_strict).build()?;
 	m.function(["position"], position).build()?;
 	m.function(["strpos"], strpos).build()?;
 	m.function(["replace"], replace).build()?;

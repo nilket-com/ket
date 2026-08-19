@@ -43,6 +43,7 @@ pub enum ScalarFunctionId {
 	Sign,
 	Sqrt,
 	Strpos,
+	StringConcat,
 	Substring,
 	SplitPart,
 	TimeBucket,
@@ -281,6 +282,7 @@ pub enum ScalarFunctionEvaluator {
 	Sign,
 	Sqrt,
 	SplitPart,
+	StringConcat,
 	Substring,
 	TimeBucket,
 	Trim,
@@ -598,6 +600,24 @@ const CONCAT: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Concat,
 };
 
+const STRING_CONCAT: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::StringConcat,
+	sql_name: "||",
+	// `||` is the strict, NULL-propagating counterpart to CONCAT. It is an
+	// operator rather than a function-call spelling, so its Rune name is the
+	// explicit semantic name instead of reusing `concat`.
+	sql_aliases: &[],
+	rune_name: "concat_strict",
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::VariadicStringConcatenating,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::StringConcat,
+};
+
 const LTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Ltrim,
 	sql_name: "LTRIM",
@@ -904,6 +924,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	CEIL,
 	CHAR_LENGTH,
 	CONCAT,
+	STRING_CONCAT,
 	DATE_TRUNC,
 	EXP,
 	EXTRACT,
@@ -984,7 +1005,8 @@ mod tests {
 			// The two surfaces share one identifier, not necessarily one
 			// spelling. A divergence is allowed only where the canonical name
 			// is unusable, and it is listed here so it stays a decision.
-			const SPELLING_EXCEPTIONS: &[(&str, &str)] = &[("MOD", "modulo")];
+			const SPELLING_EXCEPTIONS: &[(&str, &str)] =
+				&[("MOD", "modulo"), ("||", "concat_strict")];
 			let expected = SPELLING_EXCEPTIONS
 				.iter()
 				.find(|(sql, _)| *sql == metadata.sql_name)

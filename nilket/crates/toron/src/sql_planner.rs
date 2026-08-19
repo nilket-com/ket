@@ -6566,6 +6566,11 @@ impl SqlPlanner {
 					BinaryOperator::Minus => Ok(Expr::Sub(l, r)),
 					BinaryOperator::Multiply => Ok(Expr::Mul(l, r)),
 					BinaryOperator::Divide => Ok(Expr::Div(l, r)),
+					BinaryOperator::StringConcat => Ok(Expr::ScalarFunction {
+						id: crate::ir::ScalarFunctionId::StringConcat,
+						args: vec![*l, *r],
+						parameter: crate::ir::ScalarFunctionParameter::None,
+					}),
 					BinaryOperator::PGLikeMatch
 					| BinaryOperator::PGILikeMatch
 					| BinaryOperator::PGNotLikeMatch

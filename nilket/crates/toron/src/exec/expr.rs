@@ -810,6 +810,11 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_concat(args),
 		(
+			ScalarFunctionEvaluator::StringConcat,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_string_concat(args),
+		(
 			ScalarFunctionEvaluator::Position,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -951,6 +956,7 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Sign
 			| ScalarFunctionEvaluator::Sqrt
 			| ScalarFunctionEvaluator::SplitPart
+			| ScalarFunctionEvaluator::StringConcat
 			| ScalarFunctionEvaluator::Substring
 			| ScalarFunctionEvaluator::TimeBucket
 			| ScalarFunctionEvaluator::Trim
@@ -1324,6 +1330,37 @@ fn trim_string(value: &str, characters: Option<&str>, where_field: crate::ir::Tr
 }
 
 fn evaluate_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+	evaluate_concat_with_semantics(args, ConcatSemantics::NullIgnoring)
+}
+
+fn evaluate_string_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+	evaluate_concat_with_semantics(args, ConcatSemantics::NullPropagating)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConcatSemantics {
+	NullIgnoring,
+	NullPropagating,
+}
+
+impl ConcatSemantics {
+	const fn name(self) -> &'static str {
+		match self {
+			Self::NullIgnoring => "CONCAT",
+			Self::NullPropagating => "||",
+		}
+	}
+
+	const fn propagates_nulls(self) -> bool {
+		matches!(self, Self::NullPropagating)
+	}
+}
+
+fn evaluate_concat_with_semantics(
+	args: &[ArrayRef],
+	semantics: ConcatSemantics,
+) -> Result<ArrayRef, ExecutionError> {
+	let name = semantics.name();
 	if let Some(first) = args[0].as_any().downcast_ref::<StringArray>() {
 		let columns = args
 			.iter()
@@ -1331,7 +1368,7 @@ fn evaluate_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
 				arg.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
 					ExecutionError::InvalidExpression {
 						message: format!(
-							"CONCAT expects every argument to share one string type, got {:?}",
+							"{name} expects every argument to share one string type, got {:?}",
 							arg.data_type()
 						),
 					}
@@ -1340,6 +1377,10 @@ fn evaluate_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
 			.collect::<Result<Vec<_>, _>>()?;
 		let values = (0..first.len())
 			.map(|row| {
+				if semantics.propagates_nulls() && columns.iter().any(|column| column.is_null(row))
+				{
+					return None;
+				}
 				let mut value = String::new();
 				for column in &columns {
 					if column.is_valid(row) {
@@ -1359,7 +1400,7 @@ fn evaluate_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
 					.downcast_ref::<LargeStringArray>()
 					.ok_or_else(|| ExecutionError::InvalidExpression {
 						message: format!(
-							"CONCAT expects every argument to share one string type, got {:?}",
+							"{name} expects every argument to share one string type, got {:?}",
 							arg.data_type()
 						),
 					})
@@ -1367,6 +1408,10 @@ fn evaluate_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
 			.collect::<Result<Vec<_>, _>>()?;
 		let values = (0..first.len())
 			.map(|row| {
+				if semantics.propagates_nulls() && columns.iter().any(|column| column.is_null(row))
+				{
+					return None;
+				}
 				let mut value = String::new();
 				for column in &columns {
 					if column.is_valid(row) {
@@ -1380,7 +1425,7 @@ fn evaluate_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
 	}
 	Err(ExecutionError::InvalidExpression {
 		message: format!(
-			"CONCAT expects string arguments, got {:?}",
+			"{name} expects string arguments, got {:?}",
 			args[0].data_type()
 		),
 	})
@@ -4345,6 +4390,25 @@ mod tests {
 				.value(0),
 			"hi"
 		);
+	}
+
+	#[test]
+	fn strict_concat_propagates_nulls_and_rejects_mixed_offset_widths() {
+		let utf8 = Arc::new(StringArray::from(vec![Some("a"), None])) as ArrayRef;
+		let suffix = Arc::new(StringArray::from(vec![Some("b"), Some("b")])) as ArrayRef;
+		let output = super::evaluate_string_concat(&[utf8, suffix]).expect("strict concat");
+		let output = output
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("Utf8 output");
+		assert_eq!(output.value(0), "ab");
+		assert!(output.is_null(1), "strict concat must propagate NULL");
+
+		let utf8 = Arc::new(StringArray::from(vec![Some("a")])) as ArrayRef;
+		let large = Arc::new(LargeStringArray::from(vec![Some("b")])) as ArrayRef;
+		let error = super::evaluate_string_concat(&[utf8, large])
+			.expect_err("mixed Utf8/LargeUtf8 must be rejected");
+		assert!(format!("{error:?}").contains("share one string type"));
 	}
 
 	/// The specification form trims a character set from the selected edge;

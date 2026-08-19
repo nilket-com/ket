@@ -2389,6 +2389,57 @@ async fn adr553_first_string_batch_uses_the_predicted_registry_shapes() {
 	);
 }
 
+/// SQL `||` is the strict, NULL-propagating counterpart to `CONCAT`. Chaining
+/// must preserve the left-associated expression shape, and Rune exposes the
+/// same semantics under the explicit `concat_strict` name rather than taking
+/// the NULL-ignoring `concat` name.
+#[tokio::test]
+async fn adr553_strict_concat_matches_between_sql_and_rune() {
+	let sql_logical = plan_sql("SELECT region || '-' || status FROM sales");
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                concat_strict([
+                    concat_strict([col("region"), lit_str("-")]),
+                    col("status"),
+                ])
+            ])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL strict concat");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune strict concat");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+
+	let rows = run_logical(&sql_logical).await;
+	assert_eq!(
+		utf8_column_rows(&rows, 0),
+		vec![
+			Some("east-open".to_string()),
+			Some("west-open".to_string()),
+			Some("east-closed".to_string()),
+			Some("east-open".to_string()),
+			Some("west-open".to_string()),
+			None,
+		],
+		"|| propagates NULL through a chained concatenation"
+	);
+	assert_eq!(
+		canonical_arrow_ipc_digest(&rows, SortPolicy::FullRowLex)
+			.expect("SQL strict concat digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune strict concat digest")
+	);
+}
+
 #[tokio::test]
 async fn adr553_second_batch_uses_the_predicted_existing_signatures() {
 	let reverse = run_logical(&plan_sql("SELECT REVERSE(region) FROM sales")).await;
