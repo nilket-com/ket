@@ -14,6 +14,7 @@ use crate::plot::common::{PlotKernel, PlotRenderLayer, PlotWidget, ResolvedPlotS
 use crate::plot::composition::PlotComposition;
 use crate::plot::spec::{Override, Presence};
 use crate::plot::theme::PlotSettingsLayer;
+use crate::result_artifact::ResultArtifact;
 use crate::rune_view::{LocalViewIdentity, ViewContentKind, ViewPresentation};
 #[cfg(feature = "toron")]
 use crate::session_persistence::{
@@ -423,7 +424,7 @@ pub struct CodeEditor {
 	notebook_outputs: HashMap<MarkdownCellIdentity, NotebookCellOutput>,
 	/// Successful SQL results are execution state, not presentation state.
 	/// A cell with `output=none` must still be addressable by a later Rune cell.
-	notebook_cell_data: HashMap<MarkdownCellIdentity, Arc<DataFrame>>,
+	notebook_cell_data: HashMap<MarkdownCellIdentity, Arc<ResultArtifact>>,
 	/// Parsed Markdown structure per previewed source buffer. `view` runs on
 	/// every frame while the source text only changes with a projection, so
 	/// parsing happens when a viewport arrives and the result is reused.
@@ -1159,8 +1160,10 @@ impl CodeEditor {
 		identity: MarkdownCellIdentity,
 		frame: &DataFrame,
 	) {
-		self.notebook_cell_data
-			.insert(identity, Arc::new(frame.clone()));
+		self.notebook_cell_data.insert(
+			identity,
+			ResultArtifact::from_polars(Arc::new(frame.clone())),
+		);
 	}
 
 	pub fn set_markdown_cell_error(&mut self, identity: MarkdownCellIdentity, message: String) {
@@ -1196,7 +1199,7 @@ impl CodeEditor {
 	/// Values are owned `Arc`s, so the Rune VM never borrows editor state. An
 	/// unnamed SQL fence remains useful for presentation, but cannot be named
 	/// from Rune; that is precisely the purpose of `{#cell-name}`.
-	pub fn named_notebook_cell_data(&self) -> HashMap<String, Arc<DataFrame>> {
+	pub fn named_notebook_cell_data(&self) -> HashMap<String, Arc<ResultArtifact>> {
 		self.notebook_cell_data
 			.iter()
 			.filter_map(|(identity, frame)| match identity {
@@ -10171,6 +10174,11 @@ mod tests {
 
 		let frame = polars::df!("x" => [1_i32], "y" => [2_i32]).expect("frame");
 		editor.retain_markdown_cell_table(sql_identity.clone(), &frame);
+		let first_token = editor
+			.named_notebook_cell_data()
+			.get("trips")
+			.expect("named notebook artifact")
+			.artifact_token();
 		assert_eq!(
 			editor
 				.named_notebook_cell_data()
@@ -10178,6 +10186,15 @@ mod tests {
 				.map(|snapshot| snapshot.height()),
 			Some(1),
 			"output=none controls presentation, not Rune data availability"
+		);
+		assert_eq!(
+			first_token,
+			editor
+				.named_notebook_cell_data()
+				.get("trips")
+				.expect("named notebook artifact remains bound")
+				.artifact_token(),
+			"reading an unchanged notebook cell must not mint a new publication token"
 		);
 		editor.begin_markdown_cell(sql_identity);
 		assert!(

@@ -2717,15 +2717,6 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 		return Task::none();
 	}
 	let snapshots = app_state.code_editor.named_notebook_cell_data();
-	let snapshots = snapshots
-		.into_iter()
-		.map(|(name, frame)| {
-			(
-				name,
-				crate::result_artifact::ResultArtifact::from_polars(frame),
-			)
-		})
-		.collect();
 	let identity = cell.identity.clone();
 	let presentation = cell.presentation;
 	app_state.status_msg = "Building notebook plot…".into();
