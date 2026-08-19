@@ -727,6 +727,137 @@ pub(super) fn bind_scalar_function(
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
 		}
+		ScalarFunctionSignature::StringWithIntegerAndOptionalString => {
+			let (input, length, fill) = match bound_args.as_slice() {
+				[input, length] => (input, length, None),
+				[input, length, fill] => (input, length, Some(fill)),
+				_ => unreachable!("the registry arity was checked before binding"),
+			};
+			for operand in std::iter::once(input).chain(fill) {
+				if !builder
+					.node_logical_type(*operand)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			let output_type = match builder.node_type(*input) {
+				Some(data_type @ (DataType::Utf8 | DataType::LargeUtf8)) => data_type.clone(),
+				Some(actual) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects a string input, got {actual:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				None => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} input is not a bound expression", metadata.sql_name),
+					});
+				}
+			};
+			match builder.node_type(*length) {
+				Some(DataType::Int32 | DataType::Int64) => {}
+				Some(actual) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects an integer target length, got {actual:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				None => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} length is not a bound expression", metadata.sql_name),
+					});
+				}
+			}
+			if let Some(fill) = fill {
+				match (builder.node_type(*fill), &output_type) {
+					(Some(actual), expected) if actual == expected => {}
+					(Some(actual), expected) => {
+						return Err(BindingError::TypeMismatch {
+							message: format!(
+								"{} expects the fill string to match the input type, got {expected:?} and {actual:?}",
+								metadata.sql_name
+							),
+						});
+					}
+					(None, _) => {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!(
+								"{} fill is not a bound expression",
+								metadata.sql_name
+							),
+						});
+					}
+				}
+			}
+			Ok(builder.append_scalar_function(id, bound_args, output_type))
+		}
+		ScalarFunctionSignature::StringStringInteger => {
+			let [input, delimiter, part] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			for operand in [input, delimiter] {
+				if !builder
+					.node_logical_type(*operand)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			let output_type = match (builder.node_type(*input), builder.node_type(*delimiter)) {
+				(
+					Some(input_type @ (DataType::Utf8 | DataType::LargeUtf8)),
+					Some(delimiter_type),
+				) if *input_type == *delimiter_type => input_type.clone(),
+				(Some(input_type), Some(delimiter_type)) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects two arguments of the same string type, got {input_type:?} and {delimiter_type:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				_ => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!("{} input is not a bound expression", metadata.sql_name),
+					});
+				}
+			};
+			match builder.node_type(*part) {
+				Some(DataType::Int32 | DataType::Int64) => {}
+				Some(actual) => {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} expects an integer part number, got {actual:?}",
+							metadata.sql_name
+						),
+					});
+				}
+				None => {
+					return Err(BindingError::UnsupportedExpression {
+						message: format!(
+							"{} part number is not a bound expression",
+							metadata.sql_name
+						),
+					});
+				}
+			}
+			Ok(builder.append_scalar_function(id, bound_args, output_type))
+		}
 		ScalarFunctionSignature::FloatWithOptionalIntegerDigits => {
 			let (value, digits) = match bound_args.as_slice() {
 				[value] => (value, None),

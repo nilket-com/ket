@@ -29,18 +29,21 @@ pub enum ScalarFunctionId {
 	Log,
 	Lower,
 	Ltrim,
+	Lpad,
 	Mod,
 	Position,
 	Pow,
 	Random,
 	Replace,
 	Reverse,
+	Rpad,
 	Round,
 	Rtrim,
 	Sign,
 	Sqrt,
 	Strpos,
 	Substring,
+	SplitPart,
 	TimeBucket,
 	Trim,
 	Trunc,
@@ -161,6 +164,11 @@ pub enum ScalarFunctionSignature {
 	/// from neither the input nor the argument list, which is why the string
 	/// family is the real test of this metadata model.
 	StringToInteger,
+	/// A string, integer target length, and optional same-typed fill string.
+	StringWithIntegerAndOptionalString,
+	/// Two same-typed strings and an integer part number, producing the string
+	/// part at that 1-based position.
+	StringStringInteger,
 	/// `WIDTH_BUCKET(operand, low, high, count)`: three same-typed floats and an
 	/// integer bucket count, producing a bucket ordinal. The count is a shape
 	/// parameter rather than a value, so it does not participate in the output
@@ -247,6 +255,7 @@ pub enum ScalarFunctionEvaluator {
 	Least,
 	Ln,
 	Log,
+	Lpad,
 	Lower,
 	Position,
 	Mod,
@@ -254,9 +263,11 @@ pub enum ScalarFunctionEvaluator {
 	Random,
 	Replace,
 	Reverse,
+	Rpad,
 	Round,
 	Sign,
 	Sqrt,
+	SplitPart,
 	Substring,
 	TimeBucket,
 	Trim,
@@ -589,6 +600,21 @@ const LTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Trim,
 };
 
+const LPAD: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Lpad,
+	sql_name: "LPAD",
+	sql_aliases: &[],
+	rune_name: "lpad",
+	arity: ScalarFunctionArity::Between(2, 3),
+	signature: ScalarFunctionSignature::StringWithIntegerAndOptionalString,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Lpad,
+};
+
 const POSITION: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Position,
 	sql_name: "POSITION",
@@ -649,6 +675,21 @@ const RTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::Trim,
+};
+
+const RPAD: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Rpad,
+	sql_name: "RPAD",
+	sql_aliases: &[],
+	rune_name: "rpad",
+	arity: ScalarFunctionArity::Between(2, 3),
+	signature: ScalarFunctionSignature::StringWithIntegerAndOptionalString,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Rpad,
 };
 
 const CHAR_LENGTH: ScalarFunctionMetadata = ScalarFunctionMetadata {
@@ -751,6 +792,21 @@ const SUBSTRING: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Substring,
 };
 
+const SPLIT_PART: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::SplitPart,
+	sql_name: "SPLIT_PART",
+	sql_aliases: &[],
+	rune_name: "split_part",
+	arity: ScalarFunctionArity::Exact(3),
+	signature: ScalarFunctionSignature::StringStringInteger,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::SplitPart,
+};
+
 const TIME_BUCKET: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::TimeBucket,
 	sql_name: "TIME_BUCKET",
@@ -827,6 +883,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	LEAST,
 	LN,
 	LOG,
+	LPAD,
 	LOWER,
 	LTRIM,
 	MOD,
@@ -835,6 +892,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	RANDOM,
 	REPLACE,
 	REVERSE,
+	RPAD,
 	ROUND,
 	RTRIM,
 	SIGN,
@@ -846,6 +904,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	TRUNC,
 	UPPER,
 	WIDTH_BUCKET,
+	SPLIT_PART,
 ];
 
 pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunctionMetadata {

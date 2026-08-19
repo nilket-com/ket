@@ -1725,6 +1725,26 @@ pub fn rtrim(expr: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn lpad(args: Vec<RuneExpr>) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Lpad,
+			args: args.into_iter().map(|arg| arg.expr).collect(),
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn rpad(args: Vec<RuneExpr>) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Rpad,
+			args: args.into_iter().map(|arg| arg.expr).collect(),
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 pub fn concat(args: Vec<RuneExpr>) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1760,6 +1780,16 @@ pub fn replace(input: RuneExpr, from: RuneExpr, to: RuneExpr) -> RuneExpr {
 		expr: Expr::ScalarFunction {
 			id: ScalarFunctionId::Replace,
 			args: vec![input.expr, from.expr, to.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn split_part(input: RuneExpr, delimiter: RuneExpr, part: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::SplitPart,
+			args: vec![input.expr, delimiter.expr, part.expr],
 			parameter: ScalarFunctionParameter::None,
 		},
 	}
@@ -1871,10 +1901,13 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["trim"], trim).build()?;
 	m.function(["ltrim"], ltrim).build()?;
 	m.function(["rtrim"], rtrim).build()?;
+	m.function(["lpad"], lpad).build()?;
+	m.function(["rpad"], rpad).build()?;
 	m.function(["concat"], concat).build()?;
 	m.function(["position"], position).build()?;
 	m.function(["strpos"], strpos).build()?;
 	m.function(["replace"], replace).build()?;
+	m.function(["split_part"], split_part).build()?;
 	m.function(["char_length"], char_length).build()?;
 	m.function(["width_bucket"], width_bucket).build()?;
 	m.function(["greatest"], greatest).build()?;

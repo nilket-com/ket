@@ -810,6 +810,21 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_replace(&args[0], &args[1], &args[2]),
 		(
+			ScalarFunctionEvaluator::Lpad,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_pad(args, true),
+		(
+			ScalarFunctionEvaluator::Rpad,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_pad(args, false),
+		(
+			ScalarFunctionEvaluator::SplitPart,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_split_part(&args[0], &args[1], &args[2]),
+		(
 			ScalarFunctionEvaluator::CharLength,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -914,14 +929,17 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Initcap
 			| ScalarFunctionEvaluator::Ln
 			| ScalarFunctionEvaluator::Log
+			| ScalarFunctionEvaluator::Lpad
 			| ScalarFunctionEvaluator::Lower
 			| ScalarFunctionEvaluator::Mod
 			| ScalarFunctionEvaluator::Position
 			| ScalarFunctionEvaluator::Pow
+			| ScalarFunctionEvaluator::Rpad
 			| ScalarFunctionEvaluator::Replace
 			| ScalarFunctionEvaluator::Round
 			| ScalarFunctionEvaluator::Sign
 			| ScalarFunctionEvaluator::Sqrt
+			| ScalarFunctionEvaluator::SplitPart
 			| ScalarFunctionEvaluator::Substring
 			| ScalarFunctionEvaluator::TimeBucket
 			| ScalarFunctionEvaluator::Trim
@@ -1353,6 +1371,218 @@ fn evaluate_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
 		message: format!(
 			"CONCAT expects string arguments, got {:?}",
 			args[0].data_type()
+		),
+	})
+}
+
+fn integer_value_at(
+	input: &ArrayRef,
+	row: usize,
+	name: &'static str,
+) -> Result<Option<i64>, ExecutionError> {
+	if let Some(input) = input.as_any().downcast_ref::<Int32Array>() {
+		return Ok(Some(i64::from(input.value(row))));
+	}
+	if let Some(input) = input.as_any().downcast_ref::<Int64Array>() {
+		return Ok(Some(input.value(row)));
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"{name} expects an integer argument, got {:?}",
+			input.data_type()
+		),
+	})
+}
+
+fn pad_string(
+	value: &str,
+	target_len: i64,
+	fill: &str,
+	left: bool,
+) -> Result<String, ExecutionError> {
+	let target_len =
+		usize::try_from(target_len).map_err(|_| ExecutionError::InvalidExpression {
+			message: "LPAD/RPAD target length must be non-negative".to_string(),
+		})?;
+	let value_chars = value.chars().collect::<Vec<_>>();
+	if target_len <= value_chars.len() {
+		return Ok(value_chars.into_iter().take(target_len).collect());
+	}
+	let fill_chars = fill.chars().collect::<Vec<_>>();
+	if fill_chars.is_empty() {
+		return Err(ExecutionError::InvalidExpression {
+			message: "LPAD/RPAD fill string must not be empty when padding".to_string(),
+		});
+	}
+	let mut padding = Vec::with_capacity(target_len - value_chars.len());
+	while padding.len() < target_len - value_chars.len() {
+		padding.extend(
+			fill_chars
+				.iter()
+				.copied()
+				.take(target_len - value_chars.len() - padding.len()),
+		);
+	}
+	if left {
+		padding.extend(value_chars);
+		Ok(padding.into_iter().collect())
+	} else {
+		let mut output = value_chars;
+		output.extend(padding);
+		Ok(output.into_iter().collect())
+	}
+}
+
+fn evaluate_pad(args: &[ArrayRef], left: bool) -> Result<ArrayRef, ExecutionError> {
+	let ([input, length] | [input, length, _]) = args else {
+		return Err(ExecutionError::InvalidExpression {
+			message: "LPAD/RPAD expects two or three arguments".to_string(),
+		});
+	};
+	let fill = args.get(2);
+	if let Some(input) = input.as_any().downcast_ref::<StringArray>() {
+		let fill = fill
+			.map(|fill| {
+				fill.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+					ExecutionError::InvalidExpression {
+						message: format!(
+							"LPAD/RPAD expects the fill to match the input string type, got {:?}",
+							fill.data_type()
+						),
+					}
+				})
+			})
+			.transpose()?;
+		return Ok(Arc::new(
+			(0..input.len())
+				.map(|row| {
+					let value = input.value(row);
+					if input.is_null(row)
+						|| length.is_null(row)
+						|| fill.is_some_and(|fill| fill.is_null(row))
+					{
+						return Ok(None);
+					}
+					let fill = fill.map_or(" ", |fill| fill.value(row));
+					Ok(Some(pad_string(
+						value,
+						integer_value_at(length, row, "LPAD/RPAD")?.unwrap(),
+						fill,
+						left,
+					)?))
+				})
+				.collect::<Result<StringArray, ExecutionError>>()?,
+		) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<LargeStringArray>() {
+		let fill = fill
+			.map(|fill| {
+				fill.as_any()
+					.downcast_ref::<LargeStringArray>()
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: format!(
+							"LPAD/RPAD expects the fill to match the input string type, got {:?}",
+							fill.data_type()
+						),
+					})
+			})
+			.transpose()?;
+		return Ok(Arc::new(
+			(0..input.len())
+				.map(|row| {
+					let value = input.value(row);
+					if input.is_null(row)
+						|| length.is_null(row)
+						|| fill.is_some_and(|fill| fill.is_null(row))
+					{
+						return Ok(None);
+					}
+					let fill = fill.map_or(" ", |fill| fill.value(row));
+					Ok(Some(pad_string(
+						value,
+						integer_value_at(length, row, "LPAD/RPAD")?.unwrap(),
+						fill,
+						left,
+					)?))
+				})
+				.collect::<Result<LargeStringArray, ExecutionError>>()?,
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"LPAD/RPAD expects a string input, got {:?}",
+			input.data_type()
+		),
+	})
+}
+
+fn split_part_string(value: &str, delimiter: &str, part: i64) -> Result<String, ExecutionError> {
+	let part = usize::try_from(part).map_err(|_| ExecutionError::InvalidExpression {
+		message: "SPLIT_PART part number must be positive".to_string(),
+	})?;
+	if part == 0 {
+		return Err(ExecutionError::InvalidExpression {
+			message: "SPLIT_PART part number must be positive".to_string(),
+		});
+	}
+	if delimiter.is_empty() {
+		return Ok((part == 1).then(|| value.to_string()).unwrap_or_default());
+	}
+	Ok(value
+		.split(delimiter)
+		.nth(part - 1)
+		.unwrap_or_default()
+		.to_string())
+}
+
+fn evaluate_split_part(
+	input: &ArrayRef,
+	delimiter: &ArrayRef,
+	part: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	if let (Some(input), Some(delimiter)) = (
+		input.as_any().downcast_ref::<StringArray>(),
+		delimiter.as_any().downcast_ref::<StringArray>(),
+	) {
+		return Ok(Arc::new(
+			(0..input.len())
+				.map(|row| {
+					if input.is_null(row) || delimiter.is_null(row) || part.is_null(row) {
+						return Ok(None);
+					}
+					Ok(Some(split_part_string(
+						input.value(row),
+						delimiter.value(row),
+						integer_value_at(part, row, "SPLIT_PART")?.unwrap(),
+					)?))
+				})
+				.collect::<Result<StringArray, ExecutionError>>()?,
+		) as ArrayRef);
+	}
+	if let (Some(input), Some(delimiter)) = (
+		input.as_any().downcast_ref::<LargeStringArray>(),
+		delimiter.as_any().downcast_ref::<LargeStringArray>(),
+	) {
+		return Ok(Arc::new(
+			(0..input.len())
+				.map(|row| {
+					if input.is_null(row) || delimiter.is_null(row) || part.is_null(row) {
+						return Ok(None);
+					}
+					Ok(Some(split_part_string(
+						input.value(row),
+						delimiter.value(row),
+						integer_value_at(part, row, "SPLIT_PART")?.unwrap(),
+					)?))
+				})
+				.collect::<Result<LargeStringArray, ExecutionError>>()?,
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"SPLIT_PART expects two string arguments of the same type, got {:?} and {:?}",
+			input.data_type(),
+			delimiter.data_type()
 		),
 	})
 }

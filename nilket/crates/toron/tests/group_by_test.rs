@@ -2448,6 +2448,136 @@ async fn adr553_second_batch_uses_the_predicted_existing_signatures() {
 }
 
 #[tokio::test]
+async fn adr553_third_batch_uses_two_new_shapes_for_three_string_functions() {
+	let lpad = run_logical(&plan_sql("SELECT LPAD(region, 6, 'xy') FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&lpad, 0),
+		vec![
+			Some("xyeast".to_string()),
+			Some("xywest".to_string()),
+			Some("xyeast".to_string()),
+			Some("xyeast".to_string()),
+			Some("xywest".to_string()),
+			None,
+		]
+	);
+
+	let rpad = run_logical(&plan_sql("SELECT RPAD(region, 6, 'xy') FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&rpad, 0),
+		vec![
+			Some("eastxy".to_string()),
+			Some("westxy".to_string()),
+			Some("eastxy".to_string()),
+			Some("eastxy".to_string()),
+			Some("westxy".to_string()),
+			None,
+		]
+	);
+
+	let truncation = run_logical(&plan_sql(
+		"SELECT LPAD('east', 2, 'x'), RPAD('east', 2, 'x') FROM sales",
+	))
+	.await;
+	assert_eq!(
+		utf8_column_rows(&truncation, 0)[0..1],
+		[Some("ea".to_string())]
+	);
+	assert_eq!(
+		utf8_column_rows(&truncation, 1)[0..1],
+		[Some("ea".to_string())]
+	);
+
+	let default_fill = run_logical(&plan_sql(
+		"SELECT LPAD('east', 6), RPAD('east', 6) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		utf8_column_rows(&default_fill, 0)[0..1],
+		[Some("  east".to_string())]
+	);
+	assert_eq!(
+		utf8_column_rows(&default_fill, 1)[0..1],
+		[Some("east  ".to_string())]
+	);
+
+	let split_part = run_logical(&plan_sql("SELECT SPLIT_PART('a/b/c', '/', 2) FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&split_part, 0),
+		vec![
+			Some("b".to_string()),
+			Some("b".to_string()),
+			Some("b".to_string()),
+			Some("b".to_string()),
+			Some("b".to_string()),
+			Some("b".to_string()),
+		]
+	);
+
+	let missing = run_logical(&plan_sql("SELECT SPLIT_PART('a/b', '/', 3) FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&missing, 0),
+		vec![Some(String::new()); 6],
+		"SPLIT_PART returns an empty string for a missing field"
+	);
+	let error = execute_sql_err("SELECT SPLIT_PART('a/b', '/', 0) FROM sales").await;
+	assert!(
+		matches!(error, ExecutionError::InvalidExpression { ref message } if message.contains("part number must be positive")),
+		"SPLIT_PART index 0 should be rejected, got {error:?}"
+	);
+	// The current SQL planner rejects unary-negative integer literals before
+	// binding; keep that boundary explicit rather than letting it be accidental.
+	// Once unary-minus literals parse, move this expectation to the executor's
+	// "part number must be positive" error instead.
+	assert_unsupported("SELECT SPLIT_PART('a/b', '/', -1) FROM sales");
+
+	for sql in [
+		"SELECT LPAD('x', 0 - amount) FROM sales",
+		"SELECT SPLIT_PART('a/b', '/', 0 - amount) FROM sales",
+	] {
+		let error = execute_sql_err(sql).await;
+		assert!(
+			matches!(error, ExecutionError::InvalidExpression { ref message } if message.contains("must be") && (message.contains("non-negative") || message.contains("positive"))),
+			"runtime negative scalar argument should be rejected for {sql}, got {error:?}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr553_sql_and_rune_third_batch_share_a_bound_plan_and_digest() {
+	let sql_logical = plan_sql(
+		"SELECT LPAD(region, 6, 'xy'), RPAD(region, 6, 'xy'), SPLIT_PART('a/b/c', '/', 2) FROM sales",
+	);
+	let rune_logical = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([
+                lpad([col("region"), lit(6), lit_str("xy")]),
+                rpad([col("region"), lit(6), lit_str("xy")]),
+                split_part(lit_str("a/b/c"), lit_str("/"), lit(2)),
+            ])
+        }
+    "#,
+	)
+	.await;
+
+	let (catalog, _) = fixture();
+	let sql_bound = bind(&sql_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind SQL third batch");
+	let rune_bound = bind(&rune_logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind Rune third batch");
+	assert_eq!(format!("{sql_bound:?}"), format!("{rune_bound:?}"));
+	assert_eq!(
+		canonical_arrow_ipc_digest(&run_logical(&sql_logical).await, SortPolicy::FullRowLex)
+			.expect("SQL third batch digest"),
+		canonical_arrow_ipc_digest(&run_logical(&rune_logical).await, SortPolicy::FullRowLex)
+			.expect("Rune third batch digest")
+	);
+}
+
+#[tokio::test]
 async fn adr553_string_functions_reject_a_numeric_input() {
 	let (catalog, _) = fixture();
 	for sql in [
