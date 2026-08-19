@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::plot::common::{HitDimensionality, MarkFamily};
 use crate::plot::common::{
 	Orientation, PlotKernel, polars_type_to_axis_type, temporal_axis_domain,
 };
@@ -1459,7 +1461,7 @@ mod product_0013_baseline_tests {
 	}
 
 	#[test]
-	fn product_0013_bridge_hover_prefers_topmost_geometric_hit() {
+	fn product_0133_structured_hit_prefers_point_over_line_regardless_of_paint_order() {
 		let frame = df!("x" => [1.0, 2.0, 3.0], "y" => [2.0, 4.0, 6.0]).expect("frame");
 		let layered = |first, second| {
 			let mut spec = LayeredPlotSpec::new(LayerSpec::xy(first, "x", "y"));
@@ -1473,20 +1475,22 @@ mod product_0013_baseline_tests {
 		let transform = CoordinateTransformer::new(&layout, bounds);
 		let point = transform.cartesian(2.0, 4.0);
 		let cursor = Cursor::Available(Point::new(point.x + 1.8, point.y - 3.6));
-		assert_eq!(
-			line_then_scatter.hover(&transform, cursor),
-			Some("X: 2, Y: 4".to_owned()),
-			"the topmost scatter hit must win over the line beneath it"
-		);
+		let hit = line_then_scatter
+			.hit(&transform, cursor)
+			.expect("overlapping point and line must hit");
+		assert_eq!(hit.mark_family, MarkFamily::SCATTER);
+		assert_eq!(hit.dimensionality, HitDimensionality::Point);
+		assert_eq!(hit.paint_order, 1);
 
 		let scatter_then_line = layered(LayerMark::Scatter, LayerMark::Line);
 		let reverse_layout = scatter_then_line.layout(settings);
 		let reverse_transform = CoordinateTransformer::new(&reverse_layout, bounds);
-		assert_ne!(
-			scatter_then_line.hover(&reverse_transform, cursor),
-			Some("X: 2, Y: 4".to_owned()),
-			"reversing authored order must make the line hit win"
-		);
+		let reversed_hit = scatter_then_line
+			.hit(&reverse_transform, cursor)
+			.expect("reversed overlap must hit");
+		assert_eq!(reversed_hit.mark_family, MarkFamily::SCATTER);
+		assert_eq!(reversed_hit.dimensionality, HitDimensionality::Point);
+		assert_eq!(reversed_hit.paint_order, 0);
 	}
 
 	#[test]

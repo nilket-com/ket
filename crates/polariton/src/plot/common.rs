@@ -1624,7 +1624,10 @@ pub struct MarkHit {
 	pub mark_index: usize,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// Hit geometry precedence from most specific to least specific. Keep the
+/// declaration order load-bearing: PRODUCT-0133 compares these values before
+/// paint order and sibling order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum HitDimensionality {
 	Point,
 	Line,

@@ -10,6 +10,7 @@ use crate::plot::spec::{LayerSettings, NonEmpty, ResolvedLayout};
 use crate::plot::theme::PlotSettings;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
+use std::cmp::Reverse;
 use std::sync::Arc;
 
 pub enum LayerRenderer {
@@ -223,8 +224,9 @@ impl PlotKernel for LayeredPlotKernel {
 		}
 	}
 
-	/// PRODUCT-0013 bridge: topmost painted geometric hit wins, and this
-	/// composite supplies the existing coordinate wording.
+	/// PRODUCT-0133: dimensional specificity wins before paint order, then
+	/// sibling order. A point therefore remains selectable when it overlaps a
+	/// line, regardless of authored layer order.
 	fn hit(
 		&self,
 		transform: &CoordinateTransformer,
@@ -240,38 +242,55 @@ impl PlotKernel for LayeredPlotKernel {
 		settings: &PlotSettings,
 	) -> Option<crate::plot::common::PlotHit> {
 		let layers = self.layers.iter().collect::<Vec<_>>();
-		for (paint_order, layer) in layers.into_iter().enumerate().rev() {
+		let mut best = None;
+		for (paint_order, layer) in layers.into_iter().enumerate() {
 			let resolved = settings.resolve_for_layer(layer.settings());
 			if let Some(hit) = layer.hit_test(transform, cursor, &resolved) {
-				return Some(
-					crate::plot::common::PlotHit::new(
-						layer.mark_family(),
-						layer.dimensionality(),
-						hit.mark_index,
-					)
-					.with_paint_order(paint_order)
-					.labeled(
-						"X",
-						crate::plot::common::axis_hit_semantic_type(&self.x_axis_type),
-						crate::plot::common::axis_hit_value(
-							hit.data_x,
-							&self.x_axis_type,
-							format_label(hit.data_x, &self.x_axis_type),
-						),
-					)
-					.labeled(
-						"Y",
-						crate::plot::common::axis_hit_semantic_type(&self.y_axis_type),
-						crate::plot::common::axis_hit_value(
-							hit.data_y,
-							&self.y_axis_type,
-							format_label(hit.data_y, &self.y_axis_type),
-						),
+				let candidate = crate::plot::common::PlotHit::new(
+					layer.mark_family(),
+					layer.dimensionality(),
+					hit.mark_index,
+				)
+				.with_paint_order(paint_order)
+				.labeled(
+					"X",
+					crate::plot::common::axis_hit_semantic_type(&self.x_axis_type),
+					crate::plot::common::axis_hit_value(
+						hit.data_x,
+						&self.x_axis_type,
+						format_label(hit.data_x, &self.x_axis_type),
+					),
+				)
+				.labeled(
+					"Y",
+					crate::plot::common::axis_hit_semantic_type(&self.y_axis_type),
+					crate::plot::common::axis_hit_value(
+						hit.data_y,
+						&self.y_axis_type,
+						format_label(hit.data_y, &self.y_axis_type),
 					),
 				);
+				let candidate_key = (
+					candidate.dimensionality,
+					Reverse(candidate.paint_order),
+					candidate.sibling_ordinal,
+				);
+				let replaces =
+					best.as_ref()
+						.is_none_or(|current: &crate::plot::common::PlotHit| {
+							candidate_key
+								< (
+									current.dimensionality,
+									Reverse(current.paint_order),
+									current.sibling_ordinal,
+								)
+						});
+				if replaces {
+					best = Some(candidate);
+				}
 			}
 		}
-		None
+		best
 	}
 
 	fn legend_content(
