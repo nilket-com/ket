@@ -6249,6 +6249,84 @@ fn now_binding_bakes_the_statement_timestamp_into_the_bound_node() {
 	));
 }
 
+#[test]
+fn current_date_bakes_the_session_zone_date_without_becoming_deterministic() {
+	fn bind_current_date(zone: &str) -> BoundExprProgram {
+		let config = PlannerConfig::default().with_session_timezone(zone);
+		let logical_casts = HashMap::new();
+		let logical_type_registry = LogicalTypeRegistry::default();
+		let ctx = ExprBindContext {
+			config: &config,
+			session_timezone: config.resolved_session_timezone().unwrap(),
+			logical_type_specs: &logical_casts,
+			logical_type_registry: &logical_type_registry,
+			relation_scope: None,
+			// 2024-01-01 00:30:00 UTC: 2023-12-31 in Chicago and
+			// 2024-01-01 in Tokyo.
+			statement_timestamp_nanos: timestamp_ms("2024-01-01T00:30:00Z") * 1_000_000,
+		};
+		bind_expr_program(
+			&[Expr::ScalarFunction {
+				id: crate::ir::ScalarFunctionId::CurrentDate,
+				args: Vec::new(),
+				parameter: crate::ir::ScalarFunctionParameter::None,
+			}],
+			&Arc::new(Schema::empty()),
+			&ctx,
+		)
+		.expect("bind CURRENT_DATE")
+	}
+
+	let chicago = bind_current_date("America/Chicago");
+	let tokyo = bind_current_date("Asia/Tokyo");
+	let chicago_root = chicago.single_root().unwrap();
+	let tokyo_root = tokyo.single_root().unwrap();
+	assert!(matches!(
+		chicago.node(chicago_root),
+		Some(BoundExprNode::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::CurrentDate,
+			parameter: crate::ir::ScalarFunctionParameter::CurrentDate { days },
+			..
+		}) if *days == parse_date_ymd("2023-12-31").unwrap()
+	));
+	assert!(matches!(
+		tokyo.node(tokyo_root),
+		Some(BoundExprNode::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::CurrentDate,
+			parameter: crate::ir::ScalarFunctionParameter::CurrentDate { days },
+			..
+		}) if *days == parse_date_ymd("2024-01-01").unwrap()
+	));
+	let chicago_rebound = bind_current_date("America/Chicago");
+	assert_eq!(
+		postcard::to_stdvec(&chicago).expect("serialize CURRENT_DATE binding"),
+		postcard::to_stdvec(&chicago_rebound).expect("serialize rebound CURRENT_DATE binding")
+	);
+	assert_eq!(chicago.node_type(chicago_root), Some(&DataType::Date32));
+	assert!(matches!(
+		chicago.node(chicago_root),
+		Some(BoundExprNode::ScalarFunction { .. })
+	));
+	let output = Executor::evaluate_bound_program_without_storage(
+		&chicago,
+		&temporal_batch(timestamp_ms("2024-01-01T00:00:00Z"), 0),
+	)
+	.expect("evaluate CURRENT_DATE");
+	let values = output[0]
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("CURRENT_DATE Date32 output");
+	assert_eq!(values.value(0), parse_date_ymd("2023-12-31").unwrap());
+	assert!(
+		!Expr::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::CurrentDate,
+			args: Vec::new(),
+			parameter: crate::ir::ScalarFunctionParameter::None,
+		}
+		.is_deterministic()
+	);
+}
+
 struct AdvancingStatementClock {
 	value: AtomicI64,
 	captures: AtomicUsize,
@@ -6793,17 +6871,195 @@ fn calendar_fixed_interval_mix_rejects() {
 }
 
 #[test]
-fn date32_plus_interval_rejects_in_v1() {
-	let err = try_bind_temporal_expr(
+fn date32_fixed_interval_arithmetic_stays_date_and_rejects_subday_literals() {
+	let program = bind_temporal_expr(
 		Expr::Add(
 			Box::new(Expr::column("signup_date")),
 			Box::new(interval_literal(DAY_NANOS)),
 		),
 		"UTC",
+	);
+	let outputs = Executor::evaluate_bound_program_without_storage(
+		&program,
+		&temporal_batch(
+			timestamp_ms("2024-01-01T00:00:00Z"),
+			parse_date_ymd("2024-01-01").unwrap(),
+		),
 	)
-	.expect_err("Date32 + interval should reject");
+	.expect("evaluate Date32 fixed interval arithmetic");
+	let values = outputs[0]
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("Date32 output");
+	assert_eq!(values.value(0), parse_date_ymd("2024-01-02").unwrap());
+	assert_eq!(program.node_type(program.roots[0]), Some(&DataType::Date32));
 
-	assert!(err.to_string().contains("Date32 +/- Interval is deferred"));
+	let err = try_bind_temporal_expr(
+		Expr::Add(
+			Box::new(Expr::column("signup_date")),
+			Box::new(interval_literal(DAY_NANOS + 1)),
+		),
+		"UTC",
+	)
+	.expect_err("Date32 sub-day interval should reject at bind");
+	assert!(
+		err.to_string()
+			.contains("Date32 +/- Interval requires a whole number of days")
+	);
+}
+
+#[test]
+fn date32_runtime_subday_interval_rejects_without_truncation() {
+	let schema = Arc::new(Schema::new(vec![
+		Field::new("signup_date", DataType::Date32, true),
+		Field::new("delta", DataType::Duration(TimeUnit::Nanosecond), true),
+	]));
+	let config = PlannerConfig::default();
+	let logical_casts = HashMap::new();
+	let logical_type_registry = LogicalTypeRegistry::default();
+	let ctx = ExprBindContext {
+		config: &config,
+		session_timezone: config.resolved_session_timezone().unwrap(),
+		logical_type_specs: &logical_casts,
+		logical_type_registry: &logical_type_registry,
+		relation_scope: None,
+		statement_timestamp_nanos: 0,
+	};
+	let program = bind_expr_program(
+		&[Expr::Add(
+			Box::new(Expr::column("signup_date")),
+			Box::new(Expr::column("delta")),
+		)],
+		&schema,
+		&ctx,
+	)
+	.expect("bind runtime Date32 interval expression");
+	let batch = RecordBatch::try_new(
+		schema,
+		vec![
+			Arc::new(Date32Array::from(vec![Some(
+				parse_date_ymd("2024-01-01").unwrap(),
+			)])) as ArrayRef,
+			Arc::new(DurationNanosecondArray::from(vec![Some(DAY_NANOS + 1)])) as ArrayRef,
+		],
+	)
+	.expect("runtime Date32 interval batch");
+	let err = Executor::evaluate_bound_program_without_storage(&program, &batch)
+		.expect_err("runtime sub-day Date32 interval should reject");
+	assert!(
+		err.to_string()
+			.contains("Date32 +/- Interval requires a whole number of days")
+	);
+}
+
+#[test]
+fn date32_difference_returns_signed_days_and_integer_arithmetic_is_checked() {
+	let difference = bind_temporal_expr(
+		Expr::Sub(
+			Box::new(Expr::column("signup_date")),
+			Box::new(date32_literal(parse_date_ymd("2024-01-03").unwrap())),
+		),
+		"UTC",
+	);
+	let outputs = Executor::evaluate_bound_program_without_storage(
+		&difference,
+		&temporal_batch(
+			timestamp_ms("2024-01-01T00:00:00Z"),
+			parse_date_ymd("2024-01-01").unwrap(),
+		),
+	)
+	.expect("evaluate Date32 difference");
+	let values = outputs[0]
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("Int32 date difference");
+	assert_eq!(values.value(0), -2);
+
+	let plus_integer = bind_temporal_expr(
+		Expr::Add(
+			Box::new(Expr::column("signup_date")),
+			Box::new(Expr::Literal(ScalarValue::Int64(Some(7)))),
+		),
+		"UTC",
+	);
+	let outputs = Executor::evaluate_bound_program_without_storage(
+		&plus_integer,
+		&temporal_batch(
+			timestamp_ms("2024-01-01T00:00:00Z"),
+			parse_date_ymd("2024-01-01").unwrap(),
+		),
+	)
+	.expect("evaluate Date32 integer arithmetic");
+	let values = outputs[0]
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("Date32 integer output");
+	assert_eq!(values.value(0), parse_date_ymd("2024-01-08").unwrap());
+
+	let reversed_plus = bind_temporal_expr(
+		Expr::Add(
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(7)))),
+			Box::new(Expr::column("signup_date")),
+		),
+		"UTC",
+	);
+	let outputs = Executor::evaluate_bound_program_without_storage(
+		&reversed_plus,
+		&temporal_batch(
+			timestamp_ms("2024-01-01T00:00:00Z"),
+			parse_date_ymd("2024-01-01").unwrap(),
+		),
+	)
+	.expect("evaluate reversed Date32 integer arithmetic");
+	let values = outputs[0]
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("reversed Date32 integer output");
+	assert_eq!(values.value(0), parse_date_ymd("2024-01-08").unwrap());
+
+	let err = try_bind_temporal_expr(
+		Expr::Sub(
+			Box::new(date32_literal(i32::MAX)),
+			Box::new(date32_literal(i32::MIN)),
+		),
+		"UTC",
+	)
+	.expect_err("range-extreme Date32 difference should reject");
+	assert!(err.to_string().contains("temporal arithmetic overflow"));
+
+	let err = try_bind_temporal_expr(
+		Expr::Add(
+			Box::new(Expr::column("event_time")),
+			Box::new(Expr::Literal(ScalarValue::Int32(Some(7)))),
+		),
+		"UTC",
+	)
+	.expect_err("Timestamp plus bare integer should remain unsupported");
+	assert!(err.to_string().contains("arithmetic operands must be"));
+}
+
+#[test]
+fn calendar_interval_add_is_commutative_for_date32() {
+	let program = bind_temporal_expr(
+		Expr::Add(
+			Box::new(calendar_month_literal(1)),
+			Box::new(Expr::column("signup_date")),
+		),
+		"UTC",
+	);
+	let outputs = Executor::evaluate_bound_program_without_storage(
+		&program,
+		&temporal_batch(
+			timestamp_ms("2024-01-01T00:00:00Z"),
+			parse_date_ymd("2024-01-31").unwrap(),
+		),
+	)
+	.expect("evaluate CalendarMonthInterval + Date32");
+	let values = outputs[0]
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("Date32 output");
+	assert_eq!(values.value(0), parse_date_ymd("2024-02-29").unwrap());
 }
 
 #[tokio::test]

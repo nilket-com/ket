@@ -418,6 +418,7 @@ pub(crate) fn adr151_session_zoned_temporal_operations_are_bound_and_toron_execu
 pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 	let binder = binder_source();
 	let ir = source("src/ir.rs");
+	let scalar = source("src/ir/scalar_function.rs");
 	let execution_ir = source("src/ir/execution.rs");
 	let planner = source("src/sql_planner.rs");
 	let exec = exec_source();
@@ -434,6 +435,9 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 	let contains_column = source_block(&planner, "fn expr_contains_nonaggregate_column_reference");
 
 	assert!(ir.contains("Interval(Option<i64>)"));
+	assert!(scalar.contains("CurrentDate { days: i32 }"));
+	assert!(scalar.contains("sql_name: \"CURRENT_DATE\""));
+	assert!(scalar.contains("signature: ScalarFunctionSignature::NiladicDate"));
 	assert!(ir.contains("pub fn interval_data_type() -> DataType"));
 	assert!(ir.contains("DataType::Duration(TimeUnit::Nanosecond)"));
 	assert!(ir.contains("Self::Interval(_) => interval_data_type()"));
@@ -451,7 +455,7 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 				.expect("numeric branch")
 	);
 	assert!(binder.contains("fn fold_temporal_arithmetic"));
-	assert!(binder.contains("Date32 +/- Interval is deferred"));
+	assert!(binder.contains("Date32 +/- Interval requires a whole number of days"));
 	assert!(binder.contains("mixed-unit Timestamp - Timestamp is deferred in ADR 152"));
 	assert!(binder.contains("not exactly representable at {} precision"));
 	assert!(lower_expr.contains("SqlExpr::Interval(interval) => lower_interval_literal(interval)"));
@@ -480,6 +484,9 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 	assert!(temporal_exec.contains("Timestamp + Timestamp is not supported"));
 	assert!(temporal_exec.contains("Interval - Timestamp is not supported"));
 	assert!(exec.contains("fn checked_interval_nanos_to_timestamp_ticks_exec"));
+	assert!(exec.contains("ScalarFunctionId::CurrentDate"));
+	assert!(rune.contains("pub fn current_date()"));
+	assert!(rune.contains("rune_current_date_uses_the_statement_stable_scalar_identifier"));
 	assert!(!temporal_exec.contains("arrow::compute"));
 	assert!(pbc.contains("fixed-duration interval arithmetic is not PBC-eligible"));
 	assert!(pbc.contains("DataType::Duration(TimeUnit::Nanosecond)"));
@@ -519,7 +526,11 @@ pub(crate) fn adr152_fixed_duration_interval_delta_arithmetic_is_toron_only() {
 		"calendar_interval_runtime_array_arithmetic_uses_year_month",
 		"calendar_interval_comparison_rejects",
 		"calendar_fixed_interval_mix_rejects",
-		"date32_plus_interval_rejects_in_v1",
+		"date32_fixed_interval_arithmetic_stays_date_and_rejects_subday_literals",
+		"date32_runtime_subday_interval_rejects_without_truncation",
+		"date32_difference_returns_signed_days_and_integer_arithmetic_is_checked",
+		"calendar_interval_add_is_commutative_for_date32",
+		"current_date_bakes_the_session_zone_date_without_becoming_deterministic",
 		"rune_interval_arithmetic_matches_sql",
 		"rune_calendar_interval_arithmetic_matches_sql",
 	] {

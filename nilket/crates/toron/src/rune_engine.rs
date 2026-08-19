@@ -1098,6 +1098,16 @@ pub fn now() -> RuneExpr {
 	}
 }
 
+pub fn current_date() -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::CurrentDate,
+			args: Vec::new(),
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 pub fn greatest(args: Vec<RuneExpr>) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -1935,6 +1945,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["least"], least).build()?;
 	m.function(["random"], random).build()?;
 	m.function(["now"], now).build()?;
+	m.function(["current_date"], current_date).build()?;
 	m.function(["substring"], substring).build()?;
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
@@ -2415,6 +2426,19 @@ mod tests {
 			expr,
 			Expr::ScalarFunction {
 				id: ScalarFunctionId::Now,
+				args,
+				parameter: ScalarFunctionParameter::None,
+			} if args.is_empty()
+		));
+	}
+
+	#[test]
+	fn rune_current_date_uses_the_statement_stable_scalar_identifier() {
+		let expr = current_date().expr;
+		assert!(matches!(
+			expr,
+			Expr::ScalarFunction {
+				id: ScalarFunctionId::CurrentDate,
 				args,
 				parameter: ScalarFunctionParameter::None,
 			} if args.is_empty()

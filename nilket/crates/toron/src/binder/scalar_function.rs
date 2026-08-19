@@ -535,6 +535,21 @@ pub(super) fn bind_scalar_function(
 				},
 				DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
 			)),
+		ScalarFunctionSignature::NiladicDate => {
+			let days = crate::timestamp::date32_from_utc_timestamp_nanos(
+				ctx.statement_timestamp_nanos,
+				ctx.session_timezone,
+			)
+			.map_err(|error| BindingError::TypeMismatch {
+				message: error.to_string(),
+			})?;
+			Ok(builder.append_parameterized_scalar_function(
+				id,
+				bound_args,
+				ScalarFunctionParameter::CurrentDate { days },
+				DataType::Date32,
+			))
+		}
 		ScalarFunctionSignature::VariadicOrderedSameType => {
 			let [first, rest @ ..] = bound_args.as_slice() else {
 				unreachable!("the registry arity was checked before binding")

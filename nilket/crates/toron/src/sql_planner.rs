@@ -6865,13 +6865,22 @@ impl SqlPlanner {
 			return Ok(None);
 		};
 		let metadata = crate::ir::scalar_function_metadata(id);
-		let mut args = if id == crate::ir::ScalarFunctionId::Now
-			&& matches!(function.args, FunctionArguments::None)
+		let mut args = if matches!(
+			id,
+			crate::ir::ScalarFunctionId::Now | crate::ir::ScalarFunctionId::CurrentDate
+		) && matches!(function.args, FunctionArguments::None)
 		{
 			Vec::new()
 		} else {
 			function_positional_args(function, metadata.sql_name)?
 		};
+		if id == crate::ir::ScalarFunctionId::CurrentDate
+			&& !matches!(function.args, FunctionArguments::None)
+		{
+			return Err(unsupported(
+				"CURRENT_DATE is a value function and does not take parentheses",
+			));
+		}
 		if !metadata.arity.accepts(args.len()) {
 			return Err(unsupported(format!(
 				"{} expects {}, got {}",
@@ -11856,6 +11865,32 @@ mod tests {
 				} if args.is_empty()
 			));
 		}
+	}
+
+	#[test]
+	fn sql_current_date_is_a_no_parentheses_statement_function() {
+		let plan = SqlPlanner::new()
+			.plan("SELECT CURRENT_DATE FROM sales")
+			.expect("plan CURRENT_DATE");
+		let LogicalPlan::Project { exprs, .. } = plan else {
+			panic!("CURRENT_DATE projection must lower to Project");
+		};
+		assert!(matches!(
+			exprs.as_slice(),
+			[Expr::ScalarFunction {
+				id: crate::ir::ScalarFunctionId::CurrentDate,
+				args,
+				parameter: crate::ir::ScalarFunctionParameter::None,
+			}] if args.is_empty()
+		));
+		let error = SqlPlanner::new()
+			.plan("SELECT CURRENT_DATE() FROM sales")
+			.expect_err("CURRENT_DATE parentheses should be rejected");
+		assert!(
+			error
+				.to_string()
+				.contains("CURRENT_DATE is a value function and does not take parentheses")
+		);
 	}
 
 	fn filter_count(plan: &LogicalPlan) -> usize {

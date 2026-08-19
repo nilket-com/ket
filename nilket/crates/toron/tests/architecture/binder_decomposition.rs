@@ -416,6 +416,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// ADR 553: EXTRACT and DATE_TRUNC moved into the typed scalar registry,
 				// including their shared identity-bearing regression fixture.
 				"crates/toron/src/ir/scalar_function.rs",
+				// ADR 557: Date32 arithmetic and CURRENT_DATE add the session-zone
+				// date conversion and checked temporal kernels.
+				"crates/toron/src/date32.rs",
+				"crates/toron/src/timestamp.rs",
 				"crates/toron/tests/non_aggregate_projection_accounting_test.rs",
 				// Plan filenames are zero-padded to four digits; this README documents a
 				// command whose argument is one of the renamed implementation docs.

@@ -707,6 +707,12 @@ fn evaluate_scalar_function(
 				num_rows,
 			));
 		}
+		(
+			ScalarFunctionId::CurrentDate,
+			crate::ir::ScalarFunctionParameter::CurrentDate { days },
+		) => {
+			return Ok(Arc::new(Date32Array::from(vec![Some(*days); num_rows])) as ArrayRef);
+		}
 		_ => {}
 	}
 	if !matches!(parameter, crate::ir::ScalarFunctionParameter::None) {
@@ -938,6 +944,7 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::Ceil
 			| ScalarFunctionEvaluator::CharLength
 			| ScalarFunctionEvaluator::Concat
+			| ScalarFunctionEvaluator::CurrentDate
 			| ScalarFunctionEvaluator::DateTrunc
 			| ScalarFunctionEvaluator::Exp
 			| ScalarFunctionEvaluator::Extract
@@ -3120,10 +3127,61 @@ fn evaluate_temporal_arithmetic(
 		}
 		return Ok(Some(evaluate_calendar_arithmetic(op, left, right)?));
 	}
-	let left_unit = temporal_timestamp_unit(left.data_type())?;
-	let right_unit = temporal_timestamp_unit(right.data_type())?;
+	let left_is_date32 = left.data_type() == &DataType::Date32;
+	let right_is_date32 = right.data_type() == &DataType::Date32;
 	let left_is_interval = left.data_type() == &DataType::Duration(TimeUnit::Nanosecond);
 	let right_is_interval = right.data_type() == &DataType::Duration(TimeUnit::Nanosecond);
+	let left_is_integer = matches!(left.data_type(), DataType::Int32 | DataType::Int64);
+	let right_is_integer = matches!(right.data_type(), DataType::Int32 | DataType::Int64);
+	if (left_is_date32 || right_is_date32)
+		&& (left_is_interval
+			|| right_is_interval
+			|| left_is_integer
+			|| right_is_integer
+			|| (left_is_date32 && right_is_date32))
+	{
+		if left.len() != right.len() {
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"temporal arithmetic operand length mismatch: left {}, right {}",
+					left.len(),
+					right.len()
+				),
+			});
+		}
+		if left_is_date32 && right_is_interval {
+			return Ok(Some(evaluate_date32_fixed_interval(op, left, right)?));
+		}
+		if left_is_interval && right_is_date32 {
+			if matches!(op, ArithmeticOp::Add) {
+				return Ok(Some(evaluate_date32_fixed_interval(op, right, left)?));
+			}
+			return Err(ExecutionError::InvalidExpression {
+				message: "Interval - Date32 is not supported".to_string(),
+			});
+		}
+		if left_is_date32 && right_is_date32 {
+			if matches!(op, ArithmeticOp::Sub) {
+				return Ok(Some(evaluate_date32_difference(left, right)?));
+			}
+			return Err(ExecutionError::InvalidExpression {
+				message: "Date32 + Date32 is not supported".to_string(),
+			});
+		}
+		if left_is_date32 && right_is_integer {
+			return Ok(Some(evaluate_date32_integer(op, left, right)?));
+		}
+		if left_is_integer && right_is_date32 {
+			if matches!(op, ArithmeticOp::Add) {
+				return Ok(Some(evaluate_date32_integer(op, right, left)?));
+			}
+			return Err(ExecutionError::InvalidExpression {
+				message: "integer - Date32 is not supported".to_string(),
+			});
+		}
+	}
+	let left_unit = temporal_timestamp_unit(left.data_type())?;
+	let right_unit = temporal_timestamp_unit(right.data_type())?;
 	if left_unit.is_none() && right_unit.is_none() && !left_is_interval && !right_is_interval {
 		return Ok(None);
 	}
@@ -3202,6 +3260,139 @@ fn evaluate_temporal_arithmetic(
 	}
 }
 
+const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+
+fn evaluate_date32_fixed_interval(
+	op: ArithmeticOp,
+	dates: &ArrayRef,
+	intervals: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let dates = dates
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!(
+				"Date32 +/- Interval expects Date32 input, got {:?}",
+				dates.data_type()
+			),
+		})?;
+	let intervals = as_duration_nanos(intervals, "Date32 +/- Interval operand")?;
+	let values = dates
+		.iter()
+		.zip(intervals.iter())
+		.map(|(days, nanos)| {
+			let Some(days) = days else { return Ok(None) };
+			let Some(nanos) = nanos else { return Ok(None) };
+			if nanos % NANOS_PER_DAY != 0 {
+				return Err(ExecutionError::InvalidExpression {
+					message: format!(
+						"Date32 +/- Interval requires a whole number of days; got {nanos} nanoseconds"
+					),
+				});
+			}
+			let delta = nanos / NANOS_PER_DAY;
+			let result = match op {
+				ArithmeticOp::Add => i128::from(days) + i128::from(delta),
+				ArithmeticOp::Sub => i128::from(days) - i128::from(delta),
+				_ => {
+					return Err(ExecutionError::InvalidExpression {
+						message: "Date32 interval multiplication and division are not supported"
+							.to_string(),
+					});
+				}
+			};
+			let result = i32::try_from(result)
+				.map_err(|_| temporal_arithmetic_overflow_exec(op, &DataType::Date32))?;
+			Ok(Some(result))
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
+}
+
+fn evaluate_date32_integer(
+	op: ArithmeticOp,
+	dates: &ArrayRef,
+	integers: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let dates = dates
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.ok_or_else(|| ExecutionError::InvalidExpression {
+			message: format!(
+				"Date32 integer arithmetic expects Date32 input, got {:?}",
+				dates.data_type()
+			),
+		})?;
+	let values = if let Some(integers) = integers.as_any().downcast_ref::<Int32Array>() {
+		dates
+			.iter()
+			.zip(integers.iter())
+			.map(|(days, delta)| date32_integer_value(op, days, delta.map(i128::from)))
+			.collect::<Result<Vec<_>, ExecutionError>>()?
+	} else if let Some(integers) = integers.as_any().downcast_ref::<Int64Array>() {
+		dates
+			.iter()
+			.zip(integers.iter())
+			.map(|(days, delta)| date32_integer_value(op, days, delta.map(i128::from)))
+			.collect::<Result<Vec<_>, ExecutionError>>()?
+	} else {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"Date32 integer operand must be Int32 or Int64, got {:?}",
+				integers.data_type()
+			),
+		});
+	};
+	Ok(Arc::new(Date32Array::from(values)) as ArrayRef)
+}
+
+fn date32_integer_value(
+	op: ArithmeticOp,
+	days: Option<i32>,
+	delta: Option<i128>,
+) -> Result<Option<i32>, ExecutionError> {
+	let Some(days) = days else { return Ok(None) };
+	let Some(delta) = delta else { return Ok(None) };
+	let result = match op {
+		ArithmeticOp::Add => i128::from(days) + delta,
+		ArithmeticOp::Sub => i128::from(days) - delta,
+		_ => {
+			return Err(ExecutionError::InvalidExpression {
+				message: "Date32 integer multiplication and division are not supported".to_string(),
+			});
+		}
+	};
+	i32::try_from(result)
+		.map(Some)
+		.map_err(|_| temporal_arithmetic_overflow_exec(op, &DataType::Date32))
+}
+
+fn evaluate_date32_difference(
+	left: &ArrayRef,
+	right: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	let left = left
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("Date32 difference left operand");
+	let right = right
+		.as_any()
+		.downcast_ref::<Date32Array>()
+		.expect("Date32 difference right operand");
+	let values = left
+		.iter()
+		.zip(right.iter())
+		.map(|(left, right)| {
+			let Some(left) = left else { return Ok(None) };
+			let Some(right) = right else { return Ok(None) };
+			i32::try_from(i128::from(left) - i128::from(right))
+				.map(Some)
+				.map_err(|_| temporal_arithmetic_overflow_exec(ArithmeticOp::Sub, &DataType::Int32))
+		})
+		.collect::<Result<Vec<_>, ExecutionError>>()?;
+	Ok(Arc::new(Int32Array::from(values)) as ArrayRef)
+}
+
 fn evaluate_calendar_arithmetic(
 	op: ArithmeticOp,
 	left: &ArrayRef,
@@ -3256,6 +3447,11 @@ fn evaluate_calendar_arithmetic(
 				let intervals =
 					as_interval_year_month(right, "Date32 + CalendarMonthInterval right operand")?;
 				evaluate_date32_calendar_interval(op, left, intervals)
+			}
+			(None, None, false, true, true, false) => {
+				let intervals =
+					as_interval_year_month(left, "CalendarMonthInterval + Date32 left operand")?;
+				evaluate_date32_calendar_interval(op, right, intervals)
 			}
 			(None, None, false, false, true, true) => {
 				evaluate_calendar_interval_interval(op, left, right)

@@ -216,12 +216,31 @@ pub(super) fn temporal_arithmetic_output_type(
 	let right_is_interval = is_interval_type(right);
 	let left_is_timestamp = matches!(left, DataType::Timestamp(_, _));
 	let right_is_timestamp = matches!(right, DataType::Timestamp(_, _));
+	let left_is_date32 = matches!(left, DataType::Date32);
+	let right_is_date32 = matches!(right, DataType::Date32);
+	let left_is_integer = matches!(left, DataType::Int32 | DataType::Int64);
+	let right_is_integer = matches!(right, DataType::Int32 | DataType::Int64);
 	let date32_interval = (matches!(left, DataType::Date32) && right_is_interval)
 		|| (left_is_interval && matches!(right, DataType::Date32));
 	if date32_interval && matches!(op, BoundBinaryOp::Add | BoundBinaryOp::Sub) {
-		return Err(BindingError::TypeMismatch {
-			message: "Date32 +/- Interval is deferred; use Timestamp arithmetic".to_string(),
-		});
+		return match (op, left_is_date32, right_is_date32) {
+			(BoundBinaryOp::Add, true, false) | (BoundBinaryOp::Add, false, true) => {
+				Ok(Some(DataType::Date32))
+			}
+			(BoundBinaryOp::Sub, true, false) => Ok(Some(DataType::Date32)),
+			_ => Err(BindingError::TypeMismatch {
+				message: "Interval - Date32 is not supported".to_string(),
+			}),
+		};
+	}
+	if matches!(op, BoundBinaryOp::Sub) && left_is_date32 && right_is_date32 {
+		return Ok(Some(DataType::Int32));
+	}
+	if matches!(op, BoundBinaryOp::Add | BoundBinaryOp::Sub)
+		&& ((left_is_date32 && right_is_integer)
+			|| (matches!(op, BoundBinaryOp::Add) && left_is_integer && right_is_date32))
+	{
+		return Ok(Some(DataType::Date32));
 	}
 	if (left_is_interval || right_is_interval)
 		&& matches!(op, BoundBinaryOp::Mul | BoundBinaryOp::Div)
@@ -351,6 +370,7 @@ pub(super) fn calendar_arithmetic_output_type(
 				Ok(Some(DataType::Timestamp(unit, Some("UTC".into()))))
 			}
 			(false, false, true, false, false, true) => Ok(Some(DataType::Date32)),
+			(false, false, false, true, true, false) => Ok(Some(DataType::Date32)),
 			(false, false, false, false, true, true) => {
 				Ok(Some(calendar_month_interval_data_type()))
 			}
@@ -514,6 +534,13 @@ pub(super) fn fold_calendar_arithmetic(
 			add_date32_calendar_months_for_bind(*days, *months)?,
 		))),
 		(
+			&BoundBinaryOp::Add,
+			ScalarValue::CalendarMonthInterval(Some(months)),
+			ScalarValue::Date32(Some(days)),
+		) => Ok(ScalarValue::Date32(Some(
+			add_date32_calendar_months_for_bind(*days, *months)?,
+		))),
+		(
 			&BoundBinaryOp::Sub,
 			ScalarValue::Date32(Some(days)),
 			ScalarValue::CalendarMonthInterval(Some(months)),
@@ -616,6 +643,62 @@ pub(super) fn fold_temporal_arithmetic(
 			unit: *unit,
 		}),
 		(
+			&BoundBinaryOp::Add,
+			ScalarValue::Date32(Some(days)),
+			ScalarValue::Interval(Some(nanos)),
+		)
+		| (
+			&BoundBinaryOp::Add,
+			ScalarValue::Interval(Some(nanos)),
+			ScalarValue::Date32(Some(days)),
+		) => Ok(ScalarValue::Date32(Some(checked_date32_interval_op(
+			*days, *nanos, op,
+		)?))),
+		(
+			&BoundBinaryOp::Sub,
+			ScalarValue::Date32(Some(days)),
+			ScalarValue::Interval(Some(nanos)),
+		) => Ok(ScalarValue::Date32(Some(checked_date32_interval_op(
+			*days, *nanos, op,
+		)?))),
+		(
+			&BoundBinaryOp::Sub,
+			ScalarValue::Date32(Some(left)),
+			ScalarValue::Date32(Some(right)),
+		) => Ok(ScalarValue::Int32(Some(checked_date32_difference(
+			*left, *right, op,
+		)?))),
+		(&BoundBinaryOp::Add, ScalarValue::Date32(Some(days)), ScalarValue::Int32(Some(delta)))
+		| (&BoundBinaryOp::Add, ScalarValue::Int32(Some(delta)), ScalarValue::Date32(Some(days))) => {
+			Ok(ScalarValue::Date32(Some(checked_date32_integer_op(
+				*days,
+				i128::from(*delta),
+				op,
+			)?)))
+		}
+		(&BoundBinaryOp::Add, ScalarValue::Date32(Some(days)), ScalarValue::Int64(Some(delta)))
+		| (&BoundBinaryOp::Add, ScalarValue::Int64(Some(delta)), ScalarValue::Date32(Some(days))) => {
+			Ok(ScalarValue::Date32(Some(checked_date32_integer_op(
+				*days,
+				i128::from(*delta),
+				op,
+			)?)))
+		}
+		(&BoundBinaryOp::Sub, ScalarValue::Date32(Some(days)), ScalarValue::Int32(Some(delta))) => {
+			Ok(ScalarValue::Date32(Some(checked_date32_integer_op(
+				*days,
+				i128::from(*delta),
+				op,
+			)?)))
+		}
+		(&BoundBinaryOp::Sub, ScalarValue::Date32(Some(days)), ScalarValue::Int64(Some(delta))) => {
+			Ok(ScalarValue::Date32(Some(checked_date32_integer_op(
+				*days,
+				i128::from(*delta),
+				op,
+			)?)))
+		}
+		(
 			&BoundBinaryOp::Sub,
 			ScalarValue::Timestamp {
 				value: Some(timestamp),
@@ -663,6 +746,52 @@ pub(super) fn fold_temporal_arithmetic(
 			),
 		}),
 	}
+}
+
+const NANOS_PER_DAY: i64 = 86_400_000_000_000;
+
+fn checked_date32_interval_op(
+	days: i32,
+	interval_nanos: i64,
+	op: &BoundBinaryOp,
+) -> Result<i32, BindingError> {
+	validate_date32_interval_nanos(interval_nanos)?;
+	checked_date32_integer_op(days, i128::from(interval_nanos / NANOS_PER_DAY), op)
+}
+
+fn validate_date32_interval_nanos(interval_nanos: i64) -> Result<(), BindingError> {
+	if interval_nanos % NANOS_PER_DAY != 0 {
+		return Err(BindingError::TypeMismatch {
+			message: format!(
+				"Date32 +/- Interval requires a whole number of days; got {interval_nanos} nanoseconds"
+			),
+		});
+	}
+	Ok(())
+}
+
+fn checked_date32_integer_op(
+	days: i32,
+	delta: i128,
+	op: &BoundBinaryOp,
+) -> Result<i32, BindingError> {
+	let days = i128::from(days);
+	let result = match op {
+		BoundBinaryOp::Add => days.checked_add(delta),
+		BoundBinaryOp::Sub => days.checked_sub(delta),
+		_ => None,
+	}
+	.ok_or_else(|| temporal_arithmetic_overflow(op, &DataType::Date32))?;
+	i32::try_from(result).map_err(|_| temporal_arithmetic_overflow(op, &DataType::Date32))
+}
+
+fn checked_date32_difference(
+	left: i32,
+	right: i32,
+	op: &BoundBinaryOp,
+) -> Result<i32, BindingError> {
+	let difference = i128::from(left) - i128::from(right);
+	i32::try_from(difference).map_err(|_| temporal_arithmetic_overflow(op, &DataType::Int32))
 }
 
 pub(super) fn checked_timestamp_interval_op(
@@ -1137,6 +1266,18 @@ pub(super) fn bind_arithmetic(
 		return Ok(builder.append_binary(op, left, right, output_type));
 	}
 	if let Some(output_type) = temporal_arithmetic_output_type(&op, &left_type, &right_type)? {
+		if output_type == DataType::Date32 {
+			if matches!(right_type, DataType::Duration(TimeUnit::Nanosecond))
+				&& let Some(ScalarValue::Interval(Some(nanos))) = builder.literal(right)
+			{
+				validate_date32_interval_nanos(*nanos)?;
+			}
+			if matches!(left_type, DataType::Duration(TimeUnit::Nanosecond))
+				&& let Some(ScalarValue::Interval(Some(nanos))) = builder.literal(left)
+			{
+				validate_date32_interval_nanos(*nanos)?;
+			}
+		}
 		if let (Some(left_literal), Some(right_literal)) = (
 			builder.literal(left).cloned(),
 			builder.literal(right).cloned(),

@@ -1016,6 +1016,7 @@ impl BoundExprProgram {
 					ScalarFunctionParameter::CurrentTimestamp { timestamp_nanos } => {
 						format!("<{timestamp_nanos}>")
 					}
+					ScalarFunctionParameter::CurrentDate { days } => format!("<{days}>"),
 				},
 				args.iter()
 					.map(|arg| self.pretty_node(*arg))

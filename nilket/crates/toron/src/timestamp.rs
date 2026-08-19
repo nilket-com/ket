@@ -97,6 +97,22 @@ pub(crate) fn format_utc_timestamp(value: i64, unit: TimeUnit) -> String {
 	format_timestamp_in_zone(value, unit, chrono_tz::UTC)
 }
 
+pub(crate) fn date32_from_utc_timestamp_nanos(
+	value: i64,
+	timezone: Tz,
+) -> Result<i32, TimestampParseError> {
+	let datetime = utc_datetime_from_ticks(value, TimeUnit::Nanosecond)
+		.ok_or_else(|| TimestampParseError::new(&value.to_string(), "timestamp out of range"))?;
+	let local = datetime.with_timezone(&timezone);
+	let days = crate::date32::days_from_civil(
+		i64::from(local.year()),
+		i64::from(local.month()),
+		i64::from(local.day()),
+	);
+	i32::try_from(days)
+		.map_err(|_| TimestampParseError::new(&value.to_string(), "day count out of i32 range"))
+}
+
 pub(crate) fn format_timestamp_in_zone(value: i64, unit: TimeUnit, timezone: Tz) -> String {
 	let Some(datetime) = utc_datetime_from_ticks(value, unit) else {
 		return value.to_string();

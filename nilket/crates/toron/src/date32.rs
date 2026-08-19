@@ -169,7 +169,7 @@ fn iso_year_week(days: i64) -> (i64, u32) {
 	(iso_year, u32::try_from(week).expect("ISO week in range"))
 }
 
-fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+pub(crate) fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
 	let year = year - i64::from(month <= 2);
 	let era = if year >= 0 { year } else { year - 399 } / 400;
 	let year_of_era = year - era * 400;

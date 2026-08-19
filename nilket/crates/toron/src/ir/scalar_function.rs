@@ -31,6 +31,7 @@ pub enum ScalarFunctionId {
 	Ltrim,
 	Lpad,
 	Mod,
+	CurrentDate,
 	Now,
 	Position,
 	Pow,
@@ -66,6 +67,7 @@ pub enum ScalarFunctionParameter {
 	DateTrunc(Box<DateTruncScalarFunctionParameter>),
 	Trim(Box<TrimScalarFunctionParameter>),
 	CurrentTimestamp { timestamp_nanos: i64 },
+	CurrentDate { days: i32 },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -187,6 +189,8 @@ pub enum ScalarFunctionSignature {
 	NiladicFloat,
 	/// No arguments at all, producing the execution's one statement timestamp.
 	NiladicTimestamp,
+	/// No arguments at all, producing the statement's session-zone calendar date.
+	NiladicDate,
 	/// A `Utf8` string, a 1-based start, and an optional length. The bounds are
 	/// **constant** argument positions: they must bind to integer literals, and
 	/// the binder reads their values rather than evaluating them per row.
@@ -272,6 +276,7 @@ pub enum ScalarFunctionEvaluator {
 	Lower,
 	Position,
 	Mod,
+	CurrentDate,
 	Now,
 	Pow,
 	Random,
@@ -827,6 +832,21 @@ const NOW: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Now,
 };
 
+const CURRENT_DATE: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::CurrentDate,
+	sql_name: "CURRENT_DATE",
+	sql_aliases: &[],
+	rune_name: "current_date",
+	arity: ScalarFunctionArity::Exact(0),
+	signature: ScalarFunctionSignature::NiladicDate,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::PerStatement,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::CurrentDate,
+};
+
 const SUBSTRING: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::Substring,
 	sql_name: "SUBSTRING",
@@ -938,6 +958,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	LOWER,
 	LTRIM,
 	MOD,
+	CURRENT_DATE,
 	NOW,
 	POSITION,
 	POW,
@@ -1105,6 +1126,19 @@ mod tests {
 		assert_eq!(
 			scalar_function_from_sql_name("current_timestamp"),
 			Some(ScalarFunctionId::Now)
+		);
+	}
+
+	#[test]
+	fn current_date_is_a_statement_stable_date_registration() {
+		let metadata = scalar_function_metadata(ScalarFunctionId::CurrentDate);
+		assert_eq!(metadata.sql_name, "CURRENT_DATE");
+		assert_eq!(metadata.rune_name, "current_date");
+		assert_eq!(metadata.signature, ScalarFunctionSignature::NiladicDate);
+		assert_eq!(metadata.evaluation, ScalarFunctionEvaluation::PerStatement);
+		assert_eq!(
+			scalar_function_from_sql_name("current_date"),
+			Some(ScalarFunctionId::CurrentDate)
 		);
 	}
 

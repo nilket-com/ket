@@ -162,6 +162,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Ceil".to_string(),
 			"CharLength".to_string(),
 			"Concat".to_string(),
+			"CurrentDate".to_string(),
 			"StringConcat".to_string(),
 			"DateTrunc".to_string(),
 			"Exp".to_string(),
