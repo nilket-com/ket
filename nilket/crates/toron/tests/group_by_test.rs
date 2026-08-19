@@ -9550,3 +9550,50 @@ async fn adr562_rune_string_agg_matches_sql_through_one_identifier() {
 		"SQL and Rune must reach one registry identifier and one result"
 	);
 }
+
+#[tokio::test]
+async fn adr563_exact_quantile_names_are_refused_with_a_directive() {
+	// The refusal is a decision, not ignorance: each error names the honest
+	// alternative instead of dumping the expression.
+	let median = SqlPlanner::new()
+		.plan("SELECT MEDIAN(price) FROM sales")
+		.expect_err("MEDIAN must be refused");
+	assert!(
+		median.to_string().contains("APPROX_QUANTILE(value, 0.5)"),
+		"MEDIAN's refusal must direct to the median spelling, got {median}"
+	);
+
+	let cont_plain = SqlPlanner::new()
+		.plan("SELECT PERCENTILE_CONT(0.5, price) FROM sales")
+		.expect_err("plain PERCENTILE_CONT must be refused");
+	assert!(cont_plain.to_string().contains("APPROX_QUANTILE(value, q)"));
+
+	let cont_within = SqlPlanner::new()
+		.plan("SELECT PERCENTILE_CONT(0.5) WITHIN GROUP (ORDER BY price) FROM sales")
+		.expect_err("WITHIN GROUP PERCENTILE_CONT must be refused");
+	assert!(
+		cont_within
+			.to_string()
+			.contains("APPROX_QUANTILE(value, q)")
+	);
+
+	let disc = SqlPlanner::new()
+		.plan("SELECT PERCENTILE_DISC(0.5, price) FROM sales")
+		.expect_err("PERCENTILE_DISC must be refused");
+	assert!(disc.to_string().contains("does not compute"));
+
+	let grouped = SqlPlanner::new()
+		.plan("SELECT status, MEDIAN(price) FROM sales GROUP BY status")
+		.expect_err("the refusal must fire under GROUP BY too");
+	assert!(grouped.to_string().contains("APPROX_QUANTILE(value, 0.5)"));
+
+	// The table refuses exactly its names: a typo still gets the generic error,
+	// never a quantile lecture.
+	let typo = SqlPlanner::new()
+		.plan("SELECT MEDIANN(price) FROM sales")
+		.expect_err("an unknown name still errs generically");
+	assert!(
+		!typo.to_string().contains("APPROX_QUANTILE"),
+		"the refusal table must not swallow unknown names, got {typo}"
+	);
+}

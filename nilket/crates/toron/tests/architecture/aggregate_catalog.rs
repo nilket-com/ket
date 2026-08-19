@@ -185,3 +185,43 @@ pub(crate) fn adr028_experimental_kernels_excluded_from_grouped_signatures() {
 		.expect("LinearRegress registry entry");
 	assert!(linreg_entry.contains("grouped_supported: false"));
 }
+
+#[test]
+pub(crate) fn adr563_refused_quantile_names_are_an_exact_set() {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
+		.expect("read aggregate catalog source");
+	let refused = brace_blocks_after_marker(&catalog, "fn refused_aggregate_sql_name")
+		.into_iter()
+		.next()
+		.expect("refused aggregate names")
+		.1;
+	// ADR 563: a name leaves this set only through the ADR that decides exact
+	// quantile buffering, spill, and accounting. Additions are review decisions
+	// for the same reason.
+	for name in ["\"MEDIAN\"", "\"PERCENTILE_CONT\"", "\"PERCENTILE_DISC\""] {
+		assert!(refused.contains(name), "refusal table missing {name}");
+	}
+	// Count the quoted SCREAMING_CASE tokens — the name patterns — rather than
+	// raw quotes, which the directive messages also contain.
+	let refused_names = refused
+		.split('"')
+		.skip(1)
+		.step_by(2)
+		.filter(|content| {
+			!content.is_empty()
+				&& content
+					.chars()
+					.all(|character| character.is_ascii_uppercase() || character == '_')
+		})
+		.count();
+	assert_eq!(
+		refused_names, 3,
+		"the refusal table holds exactly its three names; changing the set is a review decision"
+	);
+	// The directive must name the honest alternative, or it is a bare refusal.
+	assert_eq!(refused.matches("APPROX_QUANTILE").count(), 2);
+
+	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
+		.expect("read SQL planner source");
+	assert!(planner.contains("refused_aggregate_message(&f.name)"));
+}

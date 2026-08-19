@@ -776,3 +776,23 @@ mod adr561_registry_tests {
 		assert!(aggregate_entry("COUNT", 2).is_none());
 	}
 }
+
+/// ADR 563: names refused deliberately, with a directive. Each promises an
+/// exact quantile this engine does not compute; aliasing them onto the sketch
+/// would be a result wearing a precision its computation lacks. A name leaves
+/// this table only through the ADR that decides exact-quantile buffering,
+/// spill, and accounting — the guard failing on removal forces that order.
+pub(crate) fn refused_aggregate_sql_name(upper: &str) -> Option<&'static str> {
+	match upper {
+		"MEDIAN" => Some(
+			"MEDIAN implies an exact quantile, which this engine does not compute; \
+			 APPROX_QUANTILE(value, 0.5) states the approximation it makes",
+		),
+		"PERCENTILE_CONT" | "PERCENTILE_DISC" => Some(
+			"PERCENTILE_CONT and PERCENTILE_DISC imply exact quantiles, which this \
+			 engine does not compute; APPROX_QUANTILE(value, q) states the \
+			 approximation it makes",
+		),
+		_ => None,
+	}
+}

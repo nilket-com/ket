@@ -6963,9 +6963,16 @@ impl SqlPlanner {
 					};
 					Ok(crate::ir::time_bucket_scalar_function(interval, ts))
 				}
-				None => self
-					.lower_scalar_function(f)?
-					.ok_or_else(|| unsupported(format!("unsupported expression: {sql_expr:?}"))),
+				None => match self.lower_scalar_function(f)? {
+					Some(lowered) => Ok(lowered),
+					// ADR 563: a deliberately refused name gets its directive
+					// before the generic fallthrough, in the one place every
+					// unrecognized call reaches — plain, WITHIN GROUP, or grouped.
+					None => match refused_aggregate_message(&f.name) {
+						Some(message) => Err(unsupported(message)),
+						None => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
+					},
+				},
 			},
 			_ => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
 		}
@@ -9606,6 +9613,16 @@ fn aggregate_projection_matches_natural(
 	}
 
 	Ok(true)
+}
+
+/// ADR 563: the registry's refused-name directive for a call site, if the name
+/// is one this engine deliberately declines rather than merely does not know.
+fn refused_aggregate_message(name: &ObjectName) -> Option<&'static str> {
+	let [part] = name.0.as_slice() else {
+		return None;
+	};
+	let ident = part.as_ident()?;
+	aggregate_kernel::refused_aggregate_sql_name(&ident.value.to_ascii_uppercase())
 }
 
 fn aggregate_function_name(name: &ObjectName) -> Option<&'static str> {
