@@ -1,6 +1,6 @@
 # ADR 0133: the interaction contract
 
-Status: proposed 2026-08-19. This record is the interaction record PRODUCT-0044
+Status: accepted 2026-08-19. This record is the interaction record PRODUCT-0044
 names when it says the hover half of PRODUCT-0013 §3's bridge "stands until an
 interaction record exists." It replaces that hover half, and it fills the
 round-trip question PRODUCT-0007 §7 deferred for the pane-override layer.
