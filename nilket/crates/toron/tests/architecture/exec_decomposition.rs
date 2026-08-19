@@ -5,12 +5,10 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // ADR 541 adds the caller-deadline context field. ADR 556 adds the statement-clock
 // seam and its execution-context plumbing; both are real context surfaces, not
 // executor logic drifting back — bumped by their measured cost, not rounded up.
-// ADR 560 added roughly twenty lines of aggregate dispatch to the root: three
-// variant lists naming the four spread spellings, in the unbound global path and
-// the two window paths. Aggregates have no metadata registry, so each consumer
-// enumerates `AggregateFunction` by hand — the cost the aggregate-registry cut
-// exists to remove. Ratchet this back down when that lands.
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_580;
+// ADR 560 briefly raised this to 7,580 to hold hand-written aggregate variant
+// lists; ADR 561's registry removed them and relocated the window state init
+// beside its constructors, so the ratchet returns to its pre-560 value.
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_560;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
 

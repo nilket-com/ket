@@ -95,28 +95,21 @@ pub(super) const JOIN_OUTPUT_MATERIALIZATION_MEMORY_CAP_MULTIPLIER: u64 = 16;
 pub(super) const JOIN_SPILL_RETAINED_FOOTPRINT_MEMORY_CAP_MULTIPLIER: u64 = 16;
 
 pub(super) fn grouped_aggregate_is_order_insensitive(aggr_expr: &[BoundAggregateCall]) -> bool {
-	aggr_expr.iter().all(|call| match call.function {
-		AggregateFunction::Sum | AggregateFunction::Avg => call.args.roots.iter().all(|root| {
-			!matches!(
-				call.args.node_type(*root),
-				Some(DataType::Float32 | DataType::Float64)
-			)
-		}),
-
-		AggregateFunction::CountAll
-		| AggregateFunction::Count
-		| AggregateFunction::Min
-		| AggregateFunction::Max => true,
-
-		AggregateFunction::LinearRegress
-		| AggregateFunction::ApproxQuantile(_)
-		// ADR 560: Welford accumulates in Float64 whatever the input type, so
-		// the spread family is order-sensitive even over integer columns —
-		// unlike SUM and AVG, which are safe until a float appears.
-		| AggregateFunction::VarPop
-		| AggregateFunction::VarSamp
-		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => false,
+	// ADR 561: the classification is registry metadata; this predicate only
+	// applies the float qualification the `InsensitiveUnlessFloat` rule names.
+	aggr_expr.iter().all(|call| {
+		match crate::aggregate_kernel::stable_spec_for_function(&call.function).order_sensitivity {
+			crate::aggregate_kernel::AggregateOrderSensitivity::Insensitive => true,
+			crate::aggregate_kernel::AggregateOrderSensitivity::InsensitiveUnlessFloat => {
+				call.args.roots.iter().all(|root| {
+					!matches!(
+						call.args.node_type(*root),
+						Some(DataType::Float32 | DataType::Float64)
+					)
+				})
+			}
+			crate::aggregate_kernel::AggregateOrderSensitivity::Sensitive => false,
+		}
 	})
 }
 

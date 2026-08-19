@@ -6,6 +6,19 @@ fn ir_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/ir.rs")).expect("read IR source")
 }
 
+/// ADR 561: aggregate logical-type classification lives in the registry, so
+/// these guards read the entry that names itself rather than a binder match.
+fn aggregate_entry_block(kind: &str) -> String {
+	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
+		.expect("read aggregate catalog source");
+	catalog
+		.split(&format!("kind: StableAggregateKernel::{kind},"))
+		.nth(1)
+		.and_then(|rest| rest.split("},").next())
+		.unwrap_or_else(|| panic!("no registry entry for {kind}"))
+		.to_string()
+}
+
 fn execution_source() -> String {
 	std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source")
@@ -501,19 +514,21 @@ pub(crate) fn adr113_min_max_preserve_aggregate_identity() {
 
 	assert!(output_identity.contains("call.args.root_logical_type(0)"));
 	assert!(output_identity.contains("call.args.root_type(0)"));
-	assert!(output_identity.contains("AggregateFunction::Min | AggregateFunction::Max"));
+	// ADR 561: the binder implements the three rules without naming functions;
+	// the registry entries classify themselves.
+	assert!(output_identity.contains("AggregateLogicalTypeRule::Preserve"));
 	assert!(output_identity.contains("input_type != output_type"));
-	assert!(output_identity.contains("AggregateFunction::Sum | AggregateFunction::Avg"));
+	assert!(output_identity.contains("AggregateLogicalTypeRule::AdditiveUnit"));
 	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
-	for naked in [
-		"AggregateFunction::CountAll",
-		"AggregateFunction::Count",
-		"AggregateFunction::LinearRegress",
-		"AggregateFunction::ApproxQuantile(_)",
-	] {
+	assert!(
+		!output_identity.contains("AggregateFunction::"),
+		"the classification must come from the registry, not a function match"
+	);
+	for preserve in ["Min", "Max"] {
 		assert!(
-			output_identity.contains(naked),
-			"missing naked arm for {naked}"
+			aggregate_entry_block(preserve)
+				.contains("logical_type: AggregateLogicalTypeRule::Preserve"),
+			"{preserve} must preserve its input's logical identity"
 		);
 	}
 }
@@ -524,8 +539,15 @@ pub(crate) fn adr168_sum_avg_preserve_only_declared_unit_identity() {
 	let output_identity = source_block(&binder, "fn aggregate_output_logical_type");
 	let additive = source_block(&binder, "fn additive_unit_aggregate_logical_type");
 
-	assert!(output_identity.contains("AggregateFunction::Sum | AggregateFunction::Avg"));
+	assert!(output_identity.contains("AggregateLogicalTypeRule::AdditiveUnit"));
 	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
+	for additive_unit in ["Sum", "Avg"] {
+		assert!(
+			aggregate_entry_block(additive_unit)
+				.contains("logical_type: AggregateLogicalTypeRule::AdditiveUnit"),
+			"{additive_unit} must route through the additive-unit rule"
+		);
+	}
 	assert!(additive.contains("call.args.root_logical_type(0)"));
 	assert!(additive.contains("call.args.root_type(0)"));
 	assert!(additive.contains("logical_arithmetic_domain_for_type(logical_type, logical_types)?"));
@@ -567,15 +589,25 @@ pub(crate) fn adr168_count_and_statistical_aggregates_stay_naked() {
 	let binder = binder_source();
 	let output_identity = source_block(&binder, "fn aggregate_output_logical_type");
 
+	assert!(
+		output_identity.contains("AggregateLogicalTypeRule::Naked => Ok(LogicalTypeId::NAKED)")
+	);
+	// ADR 561: the naked set is registry data. The spread family joined it in
+	// ADR 560 — a spread is a Float64 magnitude, not a value in the input's
+	// unit — and this exact set must change deliberately.
 	for naked in [
-		"AggregateFunction::CountAll",
-		"AggregateFunction::Count",
-		"AggregateFunction::LinearRegress",
-		"AggregateFunction::ApproxQuantile(_)",
+		"CountAll",
+		"Count",
+		"ApproxQuantile",
+		"VarPop",
+		"VarSamp",
+		"StddevPop",
+		"StddevSamp",
+		"LinearRegress",
 	] {
 		assert!(
-			output_identity.contains(naked),
-			"missing naked aggregate arm for {naked}"
+			aggregate_entry_block(naked).contains("logical_type: AggregateLogicalTypeRule::Naked"),
+			"{naked} must stay naked"
 		);
 	}
 }
@@ -625,7 +657,7 @@ pub(crate) fn adr169_sum_avg_reject_non_additive_identity() {
 	let output_identity = source_block(&binder, "fn aggregate_output_logical_type");
 	let additive = source_block(&binder, "fn additive_unit_aggregate_logical_type");
 
-	assert!(output_identity.contains("AggregateFunction::Sum | AggregateFunction::Avg"));
+	assert!(output_identity.contains("AggregateLogicalTypeRule::AdditiveUnit"));
 	assert!(output_identity.contains("additive_unit_aggregate_logical_type"));
 	assert!(additive.contains("AggregateFunction::Sum => \"SUM\""));
 	assert!(additive.contains("AggregateFunction::Avg => \"AVG\""));
@@ -831,8 +863,8 @@ pub(crate) fn adr170_comparison_selection_stay_identity_aware() {
 	}
 	assert!(comparison.contains("nominal_compatible("));
 	assert!(in_list.contains("nominal_compatible("));
-	assert!(aggregate_output.contains("AggregateFunction::Min | AggregateFunction::Max"));
-	assert!(aggregate_output.contains("AggregateFunction::Count"));
+	assert!(aggregate_output.contains("AggregateLogicalTypeRule::Preserve"));
+	assert!(aggregate_output.contains("AggregateLogicalTypeRule::Naked"));
 }
 
 #[test]

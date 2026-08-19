@@ -12,37 +12,28 @@ pub(super) fn bind_aggregate_call(
 			args: BoundExprProgramBuilder::new().build(),
 		});
 	}
-	if let Some(spec) = aggregate_kernel::stable_spec_for_function(function) {
-		return bind_stable_aggregate_call(function, args, input_schema, ctx, spec);
-	}
-	match function {
-		AggregateFunction::LinearRegress => {
-			if !ctx.config.allow_experimental_kernels {
-				return Err(BindingError::ExperimentalKernel {
-					kernel: "LinearRegress",
-				});
-			}
-			let args = args
-				.iter()
-				.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, ctx))
-				.collect::<Result<Vec<_>, _>>()?;
-			Ok(BoundAggregateCall {
-				function: function.clone(),
-				args: merge_aggregate_args(args),
-			})
+	let spec = aggregate_kernel::stable_spec_for_function(function);
+	// ADR 561: the gate reads metadata; the experimental bind path stays the
+	// kernel's own, binding each argument separately and merging.
+	if spec.experimental {
+		if !ctx.config.allow_experimental_kernels {
+			return Err(BindingError::ExperimentalKernel {
+				// The error names the kernel in its historical spelling, which
+				// tests pin; a second experimental kernel should generalize
+				// this field rather than reuse the name.
+				kernel: "LinearRegress",
+			});
 		}
-		AggregateFunction::CountAll
-		| AggregateFunction::Count
-		| AggregateFunction::Sum
-		| AggregateFunction::Min
-		| AggregateFunction::Max
-		| AggregateFunction::Avg
-		| AggregateFunction::ApproxQuantile(_)
-		| AggregateFunction::VarPop
-		| AggregateFunction::VarSamp
-		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => unreachable!("stable aggregate metadata missing"),
+		let args = args
+			.iter()
+			.map(|expr| bind_expr_program(std::slice::from_ref(expr), input_schema, ctx))
+			.collect::<Result<Vec<_>, _>>()?;
+		return Ok(BoundAggregateCall {
+			function: function.clone(),
+			args: merge_aggregate_args(args),
+		});
 	}
+	bind_stable_aggregate_call(function, args, input_schema, ctx, spec)
 }
 
 pub(super) fn bind_stable_aggregate_call(
@@ -59,7 +50,7 @@ pub(super) fn bind_stable_aggregate_call(
 			message: "APPROX_QUANTILE requires a finite quantile literal in [0, 1]".to_string(),
 		});
 	}
-	if args.len() != aggregate_arity_len(spec.arity) {
+	if args.len() != spec.arity.len() {
 		return Err(BindingError::UnsupportedExpression {
 			message: format!("{} requires one argument", spec.sql_name),
 		});
@@ -199,13 +190,6 @@ pub(super) fn offset_bound_node(
 	}
 }
 
-pub(super) fn aggregate_arity_len(arity: AggregateArity) -> usize {
-	match arity {
-		AggregateArity::Zero => 0,
-		AggregateArity::One => 1,
-	}
-}
-
 pub(super) fn aggregate_type_mismatch_message(
 	kernel: StableAggregateKernel,
 	data_type: &DataType,
@@ -237,6 +221,9 @@ pub(super) fn aggregate_type_mismatch_message(
 		}
 		StableAggregateKernel::CountAll | StableAggregateKernel::Count => {
 			unreachable!("COUNT accepts any input type")
+		}
+		StableAggregateKernel::LinearRegress => {
+			unreachable!("LINEAR_REGRESS binds through its own experimental path")
 		}
 	}
 }
@@ -334,21 +321,7 @@ pub(super) fn aggregate_field(
 	call: &BoundAggregateCall,
 	logical_types: &LogicalTypeRegistry,
 ) -> Result<Field, BindingError> {
-	let field =
-		aggregate_kernel::stable_output_field(call).unwrap_or_else(|| match call.function {
-			AggregateFunction::LinearRegress => Field::new("linreg", DataType::Float64, true),
-			AggregateFunction::ApproxQuantile(_) => Field::new("quantile", DataType::Float64, true),
-			AggregateFunction::CountAll
-			| AggregateFunction::Count
-			| AggregateFunction::Sum
-			| AggregateFunction::Min
-			| AggregateFunction::Max
-			| AggregateFunction::Avg
-			| AggregateFunction::VarPop
-			| AggregateFunction::VarSamp
-			| AggregateFunction::StddevPop
-			| AggregateFunction::StddevSamp => unreachable!("stable aggregate metadata missing"),
-		});
+	let field = aggregate_kernel::stable_output_field(call);
 	let logical_type = aggregate_output_logical_type(call, field.data_type(), logical_types)?;
 	if logical_type.is_naked() {
 		Ok(field)
@@ -367,8 +340,10 @@ pub(super) fn aggregate_output_logical_type(
 	output_type: &DataType,
 	logical_types: &LogicalTypeRegistry,
 ) -> Result<LogicalTypeId, BindingError> {
-	match call.function {
-		AggregateFunction::Min | AggregateFunction::Max => {
+	// ADR 561: the rule is registry metadata; this fn implements the three
+	// behaviors and never matches on which function was called.
+	match aggregate_kernel::stable_spec_for_function(&call.function).logical_type {
+		AggregateLogicalTypeRule::Preserve => {
 			let Some(logical_type) = call.args.root_logical_type(0) else {
 				return Ok(LogicalTypeId::NAKED);
 			};
@@ -381,19 +356,10 @@ pub(super) fn aggregate_output_logical_type(
 				Ok(logical_type)
 			}
 		}
-		AggregateFunction::Sum | AggregateFunction::Avg => {
+		AggregateLogicalTypeRule::AdditiveUnit => {
 			additive_unit_aggregate_logical_type(call, output_type, logical_types)
 		}
-		AggregateFunction::CountAll
-		| AggregateFunction::Count
-		| AggregateFunction::LinearRegress
-		| AggregateFunction::ApproxQuantile(_)
-		// A spread is a Float64 magnitude, not a value in the input's unit, so
-		// it carries no logical type forward.
-		| AggregateFunction::VarPop
-		| AggregateFunction::VarSamp
-		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => Ok(LogicalTypeId::NAKED),
+		AggregateLogicalTypeRule::Naked => Ok(LogicalTypeId::NAKED),
 	}
 }
 

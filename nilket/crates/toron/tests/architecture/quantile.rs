@@ -98,10 +98,15 @@ pub(crate) fn adr083_fragment_plan_construction_requires_real_execution_context(
 pub(crate) fn adr546_quantile_has_one_stable_authoritative_execution_path() {
 	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
 		.expect("read aggregate catalog source");
-	assert!(catalog.contains(
-		"AggregateFunction::ApproxQuantile(_) => Some(StableAggregateKernel::ApproxQuantile)"
-	));
-	assert!(catalog.contains("\"LINEAR_REGRESS\" => Some(\"LINEAR_REGRESS\")"));
+	// ADR 561: the mapping is total, so the quantile arm carries no Option.
+	assert!(
+		catalog.contains(
+			"AggregateFunction::ApproxQuantile(_) => StableAggregateKernel::ApproxQuantile"
+		)
+	);
+	// Experimental name resolution derives from the entries' experimental flag
+	// rather than a hand match, so APPROX_QUANTILE cannot drift into it.
+	assert!(catalog.contains("spec.experimental && spec.sql_name == upper"));
 	assert!(!catalog.contains("\"APPROX_QUANTILE\" => Some(\"APPROX_QUANTILE\")"));
 
 	let aggregate = std::fs::read_to_string(manifest_dir().join("src/exec/aggregate.rs"))

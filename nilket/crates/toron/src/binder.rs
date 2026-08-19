@@ -13,7 +13,8 @@ use arrow::record_batch::{RecordBatch, RecordBatchOptions};
 use chrono_tz::Tz;
 
 use crate::aggregate_kernel::{
-	self, AggregateArity, AggregateInputDomain, AggregateKernelSpec, StableAggregateKernel,
+	self, AggregateInputDomain, AggregateKernelSpec, AggregateLogicalTypeRule,
+	StableAggregateKernel,
 };
 use crate::catalog::{
 	Catalog, ColumnGroupTopKFact, ColumnHeavyHitterFact, ColumnRangeDistributionFact,

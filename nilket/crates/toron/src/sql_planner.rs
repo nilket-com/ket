@@ -4237,29 +4237,20 @@ impl SqlPlanner {
 			if lowered.distinct {
 				return Err(unsupported("DISTINCT window aggregates are not supported"));
 			}
+			// ADR 561: window eligibility is registry metadata. A function made
+			// eligible must also gain executor support — the executor asserts
+			// agreement with this same property rather than keeping its own list.
+			if !aggregate_kernel::stable_spec_for_function(&lowered.function).window_eligible {
+				return Err(unsupported(
+					"only COUNT, SUM, MIN, MAX, and AVG window aggregate functions are supported",
+				));
+			}
 			match lowered.function {
 				AggregateFunction::CountAll => (
 					WindowFunction::Aggregate(AggregateFunction::CountAll),
 					Vec::new(),
 				),
-				AggregateFunction::Count
-				| AggregateFunction::Sum
-				| AggregateFunction::Min
-				| AggregateFunction::Max
-				| AggregateFunction::Avg => (WindowFunction::Aggregate(lowered.function), lowered.args),
-				// ADR 560 registers the spread family as grouped aggregates only.
-				// Admitting them as window functions needs the window executor to
-				// carry the Welford accumulator, which is its own cut.
-				AggregateFunction::LinearRegress
-				| AggregateFunction::ApproxQuantile(_)
-				| AggregateFunction::VarPop
-				| AggregateFunction::VarSamp
-				| AggregateFunction::StddevPop
-				| AggregateFunction::StddevSamp => {
-					return Err(unsupported(
-						"only COUNT, SUM, MIN, MAX, and AVG window aggregate functions are supported",
-					));
-				}
+				_ => (WindowFunction::Aggregate(lowered.function), lowered.args),
 			}
 		} else if let Some((value_fn, value_args)) = self.extract_value_function(function)? {
 			(WindowFunction::Value(value_fn), value_args)
@@ -5208,13 +5199,11 @@ impl SqlPlanner {
 			"MIN" => self.lower_min_aggregate(args),
 			"MAX" => self.lower_max_aggregate(args),
 			"AVG" => self.lower_avg_aggregate(args),
-			"VAR_POP" => self.lower_spread_aggregate(AggregateFunction::VarPop, "VAR_POP", args),
-			"VAR_SAMP" => self.lower_spread_aggregate(AggregateFunction::VarSamp, "VAR_SAMP", args),
-			"STDDEV_POP" => {
-				self.lower_spread_aggregate(AggregateFunction::StddevPop, "STDDEV_POP", args)
-			}
-			"STDDEV_SAMP" => {
-				self.lower_spread_aggregate(AggregateFunction::StddevSamp, "STDDEV_SAMP", args)
+			// ADR 561: payload-less aggregates with ordinary arguments lower
+			// through one registry-driven path. A new simple registration joins
+			// this arm rather than adding its own lowering.
+			"VAR_POP" | "VAR_SAMP" | "STDDEV_POP" | "STDDEV_SAMP" => {
+				self.lower_simple_aggregate(name, args)
 			}
 			"LINEAR_REGRESS" => {
 				if matches!(mode, AggregateSqlMode::Grouped) {
@@ -5300,17 +5289,29 @@ impl SqlPlanner {
 	/// ADR 560: all four spread spellings lower identically apart from which
 	/// function they name, so one path serves them and they cannot drift into
 	/// different argument rules.
-	fn lower_spread_aggregate(
+	/// ADR 561: lowering for aggregates whose call carries no payload and whose
+	/// arguments need no special grammar. Resolution takes the name **and** the
+	/// argument count; a name-only lookup is not expressible against the
+	/// registry because `COUNT` legitimately appears at two arities.
+	fn lower_simple_aggregate(
 		&self,
-		function: AggregateFunction,
-		sql_name: &str,
+		name: &str,
 		args: &[FunctionArg],
 	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
-		if args.len() != 1 {
-			return Err(unsupported(format!("{sql_name} requires one argument")));
+		let Some(entry) = aggregate_kernel::aggregate_entry(name, args.len()) else {
+			return Err(unsupported(format!("{name} requires one argument")));
+		};
+		let Some(function) = aggregate_kernel::function_for_payloadless_kind(entry.kind) else {
+			return Err(unsupported(format!("{name} requires its own lowering")));
+		};
+		for arg in args {
+			validate_simple_aggregate_arg(arg)?;
 		}
-		validate_simple_aggregate_arg(&args[0])?;
-		Ok((function, vec![self.lower_arg(&args[0])?]))
+		let lowered = args
+			.iter()
+			.map(|arg| self.lower_arg(arg))
+			.collect::<Result<Vec<_>, _>>()?;
+		Ok((function, lowered))
 	}
 
 	fn lower_linear_regress_aggregate(
@@ -9073,9 +9074,9 @@ pub(crate) fn window_function_default_name(function: &WindowFunction) -> &'stati
 		WindowFunction::Rank => "rank",
 		WindowFunction::DenseRank => "dense_rank",
 		WindowFunction::Ntile { .. } => "ntile",
-		WindowFunction::Aggregate(function) => aggregate_kernel::stable_spec_for_function(function)
-			.map(|spec| spec.output_name)
-			.unwrap_or("window"),
+		WindowFunction::Aggregate(function) => {
+			aggregate_kernel::stable_spec_for_function(function).output_name
+		}
 		WindowFunction::Value(value) => match value {
 			ValueFunction::Lag { .. } => "lag",
 			ValueFunction::Lead { .. } => "lead",
@@ -9653,23 +9654,7 @@ where
 }
 
 fn aggregate_output_name(function: &AggregateFunction) -> &'static str {
-	if let Some(spec) = aggregate_kernel::stable_spec_for_function(function) {
-		return spec.output_name;
-	}
-	match function {
-		AggregateFunction::LinearRegress => "linreg",
-		AggregateFunction::ApproxQuantile(_) => "quantile",
-		AggregateFunction::CountAll
-		| AggregateFunction::Count
-		| AggregateFunction::Sum
-		| AggregateFunction::Min
-		| AggregateFunction::Max
-		| AggregateFunction::Avg
-		| AggregateFunction::VarPop
-		| AggregateFunction::VarSamp
-		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => unreachable!("stable aggregate metadata missing"),
-	}
+	aggregate_kernel::stable_spec_for_function(function).output_name
 }
 
 fn grouped_aggregate_signature(
@@ -9677,7 +9662,7 @@ fn grouped_aggregate_signature(
 	args: &[Expr],
 	distinct: bool,
 ) -> Option<GroupedAggregateSignature> {
-	let kernel = aggregate_kernel::stable_kernel_for_function(function)?;
+	let kernel = aggregate_kernel::stable_kernel_for_function(function);
 	let parameter = match function {
 		AggregateFunction::ApproxQuantile(q) => {
 			let canonical = if *q == 0.0 { 0.0 } else { *q };

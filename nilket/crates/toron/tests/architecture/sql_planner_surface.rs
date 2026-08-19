@@ -116,94 +116,6 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 	assert!(planner.contains("ambiguous HAVING aggregate-call"));
 	assert!(planner.contains("unsupported aggregate function"));
 
-	let lib = std::fs::read_to_string(manifest_dir().join("src/lib.rs")).expect("read lib source");
-	assert!(lib.contains("mod aggregate_kernel;"));
-	assert!(!lib.contains("pub mod aggregate_kernel"));
-
-	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
-		.expect("read aggregate catalog source");
-	assert!(catalog.contains("debug_assert_eq!(spec.kind, kernel);"));
-	let stable_kernel_enum = catalog
-		.split("pub(crate) enum StableAggregateKernel")
-		.nth(1)
-		.and_then(|rest| rest.split("#[derive").next())
-		.expect("stable aggregate kernel enum");
-	for variant in [
-		"CountAll",
-		"Count",
-		"Sum",
-		"Min",
-		"Max",
-		"Avg",
-		"VarPop",
-		"VarSamp",
-		"StddevPop",
-		"StddevSamp",
-		"ApproxQuantile",
-		"VarPop",
-		"VarSamp",
-		"StddevPop",
-		"StddevSamp",
-	] {
-		assert!(
-			stable_kernel_enum.contains(variant),
-			"stable aggregate kernel missing {variant}"
-		);
-	}
-	assert_eq!(enum_variant_count(stable_kernel_enum), 11);
-
-	let stable_rows = catalog
-		.split("STABLE_AGGREGATE_KERNELS")
-		.nth(1)
-		.and_then(|rest| rest.split("];").next())
-		.expect("stable aggregate kernel rows");
-	assert_eq!(stable_rows.matches("AggregateKernelSpec {").count(), 11);
-	for marker in [
-		"kind: StableAggregateKernel::CountAll",
-		"kind: StableAggregateKernel::Count",
-		"kind: StableAggregateKernel::Sum",
-		"kind: StableAggregateKernel::Min",
-		"kind: StableAggregateKernel::Max",
-		"kind: StableAggregateKernel::Avg",
-		"kind: StableAggregateKernel::ApproxQuantile",
-		"kind: StableAggregateKernel::VarPop",
-		"kind: StableAggregateKernel::VarSamp",
-		"kind: StableAggregateKernel::StddevPop",
-		"kind: StableAggregateKernel::StddevSamp",
-		"arity: AggregateArity::Zero",
-		"arity: AggregateArity::One",
-		"input_domain: AggregateInputDomain::Any",
-		"input_domain: AggregateInputDomain::SumNumeric",
-		"input_domain: AggregateInputDomain::AvgNumeric",
-		"input_domain: AggregateInputDomain::OrderedMinMax",
-		"input_domain: AggregateInputDomain::QuantileNumeric",
-		"output_rule: AggregateOutputRule::Int64",
-		"output_rule: AggregateOutputRule::AvgNumeric",
-		"output_rule: AggregateOutputRule::SameAsInput",
-		"output_rule: AggregateOutputRule::SumNumeric",
-		"output_rule: AggregateOutputRule::Float64",
-		"nullable: false",
-		"nullable: true",
-		"grouped_supported: true",
-	] {
-		assert!(stable_rows.contains(marker), "catalog missing {marker}");
-	}
-	assert_eq!(stable_rows.matches("sql_name: \"COUNT\"").count(), 2);
-	for sql_name in ["COUNT", "SUM", "MIN", "MAX", "AVG", "APPROX_QUANTILE"] {
-		assert!(
-			stable_rows.contains(&format!("sql_name: \"{sql_name}\"")),
-			"catalog missing SQL name {sql_name}"
-		);
-	}
-	for output_name in ["count", "sum", "min", "max", "avg", "quantile"] {
-		assert!(
-			stable_rows.contains(&format!("output_name: \"{output_name}\"")),
-			"catalog missing output name {output_name}"
-		);
-	}
-	assert!(!stable_rows.contains("LinearRegress"));
-	assert!(stable_rows.contains("ApproxQuantile"));
-
 	let execution_source = std::fs::read_to_string(manifest_dir().join("src/ir/execution.rs"))
 		.expect("read execution IR source");
 	let filter_disposition = execution_source
@@ -1301,29 +1213,6 @@ pub(crate) fn adr028_nested_aggregate_rejects_at_sql_walk() {
 	}
 	assert!(walker.contains("aggregate_function_name(&function.name).is_some()"));
 	assert!(planner.contains("aggregate arguments must not contain aggregate calls"));
-}
-
-#[test]
-pub(crate) fn adr028_experimental_kernels_excluded_from_grouped_signatures() {
-	let catalog = std::fs::read_to_string(manifest_dir().join("src/aggregate_kernel.rs"))
-		.expect("read aggregate catalog source");
-	let mapping = brace_blocks_after_marker(&catalog, "fn stable_kernel_for_function")
-		.into_iter()
-		.next()
-		.expect("stable kernel for function")
-		.1;
-	assert!(mapping.contains("AggregateFunction::LinearRegress => None"));
-	assert!(mapping.contains(
-		"AggregateFunction::ApproxQuantile(_) => Some(StableAggregateKernel::ApproxQuantile)"
-	));
-	let planner = std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs"))
-		.expect("read SQL planner source");
-	let signature = brace_blocks_after_marker(&planner, "fn grouped_aggregate_signature")
-		.into_iter()
-		.next()
-		.expect("grouped aggregate signature")
-		.1;
-	assert!(signature.contains("aggregate_kernel::stable_kernel_for_function(function)?"));
 }
 
 #[test]

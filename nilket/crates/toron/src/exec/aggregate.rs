@@ -2576,6 +2576,20 @@ pub(in crate::exec) struct QuantileState {
 	owner: bool,
 }
 
+/// ADR 561: the window reject arms read the same registry property the planner
+/// gates on, rather than keeping their own list. Reaching this with a
+/// window-eligible function means the registry was flipped without executor
+/// support — a defect this assert names instead of silently miscomputing.
+pub(in crate::exec) fn non_window_aggregate_error(function: &AggregateFunction) -> ExecutionError {
+	debug_assert!(
+		!crate::aggregate_kernel::stable_spec_for_function(function).window_eligible,
+		"window-eligible aggregate reached the executor without window support"
+	);
+	ExecutionError::NotImplemented {
+		feature: "window experimental aggregate execution",
+	}
+}
+
 /// ADR 560: one Welford step, used by every path that accumulates a spread.
 ///
 /// The naive `sum(x²) − n·mean²` form is accurate on small synthetic data and
@@ -2877,17 +2891,16 @@ fn group_identity_bytes(key: &[GroupValue]) -> Vec<u8> {
 }
 
 fn init_bound_state_for_call(call: &BoundAggregateCall) -> Result<AggState, ExecutionError> {
-	match call.function {
-		AggregateFunction::CountAll | AggregateFunction::Count => Ok(AggState::Count(0)),
-		AggregateFunction::VarPop
-		| AggregateFunction::VarSamp
-		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => Ok(AggState::Spread {
+	// ADR 561: the accumulator family is registry metadata; the per-type
+	// constructor each family applies stays the executor's own.
+	match aggregate_kernel::stable_spec_for_function(&call.function).state_family {
+		aggregate_kernel::AggregateStateFamily::Count => Ok(AggState::Count(0)),
+		aggregate_kernel::AggregateStateFamily::Spread => Ok(AggState::Spread {
 			count: 0,
 			mean: 0.0,
 			m2: 0.0,
 		}),
-		AggregateFunction::Sum => Ok(call
+		aggregate_kernel::AggregateStateFamily::Sum => Ok(call
 			.args
 			.root_type(0)
 			.map(sum_state_for_data_type)
@@ -2895,24 +2908,30 @@ fn init_bound_state_for_call(call: &BoundAggregateCall) -> Result<AggState, Exec
 				total: 0,
 				seen: false,
 			})),
-		AggregateFunction::Min => call
+		aggregate_kernel::AggregateStateFamily::Min => call
 			.args
 			.root_type(0)
 			.map(min_state_for_data_type)
 			.transpose()
 			.map(|state| state.unwrap_or(AggState::MinInt64 { value: None })),
-		AggregateFunction::Max => call
+		aggregate_kernel::AggregateStateFamily::Max => call
 			.args
 			.root_type(0)
 			.map(max_state_for_data_type)
 			.transpose()
 			.map(|state| state.unwrap_or(AggState::MaxInt64 { value: None })),
-		AggregateFunction::Avg => avg_state_for_data_type(first_arg_type(call)?),
-		AggregateFunction::LinearRegress => Ok(AggState::SumInt {
+		aggregate_kernel::AggregateStateFamily::Avg => {
+			avg_state_for_data_type(first_arg_type(call)?)
+		}
+		// The experimental path owns its execution; this placeholder is never
+		// accumulated into because the grouped path rejects downstream.
+		aggregate_kernel::AggregateStateFamily::Experimental => Ok(AggState::SumInt {
 			total: 0,
 			seen: false,
 		}),
-		AggregateFunction::ApproxQuantile(_) => unreachable!("quantile state is shared by program"),
+		aggregate_kernel::AggregateStateFamily::Quantile => {
+			unreachable!("quantile state is shared by program")
+		}
 	}
 }
 
@@ -4024,30 +4043,12 @@ fn avg_column_from_groups(
 
 #[cfg(test)]
 pub(in crate::exec) fn aggregate_state_keyword(function: &AggregateFunction) -> &'static str {
-	aggregate_kernel::stable_spec_for_function(function)
-		.map(|spec| spec.sql_name)
-		.unwrap_or("aggregate")
+	aggregate_kernel::stable_spec_for_function(function).sql_name
 }
 
 #[cfg(test)]
 pub(in crate::exec) fn aggregate_state_output_name(function: &AggregateFunction) -> &'static str {
-	if let Some(spec) = aggregate_kernel::stable_spec_for_function(function) {
-		return spec.output_name;
-	}
-	match function {
-		AggregateFunction::LinearRegress => "linreg",
-		AggregateFunction::ApproxQuantile(_) => "quantile",
-		AggregateFunction::CountAll
-		| AggregateFunction::Count
-		| AggregateFunction::Sum
-		| AggregateFunction::Min
-		| AggregateFunction::Max
-		| AggregateFunction::Avg
-		| AggregateFunction::VarPop
-		| AggregateFunction::VarSamp
-		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => unreachable!("stable aggregate metadata missing"),
-	}
+	aggregate_kernel::stable_spec_for_function(function).output_name
 }
 
 /// ADR 475: the array's concrete type resolved **once**, so accumulation loops stop
@@ -5323,4 +5324,38 @@ mod adr560_spread_tests {
 		let value = spread_finalize(&AggregateFunction::VarPop, count, m2).expect("var_pop");
 		assert!(value.is_nan(), "a non-finite input propagates, got {value}");
 	}
+}
+
+/// ADR 561: the accumulator family is registry metadata; this init applies the
+/// per-type constructor the executor owns for each family. Lives beside those
+/// constructors rather than in the exec root.
+pub(in crate::exec) fn fresh_window_agg_state(
+	function: &AggregateFunction,
+	arg_type: Option<&DataType>,
+) -> Result<Option<AggState>, ExecutionError> {
+	let require_arg = || ExecutionError::InvalidExpression {
+		message: "window aggregate requires an argument type".to_string(),
+	};
+	Ok(
+		match aggregate_kernel::stable_spec_for_function(function).state_family {
+			aggregate_kernel::AggregateStateFamily::Count => None,
+			aggregate_kernel::AggregateStateFamily::Sum => {
+				Some(sum_state_for_data_type(arg_type.ok_or_else(require_arg)?))
+			}
+			aggregate_kernel::AggregateStateFamily::Avg => {
+				Some(avg_state_for_data_type(arg_type.ok_or_else(require_arg)?)?)
+			}
+			aggregate_kernel::AggregateStateFamily::Min => {
+				Some(min_state_for_data_type(arg_type.ok_or_else(require_arg)?)?)
+			}
+			aggregate_kernel::AggregateStateFamily::Max => {
+				Some(max_state_for_data_type(arg_type.ok_or_else(require_arg)?)?)
+			}
+			// Non-window families carry no window accumulator; the planner never
+			// admits them and the reject arms assert that agreement.
+			aggregate_kernel::AggregateStateFamily::Quantile
+			| aggregate_kernel::AggregateStateFamily::Spread
+			| aggregate_kernel::AggregateStateFamily::Experimental => None,
+		},
+	)
 }

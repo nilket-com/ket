@@ -604,23 +604,7 @@ fn logical_aggregate_output_names(aggr_expr: &[(AggregateFunction, Vec<Expr>)]) 
 		.iter()
 		.map(|(function, _)| {
 			aggregate_kernel::stable_spec_for_function(function)
-				.map(|spec| spec.output_name)
-				.unwrap_or_else(|| match function {
-					AggregateFunction::LinearRegress => "linreg",
-					AggregateFunction::ApproxQuantile(_) => "quantile",
-					AggregateFunction::CountAll
-					| AggregateFunction::Count
-					| AggregateFunction::Sum
-					| AggregateFunction::Min
-					| AggregateFunction::Max
-					| AggregateFunction::Avg
-					| AggregateFunction::VarPop
-					| AggregateFunction::VarSamp
-					| AggregateFunction::StddevPop
-					| AggregateFunction::StddevSamp => {
-						unreachable!("stable aggregate metadata missing")
-					}
-				})
+				.output_name
 				.to_string()
 		})
 		.collect::<Vec<_>>();

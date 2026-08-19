@@ -1,4 +1,5 @@
 use crate::aggregate_kernel;
+
 use crate::distributed::budget::{BudgetDimension, ByteCount, QueryBudget, TaskBudget};
 use crate::distributed::cancellation::DownstreamCancellationContext;
 use crate::distributed::task::{
@@ -118,12 +119,14 @@ mod scan_open;
 
 pub(in crate::exec) use self::aggregate::{
 	AggState, BoundGroupedAggregateGroups, add_avg_value, add_sum_value, avg_state_array,
-	avg_state_for_data_type, finalize_global_aggregate_state, init_global_aggregate_state,
-	max_state_for_data_type, min_max_state_array, min_state_for_data_type, numeric_value,
-	sum_state_array, sum_state_for_data_type, update_max_state, update_min_state,
+	finalize_global_aggregate_state, fresh_window_agg_state, init_global_aggregate_state,
+	min_max_state_array, numeric_value, sum_state_array, update_max_state, update_min_state,
 };
 #[cfg(test)]
-pub(in crate::exec) use self::aggregate::{aggregate_state_keyword, aggregate_state_output_name};
+pub(in crate::exec) use self::aggregate::{
+	aggregate_state_keyword, aggregate_state_output_name, avg_state_for_data_type,
+	max_state_for_data_type, min_state_for_data_type,
+};
 pub(crate) use self::expr::evaluate_cast;
 pub(crate) use self::join::partition_bucket;
 use self::join::{JoinTiming, execute_hash_join, partition_bucket_with_scratch};
@@ -2603,9 +2606,7 @@ fn window_agg_add(
 		| AggregateFunction::VarSamp
 		| AggregateFunction::StddevPop
 		| AggregateFunction::StddevSamp => {
-			return Err(ExecutionError::NotImplemented {
-				feature: "window experimental aggregate execution",
-			});
+			return Err(crate::exec::aggregate::non_window_aggregate_error(function));
 		}
 	}
 	Ok(())
@@ -2637,9 +2638,7 @@ fn window_agg_finalize(
 		| AggregateFunction::VarSamp
 		| AggregateFunction::StddevPop
 		| AggregateFunction::StddevSamp => {
-			return Err(ExecutionError::NotImplemented {
-				feature: "window experimental aggregate execution",
-			});
+			return Err(crate::exec::aggregate::non_window_aggregate_error(function));
 		}
 	})
 }
@@ -2974,28 +2973,6 @@ fn execute_window_value(
 		}
 		None => Ok(taken),
 	}
-}
-
-fn fresh_window_agg_state(
-	function: &AggregateFunction,
-	arg_type: Option<&arrow::datatypes::DataType>,
-) -> Result<Option<AggState>, ExecutionError> {
-	let require_arg = || ExecutionError::InvalidExpression {
-		message: "window aggregate requires an argument type".to_string(),
-	};
-	Ok(match function {
-		AggregateFunction::CountAll | AggregateFunction::Count => None,
-		AggregateFunction::Sum => Some(sum_state_for_data_type(arg_type.ok_or_else(require_arg)?)),
-		AggregateFunction::Avg => Some(avg_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
-		AggregateFunction::Min => Some(min_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
-		AggregateFunction::Max => Some(max_state_for_data_type(arg_type.ok_or_else(require_arg)?)?),
-		AggregateFunction::LinearRegress
-		| AggregateFunction::ApproxQuantile(_)
-		| AggregateFunction::VarPop
-		| AggregateFunction::VarSamp
-		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => None,
-	})
 }
 
 fn take_all(arrays: &[ArrayRef], indices: &UInt32Array) -> Result<Vec<ArrayRef>, ExecutionError> {
