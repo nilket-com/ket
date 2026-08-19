@@ -82,6 +82,13 @@ pub enum Message {
 	Menu(menu::MenuMessage),
 	MinimizeWindow,
 	OpenSettings,
+	/// PRODUCT-0134 §8: something needs the profile store. Unlocks (or begins
+	/// creating) it lazily; never sent at startup.
+	ProfileStoreAccessRequested,
+	ProfilePassphraseChanged(String),
+	ProfilePassphraseConfirmationChanged(String),
+	ProfileUnlockSubmitted,
+	ProfileUnlockCancelled,
 	ResizeWindow(window::Direction),
 	Run,
 	RunSnippet,

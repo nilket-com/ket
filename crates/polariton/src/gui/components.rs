@@ -165,6 +165,7 @@ pub fn main_screen<'a>(
 	local_workspace_offer: Option<&'a std::path::Path>,
 	saved_session: bool,
 	close_without_checkpoint: bool,
+	profile_unlock: Option<&'a crate::profile_store::UnlockPrompt>,
 ) -> Element<'a, Message> {
 	// Baryon's workspace is the sole top-level layout owner.
 	let main_content = container(code_editor.view().map(Message::CodeEditEvent))
@@ -256,12 +257,15 @@ pub fn main_screen<'a>(
 		let _ = local_workspace_offer;
 		container(text("")).into()
 	};
+	let profile_unlock_modal: Element<Message> = profile_unlock
+		.map_or_else(|| container(text("")).into(), profile_unlock_view);
 	stack![
 		main_window,
 		adapter_modal,
 		settings_modal,
 		detail_overlay,
-		local_workspace_overlay
+		local_workspace_overlay,
+		profile_unlock_modal
 	]
 	.into()
 }
@@ -949,6 +953,81 @@ fn settings_dialog_view<'a>(show_column_types: bool) -> Element<'a, Message> {
 		..Default::default()
 	})
 	.into();
+	column![
+		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
+		row![space::horizontal(), dialog, space::horizontal()],
+		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
+	]
+	.into()
+}
+
+/// PRODUCT-0134 §8/§9: the passphrase prompt. Creating a store demands the
+/// double-entry confirmation; unlocking an existing one takes a single entry.
+/// Both inputs are secure. Cancel is always available and always non-modal in
+/// consequence: it closes the prompt and nothing else changes.
+pub fn profile_unlock_view(
+	prompt: &crate::profile_store::UnlockPrompt,
+) -> Element<'static, Message> {
+	let title = if prompt.creating {
+		"Create profile store"
+	} else {
+		"Unlock profile store"
+	};
+	let mut content = column![
+		row![text(title).size(24), space::horizontal()].align_y(Alignment::Center),
+		field(
+			"Passphrase",
+			styled_text_input("", &prompt.passphrase)
+				.secure(true)
+				.on_input(Message::ProfilePassphraseChanged)
+				.on_submit(Message::ProfileUnlockSubmitted),
+		),
+	]
+	.spacing(20)
+	.padding(20);
+	if prompt.creating {
+		content = content.push(field(
+			"Confirm passphrase",
+			styled_text_input("", &prompt.confirmation)
+				.secure(true)
+				.on_input(Message::ProfilePassphraseConfirmationChanged)
+				.on_submit(Message::ProfileUnlockSubmitted),
+		));
+	}
+	if let Some(error) = &prompt.error {
+		content = content.push(
+			text(error.clone())
+				.size(14)
+				.style(|_| iced::widget::text::Style {
+					color: Some(colors::DANGER),
+				}),
+		);
+	}
+	content = content.push(
+		row![
+			space::horizontal(),
+			styled_button("Cancel", Message::ProfileUnlockCancelled, BUTTON_SIZE_DEFAULT),
+			styled_button(
+				if prompt.creating { "Create" } else { "Unlock" },
+				Message::ProfileUnlockSubmitted,
+				BUTTON_SIZE_DEFAULT,
+			),
+		]
+		.spacing(10)
+		.align_y(Alignment::Center),
+	);
+	let dialog: Element<Message> = container(content)
+		.width(Length::Fixed(520.0))
+		.style(|_| container::Style {
+			background: Some(colors::BG_MODAL.into()),
+			border: border::Border {
+				color: colors::BORDER_PRIMARY,
+				width: 1.0,
+				radius: 5.0.into(),
+			},
+			..Default::default()
+		})
+		.into();
 	column![
 		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
 		row![space::horizontal(), dialog, space::horizontal()],

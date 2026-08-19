@@ -105,6 +105,16 @@ struct AppState {
 	pending_runs: VecDeque<PendingRun>,
 	session_id: Option<SessionId>,
 	saved_close_state: SavedCloseState,
+	/// PRODUCT-0134 §7: the saved-connection store, holding its own secret
+	/// session — never libaryon's document session.
+	profile_store: crate::profile_store::ProfileStore,
+	/// Where the store file lives; a field so tests can isolate it. `None`
+	/// only when no configuration directory exists at all.
+	profile_store_path: Option<std::path::PathBuf>,
+	/// PRODUCT-0134 §8: `Some` only between a store-access request and its
+	/// unlock, cancel, or failure. A session that never touches the store
+	/// never sees a prompt.
+	profile_unlock: Option<crate::profile_store::UnlockPrompt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -580,6 +590,9 @@ fn new_with_authority(
 		pending_runs: VecDeque::new(),
 		session_id,
 		saved_close_state: SavedCloseState::Open,
+		profile_store: crate::profile_store::ProfileStore::default(),
+		profile_store_path: crate::profile_store::ProfileStore::default_path(),
+		profile_unlock: None,
 	};
 	sync_workspace_viewport(&mut state);
 	// Eagerly open the session scratch database so SQL always has a target;
@@ -627,6 +640,7 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		None,
 		app_state.session_id.is_some(),
 		app_state.saved_close_state == SavedCloseState::Failed,
+		app_state.profile_unlock.as_ref(),
 	)
 }
 
@@ -2941,6 +2955,89 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::AdapterSelected(adapter_selection) => {
 			app_state.status_msg = format!("Adapter selected: {:?}", adapter_selection);
 			app_state.adapter_state.select(adapter_selection);
+		}
+		// PRODUCT-0134 §8/§9: the profile-store unlock flow. The prompt opens
+		// only on an access request; cancel and failure leave the application
+		// fully usable with no adapter connected — the scratch target is never
+		// silently substituted for a saved profile, and the store is never
+		// cleared, rewritten, or migrated on a failed open.
+		Message::ProfileStoreAccessRequested => {
+			if app_state.profile_store.is_unlocked() {
+				app_state.status_msg = "Profile store unlocked.".into();
+				return Task::none();
+			}
+			let Some(path) = app_state.profile_store_path.clone() else {
+				app_state.status_error =
+					"No configuration directory is available for connection profiles.".into();
+				return Task::none();
+			};
+			app_state.profile_unlock = Some(crate::profile_store::UnlockPrompt::for_store(
+				path.exists(),
+			));
+		}
+		Message::ProfilePassphraseChanged(value) => {
+			if let Some(prompt) = &mut app_state.profile_unlock {
+				prompt.passphrase = zeroize::Zeroizing::new(value);
+			}
+		}
+		Message::ProfilePassphraseConfirmationChanged(value) => {
+			if let Some(prompt) = &mut app_state.profile_unlock {
+				prompt.confirmation = zeroize::Zeroizing::new(value);
+			}
+		}
+		Message::ProfileUnlockSubmitted => {
+			let Some(prompt) = &app_state.profile_unlock else {
+				return Task::none();
+			};
+			let Some(path) = app_state.profile_store_path.clone() else {
+				return Task::none();
+			};
+			let creating = prompt.creating;
+			if prompt.passphrase.is_empty() {
+				if let Some(prompt) = &mut app_state.profile_unlock {
+					prompt.error = Some("A passphrase is required.".to_owned());
+				}
+				return Task::none();
+			}
+			// The first-write flow refuses a mismatched double entry before
+			// any file exists: a typo here would seal an unopenable store.
+			if creating && *prompt.passphrase != *prompt.confirmation {
+				if let Some(prompt) = &mut app_state.profile_unlock {
+					prompt.error = Some("Passphrases do not match.".to_owned());
+				}
+				return Task::none();
+			}
+			let passphrase =
+				zeroize::Zeroizing::new(prompt.passphrase.as_bytes().to_vec());
+			let outcome = if creating {
+				app_state.profile_store.initialize(&path, passphrase)
+			} else {
+				app_state.profile_store.unlock(&path, passphrase)
+			};
+			match outcome {
+				Ok(()) => {
+					app_state.profile_unlock = None;
+					app_state.status_msg = if creating {
+						"Profile store created.".into()
+					} else {
+						"Profile store unlocked.".into()
+					};
+					app_state.status_error.clear();
+				}
+				Err(error) => {
+					// Retry stays available; the sealed file is untouched.
+					if let Some(prompt) = &mut app_state.profile_unlock {
+						prompt.error = Some(error);
+					}
+				}
+			}
+		}
+		Message::ProfileUnlockCancelled => {
+			app_state.profile_unlock = None;
+			// Routine interaction feedback, not an error: the saved-profile
+			// surface is disabled while locked, everything else still works.
+			app_state.status_msg =
+				"Profile store stays locked; ad hoc connections remain available.".into();
 		}
 		Message::AdapterAdHocChanged(value) => {
 			app_state.adapter_state.ad_hoc_connection_string = value;
@@ -11482,6 +11579,132 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 
 		assert!(state.status_error.is_empty());
 		assert!(state.status_detail.is_none());
+		state.code_editor.shutdown();
+	}
+
+	fn profile_store_test_path(tag: &str) -> std::path::PathBuf {
+		let dir = std::env::temp_dir().join(format!(
+			"polariton-0134-state-{tag}-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("temp dir");
+		dir.join("connection_profiles.enc")
+	}
+
+	/// PRODUCT-0134 §8/§9: no prompt without a store-access request, and
+	/// cancelling leaves the application fully usable — routine status, no
+	/// error tone, no adapter connected, scratch not substituted.
+	#[test]
+	fn product_0134_unlock_prompts_only_on_request_and_cancel_is_routine() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let path = profile_store_test_path("cancel");
+		state.profile_store_path = Some(path.clone());
+		assert!(
+			state.profile_unlock.is_none(),
+			"a session that never accesses the store is never prompted"
+		);
+
+		drop(update(&mut state, Message::ProfileStoreAccessRequested));
+		let prompt = state.profile_unlock.as_ref().expect("prompt opened");
+		assert!(prompt.creating, "a missing store enters the creation flow");
+
+		drop(update(&mut state, Message::ProfileUnlockCancelled));
+		assert!(state.profile_unlock.is_none());
+		assert!(
+			state.status_error.is_empty(),
+			"cancelling an unlock is not an error"
+		);
+		assert!(state.status_msg.contains("ad hoc"));
+		assert!(state.adapter_state.connection.is_none());
+		assert!(!path.exists(), "cancel writes nothing");
+		let _ = std::fs::remove_dir_all(path.parent().unwrap());
+		state.code_editor.shutdown();
+	}
+
+	/// PRODUCT-0134 §8: creation is a distinct flow — a mismatched double
+	/// entry refuses without writing a file, because a mistyped creation
+	/// passphrase would seal a store nobody can open.
+	#[test]
+	fn product_0134_creation_double_entry_mismatch_writes_no_file() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		let path = profile_store_test_path("mismatch");
+		state.profile_store_path = Some(path.clone());
+
+		drop(update(&mut state, Message::ProfileStoreAccessRequested));
+		drop(update(
+			&mut state,
+			Message::ProfilePassphraseChanged("one".into()),
+		));
+		drop(update(
+			&mut state,
+			Message::ProfilePassphraseConfirmationChanged("two".into()),
+		));
+		drop(update(&mut state, Message::ProfileUnlockSubmitted));
+		let prompt = state.profile_unlock.as_ref().expect("prompt stays open");
+		assert_eq!(prompt.error.as_deref(), Some("Passphrases do not match."));
+		assert!(!path.exists(), "a mismatch writes no file");
+		assert!(!state.profile_store.is_unlocked());
+
+		drop(update(
+			&mut state,
+			Message::ProfilePassphraseConfirmationChanged("one".into()),
+		));
+		drop(update(&mut state, Message::ProfileUnlockSubmitted));
+		assert!(state.profile_unlock.is_none(), "matching entries create");
+		assert!(state.profile_store.is_unlocked());
+		assert!(path.exists());
+		let _ = std::fs::remove_dir_all(path.parent().unwrap());
+		state.code_editor.shutdown();
+	}
+
+	/// PRODUCT-0134 §9: a wrong passphrase reports, keeps the prompt open for
+	/// retry, and leaves the sealed store byte-identical.
+	#[test]
+	fn product_0134_wrong_passphrase_retries_and_the_store_survives() {
+		let path = profile_store_test_path("retry");
+		let mut seeded = crate::profile_store::ProfileStore::default();
+		seeded
+			.initialize(&path, zeroize::Zeroizing::new(b"right".to_vec()))
+			.expect("seed store");
+		drop(seeded);
+		let sealed = std::fs::read(&path).expect("sealed bytes");
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		state.profile_store_path = Some(path.clone());
+		drop(update(&mut state, Message::ProfileStoreAccessRequested));
+		assert!(
+			!state.profile_unlock.as_ref().expect("prompt").creating,
+			"an existing store enters the unlock flow"
+		);
+		drop(update(
+			&mut state,
+			Message::ProfilePassphraseChanged("wrong".into()),
+		));
+		drop(update(&mut state, Message::ProfileUnlockSubmitted));
+		let prompt = state.profile_unlock.as_ref().expect("prompt stays open");
+		assert!(prompt.error.is_some(), "the failure is reported");
+		assert!(!state.profile_store.is_unlocked());
+		assert_eq!(
+			std::fs::read(&path).expect("sealed bytes"),
+			sealed,
+			"a failed open never touches the store file"
+		);
+
+		drop(update(
+			&mut state,
+			Message::ProfilePassphraseChanged("right".into()),
+		));
+		drop(update(&mut state, Message::ProfileUnlockSubmitted));
+		assert!(state.profile_unlock.is_none(), "retry succeeds");
+		assert!(state.profile_store.is_unlocked());
+		let _ = std::fs::remove_dir_all(path.parent().unwrap());
 		state.code_editor.shutdown();
 	}
 }

@@ -11,7 +11,7 @@
 use libaryon::secrets::SecretSession;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use zeroize::Zeroizing;
 
 pub(crate) const SCHEMA_VERSION: u32 = 1;
@@ -45,8 +45,33 @@ pub struct ProfileStore {
 	profiles: BTreeMap<String, SavedProfile>,
 }
 
+#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 const LOCKED: &str = "The connection profile store is locked.";
 
+/// The passphrase prompt's interface state (PRODUCT-0134 §8/§9). `creating`
+/// selects the first-write flow, a distinct flow from unlocking: it demands a
+/// double-entry confirmation because a mistyped passphrase at creation would
+/// seal a store nobody can ever open. Prompt text lives in zeroizing
+/// containers; the iced input boundary hands over transient `String`s that are
+/// moved in and dropped, never retained.
+#[derive(Default)]
+pub struct UnlockPrompt {
+	pub creating: bool,
+	pub passphrase: Zeroizing<String>,
+	pub confirmation: Zeroizing<String>,
+	pub error: Option<String>,
+}
+
+impl UnlockPrompt {
+	pub fn for_store(path_exists: bool) -> Self {
+		Self {
+			creating: !path_exists,
+			..Self::default()
+		}
+	}
+}
+
+#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 fn valid_name(name: &str) -> Result<&str, String> {
 	let trimmed = name.trim();
 	if trimmed.is_empty() {
@@ -71,7 +96,7 @@ impl ProfileStore {
 	/// any previously loaded state untouched. A missing file refuses: creating
 	/// a store is [`ProfileStore::initialize`], a distinct flow, so a typo in
 	/// a store path can never silently mint an empty store.
-	pub fn unlock(&mut self, path: &PathBuf, passphrase: Zeroizing<Vec<u8>>) -> Result<(), String> {
+	pub fn unlock(&mut self, path: &Path, passphrase: Zeroizing<Vec<u8>>) -> Result<(), String> {
 		let contents = std::fs::read(path)
 			.map_err(|error| format!("could not read the profile store: {error}"))?;
 		self.session.unlock(passphrase)?;
@@ -105,7 +130,7 @@ impl ProfileStore {
 	/// The double-entry confirmation belongs to the prompt, upstream.
 	pub fn initialize(
 		&mut self,
-		path: &PathBuf,
+		path: &Path,
 		passphrase: Zeroizing<Vec<u8>>,
 	) -> Result<(), String> {
 		if path.exists() {
@@ -116,16 +141,19 @@ impl ProfileStore {
 		self.persist(path)
 	}
 
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn lock(&mut self) {
 		self.session.lock();
 		self.profiles.clear();
 	}
 
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn names(&self) -> Result<Vec<&str>, String> {
 		self.require_unlocked()?;
 		Ok(self.profiles.keys().map(String::as_str).collect())
 	}
 
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn get(&self, name: &str) -> Result<&SavedProfile, String> {
 		self.require_unlocked()?;
 		self.profiles
@@ -134,9 +162,10 @@ impl ProfileStore {
 	}
 
 	/// PRODUCT-0134 §4: a create never silently replaces a stored credential.
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn save_new(
 		&mut self,
-		path: &PathBuf,
+		path: &Path,
 		name: &str,
 		profile: SavedProfile,
 	) -> Result<(), String> {
@@ -152,9 +181,10 @@ impl ProfileStore {
 	}
 
 	/// PRODUCT-0134 §4: the identity being edited is the identity written.
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn replace(
 		&mut self,
-		path: &PathBuf,
+		path: &Path,
 		name: &str,
 		profile: SavedProfile,
 	) -> Result<(), String> {
@@ -169,7 +199,8 @@ impl ProfileStore {
 
 	/// PRODUCT-0134 §4: renaming onto an existing name refuses, for the same
 	/// reason a create does.
-	pub fn rename(&mut self, path: &PathBuf, from: &str, to: &str) -> Result<(), String> {
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
+	pub fn rename(&mut self, path: &Path, from: &str, to: &str) -> Result<(), String> {
 		self.require_unlocked()?;
 		let from = valid_name(from)?;
 		let to = valid_name(to)?;
@@ -186,7 +217,8 @@ impl ProfileStore {
 		self.persist(path)
 	}
 
-	pub fn delete(&mut self, path: &PathBuf, name: &str) -> Result<(), String> {
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
+	pub fn delete(&mut self, path: &Path, name: &str) -> Result<(), String> {
 		self.require_unlocked()?;
 		let name = valid_name(name)?;
 		if self.profiles.remove(name).is_none() {
@@ -195,6 +227,7 @@ impl ProfileStore {
 		self.persist(path)
 	}
 
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	fn require_unlocked(&self) -> Result<(), String> {
 		if self.session.is_unlocked() {
 			Ok(())
@@ -203,7 +236,7 @@ impl ProfileStore {
 		}
 	}
 
-	fn persist(&self, path: &PathBuf) -> Result<(), String> {
+	fn persist(&self, path: &Path) -> Result<(), String> {
 		let payload = StorePayload {
 			schema_version: SCHEMA_VERSION,
 			profiles: self.profiles.clone(),
@@ -248,7 +281,7 @@ mod tests {
 		}
 	}
 
-	fn cleanup(path: &PathBuf) {
+	fn cleanup(path: &Path) {
 		let _ = std::fs::remove_dir_all(path.parent().unwrap());
 	}
 
@@ -407,6 +440,65 @@ mod tests {
 		store.initialize(&path, passphrase("pw")).expect("initialize");
 		let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
 		assert_eq!(mode & 0o777, 0o600, "store file must be owner-only");
+		cleanup(&path);
+	}
+
+	/// PRODUCT-0134 §9: `secrets.rs` speaks Baryon command vocabulary
+	/// ("use :unlock") that describes a command Polariton does not have. Every
+	/// error a locked store can surface must be Polariton's own wording.
+	#[test]
+	fn product_0134_locked_store_errors_use_polariton_wording() {
+		let path = temp_store_path("wording");
+		let mut store = ProfileStore::default();
+		let errors = [
+			store.names().expect_err("locked"),
+			// `expect_err` needs `T: Debug`; `SavedProfile` deliberately has
+			// none, so credentials can never transit a debug format.
+			store.get("prod").err().expect("locked"),
+			store
+				.save_new(&path, "prod", postgres_profile())
+				.expect_err("locked"),
+			store
+				.replace(&path, "prod", postgres_profile())
+				.expect_err("locked"),
+			store.rename(&path, "a", "b").expect_err("locked"),
+			store.delete(&path, "prod").expect_err("locked"),
+		];
+		for error in errors {
+			assert!(
+				!error.contains(":unlock") && !error.contains(":eenc") && !error.contains(":wenc"),
+				"Baryon command vocabulary must not reach a Polariton surface: {error}"
+			);
+		}
+		cleanup(&path);
+	}
+
+	/// PRODUCT-0134 §7: the profile session is its own `SecretSession`.
+	/// Unlocking another session — libaryon's document session is one — leaves
+	/// the store locked, and locking the store leaves the other session
+	/// unlocked. There is no shared or global session state.
+	#[test]
+	fn product_0134_profile_session_is_independent_of_other_secret_sessions() {
+		let mut document_session = SecretSession::default();
+		document_session
+			.unlock(Zeroizing::new(b"doc pass".to_vec()))
+			.expect("document session unlocks");
+
+		let mut store = ProfileStore::default();
+		assert!(
+			!store.is_unlocked(),
+			"an unlocked document session must not unlock the profile store"
+		);
+
+		let path = temp_store_path("independent");
+		store.initialize(&path, passphrase("pw")).expect("initialize");
+		assert!(store.is_unlocked());
+		store.lock();
+		assert!(!store.is_unlocked());
+		assert!(
+			document_session.is_unlocked(),
+			"locking the profile store must not lock the document session"
+		);
 		cleanup(&path);
 	}
 
