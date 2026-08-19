@@ -77,6 +77,30 @@ pub struct RuneDispatchFailure {
 #[cfg(feature = "toron")]
 pub type RuneDispatchResult = Result<Arc<ResultArtifact>, RuneDispatchFailure>;
 
+/// PRODUCT-0135 §2: an engine-side cancellation signal. Implementations must
+/// reach their engine over a path that can never wait on the adapter's
+/// `RwLock` — the active query owns that lock.
+#[async_trait]
+pub trait EngineCancel: Send + Sync {
+	async fn signal(&self) -> Result<(), String>;
+}
+
+/// PRODUCT-0135 §2/§3: the out-of-band cancellation capability, acquired at
+/// connect and held beside the connection, never behind it. The variants are
+/// the accepted table's honest outcomes.
+#[derive(Clone, Default)]
+pub enum CancelCapability {
+	/// The engine can be told to stop.
+	Engine(Arc<dyn EngineCancel>),
+	/// Abandon the client future; the engine may keep finishing. The default:
+	/// it is the scratch fallback's row.
+	#[default]
+	StopWaiting,
+	/// Neither cancellation nor abandonment takes effect mid-query; the
+	/// affordance refuses rather than pretending.
+	Refuse,
+}
+
 #[async_trait]
 pub trait DatabaseAdapter: Send + Sync + 'static {
 	async fn dispatch(&mut self, code: &str) -> ExecutionResult;

@@ -233,7 +233,7 @@ fn product_0134_census_connection_identity_trims_the_name() {
 #[test]
 fn product_0134_baseline_sqlite_connects_memory_and_file() {
 	let runtime = tokio::runtime::Runtime::new().expect("runtime");
-	let memory = runtime
+	let (memory, _cancel) = runtime
 		.block_on(AdapterState::connect(AdapterConfiguration::SQLite {
 			connection_string: "memory".into(),
 		}))
@@ -288,7 +288,7 @@ fn product_0134_baseline_parquet_connects_a_fixture_file() {
 		.finish(&mut frame)
 		.expect("fixture written");
 
-	let adapter = runtime
+	let (adapter, _cancel) = runtime
 		.block_on(AdapterState::connect(AdapterConfiguration::Parquet {
 			input_path: path.to_str().expect("utf8 path").to_owned(),
 		}))

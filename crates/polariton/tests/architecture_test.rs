@@ -2351,8 +2351,10 @@ fn product_0071_chrome_consumes_the_guarded_title_status_and_menu_models() {
 		.next()
 		.expect("bounded production status model binding");
 	assert_eq!(status_binding.matches("app_status_bar(").count(), 1);
+	// PRODUCT-0135 §6: the model renders through the action-mapped view so
+	// the Cancel segment is pressable; it is still the same returned model.
 	assert!(
-		status_binding.contains(")\n\t.view();"),
+		status_binding.contains(")\n\t.view_with_action("),
 		"main screen must render the StatusBar model returned by app_status_bar"
 	);
 	assert!(
@@ -5130,4 +5132,40 @@ fn product_0126_the_y_axis_title_draw_path_reads_only_the_shared_left_guide() {
 		vec![".y_label_padding"],
 		"y_label_padding survives as exactly one guide-owned floor"
 	);
+}
+
+#[test]
+fn product_0135_sql_results_reach_the_host_through_exactly_two_paths() {
+	// PRODUCT-0135 stage 0 census: the generation gate's discard rule is only
+	// as good as this enumeration. SQL dispatches exactly twice — the plain /
+	// snippet path (`run_code`) and the notebook-cell path
+	// (`run_sql_markdown_cell`) — and each concludes through its own message
+	// handler. A third `dispatch` site is a new completion path that must be
+	// stamped, so its appearance fails this census rather than shipping
+	// unstamped.
+	let state = std::fs::read_to_string(
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui/state.rs"),
+	)
+	.expect("read state.rs");
+	let production = state
+		.split("\n#[cfg(test)]\nmod ")
+		.next()
+		.expect("bounded production source");
+	// Stage 1 strengthened the census: both SQL paths now share one gated
+	// dispatch future, so exactly one raw dispatch site exists — inside
+	// `dispatch_sql_gated` — and both dispatch call sites route through it.
+	let dispatch_sites = production.matches("guard.dispatch(&").count();
+	assert_eq!(
+		dispatch_sites, 1,
+		"SQL dispatch must flow through the one generation-gated future; a \
+		 second raw dispatch site is an unstamped completion path"
+	);
+	assert_eq!(
+		production.matches("dispatch_sql_gated(").count(),
+		3,
+		"one definition and exactly two call sites — the plain/snippet path \
+		 and the notebook-cell path"
+	);
+	assert!(production.contains("Message::RunResult {"));
+	assert!(production.contains("Message::RunMarkdownCellResult {"));
 }

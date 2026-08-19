@@ -13,22 +13,89 @@ pub const FIELDS: &[AdapterField] = &[AdapterField {
 	is_secure: false,
 }];
 
+/// PRODUCT-0135 §2: the dispatch-minted query identity, shared between the
+/// adapter and its cancellation capability through this slot's own mutex —
+/// never through the adapter lock.
+pub(crate) type CurrentQuery = std::sync::Arc<std::sync::Mutex<Option<toron_client::QueryId>>>;
+
+/// RAII stamp: minting writes the slot, and the guard clears it however the
+/// dispatch ends, so a completed query can never be "cancelled" late.
+pub(crate) struct QueryStamp {
+	slot: CurrentQuery,
+	pub id: toron_client::QueryId,
+}
+
+pub(crate) fn stamp_query(slot: &CurrentQuery) -> QueryStamp {
+	let id = toron_client::QueryId::new();
+	*slot.lock().expect("query slot") = Some(id);
+	QueryStamp {
+		slot: std::sync::Arc::clone(slot),
+		id,
+	}
+}
+
+impl Drop for QueryStamp {
+	fn drop(&mut self) {
+		*self.slot.lock().expect("query slot") = None;
+	}
+}
+
+/// The engine-side signal: a client clone plus the shared slot. Cancelling
+/// with no query in flight is a routine no-op — the cancel raced completion.
+struct ToronCancel {
+	client: toron_client::ToronClient,
+	current: CurrentQuery,
+}
+
+#[async_trait]
+impl crate::adapters::common::EngineCancel for ToronCancel {
+	async fn signal(&self) -> Result<(), String> {
+		let id = *self.current.lock().expect("query slot");
+		match id {
+			Some(id) => self
+				.client
+				.cancel(id)
+				.await
+				.map_err(|error| format!("Toron cancel: {error}")),
+			None => Ok(()),
+		}
+	}
+}
+
 pub struct ToronAdapter {
 	client: toron_client::ToronClient,
+	current_query: CurrentQuery,
 }
 
 impl ToronAdapter {
 	pub async fn connect(endpoint: &str) -> Result<Self, toron_client::ClientError> {
 		let client = toron_client::ToronClient::loopback(endpoint)?;
 		client.health().await?;
-		Ok(Self { client })
+		Ok(Self {
+			client,
+			current_query: CurrentQuery::default(),
+		})
+	}
+
+	/// PRODUCT-0135 §2: taken at connect time, before the adapter goes behind
+	/// its lock; the returned capability never touches that lock again.
+	pub fn cancel_capability(&self) -> crate::adapters::common::CancelCapability {
+		crate::adapters::common::CancelCapability::Engine(std::sync::Arc::new(ToronCancel {
+			client: self.client.clone(),
+			current: std::sync::Arc::clone(&self.current_query),
+		}))
 	}
 }
 
 #[async_trait]
 impl DatabaseAdapter for ToronAdapter {
 	async fn dispatch(&mut self, code: &str) -> ExecutionResult {
-		let result = match self.client.execute(code).await {
+		let stamp = stamp_query(&self.current_query);
+		let result = match self
+			.client
+			.execute_with_query_id(stamp.id, code, "UTC")
+			.await
+		{
 			Ok(result) => result,
 			Err(error) => return ExecutionResult::Err(error.to_string()),
 		};
@@ -99,6 +166,23 @@ mod tests {
 	};
 	use iced::Rectangle;
 	use std::path::PathBuf;
+
+	/// PRODUCT-0135 §2: the dispatch-minted identity is visible to the
+	/// capability exactly while a dispatch is in flight, and cleared however
+	/// the dispatch ends — no live deployment required.
+	#[test]
+	fn product_0135_query_stamp_fills_and_clears_the_shared_slot() {
+		let slot = super::CurrentQuery::default();
+		assert!(slot.lock().expect("slot").is_none());
+		{
+			let stamp = super::stamp_query(&slot);
+			assert_eq!(*slot.lock().expect("slot"), Some(stamp.id));
+		}
+		assert!(
+			slot.lock().expect("slot").is_none(),
+			"a finished dispatch can never be cancelled late"
+		);
+	}
 
 	// These gates share one live tenant. Serializing them keeps the tenant's
 	// bounded query budget from turning test parallelism into rotating failures.

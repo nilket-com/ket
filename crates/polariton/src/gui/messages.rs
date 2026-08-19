@@ -1,6 +1,6 @@
 use super::menu;
 use crate::adapters::{
-	common::{DatabaseAdapter, ExecutionResult},
+	common::{CancelCapability, DatabaseAdapter, ExecutionResult},
 	driver::AdapterSelection,
 };
 use crate::editor::EditorMsg;
@@ -47,13 +47,18 @@ pub enum Message {
 	AdapterAdHocChanged(String),
 	AdapterConfigurationChanged(String, String),
 	AdapterConfigurationSubmitted,
-	AdapterConnected(Result<Arc<RwLock<dyn DatabaseAdapter>>, String>),
+	AdapterConnected(Result<(Arc<RwLock<dyn DatabaseAdapter>>, CancelCapability), String>),
+	/// PRODUCT-0135 §6: the user's brake. One verb; the capability decides the
+	/// honest outcome.
+	CancelRun,
+	/// The engine-side signal settled; report the outcome in the routine lane.
+	CancelSignalSettled(Result<(), String>),
 	#[cfg(feature = "toron")]
 	LocalWorkspaceDiscovered(nilket_local::LocalWorkspace),
 	#[cfg(feature = "toron")]
 	LocalWorkspaceAttached {
 		workspace: nilket_local::ReadyWorkspace,
-		connection: Result<Arc<RwLock<dyn DatabaseAdapter>>, String>,
+		connection: Result<(Arc<RwLock<dyn DatabaseAdapter>>, CancelCapability), String>,
 	},
 	#[cfg(feature = "toron")]
 	StartLocalWorkspace,
@@ -102,6 +107,9 @@ pub enum Message {
 		/// A `-- @result name` claim made at dispatch, redeemed against the
 		/// session registry when the execution concludes.
 		publish: Option<PendingPublication>,
+		/// PRODUCT-0135 §4: the SQL run generation captured at dispatch. A
+		/// stale generation's result is discarded before any effect.
+		generation: u64,
 	},
 	RunMarkdownCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
@@ -111,6 +119,8 @@ pub enum Message {
 		/// through this origin before presenting them.
 		source_start_line: usize,
 		result: ExecutionResult,
+		/// PRODUCT-0135 §4: the SQL run generation captured at dispatch.
+		generation: u64,
 	},
 	/// A plain Rune buffer finished: its trailing-expression display plus at
 	/// most one planned plot, per the one-buffer-one-plot-pane rule.

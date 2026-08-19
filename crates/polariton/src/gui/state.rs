@@ -118,6 +118,14 @@ struct AppState {
 	/// The operation that asked for the store, applied once unlock succeeds
 	/// and dropped on cancel.
 	pending_profile_operation: Option<crate::profile_store::ProfileOperation>,
+	/// PRODUCT-0135 §4: the SQL run generation. A shared atomic so a dispatch
+	/// task can re-read the current value at lock-acquisition time without
+	/// touching the adapter lock. Runs capture it before their task first
+	/// awaits the lock; cancel advances it before anything else.
+	sql_run_generation: Arc<std::sync::atomic::AtomicU64>,
+	/// The in-flight SQL task's abort handle. Dropping a plain handle does not
+	/// abort; only an explicit `abort()` on cancel does.
+	sql_abort: Option<iced::task::Handle>,
 	/// PRODUCT-0134 §4: `Some(original_name)` while the configuration dialog
 	/// edits a stored profile. Save then replaces in place (or renames, which
 	/// refuses onto an existing name); `None` makes Save a create, which
@@ -604,6 +612,8 @@ fn new_with_authority(
 		profile_unlock: None,
 		pending_profile_operation: None,
 		editing_profile: None,
+		sql_run_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+		sql_abort: None,
 	};
 	sync_workspace_viewport(&mut state);
 	// Eagerly open the session scratch database so SQL always has a target;
@@ -659,6 +669,9 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 			.names()
 			.ok()
 			.map(|names| names.into_iter().map(str::to_owned).collect()),
+		// PRODUCT-0135 §6: the Cancel affordance exists only while a run is
+		// in flight.
+		app_state.sql_abort.is_some(),
 	)
 }
 
@@ -805,6 +818,43 @@ fn clear_transient_execution_status_on_editor_activity(
 	}
 }
 
+impl AppState {
+	fn current_sql_generation(&self) -> u64 {
+		self.sql_run_generation
+			.load(std::sync::atomic::Ordering::SeqCst)
+	}
+}
+
+/// PRODUCT-0135 §4: the one dispatch future both SQL paths share. The run's
+/// generation was captured before this future was built — and therefore
+/// before it first awaits the adapter lock — and is re-checked once the lock
+/// is acquired, so a task that waited across a cancellation dies at the gate
+/// instead of dispatching.
+async fn dispatch_sql_gated(
+	db: Arc<tokio::sync::RwLock<dyn crate::adapters::common::DatabaseAdapter>>,
+	code: String,
+	generation: u64,
+	current: Arc<std::sync::atomic::AtomicU64>,
+) -> ExecutionResult {
+	let mut guard = db.write().await;
+	if current.load(std::sync::atomic::Ordering::SeqCst) != generation {
+		return ExecutionResult::None;
+	}
+	guard.dispatch(&code).await
+}
+
+/// PRODUCT-0135 §4/§5: cancellation's host half, in the contract's order —
+/// the generation advances first, before any signal or teardown, so by the
+/// time any guard releases every waiting task is already stale; then the
+/// undispatched queue drains. The in-flight abort and the engine-side signal
+/// join in the cancellation surface stage.
+fn cancel_sql_generation(app_state: &mut AppState) {
+	app_state
+		.sql_run_generation
+		.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+	app_state.pending_runs.clear();
+}
+
 fn run_code(
 	app_state: &mut AppState,
 	source_buffer: BufferId,
@@ -840,13 +890,19 @@ fn run_code(
 	set_sql_status(app_state, "SQL · running…");
 	app_state.status_time_elapsed = None;
 	app_state.code_started = Instant::now();
-	Task::perform(
-		async move {
-			let mut guard = db.write().await;
-			guard.dispatch(&code).await
+	let generation = app_state.current_sql_generation();
+	let current = Arc::clone(&app_state.sql_run_generation);
+	let (task, handle) = Task::perform(
+		dispatch_sql_gated(db, code, generation, current),
+		move |result| Message::RunResult {
+			result,
+			publish,
+			generation,
 		},
-		move |result| Message::RunResult { result, publish },
 	)
+	.abortable();
+	app_state.sql_abort = Some(handle);
+	task
 }
 
 fn run_language_code(
@@ -2729,18 +2785,21 @@ fn run_sql_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) 
 	app_state
 		.code_editor
 		.clear_markdown_cell_artifact(&cell.identity);
-	Task::perform(
-		async move {
-			let mut guard = db.write().await;
-			guard.dispatch(&cell.code).await
-		},
+	let generation = app_state.current_sql_generation();
+	let current = Arc::clone(&app_state.sql_run_generation);
+	let (task, handle) = Task::perform(
+		dispatch_sql_gated(db, cell.code, generation, current),
 		move |result| Message::RunMarkdownCellResult {
 			identity,
 			presentation,
 			source_start_line,
 			result,
+			generation,
 		},
 	)
+	.abortable();
+	app_state.sql_abort = Some(handle);
+	task
 }
 
 fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
@@ -3077,6 +3136,52 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_msg =
 				"Profile store stays locked; ad hoc connections remain available.".into();
 		}
+		// PRODUCT-0135 §1/§4/§5: Cancel. The generation advances before the
+		// abort and before any engine-side signal — edge two of the ordering
+		// contract — so every lock-waiting task is stale by the time a guard
+		// releases. Refusal does nothing at all except say so.
+		Message::CancelRun => {
+			if app_state.sql_abort.is_none() {
+				set_sql_status(app_state, "SQL · nothing to cancel");
+				return Task::none();
+			}
+			match app_state.adapter_state.active_cancel_capability() {
+				crate::adapters::common::CancelCapability::Refuse => {
+					set_sql_status(
+						app_state,
+						"SQL · this source cannot be cancelled; the query runs to completion",
+					);
+				}
+				crate::adapters::common::CancelCapability::StopWaiting => {
+					cancel_sql_generation(app_state);
+					if let Some(handle) = app_state.sql_abort.take() {
+						handle.abort();
+					}
+					set_sql_status(
+						app_state,
+						"SQL · stopped waiting; the engine may still be finishing",
+					);
+				}
+				crate::adapters::common::CancelCapability::Engine(signal) => {
+					cancel_sql_generation(app_state);
+					if let Some(handle) = app_state.sql_abort.take() {
+						handle.abort();
+					}
+					set_sql_status(app_state, "SQL · cancelling…");
+					return Task::perform(
+						async move { signal.signal().await },
+						Message::CancelSignalSettled,
+					);
+				}
+			}
+		}
+		Message::CancelSignalSettled(result) => match result {
+			Ok(()) => set_sql_status(app_state, "SQL · cancelled"),
+			Err(error) => set_sql_status(
+				app_state,
+				format!("SQL · stopped waiting; the engine cancel failed: {error}"),
+			),
+		},
 		Message::AdapterAdHocChanged(value) => {
 			app_state.adapter_state.ad_hoc_connection_string = value;
 			app_state.status_msg = "Configure adapter.".into();
@@ -3124,8 +3229,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			);
 		}
 		Message::AdapterConnected(result) => match result {
-			Ok(connection) => {
+			Ok((connection, cancellation)) => {
 				app_state.adapter_state.connection = Some(connection);
+				app_state.adapter_state.cancellation = cancellation;
 				app_state.adapter_state.stage = AdapterStage::Connected;
 				app_state.status_error.clear();
 				app_state.status_msg = "Adapter connected.".into();
@@ -3168,8 +3274,12 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 					crate::adapters::toron::ToronAdapter::connect(&endpoint)
 						.await
 						.map(|adapter| {
-							Arc::new(RwLock::new(adapter))
-								as Arc<RwLock<dyn crate::adapters::common::DatabaseAdapter>>
+							let cancellation = adapter.cancel_capability();
+							(
+								Arc::new(RwLock::new(adapter))
+									as Arc<RwLock<dyn crate::adapters::common::DatabaseAdapter>>,
+								cancellation,
+							)
 						})
 						.map_err(|error| error.to_string())
 				},
@@ -3188,7 +3298,8 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				return Task::none();
 			}
 			match connection {
-				Ok(connection) => {
+				Ok((connection, cancellation)) => {
+					app_state.adapter_state.cancellation = cancellation;
 					app_state.adapter_state.selection =
 						crate::adapters::driver::AdapterSelection::Toron;
 					app_state.adapter_state.configuration =
@@ -3314,7 +3425,18 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		Message::RunResult {
 			result: er,
 			publish,
+			generation,
 		} => {
+			// PRODUCT-0135 §4: a cancelled generation's late result changes
+			// nothing — checked before status, grid, or registry effects. The
+			// named claim concludes exactly as a failed run's does: unbound.
+			if generation != app_state.current_sql_generation() {
+				if let Some(claim) = publish.as_ref() {
+					let _ = app_state.result_registry.conclude_unbound(claim);
+				}
+				return Task::none();
+			}
+			app_state.sql_abort = None;
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			if let Some(claim) = publish.as_ref() {
 				match &er {
@@ -3860,7 +3982,15 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			presentation,
 			source_start_line,
 			result,
+			generation,
 		} => {
+			// PRODUCT-0135 §4: stale-generation discard before any effect —
+			// the cell's prior artifact was already retired at dispatch, and a
+			// cancelled run leaves it retired, per the registry's own rule.
+			if generation != app_state.current_sql_generation() {
+				return Task::none();
+			}
+			app_state.sql_abort = None;
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
 				ExecutionResult::Rows {
@@ -4182,6 +4312,7 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 		"connect:save-profile" => Some(Message::ProfileSaveRequested),
 		"code:run" => Some(Message::Run),
 		"code:run-snippet" => Some(Message::RunSnippet),
+		"code:cancel" => Some(Message::CancelRun),
 		"settings:preferences" => Some(Message::OpenSettings),
 		"session:checkpoint" => Some(Message::CheckpointSession),
 		"session:copy-id" => Some(Message::CopySessionId),
@@ -4595,6 +4726,7 @@ mod tests {
 				Message::RunResult {
 					result: ExecutionResult::Err("late completion".to_owned()),
 					publish: None,
+					generation: 0,
 				},
 			)
 			.units(),
@@ -5420,7 +5552,7 @@ mod tests {
 				&mut state,
 				Message::LocalWorkspaceAttached {
 					workspace,
-					connection: Ok(connection),
+					connection: Ok((connection, crate::adapters::common::CancelCapability::StopWaiting)),
 				},
 			)
 			.units(),
@@ -10605,6 +10737,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			Message::RunResult {
 				result: ExecutionResult::Batch { statements: 3 },
 				publish: None,
+				generation: 0,
 			},
 		);
 
@@ -10630,6 +10763,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 					statements: 3,
 				},
 				publish: None,
+				generation: 0,
 			},
 		);
 
@@ -11684,6 +11818,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			Message::RunResult {
 				result: ExecutionResult::Err(raw.to_owned()),
 				publish: None,
+				generation: 0,
 			},
 		);
 
@@ -11714,6 +11849,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			Message::RunResult {
 				result: ExecutionResult::Err(raw.to_owned()),
 				publish: None,
+				generation: 0,
 			},
 		);
 		let _ = update(&mut state, Message::ToggleStatusDetail);
@@ -12090,6 +12226,241 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert_eq!(state.status_msg, "Profile saved: new-name");
 		assert_eq!(state.profile_store.names().expect("names"), ["new-name"]);
 		let _ = std::fs::remove_dir_all(path.parent().unwrap());
+		state.code_editor.shutdown();
+	}
+
+	/// PRODUCT-0135 §4, edge one plus the lock-waiter gate: a task whose
+	/// generation was captured before it awaited the adapter lock never
+	/// dispatches once that generation is stale.
+	#[test]
+	fn product_0135_stale_generation_task_never_dispatches() {
+		use crate::adapters::common::DatabaseAdapter;
+		use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+		struct CountingAdapter(std::sync::Arc<AtomicUsize>);
+		#[async_trait::async_trait]
+		impl DatabaseAdapter for CountingAdapter {
+			async fn dispatch(&mut self, _code: &str) -> ExecutionResult {
+				self.0.fetch_add(1, Ordering::SeqCst);
+				ExecutionResult::Affected(1)
+			}
+		}
+
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		let dispatches = std::sync::Arc::new(AtomicUsize::new(0));
+		let db: std::sync::Arc<tokio::sync::RwLock<dyn DatabaseAdapter>> = std::sync::Arc::new(
+			tokio::sync::RwLock::new(CountingAdapter(dispatches.clone())),
+		);
+
+		// The run captured generation 0; cancellation advanced to 1 while the
+		// task waited. It must die at the gate.
+		let current = std::sync::Arc::new(AtomicU64::new(1));
+		let result = runtime.block_on(super::dispatch_sql_gated(
+			db.clone(),
+			"select 1".into(),
+			0,
+			current.clone(),
+		));
+		assert!(matches!(result, ExecutionResult::None));
+		assert_eq!(dispatches.load(Ordering::SeqCst), 0, "no dispatch");
+
+		// A fresh generation dispatches normally.
+		let result = runtime.block_on(super::dispatch_sql_gated(
+			db,
+			"select 1".into(),
+			1,
+			current,
+		));
+		assert!(matches!(result, ExecutionResult::Affected(1)));
+		assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+	}
+
+	/// PRODUCT-0135 §4: a cancelled generation's late result changes nothing —
+	/// status, timer, grid size, and the named claim each asserted, for both
+	/// completion paths.
+	#[test]
+	fn product_0135_late_results_from_a_cancelled_generation_change_nothing() {
+		use libaryon::uast::projection::{
+			MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellOutputTarget,
+			MarkdownCellPresentation,
+		};
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+
+		let claim = state.result_registry.begin(
+			"late",
+			libaryon::core::BufferId::new(7),
+			"scratch".to_owned(),
+		);
+		super::cancel_sql_generation(&mut state);
+
+		let frame = polars::df!("x" => [1_i32]).expect("frame");
+		drop(update(
+			&mut state,
+			Message::RunResult {
+				result: ExecutionResult::Rows {
+					artifact: crate::result_artifact::ResultArtifact::test_frame(frame.clone()),
+					statements: 1,
+				},
+				publish: Some(claim),
+				generation: 0,
+			},
+		));
+		assert!(state.status_msg.is_empty(), "no status effect");
+		assert!(state.status_time_elapsed.is_none(), "no timer effect");
+		assert!(state.status_df_size.is_none(), "no grid effect");
+		assert!(
+			state.result_registry.provenance("late").is_none(),
+			"the cancelled claim concludes unbound, as a failure does"
+		);
+
+		drop(update(
+			&mut state,
+			Message::RunMarkdownCellResult {
+				identity: MarkdownCellIdentity::Explicit {
+					id: "cell".to_owned(),
+				},
+				presentation: MarkdownCellPresentation {
+					output: MarkdownCellOutputTarget::Inline,
+					code: MarkdownCellCodeVisibility::Show,
+				},
+				source_start_line: 1,
+				result: ExecutionResult::Rows {
+					artifact: crate::result_artifact::ResultArtifact::test_frame(frame),
+					statements: 1,
+				},
+				generation: 0,
+			},
+		));
+		assert!(state.status_msg.is_empty());
+		assert!(state.status_time_elapsed.is_none());
+		assert!(state.status_df_size.is_none());
+		assert!(
+			state
+				.code_editor
+				.named_notebook_cell_data()
+				.is_empty(),
+			"a cancelled cell result never reaches the notebook"
+		);
+		state.code_editor.shutdown();
+	}
+
+	fn idle_abort_handle() -> iced::task::Handle {
+		let (_task, handle): (iced::Task<Message>, iced::task::Handle) =
+			iced::Task::perform(std::future::ready(()), |()| Message::CancelRun).abortable();
+		handle
+	}
+
+	/// PRODUCT-0135 §1/§4/§5: each capability's outcome, in the routine
+	/// status lane — and Refusal does nothing at all except say so.
+	#[test]
+	fn product_0135_cancel_outcomes_follow_the_capability() {
+		use crate::adapters::common::{CancelCapability, DatabaseAdapter, EngineCancel};
+
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+
+		// Nothing in flight: routine feedback, no generation movement.
+		let before = state.current_sql_generation();
+		drop(update(&mut state, Message::CancelRun));
+		assert_eq!(state.status_msg, "SQL · nothing to cancel");
+		assert_eq!(state.current_sql_generation(), before);
+
+		// Stopped waiting: no external connection, so the scratch row governs.
+		state.sql_abort = Some(idle_abort_handle());
+		drop(update(&mut state, Message::CancelRun));
+		assert_eq!(state.current_sql_generation(), before + 1);
+		assert!(state.sql_abort.is_none(), "the client future was abandoned");
+		assert!(state.status_msg.contains("stopped waiting"), "{}", state.status_msg);
+		assert!(state.status_error.is_empty(), "routine lane, not an error");
+
+		// Refusal: nothing moves — no advance, no abort, no drain.
+		struct InertAdapter;
+		#[async_trait::async_trait]
+		impl DatabaseAdapter for InertAdapter {
+			async fn dispatch(&mut self, _code: &str) -> ExecutionResult {
+				ExecutionResult::None
+			}
+		}
+		state.adapter_state.connection = Some(std::sync::Arc::new(tokio::sync::RwLock::new(
+			InertAdapter,
+		)));
+		state.adapter_state.cancellation = CancelCapability::Refuse;
+		state.sql_abort = Some(idle_abort_handle());
+		state.pending_runs.push_back(super::PendingRun {
+			snapshot_request: 9,
+			source_buffer: libaryon::core::BufferId::new(9),
+			language_id: libaryon::engine::supported_languages()
+				.into_iter()
+				.map(|language| language.id)
+				.find(|id| id.as_str() == "sql")
+				.expect("sql language registered"),
+			kind: super::PendingRunKind::Buffer,
+		});
+		let before = state.current_sql_generation();
+		drop(update(&mut state, Message::CancelRun));
+		assert_eq!(state.current_sql_generation(), before, "no advance");
+		assert!(state.sql_abort.is_some(), "no abort");
+		assert_eq!(state.pending_runs.len(), 1, "no drain");
+		assert!(state.status_msg.contains("cannot be cancelled"), "{}", state.status_msg);
+		assert!(state.status_error.is_empty());
+		state.pending_runs.clear();
+
+		// Engine: the generation advances before the signal task is even
+		// built (edge two), and the settled outcomes use the honest wording.
+		struct RecordingCancel(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+		#[async_trait::async_trait]
+		impl EngineCancel for RecordingCancel {
+			async fn signal(&self) -> Result<(), String> {
+				self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+				Ok(())
+			}
+		}
+		let signals = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+		state.adapter_state.cancellation =
+			CancelCapability::Engine(std::sync::Arc::new(RecordingCancel(signals.clone())));
+		state.sql_abort = Some(idle_abort_handle());
+		let before = state.current_sql_generation();
+		let task = update(&mut state, Message::CancelRun);
+		assert_eq!(
+			state.current_sql_generation(),
+			before + 1,
+			"the generation advanced before the signal task was returned"
+		);
+		assert_eq!(state.status_msg, "SQL · cancelling…");
+		assert_eq!(task.units(), 1, "the engine signal rides one task");
+
+		drop(update(&mut state, Message::CancelSignalSettled(Ok(()))));
+		assert_eq!(state.status_msg, "SQL · cancelled");
+		drop(update(
+			&mut state,
+			Message::CancelSignalSettled(Err("connection reset".to_owned())),
+		));
+		assert!(state.status_msg.contains("stopped waiting"), "{}", state.status_msg);
+		assert!(state.status_error.is_empty());
+		state.code_editor.shutdown();
+	}
+
+	/// PRODUCT-0135 §4/§5: the host half of cancel advances the generation and
+	/// drains the undispatched queue.
+	#[test]
+	fn product_0135_cancel_advances_generation_and_drains_the_queue() {
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		state.pending_runs.push_back(super::PendingRun {
+			snapshot_request: 1,
+			source_buffer: libaryon::core::BufferId::new(7),
+			language_id: libaryon::engine::supported_languages()
+				.into_iter()
+				.map(|language| language.id)
+				.find(|id| id.as_str() == "sql")
+				.expect("sql language registered"),
+			kind: super::PendingRunKind::Buffer,
+		});
+		let before = state.current_sql_generation();
+		super::cancel_sql_generation(&mut state);
+		assert_eq!(state.current_sql_generation(), before + 1);
+		assert!(state.pending_runs.is_empty());
 		state.code_editor.shutdown();
 	}
 }

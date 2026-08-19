@@ -2,7 +2,7 @@
 use crate::adapters::toron;
 use crate::adapters::{
 	bigquery,
-	common::{AdapterField, AdapterStage, DatabaseAdapter},
+	common::{AdapterField, AdapterStage, CancelCapability, DatabaseAdapter},
 	mysql, parquet, postgres, sqlite,
 };
 use gcloud_bigquery::client::{Client, ClientConfig};
@@ -170,6 +170,9 @@ pub struct AdapterState {
 	pub ad_hoc_connection_string: String,
 	pub configuration: AdapterConfiguration,
 	pub connection: Option<Arc<RwLock<dyn DatabaseAdapter>>>,
+	/// PRODUCT-0135 §2: the external connection's cancellation capability,
+	/// held beside the connection, never behind its lock.
+	pub cancellation: CancelCapability,
 	#[cfg(feature = "toron")]
 	pub local_workspace: Option<nilket_local::LocalWorkspace>,
 	/// Session-local in-memory SQLite scratch database. Always the SQL target
@@ -241,6 +244,16 @@ impl AdapterState {
 
 	pub fn scratch_is_active(&self) -> bool {
 		self.connection.is_none() && self.scratch.is_some()
+	}
+
+	/// The capability governing the connection SQL currently executes against.
+	/// The scratch fallback is Stopped waiting, per the accepted table.
+	pub fn active_cancel_capability(&self) -> CancelCapability {
+		if self.connection.is_some() {
+			self.cancellation.clone()
+		} else {
+			CancelCapability::StopWaiting
+		}
 	}
 
 	/// Dispatch-time identity recorded in result provenance.
@@ -374,9 +387,11 @@ impl AdapterState {
 		}
 	}
 
+	/// PRODUCT-0135 §2: the capability is acquired here, at connect, while
+	/// nothing holds the adapter lock, and travels beside the connection.
 	pub async fn connect(
 		config: AdapterConfiguration,
-	) -> Result<Arc<RwLock<dyn DatabaseAdapter>>, String> {
+	) -> Result<(Arc<RwLock<dyn DatabaseAdapter>>, CancelCapability), String> {
 		match config {
 			AdapterConfiguration::None => Err("No adapter is configured.".to_owned()),
 			AdapterConfiguration::MySQL { connection_string } => {
@@ -384,7 +399,10 @@ impl AdapterState {
 					.map_err(|error| format!("MySQL URL: {error}"))?;
 				let pool = mysql_async::Pool::new(opts);
 				match tokio::time::timeout(Duration::from_secs(10), pool.get_conn()).await {
-					Ok(Ok(_conn)) => Ok(Arc::new(RwLock::new(mysql::MySQLAdapter { pool }))),
+					Ok(Ok(_conn)) => Ok((
+						Arc::new(RwLock::new(mysql::MySQLAdapter { pool })) as _,
+						CancelCapability::StopWaiting,
+					)),
 					Ok(Err(error)) => Err(format!("MySQL connection: {error}")),
 					Err(_) => Err("MySQL connection timed out after 10s".to_owned()),
 				}
@@ -399,7 +417,10 @@ impl AdapterState {
 				let opts = mysql::opts_from_fields(&host, &port, &database, &user, &password)?;
 				let pool = mysql_async::Pool::new(opts);
 				match tokio::time::timeout(Duration::from_secs(10), pool.get_conn()).await {
-					Ok(Ok(_conn)) => Ok(Arc::new(RwLock::new(mysql::MySQLAdapter { pool }))),
+					Ok(Ok(_conn)) => Ok((
+						Arc::new(RwLock::new(mysql::MySQLAdapter { pool })) as _,
+						CancelCapability::StopWaiting,
+					)),
 					Ok(Err(error)) => Err(format!("MySQL connection: {error}")),
 					Err(_) => Err("MySQL connection timed out after 10s".to_owned()),
 				}
@@ -409,10 +430,13 @@ impl AdapterState {
 					.await
 					.map_err(|error| format!("BigQuery authentication: {error}"))?;
 				match Client::new(bq_config).await {
-					Ok(client) => Ok(Arc::new(RwLock::new(bigquery::BigQueryAdapter {
-						client,
-						project_id,
-					}))),
+					Ok(client) => Ok((
+						Arc::new(RwLock::new(bigquery::BigQueryAdapter {
+							client,
+							project_id,
+						})) as _,
+						CancelCapability::StopWaiting,
+					)),
 					Err(error) => Err(format!("BigQuery client: {error}")),
 				}
 			}
@@ -444,7 +468,12 @@ impl AdapterState {
 				};
 				let context = polars::sql::SQLContext::new();
 				context.register(table_name, lf);
-				Ok(Arc::new(RwLock::new(parquet::ParquetAdapter { context })))
+				// The accepted table's Refusal row: polars executes
+				// synchronously; even abandonment waits.
+				Ok((
+					Arc::new(RwLock::new(parquet::ParquetAdapter { context })) as _,
+					CancelCapability::Refuse,
+				))
 			}
 			AdapterConfiguration::Postgres { connection_string } => {
 				let tls = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
@@ -457,7 +486,13 @@ impl AdapterState {
 						eprintln!("Postgres connection error: {}", e);
 					}
 				});
-				Ok(Arc::new(RwLock::new(postgres::PostgresAdapter { client })))
+				let cancel = CancelCapability::Engine(Arc::new(postgres::PostgresCancel {
+					token: client.cancel_token(),
+				}));
+				Ok((
+					Arc::new(RwLock::new(postgres::PostgresAdapter { client })) as _,
+					cancel,
+				))
 			}
 			AdapterConfiguration::PostgresFields {
 				host,
@@ -478,25 +513,46 @@ impl AdapterState {
 						eprintln!("Postgres connection error: {}", e);
 					}
 				});
-				Ok(Arc::new(RwLock::new(postgres::PostgresAdapter { client })))
+				let cancel = CancelCapability::Engine(Arc::new(postgres::PostgresCancel {
+					token: client.cancel_token(),
+				}));
+				Ok((
+					Arc::new(RwLock::new(postgres::PostgresAdapter { client })) as _,
+					cancel,
+				))
 			}
 			AdapterConfiguration::SQLite { connection_string } => {
+				// `tokio-rusqlite` 0.7.0 exposes no interrupt handle: the
+				// accepted table's Stopped waiting row.
 				if connection_string == "memory" {
 					AsyncConnection::open_in_memory()
 						.await
-						.map(|aconn| Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn })) as _)
+						.map(|aconn| {
+							(
+								Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn })) as _,
+								CancelCapability::StopWaiting,
+							)
+						})
 						.map_err(|error| format!("SQLite memory connection: {error}"))
 				} else {
 					AsyncConnection::open(connection_string)
 						.await
-						.map(|aconn| Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn })) as _)
+						.map(|aconn| {
+							(
+								Arc::new(RwLock::new(sqlite::SQLiteAdapter { aconn })) as _,
+								CancelCapability::StopWaiting,
+							)
+						})
 						.map_err(|error| format!("SQLite connection: {error}"))
 				}
 			}
 			#[cfg(feature = "toron")]
 			AdapterConfiguration::Toron { endpoint } => toron::ToronAdapter::connect(&endpoint)
 				.await
-				.map(|adapter| Arc::new(RwLock::new(adapter)) as _)
+				.map(|adapter| {
+					let cancel = adapter.cancel_capability();
+					(Arc::new(RwLock::new(adapter)) as _, cancel)
+				})
 				.map_err(|error| format!("Toron connection: {error}")),
 		}
 	}
@@ -577,7 +633,7 @@ mod tests {
 
 		// An external connection takes over; disconnecting falls back to the
 		// same scratch instance, so its tables survive the round trip.
-		let external = runtime
+		let (external, _cancel) = runtime
 			.block_on(AdapterState::connect(AdapterConfiguration::SQLite {
 				connection_string: "memory".into(),
 			}))
@@ -643,6 +699,52 @@ mod tests {
 		));
 	}
 
+	/// PRODUCT-0135 §3: the connectable rows of the accepted capability table,
+	/// and the scratch fallback. SQLite is Stopped waiting (`tokio-rusqlite`
+	/// exposes no interrupt handle); Parquet refuses (synchronous execution).
+	#[test]
+	fn product_0135_capabilities_match_the_accepted_table() {
+		use crate::adapters::common::CancelCapability;
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		let (_conn, capability) = runtime
+			.block_on(AdapterState::connect(AdapterConfiguration::SQLite {
+				connection_string: "memory".into(),
+			}))
+			.expect("sqlite connects");
+		assert!(matches!(capability, CancelCapability::StopWaiting));
+
+		let dir = std::env::temp_dir().join(format!(
+			"polariton-0135-cap-{}-{}",
+			std::process::id(),
+			std::time::SystemTime::now()
+				.duration_since(std::time::UNIX_EPOCH)
+				.unwrap()
+				.as_nanos()
+		));
+		std::fs::create_dir_all(&dir).expect("temp dir");
+		let path = dir.join("cap_fixture.parquet");
+		let mut frame = polars::df!("x" => [1_i64]).expect("frame");
+		polars::prelude::ParquetWriter::new(std::fs::File::create(&path).expect("file"))
+			.finish(&mut frame)
+			.expect("written");
+		let (_conn, capability) = runtime
+			.block_on(AdapterState::connect(AdapterConfiguration::Parquet {
+				input_path: path.to_str().expect("utf8").to_owned(),
+			}))
+			.expect("parquet connects");
+		assert!(matches!(capability, CancelCapability::Refuse));
+		let _ = std::fs::remove_dir_all(&dir);
+
+		// The scratch fallback: no external connection means Stopped waiting,
+		// whatever capability a previous connection left behind.
+		let mut state = AdapterState::default();
+		state.cancellation = CancelCapability::Refuse;
+		assert!(matches!(
+			state.active_cancel_capability(),
+			CancelCapability::StopWaiting
+		));
+	}
+
 	#[test]
 	fn provenance_identity_distinguishes_scratch_named_and_typed_connections() {
 		let runtime = tokio::runtime::Runtime::new().expect("runtime");
@@ -655,7 +757,8 @@ mod tests {
 				.block_on(AdapterState::connect(AdapterConfiguration::SQLite {
 					connection_string: "memory".into(),
 				}))
-				.expect("external sqlite"),
+				.expect("external sqlite")
+				.0,
 		);
 		state.selection = super::AdapterSelection::SQLite;
 		assert_eq!(state.connection_identity(), "SQLite");

@@ -94,6 +94,24 @@ pub fn config_from_fields(
 	Ok(config)
 }
 
+/// PRODUCT-0135 §2/§3: Postgres's engine-side signal — the token captured at
+/// connect cancels over its own connection by design, never the adapter lock.
+pub struct PostgresCancel {
+	pub token: tokio_postgres::CancelToken,
+}
+
+#[async_trait]
+impl crate::adapters::common::EngineCancel for PostgresCancel {
+	async fn signal(&self) -> Result<(), String> {
+		let tls = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
+		self.token
+			.clone()
+			.cancel_query(tls)
+			.await
+			.map_err(|error| format!("Postgres cancel: {error}"))
+	}
+}
+
 pub struct PostgresAdapter {
 	pub client: Client,
 }

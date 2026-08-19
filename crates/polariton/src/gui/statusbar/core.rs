@@ -109,6 +109,15 @@ pub enum Segment {
 		tone: Tone,
 		width: SegmentWidth,
 	},
+	/// PRODUCT-0135 §6: a pressable segment. Rendered as a button only when
+	/// the bar's view supplies an action mapper; inert otherwise, so
+	/// message-free callers are unchanged.
+	Action {
+		id: String,
+		label: String,
+		tone: Tone,
+		width: SegmentWidth,
+	},
 }
 
 #[derive(Debug, Clone)]
@@ -170,6 +179,15 @@ impl Segment {
 		}
 	}
 
+	pub fn action(id: impl Into<String>, label: impl Into<String>, tone: Tone) -> Self {
+		Segment::Action {
+			id: id.into(),
+			label: label.into(),
+			tone,
+			width: SegmentWidth::Compact,
+		}
+	}
+
 	pub fn timer(label: impl Into<String>, duration: Duration, tone: Tone) -> Self {
 		Self::label_value(label, format_elapsed(duration), tone)
 	}
@@ -185,7 +203,7 @@ impl Segment {
 			| Self::Spinner {
 				max_chars: slot, ..
 			} => *slot = Some(max_chars.max(1)),
-			Self::Progress { .. } => {}
+			Self::Progress { .. } | Self::Action { .. } => {}
 		}
 		self
 	}
@@ -221,7 +239,8 @@ impl Segment {
 			Self::Text { width: slot, .. }
 			| Self::LabelValue { width: slot, .. }
 			| Self::Spinner { width: slot, .. }
-			| Self::Progress { width: slot, .. } => *slot = width,
+			| Self::Progress { width: slot, .. }
+			| Self::Action { width: slot, .. } => *slot = width,
 		}
 	}
 }
@@ -246,21 +265,38 @@ impl StatusBar {
 		self
 	}
 
+	#[cfg(test)]
+	pub(crate) fn lanes_for_tests(&self) -> (&[Segment], &[Segment]) {
+		(&self.left, &self.right)
+	}
+
 	pub fn lane_split(mut self, left_portion: u16, right_portion: u16) -> Self {
 		self.layout.left_portion = left_portion.max(1);
 		self.layout.right_portion = right_portion.max(1);
 		self
 	}
 
-	pub fn view<Message: 'static>(&self) -> Element<'static, Message> {
+	/// PRODUCT-0135 §6: a view whose `Action` segments are pressable. The
+	/// mapper receives the segment's id; every other segment is unchanged.
+	pub fn view_with_action<Message: Clone + 'static>(
+		&self,
+		on_action: impl Fn(String) -> Message + 'static,
+	) -> Element<'static, Message> {
+		self.view_impl(Some(std::sync::Arc::new(on_action)))
+	}
+
+	fn view_impl<Message: Clone + 'static>(
+		&self,
+		on_action: Option<OnAction<Message>>,
+	) -> Element<'static, Message> {
 		let style = self.style;
 		let layout = self.layout;
-		let left = container(lane::<Message>(&self.left, &style))
+		let left = container(lane::<Message>(&self.left, &style, on_action.clone()))
 			.width(Length::FillPortion(layout.left_portion))
 			.height(Length::Fixed(STATUS_BAR_HEIGHT))
 			.align_y(Alignment::Center)
 			.clip(true);
-		let right = container(lane::<Message>(&self.right, &style))
+		let right = container(lane::<Message>(&self.right, &style, on_action))
 			.width(Length::FillPortion(layout.right_portion))
 			.height(Length::Fixed(STATUS_BAR_HEIGHT))
 			.align_right(Length::Fill)
@@ -318,13 +354,16 @@ impl StatusBar {
 	}
 }
 
-fn lane<Message: 'static>(
+type OnAction<Message> = std::sync::Arc<dyn Fn(String) -> Message>;
+
+fn lane<Message: Clone + 'static>(
 	segments: &[Segment],
 	style: &StatusBarStyle,
+	on_action: Option<OnAction<Message>>,
 ) -> Element<'static, Message> {
 	let mut content = row![].align_y(Alignment::Center).spacing(4);
 	for segment in segments.iter().cloned() {
-		content = content.push(segment_view(segment, *style));
+		content = content.push(segment_view(segment, *style, on_action.clone()));
 	}
 	content
 		.height(Length::Fixed(SEGMENT_HEIGHT))
@@ -332,13 +371,33 @@ fn lane<Message: 'static>(
 		.into()
 }
 
-fn segment_view<Message: 'static>(
+fn segment_view<Message: Clone + 'static>(
 	segment: Segment,
 	style: StatusBarStyle,
+	on_action: Option<OnAction<Message>>,
 ) -> Element<'static, Message> {
 	let width = segment.width();
 	let reserved_width = width.reserved_pixels(&segment);
 	match segment {
+		Segment::Action {
+			id,
+			label,
+			tone,
+			width: _,
+		} => {
+			let body = segment_shell(
+				text(label).size(SEGMENT_FONT_SIZE).color(tone.text(&style)),
+				style,
+			);
+			let element: Element<'static, Message> = match on_action {
+				Some(on_action) => iced::widget::mouse_area(body)
+					.interaction(iced::mouse::Interaction::Pointer)
+					.on_press(on_action(id))
+					.into(),
+				None => body,
+			};
+			apply_width(element, width, reserved_width)
+		}
 		Segment::Text {
 			value,
 			tone,
@@ -534,7 +593,8 @@ impl Segment {
 			Self::Text { width, .. }
 			| Self::LabelValue { width, .. }
 			| Self::Spinner { width, .. }
-			| Self::Progress { width, .. } => *width,
+			| Self::Progress { width, .. }
+			| Self::Action { width, .. } => *width,
 		}
 	}
 
@@ -565,7 +625,7 @@ impl SlotKind {
 	fn resolve(self, segment: &Segment) -> Self {
 		match self {
 			SlotKind::Auto => match segment {
-				Segment::Text { .. } => SlotKind::Text,
+				Segment::Text { .. } | Segment::Action { .. } => SlotKind::Text,
 				Segment::LabelValue { .. } => SlotKind::LabelValue,
 				Segment::Spinner { .. } => SlotKind::Spinner,
 				Segment::Progress { .. } => SlotKind::Progress,

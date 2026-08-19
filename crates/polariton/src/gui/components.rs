@@ -167,6 +167,7 @@ pub fn main_screen<'a>(
 	close_without_checkpoint: bool,
 	profile_unlock: Option<&'a crate::profile_store::UnlockPrompt>,
 	profile_names: Option<Vec<String>>,
+	sql_cancellable: bool,
 ) -> Element<'a, Message> {
 	// Baryon's workspace is the sole top-level layout owner.
 	let main_content = container(code_editor.view().map(Message::CodeEditEvent))
@@ -181,8 +182,9 @@ pub fn main_screen<'a>(
 		editor_spinner_phase,
 		adapter_state,
 		saved_session,
+		sql_cancellable,
 	)
-	.view();
+	.view_with_action(|_id| Message::CancelRun);
 	let status_bar: Element<'a, Message> = if let Some((detail, _)) = status_detail {
 		tooltip(
 			mouse_area(status_bar).on_press(Message::ToggleStatusDetail),
@@ -341,6 +343,7 @@ fn app_status_bar(
 	editor_spinner_phase: Option<usize>,
 	adapter_state: &AdapterState,
 	saved_session: bool,
+	sql_cancellable: bool,
 ) -> StatusBar {
 	let (connection_label, connection_tone) = match adapter_state.stage {
 		AdapterStage::Connected => ("connected", Tone::Success),
@@ -389,6 +392,10 @@ fn app_status_bar(
 			Segment::label_value("table", format!("{rows} x {cols}"), Tone::Normal)
 				.reserve_chars(18),
 		);
+	}
+	if sql_cancellable {
+		// PRODUCT-0135 §6: beside the timer, only while a run is in flight.
+		bar = bar.right(Segment::action("sql:cancel", "cancel", Tone::Warning));
 	}
 	if let Some(time_elapsed) = status_time_elapsed {
 		bar = bar.right(Segment::timer("time", time_elapsed, Tone::Normal).reserve_chars(12));
@@ -487,6 +494,10 @@ fn build_menu_roots(
 				MenuItem::Action {
 					id: "code:run-snippet".into(),
 					label: "Run selection / line  (Shift+Enter)".into(),
+				},
+				MenuItem::Action {
+					id: "code:cancel".into(),
+					label: "Cancel run".into(),
 				},
 			],
 		},
@@ -718,6 +729,51 @@ mod tests {
 		assert!(failed_close.contains(&"session:close-without-checkpoint".to_owned()));
 	}
 
+	/// PRODUCT-0135 stage 3: the Code menu gained exactly the cancel action —
+	/// the stage 0 census pinned the pre-arc pair this stage deliberately
+	/// extends.
+	#[test]
+	fn product_0135_code_menu_offers_the_run_and_cancel_actions() {
+		let roots = build_menu_roots(false, false, None);
+		let code = roots
+			.iter()
+			.find(|root| root.id == "code")
+			.expect("Code menu exists");
+		let ids: Vec<&str> = code
+			.items
+			.iter()
+			.filter_map(|item| match item {
+				MenuItem::Action { id, .. } => Some(id.as_str()),
+				MenuItem::Submenu { .. } | MenuItem::Separator => None,
+			})
+			.collect();
+		assert_eq!(ids, ["code:run", "code:run-snippet", "code:cancel"]);
+	}
+
+	/// PRODUCT-0135 §6: the Cancel affordance exists only while a run is in
+	/// flight, rendered in the right lane beside the timer.
+	#[test]
+	fn product_0135_cancel_affordance_is_bound_to_an_in_flight_run() {
+		use crate::gui::statusbar::Segment;
+		let adapter = AdapterState::default();
+		let idle = app_status_bar("", "", None, None, None, &adapter, false, false);
+		let (_, right) = idle.lanes_for_tests();
+		assert!(
+			!right
+				.iter()
+				.any(|segment| matches!(segment, Segment::Action { .. })),
+			"no affordance while nothing runs"
+		);
+		let running = app_status_bar("", "", None, None, Some(1), &adapter, false, true);
+		let (_, right) = running.lanes_for_tests();
+		assert!(
+			right
+				.iter()
+				.any(|segment| matches!(segment, Segment::Action { id, .. } if id == "sql:cancel")),
+			"the affordance renders while a run is in flight"
+		);
+	}
+
 	/// PRODUCT-0134 stage 4: the Connect menu's saved-profile surface. Locked,
 	/// the store cannot list names (they live inside the ciphertext), so one
 	/// action requests access. Unlocked, every profile is addressable for
@@ -800,11 +856,11 @@ mod tests {
 	#[test]
 	fn product_0071_durable_session_segment_names_attachment_not_freshness() {
 		let adapter = AdapterState::default();
-		let ephemeral = app_status_bar("", "", None, None, None, &adapter, false);
-		let durable = app_status_bar("", "", None, None, None, &adapter, true);
+		let ephemeral = app_status_bar("", "", None, None, None, &adapter, false, false);
+		let durable = app_status_bar("", "", None, None, None, &adapter, true, false);
 		let checkpointed =
-			app_status_bar("Session checkpointed", "", None, None, None, &adapter, true);
-		let failed = app_status_bar("", "checkpoint failed", None, None, None, &adapter, true);
+			app_status_bar("Session checkpointed", "", None, None, None, &adapter, true, false);
+		let failed = app_status_bar("", "checkpoint failed", None, None, None, &adapter, true, false);
 
 		let durable_segment = ("left", "durable session");
 		assert!(
