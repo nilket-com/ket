@@ -7,7 +7,7 @@
 //! without a tabular final result, leaves the name unbound rather than
 //! restoring stale data (`plans/wip/rune-data-products.md`).
 
-use crate::result_artifact::{ResultArtifact, ResultArtifactError};
+use crate::result_artifact::{ArtifactToken, ResultArtifact, ResultArtifactError};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -38,6 +38,7 @@ pub struct PendingPublication {
 pub struct ResultProvenance {
 	pub source_buffer: libaryon::core::BufferId,
 	pub revision: u64,
+	pub artifact_token: ArtifactToken,
 	pub connection: String,
 	pub completed_at: SystemTime,
 	pub rows: usize,
@@ -90,6 +91,7 @@ impl ResultRegistry {
 		let provenance = ResultProvenance {
 			source_buffer: claim.source_buffer,
 			revision: claim.revision,
+			artifact_token: artifact.artifact_token(),
 			connection: claim.connection.clone(),
 			completed_at: SystemTime::now(),
 			rows: artifact.height(),
@@ -144,6 +146,13 @@ impl ResultRegistry {
 	#[allow(dead_code)] // The plot-surface reader lands with plan step 8.
 	pub fn provenance(&self, name: &str) -> Option<&ResultProvenance> {
 		self.bound.get(name).map(|published| &published.provenance)
+	}
+
+	/// The token of the currently published artifact, when the name is bound.
+	#[allow(dead_code)] // Selection-context consumption lands in the next stage.
+	pub fn artifact_token(&self, name: &str) -> Option<ArtifactToken> {
+		self.provenance(name)
+			.map(|provenance| provenance.artifact_token)
 	}
 }
 
@@ -220,10 +229,25 @@ mod tests {
 		assert_eq!(registry.snapshot().expect("snapshot").len(), 1);
 		let provenance = registry.provenance("test").expect("provenance recorded");
 		assert_eq!(provenance.source_buffer, BufferId::new(7));
+		assert_eq!(
+			provenance.artifact_token,
+			registry.artifact_token("test").unwrap()
+		);
 		assert_eq!(provenance.rows, 1);
 		assert_eq!(provenance.cols, 1);
 		assert_eq!(provenance.connection, "scratch");
 		assert_eq!(provenance.data_kind, ResultDataKind::Materialized);
+	}
+
+	#[test]
+	fn publication_artifact_token_is_exposed_by_provenance() {
+		let mut registry = ResultRegistry::default();
+		let claim = begin(&mut registry, "test");
+		let artifact = frame(1);
+		let token = artifact.artifact_token();
+
+		assert!(registry.publish(&claim, artifact));
+		assert_eq!(registry.artifact_token("test"), Some(token));
 	}
 
 	#[test]

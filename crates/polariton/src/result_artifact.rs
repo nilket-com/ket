@@ -16,8 +16,28 @@ use polars::io::ipc::IpcStreamReader;
 use polars::prelude::AnyValue;
 use std::fmt;
 use std::io::Cursor;
+use std::num::NonZeroU64;
 use std::ops::Range;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
+
+/// Product-owned identity for one materialized publication.
+///
+/// This is deliberately not an engine revision, query id, connection id, or
+/// relation-expression hash. Every result-artifact construction path mints
+/// one, so adapter-neutral consumers can compare publication identity without
+/// branching on the producer.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ArtifactToken(NonZeroU64);
+
+static NEXT_ARTIFACT_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+impl ArtifactToken {
+	fn mint() -> Self {
+		let raw = NEXT_ARTIFACT_TOKEN.fetch_add(1, Ordering::Relaxed);
+		Self(NonZeroU64::new(raw).expect("artifact token counter exhausted"))
+	}
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FieldNullability {
@@ -77,6 +97,7 @@ enum ResultBacking {
 
 #[derive(Debug)]
 pub struct ResultArtifact {
+	artifact_token: ArtifactToken,
 	schema: ResultSchema,
 	backing: ResultBacking,
 	shape: (usize, usize),
@@ -195,6 +216,7 @@ impl ResultArtifact {
 		};
 		let width = schema.fields().len();
 		Ok(Arc::new(Self {
+			artifact_token: ArtifactToken::mint(),
 			schema: result_schema,
 			backing: ResultBacking::Arrow(ArrowBacking {
 				schema,
@@ -220,6 +242,7 @@ impl ResultArtifact {
 		};
 		let shape = frame.shape();
 		Arc::new(Self {
+			artifact_token: ArtifactToken::mint(),
 			schema,
 			backing: ResultBacking::Polars(frame),
 			shape,
@@ -234,6 +257,11 @@ impl ResultArtifact {
 
 	pub fn schema(&self) -> &ResultSchema {
 		&self.schema
+	}
+
+	/// The adapter-neutral identity of this materialized publication.
+	pub fn artifact_token(&self) -> ArtifactToken {
+		self.artifact_token
 	}
 
 	pub fn shape(&self) -> (usize, usize) {
@@ -466,6 +494,16 @@ mod tests {
 				.all(|field| field.nullability() == FieldNullability::Unknown)
 		);
 		assert!(Arc::ptr_eq(&frame, &artifact.projection().unwrap()));
+	}
+
+	#[test]
+	fn artifact_tokens_are_unique_and_stable_across_arc_sharing() {
+		let first = ResultArtifact::from_polars(Arc::new(polars::df!("x" => [1_i32]).unwrap()));
+		let second = ResultArtifact::from_polars(Arc::new(polars::df!("x" => [2_i32]).unwrap()));
+		let shared = Arc::clone(&first);
+
+		assert_ne!(first.artifact_token(), second.artifact_token());
+		assert_eq!(first.artifact_token(), shared.artifact_token());
 	}
 
 	#[test]
