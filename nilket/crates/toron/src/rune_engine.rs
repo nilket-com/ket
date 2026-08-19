@@ -1003,6 +1003,36 @@ pub fn approx_quantile(val: RuneExpr, q: f64) -> RuneAggr {
 	}
 }
 
+/// ADR 562: `string_agg(value, separator, [asc(key), desc(key), …])`. The
+/// ordering keys are required, mirroring SQL's required in-call ORDER BY.
+pub fn string_agg(
+	value: RuneExpr,
+	separator: String,
+	keys: Vec<RuneSortKey>,
+) -> VmResult<RuneAggr> {
+	if keys.is_empty() {
+		return VmResult::panic(
+			"string_agg requires ordering keys: an unordered concatenation is nondeterministic",
+		);
+	}
+	if keys.iter().any(|key| key.nulls_first) {
+		return VmResult::panic("string_agg NULLS FIRST is deferred");
+	}
+	let mut args = vec![value.expr];
+	let mut descending = Vec::with_capacity(keys.len());
+	for key in keys {
+		descending.push(key.descending);
+		args.push(key.expr);
+	}
+	VmResult::Ok(RuneAggr {
+		func: AggregateFunction::StringAgg(Box::new(crate::ir::StringAggCall {
+			separator: separator.into_boxed_str(),
+			descending,
+		})),
+		args,
+	})
+}
+
 pub fn exp(expr: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -2035,6 +2065,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["modulo"], modulo).build()?;
 	m.function(["linear_regress"], linear_regress).build()?;
 	m.function(["approx_quantile"], approx_quantile).build()?;
+	m.function(["string_agg"], string_agg).build()?;
 	m.function(["count_all"], count_all).build()?;
 	m.function(["count"], count).build()?;
 	m.function(["sum"], sum).build()?;

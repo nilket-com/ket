@@ -9349,3 +9349,204 @@ async fn adr560_grouped_spread_skips_nulls_rather_than_counting_them() {
 		"a skipped NULL must leave the spread unchanged"
 	);
 }
+
+fn string_agg_value(batches: &[RecordBatch]) -> Option<String> {
+	let column = batches[0].column(batches[0].num_columns() - 1);
+	let values = column
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("STRING_AGG Utf8 output");
+	(!values.is_null(0)).then(|| values.value(0).to_string())
+}
+
+#[tokio::test]
+async fn adr562_string_agg_orders_skips_nulls_and_reverses_under_desc() {
+	// region row 6 is NULL: it contributes neither element nor separator.
+	let ascending = run_logical(&plan_sql(
+		"SELECT STRING_AGG(region, ', ' ORDER BY id) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		string_agg_value(&ascending).as_deref(),
+		Some("east, west, east, east, west")
+	);
+
+	let descending = run_logical(&plan_sql(
+		"SELECT STRING_AGG(region, ', ' ORDER BY id DESC) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		string_agg_value(&descending).as_deref(),
+		Some("west, east, east, west, east")
+	);
+
+	// Skipping is equivalence with pre-filtering, not merely absence.
+	let filtered = run_logical(&plan_sql(
+		"SELECT STRING_AGG(region, ', ' ORDER BY id) FROM sales WHERE region IS NOT NULL",
+	))
+	.await;
+	assert_eq!(string_agg_value(&ascending), string_agg_value(&filtered));
+}
+
+#[tokio::test]
+async fn adr562_string_agg_null_keys_place_last_ascending_first_descending() {
+	// amount is NULL at rows 3 (east) and 5 (west); row 6's region is NULL and
+	// is skipped as a value regardless of its key.
+	let ascending = run_logical(&plan_sql(
+		"SELECT STRING_AGG(region, ',' ORDER BY amount) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		string_agg_value(&ascending).as_deref(),
+		Some("east,west,east,east,west"),
+		"NULL keys must place last under ASC"
+	);
+	let descending = run_logical(&plan_sql(
+		"SELECT STRING_AGG(region, ',' ORDER BY amount DESC) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		string_agg_value(&descending).as_deref(),
+		Some("east,west,east,west,east"),
+		"NULL keys must place first under DESC"
+	);
+}
+
+#[tokio::test]
+async fn adr562_string_agg_multi_key_sorts_lexicographically_with_directions() {
+	let rows = run_logical(&plan_sql(
+		"SELECT STRING_AGG(region, ',' ORDER BY status, id DESC) FROM sales",
+	))
+	.await;
+	// closed (row 3, east) first; then open by id descending: 5,4,2,1.
+	assert_eq!(
+		string_agg_value(&rows).as_deref(),
+		Some("east,west,east,west,east")
+	);
+}
+
+#[tokio::test]
+async fn adr562_string_agg_empty_and_all_null_groups_answer_null() {
+	let empty = run_logical(&plan_sql(
+		"SELECT STRING_AGG(region, ',' ORDER BY id) FROM empty_sales",
+	))
+	.await;
+	assert_eq!(
+		string_agg_value(&empty),
+		None,
+		"an empty group answers NULL"
+	);
+
+	// Row 6 is the only member of its id group and its region is NULL, so the
+	// group is all-NULL without relying on a filter the test mock may drop.
+	let grouped = run_logical(&plan_sql(
+		"SELECT id, STRING_AGG(region, ',' ORDER BY id) FROM sales GROUP BY id ORDER BY id",
+	))
+	.await;
+	let concats = grouped[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("STRING_AGG column");
+	assert!(
+		concats.is_null(5),
+		"an all-NULL group answers NULL, got {:?}",
+		concats.value(5)
+	);
+	assert_eq!(concats.value(0), "east");
+}
+
+#[tokio::test]
+async fn adr562_string_agg_grouped_concatenates_per_group() {
+	let rows = run_logical(&plan_sql(
+		"SELECT status, STRING_AGG(region, '|' ORDER BY id) FROM sales \
+		 GROUP BY status ORDER BY status",
+	))
+	.await;
+	let statuses = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("status column");
+	let concats = rows[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("STRING_AGG column");
+	assert_eq!(statuses.value(0), "closed");
+	assert_eq!(concats.value(0), "east");
+	assert_eq!(statuses.value(1), "open");
+	assert_eq!(concats.value(1), "east|west|east|west");
+}
+
+#[tokio::test]
+async fn adr562_string_agg_rejects_unordered_non_literal_null_and_distinct_forms() {
+	let unordered = SqlPlanner::new()
+		.plan("SELECT STRING_AGG(region, ',') FROM sales")
+		.expect_err("unordered STRING_AGG must be rejected");
+	assert!(
+		unordered.to_string().contains("nondeterministic"),
+		"the rejection must name the reason, got {unordered}"
+	);
+
+	let non_literal = SqlPlanner::new()
+		.plan("SELECT STRING_AGG(region, status ORDER BY id) FROM sales")
+		.expect_err("a non-literal separator must be rejected");
+	assert!(non_literal.to_string().contains("string literal"));
+
+	let null_separator = SqlPlanner::new()
+		.plan("SELECT STRING_AGG(region, NULL ORDER BY id) FROM sales")
+		.expect_err("a NULL separator must be rejected");
+	assert!(
+		null_separator
+			.to_string()
+			.contains("not a STRING_AGG separator")
+	);
+
+	let distinct = SqlPlanner::new()
+		.plan("SELECT STRING_AGG(DISTINCT region, ',' ORDER BY id) FROM sales")
+		.expect_err("STRING_AGG DISTINCT is deferred");
+	assert!(distinct.to_string().contains("deferred"));
+
+	let windowed = SqlPlanner::new()
+		.plan("SELECT STRING_AGG(region, ',' ORDER BY id) OVER (PARTITION BY status) FROM sales")
+		.expect_err("STRING_AGG is not window eligible");
+	assert!(windowed.to_string().contains("window aggregate functions"));
+
+	// An empty separator concatenates without joining text.
+	let bare = run_logical(&plan_sql(
+		"SELECT STRING_AGG(region, '' ORDER BY id) FROM sales",
+	))
+	.await;
+	assert_eq!(
+		string_agg_value(&bare).as_deref(),
+		Some("eastwesteasteastwest")
+	);
+}
+
+#[tokio::test]
+async fn adr562_rune_string_agg_matches_sql_through_one_identifier() {
+	let sql = run_logical(&plan_sql(
+		"SELECT status, STRING_AGG(region, ', ' ORDER BY id DESC) FROM sales \
+		 GROUP BY status ORDER BY status",
+	))
+	.await;
+	let rune = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .aggregate([col("status")], [string_agg(col("region"), ", ", [desc(col("id"))])])
+               .sort([asc(col("status"))])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql, SortPolicy::FullRowLex).expect("SQL digest"),
+		canonical_arrow_ipc_digest(&rune, SortPolicy::FullRowLex).expect("Rune digest"),
+		"SQL and Rune must reach one registry identifier and one result"
+	);
+}

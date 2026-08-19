@@ -30,6 +30,7 @@ pub(crate) enum StableAggregateKernel {
 	StddevPop = 9,
 	StddevSamp = 10,
 	LinearRegress = 11,
+	StringAgg = 12,
 }
 
 impl StableAggregateKernel {
@@ -51,6 +52,7 @@ impl StableAggregateKernel {
 		Self::StddevPop,
 		Self::StddevSamp,
 		Self::LinearRegress,
+		Self::StringAgg,
 	];
 }
 
@@ -78,6 +80,8 @@ pub(crate) enum AggregateInputDomain {
 	AvgNumeric,
 	OrderedMinMax,
 	QuantileNumeric,
+	/// ADR 562: `Utf8` or `LargeUtf8`, width preserved by `SameAsInput`.
+	Utf8String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -132,6 +136,8 @@ pub(crate) enum AggregateStateFamily {
 	Avg,
 	Quantile,
 	Spread,
+	/// ADR 562: buffered (keys, value) pairs, sorted and joined at finalize.
+	StringAgg,
 	/// Experimental kernels own their whole execution path and have no shared
 	/// grouped accumulator.
 	Experimental,
@@ -398,6 +404,27 @@ pub(crate) const STABLE_AGGREGATE_KERNELS: &[AggregateKernelSpec] = &[
 		grouped_supported: false,
 		experimental: true,
 	},
+	// ADR 562: ordered concatenation. The required ORDER BY makes the common
+	// case deterministic; ties still resolve by arrival, so the classification
+	// stays honest at Sensitive.
+	AggregateKernelSpec {
+		kind: StableAggregateKernel::StringAgg,
+		sql_name: "STRING_AGG",
+		sql_aliases: &[],
+		rune_name: "string_agg",
+		output_name: "string_agg",
+		arity: AggregateArity::Two,
+		input_domain: AggregateInputDomain::Utf8String,
+		output_rule: AggregateOutputRule::SameAsInput,
+		logical_type: AggregateLogicalTypeRule::Naked,
+		order_sensitivity: AggregateOrderSensitivity::Sensitive,
+		window_eligible: false,
+		state_family: AggregateStateFamily::StringAgg,
+		nullable_for_nonempty: true,
+		nullable_for_empty: true,
+		grouped_supported: true,
+		experimental: false,
+	},
 ];
 
 /// ADR 561: alias resolution reads the entries rather than a hand match, so an
@@ -423,6 +450,7 @@ pub(crate) fn stable_kernel_for_function(function: &AggregateFunction) -> Stable
 		AggregateFunction::StddevPop => StableAggregateKernel::StddevPop,
 		AggregateFunction::StddevSamp => StableAggregateKernel::StddevSamp,
 		AggregateFunction::LinearRegress => StableAggregateKernel::LinearRegress,
+		AggregateFunction::StringAgg(_) => StableAggregateKernel::StringAgg,
 	}
 }
 
@@ -446,7 +474,11 @@ pub(crate) fn function_for_payloadless_kind(
 		StableAggregateKernel::VarSamp => Some(AggregateFunction::VarSamp),
 		StableAggregateKernel::StddevPop => Some(AggregateFunction::StddevPop),
 		StableAggregateKernel::StddevSamp => Some(AggregateFunction::StddevSamp),
-		StableAggregateKernel::ApproxQuantile | StableAggregateKernel::LinearRegress => None,
+		StableAggregateKernel::ApproxQuantile
+		| StableAggregateKernel::LinearRegress
+		// The payload carries the separator and directions, so construction goes
+		// through its own lowering arm.
+		| StableAggregateKernel::StringAgg => None,
 	}
 }
 
@@ -536,6 +568,9 @@ pub(crate) fn input_domain_accepts(domain: AggregateInputDomain, input: Option<&
 		AggregateInputDomain::AvgNumeric => input.is_some_and(is_avg_numeric_input),
 		AggregateInputDomain::OrderedMinMax => input.is_some_and(is_ordered_min_max_input),
 		AggregateInputDomain::QuantileNumeric => input.is_some_and(is_quantile_numeric_input),
+		AggregateInputDomain::Utf8String => {
+			input.is_some_and(|input| matches!(input, DataType::Utf8 | DataType::LargeUtf8))
+		}
 	}
 }
 
@@ -722,9 +757,9 @@ mod adr561_registry_tests {
 				constructible += 1;
 			}
 		}
-		// Exactly the payload-carrying quantile and the experimental kernel
-		// construct through their own arms.
-		assert_eq!(constructible, StableAggregateKernel::ALL.len() - 2);
+		// Exactly the payload-carrying quantile and string-agg calls and the
+		// experimental kernel construct through their own arms.
+		assert_eq!(constructible, StableAggregateKernel::ALL.len() - 3);
 	}
 
 	/// `COUNT` is the reason resolution takes name **and** arity.

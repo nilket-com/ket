@@ -50,6 +50,54 @@ pub(super) fn bind_stable_aggregate_call(
 			message: "APPROX_QUANTILE requires a finite quantile literal in [0, 1]".to_string(),
 		});
 	}
+	// ADR 562: STRING_AGG's lowered arguments are the value plus one root per
+	// ordering key, so the registry's call-site arity does not apply to them.
+	// The payload's directions and the key roots must agree one-to-one.
+	if let AggregateFunction::StringAgg(payload) = function {
+		if args.is_empty() || payload.descending.len() != args.len() - 1 {
+			return Err(BindingError::UnsupportedExpression {
+				message: "STRING_AGG requires a value and one direction per ordering key"
+					.to_string(),
+			});
+		}
+		let args = bind_expr_program(args, input_schema, ctx)?;
+		let Some(value_type) = args.root_type(0) else {
+			return Err(BindingError::UnsupportedExpression {
+				message: "STRING_AGG value is not a bound expression".to_string(),
+			});
+		};
+		if aggregate_kernel::stable_output_data_type(function, Some(value_type)).is_none() {
+			return Err(BindingError::TypeMismatch {
+				message: aggregate_type_mismatch_message(spec.kind, value_type),
+			});
+		}
+		for key_root in 1..args.roots.len() {
+			let Some(key_type) = args.root_type(key_root) else {
+				return Err(BindingError::UnsupportedExpression {
+					message: "STRING_AGG ordering key is not a bound expression".to_string(),
+				});
+			};
+			if !matches!(
+				key_type,
+				DataType::Int32
+					| DataType::Int64
+					| DataType::Float32
+					| DataType::Float64
+					| DataType::Utf8
+					| DataType::LargeUtf8
+					| DataType::Date32
+					| DataType::Timestamp(_, _)
+			) {
+				return Err(BindingError::TypeMismatch {
+					message: format!("STRING_AGG ordering key must be orderable, got {key_type:?}"),
+				});
+			}
+		}
+		return Ok(BoundAggregateCall {
+			function: function.clone(),
+			args,
+		});
+	}
 	if args.len() != spec.arity.len() {
 		return Err(BindingError::UnsupportedExpression {
 			message: format!("{} requires one argument", spec.sql_name),
@@ -218,6 +266,9 @@ pub(super) fn aggregate_type_mismatch_message(
 				"{} expects numeric input, got {data_type:?}",
 				aggregate_kernel::stable_spec(kernel).sql_name
 			)
+		}
+		StableAggregateKernel::StringAgg => {
+			format!("STRING_AGG expects a Utf8 or LargeUtf8 value, got {data_type:?}")
 		}
 		StableAggregateKernel::CountAll | StableAggregateKernel::Count => {
 			unreachable!("COUNT accepts any input type")

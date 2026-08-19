@@ -37,6 +37,7 @@ pub(crate) fn adr561_aggregate_catalog_is_the_single_classification_seam() {
 		"StddevPop",
 		"StddevSamp",
 		"LinearRegress",
+		"StringAgg",
 	];
 	for variant in expected_kinds {
 		assert!(
@@ -90,6 +91,8 @@ pub(crate) fn adr561_aggregate_catalog_is_the_single_classification_seam() {
 		"window_eligible: false",
 		"state_family: AggregateStateFamily::Count",
 		"state_family: AggregateStateFamily::Spread",
+		"state_family: AggregateStateFamily::StringAgg",
+		"input_domain: AggregateInputDomain::Utf8String",
 		"nullable_for_nonempty: false",
 		"nullable_for_nonempty: true",
 		"nullable_for_empty: false",
@@ -112,6 +115,7 @@ pub(crate) fn adr561_aggregate_catalog_is_the_single_classification_seam() {
 		"STDDEV_POP",
 		"STDDEV_SAMP",
 		"LINEAR_REGRESS",
+		"STRING_AGG",
 	] {
 		assert!(
 			stable_rows.contains(&format!("sql_name: \"{sql_name}\"")),

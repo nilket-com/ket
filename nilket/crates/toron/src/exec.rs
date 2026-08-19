@@ -675,14 +675,16 @@ impl Executor {
 									true,
 								));
 							}
-							// ADR 560: the spread family reaches execution through the
-							// bound aggregate path, which the planner always produces.
-							AggregateFunction::VarPop
+							// ADR 560/562: the spread family and STRING_AGG reach
+							// execution through the bound aggregate path only, which
+							// the planner always produces.
+							AggregateFunction::StringAgg(_)
+							| AggregateFunction::VarPop
 							| AggregateFunction::VarSamp
 							| AggregateFunction::StddevPop
 							| AggregateFunction::StddevSamp => {
 								return Err(ExecutionError::NotImplemented {
-									feature: "unbound global spread aggregate",
+									feature: "unbound global bound-only aggregate",
 								});
 							}
 							AggregateFunction::LinearRegress => {
@@ -2605,7 +2607,8 @@ fn window_agg_add(
 		| AggregateFunction::VarPop
 		| AggregateFunction::VarSamp
 		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => {
+		| AggregateFunction::StddevSamp
+		| AggregateFunction::StringAgg(_) => {
 			return Err(crate::exec::aggregate::non_window_aggregate_error(function));
 		}
 	}
@@ -2637,7 +2640,8 @@ fn window_agg_finalize(
 		| AggregateFunction::VarPop
 		| AggregateFunction::VarSamp
 		| AggregateFunction::StddevPop
-		| AggregateFunction::StddevSamp => {
+		| AggregateFunction::StddevSamp
+		| AggregateFunction::StringAgg(_) => {
 			return Err(crate::exec::aggregate::non_window_aggregate_error(function));
 		}
 	})

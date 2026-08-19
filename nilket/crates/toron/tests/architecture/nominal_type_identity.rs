@@ -604,6 +604,7 @@ pub(crate) fn adr168_count_and_statistical_aggregates_stay_naked() {
 		"StddevPop",
 		"StddevSamp",
 		"LinearRegress",
+		"StringAgg",
 	] {
 		assert!(
 			aggregate_entry_block(naked).contains("logical_type: AggregateLogicalTypeRule::Naked"),

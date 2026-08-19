@@ -24,10 +24,10 @@ use sqlparser::ast::{
 	FromTable, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList, FunctionArguments,
 	GroupByExpr, HiveDistributionStyle, Ident, Insert, Interval as SqlInterval, JoinConstraint,
 	JoinOperator, LimitClause, NamedWindowDefinition, NamedWindowExpr, NullTreatment, ObjectName,
-	ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByKind, Query,
-	Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement, TableAlias,
-	TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo, TrimWhereField,
-	TypedString, UnaryOperator, Value, WindowSpec, WindowType,
+	ObjectNamePart, ObjectType, OptimizerHint, OptimizerHintStyle, OrderBy, OrderByExpr,
+	OrderByKind, Query, Select, SelectItem, SetExpr, SetOperator, SetQuantifier, Statement,
+	TableAlias, TableConstraint, TableFactor, TableObject, TableWithJoins, TimezoneInfo,
+	TrimWhereField, TypedString, UnaryOperator, Value, WindowSpec, WindowType,
 };
 use sqlparser::dialect::GenericDialect;
 use sqlparser::parser::Parser;
@@ -5191,7 +5191,19 @@ impl SqlPlanner {
 	) -> Result<LoweredAggregateCall, FrontendError> {
 		let name = aggregate_function_name(&function.name)
 			.ok_or_else(|| unsupported("unsupported aggregate function"))?;
-		let AggregateFunctionArgs { args, distinct } = aggregate_function_args(function)?;
+		let AggregateFunctionArgs {
+			args,
+			distinct,
+			order_by,
+		} = aggregate_function_args(function)?;
+		if !order_by.is_empty() && name != "STRING_AGG" {
+			return Err(unsupported(
+				"aggregate function modifiers are not supported",
+			));
+		}
+		if distinct && name == "STRING_AGG" {
+			return Err(unsupported("STRING_AGG DISTINCT is deferred"));
+		}
 
 		let (function, args) = match name {
 			"COUNT" => self.lower_count_aggregate(args),
@@ -5205,6 +5217,7 @@ impl SqlPlanner {
 			"VAR_POP" | "VAR_SAMP" | "STDDEV_POP" | "STDDEV_SAMP" => {
 				self.lower_simple_aggregate(name, args)
 			}
+			"STRING_AGG" => self.lower_string_agg_aggregate(args, &order_by),
 			"LINEAR_REGRESS" => {
 				if matches!(mode, AggregateSqlMode::Grouped) {
 					return Err(unsupported(
@@ -5221,6 +5234,71 @@ impl SqlPlanner {
 			args,
 			distinct,
 		})
+	}
+
+	/// ADR 562: `STRING_AGG(value, separator ORDER BY key…)`. The ordering
+	/// clause is required — an unordered concatenation publishes row-arrival
+	/// order, which is nondeterministic under exchange — and the separator is a
+	/// constant string literal per the SUBSTRING-bounds precedent. Keys travel
+	/// as ordinary arguments after the value; directions ride the payload.
+	fn lower_string_agg_aggregate(
+		&self,
+		args: &[FunctionArg],
+		order_by: &[&OrderByExpr],
+	) -> Result<(AggregateFunction, Vec<Expr>), FrontendError> {
+		if args.len() != 2 {
+			return Err(unsupported(
+				"STRING_AGG requires a value and a separator argument",
+			));
+		}
+		validate_simple_aggregate_arg(&args[0])?;
+		let separator = match &args[1] {
+			FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Value(value))) => {
+				match &value.value {
+					Value::SingleQuotedString(text) => text.clone(),
+					Value::Null => {
+						return Err(unsupported(
+							"NULL is not a STRING_AGG separator; use '' to concatenate without one",
+						));
+					}
+					_ => {
+						return Err(unsupported("STRING_AGG separator must be a string literal"));
+					}
+				}
+			}
+			_ => {
+				return Err(unsupported("STRING_AGG separator must be a string literal"));
+			}
+		};
+		if order_by.is_empty() {
+			return Err(unsupported(
+				"STRING_AGG requires ORDER BY inside the call: an unordered \
+				 concatenation publishes row-arrival order, which is nondeterministic",
+			));
+		}
+		let mut lowered = vec![self.lower_arg(&args[0])?];
+		let mut descending = Vec::with_capacity(order_by.len());
+		for key in order_by {
+			if key.options.nulls_first.is_some() {
+				return Err(unsupported(
+					"STRING_AGG NULLS FIRST/LAST is deferred; NULL keys place last \
+					 ascending and first descending",
+				));
+			}
+			if key.with_fill.is_some() {
+				return Err(unsupported("STRING_AGG WITH FILL is not supported"));
+			}
+			validate_aggregate_argument(&key.expr)?;
+			descending.push(!key.options.asc.unwrap_or(true));
+			lowered.push(self.lower_expr(&key.expr)?);
+		}
+		Ok((
+			AggregateFunction::StringAgg(Box::new(crate::ir::StringAggCall {
+				separator: separator.into_boxed_str(),
+				descending,
+			})),
+			lowered,
+		))
 	}
 
 	fn lower_count_aggregate(
@@ -8108,10 +8186,13 @@ struct GroupedAggregateSignature {
 	parameter: GroupedAggregateParameter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum GroupedAggregateParameter {
 	None,
 	Quantile(u64),
+	// ADR 562: two STRING_AGG calls with different separators or directions
+	// are different aggregates and must not dedup together.
+	StringAgg(Box<crate::ir::StringAggCall>),
 }
 
 impl PartialEq for GroupedAggregateSignature {
@@ -9668,6 +9749,7 @@ fn grouped_aggregate_signature(
 			let canonical = if *q == 0.0 { 0.0 } else { *q };
 			GroupedAggregateParameter::Quantile(canonical.to_bits())
 		}
+		AggregateFunction::StringAgg(call) => GroupedAggregateParameter::StringAgg(call.clone()),
 		_ => GroupedAggregateParameter::None,
 	};
 	let spec = aggregate_kernel::stable_spec(kernel);
@@ -9811,6 +9893,8 @@ fn canonical_binary_signature_expr(
 struct AggregateFunctionArgs<'a> {
 	args: &'a [FunctionArg],
 	distinct: bool,
+	// ADR 562: STRING_AGG's in-call ORDER BY; every other aggregate rejects it.
+	order_by: Vec<&'a OrderByExpr>,
 }
 
 fn aggregate_function_args(
@@ -9847,12 +9931,27 @@ fn aggregate_function_args(
 			));
 		}
 	};
-	if !clauses.is_empty() {
-		return Err(unsupported(
-			"aggregate function modifiers are not supported",
-		));
+	// ADR 562: the in-call ORDER BY clause is extracted rather than rejected
+	// here; the dispatch admits it for STRING_AGG alone. Any other clause
+	// stays a modifier error.
+	let mut order_by = Vec::new();
+	for clause in clauses {
+		match clause {
+			sqlparser::ast::FunctionArgumentClause::OrderBy(exprs) => {
+				order_by.extend(exprs.iter());
+			}
+			_ => {
+				return Err(unsupported(
+					"aggregate function modifiers are not supported",
+				));
+			}
+		}
 	}
-	Ok(AggregateFunctionArgs { args, distinct })
+	Ok(AggregateFunctionArgs {
+		args,
+		distinct,
+		order_by,
+	})
 }
 
 fn table_factor_is_derived(factor: &TableFactor) -> bool {

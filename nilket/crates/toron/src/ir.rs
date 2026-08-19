@@ -1082,6 +1082,19 @@ pub enum AggregateFunction {
 	StddevSamp,
 	LinearRegress,
 	ApproxQuantile(f64),
+	/// ADR 562: ordered string concatenation. The payload carries the
+	/// non-expression call data; the value and ordering keys travel as
+	/// ordinary arguments (`args[0]` the value, `args[1..]` the keys).
+	StringAgg(Box<StringAggCall>),
+}
+
+/// ADR 562: `STRING_AGG`'s non-expression call data, the aggregate form of a
+/// scalar keyword payload. The separator is constant by decision; `descending`
+/// holds one direction per ordering key, in key order.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StringAggCall {
+	pub separator: Box<str>,
+	pub descending: Vec<bool>,
 }
 
 /// Window functions over one `OVER (...)` spec. Ranking functions (ADR 241) depend only on the partition

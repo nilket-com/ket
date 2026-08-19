@@ -141,8 +141,8 @@ pub(crate) fn aggregate_kernel_catalog_guards_are_narrow() {
 		.and_then(|rest| rest.split("#[derive").next())
 		.expect("AggState enum");
 	// ADR 268 `AvgDecimal`; ADR 284 Decimal MIN/MAX; ADR 546 the shared quantile
-	// state; ADR 560 the one `Spread` state all four spread spellings share.
-	assert_eq!(enum_variant_count(agg_state_enum), 18);
+	// state; ADR 560 the one `Spread` state; ADR 562 the string-agg buffer.
+	assert_eq!(enum_variant_count(agg_state_enum), 19);
 	let before_agg_state = exec.split("enum AggState").next().unwrap_or("");
 	let derives_above = before_agg_state.rsplit("#[derive").next().unwrap_or("");
 	assert!(derives_above.contains("Clone"));

@@ -1452,6 +1452,25 @@ impl Executor {
 						update_quantile_state(state, &arr, row)?;
 					}
 				}
+				AggregateFunction::StringAgg(_) => {
+					// The program's roots are [value, key…]; one evaluation
+					// feeds both channels.
+					let roots = self.evaluate_bound_program(&call.args, batch)?;
+					let AggState::StringAgg(state) = state else {
+						return Err(ExecutionError::InvalidExpression {
+							message: "STRING_AGG reached a non-string-agg accumulator".to_string(),
+						});
+					};
+					let (value_array, key_arrays) =
+						roots
+							.split_first()
+							.ok_or_else(|| ExecutionError::InvalidExpression {
+								message: "STRING_AGG requires a value argument".to_string(),
+							})?;
+					for row in 0..batch.num_rows() {
+						string_agg_accumulate_row(state, value_array, key_arrays, row)?;
+					}
+				}
 				AggregateFunction::LinearRegress => {
 					return Err(ExecutionError::NotImplemented {
 						feature: "bound experimental aggregate execution",
@@ -1898,6 +1917,18 @@ pub(in crate::exec) fn finalize_global_aggregate_state(
 					state,
 				)?])) as ArrayRef);
 			}
+			AggregateFunction::StringAgg(ref call_payload) => {
+				let AggState::StringAgg(state) = state else {
+					return Err(ExecutionError::InvalidExpression {
+						message: "STRING_AGG reached a non-string-agg accumulator".to_string(),
+					});
+				};
+				let output_type = output_schema.field(results_cols.len()).data_type().clone();
+				results_cols.push(string_agg_column(
+					vec![string_agg_finalize(state, call_payload.as_ref())],
+					&output_type,
+				)?);
+			}
 			AggregateFunction::LinearRegress => {
 				return Err(ExecutionError::NotImplemented {
 					feature: "bound experimental aggregate execution",
@@ -1969,6 +2000,7 @@ impl Executor {
 					| AggregateFunction::StddevPop
 					| AggregateFunction::StddevSamp
 					| AggregateFunction::LinearRegress
+					| AggregateFunction::StringAgg(_)
 					| AggregateFunction::ApproxQuantile(_) => Err(ExecutionError::NotImplemented {
 						feature: "grouped experimental aggregate",
 					}),
@@ -2082,6 +2114,11 @@ impl Executor {
 									feature: "unbound grouped spread aggregate",
 								});
 							}
+							AggState::StringAgg(_) => {
+								return Err(ExecutionError::NotImplemented {
+									feature: "unbound grouped string aggregate",
+								});
+							}
 						},
 					}
 				}
@@ -2128,7 +2165,8 @@ impl Executor {
 							| AggState::AvgFloat { .. }
 							| AggState::AvgDecimal { .. }
 							| AggState::Quantile(_)
-							| AggState::Spread { .. } => 0,
+							| AggState::Spread { .. }
+							| AggState::StringAgg(_) => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -2156,6 +2194,7 @@ impl Executor {
 				| AggregateFunction::StddevPop
 				| AggregateFunction::StddevSamp
 				| AggregateFunction::LinearRegress
+				| AggregateFunction::StringAgg(_)
 				| AggregateFunction::ApproxQuantile(_) => {
 					return Err(ExecutionError::NotImplemented {
 						feature: "grouped experimental aggregate",
@@ -2260,9 +2299,13 @@ impl Executor {
 		let arg_stage = refine.as_ref().and_then(|h| {
 			node_attribution::open_substage(h, "fold", "arg_eval_and_readers", &telemetry)
 		});
+		// ADR 562: STRING_AGG's ordering-key arrays ride a per-call side channel
+		// so the single-array fast path the other kernels share stays untouched.
+		let mut string_agg_keys: Vec<Option<Vec<ArrayRef>>> = vec![None; aggr_expr.len()];
 		let aggr_arrays = aggr_expr
 			.iter()
-			.map(|call| match call.function {
+			.enumerate()
+			.map(|(agg_idx, call)| match call.function {
 				AggregateFunction::CountAll => Ok(None),
 				AggregateFunction::Count
 				| AggregateFunction::Sum
@@ -2278,6 +2321,17 @@ impl Executor {
 					batch,
 					"aggregate arg",
 				)?)),
+				AggregateFunction::StringAgg(_) => {
+					let mut roots = self.evaluate_bound_program(&call.args, batch)?;
+					if roots.is_empty() {
+						return Err(ExecutionError::InvalidExpression {
+							message: "STRING_AGG requires a value argument".to_string(),
+						});
+					}
+					let value = roots.remove(0);
+					string_agg_keys[agg_idx] = Some(roots);
+					Ok(Some(value))
+				}
 				AggregateFunction::LinearRegress => Err(ExecutionError::NotImplemented {
 					feature: "bound grouped experimental aggregate",
 				}),
@@ -2333,10 +2387,11 @@ impl Executor {
 					init_bound_states_with_seed(aggr_expr, quantile_seed, &identity)
 				})?
 			};
-			for ((state, input), reader) in states
+			for (agg_idx, ((state, input), reader)) in states
 				.iter_mut()
 				.zip(aggr_arrays.iter())
 				.zip(readers.iter())
+				.enumerate()
 			{
 				match input {
 					None => {
@@ -2345,6 +2400,10 @@ impl Executor {
 						}
 					}
 					Some(array) => match state {
+						AggState::StringAgg(string_state) => {
+							let keys = string_agg_keys[agg_idx].as_deref().unwrap_or(&[]);
+							string_agg_accumulate_row(string_state, array, keys, row)?;
+						}
 						AggState::Count(total) => {
 							if !array.is_null(row) {
 								*total += 1;
@@ -2458,7 +2517,8 @@ impl Executor {
 								| AggState::AvgFloat { .. }
 								| AggState::AvgDecimal { .. }
 								| AggState::Quantile(_)
-								| AggState::Spread { .. } => 0,
+								| AggState::Spread { .. }
+								| AggState::StringAgg(_) => 0,
 							})
 							.collect::<Vec<_>>();
 						columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -2499,6 +2559,22 @@ impl Executor {
 							})
 							.collect::<Result<Vec<_>, ExecutionError>>()?;
 						columns.push(Arc::new(Float64Array::from(values)) as ArrayRef);
+					}
+					AggregateFunction::StringAgg(ref payload) => {
+						let output_type = output_schema.field(columns.len()).data_type().clone();
+						let values = entries
+							.iter()
+							.map(|entry| match &entry.states[agg_idx] {
+								AggState::StringAgg(state) => {
+									Ok(string_agg_finalize(state, payload.as_ref()))
+								}
+								_ => Err(ExecutionError::InvalidExpression {
+									message: "STRING_AGG reached a non-string-agg accumulator"
+										.to_string(),
+								}),
+							})
+							.collect::<Result<Vec<_>, ExecutionError>>()?;
+						columns.push(string_agg_column(values, &output_type)?);
 					}
 					AggregateFunction::LinearRegress => {
 						return Err(ExecutionError::NotImplemented {
@@ -2636,6 +2712,9 @@ pub(in crate::exec) enum AggState {
 		mean: f64,
 		m2: f64,
 	},
+	/// ADR 562: buffered ordered concatenation; boxed so the common numeric
+	/// states stay small.
+	StringAgg(Box<StringAggState>),
 	SumInt {
 		total: i128,
 		seen: bool,
@@ -2754,6 +2833,7 @@ fn init_states(
 			| AggregateFunction::StddevPop
 			| AggregateFunction::StddevSamp
 			| AggregateFunction::LinearRegress
+			| AggregateFunction::StringAgg(_)
 			| AggregateFunction::ApproxQuantile(_) => Ok(AggState::SumInt {
 				total: 0,
 				seen: false,
@@ -2782,6 +2862,8 @@ fn legacy_aggregate_output_type(function: &AggregateFunction, input_type: &DataT
 		| AggregateFunction::StddevSamp
 		| AggregateFunction::LinearRegress
 		| AggregateFunction::ApproxQuantile(_) => DataType::Float64,
+		// Unreachable here: the unbound path rejects STRING_AGG at evaluation.
+		AggregateFunction::StringAgg(_) => input_type.clone(),
 	}
 }
 
@@ -2900,6 +2982,9 @@ fn init_bound_state_for_call(call: &BoundAggregateCall) -> Result<AggState, Exec
 			mean: 0.0,
 			m2: 0.0,
 		}),
+		aggregate_kernel::AggregateStateFamily::StringAgg => {
+			Ok(AggState::StringAgg(Box::default()))
+		}
 		aggregate_kernel::AggregateStateFamily::Sum => Ok(call
 			.args
 			.root_type(0)
@@ -3405,6 +3490,7 @@ pub(in crate::exec) fn add_sum_value(
 		| (AggState::AvgFloat { .. }, _)
 		| (AggState::AvgDecimal { .. }, _)
 		| (AggState::Spread { .. }, _)
+		| (AggState::StringAgg(_), _)
 		| (AggState::Quantile(_), _) => Err(ExecutionError::InvalidExpression {
 			message: "SUM value reached non-SUM accumulator".to_string(),
 		}),
@@ -3477,6 +3563,7 @@ pub(in crate::exec) fn add_avg_value(
 		| (AggState::MaxFloat64 { .. }, _)
 		| (AggState::MaxDecimal128 { .. }, _)
 		| (AggState::Spread { .. }, _)
+		| (AggState::StringAgg(_), _)
 		| (AggState::Quantile(_), _) => Err(ExecutionError::InvalidExpression {
 			message: "AVG value reached non-AVG accumulator".to_string(),
 		}),
@@ -3788,7 +3875,8 @@ fn sum_column_from_groups(
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. }
 					| AggState::Quantile(_)
-					| AggState::Spread { .. } => Ok(None),
+					| AggState::Spread { .. }
+					| AggState::StringAgg(_) => Ok(None),
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
@@ -3814,7 +3902,8 @@ fn sum_column_from_groups(
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. }
 					| AggState::Quantile(_)
-					| AggState::Spread { .. } => None,
+					| AggState::Spread { .. }
+					| AggState::StringAgg(_) => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
@@ -3843,7 +3932,8 @@ fn sum_column_from_groups(
 					| AggState::AvgFloat { .. }
 					| AggState::AvgDecimal { .. }
 					| AggState::Quantile(_)
-					| AggState::Spread { .. } => None,
+					| AggState::Spread { .. }
+					| AggState::StringAgg(_) => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(
@@ -5355,7 +5445,246 @@ pub(in crate::exec) fn fresh_window_agg_state(
 			// admits them and the reject arms assert that agreement.
 			aggregate_kernel::AggregateStateFamily::Quantile
 			| aggregate_kernel::AggregateStateFamily::Spread
+			| aggregate_kernel::AggregateStateFamily::StringAgg
 			| aggregate_kernel::AggregateStateFamily::Experimental => None,
 		},
 	)
+}
+
+/// ADR 562: one ordering key value, captured per row for the string-agg buffer.
+///
+/// This exists because `GroupValue` orders floats by canonical bits — right for
+/// grouping equality, wrong for sorting. `Null` is greatest so an ascending
+/// sort places it last; a descending key reverses the comparison and places it
+/// first, which is the Postgres default placement this cut adopts.
+#[derive(Debug, Clone, PartialEq)]
+pub(in crate::exec) enum SortKeyValue {
+	Int(i128),
+	Float(f64),
+	Text(String),
+	Null,
+}
+
+impl SortKeyValue {
+	fn rank(&self) -> u8 {
+		match self {
+			Self::Int(_) => 0,
+			Self::Float(_) => 1,
+			Self::Text(_) => 2,
+			Self::Null => 3,
+		}
+	}
+
+	fn compare(&self, other: &Self) -> std::cmp::Ordering {
+		match (self, other) {
+			(Self::Int(left), Self::Int(right)) => left.cmp(right),
+			(Self::Float(left), Self::Float(right)) => left.total_cmp(right),
+			(Self::Text(left), Self::Text(right)) => left.cmp(right),
+			// A key position is one bound expression, so cross-variant
+			// comparison only happens against Null; rank order keeps it total.
+			_ => self.rank().cmp(&other.rank()),
+		}
+	}
+}
+
+/// ADR 562: the buffered accumulator behind `AggregateStateFamily::StringAgg`.
+/// Every (keys, value) pair is held until finalization — the unbounded buffer
+/// the ADR names, gated on state accounting before adversarial use.
+#[derive(Debug, Clone, Default)]
+pub(in crate::exec) struct StringAggState {
+	rows: Vec<(Vec<SortKeyValue>, String)>,
+}
+
+fn string_agg_key_value(array: &ArrayRef, row: usize) -> Result<SortKeyValue, ExecutionError> {
+	if array.is_null(row) {
+		return Ok(SortKeyValue::Null);
+	}
+	let any = array.as_any();
+	if let Some(array) = any.downcast_ref::<Int32Array>() {
+		return Ok(SortKeyValue::Int(i128::from(array.value(row))));
+	}
+	if let Some(array) = any.downcast_ref::<Int64Array>() {
+		return Ok(SortKeyValue::Int(i128::from(array.value(row))));
+	}
+	if let Some(array) = any.downcast_ref::<Date32Array>() {
+		return Ok(SortKeyValue::Int(i128::from(array.value(row))));
+	}
+	if let Some(array) = any.downcast_ref::<TimestampMillisecondArray>() {
+		return Ok(SortKeyValue::Int(i128::from(array.value(row))));
+	}
+	if let Some(array) = any.downcast_ref::<TimestampMicrosecondArray>() {
+		return Ok(SortKeyValue::Int(i128::from(array.value(row))));
+	}
+	if let Some(array) = any.downcast_ref::<TimestampNanosecondArray>() {
+		return Ok(SortKeyValue::Int(i128::from(array.value(row))));
+	}
+	if let Some(array) = any.downcast_ref::<Float32Array>() {
+		return Ok(SortKeyValue::Float(f64::from(array.value(row))));
+	}
+	if let Some(array) = any.downcast_ref::<Float64Array>() {
+		return Ok(SortKeyValue::Float(array.value(row)));
+	}
+	if let Some(array) = any.downcast_ref::<StringArray>() {
+		return Ok(SortKeyValue::Text(array.value(row).to_owned()));
+	}
+	if let Some(array) = any.downcast_ref::<LargeStringArray>() {
+		return Ok(SortKeyValue::Text(array.value(row).to_owned()));
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"STRING_AGG ordering key type {:?} is not orderable here",
+			array.data_type()
+		),
+	})
+}
+
+fn string_agg_value(array: &ArrayRef, row: usize) -> Result<Option<String>, ExecutionError> {
+	if array.is_null(row) {
+		return Ok(None);
+	}
+	let any = array.as_any();
+	if let Some(array) = any.downcast_ref::<StringArray>() {
+		return Ok(Some(array.value(row).to_owned()));
+	}
+	if let Some(array) = any.downcast_ref::<LargeStringArray>() {
+		return Ok(Some(array.value(row).to_owned()));
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"STRING_AGG expects a string value, got {:?}",
+			array.data_type()
+		),
+	})
+}
+
+/// Accumulates one row: a NULL value contributes neither element nor
+/// separator; NULL keys are captured and placed by the sort.
+pub(in crate::exec) fn string_agg_accumulate_row(
+	state: &mut StringAggState,
+	value_array: &ArrayRef,
+	key_arrays: &[ArrayRef],
+	row: usize,
+) -> Result<(), ExecutionError> {
+	let Some(value) = string_agg_value(value_array, row)? else {
+		return Ok(());
+	};
+	let mut keys = Vec::with_capacity(key_arrays.len());
+	for array in key_arrays {
+		keys.push(string_agg_key_value(array, row)?);
+	}
+	state.rows.push((keys, value));
+	Ok(())
+}
+
+/// Sorts by the keys with per-key directions and joins. `None` is the NULL
+/// answer for an empty or all-NULL group. The sort is stable, so tied keys
+/// keep arrival order — arrival is what the `Sensitive` classification admits.
+pub(in crate::exec) fn string_agg_finalize(
+	state: &StringAggState,
+	call: &crate::ir::StringAggCall,
+) -> Option<String> {
+	if state.rows.is_empty() {
+		return None;
+	}
+	let mut ordered: Vec<&(Vec<SortKeyValue>, String)> = state.rows.iter().collect();
+	ordered.sort_by(|left, right| {
+		for (index, (left_key, right_key)) in left.0.iter().zip(right.0.iter()).enumerate() {
+			let mut ordering = left_key.compare(right_key);
+			if call.descending.get(index).copied().unwrap_or(false) {
+				ordering = ordering.reverse();
+			}
+			if ordering != std::cmp::Ordering::Equal {
+				return ordering;
+			}
+		}
+		std::cmp::Ordering::Equal
+	});
+	Some(
+		ordered
+			.iter()
+			.map(|(_, value)| value.as_str())
+			.collect::<Vec<_>>()
+			.join(&call.separator),
+	)
+}
+
+/// Builds the output column at the schema's width, so a `LargeUtf8` value does
+/// not silently narrow.
+pub(in crate::exec) fn string_agg_column(
+	values: Vec<Option<String>>,
+	output_type: &DataType,
+) -> Result<ArrayRef, ExecutionError> {
+	match output_type {
+		DataType::Utf8 => Ok(Arc::new(values.into_iter().collect::<StringArray>()) as ArrayRef),
+		DataType::LargeUtf8 => {
+			Ok(Arc::new(values.into_iter().collect::<LargeStringArray>()) as ArrayRef)
+		}
+		other => Err(ExecutionError::InvalidExpression {
+			message: format!("STRING_AGG output must be a string type, got {other:?}"),
+		}),
+	}
+}
+
+#[cfg(test)]
+mod adr562_string_agg_tests {
+	use super::*;
+
+	/// A negative float must order numerically. `GroupValue` orders floats by
+	/// canonical bits — where every negative's bits exceed every positive's —
+	/// so this control fails if the key representation ever routes through it.
+	#[test]
+	fn float_keys_order_numerically_not_by_bits() {
+		assert_eq!(
+			SortKeyValue::Float(-2.0).compare(&SortKeyValue::Float(1.0)),
+			std::cmp::Ordering::Less
+		);
+		assert_eq!(
+			SortKeyValue::Float(-30.5).compare(&SortKeyValue::Float(-10.5)),
+			std::cmp::Ordering::Less
+		);
+		assert_eq!(
+			SortKeyValue::Float(f64::NEG_INFINITY).compare(&SortKeyValue::Float(0.0)),
+			std::cmp::Ordering::Less
+		);
+		// NULL is greatest, so ascending places it last; a descending key
+		// reverses and places it first.
+		assert_eq!(
+			SortKeyValue::Float(f64::INFINITY).compare(&SortKeyValue::Null),
+			std::cmp::Ordering::Less
+		);
+	}
+
+	#[test]
+	fn large_utf8_values_keep_their_width_and_accumulate() {
+		let values = Arc::new(LargeStringArray::from(vec![
+			Some("beta"),
+			Some("alpha"),
+			None,
+		])) as ArrayRef;
+		let keys = Arc::new(Int64Array::from(vec![Some(2_i64), Some(1), Some(0)])) as ArrayRef;
+		let mut state = StringAggState::default();
+		for row in 0..3 {
+			string_agg_accumulate_row(&mut state, &values, std::slice::from_ref(&keys), row)
+				.expect("accumulate LargeUtf8 row");
+		}
+		let call = crate::ir::StringAggCall {
+			separator: "-".into(),
+			descending: vec![false],
+		};
+		assert_eq!(
+			string_agg_finalize(&state, &call).as_deref(),
+			Some("alpha-beta"),
+			"the NULL value row contributes neither element nor separator"
+		);
+		let column = string_agg_column(
+			vec![string_agg_finalize(&state, &call)],
+			&DataType::LargeUtf8,
+		)
+		.expect("LargeUtf8 output column");
+		assert_eq!(
+			column.data_type(),
+			&DataType::LargeUtf8,
+			"a LargeUtf8 value must not narrow to Utf8"
+		);
+	}
 }
