@@ -27,7 +27,9 @@ fn main() -> gui::Result {
 	match action {
 		ApplicationAction::ListSessions => list_saved_sessions(),
 		ApplicationAction::Gui(startup_target) => {
-			let _ = rustls::crypto::ring::default_provider().install_default();
+			rustls::crypto::ring::default_provider()
+				.install_default()
+				.expect("install rustls crypto provider before GUI startup");
 			let startup_data = configuration::load_startup_data();
 			gui::run(startup_data, startup_target)
 		}

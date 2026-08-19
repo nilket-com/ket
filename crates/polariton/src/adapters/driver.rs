@@ -352,6 +352,12 @@ mod tests {
 	}
 
 	#[test]
+	fn postgres_tls_connector_constructs_after_provider_selection() {
+		let _ = rustls::crypto::ring::default_provider().install_default();
+		let _ = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
+	}
+
+	#[test]
 	fn sql_connection_prefers_external_and_falls_back_to_scratch() {
 		let runtime = tokio::runtime::Runtime::new().expect("runtime");
 		let mut state = AdapterState::default();
