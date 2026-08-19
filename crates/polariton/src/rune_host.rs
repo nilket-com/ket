@@ -11,6 +11,7 @@ use crate::plot::composition::PlotComposition;
 use crate::plot::core::PlotType;
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::spec::AuthoredPlotSpec;
+use crate::result_artifact::ResultArtifact;
 use polars::frame::DataFrame;
 use rune::runtime::{Value, VmResult};
 use rune::{Any, Context, Module, Source, Sources, Vm};
@@ -33,10 +34,10 @@ pub struct RuneExecution {
 pub struct RuneCapabilities {
 	/// Explicitly named notebook SQL-cell snapshots (`{#name}` fences), read
 	/// with `workspace.cell("name")`.
-	pub cells: HashMap<String, Arc<DataFrame>>,
+	pub cells: HashMap<String, Arc<ResultArtifact>>,
 	/// Session results published by plain SQL buffers (`-- @result name`),
 	/// read with `workspace.result("name")`.
-	pub results: HashMap<String, Arc<DataFrame>>,
+	pub results: HashMap<String, Arc<ResultArtifact>>,
 }
 
 #[derive(Default)]
@@ -63,8 +64,8 @@ impl RequestQueue {
 #[derive(Any, Clone)]
 #[rune(item = ::polariton, name = Workspace)]
 struct RuneWorkspace {
-	cells: Arc<HashMap<String, Arc<DataFrame>>>,
-	results: Arc<HashMap<String, Arc<DataFrame>>>,
+	cells: Arc<HashMap<String, Arc<ResultArtifact>>>,
+	results: Arc<HashMap<String, Arc<ResultArtifact>>>,
 }
 
 #[derive(Any, Clone)]
@@ -72,6 +73,7 @@ struct RuneWorkspace {
 struct RuneCell {
 	name: String,
 	data: Arc<DataFrame>,
+	artifact: Arc<ResultArtifact>,
 }
 
 #[derive(Any, Clone)]
@@ -287,9 +289,14 @@ fn workspace_cell(workspace: &RuneWorkspace, name: &str) -> VmResult<Result<Rune
 	let Some(data) = workspace.cells.get(name) else {
 		return VmResult::Ok(Err(format!("Unknown notebook cell: {name}")));
 	};
+	let data_frame = match data.projection() {
+		Ok(data_frame) => data_frame,
+		Err(error) => return VmResult::Ok(Err(error.to_string())),
+	};
 	VmResult::Ok(Ok(RuneCell {
 		name: name.to_owned(),
-		data: data.clone(),
+		data: data_frame,
+		artifact: data.clone(),
 	}))
 }
 
@@ -299,9 +306,14 @@ fn workspace_result(workspace: &RuneWorkspace, name: &str) -> VmResult<Result<Ru
 			"No published result named {name}; publish one with `-- @result {name}` in a SQL buffer"
 		)));
 	};
+	let data_frame = match data.projection() {
+		Ok(data_frame) => data_frame,
+		Err(error) => return VmResult::Ok(Err(error.to_string())),
+	};
 	VmResult::Ok(Ok(RuneCell {
 		name: name.to_owned(),
-		data: data.clone(),
+		data: data_frame,
+		artifact: data.clone(),
 	}))
 }
 
@@ -360,7 +372,7 @@ fn plot_show(plot: RunePlot) -> VmResult<Result<(), String>> {
 	let request = PlotRequest {
 		source: PlotSource::Materialized {
 			name: plot.cell.name,
-			data: crate::result_artifact::ResultArtifact::from_polars(plot.cell.data),
+			data: ResultArtifact::from_polars_derived(plot.cell.data, &plot.cell.artifact),
 		},
 		authored_spec,
 	};
@@ -382,14 +394,17 @@ mod tests {
 
 	fn cells(name: &str, data: DataFrame) -> RuneCapabilities {
 		RuneCapabilities {
-			cells: HashMap::from([(name.to_owned(), Arc::new(data))]),
+			cells: HashMap::from([(name.to_owned(), ResultArtifact::from_polars(Arc::new(data)))]),
 			..RuneCapabilities::default()
 		}
 	}
 
 	fn results(name: &str, data: DataFrame) -> RuneCapabilities {
 		RuneCapabilities {
-			results: HashMap::from([(name.to_owned(), Arc::new(data))]),
+			results: HashMap::from([(
+				name.to_owned(),
+				ResultArtifact::from_polars(Arc::new(data)),
+			)]),
 			..RuneCapabilities::default()
 		}
 	}

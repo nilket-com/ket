@@ -26,7 +26,9 @@ use crate::plot::core::PlotType;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
 #[cfg(feature = "toron")]
-use crate::plot::factory::{create_layered_plot, create_styled_plot};
+use crate::plot::factory::{
+	create_layered_plot_from_artifact, create_styled_plot,
+};
 #[cfg(feature = "toron")]
 use crate::plot::grid::{PlotGrid, PlotGridKernel};
 #[cfg(feature = "toron")]
@@ -412,7 +414,15 @@ fn build_facet_layered_plot_task(
 					figure_grid,
 					1200,
 					720,
-					|_, data| create_layered_plot(&specification, data, 1200, 720),
+					|_, data| {
+						create_layered_plot_from_artifact(
+							&specification,
+							data,
+							stamped.data.as_ref(),
+							1200,
+							720,
+						)
+					},
 				)
 				.map(|kernel| {
 					Arc::new(kernel) as Arc<dyn crate::plot::common::PlotKernel + Send + Sync>
@@ -2328,24 +2338,30 @@ fn rune_view_outcome_with_palettes(
 										authored_settings,
 									))
 								} else {
-									create_layered_plot(&specification, frame.as_ref(), 1200, 720)
-										.map_err(|error| error.to_string())
-										.and_then(|kernel| {
-											validate_rune_tick_capacity(
-												kernel.as_ref(),
-												&resolved_tick_settings,
-												&tick_step_spans,
-												&tick_every_spans,
-												&minor_tick_spans,
+									create_layered_plot_from_artifact(
+										&specification,
+										frame.as_ref(),
+										result.as_ref(),
+										1200,
+										720,
+									)
+									.map_err(|error| error.to_string())
+									.and_then(|kernel| {
+										validate_rune_tick_capacity(
+											kernel.as_ref(),
+											&resolved_tick_settings,
+											&tick_step_spans,
+											&tick_every_spans,
+											&minor_tick_spans,
+										)
+										.map_err(|(_, error)| error)
+										.map(|_| {
+											RuneRelationSinkOutput::LayeredPlot(
+												specification,
+												authored_settings,
 											)
-											.map_err(|(_, error)| error)
-											.map(|_| {
-												RuneRelationSinkOutput::LayeredPlot(
-													specification,
-													authored_settings,
-												)
-											})
 										})
+									})
 								}
 							}
 							Err(styled) => {
@@ -2439,24 +2455,30 @@ fn rune_view_outcome_with_palettes(
 									authored_settings,
 								))
 							} else {
-								create_layered_plot(&specification, frame.as_ref(), 1200, 720)
-									.map_err(|error| error.to_string())
-									.and_then(|kernel| {
-										validate_rune_tick_capacity(
-											kernel.as_ref(),
-											&resolved_tick_settings,
-											&tick_step_spans,
-											&tick_every_spans,
-											&minor_tick_spans,
+								create_layered_plot_from_artifact(
+									&specification,
+									frame.as_ref(),
+									result.as_ref(),
+									1200,
+									720,
+								)
+								.map_err(|error| error.to_string())
+								.and_then(|kernel| {
+									validate_rune_tick_capacity(
+										kernel.as_ref(),
+										&resolved_tick_settings,
+										&tick_step_spans,
+										&tick_every_spans,
+										&minor_tick_spans,
+									)
+									.map_err(|(_, error)| error)
+									.map(|_| {
+										RuneRelationSinkOutput::LayeredPlot(
+											specification,
+											authored_settings,
 										)
-										.map_err(|(_, error)| error)
-										.map(|_| {
-											RuneRelationSinkOutput::LayeredPlot(
-												specification,
-												authored_settings,
-											)
-										})
 									})
+								})
 							}
 						}
 					};
@@ -2695,6 +2717,15 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 		return Task::none();
 	}
 	let snapshots = app_state.code_editor.named_notebook_cell_data();
+	let snapshots = snapshots
+		.into_iter()
+		.map(|(name, frame)| {
+			(
+				name,
+				crate::result_artifact::ResultArtifact::from_polars(frame),
+			)
+		})
+		.collect();
 	let identity = cell.identity.clone();
 	let presentation = cell.presentation;
 	app_state.status_msg = "Building notebook plot…".into();
@@ -3928,7 +3959,9 @@ mod tests {
 	#[cfg(feature = "toron")]
 	use crate::plot::core::PlotType;
 	#[cfg(feature = "toron")]
-	use crate::plot::factory::{create_layered_plot, create_plot, create_styled_plot};
+	use crate::plot::factory::{
+		create_layered_plot, create_layered_plot_from_artifact, create_plot, create_styled_plot,
+	};
 	#[cfg(feature = "toron")]
 	use crate::plot::grid::PlotGrid;
 	#[cfg(feature = "toron")]
@@ -4844,7 +4877,13 @@ mod tests {
 						.projection()
 						.map_err(|error| error.to_string())
 						.and_then(|frame| {
-							create_layered_plot(&specification, frame.as_ref(), 1200, 720)
+							create_layered_plot_from_artifact(
+								&specification,
+								frame.as_ref(),
+								source.as_ref(),
+								1200,
+								720,
+							)
 						});
 					drop(update(
 						state,

@@ -124,17 +124,10 @@ impl ResultRegistry {
 	}
 
 	/// The immutable workspace a Rune execution receives, cloned at dispatch.
-	pub fn snapshot(
-		&self,
-	) -> Result<HashMap<String, Arc<polars::frame::DataFrame>>, ResultArtifactError> {
+	pub fn snapshot(&self) -> Result<HashMap<String, Arc<ResultArtifact>>, ResultArtifactError> {
 		self.bound
 			.iter()
-			.map(|(name, published)| {
-				published
-					.artifact
-					.projection()
-					.map(|frame| (name.clone(), frame))
-			})
+			.map(|(name, published)| Ok((name.clone(), Arc::clone(&published.artifact))))
 			.collect()
 	}
 
@@ -228,6 +221,15 @@ mod tests {
 		assert!(registry.publish(&claim, frame(1)));
 		assert_eq!(registry.snapshot().expect("snapshot").len(), 1);
 		let provenance = registry.provenance("test").expect("provenance recorded");
+		assert_eq!(
+			registry
+				.snapshot()
+				.expect("snapshot recorded")
+				.get("test")
+				.expect("snapshot publication")
+				.artifact_token(),
+			provenance.artifact_token
+		);
 		assert_eq!(provenance.source_buffer, BufferId::new(7));
 		assert_eq!(
 			provenance.artifact_token,
@@ -272,7 +274,14 @@ mod tests {
 		let snapshot = registry.snapshot().expect("snapshot");
 		let bound = snapshot.get("test").expect("newer publication bound");
 		assert_eq!(
-			bound.column("x").unwrap().i32().unwrap().get(0),
+			bound
+				.projection()
+				.unwrap()
+				.column("x")
+				.unwrap()
+				.i32()
+				.unwrap()
+				.get(0),
 			Some(2),
 			"the newer dispatch's data must win regardless of completion order"
 		);

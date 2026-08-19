@@ -176,6 +176,8 @@ export references.
 - Repeated publication of one `input_ref` keeps the context identity and mints
   a new token.
 - Every listed path receives a token, including unannotated SQL and Rune.
+- Any projection or derived-artifact wrapper over an existing publication
+  inherits that publication's token; only a fresh publication mints a new one.
 - An old token is invalid before the replacement artifact is observable.
 - A latest-dispatch-wins race cannot publish or validate an old token.
 - Token creation and invalidation contain no adapter-name or engine-brand

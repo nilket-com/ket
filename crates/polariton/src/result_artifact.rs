@@ -230,6 +230,17 @@ impl ResultArtifact {
 
 	/// Row/file producers have no admitted nullability metadata in this cut.
 	pub fn from_polars(frame: Arc<DataFrame>) -> Arc<Self> {
+		Self::from_polars_with_token(frame, ArtifactToken::mint())
+	}
+
+	/// Re-wrap a projection or derived frame without changing its publication
+	/// identity. A view may change the frame allocation while remaining bound
+	/// to the same published relation for selection and staleness checks.
+	pub fn from_polars_derived(frame: Arc<DataFrame>, source: &Self) -> Arc<Self> {
+		Self::from_polars_with_token(frame, source.artifact_token)
+	}
+
+	fn from_polars_with_token(frame: Arc<DataFrame>, artifact_token: ArtifactToken) -> Arc<Self> {
 		let schema = ResultSchema {
 			fields: frame
 				.get_column_names()
@@ -242,7 +253,7 @@ impl ResultArtifact {
 		};
 		let shape = frame.shape();
 		Arc::new(Self {
-			artifact_token: ArtifactToken::mint(),
+			artifact_token,
 			schema,
 			backing: ResultBacking::Polars(frame),
 			shape,
@@ -504,6 +515,21 @@ mod tests {
 
 		assert_ne!(first.artifact_token(), second.artifact_token());
 		assert_eq!(first.artifact_token(), shared.artifact_token());
+	}
+
+	#[test]
+	fn derived_polars_artifacts_inherit_publication_identity() {
+		let source = ResultArtifact::from_polars(Arc::new(
+			polars::df!("x" => [1_i32], "y" => [2_i32]).unwrap(),
+		));
+		let derived = ResultArtifact::from_polars_derived(
+			Arc::new(source.projection().unwrap().select(["x"]).unwrap()),
+			&source,
+		);
+		let fresh = ResultArtifact::from_polars(Arc::new(polars::df!("x" => [1_i32]).unwrap()));
+
+		assert_eq!(derived.artifact_token(), source.artifact_token());
+		assert_ne!(fresh.artifact_token(), source.artifact_token());
 	}
 
 	#[test]

@@ -457,16 +457,45 @@ pub fn create_styled_plot(
 /// Lower PRODUCT-0013's additive layered specification. One layer deliberately
 /// reuses the established kernel path; multiple layers preserve authored order
 /// in the ordered shared-domain composite.
+#[allow(dead_code)] // Fresh dataframe fixtures remain independent publications.
 pub fn create_layered_plot(
 	spec: &LayeredPlotSpec,
 	df: &DataFrame,
 	width: u32,
 	height: u32,
 ) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
+	create_layered_plot_with_artifact(spec, df, None, width, height)
+}
+
+/// Build a layered plot over a projection of an existing publication while
+/// preserving that publication's adapter-neutral identity.
+pub fn create_layered_plot_from_artifact(
+	spec: &LayeredPlotSpec,
+	df: &DataFrame,
+	source: &crate::result_artifact::ResultArtifact,
+	width: u32,
+	height: u32,
+) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
+	create_layered_plot_with_artifact(spec, df, Some(source), width, height)
+}
+
+fn create_layered_plot_with_artifact(
+	spec: &LayeredPlotSpec,
+	df: &DataFrame,
+	source: Option<&crate::result_artifact::ResultArtifact>,
+	width: u32,
+	height: u32,
+) -> Result<Arc<dyn PlotKernel + Send + Sync>, String> {
 	let binding =
 		resolve_layered_channels(spec, df.schema().as_ref()).map_err(|e| e.to_string())?;
 	let stamped = StampedResult {
-		data: crate::result_artifact::ResultArtifact::from_polars(Arc::new(df.clone())),
+		data: match source {
+			Some(source) => crate::result_artifact::ResultArtifact::from_polars_derived(
+				Arc::new(df.clone()),
+				source,
+			),
+			None => crate::result_artifact::ResultArtifact::from_polars(Arc::new(df.clone())),
+		},
 		provenance: PlotProvenance {
 			source_name: "layered plot".to_owned(),
 			revision: None,
@@ -510,11 +539,12 @@ pub fn create_layered_plot(
 	let (x_temporal_domain, y_temporal_domain) = if is_single_layer {
 		(
 			temporal_axis_domain(
-				df.column(&x_label).expect("resolved x field remains present"),
+			df.column(&x_label).expect("resolved x field remains present"),
 				&x_axis_type,
 			),
 			temporal_axis_domain(
-				df.column(&y_label).expect("resolved y field remains present"),
+				df.column(&y_label)
+					.expect("resolved y field remains present"),
 				&y_axis_type,
 			),
 		)
