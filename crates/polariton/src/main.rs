@@ -21,15 +21,21 @@ mod rune_view_compiler;
 #[cfg(feature = "toron")]
 mod session_persistence;
 
+fn ensure_rustls_provider() {
+	if rustls::crypto::CryptoProvider::get_default().is_none() {
+		rustls::crypto::ring::default_provider()
+			.install_default()
+			.expect("install rustls crypto provider before GUI startup");
+	}
+}
+
 fn main() -> gui::Result {
 	let action = action_from_args(std::env::args())
 		.map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
 	match action {
 		ApplicationAction::ListSessions => list_saved_sessions(),
 		ApplicationAction::Gui(startup_target) => {
-			rustls::crypto::ring::default_provider()
-				.install_default()
-				.expect("install rustls crypto provider before GUI startup");
+			ensure_rustls_provider();
 			let startup_data = configuration::load_startup_data();
 			gui::run(startup_data, startup_target)
 		}

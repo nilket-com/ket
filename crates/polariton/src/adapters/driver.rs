@@ -352,8 +352,8 @@ mod tests {
 	}
 
 	#[test]
-	fn postgres_tls_connector_constructs_after_provider_selection() {
-		let _ = rustls::crypto::ring::default_provider().install_default();
+	fn postgres_tls_connector_constructs_with_the_production_provider() {
+		crate::ensure_rustls_provider();
 		let _ = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
 	}
 

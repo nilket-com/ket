@@ -14,6 +14,8 @@ use tokio_postgres::{Client, types::Type};
 use tokio_stream::StreamExt;
 
 pub const FIELDS: &[AdapterField] = &[AdapterField {
+	// TLS currently trusts the Mozilla WebPKI roots only. Custom or private CA
+	// roots are not configurable through the connection-string-only surface yet.
 	key: "connection_string",
 	placeholder: "postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&param2=value2]",
 	default_value: None,
