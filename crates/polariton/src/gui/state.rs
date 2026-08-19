@@ -2942,20 +2942,39 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			app_state.status_msg = format!("Adapter selected: {:?}", adapter_selection);
 			app_state.adapter_state.select(adapter_selection);
 		}
+		Message::AdapterAdHocChanged(value) => {
+			app_state.adapter_state.ad_hoc_connection_string = value;
+			app_state.status_msg = "Configure adapter.".into();
+		}
 		Message::AdapterConfigurationChanged(key, value) => {
 			app_state.adapter_state.fields.insert(key, value);
 			app_state.status_msg = "Configure adapter.".into();
 		}
 		Message::AdapterConfigurationSubmitted => {
-			let has_empty = crate::adapters::driver::fields_for(&app_state.adapter_state.selection)
-				.iter()
-				.any(|f| {
-					app_state
-						.adapter_state
-						.fields
-						.get(f.key)
-						.is_none_or(|v| v.trim().is_empty())
-				});
+			// PRODUCT-0134 §1: the two input kinds never merge — a submission
+			// mixing them refuses, and only a submission with no ad hoc string
+			// requires the declared fields. Secure fields stay optional: an
+			// absent credential is an authentication policy, not a form error.
+			if let Some(error) = app_state.adapter_state.input_kind_error() {
+				app_state.status_error = error;
+				return Task::none();
+			}
+			let ad_hoc_active = !app_state
+				.adapter_state
+				.ad_hoc_connection_string
+				.trim()
+				.is_empty();
+			let has_empty = !ad_hoc_active
+				&& crate::adapters::driver::fields_for(&app_state.adapter_state.selection)
+					.iter()
+					.filter(|f| !f.is_secure)
+					.any(|f| {
+						app_state
+							.adapter_state
+							.fields
+							.get(f.key)
+							.is_none_or(|v| v.trim().is_empty())
+					});
 			if has_empty {
 				app_state.status_error = "All connection fields are required.".to_string();
 				return Task::none();

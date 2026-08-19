@@ -39,7 +39,7 @@ impl AdapterSelection {
 	}
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Default)]
 pub enum AdapterConfiguration {
 	#[default]
 	None,
@@ -49,11 +49,28 @@ pub enum AdapterConfiguration {
 	MySQL {
 		connection_string: String,
 	},
+	/// PRODUCT-0134 §2: the decomposed MySQL field set. The port stays a
+	/// string here and refuses non-numeric input at connect time.
+	MySQLFields {
+		host: String,
+		port: String,
+		database: String,
+		user: String,
+		password: String,
+	},
 	Parquet {
 		input_path: String,
 	},
 	Postgres {
 		connection_string: String,
+	},
+	/// PRODUCT-0134 §2: the decomposed Postgres field set.
+	PostgresFields {
+		host: String,
+		port: String,
+		database: String,
+		user: String,
+		password: String,
 	},
 	SQLite {
 		connection_string: String,
@@ -64,12 +81,78 @@ pub enum AdapterConfiguration {
 	},
 }
 
+/// Manual so the secure password field can never reach a log line, panic
+/// message, or diagnostic through a debug print (PRODUCT-0134 §5).
+impl std::fmt::Debug for AdapterConfiguration {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			AdapterConfiguration::None => f.write_str("None"),
+			AdapterConfiguration::BigQuery { project_id } => f
+				.debug_struct("BigQuery")
+				.field("project_id", project_id)
+				.finish(),
+			AdapterConfiguration::MySQL { connection_string } => f
+				.debug_struct("MySQL")
+				.field("connection_string", connection_string)
+				.finish(),
+			AdapterConfiguration::MySQLFields {
+				host,
+				port,
+				database,
+				user,
+				password: _,
+			} => f
+				.debug_struct("MySQLFields")
+				.field("host", host)
+				.field("port", port)
+				.field("database", database)
+				.field("user", user)
+				.field("password", &"<redacted>")
+				.finish(),
+			AdapterConfiguration::Parquet { input_path } => f
+				.debug_struct("Parquet")
+				.field("input_path", input_path)
+				.finish(),
+			AdapterConfiguration::Postgres { connection_string } => f
+				.debug_struct("Postgres")
+				.field("connection_string", connection_string)
+				.finish(),
+			AdapterConfiguration::PostgresFields {
+				host,
+				port,
+				database,
+				user,
+				password: _,
+			} => f
+				.debug_struct("PostgresFields")
+				.field("host", host)
+				.field("port", port)
+				.field("database", database)
+				.field("user", user)
+				.field("password", &"<redacted>")
+				.finish(),
+			AdapterConfiguration::SQLite { connection_string } => f
+				.debug_struct("SQLite")
+				.field("connection_string", connection_string)
+				.finish(),
+			#[cfg(feature = "toron")]
+			AdapterConfiguration::Toron { endpoint } => {
+				f.debug_struct("Toron").field("endpoint", endpoint).finish()
+			}
+		}
+	}
+}
+
 #[derive(Default)]
 pub struct AdapterState {
 	pub stage: AdapterStage,
 	pub selection: AdapterSelection,
 	pub name: String,
 	pub fields: BTreeMap<String, String>,
+	/// PRODUCT-0134 §1: the ad hoc connection string is a separate input kind
+	/// from the decomposed field set, never derived from it and never merged
+	/// with it. Only adapters with an `ad_hoc_placeholder` render it.
+	pub ad_hoc_connection_string: String,
 	pub configuration: AdapterConfiguration,
 	pub connection: Option<Arc<RwLock<dyn DatabaseAdapter>>>,
 	#[cfg(feature = "toron")]
@@ -88,6 +171,7 @@ impl AdapterState {
 	/// usable defaults. Placeholder examples never become connection input.
 	pub fn select(&mut self, selection: AdapterSelection) {
 		self.fields.clear();
+		self.ad_hoc_connection_string.clear();
 		self.fields
 			.extend(fields_for(&selection).iter().filter_map(|field| {
 				field
@@ -96,6 +180,27 @@ impl AdapterState {
 			}));
 		self.selection = selection;
 		self.stage = AdapterStage::Unconfigured;
+	}
+
+	/// PRODUCT-0134 §1/§10: a submission mixing the ad hoc connection string
+	/// with touched decomposed fields refuses rather than choosing between the
+	/// two input kinds. A field still holding its seeded default is untouched.
+	pub fn input_kind_error(&self) -> Option<String> {
+		if self.ad_hoc_connection_string.trim().is_empty() {
+			return None;
+		}
+		let touched = fields_for(&self.selection).iter().any(|field| {
+			let value = self
+				.fields
+				.get(field.key)
+				.map(String::as_str)
+				.unwrap_or_default();
+			!value.trim().is_empty() && value.trim() != field.default_value.unwrap_or_default()
+		});
+		touched.then(|| {
+			"Use either the connection fields or the ad hoc connection string, not both."
+				.to_owned()
+		})
 	}
 
 	/// The connection SQL executes against: the external adapter when one is
@@ -172,6 +277,10 @@ impl AdapterConfiguration {
 }
 
 impl AdapterState {
+	fn field_value(&self, key: &str) -> String {
+		self.fields.get(key).cloned().unwrap_or_default()
+	}
+
 	pub fn configure(&mut self) {
 		match &self.selection {
 			AdapterSelection::None => {
@@ -179,12 +288,20 @@ impl AdapterState {
 				self.stage = AdapterStage::Unconfigured;
 			}
 			AdapterSelection::MySQL => {
-				let connection_string = self
-					.fields
-					.get("connection_string")
-					.unwrap_or(&"mysql://root@localhost/mydb".to_string())
-					.clone();
-				self.configuration = AdapterConfiguration::MySQL { connection_string };
+				let ad_hoc = self.ad_hoc_connection_string.trim();
+				self.configuration = if ad_hoc.is_empty() {
+					AdapterConfiguration::MySQLFields {
+						host: self.field_value("host"),
+						port: self.field_value("port"),
+						database: self.field_value("database"),
+						user: self.field_value("user"),
+						password: self.field_value("password"),
+					}
+				} else {
+					AdapterConfiguration::MySQL {
+						connection_string: ad_hoc.to_owned(),
+					}
+				};
 				self.stage = AdapterStage::Configured;
 			}
 			AdapterSelection::BigQuery => {
@@ -198,12 +315,20 @@ impl AdapterState {
 				self.stage = AdapterStage::Configured;
 			}
 			AdapterSelection::Postgres => {
-				let connection_string = self
-					.fields
-					.get("connection_string")
-					.unwrap_or(&"postgresql://localhost".to_string())
-					.clone();
-				self.configuration = AdapterConfiguration::Postgres { connection_string };
+				let ad_hoc = self.ad_hoc_connection_string.trim();
+				self.configuration = if ad_hoc.is_empty() {
+					AdapterConfiguration::PostgresFields {
+						host: self.field_value("host"),
+						port: self.field_value("port"),
+						database: self.field_value("database"),
+						user: self.field_value("user"),
+						password: self.field_value("password"),
+					}
+				} else {
+					AdapterConfiguration::Postgres {
+						connection_string: ad_hoc.to_owned(),
+					}
+				};
 				self.stage = AdapterStage::Configured;
 			}
 			AdapterSelection::SQLite => {
@@ -232,6 +357,21 @@ impl AdapterState {
 			AdapterConfiguration::MySQL { connection_string } => {
 				let opts = mysql_async::Opts::from_url(&connection_string)
 					.map_err(|error| format!("MySQL URL: {error}"))?;
+				let pool = mysql_async::Pool::new(opts);
+				match tokio::time::timeout(Duration::from_secs(10), pool.get_conn()).await {
+					Ok(Ok(_conn)) => Ok(Arc::new(RwLock::new(mysql::MySQLAdapter { pool }))),
+					Ok(Err(error)) => Err(format!("MySQL connection: {error}")),
+					Err(_) => Err("MySQL connection timed out after 10s".to_owned()),
+				}
+			}
+			AdapterConfiguration::MySQLFields {
+				host,
+				port,
+				database,
+				user,
+				password,
+			} => {
+				let opts = mysql::opts_from_fields(&host, &port, &database, &user, &password)?;
 				let pool = mysql_async::Pool::new(opts);
 				match tokio::time::timeout(Duration::from_secs(10), pool.get_conn()).await {
 					Ok(Ok(_conn)) => Ok(Arc::new(RwLock::new(mysql::MySQLAdapter { pool }))),
@@ -294,6 +434,27 @@ impl AdapterState {
 				});
 				Ok(Arc::new(RwLock::new(postgres::PostgresAdapter { client })))
 			}
+			AdapterConfiguration::PostgresFields {
+				host,
+				port,
+				database,
+				user,
+				password,
+			} => {
+				let config =
+					postgres::config_from_fields(&host, &port, &database, &user, &password)?;
+				let tls = tokio_postgres_rustls::MakeRustlsConnect::with_webpki_roots();
+				let (client, connection) = config
+					.connect(tls)
+					.await
+					.map_err(|error| format!("Postgres connection: {error}"))?;
+				tokio::spawn(async move {
+					if let Err(e) = connection.await {
+						eprintln!("Postgres connection error: {}", e);
+					}
+				});
+				Ok(Arc::new(RwLock::new(postgres::PostgresAdapter { client })))
+			}
 			AdapterConfiguration::SQLite { connection_string } => {
 				if connection_string == "memory" {
 					AsyncConnection::open_in_memory()
@@ -313,6 +474,17 @@ impl AdapterState {
 				.map(|adapter| Arc::new(RwLock::new(adapter)) as _)
 				.map_err(|error| format!("Toron connection: {error}")),
 		}
+	}
+}
+
+/// Adapters that keep an ad hoc connection-string input alongside their
+/// decomposed field set (PRODUCT-0134 §1). The other adapters' single field is
+/// their whole configuration and needs no second kind.
+pub fn ad_hoc_placeholder(selection: &AdapterSelection) -> Option<&'static str> {
+	match selection {
+		AdapterSelection::MySQL => Some(mysql::AD_HOC_PLACEHOLDER),
+		AdapterSelection::Postgres => Some(postgres::AD_HOC_PLACEHOLDER),
+		_ => None,
 	}
 }
 
@@ -348,7 +520,12 @@ mod tests {
 	fn placeholder_examples_do_not_become_connection_values() {
 		let mut state = AdapterState::default();
 		state.select(AdapterSelection::Postgres);
-		assert!(state.fields.is_empty());
+		// The port's declared default seeds like SQLite's `memory`; the
+		// placeholder examples (host, database, user) must not.
+		assert_eq!(
+			state.fields.iter().collect::<Vec<_>>(),
+			[(&"port".to_owned(), &"5432".to_owned())]
+		);
 	}
 
 	#[test]

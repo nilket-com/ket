@@ -11,13 +11,84 @@ use polars::{
 use sqlparser::dialect::MySqlDialect;
 use std::time::Duration;
 
-pub const FIELDS: &[AdapterField] = &[AdapterField {
-	key: "connection_string",
-	placeholder: "mysql://user:p%40ssword@host:3306/database",
-	default_value: None,
-	field_type: &AdapterFieldType::Text,
-	is_secure: false,
-}];
+pub const AD_HOC_PLACEHOLDER: &str = "mysql://user:p%40ssword@host:3306/database";
+
+/// PRODUCT-0134 §2: connection and authentication fields only. The password is
+/// the one secure field; vendor DSN options stay on the ad hoc string.
+pub const FIELDS: &[AdapterField] = &[
+	AdapterField {
+		key: "host",
+		placeholder: "db.example.com",
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+	},
+	AdapterField {
+		key: "port",
+		placeholder: "3306",
+		default_value: Some("3306"),
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+	},
+	AdapterField {
+		key: "database",
+		placeholder: "mydb",
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+	},
+	AdapterField {
+		key: "user",
+		placeholder: "root",
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+	},
+	AdapterField {
+		key: "password",
+		placeholder: "",
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: true,
+	},
+];
+
+/// Assemble the decomposed field set into driver arguments. This is the single
+/// assembly point for the MySQL field kind (PRODUCT-0134 §3): field values are
+/// passed to the driver verbatim, so a password needs no percent-encoding. The
+/// port refuses non-numeric input here, at connect time.
+pub fn opts_from_fields(
+	host: &str,
+	port: &str,
+	database: &str,
+	user: &str,
+	password: &str,
+) -> Result<mysql_async::Opts, String> {
+	if host.trim().is_empty() {
+		return Err("MySQL host is required".to_owned());
+	}
+	if user.trim().is_empty() {
+		return Err("MySQL user is required".to_owned());
+	}
+	let port: u16 = if port.trim().is_empty() {
+		3306
+	} else {
+		port.trim()
+			.parse()
+			.map_err(|_| format!("MySQL port must be a number, got: {port}"))?
+	};
+	let mut builder = mysql_async::OptsBuilder::default()
+		.ip_or_hostname(host.trim())
+		.tcp_port(port)
+		.user(Some(user.trim()));
+	if !database.trim().is_empty() {
+		builder = builder.db_name(Some(database.trim()));
+	}
+	if !password.is_empty() {
+		builder = builder.pass(Some(password));
+	}
+	Ok(mysql_async::Opts::from(builder))
+}
 
 pub struct MySQLAdapter {
 	pub pool: Pool,

@@ -13,15 +13,86 @@ use std::pin::pin;
 use tokio_postgres::{Client, types::Type};
 use tokio_stream::StreamExt;
 
-pub const FIELDS: &[AdapterField] = &[AdapterField {
-	// TLS currently trusts the Mozilla WebPKI roots only. Custom or private CA
-	// roots are not configurable through the connection-string-only surface yet.
-	key: "connection_string",
-	placeholder: "postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&param2=value2]",
-	default_value: None,
-	field_type: &AdapterFieldType::Text,
-	is_secure: false,
-}];
+// TLS currently trusts the Mozilla WebPKI roots only. Custom or private CA
+// roots are not configurable through this surface yet; PRODUCT-0134 defers
+// transport policy to its own record.
+pub const AD_HOC_PLACEHOLDER: &str =
+	"postgresql://[user[:password]@][host][:port][/dbname][?param1=value1&param2=value2]";
+
+/// PRODUCT-0134 §2: connection and authentication fields only. The password is
+/// the one secure field; vendor DSN options stay on the ad hoc string.
+pub const FIELDS: &[AdapterField] = &[
+	AdapterField {
+		key: "host",
+		placeholder: "db.example.com",
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+	},
+	AdapterField {
+		key: "port",
+		placeholder: "5432",
+		default_value: Some("5432"),
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+	},
+	AdapterField {
+		key: "database",
+		placeholder: "postgres",
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+	},
+	AdapterField {
+		key: "user",
+		placeholder: "postgres",
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: false,
+	},
+	AdapterField {
+		key: "password",
+		placeholder: "",
+		default_value: None,
+		field_type: &AdapterFieldType::Text,
+		is_secure: true,
+	},
+];
+
+/// Assemble the decomposed field set into driver arguments. This is the single
+/// assembly point for the Postgres field kind (PRODUCT-0134 §3): no connection
+/// string is built and re-parsed, so nothing needs percent-encoding. The port
+/// refuses non-numeric input here, at connect time.
+pub fn config_from_fields(
+	host: &str,
+	port: &str,
+	database: &str,
+	user: &str,
+	password: &str,
+) -> Result<tokio_postgres::Config, String> {
+	if host.trim().is_empty() {
+		return Err("Postgres host is required".to_owned());
+	}
+	if user.trim().is_empty() {
+		return Err("Postgres user is required".to_owned());
+	}
+	let port: u16 = if port.trim().is_empty() {
+		5432
+	} else {
+		port.trim()
+			.parse()
+			.map_err(|_| format!("Postgres port must be a number, got: {port}"))?
+	};
+	let mut config = tokio_postgres::Config::new();
+	config.host(host.trim()).port(port).user(user.trim());
+	if !database.trim().is_empty() {
+		config.dbname(database.trim());
+	}
+	if !password.is_empty() {
+		config.password(password);
+	}
+	Ok(config)
+}
 
 pub struct PostgresAdapter {
 	pub client: Client,

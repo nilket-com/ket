@@ -13,6 +13,9 @@ use crate::adapters::driver::{
 	AdapterConfiguration, AdapterSelection, AdapterState, fields_for,
 };
 
+/// (key, default_value, is_secure) — one declared adapter field.
+type FieldRow = (&'static str, Option<&'static str>, bool);
+
 fn all_selections() -> Vec<AdapterSelection> {
 	vec![
 		AdapterSelection::BigQuery,
@@ -25,21 +28,31 @@ fn all_selections() -> Vec<AdapterSelection> {
 	]
 }
 
-/// 0a census: every adapter declares exactly one plaintext text field, so the
-/// masking branch in `adapter_configuration_view` has no consumer and a saved
-/// profile could not yet separate a secret field from a plain one.
+/// Stage 1: the four uncredentialed adapters keep their stage 0 single-field
+/// declarations byte for byte, while Postgres and MySQL decompose into the
+/// PRODUCT-0134 §2 field set with exactly one secure field, `password` — the
+/// masking branch's first production consumer.
 #[test]
-fn product_0134_census_every_adapter_declares_one_plaintext_field() {
-	let expected: &[(&str, &str, Option<&str>)] = &[
-		("BigQuery", "project_id", None),
-		("MySQL", "connection_string", None),
-		("Parquet", "input_path", None),
-		("Postgres", "connection_string", None),
-		("SQLite", "connection_string", Some("memory")),
+fn product_0134_fields_decompose_only_the_credentialed_adapters() {
+	let decomposed = |port_default: &'static str| {
+		vec![
+			("host", None, false),
+			("port", Some(port_default), false),
+			("database", None, false),
+			("user", None, false),
+			("password", None, true),
+		]
+	};
+	let expected: Vec<(&str, Vec<FieldRow>)> = vec![
+		("BigQuery", vec![("project_id", None, false)]),
+		("MySQL", decomposed("3306")),
+		("Parquet", vec![("input_path", None, false)]),
+		("Postgres", decomposed("5432")),
+		("SQLite", vec![("connection_string", Some("memory"), false)]),
 		#[cfg(feature = "toron")]
-		("Toron", "endpoint", None),
+		("Toron", vec![("endpoint", None, false)]),
 	];
-	let actual: Vec<(String, Vec<(&str, Option<&str>, bool)>)> = all_selections()
+	let actual: Vec<(String, Vec<FieldRow>)> = all_selections()
 		.iter()
 		.map(|selection| {
 			(
@@ -51,15 +64,152 @@ fn product_0134_census_every_adapter_declares_one_plaintext_field() {
 			)
 		})
 		.collect();
-	for ((name, key, default), (actual_name, fields)) in expected.iter().zip(&actual) {
+	for ((name, fields), (actual_name, actual_fields)) in expected.iter().zip(&actual) {
 		assert_eq!(name, actual_name);
-		assert_eq!(
-			fields,
-			&vec![(*key, *default, false)],
-			"{name} must declare exactly one plaintext field before decomposition"
-		);
+		assert_eq!(fields, actual_fields, "{name} field surface");
 	}
 	assert_eq!(expected.len(), actual.len());
+	for selection in [AdapterSelection::Postgres, AdapterSelection::MySQL] {
+		let secure: Vec<&str> = fields_for(&selection)
+			.iter()
+			.filter(|field| field.is_secure)
+			.map(|field| field.key)
+			.collect();
+		assert_eq!(secure, ["password"]);
+	}
+}
+
+/// Stage 1: the decomposed Postgres field set assembles driver arguments equal
+/// to parsing the equivalent typed string — the stage 0 oracle.
+#[test]
+fn product_0134_postgres_fields_match_the_typed_string_oracle() {
+	use tokio_postgres::config::Host;
+	let assembled =
+		crate::adapters::postgres::config_from_fields("db.example.com", "6432", "analytics", "user", "secret")
+			.expect("fields assemble");
+	let oracle: tokio_postgres::Config = "postgresql://user:secret@db.example.com:6432/analytics"
+		.parse()
+		.expect("oracle parses");
+	assert_eq!(assembled.get_hosts(), oracle.get_hosts());
+	assert_eq!(assembled.get_hosts(), &[Host::Tcp("db.example.com".into())]);
+	assert_eq!(assembled.get_ports(), oracle.get_ports());
+	assert_eq!(assembled.get_dbname(), oracle.get_dbname());
+	assert_eq!(assembled.get_user(), oracle.get_user());
+	assert_eq!(assembled.get_password(), oracle.get_password());
+}
+
+/// Stage 1: the decomposed MySQL field set assembles driver arguments equal to
+/// the typed-string oracle, with the password taken verbatim — no
+/// percent-encoding, where the URL form requires `p%40ssword`.
+#[test]
+fn product_0134_mysql_fields_match_the_typed_string_oracle() {
+	let assembled = crate::adapters::mysql::opts_from_fields(
+		"db.example.com",
+		"3307",
+		"analytics",
+		"user",
+		"p@ssword",
+	)
+	.expect("fields assemble");
+	let oracle =
+		mysql_async::Opts::from_url("mysql://user:p%40ssword@db.example.com:3307/analytics")
+			.expect("oracle parses");
+	assert_eq!(assembled.ip_or_hostname(), oracle.ip_or_hostname());
+	assert_eq!(assembled.tcp_port(), oracle.tcp_port());
+	assert_eq!(assembled.db_name(), oracle.db_name());
+	assert_eq!(assembled.user(), oracle.user());
+	assert_eq!(assembled.pass(), oracle.pass());
+}
+
+/// Stage 1: the port refuses non-numeric input at connect time; empty
+/// optional fields fall to driver defaults rather than erroring.
+#[test]
+fn product_0134_port_refuses_non_numeric_and_optionals_default() {
+	let error = crate::adapters::postgres::config_from_fields("h", "54x2", "db", "u", "")
+		.expect_err("non-numeric port refuses");
+	assert!(error.contains("port"), "{error}");
+	let error = crate::adapters::mysql::opts_from_fields("h", "33 06", "db", "u", "")
+		.expect_err("non-numeric port refuses");
+	assert!(error.contains("port"), "{error}");
+
+	let config = crate::adapters::postgres::config_from_fields("h", "", "", "u", "")
+		.expect("optionals may be empty");
+	assert_eq!(config.get_ports(), &[5432]);
+	assert_eq!(config.get_dbname(), None);
+	assert_eq!(config.get_password(), None);
+	let opts = crate::adapters::mysql::opts_from_fields("h", "", "", "u", "")
+		.expect("optionals may be empty");
+	assert_eq!(opts.tcp_port(), 3306);
+	assert_eq!(opts.db_name(), None);
+	assert_eq!(opts.pass(), None);
+}
+
+/// Stage 1: the two input kinds never merge. An ad hoc string beside touched
+/// decomposed fields refuses; a field still holding its seeded default is
+/// untouched and does not trip the refusal.
+#[test]
+fn product_0134_input_kinds_refuse_when_mixed() {
+	let mut state = AdapterState::default();
+	state.select(AdapterSelection::Postgres);
+	assert_eq!(
+		state.fields.get("port").map(String::as_str),
+		Some("5432"),
+		"select seeds only the safe port default"
+	);
+	assert_eq!(state.fields.len(), 1);
+
+	state.ad_hoc_connection_string = "postgresql://u@h/db".to_owned();
+	assert!(
+		state.input_kind_error().is_none(),
+		"a seeded default is not a touched field"
+	);
+
+	state.fields.insert("host".into(), "h".into());
+	assert!(state.input_kind_error().is_some());
+
+	state.ad_hoc_connection_string.clear();
+	assert!(state.input_kind_error().is_none());
+}
+
+/// Stage 1: `configure()` routes each input kind to its own configuration —
+/// the field kind carries values verbatim, the ad hoc kind stays a string —
+/// and a debug rendering of the field kind never exposes the password.
+#[test]
+fn product_0134_configure_routes_input_kinds_and_debug_redacts() {
+	let mut state = AdapterState::default();
+	state.select(AdapterSelection::Postgres);
+	state.fields.insert("host".into(), "h".into());
+	state.fields.insert("database".into(), "db".into());
+	state.fields.insert("user".into(), "u".into());
+	state.fields.insert("password".into(), "sekrit".into());
+	state.configure();
+	assert!(matches!(
+		&state.configuration,
+		AdapterConfiguration::PostgresFields { host, port, database, user, password }
+			if host == "h" && port == "5432" && database == "db" && user == "u" && password == "sekrit"
+	));
+	let rendered = format!("{:?}", state.configuration);
+	assert!(!rendered.contains("sekrit"), "{rendered}");
+	assert!(rendered.contains("<redacted>"));
+
+	state.select(AdapterSelection::Postgres);
+	state.ad_hoc_connection_string = "postgresql://u@h/db".to_owned();
+	state.configure();
+	assert!(matches!(
+		&state.configuration,
+		AdapterConfiguration::Postgres { connection_string } if connection_string == "postgresql://u@h/db"
+	));
+
+	state.select(AdapterSelection::MySQL);
+	state.fields.insert("host".into(), "h".into());
+	state.fields.insert("database".into(), "db".into());
+	state.fields.insert("user".into(), "u".into());
+	state.configure();
+	assert!(matches!(
+		&state.configuration,
+		AdapterConfiguration::MySQLFields { host, port, database, user, password }
+			if host == "h" && port == "3306" && database == "db" && user == "u" && password.is_empty()
+	));
 }
 
 /// 0a census: `connection_identity` trims the dialog Name and falls back to
@@ -67,9 +217,11 @@ fn product_0134_census_every_adapter_declares_one_plaintext_field() {
 /// identity, so the trim itself is baselined.
 #[test]
 fn product_0134_census_connection_identity_trims_the_name() {
-	let mut state = AdapterState::default();
-	state.selection = AdapterSelection::Postgres;
-	state.name = "   ".to_owned();
+	let mut state = AdapterState {
+		selection: AdapterSelection::Postgres,
+		name: "   ".to_owned(),
+		..AdapterState::default()
+	};
 	assert_eq!(state.connection_identity(), "Postgres");
 	state.name = "prod-warehouse".to_owned();
 	assert_eq!(state.connection_identity(), "prod-warehouse");
@@ -187,39 +339,15 @@ fn product_0134_baseline_mysql_assembly_from_a_typed_string() {
 	assert_eq!(opts.pass(), Some("p@ssword"));
 }
 
-/// 0a/0b: `configure()` assembles each adapter's configuration from the field
-/// map verbatim, and the missing-field fallbacks are pinned exactly as they
-/// stand. BigQuery and Toron are configuration-only: no credential, no
-/// network, nothing decomposes.
+/// 0a/0b: `configure()` assembles the uncredentialed adapters' configurations
+/// from the field map verbatim, with the SQLite fallback pinned exactly as it
+/// stands. BigQuery and Toron are configuration-only: no credential, no
+/// network, nothing decomposes. (The stage 0 Postgres/MySQL fallback arms were
+/// the deliberately moved surface; their stage 1 routing is pinned in
+/// `product_0134_configure_routes_input_kinds_and_debug_redacts`.)
 #[test]
 fn product_0134_baseline_configure_assembles_each_configuration_from_fields() {
 	let mut state = AdapterState::default();
-
-	state.select(AdapterSelection::Postgres);
-	state
-		.fields
-		.insert("connection_string".into(), "postgresql://h/db".into());
-	state.configure();
-	assert!(matches!(
-		&state.configuration,
-		AdapterConfiguration::Postgres { connection_string } if connection_string == "postgresql://h/db"
-	));
-
-	state.select(AdapterSelection::Postgres);
-	state.configure();
-	assert!(matches!(
-		&state.configuration,
-		AdapterConfiguration::Postgres { connection_string }
-			if connection_string == "postgresql://localhost"
-	));
-
-	state.select(AdapterSelection::MySQL);
-	state.configure();
-	assert!(matches!(
-		&state.configuration,
-		AdapterConfiguration::MySQL { connection_string }
-			if connection_string == "mysql://root@localhost/mydb"
-	));
 
 	state.select(AdapterSelection::SQLite);
 	state.configure();

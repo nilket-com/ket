@@ -44,6 +44,7 @@ impl std::fmt::Display for ExportFormat {
 
 #[derive(Clone)]
 pub enum Message {
+	AdapterAdHocChanged(String),
 	AdapterConfigurationChanged(String, String),
 	AdapterConfigurationSubmitted,
 	AdapterConnected(Result<Arc<RwLock<dyn DatabaseAdapter>>, String>),

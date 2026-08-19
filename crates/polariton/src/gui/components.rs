@@ -1,6 +1,6 @@
 use crate::adapters::{
 	common::{AdapterFieldType, AdapterStage},
-	driver::{AdapterSelection, AdapterState, fields_for},
+	driver::{AdapterSelection, AdapterState, ad_hoc_placeholder, fields_for},
 };
 use crate::editor::CodeEditor;
 use crate::gui::messages::Message;
@@ -1002,34 +1002,48 @@ pub fn adapter_configuration_view(adapter_state: &AdapterState) -> Element<'stat
 			section(adapter_label, inputs)
 		}
 	};
-	let dialog: Element<Message> = container(
-		column![
-			row![text("Configure Adapter").size(24), space::horizontal(),]
-				.align_y(Alignment::Center),
-			section(
-				"Connection",
-				field(
-					"Name",
-					styled_text_input("Required", &name)
-						.on_input(Message::ConnectionNameChanged)
-						.on_submit(Message::AdapterConfigurationSubmitted),
-				),
-			),
-			fields_section,
-			row![
-				space::horizontal(),
-				styled_button(
-					"Connect",
-					Message::AdapterConfigurationSubmitted,
-					BUTTON_SIZE_DEFAULT,
-				),
-			]
-			.spacing(10)
+	let mut content = column![
+		row![text("Configure Adapter").size(24), space::horizontal(),]
 			.align_y(Alignment::Center),
+		section(
+			"Connection",
+			field(
+				"Name",
+				styled_text_input("Required", &name)
+					.on_input(Message::ConnectionNameChanged)
+					.on_submit(Message::AdapterConfigurationSubmitted),
+			),
+		),
+		fields_section,
+	]
+	.spacing(20)
+	.padding(20);
+	// PRODUCT-0134 §1: the ad hoc connection string is a separate input kind
+	// from the decomposed fields; a submission mixing both refuses.
+	if let Some(placeholder) = ad_hoc_placeholder(&adapter_state.selection) {
+		content = content.push(section(
+			"Ad hoc",
+			field(
+				"connection_string",
+				styled_text_input(placeholder, &adapter_state.ad_hoc_connection_string)
+					.on_input(Message::AdapterAdHocChanged)
+					.on_submit(Message::AdapterConfigurationSubmitted),
+			),
+		));
+	}
+	content = content.push(
+		row![
+			space::horizontal(),
+			styled_button(
+				"Connect",
+				Message::AdapterConfigurationSubmitted,
+				BUTTON_SIZE_DEFAULT,
+			),
 		]
-		.spacing(20)
-		.padding(20),
-	)
+		.spacing(10)
+		.align_y(Alignment::Center),
+	);
+	let dialog: Element<Message> = container(content)
 	.width(Length::Fixed(800.0))
 	.style(|_| container::Style {
 		background: Some(colors::BG_MODAL.into()),
