@@ -2320,6 +2320,75 @@ async fn adr553_string_functions_type_their_outputs_independently_of_their_input
 }
 
 #[tokio::test]
+async fn adr553_first_string_batch_uses_the_predicted_registry_shapes() {
+	let ltrim = run_logical(&plan_sql("SELECT LTRIM('xxeast', 'x') FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&ltrim, 0),
+		vec![
+			Some("east".to_string()),
+			Some("east".to_string()),
+			Some("east".to_string()),
+			Some("east".to_string()),
+			Some("east".to_string()),
+			Some("east".to_string()),
+		]
+	);
+	let rtrim = run_logical(&plan_sql("SELECT RTRIM('eastxx', 'x') FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&rtrim, 0)[0..1],
+		[Some("east".to_string())]
+	);
+
+	let concat = run_logical(&plan_sql("SELECT CONCAT(region, '-', status) FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&concat, 0),
+		vec![
+			Some("east-open".to_string()),
+			Some("west-open".to_string()),
+			Some("east-closed".to_string()),
+			Some("east-open".to_string()),
+			Some("west-open".to_string()),
+			Some("-open".to_string()),
+		],
+		"CONCAT ignores NULL operands rather than propagating them"
+	);
+
+	let position = run_logical(&plan_sql("SELECT POSITION('a' IN region) FROM sales")).await;
+	let positions = position[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("POSITION Int64 output");
+	assert_eq!(
+		(0..positions.len())
+			.map(|row| (!positions.is_null(row)).then(|| positions.value(row)))
+			.collect::<Vec<_>>(),
+		vec![Some(2), Some(0), Some(2), Some(2), Some(0), None]
+	);
+	let strpos = run_logical(&plan_sql("SELECT STRPOS(region, 'a') FROM sales")).await;
+	let strpos_values = strpos[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("STRPOS Int64 output");
+	assert_eq!(strpos_values.value(0), 2);
+	assert_eq!(strpos_values.value(1), 0);
+
+	let replace = run_logical(&plan_sql("SELECT REPLACE(region, 'e', 'E') FROM sales")).await;
+	assert_eq!(
+		utf8_column_rows(&replace, 0),
+		vec![
+			Some("East".to_string()),
+			Some("wEst".to_string()),
+			Some("East".to_string()),
+			Some("East".to_string()),
+			Some("wEst".to_string()),
+			None,
+		]
+	);
+}
+
+#[tokio::test]
 async fn adr553_string_functions_reject_a_numeric_input() {
 	let (catalog, _) = fixture();
 	for sql in [

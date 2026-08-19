@@ -17,6 +17,7 @@ pub enum ScalarFunctionId {
 	AtTimeZone,
 	Ceil,
 	CharLength,
+	Concat,
 	DateTrunc,
 	Exp,
 	Extract,
@@ -25,12 +26,17 @@ pub enum ScalarFunctionId {
 	Least,
 	Ln,
 	Lower,
+	Ltrim,
 	Mod,
+	Position,
 	Pow,
 	Random,
+	Replace,
 	Round,
+	Rtrim,
 	Sign,
 	Sqrt,
+	Strpos,
 	Substring,
 	TimeBucket,
 	Trim,
@@ -190,6 +196,14 @@ pub enum ScalarFunctionSignature {
 	/// value** rather than only on argument types — the zone string becomes part
 	/// of `DataType::Timestamp`.
 	TimestampWithConstantZone,
+	/// One or more strings, producing the first string's type. Unlike the
+	/// ordered variadic rule, this is a concatenation operation and does not
+	/// require the strings to be comparable beyond sharing one string type.
+	VariadicStringConcatenating,
+	/// Two same-typed strings in, a 1-based character position out.
+	BinaryStringToInteger,
+	/// Three same-typed strings in, with the first string's type as output.
+	TernaryStringPreserving,
 	/// One or two strings, producing the first string's type. The optional second
 	/// string is TRIM's character set; it is an expression rather than a
 	/// parameter because SQL permits it to vary by row.
@@ -200,6 +214,7 @@ pub enum ScalarFunctionSignature {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScalarFunctionNullBehavior {
 	Propagates,
+	Ignores,
 }
 
 /// How non-finite floating inputs affect the output.
@@ -218,6 +233,7 @@ pub enum ScalarFunctionEvaluator {
 	AtTimeZone,
 	Ceil,
 	CharLength,
+	Concat,
 	DateTrunc,
 	Exp,
 	Extract,
@@ -226,9 +242,11 @@ pub enum ScalarFunctionEvaluator {
 	Least,
 	Ln,
 	Lower,
+	Position,
 	Mod,
 	Pow,
 	Random,
+	Replace,
 	Round,
 	Sign,
 	Sqrt,
@@ -246,8 +264,10 @@ pub struct ScalarFunctionMetadata {
 	/// The ANSI spelling where the standard has one. Vendor spellings belong in
 	/// [`ScalarFunctionMetadata::sql_aliases`], never here.
 	pub sql_name: &'static str,
-	/// Additional accepted SQL spellings. The standard admits two names for the
-	/// ceiling function, and a vendor spelling already in use has to keep
+	/// Additional accepted SQL spellings. Aliases must preserve the canonical
+	/// function's argument order; a spelling with a different calling convention
+	/// gets its own registration and identifier. The standard admits two names
+	/// for the ceiling function, and a vendor spelling already in use has to keep
 	/// resolving once the canonical name is adopted.
 	pub sql_aliases: &'static [&'static str],
 	pub rune_name: &'static str,
@@ -464,6 +484,100 @@ const TRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Trim,
 };
 
+const CONCAT: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Concat,
+	sql_name: "CONCAT",
+	// CONCAT intentionally is not the registry identity for SQL `||`: CONCAT
+	// ignores NULL operands, while `||` propagates NULL.
+	sql_aliases: &[],
+	rune_name: "concat",
+	arity: ScalarFunctionArity::AtLeast(1),
+	signature: ScalarFunctionSignature::VariadicStringConcatenating,
+	null_behavior: ScalarFunctionNullBehavior::Ignores,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Concat,
+};
+
+const LTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Ltrim,
+	sql_name: "LTRIM",
+	sql_aliases: &[],
+	rune_name: "ltrim",
+	arity: ScalarFunctionArity::Between(1, 2),
+	signature: ScalarFunctionSignature::StringWithOptionalString,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Trim,
+};
+
+const POSITION: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Position,
+	sql_name: "POSITION",
+	// STRPOS has the same kernel but reverses the two argument positions, so it
+	// is a separate registration rather than an alias.
+	sql_aliases: &[],
+	rune_name: "position",
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::BinaryStringToInteger,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Position,
+};
+
+const STRPOS: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Strpos,
+	sql_name: "STRPOS",
+	sql_aliases: &[],
+	rune_name: "strpos",
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::BinaryStringToInteger,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Position,
+};
+
+const REPLACE: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Replace,
+	sql_name: "REPLACE",
+	sql_aliases: &[],
+	rune_name: "replace",
+	arity: ScalarFunctionArity::Exact(3),
+	signature: ScalarFunctionSignature::TernaryStringPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Replace,
+};
+
+const RTRIM: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Rtrim,
+	sql_name: "RTRIM",
+	sql_aliases: &[],
+	rune_name: "rtrim",
+	arity: ScalarFunctionArity::Between(1, 2),
+	signature: ScalarFunctionSignature::StringWithOptionalString,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	deterministic: true,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Trim,
+};
+
 const CHAR_LENGTH: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::CharLength,
 	sql_name: "CHAR_LENGTH",
@@ -630,6 +744,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	AT_TIME_ZONE,
 	CEIL,
 	CHAR_LENGTH,
+	CONCAT,
 	DATE_TRUNC,
 	EXP,
 	EXTRACT,
@@ -638,12 +753,17 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	LEAST,
 	LN,
 	LOWER,
+	LTRIM,
 	MOD,
+	POSITION,
 	POW,
 	RANDOM,
+	REPLACE,
 	ROUND,
+	RTRIM,
 	SIGN,
 	SQRT,
+	STRPOS,
 	SUBSTRING,
 	TIME_BUCKET,
 	TRIM,
@@ -785,6 +905,23 @@ mod tests {
 		assert_eq!(
 			scalar_function_from_sql_name("ceil"),
 			Some(ScalarFunctionId::Ceil)
+		);
+	}
+
+	#[test]
+	fn strpos_is_a_distinct_registration_with_the_position_evaluator() {
+		assert_eq!(
+			scalar_function_from_sql_name("STRPOS"),
+			Some(ScalarFunctionId::Strpos)
+		);
+		assert_eq!(
+			scalar_function_metadata(ScalarFunctionId::Strpos).evaluator,
+			ScalarFunctionEvaluator::Position
+		);
+		assert!(
+			scalar_function_metadata(ScalarFunctionId::Strpos)
+				.sql_aliases
+				.is_empty()
 		);
 	}
 

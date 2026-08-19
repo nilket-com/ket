@@ -161,6 +161,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"AtTimeZone".to_string(),
 			"Ceil".to_string(),
 			"CharLength".to_string(),
+			"Concat".to_string(),
 			"DateTrunc".to_string(),
 			"Exp".to_string(),
 			"Extract".to_string(),
@@ -168,13 +169,18 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Greatest".to_string(),
 			"Least".to_string(),
 			"Ln".to_string(),
+			"Ltrim".to_string(),
 			"Mod".to_string(),
+			"Position".to_string(),
 			"Pow".to_string(),
 			"Random".to_string(),
+			"Replace".to_string(),
 			"Round".to_string(),
+			"Rtrim".to_string(),
 			"Lower".to_string(),
 			"Sign".to_string(),
 			"Sqrt".to_string(),
+			"Strpos".to_string(),
 			"Substring".to_string(),
 			"TimeBucket".to_string(),
 			"Trim".to_string(),
@@ -195,9 +201,19 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 		.next()
 		.unwrap_or_else(|| panic!("{id} has no ScalarFunctionMetadata const"))
 		.1;
+		let evaluator_id = match id.as_str() {
+			"Ltrim" | "Rtrim" => "Trim",
+			"Strpos" => "Position",
+			_ => id.as_str(),
+		};
+		assert!(
+			metadata.contains(&format!(
+				"evaluator: ScalarFunctionEvaluator::{evaluator_id}"
+			)),
+			"{id} metadata has the wrong evaluator"
+		);
 		for property in [
 			format!("id: ScalarFunctionId::{id}"),
-			format!("evaluator: ScalarFunctionEvaluator::{id}"),
 			"sql_name: \"".to_string(),
 			"sql_aliases: &[".to_string(),
 			"rune_name: \"".to_string(),

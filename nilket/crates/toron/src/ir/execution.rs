@@ -843,6 +843,7 @@ impl BoundExprProgram {
 						.map(|arg| self.node_nullable(*arg))
 						.collect::<Option<Vec<_>>>()
 						.map(|nullability| nullability.into_iter().any(|nullable| nullable)),
+					crate::ir::ScalarFunctionNullBehavior::Ignores => Some(false),
 				}
 			}
 		}

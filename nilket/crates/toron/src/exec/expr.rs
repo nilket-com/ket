@@ -685,8 +685,17 @@ fn evaluate_scalar_function(
 				})
 				.and_then(|zone| evaluate_date_trunc(payload.field, zone, &args[0]));
 		}
-		(ScalarFunctionId::Trim, crate::ir::ScalarFunctionParameter::Trim(payload)) => {
+		(
+			ScalarFunctionId::Trim | ScalarFunctionId::Ltrim | ScalarFunctionId::Rtrim,
+			crate::ir::ScalarFunctionParameter::Trim(payload),
+		) => {
 			return evaluate_trim(args, payload.where_field);
+		}
+		(ScalarFunctionId::Ltrim, crate::ir::ScalarFunctionParameter::None) => {
+			return evaluate_trim(args, crate::ir::TrimWhere::Leading);
+		}
+		(ScalarFunctionId::Rtrim, crate::ir::ScalarFunctionParameter::None) => {
+			return evaluate_trim(args, crate::ir::TrimWhere::Trailing);
 		}
 		_ => {}
 	}
@@ -765,6 +774,21 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_unary_string(&args[0], "TRIM", |value| value.trim().to_string()),
+		(
+			ScalarFunctionEvaluator::Concat,
+			crate::ir::ScalarFunctionNullBehavior::Ignores,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_concat(args),
+		(
+			ScalarFunctionEvaluator::Position,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_position(&args[0], &args[1]),
+		(
+			ScalarFunctionEvaluator::Replace,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_replace(&args[0], &args[1], &args[2]),
 		(
 			ScalarFunctionEvaluator::CharLength,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
@@ -863,13 +887,16 @@ fn evaluate_scalar_function(
 			| ScalarFunctionEvaluator::AtTimeZone
 			| ScalarFunctionEvaluator::Ceil
 			| ScalarFunctionEvaluator::CharLength
+			| ScalarFunctionEvaluator::Concat
 			| ScalarFunctionEvaluator::DateTrunc
 			| ScalarFunctionEvaluator::Exp
 			| ScalarFunctionEvaluator::Extract
 			| ScalarFunctionEvaluator::Ln
 			| ScalarFunctionEvaluator::Lower
 			| ScalarFunctionEvaluator::Mod
+			| ScalarFunctionEvaluator::Position
 			| ScalarFunctionEvaluator::Pow
+			| ScalarFunctionEvaluator::Replace
 			| ScalarFunctionEvaluator::Round
 			| ScalarFunctionEvaluator::Sign
 			| ScalarFunctionEvaluator::Sqrt
@@ -884,6 +911,12 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Rejects,
 		) => Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"internal: {} has an unsupported scalar-function behavior tuple",
+				metadata.sql_name
+			),
+		}),
+		_ => Err(ExecutionError::InvalidExpression {
 			message: format!(
 				"internal: {} has an unsupported scalar-function behavior tuple",
 				metadata.sql_name
@@ -1214,6 +1247,165 @@ fn trim_string(value: &str, characters: Option<&str>, where_field: crate::ir::Tr
 				.to_string(),
 		},
 	}
+}
+
+fn evaluate_concat(args: &[ArrayRef]) -> Result<ArrayRef, ExecutionError> {
+	if let Some(first) = args[0].as_any().downcast_ref::<StringArray>() {
+		let columns = args
+			.iter()
+			.map(|arg| {
+				arg.as_any().downcast_ref::<StringArray>().ok_or_else(|| {
+					ExecutionError::InvalidExpression {
+						message: format!(
+							"CONCAT expects every argument to share one string type, got {:?}",
+							arg.data_type()
+						),
+					}
+				})
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		let values = (0..first.len())
+			.map(|row| {
+				let mut value = String::new();
+				for column in &columns {
+					if column.is_valid(row) {
+						value.push_str(column.value(row));
+					}
+				}
+				Some(value)
+			})
+			.collect::<StringArray>();
+		return Ok(Arc::new(values) as ArrayRef);
+	}
+	if let Some(first) = args[0].as_any().downcast_ref::<LargeStringArray>() {
+		let columns = args
+			.iter()
+			.map(|arg| {
+				arg.as_any()
+					.downcast_ref::<LargeStringArray>()
+					.ok_or_else(|| ExecutionError::InvalidExpression {
+						message: format!(
+							"CONCAT expects every argument to share one string type, got {:?}",
+							arg.data_type()
+						),
+					})
+			})
+			.collect::<Result<Vec<_>, _>>()?;
+		let values = (0..first.len())
+			.map(|row| {
+				let mut value = String::new();
+				for column in &columns {
+					if column.is_valid(row) {
+						value.push_str(column.value(row));
+					}
+				}
+				Some(value)
+			})
+			.collect::<LargeStringArray>();
+		return Ok(Arc::new(values) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"CONCAT expects string arguments, got {:?}",
+			args[0].data_type()
+		),
+	})
+}
+
+fn string_position(needle: &str, input: &str) -> i64 {
+	input
+		.find(needle)
+		.map(|byte| i64::try_from(input[..byte].chars().count() + 1).unwrap_or(i64::MAX))
+		.unwrap_or(0)
+}
+
+fn evaluate_position(needle: &ArrayRef, input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	if let (Some(needle), Some(input)) = (
+		needle.as_any().downcast_ref::<StringArray>(),
+		input.as_any().downcast_ref::<StringArray>(),
+	) {
+		return Ok(Arc::new(
+			needle
+				.iter()
+				.zip(input.iter())
+				.map(|(needle, input)| match (needle, input) {
+					(Some(needle), Some(input)) => Some(string_position(needle, input)),
+					_ => None,
+				})
+				.collect::<Int64Array>(),
+		) as ArrayRef);
+	}
+	if let (Some(needle), Some(input)) = (
+		needle.as_any().downcast_ref::<LargeStringArray>(),
+		input.as_any().downcast_ref::<LargeStringArray>(),
+	) {
+		return Ok(Arc::new(
+			needle
+				.iter()
+				.zip(input.iter())
+				.map(|(needle, input)| match (needle, input) {
+					(Some(needle), Some(input)) => Some(string_position(needle, input)),
+					_ => None,
+				})
+				.collect::<Int64Array>(),
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"POSITION expects two string arguments of the same type, got {:?} and {:?}",
+			needle.data_type(),
+			input.data_type()
+		),
+	})
+}
+
+fn evaluate_replace(
+	input: &ArrayRef,
+	from: &ArrayRef,
+	to: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	if let (Some(input), Some(from), Some(to)) = (
+		input.as_any().downcast_ref::<StringArray>(),
+		from.as_any().downcast_ref::<StringArray>(),
+		to.as_any().downcast_ref::<StringArray>(),
+	) {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.zip(from.iter())
+				.zip(to.iter())
+				.map(|((input, from), to)| match (input, from, to) {
+					(Some(input), Some(from), Some(to)) => Some(input.replace(from, to)),
+					_ => None,
+				})
+				.collect::<StringArray>(),
+		) as ArrayRef);
+	}
+	if let (Some(input), Some(from), Some(to)) = (
+		input.as_any().downcast_ref::<LargeStringArray>(),
+		from.as_any().downcast_ref::<LargeStringArray>(),
+		to.as_any().downcast_ref::<LargeStringArray>(),
+	) {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.zip(from.iter())
+				.zip(to.iter())
+				.map(|((input, from), to)| match (input, from, to) {
+					(Some(input), Some(from), Some(to)) => Some(input.replace(from, to)),
+					_ => None,
+				})
+				.collect::<LargeStringArray>(),
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"REPLACE expects three string arguments of the same type, got {:?}, {:?}, and {:?}",
+			input.data_type(),
+			from.data_type(),
+			to.data_type()
+		),
+	})
 }
 
 /// `CHAR_LENGTH` counts characters, not bytes — `OCTET_LENGTH` is the byte

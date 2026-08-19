@@ -1657,6 +1657,74 @@ impl RuneExpr {
 	}
 }
 
+pub fn ltrim(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Ltrim,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::Trim(Box::new(
+				crate::ir::TrimScalarFunctionParameter {
+					where_field: crate::ir::TrimWhere::Leading,
+				},
+			)),
+		},
+	}
+}
+
+pub fn rtrim(expr: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Rtrim,
+			args: vec![expr.expr],
+			parameter: ScalarFunctionParameter::Trim(Box::new(
+				crate::ir::TrimScalarFunctionParameter {
+					where_field: crate::ir::TrimWhere::Trailing,
+				},
+			)),
+		},
+	}
+}
+
+pub fn concat(args: Vec<RuneExpr>) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Concat,
+			args: args.into_iter().map(|arg| arg.expr).collect(),
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn position(needle: RuneExpr, input: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Position,
+			args: vec![needle.expr, input.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn strpos(input: RuneExpr, needle: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Strpos,
+			args: vec![needle.expr, input.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn replace(input: RuneExpr, from: RuneExpr, to: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Replace,
+			args: vec![input.expr, from.expr, to.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 impl RuneSortKey {
 	pub fn nulls_first(mut self) -> Self {
 		self.nulls_first = true;
@@ -1757,6 +1825,12 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["upper"], upper).build()?;
 	m.function(["lower"], lower).build()?;
 	m.function(["trim"], trim).build()?;
+	m.function(["ltrim"], ltrim).build()?;
+	m.function(["rtrim"], rtrim).build()?;
+	m.function(["concat"], concat).build()?;
+	m.function(["position"], position).build()?;
+	m.function(["strpos"], strpos).build()?;
+	m.function(["replace"], replace).build()?;
 	m.function(["char_length"], char_length).build()?;
 	m.function(["width_bucket"], width_bucket).build()?;
 	m.function(["greatest"], greatest).build()?;

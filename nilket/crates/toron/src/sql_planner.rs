@@ -6673,6 +6673,11 @@ impl SqlPlanner {
 				lower_extract_datetime_field(field)?,
 				self.lower_expr(expr)?,
 			)),
+			SqlExpr::Position { expr, r#in } => Ok(Expr::ScalarFunction {
+				id: crate::ir::ScalarFunctionId::Position,
+				args: vec![self.lower_expr(expr)?, self.lower_expr(r#in)?],
+				parameter: crate::ir::ScalarFunctionParameter::None,
+			}),
 			SqlExpr::Substring {
 				expr,
 				substring_from,
@@ -6855,7 +6860,7 @@ impl SqlPlanner {
 			return Ok(None);
 		};
 		let metadata = crate::ir::scalar_function_metadata(id);
-		let args = function_positional_args(function, metadata.sql_name)?;
+		let mut args = function_positional_args(function, metadata.sql_name)?;
 		if !metadata.arity.accepts(args.len()) {
 			return Err(unsupported(format!(
 				"{} expects {}, got {}",
@@ -6864,14 +6869,30 @@ impl SqlPlanner {
 				args.len()
 			)));
 		}
+		if id == crate::ir::ScalarFunctionId::Strpos {
+			args.reverse();
+		}
 		let args = args
 			.into_iter()
 			.map(|arg| self.lower_expr(arg))
 			.collect::<Result<Vec<_>, _>>()?;
+		let parameter = match id {
+			crate::ir::ScalarFunctionId::Ltrim => crate::ir::ScalarFunctionParameter::Trim(
+				Box::new(crate::ir::TrimScalarFunctionParameter {
+					where_field: crate::ir::TrimWhere::Leading,
+				}),
+			),
+			crate::ir::ScalarFunctionId::Rtrim => crate::ir::ScalarFunctionParameter::Trim(
+				Box::new(crate::ir::TrimScalarFunctionParameter {
+					where_field: crate::ir::TrimWhere::Trailing,
+				}),
+			),
+			_ => crate::ir::ScalarFunctionParameter::None,
+		};
 		Ok(Some(Expr::ScalarFunction {
 			id,
 			args,
-			parameter: crate::ir::ScalarFunctionParameter::None,
+			parameter,
 		}))
 	}
 
