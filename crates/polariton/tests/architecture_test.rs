@@ -3459,7 +3459,7 @@ fn product_0097_widget_hit_geometry_has_closed_typed_trust_boundaries() {
 	assert!(!grid.contains("Pt::<Cell>::from_widget"));
 	assert!(!grid.contains("Pt::<Plot>::from_widget"));
 	assert!(!grid.contains("_cell_cursor"));
-	assert!(grid.contains("Cursor::Available(cursor.into_iced())"));
+	assert!(grid.contains("Cursor::Available(local_cursor)"));
 	assert!(!funnel.contains("transform.bounds"));
 	assert!(!radial.contains("transform.bounds"));
 	assert!(!pie.contains("transform.bounds"));

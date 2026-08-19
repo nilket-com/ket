@@ -87,7 +87,14 @@ impl PlotKernel for FillBetweenLinePlotKernel {
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 	) -> Option<crate::plot::common::PlotHit> {
-		self.fill_between.hit(transform, cursor)
+		crate::plot::common::PlotHit::best_of([
+			self.fill_between
+				.hit(transform, cursor)
+				.map(|hit| hit.with_paint_order(0)),
+			self.line
+				.hit(transform, cursor)
+				.map(|hit| hit.with_paint_order(1)),
+		])
 	}
 
 	fn x_label(&self) -> String {

@@ -10,7 +10,6 @@ use crate::plot::spec::{LayerSettings, NonEmpty, ResolvedLayout};
 use crate::plot::theme::PlotSettings;
 use iced::Rectangle;
 use iced::advanced::mouse::Cursor;
-use std::cmp::Reverse;
 use std::sync::Arc;
 
 pub enum LayerRenderer {
@@ -242,7 +241,7 @@ impl PlotKernel for LayeredPlotKernel {
 		settings: &PlotSettings,
 	) -> Option<crate::plot::common::PlotHit> {
 		let layers = self.layers.iter().collect::<Vec<_>>();
-		let mut best = None;
+		let mut candidates = Vec::new();
 		for (paint_order, layer) in layers.into_iter().enumerate() {
 			let resolved = settings.resolve_for_layer(layer.settings());
 			if let Some(hit) = layer.hit_test(transform, cursor, &resolved) {
@@ -270,27 +269,10 @@ impl PlotKernel for LayeredPlotKernel {
 						format_label(hit.data_y, &self.y_axis_type),
 					),
 				);
-				let candidate_key = (
-					candidate.dimensionality,
-					Reverse(candidate.paint_order),
-					candidate.sibling_ordinal,
-				);
-				let replaces =
-					best.as_ref()
-						.is_none_or(|current: &crate::plot::common::PlotHit| {
-							candidate_key
-								< (
-									current.dimensionality,
-									Reverse(current.paint_order),
-									current.sibling_ordinal,
-								)
-						});
-				if replaces {
-					best = Some(candidate);
-				}
+				candidates.push(candidate);
 			}
 		}
-		best
+		crate::plot::common::PlotHit::best_of(candidates.into_iter().map(Some))
 	}
 
 	fn legend_content(

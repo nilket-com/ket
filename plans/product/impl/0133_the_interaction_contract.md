@@ -246,6 +246,55 @@ hover sentence.
 
 Commit: `impl: adr 0133 replace hover prose with structured hits`.
 
+### Stage 2 findings — a pre-existing faceted hover defect
+
+Stage 2 uncovered a production defect in faceted hover that predates this
+record. It is documented here rather than in a commit message because it is
+evidence about PRODUCT-0097's seam, not plumbing for this stage.
+
+`CoordinateTransformer::cartesian` (`crates/polariton/src/plot/common.rs:805`)
+and `categorical` (`:822`) compute mark positions from `bounds.width` and
+`bounds.height` only. Neither reads `bounds.x` or `bounds.y`. Mark geometry is
+therefore always **cell-local and anchored at origin**.
+
+`PlotGridKernel`'s composite hit passed the cursor in **absolute figure space**
+to be compared against that origin-anchored geometry. Every facet cell not
+positioned at the figure origin was offset by its own `(x, y)`, so hover
+reported the wrong observation or no observation at all, with the error growing
+with distance from the origin. In a 2×2 facet grid, three of four panels were
+affected.
+
+The fix anchors the transform rectangle at origin and translates the cursor into
+cell-local space before forwarding. `widget_hit_geometry` (`:787`) remains
+consistent with it because `from_transformer_bounds` then yields an
+origin-anchored rect.
+
+Three points make this worth recording:
+
+- **It is pre-existing.** No commit in this arc introduced it; the ADR 0133
+  series exposed it.
+- **It survived PRODUCT-0097**, the record that named the faceted hover
+  coordinate seam. The seam was specified correctly and the grid consumer did
+  not honor it. A future interaction consumer joining that seam should verify
+  the space it receives rather than assume it.
+- **Prose hover could not have caught it.** A hover string is compared against
+  an expected sentence; an offset cursor in a facet cell often still produced a
+  plausible sentence about the wrong observation. The structured hit made the
+  resolved coordinate assertable, which is the first concrete return on Stage
+  2's migration cost.
+
+Fixed in `fix: adr 0133 apply structured hit priority` follow-up
+`impl: adr 0133 unify overlay hit priority`.
+
+### Stage 2 deferral — per-kernel sibling ties
+
+`PlotHit::best_of` enforces §1's order wherever a composite chooses between
+members. Whether an individual kernel returns its lowest `mark_index` when
+several of its own marks tie under the cursor is per-kernel and unasserted.
+`best_of` gives that sweep a single place to land. It is deliberately deferred:
+no accepted behavior depends on it, and the composite sites were the ones that
+demonstrably resolved incorrectly.
+
 ## Stage 3 — implement pane interaction and selection contexts
 
 ### Pane override viewport

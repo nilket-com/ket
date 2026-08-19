@@ -965,10 +965,18 @@ impl PlotComposite for PlotGridKernel {
 				continue;
 			}
 			let inner = grid_plot_area(cell_bounds, cell.cell.label.as_deref(), &resolved);
-			let transform = CoordinateTransformer::new(layout, inner.into_iced());
+			let inner_bounds = inner.into_iced();
+			let transform = CoordinateTransformer::new(
+				layout,
+				IcedRectangle::new(Point::ORIGIN, inner_bounds.size()),
+			);
+			let local_cursor = Point::new(
+				cursor.x() - inner.x(),
+				cursor.y() - inner.y(),
+			);
 			let hit = cell.kernel.hit_with_settings(
 				&transform,
-				Cursor::Available(cursor.into_iced()),
+				Cursor::Available(local_cursor),
 				settings,
 			);
 			return hit.map(|hit| match (&self.partition_field, &cell.cell.label) {

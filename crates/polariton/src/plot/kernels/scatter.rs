@@ -135,36 +135,18 @@ impl PlotKernel for ScatterPlotKernel {
 		transform: &CoordinateTransformer,
 		cursor: Cursor,
 	) -> Option<crate::plot::common::PlotHit> {
-		if let Some(cursor_pos) = cursor.position()
-			&& let Some((x, y)) = transform.pixel_to_cartesian(cursor_pos)
-		{
-			return Some(
-				crate::plot::common::PlotHit::new(
-					crate::plot::common::MarkFamily::SCATTER,
-					crate::plot::common::HitDimensionality::Point,
-					0,
-				)
-				.labeled(
-					"X",
-					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
-					crate::plot::common::axis_hit_value(
-						x,
-						&self.prepared_data.x_axis_type,
-						format_label(x, &self.prepared_data.x_axis_type),
-					),
-				)
-				.labeled(
-					"Y",
-					crate::plot::common::axis_hit_semantic_type(&self.prepared_data.y_axis_type),
-					crate::plot::common::axis_hit_value(
-						y,
-						&self.prepared_data.y_axis_type,
-						format_label(y, &self.prepared_data.y_axis_type),
-					),
-				),
-			);
-		}
-		None
+		let settings = PlotSettings::default().resolve_for_layer(&self.layer_settings);
+		self.structured_hit(transform, cursor, &settings)
+	}
+
+	fn hit_with_settings(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &PlotSettings,
+	) -> Option<crate::plot::common::PlotHit> {
+		let resolved = settings.resolve_for_layer(&self.layer_settings);
+		self.structured_hit(transform, cursor, &resolved)
 	}
 
 	fn x_label(&self) -> String {
@@ -177,6 +159,40 @@ impl PlotKernel for ScatterPlotKernel {
 }
 
 impl ScatterPlotKernel {
+	fn structured_hit(
+		&self,
+		transform: &CoordinateTransformer,
+		cursor: Cursor,
+		settings: &ResolvedPlotSettings,
+	) -> Option<crate::plot::common::PlotHit> {
+		let hit = self.renderer.hit_test(transform, cursor, settings)?;
+		Some(
+			crate::plot::common::PlotHit::new(
+				crate::plot::common::MarkFamily::SCATTER,
+				crate::plot::common::HitDimensionality::Point,
+				hit.mark_index,
+			)
+			.labeled(
+				"X",
+				crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+				crate::plot::common::axis_hit_value(
+					hit.data_x,
+					&self.prepared_data.x_axis_type,
+					format_label(hit.data_x, &self.prepared_data.x_axis_type),
+				),
+			)
+			.labeled(
+				"Y",
+				crate::plot::common::axis_hit_semantic_type(&self.prepared_data.y_axis_type),
+				crate::plot::common::axis_hit_value(
+					hit.data_y,
+					&self.prepared_data.y_axis_type,
+					format_label(hit.data_y, &self.prepared_data.y_axis_type),
+				),
+			),
+		)
+	}
+
 	pub fn new(prepared_data: Arc<ScatterPreparedData>) -> Self {
 		Self::with_layer_settings(prepared_data, LayerSettings::default())
 	}

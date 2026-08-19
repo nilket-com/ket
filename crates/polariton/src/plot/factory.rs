@@ -1494,6 +1494,48 @@ mod product_0013_baseline_tests {
 	}
 
 	#[test]
+	fn product_0133_overlay_composites_apply_the_same_hit_priority() {
+		let frame = df!(
+			"x" => [1.0, 2.0, 3.0],
+			"y" => [2.0, 4.0, 6.0],
+			"lower" => [1.0, 3.0, 5.0],
+			"upper" => [3.0, 5.0, 7.0]
+		)
+		.expect("overlay frame");
+		let scatter_frame = df!("x" => [0.0, 10.0], "y" => [0.0, 10.0]).expect("scatter frame");
+		let bounds = Rectangle::new(Point::ORIGIN, Size::new(100.0, 100.0));
+
+		let scatter_line = ScatterLinePlotKernel::new(
+			Arc::new(scatter::prepare_scatter_data(&scatter_frame, "", "x", "y")),
+			Arc::new(line::prepare_line_data(&scatter_frame, "", "x", "y")),
+		);
+		let scatter_line_layout = scatter_line.layout(ResolvedPlotSettings::default());
+		let scatter_line_transform = CoordinateTransformer::new(&scatter_line_layout, bounds);
+		let line_only_cursor = scatter_line_transform.cartesian(5.0, 5.0);
+		let line_only_hit = scatter_line
+			.hit(&scatter_line_transform, Cursor::Available(line_only_cursor))
+			.expect("scatter-line must retain a line-only hit");
+		assert_eq!(line_only_hit.mark_family, MarkFamily::LINE);
+		assert_eq!(line_only_hit.dimensionality, HitDimensionality::Line);
+
+		let fill_between_line = FillBetweenLinePlotKernel::new(
+			Arc::new(fill_between::prepare_fill_between_data(
+				&frame, "x", "y", "lower", "upper",
+			)),
+			Arc::new(line::prepare_line_data(&frame, "", "x", "y")),
+		);
+		let fill_between_layout = fill_between_line.layout(ResolvedPlotSettings::default());
+		let fill_between_transform = CoordinateTransformer::new(&fill_between_layout, bounds);
+		let overlap = fill_between_transform.cartesian(2.0, 4.0);
+		let overlap_hit = fill_between_line
+			.hit(&fill_between_transform, Cursor::Available(overlap))
+			.expect("fill-between-line overlap must hit");
+		assert_eq!(overlap_hit.mark_family, MarkFamily::LINE);
+		assert_eq!(overlap_hit.dimensionality, HitDimensionality::Line);
+		assert_eq!(overlap_hit.paint_order, 1);
+	}
+
+	#[test]
 	fn product_0044_layered_legend_unions_paint_order_without_flattening_samples() {
 		let mut spec = LayeredPlotSpec::new(LayerSpec::xy(LayerMark::Line, "x", "y"));
 		spec.push(LayerSpec::xy(LayerMark::Scatter, "x", "y"));

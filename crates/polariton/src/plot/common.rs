@@ -1770,6 +1770,19 @@ pub struct PlotHit {
 }
 
 impl PlotHit {
+	/// Select the PRODUCT-0133 winner from any composite's candidate hits.
+	/// Dimensional specificity is primary, later paint order wins ties, and the
+	/// lowest sibling ordinal wins the remaining tie.
+	pub fn best_of(candidates: impl IntoIterator<Item = Option<Self>>) -> Option<Self> {
+		candidates.into_iter().flatten().min_by_key(|candidate| {
+			(
+				candidate.dimensionality,
+				std::cmp::Reverse(candidate.paint_order),
+				candidate.sibling_ordinal,
+			)
+		})
+	}
+
 	pub fn new(
 		mark_family: MarkFamily,
 		dimensionality: HitDimensionality,
