@@ -115,6 +115,15 @@ struct AppState {
 	/// unlock, cancel, or failure. A session that never touches the store
 	/// never sees a prompt.
 	profile_unlock: Option<crate::profile_store::UnlockPrompt>,
+	/// The operation that asked for the store, applied once unlock succeeds
+	/// and dropped on cancel.
+	pending_profile_operation: Option<crate::profile_store::ProfileOperation>,
+	/// PRODUCT-0134 §4: `Some(original_name)` while the configuration dialog
+	/// edits a stored profile. Save then replaces in place (or renames, which
+	/// refuses onto an existing name); `None` makes Save a create, which
+	/// refuses an existing name. The operation carries the intent — there is
+	/// no overwrite prompt.
+	editing_profile: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -593,6 +602,8 @@ fn new_with_authority(
 		profile_store: crate::profile_store::ProfileStore::default(),
 		profile_store_path: crate::profile_store::ProfileStore::default_path(),
 		profile_unlock: None,
+		pending_profile_operation: None,
+		editing_profile: None,
 	};
 	sync_workspace_viewport(&mut state);
 	// Eagerly open the session scratch database so SQL always has a target;
@@ -641,6 +652,13 @@ fn view(app_state: &AppState) -> Element<'_, Message> {
 		app_state.session_id.is_some(),
 		app_state.saved_close_state == SavedCloseState::Failed,
 		app_state.profile_unlock.as_ref(),
+		// `None` while locked: names live inside the ciphertext, so no list
+		// can render before unlock (PRODUCT-0134 §8).
+		app_state
+			.profile_store
+			.names()
+			.ok()
+			.map(|names| names.into_iter().map(str::to_owned).collect()),
 	)
 }
 
@@ -2943,7 +2961,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			return window::latest().and_then(move |id| window::drag_resize(id, direction));
 		}
 		Message::Connect => match app_state.adapter_state.stage {
+			// PRODUCT-0134: `connect:new` stays a session-scoped, unsaved
+			// connection; it never edits a stored profile.
 			AdapterStage::None => {
+				app_state.editing_profile = None;
 				app_state.adapter_state.stage = AdapterStage::Unselected;
 				app_state.status_msg = "Select an adapter.".into();
 			}
@@ -2962,18 +2983,31 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		// silently substituted for a saved profile, and the store is never
 		// cleared, rewritten, or migrated on a failed open.
 		Message::ProfileStoreAccessRequested => {
-			if app_state.profile_store.is_unlocked() {
-				app_state.status_msg = "Profile store unlocked.".into();
-				return Task::none();
-			}
-			let Some(path) = app_state.profile_store_path.clone() else {
-				app_state.status_error =
-					"No configuration directory is available for connection profiles.".into();
-				return Task::none();
-			};
-			app_state.profile_unlock = Some(crate::profile_store::UnlockPrompt::for_store(
-				path.exists(),
-			));
+			return request_profile_access(app_state, crate::profile_store::ProfileOperation::Browse);
+		}
+		Message::ProfileSaveRequested => {
+			return request_profile_access(
+				app_state,
+				crate::profile_store::ProfileOperation::SaveCurrent,
+			);
+		}
+		Message::ProfileConnectRequested(name) => {
+			return request_profile_access(
+				app_state,
+				crate::profile_store::ProfileOperation::Connect(name),
+			);
+		}
+		Message::ProfileEditRequested(name) => {
+			return request_profile_access(
+				app_state,
+				crate::profile_store::ProfileOperation::Edit(name),
+			);
+		}
+		Message::ProfileDeleteRequested(name) => {
+			return request_profile_access(
+				app_state,
+				crate::profile_store::ProfileOperation::Delete(name),
+			);
 		}
 		Message::ProfilePassphraseChanged(value) => {
 			if let Some(prompt) = &mut app_state.profile_unlock {
@@ -3023,6 +3057,9 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 						"Profile store unlocked.".into()
 					};
 					app_state.status_error.clear();
+					if let Some(operation) = app_state.pending_profile_operation.take() {
+						return apply_profile_operation(app_state, operation);
+					}
 				}
 				Err(error) => {
 					// Retry stays available; the sealed file is untouched.
@@ -3034,6 +3071,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		}
 		Message::ProfileUnlockCancelled => {
 			app_state.profile_unlock = None;
+			app_state.pending_profile_operation = None;
 			// Routine interaction feedback, not an error: the saved-profile
 			// surface is disabled while locked, everything else still works.
 			app_state.status_msg =
@@ -3995,9 +4033,153 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 	Task::none()
 }
 
+/// PRODUCT-0134 §8: run a store operation now when the store is unlocked,
+/// otherwise hold it pending and open the passphrase prompt. This is the only
+/// way a prompt opens, so a session that never touches the store is never
+/// prompted.
+fn request_profile_access(
+	app_state: &mut AppState,
+	operation: crate::profile_store::ProfileOperation,
+) -> Task<Message> {
+	if app_state.profile_store.is_unlocked() {
+		return apply_profile_operation(app_state, operation);
+	}
+	let Some(path) = app_state.profile_store_path.clone() else {
+		app_state.status_error =
+			"No configuration directory is available for connection profiles.".into();
+		return Task::none();
+	};
+	app_state.pending_profile_operation = Some(operation);
+	app_state.profile_unlock = Some(crate::profile_store::UnlockPrompt::for_store(path.exists()));
+	Task::none()
+}
+
+fn apply_profile_operation(
+	app_state: &mut AppState,
+	operation: crate::profile_store::ProfileOperation,
+) -> Task<Message> {
+	use crate::profile_store::{ProfileOperation, SavedProfile};
+	let Some(path) = app_state.profile_store_path.clone() else {
+		return Task::none();
+	};
+	match operation {
+		ProfileOperation::Browse => {
+			// Unlocking was the operation: the Connect menu now lists names.
+		}
+		ProfileOperation::SaveCurrent => {
+			// PRODUCT-0134 §1: a profile is named fields, never a connection
+			// string. Saving while the ad hoc kind is active would have to
+			// parse one into the other, which no path may do.
+			if !app_state
+				.adapter_state
+				.ad_hoc_connection_string
+				.trim()
+				.is_empty()
+			{
+				app_state.status_error =
+					"Profiles use named fields; clear the ad hoc connection string first."
+						.into();
+				return Task::none();
+			}
+			let adapter_type = app_state.adapter_state.selection.adapter_type_str();
+			if adapter_type == "None" {
+				app_state.status_error = "Select and configure an adapter first.".into();
+				return Task::none();
+			}
+			let name = app_state.adapter_state.name.trim().to_owned();
+			let profile = SavedProfile {
+				adapter_type: adapter_type.to_owned(),
+				fields: app_state.adapter_state.fields.clone(),
+			};
+			let outcome = match app_state.editing_profile.clone() {
+				None => app_state.profile_store.save_new(&path, &name, profile),
+				Some(original) if original == name => {
+					app_state.profile_store.replace(&path, &name, profile)
+				}
+				Some(original) => app_state
+					.profile_store
+					.rename(&path, &original, &name)
+					.and_then(|()| app_state.profile_store.replace(&path, &name, profile)),
+			};
+			match outcome {
+				Ok(()) => {
+					app_state.editing_profile = Some(name.clone());
+					app_state.status_msg = format!("Profile saved: {name}");
+					app_state.status_error.clear();
+				}
+				Err(error) => app_state.status_error = error,
+			}
+		}
+		ProfileOperation::Connect(name) => match load_profile(app_state, &name) {
+			Ok(configuration) => {
+				app_state.adapter_state.configuration = configuration.clone();
+				app_state.adapter_state.stage = AdapterStage::Configured;
+				app_state.status_msg = format!("Connecting profile: {name}");
+				app_state.status_error.clear();
+				return Task::perform(
+					async move { AdapterState::connect(configuration).await },
+					Message::AdapterConnected,
+				);
+			}
+			Err(error) => app_state.status_error = error,
+		},
+		ProfileOperation::Edit(name) => match load_profile(app_state, &name) {
+			Ok(_configuration) => {
+				// The dialog edits fields; the configuration is rebuilt on
+				// submit. Opening it is the whole operation.
+				app_state.adapter_state.stage = AdapterStage::Unconfigured;
+				app_state.status_msg = format!("Editing profile: {name}");
+				app_state.status_error.clear();
+			}
+			Err(error) => app_state.status_error = error,
+		},
+		ProfileOperation::Delete(name) => match app_state.profile_store.delete(&path, &name) {
+			Ok(()) => {
+				if app_state.editing_profile.as_deref() == Some(name.as_str()) {
+					app_state.editing_profile = None;
+				}
+				app_state.status_msg = format!("Profile deleted: {name}");
+				app_state.status_error.clear();
+			}
+			Err(error) => app_state.status_error = error,
+		},
+	}
+	Task::none()
+}
+
+/// Load a stored profile into the adapter state — selection, dialog Name
+/// (which is the profile identity, PRODUCT-0134 §4), and the field map — and
+/// rebuild its configuration through the one saved path, `from_saved`.
+fn load_profile(
+	app_state: &mut AppState,
+	name: &str,
+) -> std::result::Result<crate::adapters::driver::AdapterConfiguration, String> {
+	let profile = app_state.profile_store.get(name)?.clone();
+	let Some(selection) =
+		crate::adapters::driver::AdapterSelection::from_type_str(&profile.adapter_type)
+	else {
+		return Err(format!(
+			"Profile {name} names an adapter this build does not include: {}",
+			profile.adapter_type
+		));
+	};
+	let configuration = crate::adapters::driver::AdapterConfiguration::from_saved(
+		&profile.adapter_type,
+		&profile.fields,
+	);
+	app_state.adapter_state.selection = selection;
+	app_state.adapter_state.name = name.to_owned();
+	app_state.adapter_state.fields = profile.fields;
+	app_state.adapter_state.ad_hoc_connection_string.clear();
+	app_state.editing_profile = Some(name.to_owned());
+	Ok(configuration)
+}
+
 fn menu_action_to_message(action: &str) -> Option<Message> {
 	match action {
 		"connect:new" => Some(Message::Connect),
+		"connect:profiles" => Some(Message::ProfileStoreAccessRequested),
+		"connect:save-profile" => Some(Message::ProfileSaveRequested),
 		"code:run" => Some(Message::Run),
 		"code:run-snippet" => Some(Message::RunSnippet),
 		"settings:preferences" => Some(Message::OpenSettings),
@@ -4005,6 +4187,17 @@ fn menu_action_to_message(action: &str) -> Option<Message> {
 		"session:copy-id" => Some(Message::CopySessionId),
 		"session:close-without-checkpoint" => Some(Message::CloseWithoutCheckpoint),
 		_ => {
+			// Profile names ride after a fixed prefix and are taken verbatim,
+			// so any name the store accepts is addressable from the menu.
+			if let Some(name) = action.strip_prefix("connect:profile-connect:") {
+				return Some(Message::ProfileConnectRequested(name.to_owned()));
+			}
+			if let Some(name) = action.strip_prefix("connect:profile-edit:") {
+				return Some(Message::ProfileEditRequested(name.to_owned()));
+			}
+			if let Some(name) = action.strip_prefix("connect:profile-delete:") {
+				return Some(Message::ProfileDeleteRequested(name.to_owned()));
+			}
 			if let Some(format) = action.strip_prefix("plot:export:") {
 				return parse_export_format(format).map(Message::Export);
 			}
@@ -11704,6 +11897,198 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		drop(update(&mut state, Message::ProfileUnlockSubmitted));
 		assert!(state.profile_unlock.is_none(), "retry succeeds");
 		assert!(state.profile_store.is_unlocked());
+		let _ = std::fs::remove_dir_all(path.parent().unwrap());
+		state.code_editor.shutdown();
+	}
+
+	/// PRODUCT-0134 stage 4: a profile saved in one process is selectable and
+	/// connects in the next. The pending operation survives the unlock prompt,
+	/// `from_saved` is the one reconstruction path, and the status identity is
+	/// the profile name.
+	#[test]
+	fn product_0134_profile_saved_in_one_process_connects_in_the_next() {
+		let path = profile_store_test_path("cross-process");
+
+		let (mut first, startup) = new(StartupData::default(), None);
+		drop(startup);
+		first.profile_store_path = Some(path.clone());
+		first
+			.profile_store
+			.initialize(&path, zeroize::Zeroizing::new(b"pw".to_vec()))
+			.expect("create store");
+		drop(update(
+			&mut first,
+			Message::AdapterSelected(crate::adapters::driver::AdapterSelection::SQLite),
+		));
+		drop(update(
+			&mut first,
+			Message::ConnectionNameChanged("local-mem".into()),
+		));
+		drop(update(
+			&mut first,
+			Message::AdapterConfigurationChanged("connection_string".into(), "memory".into()),
+		));
+		drop(update(&mut first, Message::ProfileSaveRequested));
+		assert_eq!(first.status_msg, "Profile saved: local-mem");
+		assert_eq!(first.editing_profile.as_deref(), Some("local-mem"));
+		first.code_editor.shutdown();
+		drop(first);
+
+		// The next process: locked store, connect drives the unlock prompt,
+		// and the pending operation applies on success.
+		let (mut second, startup) = new(StartupData::default(), None);
+		drop(startup);
+		second.profile_store_path = Some(path.clone());
+		drop(update(
+			&mut second,
+			Message::ProfileConnectRequested("local-mem".into()),
+		));
+		assert!(second.profile_unlock.is_some(), "locked store prompts");
+		drop(update(
+			&mut second,
+			Message::ProfilePassphraseChanged("pw".into()),
+		));
+		drop(update(&mut second, Message::ProfileUnlockSubmitted));
+		assert!(second.profile_unlock.is_none());
+		assert!(matches!(
+			&second.adapter_state.configuration,
+			crate::adapters::driver::AdapterConfiguration::SQLite { connection_string }
+				if connection_string == "memory"
+		));
+		assert!(matches!(
+			second.adapter_state.stage,
+			crate::adapters::common::AdapterStage::Configured
+		));
+		assert_eq!(second.adapter_state.connection_identity(), "local-mem");
+
+		// The reconstructed configuration genuinely connects.
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		runtime
+			.block_on(crate::adapters::driver::AdapterState::connect(
+				second.adapter_state.configuration.clone(),
+			))
+			.expect("saved profile connects");
+		let _ = std::fs::remove_dir_all(path.parent().unwrap());
+		second.code_editor.shutdown();
+	}
+
+	/// PRODUCT-0134 §1/§4 at the surface: saving with the ad hoc kind active
+	/// refuses; a create onto an existing name refuses after `connect:new`
+	/// cleared the editing identity; deleting removes the profile from the
+	/// store (and with it the menu listing, which renders `names()`).
+	#[test]
+	fn product_0134_save_refusals_and_delete_follow_the_identity_rules() {
+		let path = profile_store_test_path("surface-rules");
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		state.profile_store_path = Some(path.clone());
+		state
+			.profile_store
+			.initialize(&path, zeroize::Zeroizing::new(b"pw".to_vec()))
+			.expect("create store");
+
+		drop(update(
+			&mut state,
+			Message::AdapterSelected(crate::adapters::driver::AdapterSelection::SQLite),
+		));
+		drop(update(
+			&mut state,
+			Message::ConnectionNameChanged("scratchpad".into()),
+		));
+		drop(update(
+			&mut state,
+			Message::AdapterConfigurationChanged("connection_string".into(), "memory".into()),
+		));
+
+		drop(update(
+			&mut state,
+			Message::AdapterAdHocChanged("postgresql://u@h/db".into()),
+		));
+		drop(update(&mut state, Message::ProfileSaveRequested));
+		assert!(
+			state.status_error.contains("named fields"),
+			"a profile is never a connection string: {}",
+			state.status_error
+		);
+		drop(update(&mut state, Message::AdapterAdHocChanged(String::new())));
+
+		drop(update(&mut state, Message::ProfileSaveRequested));
+		assert_eq!(state.status_msg, "Profile saved: scratchpad");
+
+		// connect:new is session-scoped and unsaved: it clears the editing
+		// identity, so saving the same name again is a create, which refuses.
+		drop(update(&mut state, Message::Connect));
+		drop(update(&mut state, Message::Connect));
+		assert!(state.editing_profile.is_none());
+		drop(update(
+			&mut state,
+			Message::AdapterSelected(crate::adapters::driver::AdapterSelection::SQLite),
+		));
+		drop(update(
+			&mut state,
+			Message::ConnectionNameChanged("scratchpad".into()),
+		));
+		drop(update(
+			&mut state,
+			Message::AdapterConfigurationChanged("connection_string".into(), "memory".into()),
+		));
+		drop(update(&mut state, Message::ProfileSaveRequested));
+		assert!(
+			state.status_error.contains("already exists"),
+			"create never silently replaces: {}",
+			state.status_error
+		);
+
+		drop(update(
+			&mut state,
+			Message::ProfileDeleteRequested("scratchpad".into()),
+		));
+		assert_eq!(state.status_msg, "Profile deleted: scratchpad");
+		assert!(state.profile_store.names().expect("names").is_empty());
+		let _ = std::fs::remove_dir_all(path.parent().unwrap());
+		state.code_editor.shutdown();
+	}
+
+	/// PRODUCT-0134 §4: rename is edit plus a changed Name — the original
+	/// identity is renamed, never duplicated, and renaming onto an existing
+	/// name refuses.
+	#[test]
+	fn product_0134_edit_with_a_changed_name_renames_the_profile() {
+		let path = profile_store_test_path("rename");
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		state.profile_store_path = Some(path.clone());
+		state
+			.profile_store
+			.initialize(&path, zeroize::Zeroizing::new(b"pw".to_vec()))
+			.expect("create store");
+		drop(update(
+			&mut state,
+			Message::AdapterSelected(crate::adapters::driver::AdapterSelection::SQLite),
+		));
+		drop(update(
+			&mut state,
+			Message::ConnectionNameChanged("old-name".into()),
+		));
+		drop(update(
+			&mut state,
+			Message::AdapterConfigurationChanged("connection_string".into(), "memory".into()),
+		));
+		drop(update(&mut state, Message::ProfileSaveRequested));
+		assert_eq!(state.status_msg, "Profile saved: old-name");
+
+		drop(update(
+			&mut state,
+			Message::ProfileEditRequested("old-name".into()),
+		));
+		assert_eq!(state.editing_profile.as_deref(), Some("old-name"));
+		drop(update(
+			&mut state,
+			Message::ConnectionNameChanged("new-name".into()),
+		));
+		drop(update(&mut state, Message::ProfileSaveRequested));
+		assert_eq!(state.status_msg, "Profile saved: new-name");
+		assert_eq!(state.profile_store.names().expect("names"), ["new-name"]);
 		let _ = std::fs::remove_dir_all(path.parent().unwrap());
 		state.code_editor.shutdown();
 	}

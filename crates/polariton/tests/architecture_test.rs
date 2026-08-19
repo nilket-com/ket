@@ -2384,7 +2384,8 @@ fn product_0071_chrome_consumes_the_guarded_title_status_and_menu_models() {
 		.expect("bounded menu bar");
 	assert!(menu_bar.contains("MenuBar::new("));
 	assert!(
-		menu_bar.contains("build_menu_roots(saved_session, close_without_checkpoint)"),
+		menu_bar
+			.contains("build_menu_roots(saved_session, close_without_checkpoint, profile_names)"),
 		"MenuBar must consume the tested MenuRoot model without reconstructing it"
 	);
 }

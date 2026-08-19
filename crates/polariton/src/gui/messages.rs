@@ -85,6 +85,11 @@ pub enum Message {
 	/// PRODUCT-0134 §8: something needs the profile store. Unlocks (or begins
 	/// creating) it lazily; never sent at startup.
 	ProfileStoreAccessRequested,
+	/// Save the currently configured adapter state under its dialog Name.
+	ProfileSaveRequested,
+	ProfileConnectRequested(String),
+	ProfileEditRequested(String),
+	ProfileDeleteRequested(String),
 	ProfilePassphraseChanged(String),
 	ProfilePassphraseConfirmationChanged(String),
 	ProfileUnlockSubmitted,

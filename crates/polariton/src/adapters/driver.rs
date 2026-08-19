@@ -25,6 +25,21 @@ pub enum AdapterSelection {
 }
 
 impl AdapterSelection {
+	/// The inverse of `adapter_type_str`, for rebuilding a selection from a
+	/// saved profile's stored adapter type (PRODUCT-0134 §4).
+	pub fn from_type_str(adapter_type: &str) -> Option<Self> {
+		match adapter_type {
+			"BigQuery" => Some(AdapterSelection::BigQuery),
+			"MySQL" => Some(AdapterSelection::MySQL),
+			"Parquet" => Some(AdapterSelection::Parquet),
+			"Postgres" => Some(AdapterSelection::Postgres),
+			"SQLite" => Some(AdapterSelection::SQLite),
+			#[cfg(feature = "toron")]
+			"Toron" => Some(AdapterSelection::Toron),
+			_ => None,
+		}
+	}
+
 	pub fn adapter_type_str(&self) -> &str {
 		match self {
 			AdapterSelection::None => "None",
@@ -251,7 +266,6 @@ impl AdapterConfiguration {
 	/// PRODUCT-0134 §3. Keeping this mapping here prevents a frontend from
 	/// needing to know the adapter-specific configuration shape, and keeps
 	/// exactly one path from stored profile to live configuration.
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn from_saved(adapter_type: &str, fields: &BTreeMap<String, String>) -> Self {
 		let value = |key: &str| fields.get(key).cloned().unwrap_or_default();
 		match adapter_type {

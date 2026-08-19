@@ -45,7 +45,6 @@ pub struct ProfileStore {
 	profiles: BTreeMap<String, SavedProfile>,
 }
 
-#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 const LOCKED: &str = "The connection profile store is locked.";
 
 /// The passphrase prompt's interface state (PRODUCT-0134 §8/§9). `creating`
@@ -71,7 +70,20 @@ impl UnlockPrompt {
 	}
 }
 
-#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
+/// A store operation requested before the store was necessarily unlocked
+/// (PRODUCT-0134 §8). Held while the prompt is open; applied on unlock,
+/// dropped on cancel.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProfileOperation {
+	/// Unlock so the Connect menu can list profile names.
+	Browse,
+	/// Save the currently configured adapter state under its dialog Name.
+	SaveCurrent,
+	Connect(String),
+	Edit(String),
+	Delete(String),
+}
+
 fn valid_name(name: &str) -> Result<&str, String> {
 	let trimmed = name.trim();
 	if trimmed.is_empty() {
@@ -141,19 +153,19 @@ impl ProfileStore {
 		self.persist(path)
 	}
 
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
+	// No production lock surface exists yet; the §7 independence test
+	// exercises this, and a menu affordance would be a later decision.
+	#[allow(dead_code)]
 	pub fn lock(&mut self) {
 		self.session.lock();
 		self.profiles.clear();
 	}
 
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn names(&self) -> Result<Vec<&str>, String> {
 		self.require_unlocked()?;
 		Ok(self.profiles.keys().map(String::as_str).collect())
 	}
 
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn get(&self, name: &str) -> Result<&SavedProfile, String> {
 		self.require_unlocked()?;
 		self.profiles
@@ -162,7 +174,6 @@ impl ProfileStore {
 	}
 
 	/// PRODUCT-0134 §4: a create never silently replaces a stored credential.
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn save_new(
 		&mut self,
 		path: &Path,
@@ -181,7 +192,6 @@ impl ProfileStore {
 	}
 
 	/// PRODUCT-0134 §4: the identity being edited is the identity written.
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn replace(
 		&mut self,
 		path: &Path,
@@ -199,7 +209,6 @@ impl ProfileStore {
 
 	/// PRODUCT-0134 §4: renaming onto an existing name refuses, for the same
 	/// reason a create does.
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn rename(&mut self, path: &Path, from: &str, to: &str) -> Result<(), String> {
 		self.require_unlocked()?;
 		let from = valid_name(from)?;
@@ -217,7 +226,6 @@ impl ProfileStore {
 		self.persist(path)
 	}
 
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	pub fn delete(&mut self, path: &Path, name: &str) -> Result<(), String> {
 		self.require_unlocked()?;
 		let name = valid_name(name)?;
@@ -227,7 +235,6 @@ impl ProfileStore {
 		self.persist(path)
 	}
 
-	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
 	fn require_unlocked(&self) -> Result<(), String> {
 		if self.session.is_unlocked() {
 			Ok(())

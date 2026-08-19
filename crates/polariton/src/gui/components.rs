@@ -166,6 +166,7 @@ pub fn main_screen<'a>(
 	saved_session: bool,
 	close_without_checkpoint: bool,
 	profile_unlock: Option<&'a crate::profile_store::UnlockPrompt>,
+	profile_names: Option<Vec<String>>,
 ) -> Element<'a, Message> {
 	// Baryon's workspace is the sole top-level layout owner.
 	let main_content = container(code_editor.view().map(Message::CodeEditEvent))
@@ -207,6 +208,7 @@ pub fn main_screen<'a>(
 		menu_state,
 		saved_session,
 		close_without_checkpoint,
+		profile_names,
 	);
 	let adapter_modal = adapter_view(adapter_state);
 	let settings_modal: Element<Message> = if showing_settings {
@@ -398,10 +400,11 @@ pub fn menu_bar<'a>(
 	menu_state: &'a MenuState,
 	saved_session: bool,
 	close_without_checkpoint: bool,
+	profile_names: Option<Vec<String>>,
 ) -> Element<'a, Message> {
 	Element::from(
 		MenuBar::new(
-			build_menu_roots(saved_session, close_without_checkpoint),
+			build_menu_roots(saved_session, close_without_checkpoint, profile_names),
 			menu_state,
 		)
 		.font_policy(MenuFontPolicy::SystemWithFallback),
@@ -409,15 +412,69 @@ pub fn menu_bar<'a>(
 	.map(Message::Menu)
 }
 
-fn build_menu_roots(saved_session: bool, close_without_checkpoint: bool) -> Vec<MenuRoot> {
+fn build_menu_roots(
+	saved_session: bool,
+	close_without_checkpoint: bool,
+	profile_names: Option<Vec<String>>,
+) -> Vec<MenuRoot> {
+	// PRODUCT-0134 §8: while the store is locked (`None`), the menu offers one
+	// entry that requests access — names live inside the ciphertext and cannot
+	// be listed. Once unlocked, every profile is addressable for connect,
+	// edit, and delete; rename is edit plus a changed Name.
+	let profiles_item = match profile_names {
+		None => MenuItem::Action {
+			id: "connect:profiles".into(),
+			label: "Profiles…".into(),
+		},
+		Some(names) if names.is_empty() => MenuItem::Submenu {
+			id: "connect:profiles-open".into(),
+			label: "Profiles".into(),
+			items: vec![MenuItem::Action {
+				id: "connect:profiles-none".into(),
+				label: "(no saved profiles)".into(),
+			}],
+		},
+		Some(names) => MenuItem::Submenu {
+			id: "connect:profiles-open".into(),
+			label: "Profiles".into(),
+			items: names
+				.into_iter()
+				.map(|name| MenuItem::Submenu {
+					id: format!("connect:profile:{name}"),
+					label: name.clone(),
+					items: vec![
+						MenuItem::Action {
+							id: format!("connect:profile-connect:{name}"),
+							label: "Connect".into(),
+						},
+						MenuItem::Action {
+							id: format!("connect:profile-edit:{name}"),
+							label: "Edit".into(),
+						},
+						MenuItem::Action {
+							id: format!("connect:profile-delete:{name}"),
+							label: "Delete".into(),
+						},
+					],
+				})
+				.collect(),
+		},
+	};
 	let mut roots = vec![
 		MenuRoot {
 			id: "connect".into(),
 			label: "Connect".into(),
-			items: vec![MenuItem::Action {
-				id: "connect:new".into(),
-				label: "New".into(),
-			}],
+			items: vec![
+				MenuItem::Action {
+					id: "connect:new".into(),
+					label: "New".into(),
+				},
+				MenuItem::Action {
+					id: "connect:save-profile".into(),
+					label: "Save profile".into(),
+				},
+				profiles_item,
+			],
 		},
 		MenuRoot {
 			id: "code".into(),
@@ -520,6 +577,7 @@ fn window_decorations<'a>(
 	menu_state: &'a MenuState,
 	saved_session: bool,
 	close_without_checkpoint: bool,
+	profile_names: Option<Vec<String>>,
 ) -> Element<'a, Message> {
 	let resize_thin = 6;
 	let resize_thick = 60;
@@ -562,7 +620,8 @@ fn window_decorations<'a>(
 					row![menu_bar(
 						menu_state,
 						saved_session,
-						close_without_checkpoint
+						close_without_checkpoint,
+						profile_names
 					)],
 				],
 				row![
@@ -635,7 +694,7 @@ mod tests {
 	use crate::gui::menu::MenuItem;
 
 	fn action_ids(saved_session: bool, close_without_checkpoint: bool) -> Vec<String> {
-		build_menu_roots(saved_session, close_without_checkpoint)
+		build_menu_roots(saved_session, close_without_checkpoint, None)
 			.into_iter()
 			.flat_map(|root| root.items)
 			.filter_map(|item| match item {
@@ -659,24 +718,57 @@ mod tests {
 		assert!(failed_close.contains(&"session:close-without-checkpoint".to_owned()));
 	}
 
-	/// PRODUCT-0134 stage 0 census: before the saved-profile surface exists,
-	/// the Connect menu offers exactly one action.
+	/// PRODUCT-0134 stage 4: the Connect menu's saved-profile surface. Locked,
+	/// the store cannot list names (they live inside the ciphertext), so one
+	/// action requests access. Unlocked, every profile is addressable for
+	/// connect, edit, and delete — and `connect:new` stays first, an unsaved
+	/// session-scoped connection.
 	#[test]
-	fn product_0134_census_connect_menu_offers_only_new() {
-		let roots = build_menu_roots(false, false);
-		let connect = roots
-			.iter()
-			.find(|root| root.id == "connect")
-			.expect("Connect menu exists");
-		let ids: Vec<&str> = connect
-			.items
-			.iter()
-			.filter_map(|item| match item {
-				MenuItem::Action { id, .. } => Some(id.as_str()),
-				MenuItem::Submenu { .. } | MenuItem::Separator => None,
-			})
-			.collect();
-		assert_eq!(ids, ["connect:new"]);
+	fn product_0134_connect_menu_offers_the_saved_profile_surface() {
+		fn connect_root(profile_names: Option<Vec<String>>) -> super::MenuRoot {
+			build_menu_roots(false, false, profile_names)
+				.into_iter()
+				.find(|root| root.id == "connect")
+				.expect("Connect menu exists")
+		}
+		fn all_ids(items: &[MenuItem], ids: &mut Vec<String>) {
+			for item in items {
+				match item {
+					MenuItem::Action { id, .. } => ids.push(id.clone()),
+					MenuItem::Submenu { id, items, .. } => {
+						ids.push(id.clone());
+						all_ids(items, ids);
+					}
+					MenuItem::Separator => {}
+				}
+			}
+		}
+
+		let locked = connect_root(None);
+		let mut ids = Vec::new();
+		all_ids(&locked.items, &mut ids);
+		assert_eq!(
+			ids,
+			["connect:new", "connect:save-profile", "connect:profiles"],
+			"a locked store offers exactly one access-requesting action"
+		);
+
+		let empty = connect_root(Some(Vec::new()));
+		let mut ids = Vec::new();
+		all_ids(&empty.items, &mut ids);
+		assert!(ids.contains(&"connect:profiles-none".to_owned()));
+
+		let listed = connect_root(Some(vec!["prod".to_owned()]));
+		let mut ids = Vec::new();
+		all_ids(&listed.items, &mut ids);
+		assert_eq!(ids[0], "connect:new");
+		for expected in [
+			"connect:profile-connect:prod",
+			"connect:profile-edit:prod",
+			"connect:profile-delete:prod",
+		] {
+			assert!(ids.contains(&expected.to_owned()), "{expected} missing");
+		}
 	}
 
 	#[test]
@@ -691,7 +783,7 @@ mod tests {
 			}
 		}
 
-		let roots = build_menu_roots(false, false);
+		let roots = build_menu_roots(false, false, None);
 		let plot = roots
 			.iter()
 			.find(|root| root.id == "plot")
@@ -750,7 +842,7 @@ mod tests {
 
 	#[test]
 	fn product_0071_session_menu_keeps_identity_behind_the_copy_action() {
-		let roots = build_menu_roots(true, false);
+		let roots = build_menu_roots(true, false, None);
 		let session = roots
 			.iter()
 			.find(|root| root.id == "session")
@@ -1113,6 +1205,11 @@ pub fn adapter_configuration_view(adapter_state: &AdapterState) -> Element<'stat
 	content = content.push(
 		row![
 			space::horizontal(),
+			styled_button(
+				"Save profile",
+				Message::ProfileSaveRequested,
+				BUTTON_SIZE_DEFAULT,
+			),
 			styled_button(
 				"Connect",
 				Message::AdapterConfigurationSubmitted,
