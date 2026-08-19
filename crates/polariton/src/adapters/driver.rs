@@ -246,30 +246,41 @@ impl AdapterState {
 }
 
 impl AdapterConfiguration {
-	/// Rebuild an adapter configuration after libaryon has decrypted an opaque
-	/// saved connection profile. Keeping this mapping here prevents a frontend
-	/// from needing to know the adapter-specific configuration shape.
-	#[allow(dead_code)] // The encrypted-profile reader is the next consumer.
-	pub fn from_saved(adapter_type: &str, config_value: &str) -> Self {
+	/// Rebuild an adapter configuration from a decrypted saved profile's field
+	/// map — the same shape the configuration editor produces, per
+	/// PRODUCT-0134 §3. Keeping this mapping here prevents a frontend from
+	/// needing to know the adapter-specific configuration shape, and keeps
+	/// exactly one path from stored profile to live configuration.
+	#[allow(dead_code)] // The saved-profile surface is the stage 4 consumer.
+	pub fn from_saved(adapter_type: &str, fields: &BTreeMap<String, String>) -> Self {
+		let value = |key: &str| fields.get(key).cloned().unwrap_or_default();
 		match adapter_type {
 			"BigQuery" => AdapterConfiguration::BigQuery {
-				project_id: config_value.to_string(),
+				project_id: value("project_id"),
 			},
-			"MySQL" => AdapterConfiguration::MySQL {
-				connection_string: config_value.to_string(),
+			"MySQL" => AdapterConfiguration::MySQLFields {
+				host: value("host"),
+				port: value("port"),
+				database: value("database"),
+				user: value("user"),
+				password: value("password"),
 			},
 			"Parquet" => AdapterConfiguration::Parquet {
-				input_path: config_value.to_string(),
+				input_path: value("input_path"),
 			},
-			"Postgres" => AdapterConfiguration::Postgres {
-				connection_string: config_value.to_string(),
+			"Postgres" => AdapterConfiguration::PostgresFields {
+				host: value("host"),
+				port: value("port"),
+				database: value("database"),
+				user: value("user"),
+				password: value("password"),
 			},
 			"SQLite" => AdapterConfiguration::SQLite {
-				connection_string: config_value.to_string(),
+				connection_string: value("connection_string"),
 			},
 			#[cfg(feature = "toron")]
 			"Toron" => AdapterConfiguration::Toron {
-				endpoint: config_value.to_string(),
+				endpoint: value("endpoint"),
 			},
 			_ => AdapterConfiguration::None,
 		}
@@ -572,21 +583,48 @@ mod tests {
 
 	#[test]
 	fn saved_configuration_keeps_adapter_specific_field_names() {
+		use std::collections::BTreeMap;
+		let map = |pairs: &[(&str, &str)]| -> BTreeMap<String, String> {
+			pairs
+				.iter()
+				.map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+				.collect()
+		};
 		assert!(matches!(
-			AdapterConfiguration::from_saved("BigQuery", "warehouse"),
+			AdapterConfiguration::from_saved("BigQuery", &map(&[("project_id", "warehouse")])),
 			AdapterConfiguration::BigQuery { project_id } if project_id == "warehouse"
 		));
 		assert!(matches!(
-			AdapterConfiguration::from_saved("Postgres", "postgres://db"),
-			AdapterConfiguration::Postgres { connection_string } if connection_string == "postgres://db"
+			AdapterConfiguration::from_saved(
+				"Postgres",
+				&map(&[
+					("host", "h"),
+					("port", "6432"),
+					("database", "db"),
+					("user", "u"),
+					("password", "pw"),
+				]),
+			),
+			AdapterConfiguration::PostgresFields { host, port, database, user, password }
+				if host == "h" && port == "6432" && database == "db" && user == "u" && password == "pw"
 		));
 		assert!(matches!(
-			AdapterConfiguration::from_saved("unknown", "ignored"),
+			AdapterConfiguration::from_saved("MySQL", &map(&[("host", "h"), ("user", "u")])),
+			AdapterConfiguration::MySQLFields { host, port, database, user, password }
+				if host == "h" && port.is_empty() && database.is_empty()
+					&& user == "u" && password.is_empty()
+		));
+		assert!(matches!(
+			AdapterConfiguration::from_saved("SQLite", &map(&[("connection_string", "memory")])),
+			AdapterConfiguration::SQLite { connection_string } if connection_string == "memory"
+		));
+		assert!(matches!(
+			AdapterConfiguration::from_saved("unknown", &map(&[("x", "ignored")])),
 			AdapterConfiguration::None
 		));
 		#[cfg(feature = "toron")]
 		assert!(matches!(
-			AdapterConfiguration::from_saved("Toron", "loopback.invalid:1"),
+			AdapterConfiguration::from_saved("Toron", &map(&[("endpoint", "loopback.invalid:1")])),
 			AdapterConfiguration::Toron { endpoint } if endpoint == "loopback.invalid:1"
 		));
 	}

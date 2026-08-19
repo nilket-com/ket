@@ -155,10 +155,19 @@ fn product_0062_persistence_schema_has_no_placement_or_renderer_authority() {
 			}
 		}
 	}
+	serialization_sites.sort();
+	// PRODUCT-0062 confined serde to the opaque session owner; PRODUCT-0134
+	// sanctions exactly one more durable schema, the encrypted profile store.
+	let mut expected = vec![
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/profile_store.rs"),
+		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session_persistence.rs"),
+	];
+	expected.sort();
 	assert_eq!(
-		serialization_sites,
-		vec![Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session_persistence.rs")],
-		"serde belongs only to Polariton's one opaque session owner"
+		serialization_sites, expected,
+		"serde belongs only to Polariton's declared durable-schema owners: the \
+		 opaque session owner (PRODUCT-0062) and the encrypted profile store \
+		 (PRODUCT-0134)"
 	);
 }
 

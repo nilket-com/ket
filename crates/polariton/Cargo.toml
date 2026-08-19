@@ -61,6 +61,7 @@ tokio-postgres-rustls = { version = "0.14.0", default-features = false, features
 tokio-rusqlite = { version = "0.7.0", features = ["bundled"] }
 tokio-stream = "0.1.18"
 unicode-segmentation = "1.13.2"
+zeroize.workspace = true
 unicode-width = "0.2.2"
 toron-client = { path = "../../nilket/crates/toron-client", optional = true }
 nilket-local = { path = "../../nilket/crates/nilket-local", optional = true }

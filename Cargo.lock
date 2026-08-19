@@ -6385,6 +6385,7 @@ dependencies = [
  "trybuild",
  "unicode-segmentation",
  "unicode-width",
+ "zeroize",
 ]
 
 [[package]]
