@@ -1761,6 +1761,28 @@ impl RuneExpr {
 		}
 	}
 
+	pub fn similar_to(self, pattern: String) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::SimilarTo {
+				expr: Box::new(self.expr),
+				pattern,
+				escape: None,
+				negated: false,
+			},
+		}
+	}
+
+	pub fn not_similar_to(self, pattern: String) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::SimilarTo {
+				expr: Box::new(self.expr),
+				pattern,
+				escape: None,
+				negated: true,
+			},
+		}
+	}
+
 	pub fn is_distinct(self, other: RuneExpr) -> RuneExpr {
 		RuneExpr {
 			expr: Expr::IsDistinctFrom {
@@ -2275,6 +2297,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("logical_not", RuneExpr::logical_not)?;
 	m.associated_function("is_null", RuneExpr::is_null)?;
 	m.associated_function("is_not_null", RuneExpr::is_not_null)?;
+	m.associated_function("similar_to", RuneExpr::similar_to)?;
+	m.associated_function("not_similar_to", RuneExpr::not_similar_to)?;
 	m.associated_function("is_distinct", RuneExpr::is_distinct)?;
 	m.associated_function("is_not_distinct", RuneExpr::is_not_distinct)?;
 	m.associated_function("add", RuneExpr::add)?;

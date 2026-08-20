@@ -973,6 +973,15 @@ pub enum Expr {
 		right: Box<Expr>,
 		negated: bool,
 	},
+	/// ADR 570: the anchored regular-pattern predicate. The pattern and the
+	/// escape are plan-time constants; the binder compiles them, so a
+	/// malformed pattern fails the statement once, before execution.
+	SimilarTo {
+		expr: Box<Expr>,
+		pattern: String,
+		escape: Option<char>,
+		negated: bool,
+	},
 }
 
 impl Expr {
@@ -1010,7 +1019,8 @@ impl Expr {
 			| Self::Not(inner)
 			| Self::IsNull(inner)
 			| Self::IsNotNull(inner)
-			| Self::Like { expr: inner, .. } => inner.is_deterministic(),
+			| Self::Like { expr: inner, .. }
+			| Self::SimilarTo { expr: inner, .. } => inner.is_deterministic(),
 			Self::Add(left, right)
 			| Self::Sub(left, right)
 			| Self::Mul(left, right)
@@ -1056,6 +1066,7 @@ impl Expr {
 			| Self::Mul(_, _)
 			| Self::Div(_, _)
 			| Self::Like { .. }
+			| Self::SimilarTo { .. }
 			| Self::Case { .. }
 			| Self::IsDistinctFrom { .. } => false,
 			Self::ScalarFunction { id, args, .. } => {

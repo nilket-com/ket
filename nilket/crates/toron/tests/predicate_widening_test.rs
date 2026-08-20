@@ -769,7 +769,8 @@ fn unsupported_pattern_predicates_and_case_subquery_in_remain_unsupported() {
 		"SELECT id FROM sales WHERE status LIKE ANY ('o%')",
 		"SELECT id FROM sales WHERE status LIKE status",
 		"SELECT id FROM sales WHERE status LIKE 'o%' ESCAPE '\\'",
-		"SELECT id FROM sales WHERE status SIMILAR TO 'o%'",
+		// ADR 570 admitted SIMILAR TO; it left this reject list through its
+		// own decision.
 		"SELECT id FROM sales WHERE status RLIKE 'o.*'",
 		"SELECT id FROM sales WHERE status ~~ 'o%'",
 		"SELECT id FROM sales WHERE status ~~* 'o%'",

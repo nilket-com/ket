@@ -40,6 +40,8 @@ const NON_SCALAR_EXPR_VARIANTS: &[&str] = &[
 	// ADR 566: a predicate operator like Eq or IsNull — grammar, not a
 	// name-resolved scalar call, so it is not a registry candidate.
 	"IsDistinctFrom",
+	// ADR 570: likewise grammar — the anchored regular-pattern predicate.
+	"SimilarTo",
 ];
 
 fn source(relative: &str) -> String {
@@ -329,4 +331,41 @@ pub(crate) fn adr569_seeded_random_is_deterministic_and_entropy_free() {
 		);
 	}
 	assert!(seeded_eval.contains("splitmix64_finalize"));
+}
+
+/// ADR 570: the SIMILAR TO matcher must stay non-backtracking and capped.
+/// A recursive match over pattern positions is the construction that makes
+/// nested repetition catastrophic; the state cap is what bounds compiled
+/// program size under `{n,m}` expansion.
+#[test]
+pub(crate) fn adr570_similar_to_matcher_is_non_backtracking_and_capped() {
+	let matcher = source("src/similar_to.rs");
+	let matches_body = brace_blocks_after_marker(&matcher, "pub(crate) fn matches")
+		.into_iter()
+		.next()
+		.expect("matches body")
+		.1;
+	assert!(
+		!matches_body.contains("self.matches("),
+		"the simulation must not recurse over pattern positions"
+	);
+	assert!(matches_body.contains("add_state"));
+	let closure = brace_blocks_after_marker(&matcher, "fn add_state")
+		.into_iter()
+		.next()
+		.expect("add_state body")
+		.1;
+	assert!(
+		closure.contains("let mut stack"),
+		"epsilon closure must use an explicit stack"
+	);
+	let push = brace_blocks_after_marker(&matcher, "fn push")
+		.into_iter()
+		.next()
+		.expect("push body")
+		.1;
+	assert!(
+		push.contains("SIMILAR_TO_MAX_STATES"),
+		"every state allocation must check the cap"
+	);
 }

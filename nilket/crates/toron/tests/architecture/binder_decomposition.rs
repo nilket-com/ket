@@ -223,8 +223,8 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// ADR 569 adds the virtual Range leaf: its bind arm and exact-facts
 	// constructor. Bumped by its cost.
 	assert!(
-		lines <= 6_415,
-		"binder root has {lines} lines; expected <= 6,415 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_455,
+		"binder root has {lines} lines; expected <= 6,455 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 
@@ -431,6 +431,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// binder and the executor conformance tests both read; it owns no
 				// binder decomposition surface.
 				"crates/toron/src/cast_support.rs",
+				// ADR 570: the SIMILAR TO compiler is bind-time vocabulary, the
+				// temporal_format precedent.
+				"crates/toron/src/similar_to.rs",
 				"crates/toron/tests/non_aggregate_projection_accounting_test.rs",
 				// Plan filenames are zero-padded to four digits; this README documents a
 				// command whose argument is one of the renamed implementation docs.

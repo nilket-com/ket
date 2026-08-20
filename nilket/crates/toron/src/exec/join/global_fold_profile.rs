@@ -511,7 +511,8 @@ fn expression_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		BoundExprNode::Cast { input, .. }
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
-		| BoundExprNode::Like { expr: input, .. } => vec![*input],
+		| BoundExprNode::Like { expr: input, .. }
+		| BoundExprNode::SimilarTo { expr: input, .. } => vec![*input],
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {
 			let mut children = Vec::with_capacity(list.len().saturating_add(1));
@@ -547,6 +548,7 @@ fn expression_node_kind(node: &BoundExprNode) -> &'static str {
 		BoundExprNode::Unary { .. } => "unary",
 		BoundExprNode::InList { .. } => "in_list",
 		BoundExprNode::Like { .. } => "like",
+		BoundExprNode::SimilarTo { .. } => "similar_to",
 		BoundExprNode::Case { .. } => "case",
 		BoundExprNode::ScalarFunction { .. } => "scalar_function",
 	}

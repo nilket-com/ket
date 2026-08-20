@@ -216,6 +216,17 @@ pub(super) fn offset_bound_node(
 			negated,
 			case_insensitive,
 		},
+		BoundExprNode::SimilarTo {
+			expr,
+			pattern,
+			escape,
+			negated,
+		} => BoundExprNode::SimilarTo {
+			expr: offset_id(expr),
+			pattern,
+			escape,
+			negated,
+		},
 		BoundExprNode::Case {
 			when_then,
 			else_input,

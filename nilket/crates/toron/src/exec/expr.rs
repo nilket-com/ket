@@ -381,6 +381,17 @@ impl Executor {
 				}
 				Ok(Arc::new(not(&not_distinct)?))
 			}
+			Expr::SimilarTo {
+				expr,
+				pattern,
+				escape,
+				negated,
+			} => {
+				// Mirrors the bound evaluator: one compiled program, negation
+				// on the boolean.
+				let arr = self.evaluate_expr(expr, batch)?;
+				evaluate_similar_to(&arr, pattern, *escape, *negated)
+			}
 		}
 	}
 
@@ -460,6 +471,15 @@ impl Executor {
 				} => {
 					let expr_arr = evaluated_child(&outputs, *expr)?;
 					evaluate_like(&expr_arr, pattern, *negated, *case_insensitive)?
+				}
+				BoundExprNode::SimilarTo {
+					expr,
+					pattern,
+					escape,
+					negated,
+				} => {
+					let expr_arr = evaluated_child(&outputs, *expr)?;
+					evaluate_similar_to(&expr_arr, pattern, *escape, *negated)?
 				}
 				BoundExprNode::Case {
 					when_then,
@@ -2441,6 +2461,35 @@ fn evaluate_case(
 		acc = arrow::compute::kernels::zip::zip(mask, &result.as_ref(), &acc.as_ref())?;
 	}
 	Ok(acc)
+}
+
+/// ADR 570: one compiled program serves both spellings — compiled once per
+/// batch from the bind-validated pattern, matched per row with the
+/// non-backtracking state-set simulation, negation applied to the boolean.
+fn evaluate_similar_to(
+	expr_arr: &ArrayRef,
+	pattern: &str,
+	escape: Option<char>,
+	negated: bool,
+) -> Result<ArrayRef, ExecutionError> {
+	let Some(values) = expr_arr.as_any().downcast_ref::<StringArray>() else {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"SIMILAR TO expects Utf8 input, got {:?}",
+				expr_arr.data_type()
+			),
+		});
+	};
+	let program = crate::similar_to::compile_similar_to(pattern, escape).map_err(|message| {
+		ExecutionError::InvalidExpression {
+			message: format!("internal: bind-validated SIMILAR TO pattern failed: {message}"),
+		}
+	})?;
+	let result = values
+		.iter()
+		.map(|value| value.map(|value| program.matches(value) != negated))
+		.collect::<arrow::array::BooleanArray>();
+	Ok(Arc::new(result) as ArrayRef)
 }
 
 fn evaluate_like(

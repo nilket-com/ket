@@ -6948,7 +6948,17 @@ impl SqlPlanner {
 			} => self.lower_case(operand.as_deref(), conditions, else_result.as_deref()),
 			SqlExpr::InSubquery { .. } => Err(unsupported("IN subquery is not supported")),
 			SqlExpr::InUnnest { .. } => Err(unsupported("IN UNNEST is not supported")),
-			SqlExpr::SimilarTo { .. } => Err(unsupported("SIMILAR TO is not supported")),
+			SqlExpr::SimilarTo {
+				negated,
+				expr,
+				pattern,
+				escape_char,
+			} => self.lower_similar_to(
+				expr,
+				pattern,
+				*negated,
+				escape_char.as_ref().map(|v| &v.value),
+			),
 			SqlExpr::RLike { .. } => Err(unsupported("RLIKE is not supported")),
 			SqlExpr::Convert {
 				is_try,
@@ -7494,6 +7504,44 @@ impl SqlPlanner {
 		})
 	}
 
+	/// ADR 570: the pattern and the escape are plan-time literals; the binder
+	/// compiles the pattern, so this only shapes the node.
+	fn lower_similar_to(
+		&self,
+		expr: &SqlExpr,
+		pattern: &SqlExpr,
+		negated: bool,
+		escape_char: Option<&Value>,
+	) -> Result<Expr, FrontendError> {
+		if expr_is_null_literal(pattern) {
+			return Err(unsupported("NULL SIMILAR TO patterns are not supported"));
+		}
+		let Some(Value::SingleQuotedString(pattern)) = stripped_sql_value(pattern) else {
+			return Err(unsupported("SIMILAR TO pattern must be a string literal"));
+		};
+		let escape = match escape_char {
+			None => None,
+			Some(Value::SingleQuotedString(escape)) => {
+				let mut chars = escape.chars();
+				match (chars.next(), chars.next()) {
+					(Some(escape), None) => Some(escape),
+					_ => {
+						return Err(unsupported("SIMILAR TO ESCAPE must be a single character"));
+					}
+				}
+			}
+			Some(_) => {
+				return Err(unsupported("SIMILAR TO ESCAPE must be a single character"));
+			}
+		};
+		Ok(Expr::SimilarTo {
+			expr: Box::new(self.lower_expr(expr)?),
+			pattern: pattern.clone(),
+			escape,
+			negated,
+		})
+	}
+
 	fn lower_in_list(
 		&self,
 		expr: &SqlExpr,
@@ -7751,7 +7799,8 @@ fn validate_hidden_sort_key_refs(
 		Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::Like { expr: inner, .. } => validate_hidden_sort_key_refs(inner, visible_names),
+		| Expr::Like { expr: inner, .. }
+		| Expr::SimilarTo { expr: inner, .. } => validate_hidden_sort_key_refs(inner, visible_names),
 		Expr::InList { expr, list, .. } => {
 			validate_hidden_sort_key_refs(expr, visible_names)?;
 			for item in list {
@@ -8621,6 +8670,18 @@ pub(crate) fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 			negated.hash(state);
 			case_insensitive.hash(state);
 		}
+		Expr::SimilarTo {
+			expr,
+			pattern,
+			escape,
+			negated,
+		} => {
+			34u8.hash(state);
+			hash_expr_structural(expr, state);
+			pattern.hash(state);
+			escape.hash(state);
+			negated.hash(state);
+		}
 		Expr::LogicalAscription { expr, logical_type } => {
 			22u8.hash(state);
 			logical_type.hash(state);
@@ -8785,6 +8846,25 @@ pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 			left_pattern == right_pattern
 				&& left_negated == right_negated
 				&& left_case_insensitive == right_case_insensitive
+				&& expr_structural_eq(left_expr, right_expr)
+		}
+		(
+			Expr::SimilarTo {
+				expr: left_expr,
+				pattern: left_pattern,
+				escape: left_escape,
+				negated: left_negated,
+			},
+			Expr::SimilarTo {
+				expr: right_expr,
+				pattern: right_pattern,
+				escape: right_escape,
+				negated: right_negated,
+			},
+		) => {
+			left_pattern == right_pattern
+				&& left_escape == right_escape
+				&& left_negated == right_negated
 				&& expr_structural_eq(left_expr, right_expr)
 		}
 		(
@@ -9142,7 +9222,8 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::Like { expr: inner, .. } => expr_contains_qualified_column(inner),
+		| Expr::Like { expr: inner, .. }
+		| Expr::SimilarTo { expr: inner, .. } => expr_contains_qualified_column(inner),
 		Expr::InList { expr, list, .. } => {
 			expr_contains_qualified_column(expr) || list.iter().any(expr_contains_qualified_column)
 		}
@@ -10159,6 +10240,17 @@ pub(crate) fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 			pattern: pattern.clone(),
 			negated: *negated,
 			case_insensitive: *case_insensitive,
+		},
+		Expr::SimilarTo {
+			expr,
+			pattern,
+			escape,
+			negated,
+		} => Expr::SimilarTo {
+			expr: Box::new(canonical_aggregate_signature_expr(expr)),
+			pattern: pattern.clone(),
+			escape: *escape,
+			negated: *negated,
 		},
 		Expr::Case {
 			when_then,
@@ -12319,7 +12411,9 @@ mod tests {
 						.iter()
 						.any(|expr| expr_references(expr, qualifier, name))
 			}
-			Expr::Like { expr, .. } => expr_references(expr, qualifier, name),
+			Expr::Like { expr, .. } | Expr::SimilarTo { expr, .. } => {
+				expr_references(expr, qualifier, name)
+			}
 			Expr::ScalarFunction { args, .. } => {
 				args.iter().any(|arg| expr_references(arg, qualifier, name))
 			}

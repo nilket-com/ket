@@ -2119,6 +2119,15 @@ pub(super) fn clone_bound_subgraph(
 			let expr = clone_bound_subgraph(source, *expr, builder, remap)?;
 			builder.append_like(expr, pattern.clone(), *negated, *case_insensitive)
 		}
+		BoundExprNode::SimilarTo {
+			expr,
+			pattern,
+			escape,
+			negated,
+		} => {
+			let expr = clone_bound_subgraph(source, *expr, builder, remap)?;
+			builder.append_similar_to(expr, pattern.clone(), *escape, *negated)
+		}
 		BoundExprNode::Case {
 			when_then,
 			else_input,
@@ -2367,7 +2376,8 @@ pub(super) fn bound_node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		BoundExprNode::Cast { input, .. }
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
-		| BoundExprNode::Like { expr: input, .. } => vec![*input],
+		| BoundExprNode::Like { expr: input, .. }
+		| BoundExprNode::SimilarTo { expr: input, .. } => vec![*input],
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {
 			let mut children = Vec::with_capacity(list.len() + 1);

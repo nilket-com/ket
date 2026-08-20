@@ -5091,7 +5091,8 @@ fn collect_program_node_columns(
 		Some(BoundExprNode::Cast { input, .. })
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
-		| Some(BoundExprNode::Like { expr: input, .. }) => {
+		| Some(BoundExprNode::Like { expr: input, .. })
+		| Some(BoundExprNode::SimilarTo { expr: input, .. }) => {
 			collect_program_node_columns(program, *input, columns);
 		}
 		Some(BoundExprNode::Binary { left, right, .. }) => {
@@ -5272,6 +5273,12 @@ fn bind_expr_into_program(
 			*negated,
 			*case_insensitive,
 		),
+		Expr::SimilarTo {
+			expr,
+			pattern,
+			escape,
+			negated,
+		} => bind_similar_to(builder, input_schema, ctx, expr, pattern, *escape, *negated),
 		Expr::Case {
 			when_then,
 			else_expr,
@@ -6026,6 +6033,35 @@ fn bind_like(
 		});
 	}
 	Ok(builder.append_like(expr, pattern.to_string(), negated, case_insensitive))
+}
+
+/// ADR 570: the pattern compiles here, so a malformed one fails the statement
+/// once, before execution; the executor recompiles the already-validated text.
+fn bind_similar_to(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	expr: &Expr,
+	pattern: &str,
+	escape: Option<char>,
+	negated: bool,
+) -> Result<BoundExprId, BindingError> {
+	let expr = bind_expr_into_program(builder, expr, input_schema, ctx)?;
+	let expr_type = builder
+		.node_type(expr)
+		.cloned()
+		.expect("builder returns typed SIMILAR TO input");
+	if expr_type != DataType::Utf8 {
+		return Err(BindingError::TypeMismatch {
+			message: format!("SIMILAR TO expects Utf8 input, got {expr_type:?}"),
+		});
+	}
+	crate::similar_to::compile_similar_to(pattern, escape).map_err(|message| {
+		BindingError::UnsupportedExpression {
+			message: format!("SIMILAR TO pattern error: {message}"),
+		}
+	})?;
+	Ok(builder.append_similar_to(expr, pattern.to_string(), escape, negated))
 }
 
 fn coerce_literal_value(

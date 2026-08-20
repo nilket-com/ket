@@ -2012,7 +2012,8 @@ fn guard_filter_pushdown_safe(expr: &Expr) -> bool {
 		Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Not(inner)
-		| Expr::Like { expr: inner, .. } => guard_filter_pushdown_safe(inner),
+		| Expr::Like { expr: inner, .. }
+		| Expr::SimilarTo { expr: inner, .. } => guard_filter_pushdown_safe(inner),
 		Expr::Eq(left, right)
 		| Expr::Neq(left, right)
 		| Expr::Lt(left, right)
@@ -2294,6 +2295,17 @@ where
 			pattern: pattern.clone(),
 			negated: *negated,
 			case_insensitive: *case_insensitive,
+		},
+		Expr::SimilarTo {
+			expr,
+			pattern,
+			escape,
+			negated,
+		} => Expr::SimilarTo {
+			expr: Box::new(child!(expr)),
+			pattern: pattern.clone(),
+			escape: *escape,
+			negated: *negated,
 		},
 		Expr::Case {
 			when_then,
@@ -2598,7 +2610,7 @@ fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> boo
 			expr_any_column(expr, predicate)
 				|| list.iter().any(|item| expr_any_column(item, predicate))
 		}
-		Expr::Like { expr, .. } => expr_any_column(expr, predicate),
+		Expr::Like { expr, .. } | Expr::SimilarTo { expr, .. } => expr_any_column(expr, predicate),
 		Expr::ScalarFunction { args, .. } => args.iter().any(|arg| expr_any_column(arg, predicate)),
 		Expr::Case {
 			when_then,
@@ -2662,7 +2674,9 @@ fn expr_column_resolution_in_scope(expr: &Expr, scope: &RelationScope) -> (bool,
 			}
 			result
 		}
-		Expr::Like { expr, .. } => expr_column_resolution_in_scope(expr, scope),
+		Expr::Like { expr, .. } | Expr::SimilarTo { expr, .. } => {
+			expr_column_resolution_in_scope(expr, scope)
+		}
 		Expr::ScalarFunction { args, .. } => {
 			let mut result = (false, true);
 			for arg in args {
@@ -2780,6 +2794,7 @@ fn null_rejecting_sides(
 		| Expr::Not(_)
 		| Expr::InList { .. }
 		| Expr::Like { .. }
+		| Expr::SimilarTo { .. }
 		| Expr::Case { .. }
 		| Expr::IsNull(_) => NullRejectedSides::default(),
 		Expr::ScalarFunction { .. } => NullRejectedSides::default(),
@@ -2968,7 +2983,9 @@ fn conjunct_column_sides(
 			}
 			sides
 		}
-		Expr::Like { expr, .. } => conjunct_column_sides(expr, left_scope, right_scope),
+		Expr::Like { expr, .. } | Expr::SimilarTo { expr, .. } => {
+			conjunct_column_sides(expr, left_scope, right_scope)
+		}
 		Expr::ScalarFunction { args, .. } => {
 			let mut sides = ConjunctColumnSides::default();
 			for arg in args {

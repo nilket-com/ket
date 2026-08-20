@@ -23,7 +23,8 @@ pub(super) fn reject_storage_synthetic_returning_reference(
 		| Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
-		| Expr::Like { expr: inner, .. } => reject_storage_synthetic_returning_reference(inner),
+		| Expr::Like { expr: inner, .. }
+		| Expr::SimilarTo { expr: inner, .. } => reject_storage_synthetic_returning_reference(inner),
 		Expr::ScalarFunction { args, .. } => {
 			for arg in args {
 				reject_storage_synthetic_returning_reference(arg)?;
@@ -99,7 +100,8 @@ pub(super) fn collect_logical_cast_names(
 		| Expr::Not(expr)
 		| Expr::IsNull(expr)
 		| Expr::IsNotNull(expr)
-		| Expr::Like { expr, .. } => collect_logical_cast_names(expr, names),
+		| Expr::Like { expr, .. }
+		| Expr::SimilarTo { expr, .. } => collect_logical_cast_names(expr, names),
 		Expr::ScalarFunction { args, .. } => {
 			for arg in args {
 				collect_logical_cast_names(arg, names)?;

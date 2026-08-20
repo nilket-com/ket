@@ -3,6 +3,7 @@ mod aggregate_kernel;
 #[allow(dead_code, reason = "KET-0006 lands before that companion")]
 pub(crate) mod canonical_expression;
 mod cast_support;
+mod similar_to;
 
 pub mod audit;
 pub mod binder;

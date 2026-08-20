@@ -10455,3 +10455,110 @@ async fn adr569_sql_and_rune_share_the_seeded_identifier() {
 		"one registry identifier, one result"
 	);
 }
+
+#[tokio::test]
+async fn adr570_similar_to_is_anchored_and_null_propagating() {
+	// region = [east, west, east, east, west, NULL].
+	let rows = run_logical(&plan_sql(
+		"SELECT id, region SIMILAR TO '(east|west)', region SIMILAR TO 'eas', \
+		 region SIMILAR TO '%as%', region NOT SIMILAR TO 'e%', \
+		 '100%' SIMILAR TO '100!%' ESCAPE '!', 'x' SIMILAR TO '[a-z]{1}' FROM sales",
+	))
+	.await;
+	let column = |idx: usize| {
+		rows[0]
+			.column(idx)
+			.as_any()
+			.downcast_ref::<arrow::array::BooleanArray>()
+			.expect("boolean output")
+	};
+	let alternation = column(1);
+	for row in 0..5 {
+		assert!(
+			alternation.value(row),
+			"row {row} is east or west, whole-value"
+		);
+	}
+	assert!(alternation.is_null(5), "NULL propagates");
+	let prefix = column(2);
+	for row in 0..5 {
+		assert!(
+			!prefix.value(row),
+			"a prefix alone must not match: anchored"
+		);
+	}
+	let contains = column(3);
+	assert!(contains.value(0), "east contains as");
+	assert!(!contains.value(1), "west does not");
+	let negated = column(4);
+	assert!(!negated.value(0), "east matches e%, so NOT is false");
+	assert!(negated.value(1), "west fails e%, so NOT is true");
+	assert!(negated.is_null(5), "NOT SIMILAR TO propagates NULL too");
+	assert!(column(5).value(0), "ESCAPE makes % literal");
+	assert!(column(6).value(0), "classes and bounds reach SQL");
+}
+
+#[tokio::test]
+async fn adr570_similar_to_rejects_what_the_vocabulary_excludes() {
+	let (catalog, _) = fixture();
+	let named_class = bind(
+		&plan_sql("SELECT region SIMILAR TO '[[:alpha:]]%' FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("POSIX named classes are refused");
+	assert!(
+		named_class.to_string().contains("POSIX named classes"),
+		"got {named_class}"
+	);
+
+	let over_cap = bind(
+		&plan_sql("SELECT region SIMILAR TO 'a{5000}' FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("over-cap expansion is refused at bind");
+	assert!(over_cap.to_string().contains("state cap"), "got {over_cap}");
+
+	let non_literal = SqlPlanner::new()
+		.plan("SELECT region SIMILAR TO status FROM sales")
+		.expect_err("a non-literal pattern is refused at plan");
+	assert!(
+		non_literal.to_string().contains("string literal"),
+		"got {non_literal}"
+	);
+	let bad_escape = SqlPlanner::new()
+		.plan("SELECT region SIMILAR TO 'a%' ESCAPE 'ab' FROM sales")
+		.expect_err("a multi-character escape is refused");
+	assert!(
+		bad_escape.to_string().contains("single character"),
+		"got {bad_escape}"
+	);
+}
+
+#[tokio::test]
+async fn adr570_rune_similar_to_matches_sql() {
+	let sql = run_logical(&plan_sql(
+		"SELECT id, region SIMILAR TO '(e|w)%t', region NOT SIMILAR TO '%st' FROM sales",
+	))
+	.await;
+	let rune = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project([col("id"), col("region").similar_to("(e|w)%t"), col("region").not_similar_to("%st")])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql, SortPolicy::FullRowLex).expect("SQL digest"),
+		canonical_arrow_ipc_digest(&rune, SortPolicy::FullRowLex).expect("Rune digest"),
+		"one node, one result"
+	);
+}

@@ -120,6 +120,14 @@ pub enum BoundExprNode {
 		args: Vec<BoundExprId>,
 		parameter: ScalarFunctionParameter,
 	},
+	/// ADR 570: `SIMILAR TO`. The pattern is bind-validated; both spellings
+	/// evaluate one compiled program with the negation applied to its boolean.
+	SimilarTo {
+		expr: BoundExprId,
+		pattern: String,
+		escape: Option<char>,
+		negated: bool,
+	},
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -619,6 +627,25 @@ impl BoundExprProgramBuilder {
 		)
 	}
 
+	pub fn append_similar_to(
+		&mut self,
+		expr: BoundExprId,
+		pattern: String,
+		escape: Option<char>,
+		negated: bool,
+	) -> BoundExprId {
+		self.assert_existing_child(expr);
+		self.append_node(
+			BoundExprNode::SimilarTo {
+				expr,
+				pattern,
+				escape,
+				negated,
+			},
+			DataType::Boolean,
+		)
+	}
+
 	pub fn append_case(
 		&mut self,
 		when_then: Vec<(BoundExprId, BoundExprId)>,
@@ -854,7 +881,9 @@ impl BoundExprProgram {
 					.any(|nullable| nullable);
 				Some(expr_nullable || list_nullable)
 			}
-			BoundExprNode::Like { expr, .. } => self.node_nullable(*expr),
+			BoundExprNode::Like { expr, .. } | BoundExprNode::SimilarTo { expr, .. } => {
+				self.node_nullable(*expr)
+			}
 			BoundExprNode::Case {
 				when_then,
 				else_input,
@@ -1017,6 +1046,19 @@ impl BoundExprProgram {
 				};
 				format!("{} {op} {pattern:?}", self.pretty_node(*expr))
 			}
+			BoundExprNode::SimilarTo {
+				expr,
+				pattern,
+				negated,
+				..
+			} => {
+				let op = if *negated {
+					"NOT SIMILAR TO"
+				} else {
+					"SIMILAR TO"
+				};
+				format!("{} {op} {pattern:?}", self.pretty_node(*expr))
+			}
 			BoundExprNode::Case {
 				when_then,
 				else_input,
@@ -1094,7 +1136,8 @@ fn node_children(node: &BoundExprNode) -> Vec<BoundExprId> {
 		BoundExprNode::Cast { input, .. }
 		| BoundExprNode::TryCast { input, .. }
 		| BoundExprNode::Unary { input, .. }
-		| BoundExprNode::Like { expr: input, .. } => vec![*input],
+		| BoundExprNode::Like { expr: input, .. }
+		| BoundExprNode::SimilarTo { expr: input, .. } => vec![*input],
 		BoundExprNode::ScalarFunction { args, .. } => args.clone(),
 		BoundExprNode::Binary { left, right, .. } => vec![*left, *right],
 		BoundExprNode::InList { expr, list, .. } => {

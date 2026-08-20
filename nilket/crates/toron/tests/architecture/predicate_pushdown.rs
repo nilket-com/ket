@@ -556,8 +556,9 @@ pub(crate) fn adr074_similar_rlike_case_subquery_in_remain_unsupported() {
 	let planner =
 		std::fs::read_to_string(manifest_dir().join("src/sql_planner.rs")).expect("read planner");
 
+	// ADR 570 admitted SIMILAR TO; it left this reject list through its own
+	// decision, which is how a marker is allowed to leave.
 	for marker in [
-		"SqlExpr::SimilarTo { .. }",
 		"SqlExpr::RLike { .. }",
 		"SqlExpr::InSubquery { .. }",
 		"SqlExpr::InUnnest { .. }",

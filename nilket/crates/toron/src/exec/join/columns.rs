@@ -24,7 +24,8 @@ fn collect_program_node_column_ordinals(
 		Some(BoundExprNode::Cast { input, .. })
 		| Some(BoundExprNode::TryCast { input, .. })
 		| Some(BoundExprNode::Unary { input, .. })
-		| Some(BoundExprNode::Like { expr: input, .. }) => {
+		| Some(BoundExprNode::Like { expr: input, .. })
+		| Some(BoundExprNode::SimilarTo { expr: input, .. }) => {
 			collect_program_node_column_ordinals(program, *input, columns);
 		}
 		Some(BoundExprNode::Binary { left, right, .. }) => {
