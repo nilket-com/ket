@@ -3838,9 +3838,13 @@ impl SqlPlanner {
 			.as_ref()
 			.is_some_and(expr_contains_subquery);
 		let mut where_scalar_pulled = false;
+		// ADR 571: projection-position value scalars assemble after the WHERE,
+		// so their per-key demand means the rows that survive it.
+		let mut post_filter_scalars: Vec<PulledScalar> = Vec::new();
 		if pull_projection || pull_where {
 			let outer_qualifiers = plan_qualifiers(&plan);
 			let mut collected = Vec::new();
+			let mut projection_scalar_count = 0usize;
 			if pull_projection {
 				owned_projection = Vec::with_capacity(projection.len());
 				for projection_item in projection {
@@ -3852,6 +3856,7 @@ impl SqlPlanner {
 					)?);
 				}
 				projection = &owned_projection;
+				projection_scalar_count = collected.len();
 			}
 			if pull_where {
 				let before = collected.len();
@@ -3868,7 +3873,15 @@ impl SqlPlanner {
 				// IN are not `SqlExpr::Subquery`, so they collect nothing here and never set this.
 				where_scalar_pulled = collected.len() > before;
 			}
-			plan = self.join_scalar_subplans(plan, collected)?;
+			let mut pre_filter = Vec::new();
+			for (index, scalar) in collected.into_iter().enumerate() {
+				if index < projection_scalar_count && scalar.assembles_after_filter() {
+					post_filter_scalars.push(scalar);
+				} else {
+					pre_filter.push(scalar);
+				}
+			}
+			plan = self.join_scalar_subplans(plan, pre_filter)?;
 		}
 
 		// 2. Handle WHERE (Filter / correlated EXISTS decorrelation). `effective_selection` is the WHERE
@@ -3880,6 +3893,9 @@ impl SqlPlanner {
 			}
 		} else if let Some(selection) = &effective_selection {
 			plan = self.lower_where(plan, selection, cte)?;
+		}
+		if !post_filter_scalars.is_empty() {
+			plan = self.join_scalar_subplans(plan, post_filter_scalars)?;
 		}
 
 		let mut owned_having: Option<SqlExpr> = None;
@@ -5194,6 +5210,12 @@ impl SqlPlanner {
 	) -> Result<LoweredAggregateCall, FrontendError> {
 		let name = aggregate_function_name(&function.name)
 			.ok_or_else(|| unsupported("unsupported aggregate function"))?;
+		// ADR 571: double-underscore names are the engine's reserved namespace.
+		if name.starts_with("__") {
+			return Err(unsupported(format!(
+				"{name} is reserved for the engine and cannot be called from SQL"
+			)));
+		}
 		let AggregateFunctionArgs {
 			args,
 			distinct,
@@ -6215,6 +6237,23 @@ impl SqlPlanner {
 		match expr {
 			SqlExpr::Subquery(query) => {
 				let alias = format!("__scalar_{}", collected.len());
+				// ADR 571: a single-column projection with no aggregate call is
+				// the value form — the at-most-one kernel enforces the scalar
+				// contract at runtime, so it routes before the aggregate-shape
+				// validator whose message would otherwise refuse it.
+				if let SetExpr::Select(select) = query.body.as_ref()
+					&& scalar_subquery_projection_expr(select)
+						.is_ok_and(|expr| !expr_contains_aggregate_call(expr))
+				{
+					return self.pull_up_value_scalar_subquery(
+						query,
+						select,
+						&alias,
+						collected,
+						outer_qualifiers,
+						cte,
+					);
+				}
 				validate_aggregate_scalar_subquery_shape(query, outer_qualifiers)?;
 				let SetExpr::Select(select) = query.body.as_ref() else {
 					// validate_aggregate_scalar_subquery_shape guarantees a Select body.
@@ -6537,6 +6576,126 @@ impl SqlPlanner {
 
 	/// ADR 257: rewrite a SELECT projection item, pulling scalar subqueries in its expression up into
 	/// `collected` (see `pull_up_scalar_subqueries`). The item's alias (if any) is preserved.
+	/// ADR 571: a value scalar subquery — no aggregate in its projection — is
+	/// wrapped in the internal at-most-one kernel, which is what enforces
+	/// zero-rows-NULL / one-row-value / raise-on-more at runtime. The
+	/// uncorrelated form wraps the **fully lowered** subquery, so `ORDER BY …
+	/// LIMIT 1` inside it is valid and satisfies the contract by bounding;
+	/// the correlated form reuses the ADR 260 keyed decorrelation, whose
+	/// per-group accumulation is what makes the assertion per correlation key.
+	fn pull_up_value_scalar_subquery(
+		&self,
+		query: &Query,
+		select: &Select,
+		alias: &str,
+		collected: &mut Vec<PulledScalar>,
+		outer_qualifiers: &[TableRef],
+		cte: &CteScope,
+	) -> Result<SqlExpr, FrontendError> {
+		let projection_expr = scalar_subquery_projection_expr(select)?;
+		let inner_qualifiers = scalar_subquery_inner_qualifiers(select);
+		if sql_expr_references_outer_qualifier(projection_expr, outer_qualifiers, &inner_qualifiers)
+		{
+			return Err(unsupported(
+				"correlated scalar subqueries are not supported",
+			));
+		}
+		let where_is_correlated = select.selection.as_ref().is_some_and(|selection| {
+			sql_expr_references_outer_qualifier(selection, outer_qualifiers, &inner_qualifiers)
+		});
+		if !where_is_correlated {
+			let subplan = self.lower_query_scoped(query, cte)?;
+			// Sort/Take wrappers (ORDER BY … LIMIT) do not change output names.
+			let mut names_source: &LogicalPlan = &subplan;
+			loop {
+				match names_source {
+					LogicalPlan::Sort { input, .. }
+					| LogicalPlan::Take { input, .. }
+					| LogicalPlan::Exchange { input, .. }
+					| LogicalPlan::Distinct { input } => names_source = input,
+					_ => break,
+				}
+			}
+			let names = visible_output_names(names_source, None)
+				.ok_or_else(|| unsupported("a scalar subquery must project one visible column"))?;
+			let [name] = names.as_slice() else {
+				return Err(unsupported(
+					"a scalar subquery must project exactly one column",
+				));
+			};
+			let rows_alias = TableRef::new(format!("{alias}_rows"));
+			let value = Expr::qualified_column(rows_alias.clone(), name.clone());
+			let aggregate = LogicalPlan::Aggregate {
+				input: Box::new(LogicalPlan::Alias {
+					input: Box::new(subplan),
+					alias: rows_alias,
+					columns: names.clone(),
+				}),
+				group_expr: vec![],
+				aggr_expr: vec![(AggregateFunction::ScalarSubqueryValue, vec![value])],
+			};
+			collected.push(PulledScalar::Resolved {
+				plan: LogicalPlan::Alias {
+					input: Box::new(aggregate),
+					alias: TableRef::new(alias.to_string()),
+					columns: vec![SCALAR_SUBQUERY_COLUMN.to_string()],
+				},
+				on: Vec::new(),
+			});
+			return Ok(scalar_value_reference(alias));
+		}
+		// Correlated: FROM and WHERE only — the keyed decorrelation has no
+		// per-key ordering machinery, so ORDER BY/LIMIT stay a deferral here.
+		validate_exists_query_shape(query).map_err(|_| {
+			unsupported("a correlated scalar subquery supports FROM and WHERE only")
+		})?;
+		if !group_by_is_empty(&select.group_by)
+			|| select.having.is_some()
+			|| select.distinct.is_some()
+		{
+			return Err(unsupported(
+				"a correlated scalar subquery supports FROM and WHERE only",
+			));
+		}
+		validate_single_source_scalar_subquery(select)?;
+		let mut inner_plan = self.lower_table_factor(&select.from[0].relation, cte)?;
+		let mut correlation_pairs: Vec<(Expr, Expr)> = Vec::new();
+		let mut inner_residuals: Vec<Expr> = Vec::new();
+		if let Some(selection) = &select.selection {
+			for conjunct in split_top_level_and(selection) {
+				match self.classify_exists_conjunct(
+					conjunct,
+					outer_qualifiers,
+					&inner_qualifiers,
+				)? {
+					ExistsConjunct::CorrelatedPair { outer, inner } => {
+						correlation_pairs.push((outer, inner))
+					}
+					ExistsConjunct::InnerResidual(predicate) => inner_residuals.push(predicate),
+					ExistsConjunct::CorrelatedResidual(_) => {
+						return Err(unsupported(
+							"unsupported correlated scalar subquery predicate",
+						));
+					}
+				}
+			}
+		}
+		if let Some(predicate) = combine_and_exprs(inner_residuals) {
+			inner_plan = LogicalPlan::Filter {
+				input: Box::new(inner_plan),
+				predicate,
+			};
+		}
+		let value = self.lower_expr(projection_expr)?;
+		collected.push(PulledScalar::ValueScalar {
+			inner: inner_plan,
+			value,
+			correlation_pairs,
+			alias: alias.to_string(),
+		});
+		Ok(scalar_value_reference(alias))
+	}
+
 	fn rewrite_select_item_scalar_subqueries(
 		&self,
 		item: &SelectItem,
@@ -6754,6 +6913,74 @@ impl SqlPlanner {
 							None,
 						)?
 					}
+				}
+				// ADR 571: the correlated value scalar assembles here, where
+				// the outer plan is in hand — the inner is first restricted to
+				// the keys the outer actually demands (a LeftSemi against the
+				// outer), so the at-most-one contract raises per demanded key
+				// and an undemanded doubled key cannot raise.
+				PulledScalar::ValueScalar {
+					inner,
+					value,
+					correlation_pairs,
+					alias,
+				} => {
+					let demanded_keys: Vec<(Expr, Expr)> = correlation_pairs
+						.iter()
+						.map(|(outer, inner)| (inner.clone(), outer.clone()))
+						.collect();
+					let demanded = build_join_plan(
+						inner,
+						plan.clone(),
+						JoinKind::LeftSemi,
+						demanded_keys,
+						JoinStrategy::HashPartitioned,
+						JoinStrategyPinSource::Direct,
+						None,
+					)?;
+					let group_expr: Vec<Expr> = correlation_pairs
+						.iter()
+						.map(|(_, inner)| inner.clone())
+						.collect();
+					let aggregate = LogicalPlan::Aggregate {
+						input: Box::new(LogicalPlan::Exchange {
+							input: Box::new(demanded),
+							partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
+							key: group_expr.clone(),
+						}),
+						group_expr,
+						aggr_expr: vec![(AggregateFunction::ScalarSubqueryValue, vec![value])],
+					};
+					let mut columns: Vec<String> = (0..correlation_pairs.len())
+						.map(|index| format!("key_{index}"))
+						.collect();
+					columns.push(SCALAR_SUBQUERY_COLUMN.to_string());
+					let on: Vec<(Expr, Expr)> = correlation_pairs
+						.into_iter()
+						.enumerate()
+						.map(|(index, (outer, _))| {
+							(
+								outer,
+								Expr::qualified_column(
+									TableRef::new(alias.clone()),
+									format!("key_{index}"),
+								),
+							)
+						})
+						.collect();
+					build_join_plan(
+						plan,
+						LogicalPlan::Alias {
+							input: Box::new(aggregate),
+							alias: TableRef::new(alias),
+							columns,
+						},
+						JoinKind::LeftOuter,
+						on,
+						JoinStrategy::HashPartitioned,
+						JoinStrategyPinSource::Direct,
+						None,
+					)?
 				}
 				// ADR 282: an unqualified correlated scalar — hand it to the binder, which resolves the
 				// correlation by ownership and builds the grouped-aggregate + LeftOuter recombine.
@@ -10897,12 +11124,31 @@ struct HavingScalar {
 /// (`__scalar_N.value`), plus the keys that recombine it. `on` empty = ADR 257's uncorrelated keyless
 /// `Cross` over a global aggregate; `on` non-empty = ADR 260's correlated `LeftOuter` over a grouped
 /// aggregate keyed on the correlation.
+impl PulledScalar {
+	/// ADR 571: projection-position value scalars assemble after the WHERE
+	/// so their per-key demand means the surviving rows.
+	fn assembles_after_filter(&self) -> bool {
+		matches!(self, Self::ValueScalar { .. })
+	}
+}
+
 enum PulledScalar {
 	/// ADR 257/260: a frontend-classified scalar — its aliased subplan + the correlation `on` keys
 	/// (empty = ADR 257's uncorrelated keyless `Cross`).
 	Resolved {
 		plan: LogicalPlan,
 		on: Vec<(Expr, Expr)>,
+	},
+	/// ADR 571: a correlated value scalar. Carried in pieces because assembly
+	/// needs the outer plan — the inner is restricted to the outer's demanded
+	/// keys before the at-most-one aggregation, which is what makes the
+	/// contract per demanded key.
+	ValueScalar {
+		inner: LogicalPlan,
+		value: Expr,
+		/// `(outer, inner)` equi-correlation pairs.
+		correlation_pairs: Vec<(Expr, Expr)>,
+		alias: String,
 	},
 	/// ADR 282: an unqualified correlated scalar the catalog-free frontend can't classify — handed to the
 	/// binder via [`LogicalPlan::DeferredScalarSubquery`]. The wrapper (`0.2 *`) already rides the rewritten

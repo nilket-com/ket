@@ -138,7 +138,9 @@ pub(crate) fn adr257_non_aggregate_and_correlated_scalar_stay_deferred() {
 	}
 	let behavior = source("tests/group_by_test.rs");
 	assert!(
-		behavior.contains("non_aggregate_and_correlated_scalar_subqueries_stay_rejected")
+		// ADR 571 admitted the non-aggregate value form; the remaining deferred
+		// boundary is aggregate-argument correlation, and its gate renamed with it.
+		behavior.contains("correlated_aggregate_argument_scalar_subqueries_stay_rejected")
 			&& behavior.contains("having_scalar_deferred_shapes_stay_rejected"),
 		"the deferred-boundary behavior gates must exist"
 	);

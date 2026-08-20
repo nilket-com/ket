@@ -8,8 +8,9 @@ const EXEC_ROOT_AFTER_AGGREGATE_LINE_LIMIT: usize = 10_000;
 // ADR 560 briefly raised this to 7,580 to hold hand-written aggregate variant
 // lists; ADR 561's registry removed them and relocated the window state init
 // beside its constructors, so the ratchet returns to its pre-560 value.
-// ADR 569 adds the Range synthesis arms (bound + legacy executor).
-const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_566;
+// ADR 569 adds the Range synthesis arms (bound + legacy executor); ADR 571
+// the scalar-subquery kernel's unbound reject arms.
+const EXEC_ROOT_AFTER_EXPR_LINE_LIMIT: usize = 7_570;
 const EXEC_JOIN_ROOT_LINE_LIMIT: usize = 5_900;
 const EXEC_JOIN_ROOT_AFTER_STREAMING_LINE_LIMIT: usize = 3_825;
 

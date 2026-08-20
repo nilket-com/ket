@@ -607,17 +607,18 @@ fn aggregate_arg_and_non_aggregate_correlated_scalar_stay_rejected() {
 		"{err}"
 	);
 
-	// A non-aggregate correlated scalar needs a ≤1-row cardinality assert (a separate, deferred cut).
-	let err = SqlPlanner::new()
+	// ADR 571: the non-aggregate correlated scalar now lowers through the
+	// at-most-one contract kernel, with the inner LeftSemi-restricted to the
+	// outer's demanded keys.
+	let plan = SqlPlanner::new()
 		.plan(
 			"SELECT fact.pk FROM fact WHERE fact.pk > \
 			 (SELECT dim.score FROM dim WHERE dim.k = fact.k)",
 		)
-		.expect_err("non-aggregate correlated scalar should reject");
+		.expect("the correlated value form plans");
 	assert!(
-		err.to_string()
-			.contains("non-aggregate scalar subqueries are not supported"),
-		"{err}"
+		format!("{plan:?}").contains("ScalarSubqueryValue"),
+		"the value subquery must lower onto the contract kernel: {plan:?}"
 	);
 }
 

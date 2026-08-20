@@ -1391,6 +1391,29 @@ impl Executor {
 						}
 					}
 				}
+				AggregateFunction::ScalarSubqueryValue => {
+					let arr =
+						self.evaluate_bound_single_root(&call.args, batch, "scalar subquery")?;
+					let AggState::ScalarSubqueryValue { rows, value } = state else {
+						return Err(ExecutionError::InvalidExpression {
+							message: "scalar subquery reached the wrong accumulator".to_string(),
+						});
+					};
+					for row in 0..batch.num_rows() {
+						*rows += 1;
+						if *rows > 1 {
+							return Err(ExecutionError::Kernel {
+								message: "scalar subquery produced more than one row".to_string(),
+							});
+						}
+						*value = Some(super::scalar_value_from_array(
+							&arr,
+							row,
+							arr.data_type(),
+							"scalar subquery value",
+						)?);
+					}
+				}
 				AggregateFunction::Sum => {
 					let arr = self.evaluate_bound_single_root(&call.args, batch, "SUM arg")?;
 					// ADR 475: resolve the array type once, not once per row.
@@ -1885,6 +1908,18 @@ pub(in crate::exec) fn finalize_global_aggregate_state(
 					output_schema.field(results_cols.len()).data_type(),
 				)?);
 			}
+			AggregateFunction::ScalarSubqueryValue => {
+				let AggState::ScalarSubqueryValue { rows, value } = state else {
+					return Err(ExecutionError::InvalidExpression {
+						message: "scalar subquery reached the wrong accumulator".to_string(),
+					});
+				};
+				let output_type = output_schema.field(results_cols.len()).data_type().clone();
+				results_cols.push(match value {
+					Some(value) if *rows == 1 => super::expr::literal_array(value, 1)?,
+					_ => arrow::array::new_null_array(&output_type, 1),
+				});
+			}
 			AggregateFunction::VarPop
 			| AggregateFunction::VarSamp
 			| AggregateFunction::StddevPop
@@ -2001,6 +2036,7 @@ impl Executor {
 					| AggregateFunction::StddevSamp
 					| AggregateFunction::LinearRegress
 					| AggregateFunction::StringAgg(_)
+					| AggregateFunction::ScalarSubqueryValue
 					| AggregateFunction::ApproxQuantile(_) => Err(ExecutionError::NotImplemented {
 						feature: "grouped experimental aggregate",
 					}),
@@ -2071,6 +2107,11 @@ impl Executor {
 								if !array.is_null(row) {
 									*total += 1;
 								}
+							}
+							AggState::ScalarSubqueryValue { .. } => {
+								return Err(ExecutionError::NotImplemented {
+									feature: "unbound scalar-subquery aggregate",
+								});
 							}
 							AggState::SumInt { .. } | AggState::SumFloat { .. } => {
 								let value = match reader {
@@ -2144,6 +2185,11 @@ impl Executor {
 
 		for (agg_idx, (function, _)) in aggr_expr.iter().enumerate() {
 			match function {
+				AggregateFunction::ScalarSubqueryValue => {
+					return Err(ExecutionError::NotImplemented {
+						feature: "unbound scalar-subquery aggregate",
+					});
+				}
 				AggregateFunction::CountAll | AggregateFunction::Count => {
 					let values = entries
 						.iter()
@@ -2166,7 +2212,8 @@ impl Executor {
 							| AggState::AvgDecimal { .. }
 							| AggState::Quantile(_)
 							| AggState::Spread { .. }
-							| AggState::StringAgg(_) => 0,
+							| AggState::StringAgg(_)
+							| AggState::ScalarSubqueryValue { .. } => 0,
 						})
 						.collect::<Vec<_>>();
 					columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -2312,6 +2359,7 @@ impl Executor {
 				| AggregateFunction::Min
 				| AggregateFunction::Max
 				| AggregateFunction::Avg
+				| AggregateFunction::ScalarSubqueryValue
 				| AggregateFunction::VarPop
 				| AggregateFunction::VarSamp
 				| AggregateFunction::StddevPop
@@ -2403,6 +2451,21 @@ impl Executor {
 						AggState::StringAgg(string_state) => {
 							let keys = string_agg_keys[agg_idx].as_deref().unwrap_or(&[]);
 							string_agg_accumulate_row(string_state, array, keys, row)?;
+						}
+						AggState::ScalarSubqueryValue { rows, value } => {
+							*rows += 1;
+							if *rows > 1 {
+								return Err(ExecutionError::Kernel {
+									message: "scalar subquery produced more than one row"
+										.to_string(),
+								});
+							}
+							*value = Some(super::scalar_value_from_array(
+								array,
+								row,
+								array.data_type(),
+								"scalar subquery value",
+							)?);
 						}
 						AggState::Count(total) => {
 							if !array.is_null(row) {
@@ -2518,7 +2581,8 @@ impl Executor {
 								| AggState::AvgDecimal { .. }
 								| AggState::Quantile(_)
 								| AggState::Spread { .. }
-								| AggState::StringAgg(_) => 0,
+								| AggState::StringAgg(_)
+								| AggState::ScalarSubqueryValue { .. } => 0,
 							})
 							.collect::<Vec<_>>();
 						columns.push(Arc::new(Int64Array::from(values)) as ArrayRef);
@@ -2575,6 +2639,32 @@ impl Executor {
 							})
 							.collect::<Result<Vec<_>, ExecutionError>>()?;
 						columns.push(string_agg_column(values, &output_type)?);
+					}
+					AggregateFunction::ScalarSubqueryValue => {
+						let output_type = output_schema.field(columns.len()).data_type().clone();
+						let arrays = entries
+							.iter()
+							.map(|entry| match &entry.states[agg_idx] {
+								AggState::ScalarSubqueryValue {
+									rows,
+									value: Some(value),
+								} if *rows == 1 => super::expr::literal_array(value, 1),
+								AggState::ScalarSubqueryValue { .. } => {
+									Ok(arrow::array::new_null_array(&output_type, 1))
+								}
+								_ => Err(ExecutionError::InvalidExpression {
+									message: "scalar subquery reached the wrong accumulator"
+										.to_string(),
+								}),
+							})
+							.collect::<Result<Vec<_>, ExecutionError>>()?;
+						if arrays.is_empty() {
+							columns.push(arrow::array::new_empty_array(&output_type));
+						} else {
+							let refs: Vec<&dyn arrow::array::Array> =
+								arrays.iter().map(|array| array.as_ref()).collect();
+							columns.push(arrow::compute::concat(&refs)?);
+						}
 					}
 					AggregateFunction::LinearRegress => {
 						return Err(ExecutionError::NotImplemented {
@@ -2715,6 +2805,12 @@ pub(in crate::exec) enum AggState {
 	/// ADR 562: buffered ordered concatenation; boxed so the common numeric
 	/// states stay small.
 	StringAgg(Box<StringAggState>),
+	/// ADR 571: the at-most-one accumulator. `rows` distinguishes an empty
+	/// group from one row whose value is NULL; a second row raises.
+	ScalarSubqueryValue {
+		rows: u64,
+		value: Option<ScalarValue>,
+	},
 	SumInt {
 		total: i128,
 		seen: bool,
@@ -2804,6 +2900,9 @@ fn init_states(
 		.iter()
 		.zip(aggr_arrays.iter())
 		.map(|((function, _), array)| match function {
+			AggregateFunction::ScalarSubqueryValue => Err(ExecutionError::NotImplemented {
+				feature: "unbound scalar-subquery aggregate",
+			}),
 			AggregateFunction::CountAll | AggregateFunction::Count => Ok(AggState::Count(0)),
 			AggregateFunction::Sum => Ok(array
 				.as_ref()
@@ -2850,7 +2949,9 @@ fn legacy_aggregate_output_type(function: &AggregateFunction, input_type: &DataT
 			DataType::Float32 | DataType::Float64 => DataType::Float64,
 			_ => DataType::Int64,
 		},
-		AggregateFunction::Min | AggregateFunction::Max => input_type.clone(),
+		AggregateFunction::Min
+		| AggregateFunction::Max
+		| AggregateFunction::ScalarSubqueryValue => input_type.clone(),
 		// ADR 268: delegate to the kernel so AVG(Decimal) yields the widened Decimal type, not Float64.
 		AggregateFunction::Avg => {
 			aggregate_kernel::stable_output_data_type(function, Some(input_type))
@@ -2984,6 +3085,12 @@ fn init_bound_state_for_call(call: &BoundAggregateCall) -> Result<AggState, Exec
 		}),
 		aggregate_kernel::AggregateStateFamily::StringAgg => {
 			Ok(AggState::StringAgg(Box::default()))
+		}
+		aggregate_kernel::AggregateStateFamily::ScalarSubqueryValue => {
+			Ok(AggState::ScalarSubqueryValue {
+				rows: 0,
+				value: None,
+			})
 		}
 		aggregate_kernel::AggregateStateFamily::Sum => Ok(call
 			.args
@@ -3491,6 +3598,7 @@ pub(in crate::exec) fn add_sum_value(
 		| (AggState::AvgDecimal { .. }, _)
 		| (AggState::Spread { .. }, _)
 		| (AggState::StringAgg(_), _)
+		| (AggState::ScalarSubqueryValue { .. }, _)
 		| (AggState::Quantile(_), _) => Err(ExecutionError::InvalidExpression {
 			message: "SUM value reached non-SUM accumulator".to_string(),
 		}),
@@ -3564,6 +3672,7 @@ pub(in crate::exec) fn add_avg_value(
 		| (AggState::MaxDecimal128 { .. }, _)
 		| (AggState::Spread { .. }, _)
 		| (AggState::StringAgg(_), _)
+		| (AggState::ScalarSubqueryValue { .. }, _)
 		| (AggState::Quantile(_), _) => Err(ExecutionError::InvalidExpression {
 			message: "AVG value reached non-AVG accumulator".to_string(),
 		}),
@@ -3876,7 +3985,8 @@ fn sum_column_from_groups(
 					| AggState::AvgDecimal { .. }
 					| AggState::Quantile(_)
 					| AggState::Spread { .. }
-					| AggState::StringAgg(_) => Ok(None),
+					| AggState::StringAgg(_)
+					| AggState::ScalarSubqueryValue { .. } => Ok(None),
 				})
 				.collect::<Result<Vec<_>, _>>()?;
 			Ok(Arc::new(Int64Array::from(values)) as ArrayRef)
@@ -3903,7 +4013,8 @@ fn sum_column_from_groups(
 					| AggState::AvgDecimal { .. }
 					| AggState::Quantile(_)
 					| AggState::Spread { .. }
-					| AggState::StringAgg(_) => None,
+					| AggState::StringAgg(_)
+					| AggState::ScalarSubqueryValue { .. } => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(Float64Array::from(values)) as ArrayRef)
@@ -3933,7 +4044,8 @@ fn sum_column_from_groups(
 					| AggState::AvgDecimal { .. }
 					| AggState::Quantile(_)
 					| AggState::Spread { .. }
-					| AggState::StringAgg(_) => None,
+					| AggState::StringAgg(_)
+					| AggState::ScalarSubqueryValue { .. } => None,
 				})
 				.collect::<Vec<_>>();
 			Ok(Arc::new(
@@ -5446,6 +5558,7 @@ pub(in crate::exec) fn fresh_window_agg_state(
 			aggregate_kernel::AggregateStateFamily::Quantile
 			| aggregate_kernel::AggregateStateFamily::Spread
 			| aggregate_kernel::AggregateStateFamily::StringAgg
+			| aggregate_kernel::AggregateStateFamily::ScalarSubqueryValue
 			| aggregate_kernel::AggregateStateFamily::Experimental => None,
 		},
 	)

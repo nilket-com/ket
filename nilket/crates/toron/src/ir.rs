@@ -1111,6 +1111,9 @@ pub enum AggregateFunction {
 	/// non-expression call data; the value and ordering keys travel as
 	/// ordinary arguments (`args[0]` the value, `args[1..]` the keys).
 	StringAgg(Box<StringAggCall>),
+	/// ADR 571: the internal at-most-one accumulator enforcing the scalar
+	/// subquery contract; never reachable from SQL or Rune text.
+	ScalarSubqueryValue,
 }
 
 /// ADR 562: `STRING_AGG`'s non-expression call data, the aggregate form of a

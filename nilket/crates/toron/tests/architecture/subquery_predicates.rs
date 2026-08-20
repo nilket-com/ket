@@ -74,7 +74,9 @@ pub(crate) fn adr256_scalar_subquery_and_select_without_from_stay_deferred() {
 		"SELECT without FROM stays deferred (its own cut)"
 	);
 	let tests = source("tests/group_by_test.rs");
-	assert!(tests.contains("scalar_subquery_comparison_stays_rejected"));
+	// ADR 571: the comparison form now lowers through the contract kernel;
+	// the behavior gate pins the positive shape instead of the old refusal.
+	assert!(tests.contains("scalar_subquery_comparison_lowers_through_the_contract_kernel"));
 }
 
 #[test]

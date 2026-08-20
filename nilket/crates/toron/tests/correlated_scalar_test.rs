@@ -143,21 +143,27 @@ async fn deferred_correlated_scalar_multi_table_inner_is_keyed() {
 	);
 }
 
-#[test]
-fn multi_table_non_aggregate_scalar_still_rejects() {
-	let err = SqlPlanner::new()
+#[tokio::test]
+async fn multi_table_non_aggregate_scalar_with_unqualified_correlation_fails_at_bind() {
+	// ADR 571 admitted the value form, but its correlation detection is
+	// qualifier-driven: the bare `p_id` here belongs to the outer relation,
+	// which the frontend cannot see. The statement now plans and fails
+	// closed at bind, where the column genuinely does not resolve — an
+	// unqualified correlated value scalar is a named boundary, not a silent
+	// wrong answer.
+	let plan = SqlPlanner::new()
 		.plan(
 			"SELECT prt.p_id FROM prt \
 			 WHERE prt.p_lim < ( \
 			   SELECT l_qty FROM itm, dim WHERE l_pid = p_id AND l_pid = d_pid \
 			 )",
 		)
-		.expect_err("non-aggregate scalar remains unsupported even with a comma-list inner");
-	assert!(
-		err.to_string()
-			.contains("non-aggregate scalar subqueries are not supported"),
-		"unexpected error: {err}"
-	);
+		.expect("the value form plans");
+	let (catalog, _) = fixture();
+	let err = bind(&plan, &catalog, &PlannerConfig::default())
+		.await
+		.expect_err("the unqualified outer reference cannot resolve in the inner scope");
+	assert!(err.to_string().contains("p_id"), "unexpected error: {err}");
 }
 
 #[tokio::test]

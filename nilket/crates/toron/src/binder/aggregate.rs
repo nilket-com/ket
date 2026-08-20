@@ -287,6 +287,9 @@ pub(super) fn aggregate_type_mismatch_message(
 		StableAggregateKernel::LinearRegress => {
 			unreachable!("LINEAR_REGRESS binds through its own experimental path")
 		}
+		StableAggregateKernel::ScalarSubqueryValue => {
+			unreachable!("the scalar-subquery kernel accepts any input type")
+		}
 	}
 }
 

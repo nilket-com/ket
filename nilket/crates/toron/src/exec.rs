@@ -679,6 +679,7 @@ impl Executor {
 							// execution through the bound aggregate path only, which
 							// the planner always produces.
 							AggregateFunction::StringAgg(_)
+							| AggregateFunction::ScalarSubqueryValue
 							| AggregateFunction::VarPop
 							| AggregateFunction::VarSamp
 							| AggregateFunction::StddevPop
@@ -2614,7 +2615,8 @@ fn window_agg_add(
 		| AggregateFunction::VarSamp
 		| AggregateFunction::StddevPop
 		| AggregateFunction::StddevSamp
-		| AggregateFunction::StringAgg(_) => {
+		| AggregateFunction::StringAgg(_)
+		| AggregateFunction::ScalarSubqueryValue => {
 			return Err(crate::exec::aggregate::non_window_aggregate_error(function));
 		}
 	}
@@ -2647,7 +2649,8 @@ fn window_agg_finalize(
 		| AggregateFunction::VarSamp
 		| AggregateFunction::StddevPop
 		| AggregateFunction::StddevSamp
-		| AggregateFunction::StringAgg(_) => {
+		| AggregateFunction::StringAgg(_)
+		| AggregateFunction::ScalarSubqueryValue => {
 			return Err(crate::exec::aggregate::non_window_aggregate_error(function));
 		}
 	})

@@ -4589,10 +4589,15 @@ async fn not_exists_lowers_to_anti_join() {
 }
 
 #[tokio::test]
-async fn scalar_subquery_comparison_stays_rejected() {
-	// Correlated IN now decorrelates (259); a non-aggregate scalar subquery in a comparison stays deferred.
-	assert_unsupported(
+async fn scalar_subquery_comparison_lowers_through_the_contract_kernel() {
+	// ADR 571 admitted the value form: the comparison plans through the
+	// internal at-most-one kernel rather than being refused.
+	let plan = plan_sql(
 		"SELECT left_dups.k FROM left_dups WHERE left_dups.k = (SELECT k FROM right_dups)",
+	);
+	assert!(
+		format!("{plan:?}").contains("ScalarSubqueryValue"),
+		"the value subquery must lower onto the contract kernel: {plan:?}"
 	);
 }
 
@@ -4780,12 +4785,10 @@ async fn one_side_scalar_cross_broadcasts_the_scalar() {
 }
 
 #[tokio::test]
-async fn non_aggregate_and_correlated_scalar_subqueries_stay_rejected() {
-	// A non-aggregate scalar subquery `(SELECT x FROM t)` needs a runtime cardinality assert (deferred).
-	assert_unsupported_message(
-		"SELECT region, (SELECT region FROM regions) FROM regions",
-		"non-aggregate scalar subqueries are not supported",
-	);
+async fn correlated_aggregate_argument_scalar_subqueries_stay_rejected() {
+	// ADR 571 admitted the non-aggregate value form with its runtime
+	// cardinality contract; it left the old reject list through its own
+	// decision. What remains rejected:
 	// ADR 260 lowers a WHERE-correlated aggregate scalar; a correlation in the aggregate ARGUMENT is
 	// undecorrelatable by GROUP BY and stays deferred.
 	assert_unsupported_message(
@@ -10560,5 +10563,140 @@ async fn adr570_rune_similar_to_matches_sql() {
 		canonical_arrow_ipc_digest(&sql, SortPolicy::FullRowLex).expect("SQL digest"),
 		canonical_arrow_ipc_digest(&rune, SortPolicy::FullRowLex).expect("Rune digest"),
 		"one node, one result"
+	);
+}
+
+#[tokio::test]
+async fn adr571_uncorrelated_scalar_contract_zero_one_two() {
+	// Zero rows -> NULL, distinct from an error.
+	let empty = run_logical(&plan_sql(
+		"SELECT o.id, (SELECT l.amount FROM empty_sales l) FROM sales o",
+	))
+	.await;
+	let values = empty[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("scalar column");
+	assert_eq!(
+		values.null_count(),
+		6,
+		"an empty subquery is NULL, every row"
+	);
+
+	// One row via ORDER BY + LIMIT 1: the author bounded the subquery, so the
+	// contract is satisfied by construction and the bounded row's value flows.
+	let bounded = run_logical(&plan_sql(
+		"SELECT o.id, (SELECT l.id FROM sales l ORDER BY l.id LIMIT 1) FROM sales o",
+	))
+	.await;
+	let values = bounded[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("scalar column");
+	for row in 0..6 {
+		assert_eq!(values.value(row), 1, "the bounded first id broadcasts");
+	}
+
+	// One row whose value is NULL: NULL result, still not an error. The
+	// derived table keeps the filter out of the mock scan's dropped pushdown;
+	// east's only NULL amount is id 3's.
+	let one_null = run_logical(&plan_sql(
+		"SELECT o.id, (SELECT w.amount FROM (SELECT CONCAT(l.region, '') AS r, l.amount AS amount FROM sales l) w \
+		 WHERE w.r = 'east' AND w.amount IS NULL) FROM sales o",
+	))
+	.await;
+	let values = one_null[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("scalar column");
+	assert_eq!(values.null_count(), 6, "a one-NULL-row subquery is NULL");
+
+	// Two rows raise — never a silent truncation.
+	let two = execute_sql_err(
+		"SELECT o.id, (SELECT l.id FROM sales l ORDER BY l.id LIMIT 2) FROM sales o",
+	)
+	.await;
+	assert!(two.to_string().contains("more than one row"), "got {two}");
+}
+
+#[tokio::test]
+async fn adr571_correlated_assertion_is_per_key() {
+	// status keys: 'open' has five inner rows, 'closed' exactly one. With the
+	// doubled key present among the outer rows, the statement raises.
+	let raising = execute_sql_err(
+		"SELECT outer_rows.id, (SELECT l.id FROM sales l WHERE l.status = outer_rows.s) \
+		 FROM (SELECT o.id AS id, CONCAT(o.status, '') AS s FROM sales o) outer_rows",
+	)
+	.await;
+	assert!(
+		raising.to_string().contains("more than one row"),
+		"got {raising}"
+	);
+
+	// Filter the doubled key away (on a computed column, so the filter stays
+	// a real Filter node): the surviving key has exactly one row and yields
+	// its value — the assertion was per key, not whole-result.
+	let filtered = run_logical(&plan_sql(
+		"SELECT outer_rows.id, (SELECT l.id FROM sales l WHERE l.status = outer_rows.s) \
+		 FROM (SELECT o.id AS id, CONCAT(o.status, '') AS s FROM sales o) outer_rows \
+		 WHERE outer_rows.s = 'closed'",
+	))
+	.await;
+	assert_eq!(filtered[0].num_rows(), 1);
+	let value = filtered[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("scalar column");
+	assert_eq!(value.value(0), 3, "the single closed row's id");
+
+	// A key that matches nothing yields NULL for exactly those outer rows.
+	let unmatched = run_logical(&plan_sql(
+		"SELECT outer_rows.id, (SELECT l.id FROM sales l WHERE l.status = outer_rows.missing) \
+		 FROM (SELECT o.id AS id, CONCAT(o.status, '_x') AS missing FROM sales o) outer_rows",
+	))
+	.await;
+	let values = unmatched[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("scalar column");
+	assert_eq!(values.null_count(), 6, "unmatched keys are NULL rows");
+}
+
+#[tokio::test]
+async fn adr571_select_and_where_positions_agree_and_the_kernel_is_reserved() {
+	let projected = run_logical(&plan_sql(
+		"SELECT o.id, (SELECT l.id FROM sales l ORDER BY l.id LIMIT 1) FROM sales o",
+	))
+	.await;
+	let value = projected[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("scalar column")
+		.value(0);
+	let kept = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o \
+			 WHERE o.id = (SELECT l.id FROM sales l ORDER BY l.id LIMIT 1)",
+		))
+		.await,
+	);
+	assert_eq!(
+		kept,
+		vec![value],
+		"one lowering, one answer in both positions"
+	);
+
+	let reserved = SqlPlanner::new()
+		.plan("SELECT __SCALAR_SUBQUERY_VALUE(amount) FROM sales")
+		.expect_err("the internal kernel is not SQL-callable");
+	assert!(
+		reserved.to_string().contains("reserved for the engine"),
+		"got {reserved}"
 	);
 }

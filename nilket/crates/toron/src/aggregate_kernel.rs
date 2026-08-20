@@ -31,6 +31,7 @@ pub(crate) enum StableAggregateKernel {
 	StddevSamp = 10,
 	LinearRegress = 11,
 	StringAgg = 12,
+	ScalarSubqueryValue = 13,
 }
 
 impl StableAggregateKernel {
@@ -53,6 +54,7 @@ impl StableAggregateKernel {
 		Self::StddevSamp,
 		Self::LinearRegress,
 		Self::StringAgg,
+		Self::ScalarSubqueryValue,
 	];
 }
 
@@ -138,6 +140,9 @@ pub(crate) enum AggregateStateFamily {
 	Spread,
 	/// ADR 562: buffered (keys, value) pairs, sorted and joined at finalize.
 	StringAgg,
+	/// ADR 571: a row count and the single value; a second row per group
+	/// raises the scalar-subquery contract rather than truncating.
+	ScalarSubqueryValue,
 	/// Experimental kernels own their whole execution path and have no shared
 	/// grouped accumulator.
 	Experimental,
@@ -425,6 +430,28 @@ pub(crate) const STABLE_AGGREGATE_KERNELS: &[AggregateKernelSpec] = &[
 		grouped_supported: true,
 		experimental: false,
 	},
+	// ADR 571: the internal at-most-one accumulator. The double-underscore
+	// name is unreachable from SQL text — the aggregate lowering refuses the
+	// engine's reserved namespace — so this entry exists for the registry's
+	// invariants and the binder's synthesized calls only.
+	AggregateKernelSpec {
+		kind: StableAggregateKernel::ScalarSubqueryValue,
+		sql_name: "__SCALAR_SUBQUERY_VALUE",
+		sql_aliases: &[],
+		rune_name: "__scalar_subquery_value",
+		output_name: "value",
+		arity: AggregateArity::One,
+		input_domain: AggregateInputDomain::Any,
+		output_rule: AggregateOutputRule::SameAsInput,
+		logical_type: AggregateLogicalTypeRule::Preserve,
+		order_sensitivity: AggregateOrderSensitivity::Insensitive,
+		window_eligible: false,
+		state_family: AggregateStateFamily::ScalarSubqueryValue,
+		nullable_for_nonempty: true,
+		nullable_for_empty: true,
+		grouped_supported: true,
+		experimental: false,
+	},
 ];
 
 /// ADR 561: alias resolution reads the entries rather than a hand match, so an
@@ -451,6 +478,7 @@ pub(crate) fn stable_kernel_for_function(function: &AggregateFunction) -> Stable
 		AggregateFunction::StddevSamp => StableAggregateKernel::StddevSamp,
 		AggregateFunction::LinearRegress => StableAggregateKernel::LinearRegress,
 		AggregateFunction::StringAgg(_) => StableAggregateKernel::StringAgg,
+		AggregateFunction::ScalarSubqueryValue => StableAggregateKernel::ScalarSubqueryValue,
 	}
 }
 
@@ -479,6 +507,9 @@ pub(crate) fn function_for_payloadless_kind(
 		// The payload carries the separator and directions, so construction goes
 		// through its own lowering arm.
 		| StableAggregateKernel::StringAgg => None,
+		StableAggregateKernel::ScalarSubqueryValue => {
+			Some(AggregateFunction::ScalarSubqueryValue)
+		}
 	}
 }
 

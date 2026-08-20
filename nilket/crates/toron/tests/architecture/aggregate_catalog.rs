@@ -38,6 +38,7 @@ pub(crate) fn adr561_aggregate_catalog_is_the_single_classification_seam() {
 		"StddevSamp",
 		"LinearRegress",
 		"StringAgg",
+		"ScalarSubqueryValue",
 	];
 	for variant in expected_kinds {
 		assert!(
@@ -141,6 +142,16 @@ pub(crate) fn adr561_aggregate_catalog_is_the_single_classification_seam() {
 		.expect("read rune engine source");
 	for row in stable_rows.split("rune_name: \"").skip(1) {
 		let rune_name = row.split('"').next().expect("rune name literal");
+		// ADR 571: double-underscore names are the engine's internal namespace
+		// — deliberately absent from every author surface. The SQL-side
+		// refusal test enforces the same closure.
+		if rune_name.starts_with("__") {
+			assert!(
+				!rune_source.contains(&format!("m.function([\"{rune_name}\"]")),
+				"an internal kernel must not be Rune-registered: {rune_name}"
+			);
+			continue;
+		}
 		assert!(
 			rune_source.contains(&format!("m.function([\"{rune_name}\"]")),
 			"rune surface missing aggregate spelling {rune_name}"
