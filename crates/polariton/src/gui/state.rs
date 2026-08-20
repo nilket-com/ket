@@ -2085,10 +2085,27 @@ async fn dispatch_rune_relation_with_palettes(
 	connection: Arc<RwLock<dyn DatabaseAdapter>>,
 	view: TransformedRuneRelation,
 	palettes: HashMap<LocalViewIdentity, PreparedRuneCategoricalPalette>,
-) -> std::result::Result<crate::gui::messages::RuneRelationViewSetOutcome, String> {
+) -> std::result::Result<crate::gui::messages::RuneRelationCompletion, String> {
+	use crate::adapters::common::RuneDispatchSuccess;
+	use crate::gui::messages::RuneRelationCompletion;
 	let result = connection.write().await.dispatch_rune(&view.source).await;
 	match result {
-		Ok(artifact) => rune_view_outcome_with_palettes(artifact, view.views, palettes),
+		// PRODUCT-0137: a receipt never passes through the view-set path —
+		// that path projects immediately, and there is no artifact here.
+		Ok(RuneDispatchSuccess::Materialized(receipt)) => {
+			Ok(RuneRelationCompletion::Materialized(receipt))
+		}
+		// A terminal relation that returned rows asked for nothing. Refuse
+		// with the terminal-view guidance rather than dropping the rows.
+		Ok(RuneDispatchSuccess::Relation(_)) if view.views.is_empty() => Err(
+			"Rune relation produced rows but no view; add a terminal view such as \
+			 `.views([table()])`, or `.materialize(\"name\")` to keep it."
+				.to_owned(),
+		),
+		Ok(RuneDispatchSuccess::Relation(artifact)) => {
+			rune_view_outcome_with_palettes(artifact, view.views, palettes)
+				.map(RuneRelationCompletion::Views)
+		}
 		Err(failure) => {
 			let location = failure
 				.span
@@ -2111,7 +2128,7 @@ async fn dispatch_rune_relation_with_palettes(
 async fn dispatch_rune_relation(
 	connection: Arc<RwLock<dyn DatabaseAdapter>>,
 	view: TransformedRuneRelation,
-) -> std::result::Result<crate::gui::messages::RuneRelationViewSetOutcome, String> {
+) -> std::result::Result<crate::gui::messages::RuneRelationCompletion, String> {
 	let palettes = default_rune_categorical_palettes(&view.views);
 	dispatch_rune_relation_with_palettes(connection, view, palettes).await
 }
@@ -3689,7 +3706,26 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			}
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
-				Ok(outcome) => {
+				// PRODUCT-0137 §7: routine status naming the resolved table,
+				// confirming the certificate was recorded, and reporting rows
+				// written. No panels, no grid — a materialization is a
+				// complete success that presents nothing.
+				Ok(crate::gui::messages::RuneRelationCompletion::Materialized(receipt)) => {
+					app_state.status_error.clear();
+					// The reported identity must round-trip into `ctx.table(...)`,
+					// which takes a bare name — `TableRef::new` does not split a
+					// qualified string. The namespace is therefore named beside
+					// the table, never dotted into it.
+					app_state.status_msg = format!(
+						"Materialized table \"{}\" in namespace \"{}\" · {} row{} written · certificate recorded (boson v{})",
+						receipt.table_name,
+						receipt.namespace,
+						receipt.rows_written,
+						if receipt.rows_written == 1 { "" } else { "s" },
+						receipt.certificate_format_version,
+					);
+				}
+				Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)) => {
 					use crate::gui::messages::RuneRelationSinkOutput;
 					let sink_count = outcome.sinks.len();
 					let mut errors = Vec::new();
@@ -5246,9 +5282,125 @@ mod tests {
 					span: None,
 				});
 			}
-			Ok(crate::result_artifact::ResultArtifact::test_frame(
-				polars::df!("x" => [1_i64], "y" => [2_i64]).expect("fixture frame"),
+			Ok(crate::adapters::common::RuneDispatchSuccess::Relation(
+				crate::result_artifact::ResultArtifact::test_frame(
+					polars::df!("x" => [1_i64], "y" => [2_i64]).expect("fixture frame"),
+				),
 			))
+		}
+	}
+
+	/// PRODUCT-0137 §7: a materialization completes as a receipt — routine
+	/// status naming the resolved table, rows written, and the certificate's
+	/// recorded format version. No grid, no panels, no empty relation, and
+	/// `status_error` stays clear.
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0137_materialization_renders_a_routine_receipt() {
+		use crate::adapters::common::MaterializationReceipt;
+		use crate::gui::messages::RuneRelationCompletion;
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		state.rune_buffer_revisions.insert(BufferId::new(7), 1);
+		// Prime the scheduler exactly as production does: a completion is
+		// only ever delivered for a program the scheduler started.
+		let view = crate::rune_relation_envelope::transform(r#"ket.table("fixture")"#)
+			.expect("terminal ket relation");
+		let origin = view
+			.executions
+			.first()
+			.expect("one execution")
+			.origin
+			.clone();
+		state
+			.rune_view_scheduler
+			.submit(crate::rune_relation_envelope::PendingRuneView {
+				source_buffer: BufferId::new(7),
+				revision: 1,
+				view,
+			});
+		drop(update(
+			&mut state,
+			Message::RunRuneViewSetResult {
+				source_buffer: BufferId::new(7),
+				revision: 1,
+				origin,
+				views: Vec::new(),
+				result: Ok(RuneRelationCompletion::Materialized(MaterializationReceipt {
+					namespace: "public".to_owned(),
+					table_name: "fixture".to_owned(),
+					certificate_format_version: 1,
+					rows_written: 1_000_000,
+				})),
+			},
+		));
+		assert!(state.status_error.is_empty(), "a receipt is routine status");
+		// The identity must be separated, not dotted: a reader pastes the
+		// table name into `ctx.table(...)`, which does not split a qualified
+		// string, so a dotted render would name something that cannot
+		// round-trip.
+		assert!(
+			state.status_msg.contains(r#"table "fixture" in namespace "public""#),
+			"{}",
+			state.status_msg
+		);
+		assert!(
+			!state.status_msg.contains("public.fixture"),
+			"the namespace must never be dotted into the table name: {}",
+			state.status_msg
+		);
+		assert!(state.status_msg.contains("1000000"), "{}", state.status_msg);
+		assert!(
+			state.status_msg.contains("certificate recorded"),
+			"{}",
+			state.status_msg
+		);
+		assert!(state.status_msg.contains("v1"), "{}", state.status_msg);
+		assert!(
+			state.status_df_size.is_none(),
+			"a materialization never populates the grid"
+		);
+		state.code_editor.shutdown();
+	}
+
+	/// PRODUCT-0137: a terminal relation that returned rows asked for
+	/// nothing. It refuses with the terminal-view guidance rather than
+	/// dropping the rows silently.
+	#[cfg(feature = "toron")]
+	#[test]
+	fn product_0137_terminal_relation_with_rows_refuses_rather_than_dropping() {
+		let runtime = tokio::runtime::Runtime::new().expect("runtime");
+		let connection: Arc<RwLock<dyn DatabaseAdapter>> =
+			Arc::new(RwLock::new(RecordingRuneAdapter {
+				calls: Arc::new(Mutex::new(Vec::new())),
+				fail_table: None,
+			}));
+		let relation = crate::rune_relation_envelope::transform(r#"ket.table("fixture")"#)
+			.expect("terminal ket relation")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		assert!(relation.views.is_empty());
+		// `RuneRelationCompletion` carries no `Debug`, so unwrap the error
+		// explicitly rather than through `expect_err`.
+		let error = match runtime.block_on(dispatch_rune_relation(connection, relation)) {
+			Err(error) => error,
+			Ok(_) => panic!("rows with no view must refuse"),
+		};
+		assert!(error.contains("no view"), "{error}");
+		assert!(error.contains("materialize"), "{error}");
+	}
+	/// PRODUCT-0137: tests that expect a view set say so; production
+	/// consumers match both completion variants explicitly.
+	#[cfg(feature = "toron")]
+	fn expect_views(
+		completion: crate::gui::messages::RuneRelationCompletion,
+	) -> crate::gui::messages::RuneRelationViewSetOutcome {
+		match completion {
+			crate::gui::messages::RuneRelationCompletion::Views(outcome) => outcome,
+			crate::gui::messages::RuneRelationCompletion::Materialized(receipt) => {
+				panic!("expected views, got a materialization of {}", receipt.table_name)
+			}
 		}
 	}
 
@@ -5264,8 +5416,12 @@ mod tests {
 		let artifact = crate::result_artifact::ResultArtifact::test_frame(
 			polars::df!("x" => [1_i64], "y" => [2_i64]).expect("fixture frame"),
 		);
-		let transport: crate::adapters::common::RuneDispatchResult = Ok(Arc::clone(&artifact));
-		let transported = transport.expect("Rune transport accepts the artifact");
+		let transport: crate::adapters::common::RuneDispatchResult = Ok(
+			crate::adapters::common::RuneDispatchSuccess::Relation(Arc::clone(&artifact)),
+		);
+		let transported = transport
+			.expect("Rune transport accepts the artifact")
+			.expect_relation();
 		assert!(Arc::ptr_eq(&artifact, &transported));
 		let palettes = super::default_rune_categorical_palettes(&relation.views);
 		let outcome = super::rune_view_outcome_with_palettes(transported, relation.views, palettes)
@@ -5387,7 +5543,7 @@ mod tests {
 				revision,
 				origin,
 				views,
-				result: Ok(outcome),
+				result: Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)),
 			},
 		));
 		for (identity, plot) in plots {
@@ -6025,6 +6181,7 @@ mod tests {
 				connection.clone(),
 				same_origin.into_relations().next().expect("one origin"),
 			))
+			.map(expect_views)
 			.expect("same origin succeeds");
 		assert_eq!(same_outcome.sinks.len(), 2);
 		assert!(
@@ -6044,9 +6201,11 @@ mod tests {
 		let first = relations.pop().expect("first origin");
 		let second_outcome = runtime
 			.block_on(dispatch_rune_relation(connection.clone(), second))
+			.map(expect_views)
 			.expect("second origin succeeds first");
 		let first_outcome = runtime
 			.block_on(dispatch_rune_relation(connection.clone(), first))
+			.map(expect_views)
 			.expect("first origin succeeds second");
 		assert_eq!(
 			(
@@ -6227,7 +6386,7 @@ mod tests {
 				revision: 1,
 				origin,
 				views: views.clone(),
-				result: Ok(outcome),
+				result: Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)),
 			},
 		));
 		assert!(
@@ -6628,7 +6787,7 @@ ket.table("test2") // Comment Test1.
 				revision: 1,
 				origin: relation.origin,
 				views: vec![styled.clone(), plain.clone(), bad.clone()],
-				result: Ok(outcome),
+				result: Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)),
 			},
 		));
 		assert_eq!(
@@ -6701,7 +6860,7 @@ ket.table("test2") // Comment Test1.
 				revision: 2,
 				origin: relation.origin,
 				views: vec![styled.clone(), plain, bad],
-				result: Ok(outcome),
+				result: Ok(crate::gui::messages::RuneRelationCompletion::Views(outcome)),
 			},
 		));
 		assert_eq!(

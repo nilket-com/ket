@@ -2900,7 +2900,13 @@ fn product_0084_result_artifact_is_the_single_truth_boundary() {
 	let spec = std::fs::read_to_string(root.join("plot/spec/mod.rs")).expect("read plot spec");
 
 	assert!(common.contains("artifact: Arc<ResultArtifact>"));
-	assert!(common.contains("Result<Arc<ResultArtifact>, RuneDispatchFailure>"));
+	// PRODUCT-0137 widened Rune dispatch's success to a closed enum so a
+	// materialization can report a receipt instead of a fabricated empty
+	// relation. PRODUCT-0084's claim is unchanged and asserted here in its
+	// new shape: the *relation* half still carries the artifact and nothing
+	// else, so the artifact remains the single truth boundary for rows.
+	assert!(common.contains("Result<RuneDispatchSuccess, RuneDispatchFailure>"));
+	assert!(common.contains("Relation(Arc<ResultArtifact>)"));
 	assert!(registry.contains("artifact: Arc<ResultArtifact>"));
 	assert!(spec.contains("pub data: Arc<crate::result_artifact::ResultArtifact>"));
 	assert!(artifact.contains("enum ResultBacking"));

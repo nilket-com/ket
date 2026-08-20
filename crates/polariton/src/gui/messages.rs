@@ -160,7 +160,7 @@ pub enum Message {
 		revision: u64,
 		origin: String,
 		views: Vec<LocalViewIdentity>,
-		result: std::result::Result<RuneRelationViewSetOutcome, String>,
+		result: std::result::Result<RuneRelationCompletion, String>,
 	},
 	RuneBufferPlotReady {
 		source_buffer: BufferId,
@@ -216,6 +216,16 @@ pub enum Message {
 pub struct RuneBufferOutcome {
 	pub display: Option<String>,
 	pub plot: Option<ResolvedPlot>,
+}
+
+/// PRODUCT-0137: a Rune relation program completes as a view set or as a
+/// materialization. Closed rather than a view set with an optional receipt,
+/// so no consumer has a `None` to interpret as "nothing happened".
+#[cfg(feature = "toron")]
+#[derive(Clone)]
+pub enum RuneRelationCompletion {
+	Views(RuneRelationViewSetOutcome),
+	Materialized(crate::adapters::common::MaterializationReceipt),
 }
 
 #[cfg(feature = "toron")]

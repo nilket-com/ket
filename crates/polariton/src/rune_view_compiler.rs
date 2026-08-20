@@ -351,6 +351,33 @@ fn analyze_static(source: &str) -> Result<StaticAnalysis, RuneEnvelopeError> {
 			last_retained_is_expression = false;
 			continue;
 		}
+		// PRODUCT-0137: a terminal `ket` relation with no view root is a
+		// complete program — it asks the engine to do something and presents
+		// nothing. It becomes an execution carrying zero presentation slots.
+		// The decision is structural: it reads the provenance's root and
+		// never inspects a method or verb name, so no relation verb is known
+		// here (PRODUCT-0003). `workspace` roots are deliberately excluded —
+		// `workspace.result(...)` and `workspace.cell(...)` are local-host
+		// programs and keep falling through to that host.
+		if let Some(expression) = expression
+			&& let Some(StaticProvenance::Relation {
+				span,
+				root: RelationRoot::Ket,
+				origin,
+			}) = static_provenance(expression, source, &provenances, shadows)?
+		{
+			let emission = byte_range(statement.span(), source.len())?;
+			outputs.push(emission.clone());
+			roots.push(StaticRoot {
+				emission,
+				relation: span,
+				root: RelationRoot::Ket,
+				origin,
+				slots: Vec::new(),
+			});
+			last_retained_is_expression = false;
+			continue;
+		}
 		last_retained_is_expression = matches!(statement, ast::Stmt::Expr(_));
 	}
 
@@ -1750,6 +1777,66 @@ mod tests {
 	use crate::plot::spec::{FacetLabelTextSize, LegendTextSize};
 	use crate::rune_relation_envelope::{RunePlotBody, RuneViewIntent};
 	use std::sync::Arc;
+
+	/// PRODUCT-0137: a terminal `ket` relation with no view root compiles to
+	/// an execution carrying zero presentation slots, so it reaches Toron
+	/// instead of falling through to `NoTerminalView`. Deliberately spelled
+	/// with a generic relation word — the route is structural, and a fixture
+	/// naming a relation verb would defeat the guard below.
+	#[test]
+	fn product_0137_terminal_ket_relation_compiles_with_no_views() {
+		let compiled = compile("ket.table(\"fixture\")").expect("terminal ket relation compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert!(
+			compiled.executions[0].views.is_empty(),
+			"a terminal relation carries zero presentation slots"
+		);
+		assert!(compiled.presentation_order.is_empty());
+	}
+
+	/// PRODUCT-0137: `workspace` roots keep today's behavior. A terminal
+	/// `workspace` relation is a local-host program and must still refuse
+	/// here so the fallback at `state.rs` sends it to that host.
+	#[test]
+	fn product_0137_terminal_workspace_relation_is_not_stolen_from_the_local_host() {
+		assert_eq!(
+			compile("workspace.result(\"sales\")"),
+			Err(RuneEnvelopeError::NoTerminalView)
+		);
+		assert_eq!(
+			compile("workspace.cell(\"trips\")"),
+			Err(RuneEnvelopeError::NoTerminalView)
+		);
+		assert_eq!(
+			compile("workspace.table(\"t\")"),
+			Err(RuneEnvelopeError::NoTerminalView)
+		);
+	}
+
+	/// PRODUCT-0137/PRODUCT-0003: the terminal route is structural. It reads
+	/// the provenance's root and never a method or verb name, and no relation
+	/// verb is spelled in the compiler. Asserted against the implementation,
+	/// not this file — a textual guard whose own fixtures contain the
+	/// excluded spelling fails on itself.
+	#[test]
+	fn product_0137_terminal_route_is_structural_and_names_no_relation_verb() {
+		let source = std::fs::read_to_string(
+			std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/rune_view_compiler.rs"),
+		)
+		.expect("read the compiler");
+		let production = source
+			.split("\n#[cfg(test)]\nmod tests {")
+			.next()
+			.expect("bounded production source");
+		assert!(
+			production.contains("root: RelationRoot::Ket,"),
+			"the terminal branch selects on the provenance root"
+		);
+		assert!(
+			!production.contains("materialize"),
+			"PRODUCT-0003 fences relation verbs out of the host compiler"
+		);
+	}
 
 	#[test]
 	fn product_0076_rewriter_injects_nested_constructor_and_modifier_origins() {

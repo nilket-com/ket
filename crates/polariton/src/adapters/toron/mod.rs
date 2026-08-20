@@ -1,6 +1,6 @@
 use crate::adapters::common::{
-	AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult, RuneDispatchFailure,
-	RuneDispatchFailureKind, RuneDispatchResult,
+	AdapterField, AdapterFieldType, DatabaseAdapter, ExecutionResult, MaterializationReceipt,
+	RuneDispatchFailure, RuneDispatchFailureKind, RuneDispatchResult, RuneDispatchSuccess,
 };
 use crate::result_artifact::{ArrowNullabilityPolicy, ResultArtifact};
 use async_trait::async_trait;
@@ -142,13 +142,28 @@ impl DatabaseAdapter for ToronAdapter {
 					span: None,
 				},
 			})?;
-		ResultArtifact::from_arrow_ipc(result.batches, ArrowNullabilityPolicy::Preserve).map_err(
-			|error| RuneDispatchFailure {
-				kind: RuneDispatchFailureKind::Execution,
-				message: format!("Toron Rune result conversion failed: {error}"),
-				span: None,
-			},
-		)
+		// PRODUCT-0137: both wire outcomes are mapped explicitly. No `_` arm,
+		// so a future variant fails the build rather than being silently
+		// rendered as one of these two.
+		match result {
+			toron_client::RuneQueryResult::Batches(batches) => {
+				ResultArtifact::from_arrow_ipc(batches.batches, ArrowNullabilityPolicy::Preserve)
+					.map(RuneDispatchSuccess::Relation)
+					.map_err(|error| RuneDispatchFailure {
+						kind: RuneDispatchFailureKind::Execution,
+						message: format!("Toron Rune result conversion failed: {error}"),
+						span: None,
+					})
+			}
+			toron_client::RuneQueryResult::Materialized(receipt) => {
+				Ok(RuneDispatchSuccess::Materialized(MaterializationReceipt {
+					namespace: receipt.namespace,
+					table_name: receipt.table_name,
+					certificate_format_version: receipt.certificate_format_version,
+					rows_written: receipt.rows_written,
+				}))
+			}
+		}
 	}
 }
 
@@ -340,7 +355,7 @@ mod tests {
 			.dispatch_rune(&view.source)
 			.await
 			.expect("one Rune relation result");
-		let frame = artifact.projection().expect("Toron projection");
+		let frame = artifact.expect_relation().projection().expect("Toron projection");
 		assert!(frame.height() > 0, "dogfood relation is nonempty");
 		assert_eq!(view.views.len(), 3);
 		for view in view.views {
@@ -412,7 +427,7 @@ mod tests {
 						relation.origin, relation.source
 					)
 				});
-			let frame = artifact.projection().expect("Toron projection");
+			let frame = artifact.expect_relation().projection().expect("Toron projection");
 			if relation.origin.contains(".aggregate(") {
 				assert_eq!(frame.height(), 3, "aggregated pie relation");
 			} else {
@@ -443,7 +458,7 @@ mod tests {
 					relation.origin, relation.source
 				)
 			});
-		let frame = artifact.projection().expect("Toron violin projection");
+		let frame = artifact.expect_relation().projection().expect("Toron violin projection");
 		assert_eq!(
 			frame.height(),
 			288,
@@ -519,7 +534,7 @@ mod tests {
 			.dispatch_rune(&relation.source)
 			.await
 			.expect("one Rune relation result");
-		let frame = artifact.projection().expect("Toron projection");
+		let frame = artifact.expect_relation().projection().expect("Toron projection");
 		let [view] = relation.views.as_slice() else {
 			panic!("line fixture must produce exactly one view");
 		};
@@ -575,7 +590,7 @@ mod tests {
 			.dispatch_rune(&view.source)
 			.await
 			.expect("one Rune relation result");
-		let frame = artifact.projection().expect("Toron projection");
+		let frame = artifact.expect_relation().projection().expect("Toron projection");
 		assert!(frame.height() > 0, "dogfood relation is nonempty");
 		assert_eq!(view.views.len(), 3);
 		for view in view.views {

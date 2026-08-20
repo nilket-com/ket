@@ -74,8 +74,51 @@ pub struct RuneDispatchFailure {
 	pub span: Option<Range<u32>>,
 }
 
+/// PRODUCT-0137 §7: what a materialization reports to the host. Built from
+/// the wire response at the adapter boundary so `toron_client` types do not
+/// leak past `adapters/`. The certificate's format version is reported as
+/// recorded; Polariton never decodes certificate bytes.
 #[cfg(feature = "toron")]
-pub type RuneDispatchResult = Result<Arc<ResultArtifact>, RuneDispatchFailure>;
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MaterializationReceipt {
+	/// Resolved namespace, carried beside the name rather than dotted into
+	/// it — `TableRef::new` does not split a qualified string.
+	pub namespace: String,
+	pub table_name: String,
+	pub certificate_format_version: u16,
+	/// Rows written to the new table. A materialization returns no rows to
+	/// the caller, so this deliberately does not share the `row_count` name.
+	pub rows_written: u64,
+}
+
+/// PRODUCT-0137: a Rune dispatch succeeds as a relation or as a
+/// materialization. A closed enum rather than an artifact plus an optional
+/// receipt: an outcome that can carry both is one that can carry neither
+/// honestly, and any `None` to interpret reopens the empty-relation trap
+/// TORON-0574 was written to close.
+#[cfg(feature = "toron")]
+#[derive(Clone, Debug)]
+pub enum RuneDispatchSuccess {
+	Relation(Arc<ResultArtifact>),
+	Materialized(MaterializationReceipt),
+}
+
+#[cfg(all(test, feature = "toron"))]
+impl RuneDispatchSuccess {
+	/// Test accessor for the relation half. Production consumers match both
+	/// variants explicitly; a test that expects rows says so.
+	pub fn expect_relation(self) -> Arc<ResultArtifact> {
+		match self {
+			RuneDispatchSuccess::Relation(artifact) => artifact,
+			RuneDispatchSuccess::Materialized(receipt) => {
+				panic!("expected a relation, got a materialization of {}", receipt.table_name)
+			}
+		}
+	}
+}
+
+#[cfg(feature = "toron")]
+pub type RuneDispatchResult = Result<RuneDispatchSuccess, RuneDispatchFailure>;
 
 /// PRODUCT-0135 §2: an engine-side cancellation signal. Implementations must
 /// reach their engine over a path that can never wait on the adapter's
