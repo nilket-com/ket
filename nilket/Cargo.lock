@@ -662,6 +662,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "boson"
+version = "0.1.0"
+
+[[package]]
 name = "boxcar"
 version = "0.2.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5450,6 +5454,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "blake3",
+ "boson",
  "bytemuck",
  "chrono",
  "chrono-tz",

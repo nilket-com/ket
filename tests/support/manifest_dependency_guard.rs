@@ -8,6 +8,7 @@ pub(crate) enum ProductBoundary {
 	Baryon,
 	Polariton,
 	NilketEngine,
+	Boson,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -165,7 +166,19 @@ fn is_forbidden_package(package: &str, boundary: ProductBoundary) -> bool {
 		ProductBoundary::Libaryon => analytics_or_connector || nilket_engine || package == "boson",
 		ProductBoundary::Baryon => analytics_or_connector || nilket_engine,
 		ProductBoundary::Polariton => nilket_engine,
-		ProductBoundary::NilketEngine => editor || package == "boson",
+		ProductBoundary::NilketEngine => editor,
+		ProductBoundary::Boson => {
+			analytics_or_connector
+				|| nilket_engine
+				|| editor || matches!(
+				package.as_str(),
+				"rune"
+					| "sqlparser" | "serde"
+					| "serde_json" | "postcard"
+					| "bincode" | "toml"
+					| "ron" | "ciborium"
+			)
+		}
 	}
 }
 
@@ -607,7 +620,7 @@ mod tests {
 	}
 
 	#[test]
-	fn nilket_engines_cannot_reach_editor_or_shared_analytics_crates() {
+	fn nilket_engines_cannot_reach_editor_crates_but_may_consume_boson() {
 		let manifest = r#"
 			[dependencies]
 			baryon = "1"
@@ -619,7 +632,37 @@ mod tests {
 		"#;
 		assert_eq!(
 			forbidden_dependencies(manifest, "", ProductBoundary::NilketEngine),
-			["baryon", "boson", "libaryon", "polariton"]
+			["baryon", "libaryon", "polariton"]
+		);
+	}
+
+	#[test]
+	fn boson_rejects_all_engine_editor_and_codec_dependencies() {
+		let manifest = r#"
+			[dependencies]
+			arrow = "1"
+			baryon = "1"
+			libaryon = "1"
+			polars = "1"
+			rune = "1"
+			serde = "1"
+			sqlparser = "1"
+			toron = "1"
+			wendelon = "1"
+		"#;
+		assert_eq!(
+			forbidden_dependencies(manifest, "", ProductBoundary::Boson),
+			[
+				"arrow",
+				"baryon",
+				"libaryon",
+				"polars",
+				"rune",
+				"serde",
+				"sqlparser",
+				"toron",
+				"wendelon",
+			]
 		);
 	}
 }

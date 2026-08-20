@@ -1,4 +1,7 @@
 mod aggregate_kernel;
+// PRODUCT-0137's materialization companion is the sole production consumer.
+#[allow(dead_code, reason = "KET-0006 lands before that companion")]
+pub(crate) mod canonical_expression;
 mod cast_support;
 
 pub mod audit;

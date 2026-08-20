@@ -47,6 +47,7 @@ tls-pki = { path = "../tls-pki" }
 toron-client = { path = "../toron-client" }
 wendelon = { path = "../wendelon" }
 wendelon-client = { path = "../wendelon/crates/wendelon-client" }
+boson = { path = "../../../shared/boson" }
 
 [lints.clippy]
 manual_div_ceil = "allow"
