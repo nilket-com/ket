@@ -16,7 +16,7 @@ use crate::gui::table_skin::{TableSkinCascade, TableSkinProjection, TableSkinSpe
 use crate::gui::{
 	components,
 	menu::MenuState,
-	messages::{ExportFormat, Message},
+	messages::{ExportFormat, Message, NotebookRuneFailure, NotebookRuneOutcome},
 };
 #[cfg(feature = "toron")]
 #[cfg(feature = "toron")]
@@ -26,9 +26,7 @@ use crate::plot::core::PlotType;
 use crate::plot::export::{AvifBackend, PngBackend, SvgBackend};
 use crate::plot::factory::create_plot;
 #[cfg(feature = "toron")]
-use crate::plot::factory::{
-	create_layered_plot_from_artifact, create_styled_plot,
-};
+use crate::plot::factory::{create_layered_plot_from_artifact, create_styled_plot};
 #[cfg(feature = "toron")]
 use crate::plot::grid::{PlotGrid, PlotGridKernel};
 #[cfg(feature = "toron")]
@@ -2802,12 +2800,39 @@ fn run_sql_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) 
 	task
 }
 
+fn resolve_notebook_rune_execution(
+	mut execution: rune_host::RuneExecution,
+) -> std::result::Result<NotebookRuneOutcome, NotebookRuneFailure> {
+	let receipts = std::mem::take(&mut execution.receipts);
+	let plot = match execution.requests.len() {
+		1 => plan(execution.requests.remove(0)).map(Some),
+		0 if receipts.is_empty() => {
+			Err("Rune cell did not publish a plot; call `.show()?`.".to_owned())
+		}
+		0 => Ok(None),
+		_ => Err(
+			"Rune cell published multiple plots; one cell currently owns one output.".to_owned(),
+		),
+	};
+	match plot {
+		Ok(plot) => Ok(NotebookRuneOutcome { plot, receipts }),
+		Err(message) => Err(NotebookRuneFailure { message, receipts }),
+	}
+}
+
 fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution) -> Task<Message> {
 	if cell.code.trim().is_empty() {
 		app_state.status_msg = "Nothing to run in this Rune cell.".into();
 		return Task::none();
 	}
 	let snapshots = app_state.code_editor.named_notebook_cell_data();
+	let results = match app_state.result_registry.snapshot() {
+		Ok(results) => results,
+		Err(error) => {
+			app_state.status_error = error.to_string();
+			return Task::none();
+		}
+	};
 	let identity = cell.identity.clone();
 	let presentation = cell.presentation;
 	app_state.status_msg = "Building notebook plot…".into();
@@ -2820,30 +2845,47 @@ fn run_rune_markdown_cell(app_state: &mut AppState, cell: MarkdownCellExecution)
 	Task::perform(
 		async move {
 			tokio::task::spawn_blocking(move || {
-				let mut execution = rune_host::execute_body(
+				let execution = rune_host::execute_body(
 					&cell.code,
 					RuneCapabilities {
 						cells: snapshots,
-						..RuneCapabilities::default()
+						results,
 					},
-				)?;
-				match execution.requests.len() {
-					1 => plan(execution.requests.remove(0)),
-					0 => Err("Rune cell did not publish a plot; call `.show()?`.".to_owned()),
-					_ => Err(
-						"Rune cell published multiple plots; one cell currently owns one output."
-							.to_owned(),
-					),
-				}
+				)
+				.map_err(|message| NotebookRuneFailure {
+					message,
+					receipts: Vec::new(),
+				})?;
+				resolve_notebook_rune_execution(execution)
 			})
 			.await
-			.map_err(|error| format!("Rune notebook task panicked: {error}"))?
+			.map_err(|error| NotebookRuneFailure {
+				message: format!("Rune notebook task panicked: {error}"),
+				receipts: Vec::new(),
+			})?
 		},
 		move |result| Message::RunRuneCellResult {
 			identity,
 			presentation,
 			result,
 		},
+	)
+}
+
+fn export_receipt_status(receipts: &[rune_host::ExportReceipt]) -> String {
+	if receipts.len() == 1 {
+		return receipts[0].status_message();
+	}
+	let rows = receipts.iter().map(|receipt| receipt.rows).sum::<usize>();
+	format!(
+		"Exported {} files ({} rows total): {}.",
+		receipts.len(),
+		rows,
+		receipts
+			.iter()
+			.map(|receipt| receipt.path.as_str())
+			.collect::<Vec<_>>()
+			.join(", ")
 	)
 }
 
@@ -3042,7 +3084,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		// silently substituted for a saved profile, and the store is never
 		// cleared, rewritten, or migrated on a failed open.
 		Message::ProfileStoreAccessRequested => {
-			return request_profile_access(app_state, crate::profile_store::ProfileOperation::Browse);
+			return request_profile_access(
+				app_state,
+				crate::profile_store::ProfileOperation::Browse,
+			);
 		}
 		Message::ProfileSaveRequested => {
 			return request_profile_access(
@@ -3100,8 +3145,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				}
 				return Task::none();
 			}
-			let passphrase =
-				zeroize::Zeroizing::new(prompt.passphrase.as_bytes().to_vec());
+			let passphrase = zeroize::Zeroizing::new(prompt.passphrase.as_bytes().to_vec());
 			let outcome = if creating {
 				app_state.profile_store.initialize(&path, passphrase)
 			} else {
@@ -4066,7 +4110,10 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 		} => {
 			app_state.status_time_elapsed = Some(app_state.code_started.elapsed());
 			match result {
-				Ok(resolved) => {
+				Ok(NotebookRuneOutcome {
+					plot: Some(resolved),
+					receipts,
+				}) => {
 					app_state.status_error.clear();
 					app_state.status_msg = format!("Building plot from {}…", resolved.source_name);
 					return build_resolved_plot_task(resolved, 720, move |resolved, kernel| {
@@ -4075,11 +4122,22 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 							presentation,
 							resolved,
 							kernel,
+							receipts,
 						}
 					});
 				}
-				Err(message) => {
+				Ok(NotebookRuneOutcome {
+					plot: None,
+					receipts,
+				}) => {
+					app_state.status_error.clear();
+					app_state.status_msg = export_receipt_status(&receipts);
+				}
+				Err(NotebookRuneFailure { message, receipts }) => {
 					set_rune_error(app_state, message.clone());
+					if !receipts.is_empty() {
+						app_state.status_msg = export_receipt_status(&receipts);
+					}
 					if presentation.output == MarkdownCellOutputTarget::Inline {
 						app_state.code_editor.set_markdown_cell_error(
 							identity,
@@ -4094,6 +4152,7 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 			presentation,
 			resolved,
 			kernel,
+			receipts,
 		} => {
 			let composition = resolved.resolved_spec.composition.clone();
 			match presentation.output {
@@ -4111,7 +4170,11 @@ fn update(app_state: &mut AppState, message: Message) -> Task<Message> {
 				MarkdownCellOutputTarget::None => {}
 			}
 			app_state.status_error.clear();
-			app_state.status_msg = "Plot cell finished.".to_owned();
+			app_state.status_msg = if receipts.is_empty() {
+				"Plot cell finished.".to_owned()
+			} else {
+				format!("Plot cell finished. {}", export_receipt_status(&receipts))
+			};
 		}
 		Message::Export(format) => {
 			let snapshots = app_state.code_editor.host_plot_exports();
@@ -4207,8 +4270,7 @@ fn apply_profile_operation(
 				.is_empty()
 			{
 				app_state.status_error =
-					"Profiles use named fields; clear the ad hoc connection string first."
-						.into();
+					"Profiles use named fields; clear the ad hoc connection string first.".into();
 				return Task::none();
 			}
 			let adapter_type = app_state.adapter_state.selection.adapter_type_str();
@@ -4375,8 +4437,8 @@ mod tests {
 	};
 	use super::{
 		clear_transient_execution_status_on_editor_activity, compact_rune_diagnostic,
-		compact_sql_diagnostic, new, resolve_startup, session_identity_text, set_rune_error,
-		set_sql_error, update,
+		compact_sql_diagnostic, new, resolve_notebook_rune_execution, resolve_startup,
+		session_identity_text, set_rune_error, set_sql_error, update,
 	};
 	use crate::adapters::common::ExecutionResult;
 	#[cfg(feature = "toron")]
@@ -4384,7 +4446,7 @@ mod tests {
 		AdapterStage, DatabaseAdapter, RuneDispatchFailure, RuneDispatchFailureKind,
 	};
 	use crate::configuration::StartupData;
-	use crate::gui::messages::Message;
+	use crate::gui::messages::{Message, NotebookRuneFailure, NotebookRuneOutcome};
 	#[cfg(feature = "toron")]
 	use crate::gui::table_skin::{TableSkin, TableSkinProjection, TableSkinSpec};
 	#[cfg(feature = "toron")]
@@ -4400,6 +4462,7 @@ mod tests {
 		common::{CoordinateTransformer, PlotKernel, PlotLayout, ResolvedPlotSettings},
 		export::SvgBackend,
 	};
+	use crate::rune_host::ExportReceipt;
 	#[cfg(feature = "toron")]
 	use crate::rune_relation_envelope::{
 		LocalViewIdentity, PendingRuneView, RuneTableSkinIntent, RuneTableSkinProjection,
@@ -5046,6 +5109,83 @@ mod tests {
 		}
 	}
 
+	#[test]
+	fn product_0136_notebook_receipts_survive_without_a_plot_and_beside_plot_errors() {
+		use libaryon::uast::projection::{
+			MarkdownCellCodeVisibility, MarkdownCellIdentity, MarkdownCellOutputTarget,
+			MarkdownCellPresentation,
+		};
+
+		let identity = MarkdownCellIdentity::Explicit {
+			id: "export".to_owned(),
+		};
+		let presentation = MarkdownCellPresentation {
+			output: MarkdownCellOutputTarget::None,
+			code: MarkdownCellCodeVisibility::Show,
+		};
+		let receipt = ExportReceipt {
+			path: "exports/sales.csv".to_owned(),
+			rows: 3,
+		};
+		let (mut state, startup) = new(StartupData::default(), None);
+		drop(startup);
+		drop(update(
+			&mut state,
+			Message::RunRuneCellResult {
+				identity: identity.clone(),
+				presentation,
+				result: Ok(NotebookRuneOutcome {
+					plot: None,
+					receipts: vec![receipt.clone()],
+				}),
+			},
+		));
+		assert_eq!(state.status_error, "");
+		assert_eq!(state.status_msg, receipt.status_message());
+
+		drop(update(
+			&mut state,
+			Message::RunRuneCellResult {
+				identity,
+				presentation,
+				result: Err(NotebookRuneFailure {
+					message: "plot columns are incompatible".to_owned(),
+					receipts: vec![receipt.clone()],
+				}),
+			},
+		));
+		assert!(state.status_error.contains("plot columns are incompatible"));
+		assert_eq!(state.status_msg, receipt.status_message());
+		state.code_editor.shutdown();
+	}
+
+	#[test]
+	fn product_0136_notebook_refuses_only_when_it_produces_nothing() {
+		let empty = resolve_notebook_rune_execution(crate::rune_host::RuneExecution {
+			display: None,
+			requests: Vec::new(),
+			receipts: Vec::new(),
+		})
+		.expect_err("an empty cell keeps the plot-era refusal");
+		assert_eq!(
+			empty.message,
+			"Rune cell did not publish a plot; call `.show()?`."
+		);
+		assert!(empty.receipts.is_empty());
+
+		let exported = resolve_notebook_rune_execution(crate::rune_host::RuneExecution {
+			display: None,
+			requests: Vec::new(),
+			receipts: vec![ExportReceipt {
+				path: "export.csv".to_owned(),
+				rows: 1,
+			}],
+		})
+		.expect("an export-only cell is a product");
+		assert!(exported.plot.is_none());
+		assert_eq!(exported.receipts.len(), 1);
+	}
+
 	#[cfg(feature = "toron")]
 	fn render_marks_with_settings(
 		kernel: &dyn PlotKernel,
@@ -5552,7 +5692,10 @@ mod tests {
 				&mut state,
 				Message::LocalWorkspaceAttached {
 					workspace,
-					connection: Ok((connection, crate::adapters::common::CancelCapability::StopWaiting)),
+					connection: Ok((
+						connection,
+						crate::adapters::common::CancelCapability::StopWaiting
+					)),
 				},
 			)
 			.units(),
@@ -8564,8 +8707,16 @@ workspace.table("bad").views([view("bad", table())]);
 				},
 				resolved,
 				kernel,
+				receipts: vec![ExportReceipt {
+					path: "markdown.csv".to_owned(),
+					rows: 2,
+				}],
 			},
 		));
+		assert_eq!(
+			state.status_msg,
+			"Plot cell finished. Exported 2 rows to markdown.csv."
+		);
 		let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
 		while state.code_editor.host_plot_exports().is_empty()
 			&& std::time::Instant::now() < deadline
@@ -8628,6 +8779,7 @@ workspace.table("bad").views([view("bad", table())]);
 					},
 					resolved,
 					kernel,
+					receipts: Vec::new(),
 				},
 			));
 			assert!(
@@ -9992,11 +10144,9 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		}
 		assert!(matches!(
 			&outcome.sinks[0].output,
-			Ok(
-				crate::gui::messages::RuneRelationSinkOutput::Plot(..)
-					| crate::gui::messages::RuneRelationSinkOutput::StyledPlot(..)
-					| crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(..)
-			)
+			Ok(crate::gui::messages::RuneRelationSinkOutput::Plot(..)
+				| crate::gui::messages::RuneRelationSinkOutput::StyledPlot(..)
+				| crate::gui::messages::RuneRelationSinkOutput::LayeredPlot(..))
 		));
 	}
 
@@ -12146,7 +12296,10 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			"a profile is never a connection string: {}",
 			state.status_error
 		);
-		drop(update(&mut state, Message::AdapterAdHocChanged(String::new())));
+		drop(update(
+			&mut state,
+			Message::AdapterAdHocChanged(String::new()),
+		));
 
 		drop(update(&mut state, Message::ProfileSaveRequested));
 		assert_eq!(state.status_msg, "Profile saved: scratchpad");
@@ -12265,12 +12418,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert_eq!(dispatches.load(Ordering::SeqCst), 0, "no dispatch");
 
 		// A fresh generation dispatches normally.
-		let result = runtime.block_on(super::dispatch_sql_gated(
-			db,
-			"select 1".into(),
-			1,
-			current,
-		));
+		let result = runtime.block_on(super::dispatch_sql_gated(db, "select 1".into(), 1, current));
 		assert!(matches!(result, ExecutionResult::Affected(1)));
 		assert_eq!(dispatches.load(Ordering::SeqCst), 1);
 	}
@@ -12336,10 +12484,7 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert!(state.status_time_elapsed.is_none());
 		assert!(state.status_df_size.is_none());
 		assert!(
-			state
-				.code_editor
-				.named_notebook_cell_data()
-				.is_empty(),
+			state.code_editor.named_notebook_cell_data().is_empty(),
 			"a cancelled cell result never reaches the notebook"
 		);
 		state.code_editor.shutdown();
@@ -12371,7 +12516,11 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		drop(update(&mut state, Message::CancelRun));
 		assert_eq!(state.current_sql_generation(), before + 1);
 		assert!(state.sql_abort.is_none(), "the client future was abandoned");
-		assert!(state.status_msg.contains("stopped waiting"), "{}", state.status_msg);
+		assert!(
+			state.status_msg.contains("stopped waiting"),
+			"{}",
+			state.status_msg
+		);
 		assert!(state.status_error.is_empty(), "routine lane, not an error");
 
 		// Refusal: nothing moves — no advance, no abort, no drain.
@@ -12382,9 +12531,8 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 				ExecutionResult::None
 			}
 		}
-		state.adapter_state.connection = Some(std::sync::Arc::new(tokio::sync::RwLock::new(
-			InertAdapter,
-		)));
+		state.adapter_state.connection =
+			Some(std::sync::Arc::new(tokio::sync::RwLock::new(InertAdapter)));
 		state.adapter_state.cancellation = CancelCapability::Refuse;
 		state.sql_abort = Some(idle_abort_handle());
 		state.pending_runs.push_back(super::PendingRun {
@@ -12402,7 +12550,11 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 		assert_eq!(state.current_sql_generation(), before, "no advance");
 		assert!(state.sql_abort.is_some(), "no abort");
 		assert_eq!(state.pending_runs.len(), 1, "no drain");
-		assert!(state.status_msg.contains("cannot be cancelled"), "{}", state.status_msg);
+		assert!(
+			state.status_msg.contains("cannot be cancelled"),
+			"{}",
+			state.status_msg
+		);
 		assert!(state.status_error.is_empty());
 		state.pending_runs.clear();
 
@@ -12436,7 +12588,11 @@ workspace.table("t").views([{mark}(first_field, second_field, color_field)])
 			&mut state,
 			Message::CancelSignalSettled(Err("connection reset".to_owned())),
 		));
-		assert!(state.status_msg.contains("stopped waiting"), "{}", state.status_msg);
+		assert!(
+			state.status_msg.contains("stopped waiting"),
+			"{}",
+			state.status_msg
+		);
 		assert!(state.status_error.is_empty());
 		state.code_editor.shutdown();
 	}

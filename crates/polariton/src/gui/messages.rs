@@ -15,6 +15,7 @@ use crate::plot::theme::PlotSettingsLayer;
 #[cfg(feature = "toron")]
 use crate::result_artifact::ResultArtifact;
 use crate::result_registry::PendingPublication;
+use crate::rune_host::ExportReceipt;
 #[cfg(feature = "toron")]
 use crate::rune_relation_envelope::{
 	LocalViewIdentity, RuneEnvelopeError, TransformedRuneView, ViewPresentation,
@@ -30,6 +31,21 @@ pub enum ExportFormat {
 	SVG,
 	PNG,
 	AVIF,
+}
+
+/// The host products from one Rune notebook cell. An export is independent of
+/// a plot: an export-only cell is valid, and a plot-planning error must not
+/// erase a file that was already written.
+#[derive(Clone, Debug)]
+pub struct NotebookRuneOutcome {
+	pub plot: Option<ResolvedPlot>,
+	pub receipts: Vec<ExportReceipt>,
+}
+
+#[derive(Clone, Debug)]
+pub struct NotebookRuneFailure {
+	pub message: String,
+	pub receipts: Vec<ExportReceipt>,
 }
 
 impl std::fmt::Display for ExportFormat {
@@ -179,13 +195,14 @@ pub enum Message {
 	RunRuneCellResult {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,
-		result: std::result::Result<ResolvedPlot, String>,
+		result: std::result::Result<NotebookRuneOutcome, NotebookRuneFailure>,
 	},
 	NotebookPlotReady {
 		identity: libaryon::uast::projection::MarkdownCellIdentity,
 		presentation: libaryon::uast::projection::MarkdownCellPresentation,
 		resolved: ResolvedPlot,
 		kernel: Arc<dyn PlotKernel + Send + Sync>,
+		receipts: Vec<ExportReceipt>,
 	},
 	CloseStatusDetail,
 	CopyStatusDetail,

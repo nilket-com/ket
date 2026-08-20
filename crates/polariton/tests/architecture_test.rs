@@ -4817,9 +4817,8 @@ fn product_0115_rotation_is_typed_and_axis_overlays_share_one_policy() {
 		.and_then(|rest| rest.split("pub struct CoordinateTransformer").next())
 		.expect("bounded formatted-axis reservation estimator");
 	assert!(
-		requirements.contains(
-			"estimate_formatted_label_width(&format_label(value, axis_type), font_size)"
-		)
+		requirements
+			.contains("estimate_formatted_label_width(&format_label(value, axis_type), font_size)")
 	);
 	assert!(requirements.contains("estimate_ascii_label_width(label, font_size)"));
 	for (entrypoint, next) in [
@@ -5143,10 +5142,9 @@ fn product_0135_sql_results_reach_the_host_through_exactly_two_paths() {
 	// handler. A third `dispatch` site is a new completion path that must be
 	// stamped, so its appearance fails this census rather than shipping
 	// unstamped.
-	let state = std::fs::read_to_string(
-		Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui/state.rs"),
-	)
-	.expect("read state.rs");
+	let state =
+		std::fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui/state.rs"))
+			.expect("read state.rs");
 	let production = state
 		.split("\n#[cfg(test)]\nmod ")
 		.next()
@@ -5168,4 +5166,26 @@ fn product_0135_sql_results_reach_the_host_through_exactly_two_paths() {
 	);
 	assert!(production.contains("Message::RunResult {"));
 	assert!(production.contains("Message::RunMarkdownCellResult {"));
+}
+
+#[test]
+fn product_0136_csv_export_keeps_arrow_canonical_and_polars_csv_unadmitted() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let manifest =
+		std::fs::read_to_string(manifest_dir.join("Cargo.toml")).expect("read Polariton manifest");
+	let polars = manifest
+		.lines()
+		.find(|line| line.starts_with("polars = "))
+		.expect("Polariton Polars dependency");
+	assert!(manifest.contains("arrow-csv = \"58.3.0\""));
+	assert!(
+		!polars.contains("csv"),
+		"PRODUCT-0136 permits Arrow CSV only; Polars csv remains unadmitted: {polars}"
+	);
+
+	let artifact = std::fs::read_to_string(manifest_dir.join("src/result_artifact.rs"))
+		.expect("read result artifact");
+	assert!(artifact.contains("arrow_csv::Writer"));
+	assert!(artifact.contains("IpcStreamWriter"));
+	assert!(artifact.contains("fn write_polars_csv"));
 }

@@ -12,11 +12,29 @@ use crate::plot::core::PlotType;
 use crate::plot::request::{PlotRequest, PlotSource};
 use crate::plot::spec::AuthoredPlotSpec;
 use crate::result_artifact::ResultArtifact;
-use polars::frame::DataFrame;
 use rune::runtime::{Value, VmResult};
 use rune::{Any, Context, Module, Source, Sources, Vm};
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::sync::{Arc, Mutex};
+
+/// A completed host-side data export, carried explicitly to the interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ExportReceipt {
+	pub path: String,
+	pub rows: usize,
+}
+
+impl ExportReceipt {
+	pub fn status_message(&self) -> String {
+		format!(
+			"Exported {} row{} to {}.",
+			self.rows,
+			if self.rows == 1 { "" } else { "s" },
+			self.path
+		)
+	}
+}
 
 /// Everything one Rune execution produced. The two channels are independent:
 /// the trailing expression goes to the Results surface, every `.show()?` adds
@@ -25,6 +43,7 @@ use std::sync::{Arc, Mutex};
 pub struct RuneExecution {
 	pub display: Option<String>,
 	pub requests: Vec<PlotRequest>,
+	pub receipts: Vec<ExportReceipt>,
 }
 
 /// The owned snapshots one execution may read, cloned before the VM runs.
@@ -61,19 +80,41 @@ impl RequestQueue {
 	}
 }
 
+#[derive(Default)]
+struct ExportQueue {
+	active: bool,
+	receipts: Vec<ExportReceipt>,
+}
+
+impl ExportQueue {
+	fn push(&mut self, receipt: ExportReceipt) -> Result<(), String> {
+		if !self.active {
+			return Err("Export handle expired".to_owned());
+		}
+		self.receipts.push(receipt);
+		Ok(())
+	}
+
+	fn finish(&mut self) -> Vec<ExportReceipt> {
+		self.active = false;
+		std::mem::take(&mut self.receipts)
+	}
+}
+
 #[derive(Any, Clone)]
 #[rune(item = ::polariton, name = Workspace)]
 struct RuneWorkspace {
 	cells: Arc<HashMap<String, Arc<ResultArtifact>>>,
 	results: Arc<HashMap<String, Arc<ResultArtifact>>>,
+	receipts: Arc<Mutex<ExportQueue>>,
 }
 
 #[derive(Any, Clone)]
 #[rune(item = ::polariton, name = Cell)]
 struct RuneCell {
 	name: String,
-	data: Arc<DataFrame>,
 	artifact: Arc<ResultArtifact>,
+	receipts: Arc<Mutex<ExportQueue>>,
 }
 
 #[derive(Any, Clone)]
@@ -101,9 +142,14 @@ pub fn execute(source: &str, capabilities: RuneCapabilities) -> Result<RuneExecu
 		active: true,
 		requests: Vec::new(),
 	}));
+	let receipts = Arc::new(Mutex::new(ExportQueue {
+		active: true,
+		receipts: Vec::new(),
+	}));
 	let workspace = RuneWorkspace {
 		cells: Arc::new(capabilities.cells),
 		results: Arc::new(capabilities.results),
+		receipts: Arc::clone(&receipts),
 	};
 	let viz = RuneViz {
 		queue: queue.clone(),
@@ -132,7 +178,15 @@ pub fn execute(source: &str, capabilities: RuneCapabilities) -> Result<RuneExecu
 		.lock()
 		.map_err(|_| "Plot request queue was poisoned".to_owned())?
 		.finish();
-	result.map(|display| RuneExecution { display, requests })
+	let receipts = receipts
+		.lock()
+		.map_err(|_| "Export receipt queue was poisoned".to_owned())?
+		.finish();
+	result.map(|display| RuneExecution {
+		display,
+		requests,
+		receipts,
+	})
 }
 
 /// Execute the body of a Rune buffer or fenced notebook cell.
@@ -251,6 +305,9 @@ fn build_context() -> Result<Context, String> {
 	module
 		.associated_function("show", plot_show)
 		.map_err(|error| format!("Rune module error: {error}"))?;
+	module
+		.associated_function("export_csv", cell_export_csv)
+		.map_err(|error| format!("Rune module error: {error}"))?;
 	context
 		.install(module)
 		.map_err(|error| format!("Rune context error: {error}"))?;
@@ -289,14 +346,10 @@ fn workspace_cell(workspace: &RuneWorkspace, name: &str) -> VmResult<Result<Rune
 	let Some(data) = workspace.cells.get(name) else {
 		return VmResult::Ok(Err(format!("Unknown notebook cell: {name}")));
 	};
-	let data_frame = match data.projection() {
-		Ok(data_frame) => data_frame,
-		Err(error) => return VmResult::Ok(Err(error.to_string())),
-	};
 	VmResult::Ok(Ok(RuneCell {
 		name: name.to_owned(),
-		data: data_frame,
 		artifact: data.clone(),
+		receipts: Arc::clone(&workspace.receipts),
 	}))
 }
 
@@ -306,14 +359,10 @@ fn workspace_result(workspace: &RuneWorkspace, name: &str) -> VmResult<Result<Ru
 			"No published result named {name}; publish one with `-- @result {name}` in a SQL buffer"
 		)));
 	};
-	let data_frame = match data.projection() {
-		Ok(data_frame) => data_frame,
-		Err(error) => return VmResult::Ok(Err(error.to_string())),
-	};
 	VmResult::Ok(Ok(RuneCell {
 		name: name.to_owned(),
-		data: data_frame,
 		artifact: data.clone(),
+		receipts: Arc::clone(&workspace.receipts),
 	}))
 }
 
@@ -369,10 +418,14 @@ fn plot_show(plot: RunePlot) -> VmResult<Result<(), String>> {
 		Some((x, y)) => AuthoredPlotSpec::xy(plot.composition, x, y),
 		None => AuthoredPlotSpec::automatic(plot.composition),
 	};
+	let data = match plot.cell.artifact.projection() {
+		Ok(data) => data,
+		Err(error) => return VmResult::Ok(Err(error.to_string())),
+	};
 	let request = PlotRequest {
 		source: PlotSource::Materialized {
 			name: plot.cell.name,
-			data: ResultArtifact::from_polars_derived(plot.cell.data, &plot.cell.artifact),
+			data: ResultArtifact::from_polars_derived(data, &plot.cell.artifact),
 		},
 		authored_spec,
 	};
@@ -387,10 +440,46 @@ fn plot_show(plot: RunePlot) -> VmResult<Result<(), String>> {
 	}
 }
 
+fn cell_export_csv(cell: RuneCell, path: String) -> VmResult<Result<(), String>> {
+	let file = match OpenOptions::new().write(true).create_new(true).open(&path) {
+		Ok(file) => file,
+		Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+			return VmResult::Ok(Err(format!("CSV export refused: {path} already exists")));
+		}
+		Err(error) => return VmResult::Ok(Err(format!("CSV export failed for {path}: {error}"))),
+	};
+	let rows = match cell.artifact.write_csv(file) {
+		Ok(rows) => rows,
+		Err(error) => return VmResult::Ok(Err(format!("CSV export failed for {path}: {error}"))),
+	};
+	let receipt = ExportReceipt { path, rows };
+	match cell
+		.receipts
+		.lock()
+		.map_err(|_| "Export receipt queue was poisoned".to_owned())
+		.and_then(|mut queue| queue.push(receipt))
+	{
+		Ok(()) => VmResult::Ok(Ok(())),
+		Err(error) => VmResult::Ok(Err(error)),
+	}
+}
+
 #[cfg(test)]
 mod tests {
 	use super::*;
 	use polars::df;
+	use polars::frame::DataFrame;
+	use std::sync::atomic::{AtomicU64, Ordering};
+
+	static NEXT_EXPORT_FIXTURE: AtomicU64 = AtomicU64::new(1);
+
+	fn export_path(label: &str) -> std::path::PathBuf {
+		std::env::temp_dir().join(format!(
+			"polariton-product-0136-{label}-{}-{}.csv",
+			std::process::id(),
+			NEXT_EXPORT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+		))
+	}
 
 	fn cells(name: &str, data: DataFrame) -> RuneCapabilities {
 		RuneCapabilities {
@@ -578,5 +667,101 @@ viz.plot(workspace.result("test")?).scatter().show()?;
 		.expect("plot plus trailing expression executes");
 		assert_eq!(execution.display.as_deref(), Some("plotted test"));
 		assert_eq!(execution.requests.len(), 1);
+	}
+
+	#[test]
+	fn product_0136_named_cell_exports_csv_and_reports_a_receipt() {
+		let path = export_path("cell");
+		let source = format!(
+			r#"workspace.cell("trips")?.export_csv("{}")?;"#,
+			path.display()
+		);
+		let execution = execute_body(
+			&source,
+			cells(
+				"trips",
+				df!("x" => [1_i32, 2], "text" => ["comma, value", "plain"]).unwrap(),
+			),
+		)
+		.expect("named cell exports");
+		assert!(execution.requests.is_empty());
+		assert_eq!(execution.receipts.len(), 1);
+		assert_eq!(execution.receipts[0].path, path.display().to_string());
+		assert_eq!(execution.receipts[0].rows, 2);
+		assert_eq!(
+			std::fs::read_to_string(&path).expect("CSV exists"),
+			"x,text\n1,\"comma, value\"\n2,plain\n"
+		);
+		std::fs::remove_file(path).expect("remove export fixture");
+	}
+
+	#[test]
+	fn product_0136_named_result_exports_csv() {
+		let path = export_path("result");
+		let source = format!(
+			r#"workspace.result("sales")?.export_csv("{}")?;"#,
+			path.display()
+		);
+		let execution = execute_body(&source, results("sales", df!("amount" => [3_i32]).unwrap()))
+			.expect("published result exports");
+		assert_eq!(execution.receipts[0].rows, 1);
+		assert_eq!(
+			std::fs::read_to_string(&path).expect("CSV exists"),
+			"amount\n3\n"
+		);
+		std::fs::remove_file(path).expect("remove export fixture");
+	}
+
+	#[test]
+	fn product_0136_existing_file_refuses_without_clobbering() {
+		let path = export_path("existing");
+		std::fs::write(&path, "keep me").expect("seed existing file");
+		let source = format!(
+			r#"workspace.cell("trips")?.export_csv("{}")?;"#,
+			path.display()
+		);
+		let error = execute_body(&source, cells("trips", df!("x" => [1_i32]).unwrap()))
+			.expect_err("existing file refuses");
+		assert!(error.contains("already exists"), "unhelpful error: {error}");
+		assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep me");
+		std::fs::remove_file(path).expect("remove export fixture");
+	}
+
+	#[test]
+	fn product_0136_write_failures_surface_through_the_rune_error_path() {
+		let parent = std::env::temp_dir().join(format!(
+			"polariton-product-0136-no-directory-{}-{}",
+			std::process::id(),
+			NEXT_EXPORT_FIXTURE.fetch_add(1, Ordering::Relaxed)
+		));
+		let _ = std::fs::remove_dir_all(&parent);
+		let path = parent.join("sales.csv");
+		let source = format!(
+			r#"workspace.cell("trips")?.export_csv("{}")?;"#,
+			path.display()
+		);
+		let error = execute_body(&source, cells("trips", df!("x" => [1_i32]).unwrap()))
+			.expect_err("missing parent directory fails visibly");
+		assert!(
+			error.contains("CSV export failed"),
+			"unhelpful error: {error}"
+		);
+		assert!(!path.exists());
+	}
+
+	#[test]
+	fn product_0136_missing_result_keeps_the_existing_name_diagnostic() {
+		let path = export_path("missing");
+		let source = format!(
+			r#"workspace.result("absent")?.export_csv("{}")?;"#,
+			path.display()
+		);
+		let error = execute_body(&source, RuneCapabilities::default())
+			.expect_err("unknown result is rejected before export");
+		assert!(
+			error.contains("-- @result absent"),
+			"unhelpful error: {error}"
+		);
+		assert!(!path.exists());
 	}
 }

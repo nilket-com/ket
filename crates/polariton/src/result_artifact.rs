@@ -8,14 +8,15 @@
 
 use arrow_array::{Array, RecordBatch};
 use arrow_buffer::NullBuffer;
+use arrow_csv::Writer as ArrowCsvWriter;
 use arrow_ipc::reader::StreamReader;
 use arrow_schema::{DataType as ArrowDataType, SchemaRef};
 use polars::frame::DataFrame;
-use polars::io::SerReader;
-use polars::io::ipc::IpcStreamReader;
+use polars::io::ipc::{IpcStreamReader, IpcStreamWriter};
+use polars::io::{SerReader, SerWriter};
 use polars::prelude::AnyValue;
 use std::fmt;
-use std::io::Cursor;
+use std::io::{Cursor, Write};
 use std::num::NonZeroU64;
 use std::ops::Range;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -127,6 +128,7 @@ pub enum ResultArtifactError {
 	RowOutOfBounds { row: usize, height: usize },
 	NotArrowBacked,
 	Polars(String),
+	Csv(String),
 }
 
 impl fmt::Display for ResultArtifactError {
@@ -153,6 +155,7 @@ impl fmt::Display for ResultArtifactError {
 				formatter.write_str("raw validity segments require an Arrow backing")
 			}
 			Self::Polars(message) => write!(formatter, "Polars result access failed: {message}"),
+			Self::Csv(message) => write!(formatter, "CSV export failed: {message}"),
 		}
 	}
 }
@@ -298,6 +301,20 @@ impl ResultArtifact {
 		}
 	}
 
+	/// Serialize this artifact through the product's canonical Arrow CSV
+	/// writer. The Polars backing crosses its existing IPC compatibility seam
+	/// before reaching that writer; no Polars CSV surface is admitted.
+	pub fn write_csv<W: Write>(&self, output: W) -> Result<usize, ResultArtifactError> {
+		match &self.backing {
+			ResultBacking::Arrow(backing) => write_arrow_csv(
+				output,
+				Arc::clone(&backing.schema),
+				backing.batches.iter().cloned(),
+			),
+			ResultBacking::Polars(frame) => write_polars_csv(output, frame),
+		}
+	}
+
 	pub fn row_is_null(&self, field: &str, global_row: usize) -> Result<bool, ResultArtifactError> {
 		if global_row >= self.height() {
 			return Err(ResultArtifactError::RowOutOfBounds {
@@ -383,6 +400,51 @@ impl ResultArtifact {
 	}
 }
 
+fn write_arrow_csv<W, B>(
+	output: W,
+	schema: SchemaRef,
+	batches: B,
+) -> Result<usize, ResultArtifactError>
+where
+	W: Write,
+	B: IntoIterator<Item = RecordBatch>,
+{
+	let mut writer = ArrowCsvWriter::new(output);
+	let mut rows = 0_usize;
+	let mut wrote_batch = false;
+	for batch in batches {
+		rows = rows
+			.checked_add(batch.num_rows())
+			.ok_or(ResultArtifactError::RowCountOverflow)?;
+		writer
+			.write(&batch)
+			.map_err(|error| ResultArtifactError::Csv(error.to_string()))?;
+		wrote_batch = true;
+	}
+	if !wrote_batch {
+		writer
+			.write(&RecordBatch::new_empty(schema))
+			.map_err(|error| ResultArtifactError::Csv(error.to_string()))?;
+	}
+	Ok(rows)
+}
+
+fn write_polars_csv<W: Write>(output: W, frame: &DataFrame) -> Result<usize, ResultArtifactError> {
+	let mut ipc_stream = Vec::new();
+	let mut frame = frame.clone();
+	IpcStreamWriter::new(&mut ipc_stream)
+		.finish(&mut frame)
+		.map_err(|error| ResultArtifactError::Polars(error.to_string()))?;
+	let mut reader = StreamReader::try_new(Cursor::new(ipc_stream), None)
+		.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+	let schema = reader.schema();
+	let batches = reader
+		.by_ref()
+		.collect::<Result<Vec<_>, _>>()
+		.map_err(|error| ResultArtifactError::Ipc(error.to_string()))?;
+	write_arrow_csv(output, schema, batches)
+}
+
 fn needs_logical_nulls(data_type: &ArrowDataType) -> bool {
 	matches!(
 		data_type,
@@ -414,9 +476,12 @@ fn decode_polars_projection(ipc_streams: &[Vec<u8>]) -> Result<DataFrame, String
 #[cfg(test)]
 mod tests {
 	use super::*;
-	use arrow_array::{ArrayRef, Int32Array, NullArray};
+	use arrow_array::{
+		ArrayRef, Date32Array, Float64Array, Int32Array, Int64Array, NullArray, StringArray,
+		TimestampMicrosecondArray,
+	};
 	use arrow_ipc::writer::StreamWriter;
-	use arrow_schema::{DataType, Field, Schema};
+	use arrow_schema::{DataType, Field, Schema, TimeUnit};
 	use libaryon::core::BufferId;
 
 	fn schema(fields: Vec<Field>) -> SchemaRef {
@@ -450,6 +515,39 @@ mod tests {
 			vec![
 				Arc::new(Int32Array::from(vec![1, 2])) as ArrayRef,
 				Arc::new(Int32Array::from(vec![3, 4])) as ArrayRef,
+			],
+		);
+		stream(&schema, &[batch])
+	}
+
+	fn csv_fixture_stream() -> Vec<u8> {
+		let schema = schema(vec![
+			Field::new("big", DataType::Int64, false),
+			Field::new("ratio", DataType::Float64, false),
+			Field::new(
+				"when",
+				DataType::Timestamp(TimeUnit::Microsecond, None),
+				false,
+			),
+			Field::new("day", DataType::Date32, false),
+			Field::new("text", DataType::Utf8, true),
+			Field::new("nullable", DataType::Utf8, true),
+		]);
+		let batch = batch(
+			Arc::clone(&schema),
+			vec![
+				Arc::new(Int64Array::from(vec![9_007_199_254_740_991_i64, -9])) as ArrayRef,
+				Arc::new(Float64Array::from(vec![0.1_f64 + 0.2, -1.25])) as ArrayRef,
+				Arc::new(TimestampMicrosecondArray::from(vec![
+					1_704_067_200_123_456_i64,
+					1_704_067_200_000_001_i64,
+				])) as ArrayRef,
+				Arc::new(Date32Array::from(vec![19_723_i32, 19_724])) as ArrayRef,
+				Arc::new(StringArray::from(vec![
+					Some("comma, quote\" and\nnewline"),
+					Some("plain"),
+				])) as ArrayRef,
+				Arc::new(StringArray::from(vec![None::<&str>, None])) as ArrayRef,
 			],
 		);
 		stream(&schema, &[batch])
@@ -667,5 +765,43 @@ mod tests {
 		assert!(matches!(segments[0].nulls, ArrowNulls::Logical(_)));
 		assert!((0..3).all(|row| artifact.row_is_null("nothing", row).unwrap()));
 		assert!(!artifact.projection_is_built());
+	}
+
+	#[test]
+	fn product_0136_arrow_csv_is_canonical_and_keeps_the_projection_lazy() {
+		let artifact = ResultArtifact::from_arrow_ipc(
+			vec![csv_fixture_stream()],
+			ArrowNullabilityPolicy::Preserve,
+		)
+		.expect("Arrow CSV fixture");
+		let mut csv = Vec::new();
+		assert_eq!(artifact.write_csv(&mut csv).expect("Arrow CSV writes"), 2);
+		assert!(!artifact.projection_is_built());
+		assert_eq!(
+			String::from_utf8(csv).expect("CSV UTF-8"),
+			concat!(
+				"big,ratio,when,day,text,nullable\n",
+				"9007199254740991,0.30000000000000004,2024-01-01T00:00:00.123456,2024-01-01,\"comma, quote\"\" and\nnewline\",\n",
+				"-9,-1.25,2024-01-01T00:00:00.000001,2024-01-02,plain,\n"
+			)
+		);
+	}
+
+	#[test]
+	fn product_0136_polars_compatibility_projection_matches_arrow_csv_bytes() {
+		let arrow = ResultArtifact::from_arrow_ipc(
+			vec![csv_fixture_stream()],
+			ArrowNullabilityPolicy::Preserve,
+		)
+		.expect("Arrow fixture");
+		let polars = ResultArtifact::from_polars(arrow.projection().expect("Polars projection"));
+		let mut canonical = Vec::new();
+		let mut compatibility = Vec::new();
+		assert_eq!(arrow.write_csv(&mut canonical).expect("Arrow writes"), 2);
+		assert_eq!(
+			polars.write_csv(&mut compatibility).expect("Polars writes"),
+			2
+		);
+		assert_eq!(compatibility, canonical);
 	}
 }
