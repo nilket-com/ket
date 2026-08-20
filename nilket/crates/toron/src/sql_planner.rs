@@ -3863,6 +3863,7 @@ impl SqlPlanner {
 				let before = collected.len();
 				effective_selection = match effective_selection {
 					Some(selection) => Some(self.pull_up_scalar_subqueries(
+						SubqueryPosition::Predicate,
 						&selection,
 						&mut collected,
 						&outer_qualifiers,
@@ -5752,6 +5753,7 @@ impl SqlPlanner {
 			let body_qualifiers = plan_qualifiers(&plan);
 			let mut collected = Vec::new();
 			effective_selection = self.pull_up_scalar_subqueries(
+				SubqueryPosition::Predicate,
 				&effective_selection,
 				&mut collected,
 				&body_qualifiers,
@@ -6230,12 +6232,30 @@ impl SqlPlanner {
 	/// subqueries reject here.
 	fn pull_up_scalar_subqueries(
 		&self,
+		position: SubqueryPosition,
 		expr: &SqlExpr,
 		collected: &mut Vec<PulledScalar>,
 		outer_qualifiers: &[TableRef],
 		cte: &CteScope,
 	) -> Result<SqlExpr, FrontendError> {
 		match expr {
+			// ADR 573: a predicate EXISTS keeps its semi-join — this traversal
+			// runs over the WHERE as well, and a semi-join is the better shape
+			// where a row filter is what's wanted. A projected EXISTS needs a
+			// value for every outer row, including the ones a semi-join drops.
+			SqlExpr::Exists { subquery, negated }
+				if matches!(position, SubqueryPosition::Projection) =>
+			{
+				let alias = format!("__exists_{}", collected.len());
+				self.pull_up_projected_exists(
+					subquery,
+					*negated,
+					&alias,
+					collected,
+					outer_qualifiers,
+					cte,
+				)
+			}
 			SqlExpr::Subquery(query) => {
 				let alias = format!("__scalar_{}", collected.len());
 				// ADR 571: a single-column projection with no aggregate call is
@@ -6447,10 +6467,11 @@ impl SqlPlanner {
 				}
 			}
 			SqlExpr::Nested(inner) => Ok(SqlExpr::Nested(Box::new(
-				self.pull_up_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+				self.pull_up_scalar_subqueries(position, inner, collected, outer_qualifiers, cte)?,
 			))),
 			SqlExpr::BinaryOp { left, op, right } => Ok(SqlExpr::BinaryOp {
 				left: Box::new(self.pull_up_scalar_subqueries(
+					position,
 					left,
 					collected,
 					outer_qualifiers,
@@ -6458,6 +6479,7 @@ impl SqlPlanner {
 				)?),
 				op: op.clone(),
 				right: Box::new(self.pull_up_scalar_subqueries(
+					position,
 					right,
 					collected,
 					outer_qualifiers,
@@ -6467,6 +6489,7 @@ impl SqlPlanner {
 			SqlExpr::UnaryOp { op, expr } => Ok(SqlExpr::UnaryOp {
 				op: *op,
 				expr: Box::new(self.pull_up_scalar_subqueries(
+					position,
 					expr,
 					collected,
 					outer_qualifiers,
@@ -6474,10 +6497,10 @@ impl SqlPlanner {
 				)?),
 			}),
 			SqlExpr::IsNull(inner) => Ok(SqlExpr::IsNull(Box::new(
-				self.pull_up_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+				self.pull_up_scalar_subqueries(position, inner, collected, outer_qualifiers, cte)?,
 			))),
 			SqlExpr::IsNotNull(inner) => Ok(SqlExpr::IsNotNull(Box::new(
-				self.pull_up_scalar_subqueries(inner, collected, outer_qualifiers, cte)?,
+				self.pull_up_scalar_subqueries(position, inner, collected, outer_qualifiers, cte)?,
 			))),
 			SqlExpr::Cast {
 				kind,
@@ -6488,6 +6511,7 @@ impl SqlPlanner {
 			} => Ok(SqlExpr::Cast {
 				kind: kind.clone(),
 				expr: Box::new(self.pull_up_scalar_subqueries(
+					position,
 					expr,
 					collected,
 					outer_qualifiers,
@@ -6504,6 +6528,7 @@ impl SqlPlanner {
 				high,
 			} => Ok(SqlExpr::Between {
 				expr: Box::new(self.pull_up_scalar_subqueries(
+					position,
 					expr,
 					collected,
 					outer_qualifiers,
@@ -6511,12 +6536,14 @@ impl SqlPlanner {
 				)?),
 				negated: *negated,
 				low: Box::new(self.pull_up_scalar_subqueries(
+					position,
 					low,
 					collected,
 					outer_qualifiers,
 					cte,
 				)?),
 				high: Box::new(self.pull_up_scalar_subqueries(
+					position,
 					high,
 					collected,
 					outer_qualifiers,
@@ -6535,7 +6562,13 @@ impl SqlPlanner {
 				operand: operand
 					.as_ref()
 					.map(|operand| {
-						self.pull_up_scalar_subqueries(operand, collected, outer_qualifiers, cte)
+						self.pull_up_scalar_subqueries(
+							position,
+							operand,
+							collected,
+							outer_qualifiers,
+							cte,
+						)
 					})
 					.transpose()?
 					.map(Box::new),
@@ -6544,12 +6577,14 @@ impl SqlPlanner {
 					.map(|case_when| {
 						Ok(CaseWhen {
 							condition: self.pull_up_scalar_subqueries(
+								position,
 								&case_when.condition,
 								collected,
 								outer_qualifiers,
 								cte,
 							)?,
 							result: self.pull_up_scalar_subqueries(
+								position,
 								&case_when.result,
 								collected,
 								outer_qualifiers,
@@ -6562,6 +6597,7 @@ impl SqlPlanner {
 					.as_ref()
 					.map(|else_result| {
 						self.pull_up_scalar_subqueries(
+							position,
 							else_result,
 							collected,
 							outer_qualifiers,
@@ -6573,6 +6609,136 @@ impl SqlPlanner {
 			}),
 			_ => Ok(expr.clone()),
 		}
+	}
+
+	/// ADR 573: a projected `EXISTS` becomes a decorrelated `COUNT(*)` compared
+	/// to zero. The admitted subquery shapes are the predicate form's — the same
+	/// validators run — but the recombine is a `LeftOuter` onto the outer keys
+	/// rather than a semi-join, because every outer row needs a value, including
+	/// the ones with no match. Those read a NULL count, which
+	/// [`count_empty_group_coalesce`] turns into `0`: that step is what makes the
+	/// result two-valued for every input, with no NULL to propagate.
+	fn pull_up_projected_exists(
+		&self,
+		subquery: &Query,
+		negated: bool,
+		alias: &str,
+		collected: &mut Vec<PulledScalar>,
+		outer_qualifiers: &[TableRef],
+		cte: &CteScope,
+	) -> Result<SqlExpr, FrontendError> {
+		validate_exists_query_shape(subquery)?;
+		let SetExpr::Select(select) = &*subquery.body else {
+			return Err(unsupported("unsupported EXISTS subquery body"));
+		};
+		validate_exists_select_shape(select)?;
+		validate_exists_projection(&select.projection)?;
+
+		let table_with_joins = select
+			.from
+			.first()
+			.expect("exists select shape has one FROM item");
+		let mut inner_plan = self.lower_table_factor(&table_with_joins.relation, cte)?;
+		let inner_qualifiers = plan_qualifiers(&inner_plan);
+		let mut correlation_pairs: Vec<(Expr, Expr)> = Vec::new();
+		let mut inner_residuals: Vec<Expr> = Vec::new();
+		if let Some(selection) = &select.selection {
+			for conjunct in split_top_level_and(selection) {
+				match self.classify_exists_conjunct(
+					conjunct,
+					outer_qualifiers,
+					&inner_qualifiers,
+				)? {
+					ExistsConjunct::CorrelatedPair { outer, inner } => {
+						correlation_pairs.push((outer, inner))
+					}
+					ExistsConjunct::InnerResidual(predicate) => inner_residuals.push(predicate),
+					// A non-equi correlation cannot become a group key, and a
+					// projected EXISTS has no semi-join to carry it as a filter.
+					ExistsConjunct::CorrelatedResidual(_) => {
+						return Err(unsupported(
+							"unsupported non-equi correlation in a projected EXISTS",
+						));
+					}
+				}
+			}
+		}
+		if let Some(predicate) = combine_and_exprs(inner_residuals) {
+			inner_plan = LogicalPlan::Filter {
+				input: Box::new(inner_plan),
+				predicate,
+			};
+		}
+
+		let group_expr: Vec<Expr> = correlation_pairs
+			.iter()
+			.map(|(_, inner)| inner.clone())
+			.collect();
+		let aggregate_input = if group_expr.is_empty() {
+			inner_plan
+		} else {
+			LogicalPlan::Exchange {
+				input: Box::new(inner_plan),
+				partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
+				key: group_expr.clone(),
+			}
+		};
+		let aggregate = LogicalPlan::Aggregate {
+			input: Box::new(aggregate_input),
+			group_expr,
+			aggr_expr: vec![(AggregateFunction::CountAll, Vec::new())],
+		};
+		let mut columns: Vec<String> = (0..correlation_pairs.len())
+			.map(|index| format!("key_{index}"))
+			.collect();
+		columns.push(SCALAR_SUBQUERY_COLUMN.to_string());
+		let correlated = !correlation_pairs.is_empty();
+		let on: Vec<(Expr, Expr)> = correlation_pairs
+			.into_iter()
+			.enumerate()
+			.map(|(index, (outer, _))| {
+				(
+					outer,
+					Expr::qualified_column(TableRef::new(alias.to_owned()), format!("key_{index}")),
+				)
+			})
+			.collect();
+		collected.push(PulledScalar::Resolved {
+			plan: LogicalPlan::Alias {
+				input: Box::new(aggregate),
+				alias: TableRef::new(alias.to_owned()),
+				columns,
+			},
+			on,
+		});
+
+		// Correlated: a grouped COUNT never emits a zero-count group, so a group
+		// exists exactly when the outer row matched — and the LeftOuter marks a
+		// miss with NULL. `IS NOT NULL` is therefore the whole test, and it is
+		// non-nullable by definition, which is how the two-valued result stays
+		// two-valued in the schema and not merely in the values.
+		// Keyless: the global COUNT always emits its one row (0 over an empty
+		// input), so the count itself is compared.
+		let value = scalar_value_reference(alias);
+		Ok(if correlated {
+			if negated {
+				SqlExpr::IsNull(Box::new(value))
+			} else {
+				SqlExpr::IsNotNull(Box::new(value))
+			}
+		} else {
+			SqlExpr::BinaryOp {
+				left: Box::new(value),
+				op: if negated {
+					BinaryOperator::Eq
+				} else {
+					BinaryOperator::Gt
+				},
+				right: Box::new(SqlExpr::Value(
+					Value::Number("0".to_string(), false).with_empty_span(),
+				)),
+			}
+		})
 	}
 
 	/// ADR 257: rewrite a SELECT projection item, pulling scalar subqueries in its expression up into
@@ -6705,11 +6871,23 @@ impl SqlPlanner {
 		cte: &CteScope,
 	) -> Result<SelectItem, FrontendError> {
 		match item {
-			SelectItem::UnnamedExpr(expr) => Ok(SelectItem::UnnamedExpr(
-				self.pull_up_scalar_subqueries(expr, collected, outer_qualifiers, cte)?,
-			)),
+			SelectItem::UnnamedExpr(expr) => {
+				Ok(SelectItem::UnnamedExpr(self.pull_up_scalar_subqueries(
+					SubqueryPosition::Projection,
+					expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?))
+			}
 			SelectItem::ExprWithAlias { expr, alias } => Ok(SelectItem::ExprWithAlias {
-				expr: self.pull_up_scalar_subqueries(expr, collected, outer_qualifiers, cte)?,
+				expr: self.pull_up_scalar_subqueries(
+					SubqueryPosition::Projection,
+					expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?,
 				alias: alias.clone(),
 			}),
 			other => Ok(other.clone()),
@@ -7174,7 +7352,7 @@ impl SqlPlanner {
 				else_result,
 				..
 			} => self.lower_case(operand.as_deref(), conditions, else_result.as_deref()),
-			SqlExpr::InSubquery { .. } => Err(unsupported("IN subquery is not supported")),
+			SqlExpr::InSubquery { .. } => Err(unsupported(refused_expression_message(sql_expr))),
 			SqlExpr::InUnnest { .. } => Err(unsupported("IN UNNEST is not supported")),
 			SqlExpr::SimilarTo {
 				negated,
@@ -7475,11 +7653,11 @@ impl SqlPlanner {
 					// unrecognized call reaches — plain, WITHIN GROUP, or grouped.
 					None => match refused_aggregate_message(&f.name) {
 						Some(message) => Err(unsupported(message)),
-						None => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
+						None => Err(unsupported(format!("unsupported function: {}", f.name))),
 					},
 				},
 			},
-			_ => Err(unsupported(format!("unsupported expression: {sql_expr:?}"))),
+			_ => Err(unsupported(refused_expression_message(sql_expr))),
 		}
 	}
 
@@ -11163,6 +11341,43 @@ enum PulledScalar {
 }
 
 /// The `__scalar_N.value` reference the rewritten outer expression uses in place of a pulled scalar.
+/// ADR 573: name the SQL construct that was refused. The parser's own debug
+/// rendering used to reach operators here, which named a Rust type rather than
+/// anything they wrote. Positions this cut deliberately leaves out say so, and
+/// say where the decision lives.
+fn refused_expression_message(expr: &SqlExpr) -> String {
+	match expr {
+		SqlExpr::Exists { .. } => {
+			"EXISTS is supported as a predicate and in a projection; this position is not \
+			 supported"
+				.to_string()
+		}
+		SqlExpr::InSubquery { .. } => {
+			"IN (subquery) is supported as a predicate; a projected IN awaits the mark join that \
+			 carries its third truth value"
+				.to_string()
+		}
+		SqlExpr::AnyOp { .. } | SqlExpr::AllOp { .. } => {
+			"a quantified comparison is supported as a predicate; a projected one awaits the mark \
+			 join that carries its third truth value"
+				.to_string()
+		}
+		SqlExpr::Subquery(_) => "unsupported subquery position".to_string(),
+		other => format!("unsupported expression: {other}"),
+	}
+}
+
+/// Where a subquery sits in the statement. `EXISTS` lowers differently in each
+/// position and one traversal serves both, so the position travels as a type
+/// rather than as a call-site convention (ADR 573).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SubqueryPosition {
+	/// A value is required for every outer row.
+	Projection,
+	/// A row filter is required; `EXISTS` keeps its semi-join lowering.
+	Predicate,
+}
+
 fn scalar_value_reference(alias: &str) -> SqlExpr {
 	SqlExpr::CompoundIdentifier(vec![Ident::new(alias), Ident::new(SCALAR_SUBQUERY_COLUMN)])
 }

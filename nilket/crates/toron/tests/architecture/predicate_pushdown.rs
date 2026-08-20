@@ -451,7 +451,19 @@ pub(crate) fn adr014_sql_in_absence_guard_is_retargeted_after_adr074() {
 	assert!(source.contains("SqlExpr::InList"));
 	assert!(source.contains("Expr::InList"));
 	assert!(source.contains("SqlExpr::InSubquery { .. }"));
-	assert!(source.contains("IN subquery is not supported"));
+	// ADR 573 moved the refusal text into `refused_expression_message`, which
+	// names the deferral instead of restating the construct. The guard's claim
+	// is unchanged — `IN (subquery)` in this expression position still refuses
+	// — so it now reads the refusal where the refusal lives.
+	assert!(
+		source
+			.contains("SqlExpr::InSubquery { .. } => Err(unsupported(refused_expression_message("),
+		"the IN-subquery expression position must still route to a refusal"
+	);
+	assert!(
+		source.contains("a projected IN awaits the mark join"),
+		"and that refusal must name where the decision went"
+	);
 }
 
 #[test]

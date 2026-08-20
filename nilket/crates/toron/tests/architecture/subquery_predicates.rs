@@ -304,3 +304,66 @@ pub(crate) fn adr260_aggregate_arg_and_non_aggregate_scalar_stay_deferred() {
 		"the deferred-shape rejects are pinned"
 	);
 }
+
+#[test]
+pub(crate) fn adr0573_projected_exists_reuses_the_predicate_form_machinery() {
+	let planner = source("src/sql_planner.rs");
+
+	// One EXISTS shape vocabulary serves both positions: the projected path
+	// calls the predicate form's validators rather than growing its own.
+	let projected = planner
+		.split("fn pull_up_projected_exists")
+		.nth(1)
+		.and_then(|tail| tail.split("\n\tfn ").next())
+		.expect("projected EXISTS lowering");
+	for validator in [
+		"validate_exists_query_shape",
+		"validate_exists_select_shape",
+		"validate_exists_projection",
+		"classify_exists_conjunct",
+	] {
+		assert!(
+			projected.contains(validator),
+			"the projected path must reuse {validator}, not restate its own shape rules"
+		);
+	}
+	assert!(
+		!projected.contains("JoinKind::"),
+		"ADR 573 introduces no join kind: the recombine is join_scalar_subplans' LeftOuter"
+	);
+	for exists_validator in [
+		"fn validate_exists_query_shape",
+		"fn validate_exists_select_shape",
+		"fn validate_exists_projection",
+	] {
+		assert_eq!(
+			planner.matches(exists_validator).count(),
+			1,
+			"a second EXISTS shape validator would let the two positions drift: {exists_validator}"
+		);
+	}
+
+	// The position is a type and it is passed explicitly at both entries, so
+	// neither a projection nor a predicate can silently take the other's path.
+	assert!(planner.contains("enum SubqueryPosition"));
+	assert!(
+		planner.contains("SubqueryPosition::Projection")
+			&& planner.contains("SubqueryPosition::Predicate"),
+		"both positions must be named at their call sites"
+	);
+	assert!(
+		!planner.contains("position: SubqueryPosition::default()")
+			&& !planner.contains("impl Default for SubqueryPosition"),
+		"a default position would make the seam implicit again"
+	);
+
+	// The operator-facing refusal never carries the parser's own rendering.
+	assert!(
+		!planner.contains("unsupported expression: {sql_expr:?}"),
+		"a parser AST dump must not reach an operator"
+	);
+	assert!(
+		planner.contains("fn refused_expression_message"),
+		"refusals name the SQL construct"
+	);
+}

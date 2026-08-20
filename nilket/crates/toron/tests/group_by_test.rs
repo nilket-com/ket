@@ -10822,3 +10822,282 @@ async fn adr571_select_and_where_positions_agree_and_the_kernel_is_reserved() {
 		"got {reserved}"
 	);
 }
+
+/// ADR 573: `(id, exists_flag)` pairs from a projected EXISTS, id-sorted.
+/// `None` marks a NULL flag — which this cut's semantics forbid, so the
+/// controls below can state that as an assertion rather than assume it.
+fn exists_flags(rows: &[RecordBatch]) -> Vec<(i64, Option<bool>)> {
+	let mut pairs = Vec::new();
+	for batch in rows {
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id output");
+		let flags = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<arrow::array::BooleanArray>()
+			.expect("exists output");
+		for row in 0..batch.num_rows() {
+			pairs.push((
+				ids.value(row),
+				flags.is_valid(row).then(|| flags.value(row)),
+			));
+		}
+	}
+	pairs.sort_by_key(|(id, _)| *id);
+	pairs
+}
+
+#[tokio::test]
+async fn adr0573_projected_exists_agrees_with_the_predicate_form() {
+	// The inner residual (`status = 'closed'`) rides a computed column: this
+	// fixture's scan ignores predicates pushed directly onto it, so a bare
+	// `l.status = 'closed'` would silently not apply and the control would
+	// prove nothing about residual handling.
+	let projected = run_logical(&plan_sql(
+		"SELECT o.id, EXISTS (SELECT 1 FROM (SELECT region, CONCAT(status, '') AS s FROM sales) l WHERE l.s = 'closed' AND l.region = o.region) FROM sales o",
+	))
+	.await;
+	let kept = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE EXISTS (SELECT 1 FROM (SELECT region, CONCAT(status, '') AS s FROM sales) l WHERE l.s = 'closed' AND l.region = o.region)",
+		))
+		.await,
+	);
+
+	let flags = exists_flags(&projected);
+	assert_eq!(
+		flags.len(),
+		6,
+		"a projected EXISTS never fans out the outer"
+	);
+	let true_ids: Vec<i64> = flags
+		.iter()
+		.filter(|(_, flag)| *flag == Some(true))
+		.map(|(id, _)| *id)
+		.collect();
+	assert_eq!(
+		true_ids, kept,
+		"the projected verdict must be the predicate form's row set"
+	);
+
+	// The discriminating rows: ids 2 and 5 are 'west', which has no closed row
+	// (a key that matches nothing), and id 6 carries a NULL region (a NULL
+	// correlation key). Under any three-valued treatment these read NULL;
+	// EXISTS is two-valued, so they read FALSE.
+	assert_eq!(
+		flags,
+		vec![
+			(1, Some(true)),
+			(2, Some(false)),
+			(3, Some(true)),
+			(4, Some(true)),
+			(5, Some(false)),
+			(6, Some(false)),
+		]
+	);
+	assert!(
+		!projected[0].schema().field(1).is_nullable(),
+		"a projected EXISTS is non-nullable by construction"
+	);
+}
+
+#[tokio::test]
+async fn adr0573_projected_not_exists_is_the_exact_complement() {
+	let query = |negated: &str| {
+		format!(
+			"SELECT o.id, {negated} EXISTS (SELECT 1 FROM (SELECT region, CONCAT(status, '') AS s FROM sales) l WHERE l.s = 'closed' AND l.region = o.region) FROM sales o"
+		)
+	};
+	let affirmed = exists_flags(&run_logical(&plan_sql(&query(""))).await);
+	let negated = exists_flags(&run_logical(&plan_sql(&query("NOT"))).await);
+
+	assert_eq!(affirmed.len(), negated.len());
+	for ((id, yes), (negated_id, no)) in affirmed.iter().zip(negated.iter()) {
+		assert_eq!(id, negated_id);
+		let (Some(yes), Some(no)) = (yes, no) else {
+			panic!("neither form may produce NULL: id {id} read {yes:?} / {no:?}");
+		};
+		assert_ne!(yes, no, "NOT EXISTS must be the complement at id {id}");
+	}
+	assert!(
+		affirmed.iter().any(|(_, flag)| *flag == Some(true))
+			&& affirmed.iter().any(|(_, flag)| *flag == Some(false)),
+		"the complement claim is vacuous unless both values occur: {affirmed:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr0573_empty_inner_relation_is_false_not_null() {
+	let rows = run_logical(&plan_sql(
+		"SELECT o.id, EXISTS (SELECT 1 FROM empty_sales l WHERE l.id = o.id) FROM sales o",
+	))
+	.await;
+	let flags = exists_flags(&rows);
+	assert_eq!(flags.len(), 6, "every outer row survives");
+	assert!(
+		flags.iter().all(|(_, flag)| *flag == Some(false)),
+		"an empty inner relation is FALSE everywhere, never NULL: {flags:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr0573_uncorrelated_projected_exists_is_constant_and_does_not_fan_out() {
+	let present = exists_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, EXISTS (SELECT 1 FROM regions r) FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(present.len(), 6);
+	assert!(present.iter().all(|(_, flag)| *flag == Some(true)));
+
+	let absent = exists_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, EXISTS (SELECT 1 FROM empty_sales l) FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(
+		absent.len(),
+		6,
+		"an empty uncorrelated inner keeps the rows"
+	);
+	assert!(
+		absent.iter().all(|(_, flag)| *flag == Some(false)),
+		"an empty uncorrelated inner is FALSE, not NULL and not zero rows: {absent:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr0573_duplicate_inner_correlation_keys_do_not_fan_out_the_outer() {
+	// left_dups carries k = [1, 1, 2, 3, 3]: ids 1 and 3 match twice. The
+	// grouped COUNT emits one row per key, so the outer keeps its cardinality
+	// — a semi-join-free rewrite that fanned out would double these rows.
+	let flags = exists_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, EXISTS (SELECT 1 FROM left_dups d WHERE d.k = o.id) FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(
+		flags.len(),
+		6,
+		"doubled inner keys must not fan out: {flags:?}"
+	);
+	assert_eq!(
+		flags,
+		vec![
+			(1, Some(true)),
+			(2, Some(true)),
+			(3, Some(true)),
+			(4, Some(false)),
+			(5, Some(false)),
+			(6, Some(false)),
+		]
+	);
+}
+
+#[tokio::test]
+async fn adr0573_projected_exists_composes_in_case_and_boolean_context() {
+	let rows = run_logical(&plan_sql(
+		"SELECT o.id, CASE WHEN EXISTS (SELECT 1 FROM (SELECT region, CONCAT(status, '') AS s FROM sales) l WHERE l.s = 'closed' AND l.region = o.region) \
+		 THEN 1 ELSE 0 END FROM sales o",
+	))
+	.await;
+	let ids = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("id output");
+	let marks = rows[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int32Array>()
+		.expect("case output");
+	let mut pairs: Vec<(i64, i32)> = (0..rows[0].num_rows())
+		.map(|row| (ids.value(row), marks.value(row)))
+		.collect();
+	pairs.sort_by_key(|(id, _)| *id);
+	assert_eq!(pairs, vec![(1, 1), (2, 0), (3, 1), (4, 1), (5, 0), (6, 0)]);
+
+	// Combined with an ordinary predicate in a boolean expression.
+	let combined = exists_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, EXISTS (SELECT 1 FROM (SELECT region, CONCAT(status, '') AS s FROM sales) l WHERE l.s = 'closed' AND l.region = o.region) AND o.id > 2 FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(
+		combined,
+		vec![
+			(1, Some(false)),
+			(2, Some(false)),
+			(3, Some(true)),
+			(4, Some(true)),
+			(5, Some(false)),
+			(6, Some(false)),
+		]
+	);
+}
+
+#[tokio::test]
+async fn adr0573_predicate_position_exists_keeps_its_semi_join() {
+	// The position-blind regression this cut had to avoid: a WHERE EXISTS must
+	// still lower to the join shape, never to the projected aggregate path.
+	// The projected path is the only producer of a `__exists_N` alias, so its
+	// absence is exactly the claim "this did not route through that path".
+	fn mentions_exists_aggregate(plan: &LogicalPlan) -> bool {
+		format!("{plan:?}").contains("__exists_")
+	}
+
+	for sql in [
+		"SELECT o.id FROM sales o WHERE EXISTS (SELECT 1 FROM sales l WHERE l.region = o.region)",
+		"SELECT o.id FROM sales o WHERE NOT EXISTS (SELECT 1 FROM sales l WHERE l.region = o.region)",
+	] {
+		let plan = plan_sql(sql);
+		assert!(
+			!mentions_exists_aggregate(&plan),
+			"a predicate EXISTS must not route through the projected COUNT path: {sql}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr0573_refused_positions_name_themselves_and_their_deferral() {
+	// The AST dump the grounding probe found is gone: each refusal names the
+	// SQL construct, and the three-valued forms name where their decision went.
+	for sql in [
+		"SELECT o.id, o.amount IN (SELECT l.amount FROM sales l) FROM sales o",
+		"SELECT o.id, o.amount > ANY (SELECT l.amount FROM sales l) FROM sales o",
+	] {
+		let error = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("a three-valued projected form is deferred");
+		let message = error.to_string();
+		assert!(
+			message.contains("mark join"),
+			"the refusal must name where the decision went: {message}"
+		);
+		assert!(
+			message.contains("predicate"),
+			"and must say the predicate form works: {message}"
+		);
+	}
+	let having = SqlPlanner::new()
+		.plan(
+			"SELECT o.region FROM sales o GROUP BY o.region \
+			 HAVING EXISTS (SELECT 1 FROM regions r WHERE r.region = o.region)",
+		)
+		.expect_err("HAVING EXISTS is out of this cut");
+	assert!(
+		having.to_string().contains("HAVING"),
+		"the refusal names the position rather than a parser type: {having}"
+	);
+	assert!(
+		!having.to_string().contains("SqlExpr") && !having.to_string().contains("Ident {"),
+		"no parser AST may reach an operator: {having}"
+	);
+}

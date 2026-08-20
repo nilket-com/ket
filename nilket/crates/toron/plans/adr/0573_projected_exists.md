@@ -19,9 +19,9 @@ have no inner match at all — precisely the rows a semi-join discards.
 
 The decorrelated grouped aggregate already produces exactly that: ADR 260's
 correlated-scalar path builds `COUNT` keyed on the correlation keys and
-recombines with a `LeftOuter`, and `count_empty_group_coalesce` already
-converts the unmatched-group `NULL` into `0`. Projected `EXISTS` is that
-value, compared to zero. No new join type, no new kernel.
+recombines with a `LeftOuter`, which marks an outer row with no matching
+group. Projected `EXISTS` is a test on that mark. No new join type, no new
+kernel.
 
 The seam that needs care: `pull_up_scalar_subqueries` runs over the WHERE
 selection as well as the projection list. `SqlExpr::Exists` currently falls
@@ -39,15 +39,18 @@ silently re-plan every existing `WHERE EXISTS` onto the aggregate path.
 plan is byte-identical. The distinction is carried by a type rather than a
 call-site convention because both positions share one traversal.
 
-### 2. Projected EXISTS lowers to a decorrelated COUNT compared to zero
+### 2. Projected EXISTS lowers to a test on a decorrelated COUNT
 
 Correlated: classify the inner WHERE with the existing
 `classify_exists_conjunct` splitter, build `COUNT(*)` grouped on the inner
-correlation keys, recombine with `LeftOuter` on the outer keys, and rewrite
-the projection expression to `count_empty_group_coalesce(value) > 0`.
-Uncorrelated: the keyless global `COUNT(*)` under ADR 257's `Cross`, rewritten
-to `value > 0`. `NOT EXISTS` is the same plan with `= 0` — negation is a
-comparison flip, never a separate lowering.
+correlation keys, and recombine with `LeftOuter` on the outer keys. A grouped
+`COUNT` never emits a zero-count group, so a group exists exactly when the
+outer row matched and the `LeftOuter` marks a miss with NULL: the whole test
+is `value IS NOT NULL`, and `NOT EXISTS` is `value IS NULL`.
+Uncorrelated: the keyless global `COUNT(*)` under ADR 257's `Cross` — which
+does emit its one row, `0`, over an empty input — rewritten to `value > 0`,
+and `= 0` when negated. Negation is a flip of the test, never a separate
+lowering.
 
 Admitted subquery shapes are exactly the predicate form's: the same
 `validate_exists_query_shape` / `validate_exists_select_shape` /
@@ -59,9 +62,12 @@ splitter cannot classify refuses with the existing directive.
 
 `EXISTS` is TRUE or FALSE — never NULL — for every input, including a NULL
 correlation key, an empty inner relation, and an inner relation of all-NULL
-rows. The `COALESCE`-to-zero step is what makes that structural here: an
-outer row with no matching group reads `0`, which compares to `FALSE`, not
-`NULL`.
+rows. The null-test formulation is what makes that structural rather than
+incidental: `IS NOT NULL` is non-nullable by definition, so the projected
+column is non-nullable in the schema and not merely in the values it happens
+to carry. An earlier `COALESCE(value, 0) > 0` produced the same values but
+inferred as nullable, which would have left the guarantee unstated where it
+matters most.
 
 This is exactly why the same rewrite does **not** extend to projected `IN`
 or the quantified comparisons of ADR 568. Those are three-valued: `x IN
@@ -103,11 +109,17 @@ quantified forms name the mark-join deferral.
 
 ## Guardrails
 
-The rewrite reuses `classify_exists_conjunct`,
-`count_empty_group_coalesce`, and the `validate_exists_*` shape validators —
-a guard pins that the projected path introduces no second EXISTS shape
-validator and no new `JoinKind`. Admitted-shape parity between the two
-positions is asserted, not assumed.
+The rewrite reuses `classify_exists_conjunct` and the `validate_exists_*`
+shape validators — a guard pins that the projected path introduces no second
+EXISTS shape validator and no new `JoinKind`, and that the position type
+reaches both call sites so neither can silently default. Admitted-shape parity
+between the two positions is asserted, not assumed.
+
+The fixture note that the controls carry: this suite's scan ignores predicates
+pushed directly onto it, so a control whose discrimination rests on an inner
+residual must route that residual through a computed column. A bare
+`l.status = 'closed'` would not apply and the control would pass while
+proving nothing.
 
 ## Risks and deferrals
 
