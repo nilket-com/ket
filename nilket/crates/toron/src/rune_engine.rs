@@ -1945,6 +1945,41 @@ pub fn replace(input: RuneExpr, from: RuneExpr, to: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn octet_length(input: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::OctetLength,
+			args: vec![input.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn overlay(
+	input: RuneExpr,
+	replacement: RuneExpr,
+	from: RuneExpr,
+	length: RuneExpr,
+) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Overlay,
+			args: vec![input.expr, replacement.expr, from.expr, length.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
+pub fn translate(input: RuneExpr, from: RuneExpr, to: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::Translate,
+			args: vec![input.expr, from.expr, to.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 pub fn split_part(input: RuneExpr, delimiter: RuneExpr, part: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -2068,6 +2103,9 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["position"], position).build()?;
 	m.function(["strpos"], strpos).build()?;
 	m.function(["replace"], replace).build()?;
+	m.function(["octet_length"], octet_length).build()?;
+	m.function(["overlay"], overlay).build()?;
+	m.function(["translate"], translate).build()?;
 	m.function(["split_part"], split_part).build()?;
 	m.function(["char_length"], char_length).build()?;
 	m.function(["width_bucket"], width_bucket).build()?;

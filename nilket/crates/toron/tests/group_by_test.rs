@@ -9995,3 +9995,149 @@ async fn adr566_is_distinct_from_inherits_eq_type_domain_and_rune_matches_sql() 
 		"SQL and Rune must lower to one composition and one result"
 	);
 }
+
+#[tokio::test]
+async fn adr567_octet_length_counts_bytes_and_length_aliases_char_length() {
+	// 'héllo' is five characters and six UTF-8 bytes — the one-byte gap is
+	// the whole reason OCTET_LENGTH exists next to CHAR_LENGTH.
+	let rows = run_logical(&plan_sql(
+		"SELECT OCTET_LENGTH('héllo'), CHAR_LENGTH('héllo'), LENGTH('héllo'), \
+		 OCTET_LENGTH('ascii'), OCTET_LENGTH(region) FROM sales",
+	))
+	.await;
+	let column = |idx: usize| {
+		rows[0]
+			.column(idx)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("length output")
+	};
+	assert_eq!(column(0).value(0), 6, "bytes");
+	assert_eq!(column(1).value(0), 5, "characters");
+	assert_eq!(
+		column(2).value(0),
+		5,
+		"LENGTH is CHAR_LENGTH's character count, not a byte measure"
+	);
+	assert_eq!(column(3).value(0), 5, "ASCII agrees on both axes");
+	assert!(column(4).is_null(5), "NULL propagates");
+	assert_eq!(column(4).value(0), 4, "east");
+}
+
+#[tokio::test]
+async fn adr567_overlay_composes_the_standard_identity() {
+	let rows = run_logical(&plan_sql(
+		"SELECT OVERLAY('abcdef' PLACING 'XY' FROM 1), \
+		 OVERLAY('abcdef' PLACING 'XY' FROM 3), \
+		 OVERLAY('abcdef' PLACING 'XY' FROM 5), \
+		 OVERLAY('abcdef' PLACING 'XY' FROM 10), \
+		 OVERLAY('abcdef' PLACING 'XY' FROM 3 FOR 0), \
+		 OVERLAY('abcdef' PLACING 'XY' FROM 3 FOR 4), \
+		 OVERLAY('héllo' PLACING '🌟' FROM 2 FOR 1), \
+		 OVERLAY(region PLACING 'X' FROM 1) FROM sales",
+	))
+	.await;
+	let column = |idx: usize| {
+		rows[0]
+			.column(idx)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("overlay output")
+	};
+	assert_eq!(column(0).value(0), "XYcdef", "start");
+	assert_eq!(column(1).value(0), "abXYef", "middle");
+	assert_eq!(column(2).value(0), "abcdXY", "end");
+	assert_eq!(column(3).value(0), "abcdefXY", "past the end appends");
+	assert_eq!(column(4).value(0), "abXYcdef", "FOR 0 is pure insertion");
+	assert_eq!(
+		column(5).value(0),
+		"abXY",
+		"FOR beyond the tail consumes it"
+	);
+	assert_eq!(
+		column(6).value(0),
+		"h🌟llo",
+		"positions count characters, not bytes"
+	);
+	assert_eq!(column(7).value(0), "Xast", "column input");
+	assert!(column(7).is_null(5), "NULL propagates");
+
+	let non_literal = SqlPlanner::new()
+		.plan("SELECT OVERLAY(region PLACING 'X' FROM id) FROM sales")
+		.expect_err("a row-valued FROM must be rejected at plan time");
+	assert!(
+		non_literal.to_string().contains("OVERLAY FROM"),
+		"got {non_literal}"
+	);
+	let zero = SqlPlanner::new()
+		.plan("SELECT OVERLAY(region PLACING 'X' FROM 0) FROM sales")
+		.expect_err("FROM 0 must be rejected");
+	assert!(zero.to_string().contains("OVERLAY FROM must be >= 1"));
+}
+
+#[tokio::test]
+async fn adr567_translate_maps_deletes_and_passes_through() {
+	let rows = run_logical(&plan_sql(
+		"SELECT TRANSLATE('abcabc', 'abc', 'xy'), TRANSLATE('12345', '143', 'ax'), \
+		 TRANSLATE('héllo', 'é', 'e'), TRANSLATE(region, 'e', '3') FROM sales",
+	))
+	.await;
+	let column = |idx: usize| {
+		rows[0]
+			.column(idx)
+			.as_any()
+			.downcast_ref::<StringArray>()
+			.expect("translate output")
+	};
+	assert_eq!(
+		column(0).value(0),
+		"xyxy",
+		"mapped characters map, unmatched targets delete"
+	);
+	assert_eq!(
+		column(1).value(0),
+		"a2x5",
+		"pass-through interleaves with mapping and deletion"
+	);
+	assert_eq!(column(2).value(0), "hello", "multibyte maps to single-byte");
+	assert_eq!(column(3).value(0), "3ast", "column input");
+	assert!(column(3).is_null(5), "NULL propagates");
+}
+
+#[tokio::test]
+async fn adr567_rune_string_batch_matches_sql() {
+	let sql = run_logical(&plan_sql(
+		"SELECT OCTET_LENGTH(region), TRANSLATE(region, 'e', '3'), \
+		 OVERLAY(region PLACING 'X' FROM 1 FOR 1) FROM sales",
+	))
+	.await;
+	let rune = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project([octet_length(col("region")), translate(col("region"), lit_str("e"), lit_str("3")), overlay(col("region"), lit_str("X"), lit(1), lit(1))])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql, SortPolicy::FullRowLex).expect("SQL digest"),
+		canonical_arrow_ipc_digest(&rune, SortPolicy::FullRowLex).expect("Rune digest"),
+		"SQL and Rune must reach the same identifiers and results"
+	);
+}
+
+#[tokio::test]
+async fn adr567_translate_using_form_stays_rejected() {
+	// The standard's `TRANSLATE ... USING` names a translation catalog object
+	// this engine does not have; reinterpreting it as the three-argument map
+	// would silently change meaning.
+	let result = SqlPlanner::new().plan("SELECT TRANSLATE('abc' USING utf8) FROM sales");
+	assert!(
+		result.is_err(),
+		"TRANSLATE ... USING must not plan, got {result:?}"
+	);
+}

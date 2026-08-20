@@ -57,6 +57,9 @@ pub enum ScalarFunctionId {
 	Trunc,
 	Upper,
 	WidthBucket,
+	OctetLength,
+	Overlay,
+	Translate,
 }
 
 /// Non-child data carried by a scalar-function node.
@@ -328,6 +331,12 @@ pub enum ScalarFunctionSignature {
 	/// remaining grandfathered variant carries a constant of some kind, so this
 	/// choice is the one that decides whether they can migrate at all.
 	StringWithConstantBounds,
+	/// ADR 567: `OVERLAY(x PLACING y FROM i [FOR n])` — two `Utf8` strings and
+	/// SUBSTRING's constant bounds. `FROM`/`FOR` are constant argument
+	/// positions validated exactly as `StringWithConstantBounds` validates
+	/// them; the second string is the replacement, which shares the input's
+	/// type.
+	StringPairWithConstantBounds,
 	/// A constant interval followed by `Int64` Unix milliseconds, producing
 	/// `Int64`. The interval is a constant argument like SUBSTRING's bounds but
 	/// carries a value rather than a count, which is what this registration
@@ -442,6 +451,9 @@ pub enum ScalarFunctionEvaluator {
 	Trunc,
 	Upper,
 	WidthBucket,
+	OctetLength,
+	Overlay,
+	Translate,
 }
 
 /// Planner and execution metadata for one scalar capability.
@@ -912,7 +924,7 @@ const CHAR_LENGTH: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::CharLength,
 	sql_name: "CHAR_LENGTH",
 	// The standard admits both spellings for the same function.
-	sql_aliases: &["CHARACTER_LENGTH"],
+	sql_aliases: &["CHARACTER_LENGTH", "LENGTH"],
 	rune_name: "char_length",
 	arity: ScalarFunctionArity::Exact(1),
 	signature: ScalarFunctionSignature::StringToInteger,
@@ -1062,6 +1074,61 @@ const SPLIT_PART: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	pbc_pushdown_eligible: false,
 	guard_filter_pushdown_safe: false,
 	evaluator: ScalarFunctionEvaluator::SplitPart,
+};
+
+const OCTET_LENGTH: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::OctetLength,
+	// ADR 567: the UTF-8 byte count, versus CHAR_LENGTH's character count.
+	sql_name: "OCTET_LENGTH",
+	sql_aliases: &[],
+	rune_name: "octet_length",
+	arity: ScalarFunctionArity::Exact(1),
+	signature: ScalarFunctionSignature::StringToInteger,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::OctetLength,
+};
+
+const OVERLAY: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Overlay,
+	// ADR 567: the standard's defining identity —
+	// SUBSTRING(x FROM 1 FOR i-1) || y || SUBSTRING(x FROM i+n) with n
+	// defaulting to CHAR_LENGTH(y) — character-positioned.
+	sql_name: "OVERLAY",
+	sql_aliases: &[],
+	rune_name: "overlay",
+	arity: ScalarFunctionArity::Between(3, 4),
+	signature: ScalarFunctionSignature::StringPairWithConstantBounds,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Overlay,
+};
+
+const TRANSLATE: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::Translate,
+	// ADR 567: the three-argument character map — the de-facto convention.
+	// The standard's `TRANSLATE ... USING` names a translation object this
+	// engine does not have and stays rejected rather than reinterpreted.
+	sql_name: "TRANSLATE",
+	sql_aliases: &[],
+	rune_name: "translate",
+	arity: ScalarFunctionArity::Exact(3),
+	signature: ScalarFunctionSignature::TernaryStringPreserving,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::Translate,
 };
 
 const TO_TIMESTAMP: ScalarFunctionMetadata = ScalarFunctionMetadata {
@@ -1254,6 +1321,9 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	UPPER,
 	WIDTH_BUCKET,
 	SPLIT_PART,
+	OCTET_LENGTH,
+	OVERLAY,
+	TRANSLATE,
 ];
 
 pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunctionMetadata {

@@ -6848,6 +6848,39 @@ impl SqlPlanner {
 					parameter: crate::ir::ScalarFunctionParameter::None,
 				})
 			}
+			SqlExpr::Overlay {
+				expr,
+				overlay_what,
+				overlay_from,
+				overlay_for,
+			} => {
+				// ADR 567: OVERLAY carries SUBSTRING's literal-bound doctrine —
+				// the grammar's FROM/FOR are plan-time constants, not row values.
+				let from = substring_bound_literal(overlay_from, "OVERLAY FROM")?;
+				if from <= 0 {
+					return Err(unsupported("OVERLAY FROM must be >= 1"));
+				}
+				let length = overlay_for
+					.as_deref()
+					.map(|expr| substring_bound_literal(expr, "OVERLAY FOR"))
+					.transpose()?;
+				if length.is_some_and(|length| length < 0) {
+					return Err(unsupported("OVERLAY FOR must be >= 0"));
+				}
+				let mut args = vec![
+					self.lower_expr(expr)?,
+					self.lower_expr(overlay_what)?,
+					Expr::Literal(crate::ir::ScalarValue::Int64(Some(from))),
+				];
+				if let Some(length) = length {
+					args.push(Expr::Literal(crate::ir::ScalarValue::Int64(Some(length))));
+				}
+				Ok(Expr::ScalarFunction {
+					id: crate::ir::ScalarFunctionId::Overlay,
+					args,
+					parameter: crate::ir::ScalarFunctionParameter::None,
+				})
+			}
 			SqlExpr::AtTimeZone {
 				timestamp,
 				time_zone,

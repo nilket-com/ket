@@ -486,6 +486,59 @@ pub(super) fn bind_scalar_function(
 			};
 			Ok(builder.append_scalar_function(id, bound_args, output_type))
 		}
+		ScalarFunctionSignature::StringPairWithConstantBounds => {
+			let (input, replacement, from, length) = match bound_args.as_slice() {
+				[input, replacement, from] => (input, replacement, from, None),
+				[input, replacement, from, length] => (input, replacement, from, Some(length)),
+				_ => unreachable!("the registry arity was checked before binding"),
+			};
+			for (node, role) in [(input, "input"), (replacement, "PLACING")] {
+				if !builder
+					.node_logical_type(*node)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} {role} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+				if builder.node_type(*node) != Some(&DataType::Utf8) {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} {role} expects Utf8 input, got {:?}",
+							metadata.sql_name,
+							builder.node_type(*node)
+						),
+					});
+				}
+			}
+			// The bounds carry SUBSTRING's contract verbatim: constant integer
+			// literals, read once at bind rather than evaluated per row.
+			let constant_bound = |id: BoundExprId, role: &str| -> Result<i64, BindingError> {
+				match builder.literal(id) {
+					Some(ScalarValue::Int32(Some(value))) => Ok(i64::from(*value)),
+					Some(ScalarValue::Int64(Some(value))) => Ok(*value),
+					_ => Err(BindingError::TypeMismatch {
+						message: format!("{} {role} must be an integer literal", metadata.sql_name),
+					}),
+				}
+			};
+			if constant_bound(*from, "FROM")? < 1 {
+				return Err(BindingError::TypeMismatch {
+					message: format!("{} FROM must be >= 1", metadata.sql_name),
+				});
+			}
+			if let Some(length) = length
+				&& constant_bound(*length, "FOR")? < 0
+			{
+				return Err(BindingError::TypeMismatch {
+					message: format!("{} FOR must be >= 0", metadata.sql_name),
+				});
+			}
+			Ok(builder.append_scalar_function(id, bound_args, DataType::Utf8))
+		}
 		ScalarFunctionSignature::Int64MillisWithConstantInterval => {
 			let [interval, input] = bound_args.as_slice() else {
 				unreachable!("the registry arity was checked before binding")

@@ -879,6 +879,39 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_replace(&args[0], &args[1], &args[2]),
 		(
+			ScalarFunctionEvaluator::OctetLength,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_octet_length(&args[0]),
+		(
+			ScalarFunctionEvaluator::Translate,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_translate(&args[0], &args[1], &args[2]),
+		(
+			ScalarFunctionEvaluator::Overlay,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => {
+			// The binder proved both bounds are integer literals, exactly as
+			// SUBSTRING's; an empty batch has no row 0 and no output either.
+			if args[0].is_empty() {
+				return evaluate_overlay(&args[0], &args[1], 1, None);
+			}
+			let from = constant_integer_argument(&args[2], "OVERLAY FROM")?;
+			let length = match args.get(3) {
+				Some(length) => Some(
+					u64::try_from(constant_integer_argument(length, "OVERLAY FOR")?).map_err(
+						|_| ExecutionError::InvalidExpression {
+							message: "OVERLAY FOR must be >= 0".to_string(),
+						},
+					)?,
+				),
+				None => None,
+			};
+			evaluate_overlay(&args[0], &args[1], from, length)
+		}
+		(
 			ScalarFunctionEvaluator::Lpad,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -1821,6 +1854,152 @@ fn evaluate_char_length(input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
 			input.data_type()
 		),
 	})
+}
+
+/// ADR 567: the UTF-8 byte measure. `CHAR_LENGTH` counts characters; the two
+/// disagreeing on any multibyte value is the function's reason to exist.
+fn evaluate_octet_length(input: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let count = |value: &str| i64::try_from(value.len()).unwrap_or(i64::MAX);
+	if let Some(input) = input.as_any().downcast_ref::<StringArray>() {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.map(|value| value.map(count))
+				.collect::<Int64Array>(),
+		) as ArrayRef);
+	}
+	if let Some(input) = input.as_any().downcast_ref::<LargeStringArray>() {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.map(|value| value.map(count))
+				.collect::<Int64Array>(),
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"OCTET_LENGTH expects a string input, got {:?}",
+			input.data_type()
+		),
+	})
+}
+
+/// ADR 567: the three-argument character map. A character found in `from`
+/// becomes the same-position character of `to`, is deleted when `to` is
+/// shorter, and passes through unmatched. The first occurrence in `from`
+/// decides, so a repeated `from` character cannot map two ways.
+fn evaluate_translate(
+	input: &ArrayRef,
+	from: &ArrayRef,
+	to: &ArrayRef,
+) -> Result<ArrayRef, ExecutionError> {
+	fn translate(value: &str, from: &str, to: &str) -> String {
+		let targets: Vec<char> = to.chars().collect();
+		let mut out = String::with_capacity(value.len());
+		for character in value.chars() {
+			match from.chars().position(|candidate| candidate == character) {
+				Some(index) => {
+					if let Some(&mapped) = targets.get(index) {
+						out.push(mapped);
+					}
+				}
+				None => out.push(character),
+			}
+		}
+		out
+	}
+	if let (Some(input), Some(from), Some(to)) = (
+		input.as_any().downcast_ref::<StringArray>(),
+		from.as_any().downcast_ref::<StringArray>(),
+		to.as_any().downcast_ref::<StringArray>(),
+	) {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.zip(from.iter())
+				.zip(to.iter())
+				.map(|((input, from), to)| match (input, from, to) {
+					(Some(input), Some(from), Some(to)) => Some(translate(input, from, to)),
+					_ => None,
+				})
+				.collect::<StringArray>(),
+		) as ArrayRef);
+	}
+	if let (Some(input), Some(from), Some(to)) = (
+		input.as_any().downcast_ref::<LargeStringArray>(),
+		from.as_any().downcast_ref::<LargeStringArray>(),
+		to.as_any().downcast_ref::<LargeStringArray>(),
+	) {
+		return Ok(Arc::new(
+			input
+				.iter()
+				.zip(from.iter())
+				.zip(to.iter())
+				.map(|((input, from), to)| match (input, from, to) {
+					(Some(input), Some(from), Some(to)) => Some(translate(input, from, to)),
+					_ => None,
+				})
+				.collect::<LargeStringArray>(),
+		) as ArrayRef);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"TRANSLATE expects three string arguments of the same type, got {:?}, {:?}, and {:?}",
+			input.data_type(),
+			from.data_type(),
+			to.data_type()
+		),
+	})
+}
+
+/// ADR 567: the standard's defining identity —
+/// `SUBSTRING(x FROM 1 FOR i-1) || y || SUBSTRING(x FROM i+n)` with `n`
+/// defaulting to the replacement's character count. Character-positioned;
+/// clamping past the end is the substring composition's own behavior rather
+/// than a special case.
+fn evaluate_overlay(
+	input: &ArrayRef,
+	replacement: &ArrayRef,
+	from: i64,
+	length: Option<u64>,
+) -> Result<ArrayRef, ExecutionError> {
+	if from <= 0 {
+		return Err(ExecutionError::InvalidExpression {
+			message: "OVERLAY FROM must be >= 1".to_string(),
+		});
+	}
+	let (Some(input), Some(replacement)) = (
+		input.as_any().downcast_ref::<StringArray>(),
+		replacement.as_any().downcast_ref::<StringArray>(),
+	) else {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"OVERLAY expects Utf8 input and replacement, got {:?} and {:?}",
+				input.data_type(),
+				replacement.data_type()
+			),
+		});
+	};
+	let start = usize::try_from(from - 1).unwrap_or(usize::MAX);
+	Ok(Arc::new(
+		input
+			.iter()
+			.zip(replacement.iter())
+			.map(|(value, replacement)| match (value, replacement) {
+				(Some(value), Some(replacement)) => {
+					let replaced =
+						usize::try_from(length.unwrap_or(replacement.chars().count() as u64))
+							.unwrap_or(usize::MAX);
+					let mut out = String::with_capacity(value.len() + replacement.len());
+					out.extend(value.chars().take(start));
+					out.push_str(replacement);
+					out.extend(value.chars().skip(start.saturating_add(replaced)));
+					Some(out)
+				}
+				_ => None,
+			})
+			.collect::<StringArray>(),
+	) as ArrayRef)
 }
 
 /// `SIGN` preserves its input type, so a decimal's sign is `1` at that decimal's
