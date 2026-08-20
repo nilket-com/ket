@@ -476,6 +476,33 @@ storage-engine forward items below continue independently.
      `symbol_table_byte_len` from `EncodingCascade::FsstWholeBuffer`
      (trivial follow-up; tracked from ADR 066 / 067).
 
+7. **WAL body shape across a format-version boundary (named
+   follow-up, ADR 085 family).** Raised by ADR 0087's
+   `SNAPSHOT_FORMAT_VERSION` / `WAL_FORMAT_VERSION` bump 1 → 2 and
+   the `fix: adr 0085 older versioned snapshot explains itself`
+   repair. **Already handled:** WAL *framing* is length-delimited
+   and version-gated — a record newer than this build refuses by
+   name and says the segment is intact rather than corrupt, and a
+   pre-versioning record still replays. **Not handled:** WAL record
+   *bodies* carry serialized mutations, and ADR 0087 added a
+   `serde(default)` tail field to `CtasSagaMutation::Provision`.
+   Postcard is not self-describing, so a body written before that
+   change has no bytes for the new field and deserializes into
+   `UnexpectedEnd` exactly as the snapshot did — the framing hands
+   the replayer a checksum-valid record whose payload this build
+   cannot interpret. Did not surface in the local-profile incident
+   because `nilket local --reset` discards the WAL with the
+   snapshot, and because snapshot decode fails first. **Open
+   questions:** does the replayer diagnose an old-shaped body the
+   way `decode_snapshot_reader` now does (digest matched, artifact
+   intact, older format version, no migrations), or a bare postcard
+   error? Is per-record refusal the right granularity when a
+   segment may mix records from either side of a bump? Is the
+   snapshot's "no migrations" contract right at record level, where
+   a record is replayable state rather than a whole state machine?
+   Answering these decides WAL-level upgrade semantics and wants
+   its own ADR, not a patch riding a fix commit.
+
 ## What not to do next
 
 Enduring guardrails for upcoming work. Items tied to
