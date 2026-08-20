@@ -1,9 +1,10 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 16] = [
+const BINDER_MODULES: [&str; 17] = [
 	"aggregate",
 	"aggregate_exchange",
 	"arithmetic",
+	"cast",
 	"decision_log",
 	"explain",
 	"expression_walk",
@@ -27,6 +28,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/aggregate.rs",
 		"src/binder/aggregate_exchange.rs",
 		"src/binder/arithmetic.rs",
+		"src/binder/cast.rs",
 		"src/binder/decision_log.rs",
 		"src/binder/explain.rs",
 		"src/binder/expression_walk.rs",
@@ -423,6 +425,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// date conversion and checked temporal kernels.
 				"crates/toron/src/date32.rs",
 				"crates/toron/src/timestamp.rs",
+				// ADR 564: the explicit-cast support table is bind-time policy the
+				// binder and the executor conformance tests both read; it owns no
+				// binder decomposition surface.
+				"crates/toron/src/cast_support.rs",
 				"crates/toron/tests/non_aggregate_projection_accounting_test.rs",
 				// Plan filenames are zero-padded to four digits; this README documents a
 				// command whose argument is one of the renamed implementation docs.

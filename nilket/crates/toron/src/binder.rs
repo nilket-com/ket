@@ -59,6 +59,7 @@ use wendelon_client::{
 mod aggregate;
 pub(crate) mod aggregate_exchange;
 mod arithmetic;
+mod cast;
 mod decision_log;
 mod explain;
 mod expression_walk;
@@ -5154,8 +5155,12 @@ fn bind_expr_into_program(
 			expr,
 			target_logical_name,
 		} => bind_sql_convert(builder, input_schema, ctx, expr, target_logical_name),
-		Expr::Cast(inner, target) => bind_explicit_cast(builder, input_schema, ctx, inner, target),
-		Expr::TryCast(inner, target) => bind_try_cast(builder, input_schema, ctx, inner, target),
+		Expr::Cast(inner, target) => {
+			cast::bind_explicit_cast(builder, input_schema, ctx, inner, target)
+		}
+		Expr::TryCast(inner, target) => {
+			cast::bind_try_cast(builder, input_schema, ctx, inner, target)
+		}
 		Expr::Add(left, right) => {
 			bind_arithmetic(builder, input_schema, ctx, left, right, BoundBinaryOp::Add)
 		}
@@ -5410,68 +5415,6 @@ fn case_common_type(types: &[DataType]) -> Result<DataType, BindingError> {
 		})?;
 	}
 	Ok(common)
-}
-
-fn bind_explicit_cast(
-	builder: &mut BoundExprProgramBuilder,
-	input_schema: &SchemaRef,
-	ctx: &ExprBindContext<'_>,
-	inner: &Expr,
-	target: &DataType,
-) -> Result<BoundExprId, BindingError> {
-	if is_untyped_null(inner) {
-		return resolve_untyped_null(builder, target);
-	}
-	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
-	coerce_decimal_literal_to_legacy_explicit_numeric_source(
-		builder,
-		inner,
-		target,
-		ctx.session_timezone,
-	)?;
-	let source = builder
-		.node_type(inner)
-		.cloned()
-		.expect("builder returns typed cast input");
-	if source != *target && !is_supported_explicit_numeric_cast(&source, target) {
-		return Err(BindingError::TypeMismatch {
-			message: format!(
-				"unsupported CAST: {source:?} to {target:?}; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
-			),
-		});
-	}
-	Ok(builder.append_cast(inner, target.clone(), target.clone()))
-}
-
-fn bind_try_cast(
-	builder: &mut BoundExprProgramBuilder,
-	input_schema: &SchemaRef,
-	ctx: &ExprBindContext<'_>,
-	inner: &Expr,
-	target: &DataType,
-) -> Result<BoundExprId, BindingError> {
-	if is_untyped_null(inner) {
-		return resolve_untyped_null(builder, target);
-	}
-	let inner = bind_expr_into_program(builder, inner, input_schema, ctx)?;
-	coerce_decimal_literal_to_legacy_explicit_numeric_source(
-		builder,
-		inner,
-		target,
-		ctx.session_timezone,
-	)?;
-	let source = builder
-		.node_type(inner)
-		.cloned()
-		.expect("builder returns typed try-cast input");
-	if source != *target && !is_supported_explicit_numeric_cast(&source, target) {
-		return Err(BindingError::TypeMismatch {
-			message: format!(
-				"unsupported TRY_CAST/SAFE_CAST: {source:?} to {target:?}; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
-			),
-		});
-	}
-	Ok(builder.append_try_cast(inner, target.clone(), target.clone()))
 }
 
 fn cast_if_needed(

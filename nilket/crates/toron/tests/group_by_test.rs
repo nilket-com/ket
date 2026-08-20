@@ -6267,17 +6267,17 @@ async fn computed_aggregate_arguments_preserve_binder_domain_errors() {
 	);
 
 	let err = bind(
-		&plan_sql("SELECT SUM(CAST(region AS BIGINT)) FROM sales"),
+		&plan_sql("SELECT SUM(CAST(price AS DATE)) FROM sales"),
 		&catalog,
 		&PlannerConfig::default(),
 	)
 	.await
-	.expect_err("inner CAST over Utf8 should reject in binder");
+	.expect_err("inner CAST over an undeclared pair should reject in binder");
 	assert!(
 		matches!(
 			err,
 			BindingError::TypeMismatch { ref message }
-				if message == "unsupported CAST: Utf8 to Int64; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
+				if message == "unsupported CAST: Float64 to Date32; the supported conversions are numeric-to-numeric, text-to-numeric, text-to-temporal, and value-to-text"
 		),
 		"unexpected CAST domain error: {err:?}"
 	);
@@ -6432,7 +6432,10 @@ async fn sql_cast_rejects_unsupported_targets_sources_and_syntax() {
 		"SELECT CAST(amount AS FLOAT) FROM sales",
 		"unsupported CAST target type: FLOAT (precision-parameter ambiguous; use REAL, DOUBLE PRECISION, FLOAT32, or FLOAT64)",
 	);
-	assert_unsupported("SELECT CAST(amount AS VARCHAR) FROM sales");
+	assert_unsupported_message(
+		"SELECT CAST(amount AS BOOLEAN) FROM sales",
+		"unsupported CAST target type: BOOLEAN",
+	);
 	assert_unsupported_message(
 		"SELECT amount::BIGINT FROM sales",
 		"unsupported cast syntax: ::; only CAST(... AS ...) is supported",
@@ -6444,17 +6447,17 @@ async fn sql_cast_rejects_unsupported_targets_sources_and_syntax() {
 
 	let (catalog, _) = fixture();
 	let err = bind(
-		&plan_sql("SELECT CAST(region AS BIGINT) FROM sales"),
+		&plan_sql("SELECT CAST(price AS DATE) FROM sales"),
 		&catalog,
 		&PlannerConfig::default(),
 	)
 	.await
-	.expect_err("non-numeric cast source should fail binding");
+	.expect_err("an undeclared cast pair should fail binding");
 	assert!(
 		matches!(
 			err,
 			BindingError::TypeMismatch { ref message }
-				if message == "unsupported CAST: Utf8 to Int64; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
+				if message == "unsupported CAST: Float64 to Date32; the supported conversions are numeric-to-numeric, text-to-numeric, text-to-temporal, and value-to-text"
 		),
 		"unexpected binding error: {err:?}"
 	);
@@ -6462,7 +6465,10 @@ async fn sql_cast_rejects_unsupported_targets_sources_and_syntax() {
 
 #[tokio::test]
 async fn sql_try_cast_rejects_unsupported_targets_sources_and_syntax() {
-	assert_unsupported("SELECT TRY_CAST(amount AS VARCHAR) FROM sales");
+	assert_unsupported_message(
+		"SELECT TRY_CAST(amount AS BOOLEAN) FROM sales",
+		"unsupported CAST target type: BOOLEAN",
+	);
 	assert_unsupported_message(
 		"SELECT TRY_CAST(amount AS FLOAT) FROM sales",
 		"unsupported CAST target type: FLOAT (precision-parameter ambiguous; use REAL, DOUBLE PRECISION, FLOAT32, or FLOAT64)",
@@ -6478,17 +6484,17 @@ async fn sql_try_cast_rejects_unsupported_targets_sources_and_syntax() {
 
 	let (catalog, _) = fixture();
 	let err = bind(
-		&plan_sql("SELECT TRY_CAST(region AS BIGINT) FROM sales"),
+		&plan_sql("SELECT TRY_CAST(price AS DATE) FROM sales"),
 		&catalog,
 		&PlannerConfig::default(),
 	)
 	.await
-	.expect_err("non-numeric try cast source should fail binding");
+	.expect_err("an undeclared try-cast pair should fail binding");
 	assert!(
 		matches!(
 			err,
 			BindingError::TypeMismatch { ref message }
-				if message == "unsupported TRY_CAST/SAFE_CAST: Utf8 to Int64; only identity casts or Int32, Int64, Float32, and Float64 numeric conversions are supported"
+				if message == "unsupported TRY_CAST/SAFE_CAST: Float64 to Date32; the supported conversions are numeric-to-numeric, text-to-numeric, text-to-temporal, and value-to-text"
 		),
 		"unexpected binding error: {err:?}"
 	);
@@ -9595,5 +9601,242 @@ async fn adr563_exact_quantile_names_are_refused_with_a_directive() {
 	assert!(
 		!typo.to_string().contains("APPROX_QUANTILE"),
 		"the refusal table must not swallow unknown names, got {typo}"
+	);
+}
+
+#[tokio::test]
+async fn adr564_cast_parses_text_strictly_and_try_yields_null_per_element() {
+	// A CASE over region mixes parseable, unparseable, and NULL text in one
+	// column, so per-element failure is distinguishable from a batch fallback.
+	let lenient = run_logical(&plan_sql(
+		"SELECT TRY_CAST(CASE WHEN id = 1 THEN ' 12 ' ELSE region END AS BIGINT) FROM sales",
+	))
+	.await;
+	let values = lenient[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("TRY_CAST Int64 output");
+	assert_eq!(values.value(0), 12, "whitespace-trimmed text parses");
+	assert!(values.is_null(1), "unparseable text yields NULL under TRY");
+	assert!(values.is_null(5), "NULL input stays NULL");
+
+	let strict = execute_sql_err(
+		"SELECT CAST(CASE WHEN id = 1 THEN ' 12 ' ELSE region END AS BIGINT) FROM sales",
+	)
+	.await;
+	assert!(
+		strict.to_string().contains("is not a valid Int64"),
+		"the strict failure must name the offending value, got {strict}"
+	);
+
+	let strict_ok = run_logical(&plan_sql("SELECT CAST('12' AS BIGINT) FROM sales")).await;
+	assert_eq!(
+		strict_ok[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("strict Int64 output")
+			.value(0),
+		12
+	);
+
+	// An integer target rejects fractional text rather than truncating it.
+	let fractional = execute_sql_err("SELECT CAST('1.5' AS BIGINT) FROM sales").await;
+	assert!(fractional.to_string().contains("1.5"), "got {fractional}");
+	let fractional_try = run_logical(&plan_sql(
+		"SELECT TRY_CAST(CASE WHEN id = 1 THEN '10' ELSE '1.5' END AS BIGINT) FROM sales",
+	))
+	.await;
+	let fractional_values = fractional_try[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("TRY fractional output");
+	assert_eq!(
+		fractional_values.value(0),
+		10,
+		"the whole-number row converts"
+	);
+	assert!(
+		fractional_values.is_null(1),
+		"fractional text yields NULL under TRY, never a truncation"
+	);
+	let as_double = run_logical(&plan_sql("SELECT CAST('1.5' AS DOUBLE) FROM sales")).await;
+	assert_eq!(
+		as_double[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Float64Array>()
+			.expect("Float64 output")
+			.value(0),
+		1.5
+	);
+}
+
+#[tokio::test]
+async fn adr564_cast_renders_canonically_and_round_trips_floats_exactly() {
+	// `price / amount` yields values like 1.0166666666666666 whose shortest
+	// rendering exercises the full precision, per the ADR's guardrail.
+	let rows = run_logical(&plan_sql(
+		"SELECT CAST(id AS VARCHAR), CAST(decimal_price AS VARCHAR), \
+		 CAST(CAST(price / amount AS VARCHAR) AS DOUBLE), price / amount, \
+		 CAST(price / amount AS VARCHAR) FROM sales",
+	))
+	.await;
+	let rendered = rows[0]
+		.column(4)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("rendered quotient");
+	assert!(
+		rendered.value(3).len() > 10,
+		"30.5 / 30 must render a precision-exercising form, got {:?}",
+		rendered.value(3)
+	);
+	let ids = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("id text");
+	assert_eq!(ids.value(0), "1");
+	let decimals = rows[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("decimal text");
+	assert_eq!(decimals.value(0), "12.34", "scale-faithful rendering");
+	assert_eq!(decimals.value(3), "10.00", "trailing zeros carry the scale");
+	let round_tripped = rows[0]
+		.column(2)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("round-tripped price");
+	let originals = rows[0]
+		.column(3)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("price");
+	for row in 0..rows[0].num_rows() {
+		assert_eq!(round_tripped.is_null(row), originals.is_null(row));
+		if !originals.is_null(row) {
+			assert_eq!(
+				round_tripped.value(row),
+				originals.value(row),
+				"the shortest round-trip form must return the value exactly"
+			);
+		}
+	}
+}
+
+#[tokio::test]
+async fn adr564_text_temporal_casts_are_the_adr558_kernels() {
+	// One node, so equality is structural — asserted here as result equality
+	// across both spellings, strict and TRY.
+	let cast = run_logical(&plan_sql(
+		"SELECT CAST('2024-01-01 00:30:00' AS TIMESTAMPTZ) FROM sales",
+	))
+	.await;
+	let kernel = run_logical(&plan_sql(
+		"SELECT TO_TIMESTAMP('2024-01-01 00:30:00') FROM sales",
+	))
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&cast, SortPolicy::FullRowLex).expect("CAST digest"),
+		canonical_arrow_ipc_digest(&kernel, SortPolicy::FullRowLex).expect("kernel digest"),
+		"CAST(text AS TIMESTAMPTZ) and TO_TIMESTAMP must be one behavior"
+	);
+
+	let lenient = run_logical(&plan_sql(
+		"SELECT TRY_CAST('not a date' AS DATE) FROM sales",
+	))
+	.await;
+	assert!(
+		lenient[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Date32Array>()
+			.expect("TRY_CAST Date32 output")
+			.is_null(0),
+		"TRY_CAST inherits the kernel's NULL-on-failure"
+	);
+	let strict = execute_sql_err("SELECT CAST('not a date' AS DATE) FROM sales").await;
+	assert!(strict.to_string().contains("not a date"), "got {strict}");
+
+	// Rendering back to text uses the canonical forms results already print.
+	let rendered = run_logical(&plan_sql(
+		"SELECT CAST(CAST('2024-01-01' AS DATE) AS VARCHAR), \
+		 CAST(TO_TIMESTAMP('2024-01-01 00:00:00') AS VARCHAR) FROM sales",
+	))
+	.await;
+	let dates = rendered[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("date text");
+	assert_eq!(dates.value(0), "2024-01-01");
+	let stamps = rendered[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<StringArray>()
+		.expect("timestamp text");
+	assert!(
+		stamps.value(0).starts_with("2024-01-01T00:00:00"),
+		"got {}",
+		stamps.value(0)
+	);
+}
+
+#[tokio::test]
+async fn adr564_admission_rejects_synthesized_and_undeclared_pairs() {
+	// SynthesizedOnly stays out of user SQL while the coercions that need it
+	// keep working: decimal arithmetic still evaluates.
+	let decimal_target = SqlPlanner::new()
+		.plan("SELECT CAST(amount AS DECIMAL(15, 2)) FROM sales")
+		.expect_err("a DECIMAL cast target must stay rejected for user SQL");
+	assert!(
+		decimal_target
+			.to_string()
+			.contains("unsupported CAST target type")
+	);
+	let arithmetic = run_logical(&plan_sql("SELECT decimal_price * 2 FROM sales")).await;
+	assert_eq!(
+		arithmetic[0].num_rows(),
+		6,
+		"synthesized decimal coercions keep working"
+	);
+
+	// An undeclared pair gets the widened rule's error.
+	let undeclared = SqlPlanner::new().plan("SELECT CAST(price AS DATE) FROM sales");
+	let message = match undeclared {
+		Err(error) => error.to_string(),
+		Ok(plan) => {
+			let (catalog, _) = fixture();
+			bind(&plan, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("Float64 to Date32 is not a supported cast")
+				.to_string()
+		}
+	};
+	assert!(
+		message.contains("the supported conversions are"),
+		"the rejection must name the wider rule, got {message}"
+	);
+
+	// Sub-nanosecond TIMESTAMPTZ precisions get a directive, not a wrong label.
+	let precision = SqlPlanner::new().plan("SELECT CAST('x' AS TIMESTAMPTZ(3)) FROM sales");
+	let message = match precision {
+		Err(error) => error.to_string(),
+		Ok(plan) => {
+			let (catalog, _) = fixture();
+			bind(&plan, &catalog, &PlannerConfig::default())
+				.await
+				.expect_err("millisecond text casts are deferred")
+				.to_string()
+		}
+	};
+	assert!(
+		message.contains("TIMESTAMPTZ(9)"),
+		"the precision rejection must direct to the supported spelling, got {message}"
 	);
 }

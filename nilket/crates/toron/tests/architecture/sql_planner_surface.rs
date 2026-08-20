@@ -523,12 +523,19 @@ pub(crate) fn adr025_explicit_cast_policy_is_separate_from_implicit_widening() {
 			.expect("is_supported_explicit_numeric_cast body")
 			.1;
 
-	assert!(explicit_cast.contains("is_supported_explicit_numeric_cast"));
+	// ADR 564: explicit-cast admission reads the cast_support table through
+	// sql_cast_admissible; is_supported_explicit_numeric_cast remains only as
+	// the legacy decimal-literal coercion gate. Identity short-circuits inside
+	// the admission check, so the bind functions stay comparison-free and the
+	// implicit-widening path stays the only identity-eliding one.
+	assert!(explicit_cast.contains("sql_cast_admissible(&source, target, \"CAST\")"));
 	assert!(explicit_cast.contains("builder.append_cast(inner, target.clone(), target.clone())"));
 	assert!(!explicit_cast.contains("source == *target"));
 	assert!(!explicit_cast.contains("source == target"));
+	assert!(!explicit_cast.contains("is_widening_cast"));
 	assert!(implicit_cast.contains("if source == *target"));
 	assert!(implicit_cast.contains("is_widening_cast"));
+	assert!(!implicit_cast.contains("sql_cast_admissible"));
 
 	for conversion in [
 		"(DataType::Int32, DataType::Int64)",
@@ -795,8 +802,9 @@ pub(crate) fn adr026_try_cast_policy_is_separate() {
 		.next()
 		.expect("bind_try_cast body")
 		.1;
-	assert!(bind_try_cast.contains("is_supported_explicit_numeric_cast"));
-	assert!(bind_try_cast.contains("unsupported TRY_CAST/SAFE_CAST"));
+	// ADR 564: the TRY spelling runs the same table-backed admission as CAST,
+	// distinguished only by the spelling it reports in the rejection.
+	assert!(bind_try_cast.contains("sql_cast_admissible(&source, target, \"TRY_CAST/SAFE_CAST\")"));
 	assert!(
 		bind_try_cast.contains("builder.append_try_cast(inner, target.clone(), target.clone())")
 	);

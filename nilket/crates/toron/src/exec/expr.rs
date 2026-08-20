@@ -2832,6 +2832,129 @@ pub(in crate::exec) fn evaluate_unbound_arithmetic(
 	evaluate_arithmetic(op, &left, &right, &output_type)
 }
 
+/// ADR 564: text parses to a numeric per row, sharing ADR 558's per-element
+/// failure machinery so strict `CAST` raises and `TRY_CAST` yields NULL
+/// through the same loop. Surrounding ASCII whitespace is trimmed — the
+/// standard's treatment; an integer target rejects fractional text rather
+/// than truncating it.
+fn cast_text_to_i32(
+	array: &ArrayRef,
+	failure: crate::ir::ScalarFunctionFailure,
+) -> Result<ArrayRef, ExecutionError> {
+	let parsed = parse_string_elements(array, "CAST to Int32", failure, |text| {
+		text.trim()
+			.parse::<i32>()
+			.map_err(|_| format!("{text:?} is not a valid Int32"))
+	})?;
+	Ok(Arc::new(Int32Array::from(parsed)) as ArrayRef)
+}
+
+fn cast_text_to_i64(
+	array: &ArrayRef,
+	failure: crate::ir::ScalarFunctionFailure,
+) -> Result<ArrayRef, ExecutionError> {
+	let parsed = parse_string_elements(array, "CAST to Int64", failure, |text| {
+		text.trim()
+			.parse::<i64>()
+			.map_err(|_| format!("{text:?} is not a valid Int64"))
+	})?;
+	Ok(Arc::new(Int64Array::from(parsed)) as ArrayRef)
+}
+
+fn cast_text_to_f32(
+	array: &ArrayRef,
+	failure: crate::ir::ScalarFunctionFailure,
+) -> Result<ArrayRef, ExecutionError> {
+	let parsed = parse_string_elements(array, "CAST to Float32", failure, |text| {
+		text.trim()
+			.parse::<f32>()
+			.map_err(|_| format!("{text:?} is not a valid Float32"))
+	})?;
+	Ok(Arc::new(Float32Array::from(parsed)) as ArrayRef)
+}
+
+fn cast_text_to_f64(
+	array: &ArrayRef,
+	failure: crate::ir::ScalarFunctionFailure,
+) -> Result<ArrayRef, ExecutionError> {
+	let parsed = parse_string_elements(array, "CAST to Float64", failure, |text| {
+		text.trim()
+			.parse::<f64>()
+			.map_err(|_| format!("{text:?} is not a valid Float64"))
+	})?;
+	Ok(Arc::new(Float64Array::from(parsed)) as ArrayRef)
+}
+
+/// ADR 564: one canonical text rendering per source family, matching what
+/// results already print: decimal digits for integers, the shortest
+/// round-trip form for floats, scale-faithful digits for decimals,
+/// `YYYY-MM-DD` for dates, and the RFC3339 UTC form for timestamps.
+/// Rendering is total, so `TRY_CAST` is identical by inheritance.
+fn cast_to_utf8(array: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let any = array.as_any();
+	let render = |values: Vec<Option<String>>| {
+		Ok(Arc::new(values.into_iter().collect::<StringArray>()) as ArrayRef)
+	};
+	if let Some(array) = any.downcast_ref::<Int32Array>() {
+		return render(array.iter().map(|v| v.map(|v| v.to_string())).collect());
+	}
+	if let Some(array) = any.downcast_ref::<Int64Array>() {
+		return render(array.iter().map(|v| v.map(|v| v.to_string())).collect());
+	}
+	if let Some(array) = any.downcast_ref::<Float32Array>() {
+		return render(array.iter().map(|v| v.map(|v| v.to_string())).collect());
+	}
+	if let Some(array) = any.downcast_ref::<Float64Array>() {
+		return render(array.iter().map(|v| v.map(|v| v.to_string())).collect());
+	}
+	if let Some(array) = any.downcast_ref::<Decimal128Array>() {
+		return render(
+			(0..array.len())
+				.map(|row| (!array.is_null(row)).then(|| array.value_as_string(row)))
+				.collect(),
+		);
+	}
+	if let Some(array) = any.downcast_ref::<Date32Array>() {
+		return render(
+			array
+				.iter()
+				.map(|v| v.map(crate::date32::format_date_ymd))
+				.collect(),
+		);
+	}
+	if let Some(array) = any.downcast_ref::<TimestampMillisecondArray>() {
+		return render(
+			array
+				.iter()
+				.map(|v| {
+					v.map(|v| crate::timestamp::format_utc_timestamp(v, TimeUnit::Millisecond))
+				})
+				.collect(),
+		);
+	}
+	if let Some(array) = any.downcast_ref::<TimestampMicrosecondArray>() {
+		return render(
+			array
+				.iter()
+				.map(|v| {
+					v.map(|v| crate::timestamp::format_utc_timestamp(v, TimeUnit::Microsecond))
+				})
+				.collect(),
+		);
+	}
+	if let Some(array) = any.downcast_ref::<TimestampNanosecondArray>() {
+		return render(
+			array
+				.iter()
+				.map(|v| v.map(|v| crate::timestamp::format_utc_timestamp(v, TimeUnit::Nanosecond)))
+				.collect(),
+		);
+	}
+	Err(ExecutionError::InvalidExpression {
+		message: format!("CAST to Utf8 is not supported from {:?}", array.data_type()),
+	})
+}
+
 pub(crate) fn evaluate_cast(
 	array: &ArrayRef,
 	target: &DataType,
@@ -2841,6 +2964,21 @@ pub(crate) fn evaluate_cast(
 	}
 
 	match (array.data_type(), target) {
+		// ADR 564: text parses strictly; a bad value raises naming itself.
+		(DataType::Utf8 | DataType::LargeUtf8, DataType::Int32) => {
+			cast_text_to_i32(array, crate::ir::ScalarFunctionFailure::Raises)
+		}
+		(DataType::Utf8 | DataType::LargeUtf8, DataType::Int64) => {
+			cast_text_to_i64(array, crate::ir::ScalarFunctionFailure::Raises)
+		}
+		(DataType::Utf8 | DataType::LargeUtf8, DataType::Float32) => {
+			cast_text_to_f32(array, crate::ir::ScalarFunctionFailure::Raises)
+		}
+		(DataType::Utf8 | DataType::LargeUtf8, DataType::Float64) => {
+			cast_text_to_f64(array, crate::ir::ScalarFunctionFailure::Raises)
+		}
+		// ADR 564: rendering to text is canonical and total.
+		(_, DataType::Utf8) => cast_to_utf8(array),
 		(DataType::Int32, DataType::Int64) => cast_i32_to_i64(array),
 		(DataType::Int32, DataType::Float32) => cast_i32_to_f32(array),
 		(DataType::Int32, DataType::Float64) => cast_i32_to_f64(array),
@@ -2874,6 +3012,22 @@ fn evaluate_try_cast(array: &ArrayRef, target: &DataType) -> Result<ArrayRef, Ex
 	}
 
 	match (array.data_type(), target) {
+		// ADR 564: the TRY spelling yields NULL for an unparseable value,
+		// through the same per-element loop the strict arm raises from.
+		(DataType::Utf8 | DataType::LargeUtf8, DataType::Int32) => {
+			cast_text_to_i32(array, crate::ir::ScalarFunctionFailure::YieldsNull)
+		}
+		(DataType::Utf8 | DataType::LargeUtf8, DataType::Int64) => {
+			cast_text_to_i64(array, crate::ir::ScalarFunctionFailure::YieldsNull)
+		}
+		(DataType::Utf8 | DataType::LargeUtf8, DataType::Float32) => {
+			cast_text_to_f32(array, crate::ir::ScalarFunctionFailure::YieldsNull)
+		}
+		(DataType::Utf8 | DataType::LargeUtf8, DataType::Float64) => {
+			cast_text_to_f64(array, crate::ir::ScalarFunctionFailure::YieldsNull)
+		}
+		// Rendering is total, so the TRY form is the strict form.
+		(_, DataType::Utf8) => cast_to_utf8(array),
 		(DataType::Int32, DataType::Int64) => cast_i32_to_i64(array),
 		(DataType::Int32, DataType::Float32) => cast_i32_to_f32(array),
 		(DataType::Int32, DataType::Float64) => cast_i32_to_f64(array),
@@ -4837,5 +4991,121 @@ mod tests {
 			.expect("decimal output");
 		assert_eq!(values.value(0), 12_345);
 		assert!(values.is_null(1), "NULL must propagate");
+	}
+
+	/// ADR 564: the per-pair conformance walk. Every pair the support table
+	/// declares executes in the arms its admission allows; every pair it
+	/// excludes fails. An executor arm added without a table declaration, or a
+	/// declaration without an arm, fails here — the drift the table exists to
+	/// prevent.
+	mod adr564_conformance {
+		use super::*;
+		use crate::cast_support::{CastAdmission, CastFamily, explicit_cast_rule};
+
+		fn representative_type(family: CastFamily) -> DataType {
+			match family {
+				CastFamily::Int32 => DataType::Int32,
+				CastFamily::Int64 => DataType::Int64,
+				CastFamily::Float32 => DataType::Float32,
+				CastFamily::Float64 => DataType::Float64,
+				CastFamily::Decimal128 => DataType::Decimal128(15, 2),
+				CastFamily::Utf8 => DataType::Utf8,
+				CastFamily::LargeUtf8 => DataType::LargeUtf8,
+				CastFamily::Date32 => DataType::Date32,
+				CastFamily::Timestamp => {
+					crate::timestamp::utc_timestamp_data_type(TimeUnit::Nanosecond)
+				}
+			}
+		}
+
+		/// One convertible value plus a NULL, so every Ok path also proves
+		/// NULL propagation. `"12"` parses under every numeric target.
+		fn representative_array(family: CastFamily) -> ArrayRef {
+			match family {
+				CastFamily::Int32 => Arc::new(Int32Array::from(vec![Some(12), None])),
+				CastFamily::Int64 => Arc::new(Int64Array::from(vec![Some(12), None])),
+				CastFamily::Float32 => Arc::new(Float32Array::from(vec![Some(12.0), None])),
+				CastFamily::Float64 => Arc::new(Float64Array::from(vec![Some(12.0), None])),
+				CastFamily::Decimal128 => Arc::new(
+					Decimal128Array::from(vec![Some(1234), None])
+						.with_precision_and_scale(15, 2)
+						.expect("decimal fixture"),
+				),
+				CastFamily::Utf8 => Arc::new(StringArray::from(vec![Some("12"), None])),
+				CastFamily::LargeUtf8 => {
+					Arc::new(arrow::array::LargeStringArray::from(vec![Some("12"), None]))
+				}
+				CastFamily::Date32 => Arc::new(Date32Array::from(vec![Some(19_722), None])),
+				CastFamily::Timestamp => Arc::new(
+					TimestampNanosecondArray::from(vec![Some(0), None]).with_timezone("UTC"),
+				),
+			}
+		}
+
+		#[test]
+		fn every_declared_pair_executes_and_every_excluded_pair_fails() {
+			for &source in CastFamily::ALL {
+				for &target in CastFamily::ALL {
+					let source_type = representative_type(source);
+					let mut target_type = representative_type(target);
+					let rule = explicit_cast_rule(source, target);
+					if source == target {
+						if rule.is_none() {
+							// Identity short-circuits at bind; nothing to walk.
+							continue;
+						}
+						// The one declared intra-family pair rescales decimals.
+						target_type = DataType::Decimal128(20, 4);
+					}
+					assert_ne!(source_type, target_type, "{source:?} -> {target:?}");
+					let array = representative_array(source);
+					// Text-to-temporal pairs are declared but kernel-routed:
+					// the binder rewrites them onto the ADR 558 nodes, so a
+					// Cast node must never carry them.
+					let kernel_routed = matches!(source, CastFamily::Utf8 | CastFamily::LargeUtf8)
+						&& matches!(target, CastFamily::Date32 | CastFamily::Timestamp);
+					match rule {
+						None => {
+							evaluate_cast(&array, &target_type).expect_err(&format!(
+								"undeclared pair {source:?} -> {target:?} must fail strict"
+							));
+							evaluate_try_cast(&array, &target_type).expect_err(&format!(
+								"undeclared pair {source:?} -> {target:?} must fail TRY"
+							));
+						}
+						Some(_) if kernel_routed => {
+							evaluate_cast(&array, &target_type).expect_err(&format!(
+								"kernel-routed pair {source:?} -> {target:?} must not have a strict arm"
+							));
+							evaluate_try_cast(&array, &target_type).expect_err(&format!(
+								"kernel-routed pair {source:?} -> {target:?} must not have a TRY arm"
+							));
+						}
+						Some((_, CastAdmission::SqlCast)) => {
+							let strict = evaluate_cast(&array, &target_type).unwrap_or_else(|e| {
+								panic!("declared pair {source:?} -> {target:?} failed strict: {e}")
+							});
+							assert_eq!(strict.data_type(), &target_type);
+							assert!(strict.is_null(1), "NULL must propagate strict");
+							let lenient =
+								evaluate_try_cast(&array, &target_type).unwrap_or_else(|e| {
+									panic!("declared pair {source:?} -> {target:?} failed TRY: {e}")
+								});
+							assert_eq!(lenient.data_type(), &target_type);
+							assert!(lenient.is_null(1), "NULL must propagate TRY");
+						}
+						Some((_, CastAdmission::SynthesizedOnly)) => {
+							// Only strict casts are synthesized (arithmetic's
+							// `append_cast`); no TRY arm exists or is needed.
+							let strict = evaluate_cast(&array, &target_type).unwrap_or_else(|e| {
+								panic!("synthesized pair {source:?} -> {target:?} failed: {e}")
+							});
+							assert_eq!(strict.data_type(), &target_type);
+							assert!(strict.is_null(1), "NULL must propagate");
+						}
+					}
+				}
+			}
+		}
 	}
 }

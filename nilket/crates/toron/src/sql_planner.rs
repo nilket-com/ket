@@ -309,6 +309,9 @@ fn lower_cast_target_type(data_type: &SqlDataType) -> Result<DataType, FrontendE
 		| SqlDataType::DoublePrecision
 		| SqlDataType::Float8
 		| SqlDataType::Float64 => Ok(DataType::Float64),
+		// ADR 564: text targets render the canonical form; a length parameter is
+		// accepted and ignored, as the standard permits for unconstrained use.
+		SqlDataType::Varchar(_) | SqlDataType::Text | SqlDataType::String(_) => Ok(DataType::Utf8),
 		SqlDataType::Date | SqlDataType::Date32 => Ok(DataType::Date32),
 		SqlDataType::Timestamp(precision, TimezoneInfo::WithTimeZone | TimezoneInfo::Tz) => Ok(
 			utc_timestamp_data_type(timestamp_unit_for_precision(*precision)?),

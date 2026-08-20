@@ -1995,7 +1995,7 @@ pub(crate) fn adr093_physical_bind_try_cast_remains_identity_free() {
 	let binder = binder_source();
 	let try_cast = source_block(&binder, "fn bind_try_cast");
 
-	assert!(try_cast.contains("is_supported_explicit_numeric_cast(&source, target)"));
+	assert!(try_cast.contains("sql_cast_admissible(&source, target"));
 	assert!(try_cast.contains("builder.append_try_cast"));
 	assert!(!try_cast.contains("reconcile_identity"));
 	assert!(!try_cast.contains("set_node_logical_type"));

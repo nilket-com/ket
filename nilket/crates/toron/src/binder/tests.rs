@@ -28316,3 +28316,77 @@ async fn adr518_right_semi_traverses_from_preserved_side_only() {
 		"RightSemi must trace from its preserved right side to the left membership source: {pairs:?}"
 	);
 }
+
+#[test]
+fn adr564_text_temporal_casts_bind_onto_the_adr558_kernel_nodes() {
+	// Non-divergence by construction: the CAST spelling produces the same
+	// bound node TO_TIMESTAMP produces, session zone captured in its payload.
+	let target = crate::timestamp::utc_timestamp_data_type(TimeUnit::Nanosecond);
+	let strict = bind_parse_expr(
+		Expr::Cast(Box::new(Expr::column("moment")), target.clone()),
+		"Asia/Tokyo",
+		false,
+	)
+	.expect("bind CAST(text AS TIMESTAMPTZ)");
+	assert!(matches!(
+		strict.node(strict.single_root().unwrap()),
+		Some(BoundExprNode::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::ToTimestamp,
+			parameter: crate::ir::ScalarFunctionParameter::ToTimestamp { zone },
+			..
+		}) if zone.as_ref() == "Asia/Tokyo"
+	));
+	assert_eq!(
+		strict.node_nullable(strict.single_root().unwrap()),
+		Some(false),
+		"strict CAST fails the statement rather than answering NULL"
+	);
+
+	let lenient = bind_parse_expr(
+		Expr::TryCast(Box::new(Expr::column("moment")), target),
+		"Asia/Tokyo",
+		false,
+	)
+	.expect("bind TRY_CAST(text AS TIMESTAMPTZ)");
+	assert!(matches!(
+		lenient.node(lenient.single_root().unwrap()),
+		Some(BoundExprNode::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::TryToTimestamp,
+			parameter: crate::ir::ScalarFunctionParameter::ToTimestamp { zone },
+			..
+		}) if zone.as_ref() == "Asia/Tokyo"
+	));
+	assert_eq!(
+		lenient.node_nullable(lenient.single_root().unwrap()),
+		Some(true),
+		"TRY_CAST inherits YieldsNull nullability from the kernel"
+	);
+
+	// The date kernels carry no zone; both spellings still route onto them.
+	let strict_date = bind_parse_expr(
+		Expr::Cast(Box::new(Expr::column("moment")), DataType::Date32),
+		"Asia/Tokyo",
+		false,
+	)
+	.expect("bind CAST(text AS DATE)");
+	assert!(matches!(
+		strict_date.node(strict_date.single_root().unwrap()),
+		Some(BoundExprNode::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::ToDate,
+			..
+		})
+	));
+	let lenient_date = bind_parse_expr(
+		Expr::TryCast(Box::new(Expr::column("moment")), DataType::Date32),
+		"Asia/Tokyo",
+		false,
+	)
+	.expect("bind TRY_CAST(text AS DATE)");
+	assert!(matches!(
+		lenient_date.node(lenient_date.single_root().unwrap()),
+		Some(BoundExprNode::ScalarFunction {
+			id: crate::ir::ScalarFunctionId::TryToDate,
+			..
+		})
+	));
+}
