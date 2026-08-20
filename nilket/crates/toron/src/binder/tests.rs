@@ -23341,7 +23341,8 @@ fn collect_join_strategies(plan: &ExecutionPlan, strategies: &mut Vec<JoinStrate
 		// ADR 255: a recursive CTE has no joins in its body (first-cut shape is scan/filter/project),
 		// so it is an opaque leaf to these join collectors.
 		| ExecutionPlan::RecursiveCte { .. }
-		| ExecutionPlan::RecursiveRef { .. } => {}
+		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. } => {}
 	}
 }
 
@@ -23387,7 +23388,8 @@ fn collect_execution_join_kinds(plan: &ExecutionPlan, kinds: &mut Vec<JoinKind>)
 		// ADR 255: a recursive CTE has no joins in its body (first-cut shape is scan/filter/project),
 		// so it is an opaque leaf to these join collectors.
 		| ExecutionPlan::RecursiveCte { .. }
-		| ExecutionPlan::RecursiveRef { .. } => {}
+		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. } => {}
 	}
 }
 
@@ -23430,7 +23432,8 @@ fn collect_join_replay_ids(plan: &ExecutionPlan, ids: &mut Vec<JoinReplayId>) {
 		// ADR 255: a recursive CTE has no joins in its body (first-cut shape is scan/filter/project),
 		// so it is an opaque leaf to these join collectors.
 		| ExecutionPlan::RecursiveCte { .. }
-		| ExecutionPlan::RecursiveRef { .. } => {}
+		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. } => {}
 	}
 }
 
@@ -23480,7 +23483,8 @@ fn collect_join_replay_metadata(
 		// ADR 255: a recursive CTE has no joins in its body (first-cut shape is scan/filter/project),
 		// so it is an opaque leaf to these join collectors.
 		| ExecutionPlan::RecursiveCte { .. }
-		| ExecutionPlan::RecursiveRef { .. } => {}
+		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. } => {}
 	}
 }
 
@@ -23562,6 +23566,7 @@ fn collect_logical_join_kinds(plan: &LogicalPlan, kinds: &mut Vec<JoinKind>) {
 		// ADR 255: the first-cut recursive CTE body has no joins — opaque leaf to this join collector.
 		| LogicalPlan::RecursiveCte { .. }
 		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::Range { .. }
 		| LogicalPlan::Insert { .. } => {}
 	}
 }
@@ -28508,4 +28513,122 @@ fn adr566_shared_bound_nodes_evaluate_once() {
 			"row {row}: a shared slot must equal itself"
 		);
 	}
+}
+
+#[tokio::test]
+async fn adr569_range_binds_with_exact_facts_and_ordinal_schema() {
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	let scoped = Binder::new(&catalog, &config)
+		.bind_plan(&LogicalPlan::Range { count: 1_000 })
+		.await
+		.expect("bind range");
+	assert!(matches!(
+		scoped.plan,
+		ExecutionPlan::Range { count: 1_000, .. }
+	));
+	let schema = scoped.plan.schema();
+	assert_eq!(schema.fields().len(), 1);
+	let ordinal = schema.field(0);
+	assert_eq!(ordinal.name(), "ordinal");
+	assert_eq!(ordinal.data_type(), &DataType::Int64);
+	assert!(!ordinal.is_nullable());
+	// Exact facts by construction: not estimates that happen to be right.
+	assert_eq!(scoped.facts.estimated_row_count, Some(RowCount::new(1_000)));
+	assert_eq!(scoped.facts.row_upper_bound, Some(RowCount::new(1_000)));
+	assert_eq!(scoped.facts.byte_upper_bound, Some(ByteCount::new(8_000)));
+
+	let negative = Binder::new(&catalog, &config)
+		.bind_plan(&LogicalPlan::Range { count: -1 })
+		.await
+		.expect_err("negative cardinality refuses");
+	assert!(negative.to_string().contains("non-negative"), "{negative}");
+
+	let empty = Binder::new(&catalog, &config)
+		.bind_plan(&LogicalPlan::Range { count: 0 })
+		.await
+		.expect("bind empty range");
+	let batches = Executor::new(Arc::new(crate::storage::InMemoryTableStorage::new()))
+		.execute_bound(&empty.plan, None)
+		.await
+		.expect("execute empty range");
+	assert_eq!(
+		batches.iter().map(|b| b.num_rows()).sum::<usize>(),
+		0,
+		"zero cardinality yields the declared schema and no rows"
+	);
+	assert_eq!(batches[0].schema().field(0).name(), "ordinal");
+}
+
+#[test]
+fn adr569_seeded_random_is_deterministic_and_random_stays_per_call() {
+	// The registry pair the planner's rewrite legality reads: the seeded
+	// generator may be deduplicated and relocated; entropy may not.
+	let seeded = Expr::ScalarFunction {
+		id: crate::ir::ScalarFunctionId::SeededRandom,
+		args: vec![
+			Expr::Literal(ScalarValue::Int64(Some(42))),
+			Expr::column("ordinal"),
+		],
+		parameter: crate::ir::ScalarFunctionParameter::None,
+	};
+	assert!(seeded.is_deterministic());
+	let entropy = Expr::ScalarFunction {
+		id: crate::ir::ScalarFunctionId::Random,
+		args: Vec::new(),
+		parameter: crate::ir::ScalarFunctionParameter::None,
+	};
+	assert!(!entropy.is_deterministic());
+	assert_eq!(
+		crate::ir::scalar_function_metadata(crate::ir::ScalarFunctionId::Random).evaluation,
+		crate::ir::ScalarFunctionEvaluation::PerCall
+	);
+	assert_eq!(
+		crate::ir::scalar_function_metadata(crate::ir::ScalarFunctionId::SeededRandom).evaluation,
+		crate::ir::ScalarFunctionEvaluation::Deterministic
+	);
+}
+
+#[tokio::test]
+async fn adr569_range_cap_bounds_admission_and_byte_facts_stay_exact() {
+	// The cap invariant the checked byte multiply relies on: the cap sits far
+	// below the overflow line, so "exact" facts can never saturate.
+	assert!(crate::ir::RANGE_MAX_CARDINALITY as u64 <= u64::MAX / 8);
+
+	let catalog = MockCatalog::new();
+	let config = PlannerConfig::default();
+	// Bind-only at the cap: facts must be exact, and nothing materializes.
+	let at_cap = Binder::new(&catalog, &config)
+		.bind_plan(&LogicalPlan::Range {
+			count: crate::ir::RANGE_MAX_CARDINALITY,
+		})
+		.await
+		.expect("bind range at the cap");
+	let rows = crate::ir::RANGE_MAX_CARDINALITY as u64;
+	assert_eq!(at_cap.facts.estimated_row_count, Some(RowCount::new(rows)));
+	assert_eq!(
+		at_cap.facts.byte_upper_bound,
+		Some(ByteCount::new(rows * 8)),
+		"byte facts are exact, never saturated"
+	);
+
+	let over = Binder::new(&catalog, &config)
+		.bind_plan(&LogicalPlan::Range {
+			count: crate::ir::RANGE_MAX_CARDINALITY + 1,
+		})
+		.await
+		.expect_err("over-cap cardinality refuses at bind");
+	assert!(over.to_string().contains("cap"), "{over}");
+
+	// The executor re-enforces the cap: a wire-delivered plan never passed
+	// the binder, and this source materializes.
+	let wire_plan = ExecutionPlan::Range {
+		count: crate::ir::RANGE_MAX_CARDINALITY + 1,
+		schema: crate::ir::range_relation_schema(),
+	};
+	let refused = Executor::new(Arc::new(crate::storage::InMemoryTableStorage::new()))
+		.execute_bound(&wire_plan, None)
+		.await
+		.expect_err("over-cap cardinality refuses at execution");
+	assert!(refused.to_string().contains("cap"), "{refused}");
 }

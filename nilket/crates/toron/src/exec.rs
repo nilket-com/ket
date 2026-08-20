@@ -839,6 +839,9 @@ impl Executor {
 				LogicalPlan::RecursiveRef { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound recursive reference execution",
 				}),
+				LogicalPlan::Range { count } => {
+					scan_open::synthesize_range_batches(*count, &crate::ir::range_relation_schema())
+				}
 				LogicalPlan::Explain { .. } => Err(ExecutionError::NotImplemented {
 					feature: "unbound EXPLAIN execution",
 				}),
@@ -911,6 +914,9 @@ impl Executor {
 				}
 				ExecutionPlan::SystemTable { schema, rows, .. } => {
 					Ok(vec![materialize_scalar_rows(schema, rows)?])
+				}
+				ExecutionPlan::Range { count, schema } => {
+					scan_open::synthesize_range_batches(*count, schema)
 				}
 				ExecutionPlan::Scan { .. } => {
 					let req = self

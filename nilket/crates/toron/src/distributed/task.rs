@@ -531,6 +531,7 @@ fn streamable_unary_plan(plan: &ExecutionPlan) -> bool {
 		// streamable unary scan chain, and its self-reference leaf is not a streamable source.
 		| ExecutionPlan::RecursiveCte { .. }
 		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. }
 		| ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::CreateTable { .. }

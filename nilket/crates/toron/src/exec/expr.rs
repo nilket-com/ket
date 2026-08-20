@@ -884,6 +884,11 @@ fn evaluate_scalar_function(
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
 		) => evaluate_octet_length(&args[0]),
 		(
+			ScalarFunctionEvaluator::SeededRandom,
+			crate::ir::ScalarFunctionNullBehavior::Propagates,
+			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
+		) => evaluate_seeded_random(&args[0], &args[1]),
+		(
 			ScalarFunctionEvaluator::Translate,
 			crate::ir::ScalarFunctionNullBehavior::Propagates,
 			crate::ir::ScalarFunctionNonFiniteBehavior::Propagates,
@@ -2000,6 +2005,45 @@ fn evaluate_overlay(
 			})
 			.collect::<StringArray>(),
 	) as ArrayRef)
+}
+
+/// SplitMix64's finalizer: the specified shift-xor-multiply sequence, wrapping.
+fn splitmix64_finalize(mut state: u64) -> u64 {
+	state = (state ^ (state >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+	state = (state ^ (state >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+	state ^ (state >> 31)
+}
+
+/// The ADR 569 contract: `value = mix64(mix64(seed_bits) ^ key_bits)` over
+/// two's-complement bit patterns, high 53 bits divided by 2^53 into [0, 1).
+/// Mixing the seed before combining destroys additive structure; the
+/// asymmetry keeps `(seed, key)` distinct from `(key, seed)`. Functional and
+/// stateless by construction — no RNG state, no entropy source.
+fn evaluate_seeded_random(seed: &ArrayRef, key: &ArrayRef) -> Result<ArrayRef, ExecutionError> {
+	let (Some(seed), Some(key)) = (
+		seed.as_any().downcast_ref::<Int64Array>(),
+		key.as_any().downcast_ref::<Int64Array>(),
+	) else {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"SEEDED_RANDOM expects two Int64 arguments, got {:?} and {:?}",
+				seed.data_type(),
+				key.data_type()
+			),
+		});
+	};
+	let values = seed
+		.iter()
+		.zip(key.iter())
+		.map(|(seed, key)| match (seed, key) {
+			(Some(seed), Some(key)) => {
+				let mixed = splitmix64_finalize(splitmix64_finalize(seed as u64) ^ key as u64);
+				Some((mixed >> 11) as f64 / (1u64 << 53) as f64)
+			}
+			_ => None,
+		})
+		.collect::<Float64Array>();
+	Ok(Arc::new(values) as ArrayRef)
 }
 
 /// `SIGN` preserves its input type, so a decimal's sign is `1` at that decimal's
@@ -5304,6 +5348,62 @@ mod tests {
 					}
 				}
 			}
+		}
+	}
+
+	/// ADR 569: the seeded generator's semantic contract, pinned by witnesses
+	/// computed outside the engine (bigint arithmetic over the specified
+	/// SplitMix64 finalizer). An implementation drift in the composition, the
+	/// bit-pattern handling, or the 53-bit conversion moves at least one pin.
+	mod adr569_seeded_random {
+		use super::*;
+
+		fn seeded(seed: i64, key: i64) -> f64 {
+			let seed_array: ArrayRef = Arc::new(Int64Array::from(vec![Some(seed)]));
+			let key_array: ArrayRef = Arc::new(Int64Array::from(vec![Some(key)]));
+			let out = evaluate_seeded_random(&seed_array, &key_array).expect("seeded random");
+			let out = out
+				.as_any()
+				.downcast_ref::<Float64Array>()
+				.expect("Float64 output");
+			assert!(!out.is_null(0));
+			out.value(0)
+		}
+
+		#[test]
+		fn golden_witnesses_pin_the_composition() {
+			assert_eq!(seeded(0, 0), 0.0, "the finalizer's fixed point");
+			assert_eq!(seeded(42, 0), 0.593_422_410_984_530_3);
+			assert_eq!(seeded(42, 1), 0.562_874_068_100_840_06);
+			assert_eq!(seeded(1, 42), 0.760_359_689_116_368_31);
+			assert_eq!(
+				seeded(-1, 7),
+				0.989_150_291_174_069_38,
+				"negative arguments enter as two's-complement bit patterns"
+			);
+			assert_eq!(seeded(43, 0), 0.007_522_809_520_149_387_2);
+		}
+
+		#[test]
+		fn composition_has_no_diagonal_and_no_symmetry() {
+			// mix-before-combine: shifting the seed while offsetting the key
+			// must not reproduce the stream, and (seed, key) != (key, seed).
+			assert_ne!(seeded(42, 1), seeded(43, 0));
+			assert_ne!(seeded(42, 1), seeded(1, 42));
+		}
+
+		#[test]
+		fn outputs_stay_in_the_unit_interval_and_nulls_propagate() {
+			for seed in [i64::MIN, -1, 0, 1, 42, i64::MAX] {
+				for key in [i64::MIN, -1, 0, 7, i64::MAX] {
+					let value = seeded(seed, key);
+					assert!((0.0..1.0).contains(&value), "({seed}, {key}) -> {value}");
+				}
+			}
+			let seed_array: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), None, Some(2)]));
+			let key_array: ArrayRef = Arc::new(Int64Array::from(vec![Some(1), Some(2), None]));
+			let out = evaluate_seeded_random(&seed_array, &key_array).expect("seeded random");
+			assert_eq!(out.null_count(), 2, "a null seed or key yields null");
 		}
 	}
 }

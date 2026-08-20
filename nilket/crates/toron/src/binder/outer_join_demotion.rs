@@ -389,6 +389,7 @@ impl<'a> Binder<'a> {
 				// demotion does not rewrite inside it, and its self-reference is a leaf.
 				LogicalPlan::RecursiveCte { .. }
 				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Range { .. }
 				| LogicalPlan::Scan { .. }
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Explain { .. }
@@ -659,6 +660,7 @@ impl<'a> Binder<'a> {
 				}),
 				LogicalPlan::RecursiveCte { .. }
 				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Range { .. }
 				| LogicalPlan::Scan { .. }
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Explain { .. }
@@ -1081,7 +1083,8 @@ impl<'a> Binder<'a> {
 				| LogicalPlan::Update { .. }
 				| LogicalPlan::Insert { .. }
 				| LogicalPlan::RecursiveCte { .. }
-				| LogicalPlan::RecursiveRef { .. } => Ok(false),
+				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Range { .. } => Ok(false),
 			}
 		})
 	}
@@ -1575,6 +1578,7 @@ impl<'a> Binder<'a> {
 				// outer-demotion column routing (sealed local node); its self-reference is a leaf.
 				LogicalPlan::RecursiveCte { .. }
 				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Range { .. }
 				| LogicalPlan::Explain { .. }
 				| LogicalPlan::ExplainAnalyze { .. }
 				| LogicalPlan::CreateTable { .. }
@@ -1956,6 +1960,7 @@ impl<'a> Binder<'a> {
 				// fixpoint, and its self-reference is a leaf; routing stops here as for Scan.
 				stopped @ (LogicalPlan::RecursiveCte { .. }
 				| LogicalPlan::RecursiveRef { .. }
+				| LogicalPlan::Range { .. }
 				| LogicalPlan::Scan { .. }
 				| LogicalPlan::ScanNamed { .. }
 				| LogicalPlan::Filter { .. }

@@ -864,6 +864,24 @@ impl PlanOptimizerFacts {
 		Self::composite_with_bounds(Some(ByteCount::ZERO), Some(RowCount::new(0)))
 	}
 
+	/// Exact by construction: `count` rows of one 8-byte column. The checked
+	/// multiply cannot fire while the cardinality cap holds (the cap is far
+	/// below `u64::MAX / 8`), and if the cap ever moved past that line this
+	/// panics rather than saturating under an "exact" contract.
+	fn range_relation(count: u64) -> Self {
+		let bytes = count
+			.checked_mul(8)
+			.expect("range cardinality is capped below byte-fact overflow");
+		Self {
+			origin: PlanOrigin::SingleBaseRelation,
+			byte_upper_bound: Some(ByteCount::new(bytes)),
+			estimated_byte_size: Some(ByteCount::new(bytes)),
+			estimated_row_count: Some(RowCount::new(count)),
+			row_upper_bound: Some(RowCount::new(count)),
+			filtered_without_estimate: false,
+		}
+	}
+
 	fn preserve_volume_non_increasing(self) -> Self {
 		self
 	}
@@ -1894,6 +1912,32 @@ impl<'a> Binder<'a> {
 						},
 						scope,
 						PlanOptimizerFacts::composite_unknown(),
+					))
+				}
+				LogicalPlan::Range { count } => {
+					if *count < 0 {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!("range cardinality must be non-negative, got {count}"),
+						});
+					}
+					if *count > crate::ir::RANGE_MAX_CARDINALITY {
+						return Err(BindingError::UnsupportedExpression {
+							message: format!(
+								"range cardinality {count} exceeds the materializing source's \
+								 cap of {}",
+								crate::ir::RANGE_MAX_CARDINALITY
+							),
+						});
+					}
+					let schema = crate::ir::range_relation_schema();
+					let scope = RelationScope::scan(TableRef::new("range"), &schema);
+					Ok(ScopedExecutionPlan::new_with_facts(
+						ExecutionPlan::Range {
+							count: *count,
+							schema,
+						},
+						scope,
+						PlanOptimizerFacts::range_relation(*count as u64),
 					))
 				}
 				LogicalPlan::DeferredExists {
@@ -4292,6 +4336,14 @@ fn optimize_for_required(
 			let remap = ordinal_remap(&requested);
 			let schema = project_schema(&schema, &requested)?;
 			Ok((ExecutionPlan::EmptyRelation { schema }, remap))
+		}
+		ExecutionPlan::Range { count, schema } => {
+			let all_columns = all_columns(&schema);
+			let required = required_output.unwrap_or(all_columns);
+			let requested = required.iter().copied().collect::<Vec<_>>();
+			let remap = ordinal_remap(&requested);
+			let schema = project_schema(&schema, &requested)?;
+			Ok((ExecutionPlan::Range { count, schema }, remap))
 		}
 		ExecutionPlan::SystemTable { kind, schema, rows } => {
 			let all_columns = all_columns(&schema);

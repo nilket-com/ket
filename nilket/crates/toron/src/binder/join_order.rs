@@ -2233,6 +2233,7 @@ fn logical_plan_contains_join(plan: &LogicalPlan) -> bool {
 		// leaf; neither exposes a reorderable join to the star/galaxy detector.
 		LogicalPlan::RecursiveCte { .. }
 		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::Range { .. }
 		| LogicalPlan::Scan { .. }
 		| LogicalPlan::ScanNamed { .. }
 		| LogicalPlan::CreateTable { .. }

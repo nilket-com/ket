@@ -220,9 +220,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// binder/scalar_function.rs.
 	// ADR 556 carries the statement timestamp through the binder entry points so a
 	// per-statement scalar is fixed before a plan is fragmented.
+	// ADR 569 adds the virtual Range leaf: its bind arm and exact-facts
+	// constructor. Bumped by its cost.
 	assert!(
-		lines <= 6_365,
-		"binder root has {lines} lines; expected <= 6,365 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_415,
+		"binder root has {lines} lines; expected <= 6,415 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

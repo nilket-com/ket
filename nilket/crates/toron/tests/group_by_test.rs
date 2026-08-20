@@ -7963,7 +7963,8 @@ fn contains_execution_join(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. }
 		| ExecutionPlan::RecursiveCte { .. }
-		| ExecutionPlan::RecursiveRef { .. } => false,
+		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. } => false,
 	}
 }
 
@@ -8001,6 +8002,7 @@ fn contains_logical_join(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::InsertSelect { .. }
 		| LogicalPlan::RecursiveCte { .. }
 		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::Range { .. }
 		| LogicalPlan::DeferredExists { .. }
 		| LogicalPlan::DeferredScalarSubquery { .. } => false,
 	}
@@ -8042,6 +8044,7 @@ fn contains_logical_distinct(plan: &LogicalPlan) -> bool {
 		| LogicalPlan::InsertSelect { .. }
 		| LogicalPlan::RecursiveCte { .. }
 		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::Range { .. }
 		| LogicalPlan::DeferredExists { .. }
 		| LogicalPlan::DeferredScalarSubquery { .. } => false,
 	}
@@ -8076,7 +8079,8 @@ fn contains_execution_sort(plan: &ExecutionPlan) -> bool {
 		| ExecutionPlan::Insert { .. }
 		| ExecutionPlan::InsertSelect { .. }
 		| ExecutionPlan::RecursiveCte { .. }
-		| ExecutionPlan::RecursiveRef { .. } => false,
+		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. } => false,
 	}
 }
 
@@ -10318,5 +10322,136 @@ async fn adr568_refused_spellings_get_directives() {
 	assert!(
 		neq_any.to_string().contains("x NOT IN (subquery)"),
 		"got {neq_any}"
+	);
+}
+
+#[tokio::test]
+async fn adr569_range_generates_ordinals_and_composes_as_a_relation() {
+	let rows = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.range(5).project([col("ordinal"), col("ordinal").mul(lit(2))])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	let ordinals = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("ordinal output");
+	let doubled = rows[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("doubled output");
+	assert_eq!(rows[0].num_rows(), 5);
+	for row in 0..5 {
+		assert_eq!(ordinals.value(row), row as i64, "zero-based exact ordinals");
+		assert_eq!(
+			doubled.value(row),
+			2 * row as i64,
+			"ordinary column arithmetic"
+		);
+	}
+
+	let empty = run_logical(&rune_plan("pub fn main(ctx) { ctx.range(0) }").await).await;
+	assert_eq!(empty.iter().map(|b| b.num_rows()).sum::<usize>(), 0);
+	assert_eq!(empty[0].schema().field(0).name(), "ordinal");
+
+	let config = RuneSandboxConfig::v1_default();
+	let engine = RuneEngine::with_config(config.clone()).expect("Rune engine");
+	let negative = engine
+		.execute_script("pub fn main(ctx) { ctx.range(-1) }", &config)
+		.await;
+	assert!(
+		negative.is_err(),
+		"negative cardinality refuses at authoring"
+	);
+	let over_cap = engine
+		.execute_script(
+			"pub fn main(ctx) { ctx.range(9223372036854775807) }",
+			&config,
+		)
+		.await;
+	assert!(
+		over_cap.is_err(),
+		"over-cap cardinality refuses at authoring"
+	);
+}
+
+#[tokio::test]
+async fn adr569_seeded_random_is_reproducible_and_seed_sensitive() {
+	let script = |seed: i64| {
+		format!(
+			r#"
+        pub fn main(ctx) {{
+            ctx.range(64).project([col("ordinal"), seeded_random(lit_i64({seed}), col("ordinal"))])
+        }}
+    "#
+		)
+	};
+	let first = run_logical(&rune_plan(&script(42)).await).await;
+	let second = run_logical(&rune_plan(&script(42)).await).await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&first, SortPolicy::FullRowLex).expect("first digest"),
+		canonical_arrow_ipc_digest(&second, SortPolicy::FullRowLex).expect("second digest"),
+		"the same seed reproduces the same multiset"
+	);
+	let reseeded = run_logical(&rune_plan(&script(43)).await).await;
+	assert_ne!(
+		canonical_arrow_ipc_digest(&first, SortPolicy::FullRowLex).expect("first digest"),
+		canonical_arrow_ipc_digest(&reseeded, SortPolicy::FullRowLex).expect("reseeded digest"),
+		"a changed seed changes the stream"
+	);
+
+	// The exchange-bearing composition: grouped aggregation over generated
+	// values fragments through the ordinary hash path and must reproduce too.
+	let grouped = r#"
+        pub fn main(ctx) {
+            ctx.range(256)
+               .project_named([col("ordinal").named("ordinal"), floor(seeded_random(lit_i64(7), col("ordinal")).mul(lit(4))).named("bucket")])
+               .aggregate([col("bucket")], [count_all()])
+        }
+    "#;
+	let grouped_first = run_logical(&rune_plan(grouped).await).await;
+	let grouped_second = run_logical(&rune_plan(grouped).await).await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&grouped_first, SortPolicy::FullRowLex).expect("digest"),
+		canonical_arrow_ipc_digest(&grouped_second, SortPolicy::FullRowLex).expect("digest"),
+		"an exchange-bearing plan reproduces the same canonical rows"
+	);
+
+	// Values from the golden contract surface through the relation surface.
+	let values = first[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("seeded values");
+	assert_eq!(values.value(0), 0.593_422_410_984_530_3, "witness (42, 0)");
+	assert_eq!(values.value(1), 0.562_874_068_100_840_06, "witness (42, 1)");
+}
+
+#[tokio::test]
+async fn adr569_sql_and_rune_share_the_seeded_identifier() {
+	let sql = run_logical(&plan_sql("SELECT id, SEEDED_RANDOM(42, id) FROM sales")).await;
+	let rune = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales").project([col("id"), seeded_random(lit_i64(42), col("id"))])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql, SortPolicy::FullRowLex).expect("SQL digest"),
+		canonical_arrow_ipc_digest(&rune, SortPolicy::FullRowLex).expect("Rune digest"),
+		"one registry identifier, one result"
 	);
 }

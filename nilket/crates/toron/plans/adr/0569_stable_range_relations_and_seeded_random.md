@@ -49,6 +49,15 @@ as leaves must consciously include the range node. The node publishes exact
 row-count, NDV, and ordinal min/max facts at birth. Those facts are true by
 construction, and only plans containing the new node can observe them.
 
+The source **materializes** its batches in this cut, so cardinality is a
+memory commitment, and admission is bounded: a documented cap of 2^28 rows
+(~2 GiB of ordinals), enforced at the Rune authoring boundary, at bind, and
+again at execution — a wire-delivered plan never passed the binder, so the
+executor must fail closed rather than allocate. The cap also keeps exact byte
+facts representable: fact arithmetic is checked, never saturating, because a
+saturated value under an "exact" contract is neither exact nor a bound. A
+streaming range source is the named deferral that lifts the cap.
+
 There is no SQL table-function spelling: Toron has no SQL `FROM` table-function
 seam. This is an absence, not a preference; adding such a grammar is deferred.
 
@@ -122,6 +131,10 @@ and scalar only.
   digests; unnormalized row/batch order is not asserted.
 - Exact range row-count, NDV, and min/max facts reach the optimizer fact carrier
   and match the source cardinality.
+- Boundary controls: cardinality at the cap binds with exact, unsaturated
+  byte facts (bind-only, nothing materializes); one past the cap refuses at
+  authoring, at bind, and at execution — the execution control through a
+  hand-built plan the binder never saw.
 - A deterministic rewrite/CSE probe preserves seeded values, proving the
   registry declaration rather than trusting it.
 - Existing `random()` remains `PerCall` and retains its current behavior.
@@ -161,5 +174,6 @@ artifact means. It must not assume this ADR supplies table creation, ordering,
 or a distributed write path.
 
 Named distributions, wider seeded-key types, a SQL table-function grammar,
-CSV ingest, and a distributed Arrow-IPC ingest/write path are separately
+CSV ingest, a distributed Arrow-IPC ingest/write path, and the streaming
+range source that lifts the materializing cardinality cap are separately
 deferred.

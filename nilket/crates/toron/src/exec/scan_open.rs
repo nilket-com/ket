@@ -302,3 +302,39 @@ mod tests {
 		));
 	}
 }
+
+/// Synthesizes the range relation's batches: `count` non-null `Int64`
+/// ordinals in `[0, count)`, split at the standard batch width. The
+/// cardinality cap is re-enforced here — a plan can arrive over the wire
+/// without ever passing the binder, and this source materializes, so an
+/// unbounded count is an unbounded memory commitment.
+pub(super) fn synthesize_range_batches(
+	count: i64,
+	schema: &arrow::datatypes::SchemaRef,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	const RANGE_BATCH_ROWS: i64 = 8_192;
+	if count > crate::ir::RANGE_MAX_CARDINALITY {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"range cardinality {count} exceeds the materializing source's cap of {}",
+				crate::ir::RANGE_MAX_CARDINALITY
+			),
+		});
+	}
+	if count <= 0 {
+		return Ok(vec![RecordBatch::new_empty(schema.clone())]);
+	}
+	let mut batches =
+		Vec::with_capacity(((count + RANGE_BATCH_ROWS - 1) / RANGE_BATCH_ROWS) as usize);
+	let mut start = 0_i64;
+	while start < count {
+		let end = (start + RANGE_BATCH_ROWS).min(count);
+		let ordinals = arrow::array::Int64Array::from_iter_values(start..end);
+		batches.push(
+			RecordBatch::try_new(schema.clone(), vec![std::sync::Arc::new(ordinals)])
+				.expect("range schema is the one ordinal column"),
+		);
+		start = end;
+	}
+	Ok(batches)
+}

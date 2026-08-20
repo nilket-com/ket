@@ -11302,6 +11302,8 @@ fn plan_qualifiers(plan: &LogicalPlan) -> Vec<TableRef> {
 		LogicalPlan::RecursiveCte { name, .. } => vec![TableRef::new(name.clone())],
 		// ADR 255: the self-reference leaf likewise exposes the CTE name (it stands in for the relation).
 		LogicalPlan::RecursiveRef { name, .. } => vec![TableRef::new(name.clone())],
+		// The range leaf exposes the same fixed qualifier the binder scopes it under.
+		LogicalPlan::Range { .. } => vec![TableRef::new("range")],
 		LogicalPlan::Scan { .. }
 		| LogicalPlan::Explain { .. }
 		| LogicalPlan::ExplainAnalyze { .. }
@@ -12433,7 +12435,7 @@ mod tests {
 			LogicalPlan::RecursiveCte {
 				seed, recursive, ..
 			} => filter_count(seed) + filter_count(recursive),
-			LogicalPlan::RecursiveRef { .. } => 0,
+			LogicalPlan::RecursiveRef { .. } | LogicalPlan::Range { .. } => 0,
 			LogicalPlan::Scan { .. }
 			| LogicalPlan::ScanNamed { .. }
 			| LogicalPlan::CreateTable { .. }

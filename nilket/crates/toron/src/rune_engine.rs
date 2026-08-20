@@ -684,6 +684,26 @@ impl ToronContext {
 		RuneDataFrame::new(name)
 	}
 
+	/// The virtual range relation: `count` rows of the non-null `Int64`
+	/// `ordinal` column, valued `[0, count)`. Negative cardinality and counts
+	/// beyond the materializing cap refuse here, at the authoring boundary.
+	pub fn range(&self, count: i64) -> VmResult<RuneDataFrame> {
+		if count < 0 {
+			return VmResult::panic(format!(
+				"range cardinality must be non-negative, got {count}"
+			));
+		}
+		if count > crate::ir::RANGE_MAX_CARDINALITY {
+			return VmResult::panic(format!(
+				"range cardinality {count} exceeds the materializing source's cap of {}",
+				crate::ir::RANGE_MAX_CARDINALITY
+			));
+		}
+		VmResult::Ok(RuneDataFrame {
+			plan: LogicalPlan::Range { count },
+		})
+	}
+
 	pub fn optimizer_decisions(&self) -> RuneDataFrame {
 		Self::optimizer_readout(RUNE_OPTIMIZER_DECISIONS_TABLE)
 	}
@@ -1945,6 +1965,16 @@ pub fn replace(input: RuneExpr, from: RuneExpr, to: RuneExpr) -> RuneExpr {
 	}
 }
 
+pub fn seeded_random(seed: RuneExpr, key: RuneExpr) -> RuneExpr {
+	RuneExpr {
+		expr: Expr::ScalarFunction {
+			id: ScalarFunctionId::SeededRandom,
+			args: vec![seed.expr, key.expr],
+			parameter: ScalarFunctionParameter::None,
+		},
+	}
+}
+
 pub fn octet_length(input: RuneExpr) -> RuneExpr {
 	RuneExpr {
 		expr: Expr::ScalarFunction {
@@ -2103,6 +2133,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["position"], position).build()?;
 	m.function(["strpos"], strpos).build()?;
 	m.function(["replace"], replace).build()?;
+	m.function(["seeded_random"], seeded_random).build()?;
 	m.function(["octet_length"], octet_length).build()?;
 	m.function(["overlay"], overlay).build()?;
 	m.function(["translate"], translate).build()?;
@@ -2159,6 +2190,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.function(["sandbox_sleep_ms"], sandbox_sleep_ms).build()?;
 
 	m.associated_function("table", ToronContext::table)?;
+	m.associated_function("range", ToronContext::range)?;
 	m.associated_function("optimizer_decisions", ToronContext::optimizer_decisions)?;
 	m.associated_function(
 		"optimizer_runtime_verdicts",

@@ -539,6 +539,42 @@ pub(super) fn bind_scalar_function(
 			}
 			Ok(builder.append_scalar_function(id, bound_args, DataType::Utf8))
 		}
+		ScalarFunctionSignature::SeededUnitInterval => {
+			let [seed, key] = bound_args.as_slice() else {
+				unreachable!("the registry arity was checked before binding")
+			};
+			// An integer literal widens exactly (the SUBSTRING-bound courtesy);
+			// non-literal expressions carry the strict Int64 contract.
+			for node in [seed, key] {
+				if let Some(ScalarValue::Int32(value)) = builder.literal(*node).cloned() {
+					let _ =
+						builder.rewrite_literal(*node, ScalarValue::Int64(value.map(i64::from)));
+				}
+			}
+			for (node, role) in [(seed, "seed"), (key, "key")] {
+				if !builder
+					.node_logical_type(*node)
+					.is_some_and(LogicalTypeId::is_naked)
+				{
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} {role} does not accept named logical types",
+							metadata.sql_name
+						),
+					});
+				}
+				if builder.node_type(*node) != Some(&DataType::Int64) {
+					return Err(BindingError::TypeMismatch {
+						message: format!(
+							"{} {role} expects Int64, got {:?}",
+							metadata.sql_name,
+							builder.node_type(*node)
+						),
+					});
+				}
+			}
+			Ok(builder.append_scalar_function(id, bound_args, DataType::Float64))
+		}
 		ScalarFunctionSignature::Int64MillisWithConstantInterval => {
 			let [interval, input] = bound_args.as_slice() else {
 				unreachable!("the registry arity was checked before binding")

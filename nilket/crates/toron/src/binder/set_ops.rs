@@ -208,6 +208,7 @@ pub(super) fn distinct_input_unsupported_message(plan: &LogicalPlan) -> Option<&
 		// first cut; conservatively report the shape as unsupported rather than recursing.
 		LogicalPlan::RecursiveCte { .. }
 		| LogicalPlan::RecursiveRef { .. }
+		| LogicalPlan::Range { .. }
 		| LogicalPlan::Explain { .. }
 		| LogicalPlan::ExplainAnalyze { .. }
 		| LogicalPlan::CreateTable { .. }

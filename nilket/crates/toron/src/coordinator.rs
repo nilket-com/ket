@@ -2061,6 +2061,7 @@ fn collect_replayable_broadcast_join_ids(plan: &ExecutionPlan, ids: &mut BTreeSe
 		// self-reference is a leaf), so its interior holds no cross-stage replay candidates.
 		ExecutionPlan::RecursiveCte { .. }
 		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. }
 		| ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
 		| ExecutionPlan::Scan { .. }

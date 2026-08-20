@@ -336,6 +336,7 @@ impl StatementClass {
 			// fixpoint node and its self-reference leaf classify as Select.
 			| LogicalPlan::RecursiveCte { .. }
 			| LogicalPlan::RecursiveRef { .. }
+			| LogicalPlan::Range { .. }
 			| LogicalPlan::Explain { .. }
 			| LogicalPlan::ExplainAnalyze { .. } => Self::Select,
 		}

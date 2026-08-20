@@ -189,6 +189,7 @@ pub(crate) fn adr553_scalar_functions_use_the_registry_not_new_expr_variants() {
 			"Reverse".to_string(),
 			"Rpad".to_string(),
 			"Round".to_string(),
+			"SeededRandom".to_string(),
 			"Rtrim".to_string(),
 			"Lower".to_string(),
 			"Sign".to_string(),
@@ -291,4 +292,41 @@ pub(crate) fn adr553_guard_rejects_an_unlisted_scalar_variant() {
 			.any(|problem| problem.contains("unexpected scalar-function variants: [\"Pow\"]")),
 		"the closed-variant guard must reject a scalar name it does not know"
 	);
+}
+
+/// ADR 569: the registry's generator pair is a contract — `SEEDED_RANDOM` is
+/// the deterministic, functional generator and `RANDOM` remains the `PerCall`
+/// entropy scalar. The seeded evaluator must stay stateless: an RNG-state or
+/// entropy call inside it would make placement observable.
+#[test]
+pub(crate) fn adr569_seeded_random_is_deterministic_and_entropy_free() {
+	let registry = source("src/ir/scalar_function.rs");
+	let seeded =
+		brace_blocks_after_marker(&registry, "const SEEDED_RANDOM: ScalarFunctionMetadata")
+			.into_iter()
+			.next()
+			.expect("SEEDED_RANDOM metadata")
+			.1;
+	assert!(seeded.contains("evaluation: ScalarFunctionEvaluation::Deterministic"));
+	let random = brace_blocks_after_marker(&registry, "const RANDOM: ScalarFunctionMetadata")
+		.into_iter()
+		.next()
+		.expect("RANDOM metadata")
+		.1;
+	assert!(random.contains("evaluation: ScalarFunctionEvaluation::PerCall"));
+	assert!(random.contains("evaluator: ScalarFunctionEvaluator::Random"));
+
+	let evaluator = source("src/exec/expr.rs");
+	let seeded_eval = brace_blocks_after_marker(&evaluator, "fn evaluate_seeded_random")
+		.into_iter()
+		.next()
+		.expect("evaluate_seeded_random body")
+		.1;
+	for prohibited in ["rand::", "thread_rng", "OsRng", "getrandom", "SystemTime"] {
+		assert!(
+			!seeded_eval.contains(prohibited),
+			"the seeded evaluator must not consume entropy or state: found {prohibited}"
+		);
+	}
+	assert!(seeded_eval.contains("splitmix64_finalize"));
 }

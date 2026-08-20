@@ -11090,6 +11090,7 @@ fn compact_execution_plan_shape(plan: &ExecutionPlan) -> String {
 			)
 		}
 		ExecutionPlan::EmptyRelation { .. } => "EmptyRelation".to_string(),
+		ExecutionPlan::Range { count, .. } => format!("Range({count})"),
 		ExecutionPlan::SystemTable { kind, .. } => format!("SystemTable({kind:?})"),
 		ExecutionPlan::CreateTable { .. } => "CreateTable".to_string(),
 		ExecutionPlan::CreateLogicalType { .. } => "CreateLogicalType".to_string(),
@@ -22636,7 +22637,8 @@ mod adr331_q08_scale_probe {
 			| ExecutionPlan::Insert { .. }
 			| ExecutionPlan::InsertSelect { .. }
 			| ExecutionPlan::RecursiveCte { .. }
-			| ExecutionPlan::RecursiveRef { .. } => {}
+			| ExecutionPlan::RecursiveRef { .. }
+			| ExecutionPlan::Range { .. } => {}
 		}
 	}
 
@@ -22676,6 +22678,7 @@ mod adr331_q08_scale_probe {
 			}
 			ExecutionPlan::Scan { local_table_id, .. } => format!("Scan({local_table_id:?})"),
 			ExecutionPlan::EmptyRelation { .. } => "EmptyRelation".to_string(),
+			ExecutionPlan::Range { count, .. } => format!("Range({count})"),
 			ExecutionPlan::SystemTable { .. } => "SystemTable".to_string(),
 			ExecutionPlan::CreateTable { .. } => "CreateTable".to_string(),
 			ExecutionPlan::CreateLogicalType { .. } => "CreateLogicalType".to_string(),

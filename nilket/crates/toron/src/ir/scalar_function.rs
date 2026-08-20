@@ -60,6 +60,7 @@ pub enum ScalarFunctionId {
 	OctetLength,
 	Overlay,
 	Translate,
+	SeededRandom,
 }
 
 /// Non-child data carried by a scalar-function node.
@@ -337,6 +338,10 @@ pub enum ScalarFunctionSignature {
 	/// them; the second string is the replacement, which shares the input's
 	/// type.
 	StringPairWithConstantBounds,
+	/// ADR 569: two `Int64` values producing a `Float64` in `[0, 1)`. The
+	/// strict integer signature keeps the key encoding exact and bounded;
+	/// broad type hashing is its own admission decision.
+	SeededUnitInterval,
 	/// A constant interval followed by `Int64` Unix milliseconds, producing
 	/// `Int64`. The interval is a constant argument like SUBSTRING's bounds but
 	/// carries a value rather than a count, which is what this registration
@@ -454,6 +459,7 @@ pub enum ScalarFunctionEvaluator {
 	OctetLength,
 	Overlay,
 	Translate,
+	SeededRandom,
 }
 
 /// Planner and execution metadata for one scalar capability.
@@ -1131,6 +1137,25 @@ const TRANSLATE: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	evaluator: ScalarFunctionEvaluator::Translate,
 };
 
+const SEEDED_RANDOM: ScalarFunctionMetadata = ScalarFunctionMetadata {
+	id: ScalarFunctionId::SeededRandom,
+	// ADR 569: the reproducible generator, `RANDOM`'s deterministic sibling.
+	// value = mix64(mix64(seed_bits) ^ key_bits) with SplitMix64's finalizer;
+	// the high 53 bits divide by 2^53 into [0, 1). Functional, never stateful.
+	sql_name: "SEEDED_RANDOM",
+	sql_aliases: &[],
+	rune_name: "seeded_random",
+	arity: ScalarFunctionArity::Exact(2),
+	signature: ScalarFunctionSignature::SeededUnitInterval,
+	null_behavior: ScalarFunctionNullBehavior::Propagates,
+	failure: ScalarFunctionFailure::Raises,
+	non_finite_behavior: ScalarFunctionNonFiniteBehavior::Propagates,
+	evaluation: ScalarFunctionEvaluation::Deterministic,
+	pbc_pushdown_eligible: false,
+	guard_filter_pushdown_safe: false,
+	evaluator: ScalarFunctionEvaluator::SeededRandom,
+};
+
 const TO_TIMESTAMP: ScalarFunctionMetadata = ScalarFunctionMetadata {
 	id: ScalarFunctionId::ToTimestamp,
 	sql_name: "TO_TIMESTAMP",
@@ -1324,6 +1349,7 @@ pub const SCALAR_FUNCTIONS: &[ScalarFunctionMetadata] = &[
 	OCTET_LENGTH,
 	OVERLAY,
 	TRANSLATE,
+	SEEDED_RANDOM,
 ];
 
 pub fn scalar_function_metadata(id: ScalarFunctionId) -> &'static ScalarFunctionMetadata {

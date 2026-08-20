@@ -1318,6 +1318,7 @@ pub(super) fn broadcast_probe_linearity(plan: &ExecutionPlan) -> ProbeLinearity 
 		}
 		ExecutionPlan::EmptyRelation { .. }
 		| ExecutionPlan::SystemTable { .. }
+		| ExecutionPlan::Range { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }
@@ -1721,6 +1722,7 @@ pub(super) fn terminal_exchange(plan: &ExecutionPlan) -> Option<(u32, &BoundExpr
 		// exchange visible to outer fragmentation) and its self-reference is a leaf.
 		| ExecutionPlan::RecursiveCte { .. }
 		| ExecutionPlan::RecursiveRef { .. }
+		| ExecutionPlan::Range { .. }
 		| ExecutionPlan::CreateTable { .. }
 		| ExecutionPlan::CreateLogicalType { .. }
 		| ExecutionPlan::CreateTableAsSelect { .. }

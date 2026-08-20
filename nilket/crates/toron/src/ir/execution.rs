@@ -416,6 +416,30 @@ pub enum ExecutionPlan {
 	RecursiveRef {
 		output_schema: SchemaRef,
 	},
+	/// The virtual range leaf: `count` non-null `Int64` ordinals `[0, count)`,
+	/// synthesized eagerly at execution under [`RANGE_MAX_CARDINALITY`] —
+	/// the executor re-enforces the cap because a wire-delivered plan never
+	/// passed the binder. No storage identity; facts are exact by
+	/// construction.
+	Range {
+		count: i64,
+		schema: SchemaRef,
+	},
+}
+
+/// The range source's admission bound: 2^28 rows (~2 GiB of ordinals). The
+/// current source materializes its batches, so cardinality is a memory
+/// commitment; a streaming source is the deferral that lifts this cap. The
+/// bound also keeps exact byte facts representable: `count * 8` stays far
+/// below `u64::MAX`, so fact arithmetic never saturates under the "exact"
+/// contract.
+pub const RANGE_MAX_CARDINALITY: i64 = 1 << 28;
+
+/// The range relation's one-column schema: non-null `Int64` `ordinal`.
+pub fn range_relation_schema() -> SchemaRef {
+	std::sync::Arc::new(arrow::datatypes::Schema::new(vec![
+		arrow::datatypes::Field::new("ordinal", DataType::Int64, false),
+	]))
 }
 
 impl ExecutionPlan {
@@ -423,6 +447,7 @@ impl ExecutionPlan {
 		match self {
 			Self::EmptyRelation { schema } => schema.clone(),
 			Self::SystemTable { schema, .. } => schema.clone(),
+			Self::Range { schema, .. } => schema.clone(),
 			Self::Scan {
 				schema,
 				row_identity,

@@ -1470,6 +1470,12 @@ pub enum LogicalPlan {
 		name: String,
 		column_names: Vec<String>,
 	},
+	/// The virtual range source: `count` rows of the non-null `Int64`
+	/// `ordinal` column, valued `[0, count)`. Cardinality is virtual — no
+	/// storage scan, no materialized rows.
+	Range {
+		count: i64,
+	},
 }
 
 /// ADR 552: the density operator's authored expressions and grid size live behind a box so adding
