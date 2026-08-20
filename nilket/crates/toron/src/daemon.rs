@@ -1639,7 +1639,16 @@ async fn handle_sql_connection(
 
 			let statement_class = StatementClass::from_plan(&plan);
 			crate::telemetry::record_query_statement_class(&query_span, statement_class);
-			if statement_class != StatementClass::Select {
+			// The materialize verb is the sole Rune write: a CTAS carrying its
+			// certificate. Everything else stays behind the read-only fence.
+			let certified_materialization = matches!(
+				&plan,
+				LogicalPlan::CreateTableAsSelect {
+					materialization_certificate: Some(_),
+					..
+				}
+			);
+			if statement_class != StatementClass::Select && !certified_materialization {
 				let failure = RuneFailure {
 					kind: RuneFailureKind::Execution(SqlErrorCode::PlanningError),
 					message: "Rune workspace first contact is read-only".to_owned(),

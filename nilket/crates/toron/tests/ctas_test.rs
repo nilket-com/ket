@@ -68,6 +68,7 @@ fn planner_accepts_create_or_replace_table_as_select_surface() {
 		if_not_exists,
 		or_replace,
 		source,
+		materialization_certificate: _,
 	} = plan
 	else {
 		panic!("expected CTAS logical plan");
@@ -1339,6 +1340,7 @@ async fn executor_and_fragmenter_reject_direct_ctas_execution() {
 		if_not_exists: false,
 		or_replace: false,
 		source: Box::new(scan_plan(&source)),
+		materialization_certificate: None,
 	};
 	let executor = Executor::with_context(
 		empty_storage(),
@@ -2073,4 +2075,300 @@ impl Catalog for ExpiredLeaseCatalog {
 	) -> Result<Option<TableBinding>, CatalogError> {
 		self.inner.drop_table(name, if_exists).await
 	}
+}
+
+async fn materialize_plan(script: &str) -> LogicalPlan {
+	let config = toron::rune_engine::RuneSandboxConfig {
+		wall_timeout: std::time::Duration::from_secs(2),
+		..toron::rune_engine::RuneSandboxConfig::v1_default()
+	};
+	let engine = toron::rune_engine::RuneEngine::with_config(config.clone()).expect("Rune engine");
+	engine
+		.execute_script(script, &config)
+		.await
+		.expect("author materialize")
+}
+
+#[tokio::test]
+async fn adr0572_materialize_creates_a_table_born_with_its_certificate() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+	let plan = materialize_plan(r#"pub fn main(ctx) { ctx.range(4).materialize("kept") }"#).await;
+	let LogicalPlan::CreateTableAsSelect {
+		materialization_certificate: Some(expected),
+		..
+	} = &plan
+	else {
+		panic!("materialize must author a certificate-carrying CTAS");
+	};
+
+	coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect("materialize executes through the ordinary CTAS saga");
+
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT ordinal FROM kept ORDER BY ordinal",
+	)
+	.await;
+	assert_eq!(
+		int64_column(&batch, 0).values(),
+		&[0, 1, 2, 3],
+		"the kept rows equal the live relation's"
+	);
+
+	let attached = catalog
+		.materialization_certificate(&TableRef::new("kept"))
+		.expect("the table is born with its attachment");
+	assert_eq!(
+		&attached, expected,
+		"the attachment is the authored certificate, byte for byte"
+	);
+	let decoded =
+		boson::CanonicalRelationExpression::decode_v1(&attached).expect("decode attachment");
+	assert_eq!(decoded.relation.count, 4);
+	assert_eq!(decoded.relation.projection, None);
+
+	// Plain CTAS control: no certificate, no attachment, behavior unchanged.
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE copy AS SELECT ordinal FROM kept")
+				.expect("plan plain CTAS"),
+			None,
+		)
+		.await
+		.expect("plain CTAS");
+	assert!(
+		catalog
+			.materialization_certificate(&TableRef::new("copy"))
+			.is_none()
+	);
+
+	// Destruction coupling: the ordinary DROP takes the attachment with it.
+	coordinator
+		.execute_query(&planner.plan("DROP TABLE kept").expect("plan drop"), None)
+		.await
+		.expect("drop the materialized table");
+	assert!(
+		catalog
+			.materialization_certificate(&TableRef::new("kept"))
+			.is_none(),
+		"the certificate never survives its object"
+	);
+}
+
+#[tokio::test]
+async fn adr0572_materialize_name_collision_refuses_and_attaches_nothing() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE kept (id INT NOT NULL)")
+				.expect("plan occupant"),
+			None,
+		)
+		.await
+		.expect("create the occupant");
+
+	let plan = materialize_plan(r#"pub fn main(ctx) { ctx.range(4).materialize("kept") }"#).await;
+	coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect_err("a name collision refuses: the verb is fresh-only");
+	assert!(
+		catalog
+			.materialization_certificate(&TableRef::new("kept"))
+			.is_none(),
+		"a refused materialization must not attach"
+	);
+}
+
+#[tokio::test]
+async fn adr0572_wire_delivered_certificate_with_reuse_flags_is_refused() {
+	let (_catalog, _storage, coordinator, _planner) = coordinator();
+	// The verb cannot author this shape; only a wire-delivered plan can. The
+	// coordinator, not authoring, is the enforcement point.
+	let certificate = boson::CanonicalRelationExpression {
+		format_version: boson::V1_FORMAT_VERSION,
+		relation: boson::GeneratedRange {
+			count: 2,
+			projection: None,
+		},
+	}
+	.encode_v1()
+	.expect("encode");
+	let plan = LogicalPlan::CreateTableAsSelect {
+		table: TableRef::new("kept"),
+		intent_request: "materialize kept".to_string(),
+		if_not_exists: true,
+		or_replace: false,
+		source: Box::new(LogicalPlan::Range { count: 2 }),
+		materialization_certificate: Some(certificate),
+	};
+	let error = coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect_err("a certificate never combines with if_not_exists");
+	assert!(
+		error.to_string().contains("fresh table binding"),
+		"got {error}"
+	);
+}
+
+#[tokio::test]
+async fn adr0572_full_vocabulary_materialize_survives_bind_recomputation() {
+	// The binder recomputes the canonical encoding from ITS bound source and
+	// requires byte equality with the verb's authoring-time encoding. The
+	// vocabulary-rich tree is the discriminating case: any drift between the
+	// authoring bind and the statement bind would reject this execution.
+	let (catalog, _storage, coordinator, _planner) = coordinator();
+	let plan = materialize_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.range(9)
+               .project_named([floor(seeded_random(lit_i64(11), col("ordinal")).mul(lit_f64(4.0))).named("bucket")])
+               .materialize("kept")
+        }
+    "#,
+	)
+	.await;
+	let LogicalPlan::CreateTableAsSelect {
+		materialization_certificate: Some(expected),
+		..
+	} = &plan
+	else {
+		panic!("materialize must author a certificate-carrying CTAS");
+	};
+	coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect("the recomputed encoding matches the authored certificate");
+	assert_eq!(
+		catalog
+			.materialization_certificate(&TableRef::new("kept"))
+			.as_ref(),
+		Some(expected)
+	);
+}
+
+#[tokio::test]
+async fn adr0572_malformed_certificate_bytes_reject_at_bind() {
+	let (catalog, _storage, coordinator, _planner) = coordinator();
+	let plan = LogicalPlan::CreateTableAsSelect {
+		table: TableRef::new("kept"),
+		intent_request: "materialize kept".to_string(),
+		if_not_exists: false,
+		or_replace: false,
+		source: Box::new(LogicalPlan::Range { count: 2 }),
+		materialization_certificate: Some(vec![0xAB; 16]),
+	};
+	let error = coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect_err("under-cap raw bytes never become the attachment");
+	assert!(
+		error
+			.to_string()
+			.contains("does not describe the bound CTAS source"),
+		"got {error}"
+	);
+	assert!(
+		catalog.resolve_table(&TableRef::new("kept")).await.is_err(),
+		"the refusal precedes provisioning: no visible table"
+	);
+}
+
+#[tokio::test]
+async fn adr0572_source_mismatched_certificate_rejects_at_bind() {
+	// A perfectly valid certificate — for a DIFFERENT relation. range(3)
+	// bytes attached to a range(2) source must reject on recomputation.
+	let (catalog, _storage, coordinator, _planner) = coordinator();
+	let foreign = boson::CanonicalRelationExpression {
+		format_version: boson::V1_FORMAT_VERSION,
+		relation: boson::GeneratedRange {
+			count: 3,
+			projection: None,
+		},
+	}
+	.encode_v1()
+	.expect("encode");
+	let plan = LogicalPlan::CreateTableAsSelect {
+		table: TableRef::new("kept"),
+		intent_request: "materialize kept".to_string(),
+		if_not_exists: false,
+		or_replace: false,
+		source: Box::new(LogicalPlan::Range { count: 2 }),
+		materialization_certificate: Some(foreign),
+	};
+	let error = coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect_err("a certificate proving a different relation rejects");
+	assert!(
+		error
+			.to_string()
+			.contains("does not describe the bound CTAS source"),
+		"got {error}"
+	);
+	assert!(catalog.resolve_table(&TableRef::new("kept")).await.is_err());
+}
+
+#[tokio::test]
+async fn adr0572_oversized_certificate_refuses_at_provision() {
+	// The payload here is HONEST — a valid canonical encoding matching its
+	// source byte for byte — so it passes the bind-time recomputation and
+	// exercises the Provision size bound itself.
+	let (catalog, _storage, coordinator, _planner) = coordinator();
+	let width = 8_000;
+	let projection = (0..width)
+		.map(|index| boson::Projection {
+			output_name: format!("c{index:04}"),
+			expression: boson::ScalarExpression {
+				data_type: boson::NumericType::Int64,
+				kind: boson::ScalarKind::Ordinal,
+			},
+		})
+		.collect::<Vec<_>>();
+	let certificate = boson::CanonicalRelationExpression {
+		format_version: boson::V1_FORMAT_VERSION,
+		relation: boson::GeneratedRange {
+			count: 2,
+			projection: Some(projection),
+		},
+	}
+	.encode_v1()
+	.expect("encode the wide certificate");
+	assert!(
+		certificate.len() > wendelon_client::MATERIALIZATION_CERTIFICATE_MAX_BYTES,
+		"the control must actually exceed the bound: {} bytes",
+		certificate.len()
+	);
+	let plan = LogicalPlan::CreateTableAsSelect {
+		table: TableRef::new("kept"),
+		intent_request: "materialize kept".to_string(),
+		if_not_exists: false,
+		or_replace: false,
+		source: Box::new(LogicalPlan::Project {
+			input: Box::new(LogicalPlan::Range { count: 2 }),
+			exprs: vec![toron::ir::Expr::column("ordinal"); width],
+			output_names: (0..width)
+				.map(|index| Some(format!("c{index:04}")))
+				.collect(),
+		}),
+		materialization_certificate: Some(certificate),
+	};
+	let error = coordinator
+		.execute_query(&plan, None)
+		.await
+		.expect_err("an oversized certificate refuses whole at Provision");
+	assert!(
+		error.to_string().contains("certificate_too_large"),
+		"got {error}"
+	);
+	assert!(
+		catalog.resolve_table(&TableRef::new("kept")).await.is_err(),
+		"the refusal leaves no visible table"
+	);
 }

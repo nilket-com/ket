@@ -3226,6 +3226,7 @@ impl SqlPlanner {
 			intent_request: create_table.to_string(),
 			if_not_exists: *if_not_exists,
 			or_replace: *or_replace,
+			materialization_certificate: None,
 			source: Box::new(source),
 		})
 	}

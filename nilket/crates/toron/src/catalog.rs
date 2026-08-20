@@ -1131,6 +1131,9 @@ pub struct CtasProvisionRequest {
 	pub owner_epoch: u64,
 	pub observed_now_ms: u64,
 	pub owner_lease_expires_at_ms: u64,
+	/// ADR 572: the materialization certificate, set only by the materialize
+	/// verb; plain CTAS provisions None.
+	pub certificate: Option<Vec<u8>>,
 }
 
 #[derive(Clone)]
@@ -1468,6 +1471,7 @@ struct MockCatalogInner {
 	provisional:
 		HashMap<(TenantId, TableId), (TableBinding, wendelon_client::TableSchemaDescriptor)>,
 	ctas_sagas: HashMap<(TenantId, CtasOperationId), CtasSagaEntry>,
+	materialization_certificates: HashMap<(TenantId, wendelon_client::TableObjectId), Vec<u8>>,
 	logical_types: HashMap<TenantId, LogicalTypeRegistry>,
 	next_table_id: u64,
 }
@@ -1490,6 +1494,7 @@ impl Default for MockCatalogInner {
 			descriptors: HashMap::new(),
 			provisional: HashMap::new(),
 			ctas_sagas: HashMap::new(),
+			materialization_certificates: HashMap::new(),
 			logical_types: HashMap::new(),
 			next_table_id: 1,
 		}
@@ -1499,6 +1504,17 @@ impl Default for MockCatalogInner {
 impl MockCatalog {
 	pub fn new() -> Self {
 		Self::default()
+	}
+
+	/// The published attachment for `name`, if any (ADR 572 test observability).
+	pub fn materialization_certificate(&self, name: &TableRef) -> Option<Vec<u8>> {
+		let inner = self.inner.read().expect("MockCatalog lock poisoned");
+		let table_id = inner.by_ref.get(&(self.tenant_id, name.clone()))?;
+		let binding = inner.by_id.get(&(self.tenant_id, *table_id))?;
+		inner
+			.materialization_certificates
+			.get(&(self.tenant_id, binding.table))
+			.cloned()
 	}
 
 	pub fn register_descriptor(
@@ -1758,6 +1774,13 @@ impl Catalog for MockCatalog {
 		request: CtasProvisionRequest,
 	) -> Result<CtasProvisionOutcome, CatalogError> {
 		let mut inner = self.inner.write().expect("MockCatalog lock poisoned");
+		if request.certificate.as_ref().is_some_and(|bytes| {
+			bytes.len() > wendelon_client::MATERIALIZATION_CERTIFICATE_MAX_BYTES
+		}) {
+			return Err(CatalogError::AdminFailed {
+				message: "CTAS provision rejected: certificate_too_large".to_string(),
+			});
+		}
 		if let Some(entry) = inner
 			.ctas_sagas
 			.get(&(self.tenant_id, request.operation_id))
@@ -1836,6 +1859,7 @@ impl Catalog for MockCatalog {
 			owner_lease_expires_at_ms: request.owner_lease_expires_at_ms,
 			retry_debt: 0,
 			terminal_at_ms: None,
+			certificate: request.certificate,
 		};
 		inner.provisional.insert(
 			(self.tenant_id, local_table_id),
@@ -1921,6 +1945,17 @@ impl Catalog for MockCatalog {
 						),
 					});
 				}
+				let certificate_key = (self.tenant_id, entry.descriptor.table_object_id);
+				if entry.certificate.is_some()
+					&& inner
+						.materialization_certificates
+						.contains_key(&certificate_key)
+				{
+					return Err(CatalogError::AdminFailed {
+						message: "CTAS saga transition rejected: foreign_provisional_object"
+							.to_string(),
+					});
+				}
 				let key = inner
 					.provisional
 					.iter()
@@ -1936,6 +1971,11 @@ impl Catalog for MockCatalog {
 					inner
 						.by_ref
 						.insert((self.tenant_id, TableRef::new(name.table)), key.1);
+				}
+				if let Some(certificate) = entry.certificate.clone() {
+					inner
+						.materialization_certificates
+						.insert(certificate_key, certificate);
 				}
 				entry.phase = CtasSagaPhase::Published;
 			}
@@ -2182,6 +2222,9 @@ impl Catalog for MockCatalog {
 			.by_ref
 			.retain(|(tenant_id, _), id| *tenant_id != self.tenant_id || *id != table_id);
 		inner.descriptors.remove(&(self.tenant_id, table_id));
+		inner
+			.materialization_certificates
+			.remove(&(self.tenant_id, binding.table));
 		Ok(Some(binding))
 	}
 }
@@ -3689,6 +3732,7 @@ impl Catalog for WendelonCatalog {
 				owner_epoch: request.owner_epoch,
 				observed_now_ms: request.observed_now_ms,
 				owner_lease_expires_at_ms: request.owner_lease_expires_at_ms,
+				certificate: request.certificate,
 			})
 			.await
 			.map_err(|error| CatalogError::AdminFailed {

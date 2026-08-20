@@ -63,6 +63,7 @@ mod cast;
 mod decision_log;
 mod explain;
 mod expression_walk;
+mod generated;
 mod join;
 mod join_order;
 mod outer_count_preaggregation;
@@ -80,6 +81,8 @@ use self::arithmetic::*;
 use self::decision_log::*;
 use self::explain::*;
 use self::expression_walk::*;
+pub(crate) use self::generated::bind_generated_relation_for_authoring;
+use self::generated::require_certificate_describes_bound_source;
 use self::join::*;
 use self::join_order::*;
 use self::outer_count_preaggregation::*;
@@ -2215,6 +2218,7 @@ impl<'a> Binder<'a> {
 					if_not_exists,
 					or_replace,
 					source,
+					materialization_certificate,
 				} => {
 					let plan = self
 						.bind_create_table_as_select(
@@ -2223,6 +2227,7 @@ impl<'a> Binder<'a> {
 							*if_not_exists,
 							*or_replace,
 							source,
+							materialization_certificate.clone(),
 							trace,
 							render_trace,
 							join_order_source_capture,
@@ -2567,6 +2572,7 @@ impl<'a> Binder<'a> {
 		Ok(resolved)
 	}
 
+	#[allow(clippy::too_many_arguments)]
 	async fn bind_create_table_as_select(
 		&self,
 		table: &TableRef,
@@ -2574,6 +2580,7 @@ impl<'a> Binder<'a> {
 		if_not_exists: bool,
 		or_replace: bool,
 		source: &LogicalPlan,
+		materialization_certificate: Option<Vec<u8>>,
 		trace: &mut OptimizerTrace,
 		render_trace: &mut Option<OptimizerExplainRenderTrace>,
 		join_order_source_capture: JoinOrderSourceCapture,
@@ -2583,6 +2590,9 @@ impl<'a> Binder<'a> {
 			.bind_plan_with_trace(source, trace, render_trace, join_order_source_capture, None)
 			.await?;
 		let source = source.plan;
+		if let Some(certificate) = materialization_certificate.as_deref() {
+			require_certificate_describes_bound_source(&source, certificate)?;
+		}
 		let source_schema = source.schema();
 		let schema = infer_ctas_schema(&source_schema)?;
 		let intent_fingerprint = ctas_intent_fingerprint(
@@ -2600,6 +2610,7 @@ impl<'a> Binder<'a> {
 			if_not_exists,
 			or_replace,
 			source: Box::new(source),
+			materialization_certificate,
 		})
 	}
 
@@ -4829,6 +4840,7 @@ fn optimize_for_required(
 			if_not_exists,
 			or_replace,
 			source,
+			materialization_certificate,
 		} => {
 			let (source, _) = optimize_for_required(*source, None, logical_types)?;
 			Ok((
@@ -4839,6 +4851,7 @@ fn optimize_for_required(
 					if_not_exists,
 					or_replace,
 					source: Box::new(source),
+					materialization_certificate,
 				},
 				OrdinalRemap::new(),
 			))

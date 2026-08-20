@@ -22,6 +22,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 const RUNE_MAX_IN_LIST_ITEMS: usize = 32;
+const MATERIALIZE_VOCABULARY_DIRECTIVE: &str = "materialize admits only a generated range with \
+	an optional projection over the closed KET-0006 scalar vocabulary (ordinal, numeric \
+	literals, cast, add, sub, mul, div, floor, seeded_random)";
 const RUNE_INFORMATION_SCHEMA_NAMESPACE: &str = "information_schema";
 const RUNE_OPTIMIZER_DECISIONS_TABLE: &str = "optimizer_decisions";
 const RUNE_OPTIMIZER_RUNTIME_VERDICTS_TABLE: &str = "optimizer_runtime_verdicts";
@@ -305,6 +308,54 @@ impl RuneDataFrame {
 			Ok(plan) => VmResult::Ok(Self { plan }),
 			Err(error) => VmResult::panic(error),
 		}
+	}
+
+	/// The terminal materialization statement: the relation becomes a fresh
+	/// named table born with its KET-0006 certificate. Translation here is the
+	/// admission gate — an inexpressible plan refuses before anything plans,
+	/// and the certificate bytes are boson's `encode_v1` output alone.
+	pub fn materialize(self, name: String) -> VmResult<Self> {
+		if name.trim().is_empty() {
+			return VmResult::panic("materialize requires a non-empty table name".to_string());
+		}
+		let bound = match crate::binder::bind_generated_relation_for_authoring(&self.plan) {
+			Ok(bound) => bound,
+			Err(error) => {
+				return VmResult::panic(format!("{MATERIALIZE_VOCABULARY_DIRECTIVE}: {error}"));
+			}
+		};
+		let canonical = match crate::canonical_expression::try_canonical_generated_relation(&bound)
+		{
+			Ok(canonical) => canonical,
+			Err(error) => {
+				return VmResult::panic(format!("{MATERIALIZE_VOCABULARY_DIRECTIVE}: {error}"));
+			}
+		};
+		let certificate = match canonical.encode_v1() {
+			Ok(bytes) => bytes,
+			Err(error) => {
+				return VmResult::panic(format!("{MATERIALIZE_VOCABULARY_DIRECTIVE}: {error}"));
+			}
+		};
+		let mut intent_request =
+			String::with_capacity("materialize  as ".len() + name.len() + certificate.len() * 2);
+		intent_request.push_str("materialize ");
+		intent_request.push_str(&name);
+		intent_request.push_str(" as ");
+		for byte in &certificate {
+			use std::fmt::Write;
+			write!(intent_request, "{byte:02x}").expect("write to String is infallible");
+		}
+		VmResult::Ok(Self {
+			plan: LogicalPlan::CreateTableAsSelect {
+				table: TableRef::new(name),
+				intent_request,
+				if_not_exists: false,
+				or_replace: false,
+				source: Box::new(self.plan),
+				materialization_certificate: Some(certificate),
+			},
+		})
 	}
 
 	pub fn explain(self) -> Self {
@@ -2249,6 +2300,7 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("auto_join", RuneDataFrame::auto_join)?;
 	m.associated_function("broadcast_join", RuneDataFrame::broadcast_join)?;
 	m.associated_function("broadcast_build", RuneDataFrame::broadcast_build)?;
+	m.associated_function("materialize", RuneDataFrame::materialize)?;
 	m.associated_function("explain", RuneDataFrame::explain)?;
 	m.associated_function("analyze", RuneDataFrame::analyze)?;
 	m.associated_function("left_join", RuneDataFrame::left_join)?;

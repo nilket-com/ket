@@ -775,6 +775,7 @@ fn ctas_project_customer_id_as_cid(if_not_exists: bool) -> LogicalPlan {
 			vec![Expr::column("customer_id")],
 			vec![Some("cid")],
 		)),
+		materialization_certificate: None,
 	}
 }
 
@@ -792,6 +793,7 @@ async fn bound_ctas_schema(source: LogicalPlan) -> SchemaRef {
 		if_not_exists: false,
 		or_replace: false,
 		source: Box::new(source),
+		materialization_certificate: None,
 	};
 	let bound = bind(&plan, &sales_catalog(), &PlannerConfig::default())
 		.await

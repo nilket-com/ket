@@ -199,6 +199,56 @@ fn lower_literal(value: &ScalarValue) -> Result<ScalarKind, CanonicalLowerError>
 	}
 }
 
+/// Literal seeds cited from an encoded expression (PRODUCT-0137 §3). The list
+/// is a witness, not an inventory: `complete` is false whenever any seed
+/// position holds a computed expression.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub(crate) struct SeedWitnesses {
+	pub literal_seeds: Vec<i64>,
+	pub complete: bool,
+}
+
+pub(crate) fn seed_witnesses(expression: &CanonicalRelationExpression) -> SeedWitnesses {
+	let mut witnesses = SeedWitnesses {
+		literal_seeds: Vec::new(),
+		complete: true,
+	};
+	if let Some(projection) = &expression.relation.projection {
+		for entry in projection {
+			collect_seed_witnesses(&entry.expression, &mut witnesses);
+		}
+	}
+	witnesses
+}
+
+fn collect_seed_witnesses(expression: &ScalarExpression, witnesses: &mut SeedWitnesses) {
+	match &expression.kind {
+		ScalarKind::Ordinal
+		| ScalarKind::Int32Literal(_)
+		| ScalarKind::Int64Literal(_)
+		| ScalarKind::Float64Literal(_) => {}
+		ScalarKind::Cast(child) | ScalarKind::Floor(child) => {
+			collect_seed_witnesses(child, witnesses);
+		}
+		ScalarKind::Add(left, right)
+		| ScalarKind::Sub(left, right)
+		| ScalarKind::Mul(left, right)
+		| ScalarKind::Div(left, right) => {
+			collect_seed_witnesses(left, witnesses);
+			collect_seed_witnesses(right, witnesses);
+		}
+		ScalarKind::SeededUnitInterval(seed, key) => {
+			if let ScalarKind::Int64Literal(value) = &seed.kind {
+				witnesses.literal_seeds.push(*value);
+			} else {
+				witnesses.complete = false;
+			}
+			collect_seed_witnesses(seed, witnesses);
+			collect_seed_witnesses(key, witnesses);
+		}
+	}
+}
+
 fn numeric_type(data_type: &DataType) -> Result<NumericType, CanonicalLowerError> {
 	match data_type {
 		DataType::Int32 => Ok(NumericType::Int32),
@@ -302,6 +352,49 @@ mod tests {
 					}),
 				),
 			}))
+		);
+	}
+
+	#[test]
+	fn seed_witnesses_cite_literals_and_a_computed_seed_marks_the_list_incomplete() {
+		let ordinal = || ScalarExpression {
+			data_type: NumericType::Int64,
+			kind: ScalarKind::Ordinal,
+		};
+		let literal_seeded = ScalarExpression {
+			data_type: NumericType::Float64,
+			kind: ScalarKind::SeededUnitInterval(
+				Box::new(ScalarExpression {
+					data_type: NumericType::Int64,
+					kind: ScalarKind::Int64Literal(11),
+				}),
+				Box::new(ordinal()),
+			),
+		};
+		let computed_seeded = ScalarExpression {
+			data_type: NumericType::Float64,
+			kind: ScalarKind::SeededUnitInterval(Box::new(ordinal()), Box::new(ordinal())),
+		};
+		let relation = |expression: ScalarExpression| CanonicalRelationExpression {
+			format_version: V1_FORMAT_VERSION,
+			relation: GeneratedRange {
+				count: 2,
+				projection: Some(vec![Projection {
+					output_name: "value".to_owned(),
+					expression,
+				}]),
+			},
+		};
+
+		let literal = seed_witnesses(&relation(literal_seeded));
+		assert_eq!(literal.literal_seeds, vec![11]);
+		assert!(literal.complete);
+
+		let computed = seed_witnesses(&relation(computed_seeded));
+		assert_eq!(computed.literal_seeds, Vec::<i64>::new());
+		assert!(
+			!computed.complete,
+			"a computed seed is not witnessed, and the list says so"
 		);
 	}
 

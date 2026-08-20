@@ -323,11 +323,13 @@ impl<'a> Binder<'a> {
 					if_not_exists,
 					or_replace,
 					source,
+					materialization_certificate,
 				} => Ok(LogicalPlan::CreateTableAsSelect {
 					table: table.clone(),
 					intent_request: intent_request.clone(),
 					if_not_exists: *if_not_exists,
 					or_replace: *or_replace,
+					materialization_certificate: materialization_certificate.clone(),
 					source: Box::new(
 						self.demote_null_rejected_outer_joins_inner(source, receipts)
 							.await?,
@@ -614,11 +616,13 @@ impl<'a> Binder<'a> {
 					if_not_exists,
 					or_replace,
 					source,
+					materialization_certificate,
 				} => Ok(LogicalPlan::CreateTableAsSelect {
 					table: table.clone(),
 					intent_request: intent_request.clone(),
 					if_not_exists: *if_not_exists,
 					or_replace: *or_replace,
+					materialization_certificate: materialization_certificate.clone(),
 					source: Box::new(self.recognize_cross_equi_joins(source).await?),
 				}),
 				LogicalPlan::InsertSelect {

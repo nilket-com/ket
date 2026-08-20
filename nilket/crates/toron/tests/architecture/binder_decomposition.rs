@@ -1,6 +1,6 @@
 use super::support::*;
 
-const BINDER_MODULES: [&str; 17] = [
+const BINDER_MODULES: [&str; 18] = [
 	"aggregate",
 	"aggregate_exchange",
 	"arithmetic",
@@ -8,6 +8,7 @@ const BINDER_MODULES: [&str; 17] = [
 	"decision_log",
 	"explain",
 	"expression_walk",
+	"generated",
 	"join",
 	"join_order",
 	"outer_count_preaggregation",
@@ -32,6 +33,7 @@ pub(crate) fn adr176_binder_source_concatenates_submodules() {
 		"src/binder/decision_log.rs",
 		"src/binder/explain.rs",
 		"src/binder/expression_walk.rs",
+		"src/binder/generated.rs",
 		"src/binder/join.rs",
 		"src/binder/join_order.rs",
 		"src/binder/outer_count_preaggregation.rs",
@@ -222,9 +224,12 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// per-statement scalar is fixed before a plan is fragmented.
 	// ADR 569 adds the virtual Range leaf: its bind arm and exact-facts
 	// constructor. Bumped by its cost.
+	// ADR 572 threads the materialization certificate through the CTAS bind
+	// arm and requires the recomputed canonical encoding to match it byte for
+	// byte; the authoring bind and the recomputation live in binder/generated.rs.
 	assert!(
-		lines <= 6_455,
-		"binder root has {lines} lines; expected <= 6,455 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_465,
+		"binder root has {lines} lines; expected <= 6,465 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 
@@ -438,6 +443,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// Plan filenames are zero-padded to four digits; this README documents a
 				// command whose argument is one of the renamed implementation docs.
 				"crates/toron/scripts/bench/README.md",
+				// KET-0006 / ADR 572: the canonical-expression lowerer and its
+				// seed witnesses are the producer-side certificate boundary; it
+				// owns no binder decomposition surface.
+				"crates/toron/src/canonical_expression.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

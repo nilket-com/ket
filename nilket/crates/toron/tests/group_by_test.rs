@@ -10460,6 +10460,128 @@ async fn adr569_sql_and_rune_share_the_seeded_identifier() {
 }
 
 #[tokio::test]
+async fn adr0572_materialize_authors_a_certified_ctas_plan() {
+	let plan = rune_plan(r#"pub fn main(ctx) { ctx.range(4).materialize("kept") }"#).await;
+	let LogicalPlan::CreateTableAsSelect {
+		table,
+		intent_request,
+		if_not_exists,
+		or_replace,
+		source,
+		materialization_certificate: Some(certificate),
+	} = plan
+	else {
+		panic!("materialize must author a certificate-carrying CTAS");
+	};
+	assert_eq!(table, toron::catalog::TableRef::new("kept"));
+	assert!(!if_not_exists, "if_not_exists is unreachable from the verb");
+	assert!(!or_replace);
+	assert!(matches!(*source, LogicalPlan::Range { count: 4 }));
+	assert!(intent_request.starts_with("materialize kept as "));
+	let decoded =
+		boson::CanonicalRelationExpression::decode_v1(&certificate).expect("decode attachment");
+	assert_eq!(decoded.relation.count, 4);
+	assert_eq!(
+		decoded.relation.projection, None,
+		"a bare range certifies with an absent projection"
+	);
+}
+
+#[tokio::test]
+async fn adr0572_materialize_certificate_round_trips_the_full_vocabulary() {
+	let plan = rune_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.range(9)
+               .project_named([floor(seeded_random(lit_i64(11), col("ordinal")).mul(lit_f64(4.0))).named("bucket")])
+               .materialize("kept")
+        }
+    "#,
+	)
+	.await;
+	let LogicalPlan::CreateTableAsSelect {
+		materialization_certificate: Some(certificate),
+		..
+	} = plan
+	else {
+		panic!("materialize must author a certificate-carrying CTAS");
+	};
+	let decoded =
+		boson::CanonicalRelationExpression::decode_v1(&certificate).expect("decode attachment");
+	assert_eq!(decoded.relation.count, 9);
+	let projection = decoded.relation.projection.expect("present projection");
+	assert_eq!(projection.len(), 1);
+	assert_eq!(projection[0].output_name, "bucket");
+	let boson::ScalarKind::Floor(product) = &projection[0].expression.kind else {
+		panic!("floor root: {:?}", projection[0].expression.kind);
+	};
+	let boson::ScalarKind::Mul(seeded, _four) = &product.kind else {
+		panic!("mul under floor: {:?}", product.kind);
+	};
+	let boson::ScalarKind::SeededUnitInterval(seed, key) = &seeded.kind else {
+		panic!("seeded_random under mul: {:?}", seeded.kind);
+	};
+	assert_eq!(
+		seed.kind,
+		boson::ScalarKind::Int64Literal(11),
+		"the seed-position literal is the witness"
+	);
+	assert_eq!(key.kind, boson::ScalarKind::Ordinal);
+	assert_eq!(
+		boson::CanonicalRelationExpression::decode_v1(&certificate)
+			.expect("decode")
+			.encode_v1()
+			.expect("re-encode"),
+		certificate,
+		"the attachment's bytes are the canonical encoding, byte-stable"
+	);
+}
+
+#[tokio::test]
+async fn adr0572_materialize_refuses_outside_the_vocabulary_before_planning() {
+	let config = RuneSandboxConfig::v1_default();
+	let engine = RuneEngine::with_config(config.clone()).expect("Rune engine");
+	for (script, reason) in [
+		(
+			r#"pub fn main(ctx) { ctx.table("sales").materialize("kept") }"#,
+			"a scan is not a generated relation",
+		),
+		(
+			r#"pub fn main(ctx) { ctx.range(4).filter(col("ordinal").gt(lit(1))).materialize("kept") }"#,
+			"a filter is outside the closed shape",
+		),
+		(
+			r#"pub fn main(ctx) { ctx.range(4).project([lit_str("x")]).materialize("kept") }"#,
+			"a non-numeric scalar is outside the vocabulary",
+		),
+	] {
+		let error = engine
+			.execute_script(script, &config)
+			.await
+			.expect_err(reason);
+		assert!(
+			error
+				.to_string()
+				.contains("materialize admits only a generated range"),
+			"{reason}: {error}"
+		);
+	}
+	let empty_name = engine
+		.execute_script(
+			r#"pub fn main(ctx) { ctx.range(4).materialize("   ") }"#,
+			&config,
+		)
+		.await
+		.expect_err("an all-whitespace name refuses");
+	assert!(
+		empty_name
+			.to_string()
+			.contains("materialize requires a non-empty table name"),
+		"got {empty_name}"
+	);
+}
+
+#[tokio::test]
 async fn adr570_similar_to_is_anchored_and_null_propagating() {
 	// region = [east, west, east, east, west, NULL].
 	let rows = run_logical(&plan_sql(

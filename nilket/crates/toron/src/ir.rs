@@ -1441,6 +1441,11 @@ pub enum LogicalPlan {
 		if_not_exists: bool,
 		or_replace: bool,
 		source: Box<LogicalPlan>,
+		/// ADR 572: boson-encoded birth certificate; Some only from the
+		/// materialize verb, which also forces if_not_exists false and a
+		/// fresh-only binding. Plain CTAS never sets it.
+		#[serde(default)]
+		materialization_certificate: Option<Vec<u8>>,
 	},
 	DropTable {
 		name: TableRef,

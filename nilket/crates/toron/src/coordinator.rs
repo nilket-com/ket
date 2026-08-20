@@ -2532,7 +2532,21 @@ async fn finish_ctas_after_rows_committed(
 			})
 			.await
 		{
-			Ok(published) => entry = published,
+			Ok(published) => {
+				if let Some(certificate) = published.certificate.as_deref()
+					&& let Ok(decoded) = boson::CanonicalRelationExpression::decode_v1(certificate)
+				{
+					let witnesses = crate::canonical_expression::seed_witnesses(&decoded);
+					tracing::info!(
+						table = %published.descriptor.table_name,
+						certificate_bytes = certificate.len(),
+						seed_witnesses = ?witnesses.literal_seeds,
+						seed_witnesses_complete = witnesses.complete,
+						"materialization certificate published with its table"
+					);
+				}
+				entry = published;
+			}
 			Err(publish_error) => {
 				let resolved = catalog.resolve_ctas_saga(operation_id).await?;
 				if let Some(resolved) = resolved
@@ -2930,7 +2944,17 @@ async fn execute_write_plan_with_source(
 			if_not_exists,
 			or_replace,
 			source,
+			materialization_certificate,
 		} => {
+			// A certificate binds to exactly one freshly created table object. With
+			// both flags false, any pre-existing binding is rejected below, so the
+			// provision always carries CtasExpectedBinding::Absent.
+			if materialization_certificate.is_some() && (*if_not_exists || *or_replace) {
+				return Err(QueryError::Internal {
+					message: "a materialization certificate requires a fresh table binding"
+						.to_string(),
+				});
+			}
 			let composite_id = wendelon_client::CtasOperationId::new(operation_id.client_uuid);
 			if let Some(existing_saga) = catalog.resolve_ctas_saga(composite_id).await? {
 				if existing_saga.intent_fingerprint != *intent_fingerprint {
@@ -3042,6 +3066,7 @@ async fn execute_write_plan_with_source(
 					owner_epoch,
 					observed_now_ms,
 					owner_lease_expires_at_ms: observed_now_ms.saturating_add(CTAS_OWNER_LEASE_MS),
+					certificate: materialization_certificate.clone(),
 				})
 				.await
 			{

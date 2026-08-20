@@ -371,6 +371,10 @@ pub enum ExecutionPlan {
 		if_not_exists: bool,
 		or_replace: bool,
 		source: Box<ExecutionPlan>,
+		/// ADR 572: rides from the logical node through bind to the CTAS
+		/// provision.
+		#[serde(default)]
+		materialization_certificate: Option<Vec<u8>>,
 	},
 	DropTable {
 		name: TableRef,
