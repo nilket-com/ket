@@ -91,7 +91,9 @@ pub use wendelon::schema::{
 	encode_secondary_index_drop_request, encode_signed_optimizer_fact_scalar,
 };
 
-pub use wendelon::schema::{CTAS_SAGA_CAPACITY, CTAS_SAGA_DETAIL_RETENTION_MS};
+pub use wendelon::schema::{
+	CTAS_SAGA_CAPACITY, CTAS_SAGA_DETAIL_RETENTION_MS, MATERIALIZATION_CERTIFICATE_MAX_BYTES,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BootstrapPeer {

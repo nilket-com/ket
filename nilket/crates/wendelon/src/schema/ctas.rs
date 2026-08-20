@@ -117,7 +117,19 @@ pub struct CtasSagaEntry {
 	/// retention. Active phases never carry this field and are never aged out.
 	#[serde(default)]
 	pub terminal_at_ms: Option<u64>,
+	/// ADR 0087: the materialization certificate, carried from `Provision` so
+	/// a recovery re-publish binds table and certificate together. The saga is
+	/// the certificate's carrier; its home is the attachment catalog, written
+	/// inside the `Publish` apply. CTAS's own verb never sets this.
+	#[serde(default)]
+	pub certificate: Option<Vec<u8>>,
 }
+
+/// ADR 0087: the materialization certificate's admission bound. Boson v1
+/// certificates measure tens to a few hundred bytes; 64 KiB is generous
+/// headroom while staying far inside the write discipline. An oversized
+/// certificate refuses at `Provision`, before any row is dispatched.
+pub const MATERIALIZATION_CERTIFICATE_MAX_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CtasSagaMutation {
@@ -132,6 +144,10 @@ pub enum CtasSagaMutation {
 		owner_epoch: u64,
 		observed_now_ms: u64,
 		owner_lease_expires_at_ms: u64,
+		/// ADR 0087: set only by the materialize verb; bounded by
+		/// [`MATERIALIZATION_CERTIFICATE_MAX_BYTES`], refused whole here.
+		#[serde(default)]
+		certificate: Option<Vec<u8>>,
 	},
 	AttestRowsCommitted {
 		tenant_id: TenantId,
@@ -234,6 +250,10 @@ pub enum CtasSagaReject {
 	StaleOwner,
 	OwnerLeaseStillLive,
 	InvalidTransition,
+	/// ADR 0087: the certificate exceeds
+	/// [`MATERIALIZATION_CERTIFICATE_MAX_BYTES`]; the materialization refuses
+	/// whole, before any row is dispatched.
+	CertificateTooLarge,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -258,6 +278,7 @@ impl CtasSagaReject {
 			Self::StaleOwner => "stale_owner",
 			Self::OwnerLeaseStillLive => "owner_lease_still_live",
 			Self::InvalidTransition => "invalid_transition",
+			Self::CertificateTooLarge => "certificate_too_large",
 		}
 	}
 
@@ -274,6 +295,7 @@ impl CtasSagaReject {
 			"stale_owner" => Self::StaleOwner,
 			"owner_lease_still_live" => Self::OwnerLeaseStillLive,
 			"invalid_transition" => Self::InvalidTransition,
+			"certificate_too_large" => Self::CertificateTooLarge,
 			_ => return None,
 		})
 	}

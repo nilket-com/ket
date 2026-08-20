@@ -1562,6 +1562,10 @@ pub struct SmState {
 	/// ADR 548 durable CTAS staged-publication saga ledger.
 	#[serde(default)]
 	pub ctas_sagas: CtasSagaCatalog,
+	/// ADR 0087: one immutable birth certificate per materialized object,
+	/// written inside the Publish apply, removed with the object.
+	#[serde(default)]
+	pub materialization_certificates: crate::schema::MaterializationCertificateCatalog,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -4308,7 +4312,15 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 			owner_epoch,
 			observed_now_ms,
 			owner_lease_expires_at_ms,
+			certificate,
 		} => {
+			// ADR 0087: an oversized certificate refuses the materialization
+			// whole, before any row is dispatched.
+			if certificate.as_ref().is_some_and(|certificate| {
+				certificate.len() > crate::schema::MATERIALIZATION_CERTIFICATE_MAX_BYTES
+			}) {
+				return CtasSagaResponse::Rejected(CtasSagaReject::CertificateTooLarge);
+			}
 			state.ctas_sagas.prune_terminal_detail(observed_now_ms);
 			if let Some(existing) = state.ctas_sagas.get(tenant_id, operation_id) {
 				return if existing.intent_fingerprint == intent_fingerprint {
@@ -4344,6 +4356,7 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 				owner_lease_expires_at_ms,
 				retry_debt: 0,
 				terminal_at_ms: None,
+				certificate,
 			};
 			let prior_matches = match (entry.expected_binding, entry.prior_descriptor.as_ref()) {
 				(CtasExpectedBinding::Absent, None) => true,
@@ -4450,6 +4463,17 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 			{
 				return CtasSagaResponse::Rejected(CtasSagaReject::ForeignProvisionalObject);
 			}
+			// ADR 0087: the attachment slot must be vacant BEFORE the binding
+			// publishes, so no failure ordering can strand a visible table
+			// without its certificate or a certificate without its table.
+			if snapshot.certificate.is_some()
+				&& state
+					.materialization_certificates
+					.get(tenant_id, snapshot.descriptor.table_object_id)
+					.is_some()
+			{
+				return CtasSagaResponse::Rejected(CtasSagaReject::ForeignProvisionalObject);
+			}
 			if state
 				.table_schemas
 				.publish_provisional(
@@ -4470,6 +4494,19 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 					node_id: 0,
 				},
 			);
+			// ADR 0087: the certificate transfers from its saga carrier into
+			// its permanent home inside this same apply — table and
+			// certificate become visible in one state transition or neither
+			// does. Infallible here: vacancy was checked before the binding
+			// published.
+			if let Some(certificate) = snapshot.certificate.clone() {
+				let admitted = state.materialization_certificates.admit(
+					tenant_id,
+					snapshot.descriptor.table_object_id,
+					certificate,
+				);
+				debug_assert!(admitted.is_ok(), "vacancy was checked before publish");
+			}
 			let entry = state
 				.ctas_sagas
 				.get_mut(tenant_id, operation_id)
@@ -4787,6 +4824,11 @@ fn apply_table_drop_finalize(
 	}
 	state
 		.table_lifecycle
+		.remove(operation_id.tenant_id, operation_id.table_object_id);
+	// ADR 0087: destruction coupling — the certificate never survives its
+	// object, removed in this same finalize apply.
+	state
+		.materialization_certificates
 		.remove(operation_id.tenant_id, operation_id.table_object_id);
 	match state.table_drop_fences.finalize(
 		operation_id,
@@ -6843,12 +6885,275 @@ mod schema_state_tests {
 				owner_epoch: 1,
 				observed_now_ms: 1,
 				owner_lease_expires_at_ms: 1_000,
+				certificate: None,
 			},
 		);
 		let CtasSagaResponse::Applied(entry) = response else {
 			panic!("provision CTAS: {response:?}");
 		};
 		entry
+	}
+
+	fn provision_ctas_with_certificate(
+		state: &mut SmState,
+		descriptor: TableSchemaDescriptor,
+		certificate: Option<Vec<u8>>,
+	) -> CtasSagaResponse {
+		apply_ctas_saga_mutation(
+			state,
+			CtasSagaMutation::Provision {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
+				descriptor,
+				expected_binding: CtasExpectedBinding::Absent,
+				prior_descriptor: None,
+				row_write_id: ctas_write_id(0x54),
+				owner_epoch: 1,
+				observed_now_ms: 1,
+				owner_lease_expires_at_ms: 1_000,
+				certificate,
+			},
+		)
+	}
+
+	fn drive_ctas_to_rows_committed(state: &mut SmState, row_count: u64) {
+		let dispatched = apply_ctas_saga_mutation(
+			state,
+			CtasSagaMutation::MarkRowDispatched {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count,
+			},
+		);
+		assert!(matches!(dispatched, CtasSagaResponse::Applied(_)));
+		let committed = apply_ctas_saga_mutation(
+			state,
+			CtasSagaMutation::AttestRowsCommitted {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count,
+			},
+		);
+		assert!(matches!(committed, CtasSagaResponse::Applied(_)));
+	}
+
+	#[test]
+	fn adr0087_oversized_certificate_refuses_whole_at_provision() {
+		let mut state = SmState::default();
+		let descriptor = append_only_table_descriptor(1);
+		let object_id = descriptor.table_object_id;
+		let response = provision_ctas_with_certificate(
+			&mut state,
+			descriptor,
+			Some(vec![
+				0;
+				crate::schema::MATERIALIZATION_CERTIFICATE_MAX_BYTES + 1
+			]),
+		);
+		assert_eq!(
+			response,
+			CtasSagaResponse::Rejected(CtasSagaReject::CertificateTooLarge)
+		);
+		assert!(
+			state
+				.ctas_sagas
+				.get(TenantId::new(7), ctas_operation_id(0x54))
+				.is_none(),
+			"an oversized certificate must refuse whole: no saga entry"
+		);
+		assert!(
+			state
+				.table_schemas
+				.get_including_provisional(TenantId::new(7), object_id, 1)
+				.is_none(),
+			"an oversized certificate must refuse whole: no provisional descriptor"
+		);
+	}
+
+	#[test]
+	fn adr0087_certificate_binds_with_the_name_in_one_publish_apply() {
+		let mut state = SmState::default();
+		let descriptor = append_only_table_descriptor(1);
+		let object_id = descriptor.table_object_id;
+		let certificate = vec![0xC5; crate::schema::MATERIALIZATION_CERTIFICATE_MAX_BYTES];
+		let response =
+			provision_ctas_with_certificate(&mut state, descriptor, Some(certificate.clone()));
+		assert!(
+			matches!(response, CtasSagaResponse::Applied(_)),
+			"a certificate at exactly the bound is admitted: {response:?}"
+		);
+		drive_ctas_to_rows_committed(&mut state, 2);
+
+		// The RowsCommitted -> Publish failure window: rows are durable, yet
+		// neither the name nor the attachment is visible.
+		assert!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "append_events")
+				.is_none()
+		);
+		assert!(
+			state
+				.materialization_certificates
+				.get(TenantId::new(7), object_id)
+				.is_none()
+		);
+
+		let published = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Publish {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+			},
+		);
+		assert!(matches!(published, CtasSagaResponse::Applied(_)));
+		assert!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "append_events")
+				.is_some()
+		);
+		assert_eq!(
+			state
+				.materialization_certificates
+				.get(TenantId::new(7), object_id),
+			Some(certificate.as_slice()),
+			"the attachment becomes visible in the same apply as the binding"
+		);
+
+		// The attachment outlives the saga entry's bounded detail retention.
+		state.ctas_sagas.prune_terminal_detail(u64::MAX);
+		assert_eq!(
+			state
+				.materialization_certificates
+				.get(TenantId::new(7), object_id),
+			Some(certificate.as_slice()),
+			"pruning saga detail must never take the certificate with it"
+		);
+	}
+
+	#[test]
+	fn adr0087_occupied_attachment_slot_refuses_publish_before_the_binding() {
+		let mut state = SmState::default();
+		let descriptor = append_only_table_descriptor(1);
+		let object_id = descriptor.table_object_id;
+		state
+			.materialization_certificates
+			.admit(TenantId::new(7), object_id, vec![0xEE; 4])
+			.expect("foreign occupancy for the control");
+		let response = provision_ctas_with_certificate(&mut state, descriptor, Some(vec![0xC5; 8]));
+		assert!(matches!(response, CtasSagaResponse::Applied(_)));
+		drive_ctas_to_rows_committed(&mut state, 2);
+		assert_eq!(
+			apply_ctas_saga_mutation(
+				&mut state,
+				CtasSagaMutation::Publish {
+					tenant_id: TenantId::new(7),
+					operation_id: ctas_operation_id(0x54),
+					owner_epoch: 1,
+				},
+			),
+			CtasSagaResponse::Rejected(CtasSagaReject::ForeignProvisionalObject)
+		);
+		assert!(
+			state
+				.table_schemas
+				.latest_by_name(TenantId::new(7), "analytics", "append_events")
+				.is_none(),
+			"a refused attachment must leave the binding unpublished: one transition or neither"
+		);
+		assert_eq!(
+			state
+				.materialization_certificates
+				.get(TenantId::new(7), object_id),
+			Some([0xEE; 4].as_slice()),
+			"the occupant is immutable"
+		);
+	}
+
+	#[test]
+	fn adr0087_drop_finalize_destroys_the_attachment_with_its_object() {
+		let mut state = SmState::default();
+		let descriptor = append_only_table_descriptor(1);
+		let object_id = descriptor.table_object_id;
+		let generation = descriptor.schema_generation;
+		let response = provision_ctas_with_certificate(&mut state, descriptor, Some(vec![0xC5; 8]));
+		assert!(matches!(response, CtasSagaResponse::Applied(_)));
+		drive_ctas_to_rows_committed(&mut state, 2);
+		let published = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Publish {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+			},
+		);
+		assert!(matches!(published, CtasSagaResponse::Applied(_)));
+
+		let drop_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: object_id,
+			schema_generation: SchemaGeneration::new(generation),
+		};
+		assert_eq!(
+			apply_table_drop_prepare(
+				&mut state,
+				TableDropPrepareRequest::current(drop_id, drop_id.schema_generation),
+				10,
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			apply_table_reclaim_completion(
+				&mut state,
+				TableReclaimCompletionRequest::current(drop_id, 10),
+				11,
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			apply_table_drop_finalize(
+				&mut state,
+				TableDropFinalizeRequest::current(drop_id, 10, 11),
+			),
+			WendelonResponse::Success
+		);
+		assert!(
+			state
+				.materialization_certificates
+				.get(TenantId::new(7), object_id)
+				.is_none(),
+			"the certificate never survives its object"
+		);
+	}
+
+	#[test]
+	fn adr0087_plain_ctas_publishes_without_an_attachment() {
+		let mut state = SmState::default();
+		let descriptor = append_only_table_descriptor(1);
+		let object_id = descriptor.table_object_id;
+		provision_ctas(&mut state, descriptor, CtasExpectedBinding::Absent);
+		drive_ctas_to_rows_committed(&mut state, 2);
+		let published = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Publish {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+			},
+		);
+		assert!(matches!(published, CtasSagaResponse::Applied(_)));
+		assert!(
+			state
+				.materialization_certificates
+				.get(TenantId::new(7), object_id)
+				.is_none()
+		);
+		assert!(state.materialization_certificates.is_empty());
 	}
 
 	#[test]
@@ -6903,6 +7208,7 @@ mod schema_state_tests {
 				owner_epoch: 1,
 				observed_now_ms: 2,
 				owner_lease_expires_at_ms: 1_001,
+				certificate: None,
 			},
 		);
 		assert_eq!(
@@ -7180,6 +7486,7 @@ mod schema_state_tests {
 					owner_epoch: 1,
 					observed_now_ms: after_retention,
 					owner_lease_expires_at_ms: after_retention.saturating_add(1_000),
+					certificate: None,
 				},
 			),
 			CtasSagaResponse::Rejected(CtasSagaReject::Expired)
@@ -7282,6 +7589,7 @@ mod schema_state_tests {
 				owner_epoch: 1,
 				observed_now_ms: 1,
 				owner_lease_expires_at_ms: 1_000,
+				certificate: None,
 			},
 		);
 		assert_eq!(
