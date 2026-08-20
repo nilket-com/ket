@@ -6503,6 +6503,17 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 				 predates format versioning — it was very likely written by a build with \
 				 a different state-machine shape"
 			)
+		} else if header.format_version < SNAPSHOT_FORMAT_VERSION {
+			// An older-but-versioned artifact. Unreachable until a second bump
+			// existed, which is exactly why it must say the same thing the
+			// pre-versioning branch does: the operator's problem is identical,
+			// and only the certainty about the writer differs.
+			format!(
+				"{err}; the body's digest matched, so this artifact is intact, and it was \
+				 written at snapshot format version {} while this build writes {}; this \
+				 build performs no migrations, so the older state cannot be read",
+				header.format_version, SNAPSHOT_FORMAT_VERSION
+			)
 		} else {
 			err
 		}
@@ -11870,6 +11881,41 @@ mod tenant_kek_tests {
 			.expect("version zero is recognized, not refused");
 		assert_eq!(header.format_version, PRE_VERSIONING_FORMAT);
 		assert_eq!(decoded.last_applied_log_id, state.last_applied_log_id);
+	}
+
+	#[test]
+	fn adr0085_older_versioned_snapshot_shape_mismatch_explains_itself_too() {
+		// The pair to the pre-versioning case below. Until a second format
+		// version existed there was no such thing as an older-but-versioned
+		// artifact, so this branch had never run: an intact version-1 snapshot
+		// reported a bare "Hit the end of buffer" with none of ADR 85's
+		// reassurance. A truncated body with a matching digest is exactly the
+		// shape a shorter state machine wrote.
+		assert!(
+			SNAPSHOT_FORMAT_VERSION > 1,
+			"this control needs a version below the current one to exist"
+		);
+		let mut bytes = snapshot_bytes_with_format_version(&SmState::default(), 1);
+		let header_len = std::mem::size_of::<SnapshotHeader>();
+		bytes.truncate(bytes.len() - 1);
+		let mut header = *bytemuck::from_bytes::<SnapshotHeader>(&bytes[..header_len]);
+		header.state_sha256 = control_artifact_digest_32(&bytes[header_len..]);
+		bytes[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
+
+		let error = decode_snapshot_reader(bytes.as_slice())
+			.expect_err("a truncated-shape body must not decode");
+		assert!(
+			error.contains("intact"),
+			"the operator is told the bytes are sound: {error}"
+		);
+		assert!(
+			error.contains("format version 1") && error.contains("no migrations"),
+			"the refusal names the writing version and says why it cannot be read: {error}"
+		);
+		assert!(
+			!error.contains("predates format versioning"),
+			"a versioned artifact must not be described as pre-versioning: {error}"
+		);
 	}
 
 	#[test]
