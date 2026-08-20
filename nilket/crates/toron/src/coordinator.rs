@@ -597,6 +597,44 @@ where
 		))
 	}
 
+	/// ADR 574: execute a certificate-carrying CTAS and return its receipt.
+	///
+	/// The receipt is optional inside the CTAS path, because plain SQL CTAS
+	/// legitimately has none. It stops being optional here: a materialization
+	/// that published and produced no receipt is a broken invariant, not a
+	/// success the caller should have to interpret.
+	pub async fn execute_materialization_with_context(
+		&self,
+		plan: &LogicalPlan,
+		context: ExecutionContext,
+	) -> Result<MaterializationReceipt, QueryError>
+	where
+		Registry: 'static,
+		Transport: 'static,
+	{
+		if !matches!(
+			plan,
+			LogicalPlan::CreateTableAsSelect {
+				materialization_certificate: Some(_),
+				..
+			}
+		) {
+			return Err(QueryError::Internal {
+				message: "execute_materialization_with_context requires a certificate-carrying \
+				          CTAS"
+					.to_string(),
+			});
+		}
+		let admitted = self.admit_query(&context).await?;
+		let query_budget = admitted.query_budget;
+		let mut receipt = None;
+		self.execute_query_with_admission(plan, context, query_budget, None, &mut receipt)
+			.await?;
+		receipt.ok_or_else(|| QueryError::Internal {
+			message: "materialization published without producing a receipt".to_string(),
+		})
+	}
+
 	pub async fn execute_query_with_context(
 		&self,
 		plan: &LogicalPlan,
@@ -640,6 +678,7 @@ where
 				context,
 				query_budget,
 				Some(active_query_handle.clone()),
+				&mut None,
 			)
 			.await;
 		let cause = if active_query_handle.lease_failure_worker().is_some() {
@@ -750,6 +789,7 @@ where
 				query_budget,
 				Some(active_query_handle.clone()),
 				planner_config,
+				&mut None,
 			)
 			.await;
 		let cause = if active_query_handle.lease_failure_worker().is_some() {
@@ -955,6 +995,7 @@ where
 		context: ExecutionContext,
 		query_budget: QueryBudget,
 		active_query: Option<ActiveQueryHandle>,
+		receipt: &mut Option<MaterializationReceipt>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let planner_config = distributed_planner_config(self.config.clone());
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
@@ -1009,6 +1050,7 @@ where
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
 				&bound,
+				receipt,
 			)
 			.await;
 			if let Err(error) = &result {
@@ -1045,6 +1087,7 @@ where
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
 				&bound,
+				receipt,
 			)
 			.await;
 			if let Err(error) = &result {
@@ -1139,6 +1182,7 @@ where
 		query_budget: QueryBudget,
 		active_query: Option<ActiveQueryHandle>,
 		planner_config: PlannerConfig,
+		receipt: &mut Option<MaterializationReceipt>,
 	) -> Result<Vec<RecordBatch>, QueryError> {
 		let planner_config = distributed_planner_config(planner_config);
 		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
@@ -1193,6 +1237,7 @@ where
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
 				&bound,
+				receipt,
 			)
 			.await;
 			if let Err(error) = &result {
@@ -1229,6 +1274,7 @@ where
 				mutation_operation_id(*context.query_id.get().as_bytes(), 0),
 				&source_executor,
 				&bound,
+				receipt,
 			)
 			.await;
 			if let Err(error) = &result {
@@ -2504,6 +2550,50 @@ async fn ctas_publication_conflict_is_proven(
 	}
 }
 
+/// ADR 574: the facts a successful `materialize` reports, taken from the
+/// publish result. They cannot be re-read later: `prune_terminal_detail`
+/// removes a terminal saga entry whole, taking the certificate bytes, the row
+/// count, and the descriptor with it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializationReceipt {
+	pub namespace: String,
+	pub table_name: String,
+	pub certificate_format_version: u16,
+	pub rows_written: u64,
+}
+
+/// ADR 574: build the receipt from a published saga entry. Called on both the
+/// fresh publish and the resumed resolution, so a crash between `RowsCommitted`
+/// and the reply does not change what the caller is told.
+fn derive_materialization_receipt(
+	entry: &wendelon_client::CtasSagaEntry,
+	receipt: &mut Option<MaterializationReceipt>,
+) -> Result<(), QueryError> {
+	let Some(certificate) = entry.certificate.as_deref() else {
+		return Ok(());
+	};
+	let decoded = boson::CanonicalRelationExpression::decode_v1(certificate).map_err(|error| {
+		QueryError::Internal {
+			message: format!("published materialization certificate does not decode: {error}"),
+		}
+	})?;
+	let witnesses = crate::canonical_expression::seed_witnesses(&decoded);
+	tracing::info!(
+		table = %entry.descriptor.table_name,
+		certificate_bytes = certificate.len(),
+		seed_witnesses = ?witnesses.literal_seeds,
+		seed_witnesses_complete = witnesses.complete,
+		"materialization certificate published with its table"
+	);
+	*receipt = Some(MaterializationReceipt {
+		namespace: entry.descriptor.namespace.clone(),
+		table_name: entry.descriptor.table_name.clone(),
+		certificate_format_version: decoded.format_version,
+		rows_written: entry.row_count.unwrap_or_default(),
+	});
+	Ok(())
+}
+
 async fn finish_ctas_after_rows_committed(
 	catalog: &dyn Catalog,
 	writer: &dyn StorageWrite,
@@ -2512,6 +2602,7 @@ async fn finish_ctas_after_rows_committed(
 	mut entry: wendelon_client::CtasSagaEntry,
 	if_not_exists: bool,
 	result_schema: &arrow::datatypes::SchemaRef,
+	receipt: &mut Option<MaterializationReceipt>,
 ) -> Result<Vec<RecordBatch>, QueryError> {
 	let tenant_id = wendelon::schema::TenantId::new(context.tenant_id.0);
 	let operation_id = entry.operation_id;
@@ -2533,18 +2624,10 @@ async fn finish_ctas_after_rows_committed(
 			.await
 		{
 			Ok(published) => {
-				if let Some(certificate) = published.certificate.as_deref()
-					&& let Ok(decoded) = boson::CanonicalRelationExpression::decode_v1(certificate)
-				{
-					let witnesses = crate::canonical_expression::seed_witnesses(&decoded);
-					tracing::info!(
-						table = %published.descriptor.table_name,
-						certificate_bytes = certificate.len(),
-						seed_witnesses = ?witnesses.literal_seeds,
-						seed_witnesses_complete = witnesses.complete,
-						"materialization certificate published with its table"
-					);
-				}
+				// ADR 574: the receipt is derived here, from the publish result,
+				// because nothing downstream can reconstruct it — the entry is
+				// removed whole once terminal and past its retention.
+				derive_materialization_receipt(&published, receipt)?;
 				entry = published;
 			}
 			Err(publish_error) => {
@@ -2556,6 +2639,10 @@ async fn finish_ctas_after_rows_committed(
 							| wendelon_client::CtasSagaPhase::RetiringOld
 							| wendelon_client::CtasSagaPhase::Complete
 					) {
+					// The resumed publish must report the same facts the
+					// original would have; the entry still carries them until
+					// its terminal retention elapses.
+					derive_materialization_receipt(&resolved, receipt)?;
 					entry = resolved;
 				} else if ctas_publication_conflict_is_proven(catalog, &entry).await? {
 					let provisional = catalog
@@ -2640,6 +2727,11 @@ async fn finish_ctas_after_rows_committed(
 	}
 
 	if entry.phase == wendelon_client::CtasSagaPhase::Complete {
+		// ADR 574: a completed saga is a successful materialization the caller
+		// may be asking about again. Its entry still carries the published
+		// facts until terminal retention removes it, so the receipt is the
+		// same one the original publish produced.
+		derive_materialization_receipt(&entry, receipt)?;
 		return Ok(Vec::new());
 	}
 	Err(ctas_pending_error(&entry))
@@ -2653,8 +2745,14 @@ async fn resume_ctas_saga(
 	mut entry: wendelon_client::CtasSagaEntry,
 	if_not_exists: bool,
 	result_schema: &arrow::datatypes::SchemaRef,
+	receipt: &mut Option<MaterializationReceipt>,
 ) -> Result<Vec<RecordBatch>, QueryError> {
 	if entry.phase == wendelon_client::CtasSagaPhase::Complete {
+		// ADR 574: a completed saga is a successful materialization being asked
+		// about again. Its entry still carries the published facts until
+		// terminal retention removes it, so the receipt is the one the original
+		// publish produced.
+		derive_materialization_receipt(&entry, receipt)?;
 		return Ok(Vec::new());
 	}
 	if entry.phase == wendelon_client::CtasSagaPhase::Conflict && if_not_exists {
@@ -2738,6 +2836,7 @@ async fn resume_ctas_saga(
 					entry,
 					if_not_exists,
 					result_schema,
+					receipt,
 				)
 				.await
 			} else if resolved.resolution == MutationResolution::Present
@@ -2783,6 +2882,7 @@ async fn resume_ctas_saga(
 				entry,
 				if_not_exists,
 				result_schema,
+				receipt,
 			)
 			.await
 		}
@@ -2801,6 +2901,7 @@ async fn execute_write_plan_with_source(
 	operation_id: wendelon::schema::ClientWriteId,
 	source_executor: &dyn MutationSourceExecutor,
 	bound: &ExecutionPlan,
+	receipt: &mut Option<MaterializationReceipt>,
 ) -> Result<Vec<RecordBatch>, QueryError> {
 	let logical_types = catalog.logical_type_registry();
 	match bound {
@@ -2970,6 +3071,7 @@ async fn execute_write_plan_with_source(
 					existing_saga,
 					*if_not_exists,
 					schema,
+					receipt,
 				)
 				.await;
 			}
@@ -3161,6 +3263,7 @@ async fn execute_write_plan_with_source(
 								entry,
 								*if_not_exists,
 								schema,
+								receipt,
 							)
 							.await;
 						}
@@ -3207,6 +3310,7 @@ async fn execute_write_plan_with_source(
 				entry,
 				*if_not_exists,
 				schema,
+				receipt,
 			)
 			.await
 		}
@@ -3488,6 +3592,56 @@ impl QueryCoordinator {
 		}
 	}
 
+	/// ADR 574: the single-node mirror of the receipt seam. Same rule as the
+	/// distributed entry — the receipt is optional inside the CTAS path and
+	/// non-optional here.
+	pub async fn execute_materialization_with_context(
+		&self,
+		plan: &LogicalPlan,
+		context: ExecutionContext,
+	) -> Result<MaterializationReceipt, QueryError> {
+		if !matches!(
+			plan,
+			LogicalPlan::CreateTableAsSelect {
+				materialization_certificate: Some(_),
+				..
+			}
+		) {
+			return Err(QueryError::Internal {
+				message: "execute_materialization_with_context requires a certificate-carrying \
+				          CTAS"
+					.to_string(),
+			});
+		}
+		let catalog = Arc::clone(&self.catalog).scoped(context.tenant_id);
+		let bound = bind_with_statement_timestamp(
+			plan,
+			catalog.as_ref(),
+			&self.config,
+			context.statement_timestamp_nanos,
+		)
+		.await?;
+		let source_executor = LocalMutationSourceExecutor {
+			executor: &self.executor,
+		};
+		let mut receipt = None;
+		execute_write_plan_with_source(
+			catalog.as_ref(),
+			self.writer.as_ref(),
+			self.deleter.as_ref(),
+			self.admin.as_ref(),
+			&context,
+			mutation_operation_id(*context.query_id.get().as_bytes(), 0),
+			&source_executor,
+			&bound,
+			&mut receipt,
+		)
+		.await?;
+		receipt.ok_or_else(|| QueryError::Internal {
+			message: "materialization published without producing a receipt".to_string(),
+		})
+	}
+
 	pub async fn execute_query(
 		&self,
 		plan: &LogicalPlan,
@@ -3710,6 +3864,7 @@ impl QueryCoordinator {
 			operation_id,
 			&source_executor,
 			bound,
+			&mut None,
 		)
 		.await;
 		if let Err(error) = &result {

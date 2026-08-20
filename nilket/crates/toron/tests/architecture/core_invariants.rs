@@ -585,3 +585,49 @@ pub(crate) fn adr542_resolution_is_a_tenant_scoped_id_lookup_not_statement_repla
 	assert!(resolve.contains(".resolve_mutation("));
 	assert!(!resolve.contains(".write("));
 }
+
+#[test]
+pub(crate) fn adr0574_receipt_variant_is_appended_and_carries_its_version_bump() {
+	let protocol = std::fs::read_to_string(
+		manifest_dir()
+			.parent()
+			.expect("workspace crates dir")
+			.join("toron-client/src/protocol.rs"),
+	)
+	.expect("read the client protocol");
+
+	// The variant is last: postcard encodes discriminants by declaration
+	// order, so appending is what keeps every existing variant's number.
+	let variants = protocol
+		.split_once("pub enum SqlMessage {")
+		.and_then(|(_, tail)| tail.split_once("\n}"))
+		.map(|(block, _)| block)
+		.expect("SqlMessage block");
+	let declared: Vec<&str> = variants
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty() && !line.starts_with("//"))
+		.collect();
+	assert_eq!(
+		declared.last().copied(),
+		Some("MaterializeOutcome(MaterializeOutcomeResponse),"),
+		"ADR 574's variant must be appended at the tail, not inserted"
+	);
+	assert_eq!(
+		declared[0], "Execute(ExecuteRequest),",
+		"the first variant's position is what every older peer's decode depends on"
+	);
+
+	// The bump travels with the variant. A response shape added without it is
+	// exactly the opaque-decode failure ADR 574 exists to prevent, so the two
+	// facts are asserted together rather than in separate guards.
+	assert!(
+		protocol.contains("rune_version!(RuneRequestProtocolVersion, 2)"),
+		"the request-protocol axis must advance in the cut that adds the variant"
+	);
+	assert!(
+		protocol.contains("rune_version!(RuneLanguageSurfaceVersion, 1)")
+			&& protocol.contains("rune_version!(RuneSandboxContractVersion, 1)"),
+		"a response-shape change moves neither the language surface nor the sandbox contract"
+	);
+}

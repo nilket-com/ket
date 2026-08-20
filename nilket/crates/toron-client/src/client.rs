@@ -12,8 +12,9 @@ use rustls::{ClientConfig, DigitallySignedStruct, Error as RustlsError, Signatur
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
 use crate::protocol::{
-	ExecuteRuneRequest, HealthyResponse, QueryId, ResolvedOperationOutcome, ResultBatch,
-	RuneFailure, SqlErrorCode, SqlFrame, SqlMessage, SqlProtocolVersion,
+	ExecuteRuneRequest, HealthyResponse, MaterializeOutcomeResponse, QueryId,
+	ResolvedOperationOutcome, ResultBatch, RuneFailure, SqlErrorCode, SqlFrame, SqlMessage,
+	SqlProtocolVersion,
 };
 
 const LOOPBACK_QUIC_ALPN: &[u8] = b"sql-task-loopback";
@@ -33,6 +34,33 @@ pub struct ToronClientTls {
 	pub cert_path: PathBuf,
 	pub key_path: PathBuf,
 	pub ca_path: PathBuf,
+}
+
+/// ADR 574 corrective: what a Rune execution returns. The two outcomes are
+/// mutually exclusive and the caller cannot know in advance which it will get
+/// — that is decided by the script, not the request — so the result is a sum
+/// rather than a `QueryResult` carrying a materialization-only optional field.
+#[derive(Debug, PartialEq)]
+pub enum RuneQueryResult {
+	/// An ordinary Rune relation: caller batches and their row count.
+	Batches(QueryResult),
+	/// A `materialize` verb: its receipt, and no caller batches.
+	Materialized(MaterializeOutcomeResponse),
+}
+
+impl RuneQueryResult {
+	/// The SQL and health paths never see a receipt: the daemon emits
+	/// `MaterializeOutcome` only for a Rune materialization, and the collector
+	/// only decodes it under `ExpectedResponse::RuneQuery`. This states that
+	/// invariant instead of trusting it.
+	fn into_batches(self) -> Result<QueryResult, ClientError> {
+		match self {
+			Self::Batches(result) => Ok(result),
+			Self::Materialized(_) => Err(ClientError::Protocol(
+				"materialization receipt on a non-Rune response path".to_owned(),
+			)),
+		}
+	}
 }
 
 #[derive(Clone)]
@@ -150,7 +178,8 @@ impl ToronClient {
 				self.health_timeout,
 				ClientOperation::Health,
 			)
-			.await?;
+			.await?
+			.into_batches()?;
 		if !response.batches.is_empty() || response.row_count != 0 {
 			return Err(ClientError::Protocol(
 				"health returned query data".to_owned(),
@@ -187,10 +216,11 @@ impl ToronClient {
 			self.query_timeout,
 			ClientOperation::Query,
 		)
-		.await
+		.await?
+		.into_batches()
 	}
 
-	pub async fn execute_rune(&self, source: &str) -> Result<QueryResult, ClientError> {
+	pub async fn execute_rune(&self, source: &str) -> Result<RuneQueryResult, ClientError> {
 		self.execute_rune_request(ExecuteRuneRequest::current(source.to_owned(), None))
 			.await
 	}
@@ -201,7 +231,7 @@ impl ToronClient {
 	pub async fn execute_rune_request(
 		&self,
 		request: ExecuteRuneRequest,
-	) -> Result<QueryResult, ClientError> {
+	) -> Result<RuneQueryResult, ClientError> {
 		self.execute_rune_request_with_query_id(QueryId::new(), request)
 			.await
 	}
@@ -210,7 +240,7 @@ impl ToronClient {
 		&self,
 		query_id: QueryId,
 		request: ExecuteRuneRequest,
-	) -> Result<QueryResult, ClientError> {
+	) -> Result<RuneQueryResult, ClientError> {
 		self.exchange(
 			SqlFrame::execute_rune_request(query_id, request),
 			ExpectedResponse::RuneQuery,
@@ -228,7 +258,8 @@ impl ToronClient {
 				self.health_timeout,
 				ClientOperation::Cancellation,
 			)
-			.await?;
+			.await?
+			.into_batches()?;
 		if !result.batches.is_empty() || result.row_count != 0 {
 			return Err(ClientError::Protocol(
 				"cancellation returned query data".to_owned(),
@@ -282,7 +313,7 @@ impl ToronClient {
 		expected: ExpectedResponse,
 		response_timeout: Duration,
 		operation: ClientOperation,
-	) -> Result<QueryResult, ClientError> {
+	) -> Result<RuneQueryResult, ClientError> {
 		let connection = self.open_connection().await?;
 		let exchange = async {
 			let (mut send, mut recv) = connection
@@ -328,7 +359,7 @@ async fn collect_response<R>(
 	reader: &mut R,
 	query_id: QueryId,
 	expected: ExpectedResponse,
-) -> Result<QueryResult, ClientError>
+) -> Result<RuneQueryResult, ClientError>
 where
 	R: AsyncRead + Unpin,
 {
@@ -340,7 +371,7 @@ async fn collect_response_bounded<R>(
 	query_id: QueryId,
 	expected: ExpectedResponse,
 	max_result_bytes: usize,
-) -> Result<QueryResult, ClientError>
+) -> Result<RuneQueryResult, ClientError>
 where
 	R: AsyncRead + Unpin,
 {
@@ -394,27 +425,27 @@ where
 					ExpectedResponse::Query | ExpectedResponse::RuneQuery
 				) =>
 			{
-				return Ok(QueryResult {
+				return Ok(RuneQueryResult::Batches(QueryResult {
 					batches,
 					row_count: complete.row_count,
-				});
+				}));
 			}
 			SqlMessage::Healthy(HealthyResponse)
 				if matches!(expected, ExpectedResponse::Health) =>
 			{
-				return Ok(QueryResult {
+				return Ok(RuneQueryResult::Batches(QueryResult {
 					batches: Vec::new(),
 					row_count: 0,
-				});
+				}));
 			}
 			SqlMessage::Error(error)
 				if matches!(expected, ExpectedResponse::Cancellation)
 					&& error.code == SqlErrorCode::Cancelled =>
 			{
-				return Ok(QueryResult {
+				return Ok(RuneQueryResult::Batches(QueryResult {
 					batches: Vec::new(),
 					row_count: 0,
-				});
+				}));
 			}
 			SqlMessage::Error(error) => {
 				return Err(ClientError::Remote {
@@ -424,6 +455,14 @@ where
 			}
 			SqlMessage::RuneError(error) if matches!(expected, ExpectedResponse::RuneQuery) => {
 				return Err(ClientError::Rune(error));
+			}
+			// ADR 574 corrective: a materialization reports a receipt and no
+			// caller batches. Only the Rune path may decode it — SQL CTAS
+			// neither produces nor accepts this variant.
+			SqlMessage::MaterializeOutcome(receipt)
+				if matches!(expected, ExpectedResponse::RuneQuery) =>
+			{
+				return Ok(RuneQueryResult::Materialized(receipt));
 			}
 			other => {
 				return Err(ClientError::Protocol(format!(
@@ -794,10 +833,10 @@ mod tests {
 		let mut reader = framed_bytes(std::slice::from_ref(&healthy)).await;
 		assert_eq!(
 			collect_response(&mut reader, id, ExpectedResponse::Health).await,
-			Ok(QueryResult {
+			Ok(RuneQueryResult::Batches(QueryResult {
 				batches: Vec::new(),
 				row_count: 0,
-			})
+			}))
 		);
 		let mut reader = framed_bytes(&[healthy]).await;
 		assert!(

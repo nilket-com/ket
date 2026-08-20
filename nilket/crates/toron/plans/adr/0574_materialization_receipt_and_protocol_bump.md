@@ -72,13 +72,17 @@ failure reachable for a new reason.
 
 ### 3. The receipt is derived from the publish result, not from a later read
 
-The payload is `{ table_name (resolved), certificate_format_version,
+The payload is `{ namespace, table_name, certificate_format_version,
 rows_written }`.
 
-- **`table_name`** is the resolved identity — the published entry's
-  `descriptor.namespace` and `descriptor.table_name`, not the bare string
-  `materialize(name)` lowered through `TableRef::new`. The receipt names
-  something the user can paste back into `ctx.table(...)`.
+- **`namespace` and `table_name`** are the resolved identity, from the
+  published entry's descriptor rather than the bare string `materialize(name)`
+  lowered through `TableRef::new`. The council settled on one `table_name`
+  field carrying "the resolved identity"; implementation showed a single
+  dotted string cannot deliver it, because `TableRef::new` does not split a
+  qualified name — it would name a table called `ns.table`. The two components
+  travel side by side so `table_name` is exactly what `ctx.table(...)`
+  accepts and the namespace is still reported.
 - **`certificate_format_version`** is read from the **attached bytes**, not
   from this build's `boson::V1_FORMAT_VERSION`. Reporting what the build
   would have written rather than what was recorded turns evidence back into
@@ -131,6 +135,33 @@ and marks its list non-exhaustive when a seed is computed rather than
 literal, so it could be carried. It is not, in this cut: §7 asks for routine
 status and no more, and witness provenance belongs to the viewer §7 defers.
 
+### 6. The client returns a closed Rune result
+
+A response variant only exists if a consumer can decode it. `toron-client`
+therefore returns a sum from a Rune execution:
+
+```text
+RuneQueryResult = Batches(QueryResult) | Materialized(MaterializeOutcomeResponse)
+```
+
+`execute_rune`, `execute_rune_request`, and `execute_rune_request_with_query_id`
+return it; the collector decodes `MaterializeOutcome` **only** under
+`ExpectedResponse::RuneQuery`. SQL `execute` keeps `QueryResult` unchanged, and
+the SQL, health, and cancellation paths convert through a checked unwrap that
+states the invariant — SQL CTAS neither produces nor accepts this variant —
+rather than assuming it.
+
+A sum rather than an optional field on `QueryResult`, for §4's reason one layer
+out: a receipt field that is empty on every SQL result is a state that cannot
+occur without something being wrong. And for a second reason §4 did not need —
+the client **cannot know in advance** which outcome a script produces. The
+daemon inspects the bound plan; the caller submits source. A per-outcome entry
+point is therefore impossible, and the return type must express both.
+
+This changes a public `toron-client` signature, which is consistent with the
+lockstep bump §1 already declared: the peers ship together.
+
+
 ## Acceptance
 
 - A `materialize` that publishes returns a receipt whose `table_name` round-
@@ -141,10 +172,20 @@ status and no more, and witness provenance belongs to the viewer §7 defers.
 - `rows_written` equals the rows the source produced, on a case where that
   count is neither zero nor the outer cardinality, so a wrong-source
   substitution fails.
-- The resume control: a materialize whose publish is re-entered through
-  `finish_ctas_after_rows_committed` still produces a receipt with the same
-  three facts, on a saga aged past `CTAS_SAGA_DETAIL_RETENTION_MS`. This
-  fails against any implementation that re-reads the saga entry.
+- The resume control: re-entering the same operation id after a successful
+  publish reports the *same* receipt rather than nothing — proven by equality
+  against the original, not by asserting a literal twice.
+
+  > **Corrected during implementation.** This item originally demanded a
+  > receipt on a saga aged past `CTAS_SAGA_DETAIL_RETENTION_MS`. That is not
+  > achievable by any implementation, including one that derives from the
+  > publish result: once the entry is pruned, the row count is gone from the
+  > system entirely and only the attachment survives. The requirement was
+  > incoherent, not merely strict. What the derive-at-publish rule actually
+  > buys is that the receipt exists *before* pruning can matter, and that a
+  > re-entry within retention reproduces it; past retention the operation is
+  > no longer resolvable at all, which is a pre-existing property of the saga
+  > ledger and not this record's to change.
 - A peer sending a stale `request_protocol_version` is refused with
   `VersionSkew` naming the `RequestProtocol` axis, the requested value, and
   the supported set — asserted in both directions, and asserted to occur
@@ -153,6 +194,16 @@ status and no more, and witness provenance belongs to the viewer §7 defers.
   reflex bump of all three fails here.
 - Plain SQL CTAS is unchanged: no receipt, no new response variant on its
   path, existing suites untouched.
+- The wire is proven end to end, daemon **to client**: a live control runs
+  `ctx.range(...).materialize(...)` through `toron-client`, asserts the typed
+  receipt, and queries the created table back by the name the receipt
+  reported. A producer-only acceptance cannot show that the receipt is
+  reachable — it would pass against a client that rejects the variant as an
+  unexpected message — so this item is what makes the response shape real
+  rather than merely emitted.
+- An ordinary Rune relation still returns `Batches`, asserted by
+  destructuring rather than field access, so the two outcomes cannot be
+  silently conflated.
 
 ## Guardrails
 
@@ -163,6 +214,21 @@ no existing variant's declaration position moved, and that
 prevent, so the two facts are asserted together rather than separately.
 
 ## Risks and deferrals
+
+Polariton renders the receipt, and cannot yet: `RuneDispatchResult` is
+`Result<Arc<ResultArtifact>, RuneDispatchFailure>`, with no case that carries
+one. Giving it a materialized case and emitting PRODUCT-0137 §7's routine
+status is a viz-owned companion, and the Toron adapter is left failing to
+compile against this signature until it lands.
+
+That break is deliberate. A placeholder mapping a materialization to the empty
+relation was written and rejected: it compiles, and it is worse than a broken
+build. A successful write would report as an empty result, which reads as
+"nothing happened" — and the natural response is to run it again, into a
+fresh-only verb that collides with the table the first run created. A silent
+loss that invites a retry after a successful write is not an acceptable
+interim state, and "it builds" is not a reason to ship one. A compile error
+cannot be missed; an empty artifact can.
 
 Mixed-version operation is not supported and is not made to work here; the
 lockstep constraint is stated, not engineered around. A richer receipt, seed

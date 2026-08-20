@@ -139,6 +139,27 @@ pub enum SqlMessage {
 	MutationOutcome(MutationOutcomeResponse),
 	// Append-only ADR 548 composite CTAS resolution.
 	CtasOutcome(CtasOutcomeResponse),
+	// Append-only ADR 574 materialization receipt.
+	MaterializeOutcome(MaterializeOutcomeResponse),
+}
+
+/// ADR 574: routine status for a successful `materialize`. Every field is
+/// derived from the publish result, so the receipt reports what was recorded
+/// rather than what this build would have written.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MaterializeOutcomeResponse {
+	/// Resolved namespace of the created table.
+	pub namespace: String,
+	/// Resolved table name. This is the identity `ctx.table(...)` accepts;
+	/// the namespace travels beside it rather than dotted into it, because
+	/// `TableRef::new` does not split a qualified string.
+	pub table_name: String,
+	/// Format version decoded from the attached certificate bytes.
+	pub certificate_format_version: u16,
+	/// Rows written to the new table. A CTAS returns no rows to the caller,
+	/// so this deliberately does not share the `row_count` name that every
+	/// other completion on this protocol uses for rows delivered.
+	pub rows_written: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -149,21 +170,24 @@ pub struct ExecuteRequest {
 }
 
 macro_rules! rune_version {
-	($name:ident) => {
+	($name:ident, $current:expr) => {
 		#[derive(
 			Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
 		)]
 		pub struct $name(pub u16);
 
 		impl $name {
-			pub const CURRENT: Self = Self(1);
+			pub const CURRENT: Self = Self($current);
 		}
 	};
 }
 
-rune_version!(RuneRequestProtocolVersion);
-rune_version!(RuneLanguageSurfaceVersion);
-rune_version!(RuneSandboxContractVersion);
+// ADR 574: the request-protocol axis alone advances for the materialization
+// receipt. A response-shape change alters neither the Rune language nor the
+// sandbox contract, and moving those axes would misreport what changed.
+rune_version!(RuneRequestProtocolVersion, 2);
+rune_version!(RuneLanguageSurfaceVersion, 1);
+rune_version!(RuneSandboxContractVersion, 1);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExecuteRuneRequest {

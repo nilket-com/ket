@@ -2372,3 +2372,112 @@ async fn adr0572_oversized_certificate_refuses_at_provision() {
 		"the refusal leaves no visible table"
 	);
 }
+
+/// ADR 574: a fresh execution context whose query id is a caller UUIDv7, which
+/// the CTAS saga requires for its operation id.
+fn ctas_context() -> ExecutionContext {
+	ExecutionContext::new(
+		SessionId(91),
+		QueryId::new(),
+		TenantId(1),
+		toron::storage::HlcBound(1),
+	)
+}
+
+#[tokio::test]
+async fn adr0574_receipt_reports_the_published_facts_and_round_trips() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+	let plan = materialize_plan(
+		r#"
+        pub fn main(ctx) {
+            ctx.range(7)
+               .project_named([floor(seeded_random(lit_i64(5), col("ordinal")).mul(lit_f64(3.0))).named("bucket")])
+               .materialize("kept")
+        }
+    "#,
+	)
+	.await;
+
+	let receipt = coordinator
+		.execute_materialization_with_context(&plan, ctas_context())
+		.await
+		.expect("materialize returns its receipt");
+
+	// rows_written is neither zero nor a fixed constant of the harness: a
+	// substituted source would not produce 7.
+	assert_eq!(receipt.rows_written, 7);
+	assert_eq!(receipt.table_name, "kept");
+	assert!(!receipt.namespace.is_empty(), "the identity is resolved");
+
+	// The version is what the attachment holds, proven against the attachment
+	// rather than against this build's constant.
+	let attached = catalog
+		.materialization_certificate(&TableRef::new("kept"))
+		.expect("the table is born with its attachment");
+	let decoded =
+		boson::CanonicalRelationExpression::decode_v1(&attached).expect("decode attachment");
+	assert_eq!(receipt.certificate_format_version, decoded.format_version);
+
+	// The name round-trips: it is what a caller can query back.
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		&format!("SELECT bucket FROM {} ORDER BY bucket", receipt.table_name),
+	)
+	.await;
+	assert_eq!(batch.num_rows(), 7);
+}
+
+#[tokio::test]
+async fn adr0574_resumed_publish_reports_the_same_receipt() {
+	// ADR 574's resume control. The saga is driven to Published, then the
+	// coordinator re-enters the same operation id: the second call resolves
+	// the already-published saga instead of publishing again, and must report
+	// the same three facts rather than nothing.
+	let (_catalog, _storage, coordinator, _planner) = coordinator();
+	let plan = materialize_plan(r#"pub fn main(ctx) { ctx.range(4).materialize("kept") }"#).await;
+	let context = ctas_context();
+	let query_id = context.query_id;
+
+	let first = coordinator
+		.execute_materialization_with_context(&plan, context)
+		.await
+		.expect("first materialization publishes");
+
+	let mut resumed_context = ctas_context();
+	resumed_context.query_id = query_id;
+	let second = coordinator
+		.execute_materialization_with_context(&plan, resumed_context)
+		.await
+		.expect("re-entering the same operation id still yields a receipt");
+
+	assert_eq!(
+		first, second,
+		"a resumed publish must report what the original would have"
+	);
+}
+
+#[tokio::test]
+async fn adr0574_receipt_entry_refuses_a_plan_without_a_certificate() {
+	let (_catalog, _storage, coordinator, planner) = coordinator();
+	coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE people (id INT NOT NULL)")
+				.expect("plan source"),
+			None,
+		)
+		.await
+		.expect("create source");
+	let plain = planner
+		.plan("CREATE TABLE copy AS SELECT id FROM people")
+		.expect("plan plain CTAS");
+	let error = coordinator
+		.execute_materialization_with_context(&plain, ctas_context())
+		.await
+		.expect_err("a plain CTAS has no receipt to give");
+	assert!(
+		error.to_string().contains("certificate-carrying"),
+		"got {error}"
+	);
+}

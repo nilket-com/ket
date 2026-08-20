@@ -1685,17 +1685,31 @@ async fn handle_sql_connection(
 			let mut context = sql_execution_context(tenant_id, frame.query_id, session_id);
 			context.deadline = std::time::Instant::now().checked_add(timeout_duration);
 			context.trace_context = query_trace.trace_context();
-			let execution = coordinator
-				.execute_query_with_context(&plan, context)
-				.instrument(query_span.clone());
+			// ADR 574: a certified materialization takes the receipt-bearing
+			// entry point. Both arms share the timeout and disconnect handling
+			// below, so the outcome is carried rather than the call duplicated.
+			let execution = async {
+				if certified_materialization {
+					coordinator
+						.execute_materialization_with_context(&plan, context)
+						.await
+						.map(RuneExecutionOutput::Materialized)
+				} else {
+					coordinator
+						.execute_query_with_context(&plan, context)
+						.await
+						.map(RuneExecutionOutput::Batches)
+				}
+			}
+			.instrument(query_span.clone());
 			tokio::pin!(execution);
 			let timeout_sleep = tokio::time::sleep(timeout_duration);
 			tokio::pin!(timeout_sleep);
 			let connection_closed = connection.closed();
 			tokio::pin!(connection_closed);
-			let batches = tokio::select! {
+			let output = tokio::select! {
 				result = &mut execution => match result {
-					Ok(batches) => batches,
+					Ok(output) => output,
 					Err(error) => {
 						let failure = rune_execution_failure(error);
 						crate::telemetry::record_query_outcome(&query_span, "error");
@@ -1771,6 +1785,45 @@ async fn handle_sql_connection(
 				},
 			};
 
+			let batches = match output {
+				RuneExecutionOutput::Batches(batches) => batches,
+				RuneExecutionOutput::Materialized(receipt) => {
+					crate::telemetry::record_query_outcome(&query_span, "ok");
+					let audit_event = ToronAuditEvent::query_outcome(
+						ToronAuditOperation::QueryCompleted,
+						tenant_id,
+						session_id,
+						frame.query_id,
+						statement_class,
+						AuditOutcome::Allowed,
+					)
+					.with_query_frontend(QueryFrontend::Rune)
+					.with_duration(query_started.elapsed());
+					if !record_sql_audit_required_or_error(
+						&audit,
+						audit_event,
+						&mut stream,
+						frame.query_id,
+					)
+					.await?
+					{
+						return Ok(());
+					}
+					let response = SqlFrame::response(
+						frame.query_id,
+						SqlMessage::MaterializeOutcome(
+							crate::sql_wire::MaterializeOutcomeResponse {
+								namespace: receipt.namespace,
+								table_name: receipt.table_name,
+								certificate_format_version: receipt.certificate_format_version,
+								rows_written: receipt.rows_written,
+							},
+						),
+					);
+					write_sql_frame(&mut stream, &response).await?;
+					return Ok(());
+				}
+			};
 			let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>() as u64;
 			let mut encoded = Vec::with_capacity(batches.len());
 			for (batch_index, batch) in batches.iter().enumerate() {
@@ -1867,7 +1920,8 @@ async fn handle_sql_connection(
 		| SqlMessage::RuneError(_)
 		| SqlMessage::Healthy(_)
 		| SqlMessage::MutationOutcome(_)
-		| SqlMessage::CtasOutcome(_) => {
+		| SqlMessage::CtasOutcome(_)
+		| SqlMessage::MaterializeOutcome(_) => {
 			if !record_sql_audit_required_or_error(
 				&audit,
 				ToronAuditEvent::edge_denial(
@@ -1893,6 +1947,13 @@ async fn handle_sql_connection(
 	}
 
 	Ok(())
+}
+
+/// ADR 574: what a Rune execution produced — ordinary batches, or the receipt
+/// a certified materialization owes its caller.
+enum RuneExecutionOutput {
+	Batches(Vec<RecordBatch>),
+	Materialized(crate::coordinator::MaterializationReceipt),
 }
 
 fn public_mutation_stop_reason(value: u8) -> MutationStopReason {

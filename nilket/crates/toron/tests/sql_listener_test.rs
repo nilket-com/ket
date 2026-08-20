@@ -156,6 +156,9 @@ async fn rune_source_executes_over_the_authenticated_query_boundary_with_typed_f
 		)
 		.await
 		.expect("Rune query result");
+	let toron_client::RuneQueryResult::Batches(result) = result else {
+		panic!("an ordinary Rune relation returns batches, not a receipt");
+	};
 	assert_eq!(result.row_count, 2);
 	let batches = result
 		.batches
@@ -181,6 +184,9 @@ async fn rune_source_executes_over_the_authenticated_query_boundary_with_typed_f
 		)
 		.await
 		.expect("composed Rune relation result");
+	let toron_client::RuneQueryResult::Batches(composed) = composed else {
+		panic!("an ordinary Rune relation returns batches, not a receipt");
+	};
 	assert_eq!(
 		composed.row_count, 2,
 		"the public Rune route must preserve filter, aggregate, sort, limit, and projection"
@@ -214,6 +220,42 @@ async fn rune_source_executes_over_the_authenticated_query_boundary_with_typed_f
 
 	let audit = wait_for_audit_records(&audit_path, &["query_frontend", "rune"]).await;
 	assert!(!audit.contains("\"query_frontend\":\"sql\""));
+
+	// ADR 574 corrective gate: the whole wire path for a materialization, not
+	// merely daemon emission. Against the original cut — which appended the
+	// response variant but never gave the client a decoder arm — this returns
+	// ClientError::Protocol("unexpected response message") and fails here.
+	let materialized = client
+		.execute_rune(r#"pub fn main(ctx) { ctx.range(6).materialize("wire_kept") }"#)
+		.await
+		.expect("a materialization must cross the wire as a typed receipt");
+	let toron_client::RuneQueryResult::Materialized(receipt) = materialized else {
+		panic!("materialize returns a receipt, not batches: {materialized:?}");
+	};
+	assert_eq!(receipt.table_name, "wire_kept");
+	assert!(
+		!receipt.namespace.is_empty(),
+		"the receipt carries the resolved identity"
+	);
+	assert_eq!(receipt.rows_written, 6);
+	assert_eq!(
+		receipt.certificate_format_version,
+		boson::V1_FORMAT_VERSION,
+		"the receipt reports the format the attachment was recorded at"
+	);
+
+	// The created table is queryable by the name the receipt reported.
+	let readback = client
+		.execute_rune(&format!(
+			"pub fn main(ctx) {{ ctx.table(\"{}\") }}",
+			receipt.table_name
+		))
+		.await
+		.expect("the materialized table is queryable");
+	let toron_client::RuneQueryResult::Batches(readback) = readback else {
+		panic!("an ordinary relation returns batches");
+	};
+	assert_eq!(readback.row_count, 6);
 
 	daemon.shutdown().await.expect("shutdown daemon");
 	fixture.shutdown();
@@ -255,8 +297,26 @@ async fn each_rune_version_axis_refuses_skew_with_requested_and_supported_versio
 		};
 		assert_eq!(skew.axis, axis);
 		assert_eq!(skew.requested, 77);
-		assert_eq!(skew.supported, vec![1]);
+		// ADR 574: each axis reports its own current version. The request
+		// protocol advanced for the materialization receipt; the language
+		// surface and sandbox contract did not, and asserting them by value
+		// here is what fails a reflex bump of all three.
+		let expected = match axis {
+			RuneVersionAxis::RequestProtocol => RuneRequestProtocolVersion::CURRENT.0,
+			RuneVersionAxis::LanguageSurface => RuneLanguageSurfaceVersion::CURRENT.0,
+			RuneVersionAxis::SandboxContract => RuneSandboxContractVersion::CURRENT.0,
+		};
+		assert_eq!(skew.supported, vec![expected]);
 	}
+	assert_eq!(
+		(
+			RuneRequestProtocolVersion::CURRENT.0,
+			RuneLanguageSurfaceVersion::CURRENT.0,
+			RuneSandboxContractVersion::CURRENT.0,
+		),
+		(2, 1, 1),
+		"ADR 574 moves the request-protocol axis alone"
+	);
 	daemon.shutdown().await.expect("shutdown daemon");
 }
 
