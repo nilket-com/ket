@@ -431,6 +431,23 @@ implementation may finish, and a defect in shipped typography remains a defect.
 2. Saved encrypted connection profiles and unlock UX.
 3. Query cancellation (the scoped half of DB-01).
 4. CSV import and export.
+5. Synthetic data generation, followed by materialization-with-provenance.
+
+**Fifth-arc selection — 2026-08-20.** With the four ratified arcs complete,
+the next arc is **synthetic data generation**, selected ahead of CSV ingest as
+the clean first consumer of
+materialization-with-provenance. Narrowly: a TORON record for an engine-side
+row-generation source and its bounded vocabulary (the Rune dataframe API has
+transformation but no row source; `random()` exists as an expression,
+`INSERT INTO ... SELECT` exists as the write path), then a PRODUCT record for
+materializing a Rune-defined relation with its PRODUCT-0002 §4 birth
+certificate — for generated data the definition *is* the provenance, complete
+by construction. **Fenced out:** CSV transport and file parsing, any ingestion
+wire frame, and broader dataframe-construction APIs. CSV ingest stays held and
+inherits the materialization contract this arc proves, adding only the
+transport frame. Immediate consumers: performance fixtures for the scatter
+thresholds and row-count claims, genuinely long-running queries for
+cancellation exhibits, and generated `uat/` seeds.
 
 **Fourth-arc annotation — 2026-08-19.** The arc split on examination. CSV
 **export** is selected and specified by PRODUCT-0136 as a Rune-authored,
