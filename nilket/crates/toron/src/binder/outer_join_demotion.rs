@@ -2015,7 +2015,10 @@ fn guard_filter_pushdown_safe(expr: &Expr) -> bool {
 		| Expr::Gt(left, right)
 		| Expr::Gte(left, right)
 		| Expr::And(left, right)
-		| Expr::Or(left, right) => guard_filter_pushdown_safe(left) && guard_filter_pushdown_safe(right),
+		| Expr::Or(left, right)
+		| Expr::IsDistinctFrom { left, right, .. } => {
+			guard_filter_pushdown_safe(left) && guard_filter_pushdown_safe(right)
+		}
 		Expr::InList { expr, list, .. } => {
 			guard_filter_pushdown_safe(expr) && list.iter().all(guard_filter_pushdown_safe)
 		}
@@ -2321,6 +2324,15 @@ where
 				parameter: parameter.clone(),
 			}
 		}
+		Expr::IsDistinctFrom {
+			left,
+			right,
+			negated,
+		} => Expr::IsDistinctFrom {
+			left: Box::new(child!(left)),
+			right: Box::new(child!(right)),
+			negated: *negated,
+		},
 	}))
 }
 
@@ -2574,6 +2586,9 @@ fn expr_any_column<F: Fn(&ColumnRef) -> bool>(expr: &Expr, predicate: &F) -> boo
 		| Expr::Gte(left, right)
 		| Expr::And(left, right)
 		| Expr::Or(left, right) => expr_any_column(left, predicate) || expr_any_column(right, predicate),
+		Expr::IsDistinctFrom { left, right, .. } => {
+			expr_any_column(left, predicate) || expr_any_column(right, predicate)
+		}
 		Expr::InList { expr, list, .. } => {
 			expr_any_column(expr, predicate)
 				|| list.iter().any(|item| expr_any_column(item, predicate))
@@ -2670,6 +2685,11 @@ fn expr_column_resolution_in_scope(expr: &Expr, scope: &RelationScope) -> (bool,
 			}
 			result
 		}
+		Expr::IsDistinctFrom { left, right, .. } => {
+			let left = expr_column_resolution_in_scope(left, scope);
+			let right = expr_column_resolution_in_scope(right, scope);
+			(left.0 || right.0, left.1 && right.1)
+		}
 	}
 }
 
@@ -2758,6 +2778,10 @@ fn null_rejecting_sides(
 		| Expr::Case { .. }
 		| Expr::IsNull(_) => NullRejectedSides::default(),
 		Expr::ScalarFunction { .. } => NullRejectedSides::default(),
+		// ADR 566: the null-safe comparison is TRUE-capable on NULL operands
+		// (both spellings), so it never rejects a side and must not demote an
+		// outer join.
+		Expr::IsDistinctFrom { .. } => NullRejectedSides::default(),
 	}
 }
 
@@ -2923,6 +2947,11 @@ fn conjunct_column_sides(
 		| Expr::Gte(left, right)
 		| Expr::And(left, right)
 		| Expr::Or(left, right) => {
+			let mut sides = conjunct_column_sides(left, left_scope, right_scope);
+			sides.merge(conjunct_column_sides(right, left_scope, right_scope));
+			sides
+		}
+		Expr::IsDistinctFrom { left, right, .. } => {
 			let mut sides = conjunct_column_sides(left, left_scope, right_scope);
 			sides.merge(conjunct_column_sides(right, left_scope, right_scope));
 			sides

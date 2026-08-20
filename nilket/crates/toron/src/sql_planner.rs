@@ -6788,6 +6788,16 @@ impl SqlPlanner {
 			}
 			SqlExpr::IsNull(expr) => Ok(Expr::IsNull(Box::new(self.lower_expr(expr)?))),
 			SqlExpr::IsNotNull(expr) => Ok(Expr::IsNotNull(Box::new(self.lower_expr(expr)?))),
+			SqlExpr::IsDistinctFrom(left, right) => Ok(Expr::IsDistinctFrom {
+				left: Box::new(self.lower_expr(left)?),
+				right: Box::new(self.lower_expr(right)?),
+				negated: false,
+			}),
+			SqlExpr::IsNotDistinctFrom(left, right) => Ok(Expr::IsDistinctFrom {
+				left: Box::new(self.lower_expr(left)?),
+				right: Box::new(self.lower_expr(right)?),
+				negated: true,
+			}),
 			SqlExpr::Extract { field, expr, .. } => Ok(crate::ir::extract_scalar_function(
 				lower_extract_datetime_field(field)?,
 				self.lower_expr(expr)?,
@@ -7513,6 +7523,10 @@ fn validate_hidden_sort_key_refs(
 				validate_hidden_sort_key_refs(arg, visible_names)?;
 			}
 			Ok(())
+		}
+		Expr::IsDistinctFrom { left, right, .. } => {
+			validate_hidden_sort_key_refs(left, visible_names)?;
+			validate_hidden_sort_key_refs(right, visible_names)
 		}
 	}
 }
@@ -8404,6 +8418,16 @@ pub(crate) fn hash_expr_structural(expr: &Expr, state: &mut impl Hasher) {
 				hash_expr_structural(arg, state);
 			}
 		}
+		Expr::IsDistinctFrom {
+			left,
+			right,
+			negated,
+		} => {
+			33u8.hash(state);
+			negated.hash(state);
+			hash_expr_structural(left, state);
+			hash_expr_structural(right, state);
+		}
 	}
 }
 
@@ -8550,6 +8574,22 @@ pub(crate) fn expr_structural_eq(left: &Expr, right: &Expr) -> bool {
 				(None, None) => true,
 				_ => false,
 			}
+		}
+		(
+			Expr::IsDistinctFrom {
+				left: left_a,
+				right: right_a,
+				negated: negated_a,
+			},
+			Expr::IsDistinctFrom {
+				left: left_b,
+				right: right_b,
+				negated: negated_b,
+			},
+		) => {
+			negated_a == negated_b
+				&& expr_structural_eq(left_a, left_b)
+				&& expr_structural_eq(right_a, right_b)
 		}
 		_ => false,
 	}
@@ -8874,6 +8914,9 @@ fn expr_contains_qualified_column(expr: &Expr) -> bool {
 		| Expr::Gte(left, right)
 		| Expr::And(left, right)
 		| Expr::Or(left, right) => {
+			expr_contains_qualified_column(left) || expr_contains_qualified_column(right)
+		}
+		Expr::IsDistinctFrom { left, right, .. } => {
 			expr_contains_qualified_column(left) || expr_contains_qualified_column(right)
 		}
 	}
@@ -9895,6 +9938,15 @@ pub(crate) fn canonical_aggregate_signature_expr(expr: &Expr) -> Expr {
 				.map(canonical_aggregate_signature_expr)
 				.collect(),
 			parameter: parameter.clone(),
+		},
+		Expr::IsDistinctFrom {
+			left,
+			right,
+			negated,
+		} => Expr::IsDistinctFrom {
+			left: Box::new(canonical_aggregate_signature_expr(left)),
+			right: Box::new(canonical_aggregate_signature_expr(right)),
+			negated: *negated,
 		},
 	}
 }
@@ -11963,6 +12015,9 @@ mod tests {
 				}) || else_expr
 					.as_ref()
 					.is_some_and(|expr| expr_references(expr, qualifier, name))
+			}
+			Expr::IsDistinctFrom { left, right, .. } => {
+				expr_references(left, qualifier, name) || expr_references(right, qualifier, name)
 			}
 			Expr::Literal(_) | Expr::UntypedNull => false,
 		}

@@ -65,6 +65,10 @@ pub(super) fn reject_storage_synthetic_returning_reference(
 			reject_storage_synthetic_returning_reference(left)?;
 			reject_storage_synthetic_returning_reference(right)
 		}
+		Expr::IsDistinctFrom { left, right, .. } => {
+			reject_storage_synthetic_returning_reference(left)?;
+			reject_storage_synthetic_returning_reference(right)
+		}
 	}
 }
 
@@ -134,6 +138,10 @@ pub(super) fn collect_logical_cast_names(
 		| Expr::Gte(left, right)
 		| Expr::And(left, right)
 		| Expr::Or(left, right) => {
+			collect_logical_cast_names(left, names)?;
+			collect_logical_cast_names(right, names)
+		}
+		Expr::IsDistinctFrom { left, right, .. } => {
 			collect_logical_cast_names(left, names)?;
 			collect_logical_cast_names(right, names)
 		}

@@ -9905,3 +9905,93 @@ async fn boolean_and_or_projections_follow_kleene_three_valued_logic() {
 		"TRUE AND NULL is genuinely unknown and stays NULL"
 	);
 }
+
+#[tokio::test]
+async fn adr566_is_distinct_from_truth_table_is_total_and_never_null() {
+	// amount is [10, 20, NULL, 30, NULL, 7]; price is [10.5, 20.5, NULL, 30.5,
+	// NULL, 7.5]. The five columns walk the full truth table — equal, unequal,
+	// NULL vs value, NULL vs NULL (literal and column-to-column) — projected,
+	// where NULL and FALSE are distinguishable in a way WHERE masks hide.
+	let rows = run_logical(&plan_sql(
+		"SELECT id, amount IS DISTINCT FROM 10, amount IS NOT DISTINCT FROM 10, \
+		 amount IS DISTINCT FROM NULL, amount IS NOT DISTINCT FROM NULL, \
+		 amount IS NOT DISTINCT FROM price FROM sales ORDER BY id",
+	))
+	.await;
+	let expected: [(&str, [bool; 6]); 5] = [
+		("IS DISTINCT FROM 10", [false, true, true, true, true, true]),
+		(
+			"IS NOT DISTINCT FROM 10",
+			[true, false, false, false, false, false],
+		),
+		(
+			"IS DISTINCT FROM NULL",
+			[true, true, false, true, false, true],
+		),
+		(
+			"IS NOT DISTINCT FROM NULL",
+			[false, false, true, false, true, false],
+		),
+		(
+			"IS NOT DISTINCT FROM price",
+			[false, false, true, false, true, false],
+		),
+	];
+	for (offset, (label, want)) in expected.iter().enumerate() {
+		let column = rows[0]
+			.column(offset + 1)
+			.as_any()
+			.downcast_ref::<arrow::array::BooleanArray>()
+			.expect("boolean output");
+		assert_eq!(column.null_count(), 0, "{label} must never yield NULL");
+		for (row, want) in want.iter().enumerate() {
+			assert_eq!(column.value(row), *want, "{label}, row {row}");
+		}
+	}
+}
+
+#[tokio::test]
+async fn adr566_is_distinct_from_inherits_eq_type_domain_and_rune_matches_sql() {
+	// The composition inherits `=`'s operand domain verbatim: an inadmissible
+	// pair fails with the very same message, so the two surfaces cannot drift.
+	let (catalog, _) = fixture();
+	let distinct_err = bind(
+		&plan_sql("SELECT region IS DISTINCT FROM 1 FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("a pair = rejects must reject")
+	.to_string();
+	let eq_err = bind(
+		&plan_sql("SELECT region = 1 FROM sales"),
+		&catalog,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("= rejects text against integer")
+	.to_string();
+	assert_eq!(distinct_err, eq_err, "one domain, one error");
+
+	let sql = run_logical(&plan_sql(
+		"SELECT id, amount IS DISTINCT FROM 10, amount IS NOT DISTINCT FROM NULL FROM sales",
+	))
+	.await;
+	let rune = run_logical(
+		&rune_plan(
+			r#"
+        pub fn main(ctx) {
+            ctx.table("sales")
+               .project([col("id"), col("amount").is_distinct(lit(10)), col("amount").is_not_distinct(lit_null())])
+        }
+    "#,
+		)
+		.await,
+	)
+	.await;
+	assert_eq!(
+		canonical_arrow_ipc_digest(&sql, SortPolicy::FullRowLex).expect("SQL digest"),
+		canonical_arrow_ipc_digest(&rune, SortPolicy::FullRowLex).expect("Rune digest"),
+		"SQL and Rune must lower to one composition and one result"
+	);
+}

@@ -28390,3 +28390,122 @@ fn adr564_text_temporal_casts_bind_onto_the_adr558_kernel_nodes() {
 		})
 	));
 }
+
+fn bind_adr566_expr(expr: Expr, nullable: bool) -> Result<BoundExprProgram, BindingError> {
+	let config = PlannerConfig::default();
+	let logical_casts = HashMap::new();
+	let logical_type_registry = LogicalTypeRegistry::default();
+	let ctx = ExprBindContext {
+		config: &config,
+		session_timezone: config
+			.resolved_session_timezone()
+			.expect("session timezone"),
+		logical_type_specs: &logical_casts,
+		logical_type_registry: &logical_type_registry,
+		relation_scope: None,
+		statement_timestamp_nanos: 0,
+	};
+	let schema = Arc::new(Schema::new(vec![Field::new(
+		"price",
+		DataType::Float64,
+		nullable,
+	)]));
+	bind_expr_program(&[expr], &schema, &ctx)
+}
+
+#[test]
+fn adr566_is_distinct_from_binds_each_operand_exactly_once() {
+	// The discriminating single-evaluation control: a duplicate-bind rewrite
+	// would append a Random node per operand reference (three under the
+	// composition), and this count would fail.
+	let program = bind_adr566_expr(
+		Expr::IsDistinctFrom {
+			left: Box::new(Expr::ScalarFunction {
+				id: crate::ir::ScalarFunctionId::Random,
+				args: Vec::new(),
+				parameter: crate::ir::ScalarFunctionParameter::None,
+			}),
+			right: Box::new(Expr::column("price")),
+			negated: false,
+		},
+		true,
+	)
+	.expect("bind RANDOM() IS DISTINCT FROM price");
+	let random_nodes = program
+		.nodes
+		.iter()
+		.filter(|node| matches!(node, BoundExprNode::ScalarFunction { .. }))
+		.count();
+	assert_eq!(
+		random_nodes, 1,
+		"the non-deterministic operand must be bound exactly once"
+	);
+	assert!(
+		matches!(
+			program.node(program.single_root().unwrap()),
+			Some(BoundExprNode::Unary {
+				op: crate::ir::BoundUnaryOp::Not,
+				..
+			})
+		),
+		"IS DISTINCT FROM is the negation of the not-distinct composition"
+	);
+
+	let negated = bind_adr566_expr(
+		Expr::IsDistinctFrom {
+			left: Box::new(Expr::column("price")),
+			right: Box::new(Expr::column("price")),
+			negated: true,
+		},
+		true,
+	)
+	.expect("bind price IS NOT DISTINCT FROM price");
+	assert!(
+		matches!(
+			negated.node(negated.single_root().unwrap()),
+			Some(BoundExprNode::Binary {
+				op: BoundBinaryOp::Or,
+				..
+			})
+		),
+		"IS NOT DISTINCT FROM is the bare composition, no extra negation"
+	);
+}
+
+#[test]
+fn adr566_shared_bound_nodes_evaluate_once() {
+	// The evaluator property the rewrite relies on, pinned at runtime: a
+	// program slot is computed once and every parent reference reuses it.
+	// Under per-reference re-evaluation the two Eq inputs would be distinct
+	// PerCall draws and some of 512 rows would compare unequal almost surely.
+	let mut builder = BoundExprProgramBuilder::new();
+	let random = builder.append_scalar_function(
+		crate::ir::ScalarFunctionId::Random,
+		Vec::new(),
+		DataType::Float64,
+	);
+	let equal = builder.append_binary(BoundBinaryOp::Eq, random, random, DataType::Boolean);
+	builder.push_root(equal);
+	let program = builder.build();
+
+	let rows = 512;
+	let batch = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![Field::new("pad", DataType::Int64, false)])),
+		vec![Arc::new((0..rows as i64).collect::<Int64Array>()) as ArrayRef],
+	)
+	.expect("pad batch");
+	let output = Executor::evaluate_bound_program_without_storage(&program, &batch)
+		.expect("evaluate shared Random node");
+	let values = output[0]
+		.as_any()
+		.downcast_ref::<BooleanArray>()
+		.expect("boolean output");
+	assert_eq!(values.len(), rows);
+	assert_eq!(values.null_count(), 0);
+	for row in 0..rows {
+		assert!(
+			values.value(row),
+			"row {row}: a shared slot must equal itself"
+		);
+	}
+}

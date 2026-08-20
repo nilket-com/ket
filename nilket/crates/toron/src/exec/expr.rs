@@ -362,6 +362,25 @@ impl Executor {
 					.collect::<Result<Vec<_>, ExecutionError>>()?;
 				evaluate_scalar_function(*id, &args, parameter, batch.num_rows())
 			}
+			Expr::IsDistinctFrom {
+				left,
+				right,
+				negated,
+			} => {
+				// Mirrors the binder's ADR 566 composition over the same
+				// kernels; each operand is evaluated once and the arrays are
+				// reused, matching the bound program's shared slots.
+				let left = self.evaluate_expr(left, batch)?;
+				let right = self.evaluate_expr(right, batch)?;
+				let both_null = and_kleene(&is_null(&left)?, &is_null(&right)?)?;
+				let both_present = and_kleene(&is_not_null(&left)?, &is_not_null(&right)?)?;
+				let equal = eq(&left, &right)?;
+				let not_distinct = or_kleene(&both_null, &and_kleene(&both_present, &equal)?)?;
+				if *negated {
+					return Ok(Arc::new(not_distinct));
+				}
+				Ok(Arc::new(not(&not_distinct)?))
+			}
 		}
 	}
 

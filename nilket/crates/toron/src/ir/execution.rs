@@ -657,6 +657,10 @@ impl BoundExprProgramBuilder {
 		self.node_types.get(id.0 as usize)
 	}
 
+	pub fn node(&self, id: BoundExprId) -> Option<&BoundExprNode> {
+		self.nodes.get(id.0 as usize)
+	}
+
 	pub fn node_logical_type(&self, id: BoundExprId) -> Option<LogicalTypeId> {
 		self.node_logical_types.get(id.0 as usize).copied()
 	}

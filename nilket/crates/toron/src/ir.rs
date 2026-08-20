@@ -963,6 +963,16 @@ pub enum Expr {
 		args: Vec<Expr>,
 		parameter: ScalarFunctionParameter,
 	},
+	/// ADR 566: the null-safe comparison. Carried as its own variant so the
+	/// binder can bind each operand once and share the bound nodes — a
+	/// planner-level rewrite would duplicate operand subtrees and with them
+	/// any non-deterministic evaluation. `negated: true` is IS NOT DISTINCT
+	/// FROM.
+	IsDistinctFrom {
+		left: Box<Expr>,
+		right: Box<Expr>,
+		negated: bool,
+	},
 }
 
 impl Expr {
@@ -1026,6 +1036,9 @@ impl Expr {
 					.as_ref()
 					.is_none_or(|expr| expr.is_deterministic())
 			}
+			Self::IsDistinctFrom { left, right, .. } => {
+				left.is_deterministic() && right.is_deterministic()
+			}
 		}
 	}
 
@@ -1043,7 +1056,8 @@ impl Expr {
 			| Self::Mul(_, _)
 			| Self::Div(_, _)
 			| Self::Like { .. }
-			| Self::Case { .. } => false,
+			| Self::Case { .. }
+			| Self::IsDistinctFrom { .. } => false,
 			Self::ScalarFunction { id, args, .. } => {
 				scalar_function_metadata(*id).pbc_pushdown_eligible
 					&& args.iter().all(Self::is_pbc_pushdown_eligible)

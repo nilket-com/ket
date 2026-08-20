@@ -5237,7 +5237,69 @@ fn bind_expr_into_program(
 			args,
 			parameter,
 		} => bind_scalar_function(builder, input_schema, ctx, *id, args, parameter),
+		Expr::IsDistinctFrom {
+			left,
+			right,
+			negated,
+		} => bind_is_distinct_from(builder, input_schema, ctx, left, right, *negated),
 	}
+}
+
+/// ADR 566: the null-safe comparison binds as a composition over operands
+/// bound exactly once. The equality node comes from `bind_comparison`, so
+/// coercion, nominal checks, and the dimensioned path are inherited rather
+/// than mirrored; the operand ids are read back from that node and shared by
+/// every reference — the program's memoized slots make sharing single
+/// evaluation by construction. Under Kleene booleans every conjunct is
+/// two-valued in every row, so the result is never NULL.
+fn bind_is_distinct_from(
+	builder: &mut BoundExprProgramBuilder,
+	input_schema: &SchemaRef,
+	ctx: &ExprBindContext<'_>,
+	left: &Expr,
+	right: &Expr,
+	negated: bool,
+) -> Result<BoundExprId, BindingError> {
+	let equality = bind_comparison(builder, input_schema, ctx, left, right, BoundBinaryOp::Eq)?;
+	let Some(BoundExprNode::Binary {
+		left: left_id,
+		right: right_id,
+		..
+	}) = builder.node(equality)
+	else {
+		return Err(BindingError::UnsupportedExpression {
+			message: "IS DISTINCT FROM equality bound to an unexpected node shape".to_string(),
+		});
+	};
+	let (left_id, right_id) = (*left_id, *right_id);
+	let left_null = builder.append_unary(BoundUnaryOp::IsNull, left_id, DataType::Boolean);
+	let right_null = builder.append_unary(BoundUnaryOp::IsNull, right_id, DataType::Boolean);
+	let both_null =
+		builder.append_binary(BoundBinaryOp::And, left_null, right_null, DataType::Boolean);
+	let left_present = builder.append_unary(BoundUnaryOp::IsNotNull, left_id, DataType::Boolean);
+	let right_present = builder.append_unary(BoundUnaryOp::IsNotNull, right_id, DataType::Boolean);
+	let both_present = builder.append_binary(
+		BoundBinaryOp::And,
+		left_present,
+		right_present,
+		DataType::Boolean,
+	);
+	let present_and_equal = builder.append_binary(
+		BoundBinaryOp::And,
+		both_present,
+		equality,
+		DataType::Boolean,
+	);
+	let not_distinct = builder.append_binary(
+		BoundBinaryOp::Or,
+		both_null,
+		present_and_equal,
+		DataType::Boolean,
+	);
+	if negated {
+		return Ok(not_distinct);
+	}
+	Ok(builder.append_unary(BoundUnaryOp::Not, not_distinct, DataType::Boolean))
 }
 
 fn bind_case(

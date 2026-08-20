@@ -1741,6 +1741,26 @@ impl RuneExpr {
 		}
 	}
 
+	pub fn is_distinct(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::IsDistinctFrom {
+				left: Box::new(self.expr),
+				right: Box::new(other.expr),
+				negated: false,
+			},
+		}
+	}
+
+	pub fn is_not_distinct(self, other: RuneExpr) -> RuneExpr {
+		RuneExpr {
+			expr: Expr::IsDistinctFrom {
+				left: Box::new(self.expr),
+				right: Box::new(other.expr),
+				negated: true,
+			},
+		}
+	}
+
 	#[allow(clippy::should_implement_trait)]
 	pub fn add(self, other: RuneExpr) -> RuneExpr {
 		RuneExpr {
@@ -2185,6 +2205,8 @@ pub fn create_toron_module() -> Result<Module, rune::compile::ContextError> {
 	m.associated_function("logical_not", RuneExpr::logical_not)?;
 	m.associated_function("is_null", RuneExpr::is_null)?;
 	m.associated_function("is_not_null", RuneExpr::is_not_null)?;
+	m.associated_function("is_distinct", RuneExpr::is_distinct)?;
+	m.associated_function("is_not_distinct", RuneExpr::is_not_distinct)?;
 	m.associated_function("add", RuneExpr::add)?;
 	m.associated_function("sub", RuneExpr::sub)?;
 	m.associated_function("mul", RuneExpr::mul)?;

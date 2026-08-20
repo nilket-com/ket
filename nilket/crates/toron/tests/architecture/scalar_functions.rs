@@ -37,6 +37,9 @@ const NON_SCALAR_EXPR_VARIANTS: &[&str] = &[
 	"Case",
 	"IsNull",
 	"IsNotNull",
+	// ADR 566: a predicate operator like Eq or IsNull — grammar, not a
+	// name-resolved scalar call, so it is not a registry candidate.
+	"IsDistinctFrom",
 ];
 
 fn source(relative: &str) -> String {
