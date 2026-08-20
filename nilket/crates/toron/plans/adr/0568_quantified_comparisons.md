@@ -69,9 +69,15 @@ refusal only through its own decision.
 - `x = ANY (S)` returns exactly `x IN (S)`'s rows on the same data; the
   `SOME` spelling matches the `ANY` spelling; `x <> ALL (S)` matches
   `NOT IN`, including the poisoned case where S contains NULL.
-- Every ordering form's table corners, uncorrelated: empty → FALSE/TRUE by
-  quantifier; hit; miss with and without NULLs in S; NULL probe → NULL row,
-  projected so NULL and FALSE are distinguishable.
+- Every ordering form's table corners, uncorrelated, observed through kept
+  row-sets with hand-computed expectations. The predicate exists only in
+  WHERE-conjunct position (the EXISTS/IN precedent), where FALSE and NULL
+  both drop — so the discriminating controls are the branches where the
+  three-valued table changes the *kept* set: a NULL-bearing set must block
+  ALL's TRUE rows but not ANY's; the empty-set answer must outrank the NULL
+  probe (`x > ALL (empty)` keeps rows whose probe is NULL). Direct
+  projection of the predicate, which would make UNKNOWN visible as a NULL
+  cell, is deferred with expression-position subqueries.
 - A correlated ordering form with per-key variance returns hand-computed
   per-row results, where key blending would return different rows — the gate
   probe generalized.

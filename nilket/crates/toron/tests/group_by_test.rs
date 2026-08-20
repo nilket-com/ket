@@ -10141,3 +10141,182 @@ async fn adr567_translate_using_form_stays_rejected() {
 		"TRANSLATE ... USING must not plan, got {result:?}"
 	);
 }
+
+#[tokio::test]
+async fn adr568_gate_multiple_correlated_scalars_compose_with_keys_preserved() {
+	// The ADR 568 feasibility gate: the quantified-comparison desugar needs
+	// two or three correlated scalar aggregates in ONE predicate, each keyed
+	// on its own correlation. East and west have different MINs, so a
+	// key-blending defect computes the global MIN 7.5 and wrongly admits ids
+	// 1 and 2; the empty group behind the NULL-region row proves COUNT's
+	// empty-group coalesce composes too. Only id 4 survives by hand.
+	let rows = run_logical(&plan_sql(
+		"SELECT o.id FROM sales o \
+		 WHERE (SELECT COUNT(l.amount) FROM sales l WHERE l.region = o.region) > 0 \
+		 AND o.price > (SELECT MIN(l.price) FROM sales l WHERE l.region = o.region)",
+	))
+	.await;
+	let ids = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("id output");
+	let kept: Vec<i64> = (0..ids.len()).map(|row| ids.value(row)).collect();
+	assert_eq!(kept, vec![4], "keyed composition of two correlated scalars");
+}
+
+fn kept_ids(rows: &[RecordBatch]) -> Vec<i64> {
+	let ids = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("id output");
+	let mut kept: Vec<i64> = (0..ids.len()).map(|row| ids.value(row)).collect();
+	kept.sort_unstable();
+	kept
+}
+
+#[tokio::test]
+async fn adr568_equality_quantifiers_are_membership_and_some_is_any() {
+	// amount = [10, 20, NULL, 30, NULL, 7]; the subquery's open rows carry
+	// {10, 20, 30, 7} plus a NULL. `= ANY`, `= SOME`, and `IN` must keep one
+	// row-set; `<> ALL` and `NOT IN` must both go empty on the poisoned set.
+	let membership = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount IN \
+			 (SELECT l.amount FROM sales l WHERE l.status = 'open')",
+		))
+		.await,
+	);
+	assert_eq!(membership, vec![1, 2, 4, 6]);
+	for spelling in ["ANY", "SOME"] {
+		let quantified = kept_ids(
+			&run_logical(&plan_sql(&format!(
+				"SELECT o.id FROM sales o WHERE o.amount = {spelling} \
+				 (SELECT l.amount FROM sales l WHERE l.status = 'open')"
+			)))
+			.await,
+		);
+		assert_eq!(quantified, membership, "= {spelling} must be membership");
+	}
+	let excluded = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount <> ALL \
+			 (SELECT l.amount FROM sales l WHERE l.status = 'open')",
+		))
+		.await,
+	);
+	assert_eq!(
+		excluded,
+		Vec::<i64>::new(),
+		"a NULL in the set poisons <> ALL exactly as NOT IN"
+	);
+}
+
+#[tokio::test]
+async fn adr568_ordering_any_finds_witnesses_through_nulls() {
+	// West amounts are {20, NULL}, reached through a derived table whose
+	// computed column keeps the region filter out of the mock scan's dropped
+	// pushdown. A witness decides ANY regardless of the
+	// NULL: rows with amount >= 20 pass, everything else — misses and NULL
+	// probes alike — drops. An over-conservative table (nulls blocking TRUE)
+	// would keep nothing.
+	let kept = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount >= ANY \
+			 (SELECT w.amount FROM (SELECT CONCAT(l.region, '') AS r, l.amount AS amount FROM sales l) w WHERE w.r = 'west')",
+		))
+		.await,
+	);
+	assert_eq!(kept, vec![2, 4]);
+
+	let strict = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount < ANY \
+			 (SELECT w.amount FROM (SELECT CONCAT(l.region, '') AS r, l.amount AS amount FROM sales l) w WHERE w.r = 'west')",
+		))
+		.await,
+	);
+	assert_eq!(strict, vec![1, 6], "witness is the MAX for < ANY");
+}
+
+#[tokio::test]
+async fn adr568_ordering_all_nulls_block_true_and_empty_is_vacuous() {
+	// West amounts are {20, NULL}: the NULL means no row can prove ALL, so
+	// even amounts <= 20 drop — the branch where the three-valued table
+	// changes the kept set versus a null-ignoring reduction, which would keep
+	// ids 1, 2, and 6.
+	let blocked = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount <= ALL \
+			 (SELECT w.amount FROM (SELECT CONCAT(l.region, '') AS r, l.amount AS amount FROM sales l) w WHERE w.r = 'west')",
+		))
+		.await,
+	);
+	assert_eq!(blocked, Vec::<i64>::new(), "a NULL value blocks every ALL");
+
+	let no_nulls = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount <= ALL \
+			 (SELECT w.amount FROM (SELECT CONCAT(l.region, '') AS r, l.amount AS amount FROM sales l) w WHERE w.r = 'west' AND w.amount IS NOT NULL)",
+		))
+		.await,
+	);
+	assert_eq!(
+		no_nulls,
+		vec![1, 2, 6],
+		"without the NULL the same rows pass"
+	);
+
+	// ALL over an empty set is vacuously TRUE for every probe, NULL included:
+	// the empty branch outranks the NULL-probe branch.
+	let vacuous = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount > ALL \
+			 (SELECT l.amount FROM empty_sales l)",
+		))
+		.await,
+	);
+	assert_eq!(vacuous, vec![1, 2, 3, 4, 5, 6]);
+	let never = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount > ANY \
+			 (SELECT l.amount FROM empty_sales l)",
+		))
+		.await,
+	);
+	assert_eq!(never, Vec::<i64>::new(), "ANY over an empty set is FALSE");
+}
+
+#[tokio::test]
+async fn adr568_correlated_ordering_preserves_keys() {
+	// Per-region MIN(price): east 10.5, west 20.5; the NULL-region row's
+	// group is empty. Only id 4 beats its own region's minimum. Key blending
+	// would compute the global minimum 7.5 and also keep ids 1 and 2.
+	let kept = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.price > ANY \
+			 (SELECT l.price FROM sales l WHERE l.region = o.region)",
+		))
+		.await,
+	);
+	assert_eq!(kept, vec![4]);
+}
+
+#[tokio::test]
+async fn adr568_refused_spellings_get_directives() {
+	let eq_all = SqlPlanner::new()
+		.plan("SELECT o.id FROM sales o WHERE o.amount = ALL (SELECT l.amount FROM sales l)")
+		.expect_err("= ALL is refused");
+	assert!(
+		eq_all.to_string().contains("write x IN (subquery)"),
+		"got {eq_all}"
+	);
+	let neq_any = SqlPlanner::new()
+		.plan("SELECT o.id FROM sales o WHERE o.amount <> ANY (SELECT l.amount FROM sales l)")
+		.expect_err("<> ANY is refused");
+	assert!(
+		neq_any.to_string().contains("x NOT IN (subquery)"),
+		"got {neq_any}"
+	);
+}
