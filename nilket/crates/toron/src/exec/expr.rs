@@ -214,7 +214,7 @@ impl Executor {
 					.ok_or_else(|| ExecutionError::InvalidExpression {
 						message: "AND right operand must be boolean".to_string(),
 					})?;
-				let res = and(l_bool, r_bool)?;
+				let res = and_kleene(l_bool, r_bool)?;
 				Ok(Arc::new(res))
 			}
 			Expr::Or(left, right) => {
@@ -232,7 +232,7 @@ impl Executor {
 					.ok_or_else(|| ExecutionError::InvalidExpression {
 						message: "OR right operand must be boolean".to_string(),
 					})?;
-				let res = or(l_bool, r_bool)?;
+				let res = or_kleene(l_bool, r_bool)?;
 				Ok(Arc::new(res))
 			}
 			Expr::Not(inner) => {
@@ -635,12 +635,12 @@ fn evaluate_bound_binary(
 		BoundBinaryOp::And => {
 			let left_bool = as_boolean(left_arr, "AND left operand")?;
 			let right_bool = as_boolean(right_arr, "AND right operand")?;
-			Ok(Arc::new(and(left_bool, right_bool)?))
+			Ok(Arc::new(and_kleene(left_bool, right_bool)?))
 		}
 		BoundBinaryOp::Or => {
 			let left_bool = as_boolean(left_arr, "OR left operand")?;
 			let right_bool = as_boolean(right_arr, "OR right operand")?;
-			Ok(Arc::new(or(left_bool, right_bool)?))
+			Ok(Arc::new(or_kleene(left_bool, right_bool)?))
 		}
 	}
 }

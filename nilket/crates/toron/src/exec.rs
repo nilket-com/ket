@@ -31,7 +31,7 @@ use arrow::array::{
 	TimestampMillisecondBuilder, TimestampNanosecondArray, TimestampNanosecondBuilder, UInt8Array,
 	UInt16Array, UInt32Array, UInt64Array,
 };
-use arrow::compute::kernels::boolean::{and, is_not_null, is_null, not, or, or_kleene};
+use arrow::compute::kernels::boolean::{and_kleene, is_not_null, is_null, not, or_kleene};
 use arrow::compute::kernels::cmp::{eq, gt, gt_eq, lt, lt_eq, neq};
 use arrow::compute::kernels::comparison::{
 	ilike as arrow_ilike, like as arrow_like, nilike as arrow_nilike, nlike as arrow_nlike,

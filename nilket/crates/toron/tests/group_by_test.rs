@@ -9840,3 +9840,68 @@ async fn adr564_admission_rejects_synthesized_and_undeclared_pairs() {
 		"the precision rejection must direct to the supported spelling, got {message}"
 	);
 }
+
+#[tokio::test]
+async fn boolean_or_keeps_a_true_row_whose_other_disjunct_is_null() {
+	// Row id 5 is status 'open' with a NULL amount: TRUE OR NULL is TRUE under
+	// the standard's three-valued logic (the ADR 0002 contract), so the row
+	// must survive the filter even though one disjunct is unknown. The
+	// predicate references a computed column so it stays in a Filter node
+	// rather than vanishing into the mock scan's dropped pushdown.
+	let rows = run_logical(&plan_sql(
+		"SELECT id FROM (SELECT id, status, amount + 0 AS amt FROM sales) shifted \
+		 WHERE status = 'open' OR amt > 5 ORDER BY id",
+	))
+	.await;
+	let ids = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("id output");
+	let kept: Vec<i64> = (0..ids.len()).map(|row| ids.value(row)).collect();
+	assert_eq!(
+		kept,
+		vec![1, 2, 4, 5, 6],
+		"TRUE OR NULL must keep the row; NULL-dropping loses id 5"
+	);
+}
+
+#[tokio::test]
+async fn boolean_and_or_projections_follow_kleene_three_valued_logic() {
+	// Projected booleans expose the full truth table WHERE masks hide:
+	// FALSE AND NULL is FALSE, TRUE OR NULL is TRUE, and only the genuinely
+	// unknown combinations stay NULL.
+	let rows = run_logical(&plan_sql(
+		"SELECT id, status = 'closed' AND amount > 5, status = 'open' OR amount > 5, \
+		 status = 'open' AND amount > 5 FROM sales ORDER BY id",
+	))
+	.await;
+	let false_and_null = rows[0]
+		.column(1)
+		.as_any()
+		.downcast_ref::<arrow::array::BooleanArray>()
+		.expect("AND output");
+	let true_or_null = rows[0]
+		.column(2)
+		.as_any()
+		.downcast_ref::<arrow::array::BooleanArray>()
+		.expect("OR output");
+	let true_and_null = rows[0]
+		.column(3)
+		.as_any()
+		.downcast_ref::<arrow::array::BooleanArray>()
+		.expect("unknown AND output");
+	// Row id 5: status 'open', amount NULL.
+	assert!(
+		!false_and_null.is_null(4) && !false_and_null.value(4),
+		"FALSE AND NULL must be FALSE, not NULL"
+	);
+	assert!(
+		!true_or_null.is_null(4) && true_or_null.value(4),
+		"TRUE OR NULL must be TRUE, not NULL"
+	);
+	assert!(
+		true_and_null.is_null(4),
+		"TRUE AND NULL is genuinely unknown and stays NULL"
+	);
+}
