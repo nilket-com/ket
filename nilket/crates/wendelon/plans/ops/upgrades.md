@@ -124,6 +124,57 @@ Every rolling-upgrade PR that changes local persistent state must include:
 - an explicit statement of whether the change is additive or cleanup-only
 - recovery tests proving replay-forward works when redb is missing or stale
 - an update to `plans/ops/durability.md` if the recovery budget changes
+- if the change bumps `SNAPSHOT_FORMAT_VERSION` or `WAL_FORMAT_VERSION`, a
+  heads-up to everyone running a local deployment, sent with the section 10
+  procedure — their next reinstall will fail to boot, and a break discovered by
+  a broken service reads as a fault in whatever else shipped that day
 
 This is the operator contract behind ADR 017's "stable across one rolling
 upgrade" acceptance bar.
+
+## 10. State-Machine Format Breaks
+
+This axis does **not** follow the read-the-previous-release rule of section 8.
+`SNAPSHOT_FORMAT_VERSION` and `WAL_FORMAT_VERSION` govern the shape of the
+serialized state machine, and ADR 0085 rules that a shape change is a version
+bump with **no migration**. A build refuses older durable state by design.
+
+### Local development profiles
+
+A profile written before the bump will not boot. Recover it by resetting:
+
+1. **Copy out anything you need first.** The reset deletes the whole `data/`
+   tree, including `data/wendelon/audit.ndjson`. There is no undo and no
+   partial reset.
+2. Stop the service, reset the profile, start it again:
+
+```
+systemctl --user stop nilket-local.service
+nilket local --reset --data-dir <profile>
+systemctl --user start nilket-local.service
+```
+
+`--reset` is the supported path and is guarded: it refuses `/`, `$HOME`, an
+unmarked profile, and a symlinked tree. Never hand-delete the profile
+directory.
+
+The boot failure reads as a snapshot decode error naming the writing format
+version. That is the intended refusal, not data loss and not a fault in
+whatever feature happened to ship alongside the bump — the artifact is intact
+and its digest matches; this build simply cannot interpret an older shape.
+
+### Why a new field breaks an old profile
+
+Postcard is not self-describing. `#[serde(default)]` does not rescue a decode
+that runs out of bytes, so a field appended to durable state has no bytes at
+all in an artifact written before it. Every new durable field is therefore a
+break for every existing profile, which is precisely why the version bump is
+mandatory rather than advisory.
+
+### Clusters
+
+This section covers the local-profile case, which is the one exercised. A
+snapshot-format break on a live multi-node cluster is **not** a rolling upgrade
+and is not covered here or by ADR 0085's acceptance; it needs its own decision
+before anyone attempts one. The related WAL-body exposure is recorded in
+`plans/wip/wal_body_shape_across_format_versions.md`.
