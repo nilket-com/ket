@@ -432,6 +432,16 @@ implementation may finish, and a defect in shipped typography remains a defect.
 3. Query cancellation (the scoped half of DB-01).
 4. CSV import and export.
 
+**Fourth-arc annotation — 2026-08-19.** The arc split on examination. CSV
+**export** is selected and specified by PRODUCT-0136 as a Rune-authored,
+Arrow-canonical surface over named results; delivery is contingent on that
+record's implementation plan completing. CSV **import** is **held**: it is
+CSV-to-Toron materialization (PRODUCT-0002 §3's verb, with §4's birth
+certificate), and it waits for a Toron Arrow-IPC ingest contract — a TORON
+record — before any Polariton record can consume it. Neither a Polars CSV
+source adapter nor an interim literal-`INSERT` loader may be offered in the
+meantime; both are rejected in PRODUCT-0136.
+
 **Held:** the catalog/schema browser (dropped outright — it serves the SQL-IDE
 lane the product is not competing in), result-grid polish, export hardening, and
 PRODUCT-0133 stages 3–4. No further interaction implementation accrues until
