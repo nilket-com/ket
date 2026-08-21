@@ -170,14 +170,47 @@ rows**. That is the product-wide ceiling today, not a plotting concern:
 The scatter thresholds remain unmeasured and untuned. Rendering has still
 never been reached at any threshold cardinality.
 
+## Second rerun — after WENDELON-0088 (response batching)
+
+0088 batched Wendelon table-query responses; the db-team handoff set the
+criterion: if the full path rose toward ~4,500 rows/s, per-frame daemon
+overhead was the material cost. Measured on binary `b1602ac5…` (from
+`cb0037e9`), same machine and data directory, load average 1.57:
+
+| rows | pre-0088 | post-0088 | post rate |
+|---|---|---|---|
+| 2,000 | 4.38 s | 8.77 / 8.66 s | ~230 rows/s |
+| 5,000 | 10.77 s | 17.69 s | ~283 rows/s |
+| 13,000 | 27.50 s | 27.02 s | ~481 rows/s |
+
+**Decisive negative result: response framing is not the dominant cost.** At
+the largest size measured the path runs at 481 rows/s against 461 before.
+
+Two further observations, both handed to the db team:
+
+- **Small results roughly doubled** while large ones did not move. The cost
+  shape changed from flat per-row to a large fixed component plus per-row,
+  consistent with a batch-accumulation threshold or timer. Until that is
+  explained, no benchmark on this path is stable — the baseline moved for
+  unstated reasons.
+- **Large-size numbers are ±30%**: 13,000 rows measured 27.02 s on the plain
+  control and 35.19 s on the materialized table in one session. The
+  2,000-row point is the reliable regression detector for now.
+
+The ceiling is therefore ~29,000 rows at the 60 s statement timeout, and a
+50,000-point read still cannot complete. Thresholds remain unmeasured and
+untuned.
+
 ## Recommended next steps
 
 1. ~~**db team:** configure QUIC liveness~~ — **done**, TORON-0577.
 2. ~~**db team:** establish the scan control~~ — **done here**: general, not
    materialization-specific, and not CLI formatting. Three controls agree.
-3. **db team:** general scan throughput is the remaining investigation, and
-   it is a larger one than this slice. ~460 rows/s bounds every query in the
-   product to ~27,000 rows at the current statement timeout.
+3. ~~**db team:** general scan throughput~~ — narrowed further: **not
+   response framing** (WENDELON-0088, decisive negative). Remaining direction
+   is profiling the Wendelon table-query path — per-location materialization
+   and PBC — plus a separate explanation of the post-0088 small-result fixed
+   latency before any benchmark on this path is treated as stable.
 4. **viz team:** rerun `live_scatter_threshold_evidence` once reads clear
    50,000 rows in reasonable time, and only then record threshold verdicts.
 5. **Do not tune the scatter thresholds** until step 4 produces numbers.
