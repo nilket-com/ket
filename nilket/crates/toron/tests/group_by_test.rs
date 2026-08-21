@@ -11672,3 +11672,138 @@ async fn adr0576_group_by_and_having_still_refuse_for_their_own_reasons() {
 		"HAVING names its own position: {having}"
 	);
 }
+
+#[tokio::test]
+async fn adr0578_keyless_count_over_a_range_returns_its_cardinality() {
+	// The direct regression: a global COUNT(*) prunes the range to zero value
+	// columns, which used to reach an `expect` and panic the executor.
+	for (count, expected) in [(4_i64, 4_i64), (0, 0)] {
+		let plan = rune_plan(&format!(
+			"pub fn main(ctx) {{ ctx.range({count}).aggregate([], [count_all()]) }}"
+		))
+		.await;
+		let rows = run_logical(&plan).await;
+		assert_eq!(
+			rows.iter().map(RecordBatch::num_rows).sum::<usize>(),
+			1,
+			"a global aggregate returns exactly one row for range({count})"
+		);
+		let counted = rows[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("count output");
+		assert_eq!(
+			counted.value(0),
+			expected,
+			"range({count}) must count its rows"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr0578_the_pruned_range_keeps_no_ordinal_column() {
+	// The success above must come from cardinality-preserving pruning, not
+	// from a retained ordinal the aggregate happened to ignore.
+	let plan = rune_plan("pub fn main(ctx) { ctx.range(4).aggregate([], [count_all()]) }").await;
+	let bound = bind(&plan, &fixture().0, &PlannerConfig::default())
+		.await
+		.expect("bind");
+	// The bound plan's debug rendering names the Range's schema; an empty
+	// field list is what pruning must have produced.
+	let rendered = format!("{bound:?}");
+	let range_at = rendered
+		.find("Range {")
+		.expect("the plan still has a Range source");
+	let range_text = &rendered[range_at..];
+	assert!(
+		range_text.contains("fields: []"),
+		"a keyless COUNT(*) prunes every value column: {}",
+		&range_text[..range_text.len().min(240)]
+	);
+}
+
+#[tokio::test]
+async fn adr0578_a_value_consumer_still_receives_the_ordinals() {
+	// The other shape must be untouched: ADR 569's witnesses are the control.
+	let rows = run_logical(
+		&rune_plan(
+			r#"pub fn main(ctx) { ctx.range(2).project_named([seeded_random(lit_i64(42), col("ordinal")).named("v")]) }"#,
+		)
+		.await,
+	)
+	.await;
+	let values = rows[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<Float64Array>()
+		.expect("seeded output");
+	assert_eq!(values.value(0), 0.593_422_410_984_530_3, "witness (42, 0)");
+	assert_eq!(values.value(1), 0.562_874_068_100_840_06, "witness (42, 1)");
+}
+
+#[tokio::test]
+async fn adr0578_a_wire_shaped_range_refuses_at_the_executor() {
+	// ADR 578's wire-safety boundary, exercised where it actually applies: a
+	// plan that never passed the binder, run through the executor. The unit
+	// control on the synthesis helper cannot show this, because reaching that
+	// helper is the thing in question — and the defect being repaired was a
+	// panic inside the executor, not a bad return value from a helper.
+	for (label, fields) in [
+		(
+			"a foreign column",
+			vec![Field::new("not_ordinal", DataType::Utf8, true)],
+		),
+		(
+			"a wrongly typed ordinal",
+			vec![Field::new("ordinal", DataType::Int32, false)],
+		),
+		(
+			"a nullable ordinal",
+			vec![Field::new("ordinal", DataType::Int64, true)],
+		),
+		(
+			"an extra column beside the ordinal",
+			vec![
+				Field::new("ordinal", DataType::Int64, false),
+				Field::new("extra", DataType::Int64, false),
+			],
+		),
+	] {
+		let (_, storage) = fixture();
+		let plan = ExecutionPlan::Range {
+			count: 4,
+			schema: Arc::new(Schema::new(fields)),
+		};
+		let error = Executor::new(storage)
+			.execute_bound(&plan, None)
+			.await
+			.expect_err(&format!("{label} must refuse, not panic"));
+		match error {
+			ExecutionError::InvalidExpression { message } => assert!(
+				message.contains("canonical") && message.contains("no columns"),
+				"{label}: the refusal names both admitted shapes, got {message:?}"
+			),
+			other => panic!("{label}: expected a typed invalid expression, got {other:?}"),
+		}
+	}
+
+	// The admitted shapes still execute through the same entry point, so the
+	// refusals above are about the schema and not about this path.
+	for (label, schema, expected_rows) in [
+		("canonical", toron::ir::range_relation_schema(), 4),
+		("pruned", Arc::new(Schema::empty()) as SchemaRef, 4),
+	] {
+		let (_, storage) = fixture();
+		let plan = ExecutionPlan::Range { count: 4, schema };
+		let batches = Executor::new(storage)
+			.execute_bound(&plan, None)
+			.await
+			.unwrap_or_else(|error| panic!("{label} range must execute: {error:?}"));
+		assert_eq!(
+			batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+			expected_rows,
+			"{label} range keeps its cardinality"
+		);
+	}
+}

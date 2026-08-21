@@ -2113,10 +2113,11 @@ fn fresh_dir(tag: &str) -> PathBuf {
 #[ignore = "real-time: deliberately exceeds 30s and 60s boundaries"]
 async fn adr0577_live_long_queries_reach_their_statement_deadline() {
 	// The generated range is a Rune verb (ADR 569) with no SQL spelling, and
-	// Rune is the frontend the reported failure used. Counting the projected
-	// column rather than `count_all()`: a keyless COUNT(*) prunes the range to
-	// zero columns, which the range executor panics on today — a separate
-	// ADR 569 defect reported alongside this cut.
+	// Rune is the frontend the reported failure used. The projected
+	// `seeded_random` is what makes the query slow enough to cross the
+	// boundaries under test — ADR 578 removed the reason to avoid
+	// `count_all()`, but a bare count would prune to cardinality and finish
+	// far too fast to exercise anything here.
 	const PAST_30S: &str = r#"pub fn main(ctx) { ctx.range(120000000).project_named([seeded_random(lit_i64(1), col("ordinal")).named("r")]).aggregate([], [count(col("r"))]) }"#;
 	const PAST_60S: &str = r#"pub fn main(ctx) { ctx.range(240000000).project_named([seeded_random(lit_i64(1), col("ordinal")).named("r")]).aggregate([], [count(col("r"))]) }"#;
 

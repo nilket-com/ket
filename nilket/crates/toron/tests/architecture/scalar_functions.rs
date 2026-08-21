@@ -369,3 +369,53 @@ pub(crate) fn adr570_similar_to_matcher_is_non_backtracking_and_capped() {
 		"every state allocation must check the cap"
 	);
 }
+
+#[test]
+pub(crate) fn adr0578_the_range_source_owns_exactly_two_physical_shapes() {
+	let scan_open =
+		std::fs::read_to_string(manifest_dir().join("src/exec/scan_open.rs")).expect("read scan");
+
+	// Two shapes, named, and a typed refusal for anything else. The panic this
+	// record repaired was an `expect` on a schema mismatch, so the absence of
+	// that spelling in the synthesis path is the load-bearing check.
+	// "Exactly two" has to be counted, not sampled: checking that the two known
+	// variants appear would pass a third one added later, which is precisely
+	// the drift this guard exists to catch.
+	let shapes = scan_open
+		.split_once("enum RangeShape {")
+		.and_then(|(_, tail)| tail.split_once("\n}"))
+		.map(|(block, _)| block)
+		.expect("RangeShape block");
+	let variants: Vec<&str> = shapes
+		.lines()
+		.map(str::trim)
+		.filter(|line| !line.is_empty() && !line.starts_with("//") && !line.starts_with("///"))
+		.collect();
+	assert_eq!(
+		variants,
+		vec!["Ordinals,", "CardinalityOnly,"],
+		"a physical range has exactly two shapes, in this order"
+	);
+	let synthesis = scan_open
+		.split("pub(super) fn synthesize_range_batches")
+		.nth(1)
+		.and_then(|tail| tail.split("\n#[cfg(test)]").next())
+		.expect("range synthesis body");
+	assert!(
+		!synthesis.contains(".expect("),
+		"a schema mismatch must be a typed error, never a panic in the executor"
+	);
+	assert!(
+		synthesis.contains("with_row_count(Some("),
+		"a zero-field batch must state its row count; nothing else can carry it"
+	);
+
+	// It stays a closed generated source: no projection list, and cardinality
+	// comes from `count` rather than from whatever column survived pruning.
+	for forbidden in ["projection", "projected_columns", "num_rows()"] {
+		assert!(
+			!synthesis.contains(forbidden),
+			"the range source must not become a general scan: {forbidden}"
+		);
+	}
+}

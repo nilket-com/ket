@@ -303,11 +303,123 @@ mod tests {
 	}
 }
 
-/// Synthesizes the range relation's batches: `count` non-null `Int64`
-/// ordinals in `[0, count)`, split at the standard batch width. The
-/// cardinality cap is re-enforced here — a plan can arrive over the wire
-/// without ever passing the binder, and this source materializes, so an
-/// unbounded count is an unbounded memory commitment.
+#[cfg(test)]
+mod range_shape_tests {
+	use super::*;
+	use arrow::datatypes::{DataType, Field, Schema};
+
+	fn canonical() -> arrow::datatypes::SchemaRef {
+		crate::ir::range_relation_schema()
+	}
+
+	fn pruned() -> arrow::datatypes::SchemaRef {
+		std::sync::Arc::new(Schema::empty())
+	}
+
+	#[test]
+	fn adr0578_pruned_batches_carry_their_rows_across_the_batch_boundary() {
+		// 8,192 is the batch width, so 20,000 rows is three batches with a
+		// short tail — the case where a row count inferred from arrays (there
+		// are none) would silently read as zero.
+		let batches = synthesize_range_batches(20_000, &pruned()).expect("pruned range");
+		assert_eq!(batches.len(), 3, "20,000 rows split at 8,192");
+		assert_eq!(
+			batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+			20_000,
+			"the rows survive having no columns"
+		);
+		for batch in &batches {
+			assert_eq!(batch.num_columns(), 0, "a pruned range carries no values");
+		}
+	}
+
+	#[test]
+	fn adr0578_the_canonical_shape_still_emits_ordinals() {
+		let batches = synthesize_range_batches(3, &canonical()).expect("canonical range");
+		let ordinals = batches[0]
+			.column(0)
+			.as_any()
+			.downcast_ref::<arrow::array::Int64Array>()
+			.expect("ordinal column");
+		assert_eq!(ordinals.values(), &[0, 1, 2]);
+	}
+
+	#[test]
+	fn adr0578_an_unbound_malformed_schema_is_refused_by_name() {
+		// A plan can arrive over the wire without binding, so execution
+		// validates. Before this cut the mismatch reached an `expect` and
+		// panicked the worker; it must be a typed error naming both shapes.
+		let malformed: arrow::datatypes::SchemaRef =
+			std::sync::Arc::new(Schema::new(vec![Field::new(
+				"not_ordinal",
+				DataType::Utf8,
+				true,
+			)]));
+		let error = synthesize_range_batches(4, &malformed)
+			.expect_err("a non-canonical, non-empty range schema must refuse");
+		let ExecutionError::InvalidExpression { message } = error else {
+			panic!("the refusal must be typed, not a generic failure");
+		};
+		assert!(
+			message.contains("canonical") && message.contains("no columns"),
+			"the refusal names both admitted shapes: {message}"
+		);
+
+		// A wrongly-typed or nullable ordinal is equally unadmitted — the
+		// column name alone must not be enough to pass.
+		for field in [
+			Field::new("ordinal", DataType::Int32, false),
+			Field::new("ordinal", DataType::Int64, true),
+		] {
+			let near_miss: arrow::datatypes::SchemaRef =
+				std::sync::Arc::new(Schema::new(vec![field]));
+			assert!(
+				matches!(
+					synthesize_range_batches(4, &near_miss),
+					Err(ExecutionError::InvalidExpression { .. })
+				),
+				"a near-miss ordinal must refuse rather than be treated as canonical"
+			);
+		}
+	}
+}
+
+/// ADR 578: the two schemas a physical range may carry. A consumer that reads
+/// the ordinal gets the canonical column; a consumer that reads only
+/// cardinality — a keyless `COUNT(*)`, whose required-column pruning removes
+/// every value — gets no columns and keeps its rows.
+enum RangeShape {
+	/// The canonical non-null `Int64` `ordinal` column.
+	Ordinals,
+	/// Pruned to zero value columns; the rows still exist.
+	CardinalityOnly,
+}
+
+fn range_shape(schema: &arrow::datatypes::SchemaRef) -> Result<RangeShape, ExecutionError> {
+	if schema.fields().is_empty() {
+		return Ok(RangeShape::CardinalityOnly);
+	}
+	if schema.fields() == crate::ir::range_relation_schema().fields() {
+		return Ok(RangeShape::Ordinals);
+	}
+	// A bound plan only ever carries the two shapes above. One that does not
+	// arrived without binding, so it is refused by name rather than being
+	// forced into an ordinal column it never described.
+	Err(ExecutionError::InvalidExpression {
+		message: format!(
+			"range source requires either the canonical non-null Int64 `ordinal` column or no \
+			 columns after pruning; got {:?}",
+			schema.fields()
+		),
+	})
+}
+
+/// Synthesizes the range relation's batches: `count` rows in `[0, count)`,
+/// split at the standard batch width. Rows carry the ordinal when a consumer
+/// needs the value, and carry only their count when pruning proved none does
+/// (ADR 578). The cardinality cap is re-enforced here — a plan can arrive over
+/// the wire without ever passing the binder, and this source materializes, so
+/// an unbounded count is an unbounded memory commitment.
 pub(super) fn synthesize_range_batches(
 	count: i64,
 	schema: &arrow::datatypes::SchemaRef,
@@ -321,6 +433,7 @@ pub(super) fn synthesize_range_batches(
 			),
 		});
 	}
+	let shape = range_shape(schema)?;
 	if count <= 0 {
 		return Ok(vec![RecordBatch::new_empty(schema.clone())]);
 	}
@@ -329,11 +442,28 @@ pub(super) fn synthesize_range_batches(
 	let mut start = 0_i64;
 	while start < count {
 		let end = (start + RANGE_BATCH_ROWS).min(count);
-		let ordinals = arrow::array::Int64Array::from_iter_values(start..end);
-		batches.push(
-			RecordBatch::try_new(schema.clone(), vec![std::sync::Arc::new(ordinals)])
-				.expect("range schema is the one ordinal column"),
-		);
+		let batch = match shape {
+			RangeShape::Ordinals => {
+				let ordinals = arrow::array::Int64Array::from_iter_values(start..end);
+				RecordBatch::try_new(schema.clone(), vec![std::sync::Arc::new(ordinals)]).map_err(
+					|error| ExecutionError::InvalidExpression {
+						message: format!("range batch does not match its schema: {error}"),
+					},
+				)?
+			}
+			// A zero-field batch needs its row count stated: with no array to
+			// infer it from, Arrow would otherwise call this batch empty.
+			RangeShape::CardinalityOnly => RecordBatch::try_new_with_options(
+				schema.clone(),
+				Vec::new(),
+				&arrow::record_batch::RecordBatchOptions::new()
+					.with_row_count(Some((end - start) as usize)),
+			)
+			.map_err(|error| ExecutionError::InvalidExpression {
+				message: format!("range cardinality batch is malformed: {error}"),
+			})?,
+		};
+		batches.push(batch);
 		start = end;
 	}
 	Ok(batches)
