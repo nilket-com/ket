@@ -1838,6 +1838,27 @@ mod tests {
 		);
 	}
 
+	/// Offline proof that the evidence exhibit's exact materialize source
+	/// routes through the terminal `ket` branch. Spelled as the engine spells
+	/// it — `project_named([... .named("x")])` — so a spelling error surfaces
+	/// here rather than against a live daemon.
+	#[test]
+	fn product_0137_evidence_exhibit_source_routes_as_a_terminal_relation() {
+		let source = concat!(
+			"ket.range(50000).project_named([",
+			"seeded_random(lit_i64(20260821), col(\"ordinal\")).named(\"x\"), ",
+			"seeded_random(lit_i64(20260822), col(\"ordinal\")).named(\"y\")",
+			"]).materialize(\"evidence_scatter_50000\")"
+		);
+		let compiled = compile(source).expect("evidence materialize source compiles");
+		assert_eq!(compiled.executions.len(), 1);
+		assert!(compiled.executions[0].views.is_empty());
+		assert!(
+			compiled.executions[0].source.contains("materialize"),
+			"the relation program reaches Toron verbatim"
+		);
+	}
+
 	#[test]
 	fn product_0076_rewriter_injects_nested_constructor_and_modifier_origins() {
 		let source = "bar(\"x\", \"y\").stacked().percent()";

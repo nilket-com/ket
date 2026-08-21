@@ -405,6 +405,140 @@ mod tests {
 		}
 	}
 
+	/// PRODUCT-0137 evidence slice: one real workflow end to end, timed.
+	///
+	/// Generates a reproducible relation, materializes it, reopens it through
+	/// the ordinary `ket.table(...)` view path, and renders a scatter — the
+	/// first exercise of the fifth arc's whole chain in one process, and the
+	/// first measurement behind `ResolvedPlotSettings`' scatter thresholds
+	/// (50k vector / 200k downsample / 1M raster), which have never had a
+	/// benchmark harness.
+	///
+	/// Run with a live local workspace:
+	///   cargo test -p polariton --bin polariton \
+	///     live_scatter_threshold_evidence -- --ignored --nocapture
+	#[tokio::test]
+	#[ignore = "requires a live local Toron workspace"]
+	async fn live_scatter_threshold_evidence() {
+		use std::time::Instant;
+
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+
+		// Just below, at, and above each scatter boundary.
+		const CARDINALITIES: &[i64] = &[49_999, 50_000, 199_999, 200_000, 999_999, 1_000_000];
+		const SEED: i64 = 20260821;
+
+		println!("\ncardinality,materialize_ms,transfer_prepare_ms,first_render_ms,steady_render_ms,rows");
+		for &n in CARDINALITIES {
+			let table = format!("evidence_scatter_{n}");
+			let _ = adapter
+				.dispatch(&format!("DROP TABLE IF EXISTS {table}"))
+				.await;
+
+			// Stage 1 — generation and materialization, routed through the
+			// production compiler so this exercises PRODUCT-0137's terminal
+			// `ket` route rather than hand-feeding the adapter.
+			let materialize_source = format!(
+				"ket.range({n}).project_named([\
+				 seeded_random(lit_i64({SEED}), col(\"ordinal\")).named(\"x\"), \
+				 seeded_random(lit_i64({}), col(\"ordinal\")).named(\"y\")\
+				 ]).materialize(\"{table}\")",
+				SEED + 1
+			);
+			let materialize_view = transform_rune_view(&materialize_source)
+				.expect("terminal ket relation compiles")
+				.into_relations()
+				.next()
+				.expect("one relation");
+			assert!(
+				materialize_view.views.is_empty(),
+				"a materialize carries no presentation slots"
+			);
+			let started = Instant::now();
+			let outcome = adapter
+				.dispatch_rune(&materialize_view.source)
+				.await
+				.expect("materialize succeeds");
+			let materialize_ms = started.elapsed().as_secs_f64() * 1000.0;
+			let crate::adapters::common::RuneDispatchSuccess::Materialized(receipt) = outcome else {
+				panic!("materialize must report a receipt, not a relation");
+			};
+			assert_eq!(receipt.rows_written, n as u64);
+			assert_eq!(receipt.certificate_format_version, 1);
+
+			// Stage 2 — reopen through the ordinary view path, transfer and
+			// prepare the plot. This is the round trip a user actually takes.
+			let view_source = format!(
+				"ket.table(\"{table}\").views([scatter(\"x\", \"y\")])"
+			);
+			let view = transform_rune_view(&view_source)
+				.expect("view envelope")
+				.into_relations()
+				.next()
+				.expect("one relation");
+			let started = Instant::now();
+			let artifact = adapter
+				.dispatch_rune(&view.source)
+				.await
+				.expect("relation reopens")
+				.expect_relation();
+			let frame = artifact.projection().expect("projection");
+			let projected = frame.select(["x", "y"]).expect("project plot fields");
+			let kernel = create_authored_plot(
+				AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x".to_owned(), "y".to_owned()),
+				&projected,
+				1200,
+				720,
+			)
+			.expect("scatter kernel");
+			let transfer_prepare_ms = started.elapsed().as_secs_f64() * 1000.0;
+			assert_eq!(frame.height(), n as usize);
+
+			let widget = PlotWidget {
+				kernel: kernel.as_ref(),
+				title: format!("{n} points"),
+				padding: 0.0,
+				settings: ResolvedPlotSettings::default(),
+				settings_model: crate::plot::theme::PlotSettings::default(),
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: PlotRenderLayer::Full,
+			};
+			let bounds = Rectangle::new([0.0, 0.0].into(), [1200.0, 720.0].into());
+
+			// Stage 3 — first render, then steady state. Separate backends so
+			// no accumulated buffer flatters the second measurement.
+			let started = Instant::now();
+			let mut backend = SvgBackend::new(1200.0, 720.0);
+			widget.render(&mut backend, bounds);
+			let first_render_ms = started.elapsed().as_secs_f64() * 1000.0;
+			assert!(backend.finish().contains("<path") || n == 0);
+
+			let mut steady = Vec::new();
+			for _ in 0..5 {
+				let started = Instant::now();
+				let mut backend = SvgBackend::new(1200.0, 720.0);
+				widget.render(&mut backend, bounds);
+				steady.push(started.elapsed().as_secs_f64() * 1000.0);
+				let _ = backend.finish();
+			}
+			steady.sort_by(|a, b| a.partial_cmp(b).expect("finite timings"));
+			let steady_render_ms = steady[steady.len() / 2];
+
+			println!(
+				"{n},{materialize_ms:.1},{transfer_prepare_ms:.1},{first_render_ms:.1},{steady_render_ms:.1},{}",
+				receipt.rows_written
+			);
+
+			let _ = adapter
+				.dispatch(&format!("DROP TABLE IF EXISTS {table}"))
+				.await;
+		}
+	}
+
 	#[tokio::test]
 	#[ignore = "requires the PRODUCT-0103 pie_probe relation on a live local Toron"]
 	async fn live_product_0103_aggregate_and_raw_handles_remain_distinct() {
