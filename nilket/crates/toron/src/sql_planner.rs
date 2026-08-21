@@ -3355,6 +3355,7 @@ impl SqlPlanner {
 			aggregate_output_catalog.as_ref(),
 			order_by.as_ref(),
 			limit_clause.as_ref(),
+			&scope,
 		)
 	}
 
@@ -3536,6 +3537,7 @@ impl SqlPlanner {
 		aggregate_output_catalog: Option<&AggregateOutputCatalog>,
 		order_by: Option<&OrderBy>,
 		limit_clause: Option<&LimitClause>,
+		cte: &CteScope,
 	) -> Result<LogicalPlan, FrontendError> {
 		let limit_offset = lower_limit_clause(limit_clause)?;
 		if order_by.is_none() && limit_offset.offset.is_some() {
@@ -3545,13 +3547,80 @@ impl SqlPlanner {
 		}
 
 		if let Some(order_by) = order_by {
-			let order_by = self.lower_order_by(order_by, aggregate_output_catalog)?;
-			let (sort_input, order_by, final_projection) =
-				if aggregate_output_catalog.is_some() && sort_needs_hidden_projection(&order_by) {
-					add_hidden_sort_projection(plan, order_by, aggregate_output_catalog)?
-				} else {
-					(plan, order_by, None)
-				};
+			// ADR 576: a sort key may carry a subquery. Its subplan joins here,
+			// after the projection, so the visible output names are captured
+			// first — `visible_output_names` cannot see through the join that
+			// is about to be added, and those names are what the sort must
+			// restore.
+			let visible_before_join = visible_output_names(&plan, aggregate_output_catalog);
+			let mut collected = Vec::new();
+			let outer_qualifiers = plan_qualifiers(&plan);
+			let pulled_order_by =
+				self.pull_up_order_by_subqueries(order_by, &mut collected, &outer_qualifiers, cte)?;
+			let pulled_aliases: HashSet<String> = collected
+				.iter()
+				.filter_map(PulledScalar::alias_name)
+				.collect();
+			let pulled_subplans = !collected.is_empty();
+			// ADR 576: a sort-key subplan joins after the projection, so every
+			// outer column it reads must have survived into the output — the
+			// probe embedded in the sort key, and the correlation keys carried
+			// on the join. Both are checked with the same exhaustive traversal
+			// the computed-aggregate sort uses, under this record's diagnostic:
+			// a partial walker would let an unhandled expression shape through
+			// to fail in the binder instead.
+			let sort_subquery_refs: Vec<Expr> = collected
+				.iter()
+				.flat_map(PulledScalar::outer_key_exprs)
+				.collect();
+			let plan = if pulled_subplans {
+				self.join_scalar_subplans(plan, collected)?
+			} else {
+				plan
+			};
+			let order_by = self.lower_order_by(&pulled_order_by, aggregate_output_catalog)?;
+			if pulled_subplans {
+				let visible: HashSet<String> = visible_before_join
+					.clone()
+					.ok_or_else(|| {
+						unsupported("ORDER BY subquery is not supported for this plan shape")
+					})?
+					.into_iter()
+					.collect();
+				for key in &order_by {
+					validate_hidden_sort_key_refs(
+						&key.expr,
+						&visible,
+						&pulled_aliases,
+						SortRefContext::Subquery,
+					)?;
+				}
+				for outer in &sort_subquery_refs {
+					validate_hidden_sort_key_refs(
+						outer,
+						&visible,
+						&pulled_aliases,
+						SortRefContext::Subquery,
+					)?;
+				}
+			}
+			// A pulled subplan adds columns the SELECT list does not name, so
+			// the hidden-sort projection is what keeps them out of the output.
+			// It is the same mechanism the computed-aggregate sort uses; this
+			// position only widens when it fires.
+			let needs_hidden = pulled_subplans
+				|| (aggregate_output_catalog.is_some() && sort_needs_hidden_projection(&order_by));
+			let (sort_input, order_by, final_projection) = if needs_hidden {
+				add_hidden_sort_projection(
+					plan,
+					order_by,
+					aggregate_output_catalog,
+					visible_before_join,
+					&pulled_aliases,
+				)?
+			} else {
+				(plan, order_by, None)
+			};
 			let limit = limit_offset
 				.limit
 				.map(parse_non_negative_usize_literal)
@@ -4571,6 +4640,44 @@ impl SqlPlanner {
 		}
 	}
 
+	/// ADR 576: rewrite a sort key's subqueries into references to pulled-up
+	/// subplans. A sort key needs a value per row and must not change
+	/// cardinality, which is the projection's contract — so this runs the
+	/// projection traversal rather than a sort-specific one, and the admitted
+	/// forms are exactly the projection's.
+	fn pull_up_order_by_subqueries(
+		&self,
+		order_by: &OrderBy,
+		collected: &mut Vec<PulledScalar>,
+		outer_qualifiers: &[TableRef],
+		cte: &CteScope,
+	) -> Result<OrderBy, FrontendError> {
+		let OrderByKind::Expressions(exprs) = &order_by.kind else {
+			return Ok(order_by.clone());
+		};
+		if !exprs.iter().any(|expr| expr_contains_subquery(&expr.expr)) {
+			return Ok(order_by.clone());
+		}
+		let mut rewritten = Vec::with_capacity(exprs.len());
+		for entry in exprs {
+			rewritten.push(OrderByExpr {
+				expr: self.pull_up_scalar_subqueries(
+					SubqueryPosition::Projection,
+					&entry.expr,
+					collected,
+					outer_qualifiers,
+					cte,
+				)?,
+				options: entry.options.clone(),
+				with_fill: entry.with_fill.clone(),
+			});
+		}
+		Ok(OrderBy {
+			kind: OrderByKind::Expressions(rewritten),
+			interpolate: order_by.interpolate.clone(),
+		})
+	}
+
 	fn lower_order_by(
 		&self,
 		order_by: &OrderBy,
@@ -5467,6 +5574,7 @@ impl SqlPlanner {
 			aggregate_output_catalog.as_ref(),
 			subquery.order_by.as_ref(),
 			subquery.limit_clause.as_ref(),
+			cte,
 		)?;
 		alias_plan(plan, Some(alias))
 	}
@@ -8381,41 +8489,96 @@ fn derive_join_exchange_keys(
 fn sort_needs_hidden_projection(order_by: &[SortExpr]) -> bool {
 	order_by
 		.iter()
-		.any(|key| !sort_key_is_direct_output_reference(&key.expr))
+		.any(|key| !sort_key_is_direct_output_reference(&key.expr, &HashSet::new()))
 }
 
-fn sort_key_is_direct_output_reference(expr: &Expr) -> bool {
+fn sort_key_is_direct_output_reference(expr: &Expr, pulled_aliases: &HashSet<String>) -> bool {
+	// ADR 576: a key referencing a pulled sort subplan is not a reference to
+	// output — that column exists only in the join beneath the sort, so it has
+	// to travel through the hidden projection like any computed key.
+	if expr_references_pulled_alias(expr, pulled_aliases) {
+		return false;
+	}
 	matches!(expr, Expr::Column(_) | Expr::Literal(_) | Expr::UntypedNull)
 		|| matches!(
 			expr,
 			Expr::LogicalAscription { expr, .. }
 				| Expr::SqlLogicalCast { expr, .. }
 				| Expr::SqlConvert { expr, .. }
-				if sort_key_is_direct_output_reference(expr)
+				if sort_key_is_direct_output_reference(expr, pulled_aliases)
 		)
+}
+
+/// ADR 576: does this sort key read a column from a subplan pulled up for the
+/// sort? Those qualifiers are the aliases `join_scalar_subplans` introduced.
+fn expr_references_pulled_alias(expr: &Expr, pulled_aliases: &HashSet<String>) -> bool {
+	if pulled_aliases.is_empty() {
+		return false;
+	}
+	// Only the shapes `sort_key_is_direct_output_reference` can accept need
+	// checking; anything deeper is already not a direct reference.
+	match expr {
+		Expr::Column(column) => column
+			.qualifier
+			.as_ref()
+			.is_some_and(|qualifier| pulled_aliases.contains(&qualifier.table)),
+		Expr::LogicalAscription { expr, .. }
+		| Expr::SqlLogicalCast { expr, .. }
+		| Expr::SqlConvert { expr, .. } => expr_references_pulled_alias(expr, pulled_aliases),
+		_ => false,
+	}
+}
+
+/// Which rule a sort key is being checked against, and therefore what a
+/// violation should say. ADR 576 shares one exhaustive traversal between the
+/// computed-aggregate sort and the sort subquery; only the diagnostic differs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SortRefContext {
+	ComputedAggregate,
+	Subquery,
 }
 
 fn validate_hidden_sort_key_refs(
 	expr: &Expr,
 	visible_names: &HashSet<String>,
+	pulled_aliases: &HashSet<String>,
+	context: SortRefContext,
 ) -> Result<(), FrontendError> {
 	match expr {
 		Expr::Column(column) => {
+			if column
+				.qualifier
+				.as_ref()
+				.is_some_and(|qualifier| pulled_aliases.contains(&qualifier.table))
+			{
+				return Ok(());
+			}
 			if !visible_names.contains(&column.name.0) {
-				return Err(unsupported(
-					"ORDER BY computed aggregate expression must reference visible output columns",
-				));
+				return Err(unsupported(match context {
+					SortRefContext::ComputedAggregate => {
+						"ORDER BY computed aggregate expression must reference visible output \
+						 columns"
+							.to_string()
+					}
+					SortRefContext::Subquery => format!(
+						"ORDER BY subquery references {}, which this query does not select; add \
+						 it to the SELECT list to sort by a subquery that reads it",
+						column.name.0
+					),
+				}));
 			}
 			Ok(())
 		}
 		Expr::Literal(_) | Expr::UntypedNull => Ok(()),
 		Expr::LogicalAscription { expr: inner, .. } => {
-			validate_hidden_sort_key_refs(inner, visible_names)
+			validate_hidden_sort_key_refs(inner, visible_names, pulled_aliases, context)
 		}
 		Expr::SqlLogicalCast { expr: inner, .. }
 		| Expr::SqlConvert { expr: inner, .. }
 		| Expr::Cast(inner, _)
-		| Expr::TryCast(inner, _) => validate_hidden_sort_key_refs(inner, visible_names),
+		| Expr::TryCast(inner, _) => {
+			validate_hidden_sort_key_refs(inner, visible_names, pulled_aliases, context)
+		}
 		Expr::Add(left, right)
 		| Expr::Sub(left, right)
 		| Expr::Mul(left, right)
@@ -8428,18 +8591,20 @@ fn validate_hidden_sort_key_refs(
 		| Expr::Gte(left, right)
 		| Expr::And(left, right)
 		| Expr::Or(left, right) => {
-			validate_hidden_sort_key_refs(left, visible_names)?;
-			validate_hidden_sort_key_refs(right, visible_names)
+			validate_hidden_sort_key_refs(left, visible_names, pulled_aliases, context)?;
+			validate_hidden_sort_key_refs(right, visible_names, pulled_aliases, context)
 		}
 		Expr::Not(inner)
 		| Expr::IsNull(inner)
 		| Expr::IsNotNull(inner)
 		| Expr::Like { expr: inner, .. }
-		| Expr::SimilarTo { expr: inner, .. } => validate_hidden_sort_key_refs(inner, visible_names),
+		| Expr::SimilarTo { expr: inner, .. } => {
+			validate_hidden_sort_key_refs(inner, visible_names, pulled_aliases, context)
+		}
 		Expr::InList { expr, list, .. } => {
-			validate_hidden_sort_key_refs(expr, visible_names)?;
+			validate_hidden_sort_key_refs(expr, visible_names, pulled_aliases, context)?;
 			for item in list {
-				validate_hidden_sort_key_refs(item, visible_names)?;
+				validate_hidden_sort_key_refs(item, visible_names, pulled_aliases, context)?;
 			}
 			Ok(())
 		}
@@ -8448,23 +8613,23 @@ fn validate_hidden_sort_key_refs(
 			else_expr,
 		} => {
 			for (condition, result) in when_then {
-				validate_hidden_sort_key_refs(condition, visible_names)?;
-				validate_hidden_sort_key_refs(result, visible_names)?;
+				validate_hidden_sort_key_refs(condition, visible_names, pulled_aliases, context)?;
+				validate_hidden_sort_key_refs(result, visible_names, pulled_aliases, context)?;
 			}
 			if let Some(else_expr) = else_expr {
-				validate_hidden_sort_key_refs(else_expr, visible_names)?;
+				validate_hidden_sort_key_refs(else_expr, visible_names, pulled_aliases, context)?;
 			}
 			Ok(())
 		}
 		Expr::ScalarFunction { args, .. } => {
 			for arg in args {
-				validate_hidden_sort_key_refs(arg, visible_names)?;
+				validate_hidden_sort_key_refs(arg, visible_names, pulled_aliases, context)?;
 			}
 			Ok(())
 		}
 		Expr::IsDistinctFrom { left, right, .. } => {
-			validate_hidden_sort_key_refs(left, visible_names)?;
-			validate_hidden_sort_key_refs(right, visible_names)
+			validate_hidden_sort_key_refs(left, visible_names, pulled_aliases, context)?;
+			validate_hidden_sort_key_refs(right, visible_names, pulled_aliases, context)
 		}
 	}
 }
@@ -8473,10 +8638,19 @@ fn add_hidden_sort_projection(
 	plan: LogicalPlan,
 	order_by: Vec<SortExpr>,
 	catalog: Option<&AggregateOutputCatalog>,
+	// ADR 576: the names to restore, when the caller knows them and the plan no
+	// longer does — a sort-key subplan joins beneath this point, and the join's
+	// columns must not become visible output.
+	visible_override: Option<Vec<String>>,
+	pulled_aliases: &HashSet<String>,
 ) -> Result<(LogicalPlan, Vec<SortExpr>, Option<FinalProjection>), FrontendError> {
-	let output_names = visible_output_names(&plan, catalog).ok_or_else(|| {
-		unsupported("ORDER BY computed aggregate expression is not supported for this plan shape")
-	})?;
+	let output_names = visible_override
+		.or_else(|| visible_output_names(&plan, catalog))
+		.ok_or_else(|| {
+			unsupported(
+				"ORDER BY computed aggregate expression is not supported for this plan shape",
+			)
+		})?;
 	if has_duplicate_names(&output_names) {
 		return Err(unsupported(
 			"ORDER BY computed aggregate expression requires unique output names",
@@ -8498,12 +8672,17 @@ fn add_hidden_sort_projection(
 	let mut rewritten_order_by = Vec::with_capacity(order_by.len());
 
 	for (idx, key) in order_by.into_iter().enumerate() {
-		if sort_key_is_direct_output_reference(&key.expr) {
+		if sort_key_is_direct_output_reference(&key.expr, pulled_aliases) {
 			rewritten_order_by.push(key);
 			continue;
 		}
 
-		validate_hidden_sort_key_refs(&key.expr, &visible_names)?;
+		validate_hidden_sort_key_refs(
+			&key.expr,
+			&visible_names,
+			pulled_aliases,
+			SortRefContext::ComputedAggregate,
+		)?;
 		let hidden_name = unique_hidden_sort_name(idx, &mut used_names);
 		projected_exprs.push(key.expr);
 		projected_output_names.push(Some(hidden_name.clone()));
@@ -11544,6 +11723,34 @@ impl PulledScalar {
 	/// so their per-key demand means the surviving rows.
 	fn assembles_after_filter(&self) -> bool {
 		matches!(self, Self::ValueScalar { .. })
+	}
+
+	/// ADR 576: the outer expressions this subplan joins on — correlation keys
+	/// and, for membership, the probe. Returned whole so the exhaustive sort-key
+	/// validator inspects them, rather than being flattened to names here by a
+	/// walker that would have to know every expression shape.
+	fn outer_key_exprs(&self) -> Vec<Expr> {
+		let pairs = match self {
+			Self::Resolved { on, .. } => on.as_slice(),
+			Self::ValueScalar {
+				correlation_pairs, ..
+			} => correlation_pairs.as_slice(),
+			Self::Deferred { .. } => &[],
+		};
+		pairs.iter().map(|(outer, _)| outer.clone()).collect()
+	}
+
+	/// ADR 576: the alias this subplan will be joined under, so a sort key
+	/// reading its columns can be recognized as pulled rather than as output.
+	fn alias_name(&self) -> Option<String> {
+		match self {
+			Self::Resolved { plan, .. } => match plan {
+				LogicalPlan::Alias { alias, .. } => Some(alias.table.clone()),
+				_ => None,
+			},
+			Self::ValueScalar { alias, .. } => Some(alias.clone()),
+			Self::Deferred { alias, .. } => Some(alias.clone()),
+		}
 	}
 }
 

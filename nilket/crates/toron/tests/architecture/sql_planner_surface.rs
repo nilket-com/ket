@@ -433,7 +433,7 @@ pub(crate) fn adr025_order_by_cast_uses_hidden_sort_projection() {
 		.next()
 		.expect("sort_needs_hidden_projection body")
 		.1;
-	assert!(hidden_gate.contains("!sort_key_is_direct_output_reference(&key.expr)"));
+	assert!(hidden_gate.contains("!sort_key_is_direct_output_reference(&key.expr,"));
 
 	let validator = brace_blocks_after_marker(&planner, "fn validate_hidden_sort_key_refs")
 		.into_iter()
@@ -943,7 +943,7 @@ pub(crate) fn adr026_try_cast_order_by_uses_hidden_sort_projection() {
 		.next()
 		.expect("sort_needs_hidden_projection body")
 		.1;
-	assert!(sort_gate.contains("!sort_key_is_direct_output_reference(&key.expr)"));
+	assert!(sort_gate.contains("!sort_key_is_direct_output_reference(&key.expr,"));
 
 	let validator = brace_blocks_after_marker(&planner, "fn validate_hidden_sort_key_refs")
 		.into_iter()
@@ -965,7 +965,7 @@ pub(crate) fn adr027_hidden_sort_projection_gate_is_generalized() {
 		.next()
 		.expect("sort_needs_hidden_projection body")
 		.1;
-	assert!(gate.contains("!sort_key_is_direct_output_reference(&key.expr)"));
+	assert!(gate.contains("!sort_key_is_direct_output_reference(&key.expr,"));
 	assert!(!gate.contains("expr_contains_cast_family"));
 	assert!(!planner.contains("fn expr_contains_cast_family"));
 }
@@ -982,11 +982,11 @@ pub(crate) fn adr027_hidden_sort_key_refs_are_visible_outputs() {
 		.1;
 
 	assert!(validator.contains("visible_names.contains(&column.name.0)"));
-	assert!(
-		validator.contains(
-			"ORDER BY computed aggregate expression must reference visible output columns"
-		)
-	);
+	// ADR 576 gave this validator a diagnostic mode, so the aggregate message
+	// is now one arm of a match and rustfmt wraps it. The claim is unchanged:
+	// the aggregate context still reports the visible-output rule.
+	assert!(validator.contains("ORDER BY computed aggregate expression must reference visible"));
+	assert!(validator.contains("SortRefContext::ComputedAggregate"));
 	assert!(validator.contains("Expr::Literal(_) | Expr::UntypedNull => Ok(())"));
 	assert!(validator.contains("Expr::SqlLogicalCast { expr: inner, .. }"));
 	assert!(validator.contains("| Expr::Cast(inner, _)"));

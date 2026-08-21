@@ -60,7 +60,37 @@ away. This record reuses that machinery rather than adding a second way to
 hide a sort column. Output schema is unchanged by the presence of a subquery
 in `ORDER BY`, and that is asserted rather than assumed.
 
-### 3. One evaluation per subquery, and the alias case says so
+### 3. A sort key's outer references must survive the projection
+
+Discovered while implementing, and stated here because it narrows what §1
+admits. The subplan joins *after* the projection, so any outer column the sort
+key reads — a correlation key, or a membership probe — has to still exist at
+that point. `SELECT id FROM sales o ORDER BY EXISTS (… WHERE r.region =
+o.region)` cannot work: `o.region` is gone by then.
+
+This is not a new rule. `validate_hidden_sort_key_refs` already requires a
+computed aggregate sort key to reference visible output columns, and this is
+the same constraint reaching the same conclusion for the same reason. What
+this record adds is the diagnostic: the same traversal, under a sort-subquery
+mode that names the column and says to select it, instead of the aggregate
+message about "computed aggregate expression" — which is true of neither the
+query nor the author's intent.
+
+**The check is that traversal, not a walker of its own.** An outer reference
+reaches the sort in two different ways: correlation keys ride the join's `on`
+pairs, while a membership or quantified *probe* is embedded in the rewritten
+sort key. A purpose-built walker has to enumerate expression shapes to find
+either, and will silently miss the ones it does not know — a probe wrapped in
+a scalar function, for instance, which then fails in the binder after passing
+the gate. Running the existing exhaustive traversal over both the lowered sort
+key and the join's outer expressions covers every shape by construction.
+
+Lifting the restriction means pulling sort-key subqueries up *before* the
+projection, alongside the projection's own. That is a larger change to the
+select pipeline than this record's scope, and it is deferred rather than
+half-done.
+
+### 4. One evaluation per subquery, and the alias case says so
 
 `SELECT x IN (…) AS m FROM t ORDER BY m` already works — the sort references
 the projected output column, and nothing new is pulled up. `ORDER BY x IN (…)`
@@ -81,8 +111,13 @@ a correctness question.
   same columns as the identical query without the `ORDER BY` subquery. A
   leaked hidden column fails here.
 - `ORDER BY <alias>` over a projected subquery still resolves to the projected
-  column and pulls nothing up — asserted structurally, since the alternative
-  silently doubles the work.
+  column and pulls nothing up — asserted structurally by counting pulled
+  subplans, since the alternative silently doubles the work.
+- A sort key whose subquery reads an outer column the SELECT list drops refuses
+  in the planner, naming that column and the remedy. The control asserts the
+  directive rather than the failure, because the pre-existing behavior was a
+  bind-time error about internal state and passing that off as a refusal would
+  be the defect this item exists to prevent.
 - `GROUP BY` and `HAVING` subqueries still refuse, each naming its own reason
   rather than a generic position message: computed group keys for the former,
   the correlated-decorrelation gap for the latter.
@@ -95,6 +130,12 @@ the projection's — no `ORDER BY`-only truth table, value form, or refusal
 text.
 
 ## Risks and deferrals
+
+A membership probe that is itself computed — `LOWER(col) IN (subquery)` —
+still refuses, and not for a visibility reason: it needs a computed join key,
+which this engine supports in no position. The predicate form fails the same
+way, and a control asserts that equivalence so the limitation is not misread
+as an `ORDER BY` gap.
 
 `GROUP BY` subqueries are deferred behind computed group keys, which is their
 actual blocker and its own record. `HAVING` subqueries are deferred to a

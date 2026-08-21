@@ -422,3 +422,59 @@ pub(crate) fn adr0575_one_truth_table_per_family_and_no_new_join_kind() {
 		"the projected forms are pulled up, not lowered in place"
 	);
 }
+
+#[test]
+pub(crate) fn adr0576_sort_position_reuses_the_projection_and_one_hidden_mechanism() {
+	let planner = source("src/sql_planner.rs");
+
+	// The sort position runs the projection traversal — it does not get its own
+	// position variant, its own truth table, or its own value form.
+	let pull_up = planner
+		.split("fn pull_up_order_by_subqueries")
+		.nth(1)
+		.and_then(|tail| tail.split("\n\tfn ").next())
+		.expect("ORDER BY pull-up");
+	assert!(
+		pull_up.contains("SubqueryPosition::Projection"),
+		"a sort key is a value per row, so it takes the projection's admitted forms"
+	);
+	for forbidden in ["truth_table", "JoinKind::", "AggregateFunction::"] {
+		assert!(
+			!pull_up.contains(forbidden),
+			"the sort position must not restate lowering machinery: {forbidden}"
+		);
+	}
+	assert!(
+		!planner.contains("enum SubqueryPosition {\n\t/// A value is required for every outer row.\n\tProjection,\n\t/// A row filter is required; `EXISTS` keeps its semi-join lowering.\n\tPredicate,\n\tSort,"),
+		"ORDER BY reuses Projection rather than adding a third position"
+	);
+
+	// One hidden-column mechanism, shared with the computed-aggregate sort.
+	assert_eq!(
+		planner.matches("fn add_hidden_sort_projection").count(),
+		1,
+		"there must be exactly one hidden-sort projection builder"
+	);
+	assert_eq!(
+		planner.matches("add_hidden_sort_projection(").count(),
+		2,
+		"its definition plus the single sort-tail call site"
+	);
+	// A dropped outer reference refuses in the planner, and the check is the
+	// exhaustive traversal under this record's diagnostic — not a second,
+	// hand-written walker that would have to enumerate expression shapes.
+	assert!(
+		planner.contains("SortRefContext::Subquery"),
+		"the sort-subquery diagnostic must exist"
+	);
+	assert!(
+		!planner.contains("fn collect_column_names")
+			&& !planner.contains("fn outer_reference_names"),
+		"no partial outer-reference walker may return"
+	);
+	assert_eq!(
+		planner.matches("fn validate_hidden_sort_key_refs").count(),
+		1,
+		"one traversal validates both the aggregate sort and the sort subquery"
+	);
+}

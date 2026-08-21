@@ -11375,3 +11375,300 @@ async fn adr0575_equality_quantifier_mapping_mirrors_the_predicate_exactly() {
 		"the complement claim needs a decided row: {any_form:?}"
 	);
 }
+
+/// ADR 576: ids in the order the plan produced them, unsorted by the harness —
+/// the row order is what these controls are about.
+fn ordered_ids(rows: &[RecordBatch]) -> Vec<i64> {
+	let mut ids = Vec::new();
+	for batch in rows {
+		let column = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id output");
+		for row in 0..batch.num_rows() {
+			ids.push(column.value(row));
+		}
+	}
+	ids
+}
+
+#[tokio::test]
+async fn adr0576_sort_keys_agree_with_the_same_expression_projected() {
+	// EXISTS over regions: only id 6 (NULL region) is FALSE, so ascending puts
+	// it first. The projection of the same expression is the oracle.
+	let projected = exists_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, EXISTS (SELECT 1 FROM regions r WHERE r.region = o.region) \
+			 FROM sales o",
+		))
+		.await,
+	);
+	let false_ids: Vec<i64> = projected
+		.iter()
+		.filter(|(_, flag)| *flag == Some(false))
+		.map(|(id, _)| *id)
+		.collect();
+	assert_eq!(false_ids, vec![6], "the fixture must discriminate");
+
+	let sorted = ordered_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.region FROM sales o \
+			 ORDER BY EXISTS (SELECT 1 FROM regions r WHERE r.region = o.region), o.id",
+		))
+		.await,
+	);
+	assert_eq!(
+		sorted,
+		vec![6, 1, 2, 3, 4, 5],
+		"FALSE sorts before TRUE, and the position must agree with the projection"
+	);
+}
+
+#[tokio::test]
+async fn adr0576_three_valued_sort_key_places_its_unknowns() {
+	// amounts [10, 20, NULL, 30, NULL, 7] against the NULL-free set {1, 1}:
+	// every non-NULL probe is FALSE, ids 3 and 5 are UNKNOWN.
+	let query = |nulls: &str| {
+		format!(
+			"SELECT o.id, o.amount FROM sales o \
+			 ORDER BY o.amount IN (SELECT r.active FROM regions r) {nulls}, o.id"
+		)
+	};
+	let nulls_first = ordered_ids(&run_logical(&plan_sql(&query("NULLS FIRST"))).await);
+	let nulls_last = ordered_ids(&run_logical(&plan_sql(&query("NULLS LAST"))).await);
+
+	assert_eq!(
+		nulls_first,
+		vec![3, 5, 1, 2, 4, 6],
+		"UNKNOWN rows are placed first, not dropped"
+	);
+	assert_eq!(
+		nulls_last,
+		vec![1, 2, 4, 6, 3, 5],
+		"and last when asked, which is the same rows in a different place"
+	);
+}
+
+#[tokio::test]
+async fn adr0576_quantified_and_scalar_keys_sort_and_preserve_the_output() {
+	// A quantified key: `> ANY` is TRUE for anything above the minimum 7, NULL
+	// for the NULL probes, and FALSE for 7 itself against a NULL-bearing set —
+	// which ADR 575 already pins, so here the claim is only that sorting sees it.
+	let quantified = ordered_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount FROM sales o \
+			 ORDER BY o.amount > ANY (SELECT l.amount FROM sales l) NULLS LAST, o.id",
+		))
+		.await,
+	);
+	assert_eq!(quantified.len(), 6, "sorting never changes cardinality");
+	// Three rows are UNKNOWN, not two: ids 3 and 5 are NULL probes, and id 6
+	// (amount 7) has no value below it to witness `> ANY` while the set still
+	// carries NULLs — ADR 575's table, seen from the sort.
+	assert_eq!(
+		&quantified[3..],
+		&[3, 5, 6],
+		"the UNKNOWN rows land last under NULLS LAST"
+	);
+
+	// A scalar subquery key is constant across rows, so the tiebreak decides —
+	// the point being that it plans, runs, and leaves the output alone.
+	let rows = run_logical(&plan_sql(
+		"SELECT o.id FROM sales o ORDER BY (SELECT MAX(l.amount) FROM sales l), o.id",
+	))
+	.await;
+	assert_eq!(ordered_ids(&rows), vec![1, 2, 3, 4, 5, 6]);
+	let columns: Vec<String> = rows[0]
+		.schema()
+		.fields()
+		.iter()
+		.map(|field| field.name().clone())
+		.collect();
+	assert_eq!(
+		columns,
+		vec!["id".to_string()],
+		"the joined sort subplan must not leak a column into the output"
+	);
+}
+
+#[tokio::test]
+async fn adr0576_schema_and_cardinality_match_the_query_without_the_sort_subquery() {
+	let with_subquery = run_logical(&plan_sql(
+		"SELECT o.id, o.amount FROM sales o \
+		 ORDER BY o.amount IN (SELECT r.active FROM regions r), o.id",
+	))
+	.await;
+	let without = run_logical(&plan_sql(
+		"SELECT o.id, o.amount FROM sales o ORDER BY o.id",
+	))
+	.await;
+
+	let names = |rows: &[RecordBatch]| -> Vec<String> {
+		rows[0]
+			.schema()
+			.fields()
+			.iter()
+			.map(|field| field.name().clone())
+			.collect()
+	};
+	assert_eq!(names(&with_subquery), names(&without));
+	assert_eq!(
+		ordered_ids(&with_subquery).len(),
+		ordered_ids(&without).len()
+	);
+}
+
+#[tokio::test]
+async fn adr0576_alias_reference_pulls_nothing_up() {
+	// The subquery is already a projected column; sorting by its alias must
+	// reuse it rather than pull a second copy. Counting the pulled aliases is
+	// what distinguishes the two — the results would be identical either way.
+	let alias_plan = format!(
+		"{:?}",
+		plan_sql(
+			"SELECT o.id, o.amount IN (SELECT r.active FROM regions r) AS m FROM sales o \
+			 ORDER BY m, o.id"
+		)
+	);
+	// One membership pull-up produces `__member_0` and its null-presence
+	// partner. A second would be `__member_2`, so its absence is the claim.
+	assert!(
+		alias_plan.contains("__member_0"),
+		"the projected subquery is pulled up once"
+	);
+	assert!(
+		!alias_plan.contains("__member_2"),
+		"sorting by the alias must not pull a second copy of the subquery"
+	);
+
+	let rows = run_logical(&plan_sql(
+		"SELECT o.id, o.amount IN (SELECT r.active FROM regions r) AS m FROM sales o \
+		 ORDER BY m, o.id",
+	))
+	.await;
+	assert_eq!(ordered_ids(&rows).len(), 6);
+}
+
+#[tokio::test]
+async fn adr0576_dropped_outer_reference_refuses_in_the_planner() {
+	// The subplan joins after the projection, so an outer column the SELECT
+	// list drops is gone by then. Before this cut that surfaced from the binder
+	// as UnknownColumnInRelation — a message about internal state. It must
+	// refuse in the planner, naming the column and the remedy.
+	for (sql, column) in [
+		(
+			"SELECT o.id FROM sales o 			 ORDER BY EXISTS (SELECT 1 FROM regions r WHERE r.region = o.region)",
+			"region",
+		),
+		(
+			"SELECT o.id FROM sales o ORDER BY o.amount IN (SELECT r.active FROM regions r)",
+			"amount",
+		),
+		// A probe inside a scalar function: an expression shape a hand-written
+		// walker would have to enumerate, and the reason this gate runs the
+		// exhaustive traversal instead.
+		(
+			"SELECT o.id FROM sales o \
+			 ORDER BY LOWER(o.region) IN (SELECT r.region FROM regions r)",
+			"region",
+		),
+		// An ordering quantifier keeps its probe in the rewritten sort key
+		// rather than on the join, so only a check over the lowered key sees it.
+		(
+			"SELECT o.id FROM sales o \
+			 ORDER BY o.amount > ANY (SELECT l.amount FROM sales l)",
+			"amount",
+		),
+	] {
+		let error = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("a dropped outer reference must refuse");
+		let message = error.to_string();
+		assert!(
+			message.contains(column) && message.contains("add it to the SELECT list"),
+			"the refusal names the column and the remedy: {message}"
+		);
+		assert!(
+			!message.contains("UnknownColumnInRelation"),
+			"and it is a planner refusal, not a bind-time surprise: {message}"
+		);
+		assert!(
+			!message.contains("computed aggregate expression"),
+			"the sort-subquery diagnostic must not fall back to the aggregate one: {message}"
+		);
+	}
+
+	// The counterparts: selecting the column the subquery reads admits every
+	// one of those shapes, so the gate refuses a real restriction rather than
+	// the shape itself.
+	for sql in [
+		"SELECT o.id, o.region FROM sales o \
+		 ORDER BY EXISTS (SELECT 1 FROM regions r WHERE r.region = o.region), o.id",
+		"SELECT o.id, o.amount FROM sales o \
+		 ORDER BY o.amount IN (SELECT r.active FROM regions r), o.id",
+		"SELECT o.id, o.amount FROM sales o \
+		 ORDER BY o.amount > ANY (SELECT l.amount FROM sales l) NULLS LAST, o.id",
+	] {
+		let rows = run_logical(&plan_sql(sql)).await;
+		assert_eq!(
+			ordered_ids(&rows).len(),
+			6,
+			"selecting the referenced column admits the sort: {sql}"
+		);
+	}
+
+	// One shape stays refused even with its column selected, and not for a
+	// visibility reason: a computed membership probe needs a computed join key,
+	// which this engine does not support anywhere. Asserting that the predicate
+	// position fails identically is what keeps it from being misread as an
+	// ORDER BY gap.
+	let sort_form = bind(
+		&plan_sql(
+			"SELECT o.id, o.region FROM sales o \
+			 ORDER BY LOWER(o.region) IN (SELECT r.region FROM regions r), o.id",
+		),
+		&fixture().0,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("a computed membership probe cannot join");
+	let predicate_form = bind(
+		&plan_sql(
+			"SELECT o.id FROM sales o \
+			 WHERE LOWER(o.region) IN (SELECT r.region FROM regions r)",
+		),
+		&fixture().0,
+		&PlannerConfig::default(),
+	)
+	.await
+	.expect_err("and fails the same way as a predicate");
+	assert_eq!(
+		format!("{sort_form:?}"),
+		format!("{predicate_form:?}"),
+		"the computed-probe limitation is the engine's, not this position's"
+	);
+}
+
+#[tokio::test]
+async fn adr0576_group_by_and_having_still_refuse_for_their_own_reasons() {
+	// The two positions this record does not take, each naming its actual
+	// blocker rather than a generic positional message.
+	let group_by = SqlPlanner::new()
+		.plan("SELECT COUNT(*) FROM sales o GROUP BY EXISTS (SELECT 1 FROM regions r)")
+		.expect_err("GROUP BY subqueries await computed group keys");
+	assert!(
+		group_by.to_string().contains("simple column references"),
+		"GROUP BY refuses on expressions generally, not on subqueries: {group_by}"
+	);
+
+	let having = SqlPlanner::new()
+		.plan(
+			"SELECT o.region FROM sales o GROUP BY o.region 			 HAVING EXISTS (SELECT 1 FROM regions r WHERE r.region = o.region)",
+		)
+		.expect_err("HAVING subqueries await post-aggregation decorrelation");
+	assert!(
+		having.to_string().contains("HAVING"),
+		"HAVING names its own position: {having}"
+	);
+}
