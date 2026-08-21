@@ -443,6 +443,10 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// Plan filenames are zero-padded to four digits; this README documents a
 				// command whose argument is one of the renamed implementation docs.
 				"crates/toron/scripts/bench/README.md",
+				// ADR 577: the SQL QUIC liveness policy is transport configuration.
+				// It owns no binder surface; it exists because quinn's default
+				// idle timeout was silently capping statement execution.
+				"crates/toron/src/quic.rs",
 				// KET-0006 / ADR 572: the canonical-expression lowerer and its
 				// seed witnesses are the producer-side certificate boundary; it
 				// owns no binder decomposition surface.

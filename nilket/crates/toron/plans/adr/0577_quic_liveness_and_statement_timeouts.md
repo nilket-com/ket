@@ -46,7 +46,22 @@ chosen statement timeout exceeds the client's configured query timeout may
 still receive the client's explicit local timeout; it must not instead receive
 a transport-loss error.
 
-### 2. Every Toron SQL QUIC endpoint receives an explicit liveness policy
+### 2. Every Toron QUIC endpoint receives an explicit liveness policy
+
+**Scope, corrected during implementation.** This record was drafted as an SQL
+transport repair, but `QuicEndpoint`'s constructors are shared: `daemon.rs`
+binds the **worker task listener** (`ListenerRole::WorkerTask`) through the
+same `bind_authenticated` / `bind_loopback`, and `QuicTransport` builds the
+**worker client** through the same `client_*`. Any policy installed there
+necessarily covers both roles.
+
+That expansion is adopted deliberately rather than left implicit, because the
+exposure is the same in both: SQL ingress is silent while a query executes,
+and a worker link is silent while a worker runs a long fragment. Narrowing the
+code to SQL alone would have left the worker link on quinn's unchosen
+30-second deadline while this record claimed the problem was solved. The policy
+is therefore Toron's QUIC liveness policy, covering SQL ingress and internal
+worker links.
 
 Toron's loopback and authenticated server and client constructors, including
 the public `toron-client` constructors, install a `quinn::TransportConfig`.
@@ -100,9 +115,15 @@ collect-then-write behavior and makes the connection live underneath it.
 
 ## Guardrails
 
-The liveness policy applies to Toron SQL transport only. It does not silently
-alter Wendelon's independently owned QUIC policy. A later worker-transport
-record may decide whether its traffic has the same silent-execution exposure.
+The liveness policy applies to Toron's own QUIC endpoints — SQL ingress and
+the internal worker link, which share their constructors. It does not alter
+Wendelon's independently owned QUIC policy, and a guard asserts the policy
+module never reaches into it.
+
+The worker link is covered by decision rather than by accident: the guard
+enumerates the SQL listener, the worker listener, and the worker client
+separately, so a later narrowing of either role fails rather than silently
+reverting one of them to quinn's default.
 
 The timeout tests must observe the typed result at the public client boundary.
 A daemon-only test of its timeout branch is insufficient: the defect is that

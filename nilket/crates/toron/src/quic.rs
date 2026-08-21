@@ -30,7 +30,10 @@ impl QuicEndpoint {
 	}
 
 	pub fn bind_loopback(bind_addr: SocketAddr) -> std::io::Result<Self> {
-		let server_config = loopback_server_config()?;
+		let mut server_config = loopback_server_config()?;
+		// ADR 577: quinn's unconfigured 30s idle timeout would preempt every
+		// statement timeout, so every endpoint Toron owns installs the policy.
+		toron_client::apply_toron_quic_liveness_server(&mut server_config);
 		Ok(Self {
 			inner: quinn::Endpoint::server(server_config, bind_addr)?,
 		})
@@ -40,6 +43,10 @@ impl QuicEndpoint {
 		bind_addr: SocketAddr,
 		server_config: quinn::ServerConfig,
 	) -> std::io::Result<Self> {
+		// ADR 577: applied here rather than only where the config is built, so
+		// a caller-supplied configuration cannot bypass the policy.
+		let mut server_config = server_config;
+		toron_client::apply_toron_quic_liveness_server(&mut server_config);
 		Ok(Self {
 			inner: quinn::Endpoint::server(server_config, bind_addr)?,
 		})
@@ -52,13 +59,20 @@ impl QuicEndpoint {
 	pub fn client_loopback() -> std::io::Result<Self> {
 		let mut endpoint =
 			quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
-		endpoint.set_default_client_config(loopback_client_config()?);
+		let mut client_config = loopback_client_config()?;
+		// ADR 577: never inherit quinn's 30s idle default.
+		toron_client::apply_toron_quic_liveness_client(&mut client_config);
+		endpoint.set_default_client_config(client_config);
 		Ok(Self { inner: endpoint })
 	}
 
 	pub fn client_authenticated(client_config: quinn::ClientConfig) -> std::io::Result<Self> {
 		let mut endpoint =
 			quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))?;
+		// ADR 577: applied here rather than only where the config is built, so
+		// a caller-supplied configuration cannot bypass the policy.
+		let mut client_config = client_config;
+		toron_client::apply_toron_quic_liveness_client(&mut client_config);
 		endpoint.set_default_client_config(client_config);
 		Ok(Self { inner: endpoint })
 	}
@@ -282,5 +296,87 @@ impl ServerCertVerifier for LoopbackServerVerifier {
 			SignatureScheme::RSA_PKCS1_SHA384,
 			SignatureScheme::RSA_PKCS1_SHA512,
 		]
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+	use std::time::Duration;
+
+	/// Build a loopback server/client pair on a compressed timescale, so the
+	/// property under test — silence outliving the idle timeout — takes
+	/// milliseconds instead of the half-minute the real policy is sized for.
+	/// The silence is the test's own `sleep`, not a race against the engine.
+	fn compressed_pair(
+		keep_alive: Option<Duration>,
+	) -> std::io::Result<(quinn::Endpoint, quinn::Endpoint, SocketAddr)> {
+		let idle = Duration::from_millis(300);
+		let mut transport = quinn::TransportConfig::default();
+		transport.max_idle_timeout(Some(idle.try_into().expect("representable")));
+		transport.keep_alive_interval(keep_alive);
+		let transport = Arc::new(transport);
+
+		let mut server_config = loopback_server_config()?;
+		server_config.transport_config(Arc::clone(&transport));
+		let server = quinn::Endpoint::server(
+			server_config,
+			SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+		)?;
+		let addr = server.local_addr()?;
+
+		let mut client_config = loopback_client_config()?;
+		client_config.transport_config(transport);
+		let mut client =
+			quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0))?;
+		client.set_default_client_config(client_config);
+		Ok((server, client, addr))
+	}
+
+	async fn connect_and_idle(
+		keep_alive: Option<Duration>,
+		silence: Duration,
+	) -> Result<(), quinn::ConnectionError> {
+		let (server, client, addr) = compressed_pair(keep_alive).expect("endpoints");
+		let accept = tokio::spawn(async move {
+			let incoming = server.accept().await.expect("incoming");
+			let connection = incoming.await.expect("accepted");
+			// Hold the connection open, sending nothing — the silent-execution
+			// window this record exists to survive.
+			tokio::time::sleep(silence).await;
+			connection
+		});
+		let connection = client
+			.connect(addr, LOOPBACK_QUIC_SERVER_NAME)
+			.expect("connect")
+			.await
+			.expect("handshake");
+		tokio::time::sleep(silence).await;
+		let opened = connection.open_bi().await;
+		let _ = accept.await;
+		opened.map(|_| ())
+	}
+
+	#[tokio::test]
+	async fn adr0577_keep_alive_holds_a_silent_connection_past_its_idle_timeout() {
+		// 900ms of silence against a 300ms idle timeout: without keep-alive the
+		// connection is three idle periods dead.
+		connect_and_idle(Some(Duration::from_millis(50)), Duration::from_millis(900))
+			.await
+			.expect("a keep-alive must hold the connection open through silence");
+	}
+
+	#[tokio::test]
+	async fn adr0577_without_keep_alive_the_same_silence_loses_the_connection() {
+		// The control that makes the test above mean something: identical
+		// timings, keep-alive disabled — quinn's unconfigured posture, and the
+		// shape of the reported 30.01s failure.
+		let error = connect_and_idle(None, Duration::from_millis(900))
+			.await
+			.expect_err("without keep-alive the idle timeout must close it");
+		assert!(
+			matches!(error, quinn::ConnectionError::TimedOut),
+			"the loss is an idle timeout, not another transport fault: {error:?}"
+		);
 	}
 }

@@ -1603,3 +1603,86 @@ pub(crate) fn adr044_new_tls_policy_names_are_brand_clean_and_no_v1_suffix() {
 		"ListenerPolicyV1",
 	]);
 }
+
+#[test]
+pub(crate) fn adr0577_every_toron_quic_endpoint_installs_the_liveness_policy() {
+	let quic = std::fs::read_to_string(manifest_dir().join("src/quic.rs")).expect("read quic");
+	let client = std::fs::read_to_string(
+		manifest_dir()
+			.parent()
+			.expect("workspace crates dir")
+			.join("toron-client/src/client.rs"),
+	)
+	.expect("read client");
+	let liveness = std::fs::read_to_string(
+		manifest_dir()
+			.parent()
+			.expect("workspace crates dir")
+			.join("toron-client/src/liveness.rs"),
+	)
+	.expect("read liveness");
+
+	// Every endpoint Toron owns installs the shared policy. Quinn's default is a
+	// 30s idle timeout with keep-alive disabled, which is shorter than any
+	// configured statement timeout, so an endpoint that inherits it silently
+	// caps execution at a number nobody chose.
+	//
+	// These constructors serve BOTH Toron QUIC roles — the SQL listener and the
+	// worker task listener bind through the same pair, and the SQL client and
+	// worker client connect through the same pair. The daemon call sites are
+	// enumerated below so a later narrowing to one role fails here instead of
+	// quietly returning the other to quinn's default.
+	let daemon =
+		std::fs::read_to_string(manifest_dir().join("src/daemon.rs")).expect("read daemon");
+	assert!(
+		daemon.contains("QuicEndpoint::bind_loopback(worker_bind_endpoint)")
+			&& daemon.contains("ListenerRole::WorkerTask"),
+		"the worker task listener must still bind through the shared constructors"
+	);
+	let transport = std::fs::read_to_string(manifest_dir().join("src/server/transport.rs"))
+		.expect("read worker transport");
+	assert!(
+		transport.contains("QuicEndpoint::client_loopback()")
+			&& transport.contains("QuicEndpoint::client_authenticated("),
+		"the worker client must still connect through the shared constructors"
+	);
+	assert_eq!(
+		quic.matches("apply_toron_quic_liveness_server(").count(),
+		2,
+		"both loopback and authenticated server endpoints must install it"
+	);
+	assert_eq!(
+		quic.matches("apply_toron_quic_liveness_client(").count(),
+		2,
+		"both loopback and authenticated client endpoints must install it"
+	);
+	assert_eq!(
+		client.matches("apply_toron_quic_liveness_client(").count(),
+		2,
+		"the public client's loopback and authenticated endpoints must install it"
+	);
+
+	// The policy is one definition with both values set explicitly.
+	assert_eq!(
+		liveness.matches("fn toron_quic_transport_config").count(),
+		1,
+		"one shared policy, not a copy per endpoint"
+	);
+	assert!(
+		liveness.contains("transport.max_idle_timeout(Some(")
+			&& liveness.contains("transport.keep_alive_interval(Some("),
+		"both values are set explicitly; neither may be left to the default"
+	);
+	assert!(
+		!liveness.contains("keep_alive_interval(None)"),
+		"a disabled keep-alive is the unconfigured posture this record removes"
+	);
+
+	// ADR 577 §Guardrails: the policy is Toron's SQL transport only. Wendelon
+	// owns its own QUIC configuration and is not altered from here.
+	assert!(
+		!quic.contains("wendelon::network::quic_transport::configure")
+			&& !liveness.contains("wendelon"),
+		"the SQL liveness policy must not reach into Wendelon's transport"
+	);
+}

@@ -154,7 +154,10 @@ impl ToronClient {
 		let mut endpoint =
 			quinn::Endpoint::client(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0))
 				.map_err(|error| ClientError::Transport(error.to_string()))?;
-		endpoint.set_default_client_config(quinn::ClientConfig::new(Arc::new(quic)));
+		let mut client_config = quinn::ClientConfig::new(Arc::new(quic));
+		// ADR 577: never inherit quinn's 30s idle default.
+		crate::liveness::apply_toron_quic_liveness_client(&mut client_config);
+		endpoint.set_default_client_config(client_config);
 		Ok(Self::new(endpoint, remote, tls.server_name.clone()))
 	}
 
@@ -592,7 +595,10 @@ fn loopback_client_config() -> Result<quinn::ClientConfig, ClientError> {
 	rustls_config.alpn_protocols = vec![LOOPBACK_QUIC_ALPN.to_vec()];
 	let quic_config = QuicClientConfig::try_from(rustls_config)
 		.map_err(|error| ClientError::Configuration(format!("QUIC client config: {error}")))?;
-	Ok(quinn::ClientConfig::new(Arc::new(quic_config)))
+	let mut config = quinn::ClientConfig::new(Arc::new(quic_config));
+	// ADR 577: never inherit quinn's 30s idle default.
+	crate::liveness::apply_toron_quic_liveness_client(&mut config);
+	Ok(config)
 }
 
 #[derive(Debug)]

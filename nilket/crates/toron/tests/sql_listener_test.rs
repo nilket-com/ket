@@ -2090,3 +2090,143 @@ fn fresh_dir(tag: &str) -> PathBuf {
 	std::fs::create_dir_all(&dir).expect("create temp dir");
 	dir
 }
+
+/// ADR 577 real-time exhibit. Opt-in: it deliberately runs past the 30-second
+/// transport boundary the finding reported, so it costs minutes rather than
+/// milliseconds and does not belong in the ordinary suite.
+///
+/// ```sh
+/// cargo test -p toron --test sql_listener_test \\
+///   adr0577_live_long_queries_reach_their_statement_deadline -- --ignored --nocapture
+/// ```
+///
+/// The compressed-timescale control in `quic.rs` proves keep-alive beats an
+/// idle timeout; only this proves it at the real 30-second boundary with the
+/// real policy constants, over the **public `ToronClient`** — the layer that
+/// reported the original failure, and the one whose own 120-second deadline
+/// must remain the outer bound rather than the transport's.
+///
+/// Every case asserts its elapsed time. A query that finishes too quickly, or
+/// a timeout that fires instantly, fails the exhibit rather than passing it
+/// without exercising the boundary it names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "real-time: deliberately exceeds 30s and 60s boundaries"]
+async fn adr0577_live_long_queries_reach_their_statement_deadline() {
+	// The generated range is a Rune verb (ADR 569) with no SQL spelling, and
+	// Rune is the frontend the reported failure used. Counting the projected
+	// column rather than `count_all()`: a keyless COUNT(*) prunes the range to
+	// zero columns, which the range executor panics on today — a separate
+	// ADR 569 defect reported alongside this cut.
+	const PAST_30S: &str = r#"pub fn main(ctx) { ctx.range(120000000).project_named([seeded_random(lit_i64(1), col("ordinal")).named("r")]).aggregate([], [count(col("r"))]) }"#;
+	const PAST_60S: &str = r#"pub fn main(ctx) { ctx.range(240000000).project_named([seeded_random(lit_i64(1), col("ordinal")).named("r")]).aggregate([], [count(col("r"))]) }"#;
+
+	fn rows_of(result: toron_client::RuneQueryResult) -> u64 {
+		match result {
+			toron_client::RuneQueryResult::Batches(batches) => batches.row_count,
+			other => panic!("an aggregate returns batches, not {other:?}"),
+		}
+	}
+
+	let fixture = LiveWendelonFixture::start(1577).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	// Case 1: silent well past 30s, with a statement deadline above it. Before
+	// this cut the connection died at 30.01s regardless of that setting.
+	let mut config = toron_config_with_descriptor(descriptor.clone(), true);
+	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_secs(180);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = ToronClient::loopback(endpoint.to_string()).expect("public client");
+
+	let started = std::time::Instant::now();
+	let response = client
+		.execute_rune_request(toron_client::ExecuteRuneRequest::current(
+			PAST_30S.to_owned(),
+			None,
+		))
+		.await
+		.expect("a silent query under its statement deadline must succeed");
+	let elapsed = started.elapsed();
+	assert!(
+		elapsed > Duration::from_secs(31),
+		"the exhibit must actually cross the old 30s boundary, took {elapsed:?}"
+	);
+	assert_eq!(rows_of(response), 1);
+	println!("ADR 577 case 1: silent success after {elapsed:?}");
+
+	// Case 3: a query that exceeds its own request deadline arrives as a typed
+	// statement timeout. The elapsed bounds are the point — an instant refusal
+	// would satisfy the type assertion while proving nothing about deadlines,
+	// and a 30s one would mean the transport still won.
+	let started = std::time::Instant::now();
+	let error = client
+		.execute_rune_request(toron_client::ExecuteRuneRequest::current(
+			PAST_30S.to_owned(),
+			Some(5),
+		))
+		.await
+		.expect_err("a 5s request budget must time out");
+	let elapsed = started.elapsed();
+	let toron_client::ClientError::Rune(failure) = &error else {
+		panic!("a deadline overrun must not surface as a transport error: {error:?}");
+	};
+	assert!(
+		matches!(
+			failure.kind,
+			RuneFailureKind::Execution(SqlErrorCode::StatementTimeout)
+		),
+		"a deadline overrun is a statement timeout: {failure:?}"
+	);
+	assert!(
+		elapsed >= Duration::from_secs(4),
+		"it must run to roughly its 5s deadline, not refuse instantly: {elapsed:?}"
+	);
+	assert!(
+		elapsed < Duration::from_secs(30),
+		"and must land on its own deadline, not the old 30s transport one: {elapsed:?}"
+	);
+	println!("ADR 577 case 3: typed timeout after {elapsed:?}");
+	daemon.shutdown().await.expect("shutdown daemon");
+
+	// Case 2: a request-level override beyond the configured 60s default — the
+	// case a merely larger static idle timeout could not guarantee, since the
+	// caller may raise the deadline above whatever number the transport picked.
+	// The override stays under the client's own 120s deadline, so success also
+	// shows that deadline remains the outer bound.
+	let mut config = toron_config_with_descriptor(descriptor, true);
+	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_secs(60);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron SQL daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("sql endpoint");
+	let client = ToronClient::loopback(endpoint.to_string()).expect("public client");
+
+	let started = std::time::Instant::now();
+	let response = client
+		.execute_rune_request(toron_client::ExecuteRuneRequest::current(
+			PAST_60S.to_owned(),
+			Some(110),
+		))
+		.await
+		.expect("a request override above the configured default must survive");
+	let elapsed = started.elapsed();
+	assert!(
+		elapsed > Duration::from_secs(61),
+		"the override case must actually cross the 60s default, took {elapsed:?}"
+	);
+	assert!(
+		elapsed < Duration::from_secs(120),
+		"and must finish inside the client's own deadline: {elapsed:?}"
+	);
+	assert_eq!(rows_of(response), 1);
+	println!("ADR 577 case 2: override success after {elapsed:?}");
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
