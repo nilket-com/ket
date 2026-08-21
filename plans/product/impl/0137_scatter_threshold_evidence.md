@@ -120,14 +120,64 @@ defects that no amount of further design work would have surfaced — including
 one, the unreachable timeout configuration, that is independent of
 materialization entirely and affects every long query the product can issue.
 
+## Post-fix rerun — 2026-08-21, after TORON-0577 and TORON-0578
+
+Rerun on a release build of `5e32f991…` (from `e7b285de`), same data
+directory, same machine.
+
+**Defect 1 is fixed.** `SELECT COUNT(*)` now returns
+`Toron StatementTimeout: statement timeout exceeded` at **60.01 s** — a typed
+outcome at the configured bound, where it previously returned an untyped
+`connection lost` at 30 s. The statement timeout is authoritative and
+reachable. TORON-0577 also widened the policy to internal worker links, which
+this slice had not identified.
+
+**Defect 2 is unchanged, and is now much better characterised.**
+
+| rows | materialized | plain CTAS control | Arrow path (no text) |
+|---|---|---|---|
+| 2,000 | 4.38 s | 4.38 s | 4.39 s |
+| 5,000 | 10.93 s | 10.77 s | 10.92 s |
+| 13,000 | 28.47 s | 27.50 s | 27.53 s |
+
+Three controls, one conclusion. The open question from the first run is
+**answered: the cost is not materialization-specific.** A table built by an
+ordinary `CREATE TABLE … AS SELECT` reads at the same rate as one built by
+`materialize`, so the fifth arc's write path is exonerated. And routing
+through the Arrow-IPC adapter, which renders no text table, is equally slow,
+so the CLI's formatting is exonerated too.
+
+**~460 rows/s (≈2.2 ms/row) is general Toron scan throughput.**
+
+TORON-0578 fixed a real defect — `COUNT(*)` over a `Range` panicking once
+column pruning left an empty schema — but that is a different bug from this
+one, and this slice never reached it: its `COUNT(*)` ran over a materialized
+Wendelon table, not a range.
+
+### What this bounds
+
+At ~460 rows/s the 60 s statement timeout caps any query at roughly **27,000
+rows**. That is the product-wide ceiling today, not a plotting concern:
+
+| target | rows | projected |
+|---|---|---|
+| statement timeout ceiling | ~27,000 | 60 s |
+| smallest scatter threshold | 50,000 | ~1.8 min |
+| downsample threshold | 200,000 | ~7.2 min |
+| raster threshold | 1,000,000 | ~36 min |
+| README claim | 10,000,000 | ~6 h |
+
+The scatter thresholds remain unmeasured and untuned. Rendering has still
+never been reached at any threshold cardinality.
+
 ## Recommended next steps
 
-1. **db team:** configure the QUIC idle timeout and/or a keep-alive so the
-   statement timeout is reachable, and long queries fail as timeouts rather
-   than transport losses. This is small and unblocks everything below.
-2. **db team:** determine whether ~460 rows/s is specific to materialized
-   tables or general to scans, using a non-materialized control table of
-   comparable size.
-3. **viz team:** rerun `live_scatter_threshold_evidence` once reads clear
+1. ~~**db team:** configure QUIC liveness~~ — **done**, TORON-0577.
+2. ~~**db team:** establish the scan control~~ — **done here**: general, not
+   materialization-specific, and not CLI formatting. Three controls agree.
+3. **db team:** general scan throughput is the remaining investigation, and
+   it is a larger one than this slice. ~460 rows/s bounds every query in the
+   product to ~27,000 rows at the current statement timeout.
+4. **viz team:** rerun `live_scatter_threshold_evidence` once reads clear
    50,000 rows in reasonable time, and only then record threshold verdicts.
-4. **Do not tune the scatter thresholds** until step 3 produces numbers.
+5. **Do not tune the scatter thresholds** until step 4 produces numbers.

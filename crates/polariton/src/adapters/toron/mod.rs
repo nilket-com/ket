@@ -405,6 +405,29 @@ mod tests {
 		}
 	}
 
+	/// Isolates engine scan cost from CLI text formatting: dispatches through
+	/// the Arrow-IPC adapter path, which never renders a text table.
+	#[tokio::test]
+	#[ignore = "requires a live local Toron workspace with ctrl_plain"]
+	async fn live_scan_cost_without_text_formatting() {
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+		for n in [2000usize, 5000, 13000] {
+			let started = std::time::Instant::now();
+			let result = adapter
+				.dispatch(&format!("SELECT x FROM ctrl_plain LIMIT {n}"))
+				.await;
+			let elapsed = started.elapsed().as_secs_f64();
+			let ExecutionResult::Rows { artifact, .. } = result else {
+				panic!("expected rows, got {result:?}")
+			};
+			assert_eq!(artifact.shape().0, n);
+			println!("arrow path {n} rows: {elapsed:.2} s");
+		}
+	}
+
 	/// PRODUCT-0137 evidence slice: one real workflow end to end, timed.
 	///
 	/// Generates a reproducible relation, materializes it, reopens it through
