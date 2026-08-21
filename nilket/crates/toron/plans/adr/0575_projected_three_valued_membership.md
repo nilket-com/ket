@@ -108,6 +108,14 @@ cannot yield UNKNOWN as a value.
 - Projected `= ANY` agrees with projected `IN` on every row of one fixture,
   and projected `> ANY` / `> ALL` agree with ADR 0568's predicate verdict
   wherever that verdict is not UNKNOWN.
+- The equality mapping is exactly the predicate's, refusals included: `= ANY`
+  is membership, `<> ALL` is its negation and their exact complement on
+  decided rows, and `<> ANY` / `= ALL` refuse in projection citing ADR 0568's
+  own directives. `= ALL` is the one that must not be quietly routed — it asks
+  whether *every* value equals the probe, so lowering it as `NOT IN` answers a
+  different question, and `1 = ALL (SELECT 1)` is TRUE where
+  `1 NOT IN (SELECT 1)` is FALSE. A single shared directive per refused
+  spelling keeps the two positions' guidance from drifting.
 - Duplicate values in the subquery do not fan out the outer: row count is
   preserved, as the grouped membership aggregate guarantees.
 - Predicate-position control: existing `WHERE x IN (…)`, `WHERE x NOT IN (…)`,

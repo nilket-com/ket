@@ -5654,11 +5654,9 @@ impl SqlPlanner {
 						)?;
 					}
 					BinaryOperator::NotEq => {
-						return Err(unsupported(
-							"x <> ANY (subquery) is refused: it is true whenever any value \
-							 differs from x, which is rarely the intent; if exclusion was \
-							 meant, write x NOT IN (subquery), which is x <> ALL (subquery)",
-						));
+						return Err(unsupported(refused_equality_quantifier(
+							QuantifiedForm::Any,
+						)));
 					}
 					BinaryOperator::Lt
 					| BinaryOperator::LtEq
@@ -5697,10 +5695,9 @@ impl SqlPlanner {
 						)?;
 					}
 					BinaryOperator::Eq => {
-						return Err(unsupported(
-							"x = ALL (subquery) is refused: it asks whether every value \
-							 equals x; if membership was meant, write x IN (subquery)",
-						));
+						return Err(unsupported(refused_equality_quantifier(
+							QuantifiedForm::All,
+						)));
 					}
 					BinaryOperator::Lt
 					| BinaryOperator::LtEq
@@ -6028,13 +6025,43 @@ impl SqlPlanner {
 		cte: &CteScope,
 	) -> Result<(LogicalPlan, Expr), FrontendError> {
 		let outer_qualifiers = plan_qualifiers(&outer_plan);
+		let (pulled, alias) =
+			self.quantified_ordering_subplan(&outer_qualifiers, op, subquery, form, ordinal, cte)?;
+		let joined = self.join_scalar_subplans(outer_plan, vec![pulled])?;
+		// ADR 575: the table is built once, in SqlExpr, and shared with the
+		// projection position — this path lowers it into a residual.
+		let predicate = self.lower_expr(&quantified_ordering_truth_table(
+			form,
+			op,
+			left.clone(),
+			&alias,
+		))?;
+		return Ok((joined, predicate));
+	}
+
+	/// ADR 568/575: the keyed aggregate behind an ordering-quantified
+	/// comparison — `[keys…, COUNT(*), COUNT(v), MIN|MAX(v)]` — as a pulled
+	/// subplan neither position has joined yet. The predicate path recombines
+	/// it immediately; the projection path defers to `join_scalar_subplans`
+	/// with the rest of its collected scalars.
+	#[allow(clippy::too_many_arguments)]
+	fn quantified_ordering_subplan(
+		&self,
+		outer_qualifiers: &[TableRef],
+		op: &BinaryOperator,
+		subquery: &Query,
+		form: QuantifiedForm,
+		ordinal: usize,
+		cte: &CteScope,
+	) -> Result<(PulledScalar, String), FrontendError> {
+		let outer_qualifiers = outer_qualifiers.to_vec();
+		let outer_qualifiers = outer_qualifiers.as_slice();
 		let context = match form {
 			QuantifiedForm::Any => "ANY",
 			QuantifiedForm::All => "ALL",
 		};
 		let (inner_plan, value, correlation_pairs) =
 			self.lower_membership_subquery(subquery, &outer_qualifiers, cte, context)?;
-		let probe = self.lower_expr(left)?;
 		// The witnessing extreme: the one value that decides. `> ANY` needs the
 		// smallest value to beat; `> ALL` needs the largest value to survive.
 		let extreme = match (form, op) {
@@ -6079,53 +6106,19 @@ impl SqlPlanner {
 				)
 			})
 			.collect();
-		let joined = self.join_scalar_subplans(
-			outer_plan,
-			vec![PulledScalar::Resolved {
+		// An unmatched correlation group NULL-fills through the LeftOuter; a
+		// missing count means an empty group, never an unknown one.
+		Ok((
+			PulledScalar::Resolved {
 				plan: LogicalPlan::Alias {
 					input: Box::new(aggregate),
 					alias: alias.clone(),
 					columns,
 				},
 				on,
-			}],
-		)?;
-		// An unmatched correlation group NULL-fills through the LeftOuter; a
-		// missing count means an empty group, never an unknown one.
-		let cnt = count_null_means_zero(Expr::qualified_column(alias.clone(), "cnt"));
-		let cntv = count_null_means_zero(Expr::qualified_column(alias.clone(), "cntv"));
-		let extreme_ref = Expr::qualified_column(alias, "extreme");
-		let comparison = match form {
-			QuantifiedForm::Any => ordering_comparison(op, probe.clone(), extreme_ref),
-			QuantifiedForm::All => {
-				ordering_comparison(&flip_ordering(op), probe.clone(), extreme_ref)
-			}
-		};
-		let on_empty = boolean_literal(matches!(form, QuantifiedForm::All));
-		let on_comparison = boolean_literal(matches!(form, QuantifiedForm::Any));
-		let on_no_nulls = boolean_literal(matches!(form, QuantifiedForm::All));
-		let predicate = Expr::Case {
-			when_then: vec![
-				(
-					Box::new(Expr::Eq(
-						Box::new(cnt.clone()),
-						Box::new(Expr::Literal(crate::ir::ScalarValue::Int64(Some(0)))),
-					)),
-					Box::new(on_empty),
-				),
-				(
-					Box::new(Expr::IsNull(Box::new(probe))),
-					Box::new(boolean_typed_null()),
-				),
-				(Box::new(comparison), Box::new(on_comparison)),
-				(
-					Box::new(Expr::Eq(Box::new(cnt), Box::new(cntv))),
-					Box::new(on_no_nulls),
-				),
-			],
-			else_expr: Some(Box::new(boolean_typed_null())),
-		};
-		Ok((joined, predicate))
+			},
+			alias.table,
+		))
 	}
 
 	/// ADR 258/259: `x NOT IN (sub)` ≡ `x IS NOT NULL AND NOT EXISTS(sub WHERE key IS NULL) AND
@@ -6243,6 +6236,49 @@ impl SqlPlanner {
 			// runs over the WHERE as well, and a semi-join is the better shape
 			// where a row filter is what's wanted. A projected EXISTS needs a
 			// value for every outer row, including the ones a semi-join drops.
+			// ADR 575: an ordering-quantified comparison in projection position
+			// reuses ADR 568's subplan and its truth table verbatim — the only
+			// difference is that the subplan defers to `join_scalar_subplans`
+			// with the rest of the collected scalars instead of joining here.
+			SqlExpr::AnyOp {
+				left,
+				compare_op,
+				right,
+				is_some: _,
+			} if matches!(position, SubqueryPosition::Projection) => self.pull_up_projected_quantified(
+				left,
+				compare_op,
+				quantified_subquery(right)?,
+				QuantifiedForm::Any,
+				collected,
+				outer_qualifiers,
+				cte,
+			),
+			SqlExpr::AllOp {
+				left,
+				compare_op,
+				right,
+			} if matches!(position, SubqueryPosition::Projection) => self.pull_up_projected_quantified(
+				left,
+				compare_op,
+				quantified_subquery(right)?,
+				QuantifiedForm::All,
+				collected,
+				outer_qualifiers,
+				cte,
+			),
+			SqlExpr::InSubquery {
+				expr,
+				subquery,
+				negated,
+			} if matches!(position, SubqueryPosition::Projection) => self.pull_up_projected_membership(
+				expr,
+				subquery,
+				*negated,
+				collected,
+				outer_qualifiers,
+				cte,
+			),
 			SqlExpr::Exists { subquery, negated }
 				if matches!(position, SubqueryPosition::Projection) =>
 			{
@@ -6609,6 +6645,199 @@ impl SqlPlanner {
 			}),
 			_ => Ok(expr.clone()),
 		}
+	}
+
+	/// ADR 575: a projected ordering-quantified comparison. Both the subplan
+	/// and the truth table are ADR 568's — nothing about either is restated
+	/// here, so the two positions cannot disagree.
+	#[allow(clippy::too_many_arguments)]
+	fn pull_up_projected_quantified(
+		&self,
+		left: &SqlExpr,
+		op: &BinaryOperator,
+		subquery: &Query,
+		form: QuantifiedForm,
+		collected: &mut Vec<PulledScalar>,
+		outer_qualifiers: &[TableRef],
+		cte: &CteScope,
+	) -> Result<SqlExpr, FrontendError> {
+		// The equality quantifiers mirror ADR 568's predicate mapping exactly:
+		// `= ANY` is membership, `<> ALL` is its negation, and the other two
+		// spellings are refused rather than lowered. `= ALL` in particular is
+		// NOT `NOT IN` — it asks whether every value equals the probe, so
+		// routing it through membership would answer a different question.
+		match (form, op) {
+			(QuantifiedForm::Any, BinaryOperator::Eq) => {
+				return self.pull_up_projected_membership(
+					left,
+					subquery,
+					false,
+					collected,
+					outer_qualifiers,
+					cte,
+				);
+			}
+			(QuantifiedForm::All, BinaryOperator::NotEq) => {
+				return self.pull_up_projected_membership(
+					left,
+					subquery,
+					true,
+					collected,
+					outer_qualifiers,
+					cte,
+				);
+			}
+			(QuantifiedForm::Any, BinaryOperator::NotEq)
+			| (QuantifiedForm::All, BinaryOperator::Eq) => {
+				return Err(unsupported(refused_equality_quantifier(form)));
+			}
+			(
+				_,
+				BinaryOperator::Lt
+				| BinaryOperator::LtEq
+				| BinaryOperator::Gt
+				| BinaryOperator::GtEq,
+			) => {}
+			(_, other) => {
+				return Err(unsupported(format!(
+					"unsupported quantified comparison operator: {other}"
+				)));
+			}
+		}
+		let (pulled, alias) = self.quantified_ordering_subplan(
+			outer_qualifiers,
+			op,
+			subquery,
+			form,
+			collected.len(),
+			cte,
+		)?;
+		collected.push(pulled);
+		Ok(quantified_ordering_truth_table(
+			form,
+			op,
+			left.clone(),
+			&alias,
+		))
+	}
+
+	/// ADR 575: projected `IN` / `NOT IN`. Two decorrelated subplans supply the
+	/// three facts membership needs. A **membership** aggregate grouped on the
+	/// subquery value recombines on `probe = value`, so a matched outer row
+	/// carries a non-null key — one inner row per distinct value, so the outer
+	/// cannot fan out. A **null-presence** aggregate carries `COUNT(*)` and
+	/// `COUNT(value)`; their inequality is exactly "the set contained a NULL".
+	fn pull_up_projected_membership(
+		&self,
+		probe: &SqlExpr,
+		subquery: &Query,
+		negated: bool,
+		collected: &mut Vec<PulledScalar>,
+		outer_qualifiers: &[TableRef],
+		cte: &CteScope,
+	) -> Result<SqlExpr, FrontendError> {
+		let (inner_plan, value, correlation_pairs) =
+			self.lower_membership_subquery(subquery, outer_qualifiers, cte, "IN")?;
+
+		// Membership: group on the correlation keys AND the value, then join
+		// the value against the probe. Grouping is what bounds the recombine to
+		// one inner row per (key…, value).
+		let membership_alias = TableRef::new(format!("__member_{}", collected.len()));
+		let mut membership_group: Vec<Expr> = correlation_pairs
+			.iter()
+			.map(|(_, inner)| inner.clone())
+			.collect();
+		membership_group.push(value.clone());
+		let membership_aggregate = LogicalPlan::Aggregate {
+			input: Box::new(LogicalPlan::Exchange {
+				input: Box::new(inner_plan.clone()),
+				partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
+				key: membership_group.clone(),
+			}),
+			group_expr: membership_group,
+			aggr_expr: vec![(AggregateFunction::CountAll, Vec::new())],
+		};
+		let mut membership_columns: Vec<String> = (0..correlation_pairs.len())
+			.map(|index| format!("key_{index}"))
+			.collect();
+		membership_columns.push("member_value".to_string());
+		membership_columns.push("matched".to_string());
+		let mut membership_on: Vec<(Expr, Expr)> = correlation_pairs
+			.iter()
+			.enumerate()
+			.map(|(index, (outer, _))| {
+				(
+					outer.clone(),
+					Expr::qualified_column(membership_alias.clone(), format!("key_{index}")),
+				)
+			})
+			.collect();
+		membership_on.push((
+			self.lower_expr(probe)?,
+			Expr::qualified_column(membership_alias.clone(), "member_value"),
+		));
+		collected.push(PulledScalar::Resolved {
+			plan: LogicalPlan::Alias {
+				input: Box::new(membership_aggregate),
+				alias: membership_alias.clone(),
+				columns: membership_columns,
+			},
+			on: membership_on,
+		});
+
+		// Null presence: keyed on the correlation only, so it answers "did this
+		// probe's candidate set contain a NULL" rather than "did this value".
+		let nulls_alias = TableRef::new(format!("__member_nulls_{}", collected.len()));
+		let nulls_group: Vec<Expr> = correlation_pairs
+			.iter()
+			.map(|(_, inner)| inner.clone())
+			.collect();
+		let nulls_input = if nulls_group.is_empty() {
+			inner_plan
+		} else {
+			LogicalPlan::Exchange {
+				input: Box::new(inner_plan),
+				partition_count: DEFAULT_AGGREGATE_PARTITION_COUNT,
+				key: nulls_group.clone(),
+			}
+		};
+		let nulls_aggregate = LogicalPlan::Aggregate {
+			input: Box::new(nulls_input),
+			group_expr: nulls_group,
+			aggr_expr: vec![
+				(AggregateFunction::CountAll, Vec::new()),
+				(AggregateFunction::Count, vec![value]),
+			],
+		};
+		let mut nulls_columns: Vec<String> = (0..correlation_pairs.len())
+			.map(|index| format!("key_{index}"))
+			.collect();
+		nulls_columns.extend(["cnt".to_string(), "cntv".to_string()]);
+		let nulls_on: Vec<(Expr, Expr)> = correlation_pairs
+			.iter()
+			.enumerate()
+			.map(|(index, (outer, _))| {
+				(
+					outer.clone(),
+					Expr::qualified_column(nulls_alias.clone(), format!("key_{index}")),
+				)
+			})
+			.collect();
+		collected.push(PulledScalar::Resolved {
+			plan: LogicalPlan::Alias {
+				input: Box::new(nulls_aggregate),
+				alias: nulls_alias.clone(),
+				columns: nulls_columns,
+			},
+			on: nulls_on,
+		});
+
+		Ok(membership_truth_table(
+			probe.clone(),
+			&membership_alias.table,
+			&nulls_alias.table,
+			negated,
+		))
 	}
 
 	/// ADR 573: a projected `EXISTS` becomes a decorrelated `COUNT(*)` compared
@@ -10102,7 +10331,14 @@ fn expr_contains_aggregate_call(expr: &SqlExpr) -> bool {
 
 fn expr_contains_subquery(expr: &SqlExpr) -> bool {
 	match strip_nested_sql_expr(expr) {
-		SqlExpr::Subquery(_) | SqlExpr::Exists { .. } => true,
+		// ADR 575: membership and quantified comparisons carry a subquery too,
+		// and a projection of one must reach the pull-up rather than falling
+		// through to `lower_expr`'s refusal.
+		SqlExpr::Subquery(_)
+		| SqlExpr::Exists { .. }
+		| SqlExpr::InSubquery { .. }
+		| SqlExpr::AnyOp { .. }
+		| SqlExpr::AllOp { .. } => true,
 		SqlExpr::BinaryOp { left, right, .. } => {
 			expr_contains_subquery(left) || expr_contains_subquery(right)
 		}
@@ -11352,14 +11588,16 @@ fn refused_expression_message(expr: &SqlExpr) -> String {
 			 supported"
 				.to_string()
 		}
+		// ADR 575 closed the projected forms; what remains refused here are the
+		// positions no record covers — GROUP BY, ORDER BY, HAVING.
 		SqlExpr::InSubquery { .. } => {
-			"IN (subquery) is supported as a predicate; a projected IN awaits the mark join that \
-			 carries its third truth value"
+			"IN (subquery) is supported as a predicate and in a projection; this position is not \
+			 supported"
 				.to_string()
 		}
 		SqlExpr::AnyOp { .. } | SqlExpr::AllOp { .. } => {
-			"a quantified comparison is supported as a predicate; a projected one awaits the mark \
-			 join that carries its third truth value"
+			"a quantified comparison is supported as a predicate and in a projection; this \
+			 position is not supported"
 				.to_string()
 		}
 		SqlExpr::Subquery(_) => "unsupported subquery position".to_string(),
@@ -11542,26 +11780,151 @@ fn quantified_subquery(expr: &SqlExpr) -> Result<&Query, FrontendError> {
 
 /// ADR 568: the ir-level twin of [`count_empty_group_coalesce`] — a NULL count
 /// reference from an unmatched `LeftOuter` group means zero rows.
-fn count_null_means_zero(reference: Expr) -> Expr {
-	Expr::Case {
-		when_then: vec![(
-			Box::new(Expr::IsNotNull(Box::new(reference.clone()))),
-			Box::new(reference),
-		)],
-		else_expr: Some(Box::new(Expr::Literal(crate::ir::ScalarValue::Int64(
-			Some(0),
-		)))),
+/// ADR 575: SqlExpr helpers for the shared three-valued tables. Both subquery
+/// positions build their truth table here, so neither can drift from the
+/// other — the predicate path lowers the result into a residual, the
+/// projection path hands it back for ordinary projection lowering.
+fn sql_qualified_column(alias: &str, column: &str) -> SqlExpr {
+	SqlExpr::CompoundIdentifier(vec![Ident::new(alias), Ident::new(column)])
+}
+
+fn sql_boolean(value: bool) -> SqlExpr {
+	SqlExpr::Value(Value::Boolean(value).with_empty_span())
+}
+
+/// UNKNOWN. A bare NULL, typed by the boolean arms it sits beside — `CAST(NULL
+/// AS BOOLEAN)` is not an admitted cast target (ADR 564's support table), and
+/// widening that table to spell a CASE arm would be a cast decision riding a
+/// subquery cut.
+fn sql_boolean_null() -> SqlExpr {
+	SqlExpr::Value(Value::Null.with_empty_span())
+}
+
+fn sql_binary(op: BinaryOperator, left: SqlExpr, right: SqlExpr) -> SqlExpr {
+	SqlExpr::BinaryOp {
+		left: Box::new(left),
+		op,
+		right: Box::new(right),
 	}
 }
 
-fn ordering_comparison(op: &BinaryOperator, left: Expr, right: Expr) -> Expr {
-	match op {
-		BinaryOperator::Lt => Expr::Lt(Box::new(left), Box::new(right)),
-		BinaryOperator::LtEq => Expr::Lte(Box::new(left), Box::new(right)),
-		BinaryOperator::Gt => Expr::Gt(Box::new(left), Box::new(right)),
-		BinaryOperator::GtEq => Expr::Gte(Box::new(left), Box::new(right)),
-		other => unreachable!("only ordering operators reach the quantified reduction: {other}"),
+fn sql_zero() -> SqlExpr {
+	SqlExpr::Value(Value::Number("0".to_string(), false).with_empty_span())
+}
+
+fn sql_case(arms: Vec<(SqlExpr, SqlExpr)>, otherwise: SqlExpr) -> SqlExpr {
+	SqlExpr::Case {
+		case_token: AttachedToken::empty(),
+		end_token: AttachedToken::empty(),
+		operand: None,
+		conditions: arms
+			.into_iter()
+			.map(|(condition, result)| CaseWhen { condition, result })
+			.collect(),
+		else_result: Some(Box::new(otherwise)),
 	}
+}
+
+/// ADR 568/575: the equality-quantified spellings this engine refuses, and the
+/// form the author most likely meant. Each quantifier has exactly one refused
+/// equality spelling — `<> ANY` for ANY, `= ALL` for ALL — and both positions
+/// cite this text so the guidance cannot drift between them.
+///
+/// `= ALL` is refused rather than lowered: it asks whether *every* value
+/// equals the probe, which is not membership and not its negation. Routing it
+/// to `NOT IN` would answer a different question — `1 = ALL (SELECT 1)` is
+/// TRUE while `1 NOT IN (SELECT 1)` is FALSE.
+fn refused_equality_quantifier(form: QuantifiedForm) -> &'static str {
+	match form {
+		QuantifiedForm::Any => {
+			"x <> ANY (subquery) is refused: it is true whenever any value differs from x, which \
+			 is rarely the intent; if exclusion was meant, write x NOT IN (subquery), which is x \
+			 <> ALL (subquery)"
+		}
+		QuantifiedForm::All => {
+			"x = ALL (subquery) is refused: it asks whether every value equals x; if membership \
+			 was meant, write x IN (subquery)"
+		}
+	}
+}
+
+/// ADR 575's three-valued table for subquery membership, over a membership
+/// aggregate whose `value` key matched (or did not) and a null-presence
+/// aggregate exposing `cnt` / `cntv`:
+///
+/// | condition | `IN` |
+/// | --- | --- |
+/// | probe is NULL | NULL |
+/// | a value matched | TRUE |
+/// | no match, set contained a NULL | NULL |
+/// | no match, no NULL in the set | FALSE |
+///
+/// The NULL probe is tested first because it dominates: a NULL probe is
+/// UNKNOWN whatever the set holds. `NOT IN` negates each decided arm and
+/// leaves the undecided ones NULL, which is why it is a flipped table rather
+/// than a `NOT` wrapped around this one — `NOT NULL` would be NULL anyway, but
+/// spelling the arms keeps the two readable side by side.
+fn membership_truth_table(
+	probe: SqlExpr,
+	membership_alias: &str,
+	nulls_alias: &str,
+	negated: bool,
+) -> SqlExpr {
+	let matched = SqlExpr::IsNotNull(Box::new(sql_qualified_column(membership_alias, "matched")));
+	let cnt = count_empty_group_coalesce(sql_qualified_column(nulls_alias, "cnt"));
+	let cntv = count_empty_group_coalesce(sql_qualified_column(nulls_alias, "cntv"));
+	sql_case(
+		vec![
+			(SqlExpr::IsNull(Box::new(probe)), sql_boolean_null()),
+			(matched, sql_boolean(!negated)),
+			(
+				sql_binary(BinaryOperator::Eq, cnt, cntv),
+				sql_boolean(negated),
+			),
+		],
+		sql_boolean_null(),
+	)
+}
+
+/// ADR 568's three-valued table for an ordering-quantified comparison, over an
+/// aggregate exposing `cnt`, `cntv`, and `extreme` under `alias`:
+///
+/// - ANY: empty → FALSE; NULL probe → NULL; `x op m` → TRUE; no NULLs in the
+///   set → FALSE; else NULL.
+/// - ALL: empty → TRUE; NULL probe → NULL; `x flip(op) m` → FALSE; no NULLs →
+///   TRUE; else NULL.
+///
+/// ADR 575 moved it into SqlExpr so the projection position shares it rather
+/// than restating it.
+fn quantified_ordering_truth_table(
+	form: QuantifiedForm,
+	op: &BinaryOperator,
+	probe: SqlExpr,
+	alias: &str,
+) -> SqlExpr {
+	let cnt = count_empty_group_coalesce(sql_qualified_column(alias, "cnt"));
+	let cntv = count_empty_group_coalesce(sql_qualified_column(alias, "cntv"));
+	let extreme = sql_qualified_column(alias, "extreme");
+	let comparison = match form {
+		QuantifiedForm::Any => sql_binary(op.clone(), probe.clone(), extreme),
+		QuantifiedForm::All => sql_binary(flip_ordering(op), probe.clone(), extreme),
+	};
+	let is_all = matches!(form, QuantifiedForm::All);
+	sql_case(
+		vec![
+			(
+				sql_binary(BinaryOperator::Eq, cnt.clone(), sql_zero()),
+				sql_boolean(is_all),
+			),
+			(SqlExpr::IsNull(Box::new(probe)), sql_boolean_null()),
+			(comparison, sql_boolean(!is_all)),
+			(
+				sql_binary(BinaryOperator::Eq, cnt, cntv),
+				sql_boolean(is_all),
+			),
+		],
+		sql_boolean_null(),
+	)
 }
 
 /// The counterexample form: `x > ALL` fails on `x <= m`, and so on.
@@ -11573,15 +11936,6 @@ fn flip_ordering(op: &BinaryOperator) -> BinaryOperator {
 		BinaryOperator::GtEq => BinaryOperator::Lt,
 		other => unreachable!("only ordering operators reach the quantified reduction: {other}"),
 	}
-}
-
-fn boolean_literal(value: bool) -> Expr {
-	Expr::Literal(crate::ir::ScalarValue::Boolean(Some(value)))
-}
-
-/// A typed NULL for a CASE arm: UNKNOWN spelled so the binder types it.
-fn boolean_typed_null() -> Expr {
-	Expr::Cast(Box::new(Expr::UntypedNull), DataType::Boolean)
 }
 
 fn count_empty_group_coalesce(value_reference: SqlExpr) -> SqlExpr {

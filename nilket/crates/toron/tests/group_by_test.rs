@@ -11068,23 +11068,16 @@ async fn adr0573_predicate_position_exists_keeps_its_semi_join() {
 #[tokio::test]
 async fn adr0573_refused_positions_name_themselves_and_their_deferral() {
 	// The AST dump the grounding probe found is gone: each refusal names the
-	// SQL construct, and the three-valued forms name where their decision went.
+	// SQL construct. ADR 575 closed the projected three-valued forms these
+	// lines once asserted were refused, so what remains is the positional
+	// refusal — and it must still name itself rather than a parser type.
 	for sql in [
 		"SELECT o.id, o.amount IN (SELECT l.amount FROM sales l) FROM sales o",
 		"SELECT o.id, o.amount > ANY (SELECT l.amount FROM sales l) FROM sales o",
 	] {
-		let error = SqlPlanner::new()
+		SqlPlanner::new()
 			.plan(sql)
-			.expect_err("a three-valued projected form is deferred");
-		let message = error.to_string();
-		assert!(
-			message.contains("mark join"),
-			"the refusal must name where the decision went: {message}"
-		);
-		assert!(
-			message.contains("predicate"),
-			"and must say the predicate form works: {message}"
-		);
+			.unwrap_or_else(|error| panic!("ADR 575 admits this projection: {sql}: {error}"));
 	}
 	let having = SqlPlanner::new()
 		.plan(
@@ -11099,5 +11092,286 @@ async fn adr0573_refused_positions_name_themselves_and_their_deferral() {
 	assert!(
 		!having.to_string().contains("SqlExpr") && !having.to_string().contains("Ident {"),
 		"no parser AST may reach an operator: {having}"
+	);
+}
+
+/// ADR 575: `(id, three-valued flag)` pairs, id-sorted. `None` is UNKNOWN —
+/// the state this family exists to carry, so the controls assert it directly.
+fn membership_flags(rows: &[RecordBatch]) -> Vec<(i64, Option<bool>)> {
+	let mut pairs = Vec::new();
+	for batch in rows {
+		let ids = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id output");
+		let flags = batch
+			.column(1)
+			.as_any()
+			.downcast_ref::<arrow::array::BooleanArray>()
+			.expect("three-valued output");
+		for row in 0..batch.num_rows() {
+			pairs.push((
+				ids.value(row),
+				flags.is_valid(row).then(|| flags.value(row)),
+			));
+		}
+	}
+	pairs.sort_by_key(|(id, _)| *id);
+	pairs
+}
+
+#[tokio::test]
+async fn adr0575_projected_in_carries_all_four_truth_states() {
+	// amounts are [10, 20, NULL, 30, NULL, 7]. Against the NULL-bearing set of
+	// itself: matches are TRUE, NULL probes are UNKNOWN.
+	let bearing = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount IN (SELECT l.amount FROM sales l) FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(
+		bearing,
+		vec![
+			(1, Some(true)),
+			(2, Some(true)),
+			(3, None),
+			(4, Some(true)),
+			(5, None),
+			(6, Some(true)),
+		]
+	);
+
+	// regions.active is non-nullable {1, 1}: a NULL-free set. No amount is 1,
+	// so every non-NULL probe is a no-match — and with no NULL in the set that
+	// is FALSE, not UNKNOWN. This is the row a two-valued implementation gets
+	// wrong, and the row a set-contains-NULL implementation gets wrong the
+	// other way.
+	let free = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount IN (SELECT r.active FROM regions r) FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(
+		free,
+		vec![
+			(1, Some(false)),
+			(2, Some(false)),
+			(3, None),
+			(4, Some(false)),
+			(5, None),
+			(6, Some(false)),
+		]
+	);
+
+	// The null-presence count is load-bearing: the only difference between the
+	// two queries above is whether the set contains a NULL, and it flips the
+	// non-matching rows between UNKNOWN and FALSE.
+	let null_free_decided = free.iter().filter(|(_, flag)| flag.is_some()).count();
+	assert_eq!(
+		null_free_decided, 4,
+		"a NULL-free set decides every non-NULL probe: {free:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr0575_projected_not_in_negates_only_the_decided_rows() {
+	let affirmed = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount IN (SELECT r.active FROM regions r) FROM sales o",
+		))
+		.await,
+	);
+	let negated = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount NOT IN (SELECT r.active FROM regions r) FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(affirmed.len(), negated.len());
+	for ((id, yes), (negated_id, no)) in affirmed.iter().zip(negated.iter()) {
+		assert_eq!(id, negated_id);
+		match (yes, no) {
+			(Some(yes), Some(no)) => assert_ne!(yes, no, "decided rows negate at id {id}"),
+			(None, None) => {}
+			other => panic!("NOT IN must be NULL exactly where IN is NULL at id {id}: {other:?}"),
+		}
+	}
+	// The complement claim is vacuous unless both a decided and an undecided
+	// row occur in the same fixture.
+	assert!(
+		affirmed.iter().any(|(_, flag)| flag.is_some())
+			&& affirmed.iter().any(|(_, flag)| flag.is_none()),
+		"the fixture must exercise both a decided and an UNKNOWN row: {affirmed:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr0575_equality_quantifier_is_membership_in_projection_too() {
+	let query = |form: &str| {
+		format!("SELECT o.id, o.amount {form} (SELECT l.amount FROM sales l) FROM sales o")
+	};
+	let in_form = membership_flags(&run_logical(&plan_sql(&query("IN"))).await);
+	let any_form = membership_flags(&run_logical(&plan_sql(&query("= ANY"))).await);
+	assert_eq!(
+		in_form, any_form,
+		"ADR 568 routes = ANY to membership; the projection position must agree"
+	);
+}
+
+#[tokio::test]
+async fn adr0575_projected_ordering_quantifiers_match_the_predicate_verdict() {
+	// `> ANY` keeps every row the predicate form keeps, and reports UNKNOWN
+	// where the predicate form silently discarded.
+	let projected = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount > ANY (SELECT l.amount FROM sales l) FROM sales o",
+		))
+		.await,
+	);
+	let kept = kept_ids(
+		&run_logical(&plan_sql(
+			"SELECT o.id FROM sales o WHERE o.amount > ANY (SELECT l.amount FROM sales l)",
+		))
+		.await,
+	);
+	let projected_true: Vec<i64> = projected
+		.iter()
+		.filter(|(_, flag)| *flag == Some(true))
+		.map(|(id, _)| *id)
+		.collect();
+	assert_eq!(
+		projected_true, kept,
+		"the projected TRUE rows are exactly the predicate form's kept rows"
+	);
+	assert!(
+		projected.iter().any(|(_, flag)| flag.is_none()),
+		"and the projection reports the UNKNOWNs the predicate could not: {projected:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr0575_duplicate_and_correlated_membership_preserve_outer_cardinality() {
+	// left_dups carries k = [1, 1, 2, 3, 3]: ids 1 and 3 appear twice. The
+	// membership aggregate groups on the value, so the recombine cannot fan
+	// out — a plain join against the raw inner would double those rows.
+	let duplicates = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.id IN (SELECT d.k FROM left_dups d) FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(
+		duplicates.len(),
+		6,
+		"doubled inner values must not fan out the outer: {duplicates:?}"
+	);
+	assert_eq!(
+		duplicates,
+		vec![
+			(1, Some(true)),
+			(2, Some(true)),
+			(3, Some(true)),
+			(4, Some(false)),
+			(5, Some(false)),
+			(6, Some(false)),
+		]
+	);
+
+	// The correlated form, where the candidate set differs per outer row.
+	let correlated = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount IN (SELECT l.amount FROM sales l WHERE l.region = o.region) \
+			 FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(
+		correlated.len(),
+		6,
+		"a correlated membership must not fan out the outer: {correlated:?}"
+	);
+}
+
+#[tokio::test]
+async fn adr0575_projected_membership_is_nullable_and_predicates_are_unchanged() {
+	let rows = run_logical(&plan_sql(
+		"SELECT o.id, o.amount IN (SELECT l.amount FROM sales l) FROM sales o",
+	))
+	.await;
+	assert!(
+		rows[0].schema().field(1).is_nullable(),
+		"the third truth state must be representable — the inverse of ADR 573's control"
+	);
+
+	// Predicate position keeps its join lowering: no membership aggregate
+	// alias may appear in a WHERE-position plan.
+	for sql in [
+		"SELECT o.id FROM sales o WHERE o.amount IN (SELECT l.amount FROM sales l)",
+		"SELECT o.id FROM sales o WHERE o.amount NOT IN (SELECT l.amount FROM sales l)",
+	] {
+		let plan = format!("{:?}", plan_sql(sql));
+		assert!(
+			!plan.contains("__member_"),
+			"a predicate IN must keep its join lowering: {sql}"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr0575_equality_quantifier_mapping_mirrors_the_predicate_exactly() {
+	// `= ALL` is NOT `NOT IN`. It asks whether every value equals the probe, so
+	// routing it through membership would answer a different question — the
+	// witness is a single-row set where the two disagree outright: with
+	// amount = 10 in the set, `10 = ALL (…)` is TRUE while `10 NOT IN (…)` is
+	// FALSE. ADR 568 refuses the spelling in a predicate; the projection must
+	// refuse it identically rather than silently lowering it.
+	for (sql, expected) in [
+		(
+			"SELECT o.id, o.amount = ALL (SELECT l.amount FROM sales l) FROM sales o",
+			"write x IN (subquery)",
+		),
+		(
+			"SELECT o.id, o.amount <> ANY (SELECT l.amount FROM sales l) FROM sales o",
+			"write x NOT IN (subquery)",
+		),
+	] {
+		let error = SqlPlanner::new()
+			.plan(sql)
+			.expect_err("this equality spelling is refused, not lowered");
+		assert!(
+			error.to_string().contains(expected),
+			"the projection must cite ADR 568's directive: {error}"
+		);
+	}
+
+	// The two spellings that DO map: `= ANY` is membership and `<> ALL` is its
+	// negation, and they must be exact complements on the decided rows.
+	let any_form = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount = ANY (SELECT r.active FROM regions r) FROM sales o",
+		))
+		.await,
+	);
+	let all_form = membership_flags(
+		&run_logical(&plan_sql(
+			"SELECT o.id, o.amount <> ALL (SELECT r.active FROM regions r) FROM sales o",
+		))
+		.await,
+	);
+	assert_eq!(any_form.len(), all_form.len());
+	for ((id, any), (all_id, all)) in any_form.iter().zip(all_form.iter()) {
+		assert_eq!(id, all_id);
+		match (any, all) {
+			(Some(a), Some(b)) => assert_ne!(a, b, "<> ALL negates = ANY at id {id}"),
+			(None, None) => {}
+			other => panic!("both spellings must be UNKNOWN together at id {id}: {other:?}"),
+		}
+	}
+	assert!(
+		any_form.iter().any(|(_, flag)| flag.is_some()),
+		"the complement claim needs a decided row: {any_form:?}"
 	);
 }

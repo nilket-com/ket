@@ -367,3 +367,58 @@ pub(crate) fn adr0573_projected_exists_reuses_the_predicate_form_machinery() {
 		"refusals name the SQL construct"
 	);
 }
+
+#[test]
+pub(crate) fn adr0575_one_truth_table_per_family_and_no_new_join_kind() {
+	let planner = source("src/sql_planner.rs");
+
+	// One quantified table, built once and consumed by both positions. A
+	// projection-only copy could drift from the predicate's, which is the
+	// failure this guard exists to prevent.
+	assert_eq!(
+		planner
+			.matches("fn quantified_ordering_truth_table")
+			.count(),
+		1,
+		"the ordering-quantified truth table must be defined exactly once"
+	);
+	assert_eq!(
+		planner.matches("quantified_ordering_truth_table(").count(),
+		3,
+		"exactly its definition plus the predicate and projection call sites"
+	);
+	assert_eq!(
+		planner.matches("fn quantified_ordering_subplan").count(),
+		1,
+		"and both positions must share one subplan builder"
+	);
+	assert_eq!(
+		planner.matches("fn membership_truth_table").count(),
+		1,
+		"membership has its own single table, not a second quantified one"
+	);
+
+	// ADR 575's claim is that the three-valued family closes without a
+	// physical mark join. If a later cut adds a join variant under this
+	// record's name, that claim should fail loudly rather than quietly.
+	let ir = source("src/ir.rs");
+	let kinds = ir
+		.split_once("pub enum JoinKind {")
+		.and_then(|(_, tail)| tail.split_once("\n}"))
+		.map(|(block, _)| block)
+		.expect("JoinKind block");
+	for forbidden in ["Mark", "mark"] {
+		assert!(
+			!kinds.contains(forbidden),
+			"ADR 575 closes the family without a mark join kind; found {forbidden}"
+		);
+	}
+
+	// The projection path routes through the shared position type rather than
+	// a second traversal.
+	assert!(
+		planner.contains("fn pull_up_projected_membership")
+			&& planner.contains("fn pull_up_projected_quantified"),
+		"the projected forms are pulled up, not lowered in place"
+	);
+}
