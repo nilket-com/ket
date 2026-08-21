@@ -1023,3 +1023,128 @@ fn assert_terminal_sort_task(
 			)
 	));
 }
+
+/// ADR 0088: this was a live-Wendelon test that proved ORDER BY completes when
+/// the producer streams more batches than Toron's live pacing depth. It
+/// verified its own premise by counting Wendelon's response frames — which
+/// worked only because Wendelon emitted one frame per stored row, and stopped
+/// working when response batching retired that.
+///
+/// The subject was always Toron's pacing, not Wendelon's physical framing, so
+/// the producer is now a Toron-owned synthetic scan that emits seven batches by
+/// construction. That is deterministic, needs no live node, and cannot be
+/// quietly reduced to one batch by a decision in the other ring.
+struct SevenBatchScan {
+	batches: Vec<RecordBatch>,
+}
+
+impl SevenBatchScan {
+	/// Seven single-row batches, unsorted, so the sort has to do real work and
+	/// the count exceeds `LIVE_BACKLOG_DEPTH` (4) with margin.
+	fn new(schema: SchemaRef) -> Self {
+		let rows: [(i64, i64, &str); 7] = [
+			(4, 2, "Cat4"),
+			(1, 1, "Cat1"),
+			(6, 2, "Cat6"),
+			(3, 1, "Cat3"),
+			(2, 1, "Cat2"),
+			(5, 2, "Cat5"),
+			(33, 1, "Cat3"),
+		];
+		let batches = rows
+			.iter()
+			.map(|(id, group, label)| {
+				RecordBatch::try_new(
+					schema.clone(),
+					vec![
+						Arc::new(Int64Array::from(vec![*id])),
+						Arc::new(Int64Array::from(vec![Some(*group)])),
+						Arc::new(StringArray::from(vec![Some(*label)])),
+					],
+				)
+				.expect("synthetic pacing batch")
+			})
+			.collect();
+		Self { batches }
+	}
+}
+
+#[async_trait::async_trait]
+impl StorageScan for SevenBatchScan {
+	async fn scan(&self, request: ScanRequest) -> Result<ScanStream, StorageError> {
+		// The pushed projection has to be honoured, exactly as `FixtureScan`
+		// does: the executor above expects the scan to have applied it, and a
+		// mock that ignores it silently feeds the wrong columns onward.
+		let mut batches = self.batches.clone();
+		if let Some(columns) = request.projected_columns {
+			let indices = columns
+				.into_iter()
+				.map(|column| column.0 as usize)
+				.collect::<Vec<_>>();
+			batches = batches
+				.iter()
+				.map(|batch| batch.project(&indices))
+				.collect::<Result<Vec<_>, _>>()?;
+		}
+		Ok(ScanStream::from_batches(
+			batches[0].schema(),
+			request.session_id,
+			request.query_id,
+			toron::storage::ScanOrigin::BaseRelation,
+			batches,
+		))
+	}
+}
+
+#[tokio::test]
+async fn order_by_completes_when_the_producer_exceeds_the_live_pacing_depth() {
+	// `LIVE_BACKLOG_DEPTH` is 4; seven batches crosses it with margin, so the
+	// pacing semaphore must drain rather than deadlock. The premise is checked
+	// by construction — the scan emits seven batches or the test is wrong about
+	// its own fixture.
+	let schema = sort_schema();
+	let scan = SevenBatchScan::new(schema.clone());
+	assert_eq!(
+		scan.batches.len(),
+		7,
+		"the fixture must exceed the live pacing depth of 4"
+	);
+
+	let mut catalog = MockCatalog::new();
+	catalog
+		.register_descriptor(TableId(1), descriptor(1, "t", schema.as_ref()))
+		.expect("register");
+	let logical = SqlPlanner::new()
+		.plan("SELECT id, label FROM t ORDER BY id")
+		.expect("plan sql");
+	let bound = bind(&logical, &catalog, &PlannerConfig::default())
+		.await
+		.expect("bind");
+
+	let batches = tokio::time::timeout(
+		std::time::Duration::from_secs(10),
+		Executor::new(Arc::new(scan)).execute_bound(&bound, None),
+	)
+	.await
+	.expect("ORDER BY must complete, not stall behind the pacing semaphore")
+	.expect("execute");
+
+	let ids: Vec<i64> = batches
+		.iter()
+		.flat_map(|batch| {
+			let column = batch
+				.column(0)
+				.as_any()
+				.downcast_ref::<Int64Array>()
+				.expect("id column");
+			(0..batch.num_rows())
+				.map(|row| column.value(row))
+				.collect::<Vec<_>>()
+		})
+		.collect();
+	assert_eq!(
+		ids,
+		vec![1, 2, 3, 4, 5, 6, 33],
+		"every producer batch must survive the sort, in order"
+	);
+}

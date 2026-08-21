@@ -479,7 +479,7 @@ async fn wendelon_table_query_appends_row_identity_for_filter_candidates() {
 }
 
 #[tokio::test]
-async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() {
+async fn collect_select_star_limit_3_returns_three_rows_in_one_response_batch() {
 	let fixture = LiveWendelonFixture::start(120).await;
 	let descriptor = descriptor();
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
@@ -514,14 +514,15 @@ async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() 
 
 	assert!(row_count(&full.batches) > 3);
 	assert_eq!(row_count(&limited.batches), 3);
+	// ADR 0088: response framing is no longer one batch per location, so batch
+	// count says nothing here about how much source the producer acquired.
+	// That bound is Wendelon's and is proven there directly against
+	// `clocks.progress_marks`; from this side it is not observable, and
+	// asserting it through frame count would be asserting a coincidence.
 	assert_eq!(
 		limited.batches.len(),
-		3,
-		"LIMIT 3 must return three per-location whole-record batches, not one post-scan rebatch"
-	);
-	assert!(
-		limited.batches.len() < full.batches.len(),
-		"LIMIT 3 must stop before the full whole-record scan"
+		1,
+		"three rows under the response target arrive as one batch"
 	);
 	for batch in &limited.batches {
 		assert_select_star_prefix_schema(&descriptor, batch);
@@ -532,7 +533,7 @@ async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() 
 }
 
 #[tokio::test]
-async fn stream_select_star_consume_three_then_drop_stops_whole_record_scan() {
+async fn stream_select_star_delivers_a_well_formed_batch_under_the_response_target() {
 	let fixture = LiveWendelonFixture::start(121).await;
 	let descriptor = descriptor();
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
@@ -554,7 +555,7 @@ async fn stream_select_star_consume_three_then_drop_stops_whole_record_scan() {
 		)
 		.await
 		.expect("full whole-record select star");
-	assert!(full.batches.len() > 3);
+	assert!(row_count(&full.batches) > 3);
 
 	let mut stream = fixture
 		.client
@@ -567,26 +568,30 @@ async fn stream_select_star_consume_three_then_drop_stops_whole_record_scan() {
 		.await
 		.expect("streaming whole-record select star");
 	let mut consumed = Vec::new();
-	for _ in 0..3 {
-		let batch = stream
-			.next_batch()
-			.await
-			.expect("stream batch")
-			.expect("expected another streamed batch");
-		assert_eq!(
-			batch.num_rows(),
-			1,
-			"whole-record stream should emit per location before cursor drop"
-		);
-		assert_select_star_prefix_schema(&descriptor, &batch);
-		consumed.push(batch);
-	}
+	// ADR 0088: this fixture is twelve rows, far under the 4,096-row response
+	// target, so the first `next_batch()` carries the entire result. There is
+	// no "drop mid-stream" left to observe here — the equality below is proof
+	// of that, not proof of bounding — and per the decision not to bloat live
+	// Toron fixtures, this test does not try to reconstruct one. Bounded
+	// producer work and cancellation are Wendelon's, proven there directly
+	// against `clocks.progress_marks` over sources larger than one quantum.
+	//
+	// What remains is what this layer uniquely owns: a streamed batch arrives
+	// well-formed, with the select-star prefix schema, carrying every row.
+	let batch = stream
+		.next_batch()
+		.await
+		.expect("stream batch")
+		.expect("expected a streamed batch");
+	assert!(batch.num_rows() > 0);
+	assert_select_star_prefix_schema(&descriptor, &batch);
+	consumed.push(batch);
 	drop(stream);
 
-	assert_eq!(row_count(&consumed), 3);
-	assert!(
-		consumed.len() < full.batches.len(),
-		"consuming three batches then dropping must stop before full whole-record materialization"
+	assert_eq!(
+		row_count(&consumed),
+		row_count(&full.batches),
+		"a source under the response target arrives in one streamed batch"
 	);
 
 	fixture.node.handles.abort();
@@ -2374,4 +2379,107 @@ fn runtime_filter_exact_for_i64_values(
 		),
 		probe_descriptor_fingerprint: descriptor.physical_descriptor_fingerprint,
 	}
+}
+
+/// PRODUCT-0137 scan-throughput diagnostic. Opt-in: it writes and reads
+/// thousands of rows against a live in-process Wendelon node, so it costs
+/// seconds rather than milliseconds.
+///
+/// ```sh
+/// cargo test -p toron --test wendelon_storage_execution_test \
+///   scan_throughput_diagnostic -- --ignored --nocapture
+/// ```
+///
+/// The viz slice measured ~460 rows/s through the full daemon stack and
+/// exonerated the materialization write path and the client formatting. This
+/// narrows further: it reads through `WendelonStorageScan` in-process, with no
+/// Toron daemon and no SQL wire between the reader and storage. A comparable
+/// rate here places the cost at or below the Toron/Wendelon storage boundary;
+/// a fast rate places it above, in the daemon or client path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "diagnostic: writes and scans thousands of rows"]
+async fn scan_throughput_diagnostic() {
+	let fixture = LiveWendelonFixture::start(1370).await;
+	let catalog = Arc::new(MockCatalog::new());
+	let planner = toron::sql_planner::SqlPlanner::new();
+	let create_coordinator = QueryCoordinator::new(
+		catalog.clone(),
+		Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		})),
+		PlannerConfig::default(),
+	);
+	create_coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE bench.scan_rate (x DOUBLE, y DOUBLE)")
+				.expect("plan create"),
+			None,
+		)
+		.await
+		.expect("create table");
+
+	let table = TableRef::with_schema("bench", "scan_rate");
+	let binding = catalog.resolve_table(&table).await.expect("resolve");
+	let descriptor = descriptor_from_sql_created_binding(&table, &binding);
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	fixture
+		.node
+		.data_server
+		.refresh_leases_once(&fixture.node.ring, &*fixture.node.clock, 60_000)
+		.await;
+
+	// Two Float64 columns, matching the shape the viz slice measured.
+	const ROWS: usize = 5_000;
+	let xs: Vec<f64> = (0..ROWS).map(|row| row as f64 * 0.5).collect();
+	let ys: Vec<f64> = (0..ROWS).map(|row| row as f64 * 0.25).collect();
+	let batch = RecordBatch::try_new(
+		Arc::new(descriptor.arrow_schema().expect("arrow schema")),
+		vec![
+			Arc::new(arrow::array::Float64Array::from(xs)),
+			Arc::new(arrow::array::Float64Array::from(ys)),
+		],
+	)
+	.expect("write batch");
+	let write_started = std::time::Instant::now();
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch).await;
+	println!("write: {ROWS} rows in {:?}", write_started.elapsed());
+
+	let descriptors = HashMap::from([(binding.local_table_id, descriptor)]);
+	let registry =
+		Arc::new(WendelonDescriptorRegistry::from_descriptors(descriptors).expect("registry"));
+	let executor = Executor::with_context(
+		Arc::new(WendelonStorageScan::with_descriptor_registry(
+			fixture.client.clone(),
+			registry,
+		)),
+		ExecutionContext::new(
+			SessionId(1),
+			QueryId::from_u128(1370),
+			ToronTenantId(1),
+			HlcBound(u64::MAX),
+		),
+	);
+	let coordinator = QueryCoordinator::new(catalog, executor, PlannerConfig::default());
+
+	let read_started = std::time::Instant::now();
+	let result = coordinator
+		.execute_query(
+			&planner
+				.plan("SELECT x, y FROM bench.scan_rate")
+				.expect("plan select"),
+			None,
+		)
+		.await
+		.expect("scan");
+	let elapsed = read_started.elapsed();
+	let rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+	let batches = result.len();
+	assert_eq!(rows, ROWS, "the scan must return every row it wrote");
+	println!(
+		"read: {rows} rows in {elapsed:?} = {:.0} rows/s, across {batches} result batches",
+		rows as f64 / elapsed.as_secs_f64()
+	);
+
+	fixture.node.handles.abort();
 }

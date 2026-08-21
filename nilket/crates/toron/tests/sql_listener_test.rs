@@ -56,7 +56,7 @@ use wendelon::schema::{
 	TenantId as WendelonTenantId, encode_table_schema_descriptor_v1,
 };
 use wendelon::simulator::network::{SimulatedTransportNetwork, SimulatedTransportProvider};
-use wendelon_client::{Client, TableQueryOptions, WriteOptions};
+use wendelon_client::{Client, WriteOptions};
 
 const LIVE_TENANT: WendelonTenantId = WendelonTenantId::new(1);
 const BASE_TS: i64 = 1_599_998_400_000;
@@ -321,8 +321,7 @@ async fn each_rune_version_axis_refuses_skew_with_requested_and_supported_versio
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn order_by_completes_over_live_wendelon_beyond_the_live_shuffle_depth() {
-	const LIVE_SHUFFLE_DEPTH: usize = 4;
+async fn order_by_and_top_k_return_ordered_rows_over_live_wendelon() {
 	let fixture = LiveWendelonFixture::start(535).await;
 	let descriptor = categorical_descriptor();
 	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
@@ -345,29 +344,15 @@ async fn order_by_completes_over_live_wendelon_beyond_the_live_shuffle_depth() {
 		.await;
 	}
 
-	let mut storage_stream = fixture
-		.client
-		.table_query_stream(
-			LIVE_TENANT,
-			&descriptor,
-			Vec::new(),
-			TableQueryOptions::default(),
-		)
-		.await
-		.expect("open real Wendelon table-query stream");
-	let mut producer_batches = 0;
-	while storage_stream
-		.next_batch()
-		.await
-		.expect("read real Wendelon table-query batch")
-		.is_some()
-	{
-		producer_batches += 1;
-	}
-	assert!(
-		producer_batches > LIVE_SHUFFLE_DEPTH,
-		"fixture must cross live pacing depth; observed {producer_batches} batches"
-	);
+	// Wendelon ADR 0088: response batching means the number of frames a live
+	// producer emits no longer tracks the number of stored rows, so this test
+	// can no longer establish "more batches than the pacing depth" by counting
+	// them. That subject moved to a Toron-owned synthetic producer —
+	// `order_by_completes_when_the_producer_exceeds_the_live_pacing_depth` in
+	// sort_ordering_test.rs — which emits seven batches by construction. What
+	// remains here is what this test uniquely owns: a global sort and a top-k
+	// over a real Wendelon node return the right rows in the right order,
+	// within the statement timeout.
 
 	let mut config = toron_config_with_descriptor(descriptor, true);
 	let audit_path = enable_audit(&mut config, "adr535-global-sort");

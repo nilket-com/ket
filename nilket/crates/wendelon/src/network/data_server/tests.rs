@@ -2639,14 +2639,23 @@ impl TransportStream for CancelAfterFrameTransport {
 /// the scan before the remaining row groups are read — the Toron
 /// production path, unlike the whole-record rebatch path which
 /// materializes every location before emitting.
-async fn projected_cost_bound_fixture(
+/// ADR 0088: a consumer that drops mid-stream now bounds producer work by the
+/// response quantum rather than by one row, so a test of that bound needs a
+/// source larger than one quantum. Six rows still serve every other caller.
+async fn projected_cost_bound_fixture_with_rows(
 	tier_name: &str,
+	rows: usize,
 ) -> (Arc<SlabManager>, TableSchemaDescriptor, pbc::Program, usize) {
 	let l2 = Arc::new(MockObjectStore::default());
 	let mgr = make_manager_with_l2_projected_fetch(l2.clone()).await;
 	let descriptor = append_only_table_descriptor();
-	append_append_only_rows_for_query(&mgr, &descriptor, vec![1, 2, 3, 4, 5, 6], hlc(10, 0, 1))
-		.await;
+	append_append_only_rows_for_query(
+		&mgr,
+		&descriptor,
+		(1..=rows as i64).collect(),
+		hlc(10, 0, 1),
+	)
+	.await;
 	let _ = tier_active_slab_with_stats_for_query(&mgr, l2, &descriptor, tier_name).await;
 
 	// `col0 >= 0` keeps every row, so a full scan reads and emits
@@ -2669,10 +2678,29 @@ async fn descriptor_backed_whole_record_cost_bound_fixture() -> (
 	QueryRequestMeta,
 	[QueryScanRange; 1],
 ) {
+	descriptor_backed_whole_record_cost_bound_fixture_with_rows(6).await
+}
+
+/// ADR 0088: see `projected_cost_bound_fixture_with_rows` — a drop-bounding
+/// control needs more rows than one response batch holds.
+async fn descriptor_backed_whole_record_cost_bound_fixture_with_rows(
+	rows: usize,
+) -> (
+	Arc<SlabManager>,
+	TableSchemaDescriptor,
+	pbc::Program,
+	QueryRequestMeta,
+	[QueryScanRange; 1],
+) {
 	let mgr = make_manager().await;
 	let descriptor = append_only_table_descriptor();
-	append_append_only_rows_for_query(&mgr, &descriptor, vec![1, 2, 3, 4, 5, 6], hlc(10, 0, 1))
-		.await;
+	append_append_only_rows_for_query(
+		&mgr,
+		&descriptor,
+		(1..=rows as i64).collect(),
+		hlc(10, 0, 1),
+	)
+	.await;
 	let program = pbc::Program::compile(&[]).unwrap();
 	let mut meta = base_meta();
 	meta.as_of_hlc = hlc(99, 0, 1);
@@ -2689,7 +2717,7 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 	// makes Wendelon stop scanning before it reaches the remaining
 	// row groups.
 	let (mgr, descriptor, program, user_column_count) =
-		projected_cost_bound_fixture("adr118-cost-bound.wnd").await;
+		projected_cost_bound_fixture_with_rows("adr118-cost-bound.wnd", 5_000).await;
 	let mut meta = base_meta();
 	meta.as_of_hlc = hlc(99, 0, 1);
 	let ranges = [QueryScanRange {
@@ -2727,8 +2755,11 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 	.await
 	.unwrap();
 	assert_eq!(full.response.status, ReadStatus::OK);
+	// ADR 0088: measured as producer work, not frames — and over a source
+	// larger than one response quantum, since below that the first frame only
+	// arrives after the scan has already finished.
 	assert!(
-		full_writer.batch_count() >= 2,
+		full.clocks.progress_marks > u64::from(TABLE_QUERY_RESPONSE_TARGET_ROWS as u32),
 		"projected scan emits one frame per location (got {})",
 		full_writer.batch_count()
 	);
@@ -2769,18 +2800,20 @@ async fn cancelled_consumer_stops_before_all_row_groups_scanned() {
 	assert_eq!(
 		cancel_writer.batch_count(),
 		1,
-		"exactly one location is emitted before the cancel check halts the scan"
+		"one response batch is emitted before the cancel check halts the scan"
 	);
 	assert!(
-		cancel_writer.batch_count() < full_writer.batch_count(),
-		"cancellation bounds the scan strictly below a full materialization"
+		cancelled.clocks.progress_marks < full.clocks.progress_marks,
+		"cancellation bounds the scan strictly below a full materialization: {} vs {}",
+		cancelled.clocks.progress_marks,
+		full.clocks.progress_marks
 	);
 }
 
 #[tokio::test]
 async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
 	let (mgr, descriptor, program, meta, ranges) =
-		descriptor_backed_whole_record_cost_bound_fixture().await;
+		descriptor_backed_whole_record_cost_bound_fixture_with_rows(5_000).await;
 
 	let (_full_client, full_server) = tokio::io::duplex(256 * 1024);
 	let mut full_stream = DuplexTransportStream { inner: full_server };
@@ -2807,8 +2840,11 @@ async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
 	.await
 	.unwrap();
 	assert_eq!(full.response.status, ReadStatus::OK);
+	// ADR 0088: producer work, not frames — over a source larger than one
+	// response quantum, since below that the first frame arrives only after
+	// the scan is already complete.
 	assert!(
-		full_writer.batch_count() >= 2,
+		full.clocks.progress_marks > u64::from(TABLE_QUERY_RESPONSE_TARGET_ROWS as u32),
 		"whole-record scan should emit multiple per-location batches"
 	);
 
@@ -2840,7 +2876,7 @@ async fn whole_record_cancelled_consumer_stops_before_all_locations_scanned() {
 
 	assert_eq!(cancelled.response.status, ReadStatus::QUERY_CANCELLED);
 	assert_eq!(cancel_writer.batch_count(), 1);
-	assert!(cancel_writer.batch_count() < full_writer.batch_count());
+	assert!(cancelled.clocks.progress_marks < full.clocks.progress_marks);
 }
 
 #[tokio::test]
@@ -2863,9 +2899,13 @@ async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() 
 	.await
 	.unwrap();
 	assert_eq!(full.response.status, ReadStatus::OK);
+	// ADR 0088: batch count is no longer a proxy for locations visited — rows
+	// coalesce into bounded response batches. The guarantee under test is
+	// bounded producer work, so it is measured directly.
 	assert!(
-		full.batches.len() > 3,
-		"control scan must visit more locations than LIMIT 3"
+		full.clocks.progress_marks > 3,
+		"control scan must examine more source locations than LIMIT 3: {}",
+		full.clocks.progress_marks
 	);
 
 	let limited = plan_query_execution_for_ranges_with_program(
@@ -2885,10 +2925,16 @@ async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() 
 	.unwrap();
 	assert_eq!(limited.response.status, ReadStatus::OK);
 	assert_eq!(limited.response.rows, 3);
-	assert_eq!(limited.batches.len(), 3);
+	assert_eq!(
+		limited.batches.len(),
+		1,
+		"three rows under the response target arrive as one tail batch"
+	);
 	assert!(
-		limited.batches.len() < full.batches.len(),
-		"LIMIT 3 must stop before the full whole-record scan completes"
+		limited.clocks.progress_marks < full.clocks.progress_marks,
+		"LIMIT 3 must stop examining locations before the full scan completes: {} vs {}",
+		limited.clocks.progress_marks,
+		full.clocks.progress_marks
 	);
 	assert_eq!(
 		limited
@@ -2901,9 +2947,9 @@ async fn collect_select_star_limit_3_stops_whole_record_scan_before_full_scan() 
 }
 
 #[tokio::test]
-async fn stream_select_star_consume_three_then_drop_stops_whole_record_scan() {
+async fn stream_select_star_consume_one_batch_then_drop_stops_whole_record_scan() {
 	let (mgr, descriptor, program, meta, ranges) =
-		descriptor_backed_whole_record_cost_bound_fixture().await;
+		descriptor_backed_whole_record_cost_bound_fixture_with_rows(5_000).await;
 
 	let (_full_client, full_server) = tokio::io::duplex(256 * 1024);
 	let mut full_stream = DuplexTransportStream { inner: full_server };
@@ -2930,14 +2976,17 @@ async fn stream_select_star_consume_three_then_drop_stops_whole_record_scan() {
 	.await
 	.unwrap();
 	assert_eq!(full.response.status, ReadStatus::OK);
+	// ADR 0088: producer work, not frames — over a source larger than one
+	// response quantum, since below that the first frame arrives only after
+	// the scan is already complete.
 	assert!(
-		full_writer.batch_count() > 3,
+		full.clocks.progress_marks > u64::from(TABLE_QUERY_RESPONSE_TARGET_ROWS as u32),
 		"control stream must emit more locations than the consuming cursor"
 	);
 
 	let token = CancellationToken::new();
 	let (_drop_client, dropped_server) = tokio::io::duplex(256 * 1024);
-	let mut dropped_stream = CancelAfterFrameTransport::new(dropped_server, token.clone(), 3);
+	let mut dropped_stream = CancelAfterFrameTransport::new(dropped_server, token.clone(), 1);
 	let mut dropped_writer = TableQueryResponseStreamWriter::new(
 		&mut dropped_stream,
 		120,
@@ -2961,9 +3010,8 @@ async fn stream_select_star_consume_three_then_drop_stops_whole_record_scan() {
 	.await
 	.unwrap();
 	assert_eq!(bounded.response.status, ReadStatus::QUERY_CANCELLED);
-	assert_eq!(dropped_writer.batch_count(), 3);
 	assert!(
-		dropped_writer.batch_count() < full_writer.batch_count(),
+		bounded.clocks.progress_marks < full.clocks.progress_marks,
 		"dropping after three streamed rows bounds the whole-record scan"
 	);
 }
@@ -3038,7 +3086,7 @@ async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
 	// Wendelon stops before reading the remaining row groups. The
 	// bound comes from the drop, not from pushdown.
 	let (mgr, descriptor, program, user_column_count) =
-		projected_cost_bound_fixture("adr118-bare-limit.wnd").await;
+		projected_cost_bound_fixture_with_rows("adr118-bare-limit.wnd", 5_000).await;
 	let mut meta = base_meta();
 	meta.as_of_hlc = hlc(99, 0, 1);
 	let ranges = [QueryScanRange {
@@ -3076,10 +3124,14 @@ async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
 	.await
 	.unwrap();
 	assert_eq!(full.response.status, ReadStatus::OK);
+	// ADR 0088: frames no longer track locations, so producer work is measured
+	// directly. The source deliberately exceeds one response quantum — below
+	// that, the first frame only arrives once the scan is already complete and
+	// a consumer drop cannot bound anything.
 	assert!(
-		full_writer.batch_count() >= 2,
-		"no pushdown + no drop scans every location (got {})",
-		full_writer.batch_count()
+		full.clocks.progress_marks > u64::from(TABLE_QUERY_RESPONSE_TARGET_ROWS as u32),
+		"the control must examine more locations than one response batch holds (got {})",
+		full.clocks.progress_marks
 	);
 
 	// The bounded consumer drops after the first batch → cancellation
@@ -3115,8 +3167,11 @@ async fn bare_limit_three_bounds_remote_scan_without_row_limit_pushdown() {
 	.unwrap();
 	assert_eq!(bounded.response.status, ReadStatus::QUERY_CANCELLED);
 	assert!(
-		dropped_writer.batch_count() < full_writer.batch_count(),
-		"consumer drop bounds remote scan below full materialization without row_limit pushdown"
+		bounded.clocks.progress_marks < full.clocks.progress_marks,
+		"consumer drop bounds remote scan below full materialization without row_limit \
+		 pushdown: {} vs {}",
+		bounded.clocks.progress_marks,
+		full.clocks.progress_marks
 	);
 }
 
@@ -14480,4 +14535,151 @@ async fn blocking_encode_slots_bound_concurrency_and_keep_expiry_typed() {
 	};
 	assert!(outcome.is_ok(), "a released slot admits new work");
 	assert_eq!(recovered.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn adr0088_encoded_frame_cap_is_enforced_on_real_bytes_not_an_estimate() {
+	// The row target and the in-memory estimate are both heuristics over
+	// uncompressed shape. Only the encoded payload is what the wire carries, so
+	// a batch whose rows are individually small but collectively encode past
+	// the cap must still be split — an estimate-only bound would pass it whole.
+	let schema = Arc::new(Schema::new(vec![Field::new(
+		"payload",
+		DataType::Utf8,
+		false,
+	)]));
+	// The payload must resist compression: the encoder compresses this path, so
+	// repetitive filler would shrink far under the cap and the split would
+	// never be exercised. A xorshift stream is close enough to incompressible.
+	fn incompressible(seed: u64, len: usize) -> String {
+		let mut state = seed | 1;
+		let mut out = String::with_capacity(len);
+		for _ in 0..len {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			// Printable ASCII, uniformly spread.
+			out.push((b'!' + (state % 90) as u8) as char);
+		}
+		out
+	}
+	// 4,000 rows x ~4 KiB. Deliberately under the 4,096-row target, so the row
+	// bound cannot be what splits this — only the encoded byte bound can.
+	let rows: Vec<String> = (0..4_000)
+		.map(|row| incompressible(row as u64 + 1, 4_096))
+		.collect();
+	let batch = RecordBatch::try_new(
+		schema.clone(),
+		vec![Arc::new(arrow::array::StringArray::from(rows)) as ArrayRef],
+	)
+	.unwrap();
+
+	let whole = wire_encode_batch_for_path(&batch, NetworkCompressionPath::QueryResponse).unwrap();
+	println!(
+		"PROBE encoded_len={} cap={}",
+		whole.len(),
+		MAX_SECTION_BYTES
+	);
+
+	// The premise, checked rather than assumed: this fixture must actually
+	// exceed the cap, or the split below proves nothing. And it must stay under
+	// the row target, or the row bound could be what split it.
+	let whole = wire_encode_batch_for_path(&batch, NetworkCompressionPath::QueryResponse).unwrap();
+	assert!(
+		whole.len() > MAX_SECTION_BYTES as usize,
+		"the fixture must encode past the cap: {} vs {}",
+		whole.len(),
+		MAX_SECTION_BYTES
+	);
+	assert!(batch.num_rows() < TABLE_QUERY_RESPONSE_TARGET_ROWS);
+
+	let mut accumulator = TableQueryResponseAccumulator::default();
+	let mut batches = Vec::new();
+	accumulator
+		.push(batch.clone(), None, &mut batches)
+		.await
+		.unwrap();
+	accumulator.flush(None, &mut batches).await.unwrap();
+
+	assert!(
+		batches.len() > 1,
+		"a payload past the encoded cap must be split, not emitted whole (len={}, rows={:?})",
+		batches.len(),
+		batches
+			.iter()
+			.map(RecordBatch::num_rows)
+			.collect::<Vec<_>>()
+	);
+	assert_eq!(
+		batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
+		batch.num_rows(),
+		"splitting preserves every row"
+	);
+	for emitted in &batches {
+		let encoded =
+			wire_encode_batch_for_path(emitted, NetworkCompressionPath::QueryResponse).unwrap();
+		assert!(
+			encoded.len() <= MAX_SECTION_BYTES as usize,
+			"every emitted batch must fit the frame cap, got {} bytes",
+			encoded.len()
+		);
+	}
+
+	// Order survives the split: the first emitted row is the first source row.
+	let first = batches[0]
+		.column(0)
+		.as_any()
+		.downcast_ref::<arrow::array::StringArray>()
+		.unwrap();
+	let source = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<arrow::array::StringArray>()
+		.unwrap();
+	assert_eq!(first.value(0), source.value(0));
+}
+
+#[tokio::test]
+async fn adr0088_a_single_row_over_the_frame_cap_is_refused_by_name() {
+	// Splitting cannot rescue one row that does not fit. That is the
+	// pre-existing oversized-payload condition, and it must stay a typed
+	// refusal rather than an emitted frame a receiver will reject.
+	let schema = Arc::new(Schema::new(vec![Field::new(
+		"payload",
+		DataType::Utf8,
+		false,
+	)]));
+	// Incompressible, for the same reason as above.
+	let huge: String = {
+		let mut state = 0x9E3779B97F4A7C15u64;
+		let mut out = String::with_capacity(8 * 1024 * 1024);
+		for _ in 0..8 * 1024 * 1024 {
+			state ^= state << 13;
+			state ^= state >> 7;
+			state ^= state << 17;
+			out.push((b'!' + (state % 90) as u8) as char);
+		}
+		out
+	};
+	let batch = RecordBatch::try_new(
+		schema,
+		vec![Arc::new(arrow::array::StringArray::from(vec![huge])) as ArrayRef],
+	)
+	.unwrap();
+
+	let mut accumulator = TableQueryResponseAccumulator::default();
+	let mut batches = Vec::new();
+	// The estimate can flush inside `push`, so the refusal may surface from
+	// either call; what matters is that it surfaces and names the bound.
+	let error = match accumulator.push(batch, None, &mut batches).await {
+		Err(error) => error,
+		Ok(()) => accumulator
+			.flush(None, &mut batches)
+			.await
+			.expect_err("one oversized row cannot be split into a legal frame"),
+	};
+	assert!(
+		error.to_string().contains("frame cap"),
+		"the refusal names the bound it hit: {error}"
+	);
 }

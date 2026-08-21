@@ -28,7 +28,7 @@ pub const HRFT_MAGIC: u32 = 0x48524654; // "HRFT" in ASCII
 /// `max_frame_size` knob in `plans/ops/configuration.md` (5 MiB
 /// default, expressed here per-section since meta + arrow +
 /// trailing can each be up to that cap).
-const MAX_SECTION_BYTES: u32 = 5 * 1024 * 1024;
+pub(crate) const MAX_SECTION_BYTES: u32 = 5 * 1024 * 1024;
 
 /// A fully parsed Wendelon wire frame.
 ///

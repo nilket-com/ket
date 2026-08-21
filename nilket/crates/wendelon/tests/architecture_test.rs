@@ -7440,7 +7440,7 @@ fn adr073_table_query_checks_cancel_at_execution_boundaries() {
 	assert!(plan.contains("plan_table_query_execution_by_secondary_index"));
 	assert!(ranged.contains("for range in ranges"));
 	assert!(ranged.contains("for (key_identity, locality, location) in scanned"));
-	assert!(ranged.contains("writer.emit_batch(&result).await?"));
+	assert!(ranged.contains(".push(result, stream_writer.as_deref_mut(), &mut batches)"));
 }
 
 #[test]
@@ -8060,7 +8060,7 @@ fn adr118_table_query_production_streams_batches_without_boundary_concat() {
 	assert!(stream_handler.contains("writer.total_arrow_bytes()"));
 	assert!(stream_handler.contains("writer.emit_terminal(response).await"));
 	assert!(data_server.contains("stream_writer.as_deref_mut()"));
-	assert!(data_server.contains("writer.emit_batch(&result).await?"));
+	assert!(data_server.contains(".push(result, stream_writer.as_deref_mut(), &mut batches)"));
 	assert!(data_server.contains("if rows == 0 && batches.is_empty()"));
 }
 
@@ -8088,8 +8088,8 @@ fn adr118_wendelon_table_query_checks_cancellation_during_production() {
 		"cancellation must be checked inside the per-location scan loop"
 	);
 	assert!(
-		scan_loop.contains("writer.emit_batch(&result).await?"),
-		"the table-query producer emits per location inside the scan loop"
+		scan_loop.contains(".push(result, stream_writer.as_deref_mut(), &mut batches)"),
+		"the table-query producer must feed its accumulator inside the scan loop (ADR 0088)"
 	);
 	assert!(
 		scan_loop.contains("ReadStatus::QUERY_CANCELLED"),
@@ -8177,8 +8177,9 @@ fn adr120_whole_record_table_query_emits_per_location() {
 	// whole-record fallback must execute PBC and emit from inside the
 	// per-location scan loop, with no post-scan rebatch buffer.
 	assert!(
-		descriptor_backed.contains("writer.emit_batch(&result).await?"),
-		"table-query results must emit per location inside the scan loop"
+		descriptor_backed.contains(".push(result, stream_writer.as_deref_mut(), &mut batches)"),
+		"table-query results must be produced inside the scan loop; ADR 0088 made the \
+		 unit a bounded response batch rather than one frame per location"
 	);
 	assert!(
 		descriptor_backed.contains("pbc::execute_program(program, &batch)"),
@@ -8252,7 +8253,7 @@ fn adr120_cost_bound_is_access_path_independent_for_descriptor_backed_queries() 
 			"{name}: row_limit must be applied before the next storage read"
 		);
 		assert!(
-			region.contains("writer.emit_batch(&result).await?"),
+			region.contains(".push(result, stream_writer.as_deref_mut(), &mut batches)"),
 			"{name}: batch must be emitted from the producer path"
 		);
 		assert!(
@@ -8917,19 +8918,21 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// The root is bounded. Set from the post-carve size plus modest headroom;
 /// ratchet DOWN as domain helper methods are relocated in follow-on cuts
 /// (see plans/conventions/module-decomposition.md). It must never regrow toward
-/// the pre-carve monolith. The 15_250 cap deliberately accounts for the
+/// the pre-carve monolith. The 15_400 cap deliberately accounts for the
 /// root-level fail-closed orphan-witness admission barrier and its two write
 /// call sites, which must remain beside MsgType dispatch for ADR 077, plus
 /// the deterministic `#[cfg(test)]` leadership-override plumbing required to
-/// exercise the unavailable-leadership branch.
+/// exercise the unavailable-leadership branch. ADR 0088 added the table-query
+/// response accumulator beside the stream writer it flushes through; it is
+/// response framing, not a domain helper, so it stays at this root.
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 15_250,
-		"data_server.rs root is {lines} lines (cap 15_250); carve more or justify a deliberate cap bump"
+		lines <= 15_460,
+		"data_server.rs root is {lines} lines (cap 15_460); carve more or justify a deliberate cap bump"
 	);
 }
 

@@ -58,7 +58,9 @@ use crate::network::cdc::{
 	CdcSubscriptionRegistry, SubscriptionHandle, cdc_emit_checkpoint, cdc_emit_empty_frame,
 	cdc_emit_frame, cdc_emit_reject,
 };
-use crate::network::core::{HRFT_MAGIC, read_frame, read_frame_from_header, write_frame};
+use crate::network::core::{
+	HRFT_MAGIC, MAX_SECTION_BYTES, read_frame, read_frame_from_header, write_frame,
+};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::ipc::{
 	observe_wire_encode_error, observe_wire_encode_success, wire_encode_batch_for_path,
@@ -10203,6 +10205,187 @@ struct QueryExecutionPlan {
 	encoding_materialize_audit: Vec<EncodingMaterializeAuditSample>,
 }
 
+/// ADR 0088: how many rows a table-query response batch targets. `SingleRow`
+/// is the default layout, so before this the storage unit was accidentally the
+/// response unit — a 5,000-row read arrived as 5,000 Arrow frames, paying frame
+/// encode, a round trip, and a batch construction once per stored row.
+///
+/// 4,096 matches Wendelon's existing point row-group target. It is a delivery
+/// quantum, not a buffering license: the byte bound below and the per-location
+/// `LIMIT` both still cut a batch short.
+const TABLE_QUERY_RESPONSE_TARGET_ROWS: usize = 4_096;
+
+/// An **early-flush estimate**, not the limit. Counting sliced in-memory bytes
+/// is cheap and keeps a normal batch comfortably clear of the wire cap, but it
+/// is not the same quantity the wire measures: encoding may compress or expand,
+/// so this can never be what enforces anything. It exists to stop a wide scan
+/// from accumulating an enormous batch before the authoritative check runs.
+///
+/// The hard limit is [`MAX_SECTION_BYTES`], enforced on the **encoded** payload
+/// at the flush seam.
+const TABLE_QUERY_RESPONSE_ESTIMATE_BYTES: usize = 4 * 1024 * 1024;
+
+/// ADR 0088: coalesces ordered result batches into bounded response batches.
+///
+/// One accumulator serves both emission paths. Batching only the streaming one
+/// would make frame count and memory posture depend on whether the caller
+/// asked for a stream, which is not a distinction the table-query value
+/// contract makes.
+#[derive(Default)]
+struct TableQueryResponseAccumulator {
+	pending: Vec<RecordBatch>,
+	rows: usize,
+	bytes: usize,
+}
+
+impl TableQueryResponseAccumulator {
+	fn pending_schema(&self) -> Option<arrow::datatypes::SchemaRef> {
+		self.pending.first().map(RecordBatch::schema)
+	}
+
+	/// Slice width for a single result larger than the row target, so one
+	/// oversized source batch cannot become one oversized response batch.
+	fn slices(result: RecordBatch) -> Vec<RecordBatch> {
+		if result.num_rows() <= TABLE_QUERY_RESPONSE_TARGET_ROWS {
+			return vec![result];
+		}
+		let mut slices = Vec::new();
+		let mut offset = 0;
+		while offset < result.num_rows() {
+			let length = TABLE_QUERY_RESPONSE_TARGET_ROWS.min(result.num_rows() - offset);
+			slices.push(result.slice(offset, length));
+			offset += length;
+		}
+		slices
+	}
+
+	/// Sliced in-memory size. An accounting failure is propagated, never read as
+	/// zero: a zero would silently disable the early-flush estimate for exactly
+	/// the batches whose size could not be determined.
+	fn slice_bytes(batch: &RecordBatch) -> std::io::Result<usize> {
+		let mut total = 0usize;
+		for column in batch.columns() {
+			// `get_slice_memory_size` measures this slice, not the allocation
+			// behind it — a sliced batch would otherwise report its parent's
+			// full size and flush far too early.
+			let bytes = column.to_data().get_slice_memory_size().map_err(|error| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!("table query response size accounting failed: {error}"),
+				)
+			})?;
+			total = total.saturating_add(bytes);
+		}
+		Ok(total)
+	}
+
+	async fn push(
+		&mut self,
+		result: RecordBatch,
+		writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
+		batches: &mut Vec<RecordBatch>,
+	) -> std::io::Result<()> {
+		let mut writer = writer;
+		for slice in Self::slices(result) {
+			if slice.num_rows() == 0 {
+				continue;
+			}
+			// A schema transition is a flush boundary; unlike Arrow schemas are
+			// never concatenated. The descriptorless compatibility path can
+			// produce one.
+			let schema_changed = self
+				.pending_schema()
+				.is_some_and(|pending| pending != slice.schema());
+			let slice_bytes = Self::slice_bytes(&slice)?;
+			let would_exceed = self.rows + slice.num_rows() > TABLE_QUERY_RESPONSE_TARGET_ROWS
+				|| self.bytes + slice_bytes > TABLE_QUERY_RESPONSE_ESTIMATE_BYTES;
+			if !self.pending.is_empty() && (schema_changed || would_exceed) {
+				self.flush(writer.as_deref_mut(), batches).await?;
+			}
+			self.rows += slice.num_rows();
+			self.bytes += slice_bytes;
+			self.pending.push(slice);
+			// A single slice that is already past the estimate must not sit in
+			// the accumulator waiting for a boundary that will never come — the
+			// check above only fires when something is already pending.
+			if self.bytes >= TABLE_QUERY_RESPONSE_ESTIMATE_BYTES {
+				self.flush(writer.as_deref_mut(), batches).await?;
+			}
+		}
+		Ok(())
+	}
+
+	async fn flush(
+		&mut self,
+		writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
+		batches: &mut Vec<RecordBatch>,
+	) -> std::io::Result<()> {
+		if self.pending.is_empty() {
+			return Ok(());
+		}
+		let schema = self.pending[0].schema();
+		let combined = if self.pending.len() == 1 {
+			self.pending.remove(0)
+		} else {
+			arrow::compute::concat_batches(&schema, self.pending.iter()).map_err(|error| {
+				std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!("table query response batching failed: {error}"),
+				)
+			})?
+		};
+		self.pending.clear();
+		self.rows = 0;
+		self.bytes = 0;
+		Self::emit_within_frame_cap(combined, writer, batches).await
+	}
+
+	/// The authoritative bound. The row target and the byte estimate are both
+	/// heuristics over uncompressed shape; only the encoded payload is what the
+	/// wire actually carries, so it is measured here and nowhere else.
+	///
+	/// A batch over the cap is halved and retried rather than refused —
+	/// batching must never turn a legal read into a rejected frame. Only a
+	/// single row that cannot fit is refused, which is the pre-existing
+	/// oversized-payload condition this record does not change.
+	async fn emit_within_frame_cap(
+		batch: RecordBatch,
+		writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
+		batches: &mut Vec<RecordBatch>,
+	) -> std::io::Result<()> {
+		let mut writer = writer;
+		// Explicit stack rather than async recursion; the halves are pushed so
+		// the earlier rows pop first and response order is preserved.
+		let mut remaining = vec![batch];
+		while let Some(next) = remaining.pop() {
+			if next.num_rows() == 0 {
+				continue;
+			}
+			let encoded = wire_encode_batch_for_path(&next, NetworkCompressionPath::QueryResponse)?;
+			if encoded.len() <= MAX_SECTION_BYTES as usize {
+				match writer.as_deref_mut() {
+					Some(writer) => writer.emit_encoded_batch(encoded).await?,
+					None => batches.push(next),
+				}
+				continue;
+			}
+			if next.num_rows() == 1 {
+				return Err(std::io::Error::new(
+					std::io::ErrorKind::InvalidData,
+					format!(
+						"table query response row encodes to {} bytes, over the {MAX_SECTION_BYTES}-byte frame cap",
+						encoded.len()
+					),
+				));
+			}
+			let mid = next.num_rows() / 2;
+			remaining.push(next.slice(mid, next.num_rows() - mid));
+			remaining.push(next.slice(0, mid));
+		}
+		Ok(())
+	}
+}
+
 struct TableQueryResponseStreamWriter<'a> {
 	stream: &'a mut dyn TransportStream,
 	stream_id: u32,
@@ -10240,8 +10423,10 @@ impl<'a> TableQueryResponseStreamWriter<'a> {
 		self.first_frame_sent
 	}
 
-	async fn emit_batch(&mut self, batch: &RecordBatch) -> std::io::Result<()> {
-		let arrow = wire_encode_batch_for_path(batch, NetworkCompressionPath::QueryResponse)?;
+	/// ADR 0088: emit a payload the accumulator has already encoded and checked
+	/// against the frame cap. Splitting the encode from the write is what lets
+	/// the cap be enforced on the real bytes without encoding twice.
+	async fn emit_encoded_batch(&mut self, arrow: Vec<u8>) -> std::io::Result<()> {
 		let header = if self.first_frame_sent {
 			FrameHeader {
 				magic: HRFT_MAGIC,
@@ -11623,6 +11808,8 @@ async fn plan_table_query_execution_by_secondary_index(
 	let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
 	let mut stats_prune_cache = QueryStatsPruneCache::default();
 	let mut batches = Vec::new();
+	// ADR 0088: rows coalesce here instead of one frame per location.
+	let mut response_batches = TableQueryResponseAccumulator::default();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
 	let mut work_locations_since_yield = 0usize;
@@ -11752,11 +11939,10 @@ async fn plan_table_query_execution_by_secondary_index(
 			if let Some(expired) = clocks.expired() {
 				return Ok(query_plan_error(meta, expired, local_node));
 			}
-			if let Some(writer) = stream_writer.as_deref_mut() {
-				writer.emit_batch(&result).await?;
-			} else {
-				batches.push(result);
-			}
+			// ADR 0088: coalesced rather than emitted per location.
+			response_batches
+				.push(result, stream_writer.as_deref_mut(), &mut batches)
+				.await?;
 			if row_limit_satisfied(rows, row_limit) {
 				break 'indexed_rows;
 			}
@@ -11902,11 +12088,10 @@ async fn plan_table_query_execution_by_secondary_index(
 			if let Some(expired) = clocks.expired() {
 				return Ok(query_plan_error(meta, expired, local_node));
 			}
-			if let Some(writer) = stream_writer.as_deref_mut() {
-				writer.emit_batch(&result).await?;
-			} else {
-				batches.push(result);
-			}
+			// ADR 0088: coalesced rather than emitted per location.
+			response_batches
+				.push(result, stream_writer.as_deref_mut(), &mut batches)
+				.await?;
 			if row_limit_satisfied(rows, row_limit) {
 				break 'ranges;
 			}
@@ -11925,6 +12110,11 @@ async fn plan_table_query_execution_by_secondary_index(
 		return Ok(plan);
 	}
 
+	// ADR 0088: the accumulator's tail must reach the caller — a bounded
+	// read that stops short of the row target still owes its rows.
+	response_batches
+		.flush(stream_writer.as_deref_mut(), &mut batches)
+		.await?;
 	Ok(QueryExecutionPlan {
 		response: QueryResponseMeta {
 			status: ReadStatus::OK,
@@ -12414,6 +12604,8 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	};
 	metrics().observe_pbc_locality_arcs_scanned(ranges.len() as u64);
 	let mut batches = Vec::new();
+	// ADR 0088: rows coalesce here instead of one frame per location.
+	let mut response_batches = TableQueryResponseAccumulator::default();
 	let mut aggregate_responses = Vec::new();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
@@ -12576,11 +12768,10 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 								if let Some(expired) = clocks.expired() {
 									return Ok(query_plan_error(meta, expired, local_node));
 								}
-								if let Some(writer) = stream_writer.as_deref_mut() {
-									writer.emit_batch(&result).await?;
-								} else {
-									batches.push(result);
-								}
+								// ADR 0088: coalesced rather than emitted per location.
+								response_batches
+									.push(result, stream_writer.as_deref_mut(), &mut batches)
+									.await?;
 								if row_limit_satisfied(rows, row_limit) {
 									break 'ranges;
 								}
@@ -12660,11 +12851,10 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					if let Some(expired) = clocks.expired() {
 						return Ok(query_plan_error(meta, expired, local_node));
 					}
-					if let Some(writer) = stream_writer.as_deref_mut() {
-						writer.emit_batch(&result).await?;
-					} else {
-						batches.push(result);
-					}
+					// ADR 0088: coalesced rather than emitted per location.
+					response_batches
+						.push(result, stream_writer.as_deref_mut(), &mut batches)
+						.await?;
 					if row_limit_satisfied(rows, row_limit) {
 						break 'ranges;
 					}
@@ -12830,11 +13020,10 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			if let Some(expired) = clocks.expired() {
 				return Ok(query_plan_error(meta, expired, local_node));
 			}
-			if let Some(writer) = stream_writer.as_deref_mut() {
-				writer.emit_batch(&result).await?;
-			} else {
-				batches.push(result);
-			}
+			// ADR 0088: coalesced rather than emitted per location.
+			response_batches
+				.push(result, stream_writer.as_deref_mut(), &mut batches)
+				.await?;
 			if row_limit_satisfied(rows, row_limit) {
 				break 'ranges;
 			}
@@ -12912,11 +13101,10 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 		if let Some(expired) = clocks.expired() {
 			return Ok(query_plan_error(meta, expired, local_node));
 		}
-		if let Some(writer) = stream_writer.as_deref_mut() {
-			writer.emit_batch(&result).await?;
-		} else {
-			batches.push(result);
-		}
+		// ADR 0088: coalesced rather than emitted per location.
+		response_batches
+			.push(result, stream_writer.as_deref_mut(), &mut batches)
+			.await?;
 	}
 
 	// 4. Empty result is a legitimate answer. Clients map
@@ -12933,6 +13121,11 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 		return Ok(plan);
 	}
 
+	// ADR 0088: the accumulator's tail must reach the caller — a bounded
+	// read that stops short of the row target still owes its rows.
+	response_batches
+		.flush(stream_writer.as_deref_mut(), &mut batches)
+		.await?;
 	Ok(QueryExecutionPlan {
 		response: QueryResponseMeta {
 			status: ReadStatus::OK,
