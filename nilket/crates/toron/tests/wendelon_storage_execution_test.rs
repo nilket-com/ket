@@ -2429,10 +2429,21 @@ async fn scan_throughput_diagnostic() {
 		.refresh_leases_once(&fixture.node.ring, &*fixture.node.clock, 60_000)
 		.await;
 
-	// Two Float64 columns, matching the shape the viz slice measured.
-	const ROWS: usize = 5_000;
-	let xs: Vec<f64> = (0..ROWS).map(|row| row as f64 * 0.5).collect();
-	let ys: Vec<f64> = (0..ROWS).map(|row| row as f64 * 0.25).collect();
+	// Two Float64 columns, matching the shape the viz slice measured. The size is
+	// parameterized so a rate can be compared across cardinalities without a rebuild.
+	let rows_env = std::env::var("SCAN_DIAG_ROWS").ok();
+	let row_count: usize = match rows_env.as_deref() {
+		Some(raw) => raw.parse().expect("SCAN_DIAG_ROWS must be a row count"),
+		None => 5_000,
+	};
+	// Everything this diagnostic reports is a rate or a ratio against the full
+	// scan, so an empty source would divide by zero and print nothing usable.
+	assert!(
+		row_count > 0,
+		"SCAN_DIAG_ROWS must be at least 1: a zero-row scan has no rate to report"
+	);
+	let xs: Vec<f64> = (0..row_count).map(|row| row as f64 * 0.5).collect();
+	let ys: Vec<f64> = (0..row_count).map(|row| row as f64 * 0.25).collect();
 	let batch = RecordBatch::try_new(
 		Arc::new(descriptor.arrow_schema().expect("arrow schema")),
 		vec![
@@ -2443,7 +2454,7 @@ async fn scan_throughput_diagnostic() {
 	.expect("write batch");
 	let write_started = std::time::Instant::now();
 	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch).await;
-	println!("write: {ROWS} rows in {:?}", write_started.elapsed());
+	println!("write: {row_count} rows in {:?}", write_started.elapsed());
 
 	let descriptors = HashMap::from([(binding.local_table_id, descriptor)]);
 	let registry =
@@ -2475,11 +2486,47 @@ async fn scan_throughput_diagnostic() {
 	let elapsed = read_started.elapsed();
 	let rows: usize = result.iter().map(RecordBatch::num_rows).sum();
 	let batches = result.len();
-	assert_eq!(rows, ROWS, "the scan must return every row it wrote");
+	assert_eq!(rows, row_count, "the scan must return every row it wrote");
 	println!(
 		"read: {rows} rows in {elapsed:?} = {:.0} rows/s, across {batches} result batches",
 		rows as f64 / elapsed.as_secs_f64()
 	);
+
+	// Producer work under a LIMIT smaller than the source. The SQL limit does not
+	// reach Wendelon: `row_limit` exists on the scan request and is translated
+	// into the table-query options, but nothing populates it here, so the scan
+	// reads the whole source and Toron slices the result afterwards. Measured
+	// both ways, the limited scan costs what the full scan costs — that is true
+	// under the current response target and under per-location framing alike, so
+	// it is not a batching effect. This reports the ratio so a future push-down
+	// shows up as the limited scan becoming proportionally cheaper.
+	for limit in [2_000usize, 5_000] {
+		if limit >= row_count {
+			continue;
+		}
+		let limited_started = std::time::Instant::now();
+		let limited = coordinator
+			.execute_query(
+				&planner
+					.plan(&format!("SELECT x, y FROM bench.scan_rate LIMIT {limit}"))
+					.expect("plan limited select"),
+				None,
+			)
+			.await
+			.expect("limited scan");
+		let limited_elapsed = limited_started.elapsed();
+		let limited_rows: usize = limited.iter().map(RecordBatch::num_rows).sum();
+		assert_eq!(
+			limited_rows, limit,
+			"the limited scan must return the limit"
+		);
+		println!(
+			"read LIMIT {limit}: {limited_elapsed:?} = {:.3} of the full {row_count}-row scan \
+			 (limit is {:.3} of the source)",
+			limited_elapsed.as_secs_f64() / elapsed.as_secs_f64(),
+			limit as f64 / row_count as f64
+		);
+	}
 
 	fixture.node.handles.abort();
 }
