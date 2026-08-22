@@ -1,3 +1,5 @@
+#[cfg(test)]
+use crate::schema::table::PlacementSemantics;
 use crate::schema::{
 	IndexObjectId, LogicalSchemaFingerprint, SecondaryIndexDescriptor, SlabId, TableObjectId,
 	TenantId,
@@ -526,6 +528,8 @@ mod tests {
 			hlc: row_hlc,
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 		}
 	}
 

@@ -374,6 +374,7 @@ fn row_tombstone_subtracts_visible_row_digest() {
 			routing_locality: Locality::new(deleted.routing_locality.get()),
 			row_hlc: delete_hlc,
 			is_tombstone: true,
+			partition: None,
 			table_object_id: Some(table),
 		}],
 		RecordBodyCompressionPolicy::Uncompressed,
@@ -634,6 +635,7 @@ fn retention_eviction_helper_matches_real_multirow_survivors() {
 				routing_locality: Locality::new((row as u64) + 1),
 				row_hlc,
 				is_tombstone: false,
+				partition: None,
 				table_object_id: Some(table),
 			}
 		})

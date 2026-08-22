@@ -727,6 +727,14 @@ impl_unit!(
 );
 
 impl_unit!(
+	/// ADR 0090: durable routing partition. Derived from a row's routing
+	/// locality by a fixed, membership-independent function, and stamped on the
+	/// record. The unit of both replica placement and record grouping: an
+	/// ownership boundary never falls inside one.
+	PartitionId, u64
+);
+
+impl_unit!(
 	/// Chunk ordinal within a slab. Encoded into the AEAD nonce per ADR 019.
 	ChunkIndex, u64
 );

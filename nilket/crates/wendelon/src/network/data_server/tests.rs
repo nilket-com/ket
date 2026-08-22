@@ -2024,6 +2024,7 @@ async fn append_append_only_tombstones_for_query(
 				.expect("append-only test row must have cached routing locality"),
 			row_hlc: delete_hlc,
 			is_tombstone: true,
+			partition: None,
 			table_object_id: Some(descriptor.table_object_id),
 		})
 		.collect::<Vec<_>>();
@@ -10378,6 +10379,8 @@ async fn migration_record_roundtrip_preserves_every_field() {
 				hlc: hlc(10, 2, 3),
 				record_row_index: crate::schema::RecordRowIndex::ZERO,
 				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 			},
 			b"frame-one".to_vec(),
 		),
@@ -10392,6 +10395,8 @@ async fn migration_record_roundtrip_preserves_every_field() {
 				hlc: hlc(20, 5, 3),
 				record_row_index: crate::schema::RecordRowIndex::ZERO,
 				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 			},
 			b"frame-two".to_vec(),
 		),
@@ -10747,6 +10752,20 @@ impl ReplicaRouter for FixedReplicaRouter {
 			.chain(std::iter::once(self.default.len()))
 			.max()
 			.unwrap_or(1)
+	}
+
+	fn replicas_for_placement(&self, key: crate::schema::table::PlacementKey) -> Vec<NodeId> {
+		// The fixed test router routes both spaces by their ring value, which
+		// keeps single-space fixtures working; the placement-discriminating
+		// route tests use StaticReplicaRouter instead.
+		match key {
+			crate::schema::table::PlacementKey::RawLocality(locality) => {
+				self.replicas_for_locality(locality)
+			}
+			crate::schema::table::PlacementKey::Partition(partition) => {
+				self.replicas_for_locality(Locality::new(partition.get()))
+			}
+		}
 	}
 }
 
@@ -14756,5 +14775,1056 @@ async fn adr0579_row_limit_bounds_producer_work_to_exactly_the_limit() {
 		"a bounded read must stop at the limit, not at the next response quantum \
 		 (rounding to the quantum would report {})",
 		marks_per_row * TABLE_QUERY_RESPONSE_TARGET_ROWS as u64
+	);
+}
+
+/// ADR 0090 route-selection gate. Route primacy for a point read is judged from
+/// the record's own stamped placement BEFORE any slab byte is touched: a
+/// partitioned entry travels the real READ_REQ route and is owned by its
+/// partition's replica set, while a legacy entry stays on its raw locality.
+/// Every installed location dangles (slab 0xDEAD), so any typed response at all
+/// proves the route decision happened pre-slab.
+mod adr0090_route_selection {
+	use super::*;
+	use crate::schema::PartitionId;
+	use crate::schema::table::PlacementSemantics;
+
+	async fn routed_server(
+		node: &WendelonNode,
+		mgr: Arc<SlabManager>,
+		nodes: Vec<NodeId>,
+	) -> WendelonDataServer {
+		routed_server_with_lease_gate(node, mgr, nodes, true).await
+	}
+
+	async fn routed_server_with_lease_gate(
+		node: &WendelonNode,
+		mgr: Arc<SlabManager>,
+		nodes: Vec<NodeId>,
+		lease_gate: bool,
+	) -> WendelonDataServer {
+		let tiers = TransportTierSet::empty();
+		let roles = NodeRoleSet::empty().with(NodeRole::Data);
+		let mut peers = std::collections::HashMap::new();
+		peers.insert(
+			node.local_node,
+			PeerCapabilities {
+				address: "loopback://77".to_string(),
+				tiers,
+				roles,
+				capabilities: crate::network::transport::NodeCapabilitySet::empty(),
+			},
+		);
+		let epoch = MembershipEpoch { epoch: 1, peers };
+		let (_epoch_tx, epoch_rx) = watch::channel(Arc::new(epoch));
+		let resolver: Arc<dyn crate::network::transport::CapabilityResolver> = Arc::new(
+			crate::network::transport::EpochCapabilityResolver::new(epoch_rx.clone()),
+		);
+		let factory = TransportProviderFactory::new(
+			tiers,
+			std::collections::HashMap::new(),
+			resolver,
+			epoch_rx,
+		);
+		WendelonDataServer::new(
+			mgr,
+			node.raft.clone(),
+			node.log_store.clone(),
+			node.state_machine.clone(),
+			node.local_node,
+			node.clock.clone(),
+			Arc::new(StaticReplicaRouter::new(nodes, 1)),
+			factory,
+			node.pool.clone(),
+		)
+		.unwrap()
+		.with_lease_gate(lease_gate)
+	}
+
+	async fn dispatch_point_read(server: &WendelonDataServer, node: &WendelonNode) -> ReadStatus {
+		let meta = simple_read_meta(1);
+		let key = encode_batch(&single_key_batch()).unwrap();
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let mut arrow_buf = node.pool.acquire();
+		arrow_buf.as_mut_vec().extend_from_slice(&key);
+		let frame = HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::READ_REQ.0,
+				flags: 0,
+				stream_id: 1,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: arrow_buf.len() as u32,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: Some(arrow_buf),
+			trailing: None,
+		};
+		let resp = DataRingServer::handle_data_frame(
+			server,
+			RequestContext {
+				remote: Some(node.local_node),
+				actor: actor(ActorRole::Operator, None),
+			},
+			frame,
+		)
+		.await
+		.unwrap()
+		.unwrap();
+		let meta: ReadResponseMeta =
+			*bytemuck::from_bytes(&resp.meta[..std::mem::size_of::<ReadResponseMeta>()]);
+		meta.status
+	}
+
+	fn dangling(
+		hlc_ms: u64,
+		placement: PlacementSemantics,
+		partition: Option<PartitionId>,
+	) -> RecordLocation {
+		RecordLocation {
+			slab_id: SlabId::new(0xDEAD),
+			offset: 0,
+			length: 8,
+			hlc: hlc(hlc_ms, 0, 1),
+			record_row_index: RecordRowIndex::ZERO,
+			is_tombstone: false,
+			placement,
+			partition,
+		}
+	}
+
+	#[tokio::test]
+	async fn adr0090_a_partitioned_entry_routes_by_partition_and_legacy_by_locality() {
+		let dir = bootstrap_tempdir("adr0090-route");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			77,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let mgr = make_manager().await;
+		let local = node.local_node;
+		let key_identity = simple_read_meta(1).key_identity;
+		let raw = Locality::from(key_identity).get();
+
+		// Static router, two nodes, RF 1: the primary is nodes[value % 2] with
+		// nodes sorted by id. Choose the peer id so the key's RAW locality
+		// routes to the peer — the local node is NOT primary for the legacy
+		// reading of this key. Parities for the partition values follow.
+		let (peer, local_parity) = if raw % 2 == 0 {
+			(
+				NodeId {
+					id: local.id.checked_sub(1).expect("dev node id is nonzero"),
+					_reserved: 0,
+				},
+				1u64,
+			)
+		} else {
+			(
+				NodeId {
+					id: local.id + 1,
+					_reserved: 0,
+				},
+				0u64,
+			)
+		};
+		let server = routed_server(&node, mgr.clone(), vec![local, peer]).await;
+		let tenant_id = simple_read_meta(1).tenant_id;
+
+		// 1. Legacy entry: primacy judged on the raw locality, which routes to
+		// the peer. The local node refuses with NOT_LEADER.
+		mgr.install_version_for_route_test(
+			tenant_id,
+			key_identity,
+			dangling(5, PlacementSemantics::RawLocality, None),
+		);
+		assert_eq!(
+			dispatch_point_read(&server, &node).await,
+			ReadStatus::NOT_LEADER,
+			"a legacy record stays on its raw locality"
+		);
+
+		// 2. A newer partitioned entry whose partition routes to the LOCAL
+		// node: primacy now passes, and with no lease filed the read stops at
+		// LEASE_EXPIRED — after routing, before any slab byte.
+		mgr.install_version_for_route_test(
+			tenant_id,
+			key_identity,
+			dangling(
+				6,
+				PlacementSemantics::Partitioned,
+				Some(PartitionId::new(0x4000 + local_parity)),
+			),
+		);
+		assert_eq!(
+			dispatch_point_read(&server, &node).await,
+			ReadStatus::LEASE_EXPIRED,
+			"a partitioned record is owned by its partition's replica set"
+		);
+
+		// 3. An even newer partitioned entry whose partition routes to the
+		// peer: NOT_LEADER again, so the partition value is genuinely
+		// consulted rather than partitioned records short-circuiting to
+		// local primacy.
+		mgr.install_version_for_route_test(
+			tenant_id,
+			key_identity,
+			dangling(
+				7,
+				PlacementSemantics::Partitioned,
+				Some(PartitionId::new(0x4000 + (1 - local_parity))),
+			),
+		);
+		assert_eq!(
+			dispatch_point_read(&server, &node).await,
+			ReadStatus::NOT_LEADER,
+			"the partition value governs, not merely the partitioned stamp"
+		);
+
+		node.handles.abort();
+	}
+
+	/// ADR 0090 step 3, real route: an in-flight partition transfer overrides
+	/// ring primacy on the production READ_REQ path. The ring says the peer owns
+	/// this partition; the ledger says the transfer owner is the local node — so
+	/// the local node serves (stopping at the lease gate), and completing the
+	/// transfer hands primacy back to the ring, which refuses with NOT_LEADER.
+	#[tokio::test]
+	async fn adr0090_an_in_flight_transfer_overrides_ring_primacy_on_the_read_route() {
+		use crate::consensus::{MigrationLedgerEntry, MigrationState, partition_span};
+
+		let dir = bootstrap_tempdir("adr0090-transfer-route");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			79,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let mgr = make_manager().await;
+		let local = node.local_node;
+		let key_identity = simple_read_meta(1).key_identity;
+		let raw = Locality::from(key_identity).get();
+
+		// A partition whose parity routes to the PEER on the two-node static
+		// ring, so the ledger override — not the ring — is what lets the local
+		// node serve. The peer id is chosen so BOTH the raw locality and the
+		// partition route away from the local node.
+		let (peer, peer_parity) = if raw % 2 == 0 {
+			(
+				NodeId {
+					id: local.id.checked_sub(1).expect("dev node id is nonzero"),
+					_reserved: 0,
+				},
+				0u64,
+			)
+		} else {
+			(
+				NodeId {
+					id: local.id + 1,
+					_reserved: 0,
+				},
+				1u64,
+			)
+		};
+		let partition = PartitionId::new(0x4000 + peer_parity);
+		let server = routed_server(&node, mgr.clone(), vec![local, peer]).await;
+		mgr.install_version_for_route_test(
+			simple_read_meta(1).tenant_id,
+			key_identity,
+			dangling(5, PlacementSemantics::Partitioned, Some(partition)),
+		);
+
+		// Ring alone: the peer owns the partition, the local node refuses.
+		assert_eq!(
+			dispatch_point_read(&server, &node).await,
+			ReadStatus::NOT_LEADER,
+			"without a transfer the ring's owner governs"
+		);
+
+		// An in-flight transfer to the local node: primacy passes and the read
+		// stops at the lease gate — served here, and only here.
+		let (start, end) = partition_span(partition, 16).unwrap();
+		node.state_machine
+			.seed_migration_for_test(MigrationLedgerEntry {
+				migration_id: 31,
+				range_start: start,
+				range_end: end,
+				from_epoch: 0,
+				to_epoch: 1,
+				logical_owner: local,
+				upstream_migration_id: None,
+				source_replicas: vec![peer],
+				migration_hlc_floor: hlc(0, 0, 0),
+				state: MigrationState::BackfillInProgress,
+				completed_by: None,
+				completed_at_hlc: None,
+			})
+			.await;
+		assert_eq!(
+			dispatch_point_read(&server, &node).await,
+			ReadStatus::LEASE_EXPIRED,
+			"an in-flight transfer makes its owner — and only its owner — serve"
+		);
+
+		// Completed: serving reverts to the ring, which still names the peer.
+		node.state_machine
+			.seed_migration_for_test(MigrationLedgerEntry {
+				migration_id: 31,
+				range_start: start,
+				range_end: end,
+				from_epoch: 0,
+				to_epoch: 1,
+				logical_owner: local,
+				upstream_migration_id: None,
+				source_replicas: vec![peer],
+				migration_hlc_floor: hlc(0, 0, 0),
+				state: MigrationState::Completed,
+				completed_by: Some(local),
+				completed_at_hlc: Some(hlc(9, 0, 1)),
+			})
+			.await;
+		assert_eq!(
+			dispatch_point_read(&server, &node).await,
+			ReadStatus::NOT_LEADER,
+			"a completed transfer hands primacy back to the ring"
+		);
+
+		node.handles.abort();
+	}
+
+	/// ADR 0090 ingress control: a REAL partitioned table write, through the
+	/// production `table_write` path, lands on the node that owns its
+	/// PARTITION — while the same row's raw locality is owned by the peer. The
+	/// received owner is proven from durable local state before any read.
+	#[tokio::test]
+	async fn adr0090_a_partitioned_write_lands_on_the_partition_owner() {
+		let dir = bootstrap_tempdir("adr0090-write-owner");
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			78,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(
+				tokio::time::Instant::now() < deadline,
+				"timed out waiting for leader"
+			);
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		node.data_server
+			.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+			.await;
+		let descriptor = multirow_typed_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		let local = node.local_node;
+
+		// Find a row whose RAW locality is odd: under a two-node static router
+		// its raw locality routes to nodes[1] while its partition — the top 63
+		// bits, always even — routes to nodes[0]. The locality of a PK row is
+		// deterministic, so it can be computed before writing.
+		let probe_hlc = hlc(1, 0, 1);
+		let mut chosen = None;
+		for id in 1..512i64 {
+			let batch = typed_table_batch(vec![id]);
+			let meta = typed_table_meta(&descriptor, batch.num_rows());
+			let admission = validate_table_write_request_batch(
+				&meta,
+				&batch,
+				&descriptor,
+				WriterNodeId::from_node_id(local),
+				probe_hlc,
+			)
+			.unwrap();
+			if admission.localities[0].get() % 2 == 1 {
+				chosen = Some((id, admission.key_identities[0], admission.localities[0]));
+				break;
+			}
+		}
+		let (id, key_identity, locality) =
+			chosen.expect("some row in 1..512 has an odd raw locality");
+		let partition = crate::schema::table::partition_for_locality(locality, 63).unwrap();
+		assert_eq!(
+			partition.get() % 2,
+			0,
+			"premise: a 63-bit prefix partition is always even"
+		);
+
+		// Premise: with nodes [local, peer] (peer id higher, so local sorts
+		// first) the partition's owner is the local node and the raw locality's
+		// owner is the peer. Routing by the wrong value is observable.
+		let peer = NodeId {
+			id: local.id + 1,
+			_reserved: 0,
+		};
+		let router = StaticReplicaRouter::new(vec![local, peer], 1);
+		assert_eq!(
+			router.replicas_for_placement(
+				crate::schema::table::PlacementKey::from_parts(
+					PlacementSemantics::Partitioned,
+					Some(partition),
+					locality,
+				)
+				.unwrap()
+			),
+			vec![local],
+			"premise: the partition is owned locally"
+		);
+		assert_eq!(
+			router.replicas_for_locality(locality),
+			vec![peer],
+			"premise: the raw locality is owned by the peer"
+		);
+
+		let mgr = make_manager().await;
+		let server =
+			routed_server_with_lease_gate(&node, mgr.clone(), vec![local, peer], false).await;
+		let batch = typed_table_batch(vec![id]);
+		let meta = typed_table_meta(&descriptor, batch.num_rows());
+		let (resp, _) = tokio::time::timeout(
+			Duration::from_secs(10),
+			server.table_write(meta, batch.clone()),
+		)
+		.await
+		.expect("partitioned write must not hang")
+		.unwrap();
+		assert_eq!(
+			resp.write.status,
+			WriteStatus::OK,
+			"a write owned by the local partition succeeds locally: {resp:?}"
+		);
+
+		// The received owner, proven from durable local state before any read:
+		// the local node holds the row, stamped partitioned, under the V5 chain.
+		let held = mgr
+			.lookup_as_of(tenant(), key_identity, hlc(0, 0, 0))
+			.expect("the partition owner holds the written row");
+		assert_eq!(
+			held.partition,
+			Some(partition),
+			"the stored location carries the derived partition"
+		);
+		assert_eq!(
+			held.placement,
+			crate::schema::table::PlacementSemantics::Partitioned,
+			"the stored location is stamped partitioned"
+		);
+
+		// No inverse arm: fan-out to a remote owner blocks awaiting transport in
+		// this harness, so "routed away" is not cheaply observable here. The
+		// positive arm IS the discriminator — under raw-locality fan-out this
+		// row's owner is the peer, so the write above could not have returned OK
+		// with the row landing locally. Verified by injection: reverting the
+		// fan-out to replicas_for_locality makes this test time out.
+		node.handles.abort();
+	}
+}
+
+/// ADR 0090 decision 6: mixed legacy/partitioned state is a supported steady
+/// state, not a transition window. One table, one scan interval, records under
+/// both placements — every row returns exactly once, each resolved by its own
+/// record's placement.
+mod adr0090_mixed_scan {
+	use super::*;
+	use crate::schema::table::PlacementSemantics;
+
+	#[tokio::test]
+	async fn adr0090_one_interval_scans_both_placements_exactly_once() {
+		let mgr = make_manager().await;
+		let descriptor = append_only_table_descriptor();
+
+		// Partitioned rows: written through the real builder, which derives the
+		// partition at the descriptor-aware boundary.
+		let partitioned_ids = vec![1_i64, 2, 3, 4];
+		let partitioned_keys = append_append_only_rows_for_query(
+			&mgr,
+			&descriptor,
+			partitioned_ids.clone(),
+			hlc(10, 0, 1),
+		)
+		.await;
+
+		// Legacy rows in the SAME table: the pre-0090 writer shape — source rows
+		// with no partition, so the frame carries no `__row_partition__` column
+		// and every index entry decodes as raw-locality.
+		let legacy_ids = vec![101_i64, 102, 103, 104];
+		let legacy_batch = typed_table_batch(legacy_ids.clone());
+		let mut legacy_meta = typed_table_meta(&descriptor, legacy_batch.num_rows());
+		legacy_meta.client_hlc = hlc(11, 0, 1);
+		let admission = validate_table_write_request_batch(
+			&legacy_meta,
+			&legacy_batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			hlc(11, 0, 1),
+		)
+		.unwrap();
+		let legacy_keys = admission.key_identities.clone();
+		let legacy_rows = (0..legacy_batch.num_rows())
+			.map(|row| MultiRowSourceRow {
+				source_row_index: row,
+				key_identity: admission.key_identities[row],
+				routing_locality: admission.localities[row],
+				row_hlc: hlc(11, 0, 1),
+				is_tombstone: false,
+				partition: None,
+				table_object_id: Some(descriptor.table_object_id),
+			})
+			.collect::<Vec<_>>();
+		let encoded = crate::storage::multirow::encode_multirow_from_survivors_with_policy(
+			&legacy_batch,
+			&legacy_rows,
+			descriptor.record_body_compression_policy,
+		)
+		.unwrap();
+		let decoded = decode_batch(&encoded.frame).unwrap();
+		assert!(
+			decoded
+				.column_by_name(crate::schema::STORAGE_ROW_PARTITION_COLUMN)
+				.is_none(),
+			"premise: the legacy frame carries no partition column"
+		);
+		let entries = storage_index_entries_from_batch(&decoded).unwrap();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &entries)
+			.await
+			.unwrap();
+
+		// Premise: both placements are genuinely present in the same table.
+		for key in &partitioned_keys {
+			let held = mgr.lookup_as_of(tenant(), *key, hlc(0, 0, 0)).unwrap();
+			assert_eq!(held.placement, PlacementSemantics::Partitioned);
+			assert!(held.partition.is_some());
+		}
+		for key in &legacy_keys {
+			let held = mgr.lookup_as_of(tenant(), *key, hlc(0, 0, 0)).unwrap();
+			assert_eq!(held.placement, PlacementSemantics::RawLocality);
+			assert_eq!(held.partition, None);
+		}
+
+		// One scan interval covering both placements, through the production
+		// whole-record query path — which cross-checks every record's index
+		// placement against its frame before serving it.
+		let program = pbc::Program::compile(&[]).unwrap();
+		let mut meta = base_meta();
+		meta.as_of_hlc = hlc(99, 0, 1);
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+		assert_eq!(plan.response.status, ReadStatus::OK);
+
+		let mut seen = Vec::new();
+		for batch in &plan.batches {
+			let ids = batch
+				.column_by_name("id")
+				.and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+				.expect("scan output carries the user id column");
+			seen.extend(ids.iter().map(|value| value.expect("id is non-null")));
+		}
+		seen.sort_unstable();
+		let mut expected = [partitioned_ids, legacy_ids].concat();
+		expected.sort_unstable();
+		assert_eq!(
+			seen, expected,
+			"one interval returns every row of both placements exactly once"
+		);
+	}
+}
+
+/// ADR 0090 decision 5: partition-granular transfer state. An in-flight
+/// Migration Ledger entry covering a partition makes exactly its owner the
+/// serving node — never both sides of the transfer, never neither — and a
+/// completed or absent entry hands serving back to the ring.
+mod adr0090_partition_transfer {
+	use super::*;
+	use crate::consensus::{
+		MigrationLedgerEntry, MigrationState, partition_span, partition_transfer_for,
+	};
+	use crate::schema::PartitionId;
+	use crate::schema::table::PlacementKey;
+	use std::collections::HashMap;
+
+	fn span_entry(
+		id: u64,
+		partition: PartitionId,
+		owner: NodeId,
+		state: MigrationState,
+	) -> MigrationLedgerEntry {
+		let (start, end) = partition_span(partition, 16).unwrap();
+		MigrationLedgerEntry {
+			migration_id: id,
+			range_start: start,
+			range_end: end,
+			from_epoch: 1,
+			to_epoch: 2,
+			logical_owner: owner,
+			upstream_migration_id: None,
+			source_replicas: vec![n(1)],
+			migration_hlc_floor: hlc(0, 0, 0),
+			state,
+			completed_by: None,
+			completed_at_hlc: None,
+		}
+	}
+
+	#[test]
+	fn adr0090_partition_span_covers_prefix_and_every_suffix() {
+		let partition = PartitionId::new(0x00AB_0000_0000_0000);
+		let (start, end) = partition_span(partition, 16).unwrap();
+		assert_eq!(start, 0x00AB_0000_0000_0000);
+		assert_eq!(end, 0x00AB_FFFF_FFFF_FFFF);
+		assert!(partition_span(partition, 0).is_err());
+		assert!(partition_span(partition, 64).is_err());
+	}
+
+	#[test]
+	fn adr0090_an_in_flight_transfer_names_exactly_one_serving_node() {
+		let partition = PartitionId::new(0x00AB_0000_0000_0000);
+		let mut migrations = HashMap::new();
+		migrations.insert(9, span_entry(9, partition, n(5), MigrationState::Pending));
+		let transfer = partition_transfer_for(partition, &migrations)
+			.unwrap()
+			.expect("an in-flight entry covering the partition yields a transfer");
+		assert_eq!(transfer.serving, n(5), "the entry owner serves, alone");
+
+		// A row deep inside the span is covered by the same entry — the whole
+		// partition transfers together, never row by row.
+		let interior = PartitionId::new(0x00AB_0000_DEAD_BEEF);
+		let same = partition_transfer_for(interior, &migrations)
+			.unwrap()
+			.unwrap();
+		assert_eq!(same.serving, n(5));
+	}
+
+	#[test]
+	fn adr0090_conflicting_in_flight_claims_are_refused_not_arbitrated() {
+		let partition = PartitionId::new(0x00AB_0000_0000_0000);
+		let mut migrations = HashMap::new();
+		migrations.insert(1, span_entry(1, partition, n(5), MigrationState::Pending));
+		migrations.insert(
+			2,
+			span_entry(2, partition, n(6), MigrationState::BackfillInProgress),
+		);
+		let err = partition_transfer_for(partition, &migrations)
+			.expect_err("two owners claiming one partition is the both-owners hazard");
+		assert!(err.to_string().contains("different owners"), "{err}");
+	}
+
+	/// The transfer owner is the serving PRIMARY, not the whole replica set: a
+	/// literal single-owner transfer would silently collapse replicated
+	/// durability to one node. The remainder of the set comes from the ring's
+	/// own walk at the configured RF.
+	#[test]
+	fn adr0090_a_transfer_keeps_the_configured_replication_factor() {
+		let partition = PartitionId::new(0x00AB_0000_0000_0000);
+		let router = StaticReplicaRouter::new(vec![n(1), n(2), n(3)], 2);
+		let mut in_flight = HashMap::new();
+		in_flight.insert(8, span_entry(8, partition, n(9), MigrationState::Pending));
+		let serving = serving_replicas_for_placement(
+			&router,
+			&in_flight,
+			PlacementKey::from_parts(
+				crate::schema::table::PlacementSemantics::Partitioned,
+				Some(partition),
+				Locality::new(partition.get()),
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		assert_eq!(
+			serving[0],
+			n(9),
+			"the transfer owner anchors the set as serving primary"
+		);
+		assert_eq!(
+			serving.len(),
+			2,
+			"the configured RF survives the transfer: {serving:?}"
+		);
+		assert!(
+			serving[1].id != n(9).id,
+			"the second replica comes from the ring, not a duplicate of the owner"
+		);
+	}
+
+	#[test]
+	fn adr0090_completed_or_absent_transfers_hand_serving_back_to_the_ring() {
+		let partition = PartitionId::new(0x00AB_0000_0000_0000);
+		let mut migrations = HashMap::new();
+		migrations.insert(3, span_entry(3, partition, n(5), MigrationState::Completed));
+		assert!(
+			partition_transfer_for(partition, &migrations)
+				.unwrap()
+				.is_none(),
+			"a completed transfer no longer overrides the ring"
+		);
+		assert!(
+			partition_transfer_for(partition, &HashMap::new())
+				.unwrap()
+				.is_none(),
+			"no entry, no override"
+		);
+
+		// And the combined serving authority never yields neither: with no
+		// transfer the ring answers, with one the owner answers.
+		let router = StaticReplicaRouter::new(vec![n(1), n(2)], 1);
+		let ring_serving = serving_replicas_for_placement(
+			&router,
+			&migrations,
+			PlacementKey::from_parts(
+				crate::schema::table::PlacementSemantics::Partitioned,
+				Some(partition),
+				Locality::new(partition.get()),
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		assert_eq!(ring_serving.len(), 1, "the ring serves a settled partition");
+		let mut in_flight = HashMap::new();
+		in_flight.insert(4, span_entry(4, partition, n(9), MigrationState::Pending));
+		let transfer_serving = serving_replicas_for_placement(
+			&router,
+			&in_flight,
+			PlacementKey::from_parts(
+				crate::schema::table::PlacementSemantics::Partitioned,
+				Some(partition),
+				Locality::new(partition.get()),
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		assert_eq!(
+			transfer_serving,
+			vec![n(9)],
+			"an in-flight transfer is served by exactly its owner"
+		);
+		assert!(
+			!transfer_serving.contains(&ring_serving[0]) || ring_serving[0] == n(9),
+			"the displaced ring owner does not also serve"
+		);
+	}
+}
+
+/// ADR 0090 step 3: a membership change over a table holding BOTH placements,
+/// with a partition transfer in flight across the boundary. Every row resolves
+/// to exactly one serving owner throughout — the in-flight partition to its
+/// transfer owner regardless of the new ring, everything else to the new ring —
+/// and the mixed scan still returns every row exactly once.
+mod adr0090_membership_transition {
+	use super::*;
+	use crate::consensus::{
+		MigrationLedgerEntry, MigrationState, partition_span, partition_transfer_for,
+	};
+	use crate::network::ring::{RingRouter, RingState};
+	use crate::network::transport::{
+		MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities,
+		TransportTierSet,
+	};
+	use crate::schema::PartitionId;
+	use crate::schema::table::{PlacementKey, PlacementSemantics};
+	use std::collections::HashMap;
+
+	fn membership(ids: &[u32], epoch: u64) -> MembershipEpoch {
+		let mut peers = HashMap::new();
+		for id in ids {
+			peers.insert(
+				n(*id),
+				PeerCapabilities {
+					address: format!("loopback://{id}"),
+					tiers: TransportTierSet::empty(),
+					roles: NodeRoleSet::empty().with(NodeRole::Data),
+					capabilities: NodeCapabilitySet::empty(),
+				},
+			);
+		}
+		MembershipEpoch { epoch, peers }
+	}
+
+	#[tokio::test]
+	async fn adr0090_membership_change_with_an_in_flight_transfer_over_mixed_state() {
+		// The mixed table from the decision-6 control: partitioned rows through
+		// the real builder, legacy rows through the pre-0090 writer shape.
+		let mgr = make_manager().await;
+		let descriptor = append_only_table_descriptor();
+		let partitioned_keys = append_append_only_rows_for_query(
+			&mgr,
+			&descriptor,
+			vec![1_i64, 2, 3, 4],
+			hlc(10, 0, 1),
+		)
+		.await;
+		let legacy_batch = typed_table_batch(vec![101_i64, 102, 103, 104]);
+		let mut legacy_meta = typed_table_meta(&descriptor, legacy_batch.num_rows());
+		legacy_meta.client_hlc = hlc(11, 0, 1);
+		let admission = validate_table_write_request_batch(
+			&legacy_meta,
+			&legacy_batch,
+			&descriptor,
+			WriterNodeId::ZERO,
+			hlc(11, 0, 1),
+		)
+		.unwrap();
+		let legacy_keys = admission.key_identities.clone();
+		let legacy_rows = (0..legacy_batch.num_rows())
+			.map(|row| MultiRowSourceRow {
+				source_row_index: row,
+				key_identity: admission.key_identities[row],
+				routing_locality: admission.localities[row],
+				row_hlc: hlc(11, 0, 1),
+				is_tombstone: false,
+				partition: None,
+				table_object_id: Some(descriptor.table_object_id),
+			})
+			.collect::<Vec<_>>();
+		let encoded = crate::storage::multirow::encode_multirow_from_survivors_with_policy(
+			&legacy_batch,
+			&legacy_rows,
+			descriptor.record_body_compression_policy,
+		)
+		.unwrap();
+		let entries =
+			storage_index_entries_from_batch(&decode_batch(&encoded.frame).unwrap()).unwrap();
+		mgr.append_durable_multirow_with_locality(tenant(), &encoded.frame, &entries)
+			.await
+			.unwrap();
+
+		// The placement key of every row, read from durable state.
+		let mut keys = Vec::new();
+		for key in partitioned_keys.iter().chain(legacy_keys.iter()) {
+			let held = mgr.lookup_as_of(tenant(), *key, hlc(0, 0, 0)).unwrap();
+			keys.push(
+				PlacementKey::from_parts(
+					held.placement,
+					held.partition,
+					held.partition
+						.map_or(Locality::from(*key), |_| Locality::from(*key)),
+				)
+				.unwrap(),
+			);
+		}
+
+		// A real membership change: the router's state is atomically swapped
+		// from epoch 1 to epoch 2 with four new nodes.
+		let router = RingRouter::new(RingState::build(&membership(&[1, 2, 3], 1), 1));
+		router.install(RingState::build(&membership(&[1, 2, 3, 4, 5, 6, 7], 2), 1));
+
+		// An in-flight transfer for one partitioned row's partition, owned by a
+		// node the new ring does NOT pick for it — the override must be
+		// load-bearing, so the premise finds such a node.
+		let transferring = keys
+			.iter()
+			.find_map(|key| match key {
+				PlacementKey::Partition(partition) => Some(*partition),
+				PlacementKey::RawLocality(_) => None,
+			})
+			.expect("the mixed table holds at least one partitioned row");
+		let ring_owner = router.replicas_for_placement(
+			PlacementKey::from_parts(
+				PlacementSemantics::Partitioned,
+				Some(transferring),
+				Locality::new(transferring.get()),
+			)
+			.unwrap(),
+		)[0];
+		let transfer_owner = (1..=7)
+			.map(n)
+			.find(|node| node.id != ring_owner.id)
+			.expect("seven nodes offer an owner besides the ring's");
+		let (start, end) = partition_span(transferring, 16).unwrap();
+		let mut migrations = HashMap::new();
+		migrations.insert(
+			21,
+			MigrationLedgerEntry {
+				migration_id: 21,
+				range_start: start,
+				range_end: end,
+				from_epoch: 1,
+				to_epoch: 2,
+				logical_owner: transfer_owner,
+				upstream_migration_id: None,
+				source_replicas: vec![ring_owner],
+				migration_hlc_floor: hlc(0, 0, 0),
+				state: MigrationState::BackfillInProgress,
+				completed_by: None,
+				completed_at_hlc: None,
+			},
+		);
+
+		// Every row resolves to exactly one serving owner across the change.
+		for key in &keys {
+			let serving = serving_replicas_for_placement(&router, &migrations, *key).unwrap();
+			assert_eq!(
+				serving.len(),
+				1,
+				"every row has exactly one serving owner during the transition: {key:?}"
+			);
+			match key {
+				PlacementKey::Partition(partition)
+					if partition_transfer_for(*partition, &migrations)
+						.unwrap()
+						.is_some() =>
+				{
+					assert_eq!(
+						serving,
+						vec![transfer_owner],
+						"the in-flight partition serves at its transfer owner"
+					);
+					assert_ne!(
+						serving[0].id, ring_owner.id,
+						"premise: the override is load-bearing, not coincidental"
+					);
+				}
+				other => {
+					assert_eq!(
+						serving,
+						router.replicas_for_placement(*other),
+						"rows outside the transfer follow the new ring"
+					);
+				}
+			}
+		}
+
+		// Completing the transfer hands the partition back to the new ring.
+		migrations.get_mut(&21).unwrap().state = MigrationState::Completed;
+		let settled = serving_replicas_for_placement(
+			&router,
+			&migrations,
+			PlacementKey::from_parts(
+				PlacementSemantics::Partitioned,
+				Some(transferring),
+				Locality::new(transferring.get()),
+			)
+			.unwrap(),
+		)
+		.unwrap();
+		assert_eq!(
+			settled,
+			vec![ring_owner],
+			"a completed transfer follows the ring"
+		);
+
+		// And the mixed scan is unmoved by any of it: local data serves every
+		// row exactly once, both placements, transfer in flight or not.
+		let program = pbc::Program::compile(&[]).unwrap();
+		let mut meta = base_meta();
+		meta.as_of_hlc = hlc(99, 0, 1);
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			None,
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+		let mut seen = Vec::new();
+		for batch in &plan.batches {
+			let ids = batch
+				.column_by_name("id")
+				.and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+				.expect("scan output carries the user id column");
+			seen.extend(ids.iter().map(|value| value.expect("id is non-null")));
+		}
+		seen.sort_unstable();
+		assert_eq!(
+			seen,
+			vec![1, 2, 3, 4, 101, 102, 103, 104],
+			"the mixed scan returns every row exactly once across the transition"
+		);
+	}
+}
+
+/// Reproduces the CTAS-replacement sequence at the wendelon layer: two
+/// partitioned tables, delete every row of the first, scan the second.
+#[tokio::test]
+async fn adr0090_probe_delete_of_one_table_then_scan_of_another() {
+	let mgr = make_manager().await;
+	let old_table = append_only_table_descriptor();
+	let mut new_table = append_only_table_descriptor();
+	new_table.table_object_id = TableObjectId::new([0x48; 16]);
+	new_table.refresh_descriptor_fingerprints().unwrap();
+
+	let old_keys =
+		append_append_only_rows_for_query(&mgr, &old_table, vec![1, 2, 3, 4], hlc(10, 0, 1)).await;
+	append_append_only_rows_for_query(&mgr, &new_table, vec![3, 4], hlc(11, 0, 1)).await;
+
+	// Delete the old table's rows (the retirement shape).
+	append_append_only_tombstones_for_query(&mgr, &old_table, &old_keys, hlc(12, 0, 1)).await;
+
+	// Scan the new table.
+	let program = pbc::Program::compile(&[]).unwrap();
+	let mut meta = base_meta();
+	meta.as_of_hlc = hlc(99, 0, 1);
+	let ranges = [QueryScanRange {
+		start: Locality::ZERO,
+		end: Locality::MAX,
+	}];
+	let plan = plan_query_execution_for_ranges_with_program(
+		&mgr,
+		n(1),
+		&meta,
+		&program,
+		&ranges,
+		QueryExecutionBudget::default(),
+		None,
+		Some(&new_table),
+		QueryProjectedExecution::Disabled,
+		RowIdentityProjection::None,
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(
+		plan.response.status,
+		ReadStatus::OK,
+		"{:?}",
+		plan.response.status
+	);
+	let rows: usize = plan.batches.iter().map(|batch| batch.num_rows()).sum();
+	assert_eq!(
+		rows, 2,
+		"the second table's rows survive the first's deletion"
 	);
 }

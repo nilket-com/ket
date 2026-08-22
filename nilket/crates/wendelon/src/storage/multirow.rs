@@ -1,8 +1,12 @@
+use crate::schema::PartitionId;
 use crate::schema::table::{
 	MultiRowLayoutDescriptor, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
 	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
 	STORAGE_ROW_TOMBSTONE_COLUMN, TableObjectId, TableSchemaDescriptor, TableWriteAdmission,
 	TableWriteRequestMeta, validate_table_write_request_batch,
+};
+use crate::schema::table::{
+	PlacementSemantics, STORAGE_ROW_PARTITION_COLUMN, partition_for_locality,
 };
 use crate::schema::{
 	HybridTimestamp, Identity, Locality, PbcRejectCode, RecordBodyByteOffset,
@@ -47,6 +51,9 @@ pub struct PackedMultiRowRecord {
 	pub source_row_indices: Vec<usize>,
 	pub key_identity: Identity,
 	pub row_hlc: HybridTimestamp,
+	/// ADR 0090: the partition every row of this record was written under;
+	/// `None` is a raw-locality (legacy) record.
+	pub partition: Option<PartitionId>,
 	pub frame_bytes: Vec<u8>,
 	pub charged_bytes: u64,
 }
@@ -58,6 +65,10 @@ pub struct MultiRowSourceRow {
 	pub routing_locality: Locality,
 	pub row_hlc: HybridTimestamp,
 	pub is_tombstone: bool,
+	/// ADR 0090: the partition this row was written under, derived from its
+	/// routing locality at the descriptor-aware write boundary. `None` writes a
+	/// raw-locality (legacy) row.
+	pub partition: Option<PartitionId>,
 	/// ADR 045 Phase 8 — durable per-row binding back to the
 	/// originating descriptor's `table_object_id`. `Some` on
 	/// every multi-row record (PK + AppendOnly); `None` on
@@ -73,6 +84,9 @@ pub struct StorageRowMetadata {
 	pub routing_locality: Locality,
 	pub row_hlc: HybridTimestamp,
 	pub is_tombstone: bool,
+	/// ADR 0090: read from the frame's per-row `__row_partition__` entry;
+	/// `None` is a raw-locality row.
+	pub partition: Option<PartitionId>,
 	pub record_row_index: RecordRowIndex,
 	/// ADR 045 Phase 8 — `Some` if the stored record carries
 	/// `__row_table_object_id__` (every multi-row record),
@@ -112,6 +126,7 @@ impl From<StorageRowMetadata> for MultiRowIndexEntry {
 			row_hlc: row.row_hlc,
 			is_tombstone: row.is_tombstone,
 			record_row_index: row.record_row_index,
+			partition: row.partition,
 		}
 	}
 }
@@ -226,6 +241,8 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_la
 				routing_locality: locality,
 				row_hlc,
 				is_tombstone: false,
+				partition: write_partition_for_row(descriptor, locality)
+					.map_err(table_pack_io_error)?,
 				table_object_id: stamped_table_object_id,
 			});
 	}
@@ -317,6 +334,19 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_la
 					.iter()
 					.map(|row| row.source_row_index)
 					.collect(),
+				// ADR 0090 decision 3: a record never spans a partition. Every row of a
+				// bucket shares one locality today, so one partition; assert the
+				// invariant rather than assume it survives future bucketing.
+				partition: {
+					let partition = rows[cursor].partition;
+					if rows[cursor..cursor + take_count]
+						.iter()
+						.any(|row| row.partition != partition)
+					{
+						return Err(table_pack_error("a packed record must not span partitions"));
+					}
+					partition
+				},
 				key_identity: first.key_identity,
 				row_hlc: encoded.max_row_hlc,
 				charged_bytes: encoded.encoded_byte_len,
@@ -874,6 +904,7 @@ pub fn merge_multirow_streams(
 			routing_locality: meta.routing_locality,
 			row_hlc: meta.row_hlc,
 			is_tombstone: meta.is_tombstone,
+			partition: meta.partition,
 			table_object_id: meta.table_object_id,
 		})
 		.collect::<Vec<_>>();
@@ -972,6 +1003,9 @@ pub fn append_storage_synthetic_columns(
 				routing_locality: admission.localities[*row],
 				row_hlc,
 				is_tombstone: false,
+				// Secondary-index segment rows stay raw-locality: the V1 segment
+				// format carries no placement.
+				partition: None,
 				table_object_id,
 			})
 		})
@@ -1035,6 +1069,8 @@ pub fn strip_storage_synthetic_columns(batch: &RecordBatch) -> std::io::Result<R
 					// schema-clean.
 					| STORAGE_ROW_TABLE_OBJECT_ID_COLUMN
 					| STORAGE_ROW_TOMBSTONE_COLUMN
+					// ADR 0090: per-row partition is storage-only.
+					| STORAGE_ROW_PARTITION_COLUMN
 			))
 			.then_some(index)
 		})
@@ -1169,6 +1205,18 @@ pub fn storage_rows_from_batch(batch: &RecordBatch) -> std::io::Result<Vec<Stora
 				})
 		})
 		.transpose()?;
+	// ADR 0090: optional per-row partition; a null entry is a raw-locality row.
+	let partitions = batch
+		.column_by_name(STORAGE_ROW_PARTITION_COLUMN)
+		.map(|array| {
+			array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"__row_partition__ column has unexpected Arrow type",
+				)
+			})
+		})
+		.transpose()?;
 	let mut entries = Vec::with_capacity(batch.num_rows());
 	for row in 0..batch.num_rows() {
 		let record_row_index = u32::try_from(row).map_err(|_| {
@@ -1195,6 +1243,9 @@ pub fn storage_rows_from_batch(batch: &RecordBatch) -> std::io::Result<Vec<Stora
 			routing_locality: Locality::new(localities.value(row)),
 			row_hlc: decode_storage_hlc(fixed_16_value(row_hlcs, row, STORAGE_ROW_HLC_COLUMN)?),
 			is_tombstone: tombstones.value(row),
+			partition: partitions
+				.filter(|array| !array.is_null(row))
+				.map(|array| PartitionId::new(array.value(row))),
 			record_row_index: RecordRowIndex::new(record_row_index),
 			table_object_id,
 		});
@@ -1360,6 +1411,18 @@ fn append_storage_synthetic_columns_from_rows(
 			false,
 		)));
 	}
+	let any_partition = rows.iter().any(|row| row.partition.is_some());
+	if any_partition {
+		// ADR 0090: nullable, because presence is per ROW — a null entry is a
+		// raw-locality row inside a record whose schema carries the column, and
+		// partition zero stays a legitimate partition. Omitted entirely when no
+		// row is partitioned, so legacy frames are byte-identical to before.
+		fields.push(Arc::new(Field::new(
+			STORAGE_ROW_PARTITION_COLUMN,
+			DataType::UInt64,
+			true,
+		)));
+	}
 
 	let mut row_hlc_builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 16);
 	let mut row_identity_builder = FixedSizeBinaryBuilder::with_capacity(rows.len(), 32);
@@ -1367,6 +1430,7 @@ fn append_storage_synthetic_columns_from_rows(
 	let mut row_tombstone_builder = BooleanBuilder::with_capacity(rows.len());
 	let mut row_table_object_id_builder =
 		some_table_object_id.map(|_| FixedSizeBinaryBuilder::with_capacity(rows.len(), 16));
+	let mut row_partition_builder = any_partition.then(|| UInt64Builder::with_capacity(rows.len()));
 	for row in rows {
 		row_hlc_builder
 			.append_value(hlc_storage_bytes(row.row_hlc))
@@ -1394,6 +1458,14 @@ fn append_storage_synthetic_columns_from_rows(
 				})?;
 		}
 	}
+	if let Some(builder) = row_partition_builder.as_mut() {
+		for row in rows {
+			match row.partition {
+				Some(partition) => builder.append_value(partition.get()),
+				None => builder.append_null(),
+			}
+		}
+	}
 
 	let mut columns = batch.columns().to_vec();
 	columns.push(Arc::new(row_hlc_builder.finish()) as ArrayRef);
@@ -1401,6 +1473,9 @@ fn append_storage_synthetic_columns_from_rows(
 	columns.push(Arc::new(row_locality_builder.finish()) as ArrayRef);
 	columns.push(Arc::new(row_tombstone_builder.finish()) as ArrayRef);
 	if let Some(mut builder) = row_table_object_id_builder {
+		columns.push(Arc::new(builder.finish()) as ArrayRef);
+	}
+	if let Some(mut builder) = row_partition_builder {
 		columns.push(Arc::new(builder.finish()) as ArrayRef);
 	}
 	RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).map_err(|err| {
@@ -1683,6 +1758,7 @@ mod tests {
 				row_hlc: hlc(12),
 				is_tombstone: false,
 				table_object_id: None,
+				partition: None,
 			},
 			MultiRowSourceRow {
 				source_row_index: 0,
@@ -1691,6 +1767,7 @@ mod tests {
 				row_hlc: hlc(11),
 				is_tombstone: false,
 				table_object_id: None,
+				partition: None,
 			},
 		];
 		let first = encode_multirow_from_survivors(&batch, &rows).unwrap();
@@ -1740,6 +1817,7 @@ mod tests {
 			row_hlc: hlc(10),
 			is_tombstone: false,
 			table_object_id: None,
+			partition: None,
 		};
 		let encoded = encode_multirow_from_survivors_with_policy(
 			&batch,
@@ -1778,6 +1856,7 @@ mod tests {
 					row_hlc: hlc(30),
 					is_tombstone: false,
 					table_object_id: None,
+					partition: None,
 				},
 				MultiRowSourceRow {
 					source_row_index: 1,
@@ -1786,6 +1865,7 @@ mod tests {
 					row_hlc: hlc(10),
 					is_tombstone: false,
 					table_object_id: None,
+					partition: None,
 				},
 			],
 		)
@@ -1800,6 +1880,7 @@ mod tests {
 					row_hlc: hlc(20),
 					is_tombstone: false,
 					table_object_id: None,
+					partition: None,
 				},
 				MultiRowSourceRow {
 					source_row_index: 3,
@@ -1808,6 +1889,7 @@ mod tests {
 					row_hlc: hlc(40),
 					is_tombstone: false,
 					table_object_id: None,
+					partition: None,
 				},
 			],
 		)
@@ -1984,6 +2066,7 @@ mod tests {
 				row_hlc: hlc(90),
 				is_tombstone: true,
 				table_object_id: Some(table_object_id),
+				partition: None,
 			},
 			MultiRowSourceRow {
 				source_row_index: 1,
@@ -1992,6 +2075,7 @@ mod tests {
 				row_hlc: hlc(90),
 				is_tombstone: true,
 				table_object_id: Some(table_object_id),
+				partition: None,
 			},
 		];
 		let packed = pack_tombstone_multirow_source_rows_with_policy(
@@ -2017,4 +2101,481 @@ mod tests {
 		assert_eq!(materialized.num_columns(), 0);
 		assert_eq!(materialized.num_rows(), 0);
 	}
+}
+
+/// ADR 0090: the placement a record frame declares **for one row**.
+///
+/// Arrow IPC is self-describing, so the frame is durable evidence independent
+/// of the persistent index. Presence is per row, not per record: the column
+/// holds a value at the rows written under partitioned placement and a null at
+/// rows that were not, so partition zero stays a legitimate partition and the
+/// requested row — never a neighbour — decides how it routes.
+pub fn storage_frame_placement(
+	batch: &RecordBatch,
+	record_row_index: RecordRowIndex,
+) -> std::io::Result<(PlacementSemantics, Option<PartitionId>)> {
+	let Some(array) = batch.column_by_name(STORAGE_ROW_PARTITION_COLUMN) else {
+		return Ok((PlacementSemantics::RawLocality, None));
+	};
+	let array = array
+		.as_any()
+		.downcast_ref::<UInt64Array>()
+		.ok_or_else(|| {
+			Error::new(
+				ErrorKind::InvalidData,
+				"__row_partition__ column has unexpected Arrow type",
+			)
+		})?;
+	let row = record_row_index.get() as usize;
+	if row >= array.len() {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!(
+				"__row_partition__ has {} rows, which does not cover record row {row}",
+				array.len()
+			),
+		));
+	}
+	if array.is_null(row) {
+		return Ok((PlacementSemantics::RawLocality, None));
+	}
+	Ok((
+		PlacementSemantics::Partitioned,
+		Some(PartitionId::new(array.value(row))),
+	))
+}
+
+/// ADR 0090: the one placement resolver. Every read path that materializes a
+/// row from a stored record resolves placement here, never from the index
+/// alone.
+///
+/// Length dispatch alone cannot tell a genuine V4 index value from a V5 value
+/// truncated back to thirty-six bytes — both read as legacy. The frame is
+/// independent durable evidence, so the two carriers must agree, and the
+/// agreement is evaluated at the requested `record_row_index`: a neighbouring
+/// row's placement never governs.
+pub fn resolve_record_placement(
+	index_placement: PlacementSemantics,
+	index_partition: Option<PartitionId>,
+	batch: &RecordBatch,
+	record_row_index: RecordRowIndex,
+) -> std::io::Result<(PlacementSemantics, Option<PartitionId>)> {
+	let (frame_placement, frame_partition) = storage_frame_placement(batch, record_row_index)?;
+	match (
+		(index_placement, index_partition),
+		(frame_placement, frame_partition),
+	) {
+		((PlacementSemantics::RawLocality, _), (PlacementSemantics::RawLocality, _)) => {
+			Ok((PlacementSemantics::RawLocality, None))
+		}
+		(
+			(PlacementSemantics::Partitioned, Some(index_partition)),
+			(PlacementSemantics::Partitioned, Some(frame_partition)),
+		) if index_partition == frame_partition => {
+			Ok((PlacementSemantics::Partitioned, Some(frame_partition)))
+		}
+		((PlacementSemantics::Partitioned, _), (PlacementSemantics::Partitioned, _)) => {
+			Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"record placement disagrees at row {}: index partition \
+					 {index_partition:?} but frame partition {frame_partition:?}",
+					record_row_index.get()
+				),
+			))
+		}
+		((PlacementSemantics::RawLocality, _), (PlacementSemantics::Partitioned, _)) => {
+			Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"record frame declares partition {frame_partition:?} at row {} but its \
+					 index entry reads as raw-locality; the index value is truncated or \
+					 damaged, not an older record",
+					record_row_index.get()
+				),
+			))
+		}
+		((PlacementSemantics::Partitioned, _), (PlacementSemantics::RawLocality, _)) => {
+			Err(Error::new(
+				ErrorKind::InvalidData,
+				format!(
+					"index entry declares partition {index_partition:?} but the record \
+					 frame carries none at row {}",
+					record_row_index.get()
+				),
+			))
+		}
+	}
+}
+
+/// ADR 0089 point-lookup gate. Packing groups rows that today land in separate
+/// records, so resolving a key inside a packed record must return that row and
+/// never a neighbour. These build packed records directly through the survivor
+/// encoder — the same entry compaction uses — because the bucket path cannot
+/// currently produce a record holding more than one row.
+#[cfg(test)]
+mod adr0089_point_lookup {
+	use super::*;
+	use arrow::array::Int64Array;
+
+	fn hlc(ms: u64) -> HybridTimestamp {
+		HybridTimestamp {
+			physical_ms: ms,
+			logical: 0,
+			node_id: 1,
+		}
+	}
+
+	fn batch(values: Vec<i64>) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(values))],
+		)
+		.unwrap()
+	}
+
+	fn identity(id: i64) -> Identity {
+		let mut bytes = [0u8; 32];
+		bytes[..8].copy_from_slice(&(id as u64).to_be_bytes());
+		Identity::new(bytes)
+	}
+
+	/// Rows whose localities share a prefix and differ only in the per-row
+	/// suffix: exactly the neighbours that packing will place in one record.
+	fn neighbouring_rows(ids: &[i64], prefix: u64) -> Vec<MultiRowSourceRow> {
+		ids.iter()
+			.enumerate()
+			.map(|(ordinal, id)| MultiRowSourceRow {
+				source_row_index: ordinal,
+				key_identity: identity(*id),
+				routing_locality: Locality::new(prefix | (*id as u64)),
+				row_hlc: hlc(10 + ordinal as u64),
+				is_tombstone: false,
+				table_object_id: None,
+				partition: None,
+			})
+			.collect()
+	}
+
+	fn user_value(record: &RecordBatch, index: RecordRowIndex) -> i64 {
+		let row = materialize_record_location_batch(record, index).expect("materialize row");
+		let user = strip_storage_synthetic_columns(&row).expect("strip synthetic columns");
+		assert_eq!(user.num_rows(), 1, "a located row is exactly one row");
+		user.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("id is Int64")
+			.value(0)
+	}
+
+	/// Resolve every key through the record's own per-row identity and assert the
+	/// row carries that key's value. A lookup that drifted to an adjacent row
+	/// would return a neighbour's value and fail here.
+	fn assert_every_key_resolves_exactly(record: &RecordBatch, expected: &[i64]) {
+		let rows = storage_rows_from_batch(record).expect("storage rows");
+		assert_eq!(rows.len(), expected.len(), "record holds every packed row");
+		for id in expected {
+			let entry = rows
+				.iter()
+				.find(|row| row.key_identity == identity(*id))
+				.unwrap_or_else(|| panic!("key {id} is resolvable inside the record"));
+			assert_eq!(
+				user_value(record, entry.record_row_index),
+				*id,
+				"key {id} must resolve to its own row, not a neighbour"
+			);
+		}
+	}
+
+	#[test]
+	fn adr0089_neighbouring_keys_sharing_a_prefix_resolve_to_their_own_rows() {
+		let ids = vec![11_i64, 12, 13, 14];
+		let source = neighbouring_rows(&ids, 0xDEAD_0000_0000_0000);
+		let encoded = encode_multirow_from_survivors(&batch(ids.clone()), &source)
+			.expect("encode packed record");
+		let record = decode_batch(&encoded.frame).expect("decode packed record");
+
+		// Premise: this really is one record holding several rows. Without it the
+		// resolution assertions below would be trivially satisfied.
+		assert_eq!(
+			record.num_rows(),
+			ids.len(),
+			"the gate requires a genuinely packed record"
+		);
+		let localities: std::collections::BTreeSet<_> =
+			source.iter().map(|row| row.routing_locality).collect();
+		assert_eq!(
+			localities.len(),
+			ids.len(),
+			"the packed rows carry distinct localities sharing one prefix"
+		);
+
+		assert_every_key_resolves_exactly(&record, &ids);
+	}
+
+	#[test]
+	fn adr0089_adjacent_row_index_returns_a_different_row() {
+		// The discriminator for the assertions above: if every row decoded the
+		// same, resolving to a neighbour would be undetectable.
+		let ids = vec![21_i64, 22, 23];
+		let source = neighbouring_rows(&ids, 0xBEEF_0000_0000_0000);
+		let encoded =
+			encode_multirow_from_survivors(&batch(ids.clone()), &source).expect("encode packed");
+		let record = decode_batch(&encoded.frame).expect("decode packed");
+		let first = user_value(&record, RecordRowIndex::ZERO);
+		let second = user_value(&record, RecordRowIndex::new(1));
+		assert_ne!(
+			first, second,
+			"adjacent rows must be distinguishable or the gate proves nothing"
+		);
+	}
+
+	#[test]
+	fn adr0089_mixed_packed_and_unpacked_records_each_resolve_exactly() {
+		let packed_ids = vec![31_i64, 32, 33];
+		let packed_source = neighbouring_rows(&packed_ids, 0xFEED_0000_0000_0000);
+		let packed = decode_batch(
+			&encode_multirow_from_survivors(&batch(packed_ids.clone()), &packed_source)
+				.expect("encode packed")
+				.frame,
+		)
+		.expect("decode packed");
+
+		let lone_ids = vec![34_i64];
+		let lone_source = neighbouring_rows(&lone_ids, 0xFEED_0000_0000_0000);
+		let lone = decode_batch(
+			&encode_multirow_from_survivors(&batch(lone_ids.clone()), &lone_source)
+				.expect("encode single")
+				.frame,
+		)
+		.expect("decode single");
+
+		assert_eq!(packed.num_rows(), 3, "packed side holds several rows");
+		assert_eq!(lone.num_rows(), 1, "unpacked side holds exactly one row");
+
+		// Both shapes coexist permanently during and after migration, so each must
+		// resolve on its own terms rather than by assuming a uniform layout.
+		assert_every_key_resolves_exactly(&packed, &packed_ids);
+		assert_every_key_resolves_exactly(&lone, &lone_ids);
+	}
+
+	#[test]
+	fn adr0089_compaction_produced_records_resolve_exactly() {
+		// Compaction encodes survivors through this entry point, so a record it
+		// produces must resolve identically to a write-path record.
+		let ids = vec![41_i64, 42, 43, 44, 45];
+		let source = neighbouring_rows(&ids, 0xC0DE_0000_0000_0000);
+		let encoded = encode_multirow_from_survivors_with_policy(
+			&batch(ids.clone()),
+			&source,
+			RecordBodyCompressionPolicy::default(),
+		)
+		.expect("encode compaction record");
+		let record = decode_batch(&encoded.frame).expect("decode compaction record");
+		assert_eq!(
+			record.num_rows(),
+			ids.len(),
+			"compaction packs every survivor"
+		);
+		assert_eq!(
+			encoded.rows.len(),
+			ids.len(),
+			"the frame's row metadata covers every packed row"
+		);
+		assert_every_key_resolves_exactly(&record, &ids);
+	}
+}
+
+/// ADR 0090 decision 7: a V5 index value truncated back to a V4 length is
+/// indistinguishable from a genuine V4 value by length alone. The record frame
+/// is independent durable evidence, evaluated at the requested row, and
+/// disagreement is refused.
+#[cfg(test)]
+mod adr0090_placement_crosscheck {
+	use super::*;
+	use arrow::array::{Int64Array, UInt64Array};
+	use arrow::datatypes::{DataType, Field, Schema};
+
+	/// A two-row frame whose per-row partition entries are given explicitly.
+	/// `None` is a null entry — that row was written under raw-locality — and
+	/// `Some(0)` is partition zero, a legitimate partition. Presence, not value,
+	/// is the discriminator.
+	fn frame_with_row_partitions(entries: Option<Vec<Option<u64>>>) -> RecordBatch {
+		let mut fields = vec![Field::new("id", DataType::Int64, false)];
+		let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from(vec![1_i64, 2]))];
+		if let Some(entries) = entries {
+			fields.push(Field::new(
+				STORAGE_ROW_PARTITION_COLUMN,
+				DataType::UInt64,
+				true,
+			));
+			columns.push(Arc::new(UInt64Array::from(entries)));
+		}
+		RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()
+	}
+
+	#[test]
+	fn adr0090_frame_placement_is_per_row_presence() {
+		let legacy = frame_with_row_partitions(None);
+		assert_eq!(
+			storage_frame_placement(&legacy, RecordRowIndex::ZERO).unwrap(),
+			(PlacementSemantics::RawLocality, None)
+		);
+		// Partition zero is present, not absent.
+		let zero = frame_with_row_partitions(Some(vec![Some(0), None]));
+		assert_eq!(
+			storage_frame_placement(&zero, RecordRowIndex::ZERO).unwrap(),
+			(PlacementSemantics::Partitioned, Some(PartitionId::new(0)))
+		);
+		// A null entry is raw-locality even though the record carries the column.
+		assert_eq!(
+			storage_frame_placement(&zero, RecordRowIndex::new(1)).unwrap(),
+			(PlacementSemantics::RawLocality, None)
+		);
+	}
+
+	/// The control ADR 0090 decision 7 was missing. A partitioned frame row whose
+	/// index value reads as raw-locality — exactly what a V5 value truncated to
+	/// thirty-six bytes produces — is corruption and must be refused. Length
+	/// dispatch alone cannot see this, which is why the frame is consulted.
+	#[test]
+	fn adr0090_a_partitioned_frame_row_with_a_legacy_reading_index_is_refused() {
+		let frame = frame_with_row_partitions(Some(vec![
+			Some(0x00AB_0000_0000_0000),
+			Some(0x00AB_0000_0000_0000),
+		]));
+		let err = resolve_record_placement(
+			// What a truncated V5 index value decodes to: legacy by length.
+			PlacementSemantics::RawLocality,
+			None,
+			&frame,
+			RecordRowIndex::ZERO,
+		)
+		.expect_err("a truncated V5 index value must be refused, not read as legacy");
+		assert!(
+			err.to_string().contains("truncated or damaged"),
+			"refusal must name truncation as the cause, got: {err}"
+		);
+	}
+
+	#[test]
+	fn adr0090_a_genuine_legacy_record_still_reads() {
+		// Both carriers agree there is no partition: an older record, not damage.
+		let resolved = resolve_record_placement(
+			PlacementSemantics::RawLocality,
+			None,
+			&frame_with_row_partitions(None),
+			RecordRowIndex::ZERO,
+		)
+		.expect("a genuine legacy record must still read");
+		assert_eq!(resolved, (PlacementSemantics::RawLocality, None));
+	}
+
+	#[test]
+	fn adr0090_a_partitioned_record_whose_carriers_agree_reads() {
+		let partition = PartitionId::new(0x00AB_0000_0000_0000);
+		let resolved = resolve_record_placement(
+			PlacementSemantics::Partitioned,
+			Some(partition),
+			&frame_with_row_partitions(Some(vec![Some(partition.get()), Some(partition.get())])),
+			RecordRowIndex::ZERO,
+		)
+		.expect("agreeing carriers must read");
+		assert_eq!(resolved, (PlacementSemantics::Partitioned, Some(partition)));
+	}
+
+	/// The requested row governs, never a neighbour. One record, two rows with
+	/// different frame entries: each row resolves by its own entry, and an index
+	/// claim that matches only the neighbour is refused.
+	#[test]
+	fn adr0090_the_requested_row_governs_not_a_neighbour() {
+		let partition = PartitionId::new(7);
+		let mixed = frame_with_row_partitions(Some(vec![Some(partition.get()), None]));
+
+		// Row 0 is partitioned; its own entry agrees.
+		assert_eq!(
+			resolve_record_placement(
+				PlacementSemantics::Partitioned,
+				Some(partition),
+				&mixed,
+				RecordRowIndex::ZERO,
+			)
+			.expect("row 0 agrees with its own frame entry"),
+			(PlacementSemantics::Partitioned, Some(partition))
+		);
+
+		// Row 1 is raw-locality; the neighbour's partition must not govern it.
+		assert_eq!(
+			resolve_record_placement(
+				PlacementSemantics::RawLocality,
+				None,
+				&mixed,
+				RecordRowIndex::new(1),
+			)
+			.expect("row 1 resolves by its own null entry"),
+			(PlacementSemantics::RawLocality, None)
+		);
+
+		// An index that claims row 1 is partitioned matches only the neighbour's
+		// entry, and is refused rather than satisfied by it.
+		let err = resolve_record_placement(
+			PlacementSemantics::Partitioned,
+			Some(partition),
+			&mixed,
+			RecordRowIndex::new(1),
+		)
+		.expect_err("a neighbour's frame entry must not satisfy row 1's index claim");
+		assert!(err.to_string().contains("carries none at row 1"), "{err}");
+
+		// And two rows carrying different partitions: the index claim matching
+		// row 0 must not pass for row 1.
+		let disagreeing = frame_with_row_partitions(Some(vec![Some(7), Some(9)]));
+		let err = resolve_record_placement(
+			PlacementSemantics::Partitioned,
+			Some(PartitionId::new(7)),
+			&disagreeing,
+			RecordRowIndex::new(1),
+		)
+		.expect_err("row 1's own entry disagrees even though the neighbour matches");
+		assert!(err.to_string().contains("disagrees at row 1"), "{err}");
+	}
+
+	#[test]
+	fn adr0090_disagreeing_partitions_are_refused() {
+		let err = resolve_record_placement(
+			PlacementSemantics::Partitioned,
+			Some(PartitionId::new(1)),
+			&frame_with_row_partitions(Some(vec![Some(2), Some(2)])),
+			RecordRowIndex::ZERO,
+		)
+		.expect_err("two carriers naming different partitions is corruption");
+		assert!(err.to_string().contains("placement disagrees"), "{err}");
+	}
+
+	#[test]
+	fn adr0090_an_index_partition_without_a_frame_partition_is_refused() {
+		let err = resolve_record_placement(
+			PlacementSemantics::Partitioned,
+			Some(PartitionId::new(1)),
+			&frame_with_row_partitions(None),
+			RecordRowIndex::ZERO,
+		)
+		.expect_err("an index-only partition claim is corruption");
+		assert!(err.to_string().contains("carries none"), "{err}");
+	}
+}
+
+/// ADR 0090: the partition a row is written under, derived at the
+/// descriptor-aware write boundary. A MultiRow-layout table whose locality
+/// policy carries a prefix writes partitioned rows; identity-projection
+/// locality has no prefix and stays raw-locality, as does every SingleRow
+/// table.
+pub(crate) fn write_partition_for_row(
+	descriptor: &TableSchemaDescriptor,
+	routing_locality: Locality,
+) -> std::io::Result<Option<PartitionId>> {
+	let Some(prefix_bits) = crate::schema::table::partitioned_prefix_width(descriptor) else {
+		return Ok(None);
+	};
+	Ok(Some(partition_for_locality(routing_locality, prefix_bits)?))
 }

@@ -2,12 +2,15 @@ use crate::crypto::{CryptoManager, TieredMultiRangeReadPlan, TieredPlaintextRang
 use crate::metrics::MetricsRegistry;
 use crate::schema::aggregate::AggregateExpression;
 use crate::schema::pbc::{self, Program};
+#[cfg(test)]
+use crate::schema::table::PlacementSemantics;
 use crate::schema::{
 	EncryptedChunkCount, IpcBufferIndex, IpcBufferLength, IpcBufferOffset,
 	LogicalSchemaFingerprint, RecordBodyByteLen, RecordBodyByteOffset, RecordBodyCompressionPolicy,
 	RecordLayoutPolicy, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
-	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
-	STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, TableSchemaDescriptor,
+	STORAGE_ROW_PARTITION_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
+	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SlabId,
+	TableSchemaDescriptor,
 };
 use crate::storage::core::RecordLocation;
 use crate::storage::encoding::directory::{
@@ -491,6 +494,9 @@ pub enum StorageColumn {
 	/// across cross-table table-spread prefix collisions and
 	/// to avoid PK re-derivation on the projected fast path.
 	RowTableObjectId,
+	/// ADR 0090 — per-row durable partition. Nullable: a null entry is a
+	/// raw-locality row inside a record whose schema carries the column.
+	RowPartition,
 }
 
 impl StorageColumn {
@@ -501,6 +507,7 @@ impl StorageColumn {
 			STORAGE_ROW_ROUTING_LOCALITY_COLUMN => Some(Self::RowRoutingLocality),
 			STORAGE_ROW_TOMBSTONE_COLUMN => Some(Self::RowTombstone),
 			STORAGE_ROW_TABLE_OBJECT_ID_COLUMN => Some(Self::RowTableObjectId),
+			STORAGE_ROW_PARTITION_COLUMN => Some(Self::RowPartition),
 			_ => None,
 		}
 	}
@@ -2158,6 +2165,8 @@ mod tests {
 			},
 			record_row_index: RecordRowIndex::new(0),
 			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 		}
 	}
 

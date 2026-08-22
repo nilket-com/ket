@@ -53,11 +53,12 @@
 //! [`append`]: LocalSlabStore::append
 
 use crate::metrics::global as metrics;
+use crate::schema::table::PlacementSemantics;
 use crate::schema::{
-	CounterCommitFrame, CounterTentativeFrame, HybridTimestamp, Identity, Locality, RecordRowIndex,
-	STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN, STORAGE_ROW_ROUTING_LOCALITY_COLUMN,
-	STORAGE_ROW_TABLE_OBJECT_ID_COLUMN, STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, SlabRecordHeader,
-	TenantId,
+	CounterCommitFrame, CounterTentativeFrame, HybridTimestamp, Identity, Locality, PartitionId,
+	RecordRowIndex, STORAGE_ROW_HLC_COLUMN, STORAGE_ROW_KEY_ID_COLUMN,
+	STORAGE_ROW_ROUTING_LOCALITY_COLUMN, STORAGE_ROW_TABLE_OBJECT_ID_COLUMN,
+	STORAGE_ROW_TOMBSTONE_COLUMN, SlabId, SlabRecordHeader, TenantId,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN};
 use crate::storage::{AsyncFileOps, FileHandle, OpenFlags};
@@ -78,7 +79,14 @@ use tokio::time::Instant;
 const SLAB_RECORD_MAGIC: u32 = 0x534C4142;
 
 /// A pointer to a record's location on disk.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+///
+/// Identity is the PHYSICAL record: two locations naming the same bytes are the
+/// same location, whatever placement metadata each copy carries. Placement is
+/// an attribute that rides along for route selection; including it in `Eq`/
+/// `Hash` silently splits map keys between registration and reconstruction —
+/// reference counts then add under one key and remove under another, and a
+/// slab still holding live rows can be retired.
+#[derive(Clone, Copy, Debug)]
 pub struct RecordLocation {
 	pub slab_id: SlabId,
 	pub offset: u64,
@@ -86,6 +94,37 @@ pub struct RecordLocation {
 	pub hlc: HybridTimestamp,
 	pub record_row_index: RecordRowIndex,
 	pub is_tombstone: bool,
+	/// ADR 0090: the placement semantics this record was written under. Route
+	/// selection consults this BEFORE the slab is read — post-decode validation
+	/// detects a bad destination too late. Loaded from the V5 persistent index
+	/// on recovery; `RawLocality` for every record written before partitions.
+	pub placement: PlacementSemantics,
+	/// Set iff `placement` is `Partitioned`.
+	pub partition: Option<PartitionId>,
+}
+
+impl PartialEq for RecordLocation {
+	fn eq(&self, other: &Self) -> bool {
+		self.slab_id == other.slab_id
+			&& self.offset == other.offset
+			&& self.length == other.length
+			&& self.hlc == other.hlc
+			&& self.record_row_index == other.record_row_index
+			&& self.is_tombstone == other.is_tombstone
+	}
+}
+
+impl Eq for RecordLocation {}
+
+impl std::hash::Hash for RecordLocation {
+	fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+		self.slab_id.hash(state);
+		self.offset.hash(state);
+		self.length.hash(state);
+		self.hlc.hash(state);
+		self.record_row_index.hash(state);
+		self.is_tombstone.hash(state);
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -95,6 +134,8 @@ pub(crate) struct MultiRowIndexEntry {
 	pub row_hlc: HybridTimestamp,
 	pub record_row_index: RecordRowIndex,
 	pub is_tombstone: bool,
+	/// ADR 0090: the row's durable partition; `None` is a raw-locality row.
+	pub partition: Option<PartitionId>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -496,6 +537,8 @@ impl LocalSlabStore {
 			hlc,
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 		})
 	}
 
@@ -770,6 +813,8 @@ fn recover_slab(
 			hlc: header.hlc,
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 		};
 		match header.record_class {
 			crate::schema::record_class::STANDARD => {
@@ -874,6 +919,8 @@ pub(crate) fn recover_slab_entries_from_blob(
 			hlc: header.hlc,
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 		};
 		// ADR 075: the blob-tier recovery path does not (yet) apply the
 		// counter tentative/commit rule — counters are not tiered in this cut.
@@ -954,6 +1001,13 @@ fn recover_entries_for_record(
 				hlc: entry.row_hlc,
 				record_row_index: entry.record_row_index,
 				is_tombstone: entry.is_tombstone,
+				// ADR 0090: recovery reads each row's placement from the frame.
+				placement: if entry.partition.is_some() {
+					PlacementSemantics::Partitioned
+				} else {
+					PlacementSemantics::RawLocality
+				},
+				partition: entry.partition,
 				..base_location
 			},
 		})
@@ -1025,6 +1079,20 @@ pub(crate) fn storage_multirow_index_entries_from_frame(
 			)
 		})?;
 	validate_recovered_row_tombstone_marker_shape(&batch, tombstones)?;
+	// ADR 0090: per-row partition presence survives recovery; a null entry or
+	// an absent column is a raw-locality row.
+	let partitions = batch
+		.column_by_name(crate::schema::STORAGE_ROW_PARTITION_COLUMN)
+		.map(|array| {
+			array.as_any().downcast_ref::<UInt64Array>().ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"multi-row storage record has invalid __row_partition__ column",
+				)
+			})
+		})
+		.transpose()?
+		.map(|array| array.clone());
 	let mut entries = Vec::with_capacity(batch.num_rows());
 	for row in 0..batch.num_rows() {
 		let record_row_index = u32::try_from(row).map_err(|_| {
@@ -1047,6 +1115,10 @@ pub(crate) fn storage_multirow_index_entries_from_frame(
 			)?)?,
 			record_row_index: RecordRowIndex::new(record_row_index),
 			is_tombstone: tombstones.value(row),
+			partition: partitions
+				.as_ref()
+				.filter(|array| !arrow::array::Array::is_null(*array, row))
+				.map(|array| PartitionId::new(array.value(row))),
 		});
 	}
 	Ok(Some(entries))
@@ -1284,6 +1356,8 @@ mod tests {
 			hlc,
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 		}
 	}
 

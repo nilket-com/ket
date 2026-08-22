@@ -82,6 +82,8 @@ fn version(ms: u64, lifecycle: VersionLifecycle) -> VersionEntry {
 			hlc: hlc(ms),
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
+			placement: wendelon::schema::table::PlacementSemantics::RawLocality,
+			partition: None,
 		},
 		lifecycle,
 	}

@@ -80,6 +80,8 @@ use crate::network::server::RequestContext;
 use crate::network::tls::{ActorIdentity, ActorRole};
 use crate::network::transport::{MembershipEpoch, NodeCapability, NodeRole, TransportStream};
 use crate::network::wire;
+use crate::schema::PartitionId;
+use crate::schema::table::{PlacementKey, PlacementSemantics};
 use crate::schema::{
 	AcquireLeaseRequestMeta, AcquireLeaseResponseMeta, AggRejectCode, AggregateBudgets,
 	AggregateDiagnostics, AggregateExpression, AggregateExpressionIndex, AggregateFunction,
@@ -134,7 +136,8 @@ use crate::storage::multirow::{
 	has_storage_synthetic_columns, materialize_record_location_batch,
 	pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_layout_config,
 	pack_tombstone_multirow_source_rows_with_policy, replace_storage_row_hlc_column,
-	storage_index_entries_from_batch, storage_row_is_tombstone_at, storage_row_table_object_id_at,
+	resolve_record_placement, storage_index_entries_from_batch, storage_row_is_tombstone_at,
+	storage_row_table_object_id_at,
 };
 use crate::storage::pk_delete::{
 	PkAdmissionOutcome, admit_pk_delete_row, admit_pk_write_row, row_visible_for_admission,
@@ -189,6 +192,7 @@ use crate::network::traits::DataRing;
 // the struct, construction, and MsgType dispatch stay in this module root.
 mod counter;
 mod replica_routing;
+use replica_routing::serving_replicas_for_placement;
 pub use replica_routing::{ReplicaRouter, StaticReplicaRouter};
 mod table_query;
 use table_query::{QueryProjectedExecution, RowGroupFetchAuditCounters};
@@ -347,6 +351,10 @@ struct BifurcatedTableChildWrite {
 	child_ordinal: u64,
 	key_identity: Identity,
 	locality: Locality,
+	/// ADR 0090: the partition every row of this record was written under,
+	/// derived at the descriptor-aware write boundary. `None` is a legacy
+	/// raw-locality record. Fan-out routes by this, never by `locality` alone.
+	partition: Option<PartitionId>,
 	record_row_index: RecordRowIndex,
 	frame_bytes: Arc<Vec<u8>>,
 	payload_hash: [u8; 32],
@@ -7393,6 +7401,15 @@ impl WendelonDataServer {
 		for (cursor, key_identity, locality, location) in candidates {
 			let bytes = self.slab.read(location).await?;
 			let storage_batch = decode_batch(&bytes)?;
+			// ADR 0090: the frame is independent placement evidence, and placement is
+			// never resolved from the index alone — the index entry and the frame must
+			// agree at this row before it is served.
+			resolve_record_placement(
+				location.placement,
+				location.partition,
+				&storage_batch,
+				location.record_row_index,
+			)?;
 			let was_multirow = has_storage_synthetic_columns(&storage_batch);
 			let stored_table_object_id = if was_multirow {
 				storage_row_table_object_id_at(&storage_batch, location.record_row_index)?
@@ -7476,6 +7493,15 @@ impl WendelonDataServer {
 				}
 				let bytes = self.slab.read(location).await?;
 				let storage_batch = decode_batch(&bytes)?;
+				// ADR 0090: the frame is independent placement evidence, and placement is
+				// never resolved from the index alone — the index entry and the frame must
+				// agree at this row before it is served.
+				resolve_record_placement(
+					location.placement,
+					location.partition,
+					&storage_batch,
+					location.record_row_index,
+				)?;
 				let was_multirow = has_storage_synthetic_columns(&storage_batch);
 				let stored_table_object_id = if was_multirow {
 					storage_row_table_object_id_at(&storage_batch, location.record_row_index)?
@@ -7896,6 +7922,9 @@ impl WendelonDataServer {
 				child_ordinal: child.child_ordinal,
 				key_identity: child.key_identity,
 				locality: child.locality,
+				// CDC staging is local bookkeeping after routing has happened;
+				// it never fans out, so the placement is not consulted here.
+				partition: None,
 				record_row_index: child.record_row_index,
 				frame_bytes: child.frame_bytes.clone(),
 				payload_hash: child.payload_hash,
@@ -8217,10 +8246,31 @@ impl WendelonDataServer {
 	fn table_batch_replica_groups(
 		&self,
 		children: &[BifurcatedTableChildWrite],
+		migrations: &std::collections::HashMap<u64, MigrationLedgerEntry>,
 	) -> Option<Vec<TableReplicaGroup>> {
 		let mut groups: Vec<TableReplicaGroup> = Vec::new();
 		for child in children {
-			let replicas = self.router.replicas_for_locality(child.locality);
+			// ADR 0090: a partitioned record fans out to its partition's replica
+			// set; only a legacy record routes by its raw locality.
+			let placement = if child.partition.is_some() {
+				PlacementSemantics::Partitioned
+			} else {
+				PlacementSemantics::RawLocality
+			};
+			let key = match PlacementKey::from_parts(placement, child.partition, child.locality) {
+				Ok(key) => key,
+				Err(error) => {
+					tracing::error!(%error, "table child write carries a malformed placement");
+					return None;
+				}
+			};
+			let replicas = match serving_replicas_for_placement(&*self.router, migrations, key) {
+				Ok(replicas) => replicas,
+				Err(error) => {
+					tracing::error!(%error, "table child write covered by a malformed transfer");
+					return None;
+				}
+			};
 			if replicas.is_empty() {
 				return None;
 			}
@@ -8396,8 +8446,9 @@ impl WendelonDataServer {
 				));
 			}
 		};
+		let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
 		groups = self
-			.table_batch_replica_groups(&bifurcated.children)
+			.table_batch_replica_groups(&bifurcated.children, &migrations_snapshot)
 			.ok_or_else(|| {
 				Error::new(ErrorKind::InvalidData, "table replica group restamp failed")
 			})?;
@@ -8953,7 +9004,10 @@ impl WendelonDataServer {
 				.await?;
 			return Ok((table_write_response(write, PbcRejectCode::NONE), None));
 		};
-		let Some(groups) = self.table_batch_replica_groups(&bifurcated.children) else {
+		let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
+		let Some(groups) =
+			self.table_batch_replica_groups(&bifurcated.children, &migrations_snapshot)
+		else {
 			return Ok((
 				self.table_write_error_response(
 					&meta,
@@ -9384,12 +9438,27 @@ impl WendelonDataServer {
 						));
 					};
 					let source_row_index = tombstone_rows.len();
+					// ADR 0090: a tombstone is placed with the row it deletes.
+					let Ok(tombstone_partition) = crate::storage::multirow::write_partition_for_row(
+						&descriptor,
+						routing_locality,
+					) else {
+						return Ok((
+							self.table_delete_error_response(
+								&meta,
+								WriteStatus::INTERNAL_ERROR,
+								PbcRejectCode::PBC_REJECT_LOCALITY_UNSUPPORTED,
+							),
+							None,
+						));
+					};
 					tombstone_rows.push(MultiRowSourceRow {
 						source_row_index,
 						key_identity: row_key_id,
 						routing_locality,
 						row_hlc: delete_hlc,
 						is_tombstone: true,
+						partition: tombstone_partition,
 						table_object_id: Some(descriptor.table_object_id),
 					});
 				}
@@ -9486,7 +9555,10 @@ impl WendelonDataServer {
 				));
 			}
 		};
-		let Some(groups) = self.table_batch_replica_groups(&bifurcated.children) else {
+		let migrations_snapshot = self.state_machine.state_snapshot().await.migrations.clone();
+		let Some(groups) =
+			self.table_batch_replica_groups(&bifurcated.children, &migrations_snapshot)
+		else {
 			return Ok((
 				self.table_delete_error_response(
 					&meta,
@@ -9654,10 +9726,38 @@ impl DataRing for WendelonDataServer {
 		// fences writes for this range to this node — anything
 		// weaker opens a window where a stale follower could serve
 		// a pre-failover value.
+		//
+		// ADR 0090: primacy is judged against the record's own placement, read
+		// from the index entry BEFORE the slab is touched — a partitioned record
+		// is owned by its partition's replica set, not by the arc its raw
+		// locality lands on. An absent record routes by the key's locality,
+		// which is the legacy space.
+		let placement_key =
+			match self
+				.slab
+				.lookup_as_of(meta.tenant_id, key_identity, meta.as_of_hlc)
+			{
+				Some(routed) => PlacementKey::from_parts(
+					routed.placement,
+					routed.partition,
+					Locality::new(key_locality),
+				)?,
+				None => PlacementKey::from_parts(
+					PlacementSemantics::RawLocality,
+					None,
+					Locality::new(key_locality),
+				)?,
+			};
 		if self.lease_gate_enabled && meta.consistency == Consistency::LINEARIZABLE {
-			let is_primary = self
-				.router
-				.replicas_for_locality(Locality::new(key_locality))
+			// ADR 0090: an in-flight partition transfer overrides ring primacy —
+			// exactly the entry's owner serves while the transfer runs.
+			let serving = if placement_key.is_partition() {
+				let sm = self.state_machine.state_snapshot().await;
+				serving_replicas_for_placement(&*self.router, &sm.migrations, placement_key)?
+			} else {
+				self.router.replicas_for_placement(placement_key)
+			};
+			let is_primary = serving
 				.first()
 				.map(|n| n.id == self.local_node.id)
 				.unwrap_or(false);
@@ -9768,6 +9868,14 @@ impl DataRing for WendelonDataServer {
 		// RecordBatch. We then project out just the `value`
 		// column, shaping the response to `read_value_schema`.
 		let stored = decode_batch(&bytes)?;
+		// ADR 0090: the index entry and the frame must agree before the value is
+		// served; a partitioned frame behind a legacy-reading entry is refused.
+		resolve_record_placement(
+			location.placement,
+			location.partition,
+			&stored,
+			location.record_row_index,
+		)?;
 		let value_bytes = extract_first_binary(&stored, "value")?;
 		let value_batch = build_value_batch(value_bytes)?;
 		let value_len = value_bytes.len() as u32;
@@ -11263,6 +11371,15 @@ async fn read_aggregate_query_location(
 	let bytes = slab.read(location).await?;
 	let decode_started = Instant::now();
 	let storage_batch = decode_batch(&bytes)?;
+	// ADR 0090: the frame is independent placement evidence, and placement is
+	// never resolved from the index alone — the index entry and the frame must
+	// agree at this row before it is served.
+	resolve_record_placement(
+		location.placement,
+		location.partition,
+		&storage_batch,
+		location.record_row_index,
+	)?;
 	let storage_row_count = storage_batch.num_rows();
 	let was_multirow = has_storage_synthetic_columns(&storage_batch);
 	// ADR 045 Phase 8: extract per-row table_object_id from the
@@ -12471,6 +12588,15 @@ async fn read_secondary_index_query_location(
 	}
 	let bytes = slab.read(row.record_location).await?;
 	let storage_batch = decode_batch(&bytes)?;
+	// ADR 0090: the frame is independent placement evidence, and placement is
+	// never resolved from the index alone — the index entry and the frame must
+	// agree at this row before it is served.
+	resolve_record_placement(
+		row.record_location.placement,
+		row.record_location.partition,
+		&storage_batch,
+		row.record_location.record_row_index,
+	)?;
 	let mut batch =
 		materialize_record_location_batch(&storage_batch, row.record_location.record_row_index)?;
 	if let Some(runtime_filter) = runtime_filter_for_projected_execution(projected_execution) {
@@ -12508,6 +12634,15 @@ async fn read_table_query_location(
 	let bytes = slab.read(location).await?;
 	let decode_started = Instant::now();
 	let storage_batch = decode_batch(&bytes)?;
+	// ADR 0090: the frame is independent placement evidence, and placement is
+	// never resolved from the index alone — the index entry and the frame must
+	// agree at this row before it is served.
+	resolve_record_placement(
+		location.placement,
+		location.partition,
+		&storage_batch,
+		location.record_row_index,
+	)?;
 	let storage_row_count = storage_batch.num_rows();
 	let was_multirow = has_storage_synthetic_columns(&storage_batch);
 	let stored_table_object_id = if was_multirow {
@@ -12876,6 +13011,15 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			};
 			let decode_started = Instant::now();
 			let storage_batch = decode_batch(&bytes)?;
+			// ADR 0090: the frame is independent placement evidence, and placement is
+			// never resolved from the index alone — the index entry and the frame must
+			// agree at this row before it is served.
+			resolve_record_placement(
+				location.placement,
+				location.partition,
+				&storage_batch,
+				location.record_row_index,
+			)?;
 			let storage_row_count = storage_batch.num_rows();
 			let was_multirow = has_storage_synthetic_columns(&storage_batch);
 			let stored_table_object_id = if was_multirow {
@@ -15092,6 +15236,8 @@ fn bifurcate_table_delete(
 			child_ordinal: children.len() as u64,
 			key_identity,
 			locality,
+			// ADR 0090: a tombstone record is placed with the rows it deletes.
+			partition: record.source_rows.first().and_then(|row| row.partition),
 			record_row_index: RecordRowIndex::ZERO,
 			payload_hash: payload_digest(frame_bytes.as_slice()),
 			charged_bytes: child_charged_bytes,
@@ -15283,6 +15429,9 @@ fn bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_
 					child_ordinal: meta.child_ordinal_base.saturating_add(row as u64),
 					key_identity: admission.key_identities[row],
 					locality: admission.localities[row],
+					// ADR 0090: SingleRow-layout tables keep raw-locality
+					// placement; partitions arrive with the MultiRow arc.
+					partition: None,
 					record_row_index: RecordRowIndex::ZERO,
 					payload_hash: payload_digest(frame_bytes.as_slice()),
 					charged_bytes: child_charged_bytes,
@@ -15313,6 +15462,7 @@ fn bifurcate_table_write_with_admission_and_row_group_encoding_and_chunk_layout_
 						.saturating_add(children.len() as u64),
 					key_identity: record.key_identity,
 					locality: record.locality,
+					partition: record.partition,
 					record_row_index: RecordRowIndex::ZERO,
 					payload_hash: payload_digest(frame_bytes.as_slice()),
 					charged_bytes: child_charged_bytes,

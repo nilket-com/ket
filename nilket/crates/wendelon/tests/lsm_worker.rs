@@ -74,6 +74,8 @@ fn version(key_byte: u8, ms: u64, length: u32, lifecycle: VersionLifecycle) -> V
 			hlc: hlc(ms),
 			record_row_index: RecordRowIndex::ZERO,
 			is_tombstone: false,
+			placement: wendelon::schema::table::PlacementSemantics::RawLocality,
+			partition: None,
 		},
 		lifecycle,
 	}

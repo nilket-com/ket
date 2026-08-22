@@ -35,6 +35,8 @@ fn version(
 			hlc: hlc(ms),
 			record_row_index: RecordRowIndex::new(row_idx),
 			is_tombstone,
+			placement: wendelon::schema::table::PlacementSemantics::RawLocality,
+			partition: None,
 		},
 		lifecycle,
 	}

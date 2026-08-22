@@ -8925,14 +8925,22 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// exercise the unavailable-leadership branch. ADR 0088 added the table-query
 /// response accumulator beside the stream writer it flushes through; it is
 /// response framing, not a domain helper, so it stays at this root.
+/// ADR 0090 wired the central placement resolver after every read-side record
+/// decode — seven sites plus an import — and judges point-read primacy from the
+/// record's own placement key before the slab is touched. Both are read-path
+/// enforcement, not domain helpers, and remain beside what they validate. The
+/// ingress slice added partition derivation at the write boundary, the
+/// tombstone placement arm, and placement-keyed fan-out; the transfer slice
+/// added the transfer-aware serving consultation at primacy and fan-out. All
+/// are read/write-path enforcement with the same claim to this root.
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 15_460,
-		"data_server.rs root is {lines} lines (cap 15_460); carve more or justify a deliberate cap bump"
+		lines <= 15_620,
+		"data_server.rs root is {lines} lines (cap 15_620); carve more or justify a deliberate cap bump"
 	);
 }
 
@@ -9291,5 +9299,81 @@ fn impl534_snapshot_headers_do_not_invent_log_identity() {
 			"fn log_id(term: u64, index: u64) -> LogId<u32> {\n\t\tlog_id_for(1, term, index)"
 		),
 		"impl 534 recovery fixtures must default to a nonzero leader node id"
+	);
+}
+
+/// ADR 0090: placement is never resolved from the index alone. The record frame
+/// is independent durable evidence — the only way a V5 index value truncated to
+/// a V4 length is distinguishable from a genuine V4 value — so every read path
+/// that decodes a stored record must run the central resolver, and nothing
+/// outside the sanctioned modules may construct a `PlacementKey` directly.
+#[test]
+fn adr0090_placement_is_resolved_centrally_never_from_the_index_alone() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+	// 1. `PlacementKey` construction is confined to the modules that own it:
+	//    the schema definition, the resolver's module, and the routing matches
+	//    (ring, the replica-router trait and its impls, and the test router).
+	//    `PlacementKey::from_parts` is the sanctioned constructor and is exempt
+	//    everywhere; a read path building a VARIANT elsewhere is resolving
+	//    placement on its own authority.
+	let allowed_construction = [
+		"src/schema/table.rs",
+		"src/storage/multirow.rs",
+		"src/network/ring.rs",
+		"src/network/data_server/replica_routing.rs",
+		"src/network/data_server/tests.rs",
+	];
+	let mut offenders = Vec::new();
+	walk_dir(&manifest_dir.join("src"), &mut |path| {
+		if path.extension().is_none_or(|ext| ext != "rs") {
+			return;
+		}
+		let source = fs::read_to_string(path).unwrap();
+		let source = source.replace("PlacementKey::from_parts", "");
+		if !source.contains("PlacementKey::") {
+			return;
+		}
+		let relative = path
+			.strip_prefix(manifest_dir)
+			.unwrap()
+			.to_string_lossy()
+			.replace('\\', "/");
+		if !allowed_construction
+			.iter()
+			.any(|allowed| relative == *allowed)
+		{
+			offenders.push(relative);
+		}
+	});
+	assert!(
+		offenders.is_empty(),
+		"PlacementKey must be constructed only where placement is owned; \
+		 found construction in: {offenders:?}"
+	);
+
+	// 2. Every storage-record decode in the data server's read paths is followed
+	//    by the central resolver. The write path decodes child frames it just
+	//    built, so the count is of read-side `decode_batch(&bytes)` sites; each
+	//    must have a resolver call, and the KV read path has its own.
+	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let read_decodes = data_server
+		.matches("let storage_batch = decode_batch(&bytes)?;")
+		.count();
+	let kv_decodes = data_server
+		.matches("let stored = decode_batch(&bytes)?;")
+		.count();
+	let resolver_calls = data_server.matches("resolve_record_placement(").count();
+	assert_eq!(
+		resolver_calls,
+		read_decodes + kv_decodes,
+		"every read-side record decode must run the central placement resolver: \
+		 {read_decodes} + {kv_decodes} decode sites, {resolver_calls} resolver calls"
+	);
+	assert!(
+		read_decodes >= 6,
+		"the read-side decode census shrank unexpectedly ({read_decodes}); \
+		 if a read path was removed or renamed, retarget this guard rather than \
+		 letting it under-count"
 	);
 }

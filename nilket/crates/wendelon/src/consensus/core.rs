@@ -265,6 +265,81 @@ pub struct MigrationLedgerEntry {
 /// seed one ledger entry per reassigned range. Kept as a thin
 /// value type so future Control Ring work can propose many of
 /// these in a single batch without reshaping `WendelonRequest`.
+/// ADR 0090: the transfer state of one partition, derived from the Migration
+/// Ledger. A partition in flight is served by exactly one node — the entry's
+/// `logical_owner` — and a partition not in flight is served by the ring. The
+/// type carries a single `serving` node, so "both owners" and "neither owner"
+/// are unrepresentable outcomes rather than guarded ones.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PartitionTransfer {
+	pub partition: crate::schema::PartitionId,
+	/// The one node serving this partition while the transfer is in flight.
+	pub serving: NodeId,
+	/// Preferred pull source, when the ledger names one.
+	pub source: Option<NodeId>,
+}
+
+/// The locality span a partition covers: its prefix followed by every suffix.
+/// Contiguous by construction, so the range-shaped Migration Ledger can carry a
+/// whole partition without a schema change.
+pub fn partition_span(
+	partition: crate::schema::PartitionId,
+	prefix_bits: u8,
+) -> std::io::Result<(u64, u64)> {
+	if prefix_bits == 0 || prefix_bits >= 64 {
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			format!("partition prefix_bits must be in 1..=63, got {prefix_bits}"),
+		));
+	}
+	let suffix_mask = u64::MAX >> prefix_bits;
+	Ok((partition.get(), partition.get() | suffix_mask))
+}
+
+/// ADR 0090: the in-flight transfer covering a partition, if any.
+///
+/// A partition is covered by an entry whose range contains its representative
+/// position — the partition value itself, which is also the single ring
+/// position the whole partition routes by. Two in-flight entries covering the
+/// same partition with different owners is a both-owners hazard and is refused
+/// rather than resolved by precedence: a malformed ledger must fail closed, not
+/// pick a side.
+pub fn partition_transfer_for(
+	partition: crate::schema::PartitionId,
+	migrations: &std::collections::HashMap<u64, MigrationLedgerEntry>,
+) -> std::io::Result<Option<PartitionTransfer>> {
+	let position = partition.get();
+	let mut covering = migrations
+		.values()
+		.filter(|entry| {
+			entry.state != MigrationState::Completed
+				&& entry.range_start <= position
+				&& position <= entry.range_end
+		})
+		.collect::<Vec<_>>();
+	covering.sort_by_key(|entry| entry.migration_id);
+	let Some(first) = covering.first() else {
+		return Ok(None);
+	};
+	if covering
+		.iter()
+		.any(|entry| entry.logical_owner.id != first.logical_owner.id)
+	{
+		return Err(std::io::Error::new(
+			std::io::ErrorKind::InvalidData,
+			format!(
+				"partition {position:#x} is claimed by in-flight migrations with \
+				 different owners; refusing to serve it from either",
+			),
+		));
+	}
+	Ok(Some(PartitionTransfer {
+		partition,
+		serving: first.logical_owner,
+		source: first.source_replicas.first().copied(),
+	}))
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SeedMigration {
 	pub entry: MigrationLedgerEntry,

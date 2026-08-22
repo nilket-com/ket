@@ -1,6 +1,7 @@
 use crate::hash::state_digest::{
 	StateDigest, StateDigestAccumulator, secondary_index_entry_element,
 };
+use crate::schema::table::PlacementSemantics;
 use crate::schema::{
 	HybridTimestamp, Identity, IndexArrowTypeTag, IndexObjectId, LogicalSchemaFingerprint,
 	RecordRowIndex, SlabId, TableObjectId, TenantId,
@@ -290,6 +291,8 @@ impl SerializableEntry {
 				hlc: self.row_hlc,
 				record_row_index: self.record_row_index,
 				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 			},
 		}
 	}
@@ -345,6 +348,8 @@ mod tests {
 				hlc: row_hlc,
 				record_row_index: RecordRowIndex::ZERO,
 				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 			},
 		}
 	}

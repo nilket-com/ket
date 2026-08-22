@@ -58,6 +58,7 @@ fn source_rows(row_count: usize) -> Vec<MultiRowSourceRow> {
 				node_id: 1,
 			},
 			is_tombstone: false,
+			partition: None,
 			table_object_id: Some(TableObjectId::new([0x55; 16])),
 		})
 		.collect()

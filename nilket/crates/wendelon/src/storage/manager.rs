@@ -47,6 +47,7 @@ use crate::crypto::{
 	TieredOffsetIndexEntry, TieredPlaintextRange, TieredSlabObjectMetadata,
 };
 use crate::metrics::{LsmCompactionResult, LsmDigestInvariantKind, global as metrics};
+use crate::schema::table::PlacementSemantics;
 use crate::schema::table::{
 	RecordBodyCompressionPolicy, RecordLayoutPolicy, RowIdentityPolicy, TableObjectId,
 	TableSchemaCatalog, TableSchemaDescriptor, TableWriteRequestMeta,
@@ -942,6 +943,9 @@ impl SlabManager {
 			key_identity,
 			routing_locality: self.routing_locality_for_key(tenant_id, key_identity),
 			table_object_id: self.published_table_object_id(location),
+			// ADR 0090: rebuilt rows keep the location's own placement.
+			placement: location.placement,
+			partition: location.partition,
 			location,
 		}
 	}
@@ -1102,6 +1106,14 @@ impl SlabManager {
 		let rows = entries
 			.iter()
 			.map(|entry| {
+				// ADR 0090: the row's durable placement travels from the frame's
+				// per-row entry into both the persistent index (V5) and the
+				// in-memory location that route selection consults.
+				let placement = if entry.partition.is_some() {
+					PlacementSemantics::Partitioned
+				} else {
+					PlacementSemantics::RawLocality
+				};
 				Ok(PersistentRecordRow {
 					tenant_id,
 					key_identity: entry.key_identity,
@@ -1110,10 +1122,14 @@ impl SlabManager {
 						&batch,
 						entry.record_row_index,
 					)?,
+					placement,
+					partition: entry.partition,
 					location: RecordLocation {
 						hlc: entry.row_hlc,
 						record_row_index: entry.record_row_index,
 						is_tombstone: entry.is_tombstone,
+						placement,
+						partition: entry.partition,
 						..base_location
 					},
 				})
@@ -3533,6 +3549,9 @@ impl SlabManager {
 			key_identity,
 			routing_locality,
 			table_object_id: None,
+			// ADR 0090: persist the location's own placement, never a default.
+			placement: location.placement,
+			partition: location.partition,
 			location,
 		};
 		if let Err(err) = index.upsert_record(row).await {
@@ -3605,6 +3624,8 @@ impl SlabManager {
 				key_identity: record.key_identity,
 				routing_locality: record.routing_locality,
 				table_object_id: None,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 				location: record.old_location,
 			})
 			.collect::<Vec<_>>();
@@ -3631,6 +3652,8 @@ impl SlabManager {
 				key_identity: record.key_identity,
 				routing_locality: record.routing_locality,
 				table_object_id: relocation_tables.get(&record.old_location).copied(),
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 				location: record.old_location,
 			})
 			.collect::<Vec<_>>();
@@ -3641,6 +3664,8 @@ impl SlabManager {
 				key_identity: record.key_identity,
 				routing_locality: record.routing_locality,
 				table_object_id: relocation_tables.get(&record.old_location).copied(),
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 				location: record.new_location,
 			})
 			.collect::<Vec<_>>();
@@ -4417,3 +4442,22 @@ fn build_locality_index(key_localities: &DashMap<TenantKey, Locality>) -> Tenant
 
 #[cfg(test)]
 mod tests;
+
+/// ADR 0090 route-gate hook: install an arbitrary version so route tests can
+/// construct placement states the write path cannot produce yet. The location
+/// may point at nothing — route selection must decide before any slab byte is
+/// touched, which is exactly what the tests prove.
+#[cfg(test)]
+impl SlabManager {
+	pub(crate) fn install_version_for_route_test(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		location: RecordLocation,
+	) {
+		self.key_index
+			.entry((tenant_id, key_identity))
+			.or_default()
+			.push(location);
+	}
+}

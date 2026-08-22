@@ -1941,6 +1941,7 @@ fn encode_test_pk_tombstone_marker_frame(
 		routing_locality,
 		row_hlc,
 		is_tombstone: true,
+		partition: None,
 		table_object_id: Some(descriptor.table_object_id),
 	}];
 	let mut packed = crate::storage::multirow::pack_tombstone_multirow_source_rows_with_policy(
@@ -1974,6 +1975,7 @@ fn encode_test_row_tombstone_marker_frame(
 		routing_locality,
 		row_hlc,
 		is_tombstone: true,
+		partition: None,
 		table_object_id: Some(table_object_id),
 	}];
 	let mut packed = crate::storage::multirow::pack_tombstone_multirow_source_rows_with_policy(
@@ -3091,6 +3093,8 @@ fn secondary_index_segment_for_test(source_slab_id: SlabId) -> SecondaryIndexSeg
 				hlc: hlc(42),
 				record_row_index: RecordRowIndex::ZERO,
 				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 			},
 		}],
 	)
@@ -3355,6 +3359,8 @@ async fn secondary_index_active_buffer_seal_persists_sidecar_and_marks_covered()
 		hlc: row_hlc,
 		record_row_index: RecordRowIndex::ZERO,
 		is_tombstone: false,
+		placement: PlacementSemantics::RawLocality,
+		partition: None,
 	};
 
 	let appended = manager
@@ -3416,6 +3422,8 @@ async fn secondary_index_declaration_cut_backfills_the_complete_old_active_slab(
 					hlc: hlc(20),
 					record_row_index: RecordRowIndex::ZERO,
 					is_tombstone: false,
+					placement: PlacementSemantics::RawLocality,
+					partition: None,
 				},
 			}],
 			old_active,
@@ -3491,6 +3499,8 @@ async fn secondary_index_declaration_cut_backfills_the_complete_old_active_slab(
 					hlc: hlc(30),
 					record_row_index: RecordRowIndex::ZERO,
 					is_tombstone: false,
+					placement: PlacementSemantics::RawLocality,
+					partition: None,
 				},
 			}],
 			middle_active,
@@ -6275,6 +6285,7 @@ async fn assert_sealed_layout_recluster_updates_multirow_codec(
 				routing_locality: *routing_locality,
 				row_hlc: hlc(10 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: None,
 			},
 		)
@@ -6882,6 +6893,7 @@ async fn compression_resident_gauge_tracks_sealed_recluster_convergence() {
 				routing_locality: *routing_locality,
 				row_hlc: hlc(10 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: None,
 			},
 		)
@@ -7001,6 +7013,7 @@ async fn compression_resident_gauge_counts_tiered_uncompressed_frames() {
 				routing_locality: *routing_locality,
 				row_hlc: hlc(50 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: None,
 			},
 		)
@@ -7155,6 +7168,7 @@ async fn projected_l2_read_materializes_sparse_multirow_record() {
 				routing_locality: *routing_locality,
 				row_hlc: hlc(100 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: None,
 			},
 		)
@@ -7326,6 +7340,7 @@ async fn row_group_l2_point_read_materializes_projected_group() {
 				routing_locality: *routing_locality,
 				row_hlc: hlc(200 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: None,
 			},
 		)
@@ -7762,6 +7777,7 @@ fn fsst_phase_b_plan_fetches_values_and_offsets_and_declines_overlap() {
 				routing_locality: Locality::ZERO,
 				row_hlc: hlc(660 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: Some(descriptor.table_object_id),
 			}
 		})
@@ -7965,6 +7981,7 @@ fn fsst_row_safe_phase_b_plan_uses_strategy_b_and_declines_overlap() {
 				routing_locality: Locality::ZERO,
 				row_hlc: hlc(670 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: Some(descriptor.table_object_id),
 			}
 		})
@@ -8218,6 +8235,7 @@ async fn fsst_phase_b_l2_read_filters_a1_and_declines_a2_overlap() {
 				routing_locality: Locality::ZERO,
 				row_hlc: hlc(700 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: Some(descriptor.table_object_id),
 			}
 		})
@@ -8485,6 +8503,7 @@ fn encoding_predicate_page_plan_narrows_clustered_scan_pages() {
 				routing_locality: Locality::ZERO,
 				row_hlc: hlc(63),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: Some(descriptor.table_object_id),
 			}
 		})
@@ -8751,6 +8770,7 @@ async fn sparse_projection_fetch_materializes_exact_cocd_clustered_pages() {
 				routing_locality: Locality::ZERO,
 				row_hlc: hlc(600 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: None,
 			}
 		})
@@ -9339,6 +9359,7 @@ async fn adr061_enabled_chunk_layout_writes_16k_encrypted_slab() {
 				routing_locality: Locality::ZERO,
 				row_hlc: hlc(610 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: None,
 			}
 		})
@@ -9527,6 +9548,7 @@ async fn encoding_secondary_index_fetches_only_selected_simd_pages() {
 				routing_locality: *routing_locality,
 				row_hlc: hlc(500 + source_row_index as u64),
 				is_tombstone: false,
+				partition: None,
 				table_object_id: None,
 			},
 		)
@@ -9779,6 +9801,7 @@ fn compaction_rewrites_table_bound_multirow_frame_with_row_group_directory() {
 			row_hlc: hlc(300 + row as u64),
 			is_tombstone: false,
 			table_object_id: Some(table_object_id),
+			partition: None,
 		})
 		.collect::<Vec<_>>();
 	let old = encode_multirow_from_survivors_with_policy(
@@ -9801,6 +9824,8 @@ fn compaction_rewrites_table_bound_multirow_frame_with_row_group_directory() {
 				hlc: row.row_hlc,
 				record_row_index: row.record_row_index,
 				is_tombstone: row.is_tombstone,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 			},
 			reclaim: false,
 			retention_ambiguous: false,
@@ -11860,4 +11885,222 @@ async fn adr0084_repair_refuses_without_a_durable_index() {
 		!index_path.exists(),
 		"the refusal must not create the index it declined to read"
 	);
+}
+
+/// ADR 0089 range discoverability. Row membership in the locality index is
+/// per row — `(routing_locality, key_identity)` is inserted individually — so a
+/// scan interval must yield exactly the rows whose localities fall inside it,
+/// each exactly once, whatever record holds them. These pin the interval
+/// semantics the packing change depends on, without assuming a scan is aligned
+/// to any prefix boundary.
+#[tokio::test]
+async fn adr0089_locality_intervals_yield_exactly_the_rows_inside_them() {
+	let dir = fresh_dir("adr0089-range-discoverability");
+	let manager = Arc::new(
+		SlabManager::open(SlabManagerConfig {
+			dir: dir.clone(),
+			max_slab_bytes: 1024 * 1024,
+			io: spawn_io_thread(64).unwrap(),
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
+	);
+
+	// A contiguous span of localities, the shape a packed record covers: one
+	// prefix, consecutive per-row suffixes.
+	const BASE: u64 = 0x5000;
+	const SPAN: u64 = 8;
+	for offset in 0..SPAN {
+		manager
+			.append_durable_with_locality(
+				tenant(),
+				id(0x9000 + offset),
+				Locality::new(BASE + offset),
+				hlc(10),
+				format!("row-{offset}").as_bytes(),
+			)
+			.await
+			.unwrap();
+	}
+
+	let scan = |start: u64, end: u64| {
+		let hits = manager.scan_as_of_with_identity_and_locality(
+			tenant(),
+			Locality::new(start),
+			Locality::new(end),
+			hlc(20),
+		);
+		let mut localities: Vec<u64> = hits
+			.iter()
+			.map(|(_identity, locality, _location)| locality.get())
+			.collect();
+		let mut identities: Vec<_> = hits.iter().map(|(identity, _, _)| *identity).collect();
+		identities.sort();
+		let before = identities.len();
+		identities.dedup();
+		assert_eq!(
+			identities.len(),
+			before,
+			"every row is emitted exactly once for [{start:#x}, {end:#x}]"
+		);
+		localities.sort_unstable();
+		localities
+	};
+
+	// Crossing the whole span.
+	assert_eq!(
+		scan(BASE, BASE + SPAN - 1),
+		(BASE..BASE + SPAN).collect::<Vec<_>>()
+	);
+
+	// Starting inside the span: the interval begins between two rows, which is
+	// exactly the case prefix alignment would not cover.
+	assert_eq!(
+		scan(BASE + 3, BASE + SPAN - 1),
+		(BASE + 3..BASE + SPAN).collect::<Vec<_>>()
+	);
+
+	// Ending inside the span.
+	assert_eq!(scan(BASE, BASE + 4), (BASE..=BASE + 4).collect::<Vec<_>>());
+
+	// Wholly inside, touching neither end.
+	assert_eq!(
+		scan(BASE + 2, BASE + 5),
+		(BASE + 2..=BASE + 5).collect::<Vec<_>>()
+	);
+
+	// A single interior locality resolves to one row, not its neighbours.
+	assert_eq!(scan(BASE + 6, BASE + 6), vec![BASE + 6]);
+
+	// Intervals outside the span yield nothing rather than the nearest row.
+	assert!(scan(BASE + SPAN, BASE + SPAN + 4).is_empty());
+	assert!(scan(BASE - 4, BASE - 1).is_empty());
+}
+
+/// ADR 0090 regression control: compaction re-homes bytes, never placement.
+/// The defect this pins: relocated locations built by struct-update from the
+/// replacement slab's base location silently downgraded partitioned rows to
+/// raw-locality, so the next read's placement cross-check refused the record —
+/// surfacing as a dropped stream ("early eof") on the daemon path.
+#[tokio::test]
+async fn adr0090_compaction_preserves_partitioned_placement() {
+	use crate::schema::table::PlacementSemantics;
+
+	let dir = fresh_dir("adr0090-compaction-placement");
+	let io = spawn_io_thread(64).unwrap();
+	let manager = Arc::new(
+		SlabManager::open(SlabManagerConfig {
+			dir: dir.clone(),
+			max_slab_bytes: 1024 * 1024,
+			io: io.clone(),
+			l2: None,
+			rehydration: RehydrationPolicy::default(),
+			l2_column_fetch: Default::default(),
+			row_group_writer: Default::default(),
+			l2_row_group_fetch: Default::default(),
+			encoding_writer: Default::default(),
+			l2_chunk_layout: Default::default(),
+			l2_encoding_fetch: Default::default(),
+			encoding_compute: Default::default(),
+			group_commit: GroupCommitConfig::default(),
+			crypto: test_crypto(),
+		})
+		.await
+		.unwrap(),
+	);
+
+	// A partitioned multirow record plus an unrelated tombstoned row, sealed
+	// together so reclaim compacts the shared slab.
+	let doomed_key = id(0x1010);
+	manager
+		.append_durable(tenant(), doomed_key, hlc(10), b"drop-me")
+		.await
+		.unwrap();
+	let partitioned_key = id(0x2020);
+	let partition = crate::schema::PartitionId::new(0x00AB_0000_0000_0000);
+	let batch = RecordBatch::try_new(
+		Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+		vec![Arc::new(arrow::array::Int64Array::from(vec![7_i64]))],
+	)
+	.unwrap();
+	let source = vec![crate::storage::multirow::MultiRowSourceRow {
+		source_row_index: 0,
+		key_identity: partitioned_key,
+		routing_locality: Locality::new(partition.get() | 0x1234),
+		row_hlc: hlc(20),
+		is_tombstone: false,
+		partition: Some(partition),
+		table_object_id: None,
+	}];
+	let encoded =
+		crate::storage::multirow::encode_multirow_from_survivors(&batch, &source).unwrap();
+	let entries = crate::storage::multirow::storage_index_entries_from_batch(
+		&crate::storage::multirow::decode_batch(&encoded.frame).unwrap(),
+	)
+	.unwrap();
+	manager
+		.append_durable_multirow_with_locality(tenant(), &encoded.frame, &entries)
+		.await
+		.unwrap();
+	let before = manager.lookup(tenant(), partitioned_key).unwrap();
+	assert_eq!(before.placement, PlacementSemantics::Partitioned);
+	assert_eq!(before.partition, Some(partition));
+
+	force_seal_active(&manager).await;
+	manager
+		.append_durable(tenant(), id(0x3030), hlc(30), b"active-row")
+		.await
+		.unwrap();
+
+	let target = Locality::from(doomed_key).get();
+	let report = manager
+		.reclaim_tombstoned_ranges(
+			&[MigratedRangeTombstone {
+				migration_id: 1,
+				range_start: target,
+				range_end: target,
+				to_epoch: 2,
+				completed_by: NodeId {
+					id: 7,
+					_reserved: 0,
+				},
+				completed_at_hlc: hlc(1),
+				migration_hlc_floor: hlc(0),
+			}],
+			&empty_compaction_catalogs().0,
+			&empty_compaction_catalogs().1,
+			1,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		report.compacted_slabs, 1,
+		"premise: the shared slab compacted"
+	);
+
+	// The partitioned row survived compaction at a NEW location, and its
+	// placement survived with it.
+	let after = manager.lookup(tenant(), partitioned_key).unwrap();
+	assert_ne!(
+		(after.slab_id, after.offset),
+		(before.slab_id, before.offset),
+		"premise: compaction relocated the row"
+	);
+	assert_eq!(
+		after.placement,
+		PlacementSemantics::Partitioned,
+		"compaction must not downgrade placement"
+	);
+	assert_eq!(after.partition, Some(partition));
 }

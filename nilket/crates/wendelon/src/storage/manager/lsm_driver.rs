@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::table::PlacementSemantics;
 
 pub(super) fn lsm_run_summary_from_index(
 	key_index: &DashMap<TenantKey, Vec<RecordLocation>>,
@@ -955,6 +956,10 @@ impl SlabManager {
 				routing_locality: self
 					.routing_locality_for_key(record.tenant_id, record.row_key_id),
 				table_object_id: record.table_object_id,
+				// ADR 0090: the row's durable placement travels with its
+				// location; a maintenance rewrite must never downgrade it.
+				placement: record.location.placement,
+				partition: record.location.partition,
 				location: record.location,
 			})
 			.collect::<Vec<_>>();
@@ -985,7 +990,16 @@ impl SlabManager {
 					routing_locality: self
 						.routing_locality_for_key(record.tenant_id, record.row_key_id),
 					table_object_id: record.table_object_id,
-					location: *location,
+					// ADR 0090: the LSM output re-homes the bytes, not the
+					// placement; carry it from the planned row into the new
+					// location so the rewrite cannot downgrade it.
+					placement: record.location.placement,
+					partition: record.location.partition,
+					location: RecordLocation {
+						placement: record.location.placement,
+						partition: record.location.partition,
+						..*location
+					},
 				});
 			}
 		}

@@ -119,6 +119,9 @@ pub(super) async fn append_existing_frame_to_replacement(
 			hlc: record.old_location.hlc,
 			record_row_index: record.old_location.record_row_index,
 			is_tombstone: record.old_location.is_tombstone,
+			// ADR 0090: compaction re-homes the bytes, never the placement.
+			placement: record.old_location.placement,
+			partition: record.old_location.partition,
 			..base_location
 		};
 		replacement.index_location(record.tenant_id, record.key_identity, new_location);
@@ -152,6 +155,9 @@ pub(super) async fn append_compacted_frame_to_replacement(
 			hlc: row.row_hlc,
 			record_row_index: row.record_row_index,
 			is_tombstone: row.old_location.is_tombstone,
+			// ADR 0090: compaction re-homes the bytes, never the placement.
+			placement: row.old_location.placement,
+			partition: row.old_location.partition,
 			..base_location
 		};
 		replacement.index_location(row.tenant_id, row.key_identity, new_location);
@@ -246,6 +252,10 @@ pub(super) fn compact_physical_record_frame(
 				routing_locality: record.routing_locality,
 				row_hlc: record.old_location.hlc,
 				is_tombstone: record.old_location.is_tombstone,
+				// ADR 0090: compaction preserves each row's durable placement.
+				partition: source_metadata
+					.get(row_index)
+					.and_then(|meta| meta.partition),
 				table_object_id,
 			}
 		})
@@ -685,6 +695,7 @@ impl SlabManager {
 							routing_locality: row.routing_locality,
 							row_hlc: row.row_hlc,
 							is_tombstone: row.old_location.is_tombstone,
+							partition: row.old_location.partition,
 							table_object_id: table_object_id_stamp,
 						})
 						.collect::<Vec<_>>();
@@ -743,6 +754,14 @@ impl SlabManager {
 								hlc: encoded_row.row_hlc,
 								record_row_index: encoded_row.record_row_index,
 								is_tombstone: encoded_row.is_tombstone,
+								// ADR 0090: the reclustered frame's per-row
+								// partition is the durable placement.
+								placement: if encoded_row.partition.is_some() {
+									crate::schema::table::PlacementSemantics::Partitioned
+								} else {
+									crate::schema::table::PlacementSemantics::RawLocality
+								},
+								partition: encoded_row.partition,
 								..base_location
 							};
 							replacement.index_location(
@@ -931,6 +950,9 @@ impl SlabManager {
 					hlc: row.row_hlc,
 					record_row_index: row.record_row_index,
 					is_tombstone: row.old_location.is_tombstone,
+					// ADR 0090: compaction re-homes the bytes, never the placement.
+					placement: row.old_location.placement,
+					partition: row.old_location.partition,
 					..base_location
 				};
 				replacement.index_location(row.tenant_id, row.key_identity, new_location);

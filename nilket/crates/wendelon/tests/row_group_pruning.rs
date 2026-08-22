@@ -69,6 +69,7 @@ fn fixture_directory() -> wendelon::storage::RecordPageDirectory {
 				node_id: 1,
 			},
 			is_tombstone: false,
+			partition: None,
 			table_object_id: Some(TableObjectId::new([0x57; 16])),
 		})
 		.collect::<Vec<_>>();

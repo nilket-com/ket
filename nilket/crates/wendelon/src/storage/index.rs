@@ -1,6 +1,7 @@
+use crate::schema::table::PlacementSemantics;
 use crate::schema::{
 	ByteCount, CompactionLevelIndex, HybridTimestamp, Identity, IndexObjectId, Locality,
-	LogicalSchemaFingerprint, ManifestEpoch, RecordRowIndex, RowCount, SlabId,
+	LogicalSchemaFingerprint, ManifestEpoch, PartitionId, RecordRowIndex, RowCount, SlabId,
 	SupersessionMetadata, TableObjectId, TenantId, TenantKekId, TombstoneMetadata,
 };
 use crate::storage::RecordLocation;
@@ -51,7 +52,14 @@ const RECORD_VALUE_LEN_V3: usize = 4 + 8 + 4 + 4;
 /// the slab is missing, so this attribution must travel with the durable
 /// reference itself.
 const RECORD_VALUE_LEN_V4: usize = 4 + 8 + 4 + 4 + 16;
-const RECORD_VALUE_LEN: usize = RECORD_VALUE_LEN_V4;
+/// ADR 0090 V5 appends the durable placement stamp and its partition. A value
+/// shorter than this is an earlier version and decodes as `RawLocality`; a value
+/// of this length with an unknown stamp is malformed and is refused, so "written
+/// before partitions" and "corrupt" never share an outcome.
+const RECORD_VALUE_LEN_V5: usize = 4 + 8 + 4 + 4 + 16 + 1 + 8;
+const RECORD_VALUE_LEN: usize = RECORD_VALUE_LEN_V5;
+const PLACEMENT_STAMP_RAW_LOCALITY: u8 = 0;
+const PLACEMENT_STAMP_PARTITIONED: u8 = 1;
 const RECORD_FLAG_IS_TOMBSTONE: u32 = 1 << 0;
 const RECORD_FLAG_HAS_TABLE_OBJECT_ID: u32 = 1 << 1;
 const TIERED_POINTER_HASH_LEN: usize = 32;
@@ -97,6 +105,12 @@ pub(crate) struct PersistentRecordRow {
 	/// Present for typed table rows written after ADR 0539. Legacy and
 	/// untyped KV rows deliberately remain unattributed rather than guessed.
 	pub table_object_id: Option<TableObjectId>,
+	/// ADR 0090: how this record resolves to a replica set. Absent stamp means
+	/// [`PlacementSemantics::RawLocality`], decoded from a shorter value rather
+	/// than inferred from a failure.
+	pub placement: PlacementSemantics,
+	/// Set only when `placement` is `Partitioned`.
+	pub partition: Option<PartitionId>,
 	pub location: RecordLocation,
 }
 
@@ -601,6 +615,12 @@ fn encode_record_value(row: PersistentRecordRow) -> [u8; RECORD_VALUE_LEN] {
 	if let Some(table_object_id) = row.table_object_id {
 		bytes[20..36].copy_from_slice(table_object_id.as_bytes());
 	}
+	bytes[36] = match row.placement {
+		PlacementSemantics::RawLocality => PLACEMENT_STAMP_RAW_LOCALITY,
+		PlacementSemantics::Partitioned => PLACEMENT_STAMP_PARTITIONED,
+	};
+	let partition = row.partition.map_or(0, |partition| partition.get());
+	bytes[37..45].copy_from_slice(&partition.to_le_bytes());
 	bytes
 }
 
@@ -615,6 +635,7 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 		));
 	}
 	if value.len() != RECORD_VALUE_LEN
+		&& value.len() != RECORD_VALUE_LEN_V4
 		&& value.len() != RECORD_VALUE_LEN_V3
 		&& value.len() != RECORD_VALUE_LEN_V2
 		&& value.len() != RECORD_VALUE_LEN_V1
@@ -622,7 +643,7 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 		return Err(Error::new(
 			ErrorKind::InvalidData,
 			format!(
-				"persistent record value length mismatch: expected {RECORD_VALUE_LEN_V1}, {RECORD_VALUE_LEN_V2}, {RECORD_VALUE_LEN_V3}, or {RECORD_VALUE_LEN}, got {}",
+				"persistent record value length mismatch: expected {RECORD_VALUE_LEN_V1}, {RECORD_VALUE_LEN_V2}, {RECORD_VALUE_LEN_V3}, {RECORD_VALUE_LEN_V4}, or {RECORD_VALUE_LEN}, got {}",
 				value.len()
 			),
 		));
@@ -663,7 +684,7 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 		));
 	}
 	let table_object_id = if flags & RECORD_FLAG_HAS_TABLE_OBJECT_ID != 0 {
-		if value.len() != RECORD_VALUE_LEN {
+		if value.len() < RECORD_VALUE_LEN_V4 {
 			return Err(Error::new(
 				ErrorKind::InvalidData,
 				"persistent record row declares a table object id without V4 storage",
@@ -676,12 +697,44 @@ fn decode_record_row(key: &[u8], value: &[u8]) -> std::io::Result<PersistentReco
 		None
 	};
 
+	// ADR 0090: a value shorter than V5 predates partitions and is legacy by
+	// length. A V5-length value carries an explicit stamp, and an unrecognized
+	// stamp is malformed rather than quietly legacy — absence and damage must
+	// not share an outcome.
+	let (placement, partition) = if value.len() >= RECORD_VALUE_LEN_V5 {
+		let stamp = value[36];
+		match stamp {
+			PLACEMENT_STAMP_RAW_LOCALITY => (PlacementSemantics::RawLocality, None),
+			PLACEMENT_STAMP_PARTITIONED => (
+				PlacementSemantics::Partitioned,
+				Some(PartitionId::new(u64::from_le_bytes(
+					value[37..45].try_into().expect("validated V5 record value"),
+				))),
+			),
+			other => {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"persistent record row has unknown placement stamp {other}; \
+						 a V5 value with an unrecognized stamp is malformed, not legacy"
+					),
+				));
+			}
+		}
+	} else {
+		(PlacementSemantics::RawLocality, None)
+	};
+
 	Ok(PersistentRecordRow {
 		tenant_id,
 		key_identity,
 		routing_locality,
 		table_object_id,
+		placement,
+		partition,
 		location: RecordLocation {
+			placement,
+			partition,
 			slab_id: SlabId::new(slab_id),
 			offset,
 			length,
@@ -1349,6 +1402,8 @@ mod tests {
 			key_identity: Identity::blake3(b"row-key"),
 			routing_locality: Locality::new(0x8877),
 			table_object_id: None,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 			location: RecordLocation {
 				slab_id: SlabId::new(9),
 				offset: 128,
@@ -1360,6 +1415,8 @@ mod tests {
 					node_id: 11,
 				},
 				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 			},
 		}
 	}
@@ -1461,6 +1518,9 @@ mod tests {
 				0x00, 0x00, 0x00, 0x00, // flags
 				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // table object id absent
 				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+				// ADR 0090 V5 tail: placement stamp then partition.
+				0x00, // stamp = RawLocality
+				0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // partition absent
 			]
 		);
 	}
@@ -1744,5 +1804,129 @@ mod tests {
 		index.upsert_tiered_slab(pointer, Some(19)).await.unwrap();
 		let third = index.load_snapshot().await.unwrap();
 		assert_eq!(third.last_control_log_index, Some(19));
+	}
+}
+
+/// ADR 0090: the length-dispatched compatibility ladder. A value shorter than V5
+/// predates partitions and decodes as legacy; a V5-length value carries an
+/// explicit stamp, and an unrecognized stamp is malformed. "Written before
+/// partitions" and "corrupt" must never resolve to the same outcome.
+#[cfg(test)]
+mod adr0090_record_value_versions {
+	use super::*;
+
+	fn row() -> PersistentRecordRow {
+		PersistentRecordRow {
+			tenant_id: TenantId::new(7),
+			key_identity: Identity::new([3; 32]),
+			routing_locality: Locality::new(0x00AB_0000_0000_1234),
+			table_object_id: Some(TableObjectId::new([9; 16])),
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
+			location: RecordLocation {
+				slab_id: SlabId::new(11),
+				offset: 4096,
+				length: 512,
+				hlc: HybridTimestamp {
+					physical_ms: 100,
+					logical: 1,
+					node_id: 2,
+				},
+				record_row_index: RecordRowIndex::new(3),
+				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
+			},
+		}
+	}
+
+	#[test]
+	fn adr0090_v5_round_trips_both_placements() {
+		for (placement, partition) in [
+			(PlacementSemantics::RawLocality, None),
+			(
+				PlacementSemantics::Partitioned,
+				Some(PartitionId::new(0x00AB_0000_0000_0000)),
+			),
+			// Partition zero is a legitimate partition, not an absent one.
+			(PlacementSemantics::Partitioned, Some(PartitionId::new(0))),
+		] {
+			let mut original = row();
+			original.placement = placement;
+			original.partition = partition;
+			let key = encode_record_key(original);
+			let value = encode_record_value(original);
+			assert_eq!(value.len(), RECORD_VALUE_LEN_V5);
+			let decoded = decode_record_row(&key, &value).expect("V5 decodes");
+			assert_eq!(decoded.placement, placement);
+			assert_eq!(decoded.partition, partition);
+			assert_eq!(decoded.routing_locality, original.routing_locality);
+			assert_eq!(decoded.table_object_id, original.table_object_id);
+		}
+	}
+
+	#[test]
+	fn adr0090_values_written_before_v5_decode_as_legacy() {
+		let original = row();
+		let key = encode_record_key(original);
+		let full = encode_record_value(original);
+		// Genuine earlier artifacts: the same value truncated to each prior
+		// version's length, which is exactly what an older build wrote.
+		for (len, label) in [
+			(RECORD_VALUE_LEN_V4, "V4"),
+			(RECORD_VALUE_LEN_V3, "V3"),
+			(RECORD_VALUE_LEN_V2, "V2"),
+			(RECORD_VALUE_LEN_V1, "V1"),
+		] {
+			let mut truncated = full[..len].to_vec();
+			if len < RECORD_VALUE_LEN_V4 && len >= RECORD_VALUE_LEN_V3 {
+				// A pre-V4 writer never set the table-object flag.
+				let mut flags = u32::from_le_bytes(truncated[16..20].try_into().unwrap());
+				flags &= !RECORD_FLAG_HAS_TABLE_OBJECT_ID;
+				truncated[16..20].copy_from_slice(&flags.to_le_bytes());
+			}
+			let decoded = decode_record_row(&key, &truncated)
+				.unwrap_or_else(|err| panic!("{label} value must still decode: {err}"));
+			assert_eq!(
+				decoded.placement,
+				PlacementSemantics::RawLocality,
+				"{label} predates partitions and is legacy"
+			);
+			assert_eq!(decoded.partition, None, "{label} carries no partition");
+		}
+	}
+
+	/// The discriminating control: a V5-length value whose stamp is unrecognized
+	/// is malformed. An implementation that fell back to legacy on an unknown
+	/// stamp would pass every other test here and silently misroute a record
+	/// whose placement it did not understand.
+	#[test]
+	fn adr0090_a_v5_value_with_an_unknown_stamp_is_malformed_not_legacy() {
+		let original = row();
+		let key = encode_record_key(original);
+		let mut value = encode_record_value(original).to_vec();
+		assert_eq!(value.len(), RECORD_VALUE_LEN_V5);
+		for stamp in [2u8, 7, 200, u8::MAX] {
+			value[36] = stamp;
+			let err =
+				decode_record_row(&key, &value).expect_err("an unknown V5 stamp must be refused");
+			assert!(
+				err.to_string().contains("unknown placement stamp"),
+				"refusal must name the cause, got: {err}"
+			);
+		}
+	}
+
+	#[test]
+	fn adr0090_an_unrecognized_length_is_still_refused() {
+		let original = row();
+		let key = encode_record_key(original);
+		let full = encode_record_value(original);
+		for len in [0usize, 5, 21, 37, 44] {
+			assert!(
+				decode_record_row(&key, &full[..len.min(full.len())]).is_err(),
+				"length {len} is not a known version and must be refused"
+			);
+		}
 	}
 }

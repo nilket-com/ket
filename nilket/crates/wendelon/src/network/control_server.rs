@@ -4289,6 +4289,19 @@ pub(crate) fn build_seed_batch(
 		return Ok(Vec::new());
 	}
 
+	// ADR 0090: partitioned rows move by PARTITION, not by arc. A moved segment
+	// changes the owner of every partition whose representative position lies
+	// inside it, and those partitions' rows live across their full spans — far
+	// outside the segment. Each qualifying intersection therefore also seeds,
+	// per live partition width, one span-shaped entry covering the contiguous
+	// run of moved partitions. Without these, a membership change re-owns a
+	// partition before its bytes transfer, and the new owner serves misses.
+	let partition_widths: std::collections::BTreeSet<u8> = snapshot
+		.table_schemas
+		.live_descriptors()
+		.filter_map(crate::schema::table::partitioned_prefix_width)
+		.collect();
+	let mut partition_planned: Vec<SeedPlanSegment> = Vec::new();
 	let mut planned: Vec<SeedPlanSegment> = Vec::new();
 	let mut i = 0usize;
 	let mut j = 0usize;
@@ -4328,11 +4341,30 @@ pub(crate) fn build_seed_batch(
 							start,
 							end,
 							logical_owner: new_owner,
-							source_replicas,
+							source_replicas: source_replicas.clone(),
 							upstream_migration_id,
 							migration_hlc_floor,
 						},
 					);
+					for width in &partition_widths {
+						let step = 1u64 << (64 - u32::from(*width));
+						let lattice_start = start.div_ceil(step).saturating_mul(step);
+						let lattice_end = (end / step).saturating_mul(step);
+						if lattice_start > end || lattice_end < start {
+							continue;
+						}
+						// One entry per contiguous run of moved partitions: it
+						// covers every representative in [start, end] and every
+						// row locality of those partitions, and nothing else.
+						partition_planned.push(SeedPlanSegment {
+							start: lattice_start,
+							end: lattice_end | (step - 1),
+							logical_owner: new_owner,
+							source_replicas: source_replicas.clone(),
+							upstream_migration_id,
+							migration_hlc_floor,
+						});
+					}
 				}
 			}
 		}
@@ -4344,8 +4376,8 @@ pub(crate) fn build_seed_batch(
 		}
 	}
 
-	let mut out = Vec::with_capacity(planned.len());
-	for segment in planned {
+	let mut out = Vec::with_capacity(planned.len() + partition_planned.len());
+	for segment in planned.into_iter().chain(partition_planned) {
 		out.push(SeedMigration {
 			entry: MigrationLedgerEntry {
 				migration_id: deterministic_migration_id(to.epoch, segment.start, segment.end),
@@ -5250,5 +5282,109 @@ mod tests {
 			.find(|version| version.tenant_kek_id == active_kek_id)
 			.unwrap();
 		assert!(!active.safe_to_retire);
+	}
+
+	/// ADR 0090: a moved segment must also seed span-shaped entries for the
+	/// partitions whose representatives it covers — without them, a membership
+	/// change re-owns a partition before its bytes transfer. The trigger is the
+	/// live catalog: no partitioned tables, no partition seeds.
+	#[test]
+	fn adr0090_epoch_seeder_emits_partition_spans_for_partitioned_tables() {
+		let epoch1 = membership(1, &[1]);
+		let epoch2 = membership(2, &[1, 2, 3, 4, 5]);
+
+		// Without partitioned tables, only segment seeds are planned.
+		let empty = crate::consensus::raft_storage::SmState::default();
+		let segment_only = build_seed_batch(&epoch1, &epoch2, 1, &empty).unwrap();
+		assert!(
+			!segment_only.is_empty(),
+			"premise: this membership change moves segments"
+		);
+		let width: u8 = 16;
+		let step = 1u64 << (64 - u32::from(width));
+		assert!(
+			segment_only
+				.iter()
+				.all(
+					|seed| (seed.entry.range_end - seed.entry.range_start + 1) % step != 0
+						|| seed.entry.range_start % step != 0
+				),
+			"premise: no segment seed is accidentally span-aligned"
+		);
+
+		// A live partitioned table puts its width in play.
+		let mut snapshot = crate::consensus::raft_storage::SmState::default();
+		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+		let mut descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([0x51; 16]),
+			1,
+			"analytics",
+			"partitioned_events",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_layout_policy = crate::schema::RecordLayoutPolicy::MultiRow(
+			crate::schema::MultiRowLayoutDescriptor::default(),
+		);
+		descriptor.record_body_compression_policy =
+			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		assert_eq!(
+			crate::schema::table::partitioned_prefix_width(&descriptor),
+			Some(width),
+			"premise: the fixture table is partitioned at the default width"
+		);
+		snapshot
+			.table_schemas
+			.upsert(TenantId::new(7), descriptor)
+			.unwrap();
+
+		let with_partitions = build_seed_batch(&epoch1, &epoch2, 1, &snapshot).unwrap();
+		let span_seeds: Vec<_> = with_partitions
+			.iter()
+			.filter(|seed| {
+				seed.entry.range_start % step == 0
+					&& (seed.entry.range_end.wrapping_sub(seed.entry.range_start) + 1) % step == 0
+			})
+			.collect();
+		assert!(
+			!span_seeds.is_empty(),
+			"a partitioned table makes moved segments seed partition spans"
+		);
+		let new_ring = RingState::build(&epoch2, 1);
+		for seed in &span_seeds {
+			// Every span covers whole partitions, and its owner is the new
+			// ring's owner at each representative inside it — the partition
+			// moves to where its position now routes, with its full span of
+			// row localities carried along.
+			let mut representative = seed.entry.range_start;
+			while representative <= seed.entry.range_end {
+				assert_eq!(
+					new_ring
+						.replicas_for_partition(crate::schema::PartitionId::new(representative))
+						.first()
+						.copied()
+						.unwrap(),
+					seed.entry.logical_owner,
+					"span seed owner matches the new ring at representative {representative:#x}"
+				);
+				let Some(next) = representative.checked_add(step) else {
+					break;
+				};
+				representative = next;
+			}
+		}
+		// And the segment seeds are unchanged by the addition.
+		for seed in &segment_only {
+			assert!(
+				with_partitions
+					.iter()
+					.any(|candidate| candidate.entry == seed.entry),
+				"segment seeds survive alongside partition seeds"
+			);
+		}
 	}
 }

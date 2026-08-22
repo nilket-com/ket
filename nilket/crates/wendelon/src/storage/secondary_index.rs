@@ -1,6 +1,7 @@
 use crate::schema::pbc::{
 	ColumnPredicate, ColumnPredicateComparison, ColumnPredicateLiteral, Program,
 };
+use crate::schema::table::PlacementSemantics;
 use crate::schema::table::TableSchemaDescriptor;
 use crate::schema::{
 	HybridTimestamp, Identity, IndexArrowTypeTag, IndexObjectId, LogicalSchemaFingerprint, NodeId,
@@ -526,6 +527,8 @@ pub fn secondary_index_entries_from_storage_batch(
 				hlc: row.row_hlc,
 				record_row_index: row.record_row_index,
 				is_tombstone: false,
+				placement: PlacementSemantics::RawLocality,
+				partition: None,
 				..base_location
 			},
 		});
@@ -554,6 +557,8 @@ pub fn secondary_index_entry_from_materialized_row(
 		record_location: RecordLocation {
 			hlc: row_hlc,
 			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 			..record_location
 		},
 	}))
@@ -979,6 +984,8 @@ mod tests {
 			hlc: row_hlc,
 			record_row_index,
 			is_tombstone: false,
+			placement: PlacementSemantics::RawLocality,
+			partition: None,
 		}
 	}
 

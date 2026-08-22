@@ -33,6 +33,8 @@ fn version(key_byte: u8, ms: u64, row_idx: u32, length: u32) -> VersionEntry {
 			hlc: hlc(ms),
 			record_row_index: RecordRowIndex::new(row_idx),
 			is_tombstone: false,
+			placement: wendelon::schema::table::PlacementSemantics::RawLocality,
+			partition: None,
 		},
 		lifecycle: VersionLifecycle::PrimaryKey,
 	}

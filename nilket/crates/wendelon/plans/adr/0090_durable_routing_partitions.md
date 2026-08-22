@@ -91,6 +91,48 @@ split, never rewritten to change its grouping, and never partially owned. During
 a transfer every row of a record moves together, and a concurrent read returns
 each row exactly once.
 
+The transfer state rides the existing Raft-persisted Migration Ledger, not a new
+machine. A partition's span — its prefix followed by every suffix — is a
+contiguous locality range, so a ledger entry can carry a whole partition without
+a schema change, and the range-based pull machinery enumerates exactly the
+partition's rows. A partition is covered by an entry whose range contains its
+representative position (the partition value, which is also the one ring
+position the whole partition routes by).
+
+**Exactly one owner serves, structurally.** `PartitionTransfer` carries a single
+`serving` node, so "both owners" and "neither owner" are unrepresentable rather
+than guarded: an in-flight entry's `logical_owner` serves alone — route primacy
+and write fan-out both consult the transfer before the ring — and a completed or
+absent entry hands serving back to the ring, which names one owner. Two
+in-flight entries claiming one partition with different owners is a malformed
+ledger and is refused rather than arbitrated: a broken ledger fails closed, it
+does not pick a side.
+
+**The epoch seeder derives partition spans, and it is load-bearing.** Without
+it, a membership change re-owns a partition the moment the ring swaps, before
+any byte transfers — the new owner serves misses. The seeder therefore emits,
+per qualifying moved intersection and per live partition width from the schema
+catalog, one span-shaped entry covering the contiguous run of moved partitions:
+range `[first_representative, last_representative | suffix_mask]`, owner and
+sources taken from the same ring diff as the segment seeds. Lattice runs are
+merged so cardinality stays one entry per intersection per width rather than one
+per partition. The trigger is `partitioned_prefix_width`, the same single
+definition ingress uses, so seeding and writing cannot disagree about which
+tables are partitioned.
+
+Seed derivation is replay-critical — a later leader reconstructs the expected
+batch — and this change is versioned **by construction of the ids**: partition
+seeds only ADD entries whose deterministic ids (span-shaped ranges) are disjoint
+from segment ids, and reconciliation converges by committing what is missing.
+Nothing existing is reinterpreted; an upgrade mid-transition commits the
+partition seeds the older derivation failed to plan, which is the repair, not a
+corruption.
+
+**`logical_owner` is the serving primary and anchor, not the whole replica
+set.** A transfer names the one node primacy is judged against; the remaining
+replicas come from the ring's own walk at the configured replication factor, so
+a transfer never silently collapses replicated durability to one node.
+
 ### 6. Existing raw-locality records stay readable, and placement semantics are durable
 
 Every record carries a durable marker for the placement semantics it was written
@@ -116,6 +158,92 @@ quickly.
 Both kinds coexist under membership change. A rebalance with both present moves
 legacy records by arc and partitioned records by partition, in the same epoch
 swap, without either kind losing or duplicating a row.
+
+### 7. Every carrier uses its own existing version mechanism, and none uses a default field
+
+Placement semantics and partitions are durable, so before anything is stamped the
+carriers that would have to hold them are enumerated with the compatibility
+mechanism each already has. No carrier gains a new scheme, and none relies on a
+defaulted field to survive an old reader.
+
+| carrier | what it holds | mechanism it already has |
+|---|---|---|
+| Record frame per-row metadata | `__row_key_id__`, `__row_routing_locality__`, `__row_hlc__`, `__row_tombstone__`, `__row_table_object_id__` | Arrow IPC is self-describing; readers probe `column_by_name`. `__row_table_object_id__` was added exactly this way |
+| Persistent record index (redb `slab_records_v1`) | routing locality, record row index, flags, table object id | fixed-length value, **length-dispatched**: V1 = 4, V2 = 12, V3 = 20, V4 = 36; the decoder accepts every earlier length |
+| Raft snapshot (`SmState`) | applied log id, membership, epoch history, leases | `SNAPSHOT_FORMAT_VERSION` in the snapshot header; no migrations, and a version mismatch is explained rather than reported as damage |
+| Raft WAL record | log entries, snapshot markers | `WALRecordHeader.format_version`, carved from reserved padding under ADR 0085; `PRE_VERSIONING_FORMAT` means shape unverifiable and decoded as before |
+| Bifurcated write wire meta | `TableWriteRequestMeta` and siblings | fixed C layout with named `_pad` bytes; size is the contract |
+| CDC cursor | `(row_hlc, row_key_id, record_row_index)` | fixed layout with `_pad`; already addresses a row inside a shared record and needs no placement |
+| Secondary index segment | segment payloads | `SECONDARY_INDEX_SEGMENT_FORMAT_VERSION` |
+
+Three rules follow, and they are not negotiable:
+
+**A missing postcard tail is not a default.** postcard is not self-describing: a
+decoder that runs out of bytes fails, and `#[serde(default)]` cannot rescue it.
+Any field added to a postcard-encoded durable structure is a format-version bump
+under ADR 0085, with no migration, and the older artifact is explained rather
+than silently reinterpreted.
+
+**Absence must be decodable, never inferred from failure.** A record without a
+placement stamp is `RawLocality` because its carrier says so — a shorter index
+value, an absent Arrow column, an older declared format version — and never
+because a parse failed. A parse failure stays an error.
+
+
+**Length dispatch alone is not sufficient, and the index is not self-validating.**
+A V5 index value truncated back to thirty-six bytes is byte-indistinguishable
+from a genuine V4 value, so length would read it as legacy and route a
+partitioned record by raw locality — silent misrouting, which is exactly the
+outcome the rules above forbid. Length dispatch therefore covers V1–V4 only.
+
+V5 is validated against **independent durable evidence**: the record frame. Arrow
+IPC is self-describing, so a partitioned record carries
+`__row_partition__` and an older one does not, and that presence cannot be
+truncated away without destroying the frame. Placement is read from both carriers
+and they must agree:
+
+| index reads | frame declares | outcome |
+|---|---|---|
+| raw-locality | no partition | legacy record, reads |
+| partitioned | same partition | partitioned record, reads |
+| raw-locality | a partition | **refused** — the index value is truncated or damaged, not older |
+| partitioned | no partition | **refused** — index claims a partition the record does not carry |
+| partitioned | a different partition | **refused** — the carriers disagree |
+
+The third row is the one that matters: it is the only way a truncated V5 value is
+distinguishable from a genuine V4 value, and it is why placement is never decided
+by the index alone.
+
+Frame presence is **per row**, not per record: the column holds a value at rows
+written under partitioned placement and a null at rows that were not, so
+partition zero stays a legitimate partition and the requested row — never a
+neighbour — governs. One central resolver performs this cross-check, wired after
+every read-side record decode; an architecture guard holds the census of decode
+sites equal to resolver calls and confines `PlacementKey` construction to the
+modules that own placement.
+
+**A fixed-layout struct's size is its contract.** Reserved padding may absorb a
+new field only where the padding already exists and the size is unchanged;
+anything larger is a protocol version bump, never a silent widening.
+`TableWriteRequestMeta` carries three padding bytes, which is not room for a
+partition, so a partition does not ride the write meta: it is derived per row at
+the write site, where the descriptor and its `prefix_bits` are known.
+
+### 8. Which writes are partitioned
+
+Ingress derives the partition at the descriptor-aware write boundary — the
+multirow packer, where the descriptor and its `prefix_bits` are in scope — and
+only there. A table writes partitioned rows iff its record layout is `MultiRow`
+and its locality policy carries a prefix (table-spread or column projection).
+`SingleRow` tables, identity-projection localities, KV records, and
+secondary-index segment rows stay raw-locality: partitioned placement exists to
+let records group, and those either cannot group or carry no prefix to group on.
+
+A tombstone is placed with the rows it deletes, so delete ingress derives the
+same partition. The packer asserts that no packed record spans partitions rather
+than assuming bucketing keeps it true. Fan-out routes every child by its
+placement key; the frame column is emitted only when at least one row is
+partitioned, so legacy frames stay byte-identical to before this record.
 
 ## Acceptance
 
@@ -150,6 +278,21 @@ swap, without either kind losing or duplicating a row.
 - A membership change with both legacy and partitioned records present relocates
   each by its own rule in one epoch swap, and every row still resolves
   afterwards — none dropped, none duplicated.
+- Every carrier that gains a placement stamp decodes artifacts written before it
+  did, by its own mechanism: a V4 index value, an Arrow frame without the
+  column, a snapshot at the previous format version. Each has a control reading
+  a genuine older artifact, not a synthesized one.
+- No durable structure gains a `#[serde(default)]` field as its compatibility
+  story. A control asserts that a truncated postcard body fails to decode rather
+  than yielding a defaulted value, so the mechanism cannot regress into an
+  assumption.
+- A V5 index value truncated to a V4 length, paired with a partitioned record
+  frame, is refused rather than read as legacy. This is the control that
+  distinguishes truncation from an older record; without it the two are
+  byte-identical and length dispatch reports the wrong one.
+- A stamp-absent artifact decodes as `RawLocality` through a successful decode
+  path. A corrupt artifact still errors: absence and damage never share an
+  outcome.
 ## Guardrails
 
 Placement semantics are read from the record, not inferred from its values. A

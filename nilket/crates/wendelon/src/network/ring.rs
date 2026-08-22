@@ -34,7 +34,8 @@
 
 use crate::network::data_server::ReplicaRouter;
 use crate::network::transport::{MembershipEpoch, NodeRole, NodeRoleSet};
-use crate::schema::{Identity, Locality, NodeId};
+use crate::schema::table::PlacementKey;
+use crate::schema::{Identity, Locality, NodeId, PartitionId};
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
@@ -146,6 +147,12 @@ impl RingState {
 	/// Replica set resolution. See [`ReplicaRouter::replicas_for_locality`] for
 	/// the contract — this is the data-ring implementation.
 	fn replicas_for_locality(&self, locality: Locality) -> Vec<NodeId> {
+		self.replicas_for_ring_position(locality.get())
+	}
+
+	/// Shared clockwise walk. Both a raw locality and a partition project to a
+	/// single ring position; what differs is which value is allowed to do so.
+	fn replicas_for_ring_position(&self, position: u64) -> Vec<NodeId> {
 		if self.positions.is_empty() || self.data_count == 0 {
 			return Vec::new();
 		}
@@ -156,7 +163,7 @@ impl RingState {
 		// walk means we start at that index and wrap around the end.
 		let start = self
 			.positions
-			.binary_search_by(|(h, _)| h.cmp(&locality.get()))
+			.binary_search_by(|(h, _)| h.cmp(&position))
 			.unwrap_or_else(|ins| ins);
 
 		let n = self.positions.len();
@@ -188,6 +195,37 @@ impl RingState {
 	}
 
 	/// Primary owner for a routing locality. This is the first
+
+	/// ADR 0090: replica set for a whole partition.
+	///
+	/// A partition resolves to exactly one ring position, so the clockwise walk
+	/// starts once for the entire partition and an ownership boundary can never
+	/// fall inside it. That is the property packing depends on: every row of a
+	/// partitioned record shares one owner, in every epoch.
+	///
+	/// This is deliberately not `replicas_for_locality(Locality::new(id.get()))`.
+	/// The two spaces overlap numerically, and routing a partition as a locality
+	/// would silently reintroduce suffix-driven placement.
+	pub fn replicas_for_partition(&self, partition: PartitionId) -> Vec<NodeId> {
+		self.replicas_for_ring_position(partition.get())
+	}
+
+	/// Primary owner of a partition.
+	pub fn owner_of_partition(&self, partition: PartitionId) -> Option<NodeId> {
+		self.replicas_for_partition(partition).into_iter().next()
+	}
+
+	/// ADR 0090: resolve a placement key by its own semantics.
+	///
+	/// Routing consults how the record was written, never the shape of its
+	/// value. A legacy locality numerically equal to a valid partition id still
+	/// routes by legacy rules.
+	pub fn replicas_for_placement(&self, key: PlacementKey) -> Vec<NodeId> {
+		match key {
+			PlacementKey::RawLocality(locality) => self.replicas_for_locality(locality),
+			PlacementKey::Partition(partition) => self.replicas_for_partition(partition),
+		}
+	}
 	/// data-capable replica the ring walk would return for the key.
 	pub fn owner_of_locality(&self, locality: Locality) -> Option<NodeId> {
 		self.replicas_for_locality(locality).into_iter().next()
@@ -407,6 +445,10 @@ impl ReplicaRouter for RingRouter {
 
 	fn replication_factor(&self) -> usize {
 		self.snapshot().replication_factor()
+	}
+
+	fn replicas_for_placement(&self, key: PlacementKey) -> Vec<NodeId> {
+		self.snapshot().replicas_for_placement(key)
 	}
 }
 
@@ -691,5 +733,170 @@ mod tests {
 				state.owner_of_locality(locality)
 			);
 		}
+	}
+}
+
+/// ADR 0090 placement controls. A partition is the unit of ownership, and the
+/// placement semantics a record was written under decide how it routes — never
+/// the numeric shape of its value.
+#[cfg(test)]
+mod adr0090_placement {
+	use super::*;
+	use crate::network::transport::{
+		NodeCapabilitySet, NodeRoleSet, PeerCapabilities, TransportTierSet,
+	};
+	use crate::schema::table::PlacementSemantics;
+
+	fn n(id: u32) -> NodeId {
+		NodeId { id, _reserved: 0 }
+	}
+
+	fn data_caps() -> PeerCapabilities {
+		PeerCapabilities {
+			address: "127.0.0.1:0".into(),
+			tiers: TransportTierSet::empty(),
+			roles: NodeRoleSet::empty().with(NodeRole::Data),
+			capabilities: NodeCapabilitySet::empty(),
+		}
+	}
+
+	fn membership_of(peers: Vec<(u32, PeerCapabilities)>) -> MembershipEpoch {
+		let mut map = HashMap::new();
+		for (id, caps) in peers {
+			map.insert(n(id), caps);
+		}
+		MembershipEpoch {
+			epoch: 1,
+			peers: map,
+		}
+	}
+	use crate::schema::table::{partition_cardinality, partition_for_locality};
+
+	const PREFIX_BITS: u8 = 16;
+
+	fn ring(nodes: &[u32], rf: usize) -> RingState {
+		RingState::build(
+			&membership_of(nodes.iter().map(|id| (*id, data_caps())).collect()),
+			rf,
+		)
+	}
+
+	/// The partition of a locality may not depend on topology. A function that
+	/// consulted membership would differ across these rings.
+	#[test]
+	fn adr0090_partition_is_independent_of_membership() {
+		let localities = [0u64, 1, 0xFFFF, 0x1234_5678_9ABC_DEF0, u64::MAX];
+		let baseline: Vec<_> = localities
+			.iter()
+			.map(|raw| partition_for_locality(Locality::new(*raw), PREFIX_BITS).unwrap())
+			.collect();
+		for nodes in [vec![1u32], vec![1, 2, 3], vec![1, 2, 3, 4, 5, 6, 7]] {
+			let _ = ring(&nodes, 3);
+			let observed: Vec<_> = localities
+				.iter()
+				.map(|raw| partition_for_locality(Locality::new(*raw), PREFIX_BITS).unwrap())
+				.collect();
+			assert_eq!(
+				observed, baseline,
+				"partition derivation must not vary with membership"
+			);
+		}
+	}
+
+	/// Rows sharing a partition share an owner. This is the property packing
+	/// depends on and the one prefix-grouping-with-locality-routing lacked: the
+	/// suffix must not move a row to another replica set.
+	#[test]
+	fn adr0090_every_row_of_a_partition_resolves_to_one_replica_set() {
+		for nodes in [
+			vec![1u32],
+			vec![1, 2, 3],
+			vec![1, 2, 3, 4, 5],
+			vec![1, 2, 3, 4, 5, 6, 7, 8, 9],
+		] {
+			for rf in [1usize, 3, 12] {
+				let state = ring(&nodes, rf);
+				// A prefix with many distinct suffixes: the shape of a packed record.
+				let prefix = 0x00AB_0000_0000_0000u64;
+				let partition = partition_for_locality(Locality::new(prefix), PREFIX_BITS).unwrap();
+				let expected = state.replicas_for_partition(partition);
+				assert!(
+					!expected.is_empty(),
+					"a populated ring places every partition"
+				);
+				for suffix in [0u64, 1, 7, 0x1234, 0xFFFF_FFFF, 0xFFFF_FFFF_FFFF] {
+					let row = Locality::new(prefix | suffix);
+					let row_partition = partition_for_locality(row, PREFIX_BITS).unwrap();
+					assert_eq!(
+						row_partition, partition,
+						"suffix must not change the partition"
+					);
+					assert_eq!(
+						state.replicas_for_partition(row_partition),
+						expected,
+						"every row of a partition shares one replica set \
+						 (nodes={nodes:?} rf={rf})"
+					);
+				}
+			}
+		}
+	}
+
+	/// The discriminating control for ADR 0090 decision 6. A row's raw locality
+	/// and the partition it belongs to reach different replica sets, so how a
+	/// record is stamped decides where it lives. An implementation that ignores
+	/// the stamp passes every other control here and fails this one.
+	#[test]
+	fn adr0090_a_legacy_record_routes_by_locality_not_by_its_partition() {
+		let state = ring(&[1, 2, 3, 4, 5, 6, 7], 2);
+
+		// Only meaningful for a row whose locality and partition diverge —
+		// otherwise misrouting is invisible. Find one rather than assume one.
+		let row = (1u64..8192)
+			.map(|i| 0x00AB_0000_0000_0000u64 | i.wrapping_mul(0x9E37_79B9_7F4A_7C15))
+			.find(|raw| {
+				let locality = Locality::new(*raw);
+				let partition = partition_for_locality(locality, PREFIX_BITS).unwrap();
+				state.replicas_for_locality(locality) != state.replicas_for_partition(partition)
+			})
+			.map(Locality::new)
+			.expect("ring must offer a row whose locality and partition diverge");
+		let partition = partition_for_locality(row, PREFIX_BITS).unwrap();
+
+		// The stamp is load-bearing for this row: reading it under the wrong
+		// semantics sends it to a different replica set.
+		assert_ne!(
+			state.replicas_for_placement(PlacementKey::RawLocality(row)),
+			state.replicas_for_placement(PlacementKey::Partition(partition)),
+			"legacy and partitioned readings of the same row must differ here"
+		);
+		assert_eq!(
+			state.replicas_for_placement(PlacementKey::RawLocality(row)),
+			state.replicas_for_locality(row),
+			"a legacy record routes by its raw locality, never by its partition"
+		);
+		assert_eq!(
+			state.replicas_for_placement(PlacementKey::Partition(partition)),
+			state.replicas_for_partition(partition),
+			"a partitioned record routes by its partition"
+		);
+
+		// An unstamped record is legacy. It must not become partitioned merely
+		// because its value would parse as a partition id.
+		assert_eq!(
+			PlacementSemantics::default(),
+			PlacementSemantics::RawLocality
+		);
+	}
+	/// Cardinality is a durable consequence of `prefix_bits`, and out-of-range
+	/// values are refused rather than silently clamped.
+	#[test]
+	fn adr0090_partition_cardinality_is_durable_and_bounded() {
+		assert_eq!(partition_cardinality(1).unwrap(), 2);
+		assert_eq!(partition_cardinality(16).unwrap(), 65_536);
+		assert!(partition_cardinality(0).is_err());
+		assert!(partition_cardinality(64).is_err());
+		assert!(partition_for_locality(Locality::new(1), 0).is_err());
+		assert!(partition_for_locality(Locality::new(1), 64).is_err());
 	}
 }

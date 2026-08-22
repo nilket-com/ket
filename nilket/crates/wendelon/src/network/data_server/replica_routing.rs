@@ -1,4 +1,5 @@
 use super::*;
+use crate::schema::table::PlacementKey;
 
 /// Resolves a routing locality to the replica set that should store it.
 ///
@@ -19,6 +20,11 @@ pub trait ReplicaRouter: Send + Sync {
 	/// Effective replication factor for this router. Exposed so the
 	/// quorum math is source-of-truthed in one place.
 	fn replication_factor(&self) -> usize;
+
+	/// ADR 0090: replica set for a record's own placement. Route selection for
+	/// a stored record consults its stamped placement, never only its raw
+	/// locality — a partitioned record is owned by its partition's replica set.
+	fn replicas_for_placement(&self, key: PlacementKey) -> Vec<NodeId>;
 }
 
 /// Static ring router. Holds the full node list and an RF; resolves
@@ -59,4 +65,48 @@ impl ReplicaRouter for StaticReplicaRouter {
 	fn replication_factor(&self) -> usize {
 		self.rf.min(self.nodes.len().max(1))
 	}
+
+	fn replicas_for_placement(&self, key: PlacementKey) -> Vec<NodeId> {
+		// The static stand-in walks from the key's ring position either way; what
+		// differs is which value is allowed to supply that position.
+		match key {
+			PlacementKey::RawLocality(locality) => self.replicas_for_locality(locality),
+			PlacementKey::Partition(partition) => {
+				self.replicas_for_locality(Locality::new(partition.get()))
+			}
+		}
+	}
+}
+
+/// ADR 0090: the replicas that may serve a placement, transfer-aware.
+///
+/// A partition covered by an in-flight Migration Ledger entry is served by
+/// exactly that entry's owner — the old ring owner must refuse and the new
+/// owner must serve, so a transfer never leaves a partition served by both
+/// owners or by neither. Raw-locality placements keep ring routing untouched.
+pub(crate) fn serving_replicas_for_placement(
+	router: &dyn ReplicaRouter,
+	migrations: &std::collections::HashMap<u64, MigrationLedgerEntry>,
+	key: crate::schema::table::PlacementKey,
+) -> std::io::Result<Vec<NodeId>> {
+	if let crate::schema::table::PlacementKey::Partition(partition) = key {
+		if let Some(transfer) = crate::consensus::partition_transfer_for(partition, migrations)? {
+			// The transfer owner is the serving PRIMARY — the anchor every
+			// primacy check compares against — not the whole replica set. The
+			// remaining replicas come from the ring's own walk, so a transfer
+			// never collapses replicated durability to one node.
+			let rf = router.replication_factor().max(1);
+			let mut replicas = vec![transfer.serving];
+			for node in router.replicas_for_placement(key) {
+				if replicas.len() >= rf {
+					break;
+				}
+				if replicas.iter().all(|existing| existing.id != node.id) {
+					replicas.push(node);
+				}
+			}
+			return Ok(replicas);
+		}
+	}
+	Ok(router.replicas_for_placement(key))
 }

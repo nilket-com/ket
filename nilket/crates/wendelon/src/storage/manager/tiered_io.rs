@@ -704,6 +704,10 @@ impl SlabManager {
 					key_identity: entry.key_identity,
 					routing_locality: self.recovered_entry_routing_locality(&entry),
 					table_object_id,
+					// ADR 0090: recovery read the row's placement from the frame;
+					// re-tiering must not downgrade it.
+					placement: entry.location.placement,
+					partition: entry.location.partition,
 					location: entry.location,
 				})
 			})

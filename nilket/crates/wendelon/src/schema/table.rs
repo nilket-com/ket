@@ -7,8 +7,8 @@ use crate::schema::pbc::{
 };
 use crate::schema::{
 	ByteCount, ClientWriteId, DurabilityLevel, HybridTimestamp, Identity, IntraBatchIndex, KllK,
-	Locality, MaxRowCount, NodeId, TargetRowCount, TenantId, WriteResponseMeta, WriterNodeId,
-	write_payload_schema,
+	Locality, MaxRowCount, NodeId, PartitionId, TargetRowCount, TenantId, WriteResponseMeta,
+	WriterNodeId, write_payload_schema,
 };
 use arrow::array::{
 	Array, BinaryArray, Int8Array, Int16Array, Int32Array, Int64Array, LargeBinaryArray,
@@ -70,6 +70,14 @@ pub const STORAGE_ROW_TABLE_OBJECT_ID_COLUMN: &str = "__row_table_object_id__";
 /// facts. Data rows store `false`; tombstone rows share the
 /// target row's `__row_key_id__` and store `true`.
 pub const STORAGE_ROW_TOMBSTONE_COLUMN: &str = "__row_tombstone__";
+
+/// ADR 0090: the record's durable partition, present iff the record was written
+/// under partitioned placement. Arrow IPC is self-describing, so presence is the
+/// stamp: an older frame simply lacks the column. This is the independent
+/// evidence the persistent index placement is cross-checked against, which is
+/// what makes a V5 index value truncated back to a V4 length detectable rather
+/// than silently legacy.
+pub const STORAGE_ROW_PARTITION_COLUMN: &str = "__row_partition__";
 pub const TABLE_FIELD_DEFAULT_METADATA_KEY: &str = "wendelon.default.v1";
 pub const TABLE_CLUSTERING_MAX_COLUMNS: usize = 6;
 pub const COLUMN_PROJECTION_RANGE_ARC_BUDGET: usize = 1024;
@@ -2544,6 +2552,17 @@ impl TableSchemaCatalog {
 		self.latest_by_id_including_provisional(tenant_id, table_object_id)
 	}
 
+	/// ADR 0090: every live (non-provisional) descriptor. The epoch seeder walks
+	/// this to learn which partition widths hold data.
+	pub fn live_descriptors(&self) -> impl Iterator<Item = &TableSchemaDescriptor> {
+		self.by_id.iter().filter_map(|(key, descriptor)| {
+			(!self
+				.provisional_by_id
+				.contains(&(key.tenant_id, key.table_object_id)))
+			.then_some(descriptor)
+		})
+	}
+
 	pub fn latest_by_id_including_provisional(
 		&self,
 		tenant_id: TenantId,
@@ -2834,7 +2853,8 @@ fn validate_no_storage_synthetic_user_columns(schema: &Schema) -> std::io::Resul
 			| STORAGE_ROW_KEY_ID_COLUMN
 			| STORAGE_ROW_ROUTING_LOCALITY_COLUMN
 			| STORAGE_ROW_TABLE_OBJECT_ID_COLUMN
-			| STORAGE_ROW_TOMBSTONE_COLUMN => {
+			| STORAGE_ROW_TOMBSTONE_COLUMN
+			| STORAGE_ROW_PARTITION_COLUMN => {
 				return Err(Error::new(
 					ErrorKind::InvalidData,
 					format!(
@@ -3812,6 +3832,111 @@ fn validate_clustering_type_and_width(
 	}
 }
 
+/// ADR 0090: which placement semantics a record was written under. Stamped and
+/// read, never inferred from a value's shape — a legacy locality can be
+/// numerically indistinguishable from a valid partition id, so routing must
+/// consult this first and the value second. Absence of a stamp means
+/// [`PlacementSemantics::RawLocality`], and that default is deliberate rather
+/// than a parse fallback.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum PlacementSemantics {
+	/// Written before durable partitions: placement resolves from the raw
+	/// routing locality and its ring arc.
+	#[default]
+	RawLocality,
+	/// Placement resolves from the record's stamped partition.
+	Partitioned,
+}
+
+/// ADR 0090: how a record resolves to a replica set. The variants are not
+/// interchangeable and never derived from one another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlacementKey {
+	/// Legacy: an arc of the raw locality space.
+	RawLocality(Locality),
+	/// Partitioned: a whole partition, indivisible with respect to ownership.
+	Partition(PartitionId),
+}
+
+impl PlacementKey {
+	/// Whether this key routes by partition. Lets route seams branch without
+	/// naming a variant, so variant construction stays confined to the
+	/// placement-owning modules.
+	pub fn is_partition(&self) -> bool {
+		matches!(self, Self::Partition(_))
+	}
+
+	/// ADR 0090: the sanctioned constructor for code outside the
+	/// placement-owning modules. A partitioned stamp without a partition is
+	/// malformed and refused, never defaulted to legacy.
+	pub fn from_parts(
+		placement: PlacementSemantics,
+		partition: Option<PartitionId>,
+		routing_locality: Locality,
+	) -> std::io::Result<Self> {
+		match (placement, partition) {
+			(PlacementSemantics::RawLocality, _) => Ok(Self::RawLocality(routing_locality)),
+			(PlacementSemantics::Partitioned, Some(partition)) => Ok(Self::Partition(partition)),
+			(PlacementSemantics::Partitioned, None) => Err(Error::new(
+				ErrorKind::InvalidData,
+				"a partitioned placement stamp carries no partition; the entry is malformed",
+			)),
+		}
+	}
+}
+
+/// ADR 0090: the prefix width a table's partitioned rows derive from, if the
+/// table writes partitioned rows at all. One definition serves both the write
+/// boundary and the epoch seeder, so ingress and rebalancing cannot disagree
+/// about which tables are partitioned.
+pub fn partitioned_prefix_width(descriptor: &TableSchemaDescriptor) -> Option<u8> {
+	if !matches!(
+		descriptor.record_layout_policy,
+		RecordLayoutPolicy::MultiRow(_)
+	) {
+		return None;
+	}
+	match &descriptor.locality_policy {
+		LocalityPolicy::TableSpreadProjection(spread) => Some(spread.prefix_bits),
+		LocalityPolicy::ColumnProjection(projection) => Some(projection.prefix_bits),
+		LocalityPolicy::IdentityProjection => None,
+	}
+}
+
+/// The partition a routing locality belongs to.
+///
+/// A pure function of the locality and the table's `prefix_bits`: the same
+/// locality yields the same partition in every membership epoch, on every node.
+/// The prefix is the placement-bearing part of a locality — the suffix is the
+/// per-row identity, which is precisely what must NOT influence placement if a
+/// record is to group rows without spanning owners.
+///
+/// `prefix_bits` is a per-table durable descriptor value, so a partition cannot
+/// be re-derived from a bare locality by a router that has not been told which
+/// table it belongs to. Partitions are therefore carried explicitly, not
+/// recomputed at routing time.
+pub fn partition_for_locality(locality: Locality, prefix_bits: u8) -> std::io::Result<PartitionId> {
+	if prefix_bits == 0 || prefix_bits >= 64 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("partition prefix_bits must be in 1..=63, got {prefix_bits}"),
+		));
+	}
+	let (prefix_mask, _) = locality_masks(prefix_bits)?;
+	Ok(PartitionId::new(locality.get() & prefix_mask))
+}
+
+/// Partition cardinality for a given `prefix_bits`. Durable: changing it re-maps
+/// every row and is a format and migration decision, not a tuning knob.
+pub fn partition_cardinality(prefix_bits: u8) -> std::io::Result<u64> {
+	if prefix_bits == 0 || prefix_bits >= 64 {
+		return Err(Error::new(
+			ErrorKind::InvalidData,
+			format!("partition prefix_bits must be in 1..=63, got {prefix_bits}"),
+		));
+	}
+	Ok(1u64 << prefix_bits)
+}
 fn validate_table_spread(spread: TableSpreadLocalityDescriptor) -> std::io::Result<()> {
 	if spread.spread_factor == 0 || spread.spread_factor > TABLE_SPREAD_MAX_FACTOR {
 		return Err(Error::new(
