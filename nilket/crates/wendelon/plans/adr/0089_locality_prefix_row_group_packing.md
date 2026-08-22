@@ -4,6 +4,16 @@
 against the live deployment. It changes which rows share a stored record; it does
 not change the record format, the response protocol, or the encryption boundary.
 
+> **BLOCKED on ADR 0090 (durable routing partitions).** The grouping key decided
+> below — the locality prefix — is unsound: ownership is an arc of the raw
+> locality space and arcs move on membership change, so a prefix-grouped record
+> has no coherent owner and can straddle an ownership boundary after rebalancing.
+> Packed rows are also unindexed today, because ingest registers one entry per
+> record rather than per row. ADR 0090 decides the partition identity, the
+> per-row indexing of shared records, and membership-change behaviour; this
+> record resumes with the partition id as its grouping key. The per-record read
+> coalescing in decision 2 is unaffected and still required.
+
 ## Context
 
 Scan cost on the daemon path is per location, and a location is one row. The
@@ -78,7 +88,32 @@ remains what identifies a row inside its record.
 `target_rows`, `max_rows`, and `max_record_bytes` keep their existing meaning and
 finally bind, because a bucket can now hold more than one row.
 
-### 2. A packed record is addressed by its prefix, and rows by suffix within it
+### 2. The scan reads and decodes each physical record once
+
+Packing alone changes nothing. Scan cost is charged per **index entry**, not per
+record: the loop calls `slab.read(location)` and `decode_batch` for every entry
+it walks, so a record holding `R` in-range rows is read and decoded `R` times no
+matter how its rows were grouped. Grouping without coalescing is a no-op, and
+the phase profile above would not move at all.
+
+The scan therefore coalesces on the physical record identity — the
+`(slab_id, offset)` pair carried by `RecordLocation` — reading and decoding a
+record once and materializing each of its in-range rows from that single decode.
+
+Row selection and order stay index-driven. The loop still walks locality index
+entries in index order and still emits one row per entry, selected by that
+entry's `record_row_index`. Coalescing replaces the physical read; it never
+changes which rows are emitted or in what order. Cancellation, deadline, budget,
+and row-limit checks stay exactly where they are, evaluated per entry.
+
+Entries for one record are **not** contiguous. Rows in a record share a prefix,
+but the index orders on the full locality, so a prefix block interleaves entries
+from every record carrying that prefix. A cache holding only the previous record
+would thrash, so coalescing retains a bounded set of decoded records and evicts.
+The bound is on retained decoded bytes and record count: this is a cache, and a
+scan must never grow its memory with the size of the scan.
+
+### 3. A packed record is addressed by its prefix, and rows by suffix within it
 
 A record spanning many suffixes cannot be addressed by any one of them. A packed
 record's stored locality is its prefix, and locality-range scans enumerate prefix
@@ -90,7 +125,7 @@ change in this record and it needs its own controls, not an assurance: a lookup
 that returns a neighbouring row from the same record is the failure this must
 make impossible.
 
-### 3. Read compatibility is a requirement, not a migration step
+### 4. Read compatibility is a requirement, not a migration step
 
 Single-row and packed records coexist permanently. A reader must never assume a
 location holds one row, and must never assume a table's records are uniformly
@@ -100,7 +135,7 @@ The read path already carries this shape; this record makes it a contract.
 No format version changes. A packed record is the existing multirow record; this
 alters only which rows are placed in one.
 
-### 4. Migration is by compaction, never by rewrite
+### 5. Migration is by compaction, never by rewrite
 
 Existing tables are not rewritten in place and no operator step is required.
 Compaction already encodes multirow records from survivors; it packs on the same
@@ -112,7 +147,7 @@ New writes pack immediately. This means a table's read cost improves in two
 stages, and a measurement taken between them is neither the old nor the final
 number; anything reporting a rate must say which state it observed.
 
-### 5. Encryption and authentication scope is unchanged
+### 6. Encryption and authentication scope is unchanged
 
 Encryption and authentication are per sealed slab, single-tenant, via the
 encrypted slab footer. A record is not the encryption unit, so grouping rows
@@ -128,12 +163,24 @@ range instead of implying a single-row fault.
 
 ## Acceptance
 
-- **Per-row amortization, exact.** Writing `N` rows to a spread-locality table and
-  scanning them examines `ceil(N / target_rows)` locations, not `N`. The control
-  asserts the exact expected count against `clocks.progress_marks`-style producer
-  work, over a source larger than one `target_rows` group, and fails on the
-  pre-change packer where locations equals rows. "Fewer locations" is not the
-  claim and would pass while packing two rows per record.
+- **Per-record amortization, exact.** Scanning `N` rows packed at `R` rows per
+  record reads and decodes `ceil(N / R)` **distinct records**, not `N`. The
+  control counts distinct `(slab_id, offset)` reads and decodes, because
+  locality entries examined stay equal to rows by design — the index is
+  row-granular and stays that way — so counting entries would show no change and
+  prove nothing. It fails on the pre-change scan, where reads equal rows.
+- **No duplicate rows.** Every row is emitted exactly once even when many index
+  entries resolve to the same physical record. A control asserts the emitted row
+  set and its order match the index order, with no repeats.
+- **Bounded coalescing memory.** A scan far larger than the cache bound retains
+  no more than the configured decoded bytes and record count. The control drives
+  a scan whose working set exceeds the bound and asserts retention stays under
+  it, so the cache cannot silently become a whole-scan buffer.
+- **Cancellation and limits are unchanged by coalescing.** A row limit stops the
+  scan at the same row it stopped at before, and cancellation and deadline exits
+  return their existing typed outcomes. A cache hit must not skip the per-entry
+  checks; the control asserts a limit satisfied mid-record stops there rather
+  than emitting the rest of the decoded record.
 - Row count, values, order within a locality, and schema are identical before and
   after packing for the same written rows. Packing changes storage grouping, never
   query results.
@@ -151,6 +198,15 @@ range instead of implying a single-row fault.
   single-row fault.
 
 ## Guardrails
+
+The locality index stays row-granular. Exact interval semantics depend on it:
+each row is discoverable through its own `(routing_locality, key_identity)`
+entry, so a scan starting inside, ending inside, or crossing a record's locality
+span yields exactly the rows inside the interval. Coarsening the index to the
+record would break that and is not an optimization this record permits.
+
+Packing without coalescing is a no-op, and coalescing without packing has
+nothing to coalesce. Neither half may land alone claiming a rate improvement.
 
 Packing groups on the locality prefix only. Grouping on any value that is unique
 per row silently degenerates to one row per record — the present defect — so a
