@@ -28632,3 +28632,120 @@ async fn adr569_range_cap_bounds_admission_and_byte_facts_stay_exact() {
 		.expect_err("over-cap cardinality refuses at execution");
 	assert!(refused.to_string().contains("cap"), "{refused}");
 }
+
+/// ADR 579: binds through the public entry, which is the only path that runs scan
+/// projection pushdown and therefore the safe-row-limit traversal. Binding through
+/// `Binder::bind_plan` instead would leave every scan unbounded and make these
+/// controls pass while proving nothing.
+async fn bind_sql_public(catalog: &dyn Catalog, sql: &str) -> ExecutionPlan {
+	let logical = SqlPlanner::new().plan(sql).expect("plan SQL");
+	crate::binder::bind(&logical, catalog, &PlannerConfig::default())
+		.await
+		.expect(sql)
+}
+
+/// The first scan's `row_limit`. The outer `Option` distinguishes "no scan reached"
+/// from "scan is unbounded", so a walker that fails to descend a shape fails the
+/// caller's `expect` instead of silently reporting an unbounded scan.
+fn first_scan_row_limit(plan: &ExecutionPlan) -> Option<Option<usize>> {
+	match plan {
+		ExecutionPlan::Scan { row_limit, .. } => Some(*row_limit),
+		ExecutionPlan::Project { input, .. }
+		| ExecutionPlan::Filter { input, .. }
+		| ExecutionPlan::Take { input, .. }
+		| ExecutionPlan::Sort { input, .. }
+		| ExecutionPlan::Aggregate { input, .. }
+		| ExecutionPlan::Exchange { input, .. }
+		| ExecutionPlan::Window { input, .. } => first_scan_row_limit(input),
+		ExecutionPlan::Join { left, right, .. } => {
+			first_scan_row_limit(left).or_else(|| first_scan_row_limit(right))
+		}
+		_ => None,
+	}
+}
+
+#[tokio::test]
+async fn adr0579_top_level_limit_pushes_through_projection_and_alias() {
+	let catalog = catalog();
+	// `SELECT *` produces `Take{Scan}` and was already bounded before this record.
+	// Every other shape introduces a `Project`, which is where the bound was lost.
+	for sql in [
+		"SELECT * FROM sales LIMIT 2000",
+		"SELECT id FROM sales LIMIT 2000",
+		"SELECT id, amount, region, ts FROM sales LIMIT 2000",
+		"SELECT id AS k FROM sales LIMIT 2000",
+		"SELECT amount + 1 AS bumped FROM sales LIMIT 2000",
+	] {
+		let plan = bind_sql_public(&catalog, sql).await;
+		let row_limit = first_scan_row_limit(&plan).expect("control must reach a scan");
+		assert_eq!(row_limit, Some(2000), "{sql} must bound its source scan");
+	}
+}
+
+#[tokio::test]
+async fn adr0579_a_smaller_inner_bound_still_wins() {
+	let catalog = catalog();
+	let plan = bind_sql_public(
+		&catalog,
+		"SELECT id FROM (SELECT id FROM sales LIMIT 10) AS inner_rows LIMIT 2000",
+	)
+	.await;
+	let row_limit = first_scan_row_limit(&plan).expect("control must reach a scan");
+	assert_eq!(
+		row_limit,
+		Some(10),
+		"the tighter inner limit bounds the source, not the outer one"
+	);
+}
+
+#[tokio::test]
+async fn adr0579_cardinality_changing_nodes_leave_the_scan_unbounded() {
+	let catalog = catalog();
+	// Each of these would return the wrong rows under a source bound: the limit
+	// applies to the node's output, which is not its input.
+	for sql in [
+		"SELECT id FROM sales ORDER BY id LIMIT 10",
+		"SELECT region, COUNT(*) FROM sales GROUP BY region LIMIT 10",
+		"SELECT DISTINCT region FROM sales LIMIT 10",
+		"SELECT a.id FROM sales AS a JOIN sales AS b ON a.id = b.id LIMIT 10",
+	] {
+		let plan = bind_sql_public(&catalog, sql).await;
+		let row_limit = first_scan_row_limit(&plan).expect("control must reach a scan");
+		assert_eq!(
+			row_limit, None,
+			"{sql} must leave its source scan unbounded"
+		);
+	}
+}
+
+#[tokio::test]
+async fn adr0579_limit_over_a_toron_evaluated_filter_leaves_the_scan_unbounded() {
+	// A predicate Toron still evaluates means the scan must supply more rows than
+	// the limit, so only a fully-pushed filter is admitted.
+	let catalog = converted_unit_catalog(false);
+	let sql = "SELECT id FROM customers \
+	           WHERE CONVERT(distance_mile, Kilometer) > CAST(10.0 AS Kilometer) LIMIT 10";
+	let plan = bind_sql_public(&catalog, sql).await;
+	let (disposition, _) = first_filter_scan_state(&plan).expect("filter present");
+	assert_eq!(
+		disposition,
+		FilterDisposition::EvaluateInToron,
+		"the control's premise is a filter Toron evaluates"
+	);
+	let row_limit = first_scan_row_limit(&plan).expect("control must reach a scan");
+	assert_eq!(
+		row_limit, None,
+		"an unpushed filter blocks the source bound"
+	);
+}
+
+#[tokio::test]
+async fn adr0579_zero_limit_is_not_pushed_through_a_projection() {
+	let catalog = catalog();
+	let plan = bind_sql_public(&catalog, "SELECT id FROM sales LIMIT 0").await;
+	let row_limit = first_scan_row_limit(&plan).expect("control must reach a scan");
+	assert_eq!(
+		row_limit, None,
+		"a zero limit keeps its own representation rather than riding this arm"
+	);
+}

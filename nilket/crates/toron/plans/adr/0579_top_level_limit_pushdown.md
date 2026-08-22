@@ -122,11 +122,13 @@ stopping at four thousand and ninety-six.
   control written against it would pass while proving nothing.
 - The same holds through an alias (`SELECT id AS k ...`) and an explicit full
   column list, and continues to hold for `SELECT *`.
-- Against a live Wendelon source larger than one response quantum, a top-level
-  `LIMIT n` for `n` under the quantum examines exactly `n` locations:
-  `clocks.progress_marks == n`. This fails on the pre-change binder, where it
-  reads a full quantum, and it is the control that would have caught ADR 0088's
-  regression.
+- Against a Wendelon source larger than one response quantum, a row limit `n`
+  under the quantum bounds producer work to exactly `n` rows' worth. A progress
+  mark is a location processed *or* a batch produced, not one per location, so
+  the control derives the per-row constant from the full scan and asserts
+  `progress_marks == marks_per_row * n` — an exact equality on producer work
+  rather than the strict inequality that let this regression through. Its failure
+  message names what quantum rounding would have reported.
 - The daemon-path exhibit recovers: with the fixture and query shape that measured
   8.8 s at 2,000 rows and 17.7 s at 5,000, cost tracks the limit rather than the
   quantum. Reported as a measurement with its binary identified, not as a CI gate.
@@ -134,7 +136,11 @@ stopping at four thousand and ninety-six.
   join under a limit, and a limit over a filter that is not fully pushed each
   leave `row_limit` unset. Each asserts the scan is unbounded, so admitting any of
   them later requires deleting a control rather than silently widening a match.
-- Rows, order, and schema are unchanged across every shape above. A pushed bound
+- A live projected `LIMIT n` returns exactly `n` rows, with the projected schema,
+  and every row is a distinct genuine row of the source. `LIMIT` without
+  `ORDER BY` promises no particular rows, so this asserts membership and
+  distinctness rather than a fixed prefix — a control demanding the first `n` in
+  order would be asserting a guarantee the query does not make. A pushed bound
   changes what the producer reads, never what the query returns.
 
 ## Guardrails

@@ -227,9 +227,11 @@ pub(crate) fn adr176_binder_root_is_bounded() {
 	// ADR 572 threads the materialization certificate through the CTAS bind
 	// arm and requires the recomputed canonical encoding to match it byte for
 	// byte; the authoring bind and the recomputation live in binder/generated.rs.
+	// ADR 579 adds the row-preserving projection arm to the safe-row-limit
+	// traversal, so a top-level LIMIT reaches the scan through a column list.
 	assert!(
-		lines <= 6_465,
-		"binder root has {lines} lines; expected <= 6,465 (bounded; bump only for real new IR nodes / passes)"
+		lines <= 6_472,
+		"binder root has {lines} lines; expected <= 6,472 (bounded; bump only for real new IR nodes / passes)"
 	);
 }
 

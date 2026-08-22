@@ -14683,3 +14683,78 @@ async fn adr0088_a_single_row_over_the_frame_cap_is_refused_by_name() {
 		"the refusal names the bound it hit: {error}"
 	);
 }
+
+/// ADR 579: a row limit bounds producer work to exactly the limit, over a source
+/// larger than one response quantum. The strict-inequality form of this claim —
+/// used when the response quantum landed — cannot distinguish stopping at the
+/// limit from stopping at the next quantum boundary, which is precisely the gap
+/// that let a bounded read cost a full quantum of speculative locations.
+#[tokio::test]
+async fn adr0579_row_limit_bounds_producer_work_to_exactly_the_limit() {
+	const SOURCE_ROWS: usize = 5_000;
+	const LIMIT: usize = 2_000;
+	assert!(
+		SOURCE_ROWS > TABLE_QUERY_RESPONSE_TARGET_ROWS,
+		"the source must exceed one response quantum or there is no rounding to observe"
+	);
+	assert!(
+		LIMIT < TABLE_QUERY_RESPONSE_TARGET_ROWS,
+		"the limit must fall inside the first quantum or rounding is unobservable"
+	);
+	let (mgr, descriptor, program, meta, ranges) =
+		descriptor_backed_whole_record_cost_bound_fixture_with_rows(SOURCE_ROWS).await;
+
+	// Premise: the counter tracks locations one-for-one, so an equality on it below
+	// is a statement about producer work rather than about batching.
+	let full = plan_query_execution_for_ranges_with_program(
+		&mgr,
+		n(1),
+		&meta,
+		&program,
+		&ranges,
+		QueryExecutionBudget::default(),
+		None,
+		Some(&descriptor),
+		QueryProjectedExecution::Disabled,
+		RowIdentityProjection::None,
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(full.response.status, ReadStatus::OK);
+	// A progress mark is "a location processed or a batch produced", so it is a fixed
+	// multiple of rows on this path rather than one per row. Deriving that multiple from
+	// the full scan keeps the bounded assertion below an exact equality on producer work.
+	let marks_per_row = full.clocks.progress_marks / SOURCE_ROWS as u64;
+	assert!(marks_per_row > 0, "the counter must advance with the scan");
+	assert_eq!(
+		full.clocks.progress_marks,
+		marks_per_row * SOURCE_ROWS as u64,
+		"progress marks must be a whole multiple of source rows for the ratio below to be exact"
+	);
+
+	let limited = plan_query_execution_for_ranges_with_program(
+		&mgr,
+		n(1),
+		&meta,
+		&program,
+		&ranges,
+		QueryExecutionBudget::default(),
+		Some(LIMIT),
+		Some(&descriptor),
+		QueryProjectedExecution::Disabled,
+		RowIdentityProjection::None,
+		None,
+	)
+	.await
+	.unwrap();
+	assert_eq!(limited.response.status, ReadStatus::OK);
+	assert_eq!(limited.response.rows, LIMIT as u64);
+	assert_eq!(
+		limited.clocks.progress_marks,
+		marks_per_row * LIMIT as u64,
+		"a bounded read must stop at the limit, not at the next response quantum \
+		 (rounding to the quantum would report {})",
+		marks_per_row * TABLE_QUERY_RESPONSE_TARGET_ROWS as u64
+	);
+}

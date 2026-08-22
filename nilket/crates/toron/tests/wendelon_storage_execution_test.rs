@@ -2530,3 +2530,118 @@ async fn scan_throughput_diagnostic() {
 
 	fixture.node.handles.abort();
 }
+
+/// ADR 579: a column list introduces a projection, which is the layer the source
+/// bound is now pushed through. The bound changes what the producer reads and must
+/// never change what the query returns, so this asserts the rows themselves.
+#[tokio::test]
+async fn adr0579_projected_limit_returns_exactly_its_limit_of_genuine_rows() {
+	const ROWS: i64 = 200;
+	const LIMIT: usize = 25;
+	let fixture = LiveWendelonFixture::start(137).await;
+	let catalog = Arc::new(MockCatalog::new());
+	let planner = toron::sql_planner::SqlPlanner::new();
+	let create_coordinator = QueryCoordinator::new(
+		catalog.clone(),
+		Executor::new(Arc::new(InMemoryStorageScan {
+			table_data: RecordBatch::new_empty(Arc::new(Schema::empty())),
+		})),
+		PlannerConfig::default(),
+	);
+	create_coordinator
+		.execute_query(
+			&planner
+				.plan("CREATE TABLE bench.limit_rows (x BIGINT, y BIGINT)")
+				.expect("plan create"),
+			None,
+		)
+		.await
+		.expect("create table");
+
+	let table = TableRef::with_schema("bench", "limit_rows");
+	let binding = catalog.resolve_table(&table).await.expect("resolve");
+	let descriptor = descriptor_from_sql_created_binding(&table, &binding);
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	fixture
+		.node
+		.data_server
+		.refresh_leases_once(&fixture.node.ring, &*fixture.node.clock, 60_000)
+		.await;
+
+	let batch = RecordBatch::try_new(
+		Arc::new(descriptor.arrow_schema().expect("arrow schema")),
+		vec![
+			Arc::new(Int64Array::from_iter_values(0..ROWS)) as ArrayRef,
+			Arc::new(Int64Array::from_iter_values((0..ROWS).map(|row| row * 2))) as ArrayRef,
+		],
+	)
+	.expect("write batch");
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch).await;
+
+	let descriptors = HashMap::from([(binding.local_table_id, descriptor)]);
+	let registry =
+		Arc::new(WendelonDescriptorRegistry::from_descriptors(descriptors).expect("registry"));
+	let coordinator = QueryCoordinator::new(
+		catalog,
+		Executor::with_context(
+			Arc::new(WendelonStorageScan::with_descriptor_registry(
+				fixture.client.clone(),
+				registry,
+			)),
+			ExecutionContext::new(
+				SessionId(1),
+				QueryId::from_u128(579),
+				ToronTenantId(1),
+				HlcBound(u64::MAX),
+			),
+		),
+		PlannerConfig::default(),
+	);
+
+	let result = coordinator
+		.execute_query(
+			&planner
+				.plan(&format!("SELECT x FROM bench.limit_rows LIMIT {LIMIT}"))
+				.expect("plan limited select"),
+			None,
+		)
+		.await
+		.expect("limited scan");
+
+	let rows: usize = result.iter().map(RecordBatch::num_rows).sum();
+	assert_eq!(rows, LIMIT, "a projected limit returns exactly its limit");
+	assert_eq!(
+		result[0].schema().fields().len(),
+		1,
+		"the projection still selects one column"
+	);
+	let mut seen = Vec::new();
+	for batch in &result {
+		let column = batch
+			.column(0)
+			.as_any()
+			.downcast_ref::<Int64Array>()
+			.expect("x is Int64");
+		seen.extend(column.iter().map(|value| value.expect("x is not null")));
+	}
+	// `LIMIT` without `ORDER BY` promises no particular rows, so the invariant is that
+	// a bounded source still yields genuine, distinct rows of the source — never a
+	// duplicate, a null, or a value the table never held.
+	seen.sort_unstable();
+	let distinct = {
+		let mut unique = seen.clone();
+		unique.dedup();
+		unique.len()
+	};
+	assert_eq!(
+		distinct, LIMIT,
+		"a bounded source must not repeat rows: {seen:?}"
+	);
+	assert!(
+		seen.iter().all(|value| (0..ROWS).contains(value)),
+		"every returned row must be one the table held: {seen:?}"
+	);
+
+	fixture.node.handles.abort();
+	let _ = std::fs::remove_dir_all(fixture.data_dir);
+}

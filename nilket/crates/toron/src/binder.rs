@@ -4330,6 +4330,15 @@ fn apply_safe_row_limit_to_scan(plan: &mut ExecutionPlan, limit: usize) -> bool 
 			limit: inner_limit,
 			..
 		} => apply_safe_row_limit_to_scan(input, limit.min(*inner_limit)),
+		// A projection emits exactly one row per input row, so a bound above it is the same
+		// bound below it. `LIMIT 0` is excluded: it has its own representation and its own
+		// handling of `Some(0)`, and must not share a path with a real bound.
+		ExecutionPlan::Project { input, .. } if limit > 0 => {
+			apply_safe_row_limit_to_scan(input, limit)
+		}
+		// Closed positive list: every cardinality-changing node (Aggregate, Sort, Window,
+		// Join, Exchange, Union) is refused here, so one added later cannot inherit
+		// pushdown by failing to be excluded.
 		_ => false,
 	}
 }
