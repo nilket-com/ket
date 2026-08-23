@@ -3924,6 +3924,39 @@ fn apply_request_at_log_index(
 			};
 			(response, None)
 		}
+		WendelonRequest::ReplayLegacyCtasRowDispatched(replay) => {
+			let declared = apply_ctas_saga_mutation(
+				state,
+				CtasSagaMutation::DeclareChain {
+					tenant_id: replay.tenant_id,
+					operation_id: replay.operation_id,
+					owner_epoch: replay.owner_epoch,
+					row_count: replay.row_count,
+					chunk_count: 1,
+				},
+			);
+			let response = match declared {
+				CtasSagaResponse::Applied(_) => apply_ctas_saga_mutation(
+					state,
+					CtasSagaMutation::MarkRowDispatched {
+						tenant_id: replay.tenant_id,
+						operation_id: replay.operation_id,
+						owner_epoch: replay.owner_epoch,
+						row_count: replay.row_count,
+					},
+				),
+				other => other,
+			};
+			let response = match response {
+				CtasSagaResponse::Applied(_) => WendelonResponse::Success,
+				CtasSagaResponse::Rejected(reject) => WendelonResponse::Error(format!(
+					"{}{code}",
+					crate::schema::CTAS_SAGA_REJECT_PREFIX,
+					code = reject.code()
+				)),
+			};
+			(response, None)
+		}
 		WendelonRequest::TierSlab(tier) => {
 			// Idempotent replays keep the existing mapping; pointer
 			// refreshes (for re-encryption or URI/hash repair) update
@@ -4354,6 +4387,8 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 				prior_descriptor,
 				row_write_id,
 				row_count: None,
+				chunk_count: None,
+				chain_pins_released: true,
 				phase: CtasSagaPhase::Provisioned,
 				terminal_cause: None,
 				owner_epoch,
@@ -4399,6 +4434,35 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 			state.ctas_sagas.insert(entry.clone());
 			CtasSagaResponse::Applied(entry)
 		}
+		CtasSagaMutation::DeclareChain {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+			row_count,
+			chunk_count,
+		} => {
+			if chunk_count == 0 || chunk_count > crate::schema::CTAS_MAX_WRITE_CHUNKS {
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch) {
+				Ok(entry) => entry,
+				Err(reject) => return CtasSagaResponse::Rejected(reject),
+			};
+			match entry.phase {
+				CtasSagaPhase::Provisioned
+					if entry.row_count.is_none() && entry.chunk_count.is_none() =>
+				{
+					entry.row_count = Some(row_count);
+					entry.chunk_count = Some(chunk_count);
+					entry.chain_pins_released = false;
+				}
+				CtasSagaPhase::Provisioned
+					if entry.row_count == Some(row_count)
+						&& entry.chunk_count == Some(chunk_count) => {}
+				_ => return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition),
+			}
+			CtasSagaResponse::Applied(entry.clone())
+		}
 		CtasSagaMutation::MarkRowDispatched {
 			tenant_id,
 			operation_id,
@@ -4410,13 +4474,38 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 				Err(reject) => return CtasSagaResponse::Rejected(reject),
 			};
 			match entry.phase {
-				CtasSagaPhase::Provisioned => {
-					entry.row_count = Some(row_count);
+				CtasSagaPhase::Provisioned
+					if entry.row_count == Some(row_count) && entry.chunk_count.is_some() =>
+				{
 					entry.phase = CtasSagaPhase::RowDispatched;
 				}
 				CtasSagaPhase::RowDispatched if entry.row_count == Some(row_count) => {}
 				_ => return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition),
 			}
+			CtasSagaResponse::Applied(entry.clone())
+		}
+		CtasSagaMutation::MarkChainPinsReleased {
+			tenant_id,
+			operation_id,
+			owner_epoch,
+		} => {
+			let entry = match ctas_owned_entry_mut(state, tenant_id, operation_id, owner_epoch) {
+				Ok(entry) => entry,
+				Err(reject) => return CtasSagaResponse::Rejected(reject),
+			};
+			if !matches!(
+				entry.phase,
+				CtasSagaPhase::RowsCommitted { .. }
+					| CtasSagaPhase::Provisioned
+					| CtasSagaPhase::Reclaimed
+					| CtasSagaPhase::Conflict
+					| CtasSagaPhase::Published
+					| CtasSagaPhase::RetiringOld
+					| CtasSagaPhase::Complete
+			) {
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
+			}
+			entry.chain_pins_released = true;
 			CtasSagaResponse::Applied(entry.clone())
 		}
 		CtasSagaMutation::AttestRowsCommitted {
@@ -4453,6 +4542,9 @@ fn apply_ctas_saga_mutation(state: &mut SmState, mutation: CtasSagaMutation) -> 
 			}
 			if !matches!(snapshot.phase, CtasSagaPhase::RowsCommitted { .. }) {
 				return CtasSagaResponse::Rejected(CtasSagaReject::RowsNotCommitted);
+			}
+			if !snapshot.chain_pins_released {
+				return CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition);
 			}
 			if !ctas_expected_binding_matches(state, tenant_id, &snapshot) {
 				return CtasSagaResponse::Rejected(CtasSagaReject::BindingChanged);
@@ -6155,6 +6247,8 @@ fn decode_log_record(
 	let entry: Entry<WendelonTypeConfig> = match header.format_version {
 		1 => crate::consensus::wal_body::v1::decode_entry(payload)
 			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 1, &err.to_string()))?,
+		2 => crate::consensus::wal_body::v2::decode_entry(payload)
+			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 2, &err.to_string()))?,
 		_ => match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload) {
 			Ok((entry, [])) => entry,
 			Ok((_entry, rest)) => {
@@ -6271,7 +6365,10 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 			(LogEntryKind::CONFIG, r.to.epoch)
 		}
 		EntryPayload::Normal(WendelonRequest::SchemaUpdate(_)) => (LogEntryKind::APPEND, 0),
-		EntryPayload::Normal(WendelonRequest::CtasSaga(_)) => (LogEntryKind::APPEND, 0),
+		EntryPayload::Normal(WendelonRequest::CtasSaga(_))
+		| EntryPayload::Normal(WendelonRequest::ReplayLegacyCtasRowDispatched(_)) => {
+			(LogEntryKind::APPEND, 0)
+		}
 		EntryPayload::Normal(WendelonRequest::TierSlab(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::RetireTieredSlab(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::CompactionCommit(_)) => (LogEntryKind::APPEND, 0),
@@ -6563,6 +6660,14 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 			format!(
 				"{err}; the body's digest matched, so this artifact is intact, and it \
 				 declares snapshot format version 2, which this build replays — failing \
+				 that decode means the artifact was not written at its declared version; \
+				 this is a format mismatch, not corruption"
+			)
+		})?,
+		3 => crate::consensus::snapshot_body::v3::decode_state(&body).map_err(|err| {
+			format!(
+				"{err}; the body's digest matched, so this artifact is intact, and it \
+				 declares snapshot format version 3, which this build replays — failing \
 				 that decode means the artifact was not written at its declared version; \
 				 this is a format mismatch, not corruption"
 			)
@@ -7002,6 +7107,17 @@ mod schema_state_tests {
 	}
 
 	fn drive_ctas_to_rows_committed(state: &mut SmState, row_count: u64) {
+		let declared = apply_ctas_saga_mutation(
+			state,
+			CtasSagaMutation::DeclareChain {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count,
+				chunk_count: 1,
+			},
+		);
+		assert!(matches!(declared, CtasSagaResponse::Applied(_)));
 		let dispatched = apply_ctas_saga_mutation(
 			state,
 			CtasSagaMutation::MarkRowDispatched {
@@ -7022,6 +7138,53 @@ mod schema_state_tests {
 			},
 		);
 		assert!(matches!(committed, CtasSagaResponse::Applied(_)));
+		let released = apply_ctas_saga_mutation(
+			state,
+			CtasSagaMutation::MarkChainPinsReleased {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+			},
+		);
+		assert!(matches!(released, CtasSagaResponse::Applied(_)));
+	}
+
+	#[test]
+	fn adr0094_chain_must_be_declared_before_dispatch_and_cleanup_before_publish() {
+		let mut state = SmState::default();
+		let entry = provision_ctas(
+			&mut state,
+			append_only_table_descriptor(2),
+			CtasExpectedBinding::Absent,
+		);
+		let dispatch_without_declaration = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::MarkRowDispatched {
+				tenant_id: entry.tenant_id,
+				operation_id: entry.operation_id,
+				owner_epoch: entry.owner_epoch,
+				row_count: 9,
+			},
+		);
+		assert_eq!(
+			dispatch_without_declaration,
+			CtasSagaResponse::Rejected(CtasSagaReject::InvalidTransition)
+		);
+		let declared = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::DeclareChain {
+				tenant_id: entry.tenant_id,
+				operation_id: entry.operation_id,
+				owner_epoch: entry.owner_epoch,
+				row_count: 9,
+				chunk_count: 3,
+			},
+		);
+		let CtasSagaResponse::Applied(declared) = declared else {
+			panic!("declare")
+		};
+		assert_eq!(declared.chunk_count, Some(3));
+		assert!(!declared.chain_pins_released);
 	}
 
 	#[test]
@@ -7325,30 +7488,13 @@ mod schema_state_tests {
 			),
 			CtasSagaResponse::Rejected(CtasSagaReject::RowsNotCommitted)
 		);
-		let _ = apply_ctas_saga_mutation(
-			&mut state,
-			CtasSagaMutation::MarkRowDispatched {
-				tenant_id: TenantId::new(7),
-				operation_id: ctas_operation_id(0x54),
-				owner_epoch: 1,
-				row_count: 2,
-			},
-		);
+		drive_ctas_to_rows_committed(&mut state, 2);
 
 		let winner = append_only_table_descriptor_for(1, TableObjectId::new([0x99; 16]));
 		state
 			.table_schemas
 			.upsert(TenantId::new(7), winner.clone())
 			.unwrap();
-		let _ = apply_ctas_saga_mutation(
-			&mut state,
-			CtasSagaMutation::AttestRowsCommitted {
-				tenant_id: TenantId::new(7),
-				operation_id: ctas_operation_id(0x54),
-				owner_epoch: 1,
-				row_count: 2,
-			},
-		);
 		assert_eq!(
 			apply_ctas_saga_mutation(
 				&mut state,
@@ -7387,24 +7533,7 @@ mod schema_state_tests {
 				schema_generation: SchemaGeneration::new(old.schema_generation),
 			},
 		);
-		let _ = apply_ctas_saga_mutation(
-			&mut state,
-			CtasSagaMutation::MarkRowDispatched {
-				tenant_id: TenantId::new(7),
-				operation_id: ctas_operation_id(0x54),
-				owner_epoch: 1,
-				row_count: 2,
-			},
-		);
-		let _ = apply_ctas_saga_mutation(
-			&mut state,
-			CtasSagaMutation::AttestRowsCommitted {
-				tenant_id: TenantId::new(7),
-				operation_id: ctas_operation_id(0x54),
-				owner_epoch: 1,
-				row_count: 2,
-			},
-		);
+		drive_ctas_to_rows_committed(&mut state, 2);
 		let _ = apply_ctas_saga_mutation(
 			&mut state,
 			CtasSagaMutation::Publish {
@@ -7468,24 +7597,7 @@ mod schema_state_tests {
 		let object_id = provisional.table_object_id;
 		let mut state = SmState::default();
 		provision_ctas(&mut state, provisional, CtasExpectedBinding::Absent);
-		let _ = apply_ctas_saga_mutation(
-			&mut state,
-			CtasSagaMutation::MarkRowDispatched {
-				tenant_id: TenantId::new(7),
-				operation_id: ctas_operation_id(0x54),
-				owner_epoch: 1,
-				row_count: 1,
-			},
-		);
-		let _ = apply_ctas_saga_mutation(
-			&mut state,
-			CtasSagaMutation::AttestRowsCommitted {
-				tenant_id: TenantId::new(7),
-				operation_id: ctas_operation_id(0x54),
-				owner_epoch: 1,
-				row_count: 1,
-			},
-		);
+		drive_ctas_to_rows_committed(&mut state, 1);
 		state
 			.table_schemas
 			.retire_unbound_object(TenantId::new(7), object_id)
@@ -7593,6 +7705,16 @@ mod schema_state_tests {
 			&mut state,
 			append_only_table_descriptor(1),
 			CtasExpectedBinding::Absent,
+		);
+		let _ = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::DeclareChain {
+				tenant_id: TenantId::new(7),
+				operation_id: ctas_operation_id(0x54),
+				owner_epoch: 1,
+				row_count: 3,
+				chunk_count: 1,
+			},
 		);
 		let _ = apply_ctas_saga_mutation(
 			&mut state,
@@ -12370,8 +12492,8 @@ mod tenant_kek_tests {
 ///
 /// The WAL body is `postcard(Entry<WendelonTypeConfig>)` and the snapshot body
 /// is `postcard(SmState)` — positional encodings that cannot describe
-/// themselves. These controls pin the CURRENT snapshot (version 3) and WAL
-/// (version 2) shapes two ways: a
+/// themselves. These controls pin the CURRENT snapshot (version 4) and WAL
+/// (version 3) shapes two ways: a
 /// stored golden encoding per request variant and per changed container, and
 /// an exact-set guard over the variant lists, because an appended enum variant
 /// moves no stored bytes and only the set check can see it. Any failure here
@@ -12519,12 +12641,30 @@ mod body_format_corpus {
 				},
 			),
 			(
+				"declare_chain",
+				CtasSagaMutation::DeclareChain {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+					row_count: 2,
+					chunk_count: 1,
+				},
+			),
+			(
 				"mark_row_dispatched",
 				CtasSagaMutation::MarkRowDispatched {
 					tenant_id,
 					operation_id,
 					owner_epoch: 1,
 					row_count: 2,
+				},
+			),
+			(
+				"mark_chain_pins_released",
+				CtasSagaMutation::MarkChainPinsReleased {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
 				},
 			),
 			(
@@ -12784,6 +12924,17 @@ mod body_format_corpus {
 				"ctas_saga",
 				WendelonRequest::CtasSaga(canonical_mutations().remove(0).1),
 			),
+			(
+				"replay_legacy_ctas_row_dispatched",
+				WendelonRequest::ReplayLegacyCtasRowDispatched(
+					crate::schema::ReplayLegacyCtasRowDispatched {
+						tenant_id,
+						operation_id: canonical_operation_id(),
+						owner_epoch: 1,
+						row_count: 2,
+					},
+				),
+			),
 		]
 	}
 
@@ -12817,7 +12968,7 @@ mod body_format_corpus {
 		state
 	}
 
-	fn canonical_v3_sm_state() -> SmState {
+	fn canonical_current_sm_state() -> SmState {
 		let mut state = canonical_sm_state();
 		state
 			.table_drop_outcomes
@@ -12830,6 +12981,32 @@ mod body_format_corpus {
 				finalize_log_index: 37,
 			});
 		state
+	}
+
+	fn canonical_v3_sm_state() -> crate::consensus::snapshot_body::v3::SmState {
+		let state = canonical_current_sm_state();
+		crate::consensus::snapshot_body::v3::SmState {
+			last_applied_log_id: state.last_applied_log_id,
+			last_membership: state.last_membership,
+			epoch_history: state.epoch_history,
+			leases: state.leases,
+			e_safe_watermarks: state.e_safe_watermarks,
+			last_e_safe_index: state.last_e_safe_index,
+			tiered_slabs: state.tiered_slabs,
+			migrations: state.migrations,
+			tombstones: state.tombstones,
+			tenants: state.tenants,
+			tenant_keysets: state.tenant_keysets,
+			revoked_actor_keys: state.revoked_actor_keys,
+			table_schemas: state.table_schemas,
+			logical_types: state.logical_types,
+			secondary_indexes: state.secondary_indexes,
+			table_lifecycle: state.table_lifecycle,
+			table_drop_fences: state.table_drop_fences,
+			table_drop_outcomes: state.table_drop_outcomes,
+			ctas_sagas: crate::consensus::snapshot_body::pre_v4_ctas::project(state.ctas_sagas),
+			materialization_certificates: state.materialization_certificates,
+		}
 	}
 
 	fn canonical_v2_sm_state() -> crate::consensus::snapshot_body::v2::SmState {
@@ -12852,7 +13029,7 @@ mod body_format_corpus {
 			secondary_indexes: state.secondary_indexes,
 			table_lifecycle: state.table_lifecycle,
 			table_drop_fences: state.table_drop_fences,
-			ctas_sagas: state.ctas_sagas,
+			ctas_sagas: crate::consensus::snapshot_body::pre_v4_ctas::project(state.ctas_sagas),
 			materialization_certificates: state.materialization_certificates,
 		}
 	}
@@ -12885,6 +13062,12 @@ mod body_format_corpus {
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v2.txt");
 	const SNAPSHOT_V3_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v3.txt");
+	const WAL_V3_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v3_entries.txt");
+	const MUTATION_V3_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/ctas_mutations_v3.txt");
+	const SNAPSHOT_V4_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v4.txt");
 
 	fn wal_corpus() -> Vec<(&'static str, Vec<u8>)> {
 		let mut corpus: Vec<(&'static str, Vec<u8>)> = canonical_requests()
@@ -12948,7 +13131,10 @@ mod body_format_corpus {
 	#[test]
 	fn adr0092_wal_v2_encodings_match_stored_goldens() {
 		let stored = parse_manifest(WAL_MANIFEST);
-		let corpus = wal_corpus();
+		let corpus = wal_corpus()
+			.into_iter()
+			.filter(|(name, _)| *name != "replay_legacy_ctas_row_dispatched")
+			.collect::<Vec<_>>();
 		assert_eq!(
 			stored.keys().cloned().collect::<Vec<_>>(),
 			{
@@ -12981,7 +13167,10 @@ mod body_format_corpus {
 		let stored = parse_manifest(MUTATION_MANIFEST);
 		let corpus: Vec<(&'static str, Vec<u8>)> = canonical_mutations()
 			.into_iter()
-			.map(|(name, mutation)| (name, postcard::to_stdvec(&mutation).unwrap()))
+			.filter_map(|(name, mutation)| {
+				crate::consensus::wal_body::v2::project_mutation(mutation)
+					.map(|mutation| (name, postcard::to_stdvec(&mutation).unwrap()))
+			})
 			.collect();
 		assert_eq!(stored.keys().cloned().collect::<Vec<_>>(), {
 			let mut names: Vec<String> = corpus.iter().map(|(name, _)| name.to_string()).collect();
@@ -12995,6 +13184,48 @@ mod body_format_corpus {
 				"CTAS mutation encoding moved for `{name}`"
 			);
 		}
+	}
+
+	#[test]
+	fn adr0094_current_wal_and_mutation_corpora_match_v3_goldens() {
+		let stored_wal = parse_manifest(WAL_V3_MANIFEST);
+		let corpus = wal_corpus();
+		assert_eq!(stored_wal.len(), corpus.len());
+		for (name, bytes) in corpus {
+			assert_eq!(
+				hex(&bytes),
+				hex(&stored_wal[name]),
+				"WAL v3 body moved for {name}"
+			);
+		}
+		let stored_mutations = parse_manifest(MUTATION_V3_MANIFEST);
+		let mutations = canonical_mutations();
+		assert_eq!(stored_mutations.len(), mutations.len());
+		for (name, mutation) in mutations {
+			assert_eq!(
+				hex(&postcard::to_stdvec(&mutation).unwrap()),
+				hex(&stored_mutations[name]),
+				"CTAS mutation v3 body moved for {name}"
+			);
+		}
+	}
+
+	#[test]
+	fn adr0094_current_snapshot_v4_matches_stored_golden() {
+		let stored = parse_manifest(SNAPSHOT_V4_MANIFEST);
+		let state = canonical_current_sm_state();
+		assert_eq!(
+			hex(&postcard::to_stdvec(&state).unwrap()),
+			hex(&stored["smstate_active_saga_and_drop_outcome"])
+		);
+		let entry = state
+			.ctas_sagas
+			.get(TenantId::new(7), canonical_operation_id())
+			.unwrap();
+		assert_eq!(
+			hex(&postcard::to_stdvec(entry).unwrap()),
+			hex(&stored["ctas_saga_entry"])
+		);
 	}
 
 	#[test]
@@ -13033,7 +13264,8 @@ mod body_format_corpus {
 		);
 		let entry = state
 			.ctas_sagas
-			.get(TenantId::new(7), canonical_operation_id())
+			.entries
+			.get(&(TenantId::new(7), canonical_operation_id()))
 			.expect("canonical state must hold its active saga")
 			.clone();
 		assert_eq!(
@@ -13041,7 +13273,7 @@ mod body_format_corpus {
 			hex(&stored["ctas_saga_entry"]),
 			"CtasSagaEntry encoding moved"
 		);
-		let decoded: SmState =
+		let decoded: crate::consensus::snapshot_body::v3::SmState =
 			postcard::from_bytes(&stored["smstate_active_saga_and_drop_outcome"]).unwrap();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&decoded).unwrap()),
@@ -13049,7 +13281,7 @@ mod body_format_corpus {
 			"stored snapshot golden must round-trip byte-stable"
 		);
 		assert_eq!(decoded.table_drop_outcomes.len(), 1);
-		let encoded_snapshot = encode_snapshot(&state).unwrap();
+		let encoded_snapshot = encode_snapshot(&canonical_current_sm_state()).unwrap();
 		let (header, round_tripped) = decode_snapshot_reader(encoded_snapshot.as_slice()).unwrap();
 		assert_eq!(header.format_version, SNAPSHOT_FORMAT_VERSION);
 		assert_eq!(
@@ -13371,7 +13603,7 @@ mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v2_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v3_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -13379,8 +13611,8 @@ mod body_format_corpus {
 				hex(&postcard::to_stdvec(&mutation).unwrap())
 			));
 		}
-		std::fs::write(dir.join("ctas_mutations_v2.txt"), mutations).unwrap();
-		let state = canonical_v3_sm_state();
+		std::fs::write(dir.join("ctas_mutations_v3.txt"), mutations).unwrap();
+		let state = canonical_current_sm_state();
 		let entry = state
 			.ctas_sagas
 			.get(TenantId::new(7), canonical_operation_id())
@@ -13391,7 +13623,7 @@ mod body_format_corpus {
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v3.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v4.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }

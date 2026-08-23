@@ -1756,7 +1756,8 @@ impl WendelonClient {
 	) -> std::io::Result<TableWriteResult> {
 		let conn = self.factory.get_connection(target).await?;
 		let mut stream = conn.open_bi().await?;
-		let arrow = encode_batch(&request.payload)?;
+		let arrow =
+			encode_table_write_arrow_section(&request.payload).map_err(std::io::Error::from)?;
 		let header = FrameHeader {
 			magic: HRFT_MAGIC,
 			version: 1,
@@ -3881,6 +3882,58 @@ fn encode_batch(batch: &RecordBatch) -> std::io::Result<Vec<u8>> {
 		started.elapsed(),
 	);
 	Ok(buf)
+}
+
+#[derive(Debug)]
+pub enum TableWriteSectionEncodeError {
+	Encode(std::io::Error),
+	TooLarge {
+		encoded_bytes: usize,
+		max_bytes: u32,
+	},
+}
+
+impl std::fmt::Display for TableWriteSectionEncodeError {
+	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		match self {
+			Self::Encode(error) => write!(f, "table-write Arrow encoding failed: {error}"),
+			Self::TooLarge {
+				encoded_bytes,
+				max_bytes,
+			} => write!(
+				f,
+				"table-write Arrow section is {encoded_bytes} bytes; exceeds HRFT {max_bytes}-byte section cap"
+			),
+		}
+	}
+}
+
+impl std::error::Error for TableWriteSectionEncodeError {}
+
+impl From<TableWriteSectionEncodeError> for std::io::Error {
+	fn from(error: TableWriteSectionEncodeError) -> Self {
+		let kind = match error {
+			TableWriteSectionEncodeError::Encode(ref source) => source.kind(),
+			TableWriteSectionEncodeError::TooLarge { .. } => ErrorKind::InvalidInput,
+		};
+		Error::new(kind, error)
+	}
+}
+
+/// ADR 0094 authoritative table-write section encoder and send-side cap.
+/// The live send path and Toron's materialization planner both call this
+/// function, so no second byte constant or compression model can drift.
+pub fn encode_table_write_arrow_section(
+	batch: &RecordBatch,
+) -> Result<Vec<u8>, TableWriteSectionEncodeError> {
+	let encoded = encode_batch(batch).map_err(TableWriteSectionEncodeError::Encode)?;
+	if encoded.len() > crate::network::core::MAX_SECTION_BYTES as usize {
+		return Err(TableWriteSectionEncodeError::TooLarge {
+			encoded_bytes: encoded.len(),
+			max_bytes: crate::network::core::MAX_SECTION_BYTES,
+		});
+	}
+	Ok(encoded)
 }
 
 fn table_delete_rows_schema() -> Schema {

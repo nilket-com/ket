@@ -1853,6 +1853,8 @@ impl Catalog for MockCatalog {
 			row_write_id: request.row_write_id,
 			prior_descriptor: request.prior_descriptor,
 			row_count: None,
+			chunk_count: None,
+			chain_pins_released: true,
 			phase: CtasSagaPhase::Provisioned,
 			terminal_cause: None,
 			owner_epoch: request.owner_epoch,
@@ -1885,6 +1887,19 @@ impl Catalog for MockCatalog {
 				message: "CTAS saga transition rejected: not_found".to_string(),
 			})?;
 		match mutation {
+			CtasSagaMutation::DeclareChain {
+				owner_epoch,
+				row_count,
+				chunk_count,
+				..
+			} if owner_epoch == entry.owner_epoch
+				&& matches!(entry.phase, CtasSagaPhase::Provisioned)
+				&& entry.row_count.is_none() =>
+			{
+				entry.row_count = Some(row_count);
+				entry.chunk_count = Some(chunk_count);
+				entry.chain_pins_released = false;
+			}
 			CtasSagaMutation::MarkRowDispatched {
 				owner_epoch,
 				row_count,
@@ -1892,8 +1907,17 @@ impl Catalog for MockCatalog {
 			} if owner_epoch == entry.owner_epoch
 				&& matches!(entry.phase, CtasSagaPhase::Provisioned) =>
 			{
-				entry.row_count = Some(row_count);
+				if entry.row_count != Some(row_count) || entry.chunk_count.is_none() {
+					return Err(CatalogError::AdminFailed {
+						message: "CTAS saga transition rejected: invalid_transition".to_string(),
+					});
+				}
 				entry.phase = CtasSagaPhase::RowDispatched;
+			}
+			CtasSagaMutation::MarkChainPinsReleased { owner_epoch, .. }
+				if owner_epoch == entry.owner_epoch =>
+			{
+				entry.chain_pins_released = true;
 			}
 			CtasSagaMutation::AttestRowsCommitted {
 				owner_epoch,
@@ -1907,7 +1931,8 @@ impl Catalog for MockCatalog {
 			}
 			CtasSagaMutation::Publish { owner_epoch, .. }
 				if owner_epoch == entry.owner_epoch
-					&& matches!(entry.phase, CtasSagaPhase::RowsCommitted { .. }) =>
+					&& matches!(entry.phase, CtasSagaPhase::RowsCommitted { .. })
+					&& entry.chain_pins_released =>
 			{
 				let name = TableRef::with_schema(
 					&entry.descriptor.namespace,

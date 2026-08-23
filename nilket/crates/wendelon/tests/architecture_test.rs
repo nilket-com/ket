@@ -9468,8 +9468,8 @@ fn adr0093_quic_config_construction_is_confined_to_the_tls_choke_point() {
 	);
 }
 
-/// ADR 0093 exercises ADR 0092's versioning mechanism: v2 stays immutable,
-/// v3 is current, and both byte fixtures remain in the guarded corpus.
+/// ADR 0093/0094 exercise ADR 0092's versioning mechanism: v2 and v3 stay
+/// immutable, v4 is current, and every byte fixture remains guarded.
 #[test]
 fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -9479,11 +9479,15 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v3 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v3.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 3;"));
+	let v4 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v4.txt"))
+		.unwrap();
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 4;"));
 	for required in [
 		"snapshot_body::v2::decode_state",
+		"snapshot_body::v3::decode_state",
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
+		"SNAPSHOT_V4_MANIFEST",
 		"adr0093_snapshot_v2_fixture_is_frozen_and_upconverts_without_outcomes",
 		"adr0093_snapshot_v3_active_saga_and_drop_outcome_match_stored_golden",
 	] {
@@ -9494,9 +9498,69 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 	}
 	assert!(v2.contains("smstate_active_saga="));
 	assert!(v3.contains("smstate_active_saga_and_drop_outcome="));
+	assert!(v4.contains("smstate_active_saga_and_drop_outcome="));
 	assert_ne!(
 		v2, v3,
 		"outgoing and current snapshot fixtures must be distinct"
+	);
+	assert_ne!(
+		v3, v4,
+		"ADR 0094's CTAS chain fields must move the current fixture"
+	);
+}
+
+#[test]
+fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let core = fs::read_to_string(manifest_dir.join("src/network/core.rs")).unwrap();
+	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
+	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 3;"));
+	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
+	assert_eq!(
+		client
+			.matches("pub fn encode_table_write_arrow_section")
+			.count(),
+		1
+	);
+	assert!(client.contains("encode_table_write_arrow_section(&request.payload)"));
+	assert!(client.contains("crate::network::core::MAX_SECTION_BYTES"));
+	assert!(raft.contains("WendelonRequest::ReplayLegacyCtasRowDispatched(replay)"));
+	assert!(raft.contains("CtasSagaMutation::DeclareChain"));
+	assert!(raft.contains("chunk_count: 1"));
+
+	let mut replay_files = Vec::new();
+	walk_dir(&manifest_dir.join("src"), &mut |path| {
+		if path.extension().and_then(|ext| ext.to_str()) == Some("rs") {
+			let source = fs::read_to_string(path).unwrap();
+			if source.contains("ReplayLegacyCtasRowDispatched") {
+				replay_files.push(
+					path.strip_prefix(manifest_dir)
+						.unwrap()
+						.to_string_lossy()
+						.into_owned(),
+				);
+			}
+		}
+	});
+	replay_files.sort();
+	assert_eq!(
+		replay_files,
+		vec![
+			"src/consensus/core.rs",
+			"src/consensus/raft_storage.rs",
+			"src/consensus/wal_body.rs",
+			"src/schema/ctas.rs",
+		],
+		"the WAL-v2 bridge may exist only in its type, decoder, and apply seams"
+	);
+	assert_eq!(
+		client
+			.matches("encode_table_write_arrow_section(&request.payload)")
+			.count(),
+		1,
+		"the live sender must cross the authoritative size seam exactly once"
 	);
 }
 

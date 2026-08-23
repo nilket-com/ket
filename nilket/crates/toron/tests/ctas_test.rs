@@ -990,7 +990,7 @@ async fn query_coordinator_ctas_failures_before_catalog_mutation_do_not_create_t
 }
 
 #[tokio::test]
-async fn query_coordinator_ctas_write_failure_leaves_no_public_catalog_entry() {
+async fn adr0094_c3_unknown_child_stays_unpublished_with_retry_debt() {
 	let catalog = Arc::new(MockCatalog::new());
 	let storage = Arc::new(InMemoryTableStorage::new());
 	let planner = SqlPlanner::new();
@@ -1017,12 +1017,13 @@ async fn query_coordinator_ctas_write_failure_leaves_no_public_catalog_entry() {
 		PlannerConfig::default(),
 		Arc::new(FailingWrite),
 	);
+	let query_id = QueryId::new();
 	let err = failing
-		.execute_query(
+		.execute_mutation_with_query_id(
 			&planner
 				.plan("CREATE TABLE failed_copy AS SELECT id FROM src")
 				.expect("plan CTAS"),
-			None,
+			query_id,
 		)
 		.await
 		.expect_err("CTAS write should fail");
@@ -1035,10 +1036,23 @@ async fn query_coordinator_ctas_write_failure_leaves_no_public_catalog_entry() {
 		catalog.resolve_table(&TableRef::new("failed_copy")).await,
 		Err(CatalogError::TableNotFound { .. })
 	));
+	let saga = catalog
+		.resolve_ctas_saga(wendelon_client::CtasOperationId::new(
+			*query_id.get().as_bytes(),
+		))
+		.await
+		.expect("resolve saga")
+		.expect("ambiguous write remains recoverable");
+	assert!(matches!(
+		saga.phase,
+		wendelon_client::CtasSagaPhase::RowDispatched { .. }
+	));
+	assert_eq!(saga.retry_debt, 1);
+	assert!(!saga.chain_pins_released);
 }
 
 #[tokio::test]
-async fn adr548_known_not_committed_rows_reclaim_with_the_row_phase_cause() {
+async fn adr0094_c3_known_not_committed_child_reclaims_with_the_adr548_cause() {
 	let catalog = Arc::new(MockCatalog::new());
 	let storage = Arc::new(InMemoryTableStorage::new());
 	let planner = SqlPlanner::new();
@@ -1085,6 +1099,10 @@ async fn adr548_known_not_committed_rows_reclaim_with_the_row_phase_cause() {
 		saga.terminal_cause,
 		Some(wendelon_client::CtasTerminalCause::RowKnownNotCommitted)
 	);
+	assert!(
+		saga.chain_pins_released,
+		"explicit negative releases every pin"
+	);
 	assert!(matches!(
 		catalog.resolve_table(&TableRef::new("rejected_copy")).await,
 		Err(CatalogError::TableNotFound { .. })
@@ -1123,7 +1141,7 @@ async fn adr548_rows_committed_then_lost_publication_cas_reclaims_as_conflict() 
 		source.schema.clone(),
 	));
 	let coordinator = QueryCoordinator::with_writer(
-		racing,
+		racing.clone(),
 		Executor::new(storage.clone()),
 		PlannerConfig::default(),
 		storage.clone(),
@@ -1139,6 +1157,7 @@ async fn adr548_rows_committed_then_lost_publication_cas_reclaims_as_conflict() 
 		.await
 		.expect_err("the concurrent winner must win publication");
 	assert!(error.to_string().contains("binding_changed"), "{error}");
+	assert!(racing.publication_probe_passed());
 
 	let winner = base
 		.resolve_table(&TableRef::new("raced_copy"))
@@ -1547,6 +1566,7 @@ struct RacingCatalog {
 	target: TableRef,
 	raced_schema: SchemaRef,
 	race_at_publication: bool,
+	publication_probe_passed: std::sync::atomic::AtomicBool,
 }
 
 impl RacingCatalog {
@@ -1556,6 +1576,7 @@ impl RacingCatalog {
 			target,
 			raced_schema,
 			race_at_publication: false,
+			publication_probe_passed: std::sync::atomic::AtomicBool::new(false),
 		}
 	}
 
@@ -1565,7 +1586,13 @@ impl RacingCatalog {
 			target,
 			raced_schema,
 			race_at_publication: true,
+			publication_probe_passed: std::sync::atomic::AtomicBool::new(false),
 		}
+	}
+
+	fn publication_probe_passed(&self) -> bool {
+		self.publication_probe_passed
+			.load(std::sync::atomic::Ordering::SeqCst)
 	}
 }
 
@@ -1775,8 +1802,26 @@ impl Catalog for RacingCatalog {
 		mutation: wendelon_client::CtasSagaMutation,
 	) -> Result<wendelon_client::CtasSagaEntry, CatalogError> {
 		if self.race_at_publication
-			&& matches!(&mutation, wendelon_client::CtasSagaMutation::Publish { .. })
+			&& let wendelon_client::CtasSagaMutation::Publish { operation_id, .. } = &mutation
 		{
+			let entry = self
+				.inner
+				.resolve_ctas_saga(*operation_id)
+				.await?
+				.expect("the publication candidate saga exists");
+			assert!(matches!(
+				entry.phase,
+				wendelon_client::CtasSagaPhase::RowsCommitted { .. }
+			));
+			assert!(entry.chain_pins_released);
+			assert!(
+				self.inner
+					.materialization_certificate(&self.target)
+					.is_none(),
+				"a committed chain has no public attachment before Publish"
+			);
+			self.publication_probe_passed
+				.store(true, std::sync::atomic::Ordering::SeqCst);
 			let _ = self
 				.inner
 				.create_table(&self.target, self.raced_schema.clone(), true)
@@ -1863,6 +1908,61 @@ impl StorageWrite for FailingWrite {
 		Err(StorageError::Internal {
 			message: "forced CTAS write failure".to_string(),
 		})
+	}
+}
+
+struct SecondPinFails {
+	pin_calls: std::sync::atomic::AtomicUsize,
+	write_calls: std::sync::atomic::AtomicUsize,
+	acknowledged: std::sync::Mutex<Vec<wendelon::schema::ClientWriteId>>,
+}
+
+impl SecondPinFails {
+	fn new() -> Self {
+		Self {
+			pin_calls: std::sync::atomic::AtomicUsize::new(0),
+			write_calls: std::sync::atomic::AtomicUsize::new(0),
+			acknowledged: std::sync::Mutex::new(Vec::new()),
+		}
+	}
+}
+
+#[async_trait]
+impl StorageWrite for SecondPinFails {
+	async fn write(&self, _request: WriteRequest) -> Result<WriteOutcome, StorageError> {
+		self.write_calls
+			.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		Err(StorageError::Internal {
+			message: "row dispatch must not follow incomplete chain pinning".to_string(),
+		})
+	}
+
+	async fn pin_mutation_outcome(
+		&self,
+		_tenant_id: TenantId,
+		_operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<(), StorageError> {
+		let call = self
+			.pin_calls
+			.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+		if call == 1 {
+			return Err(StorageError::Internal {
+				message: "forced chain pin-capacity exhaustion".to_string(),
+			});
+		}
+		Ok(())
+	}
+
+	async fn acknowledge_mutation_outcome(
+		&self,
+		_tenant_id: TenantId,
+		operation_id: wendelon::schema::ClientWriteId,
+	) -> Result<(), StorageError> {
+		self.acknowledged
+			.lock()
+			.expect("acknowledgement ledger")
+			.push(operation_id);
+		Ok(())
 	}
 }
 
@@ -1957,6 +2057,7 @@ impl StorageWrite for AmbiguousCommittedCtasWrite {
 struct ExpiredLeaseCatalog {
 	inner: Arc<MockCatalog>,
 	expire_on_resolve: std::sync::atomic::AtomicBool,
+	fail_cleanup_once: std::sync::atomic::AtomicBool,
 }
 
 impl ExpiredLeaseCatalog {
@@ -1964,11 +2065,17 @@ impl ExpiredLeaseCatalog {
 		Self {
 			inner,
 			expire_on_resolve: std::sync::atomic::AtomicBool::new(false),
+			fail_cleanup_once: std::sync::atomic::AtomicBool::new(false),
 		}
 	}
 
 	fn expire_lease_for_resolution(&self) {
 		self.expire_on_resolve
+			.store(true, std::sync::atomic::Ordering::SeqCst);
+	}
+
+	fn fail_next_cleanup(&self) {
+		self.fail_cleanup_once
 			.store(true, std::sync::atomic::Ordering::SeqCst);
 	}
 }
@@ -2023,6 +2130,17 @@ impl Catalog for ExpiredLeaseCatalog {
 		&self,
 		mutation: wendelon_client::CtasSagaMutation,
 	) -> Result<wendelon_client::CtasSagaEntry, CatalogError> {
+		if matches!(
+			&mutation,
+			wendelon_client::CtasSagaMutation::MarkChainPinsReleased { .. }
+		) && self
+			.fail_cleanup_once
+			.swap(false, std::sync::atomic::Ordering::SeqCst)
+		{
+			return Err(CatalogError::AdminUnavailable {
+				message: "forced crash after pin acknowledgement".to_string(),
+			});
+		}
 		self.inner.mutate_ctas_saga(mutation).await
 	}
 
@@ -2426,6 +2544,252 @@ async fn adr0574_receipt_reports_the_published_facts_and_round_trips() {
 	)
 	.await;
 	assert_eq!(batch.num_rows(), 7);
+}
+
+#[tokio::test]
+async fn adr0094_c1_materialize_200001_rows_publishes_only_after_four_child_writes() {
+	let (catalog, _storage, coordinator, planner) = coordinator();
+	let plan =
+		materialize_plan(r#"pub fn main(ctx) { ctx.range(200001).materialize("chained_rows") }"#)
+			.await;
+	let context = ctas_context();
+	let operation_id = wendelon_client::CtasOperationId::new(*context.query_id.get().as_bytes());
+	let receipt = coordinator
+		.execute_materialization_with_context(&plan, context)
+		.await
+		.expect("the complete chain publishes");
+	assert_eq!(receipt.rows_written, 200_001);
+	let saga = catalog
+		.resolve_ctas_saga(operation_id)
+		.await
+		.unwrap()
+		.expect("terminal detail retained");
+	assert_eq!(saga.chunk_count, Some(4));
+	assert!(
+		saga.chain_pins_released,
+		"receipt follows durable pin cleanup"
+	);
+	assert_eq!(saga.phase, wendelon_client::CtasSagaPhase::Complete);
+	let batch = concat_query(
+		&coordinator,
+		&planner,
+		"SELECT COUNT(*) AS n FROM chained_rows",
+	)
+	.await;
+	let counts = batch
+		.column(0)
+		.as_any()
+		.downcast_ref::<Int64Array>()
+		.expect("count output");
+	assert_eq!(counts.value(0), 200_001);
+}
+
+#[tokio::test]
+async fn adr0094_c4_committed_chain_has_no_public_attachment_or_receipt_before_publish() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let racing = Arc::new(RacingCatalog::at_publication(
+		catalog.clone(),
+		TableRef::new("unpublished_chain"),
+		Arc::new(Schema::new(vec![Field::new(
+			"winner",
+			DataType::Int64,
+			false,
+		)])),
+	));
+	let coordinator = QueryCoordinator::with_writer(
+		racing.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(storage);
+	let plan = materialize_plan(
+		r#"pub fn main(ctx) { ctx.range(70000).materialize("unpublished_chain") }"#,
+	)
+	.await;
+	let context = ctas_context();
+	let operation_id = wendelon_client::CtasOperationId::new(*context.query_id.get().as_bytes());
+	let error = coordinator
+		.execute_materialization_with_context(&plan, context)
+		.await
+		.expect_err("publication conflict cannot return a receipt");
+	assert!(error.to_string().contains("binding_changed"), "{error}");
+	assert!(racing.publication_probe_passed());
+	let saga = catalog
+		.resolve_ctas_saga(operation_id)
+		.await
+		.unwrap()
+		.expect("the failed publication remains attributable");
+	assert!(
+		saga.certificate.is_some(),
+		"pending certificate bytes stay inside the saga"
+	);
+	assert!(
+		catalog
+			.materialization_certificate(&TableRef::new("unpublished_chain"))
+			.is_none(),
+		"the concurrent public binding never inherits the provisional attachment"
+	);
+}
+
+#[tokio::test]
+async fn adr0094_c5_pin_failure_releases_the_whole_declared_chain_before_dispatch() {
+	let catalog = Arc::new(MockCatalog::new());
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let writer = Arc::new(SecondPinFails::new());
+	let coordinator = QueryCoordinator::with_writer(
+		catalog.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		writer.clone(),
+	)
+	.with_storage_admin(storage);
+	let plan =
+		materialize_plan(r#"pub fn main(ctx) { ctx.range(65537).materialize("pin_refused") }"#)
+			.await;
+	let context = ctas_context();
+	let operation_id = wendelon_client::CtasOperationId::new(*context.query_id.get().as_bytes());
+	let error = coordinator
+		.execute_materialization_with_context(&plan, context)
+		.await
+		.expect_err("the second pin refuses before row dispatch");
+	assert!(
+		error.to_string().contains("pin-capacity exhaustion"),
+		"{error}"
+	);
+
+	let saga = catalog
+		.resolve_ctas_saga(operation_id)
+		.await
+		.unwrap()
+		.expect("declared saga remains attributable");
+	assert_eq!(saga.chunk_count, Some(2));
+	assert_eq!(saga.phase, wendelon_client::CtasSagaPhase::Provisioned);
+	assert!(saga.chain_pins_released);
+	assert_eq!(
+		writer.write_calls.load(std::sync::atomic::Ordering::SeqCst),
+		0,
+		"MarkRowDispatched and every row write stay behind complete pinning"
+	);
+	let acknowledged = writer.acknowledged.lock().expect("acknowledgement ledger");
+	assert_eq!(
+		acknowledged.len(),
+		2,
+		"the failed pin may have taken effect"
+	);
+	assert_eq!(acknowledged[0], saga.row_write_id);
+	assert_eq!(acknowledged[1].client_uuid, saga.row_write_id.client_uuid);
+	assert_eq!(
+		acknowledged[1].sequence_no,
+		saga.row_write_id.sequence_no + 1
+	);
+	assert!(matches!(
+		catalog.resolve_table(&TableRef::new("pin_refused")).await,
+		Err(CatalogError::TableNotFound { .. })
+	));
+}
+
+#[tokio::test]
+async fn adr0094_c5_rows_committed_cleanup_debt_recovers_before_publication() {
+	let inner = Arc::new(MockCatalog::new());
+	let catalog = Arc::new(ExpiredLeaseCatalog::new(inner.clone()));
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let coordinator = QueryCoordinator::with_writer(
+		catalog.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		storage.clone(),
+	)
+	.with_storage_admin(storage);
+	let plan =
+		materialize_plan(r#"pub fn main(ctx) { ctx.range(70000).materialize("cleanup_resume") }"#)
+			.await;
+	let context = ctas_context();
+	let query_id = context.query_id;
+	let operation_id = wendelon_client::CtasOperationId::new(*context.query_id.get().as_bytes());
+	catalog.fail_next_cleanup();
+	let error = coordinator
+		.execute_materialization_with_context(&plan, context)
+		.await
+		.expect_err("durable cleanup marking is interrupted");
+	assert!(error.to_string().contains("forced crash"), "{error}");
+	let pending = inner
+		.resolve_ctas_saga(operation_id)
+		.await
+		.unwrap()
+		.expect("rows-committed saga survives cleanup failure");
+	assert!(matches!(
+		pending.phase,
+		wendelon_client::CtasSagaPhase::RowsCommitted { .. }
+	));
+	assert_eq!(pending.chunk_count, Some(2));
+	assert!(!pending.chain_pins_released);
+	assert!(matches!(
+		inner.resolve_table(&TableRef::new("cleanup_resume")).await,
+		Err(CatalogError::TableNotFound { .. })
+	));
+
+	catalog.expire_lease_for_resolution();
+	let resumed = ExecutionContext::new(SessionId(91), query_id, TenantId(1), HlcBound(1));
+	let receipt = coordinator
+		.execute_materialization_with_context(&plan, resumed)
+		.await
+		.expect("recovery retries cleanup before publication");
+	assert_eq!(receipt.rows_written, 70_000);
+	let complete = inner
+		.resolve_ctas_saga(operation_id)
+		.await
+		.unwrap()
+		.expect("terminal detail retained");
+	assert_eq!(complete.phase, wendelon_client::CtasSagaPhase::Complete);
+	assert!(complete.chain_pins_released);
+}
+
+#[tokio::test]
+async fn adr0094_c5_reclaimed_cleanup_debt_recovers_before_terminal_return() {
+	let inner = Arc::new(MockCatalog::new());
+	let catalog = Arc::new(ExpiredLeaseCatalog::new(inner.clone()));
+	let storage = Arc::new(InMemoryTableStorage::new());
+	let coordinator = QueryCoordinator::with_writer(
+		catalog.clone(),
+		Executor::new(storage.clone()),
+		PlannerConfig::default(),
+		Arc::new(KnownNotCommittedCtasWrite),
+	)
+	.with_storage_admin(storage);
+	let plan =
+		materialize_plan(r#"pub fn main(ctx) { ctx.range(4).materialize("reclaim_cleanup") }"#)
+			.await;
+	let context = ctas_context();
+	let query_id = context.query_id;
+	let operation_id = wendelon_client::CtasOperationId::new(*query_id.get().as_bytes());
+	catalog.fail_next_cleanup();
+	let error = coordinator
+		.execute_materialization_with_context(&plan, context)
+		.await
+		.expect_err("cleanup marking is interrupted after durable reclaim");
+	assert!(error.to_string().contains("forced crash"), "{error}");
+	let pending = inner
+		.resolve_ctas_saga(operation_id)
+		.await
+		.unwrap()
+		.expect("reclaimed saga survives cleanup failure");
+	assert_eq!(pending.phase, wendelon_client::CtasSagaPhase::Reclaimed);
+	assert!(!pending.chain_pins_released);
+
+	let resumed = ExecutionContext::new(SessionId(91), query_id, TenantId(1), HlcBound(1));
+	let terminal = coordinator
+		.execute_materialization_with_context(&plan, resumed)
+		.await
+		.expect_err("a reclaimed operation remains a terminal failure");
+	assert!(terminal.to_string().contains("Reclaimed"), "{terminal}");
+	let cleaned = inner
+		.resolve_ctas_saga(operation_id)
+		.await
+		.unwrap()
+		.expect("terminal detail retained");
+	assert!(cleaned.chain_pins_released);
 }
 
 #[tokio::test]

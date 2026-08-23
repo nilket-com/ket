@@ -108,6 +108,14 @@ pub struct CtasSagaEntry {
 	/// re-running the CTAS source.
 	#[serde(default)]
 	pub row_count: Option<u64>,
+	/// ADR 0094: the complete materialization write chain, declared before
+	/// any child outcome pin is installed or any row is dispatched.
+	#[serde(default)]
+	pub chunk_count: Option<u16>,
+	/// Durable cleanup acknowledgement for the chain's outcome pins. Terminal
+	/// detail may not be pruned while this is false.
+	#[serde(default)]
+	pub chain_pins_released: bool,
 	pub phase: CtasSagaPhase,
 	pub terminal_cause: Option<CtasTerminalCause>,
 	pub owner_epoch: u64,
@@ -130,6 +138,11 @@ pub struct CtasSagaEntry {
 /// headroom while staying far inside the write discipline. An oversized
 /// certificate refuses at `Provision`, before any row is dispatched.
 pub const MATERIALIZATION_CERTIFICATE_MAX_BYTES: usize = 64 * 1024;
+
+/// ADR 0094: whole-chain pin residency is capped below the global outcome
+/// store capacity. This is a chain-count bound, independent of all per-frame
+/// row and byte limits.
+pub const CTAS_MAX_WRITE_CHUNKS: u16 = 128;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CtasSagaMutation {
@@ -155,11 +168,23 @@ pub enum CtasSagaMutation {
 		owner_epoch: u64,
 		row_count: u64,
 	},
+	DeclareChain {
+		tenant_id: TenantId,
+		operation_id: CtasOperationId,
+		owner_epoch: u64,
+		row_count: u64,
+		chunk_count: u16,
+	},
 	MarkRowDispatched {
 		tenant_id: TenantId,
 		operation_id: CtasOperationId,
 		owner_epoch: u64,
 		row_count: u64,
+	},
+	MarkChainPinsReleased {
+		tenant_id: TenantId,
+		operation_id: CtasOperationId,
+		owner_epoch: u64,
 	},
 	Publish {
 		tenant_id: TenantId,
@@ -212,10 +237,12 @@ impl CtasSagaMutation {
 	/// stored golden bytes, and only this list plus the total match below can
 	/// catch it. Adding a variant here means the WAL format version must move
 	/// with it.
-	pub const ALL_VARIANT_NAMES: [&'static str; 10] = [
+	pub const ALL_VARIANT_NAMES: [&'static str; 12] = [
 		"provision",
 		"attest_rows_committed",
+		"declare_chain",
 		"mark_row_dispatched",
+		"mark_chain_pins_released",
 		"publish",
 		"mark_retiring_old",
 		"complete",
@@ -230,7 +257,9 @@ impl CtasSagaMutation {
 		match self {
 			Self::Provision { .. } => "provision",
 			Self::AttestRowsCommitted { .. } => "attest_rows_committed",
+			Self::DeclareChain { .. } => "declare_chain",
 			Self::MarkRowDispatched { .. } => "mark_row_dispatched",
+			Self::MarkChainPinsReleased { .. } => "mark_chain_pins_released",
 			Self::Publish { .. } => "publish",
 			Self::MarkRetiringOld { .. } => "mark_retiring_old",
 			Self::Complete { .. } => "complete",
@@ -245,7 +274,9 @@ impl CtasSagaMutation {
 		match self {
 			Self::Provision { tenant_id, .. }
 			| Self::AttestRowsCommitted { tenant_id, .. }
+			| Self::DeclareChain { tenant_id, .. }
 			| Self::MarkRowDispatched { tenant_id, .. }
+			| Self::MarkChainPinsReleased { tenant_id, .. }
 			| Self::Publish { tenant_id, .. }
 			| Self::MarkRetiringOld { tenant_id, .. }
 			| Self::Complete { tenant_id, .. }
@@ -260,7 +291,9 @@ impl CtasSagaMutation {
 		match self {
 			Self::Provision { operation_id, .. }
 			| Self::AttestRowsCommitted { operation_id, .. }
+			| Self::DeclareChain { operation_id, .. }
 			| Self::MarkRowDispatched { operation_id, .. }
+			| Self::MarkChainPinsReleased { operation_id, .. }
 			| Self::Publish { operation_id, .. }
 			| Self::MarkRetiringOld { operation_id, .. }
 			| Self::Complete { operation_id, .. }
@@ -295,6 +328,16 @@ pub enum CtasSagaReject {
 pub enum CtasSagaResponse {
 	Applied(CtasSagaEntry),
 	Rejected(CtasSagaReject),
+}
+
+/// ADR 0094 replay-only bridge for a WAL-v2 `MarkRowDispatched`, whose one
+/// mutation historically both declared a one-child chain and dispatched it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReplayLegacyCtasRowDispatched {
+	pub tenant_id: TenantId,
+	pub operation_id: CtasOperationId,
+	pub owner_epoch: u64,
+	pub row_count: u64,
 }
 
 pub const CTAS_SAGA_REJECT_PREFIX: &str = "CTAS_SAGA_REJECT:";
@@ -427,7 +470,9 @@ impl CtasSagaCatalog {
 			.filter_map(|(key, entry)| {
 				entry
 					.terminal_at_ms
-					.filter(|terminal_at_ms| *terminal_at_ms <= horizon)
+					.filter(|terminal_at_ms| {
+						*terminal_at_ms <= horizon && entry.chain_pins_released
+					})
 					.map(|_| *key)
 			})
 			.collect::<Vec<_>>();

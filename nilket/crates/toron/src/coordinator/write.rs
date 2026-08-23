@@ -65,20 +65,50 @@ pub(super) fn materialize_update_select_batch(
 	materialize_write_select_batch("UPDATE", target_schema, &target_columns, source_batches)
 }
 
+pub(super) fn materialize_ctas_select_batch(
+	target_schema: &SchemaRef,
+	target_columns: &[ColumnOrdinal],
+	source_batches: &[RecordBatch],
+) -> Result<Option<RecordBatch>, ExecutionError> {
+	materialize_write_select_batch_inner(
+		"MATERIALIZE",
+		target_schema,
+		target_columns,
+		source_batches,
+		false,
+	)
+}
+
 fn materialize_write_select_batch(
 	operation: &'static str,
 	target_schema: &SchemaRef,
 	target_columns: &[ColumnOrdinal],
 	source_batches: &[RecordBatch],
 ) -> Result<Option<RecordBatch>, ExecutionError> {
+	materialize_write_select_batch_inner(
+		operation,
+		target_schema,
+		target_columns,
+		source_batches,
+		true,
+	)
+}
+
+fn materialize_write_select_batch_inner(
+	operation: &'static str,
+	target_schema: &SchemaRef,
+	target_columns: &[ColumnOrdinal],
+	source_batches: &[RecordBatch],
+	enforce_single_frame_row_cap: bool,
+) -> Result<Option<RecordBatch>, ExecutionError> {
 	let total_rows = source_batches
 		.iter()
 		.map(RecordBatch::num_rows)
 		.sum::<usize>();
-	if total_rows > TABLE_WRITE_MAX_ROWS {
+	if enforce_single_frame_row_cap && total_rows > TABLE_WRITE_MAX_ROWS {
 		return Err(ExecutionError::InvalidExpression {
 			message: format!(
-				"{operation} produced {total_rows} rows; exceeds maximum {TABLE_WRITE_MAX_ROWS}"
+				"{operation} produced {total_rows} rows; exceeds maximum {TABLE_WRITE_MAX_ROWS}; use MATERIALIZE for atomic chained writes"
 			),
 		});
 	}
@@ -151,6 +181,70 @@ fn materialize_write_select_batch(
 	};
 	validate_non_null_targets(operation, &payload)?;
 	Ok(Some(payload))
+}
+
+/// ADR 0094: split a fully materialized CTAS payload by both independent
+/// per-frame contracts. The byte decision comes from Wendelon's live sender
+/// encoder, not from a Toron-owned estimate or constant.
+pub(super) fn plan_materialization_write_chunks(
+	payload: &RecordBatch,
+) -> Result<Vec<RecordBatch>, ExecutionError> {
+	if payload.num_rows() == 0 {
+		wendelon_client::encode_table_write_arrow_section(payload).map_err(|error| {
+			ExecutionError::InvalidExpression {
+				message: error.to_string(),
+			}
+		})?;
+		return Ok(vec![payload.clone()]);
+	}
+	let mut chunks = Vec::new();
+	let mut offset = 0usize;
+	while offset < payload.num_rows() {
+		let remaining = payload.num_rows() - offset;
+		let mut upper = remaining.min(TABLE_WRITE_MAX_ROWS);
+		let mut lower = 1usize;
+		let mut admitted = None;
+		while lower <= upper {
+			let candidate_rows = lower + (upper - lower) / 2;
+			let candidate = payload.slice(offset, candidate_rows);
+			match wendelon_client::encode_table_write_arrow_section(&candidate) {
+				Ok(_) => {
+					admitted = Some(candidate);
+					lower = candidate_rows.saturating_add(1);
+				}
+				Err(wendelon_client::TableWriteSectionEncodeError::TooLarge { .. }) => {
+					upper = candidate_rows.saturating_sub(1);
+				}
+				Err(error) => {
+					return Err(ExecutionError::InvalidExpression {
+						message: error.to_string(),
+					});
+				}
+			}
+		}
+		let Some(chunk) = admitted else {
+			let one = payload.slice(offset, 1);
+			let error = wendelon_client::encode_table_write_arrow_section(&one)
+				.expect_err("a one-row candidate was not admitted");
+			return Err(ExecutionError::InvalidExpression {
+				message: format!(
+					"MATERIALIZE row {offset} cannot fit one HRFT table-write Arrow section: {error}"
+				),
+			});
+		};
+		offset += chunk.num_rows();
+		chunks.push(chunk);
+	}
+	if chunks.len() > usize::from(wendelon_client::CTAS_MAX_WRITE_CHUNKS) {
+		return Err(ExecutionError::InvalidExpression {
+			message: format!(
+				"MATERIALIZE requires {} write chunks; maximum is {}",
+				chunks.len(),
+				wendelon_client::CTAS_MAX_WRITE_CHUNKS
+			),
+		});
+	}
+	Ok(chunks)
 }
 
 pub(super) fn materialize_empty_record_batch(
@@ -687,5 +781,125 @@ fn type_mismatch(field_index: usize, expected: &str, actual: &ScalarValue) -> St
 		message: format!(
 			"INSERT materialization type mismatch at field {field_index}: expected {expected}, got {actual:?}"
 		),
+	}
+}
+
+#[cfg(test)]
+mod adr0094_write_chaining_tests {
+	use super::*;
+	use arrow::array::{FixedSizeBinaryArray, UInt64Array};
+	use arrow::datatypes::{Field, Schema};
+
+	#[test]
+	fn adr0094_gate_less_verbs_keep_the_row_cap_and_name_materialization() {
+		let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)]));
+		let batch = RecordBatch::try_new(
+			schema.clone(),
+			vec![Arc::new(Int64Array::from_iter_values(
+				0..TABLE_WRITE_MAX_ROWS as i64 + 1,
+			))],
+		)
+		.unwrap();
+		let columns = [ColumnOrdinal(0)];
+		for error in [
+			materialize_insert_select_batch(&schema, &columns, std::slice::from_ref(&batch))
+				.unwrap_err(),
+			materialize_update_select_batch(&schema, std::slice::from_ref(&batch)).unwrap_err(),
+		] {
+			let message = error.to_string();
+			assert!(message.contains("65536"), "{message}");
+			assert!(message.contains("MATERIALIZE"), "{message}");
+		}
+		assert!(
+			materialize_ctas_select_batch(&schema, &columns, &[batch])
+				.unwrap()
+				.is_some(),
+			"only saga-owned materialization crosses the single-frame row cap"
+		);
+	}
+
+	#[test]
+	fn adr0094_c1_materialization_chunks_200001_rows_at_the_unchanged_row_cap() {
+		let rows = 200_001usize;
+		let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::UInt64, false)]));
+		let batch = RecordBatch::try_new(
+			schema,
+			vec![Arc::new(UInt64Array::from_iter_values(0..rows as u64))],
+		)
+		.unwrap();
+		let chunks = plan_materialization_write_chunks(&batch).unwrap();
+		assert_eq!(
+			chunks.len(),
+			4,
+			"200,001 rows require four row-bounded frames"
+		);
+		assert_eq!(
+			chunks.iter().map(RecordBatch::num_rows).sum::<usize>(),
+			rows
+		);
+		assert!(
+			chunks
+				.iter()
+				.all(|chunk| chunk.num_rows() <= TABLE_WRITE_MAX_ROWS)
+		);
+		assert_eq!(chunks[0].num_rows(), TABLE_WRITE_MAX_ROWS);
+	}
+
+	#[test]
+	fn adr0094_c2_actual_encoded_bytes_split_wide_rows_and_refuse_one_oversized_row() {
+		fn noise(mut state: u64, len: usize) -> Vec<u8> {
+			(0..len)
+				.map(|_| {
+					state ^= state << 13;
+					state ^= state >> 7;
+					state ^= state << 17;
+					state as u8
+				})
+				.collect()
+		}
+		let rows = 6_000usize;
+		let width = 1_024usize;
+		let values = (0..rows).map(|row| Some(noise(row as u64 + 1, width)));
+		let array = FixedSizeBinaryArray::try_from_sparse_iter_with_size(values, width as i32)
+			.expect("wide incompressible fixture");
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"payload",
+			DataType::FixedSizeBinary(width as i32),
+			false,
+		)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(array)]).unwrap();
+		assert_eq!(batch.num_rows(), rows);
+		let whole = wendelon_client::encode_table_write_arrow_section(&batch);
+		assert!(
+			matches!(
+				whole,
+				Err(wendelon_client::TableWriteSectionEncodeError::TooLarge { .. })
+			),
+			"fixture must genuinely exceed the encoded HRFT section cap"
+		);
+		let chunks = plan_materialization_write_chunks(&batch).unwrap();
+		assert!(
+			chunks.len() > 1,
+			"encoded bytes, not row count, must split this fixture"
+		);
+		assert!(chunks.iter().all(|chunk| {
+			chunk.num_rows() < TABLE_WRITE_MAX_ROWS
+				&& wendelon_client::encode_table_write_arrow_section(chunk).is_ok()
+		}));
+
+		let oversized_width = 6 * 1024 * 1024;
+		let oversized = FixedSizeBinaryArray::try_from_sparse_iter_with_size(
+			std::iter::once(Some(noise(0xA5A5_1234_5678_9ABC, oversized_width))),
+			oversized_width as i32,
+		)
+		.unwrap();
+		let schema = Arc::new(Schema::new(vec![Field::new(
+			"oversized",
+			DataType::FixedSizeBinary(oversized_width as i32),
+			false,
+		)]));
+		let batch = RecordBatch::try_new(schema, vec![Arc::new(oversized)]).unwrap();
+		let error = plan_materialization_write_chunks(&batch).unwrap_err();
+		assert!(error.to_string().contains("row 0 cannot fit"), "{error}");
 	}
 }

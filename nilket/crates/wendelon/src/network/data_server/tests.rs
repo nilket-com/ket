@@ -7462,6 +7462,102 @@ async fn table_replica_cdc_releases_when_parent_finalization_marker_applies() {
 }
 
 #[tokio::test]
+async fn adr0094_p2_provisional_rows_are_unreachable_by_direct_object_query() {
+	let dir = bootstrap_tempdir("adr0094-provisional-direct-query");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		94,
+		dir,
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for leader"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+
+	let descriptor = typed_table_descriptor();
+	let batch = typed_table_batch(vec![94]);
+	let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
+	write_meta.parent_write_id.sequence_no = 94;
+	let mut operation_bytes = [0x94; 16];
+	operation_bytes[..5].fill(0);
+	operation_bytes[5] = 1;
+	operation_bytes[6] = 0x70;
+	operation_bytes[8] = 0x80;
+	let provision = node
+		.raft
+		.client_write(WendelonRequest::CtasSaga(
+			crate::schema::CtasSagaMutation::Provision {
+				tenant_id: tenant(),
+				operation_id: crate::schema::CtasOperationId::new(operation_bytes),
+				intent_fingerprint: crate::schema::CtasIntentFingerprint::new([0x94; 32]),
+				descriptor: descriptor.clone(),
+				expected_binding: crate::schema::CtasExpectedBinding::Absent,
+				prior_descriptor: None,
+				row_write_id: write_meta.parent_write_id,
+				owner_epoch: 1,
+				observed_now_ms: 1,
+				owner_lease_expires_at_ms: 60_000,
+				certificate: Some(vec![0x94]),
+			},
+		))
+		.await
+		.expect("provision CTAS object");
+	assert_eq!(provision.data, WendelonResponse::Success);
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+	let (write_response, _) = node
+		.data_server
+		.table_write(write_meta, batch)
+		.await
+		.expect("write rows through the saga-owned provisional descriptor");
+	assert_eq!(write_response.write.status, WriteStatus::OK);
+
+	let state = node.state_machine.state_snapshot().await;
+	assert!(
+		state
+			.table_schemas
+			.latest_by_name(tenant(), "analytics", "events")
+			.is_none(),
+		"the provisional name is not public"
+	);
+	drop(state);
+	let query = table_query_frame_for_decode_test(
+		table_query_meta_for_test(&descriptor, write_response.write.commit_hlc, 0),
+		None,
+	);
+	let response = DataRingServer::handle_data_frame(
+		node.data_server.as_ref(),
+		RequestContext {
+			remote: Some(node.local_node),
+			actor: actor(ActorRole::Operator, None),
+		},
+		query,
+	)
+	.await
+	.unwrap()
+	.unwrap();
+	let response_meta: QueryResponseMeta =
+		*bytemuck::from_bytes(&response.meta[..std::mem::size_of::<QueryResponseMeta>()]);
+	assert_eq!(response_meta.status, ReadStatus::QUERY_INVALID_PROGRAM);
+	assert!(response.arrow_payload.is_none());
+
+	node.handles.abort();
+}
+
+#[tokio::test]
 async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 	let dir = bootstrap_tempdir("table-query-rebatch");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(

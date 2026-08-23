@@ -559,7 +559,7 @@ pub(crate) fn adr033_empty_source_ctas_writes_zero_row_batch() {
 		.and_then(|rest| rest.split("other =>").next())
 		.expect("CTAS arm");
 
-	assert!(ctas_arm.contains("materialize_insert_select_batch"));
+	assert!(ctas_arm.contains("materialize_ctas_select_batch"));
 	assert!(ctas_arm.contains("None => write::materialize_empty_record_batch(schema)?"));
 	assert!(ctas_arm.contains("write(WriteRequest"));
 
@@ -699,12 +699,14 @@ pub(crate) fn adr033_does_not_modify_insert_select_empty_contract() {
 	let coordinator_write =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
 			.expect("read coordinator/write.rs");
-	let materialize =
-		brace_blocks_after_marker(&coordinator_write, "fn materialize_write_select_batch")
-			.into_iter()
-			.next()
-			.expect("materialize_write_select_batch body")
-			.1;
+	let materialize = brace_blocks_after_marker(
+		&coordinator_write,
+		"fn materialize_write_select_batch_inner",
+	)
+	.into_iter()
+	.next()
+	.expect("materialize_write_select_batch body")
+	.1;
 
 	assert!(materialize.contains("return Ok(None);"));
 }

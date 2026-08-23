@@ -453,6 +453,9 @@ pub(crate) fn adr176_no_runtime_or_wire_surface_change() {
 				// seed witnesses are the producer-side certificate boundary; it
 				// owns no binder decomposition surface.
 				"crates/toron/src/canonical_expression.rs",
+				// ADR 0094: materialization write chaining changes the coordinator's
+				// runtime write policy; it owns no binder decomposition surface.
+				"crates/toron/src/coordinator/write.rs",
 			];
 			*path != "crates/toron/src/binder.rs"
 				&& !path.starts_with("crates/toron/src/binder/")

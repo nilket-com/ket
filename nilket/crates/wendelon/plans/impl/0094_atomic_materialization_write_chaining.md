@@ -54,7 +54,7 @@ P5's per-operation UUID premise.
 
 Extend `CtasSagaEntry` with:
 
-- `chunk_count: Option<u32>`; together with `row_count`, `Some` means the
+- `chunk_count: Option<u16>`; together with `row_count`, `Some` means the
   complete chain is declared;
 - durable chain-pin cleanup completion, false for a declared chain until all
   child pins have been acknowledged.
@@ -206,8 +206,11 @@ before terminal pruning. A cleanup crash after `RowsCommitted` and one after
   dispatched in the first case and eventual zero pins plus durable cleanup in
   every terminal case.
 
-Feature-gated hooks use ADR 0093's non-default `test-support` forwarding and
-remain covered by its architecture guard.
+No new production test hook is needed for these controls. Existing injectable
+catalog and storage-write seams induce each failure deterministically. The
+controls run in the default suite and are also repeated through ADR 0093's
+non-default `test-support` forwarding leg so the cross-crate acceptance command
+remains explicit.
 
 After C1–C6 are green, run 200k and 1M materializations on the performance
 rail and record them as forward evidence, never as correctness substitutes.
@@ -244,3 +247,54 @@ C1–C6, and the forward performance numbers.
 - Add the shared encoder caller census and forbid Toron byte-cap literals.
 - Pin source-before-provision and declaration/pin/dispatch ordering with a
   discriminating architecture control.
+
+## Implementation evidence
+
+- **P2 — provisional invisibility holds on the real data route.** The control
+  provisions a saga, writes a genuine row to the provisional object, and sends
+  a direct object-id `TABLE_QUERY_REQ`. Wendelon refuses the query before
+  publication; name lookup is absent at the same point. The ADR's atomicity
+  premise therefore rests on read behavior, not only catalog state.
+- **P4 — the existing pin substrate is sufficient but deliberately bounded.**
+  The durable store retains `OUTCOME_PIN_CAPACITY = 1_024`, idempotent install,
+  and idempotent acknowledgement. A chain declares at most 128 children. The
+  implementation installs the complete pin set before dispatch and records
+  cleanup only after every acknowledgement succeeds; partial installation is
+  reclaimed without dispatch and cleans the complete declared id set.
+- **P5/C6 — child identity is operation-local and arithmetic.** CTAS derives
+  `row_write_id.client_uuid` from the query/operation identity. Child zero is
+  the historical id byte-for-byte; later children preserve UUID, TTL, and
+  padding while checked addition advances the sequence. Overflow is a typed
+  pre-provision refusal.
+- **Consensus compatibility:** the snapshot format is v4 and WAL body is v3.
+  Frozen v3 snapshot and v2 WAL spines upconvert historical one-child sagas;
+  immutable v3/current mutation, snapshot, and WAL corpora are guarded by
+  exact variant sets. The CTAS control carrier remains an explicitly lockstep,
+  unversioned deployment seam; `TABLE_WRITE_REQ` itself is unchanged.
+- **C1/C2:** 200,001 rows publish as four ordered children, each at or below
+  65,536 rows. Incompressible wide-row controls size through the same Arrow
+  encoder and 5 MiB section authority used by the live client, split below the
+  row cap when required, and reject a single oversized row before provision.
+- **C3/C4:** an explicit known-not-committed child reclaims while an
+  indeterminate child retains retry debt and every pin. Neither path exposes a
+  name, attachment, or receipt. A fully committed chain likewise has no public
+  attachment or caller receipt until publication; recovery publishes exactly
+  one attachment and the declared row total.
+- **C5:** induced pin-install failure dispatches no child and releases the
+  declared set. Crashes after durable `RowsCommitted` and durable `Reclaimed`
+  leave cleanup debt that recovery converges to zero pins before terminal
+  return or publication.
+- **Control disposition:** no new ADR 0094 hook was added. C3-C5 use existing
+  injectable catalog/storage seams and run under both the default `ctas_test`
+  target and the explicit `--features test-support` acceptance leg. This is
+  stronger than a feature-only control and leaves ADR 0093's hook census
+  unchanged.
+- **Verification:** formatting and diff checks are clean; Wendelon lib is
+  1,257/0 and architecture 174/0, with its complete all-target sweep exiting
+  zero. Toron lib is 1,697/0, architecture 2,145/0, and its complete all-target
+  sweep exits zero; the lib sweep uses `RUST_MIN_STACK=33554432` for the
+  pre-existing deep binder test surface. Toron TPCH is green (lib 198/0 with
+  four ignored, binary 52/0, architecture 22/0, correctness 176/0 with two
+  ignored).
+- **Forward evidence:** the 200k/1M viz performance rail was not used as a
+  correctness substitute and remains the first post-landing measurement.

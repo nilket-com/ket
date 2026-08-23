@@ -678,3 +678,54 @@ pub(crate) fn adr035_wendelon_projection_change_is_privileged() {
 	assert!(client.contains("row_identity_projection: options.row_identity.as_u8()"));
 	assert!(client.contains("row_identity: options.row_identity"));
 }
+
+#[test]
+pub(crate) fn adr0094_materialization_chaining_keeps_one_byte_authority_and_ordered_seams() {
+	let write = std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
+		.expect("read write coordinator");
+	let production_write = write.split("#[cfg(test)]").next().unwrap();
+	assert!(
+		!std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+			.unwrap()
+			.contains("MAX_SECTION_BYTES")
+	);
+	assert!(!production_write.contains("MAX_SECTION_BYTES"));
+	assert!(!production_write.contains("IpcWriteOptions"));
+	assert_eq!(
+		production_write
+			.matches("wendelon_client::encode_table_write_arrow_section")
+			.count(),
+		3,
+		"the materialization planner must size through Wendelon's real encoder"
+	);
+
+	let coordinator = std::fs::read_to_string(manifest_dir().join("src/coordinator.rs"))
+		.expect("read coordinator");
+	let execute =
+		brace_blocks_after_marker(&coordinator, "async fn execute_write_plan_with_source")
+			.into_iter()
+			.next()
+			.expect("write execution function")
+			.1;
+	let ctas = execute
+		.split("ExecutionPlan::CreateTableAsSelect")
+		.nth(1)
+		.and_then(|rest| rest.split("ExecutionPlan::Delete").next())
+		.expect("CTAS execution arm");
+	let ordered = [
+		"materialize_ctas_select_batch",
+		"plan_materialization_write_chunks",
+		"provision_ctas",
+		"CtasSagaMutation::DeclareChain",
+		"pin_mutation_outcome",
+		"CtasSagaMutation::MarkRowDispatched",
+		".write(WriteRequest",
+	];
+	let mut cursor = 0;
+	for seam in ordered {
+		let offset = ctas[cursor..]
+			.find(seam)
+			.unwrap_or_else(|| panic!("CTAS arm lost ordered seam {seam}"));
+		cursor += offset + seam.len();
+	}
+}

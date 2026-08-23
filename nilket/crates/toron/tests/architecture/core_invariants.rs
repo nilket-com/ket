@@ -546,9 +546,11 @@ pub(crate) fn adr542_mutation_producer_census_keeps_ctas_visibly_excluded() {
 	// ADR 548 closes ADR 542's sole exclusion: CTAS derives a reserved row
 	// sub-identity under the caller UUIDv7 and pins its durable outcome until the
 	// cross-ring saga ledger acknowledges it.
-	assert!(ctas.contains("operation_id: Some(row_write_id)"));
+	assert!(ctas.contains("operation_id: Some(chunk_write_id)"));
+	assert!(ctas.contains("derive_ctas_chunk_write_id(row_write_id, index)"));
 	assert!(ctas.contains("pin_mutation_outcome"));
-	assert!(ctas.contains("acknowledge_mutation_outcome"));
+	assert!(ctas.contains("release_ctas_chain_pins"));
+	assert!(coordinator.contains("acknowledge_mutation_outcome(context.tenant_id, write_id)"));
 	assert!(ctas.contains("deadline: context.deadline"));
 	let delete = &rail[delete_start..];
 	assert!(delete.contains("DeleteRowsRequest {"));

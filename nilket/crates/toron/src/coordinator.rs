@@ -2594,6 +2594,61 @@ fn derive_materialization_receipt(
 	Ok(())
 }
 
+fn ctas_chain_write_ids(
+	entry: &wendelon_client::CtasSagaEntry,
+) -> Result<Vec<wendelon::schema::ClientWriteId>, QueryError> {
+	let chunk_count = entry.chunk_count.ok_or_else(|| QueryError::Internal {
+		message: "CTAS saga is missing its durable chunk count".to_string(),
+	})?;
+	(0..chunk_count)
+		.map(|index| derive_ctas_chunk_write_id(entry.row_write_id, index))
+		.collect()
+}
+
+fn derive_ctas_chunk_write_id(
+	base: wendelon::schema::ClientWriteId,
+	index: u16,
+) -> Result<wendelon::schema::ClientWriteId, QueryError> {
+	let sequence_no = base
+		.sequence_no
+		.checked_add(u64::from(index))
+		.ok_or_else(|| QueryError::Internal {
+			message: format!(
+				"CTAS write-chain sequence range overflows at base {} + chunk {index}",
+				base.sequence_no
+			),
+		})?;
+	Ok(wendelon::schema::ClientWriteId {
+		client_uuid: base.client_uuid,
+		sequence_no,
+		idempotency_ttl_ms: base.idempotency_ttl_ms,
+		_pad: base._pad,
+	})
+}
+
+async fn release_ctas_chain_pins(
+	catalog: &dyn Catalog,
+	writer: &dyn StorageWrite,
+	context: &ExecutionContext,
+	entry: &wendelon_client::CtasSagaEntry,
+) -> Result<wendelon_client::CtasSagaEntry, QueryError> {
+	if entry.chain_pins_released {
+		return Ok(entry.clone());
+	}
+	for write_id in ctas_chain_write_ids(entry)? {
+		writer
+			.acknowledge_mutation_outcome(context.tenant_id, write_id)
+			.await?;
+	}
+	Ok(catalog
+		.mutate_ctas_saga(wendelon_client::CtasSagaMutation::MarkChainPinsReleased {
+			tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+			operation_id: entry.operation_id,
+			owner_epoch: entry.owner_epoch,
+		})
+		.await?)
+}
+
 async fn finish_ctas_after_rows_committed(
 	catalog: &dyn Catalog,
 	writer: &dyn StorageWrite,
@@ -2607,9 +2662,7 @@ async fn finish_ctas_after_rows_committed(
 	let tenant_id = wendelon::schema::TenantId::new(context.tenant_id.0);
 	let operation_id = entry.operation_id;
 	let owner_epoch = entry.owner_epoch;
-	writer
-		.acknowledge_mutation_outcome(context.tenant_id, entry.row_write_id)
-		.await?;
+	entry = release_ctas_chain_pins(catalog, writer, context, &entry).await?;
 
 	if matches!(
 		entry.phase,
@@ -2747,6 +2800,9 @@ async fn resume_ctas_saga(
 	result_schema: &arrow::datatypes::SchemaRef,
 	receipt: &mut Option<MaterializationReceipt>,
 ) -> Result<Vec<RecordBatch>, QueryError> {
+	if entry.chunk_count.is_some() && !entry.chain_pins_released && entry.phase.is_terminal() {
+		entry = release_ctas_chain_pins(catalog, writer, context, &entry).await?;
+	}
 	if entry.phase == wendelon_client::CtasSagaPhase::Complete {
 		// ADR 574: a completed saga is a successful materialization being asked
 		// about again. Its entry still carries the published facts until
@@ -2792,9 +2848,15 @@ async fn resume_ctas_saga(
 
 	match entry.phase {
 		wendelon_client::CtasSagaPhase::Provisioned => {
-			writer
-				.acknowledge_mutation_outcome(context.tenant_id, entry.row_write_id)
-				.await?;
+			if entry.chunk_count.is_some() {
+				entry = release_ctas_chain_pins(catalog, writer, context, &entry).await?;
+			} else {
+				// Pre-0094 crash window: the old flow could pin its one root
+				// immediately before MarkRowDispatched without durable declaration.
+				writer
+					.acknowledge_mutation_outcome(context.tenant_id, entry.row_write_id)
+					.await?;
+			}
 			catalog
 				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Reclaim {
 					tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
@@ -2810,13 +2872,27 @@ async fn resume_ctas_saga(
 			})
 		}
 		wendelon_client::CtasSagaPhase::RowDispatched => {
-			let resolved = writer
-				.resolve_mutation(context.tenant_id, entry.row_write_id)
-				.await?;
-			if resolved.resolution == MutationResolution::Present
-				&& resolved.commit_knowledge
-					== wendelon::schema::MutationCommitKnowledge::COMMITTED.0
-			{
+			let mut all_committed = true;
+			let mut any_known_not_committed = false;
+			for write_id in ctas_chain_write_ids(&entry)? {
+				match writer.resolve_mutation(context.tenant_id, write_id).await {
+					Ok(resolved) => {
+						let committed = resolved.resolution == MutationResolution::Present
+							&& resolved.commit_knowledge
+								== wendelon::schema::MutationCommitKnowledge::COMMITTED.0;
+						let known_not_committed = resolved.resolution
+							== MutationResolution::Present
+							&& resolved.commit_knowledge
+								== wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED.0;
+						all_committed &= committed;
+						any_known_not_committed |= known_not_committed;
+					}
+					// Outcome lookup failure is indeterminate evidence, never proof that
+					// a child did not commit. Keep every pin and accrue retry debt.
+					Err(_) => all_committed = false,
+				}
+			}
+			if all_committed {
 				entry = catalog
 					.mutate_ctas_saga(wendelon_client::CtasSagaMutation::AttestRowsCommitted {
 						tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
@@ -2839,11 +2915,8 @@ async fn resume_ctas_saga(
 					receipt,
 				)
 				.await
-			} else if resolved.resolution == MutationResolution::Present
-				&& resolved.commit_knowledge
-					== wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED.0
-			{
-				catalog
+			} else if any_known_not_committed {
+				entry = catalog
 					.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Reclaim {
 						tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
 						operation_id: entry.operation_id,
@@ -2852,9 +2925,7 @@ async fn resume_ctas_saga(
 						completed_at_ms: wall_clock_millis(),
 					})
 					.await?;
-				writer
-					.acknowledge_mutation_outcome(context.tenant_id, entry.row_write_id)
-					.await?;
+				let _ = release_ctas_chain_pins(catalog, writer, context, &entry).await?;
 				Err(QueryError::Internal {
 					message:
 						"CTAS row mutation is known not committed; provisional object reclaimed"
@@ -3117,7 +3188,7 @@ async fn execute_write_plan_with_source(
 			let target_columns = (0..schema.fields().len())
 				.map(|index| ColumnOrdinal(u32::try_from(index).expect("column ordinal overflow")))
 				.collect::<Vec<_>>();
-			let payload = match write::materialize_insert_select_batch(
+			let payload = match write::materialize_ctas_select_batch(
 				schema,
 				&target_columns,
 				&source_batches,
@@ -3127,8 +3198,15 @@ async fn execute_write_plan_with_source(
 			};
 			write::validate_refined_logical_columns("CTAS", &logical_types, &payload)?;
 			let row_count = u64::try_from(payload.num_rows()).unwrap_or(u64::MAX);
+			let chunks = write::plan_materialization_write_chunks(&payload)?;
+			let chunk_count = u16::try_from(chunks.len()).map_err(|_| QueryError::Internal {
+				message: "MATERIALIZE write-chain length exceeds u16".to_string(),
+			})?;
 			let row_write_id =
 				mutation_operation_id(operation_id.client_uuid, CTAS_ROW_WRITE_SEQUENCE_NO);
+			let chunk_write_ids = (0..chunk_count)
+				.map(|index| derive_ctas_chunk_write_id(row_write_id, index))
+				.collect::<Result<Vec<_>, _>>()?;
 			let expected_binding =
 				prior
 					.as_ref()
@@ -3188,12 +3266,21 @@ async fn execute_write_plan_with_source(
 				Err(error) => return Err(error.into()),
 			};
 			let binding = provision.binding;
+			let declared = catalog
+				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::DeclareChain {
+					tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+					operation_id: composite_id,
+					owner_epoch,
+					row_count,
+					chunk_count,
+				})
+				.await?;
 
 			if context
 				.deadline
 				.is_some_and(|deadline| std::time::Instant::now() >= deadline)
 			{
-				catalog
+				let reclaimed = catalog
 					.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Reclaim {
 						tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
 						operation_id: composite_id,
@@ -3202,53 +3289,93 @@ async fn execute_write_plan_with_source(
 						completed_at_ms: wall_clock_millis(),
 					})
 					.await?;
+				let _ = release_ctas_chain_pins(catalog, writer, context, &reclaimed).await?;
 				return Err(QueryError::Internal {
 					message: "CTAS deadline elapsed before row dispatch".to_string(),
 				});
 			}
 
-			writer
-				.pin_mutation_outcome(context.tenant_id, row_write_id)
-				.await?;
-			catalog
+			for write_id in &chunk_write_ids {
+				if let Err(error) = writer
+					.pin_mutation_outcome(context.tenant_id, *write_id)
+					.await
+				{
+					// A failed pin call may still have installed its outcome before the
+					// response was lost. Acknowledge the entire declared chain, not only
+					// calls observed as successful, before recording cleanup complete.
+					if let Err(cleanup_error) =
+						release_ctas_chain_pins(catalog, writer, context, &declared).await
+					{
+						return Err(cleanup_error);
+					}
+					return Err(error.into());
+				}
+			}
+			if let Err(error) = catalog
 				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::MarkRowDispatched {
 					tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
 					operation_id: composite_id,
 					owner_epoch,
 					row_count,
 				})
-				.await?;
-			let write_result = writer
-				.write(WriteRequest {
-					session_id: context.session_id,
-					query_id: context.query_id,
-					tenant_id: context.tenant_id,
-					table_id: binding.local_table_id,
-					table_object_id: binding.table,
-					physical_descriptor_fingerprint: binding.fingerprint,
-					payload,
-					profile_hint: context.profile_hint,
-					trace_context: context.trace_context,
-					operation_id: Some(row_write_id),
-					// The caller deadline belongs to this originating activation.
-					// Recovery activations use durable attempt budgets instead of
-					// reconstructing an Instant across restart.
-					deadline: context.deadline,
-				})
-				.await;
-			let write_outcome = match write_result {
-				Ok(outcome) => outcome,
-				Err(error) => {
-					match writer.resolve_mutation(context.tenant_id, row_write_id).await {
-						Ok(resolved)
-							if resolved.resolution == MutationResolution::Present
-								&& resolved.commit_knowledge
-									== wendelon::schema::MutationCommitKnowledge::COMMITTED.0 =>
-						{
+				.await
+			{
+				if let Err(cleanup_error) =
+					release_ctas_chain_pins(catalog, writer, context, &declared).await
+				{
+					return Err(cleanup_error);
+				}
+				return Err(error.into());
+			}
+			let mut written_rows = 0usize;
+			for (payload, chunk_write_id) in chunks.into_iter().zip(chunk_write_ids.iter().copied())
+			{
+				let write_result = writer
+					.write(WriteRequest {
+						session_id: context.session_id,
+						query_id: context.query_id,
+						tenant_id: context.tenant_id,
+						table_id: binding.local_table_id,
+						table_object_id: binding.table,
+						physical_descriptor_fingerprint: binding.fingerprint,
+						payload,
+						profile_hint: context.profile_hint,
+						trace_context: context.trace_context,
+						operation_id: Some(chunk_write_id),
+						// The caller deadline belongs to this originating activation.
+						// Recovery activations use durable attempt budgets instead of
+						// reconstructing an Instant across restart.
+						deadline: context.deadline,
+					})
+					.await;
+				let write_outcome = match write_result {
+					Ok(outcome) => outcome,
+					Err(error) => {
+						let mut all_committed = true;
+						let mut any_known_not_committed = false;
+						for write_id in &chunk_write_ids {
+							match writer.resolve_mutation(context.tenant_id, *write_id).await {
+								Ok(resolved) => {
+									let committed = resolved.resolution
+										== MutationResolution::Present && resolved
+										.commit_knowledge
+										== wendelon::schema::MutationCommitKnowledge::COMMITTED.0;
+									let known_negative = resolved.resolution == MutationResolution::Present
+										&& resolved.commit_knowledge
+											== wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED.0;
+									all_committed &= committed;
+									any_known_not_committed |= known_negative;
+								}
+								Err(_) => all_committed = false,
+							}
+						}
+						if all_committed {
 							let entry = catalog
 								.mutate_ctas_saga(
 									wendelon_client::CtasSagaMutation::AttestRowsCommitted {
-										tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
+										tenant_id: wendelon::schema::TenantId::new(
+											context.tenant_id.0,
+										),
 										operation_id: composite_id,
 										owner_epoch,
 										row_count,
@@ -3267,29 +3394,36 @@ async fn execute_write_plan_with_source(
 							)
 							.await;
 						}
-						Ok(resolved)
-							if resolved.resolution == MutationResolution::Present
-								&& resolved.commit_knowledge
-									== wendelon::schema::MutationCommitKnowledge::KNOWN_NOT_COMMITTED.0 =>
-						{
-							catalog
+						if any_known_not_committed {
+							let reclaimed = catalog
 								.mutate_ctas_saga(wendelon_client::CtasSagaMutation::Reclaim {
 									tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
 									operation_id: composite_id,
 									owner_epoch,
-								cause: wendelon_client::CtasTerminalCause::RowKnownNotCommitted,
-								completed_at_ms: wall_clock_millis(),
+									cause: wendelon_client::CtasTerminalCause::RowKnownNotCommitted,
+									completed_at_ms: wall_clock_millis(),
 								})
 								.await?;
-							writer
-								.acknowledge_mutation_outcome(context.tenant_id, row_write_id)
+							let _ = release_ctas_chain_pins(catalog, writer, context, &reclaimed)
 								.await?;
+						} else {
+							let _ = catalog
+								.mutate_ctas_saga(
+									wendelon_client::CtasSagaMutation::RecordRetryDebt {
+										tenant_id: wendelon::schema::TenantId::new(
+											context.tenant_id.0,
+										),
+										operation_id: composite_id,
+										owner_epoch,
+									},
+								)
+								.await;
 						}
-						_ => {}
+						return Err(error.into());
 					}
-					return Err(error.into());
-				}
-			};
+				};
+				written_rows = written_rows.saturating_add(write_outcome.rows);
+			}
 			let entry = catalog
 				.mutate_ctas_saga(wendelon_client::CtasSagaMutation::AttestRowsCommitted {
 					tenant_id: wendelon::schema::TenantId::new(context.tenant_id.0),
@@ -3298,10 +3432,7 @@ async fn execute_write_plan_with_source(
 					row_count,
 				})
 				.await?;
-			debug_assert_eq!(
-				u64::try_from(write_outcome.rows).unwrap_or(u64::MAX),
-				row_count
-			);
+			debug_assert_eq!(u64::try_from(written_rows).unwrap_or(u64::MAX), row_count);
 			finish_ctas_after_rows_committed(
 				catalog,
 				writer,
@@ -3933,6 +4064,33 @@ impl StorageDeleteRows for UnsupportedStorageDeleteRows {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	#[test]
+	fn adr0094_c6_chunk_ids_preserve_structure_and_refuse_sequence_overflow() {
+		let base = wendelon::schema::ClientWriteId {
+			client_uuid: [0x94; 16],
+			sequence_no: 41,
+			idempotency_ttl_ms: 234_567,
+			_pad: 0xABCD,
+		};
+		assert_eq!(derive_ctas_chunk_write_id(base, 0).unwrap(), base);
+		let child = derive_ctas_chunk_write_id(base, 7).unwrap();
+		assert_eq!(child.client_uuid, base.client_uuid);
+		assert_eq!(child.sequence_no, 48);
+		assert_eq!(child.idempotency_ttl_ms, base.idempotency_ttl_ms);
+		assert_eq!(child._pad, base._pad);
+		assert_ne!(
+			child.canonical_idempotency_bytes(),
+			base.canonical_idempotency_bytes()
+		);
+
+		let overflow = wendelon::schema::ClientWriteId {
+			sequence_no: u64::MAX,
+			..base
+		};
+		let error = derive_ctas_chunk_write_id(overflow, 1).unwrap_err();
+		assert!(error.to_string().contains("overflows"), "{error}");
+	}
 
 	#[test]
 	fn adr489_distributed_planner_config_refuses_local_only_admission() {

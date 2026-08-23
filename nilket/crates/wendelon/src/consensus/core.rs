@@ -601,6 +601,8 @@ pub enum WendelonRequest {
 	TableDropFinalize(TableDropFinalizeRequest),
 	/// ADR 548 replicated CTAS staged-publication lifecycle mutation.
 	CtasSaga(CtasSagaMutation),
+	/// ADR 0094 replay-only bridge. No live producer may construct this.
+	ReplayLegacyCtasRowDispatched(crate::schema::ReplayLegacyCtasRowDispatched),
 }
 
 impl WendelonRequest {
@@ -610,7 +612,7 @@ impl WendelonRequest {
 	/// variant moves no existing golden bytes, so the corpus alone cannot see
 	/// it — the count and this list can. Adding a variant here means the WAL
 	/// format version must move with it.
-	pub const ALL_VARIANT_NAMES: [&'static str; 23] = [
+	pub const ALL_VARIANT_NAMES: [&'static str; 24] = [
 		"finalize",
 		"acquire_lease",
 		"release_lease",
@@ -634,6 +636,7 @@ impl WendelonRequest {
 		"table_reclaim_completion",
 		"table_drop_finalize",
 		"ctas_saga",
+		"replay_legacy_ctas_row_dispatched",
 	];
 
 	/// Total by construction: a new variant fails this match at compile time,
@@ -664,6 +667,7 @@ impl WendelonRequest {
 			Self::TableReclaimCompletion(_) => "table_reclaim_completion",
 			Self::TableDropFinalize(_) => "table_drop_finalize",
 			Self::CtasSaga(_) => "ctas_saga",
+			Self::ReplayLegacyCtasRowDispatched(_) => "replay_legacy_ctas_row_dispatched",
 		}
 	}
 }

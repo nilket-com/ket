@@ -51,6 +51,7 @@ use wendelon::storage::counter::{CounterKey, counter_identity};
 pub use wendelon::client::{
 	CdcFrame, CdcSubscription, QueryLocalityRange, RowIdentityProjection, StreamingQueryResult,
 	TableQueryAttempt as WendelonTableQueryAttempt, TableQueryAttemptGuard,
+	TableWriteSectionEncodeError, encode_table_write_arrow_section,
 };
 pub use wendelon::integration::compute::{
 	COMPUTE_STORAGE_CONTRACT_VERSION, ComputeQuerySessionHandoff, ComputeQuerySessionIssueRequest,
@@ -92,7 +93,8 @@ pub use wendelon::schema::{
 };
 
 pub use wendelon::schema::{
-	CTAS_SAGA_CAPACITY, CTAS_SAGA_DETAIL_RETENTION_MS, MATERIALIZATION_CERTIFICATE_MAX_BYTES,
+	CTAS_MAX_WRITE_CHUNKS, CTAS_SAGA_CAPACITY, CTAS_SAGA_DETAIL_RETENTION_MS,
+	MATERIALIZATION_CERTIFICATE_MAX_BYTES,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -748,12 +748,14 @@ pub(crate) fn adr032_coordinator_uses_only_evaluate_cast() {
 	let coordinator_write =
 		std::fs::read_to_string(manifest_dir().join("src/coordinator/write.rs"))
 			.expect("read coordinator/write.rs");
-	let materialize =
-		brace_blocks_after_marker(&coordinator_write, "fn materialize_write_select_batch")
-			.into_iter()
-			.next()
-			.expect("materialize_write_select_batch body")
-			.1;
+	let materialize = brace_blocks_after_marker(
+		&coordinator_write,
+		"fn materialize_write_select_batch_inner",
+	)
+	.into_iter()
+	.next()
+	.expect("materialize_write_select_batch body")
+	.1;
 	assert!(materialize.contains("TABLE_WRITE_MAX_ROWS"));
 	assert!(materialize.contains("coerce_insert_select_array"));
 	assert!(materialize.contains("typed_null_array"));
