@@ -547,10 +547,37 @@ impl WendelonDataServer {
 					runtime_filter_state,
 					trace_started_at,
 				);
-				if writer.has_started() {
-					metrics().observe_table_query_cancellation("stream_dropped");
+				// ADR 0091: an execution failure reaches the client as a typed
+				// terminal frame; the bare unframed close is reserved for the
+				// one case where writing is impossible — the transport itself
+				// has failed. This seam is also where the cause used to be
+				// silently discarded, so it is logged here.
+				tracing::error!(
+					error = %err,
+					tenant_id = meta.tenant_id.get(),
+					request_id = meta.request_id.get(),
+					"table query execution failed; reporting typed terminal frame"
+				);
+				let response = query_error_meta(
+					&audit_meta,
+					ReadStatus::QUERY_EXECUTION_FAILED,
+					self.local_node,
+				);
+				self.emit_query_completion_audit(actor, &audit_meta, &response, 0)?;
+				match writer.emit_terminal(response).await {
+					Ok(()) => {
+						metrics().observe_table_query_execution_error("framed");
+						stream.finish().await?;
+						return Ok(());
+					}
+					Err(write_error) => {
+						metrics().observe_table_query_execution_error("unframed");
+						if writer.has_started() {
+							metrics().observe_table_query_cancellation("stream_dropped");
+						}
+						return Err(write_error);
+					}
 				}
-				return Err(err);
 			}
 		};
 		if let Some(failure) = self

@@ -14784,7 +14784,7 @@ async fn adr0579_row_limit_bounds_producer_work_to_exactly_the_limit() {
 /// partition's replica set, while a legacy entry stays on its raw locality.
 /// Every installed location dangles (slab 0xDEAD), so any typed response at all
 /// proves the route decision happened pre-slab.
-mod adr0090_route_selection {
+pub(super) mod adr0090_route_selection {
 	use super::*;
 	use crate::schema::PartitionId;
 	use crate::schema::table::PlacementSemantics;
@@ -14797,7 +14797,7 @@ mod adr0090_route_selection {
 		routed_server_with_lease_gate(node, mgr, nodes, true).await
 	}
 
-	async fn routed_server_with_lease_gate(
+	pub(super) async fn routed_server_with_lease_gate(
 		node: &WendelonNode,
 		mgr: Arc<SlabManager>,
 		nodes: Vec<NodeId>,
@@ -15827,4 +15827,273 @@ async fn adr0090_probe_delete_of_one_table_then_scan_of_another() {
 		rows, 2,
 		"the second table's rows survive the first's deletion"
 	);
+}
+
+/// ADR 0091: a server-side execution failure after dispatch reaches the client
+/// as a typed terminal frame — never as a bare stream close the client can only
+/// report as `early eof`. The poison is a real failure: a version whose index
+/// entry reads legacy over a partitioned frame, which the placement cross-check
+/// refuses mid-scan.
+mod adr0091_typed_stream_errors {
+	use super::*;
+	use crate::schema::TableQueryRequestId;
+	use crate::schema::table::PlacementSemantics;
+	use tokio::io::AsyncWriteExt;
+
+	async fn poisoned_fixture(
+		rows: Vec<i64>,
+	) -> (
+		WendelonNode,
+		WendelonDataServer,
+		Arc<SlabManager>,
+		TableSchemaDescriptor,
+	) {
+		poisoned_fixture_with(rows, true).await
+	}
+
+	async fn poisoned_fixture_with(
+		rows: Vec<i64>,
+		poison: bool,
+	) -> (
+		WendelonNode,
+		WendelonDataServer,
+		Arc<SlabManager>,
+		TableSchemaDescriptor,
+	) {
+		let dir = bootstrap_tempdir(&format!("adr0091-{}", rows.len()));
+		let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+			81,
+			dir,
+			"127.0.0.1:0".into(),
+		))
+		.await
+		.unwrap();
+		let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+		loop {
+			if node.raft.current_leader().await == Some(node.local_node.id) {
+				break;
+			}
+			assert!(tokio::time::Instant::now() < deadline, "leader wait");
+			tokio::time::sleep(Duration::from_millis(20)).await;
+		}
+		let descriptor = append_only_table_descriptor();
+		node.raft
+			.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+				&descriptor,
+			)))
+			.await
+			.unwrap();
+		let mgr = make_manager().await;
+		let keys = append_append_only_rows_for_query(&mgr, &descriptor, rows, hlc(10, 0, 1)).await;
+
+		// Poison the row with the HIGHEST locality: scanned last, so larger
+		// fixtures emit data frames before the failure. Its newest version is a
+		// legacy-reading twin of the real partitioned location — exactly what
+		// the cross-check exists to refuse.
+		// The scan's own order is the truth about which row is reached last.
+		let poisoned = mgr
+			.scan_as_of_with_identity_and_locality(
+				tenant(),
+				Locality::ZERO,
+				Locality::MAX,
+				hlc(0, 0, 0),
+			)
+			.last()
+			.map(|(key_identity, _, _)| *key_identity)
+			.expect("fixture has rows");
+		let _ = &keys;
+		let held = mgr.lookup_as_of(tenant(), poisoned, hlc(0, 0, 0)).unwrap();
+		assert_eq!(
+			held.placement,
+			PlacementSemantics::Partitioned,
+			"premise: the poisoned row is genuinely partitioned"
+		);
+		if poison {
+			let mut twin = held;
+			twin.hlc.physical_ms += 1;
+			twin.placement = PlacementSemantics::RawLocality;
+			twin.partition = None;
+			mgr.install_version_for_route_test(tenant(), poisoned, twin);
+		}
+
+		let server = super::adr0090_route_selection::routed_server_with_lease_gate(
+			&node,
+			mgr.clone(),
+			vec![node.local_node],
+			false,
+		)
+		.await;
+		(node, server, mgr, descriptor)
+	}
+
+	fn query_frame(descriptor: &TableSchemaDescriptor, node: &WendelonNode) -> HrftFrame {
+		let query_meta = TableQueryRequestMeta {
+			min_hlc: hlc(0, 0, 0),
+			expected_epoch: 1,
+			tenant_id: tenant(),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: descriptor.schema_generation,
+			physical_descriptor_fingerprint: *descriptor.physical_descriptor_fingerprint.as_bytes(),
+			consistency: Consistency::SERIALIZABLE,
+			row_identity_projection: RowIdentityProjection::None.as_u8(),
+			_pad: [0; 6],
+			bytecode_len: 0,
+			runtime_filter_len: 0,
+			as_of_hlc: hlc(99, 0, 1),
+			row_limit_rows: 0,
+			deadline_remaining_millis: 0,
+			request_id: TableQueryRequestId::from_u128(91),
+			trace_id: [0; 16],
+			trace_parent_span_id: [0; 8],
+			trace_flags: 0,
+			_trace_pad: [0; 7],
+		};
+		let mut meta_buf = node.pool.acquire();
+		meta_buf
+			.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&query_meta));
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::TABLE_QUERY_REQ.0,
+				flags: 0,
+				stream_id: 91,
+				meta_len: meta_buf.len() as u32,
+				arrow_len: 0,
+				trailing_len: 0,
+			},
+			meta: meta_buf,
+			arrow_payload: None,
+			trailing: None,
+		}
+	}
+
+	/// Drive the streaming handler concurrently with a client-side reader and
+	/// return every frame until the stream ends.
+	async fn dispatch_and_read(
+		node: &WendelonNode,
+		server: WendelonDataServer,
+		frame: HrftFrame,
+	) -> (std::io::Result<()>, Vec<(u8, bool, Vec<u8>)>) {
+		let (mut client_side, server_side) = tokio::io::duplex(64 * 1024);
+		let header = frame.header;
+		let mut body = Vec::new();
+		body.extend_from_slice(&frame.meta[..]);
+		client_side.write_all(&body).await.unwrap();
+		client_side.shutdown().await.unwrap();
+		let context = RequestContext {
+			remote: Some(node.local_node),
+			actor: actor(ActorRole::Operator, None),
+		};
+		let pool = node.pool.clone();
+		let server_task = tokio::spawn(async move {
+			DataRingServer::handle_data_stream(
+				&server,
+				context,
+				header,
+				Box::new(DuplexTransportStream { inner: server_side }),
+				pool,
+			)
+			.await
+		});
+		let mut frames = Vec::new();
+		loop {
+			match read_frame(&mut client_side, &node.pool).await {
+				Ok(response) => {
+					let is_end = (response.header.flags & FRAME_FLAG_STREAM_END) != 0;
+					frames.push((response.header.msg_type, is_end, response.meta[..].to_vec()));
+					if is_end {
+						break;
+					}
+				}
+				Err(_) => break,
+			}
+		}
+		let outcome = server_task.await.unwrap();
+		(outcome, frames)
+	}
+
+	fn terminal_status(frames: &[(u8, bool, Vec<u8>)]) -> Option<ReadStatus> {
+		frames.last().and_then(|(_, is_end, meta)| {
+			(*is_end && meta.len() >= std::mem::size_of::<QueryResponseMeta>()).then(|| {
+				let response: &QueryResponseMeta =
+					bytemuck::from_bytes(&meta[..std::mem::size_of::<QueryResponseMeta>()]);
+				response.status
+			})
+		})
+	}
+
+	#[tokio::test]
+	async fn adr0091_a_pre_frame_execution_error_is_a_typed_terminal() {
+		let (node, server, _mgr, descriptor) = poisoned_fixture(vec![1, 2, 3, 4]).await;
+		let before = metrics().table_query_execution_error_count("framed");
+		let (outcome, frames) =
+			dispatch_and_read(&node, server, query_frame(&descriptor, &node)).await;
+		outcome.expect("a framed error is a handled request, not a transport failure");
+		assert_eq!(
+			terminal_status(&frames),
+			Some(ReadStatus::QUERY_EXECUTION_FAILED),
+			"the failure names itself instead of closing unframed: {frames:?}"
+		);
+		assert!(
+			metrics().table_query_execution_error_count("framed") > before,
+			"the dispatch seam records the framed error"
+		);
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn adr0091_a_mid_stream_execution_error_is_a_typed_terminal() {
+		let (node, server, _mgr, descriptor) = poisoned_fixture((1..=5000).collect()).await;
+		let (outcome, frames) =
+			dispatch_and_read(&node, server, query_frame(&descriptor, &node)).await;
+		outcome.expect("a framed error is a handled request, not a transport failure");
+		assert!(
+			frames.len() >= 2,
+			"premise: at least one data frame precedes the failure ({} frames)",
+			frames.len()
+		);
+		assert_eq!(
+			terminal_status(&frames),
+			Some(ReadStatus::QUERY_EXECUTION_FAILED),
+			"a mid-stream failure still names itself"
+		);
+		node.handles.abort();
+	}
+
+	#[tokio::test]
+	async fn adr0091_a_dead_transport_still_surfaces_as_an_io_error() {
+		let (node, server, _mgr, descriptor) = poisoned_fixture(vec![1, 2, 3, 4]).await;
+		let before = metrics().table_query_execution_error_count("unframed");
+		let frame = query_frame(&descriptor, &node);
+		let (mut client_side, server_side) = tokio::io::duplex(64 * 1024);
+		let header = frame.header;
+		client_side.write_all(&frame.meta[..]).await.unwrap();
+		client_side.shutdown().await.unwrap();
+		// Kill the reading half before the server can write anything: the
+		// typed frame cannot be delivered, so the bare close remains — as an
+		// io error, distinguishable from a query failure.
+		drop(client_side);
+		let outcome = DataRingServer::handle_data_stream(
+			&server,
+			RequestContext {
+				remote: Some(node.local_node),
+				actor: actor(ActorRole::Operator, None),
+			},
+			header,
+			Box::new(DuplexTransportStream { inner: server_side }),
+			node.pool.clone(),
+		)
+		.await;
+		assert!(
+			outcome.is_err(),
+			"a dead transport is a transport failure, not a silently-dropped query"
+		);
+		assert!(
+			metrics().table_query_execution_error_count("unframed") > before,
+			"the unframed outcome is still recorded at the seam"
+		);
+		node.handles.abort();
+	}
 }

@@ -1539,11 +1539,16 @@ impl ReadStatus {
 	/// monotonic instant on receipt.
 	pub const QUERY_DEADLINE_EXCEEDED: Self = Self(18);
 
+	/// ADR 0091: a server-side execution failure after dispatch. Reported as a
+	/// typed terminal frame instead of an unframed stream close, so a query
+	/// that dies mid-stream names itself rather than surfacing as `early eof`.
+	pub const QUERY_EXECUTION_FAILED: Self = Self(19);
+
 	/// The canonical named-status list. ADR 540's totality guard holds the mapping
 	/// honest: a new status constant added without an entry here (and an `as_str`
 	/// name) fails the guard, because a status the server can emit but the boundary
 	/// cannot name is how failures collapse into generic errors.
-	pub const ALL_NAMED: [Self; 19] = [
+	pub const ALL_NAMED: [Self; 20] = [
 		Self::OK,
 		Self::KEY_NOT_FOUND,
 		Self::EPOCH_STALE,
@@ -1563,6 +1568,7 @@ impl ReadStatus {
 		Self::TABLE_REFERENCE_INTEGRITY_FAILED,
 		Self::QUERY_STALLED,
 		Self::QUERY_DEADLINE_EXCEEDED,
+		Self::QUERY_EXECUTION_FAILED,
 	];
 
 	pub const fn as_str(self) -> &'static str {
@@ -1586,6 +1592,7 @@ impl ReadStatus {
 			Self::TABLE_REFERENCE_INTEGRITY_FAILED => "table_reference_integrity_failed",
 			Self::QUERY_STALLED => "query_stalled",
 			Self::QUERY_DEADLINE_EXCEEDED => "query_deadline_exceeded",
+			Self::QUERY_EXECUTION_FAILED => "query_execution_failed",
 			_ => "unknown",
 		}
 	}

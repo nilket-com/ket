@@ -1665,6 +1665,16 @@ impl StaticLabelCounters {
 		self.add(label, 1);
 	}
 
+	#[cfg(test)]
+	fn get(&self, label: &'static str) -> u64 {
+		*self
+			.0
+			.lock()
+			.expect("static label counter mutex poisoned")
+			.get(label)
+			.unwrap_or(&0)
+	}
+
 	fn render(
 		&self,
 		out: &mut String,
@@ -2492,6 +2502,10 @@ pub struct MetricsRegistry {
 	pub data_ring_backpressure_active_tenant_requests: Gauge,
 	pub data_ring_backpressure_active_actor_requests: Gauge,
 	table_query_cancellations: StaticLabelCounters,
+	/// ADR 0091: execution errors reported as typed terminal frames, by
+	/// outcome ("framed" reached the client typed; "unframed" the transport
+	/// was already dead and the bare close remained).
+	table_query_execution_errors: StaticLabelCounters,
 	pbc_rows_scanned: PbcRuntimeCounters,
 	pbc_rows_returned: PbcRuntimeCounters,
 	pbc_exec_micros: PbcRuntimeHistograms,
@@ -2768,6 +2782,7 @@ impl Default for MetricsRegistry {
 			data_ring_backpressure_active_tenant_requests: Gauge::default(),
 			data_ring_backpressure_active_actor_requests: Gauge::default(),
 			table_query_cancellations: StaticLabelCounters::default(),
+			table_query_execution_errors: StaticLabelCounters::default(),
 			pbc_rows_scanned: PbcRuntimeCounters::default(),
 			pbc_rows_returned: PbcRuntimeCounters::default(),
 			pbc_exec_micros: PbcRuntimeHistograms::default(),
@@ -3035,6 +3050,15 @@ impl MetricsRegistry {
 
 	pub fn observe_table_query_cancellation(&self, outcome: &'static str) {
 		self.table_query_cancellations.inc(outcome);
+	}
+
+	pub fn observe_table_query_execution_error(&self, outcome: &'static str) {
+		self.table_query_execution_errors.inc(outcome);
+	}
+
+	#[cfg(test)]
+	pub fn table_query_execution_error_count(&self, outcome: &'static str) -> u64 {
+		self.table_query_execution_errors.get(outcome)
 	}
 
 	pub fn set_pending_finalization_backlog(&self, value: u64) {

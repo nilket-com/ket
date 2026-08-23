@@ -1,5 +1,4 @@
 use super::*;
-use crate::schema::table::PlacementSemantics;
 
 pub(super) fn lsm_run_summary_from_index(
 	key_index: &DashMap<TenantKey, Vec<RecordLocation>>,
