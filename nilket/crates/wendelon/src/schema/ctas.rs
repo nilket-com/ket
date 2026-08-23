@@ -206,6 +206,41 @@ pub enum CtasSagaMutation {
 }
 
 impl CtasSagaMutation {
+	/// ADR 0092: every saga-mutation variant, by name, in declaration order.
+	/// This enum rides inside the WAL body (`WendelonRequest::CtasSaga`), so
+	/// the same exact-set discipline applies: an appended variant moves no
+	/// stored golden bytes, and only this list plus the total match below can
+	/// catch it. Adding a variant here means the WAL format version must move
+	/// with it.
+	pub const ALL_VARIANT_NAMES: [&'static str; 10] = [
+		"provision",
+		"attest_rows_committed",
+		"mark_row_dispatched",
+		"publish",
+		"mark_retiring_old",
+		"complete",
+		"reclaim",
+		"record_publication_conflict",
+		"record_retry_debt",
+		"claim",
+	];
+
+	/// Total by construction: a new variant fails this match at compile time.
+	pub fn variant_name(&self) -> &'static str {
+		match self {
+			Self::Provision { .. } => "provision",
+			Self::AttestRowsCommitted { .. } => "attest_rows_committed",
+			Self::MarkRowDispatched { .. } => "mark_row_dispatched",
+			Self::Publish { .. } => "publish",
+			Self::MarkRetiringOld { .. } => "mark_retiring_old",
+			Self::Complete { .. } => "complete",
+			Self::Reclaim { .. } => "reclaim",
+			Self::RecordPublicationConflict { .. } => "record_publication_conflict",
+			Self::RecordRetryDebt { .. } => "record_retry_debt",
+			Self::Claim { .. } => "claim",
+		}
+	}
+
 	pub const fn tenant_id(&self) -> TenantId {
 		match self {
 			Self::Provision { tenant_id, .. }
@@ -313,6 +348,32 @@ pub struct CtasSagaCatalog {
 }
 
 impl CtasSagaCatalog {
+	/// ADR 0092: reassemble a catalog from a versioned-replay decode. The
+	/// fields stay private — this is the one seam through which a superseded
+	/// snapshot shape re-enters the live catalog, and it takes already
+	/// upconverted entries so the catalog never holds a partial conversion.
+	pub(crate) fn from_replay_parts(
+		entries: BTreeMap<(TenantId, CtasOperationId), CtasSagaEntry>,
+		expired_through_ms: BTreeMap<TenantId, u64>,
+	) -> Self {
+		Self {
+			entries,
+			expired_through_ms,
+		}
+	}
+
+	/// The consuming inverse of [`Self::from_replay_parts`], for projecting a
+	/// live state into a superseded fixture shape. Same seam, same rule: only
+	/// versioned-replay machinery and its controls touch it.
+	pub(crate) fn into_replay_parts(
+		self,
+	) -> (
+		BTreeMap<(TenantId, CtasOperationId), CtasSagaEntry>,
+		BTreeMap<TenantId, u64>,
+	) {
+		(self.entries, self.expired_through_ms)
+	}
+
 	pub fn get(
 		&self,
 		tenant_id: TenantId,

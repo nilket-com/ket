@@ -6141,22 +6141,38 @@ fn decode_log_record(
 			"log record payload hash mismatch".to_string(),
 		));
 	}
-	// The payload hash matched just above, so these bytes are exactly what their
-	// writer produced. A decode failure is therefore a shape mismatch, and for a
-	// pre-versioning record that is the likeliest reading — the same sentence the
-	// snapshot path owes its operator.
-	let entry: Entry<WendelonTypeConfig> = postcard::from_bytes(payload).map_err(|err| {
-		let detail = if header.format_version == PRE_VERSIONING_FORMAT {
-			format!(
-				"log entry postcard decode failed: {err}; the payload hash matched, so this \
-				 record is intact, and it predates format versioning — it was very likely \
-				 written by a build with a different log-entry shape"
-			)
-		} else {
-			format!("log entry postcard decode failed: {err}")
-		};
-		interior_corruption(wal_path, offset, detail)
-	})?;
+	// The payload hash matched just above, so these bytes are exactly what
+	// their writer produced. ADR 0092's dispatch and classification rule hold
+	// from here: a superseded version is decoded by its own frozen shape and
+	// upconverted, and a hash-matched decode failure at a recognized version
+	// is a format mismatch named as such — never interior corruption, which
+	// stays reserved for damage and framing contradictions.
+	let entry: Entry<WendelonTypeConfig> = match header.format_version {
+		1 => crate::consensus::wal_body::v1::decode_entry(payload)
+			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 1, &err.to_string()))?,
+		_ => match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload) {
+			Ok((entry, [])) => entry,
+			Ok((_entry, rest)) => {
+				return Err(wal_body_format_mismatch(
+					wal_path,
+					offset,
+					header.format_version,
+					&format!(
+						"log entry decoded with {} unconsumed payload bytes",
+						rest.len()
+					),
+				));
+			}
+			Err(err) => {
+				return Err(wal_body_format_mismatch(
+					wal_path,
+					offset,
+					header.format_version,
+					&format!("log entry postcard decode failed: {err}"),
+				));
+			}
+		},
+	};
 	if entry.log_id.index != fixed.index
 		|| entry.log_id.leader_id.term != fixed.term
 		|| header.log_index != fixed.index
@@ -6169,6 +6185,35 @@ fn decode_log_record(
 		));
 	}
 	Ok(entry)
+}
+
+/// ADR 0092: a hash-matched decode failure at a recognized format version.
+/// The bytes are exactly what their writer produced, so the mismatch is
+/// between shapes, not against damage — the diagnostic names the version the
+/// record declares, the version this build writes, and stays out of the
+/// corruption vocabulary so the operator reaches for the right remedy.
+fn wal_body_format_mismatch(wal_path: &Path, offset: usize, version: u8, detail: &str) -> Error {
+	let attribution = if version == PRE_VERSIONING_FORMAT {
+		"it predates format versioning — it was very likely written by a build with a \
+		 different log-entry shape"
+			.to_string()
+	} else {
+		format!(
+			"it declares format version {version} (this build writes {WAL_FORMAT_VERSION}) \
+			 yet does not decode with that version's shape"
+		)
+	};
+	Error::new(
+		ErrorKind::InvalidData,
+		format!(
+			"wal {} record at offset {}: {}; the payload hash matched, so the record is \
+			 intact and {}; this is a format mismatch, not corruption",
+			wal_path.display(),
+			offset,
+			detail,
+			attribution
+		),
+	)
 }
 
 fn interior_corruption(wal_path: &Path, offset: usize, detail: String) -> Error {
@@ -6496,28 +6541,43 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 	// decode failure here is therefore a shape mismatch, never damage — and for a
 	// pre-versioning artifact that is the likeliest reading by far, since it is
 	// the case ADR 85 exists to explain.
-	let state = decode_snapshot_state_bytes(&body).map_err(|err| {
-		if header.format_version == PRE_VERSIONING_FORMAT {
+	// ADR 0092 dispatch: a superseded version with a registered replay
+	// decoder is decoded by its own frozen shape and upconverted; anything
+	// else decodes by the current shape, with the failure attributed to the
+	// version the header declares.
+	let state = match header.format_version {
+		1 => crate::consensus::snapshot_body::v1::decode_state(&body).map_err(|err| {
 			format!(
 				"{err}; the body's digest matched, so this artifact is intact, and it \
-				 predates format versioning — it was very likely written by a build with \
-				 a different state-machine shape"
+				 declares snapshot format version 1, which this build replays — failing \
+				 that decode means the artifact was not written at its declared version; \
+				 this is a format mismatch, not corruption"
 			)
-		} else if header.format_version < SNAPSHOT_FORMAT_VERSION {
-			// An older-but-versioned artifact. Unreachable until a second bump
-			// existed, which is exactly why it must say the same thing the
-			// pre-versioning branch does: the operator's problem is identical,
-			// and only the certainty about the writer differs.
-			format!(
-				"{err}; the body's digest matched, so this artifact is intact, and it was \
-				 written at snapshot format version {} while this build writes {}; this \
-				 build performs no migrations, so the older state cannot be read",
-				header.format_version, SNAPSHOT_FORMAT_VERSION
-			)
-		} else {
-			err
-		}
-	})?;
+		})?,
+		_ => decode_snapshot_state_bytes(&body).map_err(|err| {
+			if header.format_version == PRE_VERSIONING_FORMAT {
+				format!(
+					"{err}; the body's digest matched, so this artifact is intact, and it \
+					 predates format versioning — it was very likely written by a build with \
+					 a different state-machine shape"
+				)
+			} else if header.format_version < SNAPSHOT_FORMAT_VERSION {
+				// An older-but-versioned artifact with no registered replay
+				// decoder. Unreachable until a third version exists; kept so
+				// the future gap fails with attribution rather than a bare
+				// decoder message.
+				format!(
+					"{err}; the body's digest matched, so this artifact is intact, and it was \
+					 written at snapshot format version {} while this build writes {}; this \
+					 build has no replay decoder for that version, so the older state cannot \
+					 be read",
+					header.format_version, SNAPSHOT_FORMAT_VERSION
+				)
+			} else {
+				err
+			}
+		})?,
+	};
 	Ok((header, state))
 }
 
@@ -9485,6 +9545,240 @@ mod recovery_tests {
 		);
 	}
 
+	/// ADR 0092: the grounding probe, flipped to the contract. Immutable
+	/// stored v1 bytes — never a current-encoder truncation — drive a real
+	/// recovery, and the recovered state must be byte-equal to what the
+	/// current certificate-less encoding of the same mutation produces. The
+	/// pre-fix behavior this test replaced: the same bytes refused bootstrap
+	/// as "interior corruption ... Hit the end of buffer".
+	#[tokio::test]
+	async fn adr0092_v1_ctas_provision_wal_record_replay_behavior() {
+		let stored = manifest_bytes(
+			include_str!("../../tests/fixtures/consensus_body/wal_v1_entries.txt"),
+			"ctas_saga_provision",
+		);
+
+		// Arm one: the stored v1 payload, framed at format version 1.
+		let dir = tempdir("wal-v1-provision");
+		let (wal, vote, _snapshot) = artifact_paths(&dir);
+		write_vote_file(&vote, Vote::new_committed(3, 7));
+		write_wal_pages(
+			&wal,
+			&[
+				wal_page_for_payload(&stored, 1),
+				serialize_checkpoint_page(11, 0, 11, 3),
+			],
+		);
+		let store = open_store(&dir).await;
+		let recovered = store.recovered_state_machine().await.unwrap();
+		let v1_state = recovered.state_snapshot().await;
+
+		// Arm two: the same mutation written by this build with
+		// `certificate: None`, replayed the ordinary way.
+		let dir = tempdir("wal-v2-provision-none");
+		let (wal, vote, _snapshot) = artifact_paths(&dir);
+		write_vote_file(&vote, Vote::new_committed(3, 7));
+		write_wal_pages(
+			&wal,
+			&[
+				serialize_entry_page(&provision_none_entry()).unwrap(),
+				serialize_checkpoint_page(11, 0, 11, 3),
+			],
+		);
+		let store = open_store(&dir).await;
+		let recovered = store.recovered_state_machine().await.unwrap();
+		let v2_state = recovered.state_snapshot().await;
+
+		let saga = v1_state
+			.ctas_sagas
+			.get(TenantId::new(7), provision_operation_id())
+			.expect("the v1 provision must replay into the catalog");
+		assert_eq!(
+			saga.certificate, None,
+			"upconversion adds certificate: None"
+		);
+		assert_eq!(
+			postcard::to_stdvec(&v1_state).unwrap(),
+			postcard::to_stdvec(&v2_state).unwrap(),
+			"a v1 body and its current certificate-less twin must recover \
+			 byte-identical states"
+		);
+	}
+
+	/// ADR 0092: a profile holding a v1 snapshot AND a v1 WAL tail boots to
+	/// the state a full replay produces — the steady upgrade state, where
+	/// both artifacts predate the running build.
+	#[tokio::test]
+	async fn adr0092_v1_snapshot_and_v1_wal_tail_boot_to_full_replay_state() {
+		let snapshot_body = manifest_bytes(
+			include_str!("../../tests/fixtures/consensus_body/snapshot_v1.txt"),
+			"smstate_active_saga",
+		);
+		let wal_payload = manifest_bytes(
+			include_str!("../../tests/fixtures/consensus_body/wal_v1_entries.txt"),
+			"ctas_saga_provision_tail_table",
+		);
+
+		let dir = tempdir("v1-snapshot-and-tail");
+		let (wal, vote, snapshot) = artifact_paths(&dir);
+		write_vote_file(&vote, Vote::new_committed(3, 7));
+		let mut snapshot_bytes =
+			Vec::with_capacity(std::mem::size_of::<SnapshotHeader>() + snapshot_body.len());
+		let header = SnapshotHeader {
+			last_included_index: 0,
+			last_included_term: 0,
+			last_included_epoch: 0,
+			snapshot_hlc: HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 0,
+			},
+			state_sha256: control_artifact_digest_32(&snapshot_body),
+			cache_checkpoint_len: 0,
+			format_version: 1,
+			_pad: [0; 3],
+		};
+		snapshot_bytes.extend_from_slice(bytemuck::bytes_of(&header));
+		snapshot_bytes.extend_from_slice(&snapshot_body);
+		std::fs::write(&snapshot, snapshot_bytes).unwrap();
+		write_wal_pages(
+			&wal,
+			&[
+				wal_page_for_payload(&wal_payload, 1),
+				serialize_checkpoint_page(11, 0, 11, 3),
+			],
+		);
+
+		let store = open_store(&dir).await;
+		let recovered = store.recovered_state_machine().await.unwrap();
+		let state = recovered.state_snapshot().await;
+
+		// The snapshot's active saga (operation 0x55) and the tail's
+		// provision (operation 0x54) must both be present, certificate-less.
+		let mut op55 = [0x55u8; 16];
+		op55[..5].fill(0);
+		op55[5] = 1;
+		op55[6] = 0x70;
+		op55[8] = 0x80;
+		let snapshot_saga = state
+			.ctas_sagas
+			.get(TenantId::new(7), CtasOperationId::new(op55))
+			.expect("the snapshot's active saga survives the boot");
+		assert_eq!(snapshot_saga.certificate, None);
+		let tail_saga = state
+			.ctas_sagas
+			.get(TenantId::new(7), provision_operation_id())
+			.expect("the tail's provision applies on top of the snapshot");
+		assert_eq!(tail_saga.certificate, None);
+	}
+
+	fn manifest_bytes(manifest: &str, name: &str) -> Vec<u8> {
+		let line = manifest
+			.lines()
+			.find(|line| line.starts_with(&format!("{name}=")))
+			.unwrap_or_else(|| panic!("fixture manifest lacks `{name}`"));
+		let hex = &line[name.len() + 1..];
+		(0..hex.len())
+			.step_by(2)
+			.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+			.collect()
+	}
+
+	fn provision_operation_id() -> CtasOperationId {
+		let mut bytes = [0x54u8; 16];
+		bytes[..5].fill(0);
+		bytes[5] = 1;
+		bytes[6] = 0x70;
+		bytes[8] = 0x80;
+		CtasOperationId::new(bytes)
+	}
+
+	fn provision_none_entry() -> Entry<WendelonTypeConfig> {
+		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+		let descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([4; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.unwrap();
+		let mut client_uuid = [0x54u8; 16];
+		client_uuid[6] = 0x70;
+		client_uuid[8] = 0x80;
+		Entry {
+			log_id: log_id(3, 11),
+			payload: EntryPayload::Normal(WendelonRequest::CtasSaga(CtasSagaMutation::Provision {
+				tenant_id: TenantId::new(7),
+				operation_id: provision_operation_id(),
+				intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
+				descriptor,
+				expected_binding: CtasExpectedBinding::Absent,
+				prior_descriptor: None,
+				row_write_id: ClientWriteId {
+					client_uuid,
+					sequence_no: 7,
+					idempotency_ttl_ms: 300_000,
+					_pad: 0,
+				},
+				owner_epoch: 1,
+				observed_now_ms: 1,
+				owner_lease_expires_at_ms: 1_000,
+				certificate: None,
+			})),
+		}
+	}
+
+	/// Frame an already-encoded entry payload at a declared format version.
+	/// The framing (header, fixed prefix, hashes, checksum) is the current
+	/// writer's — only the BODY bytes are the fixture's — because framing is
+	/// not what the body format versions.
+	fn wal_page_for_payload(payload: &[u8], format_version: u8) -> AlignedBuf {
+		let (log_index, term) = (11u64, 3u64);
+		let header_size = std::mem::size_of::<WALRecordHeader>();
+		let fixed_size = std::mem::size_of::<RaftLogEntryFixed>();
+		let body_len = fixed_size + payload.len();
+		let mut page = AlignedBuf::new(page_round_up(header_size + body_len + 4));
+		let header = WALRecordHeader {
+			record_type: REC_LOG_ENTRY,
+			format_version,
+			_pad1: [0; 6],
+			body_len: body_len as u64,
+			log_index,
+			term,
+		};
+		let fixed = RaftLogEntryFixed {
+			kind: LogEntryKind::APPEND,
+			_pad1: [0; 7],
+			term,
+			index: log_index,
+			epoch: 0,
+			leader: SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			},
+			entry_hlc: HybridTimestamp {
+				physical_ms: 0,
+				logical: 0,
+				node_id: 1,
+			},
+			payload_len: payload.len() as u32,
+			_pad2: [0; 4],
+			payload_hash: control_artifact_digest_32(payload),
+		};
+		let dst = page.as_mut_slice();
+		dst[..header_size].copy_from_slice(bytemuck::bytes_of(&header));
+		dst[header_size..header_size + fixed_size].copy_from_slice(bytemuck::bytes_of(&fixed));
+		dst[header_size + fixed_size..header_size + body_len].copy_from_slice(payload);
+		let checksum = control_artifact_checksum_u32(&dst[..header_size + body_len]);
+		dst[header_size + body_len..header_size + body_len + 4]
+			.copy_from_slice(&checksum.to_le_bytes());
+		page
+	}
+
 	#[tokio::test]
 	async fn restart_without_checkpoint_defers_tail_state_machine_replay() {
 		let dir = tempdir("no-checkpoint");
@@ -11884,13 +12178,13 @@ mod tenant_kek_tests {
 	}
 
 	#[test]
-	fn adr0085_older_versioned_snapshot_shape_mismatch_explains_itself_too() {
-		// The pair to the pre-versioning case below. Until a second format
-		// version existed there was no such thing as an older-but-versioned
-		// artifact, so this branch had never run: an intact version-1 snapshot
-		// reported a bare "Hit the end of buffer" with none of ADR 85's
-		// reassurance. A truncated body with a matching digest is exactly the
-		// shape a shorter state machine wrote.
+	fn adr0092_v1_snapshot_of_the_exact_v1_shape_replays() {
+		// This control's ancestor (adr0085_older_versioned_snapshot_shape_
+		// mismatch_explains_itself_too) pinned the pre-replay behavior: an
+		// intact v1 body was refused with "no migrations". ADR 0092 gave v1 a
+		// replay decoder, so the same construction — the current default body
+		// minus its trailing certificate-catalog byte, which IS the exact v1
+		// default shape — now decodes and converts.
 		assert!(
 			SNAPSHOT_FORMAT_VERSION > 1,
 			"this control needs a version below the current one to exist"
@@ -11902,15 +12196,36 @@ mod tenant_kek_tests {
 		header.state_sha256 = control_artifact_digest_32(&bytes[header_len..]);
 		bytes[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
 
+		let (header, decoded) = decode_snapshot_reader(bytes.as_slice())
+			.expect("an exact v1 body must replay, not refuse");
+		assert_eq!(header.format_version, 1);
+		assert_eq!(
+			postcard::to_stdvec(&decoded).unwrap(),
+			postcard::to_stdvec(&SmState::default()).unwrap(),
+			"an empty v1 state converts to an empty current state"
+		);
+	}
+
+	#[test]
+	fn adr0092_v1_stamped_snapshot_of_the_wrong_shape_is_refused_by_name() {
+		// A CURRENT-shaped body stamped version 1: the v1 decode leaves the
+		// certificate-catalog bytes unconsumed, so the artifact provably was
+		// not written at its declared version. The refusal names the version
+		// and stays out of the corruption vocabulary — the digest matched.
+		let bytes = snapshot_bytes_with_format_version(&SmState::default(), 1);
 		let error = decode_snapshot_reader(bytes.as_slice())
-			.expect_err("a truncated-shape body must not decode");
+			.expect_err("a mis-stamped body must not decode");
+		assert!(
+			error.contains("snapshot format version 1"),
+			"the refusal names the declared version: {error}"
+		);
 		assert!(
 			error.contains("intact"),
 			"the operator is told the bytes are sound: {error}"
 		);
 		assert!(
-			error.contains("format version 1") && error.contains("no migrations"),
-			"the refusal names the writing version and says why it cannot be read: {error}"
+			error.contains("not corruption"),
+			"a hash-matched recognized-version mismatch is never damage: {error}"
 		);
 		assert!(
 			!error.contains("predates format versioning"),
@@ -11940,5 +12255,955 @@ mod tenant_kek_tests {
 			error.contains("intact"),
 			"the operator is told the bytes are sound: {error}"
 		);
+	}
+}
+
+/// ADR 0092: the consensus-body fixture corpus and its exact-set guards.
+///
+/// The WAL body is `postcard(Entry<WendelonTypeConfig>)` and the snapshot body
+/// is `postcard(SmState)` — positional encodings that cannot describe
+/// themselves. These controls pin the CURRENT (version 2) shape two ways: a
+/// stored golden encoding per request variant and per changed container, and
+/// an exact-set guard over the variant lists, because an appended enum variant
+/// moves no stored bytes and only the set check can see it. Any failure here
+/// means the body shape moved: the re-pin travels with a
+/// `WAL_FORMAT_VERSION`/`SNAPSHOT_FORMAT_VERSION` bump, a frozen fixture of
+/// the outgoing version, and its replay control — never alone.
+#[cfg(test)]
+mod body_format_corpus {
+	use super::*;
+	use crate::consensus::{EpochPeer, RetireTieredSlab};
+	use crate::crypto::WrappedTenantKek;
+	use crate::hash::state_digest::StateDigest;
+	use crate::integration::compute::{DropOperationId, SchemaGeneration};
+	use crate::schema::{
+		CompactionJobId, CtasExpectedBinding, CtasIntentFingerprint, CtasOperationId,
+		CtasSagaMutation, DurabilityLevel, FinalizationMarker, Identity, LeaseDescriptor,
+		LocalityPolicy, ManifestEpoch, PolicyGeneration, PrimaryKeyDescriptor,
+		ReleaseLeaseRequestMeta, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+		TableRetentionPolicy, TableSchemaDescriptor, TenantId,
+	};
+	use crate::storage::CompactionDigestSummary;
+	use arrow::datatypes::{DataType, Field, Schema};
+	use std::collections::BTreeMap;
+
+	fn hts(physical_ms: u64) -> HybridTimestamp {
+		HybridTimestamp {
+			physical_ms,
+			logical: 2,
+			node_id: 1,
+		}
+	}
+
+	fn node(id: u32) -> SchemaNodeId {
+		SchemaNodeId { id, _reserved: 0 }
+	}
+
+	fn canonical_descriptor() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+		TableSchemaDescriptor::new(
+			TableObjectId::new([4; 16]),
+			1,
+			"analytics",
+			"events",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn canonical_write_id() -> ClientWriteId {
+		let mut client_uuid = [0x54u8; 16];
+		client_uuid[6] = 0x70;
+		client_uuid[8] = 0x80;
+		ClientWriteId {
+			client_uuid,
+			sequence_no: 7,
+			idempotency_ttl_ms: 300_000,
+			_pad: 0,
+		}
+	}
+
+	fn canonical_operation_id() -> CtasOperationId {
+		let mut bytes = [0x54u8; 16];
+		bytes[..5].fill(0);
+		bytes[5] = 1;
+		bytes[6] = 0x70;
+		bytes[8] = 0x80;
+		CtasOperationId::new(bytes)
+	}
+
+	fn canonical_epoch_config(epoch: u64) -> EpochConfig {
+		let mut peers = BTreeMap::new();
+		peers.insert(
+			1,
+			EpochPeer {
+				node_id: node(1),
+				address: "127.0.0.1:7001".to_string(),
+				tier_bits: 1,
+				role_bits: 1,
+				capability_bits: 0,
+			},
+		);
+		EpochConfig { epoch, peers }
+	}
+
+	fn canonical_ledger_entry() -> MigrationLedgerEntry {
+		MigrationLedgerEntry {
+			migration_id: 9,
+			range_start: 0x1000,
+			range_end: 0x1FFF,
+			from_epoch: 1,
+			to_epoch: 2,
+			logical_owner: node(2),
+			upstream_migration_id: None,
+			source_replicas: vec![node(1)],
+			migration_hlc_floor: hts(5),
+			state: MigrationState::Pending,
+			completed_by: None,
+			completed_at_hlc: None,
+		}
+	}
+
+	fn canonical_tenant_keyset() -> TenantKeyset {
+		let tenant_kek_id = TenantKekId::try_from(1).unwrap();
+		let mut keyset = TenantKeyset::default();
+		keyset.active_tenant_kek_id = Some(tenant_kek_id);
+		keyset.keys.insert(
+			tenant_kek_id,
+			WrappedTenantKek {
+				wrapped_key: vec![0xAB; 40],
+			},
+		);
+		keyset
+	}
+
+	fn canonical_mutations() -> Vec<(&'static str, CtasSagaMutation)> {
+		let tenant_id = TenantId::new(7);
+		let operation_id = canonical_operation_id();
+		vec![
+			(
+				"provision",
+				CtasSagaMutation::Provision {
+					tenant_id,
+					operation_id,
+					intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
+					descriptor: canonical_descriptor(),
+					expected_binding: CtasExpectedBinding::Absent,
+					prior_descriptor: None,
+					row_write_id: canonical_write_id(),
+					owner_epoch: 1,
+					observed_now_ms: 1,
+					owner_lease_expires_at_ms: 1_000,
+					certificate: Some(vec![0xC5; 4]),
+				},
+			),
+			(
+				"attest_rows_committed",
+				CtasSagaMutation::AttestRowsCommitted {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+					row_count: 2,
+				},
+			),
+			(
+				"mark_row_dispatched",
+				CtasSagaMutation::MarkRowDispatched {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+					row_count: 2,
+				},
+			),
+			(
+				"publish",
+				CtasSagaMutation::Publish {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+				},
+			),
+			(
+				"mark_retiring_old",
+				CtasSagaMutation::MarkRetiringOld {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+				},
+			),
+			(
+				"complete",
+				CtasSagaMutation::Complete {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+					completed_at_ms: 9,
+				},
+			),
+			(
+				"reclaim",
+				CtasSagaMutation::Reclaim {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+					cause: CtasTerminalCause::PublicationConflict,
+					completed_at_ms: 9,
+				},
+			),
+			(
+				"record_publication_conflict",
+				CtasSagaMutation::RecordPublicationConflict {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+					completed_at_ms: 9,
+				},
+			),
+			(
+				"record_retry_debt",
+				CtasSagaMutation::RecordRetryDebt {
+					tenant_id,
+					operation_id,
+					owner_epoch: 1,
+				},
+			),
+			(
+				"claim",
+				CtasSagaMutation::Claim {
+					tenant_id,
+					operation_id,
+					expected_owner_epoch: 1,
+					new_owner_epoch: 2,
+					observed_now_ms: 5,
+					lease_expires_at_ms: 1_000,
+				},
+			),
+		]
+	}
+
+	fn canonical_requests() -> Vec<(&'static str, WendelonRequest)> {
+		let tenant_id = TenantId::new(7);
+		vec![
+			(
+				"finalize",
+				WendelonRequest::Finalize(TenantFinalization {
+					marker: FinalizationMarker {
+						log_index: 11,
+						term: 3,
+						epoch: 1,
+						commit_hlc: hts(5),
+						payload_hash: [0x11; 32],
+						e_safe_index: 10,
+						durability: DurabilityLevel(1),
+						_pad: [0; 7],
+					},
+					tenant_id,
+					key_identity: Identity::new([0x22; 32]),
+					charged_bytes: 4_096,
+					record_count: 2,
+				}),
+			),
+			(
+				"acquire_lease",
+				WendelonRequest::AcquireLease(LeaseDescriptor {
+					epoch: 1,
+					holder: node(1),
+					range_start: 0x1000,
+					range_end: 0x1FFF,
+					lease_start: hts(5),
+					lease_expiry: hts(6),
+					min_commit_index: 0,
+					issuer: node(1),
+					signature: [0x5A; 64],
+				}),
+			),
+			(
+				"release_lease",
+				WendelonRequest::ReleaseLease(ReleaseLeaseRequestMeta {
+					range_start: 0x1000,
+					range_end: 0x1FFF,
+					epoch: 1,
+					holder: node(1),
+				}),
+			),
+			(
+				"advance_epoch",
+				WendelonRequest::AdvanceEpoch(AdvanceEpochRecord {
+					from: canonical_epoch_config(1),
+					to: canonical_epoch_config(2),
+				}),
+			),
+			(
+				"schema_update",
+				WendelonRequest::SchemaUpdate(vec![0x5C; 8]),
+			),
+			(
+				"tier_slab",
+				WendelonRequest::TierSlab(TieredSlab {
+					slab_id: SlabId::new(3),
+					l2_uri: "l2://slab/3".to_string(),
+					payload_hash: [0x33; 32],
+					is_encrypted: false,
+					tenant_id: None,
+					tenant_kek_id: None,
+					stats_format_version: None,
+					stats_block_len: None,
+					stats_block_hash128: None,
+					tombstone_metadata: TombstoneMetadata::default(),
+					supersession_metadata: SupersessionMetadata::default(),
+				}),
+			),
+			(
+				"retire_tiered_slab",
+				WendelonRequest::RetireTieredSlab(RetireTieredSlab {
+					slab_id: SlabId::new(3),
+				}),
+			),
+			(
+				"compaction_commit",
+				WendelonRequest::CompactionCommit(CompactionCommit {
+					job_id: CompactionJobId::new(5),
+					manifest_epoch_pre: ManifestEpoch::new(4),
+					slabs_to_retire: vec![SlabId::new(3)],
+					slabs_to_add: Vec::new(),
+					slabs_to_mark_delete_pending: Vec::new(),
+					slabs_to_remove: Vec::new(),
+					sidecar_swaps: Vec::new(),
+					digest_summary: CompactionDigestSummary {
+						visible_pre: StateDigest::default(),
+						visible_post: StateDigest::default(),
+						version_entry_delta: StateDigest::default(),
+					},
+				}),
+			),
+			(
+				"seed_migration",
+				WendelonRequest::SeedMigration(SeedMigration {
+					entry: canonical_ledger_entry(),
+				}),
+			),
+			(
+				"migration_complete",
+				WendelonRequest::MigrationComplete(MigrationComplete {
+					migration_id: 9,
+					range_start: 0x1000,
+					range_end: 0x1FFF,
+					to_epoch: 2,
+					completed_by: node(2),
+					completed_at_hlc: hts(7),
+					migration_hlc_floor: hts(5),
+				}),
+			),
+			(
+				"create_tenant",
+				WendelonRequest::CreateTenant(CreateTenant {
+					tenant_id,
+					quota_bytes: u64::MAX,
+					replication_factor: 1,
+					tenant_keyset: canonical_tenant_keyset(),
+				}),
+			),
+			(
+				"update_tenant_quota",
+				WendelonRequest::UpdateTenantQuota(UpdateTenantQuota {
+					tenant_id,
+					quota_bytes: 1 << 30,
+				}),
+			),
+			("suspend_tenant", WendelonRequest::SuspendTenant(tenant_id)),
+			("resume_tenant", WendelonRequest::ResumeTenant(tenant_id)),
+			("delete_tenant", WendelonRequest::DeleteTenant(tenant_id)),
+			(
+				"install_tenant_kek_version",
+				WendelonRequest::InstallTenantKekVersion(InstallTenantKekVersion {
+					tenant_id,
+					tenant_kek_id: TenantKekId::try_from(2).unwrap(),
+					wrapped_tenant_kek: vec![0xAB; 40],
+				}),
+			),
+			(
+				"retire_tenant_kek_version",
+				WendelonRequest::RetireTenantKekVersion(RetireTenantKekVersion {
+					tenant_id,
+					tenant_kek_id: TenantKekId::try_from(1).unwrap(),
+				}),
+			),
+			(
+				"revoke_actor_key",
+				WendelonRequest::RevokeActorKey(RevokeActorKey {
+					trust_domain: ActorTrustDomain::Data,
+					key_id: vec![0x4B; 8],
+					revoked_at_ms: 9,
+				}),
+			),
+			(
+				"set_table_retention_policy",
+				WendelonRequest::SetTableRetentionPolicy(SetTableRetentionPolicy {
+					tenant_id,
+					table_object_id: TableObjectId::new([4; 16]),
+					expected_policy_generation: PolicyGeneration::default(),
+					new_policy: TableRetentionPolicy::default(),
+					updated_at_hlc: hts(5),
+				}),
+			),
+			(
+				"table_drop_prepare",
+				WendelonRequest::TableDropPrepare(TableDropPrepareRequest::V1 {
+					operation_id: canonical_drop_operation_id(),
+					expected_generation: SchemaGeneration::new(1),
+				}),
+			),
+			(
+				"table_reclaim_completion",
+				WendelonRequest::TableReclaimCompletion(TableReclaimCompletionRequest::V1 {
+					operation_id: canonical_drop_operation_id(),
+					fence_log_index: 11,
+				}),
+			),
+			(
+				"table_drop_finalize",
+				WendelonRequest::TableDropFinalize(TableDropFinalizeRequest::V1 {
+					operation_id: canonical_drop_operation_id(),
+					fence_log_index: 11,
+					reclaim_completion_log_index: 12,
+				}),
+			),
+			(
+				"ctas_saga",
+				WendelonRequest::CtasSaga(canonical_mutations().remove(0).1),
+			),
+		]
+	}
+
+	fn canonical_drop_operation_id() -> DropOperationId {
+		DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: TableObjectId::new([4; 16]),
+			schema_generation: SchemaGeneration::new(1),
+		}
+	}
+
+	fn entry_for(request: WendelonRequest) -> Entry<WendelonTypeConfig> {
+		Entry {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 11),
+			payload: EntryPayload::Normal(request),
+		}
+	}
+
+	/// The canonical SmState carries an ACTIVE saga — a non-empty
+	/// `CtasSagaCatalog` entry — because the certificate field this pin
+	/// exists to watch sits per-entry, mid-stream inside the catalog map. An
+	/// empty state would pin nothing that matters.
+	fn canonical_sm_state() -> SmState {
+		let mut state = SmState::default();
+		state.last_e_safe_index = 10;
+		let response = apply_ctas_saga_mutation(&mut state, canonical_mutations().remove(0).1);
+		assert!(
+			matches!(response, CtasSagaResponse::Applied(_)),
+			"canonical provision must apply: {response:?}"
+		);
+		state
+	}
+
+	fn parse_manifest(raw: &str) -> BTreeMap<String, Vec<u8>> {
+		raw.lines()
+			.filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
+			.map(|line| {
+				let (name, hex) = line
+					.split_once('=')
+					.unwrap_or_else(|| panic!("manifest line without '=': {line}"));
+				let bytes = (0..hex.len())
+					.step_by(2)
+					.map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+					.collect();
+				(name.to_string(), bytes)
+			})
+			.collect()
+	}
+
+	fn hex(bytes: &[u8]) -> String {
+		bytes.iter().map(|b| format!("{b:02x}")).collect()
+	}
+
+	const WAL_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v2_entries.txt");
+	const MUTATION_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/ctas_mutations_v2.txt");
+	const SNAPSHOT_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v2.txt");
+
+	fn wal_corpus() -> Vec<(&'static str, Vec<u8>)> {
+		let mut corpus: Vec<(&'static str, Vec<u8>)> = canonical_requests()
+			.into_iter()
+			.map(|(name, request)| (name, postcard::to_stdvec(&entry_for(request)).unwrap()))
+			.collect();
+		corpus.push((
+			"membership",
+			postcard::to_stdvec(&Entry::<WendelonTypeConfig> {
+				log_id: LogId::new(CommittedLeaderId::new(3, 1), 11),
+				payload: EntryPayload::Membership(openraft::Membership::new(
+					vec![std::collections::BTreeSet::from([1u32])],
+					BTreeMap::from([(1u32, openraft::BasicNode::new("127.0.0.1:7001"))]),
+				)),
+			})
+			.unwrap(),
+		));
+		corpus.push((
+			"blank",
+			postcard::to_stdvec(&Entry::<WendelonTypeConfig> {
+				log_id: LogId::new(CommittedLeaderId::new(3, 1), 11),
+				payload: EntryPayload::Blank,
+			})
+			.unwrap(),
+		));
+		corpus
+	}
+
+	#[test]
+	fn adr0092_wal_corpus_covers_every_request_variant_exactly() {
+		let names: Vec<&str> = canonical_requests().iter().map(|(name, _)| *name).collect();
+		assert_eq!(
+			names,
+			WendelonRequest::ALL_VARIANT_NAMES.to_vec(),
+			"the corpus and the variant list must agree, in order"
+		);
+		let by_variant_name: Vec<&str> = canonical_requests()
+			.iter()
+			.map(|(_, request)| request.variant_name())
+			.collect();
+		assert_eq!(
+			by_variant_name, names,
+			"each canonical body must actually be its named variant"
+		);
+	}
+
+	#[test]
+	fn adr0092_mutation_corpus_covers_every_variant_exactly() {
+		let names: Vec<&str> = canonical_mutations()
+			.iter()
+			.map(|(name, _)| *name)
+			.collect();
+		assert_eq!(names, CtasSagaMutation::ALL_VARIANT_NAMES.to_vec());
+		let by_variant_name: Vec<&str> = canonical_mutations()
+			.iter()
+			.map(|(_, mutation)| mutation.variant_name())
+			.collect();
+		assert_eq!(by_variant_name, names);
+	}
+
+	#[test]
+	fn adr0092_wal_v2_encodings_match_stored_goldens() {
+		let stored = parse_manifest(WAL_MANIFEST);
+		let corpus = wal_corpus();
+		assert_eq!(
+			stored.keys().cloned().collect::<Vec<_>>(),
+			{
+				let mut names: Vec<String> =
+					corpus.iter().map(|(name, _)| name.to_string()).collect();
+				names.sort();
+				names
+			},
+			"stored manifest and corpus must hold exactly the same set"
+		);
+		for (name, bytes) in &corpus {
+			let golden = &stored[*name];
+			assert_eq!(
+				&hex(bytes),
+				&hex(golden),
+				"WAL body encoding moved for `{name}`; a shape change must ride a \
+				 WAL_FORMAT_VERSION bump with a frozen fixture of the outgoing version"
+			);
+			let decoded: Entry<WendelonTypeConfig> = postcard::from_bytes(golden).unwrap();
+			assert_eq!(
+				hex(&postcard::to_stdvec(&decoded).unwrap()),
+				hex(golden),
+				"stored golden must round-trip byte-stable for `{name}`"
+			);
+		}
+	}
+
+	#[test]
+	fn adr0092_mutation_v2_encodings_match_stored_goldens() {
+		let stored = parse_manifest(MUTATION_MANIFEST);
+		let corpus: Vec<(&'static str, Vec<u8>)> = canonical_mutations()
+			.into_iter()
+			.map(|(name, mutation)| (name, postcard::to_stdvec(&mutation).unwrap()))
+			.collect();
+		assert_eq!(stored.keys().cloned().collect::<Vec<_>>(), {
+			let mut names: Vec<String> = corpus.iter().map(|(name, _)| name.to_string()).collect();
+			names.sort();
+			names
+		},);
+		for (name, bytes) in &corpus {
+			assert_eq!(
+				&hex(bytes),
+				&hex(&stored[*name]),
+				"CTAS mutation encoding moved for `{name}`"
+			);
+		}
+	}
+
+	#[test]
+	fn adr0092_snapshot_v2_active_saga_state_matches_stored_golden() {
+		let stored = parse_manifest(SNAPSHOT_MANIFEST);
+		let state_bytes = postcard::to_stdvec(&canonical_sm_state()).unwrap();
+		assert_eq!(
+			hex(&state_bytes),
+			hex(&stored["smstate_active_saga"]),
+			"SmState encoding moved; a shape change must ride a \
+			 SNAPSHOT_FORMAT_VERSION bump with a frozen fixture of the outgoing version"
+		);
+		let state = canonical_sm_state();
+		let entry = state
+			.ctas_sagas
+			.get(TenantId::new(7), canonical_operation_id())
+			.expect("canonical state must hold its active saga")
+			.clone();
+		assert_eq!(
+			hex(&postcard::to_stdvec(&entry).unwrap()),
+			hex(&stored["ctas_saga_entry"]),
+			"CtasSagaEntry encoding moved"
+		);
+		let decoded: SmState = postcard::from_bytes(&stored["smstate_active_saga"]).unwrap();
+		assert_eq!(
+			hex(&postcard::to_stdvec(&decoded).unwrap()),
+			hex(&stored["smstate_active_saga"]),
+			"stored snapshot golden must round-trip byte-stable"
+		);
+	}
+
+	// ---- ADR 0092: the frozen v1 fixtures and their replay controls ----
+
+	const V1_WAL_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v1_entries.txt");
+	const V1_SNAPSHOT_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v1.txt");
+
+	/// The canonical v1 `Provision` request, built from the frozen shadow
+	/// spine. Field values mirror `canonical_mutations()`'s provision so the
+	/// upconversion equality below is byte-exact.
+	fn v1_provision_request(operation_byte: u8) -> crate::consensus::wal_body::v1::WendelonRequest {
+		v1_provision_request_for(operation_byte, canonical_descriptor())
+	}
+
+	fn v1_provision_request_for(
+		operation_byte: u8,
+		descriptor: TableSchemaDescriptor,
+	) -> crate::consensus::wal_body::v1::WendelonRequest {
+		let mut operation_bytes = [operation_byte; 16];
+		operation_bytes[..5].fill(0);
+		operation_bytes[5] = 1;
+		operation_bytes[6] = 0x70;
+		operation_bytes[8] = 0x80;
+		crate::consensus::wal_body::v1::WendelonRequest::CtasSaga(
+			crate::consensus::wal_body::v1::CtasSagaMutation::Provision {
+				tenant_id: TenantId::new(7),
+				operation_id: CtasOperationId::new(operation_bytes),
+				intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
+				descriptor,
+				expected_binding: CtasExpectedBinding::Absent,
+				prior_descriptor: None,
+				row_write_id: canonical_write_id(),
+				owner_epoch: 1,
+				observed_now_ms: 1,
+				owner_lease_expires_at_ms: 1_000,
+			},
+		)
+	}
+
+	/// A second table identity, so the mixed snapshot+tail control's tail
+	/// provision does not collide with the snapshot's saga binding.
+	fn tail_descriptor() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+		TableSchemaDescriptor::new(
+			TableObjectId::new([6; 16]),
+			1,
+			"analytics",
+			"events_tail",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::default_table_spread(),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.unwrap()
+	}
+
+	fn v1_entry_bytes(request: crate::consensus::wal_body::v1::WendelonRequest) -> Vec<u8> {
+		postcard::to_stdvec(&openraft::Entry::<
+			crate::consensus::wal_body::v1::WendelonWalV1TypeConfig,
+		> {
+			log_id: LogId::new(CommittedLeaderId::new(3, 1), 11),
+			payload: EntryPayload::Normal(request),
+		})
+		.unwrap()
+	}
+
+	/// The current-shape provision with `certificate: None` — what the v1
+	/// fixture must upconvert to, and whose encoding must be the v1 bytes
+	/// plus exactly the trailing `None` discriminant.
+	fn v2_provision_none_entry(operation_byte: u8) -> Entry<WendelonTypeConfig> {
+		let mut operation_bytes = [operation_byte; 16];
+		operation_bytes[..5].fill(0);
+		operation_bytes[5] = 1;
+		operation_bytes[6] = 0x70;
+		operation_bytes[8] = 0x80;
+		entry_for(WendelonRequest::CtasSaga(CtasSagaMutation::Provision {
+			tenant_id: TenantId::new(7),
+			operation_id: CtasOperationId::new(operation_bytes),
+			intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
+			descriptor: canonical_descriptor(),
+			expected_binding: CtasExpectedBinding::Absent,
+			prior_descriptor: None,
+			row_write_id: canonical_write_id(),
+			owner_epoch: 1,
+			observed_now_ms: 1,
+			owner_lease_expires_at_ms: 1_000,
+			certificate: None,
+		}))
+	}
+
+	/// The canonical v1 snapshot, projected FROM the live apply path so it is
+	/// faithful to what a real v1 writer held: the provision apply also
+	/// registers the provisional descriptor in `table_schemas`, and a
+	/// hand-built state missing that would pin a state no v1 build ever
+	/// wrote. Certificates are `None` throughout, so dropping the field is
+	/// the exact v1 projection.
+	fn v1_snapshot_state() -> crate::consensus::snapshot_body::v1::SmState {
+		let state = expected_converted_state();
+		let (entries, expired_through_ms) = state.ctas_sagas.into_replay_parts();
+		crate::consensus::snapshot_body::v1::SmState {
+			last_applied_log_id: state.last_applied_log_id,
+			last_membership: state.last_membership,
+			epoch_history: state.epoch_history,
+			leases: state.leases,
+			e_safe_watermarks: state.e_safe_watermarks,
+			last_e_safe_index: state.last_e_safe_index,
+			tiered_slabs: state.tiered_slabs,
+			migrations: state.migrations,
+			tombstones: state.tombstones,
+			tenants: state.tenants,
+			tenant_keysets: state.tenant_keysets,
+			revoked_actor_keys: state.revoked_actor_keys,
+			table_schemas: state.table_schemas,
+			logical_types: state.logical_types,
+			secondary_indexes: state.secondary_indexes,
+			table_lifecycle: state.table_lifecycle,
+			table_drop_fences: state.table_drop_fences,
+			ctas_sagas: crate::consensus::snapshot_body::v1::CtasSagaCatalog {
+				entries: entries
+					.into_iter()
+					.map(|(key, entry)| {
+						assert_eq!(
+							entry.certificate, None,
+							"the v1 projection only exists for certificate-less entries"
+						);
+						(
+							key,
+							crate::consensus::snapshot_body::v1::CtasSagaEntry {
+								tenant_id: entry.tenant_id,
+								operation_id: entry.operation_id,
+								intent_fingerprint: entry.intent_fingerprint,
+								descriptor: entry.descriptor,
+								expected_binding: entry.expected_binding,
+								prior_descriptor: entry.prior_descriptor,
+								row_write_id: entry.row_write_id,
+								row_count: entry.row_count,
+								phase: entry.phase,
+								terminal_cause: entry.terminal_cause,
+								owner_epoch: entry.owner_epoch,
+								owner_lease_expires_at_ms: entry.owner_lease_expires_at_ms,
+								retry_debt: entry.retry_debt,
+								terminal_at_ms: entry.terminal_at_ms,
+							},
+						)
+					})
+					.collect(),
+				expired_through_ms,
+			},
+		}
+	}
+
+	/// What the v1 snapshot must convert to: the same state built through the
+	/// live apply path with `certificate: None`.
+	fn expected_converted_state() -> SmState {
+		let mut operation_bytes = [0x55u8; 16];
+		operation_bytes[..5].fill(0);
+		operation_bytes[5] = 1;
+		operation_bytes[6] = 0x70;
+		operation_bytes[8] = 0x80;
+		let mut state = SmState::default();
+		state.last_e_safe_index = 10;
+		let response = apply_ctas_saga_mutation(
+			&mut state,
+			CtasSagaMutation::Provision {
+				tenant_id: TenantId::new(7),
+				operation_id: CtasOperationId::new(operation_bytes),
+				intent_fingerprint: CtasIntentFingerprint::new([0x48; 32]),
+				descriptor: canonical_descriptor(),
+				expected_binding: CtasExpectedBinding::Absent,
+				prior_descriptor: None,
+				row_write_id: canonical_write_id(),
+				owner_epoch: 1,
+				observed_now_ms: 1,
+				owner_lease_expires_at_ms: 1_000,
+				certificate: None,
+			},
+		);
+		assert!(matches!(response, CtasSagaResponse::Applied(_)));
+		state
+	}
+
+	#[test]
+	fn adr0092_v1_wal_fixture_decodes_and_upconverts_from_stored_bytes() {
+		let stored = parse_manifest(V1_WAL_MANIFEST);
+		let provision = &stored["ctas_saga_provision"];
+		// The frozen bytes tie back to the grounded reality: a v1 provision
+		// body is the current certificate-less encoding minus exactly its
+		// trailing None discriminant.
+		let v2_none = postcard::to_stdvec(&v2_provision_none_entry(0x54)).unwrap();
+		assert_eq!(v2_none.last(), Some(&0u8));
+		assert_eq!(
+			hex(provision),
+			hex(&v2_none[..v2_none.len() - 1]),
+			"the stored v1 provision must be the certificate-less current \
+			 encoding minus its trailing None byte"
+		);
+		let decoded = crate::consensus::wal_body::v1::decode_entry(provision).unwrap();
+		assert_eq!(
+			hex(&postcard::to_stdvec(&decoded).unwrap()),
+			hex(&v2_none),
+			"upconversion must land exactly on the current certificate-less shape"
+		);
+		// An unchanged-shape variant must pass through the v1 decode
+		// untouched: its v1 bytes are its v2 bytes.
+		let lease = &stored["acquire_lease"];
+		let v2_lease = wal_corpus()
+			.into_iter()
+			.find(|(name, _)| *name == "acquire_lease")
+			.unwrap()
+			.1;
+		assert_eq!(hex(lease), hex(&v2_lease));
+		let decoded = crate::consensus::wal_body::v1::decode_entry(lease).unwrap();
+		assert_eq!(hex(&postcard::to_stdvec(&decoded).unwrap()), hex(&v2_lease));
+	}
+
+	#[test]
+	fn adr0092_v1_wal_fixture_still_fails_the_current_shape_decode() {
+		// The discriminating run: v1 readability comes from the dispatch, not
+		// from a widened tolerance in the current decoder.
+		let stored = parse_manifest(V1_WAL_MANIFEST);
+		let provision = &stored["ctas_saga_provision"];
+		let err = postcard::from_bytes::<Entry<WendelonTypeConfig>>(provision)
+			.expect_err("the current shape must not decode a v1 provision body");
+		assert!(err.to_string().contains("end of buffer"), "{err}");
+	}
+
+	#[test]
+	fn adr0092_v1_snapshot_fixture_converts_the_active_saga() {
+		let stored = parse_manifest(V1_SNAPSHOT_MANIFEST);
+		let body = &stored["smstate_active_saga"];
+		// Stored bytes match the frozen shadow encoding.
+		assert_eq!(
+			hex(body),
+			hex(&postcard::to_stdvec(&v1_snapshot_state()).unwrap()),
+			"the stored v1 snapshot must be the frozen shadow's encoding"
+		);
+		let converted = crate::consensus::snapshot_body::v1::decode_state(body).unwrap();
+		let entry = converted
+			.ctas_sagas
+			.get(TenantId::new(7), {
+				let mut operation_bytes = [0x55u8; 16];
+				operation_bytes[..5].fill(0);
+				operation_bytes[5] = 1;
+				operation_bytes[6] = 0x70;
+				operation_bytes[8] = 0x80;
+				CtasOperationId::new(operation_bytes)
+			})
+			.expect("the active saga survives conversion");
+		assert_eq!(entry.certificate, None, "conversion adds certificate: None");
+		assert_eq!(
+			hex(&postcard::to_stdvec(&converted).unwrap()),
+			hex(&postcard::to_stdvec(&expected_converted_state()).unwrap()),
+			"conversion must land exactly on the live apply path's state"
+		);
+	}
+
+	/// Regeneration procedure for the v1 fixtures: unlike the current-version
+	/// corpus these are IMMUTABLE — regenerate only to create them, never to
+	/// repair a drift; a drift here means a referenced type moved under the
+	/// frozen spine and the shadow must fork its own copy instead.
+	#[test]
+	#[ignore = "generator: one-time creation of the immutable v1 fixtures"]
+	fn adr0092_generate_v1_fixtures_once() {
+		let dir = std::env::temp_dir().join("wendelon_body_corpus");
+		std::fs::create_dir_all(&dir).unwrap();
+		let wal = format!(
+			"ctas_saga_provision={}\nctas_saga_provision_tail_table={}\nacquire_lease={}\n",
+			hex(&v1_entry_bytes(v1_provision_request(0x54))),
+			hex(&v1_entry_bytes(v1_provision_request_for(
+				0x54,
+				tail_descriptor()
+			))),
+			hex(&v1_entry_bytes(
+				crate::consensus::wal_body::v1::WendelonRequest::AcquireLease(LeaseDescriptor {
+					epoch: 1,
+					holder: node(1),
+					range_start: 0x1000,
+					range_end: 0x1FFF,
+					lease_start: hts(5),
+					lease_expiry: hts(6),
+					min_commit_index: 0,
+					issuer: node(1),
+					signature: [0x5A; 64],
+				})
+			)),
+		);
+		std::fs::write(dir.join("wal_v1_entries.txt"), wal).unwrap();
+		let snapshot = format!(
+			"smstate_active_saga={}\n",
+			hex(&postcard::to_stdvec(&v1_snapshot_state()).unwrap())
+		);
+		std::fs::write(dir.join("snapshot_v1.txt"), snapshot).unwrap();
+		println!("v1 fixtures written to {}", dir.display());
+	}
+
+	/// Regeneration procedure, run only inside a format-version bump cut:
+	/// `cargo test ... adr0092_regenerate_body_corpus_manifests -- --ignored
+	/// --nocapture`, then copy the printed files into
+	/// `tests/fixtures/consensus_body/` and re-run the corpus controls.
+	#[test]
+	#[ignore = "generator: writes fresh manifests for a format-version bump cut"]
+	fn adr0092_regenerate_body_corpus_manifests() {
+		let dir = std::env::temp_dir().join("wendelon_body_corpus");
+		std::fs::create_dir_all(&dir).unwrap();
+		let mut wal = String::new();
+		for (name, bytes) in wal_corpus() {
+			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
+		}
+		std::fs::write(dir.join("wal_v2_entries.txt"), wal).unwrap();
+		let mut mutations = String::new();
+		for (name, mutation) in canonical_mutations() {
+			mutations.push_str(&format!(
+				"{name}={}\n",
+				hex(&postcard::to_stdvec(&mutation).unwrap())
+			));
+		}
+		std::fs::write(dir.join("ctas_mutations_v2.txt"), mutations).unwrap();
+		let state = canonical_sm_state();
+		let entry = state
+			.ctas_sagas
+			.get(TenantId::new(7), canonical_operation_id())
+			.unwrap()
+			.clone();
+		let snapshot = format!(
+			"smstate_active_saga={}\nctas_saga_entry={}\n",
+			hex(&postcard::to_stdvec(&state).unwrap()),
+			hex(&postcard::to_stdvec(&entry).unwrap())
+		);
+		std::fs::write(dir.join("snapshot_v2.txt"), snapshot).unwrap();
+		println!("manifests written to {}", dir.display());
 	}
 }

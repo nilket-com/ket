@@ -9386,3 +9386,41 @@ fn adr0090_placement_is_resolved_centrally_never_from_the_index_alone() {
 		 letting it under-count"
 	);
 }
+
+/// ADR 0092: the versioned-replay shadow modules are replay machinery, never
+/// an API. Only the consensus decode dispatch (raft_storage, which also hosts
+/// the format-fixture controls), the shadow definitions themselves, and their
+/// module registration may name them. Any other reference means a live code
+/// path is reading or building a superseded shape on its own authority.
+#[test]
+fn adr0092_versioned_body_shadows_are_replay_only() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let allowed = [
+		"src/consensus/mod.rs",
+		"src/consensus/raft_storage.rs",
+		"src/consensus/snapshot_body.rs",
+		"src/consensus/wal_body.rs",
+	];
+	let mut offenders = Vec::new();
+	walk_dir(&manifest_dir.join("src"), &mut |path| {
+		if path.extension().is_none_or(|ext| ext != "rs") {
+			return;
+		}
+		let source = fs::read_to_string(path).unwrap();
+		if !source.contains("wal_body") && !source.contains("snapshot_body") {
+			return;
+		}
+		let relative = path
+			.strip_prefix(manifest_dir)
+			.unwrap()
+			.to_string_lossy()
+			.replace('\\', "/");
+		if !allowed.iter().any(|entry| relative == *entry) {
+			offenders.push(relative);
+		}
+	});
+	assert!(
+		offenders.is_empty(),
+		"the ADR 0092 shadow modules leaked outside the replay dispatch: {offenders:?}"
+	);
+}

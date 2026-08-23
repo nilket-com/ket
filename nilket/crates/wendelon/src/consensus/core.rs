@@ -603,6 +603,71 @@ pub enum WendelonRequest {
 	CtasSaga(CtasSagaMutation),
 }
 
+impl WendelonRequest {
+	/// ADR 0092: every WAL-body request variant, by name, in declaration
+	/// order. Paired with [`Self::variant_name`]'s total match, this is the
+	/// exact-set guard behind the consensus-body fixture corpus: appending a
+	/// variant moves no existing golden bytes, so the corpus alone cannot see
+	/// it — the count and this list can. Adding a variant here means the WAL
+	/// format version must move with it.
+	pub const ALL_VARIANT_NAMES: [&'static str; 23] = [
+		"finalize",
+		"acquire_lease",
+		"release_lease",
+		"advance_epoch",
+		"schema_update",
+		"tier_slab",
+		"retire_tiered_slab",
+		"compaction_commit",
+		"seed_migration",
+		"migration_complete",
+		"create_tenant",
+		"update_tenant_quota",
+		"suspend_tenant",
+		"resume_tenant",
+		"delete_tenant",
+		"install_tenant_kek_version",
+		"retire_tenant_kek_version",
+		"revoke_actor_key",
+		"set_table_retention_policy",
+		"table_drop_prepare",
+		"table_reclaim_completion",
+		"table_drop_finalize",
+		"ctas_saga",
+	];
+
+	/// Total by construction: a new variant fails this match at compile time,
+	/// which is the earliest possible moment to learn the WAL body shape is
+	/// about to change.
+	pub fn variant_name(&self) -> &'static str {
+		match self {
+			Self::Finalize(_) => "finalize",
+			Self::AcquireLease(_) => "acquire_lease",
+			Self::ReleaseLease(_) => "release_lease",
+			Self::AdvanceEpoch(_) => "advance_epoch",
+			Self::SchemaUpdate(_) => "schema_update",
+			Self::TierSlab(_) => "tier_slab",
+			Self::RetireTieredSlab(_) => "retire_tiered_slab",
+			Self::CompactionCommit(_) => "compaction_commit",
+			Self::SeedMigration(_) => "seed_migration",
+			Self::MigrationComplete(_) => "migration_complete",
+			Self::CreateTenant(_) => "create_tenant",
+			Self::UpdateTenantQuota(_) => "update_tenant_quota",
+			Self::SuspendTenant(_) => "suspend_tenant",
+			Self::ResumeTenant(_) => "resume_tenant",
+			Self::DeleteTenant(_) => "delete_tenant",
+			Self::InstallTenantKekVersion(_) => "install_tenant_kek_version",
+			Self::RetireTenantKekVersion(_) => "retire_tenant_kek_version",
+			Self::RevokeActorKey(_) => "revoke_actor_key",
+			Self::SetTableRetentionPolicy(_) => "set_table_retention_policy",
+			Self::TableDropPrepare(_) => "table_drop_prepare",
+			Self::TableReclaimCompletion(_) => "table_reclaim_completion",
+			Self::TableDropFinalize(_) => "table_drop_finalize",
+			Self::CtasSaga(_) => "ctas_saga",
+		}
+	}
+}
+
 /// The response returned to the client after a Raft command is committed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WendelonResponse {
