@@ -595,6 +595,13 @@ impl WendelonDataServer {
 			stream.finish().await?;
 			return Ok(());
 		}
+		// ADR 0089: the scan's physical-read amortization, visible per request.
+		tracing::debug!(
+			distinct_records = plan.scan_decode_audit.distinct_records_decoded,
+			coalesced_hits = plan.scan_decode_audit.coalesced_hits,
+			max_resident = plan.scan_decode_audit.max_resident_records,
+			"table query scan decode audit"
+		);
 		let mut response = plan.response;
 		if response.status == ReadStatus::KEY_NOT_FOUND {
 			response.status = ReadStatus::OK;

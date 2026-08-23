@@ -1,18 +1,18 @@
-# ADR 0089 - Row-group packing on the locality prefix
+# ADR 0089 - Row-group packing on the durable partition
 
 **Status:** Proposed 2026-08-22. Responds to the per-location phase profile taken
 against the live deployment. It changes which rows share a stored record; it does
 not change the record format, the response protocol, or the encryption boundary.
 
-> **BLOCKED on ADR 0090 (durable routing partitions).** The grouping key decided
-> below — the locality prefix — is unsound: ownership is an arc of the raw
-> locality space and arcs move on membership change, so a prefix-grouped record
-> has no coherent owner and can straddle an ownership boundary after rebalancing.
-> Packed rows are also unindexed today, because ingest registers one entry per
-> record rather than per row. ADR 0090 decides the partition identity, the
-> per-row indexing of shared records, and membership-change behaviour; this
-> record resumes with the partition id as its grouping key. The per-record read
-> coalescing in decision 2 is unaffected and still required.
+> **Unblocked and implemented on ADR 0090's partitions.** The grouping key is
+> the DURABLE `PartitionId` carried on each source row — derived once at the
+> descriptor-aware write boundary and never recomputed at pack time — so packing
+> and placement structurally agree. Rows without a partition keep their full
+> locality as the bucket key: legacy behaviour, unchanged. The scan coalesces
+> reads and decodes on the canonical physical record identity
+> `(slab_id, offset)` through a bounded decoded-record cache, preserving
+> row-index order, interval membership, limits, and cancellation; a per-request
+> `scan_decode_audit` makes "one read/decode per distinct record" checkable.
 
 ## Context
 
@@ -78,7 +78,7 @@ keyed on a value that is deliberately unique per row.
 
 ## Decision
 
-### 1. Rows group by the locality prefix, not the whole locality
+### 1. Rows group by their durable partition, not the whole locality
 
 Packing buckets on the placement-bearing part of the locality — the prefix — and
 not on the per-row suffix. Rows sharing a prefix already share ring placement, so

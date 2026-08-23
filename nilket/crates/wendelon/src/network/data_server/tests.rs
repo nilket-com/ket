@@ -14741,16 +14741,22 @@ async fn adr0579_row_limit_bounds_producer_work_to_exactly_the_limit() {
 	.await
 	.unwrap();
 	assert_eq!(full.response.status, ReadStatus::OK);
-	// A progress mark is "a location processed or a batch produced", so it is a fixed
-	// multiple of rows on this path rather than one per row. Deriving that multiple from
-	// the full scan keeps the bounded assertion below an exact equality on producer work.
-	let marks_per_row = full.clocks.progress_marks / SOURCE_ROWS as u64;
-	assert!(marks_per_row > 0, "the counter must advance with the scan");
-	assert_eq!(
-		full.clocks.progress_marks,
-		marks_per_row * SOURCE_ROWS as u64,
-		"progress marks must be a whole multiple of source rows for the ratio below to be exact"
+	// ADR 0089 changed the exactness instrument: progress marks are no longer a
+	// whole multiple of rows, because rows of one packed record share per-record
+	// work. The per-request decode audit IS row-exact producer work now: the
+	// append-only fixture packs sequential records, so a scan of N rows decodes
+	// exactly the records containing them.
+	let full_decodes = full.scan_decode_audit.distinct_records_decoded;
+	assert!(
+		full_decodes > 0 && full_decodes < SOURCE_ROWS as u64,
+		"premise: the source is genuinely packed ({full_decodes} records for {SOURCE_ROWS} rows)"
 	);
+	assert_eq!(
+		SOURCE_ROWS as u64 % full_decodes,
+		0,
+		"premise: uniform records, so decode counts divide exactly"
+	);
+	let rows_per_record = SOURCE_ROWS as u64 / full_decodes;
 
 	let limited = plan_query_execution_for_ranges_with_program(
 		&mgr,
@@ -14770,11 +14776,15 @@ async fn adr0579_row_limit_bounds_producer_work_to_exactly_the_limit() {
 	assert_eq!(limited.response.status, ReadStatus::OK);
 	assert_eq!(limited.response.rows, LIMIT as u64);
 	assert_eq!(
-		limited.clocks.progress_marks,
-		marks_per_row * LIMIT as u64,
+		limited.scan_decode_audit.distinct_records_decoded,
+		(LIMIT as u64).div_ceil(rows_per_record),
 		"a bounded read must stop at the limit, not at the next response quantum \
-		 (rounding to the quantum would report {})",
-		marks_per_row * TABLE_QUERY_RESPONSE_TARGET_ROWS as u64
+		 (rounding to the quantum would decode {})",
+		(TABLE_QUERY_RESPONSE_TARGET_ROWS as u64).div_ceil(rows_per_record)
+	);
+	assert!(
+		limited.clocks.progress_marks < full.clocks.progress_marks,
+		"bounded producer work stays under the full scan's"
 	);
 }
 
@@ -16258,4 +16268,122 @@ async fn adr0090_segment_decoded_locations_resolve_placement_from_the_chain() {
 	.expect("a partitioned row behind a reloaded segment must serve, not refuse")
 	.expect("the row materializes");
 	assert_eq!(read.batch.num_rows(), 1);
+}
+
+/// ADR 0089: the decisive control — one read and one decode per DISTINCT
+/// physical record. Locations examined stay equal to rows by design (the index
+/// is row-granular), so counting them would show nothing; the audit counts
+/// decodes, which packing plus coalescing amortize to ceil(rows / target).
+mod adr0089_scan_coalescing {
+	use super::*;
+
+	async fn packed_scan(rows: usize, row_limit: Option<usize>) -> (QueryExecutionPlan, usize) {
+		let mgr = make_manager().await;
+		let descriptor = append_only_table_descriptor();
+		append_append_only_rows_for_query(
+			&mgr,
+			&descriptor,
+			(1..=rows as i64).collect(),
+			hlc(10, 0, 1),
+		)
+		.await;
+		let program = pbc::Program::compile(&[]).unwrap();
+		let mut meta = base_meta();
+		meta.as_of_hlc = hlc(99, 0, 1);
+		let ranges = [QueryScanRange {
+			start: Locality::ZERO,
+			end: Locality::MAX,
+		}];
+		let plan = plan_query_execution_for_ranges_with_program(
+			&mgr,
+			n(1),
+			&meta,
+			&program,
+			&ranges,
+			QueryExecutionBudget::default(),
+			row_limit,
+			Some(&descriptor),
+			QueryProjectedExecution::Disabled,
+			RowIdentityProjection::None,
+			None,
+		)
+		.await
+		.unwrap();
+		(plan, rows)
+	}
+
+	#[tokio::test]
+	async fn adr0089_one_decode_per_distinct_record() {
+		// append-only test layout: target_rows = 4, max_rows = 8. Ten rows in a
+		// shared partition pack to ceil-shaped records; the scan must decode
+		// each record exactly once while emitting every row.
+		let (plan, rows) = packed_scan(10, None).await;
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		let emitted: usize = plan.batches.iter().map(|batch| batch.num_rows()).sum();
+		assert_eq!(emitted, rows, "every row is emitted exactly once");
+
+		let audit = plan.scan_decode_audit;
+		let locations = plan.clocks.progress_marks;
+		assert!(
+			audit.distinct_records_decoded < rows as u64,
+			"packing must beat one record per row: {} decodes for {rows} rows",
+			audit.distinct_records_decoded
+		);
+		assert_eq!(
+			audit.distinct_records_decoded + audit.coalesced_hits,
+			rows as u64,
+			"every row resolves through exactly one decode or one hit"
+		);
+		// The spread splits rows across at most `spread_factor` partitions
+		// (4 by default); with target 4 the record count is bounded by the
+		// per-partition ceilings.
+		assert!(
+			audit.distinct_records_decoded <= 8,
+			"10 rows across <=4 partitions at target 4 cannot need more than 8 \
+			 records: {audit:?}"
+		);
+		assert!(
+			locations >= rows as u64,
+			"the index stays row-granular: locations tracked per row"
+		);
+	}
+
+	#[tokio::test]
+	async fn adr0089_bounded_cache_and_order_survive_large_scans() {
+		let (plan, rows) = packed_scan(200, None).await;
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		let audit = plan.scan_decode_audit;
+		assert!(
+			audit.max_resident_records <= 8,
+			"the decoded-record cache is bounded: {audit:?}"
+		);
+		assert_eq!(
+			audit.distinct_records_decoded + audit.coalesced_hits,
+			rows as u64
+		);
+		// Order: the emitted ids are exactly the written set; index order is
+		// ascending locality, so re-sorting by value must be a permutation.
+		let mut seen = Vec::new();
+		for batch in &plan.batches {
+			let ids = batch
+				.column_by_name("id")
+				.and_then(|array| array.as_any().downcast_ref::<Int64Array>())
+				.expect("scan output carries the id column");
+			seen.extend(ids.iter().map(|value| value.expect("id non-null")));
+		}
+		seen.sort_unstable();
+		assert_eq!(seen, (1..=rows as i64).collect::<Vec<_>>());
+	}
+
+	#[tokio::test]
+	async fn adr0089_limits_still_bound_rows_not_records() {
+		let (plan, _) = packed_scan(10, Some(3)).await;
+		assert_eq!(plan.response.status, ReadStatus::OK);
+		assert_eq!(
+			plan.response.rows, 3,
+			"the limit's row semantics are untouched"
+		);
+		let emitted: usize = plan.batches.iter().map(|batch| batch.num_rows()).sum();
+		assert_eq!(emitted, 3);
+	}
 }

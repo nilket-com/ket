@@ -230,28 +230,48 @@ pub fn pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_la
 	// paths can verify table-isolation by byte-compare against the
 	// stored column instead of re-deriving identity.
 	let stamped_table_object_id = Some(descriptor.table_object_id);
-	let mut buckets: BTreeMap<Locality, Vec<MultiRowSourceRow>> = BTreeMap::new();
+	// ADR 0089: packing groups on the DURABLE partition — the id derived once at
+	// this boundary and carried on the row — never on an independently
+	// recomputed prefix. Rows sharing a partition share one owner in every
+	// epoch (ADR 0090), so a shared record never spans owners. A row without a
+	// partition keeps its full locality as the bucket key: legacy rows stay one
+	// record per locality, exactly as before this record.
+	#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+	enum PackBucket {
+		Partition(PartitionId),
+		RawLocality(Locality),
+	}
+	let mut buckets: BTreeMap<PackBucket, Vec<MultiRowSourceRow>> = BTreeMap::new();
 	for (row, locality) in admission.localities.iter().copied().enumerate() {
-		buckets
-			.entry(locality)
-			.or_default()
-			.push(MultiRowSourceRow {
-				source_row_index: row,
-				key_identity: admission.key_identities[row],
-				routing_locality: locality,
-				row_hlc,
-				is_tombstone: false,
-				partition: write_partition_for_row(descriptor, locality)
-					.map_err(table_pack_io_error)?,
-				table_object_id: stamped_table_object_id,
-			});
+		let partition =
+			write_partition_for_row(descriptor, locality).map_err(table_pack_io_error)?;
+		let bucket = match partition {
+			Some(partition) => PackBucket::Partition(partition),
+			None => PackBucket::RawLocality(locality),
+		};
+		buckets.entry(bucket).or_default().push(MultiRowSourceRow {
+			source_row_index: row,
+			key_identity: admission.key_identities[row],
+			routing_locality: locality,
+			row_hlc,
+			is_tombstone: false,
+			partition,
+			table_object_id: stamped_table_object_id,
+		});
 	}
 
 	let target_rows = layout.target_rows.get().max(1) as usize;
 	let max_rows = layout.max_rows.get().max(1) as usize;
 	let max_record_bytes = layout.max_record_bytes.get();
 	let mut packed = Vec::new();
-	for (locality, mut rows) in buckets {
+	for (bucket, mut rows) in buckets {
+		// ADR 0089: a partition-grouped record's stored locality is its prefix;
+		// each row keeps its own full routing locality in the frame and in its
+		// index entry, so interval membership stays row-exact.
+		let locality = match bucket {
+			PackBucket::Partition(partition) => Locality::new(partition.get()),
+			PackBucket::RawLocality(locality) => locality,
+		};
 		rows.sort_by_key(|row| multirow_sort_key(*row));
 		let mut cursor = 0;
 		while cursor < rows.len() {
@@ -2578,4 +2598,129 @@ pub(crate) fn write_partition_for_row(
 		return Ok(None);
 	};
 	Ok(Some(partition_for_locality(routing_locality, prefix_bits)?))
+}
+
+/// ADR 0089: the bucket packer groups on the durable partition, so rows of one
+/// partition share records at the layout's target instead of one record per
+/// row. Legacy (identity-locality) rows keep their old one-record-per-locality
+/// shape.
+#[cfg(test)]
+mod adr0089_partition_keyed_packing {
+	use super::*;
+	use crate::schema::TenantId;
+	use crate::schema::table::{
+		LocalityPolicy, PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy,
+		TableSpreadLocalityDescriptor, encode_table_write_row_count,
+	};
+	use arrow::array::Int64Array;
+
+	fn descriptor_with_spread() -> TableSchemaDescriptor {
+		let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+		let mut descriptor = TableSchemaDescriptor::new(
+			TableObjectId::new([0x59; 16]),
+			1,
+			"analytics",
+			"packed_events",
+			&schema,
+			RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+			LocalityPolicy::TableSpreadProjection(TableSpreadLocalityDescriptor {
+				spread_factor: 1,
+				prefix_bits: 1,
+			}),
+			SchemaEvolutionPolicy::AdditiveOnly,
+		)
+		.unwrap();
+		descriptor.record_layout_policy =
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::new(4, 8, 1024 * 1024).unwrap());
+		descriptor.record_body_compression_policy =
+			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+		descriptor
+	}
+
+	fn meta(descriptor: &TableSchemaDescriptor, rows: usize) -> TableWriteRequestMeta {
+		let mut meta: TableWriteRequestMeta = bytemuck::Zeroable::zeroed();
+		meta.tenant_id = TenantId::new(7);
+		meta.table_object_id = descriptor.table_object_id;
+		meta.schema_generation = descriptor.schema_generation;
+		meta.row_count = encode_table_write_row_count(rows).unwrap();
+		meta.client_hlc = HybridTimestamp {
+			physical_ms: 10,
+			logical: 0,
+			node_id: 1,
+		};
+		meta
+	}
+
+	fn batch(values: Vec<i64>) -> RecordBatch {
+		RecordBatch::try_new(
+			Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+			vec![Arc::new(Int64Array::from(values))],
+		)
+		.unwrap()
+	}
+
+	#[test]
+	fn adr0089_rows_of_one_partition_pack_to_the_target() {
+		let descriptor = descriptor_with_spread();
+		let batch = batch((1..=10).collect());
+		let meta = meta(&descriptor, batch.num_rows());
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.expect("pack partitioned rows");
+
+		// Premise: the descriptor really produces partitioned rows.
+		let total_rows: usize = packed
+			.iter()
+			.map(|record| record.source_row_indices.len())
+			.sum();
+		assert_eq!(total_rows, 10, "every row packs");
+		assert!(
+			packed.iter().all(|record| record.partition.is_some()),
+			"premise: every record is partitioned"
+		);
+
+		// Rows grouped per partition at target_rows (4 for the test layout):
+		// with spread_factor 1 every row shares one partition, so 10 rows pack
+		// to ceil(10/4) = 3 records, not 10.
+		let partitions: std::collections::BTreeSet<_> =
+			packed.iter().map(|record| record.partition).collect();
+		if partitions.len() == 1 {
+			assert_eq!(
+				packed.len(),
+				3,
+				"one partition, target 4: ceil(10/4) records"
+			);
+		} else {
+			// Spread landed rows in several partitions; the invariant is then
+			// per partition.
+			for partition in &partitions {
+				let records: Vec<_> = packed
+					.iter()
+					.filter(|record| record.partition == *partition)
+					.collect();
+				let rows: usize = records
+					.iter()
+					.map(|record| record.source_row_indices.len())
+					.sum();
+				assert_eq!(records.len(), rows.div_ceil(4));
+			}
+			assert!(
+				packed.len() < 10,
+				"grouping must beat one record per row: {} records",
+				packed.len()
+			);
+		}
+		for record in &packed {
+			// The record's stored locality is its partition prefix; every row's
+			// own locality stays inside the partition span.
+			let partition = record.partition.expect("asserted above");
+			assert_eq!(record.locality.get(), partition.get());
+		}
+	}
 }

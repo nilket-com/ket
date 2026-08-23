@@ -10311,6 +10311,75 @@ struct QueryExecutionPlan {
 	secondary_index_access_plan: Option<SecondaryIndexAccessPlan>,
 	row_group_fetch_audit: RowGroupFetchAuditCounters,
 	encoding_materialize_audit: Vec<EncodingMaterializeAuditSample>,
+	scan_decode_audit: ScanDecodeAudit,
+}
+
+/// ADR 0089: per-request accounting for the whole-record scan's physical
+/// reads. Rows of one packed record share a read and a decode, so the audit
+/// counts distinct physical records — the amortization the packing exists to
+/// buy — and the cache's high-water mark, so bounded memory is checkable.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ScanDecodeAudit {
+	distinct_records_decoded: u64,
+	coalesced_hits: u64,
+	max_resident_records: u64,
+}
+
+/// ADR 0089: the scan's bounded cache of decoded records. Locality-index
+/// entries for one packed record interleave with other records sharing the
+/// prefix, so a single-slot cache would thrash; a small bounded set is kept and
+/// the oldest entry evicted. A scan's memory must never grow with its size.
+const SCAN_DECODED_CACHE_MAX_RECORDS: usize = 8;
+const SCAN_DECODED_CACHE_MAX_BYTES: usize = 32 << 20;
+
+struct DecodedRecordCache {
+	entries: Vec<((SlabId, u64), Arc<RecordBatch>, usize)>,
+	resident_bytes: usize,
+	audit: ScanDecodeAudit,
+}
+
+impl DecodedRecordCache {
+	fn new() -> Self {
+		Self {
+			entries: Vec::new(),
+			resident_bytes: 0,
+			audit: ScanDecodeAudit::default(),
+		}
+	}
+
+	fn get(&mut self, location: RecordLocation) -> Option<Arc<RecordBatch>> {
+		let key = (location.slab_id, location.offset);
+		let hit = self
+			.entries
+			.iter()
+			.find(|(entry_key, _, _)| *entry_key == key)
+			.map(|(_, batch, _)| Arc::clone(batch));
+		if hit.is_some() {
+			self.audit.coalesced_hits = self.audit.coalesced_hits.saturating_add(1);
+		}
+		hit
+	}
+
+	fn insert(&mut self, location: RecordLocation, batch: Arc<RecordBatch>) {
+		self.audit.distinct_records_decoded = self.audit.distinct_records_decoded.saturating_add(1);
+		let bytes = batch.get_array_memory_size();
+		self.entries
+			.push(((location.slab_id, location.offset), batch, bytes));
+		self.resident_bytes = self.resident_bytes.saturating_add(bytes);
+		while self.entries.len() > SCAN_DECODED_CACHE_MAX_RECORDS
+			|| self.resident_bytes > SCAN_DECODED_CACHE_MAX_BYTES
+		{
+			if self.entries.len() <= 1 {
+				break;
+			}
+			let (_, _, evicted) = self.entries.remove(0);
+			self.resident_bytes = self.resident_bytes.saturating_sub(evicted);
+		}
+		self.audit.max_resident_records = self
+			.audit
+			.max_resident_records
+			.max(self.entries.len() as u64);
+	}
 }
 
 /// ADR 0088: how many rows a table-query response batch targets. `SingleRow`
@@ -12251,6 +12320,7 @@ async fn plan_table_query_execution_by_secondary_index(
 		secondary_index_access_plan: Some(access_plan.clone()),
 		row_group_fetch_audit,
 		encoding_materialize_audit,
+		scan_decode_audit: ScanDecodeAudit::default(),
 	})
 }
 
@@ -12772,6 +12842,8 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	let mut batches = Vec::new();
 	// ADR 0088: rows coalesce here instead of one frame per location.
 	let mut response_batches = TableQueryResponseAccumulator::default();
+	// ADR 0089: rows of one packed record share a single read and decode.
+	let mut decoded_records = DecodedRecordCache::new();
 	let mut aggregate_responses = Vec::new();
 	let mut rows = 0u64;
 	let mut scanned_locations = 0usize;
@@ -13036,19 +13108,40 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					));
 				}
 			}
-			let bytes = match clocks.bound(slab.read(location)).await {
-				Ok(bytes) => bytes?,
-				Err(expired) => return Ok(query_plan_error(meta, expired, local_node)),
+			// ADR 0089: entries of one packed record resolve to one physical
+			// record; read and decode it once and serve every row from that
+			// decode. Selection, order, limits, and cancellation stay
+			// per-entry — only the physical read is coalesced.
+			let (storage_batch, freshly_decoded) = match decoded_records.get(location) {
+				Some(batch) => (batch, false),
+				None => {
+					let bytes = match clocks.bound(slab.read(location)).await {
+						Ok(bytes) => bytes?,
+						Err(expired) => {
+							return Ok(query_plan_error(meta, expired, local_node));
+						}
+					};
+					let decode_started = Instant::now();
+					let batch = Arc::new(decode_batch(&bytes)?);
+					if has_storage_synthetic_columns(&batch) {
+						metrics().observe_storage_multirow_decode(
+							batch.num_rows() as u64,
+							bytes.len() as u64,
+							decode_started.elapsed(),
+						);
+					}
+					decoded_records.insert(location, Arc::clone(&batch));
+					(batch, true)
+				}
 			};
-			let decode_started = Instant::now();
-			let storage_batch = decode_batch(&bytes)?;
+			let storage_batch = &*storage_batch;
 			// ADR 0090: the frame is independent placement evidence, and placement is
 			// never resolved from the index alone — the index entry and the frame must
 			// agree at this row before it is served.
 			resolve_record_placement(
 				location.placement,
 				location.partition,
-				&storage_batch,
+				storage_batch,
 				location.record_row_index,
 			)?;
 			let storage_row_count = storage_batch.num_rows();
@@ -13065,17 +13158,13 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			} else {
 				Vec::new()
 			};
-			if was_multirow {
-				metrics().observe_storage_multirow_decode(
-					batch.num_rows() as u64,
-					bytes.len() as u64,
-					decode_started.elapsed(),
-				);
-				if storage_row_count <= 1 {
-					metrics()
-						.storage_multirow_uncompacted_row_records_total
-						.inc();
-				}
+			// ADR 0089: the decode metric moved to the cache-miss arm — it counts
+			// decodes, and rows of one record now share a decode. The
+			// uncompacted counter stays per record observation.
+			if was_multirow && freshly_decoded && storage_row_count <= 1 {
+				metrics()
+					.storage_multirow_uncompacted_row_records_total
+					.inc();
 			}
 			// An oversize location terminates only a caller-capped query; with server
 			// defaults it is one large unit of bounded work, not a failure.
@@ -13319,6 +13408,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 		secondary_index_access_plan: None,
 		row_group_fetch_audit,
 		encoding_materialize_audit,
+		scan_decode_audit: decoded_records.audit,
 	})
 }
 
@@ -13490,6 +13580,7 @@ fn query_plan_error(
 		aggregate_responses: Vec::new(),
 		clocks: QueryClocks::new(Duration::from_millis(250), None),
 		stats_explain: QueryStatsExplainCounters::default(),
+		scan_decode_audit: ScanDecodeAudit::default(),
 		secondary_index_access_plan: None,
 		row_group_fetch_audit: RowGroupFetchAuditCounters::default(),
 		encoding_materialize_audit: Vec::new(),

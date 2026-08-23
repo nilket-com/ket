@@ -8933,16 +8933,17 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// tombstone placement arm, and placement-keyed fan-out; the transfer slice
 /// added the transfer-aware serving consultation at primacy and fan-out; the
 /// secondary-index read resolves placement from the key chain, since the V1
-/// segment format carries none. All are read/write-path enforcement with the
-/// same claim to this root.
+/// segment format carries none; ADR 0089 added the bounded decoded-record
+/// cache and its per-request audit beside the scan loop it serves. All are
+/// read/write-path enforcement with the same claim to this root.
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 15_630,
-		"data_server.rs root is {lines} lines (cap 15_630); carve more or justify a deliberate cap bump"
+		lines <= 15_720,
+		"data_server.rs root is {lines} lines (cap 15_720); carve more or justify a deliberate cap bump"
 	);
 }
 
@@ -9359,9 +9360,15 @@ fn adr0090_placement_is_resolved_centrally_never_from_the_index_alone() {
 	//    built, so the count is of read-side `decode_batch(&bytes)` sites; each
 	//    must have a resolver call, and the KV read path has its own.
 	let data_server = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	// ADR 0089 moved the scan loop's decode inside its coalescing cache-miss
+	// arm, where the decoded record is shared across the rows that reference
+	// it; both spellings are read-side decodes and both must resolve placement.
 	let read_decodes = data_server
 		.matches("let storage_batch = decode_batch(&bytes)?;")
-		.count();
+		.count()
+		+ data_server
+			.matches("let batch = Arc::new(decode_batch(&bytes)?);")
+			.count();
 	let kv_decodes = data_server
 		.matches("let stored = decode_batch(&bytes)?;")
 		.count();
