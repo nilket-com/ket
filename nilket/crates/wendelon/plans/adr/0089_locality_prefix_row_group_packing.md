@@ -244,3 +244,40 @@ roughly the rows-per-record factor, the scan-cost arc that began with the
 scatter-threshold slice is closed and the ~29,000-row statement-timeout ceiling
 moves with it. Then split read from decrypt, which will be the largest remaining
 per-record cost.
+
+## Measured
+
+2026-08-23, optiplex, live daemon, binary `c2a23d7f72bc9adb` at `9e773b28`,
+warmup + cold restart + two measured passes, all stable.
+
+Both migration states were measured separately: `ctrl_plain` (rows written
+before ADR 0090, raw-locality records, no placement stamps) and `ctrl_packed`
+(fresh `CREATE TABLE AS` through the partitioned write path). The per-request
+scan-decode audit pinned the premise first: 13,000 rows resolve to
+`distinct_records = 4` — the per-partition `ceil(rows / 4096)` — with
+`decodes + hits == rows` at every rung and `max_resident <= 4`.
+
+| rows | pre-0089 baseline | + 0579 only | `ctrl_plain` | `ctrl_packed` |
+|---|---|---|---|---|
+| 2,000 | 8.84 / 8.88 s | 4.27 / 4.30 s | 0.06–0.07 s | 0.04–0.05 s |
+| 5,000 | 17.66 / 17.88 s | 10.84 / 10.72 s | 0.08–0.09 s | 0.08 s |
+| 13,000 | 26.93 / 27.05 s | ~27.1 s | 0.18 s | 0.16–0.17 s |
+
+The headline result: **13,000 rows in ~0.18 seconds** (~76,000 rows/s against
+the ~481 rows/s baseline). The 2k/5k rungs combine ADR 0579's limit push-down
+with this cut (1 and 2 records decoded respectively — producer work bounded to
+exactly the limit); the 13k rung is the pure full-scan comparison.
+
+The audit also settled the migration-state question in an unexpected direction:
+`ctrl_plain` shows the identical audit shape. Its rows already lived in four
+shared physical records — append-only batch locality packed them at write time
+— so the historic per-row cost was the scan re-reading and re-decoding the same
+record once per row, exactly the 57% read+decrypt / 41% decode phase profile.
+On this fixture the entire win is the read-side coalescing; compaction-driven
+migration contributed nothing, and the two states legitimately converge. The
+write-side packing delta remains unmeasured and needs a fixture whose writes
+genuinely produce one-row records.
+
+The ~29,000-row statement-timeout ceiling no longer binds at this rate; the
+implied ~4.5M-row figure is a projection, not a demonstrated ceiling, until a
+larger-cardinality run confirms the scaling.
