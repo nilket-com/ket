@@ -981,6 +981,7 @@ fn execution_error_class(error: &ExecutionError) -> &'static str {
 fn storage_error_class(error: &StorageError) -> &'static str {
 	match error {
 		StorageError::TableNotFound { .. } => "table_not_found",
+		StorageError::TableAlreadyDropped { .. } => "table_already_dropped",
 		StorageError::DescriptorEvolved { .. } => "descriptor_evolved",
 		StorageError::Cancelled => "cancelled",
 		StorageError::ReadBoundUnavailable { .. } => "read_bound_unavailable",

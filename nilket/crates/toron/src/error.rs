@@ -33,6 +33,8 @@ impl std::fmt::Display for BudgetExhaustedDetail {
 pub enum StorageError {
 	#[error("table not found: {table:?}")]
 	TableNotFound { table: TableId },
+	#[error("table was already dropped by a different durable operation: {table:?}")]
+	TableAlreadyDropped { table: TableId },
 	#[error("descriptor evolved for {table_id:?} during query planning/execution")]
 	DescriptorEvolved { table_id: TableId },
 	#[error("storage operation cancelled")]

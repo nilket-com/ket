@@ -9424,3 +9424,130 @@ fn adr0092_versioned_body_shadows_are_replay_only() {
 		"the ADR 0092 shadow modules leaked outside the replay dispatch: {offenders:?}"
 	);
 }
+
+/// ADR 0093: every production QUIC endpoint inherits one Wendelon liveness
+/// policy. A constructor outside `network/tls.rs` would silently regain
+/// Quinn's 30-second idle default.
+#[test]
+fn adr0093_quic_config_construction_is_confined_to_the_tls_choke_point() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let mut constructors = Vec::new();
+	walk_dir(&manifest_dir.join("src"), &mut |path| {
+		if path.extension().is_none_or(|ext| ext != "rs") {
+			return;
+		}
+		let source = fs::read_to_string(path).unwrap();
+		for (line_number, line) in source.lines().enumerate() {
+			if line.contains("quinn::ServerConfig::") || line.contains("quinn::ClientConfig::") {
+				constructors.push((
+					path.strip_prefix(manifest_dir)
+						.unwrap()
+						.to_string_lossy()
+						.replace('\\', "/"),
+					line_number + 1,
+				));
+			}
+		}
+	});
+	assert_eq!(
+		constructors.len(),
+		2,
+		"the guarded Quinn constructor census changed"
+	);
+	assert!(
+		constructors
+			.iter()
+			.all(|(path, _)| path == "src/network/tls.rs"),
+		"all Quinn config construction must stay behind Wendelon's shared TLS builders: {constructors:?}"
+	);
+	let tls = fs::read_to_string(manifest_dir.join("src/network/tls.rs")).unwrap();
+	assert_eq!(
+		tls.matches("transport_config(wendelon_quic_transport_config())")
+			.count(),
+		2
+	);
+}
+
+/// ADR 0093 exercises ADR 0092's versioning mechanism: v2 stays immutable,
+/// v3 is current, and both byte fixtures remain in the guarded corpus.
+#[test]
+fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let core = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
+	let v2 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v2.txt"))
+		.unwrap();
+	let v3 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v3.txt"))
+		.unwrap();
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 3;"));
+	for required in [
+		"snapshot_body::v2::decode_state",
+		"SNAPSHOT_V2_MANIFEST",
+		"SNAPSHOT_V3_MANIFEST",
+		"adr0093_snapshot_v2_fixture_is_frozen_and_upconverts_without_outcomes",
+		"adr0093_snapshot_v3_active_saga_and_drop_outcome_match_stored_golden",
+	] {
+		assert!(
+			raft.contains(required),
+			"snapshot corpus is missing {required}"
+		);
+	}
+	assert!(v2.contains("smstate_active_saga="));
+	assert!(v3.contains("smstate_active_saga_and_drop_outcome="));
+	assert_ne!(
+		v2, v3,
+		"outgoing and current snapshot fixtures must be distinct"
+	);
+}
+
+/// ADR 0093 acceptance hooks exist only in tests or an explicitly requested
+/// non-default feature. Default production builds cannot arm them.
+#[test]
+fn adr0093_test_support_is_non_default_and_every_hook_site_is_gated() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let manifest = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
+	let parsed: toml::Value = toml::from_str(&manifest).unwrap();
+	let features = parsed["features"].as_table().unwrap();
+	assert!(features.contains_key("test-support"));
+	let defaults = features["default"].as_array().unwrap();
+	assert!(
+		!defaults
+			.iter()
+			.any(|feature| feature.as_str() == Some("test-support")),
+		"test-support must never enter Wendelon's default feature set"
+	);
+	let toron_manifest = read_workspace("crates/toron/Cargo.toml");
+	let toron: toml::Value = toml::from_str(&toron_manifest).unwrap();
+	let toron_features = toron["features"].as_table().unwrap();
+	assert_eq!(
+		toron_features["test-support"].as_array().unwrap(),
+		&vec![toml::Value::String("wendelon/test-support".to_string())],
+		"Toron's non-default acceptance feature forwards only Wendelon test support"
+	);
+	assert!(
+		!toron_features["default"]
+			.as_array()
+			.unwrap()
+			.iter()
+			.any(|feature| feature.as_str() == Some("test-support"))
+	);
+
+	let control = fs::read_to_string(manifest_dir.join("src/network/control_server.rs")).unwrap();
+	assert!(
+		control.contains(
+			"#[cfg(any(test, feature = \"test-support\"))]\npub mod adr0093_test_support"
+		)
+	);
+	for gated_site in [
+		"#[cfg(any(test, feature = \"test-support\"))]\n\t\tlet table_object_id",
+		"#[cfg(any(test, feature = \"test-support\"))]\n\t\t\t\tif adr0093_test_support::take_sever_response",
+		"#[cfg(any(test, feature = \"test-support\"))]\n\t\tif let Some(delay) = adr0093_test_support::take_reclaim_delay",
+	] {
+		assert!(
+			control.contains(gated_site),
+			"ungated or moved hook seam: {gated_site}"
+		);
+	}
+	assert_eq!(control.matches("take_sever_response(").count(), 2);
+	assert_eq!(control.matches("take_reclaim_delay(").count(), 2);
+}

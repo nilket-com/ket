@@ -1134,6 +1134,202 @@ async fn toron_sql_complete_frame_carries_stable_row_count() {
 	fixture.shutdown();
 }
 
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr0093_severed_drop_response_recovers_across_a_fresh_toron_run() {
+	let fixture = LiveWendelonFixture::start(1593).await;
+	let descriptor = descriptor_with_object_id([0xA2; 16]);
+	let table_object_id = descriptor.table_object_id;
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+		toron_config_with_descriptor(descriptor.clone(), true),
+		Arc::clone(&fixture.client),
+	)
+	.await
+	.expect("start first Toron run");
+	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
+	execute_sql(
+		endpoint,
+		"CREATE TABLE adr0093_drop_source AS \
+		 SELECT id, amount, region, ts FROM storage_execution",
+	)
+	.await
+	.expect("create a durable source for same-name rematerialization");
+
+	let _sever = wendelon::network::adr0093_test_support::sever_next_drop_response(table_object_id);
+	let first = execute_sql(endpoint, "DROP TABLE storage_execution")
+		.await
+		.expect_err("the first public DROP must observe the severed storage response");
+	assert_eq!(
+		first.code,
+		SqlErrorCode::StorageError,
+		"the lost storage response reaches the public SQL boundary as a storage failure"
+	);
+
+	let operation_id = wendelon_client::DropOperationId {
+		tenant_id: LIVE_TENANT,
+		table_object_id,
+		schema_generation: wendelon_client::SchemaGeneration::new(descriptor.schema_generation),
+	};
+	let remote = fixture.node.state_machine.state_snapshot().await;
+	assert_eq!(
+		remote
+			.table_drop_outcomes
+			.get(LIVE_TENANT, table_object_id)
+			.map(|outcome| outcome.operation_id),
+		Some(operation_id),
+		"the response is severed only after durable remote finalize"
+	);
+	assert!(
+		remote
+			.table_drop_fences
+			.get(LIVE_TENANT, table_object_id)
+			.is_none(),
+		"finalize consumed the in-flight fence"
+	);
+
+	let foreign_operation = wendelon_client::DropOperationId {
+		schema_generation: wendelon_client::SchemaGeneration::new(descriptor.schema_generation + 1),
+		..operation_id
+	};
+	let foreign = fixture
+		.client
+		.drop_table_schema(wendelon_client::TableSchemaDropRequest::current(
+			wendelon_client::TableSchemaDropFields {
+				tenant_id: LIVE_TENANT,
+				table_object_id,
+				expected_generation: foreign_operation.schema_generation,
+				operation_id: foreign_operation,
+			},
+		))
+		.await
+		.expect_err("a foreign operation must not consume another DROP outcome");
+	assert!(matches!(
+		foreign,
+		wendelon_client::ClientError::Admin(
+			wendelon_client::WendelonAdminError::TableAlreadyDropped {
+				table_object_id: observed,
+			}
+		) if observed == table_object_id
+	));
+
+	// The originating incident crossed process runs. Rebuild Toron's registry
+	// from its persisted bootstrap while Wendelon's finalized outcome remains.
+	daemon.shutdown().await.expect("shutdown first Toron run");
+	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+		toron_config_with_descriptor(descriptor, true),
+		Arc::clone(&fixture.client),
+	)
+	.await
+	.expect("start recovery Toron run");
+	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
+	execute_sql(endpoint, "DROP TABLE storage_execution")
+		.await
+		.expect("same-operation retry consumes the durable completion evidence");
+	execute_sql(
+		endpoint,
+		"CREATE TABLE storage_execution AS \
+		 SELECT id, amount, region, ts FROM adr0093_drop_source",
+	)
+	.await
+	.expect("materialize the same name after recovery");
+	let read_back = execute_sql(
+		endpoint,
+		"SELECT id, amount, region, ts FROM storage_execution",
+	)
+	.await
+	.expect("the recovered same-name materialization is immediately readable");
+	assert_eq!(read_back.complete.row_count, 4);
+	assert_eq!(projected_rows(&read_back.batches).len(), 4);
+
+	daemon
+		.shutdown()
+		.await
+		.expect("shutdown recovery Toron run");
+	fixture.shutdown();
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr0093_pre_recovery_materialization_is_readable_after_registry_rebuild() {
+	let fixture = LiveWendelonFixture::start(1594).await;
+	let descriptor = descriptor_with_object_id([0xA3; 16]);
+	let table_object_id = descriptor.table_object_id;
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+		toron_config_with_descriptor(descriptor.clone(), true),
+		Arc::clone(&fixture.client),
+	)
+	.await
+	.expect("start incident Toron run");
+	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
+	execute_sql(
+		endpoint,
+		"CREATE TABLE adr0093_shadow_source AS \
+		 SELECT id, amount, region, ts FROM storage_execution",
+	)
+	.await
+	.expect("create durable materialization source");
+	let _sever = wendelon::network::adr0093_test_support::sever_next_drop_response(table_object_id);
+	let error = execute_sql(endpoint, "DROP TABLE storage_execution")
+		.await
+		.expect_err("the response-loss premise must hold");
+	assert_eq!(error.code, SqlErrorCode::StorageError);
+	assert!(
+		fixture
+			.node
+			.state_machine
+			.state_snapshot()
+			.await
+			.table_drop_outcomes
+			.get(LIVE_TENANT, table_object_id)
+			.is_some(),
+		"the remote DROP finalized before the response was lost"
+	);
+	daemon
+		.shutdown()
+		.await
+		.expect("shutdown incident Toron run");
+
+	// No stale descriptor bootstrap: this is a fresh coordinator/registry
+	// rebuilt lazily from persisted Wendelon state, matching the multi-run viz
+	// incident rather than a warm same-process TableAlreadyExists result.
+	let mut recovery_config = toron_config_with_descriptor(descriptor, true);
+	recovery_config.catalog.descriptor_bootstrap_path = None;
+	let daemon = ToronDaemon::start_with_wendelon_client_for_harness(
+		recovery_config,
+		Arc::clone(&fixture.client),
+	)
+	.await
+	.expect("start fresh-registry Toron run");
+	let endpoint = daemon.handle().sql_endpoint.expect("SQL endpoint");
+	execute_sql(
+		endpoint,
+		"CREATE TABLE storage_execution AS \
+		 SELECT id, amount, region, ts FROM adr0093_shadow_source",
+	)
+	.await
+	.expect("pre-recovery same-name materialization must publish");
+	let read_back = execute_sql(
+		endpoint,
+		"SELECT id, amount, region, ts FROM storage_execution",
+	)
+	.await
+	.expect("a successful pre-recovery receipt must name a readable relation");
+	assert_eq!(read_back.complete.row_count, 4);
+	assert_eq!(projected_rows(&read_back.batches).len(), 4);
+
+	daemon
+		.shutdown()
+		.await
+		.expect("shutdown fresh-registry Toron run");
+	fixture.shutdown();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn public_sql_client_resolves_a_mutation_by_id_without_replaying_it() {
 	let fixture = LiveWendelonFixture::start(542).await;
@@ -1947,9 +2143,13 @@ async fn write_rows(
 }
 
 fn descriptor() -> TableSchemaDescriptor {
+	descriptor_with_object_id([0x91; 16])
+}
+
+fn descriptor_with_object_id(object_id: [u8; 16]) -> TableSchemaDescriptor {
 	let schema = schema();
 	TableSchemaDescriptor::new(
-		TableObjectId::new([0x91; 16]),
+		TableObjectId::new(object_id),
 		1,
 		"bench",
 		"storage_execution",

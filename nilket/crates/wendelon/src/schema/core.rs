@@ -2159,7 +2159,7 @@ pub const PRE_VERSIONING_FORMAT: u8 = 0;
 /// Shape of the `postcard(SmState)` body this build writes. Version 2: ADR
 /// 0087 adds the materialization-certificate catalog to `SmState` and the
 /// certificate field to the CTAS saga entry.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 2;
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 3;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
 /// `postcard(Entry<..>)` payload of a log record. Version 2: ADR 0087 adds

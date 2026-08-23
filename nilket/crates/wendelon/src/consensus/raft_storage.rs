@@ -76,11 +76,11 @@ use crate::schema::{
 	LogEntryKind, NodeId as SchemaNodeId, PRE_VERSIONING_FORMAT, RaftLogEntryFixed,
 	RowIdentityPolicy, SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SNAPSHOT_FORMAT_VERSION,
 	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, SlabId, SnapshotHeader,
-	TableDropFenceCatalog, TableLifecycleCatalog, TableRetentionPolicy, TableSchemaCatalog,
-	TableSchemaDescriptor, TenantId, TenantKekId, WAL_FORMAT_VERSION, WALRecordHeader,
-	decode_secondary_index_descriptor, decode_secondary_index_drop_request,
-	decode_secondary_index_lifecycle_complete, decode_table_schema_descriptor_v1,
-	validate_table_schema_evolution,
+	TableDropFenceCatalog, TableDropOutcome, TableDropOutcomeCatalog, TableLifecycleCatalog,
+	TableRetentionPolicy, TableSchemaCatalog, TableSchemaDescriptor, TenantId, TenantKekId,
+	WAL_FORMAT_VERSION, WALRecordHeader, decode_secondary_index_descriptor,
+	decode_secondary_index_drop_request, decode_secondary_index_lifecycle_complete,
+	decode_table_schema_descriptor_v1, validate_table_schema_evolution,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
 use crate::storage::{
@@ -1559,6 +1559,9 @@ pub struct SmState {
 	/// Wendelon-owned DROP orchestration and data-path admission.
 	#[serde(default)]
 	pub table_drop_fences: TableDropFenceCatalog,
+	/// ADR 0093 terminal DROP outcomes. Unlike a fence, an outcome survives
+	/// finalize so a caller can recover after losing the success response.
+	pub table_drop_outcomes: TableDropOutcomeCatalog,
 	/// ADR 548 durable CTAS staged-publication saga ledger.
 	#[serde(default)]
 	pub ctas_sagas: CtasSagaCatalog,
@@ -3906,9 +3909,10 @@ fn apply_request_at_log_index(
 			apply_table_reclaim_completion(state, request, entry_log_index),
 			None,
 		),
-		WendelonRequest::TableDropFinalize(request) => {
-			(apply_table_drop_finalize(state, request), None)
-		}
+		WendelonRequest::TableDropFinalize(request) => (
+			apply_table_drop_finalize(state, request, entry_log_index),
+			None,
+		),
 		WendelonRequest::CtasSaga(mutation) => {
 			let response = match apply_ctas_saga_mutation(state, mutation) {
 				CtasSagaResponse::Applied(_) => WendelonResponse::Success,
@@ -4704,6 +4708,16 @@ fn apply_table_drop_prepare(
 			request.expected_generation().get()
 		));
 	}
+	if state
+		.table_drop_outcomes
+		.get(operation_id.tenant_id, operation_id.table_object_id)
+		.is_some()
+	{
+		return WendelonResponse::Error(format!(
+			"table {:?} is already dropped",
+			operation_id.table_object_id
+		));
+	}
 	let Some(descriptor) = state
 		.table_schemas
 		.latest_by_id(operation_id.tenant_id, operation_id.table_object_id)
@@ -4779,35 +4793,31 @@ fn apply_table_reclaim_completion(
 fn apply_table_drop_finalize(
 	state: &mut SmState,
 	request: TableDropFinalizeRequest,
+	entry_log_index: u64,
 ) -> WendelonResponse {
 	let operation_id = request.operation_id();
-	let Some(fence) = state
-		.table_drop_fences
-		.get(operation_id.tenant_id, operation_id.table_object_id)
-		.copied()
-	else {
-		return WendelonResponse::Error("table drop fence is missing".to_string());
+	let outcome = TableDropOutcome {
+		operation_id,
+		finalize_log_index: entry_log_index,
 	};
-	if fence.operation_id != operation_id {
-		return WendelonResponse::Error(format!(
-			"table is already dropping under operation_id {:?}",
-			fence.operation_id
-		));
+	if state
+		.table_drop_outcomes
+		.get(operation_id.tenant_id, operation_id.table_object_id)
+		.is_some_and(|existing| *existing == outcome)
+	{
+		return WendelonResponse::Success;
 	}
-	if fence.fence_log_index != request.fence_log_index() {
-		return WendelonResponse::Error(format!(
-			"table drop fence_log_index mismatch: expected {}, observed {}",
-			fence.fence_log_index,
-			request.fence_log_index()
-		));
+	if let Err(err) = state.table_drop_outcomes.validate_record(outcome) {
+		return WendelonResponse::Error(err.to_string());
 	}
-	if fence.reclaim_completion_log_index != Some(request.reclaim_completion_log_index()) {
-		return WendelonResponse::Error(format!(
-			"table drop reclaim_completion_log_index mismatch: expected {}, observed {}",
-			fence.reclaim_completion_log_index.unwrap_or(0),
-			request.reclaim_completion_log_index()
-		));
+	if let Err(err) = state.table_drop_fences.validate_finalize(
+		operation_id,
+		request.fence_log_index(),
+		request.reclaim_completion_log_index(),
+	) {
+		return WendelonResponse::Error(err.to_string());
 	}
+
 	let expected_generation = operation_id.schema_generation.get();
 	let already_unbound_for_ctas = state.ctas_sagas.retiring_old_binding(
 		operation_id.tenant_id,
@@ -4822,6 +4832,10 @@ fn apply_table_drop_finalize(
 		) {
 		return WendelonResponse::Error(err.to_string());
 	}
+	// Every fallible check is complete. The remaining mutations cannot reject,
+	// so a failed finalize leaves the state byte-for-byte unchanged.
+	state.table_drop_fences.remove_validated(operation_id);
+	state.table_drop_outcomes.insert_validated(outcome);
 	state
 		.table_lifecycle
 		.remove(operation_id.tenant_id, operation_id.table_object_id);
@@ -4830,17 +4844,8 @@ fn apply_table_drop_finalize(
 	state
 		.materialization_certificates
 		.remove(operation_id.tenant_id, operation_id.table_object_id);
-	match state.table_drop_fences.finalize(
-		operation_id,
-		request.fence_log_index(),
-		request.reclaim_completion_log_index(),
-	) {
-		Ok(_) => {
-			observe_table_retention_active_tables(&state.table_lifecycle);
-			WendelonResponse::Success
-		}
-		Err(err) => WendelonResponse::Error(err.to_string()),
-	}
+	observe_table_retention_active_tables(&state.table_lifecycle);
+	WendelonResponse::Success
 }
 
 fn apply_index_schema_update(
@@ -6554,6 +6559,14 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 				 this is a format mismatch, not corruption"
 			)
 		})?,
+		2 => crate::consensus::snapshot_body::v2::decode_state(&body).map_err(|err| {
+			format!(
+				"{err}; the body's digest matched, so this artifact is intact, and it \
+				 declares snapshot format version 2, which this build replays — failing \
+				 that decode means the artifact was not written at its declared version; \
+				 this is a format mismatch, not corruption"
+			)
+		})?,
 		_ => decode_snapshot_state_bytes(&body).map_err(|err| {
 			if header.format_version == PRE_VERSIONING_FORMAT {
 				format!(
@@ -7190,6 +7203,7 @@ mod schema_state_tests {
 			apply_table_drop_finalize(
 				&mut state,
 				TableDropFinalizeRequest::current(drop_id, 10, 11),
+				12,
 			),
 			WendelonResponse::Success
 		);
@@ -7433,6 +7447,7 @@ mod schema_state_tests {
 			apply_table_drop_finalize(
 				&mut state,
 				TableDropFinalizeRequest::current(drop_id, 10, 11),
+				12,
 			),
 			WendelonResponse::Success
 		);
@@ -8558,6 +8573,7 @@ mod schema_state_tests {
 			apply_table_drop_finalize(
 				&mut state,
 				TableDropFinalizeRequest::current(operation_id, 10, 11),
+				12,
 			),
 			WendelonResponse::Success
 		);
@@ -8584,6 +8600,89 @@ mod schema_state_tests {
 				.table_lifecycle
 				.get(TenantId::new(7), descriptor.table_object_id)
 				.is_none()
+		);
+		assert_eq!(
+			state
+				.table_drop_outcomes
+				.get(TenantId::new(7), descriptor.table_object_id),
+			Some(&TableDropOutcome {
+				operation_id,
+				finalize_log_index: 12,
+			})
+		);
+
+		let finalized_state = postcard::to_stdvec(&state).unwrap();
+		assert_eq!(
+			apply_table_drop_finalize(
+				&mut state,
+				TableDropFinalizeRequest::current(operation_id, 10, 11),
+				12,
+			),
+			WendelonResponse::Success,
+			"an identical finalize replay succeeds before consulting the consumed fence"
+		);
+		assert_eq!(
+			postcard::to_stdvec(&state).unwrap(),
+			finalized_state,
+			"an identical finalize replay is state-idempotent"
+		);
+	}
+
+	#[test]
+	fn adr0093_conflicting_finalize_is_rejected_without_any_state_mutation() {
+		let descriptor = table_descriptor(1);
+		let mut state = state_with_descriptor(&descriptor);
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: SchemaGeneration::new(descriptor.schema_generation),
+		};
+		assert_eq!(
+			apply_table_drop_prepare(
+				&mut state,
+				TableDropPrepareRequest::current(operation_id, operation_id.schema_generation),
+				10,
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			apply_table_reclaim_completion(
+				&mut state,
+				TableReclaimCompletionRequest::current(operation_id, 10),
+				11,
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			apply_table_drop_finalize(
+				&mut state,
+				TableDropFinalizeRequest::current(operation_id, 10, 11),
+				12,
+			),
+			WendelonResponse::Success
+		);
+
+		let before = postcard::to_stdvec(&state).unwrap();
+		let foreign_operation = DropOperationId {
+			schema_generation: SchemaGeneration::new(operation_id.schema_generation.get() + 1),
+			..operation_id
+		};
+		assert_ne!(foreign_operation, operation_id);
+		let response = apply_table_drop_finalize(
+			&mut state,
+			TableDropFinalizeRequest::current(foreign_operation, 10, 11),
+			12,
+		);
+		match response {
+			WendelonResponse::Error(message) => {
+				assert!(message.contains("outcome conflict"), "{message}");
+			}
+			other => panic!("expected conflicting finalize refusal, got {other:?}"),
+		}
+		assert_eq!(
+			postcard::to_stdvec(&state).unwrap(),
+			before,
+			"a rejected conflicting finalize leaves the entire state byte-identical"
 		);
 	}
 
@@ -12182,28 +12281,37 @@ mod tenant_kek_tests {
 		// This control's ancestor (adr0085_older_versioned_snapshot_shape_
 		// mismatch_explains_itself_too) pinned the pre-replay behavior: an
 		// intact v1 body was refused with "no migrations". ADR 0092 gave v1 a
-		// replay decoder, so the same construction — the current default body
-		// minus its trailing certificate-catalog byte, which IS the exact v1
-		// default shape — now decodes and converts.
+		// replay decoder. The body is immutable stored evidence: after ADR 0093
+		// inserted a field in the current spine, truncating the current encoder
+		// could no longer construct any faithful older shape.
 		assert!(
 			SNAPSHOT_FORMAT_VERSION > 1,
 			"this control needs a version below the current one to exist"
 		);
-		let mut bytes = snapshot_bytes_with_format_version(&SmState::default(), 1);
-		let header_len = std::mem::size_of::<SnapshotHeader>();
-		bytes.truncate(bytes.len() - 1);
-		let mut header = *bytemuck::from_bytes::<SnapshotHeader>(&bytes[..header_len]);
-		header.state_sha256 = control_artifact_digest_32(&bytes[header_len..]);
-		bytes[..header_len].copy_from_slice(bytemuck::bytes_of(&header));
+		let manifest = include_str!("../../tests/fixtures/consensus_body/snapshot_v1.txt");
+		let (_, encoded) = manifest.trim().split_once('=').unwrap();
+		let body = (0..encoded.len())
+			.step_by(2)
+			.map(|index| u8::from_str_radix(&encoded[index..index + 2], 16).unwrap())
+			.collect::<Vec<_>>();
+		let header = SnapshotHeader {
+			format_version: 1,
+			state_sha256: control_artifact_digest_32(&body),
+			..snapshot_header_template(&SmState::default())
+		};
+		let mut bytes = bytemuck::bytes_of(&header).to_vec();
+		bytes.extend_from_slice(&body);
 
 		let (header, decoded) = decode_snapshot_reader(bytes.as_slice())
 			.expect("an exact v1 body must replay, not refuse");
 		assert_eq!(header.format_version, 1);
 		assert_eq!(
-			postcard::to_stdvec(&decoded).unwrap(),
-			postcard::to_stdvec(&SmState::default()).unwrap(),
-			"an empty v1 state converts to an empty current state"
+			decoded.ctas_sagas.len(),
+			1,
+			"the active v1 saga survives replay"
 		);
+		assert!(decoded.materialization_certificates.is_empty());
+		assert!(decoded.table_drop_outcomes.is_empty());
 	}
 
 	#[test]
@@ -12262,7 +12370,8 @@ mod tenant_kek_tests {
 ///
 /// The WAL body is `postcard(Entry<WendelonTypeConfig>)` and the snapshot body
 /// is `postcard(SmState)` — positional encodings that cannot describe
-/// themselves. These controls pin the CURRENT (version 2) shape two ways: a
+/// themselves. These controls pin the CURRENT snapshot (version 3) and WAL
+/// (version 2) shapes two ways: a
 /// stored golden encoding per request variant and per changed container, and
 /// an exact-set guard over the variant lists, because an appended enum variant
 /// moves no stored bytes and only the set check can see it. Any failure here
@@ -12708,6 +12817,46 @@ mod body_format_corpus {
 		state
 	}
 
+	fn canonical_v3_sm_state() -> SmState {
+		let mut state = canonical_sm_state();
+		state
+			.table_drop_outcomes
+			.insert_validated(TableDropOutcome {
+				operation_id: DropOperationId {
+					tenant_id: TenantId::new(7),
+					table_object_id: TableObjectId::new([0xD3; 16]),
+					schema_generation: SchemaGeneration::new(3),
+				},
+				finalize_log_index: 37,
+			});
+		state
+	}
+
+	fn canonical_v2_sm_state() -> crate::consensus::snapshot_body::v2::SmState {
+		let state = canonical_sm_state();
+		crate::consensus::snapshot_body::v2::SmState {
+			last_applied_log_id: state.last_applied_log_id,
+			last_membership: state.last_membership,
+			epoch_history: state.epoch_history,
+			leases: state.leases,
+			e_safe_watermarks: state.e_safe_watermarks,
+			last_e_safe_index: state.last_e_safe_index,
+			tiered_slabs: state.tiered_slabs,
+			migrations: state.migrations,
+			tombstones: state.tombstones,
+			tenants: state.tenants,
+			tenant_keysets: state.tenant_keysets,
+			revoked_actor_keys: state.revoked_actor_keys,
+			table_schemas: state.table_schemas,
+			logical_types: state.logical_types,
+			secondary_indexes: state.secondary_indexes,
+			table_lifecycle: state.table_lifecycle,
+			table_drop_fences: state.table_drop_fences,
+			ctas_sagas: state.ctas_sagas,
+			materialization_certificates: state.materialization_certificates,
+		}
+	}
+
 	fn parse_manifest(raw: &str) -> BTreeMap<String, Vec<u8>> {
 		raw.lines()
 			.filter(|line| !line.trim().is_empty() && !line.starts_with('#'))
@@ -12732,8 +12881,10 @@ mod body_format_corpus {
 		include_str!("../../tests/fixtures/consensus_body/wal_v2_entries.txt");
 	const MUTATION_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/ctas_mutations_v2.txt");
-	const SNAPSHOT_MANIFEST: &str =
+	const SNAPSHOT_V2_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v2.txt");
+	const SNAPSHOT_V3_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v3.txt");
 
 	fn wal_corpus() -> Vec<(&'static str, Vec<u8>)> {
 		let mut corpus: Vec<(&'static str, Vec<u8>)> = canonical_requests()
@@ -12847,16 +12998,39 @@ mod body_format_corpus {
 	}
 
 	#[test]
-	fn adr0092_snapshot_v2_active_saga_state_matches_stored_golden() {
-		let stored = parse_manifest(SNAPSHOT_MANIFEST);
-		let state_bytes = postcard::to_stdvec(&canonical_sm_state()).unwrap();
+	fn adr0093_snapshot_v2_fixture_is_frozen_and_upconverts_without_outcomes() {
+		let stored = parse_manifest(SNAPSHOT_V2_MANIFEST);
+		let state_bytes = postcard::to_stdvec(&canonical_v2_sm_state()).unwrap();
 		assert_eq!(
 			hex(&state_bytes),
 			hex(&stored["smstate_active_saga"]),
-			"SmState encoding moved; a shape change must ride a \
+			"the immutable v2 snapshot fixture must stay on the frozen v2 spine"
+		);
+		let converted =
+			crate::consensus::snapshot_body::v2::decode_state(&stored["smstate_active_saga"])
+				.unwrap();
+		assert!(
+			converted.table_drop_outcomes.is_empty(),
+			"pre-v3 snapshots upconvert with no fabricated DROP outcomes"
+		);
+		assert_eq!(
+			hex(&postcard::to_stdvec(&converted).unwrap()),
+			hex(&postcard::to_stdvec(&canonical_sm_state()).unwrap()),
+			"v2 upconversion changes only the addition of an empty outcome catalog"
+		);
+	}
+
+	#[test]
+	fn adr0093_snapshot_v3_active_saga_and_drop_outcome_match_stored_golden() {
+		let stored = parse_manifest(SNAPSHOT_V3_MANIFEST);
+		let state = canonical_v3_sm_state();
+		let state_bytes = postcard::to_stdvec(&state).unwrap();
+		assert_eq!(
+			hex(&state_bytes),
+			hex(&stored["smstate_active_saga_and_drop_outcome"]),
+			"current SmState encoding moved; a shape change must ride a \
 			 SNAPSHOT_FORMAT_VERSION bump with a frozen fixture of the outgoing version"
 		);
-		let state = canonical_sm_state();
 		let entry = state
 			.ctas_sagas
 			.get(TenantId::new(7), canonical_operation_id())
@@ -12867,11 +13041,25 @@ mod body_format_corpus {
 			hex(&stored["ctas_saga_entry"]),
 			"CtasSagaEntry encoding moved"
 		);
-		let decoded: SmState = postcard::from_bytes(&stored["smstate_active_saga"]).unwrap();
+		let decoded: SmState =
+			postcard::from_bytes(&stored["smstate_active_saga_and_drop_outcome"]).unwrap();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&decoded).unwrap()),
-			hex(&stored["smstate_active_saga"]),
+			hex(&stored["smstate_active_saga_and_drop_outcome"]),
 			"stored snapshot golden must round-trip byte-stable"
+		);
+		assert_eq!(decoded.table_drop_outcomes.len(), 1);
+		let encoded_snapshot = encode_snapshot(&state).unwrap();
+		let (header, round_tripped) = decode_snapshot_reader(encoded_snapshot.as_slice()).unwrap();
+		assert_eq!(header.format_version, SNAPSHOT_FORMAT_VERSION);
+		assert_eq!(
+			round_tripped
+				.table_drop_outcomes
+				.get(TenantId::new(7), TableObjectId::new([0xD3; 16])),
+			state
+				.table_drop_outcomes
+				.get(TenantId::new(7), TableObjectId::new([0xD3; 16])),
+			"the full snapshot envelope carries retained DROP outcomes"
 		);
 	}
 
@@ -13192,18 +13380,18 @@ mod body_format_corpus {
 			));
 		}
 		std::fs::write(dir.join("ctas_mutations_v2.txt"), mutations).unwrap();
-		let state = canonical_sm_state();
+		let state = canonical_v3_sm_state();
 		let entry = state
 			.ctas_sagas
 			.get(TenantId::new(7), canonical_operation_id())
 			.unwrap()
 			.clone();
 		let snapshot = format!(
-			"smstate_active_saga={}\nctas_saga_entry={}\n",
+			"smstate_active_saga_and_drop_outcome={}\nctas_saga_entry={}\n",
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v2.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v3.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }

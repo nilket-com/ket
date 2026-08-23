@@ -9,6 +9,7 @@ default = []
 telemetry = ["observability/telemetry"]
 otlp-http = ["telemetry", "observability/otlp-http"]
 otlp-grpc = ["telemetry", "observability/otlp-grpc"]
+test-support = ["wendelon/test-support"]
 
 [dependencies]
 arrow.workspace = true

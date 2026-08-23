@@ -184,6 +184,22 @@ pub struct TableDropFenceCatalog {
 	by_id: BTreeMap<TableLifecycleKey, TableDropFence>,
 }
 
+/// ADR 0093: durable proof that one derived DROP operation completed.
+///
+/// The fence proves that a drop is in flight; this outcome proves that it
+/// finished. Finalize moves a table from the former catalog to this one in a
+/// single deterministic state-machine apply.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropOutcome {
+	pub operation_id: DropOperationId,
+	pub finalize_log_index: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropOutcomeCatalog {
+	by_id: BTreeMap<TableLifecycleKey, TableDropOutcome>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableLifecyclePolicyCounts {
 	pub inherit_cluster: usize,
@@ -357,8 +373,8 @@ impl TableDropFenceCatalog {
 		Ok(*fence)
 	}
 
-	pub fn finalize(
-		&mut self,
+	pub fn validate_finalize(
+		&self,
 		operation_id: DropOperationId,
 		fence_log_index: u64,
 		reclaim_completion_log_index: u64,
@@ -384,10 +400,88 @@ impl TableDropFenceCatalog {
 				observed: reclaim_completion_log_index,
 			});
 		}
-		self.by_id.remove(&key);
 		Ok(fence)
 	}
+
+	/// Remove a fence only after [`Self::validate_finalize`] succeeded in the
+	/// same exclusive state-machine apply. This seam is deliberately
+	/// infallible: all contradictions belong to the prevalidation phase.
+	pub fn remove_validated(&mut self, operation_id: DropOperationId) {
+		let key = TableLifecycleKey::new(operation_id.tenant_id, operation_id.table_object_id);
+		let removed = self.by_id.remove(&key);
+		debug_assert_eq!(removed.map(|fence| fence.operation_id), Some(operation_id));
+	}
 }
+
+impl TableDropOutcomeCatalog {
+	pub fn get(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> Option<&TableDropOutcome> {
+		self.by_id
+			.get(&TableLifecycleKey::new(tenant_id, table_object_id))
+	}
+
+	pub fn validate_record(&self, outcome: TableDropOutcome) -> Result<(), TableDropOutcomeError> {
+		let key = TableLifecycleKey::new(
+			outcome.operation_id.tenant_id,
+			outcome.operation_id.table_object_id,
+		);
+		match self.by_id.get(&key).copied() {
+			None => Ok(()),
+			Some(existing) if existing == outcome => Ok(()),
+			Some(existing) => Err(TableDropOutcomeError::Conflict {
+				existing,
+				observed: outcome,
+			}),
+		}
+	}
+
+	/// Insert an outcome only after [`Self::validate_record`] succeeded in the
+	/// same exclusive state-machine apply.
+	pub fn insert_validated(&mut self, outcome: TableDropOutcome) {
+		let key = TableLifecycleKey::new(
+			outcome.operation_id.tenant_id,
+			outcome.operation_id.table_object_id,
+		);
+		let previous = self.by_id.insert(key, outcome);
+		debug_assert!(previous.is_none() || previous == Some(outcome));
+	}
+
+	pub fn len(&self) -> usize {
+		self.by_id.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.by_id.is_empty()
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableDropOutcomeError {
+	Conflict {
+		existing: TableDropOutcome,
+		observed: TableDropOutcome,
+	},
+}
+
+impl fmt::Display for TableDropOutcomeError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::Conflict { existing, observed } => write!(
+				f,
+				"table drop outcome conflict: existing operation_id {:?} at finalize log {}, observed operation_id {:?} at finalize log {}",
+				existing.operation_id,
+				existing.finalize_log_index,
+				observed.operation_id,
+				observed.finalize_log_index,
+			),
+		}
+	}
+}
+
+impl std::error::Error for TableDropOutcomeError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableDropFenceError {

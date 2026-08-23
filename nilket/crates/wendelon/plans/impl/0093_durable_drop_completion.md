@@ -183,8 +183,8 @@ scripts/cargo-cgroup test -p toron-tpch
 # implementation time, narrow both to the named test target/filter —
 # especially the --ignored leg, so it runs the A1 exhibit alone and not
 # every ignored exhibit in the suite:
-scripts/cargo-cgroup test -p toron --features test-support --test <a2_target>
-scripts/cargo-cgroup test -p toron --features test-support --test <a1_target> -- --ignored <a1_exhibit_filter>
+scripts/cargo-cgroup test -p toron --features test-support --test sql_listener_test adr0093_
+scripts/cargo-cgroup test -p wendelon --features test-support --test quic_transport adr0093_live_quic_drop_survives_more_than_thirty_seconds_of_reclaim -- --ignored --exact
 git diff --check
 ```
 
@@ -193,6 +193,12 @@ The A1 exhibit's run is recorded in the evidence receipt (which rides the
 3c's variant reaches toron-tpch reporting types. Re-run the gate
 immediately before claiming green.
 
+The literal A1 exhibit lives in Wendelon's `quic_transport` target rather
+than behind Toron's forwarded feature: it must exercise the Wendelon control
+connection whose idle policy decision 5 changes, not Toron's independent SQL
+listener. Toron's forwarding feature executes A2, where the cross-crate hook
+must be visible to the public SQL integration target.
+
 ## Guard reconciliation
 
 None inverted. Three guards added (endpoint census; snapshot
@@ -200,3 +206,23 @@ format-fixture extension; test-support absent from default builds with
 every hook site under its gate). The Toron catalog marker guard keeps its
 message and behavior; the mapping change is additionally pinned by the A2
 end-to-end control — a behavioral net that fails if the collapse returns.
+
+## Implementation evidence
+
+- **P2 disposition — not reproducible under the required multi-run shape.**
+  After the remote DROP finalized and its response was severed, Toron was
+  stopped. A second daemon started with an empty descriptor bootstrap, so its
+  registry rebuilt lazily from persisted Wendelon state rather than retaining
+  a warm binding. CTAS into the dropped name published four rows, and an
+  immediate `SELECT` read all four. The warm `TableAlreadyExists` shortcut was
+  not exercised; the receipt-integrity consequence is closed by read-back.
+- **A2:** the feature-enabled public SQL control saw the first DROP fail as a
+  storage transport error after the remote state held an outcome and no fence.
+  A foreign operation was refused as `TableAlreadyDropped`; after a fresh
+  Toron run, the same-operation retry succeeded, installed the local marker,
+  removed the catalog binding, and a same-name CTAS was immediately readable.
+- **A1:** the ignored live-QUIC exhibit completed a real schema DROP after
+  31.61 seconds with reclaim deliberately held for 31 seconds, crossing
+  Quinn's former 30-second idle boundary. The compressed pair separately
+  proves the mechanism and its negative arm: keep-alive survives three idle
+  periods, while the otherwise-identical connection times out without it.

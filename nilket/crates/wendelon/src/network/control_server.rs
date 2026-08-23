@@ -69,6 +69,59 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio::sync::{Mutex, watch};
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod adr0093_test_support {
+	use crate::schema::TableObjectId;
+	use std::collections::{BTreeMap, BTreeSet};
+	use std::sync::{Mutex, OnceLock};
+	use std::time::Duration;
+
+	#[derive(Default)]
+	struct Hooks {
+		sever_response_for: BTreeSet<TableObjectId>,
+		delay_reclaim_for: BTreeMap<TableObjectId, Duration>,
+	}
+
+	fn hooks() -> &'static Mutex<Hooks> {
+		static HOOKS: OnceLock<Mutex<Hooks>> = OnceLock::new();
+		HOOKS.get_or_init(|| Mutex::new(Hooks::default()))
+	}
+
+	pub struct HookGuard {
+		table_object_id: TableObjectId,
+	}
+
+	impl Drop for HookGuard {
+		fn drop(&mut self) {
+			let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
+			hooks.sever_response_for.remove(&self.table_object_id);
+			hooks.delay_reclaim_for.remove(&self.table_object_id);
+		}
+	}
+
+	pub fn sever_next_drop_response(table_object_id: TableObjectId) -> HookGuard {
+		let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
+		hooks.sever_response_for.insert(table_object_id);
+		HookGuard { table_object_id }
+	}
+
+	pub fn delay_next_drop_reclaim(table_object_id: TableObjectId, delay: Duration) -> HookGuard {
+		let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
+		hooks.delay_reclaim_for.insert(table_object_id, delay);
+		HookGuard { table_object_id }
+	}
+
+	pub(super) fn take_sever_response(table_object_id: TableObjectId) -> bool {
+		let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
+		hooks.sever_response_for.remove(&table_object_id)
+	}
+
+	pub(super) fn take_reclaim_delay(table_object_id: TableObjectId) -> Option<Duration> {
+		let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
+		hooks.delay_reclaim_for.remove(&table_object_id)
+	}
+}
+
 pub const CONTROL_REASON_GRANTED: u8 = 0;
 pub const CONTROL_REASON_NOT_LEADER: u8 = 1;
 pub const CONTROL_REASON_EPOCH_STALE: u8 = 2;
@@ -1741,6 +1794,12 @@ impl WendelonControlServer {
 		let tenant_id = match request {
 			TableSchemaDropRequest::V1 { tenant_id, .. } => tenant_id,
 		};
+		#[cfg(any(test, feature = "test-support"))]
+		let table_object_id = match &request {
+			TableSchemaDropRequest::V1 {
+				table_object_id, ..
+			} => *table_object_id,
+		};
 		if let Some(claimed_tenant) = context.actor.claimed_tenant_id()? {
 			if claimed_tenant != tenant_id {
 				return self.schema_drop_rejection(
@@ -1771,16 +1830,25 @@ impl WendelonControlServer {
 		}
 
 		match self.run_table_schema_drop(request).await {
-			Ok(()) => self.build_schema_drop_frame(
-				frame.header.stream_id,
-				&TableSchemaDropResponseWire {
-					accepted: true,
-					reason_code: CONTROL_REASON_GRANTED,
-					leader_hint: Some(self.local_node.id),
-					admin_error: None,
-					message: None,
-				},
-			),
+			Ok(()) => {
+				#[cfg(any(test, feature = "test-support"))]
+				if adr0093_test_support::take_sever_response(table_object_id) {
+					return Err(Error::new(
+						ErrorKind::ConnectionAborted,
+						"ADR 0093 test seam severed DROP response after durable finalize",
+					));
+				}
+				self.build_schema_drop_frame(
+					frame.header.stream_id,
+					&TableSchemaDropResponseWire {
+						accepted: true,
+						reason_code: CONTROL_REASON_GRANTED,
+						leader_hint: Some(self.local_node.id),
+						admin_error: None,
+						message: None,
+					},
+				)
+			}
 			Err(error) => self.schema_drop_rejection(
 				&frame,
 				Self::table_schema_drop_reason(&error),
@@ -2281,6 +2349,13 @@ impl WendelonControlServer {
 		}
 
 		let snapshot = self.state_machine.state_snapshot().await;
+		if let Some(outcome) = snapshot.table_drop_outcomes.get(tenant_id, table_object_id) {
+			return if outcome.operation_id == operation_id {
+				Ok(())
+			} else {
+				Err(WendelonAdminError::TableAlreadyDropped { table_object_id })
+			};
+		}
 		let descriptor = snapshot
 			.table_schemas
 			.latest_by_id(tenant_id, table_object_id)
@@ -2375,6 +2450,10 @@ impl WendelonControlServer {
 		tenant_id: TenantId,
 		descriptor: &TableSchemaDescriptor,
 	) -> Result<(), WendelonAdminError> {
+		#[cfg(any(test, feature = "test-support"))]
+		if let Some(delay) = adr0093_test_support::take_reclaim_delay(descriptor.table_object_id) {
+			tokio::time::sleep(delay).await;
+		}
 		let Some(storage_manager) = self.storage_manager.as_ref() else {
 			return Err(WendelonAdminError::Transport {
 				message: "schema drop requires a configured Wendelon storage manager".to_string(),

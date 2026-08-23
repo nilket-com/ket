@@ -633,9 +633,11 @@ fn map_wendelon_admin_error_to_storage(
 ) -> StorageError {
 	match error {
 		wendelon_client::ClientError::Admin(
-			wendelon_client::WendelonAdminError::TableMissing { .. }
-			| wendelon_client::WendelonAdminError::TableAlreadyDropped { .. },
+			wendelon_client::WendelonAdminError::TableMissing { .. },
 		) => StorageError::TableNotFound { table: table_id },
+		wendelon_client::ClientError::Admin(
+			wendelon_client::WendelonAdminError::TableAlreadyDropped { .. },
+		) => StorageError::TableAlreadyDropped { table: table_id },
 		wendelon_client::ClientError::TableDescriptorEvolved { .. } => {
 			StorageError::DescriptorEvolved { table_id }
 		}
@@ -1502,6 +1504,37 @@ mod tests {
 		);
 
 		assert!(matches!(error, StorageError::Cancelled));
+	}
+
+	#[test]
+	fn adr0093_already_dropped_never_collapses_into_table_not_found() {
+		let table_id = TableId(93);
+		let object = wendelon::schema::TableObjectId::new([0x93; 16]);
+		let already_dropped = map_wendelon_admin_error_to_storage(
+			table_id,
+			wendelon_client::ClientError::Admin(
+				wendelon_client::WendelonAdminError::TableAlreadyDropped {
+					table_object_id: object,
+				},
+			),
+		);
+		assert!(matches!(
+			already_dropped,
+			StorageError::TableAlreadyDropped { table } if table == table_id
+		));
+
+		let missing = map_wendelon_admin_error_to_storage(
+			table_id,
+			wendelon_client::ClientError::Admin(
+				wendelon_client::WendelonAdminError::TableMissing {
+					table_object_id: object,
+				},
+			),
+		);
+		assert!(matches!(
+			missing,
+			StorageError::TableNotFound { table } if table == table_id
+		));
 	}
 
 	#[tokio::test]

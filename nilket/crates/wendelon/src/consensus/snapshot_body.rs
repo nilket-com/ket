@@ -177,8 +177,112 @@ pub(crate) mod v1 {
 			secondary_indexes,
 			table_lifecycle,
 			table_drop_fences,
+			table_drop_outcomes: Default::default(),
 			ctas_sagas: converted_sagas,
 			materialization_certificates: Default::default(),
+		})
+	}
+}
+
+/// The version-2 snapshot shape: the live state after ADR 0087/0092 and
+/// before ADR 0093 appended durable DROP outcomes.
+pub(crate) mod v2 {
+	use crate::consensus::core::{
+		EpochConfig, MigratedRangeTombstone, MigrationLedgerEntry, RevokedActorKeyId, TenantRecord,
+		TieredSlab,
+	};
+	use crate::consensus::raft_storage::SmState as CurrentSmState;
+	use crate::crypto::TenantKeyset;
+	use crate::integration::compute::LogicalTypeCatalog;
+	use crate::schema::lifecycle::{TableDropFenceCatalog, TableLifecycleCatalog};
+	use crate::schema::secondary_index::SecondaryIndexCatalog;
+	use crate::schema::table::TableSchemaCatalog;
+	use crate::schema::{
+		CtasSagaCatalog, HybridTimestamp, MaterializationCertificateCatalog, SlabId, TenantId,
+	};
+	use openraft::{BasicNode, LogId, StoredMembership};
+	use serde::{Deserialize, Serialize};
+	use std::collections::{BTreeMap, HashMap};
+
+	/// The v2 `SmState` field spine. Field order is the postcard contract.
+	#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+	pub(crate) struct SmState {
+		pub last_applied_log_id: Option<LogId<u32>>,
+		pub last_membership: StoredMembership<u32, BasicNode>,
+		pub epoch_history: BTreeMap<u64, EpochConfig>,
+		pub leases: HashMap<u64, crate::schema::LeaseDescriptor>,
+		pub e_safe_watermarks: HashMap<u64, HybridTimestamp>,
+		pub last_e_safe_index: u64,
+		pub tiered_slabs: HashMap<SlabId, TieredSlab>,
+		pub migrations: HashMap<u64, MigrationLedgerEntry>,
+		pub tombstones: Vec<MigratedRangeTombstone>,
+		pub tenants: HashMap<TenantId, TenantRecord>,
+		pub tenant_keysets: HashMap<TenantId, TenantKeyset>,
+		pub revoked_actor_keys: BTreeMap<RevokedActorKeyId, u64>,
+		pub table_schemas: TableSchemaCatalog,
+		pub logical_types: LogicalTypeCatalog,
+		pub secondary_indexes: SecondaryIndexCatalog,
+		pub table_lifecycle: TableLifecycleCatalog,
+		pub table_drop_fences: TableDropFenceCatalog,
+		pub ctas_sagas: CtasSagaCatalog,
+		pub materialization_certificates: MaterializationCertificateCatalog,
+	}
+
+	pub(crate) fn decode_state(body: &[u8]) -> std::io::Result<CurrentSmState> {
+		let (state, rest) = postcard::take_from_bytes::<SmState>(body).map_err(|err| {
+			std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("snapshot postcard decode failed: {err}"),
+			)
+		})?;
+		if !rest.is_empty() {
+			return Err(std::io::Error::new(
+				std::io::ErrorKind::InvalidData,
+				format!("snapshot decoded with {} unconsumed body bytes", rest.len()),
+			));
+		}
+		let SmState {
+			last_applied_log_id,
+			last_membership,
+			epoch_history,
+			leases,
+			e_safe_watermarks,
+			last_e_safe_index,
+			tiered_slabs,
+			migrations,
+			tombstones,
+			tenants,
+			tenant_keysets,
+			revoked_actor_keys,
+			table_schemas,
+			logical_types,
+			secondary_indexes,
+			table_lifecycle,
+			table_drop_fences,
+			ctas_sagas,
+			materialization_certificates,
+		} = state;
+		Ok(CurrentSmState {
+			last_applied_log_id,
+			last_membership,
+			epoch_history,
+			leases,
+			e_safe_watermarks,
+			last_e_safe_index,
+			tiered_slabs,
+			migrations,
+			tombstones,
+			tenants,
+			tenant_keysets,
+			revoked_actor_keys,
+			table_schemas,
+			logical_types,
+			secondary_indexes,
+			table_lifecycle,
+			table_drop_fences,
+			table_drop_outcomes: Default::default(),
+			ctas_sagas,
+			materialization_certificates,
 		})
 	}
 }

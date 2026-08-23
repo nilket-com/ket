@@ -48,6 +48,7 @@ use std::any::Any;
 use std::io::{Error, ErrorKind};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 pub use tls_pki::DEFAULT_CLUSTER_DOMAIN;
 
 /// Single ALPN token advertised on every HRFT QUIC connection.
@@ -55,6 +56,11 @@ pub use tls_pki::DEFAULT_CLUSTER_DOMAIN;
 /// version if we need to bump the wire format without reshuffling
 /// ALPN.
 pub const HRFT_ALPN: &[u8] = b"wendelon-hrft";
+/// ADR 0093: every Wendelon QUIC role uses the same explicit liveness policy.
+pub const WENDELON_QUIC_MAX_IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+/// Keep-alive is the mechanism that lets a healthy synchronous admin request
+/// outlive its silent execution window.
+pub const WENDELON_QUIC_KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const ACTOR_CLAIMS_OID_DOTTED: &str = "1.3.6.1.4.1.55555.1.1";
 
 const SUBJECT_ALT_NAME_OID: &[u8] = &[0x55, 0x1D, 0x11];
@@ -587,7 +593,9 @@ fn quinn_server_config_from_rustls(
 ) -> std::io::Result<quinn::ServerConfig> {
 	let quic_cfg = QuicServerConfig::try_from(rustls_cfg)
 		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicServerConfig: {e}")))?;
-	Ok(quinn::ServerConfig::with_crypto(Arc::new(quic_cfg)))
+	let mut config = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
+	config.transport_config(wendelon_quic_transport_config());
+	Ok(config)
 }
 
 /// Build a `quinn::ClientConfig` that:
@@ -599,7 +607,20 @@ pub fn client_config(material: &TlsMaterial) -> std::io::Result<quinn::ClientCon
 	let rustls_cfg = rustls_client_config(material)?;
 	let quic_cfg = QuicClientConfig::try_from(rustls_cfg)
 		.map_err(|e| Error::new(ErrorKind::InvalidInput, format!("QuicClientConfig: {e}")))?;
-	Ok(quinn::ClientConfig::new(Arc::new(quic_cfg)))
+	let mut config = quinn::ClientConfig::new(Arc::new(quic_cfg));
+	config.transport_config(wendelon_quic_transport_config());
+	Ok(config)
+}
+
+fn wendelon_quic_transport_config() -> Arc<quinn::TransportConfig> {
+	let mut transport = quinn::TransportConfig::default();
+	transport.max_idle_timeout(Some(
+		WENDELON_QUIC_MAX_IDLE_TIMEOUT
+			.try_into()
+			.expect("ADR 0093 idle timeout is representable by QUIC"),
+	));
+	transport.keep_alive_interval(Some(WENDELON_QUIC_KEEP_ALIVE_INTERVAL));
+	Arc::new(transport)
 }
 
 // ============================================================

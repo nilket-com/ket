@@ -2,6 +2,8 @@
 mod tls_pki;
 
 use arrow::array::LargeBinaryBuilder;
+#[cfg(feature = "test-support")]
+use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use std::collections::{BTreeMap, HashMap};
@@ -16,6 +18,15 @@ use wendelon::client::{
 	ClusterPeerWire, ClusterStatusWire, TopologySource, WendelonClient, WendelonClientConfig,
 	WriteRequest,
 };
+#[cfg(feature = "test-support")]
+use wendelon::consensus::WendelonRequest;
+#[cfg(feature = "test-support")]
+use wendelon::integration::compute::{
+	COMPUTE_STORAGE_CONTRACT_VERSION, DropOperationId, SchemaGeneration, SchemaIntentId,
+	SchemaIntentOrigin, SchemaMutationKind, SchemaObjectKind, SchemaObjectRef,
+	SchemaUpdateEnvelope, TableSchemaDropFields, TableSchemaDropRequest,
+	encode_schema_update_envelope_v1,
+};
 use wendelon::network::core::{HRFT_MAGIC, HrftFrame};
 use wendelon::network::pool::PooledBuf;
 use wendelon::network::ring::{RingRouter, RingState};
@@ -25,8 +36,9 @@ use wendelon::network::{
 	NodeRoleSet, PeerCapabilities, QuicTransportProvider, ServerAdmissionConfig, ServerLifecycle,
 	TcpTlsTransportProvider, TlsMaterial, TransportConnection, TransportProvider,
 	TransportProviderFactory, TransportTier, TransportTierSet, UnroutedService,
-	canonical_node_dns_name, canonical_server_name_resolver, endpoint_from_tls, read_frame,
-	rustls_client_config, serve_with_admission, verified_transport_peer, write_frame,
+	canonical_node_dns_name, canonical_server_name_resolver, client_config, endpoint_from_tls,
+	read_frame, rustls_client_config, serve_with_admission, server_config, verified_transport_peer,
+	write_frame,
 };
 use wendelon::node::{
 	ClusterBootstrapConfig, NodeBootstrapConfig, SeedNodeConfig, TransportTlsConfig, WendelonNode,
@@ -34,6 +46,11 @@ use wendelon::node::{
 use wendelon::schema::{
 	ClientWriteId, DurabilityLevel, FrameHeader, HybridTimestamp, Identity, Locality, MsgType,
 	NodeId, TenantId, WriteRequestMeta, WriteResponseMeta, WriteStatus, write_payload_schema,
+};
+#[cfg(feature = "test-support")]
+use wendelon::schema::{
+	PrimaryKeyDescriptor, RowIdentityPolicy, SchemaEvolutionPolicy, TableObjectId,
+	TableSchemaDescriptor, encode_table_schema_descriptor_v1,
 };
 
 fn fresh_dir(tag: &str) -> std::path::PathBuf {
@@ -364,6 +381,195 @@ async fn wait_for_voters(node: &WendelonNode, expected: &[u32]) {
 		);
 		tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 	}
+}
+
+async fn adr0093_connect_and_idle(
+	keep_alive: Option<std::time::Duration>,
+	silence: std::time::Duration,
+) -> Result<(), quinn::ConnectionError> {
+	let root = fresh_dir("adr0093-compressed-liveness");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let server_material =
+		TlsMaterial::load(&pki.server_cert, &pki.server_key, &pki.ca_cert).unwrap();
+	let client_material =
+		TlsMaterial::load(&pki.data_client_cert, &pki.data_client_key, &pki.ca_cert).unwrap();
+	let idle = std::time::Duration::from_millis(300);
+	let mut transport = quinn::TransportConfig::default();
+	transport.max_idle_timeout(Some(idle.try_into().expect("representable idle timeout")));
+	transport.keep_alive_interval(keep_alive);
+	let transport = Arc::new(transport);
+
+	let mut server_cfg = server_config(&server_material).unwrap();
+	server_cfg.transport_config(Arc::clone(&transport));
+	let server = quinn::Endpoint::server(server_cfg, "127.0.0.1:0".parse().unwrap()).unwrap();
+	let address = server.local_addr().unwrap();
+	let mut client_cfg = client_config(&client_material).unwrap();
+	client_cfg.transport_config(transport);
+	let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+	client.set_default_client_config(client_cfg);
+
+	let accepting = tokio::spawn(async move {
+		let connection = server
+			.accept()
+			.await
+			.expect("incoming")
+			.await
+			.expect("accept");
+		tokio::time::sleep(silence).await;
+		connection
+	});
+	let connection = client
+		.connect(
+			address,
+			&canonical_node_dns_name(1, tls_pki::CLUSTER_DOMAIN),
+		)
+		.expect("connect")
+		.await
+		.expect("handshake");
+	tokio::time::sleep(silence).await;
+	let opened = connection.open_bi().await;
+	let _ = accepting.await;
+	opened.map(|_| ())
+}
+
+#[tokio::test]
+async fn adr0093_keep_alive_holds_a_silent_wendelon_connection_past_idle() {
+	adr0093_connect_and_idle(
+		Some(std::time::Duration::from_millis(50)),
+		std::time::Duration::from_millis(900),
+	)
+	.await
+	.expect("keep-alive must preserve a connection through three idle periods");
+}
+
+#[tokio::test]
+async fn adr0093_without_keep_alive_the_same_wendelon_connection_times_out() {
+	let error = adr0093_connect_and_idle(None, std::time::Duration::from_millis(900))
+		.await
+		.expect_err("the same silence without keep-alive must lose the connection");
+	assert!(
+		matches!(error, quinn::ConnectionError::TimedOut),
+		"{error:?}"
+	);
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "evidence exhibit: holds a real Wendelon DROP beyond Quinn's former 30s idle timeout"]
+async fn adr0093_live_quic_drop_survives_more_than_thirty_seconds_of_reclaim() {
+	let root = fresh_dir("adr0093-live-drop");
+	let pki = tls_pki::write_test_pki(&root.join("pki"));
+	let address = reserve_socket_addr();
+	let node = WendelonNode::bootstrap(bootstrap_cfg(
+		"adr0093-live-drop-node",
+		1,
+		address.clone(),
+		1,
+		&[1],
+		ClusterBootstrapConfig::Bootstrap,
+		&pki.server_cert,
+		&pki.server_key,
+		&pki.ca_cert,
+		&pki.ops_ca_cert,
+	))
+	.await
+	.expect("bootstrap live Wendelon node");
+	wait_for_cluster(&node, 1, 1).await;
+	let tenant_id = TenantId::new(93);
+	node.create_tenant(tenant_id, u64::MAX, 1)
+		.await
+		.expect("create test tenant");
+
+	let table_object_id = TableObjectId::new([0x93; 16]);
+	let descriptor = TableSchemaDescriptor::new(
+		table_object_id,
+		1,
+		"adr0093",
+		"slow_drop",
+		&Schema::new(vec![Field::new("id", DataType::Int64, false)]),
+		RowIdentityPolicy::PrimaryKey(PrimaryKeyDescriptor::single("id")),
+		wendelon::schema::LocalityPolicy::IdentityProjection,
+		SchemaEvolutionPolicy::AdditiveOnly,
+	)
+	.unwrap();
+	let envelope = SchemaUpdateEnvelope {
+		contract_version: COMPUTE_STORAGE_CONTRACT_VERSION,
+		origin: SchemaIntentOrigin::ComputeClient,
+		tenant_id,
+		object: SchemaObjectRef {
+			kind: SchemaObjectKind::Table,
+			namespace: descriptor.namespace.clone(),
+			name: descriptor.table_name.clone(),
+		},
+		expected_generation: SchemaGeneration::ZERO,
+		requested_generation: SchemaGeneration::new(1),
+		intent_id: SchemaIntentId::new([0x93; 16]),
+		mutation: SchemaMutationKind::Create,
+		payload: encode_table_schema_descriptor_v1(&descriptor).unwrap(),
+	};
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(
+			encode_schema_update_envelope_v1(&envelope).unwrap(),
+		))
+		.await
+		.expect("install table descriptor");
+
+	let client_material =
+		TlsMaterial::load(&pki.operator_cert, &pki.operator_key, &pki.ca_cert).unwrap();
+	let client_endpoint = endpoint_from_tls(&client_material, "127.0.0.1:0".parse().unwrap())
+		.expect("build operator QUIC endpoint");
+	let provider: Arc<dyn TransportProvider> =
+		Arc::new(QuicTransportProvider::with_cluster_domain(
+			Arc::new(client_endpoint.clone()),
+			canonical_server_name_resolver(tls_pki::CLUSTER_DOMAIN),
+			tls_pki::CLUSTER_DOMAIN,
+		));
+	let topology = snapshot(1, Some(1), 1, &[(1, &address)]);
+	let inner = WendelonClient::new(WendelonClientConfig {
+		local_tiers: TransportTierSet::empty().with(TransportTier::QuicIoUring),
+		providers: HashMap::from([(TransportTier::QuicIoUring, provider)]),
+		bootstrap: topology.clone(),
+		topology: Arc::new(wendelon::client::StaticTopologySource::new(topology)),
+		pool_max_retained: 8,
+		pool_max_cap_bytes: 1024 * 1024,
+	});
+	let client = wendelon_client::Client::with_client_uuid(inner, [0x93; 16]);
+	let operation_id = DropOperationId {
+		tenant_id,
+		table_object_id,
+		schema_generation: SchemaGeneration::new(1),
+	};
+	let _delay = wendelon::network::adr0093_test_support::delay_next_drop_reclaim(
+		table_object_id,
+		std::time::Duration::from_secs(31),
+	);
+	let started = std::time::Instant::now();
+	client
+		.drop_table_schema(TableSchemaDropRequest::current(TableSchemaDropFields {
+			tenant_id,
+			table_object_id,
+			expected_generation: SchemaGeneration::new(1),
+			operation_id,
+		}))
+		.await
+		.expect("DROP must survive the old 30-second idle boundary");
+	let elapsed = started.elapsed();
+	assert!(
+		elapsed > std::time::Duration::from_secs(30),
+		"the exhibit must genuinely cross the old idle boundary: {elapsed:?}"
+	);
+	assert_eq!(
+		node.state_machine
+			.state_snapshot()
+			.await
+			.table_drop_outcomes
+			.get(tenant_id, table_object_id)
+			.map(|outcome| outcome.operation_id),
+		Some(operation_id)
+	);
+
+	client_endpoint.close(0u32.into(), b"done");
+	node.shutdown().await.unwrap();
 }
 
 #[tokio::test]
