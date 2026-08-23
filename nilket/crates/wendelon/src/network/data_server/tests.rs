@@ -15562,7 +15562,6 @@ mod adr0090_membership_transition {
 		MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities,
 		TransportTierSet,
 	};
-	use crate::schema::PartitionId;
 	use crate::schema::table::{PlacementKey, PlacementSemantics};
 	use std::collections::HashMap;
 
