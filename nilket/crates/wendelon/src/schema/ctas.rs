@@ -363,8 +363,11 @@ impl CtasSagaCatalog {
 	}
 
 	/// The consuming inverse of [`Self::from_replay_parts`], for projecting a
-	/// live state into a superseded fixture shape. Same seam, same rule: only
-	/// versioned-replay machinery and its controls touch it.
+	/// live state into a superseded fixture shape. Test-only by construction:
+	/// production replay only ever converts old shapes forward, so nothing in
+	/// a shipping build projects backward — only the fixture generators and
+	/// their controls do.
+	#[cfg(test)]
 	pub(crate) fn into_replay_parts(
 		self,
 	) -> (
