@@ -2660,6 +2660,55 @@ mod adr0089_partition_keyed_packing {
 		.unwrap()
 	}
 
+	/// The premise behind any daemon-path measurement: at the production
+	/// default target (4,096), packed record count is ceil(rows / target) per
+	/// partition — not one per row, and not silently re-capped.
+	#[test]
+	fn adr0089_default_target_packs_ceil_of_rows() {
+		let mut descriptor = descriptor_with_spread();
+		descriptor.record_layout_policy =
+			RecordLayoutPolicy::MultiRow(MultiRowLayoutDescriptor::default());
+		descriptor.record_body_compression_policy =
+			RecordBodyCompressionPolicy::default_for_layout(&descriptor.record_layout_policy);
+		descriptor.refresh_descriptor_fingerprints().unwrap();
+
+		let rows = 10_000usize;
+		let batch = batch((1..=rows as i64).collect());
+		let meta = meta(&descriptor, batch.num_rows());
+		let packed = pack_record_batch_by_bucket(
+			&meta,
+			&descriptor,
+			&batch,
+			WriterNodeId::ZERO,
+			meta.client_hlc,
+		)
+		.expect("pack at the default target");
+		let total: usize = packed
+			.iter()
+			.map(|record| record.source_row_indices.len())
+			.sum();
+		assert_eq!(total, rows);
+		let mut per_partition: BTreeMap<Option<PartitionId>, (usize, usize)> = BTreeMap::new();
+		for record in &packed {
+			let entry = per_partition.entry(record.partition).or_default();
+			entry.0 += 1;
+			entry.1 += record.source_row_indices.len();
+		}
+		for (partition, (records, rows)) in &per_partition {
+			assert!(partition.is_some(), "premise: every record partitioned");
+			assert_eq!(
+				*records,
+				rows.div_ceil(4096),
+				"partition {partition:?}: {rows} rows must pack to ceil(rows/4096)"
+			);
+		}
+		assert!(
+			per_partition.len() <= 2,
+			"prefix_bits 1 splits rows across at most two partitions: {}",
+			per_partition.len()
+		);
+	}
+
 	#[test]
 	fn adr0089_rows_of_one_partition_pack_to_the_target() {
 		let descriptor = descriptor_with_spread();
