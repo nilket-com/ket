@@ -8931,16 +8931,18 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// enforcement, not domain helpers, and remain beside what they validate. The
 /// ingress slice added partition derivation at the write boundary, the
 /// tombstone placement arm, and placement-keyed fan-out; the transfer slice
-/// added the transfer-aware serving consultation at primacy and fan-out. All
-/// are read/write-path enforcement with the same claim to this root.
+/// added the transfer-aware serving consultation at primacy and fan-out; the
+/// secondary-index read resolves placement from the key chain, since the V1
+/// segment format carries none. All are read/write-path enforcement with the
+/// same claim to this root.
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 15_620,
-		"data_server.rs root is {lines} lines (cap 15_620); carve more or justify a deliberate cap bump"
+		lines <= 15_630,
+		"data_server.rs root is {lines} lines (cap 15_630); carve more or justify a deliberate cap bump"
 	);
 }
 

@@ -4461,3 +4461,26 @@ impl SlabManager {
 			.push(location);
 	}
 }
+
+/// ADR 0090: placement resolution helpers that live outside the storage-engine
+/// trait surface.
+impl SlabManager {
+	/// ADR 0090: the placement authority for one row version. Durable carriers
+	/// that predate placement — the V1 secondary-index segment format — decode
+	/// their locations as raw-locality, so a reader holding such a location
+	/// must resolve the version's true placement from the key chain rather
+	/// than trusting the segment's reconstruction.
+	pub(crate) fn version_placement_at(
+		&self,
+		tenant_id: TenantId,
+		key_identity: Identity,
+		hlc: HybridTimestamp,
+	) -> Option<(PlacementSemantics, Option<crate::schema::PartitionId>)> {
+		let versions = self.key_index.get(&(tenant_id, key_identity))?;
+		versions
+			.value()
+			.iter()
+			.find(|location| location.hlc == hlc)
+			.map(|location| (location.placement, location.partition))
+	}
+}

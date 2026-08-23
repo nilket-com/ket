@@ -16097,3 +16097,165 @@ mod adr0091_typed_stream_errors {
 		node.handles.abort();
 	}
 }
+
+/// ADR 0090 follow-up control: a PARTITIONED row read through a secondary
+/// index. The V1 segment format carries no placement, so a segment-built
+/// location reads as legacy — over a partitioned frame, the placement
+/// cross-check must still let the row serve, because the placement authority
+/// is the key chain, never the segment.
+#[tokio::test]
+async fn secondary_index_read_serves_partitioned_rows() {
+	let dir = bootstrap_tempdir("secondary-index-partitioned-read");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		56,
+		dir,
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for leader"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+
+	let descriptor = multirow_typed_table_descriptor();
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+
+	let batch = typed_table_batch_with_names(vec![(1, "target"), (2, "other")]);
+	let mut write_meta = typed_table_meta(&descriptor, batch.num_rows());
+	write_meta.parent_write_id.sequence_no = 560;
+	let (write_resp, _) = node
+		.data_server
+		.table_write(write_meta, batch)
+		.await
+		.unwrap();
+	assert_eq!(write_resp.write.status, WriteStatus::OK);
+
+	// Premise: the rows really are partitioned — otherwise this control would
+	// pass on any build and prove nothing.
+	let admission = validate_table_write_request_batch(
+		&write_meta,
+		&typed_table_batch_with_names(vec![(1, "target"), (2, "other")]),
+		&descriptor,
+		WriterNodeId::from_node_id(node.local_node),
+		write_resp.write.commit_hlc,
+	)
+	.unwrap();
+	let held = node
+		.slab
+		.lookup_as_of(tenant(), admission.key_identities[0], hlc(0, 0, 0))
+		.expect("written row resolves");
+	assert_eq!(
+		held.placement,
+		crate::schema::table::PlacementSemantics::Partitioned,
+		"premise: the indexed table writes partitioned rows"
+	);
+
+	let sealed_slab_id = node.slab.force_seal_active_for_test().await;
+	let index = name_secondary_index_descriptor(&descriptor);
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(
+			secondary_index_schema_update(&index),
+		))
+		.await
+		.unwrap();
+	let backfill = node
+		.slab
+		.run_secondary_index_backfill_once(tenant(), &descriptor, &index, 8, 4096)
+		.await
+		.unwrap();
+	assert_eq!(backfill.completed.len(), 1);
+	assert_eq!(
+		backfill.completed[0].candidate.source_slab_id,
+		sealed_slab_id
+	);
+	node.raft
+		.client_write(WendelonRequest::SchemaUpdate(
+			secondary_index_backfill_complete_schema_update(&index, node.local_node),
+		))
+		.await
+		.unwrap();
+
+	let program = name_eq_program("target");
+	let query_meta =
+		table_query_meta_for_test(&descriptor, write_resp.write.commit_hlc, program.len());
+	let plan = node
+		.data_server
+		.prepare_table_query_execution_plan_with_migration(
+			&query_meta,
+			&program,
+			DecodedRuntimeFilter::Absent,
+		)
+		.await
+		.expect("a partitioned row behind a secondary index must serve, not refuse");
+	assert_eq!(plan.response.status, ReadStatus::OK);
+	assert_eq!(plan.response.rows, 1);
+	assert!(
+		plan.secondary_index_access_plan.is_some(),
+		"premise: the read went through the secondary index"
+	);
+
+	node.handles.abort();
+}
+
+/// ADR 0090 follow-up: the durable secondary-index round-trip. The V1 segment
+/// format carries no placement, so a segment-decoded location reads as legacy —
+/// exactly what `into_entry` reconstructs after a reload. The key chain is the
+/// placement authority, so the read must serve the partitioned row anyway.
+#[tokio::test]
+async fn adr0090_segment_decoded_locations_resolve_placement_from_the_chain() {
+	use crate::schema::table::PlacementSemantics;
+	use crate::storage::secondary_index::SecondaryIndexLookupRow;
+
+	let mgr = make_manager().await;
+	let descriptor = append_only_table_descriptor();
+	let keys = append_append_only_rows_for_query(&mgr, &descriptor, vec![7], hlc(10, 0, 1)).await;
+	let key = keys[0];
+	let held = mgr.lookup_as_of(tenant(), key, hlc(0, 0, 0)).unwrap();
+	assert_eq!(
+		held.placement,
+		PlacementSemantics::Partitioned,
+		"premise: the indexed row is partitioned"
+	);
+
+	// The segment-decoded shape: same physical location, placement lost to the
+	// V1 format. Physical identity ignores placement, so this IS the same
+	// location as far as reads are concerned.
+	let mut segment_decoded = held;
+	segment_decoded.placement = PlacementSemantics::RawLocality;
+	segment_decoded.partition = None;
+	let row = SecondaryIndexLookupRow {
+		row_key_id: key,
+		row_hlc: held.hlc,
+		record_location: segment_decoded,
+	};
+
+	let program = pbc::Program::compile(&[]).unwrap();
+	let read = read_secondary_index_query_location(
+		&mgr,
+		tenant(),
+		&row,
+		&descriptor,
+		&program,
+		&QueryProjectedExecution::Disabled,
+	)
+	.await
+	.expect("a partitioned row behind a reloaded segment must serve, not refuse")
+	.expect("the row materializes");
+	assert_eq!(read.batch.num_rows(), 1);
+}

@@ -12006,6 +12006,7 @@ async fn plan_table_query_execution_by_secondary_index(
 		let chunk_reads = match clocks
 			.bound(read_secondary_index_query_locations(
 				slab,
+				meta.tenant_id,
 				indexed_chunk,
 				table_descriptor,
 				program,
@@ -12278,6 +12279,7 @@ fn secondary_index_record_fetch_key(location: RecordLocation) -> (SlabId, u64, u
 
 async fn read_secondary_index_query_locations(
 	slab: &SlabManager,
+	tenant_id: TenantId,
 	rows: &[SecondaryIndexLookupRow],
 	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
@@ -12286,6 +12288,7 @@ async fn read_secondary_index_query_locations(
 	let Some(requirement) = projected_execution.requirement() else {
 		return read_secondary_index_query_locations_one_by_one(
 			slab,
+			tenant_id,
 			rows,
 			descriptor,
 			program,
@@ -12317,6 +12320,7 @@ async fn read_secondary_index_query_locations(
 			1 => out.extend(
 				read_secondary_index_query_location_group(
 					slab,
+					tenant_id,
 					rows,
 					&chunk[0],
 					descriptor,
@@ -12330,6 +12334,7 @@ async fn read_secondary_index_query_locations(
 				let (a, b) = tokio::join!(
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[0],
 						descriptor,
@@ -12339,6 +12344,7 @@ async fn read_secondary_index_query_locations(
 					),
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[1],
 						descriptor,
@@ -12354,6 +12360,7 @@ async fn read_secondary_index_query_locations(
 				let (a, b, c) = tokio::join!(
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[0],
 						descriptor,
@@ -12363,6 +12370,7 @@ async fn read_secondary_index_query_locations(
 					),
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[1],
 						descriptor,
@@ -12372,6 +12380,7 @@ async fn read_secondary_index_query_locations(
 					),
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[2],
 						descriptor,
@@ -12388,6 +12397,7 @@ async fn read_secondary_index_query_locations(
 				let (a, b, c, d) = tokio::join!(
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[0],
 						descriptor,
@@ -12397,6 +12407,7 @@ async fn read_secondary_index_query_locations(
 					),
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[1],
 						descriptor,
@@ -12406,6 +12417,7 @@ async fn read_secondary_index_query_locations(
 					),
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[2],
 						descriptor,
@@ -12415,6 +12427,7 @@ async fn read_secondary_index_query_locations(
 					),
 					read_secondary_index_query_location_group(
 						slab,
+						tenant_id,
 						rows,
 						&chunk[3],
 						descriptor,
@@ -12435,6 +12448,7 @@ async fn read_secondary_index_query_locations(
 
 async fn read_secondary_index_query_location_group(
 	slab: &SlabManager,
+	tenant_id: TenantId,
 	rows: &[SecondaryIndexLookupRow],
 	indices: &[usize],
 	descriptor: &TableSchemaDescriptor,
@@ -12472,6 +12486,7 @@ async fn read_secondary_index_query_location_group(
 				} else {
 					read_secondary_index_query_location(
 						slab,
+						tenant_id,
 						&row,
 						descriptor,
 						program,
@@ -12497,6 +12512,7 @@ async fn read_secondary_index_query_location_group(
 				.collect::<Vec<_>>();
 			read_secondary_index_query_locations_one_by_one(
 				slab,
+				tenant_id,
 				&fallback_rows,
 				descriptor,
 				program,
@@ -12511,6 +12527,7 @@ async fn read_secondary_index_query_location_group(
 				.collect::<Vec<_>>();
 			read_secondary_index_query_locations_one_by_one(
 				slab,
+				tenant_id,
 				&fallback_rows,
 				descriptor,
 				program,
@@ -12524,6 +12541,7 @@ async fn read_secondary_index_query_location_group(
 
 async fn read_secondary_index_query_locations_one_by_one(
 	slab: &SlabManager,
+	tenant_id: TenantId,
 	rows: &[SecondaryIndexLookupRow],
 	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
@@ -12531,9 +12549,15 @@ async fn read_secondary_index_query_locations_one_by_one(
 ) -> std::io::Result<Vec<(SecondaryIndexLookupRow, ProjectedQueryLocationRead)>> {
 	let mut out = Vec::new();
 	for row in rows {
-		if let Some(result) =
-			read_secondary_index_query_location(slab, row, descriptor, program, projected_execution)
-				.await?
+		if let Some(result) = read_secondary_index_query_location(
+			slab,
+			tenant_id,
+			row,
+			descriptor,
+			program,
+			projected_execution,
+		)
+		.await?
 		{
 			out.push((row.clone(), result));
 		}
@@ -12570,6 +12594,7 @@ fn execute_secondary_index_projected_row(
 
 async fn read_secondary_index_query_location(
 	slab: &SlabManager,
+	tenant_id: TenantId,
 	row: &SecondaryIndexLookupRow,
 	descriptor: &TableSchemaDescriptor,
 	program: &pbc::Program,
@@ -12589,11 +12614,17 @@ async fn read_secondary_index_query_location(
 	let bytes = slab.read(row.record_location).await?;
 	let storage_batch = decode_batch(&bytes)?;
 	// ADR 0090: the frame is independent placement evidence, and placement is
-	// never resolved from the index alone — the index entry and the frame must
-	// agree at this row before it is served.
+	// never resolved from the index alone. The V1 segment format carries no
+	// placement, so a segment-decoded location reads as legacy after a durable
+	// round-trip; the key chain is the placement authority for this version,
+	// and the segment's reconstruction is only the fallback when the chain no
+	// longer holds it.
+	let (index_placement, index_partition) = slab
+		.version_placement_at(tenant_id, row.row_key_id, row.record_location.hlc)
+		.unwrap_or((row.record_location.placement, row.record_location.partition));
 	resolve_record_placement(
-		row.record_location.placement,
-		row.record_location.partition,
+		index_placement,
+		index_partition,
 		&storage_batch,
 		row.record_location.record_row_index,
 	)?;
