@@ -171,6 +171,8 @@ impl HrftService for MsgRouter {
 				|| x == MsgType::MUTATION_OUTCOME_RESP.0
 				|| x == MsgType::MUTATION_OUTCOME_PIN_REQ.0
 				|| x == MsgType::MUTATION_OUTCOME_PIN_RESP.0
+				|| x == MsgType::DROP_RECLAIM_SLICE_REQ.0
+				|| x == MsgType::DROP_RECLAIM_SLICE_RESP.0
 				|| x == MsgType::AGG_REQ.0
 				|| x == MsgType::AGG_RESP.0
 				|| x == MsgType::COUNTER_ADD_REQ.0

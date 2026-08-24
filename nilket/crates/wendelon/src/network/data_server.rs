@@ -46,8 +46,9 @@ use crate::consensus::monitor::{NodeTracker, PhysicalClock};
 use crate::consensus::raft_storage::{SmState, WendelonLogStore};
 use crate::consensus::{
 	AdmissionSnapshot, HybridLogicalClockDriver, MigrationComplete, MigrationLedgerEntry,
-	MigrationState, TenantFinalization, TenantLifecycleState, WendelonRaft, WendelonRequest,
-	WendelonResponse, WendelonStateMachine,
+	MigrationState, TableDropLogicalFinalizeRequest, TableDropSettlementRequest,
+	TenantFinalization, TenantLifecycleState, WendelonRaft, WendelonRequest, WendelonResponse,
+	WendelonStateMachine,
 };
 use crate::governance::{AutonomousActionSurface, authorize_autonomous_action};
 use crate::metrics::{
@@ -60,6 +61,9 @@ use crate::network::cdc::{
 };
 use crate::network::core::{
 	HRFT_MAGIC, MAX_SECTION_BYTES, read_frame, read_frame_from_header, write_frame,
+};
+use crate::network::drop_reclaim_progress::{
+	DropReclaimPhase, DropReclaimProgressLoad, DropReclaimProgressStore, drop_reclaim_progress_path,
 };
 use crate::network::factory::TransportProviderFactory;
 use crate::network::ipc::{
@@ -137,8 +141,9 @@ use crate::storage::multirow::{
 	pack_admitted_record_batch_by_bucket_with_row_group_encoding_and_chunk_layout_config,
 	pack_tombstone_multirow_source_rows_with_policy, replace_storage_row_hlc_column,
 	resolve_record_placement, storage_index_entries_from_batch, storage_row_is_tombstone_at,
-	storage_row_table_object_id_at,
+	storage_row_table_object_id_at, storage_rows_from_batch, take_rows,
 };
+use crate::storage::mutation_drain::{MutationDrainGuard, MutationDrainRegistry};
 use crate::storage::pk_delete::{
 	PkAdmissionOutcome, admit_pk_delete_row, admit_pk_write_row, row_visible_for_admission,
 };
@@ -610,6 +615,68 @@ struct DataRequestAdmission {
 //  SERVER
 // ============================================================
 
+pub(crate) const DROP_RECLAIM_MAX_EXAMINED_PER_SLICE: usize = 32;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DropReclaimSliceRequest {
+	pub operation_id: crate::integration::compute::DropOperationId,
+	pub finalize_log_index: u64,
+	pub ownership_epoch: u64,
+	pub examined_budget: usize,
+	pub coordinator: NodeId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct DropReclaimSliceResponse {
+	pub examined: usize,
+	pub done: bool,
+	pub corruption_reset: bool,
+}
+
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct DropReclaimSliceRequestMeta {
+	tenant_id: TenantId,
+	table_object_id: TableObjectId,
+	schema_generation: u64,
+	finalize_log_index: u64,
+	ownership_epoch: u64,
+	examined_budget: u32,
+	_pad: [u8; 4],
+	coordinator: NodeId,
+}
+
+impl DropReclaimSliceRequestMeta {
+	fn into_request(self) -> DropReclaimSliceRequest {
+		DropReclaimSliceRequest {
+			operation_id: crate::integration::compute::DropOperationId {
+				tenant_id: self.tenant_id,
+				table_object_id: self.table_object_id,
+				schema_generation: self.schema_generation.into(),
+			},
+			finalize_log_index: self.finalize_log_index,
+			ownership_epoch: self.ownership_epoch,
+			examined_budget: self.examined_budget as usize,
+			coordinator: self.coordinator,
+		}
+	}
+}
+
+#[derive(Clone, Copy, Debug, bytemuck::Pod, bytemuck::Zeroable)]
+#[repr(C)]
+struct DropReclaimSliceResponseMeta {
+	examined: u32,
+	status: u8,
+	done: u8,
+	corruption_reset: u8,
+	_pad: u8,
+}
+
+impl DropReclaimSliceResponseMeta {
+	const OK: u8 = 0;
+	const REJECTED: u8 = 1;
+}
+
 /// Data Ring front door. Owns the local slab, a client to the Raft
 /// Control Ring, and everything needed to run the bifurcated write
 /// path: a [`ReplicaRouter`] to resolve the replica set and a
@@ -656,6 +723,9 @@ pub struct WendelonDataServer {
 	/// permit moves into a spawned local durable append and is released only when
 	/// that work actually finishes, never merely when the caller stops waiting.
 	mutation_work_slots: Arc<Semaphore>,
+	/// ADR 0095 per-object lifecycle linearization and drain counts.
+	mutation_drain: Arc<MutationDrainRegistry>,
+	drop_reclaim_progress: Arc<DropReclaimProgressStore>,
 	/// ADR 542 durable terminal/expiry outcomes. Unlike the process-local replay
 	/// maps, this store is reopened at bootstrap and supports resolution without
 	/// re-submitting the mutation.
@@ -836,6 +906,9 @@ pub const STREAM_FINALIZATION_BUFFER: usize = 128;
 pub const MIGRATION_SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 /// Retry delay after a migration sweep pass fails for one entry.
 pub const MIGRATION_SWEEP_FAILURE_BACKOFF: Duration = Duration::from_secs(2);
+/// ADR 0095 bounded reclaim cadence. Each pass advances only the oldest debt
+/// and each participant is capped by `DROP_RECLAIM_MAX_EXAMINED_PER_SLICE`.
+pub const DROP_RECLAIM_SWEEP_INTERVAL: Duration = Duration::from_millis(200);
 /// Retry cadence for ADR 003 control-branch recovery. Kept short
 /// because a pending row is already quorum-durable in the slabs;
 /// the remaining work is only the Raft metadata commit.
@@ -1102,6 +1175,8 @@ impl Clone for WendelonDataServer {
 			factory: self.factory.clone(),
 			pool: self.pool.clone(),
 			mutation_work_slots: self.mutation_work_slots.clone(),
+			mutation_drain: self.mutation_drain.clone(),
+			drop_reclaim_progress: self.drop_reclaim_progress.clone(),
 			mutation_outcomes: self.mutation_outcomes.clone(),
 			idempotency: self.idempotency.clone(),
 			table_delete_idempotency: self.table_delete_idempotency.clone(),
@@ -1156,6 +1231,279 @@ impl Clone for WendelonDataServer {
 impl WendelonDataServer {
 	fn admission_snapshot(&self) -> Arc<AdmissionSnapshot> {
 		self.admission_snapshot_rx.borrow().clone()
+	}
+
+	pub(crate) async fn run_drop_reclaim_slice(
+		&self,
+		request: DropReclaimSliceRequest,
+	) -> std::io::Result<DropReclaimSliceResponse> {
+		if request.examined_budget == 0
+			|| request.examined_budget > DROP_RECLAIM_MAX_EXAMINED_PER_SLICE
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!(
+					"drop reclaim examined budget must be in 1..={DROP_RECLAIM_MAX_EXAMINED_PER_SLICE}"
+				),
+			));
+		}
+		if self.raft.current_leader().await != Some(request.coordinator.id) {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"drop reclaim slice coordinator is not the current Raft leader",
+			));
+		}
+		let state = self.state_machine.state_snapshot().await;
+		let debt = state
+			.table_drop_reclaim_debts
+			.get(
+				request.operation_id.tenant_id,
+				request.operation_id.table_object_id,
+			)
+			.cloned()
+			.ok_or_else(|| Error::new(ErrorKind::NotFound, "table drop reclaim debt is absent"))?;
+		if debt.operation_id != request.operation_id
+			|| debt.finalize_log_index != request.finalize_log_index
+			|| debt.ownership_epoch != request.ownership_epoch
+		{
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"drop reclaim request identity or ownership epoch is stale",
+			));
+		}
+		if !debt.participants.contains(self.local_node) {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"drop reclaim request names a node outside the stamped participant set",
+			));
+		}
+		let descriptor = state
+			.table_schemas
+			.latest_by_id(
+				request.operation_id.tenant_id,
+				request.operation_id.table_object_id,
+			)
+			.cloned()
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					"drop reclaim descriptor is absent before settlement",
+				)
+			})?;
+		let table_schemas = state.table_schemas.clone();
+		let secondary_indexes = state.secondary_indexes.clone();
+		drop(state);
+
+		self.mutation_drain
+			.wait_until_drained(request.operation_id)
+			.await
+			.map_err(|error| Error::other(format!("table mutation drain failed: {error}")))?;
+		let load = self
+			.drop_reclaim_progress
+			.load_or_start(
+				request.operation_id,
+				request.finalize_log_index,
+				request.ownership_epoch,
+			)
+			.await?;
+		let corruption_reset = matches!(load, DropReclaimProgressLoad::CorruptReset(_));
+		let mut progress = load.progress();
+		// A cursor from an older owner epoch is safe to resume because every
+		// physical slice is idempotent. Only this validated epoch is persisted.
+		progress.owner_epoch = request.ownership_epoch;
+		let mut examined = 0usize;
+		match progress.phase {
+			DropReclaimPhase::LocalL1 => {
+				let report = self
+					.slab
+					.reclaim_table_drop_storage_slice(
+						request.operation_id.tenant_id,
+						&descriptor,
+						&table_schemas,
+						&secondary_indexes,
+						progress.cursor,
+						request.examined_budget,
+					)
+					.await?;
+				examined = report.examined;
+				progress.cursor = report.cursor_next;
+				if report.done {
+					progress.phase = DropReclaimPhase::TieredL2;
+					progress.cursor = Default::default();
+				}
+			}
+			DropReclaimPhase::TieredL2 => {
+				let committer = crate::storage::RaftCommitter::new(self.raft.clone());
+				let report = self
+					.slab
+					.reclaim_table_drop_tiered_storage_slice(
+						request.operation_id.tenant_id,
+						&descriptor,
+						&table_schemas,
+						&committer,
+						progress.cursor,
+						request.examined_budget,
+					)
+					.await?;
+				examined = report.examined;
+				progress.cursor = report.cursor_next;
+				if report.done {
+					progress.phase = DropReclaimPhase::VerifyIndexes;
+					progress.cursor = Default::default();
+				}
+			}
+			DropReclaimPhase::VerifyIndexes => {
+				let references = self.slab.table_drop_reference_counts(
+					request.operation_id.tenant_id,
+					request.operation_id.table_object_id,
+				);
+				if !references.is_empty() {
+					// A rewrite that acquired the same per-slab claim before reclaim may
+					// publish its replacement above this cycle's frozen upper bound. The
+					// keyed check is the bounded witness of that race: restart from a fresh
+					// L1 bound instead of stranding durable progress at VerifyIndexes.
+					tracing::info!(
+						tenant_id = request.operation_id.tenant_id.get(),
+						table_object_id = ?request.operation_id.table_object_id,
+						?references,
+						"table drop reclaim found post-cursor references; starting another bounded pass"
+					);
+					progress.phase = DropReclaimPhase::LocalL1;
+					progress.cursor = Default::default();
+				} else {
+					progress.phase = DropReclaimPhase::Complete;
+				}
+			}
+			DropReclaimPhase::Complete => {}
+		}
+		progress.examined_total = progress
+			.examined_total
+			.saturating_add(u64::try_from(examined).unwrap_or(u64::MAX));
+		if self.raft.current_leader().await != Some(request.coordinator.id) {
+			return Err(Error::new(
+				ErrorKind::PermissionDenied,
+				"drop reclaim leadership changed before progress persistence",
+			));
+		}
+		self.drop_reclaim_progress
+			.store_current_epoch(progress, request.ownership_epoch)
+			.await?;
+		Ok(DropReclaimSliceResponse {
+			examined,
+			done: progress.phase == DropReclaimPhase::Complete,
+			corruption_reset,
+		})
+	}
+
+	async fn request_remote_drop_reclaim_slice(
+		&self,
+		participant: NodeId,
+		request: DropReclaimSliceRequest,
+	) -> std::io::Result<DropReclaimSliceResponse> {
+		let meta = DropReclaimSliceRequestMeta {
+			tenant_id: request.operation_id.tenant_id,
+			table_object_id: request.operation_id.table_object_id,
+			schema_generation: request.operation_id.schema_generation.get(),
+			finalize_log_index: request.finalize_log_index,
+			ownership_epoch: request.ownership_epoch,
+			examined_budget: u32::try_from(request.examined_budget).map_err(|_| {
+				Error::new(
+					ErrorKind::InvalidInput,
+					"drop reclaim examined budget exceeds u32",
+				)
+			})?,
+			_pad: [0; 4],
+			coordinator: request.coordinator,
+		};
+		let conn = self.factory.get_connection(participant).await?;
+		let mut stream = conn.open_bi().await?;
+		let header = FrameHeader {
+			magic: HRFT_MAGIC,
+			version: 1,
+			msg_type: MsgType::DROP_RECLAIM_SLICE_REQ.0,
+			flags: 0,
+			stream_id: stream.stream_id() as u32,
+			meta_len: std::mem::size_of::<DropReclaimSliceRequestMeta>() as u32,
+			arrow_len: 0,
+			trailing_len: 0,
+		};
+		write_frame(&mut *stream, &header, bytemuck::bytes_of(&meta), None, None).await?;
+		stream.finish().await?;
+		let frame = read_frame(&mut *stream, &self.pool).await?;
+		if frame.header.msg_type != MsgType::DROP_RECLAIM_SLICE_RESP.0
+			|| frame.meta.len() != std::mem::size_of::<DropReclaimSliceResponseMeta>()
+		{
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"drop reclaim slice response type or width mismatch",
+			));
+		}
+		let response: DropReclaimSliceResponseMeta = *bytemuck::from_bytes(&frame.meta);
+		if response.status != DropReclaimSliceResponseMeta::OK {
+			let message = frame
+				.trailing
+				.as_deref()
+				.and_then(|bytes| std::str::from_utf8(bytes).ok())
+				.unwrap_or("remote drop reclaim slice was rejected");
+			return Err(Error::other(message.to_string()));
+		}
+		Ok(DropReclaimSliceResponse {
+			examined: response.examined as usize,
+			done: response.done != 0,
+			corruption_reset: response.corruption_reset != 0,
+		})
+	}
+
+	fn drop_reclaim_slice_response_frame(
+		&self,
+		stream_id: u32,
+		result: std::io::Result<DropReclaimSliceResponse>,
+	) -> HrftFrame {
+		let (meta, trailing_bytes) = match result {
+			Ok(response) => (
+				DropReclaimSliceResponseMeta {
+					examined: u32::try_from(response.examined).unwrap_or(u32::MAX),
+					status: DropReclaimSliceResponseMeta::OK,
+					done: u8::from(response.done),
+					corruption_reset: u8::from(response.corruption_reset),
+					_pad: 0,
+				},
+				None,
+			),
+			Err(error) => (
+				DropReclaimSliceResponseMeta {
+					examined: 0,
+					status: DropReclaimSliceResponseMeta::REJECTED,
+					done: 0,
+					corruption_reset: 0,
+					_pad: 0,
+				},
+				Some(error.to_string().into_bytes()),
+			),
+		};
+		let mut body = self.pool.acquire();
+		body.as_mut_vec()
+			.extend_from_slice(bytemuck::bytes_of(&meta));
+		let trailing = trailing_bytes.map(|bytes| {
+			let mut pooled = self.pool.acquire();
+			pooled.as_mut_vec().extend_from_slice(&bytes);
+			pooled
+		});
+		HrftFrame {
+			header: FrameHeader {
+				magic: HRFT_MAGIC,
+				version: 1,
+				msg_type: MsgType::DROP_RECLAIM_SLICE_RESP.0,
+				flags: 0,
+				stream_id,
+				meta_len: body.len() as u32,
+				arrow_len: 0,
+				trailing_len: trailing.as_ref().map_or(0, |bytes| bytes.len() as u32),
+			},
+			meta: body,
+			arrow_payload: None,
+			trailing,
+		}
 	}
 
 	async fn content_hash_admission_guard(
@@ -1859,7 +2207,10 @@ impl WendelonDataServer {
 			PendingFinalizationStore::open(pending_finalizations_path(slab.data_dir()))?;
 		let mutation_outcomes =
 			MutationOutcomeStore::open(mutation_outcomes_path(slab.data_dir()))?;
+		let drop_reclaim_progress =
+			DropReclaimProgressStore::open(drop_reclaim_progress_path(slab.data_dir()))?;
 		let admission_snapshot_rx = state_machine.subscribe_admission_snapshot();
+		let mutation_drain = state_machine.mutation_drain_registry();
 		let counter_replica = Arc::new(crate::storage::counter::CounterReplicaService::new(
 			slab.clone(),
 		));
@@ -1887,6 +2238,8 @@ impl WendelonDataServer {
 					.map(|parallelism| parallelism.get())
 					.unwrap_or(4),
 			)),
+			mutation_drain,
+			drop_reclaim_progress,
 			mutation_outcomes,
 			idempotency: Arc::new(DashMap::new()),
 			table_delete_idempotency: Arc::new(DashMap::new()),
@@ -1939,6 +2292,11 @@ impl WendelonDataServer {
 			cdc_heartbeat_localities: Arc::new(DashMap::new()),
 			cdc_heartbeat_observed_frontiers: Arc::new(DashMap::new()),
 		};
+		// Recovery found no durable store whose replay can append table bytes:
+		// pending-finalization records only finish the control branch after the
+		// data branch is already durable. Opening the barrier here is therefore
+		// the completed P6 reconciliation, not an assumption about later tasks.
+		server.mutation_drain.complete_startup_reconciliation();
 		server.refresh_pending_finalization_backlog_metric();
 		if server.degraded_reason().is_some() {
 			tracing::error!(
@@ -2862,6 +3220,136 @@ impl WendelonDataServer {
 					_ = ticker.tick() => {}
 					_ = self.pending_finalization_wakeup.notified() => {}
 				}
+			}
+		})
+	}
+
+	async fn submit_drop_reclaim_control_request(
+		&self,
+		request: WendelonRequest,
+		stage: &'static str,
+	) -> std::io::Result<()> {
+		let response = self.raft.client_write(request).await.map_err(|error| {
+			Error::other(format!("drop reclaim {stage} commit failed: {error}"))
+		})?;
+		match response.data {
+			WendelonResponse::Success => Ok(()),
+			WendelonResponse::Error(message) => Err(Error::other(format!(
+				"drop reclaim {stage} was rejected: {message}"
+			))),
+			WendelonResponse::LeaseDenied => Err(Error::other(format!(
+				"drop reclaim {stage} returned unexpected lease denial"
+			))),
+		}
+	}
+
+	async fn roll_forward_one_prepared_drop(&self, state: &SmState) -> std::io::Result<bool> {
+		let mut prepared = state
+			.table_drop_fences
+			.iter()
+			.filter(|fence| {
+				state
+					.table_drop_outcomes
+					.get(
+						fence.operation_id.tenant_id,
+						fence.operation_id.table_object_id,
+					)
+					.is_none() && state
+					.table_drop_reclaim_debts
+					.get(
+						fence.operation_id.tenant_id,
+						fence.operation_id.table_object_id,
+					)
+					.is_none()
+			})
+			.copied()
+			.collect::<Vec<_>>();
+		prepared.sort_by_key(|fence| fence.fence_log_index);
+		let Some(fence) = prepared.into_iter().next() else {
+			return Ok(false);
+		};
+		self.submit_drop_reclaim_control_request(
+			WendelonRequest::TableDropLogicalFinalize(TableDropLogicalFinalizeRequest {
+				operation_id: fence.operation_id,
+				fence_log_index: fence.fence_log_index,
+			}),
+			"prepared-drop roll-forward",
+		)
+		.await?;
+		Ok(true)
+	}
+
+	pub(crate) async fn reconcile_drop_reclaim_once(&self) -> std::io::Result<bool> {
+		if self.raft.current_leader().await != Some(self.local_node.id) {
+			return Ok(false);
+		}
+		let state = self.state_machine.state_snapshot().await;
+		if self.roll_forward_one_prepared_drop(&state).await? {
+			return Ok(true);
+		}
+		let mut debts = state
+			.table_drop_reclaim_debts
+			.iter()
+			.cloned()
+			.collect::<Vec<_>>();
+		debts.sort_by_key(|debt| debt.finalize_log_index);
+		drop(state);
+		let Some(debt) = debts.into_iter().next() else {
+			return Ok(false);
+		};
+
+		let request = DropReclaimSliceRequest {
+			operation_id: debt.operation_id,
+			finalize_log_index: debt.finalize_log_index,
+			ownership_epoch: debt.ownership_epoch,
+			examined_budget: DROP_RECLAIM_MAX_EXAMINED_PER_SLICE,
+			coordinator: self.local_node,
+		};
+		let mut all_done = true;
+		for participant in debt.participants.iter() {
+			if self.raft.current_leader().await != Some(self.local_node.id) {
+				return Err(Error::new(
+					ErrorKind::PermissionDenied,
+					"drop reclaim leadership changed during participant collection",
+				));
+			}
+			let response = if participant == self.local_node {
+				self.run_drop_reclaim_slice(request).await?
+			} else {
+				self.request_remote_drop_reclaim_slice(participant, request)
+					.await?
+			};
+			all_done &= response.done;
+		}
+		if !all_done {
+			return Ok(true);
+		}
+		self.submit_drop_reclaim_control_request(
+			WendelonRequest::TableDropSettlement(TableDropSettlementRequest {
+				operation_id: debt.operation_id,
+				finalize_log_index: debt.finalize_log_index,
+				ownership_epoch: debt.ownership_epoch,
+				attested_participants: debt.participants,
+			}),
+			"settlement",
+		)
+		.await?;
+		Ok(true)
+	}
+
+	pub fn spawn_drop_reclaim_sweeper(self: Arc<Self>, tick: Duration) -> JoinHandle<()> {
+		tokio::spawn(async move {
+			let mut ticker = tokio::time::interval(tick);
+			ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+			loop {
+				if let Err(error) = self.reconcile_drop_reclaim_once().await {
+					tracing::warn!(
+						node_id = self.local_node.id,
+						%error,
+						"bounded drop reclaim pass failed; retrying on the next tick"
+					);
+				}
+				ticker.tick().await;
 			}
 		})
 	}
@@ -4836,6 +5324,12 @@ impl WendelonDataServer {
 				}
 				match self.migrate_request(*source, &req).await {
 					Ok((resp, records)) if resp.status == MigrateStatus::OK => {
+						let state = self.state_machine.state_snapshot().await;
+						let records = migration_records_without_logically_dropped_rows(
+							&records,
+							&state.table_drop_tombstones,
+						)?;
+						drop(state);
 						for record in &records {
 							self.slab
 								.append_migration_with_locality(
@@ -5009,6 +5503,12 @@ impl WendelonDataServer {
 					);
 					break;
 				}
+				let state = self.state_machine.state_snapshot().await;
+				let records = migration_records_without_logically_dropped_rows(
+					&records,
+					&state.table_drop_tombstones,
+				)?;
+				drop(state);
 				for record in &records {
 					self.slab
 						.append_migration_with_locality(
@@ -5295,10 +5795,7 @@ impl WendelonDataServer {
 				self.local_node,
 			));
 		}
-		if sm_peek
-			.table_drop_fences
-			.is_fenced(meta.tenant_id, meta.table_object_id)
-		{
+		if sm_peek.table_drop_blocks_admission(meta.tenant_id, meta.table_object_id) {
 			return Ok(query_plan_error(
 				&range_meta,
 				ReadStatus::QUERY_INVALID_PROGRAM,
@@ -5842,10 +6339,7 @@ impl WendelonDataServer {
 		};
 
 		let sm_peek = self.state_machine.state_snapshot().await;
-		if sm_peek
-			.table_drop_fences
-			.is_fenced(request.tenant_id, request.table_object_id)
-		{
+		if sm_peek.table_drop_blocks_admission(request.tenant_id, request.table_object_id) {
 			return Ok(Err(AggRejectCode::SchemaUnknown));
 		}
 		let descriptor = match sm_peek.table_schemas.get(
@@ -6312,6 +6806,31 @@ impl DataRingServer for WendelonDataServer {
 	) -> std::io::Result<Option<HrftFrame>> {
 		let msg_type = MsgType(frame.header.msg_type);
 		match msg_type {
+			MsgType::DROP_RECLAIM_SLICE_REQ => {
+				if frame.meta.len() != std::mem::size_of::<DropReclaimSliceRequestMeta>() {
+					return Err(Error::new(
+						ErrorKind::InvalidData,
+						"DROP_RECLAIM_SLICE_REQ meta width mismatch",
+					));
+				}
+				let meta: DropReclaimSliceRequestMeta = *bytemuck::from_bytes(&frame.meta);
+				self.authorize_actor_for_data(
+					&context.actor,
+					Some(meta.tenant_id),
+					DataOperation::Replicate,
+				)?;
+				if context.actor.node_id != Some(meta.coordinator) {
+					return Err(Error::new(
+						ErrorKind::PermissionDenied,
+						"drop reclaim coordinator does not match the authenticated peer",
+					));
+				}
+				let result = self.run_drop_reclaim_slice(meta.into_request()).await;
+				Ok(Some(self.drop_reclaim_slice_response_frame(
+					frame.header.stream_id,
+					result,
+				)))
+			}
 			MsgType::WRITE_REQ => {
 				if frame.meta.len() < std::mem::size_of::<WriteRequestMeta>() {
 					return Err(Error::new(
@@ -8318,6 +8837,7 @@ impl WendelonDataServer {
 		delete_counts: Option<[u32; 3]>,
 		mut clocks: WriteClocks,
 		permit: OwnedSemaphorePermit,
+		mutation_drain: MutationDrainGuard,
 	) -> std::io::Result<(WriteResponseMeta, Option<FinalizationMarker>)> {
 		let mut synthetic = table_write_synthetic_meta(
 			&meta,
@@ -8486,6 +9006,7 @@ impl WendelonDataServer {
 			let mutation_permit = mutation_permit
 				.take()
 				.expect("one mutation permit exists before local durable spawn");
+			let local_mutation_drain = mutation_drain.clone();
 			let slab = self.slab.clone();
 			let tenant_id = meta.tenant_id;
 			let secondary_index_descriptors = secondary_index_descriptors.clone();
@@ -8499,6 +9020,7 @@ impl WendelonDataServer {
 				.take();
 			let task = tokio::spawn(async move {
 				let _mutation_permit = mutation_permit;
+				let _mutation_drain = local_mutation_drain;
 				#[cfg(test)]
 				if let Some(delay) = delay_local_durable_append {
 					tokio::time::sleep(delay).await;
@@ -8815,6 +9337,23 @@ impl WendelonDataServer {
 			Ok(permit) => permit,
 			Err(response) => return Ok(response),
 		};
+		let mutation_drain = match self.mutation_drain.admit(
+			meta.tenant_id,
+			meta.table_object_id,
+			meta.schema_generation,
+		) {
+			Ok(guard) => guard,
+			Err(_) => {
+				return Ok((
+					self.table_write_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+					),
+					None,
+				));
+			}
+		};
 
 		if self.degraded_reason().is_some() {
 			let synthetic = table_write_synthetic_meta(&meta, Identity::ZERO, 0);
@@ -8830,9 +9369,8 @@ impl WendelonDataServer {
 				meta.tenant_id,
 				meta.table_object_id,
 			);
-			let drop_fenced = state
-				.table_drop_fences
-				.is_fenced(meta.tenant_id, meta.table_object_id);
+			let drop_fenced =
+				state.table_drop_blocks_admission(meta.tenant_id, meta.table_object_id);
 			let descriptor = state
 				.table_schemas
 				.latest_by_id(meta.tenant_id, meta.table_object_id)
@@ -9033,6 +9571,7 @@ impl WendelonDataServer {
 				None,
 				clocks,
 				mutation_permit,
+				mutation_drain,
 			)
 			.await?;
 		if matches!(
@@ -9307,6 +9846,23 @@ impl WendelonDataServer {
 			Ok(permit) => permit,
 			Err(response) => return Ok(response),
 		};
+		let mutation_drain = match self.mutation_drain.admit(
+			meta.tenant_id,
+			meta.table_object_id,
+			meta.schema_generation,
+		) {
+			Ok(guard) => guard,
+			Err(_) => {
+				return Ok((
+					self.table_delete_error_response(
+						&meta,
+						WriteStatus::INTERNAL_ERROR,
+						PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN,
+					),
+					None,
+				));
+			}
+		};
 
 		if self.degraded_reason().is_some() {
 			let synthetic = table_delete_synthetic_write_meta(&meta, Identity::ZERO, 0);
@@ -9324,9 +9880,8 @@ impl WendelonDataServer {
 				meta.tenant_id,
 				meta.table_object_id,
 			);
-			let drop_fenced = state
-				.table_drop_fences
-				.is_fenced(meta.tenant_id, meta.table_object_id);
+			let drop_fenced =
+				state.table_drop_blocks_admission(meta.tenant_id, meta.table_object_id);
 			let descriptor = state
 				.table_schemas
 				.latest_by_id(meta.tenant_id, meta.table_object_id)
@@ -9579,6 +10134,7 @@ impl WendelonDataServer {
 				Some([deleted_count, already_deleted_count, not_found_count]),
 				clocks,
 				mutation_permit,
+				mutation_drain,
 			)
 			.await?;
 		let response = table_delete_rows_response(
@@ -13604,6 +14160,59 @@ struct MigrationRecord {
 	hlc: HybridTimestamp,
 	payload_hash: [u8; 32],
 	frame_bytes: Vec<u8>,
+}
+
+/// ADR 0095 migration closure: a post-finalize migration must never widen the
+/// stamped erasure participant set by copying bytes for a logically dropped
+/// object to a new node. Filtering is row-granular because one physical frame
+/// may mix live table rows and legacy unstamped rows with the dropped object.
+fn migration_records_without_logically_dropped_rows(
+	records: &[MigrationRecord],
+	tombstones: &crate::schema::TableDropTombstoneCatalog,
+) -> std::io::Result<Vec<MigrationRecord>> {
+	let mut filtered_records = Vec::with_capacity(records.len());
+	for record in records {
+		let batch = decode_batch(&record.frame_bytes)?;
+		if !has_storage_synthetic_columns(&batch) {
+			filtered_records.push(record.clone());
+			continue;
+		}
+		let rows = storage_rows_from_batch(&batch)?;
+		let requested_row = rows
+			.iter()
+			.find(|row| row.key_identity == record.key_identity && row.row_hlc == record.hlc)
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::InvalidData,
+					"migration frame does not contain its requested row identity/HLC",
+				)
+			})?;
+		let is_dropped = |row: &crate::storage::multirow::StorageRowMetadata| {
+			row.table_object_id.is_some_and(|table_object_id| {
+				tombstones.contains(record.tenant_id, table_object_id)
+			})
+		};
+		if is_dropped(requested_row) {
+			continue;
+		}
+		let keep = rows
+			.iter()
+			.enumerate()
+			.filter_map(|(index, row)| (!is_dropped(row)).then_some(index))
+			.collect::<Vec<_>>();
+		if keep.len() == rows.len() {
+			filtered_records.push(record.clone());
+			continue;
+		}
+		let filtered = take_rows(&batch, &keep)?;
+		let frame_bytes = encode_batch(&filtered)?;
+		filtered_records.push(MigrationRecord {
+			payload_hash: crate::hash::content::digest(&frame_bytes),
+			frame_bytes,
+			..record.clone()
+		});
+	}
+	Ok(filtered_records)
 }
 
 /// Find a ledger entry pending on the local node whose locality

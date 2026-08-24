@@ -3288,17 +3288,17 @@ async fn secondary_index_drop_gc_deletes_sidecars_and_clears_local_coverage() {
 }
 
 #[tokio::test]
-async fn secondary_index_source_slab_read_lease_blocks_compaction_claim() {
+async fn adr0095_slab_rewrite_claim_serializes_both_rewrite_orders() {
 	let manager = fresh_manager().await;
 	let source_slab_id = force_seal_active(&manager).await;
 	let source_slab_lease = manager
-		.acquire_secondary_index_source_slab_read_lease(source_slab_id)
+		.acquire_slab_rewrite_read_claim(source_slab_id)
 		.await
 		.unwrap();
 
 	let blocked = tokio::time::timeout(
 		Duration::from_millis(20),
-		manager.acquire_secondary_index_source_slab_compaction_lease(source_slab_id),
+		manager.acquire_slab_rewrite_exclusive_claim(source_slab_id),
 	)
 	.await;
 	assert!(
@@ -3309,11 +3309,28 @@ async fn secondary_index_source_slab_read_lease_blocks_compaction_claim() {
 	drop(source_slab_lease);
 	let compaction_lease = tokio::time::timeout(
 		Duration::from_secs(1),
-		manager.acquire_secondary_index_source_slab_compaction_lease(source_slab_id),
+		manager.acquire_slab_rewrite_exclusive_claim(source_slab_id),
 	)
 	.await
 	.expect("compaction lease should become available after backfill releases");
+	let blocked_reader = tokio::time::timeout(
+		Duration::from_millis(20),
+		manager.acquire_slab_rewrite_read_claim(source_slab_id),
+	)
+	.await;
+	assert!(
+		blocked_reader.is_err(),
+		"a backfill/read-side rewrite cannot enter while reclaim or compaction owns the slab"
+	);
 	drop(compaction_lease);
+	let reader = tokio::time::timeout(
+		Duration::from_secs(1),
+		manager.acquire_slab_rewrite_read_claim(source_slab_id),
+	)
+	.await
+	.expect("read-side rewrite proceeds after the exclusive owner leaves")
+	.unwrap();
+	drop(reader);
 }
 
 #[tokio::test]
@@ -5186,6 +5203,89 @@ async fn table_drop_reclaim_removes_target_table_rows() {
 	assert!(mgr.lookup(tenant(), target_key_a).is_none());
 	assert!(mgr.lookup(tenant(), target_key_b).is_none());
 	assert!(mgr.lookup(tenant(), other_key).is_some());
+}
+
+#[tokio::test]
+async fn adr0095_table_drop_slice_bounds_examined_work_and_resumes_after_cursor() {
+	let mgr = fresh_manager().await;
+	let target = append_only_retention_descriptor(TableObjectId::new([0x95; 16]));
+	let other =
+		append_only_retention_descriptor_named(TableObjectId::new([0x96; 16]), "other_0095");
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), target.clone()).unwrap();
+	schemas.upsert(tenant(), other.clone()).unwrap();
+	let target_key = id(0x9500);
+	let mut nonmatching_keys = Vec::new();
+	for slab_ordinal in 0..7_u64 {
+		let (table_object_id, key) = if slab_ordinal == 5 {
+			(target.table_object_id, target_key)
+		} else {
+			let key = id(0x9600 + slab_ordinal);
+			nonmatching_keys.push(key);
+			(other.table_object_id, key)
+		};
+		let frame = encode_test_append_only_storage_frame(
+			table_object_id,
+			&[(
+				key,
+				Locality::new(100 + slab_ordinal),
+				hlc(100 + slab_ordinal),
+				1,
+				false,
+			)],
+		);
+		let entries = storage_multirow_index_entries_from_frame(&frame)
+			.unwrap()
+			.expect("one-row storage entry");
+		mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+			.await
+			.unwrap();
+		force_seal_active(&mgr).await;
+	}
+
+	let mut cursor = TableDropReclaimCursor::default();
+	let mut examined_total = 0usize;
+	let mut rewritten_total = 0usize;
+	let mut prior_after = None;
+	loop {
+		let report = mgr
+			.reclaim_table_drop_storage_slice(
+				tenant(),
+				&target,
+				&schemas,
+				&SecondaryIndexCatalog::default(),
+				cursor,
+				2,
+			)
+			.await
+			.unwrap();
+		assert!(report.examined <= 2, "examined work is the API budget");
+		if let (Some(prior), Some(next)) = (prior_after, report.cursor_next.after_slab_id) {
+			assert!(
+				next > prior,
+				"the durable cursor never re-examines prior slabs"
+			);
+		}
+		examined_total += report.examined;
+		rewritten_total += report.rewritten;
+		prior_after = report.cursor_next.after_slab_id;
+		cursor = report.cursor_next;
+		if report.done {
+			break;
+		}
+	}
+	assert_eq!(
+		examined_total, 7,
+		"every captured slab was examined exactly once"
+	);
+	assert_eq!(
+		rewritten_total, 1,
+		"only the target-bearing slab was rewritten"
+	);
+	assert!(mgr.lookup(tenant(), target_key).is_none());
+	for key in nonmatching_keys {
+		assert!(mgr.lookup(tenant(), key).is_some());
+	}
 }
 
 #[tokio::test]
@@ -10416,10 +10516,12 @@ async fn reopen_restores_tiered_rows_from_redb() {
 async fn cleanup_retention_rewrite_tmp_files_removes_stale_plaintext() {
 	let dir = fresh_dir("retention-tmp-cleanup");
 	let tmp_path = retention_rewrite_tmp_path(&dir, SlabId::new(0x77));
+	let table_drop_tmp_path = table_drop_rewrite_tmp_path(&dir, SlabId::new(0x78));
 	std::fs::write(&tmp_path, b"plaintext-leak").unwrap();
+	std::fs::write(&table_drop_tmp_path, b"dropped-table-plaintext-leak").unwrap();
 	assert!(
-		tmp_path.exists(),
-		"fixture temp file should exist before open"
+		tmp_path.exists() && table_drop_tmp_path.exists(),
+		"both rewrite fixture files should exist before open"
 	);
 
 	let file_ops = BlockingFileOps;
@@ -10428,8 +10530,54 @@ async fn cleanup_retention_rewrite_tmp_files_removes_stale_plaintext() {
 		.unwrap();
 
 	assert!(
-		!tmp_path.exists(),
-		"startup cleanup should remove stale plaintext retention temp files"
+		!tmp_path.exists() && !table_drop_tmp_path.exists(),
+		"startup cleanup removes stale retention and table-drop plaintext"
+	);
+}
+
+#[tokio::test]
+async fn adr0095_tiered_cleanup_intent_is_durable_and_budgeted_before_receipt() {
+	let (manager, l2) = fresh_manager_with_l2("adr0095-l2-cleanup-intent").await;
+	let slab_id = SlabId::new(0x95);
+	let key = "adr0095/old-target-bearing-slab.wnd";
+	let old_uri = l2.put(key, b"old-target-bytes").await.unwrap();
+	manager
+		.persist_table_drop_l2_cleanup(slab_id, &old_uri, None)
+		.await
+		.unwrap();
+	let marker = super::retention_reclaim::table_drop_l2_cleanup_path(&manager.config.dir, slab_id);
+	assert!(
+		marker.exists(),
+		"cleanup intent is durable before pointer mutation"
+	);
+
+	let (examined, done) = manager
+		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 0)
+		.await
+		.unwrap();
+	assert_eq!(examined, 0);
+	assert!(
+		!done,
+		"a zero budget cannot erase or attest pending cleanup"
+	);
+	assert!(marker.exists());
+
+	let (examined, done) = manager
+		.reconcile_table_drop_l2_cleanup_markers(l2.as_ref(), 1)
+		.await
+		.unwrap();
+	assert_eq!(examined, 1);
+	assert!(done);
+	assert!(
+		!marker.exists(),
+		"the marker clears only after old-object deletion"
+	);
+	assert!(
+		l2.list("adr0095/old-target-bearing-slab")
+			.await
+			.unwrap()
+			.is_empty(),
+		"no target-bearing L2 object survives the cleanup receipt"
 	);
 }
 

@@ -729,7 +729,7 @@ impl SlabManager {
 			tenant_id, descriptor,
 		));
 		let source_slab_lease = self
-			.acquire_secondary_index_source_slab_read_lease(source_slab_id)
+			.acquire_slab_rewrite_read_claim(source_slab_id)
 			.await
 			.map_err(|err| {
 				self.mark_secondary_index_uncovered(
@@ -1634,34 +1634,29 @@ impl SlabManager {
 		(active_slab_id, historical)
 	}
 
-	pub(super) fn secondary_index_source_slab_lease(
-		&self,
-		source_slab_id: SlabId,
-	) -> Arc<AsyncRwLock<()>> {
-		self.secondary_index_source_slab_leases
+	pub(super) fn slab_rewrite_claim(&self, source_slab_id: SlabId) -> Arc<AsyncRwLock<()>> {
+		self.slab_rewrite_claims
 			.entry(source_slab_id)
 			.or_insert_with(|| Arc::new(AsyncRwLock::new(())))
 			.clone()
 	}
 
-	pub(super) async fn acquire_secondary_index_source_slab_read_lease(
+	pub(super) async fn acquire_slab_rewrite_read_claim(
 		&self,
 		source_slab_id: SlabId,
 	) -> std::io::Result<OwnedRwLockReadGuard<()>> {
-		let source_slab_lease = self.secondary_index_source_slab_lease(source_slab_id);
+		let source_slab_lease = self.slab_rewrite_claim(source_slab_id);
 		let guard = source_slab_lease.read_owned().await;
 		self.ensure_secondary_index_source_slab_available(source_slab_id)
 			.await?;
 		Ok(guard)
 	}
 
-	pub(super) async fn acquire_secondary_index_source_slab_compaction_lease(
+	pub(crate) async fn acquire_slab_rewrite_exclusive_claim(
 		&self,
 		source_slab_id: SlabId,
 	) -> OwnedRwLockWriteGuard<()> {
-		self.secondary_index_source_slab_lease(source_slab_id)
-			.write_owned()
-			.await
+		self.slab_rewrite_claim(source_slab_id).write_owned().await
 	}
 
 	pub(super) async fn ensure_secondary_index_source_slab_available(

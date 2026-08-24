@@ -14,10 +14,38 @@ pub(super) fn table_drop_rewrite_tmp_path(dir: &Path, slab_id: SlabId) -> PathBu
 	dir.join(format!("slab_{:016x}.wnd.table_drop.tmp", slab_id))
 }
 
+const TABLE_DROP_L2_CLEANUP_PREFIX: &str = "table_drop_l2_cleanup_";
+const TABLE_DROP_L2_CLEANUP_SUFFIX: &str = ".pending";
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct PendingTableDropL2Cleanup {
+	format_version: u8,
+	slab_id: SlabId,
+	old_l2_uri: String,
+	replacement_l2_uri: Option<String>,
+}
+
+pub(super) fn table_drop_l2_cleanup_path(dir: &Path, slab_id: SlabId) -> PathBuf {
+	dir.join(format!(
+		"{TABLE_DROP_L2_CLEANUP_PREFIX}{:016x}{TABLE_DROP_L2_CLEANUP_SUFFIX}",
+		slab_id
+	))
+}
+
+fn parse_table_drop_l2_cleanup_filename(name: &str) -> Option<SlabId> {
+	let raw = name
+		.strip_prefix(TABLE_DROP_L2_CLEANUP_PREFIX)?
+		.strip_suffix(TABLE_DROP_L2_CLEANUP_SUFFIX)?;
+	(raw.len() == 16)
+		.then(|| u64::from_str_radix(raw, 16).ok().map(SlabId::new))
+		.flatten()
+}
+
 pub(super) fn parse_mvcc_rewrite_tmp_filename(name: &str) -> Option<SlabId> {
-	let rest = name
-		.strip_prefix("slab_")?
-		.strip_suffix(".wnd.retention.tmp")?;
+	let rest = name.strip_prefix("slab_")?;
+	let rest = rest
+		.strip_suffix(".wnd.retention.tmp")
+		.or_else(|| rest.strip_suffix(".wnd.table_drop.tmp"))?;
 	if rest.len() != 16 {
 		return None;
 	}
@@ -53,6 +81,355 @@ pub(super) async fn cleanup_retention_rewrite_tmp_files(
 }
 
 impl SlabManager {
+	pub(super) async fn persist_table_drop_l2_cleanup(
+		&self,
+		slab_id: SlabId,
+		old_l2_uri: &str,
+		replacement_l2_uri: Option<&str>,
+	) -> std::io::Result<()> {
+		let marker = PendingTableDropL2Cleanup {
+			format_version: 1,
+			slab_id,
+			old_l2_uri: old_l2_uri.to_string(),
+			replacement_l2_uri: replacement_l2_uri.map(str::to_string),
+		};
+		let bytes = postcard::to_stdvec(&marker).map_err(|error| {
+			Error::new(
+				ErrorKind::InvalidData,
+				format!("encode table-drop L2 cleanup marker: {error}"),
+			)
+		})?;
+		let path = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
+		write_file(
+			self.file_ops.as_ref(),
+			&path,
+			OpenFlags {
+				write: true,
+				create: true,
+				truncate: true,
+				..OpenFlags::default()
+			},
+			&bytes,
+		)
+		.await?;
+		self.file_ops.fsync_dir(&self.config.dir).await
+	}
+
+	pub(super) async fn reconcile_table_drop_l2_cleanup_markers(
+		&self,
+		object_store: &dyn ObjectStore,
+		examined_budget: usize,
+	) -> std::io::Result<(usize, bool)> {
+		let mut markers = self
+			.file_ops
+			.read_dir(&self.config.dir)
+			.await?
+			.into_iter()
+			.filter_map(|entry| {
+				entry
+					.is_file
+					.then(|| {
+						entry
+							.file_name
+							.to_str()
+							.and_then(parse_table_drop_l2_cleanup_filename)
+					})
+					.flatten()
+			})
+			.collect::<Vec<_>>();
+		markers.sort_unstable();
+		let total = markers.len();
+		let mut examined = 0usize;
+		for slab_id in markers.into_iter().take(examined_budget) {
+			examined += 1;
+			let path = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
+			let bytes = self.file_ops.read_all(&path).await?;
+			let marker: PendingTableDropL2Cleanup =
+				postcard::from_bytes(&bytes).map_err(|error| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!(
+							"table-drop L2 cleanup marker for slab {slab_id} is corrupt: {error}"
+						),
+					)
+				})?;
+			if marker.format_version != 1 || marker.slab_id != slab_id {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					format!(
+						"table-drop L2 cleanup marker for slab {slab_id} has unsupported identity or format"
+					),
+				));
+			}
+			let current_uri = self
+				.tier_pointer(slab_id)
+				.await
+				.map(|pointer| pointer.l2_uri);
+			if current_uri.as_deref() != Some(marker.old_l2_uri.as_str()) {
+				Self::delete_l2_object_if_present(object_store, &marker.old_l2_uri).await?;
+			} else if let Some(replacement_uri) = marker.replacement_l2_uri.as_deref() {
+				Self::delete_l2_object_if_present(object_store, replacement_uri).await?;
+			}
+			// If the old pointer is still authoritative, the replacement commit did
+			// not become visible and the next bounded pass will retry it. Otherwise
+			// the old object is gone before this durable intent is removed.
+			unlink_local_file(self.file_ops.as_ref(), &path).await?;
+		}
+		Ok((examined, examined == total))
+	}
+
+	pub async fn reclaim_table_drop_storage_slice(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		table_schemas: &TableSchemaCatalog,
+		secondary_indexes: &SecondaryIndexCatalog,
+		cursor: TableDropReclaimCursor,
+		examined_budget: usize,
+	) -> std::io::Result<TableDropReclaimSliceReport> {
+		descriptor.validate()?;
+		if descriptor.table_object_id == TableObjectId::DEFAULT_KV || examined_budget == 0 {
+			return Ok(TableDropReclaimSliceReport {
+				cursor_next: cursor,
+				done: descriptor.table_object_id == TableObjectId::DEFAULT_KV,
+				..TableDropReclaimSliceReport::default()
+			});
+		}
+		let _ = self.seal_active_for_table_drop_reclaim().await?;
+		let sealed = {
+			let state = self.state.lock().await;
+			let mut slabs = state
+				.sealed
+				.iter()
+				.map(|entry| (*entry.key(), entry.value().clone()))
+				.collect::<Vec<_>>();
+			slabs.sort_by_key(|(slab_id, _)| *slab_id);
+			slabs
+		};
+		let upper_bound = cursor
+			.upper_bound_slab_id
+			.or_else(|| sealed.last().map(|(slab_id, _)| *slab_id));
+		let mut report = TableDropReclaimSliceReport {
+			cursor_next: TableDropReclaimCursor {
+				after_slab_id: cursor.after_slab_id,
+				upper_bound_slab_id: upper_bound,
+			},
+			..TableDropReclaimSliceReport::default()
+		};
+		let candidates = sealed.into_iter().filter(|(slab_id, _)| {
+			cursor.after_slab_id.is_none_or(|after| *slab_id > after)
+				&& upper_bound.is_none_or(|upper| *slab_id <= upper)
+		});
+		for (slab_id, slab) in candidates.take(examined_budget) {
+			report.examined += 1;
+			report.cursor_next.after_slab_id = Some(slab_id);
+			if let Some(outcome) = self
+				.reclaim_one_sealed_table_drop_slab(
+					slab_id,
+					slab,
+					tenant_id,
+					descriptor,
+					table_schemas,
+					secondary_indexes,
+				)
+				.await?
+			{
+				report.rewritten += 1;
+				report.reclaimed_records = report
+					.reclaimed_records
+					.saturating_add(outcome.reclaimed_records);
+				report.reclaimed_bytes = report
+					.reclaimed_bytes
+					.saturating_add(outcome.reclaimed_bytes);
+			}
+		}
+		report.done = match upper_bound {
+			None => true,
+			Some(upper) => report
+				.cursor_next
+				.after_slab_id
+				.is_some_and(|after| after >= upper),
+		};
+		Ok(report)
+	}
+
+	pub async fn reclaim_table_drop_tiered_storage_slice(
+		&self,
+		tenant_id: TenantId,
+		descriptor: &TableSchemaDescriptor,
+		table_schemas: &TableSchemaCatalog,
+		committer: &dyn TierCommitter,
+		cursor: TableDropReclaimCursor,
+		examined_budget: usize,
+	) -> std::io::Result<TableDropReclaimSliceReport> {
+		descriptor.validate()?;
+		if descriptor.table_object_id == TableObjectId::DEFAULT_KV || examined_budget == 0 {
+			return Ok(TableDropReclaimSliceReport {
+				cursor_next: cursor,
+				done: descriptor.table_object_id == TableObjectId::DEFAULT_KV,
+				..TableDropReclaimSliceReport::default()
+			});
+		}
+		let mut pointers = self.list_tiered_slabs().await;
+		pointers.sort_by_key(|pointer| pointer.slab_id);
+		let upper_bound = cursor
+			.upper_bound_slab_id
+			.or_else(|| pointers.last().map(|pointer| pointer.slab_id));
+		let mut report = TableDropReclaimSliceReport {
+			cursor_next: TableDropReclaimCursor {
+				after_slab_id: cursor.after_slab_id,
+				upper_bound_slab_id: upper_bound,
+			},
+			..TableDropReclaimSliceReport::default()
+		};
+		if pointers.is_empty() && self.config.l2.is_none() {
+			report.done = true;
+			return Ok(report);
+		}
+		let object_store = self.config.l2.clone().ok_or_else(|| {
+			Error::new(
+				ErrorKind::NotFound,
+				"table drop tiered reclaim requires an L2 object store",
+			)
+		})?;
+		let (cleanup_examined, cleanup_done) = self
+			.reconcile_table_drop_l2_cleanup_markers(object_store.as_ref(), examined_budget)
+			.await?;
+		report.examined = cleanup_examined;
+		if !cleanup_done || cleanup_examined == examined_budget {
+			return Ok(report);
+		}
+		if pointers.is_empty() {
+			report.done = true;
+			return Ok(report);
+		}
+		let pointer_budget = examined_budget - cleanup_examined;
+		let candidates = pointers.into_iter().filter(|pointer| {
+			cursor
+				.after_slab_id
+				.is_none_or(|after| pointer.slab_id > after)
+				&& upper_bound.is_none_or(|upper| pointer.slab_id <= upper)
+		});
+		for pointer in candidates.take(pointer_budget) {
+			let _slab_rewrite_claim = self
+				.acquire_slab_rewrite_exclusive_claim(pointer.slab_id)
+				.await;
+			report.examined += 1;
+			report.cursor_next.after_slab_id = Some(pointer.slab_id);
+			let Some(prepared) = self
+				.prepare_tiered_table_drop_rewrite(&pointer, tenant_id, descriptor, table_schemas)
+				.await?
+			else {
+				continue;
+			};
+			match prepared {
+				PreparedTieredTableDropRewrite::Rewrite {
+					slab_id,
+					old_l2_uri,
+					encrypted_bytes,
+					payload_hash,
+					tombstone_metadata,
+					supersession_metadata,
+					reclaimed_records,
+					reclaimed_bytes,
+				} => {
+					let key = self.table_drop_rewritten_key(slab_id);
+					let new_uri = object_store.put(&key, &encrypted_bytes).await?;
+					let fetched = object_store.get(&new_uri).await?;
+					let fetched_hash = crate::hash::content::digest(&fetched);
+					if fetched_hash != payload_hash {
+						let _ = Self::delete_l2_object_if_present(object_store.as_ref(), &new_uri)
+							.await;
+						return Err(Error::new(
+							ErrorKind::InvalidData,
+							format!(
+								"table drop rewrite hash mismatch for slab {}: expected {:02x?}, got {:02x?}",
+								slab_id,
+								&payload_hash[..4],
+								&fetched_hash[..4],
+							),
+						));
+					}
+					let footer = self
+						.encrypted_tiered_footer_summary(&encrypted_bytes)?
+						.ok_or_else(|| {
+							Error::new(
+								ErrorKind::InvalidData,
+								format!(
+									"table drop rewrite for slab {} did not produce an encrypted footer",
+									slab_id
+								),
+							)
+						})?;
+					let (stats_format_version, stats_block_len, stats_block_hash128) =
+						stats_advisory_fields(footer.stats_locator);
+					let tier = TieredSlab {
+						slab_id,
+						l2_uri: new_uri.clone(),
+						payload_hash,
+						is_encrypted: true,
+						tenant_id: Some(footer.tenant_id),
+						tenant_kek_id: Some(footer.tenant_kek_id),
+						stats_format_version,
+						stats_block_len,
+						stats_block_hash128,
+						tombstone_metadata,
+						supersession_metadata,
+					};
+					self.persist_table_drop_l2_cleanup(slab_id, &old_l2_uri, Some(&new_uri))
+						.await?;
+					let cleanup_marker = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
+					if let Err(error) = committer.commit_tier_slab(tier).await {
+						// Commit errors are ambiguous: the Raft apply may still have won.
+						// Keep both objects and the durable marker; the next slice resolves
+						// which URI is authoritative before deleting either old data.
+						return Err(error);
+					}
+					if old_l2_uri != new_uri {
+						Self::delete_l2_object_if_present(object_store.as_ref(), &old_l2_uri)
+							.await?;
+					}
+					unlink_local_file(self.file_ops.as_ref(), &cleanup_marker).await?;
+					self.clear_retired_tiered_cleanup(slab_id);
+					report.rewritten += 1;
+					report.reclaimed_records =
+						report.reclaimed_records.saturating_add(reclaimed_records);
+					report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(reclaimed_bytes);
+				}
+				PreparedTieredTableDropRewrite::Retire {
+					slab_id,
+					old_l2_uri,
+					reclaimed_records,
+					reclaimed_bytes,
+				} => {
+					self.persist_table_drop_l2_cleanup(slab_id, &old_l2_uri, None)
+						.await?;
+					let cleanup_marker = table_drop_l2_cleanup_path(&self.config.dir, slab_id);
+					if let Err(error) = committer.retire_tiered_slab(slab_id).await {
+						// As above, a transport error does not prove the retirement failed.
+						// Reconciliation compares the durable pointer with the marker.
+						return Err(error);
+					}
+					Self::delete_l2_object_if_present(object_store.as_ref(), &old_l2_uri).await?;
+					unlink_local_file(self.file_ops.as_ref(), &cleanup_marker).await?;
+					self.clear_retired_tiered_cleanup(slab_id);
+					report.rewritten += 1;
+					report.reclaimed_records =
+						report.reclaimed_records.saturating_add(reclaimed_records);
+					report.reclaimed_bytes = report.reclaimed_bytes.saturating_add(reclaimed_bytes);
+				}
+			}
+		}
+		report.done = match upper_bound {
+			None => true,
+			Some(upper) => report
+				.cursor_next
+				.after_slab_id
+				.is_some_and(|after| after >= upper),
+		};
+		Ok(report)
+	}
+
 	pub async fn reclaim_tombstoned_ranges(
 		&self,
 		tombstones: &[MigratedRangeTombstone],

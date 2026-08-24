@@ -487,6 +487,43 @@ pub struct TableDropReclaimReport {
 	pub reclaimed_bytes: u64,
 }
 
+/// Stable scan position for one ADR 0095 bounded reclaim phase. The upper
+/// bound is captured on the first slice: after mutation drain closes, newer
+/// slabs cannot contain target rows and must not make one debt chase an
+/// unbounded moving tail.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropReclaimCursor {
+	pub after_slab_id: Option<SlabId>,
+	pub upper_bound_slab_id: Option<SlabId>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableDropReclaimSliceReport {
+	pub cursor_next: TableDropReclaimCursor,
+	pub examined: usize,
+	pub rewritten: usize,
+	pub reclaimed_records: usize,
+	pub reclaimed_bytes: u64,
+	pub done: bool,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TableDropReferenceCounts {
+	pub in_memory_rows: usize,
+	pub persistent_rows: usize,
+	pub indexed_slabs: usize,
+	pub secondary_indexed_slabs: usize,
+}
+
+impl TableDropReferenceCounts {
+	pub fn is_empty(self) -> bool {
+		self.in_memory_rows == 0
+			&& self.persistent_rows == 0
+			&& self.indexed_slabs == 0
+			&& self.secondary_indexed_slabs == 0
+	}
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RetentionCompactionStats {
 	pub pruned_data_rows: usize,
@@ -632,12 +669,12 @@ pub struct SlabManager {
 	/// restart may repeat a cut before the durable completion receipt exists;
 	/// that is safe and only creates another historical slab to backfill.
 	secondary_index_declaration_cuts: DashSet<SecondaryIndexCoverageKey>,
-	/// Per-source-slab lease used to serialize secondary-index
-	/// backfill reads with compaction retirement of the same source
-	/// slab. Backfill holds a read lease until its sidecar is
-	/// persisted; compaction holds a write lease while removing or
-	/// replacing the source slab.
-	secondary_index_source_slab_leases: DashMap<SlabId, Arc<AsyncRwLock<()>>>,
+	/// Per-slab rewrite claim shared by every reader that must retain a physical
+	/// source and every operation that can replace or retire it. Secondary-index
+	/// backfill holds a shared claim; compaction, retention, and ADR 0095 table
+	/// reclaim hold the exclusive claim from their first physical read through
+	/// publication/retirement.
+	slab_rewrite_claims: DashMap<SlabId, Arc<AsyncRwLock<()>>>,
 	/// Parsed ADR 039 CSBs keyed by slab, descriptor, and footer
 	/// locator identity. This avoids repeated L2 range reads and
 	/// AEAD decrypts for WFRM query bursts over the same cold slab.
@@ -1491,7 +1528,7 @@ impl SlabManager {
 			secondary_index_coverage,
 			secondary_index_admission_gate: Arc::new(AsyncRwLock::new(())),
 			secondary_index_declaration_cuts: DashSet::new(),
-			secondary_index_source_slab_leases: DashMap::new(),
+			slab_rewrite_claims: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
 		};
 		manager
@@ -1531,6 +1568,44 @@ impl SlabManager {
 		self.table_by_location
 			.get(&location)
 			.map(|entry| entry.value().1)
+	}
+
+	/// Keyed ADR 0095 settlement check. Physical L1/L2 surfaces are traversed by
+	/// the bounded phase cursors; this check independently proves that neither
+	/// in-memory nor persistent lookup authority can still reach the object.
+	pub fn table_drop_reference_counts(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> TableDropReferenceCounts {
+		let in_memory_rows = self
+			.table_by_location
+			.iter()
+			.filter(|entry| *entry.value() == (tenant_id, table_object_id))
+			.count();
+		let persistent_rows = self
+			.persistent_record_rows_snapshot()
+			.into_iter()
+			.filter(|row| {
+				row.tenant_id == tenant_id && row.table_object_id == Some(table_object_id)
+			})
+			.count();
+		let indexed_slabs = self
+			.table_references_by_slab
+			.iter()
+			.filter(|entry| entry.value().contains_key(&(tenant_id, table_object_id)))
+			.count();
+		let secondary_indexed_slabs = self
+			.secondary_index_table_references_by_slab
+			.iter()
+			.filter(|entry| entry.value().contains_key(&(tenant_id, table_object_id)))
+			.count();
+		TableDropReferenceCounts {
+			in_memory_rows,
+			persistent_rows,
+			indexed_slabs,
+			secondary_indexed_slabs,
+		}
 	}
 
 	fn add_published_table_reference(

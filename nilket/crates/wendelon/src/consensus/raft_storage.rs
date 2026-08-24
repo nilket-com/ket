@@ -54,9 +54,10 @@ use crate::audit::{
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, MigratedRangeTombstone, MigrationComplete,
 	MigrationLedgerEntry, MigrationState, RevokeActorKey, RevokedActorKeyId, SeedMigration,
-	SetTableRetentionPolicy, TableDropFinalizeRequest, TableDropPrepareRequest,
-	TableReclaimCompletionRequest, TenantFinalization, TenantLifecycleState, TenantRecord,
-	TieredSlab, UpdateTenantQuota, WendelonRequest, WendelonResponse, WendelonTypeConfig,
+	SetTableRetentionPolicy, TableDropFinalizeRequest, TableDropLogicalFinalizeRequest,
+	TableDropPrepareRequest, TableDropSettlementRequest, TableReclaimCompletionRequest,
+	TenantFinalization, TenantLifecycleState, TenantRecord, TieredSlab, UpdateTenantQuota,
+	WendelonRequest, WendelonResponse, WendelonTypeConfig,
 };
 use crate::crypto::{InstallTenantKekVersion, RetireTenantKekVersion, TenantKeyset};
 use crate::integration::compute::{
@@ -68,7 +69,7 @@ use crate::network::tls::ActorTrustDomain;
 #[cfg(test)]
 use crate::schema::{
 	ClientWriteId, CtasIntentFingerprint, CtasOperationId, CtasTerminalCause, SupersessionMetadata,
-	TombstoneMetadata,
+	TableDropParticipantSet, TombstoneMetadata,
 };
 use crate::schema::{
 	CtasExpectedBinding, CtasSagaCatalog, CtasSagaEntry, CtasSagaMutation, CtasSagaPhase,
@@ -76,13 +77,15 @@ use crate::schema::{
 	LogEntryKind, NodeId as SchemaNodeId, PRE_VERSIONING_FORMAT, RaftLogEntryFixed,
 	RowIdentityPolicy, SCHEMA_UPDATE_REJECT_INDEX_ALTER_UNSUPPORTED, SNAPSHOT_FORMAT_VERSION,
 	SecondaryIndexCatalog, SecondaryIndexDescriptor, SecondaryIndexState, SlabId, SnapshotHeader,
-	TableDropFenceCatalog, TableDropOutcome, TableDropOutcomeCatalog, TableLifecycleCatalog,
-	TableRetentionPolicy, TableSchemaCatalog, TableSchemaDescriptor, TenantId, TenantKekId,
-	WAL_FORMAT_VERSION, WALRecordHeader, decode_secondary_index_descriptor,
-	decode_secondary_index_drop_request, decode_secondary_index_lifecycle_complete,
-	decode_table_schema_descriptor_v1, validate_table_schema_evolution,
+	TableDropFenceCatalog, TableDropOutcome, TableDropOutcomeCatalog, TableDropReclaimDebt,
+	TableDropTombstone, TableLifecycleCatalog, TableRetentionPolicy, TableSchemaCatalog,
+	TableSchemaDescriptor, TenantId, TenantKekId, WAL_FORMAT_VERSION, WALRecordHeader,
+	decode_secondary_index_descriptor, decode_secondary_index_drop_request,
+	decode_secondary_index_lifecycle_complete, decode_table_schema_descriptor_v1,
+	validate_table_schema_evolution,
 };
 use crate::storage::io_uring::{AlignedBuf, DIRECT_IO_ALIGN, IoRingHandle};
+use crate::storage::mutation_drain::MutationDrainRegistry;
 use crate::storage::{
 	AsyncFileOps, BlockingFileOps, CompactionCommit, FileHandle, IoUringFileOps, OpenFlags,
 	fsync_parent_dir, is_cdc_locality_heartbeat_finalization, write_file,
@@ -1569,6 +1572,26 @@ pub struct SmState {
 	/// written inside the Publish apply, removed with the object.
 	#[serde(default)]
 	pub materialization_certificates: crate::schema::MaterializationCertificateCatalog,
+	/// ADR 0095 admission authority after logical finalize and before physical
+	/// settlement. This is distinct from migrated-range tombstones above.
+	pub table_drop_tombstones: crate::schema::TableDropTombstoneCatalog,
+	/// ADR 0095 replicated physical-erasure obligations.
+	pub table_drop_reclaim_debts: crate::schema::TableDropReclaimDebtCatalog,
+}
+
+impl SmState {
+	/// One lifecycle query serves every data-path admission site. A prepared
+	/// fence and a finalized logical tombstone have identical authority.
+	pub fn table_drop_blocks_admission(
+		&self,
+		tenant_id: crate::schema::TenantId,
+		table_object_id: crate::schema::TableObjectId,
+	) -> bool {
+		self.table_drop_fences.is_fenced(tenant_id, table_object_id)
+			|| self
+				.table_drop_tombstones
+				.contains(tenant_id, table_object_id)
+	}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2119,6 +2142,10 @@ struct SmInner {
 #[derive(Clone)]
 pub struct WendelonStateMachine {
 	inner: Arc<RwLock<SmInner>>,
+	/// ADR 0095 node-local admission/drain authority. Raft apply closes an
+	/// object here when DROP prepare commits; data paths increment through the
+	/// same mutex before beginning byte-mutating work.
+	mutation_drain: Arc<MutationDrainRegistry>,
 	snapshot_runtime: SnapshotRuntime,
 	admission_snapshot: watch::Sender<Arc<AdmissionSnapshot>>,
 	revocation_snapshot: watch::Sender<Arc<RevocationSnapshot>>,
@@ -2150,6 +2177,7 @@ impl WendelonStateMachine {
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		Self {
 			inner: Arc::new(RwLock::new(SmInner::default())),
+			mutation_drain: MutationDrainRegistry::fresh_reconciled(),
 			snapshot_runtime: SnapshotRuntime::ephemeral(),
 			admission_snapshot,
 			revocation_snapshot,
@@ -2211,8 +2239,30 @@ impl WendelonStateMachine {
 
 		let admission_snapshot = watch::channel(admission_snapshot_from_state(&inner.state)).0;
 		let revocation_snapshot = watch::channel(revocation_snapshot_from_state(&inner.state)).0;
+		let mutation_drain = MutationDrainRegistry::recovering();
+		for fence in inner.state.table_drop_fences.iter() {
+			mutation_drain
+				.close_committed(fence.operation_id)
+				.map_err(|error| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("recovered DROP fence cannot seed mutation drain: {error}"),
+					)
+				})?;
+		}
+		for tombstone in inner.state.table_drop_tombstones.iter() {
+			mutation_drain
+				.close_committed(tombstone.operation_id)
+				.map_err(|error| {
+					Error::new(
+						ErrorKind::InvalidData,
+						format!("recovered DROP tombstone cannot seed mutation drain: {error}"),
+					)
+				})?;
+		}
 		Ok(Self {
 			inner: Arc::new(RwLock::new(inner)),
+			mutation_drain,
 			snapshot_runtime,
 			admission_snapshot,
 			revocation_snapshot,
@@ -2277,6 +2327,10 @@ impl WendelonStateMachine {
 
 	pub fn current_admission_snapshot(&self) -> Arc<AdmissionSnapshot> {
 		self.admission_snapshot.borrow().clone()
+	}
+
+	pub(crate) fn mutation_drain_registry(&self) -> Arc<MutationDrainRegistry> {
+		self.mutation_drain.clone()
 	}
 
 	pub fn subscribe_revocation_snapshot(&self) -> watch::Receiver<Arc<RevocationSnapshot>> {
@@ -2426,6 +2480,12 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			for entry in entries {
+				let drop_prepare_operation = match &entry.payload {
+					EntryPayload::Normal(WendelonRequest::TableDropPrepare(request)) => {
+						Some(request.operation_id())
+					}
+					_ => None,
+				};
 				let tenant_kek_rotation = match &entry.payload {
 					EntryPayload::Normal(WendelonRequest::InstallTenantKekVersion(rotation)) => {
 						Some(rotation.clone())
@@ -2456,6 +2516,11 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					finalize_index_schema_audit_context(&guard.state, context);
 				}
 				let applied_successfully = matches!(&resp, WendelonResponse::Success);
+				if applied_successfully && let Some(operation_id) = drop_prepare_operation {
+					self.mutation_drain
+						.close_committed(operation_id)
+						.expect("a committed DROP fence cannot conflict in the mutation registry");
+				}
 				guard.state.last_applied_log_id = Some(match guard.state.last_applied_log_id {
 					Some(prev) if prev > entry.log_id => prev,
 					_ => entry.log_id,
@@ -2711,6 +2776,30 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			let mut guard = self.inner.write().await;
 			state.last_applied_log_id = meta.last_log_id;
 			state.last_membership = meta.last_membership.clone();
+			for fence in state.table_drop_fences.iter() {
+				self.mutation_drain
+					.close_committed(fence.operation_id)
+					.map_err(|error| {
+						StorageIOError::read_snapshot(
+							Some(meta.signature()),
+							AnyError::error(format!(
+								"snapshot DROP fence conflicts with mutation drain state: {error}"
+							)),
+						)
+					})?;
+			}
+			for tombstone in state.table_drop_tombstones.iter() {
+				self.mutation_drain
+					.close_committed(tombstone.operation_id)
+					.map_err(|error| {
+						StorageIOError::read_snapshot(
+							Some(meta.signature()),
+							AnyError::error(format!(
+								"snapshot DROP tombstone conflicts with mutation drain state: {error}"
+							)),
+						)
+					})?;
+			}
 			guard.state = state;
 			guard.snapshot = Some(HeldSnapshot {
 				meta: meta.clone(),
@@ -3913,6 +4002,13 @@ fn apply_request_at_log_index(
 			apply_table_drop_finalize(state, request, entry_log_index),
 			None,
 		),
+		WendelonRequest::TableDropLogicalFinalize(request) => (
+			apply_table_drop_logical_finalize(state, request, entry_log_index),
+			None,
+		),
+		WendelonRequest::TableDropSettlement(request) => {
+			(apply_table_drop_settlement(state, request), None)
+		}
 		WendelonRequest::CtasSaga(mutation) => {
 			let response = match apply_ctas_saga_mutation(state, mutation) {
 				CtasSagaResponse::Applied(_) => WendelonResponse::Success,
@@ -4217,9 +4313,7 @@ fn apply_table_schema_update(
 				.map(|descriptor| descriptor.schema_generation)
 				.unwrap_or(0);
 			if let Some(descriptor) = current_descriptor.as_ref()
-				&& state
-					.table_drop_fences
-					.is_fenced(envelope.tenant_id, descriptor.table_object_id)
+				&& state.table_drop_blocks_admission(envelope.tenant_id, descriptor.table_object_id)
 			{
 				return Err(
 					"table schema update rejected because table drop is in progress".to_owned(),
@@ -4940,6 +5034,165 @@ fn apply_table_drop_finalize(
 	WendelonResponse::Success
 }
 
+fn apply_table_drop_logical_finalize(
+	state: &mut SmState,
+	request: TableDropLogicalFinalizeRequest,
+	entry_log_index: u64,
+) -> WendelonResponse {
+	let operation_id = request.operation_id;
+	let outcome = TableDropOutcome {
+		operation_id,
+		finalize_log_index: entry_log_index,
+	};
+	let Some(descriptor) = state
+		.table_schemas
+		.latest_by_id(operation_id.tenant_id, operation_id.table_object_id)
+		.cloned()
+	else {
+		return WendelonResponse::Error(format!(
+			"table {:?} is missing during logical drop finalize",
+			operation_id.table_object_id
+		));
+	};
+	let stamp = match crate::consensus::drop_reclaim::derive_drop_participant_stamp(
+		state,
+		operation_id.tenant_id,
+		&descriptor,
+	) {
+		Ok(stamp) => stamp,
+		Err(error) => return WendelonResponse::Error(error.to_string()),
+	};
+	let tombstone = TableDropTombstone {
+		operation_id,
+		fence_log_index: request.fence_log_index,
+		finalize_log_index: entry_log_index,
+	};
+	let debt = TableDropReclaimDebt {
+		operation_id,
+		fence_log_index: request.fence_log_index,
+		finalize_log_index: entry_log_index,
+		ownership_epoch: stamp.ownership_epoch,
+		participants: stamp.participants,
+	};
+
+	if state
+		.table_drop_outcomes
+		.get(operation_id.tenant_id, operation_id.table_object_id)
+		.is_some_and(|existing| *existing == outcome)
+		&& state
+			.table_drop_tombstones
+			.get(operation_id.tenant_id, operation_id.table_object_id)
+			.is_some_and(|existing| *existing == tombstone)
+		&& state
+			.table_drop_reclaim_debts
+			.get(operation_id.tenant_id, operation_id.table_object_id)
+			.is_some_and(|existing| existing == &debt)
+	{
+		return WendelonResponse::Success;
+	}
+	if let Err(error) = state.table_drop_outcomes.validate_record(outcome) {
+		return WendelonResponse::Error(error.to_string());
+	}
+	if let Err(error) = state
+		.table_drop_fences
+		.validate_logical_finalize(operation_id, request.fence_log_index)
+	{
+		return WendelonResponse::Error(error.to_string());
+	}
+	if let Err(error) = state.table_drop_tombstones.validate_insert(tombstone) {
+		return WendelonResponse::Error(error.to_string());
+	}
+	if let Err(error) = state.table_drop_reclaim_debts.validate_insert(&debt) {
+		return WendelonResponse::Error(error.to_string());
+	}
+
+	let expected_generation = operation_id.schema_generation.get();
+	let already_unbound_for_ctas = state.ctas_sagas.retiring_old_binding(
+		operation_id.tenant_id,
+		operation_id.table_object_id,
+		operation_id.schema_generation,
+	);
+	if !already_unbound_for_ctas
+		&& let Err(error) = state.table_schemas.unbind_latest_name(
+			operation_id.tenant_id,
+			operation_id.table_object_id,
+			expected_generation,
+		) {
+		return WendelonResponse::Error(error.to_string());
+	}
+
+	// All fallible validation is complete. These mutations establish one
+	// continuous admission authority: fence removal and tombstone insertion are
+	// part of this exclusive state-machine apply.
+	state.table_drop_fences.remove_validated(operation_id);
+	state.table_drop_tombstones.insert_validated(tombstone);
+	state.table_drop_reclaim_debts.insert_validated(debt);
+	state.table_drop_outcomes.insert_validated(outcome);
+	state
+		.table_lifecycle
+		.remove(operation_id.tenant_id, operation_id.table_object_id);
+	state
+		.materialization_certificates
+		.remove(operation_id.tenant_id, operation_id.table_object_id);
+	observe_table_retention_active_tables(&state.table_lifecycle);
+	WendelonResponse::Success
+}
+
+fn apply_table_drop_settlement(
+	state: &mut SmState,
+	request: TableDropSettlementRequest,
+) -> WendelonResponse {
+	let operation_id = request.operation_id;
+	let Some(tombstone) = state
+		.table_drop_tombstones
+		.get(operation_id.tenant_id, operation_id.table_object_id)
+		.copied()
+	else {
+		return WendelonResponse::Error("table drop settlement tombstone is missing".to_string());
+	};
+	let Some(debt) = state
+		.table_drop_reclaim_debts
+		.get(operation_id.tenant_id, operation_id.table_object_id)
+		.cloned()
+	else {
+		return WendelonResponse::Error("table drop settlement debt is missing".to_string());
+	};
+	if tombstone.operation_id != operation_id
+		|| debt.operation_id != operation_id
+		|| tombstone.finalize_log_index != request.finalize_log_index
+		|| debt.finalize_log_index != request.finalize_log_index
+		|| debt.ownership_epoch != request.ownership_epoch
+	{
+		return WendelonResponse::Error(
+			"table drop settlement identity, finalize index, or ownership epoch mismatch"
+				.to_string(),
+		);
+	}
+	if let Err(error) = request.attested_participants.validate() {
+		return WendelonResponse::Error(error.to_string());
+	}
+	if request.attested_participants != debt.participants {
+		return WendelonResponse::Error(
+			"table drop settlement does not carry the complete stamped participant set".to_string(),
+		);
+	}
+
+	// Validate descriptor retirement on a clone so every fallible operation is
+	// complete before the live state mutates.
+	let mut retired_schemas = state.table_schemas.clone();
+	if let Err(error) =
+		retired_schemas.retire_unbound_object(operation_id.tenant_id, operation_id.table_object_id)
+	{
+		return WendelonResponse::Error(error.to_string());
+	}
+	state.table_schemas = retired_schemas;
+	state
+		.table_drop_reclaim_debts
+		.remove_validated(operation_id);
+	state.table_drop_tombstones.remove_validated(operation_id);
+	WendelonResponse::Success
+}
+
 fn apply_index_schema_update(
 	state: &mut SmState,
 	envelope: SchemaUpdateEnvelope,
@@ -4948,10 +5201,7 @@ fn apply_index_schema_update(
 		SchemaMutationKind::Create => {
 			let descriptor = decode_secondary_index_descriptor(&envelope.payload)
 				.map_err(|err| err.to_string())?;
-			if state
-				.table_drop_fences
-				.is_fenced(envelope.tenant_id, descriptor.table_object_id)
-			{
+			if state.table_drop_blocks_admission(envelope.tenant_id, descriptor.table_object_id) {
 				return Err(
 					"secondary index create rejected because table drop is in progress".to_owned(),
 				);
@@ -4990,8 +5240,7 @@ fn apply_index_schema_update(
 			}
 			if let Some(row) = existing.as_ref()
 				&& state
-					.table_drop_fences
-					.is_fenced(envelope.tenant_id, row.descriptor.table_object_id)
+					.table_drop_blocks_admission(envelope.tenant_id, row.descriptor.table_object_id)
 			{
 				return Err(
 					"secondary index drop rejected because table drop is in progress".to_owned(),
@@ -5021,8 +5270,7 @@ fn apply_index_schema_update(
 				.cloned();
 			if let Some(row) = before.as_ref()
 				&& state
-					.table_drop_fences
-					.is_fenced(envelope.tenant_id, row.descriptor.table_object_id)
+					.table_drop_blocks_admission(envelope.tenant_id, row.descriptor.table_object_id)
 			{
 				return Err(
 					"secondary index backfill completion rejected because table drop is in progress"
@@ -5065,8 +5313,7 @@ fn apply_index_schema_update(
 				.cloned();
 			if let Some(row) = before.as_ref()
 				&& state
-					.table_drop_fences
-					.is_fenced(envelope.tenant_id, row.descriptor.table_object_id)
+					.table_drop_blocks_admission(envelope.tenant_id, row.descriptor.table_object_id)
 			{
 				return Err(
 					"secondary index drop GC completion rejected because table drop is in progress"
@@ -5144,10 +5391,7 @@ fn apply_set_table_retention_policy(
 			update.tenant_id.get()
 		));
 	};
-	if state
-		.table_drop_fences
-		.is_fenced(update.tenant_id, update.table_object_id)
-	{
+	if state.table_drop_blocks_admission(update.tenant_id, update.table_object_id) {
 		return WendelonResponse::Error(
 			"table retention policy update rejected because table drop is in progress".to_string(),
 		);
@@ -6249,6 +6493,8 @@ fn decode_log_record(
 			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 1, &err.to_string()))?,
 		2 => crate::consensus::wal_body::v2::decode_entry(payload)
 			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 2, &err.to_string()))?,
+		3 => crate::consensus::wal_body::v3::decode_entry(payload)
+			.map_err(|err| wal_body_format_mismatch(wal_path, offset, 3, &err.to_string()))?,
 		_ => match postcard::take_from_bytes::<Entry<WendelonTypeConfig>>(payload) {
 			Ok((entry, [])) => entry,
 			Ok((_entry, rest)) => {
@@ -6389,7 +6635,9 @@ fn serialize_entry_page(entry: &Entry<WendelonTypeConfig>) -> Result<AlignedBuf,
 		}
 		EntryPayload::Normal(WendelonRequest::TableDropPrepare(_))
 		| EntryPayload::Normal(WendelonRequest::TableReclaimCompletion(_))
-		| EntryPayload::Normal(WendelonRequest::TableDropFinalize(_)) => (LogEntryKind::APPEND, 0),
+		| EntryPayload::Normal(WendelonRequest::TableDropFinalize(_))
+		| EntryPayload::Normal(WendelonRequest::TableDropLogicalFinalize(_))
+		| EntryPayload::Normal(WendelonRequest::TableDropSettlement(_)) => (LogEntryKind::APPEND, 0),
 		EntryPayload::Normal(WendelonRequest::SeedMigration(s)) => {
 			(LogEntryKind::APPEND, s.entry.to_epoch)
 		}
@@ -6668,6 +6916,14 @@ fn decode_snapshot_reader<R: Read>(mut reader: R) -> Result<(SnapshotHeader, SmS
 			format!(
 				"{err}; the body's digest matched, so this artifact is intact, and it \
 				 declares snapshot format version 3, which this build replays — failing \
+				 that decode means the artifact was not written at its declared version; \
+				 this is a format mismatch, not corruption"
+			)
+		})?,
+		4 => crate::consensus::snapshot_body::v4::decode_state(&body).map_err(|err| {
+			format!(
+				"{err}; the body's digest matched, so this artifact is intact, and it \
+				 declares snapshot format version 4, which this build replays — failing \
 				 that decode means the artifact was not written at its declared version; \
 				 this is a format mismatch, not corruption"
 			)
@@ -7018,6 +7274,30 @@ mod schema_state_tests {
 			),
 		)
 		.unwrap();
+		state
+	}
+
+	fn state_with_descriptor_and_drop_epoch(descriptor: &TableSchemaDescriptor) -> SmState {
+		let mut state = state_with_descriptor(descriptor);
+		state.epoch_history.insert(
+			7,
+			EpochConfig {
+				epoch: 7,
+				peers: std::collections::BTreeMap::from([(
+					1,
+					crate::consensus::EpochPeer {
+						node_id: SchemaNodeId {
+							id: 1,
+							_reserved: 0,
+						},
+						address: "127.0.0.1:7001".to_string(),
+						tier_bits: 0,
+						role_bits: 1,
+						capability_bits: 0,
+					},
+				)]),
+			},
+		);
 		state
 	}
 
@@ -8806,6 +9086,233 @@ mod schema_state_tests {
 			before,
 			"a rejected conflicting finalize leaves the entire state byte-identical"
 		);
+	}
+
+	#[test]
+	fn adr0095_logical_finalize_is_atomic_and_settlement_requires_the_exact_stamp() {
+		let descriptor = table_descriptor(1);
+		let mut state = state_with_descriptor_and_drop_epoch(&descriptor);
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: SchemaGeneration::new(descriptor.schema_generation),
+		};
+		assert_eq!(
+			apply_table_drop_prepare(
+				&mut state,
+				TableDropPrepareRequest::current(operation_id, operation_id.schema_generation),
+				10,
+			),
+			WendelonResponse::Success
+		);
+
+		let fenced_state = postcard::to_stdvec(&state).unwrap();
+		let rejected = apply_table_drop_logical_finalize(
+			&mut state,
+			TableDropLogicalFinalizeRequest {
+				operation_id,
+				fence_log_index: 9,
+			},
+			11,
+		);
+		assert!(matches!(rejected, WendelonResponse::Error(_)));
+		assert_eq!(
+			postcard::to_stdvec(&state).unwrap(),
+			fenced_state,
+			"a rejected logical finalize leaves the complete replicated state unchanged"
+		);
+
+		assert_eq!(
+			apply_table_drop_logical_finalize(
+				&mut state,
+				TableDropLogicalFinalizeRequest {
+					operation_id,
+					fence_log_index: 10,
+				},
+				11,
+			),
+			WendelonResponse::Success
+		);
+		assert!(
+			state.table_drop_blocks_admission(operation_id.tenant_id, operation_id.table_object_id)
+		);
+		assert!(
+			state
+				.table_drop_fences
+				.get(operation_id.tenant_id, operation_id.table_object_id)
+				.is_none()
+		);
+		let tombstone = *state
+			.table_drop_tombstones
+			.get(operation_id.tenant_id, operation_id.table_object_id)
+			.expect("logical finalize installs an admission tombstone");
+		let debt = state
+			.table_drop_reclaim_debts
+			.get(operation_id.tenant_id, operation_id.table_object_id)
+			.cloned()
+			.expect("logical finalize installs durable reclaim debt");
+		assert_eq!(tombstone.finalize_log_index, 11);
+		assert_eq!(debt.finalize_log_index, 11);
+		assert_eq!(debt.ownership_epoch, 7);
+		assert_eq!(
+			state
+				.table_drop_outcomes
+				.get(operation_id.tenant_id, operation_id.table_object_id),
+			Some(&TableDropOutcome {
+				operation_id,
+				finalize_log_index: 11,
+			})
+		);
+		assert!(
+			state
+				.table_schemas
+				.latest_by_name(operation_id.tenant_id, "analytics", "events")
+				.is_none(),
+			"name publication is removed in the same apply"
+		);
+
+		let finalized_state = postcard::to_stdvec(&state).unwrap();
+		let rejected = apply_table_drop_settlement(
+			&mut state,
+			TableDropSettlementRequest {
+				operation_id,
+				finalize_log_index: 11,
+				ownership_epoch: 8,
+				attested_participants: debt.participants.clone(),
+			},
+		);
+		assert!(matches!(rejected, WendelonResponse::Error(_)));
+		assert_eq!(
+			postcard::to_stdvec(&state).unwrap(),
+			finalized_state,
+			"a stale ownership epoch cannot mutate settlement state"
+		);
+		let mut incomplete = debt.participants.iter().collect::<Vec<_>>();
+		incomplete.pop();
+		let rejected = apply_table_drop_settlement(
+			&mut state,
+			TableDropSettlementRequest {
+				operation_id,
+				finalize_log_index: 11,
+				ownership_epoch: 7,
+				attested_participants: crate::schema::TableDropParticipantSet::new(incomplete),
+			},
+		);
+		assert!(matches!(rejected, WendelonResponse::Error(_)));
+		assert_eq!(
+			postcard::to_stdvec(&state).unwrap(),
+			finalized_state,
+			"missing participant evidence cannot partially settle durable state"
+		);
+		let mut over_attested = debt.participants.iter().collect::<Vec<_>>();
+		over_attested.push(crate::schema::NodeId {
+			id: 99,
+			_reserved: 0,
+		});
+		let rejected = apply_table_drop_settlement(
+			&mut state,
+			TableDropSettlementRequest {
+				operation_id,
+				finalize_log_index: 11,
+				ownership_epoch: 7,
+				attested_participants: crate::schema::TableDropParticipantSet::new(over_attested),
+			},
+		);
+		assert!(matches!(rejected, WendelonResponse::Error(_)));
+		assert_eq!(
+			postcard::to_stdvec(&state).unwrap(),
+			finalized_state,
+			"an over-attested set cannot substitute for the exact participant stamp"
+		);
+
+		assert_eq!(
+			apply_table_drop_settlement(
+				&mut state,
+				TableDropSettlementRequest {
+					operation_id,
+					finalize_log_index: 11,
+					ownership_epoch: 7,
+					attested_participants: debt.participants,
+				},
+			),
+			WendelonResponse::Success
+		);
+		assert!(
+			!state
+				.table_drop_blocks_admission(operation_id.tenant_id, operation_id.table_object_id)
+		);
+		assert!(
+			state
+				.table_schemas
+				.latest_by_id(operation_id.tenant_id, operation_id.table_object_id)
+				.is_none(),
+			"settlement retires the already-unbound descriptor"
+		);
+		assert!(
+			state
+				.table_drop_reclaim_debts
+				.get(operation_id.tenant_id, operation_id.table_object_id)
+				.is_none()
+		);
+		assert!(
+			state
+				.table_drop_tombstones
+				.get(operation_id.tenant_id, operation_id.table_object_id)
+				.is_none()
+		);
+	}
+
+	#[tokio::test]
+	async fn adr0095_committed_prepare_closes_mutation_admission_and_drains_prior_work() {
+		let descriptor = table_descriptor(1);
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: SchemaGeneration::new(descriptor.schema_generation),
+		};
+		let mut state_machine = WendelonStateMachine::new();
+		{
+			let mut inner = state_machine.inner.write().await;
+			inner.state = state_with_descriptor(&descriptor);
+		}
+		let registry = state_machine.mutation_drain_registry();
+		let pre_fence = registry
+			.admit(
+				operation_id.tenant_id,
+				operation_id.table_object_id,
+				operation_id.schema_generation.get(),
+			)
+			.unwrap();
+		let responses = RaftStateMachine::apply(
+			&mut state_machine,
+			[Entry {
+				log_id: LogId::new(CommittedLeaderId::new(1, 1), 10),
+				payload: EntryPayload::Normal(WendelonRequest::TableDropPrepare(
+					TableDropPrepareRequest::current(operation_id, operation_id.schema_generation),
+				)),
+			}],
+		)
+		.await
+		.unwrap();
+		assert_eq!(responses, vec![WendelonResponse::Success]);
+		assert!(
+			registry
+				.admit(
+					operation_id.tenant_id,
+					operation_id.table_object_id,
+					operation_id.schema_generation.get(),
+				)
+				.is_err()
+		);
+
+		let waiting = {
+			let registry = registry.clone();
+			tokio::spawn(async move { registry.wait_until_drained(operation_id).await })
+		};
+		tokio::task::yield_now().await;
+		assert!(!waiting.is_finished());
+		drop(pre_fence);
+		waiting.await.unwrap().unwrap();
 	}
 
 	#[test]
@@ -12492,8 +12999,8 @@ mod tenant_kek_tests {
 ///
 /// The WAL body is `postcard(Entry<WendelonTypeConfig>)` and the snapshot body
 /// is `postcard(SmState)` — positional encodings that cannot describe
-/// themselves. These controls pin the CURRENT snapshot (version 4) and WAL
-/// (version 3) shapes two ways: a
+/// themselves. These controls pin the CURRENT snapshot (version 5) and WAL
+/// (version 4) shapes two ways: a
 /// stored golden encoding per request variant and per changed container, and
 /// an exact-set guard over the variant lists, because an appended enum variant
 /// moves no stored bytes and only the set check can see it. Any failure here
@@ -12935,6 +13442,22 @@ mod body_format_corpus {
 					},
 				),
 			),
+			(
+				"table_drop_logical_finalize",
+				WendelonRequest::TableDropLogicalFinalize(TableDropLogicalFinalizeRequest {
+					operation_id: canonical_drop_operation_id(),
+					fence_log_index: 11,
+				}),
+			),
+			(
+				"table_drop_settlement",
+				WendelonRequest::TableDropSettlement(TableDropSettlementRequest {
+					operation_id: canonical_drop_operation_id(),
+					finalize_log_index: 12,
+					ownership_epoch: 3,
+					attested_participants: TableDropParticipantSet::new([node(1)]),
+				}),
+			),
 		]
 	}
 
@@ -12970,17 +13493,38 @@ mod body_format_corpus {
 
 	fn canonical_current_sm_state() -> SmState {
 		let mut state = canonical_sm_state();
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: TableObjectId::new([0xD3; 16]),
+			schema_generation: SchemaGeneration::new(3),
+		};
 		state
 			.table_drop_outcomes
 			.insert_validated(TableDropOutcome {
-				operation_id: DropOperationId {
-					tenant_id: TenantId::new(7),
-					table_object_id: TableObjectId::new([0xD3; 16]),
-					schema_generation: SchemaGeneration::new(3),
-				},
+				operation_id,
 				finalize_log_index: 37,
 			});
 		state
+			.table_drop_tombstones
+			.insert_validated(TableDropTombstone {
+				operation_id,
+				fence_log_index: 36,
+				finalize_log_index: 37,
+			});
+		state
+			.table_drop_reclaim_debts
+			.insert_validated(TableDropReclaimDebt {
+				operation_id,
+				fence_log_index: 36,
+				finalize_log_index: 37,
+				ownership_epoch: 3,
+				participants: TableDropParticipantSet::new([node(1)]),
+			});
+		state
+	}
+
+	fn canonical_v4_sm_state() -> crate::consensus::snapshot_body::v4::SmState {
+		crate::consensus::snapshot_body::v4::project(canonical_current_sm_state())
 	}
 
 	fn canonical_v3_sm_state() -> crate::consensus::snapshot_body::v3::SmState {
@@ -13068,6 +13612,10 @@ mod body_format_corpus {
 		include_str!("../../tests/fixtures/consensus_body/ctas_mutations_v3.txt");
 	const SNAPSHOT_V4_MANIFEST: &str =
 		include_str!("../../tests/fixtures/consensus_body/snapshot_v4.txt");
+	const WAL_V4_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/wal_v4_entries.txt");
+	const SNAPSHOT_V5_MANIFEST: &str =
+		include_str!("../../tests/fixtures/consensus_body/snapshot_v5.txt");
 
 	fn wal_corpus() -> Vec<(&'static str, Vec<u8>)> {
 		let mut corpus: Vec<(&'static str, Vec<u8>)> = canonical_requests()
@@ -13133,7 +13681,14 @@ mod body_format_corpus {
 		let stored = parse_manifest(WAL_MANIFEST);
 		let corpus = wal_corpus()
 			.into_iter()
-			.filter(|(name, _)| *name != "replay_legacy_ctas_row_dispatched")
+			.filter(|(name, _)| {
+				!matches!(
+					*name,
+					"replay_legacy_ctas_row_dispatched"
+						| "table_drop_logical_finalize"
+						| "table_drop_settlement"
+				)
+			})
 			.collect::<Vec<_>>();
 		assert_eq!(
 			stored.keys().cloned().collect::<Vec<_>>(),
@@ -13187,9 +13742,17 @@ mod body_format_corpus {
 	}
 
 	#[test]
-	fn adr0094_current_wal_and_mutation_corpora_match_v3_goldens() {
+	fn adr0094_frozen_wal_v3_and_mutation_corpora_match_goldens() {
 		let stored_wal = parse_manifest(WAL_V3_MANIFEST);
-		let corpus = wal_corpus();
+		let corpus = wal_corpus()
+			.into_iter()
+			.filter(|(name, _)| {
+				!matches!(
+					*name,
+					"table_drop_logical_finalize" | "table_drop_settlement"
+				)
+			})
+			.collect::<Vec<_>>();
 		assert_eq!(stored_wal.len(), corpus.len());
 		for (name, bytes) in corpus {
 			assert_eq!(
@@ -13211,9 +13774,9 @@ mod body_format_corpus {
 	}
 
 	#[test]
-	fn adr0094_current_snapshot_v4_matches_stored_golden() {
+	fn adr0094_frozen_snapshot_v4_matches_stored_golden() {
 		let stored = parse_manifest(SNAPSHOT_V4_MANIFEST);
-		let state = canonical_current_sm_state();
+		let state = canonical_v4_sm_state();
 		assert_eq!(
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&stored["smstate_active_saga_and_drop_outcome"])
@@ -13226,6 +13789,29 @@ mod body_format_corpus {
 			hex(&postcard::to_stdvec(entry).unwrap()),
 			hex(&stored["ctas_saga_entry"])
 		);
+	}
+
+	#[test]
+	fn adr0095_current_wal_v4_and_snapshot_v5_match_stored_goldens() {
+		let stored_wal = parse_manifest(WAL_V4_MANIFEST);
+		let corpus = wal_corpus();
+		assert_eq!(stored_wal.len(), corpus.len());
+		for (name, bytes) in corpus {
+			assert_eq!(
+				hex(&bytes),
+				hex(&stored_wal[name]),
+				"WAL v4 body moved for {name}; bump and freeze the outgoing spine"
+			);
+		}
+
+		let stored_snapshot = parse_manifest(SNAPSHOT_V5_MANIFEST);
+		let state = canonical_current_sm_state();
+		assert_eq!(
+			hex(&postcard::to_stdvec(&state).unwrap()),
+			hex(&stored_snapshot["smstate_active_saga_drop_outcome_and_reclaim_debt"])
+		);
+		assert_eq!(state.table_drop_tombstones.len(), 1);
+		assert_eq!(state.table_drop_reclaim_debts.len(), 1);
 	}
 
 	#[test]
@@ -13603,7 +14189,7 @@ mod body_format_corpus {
 		for (name, bytes) in wal_corpus() {
 			wal.push_str(&format!("{name}={}\n", hex(&bytes)));
 		}
-		std::fs::write(dir.join("wal_v3_entries.txt"), wal).unwrap();
+		std::fs::write(dir.join("wal_v4_entries.txt"), wal).unwrap();
 		let mut mutations = String::new();
 		for (name, mutation) in canonical_mutations() {
 			mutations.push_str(&format!(
@@ -13619,11 +14205,11 @@ mod body_format_corpus {
 			.unwrap()
 			.clone();
 		let snapshot = format!(
-			"smstate_active_saga_and_drop_outcome={}\nctas_saga_entry={}\n",
+			"smstate_active_saga_drop_outcome_and_reclaim_debt={}\nctas_saga_entry={}\n",
 			hex(&postcard::to_stdvec(&state).unwrap()),
 			hex(&postcard::to_stdvec(&entry).unwrap())
 		);
-		std::fs::write(dir.join("snapshot_v4.txt"), snapshot).unwrap();
+		std::fs::write(dir.join("snapshot_v5.txt"), snapshot).unwrap();
 		println!("manifests written to {}", dir.display());
 	}
 }

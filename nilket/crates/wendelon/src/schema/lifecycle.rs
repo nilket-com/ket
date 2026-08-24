@@ -1,7 +1,7 @@
 use crate::integration::compute::DropOperationId;
-use crate::schema::{HybridTimestamp, TableObjectId, TenantId};
+use crate::schema::{HybridTimestamp, NodeId, TableObjectId, TenantId};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::time::Duration;
 
@@ -200,6 +200,95 @@ pub struct TableDropOutcomeCatalog {
 	by_id: BTreeMap<TableLifecycleKey, TableDropOutcome>,
 }
 
+/// ADR 0095: admission-authoritative state after logical DROP finalizes and
+/// before physical reclaim settles.
+///
+/// This replaces the prepare fence without opening an object-id admission
+/// gap. The descriptor remains available to reclaim machinery while every
+/// data-path admission site treats this tombstone exactly like the fence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropTombstone {
+	pub operation_id: DropOperationId,
+	pub fence_log_index: u64,
+	pub finalize_log_index: u64,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropTombstoneCatalog {
+	by_id: BTreeMap<TableLifecycleKey, TableDropTombstone>,
+}
+
+/// Deterministically ordered ADR 0095 erasure participants.
+///
+/// `NodeId` does not expose an ordering contract, so construction canonicalizes
+/// by the full wire identity `(id, _reserved)`. Decode does not silently repair
+/// malformed state: consensus apply calls [`Self::validate`] before trusting a
+/// stamped set.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropParticipantSet {
+	nodes: Vec<NodeId>,
+}
+
+impl TableDropParticipantSet {
+	pub fn new(nodes: impl IntoIterator<Item = NodeId>) -> Self {
+		let mut keyed = BTreeSet::new();
+		for node in nodes {
+			keyed.insert((node.id, node._reserved));
+		}
+		Self {
+			nodes: keyed
+				.into_iter()
+				.map(|(id, reserved)| NodeId {
+					id,
+					_reserved: reserved,
+				})
+				.collect(),
+		}
+	}
+
+	pub fn validate(&self) -> Result<(), TableDropLifecycleError> {
+		if self.nodes.is_empty() {
+			return Err(TableDropLifecycleError::EmptyParticipantSet);
+		}
+		let canonical = Self::new(self.nodes.iter().copied());
+		if canonical != *self {
+			return Err(TableDropLifecycleError::NonCanonicalParticipantSet);
+		}
+		Ok(())
+	}
+
+	pub fn contains(&self, node: NodeId) -> bool {
+		self.nodes.iter().any(|candidate| *candidate == node)
+	}
+
+	pub fn iter(&self) -> impl ExactSizeIterator<Item = NodeId> + '_ {
+		self.nodes.iter().copied()
+	}
+
+	pub fn len(&self) -> usize {
+		self.nodes.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.nodes.is_empty()
+	}
+}
+
+/// Replicated ADR 0095 physical-erasure obligation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropReclaimDebt {
+	pub operation_id: DropOperationId,
+	pub fence_log_index: u64,
+	pub finalize_log_index: u64,
+	pub ownership_epoch: u64,
+	pub participants: TableDropParticipantSet,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropReclaimDebtCatalog {
+	by_id: BTreeMap<TableLifecycleKey, TableDropReclaimDebt>,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct TableLifecyclePolicyCounts {
 	pub inherit_cluster: usize,
@@ -303,6 +392,10 @@ impl TableLifecycleCatalog {
 }
 
 impl TableDropFenceCatalog {
+	pub fn iter(&self) -> impl Iterator<Item = &TableDropFence> {
+		self.by_id.values()
+	}
+
 	pub fn get(
 		&self,
 		tenant_id: TenantId,
@@ -403,6 +496,29 @@ impl TableDropFenceCatalog {
 		Ok(fence)
 	}
 
+	pub fn validate_logical_finalize(
+		&self,
+		operation_id: DropOperationId,
+		fence_log_index: u64,
+	) -> Result<TableDropFence, TableDropFenceError> {
+		let key = TableLifecycleKey::new(operation_id.tenant_id, operation_id.table_object_id);
+		let Some(fence) = self.by_id.get(&key).copied() else {
+			return Err(TableDropFenceError::MissingFence);
+		};
+		if fence.operation_id != operation_id {
+			return Err(TableDropFenceError::AlreadyDropping {
+				existing_operation_id: fence.operation_id,
+			});
+		}
+		if fence.fence_log_index != fence_log_index {
+			return Err(TableDropFenceError::FenceLogIndexMismatch {
+				expected: fence.fence_log_index,
+				observed: fence_log_index,
+			});
+		}
+		Ok(fence)
+	}
+
 	/// Remove a fence only after [`Self::validate_finalize`] succeeded in the
 	/// same exclusive state-machine apply. This seam is deliberately
 	/// infallible: all contradictions belong to the prevalidation phase.
@@ -457,6 +573,145 @@ impl TableDropOutcomeCatalog {
 		self.by_id.is_empty()
 	}
 }
+
+impl TableDropTombstoneCatalog {
+	pub fn iter(&self) -> impl Iterator<Item = &TableDropTombstone> {
+		self.by_id.values()
+	}
+
+	pub fn get(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> Option<&TableDropTombstone> {
+		self.by_id
+			.get(&TableLifecycleKey::new(tenant_id, table_object_id))
+	}
+
+	pub fn contains(&self, tenant_id: TenantId, table_object_id: TableObjectId) -> bool {
+		self.get(tenant_id, table_object_id).is_some()
+	}
+
+	pub fn validate_insert(
+		&self,
+		tombstone: TableDropTombstone,
+	) -> Result<(), TableDropLifecycleError> {
+		let key = TableLifecycleKey::new(
+			tombstone.operation_id.tenant_id,
+			tombstone.operation_id.table_object_id,
+		);
+		match self.by_id.get(&key).copied() {
+			None => Ok(()),
+			Some(existing) if existing == tombstone => Ok(()),
+			Some(_) => Err(TableDropLifecycleError::TombstoneConflict),
+		}
+	}
+
+	pub fn insert_validated(&mut self, tombstone: TableDropTombstone) {
+		let key = TableLifecycleKey::new(
+			tombstone.operation_id.tenant_id,
+			tombstone.operation_id.table_object_id,
+		);
+		let previous = self.by_id.insert(key, tombstone);
+		debug_assert!(previous.is_none() || previous == Some(tombstone));
+	}
+
+	pub fn remove_validated(&mut self, operation_id: DropOperationId) {
+		let key = TableLifecycleKey::new(operation_id.tenant_id, operation_id.table_object_id);
+		let removed = self.by_id.remove(&key);
+		debug_assert_eq!(removed.map(|row| row.operation_id), Some(operation_id));
+	}
+
+	pub fn len(&self) -> usize {
+		self.by_id.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.by_id.is_empty()
+	}
+}
+
+impl TableDropReclaimDebtCatalog {
+	pub fn get(
+		&self,
+		tenant_id: TenantId,
+		table_object_id: TableObjectId,
+	) -> Option<&TableDropReclaimDebt> {
+		self.by_id
+			.get(&TableLifecycleKey::new(tenant_id, table_object_id))
+	}
+
+	pub fn validate_insert(
+		&self,
+		debt: &TableDropReclaimDebt,
+	) -> Result<(), TableDropLifecycleError> {
+		debt.participants.validate()?;
+		let key = TableLifecycleKey::new(
+			debt.operation_id.tenant_id,
+			debt.operation_id.table_object_id,
+		);
+		match self.by_id.get(&key) {
+			None => Ok(()),
+			Some(existing) if existing == debt => Ok(()),
+			Some(_) => Err(TableDropLifecycleError::DebtConflict),
+		}
+	}
+
+	pub fn insert_validated(&mut self, debt: TableDropReclaimDebt) {
+		let key = TableLifecycleKey::new(
+			debt.operation_id.tenant_id,
+			debt.operation_id.table_object_id,
+		);
+		let previous = self.by_id.insert(key, debt.clone());
+		debug_assert!(previous.is_none() || previous == Some(debt));
+	}
+
+	pub fn remove_validated(&mut self, operation_id: DropOperationId) {
+		let key = TableLifecycleKey::new(operation_id.tenant_id, operation_id.table_object_id);
+		let removed = self.by_id.remove(&key);
+		debug_assert_eq!(removed.map(|row| row.operation_id), Some(operation_id));
+	}
+
+	pub fn iter(&self) -> impl Iterator<Item = &TableDropReclaimDebt> {
+		self.by_id.values()
+	}
+
+	pub fn len(&self) -> usize {
+		self.by_id.len()
+	}
+
+	pub fn is_empty(&self) -> bool {
+		self.by_id.is_empty()
+	}
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TableDropLifecycleError {
+	EmptyParticipantSet,
+	NonCanonicalParticipantSet,
+	TombstoneConflict,
+	DebtConflict,
+}
+
+impl fmt::Display for TableDropLifecycleError {
+	fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+		match self {
+			Self::EmptyParticipantSet => {
+				write!(f, "table drop reclaim participant set is empty")
+			}
+			Self::NonCanonicalParticipantSet => write!(
+				f,
+				"table drop reclaim participant set is not sorted and unique"
+			),
+			Self::TombstoneConflict => {
+				write!(f, "table drop tombstone conflicts with durable state")
+			}
+			Self::DebtConflict => write!(f, "table drop reclaim debt conflicts with durable state"),
+		}
+	}
+}
+
+impl std::error::Error for TableDropLifecycleError {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TableDropOutcomeError {
@@ -588,6 +843,18 @@ mod tests {
 		}
 	}
 
+	fn node(id: u32) -> NodeId {
+		NodeId { id, _reserved: 0 }
+	}
+
+	fn drop_operation() -> DropOperationId {
+		DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: TableObjectId::new([0x95; 16]),
+			schema_generation: crate::integration::compute::SchemaGeneration::new(3),
+		}
+	}
+
 	#[test]
 	fn retention_window_bounds_are_enforced() {
 		assert!(RetentionWindowMillis::try_new(MIN_RETENTION_WINDOW_MS).is_ok());
@@ -614,5 +881,67 @@ mod tests {
 			.unwrap();
 		assert_eq!(stored.policy_generation, PolicyGeneration::new(1));
 		assert_eq!(catalog.retention_policy(tenant, table), Some(&policy));
+	}
+
+	#[test]
+	fn adr0095_participants_are_canonical_and_malformed_state_is_refused() {
+		let participants = TableDropParticipantSet::new([node(9), node(2), node(9), node(4)]);
+		assert_eq!(
+			participants.iter().map(|node| node.id).collect::<Vec<_>>(),
+			[2, 4, 9]
+		);
+		assert!(participants.validate().is_ok());
+
+		let malformed = TableDropParticipantSet {
+			nodes: vec![node(4), node(2)],
+		};
+		assert_eq!(
+			malformed.validate(),
+			Err(TableDropLifecycleError::NonCanonicalParticipantSet)
+		);
+		assert_eq!(
+			TableDropParticipantSet::default().validate(),
+			Err(TableDropLifecycleError::EmptyParticipantSet)
+		);
+	}
+
+	#[test]
+	fn adr0095_tombstone_and_debt_catalogs_refuse_conflicting_replay() {
+		let operation_id = drop_operation();
+		let tombstone = TableDropTombstone {
+			operation_id,
+			fence_log_index: 10,
+			finalize_log_index: 11,
+		};
+		let debt = TableDropReclaimDebt {
+			operation_id,
+			fence_log_index: 10,
+			finalize_log_index: 11,
+			ownership_epoch: 5,
+			participants: TableDropParticipantSet::new([node(2), node(4)]),
+		};
+
+		let mut tombstones = TableDropTombstoneCatalog::default();
+		tombstones.validate_insert(tombstone).unwrap();
+		tombstones.insert_validated(tombstone);
+		assert!(tombstones.validate_insert(tombstone).is_ok());
+		assert_eq!(
+			tombstones.validate_insert(TableDropTombstone {
+				finalize_log_index: 12,
+				..tombstone
+			}),
+			Err(TableDropLifecycleError::TombstoneConflict)
+		);
+
+		let mut debts = TableDropReclaimDebtCatalog::default();
+		debts.validate_insert(&debt).unwrap();
+		debts.insert_validated(debt.clone());
+		assert!(debts.validate_insert(&debt).is_ok());
+		let mut conflict = debt.clone();
+		conflict.ownership_epoch += 1;
+		assert_eq!(
+			debts.validate_insert(&conflict),
+			Err(TableDropLifecycleError::DebtConflict)
+		);
 	}
 }

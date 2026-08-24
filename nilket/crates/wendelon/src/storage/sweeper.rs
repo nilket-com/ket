@@ -583,6 +583,10 @@ impl SlabSweeper {
 		&self,
 		pointer: &TieredSlabPointer,
 	) -> std::io::Result<PlaintextRewriteOutcome> {
+		let _slab_rewrite_claim = self
+			.slab
+			.acquire_slab_rewrite_exclusive_claim(pointer.slab_id)
+			.await;
 		let blob = self.object_store.get_bytes(&pointer.l2_uri).await?;
 		let actual_hash = crate::hash::content::digest(blob.as_ref());
 		if actual_hash != pointer.payload_hash {
@@ -926,6 +930,10 @@ impl SlabSweeper {
 		audit_floor: HybridTimestamp,
 	) -> std::io::Result<Option<PreparedTieredRetentionOutcome>> {
 		let _permit = authorize_autonomous_action(AutonomousActionSurface::L2RetentionRewrite);
+		let _slab_rewrite_claim = self
+			.slab
+			.acquire_slab_rewrite_exclusive_claim(pointer.slab_id)
+			.await;
 		let snapshot = self.state_machine.state_snapshot().await;
 		let Some(prepared) = self
 			.slab
@@ -1296,6 +1304,10 @@ impl SlabSweeper {
 			if authoritative_by_slab.contains_key(&pointer.slab_id) {
 				continue;
 			}
+			let _slab_rewrite_claim = self
+				.slab
+				.acquire_slab_rewrite_exclusive_claim(pointer.slab_id)
+				.await;
 			match self.slab.retire_tiered_slab(pointer.slab_id).await {
 				Ok(changed) => {
 					if changed {

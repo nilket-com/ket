@@ -404,108 +404,129 @@ impl WendelonDataServer {
 					.unwrap_or_default();
 				(descriptor, indexes)
 			};
-			match decode_table_replica_children(&arrow[..]).and_then(|children| {
-				validate_table_replica_payload(&meta, &children).map(|()| children)
-			}) {
-				Ok(children) => {
-					let append_result = append_table_children_durable(
-						&self.slab,
-						meta.tenant_id,
-						meta.commit_hlc,
-						&children,
-						&secondary_index_descriptors,
-					)
-					.await;
-					match append_result {
-						Ok(()) => {
-							let cdc_staging_ok = if let Some(descriptor) = table_descriptor.as_ref()
-							{
-								match self
-									.stage_cdc_table_replica_children(
-										meta.tenant_id,
-										meta.table_object_id,
-										descriptor,
-										meta.commit_hlc,
-										&children,
-										false,
-									)
-									.await
+			// Replica wire v1 does not carry a schema generation. The registry's
+			// closure is object-wide and drains the sum of every generation, so a
+			// descriptor-less follower may safely account this under generation zero
+			// without weakening the DROP barrier.
+			let mutation_drain = self.mutation_drain.admit(
+				meta.tenant_id,
+				meta.table_object_id,
+				table_descriptor
+					.as_ref()
+					.map(|descriptor| descriptor.schema_generation)
+					.unwrap_or(0),
+			);
+			if mutation_drain.is_err() {
+				(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+			} else {
+				let _mutation_drain = mutation_drain.expect("checked above");
+				match decode_table_replica_children(&arrow[..]).and_then(|children| {
+					validate_table_replica_payload(&meta, &children).map(|()| children)
+				}) {
+					Ok(children) => {
+						let append_result = append_table_children_durable(
+							&self.slab,
+							meta.tenant_id,
+							meta.commit_hlc,
+							&children,
+							&secondary_index_descriptors,
+						)
+						.await;
+						match append_result {
+							Ok(()) => {
+								let cdc_staging_ok = if let Some(descriptor) =
+									table_descriptor.as_ref()
 								{
-									Ok(staged) => {
-										self.cdc_stage_pending_finalization_marker(
-											CdcFinalizationKey::from_table_replica_meta(&meta),
-											staged,
-										);
-										true
+									match self
+										.stage_cdc_table_replica_children(
+											meta.tenant_id,
+											meta.table_object_id,
+											descriptor,
+											meta.commit_hlc,
+											&children,
+											false,
+										)
+										.await
+									{
+										Ok(staged) => {
+											self.cdc_stage_pending_finalization_marker(
+												CdcFinalizationKey::from_table_replica_meta(&meta),
+												staged,
+											);
+											true
+										}
+										Err(err) => {
+											tracing::error!(
+												write_id = ?meta.parent_write_id,
+												tenant_id = meta.tenant_id.get(),
+												table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+												error = %err,
+												"replica failed to stage CDC rows after durable table append"
+											);
+											self.trip_local_persistence_distrust(format!(
+												"replica CDC staging failed after durable table append: {err}"
+											))
+											.await;
+											false
+										}
 									}
-									Err(err) => {
-										tracing::error!(
-											write_id = ?meta.parent_write_id,
-											tenant_id = meta.tenant_id.get(),
-											table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
-											error = %err,
-											"replica failed to stage CDC rows after durable table append"
-										);
-										self.trip_local_persistence_distrust(format!(
-											"replica CDC staging failed after durable table append: {err}"
-										))
-										.await;
-										false
-									}
-								}
-							} else {
-								tracing::warn!(
-									write_id = ?meta.parent_write_id,
-									tenant_id = meta.tenant_id.get(),
-									table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
-									"replica skipped CDC staging because table descriptor is unavailable"
-								);
-								true
-							};
-							// A split table-replication frame is only proof for its child
-							// group; the aggregate pending witness belongs to the coordinator
-							// unless this frame carries the whole parent batch.
-							if !cdc_staging_ok {
-								(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
-							} else if meta.group_record_count == meta.record_count
-								&& meta.group_payload_hash == meta.payload_hash
-							{
-								let pending =
-									self.pending_finalization_record_from_table_replica_meta(&meta);
-								match self.pending_finalizations.upsert(pending).await {
-									Ok(()) => {
-										self.refresh_pending_finalization_backlog_metric();
-										(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
-									}
-									Err(err) => {
-										tracing::error!(
-											write_id = ?meta.parent_write_id,
-											tenant_id = meta.tenant_id.get(),
-											error = %err,
-											"replica failed to persist table pending-finalization witness after durable append"
-										);
-										self.trip_local_persistence_distrust(format!(
+								} else {
+									tracing::warn!(
+										write_id = ?meta.parent_write_id,
+										tenant_id = meta.tenant_id.get(),
+										table_object_id = %format_bytes_hex(meta.table_object_id.as_bytes()),
+										"replica skipped CDC staging because table descriptor is unavailable"
+									);
+									true
+								};
+								// A split table-replication frame is only proof for its child
+								// group; the aggregate pending witness belongs to the coordinator
+								// unless this frame carries the whole parent batch.
+								if !cdc_staging_ok {
+									(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+								} else if meta.group_record_count == meta.record_count
+									&& meta.group_payload_hash == meta.payload_hash
+								{
+									let pending = self
+										.pending_finalization_record_from_table_replica_meta(&meta);
+									match self.pending_finalizations.upsert(pending).await {
+										Ok(()) => {
+											self.refresh_pending_finalization_backlog_metric();
+											(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
+										}
+										Err(err) => {
+											tracing::error!(
+												write_id = ?meta.parent_write_id,
+												tenant_id = meta.tenant_id.get(),
+												error = %err,
+												"replica failed to persist table pending-finalization witness after durable append"
+											);
+											self.trip_local_persistence_distrust(format!(
 											"table replica pending finalization witness persistence failed after durable append: {err}"
 										))
 										.await;
-										(ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE)
+											(
+												ReplicaWriteStatus::INTERNAL_ERROR,
+												ReplicaAckLevel::NONE,
+											)
+										}
 									}
+								} else {
+									(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
 								}
-							} else {
-								(ReplicaWriteStatus::OK, ReplicaAckLevel::DURABLE)
 							}
+							Err(_) => (ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE),
 						}
-						Err(_) => (ReplicaWriteStatus::INTERNAL_ERROR, ReplicaAckLevel::NONE),
 					}
-				}
-				Err(err) => {
-					tracing::warn!(
-						write_id = ?meta.parent_write_id,
-						tenant_id = meta.tenant_id.get(),
-						error = %err,
-						"replica rejected malformed table batch"
-					);
-					(ReplicaWriteStatus::HASH_MISMATCH, ReplicaAckLevel::NONE)
+					Err(err) => {
+						tracing::warn!(
+							write_id = ?meta.parent_write_id,
+							tenant_id = meta.tenant_id.get(),
+							error = %err,
+							"replica rejected malformed table batch"
+						);
+						(ReplicaWriteStatus::HASH_MISMATCH, ReplicaAckLevel::NONE)
+					}
 				}
 			}
 		};

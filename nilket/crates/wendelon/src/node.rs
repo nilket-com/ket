@@ -59,13 +59,13 @@ use crate::metrics::observability::{
 use crate::metrics::telemetry::{TraceExportConfig, TraceExportProtocol};
 use crate::network::control_server::{
 	JoinClusterRequestWire, JoinClusterResponseWire, WendelonControlServer,
-	epoch_config_from_membership, membership_from_epoch_config, select_bootstrap_epoch,
+	epoch_config_from_membership, select_bootstrap_epoch,
 };
 use crate::network::core::{HRFT_MAGIC, read_frame, write_frame};
 use crate::network::data_server::{
 	DEFAULT_SECONDARY_INDEX_ACTIVE_BUFFER_BYTES, DEFAULT_TENANT_CACHE_REFRESH_INTERVAL,
-	MIGRATION_SWEEP_FAILURE_BACKOFF, MIGRATION_SWEEP_INTERVAL, MIGRATION_SWEEP_MAX_PER_PASS,
-	PENDING_FINALIZATION_RETRY_INTERVAL, WendelonDataServer,
+	DROP_RECLAIM_SWEEP_INTERVAL, MIGRATION_SWEEP_FAILURE_BACKOFF, MIGRATION_SWEEP_INTERVAL,
+	MIGRATION_SWEEP_MAX_PER_PASS, PENDING_FINALIZATION_RETRY_INTERVAL, WendelonDataServer,
 };
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::{
@@ -76,6 +76,7 @@ use crate::network::quic_transport::{
 	QuicTransportProvider, canonical_server_name_resolver, endpoint_from_tls_with_peer_roots,
 };
 use crate::network::ring::RingRouter;
+use crate::network::ring::membership_from_epoch_config;
 use crate::network::router::{MsgRouter, MsgRouterBuilder};
 use crate::network::server::{
 	HrftService, LifecycleService, ServerAdmissionConfig, ServerLifecycle,
@@ -687,6 +688,7 @@ pub struct NodeHandles {
 	pub cdc_locality_heartbeat: JoinHandle<()>,
 	pub epoch_reconciler: JoinHandle<()>,
 	pub tenant_policy_reconciler: JoinHandle<()>,
+	pub drop_reclaim_sweeper: JoinHandle<()>,
 	pub migration_sweeper: JoinHandle<()>,
 	pub lsm_compaction: JoinHandle<()>,
 	pub lsm_compaction_control: LsmCompactionServiceControl,
@@ -710,6 +712,7 @@ impl NodeHandles {
 		self.cdc_locality_heartbeat.abort();
 		self.epoch_reconciler.abort();
 		self.tenant_policy_reconciler.abort();
+		self.drop_reclaim_sweeper.abort();
 		self.migration_sweeper.abort();
 		self.lsm_compaction.abort();
 		self.lsm_gc.abort();
@@ -744,6 +747,7 @@ impl NodeHandles {
 		await_background_task(self.cdc_locality_heartbeat, "CDC locality heartbeat").await?;
 		await_background_task(self.epoch_reconciler, "epoch reconciler").await?;
 		await_background_task(self.tenant_policy_reconciler, "tenant policy reconciler").await?;
+		await_background_task(self.drop_reclaim_sweeper, "drop reclaim sweeper").await?;
 		await_background_task(self.migration_sweeper, "migration sweeper").await?;
 		await_background_task(self.lsm_compaction, "LSM compaction").await?;
 		await_background_task(self.lsm_gc, "LSM GC").await?;
@@ -1758,6 +1762,14 @@ impl WendelonNode {
 				}
 			}
 		}
+		// ADR 0095 stamps erasure participants from replicated epoch history.
+		// Seed the genesis edge synchronously on the leader so an immediately
+		// following DROP cannot race the background epoch reconciler.
+		if let Err(error) = control_server.reconcile_pending_epoch().await
+			&& error.kind() != ErrorKind::NotConnected
+		{
+			return Err(error);
+		}
 		if bootstrap_mode == DurableBootstrapMode::FreshBootstrap
 			&& matches!(cfg.cluster, ClusterBootstrapConfig::Bootstrap)
 		{
@@ -1866,6 +1878,9 @@ impl WendelonNode {
 		let pending_finalization_reconciler = data_server
 			.clone()
 			.spawn_pending_finalization_reconciler(PENDING_FINALIZATION_RETRY_INTERVAL);
+		let drop_reclaim_sweeper = data_server
+			.clone()
+			.spawn_drop_reclaim_sweeper(DROP_RECLAIM_SWEEP_INTERVAL);
 		let cdc_finalization_release_observer = data_server
 			.clone()
 			.spawn_cdc_finalization_release_observer();
@@ -1946,6 +1961,7 @@ impl WendelonNode {
 				cdc_locality_heartbeat,
 				epoch_reconciler,
 				tenant_policy_reconciler,
+				drop_reclaim_sweeper,
 				migration_sweeper,
 				lsm_compaction,
 				lsm_compaction_control,

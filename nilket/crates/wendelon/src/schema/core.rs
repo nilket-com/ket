@@ -761,6 +761,9 @@ impl MsgType {
 	/// ADR 548: pin row-mutation evidence until the Control Ring acknowledges it.
 	pub const MUTATION_OUTCOME_PIN_REQ: Self = Self(0x56);
 	pub const MUTATION_OUTCOME_PIN_RESP: Self = Self(0x57);
+	/// ADR 0095 leader-to-participant bounded physical reclaim slices.
+	pub const DROP_RECLAIM_SLICE_REQ: Self = Self(0x58);
+	pub const DROP_RECLAIM_SLICE_RESP: Self = Self(0x59);
 
 	// raft internal (openraft RaftNetwork)
 	pub const APPEND_ENTRIES_REQ: Self = Self(0x20);
@@ -856,6 +859,8 @@ impl MsgType {
 		Self::CTAS_SAGA_RESP,
 		Self::MUTATION_OUTCOME_PIN_REQ,
 		Self::MUTATION_OUTCOME_PIN_RESP,
+		Self::DROP_RECLAIM_SLICE_REQ,
+		Self::DROP_RECLAIM_SLICE_RESP,
 		Self::APPEND_ENTRIES_REQ,
 		Self::APPEND_ENTRIES_RESP,
 		Self::INSTALL_SNAPSHOT_REQ,
@@ -2156,15 +2161,14 @@ pub struct SnapshotHeader {
 /// nothing to declare.
 pub const PRE_VERSIONING_FORMAT: u8 = 0;
 
-/// Shape of the `postcard(SmState)` body this build writes. Version 2: ADR
-/// 0087 adds the materialization-certificate catalog to `SmState` and the
-/// certificate field to the CTAS saga entry.
-pub const SNAPSHOT_FORMAT_VERSION: u8 = 4;
+/// Shape of the `postcard(SmState)` body this build writes. ADR 0095 version 5
+/// appends logical-drop tombstones and durable reclaim debts.
+pub const SNAPSHOT_FORMAT_VERSION: u8 = 5;
 
 /// Shape of the Control Ring WAL record bodies this build writes, including the
-/// `postcard(Entry<..>)` payload of a log record. Version 2: ADR 0087 adds
-/// the certificate field to the CTAS Provision mutation.
-pub const WAL_FORMAT_VERSION: u8 = 3;
+/// `postcard(Entry<..>)` payload of a log record. ADR 0095 version 4 appends
+/// logical-finalize and physical-settlement request variants.
+pub const WAL_FORMAT_VERSION: u8 = 4;
 
 // Static assertions to ensure all our size calculations remain exactly correct
 const _: () = assert!(std::mem::size_of::<HybridTimestamp>() == 16);

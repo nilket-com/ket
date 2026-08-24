@@ -181,9 +181,9 @@ scripts/cargo-cgroup test -p wendelon --test architecture_test
 scripts/cargo-cgroup test -p toron --no-fail-fast
 scripts/cargo-cgroup test -p wendelon --no-fail-fast
 scripts/cargo-cgroup test -p toron-tpch
-# Narrow feature-enabled controls to their named targets and filters:
-scripts/cargo-cgroup test -p wendelon --features test-support --test <adr0095_target> adr0095_
-scripts/cargo-cgroup test -p toron --features test-support --test <adr0095_target> adr0095_
+# The only feature-enabled ADR 0095 exhibit is the Wendelon control-ring path:
+scripts/cargo-cgroup test -p wendelon --features test-support --test quic_transport \
+  adr0095_live_quic_drop_returns_before_asynchronous_reclaim -- --ignored --exact
 git diff --check
 ```
 
@@ -200,3 +200,102 @@ guards. Record each architecture-bound change beside its guard. The new guards
 cover lifecycle admission, mutation drain, participant totality, migration
 closure, bounded statement work, sole global-sweep ownership, and consensus
 fixture corpora.
+
+## Implementation receipt — 2026-08-24
+
+ADR 0095 is implemented as one Wendelon-owned lifecycle. DROP now commits a
+logical tombstone, durable reclaim debt, retained terminal outcome, and a
+closed participant stamp before returning. One leader sweeper processes debts
+in finalize-log-index order at concurrency one; participants advance only
+their own durable cursor through a bounded RPC, and settlement removes debt,
+tombstone, and the unbound descriptor only after the exact stamped set has
+attested.
+
+### Grounding probes
+
+- **P1:** rewrite ownership previously existed as path-specific slab leases.
+  It is now one read/exclusive slab-rewrite claim used by compaction,
+  reclustering, secondary-index backfill, LSM, retention, tiering, and table
+  reclaim. The two-order control pins serialization in both directions.
+- **P2:** the fence census covered reads, streaming, writes, deletes, CDC, and
+  Raft apply. Fourteen production consultations now use
+  `table_drop_blocks_admission`; direct fence inspection is confined to that
+  combined authority and enforced by the architecture guard.
+- **P3:** `drive_table_drop_physical_reclaim`, its three unbounded statement
+  passes, and reclaim-before-finalize are gone from the RPC path. Legacy
+  finalize/reclaim bodies remain replay-only. The ordinary bounded sweeper is
+  the sole owner of migrated-range tombstone debt.
+- **P4:** participant stamping is derived entirely from replicated state:
+  descriptor locality ranges, partition and raw-locality ring ownership, and
+  every intersecting migration source, including completed migrations without
+  proven source erasure. The control separately discriminates every inclusion
+  class and deliberate over-inclusion.
+- **P5:** the old `max_slabs` bound counted rewritten slabs, not examined
+  slabs. New L1/L2 APIs charge each examined slab or cleanup marker and cap one
+  slice at `DROP_RECLAIM_MAX_EXAMINED_PER_SLICE = 32`; cursor resume and a
+  nonmatching-slab corpus pin the bound.
+- **P6:** the mutation linearization surface is three direct admissions
+  (leader write, leader delete, replica write), plus guard cloning into spawned
+  durable work and startup recovery registration. A descriptor-less replica
+  accounts under generation zero; closure and drain are object-wide, so this
+  preserves the barrier without changing the replica wire.
+
+### Evidence and failure controls
+
+- Prepared fences roll forward after restart. Logical finalize is atomic and
+  conflicting finalize/settlement requests leave the complete `SmState`
+  unchanged. A committed genesis epoch is now reconciled before a stable
+  leader returns from startup, because participant stamping cannot race an
+  empty epoch history; leader forwarding is non-fatal for joining followers.
+- The node-local `drop_reclaim_progress_v1` store distinguishes absence from
+  corruption, fences writes by owner epoch, and resumes old-epoch cursors
+  idempotently. A post-cursor replacement found during verification resets to
+  bounded L1 work instead of stranding the debt.
+- L2 rewrites persist and fsync a cleanup-intent marker before Raft pointer
+  replacement. Ambiguous commit leaves the marker; a later bounded slice
+  reconciles the authoritative URI and deletes the old or uncommitted object
+  before receipt. Corrupt markers fail closed. Startup also removes stale
+  `.table_drop.tmp` plaintext alongside retention temporaries.
+- Stale coordinator and ownership epochs are refused before progress. The RF=1
+  control withholds settlement until mutation drain and all physical surfaces
+  are empty, injects a target-bearing post-cursor replacement, then proves
+  exact-set settlement and descriptor retirement. Multi-node participant,
+  restart, migration, and receipt controls cover the non-degenerate protocol.
+- Migration filters rows inside mixed packed records: live and legacy rows
+  survive, tombstoned-object rows do not, and the finalize-time stamp remains
+  closed. Shared rewrite claims prevent table reclaim and maintenance rewrites
+  from publishing over one another.
+- The real feature-gated QUIC DROP test aborts the physical sweeper and still
+  receives durable logical completion; its test runtime was 0.51 s and the
+  statement-path assertion is below 10 s. This proves response independence
+  from reclaim work. The million-row viz cleanup/drain exhibit remains the
+  ADR's named forward evidence and is not represented by this small fixture.
+
+### Formats, trust, and measured local cost
+
+- Snapshot format is v5 and WAL body format is v4. Frozen v4/v3 spines,
+  immutable v5/v4 corpus fixtures, total upconversion, and exact-set guards
+  cover the new tombstone/debt/participant state. Pre-v5 snapshots upconvert
+  with no reclaim debt, which is exact because those writers created none.
+- `DROP_RECLAIM_SLICE_REQ/RESP` are additive lockstep Wendelon node opcodes
+  `0x58/0x59`. The request intentionally carries no cursor; an older node does
+  not understand the operation, and mixed-version rollout is not claimed.
+- Receipts are current-leader, epoch-prevalidated crash-fault attestations,
+  not signatures independently verified during apply. Signed apply-verifiable
+  receipts remain the hardening follow-on.
+- In the unoptimized test profile, 100,000 uncontended mutation
+  admit-and-release cycles took 45,987 microseconds (459 ns per pair). The
+  five-row RF=1 control converged after its induced post-cursor race in 2,607
+  microseconds. These are local mechanism samples, not production erasure-SLO
+  measurements; the viz exhibit will supply the scale result under concurrency
+  one.
+
+### Seal
+
+- formatting and `git diff --check`: clean;
+- Wendelon: library 1,275 passed / 0 failed / 9 ignored, architecture 176/0,
+  and all integration targets green;
+- Toron: library 1,697/0, architecture 2,145/0, and all integration targets
+  green;
+- `toron-tpch`: all default tests green; and
+- feature rail: the exact ignored Wendelon QUIC exhibit passed 1/1.

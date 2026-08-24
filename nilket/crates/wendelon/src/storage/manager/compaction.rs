@@ -456,6 +456,7 @@ impl SlabManager {
 		if self.is_compaction_slab_quarantined(slab_id) {
 			return Ok(None);
 		}
+		let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -862,6 +863,7 @@ impl SlabManager {
 		if self.is_compaction_slab_quarantined(slab_id) {
 			return Ok(None);
 		}
+		let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
 
 		let old_bytes = slab.write_cursor();
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();
@@ -1019,9 +1021,6 @@ impl SlabManager {
 		slab_id: SlabId,
 		records: &[CompactionRecord],
 	) -> std::io::Result<()> {
-		let source_slab_lease = self
-			.acquire_secondary_index_source_slab_compaction_lease(slab_id)
-			.await;
 		let removed = {
 			let state = self.state.lock().await;
 			state.sealed.remove(&slab_id)
@@ -1043,8 +1042,6 @@ impl SlabManager {
 		// no reconciliation proof exists.
 		let old_path = slab_path(&self.config.dir, slab_id);
 		unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
-		self.secondary_index_source_slab_leases.remove(&slab_id);
-		drop(source_slab_lease);
 		Ok(())
 	}
 
@@ -1056,9 +1053,6 @@ impl SlabManager {
 		records: &[CompactionRecord],
 		relocations: &[RelocatedRecord],
 	) -> std::io::Result<bool> {
-		let source_slab_lease = self
-			.acquire_secondary_index_source_slab_compaction_lease(old_slab_id)
-			.await;
 		let state = self.state.lock().await;
 		if !state.sealed.contains_key(&old_slab_id) || state.tiered.contains_key(&old_slab_id) {
 			return Ok(false);
@@ -1100,8 +1094,6 @@ impl SlabManager {
 		drop(state);
 		self.replace_persistent_records(records, relocations, &relocation_tables)
 			.await;
-		self.secondary_index_source_slab_leases.remove(&old_slab_id);
-		drop(source_slab_lease);
 		Ok(true)
 	}
 }

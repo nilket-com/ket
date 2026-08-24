@@ -987,7 +987,11 @@ async fn advance_epoch_commit_emits_raft_audit_once_across_restart() {
 	assert!(audit.contains("to_peers=[1,2]"));
 	assert_eq!(
 		audit
-			.matches("\"event_type\":\"control_ring.epoch_advanced\"")
+			.lines()
+			.filter(|line| {
+				line.contains("\"event_type\":\"control_ring.epoch_advanced\"")
+					&& line.contains("from_epoch=1 to_epoch=2")
+			})
 			.count(),
 		1
 	);
@@ -1005,7 +1009,11 @@ async fn advance_epoch_commit_emits_raft_audit_once_across_restart() {
 	let recovered_audit = read_audit_log(&audit_path);
 	assert_eq!(
 		recovered_audit
-			.matches("\"event_type\":\"control_ring.epoch_advanced\"")
+			.lines()
+			.filter(|line| {
+				line.contains("\"event_type\":\"control_ring.epoch_advanced\"")
+					&& line.contains("from_epoch=1 to_epoch=2")
+			})
 			.count(),
 		1
 	);

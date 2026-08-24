@@ -1,4 +1,5 @@
 pub mod core;
+pub(crate) mod drop_reclaim;
 pub mod hlc;
 pub mod monitor;
 pub mod raft_network;

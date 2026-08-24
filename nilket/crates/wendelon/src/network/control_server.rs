@@ -11,9 +11,9 @@ use crate::audit::{AuditChainHead, AuditSink};
 use crate::client::topology::{ClusterPeerWire, ClusterStatusWire};
 use crate::consensus::{
 	AdvanceEpochRecord, CreateTenant, EpochConfig, EpochPeer, MigrationLedgerEntry, MigrationState,
-	RevokeActorKey, SeedMigration, TableDropFinalizeRequest, TableDropPrepareRequest,
-	TableReclaimCompletionRequest, TenantLifecycleState, TenantRecord, UpdateTenantQuota,
-	WendelonRaft, WendelonRequest, WendelonResponse,
+	RevokeActorKey, SeedMigration, TableDropLogicalFinalizeRequest, TableDropPrepareRequest,
+	TenantLifecycleState, TenantRecord, UpdateTenantQuota, WendelonRaft, WendelonRequest,
+	WendelonResponse,
 };
 use crate::crypto::{CryptoManager, RetireTenantKekVersion};
 use crate::governance::{AdministrativeAction, require_administrative_action};
@@ -27,7 +27,7 @@ use crate::network::core::{HRFT_MAGIC, HrftFrame, read_frame, write_frame};
 use crate::network::factory::TransportProviderFactory;
 use crate::network::lease_signing::LeaseAuthority;
 use crate::network::pool::BufPool;
-use crate::network::ring::RingState;
+use crate::network::ring::{RingState, membership_from_epoch_config};
 use crate::network::router::ControlRingServer;
 use crate::network::server::RequestContext;
 use crate::network::tls::{
@@ -57,7 +57,7 @@ use crate::schema::{
 };
 #[cfg(test)]
 use crate::schema::{SupersessionMetadata, TombstoneMetadata};
-use crate::storage::{RaftCommitter, manager::SlabManager};
+use crate::storage::manager::SlabManager;
 use arrow::array::{Array, ListArray, StringArray, UInt32Array};
 use arrow::ipc::reader::StreamReader;
 use async_trait::async_trait;
@@ -72,14 +72,12 @@ use tokio::sync::{Mutex, watch};
 #[cfg(any(test, feature = "test-support"))]
 pub mod adr0093_test_support {
 	use crate::schema::TableObjectId;
-	use std::collections::{BTreeMap, BTreeSet};
+	use std::collections::BTreeSet;
 	use std::sync::{Mutex, OnceLock};
-	use std::time::Duration;
 
 	#[derive(Default)]
 	struct Hooks {
 		sever_response_for: BTreeSet<TableObjectId>,
-		delay_reclaim_for: BTreeMap<TableObjectId, Duration>,
 	}
 
 	fn hooks() -> &'static Mutex<Hooks> {
@@ -95,7 +93,6 @@ pub mod adr0093_test_support {
 		fn drop(&mut self) {
 			let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
 			hooks.sever_response_for.remove(&self.table_object_id);
-			hooks.delay_reclaim_for.remove(&self.table_object_id);
 		}
 	}
 
@@ -105,20 +102,9 @@ pub mod adr0093_test_support {
 		HookGuard { table_object_id }
 	}
 
-	pub fn delay_next_drop_reclaim(table_object_id: TableObjectId, delay: Duration) -> HookGuard {
-		let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
-		hooks.delay_reclaim_for.insert(table_object_id, delay);
-		HookGuard { table_object_id }
-	}
-
 	pub(super) fn take_sever_response(table_object_id: TableObjectId) -> bool {
 		let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
 		hooks.sever_response_for.remove(&table_object_id)
-	}
-
-	pub(super) fn take_reclaim_delay(table_object_id: TableObjectId) -> Option<Duration> {
-		let mut hooks = hooks().lock().expect("ADR 0093 test hooks lock poisoned");
-		hooks.delay_reclaim_for.remove(&table_object_id)
 	}
 }
 
@@ -2421,81 +2407,13 @@ impl WendelonControlServer {
 			}
 		};
 
-		self.drive_table_drop_physical_reclaim(tenant_id, &descriptor)
-			.await?;
-
-		let reclaim_completion_log_index =
-			if let Some(reclaim_completion_log_index) = fence.reclaim_completion_log_index {
-				reclaim_completion_log_index
-			} else {
-				self.submit_table_drop_stage(WendelonRequest::TableReclaimCompletion(
-					TableReclaimCompletionRequest::current(operation_id, fence.fence_log_index),
-				))
-				.await?
-			};
-
-		self.submit_table_drop_stage(WendelonRequest::TableDropFinalize(
-			TableDropFinalizeRequest::current(
+		self.submit_table_drop_stage(WendelonRequest::TableDropLogicalFinalize(
+			TableDropLogicalFinalizeRequest {
 				operation_id,
-				fence.fence_log_index,
-				reclaim_completion_log_index,
-			),
+				fence_log_index: fence.fence_log_index,
+			},
 		))
 		.await?;
-		Ok(())
-	}
-
-	async fn drive_table_drop_physical_reclaim(
-		&self,
-		tenant_id: TenantId,
-		descriptor: &TableSchemaDescriptor,
-	) -> Result<(), WendelonAdminError> {
-		#[cfg(any(test, feature = "test-support"))]
-		if let Some(delay) = adr0093_test_support::take_reclaim_delay(descriptor.table_object_id) {
-			tokio::time::sleep(delay).await;
-		}
-		let Some(storage_manager) = self.storage_manager.as_ref() else {
-			return Err(WendelonAdminError::Transport {
-				message: "schema drop requires a configured Wendelon storage manager".to_string(),
-			});
-		};
-		let snapshot = self.state_machine.state_snapshot().await;
-		storage_manager
-			.reclaim_tombstoned_ranges(
-				&snapshot.tombstones,
-				&snapshot.table_schemas,
-				&snapshot.secondary_indexes,
-				usize::MAX,
-			)
-			.await
-			.map_err(|err| WendelonAdminError::Transport {
-				message: format!("schema drop tombstone reclaim failed: {err}"),
-			})?;
-		storage_manager
-			.reclaim_table_drop_storage(
-				tenant_id,
-				descriptor,
-				&snapshot.table_schemas,
-				&snapshot.secondary_indexes,
-				usize::MAX,
-			)
-			.await
-			.map_err(|err| WendelonAdminError::Transport {
-				message: format!("schema drop table storage reclaim failed: {err}"),
-			})?;
-		let committer = RaftCommitter::new(self.raft.clone());
-		storage_manager
-			.reclaim_table_drop_tiered_storage(
-				tenant_id,
-				descriptor,
-				&snapshot.table_schemas,
-				&committer,
-				usize::MAX,
-			)
-			.await
-			.map_err(|err| WendelonAdminError::Transport {
-				message: format!("schema drop tiered table storage reclaim failed: {err}"),
-			})?;
 		Ok(())
 	}
 
@@ -3609,8 +3527,10 @@ impl WendelonControlServer {
 			.await
 		{
 			Ok(_) => {}
-			Err(_err) if !self.is_leader().await => {
-				return Err(not_leader_error(self.leader_hint().await));
+			Err(openraft::error::RaftError::APIError(
+				openraft::error::ClientWriteError::ForwardToLeader(forward),
+			)) => {
+				return Err(not_leader_error(forward.leader_id));
 			}
 			Err(err) => {
 				return Err(Error::new(
@@ -3624,10 +3544,43 @@ impl WendelonControlServer {
 
 	async fn reconcile_pending_epoch_locked(&self) -> std::io::Result<()> {
 		let snapshot = self.state_machine.state_snapshot().await;
-		let Some((&latest_epoch, _)) = snapshot.epoch_history.iter().next_back() else {
-			return Ok(());
-		};
 		let visible = self.epoch_rx.borrow().clone();
+		let Some((&latest_epoch, _)) = snapshot.epoch_history.iter().next_back() else {
+			drop(snapshot);
+			if !self.is_leader().await {
+				return Ok(());
+			}
+			if visible.epoch == 0 {
+				return Err(Error::new(
+					ErrorKind::InvalidData,
+					"cannot seed durable membership history from epoch zero",
+				));
+			}
+			// The runtime ring has always started from a genesis epoch, but older
+			// profiles did not copy that first epoch into replicated history until
+			// a later membership transition. ADR 0095 participant stamping cannot
+			// depend on that accident: commit the genesis edge before any DROP can
+			// need it.
+			let result = self
+				.commit_epoch_transition_locked(
+					&MembershipEpoch {
+						epoch: visible.epoch - 1,
+						peers: HashMap::new(),
+					},
+					&visible,
+				)
+				.await;
+			if result
+				.as_ref()
+				.is_err_and(|error| error.kind() == ErrorKind::NotConnected)
+			{
+				// Leadership can change between the check above and the Raft
+				// write. The new leader will reconcile the same deterministic
+				// edge; a node that lost leadership must not fail bootstrap.
+				return Ok(());
+			}
+			return result;
+		};
 		if latest_epoch <= visible.epoch {
 			return Ok(());
 		}
@@ -4331,25 +4284,6 @@ pub(crate) fn epoch_config_from_membership(epoch: &MembershipEpoch) -> EpochConf
 	}
 	EpochConfig {
 		epoch: epoch.epoch,
-		peers,
-	}
-}
-
-pub(crate) fn membership_from_epoch_config(config: &EpochConfig) -> MembershipEpoch {
-	let mut peers = HashMap::with_capacity(config.peers.len());
-	for peer in config.peers.values() {
-		peers.insert(
-			peer.node_id,
-			PeerCapabilities {
-				address: peer.address.clone(),
-				tiers: TransportTierSet::from_u8(peer.tier_bits),
-				roles: NodeRoleSet::from_u8(peer.role_bits),
-				capabilities: NodeCapabilitySet::from_u8(peer.capability_bits),
-			},
-		);
-	}
-	MembershipEpoch {
-		epoch: config.epoch,
 		peers,
 	}
 }

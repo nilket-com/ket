@@ -130,9 +130,7 @@ impl WendelonDataServer {
 				.table_schemas
 				.latest_by_id(req.tenant_id, req.table_object_id)
 				.cloned();
-			let drop_fenced = state
-				.table_drop_fences
-				.is_fenced(req.tenant_id, req.table_object_id);
+			let drop_fenced = state.table_drop_blocks_admission(req.tenant_id, req.table_object_id);
 			let retention = self.table_effective_retention_from_state(
 				&state,
 				req.tenant_id,

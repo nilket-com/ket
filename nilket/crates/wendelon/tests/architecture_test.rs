@@ -185,10 +185,13 @@ fn test_adr039_wendelon_drop_migration_substrate_guards() {
 	assert!(control_server.contains("SCHEMA_DROP_REQ"));
 	assert!(control_server.contains("SCHEMA_DROP_RESP"));
 	assert!(control_server.contains("run_table_schema_drop"));
-	assert!(control_server.contains("drive_table_drop_physical_reclaim"));
-	assert!(control_server.contains(".reclaim_table_drop_storage("));
-	assert!(control_server.contains(".reclaim_table_drop_tiered_storage("));
-	assert!(control_server.contains("RaftCommitter::new"));
+	assert!(control_server.contains("TableDropLogicalFinalizeRequest"));
+	assert!(
+		!control_server.contains("drive_table_drop_physical_reclaim"),
+		"ADR 0095 forbids physical reclaim under statement authority"
+	);
+	assert!(!control_server.contains(".reclaim_table_drop_storage("));
+	assert!(!control_server.contains(".reclaim_table_drop_tiered_storage("));
 	assert!(control_server.contains("WendelonAdminError"));
 	assert!(control_server.contains("TableSchemaDropResponseWire"));
 	assert!(control_server.contains("with_storage_manager"));
@@ -199,8 +202,82 @@ fn test_adr039_wendelon_drop_migration_substrate_guards() {
 	assert!(storage_manager.contains("PreparedTieredTableDropRewrite"));
 	assert!(storage_manager.contains("mark_record_group_for_table_drop"));
 	assert!(node.contains(".with_storage_manager(slab.clone())"));
-	assert!(data_server.matches("table_drop_fences").count() >= 5);
-	assert!(data_server.matches(".is_fenced(").count() >= 5);
+	assert!(data_server.matches("table_drop_blocks_admission").count() >= 4);
+}
+
+#[test]
+fn adr0095_async_drop_reclaim_has_one_admission_and_bounded_work_spine() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let control = fs::read_to_string(manifest_dir.join("src/network/control_server.rs")).unwrap();
+	let data_root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let data = data_server_source(manifest_dir);
+	let streaming =
+		fs::read_to_string(manifest_dir.join("src/network/data_server/streaming.rs")).unwrap();
+	let replica =
+		fs::read_to_string(manifest_dir.join("src/network/data_server/write_replication.rs"))
+			.unwrap();
+	let reclaim =
+		fs::read_to_string(manifest_dir.join("src/storage/manager/retention_reclaim.rs")).unwrap();
+	let compaction =
+		fs::read_to_string(manifest_dir.join("src/storage/manager/compaction.rs")).unwrap();
+	let lsm = fs::read_to_string(manifest_dir.join("src/storage/manager/lsm_driver.rs")).unwrap();
+	let sweeper = fs::read_to_string(manifest_dir.join("src/storage/sweeper.rs")).unwrap();
+
+	assert_eq!(
+		raft.matches(".table_drop_fences.is_fenced(").count(),
+		1,
+		"fence inspection is confined to SmState::table_drop_blocks_admission"
+	);
+	for source in [&data, &streaming, &replica] {
+		assert!(
+			!source.contains(".table_drop_fences.is_fenced("),
+			"data admission must use the fence-or-tombstone authority"
+		);
+	}
+	assert!(data.matches("table_drop_blocks_admission").count() >= 4);
+	assert!(streaming.contains("table_drop_blocks_admission"));
+	assert!(!control.contains("drive_table_drop_physical_reclaim"));
+	assert!(!control.contains("usize::MAX"));
+	assert!(data.contains("spawn_drop_reclaim_sweeper"));
+	assert!(data.contains("debts.sort_by_key(|debt| debt.finalize_log_index)"));
+	assert!(data.contains("DROP_RECLAIM_MAX_EXAMINED_PER_SLICE"));
+	let rpc = data
+		.split_once("struct DropReclaimSliceRequestMeta")
+		.and_then(|(_, tail)| tail.split_once("impl DropReclaimSliceRequestMeta"))
+		.map(|(block, _)| block)
+		.expect("drop reclaim request meta");
+	assert!(
+		!rpc.contains("cursor"),
+		"the participant alone owns its cursor"
+	);
+	assert!(rpc.contains("coordinator: NodeId"));
+	assert!(data.contains("coordinator is not the current Raft leader"));
+	assert!(data.contains("leadership changed before progress persistence"));
+
+	assert!(reclaim.contains("candidates.take(examined_budget)"));
+	assert!(reclaim.contains("report.examined += 1"));
+	assert!(reclaim.contains("acquire_slab_rewrite_exclusive_claim"));
+	assert!(
+		compaction
+			.matches("acquire_slab_rewrite_exclusive_claim")
+			.count() >= 2
+	);
+	assert!(lsm.matches("acquire_slab_rewrite_exclusive_claim").count() >= 2);
+	assert!(
+		sweeper
+			.matches("acquire_slab_rewrite_exclusive_claim")
+			.count() >= 3
+	);
+	assert!(data.contains("migration_records_without_logically_dropped_rows"));
+
+	assert_eq!(
+		data_root.matches("self.mutation_drain.admit(").count()
+			+ replica.matches(".admit(").count(),
+		3,
+		"leader write, delete, and replica write are the object mutation admissions"
+	);
+	assert!(data.contains("mutation_drain.clone()"));
 }
 
 #[test]
@@ -2418,7 +2495,7 @@ fn test_adr052_secondary_index_architecture_guards() {
 		"forget_slab",
 		"observe_storage_secondary_index_corruption_failure",
 		"source_slab_lease",
-		"acquire_secondary_index_source_slab_read_lease",
+		"acquire_slab_rewrite_read_claim",
 	] {
 		if !manager_source.contains(required) {
 			violations.push(format!(
@@ -8936,14 +9013,19 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// segment format carries none; ADR 0089 added the bounded decoded-record
 /// cache and its per-request audit beside the scan loop it serves. All are
 /// read/write-path enforcement with the same claim to this root.
+/// ADR 0095 adds the drop-reclaim wire structs and dispatch, mutation-drain
+/// admission at the leader write/delete seams, and the leader's bounded-debt
+/// orchestration. ADR 077 requires dispatch and root server state to remain
+/// here, so this is a deliberate mechanism-sized bump rather than domain
+/// helper regrowth.
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 15_720,
-		"data_server.rs root is {lines} lines (cap 15_720); carve more or justify a deliberate cap bump"
+		lines <= 16_325,
+		"data_server.rs root is {lines} lines (cap 16_325); carve more or justify a deliberate cap bump"
 	);
 }
 
@@ -9120,14 +9202,17 @@ fn adr078_slab_manager_public_surface_stays_in_root() {
 
 /// The root is bounded. Set from the post-carve size plus modest headroom;
 /// ratchet DOWN in the deferred deeper-helper-relocation follow-on (ADR 078 D5).
+/// ADR 0095 adds SlabManager's public bounded table-drop reclaim and keyed
+/// absence-verification entry points here; their mechanics remain in the
+/// retention-reclaim module, preserving ADR 078's decomposition boundary.
 #[test]
 fn adr078_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/storage/manager.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 4_500,
-		"manager.rs root is {lines} lines (cap 4_500); carve more or justify a deliberate cap bump"
+		lines <= 4_565,
+		"manager.rs root is {lines} lines (cap 4_565); carve more or justify a deliberate cap bump"
 	);
 }
 
@@ -9468,8 +9553,8 @@ fn adr0093_quic_config_construction_is_confined_to_the_tls_choke_point() {
 	);
 }
 
-/// ADR 0093/0094 exercise ADR 0092's versioning mechanism: v2 and v3 stay
-/// immutable, v4 is current, and every byte fixture remains guarded.
+/// ADR 0093/0094/0095 exercise ADR 0092's versioning mechanism: superseded
+/// bodies stay immutable, v5 is current, and every byte fixture is guarded.
 #[test]
 fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
@@ -9481,13 +9566,16 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 		.unwrap();
 	let v4 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v4.txt"))
 		.unwrap();
-	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 4;"));
+	let v5 = fs::read_to_string(manifest_dir.join("tests/fixtures/consensus_body/snapshot_v5.txt"))
+		.unwrap();
+	assert!(core.contains("pub const SNAPSHOT_FORMAT_VERSION: u8 = 5;"));
 	for required in [
 		"snapshot_body::v2::decode_state",
 		"snapshot_body::v3::decode_state",
 		"SNAPSHOT_V2_MANIFEST",
 		"SNAPSHOT_V3_MANIFEST",
 		"SNAPSHOT_V4_MANIFEST",
+		"SNAPSHOT_V5_MANIFEST",
 		"adr0093_snapshot_v2_fixture_is_frozen_and_upconverts_without_outcomes",
 		"adr0093_snapshot_v3_active_saga_and_drop_outcome_match_stored_golden",
 	] {
@@ -9499,6 +9587,7 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 	assert!(v2.contains("smstate_active_saga="));
 	assert!(v3.contains("smstate_active_saga_and_drop_outcome="));
 	assert!(v4.contains("smstate_active_saga_and_drop_outcome="));
+	assert!(v5.contains("smstate_active_saga_drop_outcome_and_reclaim_debt="));
 	assert_ne!(
 		v2, v3,
 		"outgoing and current snapshot fixtures must be distinct"
@@ -9506,6 +9595,10 @@ fn adr0093_snapshot_v2_and_v3_fixtures_are_both_guarded() {
 	assert_ne!(
 		v3, v4,
 		"ADR 0094's CTAS chain fields must move the current fixture"
+	);
+	assert_ne!(
+		v4, v5,
+		"ADR 0095's tombstone and reclaim-debt catalogs must move the current fixture"
 	);
 }
 
@@ -9516,7 +9609,7 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	let client = fs::read_to_string(manifest_dir.join("src/client/core.rs")).unwrap();
 	let schema = fs::read_to_string(manifest_dir.join("src/schema/core.rs")).unwrap();
 	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
-	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 3;"));
+	assert!(schema.contains("pub const WAL_FORMAT_VERSION: u8 = 4;"));
 	assert_eq!(core.matches("pub const MAX_SECTION_BYTES:").count(), 1);
 	assert_eq!(
 		client
@@ -9636,7 +9729,6 @@ fn adr0093_test_support_is_non_default_and_every_hook_site_is_gated() {
 	for gated_site in [
 		"#[cfg(any(test, feature = \"test-support\"))]\n\t\tlet table_object_id",
 		"#[cfg(any(test, feature = \"test-support\"))]\n\t\t\t\tif adr0093_test_support::take_sever_response",
-		"#[cfg(any(test, feature = \"test-support\"))]\n\t\tif let Some(delay) = adr0093_test_support::take_reclaim_delay",
 	] {
 		assert!(
 			control.contains(gated_site),
@@ -9644,5 +9736,6 @@ fn adr0093_test_support_is_non_default_and_every_hook_site_is_gated() {
 		);
 	}
 	assert_eq!(control.matches("take_sever_response(").count(), 2);
-	assert_eq!(control.matches("take_reclaim_delay(").count(), 2);
+	assert_eq!(control.matches("take_reclaim_delay(").count(), 0);
+	assert_eq!(control.matches("delay_next_drop_reclaim(").count(), 0);
 }

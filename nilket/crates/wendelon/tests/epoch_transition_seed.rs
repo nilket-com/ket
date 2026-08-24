@@ -247,7 +247,11 @@ async fn advance_epoch_rpc_auto_seeds_reassigned_ranges() {
 
 	wait_for_seeded_epoch(&node, 2).await;
 	let snapshot = node.state_machine.state_snapshot().await;
-	assert_eq!(snapshot.epoch_history.len(), 2);
+	assert_eq!(
+		snapshot.epoch_history.keys().copied().collect::<Vec<_>>(),
+		vec![0, 1, 2],
+		"genesis and the requested transition are both durable"
+	);
 	assert!(!snapshot.migrations.is_empty());
 	for entry in snapshot.migrations.values() {
 		assert_eq!(
@@ -287,7 +291,11 @@ async fn replayed_committed_epoch_reconciles_missing_seed_batch_idempotently() {
 
 	wait_for_seeded_epoch(&node, 2).await;
 	let snapshot = node.state_machine.state_snapshot().await;
-	assert_eq!(snapshot.epoch_history.len(), 2);
+	assert_eq!(
+		snapshot.epoch_history.keys().copied().collect::<Vec<_>>(),
+		vec![0, 1, 2],
+		"replay keeps the genesis edge and requested transition idempotent"
+	);
 	let ids: HashSet<u64> = snapshot.migrations.keys().copied().collect();
 	assert_eq!(ids.len(), snapshot.migrations.len());
 	for entry in snapshot.migrations.values() {

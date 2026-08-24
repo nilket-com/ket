@@ -7678,6 +7678,243 @@ async fn adr0094_declared_child_writes_share_the_provisional_descriptor() {
 }
 
 #[tokio::test]
+async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		195,
+		bootstrap_tempdir("adr0095-rf1-settlement"),
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"leader election timed out"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	// Keep this control deterministic: the production task uses this same method,
+	// but the test drives exactly one pass at a time.
+	node.handles.abort();
+	let descriptor = multirow_typed_table_descriptor();
+	let installed = node
+		.raft
+		.client_write(WendelonRequest::SchemaUpdate(typed_table_schema_update(
+			&descriptor,
+		)))
+		.await
+		.unwrap();
+	assert_eq!(installed.data, WendelonResponse::Success);
+	let epoch = crate::consensus::EpochConfig {
+		epoch: 1,
+		peers: std::collections::BTreeMap::from([(
+			node.local_node.id,
+			crate::consensus::EpochPeer {
+				node_id: node.local_node,
+				address: "127.0.0.1:0".to_string(),
+				tier_bits: 0,
+				role_bits: 1,
+				capability_bits: 0,
+			},
+		)]),
+	};
+	let epoch_write = node
+		.raft
+		.client_write(WendelonRequest::AdvanceEpoch(
+			crate::consensus::AdvanceEpochRecord {
+				from: crate::consensus::EpochConfig {
+					epoch: 0,
+					peers: std::collections::BTreeMap::new(),
+				},
+				to: epoch,
+			},
+		))
+		.await
+		.unwrap();
+	assert_eq!(epoch_write.data, WendelonResponse::Success);
+	let mut keys = append_append_only_rows_for_query(
+		&node.slab,
+		&descriptor,
+		vec![1, 2, 3, 4],
+		hlc(30, 0, 195),
+	)
+	.await;
+	let operation_id = crate::integration::compute::DropOperationId {
+		tenant_id: tenant(),
+		table_object_id: descriptor.table_object_id,
+		schema_generation: SchemaGeneration::new(descriptor.schema_generation),
+	};
+	let prepared = node
+		.raft
+		.client_write(WendelonRequest::TableDropPrepare(
+			crate::consensus::TableDropPrepareRequest::current(
+				operation_id,
+				SchemaGeneration::new(descriptor.schema_generation),
+			),
+		))
+		.await
+		.unwrap();
+	assert_eq!(prepared.data, WendelonResponse::Success);
+	assert!(
+		node.data_server
+			.reconcile_drop_reclaim_once()
+			.await
+			.unwrap(),
+		"the sweeper rolls a durable prepared fence forward before reclaim"
+	);
+	let debt = node
+		.state_machine
+		.state_snapshot()
+		.await
+		.table_drop_reclaim_debts
+		.get(tenant(), descriptor.table_object_id)
+		.cloned()
+		.expect("logical finalize durably records reclaim debt");
+	assert_eq!(
+		debt.participants.iter().collect::<Vec<_>>(),
+		vec![node.local_node]
+	);
+	let stale_coordinator = node
+		.data_server
+		.run_drop_reclaim_slice(DropReclaimSliceRequest {
+			operation_id,
+			finalize_log_index: debt.finalize_log_index,
+			ownership_epoch: debt.ownership_epoch,
+			examined_budget: 1,
+			coordinator: n(9_999),
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(
+		stale_coordinator.kind(),
+		std::io::ErrorKind::PermissionDenied
+	);
+	assert!(
+		stale_coordinator
+			.to_string()
+			.contains("current Raft leader")
+	);
+	let stale_epoch = node
+		.data_server
+		.run_drop_reclaim_slice(DropReclaimSliceRequest {
+			operation_id,
+			finalize_log_index: debt.finalize_log_index,
+			ownership_epoch: debt.ownership_epoch + 1,
+			examined_budget: 1,
+			coordinator: node.local_node,
+		})
+		.await
+		.unwrap_err();
+	assert_eq!(stale_epoch.kind(), std::io::ErrorKind::PermissionDenied);
+	assert!(stale_epoch.to_string().contains("ownership epoch is stale"));
+
+	let current_request = DropReclaimSliceRequest {
+		operation_id,
+		finalize_log_index: debt.finalize_log_index,
+		ownership_epoch: debt.ownership_epoch,
+		examined_budget: DROP_RECLAIM_MAX_EXAMINED_PER_SLICE,
+		coordinator: node.local_node,
+	};
+	assert!(
+		!node
+			.data_server
+			.run_drop_reclaim_slice(current_request)
+			.await
+			.unwrap()
+			.done
+	);
+	// Model a competing rewrite that held the slab claim first and published a
+	// replacement above the L1 cursor's frozen upper bound. This direct storage
+	// append deliberately bypasses lifecycle admission: it represents physical
+	// maintenance, not an admitted post-tombstone user mutation.
+	keys.extend(
+		append_append_only_rows_for_query(&node.slab, &descriptor, vec![5], hlc(31, 0, 195)).await,
+	);
+	let post_cursor_references = node
+		.slab
+		.table_drop_reference_counts(tenant(), descriptor.table_object_id);
+	assert!(
+		!post_cursor_references.is_empty(),
+		"the race fixture must publish a target-bearing replacement: {post_cursor_references:?}"
+	);
+	assert!(
+		!node
+			.data_server
+			.run_drop_reclaim_slice(current_request)
+			.await
+			.unwrap()
+			.done
+	);
+	assert!(
+		!node
+			.data_server
+			.run_drop_reclaim_slice(current_request)
+			.await
+			.expect("indexed post-cursor references restart bounded L1 work")
+			.done,
+		"verification must not attest while a replacement slab remains"
+	);
+
+	let drain_started = std::time::Instant::now();
+	for _ in 0..8 {
+		node.data_server
+			.reconcile_drop_reclaim_once()
+			.await
+			.unwrap();
+		if node
+			.state_machine
+			.state_snapshot()
+			.await
+			.table_drop_reclaim_debts
+			.get(tenant(), descriptor.table_object_id)
+			.is_none()
+		{
+			break;
+		}
+	}
+	let drain_elapsed = drain_started.elapsed();
+	eprintln!(
+		"ADR0095 RF=1 bounded reclaim receipt: rows={} drain_us={}",
+		keys.len(),
+		drain_elapsed.as_micros()
+	);
+	let settled = node.state_machine.state_snapshot().await;
+	assert!(
+		settled
+			.table_drop_reclaim_debts
+			.get(tenant(), descriptor.table_object_id)
+			.is_none(),
+		"the exact RF=1 receipt set permits settlement"
+	);
+	assert!(
+		settled
+			.table_drop_tombstones
+			.get(tenant(), descriptor.table_object_id)
+			.is_none()
+	);
+	assert!(
+		settled
+			.table_schemas
+			.latest_by_id(tenant(), descriptor.table_object_id)
+			.is_none(),
+		"settlement retires the unbound descriptor"
+	);
+	drop(settled);
+	assert!(
+		node.slab
+			.table_drop_reference_counts(tenant(), descriptor.table_object_id)
+			.is_empty()
+	);
+	for key in keys {
+		assert!(node.slab.lookup(tenant(), key).is_none());
+	}
+}
+
+#[tokio::test]
 async fn table_query_dispatch_materializes_multirow_records_before_pbc() {
 	let dir = bootstrap_tempdir("table-query-rebatch");
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
@@ -10630,6 +10867,115 @@ async fn migration_record_roundtrip_preserves_every_field() {
 	assert_eq!(decoded[1].key_identity, id(42));
 	assert_eq!(decoded[1].routing_locality, Locality::new(420));
 	assert_eq!(decoded[1].frame_bytes, b"frame-two");
+}
+
+#[test]
+fn adr0095_migration_filters_dropped_rows_inside_a_mixed_packed_record() {
+	let dropped_object = TableObjectId::new([0x95; 16]);
+	let live_object = TableObjectId::new([0x96; 16]);
+	let row_hlc = hlc(20, 0, 1);
+	let batch = typed_table_batch(vec![1, 2, 3]);
+	let source_rows = vec![
+		MultiRowSourceRow {
+			source_row_index: 0,
+			key_identity: id(1),
+			routing_locality: Locality::new(10),
+			row_hlc,
+			is_tombstone: false,
+			partition: Some(PartitionId::new(7)),
+			table_object_id: Some(live_object),
+		},
+		MultiRowSourceRow {
+			source_row_index: 1,
+			key_identity: id(2),
+			routing_locality: Locality::new(11),
+			row_hlc,
+			is_tombstone: false,
+			partition: Some(PartitionId::new(7)),
+			table_object_id: Some(live_object),
+		},
+		MultiRowSourceRow {
+			source_row_index: 2,
+			key_identity: id(3),
+			routing_locality: Locality::new(12),
+			row_hlc,
+			is_tombstone: false,
+			partition: None,
+			table_object_id: Some(live_object),
+		},
+	];
+	let encoded = crate::storage::multirow::encode_multirow_from_survivors_with_policy(
+		&batch,
+		&source_rows,
+		RecordBodyCompressionPolicy::Uncompressed,
+	)
+	.unwrap();
+	// The current packer enforces one table-object stamp per record. Construct
+	// the cross-object packed state directly to pin migration's defensive
+	// row-level contract for legacy/recovered bytes that predate that invariant.
+	let packed_batch = decode_batch(&encoded.frame).unwrap();
+	let table_column_index = packed_batch
+		.schema()
+		.index_of(crate::schema::STORAGE_ROW_TABLE_OBJECT_ID_COLUMN)
+		.unwrap();
+	let mut table_ids = FixedSizeBinaryBuilder::with_capacity(3, 16);
+	for table_object_id in [dropped_object, live_object, live_object] {
+		table_ids.append_value(table_object_id.as_bytes()).unwrap();
+	}
+	let mut columns = packed_batch.columns().to_vec();
+	columns[table_column_index] = Arc::new(table_ids.finish());
+	let mixed_batch = RecordBatch::try_new(packed_batch.schema(), columns).unwrap();
+	let mixed_frame = encode_batch(&mixed_batch).unwrap();
+	let records = source_rows
+		.iter()
+		.map(|row| MigrationRecord {
+			tenant_id: tenant(),
+			key_identity: row.key_identity,
+			routing_locality: row.routing_locality,
+			hlc: row.row_hlc,
+			payload_hash: payload_digest(&mixed_frame),
+			frame_bytes: mixed_frame.clone(),
+		})
+		.collect::<Vec<_>>();
+	let operation_id = crate::integration::compute::DropOperationId {
+		tenant_id: tenant(),
+		table_object_id: dropped_object,
+		schema_generation: SchemaGeneration::new(1),
+	};
+	let mut tombstones = crate::schema::TableDropTombstoneCatalog::default();
+	let tombstone = crate::schema::TableDropTombstone {
+		operation_id,
+		fence_log_index: 4,
+		finalize_log_index: 5,
+	};
+	tombstones.validate_insert(tombstone).unwrap();
+	tombstones.insert_validated(tombstone);
+
+	let filtered = migration_records_without_logically_dropped_rows(&records, &tombstones).unwrap();
+	assert_eq!(
+		filtered
+			.iter()
+			.map(|row| row.key_identity)
+			.collect::<Vec<_>>(),
+		vec![id(2), id(3)],
+		"the dropped row's own migration entry is absent"
+	);
+	for record in filtered {
+		let rows = storage_rows_from_batch(&decode_batch(&record.frame_bytes).unwrap()).unwrap();
+		assert_eq!(
+			rows.len(),
+			2,
+			"one physical frame retains both survivor rows"
+		);
+		assert!(
+			rows.iter()
+				.all(|row| row.table_object_id != Some(dropped_object)),
+			"no dropped-object row survives inside the packed frame"
+		);
+		assert_eq!(rows[0].partition, Some(PartitionId::new(7)));
+		assert_eq!(rows[1].partition, None, "legacy placement is preserved");
+		assert_eq!(record.payload_hash, payload_digest(&record.frame_bytes));
+	}
 }
 
 // ========================================================

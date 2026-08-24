@@ -2239,6 +2239,28 @@ pub fn column_projection_prefix_ranges(
 	)
 }
 
+/// ADR 0095: conservative locality ranges in which a descriptor can place a
+/// row, independent of whether the row uses legacy raw-locality or partitioned
+/// placement semantics.
+///
+/// Identity projection can occupy the entire ring. Table-spread and column
+/// projection reserve a finite set of table prefixes and may use every suffix
+/// beneath each prefix, which is exactly the range shape their writers use.
+pub fn table_possible_locality_ranges(
+	tenant_id: TenantId,
+	descriptor: &TableSchemaDescriptor,
+) -> std::io::Result<Vec<(Locality, Locality)>> {
+	match &descriptor.locality_policy {
+		LocalityPolicy::TableSpreadProjection(spread) => {
+			table_spread_prefix_ranges(tenant_id, descriptor.table_object_id, *spread)
+		}
+		LocalityPolicy::ColumnProjection(projection) => {
+			column_projection_prefix_ranges(tenant_id, descriptor.table_object_id, projection)
+		}
+		LocalityPolicy::IdentityProjection => Ok(vec![(Locality::new(0), Locality::new(u64::MAX))]),
+	}
+}
+
 pub fn column_projection_predicate_ranges(
 	tenant_id: TenantId,
 	table_object_id: TableObjectId,
@@ -5950,6 +5972,29 @@ mod tests {
 				.unwrap();
 		assert!(!ranges.is_empty());
 		assert!(ranges.len() <= usize::from(TABLE_SPREAD_DEFAULT_FACTOR));
+	}
+
+	#[test]
+	fn adr0095_possible_locality_ranges_are_total_across_descriptor_policies() {
+		let tenant = TenantId::new(9);
+		let projected = clustered_descriptor(
+			ProjectionFunction::ZOrder,
+			vec![cluster_column("event_hour", 24)],
+		);
+		let projected_ranges = table_possible_locality_ranges(tenant, &projected).unwrap();
+		assert!(!projected_ranges.is_empty());
+
+		let mut spread = projected.clone();
+		spread.locality_policy = LocalityPolicy::default_table_spread();
+		let spread_ranges = table_possible_locality_ranges(tenant, &spread).unwrap();
+		assert!(!spread_ranges.is_empty());
+
+		let mut identity = projected;
+		identity.locality_policy = LocalityPolicy::IdentityProjection;
+		assert_eq!(
+			table_possible_locality_ranges(tenant, &identity).unwrap(),
+			vec![(Locality::ZERO, Locality::MAX)]
+		);
 	}
 
 	#[test]

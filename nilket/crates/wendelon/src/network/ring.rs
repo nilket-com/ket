@@ -32,11 +32,14 @@
 //! `watch::Receiver<Arc<MembershipEpoch>>`, rebuilds a
 //! [`RingState`], and swaps it in atomically.
 
+use crate::consensus::EpochConfig;
 use crate::network::data_server::ReplicaRouter;
-use crate::network::transport::{MembershipEpoch, NodeRole, NodeRoleSet};
+use crate::network::transport::{
+	MembershipEpoch, NodeCapabilitySet, NodeRole, NodeRoleSet, PeerCapabilities, TransportTierSet,
+};
 use crate::schema::table::PlacementKey;
 use crate::schema::{Identity, Locality, NodeId, PartitionId};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, RwLock};
 use tokio::sync::watch;
 
@@ -276,6 +279,35 @@ impl RingState {
 		out
 	}
 
+	/// ADR 0095: every replica whose stable raw-locality arc intersects at
+	/// least one possible table range. This deliberately returns a conservative
+	/// set: legacy rows retain raw-locality placement forever, even when newer
+	/// rows in the same table route by partition.
+	pub fn replicas_intersecting_locality_ranges(
+		&self,
+		ranges: &[(Locality, Locality)],
+	) -> Vec<NodeId> {
+		let segments = self.replica_segments();
+		let mut nodes = BTreeSet::new();
+		for segment in segments {
+			if ranges
+				.iter()
+				.any(|(start, end)| segment.start <= end.get() && start.get() <= segment.end)
+			{
+				for replica in segment.replicas {
+					nodes.insert((replica.id, replica._reserved));
+				}
+			}
+		}
+		nodes
+			.into_iter()
+			.map(|(id, reserved)| NodeId {
+				id,
+				_reserved: reserved,
+			})
+			.collect()
+	}
+
 	/// Epoch this ring state was built from. Consumers — the lease
 	/// manager in particular — need the epoch so proposed lease
 	/// grants carry the correct HLC fencing.
@@ -342,6 +374,28 @@ impl RingState {
 			}
 		}
 		merged
+	}
+}
+
+/// Rebuild the transport membership view from its Raft-persisted epoch form.
+/// Kept beside [`RingState`] so consensus-time placement and live routing use
+/// one conversion rather than parallel interpretations of role/capability bits.
+pub(crate) fn membership_from_epoch_config(config: &EpochConfig) -> MembershipEpoch {
+	let mut peers = HashMap::with_capacity(config.peers.len());
+	for peer in config.peers.values() {
+		peers.insert(
+			peer.node_id,
+			PeerCapabilities {
+				address: peer.address.clone(),
+				tiers: TransportTierSet::from_u8(peer.tier_bits),
+				roles: NodeRoleSet::from_u8(peer.role_bits),
+				capabilities: NodeCapabilitySet::from_u8(peer.capability_bits),
+			},
+		);
+	}
+	MembershipEpoch {
+		epoch: config.epoch,
+		peers,
 	}
 }
 
@@ -688,6 +742,29 @@ mod tests {
 		let state = RingState::build(&m, 1);
 		let ranges = state.primary_ranges_for(n(99));
 		assert!(ranges.is_empty());
+	}
+
+	#[test]
+	fn adr0095_raw_locality_participants_cover_every_intersecting_replica_arc() {
+		let m = membership_of(vec![(1, data_caps()), (2, data_caps()), (3, data_caps())]);
+		let state = RingState::build(&m, 1);
+		let segments = state.replica_segments();
+		let target = segments
+			.iter()
+			.find(|segment| segment.start < segment.end)
+			.expect("three-node ring must expose a non-empty stable segment");
+		let narrow = state.replicas_intersecting_locality_ranges(&[(
+			Locality::new(target.start),
+			Locality::new(target.end),
+		)]);
+		assert_eq!(narrow, target.replicas);
+
+		let whole = state.replicas_intersecting_locality_ranges(&[(Locality::ZERO, Locality::MAX)]);
+		assert_eq!(
+			whole.iter().map(|node| node.id).collect::<Vec<_>>(),
+			[1, 2, 3],
+			"identity-projected legacy rows can occupy every raw-locality arc"
+		);
 	}
 
 	#[test]

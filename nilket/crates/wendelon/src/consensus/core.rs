@@ -184,6 +184,24 @@ impl TableDropFinalizeRequest {
 	}
 }
 
+/// ADR 0095 logical finalize. Unlike the replay-only ADR 039/0093 finalize,
+/// this stage does not require physical reclaim evidence: apply converts the
+/// admission fence into a tombstone and records durable debt.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropLogicalFinalizeRequest {
+	pub operation_id: DropOperationId,
+	pub fence_log_index: u64,
+}
+
+/// ADR 0095 physical settlement after every stamped participant attests.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TableDropSettlementRequest {
+	pub operation_id: DropOperationId,
+	pub finalize_log_index: u64,
+	pub ownership_epoch: u64,
+	pub attested_participants: crate::schema::TableDropParticipantSet,
+}
+
 /// Payload of a `RetireTieredSlab` Raft entry.
 ///
 /// Committed when a previously-tiered slab no longer has any live
@@ -603,6 +621,11 @@ pub enum WendelonRequest {
 	CtasSaga(CtasSagaMutation),
 	/// ADR 0094 replay-only bridge. No live producer may construct this.
 	ReplayLegacyCtasRowDispatched(crate::schema::ReplayLegacyCtasRowDispatched),
+	/// ADR 0095 logical completion: fence becomes admission-authoritative
+	/// tombstone and replicated physical-reclaim debt.
+	TableDropLogicalFinalize(TableDropLogicalFinalizeRequest),
+	/// ADR 0095 physical settlement after the complete stamped set attests.
+	TableDropSettlement(TableDropSettlementRequest),
 }
 
 impl WendelonRequest {
@@ -612,7 +635,7 @@ impl WendelonRequest {
 	/// variant moves no existing golden bytes, so the corpus alone cannot see
 	/// it — the count and this list can. Adding a variant here means the WAL
 	/// format version must move with it.
-	pub const ALL_VARIANT_NAMES: [&'static str; 24] = [
+	pub const ALL_VARIANT_NAMES: [&'static str; 26] = [
 		"finalize",
 		"acquire_lease",
 		"release_lease",
@@ -637,6 +660,8 @@ impl WendelonRequest {
 		"table_drop_finalize",
 		"ctas_saga",
 		"replay_legacy_ctas_row_dispatched",
+		"table_drop_logical_finalize",
+		"table_drop_settlement",
 	];
 
 	/// Total by construction: a new variant fails this match at compile time,
@@ -668,6 +693,8 @@ impl WendelonRequest {
 			Self::TableDropFinalize(_) => "table_drop_finalize",
 			Self::CtasSaga(_) => "ctas_saga",
 			Self::ReplayLegacyCtasRowDispatched(_) => "replay_legacy_ctas_row_dispatched",
+			Self::TableDropLogicalFinalize(_) => "table_drop_logical_finalize",
+			Self::TableDropSettlement(_) => "table_drop_settlement",
 		}
 	}
 }

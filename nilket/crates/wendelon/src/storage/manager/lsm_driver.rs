@@ -1480,6 +1480,7 @@ impl SlabManager {
 			if self.is_compaction_slab_quarantined(slab_id) {
 				continue;
 			}
+			let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
 			if self.slab_pins.pin_count(slab_id) != 0 {
 				continue;
 			}
@@ -1566,6 +1567,7 @@ impl SlabManager {
 			if self.is_compaction_slab_quarantined(slab_id) {
 				continue;
 			}
+			let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
 			if self.slab_pins.pin_count(slab_id) != 0 {
 				continue;
 			}

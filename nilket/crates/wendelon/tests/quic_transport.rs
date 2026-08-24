@@ -455,8 +455,8 @@ async fn adr0093_without_keep_alive_the_same_wendelon_connection_times_out() {
 
 #[cfg(feature = "test-support")]
 #[tokio::test]
-#[ignore = "evidence exhibit: holds a real Wendelon DROP beyond Quinn's former 30s idle timeout"]
-async fn adr0093_live_quic_drop_survives_more_than_thirty_seconds_of_reclaim() {
+#[ignore = "evidence exhibit: a real Wendelon DROP returns before asynchronous reclaim"]
+async fn adr0095_live_quic_drop_returns_before_asynchronous_reclaim() {
 	let root = fresh_dir("adr0093-live-drop");
 	let pki = tls_pki::write_test_pki(&root.join("pki"));
 	let address = reserve_socket_addr();
@@ -539,10 +539,10 @@ async fn adr0093_live_quic_drop_survives_more_than_thirty_seconds_of_reclaim() {
 		table_object_id,
 		schema_generation: SchemaGeneration::new(1),
 	};
-	let _delay = wendelon::network::adr0093_test_support::delay_next_drop_reclaim(
-		table_object_id,
-		std::time::Duration::from_secs(31),
-	);
+	// ADR 0095 makes physical reclaim independent of statement completion. Hold
+	// the production sweeper stopped so the durable debt is an observable premise
+	// rather than racing a fast empty-table settlement.
+	node.handles.drop_reclaim_sweeper.abort();
 	let started = std::time::Instant::now();
 	client
 		.drop_table_schema(TableSchemaDropRequest::current(TableSchemaDropFields {
@@ -552,11 +552,11 @@ async fn adr0093_live_quic_drop_survives_more_than_thirty_seconds_of_reclaim() {
 			operation_id,
 		}))
 		.await
-		.expect("DROP must survive the old 30-second idle boundary");
+		.expect("logical DROP must complete without waiting for physical reclaim");
 	let elapsed = started.elapsed();
 	assert!(
-		elapsed > std::time::Duration::from_secs(30),
-		"the exhibit must genuinely cross the old idle boundary: {elapsed:?}"
+		elapsed < std::time::Duration::from_secs(10),
+		"logical DROP must remain comfortably inside statement authority: {elapsed:?}"
 	);
 	assert_eq!(
 		node.state_machine
@@ -566,6 +566,15 @@ async fn adr0093_live_quic_drop_survives_more_than_thirty_seconds_of_reclaim() {
 			.get(tenant_id, table_object_id)
 			.map(|outcome| outcome.operation_id),
 		Some(operation_id)
+	);
+	assert!(
+		node.state_machine
+			.state_snapshot()
+			.await
+			.table_drop_reclaim_debts
+			.get(tenant_id, table_object_id)
+			.is_some(),
+		"the response precedes physical settlement: reclaim debt remains durable"
 	);
 
 	client_endpoint.close(0u32.into(), b"done");

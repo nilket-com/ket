@@ -3,6 +3,7 @@ pub mod cert_issuance_policy;
 pub mod control_server;
 pub mod core;
 pub mod data_server;
+pub(crate) mod drop_reclaim_progress;
 pub mod factory;
 pub mod ipc;
 pub mod lease_signing;
