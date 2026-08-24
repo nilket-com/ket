@@ -261,8 +261,8 @@ pub fn main_screen<'a>(
 		let _ = local_workspace_offer;
 		container(text("")).into()
 	};
-	let profile_unlock_modal: Element<Message> = profile_unlock
-		.map_or_else(|| container(text("")).into(), profile_unlock_view);
+	let profile_unlock_modal: Element<Message> =
+		profile_unlock.map_or_else(|| container(text("")).into(), profile_unlock_view);
 	stack![
 		main_window,
 		adapter_modal,
@@ -858,9 +858,26 @@ mod tests {
 		let adapter = AdapterState::default();
 		let ephemeral = app_status_bar("", "", None, None, None, &adapter, false, false);
 		let durable = app_status_bar("", "", None, None, None, &adapter, true, false);
-		let checkpointed =
-			app_status_bar("Session checkpointed", "", None, None, None, &adapter, true, false);
-		let failed = app_status_bar("", "checkpoint failed", None, None, None, &adapter, true, false);
+		let checkpointed = app_status_bar(
+			"Session checkpointed",
+			"",
+			None,
+			None,
+			None,
+			&adapter,
+			true,
+			false,
+		);
+		let failed = app_status_bar(
+			"",
+			"checkpoint failed",
+			None,
+			None,
+			None,
+			&adapter,
+			true,
+			false,
+		);
 
 		let durable_segment = ("left", "durable session");
 		assert!(
@@ -1154,7 +1171,11 @@ pub fn profile_unlock_view(
 	content = content.push(
 		row![
 			space::horizontal(),
-			styled_button("Cancel", Message::ProfileUnlockCancelled, BUTTON_SIZE_DEFAULT),
+			styled_button(
+				"Cancel",
+				Message::ProfileUnlockCancelled,
+				BUTTON_SIZE_DEFAULT
+			),
 			styled_button(
 				if prompt.creating { "Create" } else { "Unlock" },
 				Message::ProfileUnlockSubmitted,
@@ -1230,8 +1251,7 @@ pub fn adapter_configuration_view(adapter_state: &AdapterState) -> Element<'stat
 		}
 	};
 	let mut content = column![
-		row![text("Configure Adapter").size(24), space::horizontal(),]
-			.align_y(Alignment::Center),
+		row![text("Configure Adapter").size(24), space::horizontal(),].align_y(Alignment::Center),
 		section(
 			"Connection",
 			field(
@@ -1276,17 +1296,17 @@ pub fn adapter_configuration_view(adapter_state: &AdapterState) -> Element<'stat
 		.align_y(Alignment::Center),
 	);
 	let dialog: Element<Message> = container(content)
-	.width(Length::Fixed(800.0))
-	.style(|_| container::Style {
-		background: Some(colors::BG_MODAL.into()),
-		border: border::Border {
-			color: colors::BORDER_PRIMARY,
-			width: 1.0,
-			radius: 5.0.into(),
-		},
-		..Default::default()
-	})
-	.into();
+		.width(Length::Fixed(800.0))
+		.style(|_| container::Style {
+			background: Some(colors::BG_MODAL.into()),
+			border: border::Border {
+				color: colors::BORDER_PRIMARY,
+				width: 1.0,
+				radius: 5.0.into(),
+			},
+			..Default::default()
+		})
+		.into();
 	column![
 		space::vertical().height(FillPortion((100 - MODAL_FILL_PORTION_V) / 2)),
 		row![space::horizontal(), dialog, space::horizontal(),],

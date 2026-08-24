@@ -99,8 +99,7 @@ const PRODUCT_0132_BANKED_ROTATED_TICK_INK: (usize, usize) = (2831, 3086);
 const PRODUCT_0132_BANKED_UNROTATED_TICK_INK: usize = 2096;
 // PRODUCT-0131's pre-bound negative control. These values are retained as
 // evidence even after Stage 1 makes every corresponding plot positive.
-const PRODUCT_0131_PRE_BOUND_HEIGHTS: [[f32; 3]; 2] =
-	[[34.7, 5.9, 0.0], [0.0, 0.0, 0.0]];
+const PRODUCT_0131_PRE_BOUND_HEIGHTS: [[f32; 3]; 2] = [[34.7, 5.9, 0.0], [0.0, 0.0, 0.0]];
 
 struct Gpu {
 	adapter: wgpu::Adapter,
@@ -287,7 +286,9 @@ fn render_plot_and_overlay(
 	reset(renderer, size);
 	let frame_size = Size::new(size.width as f32, size.height as f32);
 	let mut plot_frame = canvas::Frame::new(renderer, frame_size);
-	let mut plot_backend = IcedBackend { frame: &mut plot_frame };
+	let mut plot_backend = IcedBackend {
+		frame: &mut plot_frame,
+	};
 	plot(&mut plot_backend);
 	let mut overlay_frame = canvas::Frame::new(renderer, frame_size);
 	let mut overlay_backend = IcedBackend {
@@ -664,10 +665,10 @@ fn render_product_0068_bar(
 	} else {
 		render_plot_and_overlay(
 			renderer,
-		size,
-		|backend| widget.render_plot_layer(backend, bounds),
-		|backend| widget.render_overlay_layer(backend, bounds),
-	)
+			size,
+			|backend| widget.render_plot_layer(backend, bounds),
+			|backend| widget.render_overlay_layer(backend, bounds),
+		)
 	}
 }
 
@@ -895,8 +896,8 @@ fn render_product_kernel_rotation(
 		&requirements,
 		&resolved,
 	)
-		.plot_area(Rect::from_iced_frame(figure_bounds), 0.0, &resolved)
-		.into_iced();
+	.plot_area(Rect::from_iced_frame(figure_bounds), 0.0, &resolved)
+	.into_iced();
 	let settings_model = settings;
 	let widget = PlotWidget {
 		kernel,
@@ -1193,10 +1194,10 @@ fn render_product_0068_cartesian_mark(
 	} else {
 		render_plot_and_overlay(
 			renderer,
-		size,
-		|backend| widget.render_plot_layer(backend, bounds),
-		|backend| widget.render_overlay_layer(backend, bounds),
-	)
+			size,
+			|backend| widget.render_plot_layer(backend, bounds),
+			|backend| widget.render_overlay_layer(backend, bounds),
+		)
 	}
 }
 
@@ -2171,15 +2172,13 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 			let (kernel, settings) = product_temporal_count_fixture(rotation);
 			let (capture, figure_bounds, plot_area) =
 				render_product_kernel_rotation(&mut msaa, size, &kernel, settings);
-			let expected_height =
-				figure_bounds.height * VerticalGuideBands::PLOT_MIN_SHARE;
+			let expected_height = figure_bounds.height * VerticalGuideBands::PLOT_MIN_SHARE;
 			let pre_bound_height = PRODUCT_0131_PRE_BOUND_HEIGHTS[size_index][rotation_index];
 			let bottom_band = Rectangle::new(
 				Point::new(figure_bounds.x, plot_area.y + plot_area.height),
 				Size::new(
 					figure_bounds.width,
-					(figure_bounds.y + figure_bounds.height
-						- (plot_area.y + plot_area.height))
+					(figure_bounds.y + figure_bounds.height - (plot_area.y + plot_area.height))
 						.max(0.0),
 				),
 			);
@@ -2204,9 +2203,7 @@ async fn product_0057_renderer_oracle_licenses_are_discriminating() {
 			);
 			println!(
 				"PRODUCT_0130 temporal_count_rotation size={}x{} rotation={rotation} plot_height={:.1} bottom_ink={bottom_ink}",
-				size.width,
-				size.height,
-				plot_area.height,
+				size.width, size.height, plot_area.height,
 			);
 		}
 	}

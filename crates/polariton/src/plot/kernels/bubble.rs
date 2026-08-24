@@ -223,7 +223,9 @@ impl PlotKernel for BubblePlotKernel {
 					return Some(
 						hit.labeled(
 							"X",
-							crate::plot::common::axis_hit_semantic_type(&self.prepared_data.x_axis_type),
+							crate::plot::common::axis_hit_semantic_type(
+								&self.prepared_data.x_axis_type,
+							),
 							crate::plot::common::axis_hit_value(
 								point.x(),
 								&self.prepared_data.x_axis_type,

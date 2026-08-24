@@ -216,8 +216,7 @@ impl AdapterState {
 			!value.trim().is_empty() && value.trim() != field.default_value.unwrap_or_default()
 		});
 		touched.then(|| {
-			"Use either the connection fields or the ad hoc connection string, not both."
-				.to_owned()
+			"Use either the connection fields or the ad hoc connection string, not both.".to_owned()
 		})
 	}
 

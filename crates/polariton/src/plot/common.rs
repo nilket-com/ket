@@ -2239,9 +2239,7 @@ impl VerticalGuideBands {
 		let leading = leading.min(reserved);
 		let trailing = trailing.min((reserved - leading).max(0.0));
 		debug_assert!(
-			extent <= 0.0
-				|| extent - leading - trailing + 0.001
-					>= extent * Self::PLOT_MIN_SHARE,
+			extent <= 0.0 || extent - leading - trailing + 0.001 >= extent * Self::PLOT_MIN_SHARE,
 			"PRODUCT-0131 allocation must preserve the minimum plot share"
 		);
 		(leading, trailing)
@@ -2466,8 +2464,7 @@ impl VerticalGuideBands {
 			(bounds.height() - top - bottom).max(0.0),
 		);
 		debug_assert!(
-			bounds.width() <= 0.0
-				|| plot.width() + 0.001 >= bounds.width() * Self::PLOT_MIN_SHARE,
+			bounds.width() <= 0.0 || plot.width() + 0.001 >= bounds.width() * Self::PLOT_MIN_SHARE,
 			"PRODUCT-0131 plot allocation must preserve the minimum width share"
 		);
 		debug_assert!(
@@ -2499,8 +2496,7 @@ impl VerticalGuideBands {
 			(outer.height() - top - bottom).max(0.0),
 		);
 		debug_assert!(
-			outer.width() <= 0.0
-				|| tiled.width() + 0.001 >= outer.width() * Self::PLOT_MIN_SHARE,
+			outer.width() <= 0.0 || tiled.width() + 0.001 >= outer.width() * Self::PLOT_MIN_SHARE,
 			"PRODUCT-0131 grid allocation must preserve the minimum width share"
 		);
 		debug_assert!(

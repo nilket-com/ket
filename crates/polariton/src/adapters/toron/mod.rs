@@ -355,7 +355,10 @@ mod tests {
 			.dispatch_rune(&view.source)
 			.await
 			.expect("one Rune relation result");
-		let frame = artifact.expect_relation().projection().expect("Toron projection");
+		let frame = artifact
+			.expect_relation()
+			.projection()
+			.expect("Toron projection");
 		assert!(frame.height() > 0, "dogfood relation is nonempty");
 		assert_eq!(view.views.len(), 3);
 		for view in view.views {
@@ -454,7 +457,9 @@ mod tests {
 		const CARDINALITIES: &[i64] = &[49_999, 50_000, 199_999, 200_000, 999_999, 1_000_000];
 		const SEED: i64 = 20260821;
 
-		println!("\ncardinality,materialize_ms,transfer_prepare_ms,first_render_ms,steady_render_ms,rows");
+		println!(
+			"\ncardinality,materialize_ms,transfer_prepare_ms,first_render_ms,steady_render_ms,rows"
+		);
 		for &n in CARDINALITIES {
 			let table = format!("evidence_scatter_{n}");
 			let _ = adapter
@@ -486,7 +491,8 @@ mod tests {
 				.await
 				.expect("materialize succeeds");
 			let materialize_ms = started.elapsed().as_secs_f64() * 1000.0;
-			let crate::adapters::common::RuneDispatchSuccess::Materialized(receipt) = outcome else {
+			let crate::adapters::common::RuneDispatchSuccess::Materialized(receipt) = outcome
+			else {
 				panic!("materialize must report a receipt, not a relation");
 			};
 			assert_eq!(receipt.rows_written, n as u64);
@@ -494,9 +500,7 @@ mod tests {
 
 			// Stage 2 — reopen through the ordinary view path, transfer and
 			// prepare the plot. This is the round trip a user actually takes.
-			let view_source = format!(
-				"ket.table(\"{table}\").views([scatter(\"x\", \"y\")])"
-			);
+			let view_source = format!("ket.table(\"{table}\").views([scatter(\"x\", \"y\")])");
 			let view = transform_rune_view(&view_source)
 				.expect("view envelope")
 				.into_relations()
@@ -511,7 +515,11 @@ mod tests {
 			let frame = artifact.projection().expect("projection");
 			let projected = frame.select(["x", "y"]).expect("project plot fields");
 			let kernel = create_authored_plot(
-				AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x".to_owned(), "y".to_owned()),
+				AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::Scatter),
+					"x".to_owned(),
+					"y".to_owned(),
+				),
 				&projected,
 				1200,
 				720,
@@ -584,7 +592,10 @@ mod tests {
 						relation.origin, relation.source
 					)
 				});
-			let frame = artifact.expect_relation().projection().expect("Toron projection");
+			let frame = artifact
+				.expect_relation()
+				.projection()
+				.expect("Toron projection");
 			if relation.origin.contains(".aggregate(") {
 				assert_eq!(frame.height(), 3, "aggregated pie relation");
 			} else {
@@ -615,7 +626,10 @@ mod tests {
 					relation.origin, relation.source
 				)
 			});
-		let frame = artifact.expect_relation().projection().expect("Toron violin projection");
+		let frame = artifact
+			.expect_relation()
+			.projection()
+			.expect("Toron violin projection");
 		assert_eq!(
 			frame.height(),
 			288,
@@ -691,7 +705,10 @@ mod tests {
 			.dispatch_rune(&relation.source)
 			.await
 			.expect("one Rune relation result");
-		let frame = artifact.expect_relation().projection().expect("Toron projection");
+		let frame = artifact
+			.expect_relation()
+			.projection()
+			.expect("Toron projection");
 		let [view] = relation.views.as_slice() else {
 			panic!("line fixture must produce exactly one view");
 		};
@@ -747,7 +764,10 @@ mod tests {
 			.dispatch_rune(&view.source)
 			.await
 			.expect("one Rune relation result");
-		let frame = artifact.expect_relation().projection().expect("Toron projection");
+		let frame = artifact
+			.expect_relation()
+			.projection()
+			.expect("Toron projection");
 		assert!(frame.height() > 0, "dogfood relation is nonempty");
 		assert_eq!(view.views.len(), 3);
 		for view in view.views {

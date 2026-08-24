@@ -54,17 +54,19 @@ pub(crate) fn estimate_ascii_label_width(text: &str, font_size: f32) -> f32 {
 pub(crate) fn ascii_label_advance_em(character: char) -> f32 {
 	match character {
 		'\'' => ASCII_TINY_ADVANCE_EM,
-		' ' | '!' | '(' | ')' | ',' | '.' | ':' | ';' | 'J' | 'i' | 'j' | 'l'
-		| '`' => ASCII_NARROW_ADVANCE_EM,
+		' ' | '!' | '(' | ')' | ',' | '.' | ':' | ';' | 'J' | 'i' | 'j' | 'l' | '`' => {
+			ASCII_NARROW_ADVANCE_EM
+		}
 		'-' | '[' | ']' | 'I' | 'f' => ASCII_SLIM_ADVANCE_EM,
 		'/' | '\\' | '{' | '}' | 't' => ASCII_COMPACT_ADVANCE_EM,
 		'"' | '?' | '_' | 'r' => ASCII_SMALL_ADVANCE_EM,
 		'c' | 's' | 'z' => ASCII_MEDIUM_NARROW_ADVANCE_EM,
 		'F' | 'L' | 'S' | 'k' | 'v' | 'x' | 'y' => ASCII_MEDIUM_ADVANCE_EM,
-		'$' | '+' | '0'..='9' | '<' | '=' | '>' | '^' | '~' | 'E' | 'T' | 'X'
-		| 'Y' | 'Z' => ASCII_STANDARD_ADVANCE_EM,
-		'*' | '|' | '#' | 'A' | 'B' | 'C' | 'K' | 'P' | 'R' | 'V' | 'a' | 'b' | 'd'
-		| 'e' | 'g' | 'h' | 'n' | 'o' | 'p' | 'q' | 'u' => ASCII_BROAD_ADVANCE_EM,
+		'$' | '+' | '0'..='9' | '<' | '=' | '>' | '^' | '~' | 'E' | 'T' | 'X' | 'Y' | 'Z' => {
+			ASCII_STANDARD_ADVANCE_EM
+		}
+		'*' | '|' | '#' | 'A' | 'B' | 'C' | 'K' | 'P' | 'R' | 'V' | 'a' | 'b' | 'd' | 'e' | 'g'
+		| 'h' | 'n' | 'o' | 'p' | 'q' | 'u' => ASCII_BROAD_ADVANCE_EM,
 		'&' | 'D' | 'G' | 'H' | 'U' => ASCII_WIDE_ADVANCE_EM,
 		'N' | 'O' | 'Q' | 'w' => ASCII_EXTRA_WIDE_ADVANCE_EM,
 		'%' => ASCII_PERCENT_ADVANCE_EM,
@@ -154,8 +156,7 @@ mod tests {
 			);
 		}
 		assert_eq!(
-			estimate_ascii_label_width("e\u{301}", 20.0)
-				- estimate_ascii_label_width("e", 20.0),
+			estimate_ascii_label_width("e\u{301}", 20.0) - estimate_ascii_label_width("e", 20.0),
 			20.0 * OUT_OF_PARTITION_LABEL_ADVANCE_EM,
 			"PRODUCT-0117 a combining mark must take the broad fallback beside its ASCII base"
 		);
@@ -186,7 +187,10 @@ mod tests {
 			.glyphs
 			.first()
 			.expect("PRODUCT-0117 CJK paragraph has a glyph");
-		assert_ne!(glyph.glyph_id, 0, "PRODUCT-0117 CJK fallback must not shape tofu");
+		assert_ne!(
+			glyph.glyph_id, 0,
+			"PRODUCT-0117 CJK fallback must not shape tofu"
+		);
 		let mut system = font_system().write().expect("global font system lock");
 		let face = system
 			.raw()

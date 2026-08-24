@@ -541,7 +541,8 @@ fn create_layered_plot_with_artifact(
 	let (x_temporal_domain, y_temporal_domain) = if is_single_layer {
 		(
 			temporal_axis_domain(
-			df.column(&x_label).expect("resolved x field remains present"),
+				df.column(&x_label)
+					.expect("resolved x field remains present"),
 				&x_axis_type,
 			),
 			temporal_axis_domain(
@@ -1360,7 +1361,9 @@ mod product_0013_baseline_tests {
 
 	#[test]
 	fn product_0130_styled_single_temporal_layer_retains_exact_domains() {
-		use polars::prelude::{DataType, IntoColumn, NamedFrom, TimeUnit as PolarsTimeUnit, TimeZone};
+		use polars::prelude::{
+			DataType, IntoColumn, NamedFrom, TimeUnit as PolarsTimeUnit, TimeZone,
+		};
 
 		let x = polars::prelude::Series::new(
 			"x".into(),
@@ -1388,8 +1391,9 @@ mod product_0013_baseline_tests {
 			Override::Set(crate::plot::spec::StrokeWidth::new(2.0).expect("stroke width"));
 		let kernel = create_layered_plot(&LayeredPlotSpec::new(layer), &frame, 100, 100)
 			.expect("styled temporal layer");
-		let PlotLayout::Cartesian { x_temporal_domain, .. } =
-			kernel.layout(ResolvedPlotSettings::default())
+		let PlotLayout::Cartesian {
+			x_temporal_domain, ..
+		} = kernel.layout(ResolvedPlotSettings::default())
 		else {
 			panic!("styled temporal layer must remain Cartesian");
 		};
@@ -1407,8 +1411,9 @@ mod product_0013_baseline_tests {
 		multi.push(LayerSpec::xy(LayerMark::Line, "x", "y"));
 		let multi_kernel =
 			create_layered_plot(&multi, &frame, 100, 100).expect("multi-layer temporal plot");
-		let PlotLayout::Cartesian { x_temporal_domain, .. } =
-			multi_kernel.layout(ResolvedPlotSettings::default())
+		let PlotLayout::Cartesian {
+			x_temporal_domain, ..
+		} = multi_kernel.layout(ResolvedPlotSettings::default())
 		else {
 			panic!("multi-layer temporal plot must remain Cartesian");
 		};

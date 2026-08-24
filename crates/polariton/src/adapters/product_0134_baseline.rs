@@ -9,9 +9,7 @@
 //! requires a network.
 
 use crate::adapters::common::ExecutionResult;
-use crate::adapters::driver::{
-	AdapterConfiguration, AdapterSelection, AdapterState, fields_for,
-};
+use crate::adapters::driver::{AdapterConfiguration, AdapterSelection, AdapterState, fields_for};
 
 /// (key, default_value, is_secure) — one declared adapter field.
 type FieldRow = (&'static str, Option<&'static str>, bool);
@@ -84,9 +82,14 @@ fn product_0134_fields_decompose_only_the_credentialed_adapters() {
 #[test]
 fn product_0134_postgres_fields_match_the_typed_string_oracle() {
 	use tokio_postgres::config::Host;
-	let assembled =
-		crate::adapters::postgres::config_from_fields("db.example.com", "6432", "analytics", "user", "secret")
-			.expect("fields assemble");
+	let assembled = crate::adapters::postgres::config_from_fields(
+		"db.example.com",
+		"6432",
+		"analytics",
+		"user",
+		"secret",
+	)
+	.expect("fields assemble");
 	let oracle: tokio_postgres::Config = "postgresql://user:secret@db.example.com:6432/analytics"
 		.parse()
 		.expect("oracle parses");
@@ -238,9 +241,7 @@ fn product_0134_baseline_sqlite_connects_memory_and_file() {
 			connection_string: "memory".into(),
 		}))
 		.expect("memory sqlite connects");
-	let result = runtime.block_on(async {
-		memory.write().await.dispatch("select 1 as x").await
-	});
+	let result = runtime.block_on(async { memory.write().await.dispatch("select 1 as x").await });
 	let ExecutionResult::Rows { artifact, .. } = result else {
 		panic!("memory sqlite answers a trivial query");
 	};
@@ -281,8 +282,8 @@ fn product_0134_baseline_parquet_connects_a_fixture_file() {
 	));
 	std::fs::create_dir_all(&dir).expect("temp dir");
 	let path = dir.join("baseline_fixture.parquet");
-	let mut frame = polars::df!("x" => [1_i64, 2, 3], "label" => ["a", "b", "c"])
-		.expect("fixture frame");
+	let mut frame =
+		polars::df!("x" => [1_i64, 2, 3], "label" => ["a", "b", "c"]).expect("fixture frame");
 	let file = std::fs::File::create(&path).expect("fixture file");
 	ParquetWriter::new(file)
 		.finish(&mut frame)

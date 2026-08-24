@@ -5326,12 +5326,14 @@ mod tests {
 				revision: 1,
 				origin,
 				views: Vec::new(),
-				result: Ok(RuneRelationCompletion::Materialized(MaterializationReceipt {
-					namespace: "public".to_owned(),
-					table_name: "fixture".to_owned(),
-					certificate_format_version: 1,
-					rows_written: 1_000_000,
-				})),
+				result: Ok(RuneRelationCompletion::Materialized(
+					MaterializationReceipt {
+						namespace: "public".to_owned(),
+						table_name: "fixture".to_owned(),
+						certificate_format_version: 1,
+						rows_written: 1_000_000,
+					},
+				)),
 			},
 		));
 		assert!(state.status_error.is_empty(), "a receipt is routine status");
@@ -5340,7 +5342,9 @@ mod tests {
 		// string, so a dotted render would name something that cannot
 		// round-trip.
 		assert!(
-			state.status_msg.contains(r#"table "fixture" in namespace "public""#),
+			state
+				.status_msg
+				.contains(r#"table "fixture" in namespace "public""#),
 			"{}",
 			state.status_msg
 		);
@@ -5399,7 +5403,10 @@ mod tests {
 		match completion {
 			crate::gui::messages::RuneRelationCompletion::Views(outcome) => outcome,
 			crate::gui::messages::RuneRelationCompletion::Materialized(receipt) => {
-				panic!("expected views, got a materialization of {}", receipt.table_name)
+				panic!(
+					"expected views, got a materialization of {}",
+					receipt.table_name
+				)
 			}
 		}
 	}

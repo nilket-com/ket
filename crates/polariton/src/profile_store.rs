@@ -330,7 +330,9 @@ mod tests {
 	fn product_0134_store_refuses_create_rename_collisions_and_empty_names() {
 		let path = temp_store_path("collisions");
 		let mut store = ProfileStore::default();
-		store.initialize(&path, passphrase("pw")).expect("initialize");
+		store
+			.initialize(&path, passphrase("pw"))
+			.expect("initialize");
 		store
 			.save_new(&path, "prod", postgres_profile())
 			.expect("save");
@@ -376,7 +378,9 @@ mod tests {
 	fn product_0134_store_names_are_exact_after_trimming() {
 		let path = temp_store_path("exact");
 		let mut store = ProfileStore::default();
-		store.initialize(&path, passphrase("pw")).expect("initialize");
+		store
+			.initialize(&path, passphrase("pw"))
+			.expect("initialize");
 		store
 			.save_new(&path, "prod", postgres_profile())
 			.expect("lower");
@@ -391,7 +395,9 @@ mod tests {
 	fn product_0134_store_failed_open_changes_nothing_and_stays_locked() {
 		let path = temp_store_path("failed-open");
 		let mut store = ProfileStore::default();
-		store.initialize(&path, passphrase("right")).expect("initialize");
+		store
+			.initialize(&path, passphrase("right"))
+			.expect("initialize");
 		store
 			.save_new(&path, "prod", postgres_profile())
 			.expect("save");
@@ -422,7 +428,9 @@ mod tests {
 	fn product_0134_store_initialize_refuses_an_existing_file_and_locked_refuses_writes() {
 		let path = temp_store_path("initialize");
 		let mut store = ProfileStore::default();
-		store.initialize(&path, passphrase("pw")).expect("initialize");
+		store
+			.initialize(&path, passphrase("pw"))
+			.expect("initialize");
 		drop(store);
 
 		let mut second = ProfileStore::default();
@@ -444,8 +452,13 @@ mod tests {
 		use std::os::unix::fs::PermissionsExt;
 		let path = temp_store_path("private");
 		let mut store = ProfileStore::default();
-		store.initialize(&path, passphrase("pw")).expect("initialize");
-		let mode = std::fs::metadata(&path).expect("metadata").permissions().mode();
+		store
+			.initialize(&path, passphrase("pw"))
+			.expect("initialize");
+		let mode = std::fs::metadata(&path)
+			.expect("metadata")
+			.permissions()
+			.mode();
 		assert_eq!(mode & 0o777, 0o600, "store file must be owner-only");
 		cleanup(&path);
 	}
@@ -498,7 +511,9 @@ mod tests {
 		);
 
 		let path = temp_store_path("independent");
-		store.initialize(&path, passphrase("pw")).expect("initialize");
+		store
+			.initialize(&path, passphrase("pw"))
+			.expect("initialize");
 		assert!(store.is_unlocked());
 		store.lock();
 		assert!(!store.is_unlocked());
@@ -513,7 +528,9 @@ mod tests {
 	fn product_0134_store_sealed_bytes_disclose_no_names_or_credentials() {
 		let path = temp_store_path("sealed");
 		let mut store = ProfileStore::default();
-		store.initialize(&path, passphrase("pw")).expect("initialize");
+		store
+			.initialize(&path, passphrase("pw"))
+			.expect("initialize");
 		store
 			.save_new(&path, "prod-warehouse", postgres_profile())
 			.expect("save");

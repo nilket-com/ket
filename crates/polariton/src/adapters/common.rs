@@ -111,7 +111,10 @@ impl RuneDispatchSuccess {
 		match self {
 			RuneDispatchSuccess::Relation(artifact) => artifact,
 			RuneDispatchSuccess::Materialized(receipt) => {
-				panic!("expected a relation, got a materialization of {}", receipt.table_name)
+				panic!(
+					"expected a relation, got a materialization of {}",
+					receipt.table_name
+				)
 			}
 		}
 	}

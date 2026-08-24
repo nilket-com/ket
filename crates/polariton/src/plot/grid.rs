@@ -970,10 +970,7 @@ impl PlotComposite for PlotGridKernel {
 				layout,
 				IcedRectangle::new(Point::ORIGIN, inner_bounds.size()),
 			);
-			let local_cursor = Point::new(
-				cursor.x() - inner.x(),
-				cursor.y() - inner.y(),
-			);
+			let local_cursor = Point::new(cursor.x() - inner.x(), cursor.y() - inner.y());
 			let hit = cell.kernel.hit_with_settings(
 				&transform,
 				Cursor::Available(local_cursor),
