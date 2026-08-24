@@ -165,6 +165,32 @@ Operational effect: a tenant-growth event from 1k → 1M tenants does not blow u
 
 The pilot ships with the following Prometheus/OpenMetrics surface. Metric names below are listed exactly as exported, including the `wendelon_` prefix.
 
+#### DROP reclaim drain barrier
+
+`wendelon_table_drop_reclaim_debts` is the authoritative, unlabeled count of
+replicated physical-erasure obligations awaiting settlement.
+`wendelon_table_drop_settlements_total` counts settlements live-applied by the
+scraped daemon process. Participant phase transitions and settlement are also
+logged at `info`; configure daemon logging with `WENDELON_LOG` (`RUST_LOG` does
+not control Wendelon).
+
+To measure cleanup drain time for an evidence run:
+
+1. Scrape `/metrics` and require
+   `wendelon_table_drop_reclaim_debts == 0` before issuing any DROP.
+2. Reserve an exclusive cleanup window: no unrelated actor may issue DROP
+   until the measurement ends.
+3. Record the acceptance time of the run's DROP requests externally.
+4. Poll the gauge until it returns to zero. The acceptance-to-zero interval is
+   the end-to-end drain time; the routine `table drop physical reclaim settled`
+   line must fall inside that interval.
+
+A nonzero starting value is not a baseline. Returning to it can mean an older
+debt settled while this run's debt remains, so the result is ambiguous and
+must be rejected rather than reported as drained. If a zero, exclusive window
+cannot be obtained, use the future per-operation status surface; this aggregate
+gauge cannot provide a truthful per-run receipt under overlapping DROP work.
+
 #### Raft / Control Ring
 | Metric | Type | Labels | Use |
 |--------|------|--------|-----|

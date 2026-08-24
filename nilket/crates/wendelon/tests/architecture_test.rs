@@ -281,6 +281,104 @@ fn adr0095_async_drop_reclaim_has_one_admission_and_bounded_work_spine() {
 }
 
 #[test]
+fn adr0096_drop_reclaim_observability_is_state_sourced_unlabeled_and_truthful() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let raft = fs::read_to_string(manifest_dir.join("src/consensus/raft_storage.rs")).unwrap();
+	let metrics = fs::read_to_string(manifest_dir.join("src/metrics/registry.rs")).unwrap();
+	let data = data_server_source(manifest_dir);
+	let node = fs::read_to_string(manifest_dir.join("src/node.rs")).unwrap();
+	let control = fs::read_to_string(manifest_dir.join("src/network/control_server.rs")).unwrap();
+	let runbook = fs::read_to_string(manifest_dir.join("plans/ops/observability.md")).unwrap();
+
+	let setter = metrics
+		.split_once("pub fn set_drop_reclaim_debts")
+		.and_then(|(_, tail)| tail.split_once("pub fn observe_drop_reclaim_settlement"))
+		.map(|(block, _)| block)
+		.expect("ADR 0096 debt gauge setter");
+	assert!(
+		setter.contains(".set("),
+		"the debt metric is set from state"
+	);
+	assert!(!setter.contains(".inc("));
+	assert!(!setter.contains(".add("));
+	let render = metrics
+		.split_once("\"wendelon_table_drop_reclaim_debts\"")
+		.and_then(|(_, tail)| tail.split_once("\"wendelon_table_drop_settlements_total\""))
+		.map(|(block, _)| block)
+		.expect("ADR 0096 metric render block");
+	assert!(render.contains("self.drop_reclaim_debts.get()"));
+	assert!(
+		!render.contains("render_gauge_with_labels"),
+		"operation identity must not become a Prometheus label"
+	);
+
+	for publication_family in [
+		"observability_metrics.set_drop_reclaim_debts(0)",
+		"observability_metrics.set_drop_reclaim_debts(inner.state.table_drop_reclaim_debts.len())",
+		"set_drop_reclaim_debts(guard.state.table_drop_reclaim_debts.len())",
+	] {
+		assert!(
+			raft.contains(publication_family),
+			"missing state-publication refresh family: {publication_family}"
+		);
+	}
+	assert_eq!(
+		raft.matches("set_drop_reclaim_debts(guard.state.table_drop_reclaim_debts.len())")
+			.count(),
+		2,
+		"live apply and validated snapshot install are the two locked-state publication sites"
+	);
+	for (owner, source) in [
+		("node", node.as_str()),
+		("control", control.as_str()),
+		("data", data.as_str()),
+	] {
+		assert!(
+			!source.contains("set_drop_reclaim_debts"),
+			"{owner} must not refresh the state-sourced gauge on leadership or request lifecycle events"
+		);
+	}
+	assert!(raft.contains("pending_drop_settlements"));
+	assert!(raft.contains("applied_successfully"));
+	assert!(raft.contains("observe_drop_reclaim_settlement"));
+	assert!(raft.contains("table drop physical reclaim settled"));
+	assert!(raft.contains("local_node_id"));
+	assert!(node.contains("with_observability_node_id(local_node)"));
+	for phase_field in [
+		"from_phase",
+		"to_phase",
+		"cursor_after_slab_id",
+		"cursor_upper_bound_slab_id",
+		"examined_total",
+	] {
+		assert!(
+			data.contains(phase_field),
+			"phase signal lacks {phase_field}"
+		);
+	}
+	assert!(data.contains("table drop reclaim phase transitioned"));
+
+	for contract in [
+		"wendelon_table_drop_reclaim_debts == 0",
+		"no unrelated actor may issue DROP",
+		"A nonzero starting value is not a baseline",
+		"must be rejected rather than reported as drained",
+	] {
+		assert!(runbook.contains(contract), "ops receipt lacks: {contract}");
+	}
+	// The exact false-receipt history behind the zero/exclusive rule: returning
+	// to a nonzero baseline says nothing about which debt settled.
+	let unrelated_baseline = 1u64;
+	let after_run_drop = unrelated_baseline + 1;
+	let after_unrelated_settles = after_run_drop - 1;
+	assert_eq!(after_unrelated_settles, unrelated_baseline);
+	assert_ne!(
+		unrelated_baseline, 0,
+		"only zero is an exclusive aggregate barrier"
+	);
+}
+
+#[test]
 fn test_adr055_lsm_compaction_substrate_guards() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let cargo_toml = fs::read_to_string(manifest_dir.join("Cargo.toml")).unwrap();
@@ -9017,15 +9115,18 @@ fn adr077_dispatch_and_struct_stay_in_root() {
 /// admission at the leader write/delete seams, and the leader's bounded-debt
 /// orchestration. ADR 077 requires dispatch and root server state to remain
 /// here, so this is a deliberate mechanism-sized bump rather than domain
-/// helper regrowth.
+/// helper regrowth. ADR 0096 adds the bounded participant phase-transition
+/// signal beside the durable progress write whose post-transition cursor and
+/// examined count it reports; moving it would split the observation from the
+/// state transition it describes.
 #[test]
 fn adr077_root_is_bounded() {
 	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
 	let root = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
 	let lines = root.lines().count();
 	assert!(
-		lines <= 16_325,
-		"data_server.rs root is {lines} lines (cap 16_325); carve more or justify a deliberate cap bump"
+		lines <= 16_340,
+		"data_server.rs root is {lines} lines (cap 16_340); carve more or justify a deliberate cap bump"
 	);
 }
 

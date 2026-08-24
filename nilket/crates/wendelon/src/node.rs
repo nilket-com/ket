@@ -1543,11 +1543,13 @@ impl WendelonNode {
 			.with_parameter("build_profile", build_info::build_mode())
 			.with_parameter("mlock", crypto.mlock_status_label()),
 		)?;
-		let state_machine = state_machine.with_audit_materializer(
-			local_node,
-			audit_sink.clone(),
-			audit_materialization.clone(),
-		);
+		let state_machine = state_machine
+			.with_observability_node_id(local_node)
+			.with_audit_materializer(
+				local_node,
+				audit_sink.clone(),
+				audit_materialization.clone(),
+			);
 		let audit_chain_root_rollup = spawn_signed_chain_root_rollup(
 			audit_sink.clone(),
 			local_node,

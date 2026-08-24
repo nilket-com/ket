@@ -2501,6 +2501,10 @@ pub struct MetricsRegistry {
 	pub data_ring_backpressure_rejections_actor_total: Counter,
 	pub data_ring_backpressure_active_tenant_requests: Gauge,
 	pub data_ring_backpressure_active_actor_requests: Gauge,
+	/// ADR 0096: authoritative replicated physical-erasure obligations.
+	drop_reclaim_debts: Gauge,
+	/// ADR 0096: settlements live-applied by this daemon process.
+	drop_reclaim_settlements_total: Counter,
 	table_query_cancellations: StaticLabelCounters,
 	/// ADR 0091: execution errors reported as typed terminal frames, by
 	/// outcome ("framed" reached the client typed; "unframed" the transport
@@ -2768,6 +2772,8 @@ impl Default for MetricsRegistry {
 			control_optimizer_facts_get_authorization_failed_total: Counter::default(),
 			control_optimizer_facts_get_invalid_request_total: Counter::default(),
 			data_ring_write_outcomes: WriteOutcomeCounters::default(),
+			drop_reclaim_debts: Gauge::default(),
+			drop_reclaim_settlements_total: Counter::default(),
 			data_ring_lease_refresh_passes_total: Counter::default(),
 			data_ring_lease_grants_total: Counter::default(),
 			data_ring_lease_denials_total: Counter::default(),
@@ -3044,6 +3050,30 @@ impl Default for MetricsRegistry {
 }
 
 impl MetricsRegistry {
+	/// Set the current replicated DROP reclaim debt count.
+	///
+	/// This is intentionally a set-only, unlabeled gauge. Callers source the
+	/// value from a published state-machine snapshot; event arithmetic would
+	/// drift across replay and snapshot installation.
+	pub fn set_drop_reclaim_debts(&self, value: usize) {
+		self.drop_reclaim_debts
+			.set(u64::try_from(value).unwrap_or(u64::MAX));
+	}
+
+	pub fn observe_drop_reclaim_settlement(&self) {
+		self.drop_reclaim_settlements_total.inc();
+	}
+
+	#[cfg(test)]
+	pub fn drop_reclaim_debts_for_test(&self) -> u64 {
+		self.drop_reclaim_debts.get()
+	}
+
+	#[cfg(test)]
+	pub fn drop_reclaim_settlements_for_test(&self) -> u64 {
+		self.drop_reclaim_settlements_total.get()
+	}
+
 	pub fn observe_write_outcome(&self, status: WriteStatus) {
 		self.data_ring_write_outcomes.observe(status);
 	}
@@ -4344,6 +4374,18 @@ impl MetricsRegistry {
 			"wendelon_eviction_advancer_failures_total",
 			"Eviction proposals that failed to advance the Control Ring membership.",
 			self.eviction_advancer_failures_total.get(),
+		);
+		render_gauge(
+			&mut out,
+			"wendelon_table_drop_reclaim_debts",
+			"Replicated table DROP physical-erasure obligations awaiting settlement.",
+			self.drop_reclaim_debts.get(),
+		);
+		render_counter(
+			&mut out,
+			"wendelon_table_drop_settlements_total",
+			"Table DROP settlements live-applied by this daemon process.",
+			self.drop_reclaim_settlements_total.get(),
 		);
 		render_counter_family_header(
 			&mut out,
@@ -6157,6 +6199,24 @@ mod tests {
 	use std::time::Duration;
 
 	const TEST_BUCKETS_MICROS: &[u64] = &[500, 1_000, 2_500];
+
+	#[test]
+	fn adr0096_drop_reclaim_metrics_are_unlabeled_and_set_sourced() {
+		let registry = MetricsRegistry::default();
+		registry.set_drop_reclaim_debts(3);
+		registry.observe_drop_reclaim_settlement();
+		let rendered = registry.render_prometheus();
+
+		assert!(rendered.contains("wendelon_table_drop_reclaim_debts 3\n"));
+		assert!(rendered.contains("wendelon_table_drop_settlements_total 1\n"));
+		assert!(
+			!rendered.contains("wendelon_table_drop_reclaim_debts{"),
+			"operation identity must never become a Prometheus label"
+		);
+		registry.set_drop_reclaim_debts(1);
+		assert_eq!(registry.drop_reclaim_debts_for_test(), 1);
+		assert_eq!(registry.drop_reclaim_settlements_for_test(), 1);
+	}
 
 	fn namespaced_test_metric(segment: &str) -> String {
 		format!("{}{}", "wendelon_", segment)

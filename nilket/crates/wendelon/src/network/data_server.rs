@@ -1308,6 +1308,7 @@ impl WendelonDataServer {
 			.await?;
 		let corruption_reset = matches!(load, DropReclaimProgressLoad::CorruptReset(_));
 		let mut progress = load.progress();
+		let phase_before = progress.phase;
 		// A cursor from an older owner epoch is safe to resume because every
 		// physical slice is idempotent. Only this validated epoch is persisted.
 		progress.owner_epoch = request.ownership_epoch;
@@ -1388,6 +1389,20 @@ impl WendelonDataServer {
 		self.drop_reclaim_progress
 			.store_current_epoch(progress, request.ownership_epoch)
 			.await?;
+		if progress.phase != phase_before {
+			tracing::info!(
+				tenant_id = request.operation_id.tenant_id.get(),
+				table_object_id = ?request.operation_id.table_object_id,
+				schema_generation = request.operation_id.schema_generation.get(),
+				from_phase = ?phase_before,
+				to_phase = ?progress.phase,
+				cursor_after_slab_id = ?progress.cursor.after_slab_id.map(|slab| slab.get()),
+				cursor_upper_bound_slab_id = ?progress.cursor.upper_bound_slab_id.map(|slab| slab.get()),
+				examined_total = progress.examined_total,
+				ownership_epoch = request.ownership_epoch,
+				"table drop reclaim phase transitioned"
+			);
+		}
 		Ok(DropReclaimSliceResponse {
 			examined,
 			done: progress.phase == DropReclaimPhase::Complete,

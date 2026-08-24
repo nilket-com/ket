@@ -115,3 +115,114 @@ None inverted. Additions: gauge unlabeled + set-only + publication-
 family source-scan. ADR 0095's seams are reused for C2; no new hooks
 expected (state so in the receipt if it holds, per the ADR 0094
 precedent).
+
+## Implementation receipt — 2026-08-24
+
+ADR 0096 is implemented as an observation-only Wendelon cut. The
+authoritative debt gauge is derived from published replicated state, a
+successful live-applied settlement emits one process-lifetime counter event
+and structured line after the state lock is released, and participants emit
+bounded structured lines only when their durable reclaim phase changes. No
+consensus format, wire opcode, Toron source, or reclaim behavior changed.
+
+### Grounding probes
+
+- **P1:** the state-publication families are fresh construction, recovery
+  construction after snapshot plus WAL replay, the post-batch live-apply
+  publication point, and post-validation snapshot installation. Fresh state
+  sets zero; the other three set the gauge from
+  `table_drop_reclaim_debts.len()`. Leadership change is not a publication
+  site and no node, control-RPC, or data-RPC lifecycle path calls the setter.
+- **P2:** both new metrics use the existing node-local authenticated metrics
+  registry and mTLS `/metrics` listener. The listener is not leader-gated;
+  followers expose the state they live-apply. Live optiplex scrapes used the
+  operator client certificate and node CA rather than a test-only endpoint.
+- **P3:** `DEFAULT_LOG_FILTER` is `info`, and Wendelon's filter reads
+  `WENDELON_LOG`; `RUST_LOG` is not the control. Settlement and participant
+  phase-transition lines therefore use `info` and are present under the stock
+  configuration.
+
+### C1–C5 outcomes
+
+- **C1 — barrier semantics:** live apply leaves the gauge at zero for prepare,
+  raises it to one for logical finalize, preserves one on a rejected stale
+  settlement, and returns it to zero only on the exact settlement. Recovery
+  from an outstanding-debt snapshot reports one immediately.
+- **C2 — withheld completion:** the ADR 0095 RF=1 control now withholds a
+  participant for four independently configurable reconciliation cycles.
+  Every cycle refuses the stale coordinator, retains the debt, and leaves
+  progress valid. The subsequently admitted slices emit all documented phase
+  fields and settle normally.
+- **C3 — drift-proofing:** recovery and validated snapshot installation each
+  compare the gauge directly with a one-entry catalog. The architecture guard
+  proves there is no election-triggered setter; during the optiplex startup
+  election, the recovered five-debt value remained five. Live apply and
+  snapshot publication are the only locked-state refresh sites.
+- **C4 — emission seam:** a successful live state-machine apply emits exactly
+  once even though no proposer-response path is involved; a stale settlement
+  and a rejected duplicate emit nothing; direct recovery replay of the same
+  settlement emits nothing. The one live line carries operation/object,
+  finalize log index, participant count, ownership epoch, and local node id.
+- **C5 — barrier honesty:** the source guard constructs the historical false
+  receipt: with one unrelated debt, another debt can arrive and the unrelated
+  one can settle, returning the gauge to the same nonzero value while the run's
+  debt remains. The runbook therefore rejects every nonzero baseline. The live
+  zero/exclusive run below observed its settlement line inside the external
+  acceptance-to-zero interval.
+
+### Live drain evidence
+
+The existing optiplex soak profile was checked first. Its authenticated scrape
+reported five debts and zero process-lifetime settlements; polling from
+14:45:36 through 14:55:07 CDT remained at five while the reclaim process was
+actively reading storage. No new DROP was issued: the run was rejected because
+five is not an exclusive baseline. This is the exact ambiguity the metric now
+makes visible.
+
+The evidence exhibit then used a fresh isolated profile with the same release
+binary. A deliberately oversized 200,000-row trial demonstrated 0 -> 1 but did
+not return to zero during its 67-second observation window; it was not reported
+as drained. The final bounded fixture contained 160 rows and began at
+`debts=0, settlements=0`, with no unrelated DROP activity:
+
+- external DROP start: `2026-08-24T15:00:02.437826926-05:00`;
+- DROP accepted/returned: `15:00:02.464867548` (27 ms statement time);
+- authenticated scrape observed `debts=1, settlements=0` at
+  `15:00:02.543647168`;
+- participant transitions were logged at `15:00:02.606707`
+  (`LocalL1 -> TieredL2`), `15:00:02.784829`
+  (`TieredL2 -> VerifyIndexes`), and `15:00:02.983740`
+  (`VerifyIndexes -> Complete`), with post-transition cursor and cumulative
+  examined fields;
+- the single settlement line was emitted at `15:00:02.988064`; and
+- the authenticated scrape observed `debts=0, settlements=1` at
+  `15:00:03.023631880`.
+
+The acceptance-to-zero drain interval was therefore 0.559 seconds, and the
+settlement line lies inside it. Both isolated profiles were stopped and
+removed. No new DROP, schema mutation, or reset touched the soak profile; its
+already-owed background reclaim ran while observed and may have advanced its
+node-local durable cursors. Optiplex was restored to its pre-exhibit inactive
+service state and original installed-binary checksum.
+
+An incidental operational finding is separate from ADR 0096: the standard
+local wrapper has a fixed 45-second readiness timeout, while recovery of the
+enlarged soak profile took about 88 seconds. Transient units were used for the
+exhibit; this does not affect the observability mechanism or receipt.
+
+### Seal and implementation surface
+
+- formatting and `git diff --check`: clean;
+- Wendelon: library 1,278 passed / 0 failed / 9 ignored, architecture 177/0,
+  and the full `--no-fail-fast` target and documentation sweep green;
+- Toron: library 1,697/0, architecture 2,145/0, and the full
+  `--no-fail-fast` target and documentation sweep green;
+- `toron-tpch`: 511 passed / 0 failed / 6 ignored across its default target
+  sweep; and
+- no Toron source diff.
+
+No production or cross-crate test hook was added. One private local
+`#[cfg(test)]` helper, `with_observability_metrics_for_test`, injects an
+isolated registry into state-machine controls; it is absent from production
+and feature-enabled builds. ADR 0095's participant withholding seams were
+reused unchanged.

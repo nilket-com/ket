@@ -64,7 +64,7 @@ use crate::integration::compute::{
 	LOGICAL_TYPE_INTERNAL_NAMESPACE, LogicalTypeCatalog, SchemaMutationKind, SchemaObjectKind,
 	SchemaUpdateEnvelope, decode_logical_type_definition_create, decode_schema_update_envelope_v1,
 };
-use crate::metrics::global as metrics;
+use crate::metrics::{MetricsRegistry, global as metrics};
 use crate::network::tls::ActorTrustDomain;
 #[cfg(test)]
 use crate::schema::{
@@ -2164,12 +2164,18 @@ pub struct WendelonStateMachine {
 	checkpoint_observer: Option<Arc<dyn CheckpointObserver>>,
 	/// Optional materializer for Raft-authority audit events.
 	audit_materializer: Option<RaftAuditMaterializer>,
+	/// Node identity attached by production bootstrap for process-local
+	/// observability events. Recovery remains independent of node identity.
+	observability_node_id: Option<SchemaNodeId>,
+	observability_metrics: &'static MetricsRegistry,
 	/// Non-blocking live feed of committed finalization markers.
 	finalization_events: broadcast::Sender<FinalizationMarker>,
 }
 
 impl WendelonStateMachine {
 	pub fn new() -> Self {
+		let observability_metrics = metrics();
+		observability_metrics.set_drop_reclaim_debts(0);
 		let (admission_snapshot, _) =
 			watch::channel(admission_snapshot_from_state(&SmState::default()));
 		let (revocation_snapshot, _) =
@@ -2186,6 +2192,8 @@ impl WendelonStateMachine {
 			tenant_kek_observer: None,
 			checkpoint_observer: None,
 			audit_materializer: None,
+			observability_node_id: None,
+			observability_metrics,
 			finalization_events,
 		}
 	}
@@ -2195,6 +2203,16 @@ impl WendelonStateMachine {
 		entries: Vec<Entry<WendelonTypeConfig>>,
 		checkpoint: Option<RecoveryCheckpoint>,
 		snapshot_runtime: SnapshotRuntime,
+	) -> std::io::Result<Self> {
+		Self::from_recovery_with_metrics(snapshot, entries, checkpoint, snapshot_runtime, metrics())
+	}
+
+	fn from_recovery_with_metrics(
+		snapshot: Option<LoadedSnapshot>,
+		entries: Vec<Entry<WendelonTypeConfig>>,
+		checkpoint: Option<RecoveryCheckpoint>,
+		snapshot_runtime: SnapshotRuntime,
+		observability_metrics: &'static MetricsRegistry,
 	) -> std::io::Result<Self> {
 		let (finalization_events, _) = broadcast::channel(FINALIZATION_BROADCAST_CAPACITY);
 		let mut inner = SmInner::default();
@@ -2260,6 +2278,7 @@ impl WendelonStateMachine {
 					)
 				})?;
 		}
+		observability_metrics.set_drop_reclaim_debts(inner.state.table_drop_reclaim_debts.len());
 		Ok(Self {
 			inner: Arc::new(RwLock::new(inner)),
 			mutation_drain,
@@ -2271,6 +2290,8 @@ impl WendelonStateMachine {
 			tenant_kek_observer: None,
 			checkpoint_observer: None,
 			audit_materializer: None,
+			observability_node_id: None,
+			observability_metrics,
 			finalization_events,
 		})
 	}
@@ -2314,6 +2335,26 @@ impl WendelonStateMachine {
 			sink,
 			tracker,
 		});
+		self
+	}
+
+	pub fn with_observability_node_id(mut self, local_node: SchemaNodeId) -> Self {
+		self.observability_node_id = Some(local_node);
+		self
+	}
+
+	fn observability_metrics(&self) -> &MetricsRegistry {
+		self.observability_metrics
+	}
+
+	#[cfg(test)]
+	async fn with_observability_metrics_for_test(
+		mut self,
+		registry: &'static MetricsRegistry,
+	) -> Self {
+		self.observability_metrics = registry;
+		registry
+			.set_drop_reclaim_debts(self.inner.read().await.state.table_drop_reclaim_debts.len());
 		self
 	}
 
@@ -2477,6 +2518,7 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			HashMap<crate::schema::TenantId, TenantKeyset>,
 		> = None;
 		let mut pending_finalizations: Vec<FinalizationMarker> = Vec::new();
+		let mut pending_drop_settlements: Vec<TableDropSettlementRequest> = Vec::new();
 		let pending_checkpoint = {
 			let mut guard = self.inner.write().await;
 			for entry in entries {
@@ -2516,6 +2558,12 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 					finalize_index_schema_audit_context(&guard.state, context);
 				}
 				let applied_successfully = matches!(&resp, WendelonResponse::Success);
+				if applied_successfully
+					&& let EntryPayload::Normal(WendelonRequest::TableDropSettlement(request)) =
+						&entry.payload
+				{
+					pending_drop_settlements.push(request.clone());
+				}
 				if applied_successfully && let Some(operation_id) = drop_prepare_operation {
 					self.mutation_drain
 						.close_committed(operation_id)
@@ -2563,6 +2611,8 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			// Publish under the apply lock so watch observers cannot
 			// observe snapshots out of order relative to apply order.
 			self.publish_live_snapshots_if_changed(&guard.state);
+			self.observability_metrics()
+				.set_drop_reclaim_debts(guard.state.table_drop_reclaim_debts.len());
 			checkpoint_observation_from_state(&guard.state, false)
 		};
 		let pending_checkpoint = pending_checkpoint;
@@ -2630,6 +2680,20 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 		}
 		for marker in pending_finalizations {
 			let _ = self.finalization_events.send(marker);
+		}
+		for settlement in pending_drop_settlements {
+			self.observability_metrics()
+				.observe_drop_reclaim_settlement();
+			tracing::info!(
+				tenant_id = settlement.operation_id.tenant_id.get(),
+				table_object_id = ?settlement.operation_id.table_object_id,
+				schema_generation = settlement.operation_id.schema_generation.get(),
+				finalize_log_index = settlement.finalize_log_index,
+				participant_count = settlement.attested_participants.len(),
+				ownership_epoch = settlement.ownership_epoch,
+				local_node_id = ?self.observability_node_id.map(|node| node.id),
+				"table drop physical reclaim settled"
+			);
 		}
 		if let (Some(observer), Some(observation)) =
 			(self.checkpoint_observer.as_ref(), pending_checkpoint)
@@ -2808,6 +2872,8 @@ impl RaftStateMachine<WendelonTypeConfig> for WendelonStateMachine {
 			// Publish under the state lock so install-snapshot updates
 			// stay monotonic for admission-snapshot observers.
 			self.publish_live_snapshots_if_changed(&guard.state);
+			self.observability_metrics()
+				.set_drop_reclaim_debts(guard.state.table_drop_reclaim_debts.len());
 			checkpoint_observation_from_state(&guard.state, true)
 		};
 		let pending_checkpoint = pending_checkpoint;
@@ -7047,6 +7113,73 @@ mod schema_state_tests {
 	};
 	use crate::storage::cdc_locality_heartbeat_finalization;
 	use arrow::datatypes::{DataType, Field, Schema};
+	use std::sync::Mutex as StdMutex;
+	use tracing::field::{Field as TracingField, Visit};
+	use tracing::{Event, Subscriber};
+	use tracing_subscriber::layer::Context;
+	use tracing_subscriber::prelude::*;
+	use tracing_subscriber::registry::LookupSpan;
+	use tracing_subscriber::{Layer, Registry};
+
+	#[derive(Clone, Default)]
+	struct CapturedEvents(Arc<StdMutex<Vec<Vec<(String, String)>>>>);
+
+	#[derive(Default)]
+	struct EventFieldVisitor(Vec<(String, String)>);
+
+	impl EventFieldVisitor {
+		fn push(&mut self, field: &TracingField, value: String) {
+			self.0.push((field.name().to_owned(), value));
+		}
+	}
+
+	impl Visit for EventFieldVisitor {
+		fn record_bool(&mut self, field: &TracingField, value: bool) {
+			self.push(field, value.to_string());
+		}
+
+		fn record_i64(&mut self, field: &TracingField, value: i64) {
+			self.push(field, value.to_string());
+		}
+
+		fn record_u64(&mut self, field: &TracingField, value: u64) {
+			self.push(field, value.to_string());
+		}
+
+		fn record_str(&mut self, field: &TracingField, value: &str) {
+			self.push(field, value.to_owned());
+		}
+
+		fn record_debug(&mut self, field: &TracingField, value: &dyn Debug) {
+			self.push(field, format!("{value:?}"));
+		}
+	}
+
+	impl<S> Layer<S> for CapturedEvents
+	where
+		S: Subscriber + for<'lookup> LookupSpan<'lookup>,
+	{
+		fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+			let mut visitor = EventFieldVisitor::default();
+			event.record(&mut visitor);
+			self.0.lock().expect("captured event mutex").push(visitor.0);
+		}
+	}
+
+	fn settlement_events(events: &CapturedEvents) -> Vec<Vec<(String, String)>> {
+		events
+			.0
+			.lock()
+			.expect("captured event mutex")
+			.iter()
+			.filter(|fields| {
+				fields.iter().any(|(name, value)| {
+					name == "message" && value.contains("table drop physical reclaim settled")
+				})
+			})
+			.cloned()
+			.collect()
+	}
 
 	fn finalization_entry(
 		index: u64,
@@ -9262,6 +9395,176 @@ mod schema_state_tests {
 		);
 	}
 
+	#[tokio::test(flavor = "current_thread")]
+	async fn adr0096_live_apply_owns_the_authoritative_gauge_and_single_settlement_signal() {
+		let descriptor = table_descriptor(1);
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: descriptor.table_object_id,
+			schema_generation: SchemaGeneration::new(descriptor.schema_generation),
+		};
+		let registry = Box::leak(Box::new(MetricsRegistry::default()));
+		let mut state_machine = WendelonStateMachine::new()
+			.with_observability_node_id(SchemaNodeId {
+				id: 17,
+				_reserved: 0,
+			})
+			.with_observability_metrics_for_test(registry)
+			.await;
+		{
+			let mut inner = state_machine.inner.write().await;
+			inner.state = state_with_descriptor_and_drop_epoch(&descriptor);
+		}
+		registry.set_drop_reclaim_debts(0);
+
+		let events = CapturedEvents::default();
+		let subscriber = Registry::default().with(events.clone());
+		let _subscriber_guard = tracing::subscriber::set_default(subscriber);
+		let apply = |index, request| Entry {
+			log_id: LogId::new(CommittedLeaderId::new(1, 17), index),
+			payload: EntryPayload::Normal(request),
+		};
+
+		let prepared = RaftStateMachine::apply(
+			&mut state_machine,
+			[apply(
+				10,
+				WendelonRequest::TableDropPrepare(TableDropPrepareRequest::current(
+					operation_id,
+					operation_id.schema_generation,
+				)),
+			)],
+		)
+		.await
+		.unwrap();
+		assert_eq!(prepared, vec![WendelonResponse::Success]);
+		assert_eq!(registry.drop_reclaim_debts_for_test(), 0);
+
+		let finalized = RaftStateMachine::apply(
+			&mut state_machine,
+			[apply(
+				11,
+				WendelonRequest::TableDropLogicalFinalize(TableDropLogicalFinalizeRequest {
+					operation_id,
+					fence_log_index: 10,
+				}),
+			)],
+		)
+		.await
+		.unwrap();
+		assert_eq!(finalized, vec![WendelonResponse::Success]);
+		assert_eq!(registry.drop_reclaim_debts_for_test(), 1);
+		let debt = state_machine
+			.state_snapshot()
+			.await
+			.table_drop_reclaim_debts
+			.get(operation_id.tenant_id, operation_id.table_object_id)
+			.cloned()
+			.unwrap();
+
+		let stale = RaftStateMachine::apply(
+			&mut state_machine,
+			[apply(
+				12,
+				WendelonRequest::TableDropSettlement(TableDropSettlementRequest {
+					operation_id,
+					finalize_log_index: debt.finalize_log_index,
+					ownership_epoch: debt.ownership_epoch + 1,
+					attested_participants: debt.participants.clone(),
+				}),
+			)],
+		)
+		.await
+		.unwrap();
+		assert!(matches!(stale.as_slice(), [WendelonResponse::Error(_)]));
+		assert_eq!(registry.drop_reclaim_debts_for_test(), 1);
+		assert_eq!(registry.drop_reclaim_settlements_for_test(), 0);
+
+		let settlement = TableDropSettlementRequest {
+			operation_id,
+			finalize_log_index: debt.finalize_log_index,
+			ownership_epoch: debt.ownership_epoch,
+			attested_participants: debt.participants,
+		};
+		let settled = RaftStateMachine::apply(
+			&mut state_machine,
+			[apply(
+				13,
+				WendelonRequest::TableDropSettlement(settlement.clone()),
+			)],
+		)
+		.await
+		.unwrap();
+		assert_eq!(settled, vec![WendelonResponse::Success]);
+		assert_eq!(registry.drop_reclaim_debts_for_test(), 0);
+		assert_eq!(registry.drop_reclaim_settlements_for_test(), 1);
+
+		let duplicate = RaftStateMachine::apply(
+			&mut state_machine,
+			[apply(
+				14,
+				WendelonRequest::TableDropSettlement(settlement.clone()),
+			)],
+		)
+		.await
+		.unwrap();
+		assert!(matches!(duplicate.as_slice(), [WendelonResponse::Error(_)]));
+		assert_eq!(registry.drop_reclaim_settlements_for_test(), 1);
+
+		let lines = settlement_events(&events);
+		assert_eq!(
+			lines.len(),
+			1,
+			"one live successful apply emits once: {lines:?}"
+		);
+		for required in [
+			"tenant_id",
+			"table_object_id",
+			"schema_generation",
+			"finalize_log_index",
+			"participant_count",
+			"ownership_epoch",
+			"local_node_id",
+		] {
+			assert!(
+				lines[0].iter().any(|(name, _)| name == required),
+				"settlement line lacks {required}: {:?}",
+				lines[0]
+			);
+		}
+
+		// Recovery calls this pure function directly. Replaying the same shape on
+		// a finalized state mutates consensus state but cannot emit process-lifetime
+		// settlement telemetry.
+		let mut replay_state = state_with_descriptor_and_drop_epoch(&descriptor);
+		assert_eq!(
+			apply_table_drop_prepare(
+				&mut replay_state,
+				TableDropPrepareRequest::current(operation_id, operation_id.schema_generation),
+				10,
+			),
+			WendelonResponse::Success
+		);
+		assert_eq!(
+			apply_table_drop_logical_finalize(
+				&mut replay_state,
+				TableDropLogicalFinalizeRequest {
+					operation_id,
+					fence_log_index: 10,
+				},
+				11,
+			),
+			WendelonResponse::Success
+		);
+		let replay_entry = apply(13, WendelonRequest::TableDropSettlement(settlement));
+		assert_eq!(
+			apply_entry_to_state(&mut replay_state, &replay_entry).0,
+			WendelonResponse::Success
+		);
+		assert_eq!(registry.drop_reclaim_settlements_for_test(), 1);
+		assert_eq!(settlement_events(&events).len(), 1);
+	}
+
 	#[tokio::test]
 	async fn adr0095_committed_prepare_closes_mutation_admission_and_drains_prior_work() {
 		let descriptor = table_descriptor(1);
@@ -9627,9 +9930,9 @@ mod schema_state_tests {
 mod recovery_tests {
 	use super::*;
 	use crate::integration::compute::{
-		COMPUTE_STORAGE_CONTRACT_VERSION, SchemaGeneration, SchemaIntentId, SchemaIntentOrigin,
-		SchemaMutationKind, SchemaObjectKind, SchemaObjectRef, SchemaUpdateEnvelope,
-		encode_schema_update_envelope_v1,
+		COMPUTE_STORAGE_CONTRACT_VERSION, DropOperationId, SchemaGeneration, SchemaIntentId,
+		SchemaIntentOrigin, SchemaMutationKind, SchemaObjectKind, SchemaObjectRef,
+		SchemaUpdateEnvelope, encode_schema_update_envelope_v1,
 	};
 	use crate::schema::{
 		FinalizationMarker, LeaseDescriptor, LocalityPolicy, NodeId as SchemaNodeId,
@@ -11151,6 +11454,86 @@ mod recovery_tests {
 				.table_schemas
 				.latest_by_name(TenantId::new(7), "analytics", "events"),
 			Some(&descriptor)
+		);
+	}
+
+	#[tokio::test]
+	async fn adr0096_recovery_and_snapshot_install_refresh_debt_from_published_state() {
+		let operation_id = DropOperationId {
+			tenant_id: TenantId::new(7),
+			table_object_id: TableObjectId::new([0x96; 16]),
+			schema_generation: SchemaGeneration::new(1),
+		};
+		let debt = TableDropReclaimDebt {
+			operation_id,
+			fence_log_index: 8,
+			finalize_log_index: 9,
+			ownership_epoch: 3,
+			participants: TableDropParticipantSet::new([SchemaNodeId {
+				id: 1,
+				_reserved: 0,
+			}]),
+		};
+		let mut state = SmState::default();
+		state.last_applied_log_id = Some(log_id(1, 9));
+		state.table_drop_reclaim_debts.insert_validated(debt);
+
+		let source_dir = tempdir("adr0096-recovery-source");
+		let (_, _, source_snapshot_path) = artifact_paths(&source_dir);
+		write_snapshot_file(&source_snapshot_path, &state);
+		let source_store = open_store(&source_dir).await;
+		let (loaded, entries, checkpoint) = {
+			let guard = source_store.inner.read().await;
+			(
+				guard.recovered_snapshot.clone(),
+				guard.entries.values().map(clone_entry).collect::<Vec<_>>(),
+				guard.recovery_checkpoint,
+			)
+		};
+		let recovery_metrics = Box::leak(Box::new(MetricsRegistry::default()));
+		let mut source_sm = WendelonStateMachine::from_recovery_with_metrics(
+			loaded,
+			entries,
+			checkpoint,
+			SnapshotRuntime::ephemeral(),
+			recovery_metrics,
+		)
+		.unwrap();
+		assert_eq!(recovery_metrics.drop_reclaim_debts_for_test(), 1);
+		assert_eq!(recovery_metrics.drop_reclaim_settlements_for_test(), 0);
+
+		let mut builder =
+			<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::get_snapshot_builder(
+				&mut source_sm,
+			)
+			.await;
+		let built = builder.build_snapshot().await.unwrap();
+		let target_dir = tempdir("adr0096-install-target");
+		let target_store = open_store(&target_dir).await;
+		let install_metrics = Box::leak(Box::new(MetricsRegistry::default()));
+		let mut target_sm = target_store
+			.recovered_state_machine()
+			.await
+			.unwrap()
+			.with_observability_metrics_for_test(install_metrics)
+			.await;
+		assert_eq!(install_metrics.drop_reclaim_debts_for_test(), 0);
+		let meta = built.meta.clone();
+		<WendelonStateMachine as RaftStateMachine<WendelonTypeConfig>>::install_snapshot(
+			&mut target_sm,
+			&meta,
+			built.snapshot,
+		)
+		.await
+		.unwrap();
+		assert_eq!(install_metrics.drop_reclaim_debts_for_test(), 1);
+		assert_eq!(
+			target_sm
+				.state_snapshot()
+				.await
+				.table_drop_reclaim_debts
+				.len(),
+			1
 		);
 	}
 

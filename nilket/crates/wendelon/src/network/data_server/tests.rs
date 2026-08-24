@@ -42,6 +42,7 @@ use arrow::datatypes::{DataType, Field};
 use std::io::{Read, Seek, SeekFrom};
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tracing::Event;
 use tracing::field::{Field as TracingField, Visit};
 use tracing::span::{Attributes, Id};
 use tracing_subscriber::layer::Context;
@@ -174,6 +175,32 @@ struct CapturedSpan {
 #[derive(Clone)]
 struct CapturingSpanLayer {
 	spans: Arc<StdMutex<Vec<CapturedSpan>>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CapturedEvent {
+	fields: Vec<(String, String)>,
+}
+
+#[derive(Clone)]
+struct CapturingEventLayer {
+	events: Arc<StdMutex<Vec<CapturedEvent>>>,
+}
+
+impl<S> Layer<S> for CapturingEventLayer
+where
+	S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+{
+	fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+		let mut visitor = CapturedFieldVisitor::default();
+		event.record(&mut visitor);
+		self.events
+			.lock()
+			.expect("captured event mutex")
+			.push(CapturedEvent {
+				fields: visitor.fields,
+			});
+	}
 }
 
 impl<S> Layer<S> for CapturingSpanLayer
@@ -7677,7 +7704,7 @@ async fn adr0094_declared_child_writes_share_the_provisional_descriptor() {
 	node.handles.abort();
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "current_thread")]
 async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
 		195,
@@ -7778,26 +7805,38 @@ async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 		debt.participants.iter().collect::<Vec<_>>(),
 		vec![node.local_node]
 	);
-	let stale_coordinator = node
-		.data_server
-		.run_drop_reclaim_slice(DropReclaimSliceRequest {
-			operation_id,
-			finalize_log_index: debt.finalize_log_index,
-			ownership_epoch: debt.ownership_epoch,
-			examined_budget: 1,
-			coordinator: n(9_999),
-		})
-		.await
-		.unwrap_err();
-	assert_eq!(
-		stale_coordinator.kind(),
-		std::io::ErrorKind::PermissionDenied
-	);
-	assert!(
-		stale_coordinator
-			.to_string()
-			.contains("current Raft leader")
-	);
+	const WITHHELD_COMPLETION_CYCLES: usize = 4;
+	for cycle in 0..WITHHELD_COMPLETION_CYCLES {
+		let stale_coordinator = node
+			.data_server
+			.run_drop_reclaim_slice(DropReclaimSliceRequest {
+				operation_id,
+				finalize_log_index: debt.finalize_log_index,
+				ownership_epoch: debt.ownership_epoch,
+				examined_budget: 1,
+				coordinator: n(9_999),
+			})
+			.await
+			.unwrap_err();
+		assert_eq!(
+			stale_coordinator.kind(),
+			std::io::ErrorKind::PermissionDenied
+		);
+		assert!(
+			stale_coordinator
+				.to_string()
+				.contains("current Raft leader")
+		);
+		assert!(
+			node.state_machine
+				.state_snapshot()
+				.await
+				.table_drop_reclaim_debts
+				.get(tenant(), descriptor.table_object_id)
+				.is_some(),
+			"withheld completion cycle {cycle} must not settle the debt"
+		);
+	}
 	let stale_epoch = node
 		.data_server
 		.run_drop_reclaim_slice(DropReclaimSliceRequest {
@@ -7819,6 +7858,11 @@ async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 		examined_budget: DROP_RECLAIM_MAX_EXAMINED_PER_SLICE,
 		coordinator: node.local_node,
 	};
+	let phase_events = Arc::new(StdMutex::new(Vec::new()));
+	let phase_subscriber = Registry::default().with(CapturingEventLayer {
+		events: phase_events.clone(),
+	});
+	let _phase_subscriber_guard = tracing::subscriber::set_default(phase_subscriber);
 	assert!(
 		!node
 			.data_server
@@ -7911,6 +7955,37 @@ async fn adr0095_rf1_sweeper_reclaims_attests_and_settles_the_exact_debt() {
 	);
 	for key in keys {
 		assert!(node.slab.lookup(tenant(), key).is_none());
+	}
+	let phase_events = phase_events.lock().expect("captured phase event mutex");
+	let transitions = phase_events
+		.iter()
+		.filter(|event| {
+			event.fields.iter().any(|(name, value)| {
+				name == "message" && value.contains("table drop reclaim phase transitioned")
+			})
+		})
+		.collect::<Vec<_>>();
+	assert!(
+		!transitions.is_empty(),
+		"phase transitions must be routine signals"
+	);
+	for required in [
+		"tenant_id",
+		"table_object_id",
+		"schema_generation",
+		"from_phase",
+		"to_phase",
+		"cursor_after_slab_id",
+		"cursor_upper_bound_slab_id",
+		"examined_total",
+		"ownership_epoch",
+	] {
+		assert!(
+			transitions
+				.iter()
+				.any(|event| event.fields.iter().any(|(name, _)| name == required)),
+			"phase transition lines lack {required}: {transitions:?}"
+		);
 	}
 }
 
