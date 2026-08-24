@@ -531,7 +531,11 @@ pub enum ClientError {
 		reason: wendelon::schema::MutationStopReason,
 		knowledge: wendelon::schema::MutationCommitKnowledge,
 	},
-	#[error("table write rejected with code {reject_code:?}")]
+	#[error(
+		"table write rejected: {} (0x{:04X})",
+		.reject_code.name(),
+		.reject_code.0
+	)]
 	TableWriteRejected { reject_code: PbcRejectCode },
 	#[error("table descriptor evolved during query")]
 	TableDescriptorEvolved {

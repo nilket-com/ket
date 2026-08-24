@@ -9564,6 +9564,37 @@ fn adr0094_write_cap_and_legacy_replay_have_one_authority() {
 	);
 }
 
+#[test]
+fn adr0094_every_provisional_write_route_admits_the_declared_chain() {
+	let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+	let leader = fs::read_to_string(manifest_dir.join("src/network/data_server.rs")).unwrap();
+	let replica =
+		fs::read_to_string(manifest_dir.join("src/network/data_server/write_replication.rs"))
+			.unwrap();
+	assert_eq!(
+		leader
+			.matches("saga.contains_row_write_id(meta.parent_write_id)")
+			.count(),
+		1,
+		"the leader's provisional-descriptor fallback must admit the declared chain"
+	);
+	assert_eq!(
+		replica
+			.matches("saga.contains_row_write_id(meta.parent_write_id)")
+			.count(),
+		1,
+		"the replica's provisional-descriptor fallback must admit the declared chain"
+	);
+	for source in [&leader, &replica] {
+		assert!(
+			!source.contains(
+				"saga.row_write_id.canonical_idempotency_bytes()\n\t\t\t\t\t\t== meta.parent_write_id.canonical_idempotency_bytes()"
+			),
+			"the pre-0094 single-write equality must not return at either route"
+		);
+	}
+}
+
 /// ADR 0093 acceptance hooks exist only in tests or an explicitly requested
 /// non-default feature. Default production builds cannot arm them.
 #[test]

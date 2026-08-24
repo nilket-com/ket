@@ -7524,6 +7524,19 @@ async fn adr0094_p2_provisional_rows_are_unreachable_by_direct_object_query() {
 		.await
 		.expect("write rows through the saga-owned provisional descriptor");
 	assert_eq!(write_response.write.status, WriteStatus::OK);
+	let mut undeclared_child = typed_table_meta(&descriptor, 1);
+	undeclared_child.parent_write_id = write_response.write.echoed_write_id;
+	undeclared_child.parent_write_id.sequence_no += 1;
+	let (undeclared_response, _) = node
+		.data_server
+		.table_write(undeclared_child, typed_table_batch(vec![95]))
+		.await
+		.expect("an undeclared child receives a typed refusal");
+	assert_eq!(
+		undeclared_response.reject_code,
+		PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN.0,
+		"a pre-declaration saga authorizes only its historical row_write_id"
+	);
 
 	let state = node.state_machine.state_snapshot().await;
 	assert!(
@@ -7553,6 +7566,113 @@ async fn adr0094_p2_provisional_rows_are_unreachable_by_direct_object_query() {
 		*bytemuck::from_bytes(&response.meta[..std::mem::size_of::<QueryResponseMeta>()]);
 	assert_eq!(response_meta.status, ReadStatus::QUERY_INVALID_PROGRAM);
 	assert!(response.arrow_payload.is_none());
+
+	node.handles.abort();
+}
+
+#[tokio::test]
+async fn adr0094_declared_child_writes_share_the_provisional_descriptor() {
+	let dir = bootstrap_tempdir("adr0094-provisional-write-chain");
+	let node = WendelonNode::bootstrap_single_node(NodeBootstrapConfig::dev(
+		95,
+		dir,
+		"127.0.0.1:0".into(),
+	))
+	.await
+	.unwrap();
+	let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+	loop {
+		if node.raft.current_leader().await == Some(node.local_node.id) {
+			break;
+		}
+		assert!(
+			tokio::time::Instant::now() < deadline,
+			"timed out waiting for leader"
+		);
+		tokio::time::sleep(Duration::from_millis(20)).await;
+	}
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+
+	let descriptor = typed_table_descriptor();
+	let mut first_meta = typed_table_meta(&descriptor, 1);
+	first_meta.parent_write_id.sequence_no = 950;
+	let operation_id = crate::schema::CtasOperationId::new([
+		0, 0, 0, 0, 0, 1, 0x70, 0x95, 0x80, 0x95, 0x95, 0x95, 0x95, 0x95, 0x95, 0x95,
+	]);
+	let provision = node
+		.raft
+		.client_write(WendelonRequest::CtasSaga(
+			crate::schema::CtasSagaMutation::Provision {
+				tenant_id: tenant(),
+				operation_id,
+				intent_fingerprint: crate::schema::CtasIntentFingerprint::new([0x95; 32]),
+				descriptor: descriptor.clone(),
+				expected_binding: crate::schema::CtasExpectedBinding::Absent,
+				prior_descriptor: None,
+				row_write_id: first_meta.parent_write_id,
+				owner_epoch: 1,
+				observed_now_ms: 1,
+				owner_lease_expires_at_ms: 60_000,
+				certificate: Some(vec![0x95]),
+			},
+		))
+		.await
+		.expect("provision CTAS object");
+	assert_eq!(provision.data, WendelonResponse::Success);
+	let declaration = node
+		.raft
+		.client_write(WendelonRequest::CtasSaga(
+			crate::schema::CtasSagaMutation::DeclareChain {
+				tenant_id: tenant(),
+				operation_id,
+				owner_epoch: 1,
+				row_count: 2,
+				chunk_count: 2,
+			},
+		))
+		.await
+		.expect("declare two-child CTAS chain");
+	assert_eq!(declaration.data, WendelonResponse::Success);
+	node.data_server
+		.refresh_leases_once(&node.ring, &*node.clock, 60_000)
+		.await;
+
+	let (first, _) = node
+		.data_server
+		.table_write(first_meta, typed_table_batch(vec![95]))
+		.await
+		.expect("write first declared child");
+	assert_eq!(first.write.status, WriteStatus::OK);
+	assert_eq!(first.reject_code, PbcRejectCode::NONE.0);
+
+	let mut second_meta = typed_table_meta(&descriptor, 1);
+	second_meta.parent_write_id.sequence_no = 951;
+	second_meta.parent_write_id.idempotency_ttl_ms = 1_234;
+	let (second, _) = node
+		.data_server
+		.table_write(second_meta, typed_table_batch(vec![96]))
+		.await
+		.expect("write second declared child");
+	assert_eq!(second.write.status, WriteStatus::OK);
+	assert_eq!(
+		second.reject_code,
+		PbcRejectCode::NONE.0,
+		"the second child must resolve the saga's provisional descriptor"
+	);
+	let mut outside_meta = typed_table_meta(&descriptor, 1);
+	outside_meta.parent_write_id.sequence_no = 952;
+	let (outside, _) = node
+		.data_server
+		.table_write(outside_meta, typed_table_batch(vec![97]))
+		.await
+		.expect("an out-of-range write receives a typed refusal");
+	assert_eq!(
+		outside.reject_code,
+		PbcRejectCode::PBC_REJECT_SCHEMA_UNKNOWN.0,
+		"the declared half-open child range must not authorize its end"
+	);
 
 	node.handles.abort();
 }

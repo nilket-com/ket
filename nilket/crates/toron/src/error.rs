@@ -6,6 +6,7 @@ use crate::rune_engine::RuneSandboxViolation;
 pub use distributed::{PartitionMissingReason, RuntimeError, TaskFailureKind};
 
 use thiserror::Error;
+use wendelon::schema::PbcRejectCode;
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum BudgetExhaustedDetail {
@@ -44,8 +45,13 @@ pub enum StorageError {
 		#[source]
 		source: wendelon_client::ClientError,
 	},
-	#[error("invalid PBC program for descriptor")]
-	InvalidPbcForDescriptor {
+	#[error(
+		"table write rejected: {} (0x{:04X})",
+		.reject_code.name(),
+		.reject_code.0
+	)]
+	TableWriteRejected {
+		reject_code: PbcRejectCode,
 		#[source]
 		source: wendelon_client::ClientError,
 	},
@@ -133,9 +139,10 @@ impl From<wendelon_client::ClientError> for StorageError {
 				..
 			}) => Self::Unavailable { source },
 			source @ ClientError::ReadFailed { .. } => Self::ReadBoundUnavailable { source },
-			source @ ClientError::TableWriteRejected { .. } => {
-				Self::InvalidPbcForDescriptor { source }
-			}
+			ClientError::TableWriteRejected { reject_code } => Self::TableWriteRejected {
+				reject_code,
+				source: ClientError::TableWriteRejected { reject_code },
+			},
 			source @ ClientError::WriteFailed { .. }
 			| source @ ClientError::MutationStopped { .. }
 			| source @ ClientError::SchemaUpdateRejected { .. }
@@ -415,10 +422,18 @@ mod tests {
 		let err = StorageError::from(ClientError::TableWriteRejected {
 			reject_code: PbcRejectCode::PBC_REJECT_SCHEMA_STALE,
 		});
+		assert_eq!(
+			err.to_string(),
+			"table write rejected: PBC_REJECT_SCHEMA_STALE (0x3701)"
+		);
 		match err {
-			StorageError::InvalidPbcForDescriptor {
+			StorageError::TableWriteRejected {
+				reject_code: stored_code,
 				source: ClientError::TableWriteRejected { reject_code },
-			} => assert_eq!(reject_code, PbcRejectCode::PBC_REJECT_SCHEMA_STALE),
+			} => {
+				assert_eq!(stored_code, PbcRejectCode::PBC_REJECT_SCHEMA_STALE);
+				assert_eq!(reject_code, PbcRejectCode::PBC_REJECT_SCHEMA_STALE);
+			}
 			other => panic!("unexpected storage error mapping: {other:?}"),
 		}
 

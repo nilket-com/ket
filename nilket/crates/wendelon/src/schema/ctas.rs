@@ -133,6 +133,27 @@ pub struct CtasSagaEntry {
 	pub certificate: Option<Vec<u8>>,
 }
 
+impl CtasSagaEntry {
+	/// Whether `write_id` is one of this saga's durably declared row-write
+	/// children. Before ADR 0094 declaration, the historical single write is
+	/// the only admitted identity. Once declared, the operation-local sequence
+	/// interval admits every child without re-deriving chain shape at the read
+	/// site.
+	pub fn contains_row_write_id(&self, write_id: ClientWriteId) -> bool {
+		if self.row_write_id.client_uuid != write_id.client_uuid {
+			return false;
+		}
+		let Some(offset) = write_id
+			.sequence_no
+			.checked_sub(self.row_write_id.sequence_no)
+		else {
+			return false;
+		};
+		let chunk_count = self.chunk_count.unwrap_or(1);
+		offset < u64::from(chunk_count)
+	}
+}
+
 /// ADR 0087: the materialization certificate's admission bound. Boson v1
 /// certificates measure tens to a few hundred bytes; 64 KiB is generous
 /// headroom while staying far inside the write discipline. An oversized

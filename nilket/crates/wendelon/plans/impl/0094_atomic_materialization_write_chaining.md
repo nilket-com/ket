@@ -298,3 +298,31 @@ C1–C6, and the forward performance numbers.
   ignored).
 - **Forward evidence:** the 200k/1M viz performance rail was not used as a
   correctness substitute and remains the first post-landing measurement.
+
+## Post-landing chain-descriptor correction
+
+The first viz acceptance run exposed a missing live-path gate: provisional
+descriptor lookup compared each table-write id only with the saga's historical
+`row_write_id`. That admitted chunk zero but rejected the first derived child as
+`PBC_REJECT_SCHEMA_UNKNOWN`. The same equality existed on leader admission and
+replica ingest.
+
+`CtasSagaEntry::contains_row_write_id` now admits the durably declared,
+operation-local half-open sequence interval while preserving the undeclared
+single-id behavior. Both leader and replica descriptor fallbacks use that one
+predicate, and an architecture census pins both call sites. The behavioral
+control admits a declared child with a changed TTL, refuses the range end, and
+was injection-verified against the original equality.
+
+The missing product-path acceptance now materializes 199,999 rows with two
+`Float64` columns through the public Rune client, Toron daemon, live Wendelon
+table-write handler, and four-frame chain, then reads back all 199,999 rows.
+Separately, public table-write refusals retain their typed `PbcRejectCode` and
+render its stable name plus hex value instead of claiming every rejection is an
+invalid PBC program.
+
+The corrective seal is green: Wendelon lib 1,258/0 with eight ignored and
+architecture 175/0; Toron lib 1,697/0, architecture 2,145/0, SQL listener 29/0
+with one ignored, and both complete cross-ring test sweeps exit zero. Toron's
+lib sweep retains the established enlarged test-thread stack for its unrelated
+deep binder surface.

@@ -8841,9 +8841,8 @@ impl WendelonDataServer {
 					let saga = state
 						.ctas_sagas
 						.operation_for_object(meta.tenant_id, meta.table_object_id)?;
-					(saga.row_write_id.canonical_idempotency_bytes()
-						== meta.parent_write_id.canonical_idempotency_bytes())
-					.then(|| saga.descriptor.clone())
+					saga.contains_row_write_id(meta.parent_write_id)
+						.then(|| saga.descriptor.clone())
 				});
 			let secondary_index_descriptors = descriptor
 				.as_ref()

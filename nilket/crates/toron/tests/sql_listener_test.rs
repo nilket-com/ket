@@ -262,6 +262,53 @@ async fn rune_source_executes_over_the_authenticated_query_boundary_with_typed_f
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adr0094_live_199999_row_chain_materializes_and_reads_back() {
+	let fixture = LiveWendelonFixture::start(1094).await;
+	let descriptor = descriptor();
+	install_schema(&fixture.node, LIVE_TENANT, &descriptor).await;
+	write_rows(&fixture.client, LIVE_TENANT, &descriptor, batch()).await;
+
+	let mut config = toron_config_with_descriptor(descriptor, true);
+	config.sql.as_mut().expect("SQL config").statement_timeout = Duration::from_secs(60);
+	let daemon =
+		ToronDaemon::start_with_wendelon_client_for_harness(config, Arc::clone(&fixture.client))
+			.await
+			.expect("start Toron daemon");
+	let endpoint = daemon.handle().sql_endpoint.expect("query endpoint");
+	let client = ToronClient::loopback(endpoint.to_string()).expect("public client");
+
+	let materialized = client
+		.execute_rune(
+			r#"pub fn main(ctx) {
+				ctx.range(199999)
+					.project_named([
+						seeded_random(lit_i64(17), col("ordinal")).named("x"),
+						seeded_random(lit_i64(29), col("ordinal")).named("y")
+					])
+					.materialize("adr0094_live_chain")
+			}"#,
+		)
+		.await
+		.expect("a four-chunk materialization crosses the live storage boundary");
+	let toron_client::RuneQueryResult::Materialized(receipt) = materialized else {
+		panic!("materialize returns a receipt: {materialized:?}");
+	};
+	assert_eq!(receipt.rows_written, 199_999);
+
+	let readback = client
+		.execute_rune(r#"pub fn main(ctx) { ctx.table("adr0094_live_chain") }"#)
+		.await
+		.expect("the complete chained materialization is readable");
+	let toron_client::RuneQueryResult::Batches(readback) = readback else {
+		panic!("an ordinary relation returns batches");
+	};
+	assert_eq!(readback.row_count, 199_999);
+
+	daemon.shutdown().await.expect("shutdown daemon");
+	fixture.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn each_rune_version_axis_refuses_skew_with_requested_and_supported_versions() {
 	let daemon = ToronDaemon::start(toron_config_with_descriptor(descriptor(), true))
 		.await
