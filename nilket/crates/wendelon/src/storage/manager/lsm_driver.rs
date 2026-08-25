@@ -1112,7 +1112,10 @@ impl SlabManager {
 		entry: &VersionEntry,
 		table_schemas: &TableSchemaCatalog,
 	) -> Result<VersionLifecycle, CompactionFailure> {
-		let frame = match self.read(entry.location).await {
+		let frame = match self
+			.read_with_reference_origin(entry.location, PublishedReferenceOrigin::Compaction)
+			.await
+		{
 			Ok(frame) => frame,
 			Err(err) if err.kind() == ErrorKind::InvalidData => {
 				return Ok(VersionLifecycle::AmbiguousTable);
@@ -1197,6 +1200,40 @@ impl SlabManager {
 		worker.plan_survivor_outputs(plan, entries, output_slab_ids)
 	}
 
+	/// `missing_origin` labels the retained integrity evidence when the
+	/// backing is absent: a compaction source read is not a client read, and
+	/// conflating them poisons the missing-published-reference signal.
+	pub(super) async fn read_with_reference_origin(
+		&self,
+		location: RecordLocation,
+		missing_origin: PublishedReferenceOrigin,
+	) -> std::io::Result<Vec<u8>> {
+		let location = self.relocate_read_location(location);
+		let _pin = self.pin_lsm_read_location(location)?;
+		match self.resolve_backing(location.slab_id).await {
+			SlabBacking::Local(slab) => {
+				let started = Instant::now();
+				let result = slab.read(location).await;
+				metrics()
+					.l1_read_latency_seconds
+					.observe_duration(started.elapsed());
+				result
+			}
+			SlabBacking::L2(pointer) => {
+				let started = Instant::now();
+				let result = self.read_from_l2(&pointer, location).await;
+				metrics()
+					.l2_range_read_latency_seconds
+					.observe_duration(started.elapsed());
+				result
+			}
+			SlabBacking::Missing => Err(Error::new(ErrorKind::NotFound, {
+				self.record_missing_published_references_for_slab(location.slab_id, missing_origin);
+				format!("no slab with id {} under this manager", location.slab_id)
+			})),
+		}
+	}
+
 	pub async fn read_lsm_single_row_source_frames(
 		&self,
 		plan: &CompactionPlan,
@@ -1204,7 +1241,21 @@ impl SlabManager {
 		let entries = self.lsm_version_entries_for_plan(plan);
 		let mut frames = Vec::with_capacity(entries.len());
 		for entry in entries {
-			let frame = self.read(entry.location).await?;
+			let frame = self
+				.read_with_reference_origin(entry.location, PublishedReferenceOrigin::Compaction)
+				.await
+				.map_err(|err| {
+					Error::new(
+						err.kind(),
+						format!(
+							"LSM compaction source read failed at slab {} offset {} \
+							 (plan touches slabs {:?}): {err}",
+							entry.location.slab_id.get(),
+							entry.location.offset,
+							plan.touched_slabs(),
+						),
+					)
+				})?;
 			frames.push(LsmSourceFrame { entry, frame });
 		}
 		Ok(frames)

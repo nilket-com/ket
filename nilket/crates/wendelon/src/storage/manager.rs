@@ -3175,33 +3175,8 @@ impl StorageEngine for SlabManager {
 	}
 
 	async fn read(&self, location: RecordLocation) -> std::io::Result<Vec<u8>> {
-		let location = self.relocate_read_location(location);
-		let _pin = self.pin_lsm_read_location(location)?;
-		match self.resolve_backing(location.slab_id).await {
-			SlabBacking::Local(slab) => {
-				let started = Instant::now();
-				let result = slab.read(location).await;
-				metrics()
-					.l1_read_latency_seconds
-					.observe_duration(started.elapsed());
-				result
-			}
-			SlabBacking::L2(pointer) => {
-				let started = Instant::now();
-				let result = self.read_from_l2(&pointer, location).await;
-				metrics()
-					.l2_range_read_latency_seconds
-					.observe_duration(started.elapsed());
-				result
-			}
-			SlabBacking::Missing => Err(Error::new(ErrorKind::NotFound, {
-				self.record_missing_published_references_for_slab(
-					location.slab_id,
-					PublishedReferenceOrigin::Read,
-				);
-				format!("no slab with id {} under this manager", location.slab_id)
-			})),
-		}
+		self.read_with_reference_origin(location, PublishedReferenceOrigin::Read)
+			.await
 	}
 
 	fn lookup(&self, tenant_id: TenantId, key_identity: Identity) -> Option<RecordLocation> {

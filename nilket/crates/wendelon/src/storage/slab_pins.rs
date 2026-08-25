@@ -84,6 +84,32 @@ impl SlabPinTable {
 			.get(&slab_id)
 			.is_some_and(|record| record.delete_pending)
 	}
+
+	/// Atomic pin-gate for a backing removal: marks delete-pending — which
+	/// refuses while any pin is held and blocks new pin acquisition once
+	/// set — and returns a guard that clears the mark on drop, so every
+	/// abort path leaves the slab pinnable again. Perform the removal while
+	/// the guard is live; `None` means a pin holder still needs the backing
+	/// and the removal must be deferred to a later pass.
+	pub fn mark_delete_pending_guarded(&self, slab_id: SlabId) -> Option<DeletePendingGuard> {
+		self.mark_delete_pending(slab_id)
+			.then(|| DeletePendingGuard {
+				table: self.clone(),
+				slab_id,
+			})
+	}
+}
+
+#[derive(Debug)]
+pub struct DeletePendingGuard {
+	table: SlabPinTable,
+	slab_id: SlabId,
+}
+
+impl Drop for DeletePendingGuard {
+	fn drop(&mut self) {
+		self.table.clear_delete_pending(self.slab_id);
+	}
 }
 
 #[derive(Debug)]

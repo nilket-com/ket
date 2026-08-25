@@ -864,6 +864,18 @@ impl SlabManager {
 			return Ok(None);
 		}
 		let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
+		// A compaction plan pins every slab it will read before its first read
+		// (acquire_plan_pins); those pins guarantee the backing outlives the
+		// plan. Both branches below remove the old backing, so they must honor
+		// the same contract LSM GC deletion does: the delete-pending mark is
+		// atomic with the pin check — refused while any pin is held (defer this
+		// slab to a later pass; ticks and drop-reclaim receipt verification
+		// re-drive deferred work) — and refuses new pins for the removal
+		// window, closing the pin-after-check race. The guard clears the mark
+		// on every exit, so an aborted rewrite leaves the slab pinnable.
+		let Some(_delete_pending) = self.slab_pins.mark_delete_pending_guarded(slab_id) else {
+			return Ok(None);
+		};
 
 		let old_bytes = slab.write_cursor();
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();

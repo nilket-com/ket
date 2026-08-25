@@ -12252,3 +12252,201 @@ async fn adr0090_compaction_preserves_partitioned_placement() {
 	);
 	assert_eq!(after.partition, Some(partition));
 }
+
+#[tokio::test]
+async fn repro_drop_reclaim_keeps_pinned_slab_backing_readable() {
+	// Discriminating repro for the 2026-08-24 missing-slab incident triage:
+	// a compaction plan pins every touched slab before reading
+	// (lsm_driver acquire_plan_pins); the invariant under test is that
+	// table-drop reclaim retiring a fully-dead slab must not remove the
+	// backing while such a pin is held. Failure here means the reclaim
+	// retirement path bypasses the pin/delete protocol and is a causal
+	// candidate for the live warnings.
+	let mgr = fresh_manager().await;
+	let target = append_only_retention_descriptor(TableObjectId::new([0x77; 16]));
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), target.clone()).unwrap();
+
+	let key = id(0x771);
+	let frame = encode_test_append_only_storage_frame(
+		target.table_object_id,
+		&[(key, Locality::new(10), hlc(10), 100, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("target table entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+
+	let location = mgr.lookup(tenant(), key).expect("target row location");
+	let pinned_slab = location.slab_id;
+	let sanity_read = mgr.read(location).await;
+	assert!(sanity_read.is_ok(), "pre-reclaim read must succeed");
+
+	let pins = mgr.slab_pin_table();
+	let pin_guard = pins.acquire(&[pinned_slab]).expect("pin acquisition");
+
+	let report = mgr
+		.reclaim_table_drop_storage(
+			tenant(),
+			&target,
+			&schemas,
+			&SecondaryIndexCatalog::default(),
+			usize::MAX,
+		)
+		.await
+		.unwrap();
+	// The whole rewrite defers while the pin is held: index, records, and
+	// backing all remain until the deferred pass. (The drop tombstone —
+	// admission authority since ADR 0095 — keeps the lingering entries
+	// unreachable from any table surface meanwhile.)
+	assert_eq!(report.compacted_slabs, 0, "pinned slab must be deferred");
+	assert_eq!(report.reclaimed_records, 0);
+	assert!(mgr.lookup(tenant(), key).is_some());
+
+	// The discriminating assertion: while the compaction pin is held, the
+	// slab backing must remain readable at the pre-reclaim location.
+	let read_while_pinned = mgr.read(location).await;
+	assert!(
+		read_while_pinned.is_ok(),
+		"pinned slab {pinned_slab:?} backing became unreadable during drop \
+		 reclaim; the retirement path bypasses the compaction pin protocol: {:?}",
+		read_while_pinned.err()
+	);
+	// The deferred removal must not have marked the slab delete-pending
+	// behind the live pin: an aborted gate leaves the slab pinnable.
+	assert!(!pins.is_delete_pending(pinned_slab));
+	assert!(pins.acquire(&[pinned_slab]).is_ok());
+
+	// Retirement resumes after release: the next reclaim pass removes the
+	// deferred backing.
+	drop(pin_guard);
+	let resumed = mgr
+		.reclaim_table_drop_storage(
+			tenant(),
+			&target,
+			&schemas,
+			&SecondaryIndexCatalog::default(),
+			usize::MAX,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		resumed.compacted_slabs, 1,
+		"deferred slab reclaimed after pin release"
+	);
+	assert!(
+		mgr.read(location).await.is_err(),
+		"backing must be gone once no pin needs it"
+	);
+	assert!(
+		!pins.is_delete_pending(pinned_slab),
+		"mark cleared after removal"
+	);
+}
+
+#[tokio::test]
+async fn retention_prune_defers_pinned_slab_backing_until_release() {
+	// The retention twin of the drop-reclaim pin contract: both routes
+	// funnel through compact_sealed_slab_records, and both must honor a
+	// compaction plan's pins before removing a backing.
+	let mgr = fresh_manager().await;
+	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x79; 16]));
+	let (schemas, lifecycle) = fixed_table_retention_catalog(&descriptor, 60_000);
+	let old_key = id(0x7901);
+	let frame = encode_test_append_only_storage_frame(
+		descriptor.table_object_id,
+		&[(old_key, Locality::new(11), hlc(30_000), 100, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("append-only storage entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let location = mgr.lookup(tenant(), old_key).expect("row location");
+	let pinned_slab = force_seal_active(&mgr).await;
+	assert_eq!(pinned_slab, location.slab_id);
+
+	let pins = mgr.slab_pin_table();
+	let pin_guard = pins.acquire(&[pinned_slab]).expect("pin acquisition");
+	let deferred = mgr
+		.prune_versions_for_retention(
+			MvccRetentionPolicy::Disabled,
+			&lifecycle,
+			&schemas,
+			&SecondaryIndexCatalog::default(),
+			100_000,
+			usize::MAX,
+		)
+		.await
+		.unwrap();
+	assert_eq!(deferred.compacted_slabs, 0, "pinned slab must be deferred");
+	assert!(
+		mgr.read(location).await.is_ok(),
+		"pinned slab backing must remain readable through retention pruning"
+	);
+
+	drop(pin_guard);
+	let resumed = mgr
+		.prune_versions_for_retention(
+			MvccRetentionPolicy::Disabled,
+			&lifecycle,
+			&schemas,
+			&SecondaryIndexCatalog::default(),
+			100_000,
+			usize::MAX,
+		)
+		.await
+		.unwrap();
+	assert_eq!(
+		resumed.compacted_slabs, 1,
+		"retirement resumes after pin release"
+	);
+	assert!(mgr.lookup(tenant(), old_key).is_none());
+}
+
+#[tokio::test]
+async fn missing_compaction_source_read_records_compaction_origin() {
+	// A compaction source read of a missing backing must retain
+	// Compaction-origin integrity evidence, not masquerade as a client
+	// Read — the generic origin conflated the two during the 2026-08-24
+	// incident triage.
+	let mgr = fresh_manager().await;
+	let descriptor = append_only_retention_descriptor(TableObjectId::new([0x7a; 16]));
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), descriptor.clone()).unwrap();
+	let key = id(0x7a01);
+	let frame = encode_test_append_only_storage_frame(
+		descriptor.table_object_id,
+		&[(key, Locality::new(12), hlc(10), 100, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let location = mgr.lookup(tenant(), key).expect("row location");
+	let sealed_slab = force_seal_active(&mgr).await;
+	assert_eq!(sealed_slab, location.slab_id);
+	// Simulate the incident-class inconsistency: the backing vanishes while
+	// the published reference remains.
+	let removed = {
+		let state = mgr.state.lock().await;
+		state.sealed.remove(&sealed_slab)
+	};
+	assert!(removed.is_some(), "sealed backing removed for the probe");
+
+	let err = mgr
+		.read_with_reference_origin(location, PublishedReferenceOrigin::Compaction)
+		.await
+		.expect_err("missing backing must fail");
+	assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+	let failure = mgr
+		.table_integrity_failure(tenant(), descriptor.table_object_id)
+		.expect("integrity failure retained for referencing table");
+	assert_eq!(failure.origin, PublishedReferenceOrigin::Compaction);
+	assert_eq!(failure.missing_slab_id, sealed_slab);
+}
