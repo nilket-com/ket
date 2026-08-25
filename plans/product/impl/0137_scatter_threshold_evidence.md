@@ -552,6 +552,45 @@ revision set domains on the model, moved nothing, and timed cache hits while
 labelling them invalidations. The exhibit now asserts the key changes before
 reporting any timing.
 
+## Heavy-churn verification — 2026-08-25, engine `cde25904` at `da2117e1f`
+
+The outstanding engine-backed exhibit, discharging the verification owed since
+TORON's pin fix (`945b94e1f`) and maintenance-rewrite fix (`da2117e1f`). Run on
+an isolated deployment (own data dir, ports 7011/7443/7752) so it did not
+contend with a shared one in use at the time.
+
+**All seven cardinalities pass, and every maintenance signal is clean.**
+
+| points | materialize | transfer + prepare | steady render |
+|---|---|---|---|
+| 49,999 | 905.6 ms | 676.9 ms | 286.0 ms |
+| 50,000 | 959.6 ms | 691.9 ms | 292.9 ms |
+| 199,999 | 4,216.9 ms | 2,744.9 ms | 672.9 ms |
+| 200,000 | 4,878.6 ms | 2,646.4 ms | 657.4 ms |
+| 999,999 | 27,261.4 ms | 13,670.9 ms | 1,649.0 ms |
+| 1,000,000 | 32,864.9 ms | 13,309.5 ms | 1,635.4 ms |
+| 1,000,001 | 34,688.9 ms | 13,551.9 ms | 1,673.2 ms |
+
+| signal | count |
+|---|---|
+| `LSM compaction service tick failed` | **0** |
+| `slab N is delete-pending for LSM GC` | **0** |
+| Wendelon `ERROR` lines | **0** |
+| cleanup (`# drop-after`) failures | **0** |
+
+Read throughput holds at ~73,000-77,000 rows/s across a 20x range, unchanged
+from before the maintenance fixes, so neither fix cost scan performance.
+
+**Cross-check on the raster gate.** `1_000_001` renders at 1,673.2 ms —
+downsampled, not rasterized — which independently confirms from the engine path
+what the local matrix found: the gate is not at 1,000,000, because it divides
+the inner plot area rather than the widget rect.
+
+**Scope.** This is the 1M-row materialize churn profile, which is the workload
+that produced the original compaction warnings and the delete-pending reader
+failure. It is single-node and one pass; it does not exercise the db team's
+fault-injection acceptance arms.
+
 ## Correction: the "README claim" attribution was wrong
 
 Earlier revisions of this document listed a "README claim" of 10,000,000 rows
