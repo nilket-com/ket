@@ -496,6 +496,32 @@ rescale-on-zoom, with a re-rasterize behind it — and doing so would carry its
 own fidelity cost, since a magnified bitmap loses resolution and a pan exposes
 an uncovered strip. That is a design space, not a wall.
 
+### Scoping the reuse, if it is designed
+
+Image-space reuse is only automatically valid where the old-to-new screen map
+is **affine in image space**. Two constraints follow from this codebase rather
+than from theory.
+
+**Layout and axis identity must be unchanged.** For `PlotLayout::Cartesian`
+with continuous axes, a domain change is affine: each point's position is an
+affine function of its axis-space value, so changing the range changes only the
+coefficients. That holds for `Linear` and `Percent`, and for `Date`/`Datetime`
+which are linear in their underlying instant. It does **not** survive a change
+of `AxisType`, and `CategoricalX` has no continuous domain to be affine in.
+Non-Cartesian layouts are outside it entirely.
+
+**A blit rescales the marks, which a zoom should not.** Point radius comes from
+`settings.point_size` and is baked into the bitmap. Scaling the image to serve
+a zoom magnifies the discs along with the data, so points visibly grow — an
+artifact distinct from resolution loss, and one a viewer reads as a change in
+the data's meaning rather than a transient. `point_size` is already in
+`ScatterRasterKey`, which is consistent with this: the cache treats a size
+change as a different image, and a zoom-by-blit silently produces one.
+
+Both point the same way: reuse is a **motion-only, deliberately degraded**
+frame — acceptable while a gesture is in flight, replaced by a true
+rasterization when it settles — not a general substitute for re-rasterizing.
+
 Any policy that widens raster must therefore say what happens to a moving
 viewport. Under today's cache a pixel-density gate alone would push large plots
 into a mode costing ~5.4 s per gesture frame; with transform reuse the same
