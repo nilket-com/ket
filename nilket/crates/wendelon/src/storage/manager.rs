@@ -163,10 +163,10 @@ use crate::storage::{
 	CompactionFailure, CompactionManifest, CompactionPlan, IoUringFileOps, LsmCompactionDriver,
 	LsmCompactionJobRunner, LsmCompactionWorker, LsmGcDriver, LsmGcWorker, LsmPreparedOutputs,
 	LsmRunSummary, LsmSourceFrame, LsmWrittenOutputRun, ManifestSnapshot, MvccRetentionPolicy,
-	OpenFlags, SlabPinGuard, SlabPinTable, TierCommitter, VersionEntry, VersionLifecycle,
-	VisibleDomainRow, apply_elision, cluster_retention_floor, compaction_visible_domain_summary,
-	effective_table_retention, pick_compaction, required_output_run_count,
-	storage_row_table_object_id_at, survivor_records, write_file,
+	OpenFlags, SlabPinGuard, SlabPinTable, SlabState, TierCommitter, VersionEntry,
+	VersionLifecycle, VisibleDomainRow, apply_elision, cluster_retention_floor,
+	compaction_visible_domain_summary, effective_table_retention, pick_compaction,
+	required_output_run_count, storage_row_table_object_id_at, survivor_records, write_file,
 };
 use arrow::array::{Array, BooleanArray};
 use arrow::compute::concat_batches;
@@ -180,6 +180,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Cursor, Error, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock as AsyncRwLock};
@@ -201,8 +202,12 @@ use tiered_io::{
 };
 mod compaction;
 use compaction::{
-	CompactionOutcome, CompactionRecord, RelocatedRecord, compact_physical_record_frame,
+	CompactionOutcome, CompactionRecord, compact_physical_record_frame,
 	physical_compaction_group_indices, physical_compaction_groups,
+};
+mod maintenance_publication;
+use maintenance_publication::{
+	maintenance_staged_slab_path, reconcile_staged_maintenance_publications,
 };
 mod lsm_driver;
 use lsm_driver::{
@@ -665,6 +670,17 @@ pub struct SlabManager {
 	/// declaration holds the write guard while it seals the old active slab and
 	/// installs the new active buffer.
 	secondary_index_admission_gate: Arc<AsyncRwLock<()>>,
+	/// Excludes LSM plan selection while a maintenance rewrite has durably
+	/// published its replacement but has not yet installed and reflected that
+	/// replacement in the live manager. Readers use the record index and slab
+	/// pins, so this gate is planner-only.
+	maintenance_publication_gate: Arc<AsyncRwLock<()>>,
+	/// A D2 publication whose staged replacement could not be installed after
+	/// the bounded S1 retry policy. Retaining the owned write guard keeps
+	/// planners out of the committed-but-uninstalled world until startup
+	/// reconciliation completes it.
+	maintenance_publication_restart_required: AtomicBool,
+	maintenance_publication_fail_stop: std::sync::Mutex<Option<OwnedRwLockWriteGuard<()>>>,
 	/// Process-local acceleration for declaration cuts already established. A
 	/// restart may repeat a cut before the durable completion receipt exists;
 	/// that is safe and only creates another historical slab to backfill.
@@ -1284,6 +1300,43 @@ impl SlabManager {
 			"wendelon-fs-meta-slab",
 			BlockingIoClass::SlabMetadata,
 		)?);
+		// Staged maintenance replacements are intentionally invisible to normal
+		// slab discovery. Reconcile them before every discovery/allocator step so
+		// a committed S1 publication reaches its final path and an S0 file cannot
+		// reserve an id by accident on a rebuilt manager.
+		let persistent_index =
+			match PersistentLocalIndex::open(persistent_index_path(&config.dir)).await {
+				Ok(index) => Some(Arc::new(index)),
+				Err(err) => {
+					tracing::warn!(
+						error = %err,
+						dir = %config.dir.display(),
+						"failed to open redb storage index; continuing with in-memory recovery"
+					);
+					None
+				}
+			};
+		let staged_runs = match &persistent_index {
+			Some(index) => match index.load_snapshot().await {
+				Ok(snapshot) => Some(snapshot.lsm_runs),
+				Err(err) => {
+					tracing::warn!(
+						error = %err,
+						dir = %config.dir.display(),
+						"failed to load redb before staged maintenance reconciliation; treating staged files as uninstalled"
+					);
+					None
+				}
+			},
+			None => None,
+		};
+		reconcile_staged_maintenance_publications(
+			file_ops.as_ref(),
+			&config.dir,
+			staged_runs.as_deref(),
+			None,
+		)
+		.await?;
 		cleanup_retention_rewrite_tmp_files(file_ops.as_ref(), &config.dir).await?;
 		cleanup_lsm_compaction_tmp_files(file_ops.as_ref(), &config.dir).await?;
 		let mut existing_ids = discover_slab_ids(file_ops.as_ref(), &config.dir).await?;
@@ -1397,18 +1450,6 @@ impl SlabManager {
 
 		let mut persistent_key_localities: Vec<(TenantId, Identity, Locality)> = Vec::new();
 		let mut recovered_lsm_runs: Vec<LsmRunSummary> = Vec::new();
-		let persistent_index =
-			match PersistentLocalIndex::open(persistent_index_path(&config.dir)).await {
-				Ok(index) => Some(Arc::new(index)),
-				Err(err) => {
-					tracing::warn!(
-						error = %err,
-						dir = %config.dir.display(),
-						"failed to open redb storage index; continuing with in-memory recovery"
-					);
-					None
-				}
-			};
 		if let Some(index) = &persistent_index {
 			match index.load_snapshot().await {
 				Ok(snapshot) => {
@@ -1527,6 +1568,9 @@ impl SlabManager {
 			secondary_index_segments,
 			secondary_index_coverage,
 			secondary_index_admission_gate: Arc::new(AsyncRwLock::new(())),
+			maintenance_publication_gate: Arc::new(AsyncRwLock::new(())),
+			maintenance_publication_restart_required: AtomicBool::new(false),
+			maintenance_publication_fail_stop: std::sync::Mutex::new(None),
 			secondary_index_declaration_cuts: DashSet::new(),
 			slab_rewrite_claims: DashMap::new(),
 			tiered_stats_cache: DashMap::new(),
@@ -1921,6 +1965,16 @@ impl SlabManager {
 		refresh_lsm_level_metrics(&snapshot);
 	}
 
+	/// Compatibility bridge for a sealed slab recovered or constructed by an
+	/// older path that predates manifest registration. Normal sealing already
+	/// registers every non-empty slab; maintenance must nevertheless repair a
+	/// missing Live row before it can publish that run as Retired.
+	fn ensure_live_lsm_run_for_maintenance(&self, slab_id: SlabId, size_bytes: u64) {
+		if self.compaction_manifest_snapshot().run(slab_id).is_none() {
+			self.record_l0_compaction_run(slab_id, size_bytes);
+		}
+	}
+
 	/// Test / diagnostic accessor: number of slabs currently
 	/// pivoted to L2.
 	pub async fn tiered_count(&self) -> usize {
@@ -2175,18 +2229,29 @@ impl SlabManager {
 		&self,
 		table_schemas: &TableSchemaCatalog,
 	) -> std::io::Result<u64> {
+		// A Retired slab remains physically readable until the pin-aware GC sweep
+		// disposes it, but it is no longer resident data for convergence. Count
+		// only Live manifest runs (and untracked legacy slabs, which predate the
+		// manifest and therefore have no state to classify).
+		let manifest = self.compaction_manifest_snapshot();
 		let (sealed_ids, tiered_pointers) = {
 			let state = self.state.lock().await;
 			let mut sealed_ids = state
 				.sealed
 				.iter()
 				.map(|entry| *entry.key())
+				.filter(|slab_id| manifest.run(*slab_id).is_none_or(|run| run.state.is_live()))
 				.collect::<Vec<_>>();
 			sealed_ids.sort_unstable();
 			let mut tiered_pointers = state
 				.tiered
 				.iter()
 				.map(|entry| entry.value().clone())
+				.filter(|pointer| {
+					manifest
+						.run(pointer.slab_id)
+						.is_none_or(|run| run.state.is_live())
+				})
 				.collect::<Vec<_>>();
 			tiered_pointers.sort_by_key(|pointer| pointer.slab_id);
 			(sealed_ids, tiered_pointers)
@@ -3664,70 +3729,6 @@ impl SlabManager {
 			index.rebuild(snapshot_rows, tiered, None).await?;
 		}
 		Ok(())
-	}
-
-	async fn delete_persistent_records(&self, records: &[CompactionRecord]) {
-		let rows = records
-			.iter()
-			.map(|record| PersistentRecordRow {
-				tenant_id: record.tenant_id,
-				key_identity: record.key_identity,
-				routing_locality: record.routing_locality,
-				table_object_id: None,
-				placement: PlacementSemantics::RawLocality,
-				partition: None,
-				location: record.old_location,
-			})
-			.collect::<Vec<_>>();
-		self.mirror_persistent_update(
-			PersistentIndexUpdate {
-				delete_records: rows,
-				..Default::default()
-			},
-			"compaction-delete",
-		)
-		.await;
-	}
-
-	async fn replace_persistent_records(
-		&self,
-		removed: &[CompactionRecord],
-		inserted: &[RelocatedRecord],
-		relocation_tables: &HashMap<RecordLocation, TableObjectId>,
-	) {
-		let removed_rows = removed
-			.iter()
-			.map(|record| PersistentRecordRow {
-				tenant_id: record.tenant_id,
-				key_identity: record.key_identity,
-				routing_locality: record.routing_locality,
-				table_object_id: relocation_tables.get(&record.old_location).copied(),
-				placement: PlacementSemantics::RawLocality,
-				partition: None,
-				location: record.old_location,
-			})
-			.collect::<Vec<_>>();
-		let inserted_rows = inserted
-			.iter()
-			.map(|record| PersistentRecordRow {
-				tenant_id: record.tenant_id,
-				key_identity: record.key_identity,
-				routing_locality: record.routing_locality,
-				table_object_id: relocation_tables.get(&record.old_location).copied(),
-				placement: PlacementSemantics::RawLocality,
-				partition: None,
-				location: record.new_location,
-			})
-			.collect::<Vec<_>>();
-		self.mirror_persistent_update(
-			PersistentIndexUpdate {
-				delete_records: removed_rows,
-				put_records: inserted_rows,
-				..Default::default()
-			},
-			"compaction-replace",
-		)
-		.await;
 	}
 
 	async fn persist_tiered_pointer_strict(

@@ -9203,6 +9203,7 @@ fn adr078_manager_source_concatenates_submodules() {
 			"compaction.rs",
 			"encoding_compute.rs",
 			"lsm_driver.rs",
+			"maintenance_publication.rs",
 			"retention_reclaim.rs",
 			"secondary_index_segments.rs",
 			"stats_facts.rs",

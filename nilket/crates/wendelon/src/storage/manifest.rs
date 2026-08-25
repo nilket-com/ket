@@ -3,6 +3,7 @@ use crate::storage::lsm::{
 	CompactionCommit, CompactionFailure, CompactionPlan, LsmRunSummary, SlabState,
 };
 use std::collections::{BTreeMap, BTreeSet};
+use std::io::{Error, ErrorKind};
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -145,6 +146,83 @@ impl CompactionManifest {
 
 	pub fn remove_run(&mut self, slab_id: SlabId) -> Option<LsmRunSummary> {
 		self.runs.remove(&slab_id)
+	}
+
+	/// Publish a maintenance rewrite that intentionally removes a declared
+	/// subset of the old run's visible rows. This is deliberately separate from
+	/// a normal compaction commit: normal compaction structurally requires
+	/// visible-digest invariance, while retention, table-drop reclaim, and range
+	/// reclaim change visibility by design.
+	///
+	/// The operation is idempotent by `(old slab, replacement slab)` shape. A
+	/// caller persists its resulting run rows atomically with the record-index
+	/// relocation before installing the replacement file or changing the
+	/// in-memory manager state.
+	pub fn apply_maintenance_rewrite(
+		&mut self,
+		old_slab_id: SlabId,
+		replacement: Option<LsmRunSummary>,
+	) -> Result<ManifestEpoch, Error> {
+		let successors = replacement
+			.as_ref()
+			.map(|run| vec![run.slab_id])
+			.unwrap_or_default();
+
+		if let Some(old) = self.runs.get(&old_slab_id) {
+			if matches!(&old.state, SlabState::Retired { successors: existing } if existing == &successors)
+				&& replacement.as_ref().is_none_or(|expected| {
+					self.runs.get(&expected.slab_id).is_some_and(|actual| {
+						actual.state.is_live()
+							&& actual.compaction_level == expected.compaction_level
+							&& actual.min_row_hlc == expected.min_row_hlc
+							&& actual.max_row_hlc == expected.max_row_hlc
+							&& actual.size_bytes == expected.size_bytes
+							&& actual.row_count == expected.row_count
+					})
+				}) {
+				return Ok(self.manifest_epoch);
+			}
+		}
+
+		let Some(old) = self.runs.get(&old_slab_id) else {
+			return Err(Error::new(
+				ErrorKind::NotFound,
+				format!("maintenance rewrite source run {old_slab_id} is absent"),
+			));
+		};
+		if !old.state.is_live() {
+			return Err(Error::new(
+				ErrorKind::InvalidInput,
+				format!("maintenance rewrite source run {old_slab_id} is not Live"),
+			));
+		}
+		if let Some(replacement) = &replacement {
+			if replacement.slab_id == old_slab_id || self.runs.contains_key(&replacement.slab_id) {
+				return Err(Error::new(
+					ErrorKind::AlreadyExists,
+					format!(
+						"maintenance rewrite replacement run {} conflicts with the manifest",
+						replacement.slab_id
+					),
+				));
+			}
+		}
+
+		let post_epoch = self.advance_epoch();
+		let old = self
+			.runs
+			.get_mut(&old_slab_id)
+			.expect("validated maintenance source run disappeared");
+		old.state = SlabState::Retired {
+			successors: successors.clone(),
+		};
+		old.manifest_epoch = post_epoch;
+		if let Some(mut replacement) = replacement {
+			replacement.state = SlabState::Live;
+			replacement.manifest_epoch = post_epoch;
+			self.runs.insert(replacement.slab_id, replacement);
+		}
+		Ok(post_epoch)
 	}
 
 	pub fn apply_compaction_commit(

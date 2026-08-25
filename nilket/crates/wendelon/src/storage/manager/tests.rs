@@ -34,7 +34,10 @@ use crate::storage::stats::{
 	decode_column_stats_payload, encode_float64_stat_value, encode_length_prefixed_bytes,
 	encode_signed_stat_value, parse_column_stats_block,
 };
-use crate::storage::{IndexQuery, LsmConfig, SecondaryIndexEntry, SecondaryIndexIdentity};
+use crate::storage::{
+	FaultAction, FaultOp, FaultyFileOps, IndexQuery, InjectedFault, LsmConfig, SecondaryIndexEntry,
+	SecondaryIndexIdentity,
+};
 use arrow::array::{
 	Array, BooleanArray, FixedSizeBinaryBuilder, Float64Array, Int64Array, LargeBinaryBuilder,
 	LargeStringArray, StringArray, UInt8Array, UInt64Array, UInt64Builder,
@@ -68,6 +71,176 @@ fn id(n: u64) -> Identity {
 
 fn tenant() -> TenantId {
 	TenantId::ZERO
+}
+
+#[tokio::test]
+async fn maintenance_staged_publication_recovery_distinguishes_s0_from_s1() {
+	let dir = fresh_dir("maintenance-staged-recovery");
+	let file_ops = BlockingFileOps;
+	let old = SlabId::new(41);
+	let replacement = SlabId::new(42);
+	let staged = maintenance_staged_slab_path(&dir, old, replacement);
+	std::fs::write(&staged, b"staged-replacement").unwrap();
+
+	let old_run = LsmRunSummary::new(
+		old,
+		CompactionLevelIndex::L0,
+		hlc(1),
+		hlc(1),
+		ByteCount::new(1),
+		RowCount::new(1),
+		ManifestEpoch::ZERO,
+	)
+	.with_state(SlabState::Retired {
+		successors: vec![replacement],
+	});
+	let replacement_run = LsmRunSummary::new(
+		replacement,
+		CompactionLevelIndex::L0,
+		hlc(1),
+		hlc(1),
+		ByteCount::new(1),
+		RowCount::new(1),
+		ManifestEpoch::ZERO,
+	);
+	reconcile_staged_maintenance_publications(
+		&file_ops,
+		&dir,
+		Some(&[old_run, replacement_run]),
+		None,
+	)
+	.await
+	.unwrap();
+	assert!(
+		!staged.exists() && slab_path(&dir, replacement).exists(),
+		"S1 must install the committed staged replacement before discovery"
+	);
+
+	let s0_replacement = SlabId::new(43);
+	let s0 = maintenance_staged_slab_path(&dir, old, s0_replacement);
+	std::fs::write(&s0, b"uncommitted-replacement").unwrap();
+	reconcile_staged_maintenance_publications(&file_ops, &dir, None, None)
+		.await
+		.unwrap();
+	assert!(
+		!s0.exists() && !slab_path(&dir, s0_replacement).exists(),
+		"S0 reaps only the invisible staged file; it must never create a final slab"
+	);
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_staged_install_retries_and_preserves_s1_for_recovery() {
+	let dir = fresh_dir("maintenance-staged-install-retry");
+	let old = SlabId::new(51);
+	let replacement = SlabId::new(52);
+	let staged = maintenance_staged_slab_path(&dir, old, replacement);
+	let final_path = slab_path(&dir, replacement);
+	let old_run = LsmRunSummary::new(
+		old,
+		CompactionLevelIndex::L0,
+		hlc(1),
+		hlc(1),
+		ByteCount::new(1),
+		RowCount::new(1),
+		ManifestEpoch::ZERO,
+	)
+	.with_state(SlabState::Retired {
+		successors: vec![replacement],
+	});
+	let replacement_run = LsmRunSummary::new(
+		replacement,
+		CompactionLevelIndex::L0,
+		hlc(1),
+		hlc(1),
+		ByteCount::new(1),
+		RowCount::new(1),
+		ManifestEpoch::ZERO,
+	);
+
+	// One transient D1′ failure is retried by the shared S1 installer.
+	std::fs::write(&staged, b"staged-replacement").unwrap();
+	let transient = FaultyFileOps::new(&dir).unwrap();
+	transient.inject(
+		InjectedFault::on(
+			FaultOp::Rename,
+			FaultAction::Error {
+				kind: ErrorKind::Interrupted,
+				message: "injected transient staged install failure".into(),
+			},
+		)
+		.for_path(&final_path),
+	);
+	reconcile_staged_maintenance_publications(
+		&transient,
+		&dir,
+		Some(&[old_run.clone(), replacement_run.clone()]),
+		Some((old, replacement)),
+	)
+	.await
+	.unwrap();
+	assert!(final_path.exists() && !staged.exists());
+
+	// Persistent D1′ failure never reclassifies S1 as an ordinary S0 cleanup:
+	// the staged bytes remain for the identical startup reconciler to finish.
+	std::fs::remove_file(&final_path).unwrap();
+	std::fs::write(&staged, b"staged-replacement").unwrap();
+	let persistent = FaultyFileOps::new(&dir).unwrap();
+	for _ in 0..3 {
+		persistent.inject(
+			InjectedFault::on(
+				FaultOp::Rename,
+				FaultAction::Error {
+					kind: ErrorKind::WouldBlock,
+					message: "injected persistent staged install failure".into(),
+				},
+			)
+			.for_path(&final_path),
+		);
+	}
+	let err = reconcile_staged_maintenance_publications(
+		&persistent,
+		&dir,
+		Some(&[old_run.clone(), replacement_run.clone()]),
+		Some((old, replacement)),
+	)
+	.await
+	.expect_err("persistent D1′ failure must not be reported as a successful pass");
+	assert!(err.to_string().contains("restart-required"));
+	assert!(staged.exists() && !final_path.exists());
+
+	reconcile_staged_maintenance_publications(
+		&BlockingFileOps,
+		&dir,
+		Some(&[old_run, replacement_run]),
+		Some((old, replacement)),
+	)
+	.await
+	.unwrap();
+	assert!(final_path.exists() && !staged.exists());
+	std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[tokio::test]
+async fn maintenance_publication_fail_stop_blocks_reads_until_restart() {
+	let manager = fresh_manager().await;
+	let key = id(0x5A);
+	manager
+		.append_durable(tenant(), key, hlc(1), b"must-not-serve-half-published")
+		.await
+		.unwrap();
+	let location = manager.lookup(tenant(), key).unwrap();
+	let publication_gate = manager
+		.maintenance_publication_gate
+		.clone()
+		.write_owned()
+		.await;
+	manager.enter_maintenance_publication_fail_stop(publication_gate);
+	let error = manager
+		.read(location)
+		.await
+		.expect_err("D1′ exhaustion must fail-stop local reads until restart reconciliation");
+	assert!(error.to_string().contains("restart reconciliation"));
 }
 
 fn test_crypto() -> Arc<CryptoManager> {
@@ -10621,6 +10794,9 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 		.append_durable(tenant(), id(0x3030), hlc(30), b"active-row")
 		.await
 		.unwrap();
+	let survivor_before = manager
+		.lookup(tenant(), survivor_key)
+		.expect("survivor location before maintenance");
 
 	let target = Locality::from(removed_key).get();
 	let report = manager
@@ -10657,6 +10833,22 @@ async fn reopen_after_tombstone_compaction_preserves_survivor_lookup() {
 		"compaction should relocate the survivor into a replacement slab"
 	);
 	assert_eq!(manager.read(survivor).await.unwrap(), b"keep-me");
+	let manifest = manager.compaction_manifest_snapshot();
+	let replacement_run = manifest
+		.run(survivor.slab_id)
+		.expect("replacement must be published Live");
+	assert!(replacement_run.state.is_live());
+	assert!(
+		matches!(
+			manifest.run(sealed_id).map(|run| &run.state),
+			Some(SlabState::Retired { successors }) if successors.as_slice() == [survivor.slab_id]
+		),
+		"maintenance publication must retire the old run before GC, not leave a Live run naming a removed slab"
+	);
+	assert!(
+		manager.read(survivor_before).await.is_ok(),
+		"the old backing stays readable for a stale pre-D3 location until GC disposes it"
+	);
 
 	drop(manager);
 
@@ -12449,4 +12641,249 @@ async fn missing_compaction_source_read_records_compaction_origin() {
 		.expect("integrity failure retained for referencing table");
 	assert_eq!(failure.origin, PublishedReferenceOrigin::Compaction);
 	assert_eq!(failure.missing_slab_id, sealed_slab);
+}
+
+#[tokio::test]
+async fn maintenance_rewrite_publishes_under_reader_pin_and_sweep_defers_disposal() {
+	// The regression control for the pin-fix follow-up: a reader pin held
+	// across a with-survivors maintenance rewrite must never be refused —
+	// the rewrite publishes, both old and new locations stay readable, and
+	// only Phase D (the GC sweep) defers to the pin, collecting after
+	// release.
+	let mgr = fresh_manager().await;
+	let target = append_only_retention_descriptor(TableObjectId::new([0x81; 16]));
+	let other =
+		append_only_retention_descriptor_named(TableObjectId::new([0x82; 16]), "pinned_reader");
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), target.clone()).unwrap();
+	schemas.upsert(tenant(), other.clone()).unwrap();
+
+	let target_key = id(0x811);
+	let other_key = id(0x821);
+	let target_frame = encode_test_append_only_storage_frame(
+		target.table_object_id,
+		&[(target_key, Locality::new(10), hlc(10), 100, false)],
+	);
+	let target_entries = storage_multirow_index_entries_from_frame(&target_frame)
+		.unwrap()
+		.expect("target entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &target_frame, &target_entries)
+		.await
+		.unwrap();
+	let other_frame = encode_test_append_only_storage_frame(
+		other.table_object_id,
+		&[(other_key, Locality::new(20), hlc(20), 200, false)],
+	);
+	let other_entries = storage_multirow_index_entries_from_frame(&other_frame)
+		.unwrap()
+		.expect("other entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &other_frame, &other_entries)
+		.await
+		.unwrap();
+
+	let target_old = mgr.lookup(tenant(), target_key).expect("target location");
+	let other_old = mgr.lookup(tenant(), other_key).expect("survivor location");
+	let old_slab = other_old.slab_id;
+	assert_eq!(old_slab, target_old.slab_id, "co-resident fixture");
+
+	let pins = mgr.slab_pin_table();
+	let reader_pin = pins.acquire(&[old_slab]).expect("reader pin");
+
+	let report = mgr
+		.reclaim_table_drop_storage(
+			tenant(),
+			&target,
+			&schemas,
+			&SecondaryIndexCatalog::default(),
+			usize::MAX,
+		)
+		.await
+		.expect("with-survivors rewrite must publish under a reader pin");
+	assert_eq!(report.compacted_slabs, 1);
+	assert_eq!(report.reclaimed_records, 1);
+
+	// Reads stay whole throughout: the survivor via its relocated live
+	// index entry, its stale pre-D3 location via relocation forwarding, and
+	// the dropped row's old location at the byte level — the retained old
+	// backing.
+	let other_new = mgr.lookup(tenant(), other_key).expect("survivor relocated");
+	assert_ne!(other_new.slab_id, old_slab);
+	assert_eq!(mgr.read(other_new).await.unwrap().len() > 0, true);
+	assert!(mgr.read(other_old).await.is_ok(), "stale location forwards");
+	assert!(
+		mgr.read(target_old).await.is_ok(),
+		"old backing readable under the reader pin"
+	);
+
+	let manifest = mgr.compaction_manifest_snapshot();
+	assert!(matches!(
+		manifest.run(old_slab).map(|run| &run.state),
+		Some(SlabState::Retired { successors }) if successors.as_slice() == [other_new.slab_id]
+	));
+	assert!(
+		manifest
+			.run(other_new.slab_id)
+			.is_some_and(|run| run.state.is_live())
+	);
+
+	// Phase D defers to the reader pin, then collects after release.
+	let gc = LsmGcWorker::new(
+		crate::storage::lsm::LsmConfig::default(),
+		mgr.slab_pin_table(),
+	)
+	.unwrap();
+	let deferred = mgr.sweep_lsm_delete_pending_once(&gc).await.unwrap();
+	assert!(
+		!deferred.contains(&old_slab),
+		"sweep must defer disposal while the reader pin lives"
+	);
+	assert!(
+		mgr.read_sealed_raw(old_slab).await.is_ok(),
+		"old backing physically present through the deferred sweep"
+	);
+
+	drop(reader_pin);
+	let collected = mgr.sweep_lsm_delete_pending_once(&gc).await.unwrap();
+	assert!(
+		collected.contains(&old_slab),
+		"sweep collects the retired backing after pin release"
+	);
+	assert!(mgr.read_sealed_raw(old_slab).await.is_err());
+}
+
+#[tokio::test]
+async fn maintenance_publication_refuses_relocation_survivor_mismatch() {
+	// The publication validation's negative arm: a relocation set that does
+	// not equal the declared survivor set is refused before any durable or
+	// in-memory mutation.
+	let mgr = fresh_manager().await;
+	let table = append_only_retention_descriptor(TableObjectId::new([0x83; 16]));
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), table.clone()).unwrap();
+	let key = id(0x831);
+	let frame = encode_test_append_only_storage_frame(
+		table.table_object_id,
+		&[(key, Locality::new(30), hlc(30), 300, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let location = mgr.lookup(tenant(), key).expect("row location");
+	let old_slab = force_seal_active(&mgr).await;
+	assert_eq!(old_slab, location.slab_id);
+	// The test seal helper does not register an L0 run; use the same bridge
+	// the maintenance path uses so the manifest has a Live source to guard.
+	mgr.ensure_live_lsm_run_for_maintenance(old_slab, 1024);
+
+	let records = vec![CompactionRecord {
+		tenant_id: tenant(),
+		key_identity: key,
+		routing_locality: Locality::new(30),
+		old_location: location,
+		reclaim: false,
+		retention_ambiguous: false,
+		retention_lag_seconds: 0,
+	}];
+	let replacement_id = mgr.reserve_slab_id().await;
+	let staged_path = maintenance_staged_slab_path(&mgr.config.dir, old_slab, replacement_id);
+	let replacement = Arc::new(
+		LocalSlabStore::open(
+			&staged_path,
+			replacement_id,
+			mgr.file_ops.clone(),
+			mgr.config.group_commit.clone(),
+		)
+		.await
+		.unwrap(),
+	);
+
+	// One declared survivor, zero relocations: the sets differ.
+	let err = mgr
+		.finish_compaction_with_replacement(
+			old_slab,
+			replacement_id,
+			replacement,
+			&records,
+			&[],
+			&staged_path,
+		)
+		.await
+		.expect_err("mismatched relocation set must be refused");
+	assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+	// Nothing changed: the run is still Live, the row still reads.
+	assert!(
+		mgr.compaction_manifest_snapshot()
+			.run(old_slab)
+			.is_some_and(|run| run.state.is_live())
+	);
+	assert!(mgr.read(location).await.is_ok());
+	let _ = unlink_local_file(mgr.file_ops.as_ref(), &staged_path).await;
+}
+
+#[tokio::test]
+async fn maintenance_manifest_reapply_is_a_no_op() {
+	// Idempotent re-apply: the same (old, replacement) publication applied
+	// twice leaves the manifest byte-identical; a conflicting second
+	// publication of a retired source is refused.
+	let mgr = fresh_manager().await;
+	let table = append_only_retention_descriptor(TableObjectId::new([0x84; 16]));
+	let mut schemas = TableSchemaCatalog::default();
+	schemas.upsert(tenant(), table.clone()).unwrap();
+	let key = id(0x841);
+	let frame = encode_test_append_only_storage_frame(
+		table.table_object_id,
+		&[(key, Locality::new(40), hlc(40), 400, false)],
+	);
+	let entries = storage_multirow_index_entries_from_frame(&frame)
+		.unwrap()
+		.expect("entries");
+	mgr.append_durable_multirow_with_locality(tenant(), &frame, &entries)
+		.await
+		.unwrap();
+	let old_slab = force_seal_active(&mgr).await;
+	mgr.ensure_live_lsm_run_for_maintenance(old_slab, 1024);
+	let old_run = mgr
+		.compaction_manifest_snapshot()
+		.run(old_slab)
+		.cloned()
+		.expect("bridged sealed slab registers a Live run");
+
+	let replacement = LsmRunSummary::new(
+		SlabId::new(0x8400),
+		old_run.compaction_level,
+		old_run.min_row_hlc,
+		old_run.max_row_hlc,
+		old_run.size_bytes,
+		old_run.row_count,
+		old_run.manifest_epoch,
+	);
+	let first = mgr
+		.apply_maintenance_manifest_publication(old_slab, Some(replacement.clone()))
+		.unwrap();
+	let second = mgr
+		.apply_maintenance_manifest_publication(old_slab, Some(replacement.clone()))
+		.unwrap();
+	assert_eq!(
+		first.runs(),
+		second.runs(),
+		"identical re-apply must not change the manifest"
+	);
+
+	let conflicting = LsmRunSummary::new(
+		SlabId::new(0x8401),
+		old_run.compaction_level,
+		old_run.min_row_hlc,
+		old_run.max_row_hlc,
+		old_run.size_bytes,
+		old_run.row_count,
+		old_run.manifest_epoch,
+	);
+	let err = mgr
+		.apply_maintenance_manifest_publication(old_slab, Some(conflicting))
+		.expect_err("a retired source must refuse a different publication");
+	assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
 }

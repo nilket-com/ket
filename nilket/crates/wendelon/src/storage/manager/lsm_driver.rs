@@ -579,6 +579,17 @@ impl SlabManager {
 		worker: &LsmCompactionWorker,
 		now: HybridTimestamp,
 	) -> Option<CompactionPlan> {
+		// A maintenance rewrite holds this only across its durable
+		// publication/install handoff. Returning no plan while that handoff is
+		// in flight is preferable to planning the old Live run from the
+		// pre-D3 in-memory manifest.
+		if self
+			.maintenance_publication_restart_required
+			.load(Ordering::Acquire)
+		{
+			return None;
+		}
+		let _publication_gate = self.maintenance_publication_gate.try_read().ok()?;
 		let snapshot = self.compaction_manifest_snapshot();
 		pick_compaction(&snapshot, &worker.config(), now).filter(|plan| {
 			!plan
@@ -1679,6 +1690,15 @@ impl SlabManager {
 		&self,
 		location: RecordLocation,
 	) -> std::io::Result<SlabPinGuard> {
+		if self
+			.maintenance_publication_restart_required
+			.load(Ordering::Acquire)
+		{
+			return Err(Error::new(
+				ErrorKind::Other,
+				"maintenance publication requires restart reconciliation before reads may resume",
+			));
+		}
 		self.slab_pins.acquire(&[location.slab_id]).map_err(|_| {
 			Error::new(
 				ErrorKind::NotFound,

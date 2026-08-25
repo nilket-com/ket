@@ -456,7 +456,15 @@ impl SlabManager {
 		if self.is_compaction_slab_quarantined(slab_id) {
 			return Ok(None);
 		}
+		if self
+			.compaction_manifest_snapshot()
+			.run(slab_id)
+			.is_some_and(|run| !run.state.is_live())
+		{
+			return Ok(None);
+		}
 		let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
+		self.ensure_live_lsm_run_for_maintenance(slab_id, slab.write_cursor());
 		let mut records: Vec<CompactionRecord> = slab
 			.index
 			.iter()
@@ -575,7 +583,8 @@ impl SlabManager {
 
 		let old_bytes = slab.write_cursor();
 		let replacement_id = self.reserve_slab_id().await;
-		let replacement_path = slab_path(&self.config.dir, replacement_id);
+		let replacement_path =
+			maintenance_staged_slab_path(&self.config.dir, slab_id, replacement_id);
 		let replacement = Arc::new(
 			LocalSlabStore::open(
 				&replacement_path,
@@ -812,11 +821,11 @@ impl SlabManager {
 				replacement.clone(),
 				&records,
 				&relocations,
+				&replacement_path,
 			)
 			.await?
 		{
-			let path = slab_path(&self.config.dir, replacement_id);
-			let _ = unlink_local_file(self.file_ops.as_ref(), &path).await;
+			let _ = unlink_local_file(self.file_ops.as_ref(), &replacement_path).await;
 			return Ok(None);
 		}
 
@@ -829,10 +838,7 @@ impl SlabManager {
 			)
 			.await
 		{
-			Ok(_proof) => {
-				let old_path = slab_path(&self.config.dir, slab_id);
-				unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
-			}
+			Ok(_proof) => {}
 			Err(err) => {
 				self.quarantine_compaction_slab_for_reconciliation(slab_id, &err);
 			}
@@ -863,20 +869,15 @@ impl SlabManager {
 		if self.is_compaction_slab_quarantined(slab_id) {
 			return Ok(None);
 		}
-		let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
-		// A compaction plan pins every slab it will read before its first read
-		// (acquire_plan_pins); those pins guarantee the backing outlives the
-		// plan. Both branches below remove the old backing, so they must honor
-		// the same contract LSM GC deletion does: the delete-pending mark is
-		// atomic with the pin check — refused while any pin is held (defer this
-		// slab to a later pass; ticks and drop-reclaim receipt verification
-		// re-drive deferred work) — and refuses new pins for the removal
-		// window, closing the pin-after-check race. The guard clears the mark
-		// on every exit, so an aborted rewrite leaves the slab pinnable.
-		let Some(_delete_pending) = self.slab_pins.mark_delete_pending_guarded(slab_id) else {
+		if self
+			.compaction_manifest_snapshot()
+			.run(slab_id)
+			.is_some_and(|run| !run.state.is_live())
+		{
 			return Ok(None);
-		};
-
+		}
+		let _slab_rewrite_claim = self.acquire_slab_rewrite_exclusive_claim(slab_id).await;
+		self.ensure_live_lsm_run_for_maintenance(slab_id, slab.write_cursor());
 		let old_bytes = slab.write_cursor();
 		let reclaimed_records = records.iter().filter(|record| record.reclaim).count();
 		let retention_stats = Self::retention_compaction_stats(records);
@@ -890,6 +891,13 @@ impl SlabManager {
 			)
 			.await?;
 		if survivors == 0 {
+			// A fully-dead slab has no legitimate reader after the admission
+			// tombstone. Take the pin gate only at the first irreversible step;
+			// holding it across a survivor rewrite would incorrectly reject
+			// readers of live co-resident rows.
+			let Some(_delete_pending) = self.slab_pins.mark_delete_pending_guarded(slab_id) else {
+				return Ok(None);
+			};
 			// Validate before destroying: reconciliation proof precedes the record
 			// rollback, persistent deletion and unlink inside the finish path.
 			if let Err(err) = self
@@ -914,7 +922,8 @@ impl SlabManager {
 		}
 
 		let replacement_id = self.reserve_slab_id().await;
-		let replacement_path = slab_path(&self.config.dir, replacement_id);
+		let replacement_path =
+			maintenance_staged_slab_path(&self.config.dir, slab_id, replacement_id);
 		let replacement = Arc::new(
 			LocalSlabStore::open(
 				&replacement_path,
@@ -989,11 +998,11 @@ impl SlabManager {
 				replacement.clone(),
 				&records,
 				&relocations,
+				&replacement_path,
 			)
 			.await?
 		{
-			let path = slab_path(&self.config.dir, replacement_id);
-			let _ = unlink_local_file(self.file_ops.as_ref(), &path).await;
+			let _ = unlink_local_file(self.file_ops.as_ref(), &replacement_path).await;
 			return Ok(None);
 		}
 
@@ -1006,10 +1015,7 @@ impl SlabManager {
 			)
 			.await
 		{
-			Ok(_proof) => {
-				let old_path = slab_path(&self.config.dir, slab_id);
-				unlink_local_file(self.file_ops.as_ref(), &old_path).await?;
-			}
+			Ok(_proof) => {}
 			Err(err) => {
 				// The replacement is installed and owns the records; the old file is
 				// preserved on disk as evidence, never republished. Containment, not
@@ -1033,13 +1039,41 @@ impl SlabManager {
 		slab_id: SlabId,
 		records: &[CompactionRecord],
 	) -> std::io::Result<()> {
-		let removed = {
+		let _publication_gate = self
+			.maintenance_publication_gate
+			.clone()
+			.write_owned()
+			.await;
+		{
 			let state = self.state.lock().await;
-			state.sealed.remove(&slab_id)
-		};
-		let Some((_, _removed)) = removed else {
-			return Ok(());
-		};
+			if !state.sealed.contains_key(&slab_id) || state.tiered.contains_key(&slab_id) {
+				return Ok(());
+			}
+		}
+		let deleted_rows = records
+			.iter()
+			.map(|record| {
+				self.persistent_record_row(
+					record.tenant_id,
+					record.key_identity,
+					record.old_location,
+				)
+			})
+			.collect::<Vec<_>>();
+		let lsm_runs = self.maintenance_manifest_preview(slab_id, None)?;
+		// D2′: records and the old run's Retired disposition become durable in
+		// one transaction before the in-memory index or backing changes.
+		self.persist_maintenance_publication(PersistentIndexUpdate {
+			delete_records: deleted_rows,
+			put_lsm_runs: lsm_runs,
+			..Default::default()
+		})
+		.await?;
+		self.apply_maintenance_manifest_publication(slab_id, None)?;
+		{
+			let state = self.state.lock().await;
+			state.sealed.remove(&slab_id);
+		}
 		for record in records {
 			self.rollback_indexed_location(
 				record.tenant_id,
@@ -1047,7 +1081,6 @@ impl SlabManager {
 				record.old_location,
 			);
 		}
-		self.delete_persistent_records(records).await;
 		// No negative reference scan here: this path runs only after
 		// `reconcile_secondary_index_segments_after_compaction` returned proof. The
 		// scan-based `can_retire_local_slab` guard remains on the sweep paths, where
@@ -1064,10 +1097,30 @@ impl SlabManager {
 		replacement: Arc<LocalSlabStore>,
 		records: &[CompactionRecord],
 		relocations: &[RelocatedRecord],
+		staged_path: &Path,
 	) -> std::io::Result<bool> {
-		let state = self.state.lock().await;
-		if !state.sealed.contains_key(&old_slab_id) || state.tiered.contains_key(&old_slab_id) {
-			return Ok(false);
+		let publication_gate = self
+			.maintenance_publication_gate
+			.clone()
+			.write_owned()
+			.await;
+		{
+			let state = self.state.lock().await;
+			if !state.sealed.contains_key(&old_slab_id) || state.tiered.contains_key(&old_slab_id) {
+				return Ok(false);
+			}
+		}
+		let survivor_count = records.iter().filter(|record| !record.reclaim).count();
+		if relocations.len() != survivor_count
+			|| relocations.iter().any(|relocation| {
+				records
+					.iter()
+					.any(|record| record.reclaim && record.old_location == relocation.old_location)
+			}) {
+			return Err(Error::new(
+				ErrorKind::InvalidData,
+				"maintenance rewrite relocation set does not equal the declared survivor set",
+			));
 		}
 		let relocation_tables = relocations
 			.iter()
@@ -1076,7 +1129,114 @@ impl SlabManager {
 					.map(|table_object_id| (relocation.old_location, table_object_id))
 			})
 			.collect::<HashMap<_, _>>();
-		state.sealed.remove(&old_slab_id);
+		let removed_rows = records
+			.iter()
+			.map(|record| {
+				self.persistent_record_row(
+					record.tenant_id,
+					record.key_identity,
+					record.old_location,
+				)
+			})
+			.collect::<Vec<_>>();
+		let inserted_rows = relocations
+			.iter()
+			.map(|relocation| PersistentRecordRow {
+				tenant_id: relocation.tenant_id,
+				key_identity: relocation.key_identity,
+				routing_locality: relocation.routing_locality,
+				table_object_id: relocation_tables.get(&relocation.old_location).copied(),
+				placement: relocation.new_location.placement,
+				partition: relocation.new_location.partition,
+				location: relocation.new_location,
+			})
+			.collect::<Vec<_>>();
+		let (min_row_hlc, max_row_hlc) =
+			relocations
+				.iter()
+				.fold((None, None), |(min_row_hlc, max_row_hlc), relocation| {
+					(
+						Some(
+							min_row_hlc
+								.map_or(relocation.new_location.hlc, |current: HybridTimestamp| {
+									current.min(relocation.new_location.hlc)
+								}),
+						),
+						Some(
+							max_row_hlc
+								.map_or(relocation.new_location.hlc, |current: HybridTimestamp| {
+									current.max(relocation.new_location.hlc)
+								}),
+						),
+					)
+				});
+		let old_run = self
+			.compaction_manifest_snapshot()
+			.run(old_slab_id)
+			.cloned()
+			.ok_or_else(|| {
+				Error::new(
+					ErrorKind::NotFound,
+					format!("maintenance source run {old_slab_id} is absent"),
+				)
+			})?;
+		let replacement_run = LsmRunSummary::new(
+			new_slab_id,
+			old_run.compaction_level,
+			min_row_hlc.expect("non-empty relocation set has a minimum HLC"),
+			max_row_hlc.expect("non-empty relocation set has a maximum HLC"),
+			ByteCount::new(replacement.write_cursor()),
+			RowCount::new(relocations.len() as u64),
+			old_run.manifest_epoch,
+		);
+		let lsm_runs =
+			self.maintenance_manifest_preview(old_slab_id, Some(replacement_run.clone()))?;
+
+		// D2: make the record relocation and manifest disposition durable before
+		// a final-path file exists or any live lookup starts using the replacement.
+		let published_lsm_runs = lsm_runs.clone();
+		self.persist_maintenance_publication(PersistentIndexUpdate {
+			delete_records: removed_rows,
+			put_records: inserted_rows,
+			put_lsm_runs: lsm_runs,
+			..Default::default()
+		})
+		.await?;
+
+		// D1′: live installation invokes the same S1 reconciler startup uses.
+		// Only a durable publication is ever allowed to occupy the normal
+		// discovery namespace.
+		let expected_staged_path =
+			maintenance_staged_slab_path(&self.config.dir, old_slab_id, new_slab_id);
+		if staged_path != expected_staged_path
+			|| self.file_ops.file_len(staged_path).await?.is_none()
+		{
+			let err = Error::new(
+				ErrorKind::NotFound,
+				format!(
+					"committed maintenance publication {old_slab_id}->{new_slab_id} lost its staged replacement before D1′"
+				),
+			);
+			self.enter_maintenance_publication_fail_stop(publication_gate);
+			return Err(err);
+		}
+		if let Err(err) = reconcile_staged_maintenance_publications(
+			self.file_ops.as_ref(),
+			&self.config.dir,
+			Some(&published_lsm_runs),
+			Some((old_slab_id, new_slab_id)),
+		)
+		.await
+		{
+			self.enter_maintenance_publication_fail_stop(publication_gate);
+			return Err(err);
+		}
+
+		// D3: update the in-memory manifest and record maps while the planner gate
+		// excludes a plan derived from the pre-publication Live run. Keep the old
+		// backing sealed for stale readers; Phase D owns its eventual disposal.
+		self.apply_maintenance_manifest_publication(old_slab_id, Some(replacement_run))?;
+		let state = self.state.lock().await;
 		state.sealed.insert(new_slab_id, replacement);
 		for record in records {
 			self.rollback_indexed_location(
@@ -1104,8 +1264,6 @@ impl SlabManager {
 			}
 		}
 		drop(state);
-		self.replace_persistent_records(records, relocations, &relocation_tables)
-			.await;
 		Ok(true)
 	}
 }
