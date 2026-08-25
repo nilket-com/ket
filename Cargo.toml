@@ -66,6 +66,31 @@ panic = "abort"
 strip = true
 debug = 0
 
+# Measurement profiles. Both exist because `cargo test --release` cannot build
+# this workspace at all: iced_core gates its null renderer behind
+# `#[cfg(debug_assertions)]`, and polariton's widget tests construct
+# `iced::Element<'static, _, _, ()>`. `debug-assertions = true` is therefore
+# forced, not chosen, and `panic = "unwind"` is required by the test harness.
+# Neither profile is a shipping-binary benchmark for that reason.
+
+# Routine performance iteration. Thin LTO parallelises across codegen units, so
+# a rebuild costs minutes rather than the better part of an hour.
+[profile.evidence]
+inherits = "release"
+lto = "thin"
+codegen-units = 16
+debug-assertions = true
+panic = "unwind"
+
+# Shipping-grade codegen calibration. Used rarely, to check how far `evidence`
+# numbers sit from full-optimization codegen before those numbers are quoted.
+[profile.evidence-calibration]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+debug-assertions = true
+panic = "unwind"
+
 # Workspace debuginfo stays out of the linked binary; dependencies keep their
 # optimization but drop debuginfo entirely. Optimized deps with full debuginfo
 # produced a 3.7 GB polariton binary whose per-run link and page-in stalled the

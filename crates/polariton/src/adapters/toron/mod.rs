@@ -453,18 +453,32 @@ mod tests {
 			.await
 			.expect("connect to Toron");
 
-		// Just below, at, and above each scatter boundary.
-		const CARDINALITIES: &[i64] = &[49_999, 50_000, 199_999, 200_000, 999_999, 1_000_000];
+		// Just below, at, and above each scatter boundary. The comparisons in
+		// `plot/kernels/scatter.rs` are `<=`, so a threshold engages strictly
+		// above its value: 1_000_001 is the only point here that reaches the
+		// raster path at all, and every point at or below 1_000_000 renders
+		// through downsample or vector.
+		const CARDINALITIES: &[i64] = &[
+			49_999, 50_000, 199_999, 200_000, 999_999, 1_000_000, 1_000_001,
+		];
 		const SEED: i64 = 20260821;
+
+		// Every fixture is retained until all timings finish, then dropped in
+		// one pass below. TORON-0095 reclaims asynchronously, so dropping
+		// inside the loop turns each cleanup into uncontrolled background I/O
+		// competing with the next cardinality's measurement.
+		let mut fixtures: Vec<String> = Vec::new();
 
 		println!(
 			"\ncardinality,materialize_ms,transfer_prepare_ms,first_render_ms,steady_render_ms,rows"
 		);
 		for &n in CARDINALITIES {
-			let table = format!("evidence_scatter_{n}");
-			let _ = adapter
-				.dispatch(&format!("DROP TABLE IF EXISTS {table}"))
-				.await;
+			// Per-run names, as the live plot exhibit above already does. A
+			// fixed name inherits whatever a previous session left behind, and
+			// a stale table turns into a materialize failure that reads as a
+			// defect in the path under test.
+			let table = format!("evidence_scatter_{n}_{}", std::process::id());
+			fixtures.push(table.clone());
 
 			// Stage 1 — generation and materialization, routed through the
 			// production compiler so this exercises PRODUCT-0137's terminal
@@ -486,10 +500,17 @@ mod tests {
 				"a materialize carries no presentation slots"
 			);
 			let started = Instant::now();
-			let outcome = adapter
-				.dispatch_rune(&materialize_view.source)
-				.await
-				.expect("materialize succeeds");
+			// Deliberately fatal, and deliberately not skipped: above 65,536
+			// rows this is TORON-0094's chained write path, and whether it
+			// materializes 200k and 1M is the behaviour under verification.
+			// Tolerating a failure here would hide exactly that answer.
+			let outcome = match adapter.dispatch_rune(&materialize_view.source).await {
+				Ok(outcome) => outcome,
+				Err(error) => panic!(
+					"materialize of {n} rows failed \
+					 (TORON-0094 chains writes above 65,536): {error:?}"
+				),
+			};
 			let materialize_ms = started.elapsed().as_secs_f64() * 1000.0;
 			let crate::adapters::common::RuneDispatchSuccess::Materialized(receipt) = outcome
 			else {
@@ -563,10 +584,20 @@ mod tests {
 				"{n},{materialize_ms:.1},{transfer_prepare_ms:.1},{first_render_ms:.1},{steady_render_ms:.1},{}",
 				receipt.rows_written
 			);
+		}
 
-			let _ = adapter
+		// All timings are complete; only now is it safe to reclaim. TORON-0093
+		// made drop completion durable and TORON-0095 made reclaim
+		// asynchronous, so a failure here is still worth seeing — but note that
+		// success means accepted, not reclaimed, and this exhibit cannot
+		// observe the latter.
+		for table in &fixtures {
+			if let ExecutionResult::Err(error) = adapter
 				.dispatch(&format!("DROP TABLE IF EXISTS {table}"))
-				.await;
+				.await
+			{
+				println!("# drop-after {table}: {error}");
+			}
 		}
 	}
 

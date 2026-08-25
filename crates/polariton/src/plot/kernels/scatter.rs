@@ -1079,6 +1079,206 @@ mod tests {
 		);
 	}
 
+	// PRODUCT-0138 replacement evidence. The withdrawn draft priced a mode
+	// switch using a figure measured on the other side of the switch. This
+	// matrix measures both paths at the same cardinalities and records what
+	// each one actually draws, so fidelity is observed rather than assumed.
+	#[test]
+	#[ignore = "render matrix evidence; minutes, and allocates a large frame"]
+	fn product_0138_scatter_render_matrix_evidence() {
+		use crate::plot::common::{PathBuilder, PlotRenderLayer, PlotWidget};
+		use iced::widget::canvas::{Stroke, Text};
+		use crate::plot::factory::create_authored_plot;
+		use std::time::Instant;
+
+		#[derive(Default)]
+		struct CountingPath {
+			circles: usize,
+		}
+		impl PathBuilder for CountingPath {
+			fn move_to(&mut self, _p: Point) {}
+			fn line_to(&mut self, _p: Point) {}
+			fn arc_to(&mut self, _c: Point, _r: f32, _s: f32, _e: f32) {}
+			fn circle(&mut self, _center: Point, _radius: f32) {
+				self.circles += 1;
+			}
+			fn rectangle(&mut self, _tl: Point, _size: iced::Size) {}
+			fn close(&mut self) {}
+		}
+
+		#[derive(Default)]
+		struct CountingBackend {
+			circles: usize,
+			images: usize,
+		}
+		impl PlotBackend for CountingBackend {
+			fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {
+				let mut p = CountingPath::default();
+				f(&mut p);
+				self.circles += p.circles;
+			}
+			fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {
+				let mut p = CountingPath::default();
+				f(&mut p);
+				self.circles += p.circles;
+			}
+			fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: Color) {}
+			fn fill_text_raw(&mut self, _text: Text) {}
+			fn supports_embedded_raster(&self) -> bool {
+				true
+			}
+			fn draw_image_rgba(
+				&mut self,
+				_top_left: Point,
+				_size: iced::Size,
+				_width: u32,
+				_height: u32,
+				_rgba: &[u8],
+			) {
+				self.images += 1;
+			}
+			fn draw_image_handle(
+				&mut self,
+				_top_left: Point,
+				_size: iced::Size,
+				_handle: &image::Handle,
+			) {
+				self.images += 1;
+			}
+			fn translate(&mut self, _t: iced::Vector) {}
+			fn rotate(&mut self, _angle: f32) {}
+			fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+				f(self);
+			}
+			fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+				f(self);
+			}
+		}
+
+		// Deterministic, dependency-free. Value distribution is not the
+		// variable under test; only cardinality and series count are.
+		fn frame(n: usize, series: usize) -> DataFrame {
+			let mut state: u64 = 0x2026_0825;
+			let mut next = || {
+				state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+				((state >> 11) as f64) / ((1u64 << 53) as f64)
+			};
+			let xs: Vec<f64> = (0..n).map(|_| next()).collect();
+			let ys: Vec<f64> = (0..n).map(|_| next()).collect();
+			if series <= 1 {
+				df!("x" => xs, "y" => ys).expect("frame")
+			} else {
+				let labels: Vec<String> =
+					(0..n).map(|i| format!("s{}", i % series)).collect();
+				df!("x" => xs, "y" => ys, "series" => labels).expect("frame")
+			}
+		}
+
+		// `vector_cap` models the *proposed* configuration: the auto arm must
+		// be auto-under-the-new-threshold, or it resolves to Vector across the
+		// whole band and the comparison is vacuous.
+		fn measure(
+			n: usize,
+			series: usize,
+			mode: ScatterRenderMode,
+			vector_cap: u32,
+			bounds_px: (f32, f32),
+		) -> (f64, f64, usize, usize) {
+			let composition = PlotComposition::single(PlotType::Scatter);
+			let spec = if series <= 1 {
+				AuthoredPlotSpec::xy(composition, "x", "y")
+			} else {
+				AuthoredPlotSpec::xy_color(composition, "x", "y", Some("series".to_owned()))
+			};
+			let df = frame(n, series);
+			// Preparation is timed separately: rasterization builds its image
+			// here, not in render, so a render-only figure makes raster look
+			// free.
+			let prepare_started = Instant::now();
+			let kernel = create_authored_plot(spec, &df, bounds_px.0 as u32, bounds_px.1 as u32)
+				.expect("kernel");
+			let prepare_ms = prepare_started.elapsed().as_secs_f64() * 1000.0;
+			// The kernel resolves its mode from `settings_model`, not from the
+			// widget's `ResolvedPlotSettings`: `plot_with_settings` calls
+			// `settings.resolve_for_layer(..)` on the model. Setting the cap
+			// anywhere else silently leaves every arm on the default path —
+			// which is how an earlier revision of this exhibit produced three
+			// identical arms.
+			let settings = ResolvedPlotSettings {
+				scatter_render_mode: mode,
+				scatter_max_vector_points: vector_cap,
+				..ResolvedPlotSettings::default()
+			};
+			let mut settings_model = crate::plot::theme::PlotSettings::default();
+			settings_model.library_defaults.scatter_render_mode = mode;
+			settings_model.library_defaults.scatter_max_vector_points = vector_cap;
+			let widget = PlotWidget {
+				kernel: kernel.as_ref(),
+				title: String::new(),
+				padding: 0.0,
+				settings,
+				settings_model,
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: PlotRenderLayer::Full,
+			};
+			let rect = Rectangle::new([0.0, 0.0].into(), [bounds_px.0, bounds_px.1].into());
+			// Latency from the real drawing backend; the counting backend does
+			// no drawing and under-measures it by about two orders of
+			// magnitude. Fidelity from the counting pass. Never both from one.
+			let mut times = Vec::new();
+			for _ in 0..5 {
+				let mut backend = crate::plot::export::SvgBackend::new(bounds_px.0, bounds_px.1);
+				let started = Instant::now();
+				widget.render(&mut backend, rect);
+				times.push(started.elapsed().as_secs_f64() * 1000.0);
+				let _ = backend.finish();
+			}
+			times.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+			let mut counter = CountingBackend::default();
+			widget.render(&mut counter, rect);
+			(prepare_ms, times[times.len() / 2], counter.circles, counter.images)
+		}
+
+		let viewport = (1200.0_f32, 720.0_f32);
+		const PRESENT_CAP: u32 = 50_000;
+		const PROPOSED_CAP: u32 = 20_000;
+		println!("\npoints,series,arm,prepare_ms,render_ms,circles,images");
+
+		// Chrome baseline: whatever a 10-point plot draws beyond its 10 points
+		// is axes, legend swatches, and decoration. Reported, never silently
+		// subtracted.
+		for series in [1_usize, 4, 8] {
+			let (p, r, c, i) =
+				measure(10, series, ScatterRenderMode::Auto, PRESENT_CAP, viewport);
+			println!("10,{series},chrome-baseline,{p:.1},{r:.1},{c},{i}");
+		}
+
+		// The control is the present behaviour in this band, which is Vector.
+		// The comparison arm is auto under the *proposed* cap, which is what
+		// the record would actually cause.
+		for n in [20_001_usize, 25_000, 30_000, 40_000, 50_000] {
+			for series in [1_usize, 4, 8] {
+				for (label, mode, cap) in [
+					("forced-vector", ScatterRenderMode::Vector, PRESENT_CAP),
+					("auto-present-50k", ScatterRenderMode::Auto, PRESENT_CAP),
+					("auto-proposed-20k", ScatterRenderMode::Auto, PROPOSED_CAP),
+				] {
+					let (p, r, c, i) = measure(n, series, mode, cap, viewport);
+					println!("{n},{series},{label},{p:.1},{r:.1},{c},{i}");
+				}
+			}
+		}
+
+		// Raster needs total_points > raster_threshold AND > pixel_budget * 8.
+		// At 1200x720 the second gate is 6,912,000 — so 1,000,001 downsamples
+		// here, which is the second reason raster had never been reached.
+		for n in [1_000_001_usize, 7_000_000] {
+			let (p, r, c, i) = measure(n, 1, ScatterRenderMode::Auto, PRESENT_CAP, viewport);
+			println!("{n},1,auto,{p:.1},{r:.1},{c},{i}");
+		}
+	}
+
 	#[test]
 	fn automatic_render_mode_preserves_every_threshold_boundary() {
 		let settings = ResolvedPlotSettings::default();

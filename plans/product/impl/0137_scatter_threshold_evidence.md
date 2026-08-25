@@ -165,7 +165,7 @@ rows**. That is the product-wide ceiling today, not a plotting concern:
 | smallest scatter threshold | 50,000 | ~1.8 min |
 | downsample threshold | 200,000 | ~7.2 min |
 | raster threshold | 1,000,000 | ~36 min |
-| README claim | 10,000,000 | ~6 h |
+| 10,000,000 rows (see correction below) | 10,000,000 | ~6 h |
 
 The scatter thresholds remain unmeasured and untuned. Rendering has still
 never been reached at any threshold cardinality.
@@ -201,6 +201,272 @@ The ceiling is therefore ~29,000 rows at the 60 s statement timeout, and a
 50,000-point read still cannot complete. Thresholds remain unmeasured and
 untuned.
 
+## Third rerun — 2026-08-24, after TORON-0093 and TORON-0094
+
+**The scan blocker is gone and rendering was reached for the first time.**
+Every earlier run in this document failed before rendering at any threshold
+cardinality. Measured on binary `0b8d76d5…` at engine commit `ef27685c7`,
+verified as the running `nilket toron` process before the run rather than
+merely installed.
+
+| points | materialize | transfer + prepare | first render | steady render |
+|---|---|---|---|---|
+| 49,999 | 865.8 ms | 656.9 ms | 260.8 ms | 256.6 ms |
+| 50,000 | 791.7 ms | 635.1 ms | 255.8 ms | 256.1 ms |
+
+Reads run at roughly **76,000 rows/s**, against ~481 rows/s on 2026-08-21.
+
+### Build basis, which is not the obvious one
+
+`cargo test --release` **cannot compile this workspace**:
+`iced_core-0.14.0/src/renderer.rs:2` gates the null renderer behind
+`#[cfg(debug_assertions)]`, and polariton's widget tests construct
+`iced::Element<'static, _, _, ()>`. Optimized measurement therefore requires
+assertions left on, which is why the `evidence` and `evidence-calibration`
+profiles exist. Neither is a shipping-binary benchmark: `debug-assertions` and
+`panic = "unwind"` are forced by the renderer and the test harness. They
+calibrate shipping-grade *codegen*, not the shipping binary.
+
+### Verdict: `scatter_max_vector_points = 50_000` is too high
+
+At exactly the threshold a steady vector re-render costs **~256 ms** — roughly
+4 frames per second, excluding the 635 ms transfer. 50,000 is the value chosen
+as the *maximum* at which vector rendering is still acceptable, and it meets no
+interactive budget.
+
+A replacement value is not proposed from these two points alone. The curve
+below 65,536 was measured separately and is linear at ~5.09 µs/point; on that
+basis 20,000 (~103 ms) is the defensible replacement, and 6,000 (~33 ms) would
+be required if ADR 0133 stages 3–4 introduce continuous drag-to-zoom. Changing
+the constant is a PRODUCT record decision, not one this document makes.
+
+### Tuning the threshold does not improve time-to-first-plot
+
+Transfer costs ~12.7 µs/point here, about 2.5× the render cost.
+`scatter_max_vector_points` governs re-render smoothness only; the dominant
+term in getting a plot on screen is the read, and that lever is not in the
+plotting layer.
+
+## Fourth rerun — TORON-0094 fixed; every threshold cardinality reached
+
+**Chained writes work.** `c92833aff` clears the rejection below, and for the
+first time in this document all six threshold cardinalities materialize, read,
+and render. Binary `42608211…`, verified as the running `nilket toron` process.
+
+| points | materialize | transfer + prepare | steady render | µs/point |
+|---|---|---|---|---|
+| 49,999 | 970 ms | 666 ms | 272.3 ms | 5.45 |
+| 50,000 | 1,177 ms | 647 ms | 271.1 ms | 5.42 |
+| 199,999 | 3,630 ms | 2,580 ms | 655.2 ms | 3.28 |
+| 200,000 | 4,460 ms | 2,567 ms | 658.6 ms | 3.29 |
+| 999,999 | 27,720 ms | 13,483 ms | 1,624.0 ms | 1.62 |
+| 1,000,000 | 33,141 ms | 13,344 ms | 1,606.9 ms | 1.61 |
+
+**Profile caveat:** taken under `evidence` (thin LTO), which measured ~7%
+slower than fat-LTO codegen on the 50,000 case. These are conservative bounds;
+a calibration-grade rerun is outstanding before any threshold constant moves.
+
+Transfer holds **~74,000–77,000 rows/s across a 20× range**, so chaining costs
+nothing on the read side. Write throughput falls with size — ~52,000 rows/s at
+199,999 against ~30,000 rows/s at 1,000,000 — which is the chained path's own
+scaling and is not a plotting concern.
+
+### The downsample threshold does not bound render cost
+
+This was tested by prediction and the prediction failed. If
+`scatter_downsample_target = 200_000` bounded cost, a 1,000,000-point render
+should cost about what a 200,000-point render costs (~658 ms). It costs
+**1,624 ms**, 2.5× that.
+
+Cost per point falls monotonically — 5.09 µs vector, 3.28 µs at 200k, 1.62 µs
+at 1M — but never flattens. That is the signature of an O(n) selection pass
+over every point followed by drawing the survivors: **the threshold reduces the
+draw, not the scan.** A million-point plot costs ~1.6 s to re-render regardless
+of what the target is set to.
+
+Consequence: lowering `scatter_downsample_target` cannot make large plots
+interactive. Bounding that cost requires not visiting every point — a different
+mechanism from choosing how many to draw.
+
+### The raster threshold is still unmeasured, and the exhibit cannot reach it
+
+The comparisons are `<=` (`plot/kernels/scatter.rs:586`), so a threshold
+engages strictly *above* its value. `CARDINALITIES` tops out **at** 1,000,000,
+so the raster path is never exercised: 999,999 and 1,000,000 render identically
+(1,624.0 ms and 1,606.9 ms), both on the downsample path.
+
+The list's own comment claims "just below, at, and above each scatter
+boundary," which holds for the vector threshold and the downsample threshold
+but not the top one. Reaching raster needs a cardinality above 1,000,000. This
+was invisible until now because no run had ever got this far.
+
+### Fifth rerun — TORON-0095 clears the cleanup timeouts
+
+On binary `89c00b4a…` (commit `95574557e`) all six cardinalities complete with
+**zero cleanup failures**, where the previous engine failed five of six.
+
+| points | materialize | transfer + prepare | steady render |
+|---|---|---|---|
+| 49,999 | 992 ms | 647 ms | 273.1 ms |
+| 50,000 | 1,232 ms | 659 ms | 275.6 ms |
+| 199,999 | 4,389 ms | 2,589 ms | 639.9 ms |
+| 200,000 | 4,294 ms | 2,567 ms | 650.0 ms |
+| 999,999 | 29,921 ms | 13,203 ms | 1,614.1 ms |
+| 1,000,000 | 32,418 ms | 13,278 ms | 1,597.4 ms |
+
+Render and transfer are unchanged from the fourth rerun, so asynchronous
+reclaim does not perturb the measurements. Total run time fell from **478.9 s
+to 137.0 s** — the ~342 s difference matches the five 60 s timeouts the
+previous run was paying, confirming those were real wall-clock stalls rather
+than merely reported errors.
+
+**What this run does not show.** 0095 makes reclaim asynchronous, so a
+successful `DROP` now means *accepted*, not *reclaimed*. The exhibit therefore
+lost a capability it had this morning: it can no longer detect a failed
+reclaim, because the failure would happen after the response. Storage
+occupancy, not the drop's return value, is the only viz-side signal left.
+
+### Superseded regression: `DROP TABLE` exceeds the statement timeout
+
+**Five of six cleanups failed**, each with
+`Toron StatementTimeout: statement timeout exceeded` — at 49,999, 199,999,
+200,000, 999,999, and 1,000,000. Only 50,000 succeeded. The previous engine
+(`0b8d76d5…`) produced zero drop errors on the same workload.
+
+This is a typed timeout, not a recurrence of the 0093 catalog wedge. Notably it
+does **not** track table size: 49,999 failed while 50,000 succeeded, and both
+ends of a 20× size range failed alike, which argues against a per-row cost.
+Visible only because the exhibit reports cleanup failures instead of discarding
+them.
+
+## Superseded — TORON-0094 acceptance: chained writes were rejected
+
+**The 200,000 and 1,000,000 thresholds remain unmeasurable**, now for a
+different reason than before. The 64Ki admission cap no longer refuses them —
+TORON-0094 chains writes above it — but the first chained write fails:
+
+```
+materialize of 199999 rows failed (TORON-0094 chains writes above 65,536):
+RuneDispatchFailure { kind: Execution,
+  message: "invalid PBC program for descriptor", span: None }
+```
+
+199,999 rows of two `Float64` columns plans to four chunks
+(65,536 × 3 + 3,391), well inside the 5 MiB section bound. `exceeds maximum
+65536` is gone, so admission passed and the rejection came from the receiver,
+past planning.
+
+**Corrected by the db team's diagnosis:** the *first* chunk commits. The
+descriptor fallback for a provisional CTAS object was gated on write-id
+equality with the saga's `row_write_id`, which admits chunk 0 alone; the
+**second** frame — the first derived id — was rejected with
+`PBC_REJECT_SCHEMA_UNKNOWN`. The statement fails on its first chained attempt,
+which is what this slice observed, but the failing frame is the second.
+
+This is recorded as the current 0094 acceptance state, not as a discarded run.
+The exhibit is deliberately fatal here rather than skipping the cardinality, so
+the failure is visible in the run itself. Handed off in
+`nilket/crates/toron/plans/wip/claude_iter_6_0094_chained_write_rejected.md`,
+with two asks: that `PbcRejectCode` survive into the public error — Toron
+flattens `TableWriteRejected` to a fixed string at `error.rs:136`, discarding
+which of ~30 causes fired — and that a live 199,999-row regression exist, since
+the current coverage exercises the planner in-process and cannot catch a
+wire-side rejection.
+
+**Excluded hypothesis:** the `u16` row-count sentinel. Every chained write
+necessarily contains at least one chunk of exactly 65,536 rows, which ADR 0094
+§2 flags as the sentinel case, but `encode_table_write_row_count` /
+`decode_table_write_row_count` (`wendelon/src/schema/table.rs:551-575`)
+round-trip it correctly. Recorded so it is not re-investigated.
+
+## TORON-0093 confirmed from this side
+
+The 2026-08-23 defect — a half-completed `DROP` leaving a local descriptor with
+no finalized Wendelon marker, after which `materialize` issued a certificate
+for a table that could not be read back — did not recur. The exhibit now
+reports every cleanup failure instead of discarding it, and the run produced
+**zero** drop errors.
+
+## Render matrix — 2026-08-25, the measurement PRODUCT-0138 was withdrawn for
+
+The withdrawn ADR 0138 claimed that lowering `scatter_max_vector_points` to
+20,000 would trade per-point fidelity for a re-render falling from ~255 ms to
+~103 ms. **Both halves were wrong**, and this section is the measurement that
+replaces the claim.
+
+The error was structural: 102.8 ms was the **vector** cost at 20,000 points,
+quoted as though it were the **downsampled** cost of a 20,001-point plot. Two
+different code paths. `plot/kernels/scatter.rs:586` routes above-threshold work
+to `Downsampled`; `:287` sets `per_series_target = scatter_downsample_target /
+series_count`; and `downsample_series` allocates a ~target-cell grid while
+scanning every point. Against 200,000 cells, a plot of 20,001..=50,000 points
+keeps most of them.
+
+Measured with a pure-render exhibit —
+`product_0138_scatter_render_matrix_evidence` in `plot/kernels/scatter.rs`,
+no engine required. Latency comes from `SvgBackend`; surviving-point counts
+come from a separate counting backend that tallies `PathBuilder::circle`
+inside `fill_path`/`stroke_path` and `draw_image_*` separately, so the resolved
+path is **observed rather than assumed**. Median of five renders, 1200×720.
+
+### The band: the proposed change is an unfavourable trade throughout
+
+Single series; `auto-present-50k` reproduced `forced-vector` exactly at every
+cell, which is the harness self-check.
+
+| points | vector | proposed 20k | latency saved | points retained |
+|---|---|---|---|---|
+| 20,001 | 112.7 ms | 107.4 ms | 4.7% | 93.0% |
+| 25,000 | 135.3 ms | 129.8 ms | 4.1% | 91.4% |
+| 30,000 | 159.6 ms | 150.3 ms | 5.8% | 90.0% |
+| 40,000 | 216.5 ms | 195.3 ms | 9.8% | 87.0% |
+| 50,000 | 268.6 ms | 235.9 ms | 12.2% | 84.4% |
+
+**At every cardinality in the band the fidelity surrendered exceeds the latency
+gained**, and the gap never closes. Lowering the threshold to 20,000 discards
+7–16% of points to recover 4–12% of render time.
+
+Series count is immaterial here — 18,604 / 18,667 / 18,623 survivors at 1, 4,
+and 8 series — because `per_series_target` divides 200,000 by the series count
+while the total cell budget stays fixed.
+
+**Consequence: `scatter_max_vector_points` is not independently meaningful.**
+In this band the surviving-point count is governed by
+`scatter_downsample_target`, not by the threshold that selects the path. Any
+record proposing a threshold change must decide both together.
+
+### Above the band: rasterization is the real lever
+
+| case | prepare | render | survivors | mode |
+|---|---|---|---|---|
+| 1,000,001 | 99.3 ms | 879.6 ms | 139,542 (14.0%) | downsampled |
+| 7,000,000 | 692.4 ms | 7.9 ms | 0 circles, 1 image | rasterized |
+
+Re-render falls **~110×** across that boundary, because rasterization moves the
+cost into preparation — paid once, not per frame. Nothing available inside the
+vector/downsample bands approaches it.
+
+### Why raster had never been exercised
+
+`resolve_render_mode` requires **both** `total_points > scatter_raster_threshold`
+**and** `total_points > pixel_budget * 8`. At 1200×720 the pixel budget is
+864,000, so the second gate demands **more than 6,912,000 points**.
+
+`1_000_001` therefore downsamples at this viewport; it does not rasterize. That
+is the second reason raster had never been reached, independent of every run
+having stopped at 1,000,000. The unit test that shows `Rasterized` uses a
+100×100 viewport, where the same gate sits at 80,000.
+
+## Correction: the "README claim" attribution was wrong
+
+Earlier revisions of this document listed a "README claim" of 10,000,000 rows
+in their projection tables. **There is no such claim in the README.** The only
+occurrence in product prose is ADR 0135's aside — "an engine that answers
+10M-row queries" — which concerns reads, not materialization, and is rhetorical
+framing for why cancellation matters. The row is retained above with its
+attribution struck, since the projection itself was used in reasoning at the
+time.
+
 ## Recommended next steps
 
 1. ~~**db team:** configure QUIC liveness~~ — **done**, TORON-0577.
@@ -211,6 +477,27 @@ untuned.
    is profiling the Wendelon table-query path — per-location materialization
    and PBC — plus a separate explanation of the post-0088 small-result fixed
    latency before any benchmark on this path is treated as stable.
-4. **viz team:** rerun `live_scatter_threshold_evidence` once reads clear
-   50,000 rows in reasonable time, and only then record threshold verdicts.
-5. **Do not tune the scatter thresholds** until step 4 produces numbers.
+4. ~~**viz team:** rerun once reads clear 50,000 rows~~ — **done**, third
+   rerun above. Reads run at ~76,000 rows/s and rendering was reached.
+5. ~~**db team:** TORON-0094's chained write is rejected~~ — **fixed**,
+   `c92833aff`. All six cardinalities now complete.
+6. **db team:** `DROP TABLE` exceeds the 60 s statement timeout on five of six
+   tables, new in `42608211…`. Size-independent, so not a per-row cost.
+7. ~~**viz team:** `scatter_max_vector_points` should fall to 20,000~~ —
+   **retracted.** The render matrix shows that change discards 7–16% of points
+   to recover 4–12% of render time, an unfavourable trade at every cardinality
+   in the band. ADR 0138 was withdrawn before acceptance for this reason. Any
+   replacement must decide `scatter_max_vector_points` and
+   `scatter_downsample_target` **together**; the threshold alone selects a path
+   without governing what that path retains. The larger lever is
+   rasterization, which cuts re-render ~110x but is gated behind
+   `pixel_budget * 8`.
+8. **viz team:** rerun under `evidence-calibration` before any constant moves —
+   the fourth-rerun figures are `evidence`-grade and ~7% conservative.
+9. **viz team:** add a cardinality above 1,000,000. The raster threshold has
+   never been exercised, because `CARDINALITIES` stops at its exact value and
+   the comparisons are `<=`.
+10. **Open question, not a tuning task:** the downsample threshold reduces the
+    draw but not the O(n) scan, so no value of `scatter_downsample_target`
+    makes a million-point plot interactive. Bounding that needs a mechanism
+    that does not visit every point.
