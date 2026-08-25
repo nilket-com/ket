@@ -960,6 +960,81 @@ pub fn prepare_scatter_data(
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::plot::common::PathBuilder;
+	use iced::widget::canvas::{Stroke, Text};
+
+	// Shared measurement instrument: counts what actually reached the
+	// backend, so a render path is observed rather than inferred.
+	#[derive(Default)]
+	struct CountingPath {
+		circles: usize,
+	}
+	impl PathBuilder for CountingPath {
+		fn move_to(&mut self, _p: Point) {}
+		fn line_to(&mut self, _p: Point) {}
+		fn arc_to(&mut self, _c: Point, _r: f32, _s: f32, _e: f32) {}
+		fn circle(&mut self, _center: Point, _radius: f32) {
+			self.circles += 1;
+		}
+		fn rectangle(&mut self, _tl: Point, _size: iced::Size) {}
+		fn close(&mut self) {}
+	}
+
+	#[derive(Default)]
+	struct CountingBackend {
+		circles: usize,
+		images: usize,
+		/// The rasterized image's size is the inner plot area — the same
+		/// bounds `resolve_render_mode` divides for its pixel budget, read
+		/// from the rasterizer's own output rather than reconstructed.
+		image_size: Option<(f32, f32)>,
+	}
+	impl PlotBackend for CountingBackend {
+		fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {
+			let mut p = CountingPath::default();
+			f(&mut p);
+			self.circles += p.circles;
+		}
+		fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {
+			let mut p = CountingPath::default();
+			f(&mut p);
+			self.circles += p.circles;
+		}
+		fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: Color) {}
+		fn fill_text_raw(&mut self, _text: Text) {}
+		fn supports_embedded_raster(&self) -> bool {
+			true
+		}
+		fn draw_image_rgba(
+			&mut self,
+			_top_left: Point,
+			size: iced::Size,
+			_width: u32,
+			_height: u32,
+			_rgba: &[u8],
+		) {
+			self.images += 1;
+			self.image_size = Some((size.width, size.height));
+		}
+		fn draw_image_handle(
+			&mut self,
+			_top_left: Point,
+			size: iced::Size,
+			_handle: &image::Handle,
+		) {
+			self.images += 1;
+			self.image_size = Some((size.width, size.height));
+		}
+		fn translate(&mut self, _t: iced::Vector) {}
+		fn rotate(&mut self, _angle: f32) {}
+		fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+		fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
+			f(self);
+		}
+	}
+
 	use crate::plot::composition::PlotComposition;
 	use crate::plot::core::PlotType;
 	use crate::plot::spec::{
@@ -1086,74 +1161,9 @@ mod tests {
 	#[test]
 	#[ignore = "render matrix evidence; minutes, and allocates a large frame"]
 	fn product_0138_scatter_render_matrix_evidence() {
-		use crate::plot::common::{PathBuilder, PlotRenderLayer, PlotWidget};
-		use iced::widget::canvas::{Stroke, Text};
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
 		use crate::plot::factory::create_authored_plot;
 		use std::time::Instant;
-
-		#[derive(Default)]
-		struct CountingPath {
-			circles: usize,
-		}
-		impl PathBuilder for CountingPath {
-			fn move_to(&mut self, _p: Point) {}
-			fn line_to(&mut self, _p: Point) {}
-			fn arc_to(&mut self, _c: Point, _r: f32, _s: f32, _e: f32) {}
-			fn circle(&mut self, _center: Point, _radius: f32) {
-				self.circles += 1;
-			}
-			fn rectangle(&mut self, _tl: Point, _size: iced::Size) {}
-			fn close(&mut self) {}
-		}
-
-		#[derive(Default)]
-		struct CountingBackend {
-			circles: usize,
-			images: usize,
-		}
-		impl PlotBackend for CountingBackend {
-			fn stroke_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _stroke: Stroke) {
-				let mut p = CountingPath::default();
-				f(&mut p);
-				self.circles += p.circles;
-			}
-			fn fill_path(&mut self, f: &dyn Fn(&mut dyn PathBuilder), _color: Color) {
-				let mut p = CountingPath::default();
-				f(&mut p);
-				self.circles += p.circles;
-			}
-			fn fill_rectangle(&mut self, _tl: Point, _size: iced::Size, _color: Color) {}
-			fn fill_text_raw(&mut self, _text: Text) {}
-			fn supports_embedded_raster(&self) -> bool {
-				true
-			}
-			fn draw_image_rgba(
-				&mut self,
-				_top_left: Point,
-				_size: iced::Size,
-				_width: u32,
-				_height: u32,
-				_rgba: &[u8],
-			) {
-				self.images += 1;
-			}
-			fn draw_image_handle(
-				&mut self,
-				_top_left: Point,
-				_size: iced::Size,
-				_handle: &image::Handle,
-			) {
-				self.images += 1;
-			}
-			fn translate(&mut self, _t: iced::Vector) {}
-			fn rotate(&mut self, _angle: f32) {}
-			fn with_save(&mut self, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
-				f(self);
-			}
-			fn with_clip(&mut self, _bounds: Rectangle, f: &mut dyn FnMut(&mut dyn PlotBackend)) {
-				f(self);
-			}
-		}
 
 		// Deterministic, dependency-free. Value distribution is not the
 		// variable under test; only cardinality and series count are.
@@ -1277,6 +1287,130 @@ mod tests {
 			let (p, r, c, i) = measure(n, 1, ScatterRenderMode::Auto, PRESENT_CAP, viewport);
 			println!("{n},1,auto,{p:.1},{r:.1},{c},{i}");
 		}
+	}
+
+	// PRODUCT-0138 follow-on: raster policy evidence. The render matrix
+	// reported a 7.9 ms raster render, which was a *cache hit* — rasterization
+	// happens on first render, not in preparation, so a median-of-five hides
+	// the cost that a pixel-density gate would actually be trading on.
+	// `ScatterRasterKey` includes x_range and y_range, so zoom and pan
+	// invalidate the cache every frame.
+	// PRODUCT-0138 follow-on: raster policy evidence.
+	//
+	// Two corrections to the previous revision are load-bearing. The domain
+	// reaches the raster key through `PlotWidget.settings` — `layout()` is
+	// called with it — while the *render mode* resolves from `settings_model`.
+	// Editing the model's library defaults moved the mode and never the key,
+	// so an earlier revision's "invalidated" column was measuring cache hits.
+	// And the pixel budget divides the **inner plot area**, not the widget
+	// rect, so the gate sits below `width * height * 8`.
+	#[test]
+	#[ignore = "raster policy evidence; allocates multi-million-point frames"]
+	fn product_0138_raster_cache_and_gate_evidence() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		use crate::plot::export::SvgBackend;
+		use crate::plot::factory::create_authored_plot;
+		use std::time::Instant;
+
+		fn frame(n: usize) -> DataFrame {
+			let mut state: u64 = 0x2026_0825;
+			let mut next = || {
+				state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+				((state >> 11) as f64) / ((1u64 << 53) as f64)
+			};
+			let xs: Vec<f64> = (0..n).map(|_| next()).collect();
+			let ys: Vec<f64> = (0..n).map(|_| next()).collect();
+			df!("x" => xs, "y" => ys).expect("frame")
+		}
+
+		fn domain(x_min: f64, x_max: f64) -> ResolvedPlotSettings {
+			ResolvedPlotSettings {
+				x_min: Some(x_min),
+				x_max: Some(x_max),
+				..ResolvedPlotSettings::default()
+			}
+		}
+
+		fn x_range_bits(layout: &PlotLayout) -> (u64, u64) {
+			match layout {
+				PlotLayout::Cartesian { x_range, .. } => (x_range.0.to_bits(), x_range.1.to_bits()),
+				_ => (0, 0),
+			}
+		}
+
+		let (w, h) = (1200.0_f32, 720.0_f32);
+		let rect = Rectangle::new([0.0, 0.0].into(), [w, h].into());
+		let df = frame(7_000_000);
+		let kernel = create_authored_plot(
+			AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+			&df,
+			w as u32,
+			h as u32,
+		)
+		.expect("kernel");
+
+		// Proof before timing: the key input must actually move. These are the
+		// exact bits `ScatterRasterKey.x_range` is built from.
+		let base = x_range_bits(&kernel.layout(domain(0.0, 1.0)));
+		let panned = x_range_bits(&kernel.layout(domain(0.10, 1.10)));
+		let zoomed = x_range_bits(&kernel.layout(domain(0.25, 0.75)));
+		assert_ne!(base, panned, "a pan must move the raster key");
+		assert_ne!(base, zoomed, "a zoom must move the raster key");
+		println!("\nkey_moves_on_pan={} key_moves_on_zoom={}", base != panned, base != zoomed);
+
+		let render = |settings: ResolvedPlotSettings, backend: &mut dyn PlotBackend| {
+			let widget = PlotWidget {
+				kernel: kernel.as_ref(),
+				title: String::new(),
+				padding: 0.0,
+				settings,
+				settings_model: crate::plot::theme::PlotSettings::default(),
+				render_revision: 0,
+				resize_render_suspended: false,
+				layer: PlotRenderLayer::Full,
+			};
+			widget.render(backend, rect);
+		};
+
+		let time = |settings: ResolvedPlotSettings| {
+			let mut b = SvgBackend::new(w, h);
+			let started = Instant::now();
+			render(settings, &mut b);
+			let ms = started.elapsed().as_secs_f64() * 1000.0;
+			let _ = b.finish();
+			ms
+		};
+
+		// Cache miss: nothing rasterized yet for this domain.
+		let miss_ms = time(domain(0.0, 1.0));
+		// Cache hits: identical domain, so the key matches.
+		let mut hits: Vec<f64> = (0..5).map(|_| time(domain(0.0, 1.0))).collect();
+		hits.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+		// A real gesture: the domain moves every frame, as a drag would move it.
+		let mut pans: Vec<f64> = (1..=5)
+			.map(|i| {
+				let shift = i as f64 * 0.01;
+				time(domain(shift, 1.0 + shift))
+			})
+			.collect();
+		pans.sort_by(|a, b| a.partial_cmp(b).expect("finite"));
+
+		let mut counter = CountingBackend::default();
+		render(domain(0.0, 1.0), &mut counter);
+		let (iw, ih) = counter.image_size.unwrap_or((0.0, 0.0));
+		let inner_budget = (iw as usize) * (ih as usize);
+
+		println!("widget_px={}x{} inner_plot_px={iw}x{ih}", w, h);
+		println!(
+			"naive_gate={} actual_gate={}",
+			(w as usize) * (h as usize) * 8,
+			inner_budget * 8
+		);
+		println!("\nscenario,ms");
+		println!("first_render_cache_miss,{miss_ms:.1}");
+		println!("steady_same_domain_hit,{:.1}", hits[hits.len() / 2]);
+		println!("pan_domain_moves_each_frame,{:.1}", pans[pans.len() / 2]);
+		println!("circles={} images={}", counter.circles, counter.images);
 	}
 
 	#[test]

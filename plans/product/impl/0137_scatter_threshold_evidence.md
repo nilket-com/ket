@@ -457,6 +457,59 @@ is the second reason raster had never been reached, independent of every run
 having stopped at 1,000,000. The unit test that shows `Rasterized` uses a
 100×100 viewport, where the same gate sits at 80,000.
 
+## Raster policy — 2026-08-25, and a correction to the section above
+
+The render-matrix section reports a 7.9 ms raster render and calls
+rasterization "the real lever", with cost "paid once, not per frame."
+**That conclusion is withdrawn.** The 7.9 ms was a cache *hit*, and the claim
+only holds for a viewport that never moves.
+
+`ScatterRasterKey` is `{ width, height, point_size, x_range, y_range,
+background, series_colors }` (`plot/kernels/scatter.rs:46`), and its ranges come
+from the resolved transform via `current_x_range_bits`. **A pan or a zoom moves
+`x_range`, so it invalidates the cache.** Measured by
+`product_0138_raster_cache_and_gate_evidence`, which asserts the key actually
+moves before timing anything:
+
+| scenario | median |
+|---|---|
+| first render, cold cache | 5,538.7 ms |
+| steady state, domain unchanged | **8.5 ms** |
+| pan, domain moves every frame | **5,361.4 ms** |
+
+A gesture frame costs what a cold miss costs. Against the 879.6 ms a
+1,000,001-point downsampled render takes, rasterization under interaction is
+roughly **six times worse**, not 110× better.
+
+**Raster is therefore a static-viewport optimisation.** Any policy that widens
+it must be conditioned on whether the viewport is moving; a pixel-density gate
+alone would push large plots into a mode costing ~5.4 s per gesture frame.
+
+### The gate is not where the widget rect suggests
+
+`resolve_render_mode` divides the **inner plot area**, not the widget rect. The
+rasterizer's own output reports that area as 1075×605 at a 1200×720 widget:
+
+| | pixels | gate (`× 8`) |
+|---|---|---|
+| widget rect | 1200 × 720 = 864,000 | 6,912,000 |
+| inner plot area | 1075 × 605 = 650,375 | **5,203,000** |
+
+The earlier section's 6,912,000 is wrong by 25%, which is why a 6,900,000-point
+frame rasterized when that figure predicted it would not. Chrome — axes, labels,
+padding — shrinks the budget, so the gate moves with title and label
+configuration rather than being a property of the window.
+
+### Method note
+
+Both corrections trace to the same cause: two different structs feed two
+different decisions. The render **mode** resolves from `settings_model`
+(`plot_with_settings` → `resolve_for_layer`), while the **domain** reaches the
+raster key through `PlotWidget.settings`, which `layout()` consumes. An earlier
+revision set domains on the model, moved nothing, and timed cache hits while
+labelling them invalidations. The exhibit now asserts the key changes before
+reporting any timing.
+
 ## Correction: the "README claim" attribution was wrong
 
 Earlier revisions of this document listed a "README claim" of 10,000,000 rows
