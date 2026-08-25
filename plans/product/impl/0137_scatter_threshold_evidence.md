@@ -481,9 +481,25 @@ A gesture frame costs what a cold miss costs. Against the 879.6 ms a
 1,000,001-point downsampled render takes, rasterization under interaction is
 roughly **six times worse**, not 110× better.
 
-**Raster is therefore a static-viewport optimisation.** Any policy that widens
-it must be conditioned on whether the viewport is moving; a pixel-density gate
-alone would push large plots into a mode costing ~5.4 s per gesture frame.
+**This is a cache-design cost, not a property of rasterization.** Scaling or
+translating a bitmap is cheap — that is much of the point of a raster path. But
+`rasterize` responds to any key mismatch by calling `build_raster_rgba` over
+`prepared_data`, a full re-scan of every source point. Nothing blits the cached
+image at an offset for a pan, and nothing rescales it for a zoom; the cache is
+all-or-nothing on an exact key match, so a one-pixel drag discards a 5.5 s
+bitmap and rebuilds it from 7M points.
+
+So the honest statement is narrower than "raster suits only static viewports":
+**as implemented, the raster path has no viewport-transform reuse, and that is
+what makes a gesture cost a full rebuild.** The gap is closable — blit-on-pan,
+rescale-on-zoom, with a re-rasterize behind it — and doing so would carry its
+own fidelity cost, since a magnified bitmap loses resolution and a pan exposes
+an uncovered strip. That is a design space, not a wall.
+
+Any policy that widens raster must therefore say what happens to a moving
+viewport. Under today's cache a pixel-density gate alone would push large plots
+into a mode costing ~5.4 s per gesture frame; with transform reuse the same
+gate could be the right answer.
 
 ### The gate is not where the widget rect suggests
 
