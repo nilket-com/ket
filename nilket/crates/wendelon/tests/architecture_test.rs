@@ -8969,6 +8969,11 @@ fn adr077_data_server_source_concatenates_submodules() {
 			"query_clocks.rs",
 			"query_encode.rs",
 			"replica_routing.rs",
+			// ADR 0089's per-request scan accounting: the decode audit that makes
+			// read amortization checkable, the bounded cache that produces it, and
+			// the sampled phase trace that attributes what the amortization left
+			// behind. One question — what did this scan do — so one module.
+			"scan_accounting.rs",
 			"streaming.rs",
 			"table_query.rs",
 			"write_clocks.rs",

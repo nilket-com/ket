@@ -199,6 +199,11 @@ mod counter;
 mod replica_routing;
 use replica_routing::serving_replicas_for_placement;
 pub use replica_routing::{ReplicaRouter, StaticReplicaRouter};
+mod scan_accounting;
+use scan_accounting::{
+	DecodedRecordCache, PostPackingScanPhaseTrace,
+	QUERY_REQUEST_FLAG_SAMPLED_POST_PACKING_PHASE_TRACE, ScanDecodeAudit, ScanPhase,
+};
 mod table_query;
 use table_query::{QueryProjectedExecution, RowGroupFetchAuditCounters};
 mod write_replication;
@@ -5742,7 +5747,13 @@ impl WendelonDataServer {
 		cancellation_token: &CancellationToken,
 		mut stream_writer: Option<&mut TableQueryResponseStreamWriter<'_>>,
 	) -> std::io::Result<QueryExecutionPlan> {
-		let range_meta = table_query_as_range_query(meta);
+		let mut range_meta = table_query_as_range_query(meta);
+		if matches!(
+			decode_table_query_trace_carrier(meta),
+			TableQueryTraceCarrier::Sampled { .. }
+		) {
+			range_meta._pad[0] |= QUERY_REQUEST_FLAG_SAMPLED_POST_PACKING_PHASE_TRACE;
+		}
 		let row_limit = match table_query_row_limit(meta) {
 			Ok(row_limit) => row_limit,
 			Err(status) => return Ok(query_plan_error(&range_meta, status, self.local_node)),
@@ -7978,6 +7989,7 @@ impl WendelonDataServer {
 				locality,
 				stored_table_object_id,
 				&materialized,
+				None,
 			)? {
 				continue;
 			}
@@ -8057,6 +8069,7 @@ impl WendelonDataServer {
 					locality,
 					stored_table_object_id,
 					&materialized,
+					None,
 				)? {
 					latest_by_key.insert(key_identity, (cursor, true));
 				}
@@ -10884,74 +10897,6 @@ struct QueryExecutionPlan {
 	scan_decode_audit: ScanDecodeAudit,
 }
 
-/// ADR 0089: per-request accounting for the whole-record scan's physical
-/// reads. Rows of one packed record share a read and a decode, so the audit
-/// counts distinct physical records — the amortization the packing exists to
-/// buy — and the cache's high-water mark, so bounded memory is checkable.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-struct ScanDecodeAudit {
-	distinct_records_decoded: u64,
-	coalesced_hits: u64,
-	max_resident_records: u64,
-}
-
-/// ADR 0089: the scan's bounded cache of decoded records. Locality-index
-/// entries for one packed record interleave with other records sharing the
-/// prefix, so a single-slot cache would thrash; a small bounded set is kept and
-/// the oldest entry evicted. A scan's memory must never grow with its size.
-const SCAN_DECODED_CACHE_MAX_RECORDS: usize = 8;
-const SCAN_DECODED_CACHE_MAX_BYTES: usize = 32 << 20;
-
-struct DecodedRecordCache {
-	entries: Vec<((SlabId, u64), Arc<RecordBatch>, usize)>,
-	resident_bytes: usize,
-	audit: ScanDecodeAudit,
-}
-
-impl DecodedRecordCache {
-	fn new() -> Self {
-		Self {
-			entries: Vec::new(),
-			resident_bytes: 0,
-			audit: ScanDecodeAudit::default(),
-		}
-	}
-
-	fn get(&mut self, location: RecordLocation) -> Option<Arc<RecordBatch>> {
-		let key = (location.slab_id, location.offset);
-		let hit = self
-			.entries
-			.iter()
-			.find(|(entry_key, _, _)| *entry_key == key)
-			.map(|(_, batch, _)| Arc::clone(batch));
-		if hit.is_some() {
-			self.audit.coalesced_hits = self.audit.coalesced_hits.saturating_add(1);
-		}
-		hit
-	}
-
-	fn insert(&mut self, location: RecordLocation, batch: Arc<RecordBatch>) {
-		self.audit.distinct_records_decoded = self.audit.distinct_records_decoded.saturating_add(1);
-		let bytes = batch.get_array_memory_size();
-		self.entries
-			.push(((location.slab_id, location.offset), batch, bytes));
-		self.resident_bytes = self.resident_bytes.saturating_add(bytes);
-		while self.entries.len() > SCAN_DECODED_CACHE_MAX_RECORDS
-			|| self.resident_bytes > SCAN_DECODED_CACHE_MAX_BYTES
-		{
-			if self.entries.len() <= 1 {
-				break;
-			}
-			let (_, _, evicted) = self.entries.remove(0);
-			self.resident_bytes = self.resident_bytes.saturating_sub(evicted);
-		}
-		self.audit.max_resident_records = self
-			.audit
-			.max_resident_records
-			.max(self.entries.len() as u64);
-	}
-}
-
 /// ADR 0088: how many rows a table-query response batch targets. `SingleRow`
 /// is the default layout, so before this the storage unit was accidentally the
 /// response unit — a 5,000-row read arrived as 5,000 Arrow frames, paying frame
@@ -12050,6 +11995,7 @@ async fn read_aggregate_query_location(
 		locality,
 		stored_table_object_id,
 		&batch,
+		None,
 	)? {
 		return Ok(None);
 	}
@@ -13341,6 +13287,7 @@ async fn read_table_query_location(
 		locality,
 		stored_table_object_id,
 		&batch,
+		None,
 	)? {
 		return Ok(None);
 	}
@@ -13429,6 +13376,18 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	let mut encoding_materialize_audit = Vec::new();
 	let mut stats_prune_cache = QueryStatsPruneCache::default();
 	let mut descriptorless_rebatch_groups: Vec<DescriptorlessRebatchGroup> = Vec::new();
+	// Descriptor identity is checked once per index entry, but its Arrow schema
+	// is query-invariant. Decoding the descriptor's IPC schema inside that loop
+	// cost 425 ns/row in ADR 0089's post-packing attribution.
+	let descriptor_schema = table_descriptor
+		.map(TableSchemaDescriptor::arrow_schema)
+		.transpose()?;
+	// The pre-0089 phase profile was measured when every row paid a physical
+	// read and decode. Keep the replacement trace sampled: it is for an
+	// explicit request-local attribution run, not a timer in the hot path.
+	let mut phase_trace = PostPackingScanPhaseTrace::new(
+		meta._pad[0] & QUERY_REQUEST_FLAG_SAMPLED_POST_PACKING_PHASE_TRACE != 0,
+	);
 	let max_rows_per_location = usize::try_from(budget.max_rows).unwrap_or(usize::MAX);
 	if let Some(cancel) = cancellation_token {
 		if cancel.is_cancelled() {
@@ -13452,12 +13411,14 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 				));
 			}
 		}
+		let phase_started = phase_trace.started();
 		let scanned = slab.scan_as_of_with_identity_and_locality(
 			meta.tenant_id,
 			range.start,
 			range.end,
 			meta.as_of_hlc,
 		);
+		phase_trace.record(ScanPhase::IndexEntries, phase_started);
 		for (key_identity, locality, location) in scanned {
 			// Examining a location is progress whatever its disposition — pruned,
 			// filtered, duplicate, mismatched and zero-result locations are work
@@ -13494,6 +13455,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 				return Ok(query_plan_error(meta, expired, local_node));
 			}
 			if budget.stats_pruning_enabled {
+				let phase_started = phase_trace.started();
 				let may_match = match clocks
 					.bound(table_stats_may_match_location(
 						slab,
@@ -13509,6 +13471,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 						return Ok(query_plan_error(meta, expired, local_node));
 					}
 				};
+				phase_trace.record(ScanPhase::StatsPrune, phase_started);
 				if !may_match {
 					continue;
 				}
@@ -13611,6 +13574,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					}
 					continue;
 				}
+				let phase_started = phase_trace.started();
 				let projected_read = match clocks
 					.bound(read_projected_query_location(
 						slab,
@@ -13626,6 +13590,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 						return Ok(query_plan_error(meta, expired, local_node));
 					}
 				};
+				phase_trace.record(ScanPhase::ProjectedRead, phase_started);
 				if let Some(result) = projected_read {
 					if let Some(cancel) = cancellation_token {
 						if cancel.is_cancelled() {
@@ -13682,17 +13647,24 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			// record; read and decode it once and serve every row from that
 			// decode. Selection, order, limits, and cancellation stay
 			// per-entry — only the physical read is coalesced.
-			let (storage_batch, freshly_decoded) = match decoded_records.get(location) {
+			let phase_started = phase_trace.started();
+			let cached = decoded_records.get(location);
+			phase_trace.record(ScanPhase::CacheLookup, phase_started);
+			let (storage_batch, freshly_decoded) = match cached {
 				Some(batch) => (batch, false),
 				None => {
+					let phase_started = phase_trace.started();
 					let bytes = match clocks.bound(slab.read(location)).await {
 						Ok(bytes) => bytes?,
 						Err(expired) => {
 							return Ok(query_plan_error(meta, expired, local_node));
 						}
 					};
+					phase_trace.record(ScanPhase::PhysicalRead, phase_started);
+					let phase_started = phase_trace.started();
 					let decode_started = Instant::now();
 					let batch = Arc::new(decode_batch(&bytes)?);
+					phase_trace.record(ScanPhase::Decode, phase_started);
 					if has_storage_synthetic_columns(&batch) {
 						metrics().observe_storage_multirow_decode(
 							batch.num_rows() as u64,
@@ -13708,21 +13680,29 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 			// ADR 0090: the frame is independent placement evidence, and placement is
 			// never resolved from the index alone — the index entry and the frame must
 			// agree at this row before it is served.
-			resolve_record_placement(
+			let phase_started = phase_trace.started();
+			let placement = resolve_record_placement(
 				location.placement,
 				location.partition,
 				storage_batch,
 				location.record_row_index,
-			)?;
+			);
+			phase_trace.record(ScanPhase::Placement, phase_started);
+			placement?;
 			let storage_row_count = storage_batch.num_rows();
+			let phase_started = phase_trace.started();
 			let was_multirow = has_storage_synthetic_columns(&storage_batch);
 			let stored_table_object_id = if was_multirow {
 				storage_row_table_object_id_at(&storage_batch, location.record_row_index)?
 			} else {
 				None
 			};
-			let mut batch =
-				materialize_record_location_batch(&storage_batch, location.record_row_index)?;
+			phase_trace.record(ScanPhase::SyntheticProbe, phase_started);
+			let phase_started = phase_trace.started();
+			let materialized =
+				materialize_record_location_batch(&storage_batch, location.record_row_index);
+			phase_trace.record(ScanPhase::Materialize, phase_started);
+			let mut batch = materialized?;
 			let batch_row_key_ids = if row_identity_projection == RowIdentityProjection::Append {
 				vec![key_identity; batch.num_rows()]
 			} else {
@@ -13745,15 +13725,21 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					local_node,
 				));
 			}
-			if let Some(descriptor) = table_descriptor {
-				if !table_record_matches_descriptor(
+			if let (Some(descriptor), Some(expected_schema)) =
+				(table_descriptor, &descriptor_schema)
+			{
+				let phase_started = phase_trace.started();
+				let matches_descriptor = table_record_matches_descriptor(
 					meta,
 					descriptor,
 					key_identity,
 					locality,
 					stored_table_object_id,
 					&batch,
-				)? {
+					Some(expected_schema),
+				);
+				phase_trace.record(ScanPhase::DescriptorMatch, phase_started);
+				if !matches_descriptor? {
 					continue;
 				}
 			}
@@ -13812,6 +13798,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 				};
 				row_key_ids = filter_row_key_ids_by_mask(&batch_row_key_ids, &mask);
 			}
+			let phase_started = phase_trace.started();
 			let mut result = match pbc::execute_program(program, &batch) {
 				Ok(result) => result,
 				Err(_) => {
@@ -13822,6 +13809,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 					));
 				}
 			};
+			phase_trace.record(ScanPhase::Pbc, phase_started);
 			if row_identity_projection == RowIdentityProjection::Append {
 				result = append_query_row_identity_column(result, &row_key_ids)?;
 			}
@@ -13855,9 +13843,11 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 				return Ok(query_plan_error(meta, expired, local_node));
 			}
 			// ADR 0088: coalesced rather than emitted per location.
+			let phase_started = phase_trace.started();
 			response_batches
 				.push(result, stream_writer.as_deref_mut(), &mut batches)
 				.await?;
+			phase_trace.record(ScanPhase::AccumulatorPush, phase_started);
 			if row_limit_satisfied(rows, row_limit) {
 				break 'ranges;
 			}
@@ -13945,6 +13935,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	// KEY_NOT_FOUND to an empty batch on the receive side, so we
 	// avoid the cost of encoding a zero-row stream.
 	if rows == 0 && batches.is_empty() && aggregate_responses.is_empty() {
+		phase_trace.emit(rows, scanned_locations);
 		let mut plan = query_plan_error(meta, ReadStatus::KEY_NOT_FOUND, local_node);
 		// An empty result is a legitimate answer produced by real work: the live
 		// clocks (and their progress marks) belong to it like any other exit.
@@ -13960,6 +13951,7 @@ async fn plan_query_execution_for_ranges_with_program_maybe_cancelled(
 	response_batches
 		.flush(stream_writer.as_deref_mut(), &mut batches)
 		.await?;
+	phase_trace.emit(rows, scanned_locations);
 	Ok(QueryExecutionPlan {
 		response: QueryResponseMeta {
 			status: ReadStatus::OK,
@@ -13989,11 +13981,16 @@ fn table_record_matches_descriptor(
 	locality: Locality,
 	stored_table_object_id: Option<TableObjectId>,
 	batch: &RecordBatch,
+	expected_schema: Option<&Schema>,
 ) -> std::io::Result<bool> {
 	if batch.num_rows() != 1 {
 		return Ok(false);
 	}
-	if batch.schema().as_ref() != &descriptor.arrow_schema()? {
+	let schema_matches = match expected_schema {
+		Some(expected_schema) => batch.schema().as_ref() == expected_schema,
+		None => batch.schema().as_ref() == &descriptor.arrow_schema()?,
+	};
+	if !schema_matches {
 		return Ok(false);
 	}
 	match &descriptor.row_identity_policy {

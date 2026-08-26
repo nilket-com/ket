@@ -230,20 +230,23 @@ Read amplification for point lookups rises for the same reason. `target_rows`
 and `max_record_bytes` are the tuning surface, and a workload dominated by single
 point reads may want a smaller target; this record does not retune per workload.
 
-Not addressed: the read+decrypt phase's internal split — physical read and
-decryption are inseparable at the scan boundary, and at 57% a split is worth
-having once packing has amortized it. Also unaddressed: whether `spread_factor`
-of four is the right placement spread, which is a distribution question, not a
-packing one.
+Not addressed: a new end-to-end attribution at the post-packing operating
+point. Physical read and decryption are still inseparable at the scan boundary,
+but the old 57% read+decrypt share was measured before one physical record was
+shared across thousands of index entries; it is not evidence that a read/decrypt
+split owns the new budget. Also unaddressed: whether `spread_factor` of four is
+the right placement spread, which is a distribution question, not a packing one.
 
 ## Forward
 
-Re-measure the daemon path after packing, on a table whose records are known
-packed, and state which migration state was observed. If per-row cost falls by
-roughly the rows-per-record factor, the scan-cost arc that began with the
-scatter-threshold slice is closed and the ~29,000-row statement-timeout ceiling
-moves with it. Then split read from decrypt, which will be the largest remaining
-per-record cost.
+Re-attribute the complete request at the post-packing operating point, on a
+table whose records are known packed, and state which migration state was
+observed. The pre-0089 exclusion controls were priced against a ~2.08 ms/row
+request, so their percentage shares do not carry over to a ~13 us/row request.
+Instrument the per-index-entry tail beyond the whole-record decode cache
+(`resolve_record_placement`, descriptor matching, materialization, PBC,
+accumulation, and index-entry production), then re-run the client/transport
+controls. Optimize only the component the new attribution identifies.
 
 ## Measured
 
@@ -278,6 +281,15 @@ migration contributed nothing, and the two states legitimately converge. The
 write-side packing delta remains unmeasured and needs a fixture whose writes
 genuinely produce one-row records.
 
-The ~29,000-row statement-timeout ceiling no longer binds at this rate; the
-implied ~4.5M-row figure is a projection, not a demonstrated ceiling, until a
-larger-cardinality run confirms the scaling.
+The ~29,000-row statement-timeout ceiling no longer binds at this rate. An
+isolated single-node heavy-churn exhibit on the same implemented engine,
+recorded in `crates/toron/plans/wip/claude_iter_14_heavy_churn_verified.md`,
+then read seven terminal-route cardinalities from 49,999 through 1,000,001
+rows. It confirmed the expected scaling: read throughput stayed flat at
+~72,000–76,000 rows/s (13.31–13.67 s for 1,000,000 rows). The approximately
+4.5M-row statement-timeout figure is therefore demonstrated as an extrapolated
+budget at the measured rate, rather than awaiting a cardinality check. That
+exhibit also confirmed its requested and reopened row counts and reported no
+maintenance, slab-GC, or cleanup failures; it is a one-pass, single-node
+happy-path result, not a substitute for fault-injection or replica acceptance
+arms.

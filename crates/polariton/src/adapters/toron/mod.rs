@@ -598,6 +598,133 @@ mod tests {
 		}
 	}
 
+	/// Post-ADR-0089 attribution rail. ADR 0089 amortized the physical read and
+	/// the decode across a packed record's rows, which retired the phase
+	/// profile that named them: at ~75,000 rows/s nothing in the pre-0089
+	/// attribution still holds, including everything it excluded as under one
+	/// percent. This drives one sampled full scan per cardinality so the
+	/// server-side `PostPackingScanPhaseTrace` has a request to attribute.
+	///
+	/// The client wall printed here is the ENVELOPE the trace must account for.
+	/// It is not itself the attribution: if the phases sum to a small share of
+	/// it, the remaining per-row cost lives outside the scan loop, and that is
+	/// the finding. Read the two together or neither means anything.
+	///
+	/// Run against an ISOLATED deployment — never the shared local one, whose
+	/// contention would land inside the measured window:
+	///   TORON_SQL_ENDPOINT=127.0.0.1:7762 cargo test -p polariton \
+	///     --bin polariton live_post_packing_scan_attribution -- \
+	///     --ignored --nocapture
+	#[tokio::test]
+	#[ignore = "requires an isolated live Toron workspace at TORON_SQL_ENDPOINT"]
+	async fn live_post_packing_scan_attribution() {
+		use std::time::Instant;
+
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+
+		// 13,000 reproduces the rung ADR 0089 banked (0.18 s, ~76,000 rows/s),
+		// so the run is comparable to the record. 200,000 is large enough that
+		// any fixed per-request cost is a rounding error against the per-row
+		// budget under investigation.
+		const CARDINALITIES: &[i64] = &[13_000, 200_000];
+		const SEED: i64 = 20260826;
+
+		let mut fixtures: Vec<String> = Vec::new();
+
+		// A throwaway first materialize+read so connection setup, descriptor
+		// sync, and allocator warmup are not charged to a measured scan.
+		let warmup = format!("perf0089_warmup_{}", std::process::id());
+		fixtures.push(warmup.clone());
+		materialize_fixture(&mut adapter, &warmup, 1_000, SEED).await;
+		let _ = scan_all(&mut adapter, &warmup).await;
+
+		println!("\ncardinality,materialize_ms,scan_ms,scan_rows_per_second,rows");
+		for &n in CARDINALITIES {
+			let table = format!("perf0089_scan_{n}_{}", std::process::id());
+			fixtures.push(table.clone());
+
+			let started = Instant::now();
+			let rows_written = materialize_fixture(&mut adapter, &table, n, SEED).await;
+			let materialize_ms = started.elapsed().as_secs_f64() * 1000.0;
+			assert_eq!(rows_written, n as u64);
+
+			// Exactly one scan per cardinality: the server emits one phase
+			// trace per sampled table query, and a second read here would put
+			// two lines in the log with nothing to tell them apart but a row
+			// count they would share.
+			let started = Instant::now();
+			let height = scan_all(&mut adapter, &table).await;
+			let scan_ms = started.elapsed().as_secs_f64() * 1000.0;
+			assert_eq!(height, n as usize, "the scan must return every row");
+
+			println!(
+				"{n},{materialize_ms:.1},{scan_ms:.1},{:.0},{rows_written}",
+				n as f64 / (scan_ms / 1000.0)
+			);
+		}
+
+		for table in &fixtures {
+			if let ExecutionResult::Err(error) = adapter
+				.dispatch(&format!("DROP TABLE IF EXISTS {table}"))
+				.await
+			{
+				println!("# drop-after {table}: {error}");
+			}
+		}
+	}
+
+	/// Two `Float64` columns through the terminal `ket` route, which is the
+	/// write path that produces ADR 0090 partition stamps and therefore the
+	/// ADR 0089 packed records the scan under measurement reads.
+	async fn materialize_fixture(
+		adapter: &mut ToronAdapter,
+		table: &str,
+		rows: i64,
+		seed: i64,
+	) -> u64 {
+		let source = format!(
+			"ket.range({rows}).project_named([\
+			 seeded_random(lit_i64({seed}), col(\"ordinal\")).named(\"x\"), \
+			 seeded_random(lit_i64({}), col(\"ordinal\")).named(\"y\")\
+			 ]).materialize(\"{table}\")",
+			seed + 1
+		);
+		let view = transform_rune_view(&source)
+			.expect("terminal ket relation compiles")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let outcome = adapter
+			.dispatch_rune(&view.source)
+			.await
+			.unwrap_or_else(|error| panic!("materialize of {rows} rows failed: {error:?}"));
+		let crate::adapters::common::RuneDispatchSuccess::Materialized(receipt) = outcome else {
+			panic!("materialize must report a receipt, not a relation");
+		};
+		receipt.rows_written
+	}
+
+	/// The full scan under measurement: every row, no predicate, no rendering.
+	async fn scan_all(adapter: &mut ToronAdapter, table: &str) -> usize {
+		let source = format!("ket.table(\"{table}\")");
+		let view = transform_rune_view(&source)
+			.expect("view envelope")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		adapter
+			.dispatch_rune(&view.source)
+			.await
+			.expect("relation reopens")
+			.expect_relation()
+			.projection()
+			.expect("projection")
+			.height()
+	}
+
 	#[tokio::test]
 	#[ignore = "requires the PRODUCT-0103 pie_probe relation on a live local Toron"]
 	async fn live_product_0103_aggregate_and_raw_handles_remain_distinct() {
