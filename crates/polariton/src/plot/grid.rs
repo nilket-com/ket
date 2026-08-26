@@ -1593,6 +1593,7 @@ mod tests {
 	#[derive(Default)]
 	struct FacetRasterBackend {
 		images: usize,
+		image_sizes: Vec<(f32, f32)>,
 	}
 
 	impl crate::plot::common::PlotBackend for FacetRasterBackend {
@@ -1619,12 +1620,13 @@ mod tests {
 		fn draw_image_rgba(
 			&mut self,
 			_top_left: Point,
-			_size: iced::Size,
+			size: iced::Size,
 			_width: u32,
 			_height: u32,
 			_rgba: &[u8],
 		) {
 			self.images += 1;
+			self.image_sizes.push((size.width, size.height));
 		}
 		fn translate(&mut self, _translation: iced::Vector) {}
 		fn rotate(&mut self, _angle: f32) {}
@@ -1641,6 +1643,12 @@ mod tests {
 	}
 
 	fn facet_scatter_fixture() -> (PlotGridKernel, crate::plot::theme::PlotSettings) {
+		facet_scatter_fixture_with_columns(2)
+	}
+
+	fn facet_scatter_fixture_with_columns(
+		columns: usize,
+	) -> (PlotGridKernel, crate::plot::theme::PlotSettings) {
 		let data = Arc::new(
 			df!(
 				"facet" => ["A", "B", "A", "B"],
@@ -1672,7 +1680,7 @@ mod tests {
 			Arc::new(resolved.resolved_spec),
 			&stamped,
 			"facet",
-			GridArrangement::new(1, 2).expect("arrangement"),
+			GridArrangement::new(1, columns).expect("arrangement"),
 		)
 		.expect("facet");
 		let kernel = PlotGridKernel::from_grid(grid, 800, 400);
@@ -1698,6 +1706,150 @@ mod tests {
 		let before = RASTER_BUILDS.with(std::cell::Cell::get);
 		f();
 		RASTER_BUILDS.with(std::cell::Cell::get) - before
+	}
+
+	/// PRODUCT-0140 evidence: cold raster cost inside a facet cell, on both
+	/// sides of the audit's crossover.
+	///
+	/// At 800×400 a cell's pixel budget is 670,248, below the 1,000,000
+	/// threshold, so the threshold binds. At 1200×720 it is 2,421,608 and the
+	/// budget binds. No facet has ever been timed at all.
+	#[test]
+	#[ignore = "PRODUCT-0140 gate pricing; allocates multi-million-point frames"]
+	fn product_0140_facet_cold_raster_evidence() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget, ScatterRenderMode};
+		use crate::plot::export::SvgBackend;
+		use std::time::Instant;
+
+		fn faceted(points_per_cell: usize) -> (PlotGridKernel, crate::plot::theme::PlotSettings) {
+			let mut state: u64 = 0x2026_0827;
+			let mut next = || {
+				state = state
+					.wrapping_mul(6364136223846793005)
+					.wrapping_add(1442695040888963407);
+				((state >> 11) as f64) / ((1u64 << 53) as f64)
+			};
+			let total = points_per_cell * 2;
+			let facets: Vec<&str> = (0..total)
+				.map(|i| if i % 2 == 0 { "A" } else { "B" })
+				.collect();
+			let xs: Vec<f64> = (0..total).map(|_| next()).collect();
+			let ys: Vec<f64> = (0..total).map(|_| next()).collect();
+			let data = Arc::new(df!("facet" => facets, "x" => xs, "y" => ys).expect("frame"));
+			let resolved = plan(PlotRequest {
+				source: PlotSource::Materialized {
+					name: "facet pricing".to_owned(),
+					data: artifact(&data),
+				},
+				authored_spec: AuthoredPlotSpec::xy(
+					PlotComposition::single(PlotType::Scatter),
+					"x",
+					"y",
+				),
+			})
+			.expect("resolves");
+			let stamped = StampedResult {
+				data: artifact(&data),
+				provenance: PlotProvenance {
+					source_name: "facet pricing".to_owned(),
+					revision: None,
+				},
+			};
+			let grid = PlotGrid::value_facet(
+				Arc::new(resolved.resolved_spec),
+				&stamped,
+				"facet",
+				GridArrangement::new(1, 2).expect("arrangement"),
+			)
+			.expect("facet");
+			let mut model = crate::plot::theme::PlotSettings::default();
+			model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+			(PlotGridKernel::from_grid(grid, 800, 400), model)
+		}
+
+		println!("\nwidget,points_per_cell,cold_ms,images");
+		for (widget, per_cell) in [
+			((800.0_f32, 400.0_f32), 1_000_000_usize),
+			((1200.0, 720.0), 1_000_000),
+			((1200.0, 720.0), 2_421_608),
+		] {
+			let (kernel, model) = faceted(per_cell);
+			let rect = IcedRectangle::new(Point::ORIGIN, iced::Size::new(widget.0, widget.1));
+			let mut svg = SvgBackend::new(widget.0, widget.1);
+			let started = Instant::now();
+			PlotWidget::new(
+				&kernel,
+				String::new(),
+				0.0,
+				model.clone(),
+				0,
+				false,
+				PlotRenderLayer::Full,
+			)
+			.render(&mut svg, rect);
+			let ms = started.elapsed().as_secs_f64() * 1000.0;
+			let _ = svg.finish();
+
+			let (fresh, fresh_model) = faceted(per_cell);
+			let mut counter = FacetRasterBackend::default();
+			PlotWidget::new(
+				&fresh,
+				String::new(),
+				0.0,
+				fresh_model,
+				0,
+				false,
+				PlotRenderLayer::Full,
+			)
+			.render(&mut counter, rect);
+			println!(
+				"{}x{},{per_cell},{ms:.1},{}",
+				widget.0, widget.1, counter.images
+			);
+		}
+	}
+
+	/// PRODUCT-0140 evidence, facet half: a cell's pixel budget is a fraction of
+	/// the figure's, so a facet cell reaches the raster gate at a point count no
+	/// single-cell measurement has ever priced.
+	#[test]
+	#[ignore = "PRODUCT-0140 gate-input evidence"]
+	fn product_0140_facet_cell_gate_input_evidence() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget, ViewportMotion};
+
+		for (columns, widget) in [(2_usize, (800.0_f32, 400.0_f32)), (2, (1200.0, 720.0))] {
+			let (kernel, model) = facet_scatter_fixture_with_columns(columns);
+			let widget_plot = PlotWidget::new(
+				&kernel,
+				String::new(),
+				0.0,
+				model,
+				0,
+				false,
+				PlotRenderLayer::Full,
+			)
+			.with_viewport_motion(ViewportMotion::Settled);
+			let mut backend = FacetRasterBackend::default();
+			widget_plot.render(
+				&mut backend,
+				IcedRectangle::new(Point::ORIGIN, iced::Size::new(widget.0, widget.1)),
+			);
+			let naive = (widget.0 as usize) * (widget.1 as usize);
+			println!(
+				"\nfacet {columns} cells at {}x{}: naive_gate={}",
+				widget.0,
+				widget.1,
+				naive * 8
+			);
+			for (index, (iw, ih)) in backend.image_sizes.iter().enumerate() {
+				let inner = (*iw as usize) * (*ih as usize);
+				println!(
+					"  cell {index}: inner_px={iw}x{ih} share={:.3} effective_gate={}",
+					inner as f64 / naive as f64,
+					inner * 8
+				);
+			}
+		}
 	}
 
 	#[test]

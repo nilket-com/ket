@@ -1991,6 +1991,230 @@ mod tests {
 		}
 	}
 
+	/// PRODUCT-0140 evidence: what rasterizing costs at the gate, and what the
+	/// bare `× 8` multiplier is actually choosing.
+	///
+	/// Two questions the audit left open. **Cold raster cost** is the stall a
+	/// lower gate makes more common, and it has never been priced at the
+	/// cardinalities near the gate itself. **The multiplier is a density** —
+	/// "rasterize above 8 points per pixel" — so pricing it means finding the
+	/// density at which rasterizing actually beats downsampling, rather than
+	/// assuming 8 is that density.
+	///
+	/// Every arm builds a fresh kernel, because the raster cache lives on the
+	/// renderer and a reused kernel would price a hit instead of a cold build.
+	/// Every arm also reports the draw calls it emitted, so the path each figure
+	/// took is confirmed rather than assumed.
+	#[test]
+	#[ignore = "PRODUCT-0140 gate pricing; allocates multi-million-point frames"]
+	fn product_0140_gate_pricing_evidence() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		use crate::plot::export::SvgBackend;
+		use crate::plot::factory::create_authored_plot;
+		use std::time::Instant;
+
+		fn frame(n: usize) -> DataFrame {
+			let mut state: u64 = 0x2026_0827;
+			let mut next = || {
+				state = state
+					.wrapping_mul(6364136223846793005)
+					.wrapping_add(1442695040888963407);
+				((state >> 11) as f64) / ((1u64 << 53) as f64)
+			};
+			let xs: Vec<f64> = (0..n).map(|_| next()).collect();
+			let ys: Vec<f64> = (0..n).map(|_| next()).collect();
+			df!("x" => xs, "y" => ys).expect("frame")
+		}
+
+		/// One cold render at a forced mode. Returns (ms, circles, images).
+		fn measure(n: usize, widget: (f32, f32), mode: ScatterRenderMode) -> (f64, usize, usize) {
+			let df = frame(n);
+			let kernel = create_authored_plot(
+				AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+				&df,
+				widget.0 as u32,
+				widget.1 as u32,
+			)
+			.expect("kernel");
+			let mut model = crate::plot::theme::PlotSettings::default();
+			model.library_defaults.scatter_render_mode = mode;
+			fn widget_for<'a>(
+				kernel: &'a (dyn PlotKernel + Send + Sync),
+				model: &crate::plot::theme::PlotSettings,
+			) -> PlotWidget<'a> {
+				PlotWidget::new(
+					kernel,
+					String::new(),
+					0.0,
+					model.clone(),
+					0,
+					false,
+					PlotRenderLayer::Full,
+				)
+			}
+			let rect = Rectangle::new(Point::ORIGIN, iced::Size::new(widget.0, widget.1));
+
+			let mut svg = SvgBackend::new(widget.0, widget.1);
+			let started = Instant::now();
+			widget_for(kernel.as_ref(), &model).render(&mut svg, rect);
+			let ms = started.elapsed().as_secs_f64() * 1000.0;
+			let _ = svg.finish();
+
+			// Path confirmation from a second, fresh kernel so the timing above
+			// is not polluted by the counting pass.
+			let cold = create_authored_plot(
+				AuthoredPlotSpec::xy(PlotComposition::single(PlotType::Scatter), "x", "y"),
+				&df,
+				widget.0 as u32,
+				widget.1 as u32,
+			)
+			.expect("kernel");
+			let mut counter = CountingBackend::default();
+			widget_for(cold.as_ref(), &model).render(&mut counter, rect);
+			(ms, counter.circles, counter.images)
+		}
+
+		// Part 1 — cold raster at gate-adjacent cardinalities. The full window's
+		// gate is 5,203,000 (the pixel budget binds); the small pane's is
+		// 1,000,000 (the threshold binds, its budget being only 407,000).
+		println!("\npart,widget,points,mode,ms,circles,images");
+		for (label, widget, cardinalities) in [
+			(
+				"full-window (budget binds)",
+				(1200.0_f32, 720.0_f32),
+				[2_600_000_usize, 5_203_000, 7_800_000],
+			),
+			(
+				"small-pane (threshold binds)",
+				(400.0, 300.0),
+				[500_000, 1_000_000, 2_000_000],
+			),
+		] {
+			for n in cardinalities {
+				let (ms, circles, images) = measure(n, widget, ScatterRenderMode::Rasterized);
+				println!(
+					"cold-raster,{label} {}x{},{n},forced-raster,{ms:.1},{circles},{images}",
+					widget.0, widget.1
+				);
+			}
+		}
+
+		// Part 2 — price the multiplier. It is a density, so sweep density and
+		// find where rasterizing actually overtakes downsampling. If the
+		// crossover is not near 8, the constant is not where the evidence puts
+		// it.
+		for (label, widget, area) in [
+			("small-pane", (400.0_f32, 300.0_f32), 275_usize * 185),
+			("full-window", (1200.0, 720.0), 1075_usize * 605),
+		] {
+			for density in [1_usize, 2, 4, 8, 16] {
+				let n = area * density;
+				let (down_ms, down_circles, _) = measure(n, widget, ScatterRenderMode::Downsampled);
+				let (rast_ms, _, rast_images) = measure(n, widget, ScatterRenderMode::Rasterized);
+				println!(
+					"multiplier,{label} {}x{},{n},density={density},down={down_ms:.1},raster={rast_ms:.1},down_circles={down_circles},raster_images={rast_images}",
+					widget.0, widget.1
+				);
+			}
+		}
+	}
+
+	/// PRODUCT-0140 evidence: what the raster gate's pixel budget actually is.
+	///
+	/// `resolve_render_mode` divides `bounds`, and `bounds` is the **inner plot
+	/// area** — the widget rect minus every guide band. This exhibit measures
+	/// that rectangle for representative configurations, reading it from the
+	/// rasterizer's own output rather than reconstructing it, so the gate is
+	/// priced against what production computes.
+	#[test]
+	#[ignore = "PRODUCT-0140 gate-input evidence"]
+	fn product_0140_gate_input_evidence() {
+		use crate::plot::common::{PlotRenderLayer, PlotWidget};
+		use crate::plot::factory::create_authored_plot;
+
+		fn frame(series: usize, y_scale: f64) -> DataFrame {
+			let xs: Vec<f64> = (0..64).map(|i| f64::from(i)).collect();
+			let ys: Vec<f64> = (0..64).map(|i| f64::from(i) * y_scale).collect();
+			if series <= 1 {
+				df!("x" => xs, "y" => ys).expect("frame")
+			} else {
+				let labels: Vec<String> =
+					(0..64).map(|i| format!("series {}", i % series)).collect();
+				df!("x" => xs, "y" => ys, "series" => labels).expect("frame")
+			}
+		}
+
+		fn inner_plot_px(
+			series: usize,
+			y_scale: f64,
+			title: Option<&str>,
+			widget: (f32, f32),
+		) -> (f32, f32) {
+			let composition = PlotComposition::single(PlotType::Scatter);
+			let spec = if series <= 1 {
+				AuthoredPlotSpec::xy(composition, "x", "y")
+			} else {
+				AuthoredPlotSpec::xy_color(composition, "x", "y", Some("series".to_owned()))
+			};
+			let df = frame(series, y_scale);
+			let kernel =
+				create_authored_plot(spec, &df, widget.0 as u32, widget.1 as u32).expect("kernel");
+			let mut model = crate::plot::theme::PlotSettings::default();
+			// Force the raster path so the image reports the inner rectangle.
+			model.library_defaults.scatter_render_mode = ScatterRenderMode::Rasterized;
+			let widget_plot = PlotWidget::new(
+				kernel.as_ref(),
+				title.unwrap_or_default().to_owned(),
+				0.0,
+				model,
+				0,
+				false,
+				PlotRenderLayer::Full,
+			);
+			let mut counter = CountingBackend::default();
+			widget_plot.render(
+				&mut counter,
+				Rectangle::new(Point::ORIGIN, iced::Size::new(widget.0, widget.1)),
+			);
+			counter
+				.image_size
+				.expect("the raster path reports its rectangle")
+		}
+
+		println!(
+			"
+configuration,widget_px,inner_px,inner_share,effective_gate,naive_gate"
+		);
+		let cases: [(&str, usize, f64, Option<&str>, (f32, f32)); 7] = [
+			("baseline 1200x720", 1, 1.0, None, (1200.0, 720.0)),
+			("with title", 1, 1.0, Some("A title"), (1200.0, 720.0)),
+			("8 series (legend)", 8, 1.0, None, (1200.0, 720.0)),
+			("wide y tick labels", 1, 1.0e9, None, (1200.0, 720.0)),
+			(
+				"wide labels + legend + title",
+				8,
+				1.0e9,
+				Some("A title"),
+				(1200.0, 720.0),
+			),
+			("small pane 400x300", 1, 1.0, None, (400.0, 300.0)),
+			("small pane, wide labels", 1, 1.0e9, None, (400.0, 300.0)),
+		];
+		for (label, series, y_scale, title, widget) in cases {
+			let (iw, ih) = inner_plot_px(series, y_scale, title, widget);
+			let inner = (iw as usize) * (ih as usize);
+			let naive = (widget.0 as usize) * (widget.1 as usize);
+			println!(
+				"{label},{}x{},{iw}x{ih},{:.3},{},{}",
+				widget.0,
+				widget.1,
+				inner as f64 / naive as f64,
+				inner * 8,
+				naive * 8
+			);
+		}
+	}
+
 	/// PRODUCT-0139 §2 gate: the reuse placement maps the cached image onto the
 	/// new viewport exactly.
 	///
