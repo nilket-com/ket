@@ -725,6 +725,148 @@ mod tests {
 			.height()
 	}
 
+	/// Why does this rail read ~5x faster than the rate ADR 0089 banked?
+	///
+	/// The banked figure is 13,000 rows in 0.18 s (~72,000 rows/s) from
+	/// `SELECT x FROM ctrl_plain LIMIT 13000`. **That fixture no longer exists**
+	/// — `ctrl_plain` and `ctrl_packed` were both dropped from the shared
+	/// deployment — so the original run cannot be reproduced, only
+	/// reconstructed. This isolates the factors that are still reachable, all
+	/// on one engine and one deployment, at the banked 13,000-row rung:
+	///
+	/// * **fixture width** — one `Int64` column against two `Float64`
+	/// * **query path** — SQL through the Arrow adapter against Rune
+	/// * **the bound** — `LIMIT 13000` against an unbounded scan
+	///
+	/// What it cannot isolate is engine version and accumulated deployment
+	/// state. If no arm here lands near 72,000 rows/s, those two are what
+	/// remain, and the next step is building `9e773b28` rather than more
+	/// arms on this one.
+	///
+	/// Every arm goes through the Arrow-IPC adapter, never the text table, so
+	/// no arm pays for rendering. Medians of three.
+	///
+	/// Run against an ISOLATED deployment:
+	///   TORON_SQL_ENDPOINT=127.0.0.1:7762 cargo test -p polariton \
+	///     --bin polariton live_absolute_rate_factor_isolation -- \
+	///     --ignored --nocapture
+	#[tokio::test]
+	#[ignore = "requires an isolated live Toron workspace at TORON_SQL_ENDPOINT"]
+	async fn live_absolute_rate_factor_isolation() {
+		use std::time::Instant;
+
+		let _live_gate = LIVE_TORON_TEST_LOCK.lock().await;
+		let mut adapter = ToronAdapter::connect(&live_endpoint())
+			.await
+			.expect("connect to Toron");
+
+		// The rung ADR 0089 banked, so every number here is directly
+		// comparable to 0.18 s without rescaling.
+		const ROWS: i64 = 13_000;
+		const SEED: i64 = 20260826;
+		const REPEATS: usize = 3;
+
+		let pid = std::process::id();
+		let wide = format!("rate_wide_{pid}");
+		let narrow = format!("rate_narrow_{pid}");
+		let warmup = format!("rate_warmup_{pid}");
+
+		materialize_fixture(&mut adapter, &warmup, 1_000, SEED).await;
+		let _ = scan_all(&mut adapter, &warmup).await;
+
+		// Two Float64 columns: what this rail has been measuring.
+		let written = materialize_fixture(&mut adapter, &wide, ROWS, SEED).await;
+		assert_eq!(written, ROWS as u64);
+		// One Int64 column: `ctrl_plain`'s shape, as close as a fixture built
+		// through today's write path can come to it.
+		let source = format!(
+			"ket.range({ROWS}).project_named([col(\"ordinal\").named(\"x\")]).materialize(\"{narrow}\")"
+		);
+		let view = transform_rune_view(&source)
+			.expect("narrow relation compiles")
+			.into_relations()
+			.next()
+			.expect("one relation");
+		let crate::adapters::common::RuneDispatchSuccess::Materialized(receipt) = adapter
+			.dispatch_rune(&view.source)
+			.await
+			.expect("narrow materialize")
+		else {
+			panic!("materialize must report a receipt")
+		};
+		assert_eq!(receipt.rows_written, ROWS as u64);
+
+		println!("\narm,fixture,path,projected_cols,bound,median_ms,rows_per_second");
+		let arms: &[(&str, &str, &str, usize, &str, Option<String>)] = &[
+			("A", "2xFloat64", "rune", 2, "none", None),
+			(
+				"B",
+				"2xFloat64",
+				"sql",
+				2,
+				"none",
+				Some(format!("SELECT x, y FROM {wide}")),
+			),
+			(
+				"C",
+				"2xFloat64",
+				"sql",
+				1,
+				"LIMIT 13000",
+				Some(format!("SELECT x FROM {wide} LIMIT {ROWS}")),
+			),
+			(
+				"D",
+				"1xInt64",
+				"sql",
+				1,
+				"LIMIT 13000",
+				Some(format!("SELECT x FROM {narrow} LIMIT {ROWS}")),
+			),
+			("E", "1xInt64", "rune", 1, "none", None),
+		];
+
+		for (arm, fixture, path, cols, bound, sql) in arms {
+			let table = if *fixture == "2xFloat64" {
+				&wide
+			} else {
+				&narrow
+			};
+			let mut samples = Vec::new();
+			for _ in 0..REPEATS {
+				let started = Instant::now();
+				let observed = match sql {
+					Some(statement) => {
+						let ExecutionResult::Rows { artifact, .. } =
+							adapter.dispatch(statement).await
+						else {
+							panic!("arm {arm} expected rows")
+						};
+						artifact.shape().0
+					}
+					None => scan_all(&mut adapter, table).await,
+				};
+				samples.push(started.elapsed().as_secs_f64() * 1000.0);
+				assert_eq!(observed, ROWS as usize, "arm {arm} must return every row");
+			}
+			samples.sort_by(|a, b| a.partial_cmp(b).expect("finite timings"));
+			let median = samples[samples.len() / 2];
+			println!(
+				"{arm},{fixture},{path},{cols},{bound},{median:.1},{:.0}",
+				ROWS as f64 / (median / 1000.0)
+			);
+		}
+
+		for table in [&warmup, &wide, &narrow] {
+			if let ExecutionResult::Err(error) = adapter
+				.dispatch(&format!("DROP TABLE IF EXISTS {table}"))
+				.await
+			{
+				println!("# drop-after {table}: {error}");
+			}
+		}
+	}
+
 	#[tokio::test]
 	#[ignore = "requires the PRODUCT-0103 pie_probe relation on a live local Toron"]
 	async fn live_product_0103_aggregate_and_raw_handles_remain_distinct() {
