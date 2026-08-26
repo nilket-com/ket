@@ -339,6 +339,29 @@ pub struct TaskTelemetryPhases {
 	/// diagnostic, and only this counter affects the task-wall partition.
 	#[serde(default)]
 	pub aggregate_accumulation_micros: u64,
+	/// ADR 554 Branch A follow-on: per-batch **input processing** — predicate
+	/// evaluation and projection expression evaluation — at the generic executor
+	/// tree's `ExecutionPlan::Filter` and `ExecutionPlan::Project` nodes.
+	///
+	/// ADR 554 named "a separate term for scan input processing" as the candidate
+	/// follow-on and pointed at `apply_streaming_scan_input_ops`. That pointer is
+	/// wrong for the evidence cell: all four of its call sites are fused
+	/// aggregate loops, and q06's residual sits on a producer task that records
+	/// zero accumulation and therefore never enters one. The sites below are the
+	/// ones a scan-and-filter producer stage actually executes.
+	///
+	/// A `FullyPushed` filter returns its input untouched before the bracket is
+	/// reached, so it contributes nothing here. That is deliberate — there is no
+	/// work to time — but it means a zero reading on a filter node does NOT
+	/// discriminate "pushed to storage" from "never executed". The Project
+	/// bracket is what carries the signal on a fully-pushed scan stage.
+	///
+	/// This counter participates in `framework_overhead = task_wall - accounted`,
+	/// so naming this time shrinks the residual by the same amount. Like
+	/// accumulation it is a **named subterm of the remainder**, never an ADR 538
+	/// component, and the frozen phase-to-component mapping is not reopened.
+	#[serde(default)]
+	pub input_processing_micros: u64,
 	/// Time spent partitioning batches across an exchange boundary. Written by the executor,
 	/// so it is produced on both arms: locally as in-memory repartitioning, and inside a
 	/// distributed producer task. That symmetry is what makes it a paired component.

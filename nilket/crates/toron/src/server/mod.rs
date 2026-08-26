@@ -1358,6 +1358,10 @@ fn recompute_framework_overhead(telemetry: &mut TaskTelemetry) {
 		// ADR 554 Branch A: naming accumulation must shrink the residual by the
 		// same amount, or the counter double-counts against a bucket that never
 		// moves.
+		// ADR 554 Branch A follow-on: same discipline as accumulation — a named
+		// subterm must leave the residual, or it double-counts against a bucket
+		// that never moves.
+		.saturating_add(telemetry.phases.input_processing_micros)
 		.saturating_add(telemetry.phases.aggregate_accumulation_micros);
 	telemetry.phases.framework_overhead_micros =
 		telemetry.phases.task_wall_micros.saturating_sub(accounted);
